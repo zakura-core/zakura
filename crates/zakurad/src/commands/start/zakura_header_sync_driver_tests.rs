@@ -498,6 +498,7 @@ fn test_committed_views(
     };
     let (snapshot_tx, snapshot_rx) =
         tokio::sync::watch::channel(Some(zakura_header_chain::CommittedHeaderChainView::new(
+            snapshot.frontiers.verified_best,
             snapshot,
             zakura_header_chain::BodyWorkEpoch::default(),
         )));

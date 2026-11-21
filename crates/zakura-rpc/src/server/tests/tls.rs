@@ -59,6 +59,23 @@ impl RpcMethods for TestMethods {
     }
 }
 
+/// Accepts TLS with the localhost test certificate that [`tls_connector`] trusts.
+pub(super) fn test_acceptor() -> TlsAcceptor {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            parse_tls_cert_chain(HANDSHAKE_CERT.as_bytes()).unwrap(),
+            parse_tls_private_key(HANDSHAKE_KEY.as_bytes())
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+    TlsAcceptor::from(Arc::new(config))
+}
+
 struct TestTlsListener {
     address: SocketAddr,
     handle: ServerHandle,
@@ -82,18 +99,6 @@ impl TestTlsListener {
         max_connections: usize,
         header_read_timeout: Duration,
     ) -> Self {
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let config = rustls::ServerConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()
-            .unwrap()
-            .with_no_client_auth()
-            .with_single_cert(
-                parse_tls_cert_chain(HANDSHAKE_CERT.as_bytes()).unwrap(),
-                parse_tls_private_key(HANDSHAKE_KEY.as_bytes())
-                    .unwrap()
-                    .unwrap(),
-            )
-            .unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (stop_handle, handle) = stop_channel();
@@ -108,7 +113,7 @@ impl TestTlsListener {
         );
         let task = tokio::spawn(run_tls_listener(
             listener,
-            TlsAcceptor::from(Arc::new(config)),
+            test_acceptor(),
             stop_handle,
             handle.clone(),
             max_pending,
@@ -119,7 +124,7 @@ impl TestTlsListener {
                 async move {
                     let _ = serve_tls_connection(
                         stream,
-                        service,
+                        hyper_util::service::TowerToHyperService::new(service),
                         stop_handle.shutdown(),
                         header_read_timeout,
                     )

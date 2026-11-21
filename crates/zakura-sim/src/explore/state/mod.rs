@@ -9,7 +9,7 @@
 //!
 //! # Index layout
 //!
-//! [`FEEDBACK_VERSION`] 5 fixes this layout. Each [`Family`] owns 4,096
+//! [`FEEDBACK_VERSION`] 6 fixes this layout. Each [`Family`] owns 4,096
 //! indices from `family × 4096`, in [`Family::ALL`]'s order. A family splits
 //! its span into blocks, one per [`StateFeature`] variant. A block's index is
 //! mixed-radix over the variant's fields, in field order, each field by its
@@ -50,7 +50,8 @@
 //! a change fails them until the version and the pins move together.
 //!
 //! [`REQUIRED`] is the exact required-state matrix: every state the feature
-//! table requires, and the features that show it, or why none does yet.
+//! table requires, and the features that show it, or why no run can reach
+//! it.
 
 mod collector;
 pub mod crossing;
@@ -769,8 +770,10 @@ impl Transition {
 }
 
 vocabulary! {
-    /// A stage of block sync's work on a new branch, after its body-work
-    /// epoch first advanced, for work of the newest epoch.
+    /// A stage of syncing a new branch. Header sync's stages are those of a
+    /// branch whose common ancestor lies below the selected tip. Block
+    /// sync's are those of its work after its body-work epoch first
+    /// advanced, for work of the newest epoch.
     ReorgStage {
         /// Block sync asked storage which bodies it needs.
         Query = "query",
@@ -787,6 +790,14 @@ vocabulary! {
         VerdictCommitted = "verdict-committed",
         /// Storage gave a submission another verdict.
         VerdictOther = "verdict-other",
+        /// Header sync asked storage to prepare a target whose common
+        /// ancestor lies below the selected tip.
+        HeaderPrepare = "header-prepare",
+        /// Storage applied such a target.
+        HeaderApply = "header-apply",
+        /// Storage returned a locator, and header sync's next prepare was
+        /// such a target's: the locator found the branch's common ancestor.
+        HeaderLocator = "header-locator",
     }
 }
 
@@ -819,6 +830,10 @@ vocabulary! {
         Discharged = "discharged",
         /// One expired undischarged: its deadline passed.
         Expired = "expired",
+        /// An assumption the property rests on stopped holding while it had
+        /// an obligation open, and the registry withdrew the obligation
+        /// (`Lifecycle::AssumptionLost`).
+        Withdrawn = "withdrawn",
     }
 }
 
@@ -1380,6 +1395,11 @@ pub enum Coverage {
         /// What's missing.
         why: &'static str,
     },
+    /// No unpatched run can reach it, so it leaves the coverage target.
+    Excluded {
+        /// Why no run reaches it.
+        why: &'static str,
+    },
 }
 
 /// One required state of the feature table.
@@ -1402,6 +1422,9 @@ const HEADER_STORAGE: &str = "header-sync/storage";
 /// The header-sync wire harness.
 const HEADER_WIRE: &str = "header-sync/wire";
 
+/// The joint wire harness: header sync, block sync and discovery on QUIC.
+const SYNC_WIRE: &str = "sync/wire";
+
 /// A required state that `shows` collects, reached by `harnesses`'
 /// witnesses.
 const fn collected(
@@ -1422,17 +1445,12 @@ const fn collected(
     }
 }
 
-/// A required state that waits `on` a chunk or source, because of `why`.
-const fn waiting(
-    family: Family,
-    state: &'static str,
-    on: &'static str,
-    why: &'static str,
-) -> RequiredState {
+/// A required state that no unpatched run can reach, because of `why`.
+const fn excluded(family: Family, state: &'static str, why: &'static str) -> RequiredState {
     RequiredState {
         family,
         state,
-        coverage: Coverage::Waiting { on, why },
+        coverage: Coverage::Excluded { why },
     }
 }
 
@@ -1517,13 +1535,12 @@ pub const REQUIRED: &[RequiredState] = &[
             )
         },
     ),
-    waiting(
+    excluded(
         Family::CompletionCancellation,
         "completion after cancellation acknowledgement",
-        "fuzz-14",
         "neither storage contract acknowledges a cancellation: header storage never stops \
-         accepted work, and only shutdown removes a pending operation, so no witness can \
-         reach it and fuzz-14's acceptance must list it as an exclusion",
+         accepted work, and only shutdown removes a pending operation, so reaching it needs a \
+         storage that acknowledges a cancellation, which production doesn't have",
     ),
     collected(
         Family::CompletionCancellation,
@@ -1807,11 +1824,22 @@ pub const REQUIRED: &[RequiredState] = &[
             StateFeature::ReorgStage(ReorgStage::VerdictCommitted | ReorgStage::VerdictOther)
         )
     }),
-    waiting(
+    // `sync/wire`'s reorg: a locator finds the mirrors' fork below header
+    // sync's selected tip, and header sync prepares and applies it, before
+    // block sync's epoch advances.
+    collected(
         Family::ReorgStage,
         "header locator, prepare and apply stages",
-        "P8",
-        "no harness runs header and block sync together",
+        &[SYNC_WIRE],
+        true,
+        |f| {
+            matches!(
+                f,
+                StateFeature::ReorgStage(
+                    ReorgStage::HeaderPrepare | ReorgStage::HeaderApply | ReorgStage::HeaderLocator
+                )
+            )
+        },
     ),
     collected(
         Family::Recovery,
@@ -1850,20 +1878,29 @@ pub const REQUIRED: &[RequiredState] = &[
             )
         },
     ),
-    waiting(
+    excluded(
         Family::Recovery,
         "deadline expired",
-        "a planted witness",
-        "without a bug, an expired obligation is a violation, so only a planted case, such \
-         as hdr-7's `capacity-release-wakes` bypass, can reach it",
+        "without a bug, an expired obligation is a violation, so only a planted bug reaches \
+         it, and the planted cases and mutation runs already plant such bugs, such as hdr-7's \
+         `capacity-release-wakes` bypass",
     ),
-    waiting(
+    // `header-sync/honest-progress`'s honest peer leaves before the node
+    // applies the header it advertised.
+    collected(
         Family::Recovery,
         "assumption lost",
-        "hdr-13",
-        "the registry tracks a loss only for a property that lists an assumption, and emits \
-         no event for it; hdr-13's recovery property lists the storage harness's \
-         assumptions, and the event comes with it",
+        &[HEADER_WIRE],
+        false,
+        |f| {
+            matches!(
+                f,
+                StateFeature::Obligation {
+                    point: ObligationPoint::Withdrawn,
+                    ..
+                }
+            )
+        },
     ),
     collected(
         Family::Teardown,
@@ -1890,11 +1927,9 @@ pub const REQUIRED: &[RequiredState] = &[
     collected(Family::Teardown, "settled baseline", &[BLOCK], false, |f| {
         *f == StateFeature::Baseline(Baseline::Settled)
     }),
-    waiting(
-        Family::Teardown,
-        "incomplete drain",
-        "a drain bound knob",
-        "the drain stops at its bound only with tasks still ready, and no harness's controls \
-         keep tasks ready for its 1,000 steps; reaching it needs a lower drain bound",
-    ),
+    // A block scenario whose `drain_steps` cuts the drain off while the
+    // peers' work is still ready.
+    collected(Family::Teardown, "incomplete drain", &[BLOCK], false, |f| {
+        *f == StateFeature::IncompleteDrain
+    }),
 ];

@@ -1355,11 +1355,10 @@ pub static COVERAGE: &[Coverage] = &[
     discovery(
         "discovery/s4v2/peers/sender-within-owed",
         OWED_ANSWERS,
-        Bypass::Pending(
-            "every simulated peer binds an RFC 1918 address, which `is_sample_eligible` refuses, \
-             so the node answers every GetPeers with no records and no limit bug can reach this \
-             check yet",
-        ),
+        Bypass::Test(sim_test(
+            DISCOVERY_WITNESSES,
+            "peers_sender_within_owed_breaks_in_its_bypass",
+        )),
     ),
     discovery(
         "discovery/s4v2/services/sender-within-owed",

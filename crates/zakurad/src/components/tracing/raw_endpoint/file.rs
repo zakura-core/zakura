@@ -58,10 +58,13 @@ impl TraceFile {
             .open(directory.join(format!("{table}{SUFFIX}")))
             .map_err(|error| match error.kind() {
                 io::ErrorKind::NotFound => OpenError::NotFound,
-                // ELOOP: a symlink under O_NOFOLLOW. ENXIO: a Unix socket.
+                // O_NOFOLLOW rejects symlinks with ELOOP. Opening a Unix socket returns
+                // ENXIO on Linux and EOPNOTSUPP on macOS.
                 _ if matches!(error.raw_os_error(), Some(libc::ELOOP | libc::ENXIO)) => {
                     OpenError::NotRegular
                 }
+                #[cfg(target_os = "macos")]
+                _ if error.raw_os_error() == Some(libc::EOPNOTSUPP) => OpenError::NotRegular,
                 _ => OpenError::Io(error),
             })?;
         let metadata = file.metadata().map_err(OpenError::Io)?;

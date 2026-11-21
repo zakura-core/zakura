@@ -22,7 +22,6 @@ use hyper::{
 use hyper_util::{
     rt::{TokioExecutor, TokioIo, TokioTimer},
     server::conn::auto,
-    service::TowerToHyperService,
 };
 use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 use tokio::{
@@ -70,6 +69,7 @@ pub mod rpc_logger;
 pub mod rpc_metrics;
 pub mod rpc_service;
 pub mod rpc_tracing;
+pub(crate) mod trusted_block;
 
 #[cfg(test)]
 mod tests;
@@ -229,6 +229,7 @@ impl RpcServer {
         );
         conf.admin_listen_addr = None;
         conf.enable_cookie_auth = true;
+        conf.enable_trusted_block_submission = false;
         conf.tls = None;
 
         Self::start_inner(rpc, conf, RpcSurface::Full, OPENED_ADMIN_RPC_ENDPOINT_MSG).await
@@ -269,14 +270,16 @@ impl RpcServer {
         // as a hex string (2x MAX_BLOCK_BYTES) plus a small JSON-RPC wrapper.
         let max_request_body_size = (MAX_BLOCK_BYTES as usize) * 2 + 1024;
 
-        let http_middleware_layer = if conf.enable_cookie_auth {
+        let auth_cookie = if conf.enable_cookie_auth {
             let cookie = Cookie::default();
             cookie::write_to_disk(&cookie, &conf.cookie_dir, Some(&conf.cookie_file_name))
                 .expect("Zakura must be able to write the auth cookie to the disk");
-            HttpRequestMiddlewareLayer::new(Some(cookie), max_request_body_size)
+            Some(cookie)
         } else {
-            HttpRequestMiddlewareLayer::new(None, max_request_body_size)
+            None
         };
+        let http_middleware_layer =
+            HttpRequestMiddlewareLayer::new(auth_cookie.clone(), max_request_body_size);
         // Credential-free admin methods trust the network boundary, which a local browser
         // is already inside.
         let http_middleware_layer = if surface == RpcSurface::WithAdmin {
@@ -286,6 +289,14 @@ impl RpcServer {
         };
 
         let max_response_body_size = conf.max_response_body_size;
+        let trusted_submit: Option<trusted_block::Submit> =
+            conf.enable_trusted_block_submission.then(|| {
+                let rpc = rpc.clone();
+                std::sync::Arc::new(move |bytes: Bytes| -> trusted_block::SubmissionFuture {
+                    let rpc = rpc.clone();
+                    Box::pin(async move { rpc.submit_trusted_block(&bytes).await })
+                }) as trusted_block::Submit
+            });
         let rpc_service = RpcLoggerMiddleware::new(
             FixRpcResponseMiddleware::new(RpcMetricsMiddleware::new(RpcTracingMiddleware::new(
                 RpcService::new(rpc, enabled_methods, max_response_body_size),
@@ -299,6 +310,9 @@ impl RpcServer {
                 MAX_RPC_BATCH_REQUESTS,
                 max_response_body_size,
             ));
+
+        let service =
+            trusted_block::TrustedBlockHttpService::new(service, auth_cookie, trusted_submit);
 
         if let Some(tls) = conf.tls.clone() {
             let tls_config = load_tls_config(&tls)?;
@@ -445,8 +459,11 @@ fn stop_channel() -> (StopHandle, ServerHandle) {
 /// in-flight requests and close, like `jsonrpsee`'s server did when it stopped.
 async fn run_listener<S>(listener: TcpListener, service: S)
 where
-    S: tower::Service<Request<Incoming>, Response = Response<HttpBody>, Error = tower::BoxError>
-        + Clone
+    S: hyper::service::Service<
+            Request<Incoming>,
+            Response = Response<HttpBody>,
+            Error = tower::BoxError,
+        > + Clone
         + Send
         + 'static,
     S::Future: Send + 'static,
@@ -468,23 +485,22 @@ where
             continue;
         }
 
+        // Hyper calls this when it parses a request head, so the first request counts as
+        // received at that point rather than when its response future is first polled.
         let request_received = Arc::new(Notify::new());
         let service = {
             let request_received = request_received.clone();
             let service = service.clone();
-            tower::service_fn(move |request| {
+            hyper::service::service_fn(move |request| {
                 request_received.notify_one();
-                tower::ServiceExt::oneshot(service.clone(), request)
+                hyper::service::Service::call(&service, request)
             })
         };
 
         let stopped = stop_handle.clone().shutdown();
         tokio::spawn(async move {
             let builder = auto::Builder::new(TokioExecutor::new());
-            let connection = builder.serve_connection_with_upgrades(
-                TokioIo::new(socket),
-                TowerToHyperService::new(service),
-            );
+            let connection = builder.serve_connection_with_upgrades(TokioIo::new(socket), service);
             tokio::pin!(connection, stopped);
 
             let result = tokio::select! {
@@ -628,7 +644,7 @@ async fn serve_tls_connection<S, B>(
     header_read_timeout: Duration,
 ) -> Result<(), tower::BoxError>
 where
-    S: tower::Service<Request<Incoming>, Response = Response<B>> + Clone + Send + 'static,
+    S: hyper::service::Service<Request<Incoming>, Response = Response<B>> + Send + 'static,
     S::Future: Send,
     S::Error: Into<tower::BoxError>,
     B: Body<Data = Bytes> + Send + 'static,
@@ -637,7 +653,7 @@ where
     let connection = http1::Builder::new()
         .timer(TokioTimer::new())
         .header_read_timeout(header_read_timeout)
-        .serve_connection(TokioIo::new(stream), TowerToHyperService::new(service));
+        .serve_connection(TokioIo::new(stream), service);
     tokio::pin!(connection, stopped);
 
     tokio::select! {

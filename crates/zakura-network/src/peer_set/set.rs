@@ -2059,6 +2059,7 @@ where
             self.block_gossip_fanout.window(block.size),
             tokio::time::Instant::now() + self.block_gossip_fanout.delay(),
             push,
+            block.pending_send,
         )
     }
 

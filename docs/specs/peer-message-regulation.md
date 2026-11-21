@@ -275,27 +275,30 @@ MAX_DISCOVERY_RECORDS        = 32
 MAX_EXCLUDED_NODE_IDS        = 256
 MAX_SERVICE_SUMMARIES        = 8
 MAX_SERVICE_SUMMARY_BYTES    = 256
-NODE_RECORD_MAX              = 648 bytes
+MAX_NODE_KEYS                = 4
+NODE_RECORD_MAX              = 753 bytes
 SERVICE_ENVELOPE_MAX         = 294 bytes
 ```
 
 #### `Hello` — Announcement, discriminator 1
 
 - **Frame**
-  - payload cap = 648 bytes
+  - payload cap = 753 bytes
 - **Decode** — [`validate_record_body_bounds`][record-bounds], [`validate_service_id`][service-id]
   - addresses <= 8
   - services <= 8
   - service ID length = 1..=32 ASCII bytes
   - `protocol_min <= protocol_max`
-  - record body <= 580 bytes
+  - key list = 1..=4 entries of a `u16` tag and 32 bytes, tags nonzero and strictly increasing
+  - an Ed25519 entry (tag 1) holds a valid key; an entry with any other tag is kept as it is
+  - record body <= 685 bytes
   - exact consumption
 - **Verify** — [`ZakuraNodeRecord::verify`][record-verify], with time-varying import policy split
   from [`validate_record_body_for_import`][record-import]
-  - record signature
+  - record signature, by the Ed25519 key in the record's key list
   - network and chain IDs
   - protocol overlap
-  - record author == authenticated peer
+  - record author (the hash of its key list) == authenticated peer
 - **Cadence**
   - capacity = 42
   - refill = 1 message / 7 seconds
@@ -344,8 +347,8 @@ MUST send exactly one `Peers` response for every admitted request.
 #### `Peers` — Response, discriminator 3
 
 - **Frame**
-  - absolute payload cap = 20,738 bytes
-  - reservation payload cap = 2 + reserved_limit * 648 bytes
+  - absolute payload cap = 24,098 bytes
+  - reservation payload cap = 2 + reserved_limit * 753 bytes
 - **Decode** — [`validate_record_body_bounds`][record-bounds]
   - count = 0..=reserved_limit
   - records <= 32
@@ -365,6 +368,9 @@ MUST send exactly one `Peers` response for every admitted request.
 A malformed record, invalid signature, wrong network, or wrong chain MUST disconnect the relaying
 peer. The handler MUST discard an otherwise valid record whose protocol range does not overlap
 local support. A relaying peer can legitimately know nodes with different protocol compatibility.
+The handler MUST likewise discard, and MUST NOT disconnect the relaying peer for, a record whose
+key list is well formed but holds no key the handler can verify a signature with. A relay passes
+on key lists it cannot read, byte for byte, so such a record is never the relay's fault.
 Expiry MUST remain a handler policy check because a record can expire in transit.
 The handler MUST discard an otherwise valid record when local staleness, expiry,
 address, or storage policy rejects it. The handler MUST NOT store an address that is not globally

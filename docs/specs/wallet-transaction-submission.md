@@ -81,6 +81,14 @@ client's first QUIC Initial packet, before it starts the TLS handshake.
 
 The wallet MUST send a ClientHello that fits in one Initial packet.
 
+Open: a ClientHello that offers the hybrid key-exchange group
+X25519MLKEM768, as `zakura-quic`'s default provider does (`zakura-quic`
+spec TLS-9), spans two Initial packets, and rustls orders its extensions at
+random, so the ALPN list is in the first packet on some connections only. A
+wallet built on that provider can't meet the rule above and lands in rule 3.
+This draft must choose between a wallet that offers only classical groups
+and admission that waits for the whole ClientHello.
+
 Wallet sessions MUST NOT count toward peer connection limits
 (`DEFAULT_ZAKURA_MAX_CONNECTIONS`, `max_connections_per_ip`, or
 `ServicePeerLimits`). Peer connections MUST NOT use wallet slots.

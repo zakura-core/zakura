@@ -51,8 +51,8 @@ charges once TLS starts, and reports when the endpoint admitted a
 connection; it changes ADM-3 and API-4, and §17t lists each change. Version
 0.23 offers the hybrid key-exchange group X25519MLKEM768 ahead of ring's
 groups, so recorded traffic between two upgraded nodes stays secret from a
-later quantum computer; it changes DEP-2, TLS-9, ADM-1, API-3 and the OBS-1
-outcome counters, and adds §16 rows; §17u lists each change.
+later quantum computer; it changes DEP-2, TLS-9, ADM-1, API-3, SEC-1, SEC-2
+and the OBS-1 outcome counters, and adds §16 rows; §17u lists each change.
 
 ## 0. Conventions
 
@@ -1113,13 +1113,18 @@ this release tolerates, and keep each hard change explicit.
   - no signature verifying under a mixed-order key (ID-6);
   - small-order `R` points, `R` points with a torsion component, and
     non-canonical `S` scalars refused (ID-6);
-  - honest keys and signatures accepted.
+  - honest keys and signatures accepted;
+  - Project Wycheproof's ML-KEM-768 vectors for key generation,
+    encapsulation and decapsulation, including encapsulation keys that fail
+    the modulus check (TLS-9).
 - **SEC-2.** These handshakes MUST fail:
   - a dial that reaches a server with the wrong `NodeId`;
   - a client without a key;
   - TLS 1.2;
   - an X.509 certificate instead of a raw public key;
-  - a signature scheme other than Ed25519.
+  - a signature scheme other than Ed25519;
+  - an X25519MLKEM768 key share of the wrong length, or one whose ML-KEM
+    key fails the modulus check (TLS-9).
 - **SEC-3.** For a refused or ignored IP, no `Connecting` may exist. A test
   asserts that `quinn-proto` created no connection state.
 - **SEC-4.** A flood of Initials that never complete MUST stay bounded by
@@ -1702,8 +1707,12 @@ Changed:
   stays Ed25519: this protects recorded traffic, not a handshake that a
   quantum computer attacks live.
 - **DEP-2.** Adds `libcrux-ml-kem` with only its `mlkem768` feature. It is
-  Rust with no C, and it takes its randomness from the caller, so a
-  simulation seeds it like the X25519 secrets.
+  Rust with no C. Its build script also compiles its NEON code on aarch64
+  and its AVX2 code on x86_64, written with `unsafe` CPU intrinsics, and it
+  picks one at run time from the CPU's features. It takes its randomness
+  from the caller, so a simulation seeds it like the X25519 secrets.
+- **SEC-1, SEC-2.** Add the ML-KEM-768 known answers and the refused hybrid
+  key shares.
 - **ADM-1, API-3.** State what a two-datagram hello does. The dialer's hello
   now carries a 1,216-byte hybrid share next to its 32-byte X25519 share, so
   it no longer fits one 1,200-byte Initial datagram. Both datagrams leave in

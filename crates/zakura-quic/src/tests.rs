@@ -177,9 +177,10 @@ fn client() -> QuicEndpoint {
     QuicEndpoint::bind(NodeSecretKey::generate(), &loopback(), &test_config()).unwrap()
 }
 
-/// A handshake that never finishes: one client Initial sent from a socket
-/// nobody reads. The server's replies, including any Retry, go nowhere. This
-/// is what a spoofed source looks like to the server.
+/// A handshake that never finishes: a client's whole first flight, the
+/// hello in two Initial datagrams, sent from a socket nobody reads. The
+/// server's replies, including any Retry, go nowhere. This is what a spoofed
+/// source looks like to the server.
 struct StalledHandshake {
     _socket: std::net::UdpSocket,
 }
@@ -210,11 +211,16 @@ fn stalled_handshake_to(server: &QuicEndpoint) -> StalledHandshake {
             crate::tls::UNSENT_SERVER_NAME,
         )
         .unwrap();
-    let mut buf = Vec::new();
-    let transmit = conn
-        .poll_transmit(now, 1, &mut buf)
-        .expect("a new connection sends its Initial at once");
-    socket.send_to(&buf[..transmit.size], target).unwrap();
+    let mut sent = 0;
+    loop {
+        let mut buf = Vec::new();
+        let Some(transmit) = conn.poll_transmit(now, 1, &mut buf) else {
+            break;
+        };
+        socket.send_to(&buf[..transmit.size], target).unwrap();
+        sent += 1;
+    }
+    assert_eq!(sent, 2, "the hybrid hello spans two Initial datagrams");
     StalledHandshake { _socket: socket }
 }
 

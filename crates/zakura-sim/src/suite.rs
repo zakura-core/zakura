@@ -89,6 +89,11 @@ pub const SIM_FUZZ_PACKAGE: &str = "sim";
 /// What a command's `{evidence}` stands for.
 pub const EVIDENCE: &str = "{evidence}";
 
+/// The reason a planted bypass's witness row is excluded from a manifest
+/// built without the QA store, which holds the planted cases.
+pub const NO_STORE: &str =
+    "The QA store holds this planted case, and the manifest was built without one.";
+
 /// `qa/suite.toml`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
@@ -834,14 +839,28 @@ pub fn manifest_from(root: &Path, text: &str) -> Result<Manifest, Problems> {
 }
 
 /// The manifest of the checkout at `root`, with `suite` as its parsed
-/// `qa/suite.toml`, whose SHA-256 is `suite_sha256`.
+/// `qa/suite.toml`, whose SHA-256 is `suite_sha256`, and the planted cases
+/// and seeds of the QA store that [`planted::STORE_ENV`] names, if any.
 pub fn manifest_of(
     root: &Path,
     suite: &SuiteFile,
     suite_sha256: String,
 ) -> Result<Manifest, Problems> {
+    manifest_in(root, planted::store_root().as_deref(), suite, suite_sha256)
+}
+
+/// [`manifest_of`] with the planted cases of the QA store at `store`, or
+/// none without one. Without a store, the manifest has no planted rows, and
+/// a coverage row's planted bypass goes unchecked.
+pub fn manifest_in(
+    root: &Path,
+    store: Option<&Path>,
+    suite: &SuiteFile,
+    suite_sha256: String,
+) -> Result<Manifest, Problems> {
     let mut builder = Builder {
         root,
+        store,
         canonical_root: root.canonicalize().unwrap_or_else(|_| root.to_owned()),
         suite,
         problems: Vec::new(),
@@ -858,6 +877,8 @@ pub fn manifest_of(
 /// The state of one [`manifest_from`] call.
 struct Builder<'a> {
     root: &'a Path,
+    /// The QA store's local copy, which holds the planted cases.
+    store: Option<&'a Path>,
     /// `root` with symbolic links resolved, as `cargo metadata` reports
     /// paths.
     canonical_root: PathBuf,
@@ -1358,11 +1379,15 @@ impl Builder<'_> {
         relative(&self.canonical_root, &path)
     }
 
-    /// One row per property directory under `qa/planted/`, each running
-    /// its patches.
+    /// One row per property directory under the QA store's `qa/planted/`,
+    /// each running its patches, or none without a store.
     fn planted(&mut self) -> Vec<PlantedRow> {
         let mut by_property: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for file in files(self.root, PLANTED_DIR, "patch") {
+        let files = self
+            .store
+            .map(|store| files(store, PLANTED_DIR, "patch"))
+            .unwrap_or_default();
+        for file in files {
             let path = Path::new(&file);
             let property = planted::property_id(Path::new(PLANTED_DIR), path).unwrap_or_default();
             let name = path
@@ -1396,7 +1421,15 @@ impl Builder<'_> {
     /// One seed-set row per harness, one row per witness an admitted corpus
     /// seed carries, and the seed report. A rejected seed is a problem.
     fn seeds(&mut self) -> (Vec<SeedSetRow>, Vec<SeedWitnessRow>, seed::Report) {
-        let report = seed::load(SeedSet::Corpus, None);
+        let seeds = match self.store.map(seed::read) {
+            Some(Ok(seeds)) => seeds,
+            Some(Err(error)) => {
+                self.problem(format!("the QA store's seeds: {error}"));
+                Vec::new()
+            }
+            None => Vec::new(),
+        };
+        let report = seed::load_in(seeds, SeedSet::Corpus, None);
         for failed in &report.rejected {
             self.problem(format!(
                 "the seed {} fails validation: {}",
@@ -1423,12 +1456,6 @@ impl Builder<'_> {
         }
         let mut witnesses = Vec::new();
         for seed in &report.admitted {
-            if !self.root.join(&seed.source).exists() {
-                self.problem(format!(
-                    "the seed {} names the source `{}`, which doesn't exist",
-                    seed.name, seed.source
-                ));
-            }
             for witness in &seed.witness {
                 let id = self.id(format!("seed-witness/{}/{}", seed.name, witness.property));
                 let command = Build::SimPlanted.command(
@@ -1758,21 +1785,27 @@ impl Builder<'_> {
                         .iter()
                         .find(|case| case.property == row.property)
                         .filter(|case| case.patches.iter().any(|patch| patch == name));
-                    if case.is_none() {
+                    // Without a store, the manifest can't see the cases, so
+                    // the row is excluded with that reason.
+                    if case.is_none() && self.store.is_some() {
                         self.problem(format!(
                             "`{}`'s bypass is {PLANTED_DIR}/{}/{name}.patch, which doesn't exist",
                             row.property, row.property
                         ));
                     }
+                    let (expect, pending) = match self.store {
+                        Some(_) => (Expect::Pass, None),
+                        None => (Expect::Excluded, Some(NO_STORE)),
+                    };
                     WitnessRow {
                         id,
-                        expect: Expect::Pass,
+                        expect,
                         property: row.property.to_owned(),
                         role: "bypass",
                         test: None,
                         unreachable: None,
                         patch: Some(name),
-                        pending: None,
+                        pending,
                         decided_by: case.map(|case| case.id.clone()),
                     }
                 }
@@ -2744,6 +2777,7 @@ mod tests {
         let mut builder = Builder {
             root: Path::new("."),
             canonical_root: PathBuf::from("."),
+            store: None,
             suite: &suite,
             problems: Vec::new(),
             ids: BTreeSet::new(),

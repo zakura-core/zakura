@@ -1,8 +1,8 @@
 # The full property suite (campaign.md, C1): what the suite runs beyond the
 # harness registry. `cargo xtask sim-suite` joins this file with the
 # registered harnesses and their properties, the coverage manifest, the
-# planted cases under qa/planted/, the seed registry, the test and fuzz
-# targets `cargo metadata` reports and their sources, and fails if any of
+# QA store's planted cases and seeds when $ZAKURA_QA_STORE names one, the
+# test and fuzz targets `cargo metadata` reports and their sources, and fails if any of
 # them is missing here. A new harness, fuzz target or ignored test fails
 # the check until this file runs it, excludes it with a reason, or lists it
 # as missing.
@@ -117,19 +117,19 @@ timeout-secs = 1800
 file = "crates/zakura-sim/tests/header_wire_witness.rs"
 test = "regenerate_planted_scenarios"
 run = false
-reason = "a tool, not a test: it rewrites the committed planted scenarios from their builders"
+reason = "a tool, not a test: it rewrites the QA store's planted scenarios from their builders"
 
 [[ignored]]
 file = "crates/zakura-sim/tests/discovery_wire_planted.rs"
 test = "regenerate_planted_reader_scenarios"
 run = false
-reason = "a tool, not a test: it rewrites the planted cases' scenarios"
+reason = "a tool, not a test: it rewrites the QA store's planted scenarios"
 
 [[ignored]]
 file = "crates/zakura-sim/tests/discovery_wire_planted_guards.rs"
 test = "regenerate_planted_guard_scenarios"
 run = false
-reason = "a tool, not a test: it rewrites the planted cases' scenarios"
+reason = "a tool, not a test: it rewrites the QA store's planted scenarios"
 
 # Commands the package rows don't cover: the doc tests, and the release and
 # AddressSanitizer runs of the scheduler and runtime that CI's

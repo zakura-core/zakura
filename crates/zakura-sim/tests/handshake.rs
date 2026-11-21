@@ -8,17 +8,17 @@ use zakura_sim::{
         RecordInput, Subsystem,
     },
     peer::handshake::options::{ControlFault, HandshakeSpec},
-    seed,
     trace::{replay_with, ReplayOptions},
     NullSink, PlanInput, PropertyOutcome,
 };
 
+/// `handshake/counts`' op tape in which one host's connection moves
+/// through QUIC, control and registration.
+const OWNERS: [u8; 12] = [0, 0, 0, 2, 0, 0, 3, 0, 0, 5, 0, 0];
+
 #[test]
 fn counts_trace_replays_with_each_named_rule() {
-    let input = seed::find("handshake-counts-owners")
-        .expect("the seed is registered")
-        .input()
-        .to_vec();
+    let input = OWNERS.to_vec();
     (handshake_counts::ENTRY.witness)(
         &(handshake_counts::ENTRY.draw)(&input),
         PlanInput::Bytes(Vec::new()),
@@ -39,9 +39,12 @@ fn counts_trace_replays_with_each_named_rule() {
     replay_with(&trace, &handshake_counts::ENTRY, ReplayOptions::default()).unwrap();
 }
 
-/// The scenario the `handshake/wire` seed `name` runs.
-fn seeded(name: &str) -> Scenario {
-    Wire::draw(seed::find(name).expect("the seed is registered").input())
+/// The scenario `handshake/wire`'s decoder draws from `prefix`, zero-padded
+/// to its input length.
+fn drawn(prefix: &[u8]) -> Scenario {
+    let mut input = vec![0; Wire::SCENARIO_BYTES];
+    input[..prefix.len()].copy_from_slice(prefix);
+    Wire::draw(&input)
 }
 
 fn run(scenario: Scenario) -> zakura_sim::RunReport {
@@ -315,7 +318,7 @@ fn inbound_connection_pressure_preserves_a_wire_dial() {
 
 #[test]
 fn slow_control_steps_share_one_deadline() {
-    let scenario = seeded("handshake-slow-control");
+    let scenario = drawn(&[3, 0, 0xe1, 0xe1]);
     let entry = harness::find(Wire::NAME).unwrap();
     let report = (entry.run)(
         &serde_json::to_value(scenario).unwrap(),
@@ -548,7 +551,7 @@ fn installed_services_follow_each_peers_negotiation() {
 #[test]
 fn invalid_stream_churn_obeys_the_open_rate() {
     use zakura_sim::{observe::TransportFact, Observation};
-    let report = run(seeded("handshake-stream-churn"));
+    let report = run(drawn(&[8, 64]));
     assert_held(&report, "session/stream-opens-bounded");
     zakura_sim::witness::judge_report::<Wire>(
         &report,
@@ -764,7 +767,7 @@ fn complete_session_transfers_setup_to_installed_owners() {
 
 #[test]
 fn fast_fail_handshakes_exhaust_the_address_cadence() {
-    let report = run(seeded("handshake-cadence-burst"));
+    let report = run(drawn(&[5, 31, 0, 1, 1]));
     for id in [
         "handshake/attempts-within-cadence",
         "handshake/cadence-never-refuses-conformant",
@@ -797,7 +800,7 @@ fn fast_fail_handshakes_exhaust_the_address_cadence() {
 
 #[test]
 fn sixteen_conformant_dialers_share_an_address_cadence() {
-    let report = run(seeded("handshake-cadence-conformant"));
+    let report = run(drawn(&[5, 1, 0, 1, 3, 15, 15]));
     assert_held(&report, "handshake/cadence-never-refuses-conformant");
     zakura_sim::witness::judge_report::<Wire>(
         &report,

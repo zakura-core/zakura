@@ -614,12 +614,9 @@ fn a_harness_failure_keeps_its_active_violation() {
 }
 
 #[test]
-fn seed_input_records_and_classifies() {
+fn built_input_records_and_classifies() {
     let discovery = harness::find("discovery/wait-complete").unwrap();
-    let input = zakura_sim::seed::find("discovery-wait-complete")
-        .expect("the seed is registered")
-        .input()
-        .to_vec();
+    let input = support::discovery_inputs::wait_complete_input();
     let mut sink = MemorySink::default();
     let recorded = (discovery.run_bytes)(&input, &mut sink, None);
     assert_eq!(

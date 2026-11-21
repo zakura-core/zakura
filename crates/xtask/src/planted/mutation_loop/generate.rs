@@ -125,11 +125,11 @@ const DEFAULT_SECONDS: u64 = 600;
 /// the repository root.
 const FUZZ_DIR: &str = "qa/fuzz/sim";
 
-/// True if `changed`, paths relative to the repository root, holds one
-/// whose change can change any case's generator lanes under `flags`: the
-/// work list, whose `[[no-generator]]` records decide which cases get a
-/// lane, then the seed registry's source, whose inputs an `inproc` search
-/// skips ([`write_exclusions`]), or a file under [`FUZZ_DIR`], whose
+/// True if `changed`, paths relative to the repository's or the QA store's
+/// root, holds one whose change can change any case's generator lanes under
+/// `flags`: the store's work list, whose `[[no-generator]]` records decide
+/// which cases get a lane, then the store's seeds, whose inputs an `inproc`
+/// search skips ([`write_exclusions`]), or a file under [`FUZZ_DIR`], whose
 /// targets a `libfuzzer` lane builds. False with the lanes off, so a
 /// triage-only commit selects no case.
 pub(super) fn affected(flags: &GenerateFlags, changed: &[PathBuf]) -> bool {
@@ -1209,9 +1209,9 @@ pub(super) fn plan(
         .collect()
 }
 
-/// The work list's `[[no-generator]]` records in `tree`: each property's
-/// reason.
-pub(super) fn no_generator(tree: &Path) -> Result<BTreeMap<String, String>, BoxError> {
+/// The `[[no-generator]]` records in the QA store `store`'s work list: each
+/// property's reason.
+pub(super) fn no_generator(store: &Path) -> Result<BTreeMap<String, String>, BoxError> {
     #[derive(Deserialize)]
     struct List {
         #[serde(default, rename = "no-generator")]
@@ -1222,7 +1222,7 @@ pub(super) fn no_generator(tree: &Path) -> Result<BTreeMap<String, String>, BoxE
         reason: String,
         properties: Vec<String>,
     }
-    let list: List = toml::from_str(&fs::read_to_string(tree.join(WORK_LIST))?)?;
+    let list: List = toml::from_str(&fs::read_to_string(store.join(WORK_LIST))?)?;
     Ok(list
         .no_generator
         .into_iter()
@@ -1380,7 +1380,7 @@ impl Runner {
             cases,
             runnables,
             &generator_map(sim)?,
-            &no_generator(&slot.tree)?,
+            &no_generator(&self.store)?,
             flags.harness.as_deref(),
             libfuzzer.then_some(&targets),
         );

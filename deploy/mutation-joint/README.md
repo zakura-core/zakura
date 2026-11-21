@@ -4,20 +4,31 @@ The droplet timer for mutation plan mut-4.6 and run-2 to run-4. Once a day it
 runs `scripts/mutation_joint_run.py routine`, which, in order:
 
 1. fetches `origin/main` into its own checkout and detaches it there;
-2. `suite-manifest`: writes the frozen suite manifest, `suite-manifest.json`,
+2. `qa-store-pull`: mirrors the QA store's Space into `--store`
+   (`<state>/qa-store` by default) with `scripts/qa_store.py pull`. See
+   [QA store](#qa-store);
+3. `suite-manifest`: writes the frozen suite manifest, `suite-manifest.json`,
    with `cargo xtask sim-suite --frozen`;
-3. `suite`: runs the full planted sim suite (`cargo test -p zakura-sim
+4. `suite`: runs the full planted sim suite (`cargo test -p zakura-sim
    --profile planted`);
-4. `loop`: runs `cargo xtask planted loop` with generator lanes on the cases
-   a change since the last pin affects, or on every case the first time;
-5. `libfuzzer`: with `--libfuzzer-seconds`, runs the libFuzzer lane on the
+5. `planted`, `planted-targets` and `sim-targets`: with `--planted-shards
+   <n>`, runs the day's shard of the planted cases with `cargo xtask planted
+   --shard`, so each case runs once every `n` days. `--planted-targets` also
+   confirms the shard through its fuzz targets. `--sim-targets` checks each
+   fuzz target on the store's seeds with `cargo xtask sim-targets`. These
+   steps replaced the nightly `sim-planted`, `sim-planted-targets` and
+   `sim-targets` CI jobs, which had no store to read;
+6. `loop`: runs `cargo xtask planted loop` with generator lanes on the cases
+   a change since the last pin affects, in the repository or the store, or
+   on every case the first time;
+7. `libfuzzer`: with `--libfuzzer-seconds`, runs the libFuzzer lane on the
    same cases;
-6. `suite-fuzz` and `archive`: with `--suite-fuzz` or `--fuzz-seconds`, runs
+8. `suite-fuzz` and `archive`: with `--suite-fuzz` or `--fuzz-seconds`, runs
    `scripts/suite_fuzz_run.py run` (run-3), then `scripts/suite_fuzz_run.py
    archive` (run-4). See [Suite fuzz](#suite-fuzz);
-7. `cases`: lists the loop's cases at the checkout with `cargo xtask planted
+9. `cases`: lists the loop's cases at the checkout with `cargo xtask planted
    loop --list`;
-8. `triage-<lane>`: merges each new report into its cumulative report.
+10. `triage-<lane>`: merges each new report into its cumulative report.
    `<state>/cumulative.json` holds every case's latest generator-lane result,
    every property finding so far and each generator search's latest baseline
    failure, and `<state>/cumulative-libfuzzer.json` holds the libFuzzer
@@ -27,12 +38,12 @@ runs `scripts/mutation_joint_run.py routine`, which, in order:
    listed, so a removed case, or one a witness change re-keyed, leaves it,
    and the diff lists it under `removed_cases`. The step then runs `cargo
    xtask planted triage` on the cumulative report, which applies the
-   checkout's `qa/native-mutations/triage.toml` afresh. A triage-only commit
+   store's `qa/native-mutations/triage.toml` afresh. A triage-only commit
    selects no case, so this step is what records its triage. Last, the
    routine diffs each new report against the previous cumulative report into
    `joint-diff.json`, with the cumulative report's untriaged lanes, and
    writes every lane's diff to `findings.json`;
-9. `completeness`: runs `scripts/suite_fuzz_run.py completeness` (run-4),
+11. `completeness`: runs `scripts/suite_fuzz_run.py completeness` (run-4),
    which writes `completeness.json`.
 
 Each run writes under `<state>/runs/<UTC time>-<commit>/`: one log per step,
@@ -44,8 +55,34 @@ succeeds, so the next run covers a failed run's changes again. Before it has
 one, the lane uses the loop's pin. The unit fails when a step fails or when
 either diff lists a new survivor, a newly failing baseline, a new property
 finding or a new generator baseline failure. `untriaged` in the diff lists
-the cumulative report's lanes that still need a record in
+the cumulative report's lanes that still need a record in the store's
 `qa/native-mutations/triage.toml`.
+
+## QA store
+
+The repository holds no test artifact. The planted cases, the native
+mutations and their triage, the scenario fixtures and the seeds live in the
+DigitalOcean Space `zakura-sim-corpus` (nyc3). The QA store is a local mirror
+of it, and every tool reads it through `ZAKURA_QA_STORE`.
+`scripts/qa_store.py` documents its layout.
+
+The routine's first step pulls the Space and writes the store's manifest,
+`qa-store-manifest.json`, into the run's directory. Each pin records its
+run's manifest. The routine diffs the new manifest against each lane's pin
+and passes the changed paths to the loop's `--store-changed`, so a changed
+case or seed reruns as a changed commit would. A pin without a manifest
+counts every store path as changed. A failed pull ends the run before any
+other step, and no pin advances.
+
+The pull reads the bucket, endpoint and bucket-scoped key from
+`/etc/zakura-mutation-joint.env`. To add or change a case, edit a pulled
+store and push it:
+
+```sh
+python3 scripts/qa_store.py --env-file /etc/zakura-mutation-joint.env pull --dest ~/qa-store
+# edit ~/qa-store/qa/planted/...
+python3 scripts/qa_store.py --env-file /etc/zakura-mutation-joint.env push --src ~/qa-store
+```
 
 ## Suite fuzz
 
@@ -64,7 +101,7 @@ later run resumes it if the build has the last run's identity and the
 harness's versions didn't change, as the campaign tool requires. Otherwise,
 such as after a new commit or a new generator, it starts a new segment after
 the last run. The segment carries the last snapshot only if both builds are
-clean and the harness's versions match, and else starts from the curated
+clean and the harness's versions match, and else starts from the store's
 seeds. `run` then runs `sim-campaign verify` and `sim-campaign evidence`,
 and writes `suite-fuzz.json`. `sim-campaign build` builds only qa/fuzz/sim's
 targets, so `suite-fuzz.json` lists each p2p and header-chain target as not

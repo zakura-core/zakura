@@ -1,3 +1,0 @@
-# Bypass the generation check after registration publishes the connection.
-seed = "handshake-capability-before"
-checks = ["crates/zakura-network/src/zakura/handler.rs", "crates/zakura-sim/src/harness/handshake_wire.rs"]

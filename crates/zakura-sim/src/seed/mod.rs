@@ -1,49 +1,52 @@
-//! Curated fuzz seeds, built in code (explorer implementation plan, E3a-1).
+//! Curated fuzz seeds, read from the QA store.
 //!
-//! Each seed is a full fuzz input (the harness's scenario prefix, then the
-//! Plan bytes) that a function in this module builds from typed fields,
-//! a saved scenario's tag, or a fixed draw from [`draws::byte_inputs`]. No
-//! seed is committed as bytes: `zakura-sim seeds --out` writes the corpus
-//! when a fuzz campaign needs it, and `zakura-sim record --seed` runs one
-//! seed by name.
+//! A seed is a full fuzz input (the harness's scenario prefix, then the
+//! Plan bytes) with a name, its harness, its set and its witnesses. Seeds
+//! are test artifacts, so they live outside the repository, in the
+//! `zakura-sim-corpus` Space. `scripts/qa_store.py pull` copies the Space to
+//! a local directory, and [`crate::planted::STORE_ENV`] names it. The store
+//! holds `seeds/index.json`, one row per seed, and `seeds/<name>.bin`, each
+//! seed's input. Without a store there are no seeds, so a repository test
+//! never reads one.
 //!
 //! A seed belongs to one [`SeedSet`]. The [corpus](SeedSet::Corpus) is the
 //! set fuzz campaigns, target checks and `zakura-sim seeds --out` start
 //! from, so each of its seeds runs as an input that passes. A seed that
 //! fails by design sits in [`SeedSet::KnownFailure`], and one that runs too
-//! long for a fuzz input sits in [`SeedSet::Slow`]. Only its own test runs
-//! such a seed.
+//! long for a fuzz input sits in [`SeedSet::Slow`].
 //!
-//! [`load`] admits a seed only if its harness is registered, the harness
-//! accepts its input, the decoded scenario round-trips through the
-//! harness's scenario type, it names the test that runs it, each witness
-//! names a property the harness registers, and its witnesses fit its set.
-//! A seed that fails is rejected, and the report gives the reason.
+//! [`load`] admits a seed only if its input is the one its row names, its
+//! harness is registered, the harness accepts its input, the decoded
+//! scenario round-trips through the harness's scenario type, it names the
+//! test it came from, each witness names a property the harness registers,
+//! and its witnesses fit its set. A seed that fails is rejected, and the
+//! report gives the reason.
 
-mod block;
-mod discovery;
 pub mod draws;
-mod handshake;
-mod header;
-mod race;
-mod sync;
 
 use std::{
     collections::BTreeSet,
-    fmt,
+    fmt, fs,
     path::{Path, PathBuf},
 };
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::{
     harness::{self, HarnessEntry},
+    planted,
     record::{CONTRACT_VERSION, FORMAT_VERSION},
     trace::meta::hex,
     witness::Expect,
 };
+
+/// The store's seed directory, relative to the store's root.
+pub const SEEDS_DIR: &str = "seeds";
+
+/// The seed index, relative to [`SEEDS_DIR`].
+pub const INDEX_FILE: &str = "index.json";
 
 /// The versions that fix what `entry`'s fuzz input means, as `KEY=VALUE`
 /// pairs in a stable order: the harness, its generator, its scenario prefix
@@ -60,7 +63,7 @@ pub fn versions(entry: &HarnessEntry) -> Vec<(&'static str, String)> {
 }
 
 /// Which runs use a seed.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SeedSet {
     /// The seed corpus: fuzz campaigns and target checks start from it, so
@@ -88,7 +91,7 @@ impl SeedSet {
 
 /// A property witness a seed carries: the witness test of `property` on the
 /// seed expects `expect`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SeedWitness {
     /// The property's ID. The harness must register it.
     pub property: String,
@@ -97,8 +100,8 @@ pub struct SeedWitness {
     pub expect: String,
 }
 
-/// One seed: its name, the harness that runs it, its set, the test that
-/// runs it, its witnesses and its full fuzz input.
+/// One seed: its name, the harness that runs it, its set, the test it came
+/// from, its witnesses and its full fuzz input.
 #[derive(Clone, Debug, Serialize)]
 pub struct Seed {
     /// The seed's name, unique across every set.
@@ -107,29 +110,23 @@ pub struct Seed {
     pub harness: String,
     /// The runs that use the seed.
     pub set: SeedSet,
-    /// The test that runs the seed, as a path from the repository's root.
+    /// The test the seed came from, as a path from the repository's root.
     pub source: String,
     /// The property witnesses the seed carries.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub witness: Vec<SeedWitness>,
-    /// The full fuzz input, or the builder that makes it.
+    /// The full fuzz input: the scenario prefix, then the Plan bytes.
     #[serde(skip)]
-    input: Input,
-}
-
-/// A seed's full fuzz input: the scenario prefix, then the Plan bytes.
-#[derive(Clone, Debug)]
-enum Input {
-    /// Bytes built with the seed.
-    Bytes(Vec<u8>),
-    /// A builder that takes seconds, so it runs only when a caller reads
-    /// the input, and keeps its bytes for the rest of the process.
-    Built(fn() -> &'static [u8]),
+    input: Vec<u8>,
+    /// The input's SHA-256 that the store's index names, if this seed came
+    /// from a store.
+    #[serde(skip)]
+    indexed_sha256: Option<String>,
 }
 
 impl Seed {
-    /// A corpus seed named `name` for `harness` with no witnesses, run by
-    /// the test at `source`.
+    /// A corpus seed named `name` for `harness` with no witnesses, from the
+    /// test at `source`.
     pub fn new(name: impl Into<String>, harness: &str, source: &str, input: Vec<u8>) -> Seed {
         Seed {
             name: name.into(),
@@ -137,31 +134,14 @@ impl Seed {
             set: SeedSet::Corpus,
             source: source.to_owned(),
             witness: Vec::new(),
-            input: Input::Bytes(input),
-        }
-    }
-
-    /// [`Seed::new`] with an input that `build` makes the first time a
-    /// caller reads it, for a builder slow enough that loading another
-    /// harness's seeds shouldn't wait for it.
-    pub fn built(
-        name: impl Into<String>,
-        harness: &str,
-        source: &str,
-        build: fn() -> &'static [u8],
-    ) -> Seed {
-        Seed {
-            input: Input::Built(build),
-            ..Seed::new(name, harness, source, Vec::new())
+            input,
+            indexed_sha256: None,
         }
     }
 
     /// The full fuzz input: the scenario prefix, then the Plan bytes.
     pub fn input(&self) -> &[u8] {
-        match &self.input {
-            Input::Bytes(bytes) => bytes,
-            Input::Built(build) => build(),
-        }
+        &self.input
     }
 
     /// The seed in `set`.
@@ -192,21 +172,117 @@ impl Seed {
     }
 }
 
-/// Every seed, in every set, sorted by name.
-pub fn all() -> Vec<Seed> {
-    let mut seeds: Vec<Seed> = [
-        block::seeds(),
-        discovery::seeds(),
-        handshake::seeds(),
-        header::seeds(),
-        race::seeds(),
-        sync::seeds(),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
+/// One row of the store's seed index: a [`Seed`] without its input.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IndexRow {
+    /// [`Seed::name`].
+    pub name: String,
+    /// [`Seed::harness`].
+    pub harness: String,
+    /// [`Seed::set`].
+    pub set: SeedSet,
+    /// [`Seed::source`].
+    pub source: String,
+    /// [`Seed::witness`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub witness: Vec<SeedWitness>,
+    /// The SHA-256 of the input in `<name>.bin`.
+    pub input_sha256: String,
+}
+
+/// The store's seed index, `seeds/index.json`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Index {
+    /// Every seed, by name.
+    pub seeds: Vec<IndexRow>,
+}
+
+impl Index {
+    /// The index row of `seed`.
+    pub fn row(seed: &Seed) -> IndexRow {
+        IndexRow {
+            name: seed.name.clone(),
+            harness: seed.harness.clone(),
+            set: seed.set,
+            source: seed.source.clone(),
+            witness: seed.witness.clone(),
+            input_sha256: seed.input_sha256(),
+        }
+    }
+
+    /// Writes `seeds` as a store's seed directory under `store`: the index
+    /// and each seed's input. Tests use it to build a store in a temporary
+    /// directory.
+    pub fn write(store: &Path, seeds: &[Seed]) -> std::io::Result<()> {
+        let dir = store.join(SEEDS_DIR);
+        fs::create_dir_all(&dir)?;
+        for seed in seeds {
+            fs::write(dir.join(format!("{}.bin", seed.name)), seed.input())?;
+        }
+        let index = Index {
+            seeds: seeds.iter().map(Index::row).collect(),
+        };
+        let json = serde_json::to_string_pretty(&index).map_err(std::io::Error::other)?;
+        fs::write(dir.join(INDEX_FILE), format!("{json}\n"))
+    }
+}
+
+/// Every seed in the store at `store`, sorted by name. Fails if the index
+/// or a seed's input can't be read.
+pub fn read(store: &Path) -> Result<Vec<Seed>, String> {
+    let dir = store.join(SEEDS_DIR);
+    let index_path = dir.join(INDEX_FILE);
+    let text = fs::read_to_string(&index_path)
+        .map_err(|error| format!("{}: {error}", index_path.display()))?;
+    let index: Index = serde_json::from_str(&text)
+        .map_err(|error| format!("{}: {error}", index_path.display()))?;
+    let mut seeds = index
+        .seeds
+        .into_iter()
+        .map(|row| {
+            if !is_plain_name(&row.name) {
+                return Err(format!(
+                    "{}: `{}` isn't a plain file name",
+                    index_path.display(),
+                    row.name
+                ));
+            }
+            let path = dir.join(format!("{}.bin", row.name));
+            let input = fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+            Ok(Seed {
+                name: row.name,
+                harness: row.harness,
+                set: row.set,
+                source: row.source,
+                witness: row.witness,
+                input,
+                indexed_sha256: Some(row.input_sha256),
+            })
+        })
+        .collect::<Result<Vec<Seed>, String>>()?;
     seeds.sort_by(|a, b| a.name.cmp(&b.name));
-    seeds
+    Ok(seeds)
+}
+
+/// True if `name` names a file in the seed directory: not empty, no path
+/// separator, and not `.` or `..`.
+fn is_plain_name(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\'])
+}
+
+/// Every seed in the store that [`planted::STORE_ENV`] names, in every
+/// set, sorted by name, or none without a store.
+///
+/// # Panics
+///
+/// If the store is named but its seeds can't be read.
+pub fn all() -> Vec<Seed> {
+    match planted::store_root() {
+        Some(store) => read(&store).unwrap_or_else(|error| panic!("the QA store's seeds: {error}")),
+        None => Vec::new(),
+    }
 }
 
 /// The seed named `name`, in any set.
@@ -219,6 +295,14 @@ pub fn find(name: &str) -> Option<Seed> {
 pub enum SeedError {
     /// Another seed has the same name.
     DuplicateName,
+    /// The seed's input isn't the one the store's index names: the index
+    /// names `indexed`, and the input's SHA-256 is `actual`.
+    InputChanged {
+        /// The SHA-256 the index names.
+        indexed: String,
+        /// The input's SHA-256.
+        actual: String,
+    },
     /// The seed names no registered harness.
     UnknownHarness(String),
     /// The seed's prefix is for another generator than the harness's, so the
@@ -243,6 +327,10 @@ impl fmt::Display for SeedError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             SeedError::DuplicateName => write!(f, "another seed has the same name"),
+            SeedError::InputChanged { indexed, actual } => write!(
+                f,
+                "the index names input sha256 {indexed}, and the input's is {actual}"
+            ),
             SeedError::UnknownHarness(name) => write!(f, "no harness is named `{name}`"),
             SeedError::OtherGenerator => write!(
                 f,
@@ -298,14 +386,18 @@ pub struct SeedReport {
     pub other_harnesses: usize,
 }
 
-/// Builds and validates every seed in `set`. With `harness`, it validates
-/// only that harness's seeds and counts the rest in
+/// Reads and validates every seed in `set` from the store ([`all`]). With
+/// `harness`, it validates only that harness's seeds and counts the rest in
 /// [`SeedReport::other_harnesses`]. A seed that names no registered harness
 /// is rejected whatever `harness` is, since a misspelled name could be
 /// `harness`.
 pub fn load(set: SeedSet, harness: Option<&str>) -> SeedReport {
+    load_in(all(), set, harness)
+}
+
+/// [`load`] on `seeds` instead of the store's.
+pub fn load_in(seeds: Vec<Seed>, set: SeedSet, harness: Option<&str>) -> SeedReport {
     let mut report = SeedReport::default();
-    let seeds = all();
     let mut names = BTreeSet::new();
     let duplicates: BTreeSet<&str> = seeds
         .iter()
@@ -402,11 +494,20 @@ pub fn from_root(path: &Path) -> PathBuf {
         .unwrap_or_else(|| path.to_owned())
 }
 
-/// Checks `seed` on its own: its harness is registered and accepts its
-/// input, the decoded scenario round-trips, it names its source, and its
+/// Checks `seed` on its own: its input is the one its index row names, its
+/// harness is registered and accepts its input, the decoded scenario round-trips, it names its source, and its
 /// witnesses are registered, unique and fit its set. [`load`] also checks
 /// that no other seed has its name.
 pub fn check(seed: &Seed) -> Result<(), SeedError> {
+    if let Some(indexed) = &seed.indexed_sha256 {
+        let actual = seed.input_sha256();
+        if *indexed != actual {
+            return Err(SeedError::InputChanged {
+                indexed: indexed.clone(),
+                actual,
+            });
+        }
+    }
     let entry = harness::find(&seed.harness)
         .map_err(|_| SeedError::UnknownHarness(seed.harness.clone()))?;
     if !entry.accepts_input(seed.input()) {

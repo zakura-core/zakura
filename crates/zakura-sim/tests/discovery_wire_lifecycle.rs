@@ -1,4 +1,4 @@
-//! disc-2.3: `discovery/wire`'s saved Plans. Each Plan's seed runs clean
+//! disc-2.3: `discovery/wire`'s saved Plans. Each Plan's input runs clean
 //! and shows the history its scenario exists for: a
 //! completed exchange, a timed-out one, verification on `discovery_verify`
 //! tasks, a dial of a static candidate, and a late answer (disc-3.4). A
@@ -7,6 +7,8 @@
 //! through `zakura-sim replay`. A history a test needs that never happened fails
 //! it: a missing observation is a harness failure, never evidence.
 #![cfg(zakura_sim)]
+
+mod support;
 
 use std::{
     collections::BTreeMap,
@@ -32,7 +34,7 @@ use zakura_sim::{
     },
     observe::TransportFact,
     peer::{discovery::relayed_node, peer_addr},
-    seed, MemorySink, Observation, Outcome, Plan, PropertyOutcome, RunReport,
+    MemorySink, Observation, Outcome, Plan, PropertyOutcome, RunReport,
 };
 
 /// Runs `scenario` under the Plan `plan`, and returns the report, even of a
@@ -56,13 +58,20 @@ fn run(scenario: &WireScenario, plan: &[u8]) -> (RunReport, Vec<String>, NodeHan
     (report, sink.lines(), node)
 }
 
-/// Runs saved Plan `plan`'s seed as `zakura-sim record --seed` does: its
+/// Saved Plan `plan`'s full input: its tag, then the Plan. Only the late
+/// response needs Plan bytes, which a steered search builds
+/// ([`support::discovery_inputs::late_response_input`]).
+fn input(plan: SavedPlan) -> Vec<u8> {
+    match plan {
+        SavedPlan::LateResponse => support::discovery_inputs::late_response_input(),
+        plan => plan.tag().to_vec(),
+    }
+}
+
+/// Runs saved Plan `plan`'s input as `zakura-sim record --input` does: its
 /// prefix picks the scenario, and the rest is the Plan.
 fn replay(plan: SavedPlan) -> (RunReport, Vec<String>, NodeHandle) {
-    let input = seed::find(&format!("discovery-wire-{}", plan.name()))
-        .expect("each saved Plan has a seed")
-        .input()
-        .to_vec();
+    let input = input(plan);
     let (prefix, plan) = input.split_at(DiscoveryWire::SCENARIO_BYTES.min(input.len()));
     run(&DiscoveryWire::draw(prefix), plan)
 }
@@ -315,7 +324,7 @@ fn assert_applied(plan: SavedPlan, report: &RunReport) {
     assert!(expected.is_empty(), "{name}: never applied {expected:?}");
 }
 
-/// Each saved Plan's seed, `discovery-wire-<name>`, runs to its budget, and
+/// Each saved Plan's input runs to its budget, and
 /// its prefix picks the saved scenario. No run fails, violates a property
 /// or applies one its history doesn't ([`assert_applied`]), and each shows
 /// its history:
@@ -500,7 +509,7 @@ fn trace_end(dir: &Path) -> String {
     trace.lines().last().unwrap().to_owned()
 }
 
-/// `zakura-sim record --seed` runs each saved Plan's seed in a fresh
+/// `zakura-sim record --input` runs each saved Plan's input in a fresh
 /// process to the end record an in-process run writes, and `zakura-sim
 /// replay` reruns its trace Exact in another.
 #[test]
@@ -509,8 +518,17 @@ fn saved_plans_replay_exact_in_a_fresh_process() {
         let name = plan.name();
         let dir = TempDir::new().unwrap();
         let trace = dir.path().join("trace");
-        let seed = format!("discovery-wire-{name}");
-        let recorded = zakura_sim(&["record", "--seed", &seed, "--out", trace.to_str().unwrap()]);
+        let file = dir.path().join("input");
+        fs::write(&file, input(plan)).unwrap();
+        let recorded = zakura_sim(&[
+            "record",
+            "--sim",
+            DiscoveryWire::NAME,
+            "--input",
+            file.to_str().unwrap(),
+            "--out",
+            trace.to_str().unwrap(),
+        ]);
         assert!(recorded.status.success(), "{name}: {recorded:?}");
         assert_eq!(trace_end(&trace), end(&replay(plan).1), "{name}");
         let replayed = zakura_sim(&["replay", trace.to_str().unwrap()]);

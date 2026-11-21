@@ -6,8 +6,9 @@
 
 mod support;
 
-use std::{io::Write, path::Path, process::Command};
+use std::{io::Write, path::Path, process::Command, sync::OnceLock};
 
+use support::header_inputs;
 use tempfile::TempDir;
 use zakura_sim::{
     domain::header_sync::WATCH_OBSERVED_UNDER_LIFECYCLE_FLOOD,
@@ -17,28 +18,38 @@ use zakura_sim::{
         header_sync::{Flood, FloodScenario},
         record, run_prepared, RecordInput, Subsystem,
     },
-    seed,
     trace::{replay_with, ReplayOptions, TraceReader},
     witness::Expect,
     MemorySink, NullSink, Outcome, Plan, PlanInput, PropertyOutcome, RunReport,
 };
 
-/// The seed's name, `header-flood-lifecycle` in `zakura_sim::seed`:
-/// [`FloodScenario::Lifecycle`]'s scenario byte, then Plan bytes. The
-/// lifecycle queue delivers an event after its commit and before the watch
-/// read, and the reverted reactor breaks the rule while a churn connect
-/// still adopts the published state before the third lifecycle event.
-/// `cargo xtask planted header-sync/watch-observed-under-lifecycle-flood`
-/// checks that reverting #1566's top-of-turn watch check violates the rule
-/// on it.
-const SEED: &str = "header-flood-lifecycle";
+/// How many Plans [`seed_input`]'s search draws.
+const SEARCH_PLANS: usize = 16;
 
-/// The seed's input.
+/// The longest Plan [`seed_input`]'s search draws.
+const SEARCH_PLAN_BYTES: usize = 256;
+
+/// [`FloodScenario::Lifecycle`]'s scenario byte, then the first of
+/// [`SEARCH_PLANS`] Plans whose run reaches the lifecycle watch property's
+/// trigger history and holds it: the lifecycle queue delivers an event after
+/// its commit and before the watch read. On that order, reverting #1566's
+/// top-of-turn watch check breaks the rule. Not every Plan's queue competes
+/// with the watch read, so the search skips the ones that don't. The process
+/// keeps the found input.
 fn seed_input() -> Vec<u8> {
-    seed::find(SEED)
-        .unwrap_or_else(|| panic!("{SEED} is registered"))
-        .input()
-        .to_vec()
+    static FOUND: OnceLock<Vec<u8>> = OnceLock::new();
+    FOUND
+        .get_or_init(|| {
+            let entry = harness::find(Flood::NAME).expect("the harness is registered");
+            header_inputs::first(
+                "header-flood-lifecycle",
+                support::byte_inputs(SEARCH_PLANS, SEARCH_PLAN_BYTES)
+                    .into_iter()
+                    .map(|plan| [&[1][..], &plan].concat()),
+                |input| header_inputs::holds(entry, input, &[WATCH_OBSERVED_UNDER_LIFECYCLE_FLOOD]),
+            )
+        })
+        .clone()
 }
 
 /// `input`'s Plan, after its scenario byte.
@@ -61,7 +72,7 @@ fn run(scenario: FloodScenario, input: PlanInput) -> (RunReport, PropertyOutcome
     (report, outcome)
 }
 
-/// The seed holds its property through the registered harness and reaches
+/// The searched input holds its property through the registered harness and reaches
 /// its trigger history: the lifecycle queue delivered an event after the
 /// commit and before the watch read.
 #[test]
@@ -81,7 +92,7 @@ fn the_flood_seed_holds_its_watch_rule() {
 
 /// The lifecycle watch property holds under every plan in both fixtures.
 /// Not every plan's queue competes with the commit's watch read, which is
-/// why the seed's Plan is fixed.
+/// why the witness searches for its Plan.
 #[test]
 fn the_flood_fixtures_hold_the_watch_rule_under_every_plan() {
     for scenario in [FloodScenario::Wire, FloodScenario::Lifecycle] {
@@ -109,8 +120,8 @@ fn the_scenario_byte_picks_the_flood_fixture() {
     }
 }
 
-/// The run's log and the watch outcome depend only on the plan: the seed's
-/// plan A twice, then B, then A again, gives A's every time, and B's log
+/// The run's log and the watch outcome depend only on the plan: the searched
+/// input's plan A twice, then B, then A again, gives A's every time, and B's log
 /// differs.
 #[test]
 fn flood_runs_repeat_a_a_and_a_b_a() {
@@ -131,11 +142,11 @@ fn flood_runs_repeat_a_a_and_a_b_a() {
     assert_ne!(runs[0].0, runs[2].0, "plan B's log differs");
 }
 
-/// Set, to a directory holding the seed's recorded trace, in the child
+/// Set, to a directory holding the searched input's recorded trace, in the child
 /// process that [`the_flood_witness_replays_in_a_fresh_process`] starts.
 const CHILD: &str = "ZAKURA_SIM_FLOOD_TRACE";
 
-/// The seed, recorded in this process, replays exactly in a fresh process
+/// The searched input, recorded in this process, replays exactly in a fresh process
 /// of the same test binary, where its run gives the same watch outcome.
 #[test]
 fn the_flood_witness_replays_in_a_fresh_process() {
@@ -175,7 +186,7 @@ fn the_flood_witness_replays_in_a_fresh_process() {
     assert_eq!(replayed, format!("{outcome:?}"));
 }
 
-/// The seed draws the lifecycle fixture, and runs through the registered
+/// The searched input draws the lifecycle fixture, and runs through the registered
 /// harness to a defined end that the explorer classifies clean.
 #[test]
 fn the_flood_seed_draws_its_fixture_and_runs_clean() {

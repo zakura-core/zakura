@@ -14,7 +14,7 @@
 
 mod support;
 
-use std::{cell::RefCell, fs, path::PathBuf, process::Command, rc::Rc};
+use std::{cell::RefCell, fs, process::Command, rc::Rc};
 
 use support::{byte_inputs, inputs};
 use zakura_chain::block;
@@ -197,32 +197,34 @@ fn the_recovery_control_holds_at_its_recovered_pick() {
 
 /// The property's report and the full log depend only on the fixture and
 /// the plan: the recovery control under plan A twice, then B, then A again,
-/// gives A's every time, and B's log differs.
+/// gives A's every time. Plan A is empty, and plan B is the first of 16
+/// drawn plans whose log differs from A's.
 #[test]
 fn the_recovery_control_repeats_a_a_and_a_b_a() {
-    let plans = [Vec::new(), byte_inputs(16, 256).remove(6)];
-    let runs: Vec<(String, String)> = [&plans[0], &plans[0], &plans[1], &plans[0]]
+    let record = |plan: &[u8]| {
+        let run = run(
+            RecoveryFixture::Successor,
+            zakura_sim::Plan::from_fuzz(plan),
+        );
+        (
+            format!("{:?}", run.report.log.entries()),
+            format!("{:?}", outcome(&run.report, BOUNDED_ADVERSARY_PROGRESS)),
+        )
+    };
+    let first = record(&[]);
+    let other = byte_inputs(16, 256)
         .into_iter()
-        .map(|plan| {
-            let run = run(
-                RecoveryFixture::Successor,
-                zakura_sim::Plan::from_fuzz(plan),
-            );
-            (
-                format!("{:?}", run.report.log.entries()),
-                format!("{:?}", outcome(&run.report, BOUNDED_ADVERSARY_PROGRESS)),
-            )
-        })
-        .collect();
-    assert_eq!(runs[0], runs[1], "plan A, then A");
-    assert_eq!(runs[0], runs[3], "plan A, then B, then A");
-    assert_ne!(runs[0].0, runs[2].0, "plan B's log differs");
+        .find(|plan| record(plan).0 != first.0)
+        .expect("some drawn plan gives a different log");
+    assert_eq!(record(&[]), first, "plan A, then A");
+    let _ = record(&other);
+    assert_eq!(record(&[]), first, "plan A, then B, then A");
 }
 
-/// The fixtures `cargo xtask planted` runs as typed cases, each committed
-/// as `tests/fixtures/header-recovery-<name>.json`.
+/// The fixtures `cargo xtask planted` runs as typed cases. The QA store
+/// holds each as `fixtures/header-recovery-<name>.json`.
 /// Each runs under the empty Plan.
-fn committed_fixtures() -> [(&'static str, LivenessScenario); 4] {
+fn typed_fixtures() -> [(&'static str, LivenessScenario); 4] {
     [
         ("successor", RecoveryFixture::Successor),
         ("closes", RecoveryFixture::Closes),
@@ -232,26 +234,17 @@ fn committed_fixtures() -> [(&'static str, LivenessScenario); 4] {
     .map(|(name, fixture)| (name, LivenessScenario::Recovery(fixture)))
 }
 
-/// The committed fixture file `header-recovery-<name>.<extension>`.
-fn fixture_file(name: &str, extension: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures")
-        .join(format!("header-recovery-{name}.{extension}"))
-}
-
-/// Each committed fixture is its named fixture, as JSON, and holds
-/// and applies under the empty Plan.
+/// Each typed fixture reads back from its JSON, as the QA store holds it,
+/// and holds and applies under the empty Plan.
 #[test]
 fn the_committed_fixtures_match_their_names() {
-    for (name, fixture) in committed_fixtures() {
-        let committed: LivenessScenario = serde_json::from_str(
-            &fs::read_to_string(fixture_file(name, "json"))
-                .unwrap_or_else(|error| panic!("{name}: {error}")),
-        )
-        .unwrap_or_else(|error| panic!("{name}: {error}"));
-        assert_eq!(committed, fixture, "{name}");
+    for (name, fixture) in typed_fixtures() {
+        let json = serde_json::to_string(&fixture).expect("scenarios serialize");
+        let read: LivenessScenario =
+            serde_json::from_str(&json).unwrap_or_else(|error| panic!("{name}: {error}"));
+        assert_eq!(read, fixture, "{name}");
         let LivenessScenario::Recovery(recovery) = fixture else {
-            unreachable!("committed fixtures are recovery fixtures");
+            unreachable!("typed fixtures are recovery fixtures");
         };
         let run = run(recovery, zakura_sim::Plan::from_fuzz(&[]));
         assert_eq!(
@@ -262,22 +255,21 @@ fn the_committed_fixtures_match_their_names() {
     }
 }
 
-/// `record --witness` judges each committed fixture as `cargo xtask
-/// planted` runs it, expecting a hold, the trace ends idle, and `replay`
+/// `record --witness` judges each typed fixture as `cargo xtask planted`
+/// runs it, expecting a hold, the trace ends idle, and `replay`
 /// reruns it Exact in a fresh process.
 #[test]
-fn the_committed_fixtures_record_and_replay_in_a_fresh_process() {
+fn every_typed_fixture_records_and_replays_in_a_fresh_process() {
     let zakura_sim = |args: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_zakura-sim"))
             .args(args)
             .output()
             .expect("the binary runs")
     };
-    for (name, _) in committed_fixtures() {
+    for (name, fixture) in typed_fixtures() {
         let dir = tempfile::TempDir::new().expect("a temporary directory");
         let trace = dir.path().join("trace");
-        let scenario =
-            fs::read_to_string(fixture_file(name, "json")).expect("the fixture is committed");
+        let scenario = serde_json::to_string(&fixture).expect("scenarios serialize");
         let recorded = zakura_sim(&[
             "record",
             "--sim",

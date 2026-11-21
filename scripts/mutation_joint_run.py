@@ -29,27 +29,38 @@ affects, so a case missing from it is unchanged, not fixed. The loop runs
 only on the remote host.
 
 `routine` is the droplet timer's run (mutation plan, mut-4.6 and run-2 to
-run-4). In order, it:
+run-4). Every step after the pull reads the QA store, `--store`, through
+`ZAKURA_QA_STORE`. In order, it:
 
 1. pins the checkout to `origin/main`;
-2. `suite-manifest`: writes the frozen suite manifest with
+2. `qa-store-pull`: mirrors the Space into the QA store with
+   `scripts/qa_store.py pull`, and writes the store's manifest. The routine
+   then lists the store paths that changed since each lane's pin, for the
+   loop's `--store-changed`. A failed pull ends the run;
+3. `suite-manifest`: writes the frozen suite manifest with
    `cargo xtask sim-suite --frozen`;
-3. `suite`: runs the full planted sim suite;
-4. `loop`: runs the loop with generator lanes on what changed since the
+4. `suite`: runs the full planted sim suite;
+5. `planted` and `planted-targets`: with `--planted-shards <n>`, checks the
+   day's shard of the store's planted cases with `cargo xtask planted
+   --shard`, and with `--planted-targets` also confirms them through their
+   fuzz targets, so each case runs once every `n` days. `sim-targets`: with
+   `--sim-targets`, checks each fuzz target on the store's seeds with
+   `cargo xtask sim-targets`;
+6. `loop`: runs the loop with generator lanes on what changed since the
    last pin, or on every case on its first run. Each lane's search takes
    turns between cycled families under the Plan, cycled families under PCT,
    and free draws (`--generate-draws`, `mix` by default);
-5. `libfuzzer`: with `--libfuzzer-seconds`, runs the libFuzzer lane on what
+7. `libfuzzer`: with `--libfuzzer-seconds`, runs the libFuzzer lane on what
    changed since its own pin, `<state>/latest-libfuzzer.json`, which
    advances only when the step succeeds, so a failed step's changes run
    again next time;
-6. `suite-fuzz` and `archive`: with `--suite-fuzz` or `--fuzz-seconds`,
+8. `suite-fuzz` and `archive`: with `--suite-fuzz` or `--fuzz-seconds`,
    fuzzes each manifest target in its own campaign store under
    `<state>/campaigns/`, then triages the campaigns' failure inputs into
    `<state>/archive/`, with `scripts/suite_fuzz_run.py`;
-7. `cases`: lists the loop's cases at the checkout with
+9. `cases`: lists the loop's cases at the checkout with
    `cargo xtask planted loop --list`;
-8. `triage-<lane>`: merges each new report into its cumulative one,
+10. `triage-<lane>`: merges each new report into its cumulative one,
    `<state>/cumulative.json` (`cumulative-libfuzzer.json` for the libFuzzer
    lane), keeps only the listed cases, and applies the checkout's triage
    records to it afresh with `cargo xtask planted triage`. A
@@ -60,12 +71,12 @@ run-4). In order, it:
    triage. The routine then diffs the new report against the previous
    cumulative one, lists the cumulative report's untriaged lanes, and
    writes every lane's diff to `findings.json`;
-9. `reach`: with `--reach-runs` above 0, the default, runs one mixed
+11. `reach`: with `--reach-runs` above 0, the default, runs one mixed
    generator search on every generator harness with
    `scripts/suite_fuzz_run.py reach`, seeded by the UTC day, and counts for
    each property the runs and the free runs that applied it. The step
    fails when a search exits nonzero, writes no report or stops early;
-10. `completeness`: writes `completeness.json`, which lists the manifest rows
+12. `completeness`: writes `completeness.json`, which lists the manifest rows
    the routine ran, the rows it didn't run and why, the unimplemented rows,
    and each property's reach. It reports coverage only, apart from
    `findings.json`. A property no free run applied is a reach finding:
@@ -102,6 +113,13 @@ REACH_MISSES = 3
 FINDINGS_FILE = "findings.json"
 SUITE_MANIFEST_FILE = "suite-manifest.json"
 SUITE_FUZZ_SCRIPT = Path(__file__).resolve().parent / "suite_fuzz_run.py"
+QA_STORE_SCRIPT = Path(__file__).resolve().parent / "qa_store.py"
+STORE_ENV = "ZAKURA_QA_STORE"
+STORE_MANIFEST_FILE = "qa-store-manifest.json"
+STORE_CHANGED_FILES = {"loop": "store-changed.txt", "libfuzzer": "store-changed-libfuzzer.txt"}
+# The nightly toolchain the simulator's fuzz targets build with
+# (`header_fuzz::PINNED_NIGHTLY` in xtask).
+FUZZ_TOOLCHAIN = "nightly-2026-07-15"
 NEEDS_TRIAGE = ("survived", "killed-by-other-rule")
 SIM_RUSTFLAGS = "--cfg zakura_sim"
 
@@ -250,9 +268,14 @@ def report_diff(previous_path, new_path):
     return 1 if has_news(changes) else 0
 
 
-def loop_command(previous, out, generate_runs, extra, draws=None):
-    """Return the loop's command line: the cases a change since `previous`'s pin affects, or every case without one."""
+def loop_command(previous, out, generate_runs, extra, store_changed=None, draws=None):
+    """Return the loop's command line: the cases a change since `previous`'s pin affects, or every case without one.
+
+    `store_changed` names the file that lists the QA store's changes since that pin, and `draws` is each search's draw policy.
+    """
     since = ["--changed-since", previous["pinned"]] if previous else []
+    if previous and store_changed:
+        since += ["--store-changed", str(store_changed)]
     policy = ["--generate-draws", draws] if draws else []
     return [
         "cargo", "xtask", "planted", "loop",
@@ -298,19 +321,38 @@ def libfuzzer_since(latest, libfuzzer_latest):
     return None
 
 
-def routine_steps(checkout, state, run_dir, latest, args, libfuzzer_latest=None):
+def store_dir(args, state):
+    """Return the QA store's directory: `--store`, or `<state>/qa-store`."""
+    return Path(args.store).resolve() if args.store else Path(state) / "qa-store"
+
+
+def planted_shard(shards, day):
+    """Return the `--shard` of day `day`, a proleptic Gregorian ordinal, among `shards` shards."""
+    return f"{day % shards}/{shards}"
+
+
+def routine_steps(checkout, state, run_dir, latest, args, libfuzzer_latest=None, day=None):
     """Return the routine's steps after the checkout is pinned, as {name, argv, env, cwd} dicts.
 
     The loop runs on what changed since `latest`, and the libFuzzer lane on
     what changed since its own pin, `libfuzzer_latest`, or the loop's before
-    it has one. `cases_step`, each lane's `triage_step` and
-    `completeness_step` follow them.
+    it has one. The planted steps check day `day`'s shard, today's without
+    one. `cases_step`, each lane's `triage_step` and `completeness_step`
+    follow them. Every step reads the QA store.
     """
     checkout = str(checkout)
+    run_dir = Path(run_dir)
+    store = store_dir(args, state)
     previous = {"pinned": latest["pinned"]} if latest else None
     sim_env = {"RUSTFLAGS": SIM_RUSTFLAGS}
-    manifest = Path(run_dir) / SUITE_MANIFEST_FILE
+    manifest = run_dir / SUITE_MANIFEST_FILE
     steps = [{
+        "name": "qa-store-pull",
+        "argv": [sys.executable, str(QA_STORE_SCRIPT), "pull", "--dest", str(store),
+                 "--manifest", str(run_dir / STORE_MANIFEST_FILE)],
+        "env": {},
+        "cwd": checkout,
+    }, {
         "name": "suite-manifest",
         "argv": ["cargo", "xtask", "sim-suite", "--out", str(manifest), "--frozen"],
         "env": {},
@@ -321,12 +363,36 @@ def routine_steps(checkout, state, run_dir, latest, args, libfuzzer_latest=None)
         "env": sim_env,
         "cwd": checkout,
     }]
+    if args.planted_shards:
+        day = datetime.now(timezone.utc).toordinal() if day is None else day
+        shard = planted_shard(args.planted_shards, day)
+        steps.append({
+            "name": "planted",
+            "argv": ["cargo", "xtask", "planted", "--shard", shard],
+            "env": sim_env,
+            "cwd": checkout,
+        })
+        if args.planted_targets:
+            steps.append({
+                "name": "planted-targets",
+                "argv": ["cargo", f"+{FUZZ_TOOLCHAIN}", "xtask", "planted", "--targets", "--shard", shard],
+                "env": sim_env,
+                "cwd": checkout,
+            })
+    if args.sim_targets:
+        steps.append({
+            "name": "sim-targets",
+            "argv": ["cargo", f"+{FUZZ_TOOLCHAIN}", "xtask", "sim-targets", "--child-secs", "180",
+                     "--out", str(run_dir / "sim-targets")],
+            "env": {},
+            "cwd": checkout,
+        })
     budget = [flag for harness in args.harness_runs for flag in ("--generate-harness-runs", harness)]
     extra = [arg for arg in args.loop_args if arg != "--"]
     steps.append({
         "name": "loop",
-        "argv": loop_command(previous, Path(run_dir) / "loop", args.generate_runs, budget + extra,
-                             args.generate_draws),
+        "argv": loop_command(previous, run_dir / "loop", args.generate_runs, budget + extra,
+                             run_dir / STORE_CHANGED_FILES["loop"], args.generate_draws),
         "env": {},
         "cwd": checkout,
     })
@@ -337,7 +403,8 @@ def routine_steps(checkout, state, run_dir, latest, args, libfuzzer_latest=None)
         libfuzzer = ["--generate-mode", "libfuzzer", "--generate-seconds", str(args.libfuzzer_seconds)]
         steps.append({
             "name": "libfuzzer",
-            "argv": loop_command({"pinned": since}, Path(run_dir) / "libfuzzer", args.generate_runs, libfuzzer + extra),
+            "argv": loop_command({"pinned": since}, run_dir / "libfuzzer", args.generate_runs, libfuzzer + extra,
+                                 run_dir / STORE_CHANGED_FILES["libfuzzer"]),
             "env": {},
             "cwd": checkout,
         })
@@ -370,7 +437,24 @@ def routine_steps(checkout, state, run_dir, latest, args, libfuzzer_latest=None)
             "env": {},
             "cwd": checkout,
         })
+    for step in steps[1:]:
+        step["env"] = {**step["env"], STORE_ENV: str(store)}
     return steps
+
+
+def write_store_changes(run_dir, pins):
+    """Write each lane's `--store-changed` file: the store paths that changed since its pin's manifest.
+
+    `pins` maps each lane to its pin record, or None. A pin without a
+    manifest predates the store, so every path counts as changed.
+    """
+    run_dir = Path(run_dir)
+    current = read_json(run_dir / STORE_MANIFEST_FILE)
+    for lane, pinned in pins.items():
+        manifest = (pinned or {}).get("store_manifest")
+        old = read_json(manifest) if manifest and Path(manifest).exists() else {}
+        paths = sorted(path for path in set(old) | set(current) if old.get(path) != current.get(path))
+        (run_dir / STORE_CHANGED_FILES[lane]).write_text("".join(f"{path}\n" for path in paths))
 
 
 def completeness_step(checkout, run_dir, steps):
@@ -393,13 +477,13 @@ def completeness_step(checkout, run_dir, steps):
     }
 
 
-def cases_step(checkout, args):
-    """Return the step that prints the loop's current cases at the checkout, selected by the loop's own flags."""
+def cases_step(checkout, args, store):
+    """Return the step that prints the loop's current cases in `store`, selected by the loop's own flags."""
     extra = [arg for arg in args.loop_args if arg != "--"]
     return {
         "name": "cases",
         "argv": ["cargo", "xtask", "planted", "loop", "--list", *extra],
-        "env": {},
+        "env": {STORE_ENV: str(store)},
         "cwd": str(checkout),
     }
 
@@ -422,14 +506,19 @@ def current_cases(step, run_dir):
         return None
 
 
-def triage_step(checkout, lane, cumulative_path):
-    """Return the step that applies the checkout's triage records afresh to a lane's cumulative report, in place."""
+def triage_step(checkout, lane, cumulative_path, store):
+    """Return the step that applies `store`'s triage records afresh to a lane's cumulative report, in place."""
     return {
         "name": f"triage-{lane}",
         "argv": ["cargo", "xtask", "planted", "triage", "--report", str(cumulative_path)],
-        "env": {},
+        "env": {STORE_ENV: str(store)},
         "cwd": str(checkout),
     }
+
+
+def pin_record(pinned, run_dir):
+    """Return the record of a pin at commit `pinned`, with the store manifest its run pulled."""
+    return {"pinned": pinned, "run": str(run_dir), "store_manifest": str(Path(run_dir) / STORE_MANIFEST_FILE)}
 
 
 def pin(checkout):
@@ -454,17 +543,19 @@ def routine(args):
     """Run the droplet timer's routine once, and return its exit status."""
     state = Path(args.state).resolve()
     checkout = Path(args.checkout).resolve()
+    store = store_dir(args, state)
     args.reach_seed = reach_seed(datetime.now(timezone.utc))
     latest = read_latest(state)
     libfuzzer_latest = read_latest(state, LIBFUZZER_LATEST_FILE)
     if args.dry_run:
         run_dir = state / "runs" / "<UTC time>-<commit>"
         steps = routine_steps(checkout, state, run_dir, latest, args, libfuzzer_latest)
-        cases = cases_step(checkout, args)
-        triage = [triage_step(checkout, lane, state / name) for lane, name in CUMULATIVE_FILES.items()]
+        cases = cases_step(checkout, args, store)
+        triage = [triage_step(checkout, lane, state / name, store) for lane, name in CUMULATIVE_FILES.items()]
         completeness = completeness_step(checkout, run_dir, steps)
         plan = {
-            "latest": latest, "libfuzzer_latest": libfuzzer_latest, "pin": "origin/main", "steps": steps,
+            "latest": latest, "libfuzzer_latest": libfuzzer_latest, "pin": "origin/main", "store": str(store),
+            "steps": steps,
             "cases": cases, "triage": triage, "completeness": completeness,
             "order": [step["name"] for step in [*steps, cases, *triage, completeness]],
         }
@@ -476,16 +567,23 @@ def routine(args):
     run_dir.mkdir(parents=True)
     ended = {}
     steps = routine_steps(checkout, state, run_dir, latest, args, libfuzzer_latest)
-    for step in steps:
-        ended[step["name"]] = run_step(step, run_dir)
     record = {
         "pinned": pinned, "previous": latest, "previous_libfuzzer": libfuzzer_latest,
         "steps": ended, "news": {},
     }
+    pull, *steps = steps
+    ended[pull["name"]] = run_step(pull, run_dir)
+    if ended[pull["name"]] != 0 or not (run_dir / STORE_MANIFEST_FILE).exists():
+        print("the QA store's pull failed; no step runs, and every pin stays")
+        (run_dir / ROUTINE_FILE).write_text(json.dumps(record, indent=2) + "\n")
+        return 1
+    write_store_changes(run_dir, {"loop": latest, "libfuzzer": libfuzzer_latest or latest})
+    for step in steps:
+        ended[step["name"]] = run_step(step, run_dir)
     status = 0 if all(code == 0 for code in ended.values()) else 1
     # The cumulative reports keep only the checkout's current cases, so a
     # removed case, or one a witness change re-keyed, leaves them.
-    current = current_cases(cases_step(checkout, args), run_dir)
+    current = current_cases(cases_step(checkout, args, store), run_dir)
     ended["cases"] = 0 if current is not None else 1
     if current is None:
         print("the loop's case list failed; the cumulative reports keep every case")
@@ -505,7 +603,7 @@ def routine(args):
         if current is not None:
             merged, removed = prune(merged, current)
         cumulative_path.write_text(json.dumps(merged, indent=2) + "\n")
-        step = triage_step(checkout, lane, cumulative_path)
+        step = triage_step(checkout, lane, cumulative_path, store)
         ended[step["name"]] = run_step(step, run_dir)
         status = status or int(ended[step["name"]] != 0)
         changes = diff(cumulative, new, read_json(cumulative_path), removed)
@@ -526,17 +624,17 @@ def routine(args):
                 {"pinned": pinned, "unreached": found["unreached"], "misses": found["misses"]}, indent=2) + "\n")
     (run_dir / FINDINGS_FILE).write_text(json.dumps(findings, indent=2) + "\n")
     if ended.get("loop") == 0 or (run_dir / "loop" / REPORT_FILE).exists():
-        (state / LATEST_FILE).write_text(json.dumps({"pinned": pinned, "run": str(run_dir)}, indent=2) + "\n")
+        (state / LATEST_FILE).write_text(json.dumps(pin_record(pinned, run_dir), indent=2) + "\n")
     else:
         print(f"the loop failed without a report; {LATEST_FILE} stays")
     # The libFuzzer lane keeps its own pin, which advances only when its
     # step succeeds, so the next run covers a failed run's changes again.
     if "libfuzzer" in ended:
         if ended["libfuzzer"] == 0:
-            libfuzzer_pin = {"pinned": pinned, "run": str(run_dir)}
+            libfuzzer_pin = pin_record(pinned, run_dir)
         else:
             print(f"the libFuzzer lane failed; its pin stays in {LIBFUZZER_LATEST_FILE}")
-            libfuzzer_pin = libfuzzer_latest or {"pinned": libfuzzer_since(latest, None)}
+            libfuzzer_pin = libfuzzer_latest or {"pinned": latest["pinned"], "store_manifest": latest.get("store_manifest")}
         (state / LIBFUZZER_LATEST_FILE).write_text(json.dumps(libfuzzer_pin, indent=2) + "\n")
     # The completeness step reads the steps that ran from routine.json.
     (run_dir / ROUTINE_FILE).write_text(json.dumps(record, indent=2) + "\n")
@@ -570,6 +668,12 @@ def main(argv=None):
                        help="fuzz each target for this long per worker instead; nonzero also turns the suite fuzz on")
     timer.add_argument("--fuzz-workers", type=int, default=1, help="each suite-fuzz campaign run's workers")
     timer.add_argument("--fuzz-jobs", type=int, default=1, help="how many suite-fuzz campaigns run at once")
+    timer.add_argument("--store", help="the QA store the routine pulls and every step reads; <state>/qa-store by default")
+    timer.add_argument("--planted-shards", type=int, default=0,
+                       help="check one of this many shards of the planted cases each day; 0 turns it off")
+    timer.add_argument("--planted-targets", action="store_true",
+                       help="with --planted-shards, also confirm the day's shard through its fuzz targets")
+    timer.add_argument("--sim-targets", action="store_true", help="also check each fuzz target on the store's seeds")
     timer.add_argument("--generate-draws", default="mix",
                        help="each inproc search's draw policy: uniform, cycle, free or mix")
     timer.add_argument("--reach-runs", type=int, default=30,

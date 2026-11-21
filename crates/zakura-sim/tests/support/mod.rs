@@ -2,8 +2,14 @@
 
 #![allow(dead_code)]
 
+pub mod discovery_inputs;
 pub mod feed;
+pub mod header_inputs;
+pub mod machine_tapes;
+pub mod plan_search;
 pub mod prepare_fault;
+pub mod qa_store;
+pub mod race_schedule;
 pub mod script;
 pub mod steer;
 

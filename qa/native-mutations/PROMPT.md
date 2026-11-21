@@ -6,6 +6,11 @@ in `work-list.toml`. `cargo xtask planted loop` runs what it writes.
 
 ## Inputs
 
+The work list, the patches and the planted cases live in the QA store,
+`$ZAKURA_QA_STORE` (`scripts/qa_store.py pull`). Every `qa/planted/` and
+`qa/native-mutations/` path below is relative to the store's root. Every
+other path is in the repository.
+
 You get one entry of `qa/native-mutations/work-list.toml`. Read these before
 you write anything:
 
@@ -22,7 +27,7 @@ you write anything:
    only.
 3. **The reaching witness.** Each instance names one witness: a retained
    `qa/planted/` case's seed or typed scenario (`planted`), a seed of the
-   simulator's registry by name (`seed`), or one `zakura-sim` test (`test`
+   store's `seeds` by name (`seed`), or one `zakura-sim` test (`test`
    and `test_target`). The
    witness holds on `main`. Read what it drives, so that your break lies on
    its path.

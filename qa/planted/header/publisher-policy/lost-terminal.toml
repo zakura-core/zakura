@@ -1,9 +1,0 @@
-# Drops a queued terminal outcome instead of offering it, so the subscriber never
-# learns that its subscription ended and the slot stays held. The input's
-# `NextTerminal` finds no outcome although one ended and none is being written.
-seed = "header-publisher-policy"
-checks = [
-    "crates/zakura-network/src/zakura/header_sync/v9/publisher",
-    "crates/zakura-network/src/zakura/header_sync/v9/publisher.rs",
-    "crates/zakura-network/src/zakura/regulation/subscription",
-]

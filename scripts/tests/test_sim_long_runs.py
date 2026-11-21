@@ -60,6 +60,7 @@ class SimLongRunsTest(unittest.TestCase):
         self.env = dict(
             os.environ,
             PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+            ZAKURA_QA_STORE=str(self.dir / "qa-store"),
             STUB_LOG=str(self.log),
         )
         matrix = subprocess.run(

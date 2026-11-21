@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Runs the simulator's long checks on a remote host, which the nightly CI jobs
-# only smoke: the whole planted catalogue under qa/planted/, and a long fuzz
-# campaign of each simulator fuzz target. See qa/fuzz/sim/README.md, Long runs.
+# only smoke: the whole planted catalogue under the QA store's qa/planted/,
+# and a long fuzz campaign of each simulator fuzz target. See
+# qa/fuzz/sim/README.md, Long runs. ZAKURA_QA_STORE names the store, which
+# `scripts/qa_store.py pull` fills from the Space.
 #
 # Usage, from a checkout on the host:
 #
@@ -27,7 +29,7 @@
 # checkout's toolchain, the nightly that sim-fuzz.yml pins, cargo-fuzz and jq.
 # A run takes hours, so start it detached and read the log later:
 #
-#   ssh <host> 'cd ~/zakura && nohup scripts/sim-long-runs.sh --out ~/sim-runs \
+#   ssh <host> 'cd ~/zakura && ZAKURA_QA_STORE=~/qa-store nohup scripts/sim-long-runs.sh --out ~/sim-runs \
 #       --seconds 14400 --workers 2 > ~/sim-runs.log 2>&1 < /dev/null &'
 
 set -euo pipefail
@@ -49,6 +51,7 @@ while [ $# -gt 0 ]; do
     esac
 done
 [ -n "${out}" ] || usage
+[ -n "${ZAKURA_QA_STORE:-}" ] || { echo "set ZAKURA_QA_STORE to the QA store (scripts/qa_store.py pull)" >&2; exit 2; }
 
 # Resolve --out from the caller's directory before moving to the checkout.
 mkdir -p "${out}"

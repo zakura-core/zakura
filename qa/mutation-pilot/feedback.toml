@@ -1,14 +1,15 @@
 # The feedback comparison's frozen case list (fuzz-14). `cargo xtask planted
 # pilot feedback` reads it. See README.md, Feedback comparison.
 #
-# Each case names a retained planted case by its path under qa/planted/,
-# without the `.patch`, and repeats the case's property, the directory it
-# lies in. Its target must be a simulator fuzz target that runs the harness
-# of the case's committed input, and its harness must log the observations
-# that `zakura_sim::explore::state::collector` reads. Nightly
-# `cargo xtask planted --targets` confirms each committed input through that
-# target. A nested case, one with a `set`, isn't allowed: a campaign stops at
-# its first finding, which needn't show the whole set.
+# Each case names a retained planted case by its path under the QA store's
+# qa/planted/ (scripts/qa_store.py), without the `.patch`, and repeats the
+# case's property, the directory it lies in. Its target must be a simulator
+# fuzz target that runs the harness of the case's stored input, and its
+# harness must log the observations that
+# `zakura_sim::explore::state::collector` reads. The joint-run droplet's
+# `cargo xtask planted --targets` confirms each stored input through that
+# target. A nested case, one with a `set`, isn't allowed: a campaign stops
+# at its first finding, which needn't show the whole set.
 #
 # To extend the list, add a `[[case]]`. Every case runs the same seeds, arms
 # and bounds, so a case added later compares with the earlier ones.

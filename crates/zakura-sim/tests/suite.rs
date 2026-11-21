@@ -8,7 +8,10 @@ use std::{collections::BTreeSet, fs, path::Path, process::Command};
 use serde_json::Value;
 use tempfile::TempDir;
 use zakura_sim::{
-    harness::{coverage::COVERAGE, HARNESSES},
+    harness::{
+        coverage::{Bypass, COVERAGE},
+        HARNESSES,
+    },
     seed,
     suite::{
         self, ExcludedHarness, ExcludedTarget, Expect, Ignored, MissingTarget, Pending,
@@ -23,12 +26,24 @@ fn committed() -> SuiteFile {
 }
 
 /// The problems the manifest of this checkout has with `suite` as its
-/// `qa/suite.toml`.
+/// `qa/suite.toml`, with no QA store: a repository test reads none.
 fn problems(suite: &SuiteFile) -> Vec<String> {
-    match suite::manifest_of(&seed::repo_root(), suite, String::new()) {
+    problems_in(None, suite)
+}
+
+/// The problems the manifest of this checkout has with `suite` and the QA
+/// store at `store`.
+fn problems_in(store: Option<&Path>, suite: &SuiteFile) -> Vec<String> {
+    match suite::manifest_in(&seed::repo_root(), store, suite, String::new()) {
         Ok(_) => Vec::new(),
         Err(problems) => problems.0,
     }
+}
+
+/// The manifest of this checkout and its committed `qa/suite.toml`, with no
+/// QA store.
+fn committed_manifest() -> Result<suite::Manifest, suite::Problems> {
+    suite::manifest_in(&seed::repo_root(), None, &committed(), String::new())
 }
 
 /// Removes the one entry of `entries` that `matches`.
@@ -170,7 +185,7 @@ fn assert_problem(problems: &[String], text: &str) {
 
 #[test]
 fn the_committed_suite_covers_the_registry() {
-    let manifest = suite::manifest(&seed::repo_root()).unwrap_or_else(|problems| {
+    let manifest = committed_manifest().unwrap_or_else(|problems| {
         panic!("{problems}");
     });
     assert_eq!(manifest.harnesses.len(), HARNESSES.len());
@@ -206,15 +221,10 @@ fn the_committed_suite_covers_the_registry() {
             ),
             Expect::Unimplemented => assert!(row.pending.is_some(), "{row:?}"),
             // A native bypass runs in the droplet mutation campaign, not
-            // here, so its row names an existing patch and the reason.
-            Expect::Excluded => assert!(
-                row.pending.is_some()
-                    && row.patch.is_some_and(|patch| seed::repo_root()
-                        .join("qa/native-mutations")
-                        .join(patch)
-                        .is_file()),
-                "{row:?}"
-            ),
+            // here, and a planted one needs the QA store, which a
+            // repository test doesn't read. Each row names its patch and
+            // the reason.
+            Expect::Excluded => assert!(row.pending.is_some() && row.patch.is_some(), "{row:?}"),
             other => panic!("{}: {other:?}", row.id),
         }
     }
@@ -340,7 +350,7 @@ fn a_target_covering_a_harness_its_harness_doesnt_compose_fails() {
 
 #[test]
 fn planted_fixture_properties_expect_a_violation() {
-    let manifest = suite::manifest(&seed::repo_root()).unwrap_or_else(|problems| {
+    let manifest = committed_manifest().unwrap_or_else(|problems| {
         panic!("{problems}");
     });
     let expect = |id: &str| {
@@ -399,7 +409,7 @@ fn a_sim_library_without_unit_tests_fails() {
 
 #[test]
 fn a_simulator_target_takes_its_harness_from_its_cargo_toml() {
-    let manifest = suite::manifest(&seed::repo_root()).unwrap_or_else(|problems| {
+    let manifest = committed_manifest().unwrap_or_else(|problems| {
         panic!("{problems}");
     });
     for (name, harness) in [
@@ -538,7 +548,7 @@ fn an_unmapped_fuzz_target_fails() {
 /// reaches a target or names the harness whose missing-target row explains it.
 #[test]
 fn the_generated_coverage_joins_harnesses_and_machines() {
-    let manifest = suite::manifest(&seed::repo_root()).unwrap_or_else(|problems| {
+    let manifest = committed_manifest().unwrap_or_else(|problems| {
         panic!("{problems}");
     });
     let property_ids: BTreeSet<_> = manifest
@@ -652,7 +662,7 @@ fn an_ignored_test_in_a_suites_child_module_fails() {
 
 #[test]
 fn library_tests_run_by_their_full_path() {
-    let manifest = suite::manifest(&seed::repo_root()).unwrap_or_else(|problems| {
+    let manifest = committed_manifest().unwrap_or_else(|problems| {
         panic!("{problems}");
     });
     let row = manifest
@@ -673,7 +683,7 @@ fn library_tests_run_by_their_full_path() {
 
 #[test]
 fn a_target_runs_with_its_environment() {
-    let manifest = suite::manifest(&seed::repo_root()).unwrap_or_else(|problems| {
+    let manifest = committed_manifest().unwrap_or_else(|problems| {
         panic!("{problems}");
     });
     let row = manifest
@@ -892,4 +902,42 @@ fn the_manifest_doesnt_depend_on_the_executable() {
         manifests.push(std::fs::read(&out).unwrap());
     }
     assert!(manifests[0] == manifests[1], "the two manifests differ");
+}
+
+/// Without a QA store, a coverage row's planted bypass is excluded with the
+/// reason. With one, each planted bypass must name a case in the store: an
+/// empty store's manifest names every missing case, and storing one
+/// case's patch clears its problem.
+#[test]
+fn planted_bypasses_need_the_store_only_when_it_is_present() {
+    let manifest = committed_manifest().unwrap_or_else(|problems| panic!("{problems}"));
+    let (property, name) = COVERAGE
+        .iter()
+        .find_map(|row| match row.bypass {
+            Bypass::Planted(name) => Some((row.property, name)),
+            _ => None,
+        })
+        .expect("a coverage row's bypass is a planted case");
+    let row = manifest
+        .witnesses
+        .iter()
+        .find(|row| row.property == property && row.role == "bypass")
+        .expect("the bypass has a witness row");
+    assert_eq!(row.expect, Expect::Excluded);
+    assert_eq!(row.pending, Some(suite::NO_STORE));
+    assert!(manifest.planted.is_empty());
+
+    let store = TempDir::new().unwrap();
+    let missing = format!("`{property}`'s bypass is qa/planted/{property}/{name}.patch");
+    let empty = problems_in(Some(store.path()), &committed());
+    assert_problem(&empty, &missing);
+    let case = store.path().join("qa/planted").join(property);
+    fs::create_dir_all(&case).unwrap();
+    fs::write(case.join(format!("{name}.patch")), "").unwrap();
+    let stored = problems_in(Some(store.path()), &committed());
+    assert!(
+        !stored.iter().any(|problem| problem.contains(&missing)),
+        "{stored:#?}"
+    );
+    assert!(stored.len() < empty.len());
 }

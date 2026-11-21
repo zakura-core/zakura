@@ -489,7 +489,7 @@ fn blob_store_looks_in_the_trace_first() {
     ));
     assert_eq!(
         BlobStore::for_trace(Path::new("t")),
-        BlobStore::new(vec![PathBuf::from("t/blobs"), BlobStore::committed()])
+        BlobStore::new(vec![PathBuf::from("t/blobs")])
     );
 }
 

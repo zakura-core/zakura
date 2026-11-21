@@ -8,6 +8,8 @@
 //! committed tables and seeds, and the status each run's evidence gets.
 #![cfg(zakura_sim)]
 
+mod support;
+
 use std::{
     collections::BTreeSet,
     fs,
@@ -23,8 +25,11 @@ use zakura_sim::{
         stats::{Counts, ProcessStats, STATS_VERSION},
         ProcessExit, Worker,
     },
-    harness::{HarnessEntry, HARNESSES},
-    seed::{self, SeedSet},
+    harness::{
+        fixtures::{All, Variant, Which},
+        HarnessEntry, Subsystem, HARNESSES,
+    },
+    seed::{self, Seed},
     suite::{SuiteFile, SUITE_FILE},
 };
 
@@ -64,17 +69,13 @@ fn manifest() -> String {
     fs::read_to_string(root().join(FUZZ_PACKAGE).join("Cargo.toml")).unwrap()
 }
 
-/// Each target's own properties that no seed applies. These targets' seeds
-/// run honest and single-fault scenarios, and the coverage manifest names
+/// Each target's own properties that no input of [`inputs`] applies. These
+/// inputs run honest and single-fault scenarios, and the coverage manifest names
 /// the test where each listed property applies, such as a frame-conformance
-/// property on a faulted frame. A target missing from the list has seeds
-/// that apply every own property. A listed property that a seed now applies
-/// fails the test until it leaves the list, so the list only shrinks.
-///
-/// `block-sync/capacity-release-wakes` applies only once the commit window
-/// fills, which only the slow-set capacity-release seeds
-/// reach. Those run too long for a fuzz input, so they are outside the
-/// corpus, and their own tests apply the property.
+/// property on a faulted frame. A target missing from the list has inputs
+/// that apply every own property. A listed property that an input now
+/// applies fails the test until it leaves the list, so the list only
+/// shrinks.
 ///
 /// `tx-relay/stalled-peers-parked` applies only after a parked peer's
 /// readmission, three virtual minutes in. That witness runs too long for a
@@ -83,118 +84,18 @@ const UNAPPLIED: &[(&str, &[&str])] = &[
     (
         "block_sync_storage",
         &[
-            "block-sync/capacity-release-wakes",
-            "block-sync/s6v3/block/bad-content-closes",
-            "block-sync/s6v3/block/long-payload-closes",
-            "block-sync/s6v3/block/over-owed-closes",
-            "block-sync/s6v3/block/reserved-flags-closes",
-            "block-sync/s6v3/block/sender-answers-open",
-            "block-sync/s6v3/block/sender-within-response-quantity",
-            "block-sync/s6v3/block/short-payload-closes",
-            "block-sync/s6v3/block/unsolicited-closes",
-            "block-sync/s6v3/blocks-done/bad-content-closes",
-            "block-sync/s6v3/blocks-done/long-payload-closes",
             "block-sync/s6v3/blocks-done/over-owed-closes",
             "block-sync/s6v3/blocks-done/receiver-work-authorized",
-            "block-sync/s6v3/blocks-done/reserved-flags-closes",
-            "block-sync/s6v3/blocks-done/sender-ends-once",
-            "block-sync/s6v3/blocks-done/sender-within-response-quantity",
-            "block-sync/s6v3/blocks-done/short-payload-closes",
-            "block-sync/s6v3/blocks-done/unsolicited-closes",
-            "block-sync/s6v3/get-blocks/bad-content-closes",
-            "block-sync/s6v3/get-blocks/long-payload-closes",
-            "block-sync/s6v3/get-blocks/over-margin-closes",
-            "block-sync/s6v3/get-blocks/receiver-serving-bounded",
-            "block-sync/s6v3/get-blocks/reserved-flags-closes",
-            "block-sync/s6v3/get-blocks/short-payload-closes",
-            "block-sync/s6v3/range-unavailable/bad-content-closes",
-            "block-sync/s6v3/range-unavailable/long-payload-closes",
             "block-sync/s6v3/range-unavailable/over-owed-closes",
             "block-sync/s6v3/range-unavailable/receiver-work-authorized",
-            "block-sync/s6v3/range-unavailable/reserved-flags-closes",
             "block-sync/s6v3/range-unavailable/sender-ends-once",
             "block-sync/s6v3/range-unavailable/sender-within-response-quantity",
-            "block-sync/s6v3/range-unavailable/short-payload-closes",
-            "block-sync/s6v3/range-unavailable/unsolicited-closes",
-            "block-sync/s6v3/status/bad-content-closes",
-            "block-sync/s6v3/status/cadence-never-closes",
-            "block-sync/s6v3/status/long-payload-closes",
-            "block-sync/s6v3/status/reserved-flags-closes",
-            "block-sync/s6v3/status/short-payload-closes",
-            "block-sync/s6v3/undeclared-type-closes",
         ],
     ),
     (
         "discovery_composed",
         &[
             "discovery/late-response-admitted",
-            "discovery/s4v2/get-peers/bad-content-closes",
-            "discovery/s4v2/get-peers/cadence-never-closes",
-            "discovery/s4v2/get-peers/long-payload-closes",
-            "discovery/s4v2/get-peers/over-margin-closes",
-            "discovery/s4v2/get-peers/reserved-flags-closes",
-            "discovery/s4v2/get-peers/short-payload-closes",
-            "discovery/s4v2/get-services/bad-content-closes",
-            "discovery/s4v2/get-services/cadence-never-closes",
-            "discovery/s4v2/get-services/long-payload-closes",
-            "discovery/s4v2/get-services/over-margin-closes",
-            "discovery/s4v2/get-services/reserved-flags-closes",
-            "discovery/s4v2/get-services/short-payload-closes",
-            "discovery/s4v2/hello/bad-content-closes",
-            "discovery/s4v2/hello/cadence-never-closes",
-            "discovery/s4v2/hello/long-payload-closes",
-            "discovery/s4v2/hello/reserved-flags-closes",
-            "discovery/s4v2/hello/short-payload-closes",
-            "discovery/s4v2/peers/bad-content-closes",
-            "discovery/s4v2/peers/long-payload-closes",
-            "discovery/s4v2/peers/over-owed-closes",
-            "discovery/s4v2/peers/reserved-flags-closes",
-            "discovery/s4v2/peers/short-payload-closes",
-            "discovery/s4v2/peers/unsolicited-closes",
-            "discovery/s4v2/services/bad-content-closes",
-            "discovery/s4v2/services/long-payload-closes",
-            "discovery/s4v2/services/over-owed-closes",
-            "discovery/s4v2/services/reserved-flags-closes",
-            "discovery/s4v2/services/short-payload-closes",
-            "discovery/s4v2/services/unsolicited-closes",
-        ],
-    ),
-    (
-        "discovery_spam",
-        &[
-            "discovery/late-response-admitted",
-            "discovery/s4v2/get-peers/bad-content-closes",
-            "discovery/s4v2/get-peers/cadence-never-closes",
-            "discovery/s4v2/get-peers/long-payload-closes",
-            "discovery/s4v2/get-peers/reserved-flags-closes",
-            "discovery/s4v2/get-peers/short-payload-closes",
-            "discovery/s4v2/get-services/cadence-never-closes",
-            "discovery/s4v2/get-services/long-payload-closes",
-            "discovery/s4v2/get-services/over-margin-closes",
-            "discovery/s4v2/get-services/reserved-flags-closes",
-            "discovery/s4v2/get-services/short-payload-closes",
-            "discovery/s4v2/hello/bad-content-closes",
-            "discovery/s4v2/hello/cadence-never-closes",
-            "discovery/s4v2/hello/long-payload-closes",
-            "discovery/s4v2/hello/reserved-flags-closes",
-            "discovery/s4v2/hello/short-payload-closes",
-            "discovery/s4v2/peers/bad-content-closes",
-            "discovery/s4v2/peers/long-payload-closes",
-            "discovery/s4v2/peers/over-owed-closes",
-            "discovery/s4v2/peers/reserved-flags-closes",
-            "discovery/s4v2/peers/short-payload-closes",
-            "discovery/s4v2/peers/unsolicited-closes",
-            "discovery/s4v2/services/bad-content-closes",
-            "discovery/s4v2/services/long-payload-closes",
-            "discovery/s4v2/services/over-owed-closes",
-            "discovery/s4v2/services/reserved-flags-closes",
-            "discovery/s4v2/services/short-payload-closes",
-            "discovery/s4v2/services/unsolicited-closes",
-        ],
-    ),
-    (
-        "discovery_wire",
-        &[
             "discovery/s4v2/get-peers/bad-content-closes",
             "discovery/s4v2/get-peers/cadence-never-closes",
             "discovery/s4v2/get-peers/long-payload-closes",
@@ -232,6 +133,105 @@ const UNAPPLIED: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        "discovery_spam",
+        &[
+            "discovery/late-response-admitted",
+            "discovery/s4v2/get-peers/bad-content-closes",
+            "discovery/s4v2/get-peers/cadence-never-closes",
+            "discovery/s4v2/get-peers/long-payload-closes",
+            "discovery/s4v2/get-peers/over-margin-closes",
+            "discovery/s4v2/get-peers/reserved-flags-closes",
+            "discovery/s4v2/get-peers/short-payload-closes",
+            "discovery/s4v2/get-services/bad-content-closes",
+            "discovery/s4v2/get-services/cadence-never-closes",
+            "discovery/s4v2/get-services/long-payload-closes",
+            "discovery/s4v2/get-services/over-margin-closes",
+            "discovery/s4v2/get-services/reserved-flags-closes",
+            "discovery/s4v2/get-services/short-payload-closes",
+            "discovery/s4v2/hello/bad-content-closes",
+            "discovery/s4v2/hello/cadence-never-closes",
+            "discovery/s4v2/hello/long-payload-closes",
+            "discovery/s4v2/hello/reserved-flags-closes",
+            "discovery/s4v2/hello/short-payload-closes",
+            "discovery/s4v2/peers/bad-content-closes",
+            "discovery/s4v2/peers/long-payload-closes",
+            "discovery/s4v2/peers/over-owed-closes",
+            "discovery/s4v2/peers/reserved-flags-closes",
+            "discovery/s4v2/peers/sender-ends-once",
+            "discovery/s4v2/peers/sender-within-owed",
+            "discovery/s4v2/peers/short-payload-closes",
+            "discovery/s4v2/peers/unsolicited-closes",
+            "discovery/s4v2/services/bad-content-closes",
+            "discovery/s4v2/services/long-payload-closes",
+            "discovery/s4v2/services/over-owed-closes",
+            "discovery/s4v2/services/reserved-flags-closes",
+            "discovery/s4v2/services/sender-ends-once",
+            "discovery/s4v2/services/sender-within-owed",
+            "discovery/s4v2/services/short-payload-closes",
+            "discovery/s4v2/services/unsolicited-closes",
+            "discovery/s4v2/undeclared-type-closes",
+        ],
+    ),
+    (
+        "discovery_wire",
+        &[
+            "discovery/late-response-admitted",
+            "discovery/s4v2/services/over-owed-closes",
+        ],
+    ),
+    (
+        "handshake_wire",
+        &[
+            "handshake/ack/bad-frame-limit-refused",
+            "handshake/ack/bad-idle-limit-refused",
+            "handshake/ack/bad-magic-refused",
+            "handshake/ack/bad-message-limit-refused",
+            "handshake/ack/bad-nonce-echo-refused",
+            "handshake/ack/bad-protocol-refused",
+            "handshake/ack/bad-queue-limit-refused",
+            "handshake/ack/bad-stream-limit-refused",
+            "handshake/ack/bad-version-refused",
+            "handshake/ack/limits-above-request-refused",
+            "handshake/ack/oversize-refused",
+            "handshake/ack/refusal-releases-slot",
+            "handshake/ack/unoffered-capability-refused",
+            "handshake/hello/bad-frame-limit-refused",
+            "handshake/hello/bad-idle-limit-refused",
+            "handshake/hello/bad-magic-refused",
+            "handshake/hello/bad-message-limit-refused",
+            "handshake/hello/bad-path-refused",
+            "handshake/hello/bad-protocol-refused",
+            "handshake/hello/bad-queue-limit-refused",
+            "handshake/hello/bad-role-refused",
+            "handshake/hello/bad-stream-limit-refused",
+            "handshake/hello/bad-version-refused",
+            "handshake/hello/identity-mismatch-refused",
+            "handshake/hello/missing-capability-refused",
+            "handshake/hello/nonzero-initiator-nonce-refused",
+            "handshake/hello/nonzero-native-transcript-refused",
+            "handshake/hello/nonzero-responder-nonce-refused",
+            "handshake/hello/oversize-refused",
+            "handshake/hello/refusal-releases-slot",
+            "handshake/hello/wrong-chain-refused",
+            "handshake/hello/wrong-network-refused",
+            "handshake/prelude/bad-magic-resets",
+            "handshake/prelude/ineligible-opener-closes",
+            "handshake/prelude/request-without-id-closes",
+            "handshake/prelude/undersized-cap-closes",
+            "handshake/prelude/unexpected-request-id-closes",
+            "handshake/prelude/unknown-kind-resets",
+            "handshake/prelude/unnegotiated-capability-resets",
+            "handshake/prelude/unselected-version-resets",
+            "session/capacity-conserved",
+            "session/renegotiation-covers-inflight-handshakes",
+            "session/setup-slot-bounded",
+        ],
+    ),
+    (
+        "header_sync_storage",
+        &["header-sync/bounded-adversary-progress"],
+    ),
+    (
         "header_sync_wire",
         &[
             "header-sync/expected-chain-selected",
@@ -259,9 +259,11 @@ const UNAPPLIED: &[(&str, &[&str])] = &[
             "block-sync/frontier-work-consistent",
             "session/connection-shares-bound",
             "session/credit-isolated",
+            "session/replacement-preserves-authorization",
             "session/send-isolated",
         ],
     ),
+    ("sync_wire", &["block-sync/frontier-work-consistent"]),
     (
         "tx_relay_wire",
         &[
@@ -305,46 +307,100 @@ fn unapplied_allowed(target: &str) -> Vec<String> {
     allowed
 }
 
-/// Each declared target resolves to its registered harness, its harness has
-/// admitted seeds and no rejected one, and the seeds apply each of the
-/// harness's own properties and those of every harness the target covers,
-/// except the properties [`UNAPPLIED`] lists. A target without seeds, or
-/// whose seeds reach only the properties every harness checks, fails here
-/// before the nightly job runs it.
+/// The scenario families whose runs take minutes, as `harness/family`, which
+/// [`inputs`] leaves out.
+const SLOW_FAMILIES: [&str; 3] = [
+    "block-sync/storage/stuck-floor",
+    "block-sync/storage/above-window",
+    "block-sync/storage/decoded-input-stall",
+];
+
+/// How many generated op tapes [`inputs`] runs on a machine, which has no
+/// scenario families.
+const PLANS_WITHOUT_FAMILIES: usize = 8;
+
+/// The longest generated Plan [`inputs`] runs, cut to a target's
+/// `-max_len`.
+const PLAN_BYTES: usize = 256;
+
+/// `fixtures/all`'s prefix that picks `fixture`'s fixed variant on one
+/// worker, under the empty Plan. The default scenario runs one fixture, so
+/// a target covering every race fixture runs each one's fix.
+fn fixed_race(fixture: Which) -> Vec<u8> {
+    let index = |found: Option<usize>| {
+        // Six fixtures and five variants fit a byte.
+        u8::try_from(found.expect("every fixture and variant is listed")).expect("it fits a byte")
+    };
+    vec![
+        index(Which::ALL.iter().position(|which| *which == fixture)),
+        index(
+            Variant::ALL
+                .iter()
+                .position(|which| *which == Variant::Fixed),
+        ),
+        0,
+    ]
+}
+
+/// `entry`'s inputs, named: the empty input, which runs the default scenario
+/// under the empty Plan, then each scenario family's tag under the empty
+/// Plan, but the [`SLOW_FAMILIES`], then the harness's built corpus
+/// ([`HarnessEntry::corpus`]). A machine runs its written op tapes
+/// ([`support::machine_tapes`]) and the first [`PLANS_WITHOUT_FAMILIES`]
+/// generated ones, each at most
+/// `max_len` bytes, and `fixtures/all` runs each race fixture's fix
+/// ([`fixed_race`]). The harnesses' seeds live in the QA store, which a
+/// repository test doesn't read.
+fn inputs(entry: &HarnessEntry, max_len: usize) -> Vec<(String, Vec<u8>)> {
+    let mut inputs = vec![(format!("{} default", entry.name), Vec::new())];
+    let families = (entry.families)();
+    if entry.machine {
+        for (name, tape) in support::machine_tapes::tapes(entry.name) {
+            inputs.push((format!("{} {name}", entry.name), tape));
+        }
+        let plans = support::byte_inputs(PLANS_WITHOUT_FAMILIES, max_len.min(PLAN_BYTES));
+        for (index, plan) in plans.into_iter().enumerate() {
+            inputs.push((format!("{} plan {index}", entry.name), plan));
+        }
+    }
+    if entry.name == All::NAME {
+        for fixture in Which::ALL {
+            inputs.push((
+                format!("{} {fixture:?} fixed", entry.name),
+                fixed_race(fixture),
+            ));
+        }
+    }
+    for family in families {
+        let name = format!("{}/{}", entry.name, family.name);
+        if !SLOW_FAMILIES.contains(&name.as_str()) {
+            inputs.push((name, family.tag));
+        }
+    }
+    for (index, input) in (entry.corpus)().into_iter().enumerate() {
+        inputs.push((format!("{} corpus {index}", entry.name), input));
+    }
+    inputs
+}
+
+/// Each declared target resolves to its registered harness, and its
+/// harness's default scenario and scenario families ([`inputs`]) apply each
+/// of the harness's own properties and those of every harness the target
+/// covers, except the properties [`UNAPPLIED`] lists. A target whose inputs
+/// reach only the properties every harness checks fails here. The
+/// joint-run droplet's `cargo xtask sim-targets` runs the store's seeds.
 #[test]
-fn every_declared_target_runs_seeds_that_apply_its_properties() {
+fn every_declared_target_runs_inputs_that_apply_its_properties() {
     let suite = suite();
     let manifest = manifest();
     let declared = declared_targets(&suite);
     assert!(!declared.is_empty(), "{SUITE_FILE} declares sim targets");
     let mut mismatched = Vec::new();
+    // Targets whose inputs apply none of their own properties.
+    let mut inapplicable = Vec::new();
     for target in &declared {
         let entry = resolve(&manifest, &target.name).unwrap();
-        let loaded = seed::load(SeedSet::Corpus, Some(entry.name));
-        assert!(
-            loaded.rejected.is_empty(),
-            "{}: {:?}",
-            target.name,
-            loaded.rejected
-        );
-        let corpus = (entry.corpus)();
-        let inputs: Vec<(String, &[u8])> = loaded
-            .admitted
-            .iter()
-            .map(|seed| (seed.name.clone(), seed.input()))
-            .chain(
-                corpus
-                    .iter()
-                    .enumerate()
-                    .map(|(index, input)| (format!("corpus {index}"), input.as_slice())),
-            )
-            .collect();
-        assert!(
-            !inputs.is_empty(),
-            "{} ({}) has no curated seed and no built corpus",
-            target.name,
-            entry.name
-        );
+        let inputs = inputs(entry, max_len(&target.args).unwrap_or(PLAN_BYTES));
         if let Some(max) = max_len(&target.args) {
             for (name, input) in &inputs {
                 assert!(
@@ -365,7 +421,9 @@ fn every_declared_target_runs_seeds_that_apply_its_properties() {
             })
             .collect();
         let (applied, mut unapplied) = own_applicability(entry, &reached);
-        assert!(!applied.is_empty(), "{}", target.name);
+        if applied.is_empty() {
+            inapplicable.push(target.name.clone());
+        }
         unapplied.sort();
         if unapplied != unapplied_allowed(&target.name) {
             mismatched.push(format!("(\"{}\", &{unapplied:?}),", target.name));
@@ -383,15 +441,19 @@ fn every_declared_target_runs_seeds_that_apply_its_properties() {
             let (_, unapplied) = own_applicability(covered, &reached);
             assert!(
                 unapplied.is_empty(),
-                "{} covers {}, and no seed applies {unapplied:?}",
+                "{} covers {}, and no input applies {unapplied:?}",
                 target.name,
                 covered.name
             );
         }
     }
     assert!(
+        inapplicable.is_empty(),
+        "these targets' inputs apply none of their own properties: {inapplicable:?}"
+    );
+    assert!(
         mismatched.is_empty(),
-        "the seeds' unapplied own properties differ from UNAPPLIED; these entries match the seeds:\n{}",
+        "the inputs' unapplied own properties differ from UNAPPLIED; these entries match the inputs:\n{}",
         mismatched.join("\n")
     );
 }
@@ -432,47 +494,50 @@ fn declared_targets_are_the_sim_packages() {
     assert!(!declared.contains(&"fork_transitions".to_owned()));
 }
 
-/// The discovery seed carries the lost-wakeup bypass, and the header
-/// storage seeds carry the planted cases that name one of them as input.
+/// A store's seed case is a bypass of the seeds it names, a typed or search
+/// case of none, and a case that names none or more than one fails.
 #[test]
 fn bypasses_follow_their_seed() {
-    let load = |harness| seed::load(SeedSet::Corpus, Some(harness)).admitted;
-    let discovery = bypasses(&root(), &load("discovery/wait-complete")).unwrap();
-    assert_eq!(discovery.len(), 1, "{discovery:?}");
-    assert_eq!(discovery[0].property, "discovery/wait-complete-wakes");
+    let store = tempfile::tempdir().unwrap();
+    let write = |path: &str, text: &str| {
+        let path = store.path().join("qa/planted").join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    };
+    write(
+        "discovery/wait-complete-wakes/lost-wakeup.toml",
+        "seed = \"wait\"\n",
+    );
+    write("header-sync/storage-bound/other.toml", "seed = \"other\"\n");
+    write(
+        "header-sync/storage-bound/typed.toml",
+        "[typed]\nharness = \"header-sync/storage\"\nscenario = \"s.json\"\n",
+    );
+    write(
+        "header-sync/storage-bound/search.toml",
+        "[search]\nharness = \"header-sync/storage\"\nseed = 1\nruns = 8\n",
+    );
+    let seed = |name: &str| Seed::new(name, "discovery/wait-complete", "s.rs", Vec::new());
+    let found = bypasses(store.path(), &[seed("wait")]).unwrap();
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].property, "discovery/wait-complete-wakes");
     assert_eq!(
-        discovery[0].patch,
+        found[0].patch,
         Path::new("qa/planted/discovery/wait-complete-wakes/lost-wakeup.patch")
     );
-    let storage = bypasses(&root(), &load("header-sync/storage")).unwrap();
-    let patches: Vec<&Path> = storage
-        .iter()
-        .map(|bypass| bypass.patch.as_path())
-        .collect();
     assert_eq!(
-        patches,
-        [
-            "qa/planted/harness/direct-dispatch/locator-to-action-channel.patch",
-            "qa/planted/header-sync/chunk-budget-bound/uncapped-secondary-reservation.patch",
-            "qa/planted/header-sync/outstanding-work-bounded/secondary-reservation.patch",
-            "qa/planted/header-sync/stale-completion-inert/stale-charge.patch",
-            "qa/planted/header-sync/stale-completion-inert/stale-close.patch",
-            "qa/planted/header-sync/stale-completion-inert/stale-credit.patch",
-            "qa/planted/header-sync/stale-completion-inert/stale-release.patch",
-            "qa/planted/header-sync/stale-completion-inert/stale-retirement.patch",
-            "qa/planted/header-sync/teardown-returns-baseline/consumed-locator-permit.patch",
-            "qa/planted/header-sync/teardown-returns-baseline/forgotten-completion.patch",
-            "qa/planted/header-sync/teardown-returns-baseline/forgotten-locator-permit.patch",
-            "qa/planted/header-sync/teardown-returns-baseline/forgotten-retained-headers.patch",
-            "qa/planted/header-sync/teardown-returns-baseline/kept-queue-lease.patch",
-            "qa/planted/header-sync/teardown-returns-baseline/leaked-lease-clone.patch",
-            "qa/planted/header-sync/teardown-returns-baseline/leaked-reservation-entry.patch",
-            "qa/planted/header-sync/teardown-returns-baseline/shutdown-kept-queue.patch",
-            "qa/planted/header-sync/teardown-returns-baseline/skipped-round-release.patch",
-        ]
-        .map(Path::new),
-        "{storage:?}"
+        bypasses(store.path(), &[seed("other"), seed("wait")])
+            .unwrap()
+            .len(),
+        2
     );
+    assert!(bypasses(store.path(), &[]).unwrap().is_empty());
+    write("header-sync/storage-bound/bad.toml", "checks = []\n");
+    assert!(bypasses(store.path(), &[seed("wait")])
+        .unwrap_err()
+        .contains("this names 0"));
+    let empty = tempfile::tempdir().unwrap();
+    assert!(bypasses(empty.path(), &[seed("wait")]).unwrap().is_empty());
 }
 
 /// The harness's own properties leave out the ones every harness checks.

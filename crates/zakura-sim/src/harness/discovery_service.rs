@@ -861,8 +861,8 @@ pub fn wire_properties<S: HasView>() -> Vec<Property<S>> {
 pub const SCRIPTED: [&str; 1] = ["discovery/s4v2/services/over-owed-closes"];
 
 /// True if the generated ID `id` has a trigger history of its own, so a
-/// planted case under `qa/planted/` or a scripted bypass can fail it, and
-/// it isn't a `Draft`.
+/// planted case under the QA store's `qa/planted/` or a scripted bypass can
+/// fail it, and it isn't a `Draft`.
 pub fn has_planted_case(id: &str) -> bool {
     planted_trigger(id).is_some()
 }

@@ -1,13 +1,15 @@
 //! hdr-9d.1: `header-sync/outstanding-work-bounded` on `header-sync/storage`.
-//! Every committed authority and reset witness holds it and applies, under
-//! the empty Plan and under generated plans.
+//! Every churn witness holds it and applies, under the empty Plan and under
+//! generated plans. `tests/header_authority.rs` and
+//! `tests/header_reset_invalidates.rs` check the property on their own
+//! witnesses.
 //! `cargo xtask planted header-sync/outstanding-work-bounded` checks that its
 //! bypasses break it.
 #![cfg(zakura_sim)]
 
 mod support;
 
-use std::{collections::BTreeSet, fs, path::PathBuf, time::Duration};
+use std::{collections::BTreeSet, time::Duration};
 
 use support::{
     inputs,
@@ -21,11 +23,11 @@ use zakura_sim::{
         header_node::{
             outstanding::OutstandingEvidence,
             policy::{Allow, Hold, OpKind, Select, Trigger},
-            Chain, ControlAction, Policy,
+            Chain, ControlAction, ControlStep, Policy,
         },
         header_sync::{
             storage_witnesses::{mirror, step},
-            Dialer, NodeSettings, PageDelay, Storage, StorageScenario,
+            Dialer, MirrorSpec, NodeSettings, PageDelay, Storage, StorageScenario,
         },
         run_prepared, HarnessError, Subsystem,
     },
@@ -33,35 +35,195 @@ use zakura_sim::{
     MemorySink, Observation, Plan, PlanInput, RunReport, StepCtx,
 };
 
-/// Every committed storage witness the outstanding-work gate runs, by its
-/// fixture stem.
-const WITNESSES: [&str; 10] = [
-    "header-authority-forks-sharing-a-header",
-    "header-authority-relinked-mid-round",
-    "header-reset-held-apply",
-    "header-reset-held-reply",
-    "header-reset-quiet-reset",
-    "header-reset-quiet-reset-deep",
-    "header-outstanding-churn",
-    "header-outstanding-serving-churn",
-    "header-outstanding-serving-replaced",
-    "header-outstanding-capacity-waits",
-];
-
-/// The committed fixture `<stem>.<extension>`.
-fn fixture(stem: &str, extension: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures")
-        .join(format!("{stem}.{extension}"))
+/// The witnesses the outstanding-work gate runs, by name. `cargo xtask
+/// planted` runs each as a typed case, and the QA store holds it as
+/// `fixtures/header-outstanding-<name>.json`.
+fn witnesses() -> [(&'static str, StorageScenario); 4] {
+    [
+        ("churn", churn()),
+        ("serving-churn", serving_churn()),
+        ("serving-replaced", serving_replaced()),
+        ("capacity-waits", capacity_waits()),
+    ]
 }
 
-/// The committed scenario `stem`.
-fn scenario(stem: &str) -> StorageScenario {
-    serde_json::from_str(
-        &fs::read_to_string(fixture(stem, "json"))
-            .unwrap_or_else(|error| panic!("{stem}: {error}")),
-    )
-    .unwrap_or_else(|error| panic!("{stem}: {error}"))
+/// A mirror at `main` on the main chain that dials the node.
+fn main_mirror(main: u32) -> MirrorSpec {
+    mirror(Chain::main(main), Dialer::Mirror)
+}
+
+/// Every operation of `kind`.
+fn every(kind: OpKind) -> Select {
+    Select {
+        kind: Some(kind),
+        ..Select::default()
+    }
+}
+
+/// A hold on every operation of `kind` until `count` of them are
+/// submitted.
+fn held_until_submitted(kind: OpKind, count: u32) -> Hold {
+    Hold {
+        select: every(kind),
+        until: Trigger::Count(count, Box::new(Trigger::Submitted(every(kind)))),
+        then: vec![Allow::Engine],
+        deadline_ms: None,
+    }
+}
+
+/// `mirror-<index>`'s link closes once `when` holds, and relinks once it
+/// closed.
+fn close_and_relink(index: usize, when: Trigger) -> [ControlStep; 2] {
+    let peer = format!("mirror-{index}");
+    [
+        step(&peer, ControlAction::Close, Some(when)),
+        step(
+            &peer,
+            ControlAction::Relink,
+            Some(Trigger::Closed(peer.clone())),
+        ),
+    ]
+}
+
+/// The node at genesis with 6 mirrors at A3 to A8. Storage holds every
+/// prepare until 6 are submitted. Mirror `i`'s link closes once the
+/// `i + 1`th prepare is submitted and relinks, so every round churns while
+/// its prepare is held.
+fn churn() -> StorageScenario {
+    StorageScenario {
+        node: Chain::main(0),
+        mirrors: (3..9).map(main_mirror).collect(),
+        policy: Policy {
+            holds: vec![held_until_submitted(OpKind::Prepare, 6)],
+            ..Policy::converging()
+        },
+        controls: (0..6)
+            .flat_map(|index| {
+                let nth = u32::try_from(index + 1).expect("six prepares");
+                close_and_relink(index, Trigger::Submitted(Select::nth(OpKind::Prepare, nth)))
+            })
+            .collect(),
+        ..StorageScenario::default()
+    }
+}
+
+/// The node at A8 serving 4 mirrors at A2. Mirror `i`'s link closes once
+/// the node's `i + 1`th serving read completes, and relinks.
+fn serving_churn() -> StorageScenario {
+    StorageScenario {
+        node: Chain::main(8),
+        mirrors: (0..4).map(|_| main_mirror(2)).collect(),
+        policy: Policy::converging(),
+        controls: (0..4)
+            .flat_map(|index| {
+                let nth = u32::try_from(index + 1).expect("four reads");
+                close_and_relink(index, Trigger::Completed(Select::nth(OpKind::Read, nth)))
+            })
+            .collect(),
+        ..StorageScenario::default()
+    }
+}
+
+/// The node at A8 serving 11 mirrors at A2. Storage holds every serving
+/// read until `count` are submitted.
+fn serving_held_until(count: u32) -> StorageScenario {
+    StorageScenario {
+        node: Chain::main(8),
+        mirrors: (0..11).map(|_| main_mirror(2)).collect(),
+        policy: Policy {
+            holds: vec![held_until_submitted(OpKind::Read, count)],
+            ..Policy::converging()
+        },
+        ..StorageScenario::default()
+    }
+}
+
+/// [`serving_held_until`] 9 reads. Mirrors 1 to 3 close once the 8th read
+/// is submitted and relink, so the node replaces their serving sessions
+/// while reads are held.
+fn serving_replaced() -> StorageScenario {
+    StorageScenario {
+        controls: (1..4)
+            .flat_map(|index| {
+                close_and_relink(index, Trigger::Submitted(Select::nth(OpKind::Read, 8)))
+            })
+            .collect(),
+        ..serving_held_until(9)
+    }
+}
+
+/// The node at A8 serving `mirror-0` at A2. Storage holds the first serving
+/// read until a control releases it, for at most 1 s. The mirror's link
+/// closes once that read is submitted and relinks. The node commits one
+/// header once the second acquire completes, and releases the hold once
+/// the third completes ([`the_capacity_waits_fixture_refuses_twice_and_holds`]).
+fn capacity_waits() -> StorageScenario {
+    let node = |action, when| step("node", action, Some(when));
+    let mut controls =
+        close_and_relink(0, Trigger::Submitted(Select::nth(OpKind::Read, 1))).to_vec();
+    controls.extend([
+        node(
+            ControlAction::Commit { len: 1 },
+            Trigger::Completed(Select::nth(OpKind::Acquire, 2)),
+        ),
+        node(
+            ControlAction::Release { hold: 0 },
+            Trigger::Completed(Select::nth(OpKind::Acquire, 3)),
+        ),
+    ]);
+    StorageScenario {
+        node: Chain::main(8),
+        mirrors: vec![main_mirror(2)],
+        policy: Policy {
+            holds: vec![Hold {
+                select: Select::nth(OpKind::Read, 1),
+                until: Trigger::Released,
+                then: vec![Allow::Engine],
+                deadline_ms: Some(1_000),
+            }],
+            ..Policy::converging()
+        },
+        controls,
+        ..StorageScenario::default()
+    }
+}
+
+/// The node at genesis with 17 mirrors at A1 to A17, each advertising 235
+/// headers per response. Storage holds every prepare for the first 3 s.
+fn slot_limit() -> StorageScenario {
+    StorageScenario {
+        node: Chain::main(0),
+        mirrors: (1..18)
+            .map(|main| MirrorSpec {
+                max_headers_per_response: Some(235),
+                ..main_mirror(main)
+            })
+            .collect(),
+        policy: Policy {
+            holds: vec![Hold {
+                select: every(OpKind::Prepare),
+                until: Trigger::VirtualTime(3_000),
+                then: vec![Allow::Engine],
+                deadline_ms: None,
+            }],
+            ..Policy::converging()
+        },
+        ..StorageScenario::default()
+    }
+}
+
+/// The node at genesis with 17 mirrors at A1 to A17. Storage holds every
+/// locator read until 16 are submitted.
+fn locator_limit() -> StorageScenario {
+    StorageScenario {
+        node: Chain::main(0),
+        mirrors: (1..18).map(main_mirror).collect(),
+        policy: Policy {
+            holds: vec![held_until_submitted(OpKind::Locator, 16)],
+            ..Policy::converging()
+        },
+        ..StorageScenario::default()
+    }
 }
 
 /// Runs `scenario` under `input`, which must end without a violation or
@@ -94,24 +256,23 @@ fn held(stem: &str, report: &RunReport) {
     );
 }
 
-/// Each committed witness holds the property and applies under the empty
-/// Plan, which the planted gate runs.
+/// Each witness holds the property and applies under the empty Plan, which
+/// the planted gate runs.
 #[test]
 fn the_committed_witnesses_hold_outstanding_work_bounded() {
-    for stem in WITNESSES {
-        let report = run(stem, &scenario(stem), Plan::from_fuzz(&[]));
-        held(stem, &report);
+    for (name, scenario) in witnesses() {
+        let report = run(name, &scenario, Plan::from_fuzz(&[]));
+        held(name, &report);
     }
 }
 
-/// Each committed witness holds the property under generated plans too, so
-/// no honest schedule breaks a row.
+/// Each witness holds the property under generated plans too, so no honest
+/// schedule breaks a row.
 #[test]
 fn the_witnesses_hold_under_generated_plans() {
-    for stem in WITNESSES {
-        let scenario = scenario(stem);
+    for (name, scenario) in witnesses() {
         for input in inputs(8, 256) {
-            held(stem, &run(stem, &scenario, input));
+            held(name, &run(name, &scenario, input));
         }
     }
 }
@@ -130,28 +291,30 @@ fn the_witnesses_hold_under_generated_plans() {
 /// the peer's 2 execution slots, and [`departed_limit`] fills the departed
 /// strikes and cooldowns to the admitted peer limit's floor of 8. Each row
 /// reaches its limit and no further. The harness's step budget ends the
-/// first three runs before release and reuse, which the committed witnesses
-/// cover at their own scale.
+/// first three runs before release and reuse, which the witnesses cover at
+/// their own scale.
 #[test]
 fn the_limit_fixtures_reach_and_hold_their_bounds() {
-    for (stem, row, limit, sessions) in [
-        ("header-outstanding-slot-limit", "work slots", 16, 17),
-        ("header-outstanding-locator-limit", "locator reads", 16, 17),
+    for (stem, scenario, row, limit, sessions) in [
+        ("slot-limit", slot_limit(), "work slots", 16, 17),
+        ("locator-limit", locator_limit(), "locator reads", 16, 17),
         (
-            "header-outstanding-serving-limit",
+            "serving-limit",
+            serving_held_until(8),
             "node execution slots",
             8,
             11,
         ),
-        (EXECUTION_WAIT_FIXTURE, "peer execution slots", 2, 1),
-        (DEPARTED_FIXTURE, "departed strikes", 8, 4),
-        (DEPARTED_FIXTURE, "cooldowns", 8, 4),
+        (
+            EXECUTION_WAIT_FIXTURE,
+            peer_execution(),
+            "peer execution slots",
+            2,
+            1,
+        ),
+        (DEPARTED_FIXTURE, departed_limit(), "departed strikes", 8, 4),
+        (DEPARTED_FIXTURE, departed_limit(), "cooldowns", 8, 4),
     ] {
-        let scenario = match stem {
-            EXECUTION_WAIT_FIXTURE => peer_execution(),
-            DEPARTED_FIXTURE => departed_limit(),
-            committed => scenario(committed),
-        };
         let (report, evidence) = run_limit_fixture(stem, &scenario);
         held(stem, &report);
         let peaks = evidence.peaks();
@@ -165,10 +328,10 @@ fn the_limit_fixtures_reach_and_hold_their_bounds() {
 }
 
 /// [`peer_execution`]'s name in failures.
-const EXECUTION_WAIT_FIXTURE: &str = "header-outstanding-peer-execution";
+const EXECUTION_WAIT_FIXTURE: &str = "peer-execution";
 
 /// [`departed_limit`]'s name in failures.
-const DEPARTED_FIXTURE: &str = "header-outstanding-departed-limit";
+const DEPARTED_FIXTURE: &str = "departed-limit";
 
 /// The node at A8 serving `mirror-0` at A2, which dials it. Storage holds
 /// the node's first page read and its second lease acquire. The mirror's
@@ -573,8 +736,8 @@ fn refused_twice(label: &str, report: &RunReport, evidence: &OutstandingEvidence
 /// time and the property holds.
 #[test]
 fn the_capacity_waits_fixture_refuses_twice_and_holds() {
-    let stem = "header-outstanding-capacity-waits";
-    let scenario = scenario(stem);
+    let stem = "capacity-waits";
+    let scenario = capacity_waits();
     let mut plans = vec![Plan::from_fuzz(&[])];
     plans.extend(inputs(8, 256));
     for (index, input) in plans.into_iter().enumerate() {
@@ -594,7 +757,7 @@ fn the_capacity_waits_fixture_refuses_twice_and_holds() {
 /// both as [`refused_twice`] checks, and `waits-kept` breaks in both.
 #[test]
 fn a_late_commit_still_refuses_twice() {
-    let scenario = scenario("header-outstanding-capacity-waits");
+    let scenario = capacity_waits();
     let rule = |cx: &StepCtx<'_>| -> Result<Steer, String> {
         if !cx.pick.to_string().ends_with(":commit") {
             return Ok(Steer::Fine);
@@ -638,7 +801,7 @@ fn steered(scenario: &StorageScenario, rule: &Rule<'_>) -> (RunReport, Outstandi
 /// and the history is the same.
 #[test]
 fn a_delayed_relink_still_finds_the_lease_live() {
-    let scenario = scenario("header-outstanding-capacity-waits");
+    let scenario = capacity_waits();
     let rule = |cx: &StepCtx<'_>| -> Result<Steer, String> {
         let names: Vec<String> = cx
             .enabled

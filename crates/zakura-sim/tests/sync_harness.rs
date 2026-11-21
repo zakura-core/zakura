@@ -4,7 +4,7 @@
 //! sync, which follows the engine's committed views. No test injects
 //! pending work.
 //!
-//! Each saved scenario is a seed. It runs to its step budget holding its
+//! Each saved scenario runs from its tag. It runs to its step budget holding its
 //! witnesses, repeats A/A and A/B/A, and replays Exact in a fresh process
 //! through `zakura-sim replay`.
 #![cfg(zakura_sim)]
@@ -21,14 +21,14 @@ use support::inputs;
 use tempfile::TempDir;
 use zakura_sim::{
     domain::cross::HEADER_REORG_RETIRES_BLOCK_WORK,
+    explore::generate::ReachSearch,
     harness::{
         run_prepared,
         sync::{SavedSync, SyncPorts, SyncScenario, SyncStorage},
         HarnessError, Subsystem,
     },
     observe::BlockSyncFact,
-    seed, MemorySink, Observation, ObservationLog, Outcome, Plan, PlanInput, PropertyOutcome,
-    RunReport,
+    MemorySink, Observation, ObservationLog, Outcome, Plan, PlanInput, PropertyOutcome, RunReport,
 };
 
 /// Runs `scenario` under `input`, and returns the report with its records
@@ -49,7 +49,7 @@ fn run(scenario: &SyncScenario, input: PlanInput) -> (RunReport, Vec<String>, Sy
     (report, sink.lines(), ports)
 }
 
-/// Runs a full fuzz input as `zakura-sim record --seed` does: its prefix
+/// Runs a full fuzz input as `zakura-sim record --input` does: its prefix
 /// picks the scenario, and the rest is the Plan.
 fn replay(input: &[u8]) -> (RunReport, Vec<String>, SyncPorts) {
     let (prefix, plan) = input.split_at(SyncStorage::SCENARIO_BYTES);
@@ -117,7 +117,7 @@ fn a_header_reorg_reaches_block_sync_through_the_engine() {
     }
 }
 
-/// Each saved scenario's seed, its tag and the empty Plan, runs to its step
+/// Each saved scenario, its tag under the empty Plan, runs to its step
 /// budget with no property violated, its drain runs dry, and cleanup finds
 /// no panic, failed unwind or leaked task. Each of its witnesses applies
 /// and holds, and both of the node's tips reach the mirrors' tip unless the
@@ -204,7 +204,7 @@ fn trace_end(dir: &Path) -> String {
     trace.lines().last().unwrap().to_owned()
 }
 
-/// `zakura-sim record --seed` runs each saved scenario's seed in another
+/// `zakura-sim record --input` runs each saved scenario's tag in another
 /// process to the end record this process's run gives, and `zakura-sim
 /// replay` reruns its trace Exact in a third.
 #[test]
@@ -213,10 +213,14 @@ fn saved_scenarios_replay_exact_in_a_fresh_process() {
         let name = saved.name();
         let dir = TempDir::new().unwrap();
         let trace = dir.path().join("trace");
+        let input = dir.path().join("input.bin");
+        fs::write(&input, saved.tag()).unwrap();
         let recorded = zakura_sim(&[
             "record",
-            "--seed",
-            &format!("sync-storage-{name}"),
+            "--input",
+            input.to_str().unwrap(),
+            "--sim",
+            SyncStorage::NAME,
             "--out",
             trace.to_str().unwrap(),
         ]);
@@ -233,70 +237,61 @@ fn saved_scenarios_replay_exact_in_a_fresh_process() {
     }
 }
 
-/// The seed of `sync/header-reorg-retires-block-work`'s planted case: the
-/// saved `reorg` scenario under a fuzz Plan whose run delivers an old-epoch
-/// body after the sequencer applied the new epoch.
-const REORG_STALE_BODY: &str = "sync-storage-reorg-stale-body";
+/// How many runs [`stale_body_input`]'s search may take. #2604's seed
+/// search found its Plan within its first nine runs, so 64 leaves a margin
+/// of seven times that.
+const STALE_BODY_RUNS: u64 = 64;
 
-/// Checks that `input` fills the stale-body input's role, or returns why it
-/// falls short. Its run must hold every property, apply
-/// `sync/header-reorg-retires-block-work`, and have the sequencer refuse an
-/// older epoch's body after it applied a newer one. That refused body is
-/// the one `accept-stale-scope-bodies.patch` buffers instead.
-fn stale_body_shortfall(input: &[u8]) -> Result<(), String> {
-    let (prefix, plan) = input.split_at(SyncStorage::SCENARIO_BYTES);
-    let scenario = SyncStorage::draw(prefix);
-    let ports = SyncStorage::prepare(&scenario);
-    let mut sink = MemorySink::default();
-    let report = run_prepared::<SyncStorage>(
-        &scenario,
-        ports.clone(),
-        Plan::from_fuzz(plan),
-        &mut sink,
-        None,
-    )
-    .map_err(|error| error.to_string())?;
-    if let Some(violation) = &report.end.violation {
-        return Err(format!("the run violated {violation:?}"));
-    }
-    if let Some(violated) = report
-        .properties
-        .iter()
-        .find(|property| matches!(property.outcome, PropertyOutcome::Violated { .. }))
-    {
-        return Err(format!("{} was violated", violated.property));
-    }
+/// Whether `report`'s run fills the stale-body input's role: it violates
+/// no property, applies `sync/header-reorg-retires-block-work`, and has the
+/// sequencer refuse a body of an older epoch than the one it applied. That
+/// refused body is the one `accept-stale-scope-bodies.patch` buffers
+/// instead.
+fn refuses_a_stale_body(report: &RunReport) -> Option<()> {
+    let violated = report.end.violation.is_some()
+        || report
+            .properties
+            .iter()
+            .any(|property| matches!(property.outcome, PropertyOutcome::Violated { .. }));
     let applied = report.properties.iter().any(|property| {
         property.property == HEADER_REORG_RETIRES_BLOCK_WORK
             && matches!(property.outcome, PropertyOutcome::Held { applicable } if applicable > 0)
     });
-    if !applied {
-        return Err(format!("{HEADER_REORG_RETIRES_BLOCK_WORK} never applied"));
-    }
-    if !ports.cross.borrow().saw_stale_body_refused {
-        return Err("the sequencer refused no old-epoch body under a newer epoch".to_owned());
-    }
-    Ok(())
+    let refused = report.log.entries().iter().any(|entry| {
+        matches!(
+            &entry.obs,
+            Observation::BlockSync {
+                event: BlockSyncFact::StaleScope { body, scope_epoch },
+                ..
+            } if body.owner.body_work_epoch.zip(*scope_epoch).is_some_and(|(own, applied)| own < applied)
+        )
+    });
+    (!violated && applied && refused).then_some(())
 }
 
-/// The stale-body seed's search finds a Plan for the saved `reorg` scenario
-/// whose run makes the sequencer refuse an old-epoch body, which the
-/// cross checker's own record confirms here. The planted case runs the
-/// same input, so a block-sync change that moves the search off that order
-/// fails here instead of weakening the planted case.
+/// The saved `reorg` scenario's tag, then the Plan of the first of
+/// [`STALE_BODY_RUNS`] search runs that [`refuses_a_stale_body`]. Planted
+/// cases of `sync/header-reorg-retires-block-work` need that input.
+fn stale_body_input() -> Vec<u8> {
+    let search = ReachSearch {
+        prefix: SavedSync::Reorg.tag().to_vec(),
+        max_bytes: 16_384,
+        steer: None,
+        ..ReachSearch::new(support::REACH_SEED, STALE_BODY_RUNS)
+    };
+    support::reaches_with(SyncStorage::NAME, &search, refuses_a_stale_body).input
+}
+
+/// A Plan exists under which the saved `reorg` scenario makes the sequencer
+/// refuse an old-epoch body, so a block-sync change that moves every run
+/// off that order fails here.
 #[test]
-fn the_stale_body_input_refuses_an_old_epoch_body() {
-    let input = seed::find(REORG_STALE_BODY)
-        .expect("the seed is registered")
-        .input()
-        .to_vec();
+fn a_reorg_plan_refuses_an_old_epoch_body() {
+    let input = stale_body_input();
     assert_eq!(
         SyncStorage::draw(&input[..SyncStorage::SCENARIO_BYTES]),
         SavedSync::Reorg.scenario()
     );
-    if let Err(shortfall) = stale_body_shortfall(&input) {
-        panic!("{shortfall}");
-    }
 }
 
 /// Whether the sequencer applied a new body-work epoch while the work queue
@@ -333,7 +328,7 @@ fn reset_finds_stale_work(log: &ObservationLog) -> bool {
     })
 }
 
-/// `omit-work-reset`'s seed, the saved `reorg-request` scenario, still has
+/// `omit-work-reset`'s input, the saved `reorg-request` scenario, still has
 /// the sequencer apply the new epoch while the work queue holds the old
 /// epoch's taken work above the verified tip, which the held range read
 /// keeps there. Without that work the case's bypass leaves nothing behind,

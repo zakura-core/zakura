@@ -5,13 +5,14 @@
 //! The file holds one test, because it sets a process-wide variable.
 #![cfg(zakura_sim)]
 
+mod support;
+
 use std::{env, fs, path::Path};
 
 use serde_json::Value;
 use zakura_sim::{
     domain::discovery::WAIT_COMPLETE_WAKES,
     harness::{discovery::WaitComplete, run_harness},
-    seed,
     trace::end_records::END_RECORDS_VAR,
     witness::{witness, Expect, WitnessScenario},
     MemorySink, Plan,
@@ -33,12 +34,9 @@ fn records(dir: &Path) -> Vec<Value> {
 fn the_hook_writes_one_record_per_run_and_nothing_when_unset() {
     let root = tempfile::tempdir().unwrap();
     let dir = root.path().join("records");
-    // The seed reaches discovery's lost-wakeup race (`tests/witness.rs`
+    // The input reaches discovery's lost-wakeup race (`tests/witness.rs`
     // runs it).
-    let input = seed::find("discovery-wait-complete")
-        .expect("the seed is registered")
-        .input()
-        .to_vec();
+    let input = support::discovery_inputs::wait_complete_input();
     let run = || {
         run_harness::<WaitComplete>(
             &Default::default(),

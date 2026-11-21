@@ -8,7 +8,7 @@
 //!
 //! 1. resolves the target to its harness through the fuzz package's
 //!    `[package.metadata.zakura-sim.targets]` table and [`HARNESSES`];
-//! 2. builds the harness's corpus seeds ([`seed::load`]);
+//! 2. reads the harness's corpus seeds from the QA store ([`seed::load`]);
 //! 3. builds the target with [`build_fuzzer`];
 //! 4. runs the built target once on the admitted seeds, as libFuzzer runs a
 //!    list of files, with the suite row's libFuzzer arguments and variables
@@ -29,8 +29,8 @@
 //! that the target builds and runs its harness. It says nothing about how
 //! well the target searches.
 //!
-//! Each row also lists the retained production bypasses under
-//! `qa/planted/` whose committed input runs on the target's harness. `cargo
+//! Each row also lists the retained production bypasses under the QA
+//! store's `qa/planted/` whose seed runs on the target's harness. `cargo
 //! xtask planted --targets` runs each one through its target.
 //!
 //! The report also lists each harness no target runs, with its
@@ -170,7 +170,7 @@ pub struct SeedFile {
 pub struct BypassCase {
     /// The property the patch violates.
     pub property: String,
-    /// The patch, relative to the repository's root.
+    /// The patch, relative to the QA store's root.
     pub patch: PathBuf,
 }
 
@@ -420,11 +420,12 @@ pub fn max_len(args: &[String]) -> Option<usize> {
         .filter(|max| *max > 0)
 }
 
-/// The retained production bypasses under `repo`'s `qa/planted/` whose
-/// seed is one of `seeds`, by name. A typed or search case names no seed,
-/// so no target runs it. A case that names no seed, typed case or search,
-/// or more than one, is an error, as `cargo xtask planted` reports it.
-pub fn bypasses(repo: &Path, seeds: &[Seed]) -> Result<Vec<BypassCase>, String> {
+/// The retained production bypasses under the QA store `store`'s
+/// `qa/planted/` whose seed is one of `seeds`, by name. A typed or search
+/// case names no seed, so no target runs it. A case that names no seed,
+/// typed case or search, or more than one, is an error, as
+/// `cargo xtask planted` reports it.
+pub fn bypasses(store: &Path, seeds: &[Seed]) -> Result<Vec<BypassCase>, String> {
     #[derive(Deserialize)]
     struct CaseFile {
         seed: Option<String>,
@@ -432,7 +433,7 @@ pub fn bypasses(repo: &Path, seeds: &[Seed]) -> Result<Vec<BypassCase>, String> 
         search: Option<toml::Table>,
     }
     let mut cases = Vec::new();
-    let root = repo.join(PLANTED_DIR);
+    let root = store.join(PLANTED_DIR);
     let case_files = match planted::files(&root, "toml") {
         Ok(files) => files,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
@@ -564,7 +565,9 @@ fn check_target(
         Err(why) => return Ok(row.with(TargetStatus::Unresolved, why)),
     };
     let loaded = seed::load(SeedSet::Corpus, Some(entry.name));
-    row.bypasses = bypasses(&options.repo, &loaded.admitted).map_err(CampaignError::Refused)?;
+    if let Some(store) = planted::store_root() {
+        row.bypasses = bypasses(&store, &loaded.admitted).map_err(CampaignError::Refused)?;
+    }
     if let Some(failed) = loaded.rejected.first() {
         return Ok(row.with(
             TargetStatus::SeedsRejected,

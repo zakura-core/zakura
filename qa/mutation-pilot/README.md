@@ -176,8 +176,8 @@ results. `discovery` skips each case whose catalogue entry sets
 ## Feedback comparison
 
 `feedback.toml` is the feedback comparison's frozen case list (fuzz-14).
-Each case names a retained planted case by its path under `qa/planted/`,
-with its property, fuzz target and fault class. The list also freezes the
+Each case names a retained planted case by its path under the QA store's
+`qa/planted/` (`scripts/qa_store.py`), with its property, fuzz target and fault class. The list also freezes the
 bounds: ten seeds, two arms (semantic feedback `on` and `off`), 600 seconds
 per campaign, one worker, `campaign start`'s default input limits
 (4096-byte inputs, a 30-second input limit, 4096 MiB RSS), no restarts, no
@@ -186,15 +186,16 @@ from `qa/suite.toml`. Confirmation gets 300 seconds per child. To extend the
 list, add a `[[case]]`.
 
 The cases run on `header_sync_storage`, `header_sync_wire`, `sync_storage`
-and `sync_wire`. Each passes the protocol-state collector,
-and each harness logs the observations the collector reads. Nightly
-`cargo xtask planted --targets` confirms each case's seed through its
-target. `discovery_wire` has none in the list: #2604 removed its one seed
-case, and #2639 re-evaluates it. `block_sync_storage` has none in the list: a generated run takes about 96 seconds, so a 600-second
-campaign runs a handful of inputs.
+and `sync_wire`. Each passes the protocol-state collector, and each harness
+logs the observations the collector reads. The joint-run droplet's
+`cargo xtask planted --targets` confirms each case's seed through its target.
+`discovery_wire` has none in the list: #2604 removed its one seed case, and
+issue #2639 re-evaluates it. `block_sync_storage` has none in the list: a
+generated run takes about 96 seconds, so a 600-second campaign runs a handful
+of inputs.
 
 `cargo xtask planted pilot feedback` builds the runner tree's simulator to
-list the seed registry, then reads the list and checks each case: its patch
+list the QA store's seeds, then reads the list and checks each case: its patch
 must exist, its property must be the case's directory, its seed must be in
 the registry, and its target must run its seed's harness. A case listed
 twice and a typed case fail. The runner then builds the runner tree's

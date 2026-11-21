@@ -2,7 +2,7 @@
 //! simulated QUIC, each behind a real handler that registers header sync,
 //! block sync and discovery, so all three services share each connection.
 //!
-//! Each saved scenario is a seed. It runs to its step budget holding its
+//! Each saved scenario runs from its tag. It runs to its step budget holding its
 //! witnesses, repeats A/A and A/B/A, and replays Exact in a fresh process
 //! through `zakura-sim replay`.
 #![cfg(zakura_sim)]
@@ -74,7 +74,7 @@ fn run_scenario_judged_by_caller(
     (report, sink.lines(), ports)
 }
 
-/// Runs a full fuzz input as `zakura-sim record --seed` does.
+/// Runs a full fuzz input as `zakura-sim record --input` does.
 fn replay(input: &[u8]) -> (RunReport, Vec<String>, SyncPorts) {
     let (prefix, plan) = input.split_at(SyncWire::SCENARIO_BYTES.min(input.len()));
     run_scenario(&SyncWire::draw(prefix), Plan::from_fuzz(plan))
@@ -210,9 +210,9 @@ fn refused_stale_writes(log: &ObservationLog) -> Vec<u64> {
 /// registry writes meet the replacement's entry, and the gates refuse them.
 #[test]
 fn a_replaced_connection_reopens_every_service_under_fresh_ids() {
-    // The seed's Plan is empty.
-    let seed = Plan::from_fuzz(&[]);
-    for input in std::iter::once(seed).chain(inputs(2, 256)) {
+    // The tag runs the empty Plan first.
+    let empty = Plan::from_fuzz(&[]);
+    for input in std::iter::once(empty).chain(inputs(2, 256)) {
         let (report, _, ports) = run(SavedWire::Replace, input);
         let tip = ports.mirror_tip();
         assert_eq!(ports.tips(), (tip, tip), "{:?}", report.end);
@@ -306,9 +306,9 @@ fn replacement_claims_at_superseded_end(log: &ObservationLog) -> Vec<usize> {
 /// node's tips still reach the mirror's tip.
 #[test]
 fn a_superseded_routine_drops_beside_its_replacements_claims() {
-    // The seed's Plan is empty.
-    let seed = Plan::from_fuzz(&[]);
-    for input in std::iter::once(seed).chain(inputs(2, 256)) {
+    // The tag runs the empty Plan first.
+    let empty = Plan::from_fuzz(&[]);
+    for input in std::iter::once(empty).chain(inputs(2, 256)) {
         let (report, _, ports) = run(SavedWire::ReplaceClaims, input);
         let tip = ports.mirror_tip();
         assert_eq!(ports.tips(), (tip, tip), "{:?}", report.end);
@@ -388,9 +388,9 @@ fn a_redial_asleep_at_the_budget_finishes_in_the_drain() {
 /// complete.
 #[test]
 fn a_stalled_block_session_starves_no_other_service() {
-    // The seed's Plan is empty.
-    let seed = Plan::from_fuzz(&[]);
-    for input in std::iter::once(seed).chain(inputs(2, 256)) {
+    // The tag runs the empty Plan first.
+    let empty = Plan::from_fuzz(&[]);
+    for input in std::iter::once(empty).chain(inputs(2, 256)) {
         let (report, _, ports) = run(SavedWire::StalledBlocks, input);
         let tip = ports.mirror_tip();
         let fixture_tip = ports.chain.last().expect("the fixture has blocks").height.0;
@@ -638,7 +638,7 @@ fn a_frame_behind_many_small_bodies_waits_within_one_send_window() {
 
 /// fuzz-13's combined actions: each curated combination of a chain change
 /// at a pipeline stage, a connection replacement and a read stall runs its
-/// seed's empty Plan with no active property violated, and both of the node's
+/// prefix under the empty Plan with no active property violated, and both of the node's
 /// tips reach the mirrors' tip.
 #[test]
 fn curated_combined_actions_sync_both_tips() {
@@ -818,7 +818,7 @@ fn end(lines: &[String]) -> &str {
     lines.last().expect("a run writes its end record")
 }
 
-/// Each saved scenario's seed, its tag and the empty Plan, runs to its step
+/// Each saved scenario, its tag under the empty Plan, runs to its step
 /// budget with no property violated, its drain runs dry, and cleanup finds
 /// no panic, failed unwind or leaked task. Each of its witnesses applies
 /// and holds.
@@ -903,7 +903,7 @@ fn trace_end(dir: &Path) -> String {
     trace.lines().last().unwrap().to_owned()
 }
 
-/// `zakura-sim record --seed` runs each saved scenario's seed in another
+/// `zakura-sim record --input` runs each saved scenario's tag in another
 /// process to the end record this process's run gives, and `zakura-sim
 /// replay` reruns its trace Exact in a third.
 #[test]
@@ -912,10 +912,14 @@ fn saved_scenarios_replay_exact_in_a_fresh_process() {
         let name = saved.name();
         let dir = TempDir::new().unwrap();
         let trace = dir.path().join("trace");
+        let input = dir.path().join("input.bin");
+        fs::write(&input, saved.tag()).unwrap();
         let recorded = zakura_sim(&[
             "record",
-            "--seed",
-            &format!("sync-wire-{name}"),
+            "--input",
+            input.to_str().unwrap(),
+            "--sim",
+            SyncWire::NAME,
             "--out",
             trace.to_str().unwrap(),
         ]);

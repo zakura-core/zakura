@@ -23,7 +23,7 @@ use rustls_pki_types::{alg_id, SubjectPublicKeyInfoDer, UnixTime};
 
 use crate::{
     inputs::EndpointInputs,
-    key::{NodeKey, NodeSecretKey, KEY_LENGTH},
+    key::{NodeId, NodeKey, NodeSecretKey, KEY_LENGTH},
 };
 
 pub(crate) mod hybrid;
@@ -125,7 +125,7 @@ impl TlsConfig {
         let tls = Self::with_provider(secret_key, provider);
         #[cfg(any(test, zakura_sim))]
         inputs.provider_built(&tls.provider);
-        tls.client_config(secret_key.public_key(), &[b"zakura-quic/check"])?;
+        tls.client_config(secret_key.public(), &[b"zakura-quic/check"])?;
         Ok(tls)
     }
 
@@ -164,11 +164,12 @@ impl TlsConfig {
         Ok(crypto)
     }
 
-    /// Builds a client config that accepts only a server that proves the key
-    /// `expected` (TLS-7), and offers `alpns` in preference order.
+    /// Builds a client config that accepts only a server whose credential
+    /// derives the node ID `expected` (TLS-7), and offers `alpns` in
+    /// preference order.
     pub(crate) fn client_config(
         &self,
-        expected: NodeKey,
+        expected: NodeId,
         alpns: &[&[u8]],
     ) -> Result<QuicClientConfig, TlsConfigError> {
         Ok(QuicClientConfig::try_from(
@@ -178,7 +179,7 @@ impl TlsConfig {
 
     fn rustls_client(
         &self,
-        expected: NodeKey,
+        expected: NodeId,
         alpns: &[&[u8]],
     ) -> Result<rustls::ClientConfig, TlsConfigError> {
         let mut crypto =
@@ -224,14 +225,24 @@ pub(crate) fn node_key_from_spki(spki: &[u8]) -> Option<NodeKey> {
     (ed25519_spki(&key).as_ref() == spki).then_some(key)
 }
 
-/// Returns the key a connection's peer proved in the TLS handshake (TLS-8).
-pub(crate) fn remote_node_key(session: &dyn quinn_proto::crypto::Session) -> Option<NodeKey> {
+/// Derives the node ID a TLS credential names (TLS-8).
+///
+/// This is the one place a credential becomes a node ID: the client verifier
+/// compares its result with the dialed ID, and both endpoints report it as
+/// the peer's ID. Today the credential is an Ed25519 key and the ID is that
+/// key.
+pub(crate) fn node_id_from_credential(spki: &[u8]) -> Option<NodeId> {
+    node_key_from_spki(spki).map(NodeId::from)
+}
+
+/// Returns the node ID a connection's peer proved in the TLS handshake (TLS-8).
+pub(crate) fn remote_node_id(session: &dyn quinn_proto::crypto::Session) -> Option<NodeId> {
     let certs = session
         .peer_identity()?
         .downcast::<Vec<rustls_pki_types::CertificateDer<'static>>>()
         .ok()?;
     match certs.as_slice() {
-        [cert] => node_key_from_spki(cert.as_ref()),
+        [cert] => node_id_from_credential(cert.as_ref()),
         _ => None,
     }
 }
@@ -694,7 +705,7 @@ mod tests {
         // Writing a ClientHello starts the key share.
         let starts = TLS12_ONLY_P256.0.load(std::sync::atomic::Ordering::Relaxed);
         let client = tls
-            .rustls_client(NodeSecretKey::generate().public_key(), &[b"a"])
+            .rustls_client(NodeSecretKey::generate().public(), &[b"a"])
             .unwrap();
         let name = rustls_pki_types::ServerName::try_from(UNSENT_SERVER_NAME).unwrap();
         rustls::ClientConnection::new(Arc::new(client), name).unwrap();
@@ -734,7 +745,7 @@ mod tests {
         let tls = TlsConfig::new(&NodeSecretKey::generate());
         let server = tls.rustls_server(vec![b"a".to_vec()]).unwrap();
         let client = tls
-            .rustls_client(NodeSecretKey::generate().public_key(), &[b"a"])
+            .rustls_client(NodeSecretKey::generate().public(), &[b"a"])
             .unwrap();
         assert_eq!(format!("{:?}", server.time_provider), "RuntimeUtc");
         assert_eq!(format!("{:?}", client.time_provider), "RuntimeUtc");
@@ -762,7 +773,7 @@ mod tests {
         assert_eq!(server.send_tls13_tickets, 0);
         assert_eq!(server.alpn_protocols, [b"b".to_vec(), b"a".to_vec()]);
 
-        let peer = NodeSecretKey::generate().public_key();
+        let peer = NodeSecretKey::generate().public();
         let client = tls.rustls_client(peer, &[b"b", b"a"]).unwrap();
         assert!(!client.enable_sni);
         assert!(!client.enable_early_data);

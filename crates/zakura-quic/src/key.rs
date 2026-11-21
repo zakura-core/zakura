@@ -34,8 +34,9 @@ pub struct NodeKey([u8; KEY_LENGTH]);
 
 /// A node identity: the name peers know a node by (ID-1).
 ///
-/// A node ID is the node's [`NodeKey`], so it has the same 32 bytes and the
-/// same checks. Code that needs the key itself, to verify a signature or
+/// A node ID is always 32 bytes. Today it is the node's [`NodeKey`], so it
+/// has the same bytes and the same checks; a later version makes it the hash
+/// of the node's key list, still 32 bytes. Code that needs the key itself, to verify a signature or
 /// build a TLS certificate, takes it with [`key`](Self::key). Text form is 64
 /// lowercase hex characters (ID-2).
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

@@ -5,7 +5,7 @@
 //!
 //! One change: Iroh decoded the expected server identity from a synthetic
 //! server name. Zakura builds one verifier per dial that holds the expected
-//! [`NodeKey`] in memory (TLS-6), so no name encoding is needed.
+//! [`NodeId`] in memory (TLS-6), so no name encoding is needed.
 
 use rustls::{
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
@@ -19,7 +19,7 @@ use rustls_pki_types::{
     SignatureVerificationAlgorithm, SubjectPublicKeyInfoDer, UnixTime,
 };
 
-use crate::key::NodeKey;
+use crate::key::{NodeId, NodeKey};
 
 /// TLS 1.3 is the only version (TLS-1).
 pub(crate) const PROTOCOL_VERSIONS: &[&SupportedProtocolVersion] = &[&rustls::version::TLS13];
@@ -30,14 +30,14 @@ const SUPPORTED_SIG_ALGS: WebPkiSupportedAlgorithms = WebPkiSupportedAlgorithms 
     mapping: &[(SignatureScheme::ED25519, &[&ED25519_STRICT])],
 };
 
-/// Accepts the server only if its raw public key equals the dialed node's key (TLS-7).
+/// Accepts the server only if its credential derives the dialed node ID (TLS-7).
 #[derive(Debug)]
 pub(crate) struct ServerCertificateVerifier {
-    expected: NodeKey,
+    expected: NodeId,
 }
 
 impl ServerCertificateVerifier {
-    pub(crate) fn new(expected: NodeKey) -> Self {
+    pub(crate) fn new(expected: NodeId) -> Self {
         Self { expected }
     }
 }
@@ -57,10 +57,7 @@ impl ServerCertVerifier for ServerCertificateVerifier {
             ));
         }
 
-        // Comparing whole SPKI encodings checks both the constant Ed25519
-        // prefix and the key bytes.
-        let expected = super::ed25519_spki(&self.expected);
-        if expected.as_ref() != end_entity.as_ref() {
+        if super::node_id_from_credential(end_entity.as_ref()) != Some(self.expected) {
             return Err(rustls::Error::InvalidCertificate(
                 CertificateError::UnknownIssuer,
             ));
@@ -130,7 +127,7 @@ impl ClientCertVerifier for ClientCertificateVerifier {
                 CertificateError::UnknownIssuer,
             ));
         }
-        if super::node_key_from_spki(end_entity.as_ref()).is_none() {
+        if super::node_id_from_credential(end_entity.as_ref()).is_none() {
             return Err(rustls::Error::InvalidCertificate(
                 CertificateError::BadEncoding,
             ));

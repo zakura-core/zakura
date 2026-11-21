@@ -200,7 +200,7 @@ fn stalled_handshake_to(server: &QuicEndpoint) -> StalledHandshake {
         None,
     );
     let tls = crate::tls::TlsConfig::new(&NodeSecretKey::generate())
-        .client_config(server.local_id().key(), &[ALPN])
+        .client_config(server.local_id(), &[ALPN])
         .unwrap();
     let now = std::time::Instant::now();
     let (_, mut conn) = endpoint
@@ -1115,7 +1115,7 @@ fn raw_client_builder(
         .unwrap()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(
-            crate::tls::verifier::ServerCertificateVerifier::new(server.endpoint.local_id().key()),
+            crate::tls::verifier::ServerCertificateVerifier::new(server.endpoint.local_id()),
         ))
 }
 

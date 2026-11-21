@@ -189,13 +189,15 @@ at fork tag `zakura-iroh-v1.1.0-rc.1`, and it keeps their MIT/Apache-2.0 notices
 - **TLS-4.** The only signature scheme is `ED25519`.
 - **TLS-5.** Client authentication is mandatory. The server MUST abort a
   handshake without a client key.
-- **TLS-6.** The client MUST NOT send SNI. It passes the `NodeKey` from the
-  dialed `NodeId` to its verifier in memory.
-- **TLS-7.** The client verifier MUST abort unless the server presents the
-  expected `NodeKey`.
+- **TLS-6.** The client MUST NOT send SNI. It passes the dialed `NodeId` to
+  its verifier in memory.
+- **TLS-7.** The client verifier MUST abort unless the `NodeId` derived from
+  the server's credential (TLS-8) equals the dialed `NodeId`.
 - **TLS-8.** Each endpoint MUST derive the peer's `NodeId` from the
-  `NodeKey` the peer proved in the TLS handshake. `Conn::remote_key()`
-  returns that key, and `Conn::remote_id()` returns the derived ID.
+  credential the peer proved in the TLS handshake, through one derivation
+  that the client verifier also uses. The credential is the peer's Ed25519
+  `NodeKey`, and the derived ID is that key. `Conn::remote_key()` returns
+  the key, and `Conn::remote_id()` returns the derived ID.
 - **TLS-9.** The crypto provider is rustls' `ring` provider with its default
   TLS 1.3 cipher suites and one added key-exchange group, X25519MLKEM768
   (`draft-ietf-tls-ecdhe-mlkem`, group 0x11ec), offered ahead of ring's
@@ -1752,8 +1754,10 @@ Changed:
 
 - **ID-1.** Defines `NodeKey` as the Ed25519 public key and `NodeId` as the
   node's `NodeKey`. The construction checks are the same for both.
-- **TLS-6 through TLS-8.** The client verifier takes an expected `NodeKey`.
-  Both endpoints derive the peer's ID from the key proved in TLS.
+- **TLS-6 through TLS-8.** The client verifier takes the dialed `NodeId`
+  and compares it with the ID derived from the server's credential. Both
+  endpoints derive the peer's ID from the credential proved in TLS, through
+  the same derivation.
 - **API-1.** Adds `NodeKey`, `NodeId::key()` and
   `NodeSecretKey::public_key()`. `NodeId::verify_strict()` delegates
   to `NodeKey::verify_strict()`.

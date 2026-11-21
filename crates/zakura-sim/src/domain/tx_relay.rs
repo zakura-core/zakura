@@ -222,6 +222,8 @@ pub struct Peak {
     /// Ids reserving, requested or awaiting a verdict, with what ended
     /// sessions left.
     pub requests: usize,
+    /// What a peer's ended sessions left: reserve calls and submissions.
+    pub unsettled: usize,
     /// Requests whose answers the IO has not started.
     pub serving: usize,
     /// Ids pending or waiting.
@@ -514,6 +516,7 @@ impl RelayEvidence {
         let held = state.pending.max(state.waiting);
         let peak = &mut self.peak;
         peak.requests = peak.requests.max(requests);
+        peak.unsettled = peak.unsettled.max(state.unsettled);
         peak.serving = peak.serving.max(state.serving);
         peak.held = peak.held.max(held);
         peak.known = peak.known.max(state.known);

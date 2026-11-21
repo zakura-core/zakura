@@ -16,8 +16,8 @@ use support::script::{run_under, Node, OBSERVED};
 use zakura_chain::transaction::{self, UnminedTxId};
 use zakura_network::zakura::{
     tx_relay_sim::{
-        Received, SimEffect, SimState, TxRelayEvent, KNOWN_CAP, MAX_SERVES, PENDING_PER_PEER,
-        TX_RELAY_STREAMS,
+        Received, SimEffect, SimState, TxRelayEvent, INITIAL_WINDOW, KNOWN_CAP, MAX_SERVES,
+        PENDING_PER_PEER, TX_RELAY_STREAMS,
     },
     CloseOutcome, CloseRow, ZakuraPeerId,
 };
@@ -187,6 +187,25 @@ fn holds_in_its_witness(id: &str) {
 #[test]
 fn requests_within_limit_holds_in_its_witness() {
     holds_in_its_witness(REQUESTS_WITHIN_LIMIT);
+}
+
+/// A session that ends with a window of bodies awaiting their verdicts
+/// hands them to its peer's next session, and its last step counts them
+/// once. The pool decides nothing before the reopen, so the window never
+/// grows past its start.
+#[test]
+fn an_ended_sessions_submissions_count_once() {
+    let reopen = [
+        RelayStep::AnnounceAll,
+        RelayStep::Wait { secs: 1 },
+        RelayStep::Reopen,
+        WAIT,
+    ];
+    let (report, evidence) = run(&prefix(0x03, 0, 0, &reopen));
+    assert_eq!(violated(&report), Vec::<String>::new());
+    let peak = lock(&evidence).peak;
+    assert_eq!(peak.unsettled, INITIAL_WINDOW, "{peak:?}");
+    assert_eq!(peak.requests, INITIAL_WINDOW, "{peak:?}");
 }
 
 #[test]

@@ -1228,14 +1228,24 @@ impl Routine {
             })
             .collect();
         let state = &self.machine.state;
+        // An ended session handed its reserve calls and submissions to the
+        // reactor, which `unsettled` counts, so it reports none of its own.
+        let (asking, in_flight) = if self.machine.is_ended() {
+            (0, 0)
+        } else {
+            (
+                state.requests.len().saturating_add(state.reserving.len()),
+                state.in_flight(),
+            )
+        };
         observer(TxRelayEvent::Stepped {
             session: session.0,
             effects,
             state: SimState {
                 hello_serves: state.hello.map(|hello| hello.serves),
                 window: state.window,
-                asking: state.requests.len().saturating_add(state.reserving.len()),
-                in_flight: state.in_flight(),
+                asking,
+                in_flight,
                 unsettled: shared.reactor.unsettled_count(peer),
                 serving: state.serving.len(),
                 pending: state.pending.len(),

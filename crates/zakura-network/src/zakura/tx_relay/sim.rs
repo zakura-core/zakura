@@ -29,6 +29,9 @@ pub const MAX_TX_BYTES: u32 = super::wire::MAX_TX_BYTES;
 /// and the largest request window a session can have.
 pub const MAX_SERVES: usize = machine::MAX_SERVES;
 
+/// A new session's request window.
+pub const INITIAL_WINDOW: usize = machine::INITIAL_WINDOW;
+
 /// Ids one session may hold pending.
 pub const PENDING_PER_PEER: usize = machine::PENDING_PER_PEER;
 

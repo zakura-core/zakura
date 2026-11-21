@@ -126,6 +126,9 @@ pub struct SuiteFile {
     /// The harnesses no target runs yet.
     #[serde(default)]
     pub missing_target: Vec<MissingTarget>,
+    /// The harnesses no target runs by design, each with its reason.
+    #[serde(default)]
+    pub excluded_harness: Vec<ExcludedHarness>,
     /// The planned rows nothing implements yet.
     #[serde(default)]
     pub pending: Vec<Pending>,
@@ -256,6 +259,17 @@ pub struct ExcludedTarget {
     /// The target's `[[bin]]` name.
     pub name: String,
     /// Why.
+    pub reason: String,
+}
+
+/// A harness no target runs by design, such as a fixed fixture whose
+/// scenario no fuzz input can vary.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct ExcludedHarness {
+    /// The harness.
+    pub harness: String,
+    /// Why no target runs it.
     pub reason: String,
 }
 
@@ -575,6 +589,8 @@ pub struct HarnessRow {
     pub seed_set: String,
     /// Its missing-target row, if no target runs it.
     pub missing_target: Option<String>,
+    /// Its excluded-harness row, if no target runs it by design.
+    pub excluded: Option<String>,
 }
 
 /// A property one harness reports.
@@ -776,7 +792,8 @@ pub struct PendingRow {
 /// An ignored test or fuzz target the suite leaves out.
 #[derive(Clone, Debug, Serialize)]
 pub struct ExcludedRow {
-    /// `excluded/<file>/<test>` or `excluded/target/<package>/<name>`.
+    /// `excluded/<file>/<test>`, `excluded/target/<package>/<name>` or
+    /// `excluded/harness/<harness>`.
     pub id: String,
     /// [`Expect::Excluded`].
     pub expect: Expect,
@@ -893,11 +910,15 @@ impl Builder<'_> {
         let (targets, excluded_targets, fuzz_lockfiles) = self.targets();
         let witnesses = self.witnesses(&tests, &planted);
         let pending = self.pending();
+        let excluded_harnesses = self.excluded_harnesses();
         let (harnesses, properties) =
             self.harnesses(&witnesses, &seed_witnesses, &targets, &pending);
         let coverage = coverage_rows(&harnesses, &properties, &targets);
-        let excluded: Vec<ExcludedRow> =
-            excluded_tests.into_iter().chain(excluded_targets).collect();
+        let excluded: Vec<ExcludedRow> = excluded_tests
+            .into_iter()
+            .chain(excluded_targets)
+            .chain(excluded_harnesses)
+            .collect();
         let mut counts = Counts {
             harnesses: harnesses.len(),
             properties: properties.len(),
@@ -1810,6 +1831,40 @@ impl Builder<'_> {
         found.map(|row| row.id.clone())
     }
 
+    /// The excluded-harness rows. A row for a harness that isn't
+    /// registered, or for one that a missing-target row also names, is a
+    /// problem.
+    fn excluded_harnesses(&mut self) -> Vec<ExcludedRow> {
+        let mut rows = Vec::new();
+        for excluded in self.suite.excluded_harness.clone() {
+            if !HARNESSES.iter().any(|entry| entry.name == excluded.harness) {
+                self.problem(format!(
+                    "{SUITE_FILE} excludes the harness `{}`, which isn't registered",
+                    excluded.harness
+                ));
+            }
+            if self
+                .suite
+                .missing_target
+                .iter()
+                .any(|missing| missing.harness == excluded.harness)
+            {
+                self.problem(format!(
+                    "{SUITE_FILE} both excludes the harness `{}` and lists it as a missing \
+                     target",
+                    excluded.harness
+                ));
+            }
+            let id = self.id(format!("excluded/harness/{}", excluded.harness));
+            rows.push(ExcludedRow {
+                id,
+                expect: Expect::Excluded,
+                reason: excluded.reason,
+            });
+        }
+        rows
+    }
+
     /// The missing-target and pending rows. A pending property or harness
     /// that is now registered is a problem, and so is a pending feature
     /// family that no required state waits in.
@@ -1894,10 +1949,22 @@ impl Builder<'_> {
                 .iter()
                 .any(|row| row.id == missing_id)
                 .then_some(missing_id);
+            let excluded = self
+                .suite
+                .excluded_harness
+                .iter()
+                .any(|row| row.harness == entry.name);
+            if excluded && !running.is_empty() {
+                self.problem(format!(
+                    "a target runs the harness `{}`, and {SUITE_FILE} still excludes it",
+                    entry.name
+                ));
+            }
             match (running.is_empty(), &missing) {
+                (true, None) if excluded => {}
                 (true, None) => self.problem(format!(
                     "no target runs the harness `{}`, and {SUITE_FILE} has no \
-                     `[[missing-target]]` row for it",
+                     `[[missing-target]]` or `[[excluded-harness]]` row for it",
                     entry.name
                 )),
                 (false, Some(_)) => self.problem(format!(
@@ -1947,6 +2014,7 @@ impl Builder<'_> {
                 targets: running,
                 seed_set,
                 missing_target: missing,
+                excluded: excluded.then(|| format!("excluded/harness/{}", entry.name)),
             });
         }
         (harnesses, properties)

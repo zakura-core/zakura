@@ -92,6 +92,12 @@ pub trait Subsystem: HasView + Sized + 'static {
     /// this harness can cover only these. None by default.
     const COMPOSES: &'static [&'static str] = &[];
 
+    /// Whether a prefix that starts with no family's tag draws a free
+    /// scenario, as a machine's operation tape does: its bytes pick the
+    /// actions from the harness's whole alphabet. `false` by default, for a
+    /// harness whose untagged prefix runs a default or planned scenario.
+    const UNTAGGED_FREE: bool = false;
+
     /// Whether the harness plants the bugs its `Active` properties catch,
     /// as the race fixtures do, so its runs must violate them. `false` by
     /// default.
@@ -180,6 +186,14 @@ pub struct ScenarioFamily {
     ///
     /// [`DrawPolicy::Cycle`]: crate::explore::generate::DrawPolicy::Cycle
     pub variants: u16,
+    /// True if the family's draw composes the scenario from the bytes after
+    /// the tag: the adversary's actions, the node's limits or the links'
+    /// faults, rather than naming one planned scenario. The generator's free
+    /// draws write only free tags ([`DrawPolicy::Free`]), and the reach
+    /// report counts their runs as random.
+    ///
+    /// [`DrawPolicy::Free`]: crate::explore::generate::DrawPolicy::Free
+    pub free: bool,
 }
 
 impl ScenarioFamily {
@@ -189,6 +203,16 @@ impl ScenarioFamily {
             name,
             tag: tag.into(),
             variants: 1,
+            free: false,
+        }
+    }
+
+    /// The free family `tag` picks, named `name`: its draw composes the
+    /// scenario from the prefix's other bytes ([`ScenarioFamily::free`]).
+    pub fn free(name: &'static str, tag: impl Into<Vec<u8>>) -> Self {
+        ScenarioFamily {
+            free: true,
+            ..ScenarioFamily::new(name, tag)
         }
     }
 
@@ -201,6 +225,22 @@ impl ScenarioFamily {
             .expect("one byte picks 1 to 256 variants");
         ScenarioFamily { variants, ..self }
     }
+}
+
+/// `source`, a full fuzz input whose scenario prefix was `old` bytes long,
+/// with the prefix widened to `new` bytes: zeros after the old prefix, then
+/// the Plan bytes. A harness that adds a longer free family to a short
+/// prefix migrates with it, since its old draws read only the first `old`
+/// bytes, and a missing byte already read as 0.
+pub fn widen_prefix(source: &[u8], old: usize, new: usize) -> Vec<u8> {
+    let at = old.min(source.len());
+    let (prefix, plan) = source.split_at(at);
+    let mut widened = prefix.to_vec();
+    if !plan.is_empty() {
+        widened.resize(new, 0);
+        widened.extend_from_slice(plan);
+    }
+    widened
 }
 
 /// Why a harness couldn't run a scenario.
@@ -610,6 +650,9 @@ pub struct HarnessEntry {
     pub accepts: fn(&[u8]) -> bool,
     /// [`Subsystem::families`]. A machine has none.
     pub families: fn() -> Vec<ScenarioFamily>,
+    /// [`Subsystem::UNTAGGED_FREE`]. True for a machine, whose operation
+    /// tape draws any operation.
+    pub untagged_free: bool,
     /// [`Subsystem::migrate`].
     pub migrate: fn(&[u8], u32) -> Result<Vec<u8>, String>,
 }
@@ -687,6 +730,7 @@ pub const fn entry<S: Subsystem>() -> HarnessEntry {
         run_steered_bytes: Some(explore::run_steered_bytes::<S>),
         accepts: S::accepts,
         families: S::families,
+        untagged_free: S::UNTAGGED_FREE,
         migrate: S::migrate,
     }
 }

@@ -609,7 +609,7 @@ fn late_response_admitted_applies_in_its_saved_plan() {
         .expect("the seed is registered")
         .input()
         .to_vec();
-    let (prefix, plan) = input.split_at(DiscoveryWire::SCENARIO_BYTES);
+    let (prefix, plan) = input.split_at(DiscoveryWire::SCENARIO_BYTES.min(input.len()));
     assert_eq!(SavedPlan::from_tag(prefix), Some(SavedPlan::LateResponse));
     let (report, _) = run_plan(&DiscoveryWire::draw(prefix), plan);
     witnessed(

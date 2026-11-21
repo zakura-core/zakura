@@ -1351,7 +1351,7 @@ impl Subsystem for DiscoveryComposed {
 
     /// One family, the grammar, whose tag is [`COMPOSED_VERSION`].
     fn families() -> Vec<ScenarioFamily> {
-        vec![ScenarioFamily::new("composed", [COMPOSED_VERSION])]
+        vec![ScenarioFamily::free("composed", [COMPOSED_VERSION])]
     }
 
     /// Whether `prefix` starts with [`COMPOSED_VERSION`], so `draw` reads
@@ -1574,7 +1574,7 @@ impl Subsystem for DiscoverySpam {
 
     /// One family, the grammar, whose tag is [`SPAM_VERSION`].
     fn families() -> Vec<ScenarioFamily> {
-        vec![ScenarioFamily::new("spam", [SPAM_VERSION])]
+        vec![ScenarioFamily::free("spam", [SPAM_VERSION])]
     }
 
     /// Whether `prefix` starts with [`SPAM_VERSION`], so `draw` reads it
@@ -1604,16 +1604,52 @@ impl HasView for DiscoveryWire {
     fn view(&self) {}
 }
 
+/// The tag of `discovery/wire`'s free family that reads a
+/// `discovery/composed` script ([`composed_scenario`]) from the prefix's
+/// next bytes.
+pub const WIRE_COMPOSED_TAG: u8 = 0xFD;
+
+/// The tag of `discovery/wire`'s free family that reads a `discovery/spam`
+/// script ([`spam_scenario`]) from the prefix's next bytes.
+pub const WIRE_SPAM_TAG: u8 = 0xFC;
+
+/// `discovery/wire`'s prefix before its free families: a saved Plan's or a
+/// drawn family's two-byte tag.
+const WIRE_PLANNED_BYTES: usize = 2;
+
+/// The longer of `a` and `b`.
+const fn longer(a: usize, b: usize) -> usize {
+    if a > b {
+        a
+    } else {
+        b
+    }
+}
+
 impl Subsystem for DiscoveryWire {
     const NAME: &'static str = "discovery/wire";
-    const GENERATOR: u32 = 3;
-    const SCENARIO_BYTES: usize = 2;
+    const GENERATOR: u32 = 4;
+    /// A free family's tag, then its script: [`SPAM_BYTES`], the longer of
+    /// the two scripts with its version byte's place taken by the tag.
+    const SCENARIO_BYTES: usize = longer(COMPOSED_BYTES, SPAM_BYTES);
     type Scenario = WireScenario;
     type Prepared = NodeHandle;
 
-    /// [`wire_config`].
-    fn config(_: &WireScenario) -> RunConfig {
-        wire_config()
+    /// [`wire_config`], with [`SPAM_BUDGET`] steps for a spammer's
+    /// scenario and [`COMPOSED_BUDGET`] for a composed script's, as their
+    /// own harnesses take.
+    fn config(scenario: &WireScenario) -> RunConfig {
+        let budget = if scenario.peers.iter().any(|peer| peer.spams) {
+            SPAM_BUDGET
+        } else if scenario.peers.iter().any(|peer| peer.skip_stale_acts) {
+            COMPOSED_BUDGET
+        } else {
+            return wire_config();
+        };
+        RunConfig {
+            budget,
+            ..wire_config()
+        }
     }
 
     /// [`wire_properties`].
@@ -1644,22 +1680,59 @@ impl Subsystem for DiscoveryWire {
     }
 
     /// Each saved Plan's tag ([`SavedPlan::tag`]), then each hostile
-    /// act's and asking request's ([`drawn_families`]).
+    /// act's and asking request's ([`drawn_families`]), then the free
+    /// families: a composed script ([`WIRE_COMPOSED_TAG`]) and a spam
+    /// script ([`WIRE_SPAM_TAG`]).
     fn families() -> Vec<ScenarioFamily> {
         SavedPlan::ALL
             .into_iter()
             .map(|plan| ScenarioFamily::new(plan.name(), plan.tag()))
             .chain(drawn_families().map(|(name, tag, _)| ScenarioFamily::new(name, tag)))
+            .chain([
+                ScenarioFamily::free("composed", [WIRE_COMPOSED_TAG]),
+                ScenarioFamily::free("spam", [WIRE_SPAM_TAG]),
+            ])
             .collect()
     }
 
     /// The saved Plan's scenario `prefix` tags ([`SavedPlan::tag`]), the
-    /// hostile act's or asking request's ([`drawn_families`]), or the
-    /// default scenario.
+    /// hostile act's or asking request's ([`drawn_families`]), the script
+    /// a free family's tag composes from the bytes after it, or the default
+    /// scenario. So a planned family and a free script share one input
+    /// format, and a fuzzer's mutation of a tag moves between them.
     fn draw(prefix: &[u8]) -> WireScenario {
+        match prefix.split_first() {
+            Some((&WIRE_COMPOSED_TAG, script)) => return composed_scenario(script),
+            Some((&WIRE_SPAM_TAG, script)) => return spam_scenario(script),
+            _ => {}
+        }
         if let Some(plan) = SavedPlan::from_tag(prefix) {
             return plan.scenario();
         }
         drawn_scenario(prefix).unwrap_or_default()
+    }
+
+    /// Generator 3's input, whose prefix held only the two-byte tag, with
+    /// the prefix widened to [`Subsystem::SCENARIO_BYTES`]. Generator 3
+    /// drew the default scenario for a first byte that is now a free
+    /// family's tag, so the migrated input starts with 0 there instead,
+    /// which still draws it.
+    fn migrate(source: &[u8], generator: u32) -> Result<Vec<u8>, String> {
+        match generator {
+            3 => {
+                let mut widened =
+                    super::widen_prefix(source, WIRE_PLANNED_BYTES, Self::SCENARIO_BYTES);
+                if let Some(first @ (&mut WIRE_COMPOSED_TAG | &mut WIRE_SPAM_TAG)) =
+                    widened.first_mut()
+                {
+                    *first = 0;
+                }
+                Ok(widened)
+            }
+            _ => Err(format!(
+                "{} migrates no generator-{generator} input",
+                Self::NAME
+            )),
+        }
     }
 }

@@ -674,8 +674,17 @@ pub(in crate::planted) struct GenerateFacts {
     /// The scenario family whose tag starts that input, or `untagged`.
     #[serde(default)]
     pub(in crate::planted) family: Option<String>,
+    /// That input's mode under `--draws mix`, such as `free/pct`.
+    #[serde(default)]
+    pub(in crate::planted) mode: Option<String>,
     #[serde(default)]
     pub(in crate::planted) properties: BTreeMap<String, Applicability>,
+    /// Inputs run whose scenario was free.
+    #[serde(default)]
+    pub(in crate::planted) random_runs: u64,
+    /// Each property's outcomes over the free runs alone.
+    #[serde(default)]
+    pub(in crate::planted) random_properties: BTreeMap<String, Applicability>,
 }
 
 impl GenerateFacts {

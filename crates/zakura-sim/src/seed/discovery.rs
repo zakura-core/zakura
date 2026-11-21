@@ -79,7 +79,10 @@ pub(super) fn seeds() -> Vec<Seed> {
             SavedPlan::LateResponse => Seed::built(name, DiscoveryWire::NAME, source, || {
                 static INPUT: OnceLock<Vec<u8>> = OnceLock::new();
                 INPUT.get_or_init(|| {
-                    [&SavedPlan::LateResponse.tag()[..], &late_response_plan()].concat()
+                    let mut input = SavedPlan::LateResponse.tag().to_vec();
+                    input.resize(DiscoveryWire::SCENARIO_BYTES, 0);
+                    input.extend_from_slice(&late_response_plan());
+                    input
                 })
             })
             .witness("discovery/late-response-admitted", Expect::Holds),

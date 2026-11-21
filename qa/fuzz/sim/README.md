@@ -67,11 +67,12 @@ rows pass `-len_control=0`.
   seeds are `sync-storage-*`.
 - `sync_wire` runs `sync/wire`, `sync/storage`'s node and mirrors on
   simulated QUIC behind real handlers, so header sync, block sync and
-  discovery share each connection. Its two-byte prefix picks a saved
+  discovery share each connection. Its 27-byte prefix picks a saved
   scenario (`0xFC`), fuzz-13's combined actions (`0xFB`, then a byte of
   actions: the mirrors' fork at one stage of the block pipeline, a
-  connection replacement, and a read stall), or the honest scenario. Its
-  corpus seeds are `sync-wire-*`.
+  connection replacement, and a read stall), a free script in
+  `sync/composed`'s grammar (`0xFA`), or the honest scenario. Its corpus
+  seeds are `sync-wire-*`.
 - `block_sync_storage` runs `block-sync/storage`, a block-sync node on
   controlled block storage with mirror peers. Its two-byte prefix picks a
   saved scenario or the default one. A generated run takes about 96 s and
@@ -81,9 +82,11 @@ rows pass `-len_control=0`.
   generate nothing. Long runs search it. Its corpus seeds are
   `block-sync-*`.
 - `discovery_wire` runs `discovery/wire`, the discovery node behind its
-  real transport on simulated QUIC. Its two-byte prefix picks a saved
-  Plan's scenario or the default one. Its corpus seeds are
-  `discovery-wire-*`.
+  real transport on simulated QUIC. Its 31-byte prefix picks a saved
+  Plan's scenario, a free script in `discovery/composed`'s grammar
+  (`0xFD`), a free script in `discovery/spam`'s grammar (`0xFC`), or the
+  default one. A free script runs under its grammar's node limits. Its
+  corpus seeds are `discovery-wire-*`.
 - `header_sync_wire` runs `header-sync/wire`, the header-sync node behind
   its real transport on simulated QUIC. Its two-byte prefix picks a saved
   Plan's scenario or the default one. Its corpus seeds are
@@ -151,6 +154,52 @@ establish asynchronous races or teardown. `discovery_verification_capacity` runs
 handle under the scheduler and checks that unsettled verification results stay
 within the slots while a slow holder keeps the state lock. Run long campaigns
 manually or nightly; these targets add no blocking PR fuzz campaign.
+
+## Random search
+
+`zakura-sim generate --draws` picks how a search draws each run's scenario
+prefix. `cycle` takes the harness's named families in turn. `free` draws
+the prefix of a free family, whose grammar composes a scenario no family
+names, or random bytes for a machine harness's op tape. `mix`, the
+mutation loop's and the routine's default, takes turns of three runs: a
+cycled family under the Plan, a cycled family under PCT, and a free draw
+under the Plan or PCT in turn. A named family stays a prefix of the same
+input format, so libFuzzer, the loop and replay read every draw alike. A
+harness that takes no steered schedule, such as a machine harness, runs
+each draw under the Plan. The search's report counts runs per mode, and
+the runs and free runs that applied each property.
+
+`--schedule enumerate` runs every schedule of each drawn input that delays
+the first enabled action at most twice, breadth first, then moves to the
+next input. A race fixture's run makes tens of picks, so its depth-2
+enumeration ends in seconds. A wire run makes tens of thousands, and its
+enumeration doesn't end within a search. A machine harness makes no picks.
+
+What each harness draws, as audited for #2536's follow-up:
+
+| Harness | Prefix | Adversary | Node limits | Network faults | PCT | Free draws |
+| --- | --- | --- | --- | --- | --- | --- |
+| `handshake/wire` | 32 B, 15 families | control and prelude faults | some, per family | per-family delays, abandon, QUIC links | yes | none |
+| `discovery/wire` | 31 B, 38 families | single-act scripts; composed and spam scripts | drawn by the composed and spam grammars | the grammars' delay class | yes | `composed` (`0xFD`), `spam` (`0xFC`) |
+| `discovery/composed`, `discovery/spam` | 17 B, 31 B | composed scripts over labelled frames | drawn | delay class | yes | the whole prefix |
+| `discovery/wait-complete`, `discovery/verification-capacity` | 0 B | one scripted peer or none | fixed | none | yes | none: fixed |
+| `header-sync/storage` | 344 B grammar | honest mirrors | storage outcomes and bound drawn | close, relink | yes | the whole grammar |
+| `header-sync/wire` | 2 B, 19 plans | `Act` scripts on honest streams | fixed | per plan | yes | none |
+| `header-sync/smoke`, `flood`, `release-wake`, `repair`, `liveness` | 0 B | fixed peers | fixed | none | yes | excluded in `qa/suite.toml` |
+| `sync/storage` | 2 B, 10 plans | honest mirrors | fixed | none | yes | none |
+| `sync/wire` | 27 B | saved, combined, composed | fixed | composed delay class, closes, holds | yes | `composed` (`0xFA`) |
+| `sync/composed` | 27 B | environment events, no adversarial peer | fixed | delay class, closes, holds | yes | the whole prefix |
+| `block-sync/storage` | 2 B, 26 families | fixed probe frame lists | fixed | none | yes | none |
+| race fixtures, `fixtures/all`, `fixtures/fixed` | variant and workers | none | fixed | none | yes | none: fixed |
+| machine harnesses | 512 B op tape | the whole op alphabet | none | none | no | the whole tape |
+
+A free mode needs a ledger that labels each frame the node may judge,
+which keeps `conformant-never-closes` sound. `header-sync/wire` (a lenient
+composed `Act` script), `block-sync/storage` (composed probe frames with
+skip), `sync/storage` (composed events on the in-memory tier) and
+`handshake/wire` (a composed fault script) need that machinery first. The
+`header-sync/*` fixtures keep fixed peers that their properties need, and
+`qa/suite.toml` says why under `[[excluded-harness]]`.
 
 ## Semantic feedback
 

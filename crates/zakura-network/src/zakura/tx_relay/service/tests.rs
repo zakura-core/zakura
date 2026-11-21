@@ -466,3 +466,56 @@ fn a_connection_stays_owned_through_the_reopen_gap() {
     assert!(ownership.claims(ended + Duration::from_secs(8)));
     assert!(!ownership.claims(ended + REOPEN_GAP));
 }
+
+/// `Inv` frames queued on the data stream reach the machine as one `Inv`,
+/// so a peer that sends one-entry frames costs one lock step per queued
+/// run. The frame after them is still handled, after them: here a body
+/// nobody asked for, which closes the peer only once all three ids are
+/// taken.
+#[tokio::test]
+async fn queued_inv_frames_reach_the_machine_as_one() {
+    let (handle, inbox) = pool_port();
+    publish(&inbox, Vec::new(), Vec::new());
+    let (wiring, _handed) = wiring(handle);
+    let mut session = Session::open(&wiring);
+    session
+        .deliver(TxRelayMessage::Hello {
+            serves: 16,
+            max_tx_bytes: MAX_TX_BYTES,
+        })
+        .await;
+
+    let announced = transactions(4);
+    let frame = |message: &TxRelayMessage| encode_frame(message).expect("a valid frame");
+    let inv = |tx: &VerifiedUnminedTx| {
+        let size = u32::try_from(tx.transaction.size()).expect("a test body is small");
+        frame(&TxRelayMessage::Inv(vec![(tx.transaction.id(), size)]))
+    };
+    let (send, mut data) = framed_channel(8);
+    for tx in &announced[1..3] {
+        send.try_send(inv(tx)).expect("the queue has room");
+    }
+    let unrequested = TxRelayMessage::Tx {
+        id: announced[3].transaction.id(),
+        body: vec![0],
+    };
+    send.try_send(frame(&unrequested))
+        .expect("the queue has room");
+
+    let open = session
+        .routine
+        .data_frame(&inv(&announced[0]), &mut data)
+        .await;
+    assert!(open, "every frame decodes");
+    assert!(data.try_recv().is_err(), "every queued frame is taken");
+    assert_eq!(
+        session.routine.calls.len(),
+        3,
+        "each announced id is reserved"
+    );
+    assert_eq!(
+        session.cause.get(),
+        Some(fault(CloseRow::RELAY_CLOSE_9)),
+        "the unrequested body closes the peer"
+    );
+}

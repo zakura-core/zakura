@@ -44,8 +44,8 @@ use super::{
     },
     sessions::{LiveSession, TxRelaySessions},
     wire::{
-        tx_frame, TxRelayMessage, INV_RATE, MAX_TX_BYTES, TX_RELAY_DATA_KIND, TX_RELAY_STATE_KIND,
-        TX_RELAY_STREAMS,
+        tx_frame, TxRelayMessage, INV_RATE, MAX_INV_ENTRIES, MAX_TX_BYTES, TX_RELAY_DATA_KIND,
+        TX_RELAY_STATE_KIND, TX_RELAY_STREAMS,
     },
     ZakuraTxRelayConfig,
 };
@@ -791,7 +791,7 @@ impl Routine {
                 () = self.cancel.cancelled() => break,
                 frame = data.recv() => {
                     let Some(frame) = frame else { break };
-                    if !self.frame(&frame).await {
+                    if !self.data_frame(&frame, &mut data).await {
                         break;
                     }
                 }
@@ -956,6 +956,41 @@ impl Routine {
                 false
             }
         }
+    }
+
+    /// Handles one frame from the data stream. An `Inv` also takes the `Inv`
+    /// frames already queued behind it, up to [`MAX_INV_ENTRIES`] entries in
+    /// all, and hands them to the machine as one, so a peer that sends
+    /// one-entry frames costs a lock step per queued run, not per frame. The
+    /// first frame that does not join is handled after them, in order.
+    /// Returns `false` as [`Self::frame`] does.
+    async fn data_frame(&mut self, frame: &Frame, data: &mut FramedRecv) -> bool {
+        let mut first = decode_frame::<TxRelayMessage>(frame);
+        let mut next = None;
+        if let Ok(TxRelayMessage::Inv(entries)) = &mut first {
+            // The data stream's inbound queue bounds how many frames wait.
+            while let Ok(frame) = data.try_recv() {
+                match decode_frame::<TxRelayMessage>(&frame) {
+                    Ok(TxRelayMessage::Inv(more))
+                        if entries.len() + more.len() <= MAX_INV_ENTRIES =>
+                    {
+                        entries.extend(more);
+                    }
+                    other => {
+                        next = Some(other);
+                        break;
+                    }
+                }
+            }
+        }
+        for decoded in std::iter::once(first).chain(next) {
+            let Ok(message) = decoded else {
+                self.io.close.close(fault(CloseRow::RELAY_CLOSE_3));
+                return false;
+            };
+            self.message(message).await;
+        }
+        true
     }
 
     /// Hands one decoded message to the machine. A `Tx` body waits for its

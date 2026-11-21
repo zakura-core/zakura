@@ -1,6 +1,6 @@
 # Spec: `zakura-quic` transport
 
-Status: draft for review, 2026-11-21. Version 0.25.
+Status: draft for review, 2026-11-21. Version 0.26.
 This document is authoritative for the `zakura-quic` crate, its configuration,
 its wire behavior and its `quinn-proto` dependency policy.
 [Decision 0003](../decisions/zakura/0003-zakura-quic-transport.md) records the
@@ -59,7 +59,9 @@ that holds it. It updates ID-1, TLS-6 through TLS-8, API-1 and API-4. See
 the credential a peer proves in TLS and requires the hybrid key exchange;
 it adds ID-8 to ID-12, changes ID-1, ID-2, ID-4, ID-7, TLS-3, TLS-4, TLS-7
 to TLS-9, ADM-9, WIRE-2, API-1, API-4, CTRL-26 and §13, and §17w lists each
-change.
+change. Version 0.26 signs every handshake with a composite of Ed25519 and
+ML-DSA-44; it adds ID-13, changes DEP-2, TLS-4 and ID-11, and §17x lists
+each change.
 
 ## 0. Conventions
 
@@ -111,10 +113,12 @@ Terms:
   `cargo tree -e normal -i <pkg>` and fails on any hit.
 - **DEP-2.** `zakura-quic` MAY depend directly on these packages and no others:
   `blake2b_simd`, `bytes`, `curve25519-dalek`, `futures`, `hex`, `libc`,
-  `libcrux-ml-kem`, `metrics`, `quinn-proto`, `ring`, `rustls`,
-  `rustls-pki-types`, `serde`, `socket2`, `thiserror`, `tokio`, `tracing`,
-  `zakura-rt` and `zeroize`.
+  `libcrux-ml-dsa`, `libcrux-ml-kem`, `metrics`, `quinn-proto`, `ring`,
+  `rustls`, `rustls-pki-types`, `serde`, `socket2`, `thiserror`, `tokio`,
+  `tracing`, `zakura-rt` and `zeroize`.
   - `libcrux-ml-kem` MUST enable its `mlkem768` feature and no others, with
+    default features off.
+  - `libcrux-ml-dsa` MUST enable its `mldsa44` feature and no others, with
     default features off.
   - `data-encoding` MAY be added only if step 3 of PLAN §6 finds a deployed base32 key.
   - Any other dependency needs a spec change.
@@ -210,8 +214,9 @@ Terms:
   disconnect or penalise the peer that relayed the list, because a
   conformant relay passes on lists it can't read (ID-10). Every later release
   MUST keep this rule, or a newer node would punish older relays. This
-  release supports only the Ed25519 entry, so it connects only to nodes
-  whose list holds one, and a record carries one Ed25519 signature.
+  release authenticates a peer only by the composite of its Ed25519 and
+  ML-DSA-44 keys (TLS-4), so it connects only to nodes whose credential
+  holds both, and a record carries one Ed25519 signature.
 - **ID-12.** A node's credential holds its public keys in full, in the key
   list's tag order and under its count and tag rules (ID-8). The encoding is
   the entry count as a `u8`, then each entry as its tag (`u16`
@@ -224,6 +229,13 @@ Terms:
   `Zakura_KeyFpr_v1`. A node's `NodeId` is the ID-9 hash of that list. So
   a discovery record stays small, the node ID still commits to every key,
   and a reader keeps an unknown key (ID-10) by its fingerprint.
+- **ID-13.** Tag 2 is ML-DSA-44 (FIPS 204); its credential entry is the
+  1,312-byte public key. A node's ML-DSA-44 key pair is generated from the
+  32-byte seed that BLAKE2b-256 derives from its Ed25519 seed, used as the
+  key and personalised `Zakura_MLDSA44v1`, over no data. One key file
+  therefore yields both keys, and a node's credential is its Ed25519 key
+  and its ML-DSA-44 key. The signing key is regenerated from the seed for
+  each signature and zeroized after.
 
 ## 4. TLS profile
 
@@ -245,10 +257,16 @@ at fork tag `zakura-iroh-v1.1.0-rc.1`, and it keeps their MIT/Apache-2.0 notices
   STRING holds the encoded credential with no unused bits. A verifier MUST
   refuse any other algorithm, a non-canonical DER encoding, trailing bytes,
   and a credential ID-12 refuses.
-- **TLS-4.** The only signature scheme is `ED25519`. A peer signs with the
-  Ed25519 key in its credential, and a verifier checks the signature under
-  ID-6. A credential without an Ed25519 key can't be authenticated, so the
-  handshake fails (ID-11).
+- **TLS-4.** The only signature scheme is the composite of Ed25519 and
+  ML-DSA-44, private-use code point `0xFE44`. The signature is the Ed25519
+  signature (64 bytes) followed by the ML-DSA-44 signature (2,420 bytes),
+  both over the TLS message the scheme signs; the ML-DSA signature uses the
+  FIPS 204 context `Zakura TLS 1.3 Ed25519+ML-DSA-44 v1` and is hedged with
+  32 bytes from the endpoint's TLS random source. A verifier MUST refuse a
+  signature of another length and MUST accept only when the Ed25519 half
+  verifies under ID-6 with the credential's Ed25519 key and the ML-DSA-44
+  half verifies with its ML-DSA-44 key. A credential without both keys
+  can't be authenticated, so the handshake fails (ID-11).
 - **TLS-5.** Client authentication is mandatory. The server MUST abort a
   handshake without a client key.
 - **TLS-6.** The client MUST NOT send SNI. It passes the dialed `NodeId` to
@@ -1266,6 +1284,8 @@ this release tolerates, and keep each hard change explicit.
 | A production listener refuses a handshake whose hybrid share is one byte short or carries an ML-KEM key that fails the modulus check | TLS-9, SEC-2 |
 | A peer that offers only classical groups is refused in either direction, and two production endpoints agree on the hybrid | TLS-9 |
 | A credential with an unknown long key derives the same ID on both ends; a bare Ed25519 SubjectPublicKeyInfo, a credential whose ID isn't the dialed one, and a client presenting a credential it can't sign for are refused | TLS-3, TLS-4, TLS-7, TLS-8, ID-12 |
+| A composite signature verifies only whole: a tampered Ed25519 or ML-DSA half, a truncated signature, another node's key in either half, and a credential without an ML-DSA-44 key are refused; the ML-DSA seed derivation has a known answer | TLS-4, ID-11, ID-13 |
+| In a simulated handshake the listener's first flight stays within three times the 2,400-byte hybrid hello, and the dialer completes on it alone | TLS-4, ADM-1 |
 | The seeded X25519MLKEM768 completes against the production group in both roles and replays its shares for the same seed and node | TLS-9, API-2 |
 | A dialer that offers X25519MLKEM768 sends its hello as two 1,200-byte Initial datagrams. A refused dial is decided and answered once per datagram, and a retried one decided once per datagram. A hello refused at its first datagram and accepted at its second keeps its charge and holds a pending handshake until the deadline. A one-datagram hello, which only a dialer with classical groups alone sends, is refused at its first datagram and cancelled; a hello with no ALPN in common, which spans two, fails as a handshake | ADM-1, ADM-3, ADM-7, API-3 |
 | On the deterministic scheduler, with no tokio runtime, two `bind_with` endpoints with the same seeded inputs, plan and UTC origin send byte-identical datagrams through a Retry handshake and an echoed stream, in one process and in fresh processes. Leaving out any seeded input, or changing the seed or the UTC origin, changes the bytes, and host time doesn't | API-2, TLS-9, ADM-10, DEP-2 |
@@ -1903,3 +1923,31 @@ Changed:
 - **CTRL-26.** The node record cap grows by 105 bytes to hold a full key
   list, which raises an admitted connection's memory by 7,770 B, to
   141,945,123 B at the defaults.
+
+## 17x. Changes in version 0.26
+
+A handshake was signed with Ed25519 alone, which a quantum computer could
+forge while the connection is being made. Every signature is now the
+composite of Ed25519 and ML-DSA-44, and it verifies only if both halves do,
+so forging one needs a break of both schemes. The ML-DSA key derives from
+the existing seed, so key files don't change, but every node's credential
+gains the key and every node ID changes again. Version 0.25 and this
+version ship in the same release, so deployed IDs change once.
+
+The listener's first flight grows to about 5.8 KB, within the 7.2 KB QUIC
+lets it send before the dialer's address is validated, so the handshake
+takes no extra round trip.
+
+Added:
+
+- **ID-13.** The ML-DSA-44 credential entry and the key's derivation.
+
+Changed:
+
+- **DEP-2.** Adds `libcrux-ml-dsa` with its `mldsa44` feature only. It
+  shares its helper crates with `libcrux-ml-kem`, and adds only its own
+  build-time macro crate.
+- **TLS-4.** The only signature scheme is the composite, `0xFE44`.
+- **ID-11.** A credential without both keys can't be authenticated.
+- **§16.** Adds the composite's known answers, its refusals and the
+  first-flight bound.

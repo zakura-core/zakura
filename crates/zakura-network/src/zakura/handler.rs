@@ -10266,7 +10266,7 @@ mod tests {
             let held = cancelled.elapsed();
             assert!(
                 held <= 2 * STREAM_WORKER_DRAIN_TIMEOUT,
-                "{count} trickling workers held the admission permit for {held:?}"
+                "{count} trickling workers held the connection slot for {held:?}"
             );
             let (drained, left) = teardown.await.expect("the teardown task never panics");
             assert!(!drained, "the later workers outlast the first wait");
@@ -10434,14 +10434,14 @@ mod tests {
         Ok(())
     }
 
-    /// A full transport stops discovery dials even while admission permits
+    /// A full transport stops discovery dials even while connection slots
     /// remain, so the dialer can't spin on `ConnectionLimit` (zakura-quic
     /// ADM-12).
     #[tokio::test]
     async fn a_full_transport_reports_no_dial_capacity() -> Result<(), BoxError> {
         let _guard = zakura_test::init();
         let mut config = Config::for_test(P2pStack::Dual);
-        // No bootstrap dials, so nothing else takes the admission permit.
+        // No bootstrap dials, so nothing else takes a connection slot.
         config.zakura.bootstrap_peers = Vec::new();
         config.zakura.max_connections = 2;
         config.zakura.max_pending_handshakes = 1;
@@ -15692,7 +15692,7 @@ mod tests {
         assert_eq!(handler.supervisor.ip_slots.counts().transport_pending(), 0);
         // Account for the captured TLS start as the real acceptor would.
         assert_eq!(handler.admit(&incoming), Admit::Accept);
-        let dials: Vec<_> = (0..limits.max_inbound_connections())
+        let inbound_peers: Vec<_> = (0..limits.max_inbound_connections())
             .map(|_| {
                 handler
                     .claim_connection(NodeSecretKey::generate().public(), true)
@@ -15701,7 +15701,7 @@ mod tests {
             .collect();
         let refusal = handler.handle(inbound);
         assert_eq!(handler.supervisor.ip_slots.counts().transport_pending(), 0);
-        drop(dials);
+        drop(inbound_peers);
 
         for _ in 1..DEFAULT_ZAKURA_MAX_CONNS_PER_IP {
             assert_eq!(handler.admit(&incoming), Admit::Accept);

@@ -568,13 +568,13 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
     get a slot, and `has_discovery_capacity()` checks discovery's lower ceiling.
     `zakura-network` treats `ConnectionLimit` as its own resource limit,
     not the peer's fault. Its discovery dialer starts a dial only while both
-    the admission semaphore and discovery's transport ceiling have room, and
+    the handler's connection slots and discovery's transport ceiling have room, and
     waits one tick after a dial hits a local limit. Its supervised redials retry a limit hit
     before any packet was sent (admission or this cap) after the initial
     backoff, without counting an attempt or growing the backoff. A limit hit
     after the QUIC handshake, such as the pending control handshakes, counts
     as a failed attempt, so it can't make a bounded redial handshake with the
-    peer forever. Without these, a full transport with free admission permits
+    peer forever. Without these, a full transport with free connection slots
     made the dialer spin.
 
   Zakura sets `max_connections` to its admitted cap plus
@@ -1146,7 +1146,7 @@ this release tolerates, and keep each hard change explicit.
 | `Acceptor::handle` runs while the attempt still counts as pending | ADM-7 |
 | Peers that fill a stream, get rejected and reconnect stay within the inbound cap and the closing allowance, and every slot frees once they stop | ADM-12, ADM-13 |
 | Inbound connections can't take the dial reserve; a dial at the cap fails with `ConnectionLimit`; a multi-address dial without a slot for every address fails before contacting the peer | ADM-12 |
-| A full transport reports no dial capacity while admission permits remain; supervised redials retry local limits without counting them | ADM-12 |
+| A full transport reports no dial capacity while connection slots remain; supervised redials retry local limits without counting them | ADM-12 |
 | Silent multi-address discovery dials leave room for an inbound peer; concurrent reservations stay below their ceiling; small or zero discovery ceilings are handled without sending a forbidden attempt | ADM-12 |
 | Inbound connections stop at their own cap and count until they close, even when the acceptor closes them right after TLS; with inbound at its cap, discovery reaches the reserve and a maintained dial still fits it | ADM-12 |
 | Endpoint startup refuses a remote bootstrap identity whose dial would make more address attempts than the dial reserve, at the defaults and at small caps; the attempt count skips families with no socket and folds IPv4-mapped duplicates | ADM-12, DIAL-2 |

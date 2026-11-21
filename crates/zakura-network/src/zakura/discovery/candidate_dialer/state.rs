@@ -169,7 +169,7 @@ struct DiscoveryIpBackoff {
 ///
 /// It records an attempt only after the supervisor accepted at least one of
 /// the candidate's IPs. Its per-IP counts are logical reservations: the
-/// endpoint still takes the real admission permit inside the dial, and a
+/// endpoint still claims the real connection slot inside the dial, and a
 /// refusal there returns as [`DiscoveryDialResult::LocalResourceLimit`].
 #[derive(Debug)]
 pub(super) struct CandidateDialerState {

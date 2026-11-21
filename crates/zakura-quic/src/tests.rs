@@ -250,7 +250,7 @@ async fn dial_authenticates_both_sides_and_echoes() {
         let client = client();
         let conn = client.connect(server.addr(), &[ALPN]).await.unwrap();
         assert_eq!(conn.remote_id(), server.endpoint.local_id());
-        assert_eq!(conn.remote_key(), server.endpoint.local_id().key());
+        assert_eq!(conn.remote_key_list().node_id(), conn.remote_id());
         assert_eq!(conn.alpn(), ALPN);
         assert_eq!(conn.admitted_ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert!(conn.source_validated(), "this node dialed the address");
@@ -262,7 +262,7 @@ async fn dial_authenticates_both_sides_and_echoes() {
 
         let inbound = server.handled.recv().await.unwrap();
         assert_eq!(inbound.remote_id(), client.local_id());
-        assert_eq!(inbound.remote_key(), client.local_id().key());
+        assert_eq!(inbound.remote_key_list().node_id(), inbound.remote_id());
         assert!(!inbound.source_validated(), "no Retry validated the source");
         let seen = server.seen.lock().unwrap().clone();
         assert_eq!(seen.len(), 1);
@@ -548,21 +548,20 @@ async fn wrong_identity_is_refused() {
     .unwrap();
 }
 
-/// A hello that fits one datagram, here from a dialer with ring's groups
-/// only, as a release before the hybrid group sends it. The server rejects
-/// the first packet, so the acceptor gets its admission back through
-/// `cancel_admission` alone: a spoofed source pays no charge.
+/// A hello that fits one datagram, here from a dialer with ring's classical
+/// groups only, as a release before the hybrid group sends it. It shares no
+/// group with the listener (TLS-9), so the server rejects the first packet
+/// and the acceptor gets its admission back through `cancel_admission`
+/// alone: a spoofed source pays no charge.
 #[tokio::test]
-async fn an_alpn_mismatch_in_a_one_datagram_hello_is_cancelled() {
+async fn a_classical_one_datagram_hello_is_refused_and_cancelled() {
     tokio::time::timeout(TEST_TIMEOUT, async {
         let server = server();
         let rpk = crate::tls::resolver::ResolveRawPublicKeyCert::new(&NodeSecretKey::generate());
-        let mut crypto = raw_client_builder(&server).with_client_cert_resolver(Arc::new(rpk));
-        crypto.alpn_protocols = vec![b"p2p-v2/2".to_vec()];
-        assert!(matches!(
-            dial_raw(&server, crypto).await,
-            Err(ConnectError::AlpnMismatch)
-        ));
+        let mut crypto = raw_client_builder_with(&server, rustls::crypto::ring::default_provider())
+            .with_client_cert_resolver(Arc::new(rpk));
+        crypto.alpn_protocols = vec![ALPN.to_vec()];
+        assert!(dial_raw(&server, crypto).await.is_err());
         assert_eq!(server.seen.lock().unwrap().len(), 1);
         assert_eq!(server.returned.cancelled.load(Ordering::Relaxed), 1);
         assert_eq!(server.returned.finished.load(Ordering::Relaxed), 0);
@@ -1107,10 +1106,19 @@ async fn dial_raw(server: &Server, crypto: rustls::ClientConfig) -> Result<(), C
     }
 }
 
+/// A hand-built client on the production provider, which verifies `server`.
 fn raw_client_builder(
     server: &Server,
 ) -> rustls::ConfigBuilder<rustls::ClientConfig, rustls::client::WantsClientCert> {
-    rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+    raw_client_builder_with(server, crate::tls::production_provider())
+}
+
+/// A hand-built client on `provider`, which verifies `server`.
+fn raw_client_builder_with(
+    server: &Server,
+    provider: rustls::crypto::CryptoProvider,
+) -> rustls::ConfigBuilder<rustls::ClientConfig, rustls::client::WantsClientCert> {
+    rustls::ClientConfig::builder_with_provider(Arc::new(provider))
         .with_protocol_versions(crate::tls::verifier::PROTOCOL_VERSIONS)
         .unwrap()
         .dangerous()
@@ -1183,9 +1191,8 @@ fn profile_is_tls13_only() {
 
 #[tokio::test]
 async fn raw_client_with_the_profile_is_accepted() {
-    // Control for the refusal tests: the same raw dial with an RPK key succeeds.
-    // The raw client has ring's groups only, so this is also a dialer without
-    // the hybrid group reaching a production listener (TLS-9).
+    // Control for the refusal tests: the same raw dial with the node's
+    // credential succeeds.
     tokio::time::timeout(TEST_TIMEOUT, async {
         let mut server = server();
         let rpk = crate::tls::resolver::ResolveRawPublicKeyCert::new(&NodeSecretKey::generate());
@@ -1929,10 +1936,8 @@ impl rustls::client::ResolvesClientCert for ImpostorResolver {
 async fn client_presenting_a_key_it_cannot_sign_for_is_refused() {
     tokio::time::timeout(TEST_TIMEOUT, async {
         let mut server = server();
-        let victim = NodeSecretKey::generate().public();
-        let cert = rustls_pki_types::CertificateDer::from(
-            crate::tls::ed25519_spki(&victim.key()).to_vec(),
-        );
+        let victim = NodeSecretKey::generate();
+        let cert = rustls_pki_types::CertificateDer::from(victim.credential().to_spki().to_vec());
         let key = Arc::new(rustls::sign::CertifiedKey::new(
             vec![cert],
             Arc::new(Impostor(NodeSecretKey::generate())),
@@ -2873,11 +2878,11 @@ async fn the_hybrid_hello_leaves_as_two_initial_datagrams() {
     .unwrap();
 }
 
-/// A listener from before the hybrid group, with ring's groups only, takes
-/// the production dialer's two-datagram hello and completes the handshake on
-/// the X25519 share the hello also carries (TLS-9).
+/// A listener from before the hybrid group, with ring's groups only, shares
+/// no group with a production dialer (TLS-9), so the dial fails although the
+/// hello also carries a plain X25519 share.
 #[tokio::test(start_paused = true)]
-async fn a_production_dialer_reaches_a_listener_without_the_hybrid_group() {
+async fn a_production_dialer_is_refused_by_a_listener_without_the_hybrid_group() {
     tokio::time::timeout(SIM_TEST_TIMEOUT, async {
         let net = sim_net();
         let pump = tokio::spawn(pump(net.clone()));
@@ -2897,10 +2902,9 @@ async fn a_production_dialer_reaches_a_listener_without_the_hybrid_group() {
         let mut server = serve_test_acceptor(listener, &[ALPN], |_| Admit::Accept);
         let client = sim_endpoint(&net, sim_addr(2));
 
-        client.connect(server.addr(), &[ALPN]).await.unwrap();
-        server.handled.recv().await.unwrap();
-        assert_eq!(server.seen.lock().unwrap().len(), 1);
-        // The hello it took was the hybrid one, in two datagrams.
+        assert!(client.connect(server.addr(), &[ALPN]).await.is_err());
+        assert!(server.handled.try_recv().is_err());
+        // The hello it refused was the hybrid one, in two datagrams.
         assert_eq!(sent_lengths(&net, sim_addr(2))[..2], [1200, 1200]);
         pump.abort();
     })

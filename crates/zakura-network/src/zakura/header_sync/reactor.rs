@@ -1269,7 +1269,7 @@ impl HeaderSyncReactor {
         }
         self.request_vct_repair_context();
         self.try_assign_vct_repair();
-        if self.waits_for_deferred_pass(&peer, &status) {
+        if self.waits_for_owed_pass(&peer, &status) {
             // The new status supersedes the peer's unstarted target, as when
             // header room holds the status back.
             self.peer_work_queue.remove_unstarted(&peer);
@@ -1281,14 +1281,20 @@ impl HeaderSyncReactor {
         self.consider_advertised_header_target(peer, session_id, status);
     }
 
-    /// Whether `peer`'s fresh `status` waits for the deferred cached pass,
+    /// Whether `peer`'s fresh `status` waits for the owed cached pass,
     /// because staging it now would overtake an offer that the pass owes a
     /// turn first.
     ///
+    /// A pass is owed when it waits for its refill, or when an eligibility
+    /// input changed since the last pass. The second case covers a release
+    /// earlier in the same reactor turn: the pass at the turn's end runs
+    /// after this status, so without the guard the status would take the
+    /// freed target or slot first.
+    ///
     /// Started work can't take a new target. Unstarted work takes it in its
     /// own slot, so it can overtake only an offer that waits for that target.
-    fn waits_for_deferred_pass(&self, peer: &ZakuraPeerId, status: &Status) -> bool {
-        if !self.state.cached_pass_deferred || self.peer_work_queue.active(peer).is_some() {
+    fn waits_for_owed_pass(&self, peer: &ZakuraPeerId, status: &Status) -> bool {
+        if !self.cached_pass_owed() || self.peer_work_queue.active(peer).is_some() {
             return false;
         }
         let Some(local) = self.committed_snapshot.as_ref() else {
@@ -1487,6 +1493,14 @@ impl HeaderSyncReactor {
             available_locators: self.locator_capacity.available_permits(),
             resource_stalled: self.ordinary_discovery_paused(),
         }
+    }
+
+    /// Whether a cached pass is owed: it waits for its refill, or an
+    /// eligibility input changed since the last pass, so the pass at the end
+    /// of this reactor turn runs.
+    fn cached_pass_owed(&self) -> bool {
+        self.state.cached_pass_deferred
+            || self.state.last_scheduling_opportunity != Some(self.scheduling_opportunity())
     }
 
     /// Stage idle unspent offers only after an eligibility input changes.

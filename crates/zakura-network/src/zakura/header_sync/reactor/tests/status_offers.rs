@@ -2871,6 +2871,114 @@ async fn later_unstarted_work_does_not_take_a_freed_target_ahead_of_an_earlier_o
     expect_locator_query(&mut actions, &honest, target);
 }
 
+/// A release and a later peer's status can land in one reactor turn, before
+/// the turn's cached pass runs. The pass isn't waiting for its refill, but it
+/// is owed, so the later status still waits behind the earlier offer.
+///
+/// This fails if the guard covers only a pass that waits for its refill.
+#[tokio::test(start_paused = true)]
+async fn a_later_offer_waits_behind_an_earlier_offer_when_the_target_frees_in_the_same_turn() {
+    let (mut reactor, mut actions, snapshot) = offers_reactor();
+    let target = block::Hash([0x42; 32]);
+    let (owner, _owner_outbound) = connect(&mut reactor, 0x30);
+    let (honest, _honest_outbound) = connect(&mut reactor, 0xF0);
+    reactor.handle_status(owner.clone(), 0, status_for(&snapshot, target));
+    reactor.schedule_cached_statuses();
+    expect_locator_query(&mut actions, &owner, target);
+    reactor.handle_status(honest.clone(), 0, status_for(&snapshot, target));
+    reactor.schedule_cached_statuses();
+    assert!(actions.try_recv().is_err(), "the owner holds the target");
+
+    // In one turn, the owner leaves and a later peer's status arrives. The
+    // turn's pass runs after both.
+    let (late, _late_outbound) = connect(&mut reactor, 0x10);
+    reactor.handle_peer_disconnected(&owner, 0, "the owner stalled");
+    assert!(
+        !reactor.state.cached_pass_deferred,
+        "the pass doesn't wait for its refill"
+    );
+    reactor.handle_status(late.clone(), 0, status_for(&snapshot, target));
+    assert!(
+        actions.try_recv().is_err(),
+        "the late offer doesn't take the target before the turn's pass"
+    );
+    reactor.schedule_cached_statuses();
+    expect_locator_query(&mut actions, &honest, target);
+    assert!(actions.try_recv().is_err(), "the late offer waits");
+}
+
+/// The same-turn order for header room: room that frees earlier in the
+/// turn goes to the earlier offer the turn's pass serves first.
+///
+/// This fails if a release earlier in the turn leaves the guard off.
+#[tokio::test(start_paused = true)]
+async fn a_later_offer_waits_behind_an_earlier_offer_when_header_room_frees_in_the_same_turn() {
+    let (mut reactor, mut actions, snapshot) = offers_reactor();
+    let (owner, _owner_outbound) = connect(&mut reactor, 0x71);
+    seed_applying_request(&mut reactor, &snapshot, owner.clone(), 0);
+    reactor
+        .peer_work_queue
+        .set_capacity_for_test(&owner, 4000, 0);
+    let (honest, _honest_outbound) = connect(&mut reactor, 0xF0);
+    let honest_target = block::Hash([0x42; 32]);
+    reactor.handle_status(honest.clone(), 0, status_for(&snapshot, honest_target));
+    reactor.schedule_cached_statuses();
+    assert!(actions.try_recv().is_err(), "no room, so no locator read");
+
+    let (late, _late_outbound) = connect(&mut reactor, 0x10);
+    reactor.handle_peer_disconnected(&owner, 0, "the owner stalled");
+    reactor.handle_status(
+        late.clone(),
+        0,
+        status_for(&snapshot, block::Hash([0x43; 32])),
+    );
+    assert!(
+        actions.try_recv().is_err(),
+        "the late offer doesn't take the room before the turn's pass"
+    );
+    reactor.schedule_cached_statuses();
+    expect_locator_query(&mut actions, &honest, honest_target);
+}
+
+/// The same-turn order for unstarted work: a later peer whose unstarted
+/// work would move to a target freed earlier in the turn waits for the
+/// turn's pass.
+///
+/// This fails if a release earlier in the turn leaves the guard off for
+/// unstarted work.
+#[tokio::test(start_paused = true)]
+async fn later_unstarted_work_does_not_take_a_target_freed_in_the_same_turn() {
+    let (mut reactor, mut actions, snapshot) = offers_reactor();
+    let target = block::Hash([0x42; 32]);
+    let (owner, _owner_outbound) = connect(&mut reactor, 0x30);
+    let (honest, _honest_outbound) = connect(&mut reactor, 0xF0);
+    reactor.handle_status(owner.clone(), 0, status_for(&snapshot, target));
+    reactor.schedule_cached_statuses();
+    expect_locator_query(&mut actions, &owner, target);
+    reactor.handle_status(honest.clone(), 0, status_for(&snapshot, target));
+    reactor.schedule_cached_statuses();
+    assert!(actions.try_recv().is_err(), "the owner holds the target");
+
+    let (late, _late_outbound) = connect(&mut reactor, 0x10);
+    let alternate = block::Hash([0x43; 32]);
+    reactor.handle_status(late.clone(), 0, status_for(&snapshot, alternate));
+    expect_locator_query(&mut actions, &late, alternate);
+    reactor.schedule_cached_statuses();
+
+    reactor.handle_peer_disconnected(&owner, 0, "the owner stalled");
+    reactor.handle_status(late.clone(), 0, status_for(&snapshot, target));
+    assert!(
+        actions.try_recv().is_err(),
+        "the later peer's unstarted work doesn't take the target before the turn's pass"
+    );
+    assert!(
+        reactor.peer_work_queue.awaiting_target(&late).is_none(),
+        "the new status supersedes the unstarted work"
+    );
+    reactor.schedule_cached_statuses();
+    expect_locator_query(&mut actions, &honest, target);
+}
+
 /// F-831: the cached pass serves offers that claim less work than the node's
 /// own after the rest, so a wait record keeps the waiting offer's priority
 /// with its turn. While the pass waits for its refill, an earlier peer's

@@ -306,8 +306,9 @@ impl ReactorState {
     /// comes earlier in the cached pass.
     ///
     /// Between passes, an offer can stage only on its own status. While a
-    /// pass waits for its refill, a status that arrives just after a target or
-    /// slot frees would otherwise stage ahead of the offers the pass owes it
+    /// pass is owed, because it waits for its refill or a target or slot
+    /// freed earlier in the reactor turn, a status that arrives just after
+    /// the release would otherwise stage ahead of the offers the pass owes it
     /// to. Ownership bounds the target entries by the staging slots, and a
     /// stale entry only makes a fresh status wait for the next pass.
     pub(super) fn overtakes_waiting(

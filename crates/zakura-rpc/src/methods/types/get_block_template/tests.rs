@@ -13,11 +13,13 @@ use zakura_chain::parameters::testnet::ConfiguredFundingStreamRecipient;
 use zakura_chain::{
     block::Height,
     local_genesis::generate_local_testnet_with_funded_keys,
+    miner_mesh::MinerMeshCommitment,
     parameters::{
         subsidy::FundingStreamReceiver::{Deferred, Ecc, MajorGrants, ZcashFoundation},
         testnet::{self, ConfiguredActivationHeights, ConfiguredFundingStreams},
         Network, NetworkUpgrade,
     },
+    primitives::zcash_note_encryption::decrypts_successfully,
     serialization::{ZcashDeserializeInto, ZcashSerialize},
     transaction::Transaction,
     transparent,
@@ -185,6 +187,64 @@ fn transparent_coinbase() -> anyhow::Result<()> {
                 assert!(transaction.orchard_shielded_data().is_none());
                 assert!(transaction.ironwood_shielded_data().is_none());
             }
+        }
+    }
+
+    Ok(())
+}
+
+/// A gateway ID made of `OP_CHECKSIG` bytes: if the pushed ID were ever read as
+/// script, the coinbase's signature operation count would be wrong.
+const GATEWAY_ID: [u8; 32] = [0xac; 32];
+
+/// A miner that announces a gateway pays the same outputs as one that does not,
+/// then names the gateway in one more output that takes 48 bytes of the block.
+#[test]
+fn announcing_coinbase_names_the_gateway_in_one_extra_output() -> anyhow::Result<()> {
+    let commitment = MinerMeshCommitment::new(GATEWAY_ID);
+
+    for net in Network::iter() {
+        let quiet = MinerParams::from(
+            MinerAddress::decode(
+                &net,
+                default_miner_address(net.kind(), &MinerAddressType::Transparent),
+            )
+            .ok_or(anyhow!("hard-coded transparent address must be valid"))?,
+        );
+        let mut announcing = quiet.clone();
+        announcing.set_mesh_commitment(commitment);
+
+        for nu in NetworkUpgrade::iter().filter(|nu| nu >= &NetworkUpgrade::Sapling) {
+            let Some(height) = nu.activation_height(&net) else {
+                continue;
+            };
+            let quiet_tx = coinbase_transaction(&net, height, &quiet)?;
+            let announcing_tx = coinbase_transaction(&net, height, &announcing)?;
+
+            assert_eq!(
+                MinerMeshCommitment::from_coinbase_outputs(quiet_tx.outputs()),
+                None,
+            );
+            assert_eq!(
+                MinerMeshCommitment::from_coinbase_outputs(announcing_tx.outputs()),
+                Some(commitment),
+            );
+
+            let (last, paid) = announcing_tx
+                .outputs()
+                .split_last()
+                .expect("an announcing coinbase has the commitment output");
+            assert_eq!(last, &commitment.to_output());
+            assert_eq!(paid, quiet_tx.outputs());
+
+            assert_coinbase_resource_usage(&net, height, &announcing, &announcing_tx)?;
+            assert_eq!(
+                TransactionTemplate::coinbase_resource_usage(&net, height, &announcing, None)?
+                    .max_serialized_size,
+                TransactionTemplate::coinbase_resource_usage(&net, height, &quiet, None)?
+                    .max_serialized_size
+                    + 48,
+            );
         }
     }
 
@@ -519,6 +579,37 @@ fn shielded_coinbase_paths() -> anyhow::Result<()> {
     assert!(tx.ironwood_shielded_data().is_some());
     assert!(tx.sapling_outputs().next().is_none());
     assert!(tx.orchard_shielded_data().is_none());
+    Ok(())
+}
+
+/// A shielded reward and a named gateway go into one coinbase: the reward note
+/// still opens with the all-zero outgoing viewing key that consensus requires,
+/// and the commitment is the only transparent output.
+///
+/// Run with `--release` because it generates a shielded proof.
+#[test]
+#[ignore]
+fn announcing_shielded_coinbase_names_the_gateway() -> anyhow::Result<()> {
+    let net = shielded_coinbase_testnet();
+    let height = NetworkUpgrade::Nu6_3
+        .activation_height(&net)
+        .expect("NU6.3 activation height is configured");
+    let commitment = MinerMeshCommitment::new(GATEWAY_ID);
+    let mut params = MinerParams::from(
+        MinerAddress::decode(
+            &net,
+            default_miner_address(net.kind(), &MinerAddressType::Unified),
+        )
+        .expect("hard-coded unified miner address is valid"),
+    );
+    params.set_mesh_commitment(commitment);
+
+    let tx = coinbase_transaction(&net, height, &params)?;
+
+    assert_coinbase_resource_usage(&net, height, &params, &tx)?;
+    assert!(tx.ironwood_shielded_data().is_some());
+    assert!(decrypts_successfully(&tx, &net, height));
+    assert_eq!(tx.outputs(), [commitment.to_output()]);
     Ok(())
 }
 

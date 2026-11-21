@@ -340,7 +340,7 @@ impl RelayEvidence {
                 }
                 self.state(session, state);
             }
-            TxRelayEvent::InvSent { session, entries } => self.inv_sent(session, &entries),
+            TxRelayEvent::HaveSent { session, entries } => self.have_sent(session, &entries),
         }
     }
 
@@ -356,7 +356,7 @@ impl RelayEvidence {
         let cooling = state.state.cooling;
         match message {
             Received::Hello => state.hello = true,
-            Received::Inv(entries) => {
+            Received::Have(entries) => {
                 let early = !state.hello;
                 for (id, size) in entries {
                     state.sizes.entry(TxKey(id)).or_default().insert(size);
@@ -566,7 +566,7 @@ impl RelayEvidence {
     }
 
     /// The node announced `entries` on `session`.
-    fn inv_sent(&mut self, session: u64, entries: &[(UnminedTxId, u32)]) {
+    fn have_sent(&mut self, session: u64, entries: &[(UnminedTxId, u32)]) {
         self.apply(ANNOUNCE_AFTER_ADMISSION);
         for (id, _) in entries {
             let id = TxKey(*id);

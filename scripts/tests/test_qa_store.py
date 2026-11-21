@@ -80,6 +80,18 @@ class StoreTests(unittest.TestCase):
             self.assertEqual(store.push(space, "b", src, delete=True), (0, 1))
             self.assertEqual(sorted(space.objects), ["fixtures/f.json", "seeds/s.bin"])
 
+    def test_push_refuses_a_missing_or_empty_src(self):
+        space = FakeSpace({"seeds/s.bin": b"s"})
+        with tempfile.TemporaryDirectory() as root:
+            with self.assertRaises(SystemExit):
+                store.push(space, "b", Path(root) / "typo", delete=True)
+            with self.assertRaises(SystemExit):
+                store.push(space, "b", Path(root) / "typo", delete=False)
+            write(root, {"notes.txt": b"n"})
+            with self.assertRaises(SystemExit):
+                store.push(space, "b", root, delete=True)
+        self.assertEqual(space.objects, {"seeds/s.bin": b"s"}, "nothing is deleted")
+
     def test_changed_lists_paths_either_manifest_hashes_differently(self):
         old = {"a": "1", "b": "2", "c": "3"}
         new = {"a": "1", "b": "9", "d": "4"}

@@ -16,9 +16,10 @@ that the tooling reads through `ZAKURA_QA_STORE`:
 copy differs, removes each local file under a store prefix that the Space
 lacks, and with `--manifest` writes every file's SHA-256. `push` uploads each
 file under `--src`'s store prefixes that the Space lacks or holds otherwise,
-and with `--delete` removes each object the directory lacks. `changed` lists
-the paths whose hash differs between two manifests, one per line, for
-`cargo xtask planted --store-changed`.
+and with `--delete` removes each object the directory lacks. `push` refuses a
+`--src` that isn't a directory, and with `--delete` one with no store file.
+`changed` lists the paths whose hash differs between two manifests, one per
+line, for `cargo xtask planted --store-changed`.
 
 The Space's bucket comes from `ZAKURA_CORPUS_BUCKET` and its endpoint from
 `ZAKURA_CORPUS_ENDPOINT`. boto3 reads the key from `AWS_ACCESS_KEY_ID` and
@@ -147,10 +148,18 @@ def pull(s3, bucket, dest):
 
 
 def push(s3, bucket, src, delete):
-    """Upload `src`'s store files the Space lacks or holds otherwise, and return (uploaded, deleted) counts."""
+    """Upload `src`'s store files the Space lacks or holds otherwise, and return (uploaded, deleted) counts.
+
+    Refuses a `src` that isn't a directory, and with `delete` one that holds no
+    store file, since a mistyped `--src` would otherwise empty the Space.
+    """
     src = Path(src)
-    remote = remote_objects(s3, bucket)
+    if not src.is_dir():
+        raise SystemExit(f"--src {src} isn't a directory")
     files = local_files(src)
+    if delete and not files:
+        raise SystemExit(f"--src {src} holds no store file, so --delete would empty the Space")
+    remote = remote_objects(s3, bucket)
     uploaded = 0
     for path in files:
         if path in remote and same(src / path, remote[path]):

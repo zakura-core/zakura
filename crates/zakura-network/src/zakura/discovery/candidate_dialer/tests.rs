@@ -579,7 +579,7 @@ async fn connected_elsewhere_leaves_the_record_unconfirmed() -> Result<(), crate
         connected,
     )?;
     let record = (*candidate.current_self_record()).clone();
-    let node = record.body.node_id;
+    let node = record.body.node_id();
     let dialed = record.body.direct_addrs.first().copied();
     handle
         .import_peer_records([record], Some(node_id(82)))

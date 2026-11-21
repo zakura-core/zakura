@@ -280,7 +280,7 @@ mod tests {
 
     const MIB: u64 = 1024 * 1024;
     /// One admitted Mainnet connection at the default windows and shares.
-    const CONNECTION: u64 = 141_937_353;
+    const CONNECTION: u64 = 141_945_123;
     /// One handshake at the default windows.
     const HANDSHAKE: u64 = 64 * MIB;
 
@@ -330,7 +330,7 @@ mod tests {
         );
         assert_eq!(
             default_connection_memory(RegtestMessage::BUDGET).admitted_bytes,
-            144_030_963
+            144_038_733
         );
         let config = ZakuraConfig::default();
         assert_eq!(config.connection_memory(&mainnet(), &[]), mainnet_memory);
@@ -360,7 +360,7 @@ mod tests {
         }
         assert_eq!(
             config.quic_memory_bytes(&mainnet(), DEFAULT_ZAKURA_MAX_CONNECTIONS, &[]),
-            15_474_155_580
+            15_474_870_420
         );
         assert_eq!(
             config.quic_memory_bytes(
@@ -368,7 +368,7 @@ mod tests {
                 DEFAULT_ZAKURA_MAX_CONNECTIONS,
                 &[],
             ),
-            15_666_767_700
+            15_667_482_540
         );
     }
 

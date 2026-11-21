@@ -1348,9 +1348,11 @@ mod tests {
         let mut cluster = ZakuraTestCluster::new();
         let victim_idx = cluster.spawn_traced_node(1, &mut capture).await?;
         let victim = cluster.node(victim_idx);
+        // Seed 5's node ID sorts below the victim's, so this peer is the side
+        // that opens the stream.
         let hostile = HostilePeer::connect_native_with_capabilities(
             victim,
-            2,
+            5,
             ZAKURA_CAP_BLOCK_SYNC_REGULATED,
         )
         .await?;
@@ -1412,9 +1414,11 @@ mod tests {
         let mut cluster = ZakuraTestCluster::new();
         let victim_idx = cluster.spawn_traced_node(1, &mut capture).await?;
         let victim = cluster.node(victim_idx);
+        // Seed 5's node ID sorts below the victim's, so this peer is the side
+        // that opens the stream.
         let hostile = HostilePeer::connect_native_with_capabilities(
             victim,
-            2,
+            5,
             ZAKURA_CAP_BLOCK_SYNC_REGULATED,
         )
         .await?;
@@ -2712,7 +2716,7 @@ mod tests {
             .await??;
             match crate::zakura::wire_codec::decode_frame::<DiscoveryMessage>(&frame)? {
                 DiscoveryMessage::Hello { record } => {
-                    assert_eq!(record.body.node_id, victim_node_id);
+                    assert_eq!(record.body.node_id(), victim_node_id);
                     saw_hello = true;
                 }
                 DiscoveryMessage::Peers { records } => {

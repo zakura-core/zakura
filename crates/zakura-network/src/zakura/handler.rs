@@ -5686,6 +5686,10 @@ async fn spawn_zakura_endpoint_inner(
         config.zakura.dev_network.as_deref(),
     );
     let sought_services = sought_services_with_custom(&custom_services);
+    config.move_legacy_zakura_discovery_sequence_file(
+        &discovery_secret_key.public_key(),
+        &discovery_secret_key.public(),
+    );
     let discovery = discovery::build_discovery_handle(
         discovery_secret_key,
         Some(discovery::AuthoredSequenceFile::new(

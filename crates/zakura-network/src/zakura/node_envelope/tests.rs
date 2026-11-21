@@ -164,7 +164,7 @@ fn the_default_envelope_sums_the_reactor_shares() {
     // The connection window and the stream window that carry the shares.
     assert_eq!(
         shares.receive_window(shares.kinds.iter().map(|(kind, _)| *kind)),
-        32 * MIB + 74_828_489
+        32 * MIB + 74_836_259
     );
     assert_eq!(
         u64::from(limits.quic.stream_receive_window_bytes),
@@ -178,16 +178,16 @@ fn the_default_envelope_sums_the_reactor_shares() {
         limits.transport_limits_for_kinds(shares.kinds.iter().map(|(kind, _)| *kind)),
     );
     // Per connection: 74,828,489 B of receive shares and 180,303,803 B of output shares.
-    assert_eq!(transport.connection_raw_bytes, 74_828_489);
-    assert_eq!(transport.connection_output_bytes, 180_303_803);
+    assert_eq!(transport.connection_raw_bytes, 74_836_259);
+    assert_eq!(transport.connection_output_bytes, 180_310_523);
     // The shared compatibility client holds at most 288 exchanges at once.
     assert_eq!(transport.compat_response_bytes, 288 * 20 * MIB);
     assert_eq!(
         envelope.transport_bytes,
-        92 * u128::from(74_828_489_u64 + 180_303_803) + u128::from(288 * 20 * MIB)
+        92 * u128::from(74_836_259_u64 + 180_310_523) + u128::from(288 * 20 * MIB)
     );
     // 92 × 141,937,353 + 32 × 64 MiB + 256 MiB.
-    assert_eq!(envelope.quic_bytes, 15_474_155_580);
+    assert_eq!(envelope.quic_bytes, 15_474_870_420);
 }
 
 /// A custom stream kind takes the `other` share on a live connection, so the peer

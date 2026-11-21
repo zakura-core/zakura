@@ -1724,10 +1724,7 @@ pub static COVERAGE: &[Coverage] = &[
     tx_relay_table("tx-relay/s10v1/hello/short-payload-closes"),
     tx_relay_table("tx-relay/s10v1/hello/long-payload-closes"),
     tx_relay_table("tx-relay/s10v1/hello/bad-content-closes"),
-    tx_relay_unreachable(
-        "tx-relay/s10v1/hello/cadence-never-closes",
-        "a second Hello closes the connection under row 4 before the row's cadence bucket can run dry",
-    ),
+    tx_relay_table("tx-relay/s10v1/hello/cadence-never-closes"),
     tx_relay_table("tx-relay/s10v1/get-txs/reserved-flags-closes"),
     tx_relay_table("tx-relay/s10v1/get-txs/short-payload-closes"),
     tx_relay_table("tx-relay/s10v1/get-txs/long-payload-closes"),

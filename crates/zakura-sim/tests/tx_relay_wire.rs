@@ -513,7 +513,7 @@ fn each_neutral_close_closes_in_its_witness() {
 }
 
 /// The generated IDs no `tx-relay` scenario reaches, each with why.
-const UNREACHED: [(&str, &str); 6] = [
+const UNREACHED: [(&str, &str); 5] = [
     (
         "tx-relay/s9v1/inv/over-rate-closes",
         "no peer floods: it can't tell which Inv overran the node's bucket",
@@ -521,10 +521,6 @@ const UNREACHED: [(&str, &str); 6] = [
     (
         "tx-relay/s10v1/get-txs/over-margin-closes",
         "a request past the Hello depends on the node's writer, so its close is neutral",
-    ),
-    (
-        "tx-relay/s10v1/hello/cadence-never-closes",
-        "a second Hello closes under row 4 first",
     ),
     (
         "tx-relay/s10v1/not-found/bad-content-closes",
@@ -542,8 +538,8 @@ const UNREACHED: [(&str, &str); 6] = [
 
 /// The witnesses of the generated IDs: the row witnesses, a header fault
 /// of each row, an unrequested body, an undeclared type on each stream,
-/// and an
-/// honest exchange.
+/// four sessions' `Hello`s on one connection, which run its bucket dry,
+/// and an honest exchange.
 fn generated_witnesses() -> Vec<[u8; COMPOSED_BYTES]> {
     let mut witnesses: Vec<[u8; COMPOSED_BYTES]> = ROW_WITNESSES
         .iter()
@@ -573,6 +569,17 @@ fn generated_witnesses() -> Vec<[u8; COMPOSED_BYTES]> {
         ));
     }
     witnesses.push(prefix(0, 0x80, 0, &[RelayStep::UnrequestedNotFound, WAIT]));
+    witnesses.push(prefix(
+        0,
+        0,
+        0,
+        &[
+            RelayStep::Reopen,
+            RelayStep::Reopen,
+            RelayStep::Reopen,
+            WAIT,
+        ],
+    ));
     witnesses.push(prefix(
         0,
         0x01,

@@ -11,8 +11,10 @@
 //!
 //! Every frame a peer writes is labelled before the write, as the header
 //! and discovery peers' are: the frame model over the stream's rows for the
-//! header, a model of the node's `Inv` byte bucket for the metered row, and
-//! `tx-relay`'s own rules for the content. A content fault also names the
+//! header, a model of the node's `Inv` byte bucket for the metered row, the
+//! cadence model for each row with a cadence, and `tx-relay`'s own rules
+//! for the content. The node keeps one cadence bucket per row for the
+//! whole connection, so the peer's model survives a reopen too. A content fault also names the
 //! close-table row it breaks, in the run's [`RelayEvidence`] ledger. The
 //! labels and the writes go to [`PeerRecords`], which the evidence places
 //! on the node's connection. A request past the node's `Hello`, or for an
@@ -57,7 +59,7 @@ use super::{
 };
 use crate::{
     domain::tx_relay::{lock, SharedRelay, TxKey},
-    model::{FrameHeader, FrameModel, Label, Labels, ReaderEnd},
+    model::{CadenceModel, Charge, FrameHeader, FrameModel, Label, Labels, ReaderEnd},
     net::WireOrder,
     observe::StreamId,
 };
@@ -567,6 +569,9 @@ struct Connection {
     sender: Bucket,
     /// A model of the node's receiving bucket for the peer's `Inv`s.
     receiver: Bucket,
+    /// A model of the node's cadence buckets, which every session on the
+    /// connection pays.
+    cadence: CadenceModel,
     /// Requests the node made that the peer hasn't answered, oldest first.
     asked: VecDeque<UnminedTxId>,
     /// When the next answer may go.
@@ -714,18 +719,30 @@ impl RelayPeer {
     }
 
     /// Writes `frames` on `writer` in one write, each recorded with its
-    /// label first, and its broken row in the ledger. False once the write
+    /// label first, and its broken row in the ledger. Each frame of a row
+    /// with a cadence pays `connection`'s bucket. False once the write
     /// fails.
-    async fn write_all(&self, remote: Remote, writer: &mut Writer, frames: Vec<Out>) -> bool {
+    async fn write_all(
+        &self,
+        connection: &mut Connection,
+        writer: &mut Writer,
+        frames: Vec<Out>,
+    ) -> bool {
+        let remote = connection.remote;
         let model = FrameModel::new(writer.rules, ReaderEnd::Persistent);
         let mut bytes = Vec::new();
         let mut written = Vec::new();
         for out in frames {
             let labels = model.labels(&out.header);
             let label = labels.union(out.family).first();
-            let row = model
-                .row(out.header.message_type)
-                .map(|row| row.name.to_owned());
+            let rule = model.row(out.header.message_type);
+            let exhausted = rule.is_some_and(|rule| {
+                connection
+                    .cadence
+                    .charge(0, writer.stream.kind, rule, now())
+                    == Charge::Exhausted
+            });
+            let row = rule.map(|row| row.name.to_owned());
             // A header fault decides the frame before its content does.
             if let (Some(broken), true) = (out.row, labels == Labels::NONE) {
                 lock(&self.evidence).broke(remote.addr, broken);
@@ -741,7 +758,7 @@ impl RelayPeer {
                     row,
                     rule_stream: writer.stream,
                     label,
-                    exhausted: false,
+                    exhausted,
                     exchange: None,
                     payload: u64::try_from(out.payload.len()).unwrap_or(u64::MAX),
                     prepares: None,
@@ -781,6 +798,7 @@ impl RelayPeer {
             remote,
             sender: Bucket::new(u64::from(INV_RATE.opening_allowance), rate, opened),
             receiver: Bucket::new(self.inv_depth, INV_RATE.receiver_bytes_per_second(), opened),
+            cadence: CadenceModel::new(),
             asked: VecDeque::new(),
             next_answer: Duration::ZERO,
             announced: Vec::new(),
@@ -928,7 +946,7 @@ impl RelayPeer {
             Out::conformant(&hello)
         };
         session.hellos += 1;
-        self.write_all(connection.remote, &mut session.state, vec![out])
+        self.write_all(connection, &mut session.state, vec![out])
             .await
     }
 
@@ -1058,9 +1076,8 @@ impl RelayPeer {
                 )
             }
         };
-        let remote = connection.remote;
-        (data.is_empty() || self.write_all(remote, &mut session.data, data).await)
-            && (state.is_empty() || self.write_all(remote, &mut session.state, state).await)
+        (data.is_empty() || self.write_all(connection, &mut session.data, data).await)
+            && (state.is_empty() || self.write_all(connection, &mut session.state, state).await)
     }
 
     /// The payload bytes of the next paced `Inv`, if one waits.
@@ -1089,12 +1106,8 @@ impl RelayPeer {
         let entries: Vec<(UnminedTxId, u32)> = connection.to_announce.drain(..take).collect();
         connection.announced.extend(entries.iter().copied());
         let inv = TxRelayMessage::Inv(entries);
-        self.write_all(
-            connection.remote,
-            &mut session.data,
-            vec![Out::conformant(&inv)],
-        )
-        .await
+        self.write_all(connection, &mut session.data, vec![Out::conformant(&inv)])
+            .await
     }
 
     /// Runs one step. Returns `None` once a scripted reopen ended the
@@ -1106,7 +1119,6 @@ impl RelayPeer {
         session: &mut Session,
         connection: &mut Connection,
     ) -> Option<bool> {
-        let remote = connection.remote;
         let hello = session.hellos > 0;
         let ask = |id| {
             let message = TxRelayMessage::GetTxs(id);
@@ -1336,8 +1348,8 @@ impl RelayPeer {
                 (Vec::new(), ids.into_iter().map(ask).collect())
             }
         };
-        let wrote = (data.is_empty() || self.write_all(remote, &mut session.data, data).await)
-            && (state.is_empty() || self.write_all(remote, &mut session.state, state).await);
+        let wrote = (data.is_empty() || self.write_all(connection, &mut session.data, data).await)
+            && (state.is_empty() || self.write_all(connection, &mut session.state, state).await);
         Some(wrote)
     }
 

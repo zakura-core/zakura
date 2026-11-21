@@ -936,8 +936,7 @@ These are not configurable. Changing one needs a spec change.
   `quic_conn` JSONL row per connection every 10 s and on close. The endpoint
   delivers each sample to a `ConnObserver` callback, because `zakura-quic`
   doesn't depend on Zakura's trace crate. Each row holds `event` (`sample` or
-  `closed`), `conn`, `direction` (`inbound` or `outbound`), `peer` (null
-  until the application binds the connection's node ID),
+  `closed`), `conn`, `direction` (`inbound` or `outbound`), `peer`,
   `admitted_ip`, `rtt_micros`, `cwnd`, `lost_packets`,
   `congestion_events`, `bytes_sent`, `bytes_received`, `current_mtu`,
   `bytes_in_flight`, `send_blocked_micros` and `close_reason`. For a close this
@@ -1266,11 +1265,10 @@ this release tolerates, and keep each hard change explicit.
 | ML-KEM-768 gives a subset of Project Wycheproof's known answers for key generation, encapsulation and decapsulation; it refuses a key that fails the modulus check and a share of another length before drawing randomness; an altered ciphertext gives an unrelated secret | TLS-9, SEC-1 |
 | X25519MLKEM768's shares and secret are the ML-KEM part then the X25519 part, checked in each role against `libcrux-ml-kem` and `curve25519-dalek` used directly; fed an independent implementation's recorded shares, it gives back the shares and secrets that implementation recorded, in both roles; a bad half or a failed random source fails the exchange | TLS-9 |
 | A production listener refuses a handshake whose hybrid share is one byte short or carries an ML-KEM key that fails the modulus check | TLS-9, SEC-2 |
-| Two production configs negotiate X25519MLKEM768; with a peer that has only ring's groups, as dialer and as listener, the handshake completes on X25519 with no HelloRetryRequest. Over QUIC, a dialer with only ring's groups reaches a production listener, and a production dialer reaches a listener with only ring's groups | TLS-9 |
 | A peer that offers only classical groups is refused in either direction, and two production endpoints agree on the hybrid | TLS-9 |
 | A credential with an unknown long key derives the same ID on both ends; a bare Ed25519 SubjectPublicKeyInfo, a credential whose ID isn't the dialed one, and a client presenting a credential it can't sign for are refused | TLS-3, TLS-4, TLS-7, TLS-8, ID-12 |
 | The seeded X25519MLKEM768 completes against the production group in both roles and replays its shares for the same seed and node | TLS-9, API-2 |
-| A dialer that offers X25519MLKEM768 sends its hello as two 1,200-byte Initial datagrams. A refused dial is decided and answered once per datagram, and a retried one decided once per datagram. A hello refused at its first datagram and accepted at its second keeps its charge and holds a pending handshake until the deadline. A hello with no ALPN in common is cancelled when it fits one datagram and fails as a handshake when it spans two | ADM-1, ADM-3, ADM-7, API-3 |
+| A dialer that offers X25519MLKEM768 sends its hello as two 1,200-byte Initial datagrams. A refused dial is decided and answered once per datagram, and a retried one decided once per datagram. A hello refused at its first datagram and accepted at its second keeps its charge and holds a pending handshake until the deadline. A one-datagram hello, which only a dialer with classical groups alone sends, is refused at its first datagram and cancelled; a hello with no ALPN in common, which spans two, fails as a handshake | ADM-1, ADM-3, ADM-7, API-3 |
 | On the deterministic scheduler, with no tokio runtime, two `bind_with` endpoints with the same seeded inputs, plan and UTC origin send byte-identical datagrams through a Retry handshake and an echoed stream, in one process and in fresh processes. Leaving out any seeded input, or changing the seed or the UTC origin, changes the bytes, and host time doesn't | API-2, TLS-9, ADM-10, DEP-2 |
 | Cancelled reads lose no data; cancelled writes keep their order; concurrent streams keep their data apart; a transfer larger than the receive window completes | DRV-4–DRV-6 |
 | Dropping the last `Conn` closes the connection | DRV-7 |

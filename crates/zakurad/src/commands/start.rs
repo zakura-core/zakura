@@ -341,10 +341,16 @@ impl StartCmd {
             ));
         }
 
-        if config.network.zakura.listen_addr.is_none() {
+        // An unset address also binds loopback only.
+        if config
+            .network
+            .zakura
+            .listen_addr
+            .is_none_or(|addr| addr.ip().is_loopback())
+        {
             warn!(
-                "mining.miner_mesh is set but network.zakura.listen_addr is not, so the v2 \
-                 endpoint listens on loopback only and other miners cannot dial this gateway"
+                "mining.miner_mesh is set but network.zakura.listen_addr is unset or loopback, \
+                 so other miners cannot dial this gateway"
             );
         }
 

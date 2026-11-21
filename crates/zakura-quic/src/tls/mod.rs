@@ -34,7 +34,7 @@ pub(crate) mod verifier;
 /// The server name passed to quinn-proto for every dial.
 ///
 /// SNI is off (TLS-6), so this name never leaves the process. The verifier
-/// checks the dialed node's key instead.
+/// checks the dialed node ID instead.
 pub(crate) const UNSENT_SERVER_NAME: &str = "zakura.invalid";
 
 /// The runtime's UTC clock, `zakura_rt::time::utc_now`, for the Retry token

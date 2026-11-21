@@ -340,6 +340,138 @@ mod tests {
         assert!(tls.uses_production_provider());
     }
 
+    /// The names of a provider's key-exchange groups, in offer order.
+    fn group_names(provider: &rustls::crypto::CryptoProvider) -> Vec<rustls::NamedGroup> {
+        provider
+            .kx_groups
+            .iter()
+            .map(|group| group.name())
+            .collect()
+    }
+
+    /// TLS-9: the production provider is ring's with one change, the hybrid
+    /// group offered ahead of ring's own groups.
+    #[test]
+    fn the_production_provider_is_rings_with_the_hybrid_group_first() {
+        let ring = rustls::crypto::ring::default_provider();
+        let production = production_provider();
+        let mut expected = vec![rustls::NamedGroup::X25519MLKEM768];
+        expected.extend(group_names(&ring));
+        assert_eq!(group_names(&production), expected);
+        assert!(group_names(&ring).contains(&rustls::NamedGroup::X25519));
+        assert_eq!(
+            format!("{:?}", production.cipher_suites),
+            format!("{:?}", ring.cipher_suites)
+        );
+        assert_eq!(
+            format!("{:?}", production.signature_verification_algorithms),
+            format!("{:?}", ring.signature_verification_algorithms)
+        );
+        assert_eq!(
+            format!("{:?}", production.key_provider),
+            format!("{:?}", ring.key_provider)
+        );
+        assert_eq!(
+            format!("{:?}", production.secure_random),
+            format!("{:?}", ring.secure_random)
+        );
+        assert!(TlsConfig::new(&NodeSecretKey::generate()).uses_production_provider());
+    }
+
+    /// TLS-9: an endpoint that injects only a random source still offers the
+    /// production groups, the hybrid first.
+    #[test]
+    fn an_injected_random_source_keeps_the_production_groups() {
+        let inputs = EndpointInputs::default().tls_random(&SEVENS);
+        let tls = TlsConfig::with_inputs(&NodeSecretKey::generate(), &inputs).unwrap();
+        assert_eq!(format!("{:?}", tls.provider.secure_random), "Sevens");
+        assert_eq!(
+            group_names(&tls.provider),
+            group_names(&production_provider())
+        );
+    }
+
+    /// TLS state like a release before the hybrid group: ring's own groups.
+    fn ring_only(secret_key: &NodeSecretKey) -> TlsConfig {
+        let groups = rustls::crypto::ring::default_provider().kx_groups;
+        TlsConfig::with_inputs(secret_key, &EndpointInputs::default().kx_groups(groups)).unwrap()
+    }
+
+    /// Runs one TLS handshake in memory, the `dialer` side dialing the
+    /// `listener` side. Returns the group both sides used and whether the
+    /// dialer needed a second round trip (a HelloRetryRequest).
+    fn handshake(
+        dialer: impl Fn(&NodeSecretKey) -> TlsConfig,
+        listener: impl Fn(&NodeSecretKey) -> TlsConfig,
+    ) -> (rustls::NamedGroup, rustls::HandshakeKind) {
+        let dialer_key = NodeSecretKey::generate();
+        let listener_key = NodeSecretKey::generate();
+        let client = dialer(&dialer_key)
+            .rustls_client(listener_key.public(), &[b"a"])
+            .unwrap();
+        let server = listener(&listener_key)
+            .rustls_server(vec![b"a".to_vec()])
+            .unwrap();
+        let name = rustls_pki_types::ServerName::try_from(UNSENT_SERVER_NAME).unwrap();
+        let mut client = rustls::ClientConnection::new(Arc::new(client), name).unwrap();
+        let mut server = rustls::ServerConnection::new(Arc::new(server)).unwrap();
+        while client.is_handshaking() || server.is_handshaking() {
+            let mut flight = Vec::new();
+            while client.wants_write() {
+                client.write_tls(&mut flight).unwrap();
+            }
+            let mut unread = flight.as_slice();
+            while !unread.is_empty() {
+                server.read_tls(&mut unread).unwrap();
+                server.process_new_packets().unwrap();
+            }
+            let mut flight = Vec::new();
+            while server.wants_write() {
+                server.write_tls(&mut flight).unwrap();
+            }
+            let mut unread = flight.as_slice();
+            while !unread.is_empty() {
+                client.read_tls(&mut unread).unwrap();
+                client.process_new_packets().unwrap();
+            }
+        }
+        let group = |group: Option<&'static dyn rustls::crypto::SupportedKxGroup>| {
+            group
+                .expect("a finished TLS 1.3 handshake used a key-exchange group")
+                .name()
+        };
+        let used = group(client.negotiated_key_exchange_group());
+        assert_eq!(group(server.negotiated_key_exchange_group()), used);
+        let kind = client
+            .handshake_kind()
+            .expect("a finished handshake has a kind");
+        (used, kind)
+    }
+
+    /// TLS-9: two endpoints on the production provider use the hybrid group,
+    /// in one round trip.
+    #[test]
+    fn two_production_endpoints_use_the_hybrid_group() {
+        assert_eq!(
+            handshake(TlsConfig::new, TlsConfig::new),
+            (
+                rustls::NamedGroup::X25519MLKEM768,
+                rustls::HandshakeKind::Full
+            )
+        );
+    }
+
+    /// TLS-9: an endpoint without the hybrid group still connects, in
+    /// either direction and in one round trip. The dialer's hello carries a
+    /// plain X25519 share next to the hybrid one, so no retry is needed.
+    #[test]
+    fn a_peer_without_the_hybrid_group_connects_on_x25519() {
+        let x25519 = (rustls::NamedGroup::X25519, rustls::HandshakeKind::Full);
+        assert_eq!(handshake(TlsConfig::new, ring_only), x25519);
+        assert_eq!(handshake(ring_only, TlsConfig::new), x25519);
+        assert_eq!(handshake(ring_only, ring_only), x25519);
+    }
+
     /// ring's P-256, limited to TLS 1.2, counting the key exchanges it starts.
     #[derive(Debug)]
     struct Tls12OnlyP256(std::sync::atomic::AtomicUsize);

@@ -11,14 +11,14 @@ use zakura_rt::collections::{HashMap, HashSet};
 
 use super::protocol::{
     advertised_services, entry_is_expired, hello_verdict, normalize_direct_addrs,
-    normalize_services, push_unique_service, BookChange, DialAdmission, DialCandidateExclusions,
-    DisclosureKey, DiscoveryBookError, DiscoveryRecordError, DiscoveryRecordValidationContext,
-    DiscoveryWireError, ImportBatchOutcome, ImportOutcome, RecordVerdict, Services,
-    ZakuraCachedLiveServiceSummary, ZakuraDiscoveryBook, ZakuraDiscoveryConfig,
-    ZakuraDiscoveryDialCandidate, ZakuraDiscoveryEntry, ZakuraDiscoveryLocalConfig,
-    ZakuraDiscoveryPersistedEntry, ZakuraNodeRecord, ZakuraNodeRecordBody, ZakuraServiceId,
-    DEFAULT_LIVE_SERVICE_SUMMARY_TTL, MAX_DISCOVERY_EXCLUDED_NODE_IDS,
-    MAX_SERVICE_SUMMARIES_PER_RESPONSE,
+    normalize_services, push_unique_service, AddressScope, BookChange, DialAdmission,
+    DialCandidateExclusions, DisclosureKey, DiscoveryBookError, DiscoveryRecordError,
+    DiscoveryRecordValidationContext, DiscoveryWireError, ImportBatchOutcome, ImportOutcome,
+    RecordVerdict, Services, ZakuraCachedLiveServiceSummary, ZakuraDiscoveryBook,
+    ZakuraDiscoveryConfig, ZakuraDiscoveryDialCandidate, ZakuraDiscoveryEntry,
+    ZakuraDiscoveryLocalConfig, ZakuraDiscoveryPersistedEntry, ZakuraNodeRecord,
+    ZakuraNodeRecordBody, ZakuraServiceId, DEFAULT_LIVE_SERVICE_SUMMARY_TTL,
+    MAX_DISCOVERY_EXCLUDED_NODE_IDS, MAX_SERVICE_SUMMARIES_PER_RESPONSE,
 };
 use super::verified::VerifiedRecord;
 use crate::zakura::{
@@ -235,7 +235,10 @@ impl LocalRecordState {
             .unwrap_or(0);
         Ok(Self {
             node_id: config.secret_key.public(),
-            direct_addrs: normalize_direct_addrs(config.direct_addrs.clone()),
+            direct_addrs: normalize_direct_addrs(
+                config.direct_addrs.clone(),
+                AddressScope::for_network(config.network_id),
+            ),
             services: advertised_services(config.services.clone())?,
             zakura_protocol_min: config.zakura_protocol_min,
             zakura_protocol_max: config.zakura_protocol_max,
@@ -285,7 +288,8 @@ impl DiscoveryState {
                 config.book_limits,
                 Some(local.node_id),
                 disclosure_key,
-            ),
+            )
+            .with_address_scope(AddressScope::for_network(local.network_id)),
             active_services: HashMap::new(),
             admitted_peers: HashMap::new(),
             local,

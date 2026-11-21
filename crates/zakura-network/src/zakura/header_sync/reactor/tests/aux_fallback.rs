@@ -345,6 +345,22 @@ async fn history_pruned_without_records_rotates_and_backs_off() {
         &open,
         HeadersOutcomeCode::HistoryPruned,
     );
+
+    // The rotation gives the other peer its turn before the pruned one
+    // retries.
+    let rotated = answer_locator(
+        &mut reactor,
+        &mut actions,
+        &other,
+        &mut other_outbound,
+        target,
+    );
+    end(
+        &mut reactor,
+        &other,
+        &rotated,
+        HeadersOutcomeCode::SubscriptionSuperseded,
+    );
     let open = answer_locator(
         &mut reactor,
         &mut actions,
@@ -358,20 +374,6 @@ async fn history_pruned_without_records_rotates_and_backs_off() {
         &pruned,
         &open,
         HeadersOutcomeCode::HistoryPruned,
-    );
-
-    let rotated = answer_locator(
-        &mut reactor,
-        &mut actions,
-        &other,
-        &mut other_outbound,
-        target,
-    );
-    end(
-        &mut reactor,
-        &other,
-        &rotated,
-        HeadersOutcomeCode::SubscriptionSuperseded,
     );
     refresh(&mut reactor, &pruned, &status);
     assert!(
@@ -855,8 +857,9 @@ async fn pruned_publishers_bring_a_node_from_genesis_past_their_index_height() {
     };
 
     // Both advertise height 4, and the first peer takes the target. Its
-    // schema 1 round from genesis ends `HistoryPruned`, and its round
-    // without records reaches the tip.
+    // schema 1 round from genesis ends `HistoryPruned`. The rotation then
+    // gives the second peer its turn, whose schema 1 round ends the same
+    // way, and the first peer's round without records reaches the tip.
     for peer in &peers {
         refresh(&mut reactor, peer, &tip_status(chain[3]));
     }
@@ -871,12 +874,13 @@ async fn pruned_publishers_bring_a_node_from_genesis_past_their_index_height() {
         rounds,
         [
             (peers[0].clone(), AuxSchema::V1, false),
+            (peers[1].clone(), AuxSchema::V1, false),
             (peers[0].clone(), AuxSchema::None, true),
         ]
     );
 
-    // The second peer advertises height 10, falls back the same way, and
-    // carries the chain past the index height.
+    // The second peer advertises height 10. It already fell back, so its
+    // round without records carries the chain past the index height.
     refresh(&mut reactor, &peers[1], &tip_status(chain[9]));
     let rounds = drive_to(
         &mut reactor,
@@ -885,13 +889,7 @@ async fn pruned_publishers_bring_a_node_from_genesis_past_their_index_height() {
         &pruned,
         chain[9],
     );
-    assert_eq!(
-        rounds,
-        [
-            (peers[1].clone(), AuxSchema::V1, false),
-            (peers[1].clone(), AuxSchema::None, true),
-        ]
-    );
+    assert_eq!(rounds, [(peers[1].clone(), AuxSchema::None, true)]);
     let fallen_back = peers.clone();
     for peer in &fallen_back {
         assert!(reactor.state.pruned_peers[peer].aux_fallback.is_some());

@@ -1269,10 +1269,48 @@ impl HeaderSyncReactor {
         }
         self.request_vct_repair_context();
         self.try_assign_vct_repair();
+        if self.waits_for_owed_pass(&peer, &status) {
+            // The new status supersedes the peer's unstarted target, as when
+            // header room holds the status back.
+            self.peer_work_queue.remove_unstarted(&peer);
+            return;
+        }
         // This offer is considered synchronously. If it remains blocked, changing
         // its payload cannot make another peer eligible. Shared ownership and
         // effective locator claims below invalidate the global pass when needed.
         self.consider_advertised_header_target(peer, session_id, status);
+    }
+
+    /// Whether `peer`'s fresh `status` waits for the owed cached pass,
+    /// because staging it now would overtake an offer that the pass owes a
+    /// turn first.
+    ///
+    /// A pass is owed when it waits for its refill, or when an eligibility
+    /// input changed since the last pass. The second case covers a release
+    /// earlier in the same reactor turn: the pass at the turn's end runs
+    /// after this status, so without the guard the status would take the
+    /// freed target or slot first.
+    ///
+    /// Started work can't take a new target. Unstarted work takes it in its
+    /// own slot, so it can overtake only an offer that waits for that target.
+    fn waits_for_owed_pass(&self, peer: &ZakuraPeerId, status: &Status) -> bool {
+        if !self.cached_pass_owed() || self.peer_work_queue.active(peer).is_some() {
+            return false;
+        }
+        let Some(local) = self.committed_snapshot.as_ref() else {
+            return false;
+        };
+        let priority = PeerWorkPriority::of_status(status, local);
+        let target = status.selected_tip_hash;
+        match self.peer_work_queue.awaiting_target(peer) {
+            Some(current) => {
+                current.status.selected_tip_hash != target
+                    && self
+                        .state
+                        .overtakes_waiting_for_target(peer, priority, target)
+            }
+            None => self.state.overtakes_waiting(peer, priority, target),
+        }
     }
 
     /// Stage ordinary work for `peer`'s latest status.
@@ -1296,6 +1334,7 @@ impl HeaderSyncReactor {
             status,
         };
         let work_order = target.claimed_work_order(local);
+        let priority = PeerWorkPriority::from_work_order(work_order);
         let decision = decide_offer(
             OfferFacts {
                 pruned_pause: self.state.pruned_pause_holds(
@@ -1372,10 +1411,15 @@ impl HeaderSyncReactor {
                         }
                     );
                 }
+                // Header room is shared like a staging slot, so the offer
+                // keeps its turn for the room.
+                if !self.ordinary_discovery_paused() {
+                    self.state.note_waiting_for_slot(&peer, priority);
+                }
                 self.peer_work_queue.remove_unstarted(&peer)
             }
             OfferDecision::AwaitSubscription => self.close_subscription(&peer),
-            OfferDecision::Stage => self.stage_offer(peer, target, work_order),
+            OfferDecision::Stage => self.stage_offer(peer, target, priority),
         }
     }
 
@@ -1384,7 +1428,7 @@ impl HeaderSyncReactor {
         &mut self,
         peer: ZakuraPeerId,
         target: AdvertisedHeaderTarget,
-        work_order: Option<std::cmp::Ordering>,
+        priority: PeerWorkPriority,
     ) {
         let session_id = target.session_id;
         let target_tip_hash = target.status.selected_tip_hash;
@@ -1394,16 +1438,16 @@ impl HeaderSyncReactor {
             .awaiting_target(&peer)
             .map(|target| self.pending_locator_header_count(&target.status));
         let next_claim = self.pending_locator_header_count(&target.status);
-        match self.peer_work_queue.stage_distinct_target(
-            peer.clone(),
-            target,
-            PeerWorkPriority::from_work_order(work_order),
-        ) {
+        match self
+            .peer_work_queue
+            .stage_distinct_target(peer.clone(), target, priority)
+        {
             QueueWorkResult::NeedsLocator => {
                 if previous_claim.is_some_and(|claimed| claimed != next_claim) {
                     self.state.bump_scheduling_revision();
                 }
                 self.state.spend_status(&peer);
+                self.state.take_turn(&peer);
                 if self
                     .dispatch_action(HeaderPortOperation::QueryHeaderLocator {
                         peer: peer.clone(),
@@ -1420,9 +1464,12 @@ impl HeaderSyncReactor {
                 metrics::counter!("sync.header.target.already_active").increment(1);
             }
             QueueWorkResult::TargetAlreadyAssigned => {
+                self.state
+                    .note_waiting_for_target(&peer, priority, target_tip_hash);
                 metrics::counter!("sync.header.target.duplicate_suppressed").increment(1);
             }
             QueueWorkResult::AtCapacity => {
+                self.state.note_waiting_for_slot(&peer, priority);
                 metrics::counter!("sync.header.target.capacity_refused").increment(1);
                 observe!(
                     self,
@@ -1446,6 +1493,14 @@ impl HeaderSyncReactor {
             available_locators: self.locator_capacity.available_permits(),
             resource_stalled: self.ordinary_discovery_paused(),
         }
+    }
+
+    /// Whether a cached pass is owed: it waits for its refill, or an
+    /// eligibility input changed since the last pass, so the pass at the end
+    /// of this reactor turn runs.
+    fn cached_pass_owed(&self) -> bool {
+        self.state.cached_pass_deferred
+            || self.state.last_scheduling_opportunity != Some(self.scheduling_opportunity())
     }
 
     /// Stage idle unspent offers only after an eligibility input changes.
@@ -1489,6 +1544,7 @@ impl HeaderSyncReactor {
             );
             row.insert(hs_trace::PEERS_CONSIDERED.into(), peers.into());
         });
+        self.state.clear_waiting();
         let offers = self.state.cached_offers(
             local,
             |peer| self.peer_work_queue.has_work(peer),
@@ -1500,16 +1556,28 @@ impl HeaderSyncReactor {
                     .session_id()
             },
         );
-        for (peer, target) in offers {
+        for (peer, priority, target) in offers {
             if self.peer_work_queue.len() >= zakura_header_chain::MAX_STAGED_TARGETS_V1 {
+                // The pass would serve this offer next. Every later offer
+                // comes after it in the pass, so its place covers theirs.
+                self.state.note_waiting_for_slot(&peer, priority);
                 break;
             }
             // Leave a held-back status unspent without counting it as refused on every event.
             if self
                 .peer_work_queue
                 .is_target_assigned(target.status.selected_tip_hash)
-                || self.ordinary_headroom(&peer, &target.status) == 0
             {
+                self.state.note_waiting_for_target(
+                    &peer,
+                    priority,
+                    target.status.selected_tip_hash,
+                );
+                continue;
+            }
+            if self.ordinary_headroom(&peer, &target.status) == 0 {
+                // Header room is shared like a staging slot.
+                self.state.note_waiting_for_slot(&peer, priority);
                 continue;
             }
             self.consider_advertised_header_target(peer, target.session_id, target.status);

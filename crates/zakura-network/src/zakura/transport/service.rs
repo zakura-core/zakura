@@ -5,7 +5,7 @@ use std::{fmt, future::Future, net::IpAddr, pin::Pin, time::Duration};
 use thiserror::Error;
 use zakura_rt::{collections::HashMap, sync::CancellationToken, time::Instant};
 
-use super::{CloseCause, FramedRecv, FramedSend, MessageRule};
+use super::{CloseCause, CloseRow, FramedRecv, FramedSend, MessageRule};
 use crate::{
     zakura::{ServicePeerDirection, ZakuraConnId, ZakuraPeerId},
     BoxError,
@@ -285,16 +285,15 @@ impl ServiceStream {
     }
 }
 
-/// Reads the first cause recorded for a connection's close, such as
-/// `service_protocol_reject`.
+/// Reads the first outcome recorded for a connection's close.
 #[cfg(any(test, zakura_sim))]
 #[derive(Clone, Debug)]
 pub struct CloseCauseReader(CloseCause);
 
 #[cfg(any(test, zakura_sim))]
 impl CloseCauseReader {
-    /// The first recorded cause, or `None` while no path recorded one.
-    pub fn get(&self) -> Option<&'static str> {
+    /// The first recorded outcome, or `None` while no path recorded one.
+    pub fn get(&self) -> Option<super::CloseOutcome> {
         self.0.get()
     }
 }
@@ -758,6 +757,7 @@ pub trait Service: fmt::Debug + Send + Sync + 'static {
         _frame: Frame,
     ) -> Result<(), SinkReject> {
         Err(SinkReject::protocol(
+            CloseRow::CONN_CLOSE_24,
             "service does not accept inbound frames",
         ))
     }
@@ -830,9 +830,9 @@ pub trait Source: Send + 'static {
 /// Reason a service sink rejected a decoded frame stream.
 #[derive(Debug, Error)]
 pub enum SinkReject {
-    /// The peer sent protocol-invalid data, so the connection should close.
-    #[error("inbound sink rejected protocol-invalid frame: {0}")]
-    Protocol(#[source] BoxError),
+    /// The peer broke the close-spec row, so the connection should close.
+    #[error("inbound sink rejected protocol-invalid frame ({0}): {1}")]
+    Protocol(CloseRow, #[source] BoxError),
 
     /// Local sink state prevented delivery; the peer is not at fault.
     #[error("inbound sink could not accept frame locally: {0}")]
@@ -840,9 +840,9 @@ pub enum SinkReject {
 }
 
 impl SinkReject {
-    /// Build a fatal peer-protocol rejection.
-    pub fn protocol(error: impl Into<BoxError>) -> Self {
-        Self::Protocol(error.into())
+    /// Build a fatal peer-protocol rejection for breaking `row`.
+    pub fn protocol(row: CloseRow, error: impl Into<BoxError>) -> Self {
+        Self::Protocol(row, error.into())
     }
 
     /// Build a non-fatal local-delivery rejection.

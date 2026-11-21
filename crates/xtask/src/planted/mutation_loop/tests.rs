@@ -985,9 +985,32 @@ fn planted_cases_read_their_property() {
     fs::create_dir_all(&case).unwrap();
     fs::write(case.join("plain.patch"), "").unwrap();
     fs::write(case.join("plain.toml"), "seed = \"in\"\n").unwrap();
-    let cases = planted_cases(repo.path(), &["race".to_owned()]).unwrap();
+    let cases = planted_cases(repo.path(), &["race".to_owned()], &mut Vec::new()).unwrap();
     assert_eq!(cases.len(), 1);
     assert_eq!(cases[0].property, "race/lost-update");
+}
+
+/// A search case commits no witness, so `--planted` skips it, and says so
+/// in the notes `run` sends to stderr: on stdout, the line would break the
+/// JSON that `--list` prints and `mutation_joint_run.py` parses.
+#[test]
+fn a_skipped_search_case_leaves_stdout_to_the_listing() {
+    let repo = tempfile::tempdir().unwrap();
+    let case = repo.path().join("qa/planted/race/lost-update");
+    fs::create_dir_all(&case).unwrap();
+    fs::write(case.join("found.patch"), "").unwrap();
+    fs::write(
+        case.join("found.toml"),
+        "[search]\nharness = \"race\"\nseed = 1\nruns = 1\n",
+    )
+    .unwrap();
+    let mut notes = Vec::new();
+    let cases = planted_cases(repo.path(), &["race".to_owned()], &mut notes).unwrap();
+    assert!(cases.is_empty());
+    assert_eq!(
+        String::from_utf8(notes).unwrap(),
+        "race/lost-update/found.patch: skipped: a search case has no committed witness\n"
+    );
 }
 
 /// `--planted` selects whole path components or one case, so a prefix that
@@ -1052,8 +1075,12 @@ fn a_case_watches_its_work_list_entrys_paths() {
 #[test]
 fn generator_lanes_watch_their_inputs() {
     let repo_root = crate::repo_root().expect("xtask lives in the workspace");
-    let cases = planted_cases(&repo_root, &["session/connection-shares-bound".to_owned()])
-        .expect("the committed planted cases parse");
+    let cases = planted_cases(
+        &repo_root,
+        &["session/connection-shares-bound".to_owned()],
+        &mut Vec::new(),
+    )
+    .expect("the committed planted cases parse");
     let case = cases
         .first()
         .expect("connection-shares-bound has planted cases");

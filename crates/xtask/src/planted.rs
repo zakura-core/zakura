@@ -4,15 +4,35 @@
 //!
 //! A planted case is `qa/planted/<property-id>/<name>.patch`, a production
 //! change that bypasses the property's guard, with `<name>.toml` beside it
-//! naming what must find the bug: either a seed, by its name in the
-//! simulator's seed registry, which names the seed's harness and builds its
-//! input, or a typed case, a `[typed]` table naming the harness, a committed
-//! scenario as that harness's JSON and, optionally, the Plan it runs under:
-//! either Plan bytes (`plan`) or a scripted Plan as JSON (`script`), never
-//! both. A typed case with neither runs the empty Plan. A typed case is for
-//! a scenario the harness's grammar can't encode, such as one with a control
-//! step or more mirrors than the grammar takes, and a script is for a
-//! history no Plan bytes reach, such as one a test steers to.
+//! naming what must find the bug, in one of three ways:
+//!
+//! - a seed, by its name in the simulator's seed registry, which names the
+//!   seed's harness and builds its input;
+//! - a typed case, a `[typed]` table naming the harness, a committed
+//!   scenario as that harness's JSON and, optionally, the Plan it runs
+//!   under: either Plan bytes (`plan`) or a scripted Plan as JSON
+//!   (`script`), never both. A typed case with neither runs the empty Plan.
+//!   A typed case is for a scenario the harness's grammar can't encode, such
+//!   as one with a control step or more mirrors than the grammar takes, and
+//!   a script is for a history no Plan bytes reach, such as one a test
+//!   steers to;
+//! - a search case, a `[search]` table naming the harness and a
+//!   `zakura-sim generate` search on it: its `seed`, its `runs` and,
+//!   optionally, its `draws` (`uniform` or `cycle`) and its `schedule`
+//!   (`plan` or `pct`). The case commits no
+//!   input. The runner runs the search on the patched build, and the input
+//!   whose run stopped it is the case's witness. A search that runs out of
+//!   inputs, or stops on anything but the case's property, misses the
+//!   patch ([`Verdict::SearchMisses`]).
+//!
+//! A property that registers no trigger-history check, such as the step
+//! loop's `sim/no-task-panic` and `sim/no-livelock`, has no trigger history
+//! for a witness test to judge. `zakura-sim properties --untriggered` lists
+//! them. For such a property the runner records the unpatched run as a
+//! witness test that expects `applicable`, and the patched runs with no
+//! witness test: each is judged from its trace's end alone. So a patch that
+//! breaks the property for another reason than the case's bug still counts
+//! as a catch.
 //!
 //! The runner checks out `HEAD` once, in a scratch worktree under
 //! `target/planted/`, and builds the unpatched simulator there once. Every
@@ -25,7 +45,9 @@
 //! 1. records the witness with the unpatched build, which must hold the
 //!    property with no violation of any property and pass its witness test
 //!    expecting `holds`. A seed's witness is the input the unpatched build
-//!    writes, since a seed's builder can run the code the patch changes;
+//!    writes, since a seed's builder can run the code the patch changes. A
+//!    search case first applies the patch, builds it and runs its search
+//!    (step 2's build), and its witness is the input the search found;
 //! 2. applies the patch, which must not change, delete or rename the
 //!    case's witness files (the seed registry's source, or its scenario and
 //!    Plan bytes), so both runs read the same witness. It then rebuilds and
@@ -175,6 +197,13 @@ const CAMPAIGN_INPUT_BYTES: usize = 64;
 /// The longest one child of a confirmation through a fuzz target may run.
 const TARGET_CHILD: Duration = Duration::from_secs(300);
 
+/// The longest a search case's `zakura-sim generate` may take.
+const SEARCH_DEADLINE: Duration = Duration::from_secs(3_600);
+
+/// The file `zakura-sim generate` writes its report to, in its output
+/// directory: `zakura_sim::explore::generate::REPORT_FILE`.
+const GENERATE_REPORT: &str = "generate.json";
+
 /// The longest one `zakura-sim` run of a case may take: a baseline, patched
 /// or campaign recording, or a fresh replay. A run past it is killed and
 /// never counts as a catch.
@@ -247,6 +276,10 @@ struct Case {
     target: Option<String>,
     /// Why no fuzz target confirms the case, if none does.
     no_target: Option<String>,
+    /// Whether the case's property registers no trigger-history check, as
+    /// the unpatched build lists it. Its runs are then judged by their
+    /// outcome alone ([`Case::expect`]).
+    untriggered: bool,
 }
 
 /// What a case runs, with paths relative to the repository root.
@@ -265,6 +298,71 @@ enum Witness {
         /// The Plan file, if any.
         plan: Option<PlanFile>,
     },
+    /// The input that a search on the patched build stops at.
+    Search(Search),
+}
+
+/// A case's `[search]` table: a `zakura-sim generate` search whose stopping
+/// input is the case's witness.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct Search {
+    /// The harness it searches.
+    harness: String,
+    /// `generate`'s `--seed`.
+    seed: u64,
+    /// `generate`'s `--runs`: the most inputs it draws.
+    runs: u64,
+    /// `generate`'s `--draws`, `uniform` or `cycle`, or its default.
+    draws: Option<String>,
+    /// `generate`'s `--schedule`, `plan` or `pct`, or its default.
+    schedule: Option<String>,
+}
+
+impl Search {
+    /// Why the table can't run, if it can't: a value `generate` refuses.
+    fn check(&self) -> Result<(), String> {
+        if self.runs == 0 {
+            return Err("a search draws at least one input, and `runs` is 0".to_owned());
+        }
+        if let Some(draws) = self
+            .draws
+            .as_deref()
+            .filter(|d| !["uniform", "cycle"].contains(d))
+        {
+            return Err(format!("`draws` is uniform or cycle, not `{draws}`"));
+        }
+        if let Some(schedule) = self
+            .schedule
+            .as_deref()
+            .filter(|s| !["plan", "pct"].contains(s))
+        {
+            return Err(format!("`schedule` is plan or pct, not `{schedule}`"));
+        }
+        Ok(())
+    }
+
+    /// `zakura-sim generate`'s arguments for the search, writing to `out`.
+    fn args(&self, out: &Path) -> Vec<OsString> {
+        let mut args: Vec<OsString> = vec![
+            "generate".into(),
+            "--sim".into(),
+            (&self.harness).into(),
+            "--seed".into(),
+            self.seed.to_string().into(),
+            "--runs".into(),
+            self.runs.to_string().into(),
+            "--out".into(),
+            out.into(),
+        ];
+        if let Some(draws) = &self.draws {
+            args.extend(["--draws".into(), draws.into()]);
+        }
+        if let Some(schedule) = &self.schedule {
+            args.extend(["--schedule".into(), schedule.into()]);
+        }
+        args
+    }
 }
 
 /// A typed case's committed Plan, by its file's path.
@@ -307,28 +405,33 @@ impl Witness {
         match self {
             Witness::Seed(name) => registry.harness(name),
             Witness::Typed { harness, .. } => Ok(harness.clone()),
+            Witness::Search(search) => Ok(search.harness.clone()),
         }
     }
 
     /// The committed files it reads: the seed registry's source, or the
-    /// scenario and the Plan file.
+    /// scenario and the Plan file. A search reads none: it runs the
+    /// simulator's generator, which [`SHARED`] holds.
     fn files(&self) -> Vec<PathBuf> {
         match self {
             Witness::Seed(_) => vec![PathBuf::from(seeds::REGISTRY)],
             Witness::Typed { scenario, plan, .. } => std::iter::once(scenario.clone())
                 .chain(plan.as_ref().map(|plan| plan.path().to_path_buf()))
                 .collect(),
+            Witness::Search(_) => Vec::new(),
         }
     }
 
-    /// What [`record`] runs, with a typed case's files under `root`.
-    fn located(&self, root: &Path) -> Located {
+    /// What [`record`] runs, with a typed case's files under `root`, or
+    /// `None` for a search case, whose input only its search finds.
+    fn located(&self, root: &Path) -> Option<Located> {
         match self {
-            Witness::Seed(name) => Located::Seed(name.clone()),
-            Witness::Typed { scenario, plan, .. } => Located::Typed {
+            Witness::Seed(name) => Some(Located::Seed(name.clone())),
+            Witness::Typed { scenario, plan, .. } => Some(Located::Typed {
                 scenario: root.join(scenario),
                 plan: plan.as_ref().map(|plan| plan.under(root)),
-            },
+            }),
+            Witness::Search(_) => None,
         }
     }
 }
@@ -385,11 +488,13 @@ impl TypedFile {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CaseFile {
-    /// The seed's name in the simulator's registry. A case names this or
-    /// `typed`, never both.
+    /// The seed's name in the simulator's registry.
     seed: Option<String>,
     /// The typed case, for a scenario the harness's grammar can't encode.
     typed: Option<TypedFile>,
+    /// The search whose stopping input is the case's witness. A case names
+    /// exactly one of `seed`, `typed` and `search`.
+    pub(super) search: Option<Search>,
     /// Files or directories, relative to the repository root, whose change
     /// can break the catch besides the files the patch changes and
     /// [`SHARED`], such as the rest of the patched module.
@@ -488,6 +593,9 @@ enum Verdict {
     WitnessFails(String),
     /// A typed case's patched trace didn't replay Exact in a fresh process.
     ReplayMisses(String),
+    /// A search case's search found no input whose run violated the
+    /// property: it ran out of inputs, failed, or stopped on another run.
+    SearchMisses(String),
     /// The patched input didn't confirm through the fuzz target that runs
     /// its harness.
     TargetMisses {
@@ -554,6 +662,7 @@ impl fmt::Display for Verdict {
             Verdict::ReplayMisses(why) => {
                 write!(f, "the patched trace doesn't replay Exact: {why}")
             }
+            Verdict::SearchMisses(why) => write!(f, "the search found no input: {why}"),
             Verdict::TargetMisses { target, why } => {
                 write!(
                     f,
@@ -595,7 +704,7 @@ pub(super) fn run(
     // Only `--targets` needs the unpatched build before it picks the cases.
     let mut baseline = None;
     let picked = pick(repo_root, &work, cases, &select, &mut baseline);
-    let cases = match picked {
+    let mut cases = match picked {
         Ok(Some(cases)) => cases,
         Ok(None) => return remove_worktree(repo_root, &worktree),
         Err(error) => {
@@ -609,6 +718,7 @@ pub(super) fn run(
             None => Baseline::build(repo_root, &work)?,
         };
         check_seeds(&baseline.registry, &cases)?;
+        mark_untriggered(&baseline, &mut cases)?;
         run_cases(&worktree, &work, &baseline, &cases)
     })();
     remove_worktree(repo_root, &worktree)?;
@@ -768,7 +878,7 @@ fn check_seeds(registry: &Registry, cases: &[Case]) -> Result<(), BoxError> {
                 .seed(name)
                 .err()
                 .map(|error| format!("{} {}: {error}", case.property, case.patch.display())),
-            Witness::Typed { .. } => None,
+            Witness::Typed { .. } | Witness::Search(_) => None,
         })
         .collect();
     if failed.is_empty() {
@@ -776,6 +886,41 @@ fn check_seeds(registry: &Registry, cases: &[Case]) -> Result<(), BoxError> {
     } else {
         Err(format!("cases name unusable seeds: {}", failed.join("; ")).into())
     }
+}
+
+/// Marks each case of `cases` whose property registers no trigger-history
+/// check on its harness, as the unpatched build's
+/// `zakura-sim properties --untriggered` lists them.
+fn mark_untriggered(baseline: &Baseline, cases: &mut [Case]) -> Result<(), BoxError> {
+    let mut listed: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for case in cases {
+        let harness = case.witness.harness(&baseline.registry)?;
+        if !listed.contains_key(&harness) {
+            let ids = untriggered(&baseline.binary, &harness)?;
+            listed.insert(harness.clone(), ids);
+        }
+        case.untriggered = listed[&harness].contains(&case.property);
+    }
+    Ok(())
+}
+
+/// The properties of `harness` that register no trigger-history check, as
+/// the `zakura_sim` binary lists them.
+fn untriggered(zakura_sim: &Path, harness: &str) -> Result<Vec<String>, BoxError> {
+    let output = Command::new(zakura_sim)
+        .args(["properties", "--sim", harness, "--untriggered"])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "`zakura-sim properties --sim {harness} --untriggered` failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    Ok(String::from_utf8(output.stdout)?
+        .lines()
+        .map(str::to_owned)
+        .collect())
 }
 
 /// Gives each seed case of `cases` the fuzz target that runs its seed's
@@ -824,6 +969,7 @@ fn cases(repo_root: &Path) -> Result<Vec<Case>, BoxError> {
             let CaseFile {
                 seed,
                 typed,
+                search,
                 checks,
                 also_violates,
                 no_target,
@@ -832,22 +978,31 @@ fn cases(repo_root: &Path) -> Result<Vec<Case>, BoxError> {
                     .map_err(|error| format!("{}: {error}", case_file.display()))?,
             )
             .map_err(|error| format!("{}: {error}", case_file.display()))?;
-            let witness = match (seed, typed) {
-                (Some(seed), None) => Witness::Seed(seed),
-                (None, Some(typed)) => Witness::Typed {
+            let witness = match (seed, typed, search) {
+                (Some(seed), None, None) => Witness::Seed(seed),
+                (None, Some(typed), None) => Witness::Typed {
                     plan: typed
                         .plan_file()
                         .map_err(|error| format!("{}: {error}", case_file.display()))?,
                     harness: typed.harness,
                     scenario: typed.scenario,
                 },
-                (seed, _) => {
+                (None, None, Some(search)) => {
+                    search
+                        .check()
+                        .map_err(|error| format!("{}: {error}", case_file.display()))?;
+                    Witness::Search(search)
+                }
+                (seed, typed, search) => {
+                    let named = [seed.is_some(), typed.is_some(), search.is_some()]
+                        .into_iter()
+                        .filter(|named| *named)
+                        .count();
                     return Err(format!(
-                        "{}: a case names either `seed` or `[typed]`, and this names {}",
+                        "{}: a case names one of `seed`, `[typed]` and `[search]`, and this names {named}",
                         case_file.display(),
-                        if seed.is_some() { "both" } else { "neither" }
                     )
-                    .into())
+                    .into());
                 }
             };
             let files = witness.files();
@@ -875,6 +1030,7 @@ fn cases(repo_root: &Path) -> Result<Vec<Case>, BoxError> {
                 also_violates,
                 target: None,
                 no_target,
+                untriggered: false,
             })
         })
         .collect()
@@ -1034,8 +1190,9 @@ fn run_cases(
 
 /// Runs the witness on the unpatched `baseline` binary, then patches
 /// `worktree` and runs it again, building in `target` and writing both
-/// traces under `scratch`. A confirmation through a fuzz target builds
-/// under `builds`.
+/// traces under `scratch`. A search case patches and builds first, and its
+/// witness is the input its search on the patched build stops at. A
+/// confirmation through a fuzz target builds under `builds`.
 fn check_case(
     worktree: &Path,
     scratch: &Path,
@@ -1045,6 +1202,7 @@ fn check_case(
     case: &Case,
 ) -> Result<Verdict, BoxError> {
     let harness = case.witness.harness(&baseline.registry)?;
+    let mut patched = None;
     let input = match &case.witness {
         // A seed's builder can run the code the patch changes, so a seed
         // built on the patched tree could be another input. Both runs take
@@ -1054,41 +1212,145 @@ fn check_case(
             baseline.registry.seed(name)?,
             &scratch.join("seed"),
         )?),
-        witness => witness.located(worktree),
+        Witness::Typed { .. } => case
+            .witness
+            .located(worktree)
+            .ok_or("a typed case has its files")?,
+        Witness::Search(search) => {
+            let binary = match build_patched(worktree, target, case)? {
+                Ok(binary) => binary,
+                Err(verdict) => return Ok(verdict),
+            };
+            let found = search_input(&binary, search, case, &scratch.join("search"))?;
+            patched = Some(binary);
+            match found {
+                Ok(input) => Located::Input(input),
+                Err(verdict) => return Ok(verdict),
+            }
+        }
     };
     let unpatched = record(
         Command::new(&baseline.binary),
         &harness,
         &input,
         &case.property,
-        Expect::Holds,
+        case.expect_unpatched(),
         &scratch.join("baseline"),
         Some((RUN_DEADLINE, &NEVER_INTERRUPTED)),
     )?;
     if let Some(why) = baseline_failure(&case.property, &unpatched) {
         return Ok(Verdict::BaselineFails(why));
     }
-    if let Some(verdict) = apply_case_patch(worktree, case)? {
-        return Ok(verdict);
-    }
-    if let Err(error) = run_command(&mut cargo_sim(worktree, target)) {
-        return Ok(Verdict::Failed(format!(
-            "the patched build failed: {error}"
-        )));
-    }
-    let patched = target.join(PROFILE).join("zakura-sim");
-    // The patched builds reuse the target directory, so a catch counts only
-    // from a binary built from this case's patched checkout.
-    if let Err(why) = built_from(&patched, worktree)? {
-        return Ok(Verdict::StaleBinary(why));
-    }
+    let patched = match patched {
+        Some(binary) => binary,
+        None => match build_patched(worktree, target, case)? {
+            Ok(binary) => binary,
+            Err(verdict) => return Ok(verdict),
+        },
+    };
     let verdict = judge_patched(&patched, &harness, &input, case, scratch, RUN_DEADLINE)?;
     match (&verdict, &case.target) {
+        // A confirmation through a target needs the trigger history.
+        (Verdict::Caught(_), Some(fuzz)) if case.untriggered => Ok(Verdict::TargetMisses {
+            target: fuzz.clone(),
+            why: format!(
+                "{} registers no trigger-history check, which `zakura-sim confirm` needs; \
+                 give the case a `no_target` reason",
+                case.property
+            ),
+        }),
         (Verdict::Caught(_), Some(fuzz)) => Ok(through_target(
             worktree, builds, scratch, case, fuzz, &harness, baseline,
         )?
         .unwrap_or(verdict)),
         _ => Ok(verdict),
+    }
+}
+
+/// Applies `case`'s patch to `worktree` and builds it in `target`. Returns
+/// the patched binary, or the verdict of a case that can't go on: the
+/// patch doesn't apply or changes a witness file, the build fails, or the
+/// binary isn't this checkout's.
+fn build_patched(
+    worktree: &Path,
+    target: &Path,
+    case: &Case,
+) -> Result<Result<PathBuf, Verdict>, BoxError> {
+    if let Some(verdict) = apply_case_patch(worktree, case)? {
+        return Ok(Err(verdict));
+    }
+    if let Err(error) = run_command(&mut cargo_sim(worktree, target)) {
+        return Ok(Err(Verdict::Failed(format!(
+            "the patched build failed: {error}"
+        ))));
+    }
+    let patched = target.join(PROFILE).join("zakura-sim");
+    // The patched builds reuse the target directory, so a catch counts only
+    // from a binary built from this case's patched checkout.
+    if let Err(why) = built_from(&patched, worktree)? {
+        return Ok(Err(Verdict::StaleBinary(why)));
+    }
+    Ok(Ok(patched))
+}
+
+/// Runs `search` with the patched `zakura_sim` binary into `out`, and
+/// returns the input that stopped it, or [`Verdict::SearchMisses`] if it
+/// ran out of inputs or stopped on anything but `case`'s property. The
+/// search gets [`SEARCH_DEADLINE`].
+fn search_input(
+    zakura_sim: &Path,
+    search: &Search,
+    case: &Case,
+    out: &Path,
+) -> Result<Result<PathBuf, Verdict>, BoxError> {
+    if out.exists() {
+        fs::remove_dir_all(out)?;
+    }
+    let out = path::absolute(out)?;
+    let log = out.with_extension("log");
+    let mut generate = Command::new(zakura_sim);
+    generate.args(search.args(&out));
+    let end = sim_minimize::run_child(
+        &mut generate,
+        &log,
+        Some(SEARCH_DEADLINE),
+        &NEVER_INTERRUPTED,
+    )?;
+    let misses = |why: String| {
+        Ok(Err(Verdict::SearchMisses(format!(
+            "{why}; see {}",
+            log.display()
+        ))))
+    };
+    let report = match (&end, fs::read_to_string(out.join(GENERATE_REPORT))) {
+        (sim_minimize::ChildEnd::Exited(0), Ok(report)) => report,
+        (end, _) => return misses(format!("`zakura-sim generate` {end}")),
+    };
+    let report: Value = serde_json::from_str(&report)?;
+    search_stop(&case.property, &report).map_or_else(misses, |input| Ok(Ok(input)))
+}
+
+/// The input that stopped the search whose `generate.json` is `report`, if
+/// a violation of `property` stopped it, or why it missed.
+fn search_stop(property: &str, report: &Value) -> Result<PathBuf, String> {
+    let stop = &report["stop"];
+    match stop["kind"].as_str() {
+        Some("violation") if stop["property"].as_str() == Some(property) => report["input"]
+            .as_str()
+            .map(PathBuf::from)
+            .ok_or_else(|| "the search stopped on a violation but saved no input".to_owned()),
+        Some("violation") => Err(format!(
+            "the search stopped on {} instead",
+            stop["property"].as_str().unwrap_or("an unnamed property")
+        )),
+        Some("clean") => Err(format!(
+            "none of the search's {} inputs violated the property",
+            report["executed"]
+        )),
+        Some(kind) => Err(format!(
+            "the search stopped on a run that ended {kind}: {stop}"
+        )),
+        None => Err(format!("the search report has no stop: {stop}")),
     }
 }
 
@@ -1162,9 +1424,25 @@ fn judge_patched(
 
 impl Case {
     /// What every patched run of the case expects: its property violated,
-    /// beside `also_violates`.
+    /// beside `also_violates`. An untriggered property's run has no witness
+    /// test, and its end alone shows the violation.
     fn expect(&self) -> Expect<'_> {
-        Expect::Violated(&self.also_violates)
+        if self.untriggered {
+            Expect::Unjudged
+        } else {
+            Expect::Violated(&self.also_violates)
+        }
+    }
+
+    /// What the unpatched run expects: the property holds. An untriggered
+    /// property's witness test can expect only `applicable`, and
+    /// [`baseline_failure`] still rejects any violation.
+    fn expect_unpatched(&self) -> Expect<'_> {
+        if self.untriggered {
+            Expect::Applicable
+        } else {
+            Expect::Holds
+        }
     }
 
     /// What `patched`, one of the case's patched runs, shows about it
@@ -1421,14 +1699,22 @@ enum Expect<'a> {
     /// The property is violated, and no other property is, except the
     /// listed ones, the case's `also_violates`.
     Violated(&'a [String]),
+    /// The property applies and holds, judged by its outcome alone: the
+    /// unpatched run of a property with no trigger-history check.
+    Applicable,
+    /// No witness test: a patched run of a property with no trigger-history
+    /// check, which the trace's end alone judges.
+    Unjudged,
 }
 
 impl Expect<'_> {
     /// `zakura-sim record`'s `--expect` flag and value, then its
-    /// `--also-violates` flag and value if the list isn't empty.
+    /// `--also-violates` flag and value if the list isn't empty. Nothing
+    /// for [`Expect::Unjudged`], which runs no witness test.
     fn args(self) -> Vec<String> {
         match self {
             Expect::Holds => vec!["--expect".to_owned(), "holds".to_owned()],
+            Expect::Applicable => vec!["--expect".to_owned(), "applicable".to_owned()],
             Expect::Violated(also_violates) => {
                 let mut args = vec!["--expect".to_owned(), "violated".to_owned()];
                 if !also_violates.is_empty() {
@@ -1436,14 +1722,21 @@ impl Expect<'_> {
                 }
                 args
             }
+            Expect::Unjudged => Vec::new(),
         }
+    }
+
+    /// Whether the run is a witness test, which writes `witness.json`.
+    fn judged(self) -> bool {
+        !matches!(self, Expect::Unjudged)
     }
 }
 
 /// Records `input`, a fuzz input, a seed or a typed scenario and its Plan bytes, on
 /// `harness` with `zakura_sim`, a `zakura-sim` command, as a witness test of
 /// `property` that expects `expect`, writing the trace to `out`, and reads
-/// its `end` record and the test's result.
+/// its `end` record and the test's result. An [`Expect::Unjudged`] run is
+/// no witness test, and its end record alone judges it.
 ///
 /// With a `deadline` and its interrupt flag, the command's output goes to
 /// `<out>.log`. A run past the deadline, or one that a signal killed, is
@@ -1465,9 +1758,11 @@ fn record(
         .args(["record", "--sim", harness])
         .args(input_args(input)?)
         .arg("--out")
-        .arg(out)
-        .args(["--witness", property])
-        .args(expect.args());
+        .arg(out);
+    if expect.judged() {
+        zakura_sim.args(["--witness", property]);
+    }
+    zakura_sim.args(expect.args());
     let ended = match deadline {
         None => format!("exited with {}", zakura_sim.status()?),
         Some((deadline, interrupt)) => {
@@ -1486,10 +1781,14 @@ fn record(
         }
     };
     // A failed witness test exits 1 too, but only after writing its result.
-    let Ok(witness) = fs::read_to_string(out.join("witness.json")) else {
-        return Ok(Run::Failed(format!("`zakura-sim record` {ended}")));
+    let witness: Option<WitnessFile> = if expect.judged() {
+        let Ok(witness) = fs::read_to_string(out.join("witness.json")) else {
+            return Ok(Run::Failed(format!("`zakura-sim record` {ended}")));
+        };
+        Some(serde_json::from_str(&witness)?)
+    } else {
+        None
     };
-    let witness: WitnessFile = serde_json::from_str(&witness)?;
     let trace = match fs::read_to_string(out.join("trace.jsonl")) {
         Ok(trace) => trace,
         Err(error) => {
@@ -1500,9 +1799,12 @@ fn record(
     };
     let end = trace.lines().next_back().ok_or("the trace is empty")?;
     let mut run = end_of(property, end)?;
-    if let Run::Ended {
-        witness: failed, ..
-    } = &mut run
+    if let (
+        Run::Ended {
+            witness: failed, ..
+        },
+        Some(witness),
+    ) = (&mut run, witness)
     {
         *failed = (!witness.passed).then(|| {
             witness
@@ -2162,6 +2464,7 @@ mod tests {
             also_violates: Vec::new(),
             target: target.map(str::to_owned),
             no_target: no_target.map(str::to_owned),
+            untriggered: false,
         };
         let (confirmed, skipped) = through_targets(vec![
             case("runs", Some("t"), None),
@@ -2367,6 +2670,7 @@ mod tests {
             also_violates: Vec::new(),
             target: None,
             no_target: None,
+            untriggered: false,
         };
         let scripted = Case {
             witness: Witness::Typed {
@@ -2653,11 +2957,11 @@ mod tests {
             plan = "p.bin"
         "#;
         let error = parse_case(both).expect_err("both is refused").to_string();
-        assert!(error.contains("names both"), "{error}");
+        assert!(error.contains("this names 2"), "{error}");
         let error = parse_case("checks = []")
             .expect_err("neither is refused")
             .to_string();
-        assert!(error.contains("names neither"), "{error}");
+        assert!(error.contains("this names 0"), "{error}");
         let outside = r#"
             [typed]
             harness = "header-sync/storage"
@@ -2703,6 +3007,239 @@ mod tests {
             .expect_err("a script outside is refused")
             .to_string();
         assert!(error.contains("isn't a plain path"), "{error}");
+    }
+
+    /// A search case names its harness and its search, and no input. It
+    /// names no other witness beside it, and only the draw policies and
+    /// schedules `zakura-sim generate` takes.
+    #[test]
+    fn a_search_case_names_its_search() {
+        let search = r#"
+            [search]
+            harness = "header-sync/storage"
+            seed = 7
+            runs = 200
+            draws = "cycle"
+        "#;
+        let parsed = parse_case(search).expect("a search case parses");
+        let Witness::Search(found) = &parsed[0].witness else {
+            panic!("{:?} is a search", parsed[0].witness);
+        };
+        assert_eq!(parsed[0].witness.files(), Vec::<PathBuf>::new());
+        assert!(parsed[0].witness.located(Path::new(".")).is_none());
+        assert_eq!(
+            found.args(Path::new("out")),
+            [
+                "generate",
+                "--sim",
+                "header-sync/storage",
+                "--seed",
+                "7",
+                "--runs",
+                "200",
+                "--out",
+                "out",
+                "--draws",
+                "cycle",
+            ]
+            .map(OsString::from)
+        );
+        let pct = r#"
+            [search]
+            harness = "sync/wire"
+            seed = 1
+            runs = 3
+            schedule = "pct"
+        "#;
+        let Witness::Search(found) = &parse_case(pct).expect("a pct search parses")[0].witness
+        else {
+            panic!("a search");
+        };
+        assert_eq!(
+            found.args(Path::new("o"))[7..],
+            ["--out", "o", "--schedule", "pct"].map(OsString::from)
+        );
+        for (bad, why) in [
+            (r#"draws = "every""#, "`draws` is uniform or cycle"),
+            (r#"schedule = "random""#, "`schedule` is plan or pct"),
+            ("runs = 0", "`runs` is 0"),
+        ] {
+            let mut table = format!("[search]\nharness = \"h\"\nseed = 1\n{bad}\n");
+            if !bad.starts_with("runs") {
+                table.push_str("runs = 5\n");
+            }
+            let error = parse_case(&table).expect_err(bad).to_string();
+            assert!(error.contains(why), "{error}");
+        }
+        let both = r#"
+            seed = "a"
+            [search]
+            harness = "h"
+            seed = 1
+            runs = 1
+        "#;
+        let error = parse_case(both)
+            .expect_err("a seed beside a search")
+            .to_string();
+        assert!(error.contains("this names 2"), "{error}");
+        let error = parse_case("[search]\nharness = \"h\"\nruns = 1\n")
+            .expect_err("a search without a seed")
+            .to_string();
+        assert!(error.contains("missing field `seed`"), "{error}");
+    }
+
+    /// The search's report gives the input only when a violation of the
+    /// case's own property stopped it. Any other stop misses the patch.
+    #[test]
+    fn a_search_stops_only_on_the_property() {
+        let report = |stop: Value| {
+            serde_json::json!({
+                "stop": stop,
+                "executed": 40,
+                "input": "/s/abc.bin",
+            })
+        };
+        assert_eq!(
+            search_stop(
+                ID,
+                &report(serde_json::json!({"kind": "violation", "property": ID}))
+            ),
+            Ok(PathBuf::from("/s/abc.bin"))
+        );
+        let other = search_stop(
+            ID,
+            &report(serde_json::json!({"kind": "violation", "property": "sim/no-livelock"})),
+        )
+        .expect_err("another property misses");
+        assert!(other.contains("sim/no-livelock instead"), "{other}");
+        let clean = search_stop(ID, &report(serde_json::json!({"kind": "clean"})))
+            .expect_err("a clean search misses");
+        assert!(clean.contains("none of the search's 40 inputs"), "{clean}");
+        let failed = search_stop(
+            ID,
+            &report(serde_json::json!({"kind": "harness-failure", "reason": "x"})),
+        )
+        .expect_err("a harness failure misses");
+        assert!(failed.contains("ended harness-failure"), "{failed}");
+        let unsaved = search_stop(
+            ID,
+            &serde_json::json!({"stop": {"kind": "violation", "property": ID}}),
+        )
+        .expect_err("a stop with no input misses");
+        assert!(unsaved.contains("saved no input"), "{unsaved}");
+    }
+
+    /// A property with no trigger-history check records its unpatched run
+    /// as a witness test that expects `applicable`, and its patched runs
+    /// with no witness test. The end record alone judges a patched run: a
+    /// violation of the property alone is a catch, and any other violation
+    /// is unrelated, as for any case.
+    #[cfg(unix)]
+    #[test]
+    fn an_untriggered_property_is_judged_by_its_outcome() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        // `record` writes `$end` as its trace and its arguments beside it,
+        // and a witness result only for a witness test.
+        let fake = |name: &str, end: &str| {
+            let path = dir.path().join(name);
+            let script = format!(
+                "#!/bin/sh\n\
+                 [ \"$1\" = replay ] && exit 0\n\
+                 out=; prev=; witness=\n\
+                 for arg in \"$@\"; do [ \"$prev\" = --out ] && out=$arg; [ \"$arg\" = --witness ] && witness=1; prev=$arg; done\n\
+                 mkdir -p \"$out\"\n\
+                 printf '%s\\n' \"$*\" > \"$out/args\"\n\
+                 printf '%s\\n' '{end}' > \"$out/trace.jsonl\"\n\
+                 [ -n \"$witness\" ] && printf '%s\\n' '{{\"passed\":false,\"error\":\"judged\"}}' > \"$out/witness.json\"\n\
+                 exit 0\n"
+            );
+            fs::write(&path, script).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            wait_until_executable(&path);
+            path
+        };
+        let case = Case {
+            property: ID.to_owned(),
+            patch: dir.path().join("case.patch"),
+            witness: Witness::Seed("a".to_owned()),
+            checks: Vec::new(),
+            also_violates: Vec::new(),
+            target: None,
+            no_target: None,
+            untriggered: true,
+        };
+        assert!(matches!(case.expect_unpatched(), Expect::Applicable));
+        assert!(matches!(case.expect(), Expect::Unjudged));
+        let triggered = Case {
+            untriggered: false,
+            ..case.clone()
+        };
+        assert!(matches!(triggered.expect_unpatched(), Expect::Holds));
+        assert!(matches!(triggered.expect(), Expect::Violated(_)));
+        assert_eq!(Expect::Applicable.args(), ["--expect", "applicable"]);
+        assert!(Expect::Unjudged.args().is_empty());
+
+        let input = Located::Seed("a".to_owned());
+        let violates = fake("violates", &end(Some(ID), &[(ID, VIOLATED)]));
+        let out = dir.path().join("unjudged");
+        let run = record(
+            Command::new(&violates),
+            "header-sync/storage",
+            &input,
+            ID,
+            case.expect(),
+            &out,
+            None,
+        )
+        .expect("the fake binary runs");
+        let args = fs::read_to_string(out.join("args")).unwrap();
+        assert!(
+            !args.contains("--witness") && !args.contains("--expect"),
+            "{args}"
+        );
+        // No witness test ran, so its failure can't read into the run.
+        assert!(matches!(&run, Run::Ended { witness: None, .. }), "{run:?}");
+        assert_eq!(case.classify(&run), Verdict::Caught(None));
+        let other = fake(
+            "other",
+            &end(
+                Some("sim/no-livelock"),
+                &[(ID, HELD), ("sim/no-livelock", VIOLATED)],
+            ),
+        );
+        let run = record(
+            Command::new(&other),
+            "header-sync/storage",
+            &input,
+            ID,
+            case.expect(),
+            &dir.path().join("other-run"),
+            None,
+        )
+        .expect("the fake binary runs");
+        assert_eq!(
+            case.classify(&run),
+            Verdict::Unrelated("sim/no-livelock".to_owned())
+        );
+        // The unpatched run is a witness test, and its result counts.
+        let baseline = dir.path().join("baseline");
+        let run = record(
+            Command::new(&other),
+            "header-sync/storage",
+            &input,
+            ID,
+            case.expect_unpatched(),
+            &baseline,
+            None,
+        )
+        .expect("the fake binary runs");
+        let args = fs::read_to_string(baseline.join("args")).unwrap();
+        assert!(
+            args.contains(&format!("--witness {ID} --expect applicable")),
+            "{args}"
+        );
+        assert!(baseline_failure(ID, &run).is_some());
     }
 
     /// A catch, a fuzz input's or a typed case's, passes only if its
@@ -2772,12 +3309,13 @@ mod tests {
             also_violates: Vec::new(),
             target: None,
             no_target: None,
+            untriggered: false,
         };
         let judge = |binary: &Path, case: &Case| {
             judge_patched(
                 binary,
                 "header-sync/storage",
-                &case.witness.located(dir.path()),
+                &case.witness.located(dir.path()).unwrap(),
                 case,
                 &scratch,
                 RUN_DEADLINE,
@@ -2859,6 +3397,7 @@ mod tests {
             also_violates: Vec::new(),
             target: None,
             no_target: None,
+            untriggered: false,
         };
         let scratch = dir.path().join("case");
         fs::create_dir_all(&scratch).unwrap();
@@ -2866,7 +3405,7 @@ mod tests {
         let run = record(
             Command::new(&hangs),
             "header-sync/storage",
-            &case.witness.located(dir.path()),
+            &case.witness.located(dir.path()).unwrap(),
             ID,
             case.expect(),
             &scratch.join("patched"),
@@ -2882,7 +3421,7 @@ mod tests {
         let verdict = judge_patched(
             &hangs,
             "header-sync/storage",
-            &case.witness.located(dir.path()),
+            &case.witness.located(dir.path()).unwrap(),
             &case,
             &scratch,
             Duration::from_millis(200),
@@ -2914,7 +3453,7 @@ mod tests {
             "header-sync/storage"
         );
         fs::write(dir.path().join("s.json"), r#"{"mirrors":2}"#).unwrap();
-        let args = input_args(&witness.located(dir.path())).expect("the scenario reads");
+        let args = input_args(&witness.located(dir.path()).unwrap()).expect("the scenario reads");
         assert_eq!(
             args,
             vec![
@@ -2934,7 +3473,7 @@ mod tests {
             vec![PathBuf::from("s.json"), PathBuf::from("p.json")]
         );
         assert_eq!(
-            input_args(&scripted.located(dir.path())).expect("the scenario reads"),
+            input_args(&scripted.located(dir.path()).unwrap()).expect("the scenario reads"),
             vec![
                 OsString::from("--scenario"),
                 OsString::from(r#"{"mirrors":2}"#),
@@ -2949,7 +3488,7 @@ mod tests {
         };
         assert_eq!(empty_plan.files(), vec![PathBuf::from("s.json")]);
         assert_eq!(
-            input_args(&empty_plan.located(dir.path())).expect("the scenario reads"),
+            input_args(&empty_plan.located(dir.path()).unwrap()).expect("the scenario reads"),
             vec![
                 OsString::from("--scenario"),
                 OsString::from(r#"{"mirrors":2}"#),
@@ -2960,7 +3499,7 @@ mod tests {
         let registry = Registry::from_rows([seed_row("a", "discovery/wire")]).expect("one row");
         assert_eq!(seed.harness(&registry).unwrap(), "discovery/wire");
         assert_eq!(
-            input_args(&seed.located(dir.path())).expect("a seed needs no read"),
+            input_args(&seed.located(dir.path()).unwrap()).expect("a seed needs no read"),
             vec![OsString::from("--seed"), OsString::from("a")]
         );
         assert_eq!(

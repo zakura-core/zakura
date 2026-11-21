@@ -337,9 +337,11 @@ python3 /opt/zakura-fleet-watchdog/zakura-cluster-watchdog.py \
   --dry-run
 ```
 
-During restart deploys, the workflows write a Unix timestamp 20 minutes in the
-future to `/run/zakura-fleet-watchdog/deploy-suppressed-until`. While that marker
-is active, new failure alerts are logged locally but not posted to Slack.
+During mainnet restart deploys, the workflow writes a Unix timestamp 20 minutes
+in the future to `/run/zakura-fleet-watchdog/deploy-suppressed-until`. The
+workflow preserves this file through the watchdog restart and removes its own
+marker during cleanup. While the marker is active, new failure alerts are logged
+locally but not posted to Slack. The timestamp limits the mute if cleanup fails.
 
 ## Release-State Availability
 
@@ -543,8 +545,9 @@ Regular mainnet deploys install the fleet watchdog as a versioned release under
 `zakura-cluster-watchdog.py` and `fleets.toml` symlinks. They keep the live unit
 and its drop-ins (including the Mac comparison settings), state and every
 non-Slack env setting, and replace the webhook (env mode 600) only when the
-secret is provided. Once the lane is enabled they also refresh the checker on
-`zakura-compat` before activating the fleet release. A checker refresh failure
+secret is provided. They refresh the checker on `zakura-compat` before activating
+the fleet release when the lane is enabled or `zakura-compat` is being deployed.
+A checker refresh failure
 fails deployment and leaves the existing fleet release and service unchanged.
 Neither path retires the Rust watchdog.
 

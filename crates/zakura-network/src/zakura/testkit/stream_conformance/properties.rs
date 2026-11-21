@@ -16,7 +16,7 @@ use super::{
 };
 use crate::{
     zakura::{
-        regulation::{ServeCapacity, Update, UNFINISHED_EXCHANGE},
+        regulation::{ServeCapacity, SessionKey, Update, STALL_POLICY},
         testkit::await_until,
         wire_codec::{decode_frame, encode_frame},
         Credit, Frame, MessageRole, MessageRule, Stream, DEFAULT_ZAKURA_RECEIVE_WINDOW,
@@ -208,7 +208,7 @@ async fn raw_peer<A: StreamConformance>(
     victim: &LayoutNode<A>,
     layout: &'static [Stream],
     seed: u64,
-) -> Result<(RawLayoutPeer, u64), BoxError> {
+) -> Result<(RawLayoutPeer, SessionKey), BoxError> {
     let mut raw = RawLayoutPeer::connect(
         victim.addr().await,
         &victim.limits,
@@ -218,7 +218,24 @@ async fn raw_peer<A: StreamConformance>(
     .await?;
     raw.open_layout(layout).await?;
     let session = victim.wait_session(&raw.id()).await?;
-    Ok((raw, session.key.session_id))
+    Ok((raw, session.key))
+}
+
+/// Reopen `layout` from `raw` after its session `old` retired, and wait for
+/// `victim` to hold the new session.
+///
+/// The offer waits for `victim`'s transport to release `old`. Until then the
+/// transport drops the offer, and unlike a node, `raw` never offers again.
+async fn reopen<A: StreamConformance>(
+    raw: &mut RawLayoutPeer,
+    victim: &LayoutNode<A>,
+    layout: &'static [Stream],
+    old: SessionKey,
+) -> Result<(), BoxError> {
+    victim.wait_released(old).await?;
+    raw.open_layout(layout).await?;
+    victim.wait_session_after(&raw.id(), Some(old.session_id)).await?;
+    Ok(())
 }
 
 fn ensure(condition: bool, failure: impl FnOnce() -> String) -> Result<(), BoxError> {
@@ -520,9 +537,18 @@ pub(crate) async fn sustained_exchanges<A: StreamConformance>(
     a.connect(&b).await?;
     let (a_id, b_id) = (a.id(), b.id());
     let pages = four_windows(&a.shared().plan).1.max(256);
+    let exchanges = a.shared().plan.requests.first().map_or(256, |plan| {
+        if let MessageRole::Request { cadence: Some(cadence), .. } = plan.row.role {
+            // Exercise one refill after the burst. Every further request
+            // would wait another production interval for the same check.
+            cadence.capacity.saturating_add(1).min(256)
+        } else {
+            256
+        }
+    });
     let (from_b, from_a) = tokio::join!(
-        a.exchange(&b_id, 0..256, pages),
-        b.exchange(&a_id, 0..256, pages)
+        a.exchange(&b_id, 0..exchanges, pages),
+        b.exchange(&a_id, 0..exchanges, pages)
     );
     from_b?;
     from_a?;
@@ -619,7 +645,9 @@ pub(crate) async fn mutual_saturation<A: StreamConformance>(
 
 /// P5: ending one member retires the whole session, other services on the
 /// connection keep working, and the layout reopens. With a started exchange
-/// or subscription and no ending, the fence closes the connection instead.
+/// or subscription and no ending, the fence resets every member of the
+/// session the same way: the connection stays, no cause is recorded, and the
+/// layout reopens on it.
 pub(crate) async fn member_retirement<A: StreamConformance>(
     layout: &'static [Stream],
 ) -> Result<(), BoxError> {
@@ -636,15 +664,14 @@ pub(crate) async fn member_retirement<A: StreamConformance>(
             raw.ended(other).await?;
         }
         raw.probe_sibling(&SIBLINGS[0]).await?;
-        raw.open_layout(layout).await?;
-        victim.wait_session_after(&raw.id(), Some(old)).await?;
+        reopen(&mut raw, &victim, layout, old).await?;
         raw_exchanges::<A>(&mut raw, &plan, 1).await?;
         ensure(!raw.is_closed(), || {
             "retiring a member closed the connection".into()
         })?;
         raw.shutdown().await;
 
-        // A started exchange: the fence closes the connection.
+        // A started exchange: the fence resets the session.
         if let Some(request) = plan.requests.first() {
             let (mut raw, _) = raw_peer(&victim, layout, seed + 2).await?;
             let session = victim.wait_session(&raw.id()).await?;
@@ -654,9 +681,9 @@ pub(crate) async fn member_retirement<A: StreamConformance>(
                 .await?;
             // The request's bytes arrived, so its write started.
             raw.recv(request.stream).await?;
-            closes_unfinished(raw, &session, member).await?;
+            resets_unfinished(raw, &victim, layout, &plan, &session, member).await?;
         }
-        // A started subscription closes it the same way.
+        // A started subscription resets it the same way.
         if let Some(subscription) = plan.subscriptions.first() {
             let (mut raw, _) = raw_peer(&victim, layout, seed + 3).await?;
             let session = victim.wait_session(&raw.id()).await?;
@@ -671,28 +698,134 @@ pub(crate) async fn member_retirement<A: StreamConformance>(
                 .await?;
             // The `Open`'s bytes arrived, so its write started.
             raw.recv(subscription.stream).await?;
-            closes_unfinished(raw, &session, member).await?;
+            resets_unfinished(raw, &victim, layout, &plan, &session, member).await?;
         }
     }
     victim.shutdown().await;
     Ok(())
 }
 
-/// Reset `member` while `session` has a started exchange, and check that the
-/// fence closes the connection.
-async fn closes_unfinished<A: StreamConformance>(
+/// Reset `member` while `session` has a started exchange. Check that the
+/// fence resets every other member, that the connection stays with no cause,
+/// and that the layout reopens on it and exchanges.
+async fn resets_unfinished<A: StreamConformance>(
     mut raw: RawLayoutPeer,
+    victim: &LayoutNode<A>,
+    layout: &'static [Stream],
+    plan: &LayoutPlan,
     session: &LayoutSession<A>,
     member: usize,
 ) -> Result<(), BoxError> {
     raw.reset(member)?;
-    raw.closed().await?;
-    ensure(
-        session.close_cause.get_or("unset") == UNFINISHED_EXCHANGE,
-        || format!("closed for {}", session.close_cause.get_or("unset")),
-    )?;
+    for other in (0..layout.len()).filter(|&other| other != member) {
+        raw.ended(other).await?;
+    }
+    raw.probe_sibling(&SIBLINGS[0]).await?;
+    reopen(&mut raw, victim, layout, session.key).await?;
+    raw_exchanges::<A>(&mut raw, plan, 1).await?;
+    ensure(!raw.is_closed(), || {
+        "resetting a started exchange closed the connection".into()
+    })?;
+    ensure(session.close_cause.get().is_none(), || {
+        format!("closed for {}", session.close_cause.get_or("unset"))
+    })?;
     raw.shutdown().await;
     Ok(())
+}
+
+/// P10: a session whose started exchange the peer never answers stalls. The
+/// first stall resets only the session: every member ends, its reservations
+/// return to the pool, a sibling service keeps exchanging, and the layout
+/// reopens on the connection with no cause recorded. A second stall on the
+/// same connection closes it with the neutral [`STALL_POLICY`] cause.
+///
+/// The harness's service applies the stall rule when the property says the
+/// deadline passed. Each family's own liveness deadline is checked by its
+/// unit tests.
+pub(crate) async fn repeated_stall<A: StreamConformance>(
+    layout: &'static [Stream],
+) -> Result<(), BoxError> {
+    let seed = seeds(10, layout);
+    let victim = LayoutNode::<A>::spawn(seed, layout).await?;
+    let plan = LayoutPlan::new(layout);
+    let (mut raw, _) = raw_peer(&victim, layout, seed + 1).await?;
+    let held = victim.shared().pool.held();
+    for stall in 0..2 {
+        // Keep only the session's ID and cause: holding the session would
+        // hold its reservations.
+        let (key, close_cause) = {
+            let session = victim.wait_session(&raw.id()).await?;
+            (session.key, session.close_cause.clone())
+        };
+        let reserved = hold_started_exchange(&mut raw, &victim, &plan).await?;
+        ensure(!reserved || victim.shared().pool.held() > held, || {
+            "the started request holds no reservation".into()
+        })?;
+        victim.service.stall(&raw.id())?;
+        if stall == 1 {
+            raw.closed().await?;
+            ensure(close_cause.get() == Some(STALL_POLICY), || {
+                format!("closed for {}", close_cause.get_or("unset"))
+            })?;
+            break;
+        }
+        for member in 0..layout.len() {
+            raw.ended(member).await?;
+        }
+        await_until(
+            "the stalled session's reservations",
+            CONFORMANCE_DEADLINE,
+            || victim.shared().pool.held() == held,
+        )
+        .await?;
+        raw.probe_sibling(&SIBLINGS[0]).await?;
+        reopen(&mut raw, &victim, layout, key).await?;
+        raw_exchanges::<A>(&mut raw, &plan, 1).await?;
+        ensure(!raw.is_closed(), || {
+            "a first stall closed the connection".into()
+        })?;
+        ensure(close_cause.get().is_none(), || {
+            format!("a first stall closed for {}", close_cause.get_or("unset"))
+        })?;
+    }
+    raw.shutdown().await;
+    victim.shutdown().await;
+    Ok(())
+}
+
+/// Start an exchange from `victim` to `raw` that `raw` never answers: a
+/// request on the first request row, else a subscription on the first
+/// subscription row. Returns once its bytes reached `raw`, with whether it
+/// took a request pool entry.
+async fn hold_started_exchange<A: StreamConformance>(
+    raw: &mut RawLayoutPeer,
+    victim: &LayoutNode<A>,
+    plan: &LayoutPlan,
+) -> Result<bool, BoxError> {
+    if let Some(request) = plan.requests.first() {
+        victim
+            .service
+            .request(&raw.id(), request.row.message_type, 5)
+            .await?;
+        raw.recv(request.stream).await?;
+        return Ok(true);
+    }
+    let subscription = plan
+        .subscriptions
+        .first()
+        .ok_or("a layout has a request or subscription row")?;
+    let key = victim.wait_session(&raw.id()).await?.next_key();
+    victim
+        .service
+        .subscribe(
+            &raw.id(),
+            subscription.row.message_type,
+            key,
+            subscription.limits.credit,
+        )
+        .await?;
+    raw.recv(subscription.stream).await?;
+    Ok(false)
 }
 
 /// Paused sibling streams the connection window supports: a paused stream
@@ -894,7 +1027,7 @@ pub(crate) async fn partial_frames<A: StreamConformance>(
                             .shared()
                             .table
                             .get(&raw.id())
-                            .is_none_or(|(key, _)| key.session_id != old)
+                            .is_none_or(|(key, _)| key != old)
                     })
                     .await?;
                     raw.probe_sibling(&SIBLINGS[0]).await?;
@@ -929,20 +1062,18 @@ pub(crate) async fn partial_frames<A: StreamConformance>(
     )
     .await?;
     raw.open_layout(layout).await?;
-    victim.wait_session(&raw.id()).await?;
+    let session = victim.wait_session(&raw.id()).await?.key.session_id;
     let started = Instant::now();
     raw.write(member, &bytes[..bytes.len() - 1]).await?;
-    while !raw.is_closed() {
+    while victim.shared().table.get(&raw.id()).is_some_and(|(key, _)| key.session_id == session) {
         ensure(started.elapsed() < CONFORMANCE_DEADLINE, || {
             "a stalled frame never ended".into()
         })?;
-        // A failed probe means the connection is closing.
-        if raw.probe_sibling(&SIBLINGS[0]).await.is_err() {
-            break;
-        }
+        raw.probe_sibling(&SIBLINGS[0]).await?;
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    raw.closed().await?;
+    raw.probe_sibling(&SIBLINGS[0]).await?;
+    ensure(!raw.is_closed(), || "the first frame stall closed the connection".into())?;
     ensure(started.elapsed() >= limits.quic_idle_timeout / 2, || {
         "the stalled frame ended before its read deadline".into()
     })?;

@@ -11,5 +11,6 @@ mod read_body;
 mod rpc_metrics;
 mod surface;
 mod tls;
+mod trusted_block;
 mod vectors;
 mod wire;

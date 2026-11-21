@@ -18,7 +18,8 @@ use std::{
 
 use support::script::{run_under, OBSERVED};
 use zakura_network::zakura::{
-    wire_codec::WireMessage, DiscoveryMessage, MAX_NODE_RECORD_BYTES, MSG_DISCOVERY_PEERS,
+    wire_codec::WireMessage, CloseOutcome, DiscoveryMessage, MAX_NODE_RECORD_BYTES,
+    MSG_DISCOVERY_PEERS,
 };
 use zakura_sim::NaReason;
 use zakura_sim::{
@@ -26,13 +27,16 @@ use zakura_sim::{
     harness::{
         discovery_service::{
             act_scenario, asking_scenario, wire_properties, DiscoveryWire, NodeHandle, SavedPlan,
-            WireScenario, ASKED, CONFORMANT_ACTS, FAMILY, HOSTILE_ACTS, SCRIPTED,
+            WireScenario, ASKED, CONFORMANT_ACTS, FAMILY, HOSTILE_ACTS, OWED_PEERS, SCRIPTED,
         },
         run_prepared, HarnessError, Subsystem,
     },
-    model::{is_fault_cause, Label},
+    model::Label,
     observe::{StreamId, TransportFact},
-    peer::discovery::{relayed_node, DiscoveryAct, DiscoveryRow, Request},
+    peer::{
+        discovery::{relayed_node, DiscoveryAct, DiscoveryRow, Request},
+        public_peer_addr,
+    },
     table::{GeneratedId, Template},
     witness::{judge_report, Expect},
     MemorySink, Observation, Plan, PropertyOutcome, RunReport,
@@ -279,21 +283,19 @@ fn over_owed_at_its_cap(scenario: &WireScenario, report: &RunReport) {
     assert_eq!(read.map(|len| len as usize), Some(cap + 1));
     let fault = entries.iter().any(|entry| {
         matches!(&entry.obs, Observation::ConnectionClosed { connection: on, cause }
-            if *on == connection && is_fault_cause(cause))
+            if *on == connection && cause.is_fault())
     });
     assert!(fault, "the node admitted a Peers over its cap");
 }
 
 /// The node's fault closes in `report`, by cause.
-fn fault_closes(report: &RunReport) -> Vec<String> {
+fn fault_closes(report: &RunReport) -> Vec<CloseOutcome> {
     report
         .log
         .entries()
         .iter()
         .filter_map(|entry| match &entry.obs {
-            Observation::ConnectionClosed { cause, .. } if is_fault_cause(cause) => {
-                Some(cause.clone())
-            }
+            Observation::ConnectionClosed { cause, .. } if cause.is_fault() => Some(*cause),
             _ => None,
         })
         .collect()
@@ -321,7 +323,7 @@ fn every_discovery_property_applies_in_its_witness() {
     let report = run(&WireScenario::default());
     let honest: Vec<String> = HONEST.iter().map(|suffix| id(suffix)).collect();
     witnessed(&report, "honest", &honest);
-    assert_eq!(fault_closes(&report), Vec::<String>::new());
+    assert_eq!(fault_closes(&report), Vec::<CloseOutcome>::new());
 }
 
 /// `discovery/wire` draws each act witness, each asking witness of
@@ -369,22 +371,58 @@ const EXPIRED_HELLO_SCENARIO: &str = include_str!(
 /// The node's answers carry only what their requests asked for:
 /// `sender-within-owed` applies and holds on a `Peers` that answers a
 /// `GetPeers` for one record, and on a `Services` that answers a
-/// `GetServices` for header sync alone, which the node doesn't run.
-/// `services/sender-within-owed`'s planted case makes the node ignore the
-/// wanted list, and the same scenario then violates the ID.
-/// `peers/sender-within-owed` stays a `Draft`: every simulated peer binds
-/// an RFC 1918 address, which the book's sampler refuses, so the `Peers`
-/// answer carries no records.
+/// `GetServices` for header sync alone, which the node doesn't run. Each
+/// ID's planted case makes the node ignore what its request asked, and a
+/// search finds an input that then violates the ID.
 ///
-/// This fails if the node's answer passes its request, or a witness stops
-/// reaching its ID.
+/// The `GetPeers` scenario's other peers listen on public addresses, so
+/// the node dials them and confirms their records, and its book can sample
+/// more records than the request asks for (#2267).
+///
+/// This fails if the node's answer passes its request, a witness stops
+/// reaching its ID, or the node's book stops confirming the public peers'
+/// records.
 #[test]
 fn answers_within_their_requests_hold_sender_within_owed() {
     for (suffix, request) in OWED {
-        let report = run(&asking_scenario(request));
+        let (report, node) = run_node(&asking_scenario(request));
         witnessed(&report, request, &[id(suffix)]);
-        assert_eq!(fault_closes(&report), Vec::<String>::new(), "{request:?}");
+        assert_eq!(
+            fault_closes(&report),
+            Vec::<CloseOutcome>::new(),
+            "{request:?}"
+        );
+        if request == Request::GetOnePeer {
+            assert_eq!(
+                confirmed_public_records(&node),
+                OWED_PEERS - 1,
+                "the node confirms each public peer's record"
+            );
+        }
     }
+}
+
+/// How many records in the node's book name only public peer addresses
+/// ([`public_peer_addr`]) and have a confirmed address, read once the run
+/// has ended, as [`book_holds_relayed`] reads.
+fn confirmed_public_records(node: &NodeHandle) -> usize {
+    let handle = node.get().expect("the run built the node");
+    let read = pin!(handle.persisted_entries());
+    let entries = match read.poll(&mut Context::from_waker(Waker::noop())) {
+        Poll::Ready(entries) => entries,
+        Poll::Pending => panic!("the book's lock is free after the run"),
+    };
+    let public = |addr: &std::net::SocketAddr| {
+        (0..OWED_PEERS).any(|index| *addr == public_peer_addr(index, 0))
+    };
+    entries
+        .iter()
+        .filter(|entry| {
+            !entry.confirmed_addrs.is_empty()
+                && !entry.record.body.direct_addrs.is_empty()
+                && entry.record.body.direct_addrs.iter().all(public)
+        })
+        .count()
 }
 
 /// `undeclared-type-closes` and each `hello` ID apply and hold in their
@@ -464,7 +502,11 @@ fn conformant_controls_hold_conformant_never_closes() {
             _ => Vec::new(),
         };
         witnessed(&report, control, &ids);
-        assert_eq!(fault_closes(&report), Vec::<String>::new(), "{control:?}");
+        assert_eq!(
+            fault_closes(&report),
+            Vec::<CloseOutcome>::new(),
+            "{control:?}"
+        );
         let labels: BTreeSet<&str> = report
             .log
             .entries()
@@ -501,10 +543,41 @@ fn bypass(id: &GeneratedId<'_>) -> Vec<Vec<Observation>> {
         quic_stream: Some(4),
         seq: 0,
     };
+    // The node's frame on the ID's row, as the peer's models labelled it.
+    let sent = |label: Label| Observation::NodeFrame {
+        connection: 1,
+        stream: STREAM,
+        quic_stream: Some(4),
+        seq: 0,
+        row: id.row.map(str::to_owned),
+        rule_stream: STREAM,
+        label,
+        exhausted: false,
+        exchange: None,
+    };
     match id.template {
         Template::Closes(label) => vec![vec![peer(label)], vec![judged]],
+        Template::SenderWithinOwed => vec![vec![sent(Label::OverOwed)]],
         template => panic!("no scripted bypass covers {template:?}"),
     }
+}
+
+/// `peers/sender-within-owed` fails, alone, on the history of a node that
+/// answers a `GetPeers` with more records than it asked for: the peer's
+/// models label the node's `Peers` over-owed. This is its bypass in the
+/// coverage manifest.
+#[test]
+fn peers_sender_within_owed_breaks_in_its_bypass() {
+    let name = id("peers/sender-within-owed");
+    let parsed = GeneratedId::parse(&name).expect("a generated ID parses back");
+    let report = run_under(wire_properties(), OBSERVED, bypass(&parsed));
+    let violated: Vec<&str> = report
+        .properties
+        .iter()
+        .filter(|property| matches!(property.outcome, PropertyOutcome::Violated { .. }))
+        .map(|property| property.property.as_str())
+        .collect();
+    assert_eq!(violated, [name.as_str()], "{:?}", report.properties);
 }
 
 /// Each [`SCRIPTED`] ID fails on a scripted history that bypasses its
@@ -544,7 +617,7 @@ fn late_response_admitted_applies_in_its_saved_plan() {
         "late-response",
         &[LATE_RESPONSE_ADMITTED.to_owned()],
     );
-    assert_eq!(fault_closes(&report), Vec::<String>::new());
+    assert_eq!(fault_closes(&report), Vec::<CloseOutcome>::new());
     assert_eq!(
         *outcome(&run(&WireScenario::default()), LATE_RESPONSE_ADMITTED),
         PropertyOutcome::not_applicable(NaReason::NeverApplied)

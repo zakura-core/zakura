@@ -470,14 +470,25 @@ fn teardown_waits_for_a_serving_read_held_across_a_close() {
         matches!(outcome, PropertyOutcome::Held { applicable } if *applicable > 0),
         "{outcome:?}"
     );
-    let last_close = report
+    // A peer's close records no cause on the node, so each routine's last
+    // snapshot marks its link's end.
+    let ends: Vec<u64> = report
         .log
         .entries()
         .iter()
-        .filter(|entry| matches!(entry.obs, Observation::ConnectionClosed { .. }))
+        .filter(|entry| {
+            matches!(
+                entry.obs,
+                Observation::BlockSync {
+                    event: BlockSyncFact::Routine { ended: true, .. },
+                    ..
+                }
+            )
+        })
         .map(|entry| entry.step)
-        .max()
-        .expect("every link closes");
+        .collect();
+    assert_eq!(ends.len(), 3, "every link's routine ends: {ends:?}");
+    let last_close = ends.into_iter().max().expect("three routines end");
     let released = report
         .log
         .entries()
@@ -493,7 +504,7 @@ fn teardown_waits_for_a_serving_read_held_across_a_close() {
     assert!(
         released > last_close,
         "the read for height 1 returned its lease at step {released}, before the last \
-         close at step {last_close}"
+         routine ended at step {last_close}"
     );
     let view = ports.view.borrow();
     assert_eq!(view.owners.serving_leases(), 0);

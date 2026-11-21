@@ -81,7 +81,9 @@ pub const T_VERIFY: Duration = Duration::from_secs(60);
 /// The wait is flat. It does not stop while a parent is being verified, and
 /// waking the transaction or checking it again does not restart it. When it
 /// ends, a parked transaction is rejected, and one whose inputs keep
-/// arriving during its checks gets one more check and no more.
+/// arriving during its checks gets one more check and no more. A parent
+/// that enters the pool runs a waiting transaction again at once only a few
+/// times per tip, and after that at most every few seconds.
 pub const T_PARK: Duration = Duration::from_secs(60);
 
 /// Commands that can wait for the core. A full queue makes
@@ -110,6 +112,8 @@ pub struct Reservation {
     release: Option<mpsc::UnboundedSender<ReservationId>>,
     /// Cancelled when the core no longer needs this reservation's body.
     cancel: CancellationToken,
+    /// When the core ends the admission. See [`Self::give_up_at`].
+    give_up: Option<Instant>,
 }
 
 impl Reservation {
@@ -126,7 +130,25 @@ impl Reservation {
             tx_id,
             release: Some(release),
             cancel,
+            give_up: None,
         }
+    }
+
+    /// Has the core end this reservation's admission at `at`, as a
+    /// [`LocalFault::VerifyTimeout`], if it is still undecided then. A caller
+    /// that frees its own per-peer state at a deadline sets it here, so the
+    /// transaction is not still undecided in the core after the caller has
+    /// let go of it. Without one, the admission ends only at the core's own
+    /// limits, [`T_VERIFY`] and [`T_PARK`].
+    pub fn give_up_at(mut self, at: Instant) -> Self {
+        self.give_up = Some(at);
+        self
+    }
+
+    /// When the core ends this reservation's admission, if its caller set a
+    /// time. See [`Self::give_up_at`].
+    pub fn give_up(&self) -> Option<Instant> {
+        self.give_up
     }
 
     /// Cancelled when the core no longer needs the body this reservation
@@ -256,7 +278,8 @@ pub struct Rejection {
 /// nothing is cached. The caller can submit again.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum LocalFault {
-    /// The verification did not finish before its deadline.
+    /// The verification did not finish before its deadline, or its
+    /// submitter's deadline passed. See [`Reservation::give_up_at`].
     VerifyTimeout,
     /// The verification job panicked.
     VerifyPanicked,
@@ -657,6 +680,13 @@ pub enum PoolCommand {
     /// A reservation was dropped before the core accepted it. No caller
     /// sends this. [`PoolInbox::next`] yields it.
     Released(ReservationId),
+    /// [`PoolHandle::known_ids`].
+    KnownIds {
+        /// The ids to check.
+        ids: HashSet<UnminedTxId>,
+        /// The ids the core already knows.
+        reply: oneshot::Sender<HashSet<UnminedTxId>>,
+    },
     /// [`PoolHandle::rejected_ids`].
     RejectedIds {
         /// The ids to check.
@@ -909,6 +939,28 @@ impl PoolHandle {
         by(deadline, async {
             let (reply, answer) = oneshot::channel();
             let command = PoolCommand::RejectedIds { ids, reply };
+            if self.commands.send(command).await.is_err() {
+                return HashSet::new();
+            }
+            answer.await.unwrap_or_default()
+        })
+        .await
+    }
+
+    /// The members of `ids` that [`Self::reserve`] would refuse without
+    /// taking a slot: pooled, undecided, waiting to be verified again after a
+    /// reset, or covered by a cached rejection. A caller that shares out
+    /// slots of its own asks this first, so an id someone else is bringing
+    /// in costs none of them. Waits until `deadline`, and is empty when the
+    /// core has stopped. See [`PoolHandle`].
+    pub async fn known_ids(
+        &self,
+        ids: HashSet<UnminedTxId>,
+        deadline: Instant,
+    ) -> Result<HashSet<UnminedTxId>, Elapsed> {
+        by(deadline, async {
+            let (reply, answer) = oneshot::channel();
+            let command = PoolCommand::KnownIds { ids, reply };
             if self.commands.send(command).await.is_err() {
                 return HashSet::new();
             }

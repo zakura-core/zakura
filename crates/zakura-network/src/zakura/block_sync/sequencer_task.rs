@@ -74,7 +74,7 @@ pub(super) struct SequencedBody {
     /// The size estimate this body's request reserved at admission. `None` for
     /// a body admitted on its wire size with no request estimate.
     pub(super) admitted_estimate_bytes: Option<u64>,
-    pub(super) peer: ZakuraPeerId,
+    pub(super) supplier: BlockSupplier,
     pub(super) received_at: Instant,
     queue_accounting: SequencerInputAccounting,
 }
@@ -166,7 +166,7 @@ impl SequencedBody {
             body,
             bytes,
             admitted_estimate_bytes,
-            peer,
+            BlockSupplier { peer, conn_id: 0 },
             received_at,
             input_bytes,
             input_decoded_attributed_memory_bytes,
@@ -185,7 +185,7 @@ impl SequencedBody {
         body: BufferedBlockBody,
         bytes: u64,
         admitted_estimate_bytes: Option<u64>,
-        peer: ZakuraPeerId,
+        supplier: BlockSupplier,
         received_at: Instant,
         input_bytes: Arc<AtomicU64>,
         input_decoded_attributed_memory_bytes: Arc<AtomicU64>,
@@ -200,7 +200,7 @@ impl SequencedBody {
             body,
             bytes,
             admitted_estimate_bytes,
-            peer,
+            supplier,
             received_at,
             queue_accounting: SequencerInputAccounting::new(
                 input_bytes,
@@ -460,7 +460,11 @@ impl state::SequencerEvidence {
                 expected_version,
                 invalid,
             },
-            Self::Misbehavior { peer, reason } => BlockSyncAction::Misbehavior { peer, reason },
+            Self::Misbehavior { supplier, reason } => BlockSyncAction::Misbehavior {
+                peer: supplier.peer,
+                conn_id: Some(supplier.conn_id),
+                reason,
+            },
         }
     }
 }
@@ -934,7 +938,7 @@ impl SequencerIO {
             body: facts,
             bytes: body.bytes,
             admitted_estimate_bytes: body.admitted_estimate_bytes,
-            peer: body.peer,
+            supplier: body.supplier,
         });
         self.payloads.apply(payload_changes);
         #[cfg(any(test, zakura_sim))]
@@ -2156,6 +2160,7 @@ mod tests {
         for _ in 0..action_sender.max_capacity() {
             action_sender
                 .send(BlockSyncAction::Misbehavior {
+                    conn_id: None,
                     peer: ZakuraPeerId::new(vec![0xee; 32])
                         .expect("the filler peer ID has the required length"),
                     reason: BlockSyncMisbehavior::InvalidBlock,
@@ -2274,6 +2279,7 @@ mod tests {
 
         action_sender
             .send(BlockSyncAction::Misbehavior {
+                conn_id: None,
                 peer: ZakuraPeerId::new(vec![0xee; 32])
                     .expect("the filler peer ID has the required length"),
                 reason: BlockSyncMisbehavior::InvalidBlock,
@@ -2618,6 +2624,7 @@ mod tests {
                         Some(BlockSyncAction::Misbehavior {
                             peer,
                             reason: BlockSyncMisbehavior::BodyPayloadMismatch(actual),
+                            ..
                         }) if peer == ZakuraPeerId::new(vec![1; 32])
                             .expect("test peer ID is valid")
                             && actual == mismatch
@@ -2774,6 +2781,7 @@ mod tests {
             );
 
             let mut body = queued_test_body(input_bytes, input_decoded_bytes);
+            body.supplier.conn_id = 19;
             body.leave_queue();
             task.handle_accept_body(body);
             task.submit_pending_blocks().await;
@@ -2793,6 +2801,7 @@ mod tests {
             for _ in 0..2 {
                 actions
                     .try_send(BlockSyncAction::Misbehavior {
+                        conn_id: None,
                         peer: busy_peer.clone(),
                         reason: BlockSyncMisbehavior::StatusSpam,
                     })
@@ -2858,7 +2867,9 @@ mod tests {
                     actions_rx.recv().await,
                     Some(BlockSyncAction::Misbehavior {
                         peer,
+                        conn_id: Some(19),
                         reason: BlockSyncMisbehavior::BodyPayloadMismatch(actual),
+                        ..
                     }) if peer == ZakuraPeerId::new(vec![1; 32]).expect("test peer ID is valid")
                         && actual == mismatch
                 ));
@@ -2982,6 +2993,7 @@ mod tests {
                     Some(BlockSyncAction::Misbehavior {
                         peer,
                         reason: BlockSyncMisbehavior::ConsensusBodyInvalid(actual),
+                        ..
                     }) if peer == ZakuraPeerId::new(vec![1; 32]).expect("test peer ID is valid")
                         && actual == invalid
                 ));

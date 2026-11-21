@@ -500,6 +500,7 @@ fn test_committed_views(
     };
     let (snapshot_tx, snapshot_rx) =
         tokio::sync::watch::channel(Some(zakura_header_chain::CommittedHeaderChainView::new(
+            snapshot.frontiers.verified_best,
             snapshot,
             zakura_header_chain::BodyWorkEpoch::default(),
         )));
@@ -1205,6 +1206,7 @@ async fn block_sync_driver_coalesces_stale_needed_queries() {
         zakura_network::zakura::ZakuraPeerId::new(vec![7; 32]).expect("test peer id is valid");
     action_tx
         .send(BlockSyncAction::Misbehavior {
+            conn_id: None,
             peer: deferred_peer.clone(),
             reason: BlockSyncMisbehavior::StatusSpam,
         })
@@ -1238,6 +1240,7 @@ async fn block_sync_driver_coalesces_stale_needed_queries() {
         Some(BlockSyncAction::Misbehavior {
             peer,
             reason: BlockSyncMisbehavior::StatusSpam,
+            ..
         }) if peer == deferred_peer
     ));
     assert!(deferred_actions.is_empty());
@@ -1293,6 +1296,7 @@ async fn block_sync_driver_does_not_refill_a_nonempty_deferred_queue() {
     for marker in [1, 2] {
         action_tx
             .send(BlockSyncAction::Misbehavior {
+                conn_id: None,
                 peer: test_zakura_peer(marker),
                 reason: BlockSyncMisbehavior::StatusSpam,
             })
@@ -1307,6 +1311,7 @@ async fn block_sync_driver_does_not_refill_a_nonempty_deferred_queue() {
 
     action_tx
         .send(BlockSyncAction::Misbehavior {
+            conn_id: None,
             peer: test_zakura_peer(3),
             reason: BlockSyncMisbehavior::StatusSpam,
         })
@@ -2047,6 +2052,7 @@ async fn block_sync_driver_commits_parent_first_and_ignores_outbound_actions() {
     action_tx
         .send(BlockSyncAction::Misbehavior {
             peer,
+            conn_id: None,
             reason: zakura_network::zakura::BlockSyncMisbehavior::InvalidBlock,
         })
         .await

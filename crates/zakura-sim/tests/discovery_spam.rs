@@ -6,7 +6,7 @@
 
 use std::collections::BTreeSet;
 
-use zakura_network::zakura::MSG_DISCOVERY_PEERS;
+use zakura_network::zakura::{CloseRow, MSG_DISCOVERY_PEERS};
 use zakura_sim::{
     explore::{classify, run_bytes, ExploreOutcome},
     harness::{
@@ -83,7 +83,7 @@ fn summary(report: &RunReport) -> (BTreeSet<u64>, usize, Vec<u16>) {
         .iter()
         .filter(|entry| {
             matches!(&entry.obs, Observation::ConnectionClosed { cause, .. }
-                if cause == "ordered_read_rejected")
+                if cause.row() == Some(CloseRow::REG_CLOSE_2))
         })
         .count();
     let answers = entries

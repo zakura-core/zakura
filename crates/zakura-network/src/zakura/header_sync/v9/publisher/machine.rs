@@ -384,6 +384,11 @@ struct Machine {
     /// Each capacity refusal's wait and signal.
     signals: Vec<(CapacityWait, ServingCapacitySignal)>,
     counters: PublisherCounters,
+    /// The instant each job request reads. It steps one walk-meter refill
+    /// interval per request, so the meter never holds a job back here. The
+    /// publisher test `walks_from_open_locators_spend_the_meter_at_exact_boundaries`
+    /// checks the meter.
+    clock: zakura_rt::time::Instant,
 }
 
 impl Machine {
@@ -400,7 +405,14 @@ impl Machine {
             exit: None,
             signals: Vec::new(),
             counters: PublisherCounters::default(),
+            clock: zakura_rt::time::Instant::now(),
         }
+    }
+
+    /// The instant for the next job request. See [`Self::clock`].
+    fn tick(&mut self) -> zakura_rt::time::Instant {
+        self.clock += state::OPEN_WALKS.refill_interval;
+        self.clock
     }
 
     fn selected(&self) -> Option<EngineSnapshot> {
@@ -718,7 +730,8 @@ impl Machine {
     fn next_job(&mut self) {
         let busy = self.busy();
         let selected = self.selected();
-        let job = self.owner.state.next_job::<HB>(selected.as_ref());
+        let now = self.tick();
+        let job = self.owner.state.next_job::<HB>(selected.as_ref(), now);
         if busy {
             assert!(
                 job.is_none(),
@@ -1049,8 +1062,12 @@ impl Machine {
             return;
         }
         let selected = self.selected();
+        let now = self.tick();
         assert!(
-            self.owner.state.next_job::<HB>(selected.as_ref()).is_none(),
+            self.owner
+                .state
+                .next_job::<HB>(selected.as_ref(), now)
+                .is_none(),
             "{PROPERTY}: no job starts after the publisher stops"
         );
         assert!(

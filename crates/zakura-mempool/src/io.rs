@@ -286,9 +286,10 @@ impl<E: VerifyError, V: Verifier<E>> MempoolIO<E, V> {
                     drop(reservation);
                     return;
                 }
+                let give_up = reservation.give_up();
                 let id = reservation.accept();
                 self.fetches.remove(&id);
-                let (waiter, step) = self.machine.submit(id, transaction, now);
+                let (waiter, step) = self.machine.submit(id, transaction, give_up, now);
                 self.verdicts.insert(waiter, reply);
                 self.finish(step);
             }
@@ -301,6 +302,20 @@ impl<E: VerifyError, V: Verifier<E>> MempoolIO<E, V> {
             PoolCommand::Released(id) => {
                 self.fetches.remove(&id);
                 let step = self.machine.release(id, now);
+                self.finish(step);
+            }
+            PoolCommand::KnownIds { ids, reply } => {
+                // A caller that gave up on the lookup costs the core no scan.
+                if reply.is_closed() {
+                    return;
+                }
+                // An admission whose deadline is due is not known any more,
+                // even while lookups keep the timer from running.
+                let step = self.machine.tick(now);
+                let answer = self.machine.known_ids(ids, now);
+                self.reply(move || {
+                    let _ = reply.send(answer);
+                });
                 self.finish(step);
             }
             PoolCommand::RejectedIds { ids, reply } => {

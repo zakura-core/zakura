@@ -581,12 +581,12 @@ fn a_simulator_target_neither_excluded_nor_mapped_fails() {
 fn an_ignored_test_the_suite_doesnt_list_fails() {
     let mut suite = committed();
     remove(&mut suite.ignored, |row| {
-        row.file == "crates/zakura-sim/tests/header_wire_lifecycle.rs"
-            && row.test == "regenerate_saved_plans"
+        row.file == "crates/zakura-sim/tests/header_wire_witness.rs"
+            && row.test == "regenerate_planted_scenarios"
     });
     assert_problem(
         &problems(&suite),
-        "crates/zakura-sim/tests/header_wire_lifecycle.rs::regenerate_saved_plans is ignored",
+        "crates/zakura-sim/tests/header_wire_witness.rs::regenerate_planted_scenarios is ignored",
     );
 }
 
@@ -701,6 +701,20 @@ fn a_registered_pending_row_fails() {
     assert_problem(
         &problems,
         "lists `header-sync/wire` as pending, and it's registered",
+    );
+}
+
+/// A feature family none of whose required states waits leaves the
+/// pending rows.
+#[test]
+fn a_settled_pending_feature_fails() {
+    let mut suite = committed();
+    suite
+        .pending
+        .push(pending("feature/reorg-stage", PendingKind::Feature));
+    assert_problem(
+        &problems(&suite),
+        "lists `feature/reorg-stage` as pending, and no required state of it waits",
     );
 }
 

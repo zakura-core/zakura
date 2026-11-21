@@ -1,3 +1,5 @@
+use super::events::BlockSupplier;
+
 use super::{state::*, wire::DecodedBlockPayload, *};
 use zakura_node_services::block_memory::{
     Admission, AdmissionFailure, BlockHandle, DecodedBlockPool, OwnedBlock,
@@ -99,7 +101,7 @@ impl ReorderBuffer {
         height: block::Height,
         block: Arc<block::Block>,
         bytes: u64,
-        source_peer: ZakuraPeerId,
+        peer: ZakuraPeerId,
     ) -> ReorderInsertResult {
         let previous_block_hash = block.header.previous_block_hash;
         self.insert_body(
@@ -115,7 +117,7 @@ impl ReorderBuffer {
             },
             bytes,
             None,
-            source_peer,
+            BlockSupplier { peer, conn_id: 0 },
         )
     }
 
@@ -132,7 +134,7 @@ impl ReorderBuffer {
         body: BodyFacts,
         bytes: u64,
         admitted_estimate_bytes: Option<u64>,
-        source_peer: ZakuraPeerId,
+        supplier: BlockSupplier,
     ) -> ReorderInsertResult {
         if self.blocks.contains_key(&height) {
             return ReorderInsertResult::Duplicate;
@@ -149,7 +151,7 @@ impl ReorderBuffer {
                 body,
                 bytes,
                 admitted_estimate_bytes,
-                source_peer,
+                supplier,
             },
         );
         self.set_buffered_bytes(self.buffered_bytes.saturating_add(bytes));
@@ -183,7 +185,7 @@ impl ReorderBuffer {
                 body: buffered.body,
                 bytes: buffered.bytes,
                 admitted_estimate_bytes: buffered.admitted_estimate_bytes,
-                source_peer: buffered.source_peer,
+                supplier: buffered.supplier,
             });
             let Some(after) = next_height(next) else {
                 break;
@@ -262,7 +264,7 @@ pub(super) struct DrainedBlock {
     pub(super) body: BodyFacts,
     pub(super) bytes: u64,
     pub(super) admitted_estimate_bytes: Option<u64>,
-    pub(super) source_peer: ZakuraPeerId,
+    pub(super) supplier: BlockSupplier,
 }
 
 /// One retained body, as the owner snapshots read it.
@@ -305,7 +307,7 @@ struct BufferedBlock {
     admitted_estimate_bytes: Option<u64>,
     /// The peer that delivered this body, so an apply rejection can be attributed
     /// back to it for misbehavior scoring.
-    source_peer: ZakuraPeerId,
+    supplier: BlockSupplier,
 }
 
 /// Identity of one payload retained by sequencer IO.

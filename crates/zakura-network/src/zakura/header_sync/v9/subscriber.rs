@@ -68,6 +68,8 @@
 use std::sync::Arc;
 
 use thiserror::Error;
+
+use crate::zakura::CloseRow;
 use zakura_chain::block;
 use zakura_header_chain::Frontier;
 
@@ -173,6 +175,25 @@ pub(crate) enum SubscriberFault {
 }
 
 impl SubscriberFault {
+    /// The close-spec row this fault breaks.
+    pub(crate) fn close_row(self) -> CloseRow {
+        match self {
+            Self::Subscription(fault) => fault.close_row(),
+            Self::AboveAdvertised => CloseRow::HSYNC_CLOSE_10,
+            Self::Target => CloseRow::HSYNC_CLOSE_11,
+            Self::Schema => CloseRow::HSYNC_CLOSE_12,
+            Self::FirstParent => CloseRow::HSYNC_CLOSE_13,
+            Self::Parent => CloseRow::HSYNC_CLOSE_14,
+            Self::Linkage => CloseRow::HSYNC_CLOSE_15,
+            Self::PastTarget => CloseRow::HSYNC_CLOSE_16,
+            Self::LowerLocator => CloseRow::HSYNC_CLOSE_17,
+            Self::TargetHeight => CloseRow::HSYNC_CLOSE_18,
+            Self::Marker => CloseRow::HSYNC_CLOSE_19,
+            Self::SecondMarker => CloseRow::HSYNC_CLOSE_20,
+            Self::OutcomeWindow(_) => CloseRow::HSYNC_CLOSE_21,
+        }
+    }
+
     /// Stable metric and trace label.
     pub(crate) fn label(self) -> &'static str {
         match self {
@@ -349,7 +370,7 @@ impl Subscriber {
     ///
     /// The subscription holds the `Open`'s exchange until its terminal
     /// outcome, so a session that ends after the `Open` was written and
-    /// before the outcome closes the connection.
+    /// before the outcome resets the session's streams.
     pub(crate) fn open(
         &mut self,
         status: &Status,
@@ -387,7 +408,7 @@ impl Subscriber {
 
     /// Remove a subscription whose `Open` failed to send. If no byte was
     /// written, nothing else happens. If its first byte was written, the peer
-    /// may answer, so dropping the exchange closes the connection.
+    /// may answer, so dropping the exchange resets the session.
     pub(crate) fn retract(&mut self, id: u64) -> bool {
         self.state.retract(&mut self.tools.lock(), id)
     }

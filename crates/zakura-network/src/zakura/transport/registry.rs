@@ -6,7 +6,8 @@ use thiserror::Error;
 use zakura_rt::collections::{HashMap, HashSet};
 
 use super::{
-    Frame, LayoutError, Peer, Service, SessionDemand, SessionPolicy, SinkReject, Stream, StreamMode,
+    CloseRow, Frame, LayoutError, Peer, Service, SessionDemand, SessionPolicy, SinkReject, Stream,
+    StreamMode,
 };
 use crate::zakura::{ServicePeerDirection, ZakuraConnId, ZakuraPeerId};
 
@@ -481,11 +482,13 @@ impl ServiceRegistry {
     ) -> Result<Vec<Frame>, SinkReject> {
         let Some(service) = self.service_for_kind(stream_kind) else {
             return Err(SinkReject::protocol(
+                CloseRow::CONN_CLOSE_23,
                 "request stream kind is not registered",
             ));
         };
         let Some(handler) = service.as_request_response() else {
             return Err(SinkReject::protocol(
+                CloseRow::CONN_CLOSE_23,
                 "service does not accept request frames",
             ));
         };
@@ -507,11 +510,13 @@ impl ServiceRegistry {
     pub fn check_request(&self, stream_kind: u16, frame: &Frame) -> Result<(), SinkReject> {
         let Some(service) = self.service_for_kind(stream_kind) else {
             return Err(SinkReject::protocol(
+                CloseRow::CONN_CLOSE_23,
                 "request stream kind is not registered",
             ));
         };
         let Some(handler) = service.as_request_response() else {
             return Err(SinkReject::protocol(
+                CloseRow::CONN_CLOSE_23,
                 "service does not accept request frames",
             ));
         };

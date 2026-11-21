@@ -161,10 +161,7 @@ impl Adapter {
                 self.unsettled(key.0, key.1, held, log);
             }
             if !self.judged_connection(connection) {
-                log.push(Observation::ConnectionClosed {
-                    connection,
-                    cause: cause.to_owned(),
-                });
+                log.push(Observation::ConnectionClosed { connection, cause });
             }
         }
     }

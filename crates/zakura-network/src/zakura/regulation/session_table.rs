@@ -9,8 +9,8 @@
 //! session retires its fence under the table's lock, before the entry changes.
 //! That puts #978's lock order (table, then fence) and its rule "retire before
 //! erasing the record" in one place. If the old session has a started exchange
-//! without an ending, retiring its fence closes the connection; a replacement
-//! on that same connection is then refused.
+//! without an ending, retiring its fence resets the old session's streams. The
+//! replacement has fresh streams, so it never sees the old session's answers.
 //!
 //! Generalized from #945's `CurrentSessions`.
 //!
@@ -21,7 +21,7 @@
 //! | One session per peer; a stale key never removes a newer session | `a_stale_key_cannot_remove_a_newer_session`, `operation_sequences_keep_one_fenced_session_per_peer` |
 //! | Changes coalesce, and a change during reconciliation stays visible | `churn_coalesces_and_changes_during_reconciliation_stay_visible` |
 //! | Replacing or removing retires the old fence first | `replacement_fences_the_old_publication_and_queued_first_write`, `removing_a_session_fences_its_writers_before_erasing_it` |
-//! | A same-connection replacement is refused exactly when the old fence closed the connection | `replacement_closes_a_started_exchange_even_after_its_write_finished`, `an_ended_exchange_or_a_new_connection_allows_replacement`, the proptest |
+//! | A replacement resets an old session with a started exchange and keeps the connection | `replacement_resets_a_started_exchange_even_after_its_write_finished`, `an_ended_exchange_or_a_new_connection_allows_replacement`, the proptest |
 
 use zakura_rt::{
     collections::HashMap,
@@ -58,10 +58,6 @@ pub(crate) enum Replacement<S> {
     Inserted,
     /// The old session was fenced and cancelled.
     Replaced(Current<S>),
-    /// The old session had a started exchange without an ending on the same
-    /// connection. Its fence closed the connection, and the new session was
-    /// cancelled.
-    Refused,
 }
 
 /// Each peer's current session, with coalesced change notifications.
@@ -99,14 +95,7 @@ impl<S: Clone> SessionTable<S> {
         let replaced = match table.remove(&peer) {
             None => Replacement::Inserted,
             Some(old) => {
-                let reusable = old.fence.retire();
-                if !reusable && old.key.conn_id == current.key.conn_id {
-                    current.cancel.cancel();
-                    // The connection is closing. The old session's own
-                    // teardown removes it.
-                    table.insert(peer, old);
-                    return Replacement::Refused;
-                }
+                old.fence.retire();
                 old.cancel.cancel();
                 Replacement::Replaced(old)
             }

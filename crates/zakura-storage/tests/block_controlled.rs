@@ -266,7 +266,7 @@ fn view_at(
 ) -> CommittedHeaderChainView {
     let mut snapshot = view.snapshot.clone();
     snapshot.frontiers.verified_best = verified_best;
-    CommittedHeaderChainView::new(snapshot, epoch)
+    CommittedHeaderChainView::new(snapshot.frontiers.verified_best, snapshot, epoch)
 }
 
 /// The query ID `id` counts as.
@@ -283,6 +283,7 @@ fn ids_are_unique_and_enumeration_is_deterministic() {
         let mut harness = Harness::new();
         let blocks = harness.chain(harness.fixture.anchor(), &[BodySpec::exact(900); 3], 0);
         let misbehavior = BlockSyncAction::Misbehavior {
+            conn_id: None,
             peer: ZakuraPeerId::new([3; 32]).expect("a 32-byte node ID is in bounds"),
             reason: BlockSyncMisbehavior::StatusSpam,
         };
@@ -733,14 +734,15 @@ fn an_earlier_admission_wins_an_equal_work_tie() {
     harness.complete(first, BlockOutcome::Admit);
     harness.complete(second, BlockOutcome::Admit);
 
-    // The selected chain ends at A1, so B1's commit moves the verified tip
-    // off it and starts an epoch too.
+    // B commits first while A remains the selected header.
+    let epoch = harness.engine.view().body_work_epoch;
     harness.complete(second, COMMITTED);
     assert_eq!(
         harness.engine.snapshot().frontiers.verified_best,
         b.frontier()
     );
-    let epoch = harness.engine.view().body_work_epoch;
+    assert_eq!(harness.engine.view().body_work_epoch, epoch);
+    assert_eq!(harness.engine.view().body_download_anchor, anchor);
     harness
         .service
         .complete(first, COMMITTED)

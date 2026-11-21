@@ -17,7 +17,7 @@ use zakura_rt::sync::CancellationToken;
 use super::*;
 use crate::zakura::{
     framed_channel,
-    regulation::{ResponsePrecheck, ServeCapacity, ServeLimits, WriterFence, UNFINISHED_EXCHANGE},
+    regulation::{ResponsePrecheck, ServeCapacity, ServeLimits, WriterFence},
     CloseCause, Frame, FrameRejection, PayloadLen, ZakuraPeerId,
 };
 
@@ -1326,11 +1326,11 @@ async fn close_needs_no_credit_and_no_execution() {
 }
 
 #[test]
-fn retirement_with_a_live_subscription_closes_the_connection() {
+fn retirement_with_a_live_subscription_resets_the_session() {
     for ended in [false, true] {
         let connection = CancellationToken::new();
-        let cause = CloseCause::new();
-        let fence = WriterFence::new(connection.clone(), cause.clone());
+        let session = connection.child_token();
+        let fence = WriterFence::new(session.clone());
         let mut subscriptions = Subscriptions::<u8, u32>::new(limits(1), RULES);
         let exchange = fence.open().unwrap();
         let writer = exchange.writer();
@@ -1344,14 +1344,12 @@ fn retirement_with_a_live_subscription_closes_the_connection() {
             subscriptions.claim_end(&1).unwrap();
         }
         assert_eq!(fence.retire(), ended);
-        assert_eq!(connection.is_cancelled(), !ended);
-        if !ended {
-            assert_eq!(cause.get_or("unset"), UNFINISHED_EXCHANGE);
-        }
+        assert_eq!(session.is_cancelled(), !ended);
+        assert!(!connection.is_cancelled(), "a reset keeps the connection");
         assert_eq!(
             subscriptions.grant(&1, credit(1, 1)).is_ok(),
             !ended,
-            "the table stays usable; only the connection closes"
+            "the table stays usable; only the session ends"
         );
     }
 }

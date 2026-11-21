@@ -34,12 +34,11 @@ pub enum AuxiliaryEffect {
 /// Effect of one committed transition on in-flight body work.
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 pub enum BodyWorkEffect {
-    /// The transition retained every selected and verified path entry, and left the
-    /// verified tip in place or on the selected chain.
+    /// Outstanding requests still belong to the selected chain.
     #[default]
     Preserved,
-    /// The transition retired a selected or verified path entry, or moved the verified
-    /// tip off the selected chain.
+    /// The transition replaced selected or verified history, or combined off-chain
+    /// verification with a change of selection or download anchor.
     Invalidated,
 }
 
@@ -105,8 +104,7 @@ impl TransitionEffect {
         self.resource_stalled
     }
 
-    /// True when this transition retired selected or verified path entries, or moved the
-    /// verified tip off the selected chain.
+    /// True when pending body requests must be discarded.
     pub const fn invalidates_body_work(self) -> bool {
         matches!(self.body_work, BodyWorkEffect::Invalidated)
     }

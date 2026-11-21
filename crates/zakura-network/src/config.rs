@@ -3,7 +3,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt,
-    io::{self, ErrorKind},
+    io::{self, ErrorKind, Write},
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     str::FromStr,
@@ -23,7 +23,7 @@ use zakura_quic::NodeSecretKey;
 use tracing::Span;
 use zakura_chain::{
     amount::Amount,
-    common::atomic_write,
+    common::{atomic_write, TempFile},
     parameters::{
         testnet::{
             self, ConfiguredActivationHeights, ConfiguredCheckpoints, ConfiguredFundingStreams,
@@ -1077,45 +1077,21 @@ impl Config {
         Ok(load_or_generate_zakura_secret_key(&key_file))
     }
 
-    /// Checks that this node keeps its [`NodeId`](zakura_quic::NodeId) across
-    /// restarts, saving a new key now if it has none yet.
+    /// Pins the configured or persisted identity in this endpoint's runtime config.
     ///
-    /// A problem with the key file never stops
-    /// [`zakura_secret_key`](Self::zakura_secret_key): when the file cannot be
-    /// read, parsed or saved, the node runs with a new identity. A node that
-    /// others look up by its ID calls this first and refuses to start on an error
-    /// instead.
-    ///
-    /// A configured key only has to parse. Otherwise the key file must hold a key,
-    /// or not exist yet. An unreadable or unparsable key file is left as it is,
-    /// and so is a link to a key file that is missing.
-    pub fn ensure_stable_zakura_identity(&self) -> Result<(), UnstableZakuraIdentityError> {
+    /// A gateway calls this before startup so endpoint construction uses the same key
+    /// even if the identity file later becomes unavailable. A missing key is created
+    /// once. An invalid configured key or an unreadable, invalid or unsavable file
+    /// stops startup without replacing an existing identity.
+    pub fn pin_stable_zakura_identity(&mut self) -> Result<(), UnstableZakuraIdentityError> {
         if self.zakura_node_secret_key.is_some() {
             self.zakura_secret_key()?;
             return Ok(());
         }
 
         let key_file = zakura_secret_key_file_path(&self.identity_dir, &self.network);
-        if read_zakura_secret_key(&key_file)?.is_none() {
-            // A link whose target is missing, such as a secrets volume that is not
-            // mounted, reads as no file. Saving a key would replace the link.
-            if std::fs::symlink_metadata(&key_file).is_ok() {
-                return Err(UnstableZakuraIdentityError::Unreadable {
-                    path: key_file,
-                    source: io::Error::new(
-                        ErrorKind::NotFound,
-                        "the key file is a link to a file that does not exist",
-                    ),
-                });
-            }
-
-            save_zakura_secret_key(&key_file, &NodeSecretKey::generate()).map_err(|source| {
-                UnstableZakuraIdentityError::NotSaved {
-                    path: key_file,
-                    source,
-                }
-            })?;
-        }
+        let key = load_or_create_zakura_secret_key(&key_file, FirstKeyWrite::NoReplace)?;
+        self.zakura_node_secret_key = Some(ZakuraNodeSecretKey(key.to_hex()));
         Ok(())
     }
 
@@ -1200,9 +1176,12 @@ pub(crate) fn test_identity_dir() -> PathBuf {
 /// I/O failures are logged and downgraded to an ephemeral key for this run, so a
 /// read-only or full cache directory never prevents the node from starting.
 fn load_or_generate_zakura_secret_key(key_file: &Path) -> NodeSecretKey {
-    match read_zakura_secret_key(key_file) {
-        Ok(Some(secret_key)) => return secret_key,
-        Ok(None) => {}
+    match load_or_create_zakura_secret_key(key_file, FirstKeyWrite::AllowRenameFallback) {
+        Ok(key) => return key,
+        Err(error @ UnstableZakuraIdentityError::NotSaved { .. }) => {
+            warn!(%error, ?key_file, "using an ephemeral Zakura identity this run");
+            return NodeSecretKey::generate();
+        }
         Err(UnstableZakuraIdentityError::Unparsable { .. }) => warn!(
             ?key_file,
             "ignoring unparsable Zakura node secret key file; regenerating a new identity"
@@ -1251,6 +1230,77 @@ fn read_zakura_secret_key(
         .map_err(|_| UnstableZakuraIdentityError::Unparsable {
             path: key_file.to_path_buf(),
         })
+}
+
+#[derive(Clone, Copy)]
+enum FirstKeyWrite {
+    NoReplace,
+    AllowRenameFallback,
+}
+
+fn load_or_create_zakura_secret_key(
+    key_file: &Path,
+    first_write: FirstKeyWrite,
+) -> Result<NodeSecretKey, UnstableZakuraIdentityError> {
+    match read_zakura_secret_key(key_file)? {
+        Some(key) => Ok(key),
+        None => create_zakura_secret_key(key_file, first_write),
+    }
+}
+
+/// Installs a complete owner-only key file, or loads the key another startup installed.
+fn create_zakura_secret_key(
+    key_file: &Path,
+    first_write: FirstKeyWrite,
+) -> Result<NodeSecretKey, UnstableZakuraIdentityError> {
+    let key = NodeSecretKey::generate();
+    if install_new_zakura_secret_key(key_file, &key, first_write).map_err(|source| {
+        UnstableZakuraIdentityError::NotSaved {
+            path: key_file.to_path_buf(),
+            source,
+        }
+    })? {
+        return Ok(key);
+    }
+    // Another startup won, or the path is a dangling link. Never replace either.
+    read_zakura_secret_key(key_file)?.ok_or_else(|| UnstableZakuraIdentityError::Unreadable {
+        path: key_file.to_path_buf(),
+        source: io::Error::new(ErrorKind::NotFound, "the existing key file has no target"),
+    })
+}
+
+/// Publishes a fully written key. Returns false if the destination already exists.
+fn install_new_zakura_secret_key(
+    key_file: &Path,
+    key: &NodeSecretKey,
+    first_write: FirstKeyWrite,
+) -> io::Result<bool> {
+    let dir = key_file
+        .parent()
+        .expect("the identity file has a parent directory");
+    std::fs::create_dir_all(dir)?;
+    let mut temp = TempFile::new_in(dir, ".tmp.zakura-key.")?;
+    temp.as_file_mut().write_all(key.to_hex().as_bytes())?;
+    temp.as_file().sync_all()?;
+    let installed = match std::fs::hard_link(temp.path(), key_file) {
+        Ok(()) => true,
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => false,
+        // Ordinary nodes can still persist their key on volumes without hard links.
+        Err(error)
+            if matches!(first_write, FirstKeyWrite::AllowRenameFallback)
+                && matches!(
+                    error.kind(),
+                    ErrorKind::Unsupported | ErrorKind::PermissionDenied
+                ) =>
+        {
+            temp.persist(key_file)?;
+            true
+        }
+        Err(error) => return Err(error),
+    };
+    #[cfg(unix)]
+    std::fs::File::open(dir)?.sync_all()?;
+    Ok(installed)
 }
 
 /// Atomically writes `secret_key` to `key_file` as lowercase hex and restricts

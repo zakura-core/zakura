@@ -163,11 +163,11 @@ fn announcing_a_gateway_requires_a_key_that_survives_restarts() {
     config.network.p2p_stack = P2pStack::Dual;
     config.network.identity_dir = blocked;
 
-    StartCmd::ensure_miner_mesh_gateway_identity(&config)
+    StartCmd::network_config_for_start(&config)
         .expect("a node that does not announce may have no usable key file");
 
     config.mining.miner_mesh = true;
-    let error = StartCmd::ensure_miner_mesh_gateway_identity(&config)
+    let error = StartCmd::network_config_for_start(&config)
         .expect_err("a gateway must be able to keep its key");
     assert!(
         error
@@ -177,15 +177,26 @@ fn announcing_a_gateway_requires_a_key_that_survives_restarts() {
     );
 
     config.network.identity_dir = dir.path().join("identity");
-    StartCmd::ensure_miner_mesh_gateway_identity(&config)
+    let network = StartCmd::network_config_for_start(&config)
         .expect("a gateway with a writable key directory saves its key");
-    let saved_files = config
+    let persisted = config
         .network
-        .identity_dir
-        .read_dir()
-        .expect("the identity directory was created")
-        .count();
-    assert_eq!(saved_files, 1, "the new key is saved to one file");
+        .zakura_secret_key()
+        .expect("read the saved identity")
+        .public();
+    std::fs::rename(&config.network.identity_dir, dir.path().join("moved"))
+        .expect("move the identity directory before endpoint startup");
+    assert_eq!(
+        network
+            .zakura_secret_key()
+            .expect("load the endpoint identity")
+            .public(),
+        persisted
+    );
+    assert!(
+        !config.network.identity_dir.exists(),
+        "startup must not generate a replacement key"
+    );
 }
 
 #[test]

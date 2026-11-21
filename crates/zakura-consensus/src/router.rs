@@ -37,7 +37,7 @@ use zakura_rt::task::JoinHandle;
 use zakura_state as zs;
 
 use crate::{
-    block::{Request, SemanticBlockVerifier, VerifyBlockError},
+    block::{AnnouncementClaims, Request, SemanticBlockVerifier, VerifyBlockError},
     checkpoint::{CheckpointVerifier, VerifyCheckpointError},
     error::{BlockError, TransactionError},
     transaction, BoxError, Config,
@@ -538,13 +538,14 @@ where
 /// Block and transaction verification requests should be wrapped in a timeout,
 /// so that out-of-order and invalid requests do not hang indefinitely.
 /// See the [`router`](`crate::router`) module documentation for details.
-#[instrument(skip(state_service, transaction_state, mempool))]
+#[instrument(skip(state_service, transaction_state, mempool, announcement_claims))]
 async fn init_with_transaction_state<S, TransactionState, Mempool>(
     config: Config,
     network: &Network,
     mut state_service: S,
     transaction_state: TransactionState,
     mempool: oneshot::Receiver<Mempool>,
+    announcement_claims: Option<(AnnouncementClaims, zs::WatchReceiver<zs::NonFinalizedState>)>,
 ) -> (
     Buffer<Request, futures::future::BoxFuture<'static, Result<block::Hash, RouterError>>>,
     Buffer<
@@ -680,7 +681,10 @@ where
         "initializing block verifier router"
     );
 
-    let block = SemanticBlockVerifier::new(network, state_service.clone(), transaction.clone());
+    let mut block = SemanticBlockVerifier::new(network, state_service.clone(), transaction.clone());
+    if let Some((claims, chains)) = announcement_claims {
+        block = block.with_announcement_claims(claims, chains);
+    }
     let checkpoint = CheckpointVerifier::from_checkpoint_list(
         list,
         network,
@@ -730,16 +734,29 @@ where
     Mempool::Future: Send + 'static,
 {
     let transaction_state = state_service.clone();
-    init_with_transaction_state(config, network, state_service, transaction_state, mempool).await
+    init_with_transaction_state(
+        config,
+        network,
+        state_service,
+        transaction_state,
+        mempool,
+        None,
+    )
+    .await
 }
 
 /// Initializes verification and routes transaction read-only queries through `read_state_service`.
+///
+/// The block verifier ranks equal-work blocks by the claims in `announcement_claims`. Pass the
+/// table that header sync writes to and the committed chains published by the same state service.
 pub async fn init_with_read_state<S, R, Mempool>(
     config: Config,
     network: &Network,
     state_service: S,
     read_state_service: R,
     mempool: oneshot::Receiver<Mempool>,
+    announcement_claims: AnnouncementClaims,
+    committed_chains: zs::WatchReceiver<zs::NonFinalizedState>,
 ) -> (
     Buffer<Request, futures::future::BoxFuture<'static, Result<block::Hash, RouterError>>>,
     Buffer<
@@ -764,7 +781,15 @@ where
     Mempool::Future: Send + 'static,
 {
     let transaction_state = TransactionStateRouter::new(state_service.clone(), read_state_service);
-    init_with_transaction_state(config, network, state_service, transaction_state, mempool).await
+    init_with_transaction_state(
+        config,
+        network,
+        state_service,
+        transaction_state,
+        mempool,
+        Some((announcement_claims, committed_chains)),
+    )
+    .await
 }
 
 /// Parses the checkpoint list for `network` and `config`.

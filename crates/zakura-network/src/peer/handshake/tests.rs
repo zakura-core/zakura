@@ -1192,8 +1192,8 @@ async fn mutual_p2p_v2_selected_upgrade_skips_legacy_connection() {
 /// A peer's announcement of one block is traced under the peer's name. An `inv` that names
 /// several blocks answers a query, and one that names only transactions is not about a block,
 /// so neither is traced.
-#[tokio::test]
-async fn only_a_single_block_inv_is_traced_as_an_announcement() {
+#[test]
+fn only_a_single_block_inv_is_traced_as_an_announcement() {
     use crate::peer::gossip_trace::tests::test_trace;
 
     let blocks: Vec<_> = (1..=3).map(|byte| block::Hash([byte; 32])).collect();
@@ -1216,11 +1216,11 @@ async fn only_a_single_block_inv_is_traced_as_an_announcement() {
         register_inventory_status(
             Ok(message),
             connected_addr,
-            broadcast::channel(16).0,
-            AnnouncedBlocks::default(),
-            trace.for_peer(&connected_addr),
+            &broadcast::channel(16).0,
+            &AnnouncedBlocks::default(),
+            &mut Default::default(),
+            &trace.for_peer(&connected_addr),
         )
-        .await
         .expect("the filter passes the message through");
     }
 
@@ -1234,8 +1234,8 @@ async fn only_a_single_block_inv_is_traced_as_an_announcement() {
 /// Every inbound block `inv` records an announcement, whatever its shape, and `notfound`
 /// withdraws one. Unlike the inventory registry, this covers solicited multi-block `inv`s and
 /// connections without a transient address.
-#[tokio::test]
-async fn inbound_invs_record_announced_blocks() {
+#[test]
+fn inbound_invs_record_announced_blocks() {
     let blocks: Vec<_> = (1..=4).map(|byte| block::Hash([byte; 32])).collect();
     let transaction = InventoryHash::Tx(zakura_chain::transaction::Hash([9; 32]));
 
@@ -1278,11 +1278,11 @@ async fn inbound_invs_record_announced_blocks() {
         let returned = register_inventory_status(
             Ok(message.clone()),
             connected_addr,
-            broadcast::channel(16).0,
-            announced.clone(),
-            Default::default(),
+            &broadcast::channel(16).0,
+            &announced,
+            &mut Default::default(),
+            &Default::default(),
         )
-        .await
         .expect("the filter passes the message through");
         assert_eq!(returned, message);
         for block in &blocks {
@@ -1303,19 +1303,110 @@ async fn inbound_invs_record_announced_blocks() {
             transaction,
         ])),
         ConnectedAddr::new_inbound_direct(peer_addr(38233)),
-        broadcast::channel(16).0,
-        announced.clone(),
-        Default::default(),
+        &broadcast::channel(16).0,
+        &announced,
+        &mut Default::default(),
+        &Default::default(),
     )
-    .await
     .expect("the filter passes the message through");
     assert!(!announced.announced(blocks[0]));
     assert!(blocks[1..].iter().all(|block| announced.announced(*block)));
 }
 
+/// Only a single-block `inv` is an announcement, so only it reaches the hook. A multi-block
+/// `inv` answers a query, and a transaction `inv` is not about a block.
+#[test]
+fn only_a_single_block_inv_reaches_the_block_announcement_hook() {
+    let blocks: Vec<_> = (1..=3).map(|byte| block::Hash([byte; 32])).collect();
+    let transaction = InventoryHash::Tx(zakura_chain::transaction::Hash([9; 32]));
+    let (hook, announced) = recording_hook();
+    let mut block_announcements = hook.for_connection();
+
+    for message in [
+        Message::Inv(vec![InventoryHash::Block(blocks[0])]),
+        Message::Inv(
+            blocks[1..]
+                .iter()
+                .copied()
+                .map(InventoryHash::Block)
+                .collect(),
+        ),
+        Message::Inv(vec![transaction]),
+        Message::Inv(vec![InventoryHash::Block(blocks[1]), transaction]),
+        Message::GetData(vec![InventoryHash::Block(blocks[2])]),
+        Message::NotFound(vec![InventoryHash::Block(blocks[2])]),
+    ] {
+        register_inventory_status(
+            Ok(message),
+            ConnectedAddr::new_inbound_direct(peer_addr(38233)),
+            &broadcast::channel(16).0,
+            &AnnouncedBlocks::default(),
+            &mut block_announcements,
+            &Default::default(),
+        )
+        .expect("the filter passes the message through");
+    }
+
+    assert_eq!(*announced.lock().unwrap(), [blocks[0]]);
+}
+
+/// One connection hands the hook at most four announcements per two-second window, and each
+/// connection has its own allowance.
+#[tokio::test(start_paused = true)]
+async fn the_block_announcement_hook_is_limited_per_connection() {
+    let (hook, announced) = recording_hook();
+    let mut connection = hook.for_connection();
+    let announce = |connection: &mut ConnectionAnnouncements, byte: u8| {
+        register_inventory_status(
+            Ok(Message::Inv(vec![InventoryHash::Block(block::Hash(
+                [byte; 32],
+            ))])),
+            ConnectedAddr::new_isolated(),
+            &broadcast::channel(16).0,
+            &AnnouncedBlocks::default(),
+            connection,
+            &Default::default(),
+        )
+    };
+    let count = || announced.lock().unwrap().len();
+
+    for byte in 1..=5 {
+        announce(&mut connection, byte).expect("passed through");
+    }
+    assert_eq!(
+        count(),
+        4,
+        "the fifth announcement in the window does not reach the hook"
+    );
+
+    announce(&mut hook.for_connection(), 6).expect("passed through");
+    assert_eq!(count(), 5, "another connection has its own allowance");
+
+    tokio::time::advance(std::time::Duration::from_millis(1_999)).await;
+    announce(&mut connection, 7).expect("passed through");
+    assert_eq!(count(), 5, "the window has not ended");
+
+    tokio::time::advance(std::time::Duration::from_millis(1)).await;
+    for byte in 8..=12 {
+        announce(&mut connection, byte).expect("passed through");
+    }
+    assert_eq!(count(), 9, "a new window allows four more announcements");
+}
+
+/// A hook that records the hashes it is called with.
+fn recording_hook() -> (
+    BlockAnnouncementHook,
+    Arc<std::sync::Mutex<Vec<block::Hash>>>,
+) {
+    let announced = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = announced.clone();
+    let hook = BlockAnnouncementHook::new(move |hash| recorded.lock().unwrap().push(hash));
+    (hook, announced)
+}
+
 /// A body request contradicts only the requested blocks' earlier announcements.
-#[tokio::test]
-async fn body_requests_withdraw_only_requested_block_announcements() {
+#[test]
+fn body_requests_withdraw_only_requested_block_announcements() {
     let blocks = [block::Hash([41; 32]), block::Hash([42; 32])];
     let transaction = InventoryHash::Tx(zakura_chain::transaction::Hash([9; 32]));
     for connected_addr in [
@@ -1335,11 +1426,11 @@ async fn body_requests_withdraw_only_requested_block_announcements() {
             let returned = register_inventory_status(
                 Ok(message.clone()),
                 connected_addr,
-                broadcast::channel(16).0,
-                announced.clone(),
-                Default::default(),
+                &broadcast::channel(16).0,
+                &announced,
+                &mut Default::default(),
+                &Default::default(),
             )
-            .await
             .expect("the filter passes the request through");
             assert_eq!(returned, message);
             for hash in blocks {

@@ -3414,8 +3414,8 @@ async fn unusable_kx_groups_fail_at_bind() {
 }
 
 /// M3.6: `bind` injects nothing. Each socket's endpoint config is the
-/// production one, with no seed, and the TLS provider is rustls' ring
-/// default.
+/// production one, with no seed, and the TLS provider is the production
+/// one: rustls' ring provider with the hybrid group first.
 #[tokio::test]
 async fn bind_keeps_the_production_inputs() {
     let endpoint =

@@ -279,6 +279,10 @@ fn a_failed_random_source_fails_the_exchange() {
 /// Our group and graviola's independent X25519MLKEM768 agree on the secret
 /// in both directions, so the shares and the secret follow the standard
 /// layout and not only our own reading of it.
+///
+/// graviola refuses to run, with a panic, on a CPU without the features its
+/// assembly needs: AVX2, ADX and BMI1 on x86_64, and the AES, PMULL and SHA-2
+/// extensions on aarch64. Our own group has no such requirement.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[test]
 fn the_group_interoperates_with_graviola() {

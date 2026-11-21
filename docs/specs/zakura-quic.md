@@ -51,8 +51,8 @@ charges once TLS starts, and reports when the endpoint admitted a
 connection; it changes ADM-3 and API-4, and §17t lists each change. Version
 0.23 offers the hybrid key-exchange group X25519MLKEM768 ahead of ring's
 groups, so recorded traffic between two upgraded nodes stays secret from a
-later quantum computer; it changes DEP-2, TLS-9, ADM-1 and API-3, and adds
-§16 rows; §17u lists each change.
+later quantum computer; it changes DEP-2, TLS-9, ADM-1, API-3 and the OBS-1
+outcome counters, and adds §16 rows; §17u lists each change.
 
 ## 0. Conventions
 
@@ -1692,13 +1692,15 @@ Changed:
 - **TLS-9.** Adds X25519MLKEM768 ahead of ring's groups. ring stays the
   provider: rustls ships this group only with its aws-lc-rs provider, which
   builds a C library, and no pure-Rust provider supplies both the group
-  and the QUIC packet keys `quinn-proto` needs. The group is built here from ring's X25519 and
-  `libcrux-ml-kem`, and its combiner follows rustls' own. Both secrets go
-  into the keys, so a fault in the ML-KEM half can fail a handshake but
-  can't make one weaker than X25519. A peer without the group connects on
-  X25519, so there is no protocol version or configuration change, and
-  nothing requires the group. Authentication stays Ed25519: this protects
-  recorded traffic, not a handshake that a quantum computer attacks live.
+  and the QUIC packet keys `quinn-proto` needs. The group is built here
+  from ring's X25519 and `libcrux-ml-kem`, and its combiner follows rustls'
+  own. Both secrets go into the keys, so a break of ML-KEM, or a wrong
+  answer from its code, can fail a handshake but can't make one weaker than
+  X25519. A peer without
+  the group connects on X25519, so there is no protocol version or
+  configuration change, and nothing requires the group. Authentication
+  stays Ed25519: this protects recorded traffic, not a handshake that a
+  quantum computer attacks live.
 - **DEP-2.** Adds `libcrux-ml-kem` with only its `mlkem768` feature. It is
   Rust with no C, and it takes its randomness from the caller, so a
   simulation seeds it like the X25519 secrets.
@@ -1710,5 +1712,9 @@ Changed:
   hello that TLS rejects on its content now fails as a handshake.
   Suppressing the second answer would mean remembering answered attempts
   from sources nothing has validated, so the endpoint doesn't.
+- **OBS-1.** Says the `zakura.quic.incoming.*` counters count each
+  `Incoming`, so a two-datagram hello that isn't accepted counts twice.
+- **§4.** The introduction no longer says the profile reproduces Iroh 1.1
+  exactly: the key exchange now differs.
 - **§16.** Adds the rows for ML-KEM-768, the hybrid group, its fallback to
   X25519, its seeded form and two-datagram admission.

@@ -394,6 +394,25 @@ mod tests {
         );
     }
 
+    /// A listener that shares neither group the dialer sent a share for asks
+    /// again (a HelloRetryRequest). The dialer drops its hybrid exchange,
+    /// starts the group the listener named, and the handshake completes in
+    /// one more round trip.
+    #[test]
+    fn a_listener_with_another_group_is_reached_in_one_more_round_trip() {
+        let p256_only = |key: &NodeSecretKey| {
+            let groups = vec![rustls::crypto::ring::kx_group::SECP256R1];
+            TlsConfig::with_inputs(key, &EndpointInputs::default().kx_groups(groups)).unwrap()
+        };
+        assert_eq!(
+            handshake(TlsConfig::new, p256_only),
+            (
+                rustls::NamedGroup::secp256r1,
+                rustls::HandshakeKind::FullWithHelloRetryRequest
+            )
+        );
+    }
+
     /// TLS state like a release before the hybrid group: ring's own groups.
     fn ring_only(secret_key: &NodeSecretKey) -> TlsConfig {
         let groups = rustls::crypto::ring::default_provider().kx_groups;

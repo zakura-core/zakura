@@ -46,7 +46,8 @@ sha2 = { workspace = true }
 toml = { workspace = true }
 
 # An independent implementation of the hybrid key-exchange group, for the
-# interoperability test. graviola supports these two architectures only.
+# interoperability test. graviola supports these two architectures only, and
+# on them only CPUs with the features its assembly needs.
 [target.'cfg(any(target_arch = "x86_64", target_arch = "aarch64"))'.dev-dependencies]
 rustls-graviola = { workspace = true }
 

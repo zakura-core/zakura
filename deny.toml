@@ -11,7 +11,12 @@ version = 2
 yanked = "deny"
 # Advisory ignores are for transitive dependencies with no immediate safe upgrade in this branch.
 # Remove each ignore entry as the dependency chain is upgraded.
-ignore = []
+ignore = [
+    # proc-macro-error2 is unmaintained. Only libcrux-ml-kem's verification
+    # annotations reach it (core-models -> hax-lib 0.3.7), behind `cfg(hax)`,
+    # which no Zakura build sets. Remove when libcrux drops hax-lib 0.3.
+    "RUSTSEC-2026-0173",
+]
 
 # This section is considered when running `cargo deny check licenses`.
 # https://embarkstudios.github.io/cargo-deny/checks/licenses/cfg.html

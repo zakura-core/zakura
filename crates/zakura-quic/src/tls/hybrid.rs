@@ -2,8 +2,8 @@
 //!
 //! Both sides run X25519 and ML-KEM-768, and TLS derives the session keys
 //! from both secrets. The keys stay secret as long as either algorithm
-//! holds, so a flaw in the newer ML-KEM code can't make a connection weaker
-//! than X25519 alone.
+//! holds, so a break of ML-KEM, or a wrong answer from its newer code, can't
+//! make a connection weaker than X25519 alone.
 //!
 //! The layout is the one `draft-ietf-tls-ecdhe-mlkem` fixes for this group:
 //! each share and the secret are the ML-KEM part followed by the X25519

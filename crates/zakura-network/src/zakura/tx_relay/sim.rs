@@ -11,7 +11,7 @@ use zakura_chain::transaction::UnminedTxId;
 use zakura_node_services::mempool::port::PoolHandle;
 
 pub use super::wire::{
-    TxRelayMessage, INV_RATE, MAX_INV_ENTRIES, TX_RELAY_DATA_KIND, TX_RELAY_STATE_KIND,
+    TxRelayMessage, HAVE_RATE, MAX_HAVE_ENTRIES, TX_RELAY_DATA_KIND, TX_RELAY_STATE_KIND,
     TX_RELAY_STREAMS, ZAKURA_CAP_TX_RELAY,
 };
 use super::{
@@ -72,8 +72,8 @@ pub enum TxRelayEvent {
         /// What the session holds after it.
         state: SimState,
     },
-    /// An `Inv` went to the session's data writer.
-    InvSent {
+    /// A `Have` went to the session's data writer.
+    HaveSent {
         /// The session.
         session: u64,
         /// Its ids and sizes.
@@ -86,8 +86,8 @@ pub enum TxRelayEvent {
 pub enum Received {
     /// `Hello`.
     Hello,
-    /// `Inv`, with its ids and sizes.
-    Inv(Vec<(UnminedTxId, u32)>),
+    /// `Have`, with its ids and sizes.
+    Have(Vec<(UnminedTxId, u32)>),
     /// `GetTxs`.
     GetTxs(UnminedTxId),
     /// `Tx`, with the body's size.

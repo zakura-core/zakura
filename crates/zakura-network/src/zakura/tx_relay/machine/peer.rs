@@ -99,7 +99,7 @@ pub(crate) struct PeerState {
     pub(crate) submissions: Submissions,
     /// Ids this node announced to it and has not seen leave the pool, with
     /// the change-log position it announced them at, and which of them are
-    /// still queued for an `Inv`. Full ids.
+    /// still queued for a `Have`. Full ids.
     pub(crate) announced: Announced,
     /// The short ids of what it announced to us or supplied, oldest first,
     /// with the change-log position when it did, to skip adverts. A removal
@@ -197,8 +197,8 @@ impl PeerState {
 
     /// Records each of `ids`, given with its short id, as
     /// [`Self::mark_known`] does one. An advert of one still queued for an
-    /// `Inv` would go back to a peer that has it, so those are withdrawn, in
-    /// one pass over the queue however many an `Inv` names. One already
+    /// `Have` would go back to a peer that has it, so those are withdrawn, in
+    /// one pass over the queue however many a `Have` names. One already
     /// sent stays, so the peer may still request the id.
     pub(crate) fn mark_all_known(
         &mut self,
@@ -332,7 +332,7 @@ pub(crate) fn max_span() -> Duration {
 }
 
 /// The ids a node announced to one peer: when it announced each, and which
-/// are still queued for an `Inv` frame.
+/// are still queued for a `Have` frame.
 ///
 /// An announcement is queued when the machine decides it and sent when
 /// [`Announced::take`] puts it in a frame. Only a sent id is served. Every
@@ -355,7 +355,7 @@ impl Announced {
         self.at.get(id)
     }
 
-    /// Announces `id` at change-log position `seq`, queued for an `Inv`.
+    /// Announces `id` at change-log position `seq`, queued for a `Have`.
     pub(crate) fn insert(&mut self, id: UnminedTxId, seq: u64) {
         self.at.insert(id, seq);
         self.queued.insert(id);
@@ -381,12 +381,12 @@ impl Announced {
         self.at.iter()
     }
 
-    /// Whether `id` went out in an `Inv`.
+    /// Whether `id` went out in a `Have`.
     pub(crate) fn is_sent(&self, id: &UnminedTxId) -> bool {
         self.at.contains_key(id) && !self.queued.contains(id)
     }
 
-    /// How many announcements wait for an `Inv`.
+    /// How many announcements wait for a `Have`.
     pub(crate) fn queued(&self) -> usize {
         self.queued.len()
     }

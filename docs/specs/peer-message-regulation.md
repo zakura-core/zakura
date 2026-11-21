@@ -976,20 +976,20 @@ off by default. A node runs it only with the v2 stack and the pool core. The sou
 
 | Stream | Kind | Carries | Frame cap |
 |--------|------|---------|-----------|
-| Data | 9 | `Inv` (2) and `Tx` (4) | 2,000,000 bytes plus 4 KiB |
+| Data | 9 | `Have` (2) and `Tx` (4) | 2,000,000 bytes plus 4 KiB |
 | State | 10 | `Hello` (1), `GetTxs` (3) and `NotFound` (5) | 4 KiB |
 
 Haves sit behind data in one flow control, so a peer learns of new transactions only as fast as it
 drains bodies. Wants never wait behind uploads. A `GetTxs` is answered on either stream: `Tx` on
 the data stream, `NotFound` on the state stream. The two streams are not ordered with each other,
-so an `Inv` may arrive before the peer's `Hello`, and it is accepted.
+so a `Have` may arrive before the peer's `Hello`, and it is accepted.
 
 An exact transaction id is 64 bytes: the mined id, then the authorizing-data digest. A transaction
 before v5 carries 32 bytes of `0xFF` as its digest, as ZIP 239 defines for inventory.
 
 ```text
 MAX_TX_BYTES      = 2,000,000 bytes
-MAX_INV_ENTRIES   = 1,024
+MAX_HAVE_ENTRIES   = 1,024
 MAX_SERVES        = 16        requests this node serves at once, sent in its Hello, and the
                               most it asks of one peer at once
 ```
@@ -997,13 +997,13 @@ MAX_SERVES        = 16        requests this node serves at once, sent in its Hel
 | Message | Stream | Payload | Rule | Breach |
 |---------|--------|---------|------|--------|
 | `Hello` | State | requests served at once (`u16`), largest transaction accepted (`u32`) | First on the state stream, once. Served requests 1 to the table's maximum. Size at most `MAX_TX_BYTES`. | Close rows 4 and 5 |
-| `Inv` | Data | 1 to 1,024 entries, each an exact id and the serialized size (`u32`) | Well formed. Within the connection's `Inv` byte rate. | Close rows 2 and 3 |
+| `Have` | Data | 1 to 1,024 entries, each an exact id and the serialized size (`u32`) | Well formed. Within the connection's `Have` byte rate. | Close rows 2 and 3 |
 | `GetTxs` | State | one exact id | Sent only after the receiver's `Hello`. Within the requests that `Hello` serves. No id outstanding twice. The receiver counts a request it serves until it starts writing the `Tx`. One it answers `NotFound` takes no place, since that answer is queued at once. | Close rows 6 to 8 |
 | `Tx` | Data | the requested id, then the body | Answers a request outstanding to that peer, once. Exactly the announced size, at most the requester's limit, hashes to the id, and decodes as one transaction. | Close rows 9 to 12 |
 | `NotFound` | State | the requested id | Answers a request outstanding to that peer | Close row 9 |
 
-The sender serves an id only once it has queued an `Inv` carrying it on the data stream. The body
-then follows that `Inv` on the same ordered stream, so the peer always reads the `Inv` first. It
+The sender serves an id only once it has queued a `Have` carrying it on the data stream. The body
+then follows that `Have` on the same ordered stream, so the peer always reads the `Have` first. It
 answers `NotFound` for an id it never announced to that peer, or one its pool no longer holds. It
 never answers `NotFound`, and never closes a peer, because of its own load: a full queue makes it
 wait.
@@ -1021,7 +1021,7 @@ one breach that ends the session before the connection.
 | Row | Breach | Owner | Ends | Recorded cause |
 |-----|--------|-------|------|----------------|
 | 1 | A frame the stream's table rejects: a message type the stream does not carry, reserved flags, or a payload outside its row's sizes or past the frame cap | Transport frame filter | Connection | `ordered_read_rejected` |
-| 2 | `Inv` bytes past the connection's byte rate | Transport byte bucket | Connection | `ordered_byte_rate_overrun` |
+| 2 | `Have` bytes past the connection's byte rate | Transport byte bucket | Connection | `ordered_byte_rate_overrun` |
 | 3 | A payload that does not decode as its message | Session routine | Connection | `tx-relay: malformed frame` |
 | 4 | A second `Hello` in a session | Machine, `HelloTwice` | Connection | `tx-relay: protocol violation` |
 | 5 | A `Hello` outside the table's limits | Machine, `BadHello` | Connection | `tx-relay: protocol violation` |
@@ -1048,11 +1048,11 @@ charge.
   - `Hello`: capacity = 3, refill = 1 message / 300 seconds
   - on_empty = record and forward (exhaustion is not a violation)
 - **Byte rate**
-  - `Inv`: 256,000 payload bytes a second, an opening allowance of 544,000 bytes (8,000
+  - `Have`: 256,000 payload bytes a second, an opening allowance of 544,000 bytes (8,000
     entries) and a sender allowance of 512 KiB, all provisional. The receiver's depth adds the
     stream receive window this node granted on the connection.
   - The sender sends new ids at once and folds new ones into the frame it holds only while it
-    waits for the rate, so it batches only under load. It keeps one `Inv` unwritten at most,
+    waits for the rate, so it batches only under load. It keeps one `Have` unwritten at most,
     about 70 KB, which with 64 KiB of write-ahead keeps it within the allowance.
   - on_empty = close the connection (`ordered_byte_rate_overrun`), row 2
 - **Capacity**

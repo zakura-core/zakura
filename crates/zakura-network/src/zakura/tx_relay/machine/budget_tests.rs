@@ -11,7 +11,7 @@ use super::{
     CallId, Granted, Mail, Mirror, PeerKey, PeerMachine, RelayConfig, RelayEffect, RelayMachine,
     Shared, Unreserved, MAX_SERVES, NO_ROOM_FIRST, PENDING_CAP, PENDING_PER_PEER, PENDING_SHARE,
 };
-use crate::zakura::tx_relay::wire::MAX_INV_ENTRIES;
+use crate::zakura::tx_relay::wire::MAX_HAVE_ENTRIES;
 
 /// The number of sessions the bounds are for.
 const SESSIONS: u64 = 100;
@@ -50,7 +50,7 @@ fn refused_reserves_per_backoff_stay_within_those_in_flight_plus_the_probe() {
         let announced: Vec<(UnminedTxId, u32)> = (first..first + 5)
             .map(|n| (body(n, script).id(), SIZE))
             .collect();
-        machine.inv(session, &announced, now);
+        machine.have(session, &announced, now);
     }
     let in_flight = reserves(&machine.take_effects());
     assert!(!in_flight.is_empty(), "the sessions reserve");
@@ -130,7 +130,7 @@ fn a_full_load_keeps_its_budgets_and_its_state_bounded() {
     for peer in 0..SESSIONS {
         let session = machine.connect(PeerKey(peer), false, now);
         machine.hello(session, hello(), now);
-        machine.inv(session, &ids, now);
+        machine.have(session, &ids, now);
         sessions.push(session);
     }
     // The first sessions fill the node-wide cap, and the rest hold their
@@ -155,7 +155,7 @@ fn a_full_load_keeps_its_budgets_and_its_state_bounded() {
         .map(|n| {
             let peer = SESSIONS + u64::try_from(n).expect("small");
             let session = machine.connect(PeerKey(peer), false, now);
-            machine.inv(session, &ids, now);
+            machine.have(session, &ids, now);
             session
         })
         .collect();
@@ -175,7 +175,7 @@ fn a_full_load_keeps_its_budgets_and_its_state_bounded() {
     let mut late = Vec::new();
     for n in 0..SESSIONS {
         let session = machine.connect(PeerKey(2 * SESSIONS + n), false, now);
-        machine.inv(session, &ids, now);
+        machine.have(session, &ids, now);
         machine.hello(session, hello(), now);
         late.push(session);
     }
@@ -328,14 +328,14 @@ fn interleaved_full_pools_leave_every_id_a_source() {
     let sessions: Vec<_> = (0..92)
         .map(|peer| machine.connect(PeerKey(peer), false, now))
         .collect();
-    for (frame, chunk) in ids.chunks(MAX_INV_ENTRIES).enumerate() {
+    for (frame, chunk) in ids.chunks(MAX_HAVE_ENTRIES).enumerate() {
         if frame == 2 {
             for session in &sessions {
                 machine.hello(*session, hello(), now);
             }
         }
         for session in &sessions {
-            machine.inv(*session, chunk, now);
+            machine.have(*session, chunk, now);
         }
     }
     assert!(machine.shared.pending >= PENDING_CAP, "the cap filled");
@@ -363,7 +363,7 @@ fn a_decided_reference_counts_until_its_session_drops_it() {
     let now = Duration::ZERO;
     let mut holder = PeerMachine::connect(&mut shared, &pool, PeerKey(1), now);
     holder.hello(&mut shared, &pool, hello(), now);
-    holder.inv(&mut shared, &pool, &ids, now);
+    holder.have(&mut shared, &pool, &ids, now);
     assert_eq!(shared.pending, ids.len());
 
     for (id, _) in &ids {
@@ -407,7 +407,7 @@ fn late_readers_keep_first_sources_within_twice_the_cap() {
             (0..per).map(|n| (plain_id(peer * per + n), SIZE)).collect();
         let mut holder = PeerMachine::connect(&mut shared, &pool, PeerKey(peer), now);
         holder.hello(&mut shared, &pool, hello(), now);
-        holder.inv(&mut shared, &pool, &ids, now);
+        holder.have(&mut shared, &pool, &ids, now);
         // Its ids are decided before it reads the ring.
         for (id, _) in &ids {
             if let Some(entry) = shared.wanted.entry(*id) {
@@ -443,7 +443,7 @@ fn the_go_counts_the_ids_it_takes_in() {
     first.hello(&mut shared, &pool, hello(), now);
     let mut second = PeerMachine::connect(&mut shared, &pool, PeerKey(1), now);
     second.hello(&mut shared, &pool, hello(), now);
-    second.inv(&mut shared, &pool, &ids, now);
+    second.have(&mut shared, &pool, &ids, now);
     assert_eq!(second.state.waiting.len(), ids.len(), "it waits for the go");
 
     first.end_session(&mut shared);

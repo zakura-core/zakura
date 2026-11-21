@@ -36,7 +36,7 @@ use zakura_chain::{
 };
 use zakura_network::{
     zakura::{
-        tx_relay_sim::{tx_relay_service_observed, TxRelayObserver, INV_RATE, TX_RELAY_STREAMS},
+        tx_relay_sim::{tx_relay_service_observed, TxRelayObserver, HAVE_RATE, TX_RELAY_STREAMS},
         CloseRow, MayCool, Service, ZakuraLocalLimits,
     },
     Config,
@@ -187,7 +187,7 @@ impl Default for RelayScenario {
 /// block sync's congestion window and the default stream window cut to
 /// 1 MiB, and the QUIC idle timeout past a park. Block sync doesn't run
 /// here, but the largest kind's share sets every stream's receive window,
-/// which is the bulk of the `Inv` bucket's depth.
+/// which is the bulk of the `Have` bucket's depth.
 pub fn node_config() -> Config {
     let mut config = Config {
         network: Network::new_regtest(Default::default()),
@@ -201,11 +201,11 @@ pub fn node_config() -> Config {
     config
 }
 
-/// The `Inv` byte bucket depth the node keeps for each connection: the
+/// The `Have` byte bucket depth the node keeps for each connection: the
 /// row's receiver depth over the stream receive window its limits set.
-pub fn inv_depth(config: &Config) -> u64 {
+pub fn have_depth(config: &Config) -> u64 {
     let limits = ZakuraLocalLimits::from_config(config);
-    INV_RATE.receiver_depth(u64::from(limits.quic.stream_receive_window_bytes))
+    HAVE_RATE.receiver_depth(u64::from(limits.quic.stream_receive_window_bytes))
 }
 
 /// The test pool's state: the bodies it admitted and the decisions it owes.
@@ -433,7 +433,7 @@ fn spawn(sim: &mut Sim, scenario: &RelayScenario, evidence: SharedRelay) -> TxRe
     let shared_ids = tap.shared_ids();
     sim.add_source(Box::new(tap));
     let config = node_config();
-    let depth = inv_depth(&config);
+    let depth = have_depth(&config);
     let relay: TxRelayObserver = {
         let evidence = Arc::clone(&evidence);
         Arc::new(move |event| lock(&evidence).step(event))
@@ -477,7 +477,7 @@ fn spawn(sim: &mut Sim, scenario: &RelayScenario, evidence: SharedRelay) -> TxRe
             order: net.order(),
             failure: failure.clone(),
             evidence: Arc::clone(&evidence),
-            inv_depth: depth,
+            have_depth: depth,
         };
         sim.scheduler().spawn_root("peer", task.run());
     }
@@ -716,7 +716,7 @@ const WAIT: RelayStep = RelayStep::Wait { secs: 1 };
 pub const ROW_WITNESSES: [RowWitness; 8] = [
     RowWitness {
         row: CloseRow::RELAY_CLOSE_3,
-        witness: || row_prefix(Answer::Serve, HelloMode::First, &[RelayStep::MalformedInv]),
+        witness: || row_prefix(Answer::Serve, HelloMode::First, &[RelayStep::MalformedHave]),
         twin: || {
             row_prefix(
                 Answer::Serve,

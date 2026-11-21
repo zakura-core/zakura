@@ -4,14 +4,14 @@
 //!
 //! A peer sends its `Hello` as its [`HelloMode`] says, answers each of the
 //! node's `GetTxs` as its [`Answer`] says, and runs its steps one after
-//! another. Its `Inv`s pay its own byte bucket, as a conformant sender's
+//! another. Its `Have`s pay its own byte bucket, as a conformant sender's
 //! do. No step floods them past the node's bucket: the node refills that
 //! bucket while it reads a flood, by an amount the run's schedule sets, so
 //! no peer can tell which frame overran it.
 //!
 //! Every frame a peer writes is labelled before the write, as the header
 //! and discovery peers' are: the frame model over the stream's rows for the
-//! header, a model of the node's `Inv` byte bucket for the metered row, the
+//! header, a model of the node's `Have` byte bucket for the metered row, the
 //! cadence model for each row with a cadence, and `tx-relay`'s own rules
 //! for the content. The node keeps one cadence bucket per row for the
 //! whole connection, so the peer's model survives a reopen too. A content fault also names the
@@ -37,7 +37,7 @@ use serde::{Deserialize, Serialize};
 use zakura_chain::transaction::{Hash, UnminedTxId};
 use zakura_network::zakura::{
     tx_relay_sim::{
-        TxRelayMessage, INV_RATE, KNOWN_CAP, MAX_INV_ENTRIES, MAX_SERVES, MAX_TX_BYTES,
+        TxRelayMessage, HAVE_RATE, KNOWN_CAP, MAX_HAVE_ENTRIES, MAX_SERVES, MAX_TX_BYTES,
         PENDING_PER_PEER, TX_RELAY_DATA_KIND, TX_RELAY_STATE_KIND, TX_RELAY_STREAMS,
         ZAKURA_CAP_TX_RELAY,
     },
@@ -126,8 +126,8 @@ pub enum RelayRow {
     GetTxs,
     /// `NotFound`, on the state stream.
     NotFound,
-    /// `Inv`, on the data stream.
-    Inv,
+    /// `Have`, on the data stream.
+    Have,
     /// `Tx`, on the data stream.
     Tx,
 }
@@ -138,13 +138,13 @@ impl RelayRow {
         RelayRow::Hello,
         RelayRow::GetTxs,
         RelayRow::NotFound,
-        RelayRow::Inv,
+        RelayRow::Have,
         RelayRow::Tx,
     ];
 
     /// Whether it travels on the data stream.
     pub fn on_data(self) -> bool {
-        matches!(self, RelayRow::Inv | RelayRow::Tx)
+        matches!(self, RelayRow::Have | RelayRow::Tx)
     }
 }
 
@@ -210,8 +210,8 @@ pub enum RelayStep {
     },
     /// A `NotFound` for an id the node never asked for: row 9.
     UnrequestedNotFound,
-    /// An `Inv` whose count promises more entries than it carries: row 3.
-    MalformedInv,
+    /// A `Have` whose count promises more entries than it carries: row 3.
+    MalformedHave,
     /// A frame of `row` whose header breaks the table.
     HeaderFault {
         /// The row.
@@ -266,7 +266,7 @@ impl RelayStep {
         RelayStep::BadHello,
         RelayStep::UnrequestedTx { tx: 0 },
         RelayStep::UnrequestedNotFound,
-        RelayStep::MalformedInv,
+        RelayStep::MalformedHave,
         RelayStep::UndeclaredType { data: true },
         RelayStep::UndeclaredType { data: false },
         RelayStep::RequestTwice,
@@ -282,9 +282,9 @@ impl RelayStep {
         header_fault(RelayRow::NotFound, HeaderFault::ReservedFlags),
         header_fault(RelayRow::NotFound, HeaderFault::ShortPayload),
         header_fault(RelayRow::NotFound, HeaderFault::LongPayload),
-        header_fault(RelayRow::Inv, HeaderFault::ReservedFlags),
-        header_fault(RelayRow::Inv, HeaderFault::ShortPayload),
-        header_fault(RelayRow::Inv, HeaderFault::LongPayload),
+        header_fault(RelayRow::Have, HeaderFault::ReservedFlags),
+        header_fault(RelayRow::Have, HeaderFault::ShortPayload),
+        header_fault(RelayRow::Have, HeaderFault::LongPayload),
         header_fault(RelayRow::Tx, HeaderFault::ReservedFlags),
         header_fault(RelayRow::Tx, HeaderFault::ShortPayload),
         header_fault(RelayRow::Tx, HeaderFault::LongPayload),
@@ -361,8 +361,8 @@ pub(crate) struct RelayPeer {
     pub(crate) failure: PeerFailure,
     /// The run's ledger of broken rows and node frames.
     pub(crate) evidence: SharedRelay,
-    /// The node's `Inv` byte bucket depth on a connection.
-    pub(crate) inv_depth: u64,
+    /// The node's `Have` byte bucket depth on a connection.
+    pub(crate) have_depth: u64,
 }
 
 /// The QUIC receive windows a peer grants, the smallest QUIC allows, so a
@@ -564,10 +564,10 @@ impl Out {
 /// What one connection keeps across its sessions.
 struct Connection {
     remote: Remote,
-    /// The peer's own `Inv` bucket, which every session on the connection
+    /// The peer's own `Have` bucket, which every session on the connection
     /// pays, as the node's does.
     sender: Bucket,
-    /// A model of the node's receiving bucket for the peer's `Inv`s.
+    /// A model of the node's receiving bucket for the peer's `Have`s.
     receiver: Bucket,
     /// A model of the node's cadence buckets, which every session on the
     /// connection pays.
@@ -793,11 +793,15 @@ impl RelayPeer {
         let Some(mut session) = self.open_session(conn, 0, &events).await else {
             return;
         };
-        let rate = u64::from(INV_RATE.bytes_per_second);
+        let rate = u64::from(HAVE_RATE.bytes_per_second);
         let mut connection = Connection {
             remote,
-            sender: Bucket::new(u64::from(INV_RATE.opening_allowance), rate, opened),
-            receiver: Bucket::new(self.inv_depth, INV_RATE.receiver_bytes_per_second(), opened),
+            sender: Bucket::new(u64::from(HAVE_RATE.opening_allowance), rate, opened),
+            receiver: Bucket::new(
+                self.have_depth,
+                HAVE_RATE.receiver_bytes_per_second(),
+                opened,
+            ),
             cadence: CadenceModel::new(),
             asked: VecDeque::new(),
             next_answer: Duration::ZERO,
@@ -830,7 +834,7 @@ impl RelayPeer {
             let admitted = reopen_at.is_none() && session.node_hellos > 0;
             if admitted {
                 if !self.answer(&mut session, &mut connection, at).await
-                    || !self.pace_inv(&mut session, &mut connection, at).await
+                    || !self.pace_have(&mut session, &mut connection, at).await
                 {
                     return;
                 }
@@ -904,7 +908,7 @@ impl RelayPeer {
             if !connection.asked.is_empty() && self.spec.answer != Answer::Never {
                 wake = wake.min(connection.next_answer);
             }
-            if let Some(bytes) = self.next_inv_bytes(connection) {
+            if let Some(bytes) = self.next_have_bytes(connection) {
                 let at = now();
                 wake = wake.min(connection.sender.ready_at(bytes, at));
             } else {
@@ -983,7 +987,7 @@ impl RelayPeer {
                 }
                 connection.asked.push_back(id);
             }
-            TxRelayMessage::Inv(entries) => {
+            TxRelayMessage::Have(entries) => {
                 for (id, _) in entries {
                     if session.told.insert(TxKey(id)) {
                         session.announced.push_back(id);
@@ -1080,20 +1084,20 @@ impl RelayPeer {
             && (state.is_empty() || self.write_all(connection, &mut session.state, state).await)
     }
 
-    /// The payload bytes of the next paced `Inv`, if one waits.
-    fn next_inv_bytes(&self, connection: &Connection) -> Option<u64> {
-        let entries = connection.to_announce.len().min(MAX_INV_ENTRIES);
-        (entries > 0).then(|| inv_bytes(entries))
+    /// The payload bytes of the next paced `Have`, if one waits.
+    fn next_have_bytes(&self, connection: &Connection) -> Option<u64> {
+        let entries = connection.to_announce.len().min(MAX_HAVE_ENTRIES);
+        (entries > 0).then(|| have_bytes(entries))
     }
 
-    /// Sends the next paced `Inv` if its bucket pays for it.
-    async fn pace_inv(
+    /// Sends the next paced `Have` if its bucket pays for it.
+    async fn pace_have(
         &self,
         session: &mut Session,
         connection: &mut Connection,
         at: Duration,
     ) -> bool {
-        let Some(bytes) = self.next_inv_bytes(connection) else {
+        let Some(bytes) = self.next_have_bytes(connection) else {
             return true;
         };
         if !connection.sender.try_pay(bytes, at) {
@@ -1102,11 +1106,11 @@ impl RelayPeer {
         // The node's bucket is at least as deep and refills faster, so a
         // paced frame always fits it.
         connection.receiver.try_pay(bytes, at);
-        let take = connection.to_announce.len().min(MAX_INV_ENTRIES);
+        let take = connection.to_announce.len().min(MAX_HAVE_ENTRIES);
         let entries: Vec<(UnminedTxId, u32)> = connection.to_announce.drain(..take).collect();
         connection.announced.extend(entries.iter().copied());
-        let inv = TxRelayMessage::Inv(entries);
-        self.write_all(connection, &mut session.data, vec![Out::conformant(&inv)])
+        let have = TxRelayMessage::Have(entries);
+        self.write_all(connection, &mut session.data, vec![Out::conformant(&have)])
             .await
     }
 
@@ -1242,15 +1246,15 @@ impl RelayPeer {
                     )],
                 )
             }
-            RelayStep::MalformedInv => {
+            RelayStep::MalformedHave => {
                 let ids = [self.fresh(connection), self.fresh(connection)];
                 let mut out = Out::breaking(
-                    &TxRelayMessage::Inv(ids.iter().map(|id| (*id, FAKE_SIZE)).collect()),
+                    &TxRelayMessage::Have(ids.iter().map(|id| (*id, FAKE_SIZE)).collect()),
                     Label::BadContent,
                     CloseRow::RELAY_CLOSE_3,
                 );
                 // Drops the last entry, which the count still promises.
-                let entry = inv_bytes(2) - inv_bytes(1);
+                let entry = have_bytes(2) - have_bytes(1);
                 let keep = out.payload.len() - usize::try_from(entry).unwrap_or(0);
                 out.payload.truncate(keep);
                 out.header.payload_len = out.payload.len();
@@ -1268,7 +1272,7 @@ impl RelayPeer {
                     },
                     RelayRow::GetTxs => TxRelayMessage::GetTxs(id),
                     RelayRow::NotFound => TxRelayMessage::NotFound(id),
-                    RelayRow::Inv => TxRelayMessage::Inv(vec![(id, FAKE_SIZE)]),
+                    RelayRow::Have => TxRelayMessage::Have(vec![(id, FAKE_SIZE)]),
                     RelayRow::Tx => TxRelayMessage::Tx {
                         id: self.bodies[0].0,
                         body: self.bodies[0].1.clone(),
@@ -1376,11 +1380,11 @@ fn stream_of(row: RelayRow) -> u16 {
     }
 }
 
-/// The payload bytes of an `Inv` of `entries` entries.
-fn inv_bytes(entries: usize) -> u64 {
+/// The payload bytes of a `Have` of `entries` entries.
+fn have_bytes(entries: usize) -> u64 {
     let entry = (UnminedTxId::from_legacy_id(Hash([0; 32])), FAKE_SIZE);
-    let frame = encode_frame(&TxRelayMessage::Inv(vec![entry; entries]))
-        .expect("an Inv within its row encodes");
+    let frame = encode_frame(&TxRelayMessage::Have(vec![entry; entries]))
+        .expect("a Have within its row encodes");
     frame.payload.len() as u64
 }
 

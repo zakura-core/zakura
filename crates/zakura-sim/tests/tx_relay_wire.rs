@@ -325,7 +325,7 @@ fn submitted(body: UnminedTxId, cooling: bool) -> Vec<TxRelayEvent> {
     vec![
         opened(false),
         received(Received::Hello),
-        received(Received::Inv(vec![(tx(1), 100)])),
+        received(Received::Have(vec![(tx(1), 100)])),
         stepped(vec![SimEffect::Ask(tx(1))], SimState::default()),
         received(Received::Tx {
             id: tx(1),
@@ -420,7 +420,7 @@ fn hello_first_breaks_in_its_bypass() {
         HELLO_FIRST,
         vec![
             opened(false),
-            received(Received::Inv(vec![(tx(1), 100)])),
+            received(Received::Have(vec![(tx(1), 100)])),
             stepped(vec![SimEffect::Ask(tx(1))], SimState::default()),
         ],
     );
@@ -447,7 +447,7 @@ fn announce_after_admission_breaks_in_its_bypass() {
         ANNOUNCE_AFTER_ADMISSION,
         vec![
             opened(false),
-            TxRelayEvent::InvSent {
+            TxRelayEvent::HaveSent {
                 session: 1,
                 entries: vec![(tx(1), 100)],
             },
@@ -515,8 +515,8 @@ fn each_neutral_close_closes_in_its_witness() {
 /// The generated IDs no `tx-relay` scenario reaches, each with why.
 const UNREACHED: [(&str, &str); 5] = [
     (
-        "tx-relay/s9v1/inv/over-rate-closes",
-        "no peer floods: it can't tell which Inv overran the node's bucket",
+        "tx-relay/s9v1/have/over-rate-closes",
+        "no peer floods: it can't tell which Have overran the node's bucket",
     ),
     (
         "tx-relay/s10v1/get-txs/over-margin-closes",

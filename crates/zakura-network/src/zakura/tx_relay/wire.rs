@@ -1,7 +1,7 @@
 //! `tx-relay`'s wire: two streams behind one capability bit, and five
 //! messages.
 //!
-//! The data stream carries `Inv` and `Tx`, so a peer learns of new
+//! The data stream carries `Have` and `Tx`, so a peer learns of new
 //! transactions only as fast as it drains bodies. The state stream carries
 //! `Hello`, `GetTxs` and `NotFound`, so this node's wants never wait behind
 //! its uploads. A `GetTxs` is answered on either stream: `Tx` on the data
@@ -23,7 +23,7 @@ use crate::zakura::{
 /// Capability bit for `tx-relay`.
 pub const ZAKURA_CAP_TX_RELAY: u64 = 1 << 11;
 
-/// The data stream's kind: `Inv` and `Tx`.
+/// The data stream's kind: `Have` and `Tx`.
 pub const TX_RELAY_DATA_KIND: u16 = 9;
 
 /// The state stream's kind: `Hello`, `GetTxs` and `NotFound`.
@@ -32,8 +32,8 @@ pub const TX_RELAY_STATE_KIND: u16 = 10;
 /// The protocol's largest transaction, in bytes.
 pub(crate) const MAX_TX_BYTES: u32 = 2_000_000;
 
-/// Most ids one `Inv` carries.
-pub const MAX_INV_ENTRIES: usize = 1_024;
+/// Most ids one `Have` carries.
+pub const MAX_HAVE_ENTRIES: usize = 1_024;
 
 /// The `Tx` frame that serves `transaction` as `id`, serialized straight
 /// into the frame, so the body exists once. `None` if it does not encode
@@ -59,9 +59,9 @@ pub(crate) fn tx_frame(id: UnminedTxId, transaction: &UnminedTx) -> Option<Frame
     })
 }
 
-/// The most payload bytes an `Inv` of `entries` ids takes: a count of at
+/// The most payload bytes a `Have` of `entries` ids takes: a count of at
 /// most 3 bytes, then 68 bytes for each id and its size.
-pub(crate) const fn inv_payload_bound(entries: usize) -> usize {
+pub(crate) const fn have_payload_bound(entries: usize) -> usize {
     3 + entries * 68
 }
 
@@ -76,7 +76,7 @@ const LEGACY_AUTH_DIGEST: [u8; 32] = [0xFF; 32];
 /// Frame message types.
 mod message_type {
     pub(super) const HELLO: u16 = 1;
-    pub(super) const INV: u16 = 2;
+    pub(super) const HAVE: u16 = 2;
     pub(super) const GET_TXS: u16 = 3;
     pub(super) const TX: u16 = 4;
     pub(super) const NOT_FOUND: u16 = 5;
@@ -153,9 +153,9 @@ impl Wire for TxBody {
 /// `Hello`: requests the sender serves at once, and its largest transaction.
 type HelloPayload = (LeU16, LeU32);
 /// One announced id and its serialized size.
-type InvEntry = (TxIdItem, LeU32);
-/// `Inv`: 1 to 1,024 announced ids.
-type InvPayload = List<InvEntry, 1, MAX_INV_ENTRIES>;
+type HaveEntry = (TxIdItem, LeU32);
+/// `Have`: 1 to 1,024 announced ids.
+type HavePayload = List<HaveEntry, 1, MAX_HAVE_ENTRIES>;
 /// `Tx`: the requested id, then its body.
 type TxPayload = (TxIdItem, TxBody);
 
@@ -174,21 +174,21 @@ const HELLO: MessageRule = MessageRule {
     },
 };
 
-/// `Inv`'s byte rate: 256 KB a second, about 3,800 ids, far above Zcash's
+/// `Have`'s byte rate: 256 KB a second, about 3,800 ids, far above Zcash's
 /// transaction rate. A sender opens with 8,000 entries and holds at most
 /// 512 KiB of paid frames unwritten. *Provisional.*
-pub const INV_RATE: ByteRate = ByteRate {
+pub const HAVE_RATE: ByteRate = ByteRate {
     bytes_per_second: 256_000,
     opening_allowance: 8_000 * 68,
     sender_allowance: 512 * 1024,
 };
 
-/// `Inv`: charged by payload bytes at [`INV_RATE`].
-const INV: MessageRule = MessageRule {
-    name: "inv",
-    message_type: message_type::INV,
-    payload: PayloadLen::of::<InvPayload>(),
-    role: MessageRole::Metered { rate: INV_RATE },
+/// `Have`: charged by payload bytes at [`HAVE_RATE`].
+const HAVE: MessageRule = MessageRule {
+    name: "have",
+    message_type: message_type::HAVE,
+    payload: PayloadLen::of::<HavePayload>(),
+    role: MessageRole::Metered { rate: HAVE_RATE },
 };
 
 /// `GetTxs`: one exact id. A peer may have as many outstanding as this
@@ -231,13 +231,13 @@ const DATA_FRAME_CAP: u32 = MAX_TX_BYTES + 4 * 1024;
 
 /// Bytes one session holds for the transport outside its output gate: a
 /// served `Tx`, built at its full size before it waits for its output
-/// grant, and one unwritten `Inv`, whose frame is guarded and skips the
-/// gate. A `Tx` is built in a buffer of its exact size. An `Inv` is encoded
+/// grant, and one unwritten `Have`, whose frame is guarded and skips the
+/// gate. A `Tx` is built in a buffer of its exact size. A `Have` is encoded
 /// in a buffer that grows by doubling, so it is counted at twice its bound.
 /// The node envelope counts them for each connection.
 // Widening `u32` and `usize` to `u64` is lossless on supported targets.
 pub(crate) const SESSION_HELD_OUTPUT_BYTES: u64 =
-    DATA_FRAME_CAP as u64 + 2 * inv_payload_bound(MAX_INV_ENTRIES) as u64;
+    DATA_FRAME_CAP as u64 + 2 * have_payload_bound(MAX_HAVE_ENTRIES) as u64;
 
 /// The state stream's frame cap.
 const STATE_FRAME_CAP: u32 = 4 * 1024;
@@ -266,8 +266,8 @@ pub const TX_RELAY_STREAMS: [Stream; 2] = [
         version: 1,
         frame_cap: DATA_FRAME_CAP,
         capability: ZAKURA_CAP_TX_RELAY,
-        messages: Some(&[INV, TX]),
-        // A small outbound queue keeps paid-for `Inv` bytes close to the
+        messages: Some(&[HAVE, TX]),
+        // A small outbound queue keeps paid-for `Have` bytes close to the
         // wire.
         queue_depths: Some(StreamQueueDepths {
             inbound: 16,
@@ -302,7 +302,7 @@ pub enum TxRelayMessage {
         max_tx_bytes: u32,
     },
     /// Announced ids with their serialized sizes.
-    Inv(Vec<(UnminedTxId, u32)>),
+    Have(Vec<(UnminedTxId, u32)>),
     /// A request for one exact id.
     GetTxs(UnminedTxId),
     /// The requested id and its body.
@@ -321,7 +321,7 @@ impl TxRelayMessage {
     #[cfg(test)]
     pub(crate) fn stream_kind(&self) -> u16 {
         match self {
-            Self::Inv(_) | Self::Tx { .. } => TX_RELAY_DATA_KIND,
+            Self::Have(_) | Self::Tx { .. } => TX_RELAY_DATA_KIND,
             Self::Hello { .. } | Self::GetTxs(_) | Self::NotFound(_) => TX_RELAY_STATE_KIND,
         }
     }
@@ -329,12 +329,12 @@ impl TxRelayMessage {
 
 impl WireMessage for TxRelayMessage {
     type Error = WireError;
-    const RULES: &'static [MessageRule] = &[HELLO, INV, GET_TXS, TX, NOT_FOUND];
+    const RULES: &'static [MessageRule] = &[HELLO, HAVE, GET_TXS, TX, NOT_FOUND];
 
     fn message_type(&self) -> u16 {
         match self {
             Self::Hello { .. } => message_type::HELLO,
-            Self::Inv(_) => message_type::INV,
+            Self::Have(_) => message_type::HAVE,
             Self::GetTxs(_) => message_type::GET_TXS,
             Self::Tx { .. } => message_type::TX,
             Self::NotFound(_) => message_type::NOT_FOUND,
@@ -347,7 +347,7 @@ impl WireMessage for TxRelayMessage {
                 serves,
                 max_tx_bytes,
             } => HelloPayload::encode(&(*serves, *max_tx_bytes), out),
-            Self::Inv(entries) => InvPayload::encode(entries, out),
+            Self::Have(entries) => HavePayload::encode(entries, out),
             Self::GetTxs(id) | Self::NotFound(id) => TxIdItem::encode(id, out),
             Self::Tx { id, body } => {
                 TxIdItem::encode(id, out)?;
@@ -368,7 +368,7 @@ impl WireMessage for TxRelayMessage {
                     max_tx_bytes,
                 }
             }
-            message_type::INV => Self::Inv(reader.read::<InvPayload>()?),
+            message_type::HAVE => Self::Have(reader.read::<HavePayload>()?),
             message_type::GET_TXS => Self::GetTxs(reader.read::<TxIdItem>()?),
             message_type::TX => {
                 let (id, body) = reader.read::<TxPayload>()?;
@@ -381,7 +381,7 @@ impl WireMessage for TxRelayMessage {
 
     fn max_heap_bytes(message_type: u16, payload_len: usize) -> usize {
         match message_type {
-            message_type::INV => InvPayload::max_heap_bytes(payload_len),
+            message_type::HAVE => HavePayload::max_heap_bytes(payload_len),
             message_type::TX => TxPayload::max_heap_bytes(payload_len),
             _ => 0,
         }

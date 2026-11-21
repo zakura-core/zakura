@@ -3,7 +3,7 @@
 use proptest::prelude::*;
 use zakura_chain::transaction::{AuthDigest, Hash, UnminedTxId, WtxId};
 
-use super::wire::{TxRelayMessage, MAX_INV_ENTRIES, MAX_TX_BYTES, TX_RELAY_STREAMS};
+use super::wire::{TxRelayMessage, MAX_HAVE_ENTRIES, MAX_TX_BYTES, TX_RELAY_STREAMS};
 use crate::zakura::{
     wire_codec::{
         message_suite::{check_layout_carries_family, message_suite, MessageSample, Violation},
@@ -56,9 +56,9 @@ impl MessageSample for TxRelayMessage {
                 serves: 1,
                 max_tx_bytes: MAX_TX_BYTES,
             },
-            Self::Inv(vec![(legacy(1), 300)]),
-            Self::Inv(
-                (0..MAX_INV_ENTRIES)
+            Self::Have(vec![(legacy(1), 300)]),
+            Self::Have(
+                (0..MAX_HAVE_ENTRIES)
                     .map(|n| (witnessed(u8::try_from(n % 250).unwrap()), 1_000))
                     .collect(),
             ),
@@ -82,7 +82,7 @@ impl MessageSample for TxRelayMessage {
                 serves,
                 max_tx_bytes
             }),
-            prop::collection::vec((any_id(), any::<u32>()), 1..8).prop_map(Self::Inv),
+            prop::collection::vec((any_id(), any::<u32>()), 1..8).prop_map(Self::Have),
             any_id().prop_map(Self::GetTxs),
             (any_id(), prop::collection::vec(any::<u8>(), 1..64))
                 .prop_map(|(id, body)| Self::Tx { id, body }),
@@ -94,8 +94,8 @@ impl MessageSample for TxRelayMessage {
     fn violations() -> Vec<Violation<Self>> {
         vec![Violation {
             // A zero count, padded to the row's minimum length.
-            name: "inv with no ids",
-            frame: frame(Self::Inv(vec![(legacy(1), 1)]).message_type(), {
+            name: "have with no ids",
+            frame: frame(Self::Have(vec![(legacy(1), 1)]).message_type(), {
                 let mut payload = vec![0];
                 payload.extend_from_slice(&[0; 68]);
                 payload

@@ -63,7 +63,7 @@ fn replay(plan: SavedPlan) -> (RunReport, Vec<String>, NodeHandle) {
         .expect("each saved Plan has a seed")
         .input()
         .to_vec();
-    let (prefix, plan) = input.split_at(DiscoveryWire::SCENARIO_BYTES);
+    let (prefix, plan) = input.split_at(DiscoveryWire::SCENARIO_BYTES.min(input.len()));
     run(&DiscoveryWire::draw(prefix), plan)
 }
 

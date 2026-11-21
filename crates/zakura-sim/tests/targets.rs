@@ -741,8 +741,13 @@ fn the_report_lists_every_missing_target() {
     };
     let report = check_targets(&options, |_| {}).unwrap();
     let missing = suite().missing_target;
-    assert!(!missing.is_empty(), "{SUITE_FILE} lists missing targets");
+    let excluded = suite().excluded_harness;
+    assert!(
+        !excluded.is_empty(),
+        "{SUITE_FILE} lists harnesses no target runs"
+    );
     assert_eq!(report.missing_targets, missing);
+    assert_eq!(report.excluded_harnesses, excluded);
     // The one checked target is unresolved, so it's the only row not ready.
     let not_ready: Vec<&str> = report.not_ready().map(|row| row.target.as_str()).collect();
     assert_eq!(not_ready, ["discovery_wait_complete"]);
@@ -752,7 +757,7 @@ fn the_report_lists_every_missing_target() {
     let json: serde_json::Value =
         serde_json::from_slice(&fs::read(options.out.join(READINESS_FILE)).unwrap()).unwrap();
     assert_eq!(
-        json["missing_targets"][0]["harness"],
-        missing[0].harness.as_str()
+        json["excluded_harnesses"][0]["harness"],
+        excluded[0].harness.as_str()
     );
 }

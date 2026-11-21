@@ -34,7 +34,8 @@
 //! xtask planted --targets` runs each one through its target.
 //!
 //! The report also lists each harness no target runs, with its
-//! `[[missing-target]]` row, so it accounts for every harness.
+//! `[[missing-target]]` or `[[excluded-harness]]` row, so it accounts for
+//! every harness.
 
 use std::{
     collections::BTreeSet,
@@ -61,7 +62,7 @@ use crate::{
     planted::{self, PLANTED_DIR},
     seed::{self, sha256, Seed, SeedSet},
     sim::NO_LIVELOCK,
-    suite::{MissingTarget, SuiteFile, SIM_FUZZ_PACKAGE, SUITE_FILE},
+    suite::{ExcludedHarness, MissingTarget, SuiteFile, SIM_FUZZ_PACKAGE, SUITE_FILE},
     trace::ARTIFACTS_VAR,
 };
 
@@ -215,6 +216,11 @@ pub struct Readiness {
     /// `qa/suite.toml`'s order. [`Readiness::not_ready`] doesn't count
     /// them, since the suite accounts for each.
     pub missing_targets: Vec<MissingTarget>,
+    /// Each harness no target runs by design, with its
+    /// `[[excluded-harness]]` row, in `qa/suite.toml`'s order. Reports from
+    /// before the row existed have none.
+    #[serde(default)]
+    pub excluded_harnesses: Vec<ExcludedHarness>,
 }
 
 impl Readiness {
@@ -514,6 +520,7 @@ pub fn check_targets(
         sanitizer: options.sanitizer.clone(),
         targets: Vec::new(),
         missing_targets: suite.missing_target.clone(),
+        excluded_harnesses: suite.excluded_harness.clone(),
     };
     for target in selected {
         let row = check_target(options, &manifest, target)?;

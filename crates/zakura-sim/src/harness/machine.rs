@@ -103,6 +103,7 @@ macro_rules! machine_entry {
             accepts: |_| true,
             families: Vec::new,
             corpus: Vec::new,
+            untagged_free: true,
             migrate: |_, generator| {
                 Err(format!(
                     "{} migrates no generator-{generator} input",

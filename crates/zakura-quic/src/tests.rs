@@ -1176,6 +1176,8 @@ fn profile_is_tls13_only() {
 #[tokio::test]
 async fn raw_client_with_the_profile_is_accepted() {
     // Control for the refusal tests: the same raw dial with an RPK key succeeds.
+    // The raw client has ring's groups only, so this is also a dialer without
+    // the hybrid group reaching a production listener (TLS-9).
     tokio::time::timeout(TEST_TIMEOUT, async {
         let mut server = server();
         let rpk = crate::tls::resolver::ResolveRawPublicKeyCert::new(&NodeSecretKey::generate());
@@ -2846,19 +2848,10 @@ async fn the_hybrid_hello_leaves_as_two_initial_datagrams() {
 
         // Nothing is delivered yet, so the client has sent its first flight
         // and nothing else.
-        let first_flight = || {
-            net.events()
-                .into_iter()
-                .filter_map(|event| match event {
-                    NetEvent::Sent { id, len, .. } if id.link.src == sim_addr(2) => Some(len),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-        };
         for _ in 0..10_000 {
             tokio::task::yield_now().await;
         }
-        assert_eq!(first_flight(), [1200, 1200]);
+        assert_eq!(sent_lengths(&net, sim_addr(2)), [1200, 1200]);
 
         let pump = tokio::spawn(pump(net.clone()));
         let (_client, result) = dial.await.unwrap();
@@ -2869,6 +2862,124 @@ async fn the_hybrid_hello_leaves_as_two_initial_datagrams() {
     })
     .await
     .unwrap();
+}
+
+/// A listener from before the hybrid group, with ring's groups only, takes
+/// the production dialer's two-datagram hello and completes the handshake on
+/// the X25519 share the hello also carries (TLS-9).
+#[tokio::test(start_paused = true)]
+async fn a_production_dialer_reaches_a_listener_without_the_hybrid_group() {
+    tokio::time::timeout(SIM_TEST_TIMEOUT, async {
+        let net = sim_net();
+        let pump = tokio::spawn(pump(net.clone()));
+        let bind = QuicBindConfig {
+            addrs: vec![sim_addr(1)],
+            ..loopback()
+        };
+        let rings_groups = rustls::crypto::ring::default_provider().kx_groups;
+        let listener = QuicEndpoint::bind_with(
+            NodeSecretKey::generate(),
+            &bind,
+            &test_config(),
+            net.clone(),
+            crate::EndpointInputs::default().kx_groups(rings_groups),
+        )
+        .unwrap();
+        let mut server = serve_test_acceptor(listener, &[ALPN], |_| Admit::Accept);
+        let client = sim_endpoint(&net, sim_addr(2));
+
+        client.connect(server.addr(), &[ALPN]).await.unwrap();
+        server.handled.recv().await.unwrap();
+        assert_eq!(server.seen.lock().unwrap().len(), 1);
+        // The hello it took was the hybrid one, in two datagrams.
+        assert_eq!(sent_lengths(&net, sim_addr(2))[..2], [1200, 1200]);
+        pump.abort();
+    })
+    .await
+    .unwrap();
+}
+
+/// A refused dial is answered once per datagram of its hello: the endpoint
+/// keeps no record of the attempt it refused, so the second datagram is a
+/// new attempt and gets its own refusal (ADM-1).
+#[tokio::test(start_paused = true)]
+async fn a_refused_two_datagram_hello_is_answered_twice() {
+    tokio::time::timeout(SIM_TEST_TIMEOUT, async {
+        let net = sim_net();
+        let pump = tokio::spawn(pump(net.clone()));
+        let mut server =
+            serve_test_acceptor(sim_endpoint(&net, sim_addr(1)), &[ALPN], |_| Admit::Refuse);
+        let client = sim_endpoint(&net, sim_addr(2));
+
+        assert!(matches!(
+            client.connect(server.addr(), &[ALPN]).await,
+            Err(ConnectError::Refused)
+        ));
+        // Long enough for the second datagram and its answer to arrive.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(server.seen.lock().unwrap().len(), 2);
+        assert_eq!(sent_lengths(&net, sim_addr(1)).len(), 2);
+        assert!(server.handled.try_recv().is_err());
+        assert_eq!(server.returned.cancelled.load(Ordering::Relaxed), 0);
+        assert_eq!(server.returned.finished.load(Ordering::Relaxed), 0);
+        pump.abort();
+    })
+    .await
+    .unwrap();
+}
+
+/// The outcome changes between a hello's two datagrams: the first is
+/// refused and the second accepted. The second alone starts TLS, so the
+/// attempt isn't cancelled. It holds its pending slot until the handshake
+/// deadline and then fails, keeping its admission charge (ADM-1, ADM-7).
+#[tokio::test(start_paused = true)]
+async fn a_hello_accepted_at_its_second_datagram_stalls_until_the_deadline() {
+    tokio::time::timeout(SIM_TEST_TIMEOUT, async {
+        let net = sim_net();
+        let pump = tokio::spawn(pump(net.clone()));
+        let decided = AtomicUsize::new(0);
+        let mut server = serve_test_acceptor(sim_endpoint(&net, sim_addr(1)), &[ALPN], move |_| {
+            if decided.fetch_add(1, Ordering::Relaxed) == 0 {
+                Admit::Refuse
+            } else {
+                Admit::Accept
+            }
+        });
+        let client = sim_endpoint(&net, sim_addr(2));
+
+        let dialed = tokio::time::Instant::now();
+        assert!(matches!(
+            client.connect(server.addr(), &[ALPN]).await,
+            Err(ConnectError::Refused)
+        ));
+        // Half the 3 s handshake deadline: the stranded attempt still holds
+        // its slot.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(server.seen.lock().unwrap().len(), 2);
+        assert_eq!(server.returned.finished.load(Ordering::Relaxed), 0);
+
+        while server.returned.finished.load(Ordering::Relaxed) == 0 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(dialed.elapsed() >= Duration::from_secs(3));
+        assert_eq!(server.returned.finished.load(Ordering::Relaxed), 1);
+        assert_eq!(server.returned.cancelled.load(Ordering::Relaxed), 0);
+        assert!(server.handled.try_recv().is_err());
+        pump.abort();
+    })
+    .await
+    .unwrap();
+}
+
+/// The lengths of the datagrams `src` has sent on `net`, in order.
+fn sent_lengths(net: &SimNet, src: SocketAddr) -> Vec<usize> {
+    net.events()
+        .into_iter()
+        .filter_map(|event| match event {
+            NetEvent::Sent { id, len, .. } if id.link.src == src => Some(len),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Bounds a simulation test in virtual time. It leaves room for the 91 s the

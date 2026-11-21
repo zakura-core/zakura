@@ -97,8 +97,8 @@ jubjub = { version = "=5.4.0", package = "zakura-jubjub" }
 async-trait = "0.1.89"
 libc = "0.2"
 # SPEC TLS-9: ML-KEM-768 for the hybrid key-exchange group. Pure Rust, formally
-# verified. Only the 768 parameter set, and no `rand`: the caller passes the
-# randomness in, so a simulation can seed it.
+# verified. Only the 768 parameter set, with its `rand` feature off: the caller
+# passes the randomness in, so a simulation can seed it.
 libcrux-ml-kem = { version = "0.0.12", default-features = false, features = ["mlkem768"] }
 memchr = "2.8"
 metrics = "0.24"

@@ -3,13 +3,18 @@
 //!
 //! The arithmetic is `libcrux-ml-kem`. This module adds what a handshake
 //! needs around it: the length checks, the check of a peer's encapsulation
-//! key, the random draws and the wiping of secrets.
+//! key, the random draws and the wiping of the secrets it holds.
 //!
 //! In one exchange the dialer [generates](MlKem768::generate) a key pair and
 //! sends the encapsulation key. The listener
 //! [encapsulates](MlKem768::encapsulate) to it and returns a ciphertext. The
 //! dialer [decapsulates](DecapsulationKey::decapsulate) the ciphertext. Both
 //! now hold the same 32-byte secret.
+//!
+//! Wiping is best effort. The buffers the randomness is drawn into, the
+//! private key and the returned secrets are wiped when they drop. libcrux
+//! takes the randomness by value and returns keys and secrets by value, so
+//! the copies those calls and later moves leave on the stack are not.
 
 use libcrux_ml_kem::{
     mlkem768::{self, MlKem768Ciphertext, MlKem768PrivateKey, MlKem768PublicKey},
@@ -82,8 +87,8 @@ impl MlKem768 {
 
 /// The dialer's key pair for one exchange.
 ///
-/// The private half is wiped when this drops. libcrux takes the seed and
-/// returns the key by value, so copies it made on the way are out of reach.
+/// The private half is wiped when this drops, as far as the module docs
+/// say wiping reaches.
 pub(crate) struct DecapsulationKey {
     private: MlKem768PrivateKey,
     public: MlKem768PublicKey,

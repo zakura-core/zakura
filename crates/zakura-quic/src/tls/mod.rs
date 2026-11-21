@@ -4,11 +4,14 @@
 //! Copyright 2025 N0, INC. Licensed under MIT OR Apache-2.0.
 //!
 //! Every rustls config in this crate comes from this module (TLS-11). The
-//! profile matches Iroh 1.1 on the wire: TLS 1.3 only, RFC 7250 raw public keys
-//! in both directions, Ed25519 only, mandatory client authentication and no
-//! SNI. It differs from Iroh in two local choices that don't change what a peer
-//! sees on a full handshake: the server refuses 0-RTT and issues no session
-//! tickets, and the client never resumes (TLS-10).
+//! profile is Iroh 1.1's: TLS 1.3 only, RFC 7250 raw public keys in both
+//! directions, Ed25519 only, mandatory client authentication and no SNI. It
+//! differs from Iroh on the wire in its key exchange: it offers the hybrid
+//! group X25519MLKEM768 ahead of ring's groups (TLS-9), and a peer without
+//! that group answers on X25519. It also differs in two local choices that
+//! don't change what a peer sees on a full handshake: the server refuses
+//! 0-RTT and issues no session tickets, and the client never resumes
+//! (TLS-10).
 
 use std::{
     sync::Arc,
@@ -415,7 +418,12 @@ mod tests {
         let name = rustls_pki_types::ServerName::try_from(UNSENT_SERVER_NAME).unwrap();
         let mut client = rustls::ClientConnection::new(Arc::new(client), name).unwrap();
         let mut server = rustls::ServerConnection::new(Arc::new(server)).unwrap();
-        while client.is_handshaking() || server.is_handshaking() {
+        // A full handshake takes two exchanges and one with a
+        // HelloRetryRequest three, so one that needs more has stalled.
+        for _ in 0..4 {
+            if !client.is_handshaking() && !server.is_handshaking() {
+                break;
+            }
             let mut flight = Vec::new();
             while client.wants_write() {
                 client.write_tls(&mut flight).unwrap();
@@ -435,6 +443,10 @@ mod tests {
                 client.process_new_packets().unwrap();
             }
         }
+        assert!(
+            !client.is_handshaking() && !server.is_handshaking(),
+            "the handshake stalled"
+        );
         let group = |group: Option<&'static dyn rustls::crypto::SupportedKxGroup>| {
             group
                 .expect("a finished TLS 1.3 handshake used a key-exchange group")

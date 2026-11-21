@@ -52,8 +52,9 @@ const ML_DSA_SEED_PERSONALISATION: &[u8; 16] = b"Zakura_MLDSA44v1";
 /// `seed`: BLAKE2b-256 keyed by the seed, under its own personalisation, so
 /// one key file holds both keys and neither reveals the other (ID-13).
 ///
-/// `blake2b_simd` keeps copies of its key in state it doesn't wipe, so this
-/// runs once, when a node loads its key, not per handshake.
+/// `blake2b_simd` keeps copies of its key, and of the derived seed in its
+/// output, in values it doesn't wipe, so this runs once, when a node loads
+/// its key, not per handshake.
 pub(crate) fn ml_dsa_seed(seed: &[u8; KEY_LENGTH]) -> [u8; KEY_GENERATION_RANDOMNESS_SIZE] {
     let hash = Params::new()
         .hash_length(KEY_GENERATION_RANDOMNESS_SIZE)
@@ -78,8 +79,9 @@ pub(crate) fn ml_dsa_public_key(
 /// hedged with `randomness`.
 ///
 /// The signing key is regenerated for each signature and its bytes wiped
-/// after, so a node holds only its seeds between handshakes. `libcrux`'s
-/// intermediate signing state isn't wiped.
+/// after. `libcrux-ml-dsa` wipes nothing itself: its key generation and
+/// signing leave the expanded seed and secret vectors, and copies of the
+/// seed passed by value, in memory it releases unwiped.
 pub(crate) fn ml_dsa_sign(
     ml_dsa_seed: &[u8; KEY_GENERATION_RANDOMNESS_SIZE],
     message: &[u8],

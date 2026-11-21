@@ -6,3 +6,7 @@
   key file, so no file changes, but every node's ID changes once more; this
   ships in the same release as the node ID change, so deployed IDs change
   once ([#PENDING](https://github.com/zakura-core/zakura/pull/PENDING)).
+- `zakura-quic` 2.0.0 also removes `NodeKey::node_id()`, since a node ID now
+  covers the ML-DSA-44 key too, and adds `ML_DSA_44_KEY_TAG`,
+  `ML_DSA_44_KEY_BYTES`, `ML_DSA_44_SIGNATURE_BYTES` and
+  `COMPOSITE_SIGNATURE_BYTES` ([#PENDING](https://github.com/zakura-core/zakura/pull/PENDING)).

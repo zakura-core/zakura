@@ -60,8 +60,8 @@ the credential a peer proves in TLS and requires the hybrid key exchange;
 it adds ID-8 to ID-12, changes ID-1, ID-2, ID-4, ID-7, TLS-3, TLS-4, TLS-7
 to TLS-9, ADM-9, WIRE-2, API-1, API-4, CTRL-26 and §13, and §17w lists each
 change. Version 0.26 signs every handshake with a composite of Ed25519 and
-ML-DSA-44; it adds ID-13, changes DEP-2, TLS-4 and ID-11, and §17x lists
-each change.
+ML-DSA-44; it adds ID-13, changes DEP-2, ID-8, ID-11, ID-12, TLS-4, API-1
+and §16, and §17x lists each change.
 
 ## 0. Conventions
 
@@ -240,8 +240,10 @@ Terms:
   loads its key, and held beside the Ed25519 seed, zeroized on drop (ID-3).
   The signing key is regenerated from it for each signature and its bytes
   zeroized after. As with `ring`'s expanded Ed25519 key, some copies are
-  not wiped: `blake2b_simd`'s state from the one derivation, and
-  `libcrux-ml-dsa`'s intermediate signing state.
+  not wiped: `blake2b_simd`'s state and output from the one derivation,
+  which hold the Ed25519 seed and the ML-DSA seed, and on every signature
+  `libcrux-ml-dsa`'s key generation and signing state, which holds the
+  ML-DSA seed, its expansion and the secret vectors.
 
 ## 4. TLS profile
 
@@ -1955,7 +1957,10 @@ Changed:
   build-time macro crate, `libcrux-macros`, which brings `syn` 3 beside the
   tree's `syn` 2.
 - **API-1.** A `NodeSecretKey`'s credential holds both keys, and
-  `with_credential` requires both.
+  `with_credential` requires both. Removes `NodeKey::node_id()`: no node's
+  ID derives from an Ed25519 key alone. Adds `ML_DSA_44_KEY_TAG`,
+  `ML_DSA_44_KEY_BYTES`, `ML_DSA_44_SIGNATURE_BYTES` and
+  `COMPOSITE_SIGNATURE_BYTES`.
 - **ID-8, ID-12.** Tag 2 is ML-DSA-44, and its credential entry is exactly
   1,312 bytes.
 - **TLS-4.** The only signature scheme is the composite, `0xFE44`.

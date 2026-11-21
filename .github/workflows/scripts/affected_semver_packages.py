@@ -10,10 +10,11 @@ import sys
 
 # `zakura` is the node binary package, rather than a supported Rust library API.
 # Its command and configuration types can change without library SemVer bumps.
+# Keep the internal QUIC transport excluded while checking its dependents.
 # `zakura-rt` and `zakura-mmr-tree` have no stable crates.io
 # release yet, so they have no baseline to check against. Remove each after its
 # first stable publish; their dependents remain checked.
-SEMVER_ENFORCEMENT_EXCLUSIONS = {"zakura", "zakura-rt", "zakura-mmr-tree", "zakura-mempool"}
+SEMVER_ENFORCEMENT_EXCLUSIONS = {"zakura", "zakura-quic", "zakura-rt", "zakura-mmr-tree", "zakura-mempool"}
 
 
 def is_publishable(package):

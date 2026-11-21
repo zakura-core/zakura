@@ -3,12 +3,16 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
 };
 
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
+use zakura_node_services::block_relay::{
+    PendingBlockSendPermit, PendingBlockStatus as PendingStatus, ServedBlock,
+};
+use zakura_rt::sync::watch;
 
 use zakura_chain::block;
 
@@ -107,6 +111,8 @@ pub enum MinedBlockSubmission {
     FullBlock,
     /// The miner submitted a compact solved header.
     CompactHeader,
+    /// An operator-authorized caller requested relay before local verification.
+    TrustedBlock,
 }
 
 impl MinedBlockSubmission {
@@ -115,15 +121,30 @@ impl MinedBlockSubmission {
         match self {
             Self::FullBlock => "submitblock",
             Self::CompactHeader => "submitsolution",
+            Self::TrustedBlock => "submittrustedblock",
         }
     }
 }
 
-/// An admitted local block eligible for optimistic announcement before commit.
+/// The authority for relaying a local submission before commit.
+///
+/// State-authorized relay stops waiting for readiness at commitment, but a dispatched broadcast
+/// may finish. Trusted relay preserves dispatched work on commitment. For both policies, failure
+/// withdraws queued announcements and temporary bodies before their peer writes start, and both
+/// retain the gossip deadline and committed fallback.
+#[derive(Debug)]
+pub enum EarlyBlockRelay {
+    /// Consensus authorized relay and state admitted the candidate.
+    StateAdmission(zakura_state::BlockAdmission),
+    /// An operator explicitly authorized relay before validation.
+    TrustedSubmission,
+}
+
+/// A local block eligible for announcement before commit.
 #[derive(Debug)]
 pub struct EarlyMinedBlock {
-    /// State's submission lifecycle, used to suppress early dispatch after commit.
-    pub admission: zakura_state::BlockAdmission,
+    /// Relay authority and lifecycle used to suppress obsolete early dispatch.
+    pub relay: EarlyBlockRelay,
     /// Block hash.
     pub hash: block::Hash,
     /// Block height.
@@ -138,28 +159,23 @@ pub struct EarlyMinedBlock {
     pub pending: PendingBlockSignal,
 }
 
-#[derive(Clone, Debug)]
-enum PendingStatus {
-    Waiting,
-    Committed,
-    Failed,
-}
-
 #[derive(Debug)]
 struct PendingBlock {
     owner_id: u64,
     block: Arc<block::Block>,
     status: watch::Sender<PendingStatus>,
+    peer_permit: Option<PendingBlockSendPermit>,
 }
 
-/// Stores admitted block bodies with their registration owners.
+/// Stores pending block bodies with their registration owners.
 #[derive(Debug)]
 struct PendingBlockRegistryInner {
     entries: Mutex<HashMap<block::Hash, PendingBlock>>,
     next_owner_id: AtomicU64,
 }
 
-/// Holds early-advertised block bodies until their contextual commits finish.
+/// Tracks local submissions through verification. Only bodies authorized for early relay
+/// are available to peers.
 #[derive(Clone, Debug)]
 pub struct PendingBlockRegistry(Arc<PendingBlockRegistryInner>);
 
@@ -173,13 +189,46 @@ impl Default for PendingBlockRegistry {
 }
 
 /// Reports whether an early-advertised block remains valid.
-#[derive(Debug)]
-pub struct PendingBlockSignal(watch::Receiver<PendingStatus>);
+#[derive(Clone, Debug)]
+pub struct PendingBlockSignal {
+    status: watch::Receiver<PendingStatus>,
+    dispatched: Arc<AtomicBool>,
+    permit: PendingBlockSendPermit,
+}
 
 impl PendingBlockSignal {
+    /// Retains this attempt's permission through the peer write boundary.
+    pub fn send_permit(&self) -> PendingBlockSendPermit {
+        self.permit.clone()
+    }
+
+    /// Records dispatch to the peer service, without claiming peer delivery.
+    pub fn mark_dispatched(&self) {
+        self.dispatched.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether the peer service was called for this pending body.
+    pub fn was_dispatched(&self) -> bool {
+        self.dispatched.load(Ordering::Relaxed)
+    }
+
+    /// Whether this submission is still awaiting verification and commit.
+    pub fn is_pending(&self) -> bool {
+        matches!(*self.status.borrow(), PendingStatus::Waiting)
+    }
+
+    /// Waits for commit or failure, so a queued trusted announcement can be withdrawn.
+    pub async fn wait_for_resolution(&mut self) {
+        while self.is_pending() {
+            if self.status.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
     /// Returns true unless contextual verification has rejected the block.
     pub fn is_valid(&self) -> bool {
-        !matches!(*self.0.borrow(), PendingStatus::Failed)
+        !matches!(*self.status.borrow(), PendingStatus::Failed)
     }
 
     /// Returns a signal for a block that never fails, so tests in other crates can build an
@@ -188,20 +237,25 @@ impl PendingBlockSignal {
     pub fn valid_for_tests() -> Self {
         // Dropping the sender leaves the signal reading `Waiting`, so it stays valid and its
         // failure future never resolves.
-        Self(watch::channel(PendingStatus::Waiting).1)
+        let (_, permit) = PendingBlockSendPermit::channel();
+        Self {
+            status: permit.subscribe(),
+            dispatched: Arc::default(),
+            permit,
+        }
     }
 
     /// Resolves when contextual verification rejects the block.
     pub async fn wait_for_failure(&mut self) {
         loop {
-            let status = self.0.borrow_and_update().clone();
+            let status = *self.status.borrow_and_update();
             match status {
                 PendingStatus::Failed => return,
                 PendingStatus::Committed => std::future::pending::<()>().await,
                 PendingStatus::Waiting => {}
             }
 
-            if self.0.changed().await.is_err() {
+            if self.status.changed().await.is_err() {
                 std::future::pending::<()>().await;
             }
         }
@@ -237,13 +291,19 @@ pub struct PendingBlockRegistration {
     owner_id: u64,
     /// A receiver for this registration's own entry, kept so `signal` needs no lookup.
     receiver: watch::Receiver<PendingStatus>,
+    dispatched: Arc<AtomicBool>,
+    permit: PendingBlockSendPermit,
     resolved: bool,
 }
 
 impl PendingBlockRegistration {
     /// Returns a signal that cancels stale early inventory after commit failure.
-    pub(crate) fn signal(&self) -> PendingBlockSignal {
-        PendingBlockSignal(self.receiver.clone())
+    pub fn signal(&self) -> PendingBlockSignal {
+        PendingBlockSignal {
+            status: self.receiver.clone(),
+            dispatched: self.dispatched.clone(),
+            permit: self.permit.clone(),
+        }
     }
 
     /// Resolves this registration and invalidates failed early advertisements.
@@ -266,6 +326,30 @@ impl PendingBlockRegistry {
     ///
     /// Returns no registration when the hash already has an owner or the registry is full.
     pub fn insert(&self, block: Arc<block::Block>) -> Option<PendingBlockRegistration> {
+        self.insert_trusted(block, true)
+    }
+
+    pub(crate) fn insert_trusted(
+        &self,
+        block: Arc<block::Block>,
+        early_relay: bool,
+    ) -> Option<PendingBlockRegistration> {
+        self.register(block, early_relay, PendingBlockSendPermit::channel)
+    }
+
+    pub(crate) fn insert_state_admitted(
+        &self,
+        block: Arc<block::Block>,
+    ) -> Option<PendingBlockRegistration> {
+        self.register(block, true, PendingBlockSendPermit::state_admitted_channel)
+    }
+
+    fn register(
+        &self,
+        block: Arc<block::Block>,
+        peer_visible: bool,
+        channel: impl FnOnce() -> (watch::Sender<PendingStatus>, PendingBlockSendPermit),
+    ) -> Option<PendingBlockRegistration> {
         let hash = block.hash();
         let mut entries = self
             .0
@@ -281,13 +365,15 @@ impl PendingBlockRegistry {
         }
 
         let owner_id = self.0.next_owner_id.fetch_add(1, Ordering::Relaxed);
-        let (status, receiver) = watch::channel(PendingStatus::Waiting);
+        let (status, permit) = channel();
+        let receiver = permit.subscribe();
         entries.insert(
             hash,
             PendingBlock {
                 owner_id,
                 block,
                 status,
+                peer_permit: peer_visible.then(|| permit.clone()),
             },
         );
         Some(PendingBlockRegistration {
@@ -295,6 +381,8 @@ impl PendingBlockRegistry {
             hash,
             owner_id,
             receiver,
+            dispatched: Arc::default(),
+            permit,
             resolved: false,
         })
     }
@@ -320,6 +408,9 @@ impl PendingBlockRegistry {
             Ok(_) => PendingStatus::Committed,
             Err(()) => PendingStatus::Failed,
         };
+        // Publish after releasing the registry. Removal already stops new permits escaping, and
+        // this update waits for write starts that hold a permit, which can take milliseconds per
+        // block encode. Holding the registry lock here would stall every other lookup meanwhile.
         entry.status.send_replace(status);
     }
 
@@ -333,7 +424,30 @@ impl PendingBlockRegistry {
             .map(|entry| PendingBlockResolution(entry.status.subscribe()))
     }
 
-    /// Returns an admitted body immediately while its contextual commit is pending.
+    /// Returns a peer-visible body with its write permission. Private submissions remain
+    /// available to local download coordination through [`Self::resolution`].
+    pub fn get_for_peer(&self, hash: block::Hash) -> Option<ServedBlock> {
+        let block = self
+            .0
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&hash)
+            .and_then(|entry| {
+                let permit = entry.peer_permit.as_ref()?;
+                Some(ServedBlock {
+                    block: entry.block.clone().into(),
+                    pending_send: Some(permit.clone()),
+                })
+            });
+        if block.is_some() {
+            metrics::counter!("mining.pending_registry.served").increment(1);
+        }
+        block
+    }
+
+    /// Inspects a pending body, which may still be awaiting consensus validation.
+    /// Peer serving must use [`Self::get_for_peer`] to retain its withdrawal permission.
     pub fn get(&self, hash: block::Hash) -> Option<Arc<block::Block>> {
         let block = self
             .0
@@ -482,6 +596,90 @@ mod tests {
         zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
             .zcash_deserialize_into()
             .expect("the genesis test vector is valid")
+    }
+
+    #[test]
+    fn retained_peer_body_is_withdrawn_on_rejection_or_owner_drop() {
+        for drop_owner in [false, true] {
+            let registry = PendingBlockRegistry::default();
+            let block = test_block();
+            let hash = block.hash();
+            let owner = registry.insert(block.clone()).unwrap();
+            let retained = registry.get_for_peer(hash).unwrap();
+            let permit = retained.pending_send.unwrap();
+            assert!(permit.try_start_write(|| ()).is_some());
+            if drop_owner {
+                drop(owner);
+            } else {
+                owner.resolve(Err(()));
+            }
+            assert!(registry.get_for_peer(hash).is_none());
+            assert!(permit
+                .try_start_write(|| panic!("a retained rejected body cannot be sent"))
+                .is_none());
+            let retry = registry.insert(block.clone()).unwrap();
+            let current = registry.get_for_peer(hash).unwrap();
+            assert!(current
+                .pending_send
+                .unwrap()
+                .try_start_write(|| ())
+                .is_some());
+            assert!(permit.try_start_write(|| ()).is_none());
+            retry.resolve(Ok(block));
+        }
+    }
+
+    /// Resolution waits for write starts that hold a permit. It must not hold the registry
+    /// meanwhile, or every other pending lookup would wait for that block's encode.
+    #[test]
+    fn resolution_waiting_on_a_write_start_does_not_block_other_lookups() {
+        use std::{sync::mpsc, time::Duration};
+
+        let registry = PendingBlockRegistry::default();
+        let block = test_block();
+        let hash = block.hash();
+        let owner = registry.insert(block).unwrap();
+        let permit = registry.get_for_peer(hash).unwrap().pending_send.unwrap();
+        let other = block::Hash([7; 32]);
+
+        let lookup_finished = permit
+            .try_start_write(|| {
+                let resolver = std::thread::spawn(move || owner.resolve(Err(())));
+                // Give the resolver time to block on the in-progress write start.
+                std::thread::sleep(Duration::from_millis(100));
+                let (finished, lookup) = mpsc::channel();
+                let registry = registry.clone();
+                std::thread::spawn(move || {
+                    let _ = finished.send(registry.get_for_peer(other).is_none());
+                });
+                let result = lookup.recv_timeout(Duration::from_secs(2));
+                (resolver, result)
+            })
+            .unwrap();
+        let (resolver, result) = lookup_finished;
+        resolver.join().unwrap();
+        assert_eq!(
+            result,
+            Ok(true),
+            "another lookup completes while resolution waits for a write start"
+        );
+        assert!(permit.try_start_write(|| ()).is_none());
+    }
+
+    #[test]
+    fn retained_peer_body_remains_sendable_after_commit() {
+        let registry = PendingBlockRegistry::default();
+        let block = test_block();
+        let hash = block.hash();
+        let owner = registry.insert(block.clone()).unwrap();
+        let retained = registry.get_for_peer(hash).unwrap();
+        owner.resolve(Ok(block));
+        assert!(registry.get_for_peer(hash).is_none());
+        assert!(retained
+            .pending_send
+            .unwrap()
+            .try_start_write(|| ())
+            .is_some());
     }
 
     #[test]

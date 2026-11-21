@@ -35,3 +35,30 @@ pub use recovery::{
 };
 pub(crate) use types::semantic_payload_fingerprint;
 pub use types::*;
+
+/// Highest common frontier of the engine's contiguous paths from finality.
+/// Equal hashes share all parents, so shared heights form a prefix.
+fn common_body_frontier(
+    selected: &[crate::Frontier],
+    verified: &[crate::Frontier],
+) -> crate::Frontier {
+    let last = selected.len().min(verified.len()) - 1;
+    if selected[last] == verified[last] {
+        return selected[last];
+    }
+    debug_assert_eq!(
+        selected[0], verified[0],
+        "both projections start at finality"
+    );
+    let mut shared = 0;
+    let mut different = last;
+    while different - shared > 1 {
+        let mid = shared + (different - shared) / 2;
+        if selected[mid] == verified[mid] {
+            shared = mid;
+        } else {
+            different = mid;
+        }
+    }
+    selected[shared]
+}

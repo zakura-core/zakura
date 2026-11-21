@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import os
 import re
@@ -75,6 +76,7 @@ class DeployToolCase(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         values = {"stage": stage, "sha": SHA, "target": tool.COMPAT_TARGET,
                   "known_hosts": None, "deploy_config": None, "work": self.tmp.name,
+                  "ensure_compat_checker": False,
                   "evidence": None, "run_url": "", "soak_seconds": 60, "restore_state": None}
         values.update(overrides)
         return tool.Context(tool.argparse.Namespace(**values))
@@ -134,8 +136,8 @@ class WorkflowHostKeyTests(DeployToolCase):
 
 
 class FleetDeployTests(DeployToolCase):
-    def run_fleet_deploy(self, lane_enabled):
-        ctx = self.context("fleet-deploy")
+    def run_fleet_deploy(self, lane_enabled, *, ensure_compat_checker=False):
+        ctx = self.context("fleet-deploy", ensure_compat_checker=ensure_compat_checker)
         recorder = Recorder(ctx)
         with mock.patch.object(tool, "lane_enabled", return_value=lane_enabled), \
                 mock.patch.dict(tool.os.environ, {"SLACK_WEB_HOOK": WEBHOOK, "PAGERDUTY_ROUTING_KEY": "fixture-pd-key"}), \
@@ -165,6 +167,10 @@ class FleetDeployTests(DeployToolCase):
         _recorder, compat = self.run_fleet_deploy(lane_enabled=True)
         compat.assert_called_once()
 
+    def test_compat_deploy_installs_checker_even_if_the_lane_is_disabled(self):
+        _recorder, compat = self.run_fleet_deploy(lane_enabled=False, ensure_compat_checker=True)
+        compat.assert_called_once()
+
     def test_checker_refresh_precedes_fleet_activation(self):
         ctx = self.context("fleet-deploy")
         recorder = Recorder(ctx)
@@ -188,6 +194,38 @@ class FleetDeployTests(DeployToolCase):
                     with self.assertRaises(type(error)):
                         tool.stage_fleet_deploy(ctx)
                 self.assertEqual(recorder.operations(), [("local", "stage")])
+
+
+class CompatibilityReadinessTests(DeployToolCase):
+    def test_dashboard_wait_requires_a_healthy_sidecar_sample_after_the_sync_check(self):
+        sidecar = {"name": "zcashd-compat", "health": "healthy", "last_seen_at": 101}
+        snapshots = [
+            {"rows": [{**sidecar, "last_seen_at": 99}]},
+            {"rows": [{**sidecar, "health": "rpc_error"}]},
+            {"rows": [sidecar]},
+        ]
+        responses = [io.BytesIO(json.dumps(snapshot).encode()) for snapshot in snapshots]
+        with mock.patch.object(tool, "urlopen", side_effect=responses) as fetch, \
+                mock.patch.object(tool.time, "sleep"):
+            tool.wait_for_sidecar_dashboard("http://127.0.0.1:8090/data", 100)
+        self.assertEqual(fetch.call_count, 3)
+
+    def test_dashboard_wait_fails_when_the_sidecar_never_recovers(self):
+        with mock.patch.object(tool, "urlopen", side_effect=OSError), \
+                mock.patch.object(tool.time, "monotonic", side_effect=[0, 0, 60, 60]), \
+                mock.patch.object(tool.time, "sleep"):
+            with self.assertRaisesRegex(tool.StageError, "did not observe a healthy zcashd-compat"):
+                tool.wait_for_sidecar_dashboard("http://127.0.0.1:8090/data", 100)
+
+    def test_sync_check_failure_fails_readiness_without_waiting_for_dashboard(self):
+        ctx = self.context("check-compat-readiness")
+        result = subprocess.CompletedProcess([], 1, b"", b"timed out\n")
+        with mock.patch.object(ctx, "ssh", return_value=result) as ssh, \
+                mock.patch.object(tool, "wait_for_sidecar_dashboard") as wait:
+            with self.assertRaisesRegex(tool.StageError, "sync check failed"):
+                tool.stage_check_compat_readiness(ctx)
+        self.assertIn("--sync-check-timeout 600", ssh.call_args.args[0])
+        wait.assert_not_called()
 
 
 class GuardTests(DeployToolCase):

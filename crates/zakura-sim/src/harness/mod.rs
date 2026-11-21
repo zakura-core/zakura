@@ -563,6 +563,17 @@ fn registered<S: Subsystem>() -> Vec<PropertyRef> {
         .collect()
 }
 
+/// The ID of each property `S` checks that registers no trigger-history
+/// check, in report order.
+fn untriggered<S: Subsystem>() -> Vec<String> {
+    registry::<S>()
+        .properties()
+        .iter()
+        .filter(|property| property.witness.is_none())
+        .map(|property| property.id.to_string())
+        .collect()
+}
+
 /// A harness by name, without its type, so a trace's `meta.sim` can pick
 /// it.
 pub struct HarnessEntry {
@@ -592,6 +603,11 @@ pub struct HarnessEntry {
     pub properties: fn() -> Vec<PropertyRef>,
     /// [`witness_into`] on a serialized scenario.
     pub witness: WitnessFn,
+    /// The ID of each property that registers no trigger-history check, in
+    /// report order. The witness test judges such a property only as
+    /// applicable. A machine lists none, since its witness test checks the
+    /// machine's own reach instead.
+    pub untriggered: fn() -> Vec<String>,
     /// [`explore::run_bytes`]: a full fuzz input, the sink, and an extra
     /// checker.
     pub run_bytes: fn(&[u8], &mut dyn RecordSink, Option<&mut dyn Checker>) -> ExploreRun,
@@ -676,6 +692,7 @@ pub const fn entry<S: Subsystem>() -> HarnessEntry {
         draw: draw_value::<S>,
         properties: registered::<S>,
         witness: witness_value::<S>,
+        untriggered: untriggered::<S>,
         run_bytes: explore::run_bytes::<S>,
         run_steered_bytes: Some(explore::run_steered_bytes::<S>),
         accepts: S::accepts,

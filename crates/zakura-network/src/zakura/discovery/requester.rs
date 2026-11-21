@@ -30,6 +30,7 @@
 use std::sync::Arc;
 
 use serde::Serialize;
+use thiserror::Error;
 use zakura_rt::{
     collections::HashMap,
     sync::{watch, CancellationToken, Mutex, MutexGuard, PoisonError},
@@ -277,12 +278,14 @@ impl QueryState {
 }
 
 /// What one session delivered and has not settled: its claimed answers of each
-/// kind, and each `Hello` in verification.
+/// kind, each `Hello` in verification, and the frames its reader received and
+/// has not judged.
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 struct Settling {
     peers: usize,
     services: usize,
     hellos: usize,
+    reading: usize,
 }
 
 impl Settling {
@@ -291,6 +294,7 @@ impl Settling {
             Held::Answer(QueryKind::Peers) => &mut self.peers,
             Held::Answer(QueryKind::Services) => &mut self.services,
             Held::Hello => &mut self.hellos,
+            Held::Reading => &mut self.reading,
         }
     }
 
@@ -311,14 +315,18 @@ enum Held {
     /// A `Hello` in verification. It holds a closing session's wait and nothing
     /// else: no reservation, no pool entry, and no query kind.
     Hello,
+    /// The frames the reader received and has not judged. Like a `Hello`, it
+    /// holds only a closing session's wait.
+    Reading,
 }
 
-/// One answer or `Hello` that a session's reader has not settled.
+/// One answer, one `Hello`, or the received frames that a session's reader
+/// has not settled.
 ///
-/// The reader holds it through decode, verification, and import. Dropping it
-/// settles on every path, including a reader cancelled inside verification.
-/// Settlement needs no lock, so a destructor that runs at shutdown cannot
-/// contend with a paused lock holder.
+/// The reader holds an answer or a `Hello` through decode, verification, and
+/// import. Dropping it settles on every path, including a reader cancelled
+/// inside verification. Settlement needs no lock, so a destructor that runs at
+/// shutdown cannot contend with a paused lock holder.
 #[derive(Debug)]
 #[must_use = "dropping the hold settles what it holds"]
 pub(super) struct SettlingHold {
@@ -362,20 +370,76 @@ impl ClaimedAnswer {
     }
 }
 
+/// Why a frame claimed no query.
+#[derive(Copy, Clone, Debug, Eq, Error, PartialEq)]
+pub(super) enum Unclaimed {
+    /// The frame breaks its query's reservation, a protocol violation.
+    #[error(transparent)]
+    Refused(#[from] ClaimRefused),
+    /// The session retired its queries, so nothing judges the frame. The
+    /// transport reader can queue an answer just before the session ends,
+    /// and the reader can take it just after (#2632). The peer broke no rule.
+    #[error("the session retired its queries")]
+    Retired,
+}
+
 /// One session's reservations and its live queries. One lock guards both,
 /// so a claim reads what its own query asked.
 #[derive(Debug)]
 struct LiveQueries {
-    reservations: Reservations<QueryKind>,
+    reservations: Ledger,
     state: QueryState,
 }
 
 impl LiveQueries {
     fn new() -> Self {
         Self {
-            reservations: Reservations::new(DiscoveryMessage::RULES, QUERY_KINDS.len()),
+            reservations: Ledger {
+                map: Reservations::new(DiscoveryMessage::RULES, QUERY_KINDS.len()),
+                retired: false,
+            },
             state: QueryState::default(),
         }
+    }
+}
+
+/// A session's reservations, and whether [`Queries::retire`] replaced them.
+///
+/// The session's end cancels its streams, then retires its queries. A
+/// transport reader already inside a read can still check one answer's
+/// header after the retirement, and the session's reader can still claim
+/// an answer it took before. Neither judges the answer: the peer sent it to
+/// a query this node asked, and the reader drops it ([`Unclaimed::Retired`]).
+/// The cancelled stream stops the transport reader at its next read, so a
+/// retired ledger lets through at most the answer in flight.
+#[derive(Debug)]
+struct Ledger {
+    map: Reservations<QueryKind>,
+    retired: bool,
+}
+
+impl Ledger {
+    /// [`Reservations::admit`] on a live ledger. A retired ledger lets an
+    /// answer through uncharged, for the reader to drop.
+    fn admit(&mut self, message_type: u16, payload_len: usize) -> Result<(), ClaimRefused> {
+        if self.retired && QueryKind::answered_by(message_type).is_some() {
+            return Ok(());
+        }
+        self.map.admit(message_type, payload_len)
+    }
+}
+
+impl std::ops::Deref for Ledger {
+    type Target = Reservations<QueryKind>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.map
+    }
+}
+
+impl std::ops::DerefMut for Ledger {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.map
     }
 }
 
@@ -496,7 +560,7 @@ impl Queries {
         &self,
         message_type: u16,
         payload_len: usize,
-    ) -> Result<Option<ClaimedAnswer>, ClaimRefused> {
+    ) -> Result<Option<ClaimedAnswer>, Unclaimed> {
         let Some(kind) = QueryKind::answered_by(message_type) else {
             return Ok(None);
         };
@@ -513,7 +577,12 @@ impl Queries {
         kind: QueryKind,
         message_type: u16,
         payload_len: usize,
-    ) -> Result<ClaimedAnswer, ClaimRefused> {
+    ) -> Result<ClaimedAnswer, Unclaimed> {
+        // Retirement dropped the ledger that the transport reader charged
+        // this frame to, so there is nothing to take or claim.
+        if live.reservations.retired {
+            return Err(Unclaimed::Retired);
+        }
         if self.transport_admits {
             live.reservations.take_admitted(message_type, payload_len);
         }
@@ -561,11 +630,16 @@ impl Queries {
         SettlingHold::new(Held::Hello, &self.settling)
     }
 
+    /// Counts the reader's received frames as unjudged until the returned hold
+    /// drops.
+    pub(super) fn reading(&self) -> SettlingHold {
+        SettlingHold::new(Held::Reading, &self.settling)
+    }
+
     /// Resolves once this session holds nothing it read and has not processed:
-    /// no claimed answer, no `Hello` in verification, and no answer the transport
-    /// reader queued. An unanswered query does not hold it, so a silent peer
-    /// costs no wait. A `Hello` the reader has not reached holds no reservation,
-    /// so it does not hold this either.
+    /// no claimed answer, no `Hello` in verification, no frame the reader
+    /// received and has not judged, and no answer the transport reader queued.
+    /// An unanswered query does not hold it, so a silent peer costs no wait.
     pub(super) async fn answers_settled(&self) {
         let mut settling = self.settling.subscribe();
         loop {
@@ -588,10 +662,13 @@ impl Queries {
     /// Ends the session's queries: an unwritten query is skipped, and an
     /// unanswered written query resets the session. The reservations
     /// return to the pool, even while the transport reader outlives the
-    /// session.
+    /// session. An answer that reaches the reservations after this claims
+    /// nothing ([`Ledger`]).
     pub(super) fn retire(&self) {
         self.fence.retire();
-        let retired = std::mem::replace(&mut *self.lock(), LiveQueries::new());
+        let mut replacement = LiveQueries::new();
+        replacement.reservations.retired = true;
+        let retired = std::mem::replace(&mut *self.lock(), replacement);
         // The exchanges take the fence's lock as they drop.
         drop(retired);
     }

@@ -12,6 +12,8 @@ use zakura_chain::{
     serialization::{sha256d, ZcashDeserialize, ZcashSerialize},
 };
 
+use zakura_node_services::block_relay::{PendingBlockSendPermit, ServedBlock};
+
 use super::*;
 use crate::{
     protocol::external::{Codec, Message},
@@ -27,7 +29,7 @@ fn large_block() -> Arc<Block> {
 
 /// An inbound service that has `block`, and counts its lookups in `lookups`.
 fn inbound_with(
-    block: Arc<Block>,
+    block: ServedBlock,
     lookups: Arc<AtomicUsize>,
 ) -> impl Service<Request, Response = Response, Error = BoxError, Future: Send> + Clone + Send {
     tower::service_fn(move |request| {
@@ -66,6 +68,16 @@ fn advertiser(
 /// sending the block afterwards does not hash it again.
 #[tokio::test]
 async fn advertised_block_checksum_is_precomputed() {
+    check_warmup(None).await;
+}
+
+#[tokio::test]
+async fn state_admitted_body_warms_the_shared_checksum_before_commit() {
+    let (_owner, permit) = PendingBlockSendPermit::state_admitted_channel();
+    check_warmup(Some(permit)).await;
+}
+
+async fn check_warmup(pending_send: Option<PendingBlockSendPermit>) {
     let _init_guard = zakura_test::init();
     let block = large_block();
     let size = block.zcash_serialized_size();
@@ -74,7 +86,13 @@ async fn advertised_block_checksum_is_precomputed() {
     let adverts = Arc::new(AtomicUsize::new(0));
     let mut warmup = BlockChecksumWarmup::new(
         advertiser(adverts.clone()),
-        inbound_with(block.clone(), lookups.clone()),
+        inbound_with(
+            ServedBlock {
+                block: block.clone().into(),
+                pending_send,
+            },
+            lookups.clone(),
+        ),
         checksums.clone(),
     );
 
@@ -134,7 +152,7 @@ async fn small_or_known_blocks_are_not_looked_up() {
     let adverts = Arc::new(AtomicUsize::new(0));
     let mut warmup = BlockChecksumWarmup::new(
         advertiser(adverts.clone()),
-        inbound_with(block.clone(), lookups.clone()),
+        inbound_with(block.clone().into(), lookups.clone()),
         checksums,
     );
 
@@ -158,4 +176,26 @@ async fn small_or_known_blocks_are_not_looked_up() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(adverts.load(Ordering::SeqCst), 2);
     assert_eq!(lookups.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn warmup_ignores_a_trusted_body_before_validation() {
+    let block = large_block();
+    let hash = block.hash();
+    let (_resolution, pending_send) = PendingBlockSendPermit::channel();
+    let inbound = tower::service_fn(move |request| {
+        assert_eq!(request, Request::BlocksByHash(IndexSet::from([hash])));
+        let body = ServedBlock {
+            block: block.clone().into(),
+            pending_send: Some(pending_send.clone()),
+        };
+        async move {
+            Ok(Response::Blocks(vec![InventoryResponse::Available((
+                body.into(),
+                None,
+            ))]))
+        }
+    });
+
+    assert!(lookup_block(inbound, hash).await.is_none());
 }

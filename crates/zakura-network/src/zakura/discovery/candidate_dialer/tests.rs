@@ -1359,11 +1359,11 @@ async fn the_dialer_loop_sleeps_until_the_round_deadline_after_a_completion() {
         .await
         .expect("dialer spawns");
     let discovery = node.discovery();
-    // Two silent IPs: the second address starts one dial stagger after the
+    // Two silent addresses: the second starts one dial stagger after the
     // round, so the dial fails one stagger past a round deadline.
     let mut silent = Vec::new();
-    for ip in ["127.0.0.1:0", "127.0.0.2:0"] {
-        silent.push(tokio::net::UdpSocket::bind(ip).await.unwrap());
+    for _ in 0..2 {
+        silent.push(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
     }
     discovery
         .insert_static_candidate(NodeAddr::with_addrs(

@@ -475,7 +475,11 @@ pub(crate) fn run(repo_root: &Path, args: impl Iterator<Item = String>) -> Resul
         });
         cases.extend(native_cases(repo_root, &dir)?);
     }
-    cases.extend(planted_cases(repo_root, &flags.planted)?);
+    cases.extend(planted_cases(
+        repo_root,
+        &flags.planted,
+        &mut std::io::stderr(),
+    )?);
     let cases = select(
         repo_root,
         cases,
@@ -623,10 +627,13 @@ pub(super) fn selects(prefix: &str, path: &str) -> bool {
 
 /// Every retained planted case whose property starts with one of
 /// `prefixes`, with its own committed witness. Fails on a case that names
-/// a nested `set`, which the loop's classes don't judge.
+/// a nested `set`, which the loop's classes don't judge. Each skipped
+/// search case gets a line in `notes`, which `run` points at stderr so that
+/// `--list` keeps stdout to its JSON.
 pub(super) fn planted_cases(
     repo_root: &Path,
     prefixes: &[String],
+    notes: &mut dyn io::Write,
 ) -> Result<Vec<LoopCase>, BoxError> {
     if prefixes.is_empty() {
         return Ok(Vec::new());
@@ -644,8 +651,21 @@ pub(super) fn planted_cases(
         }
         matched.extend(prefixes.iter().filter(|prefix| selects(prefix, &path)));
         let case_file = patch.with_extension("toml");
-        let CaseFile { also_violates, .. } = toml::from_str(&fs::read_to_string(&case_file)?)
+        let CaseFile {
+            also_violates,
+            search,
+            ..
+        } = toml::from_str(&fs::read_to_string(&case_file)?)
             .map_err(|error| format!("{}: {error}", case_file.display()))?;
+        // A search case commits no input for a witness lane to run. The
+        // loop's generator lanes search each mutant instead.
+        if search.is_some() {
+            writeln!(
+                notes,
+                "{path}: skipped: a search case has no committed witness"
+            )?;
+            continue;
+        }
         cases.push(LoopCase {
             label: relative_label(repo_root, &patch),
             listed_in: case_file.clone(),
@@ -1628,7 +1648,7 @@ fn runnable(tree: &Path, witness: &WitnessSpec, property: &str) -> Result<Runnab
                     })
                 }
                 _ => Err(format!(
-                    "{}: names neither or both of seed and typed",
+                    "{}: names no seed or typed case, or more than one",
                     path.display()
                 )
                 .into()),

@@ -2752,6 +2752,10 @@ async fn listener_peer_limit_one_handshake_ok_stay_open() {
 /// Test the listener reserves one inbound slot for a configured zcashd-compat peer,
 /// matching native and IPv4-mapped address representations canonically.
 #[tokio::test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "macOS has no 127.0.0.2 unless a loopback alias is configured"
+)]
 async fn listener_reserves_one_zcashd_compat_inbound_slot() {
     let _init_guard = zakura_test::init();
 
@@ -2863,6 +2867,10 @@ async fn listener_reserves_one_zcashd_compat_inbound_slot() {
 
 /// Test the listener does not add zcashd-compat peers to the recent-IP throttle.
 #[tokio::test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "macOS has no 127.0.0.2 unless a loopback alias is configured"
+)]
 async fn listener_zcashd_compat_reconnect_bypasses_recent_ip_limit() {
     let _init_guard = zakura_test::init();
 
@@ -3507,6 +3515,10 @@ async fn listener_drains_ready_accept_burst_with_short_pacing() {
 
 /// Test bans are applied before the zcashd-compat reserved slot.
 #[tokio::test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "macOS has no 127.0.0.2 unless a loopback alias is configured"
+)]
 async fn listener_bans_zcashd_compat_peer_before_reserved_slot() {
     let _init_guard = zakura_test::init();
 

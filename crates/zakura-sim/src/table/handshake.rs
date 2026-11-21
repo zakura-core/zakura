@@ -201,7 +201,7 @@ pub fn properties<S: HasView>() -> Vec<Property<S>> {
         ),
         (
             "handshake/counts-match-permits",
-            "Admission machine charges equal the live handshake and connection semaphore permits.",
+            "Admission machine charges equal the live handshake semaphore permits, and connection slots equal their per-node sum within the cap.",
         ),
     ] {
         properties.push(Property {
@@ -892,8 +892,9 @@ fn check_counts<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
                 TransportFact::HandshakeCounts {
                     connections,
                     inbound_connections,
-                    connection_permits,
-                    inbound_connection_permits,
+                    node_connections,
+                    inbound_node_connections,
+                    connection_cap,
                     pending,
                     inbound,
                     pending_permits,
@@ -914,15 +915,25 @@ fn check_counts<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
         applies = true;
         match cx.id().as_str() {
             "handshake/counts-match-permits"
-                if pending != pending_permits
-                    || inbound != inbound_permits
-                    || connections != connection_permits
-                    || inbound_connections != inbound_connection_permits =>
+                if pending != pending_permits || inbound != inbound_permits =>
             {
                 return cx.violated(
-                    "machine charges equal handshake and connection permits",
+                    "machine charges equal handshake permits",
                     format!(
-                        "pending {pending}/{inbound}, permits {pending_permits}/{inbound_permits}; connections {connections}/{inbound_connections}, permits {connection_permits}/{inbound_connection_permits}"
+                        "pending {pending}/{inbound}, permits {pending_permits}/{inbound_permits}"
+                    ),
+                );
+            }
+            "handshake/counts-match-permits"
+                if connections != node_connections
+                    || inbound_connections != inbound_node_connections
+                    || connections > connection_cap
+                    || *inbound_connections > connection_cap - reserve(*connection_cap) =>
+            {
+                return cx.violated(
+                    "connection slots equal their per-node sum and stay within the cap",
+                    format!(
+                        "connections {connections}/{inbound_connections}, per node {node_connections}/{inbound_node_connections}, cap {connection_cap}"
                     ),
                 );
             }

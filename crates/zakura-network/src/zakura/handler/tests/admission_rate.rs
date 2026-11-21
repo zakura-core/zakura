@@ -379,3 +379,36 @@ async fn registered_reconnects_keep_their_cadence_charge() -> Result<(), BoxErro
     server.shutdown().await;
     Ok(())
 }
+
+/// A connection guard holds one slot of its node in its direction, and its
+/// drop releases exactly that slot, leaving the node's other slots held.
+#[test]
+fn a_dropped_connection_guard_frees_exactly_its_slot() {
+    let limits = ZakuraLocalLimits::from_config(&Config::default());
+    let handler = ZakuraProtocolHandler::new(
+        ZakuraSupervisorHandle::new(limits.max_connections),
+        Network::Mainnet,
+        ZakuraHandshakeConfig::for_network(&Network::Mainnet),
+        limits,
+    );
+    let node = NodeSecretKey::generate().public();
+    let slots = || handler.supervisor.ip_slots.counts().node_connections(&node);
+    let inbound = handler
+        .claim_connection(node, true)
+        .expect("slots are free");
+    let first_dial = handler
+        .claim_connection(node, false)
+        .expect("slots are free");
+    let second_dial = handler
+        .claim_connection(node, false)
+        .expect("slots are free");
+    assert_eq!((slots().inbound, slots().outbound), (1, 2));
+
+    drop(first_dial);
+    assert_eq!((slots().inbound, slots().outbound), (1, 1));
+    drop(inbound);
+    assert_eq!((slots().inbound, slots().outbound), (0, 1));
+    assert_eq!(handler.supervisor.ip_slots.counts().connections(), 1);
+    drop(second_dial);
+    assert_eq!(handler.supervisor.ip_slots.counts().connections(), 0);
+}

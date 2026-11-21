@@ -1415,8 +1415,7 @@ async fn a_round_admits_no_more_dials_than_free_admission_permits() {
         .expect("dialer spawns");
     let endpoint = node.endpoint();
     let permits = endpoint.discovery_dial_permits();
-    let held = endpoint
-        .hold_admission_permits(u32::try_from(permits - 1).expect("the test node has few permits"));
+    let held = endpoint.hold_connection_slots(permits - 1);
     assert_eq!(endpoint.discovery_dial_permits(), 1);
     assert!(
         endpoint.discovery_admission_capacity() >= 3,

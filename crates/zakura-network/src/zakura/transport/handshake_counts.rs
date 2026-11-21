@@ -1,7 +1,13 @@
 //! Pure admission decisions and charges shared by QUIC and control handshakes.
 
 use std::{net::IpAddr, time::Duration};
+use zakura_quic::NodeId;
 use zakura_rt::{collections::HashMap, time::Instant};
+
+mod slots;
+
+use slots::ConnectionSlots;
+pub use slots::SlotCount;
 
 use crate::zakura::regulation::Bucket;
 use crate::zakura::{admission_host, Cadence, DEFAULT_ZAKURA_REDIAL_INITIAL_BACKOFF};
@@ -90,8 +96,8 @@ pub struct HandshakeCounts {
     pending: usize,
     inbound_pending: usize,
     inbound_reservations: usize,
-    connections: usize,
-    inbound_connections: usize,
+    /// Connection slots, by the remote node that holds them.
+    connections: ConnectionSlots,
     /// Charges of attempts whose source address was validated, by a Retry
     /// token, before TLS.
     validated_cadence: CadenceLedger,
@@ -264,43 +270,41 @@ impl HandshakeCounts {
     }
     /// Counts connection slots from admission until the serving task exits.
     pub fn connections(&self) -> usize {
-        self.connections
+        self.connections.total()
     }
 
     /// Counts the inbound share of connection slots.
     pub fn inbound_connections(&self) -> usize {
-        self.inbound_connections
+        self.connections.inbound()
     }
 
     /// Checks whether the connection budget can admit this direction.
     pub fn connections_full(&self, inbound: bool, cap: usize) -> bool {
-        self.connections >= cap || (inbound && self.inbound_connections >= inbound_share(cap))
+        self.connections.full(inbound, cap)
     }
 
-    /// Charges a connection slot while preserving the dial reserve.
-    pub fn claim_connection(&mut self, inbound: bool, cap: usize) -> bool {
-        if self.connections_full(inbound, cap) {
-            return false;
-        }
-        self.connections += 1;
-        if inbound {
-            self.inbound_connections += 1;
-        }
-        true
+    /// Charges a connection slot to `node` while preserving the dial
+    /// reserve: the total stays within `cap`, and inbound slots within its
+    /// inbound share. The check and the charge are one step.
+    pub fn claim_connection(&mut self, node: NodeId, inbound: bool, cap: usize) -> bool {
+        self.connections.claim(node, inbound, cap)
     }
 
-    /// Releases the slot that `claim_connection` charged.
-    pub fn release_connection(&mut self, inbound: bool) {
-        self.connections = self
-            .connections
-            .checked_sub(1)
-            .expect("a live connection owns its charge");
-        if inbound {
-            self.inbound_connections = self
-                .inbound_connections
-                .checked_sub(1)
-                .expect("an inbound connection owns its inbound charge");
-        }
+    /// Releases the slot that `claim_connection` charged to `node`.
+    pub fn release_connection(&mut self, node: NodeId, inbound: bool) {
+        self.connections.release(node, inbound);
+    }
+
+    /// The connection slots `node` holds now.
+    pub fn node_connections(&self, node: &NodeId) -> SlotCount {
+        self.connections.of_node(node)
+    }
+
+    /// Every node's connection slots added up. It equals
+    /// [`Self::connections`] and [`Self::inbound_connections`] while the
+    /// per-node record is consistent.
+    pub fn summed_node_connections(&self) -> SlotCount {
+        self.connections.summed()
     }
 
     /// Counts control-handshake permits, including this node's dials.

@@ -682,9 +682,10 @@ where
     }
 
     /// Call `block_announcement_hook` for each block a peer announces in a single-block `inv`,
-    /// at most a few times per connection per window. Optional.
+    /// and for the block header that starts each `block` message, at most a few times per
+    /// connection per window. Optional.
     ///
-    /// If this is unset, announcements are not passed on.
+    /// If this is unset, neither is passed on.
     pub fn with_block_announcement_hook(
         mut self,
         block_announcement_hook: BlockAnnouncementHook,
@@ -1811,6 +1812,10 @@ where
             let bare_codec = peer_conn.codec_mut();
             bare_codec.reconfigure_version(connection_info.negotiated_version);
             bare_codec.reconfigure_full_body_len();
+            // One allowance for this connection, shared by its decoder and its message filter.
+            // The decoder reports block headers only now that the handshake is done.
+            let block_announcements = block_announcement_hook.for_connection();
+            bare_codec.report_block_headers_to(block_announcements.block_header_hook());
 
             debug!("constructing client, spawning server");
 
@@ -1860,7 +1865,6 @@ where
             // Block gossip skips this peer for the blocks it announces to us.
             let announced_blocks = AnnouncedBlocks::default();
             let inbound_announced_blocks = announced_blocks.clone();
-            let mut block_announcements = block_announcement_hook.for_connection();
             let gossip_trace = gossip_trace.for_peer(&connected_addr);
             let connection_id = gossip_trace.connection_id();
             let peer_registry_updater = peer_registry_updater
@@ -1929,7 +1933,7 @@ where
                             connected_addr,
                             &inbound_inv_collector,
                             &inbound_announced_blocks,
-                            &mut block_announcements,
+                            &block_announcements,
                             &inbound_gossip_trace,
                         )
                     })
@@ -2100,7 +2104,7 @@ pub(crate) fn register_inventory_status(
     connected_addr: ConnectedAddr,
     inv_collector: &broadcast::Sender<InventoryChange>,
     announced_blocks: &AnnouncedBlocks,
-    block_announcements: &mut ConnectionAnnouncements,
+    block_announcements: &ConnectionAnnouncements,
     gossip_trace: &PeerGossipTrace,
 ) -> Result<Message, SerializationError> {
     match &msg {

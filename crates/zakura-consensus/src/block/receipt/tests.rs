@@ -1,6 +1,7 @@
 //! Tests for receipt order and announcement claims, with their shared fixtures.
 
 mod announced;
+mod block_message;
 mod claims;
 mod counter;
 mod registry;

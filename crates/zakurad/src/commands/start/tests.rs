@@ -31,6 +31,29 @@ async fn shutdown_cannot_mask_a_ready_writer_failure() {
     );
 }
 
+/// The node keeps the first sighting of each block legacy peers show it, to rank the block's
+/// body. If peers could fill that store, they could deny an honest block its place, so at the
+/// default connection limits it must hold everything they can show it while an entry lasts.
+///
+/// The store's size and lifetime are set in `zakura-consensus`. Each connection's allowance
+/// and the connection limits are set in `zakura-network`, which does not depend on it. This
+/// test fails if either side changes without the other.
+#[test]
+fn legacy_peers_cannot_fill_the_block_sighting_store_at_the_default_limits() {
+    use zakura_consensus::AnnouncementClaims;
+
+    let most_shown = zakura_network::BlockAnnouncementHook::most_blocks_passed_within(
+        &ZakuradConfig::default().network,
+        AnnouncementClaims::LEGACY_SIGHTING_LIFETIME,
+    );
+    assert!(
+        most_shown <= AnnouncementClaims::MAX_LEGACY_SIGHTINGS,
+        "legacy peers can show the node {most_shown} blocks while a sighting lasts, but the \
+         store holds {}: raise the store's size or lower what one connection may pass on",
+        AnnouncementClaims::MAX_LEGACY_SIGHTINGS,
+    );
+}
+
 #[test]
 fn advertised_services_describe_storage_mode_with_or_without_zcashd_compat() {
     for compat in [false, true] {

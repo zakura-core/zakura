@@ -8,8 +8,7 @@ use super::super::order::BodyArrival;
 use super::{in_claim_window, AnnouncementClaims, CLAIM_BODY_DEADLINE};
 
 impl AnnouncementClaims {
-    /// Gives a body the earliest usable reservation for its hash, without consuming it.
-    /// If all eligible claims failed, report the first one's outcome for metrics.
+    /// Checks the first held reservation for this hash against the body arrival.
     pub(in crate::block::receipt) fn resolve(
         &self,
         hash: block::Hash,
@@ -19,53 +18,38 @@ impl AnnouncementClaims {
         use ClaimOutcome::{Expired, Unclaimed, Used, Voided};
 
         let table = self.table();
-        let classify = |source, height, order, seen_at| {
-            if order >= arrival.order {
+        // A legacy sighting coexists with a header only while waiting for its apply to fail.
+        let (source, height, order, seen_at) = if let Some(header) = table.by_hash.get(&hash) {
+            (
+                ClaimSource::Header,
+                header.height,
+                header.order,
+                header.seen_at,
+            )
+        } else if let Some((height, legacy)) = height.zip(table.announced.get(hash, arrival.time)) {
+            if height < table.floor || !in_claim_window(height, legacy.tip_at_announcement) {
                 return Unclaimed;
             }
-            let Some(age) = arrival.time.checked_duration_since(seen_at) else {
-                return Unclaimed;
-            };
-            let voided = table.mined.iter().any(|(mined_hash, mined)| {
-                *mined_hash != hash && mined.height == height && order < mined.order
-            });
-            if voided {
-                Voided { source, age }
-            } else if age > CLAIM_BODY_DEADLINE {
-                Expired { source, age }
-            } else {
-                Used { source, order, age }
-            }
+            (legacy.source, height, legacy.order, legacy.seen_at)
+        } else {
+            return Unclaimed;
         };
 
-        let header = table.by_hash.get(&hash);
-        // An inv received during an earlier header apply is usable only if every apply fails.
-        let inv = height
-            .zip(table.announced.get(hash))
-            .filter(|(height, inv)| {
-                header.is_none_or(|header| inv.order < header.order)
-                    && *height >= table.floor
-                    && in_claim_window(*height, inv.tip_at_announcement)
-            })
-            .map_or(Unclaimed, |(height, inv)| {
-                classify(ClaimSource::Inv, height, inv.order, inv.seen_at)
-            });
-        if matches!(inv, Used { .. }) {
-            return inv;
+        if order >= arrival.order {
+            return Unclaimed;
         }
-
-        let Some(header) = header else {
-            return inv;
+        let Some(age) = arrival.time.checked_duration_since(seen_at) else {
+            return Unclaimed;
         };
-        let header = classify(
-            ClaimSource::Header,
-            header.height,
-            header.order,
-            header.seen_at,
-        );
-        match (inv, header) {
-            (_, Used { .. }) | (Unclaimed, _) => header,
-            _ => inv,
+        let voided = table.mined.iter().any(|(mined_hash, mined)| {
+            *mined_hash != hash && mined.height == height && order < mined.order
+        });
+        if voided {
+            Voided { source, age }
+        } else if age > CLAIM_BODY_DEADLINE {
+            Expired { source, age }
+        } else {
+            Used { source, order, age }
         }
     }
 }
@@ -77,13 +61,17 @@ pub(in crate::block::receipt) enum ClaimSource {
     Header,
     /// A legacy peer sent the first `inv` for the block.
     Inv,
+    /// The block header at the start of a legacy `block` message was the block's first legacy
+    /// sighting. The message may have been requested or pushed.
+    BlockMessage,
 }
 
 impl ClaimSource {
-    fn label(self) -> &'static str {
+    pub(super) fn label(self) -> &'static str {
         match self {
             Self::Header => "header",
             Self::Inv => "inv",
+            Self::BlockMessage => "block",
         }
     }
 }

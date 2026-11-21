@@ -364,24 +364,18 @@ impl StartCmd {
         Ok(())
     }
 
-    /// Makes sure a node that announces itself as a gateway keeps its node ID across restarts.
-    ///
-    /// Recent blocks keep naming the gateway by that ID, so a node that would come back with a
-    /// new ID refuses to start instead. A node with no key yet saves one now.
-    fn ensure_miner_mesh_gateway_identity(config: &ZakuradConfig) -> Result<(), Report> {
-        if !config.mining.miner_mesh {
-            return Ok(());
-        }
-
-        config
-            .network
-            .ensure_stable_zakura_identity()
-            .map_err(|error| {
+    /// Prepares the endpoint config, pinning a persistent identity for an announcing gateway.
+    fn network_config_for_start(config: &ZakuradConfig) -> Result<zakura_network::Config, Report> {
+        let mut network = config.network.clone();
+        if config.mining.miner_mesh {
+            network.pin_stable_zakura_identity().map_err(|error| {
                 eyre!(
                     "mining.miner_mesh needs a node key that stays the same across restarts: \
                      {error}"
                 )
-            })
+            })?;
+        }
+        Ok(network)
     }
 
     fn validate_debug_blocksync_throughput_config(config: &ZakuradConfig) -> Result<(), Report> {
@@ -524,7 +518,7 @@ impl StartCmd {
         Self::validate_consensus_config(&config)?;
         Self::validate_debug_blocksync_throughput_config(&config)?;
         Self::validate_miner_mesh_config(&config)?;
-        Self::ensure_miner_mesh_gateway_identity(&config)?;
+        let mut network_config = Self::network_config_for_start(&config)?;
         config.rpc.validate().map_err(|error| eyre!(error))?;
         let backend_verifications = config
             .sync
@@ -781,7 +775,6 @@ impl StartCmd {
 
         // The network counts `tx-relay`'s memory shares only when it is
         // registered, not merely enabled.
-        let mut network_config = config.network.clone();
         network_config.zakura.tx_relay.enabled = tx_relay_port.is_some();
         // The service is registered on the v2 endpoint, which a legacy-only
         // stack never starts.

@@ -63,14 +63,15 @@ run-4). In order, it:
 9. `reach`: with `--reach-runs` above 0, the default, runs one mixed
    generator search on every generator harness with
    `scripts/suite_fuzz_run.py reach`, seeded by the UTC day, and counts for
-   each property the runs and the free runs that applied it;
+   each property the runs and the free runs that applied it. The step
+   fails when a search exits nonzero, writes no report or stops early;
 10. `completeness`: writes `completeness.json`, which lists the manifest rows
    the routine ran, the rows it didn't run and why, the unimplemented rows,
    and each property's reach. It reports coverage only, apart from
    `findings.json`. A property no free run applied is a reach finding:
    `findings.json` lists every one under `reach`, and the routine fails on
-   one that `<state>/latest-reach.json`, the previous run's list, doesn't
-   hold.
+   one that `REACH_MISSES` runs in a row missed. `<state>/latest-reach.json`
+   carries each property's misses to the next run.
 
 Each run writes under `<state>/runs/<UTC time>-<commit>/`, with each step's
 exit status in `routine.json`, and `<state>/latest.json` names the last
@@ -93,6 +94,11 @@ CUMULATIVE_FILES = {"loop": "cumulative.json", "libfuzzer": "cumulative-libfuzze
 ROUTINE_FILE = "routine.json"
 REACH_FILE = "reach.json"
 LATEST_REACH_FILE = "latest-reach.json"
+# The daily runs in a row that must miss a property before the routine fails
+# on it. Each day's search draws new inputs, so one miss can be noise: a
+# property a day's search reaches half the time misses three in a row once
+# in eight runs, and one it reaches nine times in ten once in a thousand.
+REACH_MISSES = 3
 FINDINGS_FILE = "findings.json"
 SUITE_MANIFEST_FILE = "suite-manifest.json"
 SUITE_FUZZ_SCRIPT = Path(__file__).resolve().parent / "suite_fuzz_run.py"
@@ -264,10 +270,18 @@ def reach_seed(now):
 
 
 def reach_findings(record, previous):
-    """Return the reach findings: every unreached property, and those the previous run's list didn't hold."""
+    """Return the reach findings: every unreached property, its misses in a row, and those that just reached `REACH_MISSES`.
+
+    `previous` is the last run's `latest-reach.json`. A property's count
+    restarts once a run reaches it.
+    """
     unreached = record.get("unreached", [])
-    before = set((previous or {}).get("unreached", []))
-    return {"unreached": unreached, "new_unreached": [prop for prop in unreached if prop not in before]}
+    before = (previous or {}).get("misses", {})
+    misses = {prop: before.get(prop, 0) + 1 for prop in unreached}
+    return {
+        "unreached": unreached, "misses": misses,
+        "new_unreached": [prop for prop in unreached if misses[prop] == REACH_MISSES],
+    }
 
 
 def read_latest(state, name=LATEST_FILE):
@@ -499,8 +513,8 @@ def routine(args):
         findings[lane] = changes
         record["news"][lane] = has_news(changes)
         status = status or int(record["news"][lane])
-    # A property no free run applied is a reach finding, and one the
-    # previous run didn't list is news.
+    # A property no free run applied is a reach finding, and one that
+    # `REACH_MISSES` runs in a row missed is news.
     if (run_dir / REACH_FILE).exists():
         record_reach = read_json(run_dir / REACH_FILE)
         found = reach_findings(record_reach, read_json(state / LATEST_REACH_FILE))
@@ -509,7 +523,7 @@ def routine(args):
         status = status or int(record["news"]["reach"])
         if "error" not in record_reach:
             (state / LATEST_REACH_FILE).write_text(json.dumps(
-                {"pinned": pinned, "unreached": found["unreached"]}, indent=2) + "\n")
+                {"pinned": pinned, "unreached": found["unreached"], "misses": found["misses"]}, indent=2) + "\n")
     (run_dir / FINDINGS_FILE).write_text(json.dumps(findings, indent=2) + "\n")
     if ended.get("loop") == 0 or (run_dir / "loop" / REPORT_FILE).exists():
         (state / LATEST_FILE).write_text(json.dumps({"pinned": pinned, "run": str(run_dir)}, indent=2) + "\n")

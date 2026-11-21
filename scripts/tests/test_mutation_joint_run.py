@@ -192,11 +192,20 @@ class RoutineTests(unittest.TestCase):
         loop = plan["steps"][names.index("loop")]["argv"]
         self.assertEqual(loop[loop.index("--generate-draws") + 1], "cycle")
 
-    def test_a_reach_finding_is_news_only_when_the_previous_list_lacks_it(self):
-        record = {"unreached": ["a", "b"]}
-        self.assertEqual(joint.reach_findings(record, None), {"unreached": ["a", "b"], "new_unreached": ["a", "b"]})
-        self.assertEqual(joint.reach_findings(record, {"unreached": ["a"]})["new_unreached"], ["b"])
-        self.assertEqual(joint.reach_findings(record, {"unreached": ["a", "b", "c"]})["new_unreached"], [])
+    def test_a_reach_finding_is_news_only_after_reach_misses_runs_in_a_row(self):
+        """A property fails the routine once, on its `REACH_MISSES`th miss in a row; one reach restarts its count."""
+        self.assertEqual(joint.REACH_MISSES, 3)
+        days = [["a", "b"], ["a", "b"], ["a"], ["a", "b"], ["a", "b"], ["b"], ["b"]]
+        previous, news = None, []
+        for unreached in days:
+            found = joint.reach_findings({"unreached": unreached}, previous)
+            self.assertEqual(found["unreached"], unreached)
+            news.append(found["new_unreached"])
+            previous = {"unreached": unreached, "misses": found["misses"]}
+        # `a` misses days 1–3 and fails on day 3 only; `b` is reached on
+        # day 3, so its misses restart and reach three on day 6.
+        self.assertEqual(news, [[], [], ["a"], [], [], ["b"], []])
+        self.assertEqual(previous["misses"], {"b": 4})
 
     def test_a_later_run_covers_what_changed_since_the_last_pin(self):
         with tempfile.TemporaryDirectory() as state:

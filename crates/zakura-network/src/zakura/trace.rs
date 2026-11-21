@@ -456,9 +456,10 @@ impl ZakuraTrace {
             } else {
                 "sample"
             };
-            let peer = ZakuraPeerId::new(sample.remote_id.as_bytes().to_vec())
-                .map(|peer_id| peer_label(&peer_id))
-                .ok();
+            // A connection has no peer until its control exchange binds one.
+            let peer = sample
+                .remote_id
+                .map(|node_id| peer_label(&ZakuraPeerId::from_node_id(node_id)));
             let admitted_ip = if expose_peer_addresses {
                 sample.admitted_ip.to_string()
             } else if sample.admitted_ip.is_ipv4() {
@@ -876,7 +877,7 @@ mod tests {
         let sample = zakura_quic::ConnSample {
             stable_id: 17,
             outbound: true,
-            remote_id: zakura_quic::NodeSecretKey::from_bytes(&[5; 32]).public(),
+            remote_id: Some(zakura_quic::NodeSecretKey::from_bytes(&[5; 32]).public()),
             admitted_ip: "203.0.113.9".parse().expect("test address parses"),
             rtt: std::time::Duration::from_millis(42),
             cwnd: 12_000,

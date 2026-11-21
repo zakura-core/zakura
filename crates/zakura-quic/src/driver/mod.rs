@@ -30,7 +30,7 @@ use zakura_rt::{
 
 use crate::{
     error::{ReadError, WriteError},
-    key::NodeId,
+    key::{NodeId, NodeKey},
 };
 
 pub(crate) mod connection;
@@ -146,6 +146,9 @@ pub(crate) struct ConnShared {
     /// [`SendStream::stopped`]: crate::SendStream::stopped
     stopped: Mutex<HashMap<StreamId, watch::Sender<Option<VarInt>>>>,
     pub(crate) stable_id: usize,
+    /// The node ID the application bound to this connection (API-4). The TLS
+    /// handshake proves a key, not an ID, so this starts empty.
+    pub(crate) remote_id: std::sync::OnceLock<NodeId>,
     /// The connection task's latest load snapshot (API-9).
     pub(crate) load: watch::Sender<crate::conn::ConnLoad>,
     /// Datagram bytes the endpoint queued that the task hasn't handled yet.
@@ -176,6 +179,7 @@ impl ConnShared {
             closed: watch::Sender::new(None),
             stopped: Mutex::new(HashMap::new()),
             stable_id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            remote_id: std::sync::OnceLock::new(),
             load: watch::Sender::new(crate::conn::ConnLoad::new(remote)),
             queued_datagram_bytes: AtomicUsize::new(0),
             queue_drops: counter::AtomicU64::new(0),
@@ -279,7 +283,7 @@ impl ConnRef {
 /// What a completed handshake proved (TLS-8).
 #[derive(Clone, Debug)]
 pub(crate) struct Handshake {
-    pub(crate) remote_id: Option<NodeId>,
+    pub(crate) remote_key: Option<NodeKey>,
     pub(crate) alpn: Option<Vec<u8>>,
 }
 

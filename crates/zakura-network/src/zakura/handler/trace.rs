@@ -32,6 +32,12 @@ impl ZakuraConnTrace {
         }
     }
 
+    /// Labels the rows from here on with `peer_id`, once the control
+    /// exchange has established who the peer is.
+    pub(super) fn bind_peer(&mut self, peer_id: &ZakuraPeerId) {
+        self.peer_id = self.trace.is_enabled().then(|| peer_id.clone());
+    }
+
     #[cfg(any(test, feature = "zakura-testkit"))]
     pub(super) fn without_peer(id: u64) -> Self {
         Self {

@@ -17,7 +17,7 @@ use zakura_rt::{
 
 use crate::{
     driver::{ConnCmd, ConnRef, ConnShared},
-    key::NodeId,
+    key::{NodeId, NodeKey},
     stream::{RecvStream, SendStream},
 };
 
@@ -35,8 +35,8 @@ pub struct ConnSample {
     pub stable_id: usize,
     /// Whether this node dialed the connection.
     pub outbound: bool,
-    /// The TLS-proven remote node ID.
-    pub remote_id: NodeId,
+    /// The node ID bound with [`Conn::bind_remote_id`], if any yet.
+    pub remote_id: Option<NodeId>,
     /// The admitted IP (PATH-4).
     pub admitted_ip: IpAddr,
     /// Smoothed RTT.
@@ -278,7 +278,7 @@ impl Hooks {
 #[derive(Clone)]
 pub struct Conn {
     inner: ConnRef,
-    remote_id: NodeId,
+    remote_key: NodeKey,
     admitted_addr: SocketAddr,
     admitted_at: Instant,
     source_validated: bool,
@@ -288,7 +288,8 @@ pub struct Conn {
 impl fmt::Debug for Conn {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Conn")
-            .field("remote_id", &self.remote_id)
+            .field("remote_key", &self.remote_key)
+            .field("remote_id", &self.remote_id())
             .field("admitted_addr", &self.admitted_addr)
             .field("admitted_at", &self.admitted_at)
             .field("source_validated", &self.source_validated)
@@ -300,7 +301,7 @@ impl fmt::Debug for Conn {
 impl Conn {
     pub(crate) fn new(
         inner: ConnRef,
-        remote_id: NodeId,
+        remote_key: NodeKey,
         admitted_addr: SocketAddr,
         admitted_at: Instant,
         source_validated: bool,
@@ -308,7 +309,7 @@ impl Conn {
     ) -> Self {
         Self {
             inner,
-            remote_id,
+            remote_key,
             admitted_addr,
             admitted_at,
             source_validated,
@@ -316,9 +317,28 @@ impl Conn {
         }
     }
 
-    /// The peer's node ID, proven by the TLS handshake (TLS-8).
-    pub fn remote_id(&self) -> NodeId {
-        self.remote_id
+    /// The Ed25519 key the peer proved in the TLS handshake (TLS-8).
+    pub fn remote_key(&self) -> NodeKey {
+        self.remote_key
+    }
+
+    /// The peer's node ID, once the application has bound one with
+    /// [`Self::bind_remote_id`] (API-4).
+    ///
+    /// TLS proves a key. Which node that key belongs to is for the
+    /// application to establish, so a new connection has no ID.
+    pub fn remote_id(&self) -> Option<NodeId> {
+        self.inner.shared.remote_id.get().copied()
+    }
+
+    /// Records `id` as this connection's peer, for [`Self::remote_id`] and
+    /// the connection's samples (OBS-3). Every clone of the connection sees
+    /// it.
+    ///
+    /// The caller vouches that the peer holding [`Self::remote_key`] is the
+    /// node `id`. The first ID bound stays; a later call changes nothing.
+    pub fn bind_remote_id(&self, id: NodeId) {
+        let _ = self.inner.shared.remote_id.set(id);
     }
 
     /// The IP admitted at accept or dial time. It never changes (PATH-4).

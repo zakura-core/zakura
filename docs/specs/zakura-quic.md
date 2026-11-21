@@ -1,6 +1,6 @@
 # Spec: `zakura-quic` transport
 
-Status: draft for review, 2026-11-18. Version 0.22.
+Status: draft for review, 2026-11-20. Version 0.24.
 This document is authoritative for the `zakura-quic` crate, its configuration,
 its wire behavior and its `quinn-proto` dependency policy.
 [Decision 0003](../decisions/zakura/0003-zakura-quic-transport.md) records the
@@ -48,7 +48,12 @@ connection's source validation, and caps a closed connection's drain at
 `SHUTDOWN_DRAIN`; it changes ADM-3, ADM-13, API-3 and API-4, and §17s lists
 each change. Version 0.22 adds a node-wide handshake cadence, keeps admission
 charges once TLS starts, and reports when the endpoint admitted a
-connection; it changes ADM-3 and API-4, and §17t lists each change.
+connection; it changes ADM-3 and API-4, and §17t lists each change. Version
+0.23 names the Ed25519 public key `NodeKey`, apart from the `NodeId` that
+holds it. It updates ID-1, TLS-6 through TLS-8, API-1 and API-4. See §17u.
+Version 0.24 has a connection report the key TLS proved, and leaves the
+node ID for the application to bind; it changes TLS-8, ADM-9, OBS-3 and
+API-4, and §17v lists each change.
 
 ## 0. Conventions
 
@@ -127,8 +132,9 @@ Terms:
 
 ## 3. Identity
 
-- **ID-1.** `NodeId` is a 32-byte compressed Ed25519 public key. Construction
-  MUST reject bytes that:
+- **ID-1.** `NodeKey` is a 32-byte compressed Ed25519 public key. `NodeId`,
+  the name peers know a node by, is that node's `NodeKey`: the same bytes
+  under the same checks. Construction of either MUST reject bytes that:
   - don't decompress to a curve point;
   - aren't the canonical encoding of that point (the point must recompress to
     the same bytes);
@@ -178,12 +184,14 @@ at fork tag `zakura-iroh-v1.1.0-rc.1`, and it keeps their MIT/Apache-2.0 notices
 - **TLS-4.** The only signature scheme is `ED25519`.
 - **TLS-5.** Client authentication is mandatory. The server MUST abort a
   handshake without a client key.
-- **TLS-6.** The client MUST NOT send SNI. It passes the expected `NodeId` to
-  its verifier in memory.
-- **TLS-7.** The client verifier MUST abort unless the server's key equals the
-  dialed `NodeId`.
-- **TLS-8.** The server MUST take the client's `NodeId` from the client's key.
-  `Conn::remote_id()` MUST return only a key proven this way.
+- **TLS-6.** The client MUST NOT send SNI. It passes the `NodeKey` from the
+  dialed `NodeId` to its verifier in memory.
+- **TLS-7.** The client verifier MUST abort unless the server presents the
+  expected `NodeKey`.
+- **TLS-8.** The server MUST take the client's `NodeKey` from the client's
+  certificate. `Conn::remote_key()` MUST return only a key proven this way.
+  The handshake proves a key and no node ID: `Conn::remote_id()` is `None`
+  until the application binds an ID (API-4).
 - **TLS-9.** The crypto provider is rustls' `ring` provider with its default
   TLS 1.3 cipher suites. `bind` uses it unchanged. An endpoint built with
   `bind_with` MAY replace the provider's random source and key-exchange
@@ -508,7 +516,7 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
 - **ADM-8.** An established connection counts against its admitted IP until
   `Conn::closed()` resolves. The slot MUST NOT be released earlier.
 - **ADM-9.** After the handshake, `Acceptor::handle` receives a `Conn` whose
-  `remote_id()` is proven. Stage 2 (control hello, per-identity dedup, cohort
+  `remote_key()` is proven. Stage 2 (control hello, per-identity dedup, cohort
   check) stays in `zakura-network` and doesn't change.
 - **ADM-10.** Retry tokens and stateless-reset tokens MUST use `quinn-proto`'s
   ring-backed defaults: a random `ring::hkdf::Prk` for tokens and a random
@@ -831,7 +839,8 @@ These are not configurable. Changing one needs a spec change.
   `quic_conn` JSONL row per connection every 10 s and on close. The endpoint
   delivers each sample to a `ConnObserver` callback, because `zakura-quic`
   doesn't depend on Zakura's trace crate. Each row holds `event` (`sample` or
-  `closed`), `conn`, `direction` (`inbound` or `outbound`), `peer`,
+  `closed`), `conn`, `direction` (`inbound` or `outbound`), `peer` (null
+  until the application binds the connection's node ID),
   `admitted_ip`, `rtt_micros`, `cwnd`, `lost_packets`,
   `congestion_events`, `bytes_sent`, `bytes_received`, `current_mtu`,
   `bytes_in_flight`, `send_blocked_micros` and `close_reason`. For a close this
@@ -877,7 +886,8 @@ These are not configurable. Changing one needs a spec change.
 
 The public surface of `zakura-quic`. Changing it is a semver change of the crate.
 
-- **API-1.** Identity: `NodeId`, `NodeSecretKey` and `NodeAddr { id, direct: Vec<SocketAddr> }`.
+- **API-1.** Identity: `NodeId`, `NodeKey`, `NodeSecretKey` and
+  `NodeAddr { id, direct: Vec<SocketAddr> }`.
 - **API-2.** `QuicEndpoint`:
   - `bind(secret, &QuicBindConfig, &QuicConfig) -> Result<QuicEndpoint, BindError>`;
   - `bind_with(secret, &QuicBindConfig, &QuicConfig, impl SocketFactory, EndpointInputs)`,
@@ -923,8 +933,13 @@ The public surface of `zakura-quic`. Changing it is a semver change of the crate
     already taken over the attempt's accounting; otherwise the acceptor
     releases what `admit` reserved.
 - **API-4.** `Conn`:
-  - `remote_id()`, `admitted_ip()`, `admitted_addr()`, `admitted_at()`,
-    `source_validated()`, `alpn()` and `stable_id()`. `source_validated()` is
+  - `remote_key()`, `admitted_ip()`, `admitted_addr()`,
+    `admitted_at()`, `source_validated()`, `alpn()` and `stable_id()`.
+  - `bind_remote_id(NodeId)` and `remote_id()`. The application binds the
+    node ID once it has established which node holds `remote_key()`.
+    `remote_id()` returns it, and `None` before. The first ID bound stays,
+    and every clone of the connection sees it.
+    `source_validated()` is
     `IncomingInfo::validated` for an inbound connection, and true for an
     outbound one. `admitted_at()` is the instant of the endpoint's `Accept`
     for an inbound connection, and the start of the winning attempt for an
@@ -1638,3 +1653,40 @@ Changed:
   `control_timeout` from the endpoint's `Accept`.
 - **API-4.** Adds `Conn::admitted_at`, so an acceptor can measure a
   whole-handshake deadline from admission.
+
+## 17u. Changes in version 0.23
+
+Code that verifies a signature or builds a TLS certificate needs the node's
+Ed25519 public key, and code that names a peer needs its node ID. One type
+served both, so nothing marked which uses depend on the ID being a key.
+`NodeKey` now names the key. The wire, the text forms and every existing
+`NodeId` are unchanged.
+
+Changed:
+
+- **ID-1.** Defines `NodeKey` as the Ed25519 public key and `NodeId` as the
+  node's `NodeKey`. The construction checks are the same for both.
+- **TLS-6 through TLS-8.** The client verifier takes an expected `NodeKey`.
+  Both endpoints derive the peer's ID from the key proved in TLS.
+- **API-1.** Adds `NodeKey`, `NodeId::key()` and
+  `NodeSecretKey::public_key()`. `NodeId::verify_strict()` delegates
+  to `NodeKey::verify_strict()`.
+- **API-4.** Adds `Conn::remote_key()`, the key the peer proved in the TLS
+  handshake.
+
+## 17v. Changes in version 0.24
+
+The TLS handshake proves that the peer holds a key. Which node that key
+belongs to is a separate question, and the application answers it: Zakura's
+responder reads it from the peer's control hello, and its dialer knows which
+node it dialed. The connection reported the key as the node ID, so nothing
+marked the point where the ID became known. A node ID is still its key, so no
+ID and nothing on the wire changes.
+
+Changed:
+
+- **TLS-8.** The handshake yields a `NodeKey`, not a `NodeId`.
+- **ADM-9.** The `Conn` handed to the acceptor has a proven `remote_key()`.
+- **API-4.** `Conn::remote_id()` returns an `Option`, empty until
+  `Conn::bind_remote_id` is called.
+- **OBS-3.** A sample taken before the ID is bound has no `peer`.

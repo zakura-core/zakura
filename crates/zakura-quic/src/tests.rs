@@ -199,7 +199,7 @@ fn stalled_handshake_to(server: &QuicEndpoint) -> StalledHandshake {
         None,
     );
     let tls = crate::tls::TlsConfig::new(&NodeSecretKey::generate())
-        .client_config(server.local_id(), &[ALPN])
+        .client_config(server.local_id().key(), &[ALPN])
         .unwrap();
     let now = std::time::Instant::now();
     let (_, mut conn) = endpoint
@@ -243,7 +243,7 @@ async fn dial_authenticates_both_sides_and_echoes() {
         let mut server = server();
         let client = client();
         let conn = client.connect(server.addr(), &[ALPN]).await.unwrap();
-        assert_eq!(conn.remote_id(), server.endpoint.local_id());
+        assert_eq!(conn.remote_key(), server.endpoint.local_id().key());
         assert_eq!(conn.alpn(), ALPN);
         assert_eq!(conn.admitted_ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert!(conn.source_validated(), "this node dialed the address");
@@ -254,8 +254,17 @@ async fn dial_authenticates_both_sides_and_echoes() {
         assert_eq!(echo(&conn, &payload).await, payload);
 
         let inbound = server.handled.recv().await.unwrap();
-        assert_eq!(inbound.remote_id(), client.local_id());
+        assert_eq!(inbound.remote_key(), client.local_id().key());
         assert!(!inbound.source_validated(), "no Retry validated the source");
+
+        // TLS proves a key; the application binds the node ID, once.
+        assert_eq!(inbound.remote_id(), None);
+        let shared = inbound.clone();
+        inbound.bind_remote_id(client.local_id());
+        inbound.bind_remote_id(server.endpoint.local_id());
+        assert_eq!(shared.remote_id(), Some(client.local_id()));
+        assert_eq!(conn.remote_id(), None, "the dialing side binds its own");
+
         let seen = server.seen.lock().unwrap().clone();
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].remote.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
@@ -1067,7 +1076,7 @@ fn raw_client_builder(
         .unwrap()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(
-            crate::tls::verifier::ServerCertificateVerifier::new(server.endpoint.local_id()),
+            crate::tls::verifier::ServerCertificateVerifier::new(server.endpoint.local_id().key()),
         ))
 }
 
@@ -1880,8 +1889,9 @@ async fn client_presenting_a_key_it_cannot_sign_for_is_refused() {
     tokio::time::timeout(TEST_TIMEOUT, async {
         let mut server = server();
         let victim = NodeSecretKey::generate().public();
-        let cert =
-            rustls_pki_types::CertificateDer::from(crate::tls::ed25519_spki(&victim).to_vec());
+        let cert = rustls_pki_types::CertificateDer::from(
+            crate::tls::ed25519_spki(&victim.key()).to_vec(),
+        );
         let key = Arc::new(rustls::sign::CertifiedKey::new(
             vec![cert],
             Arc::new(Impostor(NodeSecretKey::generate())),
@@ -2820,10 +2830,10 @@ async fn the_driver_runs_over_simnet_without_os_sockets_or_pollers() {
         let client = sim_endpoint(&net, sim_addr(2));
 
         let conn = client.connect(server.addr(), &[ALPN]).await.unwrap();
-        assert_eq!(conn.remote_id(), server.endpoint.local_id());
+        assert_eq!(conn.remote_key(), server.endpoint.local_id().key());
         assert_eq!(echo(&conn, b"over the sim").await, b"over the sim");
         let inbound = server.handled.recv().await.unwrap();
-        assert_eq!(inbound.remote_id(), client.local_id());
+        assert_eq!(inbound.remote_key(), client.local_id().key());
         assert_eq!(inbound.admitted_ip(), sim_addr(2).ip());
 
         let stats = &server.endpoint.socket_stats()[0];
@@ -3173,12 +3183,15 @@ async fn seeded_inputs_handshake_over_simnet() {
         let client = bind(1, sim_addr(2), &client_inputs);
 
         let conn = client.connect(server.addr(), &[ALPN]).await.unwrap();
-        assert_eq!(conn.remote_id(), SeededInputs::node_key(SEED, 0).public());
+        assert_eq!(
+            conn.remote_key(),
+            SeededInputs::node_key(SEED, 0).public_key()
+        );
         assert_eq!(echo(&conn, b"seeded").await, b"seeded");
         let inbound = server.handled.recv().await.unwrap();
         assert_eq!(
-            inbound.remote_id(),
-            SeededInputs::node_key(SEED, 1).public()
+            inbound.remote_key(),
+            SeededInputs::node_key(SEED, 1).public_key()
         );
         assert!(server
             .seen

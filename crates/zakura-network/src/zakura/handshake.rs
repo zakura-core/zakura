@@ -1089,7 +1089,23 @@ impl ZakuraControlHello {
         })
     }
 
-    /// Validates a peer hello against authenticated Iroh identity and local policy.
+    /// Validates the hello as [`Self::validate`] does, and returns the node
+    /// ID it names.
+    ///
+    /// This is where a responder learns who its peer is: TLS proved a key,
+    /// and a valid hello names the node that key belongs to.
+    pub fn validated_node_id(
+        &self,
+        expected: &ZakuraControlValidation<'_>,
+    ) -> Result<NodeId, ZakuraValidationError> {
+        self.validate(expected)?;
+        ZakuraPeerId::new(self.iroh_node_id.clone())
+            .ok()
+            .and_then(|peer_id| peer_id.node_id())
+            .ok_or(ZakuraValidationError::IdentityMismatch)
+    }
+
+    /// Validates a peer hello against the key TLS proved and local policy.
     pub fn validate(
         &self,
         expected: &ZakuraControlValidation<'_>,
@@ -1115,7 +1131,7 @@ impl ZakuraControlHello {
         if self.chain_id != expected.local.chain_id {
             return Err(ZakuraValidationError::WrongChain);
         }
-        if self.iroh_node_id.as_slice() != expected.authenticated_remote_id {
+        if self.iroh_node_id.as_slice() != expected.authenticated_remote_key {
             return Err(ZakuraValidationError::IdentityMismatch);
         }
         if self.capabilities & expected.local.required_capabilities
@@ -1161,8 +1177,9 @@ impl ZakuraControlHello {
 pub struct ZakuraControlValidation<'a> {
     /// Local Zakura policy.
     pub local: &'a ZakuraHandshakeConfig,
-    /// The authenticated Iroh remote node id.
-    pub authenticated_remote_id: &'a [u8],
+    /// The key the peer proved in the TLS handshake. The hello's identity
+    /// must name it.
+    pub authenticated_remote_key: &'a [u8],
     /// Selected Zakura protocol.
     pub selected_zakura_protocol: u16,
     /// Native or upgraded handshake path.
@@ -2195,6 +2212,56 @@ mod tests {
     }
 
     #[test]
+    fn a_valid_hello_names_the_node_whose_key_tls_proved() {
+        let local = local_config();
+        let peer = zakura_quic::NodeSecretKey::from_bytes(&[9; 32]).public();
+        let other = zakura_quic::NodeSecretKey::from_bytes(&[10; 32]).public();
+        let hello = ZakuraControlHello {
+            magic: CONTROL_HELLO_MAGIC,
+            control_version: CONTROL_VERSION,
+            selected_zakura_protocol: ZAKURA_PROTOCOL_VERSION_CURRENT,
+            handshake_path: ZakuraHandshakePath::Native,
+            role: ZakuraControlRole::Initiator,
+            network_id: local.network_id,
+            chain_id: local.chain_id,
+            iroh_node_id: peer.as_bytes().to_vec(),
+            peer_nonce: [3; 32],
+            initiator_upgrade_nonce: [0; 32],
+            responder_upgrade_nonce: [0; 32],
+            legacy_upgrade_transcript: [0; 32],
+            capabilities: 0,
+            required_channels: 0,
+            initial_limits: ZakuraInitialLimits {
+                max_frame_bytes: 1024,
+                max_message_bytes: 2048,
+                max_open_streams: 8,
+                max_inbound_queue_depth: 8,
+                idle_timeout_millis: 1000,
+            },
+        };
+        let proved = |key: &zakura_quic::NodeId| {
+            let key = *key.as_bytes();
+            hello.validated_node_id(&ZakuraControlValidation {
+                local: &local,
+                authenticated_remote_key: &key,
+                selected_zakura_protocol: ZAKURA_PROTOCOL_VERSION_CURRENT,
+                handshake_path: ZakuraHandshakePath::Native,
+                remote_role: ZakuraControlRole::Initiator,
+                initiator_upgrade_nonce: [0; 32],
+                responder_upgrade_nonce: [0; 32],
+                legacy_upgrade_transcript: [0; 32],
+            })
+        };
+
+        assert_eq!(proved(&peer), Ok(peer));
+        assert_eq!(
+            proved(&other),
+            Err(ZakuraValidationError::IdentityMismatch),
+            "a hello can't name a node whose key the peer didn't prove"
+        );
+    }
+
+    #[test]
     fn control_hello_validates_identity_transcript_and_native_zeroes() {
         let local = local_config();
         let hello = ZakuraControlHello {
@@ -2222,7 +2289,7 @@ mod tests {
         };
         let expected = ZakuraControlValidation {
             local: &local,
-            authenticated_remote_id: &[7; 32],
+            authenticated_remote_key: &[7; 32],
             selected_zakura_protocol: ZAKURA_PROTOCOL_VERSION_CURRENT,
             handshake_path: ZakuraHandshakePath::Upgraded,
             remote_role: ZakuraControlRole::Initiator,
@@ -3007,7 +3074,7 @@ mod tests {
         assert_eq!(decoded, hello);
         let expected = ZakuraControlValidation {
             local: &local,
-            authenticated_remote_id: &[7; 32],
+            authenticated_remote_key: &[7; 32],
             selected_zakura_protocol: ZAKURA_PROTOCOL_VERSION_CURRENT,
             handshake_path: ZakuraHandshakePath::Upgraded,
             remote_role: ZakuraControlRole::Initiator,

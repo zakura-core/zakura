@@ -229,13 +229,12 @@ pub(crate) enum Echo {
     Wrong,
 }
 
-/// Runs the responder's side on `conn`, whose initiator authenticated as
-/// `remote_id`: reads and validates the hello, then acks it with the nonce
+/// Runs the responder's side on `conn`: reads the hello and validates it
+/// against the key its initiator proved in TLS, then acks it with the nonce
 /// echoed as `echo` says and the hello's mask intersected with
 /// `capabilities`. Returns that intersection.
 pub(crate) async fn respond(
     conn: &Conn,
-    remote_id: NodeId,
     capabilities: u64,
     echo: Echo,
     local: &Local,
@@ -251,7 +250,7 @@ pub(crate) async fn respond(
     hello
         .validate(&ZakuraControlValidation {
             local: &local.config,
-            authenticated_remote_id: remote_id.as_bytes(),
+            authenticated_remote_key: conn.remote_key().as_bytes(),
             selected_zakura_protocol: protocol,
             handshake_path: ZakuraHandshakePath::Native,
             remote_role: ZakuraControlRole::Initiator,

@@ -2747,48 +2747,21 @@ impl ZakuraDiscoveryBook {
         let candidates: Vec<_> = self
             .entries
             .values()
-            .filter(|entry| {
-                !connected_node_ids.contains(&entry.record.body.node_id)
-                    && !in_flight_node_ids.contains(&entry.record.body.node_id)
-                    && self.local_node_id != Some(entry.record.body.node_id)
-                    && !entry_is_expired(entry, now)
-                    && !entry_in_dial_backoff(entry, now, dial_backoff.0, dial_backoff.1)
-                    && !in_alpn_backoff(entry.alpn_backoff_until, now)
-                    && !entry_in_short_lived_exchange_backoff(
-                        entry,
-                        now,
-                        dial_backoff.0,
-                        dial_backoff.1,
-                    )
-                    && advertises_all_services(&entry.record, required_services)
-                    && has_discovery_usable_direct_addrs(entry, self.address_scope)
-            })
             .map(DialCandidateRef::SignedRecord)
-            .chain(self.static_candidates.values().filter_map(|candidate| {
-                if !required_services.is_empty()
-                    || connected_node_ids.contains(&candidate.node_id)
-                    || in_flight_node_ids.contains(&candidate.node_id)
-                    || self.local_node_id == Some(candidate.node_id)
-                    || self.entries.contains_key(&candidate.node_id)
-                    || in_alpn_backoff(candidate.alpn_backoff_until, now)
-                    || entry_metadata_in_dial_backoff(
-                        candidate.last_dial_attempt,
-                        candidate.failure_count,
-                        now,
-                        dial_backoff.0,
-                        dial_backoff.1,
-                    )
-                    || entry_metadata_in_short_lived_exchange_backoff(
-                        candidate.last_short_lived_exchange,
-                        now,
-                        dial_backoff.0,
-                        dial_backoff.1,
-                    )
-                {
-                    return None;
-                }
-                Some(DialCandidateRef::StaticConfigured(candidate))
-            }))
+            // A node with a signed record is offered through that record only.
+            .chain(
+                self.static_candidates
+                    .values()
+                    .filter(|candidate| !self.entries.contains_key(&candidate.node_id))
+                    .map(DialCandidateRef::StaticConfigured),
+            )
+            .filter(|candidate| {
+                let node_id = candidate.node_id();
+                !connected_node_ids.contains(&node_id)
+                    && !in_flight_node_ids.contains(&node_id)
+                    && candidate.advertises_all_services(required_services)
+                    && self.dial_readiness(candidate, now, dial_backoff) == DialReadiness::Ready
+            })
             .collect();
 
         // Bounded top-k selection instead of a full sort. The book can hold `max_records`
@@ -2833,6 +2806,29 @@ impl ZakuraDiscoveryBook {
                 DialAdmission::Skipped => {}
                 DialAdmission::Exhausted => return,
             }
+        }
+    }
+
+    /// Whether the book could dial `candidate` at `now`, before the caller's
+    /// own exclusions such as connected peers and dials in flight.
+    ///
+    /// This node's own ID, an expired record and a record with an address
+    /// discovery must not dial are unusable. A candidate inside its dial,
+    /// short-lived-exchange or ALPN backoff waits for it to end.
+    fn dial_readiness(
+        &self,
+        candidate: &DialCandidateRef<'_>,
+        now: u64,
+        dial_backoff: (Duration, Duration),
+    ) -> DialReadiness {
+        if self.local_node_id == Some(candidate.node_id())
+            || !candidate.is_usable(now, self.address_scope)
+        {
+            DialReadiness::Unusable
+        } else if candidate.in_backoff(now, dial_backoff) {
+            DialReadiness::InBackoff
+        } else {
+            DialReadiness::Ready
         }
     }
 
@@ -3290,6 +3286,18 @@ enum DiscoveryDirectAddrPolicy {
     StaticConfigured,
 }
 
+/// Whether the book could dial a candidate now, before the caller's own
+/// exclusions.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum DialReadiness {
+    /// The candidate can never be dialed as it stands.
+    Unusable,
+    /// The candidate can be dialed once its backoff ends.
+    InBackoff,
+    /// The candidate can be dialed now.
+    Ready,
+}
+
 #[derive(Clone, Copy)]
 enum DialCandidateRef<'a> {
     SignedRecord(&'a ZakuraDiscoveryEntry),
@@ -3330,6 +3338,59 @@ impl DialCandidateRef<'_> {
             Self::SignedRecord(entry) => entry.failure_count,
             Self::StaticConfigured(candidate) => candidate.failure_count,
         }
+    }
+
+    /// Whether the candidate advertises every `required_services` entry. A
+    /// static candidate has no signed list of services, so it only fits when
+    /// none are required.
+    fn advertises_all_services(&self, required_services: &[ZakuraServiceId]) -> bool {
+        match self {
+            Self::SignedRecord(entry) => advertises_all_services(&entry.record, required_services),
+            Self::StaticConfigured(_) => required_services.is_empty(),
+        }
+    }
+
+    /// Whether the candidate's record is unexpired at `now` and lists only
+    /// addresses discovery may dial in `scope`. A static candidate's addresses come from
+    /// the operator, so it is always usable.
+    fn is_usable(&self, now: u64, scope: AddressScope) -> bool {
+        match self {
+            Self::SignedRecord(entry) => {
+                !entry_is_expired(entry, now) && has_discovery_usable_direct_addrs(entry, scope)
+            }
+            Self::StaticConfigured(_) => true,
+        }
+    }
+
+    /// Whether the candidate is inside its ALPN, dial or short-lived-exchange
+    /// backoff at `now`.
+    fn in_backoff(&self, now: u64, (base, max): (Duration, Duration)) -> bool {
+        let (alpn_backoff_until, last_dial_attempt, last_short_lived_exchange) = match self {
+            Self::SignedRecord(entry) => (
+                entry.alpn_backoff_until,
+                entry.last_dial_attempt,
+                entry.last_short_lived_exchange,
+            ),
+            Self::StaticConfigured(candidate) => (
+                candidate.alpn_backoff_until,
+                candidate.last_dial_attempt,
+                candidate.last_short_lived_exchange,
+            ),
+        };
+        in_alpn_backoff(alpn_backoff_until, now)
+            || entry_metadata_in_dial_backoff(
+                last_dial_attempt,
+                self.failure_count(),
+                now,
+                base,
+                max,
+            )
+            || entry_metadata_in_short_lived_exchange_backoff(
+                last_short_lived_exchange,
+                now,
+                base,
+                max,
+            )
     }
 
     fn into_candidate(self) -> ZakuraDiscoveryDialCandidate {
@@ -3862,21 +3923,6 @@ pub(super) fn entry_is_expired(entry: &ZakuraDiscoveryEntry, now: u64) -> bool {
     entry.record.body.expires_at_unix_secs < now
 }
 
-fn entry_in_dial_backoff(
-    entry: &ZakuraDiscoveryEntry,
-    now: u64,
-    dial_backoff_base: Duration,
-    dial_backoff_max: Duration,
-) -> bool {
-    entry_metadata_in_dial_backoff(
-        entry.last_dial_attempt,
-        entry.failure_count,
-        now,
-        dial_backoff_base,
-        dial_backoff_max,
-    )
-}
-
 fn entry_metadata_in_dial_backoff(
     last_dial_attempt: Option<u64>,
     failure_count: u32,
@@ -3897,20 +3943,6 @@ fn entry_metadata_in_dial_backoff(
 
 fn in_alpn_backoff(alpn_backoff_until: Option<u64>, now: u64) -> bool {
     alpn_backoff_until.is_some_and(|until| now < until)
-}
-
-fn entry_in_short_lived_exchange_backoff(
-    entry: &ZakuraDiscoveryEntry,
-    now: u64,
-    dial_backoff_base: Duration,
-    dial_backoff_max: Duration,
-) -> bool {
-    entry_metadata_in_short_lived_exchange_backoff(
-        entry.last_short_lived_exchange,
-        now,
-        dial_backoff_base,
-        dial_backoff_max,
-    )
 }
 
 fn entry_metadata_in_short_lived_exchange_backoff(

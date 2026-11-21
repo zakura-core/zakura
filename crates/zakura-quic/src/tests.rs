@@ -540,10 +540,35 @@ async fn wrong_identity_is_refused() {
     .unwrap();
 }
 
-/// The server rejects the first packet, so the acceptor gets its admission
-/// back through `cancel_admission` alone: a spoofed source pays no charge.
+/// A hello that fits one datagram, here from a dialer with ring's groups
+/// only, as a release before the hybrid group sends it. The server rejects
+/// the first packet, so the acceptor gets its admission back through
+/// `cancel_admission` alone: a spoofed source pays no charge.
 #[tokio::test]
-async fn alpn_mismatch_is_classified() {
+async fn an_alpn_mismatch_in_a_one_datagram_hello_is_cancelled() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let server = server();
+        let rpk = crate::tls::resolver::ResolveRawPublicKeyCert::new(&NodeSecretKey::generate());
+        let mut crypto = raw_client_builder(&server).with_client_cert_resolver(Arc::new(rpk));
+        crypto.alpn_protocols = vec![b"p2p-v2/2".to_vec()];
+        assert!(matches!(
+            dial_raw(&server, crypto).await,
+            Err(ConnectError::AlpnMismatch)
+        ));
+        assert_eq!(server.seen.lock().unwrap().len(), 1);
+        assert_eq!(server.returned.cancelled.load(Ordering::Relaxed), 1);
+        assert_eq!(server.returned.finished.load(Ordering::Relaxed), 0);
+    })
+    .await
+    .unwrap();
+}
+
+/// A production dialer's hello carries the hybrid key share and spans two
+/// datagrams, so the server has accepted the attempt before it can read the
+/// hello. The mismatch then fails the handshake, and the acceptor gets its
+/// admission back once, through `finish_admission` (ADM-3, ADM-7).
+#[tokio::test]
+async fn an_alpn_mismatch_in_a_two_datagram_hello_fails_the_handshake() {
     tokio::time::timeout(TEST_TIMEOUT, async {
         let server = server();
         let client = client();
@@ -551,8 +576,13 @@ async fn alpn_mismatch_is_classified() {
             client.connect(server.addr(), &[b"p2p-v2/2"]).await,
             Err(ConnectError::AlpnMismatch)
         ));
-        assert_eq!(server.returned.cancelled.load(Ordering::Relaxed), 1);
-        assert_eq!(server.returned.finished.load(Ordering::Relaxed), 0);
+        // The pending slot is returned when the connection has closed.
+        while server.returned.finished.load(Ordering::Relaxed) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(server.seen.lock().unwrap().len(), 1);
+        assert_eq!(server.returned.finished.load(Ordering::Relaxed), 1);
+        assert_eq!(server.returned.cancelled.load(Ordering::Relaxed), 0);
     })
     .await
     .unwrap();
@@ -605,7 +635,12 @@ async fn refused_attempt_creates_no_connection() {
         ));
         // SEC-3: the acceptor never saw a connection.
         assert!(server.handled.try_recv().is_err());
-        assert_eq!(server.seen.lock().unwrap().len(), 1);
+        // The hello spans two datagrams. The endpoint decides each one it
+        // doesn't accept on its own (ADM-1), so the dial is refused twice.
+        wait_for_attempts(&server, 2).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(server.seen.lock().unwrap().len(), 2);
+        assert!(server.handled.try_recv().is_err());
     })
     .await
     .unwrap();
@@ -638,10 +673,15 @@ async fn retry_threshold_validates_before_accepting() {
         client.connect(server.addr(), &[ALPN]).await.unwrap();
         let inbound = server.handled.recv().await.unwrap();
         assert!(inbound.source_validated(), "the Retry token validated it");
+        // The hello spans two datagrams, and each unvalidated one gets its
+        // own Retry (ADM-1). The dialer answers the first and discards the
+        // second, as RFC 9000 section 17.2.5.2 requires.
         let seen = server.seen.lock().unwrap().clone();
-        assert_eq!(seen.len(), 2, "one Retry, then the validated attempt");
-        assert!(!seen[0].validated);
-        assert!(seen[1].validated);
+        assert_eq!(
+            seen.iter().map(|info| info.validated).collect::<Vec<_>>(),
+            [false, false, true],
+            "one Retry per datagram of the hello, then the validated attempt"
+        );
     })
     .await
     .unwrap();
@@ -2785,6 +2825,50 @@ async fn pump(net: SimNet) {
         assert!(net.can_advance(), "a datagram passed its deadline");
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
+}
+
+/// The dialer's hello carries the hybrid key share, 1,216 bytes, so its first
+/// flight is two full Initial datagrams where a hello with ring's groups
+/// needed one (TLS-9). Both leave before any reply. The server accepts the
+/// first, the second joins that connection, and the handshake completes.
+#[tokio::test(start_paused = true)]
+async fn the_hybrid_hello_leaves_as_two_initial_datagrams() {
+    tokio::time::timeout(SIM_TEST_TIMEOUT, async {
+        let net = sim_net();
+        let mut server =
+            serve_test_acceptor(sim_endpoint(&net, sim_addr(1)), &[ALPN], |_| Admit::Accept);
+        let client = sim_endpoint(&net, sim_addr(2));
+        let target = server.addr();
+        let dial = tokio::spawn(async move {
+            let result = client.connect(target, &[ALPN]).await;
+            (client, result)
+        });
+
+        // Nothing is delivered yet, so the client has sent its first flight
+        // and nothing else.
+        let first_flight = || {
+            net.events()
+                .into_iter()
+                .filter_map(|event| match event {
+                    NetEvent::Sent { id, len, .. } if id.link.src == sim_addr(2) => Some(len),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        for _ in 0..10_000 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(first_flight(), [1200, 1200]);
+
+        let pump = tokio::spawn(pump(net.clone()));
+        let (_client, result) = dial.await.unwrap();
+        result.unwrap();
+        server.handled.recv().await.unwrap();
+        assert_eq!(server.seen.lock().unwrap().len(), 1);
+        pump.abort();
+    })
+    .await
+    .unwrap();
 }
 
 /// Bounds a simulation test in virtual time. It leaves room for the 91 s the

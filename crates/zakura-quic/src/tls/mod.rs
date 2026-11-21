@@ -23,6 +23,8 @@ use crate::{
     key::{NodeId, NodeSecretKey, KEY_LENGTH},
 };
 
+pub(crate) mod hybrid;
+mod mlkem;
 pub(crate) mod resolver;
 pub(crate) mod verifier;
 
@@ -76,7 +78,7 @@ pub(crate) struct TlsConfig {
 
 impl TlsConfig {
     pub(crate) fn new(secret_key: &NodeSecretKey) -> Self {
-        Self::with_provider(secret_key, rustls::crypto::ring::default_provider())
+        Self::with_provider(secret_key, production_provider())
     }
 
     /// TLS state whose provider takes its random source and key-exchange
@@ -95,8 +97,9 @@ impl TlsConfig {
         if random.is_none() && groups.is_none() {
             return Ok(Self::new(secret_key));
         }
-        // TLS-9: everything but these two fields stays ring's default.
-        let mut provider = rustls::crypto::ring::default_provider();
+        // TLS-9: everything but these two fields stays the production
+        // provider's.
+        let mut provider = production_provider();
         if let Some(random) = random {
             provider.secure_random = random;
         }
@@ -127,15 +130,14 @@ impl TlsConfig {
         Self {
             cert_resolver: Arc::new(resolver::ResolveRawPublicKeyCert::new(secret_key)),
             client_verifier: Arc::new(verifier::ClientCertificateVerifier),
-            // TLS-9: rustls' ring provider with its default TLS 1.3 suites.
             provider: Arc::new(provider),
         }
     }
 
-    /// Whether the provider is rustls' ring default, field for field.
+    /// Whether the provider is the production one, field for field.
     #[cfg(test)]
-    pub(crate) fn uses_default_provider(&self) -> bool {
-        format!("{:?}", self.provider) == format!("{:?}", rustls::crypto::ring::default_provider())
+    pub(crate) fn uses_production_provider(&self) -> bool {
+        format!("{:?}", self.provider) == format!("{:?}", production_provider())
     }
 
     /// Builds the server config, offering `alpns` in the given order (WIRE-2).
@@ -190,6 +192,18 @@ impl TlsConfig {
         crypto.resumption = rustls::client::Resumption::disabled();
         Ok(crypto)
     }
+}
+
+/// The crypto provider of an endpoint with no injected inputs (TLS-9):
+/// rustls' ring provider with the hybrid group X25519MLKEM768 offered ahead
+/// of ring's own key-exchange groups.
+///
+/// Two endpoints on this provider agree on the hybrid. A peer without it
+/// picks X25519, which stays on offer, so the two still connect.
+fn production_provider() -> rustls::crypto::CryptoProvider {
+    let mut provider = rustls::crypto::ring::default_provider();
+    provider.kx_groups.insert(0, hybrid::x25519_mlkem768());
+    provider
 }
 
 /// The DER SubjectPublicKeyInfo for an Ed25519 key, as Iroh encodes it (TLS-3).
@@ -319,11 +333,11 @@ mod tests {
                 .collect::<Vec<_>>(),
             [x25519.name()]
         );
-        assert!(!tls.uses_default_provider());
+        assert!(!tls.uses_production_provider());
 
         let tls =
             TlsConfig::with_inputs(&NodeSecretKey::generate(), &EndpointInputs::default()).unwrap();
-        assert!(tls.uses_default_provider());
+        assert!(tls.uses_production_provider());
     }
 
     /// ring's P-256, limited to TLS 1.2, counting the key exchanges it starts.

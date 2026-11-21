@@ -22,6 +22,7 @@ bytes = { workspace = true }
 curve25519-dalek = { workspace = true }
 futures = { workspace = true }
 hex = { workspace = true }
+libcrux-ml-kem = { workspace = true }
 metrics = { workspace = true }
 quinn-proto = { workspace = true }
 ring = { workspace = true }
@@ -39,9 +40,15 @@ zeroize = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]
+serde_json = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "test-util", "time"] }
 sha2 = { workspace = true }
 toml = { workspace = true }
+
+# An independent implementation of the hybrid key-exchange group, for the
+# interoperability test. graviola supports these two architectures only.
+[target.'cfg(any(target_arch = "x86_64", target_arch = "aarch64"))'.dev-dependencies]
+rustls-graviola = { workspace = true }
 
 # The deterministic scheduler, for tests that run under
 # `RUSTFLAGS="--cfg zakura_sim"`. It's unpublished, so it has no version.

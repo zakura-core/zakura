@@ -3237,7 +3237,7 @@ async fn bind_keeps_the_production_inputs() {
         format!("{:?}", shared.config.endpoint_config())
     );
     assert!(socket_config.contains("rng_seed: None"), "{socket_config}");
-    assert!(shared.tls.uses_default_provider());
+    assert!(shared.tls.uses_production_provider());
     endpoint.shutdown().await;
 }
 

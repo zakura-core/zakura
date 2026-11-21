@@ -130,6 +130,11 @@ pub const DEFAULT_ZAKURA_MESSAGE_RATE_PER_SECOND: u32 = 2048;
 pub const DEFAULT_ZAKURA_LISTEN_ADDR: SocketAddr =
     SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 8234));
 /// Default native Zakura bootstrap peers for Mainnet.
+///
+/// These entries, and the Testnet ones, still hold each seed's protocol 3
+/// ID, its Ed25519 key. A protocol 4 ID derives from keys only the seed can
+/// compute, so they are replaced with the IDs the seeds print once they run
+/// this release; until then a dial to them fails its identity check.
 pub const DEFAULT_MAINNET_ZAKURA_BOOTSTRAP_PEERS: &[&str] = &[
     "1398f62c6d1a457c51ba6a4b5f3dbd2f69fca93216218dc8997e416bd17d93ca@165.22.54.66:8234",
     "fd1724385aa0c75b64fb78cd602fa1d991fdebf76b13c58ed702eac835e9f618@104.131.184.123:8234",
@@ -3134,7 +3139,7 @@ fn registry_streams(registry: &ServiceRegistry) -> impl Iterator<Item = Stream> 
         .flat_map(|service| service.streams().iter().copied())
 }
 
-/// zakura-quic acceptor for the Zakura `p2p-v2/3` ALPN.
+/// zakura-quic acceptor for the Zakura `p2p-v2/4` ALPN.
 #[derive(Debug, Clone)]
 pub struct ZakuraProtocolHandler {
     supervisor: ZakuraSupervisorHandle,

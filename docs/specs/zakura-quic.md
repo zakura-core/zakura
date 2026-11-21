@@ -479,7 +479,8 @@ The driver follows the P2P stack's routine and reactor pattern. No lock guards a
 ## 7. Admission
 
 Admission runs in two stages. Stage 1 runs on each `Incoming` before any crypto
-work. Stage 2 runs after TLS proves the peer's `NodeKey` and is today's Zakura logic.
+work. Stage 2 runs after TLS proves the peer's credential, and so its `NodeId`, and
+is today's Zakura logic.
 
 - **ADM-1.** For every `Incoming`, the endpoint task MUST call
   `Acceptor::admit(&IncomingInfo)` before it calls `accept`. `IncomingInfo` holds:
@@ -999,7 +1000,7 @@ The public surface of `zakura-quic`. Changing it is a semver change of the crate
     `quinn-proto` and rustls items these name: `Transmit`, `ConnectionId`,
     `ConnectionIdGenerator`, `HmacKey`, `HandshakeTokenKey`, `SecureRandom`
     and `SupportedKxGroup`;
-  - `local_id()`, `local_key()`, `local_keys()`, `local_addrs()`,
+  - `local_id()`, `local_addrs()`,
     `socket_stats()`, `connection_count()`
     and `has_dial_capacity()` / `has_discovery_capacity()` (ADM-12),
     `closing_connection_count()` (ADM-13), `network_changes()` and `config()`;
@@ -1204,7 +1205,8 @@ this release tolerates, and keep each hard change explicit.
     generation, encapsulation and decapsulation, including encapsulation
     keys that fail the modulus check (TLS-9).
 - **SEC-2.** These handshakes MUST fail:
-  - a dial that names a `NodeKey` and reaches a server with another key;
+  - a dial that names a `NodeId` and reaches a server whose credential
+    derives another ID;
   - a client without a key;
   - TLS 1.2;
   - an X.509 certificate instead of a raw public key;

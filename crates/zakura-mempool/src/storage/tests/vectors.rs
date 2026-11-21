@@ -425,6 +425,53 @@ fn mempool_rejects_ironwood_conflict_on_insert() {
     );
 }
 
+/// A block transaction that was never pooled removes the pooled transaction
+/// sharing its Ironwood nullifier.
+#[test]
+fn mempool_removes_ironwood_block_conflict() {
+    let _init_guard = zakura_test::init();
+
+    let mut storage: Storage = Storage::new(&config::Config {
+        tx_cost_limit: 160_000_000,
+        eviction_memory_time: EVICTION_MEMORY_TIME,
+        ..Default::default()
+    });
+
+    let action = ironwood_action();
+    let pooled_tx = verified_ironwood_v6_tx(Height(1_000), action.clone());
+    let rival = ironwood_v6_tx(Height(2_000), action);
+    let pooled_id = pooled_tx.transaction.id();
+    assert_ne!(pooled_id.mined_id(), rival.hash());
+
+    storage
+        .insert(
+            pooled_tx,
+            Vec::new(),
+            None,
+            crate::Instant::now(),
+            chrono::Utc::now(),
+        )
+        .expect("an empty pool accepts the transaction");
+
+    let removed = storage.connect_block(
+        &[rival.hash()],
+        [rival.as_ref()],
+        Height(1),
+        crate::Instant::now(),
+    );
+
+    assert!(removed.mined.is_empty());
+    assert_eq!(
+        removed.dropped,
+        vec![(pooled_id, RemovalReason::Conflicted)]
+    );
+    assert!(!storage.contains(&pooled_id.mined_id()));
+    assert_eq!(
+        storage.rejection(&pooled_id, crate::Instant::now()),
+        Some(SameEffectsChainRejectionError::DuplicateSpend.into())
+    );
+}
+
 /// Check that the transaction dependencies are updated when transactions with spent mempool outputs
 /// are inserted into storage, and that the `Storage.remove()` method also removes any transactions
 /// that directly or indirectly spend outputs of a removed transaction.

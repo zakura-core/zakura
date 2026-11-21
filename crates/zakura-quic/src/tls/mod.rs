@@ -394,6 +394,33 @@ mod tests {
         );
     }
 
+    /// A dialer keeps no memory of its last handshake. Every peer shares one
+    /// server name, so a dialer that remembered the group a peer without
+    /// the hybrid chose would open its next dial, to any peer, on X25519
+    /// alone, and each upgraded peer would ask again for the hybrid. The
+    /// client config's disabled resumption is what prevents that.
+    #[test]
+    fn a_dial_to_an_older_peer_leaves_the_next_dial_on_the_hybrid() {
+        let dialer_key = NodeSecretKey::generate();
+        let listener_key = NodeSecretKey::generate();
+        let client = Arc::new(
+            TlsConfig::new(&dialer_key)
+                .rustls_client(listener_key.public(), &[b"a"])
+                .unwrap(),
+        );
+        assert_eq!(
+            handshake_to(&client, &ring_only(&listener_key)),
+            (rustls::NamedGroup::X25519, rustls::HandshakeKind::Full)
+        );
+        assert_eq!(
+            handshake_to(&client, &TlsConfig::new(&listener_key)),
+            (
+                rustls::NamedGroup::X25519MLKEM768,
+                rustls::HandshakeKind::Full
+            )
+        );
+    }
+
     /// A listener that shares neither group the dialer sent a share for asks
     /// again (a HelloRetryRequest). The dialer drops its hybrid exchange,
     /// starts the group the listener named, and the handshake completes in
@@ -431,11 +458,18 @@ mod tests {
         let client = dialer(&dialer_key)
             .rustls_client(listener_key.public(), &[b"a"])
             .unwrap();
-        let server = listener(&listener_key)
-            .rustls_server(vec![b"a".to_vec()])
-            .unwrap();
+        handshake_to(&Arc::new(client), &listener(&listener_key))
+    }
+
+    /// Runs one TLS handshake in memory from `client` to a listener with
+    /// `listener`'s TLS state. Returns what [`handshake`] returns.
+    fn handshake_to(
+        client: &Arc<rustls::ClientConfig>,
+        listener: &TlsConfig,
+    ) -> (rustls::NamedGroup, rustls::HandshakeKind) {
+        let server = listener.rustls_server(vec![b"a".to_vec()]).unwrap();
         let name = rustls_pki_types::ServerName::try_from(UNSENT_SERVER_NAME).unwrap();
-        let mut client = rustls::ClientConnection::new(Arc::new(client), name).unwrap();
+        let mut client = rustls::ClientConnection::new(client.clone(), name).unwrap();
         let mut server = rustls::ServerConnection::new(Arc::new(server)).unwrap();
         // A full handshake takes two exchanges and one with a
         // HelloRetryRequest three, so one that needs more has stalled.

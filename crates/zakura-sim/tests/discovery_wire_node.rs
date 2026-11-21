@@ -381,9 +381,9 @@ fn handshake_timeout_ns() -> u64 {
 }
 
 /// The node redials `peer-0`, which listens, and a focused Plan drops every
-/// datagram the node sends on the redial after its first Initial, until the
-/// node refuses the redial's handshake, at least the peer's QUIC
-/// handshake timeout after the redial's Initial. The peer's flight reaches the node, so the node's QUIC
+/// datagram the node sends on the redial after its hello, until the node
+/// refuses the redial's handshake, at least the peer's QUIC handshake
+/// timeout after the hello's last datagram. The peer's flight reaches the node, so the node's QUIC
 /// handshake completes, but the node's last flight never reaches the peer,
 /// whose handshake ends before `Acceptor::handle`. So the node refuses
 /// a handshake the peer never counted as a connection. The node's next
@@ -468,8 +468,9 @@ fn a_redial_the_peer_never_handled() {
             } if *from == remote)
         })
         .expect("the node refused the redial's handshake");
-    // The redial's Initial is the node's datagram to the peer just before
-    // the first one dropped.
+    // The hello's last datagram is the node's datagram to the peer just
+    // before the first one dropped. The peer's handshake timeout runs from
+    // its first, which is no later.
     let initial = dropped[0] - 1;
     let initial_at = entries
         .iter()

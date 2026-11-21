@@ -481,6 +481,50 @@ class ReachTests(unittest.TestCase):
         self.assertEqual(written["reach"]["p/both"]["unsearched"], ["h/two"])
         self.assertNotIn("reach", suite.completeness(manifest, {}, None, None))
 
+    def test_a_search_that_exits_nonzero_writes_no_report_or_stops_early_fails(self):
+        clean = self.search({}, {})
+        self.assertIsNone(suite.search_failure(0, clean))
+        self.assertIn("exited 1", suite.search_failure(1, clean))
+        self.assertIn("no generate.json", suite.search_failure(0, None))
+        for stop in ({"kind": "violation", "property": "p/both"}, {"kind": "panic", "message": "boom"},
+                     {"kind": "harness-failure", "reason": "r"}, {"kind": "abandoned", "leaked": 1}):
+            self.assertIn(stop["kind"], suite.search_failure(0, {**clean, "stop": stop}))
+
+    def test_the_reach_command_fails_on_a_failed_search(self):
+        """`reach` writes its record, lists each failed search, and exits 1."""
+        outcomes = {
+            "h/one": (0, self.search({}, {"p/both": {"held": 1}, "p/planned": {"held": 1}})),
+            "h/two": (0, {**self.search({}, {}), "stop": {"kind": "violation", "property": "p/both"}}),
+            "h/three": (1, None),
+        }
+
+        def run_logged(argv, cwd, log):
+            name = argv[argv.index("--sim") + 1]
+            code, report = outcomes[name]
+            if report is not None:
+                suite.write_json(Path(argv[argv.index("--out") + 1]) / suite.GENERATE_FILE, report)
+            return suite.Ran(code, "")
+
+        listed = mock.Mock(returncode=0, stdout=json.dumps(self.GENERATORS))
+        with tempfile.TemporaryDirectory() as temp, \
+                mock.patch.object(suite, "build_sim", return_value="sim"), \
+                mock.patch.object(suite.subprocess, "run", return_value=listed), \
+                mock.patch.object(suite, "run_logged", side_effect=run_logged), \
+                contextlib.redirect_stderr(io.StringIO()):
+            status = suite.main(["reach", "--checkout", temp, "--out", temp, "--seed", "7"])
+            record = json.loads((Path(temp) / suite.REACH_FILE).read_text())
+        self.assertEqual(status, 1)
+        self.assertEqual(sorted(record["failed"]), ["h/three", "h/two"])
+        self.assertIn("violation", record["failed"]["h/two"])
+        self.assertIn("exited 1", record["failed"]["h/three"])
+        self.assertEqual(record["unreached"], ["p/lost"])
+        outcomes["h/two"], outcomes["h/three"] = (0, self.search({}, {})), (0, self.search({}, {"p/lost": {"held": 1}}))
+        with tempfile.TemporaryDirectory() as temp, \
+                mock.patch.object(suite, "build_sim", return_value="sim"), \
+                mock.patch.object(suite.subprocess, "run", return_value=listed), \
+                mock.patch.object(suite, "run_logged", side_effect=run_logged):
+            self.assertEqual(suite.main(["reach", "--checkout", temp, "--out", temp, "--seed", "7"]), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

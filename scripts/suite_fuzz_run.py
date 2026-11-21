@@ -541,12 +541,29 @@ def applied(counts):
     return counts.get("held", 0) + counts.get("violated", 0)
 
 
-def reach_report(generators, searches, seed, runs):
+# The stop kind of a search that ran every drawn input.
+CLEAN_STOP = "clean"
+
+
+def search_failure(exit_code, report):
+    """Return why a reach search failed, or None: a nonzero exit, no report, or a stop before its last input."""
+    if exit_code != 0:
+        return f"`zakura-sim generate` exited {exit_code}"
+    if report is None:
+        return f"the search wrote no {GENERATE_FILE}"
+    stop = report.get("stop", {})
+    if stop.get("kind") != CLEAN_STOP:
+        return f"the search stopped: {json.dumps(stop, sort_keys=True)}"
+    return None
+
+
+def reach_report(generators, searches, seed, runs, failed=None):
     """Return `reach.json` from the generator map and each harness's search report, or None for a search that wrote none.
 
     A property's counts sum over every harness that reports it. A harness
     whose search wrote no report counts nowhere, and the property lists it
-    under `unsearched`.
+    under `unsearched`. `failed` maps each failed search's harness to
+    `search_failure`'s reason.
     """
     harnesses = {}
     for name, report in sorted(searches.items()):
@@ -572,6 +589,7 @@ def reach_report(generators, searches, seed, runs):
     return {
         "seed": seed, "runs": runs, "draws": REACH_DRAWS, "harnesses": harnesses, "properties": properties,
         "unreached": sorted(prop for prop, row in properties.items() if row["random_runs"] == 0),
+        "failed": dict(sorted((failed or {}).items())),
     }
 
 
@@ -590,12 +608,15 @@ def reach(checkout, out, seed, runs, harness_runs, jobs):
         directory = out / "reach" / harness_key(name)
         argv = [sim, "generate", "--sim", name, "--seed", str(seed), "--runs", str(harness_runs.get(name, runs)),
                 "--draws", REACH_DRAWS, "--out", str(directory)]
-        run_logged(argv, checkout, directory / "generate.log")
-        return name, read_json(directory / GENERATE_FILE)
+        ended = run_logged(argv, checkout, directory / "generate.log")
+        report = read_json(directory / GENERATE_FILE)
+        return name, report, search_failure(ended.code, report)
 
     with ThreadPoolExecutor(max_workers=jobs) as pool:
-        searches = dict(pool.map(search, reach_harnesses(generators)))
-    return reach_report(generators, searches, seed, runs)
+        ended = list(pool.map(search, reach_harnesses(generators)))
+    searches = {name: report for name, report, _ in ended}
+    failed = {name: reason for name, _, reason in ended if reason is not None}
+    return reach_report(generators, searches, seed, runs, failed)
 
 
 # Why the routine runs no row of each command kind but targets and tests.
@@ -753,7 +774,9 @@ def reach_command(args):
     if "error" in record:
         print(record["error"], file=sys.stderr)
         return 1
-    return 0
+    for name, reason in record["failed"].items():
+        print(f"{name}: {reason}", file=sys.stderr)
+    return int(bool(record["failed"]))
 
 
 def main(argv=None):

@@ -113,7 +113,9 @@ impl rustls::sign::Signer for CompositeSigningKey {
         self.random
             .fill(&mut randomness)
             .map_err(|_| rustls::Error::FailedToGetRandomBytes)?;
-        Ok(self.secret.sign_composite(message, randomness))
+        self.secret
+            .sign_composite(message, randomness)
+            .map_err(|_| rustls::Error::General("ML-DSA-44 signing failed".into()))
     }
 
     fn scheme(&self) -> rustls::SignatureScheme {

@@ -242,6 +242,8 @@ pub struct SignatureError;
 #[derive(Clone)]
 pub struct NodeSecretKey {
     seed: [u8; KEY_LENGTH],
+    /// The ML-DSA-44 key generation seed derived from `seed` (ID-13).
+    ml_dsa_seed: [u8; KEY_LENGTH],
     public: NodeKey,
     /// The keys the node proves in TLS. `public` is the Ed25519 key among
     /// them, and the node ID is the hash of their key list.
@@ -251,6 +253,7 @@ pub struct NodeSecretKey {
 impl Drop for NodeSecretKey {
     fn drop(&mut self) {
         self.seed.zeroize();
+        self.ml_dsa_seed.zeroize();
     }
 }
 
@@ -265,16 +268,18 @@ impl NodeSecretKey {
         // A key derived from a seed is a multiple of the base point, so it
         // passes every check `NodeKey::from_bytes` makes.
         let public = NodeKey(public);
+        let ml_dsa_seed = composite::ml_dsa_seed(seed);
         let credential = NodeCredential::from_entries([
             (ED25519_KEY_TAG, public.as_bytes().to_vec()),
             (
                 ML_DSA_44_KEY_TAG,
-                composite::ml_dsa_public_key(seed).to_vec(),
+                composite::ml_dsa_public_key(&ml_dsa_seed).to_vec(),
             ),
         ])
         .expect("a valid Ed25519 key and an ML-DSA-44 key form a credential");
         Self {
             seed: *seed,
+            ml_dsa_seed,
             public,
             credential,
         }
@@ -352,11 +357,19 @@ impl NodeSecretKey {
 
     /// Signs `message` with the composite of both keys (TLS-4): the Ed25519
     /// signature, then the ML-DSA-44 signature hedged with `randomness`.
-    pub(crate) fn sign_composite(&self, message: &[u8], randomness: [u8; 32]) -> Vec<u8> {
+    pub(crate) fn sign_composite(
+        &self,
+        message: &[u8],
+        randomness: [u8; 32],
+    ) -> Result<Vec<u8>, SignatureError> {
         let mut signature = Vec::with_capacity(composite::COMPOSITE_SIGNATURE_BYTES);
         signature.extend_from_slice(&self.sign(message));
-        signature.extend_from_slice(&composite::ml_dsa_sign(&self.seed, message, randomness));
-        signature
+        signature.extend_from_slice(&composite::ml_dsa_sign(
+            &self.ml_dsa_seed,
+            message,
+            randomness,
+        )?);
+        Ok(signature)
     }
 }
 

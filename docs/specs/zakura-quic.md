@@ -191,9 +191,10 @@ Terms:
 - **ID-8.** A key list holds 1 to 4 entries. An entry is a `u16` tag and 32
   bytes. The encoding is the entry count as a `u8`, then each entry as its
   tag (little-endian) and its 32 bytes, so a list is 35 to 137 bytes. Tag 1
-  is Ed25519 and its 32 bytes are a `NodeKey`. Any other nonzero tag is
-  opaque to this release; its 32 bytes are the fingerprint of the full key
-  in the node's credential (ID-12). Decoding MUST reject, and only reject:
+  is Ed25519 and its 32 bytes are a `NodeKey`. Any other nonzero tag's 32
+  bytes are the fingerprint of the full key in the node's credential
+  (ID-12); tag 2 is ML-DSA-44 (ID-13), and the rest are opaque to this
+  release. Decoding MUST reject, and only reject:
   - a count of 0 or above 4;
   - a length other than 1 + 34 × count bytes;
   - a tag of 0, or a tag that doesn't exceed the one before it;
@@ -221,8 +222,9 @@ Terms:
   list's tag order and under its count and tag rules (ID-8). The encoding is
   the entry count as a `u8`, then each entry as its tag (`u16`
   little-endian), its length (`u16` little-endian) and its bytes. An Ed25519
-  entry is exactly 32 bytes and passes ID-1; any other entry is 1 to 2,592
-  bytes (an ML-DSA-87 public key, the largest NIST signature key). The
+  entry is exactly 32 bytes and passes ID-1, an ML-DSA-44 entry (ID-13) is
+  exactly 1,312 bytes, and any other entry is 1 to 2,592 bytes (an
+  ML-DSA-87 public key, the largest NIST signature key). The
   credential's key list maps each entry to 32 bytes: an Ed25519 key is its
   own entry, and any other key is its fingerprint, the BLAKE2b-256 hash of
   the tag (`u16` little-endian) followed by the key, personalised
@@ -234,8 +236,12 @@ Terms:
   32-byte seed that BLAKE2b-256 derives from its Ed25519 seed, used as the
   key and personalised `Zakura_MLDSA44v1`, over no data. One key file
   therefore yields both keys, and a node's credential is its Ed25519 key
-  and its ML-DSA-44 key. The signing key is regenerated from the seed for
-  each signature and zeroized after.
+  and its ML-DSA-44 key. The ML-DSA seed is derived once, when the node
+  loads its key, and held beside the Ed25519 seed, zeroized on drop (ID-3).
+  The signing key is regenerated from it for each signature and its bytes
+  zeroized after. As with `ring`'s expanded Ed25519 key, some copies are
+  not wiped: `blake2b_simd`'s state from the one derivation, and
+  `libcrux-ml-dsa`'s intermediate signing state.
 
 ## 4. TLS profile
 
@@ -1002,8 +1008,8 @@ The public surface of `zakura-quic`. Changing it is a semver change of the crate
 - **API-1.** Identity: `NodeId`, `NodeKey`, `NodeKeyList`, `NodeCredential`,
   `NodeSecretKey` and `NodeAddr { id, direct: Vec<SocketAddr> }`. A dial
   requires a credential that derives `id` (TLS-7). A `NodeSecretKey` carries
-  the node's credential: the one-entry credential of its own key, or one set
-  with `with_credential`, which MUST hold that key.
+  the node's credential: its Ed25519 and ML-DSA-44 keys (ID-13), or one set
+  with `with_credential`, which MUST hold both.
 - **API-2.** `QuicEndpoint`:
   - `bind(secret, &QuicBindConfig, &QuicConfig) -> Result<QuicEndpoint, BindError>`;
   - `bind_with(secret, &QuicBindConfig, &QuicConfig, impl SocketFactory, EndpointInputs)`,
@@ -1945,8 +1951,13 @@ Added:
 Changed:
 
 - **DEP-2.** Adds `libcrux-ml-dsa` with its `mldsa44` feature only. It
-  shares its helper crates with `libcrux-ml-kem`, and adds only its own
-  build-time macro crate.
+  shares its helper crates with `libcrux-ml-kem`, and adds only its
+  build-time macro crate, `libcrux-macros`, which brings `syn` 3 beside the
+  tree's `syn` 2.
+- **API-1.** A `NodeSecretKey`'s credential holds both keys, and
+  `with_credential` requires both.
+- **ID-8, ID-12.** Tag 2 is ML-DSA-44, and its credential entry is exactly
+  1,312 bytes.
 - **TLS-4.** The only signature scheme is the composite, `0xFE44`.
 - **ID-11.** A credential without both keys can't be authenticated.
 - **§16.** Adds the composite's known answers, its refusals and the

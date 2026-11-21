@@ -233,7 +233,7 @@ mod tests {
         let secret = NodeSecretKey::generate();
         let other = NodeSecretKey::generate();
         let message = b"transcript";
-        let signature = secret.sign_composite(message, [3; 32]);
+        let signature = secret.sign_composite(message, [3; 32]).unwrap();
         let ml_dsa =
             |node: &NodeSecretKey| node.credential().key(ML_DSA_44_KEY_TAG).unwrap().to_vec();
         assert!(

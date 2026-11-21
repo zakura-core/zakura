@@ -50,8 +50,11 @@ const ML_DSA_SEED_PERSONALISATION: &[u8; 16] = b"Zakura_MLDSA44v1";
 
 /// The ML-DSA-44 key generation seed of the node whose Ed25519 seed is
 /// `seed`: BLAKE2b-256 keyed by the seed, under its own personalisation, so
-/// one key file holds both keys and neither reveals the other.
-fn ml_dsa_seed(seed: &[u8; KEY_LENGTH]) -> [u8; KEY_GENERATION_RANDOMNESS_SIZE] {
+/// one key file holds both keys and neither reveals the other (ID-13).
+///
+/// `blake2b_simd` keeps copies of its key in state it doesn't wipe, so this
+/// runs once, when a node loads its key, not per handshake.
+pub(crate) fn ml_dsa_seed(seed: &[u8; KEY_LENGTH]) -> [u8; KEY_GENERATION_RANDOMNESS_SIZE] {
     let hash = Params::new()
         .hash_length(KEY_GENERATION_RANDOMNESS_SIZE)
         .key(seed)
@@ -62,34 +65,34 @@ fn ml_dsa_seed(seed: &[u8; KEY_LENGTH]) -> [u8; KEY_GENERATION_RANDOMNESS_SIZE] 
     derived
 }
 
-/// The ML-DSA-44 public key of the node whose Ed25519 seed is `seed`.
-pub(crate) fn ml_dsa_public_key(seed: &[u8; KEY_LENGTH]) -> [u8; ML_DSA_44_KEY_BYTES] {
-    let mut derived = ml_dsa_seed(seed);
-    let mut pair = ml_dsa_44::generate_key_pair(derived);
-    derived.zeroize();
+/// The ML-DSA-44 public key generated from `ml_dsa_seed`.
+pub(crate) fn ml_dsa_public_key(
+    ml_dsa_seed: &[u8; KEY_GENERATION_RANDOMNESS_SIZE],
+) -> [u8; ML_DSA_44_KEY_BYTES] {
+    let mut pair = ml_dsa_44::generate_key_pair(*ml_dsa_seed);
     pair.signing_key.as_mut_slice().zeroize();
     *pair.verification_key.as_ref()
 }
 
-/// Signs `message` with the ML-DSA-44 key of the node whose Ed25519 seed is
-/// `seed`, hedged with `randomness`.
+/// Signs `message` with the ML-DSA-44 key generated from `ml_dsa_seed`,
+/// hedged with `randomness`.
 ///
-/// The signing key is regenerated from the seed for each signature and wiped
-/// after, as the Ed25519 key is, so the node holds one secret in memory.
+/// The signing key is regenerated for each signature and its bytes wiped
+/// after, so a node holds only its seeds between handshakes. `libcrux`'s
+/// intermediate signing state isn't wiped.
 pub(crate) fn ml_dsa_sign(
-    seed: &[u8; KEY_LENGTH],
+    ml_dsa_seed: &[u8; KEY_GENERATION_RANDOMNESS_SIZE],
     message: &[u8],
     mut randomness: [u8; SIGNING_RANDOMNESS_SIZE],
-) -> [u8; ML_DSA_44_SIGNATURE_BYTES] {
-    let mut derived = ml_dsa_seed(seed);
-    let mut pair = ml_dsa_44::generate_key_pair(derived);
-    derived.zeroize();
+) -> Result<[u8; ML_DSA_44_SIGNATURE_BYTES], SignatureError> {
+    let mut pair = ml_dsa_44::generate_key_pair(*ml_dsa_seed);
+    // Fails only for a context over 255 bytes, which `ML_DSA_CONTEXT` isn't,
+    // or when rejection sampling runs out of attempts, which FIPS 204 puts
+    // below 2^-256.
     let signature = ml_dsa_44::sign(&pair.signing_key, message, ML_DSA_CONTEXT, randomness);
     pair.signing_key.as_mut_slice().zeroize();
     randomness.zeroize();
-    *signature
-        .expect("ML-DSA signing fails only for a context longer than 255 bytes")
-        .as_ref()
+    Ok(*signature.map_err(|_| SignatureError)?.as_ref())
 }
 
 /// Verifies a composite `signature` over `message`: the Ed25519 half under
@@ -127,14 +130,16 @@ mod tests {
 
     fn sign(secret: &NodeSecretKey, message: &[u8]) -> Vec<u8> {
         let mut signature = secret.sign(message).to_vec();
-        signature.extend_from_slice(&ml_dsa_sign(&secret.to_bytes(), message, [9; 32]));
+        signature.extend_from_slice(
+            &ml_dsa_sign(&ml_dsa_seed(&secret.to_bytes()), message, [9; 32]).unwrap(),
+        );
         signature
     }
 
     #[test]
     fn a_composite_signature_verifies_only_whole() {
         let secret = NodeSecretKey::from_bytes(&SEED);
-        let ml_dsa = ml_dsa_public_key(&SEED);
+        let ml_dsa = ml_dsa_public_key(&ml_dsa_seed(&SEED));
         let signature = sign(&secret, b"transcript");
         assert_eq!(signature.len(), COMPOSITE_SIGNATURE_BYTES);
         assert_eq!(
@@ -167,14 +172,14 @@ mod tests {
         let signature = sign(&secret, b"transcript");
         assert!(verify(
             &other.public_key(),
-            &ml_dsa_public_key(&SEED),
+            &ml_dsa_public_key(&ml_dsa_seed(&SEED)),
             b"transcript",
             &signature
         )
         .is_err());
         assert!(verify(
             &secret.public_key(),
-            &ml_dsa_public_key(&[8; KEY_LENGTH]),
+            &ml_dsa_public_key(&ml_dsa_seed(&[8; KEY_LENGTH])),
             b"transcript",
             &signature
         )
@@ -183,10 +188,13 @@ mod tests {
 
     #[test]
     fn the_ml_dsa_key_derives_from_the_seed_alone() {
-        assert_eq!(ml_dsa_public_key(&SEED), ml_dsa_public_key(&SEED));
+        assert_eq!(
+            ml_dsa_public_key(&ml_dsa_seed(&SEED)),
+            ml_dsa_public_key(&ml_dsa_seed(&SEED))
+        );
         assert_ne!(
-            ml_dsa_public_key(&SEED),
-            ml_dsa_public_key(&[8; KEY_LENGTH])
+            ml_dsa_public_key(&ml_dsa_seed(&SEED)),
+            ml_dsa_public_key(&ml_dsa_seed(&[8; KEY_LENGTH]))
         );
         // Computed with Python's `hashlib.blake2b(b"", digest_size=32,
         // key=bytes([7] * 32), person=b"Zakura_MLDSA44v1")`.
@@ -198,11 +206,11 @@ mod tests {
 
     #[test]
     fn hedged_signatures_differ_and_both_verify() {
-        let ml_dsa = ml_dsa_public_key(&SEED);
+        let ml_dsa = ml_dsa_public_key(&ml_dsa_seed(&SEED));
         let secret = NodeSecretKey::from_bytes(&SEED);
         let ed = secret.sign(b"m");
-        let first = ml_dsa_sign(&SEED, b"m", [1; 32]);
-        let second = ml_dsa_sign(&SEED, b"m", [2; 32]);
+        let first = ml_dsa_sign(&ml_dsa_seed(&SEED), b"m", [1; 32]).unwrap();
+        let second = ml_dsa_sign(&ml_dsa_seed(&SEED), b"m", [2; 32]).unwrap();
         assert_ne!(first, second);
         for half in [first, second] {
             let mut signature = ed.to_vec();

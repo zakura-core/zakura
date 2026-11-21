@@ -101,8 +101,7 @@ impl ReactorState {
 
     /// Panic if the state breaks a rule it keeps: the query state keeps its
     /// own invariants, the pending query carries the current body-work
-    /// authority, the needed heights are sorted and distinct, and this node
-    /// advertises exactly its verified tip.
+    /// authority, and the needed heights are sorted and distinct.
     #[cfg(any(test, feature = "p2p-fuzz"))]
     pub(super) fn assert_invariants(&self) {
         self.queries.assert_invariants();
@@ -117,14 +116,6 @@ impl ReactorState {
             self.needed_heights.windows(2).all(|pair| pair[0] < pair[1]),
             "needed heights are sorted and distinct: {:?}",
             self.needed_heights
-        );
-        assert_eq!(
-            (self.progress.servable_high, self.progress.servable_hash),
-            (
-                self.progress.verified_block_tip,
-                self.progress.verified_block_hash
-            ),
-            "this node advertises its verified tip"
         );
     }
 
@@ -201,14 +192,12 @@ impl ReactorState {
     /// Whether the committed verified tip lies off the selected chain at or
     /// above its tip.
     ///
-    /// Such a tip leaves no selected height above the floor, yet only state's
-    /// answer names the common ancestor block sync must reset to.
+    /// Allow a scheduling refresh even when the last missing height is already claimed.
     fn verified_tip_diverged(&self) -> bool {
         self.committed_view.as_ref().is_some_and(|view| {
             let frontiers = view.frontiers;
-            frontiers.verified_best.height > frontiers.header_best.height
-                || (frontiers.verified_best.height == frontiers.header_best.height
-                    && frontiers.verified_best.hash != frontiers.header_best.hash)
+            view.body_download_anchor.height < frontiers.header_best.height
+                && frontiers.verified_best.height >= frontiers.header_best.height
         })
     }
 
@@ -862,9 +851,6 @@ pub(super) struct ReactorProgress {
     /// Mirror of the Sequencer's verified tip.
     pub(super) verified_block_tip: block::Height,
     pub(super) verified_block_hash: block::Hash,
-    /// Highest height this node advertises as servable.
-    pub(super) servable_high: block::Height,
-    pub(super) servable_hash: block::Hash,
     /// Scheduler and query lower bound. It follows the Sequencer's download
     /// floor, but it is not verified state and never reaches status.
     pub(super) request_floor: block::Height,
@@ -890,8 +876,6 @@ impl ReactorProgress {
             finalized_height: frontiers.finalized_height,
             verified_block_tip: frontiers.verified_block_tip,
             verified_block_hash: frontiers.verified_block_hash,
-            servable_high: frontiers.verified_block_tip,
-            servable_hash: frontiers.verified_block_hash,
             request_floor: frontiers.verified_block_tip,
             best_header_tip: best_header_tip.0,
             best_header_hash: best_header_tip.1,
@@ -920,8 +904,6 @@ impl ReactorProgress {
         self.verified_block_tip = view.verified_tip;
         self.request_floor = view.download_floor;
         self.verified_block_hash = view.verified_hash;
-        self.servable_high = view.verified_tip;
-        self.servable_hash = view.verified_hash;
     }
 
     /// The height whose expired claims the floor watchdog cancels.
@@ -930,11 +912,23 @@ impl ReactorProgress {
     }
 
     /// The status this node advertises before body retention applies.
-    pub(super) fn local_status(&self, config: &ZakuraBlockSyncConfig) -> BlockSyncStatus {
+    pub(super) fn local_status(
+        &self,
+        config: &ZakuraBlockSyncConfig,
+        committed: Option<&CommittedHeaderChainView>,
+    ) -> BlockSyncStatus {
+        // Range reads follow the selected headers. While full state is on a rival
+        // branch, only advertise through the block both chains share.
+        let tip = committed
+            .filter(|view| view.frontiers.verified_best != view.body_download_anchor)
+            .map_or(
+                Frontier::new(self.verified_block_tip, self.verified_block_hash),
+                |view| view.body_download_anchor,
+            );
         BlockSyncStatus {
             servable_low: block::Height::MIN,
-            servable_high: self.servable_high,
-            tip_hash: self.servable_hash,
+            servable_high: tip.height,
+            tip_hash: tip.hash,
             max_blocks_per_response: config.advertised_max_blocks_per_response(),
             max_inflight_requests: config.advertised_max_inflight_requests(),
             max_response_bytes: config.advertised_max_response_bytes(),
@@ -1003,12 +997,12 @@ impl BootstrapGate {
 
 // ---- committed authority ----
 
-/// The verified and finalized frontiers a committed snapshot carries.
-pub(super) fn block_sync_frontiers(snapshot: &EngineSnapshot) -> BlockSyncFrontiers {
+/// Committed progress along the selected path used for scheduling downloads.
+pub(super) fn block_sync_frontiers(view: &CommittedHeaderChainView) -> BlockSyncFrontiers {
     BlockSyncFrontiers {
-        finalized_height: snapshot.frontiers.finalized.height,
-        verified_block_tip: snapshot.frontiers.verified_best.height,
-        verified_block_hash: snapshot.frontiers.verified_best.hash,
+        finalized_height: view.frontiers.finalized.height,
+        verified_block_tip: view.body_download_anchor.height,
+        verified_block_hash: view.body_download_anchor.hash,
     }
 }
 
@@ -1178,17 +1172,17 @@ impl ReactorState {
             None => FrontierUpdate::Initial(frontiers),
             Some(_) if body_work_epoch_changed => FrontierUpdate::Unchanged,
             Some(old)
-                if old.frontiers.verified_best != view.frontiers.verified_best
+                if old.body_download_anchor != view.body_download_anchor
                     || old.frontiers.finalized != view.frontiers.finalized =>
             {
                 debug_assert!(
-                    view.frontiers.verified_best.height >= old.frontiers.verified_best.height,
-                    "same-epoch verified authority cannot retreat"
+                    view.body_download_anchor.height >= old.body_download_anchor.height,
+                    "same-epoch body download anchor cannot retreat"
                 );
                 debug_assert!(
-                    view.frontiers.verified_best.height != old.frontiers.verified_best.height
-                        || view.frontiers.verified_best.hash == old.frontiers.verified_best.hash,
-                    "same-epoch verified authority cannot replace a hash at the same height"
+                    view.body_download_anchor.height != old.body_download_anchor.height
+                        || view.body_download_anchor.hash == old.body_download_anchor.hash,
+                    "same-epoch body download anchor cannot replace a hash at the same height"
                 );
                 FrontierUpdate::Advanced(frontiers)
             }

@@ -20,7 +20,7 @@ use std::{
 
 use zakura_rt::{sync::CancellationToken, task::JoinHandle};
 
-use super::{Frame, SinkReject};
+use super::{CloseOutcome, Frame, SinkReject};
 use crate::zakura::transport::guard::{Admit, SessionGuard};
 use crate::zakura::ZakuraPeerId;
 
@@ -28,11 +28,11 @@ use crate::zakura::ZakuraPeerId;
 ///
 /// A Zakura connection can be cancelled from the supervisor, the transport loop,
 /// or any service task. The final `closed.neutral` trace row is emitted by the
-/// transport loop, so every teardown path records its bounded reason here before
-/// cancelling the shared connection token. The first writer wins.
+/// transport loop, so every teardown path records its [`CloseOutcome`] here
+/// before cancelling the shared connection token. The first writer wins.
 #[derive(Clone, Debug)]
 pub(crate) struct CloseCause {
-    reason: Arc<OnceLock<&'static str>>,
+    reason: Arc<OnceLock<CloseOutcome>>,
     /// The connection's transport observer, attached before registration.
     #[cfg(any(test, zakura_sim))]
     tap: Arc<OnceLock<Arc<super::ConnTap>>>,
@@ -52,7 +52,7 @@ impl CloseCause {
     ///
     /// In test and simulator builds, the call that records the first cause
     /// reports it as `CloseDecided`.
-    pub(crate) fn record(&self, reason: &'static str) {
+    pub(crate) fn record(&self, reason: CloseOutcome) {
         #[cfg(not(any(test, zakura_sim)))]
         let _ = self.reason.set(reason);
         #[cfg(any(test, zakura_sim))]
@@ -106,15 +106,16 @@ impl CloseCause {
         }
     }
 
-    /// Return the recorded reason, or `None` when no local path recorded one.
+    /// Return the recorded outcome, or `None` when no local path recorded one.
     #[cfg(any(test, zakura_sim))]
-    pub(crate) fn get(&self) -> Option<&'static str> {
+    pub(crate) fn get(&self) -> Option<CloseOutcome> {
         self.reason.get().copied()
     }
 
-    /// Return the recorded reason, or `default` when no local path recorded one.
+    /// Return the recorded outcome's trace label, or `default` when no local
+    /// path recorded one.
     pub(crate) fn get_or(&self, default: &'static str) -> &'static str {
-        self.reason.get().copied().unwrap_or(default)
+        self.reason.get().map_or(default, |reason| reason.label())
     }
 }
 
@@ -284,7 +285,7 @@ impl<S, Env> Pipe<S, Env> {
     pub(crate) fn run_one(&mut self, frame: Frame) -> Flow<()> {
         match self.guard.admit(&frame) {
             Admit::Throttle => Flow::Done,
-            Admit::Reject(reason) => Flow::Reject(SinkReject::protocol(reason)),
+            Admit::Reject(row) => Flow::Reject(SinkReject::protocol(row, row.id())),
             Admit::Pass => {
                 let mut cx = PipeCx {
                     peer_id: &self.peer_id,
@@ -516,7 +517,8 @@ pub(crate) fn spawn_supervised_peer_task_unboxed(
 /// Map a finished pipe run to its connection-teardown effect — the single place
 /// the "is this exit fatal to the whole connection?" decision lives.
 ///
-/// A protocol reject is fatal: it cancels the shared `connection_cancel` token so
+/// A protocol reject is fatal: it records the reject's row as a fault on the
+/// `(kind, version)` stream and cancels the shared `connection_cancel` token so
 /// the whole connection tears down. A local reject (e.g. a closed service queue)
 /// tears down only this stream — the per-service token is already cancelled by
 /// the [`PipeTeardown`] — so it is logged and the connection is left for other
@@ -525,19 +527,21 @@ pub(crate) fn spawn_supervised_peer_task_unboxed(
 /// `Result` to inspect.
 pub(crate) fn handle_pipe_exit(
     service: &'static str,
+    (kind, version): (u16, u16),
     connection_cancel: &CancellationToken,
     close_cause: &CloseCause,
     result: Result<(), SinkReject>,
 ) {
     match result {
         Ok(()) => {}
-        Err(SinkReject::Protocol(error)) => {
+        Err(SinkReject::Protocol(row, error)) => {
             tracing::debug!(
                 ?error,
                 service,
+                %row,
                 "Zakura stream rejected protocol-invalid frame"
             );
-            close_cause.record("service_protocol_reject");
+            close_cause.record(CloseOutcome::fault(kind, version, row));
             connection_cancel.cancel();
         }
         Err(SinkReject::Local(error)) => {
@@ -578,6 +582,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::zakura::transport::{CloseRow, NeutralCause};
 
     const SHAPE: PipeShape = PipeShape {
         service: "test",
@@ -661,9 +666,11 @@ mod tests {
     fn close_cause_keeps_first_recorded_reason() {
         let cause = CloseCause::new();
 
-        cause.record("first");
-        cause.record("second");
+        let first = CloseOutcome::neutral(NeutralCause::Timeout, "first");
+        cause.record(first);
+        cause.record(CloseOutcome::fault(1, 1, CloseRow::REG_CLOSE_2));
 
+        assert_eq!(cause.get(), Some(first));
         assert_eq!(cause.get_or("fallback"), "first");
     }
 
@@ -681,13 +688,17 @@ mod tests {
 
         handle_pipe_exit(
             "test",
+            (6, 3),
             &cancel,
             &cause,
-            Err(SinkReject::protocol("bad frame")),
+            Err(SinkReject::protocol(CloseRow::BSYNC_CLOSE_9, "bad frame")),
         );
 
         assert!(cancel.is_cancelled());
-        assert_eq!(cause.get_or("fallback"), "service_protocol_reject");
+        assert_eq!(
+            cause.get(),
+            Some(CloseOutcome::fault(6, 3, CloseRow::BSYNC_CLOSE_9))
+        );
     }
 
     #[tokio::test]

@@ -48,7 +48,7 @@ Four suites read the declarations, so each property is written once:
 | Item | one codec item | Tight length bounds against real encodings, round trips, exact reads, truncation, canonical decoding of arbitrary and mutated input, and the allocation bound |
 | Message | one message family | Closed coverage of its rows, tight row bounds, round trips, header and payload mutations, domain violations, and the allocation bound for every decode |
 | Frame | one layout | Each reader accepts its rows at both bounds and rejects short, flagged, other-role, sibling-stream, and undeclared frames from the header |
-| Stream conformance | one layout and an adapter | Over real QUIC: unsolicited responses and pages beyond their credit, the request and subscription margins, sustained and mutually saturated exchanges and subscriptions, member retirement and the writer fence, paused siblings and connection credit, unnegotiated versions, partial frames, and `Close` progress while pages and execution are blocked |
+| Stream conformance | one layout and an adapter | Over real QUIC: unsolicited responses and pages beyond their credit, the request and subscription margins, sustained and mutually saturated exchanges and subscriptions, member retirement and the writer fence, paused siblings and connection credit, unnegotiated versions, partial frames, `Close` progress while pages and execution are blocked, and the repeated-stall close |
 
 The stream conformance adapter only encodes a valid message for a row and names the exchange a
 message belongs to. For a subscription row it also encodes and reads updates and encodes and reads

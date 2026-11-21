@@ -1,5 +1,6 @@
 //! Generation policy and durable write-set derivation.
 
+use crate::transition::common_body_frontier;
 use std::{borrow::Cow, sync::Arc};
 
 use crate::graph::{GraphDelta, HeaderGraphView};
@@ -331,39 +332,33 @@ pub(super) fn body_work_effect(
     finality_append: Option<crate::FinalityRecord>,
     finality_lineage: FinalityLineage,
 ) -> BodyWorkEffect {
-    if projection_retains_path(
+    if !projection_retains_path(
         old_selected,
         new_selected,
         finality_append,
         finality_lineage.continues_selected,
-    ) && projection_retains_path(
+    ) || !projection_retains_path(
         old_verified,
         new_verified,
         finality_append,
         finality_lineage.continues_verified,
-    ) && !verified_tip_left_selection(old_verified, new_selected, new_verified)
+    ) {
+        return BodyWorkEffect::Invalidated;
+    }
+    if old_verified.last() == new_verified.last() || new_selected.starts_with(new_verified) {
+        return BodyWorkEffect::Preserved;
+    }
+
+    // Both paths retained their history. Compare tips because finalization can trim
+    // their common prefix in the same transaction as a rival commit.
+    if new_selected.last() == old_selected.last()
+        && common_body_frontier(old_selected, old_verified)
+            == common_body_frontier(new_selected, new_verified)
     {
         BodyWorkEffect::Preserved
     } else {
         BodyWorkEffect::Invalidated
     }
-}
-
-/// True when the verified tip moved to a block off the selected chain.
-///
-/// A late commit of a block that a reset replaced grows the verified chain on the
-/// replaced branch, and both projections still retain their paths. Block sync retires
-/// work by height, so without a new epoch it would retire the replacement's heights
-/// as committed. Both final projections start at the finalized frontier, so the
-/// verified tip lies on the selected chain exactly when the verified projection is a
-/// prefix of the selected one. A tip that stays in place never fires, so a selection
-/// change that leaves the verified tip behind invalidates body work only once.
-fn verified_tip_left_selection(
-    old_verified: &[Frontier],
-    new_selected: &[Frontier],
-    new_verified: &[Frontier],
-) -> bool {
-    new_verified.last() != old_verified.last() && !new_selected.starts_with(new_verified)
 }
 
 fn projection_retains_path(
@@ -510,7 +505,7 @@ mod body_work_epoch_tests {
     }
 
     #[test]
-    fn verified_growth_off_the_selected_chain_advances_body_work_epoch() {
+    fn verified_growth_off_the_selected_chain_preserves_body_work_at_the_same_anchor() {
         // A reset replaced height 2 with the fork's block 9, and storage then committed
         // the replaced block 3 that the node had submitted before the reset.
         let selected = path(&[1, 2, 9, 8]);
@@ -525,9 +520,21 @@ mod body_work_epoch_tests {
                 None,
                 replaces(),
             ),
-            BodyWorkEffect::Invalidated
+            BodyWorkEffect::Preserved
         );
-        // Later transitions that leave the verified tip in place keep the new epoch, even
+        // The same commit may also finalize the common parent.
+        assert_eq!(
+            body_work_effect(
+                &selected,
+                &selected[1..],
+                &before_commit,
+                &late_commit[1..],
+                Some(finality(selected[1])),
+                continues(),
+            ),
+            BodyWorkEffect::Preserved,
+        );
+        // Later transitions that leave the verified tip in place keep the epoch, even
         // when finality trims both projections.
         let extended = path(&[1, 2, 9, 8, 7]);
         assert_eq!(
@@ -561,6 +568,30 @@ mod body_work_epoch_tests {
                 &path(&[1, 2, 3, 4]),
                 None,
                 replaces(),
+            ),
+            BodyWorkEffect::Preserved
+        );
+        // Changing selection at the same time as off-chain growth is outside this exception.
+        assert_eq!(
+            body_work_effect(
+                &selected,
+                &extended,
+                &before_commit,
+                &late_commit,
+                None,
+                replaces()
+            ),
+            BodyWorkEffect::Invalidated
+        );
+        // A batch can verify a selected block and then diverge above it.
+        assert_eq!(
+            body_work_effect(
+                &selected,
+                &selected,
+                &path(&[1]),
+                &late_commit,
+                None,
+                replaces()
             ),
             BodyWorkEffect::Invalidated
         );

@@ -14,7 +14,7 @@ use std::{
     task::{Context, Poll},
     time::{Duration, Instant},
 };
-use zakura_node_services::block_memory::{is_read_capacity_refusal, BlockHandle};
+use zakura_node_services::{block_memory::is_read_capacity_refusal, block_relay::ServedBlock};
 
 use futures::{
     future::{FutureExt, TryFutureExt},
@@ -220,17 +220,18 @@ async fn retained_block_height(mut state: State, hash: block::Hash) -> Option<bl
     }
 }
 
-/// Returns an admitted block or a committed block from any active chain.
+/// Returns a committed block from any active chain, or else a pending block.
 ///
 /// Peers can request a hash on any active chain, even when this node does not consider it best.
+/// A pending body can be unvalidated and differ from a committed block with the same header
+/// hash, so committed state wins. A registration is removed only after its block commits, so
+/// a pending miss followed by state is never a gap.
 async fn block_by_hash_or_pending(
     mut state: State,
     pending_blocks: PendingBlockRegistry,
     hash: block::Hash,
-) -> Result<Option<BlockHandle>, zn::BoxError> {
-    if let Some(block) = pending_blocks.get(hash) {
-        return Ok(Some(block.into()));
-    }
+) -> Result<Option<ServedBlock>, zn::BoxError> {
+    let pending = pending_blocks.get_for_peer(hash);
 
     let response = state
         .ready()
@@ -239,8 +240,8 @@ async fn block_by_hash_or_pending(
         .await?;
 
     match response {
-        zs::Response::Block(Some(block)) => Ok(Some(block)),
-        zs::Response::Block(None) => Ok(None),
+        zs::Response::Block(Some(block)) => Ok(Some(block.into())),
+        zs::Response::Block(None) => Ok(pending),
         _ => unreachable!("wrong response from state"),
     }
 }
@@ -401,6 +402,8 @@ pub struct Inbound {
     /// Whether a gossiped block can also be requested from a second announcer expected to
     /// deliver it sooner.
     second_block_request: bool,
+    /// Shares the node's bounded writer for local-submission wait traces.
+    trace: zakura_jsonl_trace::JsonlEventEmitter,
 }
 
 impl Inbound {
@@ -431,6 +434,7 @@ impl Inbound {
             )),
             pending_blocks: PendingBlockRegistry::default(),
             second_block_request: false,
+            trace: zakura_jsonl_trace::JsonlEventEmitter::noop(),
         }
     }
 
@@ -444,6 +448,12 @@ impl Inbound {
     /// deliver it sooner. See `[network.block_download_score_and_hedge] enabled`.
     pub fn with_second_block_request(mut self, enabled: bool) -> Self {
         self.second_block_request = enabled;
+        self
+    }
+
+    /// Records completed local-submission waits using the node's existing trace writer.
+    pub fn with_trace(mut self, trace: zakura_jsonl_trace::JsonlEventEmitter) -> Self {
+        self.trace = trace;
         self
     }
 
@@ -501,7 +511,9 @@ impl Service<zn::Request> for Inbound {
                             latest_chain_tip,
                             network,
                         )
-                        .with_second_block_request(self.second_block_request),
+                        .with_second_block_request(self.second_block_request)
+                        .with_pending_blocks(self.pending_blocks.clone())
+                        .with_trace(self.trace.clone()),
                     );
 
                     result = Ok(());

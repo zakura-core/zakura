@@ -25,7 +25,7 @@ use crate::{
     check::{Phase, StepCtx},
     end::RunEnd,
     explore::feedback::{Collect, FeatureMap},
-    model::{is_fault_cause, Label},
+    model::Label,
     observe::{
         BlockSyncFact, HeaderCheckFact, ReactorCall, ReactorFact, ReactorPurpose, StorageFact,
         StoragePoint, StorageRequest, StorageResult, StreamId, TransitionFact, TransportFact,
@@ -157,6 +157,9 @@ struct StateCollector {
     /// branch too, so an apply is a reorg only once a locator reports its
     /// target as the selected tip.
     reorg_targets: Vec<StoragePoint>,
+    /// Whether storage returned a locator since header sync last asked it to
+    /// prepare a target.
+    located_since_prepare: bool,
     /// Each block request's last progress step, by session and request ID.
     progress: BTreeMap<(u64, u64), RequestProgress>,
     /// The first and the newest body-work epoch block sync's work named.
@@ -233,12 +236,13 @@ impl Collect for StateCollector {
                 continue;
             };
             let point = match to {
-                // An assumption loss ends obligations without the node
-                // doing anything, so it's no point of the node's.
-                Lifecycle::Applicable | Lifecycle::AssumptionLost => continue,
+                Lifecycle::Applicable => continue,
                 Lifecycle::Obliged => ObligationPoint::Opened,
                 Lifecycle::Discharged => ObligationPoint::Discharged,
                 Lifecycle::Expired => ObligationPoint::Expired,
+                // The registry emits it only when the loss withdraws an
+                // open obligation or pending mark.
+                Lifecycle::AssumptionLost => ObligationPoint::Withdrawn,
             };
             let first = property.as_str().split('/').next().unwrap_or_default();
             let namespace = Namespace::of(first);
@@ -505,7 +509,7 @@ impl StateCollector {
             Observation::ConnectionClosed { connection, cause } => {
                 self.closed.insert(*connection);
                 if let Some(&(row, label)) = self.last_judged.get(connection) {
-                    let stage = match is_fault_cause(cause) {
+                    let stage = match cause.is_fault() {
                         true => FrameStage::FaultCloseAfter,
                         false => FrameStage::OtherCloseAfter,
                     };
@@ -734,6 +738,16 @@ impl StateCollector {
             ..
         } = request
         {
+            if self
+                .selected_tip
+                .is_some_and(|tip| common_ancestor.height < tip)
+            {
+                if self.located_since_prepare {
+                    hit(StateFeature::ReorgStage(ReorgStage::HeaderLocator));
+                }
+                hit(StateFeature::ReorgStage(ReorgStage::HeaderPrepare));
+            }
+            self.located_since_prepare = false;
             let shared = self.prepared.iter().any(|earlier| {
                 earlier.ancestor == *common_ancestor && earlier.target.hash != target.hash
             });
@@ -852,6 +866,7 @@ impl StateCollector {
     /// if `tip` is a reorg's target.
     fn located(&mut self, tip: &StoragePoint, hit: &mut dyn FnMut(StateFeature)) {
         self.selected_tip = Some(tip.height);
+        self.located_since_prepare = true;
         if let Some(at) = self.reorg_targets.iter().position(|target| target == tip) {
             self.reorg_targets.remove(at);
             hit(StateFeature::Fork(Fork::HeaderReorgApplied));
@@ -877,6 +892,7 @@ impl StateCollector {
             .is_some_and(|tip| prepared.ancestor.height < tip)
         {
             self.reorg_targets.push(prepared.target.clone());
+            hit(StateFeature::ReorgStage(ReorgStage::HeaderApply));
         }
     }
 

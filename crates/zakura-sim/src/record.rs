@@ -1442,7 +1442,10 @@ mod tests {
                 23,
                 Some(1),
                 TransportFact::CloseDecided {
-                    cause: Some("unexpected_stream".into()),
+                    cause: Some(zakura_network::zakura::CloseOutcome::neutral(
+                        zakura_network::zakura::NeutralCause::IncompatibleConfiguration,
+                        "unexpected_stream",
+                    )),
                 },
             ),
             transport(24, Some(1), TransportFact::TornDown),

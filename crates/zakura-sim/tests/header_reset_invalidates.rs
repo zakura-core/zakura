@@ -70,8 +70,9 @@ fn held_until_reset(kind: OpKind, nth: u32) -> Hold {
 
 /// The node at A3 syncing from `mirror-0` at A6. Its first locator read is
 /// held until an invalidation of its tip, made once the read is submitted.
-/// The read then answers in the reset's generation, so the reactor reads
-/// again before it starts a round. A reconsider follows the read.
+/// The read then answers in the reset's generation. A reactor that hasn't
+/// adopted the reset yet reads again before it starts a round, and one that
+/// has uses the answer. A reconsider follows the read.
 pub fn held_locator() -> StorageScenario {
     StorageScenario {
         node: Chain::main(3),
@@ -85,6 +86,9 @@ pub fn held_locator() -> StorageScenario {
             Trigger::Completed(Select::nth(OpKind::Locator, 1)),
         ),
         weights: Default::default(),
+        node_settings: Default::default(),
+        page_delays: Vec::new(),
+        budget: None,
     }
 }
 
@@ -156,6 +160,9 @@ pub fn two_forks() -> StorageScenario {
         policy: Policy::converging(),
         controls: Vec::new(),
         weights: Default::default(),
+        node_settings: Default::default(),
+        page_delays: Vec::new(),
+        budget: None,
     }
 }
 
@@ -238,6 +245,9 @@ pub fn quiet_reset() -> StorageScenario {
             ),
         ],
         weights: Default::default(),
+        node_settings: Default::default(),
+        page_delays: Vec::new(),
+        budget: None,
     }
 }
 
@@ -636,7 +646,9 @@ fn locators_before_start(report: &RunReport) -> (Vec<(u64, String)>, Option<(u64
 
 /// Each witness takes the path it names, so a run that holds the property
 /// some other way doesn't pass for it. The held locator read answers in
-/// the reset's generation and the reactor reads again before it starts.
+/// the reset's generation, and under some plan the reactor reads again
+/// before it starts: whether its reconsider runs before the answer depends
+/// on the interleaving.
 /// The held apply is refused stale. The held reply commits, then arrives in
 /// the reset's generation. A replaced session's held read serves nothing,
 /// so the new session reads again and starts. Under some plan a read held
@@ -646,6 +658,7 @@ fn locators_before_start(report: &RunReport) -> (Vec<(u64, String)>, Option<(u64
 #[test]
 fn each_witness_takes_the_path_it_names() {
     let mut reused = 0;
+    let mut reread = 0;
     for input in inputs(8, 256) {
         let report = run(&held_locator(), input.clone());
         let read = first_op(&report, |request| {
@@ -661,7 +674,10 @@ fn each_witness_takes_the_path_it_names() {
         };
         assert_eq!(Some(header_generation), reset_generation(&report));
         let (locators, started) = locators_before_start(&report);
-        assert!(started.is_some() && locators.len() >= 2, "{locators:?}");
+        assert!(started.is_some(), "{locators:?}");
+        if locators.len() >= 2 {
+            reread += 1;
+        }
 
         let report = run(&held_apply(), input.clone());
         let apply = first_op(&report, |request| {
@@ -707,4 +723,5 @@ fn each_witness_takes_the_path_it_names() {
         assert!(!reactor(&report).any(|(_, fact)| matches!(fact, ReactorFact::Started { .. })));
     }
     assert!(reused > 0, "no plan reused the read across the tip's move");
+    assert!(reread > 0, "no plan read the held locator again");
 }

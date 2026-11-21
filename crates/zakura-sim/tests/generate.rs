@@ -207,7 +207,8 @@ fn the_generator_map_leaves_out_planted_harnesses() {
 /// its 256 prefixes.
 /// A draw that matches a new tag fails here until the harness lists it.
 /// Some prefix that each listed tag starts draws a rare scenario, so no
-/// family is stale.
+/// family is stale. A tag longer than two bytes starts no such prefix, so
+/// the scenario the tag itself draws must be rare instead.
 #[test]
 fn every_fixed_tag_a_draw_matches_is_a_listed_family() {
     const RARE: usize = 256;
@@ -243,14 +244,18 @@ fn every_fixed_tag_a_draw_matches_is_a_listed_family() {
             );
         }
         for family in &families {
-            assert!(
+            let picks = if family.tag.len() > 2 {
+                let scenario = entry.scenario(&family.tag).to_string();
+                counts.get(&scenario).is_none_or(|count| *count <= RARE)
+            } else {
                 drawn.iter().any(|(prefix, scenario)| {
                     prefix.starts_with(&family.tag) && counts[scenario] <= RARE
-                }),
-                "{}: no prefix family {}'s tag starts draws a rare scenario, so the tag \
-                 picks nothing",
-                entry.name,
-                family.name
+                })
+            };
+            assert!(
+                picks,
+                "{}: family {}'s tag draws no rare scenario, so the tag picks nothing",
+                entry.name, family.name
             );
         }
     }

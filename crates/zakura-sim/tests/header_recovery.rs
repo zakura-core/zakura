@@ -81,6 +81,9 @@ fn scenario(controls: Vec<ControlStep>) -> StorageScenario {
         weights: Weights::default(),
         policy: Policy::converging(),
         controls,
+        node_settings: Default::default(),
+        page_delays: Vec::new(),
+        budget: None,
     }
 }
 

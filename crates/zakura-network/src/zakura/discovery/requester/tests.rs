@@ -13,8 +13,7 @@ use crate::zakura::{
     },
     framed_channel,
     machine_test::machine_target_tests,
-    regulation::{PrecheckSlot, UNFINISHED_EXCHANGE},
-    CloseCause,
+    regulation::PrecheckSlot,
 };
 
 const PEERS: u16 = MSG_DISCOVERY_PEERS as u16;
@@ -29,6 +28,10 @@ impl Queries {
     ) -> Result<Option<Asked>, ClaimRefused> {
         self.claim(message_type, payload_len)
             .map(|answer| answer.map(|answer| answer.admitted.asked.clone()))
+            .map_err(|unclaimed| match unclaimed {
+                Unclaimed::Refused(refused) => refused,
+                Unclaimed::Retired => panic!("the session's queries are live"),
+            })
     }
 }
 
@@ -42,7 +45,6 @@ struct Session {
     /// The peer's end of the stream that carries this node's queries.
     written: FramedRecv,
     connection: CancellationToken,
-    close_cause: CloseCause,
     cancel: CancellationToken,
 }
 
@@ -50,14 +52,12 @@ struct Session {
 fn session_with(pool: ReservationPool, recv: &FramedRecv) -> Session {
     let (send, written) = framed_channel(4);
     let connection = CancellationToken::new();
-    let close_cause = CloseCause::new();
-    let cancel = CancellationToken::new();
-    let fence = WriterFence::new(connection.clone(), close_cause.clone());
+    let cancel = connection.child_token();
+    let fence = WriterFence::new(cancel.clone());
     Session {
         queries: Queries::new(pool, fence, recv, send, cancel.clone()),
         written,
         connection,
-        close_cause,
         cancel,
     }
 }
@@ -367,6 +367,21 @@ async fn a_retired_session_refuses_the_next_query() {
     assert_eq!(pool.held(), 0);
 }
 
+/// disco-14: silent sessions cannot starve the query pool. A session holds
+/// at most one reservation per query kind, so 92 sessions (the default
+/// connection limit) hold at most 184 entries. The derived pool covers twice
+/// that, 368 entries, so an honest session always reserves at once.
+#[test]
+fn the_query_pool_covers_twice_every_sessions_queries() {
+    let pool = reservation_pool();
+    let needed = 2 * crate::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS * QUERY_KINDS.len();
+    assert_eq!(needed, 368);
+    let entries: Vec<_> = std::iter::from_fn(|| pool.try_entry())
+        .take(needed)
+        .collect();
+    assert_eq!(entries.len(), needed);
+}
+
 /// A full node-wide pool defers the query to the next exchange.
 #[tokio::test]
 async fn a_full_pool_defers_the_query() {
@@ -422,12 +437,12 @@ async fn retiring_closes_the_connection_only_for_an_unanswered_written_query() {
     queries.retire();
     assert!(!connection.is_cancelled());
 
-    // Written and unanswered.
+    // Written and unanswered: the session resets, and the connection stays.
     let Session {
         queries,
         mut written,
         connection,
-        close_cause,
+        cancel,
         ..
     } = session(&pool);
     queries
@@ -436,9 +451,49 @@ async fn retiring_closes_the_connection_only_for_an_unanswered_written_query() {
         .expect("the query is queued");
     written.recv().await.expect("the query is written");
     queries.retire();
-    assert!(connection.is_cancelled());
-    assert_eq!(close_cause.get_or("none"), UNFINISHED_EXCHANGE);
+    assert!(cancel.is_cancelled());
+    assert!(!connection.is_cancelled());
     assert_eq!(pool.held(), 0, "retiring returns every reservation");
+}
+
+/// The transport reader can queue an answer just before the session retires
+/// its queries, and the reader can take it just after (#2632). The claim
+/// finds the queries retired and judges nothing, so a conformant peer's
+/// answer neither trips the queue's ledger nor counts as unsolicited. The
+/// same holds for an answer whose header the transport reader checks after
+/// the retirement.
+#[tokio::test]
+async fn an_answer_queued_before_retirement_claims_nothing() {
+    let pool = reservation_pool();
+    let slot = PrecheckSlot::default();
+    let (_peer, recv) = framed_channel(1);
+    let recv = recv.with_precheck(slot.clone());
+    let Session {
+        queries,
+        mut written,
+        ..
+    } = session_with(pool.clone(), &recv);
+    queries.send_get_peers(get_peers(1)).await.unwrap();
+    written.recv().await.expect("the query is written");
+    let precheck = slot.get().expect("the session attached its precheck");
+    precheck
+        .check(PEERS, peers_len(1))
+        .expect("the transport admits the owed answer");
+
+    queries.retire();
+    assert!(matches!(
+        queries.claim(PEERS, peers_len(1)),
+        Err(Unclaimed::Retired)
+    ));
+    assert_eq!(pool.held(), 0, "retiring returns every reservation");
+
+    // A transport reader inside a read can check the next answer's header
+    // after the retirement too. It reaches the reader, which drops it.
+    assert_eq!(precheck.check(PEERS, peers_len(1)), Ok(()));
+    assert!(matches!(
+        queries.claim(PEERS, peers_len(1)),
+        Err(Unclaimed::Retired)
+    ));
 }
 
 /// A claim ends the query's protocol authority. The answer keeps the pool
@@ -462,7 +517,7 @@ async fn a_claimed_answer_holds_its_entry_and_kind_until_it_settles() {
     assert_eq!(pool.held(), 1, "the claimed answer keeps its pool entry");
     assert!(matches!(
         queries.claim(PEERS, 2),
-        Err(ClaimRefused::Unsolicited { .. })
+        Err(Unclaimed::Refused(ClaimRefused::Unsolicited { .. }))
     ));
     assert!(
         matches!(

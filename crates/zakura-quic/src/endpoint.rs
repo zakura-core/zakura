@@ -599,18 +599,18 @@ impl QuicEndpoint {
                 let started = Instant::now();
                 let result = self.dial_once(socket, crypto, target, deadline, slot).await;
                 record_handshake(&result, started);
-                (target, result)
+                (target, started, result)
             });
         }
 
         let mut best: Option<ConnectError> = None;
-        while let Some((target, result)) = attempts.next().await {
+        while let Some((target, started, result)) = attempts.next().await {
             match result {
                 Ok((conn, handshake)) => {
                     // Dropping `attempts` drops every other attempt, which
                     // closes those connections with code 0.
                     drop(attempts);
-                    return finish_dial(conn, handshake, addr.id, target);
+                    return finish_dial(conn, handshake, addr.id, target, started);
                 }
                 Err(error) => {
                     if best.as_ref().is_none_or(|best| error.rank() > best.rank()) {
@@ -777,6 +777,7 @@ fn finish_dial(
     handshake: Handshake,
     expected: NodeId,
     target: SocketAddr,
+    started: Instant,
 ) -> Result<Conn, ConnectError> {
     let close = |reason: &'static [u8]| {
         let _ = conn.send(crate::driver::ConnCmd::Close {
@@ -793,7 +794,7 @@ fn finish_dial(
         close(b"alpn");
         return Err(ConnectError::AlpnMismatch);
     };
-    Ok(Conn::new(conn, expected, target, true, alpn))
+    Ok(Conn::new(conn, expected, target, started, true, alpn))
 }
 
 /// Waits for a handshake, closing the connection at the deadline (ADM-6,
@@ -816,6 +817,7 @@ async fn establish(
 /// Finishes one inbound handshake and hands the connection to the acceptor.
 pub(crate) async fn inbound_handshake(
     connecting: Connecting,
+    admitted_at: Instant,
     source_validated: bool,
     deadline: Option<Duration>,
     pending: PendingGuard,
@@ -850,7 +852,14 @@ pub(crate) async fn inbound_handshake(
     // `handle` runs before the pending count drops, so an acceptor that moves
     // the connection into its own accounting there leaves no gap (ADM-7).
     let pending = pending.handoff();
-    let handled = acceptor.handle(Conn::new(conn, remote_id, remote, source_validated, alpn));
+    let handled = acceptor.handle(Conn::new(
+        conn,
+        remote_id,
+        remote,
+        admitted_at,
+        source_validated,
+        alpn,
+    ));
     drop(pending);
     handled.await;
 }

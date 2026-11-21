@@ -537,7 +537,7 @@ pub struct SessionLife {
 mod tests {
     use super::*;
     use crate::{
-        domain::header_sync::{watch_end_violations, WATCH_OBSERVED_UNDER_FLOOD},
+        domain::header_sync::{watch_end_violations, WATCH_OBSERVED_UNDER_LIFECYCLE_FLOOD},
         end::Drain,
         Outcome,
     };
@@ -580,10 +580,10 @@ mod tests {
         AdoptionFact::Adopted(adoption.clone())
     }
 
-    /// A wire take at `point` leaving `queued`.
-    fn wire(point: TakePoint, queued: usize) -> AdoptionFact {
+    /// A lifecycle take at `point` leaving `queued`.
+    fn lifecycle(point: TakePoint, queued: usize) -> AdoptionFact {
         AdoptionFact::EventTaken {
-            queue: EventQueue::Wire,
+            queue: EventQueue::Lifecycle,
             point,
             queued,
         }
@@ -636,56 +636,60 @@ mod tests {
             ..settled.clone()
         };
         let wedged = evidence(vec![(0, commit(2))], 0);
-        assert!(!wedged.unread_at_settled_end(EventQueue::Wire));
+        assert!(!wedged.unread_at_settled_end(EventQueue::Lifecycle));
         wedged.end(&settled);
-        assert!(!wedged.published_into_flood(EventQueue::Wire));
-        assert!(wedged.unread_at_settled_end(EventQueue::Wire));
-        let found = watch_end_violations(&wedged, EventQueue::Wire, false);
+        assert!(!wedged.published_into_flood(EventQueue::Lifecycle));
+        assert!(wedged.unread_at_settled_end(EventQueue::Lifecycle));
+        let found = watch_end_violations(&wedged, false);
         assert_eq!(found.len(), 1, "{found:?}");
-        assert_eq!(found[0].property.to_string(), WATCH_OBSERVED_UNDER_FLOOD);
-        assert!(watch_end_violations(&wedged, EventQueue::Wire, true).is_empty());
+        assert_eq!(
+            found[0].property.to_string(),
+            WATCH_OBSERVED_UNDER_LIFECYCLE_FLOOD
+        );
+        assert!(watch_end_violations(&wedged, true).is_empty());
 
         let unsettled = evidence(vec![(0, commit(2))], 0);
         unsettled.end(&cut);
-        assert!(!unsettled.unread_at_settled_end(EventQueue::Wire));
-        assert!(watch_end_violations(&unsettled, EventQueue::Wire, false).is_empty());
+        assert!(!unsettled.unread_at_settled_end(EventQueue::Lifecycle));
+        assert!(watch_end_violations(&unsettled, false).is_empty());
 
         let read = evidence(vec![(0, commit(2)), (0, self::read(2))], 0);
         read.end(&settled);
-        assert!(!read.unread_at_settled_end(EventQueue::Wire));
-        assert!(watch_end_violations(&read, EventQueue::Wire, false).is_empty());
+        assert!(!read.unread_at_settled_end(EventQueue::Lifecycle));
+        assert!(watch_end_violations(&read, false).is_empty());
     }
 
     /// The watch rule over `facts`, all at time 0.
     fn watch(facts: Vec<AdoptionFact>) -> WatchRead {
-        evidence(facts.into_iter().map(|fact| (0, fact)).collect(), 0).watch_read(EventQueue::Wire)
+        evidence(facts.into_iter().map(|fact| (0, fact)).collect(), 0)
+            .watch_read(EventQueue::Lifecycle)
     }
 
-    /// Two wire events and then a read of a later state answer a
-    /// publication. A third wire event before any read breaks the rule, a
-    /// read of an earlier state doesn't count, lifecycle events don't
-    /// count against the wire rule, and a publication with no answer yet is
-    /// open. No publication is nothing.
+    /// Two lifecycle events and then a read of a later state answer a
+    /// publication. A third lifecycle event before any read breaks the
+    /// rule, a read of an earlier state doesn't count, wire events don't
+    /// count against the lifecycle rule, and a publication with no answer
+    /// yet is open. No publication is nothing.
     #[test]
     fn the_watch_rule_counts_one_queue_after_each_publication() {
         use TakePoint::{Select, TurnStart};
-        let lifecycle = AdoptionFact::EventTaken {
-            queue: EventQueue::Lifecycle,
+        let wire = AdoptionFact::EventTaken {
+            queue: EventQueue::Wire,
             point: TurnStart,
             queued: 3,
         };
         assert_eq!(
-            watch(vec![wire(TurnStart, 4), AdoptionFact::Pass]),
+            watch(vec![lifecycle(TurnStart, 4), AdoptionFact::Pass]),
             WatchRead::Nothing
         );
         assert_eq!(
             watch(vec![
                 commit(2),
-                wire(TurnStart, 4),
-                wire(Select, 3),
-                lifecycle.clone(),
-                lifecycle.clone(),
-                lifecycle,
+                lifecycle(TurnStart, 4),
+                lifecycle(Select, 3),
+                wire.clone(),
+                wire.clone(),
+                wire,
                 read(3),
             ]),
             WatchRead::Holds
@@ -694,49 +698,56 @@ mod tests {
             watch(vec![
                 commit(2),
                 read(1),
-                wire(TurnStart, 4),
-                wire(Select, 3),
-                wire(TurnStart, 2),
+                lifecycle(TurnStart, 4),
+                lifecycle(Select, 3),
+                lifecycle(TurnStart, 2),
                 read(2),
             ]),
             WatchRead::Broken(_)
         ));
         assert_eq!(
-            watch(vec![commit(2), wire(TurnStart, 4), wire(Select, 3)]),
+            watch(vec![
+                commit(2),
+                lifecycle(TurnStart, 4),
+                lifecycle(Select, 3)
+            ]),
             WatchRead::Open
         );
         assert_eq!(
-            watch(vec![commit(2), read(2), commit(3), wire(TurnStart, 4)]),
+            watch(vec![commit(2), read(2), commit(3), lifecycle(TurnStart, 4)]),
             WatchRead::Open
         );
     }
 
     /// A publication whose queue delivers an event before its watch read
     /// is published into a flood. One read first, or with no later event,
-    /// isn't, and a lifecycle event doesn't count for the wire queue.
+    /// isn't, and a wire event doesn't count for the lifecycle queue.
     #[test]
     fn a_publication_read_before_any_event_is_not_into_a_flood() {
         let flooded = |facts: Vec<AdoptionFact>| {
             evidence(facts.into_iter().map(|fact| (0, fact)).collect(), 0)
-                .published_into_flood(EventQueue::Wire)
+                .published_into_flood(EventQueue::Lifecycle)
         };
-        let lifecycle = AdoptionFact::EventTaken {
-            queue: EventQueue::Lifecycle,
+        let wire = AdoptionFact::EventTaken {
+            queue: EventQueue::Wire,
             point: TakePoint::TurnStart,
             queued: 1,
         };
         assert!(flooded(vec![
             commit(2),
-            wire(TakePoint::TurnStart, 1),
+            lifecycle(TakePoint::TurnStart, 1),
             read(2)
         ]));
         assert!(!flooded(vec![
             commit(2),
             read(2),
-            wire(TakePoint::TurnStart, 5)
+            lifecycle(TakePoint::TurnStart, 5)
         ]));
-        assert!(!flooded(vec![wire(TakePoint::TurnStart, 5), commit(2)]));
-        assert!(!flooded(vec![commit(2), lifecycle, read(2)]));
+        assert!(!flooded(vec![
+            lifecycle(TakePoint::TurnStart, 5),
+            commit(2)
+        ]));
+        assert!(!flooded(vec![commit(2), wire, read(2)]));
     }
 
     /// Whether `outcome` is a violation naming `rule`.

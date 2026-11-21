@@ -305,7 +305,10 @@ impl BenchBodyFeeder {
             body,
             bytes,
             None,
-            self.bench_peer.clone(),
+            super::events::BlockSupplier {
+                peer: self.bench_peer.clone(),
+                conn_id: 0,
+            },
             Instant::now(),
             self.body_input_bytes.clone(),
             self.body_input_decoded_attributed_memory_bytes.clone(),

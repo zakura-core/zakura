@@ -63,13 +63,16 @@ fn every(kind: BlockKind) -> Select {
     }
 }
 
-/// Relinks `peer` once its connection closes, as a reset closes it.
+/// Relinks `peer` once its session ends, as a reset ends it. A fork's
+/// answer resets only the block-sync session, and production's transport
+/// then reopens it. The in-memory link can't reopen a session, so the
+/// harness links the peer again.
 fn relink(peer: &str) -> ControlStep {
     ControlStep {
         action: ControlAction::Relink {
             peer: peer.to_owned(),
         },
-        when: Some(Trigger::Closed(peer.to_owned())),
+        when: Some(Trigger::SessionEnded(peer.to_owned())),
     }
 }
 
@@ -210,11 +213,13 @@ impl BlockScenario {
     /// reply that follows frees room that must wake the waiting body
     /// (#1523).
     ///
-    /// The teardown ends by step 540,000 on the frontier-first input, after
-    /// which only the mirror's metrics timer runs, so the run stops at
-    /// 580,000 steps instead of the default budget's 837,000. Preemption
-    /// points added to the block path move the mirror's second close, so a
-    /// change there can pass this budget.
+    /// The teardown ends by step 520,000 on the frontier-first input, after
+    /// which only timers run. The run keeps the default budget of 837,000
+    /// steps: a PCT schedule can keep the node syncing past step 600,000, and
+    /// the 60,000-step drain can't finish that work (#2641). The closes count
+    /// mirror reads, and the fork's bodies wait for room, so a schedule can
+    /// also stop the reads short of the second close. The node then idles
+    /// until the budget, and the run checks nothing about the release.
     pub fn capacity_release() -> Self {
         let mirror = "mirror-0";
         let reads = |count: u32| {
@@ -284,7 +289,6 @@ impl BlockScenario {
                     when: Some(Trigger::Completed(Select::nth(BlockKind::Apply, 21))),
                 },
             ],
-            steps: Some(580_000),
             ..BlockScenario::default()
         }
     }

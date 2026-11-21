@@ -551,6 +551,7 @@ impl PeerRoutine {
                 });
                 let key = self.state.window.outstanding.push(OutstandingBlockRange {
                     request,
+                    max_response_bytes: self.state.max_response_bytes,
                     queued_at,
                     deadline,
                     delivery_snapshot: self.state.window.delivery_snapshot(queued_at),

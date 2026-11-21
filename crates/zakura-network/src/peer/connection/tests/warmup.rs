@@ -119,6 +119,7 @@ async fn block_advert_is_written_before_a_queued_warmup_ping() {
         .try_send(crate::peer::block_gossip::BlockAdvert {
             hash,
             push: false,
+            pending_send: None,
             result,
         })
         .unwrap();

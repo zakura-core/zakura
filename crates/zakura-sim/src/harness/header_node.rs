@@ -923,8 +923,8 @@ pub struct Topology {
     sessions: Option<SessionEvidence>,
     /// Set once a `Shutdown` step was picked, which stops any churn.
     stopping: Cell<bool>,
-    /// The mirror whose pages the harness holds back, if any.
-    delayed_page: Option<DelayedPage>,
+    /// The mirrors whose pages the harness holds back.
+    delayed_pages: Vec<DelayedPage>,
 }
 
 /// A mirror whose first `Headers` frame on each of its links the harness
@@ -1102,15 +1102,15 @@ impl Topology {
             tap: None,
             sessions: None,
             stopping: Cell::new(false),
-            delayed_page: None,
+            delayed_pages: Vec::new(),
         }
     }
 
-    /// This topology, holding back `delayed`'s mirror's first page on each
-    /// of its links ([`DelayedPage`]).
-    pub fn with_delayed_page(self, delayed: Option<DelayedPage>) -> Self {
+    /// This topology, holding back each of `delayed`'s mirrors' first page
+    /// on each of its links ([`DelayedPage`]).
+    pub fn with_delayed_pages(self, delayed: Vec<DelayedPage>) -> Self {
         Topology {
-            delayed_page: delayed,
+            delayed_pages: delayed,
             ..self
         }
     }
@@ -1350,9 +1350,9 @@ impl Topology {
                 continue;
             }
             let delay = self
-                .delayed_page
-                .as_ref()
-                .filter(|delayed| local != 0 && delayed.mirror == self.nodes[local].name)
+                .delayed_pages
+                .iter()
+                .find(|delayed| local != 0 && delayed.mirror == self.nodes[local].name)
                 .map(|delayed| delayed.by);
             let streams = match delay {
                 Some(by) => {

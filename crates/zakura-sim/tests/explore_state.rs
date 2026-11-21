@@ -6,11 +6,12 @@
 mod support;
 
 use zakura_sim::harness::header_sync::storage_witnesses::{
-    competing_mirrors, header_apply, reply_hold,
+    self, competing_mirrors, header_apply, reply_hold,
 };
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    sync::{Arc, OnceLock},
     thread,
 };
 
@@ -21,9 +22,11 @@ use zakura_network::zakura::{
 use zakura_sim::{
     explore::{
         feedback::{Counters, Feature, Feedback, FEATURES, FEEDBACK_VERSION},
+        generate::ReachSearch,
         state::{
-            collector, Coverage, Disposition, Family, Fork as ForkState, FrameLabel, Operation,
-            RetireReason, Row, Service, StateFeature, Transition, REQUIRED, SPAN,
+            collector, Coverage, Disposition, Family, Fork as ForkState, FrameLabel, Namespace,
+            ObligationPoint, Operation, ReorgStage, RetireReason, Row, Service, StateFeature,
+            Transition, REQUIRED, SPAN,
         },
     },
     harness::{
@@ -37,14 +40,17 @@ use zakura_sim::{
             policy::{Allow, Hold as HeaderHold, Trigger as HeaderTrigger},
             Policy as HeaderPolicy,
         },
-        header_sync::{HeaderWire, Storage as HeaderStorage, StorageScenario},
+        header_sync::{
+            grammar, HeaderWire, Storage as HeaderStorage, StorageScenario, WireScenario,
+        },
         run_harness,
-        wire_plans::act_scenario,
+        sync_wire::COMBINED_TAG,
+        wire_plans::{act_scenario, progress_scenario},
         HarnessError, Subsystem,
     },
     model::Label,
     observe::{StorageFact, StorageRequest, StorageResult},
-    peer::adversary::Act,
+    peer::{adversary::Act, PeerAction},
     Checker, MemorySink, Observation, Plan, PropertyReport, RecordSink, RunEnd, RunReport,
 };
 
@@ -105,13 +111,13 @@ fn state_features_have_distinct_indices_inside_their_blocks() {
     }
 }
 
-/// [`FEEDBACK_VERSION`] 5's layout: one pinned index per block, and every
+/// [`FEEDBACK_VERSION`] 6's layout: one pinned index per block, and every
 /// vocabulary's size. A change here changes what a corpus means, so it
 /// bumps the version.
 #[test]
 fn the_layout_is_pinned_to_its_version() {
     use zakura_sim::explore::state::*;
-    assert_eq!(FEEDBACK_VERSION, 5);
+    assert_eq!(FEEDBACK_VERSION, 6);
     let pinned = [
         (
             StateFeature::HeaderRetired {
@@ -225,11 +231,22 @@ fn the_layout_is_pinned_to_its_version() {
             28672 + 6,
         ),
         (
+            StateFeature::ReorgStage(ReorgStage::HeaderLocator),
+            28672 + 9,
+        ),
+        (
             StateFeature::Obligation {
                 namespace: Namespace::HeaderSync,
                 point: ObligationPoint::Expired,
             },
-            32768 + 3 * 3 + 2,
+            32768 + 3 * 4 + 2,
+        ),
+        (
+            StateFeature::Obligation {
+                namespace: Namespace::Unlisted,
+                point: ObligationPoint::Withdrawn,
+            },
+            32768 + 7 * 4 + 3,
         ),
         (StateFeature::ConditionsEstablished, 32768 + 512),
         (
@@ -293,10 +310,10 @@ fn the_layout_is_pinned_to_its_version() {
         sizes,
         [
             10, 2, 4, 21, 4, 9, 2, 4, 2, 2, 13, 3, 8, 4, 6, 8, 2, 3, 4, 4, 4, 2, 4, 12, 2, 14, 6,
-            18, 2, 3, 7, 8, 3, 3, 2, 2, 2
+            18, 2, 3, 10, 8, 4, 3, 2, 2, 2
         ]
     );
-    assert_eq!(StateFeature::all().len(), 2_833);
+    assert_eq!(StateFeature::all().len(), 2_844);
     // Swapping two values inside a vocabulary keeps every size above, and
     // can keep every pinned index, but moves both values' indices. The
     // digest of every feature's index pins the whole mapping.
@@ -309,7 +326,7 @@ fn the_layout_is_pinned_to_its_version() {
         .map(|byte| format!("{byte:02x}"))
         .collect();
     assert_eq!(
-        digest, "97fbed6b88912692acac743b89144d2bf44e6817ba5a03b7d12b63b2a5a9e4dd",
+        digest, "e4484807aee0798357170b57f056b8601981024cb2d0e2f95ece813768db3005",
         "the index mapping moved: bump FEEDBACK_VERSION and this digest together"
     );
 }
@@ -568,25 +585,21 @@ fn witnesses() -> Vec<Witness> {
             relink_while_applying(),
             plan(),
         ),
-        drawn(
-            "header-sync/storage",
-            "header storage locator dropped at its timeout",
-            seed("header-storage-locator-dropped"),
-        ),
-        drawn(
-            "header-sync/storage",
-            "header storage apply pending at close",
-            seed("header-storage-apply-at-close"),
-        ),
-        drawn(
-            "header-sync/storage",
-            "header storage competing mirrors",
-            seed("header-storage-competing-mirrors"),
-        ),
         explicit::<HeaderWire>(
             "header wire status burst",
             act_scenario(Act::StatusBurst),
             plan(),
+        ),
+        explicit::<HeaderWire>(
+            "header wire honest peer leaves before the apply",
+            leaving(),
+            Vec::new(),
+        ),
+        explicit::<BlockStorage>("block drain cut short", drain_cut_short(), plan()),
+        drawn(
+            "sync/wire",
+            "sync wire reorg",
+            [&[COMBINED_TAG, 1][..], &plan()].concat(),
         ),
     ];
     for tag in 1..=14u8 {
@@ -601,11 +614,15 @@ fn witnesses() -> Vec<Witness> {
         StorageScenario::grow(),
         grow_to_drain_plan(),
     ));
-    // fuzz-12 item 7's witness seeds.
+    // The searched witnesses, then fuzz-12 item 7's other witness seeds.
+    for (name, input) in searched_inputs() {
+        all.push(drawn(HeaderStorage::NAME, name, input.clone()));
+    }
     for witness in zakura_sim::seed::all() {
-        if witness.name.starts_with("header-storage-w-") {
+        let searched = searched_inputs().contains_key(witness.name.as_str());
+        if witness.name.starts_with("header-storage-w-") && !searched {
             all.push(drawn(
-                "header-sync/storage",
+                HeaderStorage::NAME,
                 &witness.name,
                 witness.input().to_vec(),
             ));
@@ -624,6 +641,174 @@ fn witnesses() -> Vec<Witness> {
         ));
     }
     all
+}
+
+/// How many Plans a searched witness's search may run. Each search found its
+/// Plan within its first four runs when this was set, so 64 leaves a wide
+/// margin, and a run takes milliseconds.
+const SEARCHED_RUNS: u64 = 64;
+
+/// The longest Plan a searched witness's search draws.
+const SEARCHED_PLAN_BYTES: usize = 1_024;
+
+/// What a searched witness's run must show: a test over its states.
+type Wanted = Arc<dyn Fn(&BTreeSet<StateFeature>) -> bool + Send + Sync>;
+
+/// Wants every row named in `rows` shown.
+fn rows(rows: &'static [&'static str]) -> Wanted {
+    Arc::new(move |states: &BTreeSet<StateFeature>| {
+        rows.iter().all(|name| {
+            let row = REQUIRED
+                .iter()
+                .find(|row| row.state == *name)
+                .unwrap_or_else(|| panic!("no required row {name}"));
+            let Coverage::Collected { shows, .. } = row.coverage else {
+                panic!("{name} is collected");
+            };
+            states.iter().any(shows)
+        })
+    })
+}
+
+/// Wants exactly `label` among the fork-work labels.
+fn fork(label: ForkState) -> Wanted {
+    Arc::new(move |states: &BTreeSet<StateFeature>| fork_labels(states.iter().copied()) == [label])
+}
+
+/// Wants each hold stage of `op`'s held `part`.
+fn every_hold_stage(op: Operation, part: zakura_sim::explore::state::HeldPart) -> Wanted {
+    use zakura_sim::explore::state::HoldStage;
+    Arc::new(move |states: &BTreeSet<StateFeature>| {
+        HoldStage::ALL
+            .iter()
+            .all(|&stage| states.contains(&StateFeature::Hold { op, part, stage }))
+    })
+}
+
+/// Wants each of `all`.
+fn all_of(all: Vec<Wanted>) -> Wanted {
+    Arc::new(move |states: &BTreeSet<StateFeature>| all.iter().all(|wanted| wanted(states)))
+}
+
+/// The `header-sync/storage` witnesses whose rows depend on how a Plan
+/// orders the run, each by name, with its scenario and what its run must
+/// show. A search finds each one's Plan on every build, so a change in
+/// header sync's timing can't move a pinned Plan off the rows the tests
+/// below check.
+fn searched() -> Vec<(&'static str, StorageScenario, Wanted)> {
+    use zakura_sim::explore::state::HeldPart;
+    let witness = |name: &str| {
+        storage_witnesses::witness_scenarios()
+            .into_iter()
+            .find(|(stem, _)| stem == name)
+            .unwrap_or_else(|| panic!("no witness scenario {name}"))
+            .1
+    };
+    let fork_row = rows(&["stronger, weaker or equal work"]);
+    vec![
+        (
+            "header storage locator dropped at its timeout",
+            storage_witnesses::dropped_locator(),
+            rows(&["completion after cancellation request"]),
+        ),
+        (
+            "header storage apply pending at close",
+            storage_witnesses::apply_at_close(),
+            rows(&["completion after owner retirement"]),
+        ),
+        (
+            "header storage competing mirrors",
+            competing_mirrors(),
+            rows(&[
+                "two distinct peer offers",
+                "shared ancestor",
+                "selected winner",
+            ]),
+        ),
+        (
+            "header-storage-w-hold-succeeds",
+            witness("header-storage-w-hold-succeeds"),
+            all_of(vec![
+                rows(&["operation kind × blocked × release × resumed operation"]),
+                every_hold_stage(Operation::ReadHeaderPath, HeldPart::Completion),
+            ]),
+        ),
+        (
+            "header-storage-w-reply-hold",
+            witness("header-storage-w-reply-hold"),
+            every_hold_stage(Operation::ApplyHeaderTarget, HeldPart::Reply),
+        ),
+        (
+            "header-storage-w-equal-forks",
+            witness("header-storage-w-equal-forks"),
+            all_of(vec![fork_row.clone(), fork(ForkState::EqualWork)]),
+        ),
+        (
+            "header-storage-w-longer-fork",
+            witness("header-storage-w-longer-fork"),
+            all_of(vec![fork_row.clone(), fork(ForkState::WeakerWork)]),
+        ),
+        (
+            "header-storage-w-weighted-fork",
+            witness("header-storage-w-weighted-fork"),
+            all_of(vec![fork_row, fork(ForkState::StrongerWork)]),
+        ),
+        (
+            "header-storage-w-peer-lease-denied",
+            witness("header-storage-w-peer-lease-denied"),
+            rows(&["exactly limit", "attempted over-limit and denied"]),
+        ),
+        (
+            "header-storage-w-recover-closes",
+            witness("header-storage-w-recover-closes"),
+            rows(&["conditions established"]),
+        ),
+        (
+            "header-storage-w-stop-storage",
+            witness("header-storage-w-stop-storage"),
+            rows(&["external acknowledgement"]),
+        ),
+    ]
+}
+
+/// Each searched witness's input: its scenario under the first Plan whose
+/// run shows what it wants, found once per process.
+fn searched_inputs() -> &'static BTreeMap<&'static str, Vec<u8>> {
+    static INPUTS: OnceLock<BTreeMap<&'static str, Vec<u8>>> = OnceLock::new();
+    INPUTS.get_or_init(|| {
+        thread::scope(|scope| {
+            let searches: Vec<_> = searched()
+                .into_iter()
+                .map(|(name, scenario, wanted)| {
+                    scope.spawn(move || {
+                        let counters = counters();
+                        let search = ReachSearch {
+                            prefix: grammar::input(&scenario, &[])
+                                .unwrap_or_else(|error| panic!("{name}: {error}")),
+                            max_bytes: SEARCHED_PLAN_BYTES,
+                            steer: None,
+                            feedback: Some(Feedback::new(counters, collector)),
+                            ..ReachSearch::new(support::REACH_SEED, SEARCHED_RUNS)
+                        };
+                        let reached =
+                            support::reaches_with(HeaderStorage::NAME, &search, move |_| {
+                                let states: BTreeSet<StateFeature> = counters
+                                    .hits()
+                                    .into_iter()
+                                    .filter_map(StateFeature::decode)
+                                    .collect();
+                                wanted(&states).then_some(())
+                            });
+                        (name, reached.input)
+                    })
+                })
+                .collect();
+            searches
+                .into_iter()
+                .map(|search| search.join().expect("the search runs"))
+                .collect()
+        })
+    })
 }
 
 /// fuzz-13's `header-sync/wire` seeds.
@@ -670,6 +855,26 @@ fn teardown() -> BlockScenario {
                 })),
             )),
         }],
+        ..BlockScenario::default()
+    }
+}
+
+/// The progress fixture with an honest peer that disconnects once it has
+/// served its page. Under the default Plan, it leaves before the node
+/// applies the header it advertised, so `StableMembership` stops holding
+/// while `header-sync/honest-progress`'s obligation is open.
+fn leaving() -> WireScenario {
+    let mut scenario = progress_scenario();
+    scenario.peers[0].script = vec![PeerAction::Disconnect];
+    scenario
+}
+
+/// Eight blocks whose run stops a quarter of the way through its sync and
+/// whose drain ends after ten steps, while the node still has work ready.
+fn drain_cut_short() -> BlockScenario {
+    BlockScenario {
+        steps: Some(2_000),
+        drain_steps: Some(10),
         ..BlockScenario::default()
     }
 }
@@ -782,10 +987,6 @@ fn every_collected_state_has_a_witness() {
             &["stronger, weaker or equal work"][..],
         ),
         (
-            "header-storage-w-longer-fork",
-            &["stronger, weaker or equal work"][..],
-        ),
-        (
             "header-storage-w-weighted-fork",
             &["stronger, weaker or equal work"][..],
         ),
@@ -827,6 +1028,39 @@ fn every_collected_state_has_a_witness() {
             assert!(states.iter().any(shows), "{name} doesn't show {state}");
         }
     }
+    // Each witness built for fuzz-5's waiting states shows its own, and the
+    // reorg shows each of header sync's three stages.
+    let shown_by = |name: &str| {
+        witnesses
+            .iter()
+            .zip(&reached)
+            .find(|(witness, _)| witness.name == name)
+            .map(|(_, states)| states)
+            .unwrap_or_else(|| panic!("no witness {name}"))
+    };
+    for stage in [
+        ReorgStage::HeaderPrepare,
+        ReorgStage::HeaderApply,
+        ReorgStage::HeaderLocator,
+    ] {
+        assert!(
+            shown_by("sync wire reorg").contains(&StateFeature::ReorgStage(stage)),
+            "sync wire reorg doesn't show {stage:?}"
+        );
+    }
+    assert!(
+        shown_by("header wire honest peer leaves before the apply").contains(
+            &StateFeature::Obligation {
+                namespace: Namespace::HeaderSync,
+                point: ObligationPoint::Withdrawn,
+            }
+        ),
+        "the leaving peer withdraws no obligation"
+    );
+    assert!(
+        shown_by("block drain cut short").contains(&StateFeature::IncompleteDrain),
+        "the cut drain is complete"
+    );
     for row in REQUIRED {
         let Coverage::Collected {
             harnesses,
@@ -857,6 +1091,25 @@ fn every_collected_state_has_a_witness() {
     }
 }
 
+/// fuzz-5's acceptance: every required state is collected, or excluded
+/// with a reason. None waits.
+#[test]
+fn every_required_state_is_collected_or_excluded() {
+    for row in REQUIRED {
+        match row.coverage {
+            Coverage::Collected { harnesses, .. } => {
+                assert!(!harnesses.is_empty(), "{}: no harness", row.state);
+            }
+            Coverage::Excluded { why } => {
+                assert!(!why.trim().is_empty(), "{}: no reason", row.state);
+            }
+            Coverage::Waiting { on, why } => {
+                panic!("{} waits on {on}: {why}", row.state)
+            }
+        }
+    }
+}
+
 /// The states `name`'s witness hits.
 fn witness_states(name: &str) -> BTreeSet<StateFeature> {
     let witness = witnesses()
@@ -864,6 +1117,19 @@ fn witness_states(name: &str) -> BTreeSet<StateFeature> {
         .find(|witness| witness.name == name)
         .unwrap_or_else(|| panic!("no witness {name}"));
     states(&witness)
+}
+
+/// The fork-work labels a run's states hold.
+fn fork_labels(states: impl IntoIterator<Item = StateFeature>) -> Vec<ForkState> {
+    states
+        .into_iter()
+        .filter_map(|state| match state {
+            StateFeature::Fork(
+                fork @ (ForkState::StrongerWork | ForkState::WeakerWork | ForkState::EqualWork),
+            ) => Some(fork),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Each fork-work label has the witness built for it, and each hold stage
@@ -878,16 +1144,7 @@ fn fuzz_12_features_have_their_witnesses() {
         ("header-storage-w-longer-fork", ForkState::WeakerWork),
         ("header-storage-w-weighted-fork", ForkState::StrongerWork),
     ] {
-        let labels: Vec<ForkState> = witness_states(stem)
-            .into_iter()
-            .filter_map(|state| match state {
-                StateFeature::Fork(
-                    fork @ (ForkState::StrongerWork | ForkState::WeakerWork | ForkState::EqualWork),
-                ) => Some(fork),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(labels, [label], "{stem}");
+        assert_eq!(fork_labels(witness_states(stem)), [label], "{stem}");
     }
     for (stem, op, part) in [
         (
@@ -909,14 +1166,14 @@ fn fuzz_12_features_have_their_witnesses() {
     }
 }
 
-/// The weighted-fork seed prepares the five-header branch again after the
-/// three-header one, and that retry earns no reverse label: the seed hits
-/// only [`ForkState::StrongerWork`], as the test above checks.
+/// The weighted-fork witness prepares the five-header branch again after
+/// the three-header one, and that retry earns no reverse label: the
+/// witness hits only [`ForkState::StrongerWork`], as the test above checks.
 #[test]
 fn a_retried_prepare_earns_no_fork_work() {
     let entry = zakura_sim::harness::find("header-sync/storage").unwrap();
     let run = (entry.run_bytes)(
-        &seed("header-storage-w-weighted-fork"),
+        &searched_inputs()["header-storage-w-weighted-fork"],
         &mut zakura_sim::NullSink,
         None,
     );

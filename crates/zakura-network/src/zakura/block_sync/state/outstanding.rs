@@ -60,6 +60,8 @@ pub(in crate::zakura::block_sync) struct OutstandingRequests {
     charged_for_liveness: BTreeSet<RequestKey>,
     /// Sum of the size estimates still reserved for unreceived heights.
     reserved_bytes: u64,
+    /// Maximum serialized body bytes still owed across requests.
+    transfer_bytes: u64,
     /// Largest block count of any request issued, which bounds height lookups.
     max_count: u32,
     next_key: u64,
@@ -150,6 +152,7 @@ impl OutstandingRequests {
         self.by_end.insert((request.request.end_height(), key));
         self.by_deadline.insert((request.deadline, key));
         self.reserved_bytes = self.reserved_bytes.saturating_add(request.reserved_bytes());
+        self.transfer_bytes += request.transfer_bytes();
         self.max_count = self.max_count.max(request.request.count);
         self.requests.insert(key, request);
         key
@@ -165,6 +168,7 @@ impl OutstandingRequests {
         self.by_deadline.remove(&(request.deadline, key));
         self.charged_for_liveness.remove(&key);
         self.reserved_bytes = self.reserved_bytes.saturating_sub(request.reserved_bytes());
+        self.transfer_bytes -= request.transfer_bytes();
         Some(request)
     }
 
@@ -250,7 +254,9 @@ impl OutstandingRequests {
         if request.has_received(height) {
             return false;
         }
+        let before = request.transfer_bytes();
         request.mark_received(height);
+        self.transfer_bytes -= before - request.transfer_bytes();
         self.reserved_bytes = self.reserved_bytes.saturating_sub(estimate);
         true
     }
@@ -265,15 +271,23 @@ impl OutstandingRequests {
         let Some(request) = self.requests.get_mut(&key) else {
             return 0;
         };
+        let before = request.transfer_bytes();
         let released = request.mark_received_through(tip);
+        self.transfer_bytes -= before - request.transfer_bytes();
         self.reserved_bytes = self.reserved_bytes.saturating_sub(released);
         released
     }
 
     pub(in crate::zakura::block_sync) fn record_body_bytes(&mut self, key: RequestKey, bytes: u64) {
         if let Some(request) = self.requests.get_mut(&key) {
+            let before = request.transfer_bytes();
             request.record_body_bytes(bytes);
+            self.transfer_bytes -= before - request.transfer_bytes();
         }
+    }
+
+    pub(in crate::zakura::block_sync) fn transfer_bytes(&self) -> u64 {
+        self.transfer_bytes
     }
 
     /// Size estimates still reserved for unreceived heights across all requests.
@@ -324,6 +338,13 @@ impl OutstandingRequests {
             acc.saturating_add(request.reserved_bytes())
         });
         assert_eq!(self.reserved_bytes, reserved);
+        assert_eq!(
+            self.transfer_bytes,
+            self.requests
+                .values()
+                .map(OutstandingBlockRange::transfer_bytes)
+                .sum::<u64>()
+        );
         let starts: BTreeSet<_> = self
             .requests
             .iter()

@@ -4,10 +4,9 @@
 //! path and matching metric. `closed.neutral` carries a bounded `reason` label
 //! describing the teardown cause (for example `idle_timeout`, `accept_failed`,
 //! `outbound_closed`, `bad_response`, or `cancelled`). A frame-read error
-//! records `ordered_read_rejected` or `request_read_rejected` for a peer fault,
-//! and the neutral `ordered_read_timeout`, `request_read_timeout`,
-//! `ordered_read_transport`, or `request_read_transport` otherwise. Readers
-//! can match the `ordered_read_` and `request_read_` prefixes. Connection
+//! can record a versioned fault row or the neutral `ordered_read_transport`
+//! or `request_read_transport` label. A frame-read timeout ends the stream or
+//! session without a connection close decision. Connection
 //! admission rejects use `rejected.admission` with a bounded `reason` label
 //! rather than one event name per rejection metric, so readers should pivot by
 //! `event` plus `reason` for those rows.

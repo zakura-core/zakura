@@ -3,7 +3,8 @@ use std::sync::Mutex as StdMutex;
 use super::*;
 use crate::zakura::{
     header_sync::observe::{HeaderSyncObserver, ReactorEvent},
-    CloseCause, FramedRecv, SinkReject,
+    CloseCause, CloseOutcome, CloseRow, FramedRecv, SinkReject, ZAKURA_HEADER_SYNC_STREAM_VERSION,
+    ZAKURA_STREAM_HEADER_SYNC,
 };
 
 #[test]
@@ -266,7 +267,14 @@ fn header_peer_faults_disconnect_only_the_sending_session() {
                 continue;
             }
             assert_peer_violation(&mut actions, HeaderSyncMisbehavior::InvalidHeader);
-            assert_eq!(close_cause.get_or("missing"), "header_peer_fault");
+            assert_eq!(
+                close_cause.get(),
+                Some(CloseOutcome::fault(
+                    ZAKURA_STREAM_HEADER_SYNC,
+                    ZAKURA_HEADER_SYNC_STREAM_VERSION,
+                    CloseRow::HSYNC_CLOSE_33,
+                ))
+            );
             let start = v9::Cursor {
                 height: anchor.height,
                 hash: anchor.hash,
@@ -612,9 +620,10 @@ async fn unlinked_page_ends_the_session_in_the_reader() {
     )
     .await
     .expect_err("an unlinked page ends the session");
-    let SinkReject::Protocol(error) = rejected else {
+    let SinkReject::Protocol(row, error) = rejected else {
         panic!("an unlinked page is a protocol violation, got {rejected:?}");
     };
+    assert_eq!(row, CloseRow::HSYNC_CLOSE_15);
     assert_eq!(
         error.to_string(),
         "the headers do not link from the page parent",
@@ -655,4 +664,93 @@ fn a_cooldown_without_a_current_session_is_published() {
         reactor.candidates.borrow().backed_off_node_ids,
         vec![node_id]
     );
+}
+
+/// hsync-19: the session reader sends a `Status` flood to the reactor at the
+/// meter's rate, each held `Status` at its exact token boundary, and the last
+/// one the peer sent always arrives.
+#[tokio::test(start_paused = true)]
+async fn the_session_reader_meters_a_status_flood() {
+    use crate::zakura::header_sync::{
+        config::REGTEST_HEADER_BYTES,
+        peer::run_peer,
+        v9::{LeaseOwner, Publisher, STATUS_CADENCE},
+    };
+
+    const FLOOD: u32 = 50;
+    let (handle, _actions, mut reactor) =
+        build_header_sync_reactor(startup(CancellationToken::new()))
+            .expect("the session reader fixture starts");
+    let peer = peer();
+    let cancel = CancellationToken::new();
+    let (send, _outbound) = framed_channel(8);
+    let session = PeerSession::from_parts(peer.clone(), send.clone(), cancel.clone());
+    let (publisher, publishing) = Publisher::spawn::<REGTEST_HEADER_BYTES>(
+        handle.port.clone(),
+        handle.serving.push(&peer),
+        send,
+        LeaseOwner {
+            peer: zakura_header_chain::SourceId::from_digest(peer.digest()),
+            session_id: session.session_id(),
+        },
+        handle.page_limits,
+        cancel.clone(),
+        (None, None),
+    );
+    let (inbound, recv) = framed_channel(usize::try_from(FLOOD).unwrap());
+    let start = Instant::now();
+    for height in 1..=FLOOD {
+        let target = zakura_header_chain::Frontier::new(
+            block::Height(height),
+            block::Hash([u8::try_from(height).unwrap(); 32]),
+        );
+        let status = v9::test_support::status::<REGTEST_HEADER_BYTES>(target);
+        inbound
+            .try_send(encode_frame(&v9::RegtestMessage::Status(status)).unwrap())
+            .expect("the inbound queue has room");
+    }
+    let reader = tokio::spawn(run_peer::<REGTEST_HEADER_BYTES>(
+        handle,
+        session,
+        publisher,
+        publishing,
+        recv,
+        cancel.clone(),
+    ));
+    let settle = || async {
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+    };
+    let mut heights = Vec::new();
+    let mut drain = |reactor: &mut HeaderSyncReactor| {
+        while let Ok(event) = reactor.events.try_recv() {
+            if let Event::Status { status, .. } = event {
+                heights.push(status.selected_tip_height.0);
+            }
+        }
+        heights.clone()
+    };
+    settle().await;
+    // Two go back to back; the rest wait, and only the latest is kept.
+    assert_eq!(drain(&mut reactor), [1, 2]);
+    let due = start + STATUS_CADENCE.refill_interval;
+    tokio::time::advance(due - std::time::Duration::from_nanos(1) - Instant::now()).await;
+    settle().await;
+    assert_eq!(
+        drain(&mut reactor),
+        [1, 2],
+        "no Status goes before its token"
+    );
+    tokio::time::advance(std::time::Duration::from_nanos(1)).await;
+    settle().await;
+    assert_eq!(drain(&mut reactor), [1, 2, FLOOD], "the latest Status goes");
+    tokio::time::advance(STATUS_CADENCE.refill_interval * 4).await;
+    settle().await;
+    assert_eq!(drain(&mut reactor), [1, 2, FLOOD], "nothing else is held");
+    cancel.cancel();
+    reader
+        .await
+        .expect("the reader doesn't panic")
+        .expect("cancellation ends the reader cleanly");
 }

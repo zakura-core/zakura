@@ -47,7 +47,7 @@ use super::trace::BlockBodySource;
 use super::transport::{COMPAT_RESPONSE_MAX_AGGREGATE_BYTES, DEFAULT_REACTOR_OUTPUT_BYTES};
 use super::TxRelaySessions;
 use super::{
-    spawn_supervised_peer_task, BoxRunFuture, Frame, FramedSend, OrderedSendError, Peer,
+    spawn_supervised_peer_task, BoxRunFuture, CloseRow, Frame, FramedSend, OrderedSendError, Peer,
     ReactorBudget, RequestResponseService, Service as ZakuraService, ServicePeerDirection,
     SessionDemand, SessionOpening, SessionPolicy, SinkReject, Stream, ZakuraConnId,
     ZakuraPeerHandle, ZakuraPeerId, ZakuraSupervisorHandle, ZakuraTrace, FRAME_HEADER_BYTES,
@@ -828,15 +828,27 @@ impl LegacyResponseCodec {
                 for block in blocks {
                     match block {
                         InventoryResponse::Available((block, _)) => {
-                            push_chunked_response(
-                                &mut frames,
-                                &mut budget,
-                                MSG_RESPONSE_BLOCK,
-                                request_id,
-                                max_frame_bytes,
-                                max_message_bytes,
-                                block.zcash_serialize_to_vec()?,
-                            )?;
+                            // A withdrawn temporary body is reported missing, as on legacy TCP.
+                            // Encoding is this transport's write start: frames are queued to the
+                            // stream only after it.
+                            let encoded = match block.pending_send() {
+                                Some(permit) => {
+                                    permit.try_start_write(|| block.zcash_serialize_to_vec())
+                                }
+                                None => Some(block.zcash_serialize_to_vec()),
+                            };
+                            match encoded {
+                                Some(bytes) => push_chunked_response(
+                                    &mut frames,
+                                    &mut budget,
+                                    MSG_RESPONSE_BLOCK,
+                                    request_id,
+                                    max_frame_bytes,
+                                    max_message_bytes,
+                                    bytes?,
+                                )?,
+                                None => missing.push(block.hash()),
+                            }
                         }
                         InventoryResponse::Missing(hash) => missing.push(hash),
                     }
@@ -3059,7 +3071,8 @@ impl LegacyGossipSink {
         peer_id: ZakuraPeerId,
         frame: Frame,
     ) -> Result<(), SinkReject> {
-        let frame = LegacyGossipFrame::decode_frame(frame).map_err(SinkReject::protocol)?;
+        let frame = LegacyGossipFrame::decode_frame(frame)
+            .map_err(|error| SinkReject::protocol(CloseRow::CONN_CLOSE_24, error))?;
         let message_type = frame.message_type();
         if message_type == MSG_ADVERTISE_TX_IDS {
             count_received_tx_messages(message_type, 1);
@@ -3118,10 +3131,12 @@ impl LegacyGossipSink {
     fn decode_request(stream_kind: u16, frame: &Frame) -> Result<LegacyRequestFrame, SinkReject> {
         if stream_kind != ZAKURA_STREAM_LEGACY_REQUESTS {
             return Err(SinkReject::protocol(
+                CloseRow::CONN_CLOSE_23,
                 "unsupported legacy request stream kind",
             ));
         }
-        LegacyRequestFrame::decode_borrowed(frame).map_err(SinkReject::protocol)
+        LegacyRequestFrame::decode_borrowed(frame)
+            .map_err(|error| SinkReject::protocol(CloseRow::CONN_CLOSE_23, error))
     }
 
     fn request<'a>(
@@ -3346,7 +3361,7 @@ impl ZakuraService for LegacyGossipSink {
                         frame,
                     ) {
                         Ok(()) => {}
-                        Err(SinkReject::Protocol(error)) => {
+                        Err(SinkReject::Protocol(_, error)) => {
                             debug!(
                                 ?error,
                                 ?peer_id,
@@ -3946,7 +3961,7 @@ mod tests {
         assert!(check(ZAKURA_STREAM_LEGACY_REQUESTS, &valid).is_ok());
         assert!(matches!(
             check(ZAKURA_STREAM_GOSSIP, &valid),
-            Err(SinkReject::Protocol(_))
+            Err(SinkReject::Protocol(..))
         ));
         for invalid in [
             frame(MSG_REQUEST_BLOCKS_BY_HASH, 1, one_block),
@@ -3958,7 +3973,7 @@ mod tests {
             assert!(
                 matches!(
                     check(ZAKURA_STREAM_LEGACY_REQUESTS, &invalid),
-                    Err(SinkReject::Protocol(_))
+                    Err(SinkReject::Protocol(..))
                 ),
                 "{invalid:?}"
             );
@@ -7812,6 +7827,66 @@ mod tests {
             blocks.as_slice(),
             [InventoryResponse::Available((received, None))] if received.hash() == block.hash()
         ));
+
+        Ok(())
+    }
+
+    /// The v2 compatibility adapter applies the same withdrawal as legacy TCP: a temporary body
+    /// whose submission failed before encoding is reported missing, while a committed one is sent.
+    #[test]
+    fn encode_response_reports_withdrawn_pending_bodies_missing() -> Result<(), BoxError> {
+        use zakura_node_services::block_relay::{
+            PendingBlockSendPermit, PendingBlockStatus, ServedBlock,
+        };
+
+        let block = Arc::new(Block::zcash_deserialize(
+            BLOCK_TESTNET_141042_BYTES.as_slice(),
+        )?);
+        let cap = u32::try_from(MAX_PROTOCOL_MESSAGE_LEN)?;
+        let encode = |permit: PendingBlockSendPermit| {
+            LegacyResponseCodec::encode_response(
+                9,
+                Response::Blocks(vec![InventoryResponse::Available((
+                    ServedBlock {
+                        block: block.clone().into(),
+                        pending_send: Some(permit),
+                    }
+                    .into(),
+                    None,
+                ))]),
+                cap,
+                cap,
+            )
+        };
+
+        let (status, withdrawn) = PendingBlockSendPermit::channel();
+        status.send_replace(PendingBlockStatus::Failed);
+        let frames = encode(withdrawn)?;
+        assert_eq!(
+            frames
+                .iter()
+                .map(|frame| frame.message_type)
+                .collect::<Vec<_>>(),
+            vec![MSG_RESPONSE_MISSING_BLOCKS],
+            "a withdrawn body is never encoded"
+        );
+        let Response::Blocks(blocks) =
+            LegacyResponseCodec::decode_response(9, LegacyRequestKind::Blocks, frames, None)?
+        else {
+            panic!("a block request decodes as a block response");
+        };
+        assert_eq!(blocks, vec![InventoryResponse::Missing(block.hash())]);
+
+        let (status, committed) = PendingBlockSendPermit::channel();
+        status.send_replace(PendingBlockStatus::Committed);
+        // A same-hash retry has its own permit, unaffected by the withdrawn attempt.
+        let (_retry_status, retry) = PendingBlockSendPermit::channel();
+        for permit in [committed, retry] {
+            let frames = encode(permit)?;
+            assert!(frames
+                .iter()
+                .all(|frame| frame.message_type == MSG_RESPONSE_BLOCK));
+        }
 
         Ok(())
     }

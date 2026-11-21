@@ -1259,6 +1259,29 @@ impl TransportTap {
                 self.remote(conn_id)?,
                 TransportFact::FrameRead { quic_stream, seq },
             ),
+            TransportEvent::FrameHeld {
+                conn_id,
+                quic_stream,
+                seq,
+                bytes,
+            } => (
+                Some(conn_id),
+                self.remote(conn_id)?,
+                TransportFact::FrameHeld {
+                    quic_stream,
+                    seq,
+                    bytes,
+                },
+            ),
+            TransportEvent::FrameReleased {
+                conn_id,
+                quic_stream,
+                seq,
+            } => (
+                Some(conn_id),
+                self.remote(conn_id)?,
+                TransportFact::FrameReleased { quic_stream, seq },
+            ),
             TransportEvent::Regulated {
                 conn_id,
                 quic_stream,
@@ -1308,13 +1331,7 @@ impl TransportTap {
                 remote,
                 conn_id,
                 cause,
-            } => (
-                conn_id,
-                remote,
-                TransportFact::CloseDecided {
-                    cause: cause.map(str::to_owned),
-                },
-            ),
+            } => (conn_id, remote, TransportFact::CloseDecided { cause }),
             TransportEvent::TornDown { conn_id } => (
                 Some(conn_id),
                 self.remote(conn_id)?,

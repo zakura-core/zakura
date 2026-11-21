@@ -91,7 +91,7 @@ pub(crate) async fn run_scenario(
     );
     let (snapshots, committed_views) =
         watch::channel(Some(zakura_header_chain::CommittedHeaderChainView::new(
-            initial,
+            initial.frontiers.verified_best, initial,
             zakura_header_chain::BodyWorkEpoch::default(),
         )));
 
@@ -402,9 +402,12 @@ fn spawn_timeline_driver(
             } else {
                 current_view.body_work_epoch
             };
+            // Both mock chains follow the same corpus through the shorter tip.
+            let anchor_height = current.frontiers.verified_best.height.min(current.frontiers.header_best.height);
+            let anchor = zakura_header_chain::Frontier::new(anchor_height, corpus_hash(&corpus, anchor_height));
             snapshots
                 .send(Some(zakura_header_chain::CommittedHeaderChainView::new(
-                    current,
+                    anchor, current,
                     body_work_epoch,
                 )))
                 .expect("the fuzz reactor keeps its committed-snapshot receiver");

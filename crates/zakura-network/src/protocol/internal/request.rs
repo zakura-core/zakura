@@ -13,6 +13,7 @@ use zakura_chain::{
     transaction::{UnminedTx, UnminedTxId},
 };
 use zakura_node_services::block_memory::BlockHandle;
+use zakura_node_services::block_relay::PendingBlockSendPermit;
 
 use super::super::types::Nonce;
 use crate::{zakura::ZakuraPeerId, PeerSocketAddr};
@@ -121,6 +122,11 @@ impl BlockHedge {
         self.state().first
     }
 
+    /// When the window for dispatching a second request ends, unless it is closed sooner.
+    pub(crate) fn window_end(&self) -> Instant {
+        self.started + Self::WINDOW
+    }
+
     /// Publish the dual-stack deadline before the legacy future is dropped.
     pub(crate) fn legacy_timeout(&self) {
         self.state().legacy_timed_out = true;
@@ -194,7 +200,7 @@ impl From<PeerSocketAddr> for PeerSource {
 ///
 /// Local callers that hold the block fill in `size`. An `inv` received from a peer carries only
 /// the hash, so it is `None` there.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 #[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
 pub struct AdvertisedBlock {
     /// The block hash.
@@ -202,6 +208,9 @@ pub struct AdvertisedBlock {
     /// The block's serialized size in bytes, if known. Legacy gossip sizes the broadcast's
     /// advert window from it.
     pub size: Option<u32>,
+    /// Attempt-specific authorization, retained until the local inventory write starts.
+    #[cfg_attr(any(test, feature = "proptest-impl"), proptest(value = "None"))]
+    pub pending_send: Option<PendingBlockSendPermit>,
 }
 
 impl AdvertisedBlock {
@@ -211,6 +220,7 @@ impl AdvertisedBlock {
             hash,
             // A size that does not fit is unknown, rather than a misleadingly small block.
             size: u32::try_from(size).ok(),
+            pending_send: None,
         }
     }
 }
@@ -218,7 +228,11 @@ impl AdvertisedBlock {
 impl From<block::Hash> for AdvertisedBlock {
     /// Returns an advertisement of the block with `hash` and unknown size.
     fn from(hash: block::Hash) -> Self {
-        Self { hash, size: None }
+        Self {
+            hash,
+            size: None,
+            pending_send: None,
+        }
     }
 }
 
@@ -331,17 +345,22 @@ pub enum Request {
     /// to answer soonest, but only if that peer should deliver the block clearly before the first
     /// request does, or if the first request has run well past its expected time (see
     /// `[network.block_download_score_and_hedge]`). It sends at most one such request per
-    /// block.
+    /// download.
+    ///
+    /// Send this once per download. The peer set holds the request while `attempt`'s window is
+    /// open, and decides again whenever a peer announces the block, an announcer becomes a
+    /// better source, or the first request becomes overdue or stalls. Dropping the response
+    /// future before a second request is sent withdraws it.
     ///
     /// # Returns
     ///
-    /// Returns [`Response::Blocks`](super::Response::Blocks), or fails at once with
-    /// [`NoFasterBlockSource`](crate::NoFasterBlockSource) when no peer was asked, so the caller
-    /// can ask again later.
+    /// Returns [`Response::Blocks`](super::Response::Blocks) from the second request, or fails
+    /// with [`NoFasterBlockSource`](crate::NoFasterBlockSource) once the window closes without
+    /// any peer being asked.
     BlockByHashHedge {
         /// The block to request.
         hash: block::Hash,
-        /// Shared dispatch window, checked by the peer set after any queue wait.
+        /// Shared dispatch window, which also tells the peer set where the first request went.
         #[cfg_attr(
             any(test, feature = "proptest-impl"),
             proptest(value = "BlockHedge::new(Instant::now())")

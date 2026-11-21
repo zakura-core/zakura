@@ -99,18 +99,23 @@ The workflow is manual (`workflow_dispatch`). Inputs:
 - `no_restart` — stage binary/config/unit without restarting, default `false`.
 - `p2p_stack` — optionally override the selected node with `dual`, `zakura`, or
   `legacy`. The default `auto` preserves the fleet's dual-stack role.
+- `mempool_implementation` — optionally put the selected node on `default`,
+  `classic` or `core`. The default `auto` leaves it on zakurad's default.
+- `tx_relay` — turn on `[network.zakura.tx_relay]` for the selected node. The
+  deployer refuses it unless the node runs the `core` pool on a `dual` or
+  `zakura` stack, since zakurad would otherwise leave it off without saying so.
 - `setup` — optionally put the selected node on `legacy` (legacy P2P and the
   classic pool) or `v2` (dual P2P, the pool core and tx-relay), for comparing
   pools on real peers. The default `auto` keeps the fleet's setup, and
   deploying a node with `auto` again restores it. It can't be combined with
-  `p2p_stack`.
+  `p2p_stack`, `mempool_implementation` or `tx_relay`.
 - `header_sync_trace` — write structured canary traces under
   `/mnt/data/traces/header-chain-canary`; defaults to `false`.
 - `node` — optional deployer node name; blank deploys the whole fleet.
 
-Explicit `p2p_stack` or `setup` overrides and `header_sync_trace = true`
-require an explicit `node`, preventing canary settings from being applied
-fleet-wide.
+Explicit `p2p_stack`, `mempool_implementation` or `setup` overrides,
+`tx_relay = true` and `header_sync_trace = true` require an explicit `node`,
+preventing canary settings from being applied fleet-wide.
 
 The generated CI config uses Testnet ports, public RPC at `0.0.0.0:18232`, and
 explicitly sets `vct_fast_sync = false`, which keeps checkpoint sync available
@@ -356,18 +361,20 @@ unreachable, malformed, or serves a stale collector snapshot for at least 10
 minutes. It posts one recovery message when a node or dashboard recovers.
 Persistent failures do not post on every poll cycle.
 
-Restart deploys write a 20-minute suppression marker before touching the fleet.
-The mainnet workflow writes it locally on `us-east-0`; the testnet workflow
-refreshes it on `us-east-0` over SSH on a best-effort basis. While the marker is
-in the future, new failure alerts are logged but not posted to Slack.
+Mainnet restart deploys write a 20-minute fleet mute on `us-east-0` after build
+and profiler preparation. A systemd drop-in preserves the marker through the
+workflow's watchdog restart. Deploys that restart `zakura-compat` also write
+`/run/zakura-watchdog/deployment-suppressed-until` on that node to mute the
+dedicated compatibility check. Both checks continue collecting observations.
 
-Restart deploys that include `zakura-compat` also refresh that host's node-local
-compatibility marker (`/run/zakura-watchdog/deployment-suppressed-until`) before
-`zakurad-compat` restarts. The compatibility checker reports it with every probe,
-and only the fleet watchdog's compatibility lane honors it, for at most 20
-minutes. It stays in the workflow so rollback refs whose deployer predates the
-marker remain covered. See `deploy/runner/README.md` for compatibility
-monitoring and its `operation=monitoring` stages.
+After deploying `zakura-compat`, the workflow waits up to 10 minutes for peering,
+RPC and height checks to pass, then waits up to one minute for a fresh, healthy
+sidecar observation on the fleet dashboard. The workflow fails if readiness
+times out.
+Cleanup clears both markers after the watchdog refresh and readiness check,
+including on failure or cancellation when the runner remains available. Any
+marker left behind expires 20 minutes after it was written. See
+`deploy/runner/README.md` for the compatibility checks and alert behavior.
 
 Manual dry run from `us-east-0`:
 

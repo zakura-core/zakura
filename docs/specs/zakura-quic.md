@@ -1,6 +1,6 @@
 # Spec: `zakura-quic` transport
 
-Status: draft for review, 2026-11-17. Version 0.21.
+Status: draft for review, 2026-11-18. Version 0.22.
 This document is authoritative for the `zakura-quic` crate, its configuration,
 its wire behavior and its `quinn-proto` dependency policy.
 [Decision 0003](../decisions/zakura/0003-zakura-quic-transport.md) records the
@@ -46,7 +46,9 @@ per-address handshake cadence with one ledger per source validation state,
 returns admission charges through two new acceptor hooks, reports a
 connection's source validation, and caps a closed connection's drain at
 `SHUTDOWN_DRAIN`; it changes ADM-3, ADM-13, API-3 and API-4, and §17s lists
-each change.
+each change. Version 0.22 adds a node-wide handshake cadence, keeps admission
+charges once TLS starts, and reports when the endpoint admitted a
+connection; it changes ADM-3 and API-4, and §17t lists each change.
 
 ## 0. Conventions
 
@@ -460,10 +462,25 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
   source and `Refuse` for a validated one. A spoofed Initial is never
   validated, so it can only drain the unvalidated ledger, and its victim
   answers the Retry with a validated Initial that the other ledger charges.
-  The acceptor refunds the token, to the ledger it charged, when the attempt
-  registers, when it never starts TLS (`cancel_admission`), and when Zakura
-  refuses it after TLS for its own capacity. A failed handshake keeps its
-  charge.
+  Each ledger also has one node-wide bucket of 24 tokens that refills at 24
+  a second. Its last 8 tokens are a reserve. While the node's bucket holds
+  8 tokens or fewer, an attempt also spends a token from its address's
+  share: a bucket of one token that refills at an eighth of the node's
+  rate, 3 a second. Above the reserve, one address's
+  default burst of 16 fits. An attempt that any bucket refuses keeps no
+  token. When the node's bucket or the address's share is empty, the
+  acceptor returns `Retry` for an unvalidated source and `Refuse` for a
+  validated one. Busy addresses keep the node's bucket near the reserve,
+  and each spends at most its share of the reserve, so fewer than eight
+  addresses can't refuse every other address.
+  The acceptor refunds every token, to the ledger it charged, when the
+  attempt never starts TLS (`cancel_admission`). Every TLS start keeps its
+  charge, including a failed handshake or a local refusal after TLS.
+
+  Zakura's responder measures `control_timeout` (10 s) from the endpoint's
+  `Accept` (`Conn::admitted_at`). The control exchange gets what TLS and the
+  claim left of it, so an inbound attempt holds its handshake slot for at
+  most `control_timeout` while `handshake_timeout_secs` is at most that.
 
   A control handshake is an inbound connection past TLS that hasn't
   registered yet. The transport stops counting a connection when TLS
@@ -906,9 +923,12 @@ The public surface of `zakura-quic`. Changing it is a semver change of the crate
     already taken over the attempt's accounting; otherwise the acceptor
     releases what `admit` reserved.
 - **API-4.** `Conn`:
-  - `remote_id()`, `admitted_ip()`, `admitted_addr()`, `source_validated()`,
-    `alpn()` and `stable_id()`. `source_validated()` is `IncomingInfo::validated`
-    for an inbound connection, and true for an outbound one;
+  - `remote_id()`, `admitted_ip()`, `admitted_addr()`, `admitted_at()`,
+    `source_validated()`, `alpn()` and `stable_id()`. `source_validated()` is
+    `IncomingInfo::validated` for an inbound connection, and true for an
+    outbound one. `admitted_at()` is the instant of the endpoint's `Accept`
+    for an inbound connection, and the start of the winning attempt for an
+    outbound one;
   - `open_bi()`, `accept_bi()`, `close(code, reason)`, `closed()` and
     `close_reason()`;
   - `async stats() -> Option<ConnStats>`, `None` once the connection task has
@@ -1600,3 +1620,21 @@ Changed:
   `Acceptor::finish_admission`.
 - **API-4.** Adds `Conn::source_validated`, so an acceptor can refund the
   ledger it charged once the attempt has become a connection.
+
+## 17t. Changes in version 0.22
+
+The handshake cadence bounded each address, but not the node: 124 addresses
+in each ledger could start about 2,000 TLS handshakes a second. A registered
+connection also refunded its token, so a peer that registered, closed and
+reconnected started TLS handshakes at no cadence cost. The responder's
+control deadline started after TLS, so an inbound attempt could hold a
+handshake slot for the TLS deadline plus `control_timeout`.
+
+Changed:
+
+- **ADM-3.** Adds a node-wide bucket with a per-address reserve share to
+  each cadence ledger, keeps both charges
+  once TLS starts, and measures the responder's
+  `control_timeout` from the endpoint's `Accept`.
+- **API-4.** Adds `Conn::admitted_at`, so an acceptor can measure a
+  whole-handshake deadline from admission.

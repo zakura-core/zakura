@@ -1,6 +1,8 @@
 pub(super) mod gauge_recorder;
+mod progress;
 mod query_lifecycle;
 mod retention;
+mod rival_commit;
 
 use std::{
     collections::{BTreeSet, HashMap},
@@ -361,6 +363,7 @@ fn committed_view(
     epoch: u64,
 ) -> zakura_header_chain::CommittedHeaderChainView {
     zakura_header_chain::CommittedHeaderChainView::new(
+        snapshot.frontiers.verified_best,
         snapshot,
         zakura_header_chain::BodyWorkEpoch::new(epoch),
     )
@@ -784,8 +787,8 @@ fn state_is_only_frontier_publisher() {
 
     assert!(
         STATE_PUBLISHER.contains("pub struct Publisher")
-            && STATE_PUBLISHER
-                .contains("fn publish(&self, snapshot: EngineSnapshot, effect: TransitionEffect)"),
+            && STATE_PUBLISHER.contains("views: watch::Sender<CommittedHeaderChainView>")
+            && STATE_PUBLISHER.contains("self.views.send_replace("),
         "state must retain the sole committed-snapshot publisher"
     );
 }
@@ -1296,6 +1299,7 @@ fn window_request(height: u32) -> OutstandingBlockRange {
         queued_at: now,
         deadline: now,
         delivery_snapshot: test_delivery_snapshot(now),
+        max_response_bytes: 1,
         delivered_bytes: 0,
         received: ReceivedBlockTracker::default(),
     }
@@ -1322,6 +1326,7 @@ fn window_request_range(start: u32, count: u32) -> OutstandingBlockRange {
         queued_at: now,
         deadline: now,
         delivery_snapshot: test_delivery_snapshot(now),
+        max_response_bytes: 1,
         delivered_bytes: 0,
         received: ReceivedBlockTracker::default(),
     }
@@ -1431,12 +1436,13 @@ fn block_liveness_disconnects_silent_active_peer_after_default_timeout() {
     let mut window = download_window();
     window.outstanding.push(window_request(1));
     window.arm_liveness(now, timeout);
+    let deadline = window.block_liveness_deadline().unwrap();
 
     assert_eq!(
-        window.check_liveness(now + timeout - Duration::from_millis(1)),
+        window.check_liveness(deadline - Duration::from_millis(1)),
         LivenessOutcome::Ok
     );
-    assert_eq!(window.check_liveness(now + timeout), LivenessOutcome::Park);
+    assert_eq!(window.check_liveness(deadline), LivenessOutcome::Park);
 }
 
 /// The defensive `Disarm` arm in `check_liveness`: a block-liveness deadline that exists
@@ -1451,10 +1457,10 @@ fn block_liveness_disarms_a_deadline_set_without_a_request() {
 
     assert_eq!(window.check_liveness(now), LivenessOutcome::Ok);
 
-    window.block_liveness_deadline = Some(now);
+    window.liveness_base_deadline = Some(now);
     assert_eq!(window.check_liveness(now), LivenessOutcome::Disarm);
     window.clear_liveness_if_idle();
-    assert_eq!(window.block_liveness_deadline, None);
+    assert_eq!(window.block_liveness_deadline(), None);
     assert_eq!(window.check_liveness(now), LivenessOutcome::Ok);
 }
 
@@ -1489,6 +1495,152 @@ fn short_response_charges_one_reliability_failure_per_request_not_per_height() {
     );
 }
 
+/// The liveness deadline is the 32 s allowance plus the outstanding bytes'
+/// transfer time at 256 KiB/s. A 2 MB body adds 7.629 s, so a peer that
+/// delivers one every 39.6 s keeps its session.
+#[test]
+fn block_liveness_deadline_adds_transfer_time_at_the_minimum_rate() {
+    let allowance = ZakuraBlockSyncConfig::default().effective_liveness_timeout();
+    assert_eq!(allowance, Duration::from_secs(32));
+    let body = |height| {
+        let mut request = window_request(height);
+        request.max_response_bytes = 2_000_000;
+        assert_eq!(request.request.estimated_bytes, 1);
+        request
+    };
+    let transfer = admission::min_rate_transfer_time(2_000_000);
+    let mut now = Instant::now();
+    let mut window = download_window();
+    window.outstanding.push(body(1));
+    window.arm_liveness(now, allowance);
+    assert_eq!(
+        window.block_liveness_deadline(),
+        Some(now + allowance + transfer)
+    );
+
+    // A second request in the same episode adds no time: the next accepted
+    // body is at most one maximum body away on the ordered stream.
+    window.outstanding.push(body(2));
+    window.arm_liveness(now, allowance);
+    assert_eq!(
+        window.block_liveness_deadline(),
+        Some(now + allowance + transfer)
+    );
+
+    // Slow, continuous progress: one body just inside each deadline.
+    for height in 3..8 {
+        let deadline = window.block_liveness_deadline().unwrap();
+        now = deadline - Duration::from_millis(1);
+        assert_eq!(window.check_liveness(now), LivenessOutcome::Ok);
+        let key = window.outstanding.first_key().unwrap();
+        window.outstanding.remove(key);
+        window.outstanding.push(body(height));
+        window.note_block_progress(now, allowance);
+        assert_eq!(
+            window.block_liveness_deadline(),
+            Some(now + allowance + transfer)
+        );
+    }
+}
+
+/// Re-issuing one returned body without delivering it keeps the episode's
+/// deadline. The scheduler estimate equals the authorization here, so only
+/// the episode anchor separates this rule from charging each issue again.
+#[test]
+fn recycling_one_authorization_cannot_move_the_liveness_deadline() {
+    let start = Instant::now();
+    let base = Duration::from_secs(32);
+    let deadline = start + base + admission::min_rate_transfer_time(2_000_000);
+    let body = || {
+        let mut request = window_request(1);
+        request.request.estimated_bytes = 2_000_000;
+        request.request.expected_blocks[0].estimated_bytes = 2_000_000;
+        request.max_response_bytes = 2_000_000;
+        request
+    };
+    let mut window = download_window();
+    let mut key = window.outstanding.push(body());
+    window.arm_liveness(start, base);
+    assert_eq!(window.block_liveness_deadline(), Some(deadline));
+    for second in 1..=8 {
+        window.outstanding.remove(key).unwrap();
+        key = window.outstanding.push(body());
+        window.arm_liveness(start + Duration::from_secs(second), base);
+        assert_eq!(window.block_liveness_deadline(), Some(deadline));
+    }
+    assert_eq!(window.check_liveness(deadline), LivenessOutcome::Park);
+}
+
+/// A silent peer that keeps taking new requests still parks one maximum body
+/// after its episode's base: each new authorization adds no time.
+#[test]
+fn a_silent_peer_cannot_extend_liveness_with_new_requests() {
+    let start = Instant::now();
+    let base = Duration::from_secs(32);
+    let deadline = start + base + admission::min_rate_transfer_time(block::MAX_BLOCK_BYTES);
+    let range = |height| {
+        let mut range = window_request_range(height, 16);
+        range.max_response_bytes = MAX_BS_RESPONSE_BYTES;
+        range
+    };
+    let mut window = download_window();
+    let mut key = window.outstanding.push(range(1));
+    window.arm_liveness(start, base);
+    assert_eq!(window.block_liveness_deadline(), Some(deadline));
+    // The peer takes a replacement before each earlier request expires, so
+    // two 32 MiB authorizations are always live.
+    for issue in 1..5 {
+        let next = window.outstanding.push(range(1 + 16 * issue));
+        window.arm_liveness(start + Duration::from_secs(8 * u64::from(issue)), base);
+        window.outstanding.remove(key).unwrap();
+        key = next;
+        assert_eq!(window.block_liveness_deadline(), Some(deadline));
+    }
+    assert_eq!(window.check_liveness(deadline), LivenessOutcome::Park);
+}
+
+#[test]
+fn replacing_a_returned_range_cannot_carry_forward_its_transfer_time() {
+    let start = Instant::now();
+    let base = Duration::from_secs(32);
+    let transfer = admission::min_rate_transfer_time(2_000_000);
+    let mut window = download_window();
+    let range = |height| {
+        let mut range = window_request_range(height, 2);
+        range.max_response_bytes = 2_000_000;
+        range
+    };
+    let mut key = window.outstanding.push(range(1));
+    window.arm_liveness(start, base);
+    for second in 1..=4 {
+        // Remove the range the peer returned unavailable, then replace its
+        // still-wanted work. The old authorization adds no time to the new one.
+        window.outstanding.remove(key).unwrap();
+        assert_eq!(window.block_liveness_deadline(), Some(start + base));
+        key = window.outstanding.push(range(1));
+        window.arm_liveness(start + Duration::from_secs(second), base);
+        assert_eq!(
+            window.block_liveness_deadline(),
+            Some(start + base + transfer)
+        );
+    }
+
+    // A second range can be live concurrently. A received body consumes the
+    // first range's byte allowance even when its scheduler estimate was tiny.
+    let mut second = window_request_range(3, 2);
+    second.max_response_bytes = 1_000_000;
+    window.outstanding.push(second);
+    window.arm_liveness(start + Duration::from_secs(5), base);
+    let accepted_at = start + transfer;
+    window.outstanding.record_body_bytes(key, 1_500_000);
+    assert!(window.outstanding.mark_received(key, block::Height(1)));
+    window.note_block_progress(accepted_at, base);
+    assert_eq!(
+        window.block_liveness_deadline(),
+        Some(accepted_at + base + admission::min_rate_transfer_time(1_500_000))
+    );
+}
+
 #[test]
 fn block_liveness_progress_before_deadline_keeps_peer_alive() {
     let timeout = ZakuraBlockSyncConfig::default().effective_liveness_timeout();
@@ -1501,7 +1653,10 @@ fn block_liveness_progress_before_deadline_keeps_peer_alive() {
         now += timeout - Duration::from_millis(1);
         assert_eq!(window.check_liveness(now), LivenessOutcome::Ok);
         window.note_block_progress(now, timeout);
-        assert_eq!(window.block_liveness_deadline, Some(now + timeout));
+        assert_eq!(
+            window.block_liveness_deadline(),
+            Some(now + timeout + admission::min_rate_transfer_time(1))
+        );
     }
 }
 
@@ -1516,7 +1671,7 @@ fn block_liveness_disconnects_silent_peer_after_outstanding_drains() {
     window.outstanding.drain();
     window.disarm_liveness_after_progress_if_idle();
 
-    assert_eq!(window.block_liveness_deadline, Some(now + timeout));
+    assert_eq!(window.block_liveness_deadline(), Some(now + timeout));
     assert_eq!(window.check_liveness(now + timeout), LivenessOutcome::Park);
 }
 
@@ -1531,7 +1686,7 @@ fn block_liveness_disarms_when_satisfied_request_drains() {
     window.outstanding.drain();
     window.disarm_liveness_after_progress_if_idle();
 
-    assert_eq!(window.block_liveness_deadline, None);
+    assert_eq!(window.block_liveness_deadline(), None);
     assert_eq!(window.check_liveness(now + timeout), LivenessOutcome::Ok);
 }
 
@@ -1577,7 +1732,10 @@ fn block_liveness_resuming_after_idle_gets_fresh_deadline() {
     window.outstanding.push(window_request(2));
     window.arm_liveness(resumed, timeout);
 
-    assert_eq!(window.block_liveness_deadline, Some(resumed + timeout));
+    assert_eq!(
+        window.block_liveness_deadline(),
+        Some(resumed + timeout + admission::min_rate_transfer_time(1))
+    );
 }
 
 #[test]
@@ -1668,15 +1826,16 @@ fn backpressure_extends_liveness_instead_of_disconnecting() {
 
     window.outstanding.push(window_request(1));
     window.arm_liveness(now, timeout);
+    let deadline = window.block_liveness_deadline().unwrap();
     assert_eq!(
-        window.check_liveness(now + timeout),
+        window.check_liveness(deadline),
         LivenessOutcome::Park,
         "the deadline has expired: without backpressure this disconnects",
     );
 
     // Under local backpressure the routine extends instead of disconnecting.
-    let extended_at = now + timeout;
-    window.extend_liveness_deadline(extended_at, timeout);
+    let extended_at = deadline;
+    window.extend_liveness_deadline(timeout);
     assert_eq!(window.check_liveness(extended_at), LivenessOutcome::Ok);
 
     // The extension is bounded: once it too expires (congestion did not clear and no
@@ -4381,7 +4540,8 @@ async fn reactor_timeout_recovery_is_local_and_healthy_peer_keeps_filling() {
 #[tokio::test]
 async fn block_liveness_parks_silent_peer_and_traces_reason() {
     // The first no-progress deadline parks the peer for its cooldown. Its
-    // unended request then closes the connection (see `WriterFence`).
+    // unended request resets the session and keeps the connection (see
+    // `regulation::stall`).
     let mut capture = TraceCapture::for_test("block_liveness_parks_silent_peer_and_traces_reason")
         .expect("trace capture initializes");
     let mut config = immediate_body_download_config();
@@ -4459,8 +4619,8 @@ async fn block_liveness_parks_silent_peer_and_traces_reason() {
     .await
     .expect("silent active peer is parked by block-progress liveness");
     assert!(
-        connection_cancel.is_cancelled(),
-        "parking a session with an unended request closes the connection",
+        !connection_cancel.is_cancelled(),
+        "a first stall resets the session and keeps the connection",
     );
 
     capture.flush().await;
@@ -4602,8 +4762,8 @@ async fn check_cold_probe_deadline(expired: bool) {
     .await
     .expect("an unproven peer is still parked at its liveness deadline");
     assert!(
-        connection_cancel.is_cancelled(),
-        "parking a session with an unended request closes the connection",
+        !connection_cancel.is_cancelled(),
+        "a first stall resets the session and keeps the connection",
     );
 
     reactor_task.abort();
@@ -4941,7 +5101,15 @@ impl TestSequencer {
     ) -> AcceptOutcome {
         let facts = self.payloads.insert(body);
         let result = self.policy.accept_buffered_body(
-            owner, source, height, hash, previous, facts, bytes, estimate, peer,
+            owner,
+            source,
+            height,
+            hash,
+            previous,
+            facts,
+            bytes,
+            estimate,
+            super::events::BlockSupplier { peer, conn_id: 0 },
         );
         if matches!(result, AcceptOutcome::Redundant { .. }) {
             self.payloads.release(facts.id);
@@ -7309,6 +7477,7 @@ fn outstanding_three_block_range() -> OutstandingBlockRange {
         queued_at: now,
         deadline: now,
         delivery_snapshot: test_delivery_snapshot(now),
+        max_response_bytes: 1,
         delivered_bytes: 0,
         received: ReceivedBlockTracker::default(),
     }
@@ -7686,6 +7855,7 @@ fn underestimated_body_is_buffered_and_releases_only_its_estimate() {
         queued_at: now,
         deadline: now,
         delivery_snapshot: test_delivery_snapshot(now),
+        max_response_bytes: 1,
         delivered_bytes: 0,
         received: ReceivedBlockTracker::default(),
     };
@@ -10680,6 +10850,7 @@ async fn reactor_accepts_blocks_done_after_completed_range() {
         if let BlockSyncAction::Misbehavior {
             peer: action_peer,
             reason,
+            ..
         } = action
         {
             assert_ne!(
@@ -11976,15 +12147,11 @@ async fn reactor_fast_forward_reset_releases_abandoned_budget_and_keeps_peer() {
 #[tokio::test]
 async fn reactor_competing_fork_download_switches_to_current_header_hashes() {
     let blocks = mainnet_blocks_1_to_3();
-    let (tip_tx, tip_rx) = watch::channel((block::Height(1), blocks[0].hash()));
-    let startup = header_tip_startup(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(1),
-            verified_block_hash: blocks[0].hash(),
-        },
-        (block::Height(1), blocks[0].hash()),
-        tip_rx,
+    let finalized =
+        zakura_header_chain::Frontier::new(block::Height(0), blocks[0].header.previous_block_hash);
+    let parent = zakura_header_chain::Frontier::new(block::Height(1), blocks[0].hash());
+    let (snapshots, startup) = committed_block_sync_startup(
+        committed_snapshot(1, 1, 1, finalized, parent, parent),
         immediate_body_download_config(),
     );
     let (handle, mut actions, reactor_task) =
@@ -12004,9 +12171,11 @@ async fn reactor_competing_fork_download_switches_to_current_header_hashes() {
     )
     .await;
 
-    tip_tx
-        .send((block::Height(3), blocks[2].hash()))
-        .expect("tip watch is live");
+    let old_tip = zakura_header_chain::Frontier::new(block::Height(3), blocks[2].hash());
+    snapshots.send_replace(Some(committed_view(
+        committed_snapshot(2, 2, 1, finalized, parent, old_tip),
+        0,
+    )));
     while !matches!(
         next_action(&mut actions).await,
         BlockSyncAction::QueryNeededBlocks { .. }
@@ -12023,14 +12192,21 @@ async fn reactor_competing_fork_download_switches_to_current_header_hashes() {
         (block::Height(2), 1)
     );
 
-    handle
-        .send(BlockSyncEvent::ChainTipReset(BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(1),
-            verified_block_hash: blocks[0].hash(),
-        }))
-        .await
-        .expect("reset event queues");
+    // Both publications happen before this current-thread reactor can poll the watch.
+    // The switch invalidated the request even though the latest transition only extended headers.
+    let replacement = forked_block(&blocks[1], 42);
+    let replacement_tip = zakura_header_chain::Frontier::new(block::Height(2), replacement.hash());
+    let mut child = (*blocks[2]).clone();
+    Arc::make_mut(&mut child.header).previous_block_hash = replacement.hash();
+    let extended_tip = zakura_header_chain::Frontier::new(block::Height(3), child.hash());
+    snapshots.send_replace(Some(committed_view(
+        committed_snapshot(3, 3, 1, finalized, parent, replacement_tip),
+        1,
+    )));
+    snapshots.send_replace(Some(committed_view(
+        committed_snapshot(4, 4, 1, finalized, parent, extended_tip),
+        1,
+    )));
     // The old range stays live until its ending, so the peer ends it before the
     // new fork's height 2 can be requested without overlap.
     send_inbound(
@@ -12043,11 +12219,7 @@ async fn reactor_competing_fork_download_switches_to_current_header_hashes() {
     .await;
     // reset (`reset_above`) and the producer are decoupled, so re-supply the
     // new-fork metadata on every query until the height-2 re-fetch appears.
-    let new_fork_meta = vec![BlockSyncBlockMeta {
-        height: block::Height(2),
-        hash: block::Hash([222; 32]),
-        size: BlockSizeEstimate::Advertised(block_size(&blocks[1])),
-    }];
+    let new_fork_meta = vec![block_meta(&replacement)];
     loop {
         tokio::select! {
             biased;
@@ -12180,7 +12352,7 @@ async fn reactor_legacy_commit_dedups_inflight_request_and_reuses_budget() {
 }
 
 #[tokio::test]
-async fn mismatched_header_retires_the_connection_without_a_fault_report() {
+async fn mismatched_header_retires_the_session_without_a_fault_report() {
     let (tip_tx, handle, mut actions, reactor_task) =
         spawn_genesis_reactor(immediate_body_download_config());
     let service = BlockSyncService::new_with_handle_for_test(
@@ -12254,9 +12426,17 @@ async fn mismatched_header_retires_the_connection_without_a_fault_report() {
 
     // Height-only requests do not commit the supplier to our chain, so this is
     // a local incompatibility rather than a peer fault.
-    tokio::time::timeout(Duration::from_secs(1), connection_cancel.cancelled())
-        .await
-        .expect("a header that does not match the next expected hash retires the connection");
+    await_until(
+        "a mismatched header retires the session",
+        Duration::from_secs(1),
+        || handle.peer_snapshot().outbound_peers == 0,
+    )
+    .await
+    .expect("a header that does not match the next expected hash retires the session");
+    assert!(
+        !connection_cancel.is_cancelled(),
+        "retiring the session keeps the connection"
+    );
     while let Ok(action) = actions.try_recv() {
         assert!(
             !matches!(action, BlockSyncAction::Misbehavior { .. }),
@@ -12454,8 +12634,16 @@ async fn reactor_scores_exact_supplier_for_commitment_matching_consensus_invalid
     // and wait for the misbehavior; if it never arrives the `next_action` timeout
     // fails the test (the peer was not scored).
     let scored = loop {
-        if let BlockSyncAction::Misbehavior { peer, reason } = next_action(&mut actions).await {
+        if let BlockSyncAction::Misbehavior {
+            peer,
+            conn_id,
+            reason,
+        } = next_action(&mut actions).await
+        {
             assert_eq!(peer, bad_peer);
+            // The verdict names the supplying registration, which the helper
+            // gives connection ID 0.
+            assert_eq!(conn_id, Some(0));
             assert_eq!(
                 reason,
                 BlockSyncMisbehavior::ConsensusBodyInvalid(invalid.clone())
@@ -12957,88 +13145,6 @@ async fn committed_reanchor_requeries_while_downloads_in_flight() {
         )))
         .expect("the committed snapshot receiver is live");
     wait_for_query_needed_blocks(&mut actions, block::Height(0), block::Height(3)).await;
-
-    reactor_task.abort();
-}
-
-/// A late commit can move the verified tip off the selected chain to the
-/// selected tip's height, as when a fork with more work replaces the
-/// committed block's height. The body-work epoch changes, and block sync
-/// resets its floor to the replaced block. Only storage's needed-blocks
-/// answer names the common ancestor, so block sync must still ask once its
-/// floor reaches the selected tip, and then reset to the ancestor.
-#[tokio::test]
-async fn off_selected_commit_at_the_selected_height_requeries_the_anchor() {
-    let ancestor = (2, block::Hash([0x02; 32]));
-    let replaced = (3, block::Hash([0x33; 32]));
-    let fork_tip = (3, block::Hash([0x43; 32]));
-    let initial = test_committed_snapshot(1, 1, 1, (0, block::Hash([0; 32])), ancestor, fork_tip);
-    let (snapshots, startup) =
-        committed_block_sync_startup(initial, immediate_body_download_config());
-    let (handle, mut actions, reactor_task) =
-        spawn_block_sync_reactor(startup).expect("valid block-sync config");
-    let sequencer_view = handle
-        .routine_wiring
-        .as_ref()
-        .expect("the test reactor exposes routine wiring")
-        .view
-        .clone();
-    let answer = |query_id, scope| BlockSyncEvent::ScopedNeededBlocks {
-        query_id,
-        scope,
-        body_anchor: zakura_header_chain::Frontier::new(block::Height(ancestor.0), ancestor.1),
-        blocks: vec![BlockSyncBlockMeta {
-            height: block::Height(fork_tip.0),
-            hash: fork_tip.1,
-            size: BlockSizeEstimate::Unknown,
-        }],
-    };
-    let BlockSyncAction::QueryNeededBlocks {
-        query_id, scope, ..
-    } = next_action(&mut actions).await
-    else {
-        panic!("startup queries the needed blocks");
-    };
-    handle
-        .send(answer(query_id, scope))
-        .await
-        .expect("the startup answer queues");
-
-    // The replaced block commits after the fork took its height.
-    snapshots
-        .send(Some(committed_view(
-            test_committed_snapshot(2, 1, 2, (0, block::Hash([0; 32])), replaced, fork_tip),
-            1,
-        )))
-        .expect("the committed snapshot receiver is live");
-    await_until(
-        "the epoch change resets the floor to the replaced block",
-        Duration::from_secs(1),
-        || sequencer_view.borrow().verified_tip == block::Height(replaced.0),
-    )
-    .await
-    .expect("the epoch change resets block sync");
-
-    // Storage answers every query with the common ancestor.
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while sequencer_view.borrow().verified_tip != block::Height(ancestor.0)
-        && Instant::now() < deadline
-    {
-        if let Ok(Some(BlockSyncAction::QueryNeededBlocks {
-            query_id, scope, ..
-        })) = tokio::time::timeout(Duration::from_millis(50), actions.recv()).await
-        {
-            handle
-                .send(answer(query_id, scope))
-                .await
-                .expect("the answer queues");
-        }
-    }
-    assert_eq!(
-        sequencer_view.borrow().verified_tip,
-        block::Height(ancestor.0),
-        "block sync resets to the common ancestor"
-    );
 
     reactor_task.abort();
 }
@@ -13926,6 +14032,7 @@ async fn failed_needed_block_query_keeps_retrying_when_action_queue_is_full() {
     while action_sender.capacity() > 0 {
         action_sender
             .try_send(BlockSyncAction::Misbehavior {
+                conn_id: None,
                 peer: peer(0xfe),
                 reason: BlockSyncMisbehavior::InvalidBlock,
             })
@@ -14378,6 +14485,7 @@ async fn serving_flood_cannot_consume_needed_query_retry() {
         wiring
             .actions
             .try_send(BlockSyncAction::Misbehavior {
+                conn_id: None,
                 peer: peer(0xfe),
                 reason: BlockSyncMisbehavior::InvalidBlock,
             })
@@ -14507,6 +14615,7 @@ async fn misbehavior_flood_cannot_consume_needed_query_capacity() {
         wiring
             .actions
             .try_send(BlockSyncAction::Misbehavior {
+                conn_id: None,
                 peer: peer(0xfe),
                 reason: BlockSyncMisbehavior::InvalidBlock,
             })
@@ -14870,7 +14979,9 @@ async fn repeated_misbehavior_is_recorded_without_disconnecting_the_peer() {
     // The violation is still recorded as a best-effort `Misbehavior` action.
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            if let BlockSyncAction::Misbehavior { peer, reason } = next_action(&mut actions).await {
+            if let BlockSyncAction::Misbehavior { peer, reason, .. } =
+                next_action(&mut actions).await
+            {
                 if peer == probe && reason == BlockSyncMisbehavior::InvalidBlock {
                     break;
                 }

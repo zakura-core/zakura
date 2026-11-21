@@ -12,7 +12,7 @@ use zakura_scheduler::Status as SchedulerStatus;
 
 use crate::{
     harness::discovery::{CapacityEvidence, VERIFICATION_READERS, VERIFICATION_SLOTS},
-    model::{is_fault_cause, Label},
+    model::Label,
     observe::{Entry, TransportFact},
     peer::discovery::DiscoveryRow,
     property::{
@@ -539,7 +539,7 @@ fn check_late_response_admitted<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict
     let mut punished = Vec::new();
     for at in start..entries.len() {
         let (connection, punishment) = match &entries[at].obs {
-            Observation::ConnectionClosed { connection, cause } if is_fault_cause(cause) => {
+            Observation::ConnectionClosed { connection, cause } if cause.is_fault() => {
                 (*connection, format!("a close with cause {cause}"))
             }
             Observation::Misbehavior { connection } => (*connection, "a Misbehavior".to_owned()),
@@ -750,6 +750,7 @@ fn time_at(entries: &[Entry], at: usize) -> Duration {
 
 #[cfg(test)]
 mod tests {
+    use zakura_network::zakura::{CloseOutcome, CloseRow, ZAKURA_DISCOVERY_STREAM_VERSION};
     use zakura_scheduler::SimInstant;
 
     use super::*;
@@ -1151,7 +1152,11 @@ mod tests {
         fn fault_close(&mut self) -> &mut Wire {
             self.push(Observation::ConnectionClosed {
                 connection: CONNECTION,
-                cause: "service_protocol_reject".to_owned(),
+                cause: CloseOutcome::fault(
+                    ZAKURA_STREAM_DISCOVERY,
+                    ZAKURA_DISCOVERY_STREAM_VERSION,
+                    CloseRow::DISCO_CLOSE_13,
+                ),
             })
         }
 

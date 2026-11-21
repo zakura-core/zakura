@@ -114,8 +114,8 @@ pub(super) enum PeerOutput {
     /// Exchange again once `interval` passes, unless the session is cancelled
     /// first.
     Refresh { interval: Duration },
-    /// Wait until this session writes every answer it admitted and processes
-    /// every answer and `Hello` it read, the session is cancelled, or `deadline`
+    /// Wait until this session writes every answer it admitted and judges
+    /// every frame it received, the session is cancelled, or `deadline`
     /// passes.
     WaitForAnswers { deadline: Duration },
     /// Mark the peer's exchange as short-lived.

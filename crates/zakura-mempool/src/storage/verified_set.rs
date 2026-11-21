@@ -127,6 +127,11 @@ impl VerifiedSet {
             .map(|(_, _, id)| &self.transactions[id])
     }
 
+    /// The mined ids of [`Self::mining_transactions`], in the same order.
+    pub(super) fn mining_order(&self) -> impl Iterator<Item = transaction::Hash> + '_ {
+        self.mining_order.iter().map(|(_, _, id)| *id)
+    }
+
     /// Returns a reference to the [`TransactionDependencies`] in the set.
     pub fn transaction_dependencies(&self) -> &TransactionDependencies {
         &self.transaction_dependencies

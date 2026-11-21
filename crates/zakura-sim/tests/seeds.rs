@@ -40,7 +40,8 @@ fn every_seed_validates() {
 /// a harness reports. A seed case names a seed of any set that carries a
 /// `holds` witness of the case's property, as `cargo xtask planted` checks
 /// it unpatched. A typed case names a committed scenario, and a Plan file
-/// if it gives one.
+/// if it gives one. A search case names a harness that reports the case's
+/// property, and commits no input.
 #[test]
 fn planted_cases_name_their_witnesses() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -88,6 +89,29 @@ fn planted_cases_name_their_witnesses() {
                 };
                 assert!(root.join(path).is_file(), "{}: no {path}", case.display());
             }
+            continue;
+        }
+        if let Some(search) = table.get("search").and_then(toml::Value::as_table) {
+            let harness = search
+                .get("harness")
+                .and_then(toml::Value::as_str)
+                .unwrap_or_else(|| panic!("{}: the search names no harness", case.display()));
+            let entry = HARNESSES
+                .iter()
+                .find(|entry| entry.name == harness)
+                .unwrap_or_else(|| panic!("{}: no harness is named {harness}", case.display()));
+            assert!(
+                (entry.properties)()
+                    .iter()
+                    .any(|property| property.id == id),
+                "{}: {harness} doesn't report {id}",
+                case.display()
+            );
+            assert!(
+                !table.contains_key("seed") && !table.contains_key("typed"),
+                "{}: a search case names no other witness",
+                case.display()
+            );
             continue;
         }
         let name = table["seed"]

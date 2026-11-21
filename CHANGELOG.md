@@ -11,6 +11,64 @@ independently.
 
 ## [Unreleased]
 
+## [1.9.0-rc1] - 2026-11-21
+
+### Changed
+
+- Finalized transaction bodies now move out of RocksDB into append-only
+  static files in the state directory, in the background and at least 50
+  blocks at a time. On first start the node upgrades its database in place
+  to state format v32. Older releases can't open the upgraded database, so
+  going back means a fresh sync or restoring a backup from before the
+  upgrade ([#2146](https://github.com/zakura-core/zakura/pull/2146)).
+- A Mainnet archive node grows by about 11 GB at the peak of the move,
+  because the new static files sit next to the old RocksDB data until
+  RocksDB frees it. Leave that much free disk. If a static file write
+  fails, for example on a full disk, moves stop until zakurad restarts, so
+  free space and restart it
+  ([#2146](https://github.com/zakura-core/zakura/pull/2146)).
+- Back up the `static_files` directory along with RocksDB, because a
+  RocksDB checkpoint no longer holds finalized transaction bodies. Copy the
+  whole state directory with zakurad stopped or take a filesystem snapshot,
+  and don't hard link static files into a restore
+  ([#2146](https://github.com/zakura-core/zakura/pull/2146)).
+- Upgrade read-only RPC secondaries together with their primary, and stop
+  them around `zakurad rollback-state`. A v31 secondary can't follow a v32
+  primary, and rollback shortens static files in place
+  ([#2146](https://github.com/zakura-core/zakura/pull/2146)).
+- A pruned node that started as an archive used to keep serving old
+  transaction bodies below its pruning marker. After the first static file
+  move it treats them as pruned
+  ([#2146](https://github.com/zakura-core/zakura/pull/2146)).
+- With the experimental core mempool, a new block no longer scans the whole
+  pool for conflicting and expired transactions, so its cost follows the
+  block's size instead of the pool's
+  ([#2636](https://github.com/zakura-core/zakura/pull/2636)).
+- With the experimental `tx-relay` enabled, the
+  `zakura.p2p.tx_relay.inv_ids` counter is now
+  `zakura.p2p.tx_relay.have_ids`, because the announcement message is now
+  called `Have`. Update dashboards that read the old name. The wire format
+  is unchanged ([#2665](https://github.com/zakura-core/zakura/pull/2665)).
+
+### Fixed
+
+- Header sync now takes equal peer offers in arrival order, so peers that
+  reconnect under fresh keys or overstate their chain work can't keep an
+  honest peer's headers from being requested
+  ([#2638](https://github.com/zakura-core/zakura/pull/2638)).
+- With the experimental `tx-relay` enabled, a new connection accepts at
+  most its peer's 544 KB `Have` opening allowance plus what 256 KB/s earns
+  since the handshake, instead of about 44 MB
+  ([#2637](https://github.com/zakura-core/zakura/pull/2637)).
+
+### Security
+
+- With the experimental `tx-relay` enabled, orphan transactions and late
+  `notfound` answers now shrink a peer's request window, and tx-relay
+  fetches can hold at most 250 of the pool core's 500 slots, so peers can't
+  crowd out local submissions, legacy peers or re-admissions after a reset
+  ([#2634](https://github.com/zakura-core/zakura/pull/2634)).
+
 ## [1.9.0-rc0] - 2026-11-20
 
 ### Added

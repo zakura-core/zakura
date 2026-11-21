@@ -95,7 +95,10 @@ use tokio_util::sync::CancellationToken;
 use tower::{load_shed::LoadShed, timeout::Timeout, util::BoxService, ServiceExt};
 use tracing::Instrument;
 
-use zakura_chain::block::{self, genesis::regtest_genesis_block};
+use zakura_chain::{
+    block::{self, genesis::regtest_genesis_block},
+    miner_mesh::MinerMeshCommitment,
+};
 use zakura_consensus::router::BackgroundTaskHandles;
 use zakura_jsonl_trace::{JsonlEventEmitter, JsonlTracer};
 use zakura_network::types::PeerServices;
@@ -322,6 +325,40 @@ impl StartCmd {
             .map_err(|error| eyre!("invalid consensus configuration: {error}"))
     }
 
+    /// Refuses `mining.miner_mesh` on a node that cannot be a gateway.
+    ///
+    /// Other miners find the gateway by its v2 node ID, so it needs the v2 stack.
+    fn validate_miner_mesh_config(config: &ZakuradConfig) -> Result<(), Report> {
+        if config.mining.miner_mesh && !config.network.v2_p2p() {
+            return Err(eyre!(
+                "mining.miner_mesh requires the Zakura P2P v2 stack; set network.p2p_stack to \
+                 \"zakura\" or \"dual\""
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Makes sure a node that announces itself as a gateway keeps its node ID across restarts.
+    ///
+    /// Recent blocks keep naming the gateway by that ID, so a node that would come back with a
+    /// new ID refuses to start instead. A node with no key yet saves one now.
+    fn ensure_miner_mesh_gateway_identity(config: &ZakuradConfig) -> Result<(), Report> {
+        if !config.mining.miner_mesh {
+            return Ok(());
+        }
+
+        config
+            .network
+            .ensure_stable_zakura_identity()
+            .map_err(|error| {
+                eyre!(
+                    "mining.miner_mesh needs a node key that stays the same across restarts: \
+                     {error}"
+                )
+            })
+    }
+
     fn validate_debug_blocksync_throughput_config(config: &ZakuradConfig) -> Result<(), Report> {
         let Some(target_height) = config.sync.debug_blocksync_throughput_target_height else {
             return Ok(());
@@ -461,6 +498,8 @@ impl StartCmd {
 
         Self::validate_consensus_config(&config)?;
         Self::validate_debug_blocksync_throughput_config(&config)?;
+        Self::validate_miner_mesh_config(&config)?;
+        Self::ensure_miner_mesh_gateway_identity(&config)?;
         config.rpc.validate().map_err(|error| eyre!(error))?;
         let backend_verifications = config
             .sync
@@ -958,6 +997,18 @@ impl StartCmd {
         let rpc_impl = rpc_impl
             .with_template_trace(template_path_trace)
             .with_local_services(config.network.handshake_services(advertised_services));
+        let rpc_impl = if config.mining.miner_mesh {
+            let gateway = zakura_endpoint
+                .as_ref()
+                .ok_or_else(|| {
+                    eyre!("mining.miner_mesh is set but the v2 endpoint is not running")
+                })?
+                .local_node_id();
+            info!(%gateway, "coinbases this node builds name it as the miner's gateway");
+            rpc_impl.with_mesh_commitment(MinerMeshCommitment::new(*gateway.as_bytes()))
+        } else {
+            rpc_impl
+        };
         node_tasks.supervise("rpc transaction queue", rpc_tx_queue_handle, Ok);
 
         let node_services = ready.as_ref().map(|_| crate::node::NodeServices {
@@ -1591,6 +1642,7 @@ impl StartCmd {
 
         Self::validate_consensus_config(&config).map_err(config_error)?;
         Self::validate_debug_blocksync_throughput_config(&config).map_err(config_error)?;
+        Self::validate_miner_mesh_config(&config).map_err(config_error)?;
         config.rpc.validate().map_err(config_error)?;
 
         Ok(config)

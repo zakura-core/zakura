@@ -300,6 +300,70 @@ impl From<VerifyBlockError> for RouterError {
 }
 
 impl RouterError {
+    /// Whether local service failure or missing state prevented a mined-block verdict.
+    /// A bad header can be retryable for body download but still rejects the submitted block.
+    pub fn is_verification_unavailable(&self) -> bool {
+        use zakura_header_chain::{
+            BodyVerificationClass::Retryable,
+            TransientBodyFailureKind::{MissingContext, Storage},
+        };
+
+        let missing_state = |error: &zs::ValidateContextError| {
+            !matches!(error, zs::ValidateContextError::NonSequentialBlock { .. })
+                && matches!(
+                    error.body_verification_class(),
+                    Retryable(MissingContext | Storage)
+                )
+        };
+        let commit_unavailable = |error: &zs::CommitBlockError| match error {
+            zs::CommitBlockError::ValidateContextError(error) => missing_state(error),
+            _ => matches!(error.body_verification_class(), Retryable(_)),
+        };
+
+        let block_error = match self {
+            Self::Block { source } => source.as_ref(),
+            Self::Checkpoint { source } => match source.as_ref() {
+                VerifyCheckpointError::VerifyBlock(error) => error,
+                VerifyCheckpointError::CommitCheckpointVerified(source) => {
+                    return source
+                        .downcast_ref::<zs::CommitCheckpointVerifiedError>()
+                        .map(zs::CommitCheckpointVerifiedError::inner)
+                        .or_else(|| source.downcast_ref::<zs::CommitBlockError>())
+                        .is_none_or(commit_unavailable);
+                }
+                VerifyCheckpointError::Finished
+                | VerifyCheckpointError::Dropped
+                | VerifyCheckpointError::Tip(_)
+                | VerifyCheckpointError::CheckpointList(_)
+                | VerifyCheckpointError::QueuedLimit
+                | VerifyCheckpointError::ShuttingDown => return true,
+                _ => return false,
+            },
+        };
+        match block_error {
+            VerifyBlockError::Depth { .. }
+            | VerifyBlockError::StateService { .. }
+            | VerifyBlockError::PowPolicy(_)
+            | VerifyBlockError::ParentUnavailable { .. } => true,
+            // This wrapper retains a verification error for the exact submitted bytes.
+            // Only attributing that failure to the header needed more state.
+            VerifyBlockError::AuthDataUnconfirmed { .. } => false,
+            VerifyBlockError::Commit(error) => commit_unavailable(error),
+            VerifyBlockError::Transaction(error)
+            | VerifyBlockError::Block {
+                source: BlockError::Transaction(error),
+            } => match error {
+                TransactionError::StateUnavailable(_)
+                | TransactionError::InternalDowncastError(_)
+                | TransactionError::SproutVerifierNotBuilt
+                | TransactionError::TransparentInputNotFound => true,
+                TransactionError::ValidateContextError(error) => missing_state(error),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
     /// Classify the concrete verifier failure selected by the routing boundary.
     pub fn body_verification_class(&self) -> zakura_header_chain::BodyVerificationClass {
         match self {

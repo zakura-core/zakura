@@ -10,11 +10,11 @@ use std::{collections::BTreeMap, sync::Arc};
 use zakura_chain::parameters::Network;
 use zakura_network::{
     zakura::{
-        TransportEvent, TransportObserver, ZakuraLocalLimits, ZAKURA_CAP_BLOCK_SYNC_REGULATED,
-        ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC, ZAKURA_CAP_LEGACY_GOSSIP,
-        ZAKURA_DISCOVERY_STREAM_VERSION, ZAKURA_HEADER_SYNC_STREAM_VERSION,
-        ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION, ZAKURA_STREAM_BLOCK_SYNC,
-        ZAKURA_STREAM_DISCOVERY, ZAKURA_STREAM_HEADER_SYNC,
+        CloseOutcome, NeutralCause, TransportEvent, TransportObserver, ZakuraLocalLimits,
+        ZAKURA_CAP_BLOCK_SYNC_REGULATED, ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC,
+        ZAKURA_CAP_LEGACY_GOSSIP, ZAKURA_DISCOVERY_STREAM_VERSION,
+        ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
+        ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_DISCOVERY, ZAKURA_STREAM_HEADER_SYNC,
     },
     Config,
 };
@@ -264,12 +264,12 @@ fn refusals(events: &[Event], connection: u64) -> Vec<(u16, u16, String)> {
 }
 
 /// The close decisions on `connection`, with the event.
-fn closes(events: &[Event], connection: u64) -> Vec<(Event, Option<String>)> {
+fn closes(events: &[Event], connection: u64) -> Vec<(Event, Option<CloseOutcome>)> {
     events
         .iter()
         .filter(|event| event.connection == Some(connection))
         .filter_map(|event| match &event.fact {
-            TransportFact::CloseDecided { cause } => Some((event.clone(), cause.clone())),
+            TransportFact::CloseDecided { cause } => Some((event.clone(), *cause)),
             _ => None,
         })
         .collect()
@@ -570,7 +570,13 @@ fn only_the_dialer_opens_the_header_stream() {
             .into_iter()
             .map(|(_, cause)| cause)
             .collect();
-        assert_eq!(causes, [Some("unexpected_stream".to_owned())]);
+        assert_eq!(
+            causes,
+            [Some(CloseOutcome::neutral(
+                NeutralCause::IncompatibleConfiguration,
+                "unexpected_stream"
+            ))]
+        );
     }
 }
 

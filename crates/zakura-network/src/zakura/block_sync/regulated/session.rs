@@ -8,6 +8,7 @@ use super::{
     serving::{Server, Source},
     wire::{Range, GET_BLOCKS, LARGEST_SERVED_RESPONSE},
 };
+use crate::zakura::CloseRow;
 use crate::zakura::{
     block_sync::ZakuraBlockSyncConfig,
     regulation::{
@@ -31,7 +32,7 @@ const BYTES_PER_REQUEST: u64 = 160;
 const NODE_EXECUTION: usize = 24;
 /// Read-and-encode jobs for one peer: half the node, so a stalled peer cannot
 /// hold every slot. One peer's share still exceeds one connection's throughput.
-const PEER_EXECUTION: usize = NODE_EXECUTION / 2;
+pub(super) const PEER_EXECUTION: usize = NODE_EXECUTION / 2;
 // An honest server interleaves at most one body per running job, so keep the
 // owed-ending gate well above one peer's jobs (see `MAX_PENDING_ENDINGS`).
 const _: () = assert!(2 * PEER_EXECUTION <= super::live_requester::MAX_PENDING_ENDINGS);
@@ -248,16 +249,16 @@ impl ServingSession {
             .next_back()
             .is_some_and(|(_, (end, _))| *end >= start)
         {
-            return Err(SinkReject::protocol(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
+            return Err(SinkReject::protocol(
+                CloseRow::BSYNC_CLOSE_9,
                 "GetBlocks overlaps a live range",
-            )));
+            ));
         }
         let completed = self.completed.track(u64::from(start.0));
         let id = completed.id();
         self.serve
             .admit_tracked(range, completed)
-            .map_err(SinkReject::protocol)?;
+            .map_err(|error| SinkReject::protocol(error.close_row(), error))?;
         self.ranges.insert(start, (last, id));
         Ok(())
     }

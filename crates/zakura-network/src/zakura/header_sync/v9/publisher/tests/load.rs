@@ -20,7 +20,7 @@ use crate::zakura::{
         wire::{DEFAULT_HS_RANGE, MAX_HS_MESSAGE_BYTES},
     },
     regulation::{sizing, WriterFence},
-    CloseCause, FRAME_HEADER_BYTES,
+    FRAME_HEADER_BYTES,
 };
 
 /// The production window: 4,000 headers and 8 MiB.
@@ -314,7 +314,7 @@ async fn header_credit_sets_throughput_at_the_target_round_trip() {
             max_message_bytes: caps.max_bytes,
             ..v9::test_support::status::<HB>(tip)
         };
-        let fence = WriterFence::new(CancellationToken::new(), CloseCause::default());
+        let fence = WriterFence::new(CancellationToken::new());
         let mut subscriber = v9::Subscriber::new(HB, fence, &framed_channel(1).1);
         let open = subscriber
             .open(&status, &[port.genesis], AuxSchema::None, WINDOW.objects)

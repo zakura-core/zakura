@@ -3,6 +3,7 @@
 use futures::{FutureExt, Sink, SinkExt};
 
 use zakura_chain::serialization::SerializationError;
+use zakura_node_services::block_relay::PendingBlockSendPermit;
 
 use crate::{constants::REQUEST_TIMEOUT, protocol::external::Message, PeerError};
 
@@ -41,19 +42,39 @@ where
         &mut self,
         msg: Message,
         authorized: impl FnOnce() -> bool,
+        pending_send: Option<PendingBlockSendPermit>,
     ) -> Result<bool, PeerError> {
         tokio::time::timeout(REQUEST_TIMEOUT, async {
             futures::future::poll_fn(|cx| std::pin::Pin::new(&mut self.inner).poll_ready(cx))
                 .await?;
-            if !authorized() {
+            if !self.start_authorized(msg, authorized, pending_send.as_ref())? {
                 return Ok(false);
             }
-            std::pin::Pin::new(&mut self.inner).start_send(msg)?;
             self.inner.flush().await?;
             Ok(true)
         })
         .await
         .map_err(|_| PeerError::ConnectionSendTimeout)?
+    }
+
+    /// Keeps the permission guard entirely outside the asynchronous send future's state.
+    fn start_authorized(
+        &mut self,
+        msg: Message,
+        authorized: impl FnOnce() -> bool,
+        pending_send: Option<&PendingBlockSendPermit>,
+    ) -> Result<bool, PeerError> {
+        let start = || -> Result<bool, PeerError> {
+            if !authorized() {
+                return Ok(false);
+            }
+            std::pin::Pin::new(&mut self.inner).start_send(msg)?;
+            Ok(true)
+        };
+        match pending_send {
+            Some(permit) => Ok(permit.try_start_write(start).transpose()?.unwrap_or(false)),
+            None => start(),
+        }
     }
 
     /// Flush any remaining output and close this [`PeerTx`], if necessary.

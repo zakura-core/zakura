@@ -388,7 +388,10 @@ fn runtime_payload(
             facts,
             bytes,
             None,
-            ZakuraPeerId::new(vec![1; 32]).unwrap(),
+            BlockSupplier {
+                peer: ZakuraPeerId::new(vec![1; 32]).unwrap(),
+                conn_id: 0,
+            },
         ),
         super::super::sequencer::AcceptOutcome::Buffered { .. }
     ));

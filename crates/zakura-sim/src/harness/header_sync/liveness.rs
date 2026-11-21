@@ -89,8 +89,9 @@ pub const FIXTURE_HORIZON: std::time::Duration = std::time::Duration::from_secs(
 pub const LATE_PAGE_DELAY: std::time::Duration = std::time::Duration::from_secs(29);
 
 /// When the late-page fixture lets A's held prepare go, in virtual
-/// milliseconds: past the deadline the late page rearmed, 30 seconds after
-/// a page that comes 29 seconds after a start within the first second.
+/// milliseconds: past the deadline the late page's prepare rearms, 30
+/// seconds after a page that comes 29 seconds after a start within the
+/// first second.
 const LATE_PAGE_PREPARE_MS: u64 = 70_000;
 
 /// [`FIXTURE_HORIZON`] for the late-page fixture, past its prepare's
@@ -472,10 +473,10 @@ pub enum LivenessScenario {
     },
     /// The timeout fixture with A's first page held [`LATE_PAGE_DELAY`] on
     /// its way to the node, so it arrives a second before the deadline its
-    /// round's start armed and rearms it, and the run's clock crosses the
-    /// first deadline with the round still live. A's prepare is held past
-    /// the rearmed deadline, so production retires A's round 30 seconds
-    /// after the page, and the cached pass hands the target to B.
+    /// round's start armed. The page completes the round, so its prepare's
+    /// dispatch rearms the deadline. A's prepare is held past that
+    /// deadline, so production retires A's round there, and the cached pass
+    /// then hands the target to B.
     LatePage,
     /// The serving-read fixture: the node at A3 serving `mirror-0` at A1,
     /// its only peer, which subscribes to it. The publisher's first page

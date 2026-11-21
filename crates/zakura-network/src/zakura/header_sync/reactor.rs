@@ -871,6 +871,9 @@ impl HeaderSyncReactor {
                 session_id,
                 reason,
             } => self.handle_peer_disconnected(&peer, session_id, reason),
+            Event::PeerReadTimedOut { peer, session_id } => {
+                self.stall_session(&peer, session_id, "frame_read_timeout");
+            }
             Event::AdvisorySummary { .. } => {}
             Event::Status {
                 peer,
@@ -1674,10 +1677,10 @@ impl HeaderSyncReactor {
             self.reject_page(peer, session_id);
             return;
         }
-        self.reset_unproductive_requests(&peer, session_id);
-        self.state
-            .arm_request_deadline(peer.clone(), Instant::now(), self.startup.request_timeout);
-
+        // A staged page is not progress yet (#2248): a peer could drip one
+        // header per deadline and hold its reservation. Progress is a
+        // prepared target, or a round that staged a fair share of headers
+        // since its last progress.
         let active = self
             .peer_work_queue
             .active(&peer)
@@ -1699,10 +1702,30 @@ impl HeaderSyncReactor {
                 if bounded_prefix && facts.checkpoint_prefix_ready {
                     metrics::counter!("sync.header.checkpoint_prefix.prepared.total").increment(1);
                 }
+                // The peer delivered the round. Its own deadline must not
+                // retire a prepare still running near it.
+                self.state.arm_request_deadline(
+                    peer.clone(),
+                    Instant::now(),
+                    self.startup.request_timeout,
+                );
                 self.prepare_staged_work(&peer, bounded_prefix);
             }
-            PageNext::Continue { staged_tip } => self.continue_round(&peer, staged_tip),
+            PageNext::Continue { staged_tip } => {
+                if self.peer_work_queue.credit_staged_share(&peer) {
+                    self.note_request_progress(&peer, session_id);
+                }
+                self.continue_round(&peer, staged_tip);
+            }
         }
+    }
+
+    /// Count progress on `peer`'s request from `session_id`: clear its
+    /// strikes and give the request a full timeout.
+    fn note_request_progress(&mut self, peer: &ZakuraPeerId, session_id: u64) {
+        self.reset_unproductive_requests(peer, session_id);
+        self.state
+            .arm_request_deadline(peer.clone(), Instant::now(), self.startup.request_timeout);
     }
 
     /// Judge a page for `peer`'s selected-range repair, and retry the repair
@@ -2296,11 +2319,7 @@ impl HeaderSyncReactor {
                         return;
                     }
                 }
-                self.state.arm_request_deadline(
-                    peer.clone(),
-                    Instant::now(),
-                    self.startup.request_timeout,
-                );
+                self.note_request_progress(&peer, active.owner.session_id());
                 assert!(
                     self.peer_work_queue.begin_apply(&peer),
                     "the exact preparing request passed the completion gate"
@@ -3190,8 +3209,23 @@ impl HeaderSyncReactor {
         if !self.state.charge_unproductive_request(peer, limit) {
             return false;
         }
-        self.drop_unproductive_peer(peer, session_id, reason);
+        self.stall_session(peer, session_id, reason);
         true
+    }
+
+    /// Apply the shared stall rule (`regulation::stall`) to `peer`'s exact
+    /// session: drop it and start the readmission cooldown, and close its
+    /// connection if that connection stalled before.
+    fn stall_session(&mut self, peer: &ZakuraPeerId, session_id: u64, reason: &'static str) {
+        let Some(handles) = self.sessions.get(peer) else {
+            return;
+        };
+        if handles.session.session_id() != session_id {
+            return;
+        }
+        let session = handles.session.clone();
+        session.note_stall();
+        self.drop_unproductive_peer(peer, session_id, reason);
     }
 
     /// Clears `peer`'s strike count after its session supplies usable work.
@@ -3208,7 +3242,9 @@ impl HeaderSyncReactor {
             .is_some_and(|handles| handles.session.session_id() == session_id)
     }
 
-    /// Closes one exact unproductive session and blocks its readmission for the cooldown.
+    /// Ends one exact unproductive session and blocks its readmission for the
+    /// cooldown. The session's fence resets any open subscription's streams;
+    /// the connection stays.
     fn drop_unproductive_peer(
         &mut self,
         peer: &ZakuraPeerId,
@@ -3278,8 +3314,8 @@ impl HeaderSyncReactor {
     /// its target after a committed prefix.
     ///
     /// A subscription kept for the next round still holds its `Open`'s
-    /// started exchange, so retiring the session while it is open closes the
-    /// connection, as during a round. The next round resumes it, or the peer's
+    /// started exchange, so retiring the session while it is open resets the
+    /// session, as during a round. The next round resumes it, or the peer's
     /// next status that cannot closes it; see
     /// [`Self::consider_advertised_header_target`].
     fn cancel_active_request(&mut self, active: &ActiveHeaderRequest) {
@@ -3306,13 +3342,10 @@ impl HeaderSyncReactor {
             return;
         };
         let session_id = handles.session.session_id();
-        let refused = matches!(handles.session.try_close(), Err(OrderedSendError::Full));
-        let attempt = if refused {
-            CloseAttempt::Refused
-        } else {
-            CloseAttempt::Sent {
-                live: handles.session.subscriber().live().is_some(),
-            }
+        let attempt = match handles.session.try_close() {
+            Err(OrderedSendError::Full) => CloseAttempt::Refused,
+            Ok(queued) => CloseAttempt::Sent { live: queued },
+            Err(_) => CloseAttempt::Sent { live: false },
         };
         self.state.record_close_attempt(
             peer,
@@ -3341,13 +3374,30 @@ impl HeaderSyncReactor {
     /// by its deadline.
     fn retire_unanswered_closes(&mut self, now: Instant) {
         for (peer, session_id) in self.state.take_expired_closes(now) {
-            let unanswered = self.sessions.get(&peer).is_some_and(|handles| {
+            let Some(handles) = self.sessions.get(&peer).filter(|handles| {
                 handles.session.session_id() == session_id
                     && handles.session.subscriber().live().is_some()
-            });
-            if unanswered {
-                metrics::counter!("sync.header.subscription.close_timed_out.total").increment(1);
-                self.drop_unproductive_peer(&peer, session_id, "unresponsive");
+            }) else {
+                continue;
+            };
+            // A queued Close does not start the peer's response time. Wait until
+            // the transport has accepted the whole frame before charging a stall.
+            let deadline = handles
+                .session
+                .close_written_at()
+                .map(|written_at| written_at + self.startup.request_timeout);
+            match deadline {
+                Some(deadline) if deadline <= now => {
+                    metrics::counter!("sync.header.subscription.close_timed_out.total")
+                        .increment(1);
+                    self.stall_session(&peer, session_id, "unresponsive");
+                }
+                _ => {
+                    let check_at = deadline.unwrap_or(now + state::CLOSE_RETRY_INTERVAL);
+                    self.state
+                        .close_deadlines
+                        .insert(peer, (session_id, check_at));
+                }
             }
         }
     }

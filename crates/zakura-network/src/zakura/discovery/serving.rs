@@ -149,6 +149,15 @@ impl ServingCapacity {
     }
 }
 
+#[cfg(test)]
+impl ServingCapacity {
+    /// The node-wide capacity of `GetPeers` and of `GetServices`, in that
+    /// order, so a test can read what each row holds.
+    pub(super) fn rows(&self) -> [&ServeCapacity; 2] {
+        [&self.get_peers, &self.get_services]
+    }
+}
+
 impl Serving {
     /// Reports each commitment of `recv`'s requests on its stream's tap, if
     /// it has one, with the frame each admitted request was read as. Call it

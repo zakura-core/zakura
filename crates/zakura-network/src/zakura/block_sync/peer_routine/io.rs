@@ -360,7 +360,10 @@ impl PeerIO {
             body,
             serialized_bytes,
             admitted_estimate_bytes,
-            self.peer.clone(),
+            super::super::events::BlockSupplier {
+                peer: self.peer.clone(),
+                conn_id: self.conn_id,
+            },
             received_at,
             self.sequencer_input_bytes.clone(),
             self.sequencer_input_decoded_attributed_memory_bytes.clone(),

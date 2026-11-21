@@ -12,16 +12,17 @@ use zakura_rt::collections::{HashMap, HashSet};
 use super::protocol::{
     advertised_services, entry_is_expired, hello_verdict, normalize_direct_addrs,
     normalize_services, push_unique_service, BookChange, DialAdmission, DialCandidateExclusions,
-    DisclosureKey, DiscoveryBookError, DiscoveryRecordValidationContext, DiscoveryWireError,
-    ImportBatchOutcome, ImportOutcome, RecordVerdict, Services, ZakuraCachedLiveServiceSummary,
-    ZakuraDiscoveryBook, ZakuraDiscoveryConfig, ZakuraDiscoveryDialCandidate, ZakuraDiscoveryEntry,
-    ZakuraDiscoveryLocalConfig, ZakuraDiscoveryPersistedEntry, ZakuraNodeRecord,
-    ZakuraNodeRecordBody, ZakuraServiceId, DEFAULT_LIVE_SERVICE_SUMMARY_TTL,
-    MAX_DISCOVERY_EXCLUDED_NODE_IDS, MAX_SERVICE_SUMMARIES_PER_RESPONSE,
+    DisclosureKey, DiscoveryBookError, DiscoveryRecordError, DiscoveryRecordValidationContext,
+    DiscoveryWireError, ImportBatchOutcome, ImportOutcome, RecordVerdict, Services,
+    ZakuraCachedLiveServiceSummary, ZakuraDiscoveryBook, ZakuraDiscoveryConfig,
+    ZakuraDiscoveryDialCandidate, ZakuraDiscoveryEntry, ZakuraDiscoveryLocalConfig,
+    ZakuraDiscoveryPersistedEntry, ZakuraNodeRecord, ZakuraNodeRecordBody, ZakuraServiceId,
+    DEFAULT_LIVE_SERVICE_SUMMARY_TTL, MAX_DISCOVERY_EXCLUDED_NODE_IDS,
+    MAX_SERVICE_SUMMARIES_PER_RESPONSE,
 };
 use super::verified::VerifiedRecord;
 use crate::zakura::{
-    ServiceAdmissionDecision, ServicePeerDirection, ServicePeerSnapshot, ZakuraConnId,
+    CloseRow, ServiceAdmissionDecision, ServicePeerDirection, ServicePeerSnapshot, ZakuraConnId,
     ZakuraNetworkId, ZakuraPeerId,
 };
 
@@ -71,6 +72,20 @@ impl SessionRecordError {
         match self {
             Self::Superseded => RecordVerdict::Drop,
             Self::Import(error) => hello_verdict(error),
+        }
+    }
+
+    /// The close-spec row a `Hello` breaks when its [`Self::verdict`] is
+    /// `Disconnect`.
+    pub(super) fn close_row(&self) -> CloseRow {
+        match self {
+            Self::Import(DiscoveryBookError::MismatchedConnectedPeerRecord) => {
+                CloseRow::DISCO_CLOSE_6
+            }
+            Self::Import(DiscoveryBookError::Record(
+                DiscoveryRecordError::Wire(_) | DiscoveryRecordError::MalformedNodeId,
+            )) => CloseRow::DISCO_CLOSE_5,
+            Self::Superseded | Self::Import(_) => CloseRow::DISCO_CLOSE_7,
         }
     }
 }

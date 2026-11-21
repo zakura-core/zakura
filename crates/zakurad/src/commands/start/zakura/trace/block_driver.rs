@@ -180,7 +180,7 @@ impl BlockDriverTraceExt for ZakuraTrace {
             event: event::ACTION_RECEIVED,
             source: SOURCE,
             fields: match action {
-                BlockSyncAction::Misbehavior { peer, reason } => ReceivedAction::Misbehavior {
+                BlockSyncAction::Misbehavior { peer, reason, .. } => ReceivedAction::Misbehavior {
                     action: "misbehavior",
                     peer: zakura_trace_peer_label(peer),
                     reason: misbehavior_label(reason),

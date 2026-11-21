@@ -165,7 +165,7 @@ pub fn spawn_block_sync_reactor(
         startup.best_header_tip,
         initial_view(startup.frontiers),
     );
-    let mut local_status = progress.local_status(&startup.config);
+    let mut local_status = progress.local_status(&startup.config, committed_view.as_ref());
     if let Some(retention) = &body_retention {
         local_status = retention.apply(local_status);
     }
@@ -834,10 +834,14 @@ impl ReactorIO {
         &mut self,
         view: zakura_header_chain::CommittedHeaderChainView,
     ) {
+        let previous_status = self.local_status();
         synchronize_persisted_body_alarm(&self.registry, Some(&view));
         let update = self
             .state
             .observe_committed_view(view, time::Instant::now());
+        if self.local_status() != previous_status {
+            self.flush_status_refresh();
+        }
         if let Some(gate_change) = update.gate_change {
             self.report_transition(gate_change);
         }
@@ -1775,7 +1779,10 @@ impl ReactorIO {
     }
 
     fn local_status(&self) -> BlockSyncStatus {
-        let status = self.state.progress.local_status(&self.startup.config);
+        let status = self
+            .state
+            .progress
+            .local_status(&self.startup.config, self.state.committed_view());
         self.body_retention
             .as_ref()
             .map_or(status, |retention| retention.apply(status))
@@ -1847,7 +1854,11 @@ impl ReactorIO {
         // channel here was the backpressure stall that delayed request timeouts and
         // lifecycle draining whenever the action driver was slow. `try_send` keeps
         // the reactor live.
-        let action = BlockSyncAction::Misbehavior { peer, reason };
+        let action = BlockSyncAction::Misbehavior {
+            peer,
+            conn_id: None,
+            reason,
+        };
         if self.dispatch_action(action).is_err() {
             metrics::counter!("sync.block.peer.violation.action_dropped").increment(1);
         }

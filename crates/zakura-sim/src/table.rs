@@ -27,11 +27,11 @@ pub mod handshake;
 
 use std::fmt;
 
-use zakura_network::zakura::{MessageRole, MessageRule, Stream};
+use zakura_network::zakura::{CloseOutcome, MessageRole, MessageRule, Stream};
 
 use crate::{
     downstream,
-    model::{consequence, is_fault_cause, is_rate_limit_cause, Consequence, Label},
+    model::{consequence, Consequence, Label},
     observe::{Entry, StreamId},
     property::{
         Cardinality, CheckCtx, HasView, Kind, LivenessBound, ObligationKey, Property, PropertyId,
@@ -875,7 +875,7 @@ fn session(connection: u64) -> Subject {
 /// True if `obs` closes the obligation's connection with a fault cause.
 fn fault_close(key: &ObligationKey, obs: &Observation) -> bool {
     matches!(obs, Observation::ConnectionClosed { connection, cause }
-        if is_fault_cause(cause) && key.subject == session(*connection))
+        if cause.is_fault() && key.subject == session(*connection))
 }
 
 /// True if `obs` closes the obligation's connection with a fault cause, or
@@ -990,7 +990,7 @@ fn check_closes<S: HasView>(
 ///
 /// A rate-limit close names no stream, so this assumes the connection
 /// carries no stream without a table, whose own message bucket can justify
-/// that close ([`crate::model::RATE_LIMIT_CAUSES`]).
+/// that close ([`CloseOutcome::ORDERED_RATE_LIMITED`]).
 fn check_never_closes<S: HasView>(
     cx: &mut CheckCtx<'_, S>,
     id: &GeneratedId<'_>,
@@ -1022,9 +1022,9 @@ fn check_never_closes<S: HasView>(
                 continue;
             }
             Observation::ConnectionClosed { connection, cause }
-                if is_fault_cause(cause)
+                if cause.is_fault()
                     || (id.template == Template::CadenceNeverCloses
-                        && is_rate_limit_cause(cause)) =>
+                        && *cause == CloseOutcome::ORDERED_RATE_LIMITED) =>
             {
                 (*connection, format!("a close with cause {cause}"))
             }

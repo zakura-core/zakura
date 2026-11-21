@@ -2451,8 +2451,8 @@ fn committed_list() -> feedback::List {
 }
 
 /// The committed case list resolves each case to its planted patch, case
-/// file and production files, and freezes ten seeds in both arms: ten cases
-/// on five targets, 300 campaigns of 600 s.
+/// file and production files, and freezes ten seeds in both arms: nine cases
+/// on four targets, 260 campaigns of 600 s.
 #[test]
 fn the_feedback_list_plans_paired_arms() {
     let list = committed_list();
@@ -2487,7 +2487,7 @@ fn the_feedback_list_plans_paired_arms() {
             targets.len(),
             originals + cases.len() * planned.len()
         ),
-        (10, 5, 300)
+        (9, 4, 260)
     );
 }
 
@@ -2522,6 +2522,7 @@ fn planted_repo() -> (
         also_violates: vec!["p/also".to_owned()],
         target: None,
         no_target: None,
+        untriggered: false,
     };
     let targets = BTreeMap::from([
         ("t_one".to_owned(), Some("h/one".to_owned())),
@@ -2632,7 +2633,7 @@ fn the_feedback_list_rejects_bad_cases() {
             "t_two runs h/two, but the case's seed runs h/one",
         ),
         (vec![good.clone(), good.clone()], &planted, "listed twice"),
-        (vec![good.clone()], &typed, "a typed case has no seed"),
+        (vec![good.clone()], &typed, "only a seed case has a seed"),
         (vec![good.clone()], &unknown, "no seed is named `y`"),
         (Vec::new(), &planted, "the list names no case"),
     ] {

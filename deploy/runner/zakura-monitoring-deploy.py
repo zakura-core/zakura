@@ -34,7 +34,9 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 from pathlib import Path
+from urllib.request import urlopen
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -45,6 +47,7 @@ COMPAT_NAME = "zakura-compat"
 COMPAT_TARGET = monitor.KNOWN_TARGETS[COMPAT_NAME]
 FLEET_ROOT = Path("/opt/zakura-fleet-watchdog")
 COMPAT_ROOT = Path("/opt/zakura-monitoring")
+FLEET_CONFIG = HERE / "fleet-watchdog.toml"
 FLEET_LINKS = (
     "zakura-cluster-watchdog.py=zakura-cluster-watchdog.py",
     "fleets.toml=fleet-watchdog.toml",
@@ -149,21 +152,20 @@ def build(ctx: Context) -> dict:
     return ctx.package
 
 
-def validate_target(ctx: Context) -> None:
+def validate_target(ctx: Context) -> monitor.CompatTarget:
     if ctx.target != COMPAT_TARGET:
         raise StageError(f"compatibility target must be {COMPAT_TARGET}")
-    targets = monitor.load_compatibility_targets(HERE / "fleet-watchdog.toml")
+    targets = monitor.load_compatibility_targets(FLEET_CONFIG)
     if [(t.name, t.ssh_target) for t in targets] != [(COMPAT_NAME, COMPAT_TARGET)]:
         raise StageError("fleet-watchdog.toml does not name the compatibility target")
     if ctx.args.deploy_config:
-        import tomllib
-
         with Path(ctx.args.deploy_config).open("rb") as config:
             nodes = tomllib.load(config).get("nodes", [])
         hosts = [node.get("ssh_string") for node in nodes if node.get("name") == COMPAT_NAME]
         if hosts != [COMPAT_TARGET]:
             raise StageError("deploy config disagrees about the compatibility host")
     ctx.record("target", {"name": COMPAT_NAME, "ssh_target": COMPAT_TARGET})
+    return targets[0]
 
 
 def install_compat(ctx: Context, *, activate: bool = True) -> None:
@@ -259,7 +261,7 @@ def last_probe(ctx: Context) -> dict:
 def stage_fleet_deploy(ctx: Context) -> None:
     """Regular deploys: install the fleet release in place and restart only the watchdog."""
     stage_fleet(ctx)
-    if lane_enabled():
+    if ctx.args.ensure_compat_checker or lane_enabled():
         # Do not change the live fleet release until the checker refresh succeeds.
         validate_target(ctx)
         install_compat(ctx)
@@ -273,6 +275,48 @@ def stage_fleet_deploy(ctx: Context) -> None:
     ctx.systemctl("enable", FLEET_UNIT)
     ctx.systemctl("restart", FLEET_UNIT)
     ctx.record("fleet service", ctx.systemctl("is-active", FLEET_UNIT, check=False))
+
+
+def wait_for_sidecar_dashboard(url: str, ready_at: float) -> None:
+    """Wait until the Slack watchdog's source has seen the sidecar recover."""
+    deadline = time.monotonic() + 60
+    while (remaining := deadline - time.monotonic()) > 0:
+        try:
+            with urlopen(url, timeout=min(remaining, 5)) as response:
+                snapshot = json.loads(response.read(1 << 20))
+        except (OSError, ValueError):
+            snapshot = {}
+        rows = snapshot.get("rows") if isinstance(snapshot, dict) else None
+        if isinstance(rows, list) and any(
+            isinstance(row, dict)
+            and row.get("name") == "zcashd-compat"
+            and row.get("health") == "healthy"
+            and type(row.get("last_seen_at")) in (int, float)
+            and row["last_seen_at"] >= ready_at
+            for row in rows
+        ):
+            return
+        time.sleep(min(5, max(0, deadline - time.monotonic())))
+    raise StageError("fleet dashboard did not observe a healthy zcashd-compat after the sync check")
+
+
+def stage_check_compat_readiness(ctx: Context) -> None:
+    target = validate_target(ctx)
+    check = [target.checker, "check", "--env-file", target.env_file,
+             "--height-max-drift", str(target.height_max_drift), "--sync-check-timeout", "600"]
+    result = ctx.ssh(shlex.join(check), timeout=650)
+    # The checker emits sanitized health predicates and measurements.
+    print(result.stdout.decode(errors="replace"), end="", flush=True)
+    if result.returncode != 0:
+        print(result.stderr.decode(errors="replace"), end="", file=sys.stderr, flush=True)
+        raise StageError(f"compatibility sync check failed with exit {result.returncode}")
+
+    ready_at = time.time()
+    with FLEET_CONFIG.open("rb") as config:
+        fleets = tomllib.load(config)["fleets"]
+    mainnet_url = next(fleet["url"] for fleet in fleets if fleet["name"] == "mainnet")
+    wait_for_sidecar_dashboard(mainnet_url, ready_at)
+    ctx.record("compatibility dashboard", "healthy")
 
 
 def stage_install(ctx: Context) -> None:
@@ -474,6 +518,7 @@ def json_or_marker(stdout: bytes) -> object:
 
 STAGES = {
     "fleet-deploy": stage_fleet_deploy,
+    "check-compat-readiness": stage_check_compat_readiness,
     "install": stage_install,
     "validate": stage_validate,
     "cutover": stage_cutover,
@@ -492,6 +537,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--target", default=COMPAT_TARGET)
     parser.add_argument("--known-hosts", help="pinned known_hosts used by the workflow")
     parser.add_argument("--deploy-config", help="nodes.ci.toml to cross-check the target")
+    parser.add_argument("--ensure-compat-checker", action="store_true",
+                        help="install the readiness checker for a compatibility node restart")
     parser.add_argument("--work", default=tempfile.gettempdir())
     parser.add_argument("--evidence", type=Path)
     parser.add_argument("--run-url", default="")

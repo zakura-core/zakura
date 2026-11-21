@@ -99,7 +99,11 @@ fn committed(spec: &Spec) -> CommittedHeaderChainView {
             ..AlarmSet::default()
         },
     };
-    let mut view = CommittedHeaderChainView::new(snapshot, BodyWorkEpoch::new(spec.epoch));
+    let mut view = CommittedHeaderChainView::new(
+        snapshot.frontiers.verified_best,
+        snapshot,
+        BodyWorkEpoch::new(spec.epoch),
+    );
     view.body_size_hint_revision = spec.hint_revision;
     view.body_size_hint_batches = spec.first_batch.map(|first| {
         (first..=spec.hint_revision.max(first))
@@ -316,6 +320,7 @@ fn only_misbehavior_reports_are_optional_actions() {
         );
     }
     let misbehavior = BlockSyncAction::Misbehavior {
+        conn_id: None,
         peer: ZakuraPeerId::new(vec![1; 32]).expect("the test peer id is within bounds"),
         reason: crate::zakura::block_sync::BlockSyncMisbehavior::InvalidBlock,
     };

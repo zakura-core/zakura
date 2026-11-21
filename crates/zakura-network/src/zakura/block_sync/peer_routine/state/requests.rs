@@ -136,6 +136,9 @@ pub(in super::super) struct SharedDeadlines {
     pub(in super::super) body_retry_avoid: Option<Instant>,
     /// When the last fill pass's retry filter allows its returned work again.
     pub(in super::super) retry_filter: Option<Instant>,
+    /// Body bytes the live requester's authorizations still owe; see
+    /// `DownloadWindow::block_liveness_deadline_owing`.
+    pub(in super::super) authorized_body_bytes: u64,
 }
 
 impl PeerState {
@@ -290,9 +293,9 @@ impl PeerState {
         now: Instant,
         liveness_timeout: Duration,
     ) -> bool {
-        self.window.note_block_progress(now, liveness_timeout);
         self.window.outstanding.record_body_bytes(key, body_bytes);
         self.window.outstanding.mark_received(key, height);
+        self.window.note_block_progress(now, liveness_timeout);
         self.window
             .outstanding
             .get(key)
@@ -307,11 +310,13 @@ impl PeerState {
         &mut self,
         key: RequestKey,
         height: block::Height,
+        body_bytes: u64,
         now: Instant,
         liveness_timeout: Duration,
     ) -> Option<bool> {
-        self.window.note_block_progress(now, liveness_timeout);
+        self.window.outstanding.record_body_bytes(key, body_bytes);
         self.window.outstanding.mark_received(key, height);
+        self.window.note_block_progress(now, liveness_timeout);
         self.window
             .outstanding
             .get(key)
@@ -438,15 +443,16 @@ impl PeerState {
         })
     }
 
-    /// Whether a request deadline or the block-liveness deadline is due at `now`.
-    pub(in super::super) fn deadlines_due(&self, now: Instant) -> bool {
+    /// Whether a request deadline or the block-liveness deadline is due at
+    /// `now`, while the peer's authorizations owe `authorized` body bytes.
+    pub(in super::super) fn deadlines_due(&self, now: Instant, authorized: u64) -> bool {
         self.window
             .outstanding
             .earliest_deadline()
             .is_some_and(|deadline| deadline <= now)
             || self
                 .window
-                .block_liveness_deadline
+                .block_liveness_deadline_owing(authorized)
                 .is_some_and(|deadline| deadline <= now)
     }
 
@@ -539,7 +545,8 @@ impl PeerState {
     pub(in super::super) fn next_wake(&self, shared: SharedDeadlines) -> Option<Instant> {
         [
             self.window.outstanding.earliest_deadline(),
-            self.window.block_liveness_deadline,
+            self.window
+                .block_liveness_deadline_owing(shared.authorized_body_bytes),
             shared.requester_retirement,
             self.retry_avoid_expiry(),
             shared.floor_watchdog_avoid,

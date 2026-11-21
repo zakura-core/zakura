@@ -449,7 +449,10 @@ enum Probe {
     AcquireHold,
     /// Submit an acquire, let it complete, then drop the call unread.
     AbandonAcquire,
-    /// After 31 s, acquire and release, which sweeps idle leases.
+    /// After 61 s, acquire and release, which sweeps idle leases. A serve's
+    /// read can complete as late as the requester's 30 s deadline, whose
+    /// stall ends the session, so no later serve sweeps. 61 s is past the
+    /// lease's 30 s idle limit after that read.
     SweepLate,
     /// Prepare `len` fixture headers on genesis.
     Prepare {
@@ -575,7 +578,7 @@ async fn probe(
             drop(call);
         }
         Probe::SweepLate => {
-            zakura_rt::time::sleep(Duration::from_secs(31)).await;
+            zakura_rt::time::sleep(Duration::from_secs(61)).await;
             let path = acquired(acquire().await);
             port.release_header_path(path)
                 .await

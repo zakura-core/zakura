@@ -205,8 +205,8 @@ fn a_fenced_reservation_ends_its_exchange_with_its_ending() {
 
     for ended in [false, true] {
         let pool = pool(2);
-        let connection = CancellationToken::new();
-        let fence = WriterFence::new(connection.clone(), CloseCause::new());
+        let session = CancellationToken::new();
+        let fence = WriterFence::new(session.clone());
         let mut map = Reservations::new(RULES, 8);
         for key in [1u32, 2] {
             let exchange = fence.open().unwrap();
@@ -230,9 +230,9 @@ fn a_fenced_reservation_ends_its_exchange_with_its_ending() {
         }
         drop(map);
         assert_eq!(
-            connection.is_cancelled(),
+            session.is_cancelled(),
             !ended,
-            "only a started exchange left without its ending closes the connection"
+            "only a started exchange left without its ending resets the session"
         );
     }
 }

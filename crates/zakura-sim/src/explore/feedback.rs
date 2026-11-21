@@ -68,7 +68,8 @@ pub const FEEDBACK_BACKEND: &str = "libfuzzer-extra-counters";
 /// - 4: adds fuzz-13's conformant crossing feature.
 /// - 5: adds the `over-rate` frame label, a metered row's frame past the
 ///   receiver's byte bucket.
-pub const FEEDBACK_VERSION: u32 = 5;
+/// - 6: adds header sync's reorg stages and the withdrawn obligation point.
+pub const FEEDBACK_VERSION: u32 = 6;
 
 /// How many features the counters hold: every [`Feature`] index.
 pub const FEATURES: usize = 1 << 16;

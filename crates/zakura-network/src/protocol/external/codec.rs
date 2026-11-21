@@ -26,6 +26,7 @@ use zakura_chain::{
     },
     transaction::Transaction,
 };
+use zakura_node_services::block_relay::AttemptChecksum;
 
 use zakura_node_services::block_memory::BlockHandle;
 
@@ -133,8 +134,11 @@ enum BodyDecodePanic {
 /// advertisement can also [`precompute`](Self::precompute) a checksum before peers request
 /// the block.
 ///
-/// A checksum is found by the block's hash. Bodies using this cache must come from committed
-/// state, or from trusted `submitblock` callers after semantic verification. Before contextual
+/// A checksum is found by the block's hash. Bodies using this cache come from committed
+/// state or from state-authorized early relay after their body commitments were checked.
+/// Trusted early submissions use [`Message::UncachedBlock`] instead, even when
+/// they later commit, and neither read nor populate this cache; they share a checksum
+/// only across sends of the same submission attempt. Before contextual
 /// verification checks `hashBlockCommitments`, different v5 authorization data can produce
 /// bodies with the same block hash and length, even when their proofs and signatures verify.
 /// Untrusted bodies served before that check must not use this cache: they could leave a
@@ -400,7 +404,7 @@ impl Encoder<Message> for Codec {
             P2pV2Upgrade(_) => crate::zakura::P2P_V2_UPGRADE_COMMAND_BYTES,
             Addr { .. } => b"addr\0\0\0\0\0\0\0\0",
             GetAddr => b"getaddr\0\0\0\0\0",
-            Block { .. } => BLOCK_COMMAND,
+            Block { .. } | UncachedBlock { .. } => BLOCK_COMMAND,
             GetBlocks { .. } => b"getblocks\0\0\0",
             Headers { .. } => b"headers\0\0\0\0\0",
             GetHeaders { .. } => b"getheaders\0\0",
@@ -415,6 +419,7 @@ impl Encoder<Message> for Codec {
         // copies it again at each step, which costs more than measuring it first. A block
         // that was sent before has its body length remembered with its checksum, so it is
         // serialized only once; every other message is measured first.
+        // Trusted early submission bodies never read or populate the shared cache.
         let block_hash = match &item {
             Message::Block(block) => Some(block.hash()),
             _ => None,
@@ -464,7 +469,16 @@ impl Encoder<Message> for Codec {
 
         // Production codecs cap bodies at `MAX_PROTOCOL_MESSAGE_LEN`, which fits in a u32.
         dst[start_len + 16..][..4].copy_from_slice(&(body_length as u32).to_le_bytes());
-        let checksum = self.body_checksum(block_hash, remembered, &dst[start_len + HEADER_LEN..]);
+        let attempt = match &item {
+            Message::UncachedBlock(_, attempt) => Some(attempt),
+            _ => None,
+        };
+        let checksum = self.body_checksum(
+            block_hash,
+            remembered,
+            attempt,
+            &dst[start_len + HEADER_LEN..],
+        );
         dst[start_len + 20..][..4].copy_from_slice(&checksum.0);
 
         Ok(())
@@ -489,12 +503,20 @@ impl Codec {
     ///
     /// A large block's remembered checksum is used when its body length matches. Otherwise
     /// the send shares any calculation already in progress, or hashes and remembers the body.
+    /// A temporary block bypasses the shared cache and shares a checksum only with
+    /// other sends of the same submission attempt.
     fn body_checksum(
         &self,
         block_hash: Option<block::Hash>,
         remembered: Option<(usize, sha256d::Checksum)>,
+        attempt: Option<&AttemptChecksum>,
         body: &[u8],
     ) -> sha256d::Checksum {
+        if body.len() >= MIN_SHARED_CHECKSUM_BODY_LEN {
+            if let Some(attempt) = attempt {
+                return attempt.get_or_compute(body, message_checksum);
+            }
+        }
         let hash = match block_hash {
             Some(hash) if body.len() >= MIN_SHARED_CHECKSUM_BODY_LEN => hash,
             _ => return message_checksum(body),
@@ -621,7 +643,9 @@ impl Codec {
                 v1_addrs.zcash_serialize(writer)?
             }
             Message::GetAddr => { /* Empty payload -- no-op */ }
-            Message::Block(block) => block.zcash_serialize(writer)?,
+            Message::Block(block) | Message::UncachedBlock(block, _) => {
+                block.zcash_serialize(writer)?
+            }
             Message::GetBlocks { known_blocks, stop } => {
                 writer.write_u32::<LittleEndian>(self.builder.version.0)?;
                 known_blocks.zcash_serialize(writer)?;

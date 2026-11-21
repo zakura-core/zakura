@@ -16,7 +16,10 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use zakura_node_services::block_memory::BlockHandle;
+use zakura_node_services::{
+    block_memory::BlockHandle,
+    block_relay::{PendingBlockSendPermit, ServedBlock},
+};
 
 use futures::{future::Either, prelude::*};
 use rand_10::{rng as thread_rng, seq::SliceRandom, RngExt};
@@ -56,6 +59,26 @@ use crate::{
 };
 
 use InventoryResponse::*;
+
+/// Choose the checksum from the body returned by lookup, retaining its write permission.
+fn legacy_block_message(
+    served: ServedBlock,
+) -> (Message, block::Hash, Option<PendingBlockSendPermit>) {
+    let ServedBlock {
+        block,
+        pending_send,
+    } = served;
+    let block = HashedBlock::from(block);
+    let hash = block.hash();
+    let message = match pending_send
+        .as_ref()
+        .and_then(PendingBlockSendPermit::attempt_checksum)
+    {
+        Some(checksum) => Message::UncachedBlock(block, checksum.clone()),
+        None => Message::Block(block),
+    };
+    (message, hash, pending_send)
+}
 
 mod peer_tx;
 
@@ -806,7 +829,7 @@ const COPIED_HEADER_BYTES: u64 =
 /// The decoded bytes a `block` or `tx` message retains while a handler holds it.
 fn decoded_payload_bytes(message: &Message) -> u64 {
     match message {
-        Message::Block(block) => block.decoded_bytes(),
+        Message::Block(block) | Message::UncachedBlock(block, _) => block.decoded_bytes(),
         Message::Tx(transaction) => transaction.transaction().retained_memory_size_bytes(),
         _ => 0,
     }
@@ -1303,17 +1326,29 @@ where
         )
         .increment(1);
 
-        let BlockAdvert { hash, push, result } = advert;
+        let BlockAdvert {
+            hash,
+            push,
+            result,
+            pending_send,
+        } = advert;
         let mut result = Some(result);
 
         if push {
             match self.advertised_block_body(hash).await {
                 Some(block) => {
+                    let (message, _, body_permit) = legacy_block_message(block);
+                    if matches!((&pending_send, &body_permit), (Some(advert), Some(body)) if advert != body)
+                    {
+                        // A newer attempt has replaced the body. It owns its own delivery.
+                        return;
+                    }
                     if !self
                         .send_advert_message(
-                            Message::Block(HashedBlock::from(block)),
+                            message,
                             hash,
                             &mut result,
+                            body_permit.or_else(|| pending_send.clone()),
                         )
                         .await
                     {
@@ -1333,7 +1368,10 @@ where
         }
 
         let inv = Message::Inv(vec![InventoryHash::Block(hash)]);
-        if self.send_advert_message(inv, hash, &mut result).await {
+        if self
+            .send_advert_message(inv, hash, &mut result, pending_send)
+            .await
+        {
             // Mark the write before reading the peer's next message, which can be its getdata.
             self.block_uploads.advertised(hash);
             self.gossip_trace.block_inv_sent(hash);
@@ -1365,6 +1403,7 @@ where
         msg: Message,
         hash: block::Hash,
         result: &mut Option<tokio::sync::oneshot::Sender<Result<(), BlockAdvertError>>>,
+        pending_send: Option<PendingBlockSendPermit>,
     ) -> bool {
         let address = self.connection_info.connected_addr.get_transient_addr();
         let version = self.connection_info.remote.version;
@@ -1372,20 +1411,34 @@ where
         let bans = &self.bans;
         let delivery = self
             .peer_tx
-            .send_authorized(msg, || {
-                version >= minimum.current()
-                    && !address.is_some_and(|addr| bans.contains(addr.ip()))
-            })
+            .send_authorized(
+                msg,
+                || {
+                    // Validation can withdraw the advert while writer readiness is pending.
+                    result.as_ref().is_some_and(|result| !result.is_closed())
+                        && version >= minimum.current()
+                        && !address.is_some_and(|addr| bans.contains(addr.ip()))
+                },
+                pending_send.clone(),
+            )
             .await;
         match delivery {
             Ok(true) => true,
             Ok(false) => {
                 debug!(
                     ?hash,
-                    "not advertising block: peer authorization was revoked"
+                    "not advertising block: cancelled or peer authorization revoked"
                 );
                 if let Some(result) = result.take() {
-                    let _ = result.send(Err(BlockAdvertError::AuthorizationRevoked));
+                    let error = if pending_send
+                        .as_ref()
+                        .is_some_and(|permit| permit.try_start_write(|| ()).is_none())
+                    {
+                        BlockAdvertError::SubmissionWithdrawn
+                    } else {
+                        BlockAdvertError::AuthorizationRevoked
+                    };
+                    let _ = result.send(Err(error));
                 }
                 false
             }
@@ -1404,7 +1457,7 @@ where
     ///
     /// The inbound service serves a mined block before it commits, and a relayed block from
     /// state. Returns `None` if the service fails, or no longer has the block.
-    async fn advertised_block_body(&mut self, hash: block::Hash) -> Option<BlockHandle> {
+    async fn advertised_block_body(&mut self, hash: block::Hash) -> Option<ServedBlock> {
         let request = Request::BlocksByHash(std::iter::once(hash).collect());
         // The inbound service has its own timeout layer.
         let response = self.svc.ready().await.ok()?.call(request).await.ok()?;
@@ -1412,7 +1465,7 @@ where
             return None;
         };
         let (block, _) = blocks.first()?.available()?;
-        Some(block.into_block())
+        Some(block.into_served())
     }
 
     /// Writes a warm-up ping and records it as awaiting its `pong`.
@@ -1730,6 +1783,7 @@ where
                     .map(Into::into),
             )
             .into(),
+            Message::UncachedBlock(..) => Unused,
             Message::Headers(_) => {
                 debug!(%msg, "got headers message unsolicited or from canceled request");
                 Unused
@@ -2145,12 +2199,24 @@ where
                 for block in blocks.into_iter() {
                     match block {
                         Available((block, _)) => {
-                            // The message hashes the block once, for the encoder and for us.
-                            let block = HashedBlock::from(block.into_block());
-                            let hash = block.hash();
-                            if let Err(e) = self.peer_tx.send(Message::Block(block)).await {
-                                self.fail_with(e).await;
-                                return;
+                            let (message, hash, pending_send) =
+                                legacy_block_message(block.into_served());
+                            match self
+                                .peer_tx
+                                .send_authorized(message, || true, pending_send)
+                                .await
+                            {
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    self.block_uploads.unavailable(hash);
+                                    self.gossip_trace.block_unavailable(hash);
+                                    missing_hashes.push(hash.into());
+                                    continue;
+                                }
+                                Err(error) => {
+                                    self.fail_with(error).await;
+                                    return;
+                                }
                             }
                             self.block_uploads.written(hash);
                             self.gossip_trace.block_sent(hash);

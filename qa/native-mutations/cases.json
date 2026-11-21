@@ -305,16 +305,6 @@
     "fault_class": "wakeup"
   },
   {
-    "patch": "submit-only-requested/stale-body-credits-current-owner/stale-body-credits-current-owner.patch",
-    "entry": "block-sync-table",
-    "property": "block-sync/s6v3/block/receiver-work-authorized",
-    "witness": {
-      "test": "the_stale_request_body_input_holds_receiver_work_authorized",
-      "test_target": "block_table"
-    },
-    "fault_class": "ownership"
-  },
-  {
     "patch": "submit-only-requested/competing-receipt-any-hash/competing-receipt-any-hash.patch",
     "entry": "block-sync-table",
     "property": "block-sync/s6v3/block/receiver-work-authorized",
@@ -458,42 +448,6 @@
       "planted": "qa/planted/block/decoded-retention/missing-admission.toml"
     },
     "fault_class": "resource-lifetime"
-  },
-  {
-    "patch": "discovery-machines/eviction-keeps-relay-attribution/eviction-keeps-relay-attribution.patch",
-    "entry": "discovery-machines",
-    "property": "discovery/record-book",
-    "witness": {
-      "planted": "qa/planted/discovery/record-book/skip-book-eviction.toml"
-    },
-    "fault_class": "resource-lifetime"
-  },
-  {
-    "patch": "discovery-machines/eviction-ignores-expiry/eviction-ignores-expiry.patch",
-    "entry": "discovery-machines",
-    "property": "discovery/record-book",
-    "witness": {
-      "planted": "qa/planted/discovery/record-book/skip-book-eviction.toml"
-    },
-    "fault_class": "resource-lifetime"
-  },
-  {
-    "patch": "discovery-machines/expired-record-keeps-ordering/expired-record-keeps-ordering.patch",
-    "entry": "discovery-machines",
-    "property": "discovery/record-book",
-    "witness": {
-      "planted": "qa/planted/discovery/record-book/skip-book-eviction.toml"
-    },
-    "fault_class": "stale-result"
-  },
-  {
-    "patch": "discovery-machines/replayed-record-keeps-confirmation/replayed-record-keeps-confirmation.patch",
-    "entry": "discovery-machines",
-    "property": "discovery/record-book",
-    "witness": {
-      "planted": "qa/planted/discovery/record-book/skip-book-eviction.toml"
-    },
-    "fault_class": "request-authorization"
   },
   {
     "patch": "discovery-machines/replacement-keeps-old-session/replacement-keeps-old-session.patch",

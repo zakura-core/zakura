@@ -1,29 +1,27 @@
 //! The `sync` seeds: `sync/wire`'s and `sync/storage`'s saved scenarios and
 //! curated combinations, each its tag and the empty Plan, the
-//! `sync/storage` seeds whose Plan is a fixed draw a search picked,
-//! zakura#2378's known failure, whose Plan a steered run records, and the
-//! `sync/composed` prefixes, each under the empty Plan.
+//! `sync/storage` seeds whose Plan a search finds or is a fixed draw a
+//! search picked, and the `sync/composed` prefixes, each under the empty
+//! Plan.
 
-use std::{collections::BTreeMap, sync::OnceLock};
+use std::sync::OnceLock;
 
-use super::{draws::byte_input, Seed, SeedSet};
+use super::{draws::byte_input, Seed};
 use crate::{
-    domain::{
-        cross::{BLOCK_REQUESTS_FOLLOW_HEADERS, HEADER_REORG_RETIRES_BLOCK_WORK},
-        session::STALLED_SERVICE_ISOLATED,
-    },
+    check::PropertyOutcome,
+    domain::cross::{BLOCK_REQUESTS_FOLLOW_HEADERS, HEADER_REORG_RETIRES_BLOCK_WORK},
+    explore::generate::{reach, ReachSearch},
     harness::{
-        run_steered,
+        self,
         sync::{SavedSync, SyncStorage},
         sync_wire::{
-            SavedWire, SyncComposed, SyncWire, COMBINED_TAG, CURATED, SYNC_COMPOSED_BYTES,
-            SYNC_COMPOSED_VERSION,
+            SavedWire, SyncComposed, SyncWire, CURATED, SYNC_COMPOSED_BYTES, SYNC_COMPOSED_VERSION,
         },
         Subsystem,
     },
     observe::BlockSyncFact,
     witness::Expect,
-    Category, Identity, NullSink, Observation, ObservationLog, Plan, Steer,
+    Observation, RunReport,
 };
 
 /// The test that runs the `sync/wire` seeds.
@@ -32,21 +30,67 @@ const WIRE: &str = "crates/zakura-sim/tests/sync_wire.rs";
 /// The test that runs the `sync/storage` seeds.
 const STORAGE: &str = "crates/zakura-sim/tests/sync_harness.rs";
 
-/// How many fuzz Plans the `sync/storage` searches drew from
+/// How many fuzz Plans the `reorg-verdict` search drew from
 /// [`super::draws::byte_inputs`], each up to [`SEARCH_PLAN_BYTES`] long.
 const SEARCH_CANDIDATES: usize = 64;
 
-/// The longest Plan the `sync/storage` searches drew.
+/// The longest Plan the `sync/storage` searches draw.
 const SEARCH_PLAN_BYTES: usize = 16_384;
 
+/// How many Plans [`reorg_stale_body`]'s search may run. It found its Plan
+/// within its first nine runs when this was set, so 256 leaves a wide
+/// margin.
+const STALE_BODY_RUNS: u64 = 256;
+
 /// `sync-storage-reorg-stale-body`'s full input: the saved `reorg`
-/// scenario under the first search candidate whose run delivers an
-/// old-epoch body after the sequencer applied the new epoch, which the
-/// sequencer refuses as stale. `accept-stale-scope-bodies.patch` buffers
-/// that body instead.
-fn reorg_stale_body() -> Vec<u8> {
-    let plan = byte_input(SEARCH_CANDIDATES, SEARCH_PLAN_BYTES, 7);
-    [&SavedSync::Reorg.tag()[..], &plan].concat()
+/// scenario under the first Plan a search finds whose run
+/// [`refuses_a_stale_body`]. `accept-stale-scope-bodies.patch` buffers that
+/// body instead.
+///
+/// The search runs on the unpatched build, so a production change that
+/// moves the old Plan off that order finds a new one instead of weakening
+/// the planted case. The first call runs it, and later calls in the process
+/// reuse its bytes.
+fn reorg_stale_body() -> &'static [u8] {
+    static INPUT: OnceLock<Vec<u8>> = OnceLock::new();
+    INPUT.get_or_init(|| {
+        let entry = harness::find(SyncStorage::NAME).expect("sync/storage is registered");
+        let search = ReachSearch {
+            prefix: SavedSync::Reorg.tag().to_vec(),
+            max_bytes: SEARCH_PLAN_BYTES,
+            steer: None,
+            ..ReachSearch::new(0, STALE_BODY_RUNS)
+        };
+        let reached = reach(entry, &search, refuses_a_stale_body).unwrap_or_else(|| {
+            panic!("no Plan of {STALE_BODY_RUNS} makes the sequencer refuse a stale body")
+        });
+        reached.input
+    })
+}
+
+/// Whether `report`'s run fills the stale-body input's role: it violates
+/// no property, applies [`HEADER_REORG_RETIRES_BLOCK_WORK`], and has the
+/// sequencer refuse a body of an older epoch than the one it applied.
+fn refuses_a_stale_body(report: &RunReport) -> Option<()> {
+    let violated = report.end.violation.is_some()
+        || report
+            .properties
+            .iter()
+            .any(|property| matches!(property.outcome, PropertyOutcome::Violated { .. }));
+    let applied = report.properties.iter().any(|property| {
+        property.property == HEADER_REORG_RETIRES_BLOCK_WORK
+            && matches!(property.outcome, PropertyOutcome::Held { applicable } if applicable > 0)
+    });
+    let refused = report.log.entries().iter().any(|entry| {
+        matches!(
+            &entry.obs,
+            Observation::BlockSync {
+                event: BlockSyncFact::StaleScope { body, scope_epoch },
+                ..
+            } if body.owner.body_work_epoch.zip(*scope_epoch).is_some_and(|(own, applied)| own < applied)
+        )
+    });
+    (!violated && applied && refused).then_some(())
 }
 
 /// `sync-storage-reorg-verdict-republish`'s full input: the saved
@@ -58,128 +102,6 @@ fn reorg_stale_body() -> Vec<u8> {
 fn reorg_verdict_republish() -> Vec<u8> {
     let plan = byte_input(SEARCH_CANDIDATES, SEARCH_PLAN_BYTES, 8);
     [&SavedSync::ReorgVerdict.tag()[..], &plan].concat()
-}
-
-/// `sync-wire-reset-mid-write`'s prefix: fuzz-13's combined actions `FB 14`,
-/// the fork while storage holds a submission, with every read stalled.
-const RESET_MID_WRITE_PREFIX: [u8; 2] = [COMBINED_TAG, 0b0001_0100];
-
-/// The [`xorshift_plan`] seed whose run under [`WriterLast`] reaches
-/// zakura#2378: the first of 200 a search tried that does.
-const RESET_MID_WRITE_SEED: u64 = 23;
-
-/// `sync-wire-reset-mid-write`'s full input, which reaches zakura#2378:
-/// [`RESET_MID_WRITE_PREFIX`], then the Plan bytes that replay, with no
-/// steer, the run of [`RESET_MID_WRITE_SEED`]'s Plan under [`WriterLast`].
-/// The steer is what reaches the reset: random Plans alone rarely leave a
-/// request mid-write when the fork's reset lands. The fork's tip reset then
-/// retires a block request while its frame is partly written, which cancels
-/// the whole block-sync session, and the writer fence closes the honest
-/// connection with `unfinished_exchange` while the session's other requests
-/// wait.
-///
-/// The steered run takes a few seconds, so the first call runs it and later
-/// calls in the process reuse its bytes.
-fn reset_mid_write() -> &'static [u8] {
-    static INPUT: OnceLock<Vec<u8>> = OnceLock::new();
-    INPUT.get_or_init(|| {
-        let scenario = SyncWire::draw(&RESET_MID_WRITE_PREFIX);
-        let ports = SyncWire::prepare(&scenario);
-        let input = Plan::from_fuzz(&xorshift_plan(RESET_MID_WRITE_SEED));
-        let steer = Box::new(WriterLast::default());
-        let (_, plan) = run_steered::<SyncWire>(&scenario, ports, input, &mut NullSink, steer)
-            .unwrap_or_else(|error| panic!("the steered zakura#2378 run fails: {error}"));
-        [&RESET_MID_WRITE_PREFIX[..], &plan].concat()
-    })
-}
-
-/// Seed `seed`'s Plan bytes: enough xorshift64 output that no `sync/wire`
-/// run exhausts it.
-fn xorshift_plan(seed: u64) -> Vec<u8> {
-    // An odd state is never zero, and xorshift64 never reaches zero from a
-    // nonzero state.
-    let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
-    (0..400_000)
-        .map(|_| {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            // Truncation keeps the low byte, which is all a byte needs.
-            state as u8
-        })
-        .collect()
-}
-
-/// A steer that picks each block request's writer last among the ready
-/// actions while its frame write is under way, as a slow thread would.
-/// Otherwise it lets the Plan pick.
-///
-/// A writer is the task whose step logged the request's `started` step, and
-/// its write is under way until the request's next step. Among the other
-/// ready actions, the steer takes the first that sorts after its previous
-/// pick, wrapping to the start.
-#[derive(Default)]
-struct WriterLast {
-    /// How many log entries the steer has read.
-    read: usize,
-    /// Each block request, as `(session, request)`, that started at the step
-    /// being read and has no writer yet.
-    started: Vec<(u64, u64)>,
-    /// Each block request whose write is under way, and its writer's name.
-    writing: BTreeMap<(u64, u64), String>,
-    /// The steer's previous pick.
-    last: Option<Identity>,
-}
-
-impl WriterLast {
-    /// Reads the log entries after the ones already read.
-    fn catch_up(&mut self, log: &ObservationLog) {
-        for entry in &log.entries()[self.read..] {
-            if let Some(task) = entry.obs.ran_task() {
-                for request in self.started.drain(..) {
-                    self.writing.insert(request, task.to_owned());
-                }
-            }
-            if let Observation::BlockSync {
-                event: BlockSyncFact::Request { owner, step, .. },
-                ..
-            } = &entry.obs
-            {
-                let request = (owner.session_id, owner.request_id);
-                if step == "started" {
-                    self.started.push(request);
-                } else {
-                    self.writing.remove(&request);
-                }
-            }
-        }
-        self.read = log.entries().len();
-    }
-}
-
-impl Steer for WriterLast {
-    /// The first ready action after the previous pick that isn't a writer
-    /// mid-write, if any writer is mid-write and ready.
-    fn pick(&mut self, options: &[Identity], log: &ObservationLog) -> Option<usize> {
-        self.catch_up(log);
-        let writing = |option: &Identity| {
-            option.category == Category::Task && self.writing.values().any(|w| *w == option.key)
-        };
-        if !options.iter().any(writing) {
-            return None;
-        }
-        let rest: Vec<usize> = (0..options.len())
-            .filter(|&index| !writing(&options[index]))
-            .collect();
-        let after_last = |&&index: &&usize| {
-            self.last.as_ref().is_none_or(|last| {
-                (options[index].category, &options[index].key) > (last.category, &last.key)
-            })
-        };
-        let index = *rest.iter().find(after_last).or(rest.first())?;
-        self.last = Some(options[index].clone());
-        Some(index)
-    }
 }
 
 /// A `sync/composed` prefix: two mirrors, the second dialed by the node,
@@ -268,11 +190,11 @@ pub(super) fn seeds() -> Vec<Seed> {
         witnessed(seed, saved.witnesses())
     });
     let searched = [
-        Seed::new(
+        Seed::built(
             "sync-storage-reorg-stale-body",
             SyncStorage::NAME,
             STORAGE,
-            reorg_stale_body(),
+            reorg_stale_body,
         )
         .witness(HEADER_REORG_RETIRES_BLOCK_WORK, Expect::Holds),
         Seed::new(
@@ -283,19 +205,9 @@ pub(super) fn seeds() -> Vec<Seed> {
         )
         .witness(BLOCK_REQUESTS_FOLLOW_HEADERS, Expect::Holds),
     ];
-    // zakura#2378 is open, so the seed fails by design.
-    let known_failure = Seed::built(
-        "sync-wire-reset-mid-write",
-        SyncWire::NAME,
-        WIRE,
-        reset_mid_write,
-    )
-    .witness(STALLED_SERVICE_ISOLATED, Expect::Violated)
-    .in_set(SeedSet::KnownFailure);
     wire.chain(curated)
         .chain(storage)
         .chain(searched)
-        .chain([known_failure])
         .chain(composed_seeds())
         .collect()
 }

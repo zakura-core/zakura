@@ -57,6 +57,21 @@ fn network() -> (TestNetwork, mpsc::UnboundedReceiver<Sent>) {
     (network, sent_rx)
 }
 
+/// A state that has every block except `announced`, so the announced block is downloaded and
+/// its parent needs no recovery.
+fn state_missing_only(
+    announced: block::Hash,
+) -> BoxCloneService<zs::Request, zs::Response, BoxError> {
+    BoxCloneService::new(service_fn(move |request| async move {
+        match request {
+            zs::Request::KnownBlock(hash) => Ok(zs::Response::KnownBlock(
+                (hash != announced).then_some(zs::KnownBlock::BestChain),
+            )),
+            request => panic!("unexpected state request: {request:?}"),
+        }
+    }))
+}
+
 fn body(bytes: &[u8]) -> Arc<Block> {
     bytes.zcash_deserialize_into().expect("valid block vector")
 }
@@ -183,15 +198,7 @@ async fn verification_can_commit_the_already_requested_copy_after_a_payload_reje
             commits.send((request, reply)).unwrap();
             async { decision.await.unwrap() }
         });
-        let state = service_fn(|request| async move {
-            Ok(match request {
-                zs::Request::AnyChainBlock(_) => zs::Response::Block(None),
-                zs::Request::KnownBlock(_) => {
-                    zs::Response::KnownBlock(Some(zs::KnownBlock::BestChain))
-                }
-                _ => panic!("unexpected state request"),
-            })
-        });
+        let state = state_missing_only(hash());
         let (mut tip_sender, tip, _) = zs::ChainTipSender::new(None, &Network::Mainnet);
         let reporter = crate::components::test_misbehavior::reporter();
         let mut downloads = Downloads::new(
@@ -586,15 +593,9 @@ async fn a_height_window_rejection_uses_the_retained_copy_once() {
             commits.send(block).unwrap();
             std::future::ready(Ok(hash))
         });
-        let state = service_fn(|request| async move {
-            Ok(match request {
-                zs::Request::AnyChainBlock(_) => zs::Response::Block(None),
-                zs::Request::KnownBlock(_) => {
-                    zs::Response::KnownBlock(Some(zs::KnownBlock::BestChain))
-                }
-                _ => panic!("unexpected state request"),
-            })
-        });
+        let other_body = body(bytes);
+        let hash = other_body.hash();
+        let state = state_missing_only(hash);
         let (mut tip_sender, tip) =
             super::tests::chain_tip_at(block::Height(initial_tip), block::Hash([1; 32]));
         let reporter = crate::components::test_misbehavior::reporter();
@@ -609,8 +610,6 @@ async fn a_height_window_rejection_uses_the_retained_copy_once() {
             Network::Mainnet,
         )
         .with_second_block_request(true);
-        let other_body = body(bytes);
-        let hash = other_body.hash();
         assert_eq!(
             downloads.download_and_verify(hash, None),
             DownloadAction::AddedToQueue

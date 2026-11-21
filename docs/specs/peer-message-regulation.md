@@ -911,7 +911,10 @@ header hashes expected by live ranges. A block that does not match the next expe
 one live range MUST retire the connection as a local incompatibility, without a peer-fault report or
 penalty. Height-only requests do not commit the publisher to the requester's chain. The receiver
 MUST retain the exchange fences until connection cleanup and requeue unreceived work. Local waits
-for decode or sequencer capacity MUST pause the ending deadline. Crediting local waits MUST NOT
+for decode or sequencer capacity MUST pause the ending deadline. After a range's last body, its
+ending deadline MUST first allow the floor-rate transfer time of the bodies that ready-order output
+can put before the ending: one per other running job, from ranges that still owe a body, at most
+`PEER_EXECUTION - 1` maximum-size bodies. Crediting local waits MUST NOT
 release reservations or excuse a withheld ending while the reader remains active. It SHOULD briefly
 avoid this supplier for the still-wanted unreceived bodies in every live exchange, including across
 reconnects, without delaying other suppliers. Invalid framing, excess response bytes, and invalid

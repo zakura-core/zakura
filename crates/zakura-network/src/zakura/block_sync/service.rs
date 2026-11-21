@@ -8,10 +8,11 @@ use super::{
     wire::*, *,
 };
 use crate::zakura::{
-    handle_pipe_exit, spawn_supervised_pipe, BudgetError, FramedRecv, FramedSend, LocalRole,
-    OrderedSendError, Peer, PeerStreamSession, ReactorBudget, Service, ServicePeerSnapshot,
-    SessionDemand, SessionOpening, SessionPolicy, SinkReject, Stream, StreamQueueDepths,
-    ZakuraBlockSyncCandidateState, ZakuraConnId, ZakuraPeerId, FRAME_HEADER_BYTES,
+    handle_pipe_exit, spawn_supervised_pipe, BudgetError, CloseOutcome, FramedRecv, FramedSend,
+    LocalRole, NeutralCause, OrderedSendError, Peer, PeerStreamSession, ReactorBudget, Service,
+    ServicePeerSnapshot, SessionDemand, SessionOpening, SessionPolicy, SinkReject, Stream,
+    StreamQueueDepths, ZakuraBlockSyncCandidateState, ZakuraConnId, ZakuraPeerId,
+    FRAME_HEADER_BYTES,
 };
 
 /// Maximum frame bytes for one stream-6 body frame plus protocol framing.
@@ -735,7 +736,10 @@ impl Service for BlockSyncService {
                 && (peer.negotiated & ZAKURA_CAP_BLOCK_SYNC_REGULATED == 0
                     || send.max_capacity() < 2))
         {
-            peer.close_cause().record("block_sync_regulation_contract");
+            peer.close_cause().record(CloseOutcome::neutral(
+                NeutralCause::IncompatibleConfiguration,
+                "block_sync_regulation_contract",
+            ));
             peer.cancel_token().cancel();
             return;
         }
@@ -841,36 +845,26 @@ impl Service for BlockSyncService {
                         SessionAdmission::Readmitted { generation } => (generation, true),
                         SessionAdmission::Fresh { generation } => (generation, false),
                     };
-                    let fence = crate::zakura::regulation::WriterFence::new(
-                        connection_cancel_token.clone(),
-                        close_cause.clone(),
-                    );
+                    let fence =
+                        crate::zakura::regulation::WriterFence::new(service_cancel_token.clone());
                     (Some((wiring, generation, fence)), readmitted)
                 }
                 None => (None, false),
             };
-            if let Some((wiring, generation, fence)) = &routine {
-                use crate::zakura::regulation::{Current, Replacement, SessionKey};
-                if matches!(
-                    self.inner.requester_sessions.replace(
-                        peer_id.clone(),
-                        Current {
-                            key: SessionKey {
-                                conn_id,
-                                session_id
-                            },
-                            cancel: service_cancel_token.clone(),
-                            fence: fence.clone(),
-                            session: (),
-                        }
-                    ),
-                    Replacement::Refused
-                ) {
-                    // No session owns this admission. The kept session's
-                    // disconnect removes the closed entry.
-                    wiring.registry.close_session(&peer_id, *generation);
-                    return;
-                }
+            if let Some((_, _, fence)) = &routine {
+                use crate::zakura::regulation::{Current, SessionKey};
+                self.inner.requester_sessions.replace(
+                    peer_id.clone(),
+                    Current {
+                        key: SessionKey {
+                            conn_id,
+                            session_id,
+                        },
+                        cancel: service_cancel_token.clone(),
+                        fence: fence.clone(),
+                        session: (),
+                    },
+                );
                 block_sync_session.status_sender = Some(
                     self.inner
                         .status_senders
@@ -942,7 +936,7 @@ impl Service for BlockSyncService {
             let connection_cancel_token = connection_cancel_token.clone();
             let close_cause = close_cause.clone();
             move || {
-                close_cause.record("service_panic");
+                close_cause.record(CloseOutcome::SERVICE_PANIC);
                 connection_cancel_token.cancel();
             }
         };
@@ -977,6 +971,10 @@ impl Service for BlockSyncService {
                         let requester = super::regulated::live_requester::LiveRequester::new(
                             wiring.request_pool,
                             fence,
+                            crate::zakura::regulation::StallClose::new(
+                                connection_cancel_token.clone(),
+                                close_cause.clone(),
+                            ),
                             &recv,
                             block_sync_session.request_sender(),
                         );
@@ -1012,7 +1010,16 @@ impl Service for BlockSyncService {
                     }
                     None => drain_inbound(recv, run_cancel).await,
                 };
-                handle_pipe_exit("block-sync", &connection_cancel_token, &close_cause, result);
+                handle_pipe_exit(
+                    "block-sync",
+                    (
+                        ZAKURA_STREAM_BLOCK_SYNC,
+                        ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
+                    ),
+                    &connection_cancel_token,
+                    &close_cause,
+                    result,
+                );
             }
         };
         // Let the returned handle drop to detach the supervised task (like
@@ -1170,10 +1177,7 @@ impl BlockSyncService {
 #[cfg(all(test, not(zakura_sim)))]
 mod requester_session_tests {
     use super::*;
-    use crate::zakura::{
-        regulation::{Current, SessionKey, WriterFence},
-        CloseCause,
-    };
+    use crate::zakura::regulation::{Current, SessionKey, WriterFence};
 
     fn with_session_slots(inbound: usize, outbound: usize) -> ZakuraBlockSyncConfig {
         let mut config = ZakuraBlockSyncConfig::default();
@@ -1242,8 +1246,8 @@ mod requester_session_tests {
             .expect("valid block-sync config");
         let peer = ZakuraPeerId::new(vec![41; 32]).unwrap();
         let connection = CancellationToken::new();
-        let cancel = CancellationToken::new();
-        let fence = WriterFence::new(connection.clone(), CloseCause::default());
+        let cancel = connection.child_token();
+        let fence = WriterFence::new(cancel.clone());
         let exchange = fence.open().unwrap();
         let writer = exchange.writer();
         assert!(writer.publish(|| {}));
@@ -1273,16 +1277,16 @@ mod requester_session_tests {
         service.remove_peer(&peer, 6);
         assert!(service.inner.requester_sessions.get(&peer).is_some());
         assert!(
-            !connection.is_cancelled(),
+            !cancel.is_cancelled(),
             "stale removal leaves the current fence open"
         );
         service.remove_peer(&peer, 7);
         assert!(service.inner.requester_sessions.get(&peer).is_none());
         assert!(
-            connection.is_cancelled(),
-            "removal fences the unanswered written exchange"
+            cancel.is_cancelled(),
+            "removal resets the session with the unanswered written exchange"
         );
-        assert!(cancel.is_cancelled());
+        assert!(!connection.is_cancelled(), "the reset keeps the connection");
         assert!(fence.open().is_none());
     }
 
@@ -1338,81 +1342,6 @@ mod requester_session_tests {
             next_event(&mut events).await,
             BlockSyncEvent::PeerConnected(session) if session.peer_id() == &peer
         ));
-    }
-
-    /// A same-connection replacement refused because the old session has a
-    /// started exchange closes the connection and keeps the old record. The
-    /// replacement's unused registry generation must not outlive the old
-    /// session's disconnect.
-    #[tokio::test]
-    async fn a_refused_replacement_leaves_no_registry_entry_after_the_old_session_ends() {
-        let mut relayed =
-            super::super::tests::RelayedBlockSync::spawn(ZakuraBlockSyncConfig::default());
-        let service = &relayed.service;
-        let wiring = service.inner.routine_wiring.as_ref().unwrap();
-        let peer = ZakuraPeerId::new(vec![44; 32]).unwrap();
-        let (conn_id, session_id) = (7, 3);
-        let generation = wiring
-            .registry
-            .admit_session(
-                &peer,
-                ServicePeerDirection::Outbound,
-                &wiring.config,
-                conn_id,
-                Instant::now(),
-            )
-            .generation();
-        let connection = CancellationToken::new();
-        let fence = WriterFence::new(connection.clone(), CloseCause::default());
-        let exchange = fence.open().unwrap();
-        let writer = exchange.writer();
-        assert!(writer.publish(|| {}));
-        assert!(writer.try_start(|| true));
-        let cancel = CancellationToken::new();
-        service.inner.requester_sessions.replace(
-            peer.clone(),
-            Current {
-                key: SessionKey {
-                    conn_id,
-                    session_id,
-                },
-                cancel: cancel.clone(),
-                fence,
-                session: (),
-            },
-        );
-        service.inner.active_peers.lock().unwrap().insert(
-            peer.clone(),
-            BlockSyncPeerRecord {
-                conn_id,
-                session_id,
-                direction: ServicePeerDirection::Outbound,
-                cancel_token: cancel,
-                generation: Some(generation),
-            },
-        );
-
-        let _stream = relayed.add_outbound(conn_id, &peer);
-        assert!(
-            connection.is_cancelled(),
-            "the started exchange closes the connection"
-        );
-        assert_eq!(
-            service.inner.active_peers.lock().unwrap()[&peer].session_id,
-            session_id,
-            "the old record stays until its teardown",
-        );
-
-        // The old session's teardown queues the first lifecycle event, since the
-        // refused replacement queued no connect.
-        service.inner.finish_session(&peer, conn_id, session_id);
-        let disconnect = relayed.next_event().await;
-        assert!(matches!(&disconnect, BlockSyncEvent::PeerDisconnected(gone) if gone == &peer));
-        assert_eq!(relayed.relay(disconnect).await, 0);
-        assert!(
-            !relayed.has_entry(&peer),
-            "the refused replacement's generation must not outlive the old session",
-        );
     }
 }
 

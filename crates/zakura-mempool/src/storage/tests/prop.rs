@@ -335,7 +335,7 @@ proptest! {
 }
 
 proptest! {
-    /// Block conflicts follow the current owner after removal and clearing.
+    /// Block conflicts follow the current owner after removal and after draining the pool.
     #[test]
     fn block_conflicts_follow_current_spend_owners(input in any::<SpendConflictTestInput>()) {
         let (first, second) = input.conflicting_transactions();
@@ -361,8 +361,11 @@ proptest! {
         prop_assert_eq!(removed.dropped, vec![(second_id, RemovalReason::Conflicted)]);
         prop_assert_eq!(storage.transaction_count(), 0);
 
-        storage.take_all();
+        // Drain a pool that still holds `second`, so `take_all` must drop its spend owners.
         storage.clear_rejections();
+        storage.insert(second.clone(), Vec::new(), None, crate::Instant::now(), chrono::Utc::now()).unwrap();
+        let drained: Vec<_> = storage.take_all().into_iter().map(|tx| tx.transaction.id()).collect();
+        prop_assert_eq!(drained, vec![second_id]);
         storage.insert(first, Vec::new(), None, crate::Instant::now(), chrono::Utc::now()).unwrap();
         let removed = storage.connect_block(
             &[second_id.mined_id()],

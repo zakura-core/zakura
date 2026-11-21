@@ -99,6 +99,13 @@ class CleanupTests(unittest.TestCase):
                          {("target", "a/target", "disk"), ("target", "b/target", "disk")})
         self.assertTrue((self.root / "c" / "target").exists())
 
+    def test_a_resumed_campaign_keeps_its_old_builds(self):
+        resumed = store(self.root / "fuzz" / "resumed", 10)
+        make(resumed / "runs" / "r2", 0.5)
+        store(self.root / "fuzz" / "idle", 10)
+        self.assertEqual(self.run_cleanup(), {("builds", "fuzz/idle/builds", "age")})
+        self.assertTrue((resumed / "builds").exists())
+
     def test_a_dry_run_deletes_nothing(self):
         target(self.root / "old" / "target", 5)
         self.assertEqual(self.run_cleanup(dry_run=True), {("target", "old/target", "age")})

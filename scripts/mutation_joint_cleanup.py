@@ -17,7 +17,10 @@ It keeps every `--keep` path, and each `--state`'s cumulative reports,
 whole, because `sim-campaign verify` reads the build of every run a store
 records.
 
-A directory is old when nothing under it changed for `--max-age-days`. The
+A directory is old when nothing under it changed for `--max-age-days`. A
+`builds/` directory counts as changed when anything in its store changed,
+because a resumed campaign writes to its store but never to its old builds,
+and still needs them. The
 cleanup deletes every old directory. If the disk is then fuller than
 `--disk-limit` percent, it deletes the remaining directories, least recently
 changed first, until the disk is below the limit. It never deletes a
@@ -123,6 +126,8 @@ def cleanup(roots, states, keep, max_age_days, disk_limit, busy_hours, dry_run=F
     entries = []
     for kind, path in candidates(roots, states, keep):
         newest, size = scan(path)
+        if kind == "builds":
+            newest = max(newest, scan(os.path.dirname(path))[0])
         entries.append({"kind": kind, "path": path, "age_days": (now - newest) / 86400, "bytes": size})
     entries.sort(key=lambda entry: -entry["age_days"])
     deleted = []

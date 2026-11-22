@@ -232,13 +232,14 @@ pub struct SignatureError;
 
 /// A node's Ed25519 secret seed (ID-3).
 ///
-/// It holds the seed, the public keys derived from it and the credential
-/// that names the node, and zeroizes the seed on drop. The seed derives both
-/// the Ed25519 key (ID-4) and the ML-DSA-44 key (ID-13).
-/// [`sign`](Self::sign) expands the seed for each signature, and `ring` does
-/// not zeroize that expanded key when the call returns; the ML-DSA signing
-/// key is regenerated for each signature and wiped after. `Debug` and `Display`
-/// never show the seed, and it has no `Serialize` impl.
+/// It holds the seed, the ML-DSA-44 seed derived from it, the public keys
+/// and the credential that names the node, and zeroizes both seeds on drop.
+/// The seed derives both the Ed25519 key (ID-4) and the ML-DSA-44 key
+/// (ID-13). [`sign`](Self::sign) expands the seed for each signature, and
+/// `ring` does not zeroize that expanded key when the call returns; the
+/// ML-DSA signing key is regenerated for each signature, and ID-13 lists the
+/// copies `libcrux-ml-dsa` leaves unwiped. `Debug` and `Display` never show
+/// the seed, and it has no `Serialize` impl.
 #[derive(Clone)]
 pub struct NodeSecretKey {
     seed: [u8; KEY_LENGTH],

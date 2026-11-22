@@ -80,10 +80,11 @@ pub(crate) async fn regtest_coinbase() -> eyre::Result<()> {
 /// The block must be accepted by the production `submitblock`, consensus, and state path,
 /// with exactly one commitment in its coinbase.
 pub(crate) async fn regtest_coinbase_names_the_gateway() -> eyre::Result<()> {
-    // RFC 8032 section 7.1, test 1: a secret key, and its public key, which is the node ID.
+    // RFC 8032 section 7.1, test 1, as the node's secret key. The node ID is the hash of
+    // the key list that seed derives: its Ed25519 public key and its ML-DSA-44 key.
     const NODE_SECRET_KEY: &str =
         "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60";
-    const NODE_ID: &str = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
+    const NODE_ID: &str = "78333d017dc319f798578d82bcdafb434f582cf38b98bc85e4b17bfde89a4c53";
 
     let _init_guard = zakura_test::init();
     let net = Network::new_regtest(Default::default());

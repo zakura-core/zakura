@@ -38,6 +38,7 @@ pub mod history_tree;
 pub mod ironwood;
 pub mod local_genesis;
 mod memory;
+pub mod miner_mesh;
 pub mod orchard;
 pub mod parallel;
 pub mod parameters;

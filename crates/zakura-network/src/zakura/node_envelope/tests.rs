@@ -186,8 +186,8 @@ fn the_default_envelope_sums_the_reactor_shares() {
         envelope.transport_bytes,
         102 * u128::from(74_836_259_u64 + 180_310_523) + u128::from(288 * 20 * MIB)
     );
-    // 102 × 141_945_123 + 32 × 64 MiB + 256 MiB.
-    assert_eq!(envelope.quic_bytes_ 16_894_321_650);
+    // 102 × 141,945,123 + 32 × 64 MiB + 256 MiB.
+    assert_eq!(envelope.quic_bytes, 16_894_321_650);
 }
 
 /// A custom stream kind takes the `other` share on a live connection, so the peer

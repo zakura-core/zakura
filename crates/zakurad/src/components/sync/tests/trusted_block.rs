@@ -686,6 +686,24 @@ async fn faulty_trusted_block_bans_relay_and_closes_connections_then_valid_retry
     let receiver = Node::new(Some(relay.p2p)).await;
     relay.connected().await;
     receiver.connected().await;
+    // Let the receiver select the relay as its download source before adding another peer.
+    relay.hold_body.send_replace(true);
+    let valid = relay.template().await;
+    let invalid = faulty_body(&valid);
+    relay.gate.hold();
+    let submission = tokio::spawn(submit(
+        relay.rpc,
+        relay.auth.clone(),
+        invalid.zcash_serialize_to_vec().unwrap(),
+        true,
+    ));
+    assert_eq!(relay.gate.entered().await, invalid.hash());
+    assert_eq!(
+        timeout(Duration::from_secs(20), relay.body_requests.recv())
+            .await
+            .unwrap(),
+        Some(invalid.hash())
+    );
     // This second real socket shares the relay's IP. The ban must close it as well.
     let observer = zakura_network::connect_isolated_with_inbound(
         &receiver.network,
@@ -701,21 +719,18 @@ async fn faulty_trusted_block_bans_relay_and_closes_connections_then_valid_retry
         .oneshot(Request::Ping(zakura_network::types::Nonce(123)))
         .await
         .expect("the observer connection is live before the ban");
-    let valid = relay.template().await;
-    let invalid = faulty_body(&valid);
-    relay.gate.hold();
-    let submission = tokio::spawn(submit(
-        relay.rpc,
-        relay.auth.clone(),
-        invalid.zcash_serialize_to_vec().unwrap(),
-        true,
-    ));
-    assert_eq!(relay.gate.entered().await, invalid.hash());
+    relay.hold_body.send_replace(false);
     timeout(Duration::from_secs(20), async {
         while !receiver.bans.is_banned(relay.p2p.ip()) {
-            // Poll the production inbound service while its download completes.
-            let _ = observer.clone().oneshot(Request::Peers).await;
-            tokio::task::yield_now().await;
+            // Serving genesis polls the receiver's inbound service, which collects completed
+            // downloads and applies their bans. Address discovery may withhold a response.
+            let _ = observer
+                .clone()
+                .oneshot(Request::BlocksByHash(
+                    [receiver.network.genesis_hash()].into_iter().collect(),
+                ))
+                .await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
@@ -725,7 +740,12 @@ async fn faulty_trusted_block_bans_relay_and_closes_connections_then_valid_retry
     assert!(!submission.is_finished());
     timeout(Duration::from_secs(10), async {
         loop {
-            if observer.clone().oneshot(Request::Peers).await.is_err() {
+            if observer
+                .clone()
+                .oneshot(Request::Ping(zakura_network::types::Nonce(456)))
+                .await
+                .is_err()
+            {
                 break;
             }
             tokio::task::yield_now().await;

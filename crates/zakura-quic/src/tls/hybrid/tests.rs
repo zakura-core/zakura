@@ -304,6 +304,14 @@ fn the_group_is_x25519mlkem768_for_tls13_only() {
     assert!(group.start().unwrap().ffdhe_group().is_none());
 }
 
+/// The metric labels are rustls' names for the groups, which operators
+/// match on (OBS-1).
+#[test]
+fn the_group_labels_are_rustls_names() {
+    assert_eq!(NamedGroup::X25519MLKEM768.as_str(), Some(HYBRID_LABEL));
+    assert_eq!(NamedGroup::X25519.as_str(), Some(X25519_LABEL));
+}
+
 /// When ML-KEM's random source fails, neither side produces a share.
 #[test]
 fn a_failed_random_source_fails_the_exchange() {

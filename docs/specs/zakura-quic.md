@@ -1,6 +1,6 @@
 # Spec: `zakura-quic` transport
 
-Status: draft for review, 2026-11-21. Version 0.26.
+Status: draft for review, 2026-11-22. Version 0.27.
 This document is authoritative for the `zakura-quic` crate, its configuration,
 its wire behavior and its `quinn-proto` dependency policy.
 [Decision 0003](../decisions/zakura/0003-zakura-quic-transport.md) records the
@@ -61,7 +61,9 @@ it adds ID-8 to ID-12, changes ID-1, ID-2, ID-4, ID-7, TLS-3, TLS-4, TLS-7
 to TLS-9, ADM-9, WIRE-2, API-1, API-4, CTRL-26 and §13, and §17w lists each
 change. Version 0.26 signs every handshake with a composite of Ed25519 and
 ML-DSA-44; it adds ID-13, changes DEP-2, ID-8, ID-11, ID-12, TLS-4, API-1
-and §16, and §17x lists each change.
+and §16, and §17x lists each change. Version 0.27 counts the key exchanges
+a node completes by group and the handshake signatures it verifies by
+scheme; it changes OBS-1, OBS-2 and §16, and §17y lists each change.
 
 ## 0. Conventions
 
@@ -943,6 +945,8 @@ These are not configurable. Changing one needs a spec change.
 | `zakura.quic.incoming.accepted` / `.refused` / `.retried` / `.ignored` | counter | ADM-2 outcomes, one per `Incoming` (ADM-1) |
 | `zakura.quic.handshake.completed` / `.failed` / `.timed_out` | counter | Handshake results |
 | `zakura.quic.handshake.duration_seconds` | histogram | Accept or dial to handshake complete |
+| `zakura.quic.tls.key_exchange` | counter | TLS key exchanges completed, labelled `group` with rustls' name for the group: `X25519MLKEM768` (TLS-9), or `X25519` for the hybrid's classical half, which a production endpoint never completes. An exchange completes before the peer is authenticated, so its handshake can still fail |
+| `zakura.quic.tls.signature_verified` | counter | Peer handshake signatures verified, labelled `scheme`: `ed25519_mldsa44` for the TLS-4 composite, counted once both halves verify |
 | `zakura.quic.connections` | gauge | Open connections |
 | `zakura.quic.connections.held` | gauge | ADM-12 live slots held: handshakes, dial attempts and open connections |
 | `zakura.quic.connections.closing` | gauge | ADM-13 closed connections not yet drained |
@@ -956,7 +960,8 @@ These are not configurable. Changing one needs a spec change.
 | `zakura.quic.path.cwnd_bytes` | histogram | Sampled every 10 s per connection |
 
 - **OBS-2.** Metrics MUST NOT carry per-peer labels. Per-connection detail goes
-  to OBS-3.
+  to OBS-3. A label value comes from a fixed set this node names, never from
+  bytes a peer sent.
 - **OBS-3.** When `[network.zakura] trace_dir` is set, Zakura MUST write one
   `quic_conn` JSONL row per connection every 10 s and on close. The endpoint
   delivers each sample to a `ConnObserver` callback, because `zakura-quic`
@@ -1328,6 +1333,7 @@ this release tolerates, and keep each hard change explicit.
 | Congestion controller is Cubic when unset | CTRL-3 |
 | Stats report the controller, driver and socket counters | OBS-4, OBS-12 |
 | Metrics presence and no per-peer labels | OBS-1, OBS-2 |
+| Each side of a loopback handshake, on its own thread and recorder, counts one `X25519MLKEM768` key exchange and one `ed25519_mldsa44` signature and no other group or scheme; the group labels are rustls' names | OBS-1, TLS-4, TLS-9 |
 | Shutdown order and the 3 s bound; drop without `shutdown` frees the port | API-7 |
 | The focused `zakura-network` tests and the full workspace suite with Iroh deleted | No regression |
 | Fleet throughput: one 1 GiB transfer and 64 concurrent streams match or beat the noq build in throughput, at no more CPU per GB | G7, PLAN §8 |
@@ -1968,3 +1974,23 @@ Changed:
 - **ID-11.** A credential without both keys can't be authenticated.
 - **§16.** Adds the composite's known answers, its refusals and the
   first-flight bound.
+
+## 17y. Changes in version 0.27
+
+Nothing showed which key exchange or signature a node's handshakes used, so
+a node that fell back to classical cryptography, or a test network that
+never reached the post-quantum code, looked the same as one that did. Two
+counters now record each at the point it happens, and the Regtest end-to-end
+run asserts them on every node that speaks P2P v2 (the node that upgrades
+from the legacy protocol when its upgrade is required or live).
+
+Changed:
+
+- **OBS-1.** Adds `zakura.quic.tls.key_exchange`, labelled `group`, counted
+  when the hybrid group completes an exchange in either role, or the
+  dialer's X25519 half does on its fallback path, and `zakura.quic.tls.signature_verified`, labelled `scheme`, counted
+  when a peer's composite handshake signature verifies. Refused exchanges
+  and signatures aren't counted; `zakura.quic.handshake.failed` covers them.
+- **OBS-2.** States that a label value comes from this node's own fixed set,
+  which both new labels follow.
+- **§16.** Adds the row for the two counters on each side of a handshake.

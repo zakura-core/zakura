@@ -20,7 +20,7 @@ use rustls::{
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 
 use crate::{
-    composite::{self, COMPOSITE_SCHEME, ML_DSA_44_KEY_TAG},
+    composite::{self, COMPOSITE_SCHEME, COMPOSITE_SCHEME_LABEL, ML_DSA_44_KEY_TAG},
     credential::NodeCredential,
     key::NodeId,
 };
@@ -196,6 +196,8 @@ fn verify_signature(
     };
     composite::verify(&ed25519, ml_dsa, message, dss.signature())
         .map_err(|_| rustls::Error::InvalidCertificate(CertificateError::BadSignature))?;
+    metrics::counter!("zakura.quic.tls.signature_verified", "scheme" => COMPOSITE_SCHEME_LABEL)
+        .increment(1);
     Ok(HandshakeSignatureValid::assertion())
 }
 

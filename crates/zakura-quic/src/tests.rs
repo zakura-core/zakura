@@ -1,7 +1,7 @@
 //! Endpoint conformance tests (SPEC §16).
 
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -272,6 +272,172 @@ async fn dial_authenticates_both_sides_and_echoes() {
     })
     .await
     .unwrap();
+}
+
+/// The counters one thread wrote, by name and labels.
+#[derive(Clone, Default)]
+struct Counters(Arc<Mutex<BTreeMap<String, u64>>>);
+
+impl Counters {
+    /// Every series of counter `name`, keyed `name{label="value",...}`.
+    fn series(&self, name: &str) -> BTreeMap<String, u64> {
+        let prefix = format!("{name}{{");
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(key, _)| key.starts_with(&prefix))
+            .map(|(key, value)| (key.clone(), *value))
+            .collect()
+    }
+}
+
+/// One counter series in [`Counters`].
+struct CounterSeries {
+    key: String,
+    values: Arc<Mutex<BTreeMap<String, u64>>>,
+}
+
+impl metrics::CounterFn for CounterSeries {
+    fn increment(&self, value: u64) {
+        *self
+            .values
+            .lock()
+            .unwrap()
+            .entry(self.key.clone())
+            .or_default() += value;
+    }
+
+    fn absolute(&self, value: u64) {
+        self.values.lock().unwrap().insert(self.key.clone(), value);
+    }
+}
+
+impl metrics::Recorder for Counters {
+    fn describe_counter(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+
+    fn describe_gauge(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+
+    fn describe_histogram(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+
+    fn register_counter(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Counter {
+        let labels: Vec<String> = key
+            .labels()
+            .map(|label| format!("{}=\"{}\"", label.key(), label.value()))
+            .collect();
+        metrics::Counter::from_arc(Arc::new(CounterSeries {
+            key: format!("{}{{{}}}", key.name(), labels.join(",")),
+            values: self.0.clone(),
+        }))
+    }
+
+    fn register_gauge(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+        metrics::Gauge::noop()
+    }
+
+    fn register_histogram(
+        &self,
+        _: &metrics::Key,
+        _: &metrics::Metadata<'_>,
+    ) -> metrics::Histogram {
+        metrics::Histogram::noop()
+    }
+}
+
+/// Asserts that one side of a handshake counted exactly one hybrid key
+/// exchange and one composite signature, and no other group or scheme.
+fn assert_counted_one_post_quantum_handshake(side: &str, counters: &Counters) {
+    assert_eq!(
+        counters.series("zakura.quic.tls.key_exchange"),
+        BTreeMap::from([(
+            r#"zakura.quic.tls.key_exchange{group="X25519MLKEM768"}"#.to_string(),
+            1
+        )]),
+        "{side} key exchanges"
+    );
+    assert_verified_signatures(side, counters, 1);
+}
+
+/// Checks the total for the composite scheme and that no other scheme was counted.
+fn assert_verified_signatures(side: &str, counters: &Counters, expected: u64) {
+    assert_eq!(
+        counters.series("zakura.quic.tls.signature_verified"),
+        BTreeMap::from([(
+            r#"zakura.quic.tls.signature_verified{scheme="ed25519_mldsa44"}"#.to_string(),
+            expected
+        )]),
+        "{side} verified signatures"
+    );
+}
+
+/// OBS-1, TLS-4, TLS-9: each side of a handshake counts its hybrid key
+/// exchange and the peer's composite signature it verified. The listener
+/// runs on its own thread and runtime, so each side's thread-local recorder
+/// sees only that side.
+#[tokio::test]
+async fn each_side_counts_its_key_exchange_group_and_verified_signature_scheme() {
+    let dialer = Counters::default();
+    let _recording = metrics::set_default_local_recorder(&dialer);
+    let listener = Counters::default();
+    let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
+    let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+    let listener_thread = std::thread::spawn({
+        let listener = listener.clone();
+        move || {
+            let _recording = metrics::set_default_local_recorder(&listener);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let mut server = server();
+                addr_tx.send(server.addr()).unwrap();
+                let inbound = tokio::time::timeout(TEST_TIMEOUT, server.handled.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                accepted_tx.send(()).unwrap();
+                // Keep the connection until the dialer has read its counters.
+                let _ = tokio::time::timeout(TEST_TIMEOUT, done_rx).await;
+                drop(inbound);
+            });
+        }
+    });
+
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let client = client();
+        let conn = client
+            .connect(addr_rx.await.unwrap(), &[ALPN])
+            .await
+            .unwrap();
+        accepted_rx.await.unwrap();
+        assert_counted_one_post_quantum_handshake("dialer", &dialer);
+        assert_counted_one_post_quantum_handshake("listener", &listener);
+        drop(conn);
+    })
+    .await
+    .unwrap();
+    let _ = done_tx.send(());
+    listener_thread.join().unwrap();
 }
 
 /// Both ends of a connection read the same shared ID, and a second
@@ -2024,6 +2190,8 @@ async fn assert_dial_refused(
 /// the signature.
 #[tokio::test]
 async fn client_presenting_a_key_it_cannot_sign_for_is_refused() {
+    let counters = Counters::default();
+    let _recording = metrics::set_default_local_recorder(&counters);
     tokio::time::timeout(TEST_TIMEOUT, async {
         let mut server = server();
         let victim = Arc::new(NodeSecretKey::generate());
@@ -2056,6 +2224,10 @@ async fn client_presenting_a_key_it_cannot_sign_for_is_refused() {
         assert_dial_refused(&mut server, &victim, foreign_ed25519).await;
         assert_dial_refused(&mut server, &victim, truncated).await;
 
+        // Both endpoints run on this thread. On each refused dial, only the
+        // client verified its peer's signature.
+        assert_verified_signatures("after four refused dials", &counters, 4);
+
         let v5 = victim.clone();
         dial_as(&server, &victim, move |m| {
             v5.sign_composite(m, [1; 32]).unwrap()
@@ -2064,6 +2236,8 @@ async fn client_presenting_a_key_it_cannot_sign_for_is_refused() {
         .unwrap();
         let inbound = server.handled.recv().await.unwrap();
         assert_eq!(inbound.remote_id(), victim.public());
+        // On the successful dial both endpoints verified their peer.
+        assert_verified_signatures("after the successful dial", &counters, 6);
     })
     .await
     .unwrap();

@@ -125,16 +125,16 @@ fn the_default_node_config_composes() {
             .expect("the default allowance fits")
             .get()
     );
-    // Block sync and header sync each fund 92 sessions × 64 MiB; discovery adds its
+    // Block sync and header sync each fund 102 sessions × 64 MiB; discovery adds its
     // answers.
-    assert!(envelope.serve_output_bytes >= 2 * 92 * (64 << 20));
-    assert!(envelope.serve_output_bytes < 2 * 92 * (64 << 20) + (1 << 30));
+    assert!(envelope.serve_output_bytes >= 2 * 102 * (64 << 20));
+    assert!(envelope.serve_output_bytes < 2 * 102 * (64 << 20) + (1 << 30));
     // The QUIC term is the derived one, within the peer memory budget.
     assert_eq!(
         envelope.quic_bytes,
         config
             .zakura
-            .quic_memory_bytes(&config.network, limits.max_connections, &[])
+            .quic_memory_bytes(&config.network, limits.total_connections(), &[])
     );
     assert!(envelope.quic_bytes <= u128::from(config.zakura.peer_memory_budget_bytes));
     assert_eq!(
@@ -146,7 +146,7 @@ fn the_default_node_config_composes() {
     );
 }
 
-/// The default node's envelope, term by term: 92 connections at every reactor's
+/// The default node's envelope, term by term: 102 connections at every reactor's
 /// share on Mainnet.
 #[test]
 fn the_default_envelope_sums_the_reactor_shares() {
@@ -184,10 +184,10 @@ fn the_default_envelope_sums_the_reactor_shares() {
     assert_eq!(transport.compat_response_bytes, 288 * 20 * MIB);
     assert_eq!(
         envelope.transport_bytes,
-        92 * u128::from(74_836_259_u64 + 180_310_523) + u128::from(288 * 20 * MIB)
+        102 * u128::from(74_836_259_u64 + 180_310_523) + u128::from(288 * 20 * MIB)
     );
-    // 92 × 141,937,353 + 32 × 64 MiB + 256 MiB.
-    assert_eq!(envelope.quic_bytes, 15_474_870_420);
+    // 102 × 141_945_123 + 32 × 64 MiB + 256 MiB.
+    assert_eq!(envelope.quic_bytes_ 16_894_321_650);
 }
 
 /// A custom stream kind takes the `other` share on a live connection, so the peer
@@ -284,7 +284,7 @@ fn configured_serving_budgets_set_the_serve_output_bound() {
     let configured = NodeEnvelope::for_node(&config, &limits, &[], 16)
         .expect("the configured budgets fit")
         .serve_output_bytes;
-    assert_eq!(derived - configured, 2 * (92 * (64 << 20) - (1 << 30)));
+    assert_eq!(derived - configured, 2 * (102 * (64 << 20) - (1 << 30)));
 }
 
 /// With `tx-relay` on, the serve output bound adds, for each admitted connection,
@@ -293,18 +293,20 @@ fn configured_serving_budgets_set_the_serve_output_bound() {
 #[test]
 fn tx_relay_counts_what_it_holds_outside_its_output_gate() {
     let mut config = Config::default();
+    // Keep both runs at the same funded capacity even with the extra reactor.
+    config.zakura.peer_memory_budget_bytes = 17 << 30;
     let off_limits = ZakuraLocalLimits::from_config(&config);
     let off = NodeEnvelope::for_node(&config, &off_limits, &[], 16)
         .expect("the default config fits")
         .serve_output_bytes;
     config.zakura.tx_relay.enabled = true;
     let limits = ZakuraLocalLimits::from_config(&config);
-    assert_eq!(limits.max_connections, off_limits.max_connections);
+    assert_eq!(limits.total_connections(), off_limits.total_connections());
     let on = NodeEnvelope::for_node(&config, &limits, &[], 16)
         .expect("the default config fits with tx-relay on")
         .serve_output_bytes;
     let per_session = u128::from(crate::zakura::tx_relay::wire::SESSION_HELD_OUTPUT_BYTES);
-    let connections = u128::try_from(limits.max_connections).expect("a connection count fits");
+    let connections = u128::try_from(limits.total_connections()).expect("a connection count fits");
     assert_eq!(on - off, connections * per_session);
 }
 
@@ -317,7 +319,7 @@ fn serving_output_counts_admitted_sessions() {
     const SESSION: u64 = 64 << 20;
     let mut config = Config::default();
     let limits = ZakuraLocalLimits::from_config(&config);
-    let connections = limits.max_connections;
+    let connections = limits.total_connections();
     // Widening usize to u64 and u128 is lossless on supported targets.
     let (sessions, discovery) = (
         connections as u64,

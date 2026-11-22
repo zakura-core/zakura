@@ -2123,7 +2123,6 @@ impl ZakuraDiscoveryHandle {
         let limit = self.inner.lock().await.dial_slot_limit(
             ordinary_registered.saturating_add(ordinary_in_flight),
             in_flight_node_ids.len(),
-            held_places.hold,
         );
         if limit == 0 {
             return;
@@ -3632,20 +3631,17 @@ fn connected_peer_node_ids(connected: &[ZakuraPeerId]) -> Vec<NodeId> {
 ///
 /// Registered peers and in-flight dials outside the preferred set,
 /// `ordinary_occupied`, take slots under the soft cap,
-/// `max_connections - connection_headroom - hold`. The headroom stays free
-/// for maintained peers and the hold for preferred gateways. Every in-flight
+/// `max_connections - connection_headroom`. The headroom stays free
+/// for maintained peers. Preferred connections have their own allowance. Every in-flight
 /// dial, `in_flight_count`, counts against the concurrent-dial cap.
 pub(crate) fn discovery_dial_slot_limit(
     ordinary_occupied: usize,
     in_flight_count: usize,
     max_connections: usize,
     connection_headroom: usize,
-    hold: usize,
     max_concurrent_dials: usize,
 ) -> usize {
-    let soft_cap = max_connections
-        .saturating_sub(connection_headroom)
-        .saturating_sub(hold);
+    let soft_cap = max_connections.saturating_sub(connection_headroom);
     let available_connection_slots = soft_cap.saturating_sub(ordinary_occupied);
     let available_dial_slots = max_concurrent_dials.saturating_sub(in_flight_count);
     available_connection_slots.min(available_dial_slots)
@@ -10202,18 +10198,12 @@ mod tests {
 
     #[test]
     fn discovery_dial_slot_limit_reserves_headroom_and_concurrent_cap() {
-        assert_eq!(discovery_dial_slot_limit(0, 0, 8, 2, 0, 4), 4);
-        assert_eq!(discovery_dial_slot_limit(5, 0, 8, 2, 0, 4), 1);
-        assert_eq!(discovery_dial_slot_limit(6, 1, 8, 2, 0, 4), 0);
-        assert_eq!(discovery_dial_slot_limit(5, 1, 8, 2, 0, 4), 1);
-        assert_eq!(discovery_dial_slot_limit(6, 4, 8, 2, 0, 4), 0);
-        assert_eq!(discovery_dial_slot_limit(2, 0, 2, 4, 0, 4), 0);
-        // The hold comes off the soft cap; a preferred dial in flight still
-        // takes one of the concurrent dials.
-        assert_eq!(discovery_dial_slot_limit(4, 0, 8, 2, 1, 4), 1);
-        assert_eq!(discovery_dial_slot_limit(4, 1, 8, 2, 1, 4), 1);
-        assert_eq!(discovery_dial_slot_limit(5, 0, 8, 2, 1, 4), 0);
-        assert_eq!(discovery_dial_slot_limit(0, 4, 8, 2, 1, 4), 0);
+        assert_eq!(discovery_dial_slot_limit(0, 0, 8, 2, 4), 4);
+        assert_eq!(discovery_dial_slot_limit(5, 0, 8, 2, 4), 1);
+        assert_eq!(discovery_dial_slot_limit(6, 1, 8, 2, 4), 0);
+        assert_eq!(discovery_dial_slot_limit(5, 1, 8, 2, 4), 1);
+        assert_eq!(discovery_dial_slot_limit(6, 4, 8, 2, 4), 0);
+        assert_eq!(discovery_dial_slot_limit(2, 0, 2, 4, 4), 0);
     }
 
     proptest::proptest! {
@@ -10225,7 +10215,6 @@ mod tests {
             in_flight in 0usize..16,
             max_connections in 0usize..64,
             headroom in 0usize..16,
-            hold in 0usize..11,
             max_concurrent in 0usize..16,
         ) {
             let occupied = connected + in_flight;
@@ -10234,10 +10223,9 @@ mod tests {
                 in_flight,
                 max_connections,
                 headroom,
-                hold,
                 max_concurrent,
             );
-            let soft_cap = max_connections.saturating_sub(headroom + hold);
+            let soft_cap = max_connections.saturating_sub(headroom);
             proptest::prop_assert!(occupied + limit <= soft_cap.max(occupied));
             proptest::prop_assert!(in_flight + limit <= max_concurrent.max(in_flight));
             proptest::prop_assert_eq!(

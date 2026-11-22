@@ -595,7 +595,7 @@ is today's Zakura logic.
   every node the per-IP cap allows behind one address can redial once a
   second. It keeps one ledger for validated sources and one for unvalidated
   sources, each bounded at `max_connections + max_pending_handshakes`
-  addresses (124 at the defaults). A ledger drops only full buckets, so
+  addresses (134 at the defaults). A ledger drops only full buckets, so
   address churn can't erase debt. When the source's bucket is empty, or its
   ledger is full without it, the acceptor returns `Retry` for an unvalidated
   source and `Refuse` for a validated one. A spoofed Initial is never
@@ -717,11 +717,11 @@ is today's Zakura logic.
     made the dialer spin.
 
   Zakura sets `max_connections` to its admitted cap plus
-  `max_pending_handshakes`: 124 at the defaults (CTRL-26). It sets
+  `max_pending_handshakes`: 134 at the defaults (CTRL-26). It sets
   `max_inbound_connections` to its inbound connection and handshake shares
-  (ADM-3) together: 93. It sets `dial_reserve` to the 31 slots inbound can't
+  plus the funded gateway places (ADM-3), or 103 in total. It sets `dial_reserve` to the 31 slots inbound can't
   hold, capped at one discovery record's 8 addresses and at least one slot:
-  8 at the defaults. With inbound full, discovery's ceiling (116) leaves it
+  8 at the defaults. With inbound full, discovery's ceiling (126) leaves it
   the whole outbound share (23), and the reserve still fits one maintained
   dial of a full record. That holds whenever the handshake reserve is at
   least 8, so from 32 pending handshakes up. Below that the reserve keeps its
@@ -848,7 +848,7 @@ These keys stay in `[network.zakura]` and keep their meaning:
 IPv4 address or global IPv6 /64, ADM-3),
 `max_pending_handshakes` (32), `stream_open_rate_per_second`,
 `message_rate_per_second` and the handshake's `max_open_streams`.
-`peer_memory_budget_bytes` (15 GiB) joins them under CTRL-26.
+`peer_memory_budget_bytes` (16 GiB) joins them under CTRL-26.
 
 - **CTRL-26.** A QUIC connection in its handshake can make the node hold
   `receive_window_bytes + send_window_bytes` of flow-control credit, 64 MiB
@@ -868,8 +868,9 @@ IPv4 address or global IPv6 /64, ADM-3),
   peer_memory_budget_bytes`, one socket queue per bound socket and
   `max_pending_handshakes` connections at the handshake cost. The rest
   divided by the admitted connection's cost is the number of connections it
-  admits, 96 at the defaults, which bind one socket, so the default
-  `max_connections` of 92 is funded. ADM-12 holds the transport to the
+  can fund, 104 at Mainnet defaults with one socket. Ordinary peers take
+  priority up to `max_connections` (92 by default). Up to ten more places
+  can be used by preferred gateways if the remaining memory funds them. ADM-12 holds the transport to the
   admitted cap plus the handshake headroom, so every
   live connection the node holds is funded. Startup lowers a larger
   `max_connections` to the admitted count with a warning. It fails, naming

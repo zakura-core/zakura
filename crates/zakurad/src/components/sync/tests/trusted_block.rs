@@ -387,18 +387,18 @@ impl Node {
             native_tasks.push(driver.abort_handle());
         }
         let (deny_peer_state_read, deny_read) = watch::channel(false);
-        let peer_state = state.clone();
-        let peer_state = tower::service_fn(move |request| {
+        let peer_state: State = state.clone();
+        let peer_state = tower::service_fn(move |request: zakura_state::Request| {
             let unavailable =
                 *deny_read.borrow() && matches!(request, zakura_state::Request::AnyChainBlock(_));
-            let state = peer_state.clone();
-            async move {
-                if unavailable {
-                    return Err("peer block lookup unavailable".into());
-                }
-                state.oneshot(request).await
+            if unavailable {
+                futures::future::ready(Err::<zakura_state::Response, BoxError>(
+                    "peer block lookup unavailable".into(),
+                ))
+                .boxed()
+            } else {
+                peer_state.clone().oneshot(request).boxed()
             }
-            .boxed()
         });
         assert!(setup_tx
             .send(InboundSetupData {

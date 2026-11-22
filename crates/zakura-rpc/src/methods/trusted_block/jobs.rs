@@ -89,7 +89,7 @@ impl Jobs {
         let mut jobs = self
             .0
             .lock()
-            .expect("job registry lock is never held across user code");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(sender) = jobs.get(&id) {
             let mut result = Ok(false);
             sender.send_if_modified(|inputs| {
@@ -179,7 +179,7 @@ where
                 tokio::time::sleep_until(deadline).await;
                 jobs.0
                     .lock()
-                    .expect("job registry lock is never held across user code")
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .remove(&id);
             });
         }

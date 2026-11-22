@@ -661,11 +661,15 @@ fn check_cadence<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
         if let TransportFact::HandshakeCounts {
             address_cap,
             connection_cap,
+            gateway_capacity,
             cap,
             ..
         } = event
         {
-            limits.insert(*instance, (*address_cap, connection_cap + cap));
+            limits.insert(
+                *instance,
+                (*address_cap, connection_cap + gateway_capacity + cap),
+            );
         }
         if !matches!(
             event,
@@ -895,6 +899,7 @@ fn check_counts<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
                     node_connections,
                     inbound_node_connections,
                     connection_cap,
+                    gateway_capacity,
                     pending,
                     inbound,
                     pending_permits,
@@ -927,8 +932,9 @@ fn check_counts<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
             "handshake/counts-match-permits"
                 if connections != node_connections
                     || inbound_connections != inbound_node_connections
-                    || connections > connection_cap
-                    || *inbound_connections > connection_cap - reserve(*connection_cap) =>
+                    || *connections > connection_cap + gateway_capacity
+                    || *inbound_connections
+                        > connection_cap - reserve(*connection_cap) + gateway_capacity =>
             {
                 return cx.violated(
                     "connection slots equal their per-node sum and stay within the cap",
@@ -1014,6 +1020,7 @@ fn check_reserve<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
             TransportFact::HandshakeCounts {
                 inbound_connections,
                 connection_cap,
+                gateway_capacity,
                 inbound,
                 cap,
                 quic_inbound,
@@ -1022,10 +1029,13 @@ fn check_reserve<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
                 ..
             } => {
                 applies = true;
-                if *inbound_connections > connection_cap - reserve(*connection_cap)
+                if *inbound_connections
+                    > connection_cap - reserve(*connection_cap) + gateway_capacity
                     || *inbound > cap - reserve(*cap)
                     || *quic_inbound
-                        > connection_cap + cap - reserve(*connection_cap) - reserve(*cap)
+                        > connection_cap + gateway_capacity + cap
+                            - reserve(*connection_cap)
+                            - reserve(*cap)
                     || quic_inbound > quic_max_inbound
                     || quic_inbound > quic_below_reserve
                 {

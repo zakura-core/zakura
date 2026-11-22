@@ -12,8 +12,6 @@
 use zakura_quic::NodeId;
 use zakura_rt::collections::HashSet;
 
-use super::inbound_share;
-
 /// The most connection places a node holds for preferred gateways.
 pub const MAX_PREFERRED_GATEWAYS: usize = 10;
 
@@ -21,20 +19,6 @@ pub const MAX_PREFERRED_GATEWAYS: usize = 10;
 /// IDs than ten places need, and the slot checks and the dialer walk the
 /// ranking, so a longer ranking keeps only its highest-ranked entries.
 pub(crate) const MAX_RANKED_GATEWAYS: usize = 256;
-
-/// The places a node with `max_connections` slots may hold for preferred
-/// gateways while it keeps `bootstrap_headroom` slots for its bootstrap
-/// peers: what the dial quarter of the limit leaves beside the bootstrap
-/// places, and at most [`MAX_PREFERRED_GATEWAYS`].
-///
-/// The inbound share is untouched, so a small limit shrinks the hold, never
-/// the places inbound peers may take.
-pub fn preferred_hold_limit(max_connections: usize, bootstrap_headroom: usize) -> usize {
-    let dial_quarter = max_connections.saturating_sub(inbound_share(max_connections));
-    dial_quarter
-        .saturating_sub(bootstrap_headroom)
-        .min(MAX_PREFERRED_GATEWAYS)
-}
 
 /// What v2 networking knows about a ranked gateway.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -95,7 +79,7 @@ pub struct PreferredGateways {
 
 impl PreferredGateways {
     /// Forms the preferred set from `ranking`, with at most `hold_limit`
-    /// places (see [`preferred_hold_limit`]).
+    /// additional places funded for gateways.
     ///
     /// Gateways are ranked by block count, highest first. Within one count a
     /// connected gateway comes first, so a tie at the cutoff keeps the
@@ -167,10 +151,9 @@ impl PreferredGateways {
         self.set.contains(node)
     }
 
-    /// The hold and the set, the part discovery needs.
+    /// Members whose connections are outside the ordinary discovery budget.
     pub(crate) fn held_places(&self) -> HeldPlaces {
         HeldPlaces {
-            hold: self.hold,
             members: self.set.clone(),
         }
     }
@@ -205,12 +188,9 @@ impl PreferredGateways {
     }
 }
 
-/// The connection places held for preferred gateways and the gateways that
-/// fill them: what discovery needs to keep its ordinary dials out of them.
+/// Gateway identities excluded from ordinary discovery occupancy.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct HeldPlaces {
-    /// The places held.
-    pub(crate) hold: usize,
     /// The preferred set.
     pub(crate) members: Vec<NodeId>,
 }

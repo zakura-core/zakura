@@ -298,8 +298,8 @@ impl HandshakeCounts {
     }
 
     /// Charges a connection slot to `node` while keeping the dial reserve
-    /// and the held places: the total stays within `cap`, ordinary slots
-    /// within `cap` less the hold, and ordinary inbound slots within the
+    /// and the held places: the total stays within `cap` plus the hold, ordinary slots
+    /// within `cap`, and ordinary inbound slots within the
     /// inbound share. A preferred gateway's first slot takes a held place.
     /// The check and the charge are one step.
     ///
@@ -307,7 +307,7 @@ impl HandshakeCounts {
     /// for later cutoff ties. A refusal restores the previous ranking. Each member
     /// counts one preferred slot, so preferred slots never pass the hold. A member the
     /// caller displaces keeps its slot, now ordinary, which can leave the
-    /// ordinary slots one over `cap` less the hold until a slot frees. That
+    /// ordinary slots one over `cap` until a slot frees. That
     /// is bounded by the hold and passes, as after a published set change.
     pub fn claim_connection(
         &mut self,

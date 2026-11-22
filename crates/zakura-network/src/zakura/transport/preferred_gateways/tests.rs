@@ -15,28 +15,6 @@ fn gateway(seed: u8, blocks: u32, standing: GatewayStanding) -> RankedGateway {
     }
 }
 
-/// The hold fits beside the bootstrap places in the dial quarter of the
-/// limit, and is at most ten.
-#[test]
-fn the_hold_limit_fits_in_the_dial_quarter() {
-    for (max_connections, headroom, hold) in [
-        (92, 9, 10),
-        (75, 9, 9),
-        (40, 9, 1),
-        (36, 9, 0),
-        (20, 4, 1),
-        (16, 4, 0),
-        (0, 0, 0),
-        (1, 0, 0),
-    ] {
-        assert_eq!(
-            preferred_hold_limit(max_connections, headroom),
-            hold,
-            "{max_connections} connections, {headroom} bootstrap places"
-        );
-    }
-}
-
 #[test]
 fn an_empty_ranking_holds_nothing() {
     let empty = PreferredGateways::form([], MAX_PREFERRED_GATEWAYS);

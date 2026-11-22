@@ -728,6 +728,7 @@ async fn cancelled_worker_releases_its_real_quic_dial_capacity() {
     zakura_rt::time::timeout(Duration::from_secs(15), async {
         let limits = ZakuraLocalLimits {
             max_connections: 2,
+            max_preferred_connections: 0,
             max_pending_handshakes: 1,
             ..ZakuraLocalLimits::from_config(&crate::Config::default())
         };
@@ -1138,6 +1139,7 @@ async fn a_candidate_larger_than_the_free_slots_yields_to_one_that_fits() {
     // five transport discovery slots.
     let limits = ZakuraLocalLimits {
         max_connections: 6,
+        max_preferred_connections: 0,
         max_pending_handshakes: 1,
         ..ZakuraLocalLimits::from_config(&crate::Config::default())
     };
@@ -1217,6 +1219,7 @@ async fn a_round_counts_down_one_free_slot_per_admitted_address() {
     // five transport discovery slots.
     let limits = ZakuraLocalLimits {
         max_connections: 6,
+        max_preferred_connections: 0,
         max_pending_handshakes: 1,
         ..ZakuraLocalLimits::from_config(&crate::Config::default())
     };

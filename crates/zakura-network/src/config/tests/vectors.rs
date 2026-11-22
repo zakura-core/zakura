@@ -1391,7 +1391,7 @@ fn zakura_peer_memory_budget_lowers_or_refuses_at_load() {
             bind.max_inbound_connections,
             bind.max_closing_connections
         ),
-        (124, 8, Some(93), 248)
+        (134, 8, Some(103), 268)
     );
 
     // With a 1 GiB receive window, the handshake headroom alone exceeds the

@@ -46,11 +46,11 @@ today: a 32 MiB connection send window carries about 540 Mbps at 500 ms.
 
 Paused reads leave a peer's data in QUIC's receive window, so the windows are also memory every
 peer can fill. The node bounds that credit by holding fewer connections, not by shrinking windows:
-`peer_memory_budget_bytes` (15 GiB) funds one 256 MiB datagram queue per bound socket,
+`peer_memory_budget_bytes` (16 GiB) funds one 256 MiB datagram queue per bound socket,
 `max_pending_handshakes` (32) connections in their handshakes at 64 MiB of windows each, and
 admitted connections at their raised windows: the handshake window, each negotiated reactor's
-receive share and the send window, 141,937,353 B at the defaults. That admits 96, above the 92
-default peers, so the transport holds at most 124 live QUIC connections. A closed connection
+receive share and the send window, 141,937,353 B at the defaults. That funds 92 ordinary peers and
+up to ten additional preferred gateways, plus 32 handshakes for 134 live QUIC connections. A closed connection
 releases its stream buffers and waits out its drain in a separate, cheap allowance, so a peer that
 gets rejected and reconnects can't pile up buffers, and its closed connections take no slot from
 inbound peers. CTRL-26, ADM-12 and ADM-13 in the zakura-quic spec give the rules

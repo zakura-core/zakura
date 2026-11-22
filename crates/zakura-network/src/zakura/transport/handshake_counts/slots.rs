@@ -82,6 +82,10 @@ pub(super) struct ConnectionSlots {
 }
 
 impl ConnectionSlots {
+    pub(super) fn nodes(&self) -> impl Iterator<Item = &NodeId> {
+        self.by_node.keys()
+    }
+
     pub(super) fn total(&self) -> usize {
         self.total
     }
@@ -120,30 +124,25 @@ impl ConnectionSlots {
     /// known yet: an ordinary inbound slot, or a held place that no member
     /// fills. With no hold this is the ordinary inbound check alone.
     pub(super) fn inbound_place_free(&self, cap: usize, preferred: &PreferredGateways) -> bool {
-        if self.total >= cap {
+        if self.total >= cap.saturating_add(preferred.hold()) {
             return false;
         }
         let split = self.split(preferred);
-        let ordinary_free = split.ordinary < cap.saturating_sub(preferred.hold())
-            && split.ordinary_inbound < inbound_share(cap);
+        let ordinary_free = split.ordinary < cap && split.ordinary_inbound < inbound_share(cap);
         ordinary_free || split.preferred < preferred.hold()
     }
 
-    /// The slots an ordinary dial may claim now: free slots, and no more
-    /// than the ordinary slots left beside the hold.
+    /// Remaining ordinary places after counting live connections under the current ranking.
     pub(super) fn free_ordinary(&self, cap: usize, preferred: &PreferredGateways) -> usize {
-        let ordinary_limit = cap.saturating_sub(preferred.hold());
-        cap.saturating_sub(self.total)
-            .min(ordinary_limit.saturating_sub(self.split(preferred).ordinary))
+        cap.saturating_sub(self.split(preferred).ordinary)
     }
 
     /// Checks the limits and charges one slot to `node` in one step, so
     /// claims made under one lock never exceed them.
     ///
-    /// No slot passes `cap`. A preferred-set member that holds no slot yet
-    /// takes a held place. Any other slot is ordinary and is refused once
-    /// the ordinary slots reach `cap` less the hold, and an inbound one
-    /// also once the ordinary inbound slots reach the inbound share.
+    /// A claim may bring the total up to the ordinary cap plus the active hold.
+    /// Each preferred gateway can use one additional place. Ordinary claims
+    /// also respect the ordinary cap and, for inbound calls, its inbound share.
     pub(super) fn claim(
         &mut self,
         node: NodeId,
@@ -151,14 +150,14 @@ impl ConnectionSlots {
         cap: usize,
         preferred: &PreferredGateways,
     ) -> Result<SlotClass, SlotRefusal> {
-        if self.total >= cap {
+        if self.total >= cap.saturating_add(preferred.hold()) {
             return Err(SlotRefusal::Full);
         }
         let class = if preferred.contains(&node) && self.of_node(&node).total() == 0 {
             SlotClass::Preferred
         } else {
             let split = self.split(preferred);
-            if split.ordinary >= cap.saturating_sub(preferred.hold()) {
+            if split.ordinary >= cap {
                 return Err(SlotRefusal::Hold);
             }
             if inbound && split.ordinary_inbound >= inbound_share(cap) {

@@ -496,6 +496,30 @@ smoke-secs = 60
 args = ["-max_len=512"]
 timeout-secs = 1800
 
+# The handshake parsers' targets read peer-chosen bytes, not machine
+# histories. The longest credential's SPKI is 10,418 bytes, and a raw
+# composite input with an honest signature is about 3,900.
+[[target]]
+package = "p2p"
+name = "credential_parse"
+smoke-secs = 60
+args = ["-max_len=10500"]
+timeout-secs = 1800
+
+[[target]]
+package = "p2p"
+name = "key_list_decode"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
+package = "p2p"
+name = "composite_verify"
+smoke-secs = 60
+args = ["-max_len=4096"]
+timeout-secs = 1800
+
 [[target]]
 package = "sim"
 name = "block_work_ownership"

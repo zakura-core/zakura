@@ -18,6 +18,8 @@
 
 mod composite;
 mod credential;
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub mod fuzz;
 mod key;
 mod key_list;
 mod tls;

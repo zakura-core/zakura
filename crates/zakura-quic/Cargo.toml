@@ -15,6 +15,8 @@ default = []
 # `Conn::shared_id`, for other crates' unit tests. A simulator build gets it
 # from `--cfg zakura_sim`.
 test-support = []
+# The handshake parsers' fuzz drivers, for `qa/fuzz/p2p`. Not for production.
+p2p-fuzz = []
 
 [dependencies]
 # SPEC DEP-2 lists every allowed direct dependency. Adding one needs a spec change.

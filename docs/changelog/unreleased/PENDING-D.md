@@ -1,0 +1,8 @@
+## Added
+
+- New metrics show which cryptography each v2 handshake used:
+  `zakura.quic.tls.key_exchange` counts completed key exchanges by `group`
+  (`X25519MLKEM768`), and `zakura.quic.tls.signature_verified` counts
+  verified peer handshake signatures by `scheme` (`ed25519_mldsa44`), so an
+  operator can confirm that a node's v2 connections are post-quantum
+  ([#PENDING](https://github.com/zakura-core/zakura/pull/PENDING)).

@@ -27,6 +27,14 @@ use super::mlkem::{self, DecapsulationKey, MlKem768};
 /// The length of an X25519 share.
 const X25519_LEN: usize = 32;
 
+/// The `group` label of an exchange completed in the hybrid: rustls' name
+/// for it.
+const HYBRID_LABEL: &str = "X25519MLKEM768";
+
+/// The `group` label of an exchange completed in the hybrid's X25519 half
+/// alone.
+const X25519_LABEL: &str = "X25519";
+
 /// The hybrid group production endpoints offer: ring's X25519, and
 /// ML-KEM-768 drawing from the same random source ring's provider uses.
 pub(crate) fn x25519_mlkem768() -> &'static dyn SupportedKxGroup {
@@ -85,6 +93,7 @@ impl SupportedKxGroup for X25519MlKem768 {
         let (encapsulation_key, x25519_share) = split(dialer_share, mlkem::ENCAPSULATION_KEY_LEN)?;
         let (ciphertext, mlkem768_secret) = self.mlkem768.encapsulate(encapsulation_key)?;
         let x25519 = self.x25519.start_and_complete(x25519_share)?;
+        count_completed(HYBRID_LABEL);
         Ok(CompletedKeyExchange {
             group: NamedGroup::X25519MLKEM768,
             pub_key: [ciphertext.as_slice(), &x25519.pub_key].concat(),
@@ -123,6 +132,7 @@ impl ActiveKeyExchange for Dialer {
         let (ciphertext, x25519_share) = split(listener_share, mlkem::CIPHERTEXT_LEN)?;
         let mlkem768_secret = self.mlkem768.decapsulate(ciphertext)?;
         let x25519_secret = self.x25519.complete(x25519_share)?;
+        count_completed(HYBRID_LABEL);
         Ok(combine(&mlkem768_secret, &x25519_secret))
     }
 
@@ -137,7 +147,9 @@ impl ActiveKeyExchange for Dialer {
         self: Box<Self>,
         listener_share: &[u8],
     ) -> Result<SharedSecret, rustls::Error> {
-        self.x25519.complete(listener_share)
+        let secret = self.x25519.complete(listener_share)?;
+        count_completed(X25519_LABEL);
+        Ok(secret)
     }
 
     /// The dialer's share.
@@ -154,6 +166,11 @@ impl ActiveKeyExchange for Dialer {
     fn group(&self) -> NamedGroup {
         NamedGroup::X25519MLKEM768
     }
+}
+
+/// Counts one key exchange completed in the group `label` (OBS-1).
+fn count_completed(label: &'static str) {
+    metrics::counter!("zakura.quic.tls.key_exchange", "group" => label).increment(1);
 }
 
 /// Splits a peer's share into its ML-KEM part, of `mlkem768_len` bytes, and

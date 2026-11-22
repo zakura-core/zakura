@@ -40,6 +40,10 @@ pub const COMPOSITE_SIGNATURE_BYTES: usize = ED25519_SIGNATURE_BYTES + ML_DSA_44
 pub(crate) const COMPOSITE_SCHEME: rustls::SignatureScheme =
     rustls::SignatureScheme::Unknown(0xFE44);
 
+/// The composite's `scheme` label in metrics (OBS-1). rustls has no name for
+/// a private-use scheme.
+pub(crate) const COMPOSITE_SCHEME_LABEL: &str = "ed25519_mldsa44";
+
 /// The FIPS 204 context string of every ML-DSA signature a node makes, so a
 /// handshake signature can't be passed off as one made for anything else.
 const ML_DSA_CONTEXT: &[u8] = b"Zakura TLS 1.3 Ed25519+ML-DSA-44 v1";

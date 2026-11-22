@@ -9,8 +9,8 @@ use crate::Config;
 /// [`ZakuraConfig::replace_retired_seed_node_ids`], and warns about each one.
 ///
 /// Zakura does this before the v2 endpoint reads the list, and after tracing starts so
-/// the warnings reach the operator. It covers every config source, including
-/// environment overrides that the config file rewrite cannot see.
+/// the warnings reach the operator. `zakurad start` fixes the config file first, so an
+/// entry left here came from a file it could not rewrite or from an environment override.
 ///
 /// [`ZakuraConfig::replace_retired_seed_node_ids`]: crate::zakura::ZakuraConfig::replace_retired_seed_node_ids
 pub(super) fn replace_retired_seed_node_ids(config: &mut Config) {

@@ -240,9 +240,15 @@ fn install_panic_hook(metadata_section: String) {
 }
 
 /// Rewrites the config file at `config_path` so its `zakura.bootstrap_peers` name default
-/// seeds by their current node IDs, and logs the outcome. A failure only warns: the
-/// network layer replaces the same IDs in memory for this run.
-fn rewrite_retired_seed_ids(config_path: &std::path::Path) {
+/// seeds by their current node IDs, and logs the outcome.
+///
+/// After a rewrite, `zakura` gets the same replacement, so it matches the file. A failure
+/// only warns: the network layer replaces the IDs in memory for this run, and its warning
+/// then asks the operator to fix the file.
+fn rewrite_retired_seed_ids(
+    config_path: &std::path::Path,
+    zakura: &mut zakura_network::zakura::ZakuraConfig,
+) {
     match rewrite_config_file(config_path) {
         Ok(RewriteOutcome::Unchanged) => {}
         Ok(RewriteOutcome::Rewrote {
@@ -250,6 +256,7 @@ fn rewrite_retired_seed_ids(config_path: &std::path::Path) {
             replaced,
             backup,
         }) => {
+            zakura.replace_retired_seed_node_ids();
             for (retired, current) in &replaced {
                 info!(%retired, %current, "replaced a default seed's retired node ID in zakura.bootstrap_peers");
             }
@@ -295,7 +302,7 @@ fn start(command: &EntryPoint) -> Result<(Arc<ZakuradConfig>, Tracing), Report> 
         }
     };
 
-    let config = command.process_config(config)?;
+    let mut config = command.process_config(config)?;
 
     // collect the common metadata for the panic report,
     // skipping any env vars that aren't present
@@ -412,7 +419,7 @@ fn start(command: &EntryPoint) -> Result<(Arc<ZakuradConfig>, Tracing), Report> 
 
         if let Some(config_path) = command.config_path() {
             info!("Using config file at: {:?}", config_path);
-            rewrite_retired_seed_ids(&config_path);
+            rewrite_retired_seed_ids(&config_path, &mut config.network.zakura);
         } else {
             info!("No config file provided, using default configuration");
         }

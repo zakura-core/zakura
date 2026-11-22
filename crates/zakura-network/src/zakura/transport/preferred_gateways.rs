@@ -47,9 +47,10 @@ pub enum GatewayStanding {
     Dialable,
     /// A dial to it is in flight.
     Dialing,
-    /// Connected to this node. When its last connection slot is released
-    /// the slot counters mark it [`Self::Backoff`] until the next ranking
-    /// says otherwise, so a gateway that left gives up its place in the set.
+    /// Connected to this node.
+    ///
+    /// Whatever its standing, a gateway that loses its last connection slot
+    /// counts as in [`Self::Backoff`] until the next published ranking.
     Connected,
 }
 
@@ -212,16 +213,19 @@ impl PreferredGateways {
         formed.contains(node).then_some(formed)
     }
 
-    /// The set re-formed with the connected gateway `node` in backoff, once
-    /// it holds no connection; `None` when `node` isn't ranked as connected.
+    /// The set re-formed with `node` in backoff, once it has lost its last
+    /// connection slot; `None` when `node` is unranked, unmatched or
+    /// already in backoff.
     ///
-    /// Like a gateway whose dial failed, it keeps its held place reserved,
-    /// leaves the set so the next available gateway may fill it, and may
-    /// still call back in.
-    pub(super) fn with_disconnected(&self, node: &NodeId) -> Option<Self> {
-        let index = self.ranking.iter().position(|gateway| {
-            gateway.node == *node && gateway.standing == GatewayStanding::Connected
-        })?;
+    /// A gateway that loses its last connection slot counts as in backoff
+    /// until the next published ranking. Like a gateway whose dial failed,
+    /// it keeps its held place reserved, leaves the set so the next
+    /// available gateway may fill it, and may still call back in.
+    pub(super) fn with_released(&self, node: &NodeId) -> Option<Self> {
+        let index = self
+            .ranking
+            .iter()
+            .position(|gateway| gateway.node == *node && gateway.standing.available())?;
         let mut ranking = self.ranking.clone();
         ranking[index].standing = GatewayStanding::Backoff;
         Some(Self::form(ranking, self.hold_limit))

@@ -31,7 +31,7 @@ pub use handshake_counts::{
     HandshakeCounts, IpAdmission, SlotClass, SlotRefusal, SlotSplit,
 };
 pub use preferred_gateways::{
-    preferred_hold_limit, GatewayStanding, PreferredGateways, RankedGateway, MAX_PREFERRED_GATEWAYS,
+    GatewayRanking, GatewayStanding, PreferredGateways, RankedGateway, MAX_PREFERRED_GATEWAYS,
 };
 pub(crate) use preferred_gateways::{HeldPlaces, MAX_RANKED_GATEWAYS};
 // `SessionGuard` and `ByteBudget` are imported through this re-export; `Admit`

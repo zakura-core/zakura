@@ -8,7 +8,7 @@ use std::{
 use zakura_rt::time::Instant;
 
 use zakura_network::zakura::{
-    GatewayStanding, HandshakeCadenceAdmission, HandshakeCounts, IpAdmission, PreferredGateways,
+    GatewayRanking, GatewayStanding, HandshakeCadenceAdmission, HandshakeCounts, IpAdmission,
     RankedGateway, SlotClass, SlotRefusal, SlotSplit,
 };
 use zakura_quic::{NodeId, NodeSecretKey};
@@ -71,7 +71,7 @@ const MACHINE: Machine = Machine {
         ),
         (
             RESERVE,
-            "Inbound connections and handshakes preserve the dial reserve, and no ordinary slot is granted at or above the limit less the held places.",
+            "Inbound connections and handshakes preserve the dial reserve, and no ordinary slot is granted at or above the ordinary limit.",
             Status::Active,
         ),
         (
@@ -254,13 +254,20 @@ fn check_claim(
 ) {
     let preferred = counts.preferred_gateways();
     let before = owner_split(owners, preferred.set());
+    if claim.is_ok() && before.ordinary + before.preferred >= CONNECTION_CAP + preferred.hold() {
+        failure(
+            failures,
+            RESERVE,
+            "a slot was granted above the ordinary limit plus the active gateway places",
+        );
+    }
     match claim {
         Ok(SlotClass::Ordinary) => {
-            if before.ordinary >= CONNECTION_CAP.saturating_sub(preferred.hold()) {
+            if before.ordinary >= CONNECTION_CAP {
                 failure(
                     failures,
                     RESERVE,
-                    "an ordinary slot was granted at or above the limit less the hold",
+                    "an ordinary slot was granted at or above the ordinary limit",
                 );
             }
             if inbound && before.ordinary_inbound >= INBOUND_CONNECTION_CAP {
@@ -286,11 +293,9 @@ fn check_claim(
     }
 }
 
-/// Ranks every node of the table, the first highest, and forms the set
-/// with a hold limit of `arg`'s high bits: a node whose bit in `arg`'s low
-/// four is set is dialable, and the rest are unknown to v2.
-fn preferred_from(nodes: &[NodeId; NODES], arg: u8) -> PreferredGateways {
-    let ranking = nodes
+/// Ranks the table in order. The low four bits mark dialable nodes.
+fn ranking_from(nodes: &[NodeId; NODES], arg: u8) -> GatewayRanking {
+    nodes
         .iter()
         .enumerate()
         .map(|(index, &node)| RankedGateway {
@@ -302,8 +307,8 @@ fn preferred_from(nodes: &[NodeId; NODES], arg: u8) -> PreferredGateways {
             } else {
                 GatewayStanding::Unmatched
             },
-        });
-    PreferredGateways::form(ranking, usize::from(arg >> 4) % 4)
+        })
+        .collect()
 }
 
 fn failure(failures: &mut Vec<(String, MachineFailure)>, id: &str, message: impl Into<String>) {
@@ -508,19 +513,17 @@ fn history(input: &[u8]) -> Vec<(usize, MachineStep)> {
                 }
                 // A refused dial must be one the limits explain: a member's
                 // first slot is refused only at the limit, and an ordinary
-                // dial only once ordinary dials fill the reserve less the
-                // hold or ordinary inbound slots pass their share.
+                // dial only once ordinary dials fill the reserve or ordinary inbound slots pass their share.
                 if !inbound && !admitted {
                     let preferred = counts.preferred_gateways();
                     let split = owner_split(&owners, preferred.set());
                     let fresh_member = preferred.contains(&node)
                         && live_slots(&owners, node, true) + live_slots(&owners, node, false) == 0;
                     let ordinary_outbound = split.ordinary - split.ordinary_inbound;
-                    if (fresh_member && view.connections < CONNECTION_CAP)
+                    if (fresh_member && view.connections < CONNECTION_CAP + preferred.hold())
                         || (split.ordinary_inbound <= INBOUND_CONNECTION_CAP
-                            && ordinary_outbound
-                                < (CONNECTION_CAP - INBOUND_CONNECTION_CAP)
-                                    .saturating_sub(preferred.hold()))
+                            && ordinary_outbound < CONNECTION_CAP - INBOUND_CONNECTION_CAP
+                            && view.connections < CONNECTION_CAP + preferred.hold())
                     {
                         failure(
                             &mut failures,
@@ -625,7 +628,8 @@ fn history(input: &[u8]) -> Vec<(usize, MachineStep)> {
             }
             (10, _) => {
                 // The ranking changes. Slots already held stay held.
-                counts.publish_preferred_gateways(preferred_from(&nodes, arg));
+                counts
+                    .publish_gateway_ranking(&ranking_from(&nodes, arg), usize::from(arg >> 4) % 4);
                 published = true;
             }
             _ => {}
@@ -709,7 +713,7 @@ fn history(input: &[u8]) -> Vec<(usize, MachineStep)> {
                 "preferred slots differ from the members holding a slot",
             );
         }
-        if actual.connections > CONNECTION_CAP
+        if actual.connections > CONNECTION_CAP + NODES
             || (!published && actual.inbound_connections > INBOUND_CONNECTION_CAP)
         {
             failure(
@@ -862,27 +866,27 @@ mod tests {
     }
 
     /// A published hold keeps one place for its gateway: ordinary dials
-    /// stop a place short of the limit, the gateway's dial takes it, and a
+    /// fill the ordinary limit, the gateway's dial takes an extra place, and a
     /// ranked caller unknown to v2 takes a place it outranks.
     #[test]
     fn a_published_hold_keeps_a_place_for_its_gateway() {
         // A hold limit of one; nodes 1 to 3 dialable, node 0 unknown.
         let mut input = vec![10, 0, 0x1e];
-        for slot in 0..91 {
+        for slot in 0..92 {
             input.extend([1, slot, 0x30]);
         }
-        input.extend([1, 91, 0x30, 1, 92, 0x10]);
+        input.extend([1, 92, 0x30, 1, 93, 0x10]);
         let steps = history(&input);
         holds(&input);
         assert!(steps.iter().any(|(_, step)| matches!(step,
-            MachineStep::Handshake(step) if step.actual.connections == CONNECTION_CAP)));
+            MachineStep::Handshake(step) if step.actual.connections == CONNECTION_CAP + 1)));
 
         // Node 0 calls in at the ordinary limit and outranks the member.
         let mut input = vec![10, 0, 0x1e];
-        for slot in 0..91 {
+        for slot in 0..92 {
             input.extend([1, slot, 0x30]);
         }
-        input.extend([0, 91, 0x00, 2, 91, 0]);
+        input.extend([0, 92, 0x00, 2, 92, 0]);
         let steps = history(&input);
         holds(&input);
         let (claimed, _) = steps.last().expect("the history ends with its teardown");
@@ -890,7 +894,7 @@ mod tests {
         // limit only if the caller was granted the held place.
         assert!(steps.iter().any(|(number, step)| matches!(step,
             MachineStep::Handshake(step) if *number == claimed - 1
-                && step.actual.connections == CONNECTION_CAP
+                && step.actual.connections == CONNECTION_CAP + 1
                 && step.actual.inbound_connections == 1)));
     }
 

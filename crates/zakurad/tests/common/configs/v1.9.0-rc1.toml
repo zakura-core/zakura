@@ -62,6 +62,7 @@ tx_cost_limit = 80000000
 
 [mining]
 internal_miner = false
+miner_mesh = false
 optimistic_block_inventory = true
 
 [network]
@@ -138,7 +139,7 @@ max_connections_per_ip = 16
 max_pending_handshakes = 32
 message_rate_per_second = 2048
 nat_traversal = false
-peer_memory_budget_bytes = 16106127360
+peer_memory_budget_bytes = 17179869184
 stream_open_rate_per_second = 32
 # Optional IP-to-name labels for peers in gossip traces.
 trace_peer_names = {}

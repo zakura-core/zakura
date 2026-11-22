@@ -31,6 +31,7 @@ pub struct HandshakeProbe {
     cap: usize,
     address_cap: usize,
     connection_cap: usize,
+    gateway_capacity: usize,
 }
 
 /// Admission charges and permits sampled at one scheduler boundary.
@@ -47,8 +48,10 @@ pub struct HandshakeSample {
     /// Inbound connection slots outside the preferred set's one place per
     /// member, which the inbound share bounds.
     pub ordinary_inbound_connections: usize,
-    /// Total connection capacity.
+    /// Ordinary connection capacity.
     pub connection_cap: usize,
+    /// Additional gateway places funded by the node.
+    pub gateway_capacity: usize,
     /// The configured registered-connection limit per address.
     pub address_cap: usize,
     /// The machine's total pending charge.
@@ -70,17 +73,17 @@ impl HandshakeProbe {
         counts: &Arc<zakura_rt::sync::Mutex<super::HandshakeCounts>>,
         pending: &Arc<Semaphore>,
         inbound: &Arc<Semaphore>,
-        cap: usize,
         address_cap: usize,
-        connection_cap: usize,
+        limits: &crate::zakura::ZakuraLocalLimits,
     ) -> Self {
         Self {
             counts: Arc::downgrade(counts),
             pending: Arc::downgrade(pending),
             inbound: Arc::downgrade(inbound),
-            cap,
+            cap: limits.max_pending_handshakes,
             address_cap,
-            connection_cap,
+            connection_cap: limits.max_connections,
+            gateway_capacity: limits.max_preferred_connections,
         }
     }
 
@@ -102,6 +105,7 @@ impl HandshakeProbe {
                 inbound_node_connections: by_node.inbound,
                 ordinary_inbound_connections: counts.slot_split().ordinary_inbound,
                 connection_cap: self.connection_cap,
+                gateway_capacity: self.gateway_capacity,
                 address_cap: self.address_cap,
                 pending: counts.pending(),
                 inbound: counts.inbound_pending(),

@@ -15,28 +15,6 @@ fn gateway(seed: u8, blocks: u32, standing: GatewayStanding) -> RankedGateway {
     }
 }
 
-/// The hold fits beside the bootstrap places in the dial quarter of the
-/// limit, and is at most ten.
-#[test]
-fn the_hold_limit_fits_in_the_dial_quarter() {
-    for (max_connections, headroom, hold) in [
-        (92, 9, 10),
-        (75, 9, 9),
-        (40, 9, 1),
-        (36, 9, 0),
-        (20, 4, 1),
-        (16, 4, 0),
-        (0, 0, 0),
-        (1, 0, 0),
-    ] {
-        assert_eq!(
-            preferred_hold_limit(max_connections, headroom),
-            hold,
-            "{max_connections} connections, {headroom} bootstrap places"
-        );
-    }
-}
-
 #[test]
 fn an_empty_ranking_holds_nothing() {
     let empty = PreferredGateways::form([], MAX_PREFERRED_GATEWAYS);
@@ -110,7 +88,7 @@ fn a_tie_at_the_cutoff_is_stable_across_rounds() {
 
 /// A ranked caller re-forms the set as if connected: its backoff is
 /// ignored, an ID v2 did not know is matched, and an outranked caller
-/// changes nothing.
+/// leaves the preferred set unchanged.
 #[test]
 fn a_ranked_caller_takes_the_place_it_ranks_for() {
     let formed = PreferredGateways::form(
@@ -125,17 +103,19 @@ fn a_ranked_caller_takes_the_place_it_ranks_for() {
     assert_eq!(formed.hold(), 2);
     assert_eq!(formed.set(), [node(2), node(4)]);
 
-    let backoff = formed.with_caller(&node(1)).expect("ranked first");
+    let backoff = formed.with_connected(&node(1)).expect("ranked first");
     assert_eq!(backoff.set(), [node(1), node(2)]);
 
     let unmatched = PreferredGateways::form(formed.ranking.clone(), 3)
-        .with_caller(&node(3))
+        .with_connected(&node(3))
         .expect("ranked above a member");
     assert_eq!(unmatched.hold(), 3);
     assert_eq!(unmatched.set(), [node(2), node(3), node(4)]);
 
-    assert_eq!(formed.with_caller(&node(2)), None, "already a member");
-    assert_eq!(formed.with_caller(&node(9)), None, "not ranked");
+    let member = formed.with_connected(&node(2)).expect("member connected");
+    assert_eq!(member.set(), formed.set());
+    assert_eq!(member.with_connected(&node(2)), None, "already connected");
+    assert_eq!(formed.with_connected(&node(9)), None, "not ranked");
     let full = PreferredGateways::form(
         [
             gateway(1, 9, GatewayStanding::Connected),
@@ -144,7 +124,8 @@ fn a_ranked_caller_takes_the_place_it_ranks_for() {
         ],
         2,
     );
-    assert_eq!(full.with_caller(&node(3)), None, "outranked");
+    let outranked = full.with_connected(&node(3)).expect("caller connected");
+    assert_eq!(outranked.set(), full.set());
 }
 
 fn standing() -> impl Strategy<Value = GatewayStanding> {
@@ -206,8 +187,7 @@ fn a_long_ranking_keeps_its_highest_counts() {
 }
 
 proptest! {
-    /// The early return for an outranked caller gives what re-forming
-    /// would.
+    /// A connection gives the same ranking as updating the standing and publishing again.
     #[test]
     fn a_caller_gets_what_re_forming_gives(
         entries in proptest::collection::vec((0u8..24, 0u32..4, standing()), 0..24),
@@ -220,16 +200,12 @@ proptest! {
             .collect();
         let formed = PreferredGateways::form(ranking, hold_limit);
         let caller = node(caller);
-        let expected = if formed.contains(&caller) {
-            None
-        } else {
-            formed.ranking.iter().position(|g| g.node == caller).and_then(|index| {
-                let mut ranking = formed.ranking.clone();
-                ranking[index].standing = GatewayStanding::Connected;
-                let re_formed = PreferredGateways::form(ranking, formed.hold_limit);
-                re_formed.contains(&caller).then_some(re_formed)
-            })
-        };
-        prop_assert_eq!(formed.with_caller(&caller), expected);
+        let mut ranking = formed.ranking.clone();
+        if let Some(entry) = ranking.iter_mut().find(|entry| entry.node == caller) {
+            entry.standing = GatewayStanding::Connected;
+        }
+        let expected = PreferredGateways::form(ranking, hold_limit);
+        let actual = formed.with_connected(&caller).unwrap_or(formed);
+        prop_assert_eq!(actual, expected);
     }
 }

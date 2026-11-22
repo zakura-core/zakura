@@ -373,11 +373,16 @@ fn assert_counted_one_post_quantum_handshake(side: &str, counters: &Counters) {
         )]),
         "{side} key exchanges"
     );
+    assert_verified_signatures(side, counters, 1);
+}
+
+/// Checks the total for the composite scheme and that no other scheme was counted.
+fn assert_verified_signatures(side: &str, counters: &Counters, expected: u64) {
     assert_eq!(
         counters.series("zakura.quic.tls.signature_verified"),
         BTreeMap::from([(
             r#"zakura.quic.tls.signature_verified{scheme="ed25519_mldsa44"}"#.to_string(),
-            1
+            expected
         )]),
         "{side} verified signatures"
     );
@@ -2185,6 +2190,8 @@ async fn assert_dial_refused(
 /// the signature.
 #[tokio::test]
 async fn client_presenting_a_key_it_cannot_sign_for_is_refused() {
+    let counters = Counters::default();
+    let _recording = metrics::set_default_local_recorder(&counters);
     tokio::time::timeout(TEST_TIMEOUT, async {
         let mut server = server();
         let victim = Arc::new(NodeSecretKey::generate());
@@ -2217,6 +2224,10 @@ async fn client_presenting_a_key_it_cannot_sign_for_is_refused() {
         assert_dial_refused(&mut server, &victim, foreign_ed25519).await;
         assert_dial_refused(&mut server, &victim, truncated).await;
 
+        // Both endpoints run on this thread. On each refused dial, only the
+        // client verified its peer's signature.
+        assert_verified_signatures("after four refused dials", &counters, 4);
+
         let v5 = victim.clone();
         dial_as(&server, &victim, move |m| {
             v5.sign_composite(m, [1; 32]).unwrap()
@@ -2225,6 +2236,8 @@ async fn client_presenting_a_key_it_cannot_sign_for_is_refused() {
         .unwrap();
         let inbound = server.handled.recv().await.unwrap();
         assert_eq!(inbound.remote_id(), victim.public());
+        // On the successful dial both endpoints verified their peer.
+        assert_verified_signatures("after the successful dial", &counters, 6);
     })
     .await
     .unwrap();

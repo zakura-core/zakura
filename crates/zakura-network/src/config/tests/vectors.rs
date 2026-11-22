@@ -31,7 +31,7 @@ use crate::{
         replace_retired_seed_node_id, ZakuraConfig, ZakuraLocalLimits, DEFAULT_HS_RANGE,
         DEFAULT_MAINNET_ZAKURA_BOOTSTRAP_PEERS, DEFAULT_TESTNET_ZAKURA_BOOTSTRAP_PEERS,
         DEFAULT_ZAKURA_BOOTSTRAP_PEERS, DEFAULT_ZAKURA_BUDGETED_CONNECTIONS,
-        DEFAULT_ZAKURA_LISTEN_ADDR, DEFAULT_ZAKURA_MAX_CONNS_PER_IP, RETIRED_ZAKURA_SEED_NODE_IDS,
+        DEFAULT_ZAKURA_LISTEN_ADDR, DEFAULT_ZAKURA_MAX_CONNS_PER_IP,
     },
     CacheDir, Config, P2pStack, PeerSocketAddr, UnconditionalPeers,
 };
@@ -3025,47 +3025,53 @@ fn block_download_score_and_hedge_is_off_by_default_and_rejects_unknown_keys() {
     );
 }
 
-/// The Mainnet defaults as configs written before p2p-v2/4 spell them out.
-fn retired_mainnet_bootstrap_peers() -> Vec<String> {
-    let retired_by_current: std::collections::HashMap<&str, &str> = RETIRED_ZAKURA_SEED_NODE_IDS
-        .iter()
-        .map(|&(retired, current)| (current, retired))
-        .collect();
-    DEFAULT_MAINNET_ZAKURA_BOOTSTRAP_PEERS
-        .iter()
-        .map(|entry| {
-            let (current, addr) = entry.split_once('@').expect("defaults are id@addr");
-            format!("{}@{addr}", retired_by_current[current])
-        })
-        .collect()
-}
+/// The Mainnet defaults before p2p-v2/4, as configs written then spell them out.
+const RETIRED_MAINNET_DEFAULTS: [&str; 9] = [
+    "1398f62c6d1a457c51ba6a4b5f3dbd2f69fca93216218dc8997e416bd17d93ca@165.22.54.66:8234",
+    "fd1724385aa0c75b64fb78cd602fa1d991fdebf76b13c58ed702eac835e9f618@104.131.184.123:8234",
+    "9ec67ad6834bc2ca0d659c240e042d3446c37cabcc092b527d459c87d938b4a4@159.65.183.89:8234",
+    "bd3dc5d2a3d44c6bf90e364bf446231dbf9737e38a562ccf9e91ea631ea59b22@143.244.184.176:8234",
+    "14ab98fa0c4b07d40119e1dbc9f3c36d20c8f226ae5ba4216218a2034f148e57@159.203.38.10:8234",
+    "681d21b18644cd82ec13256a97f92bec1fff815683ef6f65dc7c993f098a4fe5@64.227.44.93:8234",
+    "058b3f20dc9bef7bb447f94d7663d793cfbc036720f97e52d7f13661b21818e1@161.35.156.226:8234",
+    "291323d78eb7186c3fa225ef5e305e95363e0ef06d42dca91bd4ef0254aed1ae@139.59.64.115:8234",
+    "85e425233a68697d4be91dd5d542305a8a327cd06d992d53c0913cef2fa75084@168.144.173.250:8234",
+];
 
-/// Every retired ID maps to a seed that the default lists name by its current ID, and no
-/// default names a seed by a retired ID.
+/// The Testnet defaults before p2p-v2/4.
+const RETIRED_TESTNET_DEFAULTS: [&str; 3] = [
+    "57ad39fad4f0bca46cf1ea831772a99d5027b372fef2be5a0ea68e1b5bb4da49@167.99.103.111:8234",
+    "2bbb907b5d90598ef49f2e637066586b311a64587479be6ed43e8388587fcd2a@164.92.209.78:8234",
+    "50999835f48f4a048c0e9042e5332844c9673943d7fab1f7e993bae698c27ea3@206.189.148.0:8234",
+];
+
+/// Each seed's old default entry becomes its current default entry, on both networks,
+/// and a current entry is left alone.
 #[test]
-fn retired_seed_node_ids_map_onto_the_default_seeds() {
-    let defaults: Vec<&str> = DEFAULT_MAINNET_ZAKURA_BOOTSTRAP_PEERS
+fn retired_default_entries_map_onto_the_current_defaults() {
+    let old = RETIRED_MAINNET_DEFAULTS
         .iter()
-        .chain(DEFAULT_TESTNET_ZAKURA_BOOTSTRAP_PEERS)
-        .copied()
-        .collect();
-    let default_ids: std::collections::HashSet<&str> = defaults
+        .chain(&RETIRED_TESTNET_DEFAULTS);
+    let current = DEFAULT_MAINNET_ZAKURA_BOOTSTRAP_PEERS
         .iter()
-        .map(|entry| entry.split_once('@').expect("defaults are id@addr").0)
-        .collect();
+        .chain(DEFAULT_TESTNET_ZAKURA_BOOTSTRAP_PEERS);
 
-    assert_eq!(RETIRED_ZAKURA_SEED_NODE_IDS.len(), defaults.len());
-    let mut retired_ids = std::collections::HashSet::new();
-    for &(retired, current) in RETIRED_ZAKURA_SEED_NODE_IDS {
-        assert!(retired_ids.insert(retired), "{retired} is listed once");
-        assert!(default_ids.contains(current), "{current} is a default seed");
-        assert!(!default_ids.contains(retired), "{retired} is not a default");
+    for (old, current) in old.zip(current) {
+        assert_eq!(
+            replace_retired_seed_node_id(old).as_deref(),
+            Some(*current),
+            "{old}"
+        );
+        assert_eq!(replace_retired_seed_node_id(current), None, "{current}");
     }
 }
 
 #[test]
 fn replace_retired_seed_node_id_keeps_the_written_address() {
-    let (retired, current) = RETIRED_ZAKURA_SEED_NODE_IDS[0];
+    let (retired, _) = RETIRED_MAINNET_DEFAULTS[0].split_once('@').unwrap();
+    let (current, _) = DEFAULT_MAINNET_ZAKURA_BOOTSTRAP_PEERS[0]
+        .split_once('@')
+        .unwrap();
 
     assert_eq!(
         replace_retired_seed_node_id(&format!("{retired}@192.0.2.7:9000")),
@@ -3078,7 +3084,6 @@ fn replace_retired_seed_node_id_keeps_the_written_address() {
     );
 
     for untouched in [
-        DEFAULT_MAINNET_ZAKURA_BOOTSTRAP_PEERS[0].to_string(),
         format!("{}@192.0.2.7:9000", "ab".repeat(32)),
         retired.to_string(),
         "not-a-node-id@192.0.2.7:9000".to_string(),
@@ -3092,38 +3097,61 @@ fn replace_retired_seed_node_id_keeps_the_written_address() {
 }
 
 #[test]
-fn replace_retired_seed_node_ids_restores_the_mainnet_defaults() {
+fn replace_retired_seed_node_ids_reports_each_replacement() {
+    let other = format!("{}@192.0.2.9:8234", "cd".repeat(32));
     let mut zakura = ZakuraConfig {
-        bootstrap_peers: retired_mainnet_bootstrap_peers(),
+        bootstrap_peers: vec![
+            RETIRED_MAINNET_DEFAULTS[2].to_string(),
+            other.clone(),
+            RETIRED_TESTNET_DEFAULTS[1].to_string(),
+        ],
         ..ZakuraConfig::default()
     };
 
     let replaced = zakura.replace_retired_seed_node_ids();
 
-    assert_eq!(replaced.len(), DEFAULT_MAINNET_ZAKURA_BOOTSTRAP_PEERS.len());
-    assert_eq!(zakura.bootstrap_peers, default_zakura_bootstrap_peers());
+    let expected = vec![
+        DEFAULT_MAINNET_ZAKURA_BOOTSTRAP_PEERS[2].to_string(),
+        other,
+        DEFAULT_TESTNET_ZAKURA_BOOTSTRAP_PEERS[1].to_string(),
+    ];
+    assert_eq!(zakura.bootstrap_peers, expected);
+    assert_eq!(
+        replaced,
+        vec![
+            (RETIRED_MAINNET_DEFAULTS[2].to_string(), expected[0].clone()),
+            (RETIRED_TESTNET_DEFAULTS[1].to_string(), expected[2].clone()),
+        ]
+    );
     assert!(
         zakura.replace_retired_seed_node_ids().is_empty(),
         "a second pass finds nothing"
     );
 }
 
-/// A generated config that spells out the Mainnet defaults by their retired IDs still
-/// counts as the implicit default, so a Testnet node gets the Testnet seeds.
+/// A generated config spells out the Mainnet defaults, possibly by their retired IDs. On
+/// Testnet that list still counts as the implicit default, so the node gets the Testnet
+/// seeds. On Mainnet it is kept as written, so the startup replacement reports it.
 #[test]
-fn retired_mainnet_defaults_switch_to_the_testnet_defaults() {
-    let peers = retired_mainnet_bootstrap_peers()
+fn retired_mainnet_defaults_follow_the_network() {
+    let peers = RETIRED_MAINNET_DEFAULTS
         .iter()
         .map(|entry| format!("'{entry}'"))
         .collect::<Vec<_>>()
         .join(", ");
-    let config: Config = toml::from_str(&format!(
-        "network = 'Testnet'\n[zakura]\nbootstrap_peers = [{peers}]"
-    ))
-    .expect("config with retired default seeds parses");
+    let parse = |network: &str| -> Config {
+        toml::from_str(&format!(
+            "network = '{network}'\n[zakura]\nbootstrap_peers = [{peers}]"
+        ))
+        .expect("config with retired default seeds parses")
+    };
 
     assert_eq!(
-        config.zakura.bootstrap_peers,
+        parse("Testnet").zakura.bootstrap_peers,
         default_testnet_zakura_bootstrap_peers()
+    );
+    assert_eq!(
+        parse("Mainnet").zakura.bootstrap_peers,
+        RETIRED_MAINNET_DEFAULTS.map(String::from)
     );
 }

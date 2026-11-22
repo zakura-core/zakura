@@ -1,21 +1,71 @@
-//! Rewrite a config file whose `network.zakura.bootstrap_peers` name default seeds
-//! by their retired v2 node IDs.
+//! Replace the default seeds' retired v2 node IDs in `zakura.bootstrap_peers`, both in
+//! the loaded config and in the config file it came from.
 
 use std::{
     fs,
     io::{self, Write as _},
+    ops::Range,
     path::{Path, PathBuf},
 };
 
-use toml_edit::{DocumentMut, Value};
-use zakura_network::zakura::replace_retired_seed_node_id;
+use toml::{
+    de::{DeTable, DeValue},
+    Spanned,
+};
+use zakura_network::zakura::{replace_retired_seed_node_id, ZakuraConfig};
 
 /// Suffix of the copy of the original file kept beside a rewritten config.
 const BACKUP_SUFFIX: &str = ".pre-pq-seed-ids.bak";
 
+/// Switches each `zakura.bootstrap_peers` entry that names a default seed by its retired
+/// node ID to the seed's current ID, in `zakura` and in the file at `config_path`.
+///
+/// The file keeps every other byte, and its original is kept beside it. Nothing here can
+/// stop startup: if the file cannot be rewritten, this warns and the node still dials the
+/// current IDs. It also warns about each replacement the file did not account for, such
+/// as one from an environment override, so the operator can fix its source.
+pub(crate) fn replace_retired_seed_ids(config_path: Option<&Path>, zakura: &mut ZakuraConfig) {
+    let rewritten = match config_path.map(rewrite_config_file) {
+        None | Some(Ok(RewriteOutcome::Unchanged)) => Vec::new(),
+        Some(Ok(RewriteOutcome::Rewrote {
+            path,
+            replaced,
+            backup,
+        })) => {
+            info!(
+                ?path,
+                ?backup,
+                ?replaced,
+                "rewrote zakura.bootstrap_peers in the config file with the default seeds' \
+                 current node IDs; the original is in the backup"
+            );
+            replaced
+        }
+        Some(Err(error)) => {
+            warn!(
+                %error,
+                "could not rewrite the config file's retired default seed node IDs"
+            );
+            Vec::new()
+        }
+    };
+
+    for replacement in zakura.replace_retired_seed_node_ids() {
+        if !rewritten.contains(&replacement) {
+            let (retired, current) = replacement;
+            warn!(
+                %retired,
+                %current,
+                "zakura.bootstrap_peers names a default seed by the node ID it had before \
+                 p2p-v2/4; dialing its current ID instead. Update the entry where it is set"
+            );
+        }
+    }
+}
+
 /// What [`rewrite_config_file`] did.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum RewriteOutcome {
+enum RewriteOutcome {
     /// No entry names a default seed by a retired node ID, so the file was not written.
     Unchanged,
     /// The file now names the seeds by their current IDs.
@@ -31,7 +81,7 @@ pub(crate) enum RewriteOutcome {
 
 /// Why [`rewrite_config_file`] left the file as it was.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum RewriteError {
+enum RewriteError {
     #[error("could not access {path:?}: {source}")]
     Io {
         path: PathBuf,
@@ -42,19 +92,22 @@ pub(crate) enum RewriteError {
     Parse {
         path: PathBuf,
         #[source]
-        source: toml_edit::TomlError,
+        source: toml::de::Error,
     },
+    #[error("{path:?} is read-only")]
+    ReadOnly { path: PathBuf },
     #[error("the rewritten {path:?} would load differently from the original beyond the seed IDs")]
     Unverified { path: PathBuf },
 }
 
-/// Replaces default seeds' retired node IDs in the config file that the loader reads
-/// for `path`, keeping everything else in the file byte for byte.
+/// Replaces default seeds' retired node IDs in the config file that the loader reads for
+/// `path`, changing only the characters of each replaced ID.
 ///
-/// Before writing, it copies the original to `<file>.pre-pq-seed-ids.bak`, unless that
-/// copy already exists. The new contents replace the file in one rename, so a crash
-/// leaves either the old or the new file. A symlink is followed and kept.
-pub(crate) fn rewrite_config_file(path: &Path) -> Result<RewriteOutcome, RewriteError> {
+/// A read-only file is left alone. Before writing, the original is copied to
+/// `<file>.pre-pq-seed-ids.bak`, unless that copy already exists. The new contents
+/// replace the file in one rename and keep its permissions and owner, so a crash leaves
+/// either the old or the new file. A symlink is followed and kept.
+fn rewrite_config_file(path: &Path) -> Result<RewriteOutcome, RewriteError> {
     let io_error = |path: &Path| {
         let path = path.to_path_buf();
         move |source| RewriteError::Io { path, source }
@@ -62,6 +115,7 @@ pub(crate) fn rewrite_config_file(path: &Path) -> Result<RewriteOutcome, Rewrite
 
     let path = super::loader::resolve_config_file(path.to_path_buf()).map_err(io_error(path))?;
     let path = fs::canonicalize(&path).map_err(io_error(&path))?;
+    let metadata = fs::metadata(&path).map_err(io_error(&path))?;
     let original = fs::read_to_string(&path).map_err(io_error(&path))?;
     // The loader accepts a UTF-8 byte order mark, which TOML parsers reject.
     let (bom, original) = match original.strip_prefix('\u{feff}') {
@@ -69,23 +123,33 @@ pub(crate) fn rewrite_config_file(path: &Path) -> Result<RewriteOutcome, Rewrite
         None => ("", original.as_str()),
     };
 
-    let Some((rewritten, replaced)) =
-        replace_in_document(original).map_err(|source| RewriteError::Parse {
+    let (rewritten, replaced) =
+        replace_in_text(original).map_err(|source| RewriteError::Parse {
             path: path.clone(),
             source,
-        })?
-    else {
+        })?;
+    if replaced.is_empty() {
         return Ok(RewriteOutcome::Unchanged);
-    };
+    }
+    if metadata.permissions().readonly() {
+        return Err(RewriteError::ReadOnly { path });
+    }
     if !loads_as_original_with_ids_replaced(original, &rewritten) {
         return Err(RewriteError::Unverified { path });
     }
 
     let backup = with_suffix(&path, BACKUP_SUFFIX);
-    if !backup.exists() {
+    let created_backup = !backup.exists();
+    if created_backup {
         fs::copy(&path, &backup).map_err(io_error(&backup))?;
     }
-    replace_file(&path, format!("{bom}{rewritten}").as_bytes()).map_err(io_error(&path))?;
+    if let Err(error) = replace_file(&path, format!("{bom}{rewritten}").as_bytes(), &metadata) {
+        // A backup of a file that was never rewritten would only mislead.
+        if created_backup {
+            let _ = fs::remove_file(&backup);
+        }
+        return Err(io_error(&path)(error));
+    }
 
     Ok(RewriteOutcome::Rewrote {
         path,
@@ -94,42 +158,59 @@ pub(crate) fn rewrite_config_file(path: &Path) -> Result<RewriteOutcome, Rewrite
     })
 }
 
-/// Returns `text` with retired seed IDs replaced in `network.zakura.bootstrap_peers`,
-/// and the `(old, new)` entries, or `None` when there is nothing to replace.
-fn replace_in_document(
-    text: &str,
-) -> Result<Option<(String, Vec<(String, String)>)>, toml_edit::TomlError> {
-    let mut document = text.parse::<DocumentMut>()?;
+/// Returns `text` with retired seed IDs replaced in `network.zakura.bootstrap_peers`, and
+/// the `(old, new)` entries. Only the characters of each replaced ID change.
+fn replace_in_text(text: &str) -> Result<(String, Vec<(String, String)>), toml::de::Error> {
+    fn table<'a, 'i>(value: Option<&'a Spanned<DeValue<'i>>>) -> Option<&'a DeTable<'i>> {
+        match value?.get_ref() {
+            DeValue::Table(table) => Some(table),
+            _ => None,
+        }
+    }
 
-    // Table-like access covers `[network.zakura]` tables, dotted keys and inline tables.
-    let Some(peers) = document
-        .get_mut("network")
-        .and_then(|network| network.as_table_like_mut())
-        .and_then(|network| network.get_mut("zakura"))
-        .and_then(|zakura| zakura.as_table_like_mut())
-        .and_then(|zakura| zakura.get_mut("bootstrap_peers"))
-        .and_then(|peers| peers.as_array_mut())
-    else {
-        return Ok(None);
-    };
+    let document = DeTable::parse(text)?;
+    // Tables, dotted keys and inline tables all parse to nested tables with source spans.
+    let peers = table(document.get_ref().get("network"))
+        .and_then(|network| table(network.get("zakura")))
+        .and_then(|zakura| match zakura.get("bootstrap_peers")?.get_ref() {
+            DeValue::Array(peers) => Some(peers),
+            _ => None,
+        });
 
+    let mut edits: Vec<(Range<usize>, String)> = Vec::new();
     let mut replaced = Vec::new();
-    for value in peers.iter_mut() {
-        let Value::String(formatted) = value else {
+    for peer in peers.into_iter().flat_map(|peers| peers.iter()) {
+        let DeValue::String(entry) = peer.get_ref() else {
             continue;
         };
-        let entry = formatted.value().clone();
-        let Some(current) = replace_retired_seed_node_id(&entry) else {
+        let Some(current) = replace_retired_seed_node_id(entry) else {
             continue;
         };
-        *value = replacement_value(value, &entry, &current);
-        replaced.push((entry, current));
+        let literal = literal_with_id_replaced(&text[peer.span()], entry, &current);
+        edits.push((peer.span(), literal));
+        replaced.push((entry.to_string(), current));
     }
 
-    if replaced.is_empty() {
-        return Ok(None);
+    let mut rewritten = text.to_owned();
+    // Later spans first, so earlier spans keep their offsets.
+    for (span, literal) in edits.into_iter().rev() {
+        rewritten.replace_range(span, &literal);
     }
-    Ok(Some((document.to_string(), replaced)))
+    Ok((rewritten, replaced))
+}
+
+/// Returns the TOML string `literal`, whose value is `entry`, holding `current` instead.
+///
+/// The ID is swapped inside the literal as written, so its quoting stays. A literal that
+/// does not spell the ID exactly once, such as one using escapes, is written plainly.
+fn literal_with_id_replaced(literal: &str, entry: &str, current: &str) -> String {
+    let id = |entry: &str| entry.split_once('@').map_or(entry, |(id, _)| id).to_owned();
+    let (entry_id, current_id) = (id(entry), id(current));
+    if literal.matches(&entry_id).count() == 1 {
+        literal.replacen(&entry_id, &current_id, 1)
+    } else {
+        format!("{current:?}")
+    }
 }
 
 /// Returns whether `rewritten` parses, with the parser the config loader uses, to exactly
@@ -157,33 +238,9 @@ fn loads_as_original_with_ids_replaced(original: &str, rewritten: &str) -> bool 
     expected == rewritten
 }
 
-/// Returns `original`, whose string is `entry`, holding `current` instead, with the same
-/// quoting and the same whitespace and comments around it.
-fn replacement_value(original: &Value, entry: &str, current: &str) -> Value {
-    let entry_id = entry.split_once('@').map_or(entry, |(id, _)| id);
-    let current_id = current.split_once('@').map_or(current, |(id, _)| id);
-
-    // Swap the ID inside the literal as written, so a single-quoted string stays one.
-    // An escaped literal does not contain the ID verbatim, so it is written plainly.
-    let mut value = match original {
-        Value::String(formatted) => formatted
-            .display_repr()
-            .replace(entry_id, current_id)
-            .parse::<Value>()
-            .ok()
-            .filter(|value| value.as_str() == Some(current)),
-        _ => None,
-    }
-    .unwrap_or_else(|| Value::from(current));
-
-    *value.decor_mut() = original.decor().clone();
-    value
-}
-
-/// Writes `contents` to a sibling of `path` with `path`'s permissions, then renames it
-/// over `path`.
-fn replace_file(path: &Path, contents: &[u8]) -> io::Result<()> {
-    let permissions = fs::metadata(path)?.permissions();
+/// Writes `contents` to a sibling of `path` with the permissions and owner in `metadata`,
+/// then renames it over `path`. Fails rather than change the file's owner.
+fn replace_file(path: &Path, contents: &[u8], metadata: &fs::Metadata) -> io::Result<()> {
     // A per-process name, so two processes sharing a config cannot interleave writes.
     let temp = with_suffix(path, &format!(".tmp.{}", std::process::id()));
     let write = || -> io::Result<()> {
@@ -192,7 +249,12 @@ fn replace_file(path: &Path, contents: &[u8]) -> io::Result<()> {
             .create(true)
             .truncate(true)
             .open(&temp)?;
-        file.set_permissions(permissions)?;
+        file.set_permissions(metadata.permissions())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            std::os::unix::fs::fchown(&file, Some(metadata.uid()), Some(metadata.gid()))?;
+        }
         file.write_all(contents)?;
         file.sync_all()?;
         fs::rename(&temp, path)

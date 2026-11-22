@@ -1,16 +1,37 @@
-//! Tests for rewriting retired seed node IDs in config files.
+//! Tests for replacing retired seed node IDs in the loaded config and the config file.
 
 use std::fs;
-
-use zakura_network::zakura::RETIRED_ZAKURA_SEED_NODE_IDS;
 
 use super::*;
 
 const DEFAULT_ENTRY: &str = zakura_network::zakura::DEFAULT_MAINNET_ZAKURA_BOOTSTRAP_PEERS[0];
 
-fn retired_entry(index: usize, addr: &str) -> (String, String) {
-    let (retired, current) = RETIRED_ZAKURA_SEED_NODE_IDS[index];
+/// Some default seeds' `(retired, current)` node IDs, Mainnet and Testnet.
+const SEED_IDS: [(&str, &str); 3] = [
+    // asia-0
+    (
+        "1398f62c6d1a457c51ba6a4b5f3dbd2f69fca93216218dc8997e416bd17d93ca",
+        "a5f148b592404c5fcdc27f06919681c1dceddb274336abf5c91e70780471bc12",
+    ),
+    // us-east-0
+    (
+        "9ec67ad6834bc2ca0d659c240e042d3446c37cabcc092b527d459c87d938b4a4",
+        "ca22584f4392a26c46f9553e45db00fc8de06f1ff8f2c48f5d28b5cd58f134b6",
+    ),
+    // zakura-testnet-1
+    (
+        "57ad39fad4f0bca46cf1ea831772a99d5027b372fef2be5a0ea68e1b5bb4da49",
+        "672cb8d35831d6020f14e35215de0f7fc1ee771ecd3c9d5fe67c32acb0b53fab",
+    ),
+];
+
+fn retired_entry(seed: usize, addr: &str) -> (String, String) {
+    let (retired, current) = SEED_IDS[seed];
     (format!("{retired}@{addr}"), format!("{current}@{addr}"))
+}
+
+fn one_entry_file(entry: &str) -> String {
+    format!("network.zakura.bootstrap_peers = [\"{entry}\"]\n")
 }
 
 /// Writes `text` to `zakura.toml` in a new temp dir.
@@ -26,7 +47,7 @@ fn config_file(text: &str) -> (tempfile::TempDir, PathBuf) {
 #[test]
 fn rewrite_replaces_only_retired_ids_in_every_layout() {
     let (old_a, new_a) = retired_entry(0, "192.0.2.1:8234");
-    let (old_b, new_b) = retired_entry(9, "192.0.2.2:8234");
+    let (old_b, new_b) = retired_entry(2, "192.0.2.2:8234");
     let other = format!("{}@192.0.2.3:8234", "ef".repeat(32));
 
     let layouts = [
@@ -91,7 +112,7 @@ fn rewrite_leaves_other_files_alone() {
 #[test]
 fn rewrite_keeps_an_existing_backup() {
     let (old, new) = retired_entry(1, "192.0.2.1:8234");
-    let original = format!("network.zakura.bootstrap_peers = [\"{old}\"]\n");
+    let original = one_entry_file(&old);
     let (_dir, path) = config_file(&original);
     let backup = with_suffix(&fs::canonicalize(&path).unwrap(), BACKUP_SUFFIX);
     fs::write(&backup, "first original").unwrap();
@@ -109,8 +130,8 @@ fn rewrite_keeps_an_existing_backup() {
 #[cfg(unix)]
 #[test]
 fn rewrite_follows_a_symlink() {
-    let (old, new) = retired_entry(2, "192.0.2.1:8234");
-    let original = format!("network.zakura.bootstrap_peers = [\"{old}\"]\n");
+    let (old, new) = retired_entry(1, "192.0.2.1:8234");
+    let original = one_entry_file(&old);
     let (dir, target) = config_file(&original);
     let link = dir.path().join("link.toml");
     std::os::unix::fs::symlink(&target, &link).unwrap();
@@ -130,8 +151,8 @@ fn rewrite_follows_a_symlink() {
 /// The rewrite keeps a UTF-8 byte order mark, which the loader accepts.
 #[test]
 fn rewrite_keeps_a_byte_order_mark() {
-    let (old, new) = retired_entry(3, "192.0.2.1:8234");
-    let original = format!("\u{feff}network.zakura.bootstrap_peers = [\"{old}\"]\n");
+    let (old, new) = retired_entry(1, "192.0.2.1:8234");
+    let original = format!("\u{feff}{}", one_entry_file(&old));
     let (_dir, path) = config_file(&original);
 
     rewrite_config_file(&path).expect("rewrite succeeds");
@@ -142,11 +163,12 @@ fn rewrite_keeps_a_byte_order_mark() {
     );
 }
 
-/// A failed write reports an error and leaves the config as it was.
+/// A failed write reports an error, leaves the config as it was, and removes the backup
+/// it made.
 #[test]
 fn failed_write_leaves_the_file_alone() {
-    let (old, _new) = retired_entry(4, "192.0.2.1:8234");
-    let original = format!("network.zakura.bootstrap_peers = [\"{old}\"]\n");
+    let (old, _new) = retired_entry(1, "192.0.2.1:8234");
+    let original = one_entry_file(&old);
     let (_dir, path) = config_file(&original);
     // A directory where the temp file goes makes the write fail, even for root.
     let temp = format!(".tmp.{}", std::process::id());
@@ -156,6 +178,74 @@ fn failed_write_leaves_the_file_alone() {
 
     assert!(matches!(error, RewriteError::Io { .. }), "{error}");
     assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    assert!(!with_suffix(&fs::canonicalize(&path).unwrap(), BACKUP_SUFFIX).exists());
+}
+
+/// A read-only config is the operator's to change, so it is left alone.
+#[test]
+fn rewrite_leaves_a_read_only_file_alone() {
+    let (old, _new) = retired_entry(0, "192.0.2.1:8234");
+    let original = one_entry_file(&old);
+    let (dir, path) = config_file(&original);
+    let mut permissions = fs::metadata(&path).unwrap().permissions();
+    permissions.set_readonly(true);
+    fs::set_permissions(&path, permissions).unwrap();
+
+    let error = rewrite_config_file(&path).expect_err("the file is read-only");
+
+    assert!(matches!(error, RewriteError::ReadOnly { .. }), "{error}");
+    assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1, "no backup");
+}
+
+/// The rewritten file keeps its owner. Changing a file's owner needs root, so this only
+/// checks anything when the tests run as root.
+#[cfg(unix)]
+#[test]
+fn rewrite_keeps_the_owner() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let (old, _new) = retired_entry(0, "192.0.2.1:8234");
+    let (_dir, path) = config_file(&one_entry_file(&old));
+    if std::os::unix::fs::chown(&path, Some(4321), Some(4321)).is_err() {
+        return;
+    }
+
+    rewrite_config_file(&path).expect("rewrite succeeds");
+
+    let metadata = fs::metadata(&path).unwrap();
+    assert_eq!((metadata.uid(), metadata.gid()), (4321, 4321));
+}
+
+/// The loaded config gets the same replacement as the file, and an entry the file does not
+/// hold, such as one from an environment override, is replaced too.
+#[test]
+fn loaded_config_follows_the_file() {
+    let (old_file, new_file) = retired_entry(0, "192.0.2.1:8234");
+    let (old_env, new_env) = retired_entry(2, "192.0.2.2:8234");
+    let (_dir, path) = config_file(&one_entry_file(&old_file));
+    let mut zakura = ZakuraConfig {
+        bootstrap_peers: vec![old_file, old_env.clone()],
+        ..ZakuraConfig::default()
+    };
+
+    replace_retired_seed_ids(Some(&path), &mut zakura);
+
+    assert_eq!(
+        zakura.bootstrap_peers,
+        vec![new_file.clone(), new_env.clone()]
+    );
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        one_entry_file(&new_file)
+    );
+
+    let mut without_file = ZakuraConfig {
+        bootstrap_peers: vec![old_env],
+        ..ZakuraConfig::default()
+    };
+    replace_retired_seed_ids(None, &mut without_file);
+    assert_eq!(without_file.bootstrap_peers, vec![new_env]);
 }
 
 /// A file that does not parse is reported, not rewritten.
@@ -173,7 +263,7 @@ fn unparseable_file_is_reported() {
 /// `network.zakura` stays, and so do entries with other IDs, the order and the addresses.
 #[test]
 fn rewrite_touches_only_matched_bootstrap_ids() {
-    let (retired, current) = RETIRED_ZAKURA_SEED_NODE_IDS[5];
+    let (retired, current) = SEED_IDS[1];
     let upper = retired.to_uppercase();
     let near_miss = format!("{}0", &retired[..63]);
     let original = format!(
@@ -225,8 +315,8 @@ fn rewrite_touches_only_matched_bootstrap_ids() {
 /// seed IDs replaced.
 #[test]
 fn rewrite_is_checked_against_the_loader() {
-    let (old, new) = retired_entry(6, "192.0.2.1:8234");
-    let original = format!("network.zakura.bootstrap_peers = [\"{old}\"]\nother = 1\n");
+    let (old, new) = retired_entry(1, "192.0.2.1:8234");
+    let original = format!("{}other = 1\n", one_entry_file(&old));
 
     assert!(loads_as_original_with_ids_replaced(
         &original,

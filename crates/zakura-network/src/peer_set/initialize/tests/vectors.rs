@@ -47,9 +47,8 @@ use crate::{
             accept_inbound_connections, add_initial_peers, crawl_and_dial,
             keep_unconditional_peers_connected, leave_out_undialable_unconditional_peers,
             lookup_host, open_listener, outbound_peer_replenishment_demand,
-            replace_retired_seed_node_ids, unconditional_peer_dial_addrs,
-            unconditional_peers::LOOKUPS_IN_FLIGHT, DiscoveredPeer, ReplenishmentBudget,
-            OUTBOUND_PEER_REPLENISHMENT_TARGET_DENOMINATOR,
+            unconditional_peer_dial_addrs, unconditional_peers::LOOKUPS_IN_FLIGHT, DiscoveredPeer,
+            ReplenishmentBudget, OUTBOUND_PEER_REPLENISHMENT_TARGET_DENOMINATOR,
             OUTBOUND_PEER_REPLENISHMENT_TARGET_NUMERATOR,
         },
         set::MorePeers,
@@ -5274,23 +5273,4 @@ where
     let add_task_handle = tokio::spawn(add_fut);
 
     (add_task_handle, peerset_rx, address_book_updater_guard)
-}
-
-/// Startup dials a default seed listed by its retired node ID at its current ID, and
-/// leaves other entries as written.
-#[test]
-fn startup_replaces_retired_seed_node_ids() {
-    let _init_guard = zakura_test::init();
-
-    let (retired, current) = crate::zakura::RETIRED_ZAKURA_SEED_NODE_IDS[2];
-    let other = format!("{}@192.0.2.9:8234", "cd".repeat(32));
-    let mut config = test_defaults();
-    config.zakura.bootstrap_peers = vec![format!("{retired}@192.0.2.8:8234"), other.clone()];
-
-    replace_retired_seed_node_ids(&mut config);
-
-    assert_eq!(
-        config.zakura.bootstrap_peers,
-        vec![format!("{current}@192.0.2.8:8234"), other],
-    );
 }

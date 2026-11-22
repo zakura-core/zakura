@@ -65,10 +65,8 @@ mod tests;
 
 mod held_seats;
 mod recent_by_ip;
-mod retired_seed_node_ids;
 mod unconditional_peers;
 
-use retired_seed_node_ids::replace_retired_seed_node_ids;
 use unconditional_peers::{
     keep_unconditional_peers_connected, leave_out_undialable_unconditional_peers, lookup_host,
     unconditional_peer_dial_addrs,
@@ -222,7 +220,6 @@ where
     };
     let mut config = config;
     leave_out_undialable_unconditional_peers(&mut config, listen_addr);
-    replace_retired_seed_node_ids(&mut config);
     // Clone the inbound service for the Zakura legacy-gossip sink before the
     // handshake builder consumes the original below. The factory only runs when
     // `v2_p2p` is enabled; otherwise the endpoint is `None` and the clone drops.

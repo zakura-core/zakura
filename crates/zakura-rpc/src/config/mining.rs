@@ -67,6 +67,18 @@ pub struct Config {
     /// Advertise prepared mined block hashes after expected-work validation and state admission,
     /// but before contextual commit completes.
     pub optimistic_block_inventory: bool,
+
+    /// Name this node as the miner's gateway in the coinbase of every block Zakura builds.
+    ///
+    /// The coinbase gets one extra zero-value output that carries this node's v2 node ID, so
+    /// other mining nodes can find the node and keep a direct connection to it. The output
+    /// takes 48 bytes of the block.
+    ///
+    /// Needs the v2 P2P stack and a node key that stays the same across restarts: `zakurad`
+    /// refuses to start with this set unless it has both.
+    ///
+    /// Off by default.
+    pub miner_mesh: bool,
 }
 
 mod miner_address {
@@ -105,6 +117,7 @@ impl Default for Config {
             miner_memo: None,
             internal_miner: false,
             optimistic_block_inventory: true,
+            miner_mesh: false,
         }
     }
 }

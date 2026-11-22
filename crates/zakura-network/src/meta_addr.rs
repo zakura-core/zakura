@@ -244,6 +244,8 @@ pub enum MetaAddrChange {
             proptest(strategy = "canonical_peer_addr_strategy()")
         )]
         addr: PeerSocketAddr,
+        /// A last seen time that keeps a failed startup peer retryable, if any.
+        untrusted_last_seen: Option<DateTime32>,
     },
 
     /// Creates a new gossiped `MetaAddr`.
@@ -330,6 +332,26 @@ impl MetaAddr {
     pub fn new_initial_peer(addr: PeerSocketAddr) -> MetaAddrChange {
         NewInitial {
             addr: canonical_peer_addr(addr),
+            untrusted_last_seen: None,
+        }
+    }
+
+    /// Returns a [`MetaAddrChange::NewInitial`] for a peer that startup dials, from
+    /// the peer cache or a DNS seed.
+    ///
+    /// The peer gets a last seen time [`STARTUP_PEER_LAST_SEEN_AGE`] before `now`. If
+    /// its startup dial fails, it stays
+    /// [probably reachable](MetaAddr::is_probably_reachable), so it is retried after
+    /// the usual reconnection delay instead of never again this run. The time is
+    /// outside [`MAX_PEER_ACTIVE_FOR_GOSSIP`], so the peer is not gossiped or cached
+    /// until it responds.
+    ///
+    /// [`STARTUP_PEER_LAST_SEEN_AGE`]: constants::STARTUP_PEER_LAST_SEEN_AGE
+    /// [`MAX_PEER_ACTIVE_FOR_GOSSIP`]: constants::MAX_PEER_ACTIVE_FOR_GOSSIP
+    pub fn new_startup_peer(addr: PeerSocketAddr, now: DateTime32) -> MetaAddrChange {
+        NewInitial {
+            addr: canonical_peer_addr(addr),
+            untrusted_last_seen: Some(now.saturating_sub(constants::STARTUP_PEER_LAST_SEEN_AGE)),
         }
     }
 
@@ -795,7 +817,7 @@ impl MetaAddrChange {
     /// Return the address for this change.
     pub fn addr(&self) -> PeerSocketAddr {
         match self {
-            NewInitial { addr }
+            NewInitial { addr, .. }
             | NewGossiped { addr, .. }
             | NewLocal { addr, .. }
             | UpdateAttempt { addr }
@@ -812,7 +834,7 @@ impl MetaAddrChange {
     /// This method should only be used in tests.
     pub fn set_addr(&mut self, new_addr: PeerSocketAddr) {
         match self {
-            NewInitial { addr }
+            NewInitial { addr, .. }
             | NewGossiped { addr, .. }
             | NewLocal { addr, .. }
             | UpdateAttempt { addr }
@@ -843,7 +865,10 @@ impl MetaAddrChange {
     /// Return the untrusted last seen time for this change, if available.
     pub fn untrusted_last_seen(&self, now: DateTime32) -> Option<DateTime32> {
         match self {
-            NewInitial { .. } => None,
+            NewInitial {
+                untrusted_last_seen,
+                ..
+            } => *untrusted_last_seen,
             NewGossiped {
                 untrusted_last_seen,
                 ..

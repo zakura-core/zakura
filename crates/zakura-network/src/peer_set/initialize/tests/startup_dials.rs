@@ -215,10 +215,19 @@ async fn startup_window_preserves_target_and_ip_limits() {
     assert_eq!(dialed, expected[..3].iter().copied().collect());
     assert!(attempts.recv().await.is_none());
     let mut addresses = Vec::new();
+    let mut failed = std::collections::HashSet::new();
     while let Some(change) = book.recv().await {
-        addresses.push(change.addr());
+        if matches!(change, MetaAddrChange::UpdateFailed { .. }) {
+            failed.insert(change.addr());
+        } else {
+            addresses.push(change.addr());
+        }
     }
     assert_eq!(addresses, cached, "even skipped candidates reach discovery");
+    assert_eq!(
+        failed, dialed,
+        "failed startup dials are marked failed, so the crawler does not retry them first"
+    );
 }
 
 /// Dropping startup aborts every admitted connector and never starts the queued suffix.

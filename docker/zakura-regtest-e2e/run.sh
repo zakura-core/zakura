@@ -15,6 +15,9 @@
 #   1. all four nodes come up on a fresh Regtest chain,
 #   2. legacy TCP compatibility: node3 peers with node1 (getpeerinfo),
 #   3. the legacy->Zakura upgrade ran (zakura_p2p_handshake_upgraded on node1/node4),
+#   3b. every v2 node (node1, node2, node4) completed X25519MLKEM768 key
+#      exchanges and verified Ed25519+ML-DSA-44 handshake signatures, with no
+#      other group or scheme; node2 is checked again after its reset catch-up,
 #   4. the pure Zakura-only node2 has zero legacy peers (no legacy stack at all),
 #   4b. the pure Zakura-only node2 bootstraps the genesis block over Zakura: with
 #      the Regtest genesis self-seed disabled (sync.debug_skip_regtest_genesis_self_seed)
@@ -447,7 +450,9 @@ rpc() {
     "${max_time}"
 }
 
-# metric <port> <name> -> counter value (0 if absent)
+# metric <port> <series> -> counter value (0 if absent). <series> is a metric
+# name, or a name with its labels exactly as /metrics renders them, such as
+# 'zakura_quic_tls_key_exchange{group="X25519MLKEM768"}'.
 metric() {
   local port="$1" name="$2"
   container_http "${port}" "/metrics" "" 5 2>/dev/null \
@@ -543,6 +548,29 @@ wait_metric_at_least() {
     sleep 3
   done
   fail "${label} ${name} stayed below ${want} within ${timeout}s"
+}
+
+# The only v2 TLS series a node may export: the hybrid key-exchange group
+# (zakura-quic TLS-9) and the composite signature scheme (TLS-4).
+PQ_KEY_EXCHANGE_SERIES='zakura_quic_tls_key_exchange{group="X25519MLKEM768"}'
+PQ_SIGNATURE_SERIES='zakura_quic_tls_signature_verified{scheme="ed25519_mldsa44"}'
+
+# assert_post_quantum_handshakes <metrics-port> <label>
+# Requires at least one completed X25519MLKEM768 key exchange and one verified
+# Ed25519+ML-DSA-44 handshake signature, and no other group or scheme.
+assert_post_quantum_handshakes() {
+  local port="$1" label="$2" other
+  wait_metric_at_least "${port}" "${PQ_KEY_EXCHANGE_SERIES}" 1 "${label}"
+  wait_metric_at_least "${port}" "${PQ_SIGNATURE_SERIES}" 1 "${label}"
+  other=$(container_http "${port}" "/metrics" "" 5 \
+    | awk -v kx="${PQ_KEY_EXCHANGE_SERIES}" -v sig="${PQ_SIGNATURE_SERIES}" '
+        $1 ~ /^zakura_quic_tls_(key_exchange|signature_verified)/ && $1 != kx && $1 != sig {
+          printf "%s%s=%s", (n++ ? " " : ""), $1, $2
+        }') \
+    || fail "could not read ${label} /metrics"
+  printf '  %s other TLS groups or schemes: %s (want none)\n' "${label}" "${other:-none}"
+  [[ -z "${other}" ]] || fail \
+    "${label} ran v2 handshakes outside X25519MLKEM768 and Ed25519+ML-DSA-44: ${other}"
 }
 
 trace_line_count() {
@@ -1420,6 +1448,13 @@ if strict_upgrade; then
   wait_metric_at_least 19004 zakura_p2p_conn_active 1 node4
 fi
 
+log "asserting post-quantum v2 handshakes (X25519MLKEM768, Ed25519+ML-DSA-44)"
+# Every node that speaks v2 has handshaken by now: node2 with node1 and node4's
+# upgrade with node1. node3 is legacy-only and runs no v2 handshake.
+assert_post_quantum_handshakes 19001 node1
+assert_post_quantum_handshakes 19002 node2
+assert_post_quantum_handshakes 19004 node4
+
 # Prove the pure-Zakura node bootstrapped genesis over Zakura.
 #
 # node2 sets sync.debug_skip_regtest_genesis_self_seed, so it does NOT commit the
@@ -1679,6 +1714,17 @@ else
   log "node2 completed its from-scratch catch-up to height ${catchup_target} with native kind-6 activity"
 fi
 snapshot_timeline "post-catch-up"
+
+log "asserting post-quantum v2 handshakes after the reset catch-up"
+# The reset restarted node2's counters, so its values come from the handshake
+# it made to catch up.
+assert_post_quantum_handshakes 19001 node1
+assert_post_quantum_handshakes 19002 node2
+if [[ "${OPTIONAL_NODE4_QUIESCED}" == "1" ]]; then
+  printf '  node4 post-quantum handshakes skipped: quiesced after upgrade smoke coverage\n'
+else
+  assert_post_quantum_handshakes 19004 node4
+fi
 
 if [[ "${ZAKURA_E2E_RESTART_MATRIX}" == "1" ]]; then
   run_restart_matrix "${catchup_target}"

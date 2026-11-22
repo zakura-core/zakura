@@ -35,20 +35,61 @@
 #      Node1 does not advertise the old blocks again.
 #   8. a non-finalized reorg converges with no block-sync byte-budget leak.
 #
+# ZAKURA_E2E_MODE=mixed-version runs a separate five-node stack instead
+# (mixed-version.sh, docker-compose.zakura-regtest-e2e-mixed-version.yml, and the
+# configs in mixed-version/). Three nodes run the latest release, v1.8.9 (p2p-v2/3:
+# classical key exchange, node ID = Ed25519 key), and two run the binary under
+# test (p2p-v2/4: hybrid key exchange, composite signature, hashed node ID):
+#   old-dual    OLD dual-stack seed                rpc 28232  metrics 29001
+#   old-zakura  OLD v2-only, bootstraps old-dual   rpc 28332  metrics 29002
+#   new-dual    NEW dual-stack, dials old-dual     rpc 28432  metrics 29003
+#   new-zakura  NEW v2-only, bootstraps new-dual   rpc 28532  metrics 29004
+#   old-dialer  OLD dual-stack, dials new-dual     rpc 28632  metrics 29005
+# The v2-only nodes' bootstrap entries use the node IDs the dual nodes log at
+# startup, since each version derives its ID from the secret key differently.
+# The old binary is ZAKURAD_OLD_BIN, or the release tarball downloaded, checked
+# against a pinned SHA256 and the release's SHA256SUMS.txt, and cached under
+# target/zakura-e2e-old-zakurad (ZAKURA_E2E_OLD_BIN_CACHE). It asserts:
+#   1. the legacy connections new-dual -> old-dual and old-dialer -> new-dual
+#      form, each upgrade prelude is rejected (zakura_p2p_upgrade_prelude_rejected
+#      on every dual node, and new-dual's fallback debug log for both prelude
+#      roles when it is a debug build), and both sides stay on legacy,
+#   2. same-version v2 works: new-zakura <-> new-dual and old-zakura <-> old-dual,
+#   3. the new nodes' v2 handshakes are all X25519MLKEM768 and Ed25519+ML-DSA-44
+#      (the old binary exports no such metrics),
+#   4. blocks mined on new-dual, old-dual, new-zakura, and old-zakura each reach
+#      all five nodes with the same hash, so blocks cross the version boundary
+#      over legacy and reach the v2-only nodes through their cohort's dual node,
+#   5. every cross-version legacy connection seen at the start (identified by the
+#      dialer's ephemeral port on the inbound side) stays open through the blocks
+#      and an idle soak (MIXED_SOAK_SECONDS, default 90), unless one end logged the
+#      legacy peer set's FindBlocks stall disconnect. Both versions apply that
+#      rule to any peer: at an idle Regtest tip, one syncer round sends FANOUT = 3
+#      empty FindBlocks to a sole legacy peer, which reaches the threshold of 3.
+#      After such a close, a redial must run a fresh upgrade prelude that is
+#      rejected again (new-dual's zakura_p2p_upgrade_prelude_rejected rises),
+#   6. no dual node counts a handshake upgrade error or malformed prelude, and
+#      no v2 connection crosses versions: new-dual completes no upgrade and holds
+#      one v2 connection, as does new-zakura, and each old node at most two,
+#   7. no node counts a misbehavior ban (address_book_misbehavior_banned_total)
+#      or logs a ban or misbehavior line. All nodes share 127.0.0.1, so any ban
+#      would hit the other cohort.
+#
 # Each container runs a zakurad binary bind-mounted into debian:trixie-slim.
 # Linux hosts use the host-built debug binary. On macOS, the harness builds and
 # caches a Linux release artifact because a Mach-O host binary cannot run in the
 # Linux container. Override with ZAKURAD_BIN=/path/to/a/Linux/zakurad.
 #
 # Usage: docker/zakura-regtest-e2e/run.sh
+#        ZAKURA_E2E_MODE=mixed-version docker/zakura-regtest-e2e/run.sh
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMPOSE_FILE="${SCRIPT_DIR}/../docker-compose.zakura-regtest-e2e.yml"
 REPO_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
-log()  { printf '\n=== %s ===\n' "$*"; }
-fail() { printf '\nFAILED: %s\n' "$*" >&2; exit 1; }
+# shellcheck source=lib.sh source-path=SCRIPTDIR
+source "${SCRIPT_DIR}/lib.sh"
 
 sed_in_place() {
   local script="$1"
@@ -142,8 +183,12 @@ case "${ZAKURA_E2E_MODE}" in
     ZAKURA_E2E_REQUIRE_HANDOFF=1
     ZAKURA_E2E_REQUIRE_V7_IDS=1
     ;;
+  mixed-version)
+    # A separate five-node topology with its own compose stack and assertions.
+    exec bash "${SCRIPT_DIR}/mixed-version.sh"
+    ;;
   *)
-    fail "unknown ZAKURA_E2E_MODE='${ZAKURA_E2E_MODE}' (expected smoke, pr-gate, checkpoint-long, no-checkpoint-long, restart-matrix, header-faults)"
+    fail "unknown ZAKURA_E2E_MODE='${ZAKURA_E2E_MODE}' (expected smoke, pr-gate, checkpoint-long, no-checkpoint-long, restart-matrix, header-faults, mixed-version)"
     ;;
 esac
 
@@ -198,31 +243,7 @@ command -v docker >/dev/null || fail "docker is required"
 command -v jq >/dev/null || fail "jq is required to parse RPC responses"
 command -v python3 >/dev/null || fail "python3 is required to run the trace oracle"
 
-# Ensure a container-compatible zakurad binary exists. Docker Desktop runs Linux
-# containers on macOS, so its bind-mounted executable must be Linux too.
-if [[ -z "${ZAKURAD_BIN:-}" && "$(uname -s)" == "Darwin" ]]; then
-  ZAKURAD_BIN="${REPO_DIR}/target/zakura-regtest-e2e-linux/zakurad"
-  log "building cached Linux zakurad for Docker Desktop"
-  mkdir -p "$(dirname "${ZAKURAD_BIN}")"
-  docker build \
-    --file "${REPO_DIR}/docker/ubuntu-package.Dockerfile" \
-    --target artifact \
-    --output "type=local,dest=$(dirname "${ZAKURAD_BIN}")" \
-    "${REPO_DIR}"
-else
-  ZAKURAD_BIN="${ZAKURAD_BIN:-${REPO_DIR}/target/debug/zakurad}"
-fi
-if [[ ! -x "${ZAKURAD_BIN}" ]]; then
-  log "building host zakurad (debug) — no in-container build"
-  ( cd "${REPO_DIR}" && CXXFLAGS="-include cstdint" cargo build -p zakura --bin zakurad )
-fi
-[[ -x "${ZAKURAD_BIN}" ]] || fail "zakurad binary not found at ${ZAKURAD_BIN}"
-docker run --rm \
-  -v "${ZAKURAD_BIN}:/usr/local/bin/zakurad:ro" \
-  debian:trixie-slim \
-  /usr/local/bin/zakurad --version >/dev/null 2>&1 \
-  || fail "zakurad binary is not executable in the Linux container: ${ZAKURAD_BIN}"
-export ZAKURAD_BIN
+ensure_zakurad_bin
 ZAKURA_E2E_TRACE_DIR="${ZAKURA_E2E_TRACE_DIR:-/tmp/zakura-regtest-e2e-traces-${RUN_LABEL}}"
 export ZAKURA_E2E_TRACE_DIR
 mkdir -p \
@@ -413,51 +434,6 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Fetch localhost-only node endpoints from inside node1's Linux network
-# namespace. Docker Desktop does not expose host-network container ports to the
-# macOS host unless its optional host-networking feature is enabled.
-container_http() {
-  local port="$1" path="$2" payload="$3" max_time="$4"
-  docker exec zakura-node-1 perl -MIO::Socket::INET -e '
-    my ($port, $path, $payload, $timeout) = @ARGV;
-    $SIG{ALRM} = sub { exit 28 };
-    alarm $timeout;
-    my $socket = IO::Socket::INET->new(
-      PeerAddr => "127.0.0.1",
-      PeerPort => $port,
-      Proto => "tcp",
-      Timeout => $timeout,
-    ) or exit 1;
-    my $method = length($payload) ? "POST" : "GET";
-    my $headers = "Host: 127.0.0.1\r\nConnection: close\r\n";
-    if (length($payload)) {
-      $headers .= "Content-Type: application/json\r\nContent-Length: " . length($payload) . "\r\n";
-    }
-    print {$socket} "$method $path HTTP/1.1\r\n$headers\r\n$payload";
-    my $response = do { local $/; <$socket> };
-    $response =~ /\AHTTP\/\S+ 2\d\d[^\r\n]*\r?\n.*?\r?\n\r?\n(.*)\z/s or exit 1;
-    print $1;
-  ' "${port}" "${path}" "${payload}" "${max_time}"
-}
-
-# rpc <port> <method> [json-params] [max-time-seconds] -> raw JSON-RPC response
-rpc() {
-  local port="$1" method="$2" params="${3:-[]}" max_time="${4:-10}"
-  container_http \
-    "${port}" \
-    "/" \
-    "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"${method}\",\"params\":${params}}" \
-    "${max_time}"
-}
-
-# metric <port> <series> -> counter value (0 if absent). <series> is a metric
-# name, or a name with its labels exactly as /metrics renders them, such as
-# 'zakura_quic_tls_key_exchange{group="X25519MLKEM768"}'.
-metric() {
-  local port="$1" name="$2"
-  container_http "${port}" "/metrics" "" 5 2>/dev/null \
-    | awk -v n="${name}" '$1==n {v=$2} END {print (v==""?0:v)}'
-}
 
 timeline_node_snapshot() {
   local phase="$1" node="$2" rpc_port="$3" metrics_port="$4"
@@ -536,42 +512,6 @@ wait_metric_zero() {
   fail "${label} ${name} did not return to zero within ${READY_TIMEOUT}s"
 }
 
-wait_metric_at_least() {
-  local port="$1" name="$2" want="$3" label="$4" timeout="${5:-${READY_TIMEOUT}}"
-  local deadline=$((SECONDS + timeout)) value
-  while (( SECONDS < deadline )); do
-    value=$(metric "${port}" "${name}")
-    printf '  %s %s=%s (want >= %s)\n' "${label}" "${name}" "${value}" "${want}"
-    if awk "BEGIN{exit !(${value} >= ${want})}"; then
-      return 0
-    fi
-    sleep 3
-  done
-  fail "${label} ${name} stayed below ${want} within ${timeout}s"
-}
-
-# The only v2 TLS series a node may export: the hybrid key-exchange group
-# (zakura-quic TLS-9) and the composite signature scheme (TLS-4).
-PQ_KEY_EXCHANGE_SERIES='zakura_quic_tls_key_exchange{group="X25519MLKEM768"}'
-PQ_SIGNATURE_SERIES='zakura_quic_tls_signature_verified{scheme="ed25519_mldsa44"}'
-
-# assert_post_quantum_handshakes <metrics-port> <label>
-# Requires at least one completed X25519MLKEM768 key exchange and one verified
-# Ed25519+ML-DSA-44 handshake signature, and no other group or scheme.
-assert_post_quantum_handshakes() {
-  local port="$1" label="$2" other
-  wait_metric_at_least "${port}" "${PQ_KEY_EXCHANGE_SERIES}" 1 "${label}"
-  wait_metric_at_least "${port}" "${PQ_SIGNATURE_SERIES}" 1 "${label}"
-  other=$(container_http "${port}" "/metrics" "" 5 \
-    | awk -v kx="${PQ_KEY_EXCHANGE_SERIES}" -v sig="${PQ_SIGNATURE_SERIES}" '
-        $1 ~ /^zakura_quic_tls_(key_exchange|signature_verified)/ && $1 != kx && $1 != sig {
-          printf "%s%s=%s", (n++ ? " " : ""), $1, $2
-        }') \
-    || fail "could not read ${label} /metrics"
-  printf '  %s other TLS groups or schemes: %s (want none)\n' "${label}" "${other:-none}"
-  [[ -z "${other}" ]] || fail \
-    "${label} ran v2 handshakes outside X25519MLKEM768 and Ed25519+ML-DSA-44: ${other}"
-}
 
 trace_line_count() {
   local file="$1"
@@ -894,16 +834,6 @@ wait_for_native_suffix_coverage() {
   log "node2 prefetched an authenticated native suffix and committed it only after checkpoint handoff (${suffix_start}..${suffix_end})"
 }
 
-wait_ready() {
-  local port="$1" name="$2" deadline=$((SECONDS + READY_TIMEOUT))
-  while (( SECONDS < deadline )); do
-    if rpc "${port}" getblockchaininfo | jq -e '.result' >/dev/null 2>&1; then
-      printf '  %s RPC ready on %s\n' "${name}" "${port}"; return 0
-    fi
-    sleep 2
-  done
-  fail "${name} RPC did not become ready within ${READY_TIMEOUT}s"
-}
 
 stop_node2_for_reset() {
   local label="$1"
@@ -1128,9 +1058,6 @@ wait_for_node2_debug_stop() {
   fail "node2 did not durably stop at exact height ${height} within ${timeout}s"
 }
 
-peer_count() { rpc "$1" getpeerinfo | jq -r 'if .result then (.result | length) else 0 end'; }
-block_count() { rpc "$1" getblockcount | jq -r '.result // 0'; }
-block_hash() { rpc "$1" getblockhash "[$2]" | jq -r '.result // empty'; }
 strict_upgrade() { [[ "${ZAKURA_REGTEST_E2E_STRICT_UPGRADE:-0}" == "1" ]]; }
 
 # Kind-6 block bodies served by the nodes that can serve node2's catch-up.

@@ -44,7 +44,7 @@ pub struct MinerGateway {
 }
 
 /// Converts `ranking` to the gateways the dialer can rank, best first, at
-/// most [`MAX_RANKED_GATEWAYS`] of them. Their standings are
+/// most [`MAX_RANKED_GATEWAYS`] plus ties at the cutoff. Their standings are
 /// [`GatewayStanding::Unmatched`] until [`classify_gateways`] reads them.
 ///
 /// It drops entries with no blocks, IDs that are not valid node IDs,

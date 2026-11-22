@@ -24,6 +24,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 async fn node(seed: u64, capture: Option<&mut TraceCapture>) -> ZakuraTestNode {
     let mut limits = ZakuraLocalLimits::from_config(&crate::Config::default());
     limits.max_connections = MAX_CONNECTIONS;
+    limits.max_preferred_connections = 10;
     let mut builder = ZakuraTestNode::builder(seed).limits(limits);
     if let Some(capture) = capture {
         builder = builder.tracer(capture.tracer_for_node(seed));
@@ -89,7 +90,7 @@ async fn a_node_at_its_ordinary_limit_connects_to_a_known_gateway() {
     // One place is held for the gateway, and every other slot is taken.
     let _ordinary = dialer_node
         .endpoint()
-        .hold_connection_slots(MAX_CONNECTIONS - 1, false);
+        .hold_connection_slots(MAX_CONNECTIONS, false);
     let gateway_id = dialer_node
         .insert_static_discovery_candidate(&gateway)
         .await
@@ -194,7 +195,7 @@ async fn a_gateway_leaving_the_set_stays_connected_and_its_replacement_is_dialed
     // first gateway fills once it leaves the set.
     let _ordinary = dialer_node
         .endpoint()
-        .hold_connection_slots(MAX_CONNECTIONS - 2, false);
+        .hold_connection_slots(MAX_CONNECTIONS - 1, false);
     let first_id = dialer_node
         .insert_static_discovery_candidate(&first)
         .await

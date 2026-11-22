@@ -29,6 +29,7 @@ pub(super) async fn dialer(
 ) {
     let mut limits = ZakuraLocalLimits::from_config(&crate::Config::default());
     limits.max_connections = MAX_CONNECTIONS;
+    limits.max_preferred_connections = 10;
     let node = ZakuraTestNode::builder(seed)
         .limits(limits)
         .spawn()
@@ -40,7 +41,6 @@ pub(super) async fn dialer(
     let io = CandidateDialerIO {
         preferred: PreferredGatewayInput::new(Some(ranking_rx), endpoint.local_node_id()),
         deferred: DeferredDials::new(endpoint.local_node_id()),
-        preferred_hold_limit: discovery.preferred_hold_limit().await,
         max_concurrent_dials: discovery.max_concurrent_dials().await,
         preferred_attempts: HashSet::default(),
         trace: endpoint.trace(),
@@ -50,7 +50,6 @@ pub(super) async fn dialer(
         endpoint,
         discovery,
     };
-    assert_eq!(io.preferred_hold_limit, 10);
     (node, io, ranking_tx)
 }
 
@@ -131,7 +130,6 @@ async fn the_ten_best_of_thirty_one_gateways_are_held_and_dialed_in_rank_order()
     let mut state = CandidateDialerState::new(DIAL_BACKOFF);
 
     let first = io.admit_round(&mut state, &[], Instant::now()).await;
-    assert_eq!(held(&node.endpoint()).hold, 10);
     assert_eq!(held(&node.endpoint()).members, gateways[..10]);
     assert_eq!(dialed(&first.preferred), gateways[..4]);
     assert!(
@@ -148,6 +146,11 @@ async fn the_ten_best_of_thirty_one_gateways_are_held_and_dialed_in_rank_order()
             Instant::now()
         ));
     }
+    let _authenticated: Vec<_> = gateways[..4]
+        .iter()
+        .copied()
+        .map(|id| node.endpoint().hold_inbound_gateway(id))
+        .collect();
     let second = io
         .admit_round(&mut state, &gateways[..4], Instant::now())
         .await;
@@ -175,9 +178,14 @@ async fn a_gateway_in_backoff_yields_its_place_until_it_connects_or_the_backoff_
 
     // Calling in ends the wait at once: a connected gateway may hold a place.
     let mut state = CandidateDialerState::new(DIAL_BACKOFF);
+    let authenticated: Vec<_> = [third]
+        .into_iter()
+        .map(|id| node.endpoint().hold_inbound_gateway(id))
+        .collect();
     io.admit_round(&mut state, &[third], Instant::now()).await;
     assert_eq!(held(&node.endpoint()).members, gateways[..10]);
 
+    drop(authenticated);
     // So does the end of the backoff, which a success also brings.
     discovery.mark_dial_success(&third, None).await;
     let mut state = CandidateDialerState::new(DIAL_BACKOFF);
@@ -199,12 +207,16 @@ async fn a_connected_or_dialing_member_holds_one_place_and_gets_no_dial() {
         .record_attempt(gateways[0], vec![gateway_ip(gateways[0])])
         .expect("an idle dialer records the attempt");
 
+    let _authenticated: Vec<_> = gateways[..2]
+        .iter()
+        .copied()
+        .map(|id| node.endpoint().hold_inbound_gateway(id))
+        .collect();
     let round = io
         .admit_round(&mut state, &gateways[..2], Instant::now())
         .await;
 
     let held = held(&node.endpoint());
-    assert_eq!(held.hold, 3);
     assert_eq!(held.members, gateways);
     assert_eq!(dialed(&round.preferred), gateways[2..]);
     assert!(round.ordinary.is_empty());
@@ -223,10 +235,6 @@ async fn unknown_gateways_and_the_node_itself_are_neither_held_nor_dialed() {
     let round = io.admit_round(&mut state, &[], Instant::now()).await;
 
     let held = held(&node.endpoint());
-    assert_eq!(
-        held.hold, 1,
-        "only the known gateway counts towards the hold"
-    );
     assert_eq!(held.members, known);
     assert_eq!(dialed(&round.preferred), known);
     assert_eq!(state.in_flight_node_ids(), known);
@@ -234,22 +242,16 @@ async fn unknown_gateways_and_the_node_itself_are_neither_held_nor_dialed() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_full_node_starts_no_preferred_dial_until_a_connection_ends() {
+async fn a_node_at_ordinary_capacity_can_dial_a_funded_gateway() {
     let (node, mut io, ranking_tx) = dialer(9234).await;
     let endpoint = node.endpoint();
-    let mut slots = endpoint.hold_connection_slots(MAX_CONNECTIONS, false);
+    let slots = endpoint.hold_connection_slots(MAX_CONNECTIONS, false);
     let gateways = known_gateways(&node, 1).await;
     ranking_tx.send_replace(ranking(&gateways));
     let mut state = CandidateDialerState::new(DIAL_BACKOFF);
 
     let round = io.admit_round(&mut state, &[], Instant::now()).await;
     assert_eq!(held(&endpoint).members, gateways);
-    assert!(round.preferred.is_empty() && round.ordinary.is_empty());
-
-    // An ordinary connection ends. Its slot goes to the held place, not to
-    // another ordinary dial.
-    slots.pop();
-    let round = io.admit_round(&mut state, &[], Instant::now()).await;
     assert_eq!(dialed(&round.preferred), gateways);
     assert!(round.ordinary.is_empty());
     drop(slots);
@@ -303,6 +305,11 @@ async fn a_member_the_dialer_backed_off_gives_way_until_its_backoff_ends() {
     for (attempt, _) in &first.preferred {
         assert!(state.complete(*attempt, DiscoveryDialResult::Registered, None, start));
     }
+    let _authenticated: Vec<_> = connected
+        .iter()
+        .copied()
+        .map(|id| node.endpoint().hold_inbound_gateway(id))
+        .collect();
     let later = start + DIAL_BACKOFF.0;
     let second = io.admit_round(&mut state, &connected, later).await;
     assert_eq!(held(&node.endpoint()).members, gateways[..10]);
@@ -351,11 +358,17 @@ async fn a_waiting_member_that_calls_in_gets_no_dial() {
     let first = io.admit_round(&mut state, &[], start).await;
     assert!(first.preferred.is_empty());
     // It calls in during the grace, and stays connected past it.
+    let authenticated: Vec<_> = below
+        .iter()
+        .copied()
+        .map(|id| node.endpoint().hold_inbound_gateway(id))
+        .collect();
     let connected = io
         .admit_round(&mut state, &below, start + MUTUAL_DIAL_GRACE)
         .await;
     assert_eq!(held(&node.endpoint()).members, below);
     assert!(connected.preferred.is_empty());
+    drop(authenticated);
     // Once it disconnects, it waits out a whole grace again.
     let gone = start + MUTUAL_DIAL_GRACE * 2;
     let third = io.admit_round(&mut state, &[], gone).await;

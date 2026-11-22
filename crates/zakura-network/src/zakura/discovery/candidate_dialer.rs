@@ -34,8 +34,8 @@ use super::redial::ZAKURA_REDIAL_HEALTHY_CONNECTION;
 use super::trace::{DialOwner, DialPhase, DiscoveryDialPhaseEvent, DiscoveryDialResultEvent};
 use crate::zakura::{
     handler::{DialRegistration, DialReport},
-    PreferredGateways, ZakuraEndpoint, ZakuraHandlerError, ZakuraLocalLimits, ZakuraPeerId,
-    ZakuraServiceId, ZakuraTrace,
+    ZakuraEndpoint, ZakuraHandlerError, ZakuraLocalLimits, ZakuraPeerId, ZakuraServiceId,
+    ZakuraTrace,
 };
 
 mod preferred;
@@ -158,7 +158,6 @@ pub(crate) async fn run_native_discovery_dialer(
     let mut io = CandidateDialerIO {
         preferred,
         deferred: DeferredDials::new(endpoint.local_node_id()),
-        preferred_hold_limit: discovery.preferred_hold_limit().await,
         max_concurrent_dials: discovery.max_concurrent_dials().await,
         preferred_attempts: HashSet::default(),
         endpoint,
@@ -207,8 +206,6 @@ struct CandidateDialerIO {
     preferred: PreferredGatewayInput,
     /// The members whose dial waits out a grace.
     deferred: DeferredDials,
-    /// The most connection places the node may hold for them.
-    preferred_hold_limit: usize,
     /// The most dials, preferred or ordinary, in flight at once.
     max_concurrent_dials: usize,
     /// The attempts in flight that the preferred pass started.
@@ -327,13 +324,11 @@ impl CandidateDialerIO {
             now,
         )
         .await;
-        let formed = PreferredGateways::form(classified.ranking, self.preferred_hold_limit);
-        let round = PreferredRound {
-            set: formed.set().to_vec(),
+        self.endpoint.publish_gateway_ranking(classified.ranking);
+        PreferredRound {
+            set: self.endpoint.held_places().members,
             dialable: classified.dialable,
-        };
-        self.endpoint.publish_preferred_gateways(formed);
-        round
+        }
     }
 
     /// Starts a worker that dials `node_addr` for `attempt` under discovery's

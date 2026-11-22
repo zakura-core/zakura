@@ -311,13 +311,12 @@ pub struct ZakuraNodeRecord {
 }
 
 impl ZakuraNodeRecord {
-    /// Signs `body` with `secret_key`, which must be the Ed25519 key among
-    /// `body.keys`.
+    /// Signs `body` when its full author key list matches the signer's credential.
     pub fn sign(
         body: ZakuraNodeRecordBody,
         secret_key: &NodeSecretKey,
     ) -> Result<Self, DiscoveryWireError> {
-        if body.keys.ed25519() != Some(secret_key.public_key()) {
+        if &body.keys != secret_key.key_list() {
             return Err(DiscoveryWireError::SigningKeyMismatch);
         }
         let signature = secret_key.sign(&body.encode_for_signature()?);
@@ -683,8 +682,8 @@ pub enum DiscoveryWireError {
     #[error("numeric overflow while encoding Zakura discovery {0}")]
     NumericOverflow(&'static str),
 
-    /// The signing key does not match the record author.
-    #[error("Zakura discovery signing key does not match record node id")]
+    /// The signer's credential and the record name different nodes.
+    #[error("Zakura discovery record author differs from the signer's node ID")]
     SigningKeyMismatch,
 
     /// The record has an invalid protocol range.
@@ -4987,6 +4986,21 @@ mod tests {
         assert!(matches!(
             services_message(vec![block_envelope]).encode(),
             Err(WireError::OutOfRange("service summary"))
+        ));
+    }
+
+    #[test]
+    fn signing_refuses_another_identity_with_the_same_ed25519_key() {
+        let signer = secret_key();
+        let mut record = body(&signer);
+        record.keys = NodeKeyList::from_entries([
+            (ED25519_KEY_TAG, *signer.public_key().as_bytes()),
+            (UNREADABLE_KEY_TAG, [0x55; 32]),
+        ])
+        .expect("the two entries have distinct increasing tags");
+        assert!(matches!(
+            ZakuraNodeRecord::sign(record, &signer),
+            Err(DiscoveryWireError::SigningKeyMismatch)
         ));
     }
 

@@ -303,10 +303,9 @@ impl HandshakeCounts {
     /// inbound share. A preferred gateway's first slot takes a held place.
     /// The check and the charge are one step.
     ///
-    /// A ranked gateway that calls in counts as connected: when that brings
-    /// it into the preferred set, the set changes with the granted claim,
-    /// and stays as it was when the claim is refused. Each member counts one
-    /// preferred slot, so preferred slots never pass the hold. A member the
+    /// A granted inbound claim records the authenticated gateway as connected
+    /// for later cutoff ties. A refusal restores the previous ranking. Each member
+    /// counts one preferred slot, so preferred slots never pass the hold. A member the
     /// caller displaces keeps its slot, now ordinary, which can leave the
     /// ordinary slots one over `cap` less the hold until a slot frees. That
     /// is bounded by the hold and passes, as after a published set change.
@@ -317,7 +316,7 @@ impl HandshakeCounts {
         cap: usize,
     ) -> Result<SlotClass, SlotRefusal> {
         let before = inbound
-            .then(|| self.preferred.with_caller(&node))
+            .then(|| self.preferred.with_connected(&node))
             .flatten()
             .map(|formed| std::mem::replace(&mut self.preferred, formed));
         let claim = self.connections.claim(node, inbound, cap, &self.preferred);
@@ -325,6 +324,13 @@ impl HandshakeCounts {
             self.preferred = before;
         }
         claim
+    }
+
+    /// Records a dial target as connected once the outbound transport proves its ID.
+    pub(crate) fn outbound_connected(&mut self, node: NodeId) {
+        if let Some(formed) = self.preferred.with_connected(&node) {
+            self.preferred = formed;
+        }
     }
 
     /// Replaces the preferred gateways the slot checks use. Slots already

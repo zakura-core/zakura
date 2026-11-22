@@ -443,6 +443,73 @@ fn simultaneous_claims_never_pass_the_ordinary_limit() {
     assert_eq!(split.preferred + split.ordinary, granted.len());
 }
 
+fn publish_tied_gateways(handler: &ZakuraProtocolHandler, first: NodeId, second: NodeId) {
+    let ranking = [first, second].map(|node| RankedGateway {
+        node,
+        blocks: 1,
+        standing: GatewayStanding::Dialable,
+    });
+    handler
+        .supervisor
+        .ip_slots
+        .counts()
+        .publish_preferred_gateways(PreferredGateways::form(ranking, 1));
+}
+
+/// Between ranking updates, the connected incumbent keeps the tied place.
+#[test]
+fn equally_ranked_gateways_call_in_between_ranking_updates() {
+    let handler = handler(40);
+    let first = new_node();
+    let second = new_node();
+    publish_tied_gateways(&handler, first, second);
+
+    assert!(admits_a_caller(&handler, 1));
+    let incumbent = handler.claim_connection(first, true).expect("held place");
+    assert!(admits_a_caller(&handler, 2));
+    let _second = handler
+        .claim_connection(second, true)
+        .expect("ordinary place");
+    assert_eq!(preferred_set(&handler), [first]);
+    assert_eq!(
+        split(&handler),
+        SlotSplit {
+            preferred: 1,
+            ordinary: 1,
+            ordinary_inbound: 1
+        }
+    );
+
+    drop(incumbent);
+    assert_eq!(preferred_set(&handler), [second]);
+}
+
+/// A dial gets the connected tie-break only after the transport authenticates it.
+#[test]
+fn outbound_gateway_keeps_a_tied_place_after_authentication() {
+    for authenticated in [false, true] {
+        let handler = handler(40);
+        let target = new_node();
+        let caller = new_node();
+        publish_tied_gateways(&handler, target, caller);
+        let _dial = handler.claim_connection(target, false).expect("held place");
+        if authenticated {
+            handler
+                .supervisor
+                .ip_slots
+                .counts()
+                .outbound_connected(target);
+        }
+        let _inbound = handler
+            .claim_connection(caller, true)
+            .expect("room for caller");
+        assert_eq!(
+            preferred_set(&handler),
+            [if authenticated { target } else { caller }]
+        );
+    }
+}
+
 /// A ranked caller that outranks a member already holding a slot takes that
 /// member's place: the caller's slot is preferred and the member's stays
 /// connected as ordinary, one over the ordinary limit until a slot frees.

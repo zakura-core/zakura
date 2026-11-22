@@ -175,42 +175,15 @@ impl PreferredGateways {
         }
     }
 
-    /// The set re-formed as if the ranked gateway `node` were connected,
-    /// when that brings `node` into the set; `None` when `node` is
-    /// unranked, already a member, or still outranked.
-    ///
-    /// A gateway that calls in is connected, whatever its backoff or
-    /// whether v2 networking knew it, so it may take the place it ranks for.
-    /// A member it displaces stays connected, and its slot counts as
-    /// ordinary from then on.
-    pub(super) fn with_caller(&self, node: &NodeId) -> Option<Self> {
-        if self.contains(node) {
-            return None;
-        }
-        let index = self
-            .ranking
-            .iter()
-            .position(|gateway| gateway.node == *node)?;
-        // With every place filled the hold can't grow, and a caller below
-        // the last member's count can't pass it, since being connected only
-        // reorders gateways of equal count.
-        if self.set.len() == self.hold_limit {
-            let last = self.set.last()?;
-            // Every member is ranked, because the set is formed from the
-            // ranking, so the last member's count is always found.
-            let outranked = self
-                .ranking
-                .iter()
-                .find(|gateway| gateway.node == *last)
-                .is_some_and(|last| self.ranking[index].blocks < last.blocks);
-            if outranked {
-                return None;
-            }
-        }
+    /// Records a ranked gateway as connected, including when it already owns
+    /// a preferred place. Later callers then see its standing in cutoff ties.
+    pub(super) fn with_connected(&self, node: &NodeId) -> Option<Self> {
+        let index = self.ranking.iter().position(|gateway| {
+            gateway.node == *node && gateway.standing != GatewayStanding::Connected
+        })?;
         let mut ranking = self.ranking.clone();
         ranking[index].standing = GatewayStanding::Connected;
-        let formed = Self::form(ranking, self.hold_limit);
-        formed.contains(node).then_some(formed)
+        Some(Self::form(ranking, self.hold_limit))
     }
 
     /// The set re-formed with `node` in backoff, once it has lost its last

@@ -1234,7 +1234,8 @@ this release tolerates, and keep each hard change explicit.
   - a client without a key;
   - TLS 1.2;
   - an X.509 certificate instead of a raw public key;
-  - a signature scheme other than Ed25519;
+  - any signature scheme other than the Ed25519 + ML-DSA-44 composite
+    (`0xFE44`, TLS-4), including standalone Ed25519;
   - an X25519MLKEM768 key share of the wrong length, or one whose ML-KEM
     key fails the modulus check (TLS-9).
 - **SEC-3.** For a refused or ignored IP, no `Connecting` may exist. A test

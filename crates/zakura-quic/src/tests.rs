@@ -1983,12 +1983,11 @@ impl rustls::client::ResolvesClientCert for ImpostorResolver {
 }
 
 /// Dials `server` presenting `victim`'s credential and signing with `sign`.
-/// Returns whether the server took the connection as the victim's.
 async fn dial_as(
-    server: &mut Server,
+    server: &Server,
     victim: &NodeSecretKey,
     sign: impl Fn(&[u8]) -> Vec<u8> + Send + Sync + 'static,
-) -> bool {
+) -> Result<(), ConnectError> {
     let cert = rustls_pki_types::CertificateDer::from(victim.credential().to_spki().to_vec());
     let key = Arc::new(rustls::sign::CertifiedKey::new(
         vec![cert],
@@ -1997,9 +1996,24 @@ async fn dial_as(
     let mut crypto =
         raw_client_builder(server).with_client_cert_resolver(Arc::new(ImpostorResolver(key)));
     crypto.alpn_protocols = vec![ALPN.to_vec()];
-    let dialed = dial_raw(server, crypto).await.is_ok();
-    let handled = server.handled.try_recv().is_ok();
-    dialed && handled
+    dial_raw(server, crypto).await
+}
+
+/// Checks that the dial fails and the listener finishes admission without a handoff.
+async fn assert_dial_refused(
+    server: &mut Server,
+    victim: &NodeSecretKey,
+    sign: impl Fn(&[u8]) -> Vec<u8> + Send + Sync + 'static,
+) {
+    let finished = server.returned.finished.load(Ordering::Relaxed);
+    assert!(dial_as(server, victim, sign).await.is_err());
+    while server.returned.finished.load(Ordering::Relaxed) == finished {
+        tokio::task::yield_now().await;
+    }
+    assert!(matches!(
+        server.handled.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
 }
 
 /// TLS-4, TLS-8, SEC-2: a client that presents another node's credential
@@ -2037,18 +2051,19 @@ async fn client_presenting_a_key_it_cannot_sign_for_is_refused() {
             signature
         };
 
-        assert!(!dial_as(&mut server, &victim, foreign_both).await);
-        assert!(!dial_as(&mut server, &victim, foreign_ml_dsa).await);
-        assert!(!dial_as(&mut server, &victim, foreign_ed25519).await);
-        assert!(!dial_as(&mut server, &victim, truncated).await);
+        assert_dial_refused(&mut server, &victim, foreign_both).await;
+        assert_dial_refused(&mut server, &victim, foreign_ml_dsa).await;
+        assert_dial_refused(&mut server, &victim, foreign_ed25519).await;
+        assert_dial_refused(&mut server, &victim, truncated).await;
 
         let v5 = victim.clone();
-        assert!(
-            dial_as(&mut server, &victim, move |m: &[u8]| v5
-                .sign_composite(m, [1; 32])
-                .unwrap())
-            .await
-        );
+        dial_as(&server, &victim, move |m| {
+            v5.sign_composite(m, [1; 32]).unwrap()
+        })
+        .await
+        .unwrap();
+        let inbound = server.handled.recv().await.unwrap();
+        assert_eq!(inbound.remote_id(), victim.public());
     })
     .await
     .unwrap();

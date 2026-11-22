@@ -4393,3 +4393,98 @@ async fn zcashd_compat_reorg_context_zakura_tip_behind_recovers() -> Result<()> 
 async fn zcashd_compat_reorg_churn() -> Result<()> {
     common::zcashd_compat::reorg::churn().await
 }
+
+/// Startup survives every way a default seed's retired v2 node ID can reach the config:
+/// a file zakurad rewrites, a file it cannot rewrite, and an environment override. In
+/// each case the node keeps running until it is killed.
+#[test]
+fn retired_seed_ids_never_stop_startup() -> Result<()> {
+    use std::{fs, io::Write as _, process::Stdio, time::Duration};
+
+    use tempfile::TempDir;
+    use zakura_network::zakura::RETIRED_ZAKURA_SEED_NODE_IDS;
+    use zakura_test::command::{test_cmd, CommandExt as _};
+
+    let _init_guard = zakura_test::init();
+    let (retired, current) = RETIRED_ZAKURA_SEED_NODE_IDS[0];
+    let retired_entry = format!("{retired}@127.0.0.1:1");
+    let rewritten_line = "rewrote the config file with the default seeds' current node IDs";
+    let network_warning = "names a default seed by the node ID it had before";
+
+    // Runs `start` with `env`, waits for each of `expected` in order, then checks that the
+    // node was still running a few seconds later, when it was killed. The file rewrite
+    // logs before "Starting zakurad", and the network layer after it.
+    let start = |dir: &TempDir, env: &[(&str, &str)], expected: &[&str]| -> Result<()> {
+        let config_path = dir.path().join("zakura.toml");
+        let mut command = test_cmd(&common::zakurad_exe_path(), dir.path())?;
+        command
+            .args([
+                "-c",
+                config_path.to_str().expect("temp path is Unicode"),
+                "start",
+            ])
+            .envs(env.iter().copied())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command
+            .spawn2(dir, common::zakurad_exe_path())?
+            .with_timeout(EXTENDED_LAUNCH_DELAY);
+        for line in expected {
+            child.expect_stdout_line_matches(regex::escape(line))?;
+        }
+        std::thread::sleep(Duration::from_secs(5));
+        child.kill(false)?;
+        let output = child.wait_with_output()?.assert_failure()?;
+        output.assert_was_killed()?;
+        Ok(())
+    };
+
+    // A file with a retired ID is rewritten, and the network layer finds nothing left.
+    let mut config = default_test_config(&Mainnet);
+    config.network.zakura.bootstrap_peers = vec![retired_entry.clone()];
+    let dir = testdir()?.with_config(&mut config)?;
+    start(&dir, &[], &[rewritten_line, "Starting zakurad"])?;
+    let file = fs::read_to_string(dir.path().join("zakura.toml"))?;
+    assert!(file.contains(current) && !file.contains(retired), "{file}");
+    assert!(dir.path().join("zakura.toml.pre-pq-seed-ids.bak").exists());
+
+    // A file the rewrite cannot read as UTF-8 still loads, since the loader is lossy.
+    // Startup warns and dials the current ID for this run.
+    let dir = testdir()?.with_config(&mut config)?;
+    let config_path = dir.path().join("zakura.toml");
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&config_path)?
+        .write_all(b"# not UTF-8: \xff\n")?;
+    let before = fs::read(&config_path)?;
+    start(
+        &dir,
+        &[],
+        &[
+            "could not check the config file",
+            "Starting zakurad",
+            network_warning,
+        ],
+    )?;
+    assert_eq!(fs::read(&config_path)?, before, "the file is left alone");
+
+    // An environment override is not in the file, so the network layer replaces it. The
+    // file lists a current seed, and the override replaces that entry.
+    let mut config = default_test_config(&Mainnet);
+    config.network.zakura.bootstrap_peers = vec![format!("{current}@127.0.0.1:1")];
+    let dir = testdir()?.with_config(&mut config)?;
+    let config_path = dir.path().join("zakura.toml");
+    let before = fs::read(&config_path)?;
+    start(
+        &dir,
+        &[(
+            "ZAKURA_NETWORK__ZAKURA__BOOTSTRAP_PEERS[0]",
+            retired_entry.as_str(),
+        )],
+        &["Starting zakurad", network_warning],
+    )?;
+    assert_eq!(fs::read(&config_path)?, before, "the file is left alone");
+    assert!(!dir.path().join("zakura.toml.pre-pq-seed-ids.bak").exists());
+
+    Ok(())
+}

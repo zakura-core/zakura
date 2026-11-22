@@ -44,6 +44,8 @@ pub(crate) enum RewriteError {
         #[source]
         source: toml_edit::TomlError,
     },
+    #[error("the rewritten {path:?} would load differently from the original beyond the seed IDs")]
+    Unverified { path: PathBuf },
 }
 
 /// Replaces default seeds' retired node IDs in the config file that the loader reads
@@ -75,6 +77,9 @@ pub(crate) fn rewrite_config_file(path: &Path) -> Result<RewriteOutcome, Rewrite
     else {
         return Ok(RewriteOutcome::Unchanged);
     };
+    if !loads_as_original_with_ids_replaced(original, &rewritten) {
+        return Err(RewriteError::Unverified { path });
+    }
 
     let backup = with_suffix(&path, BACKUP_SUFFIX);
     if !backup.exists() {
@@ -127,6 +132,31 @@ fn replace_in_document(
     Ok(Some((document.to_string(), replaced)))
 }
 
+/// Returns whether `rewritten` parses, with the parser the config loader uses, to exactly
+/// what `original` parses to once retired seed IDs in `network.zakura.bootstrap_peers` are
+/// replaced. This guards the file against any change the edit should not make.
+fn loads_as_original_with_ids_replaced(original: &str, rewritten: &str) -> bool {
+    let (Ok(mut expected), Ok(rewritten)) = (
+        toml::from_str::<toml::Table>(original),
+        toml::from_str::<toml::Table>(rewritten),
+    ) else {
+        return false;
+    };
+    let peers = expected
+        .get_mut("network")
+        .and_then(toml::Value::as_table_mut)
+        .and_then(|network| network.get_mut("zakura"))
+        .and_then(toml::Value::as_table_mut)
+        .and_then(|zakura| zakura.get_mut("bootstrap_peers"))
+        .and_then(toml::Value::as_array_mut);
+    for peer in peers.into_iter().flatten() {
+        if let Some(current) = peer.as_str().and_then(replace_retired_seed_node_id) {
+            *peer = toml::Value::String(current);
+        }
+    }
+    expected == rewritten
+}
+
 /// Returns `original`, whose string is `entry`, holding `current` instead, with the same
 /// quoting and the same whitespace and comments around it.
 fn replacement_value(original: &Value, entry: &str, current: &str) -> Value {
@@ -154,7 +184,8 @@ fn replacement_value(original: &Value, entry: &str, current: &str) -> Value {
 /// over `path`.
 fn replace_file(path: &Path, contents: &[u8]) -> io::Result<()> {
     let permissions = fs::metadata(path)?.permissions();
-    let temp = with_suffix(path, ".tmp");
+    // A per-process name, so two processes sharing a config cannot interleave writes.
+    let temp = with_suffix(path, &format!(".tmp.{}", std::process::id()));
     let write = || -> io::Result<()> {
         let mut file = fs::OpenOptions::new()
             .write(true)

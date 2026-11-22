@@ -149,7 +149,8 @@ fn failed_write_leaves_the_file_alone() {
     let original = format!("network.zakura.bootstrap_peers = [\"{old}\"]\n");
     let (_dir, path) = config_file(&original);
     // A directory where the temp file goes makes the write fail, even for root.
-    fs::create_dir(with_suffix(&fs::canonicalize(&path).unwrap(), ".tmp")).unwrap();
+    let temp = format!(".tmp.{}", std::process::id());
+    fs::create_dir(with_suffix(&fs::canonicalize(&path).unwrap(), &temp)).unwrap();
 
     let error = rewrite_config_file(&path).expect_err("the temp file cannot be written");
 
@@ -218,4 +219,31 @@ fn rewrite_touches_only_matched_bootstrap_ids() {
             &format!("\"{current}@192.0.2.2:8234\""),
         );
     assert_eq!(fs::read_to_string(&path).unwrap(), expected);
+}
+
+/// The check before writing accepts only a file that loads like the original with the
+/// seed IDs replaced.
+#[test]
+fn rewrite_is_checked_against_the_loader() {
+    let (old, new) = retired_entry(6, "192.0.2.1:8234");
+    let original = format!("network.zakura.bootstrap_peers = [\"{old}\"]\nother = 1\n");
+
+    assert!(loads_as_original_with_ids_replaced(
+        &original,
+        &original.replace(&old, &new)
+    ));
+    for wrong in [
+        original.clone(),
+        original
+            .replace(&old, &new)
+            .replace("other = 1", "other = 2"),
+        original.replace(&old, &new).replace("other = 1", ""),
+        original.replace(&old, &format!("{new}x")),
+        "not toml [".to_string(),
+    ] {
+        assert!(
+            !loads_as_original_with_ids_replaced(&original, &wrong),
+            "{wrong}"
+        );
+    }
 }

@@ -36,8 +36,7 @@ pub struct MinerGatewayRanking {
 /// One gateway in a [`MinerGatewayRanking`].
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct MinerGateway {
-    /// The gateway's node ID exactly as the blocks wrote it. It may not be a
-    /// valid node ID.
+    /// The gateway's node ID exactly as the blocks wrote it.
     pub gateway_id: [u8; 32],
     /// How many counted blocks name this gateway.
     pub blocks: u32,
@@ -47,9 +46,8 @@ pub struct MinerGateway {
 /// most [`MAX_RANKED_GATEWAYS`] plus ties at the cutoff. Their standings are
 /// [`GatewayStanding::Unmatched`] until [`classify_gateways`] reads them.
 ///
-/// It drops entries with no blocks, IDs that are not valid node IDs,
-/// `local_node_id`, and repeats of an ID, keeping the repeat with the most
-/// blocks. It ranks before it drops or caps anything, so a dropped entry
+/// It drops entries with no blocks, `local_node_id`, and repeats of an ID,
+/// keeping the repeat with the most blocks. It ranks before it drops or caps anything, so a dropped entry
 /// takes no place and lower-ranked entries can't push out a better one.
 fn rank_gateways(ranking: &MinerGatewayRanking, local_node_id: NodeId) -> Vec<RankedGateway> {
     let mut gateways: Vec<MinerGateway> = ranking
@@ -67,14 +65,12 @@ fn rank_gateways(ranking: &MinerGatewayRanking, local_node_id: NodeId) -> Vec<Ra
     let mut ranked: Vec<_> = gateways
         .into_iter()
         .filter(|gateway| seen.insert(gateway.gateway_id))
-        .filter_map(|gateway| {
-            let node = NodeId::from_bytes(&gateway.gateway_id).ok()?;
-            (node != local_node_id).then_some(RankedGateway {
-                node,
-                blocks: gateway.blocks,
-                standing: GatewayStanding::Unmatched,
-            })
+        .map(|gateway| RankedGateway {
+            node: NodeId::from_bytes(&gateway.gateway_id),
+            blocks: gateway.blocks,
+            standing: GatewayStanding::Unmatched,
         })
+        .filter(|gateway| gateway.node != local_node_id)
         .collect();
     // Admission resolves cutoff ties against the live authenticated connections.
     if let Some(cutoff) = ranked.get(MAX_RANKED_GATEWAYS - 1) {
@@ -400,14 +396,6 @@ mod tests {
         ranked.iter().map(|gateway| gateway.node).collect()
     }
 
-    /// 32 bytes that are not a valid node ID.
-    fn invalid_gateway_id() -> [u8; 32] {
-        (0..=u8::MAX)
-            .map(|byte| [byte; 32])
-            .find(|bytes| NodeId::from_bytes(bytes).is_err())
-            .expect("some repeated byte is not a valid node ID")
-    }
-
     fn discovery_handle() -> ZakuraDiscoveryHandle {
         let (_connected_tx, connected) = watch::channel(Vec::<ZakuraPeerId>::new());
         build_discovery_handle(
@@ -453,20 +441,10 @@ mod tests {
     }
 
     #[test]
-    fn ranking_drops_the_local_node_and_invalid_ids() {
+    fn ranking_drops_the_local_node() {
         let local = node_id(1);
         let other = node_id(2);
-        let ranked = rank_gateways(
-            &ranking(vec![
-                gateway(local, 50),
-                MinerGateway {
-                    gateway_id: invalid_gateway_id(),
-                    blocks: 40,
-                },
-                gateway(other, 3),
-            ]),
-            local,
-        );
+        let ranked = rank_gateways(&ranking(vec![gateway(local, 50), gateway(other, 3)]), local);
 
         assert_eq!(ranked_ids(&ranked), vec![other]);
     }
@@ -514,10 +492,6 @@ mod tests {
             .zip((1..=300).rev())
             .map(|(node_id, blocks)| gateway(*node_id, blocks))
             .collect();
-        gateways.push(MinerGateway {
-            gateway_id: invalid_gateway_id(),
-            blocks: 1_000,
-        });
         gateways.reverse();
 
         let ranked = rank_gateways(&ranking(gateways), node_id(99));

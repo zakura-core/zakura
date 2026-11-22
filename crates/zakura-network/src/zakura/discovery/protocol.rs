@@ -7455,7 +7455,7 @@ mod tests {
         let dial_backoff = (Duration::from_secs(30), Duration::from_secs(300));
         let mut book = ZakuraDiscoveryBook::default();
         let record = signed_record_with(1, service(1), test_addr(1));
-        let node_id = record.body.node_id;
+        let node_id = record.body.node_id();
         assert_eq!(
             book.dial_target(&node_id, NOW, dial_backoff),
             DialTarget::Unknown
@@ -7503,7 +7503,7 @@ mod tests {
         );
 
         let record = signed_record_with(1, service(1), test_addr(1));
-        let record_id = record.body.node_id;
+        let record_id = record.body.node_id();
         book.insert_static_candidate(NodeAddr::with_addrs(record_id, vec![test_addr(3)]), NOW)
             .unwrap();
         import_confirmed_record(&mut book, record).unwrap();

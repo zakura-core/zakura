@@ -1270,6 +1270,8 @@ pub struct ZakuraDiscoveryBook {
     /// The non-static entries in eviction order. Every change to an entry
     /// updates it.
     eviction: EvictionIndex,
+    /// Which addresses records learned from peers may carry.
+    address_scope: AddressScope,
 }
 
 /// One disclosure epoch's peer-sample candidates, in random order.
@@ -2265,7 +2267,14 @@ impl ZakuraDiscoveryBook {
             generation: 0,
             relayed: HashMap::new(),
             eviction: EvictionIndex::default(),
+            address_scope: AddressScope::default(),
         }
+    }
+
+    /// Lets records learned from peers carry the addresses `scope` allows.
+    pub(super) fn with_address_scope(mut self, scope: AddressScope) -> Self {
+        self.address_scope = scope;
+        self
     }
 
     /// Returns how many node ids the current sample snapshot retains.
@@ -2477,8 +2486,8 @@ impl ZakuraDiscoveryBook {
     ///
     /// Static records are trusted-by-operator configuration, so this import path permits loopback
     /// and other local direct addresses needed by single-host regtest deployments. Untrusted
-    /// peer/gossip imports through [`Self::import_record`] keep requiring globally dialable
-    /// addresses.
+    /// peer/gossip imports through [`Self::import_record`] keep the book's [`AddressScope`]:
+    /// globally dialable addresses, plus loopback and private ones on Regtest.
     pub fn import_static_record(
         &mut self,
         record: ZakuraNodeRecord,
@@ -2609,7 +2618,7 @@ impl ZakuraDiscoveryBook {
         self.local_node_id != Some(entry.record.body.node_id)
             && !entry_is_expired(entry, now)
             && entry.is_confirmed()
-            && has_discovery_dialable_direct_addrs(&entry.record)
+            && has_discovery_dialable_direct_addrs(&entry.record, self.address_scope)
     }
 
     /// Starts a new snapshot for a new epoch, and adds the book's new
@@ -2728,7 +2737,7 @@ impl ZakuraDiscoveryBook {
                         dial_backoff.1,
                     )
                     && advertises_all_services(&entry.record, required_services)
-                    && has_discovery_usable_direct_addrs(entry)
+                    && has_discovery_usable_direct_addrs(entry, self.address_scope)
             })
             .map(DialCandidateRef::SignedRecord)
             .chain(self.static_candidates.values().filter_map(|candidate| {
@@ -3009,7 +3018,7 @@ impl ZakuraDiscoveryBook {
         let direct_addr_policy = if metadata.is_static {
             DiscoveryDirectAddrPolicy::StaticConfigured
         } else {
-            DiscoveryDirectAddrPolicy::UntrustedPeer
+            DiscoveryDirectAddrPolicy::UntrustedPeer(self.address_scope)
         };
         validate_discovery_direct_addrs(&record, direct_addr_policy)?;
 
@@ -3252,7 +3261,8 @@ pub(crate) struct DialCandidateExclusions<'a> {
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum DiscoveryDirectAddrPolicy {
-    UntrustedPeer,
+    /// A record learned from a peer, checked against the book's scope.
+    UntrustedPeer(AddressScope),
     StaticConfigured,
 }
 
@@ -3514,10 +3524,15 @@ fn current_sequence_tick() -> u64 {
         .unwrap_or(0)
 }
 
-pub(super) fn normalize_direct_addrs(addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
+/// Keeps the addresses `scope` allows in this node's own record, sorted and
+/// without duplicates, up to the per-record limit.
+pub(super) fn normalize_direct_addrs(
+    addrs: Vec<SocketAddr>,
+    scope: AddressScope,
+) -> Vec<SocketAddr> {
     let mut addrs: Vec<_> = addrs
         .into_iter()
-        .filter(is_discovery_dialable_addr)
+        .filter(|addr| scope.allows(addr))
         .collect();
     addrs.sort_unstable();
     addrs.dedup();
@@ -3599,14 +3614,51 @@ fn advertises_any_service(record: &ZakuraNodeRecord, wanted_services: &[ZakuraSe
         .any(|wanted| record.body.services.contains(wanted))
 }
 
+/// Which addresses the records this node learns from peers, and its own record,
+/// may carry.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub(super) enum AddressScope {
+    /// Only globally routable addresses. Every network except Regtest.
+    #[default]
+    Public,
+    /// Also loopback, RFC 1918 private and IPv6 unique-local addresses.
+    ///
+    /// Only Regtest, whose nodes share one host or a private network and
+    /// have no public addresses to exchange. Link-local targets such as
+    /// 169.254.169.254, and other special ranges, stay refused.
+    Local,
+}
+
+impl AddressScope {
+    /// Returns the scope for the network `network_id` names.
+    pub(super) fn for_network(network_id: ZakuraNetworkId) -> Self {
+        match network_id {
+            ZakuraNetworkId::Regtest => Self::Local,
+            ZakuraNetworkId::Mainnet | ZakuraNetworkId::Testnet | ZakuraNetworkId::Configured => {
+                Self::Public
+            }
+        }
+    }
+
+    /// Whether `addr` may appear in a record in this scope.
+    fn allows(self, addr: &SocketAddr) -> bool {
+        match self {
+            Self::Public => is_discovery_dialable_addr(addr),
+            Self::Local => is_discovery_dialable_addr(addr) || is_local_network_addr(addr),
+        }
+    }
+}
+
 /// Validates direct addresses for discovery-book storage.
 ///
-/// Untrusted peer/gossip records must only contain globally routable addresses, preserving the
-/// discovery security rule that gossiped records cannot inject loopback, link-local, multicast,
-/// broadcast, RFC 1918 private, RFC 6598 shared (CGNAT), or RFC 4193 unique-local targets. Static
-/// records are trusted-by-configuration bootstrap records, so they may use
-/// local addresses for regtest and single-host deployments, but still reject empty, unspecified, and
-/// port-0 targets that cannot be dialed as configured peers.
+/// Outside Regtest, untrusted peer/gossip records must only contain globally routable
+/// addresses, preserving the discovery security rule that gossiped records cannot inject
+/// loopback, link-local, multicast, broadcast, RFC 1918 private, RFC 6598 shared (CGNAT), or
+/// RFC 4193 unique-local targets. On Regtest they may also carry loopback, RFC 1918 private
+/// and unique-local addresses (see [`AddressScope`]). Static records are
+/// trusted-by-configuration bootstrap records, so they may use local addresses for regtest and
+/// single-host deployments, but still reject empty, unspecified, and port-0 targets that
+/// cannot be dialed as configured peers.
 fn validate_discovery_direct_addrs(
     record: &ZakuraNodeRecord,
     policy: DiscoveryDirectAddrPolicy,
@@ -3617,7 +3669,7 @@ fn validate_discovery_direct_addrs(
 
     for addr in &record.body.direct_addrs {
         let is_valid = match policy {
-            DiscoveryDirectAddrPolicy::UntrustedPeer => is_discovery_dialable_addr(addr),
+            DiscoveryDirectAddrPolicy::UntrustedPeer(scope) => scope.allows(addr),
             DiscoveryDirectAddrPolicy::StaticConfigured => {
                 is_static_discovery_configured_addr_usable(addr)
             }
@@ -3630,27 +3682,28 @@ fn validate_discovery_direct_addrs(
     Ok(())
 }
 
-fn has_discovery_dialable_direct_addrs(record: &ZakuraNodeRecord) -> bool {
+fn has_discovery_dialable_direct_addrs(record: &ZakuraNodeRecord, scope: AddressScope) -> bool {
     !record.body.direct_addrs.is_empty()
         && record
             .body
             .direct_addrs
             .iter()
-            .all(is_discovery_dialable_addr)
+            .all(|addr| scope.allows(addr))
 }
 
-fn has_discovery_usable_direct_addrs(entry: &ZakuraDiscoveryEntry) -> bool {
+fn has_discovery_usable_direct_addrs(entry: &ZakuraDiscoveryEntry, scope: AddressScope) -> bool {
     !entry.record.body.direct_addrs.is_empty()
         && entry.record.body.direct_addrs.iter().all(|addr| {
             if entry.is_static {
                 is_static_discovery_configured_addr_usable(addr)
             } else {
-                is_discovery_dialable_addr(addr)
+                scope.allows(addr)
             }
         })
 }
 
-/// Returns true only for addresses that are safe to dial from untrusted discovery gossip.
+/// Returns true only for addresses that are safe to dial from untrusted discovery gossip
+/// outside Regtest (see [`AddressScope`]).
 ///
 /// A signed `ZakuraNodeRecord` proves control of the node key, not ownership of the advertised
 /// `direct_addrs`. To stop an authenticated discovery peer from steering the candidate dialer at
@@ -3691,6 +3744,18 @@ fn is_discovery_dialable_ipv4(ip: &Ipv4Addr) -> bool {
         && !is_ipv4_documentation(ip)
         && !is_ipv4_benchmarking(ip)
         && !is_ipv4_reserved(ip)
+}
+
+/// Returns true for a loopback, RFC 1918 private or IPv6 unique-local address
+/// with a port: the local addresses Regtest nodes exchange.
+fn is_local_network_addr(addr: &SocketAddr) -> bool {
+    // Only the IPv4-mapped form is unwrapped: 6to4, Teredo and NAT64
+    // addresses embed an IPv4 address but do not reach it locally.
+    addr.port() != 0
+        && match addr.ip().to_canonical() {
+            IpAddr::V4(ip) => ip.is_loopback() || ip.is_private(),
+            IpAddr::V6(ip) => ip.is_loopback() || is_ipv6_unique_local(&ip),
+        }
 }
 
 fn is_static_discovery_configured_addr_usable(addr: &SocketAddr) -> bool {
@@ -6199,6 +6264,131 @@ mod tests {
     }
 
     #[test]
+    fn only_regtest_records_may_carry_local_addresses() {
+        assert_eq!(
+            AddressScope::for_network(ZakuraNetworkId::Regtest),
+            AddressScope::Local
+        );
+        for network_id in [
+            ZakuraNetworkId::Mainnet,
+            ZakuraNetworkId::Testnet,
+            ZakuraNetworkId::Configured,
+        ] {
+            assert_eq!(AddressScope::for_network(network_id), AddressScope::Public);
+        }
+    }
+
+    #[test]
+    fn discovery_book_peer_import_accepts_local_addresses_on_regtest() {
+        let mut book = ZakuraDiscoveryBook::default().with_address_scope(AddressScope::Local);
+        let record = signed_record_with_addrs(
+            1,
+            service(1),
+            vec![
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8233),
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7)), 8233),
+            ],
+        );
+
+        assert_eq!(
+            book.import_record(record.clone(), Some(secret_key().public()), NOW, &context())
+                .expect("a Regtest book stores gossiped local addresses"),
+            ImportOutcome::Added
+        );
+        assert_eq!(
+            book.dial_candidates(
+                10,
+                &[service(1)],
+                &[],
+                DialCandidateExclusions {
+                    connected_node_ids: &[],
+                    in_flight_node_ids: &[],
+                },
+                NOW,
+                (
+                    DEFAULT_DISCOVERY_DIAL_BACKOFF_BASE,
+                    DEFAULT_DISCOVERY_DIAL_BACKOFF_MAX,
+                ),
+                &mut StdRng::seed_from_u64(7),
+            ),
+            vec![candidate_for(&record, false)],
+            "a Regtest book dials gossiped local addresses"
+        );
+    }
+
+    #[test]
+    fn discovery_book_peer_import_on_regtest_accepts_every_local_range() {
+        for addr in [
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 16, 3, 4)), 8233),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 2)), 8233),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 8233),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0xfd12, 0, 0, 0, 0, 0, 0, 1)), 8233),
+            SocketAddr::new(IpAddr::V6(Ipv4Addr::LOCALHOST.to_ipv6_mapped()), 8233),
+        ] {
+            let mut book = ZakuraDiscoveryBook::default().with_address_scope(AddressScope::Local);
+            let record = signed_record_with_addrs(1, service(1), vec![addr]);
+
+            assert!(
+                matches!(
+                    book.import_record(record, Some(secret_key().public()), NOW, &context()),
+                    Ok(ImportOutcome::Added)
+                ),
+                "{addr}"
+            );
+        }
+    }
+
+    /// Peer exchange on Regtest works only if a node passes on the local
+    /// records it has confirmed.
+    #[test]
+    fn a_regtest_book_shares_a_confirmed_loopback_record() {
+        let mut book = ZakuraDiscoveryBook::default().with_address_scope(AddressScope::Local);
+        let record = signed_record_with_addrs(
+            1,
+            service(1),
+            vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8233)],
+        );
+
+        import_hello(&mut book, record.clone(), NOW).expect("a Regtest book stores the hello");
+
+        assert_eq!(
+            book.sample_peers(10, &[], &[], NOW, test_requester()),
+            vec![record]
+        );
+    }
+
+    #[test]
+    fn discovery_book_peer_import_on_regtest_still_rejects_undialable_addresses() {
+        for addr in [
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 8233),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 8233),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 1)), 8233),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1)), 8233),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), 8233),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            // Link-local, such as a cloud metadata address.
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)), 80),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)), 8233),
+            // RFC 6598 shared address space.
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)), 8233),
+            // Deprecated site-local, and 6to4 wrapping a private address.
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0xfec0, 0, 0, 0, 0, 0, 0, 1)), 8233),
+            SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::new(0x2002, 0x0a00, 0x0001, 0, 0, 0, 0, 0)),
+                8233,
+            ),
+        ] {
+            let mut book = ZakuraDiscoveryBook::default().with_address_scope(AddressScope::Local);
+            let record = signed_record_with_addrs(1, service(1), vec![addr]);
+
+            assert!(matches!(
+                book.import_record(record, Some(secret_key().public()), NOW, &context()),
+                Err(DiscoveryBookError::NonDialableDirectAddress { addr: rejected }) if rejected == addr
+            ));
+        }
+    }
+
+    #[test]
     fn discovery_book_static_import_rejects_unspecified_and_port_zero_addresses() {
         let bad_addrs = [
             SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 8233),
@@ -7461,30 +7651,50 @@ mod tests {
         assert_eq!(restarted_record.body.services, vec![service(2)]);
     }
 
-    #[test]
-    fn self_record_filters_non_routable_direct_addresses() {
+    /// The addresses a node lists, as its self-record carries them on the
+    /// network `network_id` names.
+    fn self_record_addrs(network_id: ZakuraNetworkId) -> Vec<SocketAddr> {
         let (_connected_tx, connected_rx) = watch::channel(Vec::new());
         let handle = discovery_handle_at(
-            local_config_with(
-                secret_key(),
-                vec![
-                    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8233),
-                    SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 8233),
-                    SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 8233),
-                    SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 8233),
-                    test_addr(45),
-                ],
-                vec![service(1)],
-            ),
+            ZakuraDiscoveryLocalConfig {
+                network_id,
+                ..local_config_with(
+                    secret_key(),
+                    vec![
+                        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8233),
+                        SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 8233),
+                        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 8233),
+                        SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 8233),
+                        test_addr(45),
+                    ],
+                    vec![service(1)],
+                )
+            },
             ZakuraDiscoveryConfig::default(),
             connected_rx,
             NOW,
         );
+        handle.current_self_record().body.direct_addrs.clone()
+    }
 
+    #[test]
+    fn self_record_filters_non_routable_direct_addresses() {
         assert_eq!(
-            handle.current_self_record().body.direct_addrs,
+            self_record_addrs(ZakuraNetworkId::Mainnet),
             vec![test_addr(45)]
         );
+    }
+
+    #[test]
+    fn regtest_self_record_keeps_local_direct_addresses() {
+        let mut expected = vec![
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8233),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 8233),
+            test_addr(45),
+        ];
+        expected.sort_unstable();
+
+        assert_eq!(self_record_addrs(ZakuraNetworkId::Regtest), expected);
     }
 
     #[tokio::test]
@@ -8394,6 +8604,84 @@ mod tests {
             verdict,
             Err(DiscoveryRecordError::InvalidSignature)
         ));
+    }
+
+    /// A node on Regtest stores a relayed record that lists only a loopback
+    /// address, and offers it to the dialer.
+    #[tokio::test]
+    async fn a_regtest_node_dials_a_relayed_loopback_record() {
+        let (_connected_tx, connected_rx) = watch::channel(Vec::new());
+        let handle = discovery_handle_at(
+            ZakuraDiscoveryLocalConfig {
+                network_id: ZakuraNetworkId::Regtest,
+                ..local_config_with(
+                    secret_key(),
+                    vec![test_addr(200)],
+                    vec![ZakuraServiceId::discovery()],
+                )
+            },
+            ZakuraDiscoveryConfig::default(),
+            connected_rx,
+            NOW,
+        );
+        let loopback = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8233);
+        let record = runtime_record_with(1, service(1), loopback);
+
+        handle
+            .import_peer_records([record.clone()], Some(secret_key().public()))
+            .await
+            .expect("a Regtest node keeps a relayed loopback record");
+
+        let candidates = handle.dial_candidates(&[], &[]).await;
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].direct_addrs, vec![loopback]);
+    }
+
+    /// A node on any other network refuses a relayed record that lists a
+    /// loopback address.
+    #[tokio::test]
+    async fn a_mainnet_node_refuses_a_relayed_loopback_record() {
+        let (_connected_tx, connected_rx) = watch::channel(Vec::new());
+        let handle = discovery_handle_at(
+            ZakuraDiscoveryLocalConfig {
+                network_id: ZakuraNetworkId::Mainnet,
+                ..local_config_with(
+                    secret_key(),
+                    vec![test_addr(200)],
+                    vec![ZakuraServiceId::discovery()],
+                )
+            },
+            ZakuraDiscoveryConfig::default(),
+            connected_rx,
+            NOW,
+        );
+        let mainnet_record = |addr| {
+            let peer_key = secret_key();
+            ZakuraNodeRecord::sign(
+                ZakuraNodeRecordBody {
+                    network_id: ZakuraNetworkId::Mainnet,
+                    direct_addrs: vec![addr],
+                    services: vec![service(1)],
+                    expires_at_unix_secs: current_unix_secs()
+                        + DEFAULT_DISCOVERY_RECORD_TTL.as_secs(),
+                    ..body(&peer_key)
+                },
+                &peer_key,
+            )
+            .expect("test record signs")
+        };
+        let public = mainnet_record(test_addr(1));
+        let loopback = mainnet_record(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8233));
+
+        let _ = handle
+            .import_peer_records([public.clone(), loopback], Some(secret_key().public()))
+            .await;
+
+        // The public record shows the batch was otherwise acceptable.
+        let candidates = handle.dial_candidates(&[], &[]).await;
+        assert_eq!(handle.inner.lock().await.book().len(), 1);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].node_id, public.body.node_id);
     }
 
     /// Relayed records follow the relay verdict table: a forged record anywhere in the

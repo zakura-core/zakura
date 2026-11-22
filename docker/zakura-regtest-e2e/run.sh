@@ -19,7 +19,7 @@
 #   4b. the pure Zakura-only node2 bootstraps the genesis block over Zakura: with
 #      the Regtest genesis self-seed disabled (sync.debug_skip_regtest_genesis_self_seed)
 #      and no legacy stack, node2 can only reach genesis by downloading it from
-#      node1 over Zakura — the production Mainnet/Testnet bootstrap path,
+#      a Zakura peer (node1, or node4 learned from node1) — the production Mainnet/Testnet bootstrap path,
 #   5. blocks generated on node1 propagate to the pure-Zakura node2 AND the
 #      legacy-only node3 — so node2, which has no legacy stack, proves
 #      pure-Zakura propagation,
@@ -1105,6 +1105,17 @@ block_count() { rpc "$1" getblockcount | jq -r '.result // 0'; }
 block_hash() { rpc "$1" getblockhash "[$2]" | jq -r '.result // empty'; }
 strict_upgrade() { [[ "${ZAKURA_REGTEST_E2E_STRICT_UPGRADE:-0}" == "1" ]]; }
 
+# Kind-6 block bodies served by the nodes that can serve node2's catch-up.
+# node2 joins through node1, but Regtest exchanges local v2 addresses, so node1
+# may tell node2 about node4 and node2 may fetch some or all bodies from node4.
+# node3 is legacy-only and cannot serve kind-6. A stopped node4 reads as 0.
+zakura_bodies_served_to_node2() {
+  local node1 node4
+  node1=$(metric 19001 sync_block_body_served)
+  node4=$(metric 19004 sync_block_body_served)
+  awk -v a="${node1}" -v b="${node4}" 'BEGIN {print a + b}'
+}
+
 # Extended lanes only stress node1 and node2 after the initial upgrade smoke.
 # Stop the known-optional upgraded peer at a verified idle trace boundary so
 # its unrelated catch-up cannot outlive it and keep header requests open.
@@ -1380,7 +1391,8 @@ snapshot_timeline "legacy-peers-ready"
 
 log "asserting pure-Zakura node2 has no legacy peers (p2p_stack = zakura)"
 # node2 has no legacy stack at all, so it must never have a legacy TCP peer; its
-# only connectivity is the Zakura bootstrap dial to node1.
+# connectivity is Zakura only: the bootstrap dial to node1, plus node4 when it
+# learns node4's local address from node1 on Regtest.
 n2_legacy=$(peer_count 18332)
 printf '  node2 legacy peers=%s (want 0)\n' "${n2_legacy}"
 [[ "${n2_legacy}" -eq 0 ]] || fail \
@@ -1568,7 +1580,7 @@ log "starting pure-Zakura node2 for a from-scratch kind-6 catch-up"
 catchup_target=$(block_count 18232)
 [[ "${catchup_target}" -ge 1 ]] || fail \
   "node1 has no chain for node2 to catch up to (height ${catchup_target})"
-before_node1_served=$(metric 19001 sync_block_body_served)
+before_served=$(zakura_bodies_served_to_node2)
 snapshot_timeline "pre-reset-catch-up"
 
 # ---------------------------------------------------------------------------
@@ -1653,12 +1665,12 @@ if [[ "${ZAKURA_E2E_REQUIRE_HANDOFF}" == "1" ]]; then
     "${CATCHUP_TIMEOUT}"
 fi
 
-# node2 dials only node1, so node1 must have served the catch-up bodies over kind-6.
-after_node1_served=$(metric 19001 sync_block_body_served)
-printf '  node1 kind-6 bodies served=%s (before reset %s)\n' \
-  "${after_node1_served}" "${before_node1_served}"
-if ! awk "BEGIN{exit !(${after_node1_served} > ${before_node1_served})}"; then
-  fail "node2 caught up from scratch but node1's kind-6 body-served metric did not increase — bodies did not flow over block sync"
+# The catch-up bodies must have been served over kind-6 by node1 or node4.
+after_served=$(zakura_bodies_served_to_node2)
+printf '  node1+node4 kind-6 bodies served=%s (before reset %s)\n' \
+  "${after_served}" "${before_served}"
+if ! awk "BEGIN{exit !(${after_served} > ${before_served})}"; then
+  fail "node2 caught up from scratch but the kind-6 body-served metrics of node1 and node4 did not increase: bodies did not flow over block sync"
 fi
 assert_block_sync_budget_empty "post-catch-up"
 if [[ "${ZAKURA_E2E_REQUIRE_HANDOFF}" == "1" ]]; then

@@ -1,10 +1,11 @@
 # Zakura regtest e2e — node 2 (PURE Zakura-only: no legacy TCP stack at all).
 #
 # This is the from-scratch zakura-only node. It has no legacy listener and no
-# legacy initial peers; it reaches the network solely by dialing node 1's Zakura
-# QUIC endpoint from `zakura.bootstrap_peers`. Block gossip and block fetches
-# therefore flow exclusively over the Zakura legacy-gossip adapter, so a block
-# reaching this node proves pure-Zakura propagation.
+# legacy initial peers; it joins the network solely by dialing node 1's Zakura
+# QUIC endpoint from `zakura.bootstrap_peers` (Regtest exchanges local v2
+# addresses, so it may then learn node 4's Zakura endpoint from node 1 and dial
+# it too). Block gossip and block fetches therefore flow exclusively over Zakura,
+# so a block reaching this node proves pure-Zakura propagation.
 
 [network]
 network = "Regtest"

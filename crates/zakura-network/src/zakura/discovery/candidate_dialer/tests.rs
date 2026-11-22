@@ -1403,10 +1403,10 @@ async fn the_dialer_loop_sleeps_until_the_round_deadline_after_a_completion() {
     node.shutdown().await;
 }
 
-// V12 F-583: each dial holds one of the handler's admission permits from its
+// V12 F-583: each dial holds one of the handler's connection slots from its
 // start. A round that counted only the transport's free slots could admit
-// more dials than free permits, and the extra workers then failed as local
-// limits. The round now admits at most one candidate per free permit.
+// more dials than free slots, and the extra workers then failed as local
+// limits. The round now admits at most one candidate per free slot.
 #[tokio::test]
 async fn a_round_admits_no_more_dials_than_free_admission_permits() {
     let node = crate::zakura::testkit::ZakuraTestNode::builder(9217)
@@ -1415,8 +1415,7 @@ async fn a_round_admits_no_more_dials_than_free_admission_permits() {
         .expect("dialer spawns");
     let endpoint = node.endpoint();
     let permits = endpoint.discovery_dial_permits();
-    let held = endpoint
-        .hold_admission_permits(u32::try_from(permits - 1).expect("the test node has few permits"));
+    let held = endpoint.hold_connection_slots(permits - 1);
     assert_eq!(endpoint.discovery_dial_permits(), 1);
     assert!(
         endpoint.discovery_admission_capacity() >= 3,

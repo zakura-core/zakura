@@ -524,7 +524,7 @@ mod tests {
 
     /// #2254: the transport counts inbound peers' live slots up to their
     /// connection and handshake shares, so with inbound full, discovery still
-    /// has room for every outbound connection the admission semaphore leaves,
+    /// has room for every outbound connection the connection slots leave,
     /// once the dial reserve has its full record. Before, inbound could hold
     /// 92 of the default 107 discovery slots and leave discovery 15 of its 23.
     #[test]

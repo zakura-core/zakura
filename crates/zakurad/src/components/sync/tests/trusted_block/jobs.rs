@@ -60,6 +60,22 @@ async fn prepared_delivery(confirm: bool) {
         assert_eq!(primary.submit(bytes.clone(), false).await, "accepted");
         let mut receipt = solved.hash().0.to_vec();
         receipt.extend_from_slice(&Sha256::digest(&bytes));
+        let mut different = receipt.clone();
+        different[63] ^= 1;
+        // Once the relay has bound its solution, a matching header hash with the wrong
+        // block digest is refused and leaves the job available for the correct receipt.
+        timeout(Duration::from_secs(20), async {
+            loop {
+                match post(&relay, "confirm", different.clone()).await {
+                    StatusCode::CONFLICT => break,
+                    StatusCode::ACCEPTED => tokio::task::yield_now().await,
+                    status => panic!("unexpected confirmation response {status}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(relay.pending.get(solved.hash()).is_none());
         assert_eq!(post(&relay, "confirm", receipt).await, StatusCode::ACCEPTED);
     } else {
         relay.hold_proposal.send_replace(false);

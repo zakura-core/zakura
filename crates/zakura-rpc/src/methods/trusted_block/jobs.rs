@@ -222,13 +222,14 @@ where
             return Err(JobError::Expired);
         }
         let height = candidate.coinbase_height().ok_or(JobError::Invalid)?;
-        let verify = self
-            .gbt
-            .block_verifier_router()
-            .oneshot(zakura_consensus::Request::Prepare {
-                block: candidate.clone().into(),
-                source: zakura_consensus::PreparedCandidateSource::ClientProposal,
-            });
+        let request =
+            self.gbt
+                .block_verifier_router()
+                .oneshot(zakura_consensus::Request::Prepare {
+                    block: candidate.clone().into(),
+                    source: zakura_consensus::PreparedCandidateSource::ClientProposal,
+                });
+        let verify = local_approval(request);
         tokio::pin!(verify);
         let mut verified = false;
         let mut solve_inputs = inputs.clone();
@@ -243,7 +244,7 @@ where
         let header = tokio::select! {
             biased;
             result = &mut verify => {
-                result.map_err(|_| JobError::Invalid)?;
+                result?;
                 verified = true;
                 solve.await?
             }
@@ -282,7 +283,7 @@ where
         if !verified {
             tokio::select! {
                 biased;
-                result = &mut verify => { result.map_err(|_| JobError::Invalid)?; }
+                result = &mut verify => { result?; }
                 result = inputs.wait_for(|parts| parts.confirmation == Some(confirmation)) => {
                     drop(result.map_err(|_| JobError::Expired)?);
                 }
@@ -304,8 +305,32 @@ where
             .await
         {
             Ok(SubmitBlockResponse::Accepted) => Ok(()),
+            Ok(SubmitBlockResponse::ErrorResponse(SubmitBlockErrorResponse::Rejected)) => {
+                Err(JobError::Invalid)
+            }
             Err(TrustedSubmissionError::Capacity) => Err(JobError::Capacity),
             _ => Err(JobError::Unavailable),
+        }
+    }
+}
+
+/// An unavailable verifier gives no local verdict. Keep the primary confirmation eligible
+/// until the job deadline. An actual rejection vetoes early relay.
+async fn local_approval(
+    verify: impl std::future::Future<Output = std::result::Result<block::Hash, tower::BoxError>>,
+) -> std::result::Result<(), JobError> {
+    match verify.await {
+        Ok(_) => Ok(()),
+        Err(error)
+            if error
+                .downcast_ref::<RouterError>()
+                .is_some_and(|e| !e.is_verification_unavailable()) =>
+        {
+            Err(JobError::Invalid)
+        }
+        Err(error) => {
+            tracing::debug!(%error, "local proposal verification unavailable; awaiting primary confirmation");
+            std::future::pending().await
         }
     }
 }
@@ -333,6 +358,15 @@ fn bind_header(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn unavailable_verifier_leaves_confirmation_eligible() {
+        use futures::FutureExt;
+        let unavailable = std::future::ready(Err("verifier service is closed".into()));
+        assert!(local_approval(unavailable).now_or_never().is_none());
+        let authorized = std::future::ready(Ok(block::Hash([0; 32])));
+        assert_eq!(local_approval(authorized).await, Ok(()));
+    }
 
     #[test]
     fn job_slots_accept_replays_and_bound_incomplete_jobs() {

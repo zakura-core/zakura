@@ -13,7 +13,7 @@ use zakura_network::zakura::{
 
 use super::{GetMinerMeshInfoResponse, MeshGatewayState, MeshNode, MeshWindow};
 
-// Public IDs from six v2 identities, in byte order as the endpoint reports peers.
+// Six arbitrary node IDs, in byte order as the endpoint reports peers.
 const LOCAL_NODE: [u8; 32] =
     node_id(b"2840d419ac18afd23ff4ffe3ba55fb67b620379394c054260ae223adf3d136c7");
 const PREFERRED_GATEWAY: [u8; 32] =

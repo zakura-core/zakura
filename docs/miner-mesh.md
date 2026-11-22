@@ -48,10 +48,12 @@ the same ID, so the ID survives restarts; a new secret gives a new ID.
 Moving v2 networking to protocol 4 gave every node a new ID. A block mined
 before a gateway upgraded names its old ID, which no node has any more. Such
 an ID stays unmatched: it takes no connection place, and it leaves the counts
-once its blocks fall out of the two-day window.
+once its blocks fall out of the two-day window. A gateway's new ID counts only
+the blocks mined since it upgraded, so for up to two days the ranking can show
+its old and new IDs side by side.
 
-Only nodes on the current v2 protocol connect to each other, so a gateway and
-the miners that prefer it must all run it to form a mesh.
+Only nodes on the current v2 protocol make v2 connections to each other, so a
+gateway and the miners that prefer it must all run it to form a mesh.
 
 ## Prefer announced gateways
 

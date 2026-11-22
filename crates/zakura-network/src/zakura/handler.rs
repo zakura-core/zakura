@@ -1067,7 +1067,7 @@ impl ZakuraEndpoint {
         .await
     }
     /// Returns the local node identity used to authenticate native connections.
-    pub(crate) fn local_node_id(&self) -> NodeId {
+    pub fn local_node_id(&self) -> NodeId {
         self.quic.local_id()
     }
 

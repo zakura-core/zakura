@@ -113,6 +113,93 @@ fn blocksync_throughput_probe_requires_v2_p2p() {
 }
 
 #[test]
+fn announcing_a_gateway_requires_v2_p2p() {
+    let cmd = StartCmd {
+        filters: Vec::new(),
+        zcashd_compat: false,
+        unsafe_low_specs: false,
+    };
+    let mut config = ZakuradConfig::default();
+    config.network.p2p_stack = P2pStack::Legacy;
+    config.mining.miner_mesh = true;
+
+    let error = cmd
+        .override_config(config.clone())
+        .expect_err("a gateway needs the v2 stack");
+    assert!(
+        error
+            .to_string()
+            .contains("mining.miner_mesh requires the Zakura P2P v2 stack"),
+        "unexpected error: {error}"
+    );
+
+    // The same node starts without the flag, and with the flag once it runs v2.
+    config.mining.miner_mesh = false;
+    cmd.override_config(config.clone())
+        .expect("a legacy node that does not announce is valid");
+    config.mining.miner_mesh = true;
+    config.network.p2p_stack = P2pStack::Dual;
+    cmd.override_config(config.clone())
+        .expect("a v2 node can announce");
+
+    // A gateway others cannot dial, or a node that builds no coinbase, is warned about but
+    // not refused. The warnings themselves are not captured here.
+    config.network.zakura.listen_addr = None;
+    config.mining.miner_address = None;
+    cmd.override_config(config)
+        .expect("a gateway without a listen address or miner address still starts");
+}
+
+/// A gateway that cannot keep a key file would come back with a new ID, so it refuses to
+/// start. One whose key is saved, or that announces nothing, starts.
+#[test]
+fn announcing_a_gateway_requires_a_key_that_survives_restarts() {
+    let dir = tempfile::tempdir().expect("failed to create temp dir");
+    // The identity directory's path is taken by a regular file, so it can hold no key file.
+    let blocked = dir.path().join("blocked");
+    std::fs::write(&blocked, "").expect("write the blocking file");
+
+    let mut config = ZakuradConfig::default();
+    config.network.p2p_stack = P2pStack::Dual;
+    config.network.identity_dir = blocked;
+
+    StartCmd::network_config_for_start(&config)
+        .expect("a node that does not announce may have no usable key file");
+
+    config.mining.miner_mesh = true;
+    let error = StartCmd::network_config_for_start(&config)
+        .expect_err("a gateway must be able to keep its key");
+    assert!(
+        error
+            .to_string()
+            .contains("mining.miner_mesh needs a node key that stays the same across restarts"),
+        "unexpected error: {error}"
+    );
+
+    config.network.identity_dir = dir.path().join("identity");
+    let network = StartCmd::network_config_for_start(&config)
+        .expect("a gateway with a writable key directory saves its key");
+    let persisted = config
+        .network
+        .zakura_secret_key()
+        .expect("read the saved identity")
+        .public();
+    std::fs::rename(&config.network.identity_dir, dir.path().join("moved"))
+        .expect("move the identity directory before endpoint startup");
+    assert_eq!(
+        network
+            .zakura_secret_key()
+            .expect("load the endpoint identity")
+            .public(),
+        persisted
+    );
+    assert!(
+        !config.network.identity_dir.exists(),
+        "startup must not generate a replacement key"
+    );
+}
+
+#[test]
 fn vct_fast_sync_requires_checkpoint_sync_at_startup() {
     let cmd = StartCmd {
         filters: Vec::new(),

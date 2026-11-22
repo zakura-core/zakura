@@ -531,6 +531,42 @@ async fn dial_attempts_count_only_addresses_the_dial_would_try() {
 }
 
 #[tokio::test]
+async fn a_quic_connection_authenticates_the_full_extended_credential() {
+    // Append an opaque key to the listener's normal credential. The wire
+    // entry has tag 0x0102, a little-endian length, and the full public key.
+    let secret = NodeSecretKey::generate();
+    let original_id = secret.public();
+    let mut bytes = secret.credential().encode();
+    bytes[0] += 1;
+    bytes.extend_from_slice(&0x0102u16.to_le_bytes());
+    bytes.extend_from_slice(&1312u16.to_le_bytes());
+    bytes.extend_from_slice(&[0x5a; 1312]);
+    let credential = crate::NodeCredential::decode(&bytes).unwrap();
+    let listener_keys = credential.key_list().clone();
+    let secret = secret.with_credential(credential).unwrap();
+
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let endpoint = QuicEndpoint::bind(secret, &loopback(), &test_config()).unwrap();
+        let mut server = serve_test_acceptor(endpoint, &[ALPN], |_| Admit::Accept);
+        let client = client();
+
+        let old_pin = NodeAddr::with_addrs(original_id, server.endpoint.local_addrs());
+        assert!(matches!(
+            client.connect(old_pin, &[ALPN]).await,
+            Err(ConnectError::WrongIdentity)
+        ));
+        let conn = client.connect(server.addr(), &[ALPN]).await.unwrap();
+        let inbound = server.handled.recv().await.unwrap();
+        assert_eq!(conn.remote_key_list(), &listener_keys);
+        assert_eq!(conn.remote_id(), listener_keys.node_id());
+        assert_eq!(inbound.remote_id(), client.local_id());
+        assert_eq!(echo(&conn, b"hello").await, b"hello");
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn wrong_identity_is_refused() {
     tokio::time::timeout(TEST_TIMEOUT, async {
         let server = server();

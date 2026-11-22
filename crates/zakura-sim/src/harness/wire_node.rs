@@ -902,6 +902,7 @@ impl TransportTap {
                 inbound_connections: sample.inbound_connections,
                 node_connections: sample.node_connections,
                 inbound_node_connections: sample.inbound_node_connections,
+                ordinary_inbound_connections: sample.ordinary_inbound_connections,
                 connection_cap: sample.connection_cap,
                 address_cap: sample.address_cap,
                 quic_handoffs: quic.handoffs,

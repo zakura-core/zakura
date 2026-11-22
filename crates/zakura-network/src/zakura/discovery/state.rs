@@ -12,7 +12,7 @@ use zakura_rt::collections::{HashMap, HashSet};
 use super::protocol::{
     advertised_services, entry_is_expired, hello_verdict, normalize_direct_addrs,
     normalize_services, push_unique_service, AddressScope, BookChange, DialAdmission,
-    DialCandidateExclusions, DisclosureKey, DiscoveryBookError, DiscoveryRecordError,
+    DialCandidateExclusions, DialTarget, DisclosureKey, DiscoveryBookError, DiscoveryRecordError,
     DiscoveryRecordValidationContext, DiscoveryWireError, ImportBatchOutcome, ImportOutcome,
     RecordVerdict, Services, ZakuraCachedLiveServiceSummary, ZakuraDiscoveryBook,
     ZakuraDiscoveryConfig, ZakuraDiscoveryDialCandidate, ZakuraDiscoveryEntry,
@@ -803,6 +803,16 @@ impl DiscoveryState {
             rng,
             admit,
         );
+    }
+
+    /// What the book knows about dialing `node_id` at `now`, under the
+    /// configured dial backoff, as [`ZakuraDiscoveryBook::dial_target`] says.
+    pub(super) fn dial_target(&self, node_id: &NodeId, now: u64) -> DialTarget {
+        self.book.dial_target(
+            node_id,
+            now,
+            (self.config.dial_backoff_base, self.config.dial_backoff_max),
+        )
     }
 
     /// Returns the admitted sessions by node id: connection, session, and whether outbound.

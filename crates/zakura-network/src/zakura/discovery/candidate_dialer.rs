@@ -22,6 +22,7 @@ use tracing::debug;
 use zakura_node_services::task::spawn_erased_named;
 use zakura_quic::{NodeAddr, NodeId};
 use zakura_rt::{
+    collections::HashSet,
     sync::{oneshot, watch},
     task::{AbortOnDropHandle, JoinHandle},
     time::Instant,
@@ -32,11 +33,12 @@ use super::protocol::{DialAdmission, ZakuraDiscoveryDialCandidate, ZakuraDiscove
 use super::redial::ZAKURA_REDIAL_HEALTHY_CONNECTION;
 use super::trace::{DialOwner, DialPhase, DiscoveryDialPhaseEvent, DiscoveryDialResultEvent};
 use crate::zakura::{
-    handler::{DialRegistration, DialReport},
-    ZakuraEndpoint, ZakuraHandlerError, ZakuraLocalLimits, ZakuraPeerId, ZakuraServiceId,
-    ZakuraSupervisorHandle, ZakuraTrace,
+    handler::{DialRegistration, DialReport, NativeDialKind},
+    PreferredGateways, ZakuraEndpoint, ZakuraHandlerError, ZakuraLocalLimits, ZakuraPeerId,
+    ZakuraServiceId, ZakuraTrace,
 };
 
+mod preferred;
 #[cfg(any(test, feature = "p2p-fuzz"))]
 mod replay;
 mod state;
@@ -44,6 +46,12 @@ mod state;
 mod tests;
 #[cfg(any(test, feature = "p2p-fuzz"))]
 pub use replay::{replay_candidate_dial_bytes, CandidateDialReplaySummary};
+
+use preferred::{
+    admit_preferred_dials, classify_gateways, DeferredDials, PreferredGatewayInput, PreferredRoom,
+    PreferredRound, RoundClaims,
+};
+pub use preferred::{MinerGateway, MinerGatewayRanking};
 
 use state::{
     classify_dial, CandidateDialerState, DialAttemptKey, DialFinish, DialObservation,
@@ -76,6 +84,15 @@ impl DiscoveryDialResult {
     }
 }
 
+/// The attempts one round admitted, with the addresses to dial.
+#[derive(Debug, Default)]
+struct DialRound {
+    /// Dials to preferred gateways, highest rank first.
+    preferred: Vec<(DialAttemptKey, NodeAddr)>,
+    /// Ordinary dials, in the discovery book's dial order.
+    ordinary: Vec<(DialAttemptKey, NodeAddr)>,
+}
+
 #[derive(Debug)]
 struct DiscoveryDialOutcome {
     /// The address whose handshake TLS authenticated, if this worker's dial got that far.
@@ -88,6 +105,9 @@ struct DiscoveryDialOutcome {
 
 /// Spawn the long-lived discovery candidate dialer for `endpoint`.
 ///
+/// `miner_gateways` carries the mining gateways the node prefers to stay
+/// connected to; without it the node prefers none.
+///
 /// Returns the task handle so the caller can track it under the endpoint
 /// shutdown owner; the loop also observes the endpoint shutdown token directly.
 pub(crate) fn spawn_native_discovery_dialer(
@@ -95,10 +115,11 @@ pub(crate) fn spawn_native_discovery_dialer(
     discovery: ZakuraDiscoveryHandle,
     limits: ZakuraLocalLimits,
     sought_services: Vec<ZakuraServiceId>,
+    miner_gateways: Option<watch::Receiver<MinerGatewayRanking>>,
 ) -> JoinHandle<()> {
     spawn_erased_named(
         "discovery_dialer",
-        run_native_discovery_dialer(endpoint, discovery, limits, sought_services),
+        run_native_discovery_dialer(endpoint, discovery, limits, sought_services, miner_gateways),
     )
 }
 
@@ -128,11 +149,18 @@ pub(crate) async fn run_native_discovery_dialer(
     discovery: ZakuraDiscoveryHandle,
     limits: ZakuraLocalLimits,
     sought_services: Vec<ZakuraServiceId>,
+    miner_gateways: Option<watch::Receiver<MinerGatewayRanking>>,
 ) {
     let shutdown = endpoint.background_shutdown_token();
     let trace = endpoint.trace();
     let mut state = CandidateDialerState::new(discovery.dial_backoff().await);
+    let preferred = PreferredGatewayInput::new(miner_gateways, endpoint.local_node_id());
     let mut io = CandidateDialerIO {
+        preferred,
+        deferred: DeferredDials::new(endpoint.local_node_id()),
+        preferred_hold_limit: discovery.preferred_hold_limit().await,
+        max_concurrent_dials: discovery.max_concurrent_dials().await,
+        preferred_attempts: HashSet::default(),
         endpoint,
         discovery,
         limits,
@@ -175,6 +203,16 @@ struct CandidateDialerIO {
     discovery: ZakuraDiscoveryHandle,
     limits: ZakuraLocalLimits,
     sought_services: Vec<ZakuraServiceId>,
+    /// The mining gateways the node prefers to stay connected to.
+    preferred: PreferredGatewayInput,
+    /// The members whose dial waits out a grace.
+    deferred: DeferredDials,
+    /// The most connection places the node may hold for them.
+    preferred_hold_limit: usize,
+    /// The most dials, preferred or ordinary, in flight at once.
+    max_concurrent_dials: usize,
+    /// The attempts in flight that the preferred pass started.
+    preferred_attempts: HashSet<DialAttemptKey>,
     trace: ZakuraTrace,
     workers: FuturesUnordered<DiscoveryDialWorker>,
 }
@@ -195,45 +233,144 @@ impl CandidateDialerIO {
         }
     }
 
-    /// Dials the discovery book's candidates that [`admit_dial_round`]
-    /// records, one worker per attempt.
+    /// Runs one dial round: admits its attempts with [`Self::admit_round`]
+    /// from the peers registered now, and starts one worker per attempt.
     async fn spawn_dial_round(&mut self, state: &mut CandidateDialerState) {
-        let admitted = admit_dial_round(
+        let registered: Vec<NodeId> = self
+            .endpoint
+            .supervisor()
+            .subscribe()
+            .borrow()
+            .iter()
+            .filter_map(ZakuraPeerId::node_id)
+            .collect();
+        let round = self.admit_round(state, &registered, Instant::now()).await;
+        for (attempt, node_addr) in round.preferred {
+            self.preferred_attempts.insert(attempt);
+            metrics::counter!("zakura.p2p.discovery.dial.preferred.started").increment(1);
+            self.spawn_dial(attempt, node_addr, NativeDialKind::Maintained)
+                .await;
+        }
+        for (attempt, node_addr) in round.ordinary {
+            self.spawn_dial(attempt, node_addr, NativeDialKind::Discovery)
+                .await;
+        }
+    }
+
+    /// Admits one round's dials at `now`, given the peers `registered` now:
+    ///
+    /// 1. classifies the ranked gateways, forms the preferred set and hands
+    ///    it to the connection-slot checks ([`Self::publish_preferred_gateways`]);
+    /// 2. admits the set's members, highest rank first, that are neither
+    ///    connected nor being dialed, a member with a lower node ID only
+    ///    after a grace ([`admit_preferred_dials`]);
+    /// 3. admits the discovery book's other candidates with what is left
+    ///    ([`admit_dial_round`]).
+    async fn admit_round(
+        &mut self,
+        state: &mut CandidateDialerState,
+        registered: &[NodeId],
+        now: Instant,
+    ) -> DialRound {
+        let round = self.publish_preferred_gateways(state, registered).await;
+        let room = PreferredRoom {
+            connections: self.endpoint.preferred_dial_permits(),
+            address_attempts: self.endpoint.preferred_dial_capacity(),
+            dials: self
+                .max_concurrent_dials
+                .saturating_sub(state.in_flight_node_ids().len()),
+        };
+        let supervisor = self.endpoint.supervisor();
+        let (preferred, claims) = admit_preferred_dials(
+            state,
+            &round.set,
+            &round.dialable,
+            &mut self.deferred,
+            room,
+            |ip, in_flight| supervisor.can_accept_remote_ip_with_in_flight(ip, in_flight),
+            now,
+        );
+        let ordinary = admit_dial_round(
             &self.endpoint,
             &self.discovery,
             &self.sought_services,
             state,
-            Instant::now(),
+            claims,
+            now,
         )
         .await;
-        for (attempt, node_addr) in admitted {
-            self.discovery.mark_dial_attempt(&attempt.node_id).await;
-            metrics::counter!("zakura.p2p.discovery.dial.started").increment(1);
-            trace_dial_phase(&self.trace, attempt, DialPhase::Recorded);
-            self.workers.push(DiscoveryDialWorker::spawn(
-                attempt,
-                run_discovery_dial_once(
-                    self.endpoint.clone(),
-                    node_addr,
-                    self.limits.clone(),
-                    attempt,
-                ),
-            ));
+        DialRound {
+            preferred,
+            ordinary,
         }
+    }
+
+    /// Classifies the ranked gateways given the peers `registered` now, forms
+    /// the preferred set and hands it to the connection-slot checks.
+    ///
+    /// Every round publishes again, so a gateway that connects, disconnects
+    /// or enters or leaves a backoff moves within one round interval, and a
+    /// set the slot checks re-formed for an inbound gateway is replaced by
+    /// one formed from the registrations.
+    async fn publish_preferred_gateways(
+        &mut self,
+        state: &CandidateDialerState,
+        registered: &[NodeId],
+    ) -> PreferredRound {
+        let classified = classify_gateways(
+            self.preferred.current(),
+            registered,
+            &state.in_flight_node_ids(),
+            &self.discovery,
+        )
+        .await;
+        let formed = PreferredGateways::form(classified.ranking, self.preferred_hold_limit);
+        let round = PreferredRound {
+            set: formed.set().to_vec(),
+            dialable: classified.dialable,
+        };
+        self.endpoint.publish_preferred_gateways(formed);
+        round
+    }
+
+    /// Starts a worker that dials `node_addr` for `attempt` as a `kind` dial.
+    async fn spawn_dial(
+        &mut self,
+        attempt: DialAttemptKey,
+        node_addr: NodeAddr,
+        kind: NativeDialKind,
+    ) {
+        self.discovery.mark_dial_attempt(&attempt.node_id).await;
+        metrics::counter!("zakura.p2p.discovery.dial.started").increment(1);
+        trace_dial_phase(&self.trace, attempt, DialPhase::Recorded);
+        self.workers.push(DiscoveryDialWorker::spawn(
+            attempt,
+            run_discovery_dial_once(
+                self.endpoint.clone(),
+                node_addr,
+                self.limits.clone(),
+                attempt,
+                kind,
+            ),
+        ));
     }
 
     /// Settles a finished worker's attempt in `state`, then records its
     /// result in the discovery book, the trace, and the metrics.
     async fn settle(
-        &self,
+        &mut self,
         state: &mut CandidateDialerState,
         attempt: DialAttemptKey,
         outcome: DiscoveryDialOutcome,
     ) {
         trace_dial_phase(&self.trace, attempt, outcome.phase);
+        let preferred = self.preferred_attempts.remove(&attempt);
         let admitted_ip = outcome.admitted_addr.map(|addr| addr.ip());
         if !state.complete(attempt, outcome.result, admitted_ip, Instant::now()) {
             return;
+        }
+        if preferred {
+            count_preferred_dial_result(outcome.result);
         }
         apply_discovery_dial_result(
             &self.discovery,
@@ -251,6 +388,7 @@ impl CandidateDialerIO {
         for worker in &self.workers {
             worker.task.abort();
         }
+        self.preferred_attempts.clear();
         while let Some((attempt, outcome)) = self.workers.next().await {
             trace_dial_phase(&self.trace, attempt, outcome.phase);
             let admitted_ip = outcome.admitted_addr.map(|addr| addr.ip());
@@ -315,18 +453,30 @@ impl Future for DiscoveryDialWorker {
 /// with more addresses than the endpoint has free discovery slots: the
 /// transport claims a slot for every address or fails the whole dial as a
 /// local limit. The round also admits no more candidates than the handler has
-/// free connection slots, since each dial holds one.
+/// free ordinary connection slots, since each dial holds one.
+///
+/// `preferred` is what this round's preferred pass already claimed, and the
+/// preferred set's members are left to that pass.
 async fn admit_dial_round(
     endpoint: &ZakuraEndpoint,
     discovery: &ZakuraDiscoveryHandle,
     sought_services: &[ZakuraServiceId],
     state: &mut CandidateDialerState,
+    preferred: RoundClaims,
     now: Instant,
 ) -> Vec<(DialAttemptKey, NodeAddr)> {
     // No worker of this round dials before the round ends, so the round
-    // counts down the slots and permits its own attempts will claim.
-    let mut free_slots = endpoint.discovery_admission_capacity();
-    let mut free_permits = endpoint.discovery_dial_permits();
+    // counts down the slots and permits its own attempts will claim. A
+    // preferred dial takes a held place, so it leaves the ordinary slots
+    // alone unless the free slots run out first.
+    let mut free_slots = endpoint
+        .discovery_admission_capacity()
+        .saturating_sub(preferred.address_attempts);
+    let mut free_permits = endpoint.discovery_dial_permits().min(
+        endpoint
+            .preferred_dial_permits()
+            .saturating_sub(preferred.dials),
+    );
     if free_slots == 0 || free_permits == 0 {
         return Vec::new();
     }
@@ -343,10 +493,13 @@ async fn admit_dial_round(
                 if free_slots == 0 || free_permits == 0 {
                     return DialAdmission::Exhausted;
                 }
+                if held_places.members.contains(&candidate.node_id) {
+                    return DialAdmission::Skipped;
+                }
                 let Some((node_addr, reserved_ips)) = discovery_node_addr_with_reserved_ip_capacity(
-                    &supervisor,
                     state,
                     &candidate,
+                    |ip, in_flight| supervisor.can_accept_remote_ip_with_in_flight(ip, in_flight),
                     now,
                 ) else {
                     return DialAdmission::Skipped;
@@ -370,19 +523,18 @@ async fn admit_dial_round(
 
 /// Returns the addresses of `candidate` to dial and their canonical IPs, whose
 /// admission hosts the attempt reserves: the addresses `state` allows whose
-/// hosts the supervisor accepts.
+/// hosts the supervisor accepts. `accepts_ip(ip, in_flight)` is the
+/// supervisor's per-IP check, given this dialer's attempts in flight to `ip`.
 fn discovery_node_addr_with_reserved_ip_capacity(
-    supervisor: &ZakuraSupervisorHandle,
     state: &CandidateDialerState,
     candidate: &ZakuraDiscoveryDialCandidate,
+    accepts_ip: impl Fn(IpAddr, usize) -> bool,
     now: Instant,
 ) -> Option<(NodeAddr, Vec<IpAddr>)> {
     let mut direct_addrs = Vec::new();
     let mut reserved_ips = Vec::new();
     for address in state.candidate_addresses(candidate, now) {
-        if supervisor
-            .can_accept_remote_ip_with_in_flight(address.ip, state.in_flight_dials_to(address.ip))
-        {
+        if accepts_ip(address.ip, state.in_flight_dials_to(address.ip)) {
             reserved_ips.push(address.ip);
             direct_addrs.push(address.addr);
         }
@@ -396,11 +548,14 @@ fn discovery_node_addr_with_reserved_ip_capacity(
     })
 }
 
+/// Dials `node_addr` once as a `kind` dial and classifies the attempt by
+/// what the registrations show for its peer.
 async fn run_discovery_dial_once(
     endpoint: ZakuraEndpoint,
     node_addr: NodeAddr,
     limits: ZakuraLocalLimits,
     attempt: DialAttemptKey,
+    kind: NativeDialKind,
 ) -> DiscoveryDialOutcome {
     let finished = |result| DiscoveryDialOutcome {
         admitted_addr: None,
@@ -424,7 +579,7 @@ async fn run_discovery_dial_once(
     };
     let dial = AbortOnDropHandle::new(spawn_erased_named("discovery_dial", {
         let endpoint = endpoint.clone();
-        async move { native_discovery_dial(&endpoint, node_addr, &limits, report).await }
+        async move { native_discovery_dial(&endpoint, node_addr, &limits, report, kind).await }
     }));
     DialWatch {
         attempt,
@@ -621,6 +776,24 @@ fn trace_dial_phase(trace: &ZakuraTrace, attempt: DialAttemptKey, phase: DialPha
             phase,
         )
     });
+}
+
+/// Counts a preferred dial's `result` in the
+/// `zakura.p2p.discovery.dial.preferred.*` counters.
+fn count_preferred_dial_result(result: DiscoveryDialResult) {
+    match result {
+        DiscoveryDialResult::Registered => {
+            metrics::counter!("zakura.p2p.discovery.dial.preferred.succeeded").increment(1);
+        }
+        DiscoveryDialResult::Failed | DiscoveryDialResult::AlpnMismatch => {
+            metrics::counter!("zakura.p2p.discovery.dial.preferred.failed").increment(1);
+        }
+        DiscoveryDialResult::LocalResourceLimit => {
+            metrics::counter!("zakura.p2p.discovery.dial.preferred.local_resource_limit")
+                .increment(1);
+        }
+        DiscoveryDialResult::ConnectedElsewhere | DiscoveryDialResult::ShortLivedRegistered => {}
+    }
 }
 
 async fn apply_discovery_dial_result(

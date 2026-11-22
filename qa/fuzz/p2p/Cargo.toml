@@ -25,7 +25,7 @@ block_sequencer_evidence = { decoder = 1, properties = ["block/required-evidence
 discovery_session = { decoder = 1, properties = ["discovery/session-policy"] }
 discovery_redial = { decoder = 2, properties = ["discovery/redial-policy"] }
 discovery_query = { decoder = 1, properties = ["discovery/query-ownership", "discovery/answer-settlement"] }
-discovery_candidate = { decoder = 1, properties = ["discovery/dial-attempts"] }
+discovery_candidate = { decoder = 2, properties = ["discovery/dial-attempts", "discovery/preferred-dials"] }
 
 [dependencies]
 libfuzzer-sys = "0.4"

@@ -2377,9 +2377,11 @@ async fn the_dial_reserve_keeps_dials_open_while_inbound_is_full() {
 
         let peer = server();
         assert!(node.endpoint.has_dial_capacity());
+        assert_eq!(node.endpoint.dial_capacity(), 1);
         let _dialed = node.endpoint.connect(peer.addr(), &[ALPN]).await.unwrap();
         assert_eq!(node.endpoint.connection_count(), 2);
         assert!(!node.endpoint.has_dial_capacity());
+        assert_eq!(node.endpoint.dial_capacity(), 0);
         assert!(matches!(
             node.endpoint.connect(peer.addr(), &[ALPN]).await,
             Err(ConnectError::ConnectionLimit)
@@ -2621,6 +2623,7 @@ async fn discovery_dials_leave_room_for_an_inbound_peer() {
         }
         assert!(!node.endpoint.has_discovery_capacity());
         assert!(node.endpoint.has_dial_capacity());
+        assert_eq!(node.endpoint.dial_capacity(), 3);
         assert!(matches!(
             node.endpoint.connect_discovery(peer.addr(), &[ALPN]).await,
             Err(ConnectError::ConnectionLimit)

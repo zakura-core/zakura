@@ -1,6 +1,6 @@
 # Spec: `zakura-quic` transport
 
-Status: draft for review, 2026-11-18. Version 0.22.
+Status: draft for review, 2026-11-21. Version 0.23.
 This document is authoritative for the `zakura-quic` crate, its configuration,
 its wire behavior and its `quinn-proto` dependency policy.
 [Decision 0003](../decisions/zakura/0003-zakura-quic-transport.md) records the
@@ -48,7 +48,9 @@ connection's source validation, and caps a closed connection's drain at
 `SHUTDOWN_DRAIN`; it changes ADM-3, ADM-13, API-3 and API-4, and §17s lists
 each change. Version 0.22 adds a node-wide handshake cadence, keeps admission
 charges once TLS starts, and reports when the endpoint admitted a
-connection; it changes ADM-3 and API-4, and §17t lists each change.
+connection; it changes ADM-3 and API-4, and §17t lists each change. Version
+0.23 reports how many address attempts a whole-table dial can reserve; it
+changes API-2, and §17u explains it.
 
 ## 0. Conventions
 
@@ -566,6 +568,8 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
     capacity available to inbound peers.
   - `QuicEndpoint::has_dial_capacity()` reports whether an ordinary dial would
     get a slot, and `has_discovery_capacity()` checks discovery's lower ceiling.
+    `dial_capacity()` and `discovery_capacity()` count the address attempts
+    each ceiling has room for.
     `zakura-network` treats `ConnectionLimit` as its own resource limit,
     not the peer's fault. Its discovery dialer starts a dial only while both
     the handler's connection slots and discovery's transport ceiling have room, and
@@ -890,8 +894,9 @@ The public surface of `zakura-quic`. Changing it is a semver change of the crate
     `quinn-proto` and rustls items these name: `Transmit`, `ConnectionId`,
     `ConnectionIdGenerator`, `HmacKey`, `HandshakeTokenKey`, `SecureRandom`
     and `SupportedKxGroup`;
-  - `local_id()`, `local_addrs()`, `socket_stats()`, `connection_count()`
-    and `has_dial_capacity()` / `has_discovery_capacity()` (ADM-12),
+  - `local_id()`, `local_addrs()`, `socket_stats()`, `connection_count()`,
+    `has_dial_capacity()` / `has_discovery_capacity()` and
+    `dial_capacity()` / `discovery_capacity()` (ADM-12),
     `closing_connection_count()` (ADM-13), `network_changes()` and `config()`;
   - `set_conn_observer(ConnObserver)` for OBS-3;
   - `connect_discovery(NodeAddr, alpns: &[&[u8]]) -> Result<Conn, ConnectError>`
@@ -1638,3 +1643,16 @@ Changed:
   `control_timeout` from the endpoint's `Accept`.
 - **API-4.** Adds `Conn::admitted_at`, so an acceptor can measure a
   whole-handshake deadline from admission.
+
+## 17u. Changes in version 0.23
+
+A caller that dials several nodes in one pass under the whole table's cap
+could only ask whether one more slot was free, so it could not count down
+its own attempts the way the discovery dialer does with
+`discovery_capacity()`.
+
+Changed:
+
+- **API-2.** Adds `QuicEndpoint::dial_capacity()`, the address attempts a
+  bootstrap or maintained dial can reserve now. The API-2 list also names
+  the existing `discovery_capacity()`, which it had left out.

@@ -30,10 +30,10 @@ pub use handshake_counts::{
     handshake_cadence, inbound_share, node_handshake_cadence, HandshakeCadenceAdmission,
     HandshakeCounts, IpAdmission, SlotClass, SlotRefusal, SlotSplit,
 };
-pub(crate) use preferred_gateways::HeldPlaces;
 pub use preferred_gateways::{
     preferred_hold_limit, GatewayStanding, PreferredGateways, RankedGateway, MAX_PREFERRED_GATEWAYS,
 };
+pub(crate) use preferred_gateways::{HeldPlaces, MAX_RANKED_GATEWAYS};
 // `SessionGuard` and `ByteBudget` are imported through this re-export; `Admit`
 // and `PeerMeters` are reached directly via the `guard` module path, so they are
 // unused *here* until a later service imports them through `crate::zakura`.

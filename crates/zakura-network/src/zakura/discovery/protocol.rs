@@ -955,6 +955,18 @@ pub(crate) enum DialAdmission {
     Exhausted,
 }
 
+/// What the discovery book knows about dialing one node.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum DialTarget {
+    /// The book has no usable record or static candidate for the node, or the
+    /// node is this one.
+    Unknown,
+    /// The node can be dialed once its backoff ends.
+    InBackoff,
+    /// The node can be dialed now, at these addresses.
+    Dialable(ZakuraDiscoveryDialCandidate),
+}
+
 impl ZakuraDiscoveryDialCandidate {
     /// Converts this candidate into a dial address.
     pub fn node_addr(&self) -> NodeAddr {
@@ -2047,6 +2059,20 @@ impl ZakuraDiscoveryHandle {
         selected
     }
 
+    /// Returns what the book knows about dialing each of `node_ids`, in the
+    /// same order, by the checks the ordinary dial candidates pass.
+    ///
+    /// It looks at the book only: the caller accounts for registered peers
+    /// and dials in flight. The book stays locked for the whole list.
+    pub(crate) async fn dial_targets(&self, node_ids: &[NodeId]) -> Vec<DialTarget> {
+        let now = current_unix_secs();
+        let state = self.inner.lock().await;
+        node_ids
+            .iter()
+            .map(|node_id| state.dial_target(node_id, now))
+            .collect()
+    }
+
     /// Offers service-matching candidates to `admit` first, followed by
     /// general candidates, until it admits the free dial slots' worth. The
     /// places in `held_places` stay free of these dials.
@@ -2130,6 +2156,26 @@ impl ZakuraDiscoveryHandle {
         (
             state.config().dial_backoff_base,
             state.config().dial_backoff_max,
+        )
+    }
+
+    /// The most discovery dials that may be in flight at once.
+    pub(crate) async fn max_concurrent_dials(&self) -> usize {
+        self.inner
+            .lock()
+            .await
+            .config()
+            .max_concurrent_discovery_dials
+    }
+
+    /// The most connection places the node may hold for preferred gateways:
+    /// what [`crate::zakura::preferred_hold_limit`] leaves beside the
+    /// headroom discovery keeps for bootstrap peers.
+    pub(crate) async fn preferred_hold_limit(&self) -> usize {
+        let state = self.inner.lock().await;
+        crate::zakura::preferred_hold_limit(
+            state.config().max_zakura_connections,
+            state.config().discovery_connection_headroom,
         )
     }
 
@@ -2829,6 +2875,30 @@ impl ZakuraDiscoveryBook {
             DialReadiness::InBackoff
         } else {
             DialReadiness::Ready
+        }
+    }
+
+    /// What the book knows about dialing `node_id` at `now`, by the same
+    /// checks [`Self::admit_dial_candidates`] applies. Like that method, it
+    /// offers a node through its signed record when it has one. It requires
+    /// no services and does not know about connections or dials in flight.
+    pub(crate) fn dial_target(
+        &self,
+        node_id: &NodeId,
+        now: u64,
+        dial_backoff: (Duration, Duration),
+    ) -> DialTarget {
+        let candidate = match self.entries.get(node_id) {
+            Some(entry) => DialCandidateRef::SignedRecord(entry),
+            None => match self.static_candidates.get(node_id) {
+                Some(candidate) => DialCandidateRef::StaticConfigured(candidate),
+                None => return DialTarget::Unknown,
+            },
+        };
+        match self.dial_readiness(&candidate, now, dial_backoff) {
+            DialReadiness::Unusable => DialTarget::Unknown,
+            DialReadiness::InBackoff => DialTarget::InBackoff,
+            DialReadiness::Ready => DialTarget::Dialable(candidate.into_candidate()),
         }
     }
 
@@ -7357,6 +7427,70 @@ mod tests {
             ),
             vec![candidate_for(&failed, false)]
         );
+    }
+
+    #[test]
+    fn dial_target_follows_a_record_through_backoff_and_expiry() {
+        let dial_backoff = (Duration::from_secs(30), Duration::from_secs(300));
+        let mut book = ZakuraDiscoveryBook::default();
+        let record = signed_record_with(1, service(1), test_addr(1));
+        let node_id = record.body.node_id;
+        assert_eq!(
+            book.dial_target(&node_id, NOW, dial_backoff),
+            DialTarget::Unknown
+        );
+
+        import_confirmed_record(&mut book, record.clone()).unwrap();
+        let dialable = DialTarget::Dialable(candidate_for(&record, false));
+        assert_eq!(book.dial_target(&node_id, NOW, dial_backoff), dialable);
+
+        book.mark_dial_attempt(&node_id, NOW);
+        book.mark_dial_failure(&node_id, NOW);
+        assert_eq!(
+            book.dial_target(&node_id, NOW + 29, dial_backoff),
+            DialTarget::InBackoff
+        );
+        assert_eq!(book.dial_target(&node_id, NOW + 30, dial_backoff), dialable);
+
+        let expired = record.body.expires_at_unix_secs + 1;
+        assert_eq!(
+            book.dial_target(&node_id, expired, dial_backoff),
+            DialTarget::Unknown
+        );
+    }
+
+    #[test]
+    fn dial_target_offers_a_static_candidate_unless_a_record_supersedes_it() {
+        let dial_backoff = (Duration::from_secs(30), Duration::from_secs(300));
+        let mut book = ZakuraDiscoveryBook::default();
+        let static_id = NodeSecretKey::generate().public();
+        book.insert_static_candidate(NodeAddr::with_addrs(static_id, vec![test_addr(2)]), NOW)
+            .unwrap();
+        assert_eq!(
+            book.dial_target(&static_id, NOW, dial_backoff),
+            DialTarget::Dialable(ZakuraDiscoveryDialCandidate {
+                node_id: static_id,
+                direct_addrs: vec![test_addr(2)],
+                is_static: true,
+            })
+        );
+        book.mark_dial_attempt(&static_id, NOW);
+        book.mark_alpn_mismatch(&static_id, NOW);
+        assert_eq!(
+            book.dial_target(&static_id, NOW + 1, dial_backoff),
+            DialTarget::InBackoff
+        );
+
+        let record = signed_record_with(1, service(1), test_addr(1));
+        let record_id = record.body.node_id;
+        book.insert_static_candidate(NodeAddr::with_addrs(record_id, vec![test_addr(3)]), NOW)
+            .unwrap();
+        import_confirmed_record(&mut book, record).unwrap();
+        let DialTarget::Dialable(candidate) = book.dial_target(&record_id, NOW, dial_backoff)
+        else {
+            panic!("a fresh confirmed record is dialable");
+        };
+        assert_eq!(candidate.direct_addrs, vec![test_addr(1)]);
     }
 
     // V12 F-305594: an ALPN mismatch used to count as an ordinary failure on

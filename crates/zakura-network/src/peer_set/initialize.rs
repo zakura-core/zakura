@@ -175,6 +175,7 @@ where
         block_gossip_peer_ips,
         header_sync_driver_startup,
         Vec::new(),
+        None,
     )
     .await
     .map(
@@ -186,6 +187,10 @@ where
 }
 
 /// Initialize a peer set with optional Zakura runtime components.
+///
+/// `miner_gateways` ranks the mining gateways the v2 discovery dialer prefers
+/// to stay connected to. Without it, or once its sender is gone, the dialer
+/// prefers none.
 #[allow(clippy::too_many_arguments)]
 pub async fn init_with_zakura<S, C>(
     config: Config,
@@ -196,6 +201,7 @@ pub async fn init_with_zakura<S, C>(
     block_gossip_peer_ips: Vec<IpAddr>,
     header_sync_driver_startup: Option<ZakuraHeaderSyncDriverStartup>,
     custom_services: Vec<CustomService>,
+    miner_gateways: Option<zakura_rt::sync::watch::Receiver<crate::zakura::MinerGatewayRanking>>,
 ) -> Result<
     (
         BoxCloneSyncService<Request, Response, BoxError>,
@@ -243,6 +249,7 @@ where
         header_sync_driver_startup,
         custom_services,
         peer_registry.clone(),
+        miner_gateways,
     )
     .boxed()
     .await?;

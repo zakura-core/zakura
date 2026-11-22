@@ -13,10 +13,31 @@ use zakura_network::zakura::{
 
 use super::{GetMinerMeshInfoResponse, MeshGatewayState, MeshNode, MeshWindow};
 
+// Public IDs from six v2 identities, in byte order as the endpoint reports peers.
+const LOCAL_NODE: [u8; 32] =
+    node_id(b"2840d419ac18afd23ff4ffe3ba55fb67b620379394c054260ae223adf3d136c7");
+const PREFERRED_GATEWAY: [u8; 32] =
+    node_id(b"4d70dccee88cea83ef71f9f870489b10f5c6c112d9c49725dc38d2979f6db690");
+const BACKOFF_GATEWAY: [u8; 32] =
+    node_id(b"67bb6f072c1140d0d2198e9f937d24aeeb8d644600205bec46c90592b7f9f112");
+const STANDBY_GATEWAY: [u8; 32] =
+    node_id(b"96ddfe87e3074e921304847fa147e7ee97ea3b7e430722916378ebe3ae5193ed");
+const UNMATCHED_GATEWAY: [u8; 32] =
+    node_id(b"ccc7a088afe130bbb69492031e9fa86cce4628852cc966a62ad73423e20bd947");
+const ORDINARY_PEER: [u8; 32] =
+    node_id(b"ce2480c5c1da2c6c9d28b1a6f119b1eafb5993be37b2ad01728f3d286d5d93ea");
+
+const fn node_id(hex: &[u8]) -> [u8; 32] {
+    match const_hex::const_decode_to_array(hex) {
+        Ok(id) => id,
+        Err(_) => panic!("fixture node IDs must be 32 bytes of hex"),
+    }
+}
+
 /// A mining, announcing, synced node.
 fn node() -> MeshNode {
     MeshNode {
-        node_id: Some([0x11; 32]),
+        node_id: Some(LOCAL_NODE),
         announcing: true,
         mining: true,
         synced: true,
@@ -33,9 +54,9 @@ fn coverage() -> MinerSetCoverage {
     }
 }
 
-fn gateway(byte: u8, blocks: u32, place: GatewayPlace, connected: bool) -> PlacedGateway {
+fn gateway(node_id: [u8; 32], blocks: u32, place: GatewayPlace, connected: bool) -> PlacedGateway {
     PlacedGateway {
-        node_id: [byte; 32],
+        node_id,
         blocks,
         place,
         connected,
@@ -46,10 +67,10 @@ fn gateway(byte: u8, blocks: u32, place: GatewayPlace, connected: bool) -> Place
 fn places() -> ConnectionPlaces {
     ConnectionPlaces {
         gateways: vec![
-            gateway(0x22, 40, GatewayPlace::Preferred, true),
-            gateway(0x33, 12, GatewayPlace::Backoff, false),
-            gateway(0x47, 7, GatewayPlace::Standby, true),
-            gateway(0x55, 3, GatewayPlace::Unmatched, false),
+            gateway(PREFERRED_GATEWAY, 40, GatewayPlace::Preferred, true),
+            gateway(BACKOFF_GATEWAY, 12, GatewayPlace::Backoff, false),
+            gateway(STANDBY_GATEWAY, 7, GatewayPlace::Standby, true),
+            gateway(UNMATCHED_GATEWAY, 3, GatewayPlace::Unmatched, false),
         ],
         hold: 1,
         slot_limit: 40,
@@ -61,17 +82,17 @@ fn places() -> ConnectionPlaces {
         inbound_slots: 2,
         peers: vec![
             ConnectedPeer {
-                node_id: [0x22; 32],
+                node_id: PREFERRED_GATEWAY,
                 inbound: true,
                 preferred: true,
             },
             ConnectedPeer {
-                node_id: [0x47; 32],
+                node_id: STANDBY_GATEWAY,
                 inbound: false,
                 preferred: false,
             },
             ConnectedPeer {
-                node_id: [0x66; 32],
+                node_id: ORDINARY_PEER,
                 inbound: true,
                 preferred: false,
             },

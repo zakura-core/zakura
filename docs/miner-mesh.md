@@ -90,7 +90,7 @@ bootstrap peers, leaving one place for a preferred gateway.
 
 ```json
 {
-  "node_id": "1111...1111",
+  "node_id": "2840...36c7",
   "announcing": true,
   "mining": true,
   "synced": true,
@@ -102,17 +102,17 @@ bootstrap peers, leaving one place for a preferred gateway.
     "coverage": 0.5
   },
   "gateways": [
-    { "node_id": "2222...2222", "blocks": 40, "state": "preferred", "connected": true },
-    { "node_id": "3333...3333", "blocks": 12, "state": "backoff", "connected": false },
-    { "node_id": "4747...4747", "blocks": 7, "state": "standby", "connected": true },
-    { "node_id": "5555...5555", "blocks": 3, "state": "unmatched", "connected": false }
+    { "node_id": "4d70...b690", "blocks": 40, "state": "preferred", "connected": true },
+    { "node_id": "67bb...f112", "blocks": 12, "state": "backoff", "connected": false },
+    { "node_id": "96dd...93ed", "blocks": 7, "state": "standby", "connected": true },
+    { "node_id": "ccc7...d947", "blocks": 3, "state": "unmatched", "connected": false }
   ],
   "hold": 1,
   "slots": { "limit": 40, "in_use": 3, "preferred": 1, "ordinary": 2, "inbound": 2 },
   "peers": [
-    { "node_id": "2222...2222", "inbound": true, "preferred": true },
-    { "node_id": "4747...4747", "inbound": false, "preferred": false },
-    { "node_id": "6666...6666", "inbound": true, "preferred": false }
+    { "node_id": "4d70...b690", "inbound": true, "preferred": true },
+    { "node_id": "96dd...93ed", "inbound": false, "preferred": false },
+    { "node_id": "ce24...93ea", "inbound": true, "preferred": false }
   ]
 }
 ```

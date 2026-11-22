@@ -3,7 +3,7 @@ source: crates/zakura-rpc/src/methods/types/miner_mesh_info/tests.rs
 expression: response
 ---
 {
-  "node_id": "1111111111111111111111111111111111111111111111111111111111111111",
+  "node_id": "2840d419ac18afd23ff4ffe3ba55fb67b620379394c054260ae223adf3d136c7",
   "announcing": true,
   "mining": true,
   "synced": true,
@@ -16,25 +16,25 @@ expression: response
   },
   "gateways": [
     {
-      "node_id": "2222222222222222222222222222222222222222222222222222222222222222",
+      "node_id": "4d70dccee88cea83ef71f9f870489b10f5c6c112d9c49725dc38d2979f6db690",
       "blocks": 40,
       "state": "preferred",
       "connected": true
     },
     {
-      "node_id": "3333333333333333333333333333333333333333333333333333333333333333",
+      "node_id": "67bb6f072c1140d0d2198e9f937d24aeeb8d644600205bec46c90592b7f9f112",
       "blocks": 12,
       "state": "backoff",
       "connected": false
     },
     {
-      "node_id": "4747474747474747474747474747474747474747474747474747474747474747",
+      "node_id": "96ddfe87e3074e921304847fa147e7ee97ea3b7e430722916378ebe3ae5193ed",
       "blocks": 7,
       "state": "standby",
       "connected": true
     },
     {
-      "node_id": "5555555555555555555555555555555555555555555555555555555555555555",
+      "node_id": "ccc7a088afe130bbb69492031e9fa86cce4628852cc966a62ad73423e20bd947",
       "blocks": 3,
       "state": "unmatched",
       "connected": false
@@ -50,17 +50,17 @@ expression: response
   },
   "peers": [
     {
-      "node_id": "2222222222222222222222222222222222222222222222222222222222222222",
+      "node_id": "4d70dccee88cea83ef71f9f870489b10f5c6c112d9c49725dc38d2979f6db690",
       "inbound": true,
       "preferred": true
     },
     {
-      "node_id": "4747474747474747474747474747474747474747474747474747474747474747",
+      "node_id": "96ddfe87e3074e921304847fa147e7ee97ea3b7e430722916378ebe3ae5193ed",
       "inbound": false,
       "preferred": false
     },
     {
-      "node_id": "6666666666666666666666666666666666666666666666666666666666666666",
+      "node_id": "ce2480c5c1da2c6c9d28b1a6f119b1eafb5993be37b2ad01728f3d286d5d93ea",
       "inbound": true,
       "preferred": false
     }

@@ -457,6 +457,9 @@ try_err = "allow"
 double_must_use = "allow"
 redundant_field_names = "allow"
 
+# Clippy 1.100 style lint. `chunks_exact` with a constant size reads fine.
+chunks_exact_to_as_chunks = "allow"
+
 # Panics
 fallible_impl_from = "warn"
 unwrap_in_result = "warn"

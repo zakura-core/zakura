@@ -45,10 +45,8 @@ pub const STORAGE_PLAN_BYTES: usize = 1_024;
 pub fn storage_plans() -> Vec<Vec<u8>> {
     byte_inputs(STORAGE_STREAM_INPUTS, STORAGE_PLAN_BYTES)
         .concat()
-        .as_chunks::<STORAGE_PLAN_BYTES>()
-        .0
-        .iter()
-        .map(|plan| plan.to_vec())
+        .chunks_exact(STORAGE_PLAN_BYTES)
+        .map(<[u8]>::to_vec)
         .collect()
 }
 

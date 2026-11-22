@@ -157,6 +157,8 @@ tokio-stream = "0.1.17"
 tokio-util = "0.7.14"
 # Production code only parses TOML; tests that serialize it enable `display`.
 toml = { version = "1.0", default-features = false, features = ["parse", "serde", "std"] }
+# Rewrites config files in place, keeping their comments and layout.
+toml_edit = { version = "0.25", default-features = false, features = ["parse", "display"] }
 # No `router`: the indexer serves its one gRPC service directly, and axum's
 # routing code would add about 97 KB to zakurad's .text.
 tonic = { version = "0.14", default-features = false, features = ["codegen", "tls-ring", "transport"] }

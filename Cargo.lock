@@ -2498,6 +2498,7 @@ dependencies = [
  "indexmap",
  "toml_datetime",
  "toml_parser",
+ "toml_writer",
  "winnow",
 ]
 
@@ -3029,6 +3030,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-util",
  "toml",
+ "toml_edit",
  "tower",
  "tracing",
  "tracing-subscriber",

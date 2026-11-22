@@ -20,7 +20,7 @@ use zakura_state::{state_database_format_version_in_code, state_database_format_
 use crate::{
     commands::EntryPoint,
     components::{metrics, tracing::Tracing},
-    config::ZakuradConfig,
+    config::{rewrite_config_file, RewriteOutcome, ZakuradConfig},
 };
 
 /// The last log event that occurred in the application.
@@ -239,6 +239,35 @@ fn install_panic_hook(metadata_section: String) {
     }));
 }
 
+/// Rewrites the config file at `config_path` so its `zakura.bootstrap_peers` name default
+/// seeds by their current node IDs, and logs the outcome. A failure only warns: the
+/// network layer replaces the same IDs in memory for this run.
+fn rewrite_retired_seed_ids(config_path: &std::path::Path) {
+    match rewrite_config_file(config_path) {
+        Ok(RewriteOutcome::Unchanged) => {}
+        Ok(RewriteOutcome::Rewrote {
+            path,
+            replaced,
+            backup,
+        }) => {
+            for (retired, current) in &replaced {
+                info!(%retired, %current, "replaced a default seed's retired node ID in zakura.bootstrap_peers");
+            }
+            info!(
+                ?path,
+                ?backup,
+                replaced = replaced.len(),
+                "rewrote the config file with the default seeds' current node IDs; the original is in the backup"
+            );
+        }
+        Err(error) => warn!(
+            %error,
+            "could not check the config file for default seeds' retired node IDs; \
+             if zakura.bootstrap_peers names a seed by an old ID, replace it by hand"
+        ),
+    }
+}
+
 /// Loads the configuration for `command`, then sets up error reporting, the Rayon
 /// thread pool and tracing. Server commands also get the metrics endpoint.
 ///
@@ -381,8 +410,9 @@ fn start(command: &EntryPoint) -> Result<(Arc<ZakuradConfig>, Tracing), Report> 
     if is_server {
         info!("{metadata_section}");
 
-        if command.config_path().is_some() {
-            info!("Using config file at: {:?}", command.config_path().unwrap());
+        if let Some(config_path) = command.config_path() {
+            info!("Using config file at: {:?}", config_path);
+            rewrite_retired_seed_ids(&config_path);
         } else {
             info!("No config file provided, using default configuration");
         }

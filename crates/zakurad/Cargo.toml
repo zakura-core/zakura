@@ -178,6 +178,7 @@ semver = { workspace = true }
 serde = { workspace = true, features = ["serde_derive"] }
 serde_json = { workspace = true }
 toml = { workspace = true }
+toml_edit = { workspace = true }
 
 futures = { workspace = true }
 rayon = { workspace = true }

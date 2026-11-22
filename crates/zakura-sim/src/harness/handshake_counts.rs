@@ -8,7 +8,7 @@ use std::{
 use zakura_rt::time::Instant;
 
 use zakura_network::zakura::{
-    GatewayStanding, HandshakeCadenceAdmission, HandshakeCounts, IpAdmission, PreferredGateways,
+    GatewayRanking, GatewayStanding, HandshakeCadenceAdmission, HandshakeCounts, IpAdmission,
     RankedGateway, SlotClass, SlotRefusal, SlotSplit,
 };
 use zakura_quic::{NodeId, NodeSecretKey};
@@ -293,11 +293,9 @@ fn check_claim(
     }
 }
 
-/// Ranks every node of the table, the first highest, and forms the set
-/// with a hold limit of `arg`'s high bits: a node whose bit in `arg`'s low
-/// four is set is dialable, and the rest are unknown to v2.
-fn preferred_from(nodes: &[NodeId; NODES], arg: u8) -> PreferredGateways {
-    let ranking = nodes
+/// Ranks the table in order. The low four bits mark dialable nodes.
+fn ranking_from(nodes: &[NodeId; NODES], arg: u8) -> GatewayRanking {
+    nodes
         .iter()
         .enumerate()
         .map(|(index, &node)| RankedGateway {
@@ -309,8 +307,8 @@ fn preferred_from(nodes: &[NodeId; NODES], arg: u8) -> PreferredGateways {
             } else {
                 GatewayStanding::Unmatched
             },
-        });
-    PreferredGateways::form(ranking, usize::from(arg >> 4) % 4)
+        })
+        .collect()
 }
 
 fn failure(failures: &mut Vec<(String, MachineFailure)>, id: &str, message: impl Into<String>) {
@@ -630,7 +628,8 @@ fn history(input: &[u8]) -> Vec<(usize, MachineStep)> {
             }
             (10, _) => {
                 // The ranking changes. Slots already held stay held.
-                counts.publish_preferred_gateways(preferred_from(&nodes, arg));
+                counts
+                    .publish_gateway_ranking(&ranking_from(&nodes, arg), usize::from(arg >> 4) % 4);
                 published = true;
             }
             _ => {}

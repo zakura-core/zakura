@@ -10,7 +10,7 @@
 //! decision, and with an empty ranking they hold nothing.
 
 use zakura_quic::NodeId;
-use zakura_rt::collections::HashSet;
+use zakura_rt::collections::{HashMap, HashSet};
 
 /// The most connection places a node holds for preferred gateways.
 pub const MAX_PREFERRED_GATEWAYS: usize = 10;
@@ -61,6 +61,68 @@ pub struct RankedGateway {
     pub standing: GatewayStanding,
 }
 
+/// A discovery snapshot prepared before taking the connection admission lock.
+#[derive(Debug)]
+pub struct GatewayRanking {
+    candidates: Vec<RankedGateway>,
+    /// Only a TLS-proven connection can lift one of these ties above the cutoff.
+    tied_at_cutoff: HashMap<NodeId, RankedGateway>,
+}
+
+fn unique_gateways(ranking: impl IntoIterator<Item = RankedGateway>) -> Vec<RankedGateway> {
+    let mut seen: HashSet<NodeId> = HashSet::default();
+    ranking
+        .into_iter()
+        .filter(|gateway| seen.insert(gateway.node))
+        .collect()
+}
+
+impl FromIterator<RankedGateway> for GatewayRanking {
+    fn from_iter<T: IntoIterator<Item = RankedGateway>>(ranking: T) -> Self {
+        let mut candidates = unique_gateways(ranking);
+        let mut tied_at_cutoff = HashMap::default();
+        if candidates.len() > MAX_RANKED_GATEWAYS {
+            // Ignore the snapshot's connection status. Only the admission lock can
+            // tell which of the tied identities still owns an authenticated slot.
+            candidates.sort_unstable_by(|a, b| {
+                b.blocks
+                    .cmp(&a.blocks)
+                    .then_with(|| a.node.as_bytes().cmp(b.node.as_bytes()))
+            });
+            let cutoff = candidates[MAX_RANKED_GATEWAYS - 1].blocks;
+            tied_at_cutoff.extend(
+                candidates
+                    .drain(MAX_RANKED_GATEWAYS..)
+                    .take_while(|gateway| gateway.blocks == cutoff)
+                    .map(|gateway| (gateway.node, gateway)),
+            );
+        }
+        Self {
+            candidates,
+            tied_at_cutoff,
+        }
+    }
+}
+
+impl GatewayRanking {
+    /// At publication, look up only live owners among the tied overflow entries.
+    /// Entries below the cutoff score cannot advance even if they authenticated.
+    pub(super) fn candidates<'a>(
+        &self,
+        authenticated: impl Iterator<Item = &'a NodeId>,
+    ) -> Vec<RankedGateway> {
+        let mut candidates = self.candidates.clone();
+        if !self.tied_at_cutoff.is_empty() {
+            candidates.extend(
+                authenticated
+                    .filter_map(|node| self.tied_at_cutoff.get(node))
+                    .copied(),
+            );
+        }
+        candidates
+    }
+}
+
 /// The ranked gateways, how many connection places the node holds for them,
 /// and the gateways that may fill those places: the preferred set.
 ///
@@ -94,27 +156,33 @@ impl PreferredGateways {
     /// backoff keeps a place it can call into. The set is the available
     /// gateways, in rank order, up to the hold.
     pub fn form(ranking: impl IntoIterator<Item = RankedGateway>, hold_limit: usize) -> Self {
+        Self::form_with_incumbents(unique_gateways(ranking), hold_limit, &[])
+    }
+
+    /// When two authenticated gateways tie, keep a gateway already in a preferred place.
+    pub(super) fn form_with_incumbents(
+        mut ranking: Vec<RankedGateway>,
+        hold_limit: usize,
+        incumbents: &[NodeId],
+    ) -> Self {
         let connected = |gateway: &RankedGateway| gateway.standing == GatewayStanding::Connected;
-        let mut seen: HashSet<NodeId> = HashSet::default();
-        let mut ranking: Vec<RankedGateway> = ranking
-            .into_iter()
-            .filter(|gateway| seen.insert(gateway.node))
-            .collect();
+        let priority = |gateway: &RankedGateway| {
+            (
+                gateway.blocks,
+                connected(gateway),
+                connected(gateway) && incumbents.contains(&gateway.node),
+            )
+        };
         if ranking.len() > MAX_RANKED_GATEWAYS {
             ranking.sort_unstable_by(|a, b| {
-                b.blocks
-                    .cmp(&a.blocks)
-                    .then_with(|| connected(b).cmp(&connected(a)))
+                priority(b)
+                    .cmp(&priority(a))
                     .then_with(|| a.node.as_bytes().cmp(b.node.as_bytes()))
             });
             ranking.truncate(MAX_RANKED_GATEWAYS);
         }
         // A stable sort, so equal gateways keep the order they were given.
-        ranking.sort_by(|a, b| {
-            b.blocks
-                .cmp(&a.blocks)
-                .then_with(|| connected(b).cmp(&connected(a)))
-        });
+        ranking.sort_by_key(|gateway| std::cmp::Reverse(priority(gateway)));
         let hold_limit = hold_limit.min(MAX_PREFERRED_GATEWAYS);
         let matched = ranking
             .iter()
@@ -161,11 +229,16 @@ impl PreferredGateways {
     /// Records a ranked gateway as connected, including when it already owns
     /// a preferred place. Later callers then see its standing in cutoff ties.
     pub(super) fn with_connected(&self, node: &NodeId) -> Option<Self> {
-        let index = self.ranking.iter().position(|gateway| {
-            gateway.node == *node && gateway.standing != GatewayStanding::Connected
-        })?;
+        self.with_standing(node, GatewayStanding::Connected)
+    }
+
+    pub(super) fn with_standing(&self, node: &NodeId, standing: GatewayStanding) -> Option<Self> {
+        let index = self
+            .ranking
+            .iter()
+            .position(|gateway| gateway.node == *node && gateway.standing != standing)?;
         let mut ranking = self.ranking.clone();
-        ranking[index].standing = GatewayStanding::Connected;
+        ranking[index].standing = standing;
         Some(Self::form(ranking, self.hold_limit))
     }
 

@@ -82,6 +82,10 @@ pub(super) struct ConnectionSlots {
 }
 
 impl ConnectionSlots {
+    pub(super) fn nodes(&self) -> impl Iterator<Item = &NodeId> {
+        self.by_node.keys()
+    }
+
     pub(super) fn total(&self) -> usize {
         self.total
     }

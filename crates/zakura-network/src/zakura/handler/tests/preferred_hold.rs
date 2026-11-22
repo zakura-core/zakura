@@ -364,11 +364,11 @@ fn default_and_explicit_memory_budgets_fund_gateways_after_ordinary_peers() {
 #[test]
 fn a_set_change_only_recounts_held_slots() {
     let handler = handler(92, 10);
-    let ranked = gateways(11, GatewayStanding::Connected);
+    let ranked = gateways(11, GatewayStanding::Dialable);
     publish(&handler, &ranked[..10]);
     let _gateways: Vec<_> = ranked[..10]
         .iter()
-        .map(|&(node, _)| handler.claim_connection(node, false).expect("held"))
+        .map(|&(node, _)| handler.claim_connection(node, true).expect("held"))
         .collect();
     let _dials = fill(&handler, 92, false);
     assert_eq!(
@@ -516,13 +516,9 @@ fn outbound_gateway_keeps_a_tied_place_after_authentication() {
         let target = new_node();
         let caller = new_node();
         publish_tied_gateways(&handler, target, caller);
-        let _dial = handler.claim_connection(target, false).expect("held place");
+        let mut dial = handler.claim_connection(target, false).expect("held place");
         if authenticated {
-            handler
-                .supervisor
-                .ip_slots
-                .counts()
-                .outbound_connected(target);
+            dial.outbound_connected();
         }
         let _inbound = handler
             .claim_connection(caller, true)
@@ -532,6 +528,82 @@ fn outbound_gateway_keeps_a_tied_place_after_authentication() {
             [if authenticated { target } else { caller }]
         );
     }
+}
+
+/// Snapshot order cannot erase a TLS result or displace an equally ranked live incumbent.
+#[test]
+fn ranking_publication_reconciles_authenticated_slots() {
+    for inbound in [false, true] {
+        let handler = handler(40, 1);
+        let incumbent = new_node();
+        let challenger = new_node();
+        publish_tied_gateways(&handler, incumbent, challenger);
+        let stale = [challenger, incumbent].map(|node| RankedGateway {
+            node,
+            blocks: 1,
+            standing: GatewayStanding::Dialable,
+        });
+        let mut slot = handler.claim_connection(incumbent, inbound).unwrap();
+        if !inbound {
+            slot.outbound_connected();
+        }
+        handler.publish_gateway_ranking(stale);
+        assert_eq!(preferred_set(&handler), [incumbent]);
+
+        let _challenger = handler.claim_connection(challenger, true).unwrap();
+        handler.publish_gateway_ranking(stale);
+        assert_eq!(preferred_set(&handler), [incumbent]);
+
+        // Keep an unauthenticated dial to the same identity after its TLS owner leaves.
+        let _pending = handler.claim_connection(incumbent, false).unwrap();
+        drop(slot);
+        assert_eq!(preferred_set(&handler), [challenger]);
+        let mut stale_connected = stale;
+        stale_connected[1].standing = GatewayStanding::Connected;
+        handler.publish_gateway_ranking(stale_connected);
+        assert_eq!(preferred_set(&handler), [challenger]);
+    }
+}
+
+/// Each outbound TLS owner keeps its own proof until its guard drops.
+#[test]
+fn a_stale_connected_snapshot_cannot_restore_a_closed_dial() {
+    let handler = handler(40, 1);
+    let gateway = new_node();
+    let other = new_node();
+    let snapshot = [
+        (gateway, GatewayStanding::Connected),
+        (other, GatewayStanding::Dialable),
+    ];
+    let mut first = handler.claim_connection(gateway, false).unwrap();
+    let mut second = handler.claim_connection(gateway, false).unwrap();
+    first.outbound_connected();
+    second.outbound_connected();
+    drop(first);
+    publish(&handler, &snapshot);
+    assert_eq!(preferred_set(&handler), [gateway]);
+    drop(second);
+    publish(&handler, &snapshot);
+    assert_eq!(preferred_set(&handler), [other]);
+}
+
+/// An authenticated owner at the truncation boundary beats its equally scored peers,
+/// while a lower-scoring owner stays outside the retained ranking.
+#[test]
+fn publication_checks_live_owners_at_the_ranking_cutoff() {
+    let handler = handler(40, 1);
+    let mut nodes: Vec<_> = (0..258).map(|_| new_node()).collect();
+    nodes.sort_by_key(|node| *node.as_bytes());
+    let tied = nodes[256];
+    let lower = nodes[257];
+    let _lower = handler.claim_connection(lower, true).unwrap();
+    let _tied = handler.claim_connection(tied, true).unwrap();
+    handler.publish_gateway_ranking(nodes.into_iter().map(|node| RankedGateway {
+        node,
+        blocks: if node == lower { 1 } else { 2 },
+        standing: GatewayStanding::Dialable,
+    }));
+    assert_eq!(preferred_set(&handler), [tied]);
 }
 
 /// A ranked caller that outranks a member already holding a slot takes that
@@ -635,7 +707,7 @@ fn a_dropped_caller_leaves_the_set() {
     assert_eq!(hold(&handler), 1);
 }
 
-/// A member published as connected leaves the set when its last slot is
+/// A connected member leaves the set when its last slot is
 /// released, and a member with a slot left stays.
 #[test]
 fn a_connected_member_leaves_the_set_with_its_last_slot() {
@@ -645,7 +717,7 @@ fn a_connected_member_leaves_the_set_with_its_last_slot() {
     publish(
         &handler,
         &[
-            (member, GatewayStanding::Connected),
+            (member, GatewayStanding::Dialable),
             (next, GatewayStanding::Dialable),
         ],
     );

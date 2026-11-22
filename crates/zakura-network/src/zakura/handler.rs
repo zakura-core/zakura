@@ -1649,6 +1649,7 @@ impl Drop for PendingHandshakeGuard {
 /// Holds one connection slot of `node` in one direction, and releases
 /// exactly that slot when it drops.
 pub(crate) struct ConnectionAdmissionGuard {
+    authenticated_dial: bool,
     slots: IpSlots,
     node: NodeId,
     inbound: bool,
@@ -1656,11 +1657,24 @@ pub(crate) struct ConnectionAdmissionGuard {
     observation: Option<HandshakeObservation>,
 }
 
+impl ConnectionAdmissionGuard {
+    /// The outbound QUIC connection has authenticated this guard's dial target.
+    fn outbound_connected(&mut self) {
+        assert!(!self.inbound && !self.authenticated_dial);
+        self.slots.counts().outbound_connected(self.node);
+        self.authenticated_dial = true;
+    }
+}
+
 impl Drop for ConnectionAdmissionGuard {
     fn drop(&mut self) {
-        self.slots
-            .counts()
-            .release_connection(self.node, self.inbound);
+        if self.authenticated_dial {
+            self.slots.counts().release_authenticated_dial(self.node);
+        } else {
+            self.slots
+                .counts()
+                .release_connection(self.node, self.inbound);
+        }
         #[cfg(any(test, zakura_sim))]
         if let Some(observation) = &self.observation {
             observation.released("connection-released", None);
@@ -3723,12 +3737,11 @@ impl ZakuraProtocolHandler {
     }
 
     fn publish_gateway_ranking(&self, ranking: impl IntoIterator<Item = super::RankedGateway>) {
-        let preferred =
-            super::PreferredGateways::form(ranking, self.limits.max_preferred_connections);
+        let ranking = ranking.into_iter().collect();
         self.supervisor
             .ip_slots
             .counts()
-            .publish_preferred_gateways(preferred);
+            .publish_gateway_ranking(&ranking, self.limits.max_preferred_connections);
     }
 
     /// Claims a connection slot for `node`, the dial target or the proven
@@ -3758,6 +3771,7 @@ impl ZakuraProtocolHandler {
         }
         claim?;
         Ok(ConnectionAdmissionGuard {
+            authenticated_dial: false,
             #[cfg(any(test, zakura_sim))]
             observation: None,
             slots: self.supervisor.ip_slots.clone(),
@@ -6235,7 +6249,7 @@ pub(crate) async fn serve_reported_native_dial_connection(
     report: Option<DialReport>,
     kind: NativeDialKind,
 ) -> Result<(), ZakuraHandlerError> {
-    let _admission = endpoint
+    let mut admission = endpoint
         .handler
         .claim_connection(node_addr.id, false)
         .map_err(|_| ZakuraHandlerError::ResourceLimit(ADMISSION_LIMIT))?;
@@ -6269,23 +6283,16 @@ pub(crate) async fn serve_reported_native_dial_connection(
     #[cfg(zakura_sim)]
     endpoint.handler.observe_handshake_slot(&connection);
     #[cfg(any(test, zakura_sim))]
-    let _admission = {
-        let mut guard = _admission;
-        guard.observation = endpoint.handler.handshake_observation(&connection);
-        guard
-    };
+    {
+        admission.observation = endpoint.handler.handshake_observation(&connection);
+    }
     let registration_report = report.map(|report| {
         // The receiver is gone when the caller stopped waiting for the result.
         let _ = report.admitted_addr.send(connection.admitted_addr());
         report.registration
     });
     let remote_node_id = connection.remote_id();
-    endpoint
-        .handler
-        .supervisor
-        .ip_slots
-        .counts()
-        .outbound_connected(remote_node_id);
+    admission.outbound_connected();
     let peer_id = ZakuraPeerId::from_node_id(remote_node_id);
     let conn = ZakuraConnTrace::new(
         &endpoint.handler.trace,

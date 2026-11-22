@@ -3,6 +3,7 @@
 use std::{
     fs,
     net::{IpAddr, SocketAddr},
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
@@ -22,6 +23,7 @@ use zakura_chain::{
 use crate::{
     config::zakura_listens_on_loopback_with_non_loopback_bootstrap_peers,
     config::zakura_secret_key_file_path,
+    config::{UnstableZakuraIdentityError, ZakuraSecretKeyError},
     constants::{
         INBOUND_PEER_LIMIT_MULTIPLIER, OUTBOUND_PEER_LIMIT_DIVISOR, OUTBOUND_PEER_LIMIT_MULTIPLIER,
     },
@@ -1820,6 +1822,150 @@ fn zakura_secret_key_text_forms_keep_their_node_id() {
         load_or_generate_zakura_secret_key(&fresh_file).public(),
         fresh.public()
     );
+}
+
+/// A config whose key file is under `identity_dir`, and that key file's path.
+fn config_with_identity_dir(identity_dir: &Path) -> (Config, PathBuf) {
+    let config = Config {
+        identity_dir: identity_dir.to_path_buf(),
+        zakura_node_secret_key: None,
+        ..Config::default()
+    };
+    let key_file = zakura_secret_key_file_path(&config.identity_dir, &config.network);
+    (config, key_file)
+}
+
+/// A node with no key file yet gets one, and then starts with that key.
+#[test]
+fn stable_identity_check_saves_a_first_key() {
+    let _init_guard = zakura_test::init();
+    let dir = tempfile::tempdir().expect("failed to create temp key dir");
+    let (mut config, key_file) = config_with_identity_dir(dir.path());
+
+    config
+        .pin_stable_zakura_identity()
+        .expect("a new key can be saved to an empty directory");
+
+    let saved = fs::read_to_string(&key_file).expect("the check wrote the key file");
+    let started_with = config.zakura_secret_key().expect("the saved key loads");
+    assert_eq!(started_with.to_hex(), saved);
+
+    // A fresh startup loads the same file.
+    let (mut config, _) = config_with_identity_dir(dir.path());
+    config
+        .pin_stable_zakura_identity()
+        .expect("an existing key file is stable");
+    assert_eq!(fs::read_to_string(&key_file).expect("read key file"), saved);
+}
+
+/// Two initializers that both observed a missing key must use the first installed key.
+#[test]
+fn first_key_creation_preserves_a_concurrent_winner() {
+    let dir = tempfile::tempdir().expect("create identity directory");
+    let (_, path) = config_with_identity_dir(dir.path());
+    let first =
+        crate::config::create_zakura_secret_key(&path, crate::config::FirstKeyWrite::NoReplace)
+            .expect("first key is installed");
+    let second =
+        crate::config::create_zakura_secret_key(&path, crate::config::FirstKeyWrite::NoReplace)
+            .expect("existing key is loaded");
+    assert_eq!(first.public(), second.public());
+}
+
+/// A key file that cannot be parsed or read is an error, and is left as it is.
+#[test]
+fn stable_identity_check_refuses_a_broken_key_file_and_keeps_it() {
+    let _init_guard = zakura_test::init();
+
+    let dir = tempfile::tempdir().expect("failed to create temp key dir");
+    let (mut config, key_file) = config_with_identity_dir(dir.path());
+    fs::write(&key_file, "not a key").expect("write a broken key file");
+    assert!(matches!(
+        config.pin_stable_zakura_identity(),
+        Err(UnstableZakuraIdentityError::Unparsable { path }) if path == key_file,
+    ));
+    assert_eq!(
+        fs::read_to_string(&key_file).expect("read key file"),
+        "not a key",
+    );
+
+    // A directory in the key file's place cannot be read as a key.
+    let dir = tempfile::tempdir().expect("failed to create temp key dir");
+    let (mut config, key_file) = config_with_identity_dir(dir.path());
+    fs::create_dir(&key_file).expect("create a directory in the key file's place");
+    assert!(matches!(
+        config.pin_stable_zakura_identity(),
+        Err(UnstableZakuraIdentityError::Unreadable { path, .. }) if path == key_file,
+    ));
+    assert!(key_file.is_dir());
+}
+
+/// A node that cannot save its first key would change identity on every start.
+#[cfg(unix)]
+#[test]
+fn stable_identity_check_refuses_a_key_it_cannot_save() {
+    let _init_guard = zakura_test::init();
+    let dir = tempfile::tempdir().expect("failed to create temp key dir");
+    // The identity directory is a link to nowhere: it holds no key file, and
+    // it cannot be created.
+    let blocked = dir.path().join("identity");
+    std::os::unix::fs::symlink(dir.path().join("missing"), &blocked)
+        .expect("create the dangling link");
+    let (mut config, key_file) = config_with_identity_dir(&blocked);
+
+    assert!(matches!(
+        config.pin_stable_zakura_identity(),
+        Err(UnstableZakuraIdentityError::NotSaved { path, .. }) if path == key_file,
+    ));
+}
+
+/// A key file that is a link to a missing file is not replaced with a new key.
+#[cfg(unix)]
+#[test]
+fn stable_identity_check_refuses_a_key_file_link_with_no_target() {
+    let _init_guard = zakura_test::init();
+    let dir = tempfile::tempdir().expect("failed to create temp key dir");
+    let (mut config, key_file) = config_with_identity_dir(dir.path());
+    std::os::unix::fs::symlink(dir.path().join("missing"), &key_file)
+        .expect("create the dangling link");
+
+    assert!(matches!(
+        config.pin_stable_zakura_identity(),
+        Err(UnstableZakuraIdentityError::Unreadable { path, .. }) if path == key_file,
+    ));
+    assert!(key_file.is_symlink());
+    assert!(!dir.path().join("missing").exists());
+}
+
+/// A configured key is stable when it parses, and no key file is written for it.
+#[test]
+fn stable_identity_check_accepts_a_configured_key() {
+    let _init_guard = zakura_test::init();
+    let dir = tempfile::tempdir().expect("failed to create temp key dir");
+    let (file_config, key_file) = config_with_identity_dir(dir.path());
+
+    let configured = "01".repeat(32);
+    let mut config = Config {
+        identity_dir: file_config.identity_dir.clone(),
+        ..toml::from_str(&format!("zakura_node_secret_key = '{configured}'"))
+            .expect("valid configured key parses")
+    };
+    config
+        .pin_stable_zakura_identity()
+        .expect("a valid configured key is stable");
+    assert!(!key_file.exists());
+
+    let mut config = Config {
+        identity_dir: file_config.identity_dir,
+        ..toml::from_str("zakura_node_secret_key = 'not a key'")
+            .expect("the key is only parsed when it is used")
+    };
+    assert!(matches!(
+        config.pin_stable_zakura_identity(),
+        Err(UnstableZakuraIdentityError::Configured(
+            ZakuraSecretKeyError::InvalidConfigured
+        )),
+    ));
 }
 
 #[test]

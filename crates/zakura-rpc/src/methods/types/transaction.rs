@@ -13,6 +13,7 @@ use zcash_script::script::Asm;
 use zakura_chain::{
     amount::{self, Amount, NegativeAllowed, NegativeOrZero, NonNegative},
     block::{self, merkle::AUTH_DIGEST_PLACEHOLDER, Height},
+    miner_mesh::MinerMeshCommitment,
     orchard,
     parameters::{
         subsidy::{block_subsidy, funding_stream_values, miner_fee_share, miner_subsidy},
@@ -223,6 +224,8 @@ pub(crate) fn coinbase_needs_proof(
 struct CoinbasePlan {
     miner_reward_address: MinerRewardAddress,
     funding_stream_outputs: Vec<(Zatoshis, TransparentAddress)>,
+    /// The gateway the coinbase names in its last transparent output, if any.
+    mesh_commitment: Option<MinerMeshCommitment>,
 }
 
 impl CoinbasePlan {
@@ -250,6 +253,7 @@ impl CoinbasePlan {
         Ok(Self {
             miner_reward_address,
             funding_stream_outputs,
+            mesh_commitment: miner_params.mesh_commitment(),
         })
     }
 
@@ -296,10 +300,18 @@ impl CoinbasePlan {
             })
             .sum::<usize>();
 
+        // The commitment is one more output. Its script holds no signature operation.
+        let mesh_commitment_bytes = self
+            .mesh_commitment
+            .map(|commitment| commitment.to_output().zcash_serialized_size());
+        let transparent_output_count =
+            transparent_outputs.len() + usize::from(mesh_commitment_bytes.is_some());
+
         let transparent_bytes = compact_size_bytes(1)
             + max_coinbase_input_bytes
-            + compact_size_bytes(transparent_outputs.len())
-            + transparent_output_bytes;
+            + compact_size_bytes(transparent_output_count)
+            + transparent_output_bytes
+            + mesh_commitment_bytes.unwrap_or(0);
 
         let orchard_proof_bytes = ::orchard::Proof::expected_proof_size(1);
         let orchard_bundle_bytes = compact_size_bytes(1)
@@ -461,6 +473,16 @@ impl TransactionTemplate<NegativeOrZero> {
 
         for (fs_amount, fs_addr) in plan.funding_stream_outputs {
             builder.add_transparent_output(&fs_addr, fs_amount)?;
+        }
+
+        if let Some(commitment) = plan.mesh_commitment {
+            builder
+                .add_transparent_null_data_output::<String>(&commitment.payload())
+                .map_err(|error| {
+                    TransactionError::CoinbaseConstruction(format!(
+                        "Failed to add the miner mesh commitment: {error}"
+                    ))
+                })?;
         }
 
         let build_result =

@@ -696,7 +696,11 @@ async fn faulty_trusted_block_bans_relay_and_closes_connections_then_valid_retry
     .await
     .unwrap();
     let observer = Buffer::new(observer, 4);
-    observer.clone().oneshot(Request::Peers).await.unwrap();
+    observer
+        .clone()
+        .oneshot(Request::Ping(zakura_network::types::Nonce(123)))
+        .await
+        .expect("the observer connection is live before the ban");
     let valid = relay.template().await;
     let invalid = faulty_body(&valid);
     relay.gate.hold();

@@ -273,6 +273,7 @@ fn hedged_signing_matches_acvp() {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CompositeFile {
+    scheme: String,
     ml_dsa_context: String,
     tests: Vec<CompositeTest>,
 }
@@ -304,6 +305,10 @@ struct CompositeTest {
 fn the_composite_has_its_published_known_answer() {
     let file: CompositeFile =
         serde_json::from_str(include_str!("ed25519_mldsa44_kat.json")).unwrap();
+    assert_eq!(
+        file.scheme,
+        format!("0x{:04X}", u16::from(COMPOSITE_SCHEME))
+    );
     assert_eq!(file.ml_dsa_context.as_bytes(), ML_DSA_CONTEXT);
     assert_eq!(file.tests.len(), 1);
     for test in file.tests {

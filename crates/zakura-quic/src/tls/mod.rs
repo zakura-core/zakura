@@ -4,11 +4,14 @@
 //! Copyright 2025 N0, INC. Licensed under MIT OR Apache-2.0.
 //!
 //! Every rustls config in this crate comes from this module (TLS-11). The
-//! profile matches Iroh 1.1 on the wire: TLS 1.3 only, RFC 7250 raw public keys
-//! in both directions, Ed25519 only, mandatory client authentication and no
-//! SNI. It differs from Iroh in two local choices that don't change what a peer
-//! sees on a full handshake: the server refuses 0-RTT and issues no session
-//! tickets, and the client never resumes (TLS-10).
+//! profile is Iroh 1.1's: TLS 1.3 only, RFC 7250 raw public keys in both
+//! directions, Ed25519 only, mandatory client authentication and no SNI. It
+//! differs from Iroh on the wire in its key exchange: it offers the hybrid
+//! group X25519MLKEM768 ahead of ring's groups (TLS-9), and a peer without
+//! that group answers on X25519. It also differs in two local choices that
+//! don't change what a peer sees on a full handshake: the server refuses
+//! 0-RTT and issues no session tickets, and the client never resumes
+//! (TLS-10).
 
 use std::{
     sync::Arc,
@@ -23,6 +26,8 @@ use crate::{
     key::{NodeId, NodeSecretKey, KEY_LENGTH},
 };
 
+pub(crate) mod hybrid;
+mod mlkem;
 pub(crate) mod resolver;
 pub(crate) mod verifier;
 
@@ -76,7 +81,7 @@ pub(crate) struct TlsConfig {
 
 impl TlsConfig {
     pub(crate) fn new(secret_key: &NodeSecretKey) -> Self {
-        Self::with_provider(secret_key, rustls::crypto::ring::default_provider())
+        Self::with_provider(secret_key, production_provider())
     }
 
     /// TLS state whose provider takes its random source and key-exchange
@@ -95,8 +100,9 @@ impl TlsConfig {
         if random.is_none() && groups.is_none() {
             return Ok(Self::new(secret_key));
         }
-        // TLS-9: everything but these two fields stays ring's default.
-        let mut provider = rustls::crypto::ring::default_provider();
+        // TLS-9: everything but these two fields stays the production
+        // provider's.
+        let mut provider = production_provider();
         if let Some(random) = random {
             provider.secure_random = random;
         }
@@ -127,15 +133,14 @@ impl TlsConfig {
         Self {
             cert_resolver: Arc::new(resolver::ResolveRawPublicKeyCert::new(secret_key)),
             client_verifier: Arc::new(verifier::ClientCertificateVerifier),
-            // TLS-9: rustls' ring provider with its default TLS 1.3 suites.
             provider: Arc::new(provider),
         }
     }
 
-    /// Whether the provider is rustls' ring default, field for field.
+    /// Whether the provider is the production one, field for field.
     #[cfg(test)]
-    pub(crate) fn uses_default_provider(&self) -> bool {
-        format!("{:?}", self.provider) == format!("{:?}", rustls::crypto::ring::default_provider())
+    pub(crate) fn uses_production_provider(&self) -> bool {
+        format!("{:?}", self.provider) == format!("{:?}", production_provider())
     }
 
     /// Builds the server config, offering `alpns` in the given order (WIRE-2).
@@ -190,6 +195,18 @@ impl TlsConfig {
         crypto.resumption = rustls::client::Resumption::disabled();
         Ok(crypto)
     }
+}
+
+/// The crypto provider of an endpoint with no injected inputs (TLS-9):
+/// rustls' ring provider with the hybrid group X25519MLKEM768 offered ahead
+/// of ring's own key-exchange groups.
+///
+/// Two endpoints on this provider agree on the hybrid. A peer without it
+/// picks X25519, which stays on offer, so the two still connect.
+fn production_provider() -> rustls::crypto::CryptoProvider {
+    let mut provider = rustls::crypto::ring::default_provider();
+    provider.kx_groups.insert(0, hybrid::x25519_mlkem768());
+    provider
 }
 
 /// The DER SubjectPublicKeyInfo for an Ed25519 key, as Iroh encodes it (TLS-3).
@@ -319,11 +336,315 @@ mod tests {
                 .collect::<Vec<_>>(),
             [x25519.name()]
         );
-        assert!(!tls.uses_default_provider());
+        assert!(!tls.uses_production_provider());
 
         let tls =
             TlsConfig::with_inputs(&NodeSecretKey::generate(), &EndpointInputs::default()).unwrap();
-        assert!(tls.uses_default_provider());
+        assert!(tls.uses_production_provider());
+    }
+
+    /// The names of a provider's key-exchange groups, in offer order.
+    fn group_names(provider: &rustls::crypto::CryptoProvider) -> Vec<rustls::NamedGroup> {
+        provider
+            .kx_groups
+            .iter()
+            .map(|group| group.name())
+            .collect()
+    }
+
+    /// TLS-9: the production provider is ring's with one change, the hybrid
+    /// group offered ahead of ring's own groups.
+    #[test]
+    fn the_production_provider_is_rings_with_the_hybrid_group_first() {
+        let ring = rustls::crypto::ring::default_provider();
+        let production = production_provider();
+        let mut expected = vec![rustls::NamedGroup::X25519MLKEM768];
+        expected.extend(group_names(&ring));
+        assert_eq!(group_names(&production), expected);
+        assert!(group_names(&ring).contains(&rustls::NamedGroup::X25519));
+        assert_eq!(
+            format!("{:?}", production.cipher_suites),
+            format!("{:?}", ring.cipher_suites)
+        );
+        assert_eq!(
+            format!("{:?}", production.signature_verification_algorithms),
+            format!("{:?}", ring.signature_verification_algorithms)
+        );
+        assert_eq!(
+            format!("{:?}", production.key_provider),
+            format!("{:?}", ring.key_provider)
+        );
+        assert_eq!(
+            format!("{:?}", production.secure_random),
+            format!("{:?}", ring.secure_random)
+        );
+        assert!(TlsConfig::new(&NodeSecretKey::generate()).uses_production_provider());
+    }
+
+    /// TLS-9: an endpoint that injects only a random source still offers the
+    /// production groups, the hybrid first.
+    #[test]
+    fn an_injected_random_source_keeps_the_production_groups() {
+        let inputs = EndpointInputs::default().tls_random(&SEVENS);
+        let tls = TlsConfig::with_inputs(&NodeSecretKey::generate(), &inputs).unwrap();
+        assert_eq!(format!("{:?}", tls.provider.secure_random), "Sevens");
+        assert_eq!(
+            group_names(&tls.provider),
+            group_names(&production_provider())
+        );
+    }
+
+    /// A client config keeps no memory of its last handshake. Every peer
+    /// shares one server name, so a config that remembered the group a peer
+    /// without the hybrid chose would open its next dial, to any peer, on
+    /// X25519 alone, and each upgraded peer would ask again for the hybrid.
+    /// The endpoint builds a config per dial today; disabled resumption keeps
+    /// this true if a config is ever reused.
+    #[test]
+    fn a_dial_to_an_older_peer_leaves_the_next_dial_on_the_hybrid() {
+        let dialer_key = NodeSecretKey::generate();
+        let listener_key = NodeSecretKey::generate();
+        let client = Arc::new(
+            TlsConfig::new(&dialer_key)
+                .rustls_client(listener_key.public(), &[b"a"])
+                .unwrap(),
+        );
+        assert_eq!(
+            handshake_to(&client, &ring_only(&listener_key)),
+            (rustls::NamedGroup::X25519, rustls::HandshakeKind::Full)
+        );
+        assert_eq!(
+            handshake_to(&client, &TlsConfig::new(&listener_key)),
+            (
+                rustls::NamedGroup::X25519MLKEM768,
+                rustls::HandshakeKind::Full
+            )
+        );
+    }
+
+    /// A dialer's group that sends the production hybrid share altered by
+    /// `alter`, for handshakes that must fail.
+    #[derive(Debug)]
+    struct Altered {
+        alter: fn(Vec<u8>) -> Vec<u8>,
+    }
+
+    impl rustls::crypto::SupportedKxGroup for Altered {
+        fn start(&self) -> Result<Box<dyn rustls::crypto::ActiveKeyExchange>, rustls::Error> {
+            let exchange = hybrid::x25519_mlkem768().start()?;
+            let share = (self.alter)(exchange.pub_key().to_vec());
+            Ok(Box::new(AlteredExchange { exchange, share }))
+        }
+
+        fn name(&self) -> rustls::NamedGroup {
+            rustls::NamedGroup::X25519MLKEM768
+        }
+    }
+
+    /// An exchange of [`Altered`]: the production one, with another share.
+    struct AlteredExchange {
+        exchange: Box<dyn rustls::crypto::ActiveKeyExchange>,
+        share: Vec<u8>,
+    }
+
+    impl rustls::crypto::ActiveKeyExchange for AlteredExchange {
+        fn complete(
+            self: Box<Self>,
+            peer: &[u8],
+        ) -> Result<rustls::crypto::SharedSecret, rustls::Error> {
+            self.exchange.complete(peer)
+        }
+
+        fn hybrid_component(&self) -> Option<(rustls::NamedGroup, &[u8])> {
+            self.exchange.hybrid_component()
+        }
+
+        fn complete_hybrid_component(
+            self: Box<Self>,
+            peer: &[u8],
+        ) -> Result<rustls::crypto::SharedSecret, rustls::Error> {
+            self.exchange.complete_hybrid_component(peer)
+        }
+
+        fn pub_key(&self) -> &[u8] {
+            &self.share
+        }
+
+        fn group(&self) -> rustls::NamedGroup {
+            self.exchange.group()
+        }
+    }
+
+    /// SEC-2: a production listener refuses the handshake when the dialer's
+    /// hybrid share has the wrong length or carries an ML-KEM key that
+    /// fails the modulus check. The hello also carries a valid plain X25519
+    /// share, as a production hello does, and the listener doesn't fall back
+    /// to it.
+    #[test]
+    fn a_malformed_hybrid_share_fails_the_handshake() {
+        fn one_byte_short(mut share: Vec<u8>) -> Vec<u8> {
+            share.pop();
+            share
+        }
+        fn coefficient_above_the_modulus(mut share: Vec<u8>) -> Vec<u8> {
+            // The first 12-bit coefficient becomes 4,095, above q = 3,329.
+            share[0] = 0xff;
+            share[1] |= 0x0f;
+            share
+        }
+        let alterations: [fn(Vec<u8>) -> Vec<u8>; 2] =
+            [one_byte_short, coefficient_above_the_modulus];
+        for alter in alterations {
+            let dialer_key = NodeSecretKey::generate();
+            let listener_key = NodeSecretKey::generate();
+            let group: &'static Altered = Box::leak(Box::new(Altered { alter }));
+            let client = TlsConfig::with_inputs(
+                &dialer_key,
+                &EndpointInputs::default()
+                    .kx_groups(vec![group, rustls::crypto::ring::kx_group::X25519]),
+            )
+            .unwrap()
+            .rustls_client(listener_key.public(), &[b"a"])
+            .unwrap();
+            let client = Arc::new(client);
+            // The hello carries a valid plain X25519 share: a listener with
+            // X25519 alone completes on it in one round trip.
+            assert_eq!(
+                handshake_to(&client, &ring_only(&listener_key)),
+                (rustls::NamedGroup::X25519, rustls::HandshakeKind::Full)
+            );
+            let server = TlsConfig::new(&listener_key)
+                .rustls_server(vec![b"a".to_vec()])
+                .unwrap();
+            let name = rustls_pki_types::ServerName::try_from(UNSENT_SERVER_NAME).unwrap();
+            let mut client = rustls::ClientConnection::new(client, name).unwrap();
+            let mut server = rustls::ServerConnection::new(Arc::new(server)).unwrap();
+            let mut hello = Vec::new();
+            while client.wants_write() {
+                client.write_tls(&mut hello).unwrap();
+            }
+            server.read_tls(&mut hello.as_slice()).unwrap();
+            assert_eq!(
+                server.process_new_packets().unwrap_err(),
+                rustls::Error::PeerMisbehaved(rustls::PeerMisbehaved::InvalidKeyShare)
+            );
+        }
+    }
+
+    /// A listener that shares neither group the dialer sent a share for asks
+    /// again (a HelloRetryRequest). The dialer drops its hybrid exchange,
+    /// starts the group the listener named, and the handshake completes in
+    /// one more round trip.
+    #[test]
+    fn a_listener_with_another_group_is_reached_in_one_more_round_trip() {
+        let p256_only = |key: &NodeSecretKey| {
+            let groups = vec![rustls::crypto::ring::kx_group::SECP256R1];
+            TlsConfig::with_inputs(key, &EndpointInputs::default().kx_groups(groups)).unwrap()
+        };
+        assert_eq!(
+            handshake(TlsConfig::new, p256_only),
+            (
+                rustls::NamedGroup::secp256r1,
+                rustls::HandshakeKind::FullWithHelloRetryRequest
+            )
+        );
+    }
+
+    /// TLS state like a release before the hybrid group: ring's own groups.
+    fn ring_only(secret_key: &NodeSecretKey) -> TlsConfig {
+        let groups = rustls::crypto::ring::default_provider().kx_groups;
+        TlsConfig::with_inputs(secret_key, &EndpointInputs::default().kx_groups(groups)).unwrap()
+    }
+
+    /// Runs one TLS handshake in memory, the `dialer` side dialing the
+    /// `listener` side. Returns the group both sides used and whether the
+    /// dialer needed a second round trip (a HelloRetryRequest).
+    fn handshake(
+        dialer: impl Fn(&NodeSecretKey) -> TlsConfig,
+        listener: impl Fn(&NodeSecretKey) -> TlsConfig,
+    ) -> (rustls::NamedGroup, rustls::HandshakeKind) {
+        let dialer_key = NodeSecretKey::generate();
+        let listener_key = NodeSecretKey::generate();
+        let client = dialer(&dialer_key)
+            .rustls_client(listener_key.public(), &[b"a"])
+            .unwrap();
+        handshake_to(&Arc::new(client), &listener(&listener_key))
+    }
+
+    /// Runs one TLS handshake in memory from `client` to a listener with
+    /// `listener`'s TLS state. Returns what [`handshake`] returns.
+    fn handshake_to(
+        client: &Arc<rustls::ClientConfig>,
+        listener: &TlsConfig,
+    ) -> (rustls::NamedGroup, rustls::HandshakeKind) {
+        let server = listener.rustls_server(vec![b"a".to_vec()]).unwrap();
+        let name = rustls_pki_types::ServerName::try_from(UNSENT_SERVER_NAME).unwrap();
+        let mut client = rustls::ClientConnection::new(client.clone(), name).unwrap();
+        let mut server = rustls::ServerConnection::new(Arc::new(server)).unwrap();
+        // A full handshake takes two exchanges and one with a
+        // HelloRetryRequest three, so one that needs more has stalled.
+        for _ in 0..4 {
+            if !client.is_handshaking() && !server.is_handshaking() {
+                break;
+            }
+            let mut flight = Vec::new();
+            while client.wants_write() {
+                client.write_tls(&mut flight).unwrap();
+            }
+            let mut unread = flight.as_slice();
+            while !unread.is_empty() {
+                server.read_tls(&mut unread).unwrap();
+                server.process_new_packets().unwrap();
+            }
+            let mut flight = Vec::new();
+            while server.wants_write() {
+                server.write_tls(&mut flight).unwrap();
+            }
+            let mut unread = flight.as_slice();
+            while !unread.is_empty() {
+                client.read_tls(&mut unread).unwrap();
+                client.process_new_packets().unwrap();
+            }
+        }
+        assert!(
+            !client.is_handshaking() && !server.is_handshaking(),
+            "the handshake stalled"
+        );
+        let group = |group: Option<&'static dyn rustls::crypto::SupportedKxGroup>| {
+            group
+                .expect("a finished TLS 1.3 handshake used a key-exchange group")
+                .name()
+        };
+        let used = group(client.negotiated_key_exchange_group());
+        assert_eq!(group(server.negotiated_key_exchange_group()), used);
+        let kind = client
+            .handshake_kind()
+            .expect("a finished handshake has a kind");
+        (used, kind)
+    }
+
+    /// TLS-9: two endpoints on the production provider use the hybrid group,
+    /// in one round trip.
+    #[test]
+    fn two_production_endpoints_use_the_hybrid_group() {
+        assert_eq!(
+            handshake(TlsConfig::new, TlsConfig::new),
+            (
+                rustls::NamedGroup::X25519MLKEM768,
+                rustls::HandshakeKind::Full
+            )
+        );
+    }
+
+    /// TLS-9: an endpoint without the hybrid group still connects, in
+    /// either direction and in one round trip. The dialer's hello carries a
+    /// plain X25519 share next to the hybrid one, so no retry is needed.
+    #[test]
+    fn a_peer_without_the_hybrid_group_connects_on_x25519() {
+        let x25519 = (rustls::NamedGroup::X25519, rustls::HandshakeKind::Full);
+        assert_eq!(handshake(TlsConfig::new, ring_only), x25519);
+        assert_eq!(handshake(ring_only, TlsConfig::new), x25519);
+        assert_eq!(handshake(ring_only, ring_only), x25519);
     }
 
     /// ring's P-256, limited to TLS 1.2, counting the key exchanges it starts.

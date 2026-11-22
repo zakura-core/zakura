@@ -118,11 +118,13 @@ impl EndpointInputs {
         self
     }
 
-    /// The TLS key-exchange groups, in preference order (TLS-9). ring's own
-    /// groups draw their ephemeral keys from `SystemRandom` directly, so a
-    /// seeded [`Self::tls_random`] alone doesn't fix the key shares.
+    /// The TLS key-exchange groups, in preference order (TLS-9). The
+    /// production groups draw their ephemeral keys from `SystemRandom`
+    /// directly, so a seeded [`Self::tls_random`] alone doesn't fix the key
+    /// shares.
     ///
-    /// Unset, rustls' ring provider offers its default groups.
+    /// Unset, the endpoint offers the production groups: X25519MLKEM768, then
+    /// ring's defaults.
     pub fn kx_groups(mut self, groups: Vec<&'static dyn SupportedKxGroup>) -> Self {
         self.kx_groups = Some(groups);
         self

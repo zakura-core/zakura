@@ -651,9 +651,11 @@ fn curated_combined_actions_sync_both_tips() {
 
 /// How many runs [`a_mid_write_reset_keeps_an_honest_connection`]'s
 /// search may take to reset a block request mid-write. Searches from seeds
-/// 0 to 5 took 30, 24, 9, 1, 6 and 6 runs when this was set, at about 4 s a
-/// run, so 150 leaves a margin of five times the slowest.
-const MID_WRITE_RESET_RUNS: u64 = 150;
+/// 0 to 5 took 247, 93, 36, 118, 19 and 128 runs when this was set, at about
+/// 1.3 s a run in the `planted` profile, so 1,250 leaves a margin of five
+/// times the slowest. The hybrid key share made the reset rarer: with a
+/// one-datagram hello the same searches took 30, 24, 9, 1, 6 and 6 runs.
+const MID_WRITE_RESET_RUNS: u64 = 1_250;
 
 /// The longest Plan the search draws: long enough that most drawn Plans
 /// outlast their run, since an exhausted Plan picks the same way each

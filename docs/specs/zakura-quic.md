@@ -1,6 +1,6 @@
 # Spec: `zakura-quic` transport
 
-Status: draft for review, 2026-11-18. Version 0.22.
+Status: draft for review, 2026-11-20. Version 0.23.
 This document is authoritative for the `zakura-quic` crate, its configuration,
 its wire behavior and its `quinn-proto` dependency policy.
 [Decision 0003](../decisions/zakura/0003-zakura-quic-transport.md) records the
@@ -48,7 +48,11 @@ connection's source validation, and caps a closed connection's drain at
 `SHUTDOWN_DRAIN`; it changes ADM-3, ADM-13, API-3 and API-4, and §17s lists
 each change. Version 0.22 adds a node-wide handshake cadence, keeps admission
 charges once TLS starts, and reports when the endpoint admitted a
-connection; it changes ADM-3 and API-4, and §17t lists each change.
+connection; it changes ADM-3 and API-4, and §17t lists each change. Version
+0.23 offers the hybrid key-exchange group X25519MLKEM768 ahead of ring's
+groups, so recorded traffic between two upgraded nodes stays secret from a
+later quantum computer; it changes DEP-2, TLS-9, ADM-1, API-3, SEC-1, SEC-2
+and the OBS-1 outcome counters, and adds §16 rows; §17u lists each change.
 
 ## 0. Conventions
 
@@ -99,9 +103,11 @@ Terms:
   `ed25519-dalek`, `nix` or `memoffset`. CI enforces the list with
   `cargo tree -e normal -i <pkg>` and fails on any hit.
 - **DEP-2.** `zakura-quic` MAY depend directly on these packages and no others:
-  `bytes`, `curve25519-dalek`, `futures`, `hex`, `libc`, `metrics`,
-  `quinn-proto`, `ring`, `rustls`, `rustls-pki-types`, `serde`, `socket2`,
-  `thiserror`, `tokio`, `tracing`, `zakura-rt` and `zeroize`.
+  `bytes`, `curve25519-dalek`, `futures`, `hex`, `libc`, `libcrux-ml-kem`,
+  `metrics`, `quinn-proto`, `ring`, `rustls`, `rustls-pki-types`, `serde`,
+  `socket2`, `thiserror`, `tokio`, `tracing`, `zakura-rt` and `zeroize`.
+  - `libcrux-ml-kem` MUST enable its `mlkem768` feature and no others, with
+    default features off.
   - `data-encoding` MAY be added only if step 3 of PLAN §6 finds a deployed base32 key.
   - Any other dependency needs a spec change.
 - **DEP-3.** `zakura-quic` MUST enable the `quinn-proto` feature `rustls-ring`
@@ -164,7 +170,8 @@ Terms:
 
 ## 4. TLS profile
 
-The profile reproduces Iroh 1.1 exactly. The code comes from
+The profile reproduces Iroh 1.1, apart from the key-exchange group that
+TLS-9 adds. The code comes from
 `iroh/src/tls{,/verifier,/resolver,/name,/misc}.rs` and `iroh-base/src/key.rs`
 at fork tag `zakura-iroh-v1.1.0-rc.1`, and it keeps their MIT/Apache-2.0 notices.
 
@@ -185,9 +192,24 @@ at fork tag `zakura-iroh-v1.1.0-rc.1`, and it keeps their MIT/Apache-2.0 notices
 - **TLS-8.** The server MUST take the client's `NodeId` from the client's key.
   `Conn::remote_id()` MUST return only a key proven this way.
 - **TLS-9.** The crypto provider is rustls' `ring` provider with its default
-  TLS 1.3 cipher suites. `bind` uses it unchanged. An endpoint built with
-  `bind_with` MAY replace the provider's random source and key-exchange
-  groups, and nothing else.
+  TLS 1.3 cipher suites and one added key-exchange group, X25519MLKEM768
+  (`draft-ietf-tls-ecdhe-mlkem`, group 0x11ec), offered ahead of ring's
+  groups.
+  - The group runs ring's X25519 and ML-KEM-768 (FIPS 203, from
+    `libcrux-ml-kem`). Both secrets go into the session keys, so the keys
+    stay secret while either algorithm holds.
+  - Each share and the secret are the ML-KEM part followed by the X25519
+    part: 1,184 + 32 bytes from the dialer, 1,088 + 32 bytes from the
+    listener, and a 32 + 32 byte secret.
+  - The listener MUST refuse a share of another length and an ML-KEM key
+    that fails the FIPS 203 §7.2 modulus check. The dialer MUST refuse a
+    share of another length. Either half failing fails the handshake.
+  - The dialer also sends its X25519 half as a plain X25519 share, so a
+    peer without the group connects on X25519 in the same round trip.
+
+  `bind` uses this provider unchanged. An endpoint built with `bind_with`
+  MAY replace the provider's random source and key-exchange groups, and
+  nothing else.
 - **TLS-10.** The server MUST refuse 0-RTT (`max_early_data_size = 0`). The
   client MUST NOT send 0-RTT data. Session tickets MAY be issued; they don't
   affect 1-RTT compatibility.
@@ -396,6 +418,18 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
   - `pending_total` and `pending_from_ip`, the handshakes in progress on the
     endpoint and from `remote`'s IP group, `Acceptor::pending_group(remote's
     IP)` (ADM-7).
+
+  An `Incoming` is one Initial datagram that belongs to no connection the
+  endpoint holds. A dialer that offers X25519MLKEM768 (TLS-9) sends a hello
+  that spans two Initial datagrams. After `Accept` the second joins the
+  connection. After any other outcome the second is another `Incoming`:
+  `admit` runs again, and a retried or refused dialer gets a second answer,
+  which it discards. The endpoint remembers no answered attempt, so it
+  doesn't suppress the second answer, and the outcome counters (OBS-1) and
+  the acceptor's own count each decision, so such a dial counts twice. If
+  the outcome changes to `Accept` between the two, the second datagram alone
+  starts TLS: it keeps its admission charge (API-3) and holds a pending
+  handshake until `handshake_timeout_secs`, as any unfinished hello does.
 - **ADM-2.** `admit` returns one of four outcomes, each mapped to a
   `quinn_proto::Endpoint` call:
   - `Accept` → `accept`;
@@ -810,7 +844,7 @@ These are not configurable. Changing one needs a spec change.
 | `zakura.quic.socket.send_dropped` / `.send_errors` | counter | Sends dropped for a droppable error (an oversized MTU probe, a vanished source address, GSO `EIO`), and other send errors |
 | `zakura.quic.endpoint.queue_drops` | counter | Datagrams dropped at a full connection queue (DRV-3) |
 | `zakura.quic.network_changes` | counter | SOCK-12 interface changes passed to connections |
-| `zakura.quic.incoming.accepted` / `.refused` / `.retried` / `.ignored` | counter | ADM-2 outcomes |
+| `zakura.quic.incoming.accepted` / `.refused` / `.retried` / `.ignored` | counter | ADM-2 outcomes, one per `Incoming` (ADM-1) |
 | `zakura.quic.handshake.completed` / `.failed` / `.timed_out` | counter | Handshake results |
 | `zakura.quic.handshake.duration_seconds` | histogram | Accept or dial to handshake complete |
 | `zakura.quic.connections` | gauge | Open connections |
@@ -916,7 +950,11 @@ The public surface of `zakura-quic`. Changing it is a semver change of the crate
     endpoint calls it on its own task, after `admit` returned `Accept`, when
     the attempt never starts TLS: rule 3 or 5 of ADM-3, a full ADM-12 cap, or
     a first packet that `quinn-proto` rejects. The acceptor returns any charge
-    `admit` took, so a source whose attempt never reached TLS pays nothing;
+    `admit` took, so a source whose attempt never reached TLS pays nothing.
+    A hello that spans two datagrams (ADM-1) starts TLS with its first, so
+    one that TLS rejects on its content, such as a hello with no ALPN in
+    common, fails as a handshake and keeps its charge. The same hello in one
+    datagram is rejected as a first packet;
   - `fn finish_admission(&self, handed_off: bool)`, default no-op. The
     endpoint calls it once for every accepted attempt not cancelled above,
     when ADM-7 stops counting it. `handed_off` is true when `handle` has
@@ -1075,13 +1113,18 @@ this release tolerates, and keep each hard change explicit.
   - no signature verifying under a mixed-order key (ID-6);
   - small-order `R` points, `R` points with a torsion component, and
     non-canonical `S` scalars refused (ID-6);
-  - honest keys and signatures accepted.
+  - honest keys and signatures accepted;
+  - a subset of Project Wycheproof's ML-KEM-768 vectors for key
+    generation, encapsulation and decapsulation, including encapsulation
+    keys that fail the modulus check (TLS-9).
 - **SEC-2.** These handshakes MUST fail:
   - a dial that reaches a server with the wrong `NodeId`;
   - a client without a key;
   - TLS 1.2;
   - an X.509 certificate instead of a raw public key;
-  - a signature scheme other than Ed25519.
+  - a signature scheme other than Ed25519;
+  - an X25519MLKEM768 key share of the wrong length, or one whose ML-KEM
+    key fails the modulus check (TLS-9).
 - **SEC-3.** For a refused or ignored IP, no `Connecting` may exist. A test
   asserts that `quinn-proto` created no connection state.
 - **SEC-4.** A flood of Initials that never complete MUST stay bounded by
@@ -1130,7 +1173,14 @@ this release tolerates, and keep each hard change explicit.
 | Control-message round trip, and every truncated or lying control message parses to nothing | SOCK-13 |
 | Loopback transfer through the SOCK-13 fast path beats the plain path on the same host | SOCK-13 |
 | An endpoint on injected sockets binds, completes a handshake, rebinds and shuts down without opening an OS socket or starting the kernel drop poller, the GSO probe or the interface watcher | SOCK-3–SOCK-5, SOCK-7, SOCK-9, SOCK-13 |
-| `bind` keeps the secure inputs: each socket's endpoint config has no seed and the production keys, the TLS provider is ring's default, and the dependency graph excludes the deterministic test provider. A `bind_with` handshake uses every injected input, and an injected provider keeps ring's cipher suites | API-2, TLS-9, ADM-10 |
+| `bind` keeps the secure inputs: each socket's endpoint config has no seed and the production keys, the TLS provider is ring's with X25519MLKEM768 added first, and the dependency graph excludes the deterministic test provider. A `bind_with` handshake uses every injected input, and an injected provider keeps ring's cipher suites | API-2, TLS-9, ADM-10 |
+| ML-KEM-768 gives a subset of Project Wycheproof's known answers for key generation, encapsulation and decapsulation; it refuses a key that fails the modulus check and a share of another length before drawing randomness; an altered ciphertext gives an unrelated secret | TLS-9, SEC-1 |
+| X25519MLKEM768's shares and secret are the ML-KEM part then the X25519 part, checked in each role against `libcrux-ml-kem` and `curve25519-dalek` used directly; fed an independent implementation's recorded shares, it gives back the shares and secrets that implementation recorded, in both roles; a bad half or a failed random source fails the exchange | TLS-9 |
+| A production listener refuses a handshake whose hybrid share is one byte short or carries an ML-KEM key that fails the modulus check | TLS-9, SEC-2 |
+| Two production configs negotiate X25519MLKEM768; with a peer that has only ring's groups, as dialer and as listener, the handshake completes on X25519 with no HelloRetryRequest. Over QUIC, a dialer with only ring's groups reaches a production listener, and a production dialer reaches a listener with only ring's groups | TLS-9 |
+| Against the released `zakura-quic` 1.1.0, which has no hybrid group, this tree's endpoint dials and is dialed over loopback: both nodes are authenticated and a stream echoes, repeatedly, in both directions (`qa/quic-compat`) | TLS-9 |
+| The seeded X25519MLKEM768 completes against the production group in both roles and replays its shares for the same seed and node | TLS-9, API-2 |
+| A dialer that offers X25519MLKEM768 sends its hello as two 1,200-byte Initial datagrams. A refused dial is decided and answered once per datagram, and a retried one decided once per datagram. A hello refused at its first datagram and accepted at its second keeps its charge and holds a pending handshake until the deadline. A hello with no ALPN in common is cancelled when it fits one datagram and fails as a handshake when it spans two | ADM-1, ADM-3, ADM-7, API-3 |
 | On the deterministic scheduler, with no tokio runtime, two `bind_with` endpoints with the same seeded inputs, plan and UTC origin send byte-identical datagrams through a Retry handshake and an echoed stream, in one process and in fresh processes. Leaving out any seeded input, or changing the seed or the UTC origin, changes the bytes, and host time doesn't | API-2, TLS-9, ADM-10, DEP-2 |
 | Cancelled reads lose no data; cancelled writes keep their order; concurrent streams keep their data apart; a transfer larger than the receive window completes | DRV-4–DRV-6 |
 | Dropping the last `Conn` closes the connection | DRV-7 |
@@ -1638,3 +1688,47 @@ Changed:
   `control_timeout` from the endpoint's `Accept`.
 - **API-4.** Adds `Conn::admitted_at`, so an acceptor can measure a
   whole-handshake deadline from admission.
+
+## 17u. Changes in version 0.23
+
+The handshake agreed on session keys with X25519 alone. Traffic recorded
+today could be decrypted once a quantum computer can break X25519.
+
+Changed:
+
+- **TLS-9.** Adds X25519MLKEM768 ahead of ring's groups. ring stays the
+  provider: rustls ships this group only with its aws-lc-rs provider, which
+  builds a C library, and no pure-Rust provider supplies both the group
+  and the QUIC packet keys `quinn-proto` needs. The group is built here
+  from ring's X25519 and `libcrux-ml-kem`, and its combiner follows rustls'
+  own. Both secrets go into the keys, so a break of ML-KEM, or a wrong
+  answer from its code, can fail a handshake but can't make its keys weaker
+  than X25519; a memory-safety fault in `libcrux-ml-kem`, which reads a
+  peer's share before authentication, is not covered. A peer without
+  the group connects on X25519, so there is no protocol version or
+  configuration change, and nothing requires the group. Authentication
+  stays Ed25519: this protects recorded traffic, not a handshake that a
+  quantum computer attacks live.
+- **DEP-2.** Adds `libcrux-ml-kem` with only its `mlkem768` feature. It is
+  Rust with no C. Its build script also compiles its NEON code on aarch64
+  and its AVX2 code on x86_64, written with `unsafe` CPU intrinsics, and it
+  picks one at run time from the CPU's features. It takes its randomness
+  from the caller, so a simulation seeds it like the X25519 secrets.
+- **SEC-1, SEC-2.** Add the ML-KEM-768 known answers and the refused hybrid
+  key shares.
+- **ADM-1, API-3.** State what a two-datagram hello does. The dialer's hello
+  now carries a 1,216-byte hybrid share next to its 32-byte X25519 share, so
+  it no longer fits one 1,200-byte Initial datagram. Both datagrams leave in
+  one flight, so a handshake without loss takes no more round trips; losing
+  either datagram delays it until the dialer retransmits. A dial that isn't
+  accepted is now decided, answered and counted once per datagram, and a
+  hello that TLS rejects on its content now fails as a handshake.
+  Suppressing the second answer would mean remembering answered attempts
+  from sources nothing has validated, so the endpoint doesn't.
+- **OBS-1.** Says the `zakura.quic.incoming.*` counters count each
+  `Incoming`, so a two-datagram hello that isn't accepted counts twice.
+- **§4.** The introduction no longer says the profile reproduces Iroh 1.1
+  exactly: the key exchange now differs.
+- **§16.** Adds the rows for ML-KEM-768, the hybrid group, its fallback to
+  X25519, handshakes with the released crate, its seeded form and
+  two-datagram admission.

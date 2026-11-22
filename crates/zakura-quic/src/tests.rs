@@ -177,9 +177,10 @@ fn client() -> QuicEndpoint {
     QuicEndpoint::bind(NodeSecretKey::generate(), &loopback(), &test_config()).unwrap()
 }
 
-/// A handshake that never finishes: one client Initial sent from a socket
-/// nobody reads. The server's replies, including any Retry, go nowhere. This
-/// is what a spoofed source looks like to the server.
+/// A handshake that never finishes: a client's whole first flight, the
+/// hello in two Initial datagrams, sent from a socket nobody reads. The
+/// server's replies, including any Retry, go nowhere. This is what a spoofed
+/// source looks like to the server.
 struct StalledHandshake {
     _socket: std::net::UdpSocket,
 }
@@ -210,11 +211,16 @@ fn stalled_handshake_to(server: &QuicEndpoint) -> StalledHandshake {
             crate::tls::UNSENT_SERVER_NAME,
         )
         .unwrap();
-    let mut buf = Vec::new();
-    let transmit = conn
-        .poll_transmit(now, 1, &mut buf)
-        .expect("a new connection sends its Initial at once");
-    socket.send_to(&buf[..transmit.size], target).unwrap();
+    let mut sent = 0;
+    loop {
+        let mut buf = Vec::new();
+        let Some(transmit) = conn.poll_transmit(now, 1, &mut buf) else {
+            break;
+        };
+        socket.send_to(&buf[..transmit.size], target).unwrap();
+        sent += 1;
+    }
+    assert_eq!(sent, 2, "the hybrid hello spans two Initial datagrams");
     StalledHandshake { _socket: socket }
 }
 
@@ -540,10 +546,35 @@ async fn wrong_identity_is_refused() {
     .unwrap();
 }
 
-/// The server rejects the first packet, so the acceptor gets its admission
-/// back through `cancel_admission` alone: a spoofed source pays no charge.
+/// A hello that fits one datagram, here from a dialer with ring's groups
+/// only, as a release before the hybrid group sends it. The server rejects
+/// the first packet, so the acceptor gets its admission back through
+/// `cancel_admission` alone: a spoofed source pays no charge.
 #[tokio::test]
-async fn alpn_mismatch_is_classified() {
+async fn an_alpn_mismatch_in_a_one_datagram_hello_is_cancelled() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let server = server();
+        let rpk = crate::tls::resolver::ResolveRawPublicKeyCert::new(&NodeSecretKey::generate());
+        let mut crypto = raw_client_builder(&server).with_client_cert_resolver(Arc::new(rpk));
+        crypto.alpn_protocols = vec![b"p2p-v2/2".to_vec()];
+        assert!(matches!(
+            dial_raw(&server, crypto).await,
+            Err(ConnectError::AlpnMismatch)
+        ));
+        assert_eq!(server.seen.lock().unwrap().len(), 1);
+        assert_eq!(server.returned.cancelled.load(Ordering::Relaxed), 1);
+        assert_eq!(server.returned.finished.load(Ordering::Relaxed), 0);
+    })
+    .await
+    .unwrap();
+}
+
+/// A production dialer's hello carries the hybrid key share and spans two
+/// datagrams, so the server has accepted the attempt before it can read the
+/// hello. The mismatch then fails the handshake, and the acceptor gets its
+/// admission back once, through `finish_admission` (ADM-3, ADM-7).
+#[tokio::test]
+async fn an_alpn_mismatch_in_a_two_datagram_hello_fails_the_handshake() {
     tokio::time::timeout(TEST_TIMEOUT, async {
         let server = server();
         let client = client();
@@ -551,8 +582,13 @@ async fn alpn_mismatch_is_classified() {
             client.connect(server.addr(), &[b"p2p-v2/2"]).await,
             Err(ConnectError::AlpnMismatch)
         ));
-        assert_eq!(server.returned.cancelled.load(Ordering::Relaxed), 1);
-        assert_eq!(server.returned.finished.load(Ordering::Relaxed), 0);
+        // The pending slot is returned when the connection has closed.
+        while server.returned.finished.load(Ordering::Relaxed) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(server.seen.lock().unwrap().len(), 1);
+        assert_eq!(server.returned.finished.load(Ordering::Relaxed), 1);
+        assert_eq!(server.returned.cancelled.load(Ordering::Relaxed), 0);
     })
     .await
     .unwrap();
@@ -605,7 +641,12 @@ async fn refused_attempt_creates_no_connection() {
         ));
         // SEC-3: the acceptor never saw a connection.
         assert!(server.handled.try_recv().is_err());
-        assert_eq!(server.seen.lock().unwrap().len(), 1);
+        // The hello spans two datagrams. The endpoint decides each one it
+        // doesn't accept on its own (ADM-1), so the dial is refused twice.
+        wait_for_attempts(&server, 2).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(server.seen.lock().unwrap().len(), 2);
+        assert!(server.handled.try_recv().is_err());
     })
     .await
     .unwrap();
@@ -638,10 +679,15 @@ async fn retry_threshold_validates_before_accepting() {
         client.connect(server.addr(), &[ALPN]).await.unwrap();
         let inbound = server.handled.recv().await.unwrap();
         assert!(inbound.source_validated(), "the Retry token validated it");
+        // The hello spans two datagrams, and each unvalidated one gets its
+        // own Retry (ADM-1). The dialer answers the first and discards the
+        // second, as RFC 9000 section 17.2.5.2 requires.
         let seen = server.seen.lock().unwrap().clone();
-        assert_eq!(seen.len(), 2, "one Retry, then the validated attempt");
-        assert!(!seen[0].validated);
-        assert!(seen[1].validated);
+        assert_eq!(
+            seen.iter().map(|info| info.validated).collect::<Vec<_>>(),
+            [false, false, true],
+            "one Retry per datagram of the hello, then the validated attempt"
+        );
     })
     .await
     .unwrap();
@@ -1136,6 +1182,8 @@ fn profile_is_tls13_only() {
 #[tokio::test]
 async fn raw_client_with_the_profile_is_accepted() {
     // Control for the refusal tests: the same raw dial with an RPK key succeeds.
+    // The raw client has ring's groups only, so this is also a dialer without
+    // the hybrid group reaching a production listener (TLS-9).
     tokio::time::timeout(TEST_TIMEOUT, async {
         let mut server = server();
         let rpk = crate::tls::resolver::ResolveRawPublicKeyCert::new(&NodeSecretKey::generate());
@@ -2787,6 +2835,159 @@ async fn pump(net: SimNet) {
     }
 }
 
+/// The dialer's hello carries the hybrid key share, 1,216 bytes, so its first
+/// flight is two full Initial datagrams where a hello with ring's groups
+/// needed one (TLS-9). Both leave before any reply. The server accepts the
+/// first, the second joins that connection, and the handshake completes.
+#[tokio::test(start_paused = true)]
+async fn the_hybrid_hello_leaves_as_two_initial_datagrams() {
+    tokio::time::timeout(SIM_TEST_TIMEOUT, async {
+        let net = sim_net();
+        let mut server =
+            serve_test_acceptor(sim_endpoint(&net, sim_addr(1)), &[ALPN], |_| Admit::Accept);
+        let client = sim_endpoint(&net, sim_addr(2));
+        let target = server.addr();
+        let dial = tokio::spawn(async move {
+            let result = client.connect(target, &[ALPN]).await;
+            (client, result)
+        });
+
+        // Nothing is delivered yet, so the client has sent its first flight
+        // and nothing else.
+        for _ in 0..10_000 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(sent_lengths(&net, sim_addr(2)), [1200, 1200]);
+
+        let pump = tokio::spawn(pump(net.clone()));
+        let (_client, result) = dial.await.unwrap();
+        result.unwrap();
+        server.handled.recv().await.unwrap();
+        assert_eq!(server.seen.lock().unwrap().len(), 1);
+        pump.abort();
+    })
+    .await
+    .unwrap();
+}
+
+/// A listener from before the hybrid group, with ring's groups only, takes
+/// the production dialer's two-datagram hello and completes the handshake on
+/// the X25519 share the hello also carries (TLS-9).
+#[tokio::test(start_paused = true)]
+async fn a_production_dialer_reaches_a_listener_without_the_hybrid_group() {
+    tokio::time::timeout(SIM_TEST_TIMEOUT, async {
+        let net = sim_net();
+        let pump = tokio::spawn(pump(net.clone()));
+        let bind = QuicBindConfig {
+            addrs: vec![sim_addr(1)],
+            ..loopback()
+        };
+        let rings_groups = rustls::crypto::ring::default_provider().kx_groups;
+        let listener = QuicEndpoint::bind_with(
+            NodeSecretKey::generate(),
+            &bind,
+            &test_config(),
+            net.clone(),
+            crate::EndpointInputs::default().kx_groups(rings_groups),
+        )
+        .unwrap();
+        let mut server = serve_test_acceptor(listener, &[ALPN], |_| Admit::Accept);
+        let client = sim_endpoint(&net, sim_addr(2));
+
+        client.connect(server.addr(), &[ALPN]).await.unwrap();
+        server.handled.recv().await.unwrap();
+        assert_eq!(server.seen.lock().unwrap().len(), 1);
+        // The hello it took was the hybrid one, in two datagrams.
+        assert_eq!(sent_lengths(&net, sim_addr(2))[..2], [1200, 1200]);
+        pump.abort();
+    })
+    .await
+    .unwrap();
+}
+
+/// A refused dial is answered once per datagram of its hello: the endpoint
+/// keeps no record of the attempt it refused, so the second datagram is a
+/// new attempt and gets its own refusal (ADM-1).
+#[tokio::test(start_paused = true)]
+async fn a_refused_two_datagram_hello_is_answered_twice() {
+    tokio::time::timeout(SIM_TEST_TIMEOUT, async {
+        let net = sim_net();
+        let pump = tokio::spawn(pump(net.clone()));
+        let mut server =
+            serve_test_acceptor(sim_endpoint(&net, sim_addr(1)), &[ALPN], |_| Admit::Refuse);
+        let client = sim_endpoint(&net, sim_addr(2));
+
+        assert!(matches!(
+            client.connect(server.addr(), &[ALPN]).await,
+            Err(ConnectError::Refused)
+        ));
+        // Long enough for the second datagram and its answer to arrive.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(server.seen.lock().unwrap().len(), 2);
+        assert_eq!(sent_lengths(&net, sim_addr(1)).len(), 2);
+        assert!(server.handled.try_recv().is_err());
+        assert_eq!(server.returned.cancelled.load(Ordering::Relaxed), 0);
+        assert_eq!(server.returned.finished.load(Ordering::Relaxed), 0);
+        pump.abort();
+    })
+    .await
+    .unwrap();
+}
+
+/// The outcome changes between a hello's two datagrams: the first is
+/// refused and the second accepted. The second alone starts TLS, so the
+/// attempt isn't cancelled. It holds its pending slot until the handshake
+/// deadline and then fails, keeping its admission charge (ADM-1, ADM-7).
+#[tokio::test(start_paused = true)]
+async fn a_hello_accepted_at_its_second_datagram_stalls_until_the_deadline() {
+    tokio::time::timeout(SIM_TEST_TIMEOUT, async {
+        let net = sim_net();
+        let pump = tokio::spawn(pump(net.clone()));
+        let decided = AtomicUsize::new(0);
+        let mut server = serve_test_acceptor(sim_endpoint(&net, sim_addr(1)), &[ALPN], move |_| {
+            if decided.fetch_add(1, Ordering::Relaxed) == 0 {
+                Admit::Refuse
+            } else {
+                Admit::Accept
+            }
+        });
+        let client = sim_endpoint(&net, sim_addr(2));
+
+        let dialed = tokio::time::Instant::now();
+        assert!(matches!(
+            client.connect(server.addr(), &[ALPN]).await,
+            Err(ConnectError::Refused)
+        ));
+        // Half the 3 s handshake deadline: the stranded attempt still holds
+        // its slot.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(server.seen.lock().unwrap().len(), 2);
+        assert_eq!(server.returned.finished.load(Ordering::Relaxed), 0);
+
+        while server.returned.finished.load(Ordering::Relaxed) == 0 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(dialed.elapsed() >= Duration::from_secs(3));
+        assert_eq!(server.returned.finished.load(Ordering::Relaxed), 1);
+        assert_eq!(server.returned.cancelled.load(Ordering::Relaxed), 0);
+        assert!(server.handled.try_recv().is_err());
+        pump.abort();
+    })
+    .await
+    .unwrap();
+}
+
+/// The lengths of the datagrams `src` has sent on `net`, in order.
+fn sent_lengths(net: &SimNet, src: SocketAddr) -> Vec<usize> {
+    net.events()
+        .into_iter()
+        .filter_map(|event| match event {
+            NetEvent::Sent { id, len, .. } if id.link.src == src => Some(len),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Bounds a simulation test in virtual time. It leaves room for the 91 s the
 /// rebind test sleeps on purpose, and a hang still fails within seconds of
 /// wall time, because paused time jumps ahead while the test waits.
@@ -3219,8 +3420,8 @@ async fn unusable_kx_groups_fail_at_bind() {
 }
 
 /// M3.6: `bind` injects nothing. Each socket's endpoint config is the
-/// production one, with no seed, and the TLS provider is rustls' ring
-/// default.
+/// production one, with no seed, and the TLS provider is the production
+/// one: rustls' ring provider with the hybrid group first.
 #[tokio::test]
 async fn bind_keeps_the_production_inputs() {
     let endpoint =
@@ -3237,7 +3438,7 @@ async fn bind_keeps_the_production_inputs() {
         format!("{:?}", shared.config.endpoint_config())
     );
     assert!(socket_config.contains("rng_seed: None"), "{socket_config}");
-    assert!(shared.tls.uses_default_provider());
+    assert!(shared.tls.uses_production_provider());
     endpoint.shutdown().await;
 }
 

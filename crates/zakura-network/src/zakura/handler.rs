@@ -5335,10 +5335,13 @@ impl Acceptor for ZakuraProtocolHandler {
                 "zakura.p2p.conn.rejected.pending_handshake",
             );
         }
-        // The caller's node ID is unknown until TLS, so a held place that no
-        // preferred gateway fills admits any caller. One that turns out to
-        // be ordinary is refused after TLS and keeps its cadence charges, so
-        // held places give no free handshakes.
+        // TLS 1.3 proves the caller's node ID only in its last flight, after
+        // this node has done its handshake work, so a held place that no
+        // preferred gateway fills has to admit callers whose ID is not known
+        // yet. The claim after the handshake (`claim_inbound`) decides by the
+        // proven ID: a caller that turns out to be ordinary is refused there
+        // and keeps its cadence charges, so held places give no free
+        // handshakes.
         if !counts.inbound_place_free(self.limits.max_connections) {
             metrics::counter!("zakura.p2p.conn.rejected.admission").increment(1);
             return Admit::Refuse;

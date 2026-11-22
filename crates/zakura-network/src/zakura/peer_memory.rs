@@ -51,8 +51,8 @@ const GIB: u64 = 1024 * 1024 * 1024;
 /// It funds the default ordinary connections and ten preferred gateways at the
 /// default windows and reactor shares on the one socket the default
 /// `listen_addr` binds, rounded up to a whole GiB. Regtest's larger header
-/// share needs the most: 256 MiB + 32 × 64 MiB + 102 × 144,030,963 B =
-/// 17,107,077,330 B.
+/// share needs the most: 256 MiB + 32 × 64 MiB + 102 × 144,038,733 B =
+/// 17,107,869,870 B.
 pub const DEFAULT_ZAKURA_PEER_MEMORY_BUDGET_BYTES: u64 = {
     let mainnet = default_budget_need(default_connection_memory(CommonMessage::BUDGET));
     let regtest = default_budget_need(default_connection_memory(RegtestMessage::BUDGET));
@@ -127,8 +127,8 @@ impl ConnectionMemory {
 }
 
 /// The cost of one connection at the default windows and reactor shares,
-/// with `header_sync` as the header sync share: 141,937,353 B on Mainnet and
-/// Testnet, and 144,030,963 B on Regtest.
+/// with `header_sync` as the header sync share: 141,945,123 B on Mainnet and
+/// Testnet, and 144,038,733 B on Regtest.
 pub const fn default_connection_memory(header_sync: ReactorBudget) -> ConnectionMemory {
     // Widening u32 to u64 is lossless.
     ConnectionMemory::new(

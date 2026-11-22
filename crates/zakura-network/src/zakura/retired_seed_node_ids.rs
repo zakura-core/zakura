@@ -12,7 +12,7 @@ use zakura_quic::NodeId;
 use super::ZakuraConfig;
 
 /// Each default seed's protocol 3 node ID, its Ed25519 key, paired with its current ID.
-pub(crate) const RETIRED_ZAKURA_SEED_NODE_IDS: &[(&str, &str)] = &[
+const RETIRED_ZAKURA_SEED_NODE_IDS: &[(&str, &str)] = &[
     // asia-0
     (
         "1398f62c6d1a457c51ba6a4b5f3dbd2f69fca93216218dc8997e416bd17d93ca",

@@ -337,3 +337,53 @@ fn rewrite_is_checked_against_the_loader() {
         );
     }
 }
+
+/// Symlinks someone else placed at the temp or backup path are never written through.
+#[cfg(unix)]
+#[test]
+fn rewrite_never_writes_through_a_planted_symlink() {
+    let (old, new) = retired_entry(0, "192.0.2.1:8234");
+    let original = one_entry_file(&old);
+    let (dir, path) = config_file(&original);
+    let path = fs::canonicalize(&path).unwrap();
+    let victim = dir.path().join("victim");
+    fs::write(&victim, "victim").unwrap();
+    let temp = with_suffix(&path, &format!(".tmp.{}", std::process::id()));
+    std::os::unix::fs::symlink(&victim, &temp).unwrap();
+
+    rewrite_config_file(&path).expect_err("the temp path is taken");
+
+    assert_eq!(fs::read_to_string(&victim).unwrap(), "victim");
+    assert_eq!(fs::read_to_string(&path).unwrap(), original);
+
+    // A dangling symlink at the backup path counts as an earlier backup.
+    let elsewhere = dir.path().join("elsewhere");
+    std::os::unix::fs::symlink(&elsewhere, with_suffix(&path, BACKUP_SUFFIX)).unwrap();
+
+    rewrite_config_file(&path).expect("rewrite succeeds");
+
+    assert!(!elsewhere.exists());
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        original.replace(&old, &new)
+    );
+}
+
+/// An ID spelled with escapes cannot be swapped in place, so the file keeps it for the
+/// operator to fix, and the loaded config is still switched to the current ID.
+#[test]
+fn escaped_id_is_left_in_the_file() {
+    let (old, new) = retired_entry(1, "192.0.2.1:8234");
+    let escaped = format!("\\u{:04x}{}", u32::from(old.as_bytes()[0]), &old[1..]);
+    let original = one_entry_file(&escaped);
+    let (_dir, path) = config_file(&original);
+    let mut zakura = ZakuraConfig {
+        bootstrap_peers: vec![old],
+        ..ZakuraConfig::default()
+    };
+
+    replace_retired_seed_ids(Some(&path), &mut zakura);
+
+    assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    assert_eq!(zakura.bootstrap_peers, vec![new]);
+}

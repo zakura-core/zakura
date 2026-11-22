@@ -37,7 +37,7 @@ pub(crate) fn replace_retired_seed_ids(config_path: Option<&Path>, zakura: &mut 
                 ?backup,
                 ?replaced,
                 "rewrote zakura.bootstrap_peers in the config file with the default seeds' \
-                 current node IDs; the original is in the backup"
+                 current node IDs; the backup holds the file as it was before its first rewrite"
             );
             replaced
         }
@@ -103,10 +103,10 @@ enum RewriteError {
 /// Replaces default seeds' retired node IDs in the config file that the loader reads for
 /// `path`, changing only the characters of each replaced ID.
 ///
-/// A read-only file is left alone. Before writing, the original is copied to
-/// `<file>.pre-pq-seed-ids.bak`, unless that copy already exists. The new contents
-/// replace the file in one rename and keep its permissions and owner, so a crash leaves
-/// either the old or the new file. A symlink is followed and kept.
+/// A read-only file is left alone. Before the first rewrite, the original is saved as
+/// `<file>.pre-pq-seed-ids.bak`. The new contents replace the file in one rename and keep
+/// its permissions and, on Unix, its owner, so a crash leaves either the old or the new
+/// file. A symlinked config is followed and kept.
 fn rewrite_config_file(path: &Path) -> Result<RewriteOutcome, RewriteError> {
     let io_error = |path: &Path| {
         let path = path.to_path_buf();
@@ -117,14 +117,9 @@ fn rewrite_config_file(path: &Path) -> Result<RewriteOutcome, RewriteError> {
     let path = fs::canonicalize(&path).map_err(io_error(&path))?;
     let metadata = fs::metadata(&path).map_err(io_error(&path))?;
     let original = fs::read_to_string(&path).map_err(io_error(&path))?;
-    // The loader accepts a UTF-8 byte order mark, which TOML parsers reject.
-    let (bom, original) = match original.strip_prefix('\u{feff}') {
-        Some(rest) => ("\u{feff}", rest),
-        None => ("", original.as_str()),
-    };
 
     let (rewritten, replaced) =
-        replace_in_text(original).map_err(|source| RewriteError::Parse {
+        replace_in_text(&original).map_err(|source| RewriteError::Parse {
             path: path.clone(),
             source,
         })?;
@@ -134,16 +129,17 @@ fn rewrite_config_file(path: &Path) -> Result<RewriteOutcome, RewriteError> {
     if metadata.permissions().readonly() {
         return Err(RewriteError::ReadOnly { path });
     }
-    if !loads_as_original_with_ids_replaced(original, &rewritten) {
+    if !loads_as_original_with_ids_replaced(&original, &rewritten) {
         return Err(RewriteError::Unverified { path });
     }
 
     let backup = with_suffix(&path, BACKUP_SUFFIX);
-    let created_backup = !backup.exists();
+    // Anything at the backup path, even a dangling symlink, is an earlier backup.
+    let created_backup = fs::symlink_metadata(&backup).is_err();
     if created_backup {
-        fs::copy(&path, &backup).map_err(io_error(&backup))?;
+        replace_file(&backup, original.as_bytes(), &metadata).map_err(io_error(&backup))?;
     }
-    if let Err(error) = replace_file(&path, format!("{bom}{rewritten}").as_bytes(), &metadata) {
+    if let Err(error) = replace_file(&path, rewritten.as_bytes(), &metadata) {
         // A backup of a file that was never rewritten would only mislead.
         if created_backup {
             let _ = fs::remove_file(&backup);
@@ -186,7 +182,9 @@ fn replace_in_text(text: &str) -> Result<(String, Vec<(String, String)>), toml::
         let Some(current) = replace_retired_seed_node_id(entry) else {
             continue;
         };
-        let literal = literal_with_id_replaced(&text[peer.span()], entry, &current);
+        let Some(literal) = literal_with_id_replaced(&text[peer.span()], entry, &current) else {
+            continue;
+        };
         edits.push((peer.span(), literal));
         replaced.push((entry.to_string(), current));
     }
@@ -199,18 +197,15 @@ fn replace_in_text(text: &str) -> Result<(String, Vec<(String, String)>), toml::
     Ok((rewritten, replaced))
 }
 
-/// Returns the TOML string `literal`, whose value is `entry`, holding `current` instead.
+/// Returns the TOML string `literal`, whose value is `entry`, with the node ID swapped for
+/// the one in `current`, keeping the literal's quoting.
 ///
-/// The ID is swapped inside the literal as written, so its quoting stays. A literal that
-/// does not spell the ID exactly once, such as one using escapes, is written plainly.
-fn literal_with_id_replaced(literal: &str, entry: &str, current: &str) -> String {
+/// Returns `None` when the literal does not spell the ID exactly once, such as when it uses
+/// escapes. That entry is then left for the operator, and the startup warning names it.
+fn literal_with_id_replaced(literal: &str, entry: &str, current: &str) -> Option<String> {
     let id = |entry: &str| entry.split_once('@').map_or(entry, |(id, _)| id).to_owned();
     let (entry_id, current_id) = (id(entry), id(current));
-    if literal.matches(&entry_id).count() == 1 {
-        literal.replacen(&entry_id, &current_id, 1)
-    } else {
-        format!("{current:?}")
-    }
+    (literal.matches(&entry_id).count() == 1).then(|| literal.replacen(&entry_id, &current_id, 1))
 }
 
 /// Returns whether `rewritten` parses, with the parser the config loader uses, to exactly
@@ -238,16 +233,15 @@ fn loads_as_original_with_ids_replaced(original: &str, rewritten: &str) -> bool 
     expected == rewritten
 }
 
-/// Writes `contents` to a sibling of `path` with the permissions and owner in `metadata`,
-/// then renames it over `path`. Fails rather than change the file's owner.
+/// Writes `contents` to a new sibling of `path` with the permissions and, on Unix, the
+/// owner in `metadata`, then renames it over `path`. Fails rather than change the owner.
 fn replace_file(path: &Path, contents: &[u8], metadata: &fs::Metadata) -> io::Result<()> {
-    // A per-process name, so two processes sharing a config cannot interleave writes.
     let temp = with_suffix(path, &format!(".tmp.{}", std::process::id()));
     let write = || -> io::Result<()> {
+        // A new file only: an existing path, even a symlink someone else made, fails.
         let mut file = fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .open(&temp)?;
         file.set_permissions(metadata.permissions())?;
         #[cfg(unix)]
@@ -257,6 +251,7 @@ fn replace_file(path: &Path, contents: &[u8], metadata: &fs::Metadata) -> io::Re
         }
         file.write_all(contents)?;
         file.sync_all()?;
+        drop(file);
         fs::rename(&temp, path)
     };
     write().inspect_err(|_| {

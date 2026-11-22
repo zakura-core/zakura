@@ -316,9 +316,9 @@ pub struct ZakuraConfig {
     /// are disabled for Zakura v1. Each entry must contain the peer's 32-byte
     /// node id and a directly reachable socket address.
     ///
-    /// An entry that names a default seed by the node ID it had before
-    /// p2p-v2/4 is switched to the seed's current ID when the node starts,
-    /// see [`replace_retired_seed_node_ids`](Self::replace_retired_seed_node_ids).
+    /// An entry can still name a default seed by the node ID it had before
+    /// p2p-v2/4, which [`replace_retired_seed_node_ids`](Self::replace_retired_seed_node_ids)
+    /// switches to the seed's current ID.
     pub bootstrap_peers: Vec<String>,
     /// Address the native Zakura QUIC endpoint binds to.
     ///

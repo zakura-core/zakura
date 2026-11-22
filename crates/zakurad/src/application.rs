@@ -381,12 +381,13 @@ fn start(command: &EntryPoint) -> Result<(Arc<ZakuradConfig>, Tracing), Report> 
     if is_server {
         info!("{metadata_section}");
 
-        if let Some(config_path) = command.config_path() {
+        let config_path = command.config_path();
+        if let Some(config_path) = &config_path {
             info!("Using config file at: {:?}", config_path);
         } else {
             info!("No config file provided, using default configuration");
         }
-        replace_retired_seed_ids(command.config_path().as_deref(), &mut config.network.zakura);
+        replace_retired_seed_ids(config_path.as_deref(), &mut config.network.zakura);
 
         // Log only selected diagnostics. The full config can contain credentials.
         info!(

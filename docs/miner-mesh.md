@@ -72,10 +72,8 @@ A held place is a connection slot that only a preferred gateway may use:
 A held place grants nothing else: once connected, a preferred gateway is
 treated like any other peer.
 
-The places come out of the quarter of `network.zakura.max_connections` kept for
-the node's own dials, after the places kept for bootstrap peers, so the hold
-never shrinks the share of slots inbound peers may take. With the default limit
-the node holds up to ten places.
+The peer memory budget funds up to ten additional gateway places above the ordinary
+connection limit. Ordinary inbound and outbound peers keep their existing capacity.
 
 ## `getminermeshinfo`
 
@@ -85,8 +83,7 @@ served on the admin listener, on a primary listener with cookie
 authentication, on Regtest, and with `rpc.allow_unauthenticated_admin`, but
 not on the restricted unauthenticated listener. It reports what the node
 counts, the places it holds, and its v2 peers. In this example the node has
-40 connection slots. Of the ten set aside for dials, nine are kept for
-bootstrap peers, leaving one place for a preferred gateway.
+40 funded connection slots in total, with one place currently held for a preferred gateway.
 
 ```json
 {
@@ -132,7 +129,7 @@ bootstrap peers, leaving one place for a preferred gateway.
 | `gateways[].state` | See below. |
 | `gateways[].connected` | The gateway is a v2 peer now. |
 | `hold` | The connection places held for preferred gateways. |
-| `slots` | How connection slots are used, or null without v2 networking. `in_use` is `preferred` plus `ordinary`; `preferred` counts one slot per preferred gateway connected; `inbound` counts slots of connections the remote node opened. |
+| `slots` | How connection slots are used, or null without v2 networking. `limit` includes all funded ordinary and gateway places. `in_use` is `preferred` plus `ordinary`; `preferred` counts one slot per preferred gateway connected; `inbound` counts slots of connections the remote node opened. |
 | `peers` | Every v2 peer connected now, ordered by node ID, at most the connection limit. A peer connected both ways counts as inbound. |
 
 A gateway's `state` reads its standing in v2 networking together with the

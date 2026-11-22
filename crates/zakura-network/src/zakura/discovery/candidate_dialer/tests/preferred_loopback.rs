@@ -267,7 +267,7 @@ async fn connection_places_report_the_ranking_and_the_peers() {
             },
         ],
         hold: 1,
-        slot_limit: MAX_CONNECTIONS,
+        slot_limit: dialer_node.limits().total_connections(),
         slots: SlotSplit {
             preferred: 1,
             ordinary: 0,

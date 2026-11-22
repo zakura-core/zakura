@@ -1981,13 +1981,14 @@ Nothing showed which key exchange or signature a node's handshakes used, so
 a node that fell back to classical cryptography, or a test network that
 never reached the post-quantum code, looked the same as one that did. Two
 counters now record each at the point it happens, and the Regtest end-to-end
-run asserts them on every node that speaks P2P v2.
+run asserts them on every node that speaks P2P v2 (the node that upgrades
+from the legacy protocol when its upgrade is required or live).
 
 Changed:
 
 - **OBS-1.** Adds `zakura.quic.tls.key_exchange`, labelled `group`, counted
-  when the hybrid group or its X25519 half completes an exchange in either
-  role, and `zakura.quic.tls.signature_verified`, labelled `scheme`, counted
+  when the hybrid group completes an exchange in either role, or the
+  dialer's X25519 half does on its fallback path, and `zakura.quic.tls.signature_verified`, labelled `scheme`, counted
   when a peer's composite handshake signature verifies. Refused exchanges
   and signatures aren't counted; `zakura.quic.handshake.failed` covers them.
 - **OBS-2.** States that a label value comes from this node's own fixed set,

@@ -338,6 +338,35 @@ async fn assert_segmented_listener_access(allow_unauthenticated_admin: bool) {
     assert!(admin_methods.contains("reconsiderblock"));
     assert!(admin_methods.contains("preciousblock"));
 
+    assert_eq!(
+        primary_methods.contains("getminermeshinfo"),
+        allow_unauthenticated_admin
+    );
+    assert!(admin_methods.contains("getminermeshinfo"));
+    for (address, auth, allowed) in [
+        (primary_addr, None, allow_unauthenticated_admin),
+        (admin_addr, Some(authorization.as_str()), true),
+    ] {
+        let (status, body) = post(
+            address,
+            r#"{"jsonrpc":"2.0","method":"getminermeshinfo","id":10}"#,
+            auth,
+        )
+        .await
+        .expect("the miner mesh request should complete");
+        assert!(status.is_success());
+        let reply: serde_json::Value = serde_json::from_str(&body).expect("JSON-RPC reply");
+        if allowed {
+            serde_json::from_value::<crate::client::GetMinerMeshInfoResponse>(
+                reply["result"].clone(),
+            )
+            .expect("an admin listener returns the miner mesh report");
+        } else {
+            assert_eq!(reply["error"]["code"], -32601);
+            assert!(reply.get("result").is_none());
+        }
+    }
+
     let admin_call = post(
         admin_addr,
         r#"{"jsonrpc":"2.0","method":"invalidateblock","params":["00"],"id":5}"#,

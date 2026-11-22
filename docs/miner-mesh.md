@@ -50,9 +50,10 @@ its counts after a reorg.
 
 While its tip is recent enough to mine on, the node hands the counts to v2
 networking, which ranks the gateways by block count and keeps up to ten
-connection places for the highest-ranked gateways it can reach. A node that is
-not synced, or does not mine, holds no places, and its connection limits are
-the same as without the miner mesh.
+connection places for the highest-ranked gateways it can reach. When the tracker
+next checks a stale tip, it publishes an empty ranking. Networking releases
+the held places when it applies that update. A node without a miner address
+holds no places.
 
 ### What a held place grants
 
@@ -119,13 +120,13 @@ counts, the places it holds, and its v2 peers:
 | `node_id` | This node's v2 node ID in hex, or null without v2 networking. |
 | `announcing` | The coinbases this node builds name its gateway. |
 | `mining` | The node has a miner address. |
-| `synced` | The tip is recent enough to prefer gateways. Always true on test networks. |
+| `synced` | The tip is recent enough to prefer gateways when this request is served. Always true on test networks. |
 | `window` | The counted heights, or null on a node that does not mine. |
 | `window.tip` | The best tip height the counts follow. |
 | `window.newest`, `window.oldest` | The heights that count, or null while the tip is below 100. |
 | `window.checked` | Heights in the window read so far. |
 | `window.coverage` | The share of the window read, from 0 to 1. Below 1 the counts are a lower bound, as on a pruned node. A tip below 100 has an empty window, which reports 1. |
-| `gateways` | The gateways v2 networking ranks, best first, at most 256. Empty unless the node mines and is synced. This node's own ID, and IDs that are not valid node IDs, are left out. |
+| `gateways` | The last ranking applied by v2 networking, best first, at most 256 gateways. This node's own ID, and IDs that are not valid node IDs, are left out. |
 | `gateways[].state` | See below. |
 | `gateways[].connected` | The gateway is a v2 peer now. |
 | `hold` | The connection places held for preferred gateways. |
@@ -142,8 +143,9 @@ preferred set:
 | `backoff` | Known, but waiting out a failed dial or a lost connection. It still counts towards the hold, so a place may stay reserved for it. |
 | `unmatched` | v2 networking has no record of it: it is not connected and discovery has no address for it, so it takes no place. Gateways are usually learned through v2 peer exchange. |
 
-The `gateways`, `hold` and `slots` fields come from the set the node formed on
-its last dial round, about once a second, and change in between when a
-gateway connects in or loses its last connection. The peers are read just
-before the slots, so a connection that opens or closes in between can show in
-one and not the other.
+On Mainnet, `synced` can turn false while `gateways` and `hold` still show the
+previous ranking. The tracker rechecks tip freshness on progress and at
+one-minute intervals while idle. Networking applies the ranking on its next
+dial round and adjusts places as gateways connect and disconnect. Peers are read
+just before slots, so a connection opening or closing between the two reads
+can appear in only one of them.

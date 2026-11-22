@@ -63,8 +63,8 @@ pub struct GetMinerMeshInfoResponse {
     /// because it does not mine.
     pub window: Option<MeshWindow>,
 
-    /// The gateways v2 networking ranks, best first, at most 256. Empty
-    /// unless the node mines and is synced.
+    /// The last ranking applied by v2 networking, best first, at most 256.
+    /// It can briefly reflect an earlier tip freshness decision than `synced`.
     pub gateways: Vec<MeshGateway>,
 
     /// The connection places held for preferred gateways.

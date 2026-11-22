@@ -298,6 +298,8 @@ pub(super) const PARAM_VERBOSITY_DESC: &str = "Whether to include verbose output
 pub(super) const PARAM_N_DESC: &str = "The output index in the transaction.";
 pub(super) const PARAM_INCLUDE_MEMPOOL_DESC: &str =
     "Whether to include mempool transactions in the response.";
+pub(super) const RESULT_GETMINERMESHINFO_DESC: &str =
+    "The node's miner mesh window, ranked gateways, connection slots, and registered peers.";
 pub(super) const RESULT_PRECIOUSBLOCK_DESC: &str =
     "Always null. Errors are returned as JSON-RPC errors.";
 
@@ -851,6 +853,9 @@ pub trait RpcServer {
     /// held place, `standby` when it is reachable but ranked below those,
     /// `backoff` when it is known but waiting out a failed dial or a lost
     /// connection, and `unmatched` when v2 networking has no address for it.
+    ///
+    /// `synced` is evaluated at request time. The ranking and held places reflect
+    /// the last update applied by networking and can lag a change in tip freshness.
     ///
     /// `window` is null on a node that does not mine, and `slots` is null on
     /// a node that runs no v2 networking.

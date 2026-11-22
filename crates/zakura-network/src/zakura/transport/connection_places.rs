@@ -11,9 +11,8 @@ use super::{GatewayPlace, HandshakeCounts, SlotSplit};
 /// the v2 peers connected now.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ConnectionPlaces {
-    /// Every ranked gateway, in rank order, at most 256. Empty while the
-    /// node has no ranking, which is always the case unless it mines and is
-    /// synced.
+    /// Every ranked gateway, in rank order, at most 256. Reflects the last
+    /// ranking applied by networking.
     pub gateways: Vec<PlacedGateway>,
     /// The connection places held for the preferred set.
     pub hold: usize,

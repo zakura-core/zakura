@@ -448,7 +448,13 @@ impl QuicEndpoint {
     /// make them spin on `ConnectionLimit`. A dial needs one slot per address
     /// it tries, so a multi-address dial can still fail with that error.
     pub fn has_dial_capacity(&self) -> bool {
-        self.inner.shared.connections.can_dial()
+        self.dial_capacity() > 0
+    }
+
+    /// How many address attempts a bootstrap or maintained dial can reserve
+    /// now under the whole table's cap (see [`Self::has_dial_capacity`]).
+    pub fn dial_capacity(&self) -> usize {
+        self.inner.shared.connections.dial_room()
     }
 
     /// Whether discovery can reserve an address attempt under its ceiling,
@@ -1349,9 +1355,12 @@ impl ConnectionSlots {
             .saturating_sub(held.live)
     }
 
-    /// Whether a dial attempt would get a slot right now.
-    pub(crate) fn can_dial(&self) -> bool {
-        self.live() < self.max
+    /// Address attempts a dial under the whole table's cap could reserve
+    /// right now.
+    pub(crate) fn dial_room(&self) -> usize {
+        let held = self.held();
+        self.limit(DialCeiling::Whole, held)
+            .saturating_sub(held.live)
     }
 
     /// Claims a live slot for an inbound attempt, or `None` when inbound

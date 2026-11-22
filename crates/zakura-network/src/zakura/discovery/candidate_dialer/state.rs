@@ -36,7 +36,7 @@ pub(super) const MAX_DIAL_BACKOFF_ENTRIES: usize = 1 << 15;
 /// The runtime join owner attaches this key to completion, panic, and cancellation.
 /// Settlement releases exactly the IPs this attempt reserved.
 /// A later attempt to the same node gets a new key, so a duplicate completion cannot settle it.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
 pub(super) struct DialAttemptKey {
     /// The dialed node.
     pub(super) node_id: NodeId,

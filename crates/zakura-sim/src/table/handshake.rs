@@ -217,7 +217,7 @@ pub fn properties<S: HasView>() -> Vec<Property<S>> {
     }
     properties.push(Property {
         id: PropertyId::new("handshake/dial-reserve-kept"),
-        claim: "Inbound load preserves each dial reserve and cannot refuse a dial within that reserve.",
+        claim: "Inbound load outside the places held for preferred gateways preserves each dial reserve and cannot refuse a dial within that reserve.",
         kind: Kind::Safety,
         assumes: &[],
         needs: &[Source::Closes],
@@ -856,7 +856,7 @@ fn admission_reached(property: &PropertyId, log: &crate::ObservationLog) -> bool
                     inbound,
                     cap,
                     connections,
-                    inbound_connections,
+                    ordinary_inbound_connections,
                     connection_cap,
                     ..
                 },
@@ -881,7 +881,8 @@ fn admission_reached(property: &PropertyId, log: &crate::ObservationLog) -> bool
             "handshake/dial-reserve-kept" => {
                 (*cap > 0 && *inbound >= cap - reserve(*cap))
                     || (*connection_cap > 0
-                        && *inbound_connections >= connection_cap - reserve(*connection_cap))
+                        && *ordinary_inbound_connections
+                            >= connection_cap - reserve(*connection_cap))
             }
             _ => false,
         }
@@ -898,6 +899,7 @@ fn check_counts<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
                     inbound_connections,
                     node_connections,
                     inbound_node_connections,
+                    ordinary_inbound_connections,
                     connection_cap,
                     pending,
                     inbound,
@@ -931,6 +933,7 @@ fn check_counts<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
             "handshake/counts-match-permits"
                 if connections != node_connections
                     || inbound_connections != inbound_node_connections
+                    || ordinary_inbound_connections != inbound_connections
                     || !wire_connection_counts_fit(
                         *connections,
                         *inbound_connections,
@@ -1034,6 +1037,7 @@ fn check_reserve<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
             TransportFact::HandshakeCounts {
                 connections,
                 inbound_connections,
+                ordinary_inbound_connections,
                 connection_cap,
                 gateway_capacity,
                 inbound,
@@ -1054,7 +1058,7 @@ fn check_reserve<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
                     || quic_inbound > quic_below_reserve
                 {
                     return cx.violated("inbound charges leave the connection, QUIC, and handshake reserves",
-                        format!("connections {inbound_connections}/{connection_cap}; pending {inbound}/{cap}; QUIC {quic_inbound}/{quic_max_inbound}, inbound ceiling {quic_below_reserve}"));
+                        format!("ordinary inbound connections {ordinary_inbound_connections}/{connection_cap}; pending {inbound}/{cap}; QUIC {quic_inbound}/{quic_max_inbound}, inbound ceiling {quic_below_reserve}"));
                 }
             }
             TransportFact::DialFailed { error } => {

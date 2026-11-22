@@ -67,8 +67,8 @@ use super::transport::{
     worker_framed_channel, AdmittedFrame, CloseOutcome, CloseRow, CompatResponseGrant,
     ConnectionResources, FrameGate, FrameGrant, FramedWorkerRecv, HandshakeCounts, HeldPlaces,
     IpAdmission, NeutralCause, NodeResources, OrderedStreamFailure, OrderedStreamFailureCause,
-    OwnerBound, OwnerGuard, OwnerPhase, ReactorBudget, ReactorShares, ResourceEnvelope,
-    SessionLayout, SlotClass, SlotRefusal, StreamResources, TransportLimits,
+    OwnerBound, OwnerGuard, OwnerPhase, PreferredGateways, ReactorBudget, ReactorShares,
+    ResourceEnvelope, SessionLayout, SlotClass, SlotRefusal, StreamResources, TransportLimits,
     COMPAT_EXCHANGE_BUDGET, COMPAT_RESPONSE_MAX_AGGREGATE_BYTES,
 };
 #[cfg(any(test, feature = "zakura-testkit"))]
@@ -1385,6 +1385,22 @@ impl ZakuraEndpoint {
             .held_places()
     }
 
+    /// Hands `preferred` to the connection-slot checks, then records the
+    /// hold and the slots in use, split by the new set, in the
+    /// `zakura.p2p.conn.slots.*` gauges.
+    pub(crate) fn publish_preferred_gateways(&self, preferred: PreferredGateways) {
+        let hold = preferred.hold();
+        let mut counts = self.handler.supervisor.ip_slots.counts();
+        counts.publish_preferred_gateways(preferred);
+        let split = counts.slot_split();
+        drop(counts);
+        // Slot counts are bounded by `max_connections`, far below 2^52, so
+        // the gauges hold them exactly.
+        metrics::gauge!("zakura.p2p.conn.slots.hold").set(hold as f64);
+        metrics::gauge!("zakura.p2p.conn.slots.preferred").set(split.preferred as f64);
+        metrics::gauge!("zakura.p2p.conn.slots.ordinary").set(split.ordinary as f64);
+    }
+
     /// How many dials discovery can start now: the handler's free ordinary
     /// connection slots, which leave the places held for preferred gateways.
     /// Each dial holds one slot from its start, or fails as a local limit
@@ -1393,14 +1409,38 @@ impl ZakuraEndpoint {
         self.handler.free_connection_slots()
     }
 
-    /// Holds `count` of the handler's connection slots, as dials to
-    /// unrelated nodes, until the returned guards drop.
+    /// How many dials to preferred gateways can start now: every free
+    /// connection slot, since a member that holds no slot takes a held
+    /// place.
+    pub(crate) fn preferred_dial_permits(&self) -> usize {
+        self.handler
+            .limits
+            .max_connections
+            .saturating_sub(self.handler.supervisor.ip_slots.counts().connections())
+    }
+
+    /// How many address attempts dials to preferred gateways can start now:
+    /// none without a free connection slot, otherwise the transport's room
+    /// under its whole-table cap, which maintained dials use.
+    pub(crate) fn preferred_dial_capacity(&self) -> usize {
+        if self.preferred_dial_permits() == 0 {
+            return 0;
+        }
+        self.quic.dial_capacity()
+    }
+
+    /// Holds `count` of the handler's connection slots, as connections with
+    /// unrelated nodes, inbound or dialed, until the returned guards drop.
     #[cfg(test)]
-    pub(crate) fn hold_connection_slots(&self, count: usize) -> Vec<ConnectionAdmissionGuard> {
+    pub(crate) fn hold_connection_slots(
+        &self,
+        count: usize,
+        inbound: bool,
+    ) -> Vec<ConnectionAdmissionGuard> {
         (0..count)
             .map(|_| {
                 self.handler
-                    .claim_connection(NodeSecretKey::generate().public(), false)
+                    .claim_connection(NodeSecretKey::generate().public(), inbound)
                     .expect("the test holds free connection slots")
             })
             .collect()
@@ -5664,16 +5704,21 @@ pub async fn spawn_zakura_endpoint_with_services(
         header_sync_driver_startup,
         custom_services,
         None,
+        None,
     )
     .await
 }
 
+/// Starts the endpoint with the legacy stack's `peer_registry`. The discovery
+/// dialer prefers the mining gateways `miner_gateways` ranks, or none without
+/// it.
 pub(crate) async fn spawn_zakura_endpoint_with_peer_registry(
     config: &Config,
     sink_factory: impl FnOnce(ZakuraSupervisorHandle, ZakuraTrace) -> Arc<dyn Service> + Send + 'static,
     header_sync_driver_startup: Option<ZakuraHeaderSyncDriverStartup>,
     custom_services: Vec<CustomService>,
     peer_registry: PeerRegistry,
+    miner_gateways: Option<watch::Receiver<super::MinerGatewayRanking>>,
 ) -> Result<Option<ZakuraEndpoint>, BoxError> {
     spawn_zakura_endpoint_inner(
         config,
@@ -5681,6 +5726,7 @@ pub(crate) async fn spawn_zakura_endpoint_with_peer_registry(
         header_sync_driver_startup,
         custom_services,
         Some(peer_registry),
+        miner_gateways,
     )
     .await
 }
@@ -5693,6 +5739,7 @@ async fn spawn_zakura_endpoint_inner(
     header_sync_driver_startup: Option<ZakuraHeaderSyncDriverStartup>,
     custom_services: Vec<CustomService>,
     peer_registry: Option<PeerRegistry>,
+    miner_gateways: Option<watch::Receiver<super::MinerGatewayRanking>>,
 ) -> Result<Option<ZakuraEndpoint>, BoxError> {
     if !config.v2_p2p() {
         return Ok(None);
@@ -6117,6 +6164,7 @@ async fn spawn_zakura_endpoint_inner(
         discovery,
         limits,
         sought_services,
+        miner_gateways,
     );
     endpoint.push_header_sync_task(discovery_dialer).await;
     startup_shutdown.disarm();
@@ -10701,6 +10749,7 @@ mod tests {
             discovery,
             limits,
             Vec::new(),
+            None,
         );
 
         tokio::time::sleep(Duration::from_millis(50)).await;

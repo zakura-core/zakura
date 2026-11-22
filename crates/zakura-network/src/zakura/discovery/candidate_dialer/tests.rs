@@ -14,7 +14,13 @@ use super::replay::*;
 use super::state::{classify_dial, DialFinish, DialObservation, PeerRegistration};
 use super::state::{CandidateAddress, CandidateDialerState, MAX_DIAL_BACKOFF_ENTRIES};
 use super::*;
-use crate::zakura::{canonical_ip, machine_test::machine_target_tests};
+use crate::zakura::{
+    canonical_ip, discovery::DEFAULT_MAX_CONCURRENT_DISCOVERY_DIALS,
+    machine_test::machine_target_tests,
+};
+
+mod preferred_loopback;
+mod preferred_round;
 
 const DIAL_BACKOFF: (Duration, Duration) = (Duration::from_secs(60), Duration::from_secs(3_600));
 
@@ -422,15 +428,19 @@ async fn success_clears_backoff_only_for_the_admitted_ip() {
 
 /// A dial of one node fails and its completion repeats. Three seconds later a
 /// round opens and the node's next dial hits a local limit, which holds the
-/// next round for one dial interval.
+/// next round for one dial interval. Then a ranking holds two places, for the
+/// first two nodes. The preferred pass dials the second at once and defers
+/// the first, whose ID is below this node's; a ranking five seconds later
+/// dials it.
 const WITNESS: &[u8] = &[
-    2, 7, 0, 3, 0, 3, 4, 0, 3, 0, 30, 0, 1, 0, 0, 2, 7, 0, 3, 0, 5, 1, 0, 0, 0, 10, 0, 1, 0, 0,
+    2, 7, 0, 3, 0, 3, 4, 0, 3, 0, 30, 0, 1, 0, 0, 2, 7, 0, 3, 0, 5, 1, 0, 0, 0, 10, 0, 1, 0, 0, 11,
+    35, 56, 0, 50, 0, 11, 35, 56,
 ];
 
 machine_target_tests! {
     replay: replay_candidate_dial_bytes,
     target: "discovery_candidate",
-    decoder: 1,
+    decoder: 2,
     witness: WITNESS => CandidateDialReplaySummary {
         attempts: 2,
         completions: 2,
@@ -438,6 +448,8 @@ machine_target_tests! {
         local_limits: 1,
         failures: 1,
         rounds: 3,
+        rankings: 2,
+        preferred_dials: 2,
     },
 }
 
@@ -686,6 +698,11 @@ async fn shutdown_joins_started_and_unpolled_workers_before_discarding_reservati
         discovery: node.discovery(),
         limits: node.limits().clone(),
         sought_services: Vec::new(),
+        preferred: PreferredGatewayInput::new(None, node.endpoint().local_node_id()),
+        deferred: DeferredDials::new(node.endpoint().local_node_id()),
+        preferred_hold_limit: 0,
+        max_concurrent_dials: DEFAULT_MAX_CONCURRENT_DISCOVERY_DIALS,
+        preferred_attempts: HashSet::default(),
         trace: node.endpoint().trace(),
         workers: FuturesUnordered::new(),
     };
@@ -757,6 +774,7 @@ async fn cancelled_worker_releases_its_real_quic_dial_capacity() {
                     NodeAddr::with_addrs(target, [silent.local_addr().unwrap()]),
                     limits.clone(),
                     attempt,
+                    NativeDialKind::Discovery,
                 ),
             );
             let mut packet = [0; 2048];
@@ -1041,10 +1059,11 @@ async fn dial_keeps_the_first_address_of_each_ip() {
         is_static: false,
     };
 
+    let supervisor = node.supervisor();
     let (node_addr, reserved_ips) = discovery_node_addr_with_reserved_ip_capacity(
-        &node.supervisor(),
         &CandidateDialerState::new((Duration::from_secs(60), Duration::from_secs(3_600))),
         &candidate,
+        |ip, in_flight| supervisor.can_accept_remote_ip_with_in_flight(ip, in_flight),
         Instant::now(),
     )
     .expect("both IPs have capacity");
@@ -1113,6 +1132,7 @@ async fn honest_candidates_fill_the_round_when_the_best_share_a_full_ip() {
         &node.discovery(),
         &[],
         &mut state,
+        RoundClaims::default(),
         Instant::now(),
     )
     .await;
@@ -1192,6 +1212,7 @@ async fn a_candidate_larger_than_the_free_slots_yields_to_one_that_fits() {
         &node.discovery(),
         &[],
         &mut state,
+        RoundClaims::default(),
         Instant::now(),
     )
     .await;
@@ -1275,6 +1296,7 @@ async fn a_round_counts_down_one_free_slot_per_admitted_address() {
         &node.discovery(),
         &[],
         &mut state,
+        RoundClaims::default(),
         Instant::now(),
     )
     .await;
@@ -1418,7 +1440,7 @@ async fn a_round_admits_no_more_dials_than_free_admission_permits() {
         .expect("dialer spawns");
     let endpoint = node.endpoint();
     let permits = endpoint.discovery_dial_permits();
-    let held = endpoint.hold_connection_slots(permits - 1);
+    let held = endpoint.hold_connection_slots(permits - 1, false);
     assert_eq!(endpoint.discovery_dial_permits(), 1);
     assert!(
         endpoint.discovery_admission_capacity() >= 3,
@@ -1440,6 +1462,7 @@ async fn a_round_admits_no_more_dials_than_free_admission_permits() {
         &node.discovery(),
         &[],
         &mut state,
+        RoundClaims::default(),
         Instant::now(),
     )
     .await;
@@ -1470,6 +1493,11 @@ async fn finished_workers_settle_before_the_round_starts() {
         discovery: node.discovery(),
         limits: ZakuraLocalLimits::from_config(&crate::Config::default()),
         sought_services: Vec::new(),
+        preferred: PreferredGatewayInput::new(None, node.endpoint().local_node_id()),
+        deferred: DeferredDials::new(node.endpoint().local_node_id()),
+        preferred_hold_limit: 0,
+        max_concurrent_dials: DEFAULT_MAX_CONCURRENT_DISCOVERY_DIALS,
+        preferred_attempts: HashSet::default(),
         trace: endpoint.trace(),
         workers: FuturesUnordered::new(),
     };
@@ -1604,15 +1632,19 @@ async fn a_failed_address_leaves_the_rest_of_its_slash_64_dialable() {
 #[tokio::test(start_paused = true)]
 async fn a_round_dials_every_ip_of_a_slash_64() {
     let addr = |ip: &str| SocketAddr::new(ip.parse().expect("test address parses"), 8233);
-    let supervisor = ZakuraSupervisorHandle::new(16);
+    let supervisor = crate::zakura::ZakuraSupervisorHandle::new(16);
     let state = CandidateDialerState::new(DIAL_BACKOFF);
     let record = candidate(
         node_id(1),
         vec![addr("2001:db8:a:b::1"), addr("2001:db8:a:b::2")],
     );
-    let (node_addr, reserved) =
-        discovery_node_addr_with_reserved_ip_capacity(&supervisor, &state, &record, Instant::now())
-            .expect("an empty supervisor accepts the host");
+    let (node_addr, reserved) = discovery_node_addr_with_reserved_ip_capacity(
+        &state,
+        &record,
+        |ip, in_flight| supervisor.can_accept_remote_ip_with_in_flight(ip, in_flight),
+        Instant::now(),
+    )
+    .expect("an empty supervisor accepts the host");
     assert_eq!(
         node_addr.direct.to_vec(),
         vec![addr("2001:db8:a:b::1"), addr("2001:db8:a:b::2")]
@@ -1646,6 +1678,11 @@ async fn every_dial_reservation_returns_to_baseline_after_each_exit() {
         discovery: node.discovery(),
         limits: node.limits().clone(),
         sought_services: Vec::new(),
+        preferred: PreferredGatewayInput::new(None, node.endpoint().local_node_id()),
+        deferred: DeferredDials::new(node.endpoint().local_node_id()),
+        preferred_hold_limit: 0,
+        max_concurrent_dials: DEFAULT_MAX_CONCURRENT_DISCOVERY_DIALS,
+        preferred_attempts: HashSet::default(),
         trace: node.endpoint().trace(),
         workers: FuturesUnordered::new(),
     };

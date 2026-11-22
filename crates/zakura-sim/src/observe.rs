@@ -2141,6 +2141,9 @@ pub enum TransportFact {
         node_connections: usize,
         /// Inbound connection slots summed over the machine's per-node record.
         inbound_node_connections: usize,
+        /// Inbound connection slots outside the preferred set's one place
+        /// per member, which the inbound share bounds.
+        ordinary_inbound_connections: usize,
         /// Ordinary connection capacity.
         connection_cap: usize,
         /// Additional memory-funded gateway places.

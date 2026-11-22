@@ -1,9 +1,11 @@
 //! X25519MLKEM768: the layout of its shares and secret, refused inputs, the
-//! plain X25519 fallback and interoperability with another implementation.
+//! plain X25519 fallback and agreement with another implementation's
+//! recorded answers.
 
 use curve25519_dalek::montgomery::MontgomeryPoint;
 use libcrux_ml_kem::mlkem768::{self, MlKem768PublicKey};
 use rustls::crypto::GetRandomFailed;
+use serde::Deserialize;
 
 use super::*;
 
@@ -45,6 +47,47 @@ const FIXED_BYTE: u8 = 0x42;
 
 static FIXED: Fixed = Fixed(FIXED_BYTE);
 static FAILING: Failing = Failing;
+
+/// X25519 whose every key pair has one fixed scalar, computed with
+/// curve25519-dalek, for known answers.
+#[derive(Debug)]
+struct FixedX25519([u8; 32]);
+
+impl SupportedKxGroup for FixedX25519 {
+    fn start(&self) -> Result<Box<dyn ActiveKeyExchange>, rustls::Error> {
+        let (scalar, public) = x25519_pair(self.0);
+        Ok(Box::new(FixedX25519Exchange { scalar, public }))
+    }
+
+    fn name(&self) -> NamedGroup {
+        NamedGroup::X25519
+    }
+}
+
+/// One [`FixedX25519`] exchange.
+struct FixedX25519Exchange {
+    scalar: [u8; 32],
+    public: [u8; 32],
+}
+
+impl ActiveKeyExchange for FixedX25519Exchange {
+    fn complete(self: Box<Self>, peer: &[u8]) -> Result<SharedSecret, rustls::Error> {
+        Ok(SharedSecret::from(&x25519_secret(self.scalar, peer)[..]))
+    }
+
+    fn pub_key(&self) -> &[u8] {
+        &self.public
+    }
+
+    fn group(&self) -> NamedGroup {
+        NamedGroup::X25519
+    }
+}
+
+/// The scalar [`FIXED_X25519`] uses.
+const X25519_SCALAR: [u8; 32] = [0x5a; 32];
+
+static FIXED_X25519: FixedX25519 = FixedX25519(X25519_SCALAR);
 
 /// ring's X25519, the production classical half.
 fn ring_x25519() -> &'static dyn SupportedKxGroup {
@@ -276,22 +319,61 @@ fn a_failed_random_source_fails_the_exchange() {
     );
 }
 
-/// Our group and graviola's independent X25519MLKEM768 agree on the secret
-/// in both directions, so the shares and the secret follow the standard
-/// layout and not only our own reading of it.
-///
-/// graviola refuses to run, with a panic, on a CPU without the features its
-/// assembly needs: AVX2, ADX and BMI1 on x86_64, and the AES, PMULL and SHA-2
-/// extensions on aarch64. Our own group has no such requirement.
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-#[test]
-fn the_group_interoperates_with_graviola() {
-    let ours = x25519_mlkem768();
-    let theirs = rustls_graviola::kx::X25519MLKEM768;
-    assert_eq!(theirs.name(), ours.name());
+/// Exchanges an independent X25519MLKEM768 implementation recorded with
+/// our group, one in each role. Shares and secrets are hex, and the file's
+/// `comment` says how they were recorded.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Recorded {
+    /// The group's TLS code point.
+    group: u16,
+    /// The independent implementation dialed, and `secret` is its dialer's.
+    they_dial: RecordedExchange,
+    /// The independent implementation listened, and `secret` is its
+    /// listener's.
+    they_listen: RecordedExchange,
+}
 
-    let (dialer, listener) = exchange(ours, theirs);
-    assert_eq!(dialer, listener);
-    let (dialer, listener) = exchange(theirs, ours);
-    assert_eq!(dialer, listener);
+/// One recorded exchange.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RecordedExchange {
+    #[serde(deserialize_with = "from_hex")]
+    dialer_share: Vec<u8>,
+    #[serde(deserialize_with = "from_hex")]
+    listener_share: Vec<u8>,
+    #[serde(deserialize_with = "from_hex")]
+    secret: Vec<u8>,
+}
+
+/// Decodes a hex string field.
+fn from_hex<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+    hex::decode(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+}
+
+/// Our group, fed the shares an independent implementation recorded, gives
+/// back the shares it answered with and the secrets it derived, in both
+/// roles. So the shares and the secret follow the standard layout and not
+/// only our own reading of it.
+///
+/// Our side is the production combiner and ML-KEM with every draw fixed, as
+/// when the answers were recorded. Its X25519 half is [`FixedX25519`],
+/// because ring's draws from the operating system.
+#[test]
+fn the_group_agrees_with_an_independent_implementation() {
+    let recorded: Recorded =
+        serde_json::from_str(include_str!("independent_answers.json")).unwrap();
+    let ours = X25519MlKem768::new(&FIXED_X25519, &FIXED);
+    assert_eq!(u16::from(ours.name()), recorded.group);
+
+    let they_dial = recorded.they_dial;
+    let answered = ours.start_and_complete(&they_dial.dialer_share).unwrap();
+    assert_eq!(answered.pub_key, they_dial.listener_share);
+    assert_eq!(answered.secret.secret_bytes(), they_dial.secret);
+
+    let they_listen = recorded.they_listen;
+    let dialer = ours.start().unwrap();
+    assert_eq!(dialer.pub_key(), they_listen.dialer_share);
+    let secret = dialer.complete(&they_listen.listener_share).unwrap();
+    assert_eq!(secret.secret_bytes(), they_listen.secret);
 }

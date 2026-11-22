@@ -126,9 +126,6 @@ quinn-proto = { version = "0.11.19", default-features = false, features = ["rust
 ripemd = "0.1"
 ring = "0.17.14"
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std"] }
-# Test-only: an independent X25519MLKEM768 that zakura-quic's own hybrid group
-# must interoperate with. Rust and assembly, no C.
-rustls-graviola = "0.4.0"
 rustls-pki-types = "1.12"
 # Zakura's fork of rocksdb 0.24.0 (https://github.com/zakura-core/rust-rocksdb-wrapper).
 # It compiles the bundled RocksDB C++ as a unity build, 16 sources per

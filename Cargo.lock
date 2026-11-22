@@ -907,16 +907,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 
 [[package]]
-name = "graviola"
-version = "0.4.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc0377ccc5ef095424121430046e475cf06658e23475b1af526655cfad0b86b2"
-dependencies = [
- "cfg-if",
- "getrandom 0.4.3",
-]
-
-[[package]]
 name = "group"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2053,16 +2043,6 @@ dependencies = [
  "rustls-webpki",
  "subtle",
  "zeroize",
-]
-
-[[package]]
-name = "rustls-graviola"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf5d0a370be690f7f1aa4e1b912fde3f5f9a5c53285062fd2d6ac1a52ab3e883"
-dependencies = [
- "graviola",
- "rustls",
 ]
 
 [[package]]
@@ -3542,7 +3522,6 @@ dependencies = [
  "quinn-proto",
  "ring",
  "rustls",
- "rustls-graviola",
  "rustls-pki-types",
  "serde",
  "serde_json",

@@ -69,10 +69,14 @@ chunked transfer encoding, a relay can receive all the block bytes and wait
 for a five-byte signal before submitting them for local validation and relay.
 
 1. Before mining, establish a TLS connection to each relay and send an ordinary
-   RPC request on it. Keep that socket available for submissions. Zakura waits
-   30 seconds for the next request's headers, including between requests. While
-   idle, use ordinary RPC traffic or send `getblockcount` every 15 seconds on
-   that same socket. Read each response fully and reconnect between solves if
+   RPC request on it. Keep that socket available for submissions. After a
+   successful HTTP response, Zakura waits up to 90 seconds for the next request
+   to start. The first request must deliver its
+   headers within 30 seconds of the TLS handshake. Later requests have
+   30 seconds to finish their headers once they start. While idle, use ordinary
+   RPC traffic or send `getblockcount` every 45 seconds on
+   that same socket (every 15 seconds for relays with the older 30-second
+   idle timeout). Read each response fully and reconnect between solves if
    the socket closes. Use a separate connection for long polls. A client pool
    can open another socket if the first is busy.
 2. At solve time, freeze the final serialized block. Its coinbase and ordered
@@ -106,7 +110,7 @@ solve, primary acceptance, last block-data write, release write (when used),
 first receipt at an observing peer, and final relay response. Identify the block
 and source path at the observer and account for clock differences across hosts.
 Compare solve-to-first-peer-receipt at similar block sizes. Check that a healthy
-warm path opens zero connections at solve time even after more than 30 seconds
+warm path opens zero connections at solve time even after more than 90 seconds
 between solves.
 
 ## Request and response

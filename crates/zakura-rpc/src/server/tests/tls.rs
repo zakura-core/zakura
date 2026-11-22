@@ -24,6 +24,8 @@ use super::super::{
 };
 use super::http_client::{tls_connector, tls_stream, HttpConnection};
 
+mod request_deadlines;
+
 // This self-signed localhost certificate and key are exclusively test fixtures.
 pub(super) const HANDSHAKE_CERT: &str = include_str!("handshake-cert.pem");
 const HANDSHAKE_KEY: &str = include_str!("handshake-key.pem");

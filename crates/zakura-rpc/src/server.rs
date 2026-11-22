@@ -20,7 +20,7 @@ use hyper::{
     Request, Response,
 };
 use hyper_util::{
-    rt::{TokioExecutor, TokioIo, TokioTimer},
+    rt::{TokioExecutor, TokioIo},
     server::conn::auto,
 };
 use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
@@ -69,6 +69,7 @@ pub mod rpc_logger;
 pub mod rpc_metrics;
 pub mod rpc_service;
 pub mod rpc_tracing;
+mod tls_request_timer;
 pub(crate) mod trusted_block;
 
 #[cfg(test)]
@@ -126,12 +127,11 @@ const TLS_CONNECTION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 /// handshakes.
 const MAX_TLS_CONNECTIONS: usize = 256;
 
-/// Time allowed for a TLS client to send each request's HTTP headers, measured
-/// from when the connection starts waiting for them.
-///
-/// This closes connections that are silent after the handshake or idle between
-/// keep-alive requests. It does not limit time spent handling a request.
+/// Time to receive the first complete HTTP request head after TLS, or to finish a started head.
 const TLS_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Time to start another request on a quiet TLS connection after a successful response.
+const TLS_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Maximum number of entries in a JSON-RPC batch, counting notifications and
 /// invalid entries.
@@ -633,25 +633,39 @@ where
 }
 
 /// Serves HTTP/1 requests on an established TLS connection until the client
-/// closes it, it exceeds `header_read_timeout`, or `stopped` resolves.
+/// closes it, a header or idle deadline expires, or `stopped` resolves.
 ///
 /// Unlike plain HTTP connections, these only support HTTP/1, and close
 /// connections whose request headers are too slow.
-async fn serve_tls_connection<S, B>(
-    stream: TlsStream<TcpStream>,
+async fn serve_tls_connection<S, B, T>(
+    stream: TlsStream<T>,
     service: S,
     stopped: impl Future<Output = ()>,
     header_read_timeout: Duration,
 ) -> Result<(), tower::BoxError>
 where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     S: hyper::service::Service<Request<Incoming>, Response = Response<B>> + Send + 'static,
     S::Future: Send,
     S::Error: Into<tower::BoxError>,
     B: Body<Data = Bytes> + Send + 'static,
     B::Error: Into<tower::BoxError>,
 {
+    let timer = tls_request_timer::RequestTimer::new(header_read_timeout, TLS_KEEP_ALIVE_TIMEOUT);
+    let stream = timer.observe_io(stream);
+    let response_timer = timer.clone();
+    let service = hyper::service::service_fn(move |request| {
+        // The trusted service takes ownership of the upload synchronously at header receipt.
+        let response = service.call(request);
+        let timer = response_timer.clone();
+        async move {
+            let response = response.await?;
+            timer.response(response.status());
+            Ok::<_, S::Error>(response)
+        }
+    });
     let connection = http1::Builder::new()
-        .timer(TokioTimer::new())
+        .timer(timer)
         .header_read_timeout(header_read_timeout)
         .serve_connection(TokioIo::new(stream), service);
     tokio::pin!(connection, stopped);

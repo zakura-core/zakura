@@ -258,12 +258,18 @@ impl Fixture {
         if let Some(max_open_streams) = max_open_streams {
             local.max_open_streams = max_open_streams;
         }
+        // The client's node ID sorts below the server's, so the client wins
+        // an open collision; the tests that hold credit rely on that.
         let server = LocalEndpointFactory::with_limits(&local)
-            .endpoint(93101)
-            .await?;
-        let client = LocalEndpointFactory::with_limits(&local)
             .endpoint(93102)
             .await?;
+        let client = LocalEndpointFactory::with_limits(&local)
+            .endpoint(93101)
+            .await?;
+        assert!(
+            client.local_id() < server.local_id(),
+            "the fixture's client must win open collisions"
+        );
         let (server_tx, server_sessions) = mpsc::channel(2);
         let (client_tx, client_sessions) = mpsc::channel(2);
         let (server_sibling_tx, server_siblings) = mpsc::channel(1);

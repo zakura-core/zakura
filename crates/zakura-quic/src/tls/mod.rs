@@ -136,7 +136,10 @@ impl TlsConfig {
 
     fn with_provider(secret_key: &NodeSecretKey, provider: rustls::crypto::CryptoProvider) -> Self {
         Self {
-            cert_resolver: Arc::new(resolver::ResolveRawPublicKeyCert::new(secret_key)),
+            cert_resolver: Arc::new(resolver::ResolveRawPublicKeyCert::new(
+                secret_key,
+                provider.secure_random,
+            )),
             client_verifier: Arc::new(verifier::ClientCertificateVerifier),
             provider: Arc::new(provider),
         }
@@ -623,11 +626,13 @@ mod tests {
     fn a_node_is_known_by_the_id_its_credential_derives() {
         let plain = NodeSecretKey::generate();
         let extended = NodeSecretKey::generate();
+        let own = |tag| {
+            let key = extended.credential().key(tag).unwrap().to_vec();
+            (tag, key)
+        };
         let credential = NodeCredential::from_entries([
-            (
-                crate::ED25519_KEY_TAG,
-                extended.public_key().as_bytes().to_vec(),
-            ),
+            own(crate::ED25519_KEY_TAG),
+            own(crate::ML_DSA_44_KEY_TAG),
             (0x0102, vec![0x5A; 1_312]),
         ])
         .unwrap();

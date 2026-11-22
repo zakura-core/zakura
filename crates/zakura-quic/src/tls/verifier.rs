@@ -6,9 +6,10 @@
 //! Two changes from Iroh. Iroh decoded the expected server identity from a
 //! synthetic server name; Zakura builds one verifier per dial that holds the
 //! expected [`NodeId`] in memory (TLS-6). And the raw public key is the
-//! node's credential, not a bare Ed25519 key (TLS-3), so both verifiers read
-//! it through [`super::credential_from_cert`] and check the signature with
-//! the credential's Ed25519 key themselves.
+//! node's credential, not a bare Ed25519 key (TLS-3), and the signature is a
+//! composite of Ed25519 and ML-DSA-44 (TLS-4), so both verifiers read the
+//! credential through [`super::credential_from_cert`] and check the
+//! signature with its two keys themselves.
 
 use rustls::{
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
@@ -18,13 +19,17 @@ use rustls::{
 };
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 
-use crate::{credential::NodeCredential, key::NodeId};
+use crate::{
+    composite::{self, COMPOSITE_SCHEME, ML_DSA_44_KEY_TAG},
+    credential::NodeCredential,
+    key::NodeId,
+};
 
 /// TLS 1.3 is the only version (TLS-1).
 pub(crate) const PROTOCOL_VERSIONS: &[&SupportedProtocolVersion] = &[&rustls::version::TLS13];
 
 /// The signature schemes a peer may sign its handshake with (TLS-4).
-const SIGNATURE_SCHEMES: &[SignatureScheme] = &[SignatureScheme::ED25519];
+const SIGNATURE_SCHEMES: &[SignatureScheme] = &[COMPOSITE_SCHEME];
 
 /// Accepts the server only if its credential derives the dialed node ID (TLS-7).
 #[derive(Debug)]
@@ -87,8 +92,8 @@ impl ServerCertVerifier for ServerCertificateVerifier {
 
 /// Requires a client credential (TLS-5).
 ///
-/// The handshake signature, checked with the credential's Ed25519 key, proves
-/// the client holds the credential its node ID derives from (TLS-8).
+/// The handshake signature, checked with both of the credential's keys,
+/// proves the client holds the credential its node ID derives from (TLS-8).
 #[derive(Debug, Default)]
 pub(super) struct ClientCertificateVerifier;
 
@@ -145,7 +150,8 @@ impl ClientCertVerifier for ClientCertificateVerifier {
 }
 
 /// Reads a peer's credential and checks this release can authenticate it: it
-/// stands alone and holds an Ed25519 key (TLS-3, ID-11).
+/// stands alone and holds both an Ed25519 and an ML-DSA-44 key (TLS-3,
+/// TLS-4, ID-11).
 fn verifiable_credential(
     end_entity: &CertificateDer<'_>,
     intermediates: &[CertificateDer<'_>],
@@ -158,9 +164,9 @@ fn verifiable_credential(
     let credential = super::credential_from_cert(end_entity.as_ref()).ok_or(
         rustls::Error::InvalidCertificate(CertificateError::BadEncoding),
     )?;
-    // A well-formed credential with no key this release can check is
-    // unverifiable, not malformed (ID-11): the handshake fails either way.
-    if credential.ed25519().is_none() {
+    // A well-formed credential without both keys this release signs with
+    // is unverifiable, not malformed (ID-11): the handshake fails either way.
+    if credential.ed25519().is_none() || credential.key(ML_DSA_44_KEY_TAG).is_none() {
         return Err(rustls::Error::InvalidCertificate(
             CertificateError::ApplicationVerificationFailure,
         ));
@@ -168,25 +174,84 @@ fn verifiable_credential(
     Ok(credential)
 }
 
-/// Checks the peer's handshake signature with its credential's Ed25519 key
-/// under ID-6's strict rules (TLS-4).
+/// Checks the peer's composite handshake signature with its credential's
+/// Ed25519 key, under ID-6's strict rules, and its ML-DSA-44 key (TLS-4).
 fn verify_signature(
     message: &[u8],
     cert: &CertificateDer<'_>,
     dss: &DigitallySignedStruct,
 ) -> Result<HandshakeSignatureValid, rustls::Error> {
-    if dss.scheme != SignatureScheme::ED25519 {
+    if dss.scheme != COMPOSITE_SCHEME {
         return Err(rustls::Error::PeerMisbehaved(
             rustls::PeerMisbehaved::SignedHandshakeWithUnadvertisedSigScheme,
         ));
     }
-    // rustls calls this only after a verifier accepted `cert`.
-    let key = super::credential_from_cert(cert.as_ref())
-        .and_then(|credential| credential.ed25519())
-        .ok_or(rustls::Error::InvalidCertificate(
-            CertificateError::BadEncoding,
-        ))?;
-    key.verify_strict(message, dss.signature())
+    // rustls calls this only after a verifier accepted `cert`, so the
+    // credential parses and holds both keys.
+    let bad_encoding = rustls::Error::InvalidCertificate(CertificateError::BadEncoding);
+    let credential = super::credential_from_cert(cert.as_ref()).ok_or(bad_encoding.clone())?;
+    let (Some(ed25519), Some(ml_dsa)) = (credential.ed25519(), credential.key(ML_DSA_44_KEY_TAG))
+    else {
+        return Err(bad_encoding);
+    };
+    composite::verify(&ed25519, ml_dsa, message, dss.signature())
         .map_err(|_| rustls::Error::InvalidCertificate(CertificateError::BadSignature))?;
     Ok(HandshakeSignatureValid::assertion())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{NodeSecretKey, ED25519_KEY_TAG};
+
+    fn cert(credential: &NodeCredential) -> CertificateDer<'static> {
+        CertificateDer::from(credential.to_spki().to_vec())
+    }
+
+    /// TLS-4, ID-11: a credential with only an Ed25519 key can't sign the
+    /// composite, so both verifiers refuse it, even when its ID is the
+    /// dialed one.
+    #[test]
+    fn a_credential_without_an_ml_dsa_key_is_refused() {
+        let secret = NodeSecretKey::generate();
+        let ed25519_only = NodeCredential::single(secret.public_key());
+        let refused = verifiable_credential(&cert(&ed25519_only), &[]);
+        assert!(refused.is_err());
+
+        let verifier = ServerCertificateVerifier::new(ed25519_only.node_id());
+        let name = ServerName::try_from(super::super::UNSENT_SERVER_NAME).unwrap();
+        assert!(verifier
+            .verify_server_cert(&cert(&ed25519_only), &[], &name, &[], UnixTime::now())
+            .is_err());
+        assert!(verifiable_credential(&cert(secret.credential()), &[]).is_ok());
+    }
+
+    /// TLS-4: a credential that pairs this node's Ed25519 key with another
+    /// node's ML-DSA key fails the ML-DSA half of the composite.
+    #[test]
+    fn a_credential_with_a_swapped_ml_dsa_key_fails_the_signature() {
+        let secret = NodeSecretKey::generate();
+        let other = NodeSecretKey::generate();
+        let message = b"transcript";
+        let signature = secret.sign_composite(message, [3; 32]).unwrap();
+        let ml_dsa =
+            |node: &NodeSecretKey| node.credential().key(ML_DSA_44_KEY_TAG).unwrap().to_vec();
+        assert!(
+            composite::verify(&secret.public_key(), &ml_dsa(&secret), message, &signature).is_ok()
+        );
+
+        let swapped = NodeCredential::from_entries([
+            (ED25519_KEY_TAG, secret.public_key().as_bytes().to_vec()),
+            (ML_DSA_44_KEY_TAG, ml_dsa(&other)),
+        ])
+        .unwrap();
+        assert!(verifiable_credential(&cert(&swapped), &[]).is_ok());
+        assert!(composite::verify(
+            &secret.public_key(),
+            swapped.key(ML_DSA_44_KEY_TAG).unwrap(),
+            message,
+            &signature
+        )
+        .is_err());
+    }
 }

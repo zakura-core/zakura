@@ -103,6 +103,7 @@ libc = "0.2"
 # `rand` feature off: the caller passes the randomness in, so a simulation can
 # seed it.
 libcrux-ml-kem = { version = "0.0.12", default-features = false, features = ["mlkem768"] }
+libcrux-ml-dsa = { version = "0.0.12", default-features = false, features = ["mldsa44"] }
 memchr = "2.8"
 metrics = "0.24"
 pin-project = "1.1.10"

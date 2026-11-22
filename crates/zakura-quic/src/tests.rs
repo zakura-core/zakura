@@ -593,7 +593,10 @@ async fn wrong_identity_is_refused() {
 async fn a_classical_one_datagram_hello_is_refused_and_cancelled() {
     tokio::time::timeout(TEST_TIMEOUT, async {
         let server = server();
-        let rpk = crate::tls::resolver::ResolveRawPublicKeyCert::new(&NodeSecretKey::generate());
+        let rpk = crate::tls::resolver::ResolveRawPublicKeyCert::new(
+            &NodeSecretKey::generate(),
+            crate::tls::production_provider().secure_random,
+        );
         let mut crypto = raw_client_builder_with(&server, rustls::crypto::ring::default_provider())
             .with_client_cert_resolver(Arc::new(rpk));
         crypto.alpn_protocols = vec![ALPN.to_vec()];
@@ -1203,7 +1206,10 @@ async fn client_with_an_x509_style_certificate_is_refused() {
     tokio::time::timeout(TEST_TIMEOUT, async {
         let mut server = server();
         // Borrow the RPK resolver's key, but present it as an X.509 chain.
-        let rpk = crate::tls::resolver::ResolveRawPublicKeyCert::new(&NodeSecretKey::generate());
+        let rpk = crate::tls::resolver::ResolveRawPublicKeyCert::new(
+            &NodeSecretKey::generate(),
+            crate::tls::production_provider().secure_random,
+        );
         let key = rustls::client::ResolvesClientCert::resolve(&rpk, &[], &[]).unwrap();
         let mut crypto =
             raw_client_builder(&server).with_client_cert_resolver(Arc::new(NotRawPublicKey(key)));
@@ -1231,7 +1237,10 @@ async fn raw_client_with_the_profile_is_accepted() {
     // credential succeeds.
     tokio::time::timeout(TEST_TIMEOUT, async {
         let mut server = server();
-        let rpk = crate::tls::resolver::ResolveRawPublicKeyCert::new(&NodeSecretKey::generate());
+        let rpk = crate::tls::resolver::ResolveRawPublicKeyCert::new(
+            &NodeSecretKey::generate(),
+            crate::tls::production_provider().secure_random,
+        );
         let mut crypto = raw_client_builder(&server).with_client_cert_resolver(Arc::new(rpk));
         crypto.alpn_protocols = vec![ALPN.to_vec()];
         dial_raw(&server, crypto).await.unwrap();
@@ -1913,9 +1922,19 @@ async fn driver_send_counters_match_quinn_proto() {
     .unwrap();
 }
 
-/// A key that presents a victim's public key but signs with another key.
-#[derive(Debug)]
-struct Impostor(NodeSecretKey);
+/// How an [`Impostor`] signs a handshake message.
+type ImpostorSign = Arc<dyn Fn(&[u8]) -> Vec<u8> + Send + Sync>;
+
+/// A key that presents a victim's credential and signs under the composite
+/// scheme however its `sign` says.
+#[derive(Clone)]
+struct Impostor(ImpostorSign);
+
+impl std::fmt::Debug for Impostor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Impostor")
+    }
+}
 
 impl rustls::sign::SigningKey for Impostor {
     fn choose_scheme(
@@ -1923,25 +1942,22 @@ impl rustls::sign::SigningKey for Impostor {
         offered: &[rustls::SignatureScheme],
     ) -> Option<Box<dyn rustls::sign::Signer>> {
         offered
-            .contains(&rustls::SignatureScheme::ED25519)
-            .then(|| Box::new(ImpostorSigner(self.0.clone())) as Box<dyn rustls::sign::Signer>)
+            .contains(&crate::composite::COMPOSITE_SCHEME)
+            .then(|| Box::new(self.clone()) as Box<dyn rustls::sign::Signer>)
     }
 
     fn algorithm(&self) -> rustls::SignatureAlgorithm {
-        rustls::SignatureAlgorithm::ED25519
+        rustls::SignatureAlgorithm::Unknown(0x44)
     }
 }
 
-#[derive(Debug)]
-struct ImpostorSigner(NodeSecretKey);
-
-impl rustls::sign::Signer for ImpostorSigner {
+impl rustls::sign::Signer for Impostor {
     fn sign(&self, message: &[u8]) -> Result<Vec<u8>, rustls::Error> {
-        Ok(self.0.sign(message).to_vec())
+        Ok((self.0)(message))
     }
 
     fn scheme(&self) -> rustls::SignatureScheme {
-        rustls::SignatureScheme::ED25519
+        crate::composite::COMPOSITE_SCHEME
     }
 }
 
@@ -1966,23 +1982,88 @@ impl rustls::client::ResolvesClientCert for ImpostorResolver {
     }
 }
 
-/// TLS-8, SEC-2: a client that presents another node's key without its
-/// secret is refused, so `remote_id()` can't name the victim.
+/// Dials `server` presenting `victim`'s credential and signing with `sign`.
+async fn dial_as(
+    server: &Server,
+    victim: &NodeSecretKey,
+    sign: impl Fn(&[u8]) -> Vec<u8> + Send + Sync + 'static,
+) -> Result<(), ConnectError> {
+    let cert = rustls_pki_types::CertificateDer::from(victim.credential().to_spki().to_vec());
+    let key = Arc::new(rustls::sign::CertifiedKey::new(
+        vec![cert],
+        Arc::new(Impostor(Arc::new(sign))),
+    ));
+    let mut crypto =
+        raw_client_builder(server).with_client_cert_resolver(Arc::new(ImpostorResolver(key)));
+    crypto.alpn_protocols = vec![ALPN.to_vec()];
+    dial_raw(server, crypto).await
+}
+
+/// Checks that the dial fails and the listener finishes admission without a handoff.
+async fn assert_dial_refused(
+    server: &mut Server,
+    victim: &NodeSecretKey,
+    sign: impl Fn(&[u8]) -> Vec<u8> + Send + Sync + 'static,
+) {
+    let finished = server.returned.finished.load(Ordering::Relaxed);
+    assert!(dial_as(server, victim, sign).await.is_err());
+    while server.returned.finished.load(Ordering::Relaxed) == finished {
+        tokio::task::yield_now().await;
+    }
+    assert!(matches!(
+        server.handled.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+}
+
+/// TLS-4, TLS-8, SEC-2: a client that presents another node's credential
+/// without both of its secrets is refused, so `remote_id()` can't name the
+/// victim. Each half of the composite is checked on its own: a signature
+/// with either half from another key, or one byte short, fails. The control
+/// dial, signed with the victim's own keys, shows the refusals come from
+/// the signature.
 #[tokio::test]
 async fn client_presenting_a_key_it_cannot_sign_for_is_refused() {
     tokio::time::timeout(TEST_TIMEOUT, async {
         let mut server = server();
-        let victim = NodeSecretKey::generate();
-        let cert = rustls_pki_types::CertificateDer::from(victim.credential().to_spki().to_vec());
-        let key = Arc::new(rustls::sign::CertifiedKey::new(
-            vec![cert],
-            Arc::new(Impostor(NodeSecretKey::generate())),
-        ));
-        let mut crypto =
-            raw_client_builder(&server).with_client_cert_resolver(Arc::new(ImpostorResolver(key)));
-        crypto.alpn_protocols = vec![ALPN.to_vec()];
-        assert!(dial_raw(&server, crypto).await.is_err());
-        assert!(server.handled.try_recv().is_err());
+        let victim = Arc::new(NodeSecretKey::generate());
+        let other = Arc::new(NodeSecretKey::generate());
+        const ED25519: usize = 64;
+
+        let o = other.clone();
+        let foreign_both = move |m: &[u8]| o.sign_composite(m, [1; 32]).unwrap();
+        let (v2, o2) = (victim.clone(), other.clone());
+        let foreign_ml_dsa = move |m: &[u8]| {
+            let mut signature = v2.sign(m).to_vec();
+            signature.extend_from_slice(&o2.sign_composite(m, [1; 32]).unwrap()[ED25519..]);
+            signature
+        };
+        let (v3, o3) = (victim.clone(), other.clone());
+        let foreign_ed25519 = move |m: &[u8]| {
+            let mut signature = o3.sign(m).to_vec();
+            signature.extend_from_slice(&v3.sign_composite(m, [1; 32]).unwrap()[ED25519..]);
+            signature
+        };
+        let v4 = victim.clone();
+        let truncated = move |m: &[u8]| {
+            let mut signature = v4.sign_composite(m, [1; 32]).unwrap();
+            signature.pop();
+            signature
+        };
+
+        assert_dial_refused(&mut server, &victim, foreign_both).await;
+        assert_dial_refused(&mut server, &victim, foreign_ml_dsa).await;
+        assert_dial_refused(&mut server, &victim, foreign_ed25519).await;
+        assert_dial_refused(&mut server, &victim, truncated).await;
+
+        let v5 = victim.clone();
+        dial_as(&server, &victim, move |m| {
+            v5.sign_composite(m, [1; 32]).unwrap()
+        })
+        .await
+        .unwrap();
+        let inbound = server.handled.recv().await.unwrap();
+        assert_eq!(inbound.remote_id(), victim.public());
     })
     .await
     .unwrap();
@@ -2909,6 +2990,62 @@ async fn the_hybrid_hello_leaves_as_two_initial_datagrams() {
         server.handled.recv().await.unwrap();
         assert_eq!(server.seen.lock().unwrap().len(), 1);
         pump.abort();
+    })
+    .await
+    .unwrap();
+}
+
+/// TLS-4, ADM-1: with the composite credential and signature, the
+/// listener's whole first flight still fits QUIC's allowance before the
+/// dialer's address is validated, three times the 2,400 bytes of the hybrid
+/// hello. The dialer completes its handshake on that flight alone, so the
+/// larger signature adds no round trip.
+#[tokio::test(start_paused = true)]
+async fn the_listeners_first_flight_fits_the_amplification_limit() {
+    tokio::time::timeout(SIM_TEST_TIMEOUT, async {
+        let net = sim_net();
+        let _server =
+            serve_test_acceptor(sim_endpoint(&net, sim_addr(1)), &[ALPN], |_| Admit::Accept);
+        let client = sim_endpoint(&net, sim_addr(2));
+        let target = _server.addr();
+        let dial = tokio::spawn(async move {
+            let result = client.connect(target, &[ALPN]).await;
+            (client, result)
+        });
+        let settle = || async {
+            for _ in 0..10_000 {
+                tokio::task::yield_now().await;
+            }
+        };
+        let deliver_from = |src: SocketAddr| {
+            for id in net.deliverable() {
+                if id.link.src == src {
+                    net.deliver(id).unwrap();
+                }
+            }
+        };
+
+        settle().await;
+        let hello: usize = sent_lengths(&net, sim_addr(2)).iter().sum();
+        assert_eq!(hello, 2_400, "the hybrid hello is two full datagrams");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        deliver_from(sim_addr(2));
+        settle().await;
+
+        let flight: usize = sent_lengths(&net, sim_addr(1)).iter().sum();
+        assert!(
+            flight <= 3 * hello,
+            "the listener sent {flight} bytes before validation"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        deliver_from(sim_addr(1));
+        settle().await;
+        assert!(
+            dial.is_finished(),
+            "the dialer completed on the listener's first flight of {flight} bytes"
+        );
+        let (_client, result) = dial.await.unwrap();
+        result.unwrap();
     })
     .await
     .unwrap();

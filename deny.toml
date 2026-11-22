@@ -96,6 +96,10 @@ skip = [
     { name = "hax-lib", version = "=0.3.7" },
     { name = "hax-lib-macros", version = "=0.3.7" },
     { name = "hax-lib-macros-types", version = "=0.3.7" },
+
+    # libcrux-ml-dsa's proc macro, libcrux-macros, builds on syn 3 while the
+    # rest of the tree is on syn 2. It runs only at build time.
+    { name = "syn", version = "=3.0.10" },
 ]
 
 # Similarly to `skip` allows you to skip certain crates during duplicate

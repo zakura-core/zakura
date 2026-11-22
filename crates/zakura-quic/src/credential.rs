@@ -12,6 +12,7 @@ use blake2b_simd::Params;
 use rustls_pki_types::{AlgorithmIdentifier, SubjectPublicKeyInfoDer};
 
 use crate::{
+    composite::{ML_DSA_44_KEY_BYTES, ML_DSA_44_KEY_TAG},
     key::{NodeId, NodeKey, KEY_LENGTH},
     key_list::{KeyListError, NodeKeyList, ED25519_KEY_TAG, MAX_NODE_KEYS},
 };
@@ -47,7 +48,7 @@ pub enum CredentialError {
     #[error(transparent)]
     KeyList(#[from] KeyListError),
     /// A key is empty, longer than [`MAX_CREDENTIAL_KEY_BYTES`], or not the
-    /// length its tag fixes.
+    /// length its tag fixes (32 bytes for Ed25519, 1,312 for ML-DSA-44).
     #[error("a credential key has the wrong length")]
     KeyLength,
 }
@@ -79,7 +80,11 @@ impl NodeCredential {
     ) -> Result<Self, CredentialError> {
         let entries: Vec<_> = entries.into_iter().take(MAX_NODE_KEYS + 1).collect();
         for (tag, key) in &entries {
-            let fixed = (*tag == ED25519_KEY_TAG).then_some(KEY_LENGTH);
+            let fixed = match *tag {
+                ED25519_KEY_TAG => Some(KEY_LENGTH),
+                ML_DSA_44_KEY_TAG => Some(ML_DSA_44_KEY_BYTES),
+                _ => None,
+            };
             let fits = match fixed {
                 Some(length) => key.len() == length,
                 None => !key.is_empty() && key.len() <= MAX_CREDENTIAL_KEY_BYTES,
@@ -270,7 +275,10 @@ mod tests {
     fn an_ed25519_only_credential_names_the_one_entry_list() {
         let credential = NodeCredential::single(ed25519());
         assert_eq!(credential.key_list(), &NodeKeyList::single(ed25519()));
-        assert_eq!(credential.node_id(), ed25519().node_id());
+        assert_eq!(
+            credential.node_id(),
+            NodeKeyList::single(ed25519()).node_id()
+        );
         assert_eq!(credential.ed25519(), Some(ed25519()));
     }
 
@@ -297,14 +305,14 @@ mod tests {
 
     /// The Regtest e2e harness names its seed node by this ID
     /// (`docker/zakura-regtest-e2e/node2.toml`). Computed with Python's
-    /// `hashlib.blake2b(digest_size=32, person=b"Zakura_NodeId_v1")` over
-    /// the one-entry list of the seed's public key.
+    /// `hashlib.blake2b`: the ML-DSA-44 key's fingerprint under
+    /// `Zakura_KeyFpr_v1`, then the two-entry list under `Zakura_NodeId_v1`.
     #[test]
     fn the_e2e_seed_nodes_id_has_its_known_value() {
         let secret = NodeSecretKey::from_bytes(&[1; KEY_LENGTH]);
         assert_eq!(
             secret.public().to_string(),
-            "5cb9925880507c23dcf120a5a87e0c7577e1c16cb0ea62488d01174175550a91"
+            "aefd494144d9d64d7a45c4946c5af2adeb2c9242ccf7325c05904c40456b1797"
         );
     }
 
@@ -406,7 +414,7 @@ mod tests {
 
     #[test]
     fn the_longest_credential_fits_its_bound() {
-        let entries = [ED25519_KEY_TAG, 2, 3, 4].map(|tag| {
+        let entries = [ED25519_KEY_TAG, 3, 4, 5].map(|tag| {
             let key = if tag == ED25519_KEY_TAG {
                 ed25519().as_bytes().to_vec()
             } else {

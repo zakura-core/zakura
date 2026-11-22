@@ -16,11 +16,15 @@
 //! connection task owns each `quinn_proto::Connection`. Handles reach them only
 //! through ordered message channels, so no lock guards a QUIC state machine.
 
+mod composite;
 mod credential;
 mod key;
 mod key_list;
 mod tls;
 
+pub use composite::{
+    COMPOSITE_SIGNATURE_BYTES, ML_DSA_44_KEY_BYTES, ML_DSA_44_KEY_TAG, ML_DSA_44_SIGNATURE_BYTES,
+};
 pub use credential::{
     CredentialError, NodeCredential, MAX_CREDENTIAL_BYTES, MAX_CREDENTIAL_KEY_BYTES,
 };

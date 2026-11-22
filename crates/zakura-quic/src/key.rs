@@ -16,7 +16,10 @@ use curve25519_dalek::edwards::{CompressedEdwardsY, EdwardsPoint};
 use ring::signature::{Ed25519KeyPair, KeyPair as _, UnparsedPublicKey, ED25519};
 use zeroize::Zeroize as _;
 
-use crate::{NodeCredential, NodeKeyList};
+use crate::{
+    composite::{self, ML_DSA_44_KEY_TAG},
+    NodeCredential, NodeKeyList, ED25519_KEY_TAG,
+};
 
 /// Length of an Ed25519 public key or secret seed, in bytes.
 pub const KEY_LENGTH: usize = 32;
@@ -83,12 +86,6 @@ impl NodeKey {
     /// Returns the 32 raw key bytes.
     pub fn as_bytes(&self) -> &[u8; KEY_LENGTH] {
         &self.0
-    }
-
-    /// The node ID of a node whose only key is this one: the ID of the
-    /// one-entry [`NodeKeyList`](crate::NodeKeyList) holding it.
-    pub fn node_id(&self) -> NodeId {
-        NodeKeyList::single(*self).node_id()
     }
 
     /// Verifies `signature` over `message` (ID-6).
@@ -235,14 +232,19 @@ pub struct SignatureError;
 
 /// A node's Ed25519 secret seed (ID-3).
 ///
-/// It holds the seed, its public key and the credential that names the node,
-/// and zeroizes the seed on drop.
-/// [`sign`](Self::sign) expands the seed for each signature, and `ring` does
-/// not zeroize that expanded key when the call returns. `Debug` and `Display`
-/// never show the seed, and it has no `Serialize` impl.
+/// It holds the seed, the ML-DSA-44 seed derived from it, the public keys
+/// and the credential that names the node, and zeroizes both seeds on drop.
+/// The seed derives both the Ed25519 key (ID-4) and the ML-DSA-44 key
+/// (ID-13). [`sign`](Self::sign) expands the seed for each signature, and
+/// `ring` does not zeroize that expanded key when the call returns; the
+/// ML-DSA signing key is regenerated for each signature, and ID-13 lists the
+/// copies `libcrux-ml-dsa` leaves unwiped. `Debug` and `Display` never show
+/// the seed, and it has no `Serialize` impl.
 #[derive(Clone)]
 pub struct NodeSecretKey {
     seed: [u8; KEY_LENGTH],
+    /// The ML-DSA-44 key generation seed derived from `seed` (ID-13).
+    ml_dsa_seed: [u8; KEY_LENGTH],
     public: NodeKey,
     /// The keys the node proves in TLS. `public` is the Ed25519 key among
     /// them, and the node ID is the hash of their key list.
@@ -252,6 +254,7 @@ pub struct NodeSecretKey {
 impl Drop for NodeSecretKey {
     fn drop(&mut self) {
         self.seed.zeroize();
+        self.ml_dsa_seed.zeroize();
     }
 }
 
@@ -266,10 +269,20 @@ impl NodeSecretKey {
         // A key derived from a seed is a multiple of the base point, so it
         // passes every check `NodeKey::from_bytes` makes.
         let public = NodeKey(public);
+        let ml_dsa_seed = composite::ml_dsa_seed(seed);
+        let credential = NodeCredential::from_entries([
+            (ED25519_KEY_TAG, public.as_bytes().to_vec()),
+            (
+                ML_DSA_44_KEY_TAG,
+                composite::ml_dsa_public_key(&ml_dsa_seed).to_vec(),
+            ),
+        ])
+        .expect("a valid Ed25519 key and an ML-DSA-44 key form a credential");
         Self {
             seed: *seed,
+            ml_dsa_seed,
             public,
-            credential: NodeCredential::single(public),
+            credential,
         }
     }
 
@@ -308,20 +321,21 @@ impl NodeSecretKey {
     }
 
     /// Returns the keys the node presents in TLS. Unless
-    /// [`Self::with_credential`] replaced it, this holds only
-    /// [`Self::public_key`].
+    /// [`Self::with_credential`] replaced it, this holds the node's Ed25519
+    /// and ML-DSA-44 keys.
     pub fn credential(&self) -> &NodeCredential {
         &self.credential
     }
 
-    /// Presents `credential` in TLS instead of the one-entry credential,
-    /// which changes the node ID. `credential` must hold this key as its
-    /// Ed25519 entry.
+    /// Presents `credential` in TLS instead of the derived one, which
+    /// changes the node ID. `credential` must hold this node's Ed25519 and
+    /// ML-DSA-44 keys, the two it signs with.
     ///
-    /// The other entries are opaque here: the node signs only with its
-    /// Ed25519 key, and a peer accepts the rest by their fingerprints.
+    /// The other entries are opaque here, and a peer accepts them by their
+    /// fingerprints.
     pub fn with_credential(mut self, credential: NodeCredential) -> Result<Self, ForeignKeyList> {
-        if credential.ed25519() != Some(self.public) {
+        let own = |tag| self.credential.key(tag) == credential.key(tag);
+        if credential.ed25519() != Some(self.public) || !own(ML_DSA_44_KEY_TAG) {
             return Err(ForeignKeyList);
         }
         self.credential = credential;
@@ -341,12 +355,29 @@ impl NodeSecretKey {
             .try_into()
             .expect("ring's Ed25519 signatures are 64 bytes")
     }
+
+    /// Signs `message` with the composite of both keys (TLS-4): the Ed25519
+    /// signature, then the ML-DSA-44 signature hedged with `randomness`.
+    pub(crate) fn sign_composite(
+        &self,
+        message: &[u8],
+        randomness: [u8; 32],
+    ) -> Result<Vec<u8>, SignatureError> {
+        let mut signature = Vec::with_capacity(composite::COMPOSITE_SIGNATURE_BYTES);
+        signature.extend_from_slice(&self.sign(message));
+        signature.extend_from_slice(&composite::ml_dsa_sign(
+            &self.ml_dsa_seed,
+            message,
+            randomness,
+        )?);
+        Ok(signature)
+    }
 }
 
-/// A credential that does not hold the secret key's public key as its
-/// Ed25519 entry, so the secret key cannot prove it is the node it names.
+/// A credential that does not hold the secret key's Ed25519 and ML-DSA-44
+/// public keys, so the secret key cannot prove it is the node it names.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
-#[error("the credential does not hold this secret key's Ed25519 public key")]
+#[error("the credential does not hold this secret key's public keys")]
 pub struct ForeignKeyList;
 
 /// Expands `seed` into an Ed25519 key pair, per RFC 8032.
@@ -505,13 +536,8 @@ mod tests {
             Err(KeyParsingError::InvalidKeyData)
         );
 
-        assert_eq!(secret.public(), key.node_id());
-        assert_eq!(secret.public(), crate::NodeKeyList::single(key).node_id());
-        // The known answer of the key list's own test, for the same key.
-        assert_eq!(
-            secret.public().to_string(),
-            "b596e1f72ff13a26526121761aaa59cdc0b0414ec5673ffcf40e45613c624ce5"
-        );
+        assert_eq!(secret.key_list().ed25519(), Some(key));
+        assert_eq!(secret.public(), secret.key_list().node_id());
     }
 
     #[test]

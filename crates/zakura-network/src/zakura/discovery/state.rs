@@ -752,14 +752,22 @@ impl DiscoveryState {
         )
     }
 
-    /// Returns how many discovery dials may start with `connected` connections
-    /// and `in_flight` dials.
-    pub(super) fn dial_slot_limit(&self, connected: usize, in_flight: usize) -> usize {
+    /// Returns how many ordinary discovery dials may start with
+    /// `ordinary_occupied` registered peers and in-flight dials outside the
+    /// preferred set, `in_flight` dials in all, and `hold` places held for
+    /// preferred gateways.
+    pub(super) fn dial_slot_limit(
+        &self,
+        ordinary_occupied: usize,
+        in_flight: usize,
+        hold: usize,
+    ) -> usize {
         super::protocol::discovery_dial_slot_limit(
-            connected,
+            ordinary_occupied,
             in_flight,
             self.config.max_zakura_connections,
             self.config.discovery_connection_headroom,
+            hold,
             self.config.max_concurrent_discovery_dials,
         )
     }

@@ -332,11 +332,13 @@ async fn admit_dial_round(
     }
     let supervisor = endpoint.supervisor();
     let in_flight_node_ids = state.in_flight_node_ids();
+    let held_places = endpoint.held_places();
     let mut admitted = Vec::new();
     discovery
         .admit_dial_candidates_preferring_any_service(
             sought_services,
             &in_flight_node_ids,
+            &held_places,
             |candidate| {
                 if free_slots == 0 || free_permits == 0 {
                     return DialAdmission::Exhausted;

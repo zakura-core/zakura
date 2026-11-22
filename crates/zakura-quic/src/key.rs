@@ -10,16 +10,13 @@
 //! stack already depends on. `curve25519-dalek` checks the public key and each
 //! signature's `R` point before the equation runs (ID-6).
 
-use std::{
-    fmt,
-    hash::{Hash, Hasher},
-    net::SocketAddr,
-    str::FromStr,
-};
+use std::{fmt, net::SocketAddr, str::FromStr};
 
 use curve25519_dalek::edwards::{CompressedEdwardsY, EdwardsPoint};
 use ring::signature::{Ed25519KeyPair, KeyPair as _, UnparsedPublicKey, ED25519};
 use zeroize::Zeroize as _;
+
+use crate::{NodeCredential, NodeKeyList};
 
 /// Length of an Ed25519 public key or secret seed, in bytes.
 pub const KEY_LENGTH: usize = 32;
@@ -34,16 +31,19 @@ pub struct NodeKey([u8; KEY_LENGTH]);
 
 /// A node identity: the name peers know a node by (ID-1).
 ///
-/// A node ID is always 32 bytes. Today it is the node's [`NodeKey`], so it
-/// has the same bytes and the same checks; a later version makes it the hash
-/// of the node's key list, still 32 bytes. Code that needs the key itself, to verify a signature or
-/// build a TLS certificate, takes it with [`key`](Self::key). Text form is 64
-/// lowercase hex characters (ID-2).
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct NodeId(NodeKey);
+/// A node ID is always 32 bytes: the hash of the node's [`NodeKeyList`]
+/// (ID-9), so any 32 bytes are a node ID and none of them is a key. A peer
+/// proves it is the node by presenting, in TLS, a credential whose key list
+/// hashes to the ID (TLS-7, TLS-8). Text form is 64 lowercase hex characters
+/// (ID-2).
+///
+/// [`NodeKeyList`]: crate::NodeKeyList
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NodeId([u8; KEY_LENGTH]);
 
 /// Error returned when parsing a [`NodeKey`], a [`NodeId`] or a
-/// [`NodeSecretKey`].
+/// [`NodeSecretKey`]. Only a [`NodeKey`] can fail with
+/// [`InvalidKeyData`](Self::InvalidKeyData).
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 #[non_exhaustive]
 pub enum KeyParsingError {
@@ -83,6 +83,12 @@ impl NodeKey {
     /// Returns the 32 raw key bytes.
     pub fn as_bytes(&self) -> &[u8; KEY_LENGTH] {
         &self.0
+    }
+
+    /// The node ID of a node whose only key is this one: the ID of the
+    /// one-entry [`NodeKeyList`](crate::NodeKeyList) holding it.
+    pub fn node_id(&self) -> NodeId {
+        NodeKeyList::single(*self).node_id()
     }
 
     /// Verifies `signature` over `message` (ID-6).
@@ -136,6 +142,15 @@ impl fmt::Display for NodeKey {
     }
 }
 
+/// Parses hex (either case) or Iroh's base32 form.
+impl FromStr for NodeKey {
+    type Err = KeyParsingError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::from_bytes(&decode_key_text(s)?)
+    }
+}
+
 impl fmt::Debug for NodeKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "NodeKey({self})")
@@ -143,40 +158,14 @@ impl fmt::Debug for NodeKey {
 }
 
 impl NodeId {
-    /// Builds a node ID from its 32 bytes, with the checks of
-    /// [`NodeKey::from_bytes`] (ID-6).
-    pub fn from_bytes(bytes: &[u8; KEY_LENGTH]) -> Result<Self, KeyParsingError> {
-        NodeKey::from_bytes(bytes).map(Self)
+    /// Builds a node ID from its 32 bytes. Every 32 bytes are a node ID.
+    pub fn from_bytes(bytes: &[u8; KEY_LENGTH]) -> Self {
+        Self(*bytes)
     }
 
     /// Returns the 32 raw bytes, the form Zakura's wire formats use (ID-7).
     pub fn as_bytes(&self) -> &[u8; KEY_LENGTH] {
-        self.0.as_bytes()
-    }
-
-    /// Returns the Ed25519 key this node ID names.
-    pub fn key(&self) -> NodeKey {
-        self.0
-    }
-
-    /// Verifies `signature` over `message` with this node ID's key.
-    ///
-    /// Uses the same checks and errors as [`NodeKey::verify_strict`].
-    pub fn verify_strict(&self, message: &[u8], signature: &[u8]) -> Result<(), SignatureError> {
-        self.key().verify_strict(message, signature)
-    }
-}
-
-impl From<NodeKey> for NodeId {
-    /// The node ID of the node that holds `key`.
-    fn from(key: NodeKey) -> Self {
-        Self(key)
-    }
-}
-
-impl Hash for NodeId {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.as_bytes().hash(state);
+        &self.0
     }
 }
 
@@ -184,7 +173,10 @@ impl TryFrom<&[u8]> for NodeId {
     type Error = KeyParsingError;
 
     fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
-        NodeKey::try_from(bytes).map(Self)
+        let bytes: &[u8; KEY_LENGTH] = bytes
+            .try_into()
+            .map_err(|_| KeyParsingError::InvalidLength)?;
+        Ok(Self::from_bytes(bytes))
     }
 }
 
@@ -211,7 +203,7 @@ impl FromStr for NodeId {
     type Err = KeyParsingError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Self::from_bytes(&decode_key_text(s)?)
+        decode_key_text(s).map(|bytes| Self::from_bytes(&bytes))
     }
 }
 
@@ -231,8 +223,7 @@ impl<'de> serde::Deserialize<'de> for NodeId {
             let text = String::deserialize(deserializer)?;
             text.parse().map_err(serde::de::Error::custom)
         } else {
-            let bytes = <[u8; KEY_LENGTH]>::deserialize(deserializer)?;
-            Self::from_bytes(&bytes).map_err(serde::de::Error::custom)
+            <[u8; KEY_LENGTH]>::deserialize(deserializer).map(|bytes| Self::from_bytes(&bytes))
         }
     }
 }
@@ -244,7 +235,8 @@ pub struct SignatureError;
 
 /// A node's Ed25519 secret seed (ID-3).
 ///
-/// It holds only the seed and its public key, and zeroizes the seed on drop.
+/// It holds the seed, its public key and the credential that names the node,
+/// and zeroizes the seed on drop.
 /// [`sign`](Self::sign) expands the seed for each signature, and `ring` does
 /// not zeroize that expanded key when the call returns. `Debug` and `Display`
 /// never show the seed, and it has no `Serialize` impl.
@@ -252,6 +244,9 @@ pub struct SignatureError;
 pub struct NodeSecretKey {
     seed: [u8; KEY_LENGTH],
     public: NodeKey,
+    /// The keys the node proves in TLS. `public` is the Ed25519 key among
+    /// them, and the node ID is the hash of their key list.
+    credential: NodeCredential,
 }
 
 impl Drop for NodeSecretKey {
@@ -268,11 +263,13 @@ impl NodeSecretKey {
             .as_ref()
             .try_into()
             .expect("ring's Ed25519 public keys are 32 bytes");
+        // A key derived from a seed is a multiple of the base point, so it
+        // passes every check `NodeKey::from_bytes` makes.
+        let public = NodeKey(public);
         Self {
             seed: *seed,
-            // A key derived from a seed is a multiple of the base point, so it
-            // passes every check `NodeKey::from_bytes` makes.
-            public: NodeKey(public),
+            public,
+            credential: NodeCredential::single(public),
         }
     }
 
@@ -299,9 +296,36 @@ impl NodeSecretKey {
         text
     }
 
-    /// Returns this key's node ID.
+    /// Returns the node's ID: the hash of [`Self::key_list`].
     pub fn public(&self) -> NodeId {
-        NodeId(self.public)
+        self.credential.node_id()
+    }
+
+    /// Returns the key list the node is known by: [`Self::credential`] with
+    /// each key as its fingerprint.
+    pub fn key_list(&self) -> &NodeKeyList {
+        self.credential.key_list()
+    }
+
+    /// Returns the keys the node presents in TLS. Unless
+    /// [`Self::with_credential`] replaced it, this holds only
+    /// [`Self::public_key`].
+    pub fn credential(&self) -> &NodeCredential {
+        &self.credential
+    }
+
+    /// Presents `credential` in TLS instead of the one-entry credential,
+    /// which changes the node ID. `credential` must hold this key as its
+    /// Ed25519 entry.
+    ///
+    /// The other entries are opaque here: the node signs only with its
+    /// Ed25519 key, and a peer accepts the rest by their fingerprints.
+    pub fn with_credential(mut self, credential: NodeCredential) -> Result<Self, ForeignKeyList> {
+        if credential.ed25519() != Some(self.public) {
+            return Err(ForeignKeyList);
+        }
+        self.credential = credential;
+        Ok(self)
     }
 
     /// Returns the Ed25519 public key.
@@ -318,6 +342,12 @@ impl NodeSecretKey {
             .expect("ring's Ed25519 signatures are 64 bytes")
     }
 }
+
+/// A credential that does not hold the secret key's public key as its
+/// Ed25519 entry, so the secret key cannot prove it is the node it names.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("the credential does not hold this secret key's Ed25519 public key")]
+pub struct ForeignKeyList;
 
 /// Expands `seed` into an Ed25519 key pair, per RFC 8032.
 fn expand(seed: &[u8; KEY_LENGTH]) -> Ed25519KeyPair {
@@ -345,7 +375,8 @@ impl FromStr for NodeSecretKey {
 /// A node's identity plus the direct addresses to dial it on (API-1).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct NodeAddr {
-    /// The node's identity.
+    /// The node's identity. A dial fails in the TLS handshake unless the
+    /// peer's credential derives this ID (TLS-7).
     pub id: NodeId,
     /// Direct UDP addresses, in the order to try them.
     pub direct: Vec<SocketAddr>,
@@ -419,13 +450,10 @@ mod tests {
     #[test]
     fn rfc8032_vector_derives_and_verifies() {
         let secret: NodeSecretKey = RFC8032_SEED.parse().unwrap();
-        let id = secret.public();
-        assert_eq!(id.to_string(), RFC8032_PUBLIC);
+        assert_eq!(secret.public_key().to_string(), RFC8032_PUBLIC);
         let sig = secret.sign(b"");
         assert_eq!(hex::encode(sig), RFC8032_SIG);
-        id.key().verify_strict(b"", &sig).unwrap();
-        id.verify_strict(b"", &sig).unwrap();
-        assert_eq!(id.verify_strict(b"different", &sig), Err(SignatureError));
+        secret.public_key().verify_strict(b"", &sig).unwrap();
     }
 
     #[test]
@@ -466,16 +494,36 @@ mod tests {
     }
 
     #[test]
-    fn node_key_has_the_node_id_bytes_and_checks() {
+    fn a_secret_keys_node_id_is_the_hash_of_its_one_key_list() {
         let secret: NodeSecretKey = RFC8032_SEED.parse().unwrap();
         let key = secret.public_key();
         assert_eq!(key.to_string(), RFC8032_PUBLIC);
+        assert_eq!(RFC8032_PUBLIC.parse::<NodeKey>(), Ok(key));
         assert_eq!(NodeKey::try_from(&key.as_bytes()[..]), Ok(key));
-        assert_eq!(secret.public().key(), key);
-        assert_eq!(NodeId::from(key), secret.public());
         assert_eq!(
             NodeKey::from_bytes(&IDENTITY),
             Err(KeyParsingError::InvalidKeyData)
+        );
+
+        assert_eq!(secret.public(), key.node_id());
+        assert_eq!(secret.public(), crate::NodeKeyList::single(key).node_id());
+        // The known answer of the key list's own test, for the same key.
+        assert_eq!(
+            secret.public().to_string(),
+            "b596e1f72ff13a26526121761aaa59cdc0b0414ec5673ffcf40e45613c624ce5"
+        );
+    }
+
+    #[test]
+    fn any_32_bytes_are_a_node_id() {
+        // The identity point is no key, and is still a node ID.
+        let id = NodeId::from_bytes(&IDENTITY);
+        assert_eq!(id.as_bytes(), &IDENTITY);
+        assert_eq!(hex::encode(IDENTITY).parse::<NodeId>(), Ok(id));
+        assert_eq!(NodeId::try_from(&IDENTITY[..]), Ok(id));
+        assert_eq!(
+            NodeId::try_from(&IDENTITY[..31]),
+            Err(KeyParsingError::InvalidLength)
         );
     }
 
@@ -485,7 +533,7 @@ mod tests {
         let mut bytes = [0u8; 32];
         bytes[0] = 2;
         assert_eq!(
-            NodeId::from_bytes(&bytes),
+            NodeKey::from_bytes(&bytes),
             Err(KeyParsingError::InvalidKeyData)
         );
     }
@@ -638,11 +686,11 @@ mod tests {
             let sig: [u8; 64] = hex::decode(sig).unwrap().try_into().unwrap();
 
             let secret = NodeSecretKey::from_bytes(&seed);
-            assert_eq!(secret.public().to_string(), public);
+            assert_eq!(secret.public_key().to_string(), public);
             assert_eq!(secret.sign(&message), sig, "{public}");
 
-            let public = secret.public();
-            public.key().verify_strict(&message, &sig).unwrap();
+            let public = secret.public_key();
+            public.verify_strict(&message, &sig).unwrap();
 
             let mut corrupted = Vec::new();
             // A bit flip at each end of R and of S.
@@ -670,7 +718,7 @@ mod tests {
 
             for candidate in corrupted {
                 assert_eq!(
-                    public.key().verify_strict(&message, &candidate),
+                    public.verify_strict(&message, &candidate),
                     Err(SignatureError),
                     "{public}: {}",
                     hex::encode(candidate),
@@ -679,21 +727,18 @@ mod tests {
 
             let mut other = message.clone();
             other.push(0);
-            assert_eq!(
-                public.key().verify_strict(&other, &sig),
-                Err(SignatureError)
-            );
+            assert_eq!(public.verify_strict(&other, &sig), Err(SignatureError));
         }
     }
 
     #[test]
     fn small_order_keys_are_refused() {
         assert_eq!(
-            NodeId::from_bytes(&IDENTITY),
+            NodeKey::from_bytes(&IDENTITY),
             Err(KeyParsingError::InvalidKeyData)
         );
         assert_eq!(
-            NodeId::from_bytes(&ORDER_8),
+            NodeKey::from_bytes(&ORDER_8),
             Err(KeyParsingError::InvalidKeyData)
         );
     }
@@ -704,13 +749,13 @@ mod tests {
         // order, and has a torsion component. It parses, but no signature
         // verifies under it, including one the honest key made.
         let secret: NodeSecretKey = RFC8032_SEED.parse().unwrap();
-        let honest = secret.public();
-        let mixed = NodeId::from_bytes(&add_point(honest.as_bytes(), &ORDER_8))
+        let honest = secret.public_key();
+        let mixed = NodeKey::from_bytes(&add_point(honest.as_bytes(), &ORDER_8))
             .expect("a mixed-order key parses");
         let signature = secret.sign(b"message");
-        assert!(honest.key().verify_strict(b"message", &signature).is_ok());
+        assert!(honest.verify_strict(b"message", &signature).is_ok());
         assert_eq!(
-            mixed.key().verify_strict(b"message", &signature),
+            mixed.verify_strict(b"message", &signature),
             Err(SignatureError)
         );
     }
@@ -723,7 +768,7 @@ mod tests {
         bytes[0] = 0xee;
         bytes[31] = 0x7f;
         assert_eq!(
-            NodeId::from_bytes(&bytes),
+            NodeKey::from_bytes(&bytes),
             Err(KeyParsingError::InvalidKeyData)
         );
         // x = 0 with the sign bit set decodes to the identity, but its
@@ -731,7 +776,7 @@ mod tests {
         let mut negative_zero = IDENTITY;
         negative_zero[31] |= 0x80;
         assert_eq!(
-            NodeId::from_bytes(&negative_zero),
+            NodeKey::from_bytes(&negative_zero),
             Err(KeyParsingError::InvalidKeyData)
         );
     }
@@ -740,11 +785,9 @@ mod tests {
     fn honest_keys_always_pass() {
         for seed in 0..64u8 {
             let secret = NodeSecretKey::from_bytes(&[seed; 32]);
-            let id = secret.public();
-            assert_eq!(NodeId::from_bytes(id.as_bytes()), Ok(id));
-            id.key()
-                .verify_strict(b"msg", &secret.sign(b"msg"))
-                .unwrap();
+            let id = secret.public_key();
+            assert_eq!(NodeKey::from_bytes(id.as_bytes()), Ok(id));
+            id.verify_strict(b"msg", &secret.sign(b"msg")).unwrap();
         }
     }
 
@@ -761,7 +804,7 @@ mod tests {
             carry = sum >> 8;
         }
         assert_eq!(
-            secret.public().key().verify_strict(b"", &sig),
+            secret.public_key().verify_strict(b"", &sig),
             Err(SignatureError)
         );
     }
@@ -772,7 +815,7 @@ mod tests {
         let mut sig = secret.sign(b"");
         sig[..32].copy_from_slice(&IDENTITY);
         assert_eq!(
-            secret.public().key().verify_strict(b"", &sig),
+            secret.public_key().verify_strict(b"", &sig),
             Err(SignatureError)
         );
     }
@@ -786,7 +829,7 @@ mod tests {
         // the challenge over R'. ZIP 215's cofactored equation ignores T, so
         // it alone accepts this signature; the torsion check on R refuses it.
         let secret: NodeSecretKey = RFC8032_SEED.parse().unwrap();
-        let public = secret.public();
+        let public = secret.public_key();
         let expanded = Sha512::digest(secret.to_bytes());
         let mut a_bytes = [0u8; 32];
         a_bytes.copy_from_slice(&expanded[..32]);
@@ -811,10 +854,7 @@ mod tests {
         sig[32..].copy_from_slice(s.as_bytes());
 
         assert!(cofactored_equation_holds(public.as_bytes(), b"msg", &sig));
-        assert_eq!(
-            public.key().verify_strict(b"msg", &sig),
-            Err(SignatureError)
-        );
+        assert_eq!(public.verify_strict(b"msg", &sig), Err(SignatureError));
     }
 
     #[test]
@@ -841,7 +881,7 @@ mod tests {
         a_bytes[31] &= 127;
         a_bytes[31] |= 64;
         let a = Scalar::from_bytes_mod_order(a_bytes);
-        let mixed = add_point(secret.public().as_bytes(), &ORDER_8);
+        let mixed = add_point(secret.public_key().as_bytes(), &ORDER_8);
         let r = Scalar::from_bytes_mod_order([5; 32]);
         let r_point = (r * ED25519_BASEPOINT_POINT).compress().to_bytes();
         let challenge: [u8; 64] = Sha512::new()
@@ -856,8 +896,8 @@ mod tests {
         sig[32..].copy_from_slice(s.as_bytes());
 
         assert!(cofactored_equation_holds(&mixed, b"msg", &sig));
-        let mixed = NodeId::from_bytes(&mixed).expect("a mixed-order key parses");
-        assert_eq!(mixed.key().verify_strict(b"msg", &sig), Err(SignatureError));
+        let mixed = NodeKey::from_bytes(&mixed).expect("a mixed-order key parses");
+        assert_eq!(mixed.verify_strict(b"msg", &sig), Err(SignatureError));
     }
 
     /// ID-1: y = p + k encodes the same point as y = k. Some of those points
@@ -877,7 +917,7 @@ mod tests {
                 continue;
             }
             assert_eq!(
-                NodeId::from_bytes(&bytes),
+                NodeKey::from_bytes(&bytes),
                 Err(KeyParsingError::InvalidKeyData),
                 "y = p + {k}"
             );

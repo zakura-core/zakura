@@ -1,4 +1,5 @@
-//! Presents the local Ed25519 key as an RFC 7250 raw public key (TLS-2, TLS-3).
+//! Presents the local credential as an RFC 7250 raw public key and signs
+//! with its Ed25519 key (TLS-2 to TLS-4).
 //!
 //! Adapted from `iroh/src/tls/resolver.rs` at fork tag `zakura-iroh-v1.1.0-rc.1`.
 //! Copyright 2025 N0, INC. Licensed under MIT OR Apache-2.0.
@@ -68,7 +69,7 @@ impl std::fmt::Debug for Ed25519SigningKey {
 
 impl Ed25519SigningKey {
     fn spki(&self) -> SubjectPublicKeyInfoDer<'static> {
-        super::ed25519_spki(&self.0.public_key())
+        self.0.credential().to_spki()
     }
 }
 

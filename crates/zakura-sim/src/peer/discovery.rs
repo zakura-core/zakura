@@ -86,7 +86,7 @@ fn body(
     direct_addrs: Vec<SocketAddr>,
 ) -> ZakuraNodeRecordBody {
     ZakuraNodeRecordBody {
-        node_id: secret.public(),
+        keys: secret.key_list().clone(),
         direct_addrs,
         services: vec![ZakuraServiceId::discovery()],
         zakura_protocol_min: handshake.zakura_protocol_min,

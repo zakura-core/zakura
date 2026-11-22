@@ -29,8 +29,8 @@ use zakura_rt::{
 };
 
 use crate::{
+    credential::NodeCredential,
     error::{ReadError, WriteError},
-    key::NodeId,
 };
 
 pub(crate) mod connection;
@@ -279,7 +279,8 @@ impl ConnRef {
 /// What a completed handshake proved (TLS-8).
 #[derive(Clone, Debug)]
 pub(crate) struct Handshake {
-    pub(crate) remote_id: Option<NodeId>,
+    /// The credential the peer proved, from which its node ID derives.
+    pub(crate) remote: Option<Arc<NodeCredential>>,
     pub(crate) alpn: Option<Vec<u8>>,
 }
 

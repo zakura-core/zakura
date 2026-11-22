@@ -289,10 +289,9 @@ impl SeededInputs {
             inputs = inputs.tls_random(self.streams.slot);
         }
         if set(Source::KeyExchange) {
-            // The groups a production endpoint offers first, in its order:
-            // the hybrid, then X25519.
-            let slot = self.streams.slot;
-            inputs = inputs.kx_groups(vec![slot.hybrid(), slot]);
+            // The one group a production endpoint offers: the hybrid, built
+            // on the slot's seeded X25519.
+            inputs = inputs.kx_groups(vec![self.streams.slot.hybrid()]);
         }
         inputs.provider_watch(self.lease.clone())
     }

@@ -256,7 +256,7 @@ fn the_endpoint_inputs_set_every_source() {
     assert_eq!(
         format!("{inputs:?}"),
         "EndpointInputs { rng_seed: true, reset_key: true, cid_generator: true, \
-         initial_dst_cid: true, token_key: true, tls_random: true, kx_groups: Some(2) }"
+         initial_dst_cid: true, token_key: true, tls_random: true, kx_groups: Some(1) }"
     );
 }
 

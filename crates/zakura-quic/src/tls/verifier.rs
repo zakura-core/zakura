@@ -3,32 +3,28 @@
 //! Adapted from `iroh/src/tls/verifier.rs` at fork tag `zakura-iroh-v1.1.0-rc.1`.
 //! Copyright 2025 N0, INC. Licensed under MIT OR Apache-2.0.
 //!
-//! One change: Iroh decoded the expected server identity from a synthetic
-//! server name. Zakura builds one verifier per dial that holds the expected
-//! [`NodeId`] in memory (TLS-6), so no name encoding is needed.
+//! Two changes from Iroh. Iroh decoded the expected server identity from a
+//! synthetic server name; Zakura builds one verifier per dial that holds the
+//! expected [`NodeId`] in memory (TLS-6). And the raw public key is the
+//! node's credential, not a bare Ed25519 key (TLS-3), so both verifiers read
+//! it through [`super::credential_from_cert`] and check the signature with
+//! the credential's Ed25519 key themselves.
 
 use rustls::{
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
-    crypto::{verify_tls13_signature_with_raw_key, WebPkiSupportedAlgorithms},
     server::danger::{ClientCertVerified, ClientCertVerifier},
     CertificateError, DigitallySignedStruct, DistinguishedName, SignatureScheme,
     SupportedProtocolVersion,
 };
-use rustls_pki_types::{
-    alg_id, AlgorithmIdentifier, CertificateDer, InvalidSignature, ServerName,
-    SignatureVerificationAlgorithm, SubjectPublicKeyInfoDer, UnixTime,
-};
+use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 
-use crate::key::{NodeId, NodeKey};
+use crate::{credential::NodeCredential, key::NodeId};
 
 /// TLS 1.3 is the only version (TLS-1).
 pub(crate) const PROTOCOL_VERSIONS: &[&SupportedProtocolVersion] = &[&rustls::version::TLS13];
 
-const ED25519_STRICT: Ed25519Strict = Ed25519Strict;
-const SUPPORTED_SIG_ALGS: WebPkiSupportedAlgorithms = WebPkiSupportedAlgorithms {
-    all: &[&ED25519_STRICT],
-    mapping: &[(SignatureScheme::ED25519, &[&ED25519_STRICT])],
-};
+/// The signature schemes a peer may sign its handshake with (TLS-4).
+const SIGNATURE_SCHEMES: &[SignatureScheme] = &[SignatureScheme::ED25519];
 
 /// Accepts the server only if its credential derives the dialed node ID (TLS-7).
 #[derive(Debug)]
@@ -51,18 +47,12 @@ impl ServerCertVerifier for ServerCertificateVerifier {
         _ocsp_response: &[u8],
         _now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        if !intermediates.is_empty() {
+        let credential = verifiable_credential(end_entity, intermediates)?;
+        if credential.node_id() != self.expected {
             return Err(rustls::Error::InvalidCertificate(
                 CertificateError::UnknownIssuer,
             ));
         }
-
-        if super::node_id_from_credential(end_entity.as_ref()) != Some(self.expected) {
-            return Err(rustls::Error::InvalidCertificate(
-                CertificateError::UnknownIssuer,
-            ));
-        }
-
         Ok(ServerCertVerified::assertion())
     }
 
@@ -83,16 +73,11 @@ impl ServerCertVerifier for ServerCertificateVerifier {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        verify_tls13_signature_with_raw_key(
-            message,
-            &SubjectPublicKeyInfoDer::from(cert.as_ref()),
-            dss,
-            &SUPPORTED_SIG_ALGS,
-        )
+        verify_signature(message, cert, dss)
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        SUPPORTED_SIG_ALGS.supported_schemes()
+        SIGNATURE_SCHEMES.to_vec()
     }
 
     fn requires_raw_public_keys(&self) -> bool {
@@ -100,10 +85,10 @@ impl ServerCertVerifier for ServerCertificateVerifier {
     }
 }
 
-/// Requires a client raw public key (TLS-5).
+/// Requires a client credential (TLS-5).
 ///
-/// rustls verifies the handshake signature against the presented key, which
-/// proves possession of the key that determines the client's node ID (TLS-8).
+/// The handshake signature, checked with the credential's Ed25519 key, proves
+/// the client holds the credential its node ID derives from (TLS-8).
 #[derive(Debug, Default)]
 pub(super) struct ClientCertificateVerifier;
 
@@ -122,16 +107,7 @@ impl ClientCertVerifier for ClientCertificateVerifier {
         intermediates: &[CertificateDer<'_>],
         _now: UnixTime,
     ) -> Result<ClientCertVerified, rustls::Error> {
-        if !intermediates.is_empty() {
-            return Err(rustls::Error::InvalidCertificate(
-                CertificateError::UnknownIssuer,
-            ));
-        }
-        if super::node_id_from_credential(end_entity.as_ref()).is_none() {
-            return Err(rustls::Error::InvalidCertificate(
-                CertificateError::BadEncoding,
-            ));
-        }
+        verifiable_credential(end_entity, intermediates)?;
         Ok(ClientCertVerified::assertion())
     }
 
@@ -152,16 +128,11 @@ impl ClientCertVerifier for ClientCertificateVerifier {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        verify_tls13_signature_with_raw_key(
-            message,
-            &SubjectPublicKeyInfoDer::from(cert.as_ref()),
-            dss,
-            &SUPPORTED_SIG_ALGS,
-        )
+        verify_signature(message, cert, dss)
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        SUPPORTED_SIG_ALGS.supported_schemes()
+        SIGNATURE_SCHEMES.to_vec()
     }
 
     fn root_hint_subjects(&self) -> &[DistinguishedName] {
@@ -173,31 +144,49 @@ impl ClientCertVerifier for ClientCertificateVerifier {
     }
 }
 
-/// Ed25519 with `verify_strict` (ID-6).
-#[derive(Debug)]
-struct Ed25519Strict;
-
-impl SignatureVerificationAlgorithm for Ed25519Strict {
-    fn verify_signature(
-        &self,
-        public_key: &[u8],
-        message: &[u8],
-        signature: &[u8],
-    ) -> Result<(), InvalidSignature> {
-        let key = NodeKey::try_from(public_key).map_err(|_| InvalidSignature)?;
-        key.verify_strict(message, signature)
-            .map_err(|_| InvalidSignature)
+/// Reads a peer's credential and checks this release can authenticate it: it
+/// stands alone and holds an Ed25519 key (TLS-3, ID-11).
+fn verifiable_credential(
+    end_entity: &CertificateDer<'_>,
+    intermediates: &[CertificateDer<'_>],
+) -> Result<NodeCredential, rustls::Error> {
+    if !intermediates.is_empty() {
+        return Err(rustls::Error::InvalidCertificate(
+            CertificateError::UnknownIssuer,
+        ));
     }
-
-    fn public_key_alg_id(&self) -> AlgorithmIdentifier {
-        alg_id::ED25519
+    let credential = super::credential_from_cert(end_entity.as_ref()).ok_or(
+        rustls::Error::InvalidCertificate(CertificateError::BadEncoding),
+    )?;
+    // A well-formed credential with no key this release can check is
+    // unverifiable, not malformed (ID-11): the handshake fails either way.
+    if credential.ed25519().is_none() {
+        return Err(rustls::Error::InvalidCertificate(
+            CertificateError::ApplicationVerificationFailure,
+        ));
     }
+    Ok(credential)
+}
 
-    fn signature_alg_id(&self) -> AlgorithmIdentifier {
-        alg_id::ED25519
+/// Checks the peer's handshake signature with its credential's Ed25519 key
+/// under ID-6's strict rules (TLS-4).
+fn verify_signature(
+    message: &[u8],
+    cert: &CertificateDer<'_>,
+    dss: &DigitallySignedStruct,
+) -> Result<HandshakeSignatureValid, rustls::Error> {
+    if dss.scheme != SignatureScheme::ED25519 {
+        return Err(rustls::Error::PeerMisbehaved(
+            rustls::PeerMisbehaved::SignedHandshakeWithUnadvertisedSigScheme,
+        ));
     }
-
-    fn fips(&self) -> bool {
-        false
-    }
+    // rustls calls this only after a verifier accepted `cert`.
+    let key = super::credential_from_cert(cert.as_ref())
+        .and_then(|credential| credential.ed25519())
+        .ok_or(rustls::Error::InvalidCertificate(
+            CertificateError::BadEncoding,
+        ))?;
+    key.verify_strict(message, dss.signature())
+        .map_err(|_| rustls::Error::InvalidCertificate(CertificateError::BadSignature))?;
+    Ok(HandshakeSignatureValid::assertion())
 }

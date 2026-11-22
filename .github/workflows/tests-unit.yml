@@ -438,28 +438,6 @@ jobs:
       - name: Test zakura-state with the Sprout note commitment tree
         run: cargo test --locked -p zakura-state --features sprout
 
-  # Handshakes between this tree's zakura-quic and the release deployed nodes
-  # run, in both directions. `qa/quic-compat` is its own workspace because
-  # the released crate shares this tree's name and version.
-  quic-cross-version:
-    name: QUIC handshakes with the released zakura-quic
-    needs: changes
-    if: vars.TEMPORARY_PR_CI != 'true' && (needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request')
-    permissions:
-      contents: read
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 #v2.0.1
-        with:
-          toolchain: stable
-          cache-workspaces: qa/quic-compat
-      - name: Test handshakes across versions
-        run: cargo test --locked --manifest-path qa/quic-compat/Cargo.toml
-
   network-dependent:
     name: network-dependent acceptance tests
     needs: changes
@@ -775,7 +753,6 @@ jobs:
       - zakura-config
       - extended-reissuance-properties
       - sprout-enabled
-      - quic-cross-version
       - network-dependent
       - pruned-storage
       - check-no-git-dependencies
@@ -800,7 +777,7 @@ jobs:
         with:
           jobs: ${{ toJSON(needs) }}
           # These jobs are skipped outside their event or changed-path scope:
-          # build-tests / unit-tests / sprout-enabled / quic-cross-version / network-dependent skip on pull requests
+          # build-tests / unit-tests / sprout-enabled / network-dependent skip on pull requests
           # that touch no test-relevant paths (unit-tests and zakura-config
           # cascade-skip with build-tests), pruned-storage is push-main only,
           # check-no-git-dependencies is A-release-label only, publish-graph
@@ -809,7 +786,7 @@ jobs:
           # schedule and manual dispatch, so a nightly failure still fails
           # this status and reaches report-nightly-result.
           # Failed, non-skipped jobs still fail this aggregate status.
-          allowed-skips: temporary-unit-tests, check-no-git-dependencies, pruned-storage, zakura-config, build-tests, unit-tests, extended-reissuance-properties, sprout-enabled, quic-cross-version, network-dependent, publish-graph, sim-build, sim-sanitizers, sim-feedback, zakura-testkit
+          allowed-skips: temporary-unit-tests, check-no-git-dependencies, pruned-storage, zakura-config, build-tests, unit-tests, extended-reissuance-properties, sprout-enabled, network-dependent, publish-graph, sim-build, sim-sanitizers, sim-feedback, zakura-testkit
 
   report-nightly-result:
     name: report nightly release test result

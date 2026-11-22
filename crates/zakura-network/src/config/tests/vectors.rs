@@ -1360,12 +1360,12 @@ fn zakura_peer_memory_budget_lowers_or_refuses_at_load() {
         r#"
         [zakura]
         max_connections = 256
-        peer_memory_budget_bytes = 38751881472
+        peer_memory_budget_bytes = 38753870592
         "#,
     )
     .unwrap();
     // One 256 MiB socket queue, 32 handshakes of 64 MiB, and 256 admitted
-    // connections of 141,937,353 bytes.
+    // connections of 141,945,123 bytes.
     assert_eq!(
         config.zakura.budgeted_max_connections(&config.network),
         Ok(256)
@@ -1788,7 +1788,9 @@ fn zakura_secret_key_text_forms_keep_their_node_id() {
     // RFC 8032 §7.1 test 1: the seed and the public key it derives.
     const SEED_HEX: &str = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60";
     const SEED_BASE32: &str = "TVQ3DHPP7VNGBOUEJL2JF3BMYRCETRLJPMZGSGLQHOWAGHFOP5QA";
-    const NODE_ID: &str = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
+    // The node ID of the one-entry key list that holds that public key,
+    // `d75a98...511a`.
+    const NODE_ID: &str = "b596e1f72ff13a26526121761aaa59cdc0b0414ec5673ffcf40e45613c624ce5";
 
     let key_dir = tempfile::tempdir().expect("failed to create temp key dir");
     let key_file = key_dir.path().join("mainnet.zakura-iroh-secret-key");
@@ -2239,6 +2241,48 @@ fn unconditional_peers_parse_pinned_dns_names_and_roundtrip() {
     // Mainnet runs only the legacy stack by default.
     toml::from_str::<Config>(&format!("unconditional_peers = ['{pinned}']"))
         .expect_err("a pin needs both stacks");
+}
+
+/// The discovery sequence file a release from before key lists wrote, named
+/// after the node's key, is renamed to the node ID's name once.
+#[test]
+fn legacy_discovery_sequence_file_moves_to_the_node_id_name_once() {
+    let _init_guard = zakura_test::init();
+
+    let identity_dir = tempfile::tempdir().expect("failed to create temp identity dir");
+    let config = Config {
+        identity_dir: identity_dir.path().to_owned(),
+        ..Config::default()
+    };
+    let secret_key = zakura_quic::NodeSecretKey::from_bytes(&[7; 32]);
+    let (key, node_id) = (secret_key.public_key(), secret_key.public());
+    let legacy = identity_dir.path().join(format!(
+        "{}.{key}.zakura-discovery-sequence",
+        config.network.lowercase_name()
+    ));
+    let current = config.zakura_discovery_sequence_file(&node_id);
+    assert_ne!(legacy, current);
+
+    // A node that never wrote a sequence file has nothing to move.
+    config.move_legacy_zakura_discovery_sequence_file(&key, &node_id);
+    assert!(!current.exists());
+
+    fs::write(&legacy, "41\n").expect("write the older release's file");
+    config.move_legacy_zakura_discovery_sequence_file(&key, &node_id);
+    assert!(!legacy.exists());
+    assert_eq!(
+        fs::read_to_string(&current).expect("read moved file"),
+        "41\n"
+    );
+
+    // A file under the old name never replaces the one the node now writes.
+    fs::write(&legacy, "7\n").expect("write a stale file under the old name");
+    config.move_legacy_zakura_discovery_sequence_file(&key, &node_id);
+    assert_eq!(
+        fs::read_to_string(&current).expect("read kept file"),
+        "41\n"
+    );
+    assert!(legacy.exists());
 }
 
 /// A node ID can only pin a DNS name with a port, and must be a valid node ID.

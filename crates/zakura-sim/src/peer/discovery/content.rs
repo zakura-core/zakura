@@ -94,11 +94,11 @@ impl DiscoveryContent {
                 !forged.is_empty()
                     || self.foreign(record)
                     || self.incompatible(record)
-                    || record.body.node_id != self.peer
+                    || record.body.node_id() != self.peer
             }
             DiscoveryMessage::Peers { records } => {
                 let node_ids: Vec<NodeId> =
-                    records.iter().map(|record| record.body.node_id).collect();
+                    records.iter().map(|record| record.body.node_id()).collect();
                 !forged.is_empty()
                     || records.iter().any(|record| self.foreign(record))
                     || repeats(&node_ids)

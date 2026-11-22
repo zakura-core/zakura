@@ -277,8 +277,8 @@ fn an_altered_ciphertext_gives_the_dialer_another_secret() {
     assert_eq!(dialer_x25519, listener_x25519);
 }
 
-/// The X25519 half is offered as a plain X25519 share too, and a listener
-/// that only has X25519 completes against it.
+/// A provider that also enables standalone X25519 can reuse the hybrid's
+/// X25519 half for that exchange.
 #[test]
 fn the_x25519_half_completes_against_a_plain_x25519_listener() {
     let dialer = x25519_mlkem768().start().unwrap();

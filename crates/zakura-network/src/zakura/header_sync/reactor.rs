@@ -3659,8 +3659,7 @@ fn next_height(height: block::Height) -> block::Height {
 }
 
 fn node_id_from_peer(peer: &ZakuraPeerId) -> Option<NodeId> {
-    let bytes: [u8; 32] = peer.as_bytes().try_into().ok()?;
-    NodeId::from_bytes(&bytes).ok()
+    peer.node_id()
 }
 
 fn source_id_from_peer(peer: &ZakuraPeerId) -> zakura_header_chain::SourceId {

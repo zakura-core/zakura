@@ -16,8 +16,10 @@ use zakura_rt::{
 };
 
 use crate::{
+    credential::NodeCredential,
     driver::{ConnCmd, ConnRef, ConnShared},
     key::{NodeId, NodeKey},
+    key_list::NodeKeyList,
     stream::{RecvStream, SendStream},
 };
 
@@ -278,7 +280,9 @@ impl Hooks {
 #[derive(Clone)]
 pub struct Conn {
     inner: ConnRef,
-    remote_id: NodeId,
+    /// The credential the peer proved in TLS. The verifier accepted it only
+    /// with an Ed25519 key (TLS-4).
+    remote: Arc<NodeCredential>,
     admitted_addr: SocketAddr,
     admitted_at: Instant,
     source_validated: bool,
@@ -288,7 +292,7 @@ pub struct Conn {
 impl fmt::Debug for Conn {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Conn")
-            .field("remote_id", &self.remote_id)
+            .field("remote_id", &self.remote_id())
             .field("admitted_addr", &self.admitted_addr)
             .field("admitted_at", &self.admitted_at)
             .field("source_validated", &self.source_validated)
@@ -300,7 +304,7 @@ impl fmt::Debug for Conn {
 impl Conn {
     pub(crate) fn new(
         inner: ConnRef,
-        remote_id: NodeId,
+        remote: Arc<NodeCredential>,
         admitted_addr: SocketAddr,
         admitted_at: Instant,
         source_validated: bool,
@@ -308,7 +312,7 @@ impl Conn {
     ) -> Self {
         Self {
             inner,
-            remote_id,
+            remote,
             admitted_addr,
             admitted_at,
             source_validated,
@@ -316,14 +320,23 @@ impl Conn {
         }
     }
 
-    /// The peer's node ID, proven by the TLS handshake (TLS-8).
+    /// The peer's node ID, derived from the credential it proved in the TLS
+    /// handshake (TLS-8).
     pub fn remote_id(&self) -> NodeId {
-        self.remote_id
+        self.remote.node_id()
+    }
+
+    /// The key list the peer proved in the TLS handshake: the list its node
+    /// ID is the hash of (TLS-8).
+    pub fn remote_key_list(&self) -> &NodeKeyList {
+        self.remote.key_list()
     }
 
     /// The Ed25519 key the peer proved in the TLS handshake (TLS-8).
     pub fn remote_key(&self) -> NodeKey {
-        self.remote_id.key()
+        self.remote
+            .ed25519()
+            .expect("the TLS verifiers accept only a credential with an Ed25519 key")
     }
 
     /// The IP admitted at accept or dial time. It never changes (PATH-4).

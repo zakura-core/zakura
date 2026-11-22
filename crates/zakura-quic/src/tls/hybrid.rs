@@ -27,7 +27,7 @@ use super::mlkem::{self, DecapsulationKey, MlKem768};
 /// The length of an X25519 share.
 const X25519_LEN: usize = 32;
 
-/// The hybrid group production endpoints offer first: ring's X25519, and
+/// The hybrid group production endpoints offer: ring's X25519, and
 /// ML-KEM-768 drawing from the same random source ring's provider uses.
 pub(crate) fn x25519_mlkem768() -> &'static dyn SupportedKxGroup {
     static GROUP: LazyLock<X25519MlKem768> = LazyLock::new(|| {
@@ -126,9 +126,8 @@ impl ActiveKeyExchange for Dialer {
         Ok(combine(&mlkem768_secret, &x25519_secret))
     }
 
-    /// The X25519 half, so rustls also sends it as a plain X25519 share. A
-    /// listener without the hybrid then answers that share in the same
-    /// round trip.
+    /// The X25519 half. rustls sends a separate share for it only when the
+    /// provider also enables standalone X25519.
     fn hybrid_component(&self) -> Option<(NamedGroup, &[u8])> {
         Some((self.x25519.group(), self.x25519.pub_key()))
     }

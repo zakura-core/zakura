@@ -125,7 +125,7 @@ counts, the places it holds, and its v2 peers. In this example the node has
 | `window.newest`, `window.oldest` | The heights that count, or null while the tip is below 100. |
 | `window.checked` | Heights in the window read so far. |
 | `window.coverage` | The share of the window read, from 0 to 1. Below 1 the counts are a lower bound, as on a pruned node. A tip below 100 has an empty window, which reports 1. |
-| `gateways` | The last ranking applied by v2 networking, best first, at most 256 gateways. This node's own ID, and IDs that are not valid node IDs, are left out. |
+| `gateways` | The last ranking applied by v2 networking, best first, at most 256 gateways. This node's own ID is left out. |
 | `gateways[].state` | See below. |
 | `gateways[].connected` | The gateway is a v2 peer now. |
 | `hold` | The connection places held for preferred gateways. |

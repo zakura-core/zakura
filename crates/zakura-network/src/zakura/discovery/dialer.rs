@@ -12,7 +12,7 @@ use zakura_rt::{
 
 use super::{native_dial_supervised, RedialPolicy};
 use crate::zakura::{
-    handler::{DialRegistration, DialReport, NativeDialKind},
+    handler::{DialRegistration, DialReport},
     ZakuraEndpoint, ZakuraHandlerError, ZakuraLocalLimits, DEFAULT_ZAKURA_REDIAL_INITIAL_BACKOFF,
     DEFAULT_ZAKURA_REDIAL_MAX_BACKOFF,
 };
@@ -151,26 +151,25 @@ pub(crate) async fn native_bootstrap_dial(
         node_addr,
         limits,
         Some(report),
-        NativeDialKind::Maintained,
+        crate::zakura::handler::NativeDialKind::Maintained,
     )
     .await
 }
 
-/// Dials a discovery candidate as a `kind` dial and reports on `report` the
-/// address whose handshake TLS authenticated and how registration ended.
+/// Dials a discovery candidate and reports on `report` the address whose
+/// handshake TLS authenticated and how registration ended.
 pub(crate) async fn native_discovery_dial(
     endpoint: &ZakuraEndpoint,
     node_addr: NodeAddr,
     limits: &ZakuraLocalLimits,
     report: DialReport,
-    kind: NativeDialKind,
 ) -> Result<(), ZakuraHandlerError> {
     crate::zakura::handler::serve_reported_native_dial_connection(
         endpoint,
         node_addr,
         limits,
         Some(report),
-        kind,
+        crate::zakura::handler::NativeDialKind::Discovery,
     )
     .await
 }
@@ -290,13 +289,7 @@ mod tests {
             };
             let result = tokio::time::timeout(
                 Duration::from_millis(200),
-                native_discovery_dial(
-                    &endpoint,
-                    target,
-                    &limits,
-                    report,
-                    NativeDialKind::Discovery,
-                ),
+                native_discovery_dial(&endpoint, target, &limits, report),
             )
             .await?;
             assert!(matches!(result, Err(ref error) if error.is_pre_dial_limit()));

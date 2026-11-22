@@ -740,6 +740,70 @@ async fn shutdown_joins_started_and_unpolled_workers_before_discarding_reservati
     node.shutdown().await;
 }
 
+// A preferred dial reserves its address attempts under discovery's transport
+// ceiling, so a dial to an unresponsive gateway leaves the dial reserve that
+// bootstrap and maintained dials rely on.
+#[tokio::test]
+async fn preferred_dials_leave_the_maintained_dial_reserve() {
+    zakura_rt::time::timeout(Duration::from_secs(15), async {
+        let limits = ZakuraLocalLimits {
+            max_connections: 2,
+            max_pending_handshakes: 1,
+            ..ZakuraLocalLimits::from_config(&crate::Config::default())
+        };
+        let node = crate::zakura::testkit::ZakuraTestNode::builder(9222)
+            .limits(limits.clone())
+            .quic_config(zakura_quic::QuicConfig {
+                handshake_timeout_secs: Some(30),
+                ..Default::default()
+            })
+            .spawn()
+            .await
+            .unwrap();
+        let peer = crate::zakura::testkit::ZakuraTestNode::builder(9223)
+            .spawn()
+            .await
+            .unwrap();
+        let endpoint = node.endpoint();
+        let mut state =
+            CandidateDialerState::new((Duration::from_secs(60), Duration::from_secs(3_600)));
+        let silent = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target = node_id(6);
+        let attempt = state
+            .record_attempt(target, vec![IpAddr::from([127, 0, 0, 1])])
+            .unwrap();
+        let worker = DiscoveryDialWorker::spawn(
+            attempt,
+            run_discovery_dial_once(
+                endpoint.clone(),
+                NodeAddr::with_addrs(target, [silent.local_addr().unwrap()]),
+                limits.clone(),
+                attempt,
+            ),
+        );
+        let mut packet = [0; 2048];
+        silent.recv_from(&mut packet).await.unwrap();
+
+        // The unanswered dial holds the only slot under discovery's
+        // ceiling. A connection slot is still free, but a preferred dial
+        // gets no address attempt.
+        assert_eq!(endpoint.discovery_admission_capacity(), 0);
+        assert!(endpoint.preferred_dial_permits() > 0);
+        assert_eq!(endpoint.preferred_dial_capacity(), 0);
+        // The dial reserve stays free for a maintained dial.
+        node.connect_native(&peer, Duration::from_secs(5))
+            .await
+            .expect("a maintained dial still gets a slot");
+
+        worker.task.abort();
+        let _ = worker.await;
+        node.shutdown().await;
+        peer.shutdown().await;
+    })
+    .await
+    .expect("the test finishes in time");
+}
+
 #[tokio::test]
 async fn cancelled_worker_releases_its_real_quic_dial_capacity() {
     zakura_rt::time::timeout(Duration::from_secs(15), async {
@@ -774,7 +838,6 @@ async fn cancelled_worker_releases_its_real_quic_dial_capacity() {
                     NodeAddr::with_addrs(target, [silent.local_addr().unwrap()]),
                     limits.clone(),
                     attempt,
-                    NativeDialKind::Discovery,
                 ),
             );
             let mut packet = [0; 2048];

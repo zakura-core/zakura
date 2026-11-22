@@ -205,7 +205,7 @@ pub(super) struct PreferredRound {
 pub(super) struct PreferredRoom {
     /// Free connection slots, held places included.
     pub(super) connections: usize,
-    /// Address attempts the transport's whole-table cap has room for.
+    /// Address attempts discovery's transport ceiling has room for.
     pub(super) address_attempts: usize,
     /// Dials that may start before the dialer reaches its limit on dials in
     /// flight.
@@ -277,11 +277,12 @@ pub(super) struct RoundClaims {
 /// dialed and the discovery book holds it in no backoff. A member with a
 /// lower node ID than this node's is dialed only once it has stayed in
 /// `dialable` for [`MUTUAL_DIAL_GRACE`], as [`DeferredDials`] explains. The
-/// pass keeps the ordinary pass's rules for each attempt: one attempt per node, the
-/// per-IP backoff, and the supervisor's per-IP check `accepts_ip`. It does
-/// not apply discovery's soft cap: a member takes a held place, so it only
-/// needs a free connection slot, and it dials under the transport's
-/// whole-table cap as maintained dials do.
+/// pass keeps the ordinary pass's rules for each attempt: one attempt per
+/// node, the per-IP backoff, the supervisor's per-IP check `accepts_ip`, and
+/// discovery's transport ceiling, which leaves the dial reserve to bootstrap
+/// and maintained dials. It does not apply discovery's soft cap on
+/// connections: a member takes a held place, so it only needs a free
+/// connection slot.
 pub(super) fn admit_preferred_dials(
     state: &mut CandidateDialerState,
     set: &[NodeId],

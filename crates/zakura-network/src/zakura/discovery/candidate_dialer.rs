@@ -33,7 +33,7 @@ use super::protocol::{DialAdmission, ZakuraDiscoveryDialCandidate, ZakuraDiscove
 use super::redial::ZAKURA_REDIAL_HEALTHY_CONNECTION;
 use super::trace::{DialOwner, DialPhase, DiscoveryDialPhaseEvent, DiscoveryDialResultEvent};
 use crate::zakura::{
-    handler::{DialRegistration, DialReport, NativeDialKind},
+    handler::{DialRegistration, DialReport},
     PreferredGateways, ZakuraEndpoint, ZakuraHandlerError, ZakuraLocalLimits, ZakuraPeerId,
     ZakuraServiceId, ZakuraTrace,
 };
@@ -248,12 +248,10 @@ impl CandidateDialerIO {
         for (attempt, node_addr) in round.preferred {
             self.preferred_attempts.insert(attempt);
             metrics::counter!("zakura.p2p.discovery.dial.preferred.started").increment(1);
-            self.spawn_dial(attempt, node_addr, NativeDialKind::Maintained)
-                .await;
+            self.spawn_dial(attempt, node_addr).await;
         }
         for (attempt, node_addr) in round.ordinary {
-            self.spawn_dial(attempt, node_addr, NativeDialKind::Discovery)
-                .await;
+            self.spawn_dial(attempt, node_addr).await;
         }
     }
 
@@ -333,13 +331,10 @@ impl CandidateDialerIO {
         round
     }
 
-    /// Starts a worker that dials `node_addr` for `attempt` as a `kind` dial.
-    async fn spawn_dial(
-        &mut self,
-        attempt: DialAttemptKey,
-        node_addr: NodeAddr,
-        kind: NativeDialKind,
-    ) {
+    /// Starts a worker that dials `node_addr` for `attempt` under discovery's
+    /// transport ceiling, which leaves the dial reserve to bootstrap and
+    /// maintained dials.
+    async fn spawn_dial(&mut self, attempt: DialAttemptKey, node_addr: NodeAddr) {
         self.discovery.mark_dial_attempt(&attempt.node_id).await;
         metrics::counter!("zakura.p2p.discovery.dial.started").increment(1);
         trace_dial_phase(&self.trace, attempt, DialPhase::Recorded);
@@ -350,7 +345,6 @@ impl CandidateDialerIO {
                 node_addr,
                 self.limits.clone(),
                 attempt,
-                kind,
             ),
         ));
     }
@@ -548,14 +542,11 @@ fn discovery_node_addr_with_reserved_ip_capacity(
     })
 }
 
-/// Dials `node_addr` once as a `kind` dial and classifies the attempt by
-/// what the registrations show for its peer.
 async fn run_discovery_dial_once(
     endpoint: ZakuraEndpoint,
     node_addr: NodeAddr,
     limits: ZakuraLocalLimits,
     attempt: DialAttemptKey,
-    kind: NativeDialKind,
 ) -> DiscoveryDialOutcome {
     let finished = |result| DiscoveryDialOutcome {
         admitted_addr: None,
@@ -579,7 +570,7 @@ async fn run_discovery_dial_once(
     };
     let dial = AbortOnDropHandle::new(spawn_erased_named("discovery_dial", {
         let endpoint = endpoint.clone();
-        async move { native_discovery_dial(&endpoint, node_addr, &limits, report, kind).await }
+        async move { native_discovery_dial(&endpoint, node_addr, &limits, report).await }
     }));
     DialWatch {
         attempt,

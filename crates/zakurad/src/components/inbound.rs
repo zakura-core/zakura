@@ -220,7 +220,7 @@ async fn retained_block_height(mut state: State, hash: block::Hash) -> Option<bl
     }
 }
 
-/// Returns a committed block from any active chain, or else a pending block.
+/// Serves an exact authorized prepared body directly. Other requests prefer committed state.
 ///
 /// Peers can request a hash on any active chain, even when this node does not consider it best.
 /// A pending body can be unvalidated and differ from a committed block with the same header
@@ -232,6 +232,15 @@ async fn block_by_hash_or_pending(
     hash: block::Hash,
 ) -> Result<Option<ServedBlock>, zn::BoxError> {
     let pending = pending_blocks.get_for_peer(hash);
+    if pending.as_ref().is_some_and(|body| {
+        body.pending_send
+            .as_ref()
+            .and_then(|permit| permit.attempt_checksum())
+            .and_then(|attempt| attempt.prepared_bytes())
+            .is_some()
+    }) {
+        return Ok(pending);
+    }
 
     let response = state
         .ready()

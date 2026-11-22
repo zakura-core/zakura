@@ -12,6 +12,7 @@ use super::{
     http::{HttpBody, HttpRequest, HttpResponse},
     http_request_compatibility::HttpRequestMiddleware,
 };
+use crate::methods::trusted_block::jobs::{JobError, JobId, Operation};
 use crate::methods::types::submit_block::{SubmitBlockErrorResponse, SubmitBlockResponse};
 
 /// Failures before a block is submitted to validation.
@@ -26,6 +27,26 @@ pub(super) type SubmissionFuture =
     Pin<Box<dyn Future<Output = Result<SubmitBlockResponse, TrustedSubmissionError>> + Send>>;
 pub(super) type Submit = Arc<dyn Fn(Bytes) -> SubmissionFuture + Send + Sync>;
 
+pub(super) type JobFuture = Pin<Box<dyn Future<Output = Result<(), JobError>> + Send>>;
+pub(super) type SubmitJob = Arc<dyn Fn(JobId, Operation, Bytes) -> JobFuture + Send + Sync>;
+
+enum Route {
+    Full(Submit),
+    Job(JobId, Operation, SubmitJob),
+}
+
+impl Route {
+    fn limit(&self) -> usize {
+        match self {
+            // The largest Zcash solved header is 1,487 bytes.
+            Self::Job(_, Operation::Solve, _) => 1_487,
+            Self::Job(_, Operation::Confirm, _) => 64,
+            _ => usize::try_from(zakura_chain::block::MAX_BLOCK_BYTES)
+                .expect("block limit fits supported platforms"),
+        }
+    }
+}
+
 /// Routes only the binary endpoint; all other traffic retains its JSON middleware.
 ///
 /// This is the hyper-level service of both RPC listeners, not a tower service, because hyper
@@ -37,6 +58,7 @@ pub(super) type Submit = Arc<dyn Fn(Bytes) -> SubmissionFuture + Send + Sync>;
 pub(super) struct TrustedBlockHttpService<S> {
     json: S,
     submit: Option<Submit>,
+    jobs: Option<SubmitJob>,
     credentials: HttpRequestMiddleware<()>,
     body_slots: Arc<Semaphore>,
 }
@@ -46,9 +68,15 @@ impl<S> TrustedBlockHttpService<S> {
         Self {
             json,
             submit,
+            jobs: None,
             credentials: HttpRequestMiddleware::new((), cookie, 0),
             body_slots: Arc::new(Semaphore::new(16)),
         }
+    }
+
+    pub(super) fn with_jobs(mut self, jobs: Option<SubmitJob>) -> Self {
+        self.jobs = jobs;
+        self
     }
 }
 
@@ -92,7 +120,7 @@ impl<S> TrustedBlockHttpService<S> {
     fn admit<B>(
         &self,
         request: &HttpRequest<B>,
-    ) -> Result<(Submit, OwnedSemaphorePermit), HttpResponse> {
+    ) -> Result<(Route, OwnedSemaphorePermit), HttpResponse> {
         let Some(submit) = &self.submit else {
             return Err(response(StatusCode::NOT_FOUND, "disabled"));
         };
@@ -119,6 +147,38 @@ impl<S> TrustedBlockHttpService<S> {
                 "application/octet-stream required",
             ));
         }
+        let route = match request.uri().query() {
+            None => Route::Full(submit.clone()),
+            Some(query) => {
+                let op = match query {
+                    "op=prepare" => Operation::Prepare,
+                    "op=solve" => Operation::Solve,
+                    "op=confirm" => Operation::Confirm,
+                    _ => {
+                        return Err(response(
+                            StatusCode::BAD_REQUEST,
+                            "unknown trusted operation",
+                        ))
+                    }
+                };
+                let Some(jobs) = self.jobs.clone() else {
+                    return Err(response(StatusCode::NOT_FOUND, "disabled"));
+                };
+                let mut ids = request.headers().get_all("x-job-id").iter();
+                let id = ids.next().and_then(|v| v.to_str().ok()).filter(|s| {
+                    s.len() == 32
+                        && s.bytes()
+                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                });
+                let mut key = [0; 16];
+                if ids.next().is_some()
+                    || !id.is_some_and(|id| hex::decode_to_slice(id, &mut key).is_ok())
+                {
+                    return Err(response(StatusCode::BAD_REQUEST, "invalid X-Job-Id"));
+                }
+                Route::Job(key, op, jobs)
+            }
+        };
         let Ok(slot) = self.body_slots.clone().try_acquire_owned() else {
             return Err(response(
                 StatusCode::TOO_MANY_REQUESTS,
@@ -130,23 +190,22 @@ impl<S> TrustedBlockHttpService<S> {
             .get(header::CONTENT_LENGTH)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<u64>().ok())
-            .is_some_and(|length| length > zakura_chain::block::MAX_BLOCK_BYTES)
+            .is_some_and(|length| length > route.limit() as u64)
         {
             return Err(response(StatusCode::PAYLOAD_TOO_LARGE, "block too large"));
         }
-        Ok((submit.clone(), slot))
+        Ok((route, slot))
     }
 }
 
 /// Receives the body within its deadline and size limit, then submits it. `_slot` bounds the
 /// buffered body for the whole submission.
-async fn receive_and_submit<B>(submit: Submit, _slot: OwnedSemaphorePermit, body: B) -> HttpResponse
+async fn receive_and_submit<B>(route: Route, _slot: OwnedSemaphorePermit, body: B) -> HttpResponse
 where
     B: hyper::body::Body<Data = Bytes> + Send + 'static,
     B::Error: Into<BoxError>,
 {
-    let limit = usize::try_from(zakura_chain::block::MAX_BLOCK_BYTES)
-        .expect("block limit fits supported platforms");
+    let limit = route.limit();
     let received_at = std::time::Instant::now();
     let body =
         match tokio::time::timeout(Duration::from_secs(30), Limited::new(body, limit).collect())
@@ -165,6 +224,23 @@ where
     metrics::histogram!("rpc.trusted_submission.receipt.duration_seconds")
         .record(received_at.elapsed().as_secs_f64());
     metrics::counter!("rpc.trusted_submission.received").increment(1);
+    let submit = match route {
+        Route::Full(submit) => submit,
+        Route::Job(id, op, jobs) => {
+            return match jobs(id, op, body).await {
+                Ok(()) => response(StatusCode::ACCEPTED, "received"),
+                Err(JobError::Invalid) => response(StatusCode::BAD_REQUEST, "invalid job input"),
+                Err(JobError::Conflict) => response(StatusCode::CONFLICT, "conflicting job input"),
+                Err(JobError::Capacity) => {
+                    response(StatusCode::TOO_MANY_REQUESTS, "capacity exhausted")
+                }
+                Err(JobError::Expired) => response(StatusCode::GONE, "stale job"),
+                Err(JobError::Unavailable) => {
+                    response(StatusCode::SERVICE_UNAVAILABLE, "inconclusive")
+                }
+            }
+        }
+    };
     match submit(body).await {
         Err(TrustedSubmissionError::Malformed) => {
             response(StatusCode::BAD_REQUEST, "malformed block")

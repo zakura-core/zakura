@@ -51,6 +51,7 @@ proptest-impl = [
 
 
 [dependencies]
+sha2 = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }
 

@@ -337,6 +337,17 @@ impl PendingBlockRegistry {
         self.register(block, early_relay, PendingBlockSendPermit::channel)
     }
 
+    /// Registers the exact authorized wire body alongside its revocable peer permission.
+    pub(crate) fn insert_prepared(
+        &self,
+        block: Arc<block::Block>,
+        bytes: Arc<[u8]>,
+    ) -> Option<PendingBlockRegistration> {
+        self.register(block, true, || {
+            PendingBlockSendPermit::prepared_channel(bytes)
+        })
+    }
+
     pub(crate) fn insert_state_admitted(
         &self,
         block: Arc<block::Block>,

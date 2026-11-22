@@ -2,6 +2,7 @@
 
 #![allow(clippy::unwrap_in_result)]
 
+mod jobs;
 mod native;
 mod pow;
 mod wire;
@@ -106,6 +107,8 @@ struct Node {
     pending: PendingBlockRegistry,
     bans: zakura_network::MisbehaviorReporter,
     gate: ValidationGate,
+    hold_proposal: watch::Sender<bool>,
+    deny_peer_state_read: watch::Sender<bool>,
     hold_relay: watch::Sender<bool>,
     held_relays: mpsc::UnboundedReceiver<HeldRelay>,
     hold_body: watch::Sender<bool>,
@@ -294,6 +297,7 @@ impl Node {
         let (failures, failures_rx) = mpsc::unbounded_channel();
         let gate_sender = held.clone();
         let real_verifier: Verifier = verifier.clone();
+        let (hold_proposal, proposal_gate) = watch::channel(false);
         let gated = tower::service_fn(move |request: VerifyRequest| {
             let verifier = real_verifier.clone();
             let mut held = gate_sender.subscribe();
@@ -304,9 +308,20 @@ impl Node {
                 request,
                 VerifyRequest::Commit(_) | VerifyRequest::CommitMined { .. }
             );
+            let mut proposal_gate = proposal_gate.clone();
+            let client_proposal = matches!(
+                request,
+                VerifyRequest::Prepare {
+                    source: zakura_consensus::PreparedCandidateSource::ClientProposal,
+                    ..
+                }
+            );
             let hash = request.block().hash();
             let verification = verifier.oneshot(request).boxed();
             async move {
+                if client_proposal {
+                    proposal_gate.wait_for(|held| !held).await.unwrap();
+                }
                 if commit {
                     entered.send(hash).unwrap();
                     while *held.borrow_and_update() {
@@ -371,13 +386,27 @@ impl Node {
             ));
             native_tasks.push(driver.abort_handle());
         }
+        let (deny_peer_state_read, deny_read) = watch::channel(false);
+        let peer_state = state.clone();
+        let peer_state = tower::service_fn(move |request| {
+            let unavailable =
+                *deny_read.borrow() && matches!(request, zakura_state::Request::AnyChainBlock(_));
+            let state = peer_state.clone();
+            async move {
+                if unavailable {
+                    return Err("peer block lookup unavailable".into());
+                }
+                state.oneshot(request).await
+            }
+            .boxed()
+        });
         assert!(setup_tx
             .send(InboundSetupData {
                 address_book,
                 block_download_peer_set: peers.clone(),
                 block_verifier: gated.clone(),
                 mempool: pool.clone(),
-                state: state.clone(),
+                state: Buffer::new(peer_state, 16),
                 latest_chain_tip: tip.clone(),
                 network: network.clone(),
                 misbehavior: bans.clone(),
@@ -497,6 +526,8 @@ impl Node {
             tip,
             pending,
             bans,
+            hold_proposal,
+            deny_peer_state_read,
             gate: ValidationGate {
                 held,
                 entered: entered_rx,
@@ -1432,15 +1463,30 @@ async fn http(
     content_type: &str,
     bytes: Vec<u8>,
 ) -> (StatusCode, Vec<u8>) {
+    http_with_job(address, auth, path, content_type, bytes, None).await
+}
+
+async fn http_with_job(
+    address: SocketAddr,
+    auth: &str,
+    path: &str,
+    content_type: &str,
+    bytes: Vec<u8>,
+    job: Option<&str>,
+) -> (StatusCode, Vec<u8>) {
     timeout(Duration::from_secs(9 * 60), async {
         let stream = tokio::net::TcpStream::connect(address).await.unwrap();
         let (mut client, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
             .await
             .unwrap();
         let task = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(connection));
+        let mut builder = HttpRequest::post(path);
+        if let Some(id) = job {
+            builder = builder.header("X-Job-Id", id);
+        }
         let response = client
             .send_request(
-                HttpRequest::post(path)
+                builder
                     .header("Host", address.to_string())
                     .header("Authorization", auth)
                     .header("Content-Type", content_type)

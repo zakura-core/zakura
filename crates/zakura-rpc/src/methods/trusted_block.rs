@@ -1,6 +1,8 @@
 //! Trusted submission: relay a pending body, then verify it through normal consensus.
 
 use super::*;
+
+pub(crate) mod jobs;
 use crate::server::trusted_block::TrustedSubmissionError;
 
 use super::submission_lifecycle::{
@@ -88,6 +90,27 @@ where
                 .increment(1);
             tracing::info!(?hash, "{message}");
         }
+        self.relay_trusted_block(
+            block,
+            height,
+            bytes.len(),
+            submitted_at,
+            skipped.is_none(),
+            None,
+        )
+        .await
+    }
+
+    async fn relay_trusted_block(
+        &self,
+        block: Arc<Block>,
+        height: Height,
+        size: usize,
+        submitted_at: std::time::Instant,
+        early_relay: bool,
+        prepared: Option<Arc<[u8]>>,
+    ) -> std::result::Result<SubmitBlockResponse, TrustedSubmissionError> {
+        let hash = block.hash();
         let submission = match self.gbt.reserve_mined_submission(hash) {
             Ok(guard) => guard,
             Err(SubmitBlockErrorResponse::Inconclusive) => {
@@ -95,17 +118,17 @@ where
             }
             Err(response) => return Ok(response.into()),
         };
-        let early_relay = skipped.is_none();
-        let registration = self
-            .gbt
-            .pending_blocks()
-            .insert_trusted(block.clone(), early_relay)
-            .ok_or(TrustedSubmissionError::Capacity)?;
+        let registry = self.gbt.pending_blocks();
+        let registration = match prepared {
+            Some(bytes) => registry.insert_prepared(block.clone(), bytes),
+            None => registry.insert_trusted(block.clone(), early_relay),
+        }
+        .ok_or(TrustedSubmissionError::Capacity)?;
         let submission = Submission {
             block,
             hash,
             height,
-            size: bytes.len(),
+            size,
             submitted_at,
             method: MinedBlockSubmission::TrustedBlock,
             reservation: submission,

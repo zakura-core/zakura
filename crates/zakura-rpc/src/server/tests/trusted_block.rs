@@ -573,3 +573,34 @@ async fn trusted_and_json_routes_answer_over_http2() {
     connection.abort();
     server.abort();
 }
+
+#[tokio::test]
+async fn prepared_job_controls_require_credentials_unique_id_and_bounded_body() {
+    let (cookie, auth) = credentials();
+    let json = tower::service_fn(|_| async { Ok::<_, tower::BoxError>(HttpResponse::default()) });
+    let service = TrustedBlockHttpService::new(
+        json,
+        Some(cookie),
+        Some(Arc::new(|_| panic!("a job must use the job handler"))),
+    )
+    .with_jobs(Some(Arc::new(|id, _, bytes| {
+        assert_eq!(id, [0xab; 16]);
+        assert_eq!(bytes.len(), 64);
+        Box::pin(async { Ok(()) })
+    })));
+    let valid = "abababababababababababababababab";
+    for (credential, id, size, status) in [
+        ("wrong", valid, 64, StatusCode::UNAUTHORIZED),
+        (auth.as_str(), "abcd", 64, StatusCode::BAD_REQUEST),
+        (auth.as_str(), valid, 65, StatusCode::PAYLOAD_TOO_LARGE),
+        (auth.as_str(), valid, 64, StatusCode::ACCEPTED),
+    ] {
+        let req = Request::post("/submittrustedblock?op=confirm")
+            .header("Content-Type", "application/octet-stream")
+            .header("Authorization", credential)
+            .header("X-Job-Id", id)
+            .body(Full::new(Bytes::from(vec![0; size])))
+            .unwrap();
+        assert_eq!(send(service.clone(), req).await.unwrap().status(), status);
+    }
+}

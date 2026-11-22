@@ -61,6 +61,40 @@ This sequence is an operator recommendation, not an endpoint prerequisite.
 Access to the endpoint authorizes relay; it does not establish prior validation.
 The endpoint does not accept or verify a validation certificate.
 
+## Preparing a job while mining
+
+A miner can upload the unsolved proposal while it mines. Use a fresh random
+16-byte job ID for each candidate, encoded as 32 lowercase hex characters in
+the `X-Job-Id` header. All three operations use the same endpoint, credentials,
+and binary content type. Independent connections let the short messages arrive
+while the upload is still in progress.
+
+1. Send the complete serialized proposal to `/submittrustedblock?op=prepare`.
+   Mining can start as soon as the primary issues the job. The relay starts
+   checking the proposal in the background.
+2. Send the complete binary solved header to `/submittrustedblock?op=solve`
+   when sending the solution to the primary. Only the nonce and Equihash
+   solution may differ from the uploaded header. The relay checks proof of
+   work under its network's rules. If the proposal passes local verification
+   before or after the solve, the relay can announce without another message.
+3. After the primary accepts these exact solved bytes, send
+   `/submittrustedblock?op=confirm` with the 32-byte solved header hash in
+   Zcash wire order followed by the 32-byte SHA-256 digest of the complete
+   serialized solved block. This allows release while local proposal verification
+   is still pending. The confirmation is an assertion by the authorized caller.
+
+The relay requires the complete body, matching solved header and current parent
+for either release path. An observing legacy or compatibility peer can request
+the exact bytes from memory while local consensus verification and commitment
+proceed. A failed commit withdraws outstanding permission to send that copy.
+
+HTTP 202 acknowledges receipt of an input. The miner can retry the same input
+with the same ID. A conflicting input returns 409 when detected synchronously.
+The relay retains up to 16 jobs for 120 seconds from the first input. For an
+expired job, or to recover from an inconclusive attempt, use the complete POST
+after the primary has accepted the exact bytes. A primary rejection, timeout
+or duplicate response does not authorize a confirmation.
+
 ## Request and response
 
 Send `Content-Type: application/octet-stream` with exactly one complete block in

@@ -38,6 +38,14 @@ impl PendingBlockSendPermit {
         Self::with_checksum(Some(AttemptChecksum::default()))
     }
 
+    /// Creates a revocable permission carrying the exact bytes authorized for direct peer reads.
+    pub fn prepared_channel(bytes: Arc<[u8]>) -> (watch::Sender<PendingBlockStatus>, Self) {
+        Self::with_checksum(Some(AttemptChecksum {
+            prepared: Some(bytes),
+            ..Default::default()
+        }))
+    }
+
     /// Creates a revocable permission for a body whose commitments were checked before
     /// state admission. Legacy sends can safely share its checksum by header hash.
     pub fn state_admitted_channel() -> (watch::Sender<PendingBlockStatus>, Self) {
@@ -102,10 +110,26 @@ impl Hash for PendingBlockSendPermit {
 }
 
 /// The checksum of one submission attempt's exact serialized body, computed by its first send.
-#[derive(Clone, Debug, Default)]
-pub struct AttemptChecksum(Arc<OnceLock<(usize, sha256d::Checksum)>>);
+#[derive(Clone, Default)]
+pub struct AttemptChecksum {
+    checksum: Arc<OnceLock<(usize, sha256d::Checksum)>>,
+    prepared: Option<Arc<[u8]>>,
+}
+
+impl std::fmt::Debug for AttemptChecksum {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AttemptChecksum")
+            .field("prepared_len", &self.prepared_bytes().map(<[u8]>::len))
+            .finish_non_exhaustive()
+    }
+}
 
 impl AttemptChecksum {
+    /// Exact solved bytes, when the submission authorized serving directly from memory.
+    pub fn prepared_bytes(&self) -> Option<&[u8]> {
+        self.prepared.as_deref()
+    }
+
     /// Returns the checksum of `body`, computing it on the attempt's first send.
     ///
     /// The length guards the invariant that an attempt serializes to one body: a mismatch is
@@ -115,7 +139,7 @@ impl AttemptChecksum {
         body: &[u8],
         compute: impl Fn(&[u8]) -> sha256d::Checksum,
     ) -> sha256d::Checksum {
-        let (len, checksum) = *self.0.get_or_init(|| (body.len(), compute(body)));
+        let (len, checksum) = *self.checksum.get_or_init(|| (body.len(), compute(body)));
         if len == body.len() {
             checksum
         } else {
@@ -126,7 +150,7 @@ impl AttemptChecksum {
 
 impl PartialEq for AttemptChecksum {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
+        Arc::ptr_eq(&self.checksum, &other.checksum)
     }
 }
 

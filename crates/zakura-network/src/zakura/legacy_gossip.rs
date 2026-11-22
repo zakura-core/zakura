@@ -832,9 +832,15 @@ impl LegacyResponseCodec {
                             // Encoding is this transport's write start: frames are queued to the
                             // stream only after it.
                             let encoded = match block.pending_send() {
-                                Some(permit) => {
-                                    permit.try_start_write(|| block.zcash_serialize_to_vec())
-                                }
+                                Some(permit) => permit.try_start_write(|| {
+                                    match permit
+                                        .attempt_checksum()
+                                        .and_then(|attempt| attempt.prepared_bytes())
+                                    {
+                                        Some(bytes) => Ok(bytes.to_vec()),
+                                        None => block.zcash_serialize_to_vec(),
+                                    }
+                                }),
                                 None => Some(block.zcash_serialize_to_vec()),
                             };
                             match encoded {

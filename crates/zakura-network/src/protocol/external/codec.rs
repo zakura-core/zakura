@@ -619,9 +619,11 @@ impl Codec {
                 v1_addrs.zcash_serialize(writer)?
             }
             Message::GetAddr => { /* Empty payload -- no-op */ }
-            Message::Block(block) | Message::UncachedBlock(block, _) => {
-                block.zcash_serialize(writer)?
-            }
+            Message::UncachedBlock(block, attempt) => match attempt.prepared_bytes() {
+                Some(bytes) => writer.write_all(bytes)?,
+                None => block.zcash_serialize(writer)?,
+            },
+            Message::Block(block) => block.zcash_serialize(writer)?,
             Message::GetBlocks { known_blocks, stop } => {
                 writer.write_u32::<LittleEndian>(self.builder.version.0)?;
                 known_blocks.zcash_serialize(writer)?;

@@ -6237,6 +6237,12 @@ pub(crate) async fn serve_reported_native_dial_connection(
         report.registration
     });
     let remote_node_id = connection.remote_id();
+    endpoint
+        .handler
+        .supervisor
+        .ip_slots
+        .counts()
+        .outbound_connected(remote_node_id);
     let peer_id = ZakuraPeerId::from_node_id(remote_node_id);
     let conn = ZakuraConnTrace::new(
         &endpoint.handler.trace,

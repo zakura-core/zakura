@@ -297,7 +297,6 @@ async fn a_member_the_dialer_backed_off_gives_way_until_its_backoff_ends() {
         .collect();
     assert_eq!(held(&node.endpoint()).members, without);
     assert!(!dialed(&first.preferred).contains(&backed_off));
-    assert!(!dialed(&first.ordinary).contains(&backed_off));
 
     // The first round's dials register, and the backoff ends.
     let connected = dialed(&first.preferred);

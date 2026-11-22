@@ -274,25 +274,39 @@ async fn an_empty_ranking_leaves_the_round_to_the_ordinary_pass() {
     node.shutdown().await;
 }
 
+// A member whose only IP is in this dialer's own backoff can't be dialed, so
+// it gives its place to the next gateway until that backoff ends.
 #[tokio::test(start_paused = true)]
-async fn the_ordinary_pass_leaves_set_members_to_the_preferred_pass() {
+async fn a_member_the_dialer_backed_off_gives_way_until_its_backoff_ends() {
     let (node, mut io, ranking_tx) = dialer(9236).await;
-    let gateways = known_gateways(&node, 2).await;
-    ranking_tx.send_replace(ranking(&gateways[..1]));
+    let gateways = known_gateways(&node, 11).await;
+    ranking_tx.send_replace(ranking(&gateways));
+    let backed_off = gateways[2];
+    let start = Instant::now();
     let mut state = CandidateDialerState::new(DIAL_BACKOFF);
-    // The member's only IP is in this dialer's backoff, so the preferred pass
-    // can't dial it this round.
-    let member_ip = gateway_ip(gateways[0]);
     let attempt = state
-        .record_attempt(gateways[0], vec![member_ip])
+        .record_attempt(backed_off, vec![gateway_ip(backed_off)])
         .expect("an idle dialer records the attempt");
-    assert!(state.complete(attempt, DiscoveryDialResult::Failed, None, Instant::now()));
+    assert!(state.complete(attempt, DiscoveryDialResult::Failed, None, start));
 
-    let round = io.admit_round(&mut state, &[], Instant::now()).await;
+    let first = io.admit_round(&mut state, &[], start).await;
+    let without: Vec<_> = gateways
+        .iter()
+        .copied()
+        .filter(|gateway| *gateway != backed_off)
+        .collect();
+    assert_eq!(held(&node.endpoint()).members, without);
+    assert!(!dialed(&first.preferred).contains(&backed_off));
 
-    assert_eq!(held(&node.endpoint()).members, gateways[..1]);
-    assert!(round.preferred.is_empty());
-    assert_eq!(dialed(&round.ordinary), gateways[1..]);
+    // The first round's dials register, and the backoff ends.
+    let connected = dialed(&first.preferred);
+    for (attempt, _) in &first.preferred {
+        assert!(state.complete(*attempt, DiscoveryDialResult::Registered, None, start));
+    }
+    let later = start + DIAL_BACKOFF.0;
+    let second = io.admit_round(&mut state, &connected, later).await;
+    assert_eq!(held(&node.endpoint()).members, gateways[..10]);
+    assert!(dialed(&second.preferred).contains(&backed_off));
     node.shutdown().await;
 }
 

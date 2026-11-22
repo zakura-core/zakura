@@ -27,11 +27,15 @@ use std::{
 use zakura_quic::{NodeId, NodeSecretKey};
 use zakura_rt::{collections::HashMap, time::Instant};
 
-use super::preferred::{admit_preferred_dials, DeferredDials, PreferredRoom, MUTUAL_DIAL_GRACE};
+use super::preferred::{
+    admit_preferred_dials, dialer_standing, DeferredDials, PreferredRoom, MUTUAL_DIAL_GRACE,
+};
 use super::state::{CandidateDialerState, DialAttemptKey};
 use super::{DiscoveryDialResult, ZAKURA_DISCOVERY_DIAL_INTERVAL};
 use crate::zakura::{
-    canonical_ip, discovery::ZakuraDiscoveryDialCandidate, machine_test::MAX_HISTORY_BYTES,
+    canonical_ip,
+    discovery::{protocol::DialTarget, ZakuraDiscoveryDialCandidate},
+    machine_test::MAX_HISTORY_BYTES,
     GatewayStanding, PreferredGateways, RankedGateway,
 };
 
@@ -131,7 +135,8 @@ pub(super) enum DialerOp {
     /// preferred pass.
     Rank {
         /// What the discovery book knows about each node: unmatched, in
-        /// backoff, or dialable at its one table address.
+        /// backoff, or dialable at its one table address, which the dialer
+        /// may still hold in its own backoff.
         book: [GatewayStanding; NODES],
         /// Which nodes are registered.
         registered: [bool; NODES],
@@ -532,7 +537,15 @@ fn rank(
             } else if sent.in_flight.iter().any(|attempt| attempt.node == node) {
                 GatewayStanding::Dialing
             } else {
-                book[node]
+                let target = match book[node] {
+                    GatewayStanding::Unmatched => DialTarget::Unknown,
+                    GatewayStanding::Dialable => DialTarget::Dialable(candidate(
+                        nodes[node],
+                        vec![table_address(RANKED_ADDRESS[node])],
+                    )),
+                    _ => DialTarget::InBackoff,
+                };
+                dialer_standing(state, &target, sent.now)
             }
         })
         .collect();

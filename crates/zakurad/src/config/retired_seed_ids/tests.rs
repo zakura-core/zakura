@@ -166,3 +166,56 @@ fn unparseable_file_is_reported() {
 
     assert!(matches!(error, RewriteError::Parse { .. }), "{error}");
 }
+
+/// Only an exact node ID match inside `network.zakura.bootstrap_peers` changes. The
+/// same ID in a comment, in another setting or in a `bootstrap_peers` outside
+/// `network.zakura` stays, and so do entries with other IDs, the order and the addresses.
+#[test]
+fn rewrite_touches_only_matched_bootstrap_ids() {
+    let (retired, current) = RETIRED_ZAKURA_SEED_NODE_IDS[5];
+    let upper = retired.to_uppercase();
+    let near_miss = format!("{}0", &retired[..63]);
+    let original = format!(
+        "# seed {retired} retired\n\
+         bootstrap_peers = [\"{retired}@192.0.2.9:1\"]\n\
+         [network]\n\
+         unconditional_peers = [\"{retired}@peer.example.com:8233\"]\n\
+         [network.zakura]\n\
+         bootstrap_peers = [\n\
+         \x20   \"{near_miss}@192.0.2.1:8234\", # {retired}\n\
+         \x20   \"{upper}@[2001:db8::1]:9999\",\n\
+         \x20   \"{retired}\",\n\
+         \x20   \"{retired}@192.0.2.2:8234\",\n\
+         ]\n"
+    );
+    let (_dir, path) = config_file(&original);
+
+    let outcome = rewrite_config_file(&path).expect("rewrite succeeds");
+
+    let RewriteOutcome::Rewrote { replaced, .. } = outcome else {
+        panic!("two entries match");
+    };
+    assert_eq!(
+        replaced,
+        vec![
+            (
+                format!("{upper}@[2001:db8::1]:9999"),
+                format!("{current}@[2001:db8::1]:9999")
+            ),
+            (
+                format!("{retired}@192.0.2.2:8234"),
+                format!("{current}@192.0.2.2:8234")
+            ),
+        ]
+    );
+    let expected = original
+        .replace(
+            &format!("\"{upper}@[2001:db8::1]:9999\""),
+            &format!("\"{current}@[2001:db8::1]:9999\""),
+        )
+        .replace(
+            &format!("\"{retired}@192.0.2.2:8234\""),
+            &format!("\"{current}@192.0.2.2:8234\""),
+        );
+    assert_eq!(fs::read_to_string(&path).unwrap(), expected);
+}

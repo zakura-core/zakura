@@ -26,10 +26,14 @@ discovery_session = { decoder = 1, properties = ["discovery/session-policy"] }
 discovery_redial = { decoder = 2, properties = ["discovery/redial-policy"] }
 discovery_query = { decoder = 1, properties = ["discovery/query-ownership", "discovery/answer-settlement"] }
 discovery_candidate = { decoder = 1, properties = ["discovery/dial-attempts"] }
+credential_parse = { decoder = 1, properties = ["credential/canonical-encoding", "credential/node-id", "credential/bounded-parse"] }
+key_list_decode = { decoder = 1, properties = ["key-list/canonical-encoding", "key-list/stable-id"] }
+composite_verify = { decoder = 1, properties = ["composite/signature-length", "composite/both-halves", "composite/tamper-refused"] }
 
 [dependencies]
 libfuzzer-sys = "0.4"
 zakura-network = { path = "../../../crates/zakura-network", features = ["p2p-fuzz"] }
+zakura-quic = { path = "../../../crates/zakura-quic", features = ["p2p-fuzz"] }
 
 [workspace]
 
@@ -134,6 +138,27 @@ bench = false
 [[bin]]
 name = "discovery_candidate"
 path = "fuzz_targets/discovery_candidate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "credential_parse"
+path = "fuzz_targets/credential_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "key_list_decode"
+path = "fuzz_targets/key_list_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "composite_verify"
+path = "fuzz_targets/composite_verify.rs"
 test = false
 doc = false
 bench = false

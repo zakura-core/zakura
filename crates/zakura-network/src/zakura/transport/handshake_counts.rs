@@ -345,8 +345,17 @@ impl HandshakeCounts {
     }
 
     /// Releases the slot that `claim_connection` charged to `node`.
+    ///
+    /// A ranked gateway that was connected and now holds no slot is marked
+    /// in backoff, so a dropped caller or member doesn't stay preferred
+    /// until the next ranking is published.
     pub fn release_connection(&mut self, node: NodeId, inbound: bool) {
         self.connections.release(node, inbound);
+        if self.connections.of_node(&node).total() == 0 {
+            if let Some(formed) = self.preferred.with_disconnected(&node) {
+                self.preferred = formed;
+            }
+        }
     }
 
     /// The connection slots `node` holds now.

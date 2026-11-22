@@ -47,7 +47,9 @@ pub enum GatewayStanding {
     Dialable,
     /// A dial to it is in flight.
     Dialing,
-    /// Connected to this node.
+    /// Connected to this node. When its last connection slot is released
+    /// the slot counters mark it [`Self::Backoff`] until the next ranking
+    /// says otherwise, so a gateway that left gives up its place in the set.
     Connected,
 }
 
@@ -208,6 +210,21 @@ impl PreferredGateways {
         ranking[index].standing = GatewayStanding::Connected;
         let formed = Self::form(ranking, self.hold_limit);
         formed.contains(node).then_some(formed)
+    }
+
+    /// The set re-formed with the connected gateway `node` in backoff, once
+    /// it holds no connection; `None` when `node` isn't ranked as connected.
+    ///
+    /// Like a gateway whose dial failed, it keeps its held place reserved,
+    /// leaves the set so the next available gateway may fill it, and may
+    /// still call back in.
+    pub(super) fn with_disconnected(&self, node: &NodeId) -> Option<Self> {
+        let index = self.ranking.iter().position(|gateway| {
+            gateway.node == *node && gateway.standing == GatewayStanding::Connected
+        })?;
+        let mut ranking = self.ranking.clone();
+        ranking[index].standing = GatewayStanding::Backoff;
+        Some(Self::form(ranking, self.hold_limit))
     }
 }
 

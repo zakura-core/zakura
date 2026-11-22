@@ -511,3 +511,65 @@ fn the_set_is_restored_after_a_hold_refusal() {
     assert_eq!(preferred_set(&handler), [top, member]);
     assert_eq!(split(&handler), before);
 }
+
+fn hold(handler: &ZakuraProtocolHandler) -> usize {
+    handler
+        .supervisor
+        .ip_slots
+        .counts()
+        .preferred_gateways()
+        .hold()
+}
+
+/// A ranked caller granted a place, then dropped before any new ranking,
+/// leaves the set: its place stays held and the next gateway in rank takes
+/// it.
+#[test]
+fn a_dropped_caller_leaves_the_set() {
+    let handler = handler(40);
+    let caller = new_node();
+    let next = new_node();
+    publish(
+        &handler,
+        &[
+            (caller, GatewayStanding::Backoff),
+            (next, GatewayStanding::Dialable),
+        ],
+    );
+    let slot = handler.claim_connection(caller, true).expect("held");
+    assert_eq!(preferred_set(&handler), [caller]);
+
+    drop(slot);
+    assert_eq!(preferred_set(&handler), [next]);
+    assert_eq!(hold(&handler), 1);
+}
+
+/// A member published as connected leaves the set when its last slot is
+/// released, and a member with a slot left stays.
+#[test]
+fn a_connected_member_leaves_the_set_with_its_last_slot() {
+    let handler = handler(40);
+    let member = new_node();
+    let next = new_node();
+    publish(
+        &handler,
+        &[
+            (member, GatewayStanding::Connected),
+            (next, GatewayStanding::Dialable),
+        ],
+    );
+    let first = handler.claim_connection(member, false).expect("held");
+    let second = handler
+        .claim_connection(member, true)
+        .expect("an ordinary slot is free");
+
+    drop(first);
+    assert_eq!(
+        preferred_set(&handler),
+        [member],
+        "it still holds a slot, so it stays connected"
+    );
+    drop(second);
+    assert_eq!(preferred_set(&handler), [next]);
+    assert_eq!(hold(&handler), 1);
+}

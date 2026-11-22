@@ -1400,13 +1400,14 @@ impl ZakuraEndpoint {
     }
 
     /// How many address attempts dials to preferred gateways can start now:
-    /// none without a free connection slot, otherwise the transport's room
-    /// under its whole-table cap, which maintained dials use.
+    /// none without a free connection slot, otherwise the room under
+    /// discovery's transport ceiling, which leaves the dial reserve to
+    /// bootstrap and maintained dials.
     pub(crate) fn preferred_dial_capacity(&self) -> usize {
         if self.preferred_dial_permits() == 0 {
             return 0;
         }
-        self.quic.dial_capacity()
+        self.quic.discovery_capacity()
     }
 
     /// Holds `count` of the handler's connection slots, as connections with

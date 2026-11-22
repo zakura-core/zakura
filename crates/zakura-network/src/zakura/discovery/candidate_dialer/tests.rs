@@ -747,6 +747,7 @@ async fn preferred_dials_leave_the_maintained_dial_reserve() {
     zakura_rt::time::timeout(Duration::from_secs(15), async {
         let limits = ZakuraLocalLimits {
             max_connections: 2,
+            max_preferred_connections: 0,
             max_pending_handshakes: 1,
             ..ZakuraLocalLimits::from_config(&crate::Config::default())
         };

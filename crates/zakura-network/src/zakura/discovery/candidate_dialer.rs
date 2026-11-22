@@ -270,7 +270,9 @@ impl CandidateDialerIO {
         registered: &[NodeId],
         now: Instant,
     ) -> DialRound {
-        let round = self.publish_preferred_gateways(state, registered).await;
+        let round = self
+            .publish_preferred_gateways(state, registered, now)
+            .await;
         let room = PreferredRoom {
             connections: self.endpoint.preferred_dial_permits(),
             address_attempts: self.endpoint.preferred_dial_capacity(),
@@ -303,8 +305,9 @@ impl CandidateDialerIO {
         }
     }
 
-    /// Classifies the ranked gateways given the peers `registered` now, forms
-    /// the preferred set and hands it to the connection-slot checks.
+    /// Classifies the ranked gateways at `now`, given the peers `registered`
+    /// then, forms the preferred set and hands it to the connection-slot
+    /// checks.
     ///
     /// Every round publishes again, so a gateway that connects, disconnects
     /// or enters or leaves a backoff moves within one round interval, and a
@@ -314,12 +317,14 @@ impl CandidateDialerIO {
         &mut self,
         state: &CandidateDialerState,
         registered: &[NodeId],
+        now: Instant,
     ) -> PreferredRound {
         let classified = classify_gateways(
             self.preferred.current(),
             registered,
-            &state.in_flight_node_ids(),
+            state,
             &self.discovery,
+            now,
         )
         .await;
         let formed = PreferredGateways::form(classified.ranking, self.preferred_hold_limit);

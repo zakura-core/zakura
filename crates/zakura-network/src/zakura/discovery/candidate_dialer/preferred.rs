@@ -133,19 +133,22 @@ pub(super) struct ClassifiedGateways {
     pub(super) dialable: HashMap<NodeId, ZakuraDiscoveryDialCandidate>,
 }
 
-/// Classifies each of `ranked`, in its order.
+/// Classifies each of `ranked`, in its order, at `now`.
 ///
 /// A gateway in `registered` is connected, even while a dial to it is still
-/// in flight; one in `in_flight` is being dialed; the discovery book answers
-/// for the rest in one lookup, which an empty ranking skips.
+/// in flight; one the dialer `state` has in flight is being dialed; the
+/// discovery book answers for the rest in one lookup, which an empty ranking
+/// skips, and [`dialer_standing`] adds the dialer's own backoff to its
+/// answer.
 pub(super) async fn classify_gateways(
     ranked: &[RankedGateway],
     registered: &[NodeId],
-    in_flight: &[NodeId],
+    state: &CandidateDialerState,
     discovery: &ZakuraDiscoveryHandle,
+    now: Instant,
 ) -> ClassifiedGateways {
     let registered: HashSet<NodeId> = registered.iter().copied().collect();
-    let in_flight: HashSet<NodeId> = in_flight.iter().copied().collect();
+    let in_flight: HashSet<NodeId> = state.in_flight_node_ids().into_iter().collect();
     let local_standing = |gateway: &RankedGateway| {
         if registered.contains(&gateway.node) {
             Some(GatewayStanding::Connected)
@@ -171,17 +174,15 @@ pub(super) async fn classify_gateways(
     let mut classified = ClassifiedGateways::default();
     for gateway in ranked {
         let standing = local_standing(gateway).unwrap_or_else(|| {
-            match book_answers
+            let target = book_answers
                 .next()
-                .expect("the book answers once for every unresolved gateway, in order")
+                .expect("the book answers once for every unresolved gateway, in order");
+            let standing = dialer_standing(state, &target, now);
+            if let (GatewayStanding::Dialable, DialTarget::Dialable(candidate)) = (standing, target)
             {
-                DialTarget::Unknown => GatewayStanding::Unmatched,
-                DialTarget::InBackoff => GatewayStanding::Backoff,
-                DialTarget::Dialable(candidate) => {
-                    classified.dialable.insert(gateway.node, candidate);
-                    GatewayStanding::Dialable
-                }
+                classified.dialable.insert(gateway.node, candidate);
             }
+            standing
         });
         classified.ranking.push(RankedGateway {
             standing,
@@ -198,6 +199,28 @@ pub(super) async fn classify_gateways(
 pub(super) struct PreferredRound {
     pub(super) set: Vec<NodeId>,
     pub(super) dialable: HashMap<NodeId, ZakuraDiscoveryDialCandidate>,
+}
+
+/// The standing of a gateway that is neither connected nor being dialed, from
+/// the discovery book's `target` and the dialer's own `state` at `now`.
+///
+/// A gateway the book could dial is still in backoff when the dialer has
+/// every one of its IPs in backoff, so the next gateway takes its place in
+/// the set. Node-wide limits, such as free transport slots, pass and leave
+/// the gateway dialable.
+pub(super) fn dialer_standing(
+    state: &CandidateDialerState,
+    target: &DialTarget,
+    now: Instant,
+) -> GatewayStanding {
+    match target {
+        DialTarget::Unknown => GatewayStanding::Unmatched,
+        DialTarget::InBackoff => GatewayStanding::Backoff,
+        DialTarget::Dialable(candidate) if state.candidate_addresses(candidate, now).is_empty() => {
+            GatewayStanding::Backoff
+        }
+        DialTarget::Dialable(_) => GatewayStanding::Dialable,
+    }
 }
 
 /// The room one round's preferred pass may use.
@@ -517,7 +540,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn classification_reads_registrations_dials_and_the_book() {
+    async fn classification_reads_registrations_dials_the_book_and_dialer_backoff() {
         let discovery = discovery_handle();
         let connected = node_id(1);
         let dialing = node_id(2);
@@ -525,7 +548,13 @@ mod tests {
         let backoff = node_id(4);
         let unmatched = node_id(5);
         let connected_and_dialing = node_id(6);
-        for (node, last) in [(dialable, 3), (backoff, 4), (connected, 1)] {
+        let dialer_backoff = node_id(7);
+        for (node, last) in [
+            (dialable, 3),
+            (backoff, 4),
+            (connected, 1),
+            (dialer_backoff, 7),
+        ] {
             discovery
                 .insert_static_candidate(NodeAddr::with_addrs(node, [addr(last)]))
                 .await
@@ -533,6 +562,20 @@ mod tests {
         }
         discovery.mark_dial_attempt(&backoff).await;
         discovery.mark_dial_failure(&backoff).await;
+        let now = Instant::now();
+        let mut state =
+            CandidateDialerState::new((Duration::from_secs(60), Duration::from_secs(3_600)));
+        for node in [dialing, connected_and_dialing] {
+            state
+                .record_attempt(node, vec![addr(2).ip()])
+                .expect("the node has no attempt in flight");
+        }
+        // The book could dial this one, but its only IP is in this dialer's
+        // own backoff.
+        let failed = state
+            .record_attempt(dialer_backoff, vec![addr(7).ip()])
+            .expect("the node has no attempt in flight");
+        assert!(state.complete(failed, super::super::DiscoveryDialResult::Failed, None, now));
 
         let ranked: Vec<_> = [
             connected,
@@ -541,6 +584,7 @@ mod tests {
             backoff,
             unmatched,
             connected_and_dialing,
+            dialer_backoff,
         ]
         .into_iter()
         .map(|node| RankedGateway {
@@ -552,8 +596,9 @@ mod tests {
         let classified = classify_gateways(
             &ranked,
             &[connected, connected_and_dialing],
-            &[dialing, connected_and_dialing],
+            &state,
             &discovery,
+            now,
         )
         .await;
 
@@ -571,6 +616,7 @@ mod tests {
                 GatewayStanding::Backoff,
                 GatewayStanding::Unmatched,
                 GatewayStanding::Connected,
+                GatewayStanding::Backoff,
             ]
         );
         assert_eq!(

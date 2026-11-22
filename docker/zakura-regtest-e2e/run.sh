@@ -51,9 +51,11 @@
 # against a pinned SHA256 and the release's SHA256SUMS.txt, and cached under
 # target/zakura-e2e-old-zakurad (ZAKURA_E2E_OLD_BIN_CACHE). It asserts:
 #   1. the legacy connections new-dual -> old-dual and old-dialer -> new-dual
-#      form, each upgrade prelude is rejected (zakura_p2p_upgrade_prelude_rejected
-#      on every dual node, and new-dual's fallback debug log for both prelude
-#      roles when it is a debug build), and both sides stay on legacy,
+#      form, each upgrade prelude is rejected and both sides stay on legacy:
+#      every dual node counts zakura_p2p_upgrade_prelude_rejected with
+#      reason="TemporaryUnavailable" (the only reason that keeps the legacy
+#      connection) and none with any other reason, and a debug build of new-dual
+#      logs the fallback for both prelude roles,
 #   2. same-version v2 works: new-zakura <-> new-dual and old-zakura <-> old-dual,
 #   3. the new nodes' v2 handshakes are all X25519MLKEM768 and Ed25519+ML-DSA-44
 #      (the old binary exports no such metrics),
@@ -63,17 +65,19 @@
 #   5. every cross-version legacy connection seen at the start (identified by the
 #      dialer's ephemeral port on the inbound side) stays open through the blocks
 #      and an idle soak (MIXED_SOAK_SECONDS, default 90), unless one end logged the
-#      legacy peer set's FindBlocks stall disconnect. Both versions apply that
-#      rule to any peer: at an idle Regtest tip, one syncer round sends FANOUT = 3
-#      empty FindBlocks to a sole legacy peer, which reaches the threshold of 3.
+#      legacy peer set's FindBlocks stall disconnect for it since it was last seen
+#      open. Both versions apply that rule to any peer: at an idle Regtest tip,
+#      one syncer round sends FANOUT = 3 empty FindBlocks to a sole legacy peer,
+#      which reaches the threshold of 3.
 #      After such a close, a redial must run a fresh upgrade prelude that is
-#      rejected again (new-dual's zakura_p2p_upgrade_prelude_rejected rises),
+#      rejected again (new-dual's TemporaryUnavailable count rises),
 #   6. no dual node counts a handshake upgrade error or malformed prelude, and
 #      no v2 connection crosses versions: new-dual completes no upgrade and holds
 #      one v2 connection, as does new-zakura, and each old node at most two,
 #   7. no node counts a misbehavior ban (address_book_misbehavior_banned_total)
-#      or logs a ban or misbehavior line. All nodes share 127.0.0.1, so any ban
-#      would hit the other cohort.
+#      or logs a ban line. All nodes share 127.0.0.1, so any ban would hit the
+#      other cohort. A misbehavior score below the ban threshold is neither
+#      counted nor logged, so it is not checked.
 #
 # Each container runs a zakurad binary bind-mounted into debian:trixie-slim.
 # Linux hosts use the host-built debug binary. On macOS, the harness builds and

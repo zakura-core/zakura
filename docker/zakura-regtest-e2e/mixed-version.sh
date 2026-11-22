@@ -103,9 +103,9 @@ ensure_old_zakurad_bin() {
   log "downloading ${tarball} from the ${OLD_RELEASE} release"
   mkdir -p "${cache}"
   download="$(mktemp -d "${cache}/download.XXXXXX")"
-  curl -fsSL --retry 3 -o "${download}/${tarball}" "${OLD_RELEASE_URL}/${tarball}" \
+  curl -fsSL --retry 3 --connect-timeout 20 --max-time 600 -o "${download}/${tarball}" "${OLD_RELEASE_URL}/${tarball}" \
     || fail "could not download ${OLD_RELEASE_URL}/${tarball}"
-  curl -fsSL --retry 3 -o "${download}/SHA256SUMS.txt" "${OLD_RELEASE_URL}/SHA256SUMS.txt" \
+  curl -fsSL --retry 3 --connect-timeout 20 --max-time 60 -o "${download}/SHA256SUMS.txt" "${OLD_RELEASE_URL}/SHA256SUMS.txt" \
     || fail "could not download ${OLD_RELEASE_URL}/SHA256SUMS.txt"
   listed=$(awk -v f="./${tarball}" '$2 == f || $2 == substr(f, 3) { print $1 }' \
     "${download}/SHA256SUMS.txt")
@@ -175,26 +175,49 @@ start_node() {
   wait_ready "$(rpc_port_of "${name}")" "${name}"
 }
 
-# metric_sum <name> <metric> -> the sum of every labelled series of <metric>.
+# metric_sum <name> <metric> <label> <with|without> -> the sum of the series of
+# <metric> whose labels include (with) or lack (without) <label>, such as
+# reason="TemporaryUnavailable".
 metric_sum() {
   container_http "$(metrics_port_of "$1")" "/metrics" "" 5 2>/dev/null \
-    | awk -v n="$2" '{ split($1, s, "{") } s[1] == n { v += $2 } END { print v + 0 }'
+    | awk -v n="$2" -v label="$3" -v mode="$4" '
+        { split($1, s, "{"); has = index($1, label) > 0 }
+        s[1] == n && (mode == "with") == has { v += $2 }
+        END { print v + 0 }'
 }
+
+# The prelude counts each upgrade it doesn't complete by reason. Only
+# TemporaryUnavailable continues the legacy handshake; any other reason closes
+# the legacy connection (peer/handshake.rs, after upgrade_to_zakura_handshake).
+FALLBACK_REASON='reason="TemporaryUnavailable"'
+PRELUDE_REJECTED=zakura_p2p_upgrade_prelude_rejected
+legacy_fallbacks() { metric_sum "$1" "${PRELUDE_REJECTED}" "${FALLBACK_REASON}" with; }
+closing_rejections() { metric_sum "$1" "${PRELUDE_REJECTED}" "${FALLBACK_REASON}" without; }
 
 node_metric() { metric "$(metrics_port_of "$1")" "$2"; }
 
-# wait_metric_sum_above <name> <metric> <floor> <timeout> -> waits until the
-# sum of <metric>'s series on <name> exceeds <floor>.
-wait_metric_sum_above() {
-  local name="$1" series="$2" floor="$3" timeout="$4" value
+# wait_legacy_fallbacks_above <name> <floor> <timeout> -> waits until <name>
+# has fallen back to legacy after more than <floor> upgrade preludes.
+wait_legacy_fallbacks_above() {
+  local name="$1" floor="$2" timeout="$3" value
   local deadline=$((SECONDS + timeout))
   while (( SECONDS < deadline )); do
-    value=$(metric_sum "${name}" "${series}")
-    printf '  %s %s=%s (want > %s)\n' "${name}" "${series}" "${value}" "${floor}"
+    value=$(legacy_fallbacks "${name}")
+    printf '  %s %s{%s}=%s (want > %s)\n' \
+      "${name}" "${PRELUDE_REJECTED}" "${FALLBACK_REASON}" "${value}" "${floor}"
     (( value > floor )) && return 0
     sleep 5
   done
-  fail "${name} ${series} stayed at or below ${floor} within ${timeout}s"
+  fail "${name} fell back to legacy after at most ${floor} upgrade preludes within ${timeout}s"
+}
+
+# assert_no_closing_rejections <name> -> fails if any prelude outcome closed
+# a legacy connection on <name>.
+assert_no_closing_rejections() {
+  local value
+  value=$(closing_rejections "$1")
+  printf '  %s %s with any other reason=%s (want 0)\n' "$1" "${PRELUDE_REJECTED}" "${value}"
+  (( value == 0 )) || fail "$1 ended ${value} upgrade prelude(s) with a reason that closes the legacy connection"
 }
 
 # cross_links <name> <user-agent> -> one "addr inbound|outbound" line for each
@@ -256,32 +279,53 @@ cross_links_ready() {
 # it. Neither the address book nor the ban list changes, and the rule ignores
 # the peer's version.
 #
-# stall_dropped <name> <addr> -> whether <name> logged that disconnect for <addr>.
-stall_dropped() {
-  docker logs "$(container_of "$1")" 2>&1 \
-    | grep -F 'dropping stalled peer: exceeded FindBlocks/FindHeaders stall threshold' \
-    | grep -E "peer=${2//./\\.}( |\$)" >/dev/null
+# STALL_DROP_LINE is the disconnect log line, and STALLS_WHILE_OPEN maps
+# "<node> <addr>" to how many of them named <addr> when that cross-version
+# connection was last seen open. Outbound connections reuse the peer's listen
+# address, so only a line logged since then can explain a close.
+STALL_DROP_LINE='dropping stalled peer: exceeded FindBlocks/FindHeaders stall threshold'
+declare -A STALLS_WHILE_OPEN=()
+
+# stall_count <stall-lines> <addr> -> how many of <stall-lines> name <addr>.
+stall_count() {
+  grep -cE "peer=${2//./\\.}( |\$)" <<< "$1" || true
 }
 
 # Records each cross-version connection seen at start that has since closed,
-# and fails unless one end of it logged the FindBlocks stall disconnect. For
-# the remote end, an outbound connection's peer is the node listening on its
-# address, and an inbound connection's peer dialed this node's listener.
+# and fails unless one end of it logged the FindBlocks stall disconnect after
+# the connection was last seen open. For the remote end, an outbound
+# connection's peer is the node listening on its address, and an inbound
+# connection's peer dialed this node's listener. Run it often: the stall count
+# can't tell a close from a later redial's close within one interval.
 check_cross_links() {
   local phase="$1" name peer link addr remote reason
-  declare -A now=() closed=()
+  declare -A now=() closed=() stalls=()
   for name in "${!CROSS_LINK_UA[@]}"; do
     now[${name}]=$(cross_links "${name}" "${CROSS_LINK_UA[${name}]}")
+    stalls[${name}]=$(docker logs "$(container_of "${name}")" 2>&1 \
+      | grep -F "${STALL_DROP_LINE}" || true)
     while IFS= read -r link; do
       [[ -z "${link}" ]] && continue
-      grep -qxF "${link}" <<< "${now[${name}]}" || closed[${name}]+="${link}"$'\n'
+      if grep -qxF "${link}" <<< "${now[${name}]}"; then
+        STALLS_WHILE_OPEN["${name} ${link%% *}"]=$(stall_count "${stalls[${name}]}" "${link%% *}")
+      else
+        closed[${name}]+="${link}"$'\n'
+      fi
     done <<< "${CROSS_LINKS_AT_START[${name}]}"
   done
+
+  # stall_dropped_since_open <name> <addr>
+  stall_dropped_since_open() {
+    local count
+    count=$(stall_count "${stalls[$1]}" "$2")
+    (( count > ${STALLS_WHILE_OPEN["$1 $2"]:-${count}} ))
+  }
+
   for name in "${!closed[@]}"; do
     while IFS= read -r link; do
       [[ -z "${link}" || -n "${CLOSED_CROSS_LINKS["${name} ${link}"]:-}" ]] && continue
       addr="${link%% *}" reason=""
-      if stall_dropped "${name}" "${addr}"; then
+      if stall_dropped_since_open "${name}" "${addr}"; then
         reason="${name} dropped it as a FindBlocks staller"
       fi
       for peer in ${CROSS_LINK_PEERS[${name}]}; do
@@ -289,20 +333,20 @@ check_cross_links() {
         if [[ "${link}" == *" outbound" ]]; then
           [[ "${LEGACY_LISTEN_ADDR[${peer}]}" == "${addr}" ]] || continue
           while IFS= read -r remote; do
-            if [[ "${remote}" == *" inbound" ]] && stall_dropped "${peer}" "${remote%% *}"; then
+            if [[ "${remote}" == *" inbound" ]] && stall_dropped_since_open "${peer}" "${remote%% *}"; then
               reason="${peer} dropped its end (${remote}) as a FindBlocks staller"
             fi
           done <<< "${closed[${peer}]:-}"
         else
           remote="${LEGACY_LISTEN_ADDR[${name}]} outbound"
           if grep -qxF "${remote}" <<< "${closed[${peer}]:-}" \
-            && stall_dropped "${peer}" "${remote%% *}"; then
+            && stall_dropped_since_open "${peer}" "${remote%% *}"; then
             reason="${peer} dropped its end (${remote}) as a FindBlocks staller"
           fi
         fi
       done
       [[ -n "${reason}" ]] || fail \
-        "${phase}: ${name}'s cross-version legacy connection ${link} closed, and neither end logged a FindBlocks stall disconnect (now: [${now[${name}]//$'\n'/, }])"
+        "${phase}: ${name}'s cross-version legacy connection ${link} closed, and neither end logged a FindBlocks stall disconnect since it was last seen open (now: [${now[${name}]//$'\n'/, }])"
       CLOSED_CROSS_LINKS["${name} ${link}"]="${reason}"
       printf '  %s: %s cross-version connection %s closed: %s\n' \
         "${phase}" "${name}" "${link}" "${reason}"
@@ -328,6 +372,7 @@ wait_all_nodes_at() {
   (( behind == 0 )) || fail "${label}: block ${target} did not reach every node:${heights}"
 
   want_hash=$(block_hash "$(rpc_port_of "${ALL_NODES[0]}")" "${target}")
+  [[ -n "${want_hash}" ]] || fail "${label}: could not read ${ALL_NODES[0]}'s block hash at height ${target}"
   for name in "${ALL_NODES[@]}"; do
     hash=$(block_hash "$(rpc_port_of "${name}")" "${target}")
     [[ "${hash}" == "${want_hash}" ]] || fail \
@@ -393,21 +438,25 @@ done
 for name in "${!CROSS_LINK_UA[@]}"; do
   CROSS_LINKS_AT_START[${name}]=$(cross_links "${name}" "${CROSS_LINK_UA[${name}]}")
 done
+# Sets each connection's stall-line baseline (and explains any early close).
+check_cross_links "links formed"
 
 # Both roles of the prelude ran and fell back to legacy. v1.8.9 runs the same
 # prelude code, which counts each fallback, and logs it at debug level.
 for name in "${DUAL_NODES[@]}"; do
   deadline=$((SECONDS + READY_TIMEOUT))
   while (( SECONDS < deadline )); do
-    rejected=$(metric_sum "${name}" zakura_p2p_upgrade_prelude_rejected)
-    printf '  %s zakura_p2p_upgrade_prelude_rejected=%s (want >= 1)\n' "${name}" "${rejected}"
+    rejected=$(legacy_fallbacks "${name}")
+    printf '  %s %s{%s}=%s (want >= 1)\n' \
+      "${name}" "${PRELUDE_REJECTED}" "${FALLBACK_REASON}" "${rejected}"
     (( rejected >= 1 )) && break
     sleep 3
   done
   (( rejected >= 1 )) || fail "${name} never fell back to legacy after a rejected upgrade prelude"
+  assert_no_closing_rejections "${name}"
 done
 # new-dual both dialed and was dialed by an old node, so it saw both roles.
-rejected_at_start=$(metric_sum new-dual zakura_p2p_upgrade_prelude_rejected)
+rejected_at_start=$(legacy_fallbacks new-dual)
 (( rejected_at_start >= 2 )) \
   || fail "new-dual fell back to legacy fewer than two times (once per prelude role)"
 # Release builds compile debug logs out (release_max_level_info), as in the
@@ -448,7 +497,7 @@ log "watching the cross-version legacy connections for ${MIXED_SOAK_SECONDS}s at
 soak_end=$((SECONDS + MIXED_SOAK_SECONDS))
 while (( SECONDS < soak_end )); do
   check_cross_links "soak"
-  sleep 10
+  sleep 5
 done
 check_cross_links "end of soak"
 if (( ${#CLOSED_CROSS_LINKS[@]} == 0 )); then
@@ -462,19 +511,19 @@ else
   # the redialed connection can be stall-dropped again within milliseconds, so
   # the counter, not getpeerinfo, is the evidence.
   log "waiting for a redial across the version boundary to run a fresh, rejected prelude"
-  wait_metric_sum_above new-dual zakura_p2p_upgrade_prelude_rejected "${rejected_at_start}" \
-    "$(( READY_TIMEOUT + 90 ))"
+  wait_legacy_fallbacks_above new-dual "${rejected_at_start}" "$(( READY_TIMEOUT + 90 ))"
 fi
 printf '  stall disconnects logged: %s\n' "$(
   for name in "${DUAL_NODES[@]}"; do
     printf '%s=%s ' "${name}" "$(docker logs "$(container_of "${name}")" 2>&1 \
-      | grep -c 'dropping stalled peer: exceeded FindBlocks/FindHeaders stall threshold' || true)"
+      | grep -cF "${STALL_DROP_LINE}" || true)"
   done)"
 
 log "asserting no upgrade error and no v2 connection across versions"
 for name in "${DUAL_NODES[@]}"; do
   assert_metric "${name}" zakura_p2p_handshake_upgrade_error == 0
   assert_metric "${name}" zakura_p2p_upgrade_prelude_malformed == 0
+  assert_no_closing_rejections "${name}"
 done
 # new-dual's only v2 peer is new-zakura, which has no legacy stack, so no
 # legacy upgrade may complete on it and it may hold one v2 connection. The old
@@ -499,8 +548,10 @@ done
 assert_post_quantum_handshakes "$(metrics_port_of new-dual)" new-dual
 assert_post_quantum_handshakes "$(metrics_port_of new-zakura)" new-zakura
 
-log "asserting no node banned or penalized the other cohort"
-# Every node shares 127.0.0.1, so any ban would ban the other cohort too.
+log "asserting no node banned the other cohort"
+# Every node shares 127.0.0.1, so any ban would ban the other cohort too. A
+# misbehavior score below the ban threshold is neither counted nor logged, so
+# the ban counter and the ban log lines are all there is to check.
 for name in "${ALL_NODES[@]}"; do
   assert_metric "${name}" address_book_misbehavior_banned_total == 0
   # The ban warning, the refused-inbound debug line, and misbehavior reports.

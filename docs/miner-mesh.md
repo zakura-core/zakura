@@ -104,14 +104,14 @@ bootstrap peers, leaving one place for a preferred gateway.
   "gateways": [
     { "node_id": "2222...2222", "blocks": 40, "state": "preferred", "connected": true },
     { "node_id": "3333...3333", "blocks": 12, "state": "backoff", "connected": false },
-    { "node_id": "4444...4444", "blocks": 7, "state": "standby", "connected": true },
+    { "node_id": "4747...4747", "blocks": 7, "state": "standby", "connected": true },
     { "node_id": "5555...5555", "blocks": 3, "state": "unmatched", "connected": false }
   ],
   "hold": 1,
   "slots": { "limit": 40, "in_use": 3, "preferred": 1, "ordinary": 2, "inbound": 2 },
   "peers": [
     { "node_id": "2222...2222", "inbound": true, "preferred": true },
-    { "node_id": "4444...4444", "inbound": false, "preferred": false },
+    { "node_id": "4747...4747", "inbound": false, "preferred": false },
     { "node_id": "6666...6666", "inbound": true, "preferred": false }
   ]
 }
@@ -143,7 +143,7 @@ preferred set:
 | `preferred` | Reachable and among the highest-ranked: it may fill a held place. |
 | `standby` | Known and reachable (it can be dialed, is being dialed, or is connected), but ranked below the gateways that fill the held places. |
 | `backoff` | Known, but waiting out a failed dial or a lost connection. It still counts toward the shared hold and may connect inbound during backoff. |
-| `unmatched` | v2 networking has no record of it: it is not connected and discovery has no address for it, so it takes no place. Gateways are usually learned through v2 peer exchange. |
+| `unmatched` | Networking found no connection or usable dial address for this gateway when it ranked it. A missing or expired address record can produce this state. Gateways are usually learned through v2 peer exchange. |
 
 On Mainnet, `synced` can turn false while `gateways` and `hold` still show the
 previous ranking. The tracker rechecks tip freshness on progress and at

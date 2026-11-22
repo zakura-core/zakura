@@ -48,7 +48,7 @@ fn places() -> ConnectionPlaces {
         gateways: vec![
             gateway(0x22, 40, GatewayPlace::Preferred, true),
             gateway(0x33, 12, GatewayPlace::Backoff, false),
-            gateway(0x44, 7, GatewayPlace::Standby, true),
+            gateway(0x47, 7, GatewayPlace::Standby, true),
             gateway(0x55, 3, GatewayPlace::Unmatched, false),
         ],
         hold: 1,
@@ -66,7 +66,7 @@ fn places() -> ConnectionPlaces {
                 preferred: true,
             },
             ConnectedPeer {
-                node_id: [0x44; 32],
+                node_id: [0x47; 32],
                 inbound: false,
                 preferred: false,
             },

@@ -852,7 +852,7 @@ pub trait RpcServer {
     /// it can reach. Each gateway's `state` is `preferred` when it may fill a
     /// held place, `standby` when it is reachable but ranked below those,
     /// `backoff` when it is known but waiting out a failed dial or a lost
-    /// connection, and `unmatched` when v2 networking has no address for it.
+    /// connection, and `unmatched` when v2 networking has no usable dial address for it.
     ///
     /// `synced` is evaluated at request time. The ranking and held places reflect
     /// the last update applied by networking and can lag a change in tip freshness.

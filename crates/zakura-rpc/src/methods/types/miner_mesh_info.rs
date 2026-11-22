@@ -132,7 +132,7 @@ pub enum MeshGatewayState {
     /// Known, but waiting out a failed dial or a lost connection. It still
     /// counts toward the shared hold and may connect inbound during backoff.
     Backoff,
-    /// v2 networking has no address for it, so no place is held for it.
+    /// v2 networking has no usable dial address for it, so no place is held for it.
     Unmatched,
 }
 

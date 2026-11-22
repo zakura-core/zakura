@@ -47,8 +47,9 @@ pub struct MinerGateway {
 /// [`GatewayStanding::Unmatched`] until [`classify_gateways`] reads them.
 ///
 /// It drops entries with no blocks, `local_node_id`, and repeats of an ID,
-/// keeping the repeat with the most blocks. It ranks before it drops or caps anything, so a dropped entry
-/// takes no place and lower-ranked entries can't push out a better one.
+/// keeping the repeat with the most blocks. It ranks before it drops or caps
+/// anything, so a dropped entry takes no place and lower-ranked entries can't
+/// push out a better one.
 fn rank_gateways(ranking: &MinerGatewayRanking, local_node_id: NodeId) -> Vec<RankedGateway> {
     let mut gateways: Vec<MinerGateway> = ranking
         .gateways
@@ -468,7 +469,7 @@ mod tests {
     }
 
     #[test]
-    fn ranking_keeps_every_valid_gateway() {
+    fn ranking_keeps_every_gateway_under_the_cap() {
         let gateways: Vec<_> = (1..=31).map(|byte| gateway(node_id(byte), 1)).collect();
         let ranked = rank_gateways(&ranking(gateways), node_id(99));
         assert_eq!(ranked.len(), 31);
@@ -483,21 +484,23 @@ mod tests {
 
     #[test]
     fn ranking_keeps_the_best_gateways_up_to_the_cap() {
-        let valid: Vec<NodeId> = (0..300)
+        let ids: Vec<NodeId> = (0..300)
             .map(|_| NodeSecretKey::generate().public())
             .collect();
         // Gateway `index` has `300 - index` blocks, so the list is in rank order.
-        let mut gateways: Vec<_> = valid
+        let mut gateways: Vec<_> = ids
             .iter()
             .zip((1..=300).rev())
             .map(|(node_id, blocks)| gateway(*node_id, blocks))
             .collect();
+        // The local node ranks first but is dropped, so it takes no capped place.
+        gateways.push(gateway(node_id(99), 1_000));
         gateways.reverse();
 
         let ranked = rank_gateways(&ranking(gateways), node_id(99));
 
         assert_eq!(ranked.len(), MAX_RANKED_GATEWAYS);
-        assert_eq!(ranked_ids(&ranked), valid[..MAX_RANKED_GATEWAYS].to_vec());
+        assert_eq!(ranked_ids(&ranked), ids[..MAX_RANKED_GATEWAYS].to_vec());
     }
 
     #[test]

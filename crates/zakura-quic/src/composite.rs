@@ -89,13 +89,25 @@ pub(crate) fn ml_dsa_public_key(
 pub(crate) fn ml_dsa_sign(
     ml_dsa_seed: &[u8; KEY_GENERATION_RANDOMNESS_SIZE],
     message: &[u8],
-    mut randomness: [u8; SIGNING_RANDOMNESS_SIZE],
+    randomness: [u8; SIGNING_RANDOMNESS_SIZE],
 ) -> Result<[u8; ML_DSA_44_SIGNATURE_BYTES], SignatureError> {
-    let mut pair = ml_dsa_44::generate_key_pair(*ml_dsa_seed);
     // Fails only for a context over 255 bytes, which `ML_DSA_CONTEXT` isn't,
     // or when rejection sampling runs out of attempts, which FIPS 204 puts
     // below 2^-256.
-    let signature = ml_dsa_44::sign(&pair.signing_key, message, ML_DSA_CONTEXT, randomness);
+    ml_dsa_sign_in_context(ml_dsa_seed, message, ML_DSA_CONTEXT, randomness)
+}
+
+/// FIPS 204 ML-DSA.Sign with the key generated from `ml_dsa_seed`, under
+/// `context` and hedged with `randomness` (all zeros gives the deterministic
+/// variant). Fails for a context over 255 bytes.
+fn ml_dsa_sign_in_context(
+    ml_dsa_seed: &[u8; KEY_GENERATION_RANDOMNESS_SIZE],
+    message: &[u8],
+    context: &[u8],
+    mut randomness: [u8; SIGNING_RANDOMNESS_SIZE],
+) -> Result<[u8; ML_DSA_44_SIGNATURE_BYTES], SignatureError> {
+    let mut pair = ml_dsa_44::generate_key_pair(*ml_dsa_seed);
+    let signature = ml_dsa_44::sign(&pair.signing_key, message, context, randomness);
     pair.signing_key.as_mut_slice().zeroize();
     randomness.zeroize();
     Ok(*signature.map_err(|_| SignatureError)?.as_ref())
@@ -114,18 +126,35 @@ pub(crate) fn verify(
         return Err(SignatureError);
     }
     let (classical, post_quantum) = signature.split_at(ED25519_SIGNATURE_BYTES);
-    let ml_dsa: [u8; ML_DSA_44_KEY_BYTES] = ml_dsa.try_into().map_err(|_| SignatureError)?;
-    let post_quantum: [u8; ML_DSA_44_SIGNATURE_BYTES] =
-        post_quantum.try_into().map_err(|_| SignatureError)?;
     ed25519.verify_strict(message, classical)?;
+    ml_dsa_verify_in_context(ml_dsa, message, ML_DSA_CONTEXT, post_quantum)
+}
+
+/// FIPS 204 ML-DSA.Verify of `signature` over `message` under `context`,
+/// with the encoded ML-DSA-44 public key `ml_dsa`. A key or signature of
+/// another length, or a context over 255 bytes, fails.
+fn ml_dsa_verify_in_context(
+    ml_dsa: &[u8],
+    message: &[u8],
+    context: &[u8],
+    signature: &[u8],
+) -> Result<(), SignatureError> {
+    let ml_dsa: [u8; ML_DSA_44_KEY_BYTES] = ml_dsa.try_into().map_err(|_| SignatureError)?;
+    let signature: [u8; ML_DSA_44_SIGNATURE_BYTES] =
+        signature.try_into().map_err(|_| SignatureError)?;
     ml_dsa_44::verify(
         &MLDSA44VerificationKey::new(ml_dsa),
         message,
-        ML_DSA_CONTEXT,
-        &MLDSA44Signature::new(post_quantum),
+        context,
+        &MLDSA44Signature::new(signature),
     )
     .map_err(|_| SignatureError)
 }
+
+#[cfg(test)]
+mod interop;
+#[cfg(test)]
+mod vectors;
 
 #[cfg(test)]
 mod tests {

@@ -1,6 +1,6 @@
 # Spec: `zakura-quic` transport
 
-Status: draft for review, 2026-11-22. Version 0.27.
+Status: draft for review, 2026-11-22. Version 0.28.
 This document is authoritative for the `zakura-quic` crate, its configuration,
 its wire behavior and its `quinn-proto` dependency policy.
 [Decision 0003](../decisions/zakura/0003-zakura-quic-transport.md) records the
@@ -64,6 +64,9 @@ ML-DSA-44; it adds ID-13, changes DEP-2, ID-8, ID-11, ID-12, TLS-4, API-1
 and §16, and §17x lists each change. Version 0.27 counts the key exchanges
 a node completes by group and the handshake signatures it verifies by
 scheme; it changes OBS-1, OBS-2 and §16, and §17y lists each change.
+Version 0.28 checks the composite's ML-DSA-44 half against published
+known answers and publishes one for the whole composite; it changes TLS-4
+and §16, and §17z lists each change.
 
 ## 0. Conventions
 
@@ -276,7 +279,11 @@ at fork tag `zakura-iroh-v1.1.0-rc.1`, and it keeps their MIT/Apache-2.0 notices
   signature of another length and MUST accept only when the Ed25519 half
   verifies under ID-6 with the credential's Ed25519 key and the ML-DSA-44
   half verifies with its ML-DSA-44 key. A credential without both keys
-  can't be authenticated, so the handshake fails (ID-11).
+  can't be authenticated, so the handshake fails (ID-11). The file
+  `crates/zakura-quic/src/composite/ed25519_mldsa44_kat.json` gives a
+  seed, message and hedging randomness with the composite signature and
+  node ID they produce, so another implementation can check its signer
+  against this one.
 - **TLS-5.** Client authentication is mandatory. The server MUST abort a
   handshake without a client key.
 - **TLS-6.** The client MUST NOT send SNI. It passes the dialed `NodeId` to
@@ -1299,6 +1306,9 @@ this release tolerates, and keep each hard change explicit.
 | A peer that offers only classical groups is refused in either direction, and two production endpoints agree on the hybrid | TLS-9 |
 | A credential with an unknown long key derives the same ID on both ends; a bare Ed25519 SubjectPublicKeyInfo, a credential whose ID isn't the dialed one, and a client presenting a credential it can't sign for are refused | TLS-3, TLS-4, TLS-7, TLS-8, ID-12 |
 | A composite signature verifies only whole: a tampered Ed25519 or ML-DSA half, a truncated signature, another node's key in either half, and a credential without an ML-DSA-44 key are refused; the ML-DSA seed derivation has a known answer | TLS-4, ID-11, ID-13 |
+| ML-DSA-44 key generation, signing and verification give a subset of Project Wycheproof's and NIST ACVP's known answers, each under its own context: seeded keys and deterministic and hedged signatures match, and a 256-byte context, wrong-length keys and signatures, a flipped commitment hash, a bad hint encoding and an out-of-bound response are refused | TLS-4, ID-13 |
+| Signatures that RustCrypto `ml-dsa` 0.1.2 made under the TLS-4 context, recorded offline, are reproduced byte for byte and verify, and its public key for the same seed matches | TLS-4, ID-13 |
+| The published composite known answer: a fixed seed, message and randomness give the recorded Ed25519 key, ML-DSA-44 key, node ID and composite signature, which verifies | TLS-4, ID-9, ID-12, ID-13 |
 | In a simulated handshake the listener's first flight stays within three times the 2,400-byte hybrid hello, and the dialer completes on it alone | TLS-4, ADM-1 |
 | The seeded X25519MLKEM768 completes against the production group in both roles and replays its shares for the same seed and node | TLS-9, API-2 |
 | A dialer that offers X25519MLKEM768 sends its hello as two 1,200-byte Initial datagrams. A refused dial is decided and answered once per datagram, and a retried one decided once per datagram. A hello refused at its first datagram and accepted at its second keeps its charge and holds a pending handshake until the deadline. A one-datagram hello, which only a dialer with classical groups alone sends, is refused at its first datagram and cancelled; a hello with no ALPN in common, which spans two, fails as a handshake | ADM-1, ADM-3, ADM-7, API-3 |
@@ -1994,3 +2004,21 @@ Changed:
 - **OBS-2.** States that a label value comes from this node's own fixed set,
   which both new labels follow.
 - **§16.** Adds the row for the two counters on each side of a handshake.
+
+## 17z. Changes in version 0.28
+
+The ML-DSA-44 half of the composite was tested only against itself, so a
+misused library call, such as a dropped context, deterministic instead of
+hedged signing, or a wrong key or signature encoding, would have gone
+unnoticed as long as both ends made it. It is now checked against
+published known answers from Project Wycheproof and NIST's ACVP, and
+against bytes recorded once from RustCrypto's independent `ml-dsa`. No test
+dependency is added: the recorded bytes are checked in, with how they were
+made. A known answer for the whole composite is published for other
+implementations. The wire format doesn't change.
+
+Changed:
+
+- **TLS-4.** Names the composite known-answer file.
+- **§16.** Adds the rows for the ML-DSA-44 known answers, the recorded
+  RustCrypto signatures and the composite known answer.

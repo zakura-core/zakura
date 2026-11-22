@@ -131,10 +131,11 @@ pub const DEFAULT_ZAKURA_LISTEN_ADDR: SocketAddr =
     SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 8234));
 /// Default native Zakura bootstrap peers for Mainnet.
 ///
-/// These entries, and the Testnet ones, still hold each seed's protocol 3
-/// ID, its Ed25519 key. A protocol 4 ID derives from keys only the seed can
-/// compute, so they are replaced with the IDs the seeds print once they run
-/// this release; until then a dial to them fails its identity check.
+/// These entries still hold each seed's protocol 3 ID, its Ed25519 key. A
+/// protocol 4 ID derives from keys only the seed can compute, so they are
+/// replaced with the IDs the seeds print once they run this release; until
+/// then a dial to them fails its identity check. The Testnet seeds already
+/// run it and are listed by their protocol 4 IDs.
 pub const DEFAULT_MAINNET_ZAKURA_BOOTSTRAP_PEERS: &[&str] = &[
     "1398f62c6d1a457c51ba6a4b5f3dbd2f69fca93216218dc8997e416bd17d93ca@165.22.54.66:8234",
     "fd1724385aa0c75b64fb78cd602fa1d991fdebf76b13c58ed702eac835e9f618@104.131.184.123:8234",
@@ -148,9 +149,9 @@ pub const DEFAULT_MAINNET_ZAKURA_BOOTSTRAP_PEERS: &[&str] = &[
 ];
 /// Default native Zakura bootstrap peers for Testnet.
 pub const DEFAULT_TESTNET_ZAKURA_BOOTSTRAP_PEERS: &[&str] = &[
-    "57ad39fad4f0bca46cf1ea831772a99d5027b372fef2be5a0ea68e1b5bb4da49@167.99.103.111:8234",
-    "2bbb907b5d90598ef49f2e637066586b311a64587479be6ed43e8388587fcd2a@164.92.209.78:8234",
-    "50999835f48f4a048c0e9042e5332844c9673943d7fab1f7e993bae698c27ea3@206.189.148.0:8234",
+    "672cb8d35831d6020f14e35215de0f7fc1ee771ecd3c9d5fe67c32acb0b53fab@167.99.103.111:8234",
+    "3783033db00b137ed3d11cf2d30853fce65db4967d3910bb66ff4d14191764c9@164.92.209.78:8234",
+    "fe1f7911e1675f0f3cfb17033a71ff2221d03d9f170b0209a73deba439886efe@206.189.148.0:8234",
 ];
 /// Default native Zakura bootstrap peers.
 pub const DEFAULT_ZAKURA_BOOTSTRAP_PEERS: &[&str] = DEFAULT_MAINNET_ZAKURA_BOOTSTRAP_PEERS;

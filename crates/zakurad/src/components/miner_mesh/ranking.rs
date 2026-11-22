@@ -1,7 +1,11 @@
 //! What the tracker tells the network about the mining gateways to prefer.
 
 use tokio::sync::watch;
-use zakura_chain::{chain_tip::ChainTip, miner_mesh::MinerSetSnapshot, parameters::Network};
+use zakura_chain::{
+    chain_tip::ChainTip,
+    miner_mesh::{MinerSetCoverage, MinerSetSnapshot},
+    parameters::Network,
+};
 use zakura_network::zakura::{MinerGateway, MinerGatewayRanking};
 use zakura_rpc::synced_to_tip;
 
@@ -22,6 +26,7 @@ pub fn ranking_channel<Tip: ChainTip>(
 ) {
     let (sender, receiver) = watch::channel(MinerGatewayRanking::default());
     let publisher = is_mining.then(|| RankingPublisher {
+        coverage: watch::channel(MinerSetCoverage::default()).0,
         network,
         latest_chain_tip,
         sender,
@@ -30,18 +35,29 @@ pub fn ranking_channel<Tip: ChainTip>(
 }
 
 /// Hands the network the gateways a synced mining node prefers to stay
-/// connected to.
+/// connected to, and keeps how much of the window is read for
+/// `getminermeshinfo`.
 ///
 /// When the publisher is dropped the network treats the ranking as empty.
 pub struct RankingPublisher<Tip> {
     network: Network,
     latest_chain_tip: Tip,
     sender: watch::Sender<MinerGatewayRanking>,
+    /// The coverage of the counts last published, synced or not.
+    coverage: watch::Sender<MinerSetCoverage>,
 }
 
 impl<Tip: ChainTip> RankingPublisher<Tip> {
+    /// Returns a receiver of the coverage of the counts this publisher is
+    /// handed, starting with no tip. It keeps the last coverage after the
+    /// publisher is dropped.
+    pub fn coverage(&self) -> watch::Receiver<MinerSetCoverage> {
+        self.coverage.subscribe()
+    }
+
     /// Publishes every gateway counted in `snapshot` while the best tip is
-    /// recent enough to mine on, and an empty ranking otherwise.
+    /// recent enough to mine on, and an empty ranking otherwise. The
+    /// [`coverage`](Self::coverage) receivers get its coverage either way.
     ///
     /// Whether the tip is recent enough depends on the clock, so the caller
     /// publishes again from time to time even when the counts do not change.
@@ -51,6 +67,15 @@ impl<Tip: ChainTip> RankingPublisher<Tip> {
     /// pruned node never reads its whole window, and holding the ranking
     /// back would empty it on every reorg repair.
     pub(super) fn publish(&self, snapshot: &MinerSetSnapshot) {
+        let coverage = snapshot.coverage();
+        self.coverage.send_if_modified(|current| {
+            let changed = *current != coverage;
+            if changed {
+                *current = coverage;
+            }
+            changed
+        });
+
         let ranking = if synced_to_tip(&self.network, &self.latest_chain_tip).is_ok() {
             MinerGatewayRanking {
                 gateways: snapshot

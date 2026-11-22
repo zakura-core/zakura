@@ -1056,6 +1056,12 @@ impl StartCmd {
                 sync_status: zakura_rpc::node::NodeSyncStatus::new(sync_status.clone()),
                 latest_chain_tip: latest_chain_tip.clone(),
                 address_book: address_book.clone(),
+                miner_mesh: zakura_rpc::MinerMeshSources {
+                    coverage: miner_gateway_publisher
+                        .as_ref()
+                        .map(|publisher| publisher.coverage()),
+                    endpoint: zakura_endpoint.clone(),
+                },
             },
             LAST_WARN_ERROR_LOG_SENDER.subscribe(),
             Some(submit_block_channel.sender()),

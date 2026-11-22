@@ -23,7 +23,7 @@ pub(crate) const MAX_RANKED_GATEWAYS: usize = 256;
 /// What v2 networking knows about a ranked gateway.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GatewayStanding {
-    /// v2 networking has no record of the gateway.
+    /// v2 networking has no connection or usable dial address for the gateway.
     Unmatched,
     /// Known, but waiting out a failed dial before the next one.
     Backoff,
@@ -48,6 +48,22 @@ impl GatewayStanding {
     fn available(self) -> bool {
         matches!(self, Self::Dialable | Self::Dialing | Self::Connected)
     }
+}
+
+/// Where a ranked gateway stands against the places the node holds: its
+/// [`GatewayStanding`] read together with the preferred set.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GatewayPlace {
+    /// In the preferred set, so it may fill a held place.
+    Preferred,
+    /// Known and reachable now (dialable, being dialed or connected), but
+    /// ranked below the gateways that fill the held places.
+    Standby,
+    /// Known, but waiting out a failed dial or a lost connection. It still
+    /// counts toward the shared hold while other available gateways may fill it.
+    Backoff,
+    /// v2 networking has no connection or usable dial address for it, so it takes no place.
+    Unmatched,
 }
 
 /// One gateway of the ranking.
@@ -153,7 +169,7 @@ impl PreferredGateways {
     /// lowest node ID bytes.
     ///
     /// The hold is the matched gateways, up to the ceiling, so a gateway in
-    /// backoff keeps a place it can call into. The set is the available
+    /// backoff still counts toward the shared hold. The set is the available
     /// gateways, in rank order, up to the hold.
     pub fn form(ranking: impl IntoIterator<Item = RankedGateway>, hold_limit: usize) -> Self {
         Self::form_with_incumbents(unique_gateways(ranking), hold_limit, &[])
@@ -219,6 +235,27 @@ impl PreferredGateways {
         self.set.contains(node)
     }
 
+    /// Every ranked gateway once, in rank order, with its place. A ranking
+    /// keeps at most 256 gateways.
+    pub(crate) fn places(&self) -> impl Iterator<Item = (&RankedGateway, GatewayPlace)> + '_ {
+        self.ranking.iter().map(|gateway| {
+            let place = match gateway.standing {
+                GatewayStanding::Unmatched => GatewayPlace::Unmatched,
+                GatewayStanding::Backoff => GatewayPlace::Backoff,
+                GatewayStanding::Dialable
+                | GatewayStanding::Dialing
+                | GatewayStanding::Connected => {
+                    if self.contains(&gateway.node) {
+                        GatewayPlace::Preferred
+                    } else {
+                        GatewayPlace::Standby
+                    }
+                }
+            };
+            (gateway, place)
+        })
+    }
+
     /// Members whose connections are outside the ordinary discovery budget.
     pub(crate) fn held_places(&self) -> HeldPlaces {
         HeldPlaces {
@@ -248,7 +285,7 @@ impl PreferredGateways {
     ///
     /// A gateway that loses its last connection slot counts as in backoff
     /// until the next published ranking. Like a gateway whose dial failed,
-    /// it keeps its held place reserved, leaves the set so the next
+    /// it still counts toward the hold and leaves the set so the next
     /// available gateway may fill it, and may still call back in.
     pub(super) fn with_released(&self, node: &NodeId) -> Option<Self> {
         let index = self

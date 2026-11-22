@@ -24,6 +24,10 @@ pub use crate::methods::{
         get_blockchain_info::GetBlockchainInfoBalance,
         get_mining_info::GetMiningInfoResponse,
         get_raw_mempool::{GetRawMempoolResponse, MempoolObject},
+        miner_mesh_info::{
+            GetMinerMeshInfoResponse, MeshGateway, MeshGatewayState, MeshPeer, MeshSlots,
+            MeshWindow,
+        },
         network_info::GetNetworkInfoResponse,
         peer_info::{GetPeerInfoResponse, PeerInfo},
         submit_block::{

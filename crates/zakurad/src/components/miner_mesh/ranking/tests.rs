@@ -5,7 +5,7 @@ use chrono::{Duration, Utc};
 use zakura_chain::{
     block::Height,
     chain_tip::mock::{MockChainTip, MockChainTipSender},
-    miner_mesh::{GatewayBlocks, MinerSetSnapshot},
+    miner_mesh::{GatewayBlocks, MinerSetCoverage, MinerSetSnapshot},
     parameters::Network,
 };
 use zakura_network::zakura::{MinerGateway, MinerGatewayRanking};
@@ -27,7 +27,7 @@ fn snapshot() -> MinerSetSnapshot {
             },
         ],
         checked: 10,
-        window_len: 10,
+        window: Some(Height(1)..=Height(10)),
     }
 }
 
@@ -125,4 +125,19 @@ fn publishing_the_same_ranking_again_does_not_wake_the_network() {
     publisher.publish(&snapshot());
 
     assert!(!ranking.has_changed().expect("the publisher is alive"));
+}
+
+#[test]
+fn the_coverage_reaches_its_receivers_whether_or_not_the_node_is_synced() {
+    let (tip, _sender) = MockChainTip::new();
+    let (ranking, publisher) = ranking_channel(true, Network::Mainnet, tip);
+    let publisher = publisher.expect("a mining node gets a publisher");
+    let coverage = publisher.coverage();
+    assert_eq!(*coverage.borrow(), MinerSetCoverage::default());
+
+    publisher.publish(&snapshot());
+
+    assert_eq!(*ranking.borrow(), MinerGatewayRanking::default());
+    assert_eq!(*coverage.borrow(), snapshot().coverage());
+    assert_eq!(coverage.borrow().window_len(), 10);
 }

@@ -15,6 +15,38 @@ fn gateway(seed: u8, blocks: u32, standing: GatewayStanding) -> RankedGateway {
     }
 }
 
+/// Each ranked gateway's place, in rank order: with one place held, a
+/// gateway in backoff counts towards the hold but leaves the set to the best
+/// dialable gateway, the next dialable gateway waits on standby, and an
+/// unmatched gateway takes no place.
+#[test]
+fn places_read_each_standing_against_the_set() {
+    let formed = PreferredGateways::form(
+        [
+            gateway(1, 4, GatewayStanding::Backoff),
+            gateway(2, 3, GatewayStanding::Dialable),
+            gateway(3, 2, GatewayStanding::Dialable),
+            gateway(4, 1, GatewayStanding::Unmatched),
+        ],
+        1,
+    );
+
+    let places: Vec<_> = formed
+        .places()
+        .map(|(gateway, place)| (gateway.node, place))
+        .collect();
+    assert_eq!(
+        places,
+        vec![
+            (node(1), GatewayPlace::Backoff),
+            (node(2), GatewayPlace::Preferred),
+            (node(3), GatewayPlace::Standby),
+            (node(4), GatewayPlace::Unmatched),
+        ]
+    );
+    assert_eq!(formed.hold(), 1);
+}
+
 #[test]
 fn an_empty_ranking_holds_nothing() {
     let empty = PreferredGateways::form([], MAX_PREFERRED_GATEWAYS);
@@ -24,7 +56,7 @@ fn an_empty_ranking_holds_nothing() {
 }
 
 /// Below the ceiling, the hold is the matched gateways, and one in backoff
-/// keeps its place without filling it.
+/// counts toward the shared hold while another available gateway may fill it.
 #[test]
 fn the_hold_counts_matched_gateways_and_the_set_skips_backoff() {
     let formed = PreferredGateways::form(

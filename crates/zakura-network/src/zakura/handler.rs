@@ -65,10 +65,10 @@ use super::trace::{reject_reason_label, ZakuraTrace};
 use super::transport::{
     check_reactor_shares, frame_wire_bytes, sim_arg, sim_chain, transport_observe,
     worker_framed_channel, AdmittedFrame, CloseOutcome, CloseRow, CompatResponseGrant,
-    ConnectionResources, FrameGate, FrameGrant, FramedWorkerRecv, HandshakeCounts, HeldPlaces,
-    IpAdmission, NeutralCause, NodeResources, OrderedStreamFailure, OrderedStreamFailureCause,
-    OwnerBound, OwnerGuard, OwnerPhase, ReactorBudget, ReactorShares, ResourceEnvelope,
-    SessionLayout, SlotClass, SlotRefusal, StreamResources, TransportLimits,
+    ConnectionPlaces, ConnectionResources, FrameGate, FrameGrant, FramedWorkerRecv,
+    HandshakeCounts, HeldPlaces, IpAdmission, NeutralCause, NodeResources, OrderedStreamFailure,
+    OrderedStreamFailureCause, OwnerBound, OwnerGuard, OwnerPhase, ReactorBudget, ReactorShares,
+    ResourceEnvelope, SessionLayout, SlotClass, SlotRefusal, StreamResources, TransportLimits,
     COMPAT_EXCHANGE_BUDGET, COMPAT_RESPONSE_MAX_AGGREGATE_BYTES,
 };
 #[cfg(any(test, feature = "zakura-testkit"))]
@@ -1383,6 +1383,26 @@ impl ZakuraEndpoint {
             .counts()
             .preferred_gateways()
             .held_places()
+    }
+
+    /// The places held for preferred mining gateways, how the connection
+    /// slots are used, and the v2 peers registered now.
+    ///
+    /// The peers are read just before the slot counts, so a connection that
+    /// registers or closes in between can show in one and not the other.
+    pub fn connection_places(&self) -> ConnectionPlaces {
+        let registered: HashSet<NodeId> = self
+            .supervisor
+            .subscribe()
+            .borrow()
+            .iter()
+            .filter_map(ZakuraPeerId::node_id)
+            .collect();
+        ConnectionPlaces::read(
+            || self.handler.supervisor.ip_slots.counts(),
+            self.handler.limits.total_connections(),
+            &registered,
+        )
     }
 
     /// How many dials discovery can start now: the handler's free ordinary

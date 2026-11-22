@@ -62,8 +62,22 @@ pub struct MinerSetSnapshot {
     pub gateways: Vec<GatewayBlocks>,
     /// How many heights in the window have been read.
     pub checked: usize,
-    /// How many heights the window holds.
-    pub window_len: usize,
+    /// The heights that count at the tip, oldest to newest, or `None` before
+    /// the first tip and while the tip is below height 100.
+    pub window: Option<RangeInclusive<Height>>,
+}
+
+/// How much of its window a [`RecentMinerSet`] has read, without the
+/// counts: a small summary to show an operator.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MinerSetCoverage {
+    /// The best chain's tip height when the summary was taken, if the set
+    /// has one.
+    pub tip: Option<Height>,
+    /// The heights that count at the tip, as in [`MinerSetSnapshot::window`].
+    pub window: Option<RangeInclusive<Height>>,
+    /// How many heights in the window have been read.
+    pub checked: usize,
 }
 
 impl MinerSetSnapshot {
@@ -73,7 +87,28 @@ impl MinerSetSnapshot {
     /// Until then the counts are a lower bound, and an empty list only means
     /// that no gateway has been found yet.
     pub fn is_complete(&self) -> bool {
-        self.tip.is_some() && self.checked == self.window_len
+        self.tip.is_some() && self.checked == self.window_len()
+    }
+
+    /// How many heights the window holds.
+    pub fn window_len(&self) -> usize {
+        window_len(&self.window)
+    }
+
+    /// The tip, the window and how much of it is read, without the counts.
+    pub fn coverage(&self) -> MinerSetCoverage {
+        MinerSetCoverage {
+            tip: self.tip.map(|(height, _)| height),
+            window: self.window.clone(),
+            checked: self.checked,
+        }
+    }
+}
+
+impl MinerSetCoverage {
+    /// How many heights the window holds.
+    pub fn window_len(&self) -> usize {
+        window_len(&self.window)
     }
 }
 
@@ -172,10 +207,7 @@ impl RecentMinerSet {
             tip: self.tip,
             gateways,
             checked: self.checked.len(),
-            window_len: self
-                .window
-                .as_ref()
-                .map_or(0, |window| heights(window).count()),
+            window: self.window.clone(),
         }
     }
 
@@ -185,6 +217,11 @@ impl RecentMinerSet {
             .as_ref()
             .is_some_and(|window| window.contains(&height))
     }
+}
+
+/// Returns how many heights `window` holds: none when there is no window.
+fn window_len(window: &Option<RangeInclusive<Height>>) -> usize {
+    window.as_ref().map_or(0, |window| heights(window).count())
 }
 
 /// Returns the heights in `window`, oldest first.

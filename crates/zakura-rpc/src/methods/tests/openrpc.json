@@ -186,6 +186,20 @@
       }
     },
     {
+      "name": "getminermeshinfo",
+      "summary": "Returns this node's view of the miner mesh.",
+      "description": "Returns this node's view of the miner mesh.\n\nThe response is a [`GetMinerMeshInfoResponse`] JSON struct: the\ngateways recent blocks name, the connection places this node holds for\nthe best of them, and its v2 peers.\n\nZakura-specific.\nmethod: post\ntags: network\n\n# Notes\n\nA mining node counts the gateways that recent best-chain coinbases\nname, and while it is synced, v2 networking holds up to ten connection\nplaces that ordinary peers cannot fill for the highest-ranked gateways\nit can reach. Each gateway's `state` is `preferred` when it may fill a\nheld place, `standby` when it is reachable but ranked below those,\n`backoff` when it is known but waiting out a failed dial or a lost\nconnection, and `unmatched` when v2 networking has no address for it.\n\n`window` is null on a node that does not mine, and `slots` is null on\na node that runs no v2 networking.",
+      "params": [],
+      "result": {
+        "name": "getminermeshinfo_result",
+        "summary": "An OpenRPC document.",
+        "description": "An OpenRPC document.",
+        "schema": {
+          "$ref": "#/components/schemas/OpenRPC%20Schema"
+        }
+      }
+    },
+    {
       "name": "getblock",
       "summary": "Returns the requested block by hash or height, as a",
       "description": "Returns the requested block by hash or height, as a\n[`GetBlockResponse`] JSON string.\nIf the block is not in Zebra's state, returns\n[error code `-8`.](https://github.com/zcash/zcash/issues/5758) if a height was\npassed or -5 if a hash was passed.\n\nzcashd reference: [`getblock`](https://zcash.github.io/rpc/getblock.html)\nmethod: post\ntags: blockchain\n\n# Parameters\n\n- `hash_or_height`: (string, required, example=\"1\") The hash or height for the block to be returned.\n- `verbosity`: (number, optional, default=1, example=1) 0 for hex encoded data, 1 for a json object, and 2 for json object with transaction data.\n\n# Notes\n\nThe `size` field is only returned with verbosity=2.\n\nThe undocumented `chainwork` field is not returned.\n\nWith verbosity=2, transaction objects include `ironwood` only when the\ntransaction contains Ironwood shielded data. Block `trees` can include an\nIronwood tree entry when the state has one for the requested block.",

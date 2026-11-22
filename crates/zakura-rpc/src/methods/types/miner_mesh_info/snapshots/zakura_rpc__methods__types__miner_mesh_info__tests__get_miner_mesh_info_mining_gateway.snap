@@ -1,0 +1,68 @@
+---
+source: crates/zakura-rpc/src/methods/types/miner_mesh_info/tests.rs
+expression: response
+---
+{
+  "node_id": "1111111111111111111111111111111111111111111111111111111111111111",
+  "announcing": true,
+  "mining": true,
+  "synced": true,
+  "window": {
+    "tip": 3000000,
+    "newest": 2999900,
+    "oldest": 2997597,
+    "checked": 1152,
+    "coverage": 0.5
+  },
+  "gateways": [
+    {
+      "node_id": "2222222222222222222222222222222222222222222222222222222222222222",
+      "blocks": 40,
+      "state": "preferred",
+      "connected": true
+    },
+    {
+      "node_id": "3333333333333333333333333333333333333333333333333333333333333333",
+      "blocks": 12,
+      "state": "backoff",
+      "connected": false
+    },
+    {
+      "node_id": "4444444444444444444444444444444444444444444444444444444444444444",
+      "blocks": 7,
+      "state": "standby",
+      "connected": true
+    },
+    {
+      "node_id": "5555555555555555555555555555555555555555555555555555555555555555",
+      "blocks": 3,
+      "state": "unmatched",
+      "connected": false
+    }
+  ],
+  "hold": 2,
+  "slots": {
+    "limit": 92,
+    "in_use": 3,
+    "preferred": 1,
+    "ordinary": 2,
+    "inbound": 2
+  },
+  "peers": [
+    {
+      "node_id": "2222222222222222222222222222222222222222222222222222222222222222",
+      "inbound": true,
+      "preferred": true
+    },
+    {
+      "node_id": "4444444444444444444444444444444444444444444444444444444444444444",
+      "inbound": false,
+      "preferred": false
+    },
+    {
+      "node_id": "6666666666666666666666666666666666666666666666666666666666666666",
+      "inbound": true,
+      "preferred": false
+    }
+  ]
+}

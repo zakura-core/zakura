@@ -32,7 +32,7 @@ pub use handshake_counts::{
 };
 pub(crate) use preferred_gateways::HeldPlaces;
 pub use preferred_gateways::{
-    GatewayStanding, PreferredGateways, RankedGateway, MAX_PREFERRED_GATEWAYS,
+    GatewayRanking, GatewayStanding, PreferredGateways, RankedGateway, MAX_PREFERRED_GATEWAYS,
 };
 // `SessionGuard` and `ByteBudget` are imported through this re-export; `Admit`
 // and `PeerMeters` are reached directly via the `guard` module path, so they are

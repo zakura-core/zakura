@@ -899,7 +899,6 @@ fn check_counts<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
                     node_connections,
                     inbound_node_connections,
                     connection_cap,
-                    gateway_capacity,
                     pending,
                     inbound,
                     pending_permits,
@@ -932,9 +931,11 @@ fn check_counts<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
             "handshake/counts-match-permits"
                 if connections != node_connections
                     || inbound_connections != inbound_node_connections
-                    || *connections > connection_cap + gateway_capacity
-                    || *inbound_connections
-                        > connection_cap - reserve(*connection_cap) + gateway_capacity =>
+                    || !wire_connection_counts_fit(
+                        *connections,
+                        *inbound_connections,
+                        *connection_cap,
+                    ) =>
             {
                 return cx.violated(
                     "connection slots equal their per-node sum and stay within the cap",
@@ -1003,6 +1004,19 @@ fn reserve(cap: usize) -> usize {
     }
 }
 
+// The wire scenarios never publish a gateway ranking. Every admitted connection is
+// ordinary even though QUIC has room for funded gateways before learning the peer ID.
+fn wire_connection_counts_fit(total: usize, inbound: usize, ordinary_cap: usize) -> bool {
+    total <= ordinary_cap && inbound <= ordinary_cap - reserve(ordinary_cap)
+}
+
+#[test]
+fn funded_gateways_do_not_expand_unranked_wire_admission() {
+    assert!(wire_connection_counts_fit(92, 69, 92));
+    assert!(!wire_connection_counts_fit(93, 69, 92));
+    assert!(!wire_connection_counts_fit(92, 70, 92));
+}
+
 fn check_reserve<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
     let mut applies = false;
     for obs in cx.observations() {
@@ -1018,6 +1032,7 @@ fn check_reserve<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
         };
         match event {
             TransportFact::HandshakeCounts {
+                connections,
                 inbound_connections,
                 connection_cap,
                 gateway_capacity,
@@ -1029,8 +1044,7 @@ fn check_reserve<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
                 ..
             } => {
                 applies = true;
-                if *inbound_connections
-                    > connection_cap - reserve(*connection_cap) + gateway_capacity
+                if !wire_connection_counts_fit(*connections, *inbound_connections, *connection_cap)
                     || *inbound > cap - reserve(*cap)
                     || *quic_inbound
                         > connection_cap + gateway_capacity + cap

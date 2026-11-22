@@ -222,7 +222,7 @@ connection ownership across scheduled IO.
 | --- | --- | --- |
 | `credential_parse` | `credential/canonical-encoding`, `credential/node-id`, `credential/bounded-parse` | 1 |
 | `key_list_decode` | `key-list/canonical-encoding`, `key-list/stable-id` | 1 |
-| `composite_verify` | `composite/signature-length`, `composite/both-halves`, `composite/tamper-refused` | 1 |
+| `composite_verify` | `composite/tamper-refused` | 1 |
 
 These targets feed peer-chosen bytes to what `zakura-quic` parses before a v2
 TLS handshake authenticates the peer, not machine histories. The drivers and
@@ -233,7 +233,10 @@ private to the crate.
 `credential_parse` reads its whole input both as a TLS raw public key
 (`NodeCredential::from_spki`) and as a bare credential encoding
 (`NodeCredential::decode`). An accepted credential re-encodes to exactly the
-input, decodes back to itself, and names its key list's node ID. The target
+input and decodes back to itself. The driver rebuilds an accepted SPKI's
+canonical DER, and the node ID from the ID-12 key fingerprints, from the spec
+rather than with the code under test, and compares them with the input and the
+credential's ID. The target
 installs `MeteredAllocator` from this package's library, and no single
 allocation of the two parses may exceed the input's length by more than 256
 bytes.
@@ -247,7 +250,8 @@ input whose first byte is even carries an Ed25519 key, a `u16`-prefixed
 ML-DSA-44 key, a `u16`-prefixed message and the signature. An odd first byte
 makes the rest four-byte edits of an honest signature, signed once per
 process, so an empty corpus still explores near-valid signatures. The honest
-signature must verify, and every edit of it must fail. ML-DSA verification
+signature must verify, and every edit of it must fail. A raw input checks only
+that the verifier doesn't panic. ML-DSA verification
 makes this target far slower per input than the others.
 
 The campaign corpus isn't committed. To start a local campaign from the unit

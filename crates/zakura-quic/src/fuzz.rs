@@ -11,10 +11,7 @@ use std::sync::OnceLock;
 use blake2b_simd::Params;
 
 use crate::{
-    composite::{
-        self, COMPOSITE_SIGNATURE_BYTES, ML_DSA_44_KEY_BYTES, ML_DSA_44_KEY_TAG,
-        ML_DSA_44_SIGNATURE_BYTES,
-    },
+    composite::{self, COMPOSITE_SIGNATURE_BYTES, ML_DSA_44_KEY_TAG, ML_DSA_44_SIGNATURE_BYTES},
     credential::{NodeCredential, MAX_CREDENTIAL_KEY_BYTES},
     key::{NodeId, NodeKey, NodeSecretKey, KEY_LENGTH},
     key_list::{NodeKeyList, ED25519_KEY_TAG},
@@ -25,8 +22,6 @@ const CREDENTIAL_NODE_ID: &str = "credential/node-id";
 const CREDENTIAL_BOUNDED: &str = "credential/bounded-parse";
 const KEY_LIST_CANONICAL: &str = "key-list/canonical-encoding";
 const KEY_LIST_ID: &str = "key-list/stable-id";
-const COMPOSITE_LENGTH: &str = "composite/signature-length";
-const COMPOSITE_HALVES: &str = "composite/both-halves";
 const COMPOSITE_TAMPER: &str = "composite/tamper-refused";
 
 /// How far one allocation of a credential parse may exceed its input's
@@ -34,9 +29,21 @@ const COMPOSITE_TAMPER: &str = "composite/tamper-refused";
 /// tables, at most five 34-byte entries each.
 pub const PARSE_ALLOCATION_SLACK_BYTES: usize = 256;
 
-/// The BLAKE2b personalisation of a node ID (ID-9), restated so the key-list
-/// driver checks the ID against the spec rather than the code under test.
+/// The BLAKE2b personalisation of a node ID (ID-9), restated so the drivers
+/// check IDs against the spec rather than the code under test.
 const NODE_ID_PERSONALISATION: &[u8; 16] = b"Zakura_NodeId_v1";
+
+/// The BLAKE2b personalisation of a key's fingerprint (ID-12), restated for
+/// the same reason.
+const KEY_FINGERPRINT_PERSONALISATION: &[u8; 16] = b"Zakura_KeyFpr_v1";
+
+/// The DER `AlgorithmIdentifier` of a credential's SPKI (TLS-3): a SEQUENCE
+/// holding only the object identifier `2.25.<UUID 6a31af47-5aa9-48c7-8ab9-d117edca0d9a>`.
+/// A unit test derives the identifier from the UUID.
+const CREDENTIAL_ALGORITHM_DER: &[u8] = &[
+    0x30, 0x16, 0x06, 0x14, 0x69, 0x81, 0xd4, 0xb1, 0xd7, 0xd1, 0xeb, 0xaa, 0xca, 0xa3, 0x8f, 0x8a,
+    0xdc, 0xf4, 0xa2, 0xfe, 0xee, 0xa8, 0x9b, 0x1a,
+];
 
 /// Length of the Ed25519 half of a composite signature.
 const ED25519_SIGNATURE_BYTES: usize = COMPOSITE_SIGNATURE_BYTES - ML_DSA_44_SIGNATURE_BYTES;
@@ -70,8 +77,10 @@ pub struct CredentialReplay {
 /// single allocation they made, in bytes. No allocation may exceed the
 /// input's length by more than [`PARSE_ALLOCATION_SLACK_BYTES`].
 ///
-/// An accepted credential re-encodes to exactly `data`, decodes back to
-/// itself, and names the node ID of its key list.
+/// An accepted credential re-encodes to exactly `data` and decodes back to
+/// itself. An accepted SPKI is the canonical DER that TLS-3 describes, and
+/// the credential's node ID is the ID-9 hash of its keys fingerprinted per
+/// ID-12. Both are rebuilt here from the spec, not by the code under test.
 pub fn replay_credential_bytes(
     data: &[u8],
     largest_allocation: &mut dyn FnMut(&mut dyn FnMut()) -> usize,
@@ -92,9 +101,9 @@ pub fn replay_credential_bytes(
 
     if let Ok(credential) = &spki {
         assert_eq!(
-            credential.to_spki().as_ref(),
+            spki_der(&credential.encode()),
             data,
-            "{CREDENTIAL_CANONICAL}: an accepted SPKI is not its credential's encoding"
+            "{CREDENTIAL_CANONICAL}: an accepted SPKI is not the canonical DER of its credential"
         );
         check_credential(credential);
     }
@@ -105,9 +114,9 @@ pub fn replay_credential_bytes(
             "{CREDENTIAL_CANONICAL}: an accepted encoding is not its credential's encoding"
         );
         assert_eq!(
-            NodeCredential::from_spki(credential.to_spki().as_ref()).as_ref(),
+            NodeCredential::from_spki(&spki_der(data)).as_ref(),
             Ok(credential),
-            "{CREDENTIAL_CANONICAL}: an accepted credential's SPKI doesn't read back"
+            "{CREDENTIAL_CANONICAL}: the canonical DER of an accepted credential is refused"
         );
         check_credential(credential);
     }
@@ -117,35 +126,86 @@ pub fn replay_credential_bytes(
     }
 }
 
-/// Checks the properties every accepted credential holds, however it arrived.
+/// Checks the properties every accepted credential holds, however it
+/// arrived. The caller has checked that its encoding is the input's.
 fn check_credential(credential: &NodeCredential) {
+    let encoding = credential.encode();
     assert_eq!(
-        NodeCredential::decode(&credential.encode()).as_ref(),
+        NodeCredential::decode(&encoding).as_ref(),
         Ok(credential),
         "{CREDENTIAL_CANONICAL}: a credential doesn't decode from its encoding"
     );
-    let list = credential.key_list();
     assert_eq!(
+        node_id_of(&fingerprinted_key_list(&encoding)),
         credential.node_id(),
-        list.node_id(),
-        "{CREDENTIAL_NODE_ID}: the credential names another ID than its key list"
-    );
-    let decoded = NodeKeyList::decode(&list.encode());
-    assert_eq!(
-        decoded.as_ref(),
-        Ok(list),
-        "{CREDENTIAL_NODE_ID}: the credential's key list doesn't decode from its encoding"
-    );
-    assert_eq!(
-        decoded.map(|list| list.node_id()),
-        Ok(credential.node_id()),
-        "{CREDENTIAL_NODE_ID}: the decoded key list names another ID"
+        "{CREDENTIAL_NODE_ID}: the ID is not the hash of the fingerprinted keys"
     );
     assert_eq!(
         credential.ed25519().map(|key| key.as_bytes().to_vec()),
         credential.key(ED25519_KEY_TAG).map(<[u8]>::to_vec),
         "{CREDENTIAL_NODE_ID}: the key list's Ed25519 key isn't the credential's"
     );
+}
+
+/// The canonical DER SubjectPublicKeyInfo carrying credential `encoding`
+/// (TLS-3): the algorithm, then the encoding as a BIT STRING with no unused
+/// bits.
+fn spki_der(encoding: &[u8]) -> Vec<u8> {
+    let mut bits = vec![0];
+    bits.extend_from_slice(encoding);
+    let mut contents = CREDENTIAL_ALGORITHM_DER.to_vec();
+    contents.extend(der(0x03, &bits));
+    der(0x30, &contents)
+}
+
+/// One DER element: `tag`, the shortest length form, then `contents`.
+fn der(tag: u8, contents: &[u8]) -> Vec<u8> {
+    let mut bytes = vec![tag];
+    match u8::try_from(contents.len()) {
+        Ok(short @ 0..=0x7f) => bytes.push(short),
+        Ok(one_byte) => bytes.extend([0x81, one_byte]),
+        Err(_) => {
+            let two_bytes =
+                u16::try_from(contents.len()).expect("a credential's SPKI is under 64 KiB");
+            bytes.push(0x82);
+            bytes.extend(two_bytes.to_be_bytes());
+        }
+    }
+    bytes.extend_from_slice(contents);
+    bytes
+}
+
+/// The encoded key list naming an accepted credential `encoding` (ID-12): each
+/// Ed25519 key as itself, any other key as BLAKE2b-256 under
+/// [`KEY_FINGERPRINT_PERSONALISATION`] of its little-endian tag and its bytes.
+fn fingerprinted_key_list(encoding: &[u8]) -> Vec<u8> {
+    let (&count, mut rest) = encoding
+        .split_first()
+        .expect("an accepted credential has a count byte");
+    let mut list = vec![count];
+    for _ in 0..count {
+        let (&[tag_low, tag_high, length_low, length_high], body) = rest
+            .split_first_chunk::<4>()
+            .expect("an accepted credential holds its counted entries");
+        let length = usize::from(u16::from_le_bytes([length_low, length_high]));
+        let (key, tail) = body.split_at(length);
+        let tag = [tag_low, tag_high];
+        list.extend_from_slice(&tag);
+        if u16::from_le_bytes(tag) == ED25519_KEY_TAG {
+            list.extend_from_slice(key);
+        } else {
+            let fingerprint = Params::new()
+                .hash_length(KEY_LENGTH)
+                .personal(KEY_FINGERPRINT_PERSONALISATION)
+                .to_state()
+                .update(&tag)
+                .update(key)
+                .finalize();
+            list.extend_from_slice(fingerprint.as_bytes());
+        }
+        rest = tail;
+    }
+    list
 }
 
 /// Whether [`NodeKeyList::decode`] accepted one input.
@@ -234,9 +294,8 @@ pub enum CompositeReplay {
 /// campaign explores near-valid signatures without a corpus. Each input
 /// verifies at most once.
 ///
-/// An accepted signature is exactly [`COMPOSITE_SIGNATURE_BYTES`] long, under
-/// an ML-DSA-44 key of [`ML_DSA_44_KEY_BYTES`], and its Ed25519 half verifies
-/// alone. The honest witness verifies, and every edit of it is refused.
+/// The honest witness verifies, and every edit of it is refused. A raw input
+/// checks only that the verifier doesn't panic.
 pub fn replay_composite_bytes(data: &[u8]) -> CompositeReplay {
     match data.split_first() {
         Some((&layout, rest)) if layout & 1 == 1 => replay_witness(rest),
@@ -347,28 +406,8 @@ fn replay_witness(data: &[u8]) -> CompositeReplay {
     CompositeReplay::Witness { edited, verified }
 }
 
-/// Runs the verifier and checks the shape of what it accepts.
 fn verify(ed25519: &NodeKey, ml_dsa: &[u8], message: &[u8], signature: &[u8]) -> bool {
-    if composite::verify(ed25519, ml_dsa, message, signature).is_err() {
-        return false;
-    }
-    assert_eq!(
-        signature.len(),
-        COMPOSITE_SIGNATURE_BYTES,
-        "{COMPOSITE_LENGTH}: an accepted signature has the wrong length"
-    );
-    assert_eq!(
-        ml_dsa.len(),
-        ML_DSA_44_KEY_BYTES,
-        "{COMPOSITE_LENGTH}: an accepted ML-DSA-44 key has the wrong length"
-    );
-    assert!(
-        ed25519
-            .verify_strict(message, &signature[..ED25519_SIGNATURE_BYTES])
-            .is_ok(),
-        "{COMPOSITE_HALVES}: an accepted signature's Ed25519 half doesn't verify alone"
-    );
-    true
+    composite::verify(ed25519, ml_dsa, message, signature).is_ok()
 }
 
 /// One input of a campaign's starting corpus.
@@ -653,6 +692,21 @@ mod tests {
             replay_composite_bytes(&[0; 1 + KEY_LENGTH]),
             CompositeReplay::KeyRefused
         );
+    }
+
+    /// TLS-3 names the credential algorithm by the X.667 UUID arc: `2.25`
+    /// packs into one byte, then the UUID as an integer in base 128.
+    #[test]
+    fn the_restated_algorithm_is_the_uuid_arc() {
+        let mut uuid = u128::from_str_radix("6a31af475aa948c78ab9d117edca0d9a", 16).unwrap();
+        let mut arc = Vec::new();
+        while uuid > 0 {
+            let digit = u8::try_from(uuid & 0x7f).unwrap();
+            arc.insert(0, if arc.is_empty() { digit } else { digit | 0x80 });
+            uuid >>= 7;
+        }
+        let oid = der(0x06, &[&[2 * 40 + 25][..], &arc].concat());
+        assert_eq!(der(0x30, &oid), CREDENTIAL_ALGORITHM_DER);
     }
 
     #[test]

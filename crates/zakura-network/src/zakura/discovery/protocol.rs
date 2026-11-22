@@ -27,7 +27,7 @@ use super::wire::{record_len, write_record_body, NODE_ID_BYTES, SIGNATURE_BYTES}
 use crate::zakura::{
     canonical_ip,
     regulation::{SlotBudget, SlotPermit},
-    BlockSyncStatus, ServiceAdmissionDecision, ServicePeerDirection, ServicePeerLimits,
+    BlockSyncStatus, HeldPlaces, ServiceAdmissionDecision, ServicePeerDirection, ServicePeerLimits,
     ServicePeerSnapshot, ZakuraConnId, ZakuraNetworkId, ZakuraPeerId, MAX_BS_BLOCKS_PER_REQUEST,
     MAX_BS_RESPONSE_BYTES, ZAKURA_ALPN_MISMATCH_BACKOFF,
 };
@@ -2054,29 +2054,45 @@ impl ZakuraDiscoveryHandle {
         in_flight_node_ids: &[NodeId],
     ) -> Vec<ZakuraDiscoveryDialCandidate> {
         let mut selected = Vec::new();
-        self.admit_dial_candidates_with(wanted_services, &[], in_flight_node_ids, |candidate| {
-            selected.push(candidate);
-            DialAdmission::Admitted
-        })
+        self.admit_dial_candidates_with(
+            wanted_services,
+            &[],
+            in_flight_node_ids,
+            &HeldPlaces::default(),
+            |candidate| {
+                selected.push(candidate);
+                DialAdmission::Admitted
+            },
+        )
         .await;
         selected
     }
 
     /// Offers service-matching candidates to `admit` first, followed by
-    /// general candidates, until it admits the free dial slots' worth.
+    /// general candidates, until it admits the free dial slots' worth. The
+    /// places in `held_places` stay free of these dials.
     pub(crate) async fn admit_dial_candidates_preferring_any_service(
         &self,
         preferred_services: &[ZakuraServiceId],
         in_flight_node_ids: &[NodeId],
+        held_places: &HeldPlaces,
         admit: impl FnMut(ZakuraDiscoveryDialCandidate) -> DialAdmission,
     ) {
-        self.admit_dial_candidates_with(&[], preferred_services, in_flight_node_ids, admit)
-            .await
+        self.admit_dial_candidates_with(
+            &[],
+            preferred_services,
+            in_flight_node_ids,
+            held_places,
+            admit,
+        )
+        .await
     }
 
     /// Offers dial candidates that advertise every `required_services` entry
     /// to `admit`, those advertising any `preferred_services` entry first,
-    /// until it admits the free dial slots' worth.
+    /// until it admits the free dial slots' worth. Registered peers and
+    /// in-flight dials outside `held_places`' members take those slots,
+    /// and its held places are never among them.
     ///
     /// The book stays locked while `admit` runs, so `admit` must not wait.
     async fn admit_dial_candidates_with(
@@ -2084,22 +2100,30 @@ impl ZakuraDiscoveryHandle {
         required_services: &[ZakuraServiceId],
         preferred_services: &[ZakuraServiceId],
         in_flight_node_ids: &[NodeId],
+        held_places: &HeldPlaces,
         admit: impl FnMut(ZakuraDiscoveryDialCandidate) -> DialAdmission,
     ) {
         let connected = self.connected.borrow().clone();
+        let preferred = |id: &[u8]| held_places.contains_bytes(id);
         // An attempt stays in flight after its peer registers, until the
         // attempt settles. Such a peer counts once, as in flight.
-        let registered_in_flight = in_flight_node_ids
+        let ordinary_in_flight = in_flight_node_ids
             .iter()
-            .filter(|node_id| {
-                connected
-                    .iter()
-                    .any(|peer_id| peer_id.as_bytes() == node_id.as_bytes())
+            .filter(|node_id| !preferred(node_id.as_bytes()))
+            .count();
+        let ordinary_registered = connected
+            .iter()
+            .filter(|peer_id| {
+                !preferred(peer_id.as_bytes())
+                    && !in_flight_node_ids
+                        .iter()
+                        .any(|node_id| peer_id.as_bytes() == node_id.as_bytes())
             })
             .count();
         let limit = self.inner.lock().await.dial_slot_limit(
-            connected.len().saturating_sub(registered_in_flight),
+            ordinary_registered.saturating_add(ordinary_in_flight),
             in_flight_node_ids.len(),
+            held_places.hold,
         );
         if limit == 0 {
             return;
@@ -3604,22 +3628,25 @@ fn connected_peer_node_ids(connected: &[ZakuraPeerId]) -> Vec<NodeId> {
     connected.iter().filter_map(ZakuraPeerId::node_id).collect()
 }
 
-/// Returns how many discovery dials may start.
+/// Returns how many ordinary discovery dials may start.
 ///
-/// Connected peers and in-flight dials both take slots under the soft cap,
-/// `max_connections - connection_headroom`. The headroom stays free for
-/// maintained peers. `connected_count` excludes peers that an in-flight dial
-/// already registered, so no connection counts twice.
+/// Registered peers and in-flight dials outside the preferred set,
+/// `ordinary_occupied`, take slots under the soft cap,
+/// `max_connections - connection_headroom - hold`. The headroom stays free
+/// for maintained peers and the hold for preferred gateways. Every in-flight
+/// dial, `in_flight_count`, counts against the concurrent-dial cap.
 pub(crate) fn discovery_dial_slot_limit(
-    connected_count: usize,
+    ordinary_occupied: usize,
     in_flight_count: usize,
     max_connections: usize,
     connection_headroom: usize,
+    hold: usize,
     max_concurrent_dials: usize,
 ) -> usize {
-    let soft_cap = max_connections.saturating_sub(connection_headroom);
-    let available_connection_slots =
-        soft_cap.saturating_sub(connected_count.saturating_add(in_flight_count));
+    let soft_cap = max_connections
+        .saturating_sub(connection_headroom)
+        .saturating_sub(hold);
+    let available_connection_slots = soft_cap.saturating_sub(ordinary_occupied);
     let available_dial_slots = max_concurrent_dials.saturating_sub(in_flight_count);
     available_connection_slots.min(available_dial_slots)
 }
@@ -10115,10 +10142,15 @@ mod tests {
     ) -> Vec<ZakuraDiscoveryDialCandidate> {
         let mut offered = Vec::new();
         handle
-            .admit_dial_candidates_preferring_any_service(services, &[], |candidate| {
-                offered.push(candidate);
-                DialAdmission::Admitted
-            })
+            .admit_dial_candidates_preferring_any_service(
+                services,
+                &[],
+                &HeldPlaces::default(),
+                |candidate| {
+                    offered.push(candidate);
+                    DialAdmission::Admitted
+                },
+            )
             .await;
         offered
     }
@@ -10170,12 +10202,18 @@ mod tests {
 
     #[test]
     fn discovery_dial_slot_limit_reserves_headroom_and_concurrent_cap() {
-        assert_eq!(discovery_dial_slot_limit(0, 0, 8, 2, 4), 4);
-        assert_eq!(discovery_dial_slot_limit(5, 0, 8, 2, 4), 1);
-        assert_eq!(discovery_dial_slot_limit(5, 1, 8, 2, 4), 0);
-        assert_eq!(discovery_dial_slot_limit(4, 1, 8, 2, 4), 1);
-        assert_eq!(discovery_dial_slot_limit(2, 4, 8, 2, 4), 0);
-        assert_eq!(discovery_dial_slot_limit(2, 0, 2, 4, 4), 0);
+        assert_eq!(discovery_dial_slot_limit(0, 0, 8, 2, 0, 4), 4);
+        assert_eq!(discovery_dial_slot_limit(5, 0, 8, 2, 0, 4), 1);
+        assert_eq!(discovery_dial_slot_limit(6, 1, 8, 2, 0, 4), 0);
+        assert_eq!(discovery_dial_slot_limit(5, 1, 8, 2, 0, 4), 1);
+        assert_eq!(discovery_dial_slot_limit(6, 4, 8, 2, 0, 4), 0);
+        assert_eq!(discovery_dial_slot_limit(2, 0, 2, 4, 0, 4), 0);
+        // The hold comes off the soft cap; a preferred dial in flight still
+        // takes one of the concurrent dials.
+        assert_eq!(discovery_dial_slot_limit(4, 0, 8, 2, 1, 4), 1);
+        assert_eq!(discovery_dial_slot_limit(4, 1, 8, 2, 1, 4), 1);
+        assert_eq!(discovery_dial_slot_limit(5, 0, 8, 2, 1, 4), 0);
+        assert_eq!(discovery_dial_slot_limit(0, 4, 8, 2, 1, 4), 0);
     }
 
     proptest::proptest! {
@@ -10187,12 +10225,19 @@ mod tests {
             in_flight in 0usize..16,
             max_connections in 0usize..64,
             headroom in 0usize..16,
+            hold in 0usize..11,
             max_concurrent in 0usize..16,
         ) {
-            let limit =
-                discovery_dial_slot_limit(connected, in_flight, max_connections, headroom, max_concurrent);
-            let soft_cap = max_connections.saturating_sub(headroom);
             let occupied = connected + in_flight;
+            let limit = discovery_dial_slot_limit(
+                occupied,
+                in_flight,
+                max_connections,
+                headroom,
+                hold,
+                max_concurrent,
+            );
+            let soft_cap = max_connections.saturating_sub(headroom + hold);
             proptest::prop_assert!(occupied + limit <= soft_cap.max(occupied));
             proptest::prop_assert!(in_flight + limit <= max_concurrent.max(in_flight));
             proptest::prop_assert_eq!(

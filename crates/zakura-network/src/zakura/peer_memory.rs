@@ -441,7 +441,7 @@ mod tests {
             let floor = min_budgeted_connections(bootstrap_peers);
             let headroom = effective_discovery_connection_headroom(bootstrap_peers);
             let slots = |max_connections| {
-                discovery_dial_slot_limit(bootstrap_peers, 0, max_connections, headroom, 4)
+                discovery_dial_slot_limit(bootstrap_peers, 0, max_connections, headroom, 0, 4)
             };
             assert!(slots(floor) >= 1, "{bootstrap_peers} bootstrap peers");
             if floor > MIN_ZAKURA_BUDGETED_CONNECTIONS {

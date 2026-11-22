@@ -1,0 +1,513 @@
+//! Connection places held for preferred mining gateways.
+//!
+//! The tests publish a ranking into the slot counters and drive the
+//! handler's own claim and admission checks, as dials and inbound
+//! connections reach them, without a network. Discovery dials, bootstrap
+//! redials and legacy-upgrade dials all claim an outbound slot for their
+//! target's node ID the same way, so an outbound claim stands for each.
+
+use super::*;
+use crate::zakura::{
+    preferred_hold_limit, GatewayStanding, PreferredGateways, RankedGateway, SlotSplit,
+};
+
+/// The bootstrap places Mainnet keeps: one per default bootstrap peer.
+const BOOTSTRAP_HEADROOM: usize = 9;
+
+fn handler(max_connections: usize) -> ZakuraProtocolHandler {
+    let mut limits = ZakuraLocalLimits::from_config(&Config::default());
+    limits.max_connections = max_connections;
+    ZakuraProtocolHandler::new(
+        ZakuraSupervisorHandle::new(DEFAULT_ZAKURA_MAX_CONNS_PER_IP),
+        Network::Mainnet,
+        ZakuraHandshakeConfig::for_network(&Network::Mainnet),
+        limits,
+    )
+}
+
+fn new_node() -> NodeId {
+    NodeSecretKey::generate().public()
+}
+
+/// Publishes `ranking`, highest first, with the hold limit of the
+/// handler's connection limit.
+fn publish(handler: &ZakuraProtocolHandler, ranking: &[(NodeId, GatewayStanding)]) {
+    let count = u32::try_from(ranking.len()).expect("a test ranking is short");
+    let ranked = ranking
+        .iter()
+        .zip((1..=count).rev())
+        .map(|(&(node, standing), blocks)| RankedGateway {
+            node,
+            blocks,
+            standing,
+        });
+    let hold_limit = preferred_hold_limit(handler.limits.max_connections, BOOTSTRAP_HEADROOM);
+    handler
+        .supervisor
+        .ip_slots
+        .counts()
+        .publish_preferred_gateways(PreferredGateways::form(ranked, hold_limit));
+}
+
+/// `count` gateways, each in `standing`.
+fn gateways(count: usize, standing: GatewayStanding) -> Vec<(NodeId, GatewayStanding)> {
+    (0..count).map(|_| (new_node(), standing)).collect()
+}
+
+/// Claims `count` slots for unrelated nodes in one direction.
+fn fill(
+    handler: &ZakuraProtocolHandler,
+    count: usize,
+    inbound: bool,
+) -> Vec<ConnectionAdmissionGuard> {
+    (0..count)
+        .map(|_| {
+            handler
+                .claim_connection(new_node(), inbound)
+                .expect("the test leaves room for its ordinary peers")
+        })
+        .collect()
+}
+
+fn ordinary(handler: &ZakuraProtocolHandler, inbound: bool) -> Result<(), SlotRefusal> {
+    handler.claim_connection(new_node(), inbound).map(drop)
+}
+
+fn split(handler: &ZakuraProtocolHandler) -> SlotSplit {
+    handler.supervisor.ip_slots.counts().slot_split()
+}
+
+fn preferred_set(handler: &ZakuraProtocolHandler) -> Vec<NodeId> {
+    handler
+        .supervisor
+        .ip_slots
+        .counts()
+        .preferred_gateways()
+        .set()
+        .to_vec()
+}
+
+/// Whether the acceptor admits a caller before its node ID is known. An
+/// accepted attempt hands its transport reservation back, as an attempt
+/// whose claim is refused after TLS does.
+fn admits_a_caller(handler: &ZakuraProtocolHandler, last_byte: u8) -> bool {
+    let incoming = IncomingInfo {
+        remote: SocketAddr::new(IpAddr::from([198, 51, 100, last_byte]), 8234),
+        validated: true,
+        pending_total: 0,
+        pending_from_ip: 0,
+    };
+    let admitted = handler.admit(&incoming) == Admit::Accept;
+    if admitted {
+        handler.finish_admission(false);
+    }
+    admitted
+}
+
+/// With no ranking, or a ranking whose gateways v2 doesn't know, nothing is
+/// held: 69 inbound peers, 23 dials, 92 in all, as without held places.
+/// (A ranked gateway v2 doesn't know is still matched when it calls in, by
+/// design; see the unknown-caller test.)
+#[test]
+fn an_empty_or_unmatched_ranking_keeps_todays_limits() {
+    for ranking in [Vec::new(), gateways(3, GatewayStanding::Unmatched)] {
+        let handler = handler(92);
+        publish(&handler, &ranking);
+        assert_eq!(
+            handler
+                .supervisor
+                .ip_slots
+                .counts()
+                .preferred_gateways()
+                .hold(),
+            0
+        );
+        let inbound = fill(&handler, 69, true);
+        assert_eq!(ordinary(&handler, true), Err(SlotRefusal::InboundShare));
+        assert!(!admits_a_caller(&handler, 1));
+        assert_eq!(handler.free_connection_slots(), 23);
+        let dials = fill(&handler, 23, false);
+        assert_eq!(ordinary(&handler, false), Err(SlotRefusal::Full));
+        assert_eq!(handler.free_connection_slots(), 0);
+        drop((inbound, dials));
+        assert!(admits_a_caller(&handler, 2));
+    }
+}
+
+/// Below ten matched gateways the hold is the matched count, and ordinary
+/// dials stop that many places short of the limit.
+#[test]
+fn the_hold_equals_the_matched_gateways_below_ten() {
+    let handler = handler(92);
+    let ranked = gateways(3, GatewayStanding::Dialable);
+    publish(&handler, &ranked);
+    assert_eq!(handler.free_connection_slots(), 89);
+    let _dials = fill(&handler, 89, false);
+    assert_eq!(handler.free_connection_slots(), 0);
+    assert_eq!(ordinary(&handler, false), Err(SlotRefusal::Hold));
+    let _gateways: Vec<_> = ranked
+        .iter()
+        .map(|&(node, _)| {
+            handler
+                .claim_connection(node, false)
+                .expect("a gateway takes its held place")
+        })
+        .collect();
+    assert_eq!(
+        split(&handler),
+        SlotSplit {
+            preferred: 3,
+            ordinary: 89,
+            ordinary_inbound: 0,
+        }
+    );
+}
+
+/// A limit of 40 leaves one place beside the bootstrap places in its dial
+/// quarter. The hold shrinks to it, and inbound peers keep their share.
+#[test]
+fn a_small_limit_shrinks_the_hold_and_keeps_the_inbound_share() {
+    let handler = handler(40);
+    let ranked = gateways(12, GatewayStanding::Dialable);
+    publish(&handler, &ranked);
+    assert_eq!(
+        handler
+            .supervisor
+            .ip_slots
+            .counts()
+            .preferred_gateways()
+            .hold(),
+        1
+    );
+    let _inbound = fill(&handler, 30, true);
+    assert_eq!(ordinary(&handler, true), Err(SlotRefusal::InboundShare));
+    let _dials = fill(&handler, 9, false);
+    assert_eq!(ordinary(&handler, false), Err(SlotRefusal::Hold));
+    let _gateway = handler
+        .claim_connection(ranked[0].0, false)
+        .expect("the top gateway takes the one held place");
+    assert_eq!(
+        preferred_set(&handler),
+        [ranked[0].0],
+        "only the top gateway is preferred"
+    );
+}
+
+/// At the ordinary limit a dial to a gateway is granted, and an ordinary
+/// dial (discovery, a bootstrap redial or a legacy upgrade) is refused.
+#[test]
+fn at_the_ordinary_limit_only_a_gateway_dial_is_granted() {
+    let handler = handler(92);
+    let ranked = gateways(10, GatewayStanding::Dialable);
+    publish(&handler, &ranked);
+    let _dials = fill(&handler, 82, false);
+    assert_eq!(handler.free_connection_slots(), 0);
+    assert_eq!(ordinary(&handler, false), Err(SlotRefusal::Hold));
+    let _gateway = handler
+        .claim_connection(ranked[9].0, false)
+        .expect("the lowest member still has its held place");
+    assert_eq!(split(&handler).preferred, 1);
+}
+
+/// With the inbound share and the ordinary limit both full, a gateway that
+/// calls in is admitted and granted, and an ordinary caller is refused.
+#[test]
+fn an_inbound_gateway_passes_a_full_share_and_ordinary_limit() {
+    let handler = handler(92);
+    let ranked = gateways(10, GatewayStanding::Dialable);
+    publish(&handler, &ranked);
+    let _inbound = fill(&handler, 69, true);
+    let _dials = fill(&handler, 13, false);
+    assert!(
+        admits_a_caller(&handler, 1),
+        "a held place is free before the caller's ID is known"
+    );
+    let _gateway = handler
+        .claim_connection(ranked[0].0, true)
+        .expect("a gateway calls into its held place");
+    assert_eq!(ordinary(&handler, true), Err(SlotRefusal::Hold));
+    assert_eq!(
+        split(&handler),
+        SlotSplit {
+            preferred: 1,
+            ordinary: 82,
+            ordinary_inbound: 69,
+        },
+        "the gateway sits above the inbound share"
+    );
+}
+
+/// A ranked gateway v2 never matched is granted when it calls into a free
+/// held place. Once no held place is free and the inbound share is full,
+/// the next caller is refused before its ID is read.
+#[test]
+fn an_unknown_ranked_caller_takes_a_free_place_or_is_refused_before_its_id() {
+    let handler = handler(40);
+    let unknown = new_node();
+    let member = new_node();
+    publish(
+        &handler,
+        &[
+            (unknown, GatewayStanding::Unmatched),
+            (new_node(), GatewayStanding::Unmatched),
+            (member, GatewayStanding::Dialable),
+        ],
+    );
+    assert_eq!(preferred_set(&handler), [member]);
+    let _inbound = fill(&handler, 30, true);
+    assert!(admits_a_caller(&handler, 1));
+    let _unknown = handler
+        .claim_connection(unknown, true)
+        .expect("the caller outranks the member, so it takes the held place");
+    assert_eq!(preferred_set(&handler), [unknown]);
+    assert!(
+        !admits_a_caller(&handler, 2),
+        "no held place is free and the inbound share is full"
+    );
+    assert_eq!(ordinary(&handler, true), Err(SlotRefusal::InboundShare));
+}
+
+/// A gateway waiting out a failed dial is granted when it calls in. When
+/// its claim is refused, the preferred set stays as it was.
+#[test]
+fn a_caller_in_backoff_is_granted() {
+    let handler = handler(40);
+    let waiting = new_node();
+    let member = new_node();
+    publish(
+        &handler,
+        &[
+            (waiting, GatewayStanding::Backoff),
+            (member, GatewayStanding::Dialable),
+        ],
+    );
+    assert_eq!(preferred_set(&handler), [member]);
+
+    let _dials = fill(&handler, 39, false);
+    let member_slot = handler.claim_connection(member, false).expect("held");
+    assert_eq!(
+        handler.claim_connection(waiting, true).map(drop),
+        Err(SlotRefusal::Full)
+    );
+    assert_eq!(
+        preferred_set(&handler),
+        [member],
+        "a refusal changes nothing"
+    );
+    drop(member_slot);
+
+    let _waiting = handler
+        .claim_connection(waiting, true)
+        .expect("the caller's backoff is ignored");
+    assert_eq!(preferred_set(&handler), [waiting]);
+    assert_eq!(split(&handler).preferred, 1);
+}
+
+/// A node already full when its first gateway is matched drops nobody, and
+/// grants nothing ordinary until its ordinary slots are back below the
+/// limit less the hold.
+#[test]
+fn a_node_full_before_its_first_match_grants_nothing_ordinary_until_below_the_limit() {
+    let handler = handler(92);
+    let mut inbound = fill(&handler, 69, true);
+    let _dials = fill(&handler, 23, false);
+    let ranked = gateways(10, GatewayStanding::Dialable);
+    publish(&handler, &ranked);
+    assert_eq!(split(&handler).ordinary, 92);
+    assert_eq!(
+        handler.claim_connection(ranked[0].0, false).map(drop),
+        Err(SlotRefusal::Full)
+    );
+    assert_eq!(ordinary(&handler, false), Err(SlotRefusal::Full));
+
+    inbound.pop();
+    let _gateway = handler
+        .claim_connection(ranked[0].0, false)
+        .expect("the freed slot goes to the gateway");
+    inbound.truncate(inbound.len() - 9);
+    assert_eq!(split(&handler).ordinary, 82);
+    assert_eq!(ordinary(&handler, false), Err(SlotRefusal::Hold));
+    inbound.pop();
+    assert_eq!(ordinary(&handler, false), Ok(()));
+}
+
+/// A set change recounts the slots already held, with no claim or release:
+/// a gateway that leaves the set stays connected and counts as ordinary.
+#[test]
+fn a_set_change_only_recounts_held_slots() {
+    let handler = handler(92);
+    let ranked = gateways(11, GatewayStanding::Connected);
+    publish(&handler, &ranked[..10]);
+    let _gateways: Vec<_> = ranked[..10]
+        .iter()
+        .map(|&(node, _)| handler.claim_connection(node, false).expect("held"))
+        .collect();
+    let _dials = fill(&handler, 82, false);
+    assert_eq!(
+        (split(&handler).preferred, split(&handler).ordinary),
+        (10, 82)
+    );
+
+    let mut changed = ranked[1..].to_vec();
+    changed[9].1 = GatewayStanding::Dialable;
+    publish(&handler, &changed);
+    assert_eq!(
+        (split(&handler).preferred, split(&handler).ordinary),
+        (9, 83)
+    );
+    assert_eq!(handler.supervisor.ip_slots.counts().connections(), 92);
+}
+
+/// A member's second slot is ordinary, so at the ordinary limit it is
+/// refused.
+#[test]
+fn a_second_slot_of_a_member_is_ordinary() {
+    let handler = handler(92);
+    let ranked = gateways(10, GatewayStanding::Dialable);
+    publish(&handler, &ranked);
+    let gateway = ranked[0].0;
+    let _first = handler.claim_connection(gateway, false).expect("held");
+    let _dials = fill(&handler, 82, false);
+    assert_eq!(
+        handler.claim_connection(gateway, true).map(drop),
+        Err(SlotRefusal::Hold)
+    );
+    assert_eq!(split(&handler).preferred, 1);
+}
+
+/// A caller admitted only for a held place pays its handshake tokens even
+/// though its claim is refused once its ID is known, so the hold gives
+/// anonymous callers no free retries: an address that keeps calling runs
+/// out of its cadence.
+#[test]
+fn a_caller_refused_by_the_hold_keeps_its_cadence_charge() {
+    let handler = handler(92);
+    publish(&handler, &gateways(1, GatewayStanding::Dialable));
+    let _dials = fill(&handler, 91, false);
+    let incoming = IncomingInfo {
+        remote: SocketAddr::new(IpAddr::from([203, 0, 113, 7]), 8234),
+        validated: true,
+        pending_total: 0,
+        pending_from_ip: 0,
+    };
+    let burst = DEFAULT_ZAKURA_MAX_CONNS_PER_IP;
+    for _ in 0..burst {
+        assert_eq!(handler.admit(&incoming), Admit::Accept);
+        assert_eq!(ordinary(&handler, true), Err(SlotRefusal::Hold));
+        handler.finish_admission(false);
+    }
+    assert_eq!(
+        handler.admit(&incoming),
+        Admit::Refuse,
+        "the address spent its burst on refused claims"
+    );
+}
+
+/// Claims racing from several threads never take ordinary slots past the
+/// limit less the hold, or preferred ones past the hold.
+#[test]
+fn simultaneous_claims_never_pass_the_ordinary_limit() {
+    let handler = handler(92);
+    let ranked = gateways(10, GatewayStanding::Dialable);
+    publish(&handler, &ranked);
+    let granted: Vec<ConnectionAdmissionGuard> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..8)
+            .map(|worker| {
+                let handler = &handler;
+                let ranked = &ranked;
+                scope.spawn(move || {
+                    let mut held = Vec::new();
+                    for claim in 0..30 {
+                        let node = if claim % 3 == 0 {
+                            ranked[(worker + claim) % ranked.len()].0
+                        } else {
+                            new_node()
+                        };
+                        if let Ok(guard) = handler.claim_connection(node, claim % 2 == 0) {
+                            held.push(guard);
+                        }
+                    }
+                    held
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|worker| worker.join().expect("a claiming thread finishes"))
+            .collect()
+    });
+    let split = split(&handler);
+    assert!(split.preferred <= 10, "{split:?}");
+    assert!(split.ordinary <= 82, "{split:?}");
+    assert!(split.ordinary_inbound <= 69, "{split:?}");
+    assert_eq!(split.preferred + split.ordinary, granted.len());
+}
+
+/// A ranked caller that outranks a member already holding a slot takes that
+/// member's place: the caller's slot is preferred and the member's stays
+/// connected as ordinary, one over the ordinary limit until a slot frees.
+#[test]
+fn a_ranked_caller_displaces_a_connected_member() {
+    // A limit of 44 holds two places.
+    let handler = handler(44);
+    let top = new_node();
+    let caller = new_node();
+    let displaced = new_node();
+    publish(
+        &handler,
+        &[
+            (top, GatewayStanding::Dialable),
+            (caller, GatewayStanding::Backoff),
+            (displaced, GatewayStanding::Dialable),
+        ],
+    );
+    assert_eq!(preferred_set(&handler), [top, displaced]);
+    let _displaced = handler.claim_connection(displaced, false).expect("held");
+    let _dials = fill(&handler, 42, false);
+
+    let _caller = handler
+        .claim_connection(caller, true)
+        .expect("the caller takes the place it outranks");
+    assert_eq!(preferred_set(&handler), [top, caller]);
+    assert_eq!(
+        split(&handler),
+        SlotSplit {
+            preferred: 1,
+            ordinary: 43,
+            ordinary_inbound: 0,
+        }
+    );
+    assert_eq!(handler.supervisor.ip_slots.counts().connections(), 44);
+}
+
+/// A ranked caller that already holds a slot re-forms the set, but its
+/// second slot is ordinary; when the ordinary slots are full the claim is
+/// refused for the hold and the set is restored.
+#[test]
+fn the_set_is_restored_after_a_hold_refusal() {
+    let handler = handler(44);
+    let top = new_node();
+    let caller = new_node();
+    let member = new_node();
+    publish(
+        &handler,
+        &[
+            (top, GatewayStanding::Dialable),
+            (caller, GatewayStanding::Backoff),
+            (member, GatewayStanding::Dialable),
+        ],
+    );
+    let _member = handler.claim_connection(member, false).expect("held");
+    let _caller_dial = handler
+        .claim_connection(caller, false)
+        .expect("the caller's first slot is ordinary");
+    let _dials = fill(&handler, 41, false);
+    let before = split(&handler);
+
+    assert_eq!(
+        handler.claim_connection(caller, true).map(drop),
+        Err(SlotRefusal::Hold)
+    );
+    assert_eq!(preferred_set(&handler), [top, member]);
+    assert_eq!(split(&handler), before);
+}

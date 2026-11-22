@@ -8717,7 +8717,7 @@ mod tests {
         let candidates = handle.dial_candidates(&[], &[]).await;
         assert_eq!(handle.inner.lock().await.book().len(), 1);
         assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].node_id, public.body.node_id);
+        assert_eq!(candidates[0].node_id, public.body.node_id());
     }
 
     /// Relayed records follow the relay verdict table: a forged record anywhere in the

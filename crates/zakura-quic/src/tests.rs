@@ -2879,8 +2879,7 @@ async fn the_hybrid_hello_leaves_as_two_initial_datagrams() {
 }
 
 /// A listener from before the hybrid group, with ring's groups only, shares
-/// no group with a production dialer (TLS-9), so the dial fails although the
-/// hello also carries a plain X25519 share.
+/// no group with a production dialer (TLS-9), so the dial fails.
 #[tokio::test(start_paused = true)]
 async fn a_production_dialer_is_refused_by_a_listener_without_the_hybrid_group() {
     tokio::time::timeout(SIM_TEST_TIMEOUT, async {

@@ -273,9 +273,8 @@ at fork tag `zakura-iroh-v1.1.0-rc.1`, and it keeps their MIT/Apache-2.0 notices
   - The listener MUST refuse a share of another length and an ML-KEM key
     that fails the FIPS 203 §7.2 modulus check. The dialer MUST refuse a
     share of another length. Either half failing fails the handshake.
-  - The dialer also sends its X25519 half as a plain X25519 share, as the
-    group's hooks do. With no other group on offer, a listener never
-    selects it.
+  - The production dialer's ClientHello carries one key share, for
+    X25519MLKEM768. The X25519 public value is part of that hybrid share.
 
   `bind` uses this provider unchanged. An endpoint built with `bind_with`
   MAY replace the provider's random source and key-exchange groups, and

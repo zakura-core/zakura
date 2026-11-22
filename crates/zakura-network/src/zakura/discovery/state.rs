@@ -12,7 +12,7 @@ use zakura_rt::collections::{HashMap, HashSet};
 use super::protocol::{
     advertised_services, entry_is_expired, hello_verdict, normalize_direct_addrs,
     normalize_services, push_unique_service, AddressScope, BookChange, DialAdmission,
-    DialCandidateExclusions, DisclosureKey, DiscoveryBookError, DiscoveryRecordError,
+    DialCandidateExclusions, DialTarget, DisclosureKey, DiscoveryBookError, DiscoveryRecordError,
     DiscoveryRecordValidationContext, DiscoveryWireError, ImportBatchOutcome, ImportOutcome,
     RecordVerdict, Services, ZakuraCachedLiveServiceSummary, ZakuraDiscoveryBook,
     ZakuraDiscoveryConfig, ZakuraDiscoveryDialCandidate, ZakuraDiscoveryEntry,
@@ -752,14 +752,22 @@ impl DiscoveryState {
         )
     }
 
-    /// Returns how many discovery dials may start with `connected` connections
-    /// and `in_flight` dials.
-    pub(super) fn dial_slot_limit(&self, connected: usize, in_flight: usize) -> usize {
+    /// Returns how many ordinary discovery dials may start with
+    /// `ordinary_occupied` registered peers and in-flight dials outside the
+    /// preferred set, `in_flight` dials in all, and `hold` places held for
+    /// preferred gateways.
+    pub(super) fn dial_slot_limit(
+        &self,
+        ordinary_occupied: usize,
+        in_flight: usize,
+        hold: usize,
+    ) -> usize {
         super::protocol::discovery_dial_slot_limit(
-            connected,
+            ordinary_occupied,
             in_flight,
             self.config.max_zakura_connections,
             self.config.discovery_connection_headroom,
+            hold,
             self.config.max_concurrent_discovery_dials,
         )
     }
@@ -795,6 +803,16 @@ impl DiscoveryState {
             rng,
             admit,
         );
+    }
+
+    /// What the book knows about dialing `node_id` at `now`, under the
+    /// configured dial backoff, as [`ZakuraDiscoveryBook::dial_target`] says.
+    pub(super) fn dial_target(&self, node_id: &NodeId, now: u64) -> DialTarget {
+        self.book.dial_target(
+            node_id,
+            now,
+            (self.config.dial_backoff_base, self.config.dial_backoff_max),
+        )
     }
 
     /// Returns the admitted sessions by node id: connection, session, and whether outbound.

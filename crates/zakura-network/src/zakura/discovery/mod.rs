@@ -37,6 +37,7 @@ pub(crate) use candidate_dialer::run_native_discovery_dialer;
 pub(crate) use candidate_dialer::{
     insert_static_bootstrap_candidates, spawn_native_discovery_dialer,
 };
+pub use candidate_dialer::{MinerGateway, MinerGatewayRanking};
 pub(crate) use dialer::{
     check_bootstrap_dials_fit, parse_bootstrap_peer, spawn_native_bootstrap_dialer,
 };

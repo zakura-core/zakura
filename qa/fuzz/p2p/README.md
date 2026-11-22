@@ -208,10 +208,14 @@ decoder-1 meaning: decoder 1 checks pure query ownership and each query's own
 cap, and decoder 2 checks the real `Queries` ledger of successive sessions on
 one pool, without a reader to take the `Hello` hold.
 
-`discovery_candidate` drives dial, completion, round and logical-time
-operations under decoder 1. It checks canonical IP reservations, the bounds of
-per-node backoff and the round interval, not an asynchronous worker's
-admission permit.
+`discovery_candidate` drives dial, completion, round, logical-time and
+ranking operations under decoder 2. It checks canonical IP reservations, the
+bounds of per-node backoff and the round interval, not an asynchronous
+worker's admission permit. A ranking forms the preferred set from the
+standings it chooses and runs the preferred pass, and checks that the set
+holds only gateways that may fill a held place and that no preferred dial
+targets a gateway in backoff, connected or already being dialed, or a
+gateway with a lower node ID before the mutual-dial grace has passed.
 
 These targets check pure policies. They do not check worker cancellation or
 connection ownership across scheduled IO.

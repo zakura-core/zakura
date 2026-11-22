@@ -801,6 +801,7 @@ impl StartCmd {
                 zcashd_compat_block_gossip_peer_ips.clone(),
                 zakura_header_sync_driver_startup,
                 custom_services,
+                None,
             )
             .await
             .map_err(|error| eyre!(error))?;

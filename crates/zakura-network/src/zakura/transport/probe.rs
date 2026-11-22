@@ -44,6 +44,9 @@ pub struct HandshakeSample {
     pub node_connections: usize,
     /// Inbound connection slots summed over the machine's per-node record.
     pub inbound_node_connections: usize,
+    /// Inbound connection slots outside the preferred set's one place per
+    /// member, which the inbound share bounds.
+    pub ordinary_inbound_connections: usize,
     /// Total connection capacity.
     pub connection_cap: usize,
     /// The configured registered-connection limit per address.
@@ -97,6 +100,7 @@ impl HandshakeProbe {
                 inbound_connections: counts.inbound_connections(),
                 node_connections: by_node.total(),
                 inbound_node_connections: by_node.inbound,
+                ordinary_inbound_connections: counts.slot_split().ordinary_inbound,
                 connection_cap: self.connection_cap,
                 address_cap: self.address_cap,
                 pending: counts.pending(),

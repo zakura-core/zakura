@@ -7,8 +7,9 @@ use zakura_rt::{collections::HashMap, time::Instant};
 mod slots;
 
 use slots::ConnectionSlots;
-pub use slots::SlotCount;
+pub use slots::{SlotClass, SlotCount, SlotRefusal, SlotSplit};
 
+use super::PreferredGateways;
 use crate::zakura::regulation::Bucket;
 use crate::zakura::{admission_host, Cadence, DEFAULT_ZAKURA_REDIAL_INITIAL_BACKOFF};
 
@@ -98,6 +99,10 @@ pub struct HandshakeCounts {
     inbound_reservations: usize,
     /// Connection slots, by the remote node that holds them.
     connections: ConnectionSlots,
+    /// The gateways connection places are held for. It sits under the same
+    /// lock as the slots, so a check never sees a set and slot counts from
+    /// different moments.
+    preferred: PreferredGateways,
     /// Charges of attempts whose source address was validated, by a Retry
     /// token, before TLS.
     validated_cadence: CadenceLedger,
@@ -278,21 +283,79 @@ impl HandshakeCounts {
         self.connections.inbound()
     }
 
-    /// Checks whether the connection budget can admit this direction.
-    pub fn connections_full(&self, inbound: bool, cap: usize) -> bool {
-        self.connections.full(inbound, cap)
+    /// Whether a slot within `cap` may be free for an inbound caller whose
+    /// node ID is not known yet: an ordinary inbound slot, or a held place
+    /// that no preferred gateway fills. With no hold this is the ordinary
+    /// inbound check alone.
+    pub fn inbound_place_free(&self, cap: usize) -> bool {
+        self.connections.inbound_place_free(cap, &self.preferred)
     }
 
-    /// Charges a connection slot to `node` while preserving the dial
-    /// reserve: the total stays within `cap`, and inbound slots within its
-    /// inbound share. The check and the charge are one step.
-    pub fn claim_connection(&mut self, node: NodeId, inbound: bool, cap: usize) -> bool {
-        self.connections.claim(node, inbound, cap)
+    /// Connection slots within `cap` that a dial to a node outside the
+    /// preferred set may claim now.
+    pub fn free_ordinary_connections(&self, cap: usize) -> usize {
+        self.connections.free_ordinary(cap, &self.preferred)
+    }
+
+    /// Charges a connection slot to `node` while keeping the dial reserve
+    /// and the held places: the total stays within `cap`, ordinary slots
+    /// within `cap` less the hold, and ordinary inbound slots within the
+    /// inbound share. A preferred gateway's first slot takes a held place.
+    /// The check and the charge are one step.
+    ///
+    /// A ranked gateway that calls in counts as connected: when that brings
+    /// it into the preferred set, the set changes with the granted claim,
+    /// and stays as it was when the claim is refused. Each member counts one
+    /// preferred slot, so preferred slots never pass the hold. A member the
+    /// caller displaces keeps its slot, now ordinary, which can leave the
+    /// ordinary slots one over `cap` less the hold until a slot frees. That
+    /// is bounded by the hold and passes, as after a published set change.
+    pub fn claim_connection(
+        &mut self,
+        node: NodeId,
+        inbound: bool,
+        cap: usize,
+    ) -> Result<SlotClass, SlotRefusal> {
+        let before = inbound
+            .then(|| self.preferred.with_caller(&node))
+            .flatten()
+            .map(|formed| std::mem::replace(&mut self.preferred, formed));
+        let claim = self.connections.claim(node, inbound, cap, &self.preferred);
+        if let (Err(_), Some(before)) = (claim, before) {
+            self.preferred = before;
+        }
+        claim
+    }
+
+    /// Replaces the preferred gateways the slot checks use. Slots already
+    /// held stay held; only how they count changes.
+    pub fn publish_preferred_gateways(&mut self, preferred: PreferredGateways) {
+        self.preferred = preferred;
+    }
+
+    /// The preferred gateways the slot checks use now.
+    pub fn preferred_gateways(&self) -> &PreferredGateways {
+        &self.preferred
+    }
+
+    /// The slots in use, split into preferred and ordinary ones by the
+    /// current preferred set.
+    pub fn slot_split(&self) -> SlotSplit {
+        self.connections.split(&self.preferred)
     }
 
     /// Releases the slot that `claim_connection` charged to `node`.
+    ///
+    /// A gateway that loses its last connection slot counts as in backoff
+    /// until the next published ranking, so a dropped caller or member
+    /// doesn't stay preferred in the meantime.
     pub fn release_connection(&mut self, node: NodeId, inbound: bool) {
         self.connections.release(node, inbound);
+        if self.connections.of_node(&node).total() == 0 {
+            if let Some(formed) = self.preferred.with_released(&node) {
+                self.preferred = formed;
+            }
+        }
     }
 
     /// The connection slots `node` holds now.

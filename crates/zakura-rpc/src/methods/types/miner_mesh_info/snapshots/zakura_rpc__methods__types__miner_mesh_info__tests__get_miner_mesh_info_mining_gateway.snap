@@ -40,9 +40,9 @@ expression: response
       "connected": false
     }
   ],
-  "hold": 2,
+  "hold": 1,
   "slots": {
-    "limit": 92,
+    "limit": 40,
     "in_use": 3,
     "preferred": 1,
     "ordinary": 2,

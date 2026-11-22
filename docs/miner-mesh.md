@@ -64,8 +64,8 @@ A held place is a connection slot that only a preferred gateway may use:
 - the node dials its preferred gateways ahead of ordinary candidates, and a
   gateway's first connection takes a held place even when the ordinary slots
   and the inbound share are full;
-- a preferred gateway whose dial fails, or whose connection drops, keeps its
-  place reserved while it waits out a backoff, and may still connect in;
+- a gateway in backoff still counts toward the number of places held. The
+  next available gateway can fill a place while the first waits to retry;
 - a ranked gateway that connects in takes a place when its rank brings it into
   the preferred set.
 
@@ -84,7 +84,9 @@ admin method, because it shows the node's v2 ID and its peers' IDs: it is
 served on the admin listener, on a primary listener with cookie
 authentication, on Regtest, and with `rpc.allow_unauthenticated_admin`, but
 not on the restricted unauthenticated listener. It reports what the node
-counts, the places it holds, and its v2 peers:
+counts, the places it holds, and its v2 peers. In this example the node has
+40 connection slots. Of the ten set aside for dials, nine are kept for
+bootstrap peers, leaving one place for a preferred gateway.
 
 ```json
 {
@@ -105,8 +107,8 @@ counts, the places it holds, and its v2 peers:
     { "node_id": "4444...4444", "blocks": 7, "state": "standby", "connected": true },
     { "node_id": "5555...5555", "blocks": 3, "state": "unmatched", "connected": false }
   ],
-  "hold": 2,
-  "slots": { "limit": 92, "in_use": 3, "preferred": 1, "ordinary": 2, "inbound": 2 },
+  "hold": 1,
+  "slots": { "limit": 40, "in_use": 3, "preferred": 1, "ordinary": 2, "inbound": 2 },
   "peers": [
     { "node_id": "2222...2222", "inbound": true, "preferred": true },
     { "node_id": "4444...4444", "inbound": false, "preferred": false },
@@ -140,7 +142,7 @@ preferred set:
 | --- | --- |
 | `preferred` | Reachable and among the highest-ranked: it may fill a held place. |
 | `standby` | Known and reachable (it can be dialed, is being dialed, or is connected), but ranked below the gateways that fill the held places. |
-| `backoff` | Known, but waiting out a failed dial or a lost connection. It still counts towards the hold, so a place may stay reserved for it. |
+| `backoff` | Known, but waiting out a failed dial or a lost connection. It still counts toward the shared hold and may connect inbound during backoff. |
 | `unmatched` | v2 networking has no record of it: it is not connected and discovery has no address for it, so it takes no place. Gateways are usually learned through v2 peer exchange. |
 
 On Mainnet, `synced` can turn false while `gateways` and `hold` still show the

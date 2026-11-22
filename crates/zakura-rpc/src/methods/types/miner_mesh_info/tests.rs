@@ -42,7 +42,7 @@ fn gateway(byte: u8, blocks: u32, place: GatewayPlace, connected: bool) -> Place
     }
 }
 
-/// One gateway in each place, two of them connected, and one ordinary peer.
+/// Forty slots with nine kept for bootstrap peers leave one preferred place.
 fn places() -> ConnectionPlaces {
     ConnectionPlaces {
         gateways: vec![
@@ -51,8 +51,8 @@ fn places() -> ConnectionPlaces {
             gateway(0x44, 7, GatewayPlace::Standby, true),
             gateway(0x55, 3, GatewayPlace::Unmatched, false),
         ],
-        hold: 2,
-        slot_limit: 92,
+        hold: 1,
+        slot_limit: 40,
         slots: SlotSplit {
             preferred: 1,
             ordinary: 2,

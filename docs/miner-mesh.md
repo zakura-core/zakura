@@ -39,6 +39,20 @@ It warns, and starts anyway, when `network.zakura.listen_addr` is unset or
 loopback (other miners cannot dial the gateway) or when `mining.miner_address`
 is unset (the node builds no coinbase, so it names no gateway).
 
+### The gateway's node ID
+
+The node ID a block names is worked out from the secret in the gateway's node
+key file (or `network.zakura_node_secret_key`). The same secret always gives
+the same ID, so the ID survives restarts; a new secret gives a new ID.
+
+Moving v2 networking to protocol 4 gave every node a new ID. A block mined
+before a gateway upgraded names its old ID, which no node has any more. Such
+an ID stays unmatched: it takes no connection place, and it leaves the counts
+once its blocks fall out of the two-day window.
+
+Only nodes on the current v2 protocol connect to each other, so a gateway and
+the miners that prefer it must all run it to form a mesh.
+
 ## Prefer announced gateways
 
 Every node with `mining.miner_address` set counts the gateways named in the

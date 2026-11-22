@@ -131,21 +131,19 @@ pub const DEFAULT_ZAKURA_LISTEN_ADDR: SocketAddr =
     SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 8234));
 /// Default native Zakura bootstrap peers for Mainnet.
 ///
-/// These entries still hold each seed's protocol 3 ID, its Ed25519 key. A
-/// protocol 4 ID derives from keys only the seed can compute, so they are
-/// replaced with the IDs the seeds print once they run this release; until
-/// then a dial to them fails its identity check. The Testnet seeds already
-/// run it and are listed by their protocol 4 IDs.
+/// Entries name each seed by its protocol 4 node ID, which derives from keys
+/// only the seed holds. Take a new ID from the line the seed logs at startup;
+/// a stale ID fails the dial's identity check.
 pub const DEFAULT_MAINNET_ZAKURA_BOOTSTRAP_PEERS: &[&str] = &[
-    "1398f62c6d1a457c51ba6a4b5f3dbd2f69fca93216218dc8997e416bd17d93ca@165.22.54.66:8234",
-    "fd1724385aa0c75b64fb78cd602fa1d991fdebf76b13c58ed702eac835e9f618@104.131.184.123:8234",
-    "9ec67ad6834bc2ca0d659c240e042d3446c37cabcc092b527d459c87d938b4a4@159.65.183.89:8234",
-    "bd3dc5d2a3d44c6bf90e364bf446231dbf9737e38a562ccf9e91ea631ea59b22@143.244.184.176:8234",
-    "14ab98fa0c4b07d40119e1dbc9f3c36d20c8f226ae5ba4216218a2034f148e57@159.203.38.10:8234",
-    "681d21b18644cd82ec13256a97f92bec1fff815683ef6f65dc7c993f098a4fe5@64.227.44.93:8234",
-    "058b3f20dc9bef7bb447f94d7663d793cfbc036720f97e52d7f13661b21818e1@161.35.156.226:8234",
-    "291323d78eb7186c3fa225ef5e305e95363e0ef06d42dca91bd4ef0254aed1ae@139.59.64.115:8234",
-    "85e425233a68697d4be91dd5d542305a8a327cd06d992d53c0913cef2fa75084@168.144.173.250:8234",
+    "a5f148b592404c5fcdc27f06919681c1dceddb274336abf5c91e70780471bc12@165.22.54.66:8234",
+    "10e8b19b6aabb5ccd80d2df14fabc991602aea0cfb82783ebdabb3b1b699e9b7@104.131.184.123:8234",
+    "ca22584f4392a26c46f9553e45db00fc8de06f1ff8f2c48f5d28b5cd58f134b6@159.65.183.89:8234",
+    "27fec1ed7f52ca389f8ad09e79e896fe6f0097dea6d74b71628dce992cb50b57@143.244.184.176:8234",
+    "a4ef400514ea1eaceea73e2b1a86f4102264e88cfc8b3ace9da73d43c7ccb7c2@159.203.38.10:8234",
+    "9addeca7e4ea8aced48fcf9e3a9f8ce21056fecf9c0bbce368b61ec35b4e5bdc@64.227.44.93:8234",
+    "5f0cc2933a058472140348ebe708ff7a10167cd7e9cd96fa19263ecdf62a3fbe@161.35.156.226:8234",
+    "6a13975563f5883fda0b8b0b1cee54163dedf786dc8f1b4990d2130e7cc56b51@139.59.64.115:8234",
+    "a8a2de1c199100dcd1e7985a30a6a07858d45ee3703794d9d214827724067431@168.144.173.250:8234",
 ];
 /// Default native Zakura bootstrap peers for Testnet.
 pub const DEFAULT_TESTNET_ZAKURA_BOOTSTRAP_PEERS: &[&str] = &[

@@ -790,8 +790,10 @@ async fn faulty_trusted_block_bans_relay_and_closes_connections_then_valid_retry
     .unwrap();
     let progress_peer = Buffer::new(progress_peer, 4);
     timeout(Duration::from_secs(20), async {
+        // Wait on the tip, not a `Peers` round trip: a node with no gossipable
+        // addresses cached yet sends no reply, so one probe can outlast this timeout.
         while fresh_receiver.tip.best_tip_hash() != Some(valid.hash()) {
-            progress_peer.clone().oneshot(Request::Peers).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
@@ -829,7 +831,7 @@ async fn faulty_trusted_block_bans_relay_and_closes_connections_then_valid_retry
     .expect("the descendant is announced while its local validation is held");
     timeout(Duration::from_secs(20), async {
         while fresh_receiver.tip.best_tip_hash() != Some(child.hash()) {
-            progress_peer.clone().oneshot(Request::Peers).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await

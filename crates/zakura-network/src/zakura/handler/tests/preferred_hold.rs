@@ -573,3 +573,27 @@ fn a_connected_member_leaves_the_set_with_its_last_slot() {
     assert_eq!(preferred_set(&handler), [next]);
     assert_eq!(hold(&handler), 1);
 }
+
+/// A member published as being dialed, or as dialable, that holds a slot
+/// and then loses it leaves the set like a connected one.
+#[test]
+fn a_dialing_or_dialable_member_leaves_the_set_with_its_last_slot() {
+    for (standing, inbound) in [
+        (GatewayStanding::Dialing, false),
+        (GatewayStanding::Dialable, true),
+    ] {
+        let handler = handler(40);
+        let member = new_node();
+        let next = new_node();
+        publish(
+            &handler,
+            &[(member, standing), (next, GatewayStanding::Dialable)],
+        );
+        let slot = handler.claim_connection(member, inbound).expect("held");
+        assert_eq!(preferred_set(&handler), [member]);
+
+        drop(slot);
+        assert_eq!(preferred_set(&handler), [next], "{standing:?}");
+        assert_eq!(hold(&handler), 1);
+    }
+}

@@ -700,7 +700,6 @@ async fn shutdown_joins_started_and_unpolled_workers_before_discarding_reservati
         sought_services: Vec::new(),
         preferred: PreferredGatewayInput::new(None, node.endpoint().local_node_id()),
         deferred: DeferredDials::new(node.endpoint().local_node_id()),
-        preferred_hold_limit: 0,
         max_concurrent_dials: DEFAULT_MAX_CONCURRENT_DISCOVERY_DIALS,
         preferred_attempts: HashSet::default(),
         trace: node.endpoint().trace(),
@@ -748,6 +747,7 @@ async fn preferred_dials_leave_the_maintained_dial_reserve() {
     zakura_rt::time::timeout(Duration::from_secs(15), async {
         let limits = ZakuraLocalLimits {
             max_connections: 2,
+            max_preferred_connections: 0,
             max_pending_handshakes: 1,
             ..ZakuraLocalLimits::from_config(&crate::Config::default())
         };
@@ -1558,7 +1558,6 @@ async fn finished_workers_settle_before_the_round_starts() {
         sought_services: Vec::new(),
         preferred: PreferredGatewayInput::new(None, node.endpoint().local_node_id()),
         deferred: DeferredDials::new(node.endpoint().local_node_id()),
-        preferred_hold_limit: 0,
         max_concurrent_dials: DEFAULT_MAX_CONCURRENT_DISCOVERY_DIALS,
         preferred_attempts: HashSet::default(),
         trace: endpoint.trace(),
@@ -1743,7 +1742,6 @@ async fn every_dial_reservation_returns_to_baseline_after_each_exit() {
         sought_services: Vec::new(),
         preferred: PreferredGatewayInput::new(None, node.endpoint().local_node_id()),
         deferred: DeferredDials::new(node.endpoint().local_node_id()),
-        preferred_hold_limit: 0,
         max_concurrent_dials: DEFAULT_MAX_CONCURRENT_DISCOVERY_DIALS,
         preferred_attempts: HashSet::default(),
         trace: node.endpoint().trace(),

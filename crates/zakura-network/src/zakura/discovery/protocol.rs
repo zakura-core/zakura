@@ -2167,17 +2167,6 @@ impl ZakuraDiscoveryHandle {
             .max_concurrent_discovery_dials
     }
 
-    /// The most connection places the node may hold for preferred gateways:
-    /// what [`crate::zakura::preferred_hold_limit`] leaves beside the
-    /// headroom discovery keeps for bootstrap peers.
-    pub(crate) async fn preferred_hold_limit(&self) -> usize {
-        let state = self.inner.lock().await;
-        crate::zakura::preferred_hold_limit(
-            state.config().max_zakura_connections,
-            state.config().discovery_connection_headroom,
-        )
-    }
-
     /// Marks a discovery dial attempt for `node_id`.
     pub async fn mark_dial_attempt(&self, node_id: &NodeId) {
         let mut state = self.inner.lock().await;

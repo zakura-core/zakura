@@ -67,8 +67,8 @@ use super::transport::{
     worker_framed_channel, AdmittedFrame, CloseOutcome, CloseRow, CompatResponseGrant,
     ConnectionResources, FrameGate, FrameGrant, FramedWorkerRecv, HandshakeCounts, HeldPlaces,
     IpAdmission, NeutralCause, NodeResources, OrderedStreamFailure, OrderedStreamFailureCause,
-    OwnerBound, OwnerGuard, OwnerPhase, PreferredGateways, ReactorBudget, ReactorShares,
-    ResourceEnvelope, SessionLayout, SlotClass, SlotRefusal, StreamResources, TransportLimits,
+    OwnerBound, OwnerGuard, OwnerPhase, ReactorBudget, ReactorShares, ResourceEnvelope,
+    SessionLayout, SlotClass, SlotRefusal, StreamResources, TransportLimits,
     COMPAT_EXCHANGE_BUDGET, COMPAT_RESPONSE_MAX_AGGREGATE_BYTES,
 };
 #[cfg(any(test, feature = "zakura-testkit"))]
@@ -1380,22 +1380,6 @@ impl ZakuraEndpoint {
             .held_places()
     }
 
-    /// Hands `preferred` to the connection-slot checks, then records the
-    /// hold and the slots in use, split by the new set, in the
-    /// `zakura.p2p.conn.slots.*` gauges.
-    pub(crate) fn publish_preferred_gateways(&self, preferred: PreferredGateways) {
-        let hold = preferred.hold();
-        let mut counts = self.handler.supervisor.ip_slots.counts();
-        counts.publish_preferred_gateways(preferred);
-        let split = counts.slot_split();
-        drop(counts);
-        // Slot counts are bounded by `max_connections`, far below 2^52, so
-        // the gauges hold them exactly.
-        metrics::gauge!("zakura.p2p.conn.slots.hold").set(hold as f64);
-        metrics::gauge!("zakura.p2p.conn.slots.preferred").set(split.preferred as f64);
-        metrics::gauge!("zakura.p2p.conn.slots.ordinary").set(split.ordinary as f64);
-    }
-
     /// How many dials discovery can start now: the handler's free ordinary
     /// connection slots, which leave the places held for preferred gateways.
     /// Each dial holds one slot from its start, or fails as a local limit
@@ -1410,7 +1394,7 @@ impl ZakuraEndpoint {
     pub(crate) fn preferred_dial_permits(&self) -> usize {
         self.handler
             .limits
-            .max_connections
+            .total_connections()
             .saturating_sub(self.handler.supervisor.ip_slots.counts().connections())
     }
 
@@ -1428,6 +1412,14 @@ impl ZakuraEndpoint {
             return 0;
         }
         self.quic.discovery_capacity()
+    }
+
+    /// Holds an inbound slot for the authenticated peer named by a dial-round test.
+    #[cfg(test)]
+    pub(crate) fn hold_inbound_gateway(&self, node: NodeId) -> ConnectionAdmissionGuard {
+        self.handler
+            .claim_connection(node, true)
+            .expect("the test has a free inbound slot")
     }
 
     /// Holds `count` of the handler's connection slots, as connections with
@@ -3779,10 +3771,15 @@ impl ZakuraProtocolHandler {
 
     fn publish_gateway_ranking(&self, ranking: impl IntoIterator<Item = super::RankedGateway>) {
         let ranking = ranking.into_iter().collect();
-        self.supervisor
-            .ip_slots
-            .counts()
-            .publish_gateway_ranking(&ranking, self.limits.max_preferred_connections);
+        let mut counts = self.supervisor.ip_slots.counts();
+        counts.publish_gateway_ranking(&ranking, self.limits.max_preferred_connections);
+        let hold = counts.preferred_gateways().hold();
+        let split = counts.slot_split();
+        drop(counts);
+        // These counts are bounded by the funded connection budget and fit exactly in f64.
+        metrics::gauge!("zakura.p2p.conn.slots.hold").set(hold as f64);
+        metrics::gauge!("zakura.p2p.conn.slots.preferred").set(split.preferred as f64);
+        metrics::gauge!("zakura.p2p.conn.slots.ordinary").set(split.ordinary as f64);
     }
 
     /// Claims a connection slot for `node`, the dial target or the proven

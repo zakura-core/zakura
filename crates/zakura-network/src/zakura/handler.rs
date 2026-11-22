@@ -1423,6 +1423,11 @@ impl ZakuraEndpoint {
     /// none without a free connection slot, otherwise the room under
     /// discovery's transport ceiling, which leaves the dial reserve to
     /// bootstrap and maintained dials.
+    ///
+    /// With `max_pending_handshakes` below its default of 32, that ceiling
+    /// can leave fewer free attempts than places to fill while the inbound
+    /// share is not full, so some held places may stay empty until inbound
+    /// handshakes finish. The defaults leave room for all ten.
     pub(crate) fn preferred_dial_capacity(&self) -> usize {
         if self.preferred_dial_permits() == 0 {
             return 0;

@@ -286,9 +286,35 @@ cross_links_ready() {
 STALL_DROP_LINE='dropping stalled peer: exceeded FindBlocks/FindHeaders stall threshold'
 declare -A STALLS_WHILE_OPEN=()
 
+# stall_lines <name> -> the stall disconnect lines <name> has logged so far.
+stall_lines() {
+  docker logs "$(container_of "$1")" 2>&1 | grep -F "${STALL_DROP_LINE}" || true
+}
+
 # stall_count <stall-lines> <addr> -> how many of <stall-lines> name <addr>.
 stall_count() {
   grep -cE "peer=${2//./\\.}( |\$)" <<< "$1" || true
+}
+
+# record_cross_links_at_start -> records the cross-version connections each
+# dual node has now, with their stall-line baselines. The logs are read before
+# getpeerinfo, so a drop logged after a connection was seen open always counts
+# as new.
+record_cross_links_at_start() {
+  local name link
+  declare -A before=()
+  for name in "${!CROSS_LINK_UA[@]}"; do
+    before[${name}]=$(stall_lines "${name}")
+  done
+  for name in "${!CROSS_LINK_UA[@]}"; do
+    CROSS_LINKS_AT_START[${name}]=$(cross_links "${name}" "${CROSS_LINK_UA[${name}]}")
+  done
+  for name in "${!CROSS_LINK_UA[@]}"; do
+    while IFS= read -r link; do
+      [[ -z "${link}" ]] && continue
+      STALLS_WHILE_OPEN["${name} ${link%% *}"]=$(stall_count "${before[${name}]}" "${link%% *}")
+    done <<< "${CROSS_LINKS_AT_START[${name}]}"
+  done
 }
 
 # Records each cross-version connection seen at start that has since closed,
@@ -297,24 +323,35 @@ stall_count() {
 # connection's peer is the node listening on its address, and an inbound
 # connection's peer dialed this node's listener. Run it often: the stall count
 # can't tell a close from a later redial's close within one interval.
+#
+# Every node's logs are read once before and once after every node's
+# getpeerinfo. A still-open connection's baseline comes from the read before,
+# and a close is checked against the read after, which follows the close.
 check_cross_links() {
   local phase="$1" name peer link addr remote reason
-  declare -A now=() closed=() stalls=()
+  declare -A now=() closed=() before=() stalls=()
+  for name in "${!CROSS_LINK_UA[@]}"; do
+    before[${name}]=$(stall_lines "${name}")
+  done
   for name in "${!CROSS_LINK_UA[@]}"; do
     now[${name}]=$(cross_links "${name}" "${CROSS_LINK_UA[${name}]}")
-    stalls[${name}]=$(docker logs "$(container_of "${name}")" 2>&1 \
-      | grep -F "${STALL_DROP_LINE}" || true)
+  done
+  for name in "${!CROSS_LINK_UA[@]}"; do
+    stalls[${name}]=$(stall_lines "${name}")
+  done
+  for name in "${!CROSS_LINK_UA[@]}"; do
     while IFS= read -r link; do
       [[ -z "${link}" ]] && continue
       if grep -qxF "${link}" <<< "${now[${name}]}"; then
-        STALLS_WHILE_OPEN["${name} ${link%% *}"]=$(stall_count "${stalls[${name}]}" "${link%% *}")
+        STALLS_WHILE_OPEN["${name} ${link%% *}"]=$(stall_count "${before[${name}]}" "${link%% *}")
       else
         closed[${name}]+="${link}"$'\n'
       fi
     done <<< "${CROSS_LINKS_AT_START[${name}]}"
   done
 
-  # stall_dropped_since_open <name> <addr>
+  # stall_dropped_since_open <name> <addr>. record_cross_links_at_start seeds
+  # every baseline; a missing one counts as no new drop.
   stall_dropped_since_open() {
     local count
     count=$(stall_count "${stalls[$1]}" "$2")
@@ -435,10 +472,8 @@ while (( SECONDS < deadline )); do
   sleep 3
 done
 (( links_ready == 1 )) || fail "the cross-version legacy connections did not all form within ${READY_TIMEOUT}s"
-for name in "${!CROSS_LINK_UA[@]}"; do
-  CROSS_LINKS_AT_START[${name}]=$(cross_links "${name}" "${CROSS_LINK_UA[${name}]}")
-done
-# Sets each connection's stall-line baseline (and explains any early close).
+record_cross_links_at_start
+# A connection can close between that record and here, so check right away.
 check_cross_links "links formed"
 
 # Both roles of the prelude ran and fell back to legacy. v1.8.9 runs the same

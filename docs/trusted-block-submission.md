@@ -31,7 +31,7 @@ The separate admin listener does not expose this endpoint. Browser-origin
 requests are rejected with either authentication setting. Use the existing RPC
 TLS configuration or a protected transport when connecting across hosts.
 
-## Recommended sequence
+## Submit after primary acceptance
 
 1. Obtain a template from the GBT (`getblocktemplate`) node.
 2. Mine it and construct the final solved block, including any coinbase changes
@@ -60,6 +60,54 @@ response alone does not prove that the exact submitted body was validated.
 This sequence is an operator recommendation, not an endpoint prerequisite.
 Access to the endpoint authorizes relay; it does not establish prior validation.
 The endpoint does not accept or verify a validation certificate.
+
+## Upload while the primary validates
+
+A pool using `submitsolution` can send the solved block to each trusted relay
+while the template-producing node (the primary) validates it. With HTTP/1.1
+chunked transfer encoding, a relay can receive all the block bytes and wait
+for a five-byte signal before submitting them for local validation and relay.
+
+1. Before mining, establish a TLS connection to each relay and send an ordinary
+   RPC request on it. Keep that socket available for submissions. Zakura waits
+   30 seconds for the next request's headers, including between requests. While
+   idle, use ordinary RPC traffic or send `getblockcount` every 15 seconds on
+   that same socket. Read each response fully and reconnect between solves if
+   the socket closes. Use a separate connection for long polls. A client pool
+   can open another socket if the first is busy.
+2. At solve time, freeze the final serialized block. Its coinbase and ordered
+   transactions must be exactly the ones in the primary's saved template. Send
+   the template's work ID and the solved header to the primary's `submitsolution`
+   RPC. In parallel, start a `POST /submittrustedblock` on each warm relay
+   connection with the usual authentication, `Content-Type: application/octet-stream`,
+   and `Transfer-Encoding: chunked`. Omit `Content-Length`. Flush all block bytes
+   as nonempty data chunks and keep the request body open. Use a streaming client
+   and a path that forwards chunks as written. A buffering proxy can delay the
+   entire upload until the request ends.
+3. The primary reconstructs and validates the full block. Once its response has
+   `result: null` and a given relay's data chunks have been written, finish
+   **that relay's** request. On the wire, send `0\r\n\r\n` (ASCII zero followed by
+   two CRLF pairs) and flush. This is HTTP framing. The block bytes themselves
+   stay identical. Each relay can start independently as soon as both conditions
+   hold. Read the relay's final response and return the connection to the pool.
+4. If the primary rejects the solution, times out, or returns a duplicate or
+   other inconclusive result, abort every unfinished relay request by closing
+   its connection. Configure the streaming client to signal an error on
+   cancellation. A normal end-of-stream can send the terminating chunk and
+   authorize relay. The existing 30-second receipt deadline covers the data
+   **and** the terminator, and each open upload occupies a receipt slot. If an
+   upload expires or disconnects, discard it. After confirmed primary acceptance
+   the pool can retry the same bytes with an ordinary complete POST.
+
+To measure the effect, compare the current sender, a warm TLS connection with
+the upload starting after acceptance, and a warm connection with the upload
+overlapping validation. Record new TLS handshakes per relay and the times of
+solve, primary acceptance, last block-data write, release write (when used),
+first receipt at an observing peer, and final relay response. Identify the block
+and source path at the observer and account for clock differences across hosts.
+Compare solve-to-first-peer-receipt at similar block sizes. Check that a healthy
+warm path opens zero connections at solve time even after more than 30 seconds
+between solves.
 
 ## Request and response
 

@@ -1,5 +1,7 @@
 //! Wire-level accounting across trusted relay and committed announcements.
 
+mod tls_upload;
+
 use std::{
     io,
     pin::Pin,

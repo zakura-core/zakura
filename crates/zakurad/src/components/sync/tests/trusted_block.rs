@@ -144,6 +144,7 @@ impl Node {
             stack,
             network,
             zakura_chain::block::genesis::regtest_genesis_block(),
+            None,
         )
         .await
     }
@@ -153,6 +154,7 @@ impl Node {
         stack: P2pStack,
         network: Network,
         genesis: Arc<Block>,
+        tls: Option<zakura_rpc::config::rpc::TlsConfig>,
     ) -> Self {
         assert_eq!(network.genesis_hash(), genesis.hash());
         let (
@@ -431,6 +433,7 @@ impl Node {
                 cookie_dir: directory.path().to_path_buf(),
                 enable_cookie_auth: true,
                 enable_trusted_block_submission: true,
+                tls,
                 ..Default::default()
             },
         )
@@ -515,7 +518,7 @@ impl Node {
         }
     }
 
-    async fn template(&self) -> Block {
+    async fn block_template(&self) -> zakura_rpc::client::BlockTemplateResponse {
         let (status, bytes) = http(
             self.rpc,
             &self.auth,
@@ -526,8 +529,12 @@ impl Node {
         .await;
         assert_eq!(status, StatusCode::OK);
         let response: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        let template = serde_json::from_value(response["result"].clone())
-            .unwrap_or_else(|_| panic!("getblocktemplate failed: {response}"));
+        serde_json::from_value(response["result"].clone())
+            .unwrap_or_else(|_| panic!("getblocktemplate failed: {response}"))
+    }
+
+    async fn template(&self) -> Block {
+        let template = self.block_template().await;
         proposal_block_from_template(&template, BlockTemplateTimeSource::default(), &self.network)
             .unwrap()
     }

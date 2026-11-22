@@ -77,7 +77,7 @@ fn validating_network() -> (Network, Arc<Block>) {
 async fn invalid_pow_is_relayed_then_rejected(failure: ValidationFailure) {
     let _init = zakura_test::init();
     let (network, genesis) = validating_network();
-    let mut relay = Node::with_network(None, P2pStack::Legacy, network, genesis).await;
+    let mut relay = Node::with_network(None, P2pStack::Legacy, network, genesis, None).await;
     let (advertised, mut advertisements) = mpsc::unbounded_channel();
     // An explicit peer fetch observes the relay's bytes without a downstream verifier
     // disconnecting first and obscuring the relay's own rejection and withdrawal.

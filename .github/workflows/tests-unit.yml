@@ -544,14 +544,16 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 #v2.0.1
         with:
           toolchain: stable
-          components: clippy
           cache-shared-key: zakura-sim
           cache-on-failure: true
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Lint the simulator build
+      # Compile only. New clippy lints on the floating stable toolchain shouldn't
+      # fail this nightly-only job, and this RUSTFLAGS drops the action's
+      # default `-D warnings`.
+      - name: Check the simulator build
         run: |
-          cargo clippy --locked -p zakura-rt -p zakura-scheduler -p zakura-sim -p zakura-storage -p zakura-quic --all-targets -- -D warnings
-          cargo clippy --locked -p zakura-network --lib --tests -- -D warnings
+          cargo check --locked -p zakura-rt -p zakura-scheduler -p zakura-sim -p zakura-storage -p zakura-quic --all-targets
+          cargo check --locked -p zakura-network --lib --tests
         env:
           RUSTFLAGS: --cfg zakura_sim
       - name: Test the simulator build

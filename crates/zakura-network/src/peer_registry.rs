@@ -1,20 +1,15 @@
 //! Active peer connection metadata for local diagnostics.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     net::IpAddr,
     sync::{Arc, Mutex},
+    task::Context,
     time::{Duration, Instant},
 };
 
 use futures::task::AtomicWaker;
 use zakura_chain::block;
-
-mod delivery;
-mod delivery_trace;
-
-use delivery::DeliveryEstimate;
-pub(crate) use delivery_trace::{DeliverySampleKind, DeliveryTrace};
 
 use crate::{
     peer::ConnectionInfo,
@@ -22,6 +17,38 @@ use crate::{
     zakura::{ZakuraConnId, ZakuraPeerId},
     PeerSocketAddr,
 };
+
+/// Sliding window for legacy peer RTT and transfer-rate estimates.
+pub(crate) const ESTIMATE_WINDOW: Duration = Duration::from_secs(10 * 60);
+
+/// Monotone sliding minimum of heartbeat RTTs over [`ESTIMATE_WINDOW`].
+#[derive(Clone, Debug, Default)]
+struct MinRttWindow {
+    samples: VecDeque<(tokio::time::Instant, Duration)>,
+}
+
+impl MinRttWindow {
+    fn record(&mut self, now: tokio::time::Instant, rtt: Duration) {
+        while self
+            .samples
+            .front()
+            .is_some_and(|(at, _)| now.saturating_duration_since(*at) > ESTIMATE_WINDOW)
+        {
+            self.samples.pop_front();
+        }
+        while self.samples.back().is_some_and(|(_, back)| *back >= rtt) {
+            self.samples.pop_back();
+        }
+        self.samples.push_back((now, rtt));
+    }
+
+    fn min(&self, now: tokio::time::Instant) -> Option<Duration> {
+        self.samples
+            .iter()
+            .find(|(at, _)| now.saturating_duration_since(*at) <= ESTIMATE_WINDOW)
+            .map(|(_, rtt)| *rtt)
+    }
+}
 
 /// A snapshot of one active peer connection.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -61,14 +88,16 @@ impl ConnectedPeer {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct PeerRegistry {
     inner: Arc<Mutex<RegistryState>>,
+    /// Wakes the peer set whenever any legacy connection records a new heartbeat RTT.
+    rtt_waker: Arc<AtomicWaker>,
 }
 
 #[derive(Debug, Default)]
 struct RegistryState {
     next_legacy_generation: u64,
     active_connections: HashMap<ConnectionKey, ConnectedPeer>,
-    /// How long each active legacy connection takes to answer, for choosing block sources.
-    delivery_estimates: HashMap<ConnectionKey, DeliveryEstimate>,
+    /// Windowed minimum heartbeat RTT per active legacy connection.
+    min_rtts: HashMap<ConnectionKey, MinRttWindow>,
     native_connections: HashMap<ZakuraPeerId, NativeConnection>,
     retained_native_metadata: HashMap<ZakuraPeerId, ConnectedPeer>,
 }
@@ -164,8 +193,6 @@ impl PeerRegistry {
             PeerRegistryUpdater {
                 registry: self.clone(),
                 key,
-                delivery_trace: DeliveryTrace::default(),
-                score_waker: Arc::default(),
             },
         )
     }
@@ -282,7 +309,7 @@ impl PeerRegistry {
             .lock()
             .expect("peer registry mutex is never poisoned");
         state.active_connections.remove(key);
-        state.delivery_estimates.remove(key);
+        state.min_rtts.remove(key);
     }
 }
 
@@ -291,20 +318,9 @@ impl PeerRegistry {
 pub(crate) struct PeerRegistryUpdater {
     registry: PeerRegistry,
     key: ConnectionKey,
-    /// Where this connection's delivery samples are traced.
-    delivery_trace: DeliveryTrace,
-    /// The task to wake when a delivery sample is recorded, shared by this updater's clones.
-    /// Empty unless the peer set is holding a second block request that this peer could serve.
-    score_waker: Arc<AtomicWaker>,
 }
 
 impl PeerRegistryUpdater {
-    /// Makes this connection trace its delivery samples with `delivery_trace`.
-    pub(crate) fn with_delivery_trace(mut self, delivery_trace: DeliveryTrace) -> Self {
-        self.delivery_trace = delivery_trace;
-        self
-    }
-
     pub(crate) fn rtt(&self) -> Option<Duration> {
         self.registry
             .inner
@@ -323,79 +339,42 @@ impl PeerRegistryUpdater {
     }
 
     pub(crate) fn record_response(&self, rtt: Duration) {
-        self.registry
-            .update_connection(&self.key, |connected_peer| {
-                connected_peer.rtt = Some(rtt);
-                connected_peer.ping_sent_at = None;
-            });
-        self.record_delivery_sample(DeliverySampleKind::Ping, rtt, Instant::now());
-    }
-
-    /// Records how long the peer took, measured at `now`, to answer a ping or a block request.
-    ///
-    /// Does nothing once the connection has closed, or for a native connection, whose blocks
-    /// are not chosen this way.
-    ///
-    /// Each recorded sample is written to the connection's delivery trace.
-    pub(crate) fn record_delivery_sample(
-        &self,
-        kind: DeliverySampleKind,
-        sample: Duration,
-        now: Instant,
-    ) {
-        if !matches!(self.key, ConnectionKey::Legacy(_)) {
-            return;
-        }
+        let now = tokio::time::Instant::now();
         let mut state = self
             .registry
             .inner
             .lock()
             .expect("peer registry mutex is never poisoned");
-        if !state.active_connections.contains_key(&self.key) {
+        let Some(connected_peer) = state.active_connections.get_mut(&self.key) else {
             return;
+        };
+        connected_peer.rtt = Some(rtt);
+        connected_peer.ping_sent_at = None;
+        if matches!(self.key, ConnectionKey::Legacy(_)) {
+            state
+                .min_rtts
+                .entry(self.key.clone())
+                .or_default()
+                .record(now, rtt);
+            drop(state);
+            self.registry.rtt_waker.wake();
         }
-        let estimate = state
-            .delivery_estimates
-            .entry(self.key.clone())
-            .or_default();
-        let score_before = estimate.score();
-        estimate.record(sample, now);
-        let estimate = *estimate;
-        drop(state);
-
-        let score = estimate
-            .score()
-            .expect("an estimate that just recorded a sample has a score");
-        self.delivery_trace
-            .sample(kind, sample, score_before, score, estimate.weight());
-        self.score_waker.wake();
     }
 
-    /// Registers the task polling with `cx` to be woken the next time a delivery sample is
-    /// recorded for this connection. Only the last registered task is woken, once.
-    ///
-    /// Register before reading [`Self::delivery_score`], so that a sample recorded between the
-    /// read and the task going to sleep still wakes it.
-    pub(crate) fn notify_when_score_changes(&self, cx: &std::task::Context<'_>) {
-        self.score_waker.register(cx.waker());
+    /// Registers `cx` to wake the next time any legacy connection records a heartbeat RTT.
+    pub(crate) fn notify_when_rtt_changes(&self, cx: &Context<'_>) {
+        self.registry.rtt_waker.register(cx.waker());
     }
 
-    /// Traces that the peer announced a block and did not deliver it to a first request, or to a
-    /// second request when `second_request` is set. The score does not change.
-    pub(crate) fn trace_block_missed(&self, second_request: bool) {
-        self.delivery_trace.block_missed(second_request);
-    }
-
-    /// The expected time for this peer to answer a block request, from its recent answers, or
-    /// `None` before its first measured answer.
-    pub(crate) fn delivery_score(&self) -> Option<Duration> {
+    /// The windowed minimum heartbeat RTT for this connection as of `now`.
+    pub(crate) fn min_rtt(&self, now: tokio::time::Instant) -> Option<Duration> {
         self.registry
             .inner
             .lock()
             .expect("peer registry mutex is never poisoned")
-            .delivery_estimates
+            .min_rtts
             .get(&self.key)
-            .and_then(DeliveryEstimate::score)
+            .and_then(|window| window.min(now))
     }
 }
 
@@ -486,78 +465,35 @@ mod tests {
         assert!(registry.connected_peers().is_empty());
     }
 
-    #[test]
-    fn a_legacy_connection_s_delivery_score_lasts_as_long_as_the_connection() {
+    #[tokio::test(start_paused = true)]
+    async fn min_rtt_tracks_windowed_minimum_and_drops_with_connection() {
         let registry = PeerRegistry::default();
         let (guard, updater) = registry.register_legacy(peer(1));
-        assert_eq!(updater.delivery_score(), None);
+        assert_eq!(updater.min_rtt(tokio::time::Instant::now()), None);
 
         updater.record_response(Duration::from_millis(30));
-        assert_eq!(updater.delivery_score(), Some(Duration::from_millis(30)));
+        tokio::time::advance(Duration::from_secs(60)).await;
+        updater.record_response(Duration::from_millis(80));
+        assert_eq!(
+            updater.min_rtt(tokio::time::Instant::now()),
+            Some(Duration::from_millis(30)),
+            "a single high-jitter ping does not raise the windowed minimum"
+        );
+
+        // Once the older 30 ms sample ages past the window, the 80 ms sample takes over.
+        tokio::time::advance(ESTIMATE_WINDOW).await;
+        assert_eq!(
+            updater.min_rtt(tokio::time::Instant::now()),
+            Some(Duration::from_millis(80))
+        );
 
         drop(guard);
-        assert_eq!(updater.delivery_score(), None);
-        updater.record_delivery_sample(
-            DeliverySampleKind::Block,
-            Duration::from_millis(5),
-            Instant::now(),
-        );
+        assert_eq!(updater.min_rtt(tokio::time::Instant::now()), None);
+        updater.record_response(Duration::from_millis(5));
         assert_eq!(
-            updater.delivery_score(),
+            updater.min_rtt(tokio::time::Instant::now()),
             None,
             "a closed connection keeps no estimate"
-        );
-    }
-
-    #[tokio::test]
-    async fn delivery_samples_and_missed_blocks_are_traced() {
-        let dir = tempfile::tempdir().expect("temporary trace directory");
-        let guard = zakura_jsonl_trace::JsonlTracer::spawn_guard(dir.path().to_path_buf());
-        let registry = PeerRegistry::default();
-        let (_connection, updater) = registry.register_legacy(peer(1));
-        let updater = updater.with_delivery_trace(DeliveryTrace::new(
-            zakura_jsonl_trace::JsonlEventEmitter::new(guard.tracer(), "test-node"),
-            7,
-        ));
-
-        let now = Instant::now();
-        updater.record_delivery_sample(DeliverySampleKind::Ping, Duration::from_millis(10), now);
-        updater.record_delivery_sample(DeliverySampleKind::Block, Duration::from_millis(30), now);
-        updater.trace_block_missed(true);
-        drop(updater);
-        guard.shutdown().await;
-
-        let rows: Vec<serde_json::Value> =
-            std::fs::read_to_string(dir.path().join("delivery_score.jsonl"))
-                .expect("delivery trace is written")
-                .lines()
-                .map(|line| serde_json::from_str(line).expect("trace row is valid JSON"))
-                .collect();
-        assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0]["event"], "delivery_sample");
-        assert_eq!(rows[0]["connection_id"], 7);
-        assert_eq!(rows[0]["kind"], "ping");
-        assert_eq!(rows[0]["sample_ms"], 10);
-        assert!(
-            rows[0].get("score_before_ms").is_none(),
-            "the first sample has no earlier score"
-        );
-        assert_eq!(rows[0]["score_ms"], 10);
-        assert_eq!(rows[0]["weight"], 1.0);
-        assert_eq!(rows[1]["kind"], "block");
-        assert_eq!(rows[1]["sample_ms"], 30);
-        assert_eq!(rows[1]["score_before_ms"], 10);
-        assert_eq!(
-            rows[1]["score_ms"], 20,
-            "two equal-weight samples are averaged"
-        );
-        assert_eq!(rows[1]["weight"], 2.0);
-        assert_eq!(rows[2]["event"], "block_missed");
-        assert_eq!(rows[2]["connection_id"], 7);
-        assert_eq!(rows[2]["request"], "second");
-        assert!(
-            rows[2].get("score_ms").is_none(),
-            "a missed block leaves the score alone"
         );
     }
 

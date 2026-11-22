@@ -917,7 +917,7 @@ where
                     verify_start = std::time::Instant::now();
                     let mut rsp = verifier
                         .map_err(|error| BlockDownloadVerifyError::VerifierServiceError { error })?
-                        .call(zakura_consensus::Request::Commit(block.clone().into_block())).boxed();
+                        .call(zakura_consensus::Request::Commit(block.block.clone())).boxed();
 
                     // Add a shorter timeout to workaround a known bug (#5125)
                     let short_timeout_max = (max_checkpoint_height + FINAL_CHECKPOINT_BLOCK_VERIFY_TIMEOUT_LIMIT).unwrap_or(Height::MAX);
@@ -966,7 +966,6 @@ where
                     .record(verify_elapsed.as_secs_f64());
 
                 if verification.is_ok() {
-                    block.record_verified();
                     metrics::counter!("sync.verified.block.count").increment(1);
                 }
 

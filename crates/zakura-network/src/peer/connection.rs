@@ -49,7 +49,6 @@ use crate::{
         ClientRequest, ClientRequestReceiver, ConnectionInfo, ErrorSlot, InProgressClientRequest,
         MinimumPeerVersion, MustUseClientResponseSender, PeerError, SharedPeerError,
     },
-    peer_registry::PeerRegistryUpdater,
     peer_set::ConnectionTracker,
     protocol::{
         external::{types::Nonce, HashedBlock, InventoryHash, Message},
@@ -763,13 +762,6 @@ where
 
     /// Funds the payloads of the current client request's response until its handoff.
     response_charge: Option<InboundCharge>,
-
-    /// Where this connection records how long the peer takes to answer, for choosing block
-    /// sources. `None` when the node keeps no peer registry.
-    delivery_samples: Option<PeerRegistryUpdater>,
-
-    /// When the current client request started being written, if one is outstanding.
-    request_started_at: Option<tokio::time::Instant>,
 }
 
 impl<S, Tx, C> fmt::Debug for Connection<S, Tx, C>
@@ -883,18 +875,7 @@ where
             last_overload_time: None,
             inbound_budget,
             response_charge: None,
-            delivery_samples: None,
-            request_started_at: None,
         }
-    }
-
-    /// Makes this connection record how long the peer takes to answer in `delivery_samples`.
-    pub(super) fn with_delivery_samples(
-        mut self,
-        delivery_samples: Option<PeerRegistryUpdater>,
-    ) -> Self {
-        self.delivery_samples = delivery_samples;
-        self
     }
 
     /// Makes this connection write its block gossip to `gossip_trace`.
@@ -1054,7 +1035,6 @@ where
                         Either::Right(Some(req)) => {
                             // The request may wait for the peer writer before the state changes.
                             self.request_slot.set_busy(true);
-                            self.request_started_at = Some(tokio::time::Instant::now());
                             let span = req.span.clone();
                             self.handle_client_request(req).instrument(span).await
                         }
@@ -1107,11 +1087,6 @@ where
                         _ = tx.cancellation() => {
                             // The client receiver was dropped, so we don't need to send on `tx` here.
                             trace!(parent: &span, "client request was cancelled");
-                            let timed_out = matches!(&tx.advertised_block,
-                                Some(super::AdvertisedBlockRequest::TimedPrimary(attempt)) if attempt.timed_out_after_write());
-                            if timed_out {
-                                self.record_advertised_block_miss(Some(&super::AdvertisedBlockRequest::Primary));
-                            }
                             self.record_unanswered_block_request();
                             self.state = State::AwaitingRequest;
                             continue;
@@ -1139,7 +1114,6 @@ where
                                 }
                                 // Other request timeouts fail the request.
                                 State::AwaitingResponse { tx, .. } => {
-                                    self.record_advertised_block_miss(tx.advertised_block.as_ref());
                                     let _ = tx.send(Err(e.into()));
                                     State::AwaitingRequest
                                 }
@@ -1465,7 +1439,7 @@ where
             return None;
         };
         let (block, _) = blocks.first()?.available()?;
-        Some(block.into_served())
+        Some(block)
     }
 
     /// Writes a warm-up ping and records it as awaiting its `pong`.
@@ -1536,10 +1510,6 @@ where
             // Pushes are an option of these adverts.
             (_, AdvertiseBlock(..) | AdvertiseBlockToAll(_) | AdvertiseMinedBlock(_) | PushBlock(..)) => {
                 Ok(Handler::Finished(Err(PeerError::AdvertRequiresDedicatedService)))
-            }
-            // The peer set picks the peer for a hedge and sends it an ordinary `BlocksByHash`.
-            (_, BlockByHashPrimary { .. } | BlockByHashHedge { .. }) => {
-                Ok(Handler::Finished(Err(PeerError::HedgeRequiresPeerSet)))
             }
             (Failed, request) => panic!(
                 "failed connection cannot handle new request: {:?}, client_receiver: {:?}",
@@ -1688,11 +1658,6 @@ where
         // Update the connection state with a new handler, or fail with an error.
         match new_handler {
             Ok(handler) => {
-                if let Some(super::AdvertisedBlockRequest::TimedPrimary(attempt)) =
-                    &tx.advertised_block
-                {
-                    attempt.legacy_request_written();
-                }
                 self.state = AwaitingResponse { handler, span, tx };
                 self.request_timer = Some(Box::pin(sleep(constants::REQUEST_TIMEOUT)));
             }
@@ -2021,7 +1986,7 @@ where
         let tmp_state = std::mem::replace(&mut self.state, State::Failed);
 
         if let State::AwaitingResponse {
-            handler: Handler::Finished(mut response),
+            handler: Handler::Finished(response),
             tx,
             span,
         } = tmp_state
@@ -2045,19 +2010,6 @@ where
 
             if matches!(response, Ok(Response::Blocks(_))) {
                 self.request_slot.set_block_request_unanswered(false);
-            }
-            // Capture transfer time here. Only the verifier can credit this particular body.
-            let started = self.request_started_at.take();
-            if let Ok(reply @ Response::Blocks(_)) = &mut response {
-                if let Some(started) = started {
-                    reply.observe_block_delivery(
-                        &self.request_slot,
-                        self.delivery_samples.clone(),
-                        started.elapsed(),
-                    );
-                }
-            } else {
-                self.record_advertised_block_miss(tx.advertised_block.as_ref());
             }
 
             let _ = tx.send(response.map_err(Into::into));
@@ -2199,8 +2151,7 @@ where
                 for block in blocks.into_iter() {
                     match block {
                         Available((block, _)) => {
-                            let (message, hash, pending_send) =
-                                legacy_block_message(block.into_served());
+                            let (message, hash, pending_send) = legacy_block_message(block);
                             match self
                                 .peer_tx
                                 .send_authorized(message, || true, pending_send)
@@ -2412,16 +2363,6 @@ impl<S, Tx, C> Connection<S, Tx, C>
 where
     Tx: Sink<Message, Error = SerializationError> + Unpin,
 {
-    /// Record a dispatched advertiser's miss before another request can update the same slot.
-    fn record_advertised_block_miss(&self, advertised: Option<&super::AdvertisedBlockRequest>) {
-        if let Some(route) = advertised {
-            self.request_slot.mark_announced_block_missed();
-            if let Some(registry) = &self.delivery_samples {
-                registry.trace_block_missed(*route == super::AdvertisedBlockRequest::Hedge);
-            }
-        }
-    }
-
     /// Update the connection state metrics for this connection,
     /// using `extra_state_info` as additional state information.
     ///
@@ -2536,9 +2477,6 @@ where
             // Accessing the error slot locks a threaded std::sync::Mutex, which
             // can block the current async task thread. We briefly lock the mutex
             // to clone the error.
-            if !tx.is_canceled() {
-                self.record_advertised_block_miss(tx.advertised_block.as_ref());
-            }
             let _ = tx.send(Err(error.clone()));
         }
 

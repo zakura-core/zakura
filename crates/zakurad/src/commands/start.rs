@@ -743,7 +743,6 @@ impl StartCmd {
                     setup_rx,
                 )
                 .with_pending_blocks(pending_blocks.clone())
-                .with_second_block_request(config.network.block_download_score_and_hedge.enabled)
                 .with_trace(template_path_trace.clone()),
                 MAX_INBOUND_RESPONSE_TIME,
             ),

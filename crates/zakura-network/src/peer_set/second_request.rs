@@ -1,55 +1,50 @@
-//! When to send a second request for a gossiped block that a first request has not delivered.
+//! Event-driven hedging and arrival estimation for gossiped legacy block downloads.
 //!
-//! The first request for a block goes to whichever idle peer announced it first, which from a
-//! node far from most miners is usually a far peer. A closer peer often announces the same block
-//! a few tens of milliseconds later. Asking it as well wins if its expected answer time, from
-//! now, is clearly shorter than what is left of the first request's. Otherwise the second copy
-//! would only cost bandwidth, because a legacy block request cannot be cancelled.
-//!
-//! The downloader shares the first dispatch with the peer set for each individual attempt, and
-//! asks for a second request once. The peer set holds that request (see
-//! [`HeldSecondRequest`]) and decides again only when an input to the decision changes:
+//! When a legacy block download starts, the peer set dispatches the primary request to the
+//! selected announcer and holds one optional second request internally while the download is
+//! open. The peer set re-evaluates held requests only when an input changes:
 //!
 //! - another peer announces the block;
-//! - an announcer becomes a better source: its connection is free again, which is also when
-//!   an unanswered block mark clears, a missed block mark clears or expires, or its expected
-//!   answer time is measured again;
-//! - the first request becomes overdue, and later stalls (see [`decision_times`]).
+//! - an announcer becomes free, records a new heartbeat RTT, or finishes a block transfer;
+//! - an announcer's missed-block cooldown or slow-rate entry expires;
+//! - the first request becomes overdue, stalls, or its hedge window closes.
 //!
-//! Between those events a candidate can only look worse, because the time left on the first
-//! request only shrinks.
+//! Dropping the caller's response future (for example, on dual-stack fallback to native peers or
+//! download cancellation) closes the internal oneshot receiver and withdraws the held request.
 
 use std::{task::Context, time::Duration};
 
-use futures::future::BoxFuture;
+use futures::{future::BoxFuture, FutureExt};
 use tokio::{sync::oneshot, time::Instant};
 use zakura_chain::block;
 
-use crate::{BlockHedge, BoxError, NoFasterBlockSource, Response};
+use crate::{BoxError, InventoryResponse, PeerSocketAddr, Response};
 
-/// The least a candidate must be expected to beat the first request by, so that small errors
-/// in the expected answer times do not send second requests that lose.
+/// How long after dispatching a primary request the peer set may send a second request.
+pub(super) const HEDGE_WINDOW: Duration = Duration::from_secs(5);
+
+/// Minimum lead a faster announcer must promise over the first request to justify a second copy.
 const MIN_MARGIN: Duration = Duration::from_millis(20);
 
-/// The share of the first peer's expected answer time a candidate must also beat it by.
+/// Share of the first peer's expected time that a faster announcer must also beat it by.
 const MARGIN_SHARE: u32 = 4;
 
-/// How long past its expected answer time a first request may run before it counts as stalled.
-///
-/// Measured from the expected time rather than from the request, so a far peer's normal download
-/// is not half a stall. A candidate clearly faster than the first peer is already asked by the
-/// prediction, so a stall only catches a request that has gone wrong. On the mainnet experiment
-/// nodes, first requests passed this point on 3.0% of blocks in Singapore and 0.1-0.3% in
-/// Amsterdam and New York; twice the expected time would have caught 2.6-13% of them, mostly
-/// nearby peers a few milliseconds late.
+/// How long past its expected arrival time a first request may run before it counts as stalled.
 const STALL_SLACK: Duration = Duration::from_millis(500);
+
+/// Minimum block size that always updates a peer's observed transfer rate.
+const MIN_RATE_SAMPLE_BYTES: u64 = 64 * 1024;
+
+/// Minimum transfer duration beyond RTT that updates a peer's transfer rate even on small blocks,
+/// catching peers that answer pings quickly but stall on block bodies.
+const MIN_RATE_SAMPLE_TRANSFER: Duration = Duration::from_millis(10);
 
 /// Why a second request was sent.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SecondRequestReason {
     /// Another announcer was expected to deliver the block clearly before the first request.
     Predicted,
-    /// The first request ran well past its expected answer time.
+    /// The first request ran well past its expected arrival time.
     Stalled,
 }
 
@@ -63,28 +58,24 @@ impl SecondRequestReason {
     }
 }
 
-/// How long after the first request was sent waiting alone changes the decision: when the
-/// first request becomes overdue, and when it counts as stalled.
-///
-/// Before the first, the time left on the first request only shrinks, so a candidate that does
-/// not qualify now will not qualify by waiting. Between the two, nothing changes with time.
+/// Elapsed times after primary dispatch at which waiting alone can flip a refusal into a hedge:
+/// when the first request becomes overdue, and when it stalls.
 fn decision_times(first_score: Duration) -> [Duration; 2] {
     [first_score, first_score + STALL_SLACK]
 }
 
-/// Decides whether to send a second request for a block.
+/// Returns true once the first request has run past its stall threshold.
+pub(super) fn is_stalled(first_score: Duration, waited: Duration) -> bool {
+    waited >= first_score + STALL_SLACK
+}
+
+/// Decides whether to send a second request to a measured candidate announcer.
 ///
-/// - `first_score` is the first peer's expected answer time when it was asked. A first peer
-///   with no measured answers gets no second request, because there is nothing to compare a
-///   candidate with;
-/// - `waited` is how long the first request has been outstanding;
-/// - `best_candidate_score` is the expected answer time of the fastest eligible, measured second announcer.
-///
-/// A candidate is compared with what is left of the first peer's expected time, or, once the first
-/// request is overdue, with all of it (see the comment in the body for why).
-///
-/// Returns `None` when the first request is still expected to arrive sooner, or when no other
-/// announcer is known to be faster and the first request has not stalled.
+/// Before `first_score`, the candidate must beat the remaining expected time by at least
+/// `max(20 ms, first_score / 4)`. Once overdue (`waited >= first_score`), the block is likely
+/// larger than expected or congested, so the candidate is compared against the full `first_score`
+/// plus margin. At `first_score + 500 ms` the first request counts as stalled and any candidate
+/// qualifies.
 pub(super) fn second_request_reason(
     first_score: Duration,
     waited: Duration,
@@ -95,17 +86,6 @@ pub(super) fn second_request_reason(
         return Some(SecondRequestReason::Stalled);
     }
 
-    // An overdue first request is probably fetching a block larger than the ones its score was
-    // measured on. A legacy `inv` carries no block size, and the first peer's score comes mostly
-    // from pings, so it covers the peer's distance but not the time to transfer a large block.
-    // Counting down to zero would then refuse every candidate until the stall point.
-    //
-    // This came from a load test on the asia-scored mainnet node (Singapore), with blocks of
-    // about 1.5 MB. At heights 3,586,323, 3,586,329 and 3,586,330 the first peer was expected
-    // to answer in 242 ms but took 388-605 ms. Same-city peers expected to answer in 2-5 ms
-    // announced 193-196 ms after the first request, when less than the margin was left, so no
-    // second request was sent. Once the first request is overdue, a candidate is compared with
-    // the first peer's whole expected time instead, as if the first request were starting over.
     let remaining = if waited >= overdue_after {
         first_score
     } else {
@@ -115,76 +95,186 @@ pub(super) fn second_request_reason(
     (best_candidate_score + margin < remaining).then_some(SecondRequestReason::Predicted)
 }
 
-/// The result a download awaits for its second request.
+/// Computes `rtt + ceil(bytes / rate_bps)` in nanoseconds without overflow.
+///
+/// When `bytes == 0` or no transfer rate is available, returns pure `rtt`.
+pub(super) fn arrival_duration(rtt: Duration, bytes: u64, rate_bps: Option<u64>) -> Duration {
+    let Some(rate_bps) = rate_bps.filter(|&r| r > 0 && bytes > 0) else {
+        return rtt;
+    };
+    let transfer_ns = u128::from(bytes)
+        .saturating_mul(1_000_000_000)
+        .div_ceil(u128::from(rate_bps));
+    let total_ns = rtt.as_nanos().saturating_add(transfer_ns);
+    Duration::from_nanos(u64::try_from(total_ns).unwrap_or(u64::MAX))
+}
+
+/// Derives an incoming transfer rate (bytes/sec) from an idle-dispatched block delivery,
+/// ignoring tiny fast blocks whose jitter would distort bandwidth estimates.
+pub(super) fn sample_rate_bps(block_bytes: u64, elapsed: Duration, rtt: Duration) -> Option<u64> {
+    if block_bytes == 0 {
+        return None;
+    }
+    let transfer = elapsed.saturating_sub(rtt);
+    if block_bytes < MIN_RATE_SAMPLE_BYTES && transfer < MIN_RATE_SAMPLE_TRANSFER {
+        return None;
+    }
+    let transfer_ns = transfer.max(Duration::from_millis(1)).as_nanos();
+    let rate = u128::from(block_bytes).saturating_mul(1_000_000_000) / transfer_ns;
+    Some(u64::try_from(rate).unwrap_or(u64::MAX).max(1))
+}
+
+/// Overflow-safe median of `vals`.
+pub(super) fn median_u128(vals: &mut [u128]) -> Option<u128> {
+    if vals.is_empty() {
+        return None;
+    }
+    vals.sort_unstable();
+    let mid = vals.len() / 2;
+    if vals.len().is_multiple_of(2) {
+        Some(vals[mid - 1] / 2 + vals[mid] / 2 + (vals[mid - 1] % 2 + vals[mid] % 2) / 2)
+    } else {
+        Some(vals[mid])
+    }
+}
+
+/// The response future of one block request.
 pub(super) type SecondResponse = BoxFuture<'static, Result<Response, BoxError>>;
 
-/// A download's request for a second copy of its block, held by the peer set until an announcer
-/// qualifies or the download stops accepting a second request.
+/// An internal second block request held by the peer set while its primary is outstanding.
 pub(super) struct HeldSecondRequest {
-    hash: block::Hash,
-    attempt: BlockHedge,
-    /// Hands the peer's response future to the download once the request is sent.
+    pub(super) hash: block::Hash,
+    pub(super) first_peer: PeerSocketAddr,
+    pub(super) first_score: Duration,
+    pub(super) dispatched_at: Instant,
+    window_end: Instant,
     reply: oneshot::Sender<SecondResponse>,
+    pub(super) span: tracing::Span,
 }
 
 impl HeldSecondRequest {
-    /// Returns the held request and a future that resolves to the peer's response, or
-    /// `NoFasterBlockSource` if the request is dropped before dispatch.
-    pub(super) fn new(hash: block::Hash, attempt: BlockHedge) -> (Self, SecondResponse) {
-        let (reply, response) = oneshot::channel();
+    /// Creates a held second request paired with the receiver awaited by [`race_block_request`].
+    pub(super) fn new(
+        hash: block::Hash,
+        first_peer: PeerSocketAddr,
+        first_score: Duration,
+        dispatched_at: Instant,
+    ) -> (Self, oneshot::Receiver<SecondResponse>) {
+        let (reply, receiver) = oneshot::channel();
         let held = Self {
             hash,
-            attempt,
+            first_peer,
+            first_score,
+            dispatched_at,
+            window_end: dispatched_at + HEDGE_WINDOW,
             reply,
+            span: tracing::Span::current(),
         };
-        let response = Box::pin(async move {
-            let dispatched = response.await.map_err(|_| NoFasterBlockSource)?;
-            dispatched.await
-        });
-        (held, response)
+        (held, receiver)
     }
 
-    /// The block to request.
-    pub(super) fn hash(&self) -> block::Hash {
-        self.hash
+    /// Returns whether the download still accepts a second request, registering `cx` to wake if
+    /// the primary finishes or the caller drops the download future.
+    pub(super) fn poll_open(&mut self, cx: &mut Context<'_>, now: Instant) -> bool {
+        now < self.window_end && self.reply.poll_closed(cx).is_pending()
     }
 
-    /// The download this request belongs to.
-    pub(super) fn attempt(&self) -> &BlockHedge {
-        &self.attempt
+    /// The next overdue, stall, or window-close deadline strictly after `considered_at`.
+    pub(super) fn next_decision_after(&self, considered_at: Instant) -> Instant {
+        decision_times(self.first_score)
+            .into_iter()
+            .map(|after| self.dispatched_at + after)
+            .find(|at| *at > considered_at)
+            .map_or(self.window_end, |at| at.min(self.window_end))
     }
 
-    /// Returns whether the download still accepts a second request: its window is open and it
-    /// is still waiting for the response.
-    ///
-    /// While it does, registers the task polling with `cx` to be woken when the download stops
-    /// waiting.
-    pub(super) fn poll_open(&mut self, cx: &mut Context<'_>) -> bool {
-        self.attempt.elapsed_if_open().is_some() && self.reply.poll_closed(cx).is_pending()
-    }
-
-    /// Hands the download the response of the second request that was just sent.
+    /// Hands the dispatched second request's response future to the racing primary future.
     pub(super) fn send(self, response: SecondResponse) {
-        // A download that stopped waiting since `poll_open` no longer needs the response.
         let _ = self.reply.send(response);
     }
 }
 
-/// The first request's next overdue or stall deadline after `considered_at`, capped by the
-/// window end. An announcer's miss can bring the next decision forward.
-pub(super) fn next_decision_after(attempt: &BlockHedge, considered_at: Instant) -> Instant {
-    let window_end = attempt.window_end();
-    let Some(first) = attempt.first_dispatch() else {
-        return window_end;
-    };
-    let Some(first_score) = first.score else {
-        return window_end;
-    };
-    decision_times(first_score)
-        .into_iter()
-        .map(|after| first.at + after)
-        .find(|at| *at > considered_at)
-        .map_or(window_end, |at| at.min(window_end))
+/// Returns true when `result` carries the single requested block `hash`.
+pub(super) fn is_usable_block(hash: block::Hash, result: &Result<Response, BoxError>) -> bool {
+    matches!(
+        result,
+        Ok(Response::Blocks(blocks))
+            if matches!(
+                blocks.as_slice(),
+                [InventoryResponse::Available((block, _))] if block.hash() == hash
+            )
+    )
+}
+
+/// Races a primary block request against an optional second request dispatched by the peer set.
+///
+/// The first reply that delivers the requested block wins. Dropping this future (including on
+/// dual-stack timeout or download cancellation) drops `hedge`, withdrawing any unsent hedge.
+pub(super) fn race_block_request(
+    hash: block::Hash,
+    mut first: SecondResponse,
+    mut hedge: oneshot::Receiver<SecondResponse>,
+) -> SecondResponse {
+    async move {
+        let mut second = tokio::select! {
+            biased;
+            first_result = &mut first => {
+                if is_usable_block(hash, &first_result) {
+                    if let Ok(second) = hedge.try_recv() {
+                        tokio::spawn(async move {
+                            let _ = second.await;
+                        });
+                    }
+                    return first_result;
+                }
+                match hedge.try_recv() {
+                    Ok(second) => {
+                        let second_result = second.await;
+                        if is_usable_block(hash, &second_result) {
+                            metrics::counter!("gossip.hedge.won.count").increment(1);
+                            return second_result;
+                        }
+                        return first_result;
+                    }
+                    Err(_) => return first_result,
+                }
+            }
+            dispatched = &mut hedge => match dispatched {
+                Ok(second) => second,
+                Err(_) => return first.await,
+            },
+        };
+
+        tokio::select! {
+            biased;
+            first_result = &mut first => {
+                if is_usable_block(hash, &first_result) {
+                    tokio::spawn(async move {
+                        let _ = second.await;
+                    });
+                    return first_result;
+                }
+                let second_result = second.await;
+                if is_usable_block(hash, &second_result) {
+                    metrics::counter!("gossip.hedge.won.count").increment(1);
+                    second_result
+                } else {
+                    first_result
+                }
+            }
+            second_result = &mut second => {
+                if is_usable_block(hash, &second_result) {
+                    metrics::counter!("gossip.hedge.won.count").increment(1);
+                    tokio::spawn(async move {
+                        let _ = first.await;
+                    });
+                    return second_result;
+                }
+                first.await
+            }
+        }
+    }
+    .boxed()
 }
 
 #[cfg(test)]
@@ -197,8 +287,6 @@ mod tests {
 
     #[test]
     fn a_clearly_faster_announcer_is_asked() {
-        // The first peer should answer in 230 ms; 70 ms in, a peer expected to take 50 ms
-        // would deliver about 110 ms sooner.
         assert_eq!(
             second_request_reason(ms(230), ms(70), ms(50)),
             Some(SecondRequestReason::Predicted)
@@ -207,16 +295,12 @@ mod tests {
 
     #[test]
     fn an_announcer_that_is_not_clearly_faster_is_not_asked() {
-        // 160 ms are left, and the candidate's 120 ms plus the 57 ms margin is more.
         assert_eq!(second_request_reason(ms(230), ms(70), ms(120)), None);
-        // A fast first peer leaves little to win.
         assert_eq!(second_request_reason(ms(40), ms(20), ms(5)), None);
     }
 
     #[test]
     fn the_margin_is_at_least_twenty_milliseconds() {
-        // A quarter of 40 ms is 10 ms, so the 20 ms minimum applies: 5 + 20 is not under the
-        // 25 ms left after 15 ms, but is under the 26 ms left after 14 ms.
         assert_eq!(second_request_reason(ms(40), ms(15), ms(5)), None);
         assert_eq!(
             second_request_reason(ms(40), ms(14), ms(5)),
@@ -226,27 +310,14 @@ mod tests {
 
     #[test]
     fn an_overdue_first_request_is_compared_with_its_whole_expected_time() {
-        // From the asia-scored load test: a far peer expected in 242 ms was still sending a
-        // 1.5 MB block when same-city peers expected in 3 ms announced.
-        assert_eq!(
-            second_request_reason(ms(242), ms(195), ms(3)),
-            None,
-            "before it is overdue, only 47 ms are left, less than the 3 ms plus a 60 ms margin"
-        );
+        assert_eq!(second_request_reason(ms(242), ms(195), ms(3)), None);
         assert_eq!(
             second_request_reason(ms(242), ms(242), ms(3)),
-            Some(SecondRequestReason::Predicted),
-            "once overdue, 3 ms plus the margin is well under the whole 242 ms"
+            Some(SecondRequestReason::Predicted)
         );
-        assert_eq!(
-            second_request_reason(ms(242), ms(300), ms(190)),
-            None,
-            "a candidate about as far away is still not asked"
-        );
+        assert_eq!(second_request_reason(ms(242), ms(300), ms(190)), None);
     }
 
-    /// A held second request is reconsidered at the decision times instead of on a short
-    /// interval, so waiting must not turn a refusal into a request at any other time.
     #[test]
     fn waiting_alone_changes_the_decision_only_at_the_decision_times() {
         let first_score = ms(242);
@@ -267,37 +338,30 @@ mod tests {
         }
     }
 
-    /// The timer is armed after the decision, so it must count from the time of the decision.
-    /// Counted from the time of arming, a first request that became overdue in between would
-    /// not be considered again until it stalled.
     #[tokio::test(start_paused = true)]
     async fn a_decision_time_that_arrives_while_deciding_is_not_skipped() {
-        let attempt = BlockHedge::new(Instant::now());
         let sent_at = Instant::now();
-        attempt
-            .dispatch_if_needed(None, Some(ms(242)), || ())
-            .expect("an open download accepts its first request");
-
+        let (held, _rx) = HeldSecondRequest::new(
+            block::Hash([1; 32]),
+            "127.0.0.1:8233".parse().unwrap(),
+            ms(242),
+            sent_at,
+        );
         let considered_at = sent_at + ms(241);
         tokio::time::advance(ms(243)).await;
+        assert_eq!(held.next_decision_after(considered_at), sent_at + ms(242));
         assert_eq!(
-            next_decision_after(&attempt, considered_at),
-            sent_at + ms(242),
-            "the overdue time passed after the decision, so it is still due"
-        );
-        assert_eq!(
-            next_decision_after(&attempt, sent_at + ms(242)),
+            held.next_decision_after(sent_at + ms(242)),
             sent_at + ms(742)
         );
         assert_eq!(
-            next_decision_after(&attempt, sent_at + ms(742)),
-            attempt.window_end()
+            held.next_decision_after(sent_at + ms(742)),
+            sent_at + HEDGE_WINDOW
         );
     }
 
     #[test]
     fn stall_threshold_is_inclusive_for_measured_candidates() {
-        // A stall is 500 ms past the expected time, however fast or slow the first peer.
         assert_eq!(second_request_reason(ms(230), ms(729), ms(900)), None);
         assert_eq!(
             second_request_reason(ms(230), ms(730), ms(900)),
@@ -308,10 +372,30 @@ mod tests {
             second_request_reason(ms(5), ms(505), ms(900)),
             Some(SecondRequestReason::Stalled)
         );
-        assert_eq!(second_request_reason(ms(800), ms(1299), ms(900)), None);
+    }
+
+    #[test]
+    fn arrival_separates_rtt_and_transfer_time() {
+        // 242 ms RTT + 1.5 MB at 5 MB/s = 242 ms + 300 ms = 542 ms.
         assert_eq!(
-            second_request_reason(ms(800), ms(1300), ms(900)),
-            Some(SecondRequestReason::Stalled)
+            arrival_duration(ms(242), 1_500_000, Some(5_000_000)),
+            ms(542)
         );
+        // Without a block size or rate, arrival equals pure RTT.
+        assert_eq!(arrival_duration(ms(242), 0, Some(5_000_000)), ms(242));
+        assert_eq!(arrival_duration(ms(242), 1_500_000, None), ms(242));
+    }
+
+    #[test]
+    fn rate_sampling_skips_tiny_fast_blocks_and_catches_throttled_peers() {
+        // Small fast block: 10 KB in 244 ms on a 242 ms peer -> ignored.
+        assert_eq!(sample_rate_bps(10_000, ms(244), ms(242)), None);
+        // Large block: 1.5 MB in 542 ms on a 242 ms peer -> 5 MB/s.
+        assert_eq!(
+            sample_rate_bps(1_500_000, ms(542), ms(242)),
+            Some(5_000_000)
+        );
+        // Small block served slowly by a low-RTT peer: 10 KB in 405 ms on a 5 ms peer -> 25 KB/s.
+        assert_eq!(sample_rate_bps(10_000, ms(405), ms(5)), Some(25_000));
     }
 }

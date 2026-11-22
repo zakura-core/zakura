@@ -167,11 +167,12 @@ where
     blocks.into_iter().find_map(|block| match block {
         InventoryResponse::Available((body, _))
             if body
-                .pending_send()
+                .pending_send
+                .as_ref()
                 .is_none_or(|permit| permit.attempt_checksum().is_none())
                 && body.hash() == hash =>
         {
-            Some(body.into_block())
+            Some(body.block)
         }
         _ => None,
     })

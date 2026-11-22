@@ -111,7 +111,6 @@ impl Node {
             }));
 
         let downloads = Box::pin(Downloads::new(
-            crate::components::test_misbehavior::reporter(),
             MAX_INBOUND_CONCURRENCY,
             false,
             network,

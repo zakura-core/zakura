@@ -224,12 +224,6 @@ impl PeerGossipTrace {
         self.connection_id
     }
 
-    /// A trace of this connection's delivery samples, written to the same trace directory and
-    /// with the same `connection_id`.
-    pub(crate) fn delivery_trace(&self) -> crate::peer_registry::DeliveryTrace {
-        crate::peer_registry::DeliveryTrace::new(self.emitter.clone(), self.connection_id)
-    }
-
     /// The peer announced the block `hash` to us.
     ///
     /// Written for the first [`TRACED_ANNOUNCEMENTS_PER_WINDOW`] announcements of each

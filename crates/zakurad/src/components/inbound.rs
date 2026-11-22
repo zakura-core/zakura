@@ -399,9 +399,6 @@ pub struct Inbound {
     /// Early-advertised mined blocks waiting for contextual commit.
     pending_blocks: PendingBlockRegistry,
 
-    /// Whether a gossiped block can also be requested from a second announcer expected to
-    /// deliver it sooner.
-    second_block_request: bool,
     /// Shares the node's bounded writer for local-submission wait traces.
     trace: zakura_jsonl_trace::JsonlEventEmitter,
 }
@@ -433,7 +430,6 @@ impl Inbound {
                 zcashd_compat_peer_ips,
             )),
             pending_blocks: PendingBlockRegistry::default(),
-            second_block_request: false,
             trace: zakura_jsonl_trace::JsonlEventEmitter::noop(),
         }
     }
@@ -441,13 +437,6 @@ impl Inbound {
     /// Shares one pending-block registry with the mining RPCs.
     pub fn with_pending_blocks(mut self, pending_blocks: PendingBlockRegistry) -> Self {
         self.pending_blocks = pending_blocks;
-        self
-    }
-
-    /// Lets a gossiped block also be requested from a second announcer the peer set expects to
-    /// deliver it sooner. See `[network.block_download_score_and_hedge] enabled`.
-    pub fn with_second_block_request(mut self, enabled: bool) -> Self {
-        self.second_block_request = enabled;
         self
     }
 
@@ -502,7 +491,6 @@ impl Service<zn::Request> for Inbound {
 
                     let block_downloads = Box::pin(
                         BlockDownloads::new(
-                            misbehavior.clone(),
                             full_verify_concurrency_limit,
                             self.expose_peer_addresses,
                             Timeout::new(block_download_peer_set, BLOCK_DOWNLOAD_TIMEOUT),
@@ -511,7 +499,6 @@ impl Service<zn::Request> for Inbound {
                             latest_chain_tip,
                             network,
                         )
-                        .with_second_block_request(self.second_block_request)
                         .with_pending_blocks(self.pending_blocks.clone())
                         .with_trace(self.trace.clone()),
                     );
@@ -570,10 +557,16 @@ impl Service<zn::Request> for Inbound {
                         continue;
                     };
 
-                    // Each candidate's height was checked and attributed at receipt. A mismatch
-                    // reaches this stream only if the download ended without an eligible body.
-                    // Retry because announcements for this hash were deduplicated while it ran.
+                    // A rewritten coinbase height on a tip child is rejected before the block
+                    // reaches the verifier, so `block_misbehavior` cannot classify it. Score the
+                    // supplier and re-request because announcements for this hash were
+                    // deduplicated while the download ran.
                     if let Some(mismatch) = err.downcast_ref::<GossipedTipChildHeightMismatch>() {
+                        if let Some(advertiser_addr) = advertiser_addr {
+                            misbehavior
+                                .report(advertiser_addr, zn::constants::MAX_PEER_MISBEHAVIOR_SCORE);
+                        }
+
                         // A failed parent recovery is left to the syncer. A re-request would
                         // leave the recovery bounds, because it is an ordinary download.
                         if !mismatch.parent_recovery {
@@ -687,7 +680,7 @@ impl Service<zn::Request> for Inbound {
                 let state = state.clone();
 
                 async move {
-                    let mut blocks: Vec<InventoryResponse<(zn::DeliveredBlock, Option<PeerSocketAddr>), block::Hash>> = Vec::new();
+                    let mut blocks: Vec<InventoryResponse<(ServedBlock, Option<PeerSocketAddr>), block::Hash>> = Vec::new();
                     let mut total_size = 0;
                     let mut state_lookup_bytes = 0;
                     let mut lookup_results = Vec::new();
@@ -737,7 +730,7 @@ impl Service<zn::Request> for Inbound {
                             Some((block, size)) => {
                                 total_size += size;
 
-                                blocks.push(Available((block.into(), None)))
+                                blocks.push(Available((block, None)))
                             },
                             // We don't need to limit the size of the missing block IDs list,
                             // because it is already limited to the size of the getdata request
@@ -902,7 +895,6 @@ impl Service<zn::Request> for Inbound {
                     .boxed()
             }
             zn::Request::DisconnectPeer(_) => unreachable!("disconnect requests are local to the peer set"),
-            zn::Request::BlockByHashPrimary { .. } | zn::Request::BlockByHashHedge { .. } => unreachable!("block download coordination is local to the peer set"),
             zn::Request::Ping(_) => {
                 unreachable!("ping requests are handled internally");
             }

@@ -1812,54 +1812,19 @@ impl ZakuraPeerHandle {
         payload: Vec<u8>,
         started: Option<tokio::sync::oneshot::Sender<()>>,
     ) -> Result<ResponseFrames, BoxError> {
-        self.request_frame(
-            stream_kind,
-            request_id,
-            Frame {
+        let (completion, completed) = oneshot::channel();
+        self.sender
+            .send(ZakuraOutboundFrame::Request {
+                stream_kind,
+                request_id,
                 message_type,
                 flags,
                 payload,
-            },
-            started,
-            None,
-        )
-        .await
-    }
-
-    /// Hand a request to the peer once its queue has space. Reserving first lets a
-    /// competing download finish during backpressure without sending a stale request.
-    pub(super) async fn request_frame(
-        &self,
-        stream_kind: u16,
-        request_id: u64,
-        frame: Frame,
-        started: Option<tokio::sync::oneshot::Sender<()>>,
-        attempt: Option<&crate::BlockHedge>,
-    ) -> Result<ResponseFrames, BoxError> {
-        let Frame {
-            message_type,
-            flags,
-            payload,
-        } = frame;
-        let (completion, completed) = oneshot::channel();
-        let frame = ZakuraOutboundFrame::Request {
-            stream_kind,
-            request_id,
-            message_type,
-            flags,
-            payload,
-            started,
-            completion,
-        };
-        let slot = self
-            .sender
-            .reserve()
+                started,
+                completion,
+            })
             .await
             .map_err(|_| -> BoxError { "Zakura outbound peer queue closed".into() })?;
-        match attempt {
-            Some(attempt) => attempt.dispatch_if_needed(None, None, || slot.send(frame))?,
-            None => slot.send(frame),
-        }
         completed
             .await
             .map_err(|_| -> BoxError { "Zakura outbound completion dropped".into() })?
@@ -14094,7 +14059,7 @@ mod tests {
                     let InventoryResponse::Available((block, None)) = &blocks[0] else {
                         panic!("the available block remains shared");
                     };
-                    let BlockHandle::Shared(block) = &**block else {
+                    let BlockHandle::Shared(block) = &block.block else {
                         panic!("decoded block is shared");
                     };
                     assert!(Arc::ptr_eq(block, &decoded_block.unwrap()));

@@ -43,7 +43,7 @@ fn inbound_with(
                 .into_iter()
                 .map(|hash| {
                     if hash == block.hash() {
-                        InventoryResponse::Available((block.clone().into(), None))
+                        InventoryResponse::Available((block.clone(), None))
                     } else {
                         InventoryResponse::Missing(hash)
                     }
@@ -191,8 +191,7 @@ async fn warmup_ignores_a_trusted_body_before_validation() {
         };
         async move {
             Ok(Response::Blocks(vec![InventoryResponse::Available((
-                body.into(),
-                None,
+                body, None,
             ))]))
         }
     });

@@ -64,7 +64,7 @@ fn rank_gateways(ranking: &MinerGatewayRanking, local_node_id: NodeId) -> Vec<Ra
             .then_with(|| a.gateway_id.cmp(&b.gateway_id))
     });
     let mut seen = HashSet::new();
-    gateways
+    let mut ranked: Vec<_> = gateways
         .into_iter()
         .filter(|gateway| seen.insert(gateway.gateway_id))
         .filter_map(|gateway| {
@@ -75,8 +75,13 @@ fn rank_gateways(ranking: &MinerGatewayRanking, local_node_id: NodeId) -> Vec<Ra
                 standing: GatewayStanding::Unmatched,
             })
         })
-        .take(MAX_RANKED_GATEWAYS)
-        .collect()
+        .collect();
+    // Admission resolves cutoff ties against the live authenticated connections.
+    if let Some(cutoff) = ranked.get(MAX_RANKED_GATEWAYS - 1) {
+        let keep = ranked.partition_point(|gateway| gateway.blocks >= cutoff.blocks);
+        ranked.truncate(keep);
+    }
+    ranked
 }
 
 /// The latest ranking the node handed the dialer, converted once per change.
@@ -159,7 +164,8 @@ pub(super) async fn classify_gateways(
         }
     };
 
-    let unresolved: Vec<NodeId> = ranked
+    let (candidates, tied) = ranked.split_at(ranked.len().min(MAX_RANKED_GATEWAYS));
+    let unresolved: Vec<NodeId> = candidates
         .iter()
         .filter(|gateway| local_standing(gateway).is_none())
         .map(|gateway| gateway.node)
@@ -172,7 +178,7 @@ pub(super) async fn classify_gateways(
     let mut book_answers = book_answers.into_iter();
 
     let mut classified = ClassifiedGateways::default();
-    for gateway in ranked {
+    for gateway in candidates {
         let standing = local_standing(gateway).unwrap_or_else(|| {
             let target = book_answers
                 .next()
@@ -189,6 +195,7 @@ pub(super) async fn classify_gateways(
             ..*gateway
         });
     }
+    classified.ranking.extend_from_slice(tied);
     classified
 }
 

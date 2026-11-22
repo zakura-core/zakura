@@ -1183,30 +1183,6 @@ checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
 [[package]]
 name = "zakura-quic"
 version = "1.1.0"
-dependencies = [
- "bytes",
- "curve25519-dalek",
- "futures",
- "hex",
- "libc",
- "libcrux-ml-kem",
- "metrics",
- "quinn-proto",
- "ring",
- "rustls",
- "rustls-pki-types",
- "serde",
- "socket2",
- "thiserror",
- "tokio",
- "tracing",
- "zakura-rt 0.4.0",
- "zeroize",
-]
-
-[[package]]
-name = "zakura-quic"
-version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ca05b2e4b35fb4ed8b70cb7d5aa28770f86bf46d9b16957487cd7895d7cc031d"
 dependencies = [
@@ -1230,13 +1206,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "zakura-quic"
+version = "1.2.0"
+dependencies = [
+ "bytes",
+ "curve25519-dalek",
+ "futures",
+ "hex",
+ "libc",
+ "libcrux-ml-kem",
+ "metrics",
+ "quinn-proto",
+ "ring",
+ "rustls",
+ "rustls-pki-types",
+ "serde",
+ "socket2",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "zakura-rt 0.4.0",
+ "zeroize",
+]
+
+[[package]]
 name = "zakura-quic-compat"
 version = "0.0.0"
 dependencies = [
  "futures",
  "tokio",
  "zakura-quic 1.1.0",
- "zakura-quic 1.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "zakura-quic 1.2.0",
 ]
 
 [[package]]

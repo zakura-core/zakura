@@ -250,6 +250,7 @@ async fn dial_authenticates_both_sides_and_echoes() {
         let client = client();
         let conn = client.connect(server.addr(), &[ALPN]).await.unwrap();
         assert_eq!(conn.remote_id(), server.endpoint.local_id());
+        assert_eq!(conn.remote_key(), server.endpoint.local_id().key());
         assert_eq!(conn.alpn(), ALPN);
         assert_eq!(conn.admitted_ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert!(conn.source_validated(), "this node dialed the address");
@@ -261,6 +262,7 @@ async fn dial_authenticates_both_sides_and_echoes() {
 
         let inbound = server.handled.recv().await.unwrap();
         assert_eq!(inbound.remote_id(), client.local_id());
+        assert_eq!(inbound.remote_key(), client.local_id().key());
         assert!(!inbound.source_validated(), "no Retry validated the source");
         let seen = server.seen.lock().unwrap().clone();
         assert_eq!(seen.len(), 1);
@@ -1928,8 +1930,9 @@ async fn client_presenting_a_key_it_cannot_sign_for_is_refused() {
     tokio::time::timeout(TEST_TIMEOUT, async {
         let mut server = server();
         let victim = NodeSecretKey::generate().public();
-        let cert =
-            rustls_pki_types::CertificateDer::from(crate::tls::ed25519_spki(&victim).to_vec());
+        let cert = rustls_pki_types::CertificateDer::from(
+            crate::tls::ed25519_spki(&victim.key()).to_vec(),
+        );
         let key = Arc::new(rustls::sign::CertifiedKey::new(
             vec![cert],
             Arc::new(Impostor(NodeSecretKey::generate())),

@@ -151,6 +151,19 @@ class AffectedSemverPackagesTest(unittest.TestCase):
 
         self.assertEqual(affected, ["zakura-header-chain", "dependent"])
 
+    def test_excludes_quic_but_checks_its_dependents(self):
+        packages = [
+            self.package("zakura-quic"),
+            self.package("zakura-network", dependencies=[self.dependency("zakura-quic")]),
+        ]
+
+        affected = affected_semver_packages.affected_publishable_packages(
+            self.metadata(packages),
+            changed_files=["zakura-quic/src/key.rs"],
+        )
+
+        self.assertEqual(affected, ["zakura-network"])
+
     def test_new_mmr_crate_still_selects_its_dependents(self):
         packages = [
             self.package("zakura-mmr-tree"),

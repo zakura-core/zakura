@@ -23,7 +23,7 @@ use rustls_pki_types::{alg_id, SubjectPublicKeyInfoDer, UnixTime};
 
 use crate::{
     inputs::EndpointInputs,
-    key::{NodeId, NodeSecretKey, KEY_LENGTH},
+    key::{NodeId, NodeKey, NodeSecretKey, KEY_LENGTH},
 };
 
 pub(crate) mod hybrid;
@@ -164,8 +164,9 @@ impl TlsConfig {
         Ok(crypto)
     }
 
-    /// Builds a client config that accepts only `expected` as the server
-    /// (TLS-7) and offers `alpns` in preference order.
+    /// Builds a client config that accepts only a server whose credential
+    /// derives the node ID `expected` (TLS-7), and offers `alpns` in
+    /// preference order.
     pub(crate) fn client_config(
         &self,
         expected: NodeId,
@@ -210,28 +211,38 @@ fn production_provider() -> rustls::crypto::CryptoProvider {
 }
 
 /// The DER SubjectPublicKeyInfo for an Ed25519 key, as Iroh encodes it (TLS-3).
-pub(crate) fn ed25519_spki(key: &NodeId) -> SubjectPublicKeyInfoDer<'static> {
+pub(crate) fn ed25519_spki(key: &NodeKey) -> SubjectPublicKeyInfoDer<'static> {
     rustls::sign::public_key_to_spki(&alg_id::ED25519, key.as_bytes())
 }
 
-/// Extracts the node ID from an Ed25519 SubjectPublicKeyInfo.
+/// Extracts the key from an Ed25519 SubjectPublicKeyInfo.
 ///
 /// Returns `None` unless `spki` is exactly the constant Ed25519 prefix
 /// followed by a valid 32-byte key.
-pub(crate) fn node_id_from_spki(spki: &[u8]) -> Option<NodeId> {
-    let key = spki.get(spki.len().checked_sub(KEY_LENGTH)?..)?;
-    let id = NodeId::try_from(key).ok()?;
-    (ed25519_spki(&id).as_ref() == spki).then_some(id)
+pub(crate) fn node_key_from_spki(spki: &[u8]) -> Option<NodeKey> {
+    let bytes = spki.get(spki.len().checked_sub(KEY_LENGTH)?..)?;
+    let key = NodeKey::try_from(bytes).ok()?;
+    (ed25519_spki(&key).as_ref() == spki).then_some(key)
 }
 
-/// Returns the TLS-proven node ID of a connection's peer (TLS-8).
+/// Derives the node ID a TLS credential names (TLS-8).
+///
+/// This is the one place a credential becomes a node ID: the client verifier
+/// compares its result with the dialed ID, and both endpoints report it as
+/// the peer's ID. Today the credential is an Ed25519 key and the ID is that
+/// key.
+pub(crate) fn node_id_from_credential(spki: &[u8]) -> Option<NodeId> {
+    node_key_from_spki(spki).map(NodeId::from)
+}
+
+/// Returns the node ID a connection's peer proved in the TLS handshake (TLS-8).
 pub(crate) fn remote_node_id(session: &dyn quinn_proto::crypto::Session) -> Option<NodeId> {
     let certs = session
         .peer_identity()?
         .downcast::<Vec<rustls_pki_types::CertificateDer<'static>>>()
         .ok()?;
     match certs.as_slice() {
-        [cert] => node_id_from_spki(cert.as_ref()),
+        [cert] => node_id_from_credential(cert.as_ref()),
         _ => None,
     }
 }
@@ -270,24 +281,24 @@ mod tests {
 
     #[test]
     fn spki_matches_iroh_encoding() {
-        let id = NodeSecretKey::from_bytes(&[7; 32]).public();
-        let spki = ed25519_spki(&id);
+        let key = NodeSecretKey::from_bytes(&[7; 32]).public_key();
+        let spki = ed25519_spki(&key);
         // 30 2a 30 05 06 03 2b 65 70 03 21 00 || key (TLS-3).
         assert_eq!(
             &spki.as_ref()[..12],
             &[0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00]
         );
-        assert_eq!(&spki.as_ref()[12..], id.as_bytes());
-        assert_eq!(node_id_from_spki(spki.as_ref()), Some(id));
+        assert_eq!(&spki.as_ref()[12..], key.as_bytes());
+        assert_eq!(node_key_from_spki(spki.as_ref()), Some(key));
     }
 
     #[test]
     fn spki_with_another_prefix_is_refused() {
-        let id = NodeSecretKey::from_bytes(&[7; 32]).public();
-        let mut spki = ed25519_spki(&id).as_ref().to_vec();
+        let key = NodeSecretKey::from_bytes(&[7; 32]).public_key();
+        let mut spki = ed25519_spki(&key).as_ref().to_vec();
         spki[8] = 0x71; // Ed448's OID byte.
-        assert_eq!(node_id_from_spki(&spki), None);
-        assert_eq!(node_id_from_spki(id.as_bytes()), None);
+        assert_eq!(node_key_from_spki(&spki), None);
+        assert_eq!(node_key_from_spki(key.as_bytes()), None);
     }
 
     /// A random source that always fills with 7s.

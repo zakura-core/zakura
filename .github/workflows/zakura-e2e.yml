@@ -237,8 +237,9 @@ jobs:
 
   zakura-regtest-e2e:
     name: Zakura regtest e2e (${{ matrix.zakura-mode }})
-    # The long four-node docker stack runs only on the nightly schedule and on
-    # demand. PRs and the merge queue use the trimmed pr-gate job above.
+    # The long four-node docker stack and the five-node mixed-version stack run
+    # only on the nightly schedule and on demand. PRs and the merge queue use the
+    # trimmed pr-gate job above.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     permissions:
       contents: read
@@ -254,6 +255,8 @@ jobs:
           - no-checkpoint-long
           - restart-matrix
           - header-faults
+          # Downloads the latest release (pinned SHA256) for the old cohort.
+          - mixed-version
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:

@@ -29,16 +29,14 @@ pub(crate) use announced_blocks::AnnouncedBlocks;
 
 use client::{ClientRequestReceiver, InProgressClientRequest, MustUseClientResponseSender};
 
-pub(crate) use client::{AdvertisedBlockRequest, CancelHeartbeatTask, ClientRequest, RequestSlot};
+pub(crate) use client::{CancelHeartbeatTask, ClientRequest};
 
 pub use client::Client;
 pub use connection::Connection;
 pub(crate) use connection::ConnectionRequests;
 pub(crate) use connector::disable_nagle;
 pub use connector::{Connector, OutboundConnectorRequest};
-pub use error::{
-    ErrorSlot, HandshakeError, NoFasterBlockSource, NotFoundClass, PeerError, SharedPeerError,
-};
+pub use error::{ErrorSlot, HandshakeError, NotFoundClass, PeerError, SharedPeerError};
 pub use handshake::{ConnectedAddr, ConnectionInfo, Handshake, HandshakeRequest};
 pub use load_tracked_client::LoadTrackedClient;
 pub use minimum_peer_version::MinimumPeerVersion;

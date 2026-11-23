@@ -11,14 +11,6 @@ use crate::{
     zakura::{ZakuraProtocolError, ZakuraUpgradeError},
 };
 
-/// The answer to a [`BlockByHashHedge`](crate::Request::BlockByHashHedge) request whose window
-/// closed without a second request: until then, no other peer that announced the block was
-/// expected to deliver it clearly sooner than the first request, and the first request had not
-/// stalled. No peer was contacted.
-#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
-#[error("no peer is expected to deliver the block sooner than the first request")]
-pub struct NoFasterBlockSource;
-
 /// A wrapper around `Arc<PeerError>` that implements `Error`.
 ///
 /// The second field is a [`NotFoundClass`] discriminant computed at construction, so callers can
@@ -142,11 +134,6 @@ pub enum PeerError {
     #[error("block adverts require the dedicated block advert service")]
     AdvertRequiresDedicatedService,
 
-    /// A block hedge request was sent to a single connection. Only the peer set can pick the
-    /// peer for a hedge, because it knows which peers announced the block and are idle.
-    #[error("block hedge requests require the peer set")]
-    HedgeRequiresPeerSet,
-
     /// This peer request's caused an internal service timeout, so the connection was dropped
     /// to shed load or prevent attacks.
     #[error("Internal services timed out")]
@@ -214,7 +201,6 @@ impl PeerError {
             PeerError::Overloaded => "Overloaded".into(),
             PeerError::NoReadyPeers => "NoReadyPeers".into(),
             PeerError::AdvertRequiresDedicatedService => "AdvertRequiresDedicatedService".into(),
-            PeerError::HedgeRequiresPeerSet => "HedgeRequiresPeerSet".into(),
             PeerError::InboundTimeout => "InboundTimeout".into(),
             PeerError::ServiceShutdown => "ServiceShutdown".into(),
             PeerError::NotFoundResponse(_) => "NotFoundResponse".into(),

@@ -7,17 +7,14 @@ use serde::{Deserialize, Serialize};
 /// When a block is announced by more than one idle peer, the node draws two of them at random
 /// and asks one. By default it asks the one whose recent requests are less loaded. When enabled:
 ///
-/// - it asks the one expected to answer sooner, from how long each peer has recently taken to
-///   answer pings and block requests. The node records missed announcements in either mode, but
-///   only when enabled does it pass over an announcer that missed, until a later body from the
-///   same connection verifies or 10 minutes elapse;
-/// - a block that the first request has not delivered yet is also requested from one other idle
-///   peer that announced it, but only when that peer is expected to deliver it clearly sooner
-///   than the first, or when the first request has run well past its expected time. Both peers
-///   must have measured answer times. The first reply that passes the requested-hash and
-///   tip-child height checks is tried first. If its height falls outside the local window or
-///   verification rejects its commitments or duplicate transactions, the node tries the other
-///   already-requested copy once.
+/// - it estimates each peer's arrival time from its 10-minute windowed minimum heartbeat RTT
+///   plus transfer time (`last_block_bytes / rate_in`), falling back to live fleet medians for
+///   unmeasured peers, and passes over announcers that failed to deliver an announced block
+///   within the last 10 minutes (cleared once they deliver a block);
+/// - while a gossiped block's first request is outstanding, the peer set holds one optional
+///   second request internally and dispatches it on peer events or discrete deadlines when
+///   another idle announcer is expected to deliver clearly sooner, or when the first request
+///   stalls past its expected arrival time.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct BlockDownloadScoreAndHedgeConfig {

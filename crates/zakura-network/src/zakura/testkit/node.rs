@@ -58,17 +58,6 @@ impl ZakuraTestNode {
         self.endpoint.supervisor()
     }
 
-    /// Wrap a test legacy service with the node's production dual-stack inventory router.
-    pub fn dual_stack_inventory(
-        &self,
-        legacy: tower::util::BoxCloneService<crate::Request, crate::Response, BoxError>,
-    ) -> tower::util::BoxCloneService<crate::Request, crate::Response, BoxError> {
-        tower::util::BoxCloneService::new(crate::zakura::ZakuraDualStackService::new_with_trace(
-            legacy, self.supervisor(), true, ZakuraTrace::noop(),
-            Config::default().zakura.stream_open_rate_per_second,
-        ))
-    }
-
     /// Clone the underlying endpoint for test-only external drivers.
     #[cfg(test)]
     pub(crate) fn endpoint(&self) -> ZakuraEndpoint {

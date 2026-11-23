@@ -236,7 +236,6 @@ impl Harness {
         tip_sender.set_finalized_tip(tip_block);
 
         let downloads = Downloads::new(
-            crate::components::test_misbehavior::reporter(),
             MAX_INBOUND_CONCURRENCY,
             false,
             network,

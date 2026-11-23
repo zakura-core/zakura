@@ -385,11 +385,18 @@ impl BlockGossipPeer {
         self.registry.as_ref().and_then(PeerRegistryUpdater::rtt)
     }
 
-    /// The expected time for this peer to answer a block request, from its recent answers.
-    pub(crate) fn delivery_score(&self) -> Option<Duration> {
+    /// The connection's windowed minimum heartbeat RTT, if measured within the current window.
+    pub(crate) fn min_rtt(&self, now: tokio::time::Instant) -> Option<Duration> {
         self.registry
             .as_ref()
-            .and_then(PeerRegistryUpdater::delivery_score)
+            .and_then(|registry| registry.min_rtt(now))
+    }
+
+    /// Registers `cx` to wake when any legacy connection records a new heartbeat RTT.
+    pub(crate) fn notify_when_rtt_changes(&self, cx: &std::task::Context<'_>) {
+        if let Some(registry) = &self.registry {
+            registry.notify_when_rtt_changes(cx);
+        }
     }
 
     /// Advertises `broadcast`'s block to this peer, then tracks the upload the peer requests.

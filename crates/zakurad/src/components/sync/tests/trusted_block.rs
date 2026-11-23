@@ -1015,7 +1015,7 @@ async fn faulty_trusted_block_over_v2_compatibility_is_rejected_without_legacy_i
     assert!(receiver
         .verifier
         .clone()
-        .oneshot(VerifyRequest::Commit(fetched.clone().into_block()))
+        .oneshot(VerifyRequest::Commit(fetched.block.clone()))
         .await
         .is_err());
     let verified = timeout(Duration::from_secs(20), receiver.gate.finished.recv())

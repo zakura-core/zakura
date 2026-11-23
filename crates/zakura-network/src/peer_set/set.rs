@@ -131,15 +131,18 @@ use crate::{
     constants::MIN_PEER_SET_LOG_INTERVAL,
     peer::{
         block_gossip::{AdvertFanout, BlockGossipPeer},
-        AdvertisedBlockRequest, LoadTrackedClient, MinimumPeerVersion, NoFasterBlockSource,
+        LoadTrackedClient, MinimumPeerVersion,
     },
+    peer_registry::ESTIMATE_WINDOW,
     peer_set::{
         legacy_peer_trace::{
             BlockRequestRoute, BlockSourceChoice, LegacyPeerTrace, PeerTraceContext,
             SecondRequestChoice,
         },
         second_request::{
-            next_decision_after, second_request_reason, HeldSecondRequest, SecondResponse,
+            arrival_duration, is_stalled, is_usable_block, median_u128, race_block_request,
+            sample_rate_bps, second_request_reason, HeldSecondRequest, SecondRequestReason,
+            SecondResponse,
         },
         stall_tracker::FindResponseStallTracker,
         unready_service::{Error as UnreadyError, UnreadyService},
@@ -210,6 +213,31 @@ fn classify_find_response<E>(result: &Result<Response, E>) -> Option<StallOutcom
         Ok(_) => None,
         Err(_) => Some(StallOutcome::Stall),
     }
+}
+
+/// Outcome of a routed single-block request, fed back into [`PeerSet`] without cross-thread
+/// locks so transfer rates and announced-block misses stay single-owner.
+enum BlockFeedback {
+    Delivered {
+        peer: PeerSocketAddr,
+        connection_id: u64,
+        idle_at_dispatch: bool,
+        elapsed: Duration,
+        block_bytes: u64,
+        at: tokio::time::Instant,
+    },
+    Missed {
+        peer: PeerSocketAddr,
+        connection_id: u64,
+        at: tokio::time::Instant,
+    },
+}
+
+/// Fleet-wide median RTT and incoming block rate across currently measured ready peers.
+#[derive(Clone, Copy, Debug, Default)]
+struct ReadyMedians {
+    rtt: Option<Duration>,
+    rate_bps: Option<u64>,
 }
 
 /// A [`tower::Service`] that abstractly represents "the rest of the network".
@@ -291,10 +319,12 @@ where
     cancel_handles: HashMap<D::Key, oneshot::Sender<CancelClientWork>>,
 
     /// Transaction requests waiting for a busy advertiser, oldest first. See
-    /// [`Self::route_held_tx_requests`].
+    /// [`Self::route_held_requests`].
     held_tx_requests: VecDeque<HeldTxRequest>,
-    /// Wakes the owner at the earliest deadline in `held_tx_requests`.
-    held_tx_timer: Option<Pin<Box<tokio::time::Sleep>>>,
+
+    /// Single shared timer waking the owner at the earliest deadline across held block hedges
+    /// and held transaction requests.
+    held_timer: Option<Pin<Box<Sleep>>>,
 
     // Peer Validation
     //
@@ -345,15 +375,26 @@ where
     /// them sooner. See [`crate::config::BlockDownloadScoreAndHedgeConfig`].
     block_download_score_and_hedge: bool,
 
-    /// Second block requests that downloads asked for and that no announcer qualifies for yet.
-    ///
-    /// Each is considered again whenever maintenance runs, and leaves once it is sent or its
-    /// download stops accepting one. Only the local block downloader adds to this, one request
-    /// per gossiped block download, so its concurrency limit bounds the length.
+    /// Internal second block requests held while their primary requests are outstanding.
     held_second_requests: Vec<HeldSecondRequest>,
 
-    /// Wakes the owner at the earliest deadline among the held second requests.
-    second_request_timer: Option<Pin<Box<Sleep>>>,
+    /// Latest observed incoming block transfer rate (bytes/sec) per peer connection, valid for
+    /// [`ESTIMATE_WINDOW`].
+    peer_rates: HashMap<PeerSocketAddr, (u64, tokio::time::Instant, u64)>,
+
+    /// Expiry instant until which an announcer that failed to deliver an announced block is
+    /// passed over by scored routing, keyed by peer address and connection generation.
+    announced_block_misses: HashMap<PeerSocketAddr, (u64, tokio::time::Instant)>,
+
+    /// Decoded byte size of the most recently delivered block, used with per-peer transfer rates
+    /// to estimate transfer time when legacy `inv` messages omit block size.
+    last_block_bytes: u64,
+
+    /// Receives delivery and miss outcomes from routed single-block request futures.
+    block_feedback_rx: tokio_mpsc::UnboundedReceiver<BlockFeedback>,
+
+    /// Producer clones handed to routed single-block request wrappers.
+    block_feedback_tx: tokio_mpsc::UnboundedSender<BlockFeedback>,
 
     /// The network of this peer set.
     network: Network,
@@ -412,6 +453,7 @@ where
         max_conns_per_ip: Option<usize>,
     ) -> Self {
         let (stall_event_tx, stall_event_rx) = tokio_mpsc::unbounded_channel();
+        let (block_feedback_tx, block_feedback_rx) = tokio_mpsc::unbounded_channel();
         Self {
             // New peers
             discover,
@@ -442,7 +484,7 @@ where
             unready_services: FuturesUnordered::new(),
             cancel_handles: HashMap::new(),
             held_tx_requests: VecDeque::new(),
-            held_tx_timer: None,
+            held_timer: None,
 
             // Peer validation
             minimum_peer_version,
@@ -460,7 +502,11 @@ where
             expose_peer_addresses: config.expose_peer_addresses,
             block_download_score_and_hedge: config.block_download_score_and_hedge.enabled,
             held_second_requests: Vec::new(),
-            second_request_timer: None,
+            peer_rates: HashMap::new(),
+            announced_block_misses: HashMap::new(),
+            last_block_bytes: 0,
+            block_feedback_rx,
+            block_feedback_tx,
 
             network: config.network.clone(),
         }
@@ -554,8 +600,9 @@ where
         self.unready_services = FuturesUnordered::new();
 
         // Dropping held requests fails their waiting callers.
+        self.held_second_requests.clear();
         self.held_tx_requests.clear();
-        self.held_tx_timer = None;
+        self.held_timer = None;
 
         // Close the MorePeers channel for all senders,
         // so we don't add more peers to a shut down peer set.
@@ -1213,25 +1260,161 @@ where
         (nth(idxs.index(0)), nth(idxs.index(1)))
     }
 
-    /// The expected time for the ready peer `key` to answer a block request, if measured.
-    fn delivery_score(&self, key: &D::Key) -> Option<Duration> {
-        self.ready_services
-            .get(key)
-            .and_then(|svc| svc.block_gossip.delivery_score())
+    /// Returns true if `peer` is still live on the connection generation `connection_id`.
+    fn is_current_peer_connection(&self, peer: &PeerSocketAddr, connection_id: u64) -> bool {
+        if let Some(svc) = self.ready_services.get(peer) {
+            svc.connection_id() == connection_id
+        } else {
+            self.cancel_handles.contains_key(peer)
+        }
     }
 
-    /// Draws two random peers from `peers` and returns the one expected to answer sooner.
-    ///
-    /// A peer whose answers have not been measured loses to one whose have. If neither has
-    /// been measured, the first drawn wins, which is already a random choice.
-    fn select_p2c_peer_by_delivery_score(&self, peers: &HashSet<D::Key>) -> Option<D::Key> {
+    /// Drains block delivery and miss outcomes from completed single-block requests.
+    fn drain_block_feedback(&mut self, cx: &mut Context<'_>) {
+        while let Poll::Ready(Some(event)) = self.block_feedback_rx.poll_recv(cx) {
+            match event {
+                BlockFeedback::Delivered {
+                    peer,
+                    connection_id,
+                    idle_at_dispatch,
+                    elapsed,
+                    block_bytes,
+                    at,
+                } => {
+                    if block_bytes > 0 {
+                        self.last_block_bytes = block_bytes;
+                    }
+                    if !self.is_current_peer_connection(&peer, connection_id) {
+                        continue;
+                    }
+                    if self
+                        .announced_block_misses
+                        .get(&peer)
+                        .is_some_and(|(id, missed_at)| *id == connection_id && at >= *missed_at)
+                    {
+                        self.announced_block_misses.remove(&peer);
+                    }
+                    if idle_at_dispatch {
+                        let rtt = self
+                            .block_gossip_peers
+                            .get(&peer)
+                            .and_then(|gossip| gossip.min_rtt(at))
+                            .unwrap_or(Duration::ZERO);
+                        if let Some(rate_bps) = sample_rate_bps(block_bytes, elapsed, rtt) {
+                            self.peer_rates.insert(peer, (connection_id, at, rate_bps));
+                        }
+                    }
+                }
+                BlockFeedback::Missed {
+                    peer,
+                    connection_id,
+                    at,
+                } => {
+                    if self.is_current_peer_connection(&peer, connection_id)
+                        && self
+                            .announced_block_misses
+                            .get(&peer)
+                            .is_none_or(|(id, missed_at)| *id != connection_id || *missed_at <= at)
+                    {
+                        self.announced_block_misses
+                            .insert(peer, (connection_id, at));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Returns the miss cooldown expiry for `peer` if its current connection still has an active
+    /// announced-block miss.
+    fn miss_expiry(
+        &self,
+        peer: &PeerSocketAddr,
+        connection_id: u64,
+        now: tokio::time::Instant,
+    ) -> Option<tokio::time::Instant> {
+        self.announced_block_misses
+            .get(peer)
+            .filter(|(id, _)| *id == connection_id)
+            .map(|(_, missed_at)| *missed_at + ESTIMATE_WINDOW)
+            .filter(|expiry| *expiry > now)
+    }
+
+    /// Returns `(rate_bps, expiry)` for `peer`'s current connection if a fresh rate exists.
+    fn peer_rate(
+        &self,
+        peer: &PeerSocketAddr,
+        connection_id: u64,
+        now: tokio::time::Instant,
+    ) -> Option<(u64, tokio::time::Instant)> {
+        self.peer_rates
+            .get(peer)
+            .filter(|(id, at, _)| {
+                *id == connection_id && now.saturating_duration_since(*at) <= ESTIMATE_WINDOW
+            })
+            .map(|(_, at, rate)| (*rate, *at + ESTIMATE_WINDOW))
+    }
+
+    /// Computes fleet-wide median RTT and incoming transfer rate across measured ready peers.
+    fn ready_medians(&self, now: tokio::time::Instant) -> ReadyMedians {
+        let mut rtts: Vec<u128> = self
+            .ready_services
+            .values()
+            .filter_map(|svc| svc.block_gossip.min_rtt(now).map(|d| d.as_nanos()))
+            .collect();
+        let mut rates: Vec<u128> = self
+            .ready_services
+            .iter()
+            .filter_map(|(addr, svc)| {
+                self.peer_rate(addr, svc.connection_id(), now)
+                    .map(|(rate, _)| u128::from(rate))
+            })
+            .collect();
+        ReadyMedians {
+            rtt: median_u128(&mut rtts)
+                .map(|ns| Duration::from_nanos(u64::try_from(ns).unwrap_or(u64::MAX))),
+            rate_bps: median_u128(&mut rates).map(|r| u64::try_from(r).unwrap_or(u64::MAX)),
+        }
+    }
+
+    /// Expected arrival duration for one block from `svc`, falling back to `medians` for missing
+    /// terms. Returns `None` only when neither this peer nor any ready peer has an RTT sample.
+    fn expected_arrival_for(
+        &self,
+        key: &PeerSocketAddr,
+        svc: &LoadTrackedClient,
+        now: tokio::time::Instant,
+        medians: ReadyMedians,
+    ) -> Option<Duration> {
+        let rtt = svc.block_gossip.min_rtt(now).or(medians.rtt)?;
+        let rate_bps = self
+            .peer_rate(key, svc.connection_id(), now)
+            .map(|(rate, _)| rate)
+            .or(medians.rate_bps);
+        Some(arrival_duration(rtt, self.last_block_bytes, rate_bps))
+    }
+
+    /// Draws two random peers from `peers` and returns the one expected to arrive sooner.
+    fn select_p2c_peer_by_arrival(
+        &self,
+        peers: &HashSet<D::Key>,
+        now: tokio::time::Instant,
+        medians: ReadyMedians,
+    ) -> Option<D::Key> {
         match peers.len() {
             0 => None,
             1 => peers.iter().next().copied(),
             len => {
                 let (a, b) = Self::sample_two(peers, len);
-                let selected = match (self.delivery_score(&a), self.delivery_score(&b)) {
-                    (Some(a_score), Some(b_score)) if b_score < a_score => b,
+                let a_est = self
+                    .ready_services
+                    .get(&a)
+                    .and_then(|svc| self.expected_arrival_for(&a, svc, now, medians));
+                let b_est = self
+                    .ready_services
+                    .get(&b)
+                    .and_then(|svc| self.expected_arrival_for(&b, svc, now, medians));
+                let selected = match (a_est, b_est) {
+                    (Some(a_arr), Some(b_arr)) if b_arr < a_arr => b,
                     (None, Some(_)) => b,
                     _ => a,
                 };
@@ -1244,44 +1427,49 @@ where
     ///
     /// Among the advertisers that are preferred block sources, it draws two at random and takes
     /// the less loaded one, or, with `[network.block_download_score_and_hedge]` enabled, the one
-    /// expected to answer sooner. Falls back to load-based P2C over all `advertisers` if none is preferred.
-    ///
-    /// A ready client only has space in its request channel. If its connection is awaiting a
-    /// response to an earlier request, such as a transaction `getdata`, a block request sent to it
-    /// waits for that response. Load does not capture this: an advertiser with a lower round-trip
-    /// estimate can be less loaded even with a request outstanding.
+    /// expected to arrive sooner. Falls back to load-based P2C over all `advertisers` if none is
+    /// preferred.
     fn select_block_advertiser(
         &self,
         advertisers: &HashSet<D::Key>,
+        now: tokio::time::Instant,
+        medians: ReadyMedians,
     ) -> Option<(D::Key, BlockSourceChoice)> {
         let preferred_advertisers: HashSet<D::Key> = advertisers
             .iter()
             .filter(|key| {
-                self.ready_services
-                    .get(*key)
-                    // Passing over a peer that missed an announced block is part of block
-                    // source scoring, so with scoring off routing matches the default.
-                    .is_some_and(|svc| {
-                        svc.is_preferred_block_source(self.block_download_score_and_hedge)
-                    })
+                self.ready_services.get(*key).is_some_and(|svc| {
+                    svc.is_preferred_block_source()
+                        && !(self.block_download_score_and_hedge
+                            && self.miss_expiry(key, svc.connection_id(), now).is_some())
+                })
             })
             .copied()
             .collect();
 
         let peer = if self.block_download_score_and_hedge {
-            self.select_p2c_peer_by_delivery_score(&preferred_advertisers)
+            self.select_p2c_peer_by_arrival(&preferred_advertisers, now, medians)
         } else {
             self.select_p2c_peer_from_list(&preferred_advertisers)
         }
         .or_else(|| self.select_busy_block_advertiser(advertisers))?;
 
+        let score = self
+            .ready_services
+            .get(&peer)
+            .and_then(|svc| self.expected_arrival_for(&peer, svc, now, medians));
+        let best_score = preferred_advertisers
+            .iter()
+            .filter_map(|key| {
+                self.ready_services
+                    .get(key)
+                    .and_then(|svc| self.expected_arrival_for(key, svc, now, medians))
+            })
+            .min();
         let choice = BlockSourceChoice {
             candidates: preferred_advertisers.len(),
-            score: self.delivery_score(&peer),
-            best_score: preferred_advertisers
-                .iter()
-                .filter_map(|key| self.delivery_score(key))
-                .min(),
+            score,
+            best_score,
         };
         if choice.candidates >= 2 {
             metrics::counter!("pool.route_inv.score.choices.count").increment(1);
@@ -1307,26 +1495,53 @@ where
         peer
     }
 
-    /// Hand one inventory request to a ready peer and return the client to the peer set.
-    /// For a racing block download this records the peer and dispatch time on that attempt.
-    fn dispatch_inventory(
-        &mut self,
+    /// Wraps a routed single-block response future to trace its completion and report delivery or
+    /// miss feedback back to the peer set.
+    #[allow(clippy::too_many_arguments)]
+    fn wrap_block_response(
+        &self,
+        fut: <LoadTrackedClient as Service<Request>>::Future,
         peer: PeerSocketAddr,
-        mut svc: LoadTrackedClient,
-        req: Request,
-        attempt: Option<&crate::BlockHedge>,
-        advertised: Option<AdvertisedBlockRequest>,
-    ) -> Result<<LoadTrackedClient as Service<Request>>::Future, BoxError> {
-        let response = match attempt {
-            Some(attempt) => {
-                attempt.dispatch_if_needed(Some(peer), svc.block_gossip.delivery_score(), || {
-                    svc.call_routed(req, advertised)
-                })
+        connection_id: u64,
+        trace_peer: PeerTraceContext,
+        hash: block::Hash,
+        route: BlockRequestRoute,
+        idle_at_dispatch: bool,
+        advertised: bool,
+        started: tokio::time::Instant,
+    ) -> SecondResponse {
+        let request_id = self.legacy_peer_trace.next_request_id();
+        let trace = self.legacy_peer_trace.clone();
+        let feedback_tx = self.block_feedback_tx.clone();
+        async move {
+            let result = fut.await;
+            let at = tokio::time::Instant::now();
+            let elapsed = at.saturating_duration_since(started);
+            trace.block_request_finish(request_id, trace_peer, hash, route, elapsed, &result);
+            let mapped = result.map_err(Into::into);
+            if is_usable_block(hash, &mapped) {
+                if let Ok(Response::Blocks(blocks)) = &mapped {
+                    if let Some((block, _)) = blocks[0].available() {
+                        let _ = feedback_tx.send(BlockFeedback::Delivered {
+                            peer,
+                            connection_id,
+                            idle_at_dispatch,
+                            elapsed,
+                            block_bytes: block.decoded_bytes(),
+                            at,
+                        });
+                    }
+                }
+            } else if advertised {
+                let _ = feedback_tx.send(BlockFeedback::Missed {
+                    peer,
+                    connection_id,
+                    at,
+                });
             }
-            None => Ok(svc.call_routed(req, advertised)),
-        };
-        self.push_unready(peer, svc);
-        response
+            mapped
+        }
+        .boxed()
     }
 
     /// Randomly chooses `max_peers` ready services, ignoring service load.
@@ -1467,7 +1682,7 @@ where
     /// falling back to a ready peer that isn't missing the inventory.
     ///
     /// A transaction request whose advertisers are all busy waits for one of them instead, see
-    /// [`Self::route_held_tx_requests`]. Another peer usually doesn't have the transaction yet.
+    /// [`Self::route_held_requests`]. Another peer usually doesn't have the transaction yet.
     ///
     /// If all ready peers are missing the inventory,
     /// returns a synthetic [`NotFoundRegistry`](PeerError::NotFoundRegistry) error.
@@ -1477,7 +1692,6 @@ where
         &mut self,
         req: Request,
         hash: InventoryHash,
-        attempt: Option<crate::BlockHedge>,
     ) -> <Self as tower::Service<Request>>::Future {
         let advertising_peer_list = self
             .inventory_registry
@@ -1485,6 +1699,13 @@ where
             .filter(|&addr| self.ready_services.contains_key(addr))
             .copied()
             .collect();
+
+        let now = tokio::time::Instant::now();
+        let medians = if matches!(hash, InventoryHash::Block(_)) {
+            self.ready_medians(now)
+        } else {
+            ReadyMedians::default()
+        };
 
         // # Security
         //
@@ -1496,12 +1717,12 @@ where
         // so that a peer can't provide all our inventory responses.
         let (peer, choice) = match hash {
             InventoryHash::Block(_) => self
-                .select_block_advertiser(&advertising_peer_list)
+                .select_block_advertiser(&advertising_peer_list, now, medians)
                 .map_or((None, None), |(peer, choice)| (Some(peer), Some(choice))),
             _ => (self.select_p2c_peer_from_list(&advertising_peer_list), None),
         };
 
-        if let Some(svc) = peer.and_then(|key| self.take_ready_service(&key)) {
+        if let Some(mut svc) = peer.and_then(|key| self.take_ready_service(&key)) {
             let peer = peer.expect("just checked peer is Some");
             tracing::trace!(
                 ?hash,
@@ -1509,44 +1730,25 @@ where
                 "routing to a peer which advertised inventory"
             );
             metrics::counter!("pool.route_inv.advertiser.count").increment(1);
-            let trace_context = match hash {
-                InventoryHash::Block(hash) => Some((
-                    self.legacy_peer_trace.next_request_id(),
-                    self.legacy_peer_trace_context(peer, &svc),
-                    hash,
-                    Instant::now(),
-                )),
-                _ => None,
-            };
-            let fut = match self.dispatch_inventory(
-                peer,
-                svc,
-                req,
-                attempt.as_ref(),
-                matches!(hash, InventoryHash::Block(_)).then(|| match &attempt {
-                    Some(attempt) => AdvertisedBlockRequest::TimedPrimary(attempt.clone()),
-                    None => AdvertisedBlockRequest::Primary,
-                }),
-            ) {
-                Ok(fut) => fut,
-                Err(error) => return async { Err(error) }.boxed(),
-            };
-            if let Some((request_id, peer, hash, started)) = trace_context {
-                let trace = self.legacy_peer_trace.clone();
+            let idle_at_dispatch = svc.can_send_request_now();
+            let connection_id = svc.connection_id();
+            let trace_peer = self.legacy_peer_trace_context(peer, &svc);
+            let fut = svc.call(req);
+            self.push_unready(peer, svc);
+            if let InventoryHash::Block(block_hash) = hash {
                 let choice = choice.unwrap_or_default();
-                return async move {
-                    let result = fut.await;
-                    trace.block_request_finish(
-                        request_id,
-                        peer,
-                        hash,
-                        BlockRequestRoute::Advertised(choice),
-                        started.elapsed(),
-                        &result,
-                    );
-                    result.map_err(Into::into)
-                }
-                .boxed();
+                let primary = self.wrap_block_response(
+                    fut,
+                    peer,
+                    connection_id,
+                    trace_peer,
+                    block_hash,
+                    BlockRequestRoute::Advertised(choice),
+                    idle_at_dispatch,
+                    true,
+                    now,
+                );
+                return self.maybe_hedge_block(block_hash, peer, choice.score, now, primary);
             }
             return fut.map_err(Into::into).boxed();
         }
@@ -1558,7 +1760,29 @@ where
             return self.hold_tx_request(req, hash);
         }
 
-        self.route_inv_to_any_peer(req, hash, attempt)
+        self.route_inv_to_any_peer(req, hash)
+    }
+
+    /// Arms an internal event-driven second block request when scoring/hedging is enabled and the
+    /// block has at least one advertiser.
+    fn maybe_hedge_block(
+        &mut self,
+        hash: block::Hash,
+        first_peer: PeerSocketAddr,
+        first_score: Option<Duration>,
+        dispatched_at: tokio::time::Instant,
+        primary: SecondResponse,
+    ) -> SecondResponse {
+        if !self.block_download_score_and_hedge {
+            return primary;
+        }
+        let Some(first_score) = first_score else {
+            metrics::counter!("pool.route_inv.hedge.unscored_first.count").increment(1);
+            return primary;
+        };
+        let (held, hedge_rx) = HeldSecondRequest::new(hash, first_peer, first_score, dispatched_at);
+        self.held_second_requests.push(held);
+        race_block_request(hash, primary, hedge_rx)
     }
 
     /// Routes an inventory request to a ready peer that isn't missing the inventory, without
@@ -1570,7 +1794,6 @@ where
         &mut self,
         req: Request,
         hash: InventoryHash,
-        attempt: Option<crate::BlockHedge>,
     ) -> <Self as tower::Service<Request>>::Future {
         let missing_peer_list: HashSet<PeerSocketAddr> = self
             .inventory_registry
@@ -1607,7 +1830,23 @@ where
             self.select_p2c_peer_from_list(&maybe_peer_list)
         };
 
-        if let Some(svc) = peer.and_then(|key| self.take_ready_service(&key)) {
+        let now = tokio::time::Instant::now();
+        let has_advertiser = matches!(hash, InventoryHash::Block(_))
+            && self
+                .inventory_registry
+                .advertising_peers(hash)
+                .next()
+                .is_some();
+        let first_score = peer.and_then(|key| {
+            if !(has_advertiser && self.block_download_score_and_hedge) {
+                return None;
+            }
+            let medians = self.ready_medians(now);
+            let svc = self.ready_services.get(&key)?;
+            self.expected_arrival_for(&key, svc, now, medians)
+        });
+
+        if let Some(mut svc) = peer.and_then(|key| self.take_ready_service(&key)) {
             let peer = peer.expect("just checked peer is Some");
             tracing::trace!(
                 ?hash,
@@ -1615,34 +1854,27 @@ where
                 "routing to a peer that might have inventory"
             );
             metrics::counter!("pool.route_inv.maybe.count").increment(1);
-            let trace_context = match hash {
-                InventoryHash::Block(hash) => Some((
-                    self.legacy_peer_trace.next_request_id(),
-                    self.legacy_peer_trace_context(peer, &svc),
-                    hash,
-                    Instant::now(),
-                )),
-                _ => None,
-            };
-            let fut = match self.dispatch_inventory(peer, svc, req, attempt.as_ref(), None) {
-                Ok(fut) => fut,
-                Err(error) => return async { Err(error) }.boxed(),
-            };
-            if let Some((request_id, peer, hash, started)) = trace_context {
-                let trace = self.legacy_peer_trace.clone();
-                return async move {
-                    let result = fut.await;
-                    trace.block_request_finish(
-                        request_id,
-                        peer,
-                        hash,
-                        BlockRequestRoute::Maybe,
-                        started.elapsed(),
-                        &result,
-                    );
-                    result.map_err(Into::into)
+            let idle_at_dispatch = svc.can_send_request_now();
+            let connection_id = svc.connection_id();
+            let trace_peer = self.legacy_peer_trace_context(peer, &svc);
+            let fut = svc.call(req);
+            self.push_unready(peer, svc);
+            if let InventoryHash::Block(block_hash) = hash {
+                let primary = self.wrap_block_response(
+                    fut,
+                    peer,
+                    connection_id,
+                    trace_peer,
+                    block_hash,
+                    BlockRequestRoute::Maybe,
+                    idle_at_dispatch,
+                    false,
+                    now,
+                );
+                if has_advertiser {
+                    return self.maybe_hedge_block(block_hash, peer, first_score, now, primary);
                 }
-                .boxed();
+                return primary;
             }
             return fut.map_err(Into::into).boxed();
         }
@@ -1722,27 +1954,60 @@ where
         .boxed()
     }
 
-    /// Routes the transaction requests held for busy advertisers that can go now. The peer set's
-    /// owner calls this after routing each new request, so a waiting request never takes a peer
-    /// from it, and when no new request is waiting.
-    ///
-    /// A held request goes to its advertiser once one is ready. Once it has waited
-    /// [`TX_ADVERTISER_WAIT`], or no advertiser is connected, it is routed as if no peer had
-    /// advertised it, as soon as any peer is ready. A request whose caller gave up is dropped.
-    ///
-    /// Wakes the owner after routing a request, so it polls the newly busy peer, and at the
-    /// earliest deadline.
-    pub(super) fn route_held_tx_requests(&mut self, cx: &mut Context<'_>) -> Result<(), BoxError> {
-        if self.held_tx_requests.is_empty() {
+    /// Routes held block hedges and held transaction requests that can go now, sharing one timer
+    /// across both queues. The peer set's owner calls this after routing each new request (so held
+    /// work never takes a peer from a waiting primary request) and when idle.
+    pub(super) fn route_held_requests(&mut self, cx: &mut Context<'_>) -> Result<(), BoxError> {
+        self.drain_block_feedback(cx);
+        if self.held_second_requests.is_empty() && self.held_tx_requests.is_empty() {
+            self.held_timer = None;
+            metrics::gauge!("pool.route_inv.hedge.held").set(0.0);
             return Ok(());
         }
 
         // Adverts that arrived while requests were held are only read here and while routing.
         let _poll_pending_or_ready: Poll<()> = self.inventory_registry.poll_inventory(cx)?;
 
-        let now = tokio::time::Instant::now();
         let mut routed = false;
-        let mut next_deadline = None;
+        let mut next_deadline: Option<tokio::time::Instant> = None;
+
+        // Held block hedges first: they are time-sensitive tip blocks, and primary requests
+        // already ran before this method was entered.
+        if !self.held_second_requests.is_empty() {
+            // Register the single fleet-wide RTT waker before reading any RTT or median.
+            if let Some(gossip) = self
+                .block_gossip_peers
+                .values()
+                .find(|gossip| gossip.registry.is_some())
+            {
+                gossip.notify_when_rtt_changes(cx);
+            }
+            let considered_at = tokio::time::Instant::now();
+            let medians = self.ready_medians(considered_at);
+            for mut held in std::mem::take(&mut self.held_second_requests) {
+                if !held.poll_open(cx, considered_at) {
+                    continue;
+                }
+                let mut deadline = held.next_decision_after(considered_at);
+                match self.choose_second_request(&held, considered_at, medians, cx, &mut deadline) {
+                    Some((peer, choice)) => {
+                        let response = held
+                            .span
+                            .in_scope(|| self.send_second_request(held.hash, peer, choice));
+                        held.send(response);
+                        routed = true;
+                    }
+                    None => {
+                        next_deadline = Some(next_deadline.map_or(deadline, |at| at.min(deadline)));
+                        self.held_second_requests.push(held);
+                    }
+                }
+            }
+        }
+        metrics::gauge!("pool.route_inv.hedge.held").set(self.held_second_requests.len() as f64);
+
+        // Held transaction requests waiting for busy advertisers.
+        let now = tokio::time::Instant::now();
         for _ in 0..self.held_tx_requests.len() {
             let held = self
                 .held_tx_requests
@@ -1754,37 +2019,34 @@ where
 
             let to_advertiser = self.has_ready_advertiser(held.hash);
             if !to_advertiser && held.deadline > now && self.has_busy_advertiser(held.hash) {
-                // Every request waits as long, so the oldest has the earliest deadline.
-                next_deadline.get_or_insert(held.deadline);
+                next_deadline =
+                    Some(next_deadline.map_or(held.deadline, |at| at.min(held.deadline)));
                 self.held_tx_requests.push_back(held);
                 continue;
             }
             if !to_advertiser && self.ready_services.is_empty() {
-                // Like a new request, wait until a peer is ready.
                 self.held_tx_requests.push_back(held);
                 continue;
             }
 
             let response = held.span.in_scope(|| {
                 if to_advertiser {
-                    self.route_inv(held.req, held.hash, None)
+                    self.route_inv(held.req, held.hash)
                 } else {
-                    self.route_inv_to_any_peer(held.req, held.hash, None)
+                    self.route_inv_to_any_peer(held.req, held.hash)
                 }
             });
             let _ = held.reply.send(response);
             routed = true;
         }
 
-        match (next_deadline, self.held_tx_timer.as_mut()) {
+        match (next_deadline, self.held_timer.as_mut()) {
             (Some(deadline), Some(timer)) => timer.as_mut().reset(deadline),
-            (Some(deadline), None) => {
-                self.held_tx_timer = Some(Box::pin(tokio::time::sleep_until(deadline)))
-            }
-            (None, _) => self.held_tx_timer = None,
+            (Some(deadline), None) => self.held_timer = Some(Box::pin(sleep_until(deadline))),
+            (None, _) => self.held_timer = None,
         }
         let timer_expired = self
-            .held_tx_timer
+            .held_timer
             .as_mut()
             .is_some_and(|timer| timer.as_mut().poll(cx).is_ready());
         if routed || timer_expired {
@@ -1794,147 +2056,94 @@ where
         Ok(())
     }
 
-    /// Holds a download's request for a second copy of a gossiped block until another announcer
-    /// should deliver it sooner than the first request, then sends it.
-    ///
-    /// Nothing is sent here. [`Self::retry_held_second_requests`] decides, first on the
-    /// maintenance pass that follows this call and then whenever an input to the decision
-    /// changes.
-    ///
-    /// The returned future resolves to the second request's response. It fails with
-    /// [`NoFasterBlockSource`] when the download's window closes without a second request, or
-    /// at once when second requests are off or the window is already closed.
-    fn route_block_hedge(
-        &mut self,
-        hash: block::Hash,
-        attempt: crate::BlockHedge,
-    ) -> <Self as tower::Service<Request>>::Future {
-        if !self.block_download_score_and_hedge || attempt.elapsed_if_open().is_none() {
-            return async { Err(NoFasterBlockSource.into()) }.boxed();
-        }
-
-        let (held, response) = HeldSecondRequest::new(hash, attempt);
-        self.held_second_requests.push(held);
-        response
-    }
-
-    /// Considers every held second request again, and sends the ones that now qualify.
-    ///
-    /// A request leaves once it is sent, or once its download stops accepting one: its window
-    /// closed, the first request finished, or the download dropped its response future. For
-    /// each request that stays, registers `cx` to be woken by everything that can change the
-    /// decision:
-    ///
-    /// - a new announcement, through the inventory registry;
-    /// - an announcer becoming a better source, through its connection (see
-    ///   [`Self::choose_second_request`]). A busy announcer the peer set itself is waiting on
-    ///   wakes this task when it becomes ready, as any unready peer does;
-    /// - the first request becoming overdue or stalled, an announcer's missed-block mark
-    ///   expiring, or the window ending, through one timer for the earliest deadline.
-    ///
-    /// Does nothing when no request is held.
-    fn retry_held_second_requests(&mut self, cx: &mut Context<'_>) -> Result<(), BoxError> {
-        if self.held_second_requests.is_empty() {
-            return Ok(());
-        }
-
-        // Request routing refreshes the registry only while a request waits for a ready peer.
-        // A held request needs the announcements that arrive in between.
-        let _poll_pending_or_ready: Poll<()> = self.inventory_registry.poll_inventory(cx)?;
-
-        // A deadline crossed during the scan must still wake the owner.
-        let considered_at = tokio::time::Instant::now();
-        let mut earliest: Option<tokio::time::Instant> = None;
-        for mut held in std::mem::take(&mut self.held_second_requests) {
-            if !held.poll_open(cx) {
-                continue;
-            }
-            let mut next_decision = next_decision_after(held.attempt(), considered_at);
-            let chosen = self
-                .choose_second_request(held.hash(), held.attempt(), cx, &mut next_decision)
-                // A download gets one second request, and none once it stops accepting one.
-                .filter(|_| held.attempt().claim_dispatch());
-            match chosen {
-                Some((peer, choice)) => {
-                    let response = self.send_second_request(held.hash(), peer, choice);
-                    held.send(response);
-                }
-                None => {
-                    earliest = Some(earliest.map_or(next_decision, |at| at.min(next_decision)));
-                    self.held_second_requests.push(held);
-                }
-            }
-        }
-        if let Some(at) = earliest {
-            let timer = self
-                .second_request_timer
-                .get_or_insert_with(|| Box::pin(sleep_until(at)));
-            timer.as_mut().reset(at);
-            if timer.as_mut().poll(cx).is_ready() {
-                cx.waker().wake_by_ref();
-            }
-        } else {
-            self.second_request_timer = None;
-        }
-        // The length is bounded by the block downloader's concurrency limit, far below the
-        // integers an `f64` holds exactly.
-        metrics::gauge!("pool.route_inv.hedge.held").set(self.held_second_requests.len() as f64);
-
-        Ok(())
-    }
-
     /// Chooses the peer to send a second request for a gossiped block to, if another announcer
-    /// should deliver it sooner than the first request. The caller claims the download's one
-    /// second request before sending.
-    ///
-    /// The candidates are the idle peers that announced the block, other than the one the first
-    /// request went to, and the best is the one expected to answer soonest. It is chosen when it
-    /// is expected to deliver clearly before the first request should, or when the first request
-    /// has stalled (see [`second_request_reason`]). The expected answer times are measured by
-    /// this node, so a peer cannot claim a faster one.
-    ///
-    /// Returns the chosen peer, which is in the ready set. Otherwise returns `None`. Either
-    /// way, registers `cx` for announcer changes and shortens `next_decision` for expiring misses.
+    /// should deliver it sooner than the first request or the first request has stalled.
     fn choose_second_request(
         &self,
-        hash: block::Hash,
-        attempt: &crate::BlockHedge,
+        held: &HeldSecondRequest,
+        considered_at: tokio::time::Instant,
+        medians: ReadyMedians,
         cx: &Context<'_>,
         next_decision: &mut tokio::time::Instant,
     ) -> Option<(D::Key, SecondRequestChoice)> {
-        let first = attempt.first_dispatch()?;
-        let first_peer = first.legacy_peer;
-        let first_score = first.score?;
-        let candidates: Vec<_> = self
+        let waited = considered_at.saturating_duration_since(held.dispatched_at);
+        let stalled = is_stalled(held.first_score, waited);
+        let mut best_measured: Option<(D::Key, Duration)> = None;
+        let mut measured_count = 0usize;
+        let mut fallback_unmeasured: Option<(D::Key, Option<Duration>)> = None;
+
+        for addr in self
             .inventory_registry
-            .advertising_peers(InventoryHash::from(hash))
-            .filter(|addr| Some(**addr) != first_peer)
-            .filter_map(|addr| {
-                let svc = self.ready_services.get(addr)?;
-                Some((*addr, svc.second_request_score(cx, next_decision)?))
-            })
-            .collect();
-        let Some(&(peer, score)) = candidates.iter().min_by_key(|(_, score)| *score) else {
-            metrics::counter!("pool.route_inv.hedge.no_candidate.count").increment(1);
-            return None;
-        };
-        let first_request_waited = first.at.elapsed();
-        let Some(reason) = second_request_reason(first_score, first_request_waited, score) else {
-            metrics::counter!("pool.route_inv.hedge.not_yet.count").increment(1);
-            return None;
-        };
-        let choice = SecondRequestChoice {
-            first_request_waited,
-            reason,
-            candidates: candidates.len(),
-            score: Some(score),
-            first_score,
-        };
-        Some((peer, choice))
+            .advertising_peers(InventoryHash::from(held.hash))
+            .filter(|addr| **addr != held.first_peer)
+        {
+            let Some(svc) = self.ready_services.get(addr) else {
+                continue;
+            };
+            svc.notify_when_usable(cx);
+            if !svc.is_preferred_block_source() {
+                continue;
+            }
+            let conn_id = svc.connection_id();
+            if let Some(expiry) = self.miss_expiry(addr, conn_id, considered_at) {
+                *next_decision = (*next_decision).min(expiry);
+                continue;
+            }
+            if let Some((rate, expiry)) = self.peer_rate(addr, conn_id, considered_at) {
+                if medians.rate_bps.is_none_or(|median| rate < median) {
+                    *next_decision = (*next_decision).min(expiry);
+                }
+            }
+            if svc.block_gossip.min_rtt(considered_at).is_some() {
+                if let Some(score) = self.expected_arrival_for(addr, svc, considered_at, medians) {
+                    measured_count += 1;
+                    if best_measured.is_none_or(|(_, best)| score < best) {
+                        best_measured = Some((*addr, score));
+                    }
+                }
+            } else if fallback_unmeasured.is_none() {
+                let score = self.expected_arrival_for(addr, svc, considered_at, medians);
+                fallback_unmeasured = Some((*addr, score));
+            }
+        }
+
+        if let Some((peer, score)) = best_measured {
+            let Some(reason) = second_request_reason(held.first_score, waited, score) else {
+                metrics::counter!("pool.route_inv.hedge.not_yet.count").increment(1);
+                return None;
+            };
+            return Some((
+                peer,
+                SecondRequestChoice {
+                    first_request_waited: waited,
+                    reason,
+                    candidates: measured_count,
+                    score: Some(score),
+                    first_score: held.first_score,
+                },
+            ));
+        }
+
+        if stalled {
+            if let Some((peer, score)) = fallback_unmeasured {
+                return Some((
+                    peer,
+                    SecondRequestChoice {
+                        first_request_waited: waited,
+                        reason: SecondRequestReason::Stalled,
+                        candidates: 1,
+                        score,
+                        first_score: held.first_score,
+                    },
+                ));
+            }
+        }
+
+        metrics::counter!("pool.route_inv.hedge.no_candidate.count").increment(1);
+        None
     }
 
-    /// Sends the second request for `hash` to `peer`, which [`Self::choose_second_request`]
-    /// just chose, and returns its response.
+    /// Sends the second request for `hash` to `peer` and returns its traced response future.
     fn send_second_request(
         &mut self,
         hash: block::Hash,
@@ -1947,29 +2156,24 @@ where
 
         metrics::counter!("pool.route_inv.hedge.count", "reason" => choice.reason.label())
             .increment(1);
-        let request_id = self.legacy_peer_trace.next_request_id();
+        let idle_at_dispatch = svc.can_send_request_now();
+        let connection_id = svc.connection_id();
         let trace_peer = self.legacy_peer_trace_context(peer, &svc);
-        let started = Instant::now();
-        let fut = svc.call_routed(
-            Request::BlocksByHash(std::iter::once(hash).collect()),
-            Some(AdvertisedBlockRequest::Hedge),
-        );
+        let started = tokio::time::Instant::now();
+        let fut = svc.call(Request::BlocksByHash(std::iter::once(hash).collect()));
         self.push_unready(peer, svc);
 
-        let trace = self.legacy_peer_trace.clone();
-        async move {
-            let result = fut.await;
-            trace.block_request_finish(
-                request_id,
-                trace_peer,
-                hash,
-                BlockRequestRoute::Hedge(choice),
-                started.elapsed(),
-                &result,
-            );
-            result.map_err(Into::into)
-        }
-        .boxed()
+        self.wrap_block_response(
+            fut,
+            peer,
+            connection_id,
+            trace_peer,
+            hash,
+            BlockRequestRoute::Hedge(choice),
+            idle_at_dispatch,
+            true,
+            started,
+        )
     }
 
     /// Routes the same request to up to `max_peers` ready peers, ignoring return values.
@@ -2076,9 +2280,10 @@ where
         // - an unready peer becomes ready, or
         // - a new peer arrives.
 
-        // Drain stall events first, so disconnects free up slots that
-        // `poll_discover` can fill in the same poll cycle.
+        // Drain stall and block-feedback events first, so disconnects free up slots and fresh
+        // rates/misses are visible before routing.
         self.drain_stall_events(cx);
+        self.drain_block_feedback(cx);
 
         // Check for new peers, and register a task wakeup when the next new peers arrive. New peers
         // can be infrequent if our connection slots are full, or we're connected to all
@@ -2092,17 +2297,20 @@ where
         self.prune_block_gossip_peers();
         self.publish_block_gossip_peers();
 
-        // After the peer statuses above are current: a peer that just became ready can take a
-        // held second request.
-        self.retry_held_second_requests(cx)?;
-
         // Peers leave the set through many paths. Pruning here, instead of at each
-        // path, keeps stall counts bounded by the live peers.
+        // path, keeps per-peer maps bounded by the live peers.
+        let (ready_services, cancel_handles) = (&self.ready_services, &self.cancel_handles);
+        let is_live = |addr: &PeerSocketAddr| {
+            ready_services.contains_key(addr) || cancel_handles.contains_key(addr)
+        };
         if !self.find_response_stalls.is_empty() {
-            let (ready_services, cancel_handles) = (&self.ready_services, &self.cancel_handles);
-            self.find_response_stalls.retain(|addr| {
-                ready_services.contains_key(addr) || cancel_handles.contains_key(addr)
-            });
+            self.find_response_stalls.retain(is_live);
+        }
+        if !self.peer_rates.is_empty() {
+            self.peer_rates.retain(|addr, _| is_live(addr));
+        }
+        if !self.announced_block_misses.is_empty() {
+            self.announced_block_misses.retain(|addr, _| is_live(addr));
         }
 
         // These metrics should run last, to report the most up-to-date information.
@@ -2372,24 +2580,14 @@ where
                 if hashes.len() == 1 =>
             {
                 let hash = InventoryHash::from(*hashes.iter().next().unwrap());
-                self.route_inv(req, hash, None)
+                self.route_inv(req, hash)
             }
-            Request::BlockByHashPrimary {
-                hash,
-                source,
-                attempt,
-            } => self.route_inv(
-                Request::block_by_hash(hash, source),
-                InventoryHash::from(hash),
-                Some(attempt),
-            ),
-            Request::BlockByHashHedge { hash, attempt } => self.route_block_hedge(hash, attempt),
             Request::TransactionsById(ref hashes)
             | Request::TransactionsByIdFrom {
                 ids: ref hashes, ..
             } if hashes.len() == 1 => {
                 let hash = InventoryHash::from(*hashes.iter().next().unwrap());
-                self.route_inv(req, hash, None)
+                self.route_inv(req, hash)
             }
 
             // Broadcast advertisements to lots of peers

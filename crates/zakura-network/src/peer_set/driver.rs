@@ -156,7 +156,7 @@ where
                                 Poll::Ready(Some(request)) => pending = Some(request),
                                 Poll::Ready(None) => return Poll::Ready(Ok::<_, BoxError>(false)),
                                 Poll::Pending => {
-                                    peers.route_held_tx_requests(cx)?;
+                                    peers.route_held_requests(cx)?;
                                     return Poll::Pending;
                                 }
                             }
@@ -172,7 +172,7 @@ where
                         let response = request.span.in_scope(|| peers.call(request.request));
                         let _ = request.reply.send(response);
                         // After the new request, so that a held request can't take its peer.
-                        peers.route_held_tx_requests(cx)?;
+                        peers.route_held_requests(cx)?;
                         Poll::Ready(Ok(true))
                     }) => { if !running? { break; } }
                 }

@@ -7,6 +7,7 @@ use crate::components::zcashd_compat;
 use crate::config::ZakuradConfig;
 use zakura_network::types::PeerServices;
 use zakura_network::P2pStack;
+use zakura_rpc::config::mining::{default_miner_address, MinerAddressType};
 use zakura_state::{PruningConfig, StorageMode};
 
 #[tokio::test]
@@ -133,6 +134,53 @@ fn blocksync_throughput_probe_requires_v2_p2p() {
         ),
         "unexpected error: {error}"
     );
+}
+
+#[test]
+fn turning_off_the_end_of_support_halt_is_refused_on_a_mining_node() {
+    let cmd = StartCmd {
+        filters: Vec::new(),
+        zcashd_compat: false,
+        unsafe_low_specs: false,
+    };
+    let miner_address = default_miner_address(
+        ZakuradConfig::default().network.network.kind(),
+        &MinerAddressType::Transparent,
+    )
+    .parse()
+    .expect("the default miner address is valid");
+    let refused = "end_of_support.halt = false is not allowed on a mining node";
+
+    let mut config = ZakuradConfig::default();
+    config.end_of_support.halt = false;
+    cmd.override_config(config.clone())
+        .expect("a node that does not mine can turn the halt off");
+
+    // A node that can build block templates is a miner.
+    config.mining.miner_address = Some(miner_address);
+    let error = cmd
+        .override_config(config.clone())
+        .expect_err("a node with a miner address keeps the halt");
+    assert!(
+        error.to_string().contains(refused),
+        "unexpected error: {error}"
+    );
+
+    // So is a node that runs the internal miner.
+    config.mining.miner_address = None;
+    config.mining.internal_miner = true;
+    let error = cmd
+        .override_config(config.clone())
+        .expect_err("a node with the internal miner keeps the halt");
+    assert!(
+        error.to_string().contains(refused),
+        "unexpected error: {error}"
+    );
+
+    // Miners start as long as they keep the halt.
+    config.end_of_support.halt = true;
+    cmd.override_config(config)
+        .expect("a mining node that keeps the halt is valid");
 }
 
 #[test]

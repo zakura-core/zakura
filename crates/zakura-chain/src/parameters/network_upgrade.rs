@@ -442,7 +442,6 @@ impl NetworkUpgrade {
     ///
     /// Returns None if the next upgrade has not been implemented in Zebra
     /// yet.
-    #[cfg(test)]
     pub fn next(network: &Network, height: block::Height) -> Option<NetworkUpgrade> {
         use std::ops::Bound::*;
 

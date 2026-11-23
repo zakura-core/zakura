@@ -59,10 +59,11 @@ groups:
           summary: "High error rate"
           description: "Zakura is experiencing elevated error rates (> 0.1/s for 5 minutes)."
 
-      # This release stops running when the tip passes its end of service height.
-      # 1152 blocks is one day at the 75 second target spacing.
+      # This release stops running when the tip passes its end of service height,
+      # unless `end_of_support.halt` is off, which reports `end_of_support_enforced` as 0.
+      # 3456 blocks is one day at the 25 second target spacing.
       - alert: ZakuraEndOfServiceApproaching
-        expr: end_of_support_remaining_blocks < 3456
+        expr: end_of_support_remaining_blocks < 10368 and end_of_support_enforced == 1
         for: 15m
         labels:
           severity: warning
@@ -71,13 +72,34 @@ groups:
           description: "This Zakura release halts in {{ $value }} blocks. Install the latest release before then."
 
       - alert: ZakuraEndOfServiceImminent
-        expr: end_of_support_remaining_blocks < 1152
+        expr: end_of_support_remaining_blocks < 3456 and end_of_support_enforced == 1
         for: 15m
         labels:
           severity: critical
         annotations:
           summary: "Release reaches end of service in under 1 day"
           description: "This Zakura release halts in {{ $value }} blocks. Install the latest release now."
+
+      # With `end_of_support.halt` off, the release keeps running past its end of service.
+      - alert: ZakuraRunningUnsupportedRelease
+        expr: end_of_support_remaining_blocks < 0 and end_of_support_enforced == 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Release is past its end of service and keeps running"
+          description: "The chain tip is past the last height this Zakura release supports (blocks remaining: {{ $value }}). Install the latest release."
+
+      # The gauge is only above zero while an unsupported release runs ahead of a network
+      # upgrade that it knows about.
+      - alert: ZakuraUnsupportedReleaseBeforeNetworkUpgrade
+        expr: end_of_support_blocks_until_next_upgrade > 0
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Unsupported release is approaching a network upgrade"
+          description: "A network upgrade activates in {{ $value }} blocks and this Zakura release is unsupported. Install the latest release before then."
 
   # Value Pool Alerts (Monitoring)
   - name: zakura-value-pools

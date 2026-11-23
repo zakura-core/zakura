@@ -62,6 +62,9 @@ pub struct ZakuradConfig {
     // These configs use full paths to avoid a rustdoc link bug (#7048).
     pub consensus: zakura_consensus::config::Config,
 
+    /// End of support configuration
+    pub end_of_support: crate::components::sync::end_of_support::Config,
+
     /// Metrics configuration
     pub metrics: crate::components::metrics::Config,
 

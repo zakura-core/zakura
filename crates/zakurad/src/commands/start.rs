@@ -355,6 +355,25 @@ impl StartCmd {
             .map_err(|error| eyre!("invalid consensus configuration: {error}"))
     }
 
+    /// Refuses to turn off the end of support halt on a mining node.
+    ///
+    /// A miner on an unsupported release can build blocks on outdated consensus rules, so
+    /// miners keep the halt. A node counts as a miner when it can build block templates
+    /// (`mining.miner_address`) or runs the internal miner.
+    fn validate_end_of_support_config(config: &ZakuradConfig) -> Result<(), Report> {
+        let is_miner = config.mining.miner_address.is_some() || config.mining.internal_miner;
+
+        if !config.end_of_support.halt && is_miner {
+            return Err(eyre!(
+                "end_of_support.halt = false is not allowed on a mining node; remove \
+                 mining.miner_address and mining.internal_miner, or set end_of_support.halt \
+                 to true"
+            ));
+        }
+
+        Ok(())
+    }
+
     /// Refuses `mining.miner_mesh` on a node that cannot be a gateway, and warns when the
     /// gateway it names would be of no use to other miners.
     ///
@@ -548,6 +567,7 @@ impl StartCmd {
         Self::validate_consensus_config(&config)?;
         Self::validate_debug_blocksync_throughput_config(&config)?;
         Self::validate_miner_mesh_config(&config)?;
+        Self::validate_end_of_support_config(&config)?;
         let network_config = Self::network_config_for_start(&config)?;
         config.rpc.validate().map_err(|error| eyre!(error))?;
         let backend_verifications = config
@@ -1269,8 +1289,13 @@ impl StartCmd {
         // Spawn never ending end of support task.
         info!("spawning end of support checking task");
         let end_of_support_task_handle = spawn_erased(
-            sync::end_of_support::start(config.network.network.clone(), latest_chain_tip.clone())
-                .in_current_span(),
+            sync::end_of_support::start(
+                config.end_of_support,
+                sync::end_of_support::SupportWindow::of_release(&config.network.network),
+                config.network.network.clone(),
+                latest_chain_tip.clone(),
+            )
+            .in_current_span(),
         );
         node_tasks.supervise("end of support", end_of_support_task_handle, |result| {
             result
@@ -1734,6 +1759,7 @@ impl StartCmd {
         Self::validate_consensus_config(&config).map_err(config_error)?;
         Self::validate_debug_blocksync_throughput_config(&config).map_err(config_error)?;
         Self::validate_miner_mesh_config(&config).map_err(config_error)?;
+        Self::validate_end_of_support_config(&config).map_err(config_error)?;
         config.rpc.validate().map_err(config_error)?;
 
         Ok(config)

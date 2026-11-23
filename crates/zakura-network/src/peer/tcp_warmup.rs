@@ -1,10 +1,10 @@
 //! Warms the send direction of new legacy TCP connections with padded pings.
 //!
-//! A new TCP connection starts in slow start, so the first full block it carries waits several
-//! extra round trips for the congestion window to grow. Each warm-up sends the pings that
+//! A new TCP connection starts in slow start, so sending its first full block can take extra
+//! round trips as the congestion window grows. Each warm-up sends the pings that
 //! [`TcpWarmupConfig::schedule`] lists, one at a time, and sends the next only once the peer's
-//! `pong` for the previous one arrives. Each padded ping fills the current window, so each one
-//! about doubles it. Peers ignore a ping body's trailing bytes, so receivers need no change.
+//! `pong` for the previous one arrives. The padding gives the TCP sender an opportunity to
+//! grow its congestion window. Peers ignore a ping body's trailing bytes.
 //!
 //! [`TcpWarmup`] limits warm-ups across the node: one per peer IP per
 //! [`TcpWarmupConfig::peer_cooldown`], at most [`TcpWarmupConfig::max_concurrent`] at a time,
@@ -15,12 +15,12 @@
 use std::{
     collections::HashMap,
     net::IpAddr,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
     time::Duration,
 };
 
 use tokio::{
-    sync::{mpsc, oneshot, watch, Semaphore},
+    sync::{mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore},
     time::Instant,
 };
 
@@ -46,6 +46,9 @@ pub(crate) struct WarmupChunk {
     pub nonce: Nonce,
     /// The zero bytes after the nonce.
     pub padding: u32,
+    /// The connection holds the permit through the write and any cleanup on failure. A queued
+    /// ping holds only a weak reference so an expired ping cannot occupy a slot.
+    pub permit: Weak<OwnedSemaphorePermit>,
     /// Fires just before the connection writes the ping. The connection skips the ping if the
     /// receiver is gone, because the warm-up has stopped.
     pub written: oneshot::Sender<()>,
@@ -104,7 +107,10 @@ impl TcpWarmup {
     }
 
     /// Returns a coordinator that waits for quiet periods in `tip_changed_at`.
-    fn new(config: TcpWarmupConfig, tip_changed_at: watch::Receiver<Option<Instant>>) -> Self {
+    pub(super) fn new(
+        config: TcpWarmupConfig,
+        tip_changed_at: watch::Receiver<Option<Instant>>,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 permits: Arc::new(Semaphore::new(config.max_concurrent)),
@@ -119,12 +125,8 @@ impl TcpWarmup {
     /// cooldown.
     ///
     /// Returns when the warm-up completes or stops. It stops if a `pong` takes longer than the
-    /// chunk timeout, or if the connection closes, and it never closes the connection itself.
-    /// The chunk timeout is less than half the connection's send timeout, and each ping is at
-    /// most twice the size of the last one that the peer answered in time. A peer whose link
-    /// stays as fast as its last `pong` showed therefore accepts the next ping within the send
-    /// timeout. A write that stalls past the send timeout still fails the connection, as any
-    /// write does.
+    /// chunk timeout, or if the connection closes. A started write holds the permit until it
+    /// finishes or the connection handles the send failure.
     pub(crate) async fn run(self, peer_ip: IpAddr, link: mpsc::Sender<WarmupChunk>) {
         let Some(mut claim) = self.claim(peer_ip) else {
             metrics::counter!("peer.tcp_warmup.skipped", "reason" => "cooldown").increment(1);
@@ -132,13 +134,14 @@ impl TcpWarmup {
         };
 
         let permits = self.inner.permits.clone();
-        let _permit = tokio::select! {
+        let permit = tokio::select! {
             permit = permits.acquire_owned() => permit.expect("the semaphore is never closed"),
             () = link.closed() => {
                 metrics::counter!("peer.tcp_warmup.skipped", "reason" => "closed").increment(1);
                 return;
             }
         };
+        let permit = Arc::new(permit);
         metrics::counter!("peer.tcp_warmup.started").increment(1);
 
         let config = &self.inner.config;
@@ -156,6 +159,7 @@ impl TcpWarmup {
             let chunk = WarmupChunk {
                 nonce: Nonce::default(),
                 padding,
+                permit: Arc::downgrade(&permit),
                 written: written_tx,
                 pong: pong_tx,
             };

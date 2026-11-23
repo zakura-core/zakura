@@ -962,7 +962,7 @@ fn a_reopen_after_both_subscriptions_end_gets_a_new_identity() {
         assert_eq!(seq, 0, "the reopened stream's frames count from 0");
         // Resetting the retired stream can discard a status refresh that
         // raced with retirement, even after QUIC accepted the local write.
-        let writes: Vec<_> = facts(&entries, connection)
+        let mut writes = facts(&entries, connection)
             .filter_map(|(at, fact)| match fact {
                 TransportFact::FrameWritten {
                     quic_stream,
@@ -972,33 +972,31 @@ fn a_reopen_after_both_subscriptions_end_gets_a_new_identity() {
                 } if *quic_stream == first => Some((at.step, *seq, *message_type)),
                 _ => None,
             })
-            .collect();
-        let reads: Vec<_> = entries
-            .iter()
-            .filter_map(|at| match at.obs {
-                Observation::PeerReceived {
-                    connection: c,
-                    quic_stream,
-                    seq,
-                    message_type,
-                    ..
-                } if (c, quic_stream) == (connection, first) => Some((seq, message_type)),
-                _ => None,
-            })
-            .collect();
-        let written_frames: Vec<_> = writes.iter().map(|&(_, seq, kind)| (seq, kind)).collect();
-        assert!(
-            written_frames.starts_with(&reads),
-            "reads follow write order"
-        );
-        if reads.len() < writes.len() {
-            assert!(entries.iter().any(|at| at.step > finished && matches!(
-                at.obs, Observation::PeerStreamReset { quic_stream, code: 0, .. } if quic_stream == first
-            )), "the peer saw the retired stream reset");
+            .peekable();
+        let reads = entries.iter().filter_map(|at| match at.obs {
+            Observation::PeerReceived {
+                connection: c,
+                quic_stream,
+                seq,
+                message_type,
+                ..
+            } if (c, quic_stream) == (connection, first) => Some((seq, message_type)),
+            _ => None,
+        });
+        for read in reads {
+            let (_, seq, kind) = writes.next().expect("each read has a matching write");
+            assert_eq!((seq, kind), read, "reads follow write order");
+        }
+        if writes.peek().is_some() {
+            let reset = entries.iter().any(|at| {
+                at.step > finished && matches!(
+                    at.obs,
+                    Observation::PeerStreamReset { quic_stream, code: 0, .. } if quic_stream == first
+                )
+            });
+            assert!(reset, "the peer saw the retired stream reset");
             assert!(
-                writes[reads.len()..]
-                    .iter()
-                    .all(|&(step, _, kind)| step > finished && kind == STATUS),
+                writes.all(|(step, _, kind)| step > finished && kind == STATUS),
                 "only status refreshes written after the peer finished may be lost"
             );
         }

@@ -299,13 +299,23 @@ pub(super) fn decode(data: &[u8]) -> impl Iterator<Item = DialerOp> + '_ {
                     pick: usize::from(b),
                     result,
                 },
+                // a % 6 == 5: rank the three nodes and run the preferred pass.
+                // Every count is folded into 0..=3, so any byte triple is legal.
                 _ => DialerOp::Rank {
+                    // b as three base-3 digits, one standing per node: node 0 is
+                    // b % 3, node 1 the next digit, node 2 the one after.
+                    // 0 is unmatched, 1 is backoff, 2 is dialable.
                     book: [book(b), book(b / 3), book(b / 9)],
+                    // The low three bits of c, one bit per node.
                     registered: [c & 1 != 0, c & 2 != 0, c & 4 != 0],
+                    // Bits 3 and 4 of c: how many places the set may hold.
                     hold_limit: usize::from(c >> 3) % 4,
                     room: PreferredRoom {
+                        // The part of a that a % 6 did not use.
                         connections: usize::from(a / 6) % 4,
+                        // The part of b the three digits did not use (3 * 3 * 3 = 27).
                         address_attempts: usize::from(b / 27) % 4,
+                        // Bits 5 and 6 of c. Bit 7 is unused.
                         dials: usize::from(c >> 5) % 4,
                     },
                 },

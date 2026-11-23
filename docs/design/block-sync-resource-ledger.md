@@ -7,63 +7,72 @@
 
 ## Principle
 
-The block-sync reactor decides what to ask for. Its congestion control, request byte budget
-and look-ahead gate size the work to the node's progress. Memory follows from those requests.
-A peer that sends more than its live reservations owe, or a body that disagrees with its own
-header, breaks the protocol, and the node disconnects it.
+The block-sync reactor decides what to ask for. Its congestion control, its pool-leased request
+bytes and its benefit-capped look-ahead size the work to the node's progress. Memory follows from
+those requests. A peer that sends more than its live reservations owe, or a body that disagrees
+with its own header, breaks the protocol, and the node disconnects it.
 
-The node adds no independent rate or memory cap on a conformant peer's data path. A cap that
-can stall a fast, conformant supplier would trade throughput for a bound the reactor already
-provides. Where a bound must exist without a request behind it (serving, transport windows),
-it is sized to the throughput target, not below it.
+While the node's `[memory] budget` covers the work's demand, the node adds no cap below the
+benefit signals: the link's congestion window and the commit rate. When the budget is smaller than
+demand, the shared memory pool holds bulk requests, look-ahead, serving output and send windows
+within it. That can cost a peer throughput, and it never faults or penalizes a peer. The reserved
+`Consensus` consumer funds commit-window blocks (`height ≤ verified_tip + 401`), so commit progress
+never waits behind bulk work.
 
 ## Node budget
 
-Every term counts one physical allocation once. Defaults are shown. "Peer" means one
-connection; the node admits at most `zakura.max_connections` = 92 of them. The transport holds
-at most 124 live QUIC connections, admitted or not (zakura-quic ADM-12): 92 admitted and 32 of
-headroom for handshakes. `zakura.peer_memory_budget_bytes` = 15 GiB funds them after one 256 MiB
-datagram queue for the one bound socket, charging a handshake its 64 MiB of windows and an
-admitted connection its raised window plus send window, 141,937,353 B (CTRL-26). Closed connections release their
-stream buffers and drain in a separate allowance of 248 (ADM-13). The QUIC rows count all 124
-live connections; the application rows count the 92 admitted peers.
+Every term counts one physical allocation once, under one node-wide memory budget. `[memory]
+budget` sets it, and its default `"auto"` reads the tightest of host RAM and the cgroup limit. The
+node derives the P2P budget `B = (budget − base − sidecar) / ρ` at startup.
+`[network.zakura] peer_memory_budget_bytes` is removed. `B` bounds every byte in this ledger.
+`base` and `ρ` are measured peaks, not bounds, so the process's total RSS is a target.
 
-| Term | Per peer | Node | Bound comes from |
-| --- | --- | --- | --- |
-| QUIC receive buffers | 108,382,921 B connection window once admitted: 32 MiB handshake window plus every reactor's receive share, 43,287,718 B per stream | 10.3 GiB (92 admitted plus 32 handshakes at 32 MiB) | `DEFAULT_ZAKURA_RECEIVE_WINDOW` in `handler.rs` and the reactor budgets in `ZakuraConfig::reactor_shares`, enforced by QUIC flow control |
-| QUIC send buffers | 32 MiB | 3.9 GiB | `DEFAULT_ZAKURA_SEND_WINDOW`; serving output below sits inside it |
-| Serving bookkeeping | 1 MiB (144 KiB + 2 × 2,816 × 160 B) | 512 MiB | `BOOKKEEPING_BUDGET_BYTES` in `regulated/session.rs`; config validation refuses a config that cannot fund one request per slot |
-| Serving storage results | 12 jobs | 24 jobs × one read (≤ `blocks_per_response` decoded blocks) | `NODE_EXECUTION` / `PEER_EXECUTION`; a lease lives until the blocking read and encode return |
-| Serving encoded output | 64 MiB | 1.25 GB, 1 response slot per 4 KiB | `regulation/sizing.rs` (`peer_output_bytes`, `node_output_bytes`) |
-| Requester bookkeeping | ≤ live ranges | 32,768 ranges; ≤ 128 MiB of expected hashes | `MAX_BS_INFLIGHT_REQUESTS` request pool in `reactor.rs` |
-| Raw stream-6 frames awaiting the routine | ≤ 10 frames, about 20 MB, and ≤ what live reservations owe | 1.8 GB | `BLOCK_SYNC_INBOUND_QUEUE_DEPTH` in `block_sync/service.rs`; `Reservations::admit` in `regulation/reservations.rs` disconnects over-sending |
-| Look-ahead backlog (raw) | — | `max_reorder_lookahead_bytes` = 1.5 GiB plus one range | `admission.rs` byte gate, re-checked by the sequencer on every body |
-| Decoded bodies | one transient junk decode before rejection | 401 submissions × measured decoded size | `max_submitted_block_applies`; admission charges `max(4 × wire, measured decoded)` |
-| Control state | bounded maps | 8,192 supplier cooldowns; Status keeps the latest value | `MAX_SUPPLIER_RETRIES` in `peer_registry.rs` |
+`[network.zakura] max_connections` and each reactor's `peer_limits` are unset by default. Then 256
+connections is a ceiling, and the `Sessions` consumer's share of the pool decides how many
+connections and sessions the node funds. The `Sessions` floor funds 19 full connections on
+Mainnet. The `Consensus` reserve holds the network's worst 401-block checkpoint window at
+admission's charge per block, so the chain sets the smallest host that can run. With the draft
+values in `memory/draft.rs` and `p2p_stack = "zakura"`, that host has about 12.8 GiB on Mainnet.
+A smaller host refuses to start with default settings.
 
-At defaults, block-sync application memory sums to about 11 GB in the worst case: 0.5 GiB
-serving bookkeeping, 1.25 GB serving output, 1.3 GB of worst-case serving reads (about 170 MB
-for real blocks), 0.13 GiB requester hashes, 1.8 GB of raw frames awaiting their routines and
-5.6 GB of requested bodies (both derived below). The QUIC windows
-add 10.3 + 3.9 GiB, and the datagram queues 256 MiB more per bound socket, however many
-connections it serves. They are shared with every other service on the connection: the 15 GiB
-peer memory budget covers all three for every live QUIC connection the transport holds, and is a
-transport budget, not a block-sync choice.
+A pending handshake holds 128 KiB of windows (`CONTROL_RECEIVE_BYTES` and
+`HANDSHAKE_SEND_WINDOW_BYTES`). Admission leases each connection's transport base `t` and its
+reactors' bases from `Sessions`. Closed connections release their stream buffers and drain in a
+separate allowance (ADM-13). Each request leases its receive credit above the base (API-9). A
+request that ends short keeps its unspent credit leased until the peer can no longer spend it. A
+send window grows from its base toward `min(2 × cwnd, serving_per_peer)` while output waits, and
+the `Serving` consumer leases the growth (`PeerSubPool` per peer). The base send window holds one
+maximal block-sync frame, so one block always fits. The base keeps no room free in the window:
+stream priority (CTRL-40 in the `zakura-quic` spec) decides which stream gets the room that
+acknowledgments free.
+
+| Term | Pool consumer | Bound comes from |
+| --- | --- | --- |
+| QUIC receive buffers, base | `Sessions` (`t` plus each negotiated reactor's receive part) | The control share and each negotiated reactor's unsolicited receive bytes, including one maximal frame. An idle peer holds only this base. |
+| QUIC receive buffers, requests | `BlockSync`, `Consensus` or `Tx` request lease | The node raises the window (API-9) before each request goes out. Reads move bytes onto the same lease (`CreditHold`, API-10). Unspent credit drains once the peer can no longer spend it. |
+| QUIC send buffers | Base in `Sessions` (`t`), growth in `Serving` | A connection ticks every 50 ms only while its window is above the base or output waits. On each tick, a window with output waiting grows toward `min(2 × cwnd, serving_per_peer)`. After four idle ticks it shrinks to the base, and the shrunk lease drains once the connection accepts a byte. |
+| Serving bookkeeping | `Sessions` (the block-sync session part) | `BLOCK_SYNC_SESSION_BOOKKEEPING_BYTES`, 1 MiB per admitted session, funds 2,816 requests at 160 B each plus 144 KiB of setup. |
+| State reads | Fixed (`state_reads`) | The state's read limit, which the plan derives from read concurrency: one largest response per serving `NODE_EXECUTION` slot, one legacy `getdata` response in `Dual` mode and one decoded block for RPC. The state's parser allowance adds to it. A read beyond the limit is refused. |
+| Serving encoded output | `Serving` (`PeerSubPool` per peer) | The floor is one largest served response. A peer's cap is `serving_per_peer`: 96 MiB by default, and `[memory.cap]` can change it. `Serve` shrinks both grants to the encoded bytes at the response's ending. |
+| Requester bookkeeping | Fixed | `MAX_BS_INFLIGHT_REQUESTS`: 32,768 ranges and at most 128 MiB of expected hashes. |
+| Raw stream-6 frames awaiting the routine | The request's lease (`CreditHold`) | `BLOCK_SYNC_INBOUND_QUEUE_DEPTH` (8 frames). `Reservations::admit` disconnects a peer that sends more than it owes. |
+| Look-ahead above the commit window | `BlockSync` | The benefit cap: the peers' BBR windows plus `2 × commit_rate × p99_range_fetch_time`, at most the in-flight cap plus `max_reorder_lookahead_bytes` or `[memory.cap] look_ahead`. |
+| Commit-window bodies (`≤ verified_tip + 401`) | `Consensus` (reserved) | Reserved in full for the worst checkpoint window at admission's charge, `wire + max(4 × wire, decoded)` per block. The draft value is `401 × 5 × MAX_BLOCK_BYTES` (3.73 GiB) until a scan of the chain measures it. Each height holds at most one `Consensus` lease. It never waits on bulk. |
+| Control state | Fixed | 8,192 supplier cooldowns. `Status` keeps the latest value. |
+
+Startup checks every term against `B`, and the pool enforces the leases while the node runs. A
+raised operator setting whose worst case exceeds `B` starts the node with one warning per setting.
+While the node runs, it warns about an overrun at most once every 10 minutes.
 
 ## Serving
 
 ### Bookkeeping
 
-`S × (144 KiB + 2 × A × 160 B) ≤ 512 MiB` holds with `S` = 512 session slots and `A` = 2,816
-advertised requests. `compact_session_lifecycle_peak` measures the real retained bookkeeping
-at 142 to 153 B per request, so 160 B is an upper bound. The 144 KiB per-session allowance
-overcharges the measured fixed setup (about 10 KB).
-
-Before this change, a config whose slots could not fund one request logged a warning and
-advertised one request anyway. Now every production constructor validates the served limits
-first: `spawn_block_sync_reactor`, `BlockSyncService::new*` and the endpoint refuse such a
-config with `BlockSyncStartError::InvalidConfig` before binding or negotiating. 3,633 slots
-is the largest fundable count; 3,634 slots fail.
+Each admitted block-sync session leases its own `BLOCK_SYNC_SESSION_BOOKKEEPING_BYTES` (1 MiB) in
+its session base. That funds `144 KiB + 2 × 2,816 × 160 B`. It replaces one fixed 512 MiB table, which capped the
+node at 3,633 sessions. `compact_session_lifecycle_peak` measures the real retained
+bookkeeping at 142 to 153 B per request, so 160 B is an upper bound. Each session funds its 2,816
+advertised requests, and the `Sessions` share caps how many sessions are open at once.
 
 ### Storage work
 
@@ -118,8 +127,8 @@ range's cap, and the padding survives until consensus checks the auth-data commi
 Stream 6 therefore also declares an inbound queue depth of 8 frames
 (`BLOCK_SYNC_INBOUND_QUEUE_DEPTH`). A session holds at most those 8, the one the reader is
 forwarding and the one the routine keeps while it waits for decode capacity. Its raw frames
-therefore stay under 10 × 2 MB, about 20 MB, whatever the window. That is 1.8 GB across 92
-connections. Later frames wait in the 16 MiB QUIC stream receive
+therefore stay under 10 × 2 MB, about 20 MB, whatever the window. Each of those frames arrived
+under a request's receive credit, so the request's lease counts it. Later frames wait in the 16 MiB QUIC stream receive
 window the transport already budgets. The owed check still disconnects a peer that sends more
 than it was asked for. `block_sync_queues_a_fixed_number_of_bodies_whatever_the_reservations_owe`
 pins the depth with a precheck that owes an unlimited window.
@@ -270,7 +279,7 @@ Loopback CPU limits these figures, not the protocol: each case used 32–47 CPU-
 
 Per-session completions stayed within 0.4% of each other in every run, so no session starved.
 The stalled shape queues twice the advertised limit in all 512 sessions. Its 343 MB above
-baseline fits the 512 MiB bookkeeping budget.
+baseline fits the 512 sessions' bookkeeping, 1 MiB each.
 
 **Requesting end to end** (`zakura_mock_blocksync_throughput`, `ZAKURA_MOCK_BS_RUN=1`, 4 seeds,
 100,000 synthetic blocks of 1–16 transactions, 3 runs each, alternating): base 1,434–1,584

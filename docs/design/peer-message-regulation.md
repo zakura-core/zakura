@@ -39,25 +39,48 @@ only above the largest count a conformant peer can reach on this node's tally, u
 congestion, reordering between streams, or release timing. Counts between the advertised limit and
 that margin are served and traced.
 
-Limits never cost throughput. Every capacity default derives from one target, 10 Gbps per
-connection at 500 ms round-trip time, and a test checks each default against its derivation. A
-local capacity limit makes the node wait; it never faults a peer. QUIC flow control binds first
-today: a 32 MiB connection send window carries about 540 Mbps at 500 ms.
+Limits never cost throughput while the node's `[memory]` budget covers the work's demand. Each
+consumer's cap derives from its own benefit signal: BBR congestion windows and the commit rate times
+the p99 fetch time for block sync, `2 × cwnd` for serving send windows, and the mempool's capacity
+for `tx-relay`. Raising `[memory] budget` above demand therefore doesn't grow memory use. When the
+budget is smaller than demand, the pool delays bulk requests, serving output or send-window growth
+to stay within it. A local limit makes the node wait. That can cost a peer throughput, and it never
+faults or penalizes a peer.
 
-Paused reads leave a peer's data in QUIC's receive window, so the windows are also memory every
-peer can fill. The node bounds that credit by holding fewer connections, not by shrinking windows:
-`peer_memory_budget_bytes` (15 GiB) funds one 256 MiB datagram queue per bound socket,
-`max_pending_handshakes` (32) connections in their handshakes at 64 MiB of windows each, and
-admitted connections at their raised windows: the handshake window, each negotiated reactor's
-receive share and the send window, 141,937,353 B at the defaults. That admits 96, above the 92
-default peers, so the transport holds at most 124 live QUIC connections. A closed connection
-releases its stream buffers and waits out its drain in a separate, cheap allowance, so a peer that
-gets rejected and reconnects can't pile up buffers, and its closed connections take no slot from
-inbound peers. CTRL-26, ADM-12 and ADM-13 in the zakura-quic spec give the rules
-and the overheads the budget leaves out.
+Paused reads leave a peer's data in QUIC's receive window, so the windows are memory every peer
+can fill. The node used to reserve worst-case windows for every peer and bound the total by holding
+fewer connections. Now receive credit follows the node's own requests, and send windows follow the
+node's own congestion window:
 
-Configuration loading checks this budget only when the resolved P2P stack runs v2. Legacy-only
-nodes retain the configured value without enforcing it because they create no QUIC endpoint.
+- A connection in its handshake holds 128 KiB of windows (`CONTROL_RECEIVE_BYTES` and
+  `HANDSHAKE_SEND_WINDOW_BYTES`), not 64 MiB.
+- Admission leases each connection's transport base `t` from the pool's `Sessions` consumer: the
+  control receive share, one maximal block-sync frame of send window and discovery's unsolicited
+  receive share. It adds each negotiated reactor's unsolicited receive bytes, and the serving and
+  bookkeeping part of each reactor whose service admits the peer. `Sessions` never borrows past its
+  share. An idle peer holds only its bases.
+- A reactor that sends a request (block sync or `tx-relay`) first leases the expected response
+  bytes and raises the connection's receive window by them (API-9). Reads move those bytes onto the
+  same lease (`CreditHold`, API-10). A request that ends short keeps its unspent credit leased until
+  the peer can no longer spend it, or until the connection closes.
+- While serving output waits on a connection's send window, the `Serving` consumer leases growth
+  toward `min(2 × cwnd, serving_per_peer)`, and `PeerSubPool` shares it fairly across peers. After
+  four idle ticks of 50 ms, the window shrinks back to its base. A connection ticks only while its
+  window is above the base or output waits. The base holds one maximal block-sync frame and keeps
+  no room free; stream priority decides which stream gets the room that acknowledgments free. The shrunk lease drains once the
+  connection accepts a byte, or once it closes.
+- One `[memory] budget` replaces `[network.zakura] peer_memory_budget_bytes`. Its default `"auto"`
+  reads the tightest of host RAM and the cgroup limit, and the node derives
+  `B = (budget − base − sidecar) / ρ`. `B` bounds the ledger, and the process's total RSS is a
+  target, because `base` and `ρ` are measured. The `Consensus` reserve holds the chain's worst
+  401-block checkpoint window, so the chain sets the smallest host that can run. With the draft
+  values and `p2p_stack = "zakura"`, Mainnet needs about 12.8 GiB: 4 GiB and 8 GiB hosts refuse to
+  start, and 16 GiB hosts run. A raised operator setting whose worst case exceeds `B` starts the node with one
+  warning per setting. While the node runs, it warns about an overrun at most once every 10
+  minutes. CTRL-26, ADM-12 and ADM-13 in the `zakura-quic` spec state the transport rules.
+
+Configuration loading checks the startup memory plan only when the resolved P2P stack runs v2.
+Legacy-only nodes create no QUIC endpoint.
 
 ## Message checks and handler policy
 

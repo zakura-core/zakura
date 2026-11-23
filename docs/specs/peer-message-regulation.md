@@ -8,10 +8,18 @@
 
 ### Throughput and scope
 
-Message regulation MUST preserve high throughput. Implementations SHOULD rely on QUIC flow control,
-congestion control, and the protections in this specification. Implementations MUST bound message
-size, decoded allocations, active work, retained results, buffered bytes, and response authorization.
-They MUST apply node-wide resource bounds as well as per-peer bounds.
+Message regulation MUST preserve high throughput while the node's memory budget covers the work's
+demand. Implementations SHOULD rely on QUIC flow control, congestion control, and the protections
+in this specification. Implementations MUST bound message size, decoded allocations, active work,
+retained results, buffered bytes, and response authorization. They MUST apply node-wide resource
+bounds as well as per-peer bounds, and one node-wide memory budget (`[memory]`) MUST fund them.
+
+When the budget is smaller than the work's demand, a local memory limit MAY delay new requests,
+delay serving output, hold a send window below `2 × cwnd`, or refuse a connection or session. That
+bounds the budget's ledger at the cost of a peer's throughput. The budget's non-P2P base and
+allocator overhead are measured, not bounded, so the process's total resident memory is a target. A local memory limit MUST NOT count as a
+peer violation or cause a penalty. Reserved consumers (control, tip propagation and the consensus
+commit window) MUST NOT wait behind bulk demand.
 
 This specification does not require application-level byte-rate buckets, response-byte charges,
 refunds, or serving-rate refill timers. A future rate limit requires a measured resource cost that

@@ -64,9 +64,14 @@ blocks at a 75-second spacing. The node reads each block as it reaches 100 deep,
 reads older blocks in the window when it has nothing newer to do, and repairs
 its counts after a reorg.
 
-While its tip is recent enough to mine on, the node hands the counts to v2
-networking, which ranks the gateways by block count and keeps up to ten
-connection places for the highest-ranked gateways it can reach. When the tracker
+While its tip is recent enough to mine on, the node hands v2 networking the
+gateways named in at least 10 counted blocks. Networking ranks them by block
+count and keeps up to ten connection places for the highest-ranked gateways it
+can reach. A gateway named in fewer blocks is counted but not ranked, so the
+node neither dials it nor holds a place for it. Ten blocks is about 0.15% of a
+two-day window at a 25-second spacing: a pool that mines that rarely does not
+take a place, and a node that names another node's ID in its blocks must keep
+mining to hold that node a place. When the tracker
 next checks a stale tip, it publishes an empty ranking. Networking releases
 the held places when it applies that update. A node without a miner address
 holds no places.
@@ -117,8 +122,8 @@ counts, the places it holds, and its v2 peers. In this example the node has
   "gateways": [
     { "node_id": "4d70...b690", "blocks": 40, "state": "preferred", "connected": true },
     { "node_id": "67bb...f112", "blocks": 12, "state": "backoff", "connected": false },
-    { "node_id": "96dd...93ed", "blocks": 7, "state": "standby", "connected": true },
-    { "node_id": "ccc7...d947", "blocks": 3, "state": "unmatched", "connected": false }
+    { "node_id": "96dd...93ed", "blocks": 11, "state": "standby", "connected": true },
+    { "node_id": "ccc7...d947", "blocks": 10, "state": "unmatched", "connected": false }
   ],
   "hold": 1,
   "slots": { "limit": 40, "in_use": 3, "preferred": 1, "ordinary": 2, "inbound": 2 },
@@ -141,7 +146,7 @@ counts, the places it holds, and its v2 peers. In this example the node has
 | `window.newest`, `window.oldest` | The heights that count, or null while the tip is below 100. |
 | `window.checked` | Heights in the window read so far. |
 | `window.coverage` | The share of the window read, from 0 to 1. Below 1 the counts are a lower bound, as on a pruned node. A tip below 100 has an empty window, which reports 1. |
-| `gateways` | The last ranking applied by v2 networking, best first, at most 256 gateways. This node's own ID is left out. |
+| `gateways` | The last ranking applied by v2 networking, best first, at most 256 gateways. Only gateways named in at least 10 counted blocks are ranked, and this node's own ID is left out. |
 | `gateways[].state` | See below. |
 | `gateways[].connected` | The gateway is a v2 peer now. |
 | `hold` | The connection places held for preferred gateways. |

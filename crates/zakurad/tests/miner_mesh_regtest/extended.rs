@@ -17,7 +17,7 @@ use std::{
 use eyre::Result;
 
 use crate::common::regtest_net::{
-    GatewayId, NodeSpec, RegtestNet, Role, QUALIFYING_DEPTH, WINDOW_BLOCKS,
+    GatewayId, NodeSpec, RegtestNet, Role, MIN_GATEWAY_BLOCKS, QUALIFYING_DEPTH, WINDOW_BLOCKS,
 };
 
 use super::{DIAL_TIMEOUT, DISCOVERY_TIMEOUT, QUIET_PERIOD};
@@ -37,7 +37,7 @@ const RECONNECT_TIMEOUT: Duration = Duration::from_secs(150);
 /// The blocks mined between two checks while a marker ages.
 const AGING_STEP: u32 = 600;
 
-/// Twelve pools named in 12, 11, ..., 1 blocks: every mining node prefers and
+/// Twelve pools named in 21, 20, ..., 10 blocks: every mining node prefers and
 /// holds the ten highest pools other than itself, and never the rest. When
 /// two connected pools tie at the cutoff, the existing preferred pool keeps
 /// its place through the tie and the dial rounds that follow.
@@ -63,7 +63,8 @@ async fn top_ten_of_twelve_pools() -> Result<()> {
     }
     let incumbent = net.gateway_id(ranked[cutoff]);
     let challenger = net.gateway_id(ranked[cutoff + 1]);
-    for (pool, count) in ranked.into_iter().zip((1..=12).rev()) {
+    let counts = (MIN_GATEWAY_BLOCKS..MIN_GATEWAY_BLOCKS + 12).rev();
+    for (pool, count) in ranked.into_iter().zip(counts) {
         net.mine(pool, count).await?;
     }
     net.mine(M, QUALIFYING_DEPTH).await?;
@@ -102,7 +103,7 @@ async fn top_ten_of_twelve_pools() -> Result<()> {
     let count = |id| view.gateway(id).map(|gateway| gateway.blocks);
     assert_eq!(
         (count(&incumbent), count(&challenger)),
-        (Some(3), Some(3)),
+        (Some(MIN_GATEWAY_BLOCKS + 2), Some(MIN_GATEWAY_BLOCKS + 2)),
         "the connected pools tie for the last preferred place"
     );
     net.hold_for(
@@ -136,8 +137,8 @@ async fn gateway_restart_keeps_its_id() -> Result<()> {
     .await?;
     let (a, b) = (net.gateway_id(A), net.gateway_id(B));
 
-    net.mine(A, 2).await?;
-    net.mine(B, 1).await?;
+    net.mine(A, MIN_GATEWAY_BLOCKS + 1).await?;
+    net.mine(B, MIN_GATEWAY_BLOCKS).await?;
     net.mine(M, QUALIFYING_DEPTH).await?;
     let all_held = |net: &RegtestNet| {
         [B, M]
@@ -270,9 +271,11 @@ async fn deep_reorg_moves_the_ranking() -> Result<()> {
     Ok(())
 }
 
-/// A pool that stops mining leaves every ranking once its last marker is
-/// older than the window: two days of blocks plus the qualifying depth after
-/// it, 2,404 blocks on Regtest. Its connections stay, as ordinary ones.
+/// A pool that stops mining leaves every ranking once fewer than the minimum
+/// of its markers count. Its markers are consecutive, so that is when the
+/// first of them is older than the window: two days of blocks plus the
+/// qualifying depth after it, 2,404 blocks on Regtest. Its connections stay,
+/// as ordinary ones.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "starts zakurad children: run with the miner-mesh-regtest-extended nextest profile"]
 async fn markers_age_out() -> Result<()> {
@@ -295,7 +298,7 @@ async fn markers_age_out() -> Result<()> {
     .await?;
     let (a, b) = (net.gateway_id(A), net.gateway_id(B));
 
-    let last_marker = net.mine(A, 1).await?.height.0;
+    let first_marker = net.mine(A, MIN_GATEWAY_BLOCKS).await?.height.0 + 1 - MIN_GATEWAY_BLOCKS;
     net.mine(B, 1).await?;
     let mut tip = net.mine(M, QUALIFYING_DEPTH).await?.height.0;
     net.wait_for("B and M holding A", DISCOVERY_TIMEOUT, |net| {
@@ -305,18 +308,18 @@ async fn markers_age_out() -> Result<()> {
     })
     .await?;
 
-    // From here only B mines, so B stays ranked while A's marker ages.
-    let last_tip_counting_a = last_marker + QUALIFYING_DEPTH + WINDOW_BLOCKS - 1;
-    while tip < last_tip_counting_a {
-        let step = (last_tip_counting_a - tip).min(AGING_STEP);
+    // From here only B mines, so B stays ranked while A's markers age.
+    let last_tip_counting_all_of_a = first_marker + QUALIFYING_DEPTH + WINDOW_BLOCKS - 1;
+    while tip < last_tip_counting_all_of_a {
+        let step = (last_tip_counting_all_of_a - tip).min(AGING_STEP);
         tip = net.mine(B, step).await?.height.0;
     }
     for node in [B, M] {
         let view = net.view(node);
         assert_eq!(
             view.gateway(&a).map(|gateway| gateway.blocks),
-            Some(1),
-            "node {node} still counts A's marker at the oldest height of its window",
+            Some(MIN_GATEWAY_BLOCKS),
+            "node {node} still counts A's first marker at the oldest height of its window",
         );
         assert!(view.prefers_and_holds(&a), "node {node} still holds A");
     }
@@ -330,7 +333,7 @@ async fn markers_age_out() -> Result<()> {
         assert_eq!(
             net.view(node).gateway(&a),
             None,
-            "node {node} no longer ranks A"
+            "node {node} no longer ranks A, one marker short of the minimum"
         );
     }
     let only_b_is_preferred = |net: &RegtestNet| {

@@ -64,7 +64,8 @@ pub struct GetMinerMeshInfoResponse {
     pub window: Option<MeshWindow>,
 
     /// The last ranking applied by v2 networking, best first, at most 256.
-    /// It can briefly reflect an earlier tip freshness decision than `synced`.
+    /// Only gateways named in at least 10 counted blocks are ranked. It can
+    /// briefly reflect an earlier tip freshness decision than `synced`.
     pub gateways: Vec<MeshGateway>,
 
     /// The connection places held for preferred gateways.

@@ -119,6 +119,9 @@ const GATEWAY_MARKER_PREFIX: [u8; 5] = [0x6a, 0x23, b'M', b'R', 0x01];
 /// The blocks above a marker before the gateway it names counts.
 pub const QUALIFYING_DEPTH: u32 = 100;
 
+/// The fewest counted blocks that must name a gateway before a node ranks it.
+pub const MIN_GATEWAY_BLOCKS: u32 = 10;
+
 /// The heights a node counts, the newest at the qualifying depth: two days of
 /// blocks at Regtest's 75 second spacing.
 pub const WINDOW_BLOCKS: u32 = 2 * 24 * 60 * 60 / 75;
@@ -818,9 +821,9 @@ impl RegtestNet {
     }
 
     /// Waits until every running mining node of `island` has read its whole
-    /// window at `tip`, and reports for each gateway the count the harness
-    /// finds in the same blocks: standing invariant 6. A node never ranks its
-    /// own ID.
+    /// window at `tip`, and ranks each gateway the harness finds named in at
+    /// least [`MIN_GATEWAY_BLOCKS`] of the same blocks, with that count, and
+    /// no other: standing invariant 6. A node never ranks its own ID.
     async fn wait_for_matching_counts(&mut self, tip: Tip, island: &[usize]) -> Result<()> {
         let newest = tip.height.0.checked_sub(QUALIFYING_DEPTH);
         let oldest = newest.map(|height| height.saturating_sub(WINDOW_BLOCKS - 1));
@@ -857,6 +860,7 @@ impl RegtestNet {
                     }),
                 };
                 let mut expected = counts.clone();
+                expected.retain(|_, blocks| *blocks >= MIN_GATEWAY_BLOCKS);
                 expected.remove(&self.gateway_id(index));
                 if view.counts() != expected {
                     behind.push(format!(

@@ -28,7 +28,7 @@ use zakura_rpc::client::MeshGatewayState;
 
 #[cfg(feature = "prometheus")]
 use common::regtest_net::FillerRefusal;
-use common::regtest_net::{NodeSpec, RegtestNet, Role, QUALIFYING_DEPTH};
+use common::regtest_net::{NodeSpec, RegtestNet, Role, MIN_GATEWAY_BLOCKS, QUALIFYING_DEPTH};
 
 /// How long nodes get to learn each other's addresses by peer exchange and
 /// connect.
@@ -57,9 +57,11 @@ const HOLD: Duration = Duration::from_secs(45);
 
 /// Three pools and a miner that only know a relay hub find each other: every
 /// mining node ranks the pools by the blocks that name them, learns their
-/// addresses by peer exchange, and keeps each one in a held place. The pools
-/// end up fully meshed, and a miner that names no gateway is ranked nowhere
-/// yet prefers every pool. Relays rank nothing.
+/// addresses by peer exchange, and keeps each one in a held place. A pool
+/// named in one block fewer than the minimum is counted but ranked nowhere
+/// until one more of its blocks counts. The pools end up fully meshed, and a
+/// miner that names no gateway is ranked nowhere yet prefers every pool.
+/// Relays rank nothing.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "starts zakurad children: run with the miner-mesh-regtest nextest profile"]
 async fn pools_form_a_mesh() -> Result<()> {
@@ -81,26 +83,44 @@ async fn pools_form_a_mesh() -> Result<()> {
     ])
     .await?;
     let pools = [A, B, C];
+    let c = net.gateway_id(C);
 
-    net.mine(A, 3).await?;
-    net.mine(B, 2).await?;
-    net.mine(C, 1).await?;
-    net.mine(M, QUALIFYING_DEPTH).await?;
+    net.mine(A, MIN_GATEWAY_BLOCKS + 2).await?;
+    net.mine(B, MIN_GATEWAY_BLOCKS + 1).await?;
+    net.mine(C, MIN_GATEWAY_BLOCKS).await?;
+    // C's last block is 99 deep, so C counts one block short of the minimum.
+    net.mine(M, QUALIFYING_DEPTH - 1).await?;
 
+    let prefers_every_other = |net: &RegtestNet, ranked: &[usize]| {
+        [A, B, C, M].into_iter().all(|node| {
+            let view = net.view(node);
+            let others: Vec<_> = ranked.iter().filter(|&&pool| pool != node).collect();
+            view.ranking().len() == others.len()
+                && others
+                    .iter()
+                    .all(|&&pool| view.prefers_and_holds(&net.gateway_id(pool)))
+        })
+    };
+    net.wait_for(
+        "every mining node preferring and holding A and B, and not ranking C",
+        DISCOVERY_TIMEOUT,
+        |net| prefers_every_other(net, &[A, B]),
+    )
+    .await?;
+    for node in [A, B, M] {
+        assert_eq!(
+            net.view(node).state_of(&c),
+            None,
+            "node {node} ranks C below the minimum"
+        );
+    }
+
+    net.mine(M, 1).await?;
     let ranked_pools = net.gateway_ids(pools);
     net.wait_for(
         "every mining node preferring and holding every other pool",
         DISCOVERY_TIMEOUT,
-        |net| {
-            [A, B, C, M].into_iter().all(|node| {
-                let view = net.view(node);
-                let others: Vec<_> = pools.iter().filter(|&&pool| pool != node).collect();
-                view.ranking().len() == others.len()
-                    && others
-                        .iter()
-                        .all(|&&pool| view.prefers_and_holds(&net.gateway_id(pool)))
-            })
-        },
+        |net| prefers_every_other(net, &pools),
     )
     .await?;
 
@@ -164,7 +184,7 @@ async fn a_full_node_still_reaches_a_gateway() -> Result<()> {
     let hub_before = net.view(B).peer(&hub).cloned();
 
     net.start_node(A).await?;
-    net.mine(A, 1).await?;
+    net.mine(A, MIN_GATEWAY_BLOCKS).await?;
     net.mine(B, QUALIFYING_DEPTH - 1).await?;
     assert_eq!(net.view(B).state_of(&a), None);
     assert!(!net.view(B).is_connected_to(&a));
@@ -245,7 +265,7 @@ async fn a_connected_gateway_is_promoted_in_place() -> Result<()> {
 
     // Either node may end up holding the connection it opened; what matters
     // is that one connection, in one direction, lasts.
-    net.mine(A, 1).await?;
+    net.mine(A, MIN_GATEWAY_BLOCKS).await?;
     let one_connection = |net: &RegtestNet| {
         let view = net.view(B);
         view.is_connected_to(&a)
@@ -262,7 +282,7 @@ async fn a_connected_gateway_is_promoted_in_place() -> Result<()> {
     assert_eq!(
         net.view(B).state_of(&a),
         None,
-        "A's marker is not deep enough yet"
+        "A's markers are not deep enough yet"
     );
 
     net.mine(B, QUALIFYING_DEPTH - 1).await?;
@@ -312,13 +332,18 @@ async fn an_unknown_gateway_waits_then_joins() -> Result<()> {
     .await?;
     let a = net.gateway_id(A);
 
-    // A mines its marker alone, and the block reaches the hub by RPC, so no
+    // A mines its markers alone, and the blocks reach the hub by RPC, so no
     // node has a record of A.
-    net.mine(A, 1).await?;
-    let marker = net.block(A, 1).await?;
+    net.mine(A, MIN_GATEWAY_BLOCKS).await?;
+    let mut markers = Vec::new();
+    for height in 1..=MIN_GATEWAY_BLOCKS {
+        markers.push(net.block(A, height).await?);
+    }
     net.stop(A).await;
     net.start_node(HUB).await?;
-    net.submit_block(HUB, marker).await?;
+    for marker in markers {
+        net.submit_block(HUB, marker).await?;
+    }
     net.start_node(B).await?;
     net.settle().await?;
     net.mine(B, QUALIFYING_DEPTH).await?;
@@ -367,8 +392,8 @@ async fn an_unreachable_gateway_gives_way() -> Result<()> {
     .await?;
     let (a, c) = (net.gateway_id(A), net.gateway_id(C));
 
-    net.mine(A, 2).await?;
-    net.mine(C, 1).await?;
+    net.mine(A, MIN_GATEWAY_BLOCKS + 1).await?;
+    net.mine(C, MIN_GATEWAY_BLOCKS).await?;
     net.mine(B, QUALIFYING_DEPTH).await?;
     net.wait_for("B holding A", DISCOVERY_TIMEOUT, |net| {
         net.view(B).prefers_and_holds(&a)

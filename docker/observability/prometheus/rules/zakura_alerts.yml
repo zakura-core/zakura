@@ -92,17 +92,29 @@ groups:
           summary: "Release is past its end of service and keeps running"
           description: "The chain tip is past the last height this Zakura release supports (blocks remaining: {{ $value }}). Install the latest release."
 
-      # The gauge is only above zero while an unsupported release runs ahead of a network
-      # upgrade that it was built with. It cannot see an upgrade scheduled after the
-      # release was built. 10368 blocks is three days.
+      # The gauge is only above zero while a release that keeps running is ahead of a
+      # network upgrade that activates after its end of service. It only covers upgrades
+      # the release was built with: one scheduled later is invisible to the node.
+      # 10368 blocks is three days.
       - alert: ZakuraUnsupportedReleaseBeforeNetworkUpgrade
         expr: end_of_support_blocks_until_next_upgrade > 0 and end_of_support_blocks_until_next_upgrade < 10368
         for: 15m
         labels:
           severity: critical
         annotations:
-          summary: "Unsupported release is within 3 days of a network upgrade"
-          description: "A network upgrade activates in {{ $value }} blocks and this Zakura release is unsupported. Later releases can change how the upgrade is handled. Install the latest release before then."
+          summary: "Release will be unsupported at a network upgrade within 3 days"
+          description: "A network upgrade activates in {{ $value }} blocks, after the last height this Zakura release supports. Later releases can change how the upgrade is handled. Install the latest release before then."
+
+      # The gauge is 1 once an unsupported release has kept running through a network
+      # upgrade that it was built with.
+      - alert: ZakuraUnsupportedReleasePastNetworkUpgrade
+        expr: end_of_support_upgrade_activated_unsupported == 1
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Unsupported release is running past a network upgrade"
+          description: "A network upgrade activated after the last height this Zakura release supports. Later releases can change how the upgrade is handled, so this node might not follow the network. Install the latest release."
 
   # Value Pool Alerts (Monitoring)
   - name: zakura-value-pools

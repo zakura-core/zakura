@@ -20,8 +20,8 @@ use zakura_chain::{
 };
 use zakurad::components::sync::end_of_support::{
     self, Config, SupportWindow, CHECK_INTERVAL, EOS_KEEPS_RUNNING_MESSAGE_HEADER,
-    EOS_PANIC_MESSAGE_HEADER, EOS_UNSUPPORTED_MESSAGE_HEADER, EOS_UPGRADE_AHEAD_MESSAGE_HEADER,
-    EOS_WARN_MESSAGE_HEADER, ESTIMATED_RELEASE_HEIGHT,
+    EOS_PANIC_MESSAGE_HEADER, EOS_UNSUPPORTED_MESSAGE_HEADER, EOS_UPGRADE_ACTIVATED_MESSAGE_HEADER,
+    EOS_UPGRADE_AHEAD_MESSAGE_HEADER, EOS_WARN_MESSAGE_HEADER, ESTIMATED_RELEASE_HEIGHT,
 };
 
 /// The release supports this height and halts at the next block.
@@ -160,31 +160,69 @@ fn end_of_support_halt_can_be_turned_off() {
     assert!(!logs.contains(EOS_PANIC_MESSAGE_HEADER));
 }
 
-/// Test that a release that runs unsupported is warned about a network upgrade
-/// ahead of its tip.
+/// Test that a release that keeps running is warned about a network upgrade it
+/// reaches unsupported, before and after the upgrade activates.
 #[test]
-fn unsupported_release_is_warned_about_an_upgrade_ahead() {
-    let (logs, dispatch) = log_capture::capture_logs();
-    let _log_guard = tracing::dispatcher::set_default(&dispatch);
+fn release_that_keeps_running_is_warned_about_an_upgrade_after_its_window() {
     let window = window_ending_before_last_upgrade(1_000);
     let activation_height = last_mainnet_activation_height();
-
-    // The upgrade is not reported once it has activated.
-    end_of_support::check(activation_height, &window, &Network::Mainnet, KEEPS_RUNNING);
-    assert!(logs.contains(EOS_UNSUPPORTED_MESSAGE_HEADER));
-    assert!(!logs.contains(EOS_UPGRADE_AHEAD_MESSAGE_HEADER));
-
-    end_of_support::check(
-        Height(activation_height.0 - 100),
-        &window,
-        &Network::Mainnet,
-        KEEPS_RUNNING,
-    );
-    assert!(logs.contains(EOS_UPGRADE_AHEAD_MESSAGE_HEADER));
-    assert!(logs.contains(&format!(
-        "activates at block {}, in 100 blocks",
+    let ahead = format!(
+        "{EOS_UPGRADE_AHEAD_MESSAGE_HEADER}: {} activates at block {}",
+        NetworkUpgrade::current(&Network::Mainnet, activation_height),
         activation_height.0
-    )));
+    );
+
+    // The upgrade is already named while the window is about to end.
+    let (logs, dispatch) = log_capture::capture_logs();
+    tracing::dispatcher::with_default(&dispatch, || {
+        end_of_support::check(
+            window.last_supported_height(),
+            &window,
+            &Network::Mainnet,
+            KEEPS_RUNNING,
+        );
+    });
+    assert!(logs.contains(EOS_KEEPS_RUNNING_MESSAGE_HEADER));
+    assert!(logs.contains(&format!("{ahead}, in 1000 blocks")));
+    assert!(!logs.contains(EOS_UPGRADE_ACTIVATED_MESSAGE_HEADER));
+
+    // Past the window, it is named until it activates.
+    let (logs, dispatch) = log_capture::capture_logs();
+    tracing::dispatcher::with_default(&dispatch, || {
+        end_of_support::check(
+            Height(activation_height.0 - 100),
+            &window,
+            &Network::Mainnet,
+            KEEPS_RUNNING,
+        );
+    });
+    assert!(logs.contains(EOS_UNSUPPORTED_MESSAGE_HEADER));
+    assert!(logs.contains(&format!("{ahead}, in 100 blocks")));
+    assert!(!logs.contains(EOS_UPGRADE_ACTIVATED_MESSAGE_HEADER));
+
+    // From its activation on, the warning says that the release went through it.
+    // A node that syncs past both heights between two checks still gets this one.
+    for tip_height in [activation_height, Height(activation_height.0 + 50_000)] {
+        let (logs, dispatch) = log_capture::capture_logs();
+        tracing::dispatcher::with_default(&dispatch, || {
+            end_of_support::check(tip_height, &window, &Network::Mainnet, KEEPS_RUNNING);
+        });
+        assert!(logs.contains(EOS_UNSUPPORTED_MESSAGE_HEADER));
+        assert!(!logs.contains(EOS_UPGRADE_AHEAD_MESSAGE_HEADER));
+        assert!(logs.contains(&format!(
+            "{EOS_UPGRADE_ACTIVATED_MESSAGE_HEADER}: {} activated at block {}",
+            NetworkUpgrade::current(&Network::Mainnet, activation_height),
+            activation_height.0
+        )));
+    }
+
+    // A release that is still supported is not warned about its own upgrades.
+    let (logs, dispatch) = log_capture::capture_logs();
+    tracing::dispatcher::with_default(&dispatch, || {
+        end_of_support::check(Height(0), &window, &Network::Mainnet, KEEPS_RUNNING);
+    });
+    assert!(!logs.contains(EOS_UPGRADE_AHEAD_MESSAGE_HEADER));
+    assert!(!logs.contains(EOS_UPGRADE_ACTIVATED_MESSAGE_HEADER));
 }
 
 /// Test the end of support values reported to the metrics endpoint.

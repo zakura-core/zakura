@@ -116,6 +116,9 @@ stock `zcash/zcash` in three ways:
    itself down at its deprecation height; the sidecar build logs a warning
    and keeps serving its wallet/RPC surface. Consensus safety comes from
    Zakura, which fully validates every block before relaying it to zcashd.
+   Zakura's own halt is then the only one left, so leave
+   [`end_of_support.halt`](end-of-support.md) on unless you track upgrades
+   yourself.
 
 Everything else — chainstate format, RPC semantics, ZMQ — matches stock
 zcashd. The wallet carries the Ironwood/Orchard shielded-pool limits from the

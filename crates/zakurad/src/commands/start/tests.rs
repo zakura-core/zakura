@@ -1,13 +1,13 @@
 use eyre::eyre;
 use tokio_util::sync::CancellationToken;
-use zakura_chain::block;
+use zakura_chain::{block, parameters::Network};
 
 use super::{error_exit_status, supervise_block_sync_driver, NodeTasks, StartCmd};
 use crate::components::zcashd_compat;
 use crate::config::ZakuradConfig;
 use zakura_network::types::PeerServices;
 use zakura_network::P2pStack;
-use zakura_rpc::config::mining::{default_miner_address, MinerAddressType};
+use zakura_rpc::config::mining::{self, default_miner_address, MinerAddressType};
 use zakura_state::{PruningConfig, StorageMode};
 
 #[tokio::test]
@@ -143,21 +143,25 @@ fn turning_off_the_end_of_support_halt_is_refused_on_a_mining_node() {
         zcashd_compat: false,
         unsafe_low_specs: false,
     };
-    let miner_address = default_miner_address(
-        ZakuradConfig::default().network.network.kind(),
-        &MinerAddressType::Transparent,
-    )
-    .parse()
-    .expect("the default miner address is valid");
+    let mining_with_address = mining::Config {
+        miner_address: Some(
+            default_miner_address(Network::Mainnet.kind(), &MinerAddressType::Transparent)
+                .parse()
+                .expect("the default miner address is valid"),
+        ),
+        ..Default::default()
+    };
     let refused = "end_of_support.halt = false is not allowed on a mining node";
 
+    // Support only ends on Mainnet.
     let mut config = ZakuradConfig::default();
+    config.network.network = Network::Mainnet;
     config.end_of_support.halt = false;
     cmd.override_config(config.clone())
         .expect("a node that does not mine can turn the halt off");
 
     // A node that can build block templates is a miner.
-    config.mining.miner_address = Some(miner_address);
+    config.mining = mining_with_address.clone();
     let error = cmd
         .override_config(config.clone())
         .expect_err("a node with a miner address keeps the halt");
@@ -166,25 +170,31 @@ fn turning_off_the_end_of_support_halt_is_refused_on_a_mining_node() {
         "unexpected error: {error}"
     );
 
-    // So is a node that runs the internal miner.
-    config.mining.miner_address = None;
-    config.mining.internal_miner = true;
-    let error = cmd
-        .override_config(config.clone())
-        .expect_err("a node with the internal miner keeps the halt");
-    assert!(
-        error.to_string().contains(refused),
-        "unexpected error: {error}"
-    );
+    // So is a node that runs the internal miner, which needs the `internal-miner` feature.
+    config.mining = mining::Config {
+        internal_miner: true,
+        ..Default::default()
+    };
+    let result = cmd.override_config(config.clone());
+    if cfg!(feature = "internal-miner") {
+        let error = result.expect_err("a node with the internal miner keeps the halt");
+        assert!(
+            error.to_string().contains(refused),
+            "unexpected error: {error}"
+        );
+    } else {
+        result.expect("a build without the internal miner does not mine");
+    }
 
     // Miners start as long as they keep the halt.
+    config.mining = mining_with_address;
     config.end_of_support.halt = true;
     cmd.override_config(config.clone())
         .expect("a mining node that keeps the halt is valid");
 
     // Support does not end outside Mainnet, so there is no halt for a miner to keep.
     config.end_of_support.halt = false;
-    config.network.network = zakura_chain::parameters::Network::new_default_testnet();
+    config.network.network = Network::new_default_testnet();
     cmd.override_config(config)
         .expect("a Testnet miner has no halt to turn off");
 }

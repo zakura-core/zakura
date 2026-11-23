@@ -71,10 +71,15 @@ pub const EOS_KEEPS_RUNNING_MESSAGE_HEADER: &str =
 /// running past its last supported height.
 pub const EOS_UNSUPPORTED_MESSAGE_HEADER: &str = "Your Zakura release is unsupported";
 
-/// A string which is part of the warning displayed while an unsupported release
-/// keeps running ahead of a network upgrade.
+/// A string which is part of the warning displayed while a release that keeps
+/// running past its support window is ahead of a network upgrade after that window.
 pub const EOS_UPGRADE_AHEAD_MESSAGE_HEADER: &str =
-    "Your unsupported Zakura release is approaching a network upgrade";
+    "Your Zakura release will reach a network upgrade unsupported";
+
+/// A string which is part of the warning displayed once an unsupported release
+/// has kept running through a network upgrade.
+pub const EOS_UPGRADE_ACTIVATED_MESSAGE_HEADER: &str =
+    "Your unsupported Zakura release is running past a network upgrade";
 
 /// Where operators get the latest release.
 const LATEST_RELEASE_URL: &str = "https://github.com/zakura-core/zakura/releases/latest";
@@ -108,13 +113,20 @@ const EOS_HEIGHT_METRIC: &str = "end_of_support.last_supported_height";
 /// is off.
 const EOS_REMAINING_BLOCKS_METRIC: &str = "end_of_support.remaining_blocks";
 
-/// The metric that reports how many blocks are left before the next network
-/// upgrade, while an unsupported release keeps running ahead of it.
+/// The metric that reports how many blocks are left before a network upgrade
+/// that the release will reach unsupported, see [`unsupported_upgrade_ahead`].
 ///
 /// Only set on networks where support ends. It is `0` in every other state. Like
 /// the other gauges it is refreshed at each check, so it can lag the tip by up
 /// to [`CHECK_INTERVAL`].
 const EOS_BLOCKS_UNTIL_UPGRADE_METRIC: &str = "end_of_support.blocks_until_next_upgrade";
+
+/// The metric that reports whether an unsupported release has kept running
+/// through a network upgrade, see [`unsupported_upgrade_activated`].
+///
+/// Only set on networks where support ends. It is `1` in that state and `0`
+/// otherwise.
+const EOS_UPGRADE_ACTIVATED_METRIC: &str = "end_of_support.upgrade_activated_unsupported";
 
 /// End of support configuration section.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -129,7 +141,7 @@ pub struct Config {
     /// upgrade it was built without, so the operator has to track upgrades.
     ///
     /// Mining nodes always halt: on a network where support ends, `false` is
-    /// rejected when `mining.miner_address` or `mining.internal_miner` is set.
+    /// rejected when `mining.miner_address` is set or the internal miner runs.
     pub halt: bool,
 }
 
@@ -240,17 +252,62 @@ pub fn upgrade_ahead(tip_height: Height, network: &Network) -> Option<UpgradeAhe
     })
 }
 
-/// Returns the network upgrade ahead of a release that keeps running past
-/// `window`, or `None` while the release is supported or halts.
+/// Returns the network upgrade that a release which keeps running past `window`
+/// will reach unsupported: the next upgrade ahead of `tip_height`, if it
+/// activates after the window.
+///
+/// Returns `None` while the end of the window is not close, and for a release
+/// that halts at the end of its window.
 pub fn unsupported_upgrade_ahead(
     tip_height: Height,
     window: &SupportWindow,
     network: &Network,
     config: Config,
 ) -> Option<UpgradeAhead> {
-    (!config.halt && window.status(tip_height) == SupportStatus::Expired)
-        .then(|| upgrade_ahead(tip_height, network))
-        .flatten()
+    if config.halt || window.status(tip_height) == SupportStatus::Supported {
+        return None;
+    }
+
+    upgrade_ahead(tip_height, network)
+        .filter(|upgrade_ahead| upgrade_ahead.activation_height > window.last_supported_height)
+}
+
+/// A network upgrade that activated while the release was unsupported.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UpgradeActivated {
+    /// The latest network upgrade that activated after the support window.
+    pub upgrade: NetworkUpgrade,
+    /// The height at which it activated.
+    pub activation_height: Height,
+}
+
+/// Returns the latest network upgrade that a release which keeps running past
+/// `window` has gone through unsupported: one that activated after the window,
+/// at or below `tip_height`.
+///
+/// Returns `None` for a release that halts at the end of its window.
+pub fn unsupported_upgrade_activated(
+    tip_height: Height,
+    window: &SupportWindow,
+    network: &Network,
+    config: Config,
+) -> Option<UpgradeActivated> {
+    if config.halt || window.status(tip_height) != SupportStatus::Expired {
+        return None;
+    }
+
+    // The tip is past the window, so this range is not empty or inverted.
+    network
+        .activation_list()
+        .range((
+            Bound::Excluded(window.last_supported_height),
+            Bound::Included(tip_height),
+        ))
+        .next_back()
+        .map(|(activation_height, upgrade)| UpgradeActivated {
+            upgrade: *upgrade,
+            activation_height: *activation_height,
+        })
 }
 
 /// Runs the end of support checking task.
@@ -303,6 +360,13 @@ pub async fn start(
                 .map_or(0.0, |upgrade_ahead| {
                     f64::from(upgrade_ahead.remaining_blocks)
                 }),
+        );
+        metrics::gauge!(EOS_UPGRADE_ACTIVATED_METRIC).set(
+            if unsupported_upgrade_activated(tip_height, &window, &network, config).is_some() {
+                1.0
+            } else {
+                0.0
+            },
         );
         check(tip_height, &window, &network, config);
 
@@ -360,8 +424,9 @@ fn estimated_height_after_release(network: &Network, days: u32) -> Height {
 /// Reports where `tip_height` falls in `window`, and panics if the release is
 /// too old and [`Config::halt`] is on.
 ///
-/// With the halt off, a release past its window gets a warning instead. It gets
-/// a second warning while a network upgrade on `network` is still ahead of it.
+/// With the halt off, a release past its window gets a warning instead. Further
+/// warnings name a network upgrade on `network` that the release will reach
+/// unsupported, and one it has already gone through unsupported.
 pub fn check(tip_height: Height, window: &SupportWindow, network: &Network, config: Config) {
     info!("Checking if Zakura release is inside support range ...");
 
@@ -406,6 +471,15 @@ pub fn check(tip_height: Height, window: &SupportWindow, network: &Network, conf
             upgrade_ahead.upgrade,
             upgrade_ahead.activation_height.0,
             upgrade_ahead.remaining_blocks,
+        );
+    }
+
+    if let Some(activated) = unsupported_upgrade_activated(tip_height, window, network, config) {
+        warn!(
+            "{EOS_UPGRADE_ACTIVATED_MESSAGE_HEADER}: {} activated at block {}, after the last \
+            height this release supports. Later releases can change how the upgrade is \
+            handled, so this node might not follow the network. \n{release} \n{hint}",
+            activated.upgrade, activated.activation_height.0,
         );
     }
 }
@@ -551,28 +625,93 @@ mod tests {
     }
 
     #[test]
-    fn upgrade_ahead_only_concerns_a_release_that_runs_unsupported() {
+    fn upgrade_ahead_only_concerns_a_release_that_reaches_it_unsupported() {
         let _init_guard = zakura_test::init();
         let network = Network::Mainnet;
         let (activation_height, _) = last_mainnet_upgrade();
         let window = SupportWindow::ending_at(Height(activation_height.0 - 1_000), &network);
         let unsupported_tip = Height(activation_height.0 - 100);
+        let expiring_tip = window.last_supported_height();
         let keeps_running = Config { halt: false };
 
+        assert!(upgrade_ahead(unsupported_tip, &network).is_some());
         assert_eq!(
             unsupported_upgrade_ahead(unsupported_tip, &window, &network, keeps_running),
             upgrade_ahead(unsupported_tip, &network),
         );
-        assert!(upgrade_ahead(unsupported_tip, &network).is_some());
+        // The upgrade is already named while the window is about to end.
+        assert_eq!(window.status(expiring_tip), SupportStatus::Expiring);
+        assert_eq!(
+            unsupported_upgrade_ahead(expiring_tip, &window, &network, keeps_running),
+            upgrade_ahead(expiring_tip, &network),
+        );
 
         // A release that halts never runs unsupported.
         assert_eq!(
             unsupported_upgrade_ahead(unsupported_tip, &window, &network, Config::default()),
             None,
         );
-        // A supported release is not warned about the upgrades it implements.
         assert_eq!(
-            unsupported_upgrade_ahead(
+            unsupported_upgrade_ahead(expiring_tip, &window, &network, Config::default()),
+            None,
+        );
+        // Nothing is reported while the end of the window is not close.
+        assert_eq!(window.status(Height(0)), SupportStatus::Supported);
+        assert_eq!(
+            unsupported_upgrade_ahead(Height(0), &window, &network, keeps_running),
+            None,
+        );
+        // Nothing is ahead once the last known upgrade has activated.
+        assert_eq!(
+            unsupported_upgrade_ahead(activation_height, &window, &network, keeps_running),
+            None,
+        );
+
+        // A release is supported at an upgrade that activates inside its window.
+        let window = SupportWindow::ending_at(Height(activation_height.0 + 1_000), &network);
+        let expiring_tip = Height(activation_height.0 - 10);
+        assert_eq!(window.status(expiring_tip), SupportStatus::Expiring);
+        assert_eq!(
+            unsupported_upgrade_ahead(expiring_tip, &window, &network, keeps_running),
+            None,
+        );
+    }
+
+    #[test]
+    fn upgrade_activated_is_the_latest_one_after_the_support_window() {
+        let _init_guard = zakura_test::init();
+        let network = Network::Mainnet;
+        let (activation_height, upgrade) = last_mainnet_upgrade();
+        let window = SupportWindow::ending_at(Height(activation_height.0 - 1_000), &network);
+        let keeps_running = Config { halt: false };
+        let activated = Some(UpgradeActivated {
+            upgrade,
+            activation_height,
+        });
+
+        // The upgrade is reported from its activation height on, for as long as
+        // the release keeps running.
+        assert_eq!(
+            unsupported_upgrade_activated(activation_height, &window, &network, keeps_running),
+            activated,
+        );
+        assert_eq!(
+            unsupported_upgrade_activated(Height::MAX, &window, &network, keeps_running),
+            activated,
+        );
+
+        // It has not activated one block earlier, and not while the release is supported.
+        assert_eq!(
+            unsupported_upgrade_activated(
+                Height(activation_height.0 - 1),
+                &window,
+                &network,
+                keeps_running
+            ),
+            None,
+        );
+        assert_eq!(
+            unsupported_upgrade_activated(
                 window.last_supported_height(),
                 &window,
                 &network,
@@ -580,9 +719,16 @@ mod tests {
             ),
             None,
         );
-        // Nothing is ahead once the last known upgrade has activated.
+        // A release that halts never runs unsupported.
         assert_eq!(
-            unsupported_upgrade_ahead(activation_height, &window, &network, keeps_running),
+            unsupported_upgrade_activated(Height::MAX, &window, &network, Config::default()),
+            None,
+        );
+
+        // An upgrade that activated inside the window was supported.
+        let window = SupportWindow::ending_at(activation_height, &network);
+        assert_eq!(
+            unsupported_upgrade_activated(Height::MAX, &window, &network, keeps_running),
             None,
         );
     }

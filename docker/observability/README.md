@@ -74,7 +74,7 @@ See [grafana/README.md](grafana/README.md) for dashboard details.
 
 Automated notifications for operational issues:
 
-- Critical: Negative value pools (ZIP-209 violation), release within 1 day of its end of service, unsupported release within 3 days of a network upgrade
+- Critical: Negative value pools (ZIP-209 violation), release within 1 day of its end of service, unsupported release within 3 days of a network upgrade or past one
 - Warning: High RPC latency, sync stalls, peer connection issues, release within 3 days of its end of service, release running past its end of service
 
 Configure alert destinations in [alertmanager/alertmanager.yml](alertmanager/alertmanager.yml).

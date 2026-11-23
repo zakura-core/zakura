@@ -359,18 +359,22 @@ impl StartCmd {
     ///
     /// A miner on an unsupported release can build blocks on outdated consensus rules, so
     /// miners keep the halt. A node counts as a miner when it can build block templates
-    /// (`mining.miner_address`) or is configured to run the internal miner. Networks where
-    /// support does not end have no halt to keep, so miners there are not refused.
+    /// (`mining.miner_address`) or runs the internal miner. Networks where support does not
+    /// end have no halt to keep, so miners there are not refused.
     fn validate_end_of_support_config(config: &ZakuradConfig) -> Result<(), Report> {
-        let is_miner = config.mining.miner_address.is_some() || config.mining.internal_miner;
+        #[cfg(feature = "internal-miner")]
+        let runs_internal_miner = config.mining.is_internal_miner_enabled();
+        #[cfg(not(feature = "internal-miner"))]
+        let runs_internal_miner = false;
+        let is_miner = config.mining.miner_address.is_some() || runs_internal_miner;
         let support_ends =
             sync::end_of_support::SupportWindow::of_release(&config.network.network).is_some();
 
         if !config.end_of_support.halt && is_miner && support_ends {
             return Err(eyre!(
                 "end_of_support.halt = false is not allowed on a mining node; remove \
-                 mining.miner_address and mining.internal_miner, or set end_of_support.halt \
-                 to true"
+                 mining.miner_address and turn off mining.internal_miner, or set \
+                 end_of_support.halt to true"
             ));
         }
 

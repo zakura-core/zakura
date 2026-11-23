@@ -88,6 +88,16 @@ for either release path. An observing legacy or compatibility peer can request
 the exact bytes from memory while local consensus verification and commitment
 proceed. A failed commit withdraws outstanding permission to send that copy.
 
+For legacy TCP peers, a trusted job's early release uses the node's relay
+policy. By default the relay announces the block hash and the peer requests
+the body with `getdata`. A local `submitsolution` uses the mined-block policy,
+which sends the body directly to peers in the initial broadcast group that
+advertised `NODE_BLOCK_PUSH`. To enable that direct send for early trusted
+releases, set `push_relayed_blocks = true` in the relay's `[network]` section.
+The setting also enables pushes for other relayed blocks and can increase
+upload bandwidth. Peers that do not advertise the capability continue to
+request the body.
+
 A proposal may arrive before the relay has committed its parent, for example
 right after the primary issues a template on a new tip. The job then waits for
 the parent to become the relay's best tip. A job ends as stale as soon as the

@@ -7,6 +7,8 @@
 
 use std::sync::Arc;
 
+use zakura_rt::sync::Mutex;
+
 use super::{capacity::PeerBudgets, lease::ExecutionSlots, ResponseGrants, ServeCapacity};
 use crate::zakura::{Frame, FrameGuard, FramedSend, ZakuraPeerId, FRAME_HEADER_BYTES};
 
@@ -108,9 +110,9 @@ impl Push {
         #[cfg(any(test, zakura_sim))]
         self.report_acquired();
         let grants = ResponseGrants {
-            _node: node,
+            node: Mutex::new(node),
             _node_response: node_response,
-            _peer: peer,
+            peer: Mutex::new(peer),
             _peer_response: peer_response,
             _peer_budgets: self.peer.clone(),
             _unwritten: None,
@@ -178,6 +180,9 @@ impl PushSend<'_> {
     /// returning whether the transport queue took it
     /// ([`crate::zakura::transport::Queued`]).
     pub(crate) fn send(self, frame: Frame) -> crate::zakura::transport::Queued {
+        // Widening usize to u64 is lossless on supported targets.
+        let encoded_bytes = (frame.payload.len() + FRAME_HEADER_BYTES) as u64;
+        self.grants.shrink_to(encoded_bytes);
         self.slot
             .send(frame, FrameGuard::new(Arc::new(self.grants)))
     }

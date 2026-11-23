@@ -882,3 +882,87 @@ async fn a_timed_out_read_keeps_the_same_peer_budget_after_its_output_drains() {
         "a reconnect must find the still-running peer execution budget"
     );
 }
+
+/// Property mem-6 (`serve-shrinks-at-ending`): 32 stalled `RangeUnavailable`
+/// responses whose caps reserve 2 MiB each shrink at their endings and together
+/// hold well under 64 KiB across both node and peer output budgets.
+#[tokio::test]
+async fn thirty_two_stalled_range_unavailable_responses_hold_under_64_kib() {
+    const COUNT: u32 = 32;
+    const LIMIT_BYTES: u64 = 64 * 1024;
+    let max_body_bytes = u32::try_from(zakura_chain::block::MAX_BLOCK_BYTES).unwrap();
+    let per_response_cap = Range::new(block::Height(1), 1)
+        .unwrap()
+        .response_cap(max_body_bytes)
+        .output_bytes();
+    assert!(
+        per_response_cap > 2_000_000,
+        "each GetBlocks cap reserves over 2 MB before shrinking"
+    );
+    let capacity = ServeCapacity::new(
+        "block-sync",
+        &GET_BLOCKS,
+        ServeLimits {
+            node_output_responses: usize::try_from(COUNT).unwrap(),
+            peer_output_responses: usize::try_from(COUNT).unwrap(),
+            node_execution: 8,
+            peer_execution: 8,
+            // Only enough output budget for two full-cap responses at once:
+            // all 32 stalled endings can only complete because each shrinks.
+            peer_output_bytes: per_response_cap * 2,
+            node_output_bytes: per_response_cap * 2,
+        },
+    )
+    .unwrap();
+    let peer = ZakuraPeerId::new(vec![9; 32]).unwrap();
+    // Empty store returns RangeUnavailable for every GetBlocks request.
+    let source = stored_at(Vec::new(), true);
+    // One-frame output channel with no reader simulates a stalled peer.
+    let (send, _stalled_recv) = framed_channel(1);
+    let cancel = CancellationToken::new();
+    let serving = capacity.session(
+        Arc::new(Server::new(source, 128, max_body_bytes).unwrap()),
+        &peer,
+        COUNT,
+        send,
+        cancel.clone(),
+        cancel.clone(),
+        crate::zakura::CloseCause::default(),
+    );
+
+    for i in 0..COUNT {
+        let range = Range::new(block::Height(i + 1), 1).unwrap();
+        serving.admit(range).unwrap();
+    }
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while serving.open() != 0 || capacity.node_execution_held() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect(
+        "all 32 RangeUnavailable responses must queue their endings even with a stalled reader",
+    );
+
+    let ending_wire_bytes =
+        encode_frame(&Message::End(RangeEnding::unavailable(block::Height(1), 1)))
+            .unwrap()
+            .payload
+            .len() as u64
+            + crate::zakura::FRAME_HEADER_BYTES as u64;
+    let expected = u64::from(COUNT) * ending_wire_bytes;
+    assert_eq!(capacity.node_output_held(), expected);
+    assert_eq!(capacity.peer_held(&peer), (0, expected));
+    assert!(
+        capacity.node_output_held() < LIMIT_BYTES,
+        "32 stalled RangeUnavailable responses held {} bytes (>= 64 KiB)",
+        capacity.node_output_held()
+    );
+    assert!(
+        capacity.peer_held(&peer).1 < LIMIT_BYTES,
+        "peer output held {} bytes (>= 64 KiB)",
+        capacity.peer_held(&peer).1
+    );
+    cancel.cancel();
+}

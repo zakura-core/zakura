@@ -312,14 +312,30 @@ impl Drop for Commitment {
 pub(super) struct ResponseGrants {
     // Field order is drop order: the node grant returns first, as with
     // execution slots.
-    _node: OutputGrant,
+    node: Mutex<OutputGrant>,
     _node_response: SlotPermit,
-    _peer: OutputGrant,
+    peer: Mutex<OutputGrant>,
     _peer_response: SlotPermit,
     // Keep every peer budget discoverable while queued output survives a session.
     _peer_budgets: PeerBudgets,
     // Returns last, once every grant above has returned.
     _unwritten: Option<Unwritten>,
+}
+
+impl ResponseGrants {
+    /// Shrink both output grants to `bytes`, returning any surplus immediately
+    /// to the node and peer output budgets.
+    pub(super) fn shrink_to(&self, bytes: u64) {
+        // Release the node surplus before the peer surplus, matching drop order.
+        self.node
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .shrink_to(bytes);
+        self.peer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .shrink_to(bytes);
+    }
 }
 
 /// One admitted request in its session's count of unwritten responses.
@@ -716,9 +732,9 @@ impl<P: Produce> Dispatch<P> {
             .wait("node_output", node_output.grant(node_output.clamp(bytes)))
             .await?;
         let grants = ResponseGrants {
-            _node: node,
+            node: Mutex::new(node),
             _node_response: node_response,
-            _peer: peer,
+            peer: Mutex::new(peer),
             _peer_response: peer_response,
             _peer_budgets: self.peer.clone(),
             _unwritten: None,

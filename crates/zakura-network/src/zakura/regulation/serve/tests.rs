@@ -986,9 +986,9 @@ fn sink_and_core(
         cap,
         frames,
         Arc::new(ResponseGrants {
-            _node: grant(),
+            node: Mutex::new(grant()),
             _node_response: SlotBudget::new(1).unwrap().try_reserve().unwrap(),
-            _peer: grant(),
+            peer: Mutex::new(grant()),
             _peer_response: SlotBudget::new(1).unwrap().try_reserve().unwrap(),
             _peer_budgets: capacity(LIMITS).peer(&peer(1)),
             _unwritten: None,
@@ -1705,4 +1705,70 @@ async fn an_observed_session_reports_each_count_and_release_with_its_frame() {
     );
     assert_eq!(session.serve.open(), 1);
     second.add_permits(1);
+}
+
+/// Property mem-6 (`serve-shrinks-at-ending`) and mem-2 outbound coverage:
+/// queuing an ending shrinks both node and peer output grants to the encoded
+/// response bytes, and those encoded bytes remain covered until the last frame
+/// finishes its transport write.
+#[tokio::test]
+async fn queuing_an_ending_shrinks_both_output_grants_to_encoded_bytes() {
+    let request = Job {
+        parts: 16,
+        part_len: 64,
+        fail_after: Some(1),
+        ..job()
+    };
+    let cap_bytes = Scripted.response_cap(&request).output_bytes();
+    let limits = ServeLimits {
+        node_output_responses: 4,
+        peer_output_responses: 4,
+        node_execution: 2,
+        peer_execution: 2,
+        peer_output_bytes: cap_bytes * 2,
+        node_output_bytes: cap_bytes * 2,
+    };
+    let capacity = capacity(limits);
+    let peer_id = peer(1);
+    let mut session = session(&capacity, 1, 4);
+    let gate = Arc::new(Semaphore::new(0));
+    session
+        .serve
+        .admit(Job {
+            per_part: Some(gate.clone()),
+            ..request
+        })
+        .unwrap();
+    settle().await;
+    // Before the ending is queued, both budgets hold the full response cap.
+    assert_eq!(capacity.node_output_held(), cap_bytes);
+    assert_eq!(capacity.peer_held(&peer_id).1, cap_bytes);
+
+    // Let part 0 send and part 1 fail locally, queuing the `Failed(1)` ending.
+    gate.add_permits(2);
+    settle().await;
+    let part_encoded = crate::zakura::wire_codec::encode_frame(&Probe::Part(vec![7; 64]))
+        .unwrap()
+        .payload
+        .len() as u64
+        + crate::zakura::FRAME_HEADER_BYTES as u64;
+    let ending_encoded = crate::zakura::wire_codec::encode_frame(&Probe::Failed(1))
+        .unwrap()
+        .payload
+        .len() as u64
+        + crate::zakura::FRAME_HEADER_BYTES as u64;
+    let expected = part_encoded + ending_encoded;
+    assert!(expected < cap_bytes / 4);
+    assert_eq!(capacity.node_output_held(), expected);
+    assert_eq!(capacity.peer_held(&peer_id).1, expected);
+
+    // Outbound bytes stay covered until the last frame finishes writing.
+    assert_eq!(next(&mut session.output).await, Probe::Part(vec![7; 64]));
+    assert_eq!(capacity.node_output_held(), expected);
+    assert_eq!(capacity.peer_held(&peer_id).1, expected);
+
+    assert_eq!(next(&mut session.output).await, Probe::Failed(1));
+    assert_eq!(capacity.node_output_held(), 0);
+    assert_eq!(capacity.peer_held(&peer_id), (0, 0));
+    session.cancel.cancel();
 }

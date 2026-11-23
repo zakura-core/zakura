@@ -1508,26 +1508,41 @@ mod tests {
             ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
         };
         const RESPONSE_BYTES: u32 = 256 * 1024;
-        const REQUESTS: u32 = 400;
+        const REQUESTS: u32 = 1_100;
         let _guard = zakura_test::init();
         let blocks = [
             mainnet_block(&BLOCK_MAINNET_1_BYTES),
             mainnet_block(&BLOCK_MAINNET_2_BYTES),
             mainnet_block(&BLOCK_MAINNET_3_BYTES),
         ];
-        // The first request asks for 3 bodies. Serving answers with one, which
-        // is larger than the requester's stream window. Every later request is
-        // for an unavailable height.
+        // Every request returns one serialized copy of `large`, which exceeds
+        // the requester's stream window so the first response stalls on flow
+        // control while subsequent unread responses fill `peer_output_bytes`
+        // after shrinking to their encoded frame sizes at the ending (mem-6).
         let large = mainnet_block(&BLOCK_MAINNET_1046401_BYTES);
         let source = FixtureBlockSource::new(
-            (1..=3)
+            (1..=REQUESTS + 3)
                 .map(|height| (block::Height(height), large.clone()))
                 .collect(),
         );
         let reads = source.reads.clone();
-        // Each queued response reserves output for its whole cap, at least
-        // RESPONSE_BYTES, until written. So at most `bound` can be produced.
-        let bound = usize::try_from(sizing::peer_output_bytes() / u64::from(RESPONSE_BYTES))?;
+        // Each queued response shrinks to its encoded frames (`Block` +
+        // `BlocksDone`) at the ending, so at most `bound` can be produced while
+        // unread.
+        let per_response_bytes = u64::try_from(
+            BlockSyncMessage::Block(large.clone())
+                .encode_frame()?
+                .encode(RESPONSE_BYTES)?
+                .len()
+                + BlockSyncMessage::BlocksDone {
+                    start_height: block::Height(1),
+                    returned: 1,
+                }
+                .encode_frame()?
+                .encode(RESPONSE_BYTES)?
+                .len(),
+        )?;
+        let bound = usize::try_from(sizing::peer_output_bytes() / per_response_bytes)?;
         assert!(bound < usize::try_from(REQUESTS)?);
 
         let mut cluster = ZakuraTestCluster::new();
@@ -1604,13 +1619,11 @@ mod tests {
         );
 
         // Reading releases output, so every request completes exactly once.
-        // GetBlocks writes responses as they are ready, so empty responses
-        // that finish before the large one are written ahead of it.
         let mut early = None;
-        tokio::time::timeout(Duration::from_secs(5), async {
-            let mut bodies = 0;
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let mut bodies = 0u32;
             let mut ended = vec![false; usize::try_from(REQUESTS)?];
-            let mut endings = 0;
+            let mut endings = 0u32;
             while endings < REQUESTS {
                 let frame = peer
                     .recv_ordered_frame_with_version(ZAKURA_STREAM_BLOCK_SYNC, version)
@@ -1625,13 +1638,10 @@ mod tests {
                     BlockSyncMessage::BlocksDone {
                         start_height: block::Height(1),
                         returned: 1,
-                    } => {
-                        assert_eq!(bodies, 1, "the large response ends after its body");
-                        0
-                    }
-                    BlockSyncMessage::RangeUnavailable {
+                    } => 0,
+                    BlockSyncMessage::BlocksDone {
                         start_height,
-                        count: 1,
+                        returned: 1,
                     } => start_height.0 - 3,
                     message => return Err(format!("unexpected message {message:?}").into()),
                 };
@@ -1639,7 +1649,7 @@ mod tests {
                 assert!(!std::mem::replace(&mut ended[request], true));
                 endings += 1;
             }
-            assert_eq!(bodies, 1, "a three-block request gets a one-block prefix");
+            assert_eq!(bodies, REQUESTS, "every request returns one body");
             Ok::<_, BoxError>(())
         })
         .await

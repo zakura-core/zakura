@@ -438,10 +438,20 @@ fn redial(
     });
 }
 
+/// The tag of `sync/wire`'s free family, which reads a `sync/composed`
+/// script ([`sync_composed`]) from the prefix's next bytes.
+pub const WIRE_COMPOSED_TAG: u8 = 0xFA;
+
+/// `sync/wire`'s prefix before its free family: a saved scenario's tag, or
+/// [`COMBINED_TAG`] and its actions byte.
+const WIRE_PLANNED_BYTES: usize = 2;
+
 impl Subsystem for SyncWire {
     const NAME: &'static str = "sync/wire";
-    const GENERATOR: u32 = 5;
-    const SCENARIO_BYTES: usize = 2;
+    const GENERATOR: u32 = 6;
+    /// [`WIRE_COMPOSED_TAG`], then a `sync/composed` script in the place of
+    /// its version byte and the bytes after it.
+    const SCENARIO_BYTES: usize = SYNC_COMPOSED_BYTES;
     type Scenario = SyncWireScenario;
     type Prepared = SyncPorts;
 
@@ -639,13 +649,42 @@ impl Subsystem for SyncWire {
             .map(|saved| ScenarioFamily::new(saved.name(), saved.tag()))
             .collect();
         families.push(ScenarioFamily::new("combined", [COMBINED_TAG]));
+        families.push(ScenarioFamily::free("composed", [WIRE_COMPOSED_TAG]));
         families
     }
 
-    /// The saved scenario `prefix` tags ([`SavedWire::from_tag`]), or the
-    /// scenario [`combined`] decodes from it.
+    /// The script [`WIRE_COMPOSED_TAG`] composes from the bytes after it
+    /// ([`sync_composed`]), the saved scenario `prefix` tags
+    /// ([`SavedWire::from_tag`]), or the scenario [`combined`] decodes
+    /// from it. So a planned family and a free script share one input
+    /// format, and a fuzzer's mutation of a tag moves between them.
     fn draw(prefix: &[u8]) -> SyncWireScenario {
+        if let Some((&WIRE_COMPOSED_TAG, script)) = prefix.split_first() {
+            return sync_composed(script);
+        }
         SavedWire::from_tag(prefix).map_or_else(|| combined(prefix), SavedWire::scenario)
+    }
+
+    /// Generator 5's input, whose prefix held only two bytes, with the
+    /// prefix widened to [`Subsystem::SCENARIO_BYTES`]. No generator-5
+    /// prefix starts with [`WIRE_COMPOSED_TAG`] but the honest scenario's,
+    /// which [`combined`] drew for any untagged first byte, so the migrated
+    /// input reads it as the honest scenario's tag instead.
+    fn migrate(source: &[u8], generator: u32) -> Result<Vec<u8>, String> {
+        match generator {
+            5 => {
+                let mut widened =
+                    super::widen_prefix(source, WIRE_PLANNED_BYTES, Self::SCENARIO_BYTES);
+                if widened.first() == Some(&WIRE_COMPOSED_TAG) {
+                    widened[..WIRE_PLANNED_BYTES].copy_from_slice(&SavedWire::Honest.tag());
+                }
+                Ok(widened)
+            }
+            _ => Err(format!(
+                "{} migrates no generator-{generator} input",
+                Self::NAME
+            )),
+        }
     }
 }
 
@@ -1254,7 +1293,7 @@ impl Subsystem for SyncComposed {
 
     /// One family, the grammar, whose tag is [`SYNC_COMPOSED_VERSION`].
     fn families() -> Vec<ScenarioFamily> {
-        vec![ScenarioFamily::new("composed", [SYNC_COMPOSED_VERSION])]
+        vec![ScenarioFamily::free("composed", [SYNC_COMPOSED_VERSION])]
     }
 
     /// Whether `prefix` starts with [`SYNC_COMPOSED_VERSION`].

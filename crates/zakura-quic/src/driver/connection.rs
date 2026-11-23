@@ -627,10 +627,10 @@ impl<S: UdpIo> ConnTask<S> {
     fn on_connected(&mut self) {
         let session = self.conn.crypto_session();
         let handshake = Handshake {
-            remote_id: tls::remote_node_id(session),
+            remote: tls::remote_credential(session).map(Arc::new),
             alpn: tls::negotiated_alpn(session),
         };
-        self.remote_id = handshake.remote_id;
+        self.remote_id = handshake.remote.as_ref().map(|remote| remote.node_id());
         #[cfg(any(test, zakura_sim, feature = "test-support"))]
         let _ = self.shared.shared_id.set(tls::shared_id(session));
         metrics::gauge!("zakura.quic.connections").increment(1.0);

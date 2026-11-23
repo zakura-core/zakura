@@ -30,7 +30,7 @@ pub(crate) enum Cause {
     /// The session's peer sent a `Hello`.
     Hello(SessionId),
     /// The session's peer announced these ids, as far as the machine heard.
-    Inv(SessionId, Vec<UnminedTxId>),
+    Have(SessionId, Vec<UnminedTxId>),
     /// A body frame for the id arrived on the session, and was read or not.
     Arrived(SessionId, UnminedTxId, bool),
     /// The decoded body for the id, on the session.
@@ -72,7 +72,7 @@ pub(crate) struct Open {
     /// Ids its peer announced or supplied, from the step after, until a
     /// removal or its own `NotFound` withdraws them.
     told: IndexSet<UnminedTxId>,
-    /// Ids that went out to it in an `Inv` and still stand.
+    /// Ids that went out to it in a `Have` and still stand.
     pub(crate) sent: IndexSet<UnminedTxId>,
     /// Its requests the node serves, until the IO starts each answer.
     pub(crate) serving: IndexSet<UnminedTxId>,
@@ -180,19 +180,19 @@ impl Tracker {
         self.peak_peers = self.peak_peers.max(peers.len());
     }
 
-    /// `session`'s IO took `ids` into an `Inv`.
+    /// `session`'s IO took `ids` into a `Have`.
     pub(crate) fn sent(&mut self, session: SessionId, ids: &[UnminedTxId]) {
         let pooled = ids.iter().all(|id| self.shown.contains(id));
-        assert!(pooled, "an Inv carries only pooled ids");
+        assert!(pooled, "a Have carries only pooled ids");
         if let Some(open) = self.open.get_mut(&session) {
             let back = ids.iter().any(|id| open.told.contains(id));
-            assert!(!back, "an Inv never carries an id back to its source");
+            assert!(!back, "a Have never carries an id back to its source");
             open.sent.extend(ids.iter().copied());
         }
         let kind = if ids.is_empty() {
-            "empty inv"
+            "empty have"
         } else {
-            "inv taken"
+            "have taken"
         };
         self.saw(kind);
     }
@@ -523,7 +523,7 @@ impl Tracker {
     /// step.
     fn after(&mut self, cause: &Cause, submitted: bool) {
         let (session, told): (SessionId, Vec<UnminedTxId>) = match cause {
-            Cause::Inv(session, ids) => (*session, ids.clone()),
+            Cause::Have(session, ids) => (*session, ids.clone()),
             Cause::Body(session, id) if submitted => (*session, vec![*id]),
             Cause::Verdict(..) => {
                 // The supplier's sessions mark the body known again.

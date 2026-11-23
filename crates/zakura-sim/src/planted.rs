@@ -1,8 +1,15 @@
-//! Where the planted cases live, and the property each one bypasses.
+//! Where the test artifacts live, and the property each planted case
+//! bypasses.
+//!
+//! Planted cases, native mutations, scenario fixtures and seeds are test
+//! artifacts. They live in the QA store, the `zakura-sim-corpus` Space, not
+//! in the repository. `scripts/qa_store.py pull` copies the Space to a local
+//! directory, and [`STORE_ENV`] names that directory. Paths inside the
+//! store, and the paths a case file names, are relative to its root.
 //!
 //! A case is a bypass patch and its case file, `<name>.patch` and
-//! `<name>.toml`, at any depth under [`PLANTED_DIR`]. The case's property ID
-//! is its directory relative to [`PLANTED_DIR`]: the case
+//! `<name>.toml`, at any depth under the store's [`PLANTED_DIR`]. The case's
+//! property ID is its directory relative to [`PLANTED_DIR`]: the case
 //! `qa/planted/discovery/s4v2/hello/sender-cadence/repeat-hello.patch`
 //! bypasses `discovery/s4v2/hello/sender-cadence`.
 //!
@@ -10,15 +17,39 @@
 //! simulator's own checks find the same cases under the same IDs.
 
 use std::{
-    fs, io,
+    env, fs, io,
     path::{Path, PathBuf},
 };
 
-/// Where the planted cases live, relative to the repository's root.
+/// The environment variable that names the QA store's local copy.
+pub const STORE_ENV: &str = "ZAKURA_QA_STORE";
+
+/// Where the planted cases live, relative to the store's root.
 pub const PLANTED_DIR: &str = "qa/planted";
 
+/// The QA store's local copy, if [`STORE_ENV`] names one.
+pub fn store_root() -> Option<PathBuf> {
+    env::var_os(STORE_ENV)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+/// [`store_root`], or an error that says how to get a store.
+pub fn require_store() -> io::Result<PathBuf> {
+    store_root().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "{STORE_ENV} names no QA store: the test artifacts live in the \
+                 zakura-sim-corpus Space, and `scripts/qa_store.py pull --dest <dir>` copies \
+                 them to <dir>"
+            ),
+        )
+    })
+}
+
 /// Every file with `extension` under `dir`, at any depth, sorted by path.
-/// The planted runner's cases are the `patch` files under the repository's
+/// The planted runner's cases are the `patch` files under the store's
 /// [`PLANTED_DIR`].
 pub fn files(dir: &Path, extension: &str) -> io::Result<Vec<PathBuf>> {
     let mut files = Vec::new();

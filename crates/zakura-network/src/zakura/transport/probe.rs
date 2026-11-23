@@ -21,7 +21,8 @@ use super::lifetime::{OwnerPhase, OWNER_PHASES};
 
 use crate::zakura::regulation::OutputByteBudget;
 
-/// A weak read of the admission machine and its independent semaphore permits.
+/// A weak read of the admission machine and its independent handshake
+/// semaphore permits.
 #[derive(Clone, Debug)]
 pub struct HandshakeProbe {
     counts: Weak<zakura_rt::sync::Mutex<super::HandshakeCounts>>,
@@ -29,8 +30,6 @@ pub struct HandshakeProbe {
     inbound: Weak<Semaphore>,
     cap: usize,
     address_cap: usize,
-    connections: Weak<Semaphore>,
-    inbound_connections: Weak<Semaphore>,
     connection_cap: usize,
 }
 
@@ -41,10 +40,10 @@ pub struct HandshakeSample {
     pub connections: usize,
     /// Inbound connection slots charged by the machine.
     pub inbound_connections: usize,
-    /// Live total connection permits.
-    pub connection_permits: usize,
-    /// Live inbound connection permits.
-    pub inbound_connection_permits: usize,
+    /// Connection slots summed over the machine's per-node record.
+    pub node_connections: usize,
+    /// Inbound connection slots summed over the machine's per-node record.
+    pub inbound_node_connections: usize,
     /// Total connection capacity.
     pub connection_cap: usize,
     /// The configured registered-connection limit per address.
@@ -70,7 +69,6 @@ impl HandshakeProbe {
         inbound: &Arc<Semaphore>,
         cap: usize,
         address_cap: usize,
-        connections: (&Arc<Semaphore>, &Arc<Semaphore>),
         connection_cap: usize,
     ) -> Self {
         Self {
@@ -79,8 +77,6 @@ impl HandshakeProbe {
             inbound: Arc::downgrade(inbound),
             cap,
             address_cap,
-            connections: Arc::downgrade(connections.0),
-            inbound_connections: Arc::downgrade(connections.1),
             connection_cap,
         }
     }
@@ -94,22 +90,22 @@ impl HandshakeProbe {
         let counts = self.counts.upgrade()?;
         let pending = self.pending.upgrade()?;
         let inbound = self.inbound.upgrade()?;
-        let connections = self.connections.upgrade()?;
-        let inbound_connections = self.inbound_connections.upgrade()?;
-        match counts.peek(|counts| HandshakeSample {
-            connections: counts.connections(),
-            inbound_connections: counts.inbound_connections(),
-            connection_permits: self.connection_cap - connections.peek_available(),
-            inbound_connection_permits: super::inbound_share(self.connection_cap)
-                - inbound_connections.peek_available(),
-            connection_cap: self.connection_cap,
-            address_cap: self.address_cap,
-            pending: counts.pending(),
-            inbound: counts.inbound_pending(),
-            pending_permits: self.cap - pending.peek_available(),
-            inbound_permits: super::inbound_share(self.cap) - inbound.peek_available(),
-            cap: self.cap,
-            hosts: counts.hosts(),
+        match counts.peek(|counts| {
+            let by_node = counts.summed_node_connections();
+            HandshakeSample {
+                connections: counts.connections(),
+                inbound_connections: counts.inbound_connections(),
+                node_connections: by_node.total(),
+                inbound_node_connections: by_node.inbound,
+                connection_cap: self.connection_cap,
+                address_cap: self.address_cap,
+                pending: counts.pending(),
+                inbound: counts.inbound_pending(),
+                pending_permits: self.cap - pending.peek_available(),
+                inbound_permits: super::inbound_share(self.cap) - inbound.peek_available(),
+                cap: self.cap,
+                hosts: counts.hosts(),
+            }
         }) {
             zakura_rt::sim::Peek::Current(sample) | zakura_rt::sim::Peek::Poisoned(sample) => {
                 Some(sample)

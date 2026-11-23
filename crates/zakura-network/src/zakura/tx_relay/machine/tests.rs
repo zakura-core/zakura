@@ -28,7 +28,7 @@ use zakura_node_services::mempool::port::{
 
 use self::tracker::{Cause, Tracker};
 use super::{
-    peer::Hello, CallId, CloseReason, FanOut, Granted, InvRoom, Paid, PeerKey, RelayConfig,
+    peer::Hello, CallId, CloseReason, FanOut, Granted, HaveRoom, Paid, PeerKey, RelayConfig,
     RelayEffect, RelayMachine, SessionId, SnapshotInfo, Unreserved, Verdict, WaiterId, MAX_SERVES,
     MAX_TX_BYTES,
 };
@@ -206,16 +206,16 @@ impl Bench {
     }
 
     /// `session`'s peer announces `ids`, each of [`SIZE`] bytes.
-    pub(super) fn inv(&mut self, session: SessionId, ids: &[UnminedTxId]) {
+    pub(super) fn have(&mut self, session: SessionId, ids: &[UnminedTxId]) {
         let entries: Vec<(UnminedTxId, u32)> = ids.iter().map(|id| (*id, SIZE)).collect();
-        self.inv_sized(session, &entries);
+        self.have_sized(session, &entries);
     }
 
     /// `session`'s peer announces `entries`, at the sizes they give.
-    pub(super) fn inv_sized(&mut self, session: SessionId, entries: &[(UnminedTxId, u32)]) {
-        self.machine.inv(session, entries, self.now);
+    pub(super) fn have_sized(&mut self, session: SessionId, entries: &[(UnminedTxId, u32)]) {
+        self.machine.have(session, entries, self.now);
         let ids = entries.iter().map(|(id, _)| *id).collect();
-        self.took(Cause::Inv(session, ids));
+        self.took(Cause::Have(session, ids));
     }
 
     /// A body frame for `id` of `size` bytes arrives on `session`. Returns
@@ -278,36 +278,36 @@ impl Bench {
         self.took(Cause::End(session));
     }
 
-    /// `session`'s IO takes up to `max` of its queued adverts into an `Inv`,
-    /// without the pacing [`Self::send_inv`] goes through.
-    pub(super) fn take_inv(&mut self, session: SessionId, max: usize) -> Vec<UnminedTxId> {
-        let taken = self.machine.take_inv(session, max);
-        self.inv_taken(session, taken)
+    /// `session`'s IO takes up to `max` of its queued adverts into a `Have`,
+    /// without the pacing [`Self::send_have`] goes through.
+    pub(super) fn take_have(&mut self, session: SessionId, max: usize) -> Vec<UnminedTxId> {
+        let taken = self.machine.take_have(session, max);
+        self.have_taken(session, taken)
     }
 
-    /// `session`'s IO asks for the `Inv` it may send now, with `free`
+    /// `session`'s IO asks for the `Have` it may send now, with `free`
     /// places in its data writer and the byte rate answering `paid`.
-    pub(super) fn send_inv(
+    pub(super) fn send_have(
         &mut self,
         session: SessionId,
         free: usize,
         paid: Paid,
     ) -> Vec<UnminedTxId> {
-        let room = InvRoom {
+        let room = HaveRoom {
             free,
             paid: |_| paid,
         };
-        let taken = self.machine.next_inv(session, room, self.now);
+        let taken = self.machine.next_have(session, room, self.now);
         let short = matches!(paid, Paid::At(at) if at > self.now);
         let blocked = free <= MAX_SERVES || paid == Paid::Unwritten || short;
-        assert!(!blocked || taken.is_empty(), "relay/inv-paced");
-        self.inv_taken(session, taken)
+        assert!(!blocked || taken.is_empty(), "relay/have-paced");
+        self.have_taken(session, taken)
     }
 
-    /// Records the `Inv` `session`'s IO took. No id goes out while one of
+    /// Records the `Have` `session`'s IO took. No id goes out while one of
     /// its parents still waits to go out to the same session, queued or
     /// held.
-    fn inv_taken(
+    fn have_taken(
         &mut self,
         session: SessionId,
         taken: Vec<(UnminedTxId, u32)>,
@@ -328,7 +328,7 @@ impl Bench {
                 queued && self.machine.parents(id).iter().any(waits)
             });
             if held_back {
-                self.tracker.saw("inv child waited");
+                self.tracker.saw("have child waited");
             }
         }
         self.tracker.sent(session, &ids);
@@ -613,7 +613,7 @@ impl Bench {
     pub(super) fn supply(&mut self, session: SessionId, n: u32) -> WaiterId {
         let tx = self.tx(n);
         let id = tx.id();
-        self.inv(session, &[id]);
+        self.have(session, &[id]);
         for _ in 0..20 {
             if self.calls().iter().any(|(_, called)| *called == id) {
                 break;

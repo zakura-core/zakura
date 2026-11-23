@@ -258,12 +258,18 @@ impl Fixture {
         if let Some(max_open_streams) = max_open_streams {
             local.max_open_streams = max_open_streams;
         }
+        // The client's node ID sorts below the server's, so the client wins
+        // an open collision; the tests that hold credit rely on that.
         let server = LocalEndpointFactory::with_limits(&local)
-            .endpoint(93101)
-            .await?;
-        let client = LocalEndpointFactory::with_limits(&local)
             .endpoint(93102)
             .await?;
+        let client = LocalEndpointFactory::with_limits(&local)
+            .endpoint(93101)
+            .await?;
+        assert!(
+            client.local_id() < server.local_id(),
+            "the fixture's client must win open collisions"
+        );
         let (server_tx, server_sessions) = mpsc::channel(2);
         let (client_tx, client_sessions) = mpsc::channel(2);
         let (server_sibling_tx, server_siblings) = mpsc::channel(1);
@@ -712,6 +718,7 @@ async fn serving_sets_the_window_to_the_negotiated_shares() -> Result<(), BoxErr
                 ConnectionServeContext {
                     capability_epoch: handler.capability_epoch.load(Ordering::SeqCst),
                     limits: local.clamp(&local.initial_limits()),
+                    metered_epoch: Instant::now(),
                     // The sibling only: the session service's kinds stay out.
                     accepted_capabilities: SIBLING.capability,
                     role: "responder",
@@ -873,6 +880,7 @@ impl RawFixture {
                     ConnectionServeContext {
                         capability_epoch: handler.capability_epoch.load(Ordering::SeqCst),
                         limits,
+                        metered_epoch: Instant::now(),
                         accepted_capabilities: DATA.capability | SIBLING.capability,
                         role: "responder",
                         direction: ServicePeerDirection::Inbound,

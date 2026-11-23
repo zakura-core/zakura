@@ -39,7 +39,7 @@ impl StreamConformance for TxRelayConformance {
                 serves: 16,
                 max_tx_bytes: MAX_TX_BYTES,
             },
-            2 => TxRelayMessage::Inv(vec![(id(exchange), 1)]),
+            2 => TxRelayMessage::Have(vec![(id(exchange), 1)]),
             3 => TxRelayMessage::GetTxs(id(exchange)),
             4 => TxRelayMessage::Tx {
                 id: id(exchange),
@@ -55,7 +55,7 @@ impl StreamConformance for TxRelayConformance {
             TxRelayMessage::GetTxs(id)
             | TxRelayMessage::NotFound(id)
             | TxRelayMessage::Tx { id, .. } => exchange_of(id),
-            TxRelayMessage::Inv(entries) => entries.first().map_or(0, |(id, _)| exchange_of(id)),
+            TxRelayMessage::Have(entries) => entries.first().map_or(0, |(id, _)| exchange_of(id)),
             TxRelayMessage::Hello { .. } => 0,
         }
     }

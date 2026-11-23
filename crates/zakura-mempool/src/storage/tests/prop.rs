@@ -17,6 +17,8 @@ use zakura_chain::{
     transparent, LedgerState,
 };
 
+use zakura_node_services::mempool::port::RemovalReason;
+
 use crate::arbitrary::{standard_verified_unmined_tx_strategy, standardize_transaction};
 use crate::{
     config::Config,
@@ -333,6 +335,48 @@ proptest! {
 }
 
 proptest! {
+    /// Block conflicts follow the current owner after removal and after draining the pool.
+    #[test]
+    fn block_conflicts_follow_current_spend_owners(input in any::<SpendConflictTestInput>()) {
+        let (first, second) = input.conflicting_transactions();
+        let first_id = first.transaction.id();
+        let second_id = second.transaction.id();
+        prop_assume!(first_id.mined_id() != second_id.mined_id());
+        let mut storage: Storage = Storage::new(&Config {
+            tx_cost_limit: 160_000_000,
+            ..Default::default()
+        });
+        let height = zakura_chain::block::Height(1);
+
+        storage.insert(first.clone(), Vec::new(), None, crate::Instant::now(), chrono::Utc::now()).unwrap();
+        prop_assert_eq!(storage.remove_exact(&HashSet::from([first_id])), 1);
+        storage.insert(second.clone(), Vec::new(), None, crate::Instant::now(), chrono::Utc::now()).unwrap();
+        let removed = storage.connect_block(
+            &[first_id.mined_id()],
+            [first.transaction.transaction().as_ref()],
+            height,
+            crate::Instant::now(),
+        );
+        prop_assert!(removed.mined.is_empty());
+        prop_assert_eq!(removed.dropped, vec![(second_id, RemovalReason::Conflicted)]);
+        prop_assert_eq!(storage.transaction_count(), 0);
+
+        // Drain a pool that still holds `second`, so `take_all` must drop its spend owners.
+        storage.clear_rejections();
+        storage.insert(second.clone(), Vec::new(), None, crate::Instant::now(), chrono::Utc::now()).unwrap();
+        let drained: Vec<_> = storage.take_all().into_iter().map(|tx| tx.transaction.id()).collect();
+        prop_assert_eq!(drained, vec![second_id]);
+        storage.insert(first, Vec::new(), None, crate::Instant::now(), chrono::Utc::now()).unwrap();
+        let removed = storage.connect_block(
+            &[second_id.mined_id()],
+            [second.transaction.transaction().as_ref()],
+            height,
+            crate::Instant::now(),
+        );
+        prop_assert_eq!(removed.dropped, vec![(first_id, RemovalReason::Conflicted)]);
+        prop_assert_eq!(storage.transaction_count(), 0);
+    }
+
     /// Test if a transaction that has a spend conflict with a transaction already in the mempool
     /// is rejected.
     ///

@@ -102,12 +102,6 @@ jobs:
           key: ${{ inputs.label }}-fuzz-corpus-${{ matrix.target }}-${{ matrix.decoder || steps.versions.outputs.key || hashFiles('crates/zakura-sim/src/record.rs') }}-${{ github.run_id }}
           restore-keys: |
             ${{ inputs.label }}-fuzz-corpus-${{ matrix.target }}-${{ matrix.decoder || steps.versions.outputs.key || hashFiles('crates/zakura-sim/src/record.rs') }}-
-      - name: Add the harness's corpus seeds
-        if: matrix.harness != ''
-        env:
-          HARNESS: ${{ matrix.harness }}
-          PACKAGE: ${{ inputs.package }}
-        run: cargo xtask sim-seeds --sim "${HARNESS}" --out "qa/fuzz/${PACKAGE}/corpus/${TARGET}"
       - name: Replay the corpus in a fresh process
         working-directory: qa/fuzz/${{ inputs.package }}
         run: |

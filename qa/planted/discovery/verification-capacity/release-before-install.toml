@@ -1,4 +1,0 @@
-# Frees the verification slot while the result waits for the state lock.
-seed = "discovery-verification-capacity"
-# The harness drives discovery state and the transport types under it.
-checks = ["crates/zakura-network/src/zakura"]

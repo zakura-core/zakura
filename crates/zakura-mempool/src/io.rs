@@ -261,8 +261,16 @@ impl<E: VerifyError, V: Verifier<E>> MempoolIO<E, V> {
     fn command(&mut self, command: PoolCommand) {
         let now = time::Instant::now();
         match command {
-            PoolCommand::Reserve { tx_id, reply } => {
-                let (answer, step) = self.machine.reserve(tx_id, now);
+            PoolCommand::Reserve {
+                tx_id,
+                relayed,
+                reply,
+            } => {
+                let (answer, step) = if relayed {
+                    self.machine.reserve_relayed(tx_id, now)
+                } else {
+                    self.machine.reserve(tx_id, now)
+                };
                 let answer = answer.map(|id| {
                     let cancel = CancellationToken::new();
                     self.fetches.insert(id, cancel.clone());

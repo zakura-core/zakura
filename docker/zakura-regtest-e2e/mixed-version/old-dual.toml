@@ -1,0 +1,43 @@
+# Zakura mixed-version e2e: OLD dual-stack seed (the released v1.8.9 binary).
+#
+# Speaks p2p-v2/3. It is the legacy TCP seed for new-dual and the native v2
+# bootstrap peer for old-zakura. Only keys v1.8.9 accepts may appear here.
+
+[network]
+network = "Regtest"
+listen_addr = "127.0.0.1:28233"
+p2p_stack = "dual"
+cache_dir = false
+initial_testnet_peers = []
+# Every node shares 127.0.0.1, so accept more than one connection per IP.
+max_connections_per_ip = 10
+# Log real peer addresses, so the harness can tell which connection a peer-set
+# disconnect line names.
+expose_peer_addresses = true
+# Fixed identity. The harness reads the node ID this key gives under the old
+# derivation (the Ed25519 public key) from the startup log.
+zakura_node_secret_key = "1111111111111111111111111111111111111111111111111111111111111111"
+
+[network.zakura]
+listen_addr = "127.0.0.1:28234"
+
+[state]
+ephemeral = true
+
+[rpc]
+listen_addr = "127.0.0.1:28232"
+enable_cookie_auth = false
+
+[metrics]
+endpoint_addr = "127.0.0.1:29001"
+
+[mining]
+internal_miner = false
+# Regtest uses testnet address encoding; needed so `generate` can build coinbases.
+miner_address = "tmJymvcUCn1ctbghvTJpXBwHiMEB8P6wxNV"
+
+[tracing]
+# Plain logs keep the harness greps free of ANSI escapes. The handshake module
+# logs each rejected legacy->v2 upgrade at debug level.
+use_color = false
+filter = "info,zakura_network::zakura=debug,zakura_network::peer::handshake=debug"

@@ -25,6 +25,10 @@ use std::{
 use itertools::Itertools;
 
 use rocksdb::{ColumnFamilyDescriptor, ErrorKind, Options, ReadOptions};
+
+/// The readahead of [`DiskDb::raw_sequential_scan_cf`], large enough that a
+/// scan of cold data reads at disk throughput rather than disk latency.
+const SEQUENTIAL_SCAN_READAHEAD_BYTES: usize = 4 * 1024 * 1024;
 use semver::Version;
 use zakura_chain::{
     block::Height, parameters::Network, primitives::byte_array::increment_big_endian,
@@ -515,17 +519,8 @@ impl ReadDisk for DiskDb {
         K: IntoDisk,
         V: FromDisk,
     {
-        let key_bytes = key.as_bytes();
-
-        // We use `get_pinned_cf` to avoid taking ownership of the serialized
-        // value, because we're going to deserialize it anyways, which avoids an
-        // extra copy
-        let value_bytes = self
-            .db
-            .get_pinned_cf(cf, key_bytes)
-            .expect("unexpected database failure");
-
-        value_bytes.map(V::from_bytes)
+        self.zs_try_get(cf, key)
+            .expect("unexpected database failure")
     }
 
     fn zs_contains<C, K>(&self, cf: &C, key: &K) -> bool
@@ -533,14 +528,8 @@ impl ReadDisk for DiskDb {
         C: rocksdb::AsColumnFamilyRef,
         K: IntoDisk,
     {
-        let key_bytes = key.as_bytes();
-
-        // We use `get_pinned_cf` to avoid taking ownership of the serialized
-        // value, because we don't use the value at all. This avoids an extra copy.
-        self.db
-            .get_pinned_cf(cf, key_bytes)
+        self.zs_try_contains(cf, key)
             .expect("unexpected database failure")
-            .is_some()
     }
 
     fn zs_first_key_value<C, K, V>(&self, cf: &C) -> Option<(K, V)>
@@ -853,6 +842,18 @@ impl DiskDb {
         self.finished_format_upgrades.load(atomic::Ordering::SeqCst)
     }
 
+    /// Syncs the write-ahead log, so every batch written so far survives a power
+    /// cut. [`DiskDb::write`] doesn't sync, so call this before deleting files that
+    /// only those batches stop referencing.
+    pub(crate) fn sync_wal(&self) -> Result<(), rocksdb::Error> {
+        self.db.flush_wal(true)
+    }
+
+    /// Returns `true` if this is a read-only secondary instance.
+    pub(crate) fn is_read_only_secondary(&self) -> bool {
+        self.mode.is_read_only()
+    }
+
     /// When called with a secondary DB instance, tries to catch up with the primary DB instance
     pub fn try_catch_up_with_primary(&self) -> Result<(), rocksdb::Error> {
         self.db.try_catch_up_with_primary()?;
@@ -875,6 +876,53 @@ impl DiskDb {
             Some(from_bytes.as_ref()),
             Some(until_strictly_before_bytes.as_ref()),
         );
+    }
+
+    /// Returns the value for `key` in `cf` like [`ReadDisk::zs_get`], but returns
+    /// a database error instead of panicking.
+    pub(crate) fn zs_try_get<C, K, V>(&self, cf: &C, key: &K) -> Result<Option<V>, rocksdb::Error>
+    where
+        C: rocksdb::AsColumnFamilyRef,
+        K: IntoDisk,
+        V: FromDisk,
+    {
+        // `get_pinned_cf` avoids copying the value before it is deserialized.
+        Ok(self
+            .db
+            .get_pinned_cf(cf, key.as_bytes())?
+            .map(V::from_bytes))
+    }
+
+    /// Returns `true` if `cf` contains `key`, like [`ReadDisk::zs_contains`], but
+    /// returns a database error instead of panicking.
+    pub(crate) fn zs_try_contains<C, K>(&self, cf: &C, key: &K) -> Result<bool, rocksdb::Error>
+    where
+        C: rocksdb::AsColumnFamilyRef,
+        K: IntoDisk,
+    {
+        // `get_pinned_cf` avoids copying a value that is never used.
+        Ok(self.db.get_pinned_cf(cf, key.as_bytes())?.is_some())
+    }
+
+    /// Returns a forward iterator over the items in `cf` in `range`, like
+    /// [`Self::zs_forward_range_iter_with_read_ahead`] when `read_ahead_bytes` is
+    /// set, that yields a database error instead of panicking. The iterator ends
+    /// after its first error.
+    ///
+    /// Holding this iterator open might delay block commit transactions.
+    pub(crate) fn zs_try_forward_range_iter<C, K, V, R>(
+        &self,
+        cf: &C,
+        range: R,
+        read_ahead_bytes: Option<usize>,
+    ) -> impl Iterator<Item = Result<(K, V), rocksdb::Error>> + '_
+    where
+        C: rocksdb::AsColumnFamilyRef,
+        K: IntoDisk + FromDisk,
+        V: FromDisk,
+        R: RangeBounds<K>,
+    {
+        self.zs_try_range_iter_with_direction(cf, range, false, read_ahead_bytes)
     }
 
     /// Returns a forward iterator over the items in `cf` in `range`.
@@ -957,6 +1005,26 @@ impl DiskDb {
         V: FromDisk,
         R: RangeBounds<K>,
     {
+        self.zs_try_range_iter_with_direction(cf, range, reverse, read_ahead_bytes)
+            .map(|result| result.expect("unexpected database failure"))
+    }
+
+    /// Returns an iterator over the items in `cf` in `range`, like
+    /// [`Self::zs_range_iter_with_direction`], that yields a database error
+    /// instead of panicking. The iterator ends after its first error.
+    fn zs_try_range_iter_with_direction<C, K, V, R>(
+        &self,
+        cf: &C,
+        range: R,
+        reverse: bool,
+        read_ahead_bytes: Option<usize>,
+    ) -> impl Iterator<Item = Result<(K, V), rocksdb::Error>> + '_
+    where
+        C: rocksdb::AsColumnFamilyRef,
+        K: IntoDisk + FromDisk,
+        V: FromDisk,
+        R: RangeBounds<K>,
+    {
         use std::ops::Bound::{self, *};
 
         // Replace with map() when it stabilises:
@@ -983,18 +1051,24 @@ impl DiskDb {
         // in previous RocksDB versions
         self.db
             .iterator_cf_opt(cf, opts, mode)
-            .map(|result| result.expect("unexpected database failure"))
-            .map(|(key, value)| (key.to_vec(), value))
+            .map(|result| result.map(|(key, value)| (key.to_vec(), value)))
             // Skip excluded "from" bound and empty ranges. The `mode` already skips keys
             // strictly before the "from" bound.
             .skip_while({
                 let range = range.clone();
-                move |(key, _value)| !range.contains(key)
+                move |result| {
+                    result
+                        .as_ref()
+                        .is_ok_and(|(key, _value)| !range.contains(key))
+                }
             })
             // Take until the excluded "to" bound is reached,
-            // or we're after the included "to" bound.
-            .take_while(move |(key, _value)| range.contains(key))
-            .map(|(key, value)| (K::from_bytes(key), V::from_bytes(value)))
+            // or we're after the included "to" bound. Errors pass through.
+            .take_while(move |result| match result {
+                Ok((key, _value)) => range.contains(key),
+                Err(_) => true,
+            })
+            .map(|result| result.map(|(key, value)| (K::from_bytes(key), V::from_bytes(value))))
     }
 
     /// Returns the RocksDB ReadOptions with a lower and upper bound for a range.
@@ -1423,6 +1497,35 @@ impl DiskDb {
         Ok(())
     }
 
+    /// Returns a forward iterator over the raw entries of `cf` in `lower..upper`,
+    /// for one long sequential scan of cold data.
+    ///
+    /// It reads ahead [`SEQUENTIAL_SCAN_READAHEAD_BYTES`] at a time. RocksDB's
+    /// adaptive readahead starts at 8 KiB per iterator and caps at 256 KiB, so
+    /// cold scans otherwise become many small reads bound by disk latency.
+    pub(crate) fn raw_sequential_scan_cf<C>(
+        &self,
+        cf: &C,
+        lower: &[u8],
+        upper: &[u8],
+    ) -> impl Iterator<Item = (Box<[u8]>, Box<[u8]>)> + '_
+    where
+        C: rocksdb::AsColumnFamilyRef,
+    {
+        let mut options = ReadOptions::default();
+        options.set_iterate_lower_bound(lower.to_vec());
+        options.set_iterate_upper_bound(upper.to_vec());
+        options.set_readahead_size(SEQUENTIAL_SCAN_READAHEAD_BYTES);
+        options.fill_cache(false);
+        self.db
+            .iterator_cf_opt(
+                cf,
+                options,
+                rocksdb::IteratorMode::From(lower, rocksdb::Direction::Forward),
+            )
+            .map(|result| result.expect("unexpected database failure"))
+    }
+
     /// Collect a raw half-open key range without panicking on iterator failure.
     pub(crate) fn raw_range_cf<C>(
         &self,
@@ -1489,6 +1592,49 @@ impl DiskDb {
     /// Flushes pending writes to SST files.
     pub(crate) fn flush(&self) -> Result<(), rocksdb::Error> {
         self.db.flush()
+    }
+
+    /// Returns the bytes of the current SST files of the column family named `cf_name`.
+    #[cfg(test)]
+    pub(crate) fn live_sst_bytes_for_test(&self, cf_name: &str) -> u64 {
+        let cf = self
+            .cf_handle(cf_name)
+            .expect("tests only read column families opened from the running schema");
+        self.db
+            .property_int_value_cf(&cf, "rocksdb.live-sst-files-size")
+            .expect("reading a test database property succeeds")
+            .unwrap_or(0)
+    }
+
+    /// Returns the paths of the current SST files of the column family named `cf_name`.
+    #[cfg(test)]
+    pub(crate) fn live_sst_paths_for_test(&self, cf_name: &str) -> Vec<std::path::PathBuf> {
+        self.db
+            .live_files()
+            .expect("listing a test database's files succeeds")
+            .into_iter()
+            .filter(|file| file.column_family_name == cf_name)
+            .map(|file| self.db.path().join(file.name.trim_start_matches('/')))
+            .collect()
+    }
+
+    /// Deletes the SST files of `cf` whose keys all lie in `from..=to`, which
+    /// frees their space at once instead of after compaction.
+    ///
+    /// Rows covered by a range delete stay on disk until compaction rewrites
+    /// their files, which for cold history may never happen. This ignores
+    /// snapshots, so only call it for ranges whose rows are all deleted. RocksDB
+    /// leaves level 0 files and files partly outside the range for compaction.
+    pub(crate) fn delete_files_in_range_cf<C>(
+        &self,
+        cf: &C,
+        from: &[u8],
+        to: &[u8],
+    ) -> Result<(), rocksdb::Error>
+    where
+        C: rocksdb::AsColumnFamilyRef,
+    {
+        self.db.delete_file_in_range_cf(cf, from, to)
     }
 
     // Private methods

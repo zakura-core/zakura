@@ -10,6 +10,7 @@ mod support;
 use std::{cell::RefCell, io::Write, path::Path, process::Command, sync::LazyLock};
 
 use serde_json::Value;
+use support::header_inputs;
 use tempfile::TempDir;
 use zakura_sim::{
     domain::header_sync::STALE_COMPLETION_INERT,
@@ -25,18 +26,13 @@ use zakura_sim::{
     MemorySink, Plan, PlanInput, RunReport,
 };
 
-/// The stale-prepare seed's input, `header-storage-stale-prepare`,
-/// whose node ends a prepare after its round retired while the same peer's
-/// next round is active.
-static STALE_PREPARE_INPUT: LazyLock<Vec<u8>> = LazyLock::new(|| {
-    zakura_sim::seed::find("header-storage-stale-prepare")
-        .expect("the seed is registered")
-        .input()
-        .to_vec()
-});
+/// The stale-prepare input, whose node ends a prepare after its round
+/// retired while the same peer's next round is active
+/// ([`header_inputs::stale_prepare_input`]).
+static STALE_PREPARE_INPUT: LazyLock<&[u8]> = LazyLock::new(header_inputs::stale_prepare_input);
 
-/// `header-sync/stale-completion-inert` holds on the committed stale-prepare
-/// seed, and the run reaches its trigger history: a call ends stale.
+/// `header-sync/stale-completion-inert` holds on the searched stale-prepare
+/// input, and the run reaches its trigger history: a call ends stale.
 /// `cargo xtask planted header-sync/stale-completion-inert` checks that the
 /// same input violates it under each planted patch.
 #[test]
@@ -55,7 +51,7 @@ fn the_stale_prepare_input_holds_stale_completion_inert() {
 }
 
 /// The node's stale calls, the property's report and the full log depend
-/// only on the scenario and the plan: the stale-prepare seed's scenario
+/// only on the scenario and the plan: the stale-prepare input's scenario
 /// under plan A twice, then B, then A again, gives A's every time, and B's
 /// log differs.
 #[test]
@@ -65,7 +61,7 @@ fn stale_evidence_repeats_a_a_and_a_b_a() {
             .expect("the storage harness is registered")
             .scenario(&STALE_PREPARE_INPUT[..Storage::SCENARIO_BYTES]),
     )
-    .expect("the seed's scenario is a storage scenario");
+    .expect("the input's scenario is a storage scenario");
     let plans: [&[u8]; 2] = [&STALE_PREPARE_INPUT[Storage::SCENARIO_BYTES..], &[7; 256]];
     let runs: Vec<(String, String)> = [plans[0], plans[0], plans[1], plans[0]]
         .into_iter()
@@ -175,7 +171,7 @@ fn the_stale_witness_replays_in_a_fresh_process() {
 }
 
 /// `record --witness` judges a typed scenario and its Plan bytes, as
-/// `cargo xtask planted` runs a typed case: the stale-prepare seed's
+/// `cargo xtask planted` runs a typed case: the stale-prepare input's
 /// scenario as JSON, with its Plan bytes in a file. The witness passes,
 /// the trace has no `input.bin`, and `replay` reruns it Exact in a fresh
 /// process.

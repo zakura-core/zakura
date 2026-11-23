@@ -747,7 +747,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "zakura-prometheus" },
-          "expr": "zakura_state_rocksdb_total_disk_size_bytes",
+          "expr": "zakura_state_rocksdb_total_disk_size_bytes + (zakura_state_static_files_total_disk_size_bytes or zakura_state_rocksdb_total_disk_size_bytes * 0)",
           "legendFormat": "DB Size",
           "refId": "A"
         }

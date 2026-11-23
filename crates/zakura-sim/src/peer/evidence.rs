@@ -311,6 +311,10 @@ pub(crate) struct WireEvidence {
     discovery: Option<StreamId>,
     /// Labels the node's frames on the discovery stream.
     discovery_sender: Option<DiscoverySender>,
+    /// The tx-relay streams, whose frames are judged at their label's
+    /// stage, as a discovery stream's are. The peers record no node frames
+    /// there, so nothing labels them.
+    tx_relay: Vec<StreamId>,
     /// Each discovery request the peer's models labelled `OverMargin`, its
     /// `PeerFrame` waiting for the serving to count it.
     unsettled: BTreeMap<FrameKey, Unsettled>,
@@ -358,6 +362,15 @@ impl WireEvidence {
         WireEvidence {
             discovery: Some(discovery),
             discovery_sender: Some(DiscoverySender::new(discovery)),
+            ..self
+        }
+    }
+
+    /// This evidence, also logging the peers' frames on the tx-relay
+    /// `streams`, judged at their label's stage.
+    pub(crate) fn with_tx_relay(self, streams: Vec<StreamId>) -> Self {
+        WireEvidence {
+            tx_relay: streams,
             ..self
         }
     }
@@ -895,6 +908,24 @@ impl WireEvidence {
                 "UnlabelledFrame: connection {connection} read frame {seq} on stream \
                  {quic_stream} with no PeerFrame"
             ));
+        }
+        if self.tx_relay.contains(&stream) {
+            // tx-relay's rules decide a frame where discovery's do: a
+            // stateless fault or an unrequested answer at its header, the
+            // rest once the frame is read.
+            let stage = discovery_stage(self.labels[&key]);
+            if stage == Stage::Header {
+                return self.judged(key);
+            }
+            self.waiting.insert(
+                key,
+                Waiting {
+                    stage,
+                    row: None,
+                    payload_len: header.payload_len,
+                },
+            );
+            return Ok(None);
         }
         if Some(stream) == self.discovery {
             let stage = discovery_stage(self.labels[&key]);

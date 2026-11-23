@@ -786,15 +786,18 @@ fn finish_dial(
         });
     };
     // The verifier already enforced TLS-7; this guards against a verifier bug.
-    if handshake.remote_id != Some(expected) {
+    let Some(remote) = handshake
+        .remote
+        .filter(|remote| remote.node_id() == expected)
+    else {
         close(b"identity");
         return Err(ConnectError::WrongIdentity);
-    }
+    };
     let Some(alpn) = handshake.alpn else {
         close(b"alpn");
         return Err(ConnectError::AlpnMismatch);
     };
-    Ok(Conn::new(conn, expected, target, started, true, alpn))
+    Ok(Conn::new(conn, remote, target, started, true, alpn))
 }
 
 /// Waits for a handshake, closing the connection at the deadline (ADM-6,
@@ -840,7 +843,7 @@ pub(crate) async fn inbound_handshake(
         wait_closed(&shared).await;
         return;
     };
-    let (Some(remote_id), Some(alpn)) = (handshake.remote_id, handshake.alpn) else {
+    let (Some(remote_credential), Some(alpn)) = (handshake.remote, handshake.alpn) else {
         let _ = conn.send(crate::driver::ConnCmd::Close {
             code: VarInt::from_u32(0),
             reason: bytes::Bytes::from_static(b"identity"),
@@ -854,7 +857,7 @@ pub(crate) async fn inbound_handshake(
     let pending = pending.handoff();
     let handled = acceptor.handle(Conn::new(
         conn,
-        remote_id,
+        remote_credential,
         remote,
         admitted_at,
         source_validated,

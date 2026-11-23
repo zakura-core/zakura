@@ -1,0 +1,72 @@
+# Zakura mixed-version Regtest e2e.
+#
+# Three nodes run the latest released zakurad (ZAKURAD_OLD_BIN, p2p-v2/3) and
+# two run the binary under test (ZAKURAD_BIN, p2p-v2/4). The cohorts can't
+# speak v2 to each other, so they must reach each other over legacy TCP.
+#
+# `ZAKURA_E2E_MODE=mixed-version docker/zakura-regtest-e2e/run.sh` downloads
+# the old binary, writes the bootstrap peers, and drives this stack. The node
+# configs live in docker/zakura-regtest-e2e/mixed-version/.
+#
+# Regtest accepts only localhost initial peers, so the nodes use host
+# networking and distinct ports on 127.0.0.1. State lives in tmpfs.
+
+name: zakura-regtest-e2e-mixed-version
+
+x-zakura-node: &zakura-node
+  image: debian:trixie-slim
+  network_mode: host
+  restart: "no"
+  stop_grace_period: 5s
+  cpu_shares: 256
+  mem_swappiness: 0
+  memswap_limit: 1536m
+  tmpfs:
+    - /tmp
+  deploy:
+    resources:
+      limits:
+        cpus: "2"
+        memory: 1536m
+        pids: 256
+
+services:
+  old-dual:
+    <<: *zakura-node
+    container_name: zakura-mixed-old-dual
+    entrypoint: ["/usr/local/bin/zakurad", "--config", "/etc/zakura/node.toml", "start"]
+    volumes:
+      - ${ZAKURAD_OLD_BIN:?set ZAKURAD_OLD_BIN}:/usr/local/bin/zakurad:ro
+      - ${ZAKURA_MIXED_CONFIG_DIR:?set ZAKURA_MIXED_CONFIG_DIR}/old-dual.toml:/etc/zakura/node.toml:ro
+
+  old-zakura:
+    <<: *zakura-node
+    container_name: zakura-mixed-old-zakura
+    entrypoint: ["/usr/local/bin/zakurad", "--config", "/etc/zakura/node.toml", "start"]
+    volumes:
+      - ${ZAKURAD_OLD_BIN:?set ZAKURAD_OLD_BIN}:/usr/local/bin/zakurad:ro
+      - ${ZAKURA_MIXED_CONFIG_DIR:?set ZAKURA_MIXED_CONFIG_DIR}/old-zakura.toml:/etc/zakura/node.toml:ro
+
+  new-dual:
+    <<: *zakura-node
+    container_name: zakura-mixed-new-dual
+    entrypoint: ["/usr/local/bin/zakurad", "--config", "/etc/zakura/node.toml", "start"]
+    volumes:
+      - ${ZAKURAD_BIN:?set ZAKURAD_BIN}:/usr/local/bin/zakurad:ro
+      - ${ZAKURA_MIXED_CONFIG_DIR:?set ZAKURA_MIXED_CONFIG_DIR}/new-dual.toml:/etc/zakura/node.toml:ro
+
+  new-zakura:
+    <<: *zakura-node
+    container_name: zakura-mixed-new-zakura
+    entrypoint: ["/usr/local/bin/zakurad", "--config", "/etc/zakura/node.toml", "start"]
+    volumes:
+      - ${ZAKURAD_BIN:?set ZAKURAD_BIN}:/usr/local/bin/zakurad:ro
+      - ${ZAKURA_MIXED_CONFIG_DIR:?set ZAKURA_MIXED_CONFIG_DIR}/new-zakura.toml:/etc/zakura/node.toml:ro
+
+  old-dialer:
+    <<: *zakura-node
+    container_name: zakura-mixed-old-dialer
+    entrypoint: ["/usr/local/bin/zakurad", "--config", "/etc/zakura/node.toml", "start"]
+    volumes:
+      - ${ZAKURAD_OLD_BIN:?set ZAKURAD_OLD_BIN}:/usr/local/bin/zakurad:ro
+      - ${ZAKURA_MIXED_CONFIG_DIR:?set ZAKURA_MIXED_CONFIG_DIR}/old-dialer.toml:/etc/zakura/node.toml:ro

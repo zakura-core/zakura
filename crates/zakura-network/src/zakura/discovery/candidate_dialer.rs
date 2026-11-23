@@ -315,7 +315,7 @@ impl Future for DiscoveryDialWorker {
 /// with more addresses than the endpoint has free discovery slots: the
 /// transport claims a slot for every address or fails the whole dial as a
 /// local limit. The round also admits no more candidates than the handler has
-/// free admission permits, since each dial holds one.
+/// free connection slots, since each dial holds one.
 async fn admit_dial_round(
     endpoint: &ZakuraEndpoint,
     discovery: &ZakuraDiscoveryHandle,

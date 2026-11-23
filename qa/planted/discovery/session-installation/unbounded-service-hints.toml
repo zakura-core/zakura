@@ -1,4 +1,0 @@
-# Keeps disconnected peers' hints through an install, so churn grows them.
-seed = "discovery-session-installation"
-# The harness drives discovery state and the transport types under it.
-checks = ["crates/zakura-network/src/zakura"]

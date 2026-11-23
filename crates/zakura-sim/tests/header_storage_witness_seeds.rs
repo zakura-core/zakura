@@ -1,8 +1,8 @@
 //! fuzz-12 item 7: each action and overlap the fuzz-12 controls added, as a
 //! witness scenario, `header-storage-w-*`. A search over Plans for each
 //! scenario finds a run that shows the overlap it's named for in the facts
-//! it logs, not only that the run ended. The seeds in `zakura_sim::seed`
-//! start a fuzz campaign from the same scenarios.
+//! it logs, not only that the run ended. The QA store's seeds start a
+//! fuzz campaign from the same scenarios.
 #![cfg(zakura_sim)]
 
 mod support;
@@ -22,7 +22,7 @@ use zakura_sim::{
     NullSink, Observation, RunReport,
 };
 
-/// The overlap a witness seed's run shows.
+/// The overlap a witness input's run shows.
 #[derive(Clone, Copy, Debug)]
 enum Shows {
     /// An operation of this kind was pending at a reset and completed after
@@ -68,8 +68,8 @@ enum Shows {
     Owed(&'static str),
     /// The first read, held until two other reads completed, completed
     /// through the engine with a page after them. That's `holds()`'s first
-    /// hold succeeding, which the migrated seed's slice doesn't show: its
-    /// held read ends `PageUnavailable`.
+    /// hold succeeding, which not every Plan shows: on some, its held read
+    /// ends `PageUnavailable`.
     SucceededAfterHold,
 }
 
@@ -336,7 +336,7 @@ impl Shows {
     }
 }
 
-/// What each witness seed's run shows, by name.
+/// What each witness input's run shows, by name.
 fn shows(stem: &str) -> Shows {
     use std::cmp::Ordering;
     let witness = stem

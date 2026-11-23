@@ -79,11 +79,11 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::{
-    apply, changed_since_rev, git, is_affected,
+    apply, git, is_affected,
     lane::{sim_build_failure, BuildFailure},
     patched_files,
     pilot::{add_worktree, file_sha256, fresh_dir, head, hex, INTERRUPTED_ERROR},
-    planted_layout, provenance, remove_worktree,
+    planted_layout, provenance, remove_worktree, require_plain_relative,
     seeds::{self, Registry},
     CaseFile, PLANTED_DIR, PROFILE, SHARED,
 };
@@ -108,10 +108,11 @@ use generate::{
     PropertyFinding,
 };
 
-/// The loop's retained cases, relative to the repository root.
+/// The loop's retained cases, relative to the QA store's root.
 const CASES: &str = "qa/native-mutations/cases.json";
 
-/// The generator prompt, whose hash the report records.
+/// The generator prompt, whose hash the report records, relative to the
+/// repository root.
 const PROMPT: &str = "qa/native-mutations/PROMPT.md";
 
 /// The report's file name under `--out`.
@@ -148,7 +149,7 @@ const POLL: Duration = Duration::from_millis(50);
 pub(super) enum WitnessSpec {
     /// A retained planted case's seed or typed scenario.
     Planted {
-        /// The case file, relative to the repository root.
+        /// The case file, relative to the QA store's root.
         planted: PathBuf,
     },
     /// A seed of the simulator's registry, which names its harness.
@@ -211,12 +212,14 @@ enum Runnable {
     /// One test in one test binary.
     Test { target: String, test: String },
     /// `zakura-sim generate`'s search on a harness: `runs` inputs drawn
-    /// from `seed`, skipping the digests in `exclude`.
+    /// from `seed` under the draw policy `draws`, skipping the digests in
+    /// `exclude`.
     Generate {
         harness: String,
         seed: u64,
         runs: u64,
         exclude: PathBuf,
+        draws: String,
     },
 }
 
@@ -381,15 +384,18 @@ pub(super) struct Flags {
     pub(super) planted: Vec<String>,
     pub(super) only: Vec<String>,
     pub(super) changed_since: Option<String>,
+    /// `--store-changed`: the file that lists the store's changed paths.
+    pub(super) store_changed: Option<PathBuf>,
     pub(super) jobs: usize,
     /// `Some(None)` for `--memory-max off`.
     pub(super) memory_max: Option<Option<u64>>,
     pub(super) generate: GenerateFlags,
 }
 
-/// Reads the flags after `planted loop`. `--out` and `--work` become
-/// absolute, since cargo runs from each slot's worktree. Every flag but
-/// `--list` takes a value.
+/// Reads the flags after `planted loop`. `--out`, `--work` and
+/// `--store-changed` become absolute, since cargo runs from each slot's
+/// worktree. `--cases` stays as given: a relative directory is in the QA
+/// store. Every flag but `--list` takes a value.
 pub(super) fn parse_flags(mut args: impl Iterator<Item = String>) -> Result<Flags, BoxError> {
     let mut flags = Flags {
         jobs: DEFAULT_JOBS,
@@ -408,10 +414,13 @@ pub(super) fn parse_flags(mut args: impl Iterator<Item = String>) -> Result<Flag
         match flag.as_str() {
             "--out" if out.is_none() => out = Some(std::path::absolute(value)?),
             "--work" if flags.work.is_none() => flags.work = Some(std::path::absolute(value)?),
-            "--cases" if flags.cases.is_none() => flags.cases = Some(std::path::absolute(value)?),
+            "--cases" if flags.cases.is_none() => flags.cases = Some(PathBuf::from(value)),
             "--planted" => flags.planted.push(value),
             "--only" => flags.only.push(value),
             "--changed-since" if flags.changed_since.is_none() => flags.changed_since = Some(value),
+            "--store-changed" if flags.store_changed.is_none() => {
+                flags.store_changed = Some(std::path::absolute(value)?);
+            }
             "--jobs" => {
                 flags.jobs = value
                     .parse()
@@ -429,6 +438,11 @@ pub(super) fn parse_flags(mut args: impl Iterator<Item = String>) -> Result<Flag
             }
             _ => return Err(format!("unknown or repeated flag `{flag}`").into()),
         }
+    }
+    if flags.store_changed.is_some() && flags.changed_since.is_none() {
+        return Err(
+            UsageError("`--store-changed` adds to `--changed-since`, which is missing").into(),
+        );
     }
     flags.out = match out {
         Some(out) => out,
@@ -464,27 +478,34 @@ impl<'a> From<&'a LoopCase> for ListedCase<'a> {
 pub(crate) fn run(repo_root: &Path, args: impl Iterator<Item = String>) -> Result<(), BoxError> {
     let flags = parse_flags(args)?;
     install_interrupt_handler();
+    let store = planted_layout::require_store()?;
     let mut cases = Vec::new();
     if flags.cases.is_some() || flags.planted.is_empty() {
-        let dir = flags.cases.clone().unwrap_or_else(|| {
-            repo_root
+        let dir = match &flags.cases {
+            Some(dir) => store.join(dir),
+            None => store
                 .join(CASES)
                 .parent()
                 .map(Path::to_path_buf)
-                .unwrap_or_default()
-        });
-        cases.extend(native_cases(repo_root, &dir)?);
+                .unwrap_or_default(),
+        };
+        cases.extend(native_cases(&store, &dir)?);
     }
     cases.extend(planted_cases(
-        repo_root,
+        &store,
         &flags.planted,
         &mut std::io::stderr(),
     )?);
+    let changed = flags.changed_since.as_deref().map(|rev| super::Changed {
+        rev,
+        store: flags.store_changed.as_deref(),
+    });
     let cases = select(
         repo_root,
+        &store,
         cases,
         &flags.only,
-        flags.changed_since.as_deref(),
+        changed,
         &flags.generate,
     )?;
     if flags.list {
@@ -507,6 +528,7 @@ pub(crate) fn run(repo_root: &Path, args: impl Iterator<Item = String>) -> Resul
     };
     let pinned = head(repo_root)?;
     let runner = Runner {
+        store: store.clone(),
         out: flags.out.clone(),
         work,
         pinned: pinned.clone(),
@@ -524,7 +546,7 @@ pub(crate) fn run(repo_root: &Path, args: impl Iterator<Item = String>) -> Resul
         let _ = fs::remove_dir_all(&slot.target);
     }
     let mut outcome = outcome?;
-    let records = triage::read(repo_root)?;
+    let records = triage::read(&store)?;
     for stale in triage::apply(&mut outcome.cases, &records) {
         println!("stale triage: {}: it matches no lane", stale.describe());
     }
@@ -589,8 +611,8 @@ pub(crate) fn run(repo_root: &Path, args: impl Iterator<Item = String>) -> Resul
 }
 
 /// The loop cases of `<dir>/cases.json`: its entries that name a property,
-/// with patches relative to `dir`.
-pub(super) fn native_cases(repo_root: &Path, dir: &Path) -> Result<Vec<LoopCase>, BoxError> {
+/// with patches relative to `dir`, each labeled by its path in `store`.
+pub(super) fn native_cases(store: &Path, dir: &Path) -> Result<Vec<LoopCase>, BoxError> {
     let listed_in = dir.join("cases.json");
     let entries: Vec<Value> = serde_json::from_slice(
         &fs::read(&listed_in).map_err(|error| format!("{}: {error}", listed_in.display()))?,
@@ -604,7 +626,7 @@ pub(super) fn native_cases(repo_root: &Path, dir: &Path) -> Result<Vec<LoopCase>
             .map_err(|error| format!("{}: {error}", listed_in.display()))?;
         let patch = dir.join(&entry.patch);
         cases.push(LoopCase {
-            label: relative_label(repo_root, &patch),
+            label: relative_label(store, &patch),
             patch,
             listed_in: listed_in.clone(),
             property: entry.property,
@@ -625,20 +647,20 @@ pub(super) fn selects(prefix: &str, path: &str) -> bool {
         .is_some_and(|rest| prefix.ends_with('/') || rest.starts_with('/') || rest.starts_with('.'))
 }
 
-/// Every retained planted case whose property starts with one of
-/// `prefixes`, with its own committed witness. Fails on a case that names
+/// Every retained planted case in `store` whose property starts with one
+/// of `prefixes`, with its own stored witness. Fails on a case that names
 /// a nested `set`, which the loop's classes don't judge. Each skipped
 /// search case gets a line in `notes`, which `run` points at stderr so that
 /// `--list` keeps stdout to its JSON.
 pub(super) fn planted_cases(
-    repo_root: &Path,
+    store: &Path,
     prefixes: &[String],
     notes: &mut dyn io::Write,
 ) -> Result<Vec<LoopCase>, BoxError> {
     if prefixes.is_empty() {
         return Ok(Vec::new());
     }
-    let root = repo_root.join(PLANTED_DIR);
+    let root = store.join(PLANTED_DIR);
     let mut cases = Vec::new();
     let mut matched = BTreeSet::new();
     for patch in planted_layout::files(&root, "patch")? {
@@ -667,10 +689,10 @@ pub(super) fn planted_cases(
             continue;
         }
         cases.push(LoopCase {
-            label: relative_label(repo_root, &patch),
+            label: relative_label(store, &patch),
             listed_in: case_file.clone(),
             witness: WitnessSpec::Planted {
-                planted: PathBuf::from(relative_label(repo_root, &case_file)),
+                planted: PathBuf::from(relative_label(store, &case_file)),
             },
             patch,
             property,
@@ -685,23 +707,24 @@ pub(super) fn planted_cases(
     Ok(cases)
 }
 
-/// `path` relative to `repo_root`, or whole if it lies outside.
-fn relative_label(repo_root: &Path, path: &Path) -> String {
-    path.strip_prefix(repo_root)
+/// `path` relative to `root`, or whole if it lies outside.
+fn relative_label(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
         .unwrap_or(path)
         .to_string_lossy()
         .into_owned()
 }
 
-/// The cases `only` names by property, or all of them, then those a change
-/// since `changed_since` affects, with the generator lanes `generate`
-/// turns on. `None` if the change affects none. Fails on zero cases before
-/// the change filter.
+/// The cases `only` names by property, or all of them, then those the
+/// changes `changed_since` names affect, with the generator lanes
+/// `generate` turns on. `None` if the changes affect none. Fails on zero
+/// cases before the change filter.
 fn select(
     repo_root: &Path,
+    store: &Path,
     cases: Vec<LoopCase>,
     only: &[String],
-    changed_since: Option<&str>,
+    changed_since: Option<super::Changed<'_>>,
     generate: &GenerateFlags,
 ) -> Result<Option<Vec<LoopCase>>, BoxError> {
     if let Some(unknown) = only
@@ -717,13 +740,13 @@ fn select(
     if cases.is_empty() {
         return Err("zero loop cases selected".into());
     }
-    let Some(rev) = changed_since else {
+    let Some(since) = changed_since else {
         return Ok(Some(cases));
     };
-    let changed = changed_since_rev(repo_root, rev)?;
+    let changed = since.paths(repo_root)?;
     let mut affected = Vec::new();
     for case in cases {
-        if is_affected(&watched(repo_root, &case)?, &changed)
+        if is_affected(&watched(repo_root, store, &case)?, &changed)
             || generate::affected(generate, &changed)
         {
             affected.push(case);
@@ -732,24 +755,25 @@ fn select(
     Ok((!affected.is_empty()).then_some(affected))
 }
 
-/// Every path whose change can change `case`'s result, relative to
-/// `repo_root`: the patch, the file that lists the case, the witness's
-/// files, the files the patch changes, a planted witness's checks, the
-/// shared machinery, and its work-list entry's paths ([`entry_paths`]).
-fn watched(repo_root: &Path, case: &LoopCase) -> Result<Vec<PathBuf>, BoxError> {
+/// Every path whose change can change `case`'s result: the patch, the file
+/// that lists the case and the witness's files, relative to `store`, the
+/// files the patch changes, a planted witness's checks and the shared
+/// machinery, relative to `repo_root`, and its work-list entry's paths
+/// ([`entry_paths`]). The store's paths and the repository's don't overlap.
+fn watched(repo_root: &Path, store: &Path, case: &LoopCase) -> Result<Vec<PathBuf>, BoxError> {
     let mut watched: Vec<PathBuf> = [&case.patch, &case.listed_in]
         .into_iter()
-        .filter_map(|path| path.strip_prefix(repo_root).ok().map(Path::to_path_buf))
+        .filter_map(|path| path.strip_prefix(store).ok().map(Path::to_path_buf))
         .collect();
     watched.extend(SHARED.iter().map(PathBuf::from));
     watched.extend(patched_files(repo_root, &case.patch)?);
-    watched.extend(entry_paths(repo_root, case)?);
+    watched.extend(entry_paths(store, case)?);
     match &case.witness {
         WitnessSpec::Planted { planted } => {
             watched.push(planted.clone());
-            let file: CaseFile = toml::from_str(&fs::read_to_string(repo_root.join(planted))?)?;
-            if file.seed.is_some() {
-                watched.push(PathBuf::from(seeds::REGISTRY));
+            let file = planted_case(store, planted)?;
+            if let Some(name) = &file.seed {
+                watched.push(seeds::input_path(name));
             }
             if let Some(typed) = file.typed {
                 let plan = typed.plan_file()?;
@@ -758,7 +782,7 @@ fn watched(repo_root: &Path, case: &LoopCase) -> Result<Vec<PathBuf>, BoxError> 
             }
             watched.extend(file.checks);
         }
-        WitnessSpec::Seed { .. } => watched.push(PathBuf::from(seeds::REGISTRY)),
+        WitnessSpec::Seed { seed } => watched.push(seeds::input_path(seed)),
         WitnessSpec::Test { test_target, .. } => {
             watched.push(PathBuf::from(format!(
                 "crates/zakura-sim/tests/{test_target}.rs"
@@ -768,7 +792,7 @@ fn watched(repo_root: &Path, case: &LoopCase) -> Result<Vec<PathBuf>, BoxError> 
     Ok(watched)
 }
 
-/// The mutation loop's work list, relative to the repository root.
+/// The mutation loop's work list, relative to the QA store's root.
 const WORK_LIST: &str = "qa/native-mutations/work-list.toml";
 
 /// The parts of [`WORK_LIST`] that [`entry_paths`] reads.
@@ -798,15 +822,15 @@ struct WorkInstance {
 }
 
 /// The work-list paths that bear on `case`'s result: the work list itself,
-/// and its entry's checks, shared code and code, with the code of the
-/// entry's instance of `case`'s property. A change to an instance's code can
-/// change whether a patch to the entry's shared code survives. Empty for a
-/// case that names no entry.
-fn entry_paths(repo_root: &Path, case: &LoopCase) -> Result<Vec<PathBuf>, BoxError> {
+/// in `store`, and its entry's checks, shared code and code, with the code
+/// of the entry's instance of `case`'s property, in the repository. A change
+/// to an instance's code can change whether a patch to the entry's shared
+/// code survives. Empty for a case that names no entry.
+fn entry_paths(store: &Path, case: &LoopCase) -> Result<Vec<PathBuf>, BoxError> {
     let Some(id) = &case.entry else {
         return Ok(Vec::new());
     };
-    let list: WorkList = toml::from_str(&fs::read_to_string(repo_root.join(WORK_LIST))?)?;
+    let list: WorkList = toml::from_str(&fs::read_to_string(store.join(WORK_LIST))?)?;
     let entry = list
         .entry
         .into_iter()
@@ -850,6 +874,8 @@ fn command_line(command: &mut Command) -> String {
 
 /// What every slot shares.
 struct Runner {
+    /// The QA store's root, which holds the witnesses' files.
+    store: PathBuf,
     out: PathBuf,
     work: PathBuf,
     pinned: String,
@@ -965,14 +991,14 @@ impl Runner {
     /// Runs every case: the baselines on slot 0, then each mutant on the
     /// next free slot, then each case the memory cap killed alone.
     fn run_all(&self, cases: &[LoopCase], slots: &[Slot]) -> Result<Outcome, BoxError> {
-        // Each slot reads its witnesses' inputs from its own tree, which no
-        // other slot resets.
+        // Every slot reads its witnesses' inputs from the store, which no
+        // mutant changes.
         let slot_runnables = slots
             .iter()
-            .map(|slot| {
+            .map(|_| {
                 cases
                     .iter()
-                    .map(|case| runnable(&slot.tree, &case.witness, &case.property))
+                    .map(|case| runnable(&self.store, &case.witness, &case.property))
                     .collect::<Result<Vec<_>, _>>()
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -1542,6 +1568,7 @@ impl Runner {
                 seed,
                 runs,
                 exclude,
+                draws,
             } => {
                 let sim = built
                     .sim
@@ -1551,6 +1578,7 @@ impl Runner {
                 command
                     .args(["generate", "--sim", harness])
                     .args(["--seed", &seed.to_string(), "--runs", &runs.to_string()])
+                    .args(["--draws", draws])
                     .arg("--exclude")
                     .arg(exclude)
                     .arg("--out")
@@ -1610,8 +1638,28 @@ impl Runner {
     }
 }
 
+/// The planted case file `planted` under `store`, the QA store's root. The
+/// case file and a typed case's scenario and Plan file must be plain
+/// relative paths, as the planted loader requires, so that no case reads a
+/// file outside the store.
+fn planted_case(store: &Path, planted: &Path) -> Result<CaseFile, BoxError> {
+    require_plain_relative(Path::new("a planted witness"), planted)?;
+    let path = store.join(planted);
+    let file: CaseFile = toml::from_str(
+        &fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?,
+    )
+    .map_err(|error| format!("{}: {error}", path.display()))?;
+    if let Some(typed) = &file.typed {
+        require_plain_relative(&path, &typed.scenario)?;
+        if let Some(plan) = typed.plan_file()? {
+            require_plain_relative(&path, plan.path())?;
+        }
+    }
+    Ok(file)
+}
+
 /// How the runner runs `witness` for `property`, reading a planted case
-/// from `tree`. A seed's run waits for the registry ([`resolve_seeds`]).
+/// from `tree`, the QA store's root. A seed's run waits for the registry ([`resolve_seeds`]).
 fn runnable(tree: &Path, witness: &WitnessSpec, property: &str) -> Result<Runnable, BoxError> {
     let seed = |name: &str| Runnable::Seed {
         name: name.to_owned(),
@@ -1620,11 +1668,7 @@ fn runnable(tree: &Path, witness: &WitnessSpec, property: &str) -> Result<Runnab
     match witness {
         WitnessSpec::Planted { planted } => {
             let path = tree.join(planted);
-            let file: CaseFile = toml::from_str(
-                &fs::read_to_string(&path)
-                    .map_err(|error| format!("{}: {error}", path.display()))?,
-            )
-            .map_err(|error| format!("{}: {error}", path.display()))?;
+            let file = planted_case(tree, planted)?;
             match (file.seed, file.typed) {
                 (Some(name), None) => Ok(seed(&name)),
                 (None, Some(typed)) => {

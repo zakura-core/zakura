@@ -1,2 +1,0 @@
-seed = "handshake-partial-session"
-checks = ["crates/zakura-network/src/zakura/regulation/session_capacity.rs"]

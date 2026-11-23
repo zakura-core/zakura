@@ -152,7 +152,8 @@ impl ClaimTable {
 /// [`AnnouncementClaims::note_block_header`], and the block verifier reads them by block hash,
 /// so every body transport follows the same rule. The first sighting sets the order and
 /// deadline for as long as it is held. A provisional header releases its place if every
-/// covering apply fails, and a legacy sighting stops counting once it expires.
+/// covering apply fails. Once a legacy sighting expires from the store, a new sighting can
+/// claim a fresh place, even if the old entry has yet to be pruned.
 #[derive(Clone, Debug, Default)]
 pub struct AnnouncementClaims(Arc<Mutex<ClaimTable>>);
 

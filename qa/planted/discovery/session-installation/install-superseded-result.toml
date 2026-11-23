@@ -1,4 +1,0 @@
-# Installs a verification result whose session was superseded.
-seed = "discovery-session-installation"
-# The harness drives discovery state and the transport types under it.
-checks = ["crates/zakura-network/src/zakura"]

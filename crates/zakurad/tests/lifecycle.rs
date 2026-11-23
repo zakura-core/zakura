@@ -749,6 +749,41 @@ fn invalid_config_combination_is_rejected() {
     );
 }
 
+/// A node told to name itself as a mining gateway refuses to start when its node key file
+/// does not hold a key, and leaves that file as it is. It would otherwise start with a new
+/// node ID while recent blocks still name the old one.
+#[test]
+fn gateway_announcement_with_a_broken_node_key_is_rejected() {
+    let scratch = Scratch::new();
+    let identity_dir = scratch.path().join("identity");
+    let key_file = identity_dir.join("regtest.zakura-iroh-secret-key");
+    fs::create_dir_all(&identity_dir).expect("create the identity directory");
+    fs::write(&key_file, "not a key").expect("write a broken key file");
+
+    let config = scratch.write_config("zakura.toml", &{
+        let mut config = scratch.regtest_config();
+        config.network.p2p_stack = zakura_network::P2pStack::Zakura;
+        config.network.identity_dir = identity_dir;
+        config.mining.miner_mesh = true;
+        config
+    });
+
+    let run = scratch.run(&mut scratch.command([
+        OsStr::new("-c"),
+        config.as_os_str(),
+        OsStr::new("start"),
+    ]));
+
+    // The node reports an error found while starting on its log, not on stderr.
+    run.assert_status(1).assert_stdout_contains(
+        "mining.miner_mesh needs a node key that stays the same across restarts",
+    );
+    assert_eq!(
+        fs::read_to_string(&key_file).expect("read the key file"),
+        "not a key",
+    );
+}
+
 /// A log file that can't be opened stops startup before the node starts.
 #[test]
 fn tracing_setup_failure_is_reported() {

@@ -33,10 +33,10 @@ use thiserror::Error;
 
 use zakura_chain::{
     block::Height,
-    transaction::{self, zip317, UnminedTx, UnminedTxId, VerifiedUnminedTx},
+    transaction::{self, zip317, Transaction, UnminedTx, UnminedTxId, VerifiedUnminedTx},
     transparent,
 };
-use zakura_node_services::mempool::TransactionDependencies;
+use zakura_node_services::mempool::{port::RemovalReason, TransactionDependencies};
 use zcash_script::solver;
 
 use self::{eviction_list::EvictionList, verified_set::VerifiedSet};
@@ -274,6 +274,17 @@ pub struct StorageStats {
     pub below_eviction_cost: u64,
 }
 
+/// What a block on the best chain removed from storage, in the order the
+/// pool core logs it. See [`Storage::connect_block`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BlockRemovals {
+    /// The transactions it mined, in block order.
+    pub mined: Vec<UnminedTxId>,
+    /// What conflicted with it, then what expired, each followed by what
+    /// depends on it, and why each left.
+    pub dropped: Vec<(UnminedTxId, RemovalReason)>,
+}
+
 /// Hold mempool verified and rejected mempool transactions.
 ///
 /// `E` is the verification error a rejection caches. See the module docs.
@@ -388,7 +399,8 @@ impl<E: Clone> Storage<E> {
             .0
     }
 
-    /// Insert a transaction and return the IDs of the transactions it evicted.
+    /// Insert a transaction and return the IDs of the transactions it evicted,
+    /// oldest first.
     ///
     /// If the transaction does not fit under the mempool cost limit, the mempool evicts its
     /// cheapest packages first. See [`VerifiedSet::select_eviction_victims`]. The mempool admits
@@ -422,7 +434,7 @@ impl<E: Clone> Storage<E> {
         height: Option<Height>,
         now: Instant,
         time: DateTime<Utc>,
-    ) -> (Result<UnminedTxId, MempoolError<E>>, HashSet<UnminedTxId>) {
+    ) -> (Result<UnminedTxId, MempoolError<E>>, Vec<UnminedTxId>) {
         // # Security
         //
         // Every refusal below is cached through `reject_exact` or
@@ -432,7 +444,7 @@ impl<E: Clone> Storage<E> {
 
         // First, check if we have a cached rejection for this transaction.
         if let Some(error) = self.rejection(&unmined_tx_id, now) {
-            return (Err(error), HashSet::new());
+            return (Err(error), Vec::new());
         }
 
         // If `tx` is already in the mempool, we don't change anything.
@@ -440,17 +452,14 @@ impl<E: Clone> Storage<E> {
         // Security: transactions must not get refreshed by new queries,
         // because that allows malicious peers to keep transactions live forever.
         if self.verified.contains(&tx_id) {
-            return (Err(MempoolError::InMempool), HashSet::new());
+            return (Err(MempoolError::InMempool), Vec::new());
         }
 
         // Check that the transaction is standard. The rejection is cached for
         // these exact bytes, and the caller sees which rule it broke.
         if let Err(error) = self.standardness(&tx) {
             self.reject_exact(unmined_tx_id, error.clone().into());
-            return (
-                Err(MempoolError::NonStandardTransaction(error)),
-                HashSet::new(),
-            );
+            return (Err(MempoolError::NonStandardTransaction(error)), Vec::new());
         }
 
         // Check for conflicts before evicting anything, so a rejected transaction leaves the
@@ -462,7 +471,7 @@ impl<E: Clone> Storage<E> {
             Ok(ancestors) => ancestors,
             Err(error) => {
                 self.reject_effects_tip(tx_id, error.clone());
-                return (Err(error.into()), HashSet::new());
+                return (Err(error.into()), Vec::new());
             }
         };
 
@@ -470,7 +479,7 @@ impl<E: Clone> Storage<E> {
             Ok(evicted_ids) => evicted_ids,
             Err(error) => {
                 self.reject_exact(unmined_tx_id, error.clone());
-                return (Err(error.into()), HashSet::new());
+                return (Err(error.into()), Vec::new());
             }
         };
 
@@ -500,16 +509,16 @@ impl<E: Clone> Storage<E> {
     ///
     /// `ancestors` are the mempool ancestors of `tx`, which the mempool never evicts for it.
     ///
-    /// Returns the IDs of the evicted transactions. Returns an error, and evicts nothing, if
-    /// `tx` does not pay enough to evict them.
+    /// Returns the IDs of the evicted transactions, oldest first. Returns an error, and evicts
+    /// nothing, if `tx` does not pay enough to evict them.
     fn make_room(
         &mut self,
         tx: &VerifiedUnminedTx,
         ancestors: &HashSet<transaction::Hash>,
-    ) -> Result<HashSet<UnminedTxId>, ExactTipRejectionError<E>> {
+    ) -> Result<Vec<UnminedTxId>, ExactTipRejectionError<E>> {
         if self.verified.total_cost().saturating_add(tx.cost()) <= self.tx_cost_limit {
             self.eviction_cost_floor = 0.0;
-            return Ok(HashSet::new());
+            return Ok(Vec::new());
         }
 
         let victims = self
@@ -528,13 +537,11 @@ impl<E: Clone> Storage<E> {
             return Err(ExactTipRejectionError::BelowEvictionCost);
         };
 
-        let mut evicted_ids = HashSet::new();
-        for root in roots {
-            for evicted_tx in self.verified.remove(&root) {
-                let evicted_id = evicted_tx.transaction.id();
-                self.reject_exact(evicted_id, ExactTipRejectionError::Evicted);
-                evicted_ids.insert(evicted_id);
-            }
+        // Cached in removal order, which decides what survives a list that
+        // fills up, and logged oldest first.
+        let (removed, evicted_ids) = self.verified.evict(roots);
+        for evicted_id in removed {
+            self.reject_exact(evicted_id, ExactTipRejectionError::Evicted);
         }
         // A `usize` always fits in a `u64` on supported platforms.
         self.evicted = self.evicted.saturating_add(evicted_ids.len() as u64);
@@ -544,24 +551,75 @@ impl<E: Clone> Storage<E> {
 
     // Removal.
 
-    /// Removes the transaction with mined id `tx_id` and nothing else. What
-    /// depends on it stays, no longer counted as its dependent.
+    /// Does to storage what a block on the best chain at `height` does to
+    /// the pool: removes what it mined, then what conflicts with
+    /// `transactions`, then what has expired, and caches each as mined,
+    /// a duplicate spend or expired at `now`. `mined` are the block's mined
+    /// ids, in block order. Every one is cached, stored or not.
     ///
-    /// Caches no rejection. Returns the transaction, if it was stored.
-    pub fn remove_one(&mut self, tx_id: &transaction::Hash) -> Option<VerifiedUnminedTx> {
-        if !self.verified.contains(tx_id) {
-            return None;
+    /// Returns what left, in the order the pool core logs it: the mined ones
+    /// in block order, then each conflicting and each expired one oldest
+    /// first, followed by what depends on it. The mined ones are returned
+    /// apart, because the core logs what else the block ended between them
+    /// and the rest. See
+    /// [`VerifiedSet::remove_with_descendants`]. What depends on a mined
+    /// transaction stays: its input is on the chain now.
+    ///
+    /// Conflicts are found through the owners of the block's spends, and
+    /// expiry through the expiry index, so the work scales with the block
+    /// and with what leaves, not with the pool.
+    pub fn connect_block<'a>(
+        &mut self,
+        mined: &[transaction::Hash],
+        transactions: impl IntoIterator<Item = &'a Transaction>,
+        height: Height,
+        now: Instant,
+    ) -> BlockRemovals {
+        // Conflicts are found before anything is removed. A stored copy of a
+        // mined transaction owns the spends the block's copy makes, and it
+        // leaves as mined.
+        let mined_set: HashSet<transaction::Hash> = mined.iter().copied().collect();
+        let conflicts: Vec<transaction::Hash> = transactions
+            .into_iter()
+            .flat_map(|tx| self.verified.conflicting_ids(tx).collect::<Vec<_>>())
+            .filter(|id| !mined_set.contains(id))
+            .collect();
+        let conflicts = self.verified.oldest_first(conflicts);
+
+        let removed_mined = self.verified.remove_mined(mined);
+        for &id in mined {
+            self.reject_effects_chain(id, SameEffectsChainRejectionError::Mined, now);
         }
-        self.verified
-            .clear_mined_dependencies(&[*tx_id].into_iter().collect());
-        self.verified.remove(tx_id).pop()
+
+        let mut dropped = self
+            .verified
+            .remove_with_descendants(&conflicts, RemovalReason::Conflicted);
+        for id in conflicts {
+            self.reject_effects_chain(id, SameEffectsChainRejectionError::DuplicateSpend, now);
+        }
+
+        let expired = self.verified.oldest_first(
+            self.verified
+                .expired_transaction_ids(height)
+                .collect::<Vec<_>>(),
+        );
+        dropped.extend(
+            self.verified
+                .remove_with_descendants(&expired, RemovalReason::Expired),
+        );
+        for id in expired {
+            self.reject_effects_chain(id, SameEffectsChainRejectionError::Expired, now);
+        }
+        BlockRemovals {
+            mined: removed_mined,
+            dropped,
+        }
     }
 
-    /// Removes and returns every stored transaction. Rejections stay.
+    /// Removes and returns every stored transaction, oldest first.
+    /// Rejections stay.
     pub fn take_all(&mut self) -> Vec<VerifiedUnminedTx> {
-        let transactions = self.verified.transactions().values().cloned().collect();
-        self.verified.clear();
-        transactions
+        self.verified.take_all()
     }
 
     // Rejections.
@@ -729,6 +787,7 @@ impl<E: Clone> Storage<E> {
             self.total_cost() <= self.tx_cost_limit,
             "pool/cost-within-limit: the pool within its cost limit"
         );
+        self.verified.assert_dependency_groups_are_bounded();
     }
 
     /// Entries in the rejection lists. See [`StorageStats::rejected`].
@@ -792,6 +851,28 @@ impl<E: Clone> Storage<E> {
     /// authorizing data.
     pub fn contains(&self, tx_id: &transaction::Hash) -> bool {
         self.verified.contains(tx_id)
+    }
+
+    /// The stamp of the stored transaction with the effects `tx_id`. See
+    /// [`VerifiedSet::added_at`].
+    pub fn added_at(&self, tx_id: &transaction::Hash) -> Option<u64> {
+        self.verified.added_at(tx_id)
+    }
+
+    /// Insertions since storage was made. A transaction stored after this
+    /// read `n` has an [`Self::added_at`] stamp above `n`.
+    pub fn insertions(&self) -> u64 {
+        self.verified.insertions()
+    }
+
+    /// The stored transactions' exact ids, oldest first.
+    #[cfg(test)]
+    pub(crate) fn pooled_ids(&self) -> Vec<UnminedTxId> {
+        self.verified
+            .oldest_first(self.transactions().keys().copied())
+            .iter()
+            .map(|id| self.transactions()[id].transaction.id())
+            .collect()
     }
 
     /// Returns the number of transactions in the mempool.

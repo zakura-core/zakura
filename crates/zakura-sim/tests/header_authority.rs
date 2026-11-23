@@ -6,15 +6,15 @@
 
 mod support;
 
-use std::{fs, path::PathBuf, process::Command};
+use std::{fs, process::Command};
 
 use support::inputs;
 use zakura_sim::NaReason;
 use zakura_sim::{
     check::PropertyOutcome,
     domain::header_sync::{
-        CHUNK_BUDGET_BOUND, COMMIT_ONLY_AUTHORIZED, RESET_INVALIDATES_WORK, STALE_COMPLETION_INERT,
-        TEARDOWN_RETURNS_BASELINE,
+        CHUNK_BUDGET_BOUND, COMMIT_ONLY_AUTHORIZED, OUTSTANDING_WORK_BOUNDED,
+        RESET_INVALIDATES_WORK, STALE_COMPLETION_INERT, TEARDOWN_RETURNS_BASELINE,
     },
     harness::{
         header_node::{
@@ -352,35 +352,17 @@ fn each_witness_takes_the_path_it_names() {
     }
 }
 
-/// The witnesses `cargo xtask planted` runs as typed cases, each committed
-/// as `tests/fixtures/header-authority-<name>.json`.
+/// The witnesses `cargo xtask planted` runs as typed cases. The QA store
+/// holds each as `fixtures/header-authority-<name>.json`.
 /// Each runs under the empty Plan.
-fn committed_witnesses() -> [(&'static str, StorageScenario); 4] {
+fn typed_witnesses() -> [(&'static str, StorageScenario); 4] {
     witnesses()
 }
 
-/// The committed fixture `header-authority-<name>.<extension>`.
-fn fixture(name: &str, extension: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures")
-        .join(format!("header-authority-{name}.{extension}"))
-}
-
-/// Each committed witness is its builder's scenario, as JSON, and holds
-/// and applies under the empty Plan.
+/// Each typed witness holds and applies under the empty Plan.
 #[test]
-fn the_committed_witnesses_match_their_builders() {
-    for (name, scenario) in committed_witnesses() {
-        let committed: StorageScenario = serde_json::from_str(
-            &fs::read_to_string(fixture(name, "json"))
-                .unwrap_or_else(|error| panic!("{name}: {error}")),
-        )
-        .unwrap_or_else(|error| panic!("{name}: {error}"));
-        assert_eq!(
-            serde_json::to_value(&committed).expect("scenarios serialize"),
-            serde_json::to_value(&scenario).expect("scenarios serialize"),
-            "{name}"
-        );
+fn every_typed_witness_holds_and_applies() {
+    for (name, scenario) in typed_witnesses() {
         let report = run(&scenario, zakura_sim::Plan::from_fuzz(&[]));
         assert!(
             matches!(
@@ -415,21 +397,46 @@ fn every_authority_witness_repeats_a_a_and_a_b_a() {
     }
 }
 
-/// `record --witness` judges each committed witness as `cargo xtask
-/// planted` runs it, expecting a hold, and `replay` reruns the trace Exact
+/// `cargo xtask planted header-sync/outstanding-work-bounded` runs these
+/// witnesses too. Each holds the property and applies under the empty Plan
+/// and under generated plans.
+#[test]
+fn the_outstanding_witnesses_hold_outstanding_work_bounded() {
+    let witnesses = [
+        ("forks-sharing-a-header", forks_sharing_a_header()),
+        ("relinked-mid-round", relinked_mid_round()),
+    ];
+    for (name, scenario) in witnesses {
+        let mut plans = vec![zakura_sim::Plan::from_fuzz(&[])];
+        plans.extend(inputs(8, 256));
+        for (index, input) in plans.into_iter().enumerate() {
+            let report = run(&scenario, input);
+            assert!(
+                matches!(
+                    outcome(&report, OUTSTANDING_WORK_BOUNDED),
+                    PropertyOutcome::Held { applicable } if *applicable > 0
+                ),
+                "{name} plan {index}"
+            );
+        }
+    }
+}
+
+/// `record --witness` judges each typed witness as `cargo xtask planted`
+/// runs it, expecting a hold, and `replay` reruns the trace Exact
 /// in a fresh process.
 #[test]
-fn the_committed_witnesses_record_and_replay_in_a_fresh_process() {
+fn every_typed_witness_records_and_replays_in_a_fresh_process() {
     let zakura_sim = |args: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_zakura-sim"))
             .args(args)
             .output()
             .expect("the binary runs")
     };
-    for (name, _) in committed_witnesses() {
+    for (name, scenario) in typed_witnesses() {
         let dir = tempfile::TempDir::new().expect("a temporary directory");
         let trace = dir.path().join("trace");
-        let scenario = fs::read_to_string(fixture(name, "json")).expect("the witness is committed");
+        let scenario = serde_json::to_string(&scenario).expect("scenarios serialize");
         let recorded = zakura_sim(&[
             "record",
             "--sim",

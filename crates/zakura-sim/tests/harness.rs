@@ -498,38 +498,55 @@ fn every_coverage_witness_exists_and_runs_where_it_says() {
     let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let workflow =
         std::fs::read_to_string(crate_dir.join("../../.github/workflows/tests-unit.yml")).unwrap();
+    let routine = std::fs::read_to_string(
+        crate_dir.join("../../deploy/mutation-joint/zakura-mutation-joint.env.example"),
+    )
+    .unwrap();
+    let store = zakura_sim::planted::store_root();
     for row in COVERAGE {
         let witnesses = match row.bypass {
             Bypass::Test(bypass) => vec![row.passing.witness(), bypass],
+            // The cases live in the QA store. With `ZAKURA_QA_STORE` set, as
+            // the joint-run droplet's suite step sets it, each must exist
+            // there. The droplet's routine runs them.
             Bypass::Planted(name) => {
-                let patch = crate_dir
-                    .join("../../qa/planted")
-                    .join(row.property)
-                    .join(format!("{name}.patch"));
-                assert!(patch.is_file(), "{}: no {}", row.property, patch.display());
+                if let Some(store) = &store {
+                    let patch = store
+                        .join(zakura_sim::planted::PLANTED_DIR)
+                        .join(row.property)
+                        .join(format!("{name}.patch"));
+                    assert!(patch.is_file(), "{}: no {}", row.property, patch.display());
+                }
                 assert!(
-                    workflow.contains("cargo xtask planted"),
-                    "{}: CI never runs `cargo xtask planted`",
+                    routine.contains("--planted-shards"),
+                    "{}: the routine never runs `cargo xtask planted`",
                     row.property
                 );
                 vec![row.passing.witness()]
             }
             Bypass::Native(name) => {
-                let directory = crate_dir.join("../../qa/native-mutations");
+                if let Some(store) = &store {
+                    let directory = store.join("qa/native-mutations");
+                    assert!(
+                        directory.join(name).is_file(),
+                        "{}: no {name}",
+                        row.property
+                    );
+                    let cases: Vec<serde_json::Value> = serde_json::from_str(
+                        &std::fs::read_to_string(directory.join("cases.json")).unwrap(),
+                    )
+                    .unwrap();
+                    assert!(
+                        cases
+                            .iter()
+                            .any(|case| case["patch"] == name && case["property"] == row.property),
+                        "{}: {name} has no native mutation binding",
+                        row.property
+                    );
+                }
                 assert!(
-                    directory.join(name).is_file(),
-                    "{}: no {name}",
-                    row.property
-                );
-                let cases: Vec<serde_json::Value> = serde_json::from_str(
-                    &std::fs::read_to_string(directory.join("cases.json")).unwrap(),
-                )
-                .unwrap();
-                assert!(
-                    cases
-                        .iter()
-                        .any(|case| case["patch"] == name && case["property"] == row.property),
-                    "{}: {name} has no native mutation binding",
+                    routine.contains("--cases qa/native-mutations"),
+                    "{}: the routine never runs the native mutations",
                     row.property
                 );
                 vec![row.passing.witness()]

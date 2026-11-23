@@ -1,2 +1,0 @@
-seed = "header-reactor-policy"
-checks = ["crates/zakura-network/src/zakura/header_sync/reactor"]

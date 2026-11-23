@@ -31,6 +31,12 @@
 //!   the non-finalized reorg.
 //! - `header-faults`: uses a bounded multi-range chain, restarts node2 with
 //!   outstanding header-sync work, and requires v7 request-id trace coverage.
+//! - `mixed-version`: runs a separate five-node stack that mixes the latest
+//!   release (`p2p-v2/3`, downloaded and SHA256-verified unless
+//!   `ZAKURAD_OLD_BIN` is set) with this build (`p2p-v2/4`), and asserts that
+//!   blocks cross the version boundary over legacy TCP, that the rejected
+//!   upgrade keeps each cross-version legacy connection open, that same-version
+//!   v2 still works, and that no node bans the other cohort.
 //!
 //! It shells out to `docker/zakura-regtest-e2e/run.sh`, which builds `zakurad`
 //! (debug) if needed, brings up four Regtest nodes sharing the host network — a

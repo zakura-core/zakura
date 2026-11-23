@@ -8,6 +8,7 @@ use std::{
 use zakura_rt::time::Instant;
 
 use zakura_network::zakura::{HandshakeCadenceAdmission, HandshakeCounts, IpAdmission};
+use zakura_quic::{NodeId, NodeSecretKey};
 
 use super::{machine::Machine, HarnessEntry};
 use crate::property::Status;
@@ -29,6 +30,9 @@ pub const CADENCE: &str = "handshake/attempts-within-cadence";
 pub const CONFORMANT: &str = "handshake/cadence-never-refuses-conformant";
 
 const HOSTS: usize = 8;
+/// Remote node IDs the owners draw from, few enough that one node often
+/// holds several connection slots.
+const NODES: usize = 4;
 const SLOTS: usize = 128;
 const CONNECTION_CAP: usize = 92;
 const INBOUND_CONNECTION_CAP: usize = 69;
@@ -97,6 +101,7 @@ enum Phase {
 struct Owner {
     host: usize,
     ip: IpAddr,
+    node: NodeId,
     inbound: bool,
     phase: Phase,
 }
@@ -180,7 +185,7 @@ fn actual(counts: &HandshakeCounts) -> CountsView {
 fn release(counts: &mut HandshakeCounts, owner: Owner) {
     release_handshake(counts, owner);
     if !owner.inbound || owner.phase != Phase::Quic {
-        counts.release_connection(owner.inbound);
+        counts.release_connection(owner.node, owner.inbound);
     }
 }
 
@@ -328,6 +333,10 @@ impl CadenceLog {
 
 fn history(input: &[u8]) -> Vec<(usize, MachineStep)> {
     let mut counts = HandshakeCounts::default();
+    let nodes: [NodeId; NODES] = std::array::from_fn(|index| {
+        let seed = u8::try_from(index + 1).expect("the node table is small");
+        NodeSecretKey::from_bytes(&[seed; 32]).public()
+    });
     // The address cap is sixteen, so it fits `u32`.
     let mut cadence = CadenceLog {
         origin: Instant::now(),
@@ -342,6 +351,7 @@ fn history(input: &[u8]) -> Vec<(usize, MachineStep)> {
         let slot = usize::from(*bytes.get(1).unwrap_or(&0)) % SLOTS;
         let arg = *bytes.get(2).unwrap_or(&0);
         let (host, ip) = address(arg);
+        let node = nodes[usize::from(arg >> 4) % NODES];
         let mut failures = Vec::new();
         match (op, owners[slot]) {
             (0 | 1, None) => {
@@ -371,7 +381,7 @@ fn history(input: &[u8]) -> Vec<(usize, MachineStep)> {
                         ) == IpAdmission::Open
                             && !counts.pending_full(quic_total, PENDING_CAP))
                 } else {
-                    counts.claim_connection(false, CONNECTION_CAP)
+                    counts.claim_connection(node, false, CONNECTION_CAP)
                 };
                 active |= admitted;
                 let admitted =
@@ -382,6 +392,7 @@ fn history(input: &[u8]) -> Vec<(usize, MachineStep)> {
                     owners[slot] = Some(Owner {
                         host,
                         ip,
+                        node,
                         inbound,
                         phase: Phase::Quic,
                     });
@@ -402,7 +413,7 @@ fn history(input: &[u8]) -> Vec<(usize, MachineStep)> {
             (2, Some(mut owner)) if owner.phase == Phase::Quic => {
                 let view = expected(&owners);
                 let connection_claimed =
-                    !owner.inbound || counts.claim_connection(true, CONNECTION_CAP);
+                    !owner.inbound || counts.claim_connection(owner.node, true, CONNECTION_CAP);
                 let claimed = connection_claimed
                     && if owner.inbound {
                         counts.claim_transferred_pending();
@@ -431,7 +442,7 @@ fn history(input: &[u8]) -> Vec<(usize, MachineStep)> {
                     owners[slot] = Some(owner);
                 } else {
                     if connection_claimed {
-                        counts.release_connection(owner.inbound);
+                        counts.release_connection(owner.node, owner.inbound);
                     }
                     owners[slot] = None;
                 }
@@ -444,7 +455,7 @@ fn history(input: &[u8]) -> Vec<(usize, MachineStep)> {
                     owner.phase = Phase::Registered;
                     owners[slot] = Some(owner);
                 } else {
-                    counts.release_connection(owner.inbound);
+                    counts.release_connection(owner.node, owner.inbound);
                     owners[slot] = None;
                 }
             }
@@ -502,6 +513,31 @@ fn history(input: &[u8]) -> Vec<(usize, MachineStep)> {
                 &mut failures,
                 COUNTS,
                 "transport reservations differ from live owners",
+            );
+        }
+        let live_slots = |node: NodeId, inbound: bool| {
+            owners
+                .iter()
+                .flatten()
+                .filter(|owner| {
+                    owner.node == node
+                        && owner.inbound == inbound
+                        && (!owner.inbound || owner.phase != Phase::Quic)
+                })
+                .count()
+        };
+        let by_node = counts.summed_node_connections();
+        if by_node.total() != actual.connections
+            || by_node.inbound != actual.inbound_connections
+            || nodes.iter().any(|&node| {
+                let slots = counts.node_connections(&node);
+                slots.inbound != live_slots(node, true) || slots.outbound != live_slots(node, false)
+            })
+        {
+            failure(
+                &mut failures,
+                COUNTS,
+                "per-node connection slots differ from live owners",
             );
         }
         let per_host_full = (0..HOSTS).any(|host| {

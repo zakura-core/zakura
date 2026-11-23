@@ -7,8 +7,8 @@
 //! The witness holds on every Plan here, well inside the bound. A peer that
 //! leaves before the apply withdraws its obligation, so it's not violated,
 //! and outside the fixture the property never applies. The bypass, an
-//! apply the reactor skips, is the planted case
-//! `qa/planted/header-sync/honest-progress/skipped-apply`.
+//! apply the reactor skips, is the QA store's planted case
+//! `header-sync/honest-progress/skipped-apply`.
 #![cfg(zakura_sim)]
 
 mod support;
@@ -16,7 +16,7 @@ mod support;
 use std::{cell::RefCell, io::Write, path::Path, process::Command, time::Duration};
 
 use serde_json::Value;
-use support::inputs;
+use support::{header_inputs::wire_input, inputs};
 use tempfile::TempDir;
 use zakura_sim::NaReason;
 use zakura_sim::{
@@ -42,7 +42,6 @@ use zakura_sim::{
         PeerAction, PeerSpec, NODE_ADDR,
     },
     record::RecordSink,
-    seed,
     trace::{replay_with, ReplayOptions, TraceReader},
     witness::{check_witness, Expect, WitnessScenario},
     MemorySink, Observation, Plan, PlanInput, PropertyOutcome, PropertyReport, RunReport,
@@ -52,30 +51,26 @@ use zakura_sim::{
 /// runs as the child, and where the recorded trace is.
 const CHILD: &str = "HEADER_WIRE_PROGRESS_REPLAY_CHILD";
 
-/// The progress seed's input, `header-wire-honest-progress`: the saved
-/// Plan's tag, then its Plan bytes.
-fn committed() -> Vec<u8> {
-    let name = format!("header-wire-{}", SavedPlan::HonestProgress.name());
-    seed::find(&name)
-        .unwrap_or_else(|| panic!("{name} is registered"))
-        .input()
-        .to_vec()
+/// The progress input: the saved Plan's tag, then its Plan bytes
+/// ([`wire_input`]).
+fn saved_input() -> Vec<u8> {
+    wire_input(SavedPlan::HonestProgress)
 }
 
-/// The progress seed's Plan, after its two-byte scenario tag.
-fn committed_plan() -> PlanInput {
-    let input = committed();
+/// The progress input's Plan, after its two-byte scenario tag.
+fn saved_plan() -> PlanInput {
+    let input = saved_input();
     assert_eq!(
         HeaderWire::draw(&input[..HeaderWire::SCENARIO_BYTES]),
         progress_scenario(),
-        "the seed picks the progress fixture"
+        "the input picks the progress fixture"
     );
     Plan::from_fuzz(&input[HeaderWire::SCENARIO_BYTES..])
 }
 
-/// The committed Plan, the default Plan and four byte-chosen ones.
+/// The saved Plan, the default Plan and four byte-chosen ones.
 fn plans() -> Vec<PlanInput> {
-    let mut plans = vec![committed_plan(), Plan::from_fuzz(&[])];
+    let mut plans = vec![saved_plan(), Plan::from_fuzz(&[])];
     plans.extend(inputs(4, 16_384));
     plans
 }
@@ -173,7 +168,7 @@ fn applied(report: &RunReport) -> bool {
     })
 }
 
-/// On the committed input, the witness holds `header-sync/honest-progress`
+/// On the saved input, the witness holds `header-sync/honest-progress`
 /// with its trigger history: the node read the honest peer's `Status`, and
 /// no property is violated. On every Plan here, the property holds at its
 /// one trigger, the node's tip reaches the successor, the honest peer is
@@ -187,7 +182,7 @@ fn the_progress_fixture_holds_honest_progress() {
     check_witness::<HeaderWire>(
         WitnessScenario {
             scenario: progress_scenario(),
-            input: committed_plan(),
+            input: saved_plan(),
         },
         HONEST_PROGRESS,
         Expect::Holds,
@@ -367,7 +362,7 @@ fn run_evidence(
 /// can fail.
 #[test]
 fn the_progress_witnesses_repeat_a_a_and_a_b_a() {
-    let progress = || run_evidence(&progress_scenario(), committed_plan());
+    let progress = || run_evidence(&progress_scenario(), saved_plan());
     let leaving = || run_evidence(&leaving_scenario(), Plan::from_fuzz(&[]));
     let evidence = [
         progress(),
@@ -414,7 +409,7 @@ fn captured() -> String {
 
 /// Each witness, recorded, then replayed exactly in a fresh process of the
 /// same test binary, gives the view-side evidence and end record its
-/// recorded run gave, and its property outcome there too: the committed
+/// recorded run gave, and its property outcome there too: the saved
 /// input holds the property, and so does the leaving peer, whose lost
 /// assumption withdrew the obligation.
 #[test]
@@ -452,7 +447,7 @@ fn the_progress_witnesses_replay_in_a_fresh_process() {
         return;
     }
     let dir = TempDir::new().expect("a temporary directory");
-    let input = committed();
+    let input = saved_input();
     let leaving = serde_json::to_value(leaving_scenario()).expect("a scenario serializes");
     let witnesses = [
         RecordInput::Input(&input),

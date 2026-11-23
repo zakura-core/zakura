@@ -9,6 +9,7 @@ mod support;
 use std::{cell::RefCell, io::Write, path::Path, process::Command, sync::LazyLock};
 
 use serde_json::Value;
+use support::header_inputs;
 use tempfile::TempDir;
 use zakura_sim::{
     domain::header_sync::{CHUNK_BUDGET_BOUND, TEARDOWN_RETURNS_BASELINE},
@@ -28,17 +29,12 @@ use zakura_sim::{
     MemorySink, Plan, PlanInput, PropertyOutcome, RunReport,
 };
 
-/// The close-and-relink seed's input, `header-storage-close-relink`,
-/// whose node releases rounds as its mirrors close and finish.
-static CLOSE_RELINK_INPUT: LazyLock<Vec<u8>> = LazyLock::new(|| {
-    zakura_sim::seed::find("header-storage-close-relink")
-        .expect("the seed is registered")
-        .input()
-        .to_vec()
-});
+/// The close-and-relink input, whose node releases rounds as its mirrors
+/// close and finish ([`header_inputs::close_relink_input`]).
+static CLOSE_RELINK_INPUT: LazyLock<&[u8]> = LazyLock::new(header_inputs::close_relink_input);
 
-/// `header-sync/teardown-returns-baseline` holds on the committed
-/// close-and-relink seed, and the run reaches its trigger history: the
+/// `header-sync/teardown-returns-baseline` holds on the searched
+/// close-and-relink input, and the run reaches its trigger history: the
 /// queue releases a round. `cargo xtask planted
 /// header-sync/teardown-returns-baseline` checks that the same input
 /// violates it under each planted patch.
@@ -59,7 +55,7 @@ fn the_close_relink_input_holds_teardown_returns_baseline() {
 
 /// The node's released rounds at each drain, both header-sync properties'
 /// reports and the full log depend only on the scenario and the plan: the
-/// close-and-relink seed's scenario under plan A twice, then B, then A
+/// close-and-relink input's scenario under plan A twice, then B, then A
 /// again, gives A's every time, and B's log differs.
 #[test]
 fn round_evidence_repeats_a_a_and_a_b_a() {
@@ -68,7 +64,7 @@ fn round_evidence_repeats_a_a_and_a_b_a() {
             .expect("the storage harness is registered")
             .scenario(&CLOSE_RELINK_INPUT[..Storage::SCENARIO_BYTES]),
     )
-    .expect("the seed's scenario is a storage scenario");
+    .expect("the input's scenario is a storage scenario");
     let plans: [&[u8]; 2] = [&CLOSE_RELINK_INPUT[Storage::SCENARIO_BYTES..], &[7; 256]];
     let runs: Vec<(String, String)> = [plans[0], plans[0], plans[1], plans[0]]
         .into_iter()

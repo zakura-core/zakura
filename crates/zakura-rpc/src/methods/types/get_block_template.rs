@@ -37,6 +37,7 @@ use zakura_chain::{
     },
     chain_sync_status::ChainSyncStatus,
     chain_tip::ChainTip,
+    miner_mesh::MinerMeshCommitment,
     parameters::{
         subsidy::{is_zip234_active, parent_nsm_value_balance},
         Network,
@@ -731,6 +732,9 @@ pub struct MinerParams {
     ///
     /// Applies only if [`Self::addr`] contains a shielded component.
     memo: Option<MemoBytes>,
+
+    /// The gateway the coinbase names, when the miner announces one.
+    mesh_commitment: Option<MinerMeshCommitment>,
 }
 
 /// Builds the coinbase input data for a block Zakura constructs.
@@ -772,7 +776,13 @@ impl MinerParams {
             .map(|memo| MemoBytes::from_bytes(memo.as_bytes()))
             .transpose()?;
 
-        Ok(Self { addr, data, memo })
+        Ok(Self {
+            addr,
+            data,
+            memo,
+            // The gateway is this node's ID, which only its network stack knows.
+            mesh_commitment: None,
+        })
     }
 
     /// Returns the miner address.
@@ -788,6 +798,16 @@ impl MinerParams {
     /// Returns the miner memo.
     pub fn memo(&self) -> Option<&MemoBytes> {
         self.memo.as_ref()
+    }
+
+    /// Returns the gateway every coinbase names, if the miner announces one.
+    pub fn mesh_commitment(&self) -> Option<MinerMeshCommitment> {
+        self.mesh_commitment
+    }
+
+    /// Makes every coinbase name the gateway in `commitment`.
+    pub fn set_mesh_commitment(&mut self, commitment: MinerMeshCommitment) {
+        self.mesh_commitment = Some(commitment);
     }
 
     /// Randomizes the memo.
@@ -811,6 +831,7 @@ impl From<MinerAddress> for MinerParams {
             addr,
             data: None,
             memo: None,
+            mesh_commitment: None,
         }
     }
 }
@@ -1021,6 +1042,15 @@ where
         PreparationWorker<BlockTemplateResponse>,
     )> {
         self.template_preparation_queue.enqueue(template)
+    }
+
+    /// Makes every coinbase this handler builds name the gateway in `commitment`.
+    ///
+    /// Does nothing without miner parameters, because the handler then builds no coinbase.
+    pub(crate) fn set_mesh_commitment(&mut self, commitment: MinerMeshCommitment) {
+        if let Some(miner_params) = &mut self.miner_params {
+            miner_params.set_mesh_commitment(commitment);
+        }
     }
 
     /// Randomizes the coinbase data, if miner parameters are set.

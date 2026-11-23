@@ -415,7 +415,7 @@ impl DiscoveryPeer {
                 let author = self
                     .relays
                     .iter()
-                    .find(|author| author.public() == records[0].body.node_id)
+                    .find(|author| author.public() == records[0].body.node_id())
                     .cloned()
                     .expect("the peer relays its own fixture authors' records");
                 records[0] = self.expired(records[0].clone(), &author);
@@ -514,7 +514,7 @@ impl DiscoveryPeer {
                 let author = self
                     .relays
                     .iter()
-                    .find(|author| author.public() == records[0].body.node_id)
+                    .find(|author| author.public() == records[0].body.node_id())
                     .expect("the peer relays its own fixture authors' records");
                 forge(&mut records[0], author);
                 frame = DiscoveryFrame {

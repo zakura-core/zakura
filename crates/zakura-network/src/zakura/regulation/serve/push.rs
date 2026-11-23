@@ -1,13 +1,12 @@
 //! Capacity for pushed frames, such as subscription pages.
 //!
 //! No request admits a pushed frame, so `Serve` never sees it. It still takes
-//! the budgets a served response takes, in the same order: peer and node
-//! response slots, output bytes, then execution slots. So pushes and served
-//! responses share every node-wide and per-peer bound.
+//! the budgets a served response takes, in the same order: response slots,
+//! output bytes, then execution slots. So pushes and served responses share
+//! every node-wide and per-peer bound. With a memory pool, the pool's lease
+//! replaces the node-wide response and output gates.
 
 use std::sync::Arc;
-
-use zakura_rt::sync::Mutex;
 
 use super::{capacity::PeerBudgets, lease::ExecutionSlots, ResponseGrants, ServeCapacity};
 use crate::zakura::{Frame, FrameGuard, FramedSend, ZakuraPeerId, FRAME_HEADER_BYTES};
@@ -17,8 +16,8 @@ use crate::zakura::{Frame, FrameGuard, FramedSend, ZakuraPeerId, FRAME_HEADER_BY
 pub(crate) struct Push {
     capacity: ServeCapacity,
     peer: PeerBudgets,
-    /// The pushing peer, for the capacity's acquisition report.
-    #[cfg(any(test, zakura_sim))]
+    /// The pushing peer, used for memory-pool per-peer serving leases and
+    /// acquisition reports.
     peer_id: ZakuraPeerId,
 }
 
@@ -55,7 +54,6 @@ impl ServeCapacity {
         Push {
             capacity: self.clone(),
             peer: self.peer(peer),
-            #[cfg(any(test, zakura_sim))]
             peer_id: peer.clone(),
         }
     }
@@ -83,18 +81,26 @@ impl Push {
         // Widening usize to u64 is lossless on supported targets.
         let bytes = (payload_len + FRAME_HEADER_BYTES) as u64;
         let delayed = |bound| self.capacity.metrics.delayed(bound);
+        let backing = self.capacity.pool_backing.as_deref();
         let peer_response = wait(self.peer.output_responses.reserve(), || {
             delayed("peer_output_responses")
         })
         .await;
         #[cfg(any(test, zakura_sim))]
         self.report_acquired();
-        let node_response = wait(self.capacity.node_output_responses.reserve(), || {
-            delayed("node_output_responses")
-        })
-        .await;
-        #[cfg(any(test, zakura_sim))]
-        self.report_acquired();
+        // With a memory pool, its lease replaces the node-wide gates.
+        let node_response = match backing {
+            Some(_) => None,
+            None => {
+                let node_response = wait(self.capacity.node_output_responses.reserve(), || {
+                    delayed("node_output_responses")
+                })
+                .await;
+                #[cfg(any(test, zakura_sim))]
+                self.report_acquired();
+                Some(node_response)
+            }
+        };
         let peer_output = &self.peer.output;
         let node_output = &self.capacity.node_output;
         let peer = wait(peer_output.grant(peer_output.clamp(bytes)), || {
@@ -103,20 +109,33 @@ impl Push {
         .await;
         #[cfg(any(test, zakura_sim))]
         self.report_acquired();
-        let node = wait(node_output.grant(node_output.clamp(bytes)), || {
-            delayed("node_output")
-        })
-        .await;
-        #[cfg(any(test, zakura_sim))]
-        self.report_acquired();
-        let grants = ResponseGrants {
-            node: Mutex::new(node),
-            _node_response: node_response,
-            peer: Mutex::new(peer),
-            _peer_response: peer_response,
-            _peer_budgets: self.peer.clone(),
-            _unwritten: None,
+        let (node, pool_lease) = match backing {
+            Some(backing) => {
+                let lease = wait(
+                    ServeCapacity::acquire_pool_lease(backing, &self.peer_id, bytes),
+                    || delayed("memory_pool_output"),
+                )
+                .await;
+                (None, Some(lease))
+            }
+            None => {
+                let node = wait(node_output.grant(node_output.clamp(bytes)), || {
+                    delayed("node_output")
+                })
+                .await;
+                #[cfg(any(test, zakura_sim))]
+                self.report_acquired();
+                (Some(node), None)
+            }
         };
+        let grants = ResponseGrants::new(
+            pool_lease,
+            node,
+            node_response,
+            peer,
+            peer_response,
+            self.peer.clone(),
+        );
         PushPermit {
             grants,
             execution: self.execution().await,
@@ -182,9 +201,10 @@ impl PushSend<'_> {
     pub(crate) fn send(self, frame: Frame) -> crate::zakura::transport::Queued {
         // Widening usize to u64 is lossless on supported targets.
         let encoded_bytes = (frame.payload.len() + FRAME_HEADER_BYTES) as u64;
-        self.grants.shrink_to(encoded_bytes);
-        self.slot
-            .send(frame, FrameGuard::new(Arc::new(self.grants)))
+        let Self { mut grants, slot } = self;
+        // The page owns its grants until the frame guard shares them.
+        grants.shrink_unshared_to(encoded_bytes);
+        slot.send(frame, FrameGuard::new(Arc::new(grants)))
     }
 }
 

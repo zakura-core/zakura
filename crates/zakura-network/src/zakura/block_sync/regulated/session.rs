@@ -13,6 +13,7 @@ use crate::zakura::{
     block_sync::ZakuraBlockSyncConfig,
     regulation::{
         sizing, CompletionId, Completions, OutputOrder, Serve, ServeCapacity, ServeLimits,
+        ServePoolBacking,
     },
     FramedSend, SinkReject, ZakuraPeerId,
 };
@@ -131,17 +132,27 @@ pub(crate) struct Serving {
 }
 
 impl Serving {
-    pub(crate) fn new(source: Arc<dyn Source>, config: &ZakuraBlockSyncConfig) -> Self {
+    /// Serving for every GetBlocks session, leasing output from `serving_pool`.
+    pub(crate) fn new(
+        source: Arc<dyn Source>,
+        config: &ZakuraBlockSyncConfig,
+        serving_pool: crate::zakura::memory::ServingPool,
+    ) -> Self {
         let limits = serving_limits(config);
         debug_assert!(
             serving_sessions_fit_budget(config),
             "the reactor validates the config before serving",
         );
         let advertised = serving_max_inflight_requests(config);
+        let capacity = ServeCapacity::new("block-sync", &GET_BLOCKS, limits)
+            .expect("shared sizing yields positive GetBlocks capacity limits")
+            .with_pool_backing(ServePoolBacking::Serving {
+                pool: serving_pool,
+                peer_floor: LARGEST_SERVED_RESPONSE.output_bytes(),
+            });
         Self {
             source,
-            capacity: ServeCapacity::new("block-sync", &GET_BLOCKS, limits)
-                .expect("shared sizing yields positive GetBlocks capacity limits"),
+            capacity,
             max_blocks: config.advertised_max_blocks_per_response(),
             max_body_bytes: config.advertised_max_response_bytes(),
             advertised,

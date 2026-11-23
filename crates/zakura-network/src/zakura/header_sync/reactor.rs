@@ -252,6 +252,40 @@ fn build_header_sync_reactor(
         .vct_root_repairs
         .as_ref()
         .map_or_else(Default::default, |repairs| *repairs.borrow());
+    let mut serving = sim_chain!(v9::serving_capacity(
+        header_peers,
+        startup.config.node_serve_output_bytes,
+    ) => with_reports(
+        startup
+            .observer
+            .0
+            .as_ref()
+            .and_then(|observer| observer.capacity_observer())
+            .map(|observer| {
+                let acquired = observer.clone();
+                crate::zakura::regulation::ServeReports::new(
+                    move |expired, removed, removed_live| {
+                        observer.observe(super::observe::ReactorEvent::ServingPeers {
+                            expired,
+                            removed,
+                            removed_live,
+                        });
+                    },
+                    move |peer, in_use| {
+                        acquired.observe(super::observe::ReactorEvent::ServingAcquired {
+                            peer: peer.clone(),
+                            in_use,
+                        });
+                    },
+                )
+            })
+    ));
+    if let Some(pool) = startup.serving_pool.clone() {
+        serving = serving.with_pool_backing(crate::zakura::regulation::ServePoolBacking::Serving {
+            pool,
+            peer_floor: v9::largest_header_page_bytes(&startup.network),
+        });
+    }
     let handle = HeaderSyncHandle {
         events: events_tx,
         lifecycle: lifecycle_tx,
@@ -262,34 +296,7 @@ fn build_header_sync_reactor(
         network: startup.network.clone(),
         layout: v9::layout(&startup.network),
         port: startup.header_chain_port.clone(),
-        serving: sim_chain!(v9::serving_capacity(
-            header_peers,
-            startup.config.node_serve_output_bytes,
-        ) => with_reports(
-            startup
-                .observer
-                .0
-                .as_ref()
-                .and_then(|observer| observer.capacity_observer())
-                .map(|observer| {
-                    let acquired = observer.clone();
-                    crate::zakura::regulation::ServeReports::new(
-                        move |expired, removed, removed_live| {
-                            observer.observe(super::observe::ReactorEvent::ServingPeers {
-                                expired,
-                                removed,
-                                removed_live,
-                            });
-                        },
-                        move |peer, in_use| {
-                            acquired.observe(super::observe::ReactorEvent::ServingAcquired {
-                                peer: peer.clone(),
-                                in_use,
-                            });
-                        },
-                    )
-                })
-        )),
+        serving,
         page_limits,
         #[cfg(any(test, zakura_sim))]
         credit_observer: startup

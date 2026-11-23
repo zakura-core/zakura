@@ -119,7 +119,11 @@ async fn completed_ranges_are_reusable_before_earlier_output_drains() {
         .lock()
         .unwrap()
         .insert(Height(1), first_gate.clone());
-    let serving = Serving::new(source.clone(), &ZakuraBlockSyncConfig::default());
+    let serving = Serving::new(
+        source.clone(),
+        &ZakuraBlockSyncConfig::default(),
+        crate::zakura::BlockSyncMemory::for_tests().serving,
+    );
     let cancel = CancellationToken::new();
     let (send, mut output) = framed_channel(4);
     let mut session = serving.session(
@@ -172,7 +176,11 @@ async fn cancelled_sessions_do_not_complete_replacement_ranges() {
         .lock()
         .unwrap()
         .insert(Height(1), old_gate.clone());
-    let serving = Serving::new(source.clone(), &ZakuraBlockSyncConfig::default());
+    let serving = Serving::new(
+        source.clone(),
+        &ZakuraBlockSyncConfig::default(),
+        crate::zakura::BlockSyncMemory::for_tests().serving,
+    );
     let peer = ZakuraPeerId::new(vec![62; 32]).unwrap();
     let old_cancel = CancellationToken::new();
     let (send, old_output) = framed_channel(4);
@@ -245,7 +253,31 @@ fn ready_session(
     crate::zakura::FramedRecv,
     CancellationToken,
 ) {
-    let serving = Serving::new(source.clone(), &ZakuraBlockSyncConfig::default());
+    ready_session_in(
+        source,
+        peer,
+        queue,
+        crate::zakura::BlockSyncMemory::for_tests().serving,
+    )
+}
+
+/// [`ready_session`] whose output leases from `serving_pool`.
+fn ready_session_in(
+    source: &Arc<ControlledSource>,
+    peer: u8,
+    queue: usize,
+    serving_pool: crate::zakura::memory::ServingPool,
+) -> (
+    Serving,
+    ServingSession,
+    crate::zakura::FramedRecv,
+    CancellationToken,
+) {
+    let serving = Serving::new(
+        source.clone(),
+        &ZakuraBlockSyncConfig::default(),
+        serving_pool,
+    );
     let cancel = CancellationToken::new();
     let (send, output) = framed_channel(queue);
     let session = serving.session(
@@ -410,11 +442,13 @@ async fn a_same_height_replacement_never_precedes_the_old_ranges_output() {
         ..Default::default()
     });
     // One transport slot that nobody reads holds the old output back.
-    let (serving, mut session, mut output, cancel) = ready_session(&source, 66, 1);
+    let serving_pool = crate::zakura::BlockSyncMemory::for_tests().serving;
+    let (_serving, mut session, mut output, cancel) =
+        ready_session_in(&source, 66, 1, serving_pool.clone());
     session.admit(Range::new(Height(1), 3).unwrap()).unwrap();
     wait_completed(&mut session, Height(1)).await;
     assert!(
-        serving.capacity.node_output_held() > 0,
+        serving_pool.total_leased() > 0,
         "the old range's output is not all written"
     );
     session.admit(Range::new(Height(1), 3).unwrap()).unwrap();
@@ -543,7 +577,11 @@ async fn serving_enforces_the_budgeted_limit() {
     });
     let config = ZakuraBlockSyncConfig::default();
     let limit = serving_max_inflight_requests(&config);
-    let serving = Serving::new(source, &config);
+    let serving = Serving::new(
+        source,
+        &config,
+        crate::zakura::BlockSyncMemory::for_tests().serving,
+    );
     let cancel = CancellationToken::new();
     let (send, _output) = framed_channel(4);
     let mut session = serving.session(
@@ -573,7 +611,11 @@ async fn adjacent_ranges_are_admitted_and_any_overlap_disconnects() {
         default_gate: Some(Arc::new(Semaphore::new(0))),
         ..Default::default()
     });
-    let serving = Serving::new(source, &ZakuraBlockSyncConfig::default());
+    let serving = Serving::new(
+        source,
+        &ZakuraBlockSyncConfig::default(),
+        crate::zakura::BlockSyncMemory::for_tests().serving,
+    );
     let cancel = CancellationToken::new();
     let (send, _output) = framed_channel(4);
     let mut session = serving.session(

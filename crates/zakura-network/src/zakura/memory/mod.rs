@@ -24,6 +24,7 @@ pub mod draft;
 mod peer_pool;
 mod plan;
 mod pool;
+mod serving_pool;
 #[cfg(test)]
 mod tests;
 
@@ -46,6 +47,8 @@ pub use pool::{
 };
 #[cfg(any(test, zakura_sim))]
 pub use pool::{PoolEvent, PoolObserver};
+pub(crate) use serving_pool::ServingLease;
+pub use serving_pool::ServingPool;
 
 /// Minimum interval between runtime budget-overrun warnings (`02 §8`, mem-14).
 pub const OVERRUN_WARN_INTERVAL: Duration = Duration::from_secs(10 * 60);

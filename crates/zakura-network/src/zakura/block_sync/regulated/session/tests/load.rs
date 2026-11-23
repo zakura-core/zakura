@@ -110,7 +110,11 @@ fn concurrent_sessions_share_bounded_capacity_without_refill_waits() {
             };
             let (peak, node_peak) = (source.peak.clone(), source.node_peak.clone());
             let (running, node_running) = (source.running.clone(), source.node_running.clone());
-            let serving = Serving::new(Arc::new(source), &ZakuraBlockSyncConfig::default());
+            let serving = Serving::new(
+                Arc::new(source),
+                &ZakuraBlockSyncConfig::default(),
+                crate::zakura::BlockSyncMemory::for_tests().serving,
+            );
             assert!(PEERS * usize::try_from(WINDOW).unwrap() > limits.node_execution);
             assert!(usize::try_from(WINDOW).unwrap() > limits.peer_execution);
 
@@ -384,7 +388,11 @@ async fn maximum_sessions_continuous_serving_probe() {
         shape,
         delay: Duration::from_millis(delay_ms),
     };
-    let mut serving = Serving::new(Arc::new(source), &config);
+    let mut serving = Serving::new(
+        Arc::new(source),
+        &config,
+        crate::zakura::BlockSyncMemory::for_tests().serving,
+    );
     // Production serves one block per response. The probe can still measure
     // larger responses by lifting the session limit directly.
     serving.max_blocks = blocks;

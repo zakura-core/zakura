@@ -3377,6 +3377,8 @@ pub struct ZakuraProtocolHandler {
     local_node_id: Option<NodeId>,
     /// Node-wide memory pool shared by this handler and its services.
     memory_pool: Option<super::memory::MemoryPool>,
+    /// Shared per-peer serving pool funding output and send-window leases (`02 §4–6`).
+    serving_pool: Option<super::memory::ServingPool>,
     /// Startup memory plan enforced for this handler.
     memory_plan: Option<super::memory::MemoryPlan>,
     /// Receives this handler's transport events.
@@ -3491,21 +3493,27 @@ impl ZakuraProtocolHandler {
             limits,
             local_node_id: None,
             memory_pool: None,
+            serving_pool: None,
             memory_plan: None,
             #[cfg(any(test, zakura_sim))]
             transport_observer: None,
         }
     }
 
-    /// Attach the startup [`MemoryPlan`](super::memory::MemoryPlan) and its live
-    /// [`MemoryPool`](super::memory::MemoryPool) to this handler.
+    /// Attach the startup [`MemoryPlan`](super::memory::MemoryPlan), its live
+    /// [`MemoryPool`](super::memory::MemoryPool), and the
+    /// [`ServingPool`](super::memory::ServingPool) that serving reactors and
+    /// per-connection send-window autotuning share (`02 §4–6`). The caller
+    /// builds the serving pool once and passes the same one to every reactor.
     pub fn with_memory_pool(
         mut self,
         plan: super::memory::MemoryPlan,
         pool: super::memory::MemoryPool,
+        serving_pool: super::memory::ServingPool,
     ) -> Self {
         self.memory_plan = Some(plan);
         self.memory_pool = Some(pool);
+        self.serving_pool = Some(serving_pool);
         self
     }
 
@@ -4139,12 +4147,26 @@ impl ZakuraProtocolHandler {
         self.resources.report_usage(limits_owner_bound);
         // Services such as BPv1 read this connection's path load.
         let load = connection.subscribe_load();
+        let serving_peer_id = peer_id.clone();
+        let serving_peer_floor = super::block_sync::LARGEST_SERVED_BLOCK_RESPONSE_BYTES;
+        let _serving_registration = self.serving_pool.as_ref().map(|serving_pool| {
+            serving_pool.register_connection(
+                &serving_peer_id,
+                serving_peer_floor,
+                serving_pool.default_per_peer_cap(),
+            )
+        });
         let conn_credit = self.memory_pool.as_ref().map(|_| {
+            let base_send_window = if self.serving_pool.is_some() {
+                BASE_SEND_WINDOW_BYTES.min(self.limits.admitted_send_window_bytes)
+            } else {
+                self.limits.admitted_send_window_bytes
+            };
             super::memory::ConnectionCredit::new_quic(
                 conn_id,
                 connection.clone(),
                 connection_resources.base_receive_window(),
-                self.limits.admitted_send_window_bytes,
+                base_send_window,
             )
         });
         let _close_credit = super::memory::CloseCreditOnDrop(conn_credit.clone());
@@ -4394,20 +4416,32 @@ impl ZakuraProtocolHandler {
         // Local reopens whose transport IO is in flight, created on the first
         // reopen.
         let mut local_opens: Option<FuturesUnordered<BoxFuture<'_, _>>> = None;
-        let mut credit_drain_ticks = zakura_rt::time::interval(Duration::from_millis(50));
-        credit_drain_ticks.set_missed_tick_behavior(zakura_rt::time::MissedTickBehavior::Skip);
+        // The credit machine wakes this loop only while it has credit work.
+        let mut credit_waiter = conn_credit
+            .as_ref()
+            .map(super::memory::ConnectionCredit::waiter);
         loop {
             let session_deadline = pending_sessions.deadline();
             zakura_rt::select! {
                 biased;
                 _ = connection_token.cancelled() => break,
-                _ = credit_drain_ticks.tick(),
-                    if conn_credit
-                        .as_ref()
-                        .is_some_and(super::memory::ConnectionCredit::has_draining) =>
-                {
-                    if let Some(credit) = &conn_credit {
-                        credit.poll_drain();
+                _ = async {
+                    match credit_waiter.as_mut() {
+                        Some(waiter) => waiter.wait().await,
+                        None => future::pending().await,
+                    }
+                }, if credit_waiter.is_some() => {
+                    if let (Some(credit), Some(waiter)) = (&conn_credit, credit_waiter.as_mut()) {
+                        if let Some(serving_pool) = &self.serving_pool {
+                            credit.tick_send_window(
+                                serving_pool,
+                                &serving_peer_id,
+                                serving_peer_floor,
+                            );
+                        } else {
+                            credit.poll_drain();
+                        }
+                        waiter.rearm();
                     }
                 }
                 _ = async {
@@ -5915,8 +5949,11 @@ async fn spawn_zakura_endpoint_inner(
     )?;
     memory_plan.publish_metrics();
     let memory_pool = memory_plan.build_pool();
+    let serving_pool =
+        super::memory::ServingPool::new(memory_pool.clone(), memory_plan.serving_per_peer_cap);
     let block_sync_memory = super::BlockSyncMemory::new(
         memory_pool.clone(),
+        serving_pool.clone(),
         config
             .zakura
             .memory_budget
@@ -6036,6 +6073,7 @@ async fn spawn_zakura_endpoint_inner(
     }
     let header_sync_shutdown = CancellationToken::new();
     startup.shutdown = header_sync_shutdown.clone();
+    startup.serving_pool = Some(serving_pool.clone());
     let (header_sync, header_sync_actions, header_sync_task) = spawn_header_sync_reactor(startup)?;
     let block_sync_driver_enabled = header_sync_driver_startup.is_some();
     let (block_sync, block_sync_actions, block_sync_task) =
@@ -6078,13 +6116,16 @@ async fn spawn_zakura_endpoint_inner(
         } else {
             (None, None, None)
         };
-    let discovery_service = Arc::new(super::DiscoveryService::with_sync_services(
-        discovery.clone(),
-        header_sync.clone(),
-        block_sync.clone(),
-        trace.clone(),
-        limits.max_connections,
-    ));
+    let discovery_service = Arc::new(
+        super::DiscoveryService::with_sync_services(
+            discovery.clone(),
+            header_sync.clone(),
+            block_sync.clone(),
+            trace.clone(),
+            limits.max_connections,
+        )
+        .with_memory_pool(memory_pool.clone()),
+    );
     let legacy_service = sink_factory(supervisor.clone(), trace.clone());
     let service_demand = header_sync_driver_startup
         .as_ref()
@@ -6174,7 +6215,7 @@ async fn spawn_zakura_endpoint_inner(
         trace,
     )
     .with_local_node_id(local_node_id)
-    .with_memory_pool(memory_plan, memory_pool.clone());
+    .with_memory_pool(memory_plan, memory_pool.clone(), serving_pool);
     handler.set_header_sync_enabled(header_sync_ready);
     if handler.trace.is_enabled() {
         let trace = handler.trace.clone();

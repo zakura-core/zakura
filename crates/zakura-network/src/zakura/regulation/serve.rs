@@ -108,7 +108,7 @@ use zakura_rt::sync::{
 
 #[cfg(any(test, zakura_sim))]
 pub(crate) use capacity::ServeReports;
-pub(crate) use capacity::{ServeCapacity, ServeConfigError, ServeLimits};
+pub(crate) use capacity::{ServeCapacity, ServeConfigError, ServeLimits, ServePoolBacking};
 pub(crate) use completion::{Completion, CompletionId, Completions};
 #[cfg(any(test, zakura_sim))]
 pub(crate) use lease::ReleaseReport;
@@ -118,7 +118,7 @@ pub use push::ServeInUse;
 pub(crate) use push::{Push, PushPermit, PushSend};
 pub(crate) use sink::{Responded, ResponseCap, ResponseSink, SinkError, SinkProgress};
 
-use capacity::{PeerBudgets, ServeMetrics};
+use capacity::{PeerBudgets, ServeMetrics, ServeOutputLease};
 pub(super) use sink::ending_reserve;
 use sink::{ResponseFrame, SinkCore};
 
@@ -307,14 +307,24 @@ impl Drop for Commitment {
     }
 }
 
+/// Mutable output byte grants held together under one lock so `ResponseGrants`
+/// stays compact and preserves drop order (`pool_lease`, then `node`, then `peer`).
+#[derive(Debug)]
+pub(super) struct OutputGrants {
+    pool_lease: Option<Box<ServeOutputLease>>,
+    /// The node-wide static grant, taken only without a memory pool.
+    node: Option<OutputGrant>,
+    peer: OutputGrant,
+}
+
 /// The peer and node output bytes of one response.
 #[derive(Debug)]
 pub(super) struct ResponseGrants {
-    // Field order is drop order: the node grant returns first, as with
-    // execution slots.
-    node: Mutex<OutputGrant>,
-    _node_response: SlotPermit,
-    peer: Mutex<OutputGrant>,
+    // Field order is drop order: byte grants (pool, node, peer) return before
+    // response slots and peer budgets.
+    output: Mutex<OutputGrants>,
+    /// The node-wide response slot, taken only without a memory pool.
+    _node_response: Option<SlotPermit>,
     _peer_response: SlotPermit,
     // Keep every peer budget discoverable while queued output survives a session.
     _peer_budgets: PeerBudgets,
@@ -323,18 +333,55 @@ pub(super) struct ResponseGrants {
 }
 
 impl ResponseGrants {
-    /// Shrink both output grants to `bytes`, returning any surplus immediately
-    /// to the node and peer output budgets.
+    fn new(
+        pool_lease: Option<ServeOutputLease>,
+        node: Option<OutputGrant>,
+        node_response: Option<SlotPermit>,
+        peer: OutputGrant,
+        peer_response: SlotPermit,
+        peer_budgets: PeerBudgets,
+    ) -> Self {
+        Self {
+            output: Mutex::new(OutputGrants {
+                pool_lease: pool_lease.map(Box::new),
+                node,
+                peer,
+            }),
+            _node_response: node_response,
+            _peer_response: peer_response,
+            _peer_budgets: peer_budgets,
+            _unwritten: None,
+        }
+    }
+
+    /// Shrink all output grants (and any backing memory-pool lease) to `bytes`,
+    /// returning any surplus immediately (`decision-11`).
     pub(super) fn shrink_to(&self, bytes: u64) {
-        // Release the node surplus before the peer surplus, matching drop order.
-        self.node
+        self.output
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .shrink_to(bytes);
-        self.peer
-            .lock()
+    }
+
+    /// [`Self::shrink_to`] for grants nothing shares yet, without the lock.
+    pub(super) fn shrink_unshared_to(&mut self, bytes: u64) {
+        self.output
+            .get_mut()
             .unwrap_or_else(PoisonError::into_inner)
             .shrink_to(bytes);
+    }
+}
+
+impl OutputGrants {
+    fn shrink_to(&mut self, bytes: u64) {
+        // Release pool surplus first, then node, then peer, matching drop order.
+        if let Some(lease) = self.pool_lease.as_mut() {
+            lease.shrink_to(bytes);
+        }
+        if let Some(node) = self.node.as_mut() {
+            node.shrink_to(bytes);
+        }
+        self.peer.shrink_to(bytes);
     }
 }
 
@@ -707,38 +754,63 @@ impl<P: Produce> Dispatch<P> {
         }
     }
 
-    /// Take peer and node response slots, output bytes, then execution slots.
-    /// Returns `None` if cancellation wins, releasing every acquired grant.
+    /// Take response slots, output bytes, then execution slots. Returns `None`
+    /// if cancellation wins, releasing every acquired grant.
+    ///
+    /// With a memory pool, the pool's lease replaces the node-wide response
+    /// and output gates, so a stalled reader holds only its own peer's gates
+    /// and its pool part while it waits (`#1888`). The per-peer gates stay.
     async fn acquire(&self, cap: ResponseCap) -> Option<(ResponseGrants, ExecutionSlots)> {
+        let backing = self.capacity.pool_backing.as_deref();
         let peer_response = self
             .wait(
                 "peer_output_responses",
                 self.peer.output_responses.reserve(),
             )
             .await?;
-        let node_response = self
-            .wait(
-                "node_output_responses",
-                self.capacity.node_output_responses.reserve(),
-            )
-            .await?;
+        let node_response = match backing {
+            Some(_) => None,
+            None => Some(
+                self.wait(
+                    "node_output_responses",
+                    self.capacity.node_output_responses.reserve(),
+                )
+                .await?,
+            ),
+        };
         let bytes = cap.output_bytes();
         let peer_output = &self.peer.output;
         let node_output = &self.capacity.node_output;
         let peer = self
             .wait("peer_output", peer_output.grant(peer_output.clamp(bytes)))
             .await?;
-        let node = self
-            .wait("node_output", node_output.grant(node_output.clamp(bytes)))
-            .await?;
-        let grants = ResponseGrants {
-            node: Mutex::new(node),
-            _node_response: node_response,
-            peer: Mutex::new(peer),
-            _peer_response: peer_response,
-            _peer_budgets: self.peer.clone(),
-            _unwritten: None,
+        let (node, pool_lease) = match backing {
+            Some(backing) => (
+                None,
+                Some(
+                    self.wait(
+                        "memory_pool_output",
+                        ServeCapacity::acquire_pool_lease(backing, &self.tasks.peer, bytes),
+                    )
+                    .await?,
+                ),
+            ),
+            None => (
+                Some(
+                    self.wait("node_output", node_output.grant(node_output.clamp(bytes)))
+                        .await?,
+                ),
+                None,
+            ),
         };
+        let grants = ResponseGrants::new(
+            pool_lease,
+            node,
+            node_response,
+            peer,
+            peer_response,
+            self.peer.clone(),
+        );
         let peer = self
             .wait("peer_execution", self.peer.execution.reserve())
             .await?;

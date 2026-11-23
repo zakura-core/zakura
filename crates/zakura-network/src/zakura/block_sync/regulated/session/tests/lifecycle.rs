@@ -34,7 +34,11 @@ fn compact_session_lifecycle_peak() {
                 default_gate: Some(gate.clone()),
                 ..Default::default()
             });
-            let serving = Serving::new(source, &ZakuraBlockSyncConfig::default());
+            let serving = Serving::new(
+                source,
+                &ZakuraBlockSyncConfig::default(),
+                crate::zakura::BlockSyncMemory::for_tests().serving,
+            );
             let peer = ZakuraPeerId::new(vec![63; 32]).unwrap();
             let count =
                 super::super::serving_max_inflight_requests(&ZakuraBlockSyncConfig::default()) * 2;

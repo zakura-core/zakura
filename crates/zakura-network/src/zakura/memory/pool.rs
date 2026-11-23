@@ -8,6 +8,8 @@
 
 use std::{fmt, future::Future, sync::Arc};
 
+#[cfg(any(test, zakura_sim))]
+use zakura_rt::sync::counter::AtomicU64 as CounterU64;
 use zakura_rt::{
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -1112,6 +1114,8 @@ struct MemoryPoolInner {
     pollers: [Notify; Consumer::COUNT],
     metrics: PoolMetrics,
     #[cfg(any(test, zakura_sim))]
+    draining_block_receive_bytes: Arc<CounterU64>,
+    #[cfg(any(test, zakura_sim))]
     observer: Option<Arc<dyn PoolObserver>>,
 }
 
@@ -1165,6 +1169,8 @@ impl MemoryPool {
                 pollers: std::array::from_fn(|_| Notify::new()),
                 metrics,
                 #[cfg(any(test, zakura_sim))]
+                draining_block_receive_bytes: Arc::new(CounterU64::new(0)),
+                #[cfg(any(test, zakura_sim))]
                 observer: None,
             }),
         }
@@ -1177,6 +1183,31 @@ impl MemoryPool {
             .expect("a memory pool gets its observer before anything clones it")
             .observer = observer;
         self
+    }
+
+    /// Preemption-free atomic counter of `BlockSync` + `Consensus` receive-credit
+    /// bytes currently held in `ConnectionCredit`'s QUIC drain queues (`02 §6`).
+    #[cfg(any(test, zakura_sim))]
+    pub fn draining_block_receive_bytes_atomic(&self) -> Arc<CounterU64> {
+        self.inner.draining_block_receive_bytes.clone()
+    }
+
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn add_draining_receive_bytes(&self, consumer: Consumer, bytes: u64) {
+        if bytes > 0 && matches!(consumer, Consumer::BlockSync | Consumer::Consensus) {
+            self.inner
+                .draining_block_receive_bytes
+                .fetch_add(bytes, Ordering::AcqRel);
+        }
+    }
+
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn sub_draining_receive_bytes(&self, consumer: Consumer, bytes: u64) {
+        if bytes > 0 && matches!(consumer, Consumer::BlockSync | Consumer::Consensus) {
+            self.inner
+                .draining_block_receive_bytes
+                .fetch_sub(bytes, Ordering::AcqRel);
+        }
     }
 
     /// Monotonic version bumped whenever the pool wakes anyone. A poller reads
@@ -1287,6 +1318,11 @@ impl MemoryPool {
         self.lock().machine.available_ceiling(consumer)
     }
 
+    /// Protected total (`floor + share_of_S`) for `consumer`.
+    pub fn protected_share(&self, consumer: Consumer) -> u64 {
+        self.lock().machine.protected_share(consumer)
+    }
+
     /// Bytes currently leased by `consumer`.
     pub fn consumer_leased(&self, consumer: Consumer) -> u64 {
         self.lock().machine.leased(consumer)
@@ -1313,6 +1349,83 @@ impl MemoryPool {
             log_overrun(report);
         }
         report
+    }
+
+    /// Register one serving connection of `peer` (see [`super::ServingPool`]).
+    pub(crate) fn register_serving_peer(&self, peer: &ZakuraPeerId, floor: u64, cap: u64) {
+        self.lock().serving.register(peer, floor, cap);
+    }
+
+    /// Unregister one serving connection of `peer`. The other peers' parts
+    /// grow, so serving's waiters wake.
+    pub(crate) fn unregister_serving_peer(&self, peer: &ZakuraPeerId) {
+        let wake = {
+            let mut state = self.lock();
+            let rule3_before = state.machine.any_below_share_waiting();
+            state.serving.unregister(peer);
+            state
+                .machine
+                .wake(Some(Consumer::Serving), false, rule3_before)
+        };
+        self.wake(wake);
+    }
+
+    /// Set `peer`'s serving cap. Raising it wakes serving's waiters.
+    pub(crate) fn set_serving_peer_cap(&self, peer: &ZakuraPeerId, cap: u64) {
+        let wake = {
+            let mut state = self.lock();
+            let rule3_before = state.machine.any_below_share_waiting();
+            let raised = state
+                .serving
+                .set_cap(peer, cap)
+                .then_some(Consumer::Serving);
+            state.machine.wake(raised, false, rule3_before)
+        };
+        self.wake(wake);
+    }
+
+    /// Bytes `peer` holds in serving's sub-pool.
+    #[cfg(test)]
+    pub(crate) fn serving_peer_leased(&self, peer: &ZakuraPeerId) -> u64 {
+        self.lock().serving.peer_leased(peer)
+    }
+
+    /// Bytes every serving peer holds in serving's sub-pool.
+    #[cfg(test)]
+    pub(crate) fn serving_total_leased(&self) -> u64 {
+        self.lock().serving.total_leased()
+    }
+
+    /// Try a serving lease for `target` without waiting.
+    pub(crate) fn try_acquire_serving(
+        &self,
+        target: ServingTarget<'_>,
+        conn: Option<ZakuraConnId>,
+        bytes: u64,
+    ) -> Result<PoolLease, LeaseDenied> {
+        self.try_request(&Request {
+            consumer: Consumer::Serving,
+            conn,
+            serving: Some(target),
+            bytes,
+        })
+    }
+
+    /// Wait for a serving lease for `target` (see [`Self::acquire`]).
+    pub(crate) async fn acquire_serving(
+        &self,
+        target: ServingTarget<'_>,
+        conn: Option<ZakuraConnId>,
+        bytes: u64,
+    ) -> Result<PoolLease, LeaseDenied> {
+        let request = Request {
+            consumer: Consumer::Serving,
+            conn,
+            serving: Some(target),
+            bytes,
+        };
+        self.wait_for_lease(&request, std::future::pending::<LeaseDenied>())
+            .await
     }
 
     fn try_request(&self, request: &Request<'_>) -> Result<PoolLease, LeaseDenied> {

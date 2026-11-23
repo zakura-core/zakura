@@ -1695,7 +1695,12 @@ mod tests {
             recv,
             session.request_sender(),
         );
-        let serving = Serving::new(Arc::new(EmptyBlockRangeSource), config).session(
+        let serving = Serving::new(
+            Arc::new(EmptyBlockRangeSource),
+            config,
+            crate::zakura::BlockSyncMemory::for_tests().serving,
+        )
+        .session(
             session.peer_id(),
             super::super::block_sync_observe::SessionKey::default(),
             session.request_sender(),

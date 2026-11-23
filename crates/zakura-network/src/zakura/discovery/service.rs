@@ -357,6 +357,12 @@ impl DiscoveryService {
         }
     }
 
+    /// Back discovery serving output by `Consumer::Control` on `pool` (`02 §4`).
+    pub(crate) fn with_memory_pool(mut self, pool: crate::zakura::memory::MemoryPool) -> Self {
+        self.serving = self.serving.with_memory_pool(pool);
+        self
+    }
+
     pub(crate) fn set_connection_owners(&self, owners: Vec<Arc<dyn Service>>) {
         *self
             .connection_owners

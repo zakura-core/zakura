@@ -985,14 +985,14 @@ fn sink_and_core(
         crate::zakura::regulation::test_family::RULES,
         cap,
         frames,
-        Arc::new(ResponseGrants {
-            node: Mutex::new(grant()),
-            _node_response: SlotBudget::new(1).unwrap().try_reserve().unwrap(),
-            peer: Mutex::new(grant()),
-            _peer_response: SlotBudget::new(1).unwrap().try_reserve().unwrap(),
-            _peer_budgets: capacity(LIMITS).peer(&peer(1)),
-            _unwritten: None,
-        }),
+        Arc::new(ResponseGrants::new(
+            None,
+            Some(grant()),
+            Some(SlotBudget::new(1).unwrap().try_reserve().unwrap()),
+            grant(),
+            SlotBudget::new(1).unwrap().try_reserve().unwrap(),
+            capacity(LIMITS).peer(&peer(1)),
+        )),
         Commitment(Some(commitments.clone()), None),
     );
     let core = Arc::new(Mutex::new(core));
@@ -1771,4 +1771,93 @@ async fn queuing_an_ending_shrinks_both_output_grants_to_encoded_bytes() {
     assert_eq!(capacity.node_output_held(), 0);
     assert_eq!(capacity.peer_held(&peer_id), (0, 0));
     session.cancel.cancel();
+}
+
+#[tokio::test]
+async fn serve_output_leases_from_serving_pool_before_execution_and_shrinks_at_ending() {
+    use crate::zakura::memory::{Consumer, ConsumerSpec, MemoryPool, PoolConfig, ServingPool};
+
+    let request = Job {
+        parts: 8,
+        part_len: 64,
+        fail_after: Some(1),
+        ..job()
+    };
+    let cap_bytes = Scripted.response_cap(&request).output_bytes();
+    // Pool holds just enough for one response cap at a time (floor == cap_bytes, S == 0),
+    // proving a second request waits on the serving pool BEFORE taking an execution slot.
+    let pool_cfg = PoolConfig::new(cap_bytes, 0).with_consumer(
+        Consumer::Serving,
+        ConsumerSpec::bulk(cap_bytes, cap_bytes, 1),
+    );
+    let mem_pool = MemoryPool::new(pool_cfg);
+    let serving_pool = ServingPool::new(mem_pool.clone(), cap_bytes * 2);
+
+    let capacity = capacity(ServeLimits {
+        node_output_responses: 4,
+        peer_output_responses: 4,
+        node_execution: 2,
+        peer_execution: 2,
+        peer_output_bytes: cap_bytes * 4,
+        node_output_bytes: cap_bytes * 4,
+    })
+    .with_pool_backing(ServePoolBacking::Serving {
+        pool: serving_pool.clone(),
+        peer_floor: cap_bytes,
+    });
+
+    let peer1 = peer(1);
+    let peer2 = peer(2);
+    let mut s1 = session(&capacity, 1, 4);
+    let mut s2 = session(&capacity, 2, 4);
+    let gate = Arc::new(Semaphore::new(0));
+
+    // Peer 1 admits a request that pauses before its parts, holding the entire pool cap.
+    s1.serve
+        .admit(Job {
+            per_part: Some(gate.clone()),
+            ..request.clone()
+        })
+        .unwrap();
+    settle().await;
+    assert_eq!(mem_pool.consumer_leased(Consumer::Serving), cap_bytes);
+    assert_eq!(capacity.node_execution_held(), 1);
+
+    // Peer 2 admits a request while the pool is full: it must wait on the
+    // serving pool BEFORE taking the second execution slot (02 §5).
+    s2.serve
+        .admit(Job {
+            parts: 0,
+            part_len: 0,
+            ..job()
+        })
+        .unwrap();
+    settle().await;
+    assert_eq!(
+        capacity.node_execution_held(),
+        1,
+        "waiting on serving pool must not hold an execution slot"
+    );
+
+    // Let peer 1 send 1 part and fail locally; at the ending, its pool lease
+    // shrinks immediately to the small encoded bytes (mem-6 / decision-11),
+    // unblocking peer 2 without waiting for peer 1's transport write!
+    gate.add_permits(2);
+    assert_eq!(next(&mut s2.output).await, Probe::Done(0));
+    settle().await;
+    assert!(
+        mem_pool.consumer_leased(Consumer::Serving) < cap_bytes / 2,
+        "peer 1's serving-pool lease shrank at ending"
+    );
+    assert_eq!(serving_pool.peer_leased(&peer2), 0);
+
+    // Draining peer 1's frames returns all pool leases to 0.
+    assert_eq!(next(&mut s1.output).await, Probe::Part(vec![7; 64]));
+    assert_eq!(next(&mut s1.output).await, Probe::Failed(1));
+    settle().await;
+    assert_eq!(mem_pool.consumer_leased(Consumer::Serving), 0);
+    assert_eq!(serving_pool.peer_leased(&peer1), 0);
+
+    s1.cancel.cancel();
+    s2.cancel.cancel();
 }

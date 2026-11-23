@@ -31,7 +31,7 @@ use zakura_node_services::{
     block_memory::TransactionHandle,
     mempool::port::{
         pool_port, ChainEvent, ChainTip, Change, ChangeSeq, ChangesSince, Charge, ConnectedBlock,
-        PoolHandle, PoolSnapshot, Reservation, ReservationId, Verdict,
+        PoolHandle, PoolSnapshot, RelayedFetch, Reservation, ReservationId, Verdict,
     },
 };
 use zakura_rt::{
@@ -144,6 +144,11 @@ struct Mirror {
     running: Vec<(JobId, Call)>,
     cancelled: Vec<JobId>,
     cancelled_fetches: HashSet<ReservationId>,
+    /// The relayed fetches whose memory lease the machine ended.
+    ended_tx_leases: HashSet<ReservationId>,
+    /// Each relayed fetch's wait for the core to end its memory lease,
+    /// until the machine ends it.
+    tx_leases: HashMap<ReservationId, JoinHandle<()>>,
     held: Vec<(usize, Reservation)>,
     /// Which run and input this is, for a failed comparison to name.
     at: String,
@@ -226,6 +231,8 @@ impl Mirror {
             running: Vec::new(),
             cancelled: Vec::new(),
             cancelled_fetches: HashSet::default(),
+            ended_tx_leases: HashSet::default(),
+            tx_leases: HashMap::default(),
             held: Vec::new(),
             at: String::new(),
             verdicts: HashMap::default(),
@@ -252,6 +259,9 @@ impl Mirror {
                 Effect::Cancel(job) => self.cancelled.push(job),
                 Effect::CancelFetch(reservation) => {
                     self.cancelled_fetches.insert(reservation);
+                }
+                Effect::EndTxLease(reservation) => {
+                    self.ended_tx_leases.insert(reservation);
                 }
                 Effect::Verdict { waiter, verdict } => self.due_verdicts.push((waiter, verdict)),
             }
@@ -290,6 +300,11 @@ impl Mirror {
                 .get(waiter)
                 .is_some_and(JoinHandle::is_finished)
         });
+        let leases_ended = self.ended_tx_leases.iter().all(|reservation| {
+            self.tx_leases
+                .get(reservation)
+                .is_none_or(JoinHandle::is_finished)
+        });
         let logged: usize = self.log.iter().map(Vec::len).sum();
         let published = self.handle.snapshot().is_some_and(|snapshot| {
             (
@@ -302,7 +317,7 @@ impl Mirror {
                 Some(logged),
             )
         });
-        started && cancelled && verdicts && published
+        started && cancelled && verdicts && leases_ended && published
     }
 
     /// Ends one input: gives the machine any deadline already due, as the
@@ -371,6 +386,24 @@ impl Mirror {
                 "{what}: a fetch is cancelled when the machine cancels it"
             );
         }
+        // A relayed fetch's memory lease ends exactly when the machine ends
+        // it.
+        for reservation in std::mem::take(&mut self.ended_tx_leases) {
+            let task = self
+                .tx_leases
+                .remove(&reservation)
+                .expect("the machine ends the lease of a relayed fetch the test made");
+            assert!(
+                task.is_finished(),
+                "{what}: a memory lease's end reaches its caller"
+            );
+        }
+        for task in self.tx_leases.values() {
+            assert!(
+                !task.is_finished(),
+                "{what}: a counted memory lease stays held"
+            );
+        }
 
         // The snapshot is the machine's, but for the insertion times, which
         // each side reads from the wall clock.
@@ -430,24 +463,31 @@ impl Mirror {
         assert_eq!(read, self.log.iter().collect::<Vec<_>>(), "{what}: the log");
     }
 
-    /// Reserves `tx`, and holds the reservation if one is granted.
-    async fn reserve(&mut self, tx: usize) {
+    /// Reserves `tx`, for a relayed fetch if `relayed` says what it brings,
+    /// and holds the reservation if one is granted.
+    async fn reserve(&mut self, tx: usize, relayed: Option<RelayedFetch>) {
         let id = self.txs[tx].id();
-        let (expected, step) = self.reference.reserve(id, Instant::now());
+        let (expected, step) = match relayed {
+            Some(fetch) => self.reference.reserve_relayed(id, fetch, Instant::now()),
+            None => self.reference.reserve(id, Instant::now()),
+        };
         self.absorb(step);
-        match (
-            expected,
-            answered(self.handle.reserve(id, far()))
-                .await
-                .expect("the test's deadline is far off"),
-        ) {
-            (Ok(granted), Ok(reservation)) => {
+        let answer = match relayed {
+            Some(fetch) => answered(self.handle.reserve_relayed(id, fetch, far())).await,
+            None => answered(self.handle.reserve(id, far())).await,
+        };
+        match (expected, answer.expect("the test's deadline is far off")) {
+            (Ok(granted), Ok(mut reservation)) => {
                 assert_eq!(
                     (reservation.id(), reservation.tx_id()),
                     (granted, id),
                     "{}: a grant reaches its caller as the machine made it",
                     self.at
                 );
+                if relayed.is_some() {
+                    let ended = reservation.take_tx_lease_end();
+                    self.tx_leases.insert(granted, tokio::spawn(ended.ended()));
+                }
                 self.held.push((tx, reservation));
             }
             (Err(expected), Err(got)) => {
@@ -622,7 +662,20 @@ impl Mirror {
         let any_tx = dice.below(self.txs.len());
         match dice.below(100) {
             0..=24 => {
-                self.reserve(any_tx).await;
+                // Half are relayed fetches, which lease the body's size or,
+                // now and then, nothing.
+                let size = u64::try_from(self.txs[any_tx].real.transaction.size())
+                    .expect("a test body's size fits in u64");
+                let relayed = match dice.below(8) {
+                    0..=3 => None,
+                    4 => Some(0),
+                    _ => Some(size),
+                }
+                .map(|leased_bytes| RelayedFetch {
+                    announced_size: size,
+                    leased_bytes,
+                });
+                self.reserve(any_tx, relayed).await;
                 self.compare("a reservation").await;
             }
             25..=44 if !self.held.is_empty() => {

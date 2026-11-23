@@ -12,7 +12,7 @@ use zakura_chain::{
 use zakura_node_services::mempool::{
     port::{
         pool_port, ChainTip, Change, Charge, PoolCommand, PoolInbox, PoolSnapshot, Rejection,
-        RejectionScope, RemovalReason,
+        RejectionScope, RelayedFetch, RemovalReason,
     },
     TransactionDependencies,
 };
@@ -152,7 +152,15 @@ fn connection() -> (ZakuraPeerId, ZakuraConnId) {
 
 /// A routine's wiring on `pool`, with no reactor task: the test holds what
 /// ended sessions hand off.
-fn wiring(pool: PoolHandle) -> (Wiring, mpsc::UnboundedReceiver<Calls>) {
+fn wiring(pool: PoolHandle) -> (Wiring, mpsc::UnboundedReceiver<Handoff>) {
+    wiring_with(pool, super::super::test_memory_pool())
+}
+
+/// [`wiring`], whose fetches lease from `memory_pool`.
+fn wiring_with(
+    pool: PoolHandle,
+    memory_pool: MemoryPool,
+) -> (Wiring, mpsc::UnboundedReceiver<Handoff>) {
     let (handoff, handed) = mpsc::unbounded_channel();
     let node = Node {
         shared: Shared::new(RelayConfig {
@@ -164,6 +172,7 @@ fn wiring(pool: PoolHandle) -> (Wiring, mpsc::UnboundedReceiver<Calls>) {
     let wiring = Wiring {
         node: Arc::new(Mutex::new(node)),
         pool,
+        memory_pool,
         may_cool: Arc::new(|_| true),
         handoff,
         owned: Owned::default(),
@@ -204,7 +213,7 @@ impl Session {
         let (reports, reports_rx) = mpsc::unbounded_channel();
         let (close, cause, cancel) = closer();
         let have = MeteredSender::new(open_have_bucket(&wiring.have_buckets, &connection()));
-        let io = SessionIo::new(data, state, close, reports_rx, have, connection());
+        let io = SessionIo::new(data, state, close, reports_rx, have, connection(), None);
         let mut routine = Routine::open(
             wiring.clone(),
             PeerKey(1),
@@ -243,7 +252,7 @@ struct Serving {
     ids: Vec<UnminedTxId>,
     /// Held unread, so the core's side of the port stays open.
     _inbox: PoolInbox,
-    _handed: mpsc::UnboundedReceiver<Calls>,
+    _handed: mpsc::UnboundedReceiver<Handoff>,
 }
 
 impl Serving {
@@ -520,4 +529,132 @@ async fn queued_have_frames_reach_the_machine_as_one() {
         Some(fault(CloseRow::RELAY_CLOSE_9)),
         "the unrequested body closes the peer"
     );
+}
+
+/// `02 §7` item 7, `mem-7`:
+/// - A fetch leases its announced size from `Consumer::Tx` before it asks
+///   the core for a reservation, and holds the lease until the core ends it,
+///   after the reservation is granted.
+/// - A fetch that finds `Consumer::Tx` full still asks, and says it leased
+///   nothing. The core decides whether the empty-pool exception takes it.
+#[tokio::test]
+async fn a_fetch_holds_its_tx_lease_until_the_core_ends_it() {
+    use crate::zakura::memory::{ConsumerSpec, PoolConfig};
+
+    let mut txs = transactions(3);
+    let pooled = txs.remove(0);
+    let tx_a = txs.remove(0).transaction;
+    let tx_b = txs.remove(0).transaction;
+    let (id_a, size_a) = (tx_a.id(), u32::try_from(tx_a.size()).expect("fits u32"));
+    let (id_b, size_b) = (tx_b.id(), u32::try_from(tx_b.size()).expect("fits u32"));
+
+    // `Consumer::Tx` holds `tx_a` and no more while block sync borrows the
+    // shared bytes.
+    let (handle, mut inbox) = pool_port();
+    publish(
+        &inbox,
+        vec![Change::Added(pooled.transaction.id())],
+        vec![pooled],
+    );
+    let shared = u64::from(size_b) * 2;
+    let memory_pool = MemoryPool::new(
+        PoolConfig::new(u64::from(size_a) + shared, 0)
+            .with_consumer(
+                Consumer::Tx,
+                ConsumerSpec::bulk(u64::from(size_a), u64::from(size_a) + shared, 1),
+            )
+            .with_consumer(Consumer::BlockSync, ConsumerSpec::bulk(0, shared, 1)),
+    );
+    let tx_leased = || memory_pool.snapshot().consumers[Consumer::Tx.index()].leased;
+    let borrowed = memory_pool
+        .try_acquire(Consumer::BlockSync, None, shared)
+        .expect("block sync borrows the shared bytes");
+    let (wiring, _handed) = wiring_with(handle, memory_pool.clone());
+    let mut session = Session::open(&wiring);
+    session
+        .deliver(TxRelayMessage::Hello {
+            serves: 16,
+            max_tx_bytes: MAX_TX_BYTES,
+        })
+        .await;
+
+    // The core grants `tx_a`'s fetch and counts its lease.
+    session
+        .deliver(TxRelayMessage::Have(vec![(id_a, size_a)]))
+        .await;
+    assert_eq!(tx_leased(), u64::from(size_a));
+    let grant = async {
+        let Some(PoolCommand::Reserve {
+            tx_id,
+            relayed,
+            reply,
+        }) = inbox.next().await
+        else {
+            panic!("the fetch asks the core for a reservation");
+        };
+        assert_eq!(tx_id, id_a);
+        assert_eq!(
+            relayed,
+            Some(RelayedFetch {
+                announced_size: u64::from(size_a),
+                leased_bytes: u64::from(size_a),
+            })
+        );
+        let (reservation, hold) =
+            inbox.grant_relayed(ReservationId(1), tx_id, CancellationToken::new());
+        let _ = reply.send(Ok(reservation));
+        hold
+    };
+    let reserved = apply_calls(&mut session, |r| matches!(r, PoolResult::Reserved { .. }));
+    let ((), hold) = tokio::time::timeout(
+        Duration::from_secs(5),
+        futures::future::join(reserved, grant),
+    )
+    .await
+    .expect("the reservation completes promptly");
+    assert_eq!(
+        tx_leased(),
+        u64::from(size_a),
+        "a granted fetch keeps its lease"
+    );
+
+    // `Consumer::Tx` is full, so `tx_b`'s fetch leases nothing and says so.
+    session
+        .deliver(TxRelayMessage::Have(vec![(id_b, size_b)]))
+        .await;
+    let refuse = async {
+        let Some(PoolCommand::Reserve { relayed, reply, .. }) = inbox.next().await else {
+            panic!("a fetch without a lease still asks the core");
+        };
+        assert_eq!(
+            relayed,
+            Some(RelayedFetch {
+                announced_size: u64::from(size_b),
+                leased_bytes: 0,
+            })
+        );
+        let _ = reply.send(Err(PortUnreserved::NoRoom));
+    };
+    let refused = apply_calls(&mut session, |r| matches!(r, PoolResult::Reserved { .. }));
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        futures::future::join(refused, refuse),
+    )
+    .await
+    .expect("the refusal comes back promptly");
+    assert_eq!(tx_leased(), u64::from(size_a));
+
+    // The core ends `tx_a`'s lease, and the lease goes back.
+    drop(hold);
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        apply_calls(&mut session, |r| {
+            matches!(r, PoolResult::TxLeaseEnded { .. })
+        }),
+    )
+    .await
+    .expect("the lease's end reaches the routine promptly");
+    assert_eq!(tx_leased(), 0);
+    drop(borrowed);
+    assert_eq!(memory_pool.snapshot().total_leased, 0);
 }

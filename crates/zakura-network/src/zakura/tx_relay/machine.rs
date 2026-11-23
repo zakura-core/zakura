@@ -629,6 +629,8 @@ pub(crate) enum RelayEffect {
         call: CallId,
         /// The id.
         id: UnminedTxId,
+        /// The serialized body size announced by this peer (`02 §7` item 7).
+        announced_size: u32,
     },
     /// Submit `body` under `reservation`, and answer its verdict through
     /// [`PeerMachine::verdict`] with `waiter`.

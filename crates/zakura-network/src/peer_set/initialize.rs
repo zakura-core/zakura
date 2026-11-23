@@ -176,6 +176,7 @@ where
         header_sync_driver_startup,
         Vec::new(),
         peer::BlockAnnouncementHook::default(),
+        None,
     )
     .await
     .map(
@@ -190,6 +191,9 @@ where
 ///
 /// Legacy connections pass each block a peer announces in a single-block `inv` to
 /// `block_announcement_hook`.
+///
+/// The endpoint starts `tx-relay` from `tx_relay` once it has built the
+/// memory pool.
 #[allow(clippy::too_many_arguments)]
 pub async fn init_with_zakura<S, C>(
     config: Config,
@@ -201,6 +205,7 @@ pub async fn init_with_zakura<S, C>(
     header_sync_driver_startup: Option<ZakuraHeaderSyncDriverStartup>,
     custom_services: Vec<CustomService>,
     block_announcement_hook: peer::BlockAnnouncementHook,
+    tx_relay: Option<crate::zakura::TxRelayStartup>,
 ) -> Result<
     (
         BoxCloneSyncService<Request, Response, BoxError>,
@@ -247,6 +252,7 @@ where
         },
         header_sync_driver_startup,
         custom_services,
+        tx_relay,
         peer_registry.clone(),
     )
     .boxed()

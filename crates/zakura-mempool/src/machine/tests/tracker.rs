@@ -37,6 +37,8 @@ struct Answering {
 pub(crate) struct Tracker {
     /// Every reservation the machine granted.
     reservations: HashSet<u64>,
+    /// The relayed fetches whose memory lease the machine has not ended.
+    tx_leases: HashSet<ReservationId>,
     /// Every waiter a submission was given, with its transaction, and
     /// whether it has its verdict.
     waiters: BTreeMap<u64, (UnminedTxId, bool)>,
@@ -96,6 +98,12 @@ impl Tracker {
             Err(_) if remembered => self.saw("a remembered rejection held"),
             Err(_) => {}
         }
+    }
+
+    /// The machine granted `reservation` to a relayed fetch, whose memory
+    /// lease it counts until it ends it.
+    pub(crate) fn tx_leased(&mut self, reservation: ReservationId) {
+        self.tx_leases.insert(reservation);
     }
 
     /// A submission of `tx` waits for its verdict as `waiter`.
@@ -225,6 +233,13 @@ impl Tracker {
                     );
                     self.saw("cancel fetch");
                 }
+                Effect::EndTxLease(reservation) => {
+                    assert!(
+                        self.tx_leases.remove(reservation),
+                        "the memory lease of {reservation:?} ended, but no relayed fetch held one"
+                    );
+                    self.saw("end tx lease");
+                }
                 Effect::Verdict { waiter, verdict } => {
                     let Some((tx, answered)) = self.waiters.get_mut(&waiter.0) else {
                         panic!("a verdict for {waiter:?}, which names no submission");
@@ -348,6 +363,11 @@ impl Tracker {
     /// Compares the pool the log describes with the pool the machine holds
     /// and the snapshot it offers.
     pub(crate) fn check(&self, machine: &Machine) {
+        assert_eq!(
+            machine.tx_leased(),
+            self.tx_leases,
+            "the machine counts exactly the relayed fetches whose lease it has not ended"
+        );
         let pool: HashSet<UnminedTxId> = machine.pooled_ids().into_iter().collect();
         assert_eq!(pool, self.pool, "the log leads to the pool");
         let snapshot = machine.snapshot(ChangeSeq(self.logged));
@@ -422,6 +442,15 @@ impl Tracker {
         for (waiter, (tx, answered)) in &self.waiters {
             assert!(*answered, "waiter {waiter} of {tx:?} never got a verdict");
         }
+    }
+
+    /// Every relayed fetch's memory lease has ended.
+    pub(crate) fn every_tx_lease_ended(&self) {
+        assert!(
+            self.tx_leases.is_empty(),
+            "the memory leases of {:?} never ended",
+            self.tx_leases
+        );
     }
 
     /// The log says the pool is empty.

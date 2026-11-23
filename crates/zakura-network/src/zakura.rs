@@ -67,7 +67,8 @@ pub use transport::*;
 #[cfg(zakura_sim)]
 pub use tx_relay::sim as tx_relay_sim;
 pub use tx_relay::{
-    tx_relay_service, tx_relay_service_id, MayCool, TxRelaySessions, ZakuraTxRelayConfig,
+    tx_relay_service, tx_relay_service_id, MayCool, TxRelaySessions, TxRelayStartup,
+    ZakuraTxRelayConfig,
 };
 
 #[cfg(any(test, feature = "zakura-testkit"))]

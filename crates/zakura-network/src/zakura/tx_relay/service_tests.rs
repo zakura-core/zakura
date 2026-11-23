@@ -24,7 +24,7 @@ use zakura_node_services::mempool::{
 };
 use zakura_rt::sync::{CancellationToken, Mutex};
 
-use super::{tx_relay_service, wire::ZAKURA_CAP_TX_RELAY};
+use super::{test_memory_pool as memory_pool, tx_relay_service, wire::ZAKURA_CAP_TX_RELAY};
 use crate::{
     zakura::{
         testkit::{await_until, ZakuraTestNode},
@@ -161,12 +161,14 @@ async fn moves_between_two_nodes(b_starts_on: bool) -> Result<(), BoxError> {
     let (pool_b, turn_on_b) = pool(held_b.clone());
     let relay_a = tx_relay_service(
         pool_a,
+        memory_pool(),
         Arc::new(|_| true),
         &Default::default(),
         Default::default(),
     );
     let relay_b = tx_relay_service(
         pool_b,
+        memory_pool(),
         Arc::new(|_| true),
         &Default::default(),
         Default::default(),

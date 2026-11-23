@@ -292,6 +292,7 @@ async fn start_test_zakura_endpoint_with_registry() -> (crate::zakura::ZakuraEnd
         |_supervisor, _trace| Arc::new(DropSink) as Arc<dyn ZakuraService>,
         None,
         Vec::new(),
+        None,
         peer_registry.clone(),
     )
     .await

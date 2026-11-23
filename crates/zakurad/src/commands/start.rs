@@ -879,17 +879,19 @@ impl StartCmd {
 
         // The pool is chosen once, at startup. `tx-relay` needs the pool
         // core's port before the network starts, so it is built here and
-        // handed to the core below.
+        // handed to the core below. The endpoint starts `tx-relay` once it
+        // has built the memory pool its fetches lease from.
         let pool_implementation = config.mempool.implementation.resolve();
+        let mut tx_relay = None;
         let tx_relay_port = if config.network.zakura.tx_relay.enabled {
             if pool_implementation == mempool::config::Implementation::Core {
                 let port = mempool::core::TxRelayPort::new();
-                custom_services.push(zakura_network::zakura::tx_relay_service(
-                    port.handle(),
-                    port.may_cool(),
-                    &config.network.zakura.tx_relay,
-                    config.network.unconditional_peers.clone(),
-                ));
+                tx_relay = Some(zakura_network::zakura::TxRelayStartup {
+                    pool: port.handle(),
+                    may_cool: port.may_cool(),
+                    config: config.network.zakura.tx_relay.clone(),
+                    unconditional: config.network.unconditional_peers.clone(),
+                });
                 Some(port)
             } else {
                 warn!("tx-relay needs `[mempool] implementation = \"core\"`, so it stays off");
@@ -972,6 +974,7 @@ impl StartCmd {
                     claims: announcement_claims.clone(),
                     latest_chain_tip: latest_chain_tip.clone(),
                 }),
+                tx_relay,
             )
             .await
             .map_err(|error| eyre!(error))?;

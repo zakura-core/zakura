@@ -6150,15 +6150,19 @@ pub async fn spawn_zakura_endpoint_with_services(
         header_sync_driver_startup,
         custom_services,
         None,
+        None,
     )
     .await
 }
 
+/// Start a Zakura endpoint on `peer_registry`, with `tx-relay` if
+/// `tx_relay` is given.
 pub(crate) async fn spawn_zakura_endpoint_with_peer_registry(
     config: &Config,
     sink_factory: impl FnOnce(ZakuraSupervisorHandle, ZakuraTrace) -> Arc<dyn Service> + Send + 'static,
     header_sync_driver_startup: Option<ZakuraHeaderSyncDriverStartup>,
     custom_services: Vec<CustomService>,
+    tx_relay: Option<super::TxRelayStartup>,
     peer_registry: PeerRegistry,
 ) -> Result<Option<ZakuraEndpoint>, BoxError> {
     spawn_zakura_endpoint_inner(
@@ -6166,18 +6170,21 @@ pub(crate) async fn spawn_zakura_endpoint_with_peer_registry(
         Box::new(sink_factory),
         header_sync_driver_startup,
         custom_services,
+        tx_relay,
         Some(peer_registry),
     )
     .await
 }
 
 /// Starts the endpoint. `sink_factory` is boxed so this large function is compiled once for
-/// every caller's factory type.
+/// every caller's factory type. `tx_relay` starts once the memory pool its fetches lease from
+/// exists.
 async fn spawn_zakura_endpoint_inner(
     config: &Config,
     sink_factory: Box<dyn FnOnce(ZakuraSupervisorHandle, ZakuraTrace) -> Arc<dyn Service> + Send>,
     header_sync_driver_startup: Option<ZakuraHeaderSyncDriverStartup>,
-    custom_services: Vec<CustomService>,
+    mut custom_services: Vec<CustomService>,
+    tx_relay: Option<super::TxRelayStartup>,
     peer_registry: Option<PeerRegistry>,
 ) -> Result<Option<ZakuraEndpoint>, BoxError> {
     if !config.v2_p2p() {
@@ -6199,9 +6206,14 @@ async fn spawn_zakura_endpoint_inner(
     // A custom kind with its own share, such as `tx-relay`'s, is counted
     // once, with the native kinds.
     let named_kinds = config.zakura.reactor_shares(&config.network).kinds;
+    let tx_relay_kinds = tx_relay
+        .as_ref()
+        .map_or(&[][..], |_| &super::tx_relay::wire::TX_RELAY_STREAMS[..]);
     let custom_kinds: Vec<u16> = custom_services
         .iter()
-        .flat_map(|custom| custom.service.streams().iter().map(|stream| stream.kind))
+        .flat_map(|custom| custom.service.streams())
+        .chain(tx_relay_kinds)
+        .map(|stream| stream.kind)
         .filter(|kind| !named_kinds.iter().any(|(named, _)| named == kind))
         .collect();
     let memory_plan = super::memory::MemoryPlan::size_for_node(
@@ -6213,6 +6225,7 @@ async fn spawn_zakura_endpoint_inner(
     )?;
     memory_plan.publish_metrics();
     let memory_pool = memory_plan.build_pool();
+    custom_services.extend(tx_relay.map(|startup| startup.start(memory_pool.clone())));
     let serving_pool =
         super::memory::ServingPool::new(memory_pool.clone(), memory_plan.serving_per_peer_cap);
     let block_sync_memory = super::BlockSyncMemory::new(

@@ -1456,6 +1456,7 @@ pub(crate) fn sync_properties<S: HasView<View = SyncView>>() -> Vec<Property<S>>
     properties.extend(table_wiring_properties());
     properties.extend(resource_properties());
     properties.push(memory_pool::pool_bounded());
+    properties.push(memory_pool::tip_never_waits());
     properties.push(memory_pool::consensus_once_per_height());
     properties.push(memory_pool::teardown_returns_zero());
     properties.push(header_teardown_returns_baseline());

@@ -42,6 +42,10 @@ pub const TEARDOWN_RETURNS_ZERO: &str = "memory/teardown-returns-zero";
 /// floor (`mem-13`).
 pub const SESSIONS_WITHIN_SHARE: &str = "memory/sessions-within-share";
 
+/// With bulk consumers saturated, reserved tip-priority consumers (`control`,
+/// `propagation`, `consensus`) reach their bounds without waiting (`mem-5`).
+pub const TIP_NEVER_WAITS: &str = "memory/tip-never-waits";
+
 /// At rest, `Consensus` holds at most one lease per height. A drain stays on
 /// `Consensus` only when the pool had no room to move it to `BlockSync`
 /// (`mem-15`).
@@ -245,6 +249,8 @@ pub struct PoolGaugeModel {
     session_violations: Vec<(String, String)>,
     /// `PoolFact::Waited` events recorded on reserved consumers (for `mem-5`).
     waited_reserved: Vec<(String, u64, String)>,
+    /// Number of `PoolFact::Granted` events recorded on reserved consumers (`mem-5`).
+    reserved_grants_observed: u64,
     /// The height each labeled live lease funds, by `lease_id`. `None` marks
     /// a drain a move left behind (`mem-15`).
     heights: BTreeMap<u64, Option<u32>>,
@@ -279,6 +285,7 @@ impl PoolGaugeModel {
             bound_violations: Vec::new(),
             session_violations: Vec::new(),
             waited_reserved: Vec::new(),
+            reserved_grants_observed: 0,
             heights: BTreeMap::new(),
         }
     }
@@ -301,6 +308,9 @@ impl PoolGaugeModel {
             } => {
                 if consumer == SESSIONS_LABEL {
                     self.sessions_events_observed = self.sessions_events_observed.saturating_add(1);
+                }
+                if is_reserved_consumer(consumer) {
+                    self.reserved_grants_observed = self.reserved_grants_observed.saturating_add(1);
                 }
                 if self
                     .leases
@@ -809,6 +819,11 @@ impl PoolGaugeModel {
         &self.waited_reserved
     }
 
+    /// Number of reserved-consumer grants folded so far (`mem-5`).
+    pub fn reserved_grants_observed(&self) -> u64 {
+        self.reserved_grants_observed
+    }
+
     /// The heights the live `Consensus` leases fund, one entry per lease
     /// that funds a height, and the first live `Consensus` lease that names
     /// no height. A drain a move left behind funds none (`mem-15`).
@@ -919,6 +934,26 @@ where
         status: Status::Active,
         check: check_sessions_within_share::<S>,
         witness: Some(TriggerHistory::Log(sessions_lease_observed)),
+    }
+}
+
+/// [`TIP_NEVER_WAITS`] (`mem-5`): reserved tip-priority consumers (`control`,
+/// `propagation`, `consensus`) never wait on the memory pool, even while bulk
+/// consumers saturate the shared space.
+pub fn tip_never_waits<S: HasView>() -> Property<S>
+where
+    S::View: PoolView,
+{
+    Property {
+        id: PropertyId::new(TIP_NEVER_WAITS),
+        claim: "reserved tip-priority consumers (control, propagation, consensus) reach their \
+                bounds without waiting on the memory pool, even when bulk consumers saturate",
+        kind: Kind::Safety,
+        assumes: &[],
+        needs: &[Source::View],
+        status: Status::Active,
+        check: check_tip_never_waits::<S>,
+        witness: Some(TriggerHistory::Log(reserved_lease_observed)),
     }
 }
 
@@ -1140,6 +1175,49 @@ where
         return cx.violated(expected, actual);
     }
     Verdict::Holds
+}
+
+fn check_tip_never_waits<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict
+where
+    S::View: PoolView,
+{
+    let (reserved_grants, waited) = cx.view().read_pool(|pool| {
+        (
+            pool.reserved_grants_observed(),
+            pool.waited_reserved().to_vec(),
+        )
+    });
+    if reserved_grants == 0 && waited.is_empty() {
+        return Verdict::NotApplicable;
+    }
+    let mut waited = waited.into_iter();
+    if let Some((consumer, bytes, reason)) = waited.next() {
+        for (c, b, r) in waited {
+            cx.record_violation(
+                format!("reserved consumer `{c}` never waits on the memory pool"),
+                format!("`{c}` waited for {b} B ({r})"),
+            );
+        }
+        return cx.violated(
+            format!("reserved consumer `{consumer}` never waits on the memory pool"),
+            format!("`{consumer}` waited for {bytes} B ({reason})"),
+        );
+    }
+    Verdict::Holds
+}
+
+/// [`TIP_NEVER_WAITS`]'s trigger history: the pool recorded at least one grant
+/// or wait on a reserved consumer (`control`, `propagation`, `consensus`).
+pub fn reserved_lease_observed(log: &ObservationLog) -> bool {
+    log.entries().iter().any(|entry| {
+        matches!(
+            &entry.obs,
+            Observation::Pool {
+                event: PoolFact::Granted { consumer, .. } | PoolFact::Waited { consumer, .. },
+                ..
+            } if is_reserved_consumer(consumer)
+        )
+    })
 }
 
 /// [`POOL_BOUNDED`]'s trigger history: the pool recorded at least one lease

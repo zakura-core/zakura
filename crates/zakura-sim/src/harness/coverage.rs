@@ -1503,6 +1503,14 @@ pub static COVERAGE: &[Coverage] = &[
         bypass: Bypass::Pending(NO_MEMORY_PLANTED_CASE),
     },
     Coverage {
+        property: crate::domain::memory_pool::TIP_NEVER_WAITS,
+        passing: passes(
+            "tests/memory_witnesses.rs",
+            "tip_never_waits_under_full_bulk_saturation",
+        ),
+        bypass: Bypass::Pending(NO_MEMORY_PLANTED_CASE),
+    },
+    Coverage {
         property: crate::domain::block_sync_semantic::SUBMIT_ONLY_REQUESTED,
         passing: passes(
             "tests/block_semantic_properties.rs",

@@ -264,7 +264,10 @@ pub fn unsupported_upgrade_ahead(
         .map(|(activation_height, upgrade)| UpgradeAhead {
             upgrade: *upgrade,
             activation_height: *activation_height,
-            remaining_blocks: activation_height.0.saturating_sub(tip_height.0),
+            remaining_blocks: activation_height
+                .0
+                .checked_sub(tip_height.0)
+                .expect("the range starts after the tip, so the activation height is above it"),
         })
 }
 

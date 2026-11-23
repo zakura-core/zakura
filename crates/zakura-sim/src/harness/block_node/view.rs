@@ -32,6 +32,7 @@ use zakura_network::zakura::{
 
 use crate::domain::block_sync::OwnerModel;
 use crate::domain::block_sync_semantic::SemanticModel;
+use crate::domain::memory_pool::PoolGaugeModel;
 
 /// An admitted session.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -143,6 +144,8 @@ pub struct BlockSyncView {
     /// The resource properties' owner model, which folds the events as the
     /// tap logs them.
     pub owners: OwnerModel,
+    /// The generic memory-pool gauge model, shared with [`PoolTap`].
+    pub pool: Rc<RefCell<PoolGaugeModel>>,
 }
 
 impl BlockSyncView {

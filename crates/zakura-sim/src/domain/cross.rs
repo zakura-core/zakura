@@ -17,15 +17,10 @@ use zakura_header_chain::Frontier;
 use zakura_storage::block::fixture::FixtureBlock;
 
 use crate::{
-    domain::{
-        block_sync::{self, OwnerView},
-        header_sync::{self, TeardownView},
-    },
-    harness::{block_node::view::BlockSyncView, header_node::claim::SettlementEvidence},
+    harness::block_node::view::BlockSyncView,
     observe::{BlockSyncFact, BlockSyncHolder, StorageFact, StorageRequest, WorkOwner},
     property::{
-        CheckCtx, EndViolation, HasView, Kind, Property, PropertyId, Source, Status,
-        TriggerHistory, Verdict,
+        CheckCtx, HasView, Kind, Property, PropertyId, Source, Status, TriggerHistory, Verdict,
     },
     record::machine::{BodyAuthority, ReactorAction},
     storage::{hash, BLOCK_SERVICE, HEADER_SERVICE},
@@ -804,119 +799,4 @@ fn request_after_epoch_change(log: &ObservationLog) -> bool {
 /// body-work epoch.
 fn submission_after_epoch_change(log: &ObservationLog) -> bool {
     EpochHistory::of(log).submission_after
-}
-
-/// Once the harness stops the node, both of its services return to their
-/// baseline.
-pub const TEARDOWN_RETURNS_BASELINE: &str = "sync/teardown-returns-baseline";
-
-/// The teardown property `sync/storage` registers:
-/// [`TEARDOWN_RETURNS_BASELINE`].
-pub fn teardown_properties<S>() -> Vec<Property<S>>
-where
-    S: HasView,
-    S::View: TeardownView + OwnerView,
-{
-    vec![Property {
-        id: PropertyId::new(TEARDOWN_RETURNS_BASELINE),
-        claim: "once the harness stops the node, header sync's released rounds and its own \
-                teardown keep no reservation, lease, held headers, chunk-budget charge or \
-                locator permit that no pending storage read holds, and block sync's teardown, \
-                at rest, keeps no charge or session slot",
-        kind: Kind::Safety,
-        assumes: &[],
-        needs: &[Source::View, Source::Schedule],
-        status: Status::Active,
-        check: check_teardown::<S>,
-        witness: Some(TriggerHistory::View(header_settlement_reached::<S::View>)),
-    }]
-}
-
-/// Checks [`TEARDOWN_RETURNS_BASELINE`] after a step: header sync's half as
-/// `header-sync/teardown-returns-baseline` checks it, and block sync's half
-/// as `block-sync/teardown-returns-baseline` does. A violation of either
-/// half violates it, and it holds where either half holds.
-fn check_teardown<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
-where
-    S: HasView,
-    S::View: TeardownView + OwnerView,
-{
-    let header = header_sync::check_teardown(cx);
-    let block = block_sync::check_teardown(cx);
-    match (header, block) {
-        (Verdict::Violated(header), Verdict::Violated(block)) => {
-            cx.record_violation(block.expected, block.actual);
-            Verdict::Violated(header)
-        }
-        (Verdict::Violated(violation), _) | (_, Verdict::Violated(violation)) => {
-            Verdict::Violated(violation)
-        }
-        (Verdict::Holds, _) | (_, Verdict::Holds) => Verdict::Holds,
-        (Verdict::NotApplicable, Verdict::NotApplicable) => Verdict::NotApplicable,
-    }
-}
-
-/// [`TEARDOWN_RETURNS_BASELINE`]'s violations at the run's end: header
-/// sync's half, a released round stuck when the run came to rest, as
-/// [`header_sync::teardown_end_violations`] finds it on the header
-/// harnesses. A harness reports these from [`HasView::end_violations`],
-/// after it handed the run's end to [`SettlementEvidence::end`].
-pub fn teardown_end_violations(rounds: &SettlementEvidence) -> Vec<EndViolation> {
-    header_sync::teardown_end_violations(rounds)
-        .into_iter()
-        .map(|violation| EndViolation {
-            property: PropertyId::new(TEARDOWN_RETURNS_BASELINE),
-            ..violation
-        })
-        .collect()
-}
-
-/// [`TEARDOWN_RETURNS_BASELINE`]'s trigger history, as header sync's:
-/// header sync's queue released a round, or the harness stopped the node
-/// and header sync's tap saw it settle.
-fn header_settlement_reached<V: TeardownView>(view: &V, _: &ObservationLog) -> bool {
-    view.rounds().any_released() || view.rounds().settled()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{harness::header_node::claim::Settlement, IdleStatus, Outcome, RunEnd};
-
-    /// A released round stuck when the run comes to rest violates
-    /// `sync/teardown-returns-baseline` at the run's end, under its own ID
-    /// rather than header sync's.
-    #[test]
-    fn a_stuck_round_at_rest_violates_the_sync_teardown_rule() {
-        let rounds = SettlementEvidence::default();
-        rounds.record(Settlement {
-            step: 7,
-            released: 2,
-            unsettled: 1,
-            stuck: 1,
-            tainted: 0,
-            shutdown: true,
-            settled: false,
-        });
-        assert!(
-            teardown_end_violations(&rounds).is_empty(),
-            "not at rest yet"
-        );
-        rounds.end(&RunEnd {
-            outcome: Outcome::Idle {
-                status: IdleStatus::Quiescent,
-            },
-            steps: 7,
-            violation: None,
-            drain: None,
-            harness: None,
-            rest: Some(zakura_scheduler::Status::Quiescent),
-        });
-        let found = teardown_end_violations(&rounds);
-        assert_eq!(found.len(), 1);
-        assert_eq!(
-            found[0].property,
-            PropertyId::new(TEARDOWN_RETURNS_BASELINE)
-        );
-    }
 }

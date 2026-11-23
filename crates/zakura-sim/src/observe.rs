@@ -509,6 +509,19 @@ pub enum Observation {
         /// peer's main task records it.
         order: u64,
     },
+    /// One lease event a node's memory pool reported through its tap, in the
+    /// order the pool reported it (`03 §4`).
+    Pool {
+        /// The tap's registration index among the run's pool taps, an index
+        /// space of its own.
+        instance: u64,
+        /// The event's number, from 1 per tap.
+        seq: u64,
+        /// The node's name, a display label only.
+        node: String,
+        /// What happened in the memory pool.
+        event: PoolFact,
+    },
     /// An event from a test-only fake action source.
     Fake {
         /// The source's name.
@@ -1845,6 +1858,167 @@ pub struct BlockSyncSubmission {
     pub decoded_attributed_memory_bytes: u64,
     /// Whether it left `applying` while the driver can still retain it.
     pub detached: bool,
+}
+
+/// The events that memory-pool tap `instance` logged in `observations`, in
+/// order.
+pub(crate) fn pool_entries<'o>(
+    observations: impl IntoIterator<Item = &'o Observation>,
+    instance: u64,
+) -> Vec<&'o Observation> {
+    observations
+        .into_iter()
+        .filter(|obs| {
+            matches!(
+                obs,
+                Observation::Pool { instance: index, .. } if *index == instance
+            )
+        })
+        .collect()
+}
+
+/// One lease transition reported by a node's memory pool (`03 §4`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "event", rename_all = "kebab-case")]
+pub enum PoolFact {
+    /// A new lease was granted.
+    Granted {
+        /// Unique lease identifier.
+        lease_id: u64,
+        /// Consumer label (e.g. `block_sync`, `consensus`, `serving`, `sessions`).
+        consumer: String,
+        /// Connection associated with this lease, if any.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        peer: Option<u64>,
+        /// Bytes granted.
+        bytes: u64,
+        /// Consumer's total leased bytes after this grant.
+        consumer_leased: u64,
+        /// Consumer's effective cap at grant time.
+        consumer_cap: u64,
+        /// Consumer's protected share (`floor + share_of_S`) at grant time.
+        consumer_share: u64,
+        /// Pool-wide total leased bytes after this grant.
+        total_leased: u64,
+        /// Pool-wide lease limit (`total_floors + S`).
+        pool_limit: u64,
+    },
+    /// An existing lease changed size.
+    Resized {
+        /// Lease identifier.
+        lease_id: u64,
+        /// Consumer label.
+        consumer: String,
+        /// Connection associated with this lease, if any.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        peer: Option<u64>,
+        /// Bytes before resize.
+        old_bytes: u64,
+        /// Bytes after resize.
+        new_bytes: u64,
+        /// Consumer's total leased bytes after resize.
+        consumer_leased: u64,
+        /// Consumer's effective cap at resize time.
+        consumer_cap: u64,
+        /// Consumer's protected share at resize time.
+        consumer_share: u64,
+        /// Pool-wide total leased bytes after resize.
+        total_leased: u64,
+        /// Pool-wide lease limit.
+        pool_limit: u64,
+    },
+    /// Bytes moved atomically from one lease to a newly split child lease.
+    Split {
+        /// Source lease identifier.
+        from_lease_id: u64,
+        /// Newly created child lease identifier.
+        to_lease_id: u64,
+        /// Consumer label.
+        consumer: String,
+        /// Connection associated with the child lease, if any.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        peer: Option<u64>,
+        /// Bytes moved.
+        bytes: u64,
+    },
+    /// Two leases of the same consumer merged atomically.
+    Merged {
+        /// Surviving lease identifier.
+        into_lease_id: u64,
+        /// Consumed lease identifier.
+        from_lease_id: u64,
+        /// Consumer label.
+        consumer: String,
+        /// Connection associated with the surviving lease, if any.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        peer: Option<u64>,
+        /// Bytes moved.
+        bytes: u64,
+    },
+    /// Bytes moved atomically from one lease to a new lease of another
+    /// consumer. The target may end above its cap.
+    Moved {
+        /// Source lease identifier.
+        from_lease_id: u64,
+        /// Newly created lease identifier.
+        to_lease_id: u64,
+        /// Label of the consumer that gave the bytes.
+        from: String,
+        /// Label of the consumer that took the bytes.
+        to: String,
+        /// Connection associated with both leases, if any.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        peer: Option<u64>,
+        /// Bytes moved.
+        bytes: u64,
+        /// `from`'s total leased bytes after the move.
+        from_leased: u64,
+        /// `to`'s total leased bytes after the move.
+        to_leased: u64,
+        /// Pool-wide total leased bytes.
+        total_leased: u64,
+        /// Pool-wide lease limit.
+        pool_limit: u64,
+    },
+    /// A lease returned its bytes to the pool.
+    Released {
+        /// Lease identifier.
+        lease_id: u64,
+        /// Consumer label.
+        consumer: String,
+        /// Connection associated with this lease, if any.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        peer: Option<u64>,
+        /// Bytes returned.
+        bytes: u64,
+        /// Consumer's total leased bytes after release.
+        consumer_leased: u64,
+        /// Pool-wide total leased bytes after release.
+        total_leased: u64,
+        /// Pool-wide lease limit.
+        pool_limit: u64,
+    },
+    /// A block-sync lease named the block height it funds, or stopped
+    /// funding one.
+    Labeled {
+        /// Lease identifier.
+        lease_id: u64,
+        /// The height the lease funds. `None` marks a drain that a move left
+        /// on its consumer because the target had no room.
+        height: Option<u32>,
+    },
+    /// A consumer could not immediately acquire a lease.
+    Waited {
+        /// Consumer label.
+        consumer: String,
+        /// Connection associated with the attempt, if any.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        peer: Option<u64>,
+        /// Bytes requested.
+        requested_bytes: u64,
+        /// Which pool rule refused the request.
+        reason: String,
+    },
 }
 
 /// The events that block-sync tap `instance` logged in `observations`, in

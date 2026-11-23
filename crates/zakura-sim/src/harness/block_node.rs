@@ -841,6 +841,9 @@ pub struct BlockNode {
     /// Its block service and the service's replies, if the run completes
     /// its operations.
     controlled: Option<(Arc<ControlledBlockService>, Arc<LateHandle>)>,
+    /// The node's memory, kept alive for the node's lifetime so late
+    /// teardown drops still report through the pool observer.
+    _memory: Option<BlockSyncMemory>,
 }
 
 /// The handles to a node's block sync that the harness holds outside its
@@ -871,6 +874,24 @@ impl BlockNode {
         config: ZakuraBlockSyncConfig,
         observer: Option<Arc<dyn BlockSyncObserver>>,
     ) -> Self {
+        Self::spawn_with_memory(sim, name, seed, engine, storage, config, observer, None)
+    }
+
+    /// [`BlockNode::spawn`], funding block-sync requests, retained bodies
+    /// and serving output from `memory` (`02 §3–5`). The node's handler
+    /// shares `memory`'s serving pool, as zakurad's does. Without `memory`,
+    /// the node runs on a 16 GiB default node's plan.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_with_memory(
+        sim: &mut Sim,
+        name: &str,
+        seed: u8,
+        engine: &Arc<EnginePort>,
+        storage: NodeStorage,
+        config: ZakuraBlockSyncConfig,
+        observer: Option<Arc<dyn BlockSyncObserver>>,
+        memory: Option<BlockSyncMemory>,
+    ) -> Self {
         let view = engine.view();
         let frontiers = &view.frontiers;
         let mut startup = BlockSyncStartup::new_with_committed_views(
@@ -885,7 +906,7 @@ impl BlockNode {
                 .decoded_block_pool(10_000)
                 .expect("fixture decoded allowance fits"),
             config,
-            BlockSyncMemory::for_tests(),
+            memory.clone().unwrap_or_else(BlockSyncMemory::for_tests),
         );
         startup.max_checkpoint_height = Some(LAST_CHECKPOINT);
         startup.observer.0 = observer;
@@ -924,6 +945,7 @@ impl BlockNode {
                 handle,
             })),
             controlled,
+            _memory: memory,
         }
     }
 

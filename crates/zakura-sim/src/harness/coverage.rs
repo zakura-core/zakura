@@ -212,6 +212,10 @@ const fn header_unreachable(
 /// patch no longer applied or its input no longer reached the bug.
 const REMOVED_BY_2604: &str = "#2604 removed its planted case; #2639 re-evaluates it";
 
+/// The bypass of a memory-pool property: the memory budget PR adds no
+/// planted case for it.
+const NO_MEMORY_PLANTED_CASE: &str = "the memory budget PR adds no planted case; #1970 tracks one";
+
 /// The scripted bypass that violates every header-sync generated ID.
 const HEADER_BYPASS: Bypass = Bypass::Test(sim_test(
     HEADER_WITNESSES,
@@ -1450,24 +1454,13 @@ pub static COVERAGE: &[Coverage] = &[
         ),
         bypass: Bypass::Pending(REMOVED_BY_2604),
     },
-    // The stuck floor's witness test is ignored, since one debug run takes
-    // minutes. `cargo xtask planted` runs its seed unpatched as a
-    // witness test that expects a hold, before it runs the patch.
     Coverage {
         property: crate::domain::block_sync::RETAINED_BYTE_BOUND,
         passing: passes(
             "tests/block_resource_properties.rs",
             "honest_runs_hold_every_resource_bound_a_b_a",
         ),
-        bypass: Bypass::Planted("wide-commit-window"),
-    },
-    Coverage {
-        property: crate::domain::block_sync::RESERVED_BYTE_BOUND,
-        passing: passes(
-            "tests/block_resource_properties.rs",
-            "the_paused_handoffs_input_holds_reserved_byte_bound",
-        ),
-        bypass: Bypass::Planted("above-floor-charge"),
+        bypass: Bypass::Pending(NO_MEMORY_PLANTED_CASE),
     },
     Coverage {
         property: crate::domain::block_sync::BUDGET_LEDGERS_AGREE,
@@ -1477,25 +1470,37 @@ pub static COVERAGE: &[Coverage] = &[
         ),
         bypass: Bypass::Planted("handoff-keeps-charge"),
     },
-    // The above-window witness test is ignored, since one debug run takes
-    // over a minute, and runs only on demand. `cargo xtask planted` runs its
-    // committed input unpatched as a witness test that expects a hold, before
-    // it runs the patch.
     Coverage {
-        property: crate::domain::block_sync::LOOKAHEAD_OVERSHOOT_BOUND,
-        passing: Passing::Test(on_demand_test(
-            "tests/block_resource_properties.rs",
-            "the_above_window_input_holds_lookahead_overshoot_bound",
-        )),
-        bypass: Bypass::Planted("omit-outstanding-estimates"),
+        property: crate::domain::memory_pool::POOL_BOUNDED,
+        passing: passes(
+            "tests/memory_pool_gauge.rs",
+            "pool_gauge_bounds_and_teardown_hold_on_sync",
+        ),
+        bypass: Bypass::Pending(NO_MEMORY_PLANTED_CASE),
     },
     Coverage {
-        property: crate::domain::block_sync::TEARDOWN_RETURNS_BASELINE,
+        property: crate::domain::memory_pool::TEARDOWN_RETURNS_ZERO,
+        passing: passes(
+            "tests/memory_pool_gauge.rs",
+            "pool_teardown_returns_zero_after_peers_leave",
+        ),
+        bypass: Bypass::Pending(NO_MEMORY_PLANTED_CASE),
+    },
+    Coverage {
+        property: crate::domain::memory_pool::SESSIONS_WITHIN_SHARE,
+        passing: passes(
+            "tests/memory_pool_gauge.rs",
+            "sessions_stay_within_share_at_small_budget_with_mixed_reactors",
+        ),
+        bypass: Bypass::Pending(NO_MEMORY_PLANTED_CASE),
+    },
+    Coverage {
+        property: crate::domain::memory_pool::CONSENSUS_ONCE_PER_HEIGHT,
         passing: passes(
             "tests/block_resource_properties.rs",
-            "block_sync_teardown_returns_baseline",
+            "the_floor_churn_holds_the_pool_and_ledger_bounds",
         ),
-        bypass: Bypass::Planted("skip-return-on-drop"),
+        bypass: Bypass::Pending(NO_MEMORY_PLANTED_CASE),
     },
     Coverage {
         property: crate::domain::block_sync_semantic::SUBMIT_ONLY_REQUESTED,
@@ -1549,14 +1554,6 @@ pub static COVERAGE: &[Coverage] = &[
             "a_replaced_connection_reopens_every_service_under_fresh_ids",
         ),
         bypass: Bypass::Planted("stream-scoped-session-ids"),
-    },
-    Coverage {
-        property: crate::domain::cross::TEARDOWN_RETURNS_BASELINE,
-        passing: passes(
-            "tests/sync_properties.rs",
-            "teardown_across_held_work_returns_baseline",
-        ),
-        bypass: Bypass::Planted("leaked-reservation-entry"),
     },
     Coverage {
         property: crate::domain::session::STALLED_SERVICE_ISOLATED,

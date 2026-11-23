@@ -419,6 +419,7 @@ fn retiring_generations_count_against_the_node_across_reconnects() {
 /// A generation that outlives its admission slot breaks the bound. The reader reports
 /// that and refuses nothing.
 #[test]
+#[cfg(not(zakura_sim))]
 fn owners_beyond_the_admission_bound_are_visible_and_keep_running() {
     let node = node();
     let connection = connection(&node);
@@ -438,6 +439,33 @@ fn owners_beyond_the_admission_bound_are_visible_and_keep_running() {
         .collect();
     assert!(!bound().admits(&node.usage().owners));
     drop(handshakes);
+}
+
+/// Property conn-17: in the simulator, `report_usage` asserts when stream
+/// owners exceed `OwnerBound`.
+#[cfg(zakura_sim)]
+#[test]
+#[should_panic(expected = "Zakura owners exceed their admission bound")]
+fn report_usage_asserts_when_stream_owners_exceed_bound() {
+    let node = node();
+    let connection = connection(&node);
+    let _streams: Vec<_> = (0..=bound().streams)
+        .map(|_| stream(&connection, BLOCKS))
+        .collect();
+    let _ = node.report_usage(bound());
+}
+
+/// Property conn-17: in the simulator, `report_usage` asserts when handshake
+/// owners exceed `OwnerBound`.
+#[cfg(zakura_sim)]
+#[test]
+#[should_panic(expected = "Zakura owners exceed their admission bound")]
+fn report_usage_asserts_when_handshake_owners_exceed_bound() {
+    let node = node();
+    let _handshakes: Vec<_> = (0..=bound().handshakes)
+        .map(|_| node.owners().enter(OwnerPhase::Handshake))
+        .collect();
+    let _ = node.report_usage(bound());
 }
 
 /// One kind fills its raw and output gates on one connection. Every other kind on

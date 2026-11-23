@@ -407,18 +407,22 @@ impl NodeResources {
         }
     }
 
-    /// Count a breach of `bound` in [`Self::usage`], so reconnect churn that
-    /// outlives its admission slot stays visible.
+    /// Count a breach of `bound` in [`Self::usage`] (conn-17), so reconnect
+    /// churn that outlives its admission slot stays visible.
     ///
-    /// This only observes. It never refuses an owner, because a stuck worker that
-    /// outlived its drain timeout already holds what it holds. Connections call it
-    /// when they start and end. The endpoint's usage timer sets the byte gauges
-    /// with [`NodeUsage::record`].
+    /// Outside the simulator this only observes. It never refuses an owner,
+    /// because a stuck worker that outlived its drain timeout already holds
+    /// what it holds. The simulator's drain timeout can't be outlived, so
+    /// there a breach is a bug and panics. Connections call it when they
+    /// start and end. The endpoint's usage timer sets the byte gauges with
+    /// [`NodeUsage::record`].
     pub(crate) fn report_usage(&self, bound: OwnerBound) -> NodeUsage {
         let usage = self.usage();
         if !bound.admits(&usage.owners) {
             metrics::counter!("zakura.p2p.owners.over_bound").increment(1);
             debug!(?usage, ?bound, "Zakura owners exceed their admission bound");
+            #[cfg(zakura_sim)]
+            panic!("Zakura owners exceed their admission bound: usage={usage:?}, bound={bound:?}");
         }
         usage
     }
@@ -949,11 +953,12 @@ pub(crate) struct OwnerGuard {
 }
 
 impl OwnerGuard {
-    /// Move this owner to `phase`.
+    /// Move this owner to `phase`. It leaves its old phase first, so a
+    /// concurrent [`NodeResources::report_usage`] never counts it twice.
     pub(crate) fn advance(&self, phase: OwnerPhase) {
         let previous = self.phase.swap(phase as usize, Ordering::Relaxed);
-        self.ledger.add(phase);
         self.ledger.remove(owner_phase(previous));
+        self.ledger.add(phase);
         #[cfg(zakura_sim)]
         if let Some(owners) = &self.stream_owners {
             owners[previous].fetch_sub(1, Ordering::Relaxed);

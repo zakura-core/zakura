@@ -297,7 +297,10 @@ const fn layout_budget(layout: &[Stream], header_bytes: usize) -> ReactorBudget 
 /// it, and only a written page can be acknowledged. So the queued pages and
 /// the page in progress stay within one subscription's window. The window
 /// holds at most `credit.objects` pages, and the largest page covers their
-/// frame headers. Terminal outcomes and `Status` take no serve output.
+/// frame headers. `PublicationSlots` admits `2 × max_live` overlapping
+/// subscriptions per session (the 2× subscription margin, hsync-15), so the
+/// output share covers `2 × max_live` windows. Terminal outcomes and `Status`
+/// take no serve output.
 const fn serve_output_bytes(header_bytes: usize) -> u64 {
     let MessageRole::Subscription {
         max_live, credit, ..
@@ -311,7 +314,7 @@ const fn serve_output_bytes(header_bytes: usize) -> u64 {
         credit.objects as u64 * FRAME_HEADER_BYTES as u64 <= largest,
         "the largest page covers a window's frame headers"
     );
-    max_live as u64 * (credit.bytes as u64 + largest)
+    (max_live as u64 * 2) * (credit.bytes as u64 + largest)
 }
 
 /// Payload bytes of the `SubscribeHeaders` updates that a conformant

@@ -844,7 +844,8 @@ fn every_network_selects_the_layout_for_its_header_size() {
 /// subscription's byte credit plus its largest page, and the peer's
 /// unreleased updates: `credit.objects + credit.bytes / smallest page` grants
 /// and one `Close` at 107 bytes each, and one `Open` at 523 bytes. The output
-/// share is one subscription's byte credit plus its largest page.
+/// share covers `2 × max_live` overlapping subscriptions' byte credit plus
+/// largest page (hsync-15).
 #[test]
 fn every_budget_holds_its_terms() {
     let status = 602 * 122;
@@ -857,7 +858,7 @@ fn every_budget_holds_its_terms() {
         CommonMessage::BUDGET,
         ReactorBudget {
             receive: status + credit + 2_096_713 + 999_154,
-            output: credit + 2_096_713,
+            output: 2 * (credit + 2_096_713),
         }
     );
     assert_eq!(CommonMessage::BUDGET.receive, 11_557_919);
@@ -866,13 +867,13 @@ fn every_budget_holds_its_terms() {
         RegtestMessage::BUDGET,
         ReactorBudget {
             receive: status + credit + 1_348_082 + 3_841_395,
-            output: credit + 1_348_082,
+            output: 2 * (credit + 1_348_082),
         }
     );
     assert_eq!(RegtestMessage::BUDGET.receive, 13_651_529);
     assert_eq!(
         (CommonMessage::BUDGET.output, RegtestMessage::BUDGET.output),
-        (10_485_321, 9_736_690)
+        (20_970_642, 19_473_380)
     );
 
     /// Check `network`'s budget against the `HEADER_BYTES` family.

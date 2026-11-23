@@ -157,7 +157,7 @@ pub(crate) const HEADER_BYTES_BEFORE_SOLUTION: usize = Solution::INPUT_LENGTH + 
 
 /// The serialized size of a Mainnet or Testnet header, the largest on any
 /// network. Regtest headers are smaller, so a buffer of this size fits any header.
-pub(crate) const MAX_SERIALIZED_HEADER_BYTES: usize = HEADER_BYTES_BEFORE_SOLUTION
+pub const MAX_SERIALIZED_HEADER_BYTES: usize = HEADER_BYTES_BEFORE_SOLUTION
     // Cast safe: SOLUTION_SIZE is the constant 1344, which fits in u64.
     + CompactSize64::encoded_len(crate::work::equihash::SOLUTION_SIZE as u64)
     + crate::work::equihash::SOLUTION_SIZE;

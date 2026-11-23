@@ -586,6 +586,26 @@ async fn get_block_data(
     )
 }
 
+/// Returns the `nsmValueBalance` entry that verbose `getblock` reports for the Mainnet test block
+/// at `height`, with its stored balances and change from [`get_block_data`].
+fn expected_nsm_value_balance(
+    height: usize,
+    block_info: &Option<BlockInfo>,
+    delta: Option<ValueBalance<NegativeAllowed>>,
+) -> Option<GetBlockchainInfoBalance> {
+    block_info.as_ref().map(|d| {
+        GetBlockchainInfoBalance::nsm(
+            &Mainnet,
+            Height(height.try_into().expect("valid u32")),
+            d.value_pools()
+                .nsm_value_balance_amount()
+                .constrain()
+                .expect("the test blocks are before NU7, so their NSM value balance is zero"),
+            delta.map(|delta| delta.nsm_value_balance_amount()),
+        )
+    })
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn rpc_getblock() {
     let _init_guard = zakura_test::init();
@@ -729,6 +749,7 @@ async fn rpc_getblock() {
                 value_pools: block_info
                     .as_ref()
                     .map(|d| GetBlockchainInfoBalance::value_pools(*d.value_pools(), delta)),
+                nsm_value_balance: expected_nsm_value_balance(i, &block_info, delta),
             }))
         );
     }
@@ -784,6 +805,7 @@ async fn rpc_getblock() {
                 chain_supply: block_info
                     .as_ref()
                     .map(|d| GetBlockchainInfoBalance::chain_supply(*d.value_pools())),
+                nsm_value_balance: expected_nsm_value_balance(i, &block_info, delta),
                 value_pools: block_info
                     .map(|d| GetBlockchainInfoBalance::value_pools(*d.value_pools(), delta)),
             }))
@@ -831,6 +853,7 @@ async fn rpc_getblock() {
                 solution,
                 chain_supply,
                 value_pools,
+                nsm_value_balance,
             } = &**obj;
             assert_eq!(hash, &block.hash());
             assert_eq!(confirmations, &((blocks.len() - i) as i64));
@@ -862,6 +885,10 @@ async fn rpc_getblock() {
                 block_info
                     .as_ref()
                     .map(|d| GetBlockchainInfoBalance::chain_supply(*d.value_pools()))
+            );
+            assert_eq!(
+                *nsm_value_balance,
+                expected_nsm_value_balance(i, &block_info, delta)
             );
             assert_eq!(
                 *value_pools,
@@ -930,6 +957,7 @@ async fn rpc_getblock() {
                 solution,
                 chain_supply,
                 value_pools,
+                nsm_value_balance,
             } = &**obj;
             assert_eq!(hash, &block.hash());
             assert_eq!(confirmations, &((blocks.len() - i) as i64));
@@ -961,6 +989,10 @@ async fn rpc_getblock() {
                 block_info
                     .as_ref()
                     .map(|d| GetBlockchainInfoBalance::chain_supply(*d.value_pools()))
+            );
+            assert_eq!(
+                *nsm_value_balance,
+                expected_nsm_value_balance(i, &block_info, delta)
             );
             assert_eq!(
                 *value_pools,
@@ -1039,6 +1071,7 @@ async fn rpc_getblock() {
                 chain_supply: block_info
                     .as_ref()
                     .map(|d| GetBlockchainInfoBalance::chain_supply(*d.value_pools())),
+                nsm_value_balance: expected_nsm_value_balance(i, &block_info, delta),
                 value_pools: block_info
                     .map(|d| GetBlockchainInfoBalance::value_pools(*d.value_pools(), delta)),
             }))
@@ -1096,6 +1129,7 @@ async fn rpc_getblock() {
                 chain_supply: block_info
                     .as_ref()
                     .map(|d| GetBlockchainInfoBalance::chain_supply(*d.value_pools())),
+                nsm_value_balance: expected_nsm_value_balance(i, &block_info, delta),
                 value_pools: block_info
                     .map(|d| GetBlockchainInfoBalance::value_pools(*d.value_pools(), delta)),
             }))
@@ -1539,6 +1573,174 @@ async fn rpc_getblock_serves_pre_activation_empty_trees() {
 
     read_state.expect_no_requests().await;
     assert!(rpc_tx_queue.now_or_never().is_none());
+}
+
+/// Returns block balances with an NSM value balance of `nsm_zat` zatoshis.
+fn block_info_with_nsm(nsm_zat: i64) -> BlockInfo {
+    let mut value_pools = ValueBalance::zero();
+    value_pools.set_nsm_value_balance_amount(Amount::try_from(nsm_zat).expect("valid amount"));
+    BlockInfo::new(value_pools, 0)
+}
+
+/// Calls verbose `getblock` for `block` on Mainnet, with a mock state that reports it at `height`
+/// in the best chain, and the parent and block balances as `prev_block_info` and `block_info`.
+async fn getblock_with_block_info(
+    block: Arc<Block>,
+    height: Height,
+    prev_block_info: Option<BlockInfo>,
+    block_info: BlockInfo,
+) -> BlockObject {
+    let hash = block.hash();
+    let tx_hashes = block
+        .transactions
+        .iter()
+        .map(|transaction| transaction.hash())
+        .collect::<Vec<_>>();
+
+    let mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (rpc, _rpc_tx_queue) = mock_rpc(
+        Mainnet,
+        Buffer::new(mempool, 1),
+        Buffer::new(state, 1),
+        Buffer::new(read_state.clone(), 8),
+        NoChainTip,
+        rx,
+    );
+
+    let block_future = tokio::spawn(async move { rpc.get_block(hash.to_string(), Some(1)).await });
+
+    read_state
+        .expect_request(ReadRequest::BlockHeader(hash.into()))
+        .await
+        .respond(ReadResponse::BlockHeader {
+            header: HeaderHandle::Shared(block.header.clone()),
+            hash,
+            height,
+            next_block_hash: None,
+        });
+    read_state
+        .expect_request(ReadRequest::SaplingTree(hash.into()))
+        .await
+        .respond(ReadResponse::SaplingTree(Some(Arc::new(
+            zakura_chain::sapling::tree::NoteCommitmentTree::default(),
+        ))));
+    read_state
+        .expect_request(ReadRequest::Depth(hash))
+        .await
+        .respond(ReadResponse::Depth(Some(0)));
+    read_state
+        .expect_request(ReadRequest::TransactionIdsForBlock(hash.into()))
+        .await
+        .respond(ReadResponse::TransactionIdsForBlock(Some(Arc::from(
+            tx_hashes.into_boxed_slice(),
+        ))));
+    read_state
+        .expect_request(ReadRequest::OrchardTree(hash.into()))
+        .await
+        .respond(ReadResponse::OrchardTree(Some(Arc::new(
+            zakura_chain::orchard::tree::NoteCommitmentTree::default(),
+        ))));
+    if NetworkUpgrade::Nu6_3
+        .activation_height(&Mainnet)
+        .is_some_and(|activation_height| height >= activation_height)
+    {
+        read_state
+            .expect_request(ReadRequest::IronwoodTree(hash.into()))
+            .await
+            .respond(ReadResponse::IronwoodTree(Some(Arc::new(
+                zakura_chain::ironwood::tree::NoteCommitmentTree::default(),
+            ))));
+    }
+    read_state
+        .expect_request(ReadRequest::BlockInfo(
+            block.header.previous_block_hash.into(),
+        ))
+        .await
+        .respond(ReadResponse::BlockInfo(prev_block_info));
+    read_state
+        .expect_request(ReadRequest::BlockInfo(hash.into()))
+        .await
+        .respond(ReadResponse::BlockInfo(Some(block_info)));
+
+    let response = block_future
+        .await
+        .expect("getblock future should not panic")
+        .expect("getblock should succeed");
+    let GetBlockResponse::Object(block_object) = response else {
+        panic!("verbosity 1 returns a block object");
+    };
+    *block_object
+}
+
+/// The NSM value balance is monitored from the block before NU7 activation, also when it is zero.
+#[test]
+fn nsm_value_balance_is_monitored_from_the_block_before_nu7_activation() {
+    let nu7 = NetworkUpgrade::Nu7
+        .activation_height(&Mainnet)
+        .expect("NU7 is scheduled");
+    let monitored = |height: Height| {
+        GetBlockchainInfoBalance::nsm(&Mainnet, height, Amount::zero(), None).monitored()
+    };
+
+    assert!(!monitored((nu7 - 2).expect("valid height")));
+    assert!(monitored((nu7 - 1).expect("valid height")));
+    assert!(monitored(nu7));
+}
+
+/// Verbose `getblock` reports the NSM value balance and the block's change to it, and omits the
+/// change when the parent's balances are missing.
+#[tokio::test(flavor = "multi_thread")]
+async fn rpc_getblock_reports_nsm_value_balance_changes() {
+    let _init_guard = zakura_test::init();
+
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let nu7 = NetworkUpgrade::Nu7
+        .activation_height(&Mainnet)
+        .expect("NU7 is scheduled");
+    let initial = 36_858_445_520;
+
+    // (height, parent NSM, block NSM, expected change), in zatoshis.
+    let cases = [
+        // ZIP 237 sets the balance after the block before NU7 activation to the initial balance.
+        (
+            (nu7 - 1).expect("valid height"),
+            Some(0),
+            initial,
+            Some(initial),
+        ),
+        // The NU7 activation block's change is its own, not the initial balance.
+        (nu7, Some(initial), initial - 12_500_000, Some(-12_500_000)),
+        // A parent missing after a reorg leaves the change unknown.
+        (Height(1), None, 200, None),
+    ];
+
+    for (height, parent_nsm, nsm, change) in cases {
+        let obj = getblock_with_block_info(
+            block.clone(),
+            height,
+            parent_nsm.map(block_info_with_nsm),
+            block_info_with_nsm(nsm),
+        )
+        .await;
+
+        let nsm_balance = obj
+            .nsm_value_balance()
+            .as_ref()
+            .expect("has the NSM balance");
+        assert_eq!(nsm_balance.chain_value_zat().zatoshis(), nsm);
+        assert_eq!(nsm_balance.value_delta_zat().map(|d| d.zatoshis()), change);
+        assert!(obj
+            .value_pools()
+            .as_ref()
+            .expect("has value pools")
+            .iter()
+            .all(|pool| pool.value_delta_zat().is_none() == change.is_none()));
+    }
 }
 
 /// Verbose `getblock` must preserve the typed Orchard-tree error from state.

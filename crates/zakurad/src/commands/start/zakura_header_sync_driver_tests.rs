@@ -259,6 +259,7 @@ async fn durable_header_sync_restart_requests_only_missing_suffix() {
             header_chain_authority,
             &network,
             &coordinator,
+            Default::default(),
         )
         .await
         .expect("the first durable header driver starts");
@@ -346,6 +347,7 @@ async fn durable_header_sync_restart_requests_only_missing_suffix() {
             header_chain_authority,
             &network,
             &coordinator,
+            Default::default(),
         )
         .await
         .expect("the restarted durable header driver starts");

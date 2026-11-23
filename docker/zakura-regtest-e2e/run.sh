@@ -1109,10 +1109,14 @@ quiesce_optional_node4_before_extended_work() {
   if ! awk "BEGIN{exit !(${connections_before} == 2)}"; then
     fail "node1 expected exactly node2 and node4 before optional-peer quiescence, found ${connections_before} active Zakura peers"
   fi
+  # Regtest discovery can establish either connection direction. Remember the
+  # actual sessions so the disconnect must retire one and leave the other.
   active_sessions_before=$(jq -sc '
-    ([.[] | select(.event == "header_peer_connected") | .session_id]
-      - [.[] | select(.event == "header_peer_disconnected") | .session_id])
-    | unique
+    [.[] | select(.event == "header_peer_disconnected") | .session_id] as $closed
+    | [.[] | select(.event == "header_peer_connected")
+        | select(.session_id as $id | ($closed | index($id)) == null)
+        | {session_id, direction}]
+    | unique_by(.session_id)
   ' "${header_file}") \
     || fail "could not read node1 active header sessions before stopping node4"
   [[ "$(printf '%s' "${active_sessions_before}" | jq -r 'length')" == "2" ]] \
@@ -1134,15 +1138,17 @@ quiesce_optional_node4_before_extended_work() {
       printf '%s' "${last}" \
         | jq -e --argjson active "${active_sessions_before}" '
             .session_id as $session
+            | .direction as $direction
+            | ($active | map(select(.session_id != $session))) as $remaining
             | ($session | type == "number")
-              and ($active | index($session) != null)
-              and (.direction == "inbound")
-              and (.inbound_count == 1)
-              and (.outbound_count == 0)
+              and ($direction == "inbound" or $direction == "outbound")
+              and any($active[]; .session_id == $session and .direction == $direction)
+              and (.inbound_count == ($remaining | map(select(.direction == "inbound")) | length))
+              and (.outbound_count == ($remaining | map(select(.direction == "outbound")) | length))
               and ((.reason | strings | length) > 0)
           ' \
           >/dev/null \
-        || fail "node1 post-node4 disconnect trace boundary does not retire one of the two pre-stop inbound sessions"
+        || fail "node1 post-node4 disconnect trace boundary does not retire one of the two pre-stop sessions"
       node2_connections=$(metric 19002 zakura_p2p_conn_active)
       if ! awk "BEGIN{exit !(${node2_connections} >= 1)}"; then
         fail "node2 was not connected after node1 retired the stopped node4 session"

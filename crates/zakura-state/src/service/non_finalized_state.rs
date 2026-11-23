@@ -1231,6 +1231,15 @@ impl NonFinalizedState {
             .any(|chain| chain.height_by_hash.contains_key(hash))
     }
 
+    /// Returns the committed body on any retained non-finalized branch.
+    pub fn block_by_hash(
+        &self,
+        hash: block::Hash,
+    ) -> Option<zakura_node_services::block_memory::BlockHandle> {
+        self.chain_iter()
+            .find_map(|chain| chain.block(hash.into()).map(|block| block.block.clone()))
+    }
+
     /// Returns the first chain satisfying the given predicate.
     ///
     /// If multiple chains satisfy the predicate, returns the chain with the highest difficulty.

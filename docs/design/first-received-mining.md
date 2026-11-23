@@ -48,15 +48,15 @@ The reservation is called a claim. Five rules define it:
   once the highest verified tip passes the body's height. On a node
   without native header sync, the best chain tip at `inv` time stands in for
   the verified tip.
-- **Each block keeps its first claim of each kind, and neither is renewed.** A
-  header claim, once made, is never replaced or renewed by delivering the
-  header again. An accepted header ignores later `inv`s. While a header apply
-  is pending, the first later `inv` is saved with its original order, time and
-  observed tip. It becomes usable if every apply fails and is discarded if
-  any succeeds. Repeated `inv`s keep the original record. Reading a claim
-  does not use it up, so an invalid body under the same hash cannot take it. A body whose block holds
-  both takes the earlier order among those still in force, so an `inv` never
-  makes the outcome worse than the header claim alone.
+- **A recorded claim keeps its original order and deadline.** Delivering an
+  accepted header again leaves its claim in place. An accepted header ignores
+  later `inv`s. While a header apply is pending, the first later `inv` is saved
+  with its original order, time and observed tip. It becomes usable if every
+  apply fails and is discarded if any succeeds. Repeated `inv`s keep the
+  original announcement while its entry is retained. Reading a claim does not
+  use it up, so an invalid body under the same hash cannot take it. If a block
+  has both kinds of claim, its body takes the earlier order among those still in
+  force, so an `inv` never makes the outcome worse than the header claim alone.
 
   The header table holds 64 claims. When it is full it refuses new claims and
   never drops old ones. A claim is removed when no apply covering it
@@ -72,9 +72,9 @@ The reservation is called a claim. Five rules define it:
   Each legacy connection passes at most 4 `inv`s per 2 seconds to the store,
   leaving room for both blocks in a tip race and for repeated or bunched
   announcements. One connection cannot fill the store. A sustained flood can
-  at worst return blocks to arrival order. An announcement after its entry was
-  dropped counts as a new sighting, which gives a withholder nothing it could
-  not get by announcing late.
+  at worst return blocks to arrival order. An `inv` received after its entry was
+  pruned can reserve a fresh place with a new deadline. A rival that already
+  holds a usable claim keeps its earlier place.
 - **The body has a deadline.** It is `CLAIM_BODY_DEADLINE`, a flat 2 seconds
   for every block, whatever its size. A body that arrives later draws a fresh
   order, as if its header had never been seen.
@@ -100,11 +100,11 @@ the rule is the same on every path and the latency is not.
 The deadline is what keeps the rule safe. A miner can announce a real header
 and withhold its body. With no bound, that miner would win every equal-work
 tie against blocks found while it withheld, which makes withholding profitable
-at any hashrate. Because a claim belongs to the block and not to a delivery
-attempt, a failed download or a repeated announcement does not restart the
-deadline. Inside the deadline, withholding is indistinguishable from slow
-honest delivery, so the deadline is both the delay forgiven for honest blocks
-and the most a withholder can gain.
+at any hashrate. A failed download or a repeated announcement while the claim's
+entry is retained leaves its deadline in place. To inherit a place, the body
+must arrive within two seconds of the announcement that reserved it. Inside
+that deadline, withholding is indistinguishable from slow honest delivery, so
+the deadline limits how long a miner can hold back the body and keep that place.
 
 Inside the deadline that gain carries little risk. Under arrival order, a
 miner that sat on a body could lose the tie to any block found meanwhile. With
@@ -114,12 +114,12 @@ block. Two seconds is 8% of the 25 second target block interval. Bodies that
 bunch just under the deadline in the claim-age histogram would show this in
 use.
 
-The clock starts at the first announcement from any peer, not only from the
-block's miner. A peer that learns a block's hash can announce it to a node
-before the body can get there. If the body then takes longer than the
-deadline, the claim expires and the block is ranked by arrival, as it would be
-without a claim. A claim can therefore be used up by a third party, but a
-block is never ranked later than its body's arrival.
+Each claim's clock starts when the node records the announcement, regardless of
+which peer sent it. A peer that learns a block's hash can announce it to a node
+before the body can get there. If the body then takes longer than the deadline,
+that claim expires. A block with no usable claim is ranked by its body's arrival.
+A claim can therefore be used up by a third party, but a block is never ranked
+later than its body's arrival.
 
 The deadline is the same for every block size, because scaling it with size
 does not lower that bound. Under a deadline that grows with size up to a cap,

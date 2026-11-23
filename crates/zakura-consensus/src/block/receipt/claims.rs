@@ -148,8 +148,9 @@ impl ClaimTable {
 ///
 /// Header sync creates claims with [`AnnouncementClaims::begin`], legacy block `inv`s with
 /// [`AnnouncementClaims::note_announcement`], and the block verifier reads them by block hash,
-/// so every body transport follows the same rule. A claim, once made, is never replaced or
-/// renewed.
+/// so every body transport follows the same rule. An accepted header claim keeps its original
+/// order and deadline. Repeated `inv`s keep the original announcement while its entry is
+/// retained. After that entry is pruned, a new `inv` can claim a fresh place.
 #[derive(Clone, Debug, Default)]
 pub struct AnnouncementClaims(Arc<Mutex<ClaimTable>>);
 

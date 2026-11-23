@@ -31,7 +31,8 @@ use crate::zakura::{GatewayStanding, RankedGateway, MAX_RANKED_GATEWAYS};
 /// for the connection-slot checks.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MinerGatewayRanking {
-    /// Every gateway named in the counted blocks.
+    /// The gateways named in enough counted blocks for the node to prefer
+    /// them.
     pub gateways: Vec<MinerGateway>,
 }
 

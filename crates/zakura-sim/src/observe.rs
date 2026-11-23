@@ -2130,16 +2130,17 @@ pub enum TransportFact {
         /// The enabled mask after the change.
         supported: u64,
     },
-    /// Admission machine charges and independently read semaphore usage.
+    /// Admission machine charges, its per-node connection slots, and
+    /// independently read handshake semaphore usage.
     HandshakeCounts {
         /// Connection slots charged by the machine.
         connections: usize,
         /// Inbound connection slots charged by the machine.
         inbound_connections: usize,
-        /// Live total connection permits.
-        connection_permits: usize,
-        /// Live inbound connection permits.
-        inbound_connection_permits: usize,
+        /// Connection slots summed over the machine's per-node record.
+        node_connections: usize,
+        /// Inbound connection slots summed over the machine's per-node record.
+        inbound_node_connections: usize,
         /// Total connection capacity.
         connection_cap: usize,
         /// The configured registered-connection limit per address.

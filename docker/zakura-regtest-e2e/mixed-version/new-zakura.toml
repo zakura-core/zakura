@@ -1,0 +1,44 @@
+# Zakura mixed-version e2e: NEW v2-only node (the binary under test).
+#
+# Joins only by dialing new-dual natively over p2p-v2/4. Blocks mined on an old
+# node reach it only through new-dual's legacy link to the old cohort.
+
+[network]
+network = "Regtest"
+# Inert under the zakura-only stack, but the field is required.
+listen_addr = "127.0.0.1:28533"
+p2p_stack = "zakura"
+cache_dir = false
+initial_testnet_peers = []
+max_connections_per_ip = 10
+# Log real peer addresses, so the harness can tell which connection a peer-set
+# disconnect line names.
+expose_peer_addresses = true
+zakura_node_secret_key = "4444444444444444444444444444444444444444444444444444444444444444"
+
+[network.zakura]
+listen_addr = "127.0.0.1:28534"
+# The harness replaces the placeholder with new-dual's logged node ID.
+bootstrap_peers = [
+  "NEW_DUAL_NODE_ID@127.0.0.1:28434",
+]
+
+[state]
+ephemeral = true
+
+[rpc]
+listen_addr = "127.0.0.1:28532"
+enable_cookie_auth = false
+
+[metrics]
+endpoint_addr = "127.0.0.1:29004"
+
+[mining]
+internal_miner = false
+# Regtest uses testnet address encoding; needed so `generate` can build coinbases.
+miner_address = "tmJymvcUCn1ctbghvTJpXBwHiMEB8P6wxNV"
+
+[tracing]
+# Plain logs keep the harness greps free of ANSI escapes.
+use_color = false
+filter = "info,zakura_network::zakura=debug"

@@ -6,7 +6,7 @@
 //! comments cite requirement IDs such as `ADM-3`.
 //!
 //! The crate provides:
-//! - node identity types ([`NodeId`], [`NodeSecretKey`], [`NodeAddr`]);
+//! - node identity types ([`NodeId`], [`NodeKey`], [`NodeSecretKey`], [`NodeAddr`]);
 //! - the TLS raw-public-key profile Iroh 1.1 uses;
 //! - [`QuicEndpoint`], which binds UDP sockets, admits connection attempts
 //!   before the handshake, dials, and shuts down in order;
@@ -16,10 +16,28 @@
 //! connection task owns each `quinn_proto::Connection`. Handles reach them only
 //! through ordered message channels, so no lock guards a QUIC state machine.
 
+mod composite;
+mod credential;
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub mod fuzz;
 mod key;
+mod key_list;
 mod tls;
 
-pub use key::{KeyParsingError, NodeAddr, NodeId, NodeSecretKey, SignatureError, KEY_LENGTH};
+pub use composite::{
+    COMPOSITE_SIGNATURE_BYTES, ML_DSA_44_KEY_BYTES, ML_DSA_44_KEY_TAG, ML_DSA_44_SIGNATURE_BYTES,
+};
+pub use credential::{
+    CredentialError, NodeCredential, MAX_CREDENTIAL_BYTES, MAX_CREDENTIAL_KEY_BYTES,
+};
+pub use key::{
+    ForeignKeyList, KeyParsingError, NodeAddr, NodeId, NodeKey, NodeSecretKey, SignatureError,
+    KEY_LENGTH,
+};
+pub use key_list::{
+    KeyListError, NodeKeyList, ED25519_KEY_TAG, MAX_NODE_KEYS, MAX_NODE_KEY_LIST_BYTES,
+    MIN_NODE_KEY_LIST_BYTES, NODE_KEY_ENTRY_BYTES,
+};
 pub use tls::TlsConfigError;
 
 mod config;

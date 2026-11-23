@@ -304,6 +304,7 @@ fn transactions_waiting_after_a_reset_count_against_the_cost_limit() {
         Limits {
             pending: 5,
             readmitting: 1,
+            relayed: 5,
         },
     );
     bench.admit(&txs[0]);
@@ -338,6 +339,7 @@ fn a_block_that_mines_a_waiting_transaction_takes_it_out_of_the_queue() {
         Limits {
             pending: 5,
             readmitting: 1,
+            relayed: 5,
         },
     );
     bench.admit(&txs[0]);
@@ -366,6 +368,7 @@ fn an_authorization_admitted_first_takes_the_place_of_the_one_waiting() {
         Limits {
             pending: 5,
             readmitting: 1,
+            relayed: 5,
         },
     );
     let (waiter, job) = bench.start(&other);
@@ -463,6 +466,7 @@ fn five_slots() -> Bench {
         Limits {
             pending: 5,
             readmitting: 4,
+            relayed: 5,
         },
     )
 }
@@ -547,6 +551,7 @@ fn the_ids_a_reservation_would_refuse_are_known() {
         Limits {
             pending: 1,
             readmitting: 1,
+            relayed: 1,
         },
     );
     let mut bench = readmitting;
@@ -1320,6 +1325,37 @@ fn a_block_removes_a_pooled_transaction_that_conflicts_with_one_never_pooled() {
         ]
     );
     assert!(bench.machine.pooled_ids().is_empty());
+}
+
+/// A block logs what it mined, then the undecided transactions it mined,
+/// then what conflicts with it, as today.
+#[test]
+fn a_block_logs_mined_then_ended_admissions_then_conflicts() {
+    let mut runner = TestRunner::deterministic();
+    let mined = build(&mut runner, &[], 1, None);
+    let undecided = build(&mut runner, &[], 1, None);
+    let conflicting = build(&mut runner, &[coin(0xe3)], 1, None);
+    let rival = build(&mut runner, &[coin(0xe3)], 1, None);
+    let mut bench = Bench::new();
+    bench.admit(&mined);
+    bench.admit(&conflicting);
+    bench.start(&undecided);
+
+    let step = bench.grow(&[&mined, &undecided, &rival]);
+    assert_eq!(
+        step.changes,
+        vec![
+            Change::Removed {
+                id: mined.id(),
+                reason: RemovalReason::Mined
+            },
+            Change::Refused(undecided.id()),
+            Change::Removed {
+                id: conflicting.id(),
+                reason: RemovalReason::Conflicted
+            },
+        ]
+    );
 }
 
 /// A mined parent leaves its child in the pool: the child's input is on the

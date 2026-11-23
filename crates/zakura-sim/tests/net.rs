@@ -254,8 +254,8 @@ fn echo_runs_under_sim() {
         let (first, outcome, retries) = echo(plan.clone());
         assert_eq!(outcome, "echoed", "{:?}", first.end);
         assert_eq!(
-            retries, 1,
-            "the server answered the first Initial with a Retry"
+            retries, 2,
+            "the hello spans two Initial datagrams and the server answered each with a Retry"
         );
         assert_eq!(
             first.end.outcome,

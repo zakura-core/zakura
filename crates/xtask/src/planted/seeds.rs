@@ -1,10 +1,11 @@
-//! The simulator's seed registry, as a built `zakura-sim` lists it.
+//! The QA store's seeds, as a built `zakura-sim` lists them.
 //!
 //! A planted case or a mutation-loop witness names a seed by name. The
-//! registry, `zakura_sim::seed`, builds each seed's input in code and names
-//! its harness. xtask can't link `zakura-sim`, which builds only with the
-//! simulator's flag, so [`Registry::read`] runs a built `zakura-sim seeds
-//! --report` once per set and reads the rows.
+//! seeds live in the QA store's `seeds/` directory, which names each seed's
+//! harness and holds its input. xtask can't link `zakura-sim`, which builds
+//! only with the simulator's flag, so [`Registry::read`] runs a built
+//! `zakura-sim seeds --report` once per set, which reads the store that
+//! `ZAKURA_QA_STORE` names, and reads the rows.
 
 use std::{
     collections::BTreeMap,
@@ -19,9 +20,14 @@ use sha2::{Digest, Sha256};
 use super::{cargo_sim, pilot::hex, PROFILE};
 use crate::{run_command, BoxError};
 
-/// The registry's source, relative to the repository root: the files a
+/// The store's seed directory, relative to the store's root: the files a
 /// seed's input comes from.
-pub(super) const REGISTRY: &str = "crates/zakura-sim/src/seed";
+pub(super) const REGISTRY: &str = "seeds";
+
+/// Seed `name`'s input, relative to the store's root.
+pub(super) fn input_path(name: &str) -> PathBuf {
+    Path::new(REGISTRY).join(format!("{name}.bin"))
+}
 
 /// Every seed set, as `zakura-sim seeds --set` takes it.
 const SETS: [&str; 3] = ["corpus", "known-failure", "slow"];
@@ -106,7 +112,7 @@ impl Registry {
         let seed = self
             .seeds
             .get(name)
-            .ok_or_else(|| format!("no seed is named `{name}` in {REGISTRY}"))?;
+            .ok_or_else(|| format!("no seed is named `{name}` in the QA store's {REGISTRY}"))?;
         if seed.status != "admitted" {
             return Err(format!(
                 "the seed {name} fails validation: {}",

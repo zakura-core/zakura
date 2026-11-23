@@ -4,11 +4,14 @@
 //! Copyright 2025 N0, INC. Licensed under MIT OR Apache-2.0.
 //!
 //! Every rustls config in this crate comes from this module (TLS-11). The
-//! profile matches Iroh 1.1 on the wire: TLS 1.3 only, RFC 7250 raw public keys
-//! in both directions, Ed25519 only, mandatory client authentication and no
-//! SNI. It differs from Iroh in two local choices that don't change what a peer
-//! sees on a full handshake: the server refuses 0-RTT and issues no session
-//! tickets, and the client never resumes (TLS-10).
+//! profile started as Iroh 1.1's: TLS 1.3 only, RFC 7250 raw public keys in
+//! both directions, mandatory client authentication and no SNI. It differs
+//! from Iroh on the wire in two ways: the raw public key is the node's
+//! credential, its full key list (TLS-3), and the only key-exchange group is
+//! the hybrid X25519MLKEM768 (TLS-9). It also differs in two local choices
+//! that don't change what a peer sees on a full handshake: the server refuses
+//! 0-RTT and issues no session tickets, and the client never resumes
+//! (TLS-10).
 
 use std::{
     sync::Arc,
@@ -16,13 +19,20 @@ use std::{
 };
 
 use quinn_proto::crypto::rustls::{QuicClientConfig, QuicServerConfig};
-use rustls_pki_types::{alg_id, SubjectPublicKeyInfoDer, UnixTime};
+#[cfg(test)]
+use rustls_pki_types::SubjectPublicKeyInfoDer;
+use rustls_pki_types::UnixTime;
 
+#[cfg(test)]
+use crate::key::NodeKey;
 use crate::{
+    credential::NodeCredential,
     inputs::EndpointInputs,
-    key::{NodeId, NodeSecretKey, KEY_LENGTH},
+    key::{NodeId, NodeSecretKey},
 };
 
+pub(crate) mod hybrid;
+mod mlkem;
 pub(crate) mod resolver;
 pub(crate) mod verifier;
 
@@ -76,7 +86,7 @@ pub(crate) struct TlsConfig {
 
 impl TlsConfig {
     pub(crate) fn new(secret_key: &NodeSecretKey) -> Self {
-        Self::with_provider(secret_key, rustls::crypto::ring::default_provider())
+        Self::with_provider(secret_key, production_provider())
     }
 
     /// TLS state whose provider takes its random source and key-exchange
@@ -95,8 +105,9 @@ impl TlsConfig {
         if random.is_none() && groups.is_none() {
             return Ok(Self::new(secret_key));
         }
-        // TLS-9: everything but these two fields stays ring's default.
-        let mut provider = rustls::crypto::ring::default_provider();
+        // TLS-9: everything but these two fields stays the production
+        // provider's.
+        let mut provider = production_provider();
         if let Some(random) = random {
             provider.secure_random = random;
         }
@@ -125,17 +136,19 @@ impl TlsConfig {
 
     fn with_provider(secret_key: &NodeSecretKey, provider: rustls::crypto::CryptoProvider) -> Self {
         Self {
-            cert_resolver: Arc::new(resolver::ResolveRawPublicKeyCert::new(secret_key)),
+            cert_resolver: Arc::new(resolver::ResolveRawPublicKeyCert::new(
+                secret_key,
+                provider.secure_random,
+            )),
             client_verifier: Arc::new(verifier::ClientCertificateVerifier),
-            // TLS-9: rustls' ring provider with its default TLS 1.3 suites.
             provider: Arc::new(provider),
         }
     }
 
-    /// Whether the provider is rustls' ring default, field for field.
+    /// Whether the provider is the production one, field for field.
     #[cfg(test)]
-    pub(crate) fn uses_default_provider(&self) -> bool {
-        format!("{:?}", self.provider) == format!("{:?}", rustls::crypto::ring::default_provider())
+    pub(crate) fn uses_production_provider(&self) -> bool {
+        format!("{:?}", self.provider) == format!("{:?}", production_provider())
     }
 
     /// Builds the server config, offering `alpns` in the given order (WIRE-2).
@@ -159,8 +172,9 @@ impl TlsConfig {
         Ok(crypto)
     }
 
-    /// Builds a client config that accepts only `expected` as the server
-    /// (TLS-7) and offers `alpns` in preference order.
+    /// Builds a client config that accepts only a server whose credential
+    /// derives the node ID `expected` (TLS-7), and offers `alpns` in
+    /// preference order.
     pub(crate) fn client_config(
         &self,
         expected: NodeId,
@@ -192,29 +206,47 @@ impl TlsConfig {
     }
 }
 
-/// The DER SubjectPublicKeyInfo for an Ed25519 key, as Iroh encodes it (TLS-3).
-pub(crate) fn ed25519_spki(key: &NodeId) -> SubjectPublicKeyInfoDer<'static> {
-    rustls::sign::public_key_to_spki(&alg_id::ED25519, key.as_bytes())
-}
-
-/// Extracts the node ID from an Ed25519 SubjectPublicKeyInfo.
+/// The crypto provider of an endpoint with no injected inputs (TLS-9):
+/// rustls' ring provider whose only key-exchange group is the hybrid
+/// X25519MLKEM768.
 ///
-/// Returns `None` unless `spki` is exactly the constant Ed25519 prefix
-/// followed by a valid 32-byte key.
-pub(crate) fn node_id_from_spki(spki: &[u8]) -> Option<NodeId> {
-    let key = spki.get(spki.len().checked_sub(KEY_LENGTH)?..)?;
-    let id = NodeId::try_from(key).ok()?;
-    (ed25519_spki(&id).as_ref() == spki).then_some(id)
+/// Every `p2p-v2/4` node offers the hybrid, so a classical fallback would
+/// protect no connection. A peer that offers only classical groups fails the
+/// handshake.
+pub(crate) fn production_provider() -> rustls::crypto::CryptoProvider {
+    let mut provider = rustls::crypto::ring::default_provider();
+    provider.kx_groups = vec![hybrid::x25519_mlkem768()];
+    provider
 }
 
-/// Returns the TLS-proven node ID of a connection's peer (TLS-8).
-pub(crate) fn remote_node_id(session: &dyn quinn_proto::crypto::Session) -> Option<NodeId> {
+/// The DER SubjectPublicKeyInfo for a bare Ed25519 key, as Iroh encoded its
+/// raw public keys. Zakura no longer presents one; tests use it as a
+/// certificate that is not a credential.
+#[cfg(test)]
+pub(crate) fn ed25519_spki(key: &NodeKey) -> SubjectPublicKeyInfoDer<'static> {
+    rustls::sign::public_key_to_spki(&rustls_pki_types::alg_id::ED25519, key.as_bytes())
+}
+
+/// Reads the credential a TLS certificate carries (TLS-3, TLS-8).
+///
+/// This is the one place a certificate becomes a credential, and so a node
+/// ID: the client verifier compares that ID with the dialed one, and both
+/// endpoints report it as the peer's ID.
+pub(crate) fn credential_from_cert(cert: &[u8]) -> Option<NodeCredential> {
+    NodeCredential::from_spki(cert).ok()
+}
+
+/// Returns the credential a connection's peer proved in the TLS handshake
+/// (TLS-8).
+pub(crate) fn remote_credential(
+    session: &dyn quinn_proto::crypto::Session,
+) -> Option<NodeCredential> {
     let certs = session
         .peer_identity()?
         .downcast::<Vec<rustls_pki_types::CertificateDer<'static>>>()
         .ok()?;
     match certs.as_slice() {
-        [cert] => node_id_from_spki(cert.as_ref()),
+        [cert] => credential_from_cert(cert.as_ref()),
         _ => None,
     }
 }
@@ -250,28 +282,6 @@ pub(crate) fn negotiated_alpn(session: &dyn quinn_proto::crypto::Session) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn spki_matches_iroh_encoding() {
-        let id = NodeSecretKey::from_bytes(&[7; 32]).public();
-        let spki = ed25519_spki(&id);
-        // 30 2a 30 05 06 03 2b 65 70 03 21 00 || key (TLS-3).
-        assert_eq!(
-            &spki.as_ref()[..12],
-            &[0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00]
-        );
-        assert_eq!(&spki.as_ref()[12..], id.as_bytes());
-        assert_eq!(node_id_from_spki(spki.as_ref()), Some(id));
-    }
-
-    #[test]
-    fn spki_with_another_prefix_is_refused() {
-        let id = NodeSecretKey::from_bytes(&[7; 32]).public();
-        let mut spki = ed25519_spki(&id).as_ref().to_vec();
-        spki[8] = 0x71; // Ed448's OID byte.
-        assert_eq!(node_id_from_spki(&spki), None);
-        assert_eq!(node_id_from_spki(id.as_bytes()), None);
-    }
 
     /// A random source that always fills with 7s.
     #[derive(Debug)]
@@ -319,11 +329,319 @@ mod tests {
                 .collect::<Vec<_>>(),
             [x25519.name()]
         );
-        assert!(!tls.uses_default_provider());
+        assert!(!tls.uses_production_provider());
 
         let tls =
             TlsConfig::with_inputs(&NodeSecretKey::generate(), &EndpointInputs::default()).unwrap();
-        assert!(tls.uses_default_provider());
+        assert!(tls.uses_production_provider());
+    }
+
+    /// The names of a provider's key-exchange groups, in offer order.
+    fn group_names(provider: &rustls::crypto::CryptoProvider) -> Vec<rustls::NamedGroup> {
+        provider
+            .kx_groups
+            .iter()
+            .map(|group| group.name())
+            .collect()
+    }
+
+    /// TLS-9: the production provider is ring's with one change: its only
+    /// key-exchange group is the hybrid.
+    #[test]
+    fn the_production_provider_is_rings_with_only_the_hybrid_group() {
+        let ring = rustls::crypto::ring::default_provider();
+        let production = production_provider();
+        assert_eq!(
+            group_names(&production),
+            [rustls::NamedGroup::X25519MLKEM768]
+        );
+        assert_eq!(
+            format!("{:?}", production.cipher_suites),
+            format!("{:?}", ring.cipher_suites)
+        );
+        assert_eq!(
+            format!("{:?}", production.signature_verification_algorithms),
+            format!("{:?}", ring.signature_verification_algorithms)
+        );
+        assert_eq!(
+            format!("{:?}", production.key_provider),
+            format!("{:?}", ring.key_provider)
+        );
+        assert_eq!(
+            format!("{:?}", production.secure_random),
+            format!("{:?}", ring.secure_random)
+        );
+        assert!(TlsConfig::new(&NodeSecretKey::generate()).uses_production_provider());
+    }
+
+    /// TLS-9: an endpoint that injects only a random source still offers the
+    /// production group alone.
+    #[test]
+    fn an_injected_random_source_keeps_the_production_groups() {
+        let inputs = EndpointInputs::default().tls_random(&SEVENS);
+        let tls = TlsConfig::with_inputs(&NodeSecretKey::generate(), &inputs).unwrap();
+        assert_eq!(format!("{:?}", tls.provider.secure_random), "Sevens");
+        assert_eq!(
+            group_names(&tls.provider),
+            group_names(&production_provider())
+        );
+    }
+
+    /// A dialer's group that sends the production hybrid share altered by
+    /// `alter`, for handshakes that must fail.
+    #[derive(Debug)]
+    struct Altered {
+        alter: fn(Vec<u8>) -> Vec<u8>,
+    }
+
+    impl rustls::crypto::SupportedKxGroup for Altered {
+        fn start(&self) -> Result<Box<dyn rustls::crypto::ActiveKeyExchange>, rustls::Error> {
+            let exchange = hybrid::x25519_mlkem768().start()?;
+            let share = (self.alter)(exchange.pub_key().to_vec());
+            Ok(Box::new(AlteredExchange { exchange, share }))
+        }
+
+        fn name(&self) -> rustls::NamedGroup {
+            rustls::NamedGroup::X25519MLKEM768
+        }
+    }
+
+    /// An exchange of [`Altered`]: the production one, with another share.
+    struct AlteredExchange {
+        exchange: Box<dyn rustls::crypto::ActiveKeyExchange>,
+        share: Vec<u8>,
+    }
+
+    impl rustls::crypto::ActiveKeyExchange for AlteredExchange {
+        fn complete(
+            self: Box<Self>,
+            peer: &[u8],
+        ) -> Result<rustls::crypto::SharedSecret, rustls::Error> {
+            self.exchange.complete(peer)
+        }
+
+        fn hybrid_component(&self) -> Option<(rustls::NamedGroup, &[u8])> {
+            self.exchange.hybrid_component()
+        }
+
+        fn complete_hybrid_component(
+            self: Box<Self>,
+            peer: &[u8],
+        ) -> Result<rustls::crypto::SharedSecret, rustls::Error> {
+            self.exchange.complete_hybrid_component(peer)
+        }
+
+        fn pub_key(&self) -> &[u8] {
+            &self.share
+        }
+
+        fn group(&self) -> rustls::NamedGroup {
+            self.exchange.group()
+        }
+    }
+
+    /// SEC-2: a production listener refuses the handshake when the dialer's
+    /// hybrid share has the wrong length or carries an ML-KEM key that
+    /// fails the modulus check. The hello also carries a valid plain X25519
+    /// share, as a production hello does, and the listener doesn't fall back
+    /// to it.
+    #[test]
+    fn a_malformed_hybrid_share_fails_the_handshake() {
+        fn one_byte_short(mut share: Vec<u8>) -> Vec<u8> {
+            share.pop();
+            share
+        }
+        fn coefficient_above_the_modulus(mut share: Vec<u8>) -> Vec<u8> {
+            // The first 12-bit coefficient becomes 4,095, above q = 3,329.
+            share[0] = 0xff;
+            share[1] |= 0x0f;
+            share
+        }
+        let alterations: [fn(Vec<u8>) -> Vec<u8>; 2] =
+            [one_byte_short, coefficient_above_the_modulus];
+        for alter in alterations {
+            let dialer_key = NodeSecretKey::generate();
+            let listener_key = NodeSecretKey::generate();
+            let group: &'static Altered = Box::leak(Box::new(Altered { alter }));
+            let client = TlsConfig::with_inputs(
+                &dialer_key,
+                &EndpointInputs::default()
+                    .kx_groups(vec![group, rustls::crypto::ring::kx_group::X25519]),
+            )
+            .unwrap()
+            .rustls_client(listener_key.public(), &[b"a"])
+            .unwrap();
+            let client = Arc::new(client);
+            // The hello carries a valid plain X25519 share: a listener with
+            // X25519 alone completes on it in one round trip.
+            assert_eq!(
+                handshake_to(&client, &ring_only(&listener_key)),
+                (rustls::NamedGroup::X25519, rustls::HandshakeKind::Full)
+            );
+            let server = TlsConfig::new(&listener_key)
+                .rustls_server(vec![b"a".to_vec()])
+                .unwrap();
+            let name = rustls_pki_types::ServerName::try_from(UNSENT_SERVER_NAME).unwrap();
+            let mut client = rustls::ClientConnection::new(client, name).unwrap();
+            let mut server = rustls::ServerConnection::new(Arc::new(server)).unwrap();
+            let mut hello = Vec::new();
+            while client.wants_write() {
+                client.write_tls(&mut hello).unwrap();
+            }
+            server.read_tls(&mut hello.as_slice()).unwrap();
+            assert_eq!(
+                server.process_new_packets().unwrap_err(),
+                rustls::Error::PeerMisbehaved(rustls::PeerMisbehaved::InvalidKeyShare)
+            );
+        }
+    }
+
+    /// TLS state like a release before the hybrid group: ring's own groups.
+    fn ring_only(secret_key: &NodeSecretKey) -> TlsConfig {
+        let groups = rustls::crypto::ring::default_provider().kx_groups;
+        TlsConfig::with_inputs(secret_key, &EndpointInputs::default().kx_groups(groups)).unwrap()
+    }
+
+    /// Runs one TLS handshake in memory, the `dialer` side dialing the
+    /// `listener` side. Returns the group both sides used and whether the
+    /// dialer needed a second round trip (a HelloRetryRequest).
+    fn handshake(
+        dialer: impl Fn(&NodeSecretKey) -> TlsConfig,
+        listener: impl Fn(&NodeSecretKey) -> TlsConfig,
+    ) -> (rustls::NamedGroup, rustls::HandshakeKind) {
+        let dialer_key = NodeSecretKey::generate();
+        let listener_key = NodeSecretKey::generate();
+        let client = dialer(&dialer_key)
+            .rustls_client(listener_key.public(), &[b"a"])
+            .unwrap();
+        handshake_to(&Arc::new(client), &listener(&listener_key))
+    }
+
+    /// Runs one TLS handshake in memory from `client` to a listener with
+    /// `listener`'s TLS state. Returns what [`handshake`] returns.
+    fn handshake_to(
+        client: &Arc<rustls::ClientConfig>,
+        listener: &TlsConfig,
+    ) -> (rustls::NamedGroup, rustls::HandshakeKind) {
+        let server = listener.rustls_server(vec![b"a".to_vec()]).unwrap();
+        let name = rustls_pki_types::ServerName::try_from(UNSENT_SERVER_NAME).unwrap();
+        let mut client = rustls::ClientConnection::new(client.clone(), name).unwrap();
+        let mut server = rustls::ServerConnection::new(Arc::new(server)).unwrap();
+        // A full handshake takes two exchanges and one with a
+        // HelloRetryRequest three, so one that needs more has stalled.
+        for _ in 0..4 {
+            if !client.is_handshaking() && !server.is_handshaking() {
+                break;
+            }
+            let mut flight = Vec::new();
+            while client.wants_write() {
+                client.write_tls(&mut flight).unwrap();
+            }
+            let mut unread = flight.as_slice();
+            while !unread.is_empty() {
+                server.read_tls(&mut unread).unwrap();
+                server.process_new_packets().unwrap();
+            }
+            let mut flight = Vec::new();
+            while server.wants_write() {
+                server.write_tls(&mut flight).unwrap();
+            }
+            let mut unread = flight.as_slice();
+            while !unread.is_empty() {
+                client.read_tls(&mut unread).unwrap();
+                client.process_new_packets().unwrap();
+            }
+        }
+        assert!(
+            !client.is_handshaking() && !server.is_handshaking(),
+            "the handshake stalled"
+        );
+        let group = |group: Option<&'static dyn rustls::crypto::SupportedKxGroup>| {
+            group
+                .expect("a finished TLS 1.3 handshake used a key-exchange group")
+                .name()
+        };
+        let used = group(client.negotiated_key_exchange_group());
+        assert_eq!(group(server.negotiated_key_exchange_group()), used);
+        let kind = client
+            .handshake_kind()
+            .expect("a finished handshake has a kind");
+        (used, kind)
+    }
+
+    /// TLS-9: two endpoints on the production provider use the hybrid group,
+    /// in one round trip.
+    #[test]
+    fn two_production_endpoints_use_the_hybrid_group() {
+        assert_eq!(
+            handshake(TlsConfig::new, TlsConfig::new),
+            (
+                rustls::NamedGroup::X25519MLKEM768,
+                rustls::HandshakeKind::Full
+            )
+        );
+    }
+
+    /// TLS-9: a peer that offers only classical groups shares no group with
+    /// a production endpoint, so the handshake fails in either direction.
+    #[test]
+    fn a_peer_without_the_hybrid_group_is_refused() {
+        let no_shared_group =
+            rustls::Error::PeerIncompatible(rustls::PeerIncompatible::NoKxGroupsInCommon);
+        assert_eq!(handshake_error(TlsConfig::new, ring_only), no_shared_group);
+        assert_eq!(handshake_error(ring_only, TlsConfig::new), no_shared_group);
+    }
+
+    /// Runs one TLS handshake in memory like [`handshake`] and returns the
+    /// error the listener fails it with.
+    fn handshake_error(
+        dialer: impl Fn(&NodeSecretKey) -> TlsConfig,
+        listener: impl Fn(&NodeSecretKey) -> TlsConfig,
+    ) -> rustls::Error {
+        let dialer_key = NodeSecretKey::generate();
+        let listener_key = NodeSecretKey::generate();
+        let client = dialer(&dialer_key)
+            .rustls_client(listener_key.public(), &[b"a"])
+            .unwrap();
+        let server = listener(&listener_key)
+            .rustls_server(vec![b"a".to_vec()])
+            .unwrap();
+        let name = rustls_pki_types::ServerName::try_from(UNSENT_SERVER_NAME).unwrap();
+        let mut client = rustls::ClientConnection::new(Arc::new(client), name).unwrap();
+        let mut server = rustls::ServerConnection::new(Arc::new(server)).unwrap();
+        let mut hello = Vec::new();
+        while client.wants_write() {
+            client.write_tls(&mut hello).unwrap();
+        }
+        server.read_tls(&mut hello.as_slice()).unwrap();
+        server
+            .process_new_packets()
+            .expect_err("the listener shares no group with the dialer")
+    }
+
+    /// TLS-3, TLS-8: the ID a peer's verifier derives from a node's
+    /// credential is the ID the node gives itself, including for a credential
+    /// with an entry this release doesn't know.
+    #[test]
+    fn a_node_is_known_by_the_id_its_credential_derives() {
+        let plain = NodeSecretKey::generate();
+        let extended = NodeSecretKey::generate();
+        let own = |tag| {
+            let key = extended.credential().key(tag).unwrap().to_vec();
+            (tag, key)
+        };
+        let credential = NodeCredential::from_entries([
+            own(crate::ED25519_KEY_TAG),
+            own(crate::ML_DSA_44_KEY_TAG),
+            (0x0102, vec![0x5A; 1_312]),
+        ])
+        .unwrap();
+        let extended = extended.with_credential(credential).unwrap();
+        for secret in [plain, extended] {
+            let cert = secret.credential().to_spki();
+            let derived = credential_from_cert(cert.as_ref()).map(|remote| remote.node_id());
+            assert_eq!(derived, Some(secret.public()));
+        }
     }
 
     /// ring's P-256, limited to TLS 1.2, counting the key exchanges it starts.

@@ -1,7 +1,7 @@
 //! Endpoint conformance tests (SPEC §16).
 
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -177,9 +177,10 @@ fn client() -> QuicEndpoint {
     QuicEndpoint::bind(NodeSecretKey::generate(), &loopback(), &test_config()).unwrap()
 }
 
-/// A handshake that never finishes: one client Initial sent from a socket
-/// nobody reads. The server's replies, including any Retry, go nowhere. This
-/// is what a spoofed source looks like to the server.
+/// A handshake that never finishes: a client's whole first flight, the
+/// hello in two Initial datagrams, sent from a socket nobody reads. The
+/// server's replies, including any Retry, go nowhere. This is what a spoofed
+/// source looks like to the server.
 struct StalledHandshake {
     _socket: std::net::UdpSocket,
 }
@@ -210,11 +211,16 @@ fn stalled_handshake_to(server: &QuicEndpoint) -> StalledHandshake {
             crate::tls::UNSENT_SERVER_NAME,
         )
         .unwrap();
-    let mut buf = Vec::new();
-    let transmit = conn
-        .poll_transmit(now, 1, &mut buf)
-        .expect("a new connection sends its Initial at once");
-    socket.send_to(&buf[..transmit.size], target).unwrap();
+    let mut sent = 0;
+    loop {
+        let mut buf = Vec::new();
+        let Some(transmit) = conn.poll_transmit(now, 1, &mut buf) else {
+            break;
+        };
+        socket.send_to(&buf[..transmit.size], target).unwrap();
+        sent += 1;
+    }
+    assert_eq!(sent, 2, "the hybrid hello spans two Initial datagrams");
     StalledHandshake { _socket: socket }
 }
 
@@ -244,6 +250,7 @@ async fn dial_authenticates_both_sides_and_echoes() {
         let client = client();
         let conn = client.connect(server.addr(), &[ALPN]).await.unwrap();
         assert_eq!(conn.remote_id(), server.endpoint.local_id());
+        assert_eq!(conn.remote_key_list().node_id(), conn.remote_id());
         assert_eq!(conn.alpn(), ALPN);
         assert_eq!(conn.admitted_ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert!(conn.source_validated(), "this node dialed the address");
@@ -255,6 +262,7 @@ async fn dial_authenticates_both_sides_and_echoes() {
 
         let inbound = server.handled.recv().await.unwrap();
         assert_eq!(inbound.remote_id(), client.local_id());
+        assert_eq!(inbound.remote_key_list().node_id(), inbound.remote_id());
         assert!(!inbound.source_validated(), "no Retry validated the source");
         let seen = server.seen.lock().unwrap().clone();
         assert_eq!(seen.len(), 1);
@@ -264,6 +272,172 @@ async fn dial_authenticates_both_sides_and_echoes() {
     })
     .await
     .unwrap();
+}
+
+/// The counters one thread wrote, by name and labels.
+#[derive(Clone, Default)]
+struct Counters(Arc<Mutex<BTreeMap<String, u64>>>);
+
+impl Counters {
+    /// Every series of counter `name`, keyed `name{label="value",...}`.
+    fn series(&self, name: &str) -> BTreeMap<String, u64> {
+        let prefix = format!("{name}{{");
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(key, _)| key.starts_with(&prefix))
+            .map(|(key, value)| (key.clone(), *value))
+            .collect()
+    }
+}
+
+/// One counter series in [`Counters`].
+struct CounterSeries {
+    key: String,
+    values: Arc<Mutex<BTreeMap<String, u64>>>,
+}
+
+impl metrics::CounterFn for CounterSeries {
+    fn increment(&self, value: u64) {
+        *self
+            .values
+            .lock()
+            .unwrap()
+            .entry(self.key.clone())
+            .or_default() += value;
+    }
+
+    fn absolute(&self, value: u64) {
+        self.values.lock().unwrap().insert(self.key.clone(), value);
+    }
+}
+
+impl metrics::Recorder for Counters {
+    fn describe_counter(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+
+    fn describe_gauge(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+
+    fn describe_histogram(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+
+    fn register_counter(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Counter {
+        let labels: Vec<String> = key
+            .labels()
+            .map(|label| format!("{}=\"{}\"", label.key(), label.value()))
+            .collect();
+        metrics::Counter::from_arc(Arc::new(CounterSeries {
+            key: format!("{}{{{}}}", key.name(), labels.join(",")),
+            values: self.0.clone(),
+        }))
+    }
+
+    fn register_gauge(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+        metrics::Gauge::noop()
+    }
+
+    fn register_histogram(
+        &self,
+        _: &metrics::Key,
+        _: &metrics::Metadata<'_>,
+    ) -> metrics::Histogram {
+        metrics::Histogram::noop()
+    }
+}
+
+/// Asserts that one side of a handshake counted exactly one hybrid key
+/// exchange and one composite signature, and no other group or scheme.
+fn assert_counted_one_post_quantum_handshake(side: &str, counters: &Counters) {
+    assert_eq!(
+        counters.series("zakura.quic.tls.key_exchange"),
+        BTreeMap::from([(
+            r#"zakura.quic.tls.key_exchange{group="X25519MLKEM768"}"#.to_string(),
+            1
+        )]),
+        "{side} key exchanges"
+    );
+    assert_verified_signatures(side, counters, 1);
+}
+
+/// Checks the total for the composite scheme and that no other scheme was counted.
+fn assert_verified_signatures(side: &str, counters: &Counters, expected: u64) {
+    assert_eq!(
+        counters.series("zakura.quic.tls.signature_verified"),
+        BTreeMap::from([(
+            r#"zakura.quic.tls.signature_verified{scheme="ed25519_mldsa44"}"#.to_string(),
+            expected
+        )]),
+        "{side} verified signatures"
+    );
+}
+
+/// OBS-1, TLS-4, TLS-9: each side of a handshake counts its hybrid key
+/// exchange and the peer's composite signature it verified. The listener
+/// runs on its own thread and runtime, so each side's thread-local recorder
+/// sees only that side.
+#[tokio::test]
+async fn each_side_counts_its_key_exchange_group_and_verified_signature_scheme() {
+    let dialer = Counters::default();
+    let _recording = metrics::set_default_local_recorder(&dialer);
+    let listener = Counters::default();
+    let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
+    let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+    let listener_thread = std::thread::spawn({
+        let listener = listener.clone();
+        move || {
+            let _recording = metrics::set_default_local_recorder(&listener);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let mut server = server();
+                addr_tx.send(server.addr()).unwrap();
+                let inbound = tokio::time::timeout(TEST_TIMEOUT, server.handled.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                accepted_tx.send(()).unwrap();
+                // Keep the connection until the dialer has read its counters.
+                let _ = tokio::time::timeout(TEST_TIMEOUT, done_rx).await;
+                drop(inbound);
+            });
+        }
+    });
+
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let client = client();
+        let conn = client
+            .connect(addr_rx.await.unwrap(), &[ALPN])
+            .await
+            .unwrap();
+        accepted_rx.await.unwrap();
+        assert_counted_one_post_quantum_handshake("dialer", &dialer);
+        assert_counted_one_post_quantum_handshake("listener", &listener);
+        drop(conn);
+    })
+    .await
+    .unwrap();
+    let _ = done_tx.send(());
+    listener_thread.join().unwrap();
 }
 
 /// Both ends of a connection read the same shared ID, and a second
@@ -523,6 +697,42 @@ async fn dial_attempts_count_only_addresses_the_dial_would_try() {
 }
 
 #[tokio::test]
+async fn a_quic_connection_authenticates_the_full_extended_credential() {
+    // Append an opaque key to the listener's normal credential. The wire
+    // entry has tag 0x0102, a little-endian length, and the full public key.
+    let secret = NodeSecretKey::generate();
+    let original_id = secret.public();
+    let mut bytes = secret.credential().encode();
+    bytes[0] += 1;
+    bytes.extend_from_slice(&0x0102u16.to_le_bytes());
+    bytes.extend_from_slice(&1312u16.to_le_bytes());
+    bytes.extend_from_slice(&[0x5a; 1312]);
+    let credential = crate::NodeCredential::decode(&bytes).unwrap();
+    let listener_keys = credential.key_list().clone();
+    let secret = secret.with_credential(credential).unwrap();
+
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let endpoint = QuicEndpoint::bind(secret, &loopback(), &test_config()).unwrap();
+        let mut server = serve_test_acceptor(endpoint, &[ALPN], |_| Admit::Accept);
+        let client = client();
+
+        let old_pin = NodeAddr::with_addrs(original_id, server.endpoint.local_addrs());
+        assert!(matches!(
+            client.connect(old_pin, &[ALPN]).await,
+            Err(ConnectError::WrongIdentity)
+        ));
+        let conn = client.connect(server.addr(), &[ALPN]).await.unwrap();
+        let inbound = server.handled.recv().await.unwrap();
+        assert_eq!(conn.remote_key_list(), &listener_keys);
+        assert_eq!(conn.remote_id(), listener_keys.node_id());
+        assert_eq!(inbound.remote_id(), client.local_id());
+        assert_eq!(echo(&conn, b"hello").await, b"hello");
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn wrong_identity_is_refused() {
     tokio::time::timeout(TEST_TIMEOUT, async {
         let server = server();
@@ -540,10 +750,37 @@ async fn wrong_identity_is_refused() {
     .unwrap();
 }
 
-/// The server rejects the first packet, so the acceptor gets its admission
-/// back through `cancel_admission` alone: a spoofed source pays no charge.
+/// A hello that fits one datagram, here from a dialer with ring's classical
+/// groups only, as a release before the hybrid group sends it. It shares no
+/// group with the listener (TLS-9), so the server rejects the first packet
+/// and the acceptor gets its admission back through `cancel_admission`
+/// alone: a spoofed source pays no charge.
 #[tokio::test]
-async fn alpn_mismatch_is_classified() {
+async fn a_classical_one_datagram_hello_is_refused_and_cancelled() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let server = server();
+        let rpk = crate::tls::resolver::ResolveRawPublicKeyCert::new(
+            &NodeSecretKey::generate(),
+            crate::tls::production_provider().secure_random,
+        );
+        let mut crypto = raw_client_builder_with(&server, rustls::crypto::ring::default_provider())
+            .with_client_cert_resolver(Arc::new(rpk));
+        crypto.alpn_protocols = vec![ALPN.to_vec()];
+        assert!(dial_raw(&server, crypto).await.is_err());
+        assert_eq!(server.seen.lock().unwrap().len(), 1);
+        assert_eq!(server.returned.cancelled.load(Ordering::Relaxed), 1);
+        assert_eq!(server.returned.finished.load(Ordering::Relaxed), 0);
+    })
+    .await
+    .unwrap();
+}
+
+/// A production dialer's hello carries the hybrid key share and spans two
+/// datagrams, so the server has accepted the attempt before it can read the
+/// hello. The mismatch then fails the handshake, and the acceptor gets its
+/// admission back once, through `finish_admission` (ADM-3, ADM-7).
+#[tokio::test]
+async fn an_alpn_mismatch_in_a_two_datagram_hello_fails_the_handshake() {
     tokio::time::timeout(TEST_TIMEOUT, async {
         let server = server();
         let client = client();
@@ -551,8 +788,13 @@ async fn alpn_mismatch_is_classified() {
             client.connect(server.addr(), &[b"p2p-v2/2"]).await,
             Err(ConnectError::AlpnMismatch)
         ));
-        assert_eq!(server.returned.cancelled.load(Ordering::Relaxed), 1);
-        assert_eq!(server.returned.finished.load(Ordering::Relaxed), 0);
+        // The pending slot is returned when the connection has closed.
+        while server.returned.finished.load(Ordering::Relaxed) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(server.seen.lock().unwrap().len(), 1);
+        assert_eq!(server.returned.finished.load(Ordering::Relaxed), 1);
+        assert_eq!(server.returned.cancelled.load(Ordering::Relaxed), 0);
     })
     .await
     .unwrap();
@@ -605,7 +847,12 @@ async fn refused_attempt_creates_no_connection() {
         ));
         // SEC-3: the acceptor never saw a connection.
         assert!(server.handled.try_recv().is_err());
-        assert_eq!(server.seen.lock().unwrap().len(), 1);
+        // The hello spans two datagrams. The endpoint decides each one it
+        // doesn't accept on its own (ADM-1), so the dial is refused twice.
+        wait_for_attempts(&server, 2).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(server.seen.lock().unwrap().len(), 2);
+        assert!(server.handled.try_recv().is_err());
     })
     .await
     .unwrap();
@@ -638,10 +885,15 @@ async fn retry_threshold_validates_before_accepting() {
         client.connect(server.addr(), &[ALPN]).await.unwrap();
         let inbound = server.handled.recv().await.unwrap();
         assert!(inbound.source_validated(), "the Retry token validated it");
+        // The hello spans two datagrams, and each unvalidated one gets its
+        // own Retry (ADM-1). The dialer answers the first and discards the
+        // second, as RFC 9000 section 17.2.5.2 requires.
         let seen = server.seen.lock().unwrap().clone();
-        assert_eq!(seen.len(), 2, "one Retry, then the validated attempt");
-        assert!(!seen[0].validated);
-        assert!(seen[1].validated);
+        assert_eq!(
+            seen.iter().map(|info| info.validated).collect::<Vec<_>>(),
+            [false, false, true],
+            "one Retry per datagram of the hello, then the validated attempt"
+        );
     })
     .await
     .unwrap();
@@ -1059,10 +1311,19 @@ async fn dial_raw(server: &Server, crypto: rustls::ClientConfig) -> Result<(), C
     }
 }
 
+/// A hand-built client on the production provider, which verifies `server`.
 fn raw_client_builder(
     server: &Server,
 ) -> rustls::ConfigBuilder<rustls::ClientConfig, rustls::client::WantsClientCert> {
-    rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+    raw_client_builder_with(server, crate::tls::production_provider())
+}
+
+/// A hand-built client on `provider`, which verifies `server`.
+fn raw_client_builder_with(
+    server: &Server,
+    provider: rustls::crypto::CryptoProvider,
+) -> rustls::ConfigBuilder<rustls::ClientConfig, rustls::client::WantsClientCert> {
+    rustls::ClientConfig::builder_with_provider(Arc::new(provider))
         .with_protocol_versions(crate::tls::verifier::PROTOCOL_VERSIONS)
         .unwrap()
         .dangerous()
@@ -1111,7 +1372,10 @@ async fn client_with_an_x509_style_certificate_is_refused() {
     tokio::time::timeout(TEST_TIMEOUT, async {
         let mut server = server();
         // Borrow the RPK resolver's key, but present it as an X.509 chain.
-        let rpk = crate::tls::resolver::ResolveRawPublicKeyCert::new(&NodeSecretKey::generate());
+        let rpk = crate::tls::resolver::ResolveRawPublicKeyCert::new(
+            &NodeSecretKey::generate(),
+            crate::tls::production_provider().secure_random,
+        );
         let key = rustls::client::ResolvesClientCert::resolve(&rpk, &[], &[]).unwrap();
         let mut crypto =
             raw_client_builder(&server).with_client_cert_resolver(Arc::new(NotRawPublicKey(key)));
@@ -1135,10 +1399,14 @@ fn profile_is_tls13_only() {
 
 #[tokio::test]
 async fn raw_client_with_the_profile_is_accepted() {
-    // Control for the refusal tests: the same raw dial with an RPK key succeeds.
+    // Control for the refusal tests: the same raw dial with the node's
+    // credential succeeds.
     tokio::time::timeout(TEST_TIMEOUT, async {
         let mut server = server();
-        let rpk = crate::tls::resolver::ResolveRawPublicKeyCert::new(&NodeSecretKey::generate());
+        let rpk = crate::tls::resolver::ResolveRawPublicKeyCert::new(
+            &NodeSecretKey::generate(),
+            crate::tls::production_provider().secure_random,
+        );
         let mut crypto = raw_client_builder(&server).with_client_cert_resolver(Arc::new(rpk));
         crypto.alpn_protocols = vec![ALPN.to_vec()];
         dial_raw(&server, crypto).await.unwrap();
@@ -1820,9 +2088,19 @@ async fn driver_send_counters_match_quinn_proto() {
     .unwrap();
 }
 
-/// A key that presents a victim's public key but signs with another key.
-#[derive(Debug)]
-struct Impostor(NodeSecretKey);
+/// How an [`Impostor`] signs a handshake message.
+type ImpostorSign = Arc<dyn Fn(&[u8]) -> Vec<u8> + Send + Sync>;
+
+/// A key that presents a victim's credential and signs under the composite
+/// scheme however its `sign` says.
+#[derive(Clone)]
+struct Impostor(ImpostorSign);
+
+impl std::fmt::Debug for Impostor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Impostor")
+    }
+}
 
 impl rustls::sign::SigningKey for Impostor {
     fn choose_scheme(
@@ -1830,25 +2108,22 @@ impl rustls::sign::SigningKey for Impostor {
         offered: &[rustls::SignatureScheme],
     ) -> Option<Box<dyn rustls::sign::Signer>> {
         offered
-            .contains(&rustls::SignatureScheme::ED25519)
-            .then(|| Box::new(ImpostorSigner(self.0.clone())) as Box<dyn rustls::sign::Signer>)
+            .contains(&crate::composite::COMPOSITE_SCHEME)
+            .then(|| Box::new(self.clone()) as Box<dyn rustls::sign::Signer>)
     }
 
     fn algorithm(&self) -> rustls::SignatureAlgorithm {
-        rustls::SignatureAlgorithm::ED25519
+        rustls::SignatureAlgorithm::Unknown(0x44)
     }
 }
 
-#[derive(Debug)]
-struct ImpostorSigner(NodeSecretKey);
-
-impl rustls::sign::Signer for ImpostorSigner {
+impl rustls::sign::Signer for Impostor {
     fn sign(&self, message: &[u8]) -> Result<Vec<u8>, rustls::Error> {
-        Ok(self.0.sign(message).to_vec())
+        Ok((self.0)(message))
     }
 
     fn scheme(&self) -> rustls::SignatureScheme {
-        rustls::SignatureScheme::ED25519
+        crate::composite::COMPOSITE_SCHEME
     }
 }
 
@@ -1873,24 +2148,96 @@ impl rustls::client::ResolvesClientCert for ImpostorResolver {
     }
 }
 
-/// TLS-8, SEC-2: a client that presents another node's key without its
-/// secret is refused, so `remote_id()` can't name the victim.
+/// Dials `server` presenting `victim`'s credential and signing with `sign`.
+async fn dial_as(
+    server: &Server,
+    victim: &NodeSecretKey,
+    sign: impl Fn(&[u8]) -> Vec<u8> + Send + Sync + 'static,
+) -> Result<(), ConnectError> {
+    let cert = rustls_pki_types::CertificateDer::from(victim.credential().to_spki().to_vec());
+    let key = Arc::new(rustls::sign::CertifiedKey::new(
+        vec![cert],
+        Arc::new(Impostor(Arc::new(sign))),
+    ));
+    let mut crypto =
+        raw_client_builder(server).with_client_cert_resolver(Arc::new(ImpostorResolver(key)));
+    crypto.alpn_protocols = vec![ALPN.to_vec()];
+    dial_raw(server, crypto).await
+}
+
+/// Checks that the dial fails and the listener finishes admission without a handoff.
+async fn assert_dial_refused(
+    server: &mut Server,
+    victim: &NodeSecretKey,
+    sign: impl Fn(&[u8]) -> Vec<u8> + Send + Sync + 'static,
+) {
+    let finished = server.returned.finished.load(Ordering::Relaxed);
+    assert!(dial_as(server, victim, sign).await.is_err());
+    while server.returned.finished.load(Ordering::Relaxed) == finished {
+        tokio::task::yield_now().await;
+    }
+    assert!(matches!(
+        server.handled.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+}
+
+/// TLS-4, TLS-8, SEC-2: a client that presents another node's credential
+/// without both of its secrets is refused, so `remote_id()` can't name the
+/// victim. Each half of the composite is checked on its own: a signature
+/// with either half from another key, or one byte short, fails. The control
+/// dial, signed with the victim's own keys, shows the refusals come from
+/// the signature.
 #[tokio::test]
 async fn client_presenting_a_key_it_cannot_sign_for_is_refused() {
+    let counters = Counters::default();
+    let _recording = metrics::set_default_local_recorder(&counters);
     tokio::time::timeout(TEST_TIMEOUT, async {
         let mut server = server();
-        let victim = NodeSecretKey::generate().public();
-        let cert =
-            rustls_pki_types::CertificateDer::from(crate::tls::ed25519_spki(&victim).to_vec());
-        let key = Arc::new(rustls::sign::CertifiedKey::new(
-            vec![cert],
-            Arc::new(Impostor(NodeSecretKey::generate())),
-        ));
-        let mut crypto =
-            raw_client_builder(&server).with_client_cert_resolver(Arc::new(ImpostorResolver(key)));
-        crypto.alpn_protocols = vec![ALPN.to_vec()];
-        assert!(dial_raw(&server, crypto).await.is_err());
-        assert!(server.handled.try_recv().is_err());
+        let victim = Arc::new(NodeSecretKey::generate());
+        let other = Arc::new(NodeSecretKey::generate());
+        const ED25519: usize = 64;
+
+        let o = other.clone();
+        let foreign_both = move |m: &[u8]| o.sign_composite(m, [1; 32]).unwrap();
+        let (v2, o2) = (victim.clone(), other.clone());
+        let foreign_ml_dsa = move |m: &[u8]| {
+            let mut signature = v2.sign(m).to_vec();
+            signature.extend_from_slice(&o2.sign_composite(m, [1; 32]).unwrap()[ED25519..]);
+            signature
+        };
+        let (v3, o3) = (victim.clone(), other.clone());
+        let foreign_ed25519 = move |m: &[u8]| {
+            let mut signature = o3.sign(m).to_vec();
+            signature.extend_from_slice(&v3.sign_composite(m, [1; 32]).unwrap()[ED25519..]);
+            signature
+        };
+        let v4 = victim.clone();
+        let truncated = move |m: &[u8]| {
+            let mut signature = v4.sign_composite(m, [1; 32]).unwrap();
+            signature.pop();
+            signature
+        };
+
+        assert_dial_refused(&mut server, &victim, foreign_both).await;
+        assert_dial_refused(&mut server, &victim, foreign_ml_dsa).await;
+        assert_dial_refused(&mut server, &victim, foreign_ed25519).await;
+        assert_dial_refused(&mut server, &victim, truncated).await;
+
+        // Both endpoints run on this thread. On each refused dial, only the
+        // client verified its peer's signature.
+        assert_verified_signatures("after four refused dials", &counters, 4);
+
+        let v5 = victim.clone();
+        dial_as(&server, &victim, move |m| {
+            v5.sign_composite(m, [1; 32]).unwrap()
+        })
+        .await
+        .unwrap();
+        let inbound = server.handled.recv().await.unwrap();
+        assert_eq!(inbound.remote_id(), victim.public());
+        // On the successful dial both endpoints verified their peer.
+        assert_verified_signatures("after the successful dial", &counters, 6);
     })
     .await
     .unwrap();
@@ -2787,6 +3134,213 @@ async fn pump(net: SimNet) {
     }
 }
 
+/// The dialer's hello carries the hybrid key share, 1,216 bytes, so its first
+/// flight is two full Initial datagrams where a hello with ring's groups
+/// needed one (TLS-9). Both leave before any reply. The server accepts the
+/// first, the second joins that connection, and the handshake completes.
+#[tokio::test(start_paused = true)]
+async fn the_hybrid_hello_leaves_as_two_initial_datagrams() {
+    tokio::time::timeout(SIM_TEST_TIMEOUT, async {
+        let net = sim_net();
+        let mut server =
+            serve_test_acceptor(sim_endpoint(&net, sim_addr(1)), &[ALPN], |_| Admit::Accept);
+        let client = sim_endpoint(&net, sim_addr(2));
+        let target = server.addr();
+        let dial = tokio::spawn(async move {
+            let result = client.connect(target, &[ALPN]).await;
+            (client, result)
+        });
+
+        // Nothing is delivered yet, so the client has sent its first flight
+        // and nothing else.
+        for _ in 0..10_000 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(sent_lengths(&net, sim_addr(2)), [1200, 1200]);
+
+        let pump = tokio::spawn(pump(net.clone()));
+        let (_client, result) = dial.await.unwrap();
+        result.unwrap();
+        server.handled.recv().await.unwrap();
+        assert_eq!(server.seen.lock().unwrap().len(), 1);
+        pump.abort();
+    })
+    .await
+    .unwrap();
+}
+
+/// TLS-4, ADM-1: with the composite credential and signature, the
+/// listener's whole first flight still fits QUIC's allowance before the
+/// dialer's address is validated, three times the 2,400 bytes of the hybrid
+/// hello. The dialer completes its handshake on that flight alone, so the
+/// larger signature adds no round trip.
+#[tokio::test(start_paused = true)]
+async fn the_listeners_first_flight_fits_the_amplification_limit() {
+    tokio::time::timeout(SIM_TEST_TIMEOUT, async {
+        let net = sim_net();
+        let _server =
+            serve_test_acceptor(sim_endpoint(&net, sim_addr(1)), &[ALPN], |_| Admit::Accept);
+        let client = sim_endpoint(&net, sim_addr(2));
+        let target = _server.addr();
+        let dial = tokio::spawn(async move {
+            let result = client.connect(target, &[ALPN]).await;
+            (client, result)
+        });
+        let settle = || async {
+            for _ in 0..10_000 {
+                tokio::task::yield_now().await;
+            }
+        };
+        let deliver_from = |src: SocketAddr| {
+            for id in net.deliverable() {
+                if id.link.src == src {
+                    net.deliver(id).unwrap();
+                }
+            }
+        };
+
+        settle().await;
+        let hello: usize = sent_lengths(&net, sim_addr(2)).iter().sum();
+        assert_eq!(hello, 2_400, "the hybrid hello is two full datagrams");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        deliver_from(sim_addr(2));
+        settle().await;
+
+        let flight: usize = sent_lengths(&net, sim_addr(1)).iter().sum();
+        assert!(
+            flight <= 3 * hello,
+            "the listener sent {flight} bytes before validation"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        deliver_from(sim_addr(1));
+        settle().await;
+        assert!(
+            dial.is_finished(),
+            "the dialer completed on the listener's first flight of {flight} bytes"
+        );
+        let (_client, result) = dial.await.unwrap();
+        result.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+/// A listener from before the hybrid group, with ring's groups only, shares
+/// no group with a production dialer (TLS-9), so the dial fails.
+#[tokio::test(start_paused = true)]
+async fn a_production_dialer_is_refused_by_a_listener_without_the_hybrid_group() {
+    tokio::time::timeout(SIM_TEST_TIMEOUT, async {
+        let net = sim_net();
+        let pump = tokio::spawn(pump(net.clone()));
+        let bind = QuicBindConfig {
+            addrs: vec![sim_addr(1)],
+            ..loopback()
+        };
+        let rings_groups = rustls::crypto::ring::default_provider().kx_groups;
+        let listener = QuicEndpoint::bind_with(
+            NodeSecretKey::generate(),
+            &bind,
+            &test_config(),
+            net.clone(),
+            crate::EndpointInputs::default().kx_groups(rings_groups),
+        )
+        .unwrap();
+        let mut server = serve_test_acceptor(listener, &[ALPN], |_| Admit::Accept);
+        let client = sim_endpoint(&net, sim_addr(2));
+
+        assert!(client.connect(server.addr(), &[ALPN]).await.is_err());
+        assert!(server.handled.try_recv().is_err());
+        // The hello it refused was the hybrid one, in two datagrams.
+        assert_eq!(sent_lengths(&net, sim_addr(2))[..2], [1200, 1200]);
+        pump.abort();
+    })
+    .await
+    .unwrap();
+}
+
+/// A refused dial is answered once per datagram of its hello: the endpoint
+/// keeps no record of the attempt it refused, so the second datagram is a
+/// new attempt and gets its own refusal (ADM-1).
+#[tokio::test(start_paused = true)]
+async fn a_refused_two_datagram_hello_is_answered_twice() {
+    tokio::time::timeout(SIM_TEST_TIMEOUT, async {
+        let net = sim_net();
+        let pump = tokio::spawn(pump(net.clone()));
+        let mut server =
+            serve_test_acceptor(sim_endpoint(&net, sim_addr(1)), &[ALPN], |_| Admit::Refuse);
+        let client = sim_endpoint(&net, sim_addr(2));
+
+        assert!(matches!(
+            client.connect(server.addr(), &[ALPN]).await,
+            Err(ConnectError::Refused)
+        ));
+        // Long enough for the second datagram and its answer to arrive.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(server.seen.lock().unwrap().len(), 2);
+        assert_eq!(sent_lengths(&net, sim_addr(1)).len(), 2);
+        assert!(server.handled.try_recv().is_err());
+        assert_eq!(server.returned.cancelled.load(Ordering::Relaxed), 0);
+        assert_eq!(server.returned.finished.load(Ordering::Relaxed), 0);
+        pump.abort();
+    })
+    .await
+    .unwrap();
+}
+
+/// The outcome changes between a hello's two datagrams: the first is
+/// refused and the second accepted. The second alone starts TLS, so the
+/// attempt isn't cancelled. It holds its pending slot until the handshake
+/// deadline and then fails, keeping its admission charge (ADM-1, ADM-7).
+#[tokio::test(start_paused = true)]
+async fn a_hello_accepted_at_its_second_datagram_stalls_until_the_deadline() {
+    tokio::time::timeout(SIM_TEST_TIMEOUT, async {
+        let net = sim_net();
+        let pump = tokio::spawn(pump(net.clone()));
+        let decided = AtomicUsize::new(0);
+        let mut server = serve_test_acceptor(sim_endpoint(&net, sim_addr(1)), &[ALPN], move |_| {
+            if decided.fetch_add(1, Ordering::Relaxed) == 0 {
+                Admit::Refuse
+            } else {
+                Admit::Accept
+            }
+        });
+        let client = sim_endpoint(&net, sim_addr(2));
+
+        let dialed = tokio::time::Instant::now();
+        assert!(matches!(
+            client.connect(server.addr(), &[ALPN]).await,
+            Err(ConnectError::Refused)
+        ));
+        // Half the 3 s handshake deadline: the stranded attempt still holds
+        // its slot.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(server.seen.lock().unwrap().len(), 2);
+        assert_eq!(server.returned.finished.load(Ordering::Relaxed), 0);
+
+        while server.returned.finished.load(Ordering::Relaxed) == 0 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(dialed.elapsed() >= Duration::from_secs(3));
+        assert_eq!(server.returned.finished.load(Ordering::Relaxed), 1);
+        assert_eq!(server.returned.cancelled.load(Ordering::Relaxed), 0);
+        assert!(server.handled.try_recv().is_err());
+        pump.abort();
+    })
+    .await
+    .unwrap();
+}
+
+/// The lengths of the datagrams `src` has sent on `net`, in order.
+fn sent_lengths(net: &SimNet, src: SocketAddr) -> Vec<usize> {
+    net.events()
+        .into_iter()
+        .filter_map(|event| match event {
+            NetEvent::Sent { id, len, .. } if id.link.src == src => Some(len),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Bounds a simulation test in virtual time. It leaves room for the 91 s the
 /// rebind test sleeps on purpose, and a hang still fails within seconds of
 /// wall time, because paused time jumps ahead while the test waits.
@@ -3219,8 +3773,8 @@ async fn unusable_kx_groups_fail_at_bind() {
 }
 
 /// M3.6: `bind` injects nothing. Each socket's endpoint config is the
-/// production one, with no seed, and the TLS provider is rustls' ring
-/// default.
+/// production one, with no seed, and the TLS provider is the production
+/// one: rustls' ring provider with the hybrid group first.
 #[tokio::test]
 async fn bind_keeps_the_production_inputs() {
     let endpoint =
@@ -3237,7 +3791,7 @@ async fn bind_keeps_the_production_inputs() {
         format!("{:?}", shared.config.endpoint_config())
     );
     assert!(socket_config.contains("rng_seed: None"), "{socket_config}");
-    assert!(shared.tls.uses_default_provider());
+    assert!(shared.tls.uses_production_provider());
     endpoint.shutdown().await;
 }
 

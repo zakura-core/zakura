@@ -345,14 +345,17 @@ fn mempool_storage_crud_same_effects_mainnet() {
     // Check that it is in the mempool, and not rejected.
     assert!(storage.contains(&unmined_tx_2.transaction.id().mined_id()));
 
-    // The pool core finds that a block spent its inputs. Storage removes it and
-    // caches it as a duplicate spend.
-    let mined_id = unmined_tx_2.transaction.id().mined_id();
-    assert!(storage.remove_one(&mined_id).is_some());
-    storage.reject_effects_chain(
-        mined_id,
-        SameEffectsChainRejectionError::DuplicateSpend,
+    // A block spends its inputs. Storage removes it and caches it as a
+    // duplicate spend.
+    let removed = storage.connect_block(
+        &[],
+        [unmined_tx_2.transaction.transaction().as_ref()],
+        Height(1),
         crate::Instant::now(),
+    );
+    assert_eq!(
+        removed.dropped,
+        vec![(unmined_tx_2.transaction.id(), RemovalReason::Conflicted)]
     );
 
     // Check that it is /not/ in the mempool as a verified transaction.
@@ -419,6 +422,53 @@ fn mempool_rejects_ironwood_conflict_on_insert() {
     assert_eq!(
         storage.rejection(&second_mempool_id, crate::Instant::now()),
         Some(SameEffectsTipRejectionError::SpendConflict.into())
+    );
+}
+
+/// A block transaction that was never pooled removes the pooled transaction
+/// sharing its Ironwood nullifier.
+#[test]
+fn mempool_removes_ironwood_block_conflict() {
+    let _init_guard = zakura_test::init();
+
+    let mut storage: Storage = Storage::new(&config::Config {
+        tx_cost_limit: 160_000_000,
+        eviction_memory_time: EVICTION_MEMORY_TIME,
+        ..Default::default()
+    });
+
+    let action = ironwood_action();
+    let pooled_tx = verified_ironwood_v6_tx(Height(1_000), action.clone());
+    let rival = ironwood_v6_tx(Height(2_000), action);
+    let pooled_id = pooled_tx.transaction.id();
+    assert_ne!(pooled_id.mined_id(), rival.hash());
+
+    storage
+        .insert(
+            pooled_tx,
+            Vec::new(),
+            None,
+            crate::Instant::now(),
+            chrono::Utc::now(),
+        )
+        .expect("an empty pool accepts the transaction");
+
+    let removed = storage.connect_block(
+        &[rival.hash()],
+        [rival.as_ref()],
+        Height(1),
+        crate::Instant::now(),
+    );
+
+    assert!(removed.mined.is_empty());
+    assert_eq!(
+        removed.dropped,
+        vec![(pooled_id, RemovalReason::Conflicted)]
+    );
+    assert!(!storage.contains(&pooled_id.mined_id()));
+    assert_eq!(
+        storage.rejection(&pooled_id, crate::Instant::now()),
+        Some(SameEffectsChainRejectionError::DuplicateSpend.into())
     );
 }
 

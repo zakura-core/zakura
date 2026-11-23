@@ -1017,8 +1017,8 @@ fn a_punishment_before_any_judgement_reaches_the_honest_trigger() {
     assert_eq!(judged(Punished::Judged, Expect::Holds), Ok(()));
 }
 
-/// The committed scenarios of the generated IDs' typed planted cases
-/// (hdr-14.5), by fixture name `header-wire-planted-<name>.json`: an act's
+/// The scenarios of the generated IDs' typed planted cases (hdr-14.5), by
+/// their QA store name `fixtures/header-wire-planted-<name>.json`: an act's
 /// focused scenario ([`act_scenario`]) for each act no saved Plan takes,
 /// the status bursts' cut at the 20th, an adversary serving the node its
 /// chain and the held subscription, both with no act, and the node serving
@@ -1140,46 +1140,21 @@ fn served_subscription() -> WireScenario {
     }
 }
 
-/// The committed fixture file `name`.
-fn fixture_file(name: &str) -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures")
-        .join(name)
-}
-
-/// `scenario` as its committed JSON.
+/// `scenario` as the QA store holds it.
 fn scenario_json(scenario: &WireScenario) -> String {
     serde_json::to_string_pretty(scenario).expect("scenarios serialize") + "\n"
 }
 
-/// The committed typed planted inputs are what their builders give.
-///
-/// This fails if a builder or the scenario format changes; after a
-/// deliberate change, run `regenerate_planted_scenarios`.
+/// Rewrites the typed planted inputs in the QA store, which
+/// `ZAKURA_QA_STORE` names. Run it with `RUSTFLAGS="--cfg zakura_sim" cargo
+/// test -p zakura-sim --test header_wire_witness -- --ignored
+/// regenerate_planted_scenarios`.
 #[test]
-fn planted_scenarios_match_their_builders() {
-    let read = |name: &str| {
-        std::fs::read_to_string(fixture_file(name))
-            .unwrap_or_else(|error| panic!("{name}: {error}"))
-    };
-    for (name, scenario) in planted_scenarios() {
-        let file = format!("header-wire-planted-{name}.json");
-        assert_eq!(
-            read(&file),
-            scenario_json(&scenario),
-            "run `regenerate_planted_scenarios`"
-        );
-    }
-}
-
-/// Rewrites the typed planted inputs. Run it
-/// with `RUSTFLAGS="--cfg zakura_sim" cargo test -p zakura-sim --test
-/// header_wire_witness -- --ignored regenerate_planted_scenarios`.
-#[test]
-#[ignore = "rewrites the committed planted scenarios"]
+#[ignore = "rewrites the typed planted scenarios in the QA store"]
 fn regenerate_planted_scenarios() {
     for (name, scenario) in planted_scenarios() {
-        let file = fixture_file(&format!("header-wire-planted-{name}.json"));
-        std::fs::write(file, scenario_json(&scenario)).expect("the fixture directory exists");
+        let path = support::qa_store::fixture(&format!("header-wire-planted-{name}.json"));
+        std::fs::write(&path, scenario_json(&scenario))
+            .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
     }
 }

@@ -110,6 +110,26 @@ pub(super) struct ReactorState {
     ///
     /// The admitted peer limits bound this queue. New identities enter behind established peers.
     pub(super) vct_supplier_order: VecDeque<ZakuraPeerId>,
+    /// The last place handed out in the ordinary-offer rotation. See
+    /// [`PeerSchedule::turn`].
+    last_turn: u64,
+    /// The target and place of each admitted peer's idle offer held back
+    /// because another peer owns that target. See [`Self::overtakes_waiting`].
+    ///
+    /// Keyed by peer, so the admitted peer limits bound it: a peer's newer
+    /// wait replaces its older one, and its session's removal drops it.
+    waiting_for_target: HashMap<ZakuraPeerId, (block::Hash, OfferPlace)>,
+    /// The earliest place of an idle offer held back by full staging slots.
+    waiting_for_slot: Option<OfferPlace>,
+}
+
+/// An offer's place in the cached pass: offers that claim less work than the
+/// node's own come after the rest ([`PeerWorkPriority`]), and the rotation
+/// ([`PeerSchedule::turn`]) orders each priority.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(super) struct OfferPlace {
+    priority: std::cmp::Reverse<PeerWorkPriority>,
+    turn: u64,
 }
 
 impl ReactorState {
@@ -139,6 +159,9 @@ impl ReactorState {
             vct_repair_stall: None,
             vct_local_operation: None,
             vct_supplier_order: VecDeque::new(),
+            last_turn: 0,
+            waiting_for_target: HashMap::new(),
+            waiting_for_slot: None,
         }
     }
 
@@ -180,6 +203,8 @@ impl ReactorState {
             .expect("the fresh schedule was just inserted");
         schedule.unproductive_requests = strikes;
         schedule.replaced_request_budget = replaced_request_budget;
+        self.last_turn += 1;
+        schedule.turn = self.last_turn;
         if !replaced {
             self.vct_supplier_order.push_back(peer.clone());
         }
@@ -218,6 +243,7 @@ impl ReactorState {
         self.close_deadlines.remove(peer);
         self.pending_closes.remove(peer);
         self.vct_supplier_order.retain(|queued| queued != peer);
+        self.waiting_for_target.remove(peer);
     }
 
     /// Record `status` as `peer`'s unspent offer.
@@ -226,6 +252,114 @@ impl ReactorState {
             schedule.last_status = Some(status);
             schedule.status_spent = false;
         }
+    }
+
+    /// Move `peer` to the back of the ordinary-offer rotation, because its
+    /// offer just took a turn. See [`PeerSchedule::turn`].
+    pub(super) fn take_turn(&mut self, peer: &ZakuraPeerId) {
+        if let Some(schedule) = self.peers.get_mut(peer) {
+            self.last_turn += 1;
+            schedule.turn = self.last_turn;
+        }
+    }
+
+    /// The place in the cached pass of `peer`'s offer at `priority`.
+    fn place(&self, peer: &ZakuraPeerId, priority: PeerWorkPriority) -> Option<OfferPlace> {
+        self.peers.get(peer).map(|schedule| OfferPlace {
+            priority: std::cmp::Reverse(priority),
+            turn: schedule.turn,
+        })
+    }
+
+    /// Note that `peer`'s idle offer at `priority` waits because another peer
+    /// owns `target`.
+    pub(super) fn note_waiting_for_target(
+        &mut self,
+        peer: &ZakuraPeerId,
+        priority: PeerWorkPriority,
+        target: block::Hash,
+    ) {
+        if let Some(place) = self.place(peer, priority) {
+            let wait = (target, place);
+            self.waiting_for_target
+                .entry(peer.clone())
+                .and_modify(|earlier| {
+                    *earlier = if earlier.0 == target {
+                        (target, earlier.1.min(place))
+                    } else {
+                        // The peer's offer moved to another target.
+                        wait
+                    }
+                })
+                .or_insert(wait);
+        }
+    }
+
+    /// Note that `peer`'s idle offer at `priority` waits for a staging slot or
+    /// for header room, which every offer shares like a slot.
+    pub(super) fn note_waiting_for_slot(
+        &mut self,
+        peer: &ZakuraPeerId,
+        priority: PeerWorkPriority,
+    ) {
+        if let Some(place) = self.place(peer, priority) {
+            self.waiting_for_slot =
+                Some(self.waiting_for_slot.map_or(place, |slot| slot.min(place)));
+        }
+    }
+
+    /// The number of target waits held.
+    #[cfg(test)]
+    pub(super) fn target_waits(&self) -> usize {
+        self.waiting_for_target.len()
+    }
+
+    /// Forget the waiting offers, because a full pass is about to note again
+    /// each one it leaves waiting.
+    pub(super) fn clear_waiting(&mut self) {
+        self.waiting_for_target.clear();
+        self.waiting_for_slot = None;
+    }
+
+    /// Whether `peer`'s fresh offer of `target` at `priority` would stage
+    /// ahead of an idle offer that waits for the same target or for a slot and
+    /// comes earlier in the cached pass.
+    ///
+    /// Between passes, an offer can stage only on its own status. While a
+    /// pass is owed, because it waits for its refill or a target or slot
+    /// freed earlier in the reactor turn, a status that arrives just after
+    /// the release would otherwise stage ahead of the offers the pass owes it
+    /// to. The admitted peer limits bound the target entries, and a stale
+    /// entry only makes a fresh status wait for the next pass.
+    pub(super) fn overtakes_waiting(
+        &self,
+        peer: &ZakuraPeerId,
+        priority: PeerWorkPriority,
+        target: block::Hash,
+    ) -> bool {
+        self.overtakes_waiting_for_target(peer, priority, target)
+            || self.place(peer, priority).is_some_and(|place| {
+                self.waiting_for_slot
+                    .is_some_and(|earliest| earliest < place)
+            })
+    }
+
+    /// Whether `peer`'s fresh offer of `target` at `priority` would stage
+    /// ahead of an idle offer that waits for the same target and comes
+    /// earlier in the cached pass. See [`Self::overtakes_waiting`].
+    pub(super) fn overtakes_waiting_for_target(
+        &self,
+        peer: &ZakuraPeerId,
+        priority: PeerWorkPriority,
+        target: block::Hash,
+    ) -> bool {
+        self.place(peer, priority).is_some_and(|place| {
+            self.waiting_for_target
+                .iter()
+                .any(|(waiter, (waits_for, earlier))| {
+                    waiter != peer && *waits_for == target && *earlier < place
+                })
+        })
     }
 
     /// Spend `peer`'s offer.
@@ -295,8 +429,8 @@ impl ReactorState {
         self.last_scheduling_opportunity = Some(opportunity);
     }
 
-    /// The unspent offers of peers without work, in cached-pass order: more
-    /// claimed work first, then ascending peer bytes.
+    /// The unspent offers of peers without work, with their priorities, in
+    /// cached-pass order ([`OfferPlace`]).
     ///
     /// `session_id` names each admitted peer's session.
     pub(super) fn cached_offers(
@@ -304,7 +438,7 @@ impl ReactorState {
         local: &zakura_header_chain::EngineSnapshot,
         has_work: impl Fn(&ZakuraPeerId) -> bool,
         session_id: impl Fn(&ZakuraPeerId) -> u64,
-    ) -> Vec<(ZakuraPeerId, AdvertisedHeaderTarget)> {
+    ) -> Vec<(ZakuraPeerId, PeerWorkPriority, AdvertisedHeaderTarget)> {
         let mut offers: Vec<_> = self
             .peers
             .iter()
@@ -317,19 +451,17 @@ impl ReactorState {
                     status: status.clone(),
                 };
                 let priority = PeerWorkPriority::from_work_order(target.claimed_work_order(local));
-                Some((priority, peer.clone(), target))
+                let place = OfferPlace {
+                    priority: std::cmp::Reverse(priority),
+                    turn: schedule.turn,
+                };
+                Some((place, peer.clone(), priority, target))
             })
             .collect();
-        offers.sort_unstable_by(
-            |(left_priority, left_peer, _), (right_priority, right_peer, _)| {
-                right_priority
-                    .cmp(left_priority)
-                    .then_with(|| left_peer.as_bytes().cmp(right_peer.as_bytes()))
-            },
-        );
+        offers.sort_unstable_by_key(|(place, ..)| *place);
         offers
             .into_iter()
-            .map(|(_, peer, target)| (peer, target))
+            .map(|(_, peer, priority, target)| (peer, priority, target))
             .collect()
     }
 
@@ -951,7 +1083,8 @@ impl ReactorState {
     ///   peer;
     /// - every pending storage call and locator read carries a number already
     ///   issued, and each locator read's call is a locator call;
-    /// - the cached-pass budget holds at most [`CACHED_PASS_BURST`] passes.
+    /// - the cached-pass budget holds at most [`CACHED_PASS_BURST`] passes;
+    /// - only admitted peers hold a target wait, which bounds the waits.
     #[cfg(any(test, feature = "p2p-fuzz"))]
     pub(super) fn assert_invariants(&self) {
         let ordered: HashSet<&ZakuraPeerId> = self.vct_supplier_order.iter().collect();
@@ -981,6 +1114,12 @@ impl ReactorState {
         assert!(
             self.cached_pass_budget.passes <= CACHED_PASS_BURST,
             "the cached-pass budget holds at most its burst"
+        );
+        assert!(
+            self.waiting_for_target
+                .keys()
+                .all(|peer| self.peers.contains_key(peer)),
+            "only an admitted peer holds a target wait"
         );
     }
 }
@@ -1062,6 +1201,16 @@ pub(super) struct PeerSchedule {
     /// timeout and then decline it for free, so a replacement buys nothing
     /// more.
     pub(super) replaced_request_budget: Option<Duration>,
+    /// The peer's place in the ordinary-offer rotation: lower goes first
+    /// among offers of equal priority ([`PeerWorkPriority`]).
+    ///
+    /// A session takes the next place when it's admitted, and its peer takes
+    /// the next again each time its offer stages. So a waiting offer goes
+    /// ahead of every peer that arrived or took a turn after it, and an
+    /// adversary that reopens under a fresh key, which the stall rule's
+    /// cooldown and held strikes don't follow, joins the back. The place
+    /// never penalizes an identity: it only says who waited longest.
+    pub(super) turn: u64,
 }
 
 impl StorageCallKind {

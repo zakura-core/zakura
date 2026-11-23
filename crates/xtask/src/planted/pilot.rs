@@ -502,17 +502,12 @@ fn feedback_comparison(repo_root: &Path, flags: Flags, work: &Path) -> Result<Wr
         ..
     } = flags;
     let registry = seeds::build(repo_root, &work.join("registry"))?;
-    let (bytes, list) = feedback::read(repo_root, &registry)?;
-    // The pins check each case's patch, input and production files at
-    // `HEAD`. The list and each case's file come from the tree, so they
-    // must match `HEAD` too.
-    let mut read_from_tree = vec![PathBuf::from(feedback::LIST)];
-    read_from_tree.extend(
-        list.cases
-            .iter()
-            .map(|case| case.patch.with_extension("toml")),
-    );
-    check_committed(repo_root, &read_from_tree)?;
+    let store = super::planted_layout::require_store()?;
+    let (bytes, list) = feedback::read(repo_root, &store, &registry)?;
+    // The pins check each case's patch and input in the store, and its
+    // production files at `HEAD`. The list comes from the tree, so it must
+    // match `HEAD` too.
+    check_committed(repo_root, &[PathBuf::from(feedback::LIST)])?;
     let cases = select(&list.cases, &only)?;
     let seeds = select_allocated(&list.bounds.seeds, &seeds, "seed")?;
     let arms = select_allocated(&list.bounds.feedback_arms, &arms, "arm")?;

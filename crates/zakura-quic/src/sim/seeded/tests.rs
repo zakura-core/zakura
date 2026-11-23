@@ -142,6 +142,52 @@ fn the_seeded_group_agrees_with_rings_x25519() {
     assert_eq!(inputs.streams.slot.name(), NamedGroup::X25519);
 }
 
+/// The seeded hybrid is the production combiner on seeded halves, so it
+/// completes against the production group in both directions. Each side
+/// takes two draws of the key-exchange stream, one per half.
+#[test]
+fn the_seeded_hybrid_agrees_with_the_production_hybrid() {
+    let inputs = SeededInputs::new(SEED, 1);
+    let seeded = inputs.streams.slot.hybrid();
+    let production = crate::tls::hybrid::x25519_mlkem768();
+    assert_eq!(seeded.name(), NamedGroup::X25519MLKEM768);
+    assert_eq!(seeded.name(), production.name());
+
+    let dialer = seeded.start().unwrap();
+    assert_eq!(inputs.record().draws[&Source::KeyExchange], 2);
+    let listener = production.start_and_complete(dialer.pub_key()).unwrap();
+    let secret = dialer.complete(&listener.pub_key).unwrap();
+    assert_eq!(secret.secret_bytes(), listener.secret.secret_bytes());
+
+    let dialer = production.start().unwrap();
+    let listener = seeded.start_and_complete(dialer.pub_key()).unwrap();
+    assert_eq!(inputs.record().draws[&Source::KeyExchange], 4);
+    let secret = dialer.complete(&listener.pub_key).unwrap();
+    assert_eq!(secret.secret_bytes(), listener.secret.secret_bytes());
+}
+
+/// The same seed and node replay the same hybrid shares, on the dialer's
+/// side and on the listener's. Another node gets other shares.
+#[test]
+fn the_seeded_hybrid_replays_its_shares() {
+    let shares = |node| {
+        let inputs = SeededInputs::new(SEED, node);
+        let hybrid = inputs.streams.slot.hybrid();
+        let dialer = hybrid.start().unwrap().pub_key().to_vec();
+        let listener = hybrid.start_and_complete(&dialer).unwrap().pub_key;
+        (dialer, listener)
+    };
+    assert_eq!(shares(3), shares(3));
+    assert_ne!(shares(3), shares(4));
+}
+
+/// A slot leaks its hybrid group once and hands out the same one after.
+#[test]
+fn a_slot_keeps_one_hybrid_group() {
+    let slot = SeededInputs::new(SEED, 1).streams.slot;
+    assert!(std::ptr::addr_eq(slot.hybrid(), slot.hybrid()));
+}
+
 #[test]
 fn the_seeded_group_refuses_bad_key_shares() {
     let inputs = SeededInputs::new(SEED, 1);

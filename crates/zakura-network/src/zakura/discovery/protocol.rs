@@ -13,7 +13,7 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use rand_10::seq::SliceRandom;
 use thiserror::Error;
 use zakura_chain::block;
-use zakura_quic::{NodeAddr, NodeId, NodeSecretKey};
+use zakura_quic::{NodeAddr, NodeId, NodeKeyList, NodeSecretKey};
 use zakura_rt::{
     collections::{hash_map, HashMap, HashSet},
     sync::{watch, AsyncMutex},
@@ -59,7 +59,7 @@ pub const MSG_DISCOVERY_SERVICES: u8 = 5;
 ///
 /// The fixed fields with [`MAX_DIRECT_ADDRS_PER_RECORD`] IPv6 addresses and
 /// [`MAX_SERVICES_PER_RECORD`] maximal service ids fill it exactly.
-pub const MAX_NODE_RECORD_BODY_BYTES: usize = 580;
+pub const MAX_NODE_RECORD_BODY_BYTES: usize = 685;
 /// Maximum bytes in an encoded node record: its length, body, and signature.
 pub const MAX_NODE_RECORD_BYTES: usize = 4 + MAX_NODE_RECORD_BODY_BYTES + SIGNATURE_BYTES;
 /// Maximum direct addresses in a node record.
@@ -151,7 +151,7 @@ const ZAKURA_NODE_RECORD_SIG_DOMAIN: &[u8] = b"zakura-node-record-v1";
 /// Records are relayed third-party data, so this version is not negotiated per hop.
 /// Version 2 added [`ZakuraNodeRecordBody::extensions`]. Future soft changes go in that
 /// extension area and keep this version; only a change to the fixed fields bumps it.
-const ZAKURA_NODE_RECORD_FORMAT_VERSION: u16 = 2;
+const ZAKURA_NODE_RECORD_FORMAT_VERSION: u16 = 3;
 
 /// A bounded ASCII Zakura service identifier.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -240,8 +240,9 @@ impl TryFrom<String> for ZakuraServiceId {
 /// The signed fields in a Zakura node record.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ZakuraNodeRecordBody {
-    /// The authoring node id.
-    pub node_id: NodeId,
+    /// The author's keys. Their hash is the author's node id, and the
+    /// record is signed with the Ed25519 key among them.
+    pub keys: NodeKeyList,
     /// Direct dial addresses advertised by the author.
     pub direct_addrs: Vec<SocketAddr>,
     /// Native services advertised by the author.
@@ -273,6 +274,11 @@ pub struct ZakuraNodeRecordBody {
 }
 
 impl ZakuraNodeRecordBody {
+    /// The authoring node's id: the hash of [`Self::keys`].
+    pub fn node_id(&self) -> NodeId {
+        self.keys.node_id()
+    }
+
     /// Encodes this body into canonical bytes for signing and verification.
     pub fn encode_for_signature(&self) -> Result<Vec<u8>, DiscoveryWireError> {
         validate_record_body_bounds(self)?;
@@ -305,12 +311,12 @@ pub struct ZakuraNodeRecord {
 }
 
 impl ZakuraNodeRecord {
-    /// Signs `body` with the node secret key matching `body.node_id`.
+    /// Signs `body` when its full author key list matches the signer's credential.
     pub fn sign(
         body: ZakuraNodeRecordBody,
         secret_key: &NodeSecretKey,
     ) -> Result<Self, DiscoveryWireError> {
-        if body.node_id != secret_key.public() {
+        if &body.keys != secret_key.key_list() {
             return Err(DiscoveryWireError::SigningKeyMismatch);
         }
         let signature = secret_key.sign(&body.encode_for_signature()?);
@@ -345,7 +351,9 @@ impl ZakuraNodeRecord {
         // torsion component passes the cofactored equation alone, but it can
         // never authenticate a dial, so its record is useless to the book.
         self.body
-            .node_id
+            .keys
+            .ed25519()
+            .ok_or(DiscoveryRecordError::NoSupportedKey)?
             .verify_strict(&body_bytes, &self.signature)
             .map_err(|_| DiscoveryRecordError::InvalidSignature)?;
         validate_record_context(&self.body, context)
@@ -674,8 +682,8 @@ pub enum DiscoveryWireError {
     #[error("numeric overflow while encoding Zakura discovery {0}")]
     NumericOverflow(&'static str),
 
-    /// The signing key does not match the record author.
-    #[error("Zakura discovery signing key does not match record node id")]
+    /// The signer's credential and the record name different nodes.
+    #[error("Zakura discovery record author differs from the signer's node ID")]
     SigningKeyMismatch,
 
     /// The record has an invalid protocol range.
@@ -706,6 +714,15 @@ pub enum DiscoveryRecordError {
     /// The record signature does not verify.
     #[error("invalid Zakura discovery record signature")]
     InvalidSignature,
+
+    /// The author's key list is well formed but holds no key this release
+    /// can check a signature with, so the record can't be verified.
+    ///
+    /// This is not the sender's fault: a node relays key lists it can't read
+    /// byte for byte. It MUST only drop the record, in this and every later
+    /// release, or a newer node would disconnect older relays.
+    #[error("Zakura discovery record has no supported key")]
+    NoSupportedKey,
 
     /// The record is expired beyond clock skew tolerance.
     #[error("expired Zakura discovery record")]
@@ -958,7 +975,10 @@ pub(crate) enum DialAdmission {
 impl ZakuraDiscoveryDialCandidate {
     /// Converts this candidate into a dial address.
     pub fn node_addr(&self) -> NodeAddr {
-        NodeAddr::with_addrs(self.node_id, self.direct_addrs.clone())
+        NodeAddr {
+            id: self.node_id,
+            direct: self.direct_addrs.clone(),
+        }
     }
 }
 
@@ -1102,9 +1122,9 @@ pub(super) fn hello_verdict(error: &DiscoveryBookError) -> RecordVerdict {
             | DiscoveryRecordError::WrongNetwork
             | DiscoveryRecordError::WrongChain
             | DiscoveryRecordError::IncompatibleProtocol => RecordVerdict::Disconnect,
-            DiscoveryRecordError::Expired | DiscoveryRecordError::FarFutureExpiry => {
-                RecordVerdict::Drop
-            }
+            DiscoveryRecordError::NoSupportedKey
+            | DiscoveryRecordError::Expired
+            | DiscoveryRecordError::FarFutureExpiry => RecordVerdict::Drop,
         },
         DiscoveryBookError::MismatchedConnectedPeerRecord => RecordVerdict::Disconnect,
         DiscoveryBookError::SelfRecord
@@ -1124,6 +1144,7 @@ pub(super) fn hello_verdict(error: &DiscoveryBookError) -> RecordVerdict {
 fn relay_verdict(error: &DiscoveryRecordError) -> RecordVerdict {
     match error {
         DiscoveryRecordError::IncompatibleProtocol
+        | DiscoveryRecordError::NoSupportedKey
         | DiscoveryRecordError::Expired
         | DiscoveryRecordError::FarFutureExpiry => RecordVerdict::Drop,
         DiscoveryRecordError::Wire(_)
@@ -1270,6 +1291,8 @@ pub struct ZakuraDiscoveryBook {
     /// The non-static entries in eviction order. Every change to an entry
     /// updates it.
     eviction: EvictionIndex,
+    /// Which addresses records learned from peers may carry.
+    address_scope: AddressScope,
 }
 
 /// One disclosure epoch's peer-sample candidates, in random order.
@@ -1419,7 +1442,7 @@ impl fmt::Debug for ZakuraDiscoveryHandle {
             .debug_struct("ZakuraDiscoveryHandle")
             .field(
                 "self_record_node_id",
-                &self.self_record.borrow().body.node_id,
+                &self.self_record.borrow().body.node_id(),
             )
             .finish_non_exhaustive()
     }
@@ -1591,7 +1614,7 @@ impl ZakuraDiscoveryHandle {
 
     /// Returns the local node id used in authored self-records.
     pub fn local_node_id(&self) -> NodeId {
-        self.self_record.borrow().body.node_id
+        self.self_record.borrow().body.node_id()
     }
 
     /// Returns the configured peer sample limit for active exchanges.
@@ -1914,7 +1937,7 @@ impl ZakuraDiscoveryHandle {
         record: ZakuraNodeRecord,
         peer_node_id: NodeId,
     ) -> Result<VerifiedHold<VerifiedRecord>, DiscoveryBookError> {
-        if record.body.node_id != peer_node_id {
+        if record.body.node_id() != peer_node_id {
             return Err(DiscoveryBookError::MismatchedConnectedPeerRecord);
         }
         validate_record_body_bounds(&record.body).map_err(DiscoveryRecordError::Wire)?;
@@ -2265,7 +2288,14 @@ impl ZakuraDiscoveryBook {
             generation: 0,
             relayed: HashMap::new(),
             eviction: EvictionIndex::default(),
+            address_scope: AddressScope::default(),
         }
+    }
+
+    /// Lets records learned from peers carry the addresses `scope` allows.
+    pub(super) fn with_address_scope(mut self, scope: AddressScope) -> Self {
+        self.address_scope = scope;
+        self
     }
 
     /// Returns how many node ids the current sample snapshot retains.
@@ -2294,7 +2324,8 @@ impl ZakuraDiscoveryBook {
         for (node_id, entry) in &self.entries {
             eviction.insert(*node_id, entry);
             assert_eq!(
-                entry.record.body.node_id, *node_id,
+                entry.record.body.node_id(),
+                *node_id,
                 "{PROPERTY}: an entry under another node id"
             );
             if let Some(relay) = relay_of(entry.source, *node_id) {
@@ -2477,8 +2508,8 @@ impl ZakuraDiscoveryBook {
     ///
     /// Static records are trusted-by-operator configuration, so this import path permits loopback
     /// and other local direct addresses needed by single-host regtest deployments. Untrusted
-    /// peer/gossip imports through [`Self::import_record`] keep requiring globally dialable
-    /// addresses.
+    /// peer/gossip imports through [`Self::import_record`] keep the book's [`AddressScope`]:
+    /// globally dialable addresses, plus loopback and private ones on Regtest.
     pub fn import_static_record(
         &mut self,
         record: ZakuraNodeRecord,
@@ -2606,10 +2637,10 @@ impl ZakuraDiscoveryBook {
 
     /// Whether `entry` may appear in a peer sample now.
     fn is_sample_eligible(&self, entry: &ZakuraDiscoveryEntry, now: u64) -> bool {
-        self.local_node_id != Some(entry.record.body.node_id)
+        self.local_node_id != Some(entry.record.body.node_id())
             && !entry_is_expired(entry, now)
             && entry.is_confirmed()
-            && has_discovery_dialable_direct_addrs(&entry.record)
+            && has_discovery_dialable_direct_addrs(&entry.record, self.address_scope)
     }
 
     /// Starts a new snapshot for a new epoch, and adds the book's new
@@ -2715,9 +2746,9 @@ impl ZakuraDiscoveryBook {
             .entries
             .values()
             .filter(|entry| {
-                !connected_node_ids.contains(&entry.record.body.node_id)
-                    && !in_flight_node_ids.contains(&entry.record.body.node_id)
-                    && self.local_node_id != Some(entry.record.body.node_id)
+                !connected_node_ids.contains(&entry.record.body.node_id())
+                    && !in_flight_node_ids.contains(&entry.record.body.node_id())
+                    && self.local_node_id != Some(entry.record.body.node_id())
                     && !entry_is_expired(entry, now)
                     && !entry_in_dial_backoff(entry, now, dial_backoff.0, dial_backoff.1)
                     && !in_alpn_backoff(entry.alpn_backoff_until, now)
@@ -2728,7 +2759,7 @@ impl ZakuraDiscoveryBook {
                         dial_backoff.1,
                     )
                     && advertises_all_services(&entry.record, required_services)
-                    && has_discovery_usable_direct_addrs(entry)
+                    && has_discovery_usable_direct_addrs(entry, self.address_scope)
             })
             .map(DialCandidateRef::SignedRecord)
             .chain(self.static_candidates.values().filter_map(|candidate| {
@@ -2877,13 +2908,13 @@ impl ZakuraDiscoveryBook {
         entries.sort_unstable_by_key(|entry| {
             (
                 Reverse(entry.last_seen),
-                node_id_sort_key(&entry.record.body.node_id),
+                node_id_sort_key(&entry.record.body.node_id()),
             )
         });
         entries
             .into_iter()
             .take(limit)
-            .map(|entry| entry.record.body.node_id)
+            .map(|entry| entry.record.body.node_id())
             .collect()
     }
 
@@ -2904,7 +2935,7 @@ impl ZakuraDiscoveryBook {
                 failure_count: entry.failure_count,
             })
             .collect();
-        entries.sort_by_key(|entry| node_id_sort_key(&entry.record.body.node_id));
+        entries.sort_by_key(|entry| node_id_sort_key(&entry.record.body.node_id()));
         entries
     }
 
@@ -2982,7 +3013,7 @@ impl ZakuraDiscoveryBook {
         record: ZakuraNodeRecord,
         context: &DiscoveryRecordValidationContext,
     ) -> Result<VerifiedRecord, DiscoveryBookError> {
-        if self.local_node_id == Some(record.body.node_id) {
+        if self.local_node_id == Some(record.body.node_id()) {
             return Err(DiscoveryBookError::SelfRecord);
         }
         Ok(VerifiedRecord::verify(record, context)?)
@@ -3000,7 +3031,7 @@ impl ZakuraDiscoveryBook {
         context: &DiscoveryRecordValidationContext,
         changes: &mut Vec<BookChange>,
     ) -> Result<ImportOutcome, DiscoveryBookError> {
-        if self.local_node_id == Some(record.body.node_id) {
+        if self.local_node_id == Some(record.body.node_id()) {
             return Err(DiscoveryBookError::SelfRecord);
         }
 
@@ -3009,11 +3040,11 @@ impl ZakuraDiscoveryBook {
         let direct_addr_policy = if metadata.is_static {
             DiscoveryDirectAddrPolicy::StaticConfigured
         } else {
-            DiscoveryDirectAddrPolicy::UntrustedPeer
+            DiscoveryDirectAddrPolicy::UntrustedPeer(self.address_scope)
         };
         validate_discovery_direct_addrs(&record, direct_addr_policy)?;
 
-        let node_id = record.body.node_id;
+        let node_id = record.body.node_id();
         let sequence = record.body.sequence;
         // A relay may hold only so many third-party entries.
         let full_relay = relay_of(metadata.source, node_id).filter(|relay| {
@@ -3252,7 +3283,8 @@ pub(crate) struct DialCandidateExclusions<'a> {
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum DiscoveryDirectAddrPolicy {
-    UntrustedPeer,
+    /// A record learned from a peer, checked against the book's scope.
+    UntrustedPeer(AddressScope),
     StaticConfigured,
 }
 
@@ -3265,7 +3297,7 @@ enum DialCandidateRef<'a> {
 impl DialCandidateRef<'_> {
     fn node_id(&self) -> NodeId {
         match self {
-            Self::SignedRecord(entry) => entry.record.body.node_id,
+            Self::SignedRecord(entry) => entry.record.body.node_id(),
             Self::StaticConfigured(candidate) => candidate.node_id,
         }
     }
@@ -3301,7 +3333,7 @@ impl DialCandidateRef<'_> {
     fn into_candidate(self) -> ZakuraDiscoveryDialCandidate {
         match self {
             Self::SignedRecord(entry) => ZakuraDiscoveryDialCandidate {
-                node_id: entry.record.body.node_id,
+                node_id: entry.record.body.node_id(),
                 direct_addrs: confirmed_first(entry),
                 is_static: entry.is_static,
             },
@@ -3378,7 +3410,7 @@ fn import_metadata(
 ) -> DiscoveryEntryMetadata {
     let confirmed_addrs = if is_static {
         record.body.direct_addrs.clone()
-    } else if let Some(ip) = authenticated_ip.filter(|_| source == Some(record.body.node_id)) {
+    } else if let Some(ip) = authenticated_ip.filter(|_| source == Some(record.body.node_id())) {
         record
             .body
             .direct_addrs
@@ -3467,8 +3499,8 @@ fn update_existing_entry(
     let same_sequence = stored_orders && incoming_sequence == stored_sequence;
 
     let preserve_first_party_source = same_sequence
-        && entry.source == Some(entry.record.body.node_id)
-        && metadata.source != Some(entry.record.body.node_id);
+        && entry.source == Some(entry.record.body.node_id())
+        && metadata.source != Some(entry.record.body.node_id());
 
     if !preserve_first_party_source {
         entry.source = metadata.source;
@@ -3514,10 +3546,15 @@ fn current_sequence_tick() -> u64 {
         .unwrap_or(0)
 }
 
-pub(super) fn normalize_direct_addrs(addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
+/// Keeps the addresses `scope` allows in this node's own record, sorted and
+/// without duplicates, up to the per-record limit.
+pub(super) fn normalize_direct_addrs(
+    addrs: Vec<SocketAddr>,
+    scope: AddressScope,
+) -> Vec<SocketAddr> {
     let mut addrs: Vec<_> = addrs
         .into_iter()
-        .filter(is_discovery_dialable_addr)
+        .filter(|addr| scope.allows(addr))
         .collect();
     addrs.sort_unstable();
     addrs.dedup();
@@ -3599,14 +3636,51 @@ fn advertises_any_service(record: &ZakuraNodeRecord, wanted_services: &[ZakuraSe
         .any(|wanted| record.body.services.contains(wanted))
 }
 
+/// Which addresses the records this node learns from peers, and its own record,
+/// may carry.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub(super) enum AddressScope {
+    /// Only globally routable addresses. Every network except Regtest.
+    #[default]
+    Public,
+    /// Also loopback, RFC 1918 private and IPv6 unique-local addresses.
+    ///
+    /// Only Regtest, whose nodes share one host or a private network and
+    /// have no public addresses to exchange. Link-local targets such as
+    /// 169.254.169.254, and other special ranges, stay refused.
+    Local,
+}
+
+impl AddressScope {
+    /// Returns the scope for the network `network_id` names.
+    pub(super) fn for_network(network_id: ZakuraNetworkId) -> Self {
+        match network_id {
+            ZakuraNetworkId::Regtest => Self::Local,
+            ZakuraNetworkId::Mainnet | ZakuraNetworkId::Testnet | ZakuraNetworkId::Configured => {
+                Self::Public
+            }
+        }
+    }
+
+    /// Whether `addr` may appear in a record in this scope.
+    fn allows(self, addr: &SocketAddr) -> bool {
+        match self {
+            Self::Public => is_discovery_dialable_addr(addr),
+            Self::Local => is_discovery_dialable_addr(addr) || is_local_network_addr(addr),
+        }
+    }
+}
+
 /// Validates direct addresses for discovery-book storage.
 ///
-/// Untrusted peer/gossip records must only contain globally routable addresses, preserving the
-/// discovery security rule that gossiped records cannot inject loopback, link-local, multicast,
-/// broadcast, RFC 1918 private, RFC 6598 shared (CGNAT), or RFC 4193 unique-local targets. Static
-/// records are trusted-by-configuration bootstrap records, so they may use
-/// local addresses for regtest and single-host deployments, but still reject empty, unspecified, and
-/// port-0 targets that cannot be dialed as configured peers.
+/// Outside Regtest, untrusted peer/gossip records must only contain globally routable
+/// addresses, preserving the discovery security rule that gossiped records cannot inject
+/// loopback, link-local, multicast, broadcast, RFC 1918 private, RFC 6598 shared (CGNAT), or
+/// RFC 4193 unique-local targets. On Regtest they may also carry loopback, RFC 1918 private
+/// and unique-local addresses (see [`AddressScope`]). Static records are
+/// trusted-by-configuration bootstrap records, so they may use local addresses for regtest and
+/// single-host deployments, but still reject empty, unspecified, and port-0 targets that
+/// cannot be dialed as configured peers.
 fn validate_discovery_direct_addrs(
     record: &ZakuraNodeRecord,
     policy: DiscoveryDirectAddrPolicy,
@@ -3617,7 +3691,7 @@ fn validate_discovery_direct_addrs(
 
     for addr in &record.body.direct_addrs {
         let is_valid = match policy {
-            DiscoveryDirectAddrPolicy::UntrustedPeer => is_discovery_dialable_addr(addr),
+            DiscoveryDirectAddrPolicy::UntrustedPeer(scope) => scope.allows(addr),
             DiscoveryDirectAddrPolicy::StaticConfigured => {
                 is_static_discovery_configured_addr_usable(addr)
             }
@@ -3630,27 +3704,28 @@ fn validate_discovery_direct_addrs(
     Ok(())
 }
 
-fn has_discovery_dialable_direct_addrs(record: &ZakuraNodeRecord) -> bool {
+fn has_discovery_dialable_direct_addrs(record: &ZakuraNodeRecord, scope: AddressScope) -> bool {
     !record.body.direct_addrs.is_empty()
         && record
             .body
             .direct_addrs
             .iter()
-            .all(is_discovery_dialable_addr)
+            .all(|addr| scope.allows(addr))
 }
 
-fn has_discovery_usable_direct_addrs(entry: &ZakuraDiscoveryEntry) -> bool {
+fn has_discovery_usable_direct_addrs(entry: &ZakuraDiscoveryEntry, scope: AddressScope) -> bool {
     !entry.record.body.direct_addrs.is_empty()
         && entry.record.body.direct_addrs.iter().all(|addr| {
             if entry.is_static {
                 is_static_discovery_configured_addr_usable(addr)
             } else {
-                is_discovery_dialable_addr(addr)
+                scope.allows(addr)
             }
         })
 }
 
-/// Returns true only for addresses that are safe to dial from untrusted discovery gossip.
+/// Returns true only for addresses that are safe to dial from untrusted discovery gossip
+/// outside Regtest (see [`AddressScope`]).
 ///
 /// A signed `ZakuraNodeRecord` proves control of the node key, not ownership of the advertised
 /// `direct_addrs`. To stop an authenticated discovery peer from steering the candidate dialer at
@@ -3691,6 +3766,18 @@ fn is_discovery_dialable_ipv4(ip: &Ipv4Addr) -> bool {
         && !is_ipv4_documentation(ip)
         && !is_ipv4_benchmarking(ip)
         && !is_ipv4_reserved(ip)
+}
+
+/// Returns true for a loopback, RFC 1918 private or IPv6 unique-local address
+/// with a port: the local addresses Regtest nodes exchange.
+fn is_local_network_addr(addr: &SocketAddr) -> bool {
+    // Only the IPv4-mapped form is unwrapped: 6to4, Teredo and NAT64
+    // addresses embed an IPv4 address but do not reach it locally.
+    addr.port() != 0
+        && match addr.ip().to_canonical() {
+            IpAddr::V4(ip) => ip.is_loopback() || ip.is_private(),
+            IpAddr::V6(ip) => ip.is_loopback() || is_ipv6_unique_local(&ip),
+        }
 }
 
 fn is_static_discovery_configured_addr_usable(addr: &SocketAddr) -> bool {
@@ -4176,7 +4263,7 @@ mod tests {
     use std::{net::IpAddr, time::Duration};
 
     use rand_10::{rngs::StdRng, SeedableRng};
-    use zakura_quic::NodeSecretKey;
+    use zakura_quic::{NodeCredential, NodeSecretKey, ED25519_KEY_TAG, ML_DSA_44_KEY_TAG};
 
     use super::*;
     use crate::zakura::{
@@ -4189,7 +4276,11 @@ mod tests {
 
     #[test]
     fn disclosure_key_uses_stable_keyed_hash_vectors() {
-        let requester = NodeSecretKey::from_bytes(&[0; 32]).public();
+        let requester = NodeId::from_bytes(&[
+            0x3b, 0x6a, 0x27, 0xbc, 0xce, 0xb6, 0xa4, 0x2d, 0x62, 0xa3, 0xa8, 0xd0, 0x2a, 0x6f,
+            0x0d, 0x73, 0x65, 0x32, 0x15, 0x77, 0x1d, 0xe2, 0x43, 0xa6, 0x3a, 0xc0, 0x48, 0xa1,
+            0x8b, 0x59, 0xda, 0x29,
+        ]);
         // Python hashlib.blake2b independently generated these eight-byte vectors.
         for (key, epoch, expected) in [
             (7, 123, 6_598_621_294_292_466_246),
@@ -4206,6 +4297,9 @@ mod tests {
             "DisclosureKey { .. }"
         );
     }
+
+    /// A key tag this release does not know.
+    const UNREADABLE_KEY_TAG: u16 = 0x7f00;
 
     fn secret_key() -> NodeSecretKey {
         NodeSecretKey::generate()
@@ -4229,7 +4323,7 @@ mod tests {
 
     fn body(secret_key: &NodeSecretKey) -> ZakuraNodeRecordBody {
         ZakuraNodeRecordBody {
-            node_id: secret_key.public(),
+            keys: secret_key.key_list().clone(),
             direct_addrs: vec![
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::new(45, 33, 30, 10)), 8233),
                 SocketAddr::new(
@@ -4330,7 +4424,7 @@ mod tests {
 
     fn candidate_for(record: &ZakuraNodeRecord, is_static: bool) -> ZakuraDiscoveryDialCandidate {
         ZakuraDiscoveryDialCandidate {
-            node_id: record.body.node_id,
+            node_id: record.body.node_id(),
             direct_addrs: record.body.direct_addrs.clone(),
             is_static,
         }
@@ -4364,7 +4458,7 @@ mod tests {
         authenticated_ip: Option<IpAddr>,
         now: u64,
     ) -> Result<ImportOutcome, DiscoveryBookError> {
-        let source = record.body.node_id;
+        let source = record.body.node_id();
         let context = DiscoveryRecordValidationContext {
             current_unix_secs: now,
             ..context()
@@ -4474,7 +4568,7 @@ mod tests {
     /// Imports `record` as its author's own `Hello` over a connection from the
     /// IP of the record's first address, which the import confirms.
     async fn import_hello_record(handle: &ZakuraDiscoveryHandle, record: ZakuraNodeRecord) {
-        let author = record.body.node_id;
+        let author = record.body.node_id();
         let authenticated_ip = record.body.direct_addrs.first().map(SocketAddr::ip);
         handle
             .import_connected_peer_record(record, author, authenticated_ip)
@@ -4704,8 +4798,8 @@ mod tests {
         let other = signed_record();
         let services = vec![ZakuraServiceId::discovery(), service(1)];
         let mut excluded = [
-            *record.body.node_id.as_bytes(),
-            *other.body.node_id.as_bytes(),
+            *record.body.node_id().as_bytes(),
+            *other.body.node_id().as_bytes(),
         ];
         excluded.sort_unstable();
         let header_envelope =
@@ -4896,6 +4990,21 @@ mod tests {
     }
 
     #[test]
+    fn signing_refuses_another_identity_with_the_same_ed25519_key() {
+        let signer = secret_key();
+        let mut record = body(&signer);
+        record.keys = NodeKeyList::from_entries([
+            (ED25519_KEY_TAG, *signer.public_key().as_bytes()),
+            (UNREADABLE_KEY_TAG, [0x55; 32]),
+        ])
+        .expect("the two entries have distinct increasing tags");
+        assert!(matches!(
+            ZakuraNodeRecord::sign(record, &signer),
+            Err(DiscoveryWireError::SigningKeyMismatch)
+        ));
+    }
+
+    #[test]
     fn signature_verifies_for_author_and_fails_after_mutation() {
         let record = signed_record();
         record.verify(&context()).expect("record verifies");
@@ -4941,15 +5050,15 @@ mod tests {
 
         let other_secret = secret_key();
         let mut mutated = record;
-        mutated.body.node_id = other_secret.public();
+        mutated.body.keys = other_secret.key_list().clone();
         assert!(matches!(
             mutated.verify(&context()),
             Err(DiscoveryRecordError::InvalidSignature)
         ));
     }
 
-    /// F-61: a node id with a torsion component signs a record that the
-    /// cofactored equation accepts, but TLS can never authenticate that node id.
+    /// F-61: a key with a torsion component signs a record that the
+    /// cofactored equation accepts, but TLS can never authenticate that key.
     #[test]
     fn record_from_mixed_order_node_id_is_rejected() {
         use curve25519_dalek::{
@@ -4981,12 +5090,13 @@ mod tests {
             .expect("the order-8 constant is a curve point");
         let mixed_point = a * ED25519_BASEPOINT_POINT + torsion;
         let mixed_bytes = mixed_point.compress().to_bytes();
-        let mixed = NodeId::from_bytes(&mixed_bytes).expect("a mixed-order key parses");
+        let mixed =
+            zakura_quic::NodeKey::from_bytes(&mixed_bytes).expect("a mixed-order key parses");
 
         let honest =
             ZakuraNodeRecord::sign(body(&secret_key), &secret_key).expect("test record signs");
         let mut body = body(&secret_key);
-        body.node_id = mixed;
+        body.keys = NodeKeyList::single(mixed);
         let message = body
             .encode_for_signature()
             .expect("test record body encodes");
@@ -5021,7 +5131,7 @@ mod tests {
             Err(DiscoveryRecordError::InvalidSignature)
         ));
 
-        // Control: the same secret key signs a record for its honest node id,
+        // Control: the same secret key signs a record for its honest key,
         // and that record verifies.
         assert!(honest.verify(&context()).is_ok());
     }
@@ -5501,7 +5611,7 @@ mod tests {
     #[test]
     fn decode_rejects_malformed_record_body_counts_before_allocation() {
         fn hello_with_body(mut body_bytes: Vec<u8>, record: &ZakuraNodeRecord) -> Vec<u8> {
-            body_bytes.resize(super::super::wire::RECORD_BODY_FIXED_BYTES, 0);
+            body_bytes.resize(super::super::wire::RECORD_BODY_MIN_BYTES, 0);
             let mut encoded = vec![MSG_DISCOVERY_HELLO];
             encoded
                 .write_u32::<LittleEndian>(
@@ -5515,9 +5625,7 @@ mod tests {
 
         let record = signed_record();
         let mut body_bytes = Vec::new();
-        body_bytes
-            .write_all(record.body.node_id.as_bytes())
-            .unwrap();
+        body_bytes.write_all(&record.body.keys.encode()).unwrap();
         body_bytes
             .write_u16::<LittleEndian>(
                 u16::try_from(MAX_DIRECT_ADDRS_PER_RECORD + 1)
@@ -5530,9 +5638,7 @@ mod tests {
         ));
 
         let mut body_bytes = Vec::new();
-        body_bytes
-            .write_all(record.body.node_id.as_bytes())
-            .unwrap();
+        body_bytes.write_all(&record.body.keys.encode()).unwrap();
         body_bytes.write_u16::<LittleEndian>(0).unwrap();
         body_bytes
             .write_u16::<LittleEndian>(
@@ -5591,7 +5697,7 @@ mod tests {
         let signing_secret = secret_key();
         record = ZakuraNodeRecord::sign(
             ZakuraNodeRecordBody {
-                node_id: signing_secret.public(),
+                keys: signing_secret.key_list().clone(),
                 ..record.body
             },
             &signing_secret,
@@ -5692,7 +5798,7 @@ mod tests {
         let unknown_family = signed_record_with(3, service(3), test_addr(3));
         let mut unknown_body = Vec::new();
         write_record_body(&unknown_family.body, &mut unknown_body);
-        let family_offset = NODE_ID_BYTES + 2;
+        let family_offset = unknown_family.body.keys.encoded_len() + 2;
         assert_eq!(unknown_body[family_offset], 4);
         unknown_body[family_offset] = 9;
 
@@ -5801,21 +5907,16 @@ mod tests {
         .expect("the local exclusion list encodes");
     }
 
-    /// Only connected peers whose ids are valid node IDs join the exclusion
-    /// list, whether the id kept its node ID from the connection or is plain
-    /// bytes. Ids that aren't curve points and short legacy ids are skipped.
+    /// Only connected peers whose ids are node IDs join the exclusion list,
+    /// whether the id kept its node ID from the connection or is plain
+    /// bytes. Short legacy ids are skipped.
     #[tokio::test]
     async fn peer_sample_exclusions_skip_connected_ids_that_are_not_node_ids() {
         let from_connection = secret_key().public();
         let from_bytes = secret_key().public();
-        let not_a_point = (0..=u8::MAX)
-            .map(|byte| [byte; 32])
-            .find(|bytes| NodeId::from_bytes(bytes).is_err())
-            .expect("some repeated byte is not a curve point");
         let connected = vec![
             ZakuraPeerId::from_node_id(from_connection),
             peer_id_for(from_bytes),
-            ZakuraPeerId::new(not_a_point.to_vec()).expect("32 bytes is a valid peer id"),
             ZakuraPeerId::new(vec![1, 2, 3]).expect("a short legacy id is a valid peer id"),
         ];
         let local = secret_key();
@@ -5847,7 +5948,7 @@ mod tests {
         let mut book = ZakuraDiscoveryBook::default();
         let source = secret_key().public();
         let record = signed_record();
-        let node_id = record.body.node_id;
+        let node_id = record.body.node_id();
 
         assert_eq!(
             book.import_record(record.clone(), Some(source), NOW, &context())
@@ -6093,7 +6194,7 @@ mod tests {
                 8233,
             )],
         );
-        let target_id = public_target.body.node_id;
+        let target_id = public_target.body.node_id();
 
         assert_eq!(
             book.import_record(public_target.clone(), Some(gossip_source), NOW, &context())
@@ -6170,7 +6271,7 @@ mod tests {
         let mut book = ZakuraDiscoveryBook::default();
         let loopback_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8233);
         let record = signed_record_with_addrs(1, service(1), vec![loopback_addr]);
-        let node_id = record.body.node_id;
+        let node_id = record.body.node_id();
 
         assert_eq!(
             book.import_static_record(record.clone(), NOW, &context())
@@ -6196,6 +6297,131 @@ mod tests {
             Err(DiscoveryBookError::NonDialableDirectAddress { addr }) if addr == loopback_addr
         ));
         assert!(book.is_empty());
+    }
+
+    #[test]
+    fn only_regtest_records_may_carry_local_addresses() {
+        assert_eq!(
+            AddressScope::for_network(ZakuraNetworkId::Regtest),
+            AddressScope::Local
+        );
+        for network_id in [
+            ZakuraNetworkId::Mainnet,
+            ZakuraNetworkId::Testnet,
+            ZakuraNetworkId::Configured,
+        ] {
+            assert_eq!(AddressScope::for_network(network_id), AddressScope::Public);
+        }
+    }
+
+    #[test]
+    fn discovery_book_peer_import_accepts_local_addresses_on_regtest() {
+        let mut book = ZakuraDiscoveryBook::default().with_address_scope(AddressScope::Local);
+        let record = signed_record_with_addrs(
+            1,
+            service(1),
+            vec![
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8233),
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7)), 8233),
+            ],
+        );
+
+        assert_eq!(
+            book.import_record(record.clone(), Some(secret_key().public()), NOW, &context())
+                .expect("a Regtest book stores gossiped local addresses"),
+            ImportOutcome::Added
+        );
+        assert_eq!(
+            book.dial_candidates(
+                10,
+                &[service(1)],
+                &[],
+                DialCandidateExclusions {
+                    connected_node_ids: &[],
+                    in_flight_node_ids: &[],
+                },
+                NOW,
+                (
+                    DEFAULT_DISCOVERY_DIAL_BACKOFF_BASE,
+                    DEFAULT_DISCOVERY_DIAL_BACKOFF_MAX,
+                ),
+                &mut StdRng::seed_from_u64(7),
+            ),
+            vec![candidate_for(&record, false)],
+            "a Regtest book dials gossiped local addresses"
+        );
+    }
+
+    #[test]
+    fn discovery_book_peer_import_on_regtest_accepts_every_local_range() {
+        for addr in [
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 16, 3, 4)), 8233),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 2)), 8233),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 8233),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0xfd12, 0, 0, 0, 0, 0, 0, 1)), 8233),
+            SocketAddr::new(IpAddr::V6(Ipv4Addr::LOCALHOST.to_ipv6_mapped()), 8233),
+        ] {
+            let mut book = ZakuraDiscoveryBook::default().with_address_scope(AddressScope::Local);
+            let record = signed_record_with_addrs(1, service(1), vec![addr]);
+
+            assert!(
+                matches!(
+                    book.import_record(record, Some(secret_key().public()), NOW, &context()),
+                    Ok(ImportOutcome::Added)
+                ),
+                "{addr}"
+            );
+        }
+    }
+
+    /// Peer exchange on Regtest works only if a node passes on the local
+    /// records it has confirmed.
+    #[test]
+    fn a_regtest_book_shares_a_confirmed_loopback_record() {
+        let mut book = ZakuraDiscoveryBook::default().with_address_scope(AddressScope::Local);
+        let record = signed_record_with_addrs(
+            1,
+            service(1),
+            vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8233)],
+        );
+
+        import_hello(&mut book, record.clone(), NOW).expect("a Regtest book stores the hello");
+
+        assert_eq!(
+            book.sample_peers(10, &[], &[], NOW, test_requester()),
+            vec![record]
+        );
+    }
+
+    #[test]
+    fn discovery_book_peer_import_on_regtest_still_rejects_undialable_addresses() {
+        for addr in [
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 8233),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 8233),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 1)), 8233),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1)), 8233),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), 8233),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            // Link-local, such as a cloud metadata address.
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)), 80),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)), 8233),
+            // RFC 6598 shared address space.
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)), 8233),
+            // Deprecated site-local, and 6to4 wrapping a private address.
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0xfec0, 0, 0, 0, 0, 0, 0, 1)), 8233),
+            SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::new(0x2002, 0x0a00, 0x0001, 0, 0, 0, 0, 0)),
+                8233,
+            ),
+        ] {
+            let mut book = ZakuraDiscoveryBook::default().with_address_scope(AddressScope::Local);
+            let record = signed_record_with_addrs(1, service(1), vec![addr]);
+
+            assert!(matches!(
+                book.import_record(record, Some(secret_key().public()), NOW, &context()),
+                Err(DiscoveryBookError::NonDialableDirectAddress { addr: rejected }) if rejected == addr
+            ));
+        }
     }
 
     #[test]
@@ -6296,7 +6522,7 @@ mod tests {
         let newer = record_with_secret(&secret, 10, service(1));
         let older = record_with_secret(&secret, 9, service(2));
         let equal = record_with_secret(&secret, 10, service(3));
-        let node_id = newer.body.node_id;
+        let node_id = newer.body.node_id();
 
         assert_eq!(
             book.import_record(newer.clone(), None, NOW, &context())
@@ -6346,7 +6572,7 @@ mod tests {
             ..context()
         };
         let expired = ZakuraNodeRecord::sign(expired_body, &expired_secret).expect("record signs");
-        let expired_id = expired.body.node_id;
+        let expired_id = expired.body.node_id();
         book.import_record(
             expired,
             None,
@@ -6356,14 +6582,14 @@ mod tests {
         .expect("expired-later record imports before eviction time");
 
         let failed = signed_record_with(2, service(2), test_addr(2));
-        let failed_id = failed.body.node_id;
+        let failed_id = failed.body.node_id();
         book.import_record(failed, None, NOW, &context()).unwrap();
         for _ in 0..HIGH_DIAL_FAILURE_COUNT {
             book.mark_dial_failure(&failed_id, NOW);
         }
 
         let survivor = signed_record_with(3, service(3), test_addr(3));
-        let survivor_id = survivor.body.node_id;
+        let survivor_id = survivor.body.node_id();
         book.import_record(survivor, None, NOW, &context()).unwrap();
 
         assert!(book.get(&expired_id).is_none());
@@ -6371,7 +6597,7 @@ mod tests {
         assert!(book.get(&survivor_id).is_some());
 
         let replacement = signed_record_with(4, service(4), test_addr(4));
-        let replacement_id = replacement.body.node_id;
+        let replacement_id = replacement.body.node_id();
         book.import_record(replacement, None, NOW, &context())
             .unwrap();
 
@@ -6385,7 +6611,7 @@ mod tests {
     fn discovery_book_static_entries_survive_eviction_storm() {
         let mut book = small_book(1);
         let static_record = signed_record_with(1, service(1), test_addr(1));
-        let static_id = static_record.body.node_id;
+        let static_id = static_record.body.node_id();
         book.import_static_record(static_record, NOW, &context())
             .expect("static record imports");
 
@@ -6417,9 +6643,9 @@ mod tests {
         let older_success = signed_record_with(1, service(1), test_addr(1));
         let recent_success = signed_record_with(2, service(2), test_addr(2));
         let replacement = signed_record_with(3, service(3), test_addr(3));
-        let older_success_id = older_success.body.node_id;
-        let recent_success_id = recent_success.body.node_id;
-        let replacement_id = replacement.body.node_id;
+        let older_success_id = older_success.body.node_id();
+        let recent_success_id = recent_success.body.node_id();
+        let replacement_id = replacement.body.node_id();
 
         let persisted = [older_success, recent_success, replacement]
             .into_iter()
@@ -6641,7 +6867,7 @@ mod tests {
             let mut body = body(&secret);
             body.expires_at_unix_secs = expires_at;
             let record = ZakuraNodeRecord::sign(body, &secret).expect("test record signs");
-            let node_id = record.body.node_id;
+            let node_id = record.body.node_id();
             let mut book = ZakuraDiscoveryBook::default();
             book.import_record(record, None, NOW, &context())
                 .expect("the template record imports");
@@ -6740,7 +6966,7 @@ mod tests {
         let mut full = small_book(1);
         import_confirmed_record(&mut full, confirmed).expect("a first-party record imports");
         let relayed = signed_record_with(6, service(6), test_addr(6));
-        let relayed_node_id = relayed.body.node_id;
+        let relayed_node_id = relayed.body.node_id();
         assert!(matches!(
             full.import_record(relayed, Some(relay), NOW, &context()),
             Err(DiscoveryBookError::Limit { .. })
@@ -6764,7 +6990,7 @@ mod tests {
                 let record = long_lived_record_with(1, service(index.into()), test_addr(index));
                 import_hello(&mut book, record.clone(), NOW - 1)
                     .expect("a first-party record imports");
-                record.body.node_id
+                record.body.node_id()
             })
             .collect();
 
@@ -6863,7 +7089,7 @@ mod tests {
                 let mut window: Vec<NodeId> = book
                     .sample_peers(32, &[], &[], NOW, test_requester())
                     .into_iter()
-                    .map(|record| record.body.node_id)
+                    .map(|record| record.body.node_id())
                     .collect();
                 window.sort_by_key(|node_id| *node_id.as_bytes());
                 window
@@ -6892,7 +7118,7 @@ mod tests {
         assert_eq!(first.len(), MAX_DISCOVERY_RECORDS_PER_RESPONSE);
         let mut exclude: Vec<[u8; 32]> = first
             .iter()
-            .map(|record| *record.body.node_id.as_bytes())
+            .map(|record| *record.body.node_id().as_bytes())
             .collect();
         exclude.sort_unstable();
         assert!(book
@@ -6915,7 +7141,7 @@ mod tests {
         let matching_b = signed_record_with(2, wanted.clone(), test_addr(2));
         let matching_c = signed_record_with(3, wanted.clone(), test_addr(3));
         let non_matching = signed_record_with(4, other, test_addr(4));
-        let excluded = matching_a.body.node_id;
+        let excluded = matching_a.body.node_id();
         import_confirmed_record(&mut book, matching_a).unwrap();
         import_confirmed_record(&mut book, matching_b).unwrap();
         import_confirmed_record(&mut book, matching_c).unwrap();
@@ -6928,7 +7154,7 @@ mod tests {
             NOW,
             test_requester(),
         );
-        let sample_ids: HashSet<_> = sample.iter().map(|record| record.body.node_id).collect();
+        let sample_ids: HashSet<_> = sample.iter().map(|record| record.body.node_id()).collect();
 
         assert_eq!(sample.len(), 1);
         assert!(!sample_ids.contains(&excluded));
@@ -6953,8 +7179,8 @@ mod tests {
         let mut book = ZakuraDiscoveryBook::default();
         let preferred = signed_record_with(1, service(1), test_addr(1));
         let failed = signed_record_with(2, service(1), test_addr(2));
-        let failed_id = failed.body.node_id;
-        let preferred_id = preferred.body.node_id;
+        let failed_id = failed.body.node_id();
+        let preferred_id = preferred.body.node_id();
 
         import_confirmed_record(&mut book, failed.clone()).unwrap();
         import_confirmed_record(&mut book, preferred.clone()).unwrap();
@@ -7072,7 +7298,7 @@ mod tests {
     fn discovery_book_dial_backoff_uses_configured_bounds() {
         let mut book = ZakuraDiscoveryBook::default();
         let failed = signed_record_with(1, service(1), test_addr(1));
-        let failed_id = failed.body.node_id;
+        let failed_id = failed.body.node_id();
 
         import_confirmed_record(&mut book, failed.clone()).unwrap();
         book.mark_dial_attempt(&failed_id, NOW);
@@ -7126,7 +7352,7 @@ mod tests {
             ZakuraNodeRecord::sign(body, &secret_key).expect("test record signs")
         };
         let first = record_at(1, test_addr(1));
-        let node_id = first.body.node_id;
+        let node_id = first.body.node_id();
         import_confirmed_record(&mut book, first).unwrap();
         book.mark_dial_attempt(&node_id, NOW);
         book.mark_alpn_mismatch(&node_id, NOW);
@@ -7164,7 +7390,7 @@ mod tests {
     fn discovery_book_short_lived_exchange_backoff_is_non_punitive() {
         let mut book = ZakuraDiscoveryBook::default();
         let exchanged = signed_record_with(1, service(1), test_addr(1));
-        let exchanged_id = exchanged.body.node_id;
+        let exchanged_id = exchanged.body.node_id();
 
         import_confirmed_record(&mut book, exchanged.clone()).unwrap();
         book.mark_dial_success(&exchanged_id, Some(test_addr(1)), NOW);
@@ -7209,7 +7435,7 @@ mod tests {
     fn discovery_book_services_and_persistence_hooks_revalidate_records() {
         let mut book = ZakuraDiscoveryBook::default();
         let record = signed_record_with(1, service(9), test_addr(9));
-        let node_id = record.body.node_id;
+        let node_id = record.body.node_id();
         import_confirmed_record(&mut book, record.clone()).unwrap();
         book.mark_dial_success(&node_id, Some(test_addr(9)), NOW);
         book.mark_dial_attempt(&node_id, NOW + 1);
@@ -7276,7 +7502,7 @@ mod tests {
 
         let record = handle.current_self_record();
 
-        assert_eq!(record.body.node_id, node_id);
+        assert_eq!(record.body.node_id(), node_id);
         assert_eq!(record.body.direct_addrs, vec![test_addr(42)]);
         assert_eq!(
             record.body.services,
@@ -7384,8 +7610,8 @@ mod tests {
                 > first.current_self_record().body.sequence
         );
         assert_eq!(
-            restarted.current_self_record().body.node_id,
-            first.current_self_record().body.node_id
+            restarted.current_self_record().body.node_id(),
+            first.current_self_record().body.node_id()
         );
     }
 
@@ -7455,36 +7681,56 @@ mod tests {
         );
         let restarted_record = restarted.current_self_record();
 
-        assert_eq!(restarted_record.body.node_id, first_record.body.node_id);
+        assert_eq!(restarted_record.body.node_id(), first_record.body.node_id());
         assert!(restarted_record.body.sequence > first_record.body.sequence);
         assert_eq!(restarted_record.body.direct_addrs, vec![test_addr(45)]);
         assert_eq!(restarted_record.body.services, vec![service(2)]);
     }
 
-    #[test]
-    fn self_record_filters_non_routable_direct_addresses() {
+    /// The addresses a node lists, as its self-record carries them on the
+    /// network `network_id` names.
+    fn self_record_addrs(network_id: ZakuraNetworkId) -> Vec<SocketAddr> {
         let (_connected_tx, connected_rx) = watch::channel(Vec::new());
         let handle = discovery_handle_at(
-            local_config_with(
-                secret_key(),
-                vec![
-                    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8233),
-                    SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 8233),
-                    SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 8233),
-                    SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 8233),
-                    test_addr(45),
-                ],
-                vec![service(1)],
-            ),
+            ZakuraDiscoveryLocalConfig {
+                network_id,
+                ..local_config_with(
+                    secret_key(),
+                    vec![
+                        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8233),
+                        SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 8233),
+                        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 8233),
+                        SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 8233),
+                        test_addr(45),
+                    ],
+                    vec![service(1)],
+                )
+            },
             ZakuraDiscoveryConfig::default(),
             connected_rx,
             NOW,
         );
+        handle.current_self_record().body.direct_addrs.clone()
+    }
 
+    #[test]
+    fn self_record_filters_non_routable_direct_addresses() {
         assert_eq!(
-            handle.current_self_record().body.direct_addrs,
+            self_record_addrs(ZakuraNetworkId::Mainnet),
             vec![test_addr(45)]
         );
+    }
+
+    #[test]
+    fn regtest_self_record_keeps_local_direct_addresses() {
+        let mut expected = vec![
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8233),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 8233),
+            test_addr(45),
+        ];
+        expected.sort_unstable();
+
+        assert_eq!(self_record_addrs(ZakuraNetworkId::Regtest), expected);
     }
 
     #[tokio::test]
@@ -7492,7 +7738,7 @@ mod tests {
         let (connected_tx, connected_rx) = watch::channel(Vec::new());
         let handle = discovery_handle_with_connected(connected_rx);
         let record = runtime_record_with(1, service(9), test_addr(9));
-        let node_id = record.body.node_id;
+        let node_id = record.body.node_id();
         connected_tx.send_replace(vec![peer_id_for(node_id)]);
         handle
             .import_connected_peer_record(record, node_id, None)
@@ -7513,7 +7759,7 @@ mod tests {
         let (connected_tx, connected_rx) = watch::channel(Vec::new());
         let handle = discovery_handle_with_connected(connected_rx);
         let record = runtime_record_with(1, service(9), test_addr(9));
-        let node_id = record.body.node_id;
+        let node_id = record.body.node_id();
         handle
             .import_connected_peer_record(record, node_id, None)
             .await
@@ -7529,7 +7775,7 @@ mod tests {
         let (connected_tx, connected_rx) = watch::channel(Vec::new());
         let handle = discovery_handle_with_connected(connected_rx);
         let record = runtime_record_with(1, service(9), test_addr(9));
-        let node_id = record.body.node_id;
+        let node_id = record.body.node_id();
 
         handle
             .import_peer_records([record], None)
@@ -7707,7 +7953,7 @@ mod tests {
         let (connected_tx, connected_rx) = watch::channel(Vec::new());
         let handle = discovery_handle_with_connected(connected_rx);
         let record = runtime_record_with(1, service(9), test_addr(9));
-        let node_id = record.body.node_id;
+        let node_id = record.body.node_id();
         let message = DiscoveryMessage::Peers {
             records: vec![record],
         };
@@ -7736,7 +7982,7 @@ mod tests {
         let secret = secret_key();
         let active_record = runtime_record_with_secret(&secret, 1, service(1), test_addr(1));
         let stale_book_record = runtime_record_with_secret(&secret, 2, service(2), test_addr(2));
-        let node_id = active_record.body.node_id;
+        let node_id = active_record.body.node_id();
 
         handle
             .import_connected_peer_record(active_record, node_id, None)
@@ -7761,11 +8007,11 @@ mod tests {
         let secret = secret_key();
         let stored = runtime_record_with_secret(&secret, 1, service(1), test_addr(1));
         let newer = runtime_record_with_secret(&secret, 2, service(1), test_addr(1));
-        let node_id = stored.body.node_id;
+        let node_id = stored.body.node_id();
         let addressless_secret = secret_key();
         let addressless =
             runtime_record_with_secret_and_addrs(&addressless_secret, 1, service(2), Vec::new());
-        let addressless_node_id = addressless.body.node_id;
+        let addressless_node_id = addressless.body.node_id();
         connected_tx.send_replace(vec![peer_id_for(node_id), peer_id_for(addressless_node_id)]);
         handle
             .import_connected_peer_record(stored.clone(), node_id, None)
@@ -7870,7 +8116,7 @@ mod tests {
 
         let held = handle.hold_verify_slots();
         for (record, expected) in cases {
-            let node_id = record.body.node_id;
+            let node_id = record.body.node_id();
             let error = tokio::time::timeout(
                 Duration::from_secs(5),
                 handle.import_connected_peer_record(record, node_id, None),
@@ -7895,7 +8141,7 @@ mod tests {
         let equal_conflicting = runtime_record_with_secret(&secret, 2, service(3), test_addr(3));
         let stored_newer = runtime_record_with_secret(&secret, 4, service(4), test_addr(4));
         let older_than_stored = runtime_record_with_secret(&secret, 3, service(3), test_addr(3));
-        let node_id = newer.body.node_id;
+        let node_id = newer.body.node_id();
         connected_tx.send_replace(vec![peer_id_for(node_id)]);
 
         handle
@@ -7940,7 +8186,7 @@ mod tests {
         let older = runtime_record_with_secret_and_addrs(&secret, 1, service(1), Vec::new());
         let equal_conflicting =
             runtime_record_with_secret_and_addrs(&secret, 2, service(3), Vec::new());
-        let node_id = newer.body.node_id;
+        let node_id = newer.body.node_id();
         connected_tx.send_replace(vec![peer_id_for(node_id)]);
 
         assert!(matches!(
@@ -8012,7 +8258,7 @@ mod tests {
             .saturating_sub(DEFAULT_DISCOVERY_CLOCK_SKEW_TOLERANCE.as_secs())
             .saturating_sub(1);
         let expired = ZakuraNodeRecord::sign(body, &secret).expect("expired record signs");
-        let node_id = expired.body.node_id;
+        let node_id = expired.body.node_id();
         connected_tx.send_replace(vec![peer_id_for(node_id)]);
 
         assert!(matches!(
@@ -8063,7 +8309,7 @@ mod tests {
         );
 
         let record = runtime_record_with(10, ZakuraServiceId::block_sync(), test_addr(10));
-        let node_id = record.body.node_id;
+        let node_id = record.body.node_id();
         let message = DiscoveryMessage::Peers {
             records: vec![record],
         };
@@ -8089,7 +8335,7 @@ mod tests {
         let (connected_tx, connected_rx) = watch::channel(Vec::new());
         let handle = discovery_handle_with_connected(connected_rx);
         let record = runtime_record_with(1, ZakuraServiceId::discovery(), test_addr(1));
-        let node_id = record.body.node_id;
+        let node_id = record.body.node_id();
         connected_tx.send_replace(vec![peer_id_for(node_id)]);
 
         handle
@@ -8136,7 +8382,7 @@ mod tests {
         let service = service(42);
         let live_only_node_id = secret_key().public();
         let record_backed = runtime_record_with(1, service.clone(), test_addr(42));
-        let record_backed_node_id = record_backed.body.node_id;
+        let record_backed_node_id = record_backed.body.node_id();
         let now = current_unix_secs();
         connected_tx.send_replace(vec![
             peer_id_for(live_only_node_id),
@@ -8206,7 +8452,7 @@ mod tests {
         let (connected_tx, connected_rx) = watch::channel(Vec::new());
         let handle = discovery_handle_with_connected(connected_rx);
         let record = runtime_record_with(1, service(43), test_addr(43));
-        let node_id = record.body.node_id;
+        let node_id = record.body.node_id();
         let expires_at = record.body.expires_at_unix_secs;
         connected_tx.send_replace(vec![peer_id_for(node_id)]);
 
@@ -8282,7 +8528,7 @@ mod tests {
 
         let record = runtime_record_with(1, service(1), test_addr(1));
         let verified = handle
-            .verify_connected_peer_record(record.clone(), record.body.node_id)
+            .verify_connected_peer_record(record.clone(), record.body.node_id())
             .await
             .unwrap();
         assert!(verified.slot.is_some());
@@ -8396,6 +8642,84 @@ mod tests {
         ));
     }
 
+    /// A node on Regtest stores a relayed record that lists only a loopback
+    /// address, and offers it to the dialer.
+    #[tokio::test]
+    async fn a_regtest_node_dials_a_relayed_loopback_record() {
+        let (_connected_tx, connected_rx) = watch::channel(Vec::new());
+        let handle = discovery_handle_at(
+            ZakuraDiscoveryLocalConfig {
+                network_id: ZakuraNetworkId::Regtest,
+                ..local_config_with(
+                    secret_key(),
+                    vec![test_addr(200)],
+                    vec![ZakuraServiceId::discovery()],
+                )
+            },
+            ZakuraDiscoveryConfig::default(),
+            connected_rx,
+            NOW,
+        );
+        let loopback = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8233);
+        let record = runtime_record_with(1, service(1), loopback);
+
+        handle
+            .import_peer_records([record.clone()], Some(secret_key().public()))
+            .await
+            .expect("a Regtest node keeps a relayed loopback record");
+
+        let candidates = handle.dial_candidates(&[], &[]).await;
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].direct_addrs, vec![loopback]);
+    }
+
+    /// A node on any other network refuses a relayed record that lists a
+    /// loopback address.
+    #[tokio::test]
+    async fn a_mainnet_node_refuses_a_relayed_loopback_record() {
+        let (_connected_tx, connected_rx) = watch::channel(Vec::new());
+        let handle = discovery_handle_at(
+            ZakuraDiscoveryLocalConfig {
+                network_id: ZakuraNetworkId::Mainnet,
+                ..local_config_with(
+                    secret_key(),
+                    vec![test_addr(200)],
+                    vec![ZakuraServiceId::discovery()],
+                )
+            },
+            ZakuraDiscoveryConfig::default(),
+            connected_rx,
+            NOW,
+        );
+        let mainnet_record = |addr| {
+            let peer_key = secret_key();
+            ZakuraNodeRecord::sign(
+                ZakuraNodeRecordBody {
+                    network_id: ZakuraNetworkId::Mainnet,
+                    direct_addrs: vec![addr],
+                    services: vec![service(1)],
+                    expires_at_unix_secs: current_unix_secs()
+                        + DEFAULT_DISCOVERY_RECORD_TTL.as_secs(),
+                    ..body(&peer_key)
+                },
+                &peer_key,
+            )
+            .expect("test record signs")
+        };
+        let public = mainnet_record(test_addr(1));
+        let loopback = mainnet_record(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8233));
+
+        let _ = handle
+            .import_peer_records([public.clone(), loopback], Some(secret_key().public()))
+            .await;
+
+        // The public record shows the batch was otherwise acceptable.
+        let candidates = handle.dial_candidates(&[], &[]).await;
+        assert_eq!(handle.inner.lock().await.book().len(), 1);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].node_id, public.body.node_id());
+    }
+
     /// Relayed records follow the relay verdict table: a forged record anywhere in the
     /// batch, even past the import limit, disconnects the relay before any record is
     /// imported, and records that only fail local or compatibility checks drop alone.
@@ -8461,12 +8785,53 @@ mod tests {
         let mut expired = body(&signer);
         expired.expires_at_unix_secs = now - 3_600;
         let expired = ZakuraNodeRecord::sign(expired, &signer).expect("record signs");
+        // A relay passes on key lists it cannot read, so a record with no key
+        // this release can verify with is never the relay's fault.
+        let signer = secret_key();
+        let mut unverifiable = body(&signer);
+        unverifiable.keys = NodeKeyList::from_entries([(UNREADABLE_KEY_TAG, [0x44; 32])])
+            .expect("a list of one unreadable entry is well formed");
+        unverifiable.expires_at_unix_secs = now + DEFAULT_DISCOVERY_RECORD_TTL.as_secs();
+        let unverifiable = ZakuraNodeRecord {
+            body: unverifiable,
+            signature: [0; 64],
+        };
+        // An author whose list also holds an unreadable entry signs with its
+        // Ed25519 key, and its record is kept under the ID of the whole list.
+        let signer = secret_key();
+        let own = |tag| (tag, signer.credential().key(tag).unwrap().to_vec());
+        let credential = NodeCredential::from_entries([
+            own(ED25519_KEY_TAG),
+            own(ML_DSA_44_KEY_TAG),
+            (UNREADABLE_KEY_TAG, vec![0x55; 1_312]),
+        ])
+        .expect("two entries in increasing tag order are a valid credential");
+        let longer_list = credential.key_list().clone();
+        let signer = signer
+            .with_credential(credential)
+            .expect("the credential holds the signer's own key");
+        let mut two_keys = body(&signer);
+        two_keys.expires_at_unix_secs = now + DEFAULT_DISCOVERY_RECORD_TTL.as_secs();
+        let two_keys = ZakuraNodeRecord::sign(two_keys, &signer).expect("record signs");
         let outcome = handle
-            .import_peer_records([incompatible, expired, valid()], Some(relay))
+            .import_peer_records(
+                [incompatible, expired, unverifiable, valid(), two_keys],
+                Some(relay),
+            )
             .await
-            .expect("incompatible and expired records only drop");
-        assert_eq!(outcome.added, 1);
-        assert_eq!(outcome.rejected, 2);
+            .expect("incompatible, expired and unverifiable records only drop");
+        assert_eq!(outcome.added, 2);
+        assert_eq!(outcome.rejected, 3);
+        assert!(
+            handle
+                .inner
+                .lock()
+                .await
+                .book()
+                .get(&longer_list.node_id())
+                .is_some(),
+            "the record is stored under the ID of its whole key list"
+        );
 
         // An expired record with a bad signature is forged, not stale.
         let signer = secret_key();
@@ -8589,7 +8954,7 @@ mod tests {
         book.import_record(records[0].clone(), Some(other_relay), NOW, &context())
             .expect("an update adds no entry");
         assert_eq!(
-            book.get(&records[0].body.node_id)
+            book.get(&records[0].body.node_id())
                 .expect("the entry is stored")
                 .source,
             Some(relay)
@@ -8637,7 +9002,7 @@ mod tests {
         let later = short_lived.body.expires_at_unix_secs + 1;
         book.import_record(fresh(), Some(relay), later, &context())
             .expect("the expired entry makes room");
-        assert!(book.get(&short_lived.body.node_id).is_none());
+        assert!(book.get(&short_lived.body.node_id()).is_none());
         assert_eq!(book.relayed.get(&relay), Some(&QUOTA));
         assert_eq!(book.relayed, recount_relayed(&book));
     }
@@ -8766,7 +9131,9 @@ mod tests {
             import_hello(&mut book, record.clone(), NOW + 1).expect("the hello imports"),
             ImportOutcome::MetadataUpdated
         );
-        let relay = signed_record_with(9, service(9), test_addr(9)).body.node_id;
+        let relay = signed_record_with(9, service(9), test_addr(9))
+            .body
+            .node_id();
         assert_eq!(
             book.import_record(record, Some(relay), NOW + 2, &context())
                 .expect("the relayed copy imports"),
@@ -8968,7 +9335,7 @@ mod tests {
     fn discovery_book_third_party_records_require_confirmation_before_sampling() {
         let mut book = ZakuraDiscoveryBook::default();
         let gossiped = signed_record_with(1, service(1), test_addr(1));
-        let gossiped_id = gossiped.body.node_id;
+        let gossiped_id = gossiped.body.node_id();
         book.import_record(
             gossiped.clone(),
             Some(secret_key().public()),
@@ -9031,7 +9398,7 @@ mod tests {
 
         // Identical queries return the same records, in random order.
         let node_ids = |records: Vec<ZakuraNodeRecord>| -> HashSet<NodeId> {
-            records.iter().map(|record| record.body.node_id).collect()
+            records.iter().map(|record| record.body.node_id()).collect()
         };
         let first = book.sample_peers(DISCLOSURE_LIMIT, &[], &[], NOW, requester);
         assert_eq!(first.len(), DISCLOSURE_LIMIT);
@@ -9047,13 +9414,13 @@ mod tests {
         let mut excluded: Vec<_> = seen.iter().map(|id| *id.as_bytes()).collect();
         excluded.sort_unstable();
         for record in book.sample_peers(DISCLOSURE_LIMIT, &[], &excluded, NOW, requester) {
-            seen.insert(record.body.node_id);
+            seen.insert(record.body.node_id());
         }
         for index in 0..BOOK_SIZE {
             for record in
                 book.sample_peers(DISCLOSURE_LIMIT, &[service(index)], &[], NOW, requester)
             {
-                seen.insert(record.body.node_id);
+                seen.insert(record.body.node_id());
             }
         }
         assert_eq!(
@@ -9069,7 +9436,7 @@ mod tests {
         for _ in 0..48 {
             now = next_epoch(now);
             for record in book.sample_peers(DISCLOSURE_LIMIT, &[], &[], now, requester) {
-                across_epochs.insert(record.body.node_id);
+                across_epochs.insert(record.body.node_id());
             }
         }
         assert!(
@@ -9083,7 +9450,7 @@ mod tests {
         let requester = NodeSecretKey::from_bytes(&[7; 32]).public();
         book.sample_peers(usize::MAX, &[], &[], now, requester)
             .iter()
-            .map(|record| record.body.node_id)
+            .map(|record| record.body.node_id())
             .collect()
     }
 
@@ -9100,7 +9467,7 @@ mod tests {
 
         // A gossiped record is unconfirmed until a dial confirms it.
         let gossiped = long_lived_record_with(1, service(0), test_addr(1));
-        let gossiped_id = gossiped.body.node_id;
+        let gossiped_id = gossiped.body.node_id();
         book.import_record(gossiped, Some(test_requester()), NOW, &context())
             .expect("test record imports");
         assert!(sampled_node_ids(&mut book, NOW).is_empty());
@@ -9126,7 +9493,7 @@ mod tests {
         );
 
         let late = long_lived_record_with(1, service(9), test_addr(50));
-        let late_id = late.body.node_id;
+        let late_id = late.body.node_id();
         import_confirmed_record(&mut book, late).expect("test record imports");
         assert_eq!(sampled_node_ids(&mut book, NOW), window);
 
@@ -9184,9 +9551,9 @@ mod tests {
     fn sample_rechecks_snapshot_entries() {
         let mut book = ZakuraDiscoveryBook::new(ZakuraDiscoveryBookLimits::default());
         let short_lived = signed_record_with_addrs(1, service(0), vec![test_addr(1)]);
-        let short_lived_id = short_lived.body.node_id;
+        let short_lived_id = short_lived.body.node_id();
         let long_lived = long_lived_record_with(1, service(1), test_addr(2));
-        let long_lived_id = long_lived.body.node_id;
+        let long_lived_id = long_lived.body.node_id();
         import_confirmed_record(&mut book, short_lived).expect("test record imports");
         import_confirmed_record(&mut book, long_lived).expect("test record imports");
         assert_eq!(
@@ -9226,13 +9593,13 @@ mod tests {
 
         // Three candidates get strictly increasing last-success times, so dial priority is
         // deterministic (most recent success first); the remaining seven have no successful dial.
-        book.mark_dial_success(&records[5].body.node_id, Some(test_addr(6)), NOW + 1);
-        book.mark_dial_success(&records[3].body.node_id, Some(test_addr(4)), NOW + 2);
-        book.mark_dial_success(&records[7].body.node_id, Some(test_addr(8)), NOW + 3);
+        book.mark_dial_success(&records[5].body.node_id(), Some(test_addr(6)), NOW + 1);
+        book.mark_dial_success(&records[3].body.node_id(), Some(test_addr(4)), NOW + 2);
+        book.mark_dial_success(&records[7].body.node_id(), Some(test_addr(8)), NOW + 3);
         let expected_top = vec![
-            records[7].body.node_id,
-            records[3].body.node_id,
-            records[5].body.node_id,
+            records[7].body.node_id(),
+            records[3].body.node_id(),
+            records[5].body.node_id(),
         ];
 
         let mut rng = StdRng::seed_from_u64(99);
@@ -9277,7 +9644,7 @@ mod tests {
         // no failure backs a record off.
         for (failures, record) in records.iter().enumerate() {
             for _ in 0..failures {
-                book.mark_dial_failure(&record.body.node_id, NOW);
+                book.mark_dial_failure(&record.body.node_id(), NOW);
             }
         }
         let offer = |skip: usize, exhaust_after: Option<usize>| {
@@ -9311,7 +9678,7 @@ mod tests {
         };
         let dial_order = records
             .iter()
-            .map(|record| record.body.node_id)
+            .map(|record| record.body.node_id())
             .collect::<Vec<_>>();
 
         assert_eq!(offer(0, None), dial_order[..3]);
@@ -9340,7 +9707,7 @@ mod tests {
         // deterministic: fewer failures first.
         for (failures, record) in records.iter().enumerate() {
             for _ in 0..failures {
-                book.mark_dial_failure(&record.body.node_id, NOW);
+                book.mark_dial_failure(&record.body.node_id(), NOW);
             }
         }
 
@@ -9369,7 +9736,7 @@ mod tests {
             offered,
             records
                 .iter()
-                .map(|record| record.body.node_id)
+                .map(|record| record.body.node_id())
                 .collect::<Vec<_>>(),
             "skips draw the rest of the book in dial order"
         );
@@ -9382,7 +9749,7 @@ mod tests {
         let wanted = ZakuraServiceId::block_sync();
         let matching = runtime_record_with(1, wanted.clone(), test_addr(1));
         let excluded = runtime_record_with(2, wanted.clone(), test_addr(2));
-        let excluded_id = excluded.body.node_id;
+        let excluded_id = excluded.body.node_id();
         let other = runtime_record_with(3, ZakuraServiceId::legacy_gossip(), test_addr(3));
         for record in [matching.clone(), excluded, other] {
             import_hello_record(&handle, record).await;
@@ -9566,8 +9933,8 @@ mod tests {
         );
         let candidate = runtime_record_with(1, service(1), test_addr(1));
         let connected = runtime_record_with(2, service(1), test_addr(2));
-        let connected_id = connected.body.node_id;
-        let candidate_id = candidate.body.node_id;
+        let connected_id = connected.body.node_id();
+        let candidate_id = candidate.body.node_id();
         import_one_peer_record(&handle, candidate.clone(), Some(candidate_id)).await;
         handle
             .import_connected_peer_record(connected, connected_id, None)
@@ -9589,8 +9956,8 @@ mod tests {
             NOW,
         );
         let connected = runtime_record_with(2, service(1), test_addr(2));
-        let connected_id = connected.body.node_id;
-        let candidate_id = candidate.body.node_id;
+        let connected_id = connected.body.node_id();
+        let candidate_id = candidate.body.node_id();
         import_one_peer_record(&handle, candidate.clone(), Some(candidate_id)).await;
         handle
             .import_connected_peer_record(connected, connected_id, None)
@@ -9609,7 +9976,7 @@ mod tests {
         let (_connected_tx, connected_rx) = watch::channel(Vec::new());
         let handle = discovery_handle_with_connected(connected_rx);
         let candidate = runtime_record_with(1, service(1), test_addr(1));
-        let candidate_id = candidate.body.node_id;
+        let candidate_id = candidate.body.node_id();
         import_one_peer_record(&handle, candidate, Some(secret_key().public())).await;
 
         assert!(handle
@@ -9644,7 +10011,7 @@ mod tests {
         let neither = runtime_record_with(3, service(3), test_addr(3));
 
         for record in [&matching_a, &matching_b, &neither] {
-            import_one_peer_record(&handle, record.clone(), Some(record.body.node_id)).await;
+            import_one_peer_record(&handle, record.clone(), Some(record.body.node_id())).await;
         }
 
         assert!(handle
@@ -9660,9 +10027,9 @@ mod tests {
                 .iter()
                 .map(|candidate| candidate.node_id)
                 .collect::<HashSet<_>>(),
-            HashSet::from([matching_a.body.node_id, matching_b.body.node_id])
+            HashSet::from([matching_a.body.node_id(), matching_b.body.node_id()])
         );
-        assert_eq!(prioritized[2].node_id, neither.body.node_id);
+        assert_eq!(prioritized[2].node_id, neither.body.node_id());
 
         let general = candidates_preferring_any_service(&handle, &[]).await;
         assert_eq!(
@@ -9671,9 +10038,9 @@ mod tests {
                 .map(|candidate| candidate.node_id)
                 .collect::<HashSet<_>>(),
             HashSet::from([
-                matching_a.body.node_id,
-                matching_b.body.node_id,
-                neither.body.node_id,
+                matching_a.body.node_id(),
+                matching_b.body.node_id(),
+                neither.body.node_id(),
             ])
         );
     }
@@ -9718,7 +10085,7 @@ mod tests {
         let local = secret_key();
         let candidate_secret = NodeSecretKey::from_bytes(&[91; 32]);
         let candidate = runtime_record_with_secret(&candidate_secret, 1, service(1), test_addr(1));
-        let candidate_id = candidate.body.node_id;
+        let candidate_id = candidate.body.node_id();
         let [connected_id, in_flight_a, in_flight_b] =
             [92, 93, 94].map(|byte| NodeSecretKey::from_bytes(&[byte; 32]).public());
         let (connected_tx, connected_rx) = watch::channel(vec![peer_id_for(connected_id)]);
@@ -9804,6 +10171,7 @@ mod tests {
         }
 
         let drop = [
+            DiscoveryBookError::Record(DiscoveryRecordError::NoSupportedKey),
             DiscoveryBookError::Record(DiscoveryRecordError::Expired),
             DiscoveryBookError::Record(DiscoveryRecordError::FarFutureExpiry),
             DiscoveryBookError::SelfRecord,

@@ -18,6 +18,7 @@ mod nsm_value_balance;
 mod prop;
 mod rollback;
 mod sprout_tree;
+mod static_file;
 mod transparent;
 mod transparent_indexes;
 mod vectors;

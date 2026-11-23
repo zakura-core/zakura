@@ -318,13 +318,15 @@ fn conformant_peers_survive_loss_and_reordering() {
 
 /// A focused Plan drops `peer-0`'s first QUIC Initial: datagram 0 on the
 /// fresh link from its first address to the node, sent before the node
-/// sent anything to it, so it can only be the client's first Initial. That
-/// link may lose one datagram and no other may lose any. The client then
-/// retransmits: a later datagram on that link, sent before the node sent
-/// anything, so an Initial too, reaches the node. The node admits the
-/// session within the production 10 s handshake timeout of the first send,
-/// every frame after admission is `Conformant`, no close has a fault cause,
-/// and the node syncs.
+/// sent anything to it, so it can only be the client's first Initial. The
+/// client's hello carries the hybrid key share and spans two Initial
+/// datagrams, 0 and 1, so the node holds half a hello and can only
+/// acknowledge it. That link may lose one datagram and no other may lose
+/// any. The client then retransmits: its first datagram after the hello, an
+/// Initial too, reaches the node. The node admits the session within the
+/// production 10 s handshake timeout of the first send, every frame after
+/// admission is `Conformant`, no close has a fault cause, and the node
+/// syncs.
 ///
 /// This fails if the drop or the retransmission never happened, or if the
 /// admission waited past the handshake timeout.
@@ -362,9 +364,15 @@ fn a_lost_initial_is_retransmitted() {
         .iter()
         .filter(|d| d.link == to_node && d.outcome == DatagramOutcome::Sent)
         .collect();
-    let initial = sent.first().expect("the peer sent an Initial");
-    assert_eq!(initial.id, 0);
-    assert!(initial.at < node_first_sent, "sent before the node sent");
+    let [initial, second_half, ..] = sent.as_slice() else {
+        panic!("the peer's hello spans two datagrams: {sent:?}");
+    };
+    assert_eq!((initial.id, second_half.id), (0, 1));
+    assert!(
+        second_half.at < node_first_sent,
+        "sent before the node sent"
+    );
+    assert!(second_half.len >= 1_200, "{second_half:?}");
     let lost: Vec<&Datagram> = datagrams
         .iter()
         .filter(|d| d.outcome == DatagramOutcome::Lost)
@@ -373,10 +381,11 @@ fn a_lost_initial_is_retransmitted() {
     assert_eq!((lost[0].link.as_str(), lost[0].id), (to_node.as_str(), 0));
     // A client Initial is padded to at least 1,200 bytes.
     assert!(initial.len >= 1_200, "{initial:?}");
-    let retransmitted = sent
-        .iter()
-        .find(|d| d.at > lost[0].at && d.at < node_first_sent)
-        .expect("the client retransmitted before the node sent anything");
+    // Nothing the node can send before the whole hello arrives asks the
+    // client for a reply, so the client's next datagram is its
+    // retransmission.
+    let retransmitted = sent.get(2).expect("the client sent again after its hello");
+    assert!(retransmitted.at > lost[0].at, "{retransmitted:?}");
     assert!(retransmitted.len >= 1_200, "{retransmitted:?}");
     assert!(
         datagrams.iter().any(|d| d.link == to_node

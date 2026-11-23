@@ -30,36 +30,34 @@ enum MissingBound {
     /// `max_unproductive_header_requests` is zero, so no stall ever ends an
     /// adversary's session.
     NoStallRule,
-    /// Adversaries reopen sessions, after their cooldown or under fresh
-    /// identities. Only the per-IP handshake rate bounds how many sessions
-    /// they open, and the scheduler doesn't prefer the honest offer over a
-    /// reopened one, so no figure follows from the header-sync constants.
-    Reopening,
 }
 
 /// The time by which a node must adopt the honest tip against `adversaries`
-/// peers that each hold one session.
+/// peers, each holding one session at a time and free to open a new one
+/// under a fresh key whenever the node ends the last.
 ///
 /// A session holds a target for at most `max_unproductive_header_requests`
-/// request timeouts before the stall rule ends it. Only one peer owns a
-/// branch target at a time, so in the worst case the adversaries hold the
-/// honest branch one after another. The honest round then finishes within
-/// one more request timeout. Each turn can wait one cached-pass refill
-/// before the next offer stages.
+/// request timeouts before the stall rule ends it. Each turn can wait one
+/// cached-pass refill before the next offer stages. Only one peer owns a
+/// branch target at a time, and offers take turns in the order their peers
+/// last took one, so a reopened session's offer waits behind the honest one.
+/// In the worst case the adversaries that waited ahead of the honest offer
+/// hold the honest branch one after another, and the honest round then
+/// finishes within one more turn. At most the header-sync session slots,
+/// less the honest one, wait ahead, so the deadline never exceeds one turn
+/// per slot.
 fn progress_deadline(
     startup: &HeaderSyncStartup,
     adversaries: u32,
-    reopening: bool,
 ) -> Result<Duration, MissingBound> {
-    if reopening {
-        return Err(MissingBound::Reopening);
-    }
     let strikes = startup.config.max_unproductive_header_requests;
     if strikes == 0 {
         return Err(MissingBound::NoStallRule);
     }
     let turn = startup.request_timeout * strikes + CACHED_PASS_REFILL;
-    Ok(turn * adversaries.saturating_add(1))
+    let slots =
+        u32::try_from(startup.config.serving_sessions(startup.max_connections)).unwrap_or(u32::MAX);
+    Ok(turn * adversaries.saturating_add(1).min(slots))
 }
 
 /// Genesis and the headers above it, each linked to the one before.
@@ -309,14 +307,30 @@ enum Role {
     /// Advertises tip `n` of an invalid branch with more work than the honest
     /// tip, and serves that branch.
     Invalid(u8),
+    /// Advertises the honest tip with far more work than it has, and never
+    /// answers a subscription.
+    Inflated,
+    /// Plays [`Role::Honest`], but its status names a work anchor the node
+    /// doesn't share, so its claimed work can't be compared with the node's.
+    Unanchored,
 }
 
 impl Role {
-    fn peer(self, index: usize) -> ZakuraPeerId {
-        // Adversaries sort before the honest peer.
+    /// Whether this peer serves the honest chain to the end.
+    fn honest(self) -> bool {
+        matches!(self, Role::Honest | Role::Unanchored)
+    }
+
+    /// The key of this peer's `generation`th session, for peer `index` of
+    /// `peers`. Adversaries sort before the honest peer, and each reopened
+    /// session takes a fresh key.
+    fn peer(self, index: usize, peers: usize, generation: usize) -> ZakuraPeerId {
         let byte = match self {
-            Role::Honest => 0xF0,
-            _ => 0x10 + u8::try_from(index).expect("a test runs few peers"),
+            Role::Honest | Role::Unanchored => 0xF0,
+            _ => u8::try_from(0x10 + index + peers * generation)
+                .ok()
+                .filter(|byte| *byte < 0xF0)
+                .expect("a test reopens few sessions"),
         };
         ZakuraPeerId::new(vec![byte; 32]).expect("the test peer ID has the required length")
     }
@@ -324,18 +338,19 @@ impl Role {
     /// The chain this peer serves, if it serves one.
     fn chain(self, honest: &Arc<Chain>) -> Option<Arc<Chain>> {
         match self {
-            Role::Honest | Role::Intermittent => Some(honest.clone()),
+            Role::Honest | Role::Unanchored | Role::Intermittent => Some(honest.clone()),
             Role::Invalid(branch) => Some(Arc::new(Chain::invalid(HONEST_LEN, branch))),
-            Role::Silent | Role::FalseTip(_) => None,
+            Role::Silent | Role::FalseTip(_) | Role::Inflated => None,
         }
     }
 
     fn status(self, honest: &Chain) -> Status {
         let honest_tip = honest.tip();
         let (tip, work) = match self {
-            Role::Honest | Role::Silent | Role::Intermittent => {
+            Role::Honest | Role::Unanchored | Role::Silent | Role::Intermittent => {
                 (honest_tip, U256::from(HONEST_LEN))
             }
+            Role::Inflated => (honest_tip, U256::from(1_000_000_u32)),
             Role::FalseTip(n) => (
                 zakura_header_chain::Frontier::new(
                     block::Height(HONEST_LEN + 1),
@@ -348,9 +363,14 @@ impl Role {
                 U256::from(2_000 + u32::from(n)),
             ),
         };
+        let work_anchor_hash = if self == Role::Unanchored {
+            block::Hash([0xAA; 32])
+        } else {
+            honest.frontier(0).hash
+        };
         Status {
             work_anchor_height: block::Height(0),
-            work_anchor_hash: honest.frontier(0).hash,
+            work_anchor_hash,
             selected_tip_height: tip.height,
             selected_tip_hash: tip.hash,
             suffix_cumulative_work: work,
@@ -433,11 +453,60 @@ enum Verdict {
     Violated,
 }
 
+/// Opens `peer`'s session as `role` and advertises its status. As in
+/// production, the session's token is a child of its connection's.
+async fn connect(
+    handle: &HeaderSyncHandle,
+    role: Role,
+    peer: ZakuraPeerId,
+    honest: &Chain,
+) -> (PeerSession, CancellationToken, FramedRecv) {
+    let (send, outbound) = framed_channel(8);
+    let connection = CancellationToken::new();
+    let session = PeerSession::from_parts_with_connection(
+        peer.clone(),
+        1,
+        send,
+        connection.child_token(),
+        connection.clone(),
+        CloseCause::new(),
+    );
+    handle
+        .send(Event::PeerConnected(session.clone()))
+        .await
+        .expect("the reactor runs");
+    handle
+        .send(Event::Status {
+            peer,
+            session_id: 1,
+            status: role.status(honest),
+        })
+        .await
+        .expect("the reactor runs");
+    (session, connection, outbound)
+}
+
+/// Whether an adversary whose session the node ends opens another.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Sessions {
+    /// Each adversary holds one session.
+    One,
+    /// Each adversary opens a new session under a fresh key as soon as the
+    /// node ends its last one, so neither held strikes nor the readmission
+    /// cooldown follow it.
+    Reopen,
+}
+
 /// Runs `roles` (exactly one honest) against one node until it adopts the
 /// honest tip or `deadline` passes. Peers connect and advertise in order.
 async fn run(roles: &[Role]) -> Run {
+    run_with(roles, Sessions::One).await
+}
+
+/// [`run`], with each adversary's `sessions`.
+async fn run_with(roles: &[Role], sessions: Sessions) -> Run {
     assert_eq!(
-        roles.iter().filter(|role| **role == Role::Honest).count(),
+        roles.iter().filter(|role| role.honest()).count(),
         1,
         "a run has exactly one honest peer"
     );
@@ -445,8 +514,8 @@ async fn run(roles: &[Role]) -> Run {
     let mut startup = startup(shutdown.clone());
     let adversaries = u32::try_from(roles.len() - 1).expect("a test runs few peers");
     // Each turn also waits for the port's own locator read.
-    let deadline = progress_deadline(&startup, adversaries, false)
-        .expect("one-session adversaries have a bounded deadline")
+    let deadline = progress_deadline(&startup, adversaries)
+        .expect("the test's adversaries have a bounded deadline")
         + LOCATOR_READ * adversaries.saturating_add(1);
     let honest = Arc::new(Chain::honest(HONEST_LEN));
     let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
@@ -470,43 +539,36 @@ async fn run(roles: &[Role]) -> Run {
     let mut honest_tokens = None;
     let mut adversaries = Vec::new();
     for (index, role) in roles.iter().copied().enumerate() {
-        let peer = role.peer(index);
-        let (send, outbound) = framed_channel(8);
-        // As in production, the session's token is a child of its connection's.
-        let connection = CancellationToken::new();
-        let session = PeerSession::from_parts_with_connection(
-            peer.clone(),
-            1,
-            send,
-            connection.child_token(),
-            connection.clone(),
-            CloseCause::new(),
-        );
-        if role == Role::Honest {
+        let (session, connection, outbound) =
+            connect(&handle, role, role.peer(index, roles.len(), 0), &honest).await;
+        if role.honest() {
             honest_tokens = Some((session.cancel_token(), connection));
         } else {
             adversaries.push((role, session.cancel_token()));
         }
-        handle
-            .send(Event::PeerConnected(session.clone()))
-            .await
-            .expect("the reactor runs");
-        handle
-            .send(Event::Status {
-                peer,
-                session_id: 1,
-                status: role.status(&honest),
-            })
-            .await
-            .expect("the reactor runs");
-        tokio::spawn(play(
-            role,
-            session,
-            outbound,
-            handle.clone(),
-            role.chain(&honest),
-            request_timeout,
-        ));
+        let handle = handle.clone();
+        let honest = honest.clone();
+        let peers = roles.len();
+        tokio::spawn(async move {
+            let (mut session, mut outbound) = (session, outbound);
+            for generation in 1.. {
+                let chain = role.chain(&honest);
+                play(
+                    role,
+                    session,
+                    outbound,
+                    handle.clone(),
+                    chain,
+                    request_timeout,
+                )
+                .await;
+                if role.honest() || sessions == Sessions::One {
+                    return;
+                }
+                let peer = role.peer(index, peers, generation);
+                (session, _, outbound) = connect(&handle, role, peer, &honest).await;
+            }
+        });
     }
 
     let tip = honest.tip();
@@ -576,15 +638,14 @@ impl Run {
 fn the_deadline_follows_the_request_timeout_and_stall_rule() {
     let mut startup = startup(CancellationToken::new());
     let turn = startup.request_timeout + CACHED_PASS_REFILL;
-    assert_eq!(progress_deadline(&startup, 0, false), Ok(turn));
-    assert_eq!(progress_deadline(&startup, 16, false), Ok(turn * 17));
-    assert_eq!(
-        progress_deadline(&startup, 1, true),
-        Err(MissingBound::Reopening)
-    );
+    let slots = u32::try_from(startup.config.serving_sessions(startup.max_connections))
+        .expect("the default slots fit u32");
+    assert_eq!(progress_deadline(&startup, 0), Ok(turn));
+    assert_eq!(progress_deadline(&startup, 16), Ok(turn * 17));
+    assert_eq!(progress_deadline(&startup, u32::MAX), Ok(turn * slots));
     startup.config.max_unproductive_header_requests = 0;
     assert_eq!(
-        progress_deadline(&startup, 1, false),
+        progress_deadline(&startup, 1),
         Err(MissingBound::NoStallRule)
     );
 }
@@ -651,4 +712,35 @@ async fn mixed_adversaries_cannot_hold_the_honest_tip_past_the_deadline() {
         Role::Honest,
     ]);
     run(&roles).await.held_past_every_adversary();
+}
+
+/// hsync-23, D3: silent servers of the honest tip that open a new session
+/// under a fresh key each time the stall rule ends one. A reopened offer
+/// waits behind the honest one, so each adversary holds the honest branch
+/// once.
+#[tokio::test(start_paused = true)]
+async fn reopening_silent_servers_cannot_hold_the_honest_tip_past_the_deadline() {
+    let roles = [Role::Silent, Role::Silent, Role::Silent, Role::Honest];
+    run_with(&roles, Sessions::Reopen)
+        .await
+        .held_past_every_adversary();
+}
+
+/// F-829: silent servers of the honest tip that claim far more work than it
+/// has, and reopen under a fresh key each time the stall rule ends one. The
+/// honest peer's status names a work anchor the node doesn't share, so its
+/// claim can't be compared. Claimed work is unauthenticated, so the inflated
+/// claims rank with the honest one, and the rotation still gives the honest
+/// offer its turn after each adversary's.
+#[tokio::test(start_paused = true)]
+async fn inflated_work_claims_cannot_hold_the_honest_tip_past_the_deadline() {
+    let roles = [
+        Role::Inflated,
+        Role::Inflated,
+        Role::Inflated,
+        Role::Unanchored,
+    ];
+    run_with(&roles, Sessions::Reopen)
+        .await
+        .held_past_every_adversary();
 }

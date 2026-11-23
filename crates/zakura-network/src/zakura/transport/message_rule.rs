@@ -98,7 +98,9 @@ pub enum MessageRole {
     /// [`ByteRate::sender_allowance`] paid bytes unwritten. The receiver's
     /// bucket for the connection is deeper by that allowance and by the
     /// stream receive window it granted, so a conformant sender never
-    /// overruns it. An overrun closes the connection.
+    /// overruns it. An overrun closes the connection. The receiver's bucket
+    /// starts at the opening allowance, so a reconnect buys no more than a
+    /// conformant sender's own start.
     Metered {
         /// The row's byte rate.
         rate: ByteRate,

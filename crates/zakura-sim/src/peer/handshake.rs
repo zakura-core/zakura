@@ -44,6 +44,13 @@ impl Local {
             limits: ZakuraLocalLimits::from_config(&config),
         }
     }
+
+    /// Offers the idle timeout a QUIC idle timeout of `secs` gives, in
+    /// place of the default's.
+    pub(crate) fn with_idle_timeout_secs(mut self, secs: u32) -> Self {
+        self.limits.quic_idle_timeout = std::time::Duration::from_secs(secs.into());
+        self
+    }
 }
 
 /// A fresh nonce, drawn from the `Plan` in the calling task.
@@ -305,6 +312,32 @@ pub(crate) async fn write_prelude_with(
     let bytes = prelude.encode().map_err(|error| error.to_string())?;
     let pace = script.map_or(0, |script| script.prelude_byte_delay_ms);
     write_bytes(send, &bytes, pace, None, &mut 0).await
+}
+
+/// Writes the prelude of a persistent `kind` stream at `version` with frame
+/// cap `cap`, then `session`'s 8-byte number if the stream belongs to a
+/// multi-stream session.
+pub(crate) async fn write_prelude_capped(
+    send: &mut SendStream,
+    kind: u16,
+    version: u16,
+    cap: u32,
+    session: Option<u64>,
+) -> Result<(), String> {
+    let prelude = StreamPrelude {
+        magic: STREAM_PRELUDE_MAGIC,
+        stream_kind: kind,
+        stream_version: version,
+        request_id: None,
+        max_frame_bytes: cap,
+    };
+    let mut bytes = prelude.encode().map_err(|error| error.to_string())?;
+    if let Some(session) = session {
+        bytes.extend_from_slice(&session.to_le_bytes());
+    }
+    send.write_all(&bytes)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// Reads a stream prelude: the fixed fields, then the request ID if its

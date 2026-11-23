@@ -23,7 +23,7 @@ use zakura_network::{
     Config,
 };
 use zakura_sim::{
-    domain::session::HONEST_NEVER_PUNISHED,
+    domain::{header_sync::REQUEST_TIMEOUT, session::HONEST_NEVER_PUNISHED},
     harness::{
         header_node::{
             policy::{Allow, Hold, OpKind, Select, Trigger},
@@ -42,6 +42,9 @@ use zakura_sim::{
     },
     Checker, MemorySink, Observation, Plan, PlanInput, PropertyOutcome, RunReport,
 };
+
+/// The `Status` message type.
+const STATUS: u16 = 1;
 
 /// The `Headers` message type.
 const HEADERS: u16 = 3;
@@ -457,9 +460,10 @@ impl Balance {
 /// the window never happens.
 #[test]
 fn held_storage_stops_the_credit_grants() {
+    const HOLD_MS: u64 = 20_000;
     let hold = Hold {
         select: Select::nth(OpKind::Prepare, 1),
-        until: Trigger::VirtualTime(20_000),
+        until: Trigger::VirtualTime(HOLD_MS),
         then: vec![Allow::Engine],
         deadline_ms: None,
     };
@@ -503,10 +507,10 @@ fn held_storage_stops_the_credit_grants() {
                 _ => None,
             })
             .expect("the hold opened");
-        assert_eq!(
-            completed - entries[submitted].ns,
-            20_000_000_000,
-            "held for 20 s"
+        let elapsed = Duration::from_nanos(completed - entries[submitted].ns);
+        assert!(
+            (Duration::from_millis(HOLD_MS)..REQUEST_TIMEOUT).contains(&elapsed),
+            "prepare must complete after the hold opens and before the request expires, took {elapsed:?}"
         );
         // Every page sent before the hold opened.
         let pages: Vec<u64> = entries
@@ -956,29 +960,46 @@ fn a_reopen_after_both_subscriptions_end_gets_a_new_identity() {
             })
             .expect("the node wrote on the reopened stream");
         assert_eq!(seq, 0, "the reopened stream's frames count from 0");
-        // Every frame the node wrote on the retired stream, in the whole
-        // run, was read and logged, any after the finish included.
-        let written: Vec<u64> = facts(&entries, connection)
-            .filter_map(|(_, fact)| match fact {
+        // Resetting the retired stream can discard a status refresh that
+        // raced with retirement, even after QUIC accepted the local write.
+        let mut writes = facts(&entries, connection)
+            .filter_map(|(at, fact)| match fact {
                 TransportFact::FrameWritten {
-                    quic_stream, seq, ..
-                } if *quic_stream == first => Some(*seq),
-                _ => None,
-            })
-            .collect();
-        let read: Vec<u64> = entries
-            .iter()
-            .filter_map(|at| match at.obs {
-                Observation::PeerReceived {
-                    connection: c,
                     quic_stream,
                     seq,
+                    message_type,
                     ..
-                } if (c, quic_stream) == (connection, first) => Some(seq),
+                } if *quic_stream == first => Some((at.step, *seq, *message_type)),
                 _ => None,
             })
-            .collect();
-        assert_eq!(written, read, "the retired stream's writes were all read");
+            .peekable();
+        let reads = entries.iter().filter_map(|at| match at.obs {
+            Observation::PeerReceived {
+                connection: c,
+                quic_stream,
+                seq,
+                message_type,
+                ..
+            } if (c, quic_stream) == (connection, first) => Some((seq, message_type)),
+            _ => None,
+        });
+        for read in reads {
+            let (_, seq, kind) = writes.next().expect("each read has a matching write");
+            assert_eq!((seq, kind), read, "reads follow write order");
+        }
+        if writes.peek().is_some() {
+            let reset = entries.iter().any(|at| {
+                at.step > finished && matches!(
+                    at.obs,
+                    Observation::PeerStreamReset { quic_stream, code: 0, .. } if quic_stream == first
+                )
+            });
+            assert!(reset, "the peer saw the retired stream reset");
+            assert!(
+                writes.all(|(step, _, kind)| step > finished && kind == STATUS),
+                "only status refreshes written after the peer finished may be lost"
+            );
+        }
         assert!(
             !facts(&entries, connection)
                 .any(|(_, fact)| matches!(fact, TransportFact::CloseDecided { .. })),

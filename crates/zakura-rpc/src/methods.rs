@@ -58,6 +58,7 @@ use zakura_chain::{
     block::{self, Block, Commitment, Header, Height, SerializedBlock, TryIntoHeight},
     chain_sync_status::ChainSyncStatus,
     chain_tip::{ChainTip, NetworkChainTipHeightEstimator},
+    miner_mesh::MinerMeshCommitment,
     parameters::{
         subsidy::{
             block_subsidy, founders_reward, funding_stream_values, is_zip234_active, miner_subsidy,
@@ -2040,6 +2041,14 @@ where
     /// `getblocktemplate` path from a new tip to a returned template.
     pub fn with_template_trace(mut self, trace: JsonlEventEmitter) -> Self {
         self.gbt.trace = MiningTemplateTrace(trace);
+        self
+    }
+
+    /// Makes every coinbase this node builds name the gateway in `commitment`.
+    ///
+    /// The node passes its own v2 node ID when `mining.miner_mesh` is set.
+    pub fn with_mesh_commitment(mut self, commitment: MinerMeshCommitment) -> Self {
+        self.gbt.set_mesh_commitment(commitment);
         self
     }
 

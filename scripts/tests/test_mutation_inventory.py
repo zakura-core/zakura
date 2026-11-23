@@ -98,7 +98,7 @@ class InventoryTests(unittest.TestCase):
     def test_seed_case_names_its_seed_and_checks(self):
         self.write("qa/planted/right/example.patch", "unused")
         self.write("qa/planted/right/example.toml", 'seed = "example-seed"\nchecks = ["absent"]\n')
-        row = inventory.planted_binding(self.root, self.root / "qa/planted/right/example.patch")
+        row = inventory.planted_binding(self.root, self.root, self.root / "qa/planted/right/example.patch")
         self.assertEqual(row["seed"], "example-seed")
         self.assertEqual(row["errors"], ["missing dependency path: absent"])
         self.assertEqual(row["discovery_target"], "unchecked: the seed registry names the harness")
@@ -107,24 +107,24 @@ class InventoryTests(unittest.TestCase):
         self.write("qa/planted/right/example.patch", "unused")
         self.write("qa/planted/right/example.toml", '[typed]\nharness = "harness"\nscenario = "s.json"\nplan = "p.bin"\n')
         self.write("s.json", "{}")
-        row = inventory.planted_binding(self.root, self.root / "qa/planted/right/example.patch")
+        row = inventory.planted_binding(self.root, self.root, self.root / "qa/planted/right/example.patch")
         self.assertEqual(row["errors"], ["missing typed plan: p.bin"])
         self.assertEqual(row["harness"], "harness")
         self.assertEqual(row["fuzz_targets"], [])
         self.assertEqual(row["scenario_sha256"], inventory.sha256(self.root / "s.json"))
         self.write("p.bin", "plan")
-        row = inventory.planted_binding(self.root, self.root / "qa/planted/right/example.patch")
+        row = inventory.planted_binding(self.root, self.root, self.root / "qa/planted/right/example.patch")
         self.assertEqual(row["errors"], [])
         # Without Plan bytes, the case runs the empty Plan.
         self.write("qa/planted/right/example.toml", '[typed]\nharness = "harness"\nscenario = "s.json"\n')
-        row = inventory.planted_binding(self.root, self.root / "qa/planted/right/example.patch")
+        row = inventory.planted_binding(self.root, self.root, self.root / "qa/planted/right/example.patch")
         self.assertEqual((row["errors"], row["plan"]), ([], None))
 
     def test_case_with_both_forms_is_refused(self):
         self.write("qa/planted/right/example.patch", "unused")
         self.write("qa/planted/right/example.toml", 'seed = "s"\n[typed]\nharness = "h"\nscenario = "s"\nplan = "p"\n')
         with self.assertRaises(ValueError):
-            inventory.planted_binding(self.root, self.root / "qa/planted/right/example.patch")
+            inventory.planted_binding(self.root, self.root, self.root / "qa/planted/right/example.patch")
 
 
 WORK_LIST = """schema = 1

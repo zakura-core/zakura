@@ -150,3 +150,29 @@ pub(crate) fn zakura_discovery_sequence_file_path(
         network.lowercase_name()
     ))
 }
+
+/// Moves the discovery sequence file that an older release wrote for the
+/// node with the Ed25519 key `key` to the name this release reads, the one
+/// carrying `node_id`. Returns whether it moved a file.
+///
+/// Older releases named a node by its key, so their file carries the key's
+/// hex. The move happens only when the old file exists and the new one does
+/// not, so a second start changes nothing and a file this release wrote is
+/// never replaced.
+pub(crate) fn move_legacy_zakura_discovery_sequence_file(
+    identity_dir: &Path,
+    network: &Network,
+    key: &zakura_quic::NodeKey,
+    node_id: &zakura_quic::NodeId,
+) -> std::io::Result<bool> {
+    let legacy = identity_dir.join(format!(
+        "{}.{key}.zakura-discovery-sequence",
+        network.lowercase_name()
+    ));
+    let current = zakura_discovery_sequence_file_path(identity_dir, network, node_id);
+    if current.exists() || !legacy.exists() {
+        return Ok(false);
+    }
+    std::fs::rename(&legacy, &current)?;
+    Ok(true)
+}

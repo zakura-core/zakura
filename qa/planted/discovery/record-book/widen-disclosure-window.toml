@@ -1,4 +1,0 @@
-# Widens the snapshot to the book, so a requester learns more in one epoch.
-seed = "discovery-record-book"
-# The harness drives discovery state and the transport types under it.
-checks = ["crates/zakura-network/src/zakura"]

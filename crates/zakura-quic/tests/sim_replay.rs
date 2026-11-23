@@ -3,7 +3,7 @@
 //! with `RUSTFLAGS="--cfg zakura_sim"`, in a separate `CARGO_TARGET_DIR`.
 //!
 //! Each run binds two endpoints on a [`SimNet`] with [`SeededInputs`], has the
-//! server answer the first Initial with a Retry, and echoes one stream. No
+//! server answer the unvalidated hello with a Retry, and echoes one stream. No
 //! tokio runtime exists: the scheduler runs every task, and a small seeded
 //! plan picks which ready task runs, which datagram arrives or is lost, and
 //! when time moves. The transcript digest is SHA-256 over every datagram in

@@ -1,6 +1,6 @@
 //! S4.7: discovery's `wait_complete` wakes once the initial exchange
 //! completes. The scenario and its check are the `discovery/wait-complete`
-//! harness, `zakura_sim::seed` builds its input, and `tests/witness.rs`
+//! harness, `support::discovery_inputs` builds its input, and `tests/witness.rs`
 //! holds the regression. This file holds the seed sweep.
 #![cfg(zakura_sim)]
 
@@ -13,14 +13,14 @@ use std::{
     task::{Context, Poll, Waker},
 };
 
-use support::{inputs, recorded};
+use support::{discovery_inputs::wait_complete_input, inputs, recorded};
 use zakura_network::zakura::{ZakuraDiscoveryHandle, ZakuraNodeRecord};
 use zakura_quic::NodeId;
 use zakura_sim::{
     domain::discovery::{wait_complete_wakes, WAIT_COMPLETE_WAKES as PROPERTY},
     harness::discovery::{run_config, spawn, Spawned, WaitComplete},
     property::{Assumptions, Registry, RegistryChecker, Source, Sources},
-    seed, Outcome, Plan, PropertyOutcome, RunReport,
+    Outcome, Plan, PropertyOutcome, RunReport,
 };
 
 /// The registry's check of [`PROPERTY`] alone, for runs outside the
@@ -70,16 +70,13 @@ fn book_record(handle: &ZakuraDiscoveryHandle, node: NodeId) -> Option<ZakuraNod
     }
 }
 
-/// The `discovery-wait-complete` seed holds the source back at its
+/// [`wait_complete_input`] holds the source back at its
 /// `notified` until the sink has run all three marks, and the source still
 /// wakes. The peer's Hello record is valid for the run's clock, so it enters
 /// the book rather than being dropped as expired or too far ahead.
 #[test]
 fn the_peer_record_enters_the_book() {
-    let input = seed::find("discovery-wait-complete")
-        .expect("the seed is registered")
-        .input()
-        .to_vec();
+    let input = wait_complete_input();
     let spawned = RefCell::new(None);
     let (report, _) = recorded(
         run_config(),

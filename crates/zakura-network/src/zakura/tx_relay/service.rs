@@ -2,7 +2,7 @@
 //! two streams and runs one routine for it.
 //!
 //! Each session's routine owns its streams, its [`PeerMachine`], its calls
-//! to the pool and the reservations they bring, and its `Inv` pacing. It
+//! to the pool and the reservations they bring, and its `Have` pacing. It
 //! reads and decodes its own frames, so peers' bodies decode in parallel.
 //! What the routines share, the wanted table and the reactor, is a
 //! [`Shared`] behind one brief lock, which no routine holds across an await.
@@ -34,16 +34,18 @@ use zakura_rt::{
     time::{self, Instant},
 };
 
+#[cfg(zakura_sim)]
+use super::sim::{Received, SimEffect, SimState, TxRelayEvent, TxRelayObserver};
 use super::{
     machine::{
-        peer::Hello, CallId, CloseReason, Granted, InvRoom, Mail, Marks, Paid, PeerKey,
+        peer::Hello, CallId, CloseReason, Granted, HaveRoom, Mail, Marks, Paid, PeerKey,
         PeerMachine, PoolView, RelayConfig, RelayEffect, SessionId, Shared, Time, Unreserved,
         Verdict, Violation, WaiterId, MAX_SERVES, RANK_INTERVAL,
     },
     sessions::{LiveSession, TxRelaySessions},
     wire::{
-        tx_frame, TxRelayMessage, INV_RATE, MAX_TX_BYTES, TX_RELAY_DATA_KIND, TX_RELAY_STATE_KIND,
-        TX_RELAY_STREAMS,
+        tx_frame, TxRelayMessage, HAVE_RATE, MAX_HAVE_ENTRIES, MAX_TX_BYTES, TX_RELAY_DATA_KIND,
+        TX_RELAY_STATE_KIND, TX_RELAY_STREAMS,
     },
     ZakuraTxRelayConfig,
 };
@@ -65,7 +67,7 @@ pub type MayCool = Arc<dyn Fn(zakura_chain::block::Height) -> bool + Send + Sync
 
 /// Jobs a session's data writer queues: a serve job for every request our
 /// `Hello` lets a peer have unanswered, each only an id until the writer
-/// builds its body, and room for the one unwritten `Inv`, which goes out
+/// builds its body, and room for the one unwritten `Have`, which goes out
 /// only while the jobs' room is free. A conformant peer never fills it.
 const DATA_QUEUE: usize = MAX_SERVES + 4;
 
@@ -135,10 +137,10 @@ struct Handle {
 /// Pool calls in flight.
 type Calls = FuturesUnordered<PoolCall>;
 
-/// Each connection's `Inv` byte rate, which every session on it pays before
+/// Each connection's `Have` byte rate, which every session on it pays before
 /// it queues a frame, so overlapping or replacing sessions share one
 /// opening allowance.
-type InvBuckets = Arc<Mutex<HashMap<(ZakuraPeerId, ZakuraConnId), ConnectionInv>>>;
+type HaveBuckets = Arc<Mutex<HashMap<(ZakuraPeerId, ZakuraConnId), ConnectionHave>>>;
 
 /// The connections tx-relay owns, until the transport removes them. The
 /// service adds a session when it takes its streams, and the routine removes
@@ -203,6 +205,33 @@ impl TxRelayService {
         unconditional: UnconditionalPeers,
         sessions: TxRelaySessions,
     ) -> Arc<Self> {
+        Arc::new(Self::start(pool, may_cool, config, unconditional, sessions))
+    }
+
+    /// [`Self::spawn`], with every session reporting its steps to
+    /// `observer`.
+    #[cfg(zakura_sim)]
+    pub(crate) fn spawn_observed(
+        pool: PoolHandle,
+        may_cool: MayCool,
+        config: &ZakuraTxRelayConfig,
+        unconditional: UnconditionalPeers,
+        sessions: TxRelaySessions,
+        observer: TxRelayObserver,
+    ) -> Arc<Self> {
+        let mut service = Self::start(pool, may_cool, config, unconditional, sessions);
+        service.wiring.observer = Some(observer);
+        Arc::new(service)
+    }
+
+    /// Starts the reactor task and returns the service. See [`Self::spawn`].
+    fn start(
+        pool: PoolHandle,
+        may_cool: MayCool,
+        config: &ZakuraTxRelayConfig,
+        unconditional: UnconditionalPeers,
+        sessions: TxRelaySessions,
+    ) -> Self {
         let mut key = [0; 8];
         zakura_rt::rand::rng().fill_bytes(&mut key);
         let node = Node {
@@ -220,9 +249,11 @@ impl TxRelayService {
             handoff,
             owned: Owned::default(),
             record: sessions,
-            inv_buckets: InvBuckets::default(),
+            have_buckets: HaveBuckets::default(),
             base: Instant::now(),
             unconditional,
+            #[cfg(zakura_sim)]
+            observer: None,
         };
         // The reactor task holds a reader, not a handle, so it does not keep
         // the core running, and it stops once the service, every routine
@@ -244,7 +275,7 @@ impl TxRelayService {
             .hash_length(8)
             .key(&key)
             .personal(b"Zakura_TxPeerKey");
-        Arc::new(Self { wiring, peer_key })
+        Self { wiring, peer_key }
     }
 
     /// The machine's name for `peer`, the same for every connection to it: a
@@ -270,7 +301,7 @@ impl Service for TxRelayService {
 
     /// A session that ends while its connection stays up opens again, as
     /// the plan's reopening rule says. The new session starts clean on the
-    /// machine's side and pays the connection's `Inv` bucket, so reopening
+    /// machine's side and pays the connection's `Have` bucket, so reopening
     /// buys no allowance.
     fn session_policy(&self) -> SessionPolicy {
         SessionPolicy {
@@ -323,12 +354,12 @@ impl Service for TxRelayService {
             reports,
         };
         let data = spawn_writer(data_send, DATA_QUEUE, session_cancel.clone(), Some(bodies));
-        let inv = MeteredSender::new(open_inv_bucket(&self.wiring.inv_buckets, &connection));
+        let have = MeteredSender::new(open_have_bucket(&self.wiring.have_buckets, &connection));
         let routine = Routine::open(
             self.wiring.clone(),
             peer_key,
             peer.remote_ip,
-            SessionIo::new(data, state, close, reports_rx, inv, connection),
+            SessionIo::new(data, state, close, reports_rx, have, connection),
             session_cancel,
             rtt,
         );
@@ -470,7 +501,7 @@ enum PoolResult {
 type PoolCall = Pin<Box<dyn Future<Output = PoolResult> + Send>>;
 
 /// One session's streams and regulation tools: its writers, its closer, and
-/// its `Inv` sender.
+/// its `Have` sender.
 struct SessionIo {
     data: mpsc::Sender<Outgoing>,
     state: mpsc::Sender<Outgoing>,
@@ -479,11 +510,11 @@ struct SessionIo {
     reports: mpsc::UnboundedReceiver<WriterReport>,
     /// A writer's queue was full at this step: the peer stopped reading.
     stalled: bool,
-    /// Pays the connection's `Inv` byte rate and keeps one `Inv` unwritten
-    /// at most. One unwritten `Inv` of at most about 70 KB, with the
+    /// Pays the connection's `Have` byte rate and keeps one `Have` unwritten
+    /// at most. One unwritten `Have` of at most about 70 KB, with the
     /// transport's 64 KiB of write-ahead, stays within the row's 512 KiB
     /// sender allowance.
-    inv: MeteredSender,
+    have: MeteredSender,
     /// The peer and connection the session runs on.
     connection: (ZakuraPeerId, ZakuraConnId),
     /// The session's entry in the live-session record, once the routine
@@ -492,15 +523,15 @@ struct SessionIo {
 }
 
 impl SessionIo {
-    /// A session's IO on these writers, closing with `close`, sending `Inv`
-    /// through `inv`, running on `connection`. `reports` hears from the
+    /// A session's IO on these writers, closing with `close`, sending `Have`
+    /// through `have`, running on `connection`. `reports` hears from the
     /// data writer.
     fn new(
         data: mpsc::Sender<Outgoing>,
         state: mpsc::Sender<Outgoing>,
         close: Closer,
         reports: mpsc::UnboundedReceiver<WriterReport>,
-        inv: MeteredSender,
+        have: MeteredSender,
         connection: (ZakuraPeerId, ZakuraConnId),
     ) -> Self {
         Self {
@@ -509,42 +540,42 @@ impl SessionIo {
             close,
             reports,
             stalled: false,
-            inv,
+            have,
             connection,
             live: None,
         }
     }
 }
 
-/// One connection's `Inv` byte rate, and how many of its sessions are live.
-struct ConnectionInv {
+/// One connection's `Have` byte rate, and how many of its sessions are live.
+struct ConnectionHave {
     bucket: Arc<Mutex<ByteBucket>>,
     sessions: usize,
 }
 
-/// Counts a new session on `connection` in its `Inv` bucket, making the
+/// Counts a new session on `connection` in its `Have` bucket, making the
 /// bucket if the connection has none, and returns the bucket. A bucket no
 /// session uses that has refilled is the same as a new one, so it goes.
-fn open_inv_bucket(
-    buckets: &InvBuckets,
+fn open_have_bucket(
+    buckets: &HaveBuckets,
     connection: &(ZakuraPeerId, ZakuraConnId),
 ) -> Arc<Mutex<ByteBucket>> {
     let opened = Instant::now();
     let mut buckets = buckets.lock().expect("the bucket map is never poisoned");
     // Widening u32 to u64 is lossless.
-    let full = u64::from(INV_RATE.opening_allowance);
-    buckets.retain(|_, inv| {
-        let mut bucket = inv.bucket.lock().expect("a bucket is never poisoned");
-        inv.sessions > 0 || bucket.ready_at(full, opened) != Some(opened)
+    let full = u64::from(HAVE_RATE.opening_allowance);
+    buckets.retain(|_, have| {
+        let mut bucket = have.bucket.lock().expect("a bucket is never poisoned");
+        have.sessions > 0 || bucket.ready_at(full, opened) != Some(opened)
     });
-    let inv = buckets
+    let have = buckets
         .entry(connection.clone())
-        .or_insert_with(|| ConnectionInv {
-            bucket: Arc::new(Mutex::new(ByteBucket::sender(INV_RATE, opened))),
+        .or_insert_with(|| ConnectionHave {
+            bucket: Arc::new(Mutex::new(ByteBucket::sender(HAVE_RATE, opened))),
             sessions: 0,
         });
-    inv.sessions += 1;
-    inv.bucket.clone()
+    have.sessions += 1;
+    have.bucket.clone()
 }
 
 /// The pool as a routine read it: the snapshot it last read.
@@ -619,11 +650,14 @@ struct Wiring {
     handoff: mpsc::UnboundedSender<Calls>,
     owned: Owned,
     record: TxRelaySessions,
-    inv_buckets: InvBuckets,
+    have_buckets: HaveBuckets,
     base: Instant,
     /// Bodies from these addresses are never charged. See
     /// [`Routine::exempt`].
     unconditional: UnconditionalPeers,
+    /// Hears each session's steps, in the simulator.
+    #[cfg(zakura_sim)]
+    observer: Option<TxRelayObserver>,
 }
 
 /// One session's routine. See the module docs.
@@ -675,6 +709,15 @@ impl Routine {
             let node = &mut *node;
             let marks = Marks::of(&node.shared);
             let machine = PeerMachine::connect(&mut node.shared, &view, peer, now);
+            #[cfg(zakura_sim)]
+            if let Some(observer) = &wiring.observer {
+                observer(TxRelayEvent::Opened {
+                    session: machine.session().0,
+                    peer: io.connection.0.clone(),
+                    readmitted: machine.readmitted(),
+                    parked: machine.is_ended(),
+                });
+            }
             node.sessions.insert(
                 machine.session(),
                 Handle {
@@ -748,7 +791,7 @@ impl Routine {
                 () = self.cancel.cancelled() => break,
                 frame = data.recv() => {
                     let Some(frame) = frame else { break };
-                    if !self.frame(&frame).await {
+                    if !self.data_frame(&frame, &mut data).await {
                         break;
                     }
                 }
@@ -820,6 +863,8 @@ impl Routine {
             }
             let result = input(&mut self.machine, &mut node.shared, &view, now);
             let effects = std::mem::take(&mut node.shared.effects);
+            #[cfg(zakura_sim)]
+            self.report_step(&node.shared, &effects);
             let closes = closers(node, &effects, Some(session));
             let wakes = route(node, marks, Some(session));
             (result, effects, closes, wakes)
@@ -884,7 +929,7 @@ impl Routine {
     }
 
     /// When this routine next has something due: the machine's deadline,
-    /// which covers its next `Inv` try, or its next round-trip time report.
+    /// which covers its next `Have` try, or its next round-trip time report.
     fn next_wake(&self) -> Instant {
         let far = Instant::now() + Duration::from_secs(3600);
         let machine = {
@@ -913,10 +958,47 @@ impl Routine {
         }
     }
 
+    /// Handles one frame from the data stream. A `Have` also takes the `Have`
+    /// frames already queued behind it, up to [`MAX_HAVE_ENTRIES`] entries in
+    /// all, and hands them to the machine as one, so a peer that sends
+    /// one-entry frames costs a lock step per queued run, not per frame. The
+    /// first frame that does not join is handled after them, in order.
+    /// Returns `false` as [`Self::frame`] does.
+    async fn data_frame(&mut self, frame: &Frame, data: &mut FramedRecv) -> bool {
+        let mut first = decode_frame::<TxRelayMessage>(frame);
+        let mut next = None;
+        if let Ok(TxRelayMessage::Have(entries)) = &mut first {
+            // The data stream's inbound queue bounds how many frames wait.
+            while let Ok(frame) = data.try_recv() {
+                match decode_frame::<TxRelayMessage>(&frame) {
+                    Ok(TxRelayMessage::Have(more))
+                        if entries.len() + more.len() <= MAX_HAVE_ENTRIES =>
+                    {
+                        entries.extend(more);
+                    }
+                    other => {
+                        next = Some(other);
+                        break;
+                    }
+                }
+            }
+        }
+        for decoded in std::iter::once(first).chain(next) {
+            let Ok(message) = decoded else {
+                self.io.close.close(fault(CloseRow::RELAY_CLOSE_3));
+                return false;
+            };
+            self.message(message).await;
+        }
+        true
+    }
+
     /// Hands one decoded message to the machine. A `Tx` body waits for its
     /// decode on the blocking pool first.
     async fn message(&mut self, message: TxRelayMessage) {
         count(&message, "received");
+        #[cfg(zakura_sim)]
+        self.report_received(&message);
         match message {
             TxRelayMessage::Hello {
                 serves,
@@ -928,8 +1010,8 @@ impl Routine {
                 };
                 self.step(|machine, shared, pool, now| machine.hello(shared, pool, hello, now));
             }
-            TxRelayMessage::Inv(entries) => {
-                self.step(|machine, shared, pool, now| machine.inv(shared, pool, &entries, now));
+            TxRelayMessage::Have(entries) => {
+                self.step(|machine, shared, pool, now| machine.have(shared, pool, &entries, now));
             }
             TxRelayMessage::GetTxs(id) => {
                 // The writer reports an answer it started before handing it
@@ -1110,16 +1192,103 @@ impl Routine {
             let _ = self.wiring.handoff.send(calls);
         }
         disown(&self.wiring.owned, &self.io.connection, Instant::now());
-        if let Some(inv) = self
+        if let Some(have) = self
             .wiring
-            .inv_buckets
+            .have_buckets
             .lock()
             .expect("the bucket map is never poisoned")
             .get_mut(&self.io.connection)
         {
-            inv.sessions = inv.sessions.saturating_sub(1);
+            have.sessions = have.sessions.saturating_sub(1);
         }
         self.io.live = None;
+    }
+
+    /// Reports a decoded message from the peer, before its step.
+    #[cfg(zakura_sim)]
+    fn report_received(&self, message: &TxRelayMessage) {
+        let Some(observer) = &self.wiring.observer else {
+            return;
+        };
+        let message = match message {
+            TxRelayMessage::Hello { .. } => Received::Hello,
+            TxRelayMessage::Have(entries) => Received::Have(entries.clone()),
+            TxRelayMessage::GetTxs(id) => Received::GetTxs(*id),
+            TxRelayMessage::Tx { id, body } => Received::Tx {
+                id: *id,
+                size: u32::try_from(body.len()).unwrap_or(u32::MAX),
+            },
+            TxRelayMessage::NotFound(id) => Received::NotFound(*id),
+        };
+        observer(TxRelayEvent::Received {
+            session: self.machine.session().0,
+            message,
+        });
+    }
+
+    /// Reports the step that produced `effects`, under the node's lock, so
+    /// every session's steps reach the observer in order.
+    #[cfg(zakura_sim)]
+    fn report_step(&self, shared: &Shared, effects: &[RelayEffect]) {
+        let Some(observer) = &self.wiring.observer else {
+            return;
+        };
+        let session = self.machine.session();
+        let peer = self.machine.state.peer;
+        let cooling = shared.reactor.is_cooling(peer, self.machine.clock());
+        let effects = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                RelayEffect::Ask { id, .. } => Some(SimEffect::Ask(*id)),
+                RelayEffect::Serve { id, .. } => Some(SimEffect::Serve(*id)),
+                RelayEffect::Submit {
+                    reservation, body, ..
+                } => Some(SimEffect::Submit {
+                    requested: self.reservations.get(reservation).map(Reservation::tx_id),
+                    body: body.id(),
+                    size: transaction_size(body.size()),
+                    cooling,
+                }),
+                RelayEffect::Park { session: parked } if *parked == session => {
+                    Some(SimEffect::Park)
+                }
+                RelayEffect::Close {
+                    session: closed,
+                    reason,
+                } => Some(SimEffect::Close {
+                    session: closed.0,
+                    outcome: close_outcome(*reason),
+                }),
+                _ => None,
+            })
+            .collect();
+        let state = &self.machine.state;
+        // An ended session handed its reserve calls and submissions to the
+        // reactor, which `unsettled` counts, so it reports none of its own.
+        let (asking, in_flight) = if self.machine.is_ended() {
+            (0, 0)
+        } else {
+            (
+                state.requests.len().saturating_add(state.reserving.len()),
+                state.in_flight(),
+            )
+        };
+        observer(TxRelayEvent::Stepped {
+            session: session.0,
+            effects,
+            state: SimState {
+                hello_serves: state.hello.map(|hello| hello.serves),
+                window: state.window,
+                asking,
+                in_flight,
+                unsettled: shared.reactor.unsettled_count(peer),
+                serving: state.serving.len(),
+                pending: state.pending.len(),
+                waiting: state.waiting.len(),
+                known: state.known.len(),
+                cooling,
+            },
+        });
     }
 
     /// Performs one of this session's effects.
@@ -1129,7 +1298,7 @@ impl Routine {
                 self.send(TX_RELAY_STATE_KIND, &TxRelayMessage::GetTxs(id));
             }
             // The machine queued the id, and `flush_adverts` asks it for an
-            // `Inv` after every step.
+            // `Have` after every step.
             RelayEffect::Advert { .. } => {}
             RelayEffect::Serve { id, .. } => self.serve(id),
             RelayEffect::NotFound { id, .. } => {
@@ -1154,7 +1323,7 @@ impl Routine {
                     // A core that does not answer in time is busy, so the
                     // machine tries again later.
                     let answer = pool
-                        .reserve(id, Instant::now() + POOL_ANSWER)
+                        .reserve_relayed(id, Instant::now() + POOL_ANSWER)
                         .await
                         .unwrap_or(Err(PortUnreserved::NoRoom));
                     PoolResult::Reserved { call, answer }
@@ -1239,10 +1408,10 @@ impl Routine {
         }
     }
 
-    /// Sends the `Inv` the machine lets go now, if any, and asks again until
+    /// Sends the `Have` the machine lets go now, if any, and asks again until
     /// it lets none go, so with more queued than one frame takes, it sets
     /// its own retry for after this frame is written. The machine decides
-    /// when one may go from what the data writer and the `Inv` sender say,
+    /// when one may go from what the data writer and the `Have` sender say,
     /// so while it waits, new announcements join the frame, and a session
     /// batches only under load.
     fn flush_adverts(&mut self) {
@@ -1251,27 +1420,27 @@ impl Routine {
             // payment, so a refill between two samples cannot let the
             // machine take ids the rate then refuses to pay for.
             let now = Instant::now();
-            let (inv, base) = (&self.io.inv, self.wiring.base);
+            let (have, base) = (&self.io.have, self.wiring.base);
             let at = now.saturating_duration_since(base);
-            let room = InvRoom {
+            let room = HaveRoom {
                 free: self.io.data.capacity(),
-                paid: |bytes| match inv.ready(bytes, now) {
+                paid: |bytes| match have.ready(bytes, now) {
                     MeteredReady::Now => Paid::Now,
                     MeteredReady::At(paid) => Paid::At(paid.saturating_duration_since(base)),
                     MeteredReady::Unwritten => Paid::Unwritten,
                 },
             };
-            let entries = self.machine.next_inv(&self.view, room, at);
+            let entries = self.machine.next_have(&self.view, room, at);
             if entries.is_empty() {
                 return;
             }
-            let message = TxRelayMessage::Inv(entries);
+            let message = TxRelayMessage::Have(entries);
             let Ok(frame) = encode_frame(&message) else {
                 return;
             };
             // The frame is within the bound the sender said the rate pays
             // for. Widening usize to u64 is lossless on supported targets.
-            let Some(guard) = self.io.inv.pay(frame.payload.len() as u64, now) else {
+            let Some(guard) = self.io.have.pay(frame.payload.len() as u64, now) else {
                 debug_assert!(false, "the frame is within the bound the rate paid for");
                 return;
             };
@@ -1285,6 +1454,15 @@ impl Routine {
                 .is_ok()
             {
                 count(&message, "sent");
+                #[cfg(zakura_sim)]
+                if let (Some(observer), TxRelayMessage::Have(entries)) =
+                    (&self.wiring.observer, &message)
+                {
+                    observer(TxRelayEvent::HaveSent {
+                        session: self.machine.session().0,
+                        entries: entries.clone(),
+                    });
+                }
             }
         }
     }
@@ -1455,13 +1633,13 @@ fn ended_result(
     }
 }
 
-/// Counts one message `direction` ("sent" or "received"): ids for `Inv`, one
+/// Counts one message `direction` ("sent" or "received"): ids for `Have`, one
 /// for each other message. `Hello` is not counted.
 fn count(message: &TxRelayMessage, direction: &'static str) {
     let (name, amount) = match message {
         TxRelayMessage::Hello { .. } => return,
-        // An `Inv` holds at most 1,024 ids.
-        TxRelayMessage::Inv(entries) => ("zakura.p2p.tx_relay.inv_ids", entries.len() as u64),
+        // A `Have` holds at most 1,024 ids.
+        TxRelayMessage::Have(entries) => ("zakura.p2p.tx_relay.have_ids", entries.len() as u64),
         TxRelayMessage::GetTxs(_) => ("zakura.p2p.tx_relay.get_txs", 1),
         TxRelayMessage::Tx { .. } => ("zakura.p2p.tx_relay.tx", 1),
         TxRelayMessage::NotFound(_) => ("zakura.p2p.tx_relay.not_found", 1),

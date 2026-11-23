@@ -74,7 +74,7 @@ fn full_mempool_evicts_lowest_fee_transaction() {
     );
 
     assert_eq!(result, Ok(newcomer.transaction.id()));
-    assert_eq!(evicted, [b].into());
+    assert_eq!(evicted, [b]);
     assert_eq!(ids(&storage), [a, c, newcomer.transaction.id()].into());
     assert_eq!(
         storage.rejection(&b, crate::Instant::now()),
@@ -172,7 +172,7 @@ fn high_fee_child_protects_low_fee_parent() {
     );
 
     assert_eq!(result, Ok(newcomer.transaction.id()));
-    assert_eq!(evicted, [other_id].into());
+    assert_eq!(evicted, [other_id]);
     assert!(ids(&storage).is_superset(&[parent_id, child_id].into()));
 }
 
@@ -199,7 +199,7 @@ fn low_fee_child_is_evicted_without_its_parent() {
     );
 
     assert_eq!(result, Ok(newcomer.transaction.id()));
-    assert_eq!(evicted, [child_id].into());
+    assert_eq!(evicted, [child_id]);
     assert!(ids(&storage).is_superset(&[parent_id, other_id].into()));
 }
 
@@ -230,7 +230,7 @@ fn evicting_a_parent_evicts_its_descendants() {
     // Both transactions pay the same rate, so the newest one goes first. Evicting the child
     // frees enough space.
     assert_eq!(result, Ok(newcomer.transaction.id()));
-    assert_eq!(evicted, [child_id].into());
+    assert_eq!(evicted, [child_id]);
     assert!(ids(&storage).is_superset(&[parent_id, other_id].into()));
 
     // A larger newcomer must also evict the parent, which is now alone.
@@ -295,7 +295,7 @@ fn three_transaction_chain_evicts_its_cheap_tail() {
     );
 
     assert_eq!(result, Ok(newcomer.transaction.id()));
-    assert_eq!(evicted, [tail.transaction.id()].into());
+    assert_eq!(evicted, [tail.transaction.id()]);
     storage.verified.assert_dependency_groups_are_bounded();
 }
 
@@ -350,7 +350,7 @@ fn newcomer_never_evicts_its_ancestors() {
     );
 
     assert_eq!(result, Ok(newcomer.transaction.id()));
-    assert_eq!(evicted, [other].into());
+    assert_eq!(evicted, [other]);
     assert!(ids(&storage).contains(&parent_id));
 }
 
@@ -376,7 +376,7 @@ fn equal_eviction_costs_evict_the_newest_transaction() {
     );
 
     assert!(result.is_ok());
-    assert_eq!(evicted, [newer].into());
+    assert_eq!(evicted, [newer]);
     assert!(ids(&storage).contains(&older));
 }
 
@@ -563,7 +563,7 @@ fn triangle_counts_shared_grandchild_once() {
         chrono::Utc::now(),
     );
     assert_eq!(result, Ok(newcomer.transaction.id()));
-    assert_eq!(evicted, [parent_id, child_id, grandchild_id].into());
+    assert_eq!(evicted, [parent_id, child_id, grandchild_id]);
 }
 
 #[test]
@@ -757,7 +757,7 @@ fn ancestor_package_rate_must_outbid_victims_for_every_group_shape() {
             chrono::Utc::now(),
         );
         assert_eq!(result, Ok(child.transaction.id()));
-        assert_eq!(evicted, [victim].into());
+        assert_eq!(evicted, [victim]);
         storage.verified.assert_dependency_groups_are_bounded();
     }
 }
@@ -820,7 +820,7 @@ fn rich_ancestors_do_not_subsidize_an_underpaying_child() {
         chrono::Utc::now(),
     );
     assert_eq!(result, Ok(child.transaction.id()));
-    assert_eq!(evicted, [victim].into());
+    assert_eq!(evicted, [victim]);
 }
 
 #[test]
@@ -865,7 +865,7 @@ fn ancestor_package_must_outbid_every_victim_before_any_eviction() {
         chrono::Utc::now(),
     );
     assert_eq!(result, Ok(child.transaction.id()));
-    assert_eq!(evicted, [cheap, expensive].into());
+    assert_eq!(evicted, [cheap, expensive]);
     storage.verified.assert_dependency_groups_are_bounded();
 }
 
@@ -1203,4 +1203,46 @@ proptest! {
             }
         }
     }
+}
+
+/// Evictions are cached in the order eviction picks them, cheapest first, so
+/// a rejection list that fills up keeps the same one as before. The log
+/// still lists them oldest first.
+#[test]
+fn evictions_are_cached_in_eviction_order() {
+    let _init_guard = zakura_test::init();
+    let mut factory = TxFactory::new();
+    let mut storage = Storage::new_with_rejection_list_capacity(
+        &config::Config {
+            tx_cost_limit: 2 * COST,
+            ..Default::default()
+        },
+        2,
+    );
+    let older = insert(&mut storage, &factory.tx(2 * COST), vec![]);
+    let newer = insert(&mut storage, &factory.tx(COST), vec![]);
+    // A full list clears when the first eviction is cached, so only the
+    // second survives.
+    for _ in 0..2 {
+        storage.reject_exact(
+            factory.tx(COST).transaction.id(),
+            ExactTipRejectionError::Evicted,
+        );
+    }
+    let incoming = factory.tx_with(100 * COST, 0, 9_000);
+    assert!(incoming.cost() > COST && incoming.cost() <= 2 * COST);
+    let (result, evicted) = storage.insert_with_evicted_ids(
+        incoming.clone(),
+        vec![],
+        None,
+        crate::Instant::now(),
+        chrono::Utc::now(),
+    );
+    assert_eq!(result, Ok(incoming.transaction.id()));
+    assert_eq!(evicted, [older, newer]);
+    assert_eq!(
+        storage.rejected_exact(&older),
+        Some(&ExactTipRejectionError::Evicted)
+    );
+    assert_eq!(storage.rejected_exact(&newer), None);
 }

@@ -19,7 +19,7 @@ use std::{
 };
 
 use serde_json::Value;
-use support::{config, inputs};
+use support::{config, header_inputs, inputs};
 use tempfile::TempDir;
 use zakura_network::zakura::observe::HeaderSyncObserver;
 use zakura_sim::{
@@ -193,17 +193,12 @@ fn the_probe_matches_the_accounting_through_close_relink_and_shutdown() {
     }
 }
 
-/// The close-and-relink seed's input, `header-storage-close-relink`,
-/// whose node reserves headers from both mirrors.
-static CLOSE_RELINK_INPUT: LazyLock<Vec<u8>> = LazyLock::new(|| {
-    zakura_sim::seed::find("header-storage-close-relink")
-        .expect("the seed is registered")
-        .input()
-        .to_vec()
-});
+/// The close-and-relink input, whose node reserves headers from both
+/// mirrors ([`header_inputs::close_relink_input`]).
+static CLOSE_RELINK_INPUT: LazyLock<&[u8]> = LazyLock::new(header_inputs::close_relink_input);
 
-/// `header-sync/chunk-budget-bound` holds on the committed close-and-relink
-/// seed, and the run reaches its trigger history: the probe reads the budget
+/// `header-sync/chunk-budget-bound` holds on the searched close-and-relink
+/// input, and the run reaches its trigger history: the probe reads the budget
 /// holding headers. `cargo xtask planted header-sync/chunk-budget-bound`
 /// checks that the same input violates it under each planted patch.
 #[test]

@@ -987,10 +987,7 @@ impl Service for HeaderSyncService {
         if !owns_stream {
             return false;
         }
-        let Ok(bytes) = <[u8; 32]>::try_from(peer.as_bytes()) else {
-            return false;
-        };
-        let Ok(node_id) = zakura_quic::NodeId::from_bytes(&bytes) else {
+        let Some(node_id) = peer.node_id() else {
             return false;
         };
         self.header_sync
@@ -1177,6 +1174,5 @@ impl Sink for HeaderSyncPassthroughSink {
 
 /// Return the node identity for a valid header-sync peer ID.
 fn header_peer_node_id(peer: &ZakuraPeerId) -> Option<zakura_quic::NodeId> {
-    let bytes = <[u8; 32]>::try_from(peer.as_bytes()).ok()?;
-    zakura_quic::NodeId::from_bytes(&bytes).ok()
+    peer.node_id()
 }

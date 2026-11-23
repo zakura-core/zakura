@@ -1836,7 +1836,7 @@ async fn native_fallback_closes_the_legacy_hedge_window() -> Result<(), BoxError
     announce_block(&mut peers, &mut guard, &first).await;
 
     let supervisor = ZakuraSupervisorHandle::new(1);
-    let (sender, mut native_requests) = tokio::sync::mpsc::channel(1);
+    let (sender, mut native_requests) = zakura_rt::sync::mpsc::channel(1);
     supervisor
         .register_handle_for_tests(ZakuraPeerHandle::new_for_tests(
             ZakuraPeerId::new(vec![1; 32])?,
@@ -2244,7 +2244,7 @@ async fn busy_tx_advertiser() -> BusyTxAdvertiser {
         )
         .expect("peer set receives inventory");
     let (mut peers, _adverts) =
-        crate::peer_set::driver::spawn(peer_set, tokio_util::sync::CancellationToken::new());
+        crate::peer_set::driver::spawn(peer_set, zakura_rt::sync::CancellationToken::new());
 
     let first = peers
         .ready()
@@ -2364,7 +2364,14 @@ async fn held_tx_getdata_asks_another_peer_when_advertiser_disconnects() {
 struct OwnedPeerSet {
     service: tower::util::BoxCloneSyncService<Request, Response, BoxError>,
     guard: PeerSetGuard,
-    _shutdown: tokio_util::sync::DropGuard,
+    /// Stops the owner task when this drops.
+    shutdown: zakura_rt::sync::CancellationToken,
+}
+
+impl Drop for OwnedPeerSet {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+    }
 }
 
 type ResponseTask = tokio::task::JoinHandle<Result<Response, BoxError>>;
@@ -2373,12 +2380,12 @@ impl OwnedPeerSet {
     /// Hands a peer set built from `peers` to its owner task.
     fn spawn(peers: &mut [&mut TestPeer]) -> Self {
         let (peer_set, guard) = peer_set_with_second_requests(peers);
-        let shutdown = tokio_util::sync::CancellationToken::new();
+        let shutdown = zakura_rt::sync::CancellationToken::new();
         let (service, _advertiser) = crate::peer_set::driver::spawn(peer_set, shutdown.clone());
         Self {
             service,
             guard,
-            _shutdown: shutdown.drop_guard(),
+            shutdown,
         }
     }
 

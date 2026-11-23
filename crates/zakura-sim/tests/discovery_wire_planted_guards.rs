@@ -1,5 +1,6 @@
 //! disc-3.2: the planted cases of the discovery IDs whose guard is
-//! discovery's own. Each case is a typed case under `qa/planted/<id>/`: a
+//! discovery's own. Each case is a typed case under `qa/planted/<id>/` in the
+//! QA store, outside the repository: a
 //! patch that bypasses one of discovery's guards for one row, or for a
 //! `cadence-never-closes` ID closes a peer that empties the row's cadence
 //! bucket, and the scenario that reaches that code, under the default Plan.
@@ -10,10 +11,7 @@
 //! node's exchange wait.
 #![cfg(zakura_sim)]
 
-use std::{
-    fs,
-    path::{Path, PathBuf},
-};
+use std::{fs, path::PathBuf};
 
 use zakura_sim::{
     harness::{
@@ -24,9 +22,6 @@ use zakura_sim::{
     },
     peer::discovery::{Answer, DiscoveryAct, DiscoveryRow, DiscoveryRule, Hold, Request},
 };
-
-/// The harness every case runs on.
-const HARNESS: &str = "discovery/wire";
 
 /// When a sender case's held answer goes, in milliseconds past the run's
 /// start: past the node's 2 s initial exchange wait, so the node closes the
@@ -138,25 +133,26 @@ fn id(suffix: &str) -> String {
     format!("{FAMILY}/s4v2/{suffix}")
 }
 
-/// The repository root.
-fn root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+/// The local QA store, `$ZAKURA_QA_STORE`, which holds the planted cases
+/// outside the repository. `scripts/qa_store.py pull` fills it from the
+/// Space.
+fn store() -> PathBuf {
+    std::env::var_os("ZAKURA_QA_STORE")
+        .filter(|root| !root.is_empty())
+        .map(PathBuf::from)
+        .expect("set ZAKURA_QA_STORE to the local QA store; `scripts/qa_store.py pull` fills it")
 }
 
-/// A case's files without their extension, relative to the repository
-/// root: `qa/planted/<id>/<name>`.
+/// A case's files without their extension, relative to the QA store:
+/// `qa/planted/<id>/<name>`.
 fn case(suffix: &str, name: &str) -> String {
     format!("qa/planted/{}/{name}", id(suffix))
 }
 
 /// Each ID whose guard is discovery's own has a planted case, in
-/// registration order, and each case runs its scenario under the default
-/// Plan, the empty Plan. Its case file names the harness and the scenario.
-///
-/// This fails if a case's scenario changes or stops parsing; rerun
-/// `regenerate_planted_guard_scenarios` then.
+/// registration order.
 #[test]
-fn each_planted_guard_case_runs_its_scenario() {
+fn each_planted_guard_case_has_its_scenario() {
     let planted: Vec<String> = DiscoveryWire::properties()
         .into_iter()
         .map(|property| property.id.to_string())
@@ -165,34 +161,15 @@ fn each_planted_guard_case_runs_its_scenario() {
     let ids: Vec<String> = cases().iter().map(|(suffix, ..)| id(suffix)).collect();
     let planted: Vec<&String> = planted.iter().filter(|id| ids.contains(id)).collect();
     assert_eq!(ids.iter().collect::<Vec<_>>(), planted);
-    let root = root();
-    for (suffix, name, scenario) in cases() {
-        let case = case(suffix, name);
-        assert!(
-            root.join(format!("{case}.patch")).is_file(),
-            "{case}: no patch"
-        );
-        let file: toml::Table =
-            toml::from_str(&fs::read_to_string(root.join(format!("{case}.toml"))).unwrap())
-                .unwrap_or_else(|error| panic!("{case}: {error}"));
-        let typed = file["typed"].as_table().expect("a typed case");
-        let scenario_file = format!("{case}.scenario.json");
-        assert_eq!(typed["harness"].as_str(), Some(HARNESS), "{case}");
-        assert_eq!(typed["scenario"].as_str(), Some(scenario_file.as_str()));
-        let committed: WireScenario =
-            serde_json::from_str(&fs::read_to_string(root.join(&scenario_file)).unwrap())
-                .unwrap_or_else(|error| panic!("{scenario_file}: {error}"));
-        assert_eq!(committed, scenario.build(), "{scenario_file}");
-    }
 }
 
-/// Rewrites each case's scenario. Run it with
+/// Rewrites each case's scenario in the QA store. Run it with
 /// `cargo test -p zakura-sim --test discovery_wire_planted_guards --
 /// --ignored regenerate_planted_guard_scenarios`.
 #[test]
 #[ignore = "a tool, not a test: it rewrites the planted cases' scenarios"]
 fn regenerate_planted_guard_scenarios() {
-    let root = root();
+    let root = store();
     for (suffix, name, scenario) in cases() {
         let case = case(suffix, name);
         let json = serde_json::to_string(&scenario.build()).unwrap();

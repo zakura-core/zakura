@@ -578,6 +578,8 @@ fn a_metered_row_overruns_only_past_the_receivers_depth() {
     let mut buckets = buckets.with_receive_window(WINDOW);
     let depth = METERED_RATE.receiver_depth(WINDOW);
     assert_eq!(depth, 100_000);
+    // Long enough after its epoch, the bucket holds its whole depth.
+    clock.advance(secs(60));
     for _ in 0..depth / 10_000 {
         assert_eq!(
             buckets.charge_frame(LAYOUT, &METERED, 10_000),
@@ -605,8 +607,10 @@ fn a_metered_row_overruns_only_past_the_receivers_depth() {
 /// `stall_at`, after which the receiver reads everything at once. Returns
 /// the bytes the receiver read.
 fn stall_and_resume(stall_at: Duration, stall: Duration, frame: u64) -> u64 {
-    let start = Instant::now();
     let (receiver, clock) = buckets();
+    // The sender's bucket starts at the receiver's epoch, the earliest a
+    // conformant sender's can.
+    let start = clock.now();
     let mut receiver = receiver.with_receive_window(WINDOW);
     let mut sender = ByteBucket::sender(METERED_RATE, start);
     let limit = u64::from(METERED_RATE.sender_allowance) + WINDOW;
@@ -641,8 +645,11 @@ fn stall_and_resume(stall_at: Duration, stall: Duration, frame: u64) -> u64 {
 #[test]
 fn a_sender_that_stalls_and_resumes_never_overruns_the_receiver() {
     // Stalls short and long, at the start and later, fill the window and the
-    // sender's buffers and let its bucket refill before the resume.
+    // sender's buffers and let its bucket refill before the resume. The
+    // short ones end before the receiver's bucket first fills.
     for (stall_at, stall) in [
+        (secs(0), secs(2)),
+        (secs(1), secs(2)),
         (secs(0), secs(5)),
         (secs(3), secs(60)),
         (secs(30), secs(600)),
@@ -656,8 +663,8 @@ fn a_sender_that_stalls_and_resumes_never_overruns_the_receiver() {
 proptest! {
     /// A peer that sends a burst, ends its session and reopens it, twenty
     /// times, on one connection. The connection's bucket outlives each
-    /// session, so the bytes admitted stay within its depth plus the rate
-    /// times the time elapsed.
+    /// session, so the bytes admitted stay within the opening allowance it
+    /// started with plus the rate times the time elapsed.
     #[test]
     fn reopening_sessions_on_one_connection_buys_no_bytes(
         gaps in proptest::collection::vec(0u64..2_000, 20),
@@ -677,9 +684,41 @@ proptest! {
         }
         let earned = elapsed.as_millis() * u128::from(METERED_RATE.receiver_bytes_per_second()) / 1_000;
         prop_assert!(
-            u128::from(admitted) <= u128::from(METERED_RATE.receiver_depth(WINDOW)) + earned
+            u128::from(admitted) <= u128::from(METERED_RATE.opening_allowance) + earned
         );
     }
+}
+
+/// A fresh connection's byte bucket holds the opening allowance, plus what
+/// the time since its epoch earned, up to its depth. So a reconnect buys no
+/// more than the allowance a conformant sender starts with.
+#[test]
+fn a_receivers_byte_bucket_starts_at_the_opening_allowance() {
+    let charge_all = |buckets: &mut CadenceBuckets<TestClock>| {
+        let mut admitted = 0;
+        while buckets.charge_frame(LAYOUT, &METERED, 1_000) == CadenceCharge::Admit {
+            admitted += 1_000;
+        }
+        admitted
+    };
+    // At its epoch: the allowance.
+    let (fresh, _clock) = buckets();
+    let mut fresh = fresh.with_receive_window(WINDOW);
+    assert_eq!(charge_all(&mut fresh), 50_000);
+
+    // First used two seconds after its epoch: the allowance and 22,500 bytes
+    // earned, charged in 1,000 byte frames.
+    let (late, clock) = buckets();
+    let epoch = clock.now();
+    clock.advance(secs(2));
+    let mut late = late.with_receive_window(WINDOW).with_metered_epoch(epoch);
+    assert_eq!(charge_all(&mut late), 72_000);
+
+    // Long after its epoch: no more than its depth.
+    let (old, clock) = buckets();
+    clock.advance(secs(600));
+    let mut old = old.with_receive_window(WINDOW);
+    assert_eq!(charge_all(&mut old), 100_000);
 }
 
 #[test]

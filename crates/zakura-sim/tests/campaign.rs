@@ -22,6 +22,7 @@ use std::{
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Child, Command, Output},
+    sync::OnceLock,
     thread,
     time::{Duration, Instant},
 };
@@ -37,14 +38,36 @@ use zakura_sim::{
         stats::{CleanupCounts, Counts, ProcessStats, PropertyCounts, STATS_VAR, STATS_VERSION},
         ProcessFailure, ABANDON_LIMIT_PANIC, EXPECT_VAR,
     },
-    harness,
+    harness, planted,
     property::Status as PropertyStatus,
-    seed::SeedSet,
+    seed::{self, Index, Seed, SeedSet},
     trace::BuildInfo,
 };
 
-/// The harness the tests fuzz. It has one corpus seed.
+/// The harness the tests fuzz. [`qa_store`] gives it one corpus seed.
 const SIM: &str = "discovery/wait-complete";
+
+/// A QA store, built once per test process in a temporary directory, that
+/// holds one corpus seed for [`SIM`]: its default Plan. The `campaign`
+/// commands that [`spawn`] and [`cli`] run read their seeds from it, so a
+/// test that counts seeds doesn't depend on the real store in the Space.
+fn qa_store() -> &'static Path {
+    static STORE: OnceLock<tempfile::TempDir> = OnceLock::new();
+    STORE
+        .get_or_init(|| {
+            let dir = TempDir::new().unwrap();
+            let seed = Seed::new(
+                "campaign-wait-complete",
+                SIM,
+                "crates/zakura-sim/tests/campaign.rs",
+                vec![0],
+            );
+            assert_eq!(seed::check(&seed), Ok(()));
+            Index::write(dir.path(), &[seed]).unwrap();
+            dir
+        })
+        .path()
+}
 
 /// The stand-in fuzzer. `@CONTROL@` and `@ABANDON@` are replaced.
 const STUB: &str = r#"#!/usr/bin/env bash
@@ -280,6 +303,7 @@ fn spawn(store: &Path, args: &[&str]) -> Child {
         .args(args)
         .arg("--store")
         .arg(store)
+        .env(planted::STORE_ENV, qa_store())
         .spawn()
         .unwrap()
 }
@@ -291,6 +315,7 @@ fn cli(store: &Path, args: &[&str]) -> Output {
         .args(args)
         .arg("--store")
         .arg(store)
+        .env(planted::STORE_ENV, qa_store())
         .output()
         .unwrap()
 }
@@ -498,7 +523,7 @@ fn resumed_runs_keep_corpus_additions_and_failures() {
     assert!(!failures.is_empty(), "a worker crashed once");
     let manifest = host_a.store.read_manifest(&first).unwrap();
     let seeds = inputs(&host_a.store, &manifest.initial_snapshot);
-    assert_eq!(seeds.len(), 1, "the harness has one committed seed");
+    assert_eq!(seeds.len(), 1, "the QA store gives the harness one seed");
 
     // Another host: a copy of the store, without the cache of anything.
     let other = TempDir::new().unwrap();

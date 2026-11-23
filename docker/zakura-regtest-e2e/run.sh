@@ -15,11 +15,14 @@
 #   1. all four nodes come up on a fresh Regtest chain,
 #   2. legacy TCP compatibility: node3 peers with node1 (getpeerinfo),
 #   3. the legacy->Zakura upgrade ran (zakura_p2p_handshake_upgraded on node1/node4),
+#   3b. every v2 node (node1, node2, and node4 when its upgrade is strict or
+#      live) completed X25519MLKEM768 key exchanges and verified
+#      Ed25519+ML-DSA-44 handshake signatures, with no other group or scheme; node2 is checked again after its reset catch-up,
 #   4. the pure Zakura-only node2 has zero legacy peers (no legacy stack at all),
 #   4b. the pure Zakura-only node2 bootstraps the genesis block over Zakura: with
 #      the Regtest genesis self-seed disabled (sync.debug_skip_regtest_genesis_self_seed)
 #      and no legacy stack, node2 can only reach genesis by downloading it from
-#      node1 over Zakura — the production Mainnet/Testnet bootstrap path,
+#      a Zakura peer (node1, or node4 learned from node1) — the production Mainnet/Testnet bootstrap path,
 #   5. blocks generated on node1 propagate to the pure-Zakura node2 AND the
 #      legacy-only node3 — so node2, which has no legacy stack, proves
 #      pure-Zakura propagation,
@@ -32,20 +35,65 @@
 #      Node1 does not advertise the old blocks again.
 #   8. a non-finalized reorg converges with no block-sync byte-budget leak.
 #
+# ZAKURA_E2E_MODE=mixed-version runs a separate five-node stack instead
+# (mixed-version.sh, docker-compose.zakura-regtest-e2e-mixed-version.yml, and the
+# configs in mixed-version/). Three nodes run the latest release, v1.8.9 (p2p-v2/3:
+# classical key exchange, node ID = Ed25519 key), and two run the binary under
+# test (p2p-v2/4: hybrid key exchange, composite signature, hashed node ID):
+#   old-dual    OLD dual-stack seed                rpc 28232  metrics 29001
+#   old-zakura  OLD v2-only, bootstraps old-dual   rpc 28332  metrics 29002
+#   new-dual    NEW dual-stack, dials old-dual     rpc 28432  metrics 29003
+#   new-zakura  NEW v2-only, bootstraps new-dual   rpc 28532  metrics 29004
+#   old-dialer  OLD dual-stack, dials new-dual     rpc 28632  metrics 29005
+# The v2-only nodes' bootstrap entries use the node IDs the dual nodes log at
+# startup, since each version derives its ID from the secret key differently.
+# The old binary is ZAKURAD_OLD_BIN, or the release tarball downloaded, checked
+# against a pinned SHA256 and the release's SHA256SUMS.txt, and cached under
+# target/zakura-e2e-old-zakurad (ZAKURA_E2E_OLD_BIN_CACHE). It asserts:
+#   1. the legacy connections new-dual -> old-dual and old-dialer -> new-dual
+#      form, each upgrade prelude is rejected and both sides stay on legacy:
+#      every dual node counts zakura_p2p_upgrade_prelude_rejected with
+#      reason="TemporaryUnavailable" (the only reason that keeps the legacy
+#      connection) and none with any other reason, and a debug build of new-dual
+#      logs the fallback for both prelude roles,
+#   2. same-version v2 works: new-zakura <-> new-dual and old-zakura <-> old-dual,
+#   3. the new nodes' v2 handshakes are all X25519MLKEM768 and Ed25519+ML-DSA-44
+#      (the old binary exports no such metrics),
+#   4. blocks mined on new-dual, old-dual, new-zakura, and old-zakura each reach
+#      all five nodes with the same hash, so blocks cross the version boundary
+#      over legacy and reach the v2-only nodes through their cohort's dual node,
+#   5. every cross-version legacy connection seen at the start (identified by the
+#      dialer's ephemeral port on the inbound side) stays open through the blocks
+#      and an idle soak (MIXED_SOAK_SECONDS, default 90), unless one end logged the
+#      legacy peer set's FindBlocks stall disconnect for it since it was last seen
+#      open. Both versions apply that rule to any peer: at an idle Regtest tip,
+#      one syncer round sends FANOUT = 3 empty FindBlocks to a sole legacy peer,
+#      which reaches the threshold of 3.
+#      After such a close, a redial must run a fresh upgrade prelude that is
+#      rejected again (new-dual's TemporaryUnavailable count rises),
+#   6. no dual node counts a handshake upgrade error or malformed prelude, and
+#      no v2 connection crosses versions: new-dual completes no upgrade and holds
+#      one v2 connection, as does new-zakura, and each old node at most two,
+#   7. no node counts a misbehavior ban (address_book_misbehavior_banned_total)
+#      or logs a ban line. All nodes share 127.0.0.1, so any ban would hit the
+#      other cohort. A misbehavior score below the ban threshold is neither
+#      counted nor logged, so it is not checked.
+#
 # Each container runs a zakurad binary bind-mounted into debian:trixie-slim.
 # Linux hosts use the host-built debug binary. On macOS, the harness builds and
 # caches a Linux release artifact because a Mach-O host binary cannot run in the
 # Linux container. Override with ZAKURAD_BIN=/path/to/a/Linux/zakurad.
 #
 # Usage: docker/zakura-regtest-e2e/run.sh
+#        ZAKURA_E2E_MODE=mixed-version docker/zakura-regtest-e2e/run.sh
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMPOSE_FILE="${SCRIPT_DIR}/../docker-compose.zakura-regtest-e2e.yml"
 REPO_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
-log()  { printf '\n=== %s ===\n' "$*"; }
-fail() { printf '\nFAILED: %s\n' "$*" >&2; exit 1; }
+# shellcheck source=lib.sh source-path=SCRIPTDIR
+source "${SCRIPT_DIR}/lib.sh"
 
 sed_in_place() {
   local script="$1"
@@ -139,8 +187,12 @@ case "${ZAKURA_E2E_MODE}" in
     ZAKURA_E2E_REQUIRE_HANDOFF=1
     ZAKURA_E2E_REQUIRE_V7_IDS=1
     ;;
+  mixed-version)
+    # A separate five-node topology with its own compose stack and assertions.
+    exec bash "${SCRIPT_DIR}/mixed-version.sh"
+    ;;
   *)
-    fail "unknown ZAKURA_E2E_MODE='${ZAKURA_E2E_MODE}' (expected smoke, pr-gate, checkpoint-long, no-checkpoint-long, restart-matrix, header-faults)"
+    fail "unknown ZAKURA_E2E_MODE='${ZAKURA_E2E_MODE}' (expected smoke, pr-gate, checkpoint-long, no-checkpoint-long, restart-matrix, header-faults, mixed-version)"
     ;;
 esac
 
@@ -195,31 +247,7 @@ command -v docker >/dev/null || fail "docker is required"
 command -v jq >/dev/null || fail "jq is required to parse RPC responses"
 command -v python3 >/dev/null || fail "python3 is required to run the trace oracle"
 
-# Ensure a container-compatible zakurad binary exists. Docker Desktop runs Linux
-# containers on macOS, so its bind-mounted executable must be Linux too.
-if [[ -z "${ZAKURAD_BIN:-}" && "$(uname -s)" == "Darwin" ]]; then
-  ZAKURAD_BIN="${REPO_DIR}/target/zakura-regtest-e2e-linux/zakurad"
-  log "building cached Linux zakurad for Docker Desktop"
-  mkdir -p "$(dirname "${ZAKURAD_BIN}")"
-  docker build \
-    --file "${REPO_DIR}/docker/ubuntu-package.Dockerfile" \
-    --target artifact \
-    --output "type=local,dest=$(dirname "${ZAKURAD_BIN}")" \
-    "${REPO_DIR}"
-else
-  ZAKURAD_BIN="${ZAKURAD_BIN:-${REPO_DIR}/target/debug/zakurad}"
-fi
-if [[ ! -x "${ZAKURAD_BIN}" ]]; then
-  log "building host zakurad (debug) — no in-container build"
-  ( cd "${REPO_DIR}" && CXXFLAGS="-include cstdint" cargo build -p zakura --bin zakurad )
-fi
-[[ -x "${ZAKURAD_BIN}" ]] || fail "zakurad binary not found at ${ZAKURAD_BIN}"
-docker run --rm \
-  -v "${ZAKURAD_BIN}:/usr/local/bin/zakurad:ro" \
-  debian:trixie-slim \
-  /usr/local/bin/zakurad --version >/dev/null 2>&1 \
-  || fail "zakurad binary is not executable in the Linux container: ${ZAKURAD_BIN}"
-export ZAKURAD_BIN
+ensure_zakurad_bin
 ZAKURA_E2E_TRACE_DIR="${ZAKURA_E2E_TRACE_DIR:-/tmp/zakura-regtest-e2e-traces-${RUN_LABEL}}"
 export ZAKURA_E2E_TRACE_DIR
 mkdir -p \
@@ -410,49 +438,6 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Fetch localhost-only node endpoints from inside node1's Linux network
-# namespace. Docker Desktop does not expose host-network container ports to the
-# macOS host unless its optional host-networking feature is enabled.
-container_http() {
-  local port="$1" path="$2" payload="$3" max_time="$4"
-  docker exec zakura-node-1 perl -MIO::Socket::INET -e '
-    my ($port, $path, $payload, $timeout) = @ARGV;
-    $SIG{ALRM} = sub { exit 28 };
-    alarm $timeout;
-    my $socket = IO::Socket::INET->new(
-      PeerAddr => "127.0.0.1",
-      PeerPort => $port,
-      Proto => "tcp",
-      Timeout => $timeout,
-    ) or exit 1;
-    my $method = length($payload) ? "POST" : "GET";
-    my $headers = "Host: 127.0.0.1\r\nConnection: close\r\n";
-    if (length($payload)) {
-      $headers .= "Content-Type: application/json\r\nContent-Length: " . length($payload) . "\r\n";
-    }
-    print {$socket} "$method $path HTTP/1.1\r\n$headers\r\n$payload";
-    my $response = do { local $/; <$socket> };
-    $response =~ /\AHTTP\/\S+ 2\d\d[^\r\n]*\r?\n.*?\r?\n\r?\n(.*)\z/s or exit 1;
-    print $1;
-  ' "${port}" "${path}" "${payload}" "${max_time}"
-}
-
-# rpc <port> <method> [json-params] [max-time-seconds] -> raw JSON-RPC response
-rpc() {
-  local port="$1" method="$2" params="${3:-[]}" max_time="${4:-10}"
-  container_http \
-    "${port}" \
-    "/" \
-    "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"${method}\",\"params\":${params}}" \
-    "${max_time}"
-}
-
-# metric <port> <name> -> counter value (0 if absent)
-metric() {
-  local port="$1" name="$2"
-  container_http "${port}" "/metrics" "" 5 2>/dev/null \
-    | awk -v n="${name}" '$1==n {v=$2} END {print (v==""?0:v)}'
-}
 
 timeline_node_snapshot() {
   local phase="$1" node="$2" rpc_port="$3" metrics_port="$4"
@@ -531,19 +516,6 @@ wait_metric_zero() {
   fail "${label} ${name} did not return to zero within ${READY_TIMEOUT}s"
 }
 
-wait_metric_at_least() {
-  local port="$1" name="$2" want="$3" label="$4" timeout="${5:-${READY_TIMEOUT}}"
-  local deadline=$((SECONDS + timeout)) value
-  while (( SECONDS < deadline )); do
-    value=$(metric "${port}" "${name}")
-    printf '  %s %s=%s (want >= %s)\n' "${label}" "${name}" "${value}" "${want}"
-    if awk "BEGIN{exit !(${value} >= ${want})}"; then
-      return 0
-    fi
-    sleep 3
-  done
-  fail "${label} ${name} stayed below ${want} within ${timeout}s"
-}
 
 trace_line_count() {
   local file="$1"
@@ -866,16 +838,6 @@ wait_for_native_suffix_coverage() {
   log "node2 prefetched an authenticated native suffix and committed it only after checkpoint handoff (${suffix_start}..${suffix_end})"
 }
 
-wait_ready() {
-  local port="$1" name="$2" deadline=$((SECONDS + READY_TIMEOUT))
-  while (( SECONDS < deadline )); do
-    if rpc "${port}" getblockchaininfo | jq -e '.result' >/dev/null 2>&1; then
-      printf '  %s RPC ready on %s\n' "${name}" "${port}"; return 0
-    fi
-    sleep 2
-  done
-  fail "${name} RPC did not become ready within ${READY_TIMEOUT}s"
-}
 
 stop_node2_for_reset() {
   local label="$1"
@@ -1100,10 +1062,18 @@ wait_for_node2_debug_stop() {
   fail "node2 did not durably stop at exact height ${height} within ${timeout}s"
 }
 
-peer_count() { rpc "$1" getpeerinfo | jq -r 'if .result then (.result | length) else 0 end'; }
-block_count() { rpc "$1" getblockcount | jq -r '.result // 0'; }
-block_hash() { rpc "$1" getblockhash "[$2]" | jq -r '.result // empty'; }
 strict_upgrade() { [[ "${ZAKURA_REGTEST_E2E_STRICT_UPGRADE:-0}" == "1" ]]; }
+
+# Kind-6 block bodies served by the nodes that can serve node2's catch-up.
+# node2 joins through node1, but Regtest exchanges local v2 addresses, so node1
+# may tell node2 about node4 and node2 may fetch some or all bodies from node4.
+# node3 is legacy-only and cannot serve kind-6. A stopped node4 reads as 0.
+zakura_bodies_served_to_node2() {
+  local node1 node4
+  node1=$(metric 19001 sync_block_body_served)
+  node4=$(metric 19004 sync_block_body_served)
+  awk -v a="${node1}" -v b="${node4}" 'BEGIN {print a + b}'
+}
 
 # Extended lanes only stress node1 and node2 after the initial upgrade smoke.
 # Stop the known-optional upgraded peer at a verified idle trace boundary so
@@ -1139,10 +1109,14 @@ quiesce_optional_node4_before_extended_work() {
   if ! awk "BEGIN{exit !(${connections_before} == 2)}"; then
     fail "node1 expected exactly node2 and node4 before optional-peer quiescence, found ${connections_before} active Zakura peers"
   fi
+  # Regtest discovery can establish either connection direction. Remember the
+  # actual sessions so the disconnect must retire one and leave the other.
   active_sessions_before=$(jq -sc '
-    ([.[] | select(.event == "header_peer_connected") | .session_id]
-      - [.[] | select(.event == "header_peer_disconnected") | .session_id])
-    | unique
+    [.[] | select(.event == "header_peer_disconnected") | .session_id] as $closed
+    | [.[] | select(.event == "header_peer_connected")
+        | select(.session_id as $id | ($closed | index($id)) == null)
+        | {session_id, direction}]
+    | unique_by(.session_id)
   ' "${header_file}") \
     || fail "could not read node1 active header sessions before stopping node4"
   [[ "$(printf '%s' "${active_sessions_before}" | jq -r 'length')" == "2" ]] \
@@ -1164,15 +1138,17 @@ quiesce_optional_node4_before_extended_work() {
       printf '%s' "${last}" \
         | jq -e --argjson active "${active_sessions_before}" '
             .session_id as $session
+            | .direction as $direction
+            | ($active | map(select(.session_id != $session))) as $remaining
             | ($session | type == "number")
-              and ($active | index($session) != null)
-              and (.direction == "inbound")
-              and (.inbound_count == 1)
-              and (.outbound_count == 0)
+              and ($direction == "inbound" or $direction == "outbound")
+              and any($active[]; .session_id == $session and .direction == $direction)
+              and (.inbound_count == ($remaining | map(select(.direction == "inbound")) | length))
+              and (.outbound_count == ($remaining | map(select(.direction == "outbound")) | length))
               and ((.reason | strings | length) > 0)
           ' \
           >/dev/null \
-        || fail "node1 post-node4 disconnect trace boundary does not retire one of the two pre-stop inbound sessions"
+        || fail "node1 post-node4 disconnect trace boundary does not retire one of the two pre-stop sessions"
       node2_connections=$(metric 19002 zakura_p2p_conn_active)
       if ! awk "BEGIN{exit !(${node2_connections} >= 1)}"; then
         fail "node2 was not connected after node1 retired the stopped node4 session"
@@ -1380,7 +1356,8 @@ snapshot_timeline "legacy-peers-ready"
 
 log "asserting pure-Zakura node2 has no legacy peers (p2p_stack = zakura)"
 # node2 has no legacy stack at all, so it must never have a legacy TCP peer; its
-# only connectivity is the Zakura bootstrap dial to node1.
+# connectivity is Zakura only: the bootstrap dial to node1, plus node4 when it
+# learns node4's local address from node1 on Regtest.
 n2_legacy=$(peer_count 18332)
 printf '  node2 legacy peers=%s (want 0)\n' "${n2_legacy}"
 [[ "${n2_legacy}" -eq 0 ]] || fail \
@@ -1407,6 +1384,27 @@ wait_metric_at_least 19002 zakura_p2p_conn_active 1 node2
 if strict_upgrade; then
   wait_metric_at_least 19004 zakura_p2p_conn_active 1 node4
 fi
+
+# assert_node4_post_quantum_handshakes
+# node4's legacy->v2 upgrade is a known issue outside strict mode, so its check
+# is required only under ZAKURA_REGTEST_E2E_STRICT_UPGRADE=1 or once node4 has a
+# live v2 connection.
+assert_node4_post_quantum_handshakes() {
+  local active
+  active=$(metric 19004 zakura_p2p_conn_active)
+  if strict_upgrade || awk -v v="${active}" 'BEGIN { exit !(v >= 1) }'; then
+    assert_post_quantum_handshakes 19004 node4
+  else
+    printf '  node4 post-quantum handshakes skipped: no v2 connection (known upgraded-Zakura issue)\n'
+  fi
+}
+
+log "asserting post-quantum v2 handshakes (X25519MLKEM768, Ed25519+ML-DSA-44)"
+# Every node that speaks v2 has handshaken by now: node2 with node1 and node4's
+# upgrade with node1. node3 is legacy-only and runs no v2 handshake.
+assert_post_quantum_handshakes 19001 node1
+assert_post_quantum_handshakes 19002 node2
+assert_node4_post_quantum_handshakes
 
 # Prove the pure-Zakura node bootstrapped genesis over Zakura.
 #
@@ -1568,7 +1566,7 @@ log "starting pure-Zakura node2 for a from-scratch kind-6 catch-up"
 catchup_target=$(block_count 18232)
 [[ "${catchup_target}" -ge 1 ]] || fail \
   "node1 has no chain for node2 to catch up to (height ${catchup_target})"
-before_node1_served=$(metric 19001 sync_block_body_served)
+before_served=$(zakura_bodies_served_to_node2)
 snapshot_timeline "pre-reset-catch-up"
 
 # ---------------------------------------------------------------------------
@@ -1653,12 +1651,12 @@ if [[ "${ZAKURA_E2E_REQUIRE_HANDOFF}" == "1" ]]; then
     "${CATCHUP_TIMEOUT}"
 fi
 
-# node2 dials only node1, so node1 must have served the catch-up bodies over kind-6.
-after_node1_served=$(metric 19001 sync_block_body_served)
-printf '  node1 kind-6 bodies served=%s (before reset %s)\n' \
-  "${after_node1_served}" "${before_node1_served}"
-if ! awk "BEGIN{exit !(${after_node1_served} > ${before_node1_served})}"; then
-  fail "node2 caught up from scratch but node1's kind-6 body-served metric did not increase — bodies did not flow over block sync"
+# The catch-up bodies must have been served over kind-6 by node1 or node4.
+after_served=$(zakura_bodies_served_to_node2)
+printf '  node1+node4 kind-6 bodies served=%s (before reset %s)\n' \
+  "${after_served}" "${before_served}"
+if ! awk "BEGIN{exit !(${after_served} > ${before_served})}"; then
+  fail "node2 caught up from scratch but the kind-6 body-served metrics of node1 and node4 did not increase: bodies did not flow over block sync"
 fi
 assert_block_sync_budget_empty "post-catch-up"
 if [[ "${ZAKURA_E2E_REQUIRE_HANDOFF}" == "1" ]]; then
@@ -1667,6 +1665,17 @@ else
   log "node2 completed its from-scratch catch-up to height ${catchup_target} with native kind-6 activity"
 fi
 snapshot_timeline "post-catch-up"
+
+log "asserting post-quantum v2 handshakes after the reset catch-up"
+# The reset restarted node2's counters, so its values come from the handshake
+# it made to catch up.
+assert_post_quantum_handshakes 19001 node1
+assert_post_quantum_handshakes 19002 node2
+if [[ "${OPTIONAL_NODE4_QUIESCED}" == "1" ]]; then
+  printf '  node4 post-quantum handshakes skipped: quiesced after upgrade smoke coverage\n'
+else
+  assert_node4_post_quantum_handshakes
+fi
 
 if [[ "${ZAKURA_E2E_RESTART_MATRIX}" == "1" ]]; then
   run_restart_matrix "${catchup_target}"

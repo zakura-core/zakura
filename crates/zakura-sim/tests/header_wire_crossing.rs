@@ -18,6 +18,7 @@
 
 mod support;
 
+use support::header_inputs;
 use zakura_network::zakura::{v9::RegtestMessage, Credit, MessageRole};
 use zakura_sim::{
     explore::state::crossing::{crossings, Crossed},
@@ -30,7 +31,7 @@ use zakura_sim::{
     model::Label,
     observe::StreamId,
     peer::adversary::{Act, Row},
-    seed, MemorySink, Observation, Plan, PlanInput, PropertyOutcome, RunReport,
+    MemorySink, Observation, Plan, PlanInput, PropertyOutcome, RunReport,
 };
 
 /// The ID of header sync's generated `conformant-never-closes`.
@@ -60,14 +61,13 @@ fn run(scenario: &WireScenario, plan: PlanInput) -> RunReport {
     }
 }
 
-/// The saved `outcome-crossing` Plan's seed, run as `zakura-sim record
-/// --seed` runs it: its tag picks the scenario, and the rest is the Plan.
+/// The saved `outcome-crossing` Plan's run, as `zakura-sim record
+/// --input` runs its input: its tag picks the scenario, and the rest is
+/// the Plan.
 fn saved_outcome_crossing() -> RunReport {
     let plan = SavedPlan::Act(Act::OutcomeCrossing);
-    let name = format!("header-wire-{}", plan.name());
-    let seed = seed::find(&name).unwrap_or_else(|| panic!("no seed is named {name}"));
-    let (prefix, rest) = seed.input().split_at(HeaderWire::SCENARIO_BYTES);
-    assert_eq!(prefix, plan.tag(), "the seed is the saved Plan's");
+    let input = header_inputs::wire_input(plan);
+    let (prefix, rest) = input.split_at(HeaderWire::SCENARIO_BYTES);
     let scenario = HeaderWire::draw(prefix);
     assert_eq!(scenario, plan.scenario());
     run(&scenario, Plan::from_fuzz(rest))

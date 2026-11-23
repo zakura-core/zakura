@@ -394,9 +394,51 @@ impl StartCmd {
         Ok(())
     }
 
-    /// Prepares the endpoint config, pinning a persistent identity for an announcing gateway.
+    /// Resolves `[memory] budget` (probing host and cgroup limits for `"auto"`),
+    /// publishes `zakura.memory.budget_bytes{source}`, and derives `B` for `zakura-network`
+    /// (`02 §2`, `03 §5`, decision-2).
+    fn resolve_memory_budget(
+        config: &ZakuradConfig,
+    ) -> Result<zakura_network::zakura::memory::ResolvedMemoryBudget, Report> {
+        config.memory.validate().map_err(|error| eyre!(error))?;
+        let (host_budget_bytes, source) = match config.memory.budget {
+            zakura_network::zakura::memory::MemoryBudget::Auto => (
+                crate::components::memory_probe::detect_host_memory_bytes()?,
+                "auto",
+            ),
+            zakura_network::zakura::memory::MemoryBudget::Fixed(size) => (size.bytes(), "config"),
+        };
+        metrics::gauge!("zakura.memory.budget_bytes", "source" => source)
+            .set(host_budget_bytes as f64);
+        let managed_zcashd = config.zcashd_compat.enabled && config.zcashd_compat.manage_zcashd;
+        let resolved = config
+            .memory
+            .resolve(host_budget_bytes, source, managed_zcashd);
+        info!(
+            source,
+            host_budget_bytes = resolved.derivation.host_budget_bytes,
+            base_bytes = resolved.derivation.base_bytes,
+            sidecar_bytes = resolved.derivation.sidecar_bytes,
+            p2p_budget_b = resolved.p2p_budget_b(),
+            "resolved [memory] budget"
+        );
+        Ok(resolved)
+    }
+
+    /// Prepares the endpoint config, pinning a persistent identity for an announcing gateway
+    /// and passing the resolved pure P2P memory budget `B` into `zakura-network`.
     fn network_config_for_start(config: &ZakuradConfig) -> Result<zakura_network::Config, Report> {
         let mut network = config.network.clone();
+        // The budget governs the v2 stack only, so a legacy node neither probes the host
+        // nor fails on an unreadable cgroup (`02 §2`).
+        if config.network.v2_p2p() {
+            network.zakura.memory_budget = Self::resolve_memory_budget(config)?;
+        } else if config.memory != zakura_network::zakura::memory::MemoryConfig::default() {
+            warn!(
+                "[memory] settings have no effect on the legacy P2P stack; \
+                 set network.p2p_stack to \"zakura\" or \"dual\" to use them"
+            );
+        }
         if config.mining.miner_mesh {
             network.pin_stable_zakura_identity().map_err(|error| {
                 eyre!(
@@ -753,6 +795,28 @@ impl StartCmd {
             .boxed()
             .await;
         node_tasks.track(&consensus_task_handles.state_checkpoint_verify_handle);
+        #[cfg(target_os = "linux")]
+        {
+            let rss_shutdown = shutdown.clone();
+            let rss_task = tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    select! {
+                        _ = rss_shutdown.cancelled() => break,
+                        _ = tick.tick() => {
+                            if let Some(rss) =
+                                crate::components::memory_probe::read_process_rss_bytes()
+                            {
+                                metrics::gauge!("zakura.memory.process_rss_bytes")
+                                    .set(rss as f64);
+                            }
+                        }
+                    }
+                }
+            });
+            node_tasks.track(&rss_task);
+        }
 
         info!("initializing network");
         // The service that our node uses to respond to requests by peers. The

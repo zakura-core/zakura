@@ -18,6 +18,8 @@
 //! [`MemoryPoolMachine`] decides; [`MemoryPool`] locks, waits and applies the
 //! machine's wakeups.
 
+mod config;
+pub mod draft;
 mod peer_pool;
 mod pool;
 #[cfg(test)]
@@ -25,6 +27,11 @@ mod tests;
 
 use std::time::Duration;
 
+pub use config::{
+    ByteSize, ByteSizeParseError, MemoryBudget, MemoryCaps, MemoryConfig, MemoryWeights,
+    ResolvedMemoryBudget,
+};
+pub use draft::{derive_p2p_budget, resolved_p2p_budget_bytes, BudgetDerivation};
 pub use pool::{
     ConsumerSnapshot, LeaseDenied, MemoryPool, MemoryPoolMachine, OverrunReport, PoolLease,
     PoolSnapshot, PoolWaitToken, Refusal, Released, Wake, WakeClass,

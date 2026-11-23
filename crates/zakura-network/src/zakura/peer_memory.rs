@@ -233,16 +233,16 @@ pub const fn budgeted_quic_bytes(
         + connections as u128 * memory.admitted_bytes as u128
 }
 
-/// `[network.zakura] peer_memory_budget_bytes` admits fewer connections than
+/// Resolved `[memory] budget` admits fewer connections than
 /// [`min_budgeted_connections`] requires.
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
 #[error(
-    "invalid [network.zakura] peer_memory_budget_bytes: {budget_bytes} bytes, after \
+    "invalid [memory] budget: {budget_bytes} P2P bytes, after \
      reserving {socket_queue_bytes} bytes for the bound sockets' datagram queues and \
      {headroom} max_pending_handshakes connections of {handshake_bytes} bytes each (the \
      [network.zakura.quic] receive_window_bytes plus send_window_bytes), admits \
      {admitted} connections of {connection_bytes} bytes each (those windows plus every \
-     reactor's receive share); raise peer_memory_budget_bytes or lower those windows or \
+     reactor's receive share); raise [memory] budget or lower those windows or \
      max_pending_handshakes so it admits at least {required}"
 )]
 pub struct PeerMemoryBudgetError {
@@ -486,7 +486,9 @@ mod tests {
                 .iter()
                 .map(|node_id| format!("{node_id}@192.0.2.1:8234"))
                 .collect(),
-            peer_memory_budget_bytes: budget_for(30),
+            memory_budget: crate::zakura::memory::ResolvedMemoryBudget::from_p2p_budget_b(
+                budget_for(30),
+            ),
             ..ZakuraConfig::default()
         };
         let outsider = NodeSecretKey::from_bytes(&[99; 32]).public();
@@ -520,7 +522,9 @@ mod tests {
                 .map(|port| format!("{}@192.0.2.1:{port}", node_ids[0]))
                 .chain(["not a bootstrap peer".to_string()])
                 .collect(),
-            peer_memory_budget_bytes: budget_for(30),
+            memory_budget: crate::zakura::memory::ResolvedMemoryBudget::from_p2p_budget_b(
+                budget_for(30),
+            ),
             ..ZakuraConfig::default()
         };
         assert_eq!(config.budgeted_max_connections(&mainnet()), Ok(30));
@@ -615,7 +619,8 @@ mod tests {
             .map(|node_id| format!("{node_id}@192.0.2.1:8234"))
             .collect();
         config.zakura.max_connections = 256;
-        config.zakura.peer_memory_budget_bytes = budget_for(18);
+        config.zakura.memory_budget =
+            crate::zakura::memory::ResolvedMemoryBudget::from_p2p_budget_b(budget_for(18));
         assert_eq!(config.zakura.budgeted_max_connections(&mainnet()), Ok(18));
         assert_eq!(
             config
@@ -626,7 +631,8 @@ mod tests {
         assert_eq!(ZakuraLocalLimits::from_config(&config).max_connections, 18);
 
         // A budget both checks refuse still caps the limits at its own count.
-        config.zakura.peer_memory_budget_bytes = budget_for(16);
+        config.zakura.memory_budget =
+            crate::zakura::memory::ResolvedMemoryBudget::from_p2p_budget_b(budget_for(16));
         assert!(config.zakura.budgeted_max_connections(&mainnet()).is_err());
         assert_eq!(ZakuraLocalLimits::from_config(&config).max_connections, 16);
     }
@@ -641,21 +647,21 @@ mod tests {
             ..ZakuraConfig::default()
         };
         let error = config.budgeted_max_connections(&mainnet()).unwrap_err();
-        // 32 handshakes of (1024 MiB + 64 KiB) alone exceed the 10 GiB budget.
+        // 32 handshakes of (1024 MiB + 64 KiB) alone exceed the 11 GiB budget.
         assert_eq!((error.headroom, error.admitted), (32, 0));
         assert_eq!(error.handshake_bytes, 1024 * MIB + 64 * KIB);
         // Mainnet's 9 bootstrap peers, counting one as possibly this node.
         assert_eq!(error.required, 17);
-        assert!(error
-            .to_string()
-            .contains("[network.zakura] peer_memory_budget_bytes"));
+        assert!(error.to_string().contains("[memory] budget"));
         assert!(error.to_string().contains("receive_window_bytes"));
         assert!(error.to_string().contains("max_pending_handshakes"));
         assert_eq!(error.socket_queue_bytes, 256 * MIB);
 
         // The budget admits 16 after 32 of headroom, below the floor.
         let config = ZakuraConfig {
-            peer_memory_budget_bytes: budget_for(16),
+            memory_budget: crate::zakura::memory::ResolvedMemoryBudget::from_p2p_budget_b(
+                budget_for(16),
+            ),
             ..ZakuraConfig::default()
         };
         let error = config.budgeted_max_connections(&mainnet()).unwrap_err();
@@ -663,7 +669,7 @@ mod tests {
         assert_eq!(error.connection_bytes, CONNECTION);
 
         let config = ZakuraConfig {
-            peer_memory_budget_bytes: 0,
+            memory_budget: crate::zakura::memory::ResolvedMemoryBudget::from_p2p_budget_b(0),
             ..ZakuraConfig::default()
         };
         assert!(config.budgeted_max_connections(&mainnet()).is_err());
@@ -672,12 +678,16 @@ mod tests {
         // its headroom.
         let config = ZakuraConfig {
             max_connections: 2,
-            peer_memory_budget_bytes: budget_for(2),
+            memory_budget: crate::zakura::memory::ResolvedMemoryBudget::from_p2p_budget_b(
+                budget_for(2),
+            ),
             ..ZakuraConfig::default()
         };
         assert_eq!(config.budgeted_max_connections(&mainnet()), Ok(2));
         let config = ZakuraConfig {
-            peer_memory_budget_bytes: budget_for(2) - 1,
+            memory_budget: crate::zakura::memory::ResolvedMemoryBudget::from_p2p_budget_b(
+                budget_for(2) - 1,
+            ),
             ..config
         };
         assert_eq!(

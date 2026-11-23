@@ -1406,11 +1406,13 @@ fn read_result_limit_derives_from_getdata_and_inbound_limits() {
         Some(derived)
     );
 
-    // The peer memory budget funds QUIC windows, not reads: raising or lowering it
+    // The memory budget funds v2 P2P, not state reads: raising or lowering it
     // leaves the read limit where it was.
     for budget in [1 << 30, 64 << 30] {
         let mut changed = crate::config::ZakuradConfig::default();
-        changed.network.zakura.peer_memory_budget_bytes = budget;
+        changed.memory.budget = zakura_network::zakura::memory::MemoryBudget::Fixed(
+            zakura_network::zakura::memory::ByteSize(budget),
+        );
         assert_eq!(
             changed
                 .mirrored_state_config()

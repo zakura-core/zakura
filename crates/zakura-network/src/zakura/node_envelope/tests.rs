@@ -137,7 +137,7 @@ fn the_default_node_config_composes() {
             .zakura
             .quic_memory_bytes(&config.network, limits.max_connections, &[])
     );
-    assert!(envelope.quic_bytes <= u128::from(config.zakura.peer_memory_budget_bytes));
+    assert!(envelope.quic_bytes <= u128::from(config.zakura.memory_budget.p2p_budget_b()));
     assert_eq!(
         envelope.retained_bytes_bound(),
         envelope.transport_bytes
@@ -214,8 +214,9 @@ fn custom_stream_kinds_charge_the_peer_memory_budget() {
     let native = ZakuraLocalLimits::from_config(&config).max_connections;
     // A budget that funds the native kinds on exactly the default connections.
     let native_quic = config.zakura.quic_memory_bytes(&network, native, &[]);
-    config.zakura.peer_memory_budget_bytes =
-        u64::try_from(native_quic).expect("the default QUIC envelope fits u64");
+    config.zakura.memory_budget = crate::zakura::memory::ResolvedMemoryBudget::from_p2p_budget_b(
+        u64::try_from(native_quic).expect("the default QUIC envelope fits u64"),
+    );
     assert_eq!(
         ZakuraLocalLimits::from_config(&config).max_connections,
         native
@@ -249,7 +250,7 @@ fn custom_stream_kinds_charge_the_peer_memory_budget() {
     ));
     let envelope =
         NodeEnvelope::for_node(&config, &limits, CUSTOM, 16).expect("the lowered cap fits");
-    assert!(envelope.quic_bytes <= u128::from(config.zakura.peer_memory_budget_bytes));
+    assert!(envelope.quic_bytes <= u128::from(config.zakura.memory_budget.p2p_budget_b()));
     let native_kinds = || {
         limits
             .reactor_shares()

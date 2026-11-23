@@ -57,8 +57,7 @@ use super::discovery::{
 use super::legacy_gossip::LegacyResponseItem;
 use super::peer_memory::{
     budget_admitted_connections, budgeted_max_connections, budgeted_quic_bytes, ConnectionMemory,
-    PeerMemoryBudgetError, DEFAULT_ZAKURA_PEER_MEMORY_BUDGET_BYTES,
-    ZAKURA_CLOSING_CONNECTIONS_PER_LIVE,
+    PeerMemoryBudgetError, ZAKURA_CLOSING_CONNECTIONS_PER_LIVE,
 };
 use super::regulation::{parks_on_exhaustion, CadenceBuckets, CadenceCharge, PrecheckSlot};
 use super::trace::{reject_reason_label, ZakuraTrace};
@@ -374,8 +373,7 @@ const ZAKURA_CLOSE_OVERSIZE: u32 = 4;
 const ZAKURA_CLOSE_UNKNOWN_STREAM: u32 = 5;
 
 /// Native Zakura endpoint and handler configuration.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ZakuraConfig {
     /// Native Zakura bootstrap peers as `node_id@direct_addr`.
     ///
@@ -409,28 +407,12 @@ pub struct ZakuraConfig {
     /// Inbound peers leave a quarter of it, rounded down but at least one
     /// slot once it is 2 or more, free for this node's dials (see
     /// [`ZakuraLocalLimits::max_inbound_connections`]).
-    /// [`peer_memory_budget_bytes`](Self::peer_memory_budget_bytes) lowers a
-    /// larger value at startup.
+    /// `[memory] budget` lowers a larger value at startup.
     pub max_connections: usize,
-    /// Bytes of QUIC flow-control credit and queued datagrams that native
-    /// connections together may make this node hold.
-    ///
-    /// An admitted QUIC connection can hold its receive window, which is the
-    /// `[network.zakura.quic]` receive window plus every reactor's receive
-    /// share, and its send window: 141,937,353 bytes at the Mainnet defaults.
-    /// A connection in its handshake holds only the two QUIC windows, 64 MiB.
-    /// Each bound socket can also queue 256 MiB of datagrams, however many
-    /// connections it serves (zakura-quic CTRL-26 lists what this leaves out).
-    /// The node reserves one socket queue per bound socket and
-    /// `max_pending_handshakes` handshakes, and funds the rest divided by the
-    /// admitted connection's cost: 96 connections on the one socket
-    /// `listen_addr` binds. A larger `max_connections` is lowered at startup.
-    /// A closed connection releases its stream buffers and costs nothing more
-    /// until it drains.
-    /// Startup fails when the budget admits fewer than 16 connections, or
-    /// twice the discovery headroom plus one (19 with Mainnet's 9 bootstrap
-    /// peers), or fewer than `max_connections` when that is smaller.
-    pub peer_memory_budget_bytes: u64,
+    /// Pre-resolved `[memory]` budget passed in from `zakurad` (`02 §2`,
+    /// decision-2). Never serialized under `[network.zakura]`.
+    #[serde(skip)]
+    pub memory_budget: super::memory::ResolvedMemoryBudget,
     /// Maximum established Zakura connections admitted from one source IP.
     ///
     /// A global unicast IPv6 source counts by its /64, since one host can hold
@@ -448,8 +430,7 @@ pub struct ZakuraConfig {
     /// Inbound handshakes leave the same reserve free as
     /// [`max_connections`](Self::max_connections).
     ///
-    /// Also the QUIC connections that
-    /// [`peer_memory_budget_bytes`](Self::peer_memory_budget_bytes) funds
+    /// Also the QUIC connections that `[memory] budget` funds
     /// beyond the admitted ones, for handshakes and extra dial attempts.
     pub max_pending_handshakes: usize,
     /// New streams per second admitted per connection after a valid prelude.
@@ -497,6 +478,84 @@ pub struct ZakuraConfig {
     pub dev_network: Option<String>,
 }
 
+/// Deserialization shadow for [`ZakuraConfig`] so setting the removed
+/// `peer_memory_budget_bytes` key fails with a clear message naming
+/// `[memory] budget` (`02 §2`).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct DZakuraConfig {
+    bootstrap_peers: Vec<String>,
+    listen_addr: Option<SocketAddr>,
+    nat_traversal: bool,
+    quic: QuicConfig,
+    max_connections: usize,
+    peer_memory_budget_bytes: Option<serde::de::IgnoredAny>,
+    max_connections_per_ip: usize,
+    max_pending_handshakes: usize,
+    stream_open_rate_per_second: u32,
+    message_rate_per_second: u32,
+    trace_dir: Option<PathBuf>,
+    trace_peer_names: BTreeMap<IpAddr, String>,
+    header_sync: ZakuraHeaderSyncConfig,
+    block_sync: ZakuraBlockSyncConfig,
+    tx_relay: super::ZakuraTxRelayConfig,
+    dev_network: Option<String>,
+}
+
+impl Default for DZakuraConfig {
+    fn default() -> Self {
+        let defaults = ZakuraConfig::default();
+        Self {
+            bootstrap_peers: defaults.bootstrap_peers,
+            listen_addr: defaults.listen_addr,
+            nat_traversal: defaults.nat_traversal,
+            quic: defaults.quic,
+            max_connections: defaults.max_connections,
+            peer_memory_budget_bytes: None,
+            max_connections_per_ip: defaults.max_connections_per_ip,
+            max_pending_handshakes: defaults.max_pending_handshakes,
+            stream_open_rate_per_second: defaults.stream_open_rate_per_second,
+            message_rate_per_second: defaults.message_rate_per_second,
+            trace_dir: defaults.trace_dir,
+            trace_peer_names: defaults.trace_peer_names,
+            header_sync: defaults.header_sync,
+            block_sync: defaults.block_sync,
+            tx_relay: defaults.tx_relay,
+            dev_network: defaults.dev_network,
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ZakuraConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = <DZakuraConfig as serde::Deserialize>::deserialize(deserializer)?;
+        if raw.peer_memory_budget_bytes.is_some() {
+            return Err(serde::de::Error::custom(
+                "[network.zakura] peer_memory_budget_bytes has been removed; \
+                 configure [memory] budget instead",
+            ));
+        }
+        Ok(Self {
+            bootstrap_peers: raw.bootstrap_peers,
+            listen_addr: raw.listen_addr,
+            nat_traversal: raw.nat_traversal,
+            quic: raw.quic,
+            max_connections: raw.max_connections,
+            memory_budget: super::memory::ResolvedMemoryBudget::default(),
+            max_connections_per_ip: raw.max_connections_per_ip,
+            max_pending_handshakes: raw.max_pending_handshakes,
+            stream_open_rate_per_second: raw.stream_open_rate_per_second,
+            message_rate_per_second: raw.message_rate_per_second,
+            trace_dir: raw.trace_dir,
+            trace_peer_names: raw.trace_peer_names,
+            header_sync: raw.header_sync,
+            block_sync: raw.block_sync,
+            tx_relay: raw.tx_relay,
+            dev_network: raw.dev_network,
+        })
+    }
+}
+
 impl Default for ZakuraConfig {
     fn default() -> Self {
         Self {
@@ -508,7 +567,7 @@ impl Default for ZakuraConfig {
             nat_traversal: false,
             quic: QuicConfig::default(),
             max_connections: DEFAULT_ZAKURA_MAX_CONNECTIONS,
-            peer_memory_budget_bytes: DEFAULT_ZAKURA_PEER_MEMORY_BUDGET_BYTES,
+            memory_budget: super::memory::ResolvedMemoryBudget::default(),
             max_connections_per_ip: DEFAULT_ZAKURA_MAX_CONNS_PER_IP,
             max_pending_handshakes: DEFAULT_ZAKURA_MAX_PENDING_HANDSHAKES,
             stream_open_rate_per_second: DEFAULT_ZAKURA_STREAM_OPEN_RATE_PER_SECOND,
@@ -705,7 +764,7 @@ impl ZakuraConfig {
     ) -> Result<usize, PeerMemoryBudgetError> {
         budgeted_max_connections(
             self.max_connections,
-            self.peer_memory_budget_bytes,
+            self.memory_budget.p2p_budget_b(),
             self.bound_socket_count(),
             self.connection_memory(network, custom_kinds),
             match local_node_id {
@@ -818,7 +877,7 @@ impl ZakuraLocalLimits {
                 .max_connections
                 .max(1)
                 .min(budget_admitted_connections(
-                    config.zakura.peer_memory_budget_bytes,
+                    config.zakura.memory_budget.p2p_budget_b(),
                     config.zakura.bound_socket_count(),
                     config
                         .zakura
@@ -5774,10 +5833,10 @@ async fn spawn_zakura_endpoint_inner(
         warn!(
             max_connections = config.zakura.max_connections,
             budgeted_max_connections,
-            peer_memory_budget_bytes = config.zakura.peer_memory_budget_bytes,
+            p2p_budget_b = config.zakura.memory_budget.p2p_budget_b(),
             connection_memory = ?config.zakura.connection_memory(&config.network, &custom_kinds),
-            "lowering [network.zakura] max_connections to what peer_memory_budget_bytes \
-             admits at the configured QUIC windows and reactor shares; raise the budget or \
+            "lowering [network.zakura] max_connections to what [memory] budget \
+             admits at the configured QUIC windows and reactor shares; raise [memory] budget or \
              lower max_connections to silence this"
         );
     }

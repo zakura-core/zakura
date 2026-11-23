@@ -60,7 +60,7 @@ pub(crate) enum NodeEnvelopeError {
     /// memory budget.
     #[error(
         "the Zakura QUIC envelope of {quic_bytes} bytes exceeds \
-         [network.zakura] peer_memory_budget_bytes ({budget_bytes} bytes)"
+         the resolved [memory] budget ({budget_bytes} bytes)"
     )]
     PeerMemoryBudget {
         /// The connections' QUIC windows and the sockets' queues.
@@ -134,7 +134,7 @@ impl NodeEnvelope {
             config
                 .zakura
                 .quic_memory_bytes(&config.network, limits.max_connections, custom_kinds);
-        let budget_bytes = config.zakura.peer_memory_budget_bytes;
+        let budget_bytes = config.zakura.memory_budget.p2p_budget_b();
         if quic_bytes > u128::from(budget_bytes) {
             return Err(NodeEnvelopeError::PeerMemoryBudget {
                 quic_bytes,

@@ -151,7 +151,7 @@ impl fmt::Display for ByteSize {
             return f.write_str("0 B");
         }
         for (unit, scale) in [("TiB", TIB), ("GiB", GIB), ("MiB", MIB), ("KiB", KIB)] {
-            if bytes % scale == 0 {
+            if bytes.is_multiple_of(scale) {
                 return write!(f, "{} {unit}", bytes / scale);
             }
         }
@@ -376,6 +376,9 @@ impl MemoryConfig {
             source,
             weights: self.weight,
             caps: self.cap,
+            mempool_tx_cost_limit: super::plan::DEFAULT_MEMPOOL_TX_COST_LIMIT_BYTES,
+            state_read_parser_bytes: super::plan::DEFAULT_STATE_READ_PARSER_BYTES,
+            read_result_byte_limit: None,
         }
     }
 }
@@ -392,6 +395,15 @@ pub struct ResolvedMemoryBudget {
     pub weights: MemoryWeights,
     /// Optional cap overrides.
     pub caps: MemoryCaps,
+    /// Mempool pool capacity (`[mempool] tx_cost_limit`), counted as a fixed
+    /// term and as the default cap for the `Tx` consumer (`02 §4`).
+    pub mempool_tx_cost_limit: u64,
+    /// `zakura-state`'s read parser allowance, counted in the state reads fixed
+    /// term (`02 §4`).
+    pub state_read_parser_bytes: u64,
+    /// An operator-set `[state] read_result_byte_limit`, or `None` for the
+    /// plan's derived limit (`02 §4`, decision-10).
+    pub read_result_byte_limit: Option<u64>,
 }
 
 impl ResolvedMemoryBudget {
@@ -419,6 +431,9 @@ impl ResolvedMemoryBudget {
                 serving_per_peer: None,
                 tx: None,
             },
+            mempool_tx_cost_limit: super::plan::DEFAULT_MEMPOOL_TX_COST_LIMIT_BYTES,
+            state_read_parser_bytes: super::plan::DEFAULT_STATE_READ_PARSER_BYTES,
+            read_result_byte_limit: None,
         }
     }
 
@@ -453,6 +468,9 @@ impl Default for ResolvedMemoryBudget {
             source: "auto",
             weights: MemoryWeights::default(),
             caps: MemoryCaps::default(),
+            mempool_tx_cost_limit: super::plan::DEFAULT_MEMPOOL_TX_COST_LIMIT_BYTES,
+            state_read_parser_bytes: super::plan::DEFAULT_STATE_READ_PARSER_BYTES,
+            read_result_byte_limit: None,
         }
     }
 }
@@ -497,6 +515,9 @@ mod tests {
             "GiB",
             "16 XB",
             "9999999999999999999999 GiB",
+            "16777216 TiB",
+            "1.2.3 GiB",
+            ".",
         ] {
             assert!(bad.parse::<ByteSize>().is_err(), "should reject {bad:?}");
         }

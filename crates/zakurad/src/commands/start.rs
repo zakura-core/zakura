@@ -411,9 +411,19 @@ impl StartCmd {
         metrics::gauge!("zakura.memory.budget_bytes", "source" => source)
             .set(host_budget_bytes as f64);
         let managed_zcashd = config.zcashd_compat.enabled && config.zcashd_compat.manage_zcashd;
-        let resolved = config
+        let mut resolved = config
             .memory
             .resolve(host_budget_bytes, source, managed_zcashd);
+        resolved.mempool_tx_cost_limit = config.mempool.tx_cost_limit;
+        // The plan counts state reads as one fixed term (`02 §4`).
+        let state_config = config.mirrored_state_config();
+        resolved.state_read_parser_bytes = state_config
+            .read_parser_bytes()
+            .map_err(|error| eyre!(error))?;
+        resolved.read_result_byte_limit = config
+            .state
+            .read_result_byte_limit
+            .map(std::num::NonZeroU64::get);
         info!(
             source,
             host_budget_bytes = resolved.derivation.host_budget_bytes,

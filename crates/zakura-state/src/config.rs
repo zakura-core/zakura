@@ -507,14 +507,9 @@ impl Default for PruningConfig {
 /// The largest serialized block a reader can load, as bytes of parser memory.
 const MAX_BLOCK_PARSER_BYTES: u64 = 2 * MAX_BLOCK_BYTES;
 
-/// Decoded memory per serialized byte in a legal block, rounded up.
-///
-/// Small transactions have the largest ratio. Consensus requires an input and an
-/// output, which take about 60 wire bytes and a few hundred decoded bytes.
-pub(crate) const MAX_DECODED_BYTES_PER_WIRE_BYTE: u64 = 12;
-
-/// The decoded memory of one maximum-size block.
-const MAX_DECODED_BLOCK_BYTES: u64 = MAX_BLOCK_BYTES * MAX_DECODED_BYTES_PER_WIRE_BYTE;
+use zakura_node_services::block_memory::MAX_DECODED_BLOCK_BYTES;
+pub(crate) use zakura_node_services::block_memory::MAX_DECODED_BYTES_PER_WIRE_BYTE;
+pub use zakura_node_services::block_memory::READ_RESULT_BLOCKS_PER_PEER;
 
 /// Inbound peers that [`Config::read_result_byte_limit`] serves when no peer limit is known:
 /// `zakura-network`'s default inbound limit, 100 initial target peers × 3.
@@ -524,10 +519,6 @@ pub const DEFAULT_READ_RESULT_PEERS: usize = 300;
 /// honest derivation for 300 peers is about 115 GB, which would never bind. It stays
 /// fixed, so raising `zakura-network`'s peer memory budget does not raise it.
 pub const DEFAULT_READ_RESULT_CEILING_BYTES: u64 = 8 * 1024 * 1024 * 1024;
-
-/// Blocks one peer request can hold as read results: `zakurad`'s legacy
-/// `GETDATA_MAX_BLOCK_COUNT`, the largest per-peer block request the state serves.
-pub const READ_RESULT_BLOCKS_PER_PEER: u64 = 16;
 
 /// Why a configuration cannot fund its read workers and one legal result.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -594,9 +585,6 @@ impl Config {
     ///
     /// Each partition in the sum has its own owner. Durable disk limits are not part of it.
     pub fn read_memory_bound(&self) -> Result<u64, ReadCapacityError> {
-        let workers =
-            u64::try_from(self.read_worker_count()).map_err(|_| ReadCapacityError::Overflow)?;
-
         let result_bytes = self.read_result_byte_limit().get();
         if result_bytes < MAX_DECODED_BLOCK_BYTES {
             return Err(ReadCapacityError::ResultLimitTooSmall {
@@ -605,25 +593,28 @@ impl Config {
             });
         }
 
-        // A worker parses one block at a time: its raw rows and its decoded result.
+        // Retained results, under one shared budget, plus the parser partitions.
+        result_bytes
+            .checked_add(self.read_parser_bytes()?)
+            .ok_or(ReadCapacityError::Overflow)
+    }
+
+    /// The bytes that read memory holds outside retained results: the parser
+    /// allowance (`02 §4`). Each worker parses one block at a time, its raw rows
+    /// and its decoded result, and the chain tip keeps a fixed count of blocks
+    /// with their parsers.
+    pub fn read_parser_bytes(&self) -> Result<u64, ReadCapacityError> {
+        let workers =
+            u64::try_from(self.read_worker_count()).map_err(|_| ReadCapacityError::Overflow)?;
         let parser_bytes = workers
             .checked_mul(MAX_BLOCK_PARSER_BYTES + MAX_DECODED_BLOCK_BYTES)
             .ok_or(ReadCapacityError::Overflow)?;
         let chain_tip_bytes = crate::constants::CHAIN_TIP_BLOCK_RETENTION
             .checked_mul(MAX_DECODED_BLOCK_BYTES + MAX_BLOCK_PARSER_BYTES)
             .ok_or(ReadCapacityError::Overflow)?;
-
-        [
-            // Retained results, under one shared budget.
-            result_bytes,
-            // Active parsers, which each worker bounds to one block at a time.
-            parser_bytes,
-            // Chain-tip blocks in their fixed count partition, including their parsers.
-            chain_tip_bytes,
-        ]
-        .into_iter()
-        .try_fold(0u64, u64::checked_add)
-        .ok_or(ReadCapacityError::Overflow)
+        parser_bytes
+            .checked_add(chain_tip_bytes)
+            .ok_or(ReadCapacityError::Overflow)
     }
 }
 

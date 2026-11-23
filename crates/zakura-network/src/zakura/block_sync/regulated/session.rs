@@ -25,11 +25,14 @@ const BOOKKEEPING_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
 const SESSION_ALLOWANCE_BYTES: u64 = 144 * 1024;
 /// Per-request ceiling from the lifecycle allocation regression.
 const BYTES_PER_REQUEST: u64 = 160;
+/// Per-session serving bookkeeping slot moved from the static 512 MiB cap
+/// into `b_block_sync` (`02 §8`: 512 MiB / 512 slots = 1 MiB per session).
+pub(crate) const BLOCK_SYNC_SESSION_BOOKKEEPING_BYTES: u64 = 1024 * 1024;
 /// Node-wide read-and-encode jobs. A storage probe on cloned Mainnet and
 /// Testnet state (16 vCPUs, one block per response) reached 94% or more of
 /// peak throughput at 24 jobs using about 10 cores. More jobs only added
 /// latency and CPU, which validation needs.
-const NODE_EXECUTION: usize = 24;
+pub(crate) const NODE_EXECUTION: usize = 24;
 /// Read-and-encode jobs for one peer: half the node, so a stalled peer cannot
 /// hold every slot. One peer's share still exceeds one connection's throughput.
 pub(super) const PEER_EXECUTION: usize = NODE_EXECUTION / 2;

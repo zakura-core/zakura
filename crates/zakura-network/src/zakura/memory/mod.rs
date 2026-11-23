@@ -21,6 +21,7 @@
 mod config;
 pub mod draft;
 mod peer_pool;
+mod plan;
 mod pool;
 #[cfg(test)]
 mod tests;
@@ -32,6 +33,11 @@ pub use config::{
     ResolvedMemoryBudget,
 };
 pub use draft::{derive_p2p_budget, resolved_p2p_budget_bytes, BudgetDerivation};
+pub use plan::{
+    derived_read_result_byte_limit, FixedTerms, MemoryPlan, MemoryPlanError, SessionBases,
+    DEFAULT_MEMPOOL_TX_COST_LIMIT_BYTES, DEFAULT_STATE_READ_PARSER_BYTES,
+    DISCOVERY_TABLES_FIXED_BYTES, PROPAGATION_RESERVE_BYTES, TX_RELAY_MAPS_FIXED_BYTES,
+};
 pub use pool::{
     ConsumerSnapshot, LeaseDenied, MemoryPool, MemoryPoolMachine, OverrunReport, PoolLease,
     PoolSnapshot, PoolWaitToken, Refusal, Released, Wake, WakeClass,

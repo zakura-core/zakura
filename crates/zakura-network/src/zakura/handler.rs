@@ -254,6 +254,11 @@ pub const CONTROL_RECEIVE_BYTES: u64 = if DERIVED_CONTROL_RECEIVE_BYTES > MIN_QU
 /// admitted.
 pub const HANDSHAKE_SEND_WINDOW_BYTES: u64 = MIN_QUIC_WINDOW_BYTES;
 
+/// Base send window for an admitted connection: the largest native frame
+/// (`MAX_BS_FRAME_BYTES`), so propagation never needs to lease window growth to
+/// send one block.
+pub const BASE_SEND_WINDOW_BYTES: u64 = super::MAX_BS_FRAME_BYTES as u64;
+
 /// A paused stream may consume at most half the connection receive window,
 /// leaving credit for another service stream.
 pub const DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW: u32 = 16 * 1024 * 1024;
@@ -780,7 +785,7 @@ impl ZakuraConfig {
 
     /// Returns how many sockets the native endpoint binds for this config (see
     /// `native_bind_addrs`), each with its own datagram queue.
-    fn bound_socket_count(&self) -> u64 {
+    pub(crate) fn bound_socket_count(&self) -> u64 {
         u64::try_from(native_bind_addrs(self.listen_addr).len()).unwrap_or(u64::MAX)
     }
 
@@ -1175,6 +1180,10 @@ pub struct ZakuraEndpoint {
     #[cfg(any(test, feature = "zakura-testkit"))]
     header_sync_actions: Option<Arc<AsyncMutex<Option<mpsc::Receiver<HeaderSyncAction>>>>>,
     block_sync_actions: Option<Arc<AsyncMutex<Option<mpsc::Receiver<BlockSyncAction>>>>>,
+    /// Startup memory sizing plan enforced by this endpoint (`02 §8`).
+    memory_plan: Option<super::memory::MemoryPlan>,
+    /// Node-wide logical-byte memory pool sized from [`Self::memory_plan`].
+    memory_pool: Option<super::memory::MemoryPool>,
     /// Maintained native dials started by the legacy->Zakura upgrade hand-off,
     /// keyed by the advertised peer id. See [`Self::start_upgrade_native_dial`]
     /// and [`Self::cancel_upgrade_native_dial`].
@@ -1278,6 +1287,17 @@ impl ZakuraEndpoint {
     /// Returns the endpoint trace emitter.
     pub fn trace(&self) -> ZakuraTrace {
         self.handler.trace.clone()
+    }
+
+    /// Returns the startup memory sizing plan enforced by this endpoint, if started
+    /// through the production startup path.
+    pub fn memory_plan(&self) -> Option<super::memory::MemoryPlan> {
+        self.memory_plan
+    }
+
+    /// Returns the node-wide memory pool owned by this endpoint.
+    pub fn memory_pool(&self) -> Option<super::memory::MemoryPool> {
+        self.memory_pool.clone()
     }
 
     /// Returns the header-sync handle when native header sync is active.
@@ -1590,6 +1610,8 @@ impl ZakuraEndpoint {
     /// It doesn't serve inbound connections itself. Pass `handler` to
     /// `quic.serve` for those, and dial with [`Self::dial`].
     pub fn new(quic: QuicEndpoint, handler: ZakuraProtocolHandler) -> Self {
+        let memory_plan = handler.memory_plan;
+        let memory_pool = handler.memory_pool.clone();
         Self {
             quic,
             supervisor: handler.supervisor.clone(),
@@ -1604,6 +1626,8 @@ impl ZakuraEndpoint {
             #[cfg(any(test, feature = "zakura-testkit"))]
             header_sync_actions: None,
             block_sync_actions: None,
+            memory_plan,
+            memory_pool,
             upgrade_dials: Arc::new(StdMutex::new(HashMap::new())),
             upgrade_alpn_floors: Arc::new(StdMutex::new(HashMap::new())),
         }
@@ -1650,6 +1674,8 @@ impl ZakuraEndpoint {
         header_sync_actions: Option<mpsc::Receiver<HeaderSyncAction>>,
         block_sync_actions: Option<mpsc::Receiver<BlockSyncAction>>,
     ) -> Self {
+        let memory_plan = handler.memory_plan;
+        let memory_pool = handler.memory_pool.clone();
         Self {
             quic,
             supervisor,
@@ -1665,6 +1691,8 @@ impl ZakuraEndpoint {
                 .map(|actions| Arc::new(AsyncMutex::new(Some(actions)))),
             block_sync_actions: block_sync_actions
                 .map(|actions| Arc::new(AsyncMutex::new(Some(actions)))),
+            memory_plan,
+            memory_pool,
             upgrade_dials: Arc::new(StdMutex::new(HashMap::new())),
             upgrade_alpn_floors: Arc::new(StdMutex::new(HashMap::new())),
         }
@@ -3345,6 +3373,10 @@ pub struct ZakuraProtocolHandler {
     shutdown: CancellationToken,
     // Bound endpoint identity, used for connection collision handling.
     local_node_id: Option<NodeId>,
+    /// Node-wide memory pool shared by this handler and its services.
+    memory_pool: Option<super::memory::MemoryPool>,
+    /// Startup memory plan enforced for this handler.
+    memory_plan: Option<super::memory::MemoryPlan>,
     /// Receives this handler's transport events.
     #[cfg(any(test, zakura_sim))]
     transport_observer: Option<Arc<dyn super::TransportObserver>>,
@@ -3456,9 +3488,23 @@ impl ZakuraProtocolHandler {
             shutdown: CancellationToken::new(),
             limits,
             local_node_id: None,
+            memory_pool: None,
+            memory_plan: None,
             #[cfg(any(test, zakura_sim))]
             transport_observer: None,
         }
+    }
+
+    /// Attach the startup [`MemoryPlan`](super::memory::MemoryPlan) and its live
+    /// [`MemoryPool`](super::memory::MemoryPool) to this handler.
+    pub fn with_memory_pool(
+        mut self,
+        plan: super::memory::MemoryPlan,
+        pool: super::memory::MemoryPool,
+    ) -> Self {
+        self.memory_plan = Some(plan);
+        self.memory_pool = Some(pool);
+        self
     }
 
     /// Report every connection's transport events to `observer`. Install it
@@ -5644,7 +5690,7 @@ fn advertises_no_discovery_address(config: &Config, advertised: &[SocketAddr]) -
 }
 
 /// Counts the distinct parseable bootstrap identities other than `local_node_id`.
-fn remote_bootstrap_peer_count(
+pub(crate) fn remote_bootstrap_peer_count(
     bootstrap_peers: &[String],
     local_node_id: impl Into<Option<NodeId>>,
 ) -> usize {
@@ -5824,22 +5870,16 @@ async fn spawn_zakura_endpoint_inner(
         .flat_map(|custom| custom.service.streams().iter().map(|stream| stream.kind))
         .filter(|kind| !named_kinds.iter().any(|(named, _)| named == kind))
         .collect();
-    let budgeted_max_connections = config.zakura.budgeted_max_connections_for_node(
+    let memory_plan = super::memory::MemoryPlan::size_for_node(
+        config.zakura.memory_budget.p2p_budget_b(),
+        config,
         &config.network,
-        local_node_id,
+        Some(local_node_id),
         &custom_kinds,
     )?;
-    if budgeted_max_connections < config.zakura.max_connections {
-        warn!(
-            max_connections = config.zakura.max_connections,
-            budgeted_max_connections,
-            p2p_budget_b = config.zakura.memory_budget.p2p_budget_b(),
-            connection_memory = ?config.zakura.connection_memory(&config.network, &custom_kinds),
-            "lowering [network.zakura] max_connections to what [memory] budget \
-             admits at the configured QUIC windows and reactor shares; raise [memory] budget or \
-             lower max_connections to silence this"
-        );
-    }
+    memory_plan.publish_metrics();
+    let memory_pool = memory_plan.build_pool();
+    info!(plan = %memory_plan, "sized and enforced Zakura startup memory plan");
     let limits = ZakuraLocalLimits::for_node(config, &custom_kinds);
     let node_envelope = crate::zakura::node_envelope::NodeEnvelope::for_node(
         config,
@@ -5879,6 +5919,7 @@ async fn spawn_zakura_endpoint_inner(
         .map(zakura_jsonl_trace::JsonlTracer::spawn)
         .unwrap_or_else(zakura_jsonl_trace::JsonlTracer::noop);
     let trace = ZakuraTrace::new(tracer, zakura_jsonl_trace::node_id());
+    trace.emit_memory_plan(&memory_plan);
     let handshake_config = ZakuraHandshakeConfig::for_network_with_dev_cohort(
         &config.network,
         config.zakura.dev_network.as_deref(),
@@ -6085,7 +6126,8 @@ async fn spawn_zakura_endpoint_inner(
         registry,
         trace,
     )
-    .with_local_node_id(local_node_id);
+    .with_local_node_id(local_node_id)
+    .with_memory_pool(memory_plan, memory_pool.clone());
     handler.set_header_sync_enabled(header_sync_ready);
     if handler.trace.is_enabled() {
         let trace = handler.trace.clone();
@@ -6109,6 +6151,8 @@ async fn spawn_zakura_endpoint_inner(
         #[cfg(any(test, feature = "zakura-testkit"))]
         header_sync_actions,
         block_sync_actions,
+        memory_plan: Some(memory_plan),
+        memory_pool: Some(memory_pool),
         upgrade_dials: Arc::new(StdMutex::new(HashMap::new())),
         upgrade_alpn_floors: Arc::new(StdMutex::new(HashMap::new())),
     };

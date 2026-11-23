@@ -2923,6 +2923,7 @@ impl Service<ReadRequest> for ReadStateService {
     #[instrument(name = "read_state", level = "debug", skip(self, req))]
     fn call(&mut self, req: ReadRequest) -> Self::Future {
         req.count_metric();
+        self.db.publish_read_memory_metrics();
         let timer = CodeTimer::start_desc(req.variant_name());
         let span = Span::current();
         let timed_span = TimedSpan::new(timer, span);

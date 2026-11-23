@@ -60,7 +60,8 @@ pub use trace::{
     commit_state_trace, peer_label as zakura_trace_peer_label,
     reject_reason_label as zakura_trace_reject_reason_label, ZakuraTrace, ZakuraTraceEvent,
     BLOCK_SYNC_TABLE, COMMIT_STATE_TABLE, CONN_TABLE, HANDSHAKE_TABLE, HEADER_SYNC_TABLE,
-    LEGACY_REQUEST_TABLE, QUEUE_SEND_TABLE, QUIC_CONN_TABLE, RATELIMIT_TABLE, STREAM_TABLE,
+    LEGACY_REQUEST_TABLE, MEMORY_TABLE, QUEUE_SEND_TABLE, QUIC_CONN_TABLE, RATELIMIT_TABLE,
+    STREAM_TABLE,
 };
 pub use transport::*;
 #[cfg(zakura_sim)]

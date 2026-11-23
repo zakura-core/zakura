@@ -672,3 +672,48 @@ async fn dropping_node_tasks_aborts_supervised_tasks() {
     drop(node_tasks);
     assert_aborted(supervised_aborted).await;
 }
+
+/// The budget governs only the v2 stack (`02 §2`): a legacy node starts with a
+/// `[memory]` section that a v2 node refuses, and doesn't resolve it. A v2 node
+/// counts the state's parser allowance and an operator-set read limit.
+#[test]
+fn memory_budget_resolves_only_on_the_v2_stack() {
+    use zakura_network::zakura::memory::{
+        ByteSize, MemoryBudget, ResolvedMemoryBudget, DEFAULT_STATE_READ_PARSER_BYTES,
+    };
+
+    let mut config = ZakuradConfig::default();
+    config.network.p2p_stack = P2pStack::Legacy;
+    config.memory.budget = MemoryBudget::Fixed(ByteSize(0));
+    let network =
+        StartCmd::network_config_for_start(&config).expect("the legacy stack ignores [memory]");
+    assert_eq!(
+        network.zakura.memory_budget,
+        ResolvedMemoryBudget::default()
+    );
+
+    config.network.p2p_stack = P2pStack::Zakura;
+    let error =
+        StartCmd::network_config_for_start(&config).expect_err("the v2 stack validates [memory]");
+    assert!(error.to_string().contains("[memory] budget"), "{error}");
+
+    config.memory.budget = MemoryBudget::Fixed(ByteSize(16 << 30));
+    config.state.read_result_byte_limit = std::num::NonZeroU64::new(1 << 30);
+    let resolved = StartCmd::network_config_for_start(&config)
+        .expect("a fixed budget resolves")
+        .zakura
+        .memory_budget;
+    assert_eq!(resolved.derivation.host_budget_bytes, 16 << 30);
+    assert_eq!(resolved.read_result_byte_limit, Some(1 << 30));
+    // The plan's default allowance is the state's default.
+    assert_eq!(
+        resolved.state_read_parser_bytes,
+        zakura_state::Config::default()
+            .read_parser_bytes()
+            .expect("the default state config fits")
+    );
+    assert_eq!(
+        resolved.state_read_parser_bytes,
+        DEFAULT_STATE_READ_PARSER_BYTES
+    );
+}

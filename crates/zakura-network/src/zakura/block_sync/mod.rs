@@ -81,7 +81,7 @@ pub use bench::{
 pub(crate) use config::MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES;
 pub use config::{
     BlockSyncStatus, CwndUnit, ZakuraBlockSyncConfig, BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES,
-    MAX_BS_RESPONSE_BYTES,
+    DEFAULT_BS_BBR_MIN_CWND_BYTES, MAX_BS_RESPONSE_BYTES,
 };
 pub use error::{BlockSyncStartError, BlockSyncWireError};
 pub use events::{
@@ -91,7 +91,13 @@ pub use events::{
 #[cfg(any(test, zakura_sim, feature = "zakura-testkit"))]
 pub use peer_routine::routine_accepts_body;
 pub use reactor::spawn_block_sync_reactor;
-pub(crate) use regulated::session::serving_limits as getblocks_serving_limits;
+pub(crate) use regulated::session::{
+    serving_limits as getblocks_serving_limits, BLOCK_SYNC_SESSION_BOOKKEEPING_BYTES,
+    NODE_EXECUTION as BLOCK_SYNC_SERVE_NODE_EXECUTION,
+};
+/// Output byte bound of the largest served GetBlocks response (one max block + ending).
+pub(crate) const LARGEST_SERVED_BLOCK_RESPONSE_BYTES: u64 =
+    regulated::wire::LARGEST_SERVED_RESPONSE.output_bytes();
 pub use request::BlockSizeEstimate;
 pub(crate) use service::BLOCK_SYNC_SERVICE_STREAMS;
 pub use service::MAX_BS_FRAME_BYTES;

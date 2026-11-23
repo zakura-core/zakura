@@ -4,7 +4,7 @@
 //! application's configuration file and/or command-line options
 //! for specifying it.
 
-use std::path::PathBuf;
+use std::{num::NonZeroU64, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 use zakura_rpc::config::mining::{default_miner_address, MinerAddressType};
@@ -108,15 +108,25 @@ impl ZakuradConfig {
         state_config.checkpoint_sync = self.consensus.checkpoint_sync;
         state_config.vct_fast_sync = self.consensus.vct_fast_sync_enabled();
         state_config.trace_dir = self.network.zakura.trace_dir.clone();
-        // An unset read result limit serves every inbound peer's largest block request,
-        // up to its own 8 GiB ceiling. The peer memory budget funds QUIC windows, so a
-        // larger budget does not raise this limit.
+        // On the v2 stack the memory plan counts state reads as a fixed term and derives
+        // an unset read result limit from read concurrency (`02 §4`). The legacy stack
+        // keeps today's limit: every inbound peer's largest block request, up to its own
+        // 8 GiB ceiling.
         state_config.read_result_byte_limit =
             Some(state_config.read_result_byte_limit.unwrap_or_else(|| {
-                zakura_state::Config::read_result_byte_limit_for_peers(
-                    self.network.peerset_inbound_connection_limit(),
-                    zakura_state::DEFAULT_READ_RESULT_CEILING_BYTES,
-                )
+                if self.network.v2_p2p() {
+                    let derived = zakura_network::zakura::memory::derived_read_result_byte_limit(
+                        &self.network,
+                        &self.network.network,
+                    );
+                    NonZeroU64::new(derived)
+                        .expect("the derived limit holds at least one decoded block")
+                } else {
+                    zakura_state::Config::read_result_byte_limit_for_peers(
+                        self.network.peerset_inbound_connection_limit(),
+                        zakura_state::DEFAULT_READ_RESULT_CEILING_BYTES,
+                    )
+                }
             }));
         state_config
     }

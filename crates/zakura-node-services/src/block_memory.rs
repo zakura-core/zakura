@@ -45,7 +45,7 @@
 use std::{fmt, io, num::NonZeroU64, ops::Deref, sync::Arc};
 
 use zakura_chain::{
-    block::{Block, BlockRef, Header},
+    block::{Block, BlockRef, Header, MAX_BLOCK_BYTES},
     serialization::ZcashSerialize,
     transaction::Transaction,
 };
@@ -864,6 +864,19 @@ impl DecodedSize for Vec<u8> {
     }
 }
 
+/// Decoded memory per serialized byte in a legal block, rounded up.
+///
+/// Small transactions have the largest ratio. Consensus requires an input and an
+/// output, which take about 60 wire bytes and a few hundred decoded bytes.
+pub const MAX_DECODED_BYTES_PER_WIRE_BYTE: u64 = 12;
+
+/// The decoded memory of one maximum-size block.
+pub const MAX_DECODED_BLOCK_BYTES: u64 = MAX_BLOCK_BYTES * MAX_DECODED_BYTES_PER_WIRE_BYTE;
+
+/// Blocks one peer request can hold as read results: `zakurad`'s legacy
+/// `GETDATA_MAX_BLOCK_COUNT`, the largest per-peer block request the state serves.
+pub const READ_RESULT_BLOCKS_PER_PEER: u64 = 16;
+
 /// A read refused because other holders use the rest of the retained read limit.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReadMemoryExhausted;
@@ -892,6 +905,8 @@ pub fn is_read_capacity_refusal(error: &(dyn std::error::Error + 'static)) -> bo
 struct ByteGauge {
     limit: u64,
     used: AtomicU64,
+    /// Reservations and growths this gauge refused, for observation only.
+    refused: AtomicU64,
 }
 
 impl ByteGauge {
@@ -904,7 +919,10 @@ impl ByteGauge {
                 (next <= self.limit || used == held).then_some(next)
             })
             .map(drop)
-            .map_err(|_| ReadMemoryExhausted)
+            .map_err(|_| {
+                self.refused.fetch_add(1, Ordering::Relaxed);
+                ReadMemoryExhausted
+            })
     }
 
     fn release(&self, bytes: u64) {
@@ -955,12 +973,19 @@ impl ReadMemoryBudget {
         Self(Arc::new(ByteGauge {
             limit: limit.get(),
             used: AtomicU64::new(0),
+            refused: AtomicU64::new(0),
         }))
     }
 
     /// Bytes currently charged to reservations and retained results.
     pub fn retained_bytes(&self) -> u64 {
         self.0.used.load(Ordering::Acquire)
+    }
+
+    /// Reservations and growths refused since this budget was created, so an
+    /// operator can see whether the limit binds.
+    pub fn refused_reservations(&self) -> u64 {
+        self.0.refused.load(Ordering::Relaxed)
     }
 
     /// Reserve `bytes` before a read materializes its result. Refusal proves that
@@ -1088,6 +1113,8 @@ mod tests {
             .try_decode_reserved(small, || Some(block()))
             .unwrap_err();
         assert_eq!(error, AdmissionFailure::Capacity);
+        // The refused reservation and the refused growth are both counted.
+        assert_eq!(budget.refused_reservations(), 2);
         assert_eq!(budget.retained_bytes(), bytes);
         assert_eq!(pool.reserved_blocks(), 1);
         assert_eq!(pool.reserved_bytes(), bytes);

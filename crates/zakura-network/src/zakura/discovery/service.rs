@@ -39,7 +39,7 @@ use super::trace::{AnswerPhase, DiscoveryAnswerEvent, DiscoveryViolationEvent, V
 use super::wire::{PEERS_MAX_BYTES, RULES};
 use crate::zakura::regulation::{CadenceSender, ReservationPool, WriterFence};
 
-const DISCOVERY_SERVICE_STREAMS: [Stream; 1] = [Stream {
+pub(crate) const DISCOVERY_SERVICE_STREAMS: [Stream; 1] = [Stream {
     kind: ZAKURA_STREAM_DISCOVERY,
     version: ZAKURA_DISCOVERY_STREAM_VERSION,
     // The largest payload plus its header is far below u32::MAX.

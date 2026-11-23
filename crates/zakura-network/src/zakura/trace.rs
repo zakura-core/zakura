@@ -144,6 +144,9 @@ pub const QUIC_CONN_TABLE: ZakuraTraceTable = ZakuraTraceTable::new("quic_conn",
 pub const QUEUE_SEND_TABLE: ZakuraTraceTable =
     ZakuraTraceTable::new("queue_send", "queue_send.jsonl");
 
+/// Startup memory sizing plan (`02 §8`, `03 §5`).
+pub const MEMORY_TABLE: ZakuraTraceTable = ZakuraTraceTable::new("memory", "memory.jsonl");
+
 /// Shared queue-send trace event names and field keys.
 #[allow(dead_code)] // Preserved as schema constants for compatible trace consumers.
 pub mod queue_send_trace {
@@ -518,6 +521,122 @@ impl ZakuraTrace {
             insert_optional_str(row, "peer", Some(&peer_label(peer_id)));
             insert_optional_str(row, "addr", Some(addr));
             insert_optional_str(row, "user_agent", Some(user_agent));
+        });
+    }
+
+    /// Record the startup `plan` row with every input, fixed term, reserve,
+    /// bulk floor/share/cap, `t`, each `b_r`, and resulting connection counts
+    /// (`02 §8`, `03 §5`).
+    pub(crate) fn emit_memory_plan(&self, plan: &super::memory::MemoryPlan) {
+        use super::memory::Consumer;
+        self.emit_with(MEMORY_TABLE, |row| {
+            row.insert("event".to_string(), Value::String("plan".to_string()));
+            insert_optional_str(row, "source", Some(plan.source));
+            insert_optional_str(row, "network", Some(plan.network_name));
+            insert_optional_u64(
+                row,
+                "host_budget_bytes",
+                Some(plan.derivation.host_budget_bytes),
+            );
+            insert_optional_u64(row, "base_bytes", Some(plan.derivation.base_bytes));
+            insert_optional_u64(row, "sidecar_bytes", Some(plan.derivation.sidecar_bytes));
+            insert_optional_u64(row, "rho_numerator", Some(plan.derivation.rho_numerator));
+            insert_optional_u64(
+                row,
+                "rho_denominator",
+                Some(plan.derivation.rho_denominator),
+            );
+            insert_optional_u64(row, "budget_b", Some(plan.pool_config.budget_b));
+            insert_optional_u64(row, "fixed_total", Some(plan.fixed.total()));
+            insert_optional_u64(row, "fixed_socket_queues", Some(plan.fixed.socket_queues));
+            insert_optional_u64(
+                row,
+                "fixed_incoming_buffers",
+                Some(plan.fixed.incoming_buffers),
+            );
+            insert_optional_u64(row, "fixed_handshakes", Some(plan.fixed.handshakes));
+            insert_optional_u64(row, "fixed_header_chain", Some(plan.fixed.header_chain));
+            insert_optional_u64(
+                row,
+                "fixed_discovery_tables",
+                Some(plan.fixed.discovery_tables),
+            );
+            insert_optional_u64(row, "fixed_tx_relay_maps", Some(plan.fixed.tx_relay_maps));
+            insert_optional_u64(row, "fixed_state_reads", Some(plan.fixed.state_reads));
+            insert_optional_u64(row, "fixed_mempool_pool", Some(plan.fixed.mempool_pool));
+            insert_optional_u64(
+                row,
+                "fixed_legacy_tcp_ingress",
+                Some(plan.fixed.legacy_tcp_ingress),
+            );
+            insert_optional_u64(row, "transport_base", Some(plan.bases.transport_base));
+            insert_optional_u64(
+                row,
+                "session_header_sync",
+                Some(plan.bases.header_sync.total()),
+            );
+            insert_optional_u64(
+                row,
+                "session_block_sync",
+                Some(plan.bases.block_sync.total()),
+            );
+            insert_optional_u64(row, "session_tx_relay", Some(plan.bases.tx_relay.total()));
+            insert_optional_u64(
+                row,
+                "session_legacy_compat",
+                Some(plan.bases.legacy_compat.total()),
+            );
+            insert_optional_u64(
+                row,
+                "session_custom_kinds",
+                Some(plan.bases.custom_kinds.total()),
+            );
+            insert_optional_u64(
+                row,
+                "full_connection_base",
+                Some(plan.bases.full_connection_bytes()),
+            );
+            insert_optional_u64(row, "shared_s", Some(plan.shared_capacity()));
+            insert_optional_u64(
+                row,
+                "min_connections",
+                Some(u64::try_from(plan.min_connections).unwrap_or(u64::MAX)),
+            );
+            insert_optional_u64(
+                row,
+                "connection_cap",
+                Some(u64::try_from(plan.connection_cap).unwrap_or(u64::MAX)),
+            );
+            insert_optional_u64(
+                row,
+                "planned_full_connections",
+                Some(u64::try_from(plan.planned_full_connections).unwrap_or(u64::MAX)),
+            );
+            insert_optional_u64(
+                row,
+                "planned_required_connections",
+                Some(u64::try_from(plan.planned_required_connections).unwrap_or(u64::MAX)),
+            );
+            for consumer in Consumer::ALL {
+                let label = consumer.label();
+                let spec = plan.consumer_spec(consumer);
+                row.insert(
+                    format!("{label}_floor"),
+                    Value::Number(Number::from(spec.floor)),
+                );
+                row.insert(
+                    format!("{label}_cap"),
+                    Value::Number(Number::from(spec.cap)),
+                );
+                row.insert(
+                    format!("{label}_weight"),
+                    Value::Number(Number::from(spec.weight)),
+                );
+                row.insert(
+                    format!("{label}_protected_share"),
+                    Value::Number(Number::from(plan.consumer_protected_share(consumer))),
+                );
+            }
         });
     }
 

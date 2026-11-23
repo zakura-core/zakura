@@ -182,7 +182,7 @@ const LEGACY_RESPONSE_CHUNK_BYTES: usize = 512 * 1024;
 const REQUEST_ID_BYTES: usize = 8;
 const RESPONSE_CHUNK_HEADER_BYTES: usize = REQUEST_ID_BYTES + 1;
 const NO_STOP_HASH: block::Hash = block::Hash([0; 32]);
-const LEGACY_GOSSIP_SERVICE_STREAMS: [Stream; 2] = [
+pub(crate) const LEGACY_GOSSIP_SERVICE_STREAMS: [Stream; 2] = [
     Stream {
         kind: ZAKURA_STREAM_GOSSIP,
         version: LEGACY_GOSSIP_VERSION,

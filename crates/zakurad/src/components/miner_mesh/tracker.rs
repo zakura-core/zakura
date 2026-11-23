@@ -30,10 +30,14 @@ pub(super) const REPUBLISH_INTERVAL: Duration = Duration::from_secs(60);
 /// Starts the task that counts the gateways named in recent best-chain blocks,
 /// reports the counts as metrics and hands the ranking to `publisher`.
 ///
+/// `local_gateway` is the node ID this node's own coinbases name, if it announces one. The
+/// tracker reports how many counted blocks name it.
+///
 /// The task runs until the state stops publishing tip changes.
 pub fn spawn<S, Tip>(
     state: S,
     tip_change: ChainTipChange,
+    local_gateway: Option<[u8; 32]>,
     publisher: RankingPublisher<Tip>,
 ) -> JoinHandle<()>
 where
@@ -49,7 +53,7 @@ where
     let network = tip_change.network().clone();
     tokio::spawn(
         async move {
-            let mut tracker = Tracker::new(network, state);
+            let mut tracker = Tracker::new(network, state).with_local_gateway(local_gateway);
             run(&mut tracker, tip_change, &publisher).await;
         }
         .in_current_span(),
@@ -128,7 +132,7 @@ pub(super) async fn run<S, Tip>(
         let republish_due = Instant::now() >= republish_at;
         if report || republish_due {
             let snapshot = tracker.snapshot();
-            record_metrics(&snapshot);
+            record_metrics(&snapshot, tracker.local_gateway);
             publisher.publish(&snapshot);
             republish_at = Instant::now() + REPUBLISH_INTERVAL;
         }
@@ -173,6 +177,8 @@ pub(super) struct Tracker<S> {
     /// blocks below it are not read either until the tip moves, so a pruned
     /// block costs one failed read per tip change.
     unreadable_from: Option<Height>,
+    /// The gateway this node's own coinbases name, if it announces one.
+    local_gateway: Option<[u8; 32]>,
 }
 
 impl<S> Tracker<S>
@@ -185,7 +191,14 @@ where
             set: RecentMinerSet::new(network),
             state,
             unreadable_from: None,
+            local_gateway: None,
         }
+    }
+
+    /// Reports how many counted blocks name `local_gateway`, this node's own gateway.
+    pub(super) fn with_local_gateway(mut self, local_gateway: Option<[u8; 32]>) -> Self {
+        self.local_gateway = local_gateway;
+        self
     }
 
     pub(super) fn snapshot(&self) -> MinerSetSnapshot {
@@ -296,10 +309,48 @@ where
     }
 }
 
-/// Reports how many gateways are named and how much of the window is read.
-fn record_metrics(snapshot: &MinerSetSnapshot) {
+/// Reports how many gateways are named, how much of the window is read, how many blocks the
+/// busiest gateway has, and how many name this node's own gateway.
+fn record_metrics(snapshot: &MinerSetSnapshot, local_gateway: Option<[u8; 32]>) {
     // Each is at most the number of heights in a two-day window.
     metrics::gauge!("mining.mesh.gateways").set(snapshot.gateways.len() as f64);
     metrics::gauge!("mining.mesh.window.checked").set(snapshot.checked as f64);
     metrics::gauge!("mining.mesh.window.total").set(snapshot.window_len() as f64);
+
+    let counts = gateway_block_counts(snapshot, local_gateway);
+    metrics::gauge!("mining.mesh.gateway.top_blocks").set(f64::from(counts.top));
+    metrics::gauge!("mining.mesh.announcing").set(f64::from(u8::from(local_gateway.is_some())));
+    if local_gateway.is_some() {
+        metrics::gauge!("mining.mesh.gateway.local_blocks").set(f64::from(counts.local));
+    }
+}
+
+/// The block counts the gateway metrics report.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) struct GatewayBlockCounts {
+    /// How many counted blocks name the busiest gateway, or zero when none is named.
+    pub(super) top: u32,
+    /// How many counted blocks name `local_gateway`, or zero when it is not named or unset.
+    pub(super) local: u32,
+}
+
+/// Reads the busiest gateway's count and this node's own gateway's count from `snapshot`.
+pub(super) fn gateway_block_counts(
+    snapshot: &MinerSetSnapshot,
+    local_gateway: Option<[u8; 32]>,
+) -> GatewayBlockCounts {
+    // The snapshot lists the gateway named in the most blocks first.
+    let top = snapshot
+        .gateways
+        .first()
+        .map_or(0, |gateway| gateway.blocks);
+    let local = local_gateway
+        .and_then(|id| {
+            snapshot
+                .gateways
+                .iter()
+                .find(|gateway| gateway.gateway_id == id)
+        })
+        .map_or(0, |gateway| gateway.blocks);
+    GatewayBlockCounts { top, local }
 }

@@ -1071,6 +1071,8 @@ impl StartCmd {
         let rpc_impl = rpc_impl
             .with_template_trace(template_path_trace)
             .with_local_services(config.network.handshake_services(advertised_services));
+        // The node ID this node's coinbases name, when it announces itself as a gateway.
+        let mut local_mesh_gateway = None;
         let rpc_impl = if config.mining.miner_mesh {
             let gateway = zakura_endpoint
                 .as_ref()
@@ -1081,6 +1083,7 @@ impl StartCmd {
             if config.mining.miner_address.is_some() {
                 info!(%gateway, "coinbases this node builds name it as the miner's gateway");
             }
+            local_mesh_gateway = Some(*gateway.as_bytes());
             rpc_impl.with_mesh_commitment(MinerMeshCommitment::new(*gateway.as_bytes()))
         } else {
             rpc_impl
@@ -1299,6 +1302,7 @@ impl StartCmd {
             let miner_mesh_task_handle = miner_mesh::spawn(
                 read_only_state_service.clone(),
                 chain_tip_change.clone(),
+                local_mesh_gateway,
                 publisher,
             );
             node_tasks.supervise("miner mesh tracker", miner_mesh_task_handle, |()| Ok(()));

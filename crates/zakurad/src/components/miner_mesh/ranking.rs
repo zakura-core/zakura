@@ -15,10 +15,10 @@ mod tests;
 /// The fewest counted blocks that must name a gateway before the network
 /// prefers it.
 ///
-/// A count this high costs a node that names another node's ID ten blocks
-/// every two days to keep a place at every mining node, and keeps a pool that
-/// mines a block now and then from taking places meant for regular miners.
-/// At 25-second blocks it is about 0.15% of a window.
+/// To keep a place at every mining node for another node's ID, a node must
+/// mine ten blocks naming it every two days. A pool that mines a block now and
+/// then does not take places meant for regular miners. At 25-second blocks
+/// ten is about 0.15% of a window.
 pub const MIN_GATEWAY_BLOCKS: u32 = 10;
 
 /// Returns the gateway ranking the network reads, and the publisher that

@@ -299,7 +299,7 @@ async fn markers_age_out() -> Result<()> {
     let (a, b) = (net.gateway_id(A), net.gateway_id(B));
 
     let first_marker = net.mine(A, MIN_GATEWAY_BLOCKS).await?.height.0 + 1 - MIN_GATEWAY_BLOCKS;
-    net.mine(B, 1).await?;
+    net.mine(B, MIN_GATEWAY_BLOCKS).await?;
     let mut tip = net.mine(M, QUALIFYING_DEPTH).await?.height.0;
     net.wait_for("B and M holding A", DISCOVERY_TIMEOUT, |net| {
         [B, M]

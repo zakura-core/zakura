@@ -57,24 +57,23 @@ gateway and the miners that prefer it must all run it to form a mesh.
 
 ## Prefer announced gateways
 
-Every node with `mining.miner_address` set counts the gateways named in the
-best chain's recent blocks, whether or not it announces one itself. The window
-is two days of blocks ending 100 blocks below the tip, so it holds about 2,304
-blocks at a 75-second spacing. The node reads each block as it reaches 100 deep,
-reads older blocks in the window when it has nothing newer to do, and repairs
-its counts after a reorg.
+Every node with `mining.miner_address` set counts the gateways named in the best
+chain's recent blocks, whether or not it announces one itself. The window is two
+days of blocks ending 100 blocks below the tip, so it holds about 6,912 blocks
+at a 25-second spacing (2,304 at the 75-second spacing before NU7). The node
+reads each block as it reaches 100 deep, reads older blocks in the window when
+it has nothing newer to do, and repairs its counts after a reorg.
 
 While its tip is recent enough to mine on, the node hands v2 networking the
 gateways named in at least 10 counted blocks. Networking ranks them by block
 count and keeps up to ten connection places for the highest-ranked gateways it
 can reach. A gateway named in fewer blocks is counted but not ranked, so the
-node neither dials it nor holds a place for it. Ten blocks is about 0.15% of a
-two-day window at a 25-second spacing: a pool that mines that rarely does not
-take a place, and a node that names another node's ID in its blocks must keep
-mining to hold that node a place. When the tracker
-next checks a stale tip, it publishes an empty ranking. Networking releases
-the held places when it applies that update. A node without a miner address
-holds no places.
+node neither dials it nor holds a place for it. Ten blocks is about 0.15% of the
+25-second window: a pool that mines that rarely does not take a place, and a node that
+names another node's ID in its blocks must keep mining to hold that node a
+place. When the tracker next checks a stale tip, it publishes an empty ranking.
+Networking releases the held places when it applies that update. A node without
+a miner address holds no places.
 
 ### What a held place grants
 

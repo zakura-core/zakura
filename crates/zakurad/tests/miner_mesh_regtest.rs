@@ -247,8 +247,9 @@ async fn a_full_node_still_reaches_a_gateway() -> Result<()> {
     Ok(())
 }
 
-/// A gateway already connected as an ordinary peer when its marker qualifies
-/// becomes preferred on the same connection, without a new one.
+/// A gateway already connected as an ordinary peer when the tenth of its
+/// markers qualifies becomes preferred on the same connection, without a new
+/// one.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "starts zakurad children: run with the miner-mesh-regtest nextest profile"]
 async fn a_connected_gateway_is_promoted_in_place() -> Result<()> {

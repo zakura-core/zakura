@@ -54,14 +54,10 @@ async fn first_padded_ping(link: &mut mpsc::Receiver<WarmupChunk>) -> WarmupChun
 }
 
 #[test]
-fn default_schedule_pads_more_than_a_full_block_in_two_pings() {
-    let schedule = TcpWarmupConfig::default().schedule();
-
-    assert_eq!(schedule, [0, 800_000, 1_600_000]);
-    let total: u32 = schedule.iter().sum();
-    assert!(
-        total > crate::constants::MAX_PING_PADDING,
-        "the padding grows the window past a full block"
+fn default_schedule_sends_two_padded_pings() {
+    assert_eq!(
+        TcpWarmupConfig::default().schedule(),
+        [0, 800_000, 1_600_000]
     );
 }
 
@@ -73,13 +69,40 @@ fn schedule_with_equal_first_and_max_sends_one_padded_ping() {
         ..TcpWarmupConfig::default()
     };
     assert_eq!(config.schedule(), [0, 1000]);
+}
 
+#[test]
+fn schedule_steps_up_to_a_custom_maximum() {
     let config = TcpWarmupConfig {
         first_chunk_bytes: 1000,
         max_chunk_bytes: 3000,
         ..TcpWarmupConfig::default()
     };
-    assert_eq!(config.schedule(), [0, 1000, 3000]);
+    assert_eq!(config.schedule(), [0, 1000, 2000, 3000]);
+}
+
+#[test]
+fn schedule_keeps_the_gradual_ramp_for_the_previous_defaults() {
+    let config = TcpWarmupConfig {
+        first_chunk_bytes: 14_000,
+        max_chunk_bytes: crate::constants::MAX_PING_PADDING,
+        ..TcpWarmupConfig::default()
+    };
+    assert_eq!(
+        config.schedule(),
+        [
+            0,
+            14_000,
+            28_000,
+            56_000,
+            112_000,
+            224_000,
+            448_000,
+            896_000,
+            1_792_000,
+            crate::constants::MAX_PING_PADDING,
+        ]
+    );
 }
 
 #[test]
@@ -265,6 +288,11 @@ async fn queued_padding_that_is_never_written_keeps_no_claim() {
     let queued = first_padded_ping(&mut chunks).await;
 
     driver.await.unwrap();
+    assert_eq!(
+        warmup.inner.permits.available_permits(),
+        config.max_concurrent,
+        "an expired queued ping does not occupy a warm-up slot"
+    );
     assert!(
         queued.written.send(()).is_err(),
         "the connection skips a ping whose warm-up stopped"

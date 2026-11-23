@@ -1,14 +1,21 @@
 //! Connection tests for warm-up pings.
 
-use futures::{channel::oneshot, SinkExt, StreamExt};
+use std::{net::Ipv4Addr, pin::pin, sync::Arc};
+
+use futures::{channel::oneshot, poll, SinkExt, StreamExt};
 use indexmap::IndexSet;
+use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore};
 use tracing::Span;
 
 use zakura_chain::block;
 use zakura_test::mock_service::PanicAssertion;
 
 use crate::{
-    peer::{tcp_warmup::WarmupChunk, ClientRequest},
+    config::TcpWarmupConfig,
+    peer::{
+        tcp_warmup::{TcpWarmup, WarmupChunk, WARMUP_QUEUE},
+        ClientRequest,
+    },
     protocol::external::{InventoryHash, Message},
     types::Nonce,
     Request, Response,
@@ -16,28 +23,81 @@ use crate::{
 
 use super::new_test_connection;
 
-/// The receivers that a warm-up task holds for one ping.
+/// The permit and receivers that a warm-up task holds for one ping.
 struct WarmupWaits {
+    _permit: Arc<OwnedSemaphorePermit>,
     written: tokio::sync::oneshot::Receiver<()>,
     pong: tokio::sync::oneshot::Receiver<()>,
 }
 
 /// Returns a warm-up ping and the receivers that fire on its write and its pong.
 fn warmup_chunk(nonce: Nonce, padding: u32) -> (WarmupChunk, WarmupWaits) {
+    let permit = Arc::new(Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap());
     let (written, written_rx) = tokio::sync::oneshot::channel();
     let (pong, pong_rx) = tokio::sync::oneshot::channel();
     (
         WarmupChunk {
             nonce,
             padding,
+            permit: Arc::downgrade(&permit),
             written,
             pong,
         },
         WarmupWaits {
+            _permit: permit,
             written: written_rx,
             pong: pong_rx,
         },
     )
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stalled_warmup_write_keeps_its_permit_past_the_pong_deadline() {
+    let config = TcpWarmupConfig {
+        max_concurrent: 1,
+        ..TcpWarmupConfig::default()
+    };
+    let (_tip_tx, tip_rx) = watch::channel(None);
+    let warmup = TcpWarmup::new(config, tip_rx);
+
+    let (first_tx, mut first_rx) = mpsc::channel(WARMUP_QUEUE);
+    let first = tokio::spawn(
+        warmup
+            .clone()
+            .run(Ipv4Addr::new(192, 0, 2, 1).into(), first_tx),
+    );
+    let probe = first_rx.recv().await.unwrap();
+    assert_eq!(probe.padding, 0);
+    probe.written.send(()).unwrap();
+    probe.pong.send(()).unwrap();
+
+    let padded = first_rx.recv().await.unwrap();
+    assert!(padded.padding > 0);
+    let (mut connection, _client_tx, _inbound, mut outbound, _error_slot) =
+        new_test_connection::<PanicAssertion>();
+    let mut write = pin!(connection.send_warmup_ping(padded));
+    assert!(
+        poll!(&mut write).is_pending(),
+        "the peer has not read the ping"
+    );
+    first.await.unwrap();
+
+    let (second_tx, mut second_rx) = mpsc::channel(WARMUP_QUEUE);
+    let mut second = pin!(warmup.run(Ipv4Addr::new(192, 0, 2, 2).into(), second_tx));
+    assert!(poll!(&mut second).is_pending());
+    assert_eq!(
+        second_rx.try_recv().unwrap_err(),
+        mpsc::error::TryRecvError::Empty,
+        "the next warm-up cannot start while the first write is pending"
+    );
+
+    assert!(matches!(
+        outbound.next().await,
+        Some(Message::PaddedPing { .. })
+    ));
+    write.await;
+    assert!(poll!(&mut second).is_pending());
+    assert_eq!(second_rx.try_recv().unwrap().padding, 0);
 }
 
 /// A warm-up pong that arrives while a heartbeat ping awaits its own pong reaches the warm-up,

@@ -22,7 +22,6 @@ use tracing::debug;
 use zakura_node_services::task::spawn_erased_named;
 use zakura_quic::{NodeAddr, NodeId};
 use zakura_rt::{
-    collections::HashSet,
     sync::{oneshot, watch},
     task::{AbortOnDropHandle, JoinHandle},
     time::Instant,
@@ -47,10 +46,7 @@ mod tests;
 #[cfg(any(test, feature = "p2p-fuzz"))]
 pub use replay::{replay_candidate_dial_bytes, CandidateDialReplaySummary};
 
-use preferred::{
-    admit_preferred_dials, classify_gateways, DeferredDials, PreferredGatewayInput, PreferredRoom,
-    PreferredRound, RoundClaims,
-};
+use preferred::{classify_gateways, PreferredPass, PreferredRound, RoundClaims};
 pub use preferred::{MinerGateway, MinerGatewayRanking};
 
 use state::{
@@ -154,12 +150,13 @@ pub(crate) async fn run_native_discovery_dialer(
     let shutdown = endpoint.background_shutdown_token();
     let trace = endpoint.trace();
     let mut state = CandidateDialerState::new(discovery.dial_backoff().await);
-    let preferred = PreferredGatewayInput::new(miner_gateways, endpoint.local_node_id());
+    let preferred = PreferredPass::new(
+        miner_gateways,
+        endpoint.local_node_id(),
+        discovery.max_concurrent_dials().await,
+    );
     let mut io = CandidateDialerIO {
         preferred,
-        deferred: DeferredDials::new(endpoint.local_node_id()),
-        max_concurrent_dials: discovery.max_concurrent_dials().await,
-        preferred_attempts: HashSet::default(),
         endpoint,
         discovery,
         limits,
@@ -202,14 +199,9 @@ struct CandidateDialerIO {
     discovery: ZakuraDiscoveryHandle,
     limits: ZakuraLocalLimits,
     sought_services: Vec<ZakuraServiceId>,
-    /// The mining gateways the node prefers to stay connected to.
-    preferred: PreferredGatewayInput,
-    /// The members whose dial waits out a grace.
-    deferred: DeferredDials,
-    /// The most dials, preferred or ordinary, in flight at once.
-    max_concurrent_dials: usize,
-    /// The attempts in flight that the preferred pass started.
-    preferred_attempts: HashSet<DialAttemptKey>,
+    /// The pass that dials the mining gateways the node prefers to stay
+    /// connected to.
+    preferred: PreferredPass,
     trace: ZakuraTrace,
     workers: FuturesUnordered<DiscoveryDialWorker>,
 }
@@ -243,12 +235,10 @@ impl CandidateDialerIO {
             .collect();
         let round = self.admit_round(state, &registered, Instant::now()).await;
         for (attempt, node_addr) in round.preferred {
-            self.preferred_attempts.insert(attempt);
-            metrics::counter!("zakura.p2p.discovery.dial.preferred.started").increment(1);
-            self.spawn_dial(attempt, node_addr).await;
+            self.spawn_dial(attempt, node_addr, true).await;
         }
         for (attempt, node_addr) in round.ordinary {
-            self.spawn_dial(attempt, node_addr).await;
+            self.spawn_dial(attempt, node_addr, false).await;
         }
     }
 
@@ -258,7 +248,7 @@ impl CandidateDialerIO {
     ///    it to the connection-slot checks ([`Self::publish_preferred_gateways`]);
     /// 2. admits the set's members, highest rank first, that are neither
     ///    connected nor being dialed, a member with a lower node ID only
-    ///    after a grace ([`admit_preferred_dials`]);
+    ///    after a grace ([`PreferredPass::admit`]);
     /// 3. admits the discovery book's other candidates with what is left
     ///    ([`admit_dial_round`]).
     async fn admit_round(
@@ -270,19 +260,15 @@ impl CandidateDialerIO {
         let round = self
             .publish_preferred_gateways(state, registered, now)
             .await;
-        let room = PreferredRoom {
-            connections: self.endpoint.preferred_dial_permits(),
-            address_attempts: self.endpoint.preferred_dial_capacity(),
-            dials: self
-                .max_concurrent_dials
-                .saturating_sub(state.in_flight_node_ids().len()),
-        };
-        let supervisor = self.endpoint.supervisor();
-        let (preferred, claims) = admit_preferred_dials(
+        let room = self.preferred.room(
             state,
-            &round.set,
-            &round.dialable,
-            &mut self.deferred,
+            self.endpoint.preferred_dial_permits(),
+            self.endpoint.preferred_dial_capacity(),
+        );
+        let supervisor = self.endpoint.supervisor();
+        let (preferred, claims) = self.preferred.admit(
+            state,
+            &round,
             room,
             |ip, in_flight| supervisor.can_accept_remote_ip_with_in_flight(ip, in_flight),
             now,
@@ -317,7 +303,7 @@ impl CandidateDialerIO {
         now: Instant,
     ) -> PreferredRound {
         let classified = classify_gateways(
-            self.preferred.current(),
+            self.preferred.ranked(),
             registered,
             state,
             &self.discovery,
@@ -333,8 +319,12 @@ impl CandidateDialerIO {
 
     /// Starts a worker that dials `node_addr` for `attempt` under discovery's
     /// transport ceiling, which leaves the dial reserve to bootstrap and
-    /// maintained dials.
-    async fn spawn_dial(&mut self, attempt: DialAttemptKey, node_addr: NodeAddr) {
+    /// maintained dials. `preferred` says the preferred pass admitted it.
+    async fn spawn_dial(&mut self, attempt: DialAttemptKey, node_addr: NodeAddr, preferred: bool) {
+        if preferred {
+            self.preferred.started(attempt);
+            metrics::counter!("zakura.p2p.discovery.dial.preferred.started").increment(1);
+        }
         self.discovery.mark_dial_attempt(&attempt.node_id).await;
         metrics::counter!("zakura.p2p.discovery.dial.started").increment(1);
         trace_dial_phase(&self.trace, attempt, DialPhase::Recorded);
@@ -358,7 +348,7 @@ impl CandidateDialerIO {
         outcome: DiscoveryDialOutcome,
     ) {
         trace_dial_phase(&self.trace, attempt, outcome.phase);
-        let preferred = self.preferred_attempts.remove(&attempt);
+        let preferred = self.preferred.settled(&attempt);
         let admitted_ip = outcome.admitted_addr.map(|addr| addr.ip());
         if !state.complete(attempt, outcome.result, admitted_ip, Instant::now()) {
             return;
@@ -382,7 +372,7 @@ impl CandidateDialerIO {
         for worker in &self.workers {
             worker.task.abort();
         }
-        self.preferred_attempts.clear();
+        self.preferred.clear();
         while let Some((attempt, outcome)) = self.workers.next().await {
             trace_dial_phase(&self.trace, attempt, outcome.phase);
             let admitted_ip = outcome.admitted_addr.map(|addr| addr.ip());

@@ -39,10 +39,11 @@ pub(super) async fn dialer(
     let endpoint = node.endpoint();
     let discovery = node.discovery();
     let io = CandidateDialerIO {
-        preferred: PreferredGatewayInput::new(Some(ranking_rx), endpoint.local_node_id()),
-        deferred: DeferredDials::new(endpoint.local_node_id()),
-        max_concurrent_dials: discovery.max_concurrent_dials().await,
-        preferred_attempts: HashSet::default(),
+        preferred: PreferredPass::new(
+            Some(ranking_rx),
+            endpoint.local_node_id(),
+            discovery.max_concurrent_dials().await,
+        ),
         trace: endpoint.trace(),
         limits: node.limits().clone(),
         sought_services: Vec::new(),

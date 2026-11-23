@@ -698,10 +698,11 @@ async fn shutdown_joins_started_and_unpolled_workers_before_discarding_reservati
         discovery: node.discovery(),
         limits: node.limits().clone(),
         sought_services: Vec::new(),
-        preferred: PreferredGatewayInput::new(None, node.endpoint().local_node_id()),
-        deferred: DeferredDials::new(node.endpoint().local_node_id()),
-        max_concurrent_dials: DEFAULT_MAX_CONCURRENT_DISCOVERY_DIALS,
-        preferred_attempts: HashSet::default(),
+        preferred: PreferredPass::new(
+            None,
+            node.endpoint().local_node_id(),
+            DEFAULT_MAX_CONCURRENT_DISCOVERY_DIALS,
+        ),
         trace: node.endpoint().trace(),
         workers: FuturesUnordered::new(),
     };
@@ -1556,10 +1557,11 @@ async fn finished_workers_settle_before_the_round_starts() {
         discovery: node.discovery(),
         limits: ZakuraLocalLimits::from_config(&crate::Config::default()),
         sought_services: Vec::new(),
-        preferred: PreferredGatewayInput::new(None, node.endpoint().local_node_id()),
-        deferred: DeferredDials::new(node.endpoint().local_node_id()),
-        max_concurrent_dials: DEFAULT_MAX_CONCURRENT_DISCOVERY_DIALS,
-        preferred_attempts: HashSet::default(),
+        preferred: PreferredPass::new(
+            None,
+            node.endpoint().local_node_id(),
+            DEFAULT_MAX_CONCURRENT_DISCOVERY_DIALS,
+        ),
         trace: endpoint.trace(),
         workers: FuturesUnordered::new(),
     };
@@ -1740,10 +1742,11 @@ async fn every_dial_reservation_returns_to_baseline_after_each_exit() {
         discovery: node.discovery(),
         limits: node.limits().clone(),
         sought_services: Vec::new(),
-        preferred: PreferredGatewayInput::new(None, node.endpoint().local_node_id()),
-        deferred: DeferredDials::new(node.endpoint().local_node_id()),
-        max_concurrent_dials: DEFAULT_MAX_CONCURRENT_DISCOVERY_DIALS,
-        preferred_attempts: HashSet::default(),
+        preferred: PreferredPass::new(
+            None,
+            node.endpoint().local_node_id(),
+            DEFAULT_MAX_CONCURRENT_DISCOVERY_DIALS,
+        ),
         trace: node.endpoint().trace(),
         workers: FuturesUnordered::new(),
     };

@@ -26,7 +26,9 @@ use crate::zakura::{GatewayStanding, RankedGateway, MAX_RANKED_GATEWAYS};
 /// The list may be in any order. The dialer ranks gateways by block count,
 /// most first, and by lower ID bytes among equal counts, and considers only
 /// the first 256 by rank. zakurad converts the chain crate's gateway counts
-/// into this type in one place.
+/// into this type in one place. It is the node's raw input; the dialer turns
+/// it into [`RankedGateway`]s, which carry each gateway's [`GatewayStanding`]
+/// for the connection-slot checks.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MinerGatewayRanking {
     /// Every gateway named in the counted blocks.
@@ -84,7 +86,7 @@ fn rank_gateways(ranking: &MinerGatewayRanking, local_node_id: NodeId) -> Vec<Ra
 /// The latest ranking the node handed the dialer, converted once per change.
 ///
 /// Without a channel, or once its sender is gone, the ranking is empty.
-pub(super) struct PreferredGatewayInput {
+struct PreferredGatewayInput {
     ranking: Option<watch::Receiver<MinerGatewayRanking>>,
     local_node_id: NodeId,
     ranked: Vec<RankedGateway>,
@@ -92,7 +94,7 @@ pub(super) struct PreferredGatewayInput {
 
 impl PreferredGatewayInput {
     /// Reads `ranking` for a node whose own ID is `local_node_id`.
-    pub(super) fn new(
+    fn new(
         mut ranking: Option<watch::Receiver<MinerGatewayRanking>>,
         local_node_id: NodeId,
     ) -> Self {
@@ -109,7 +111,7 @@ impl PreferredGatewayInput {
 
     /// Returns the ranked gateways, best first, converting the ranking again
     /// only if it changed since the last call.
-    pub(super) fn current(&mut self) -> &[RankedGateway] {
+    fn current(&mut self) -> &[RankedGateway] {
         if let Some(ranking) = &mut self.ranking {
             match ranking.has_changed() {
                 Ok(false) => {}
@@ -280,9 +282,35 @@ impl DeferredDials {
         }
     }
 
-    /// Whether a dial to `member` waits before it starts.
-    fn waits_for(&self, member: &NodeId) -> bool {
-        member.as_bytes() < self.local_node_id.as_bytes()
+    /// Starts a round: keeps only the members of `set` that are in `dialable`
+    /// and have a lower node ID than this node's, each with the time this
+    /// node first found it dialable, or `now` if it is new.
+    fn refresh(
+        &mut self,
+        set: &[NodeId],
+        dialable: &HashMap<NodeId, ZakuraDiscoveryDialCandidate>,
+        now: Instant,
+    ) {
+        let waited = std::mem::take(&mut self.waiting);
+        self.waiting = set
+            .iter()
+            .filter(|member| {
+                dialable.contains_key(*member) && member.as_bytes() < self.local_node_id.as_bytes()
+            })
+            .map(|member| (*member, waited.get(member).copied().unwrap_or(now)))
+            .collect();
+    }
+
+    /// Whether a dial to `member` still waits out [`MUTUAL_DIAL_GRACE`] at `now`.
+    fn is_waiting(&self, member: &NodeId, now: Instant) -> bool {
+        self.waiting
+            .get(member)
+            .is_some_and(|since| now.saturating_duration_since(*since) < MUTUAL_DIAL_GRACE)
+    }
+
+    /// Forgets `member` once its dial starts.
+    fn release(&mut self, member: &NodeId) {
+        self.waiting.remove(member);
     }
 }
 
@@ -319,12 +347,7 @@ pub(super) fn admit_preferred_dials(
     accepts_ip: impl Fn(IpAddr, usize) -> bool,
     now: Instant,
 ) -> (Vec<(DialAttemptKey, NodeAddr)>, RoundClaims) {
-    let waited = std::mem::take(&mut deferred.waiting);
-    deferred.waiting = set
-        .iter()
-        .filter(|member| dialable.contains_key(*member) && deferred.waits_for(member))
-        .map(|member| (*member, waited.get(member).copied().unwrap_or(now)))
-        .collect();
+    deferred.refresh(set, dialable, now);
     let mut admitted = Vec::new();
     let mut claims = RoundClaims::default();
     for member in set {
@@ -339,11 +362,7 @@ pub(super) fn admit_preferred_dials(
         let Some(candidate) = dialable.get(member) else {
             continue;
         };
-        if deferred
-            .waiting
-            .get(member)
-            .is_some_and(|since| now.saturating_duration_since(*since) < MUTUAL_DIAL_GRACE)
-        {
+        if deferred.is_waiting(member, now) {
             continue;
         }
         let Some((node_addr, reserved_ips)) =
@@ -358,12 +377,100 @@ pub(super) fn admit_preferred_dials(
         let Some(attempt) = state.record_attempt(*member, reserved_ips) else {
             continue;
         };
-        deferred.waiting.remove(member);
+        deferred.release(member);
         claims.dials += 1;
         claims.address_attempts += attempts;
         admitted.push((attempt, node_addr));
     }
     (admitted, claims)
+}
+
+/// What the dialer keeps between rounds for its preferred pass: the ranking
+/// it reads, the dials it defers, and the attempts it has in flight.
+pub(super) struct PreferredPass {
+    input: PreferredGatewayInput,
+    deferred: DeferredDials,
+    /// The most dials, preferred or ordinary, in flight at once.
+    max_concurrent_dials: usize,
+    /// The attempts in flight that this pass started.
+    attempts: HashSet<DialAttemptKey>,
+}
+
+impl PreferredPass {
+    /// Prepares the pass for a node whose own ID is `local_node_id`, reading
+    /// `ranking` (none ranks no gateway), within `max_concurrent_dials`.
+    pub(super) fn new(
+        ranking: Option<watch::Receiver<MinerGatewayRanking>>,
+        local_node_id: NodeId,
+        max_concurrent_dials: usize,
+    ) -> Self {
+        Self {
+            input: PreferredGatewayInput::new(ranking, local_node_id),
+            deferred: DeferredDials::new(local_node_id),
+            max_concurrent_dials,
+            attempts: HashSet::default(),
+        }
+    }
+
+    /// Returns the ranked gateways, best first, as [`PreferredGatewayInput`]
+    /// does.
+    pub(super) fn ranked(&mut self) -> &[RankedGateway] {
+        self.input.current()
+    }
+
+    /// Returns the room one round's pass may use, given the free
+    /// `connections` and `address_attempts` the endpoint reports and the
+    /// dials `state` already has in flight.
+    pub(super) fn room(
+        &self,
+        state: &CandidateDialerState,
+        connections: usize,
+        address_attempts: usize,
+    ) -> PreferredRoom {
+        PreferredRoom {
+            connections,
+            address_attempts,
+            dials: self
+                .max_concurrent_dials
+                .saturating_sub(state.in_flight_count()),
+        }
+    }
+
+    /// Admits the round's dials as [`admit_preferred_dials`] does, keeping the
+    /// grace of the members it defers for the next round.
+    pub(super) fn admit(
+        &mut self,
+        state: &mut CandidateDialerState,
+        round: &PreferredRound,
+        room: PreferredRoom,
+        accepts_ip: impl Fn(IpAddr, usize) -> bool,
+        now: Instant,
+    ) -> (Vec<(DialAttemptKey, NodeAddr)>, RoundClaims) {
+        admit_preferred_dials(
+            state,
+            &round.set,
+            &round.dialable,
+            &mut self.deferred,
+            room,
+            accepts_ip,
+            now,
+        )
+    }
+
+    /// Records that this pass started `attempt`.
+    pub(super) fn started(&mut self, attempt: DialAttemptKey) {
+        self.attempts.insert(attempt);
+    }
+
+    /// Forgets `attempt` as settled, and returns whether this pass started it.
+    pub(super) fn settled(&mut self, attempt: &DialAttemptKey) -> bool {
+        self.attempts.remove(attempt)
+    }
+
+    /// Forgets every attempt, as the dialer does when it shuts down.
+    pub(super) fn clear(&mut self) {
+        self.attempts.clear();
+    }
 }
 
 #[cfg(all(test, not(zakura_sim)))]

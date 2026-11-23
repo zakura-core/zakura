@@ -241,6 +241,11 @@ impl CandidateDialerState {
         self.in_flight.keys().copied().collect()
     }
 
+    /// Returns how many nodes have an attempt in flight.
+    pub(super) fn in_flight_count(&self) -> usize {
+        self.in_flight.len()
+    }
+
     /// Returns the number of in-flight attempts that reserved `ip`'s
     /// admission host.
     pub(super) fn in_flight_dials_to(&self, ip: IpAddr) -> usize {

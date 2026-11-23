@@ -2193,7 +2193,7 @@ where
     async fn get_deprecation_info(&self) -> Result<GetDeprecationInfoResponse> {
         let end_of_service = self
             .end_of_support_height
-            // End of support is only enforced on Mainnet. Match zcashd by
+            // A release's support only ends on Mainnet. Match zcashd by
             // omitting `end_of_service` on other networks.
             .filter(|_| self.network == Network::Mainnet)
             .map(|end_of_support_height| {

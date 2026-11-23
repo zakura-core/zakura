@@ -66,6 +66,8 @@ fn window_ending_before_last_upgrade(blocks: u32) -> SupportWindow {
 #[test]
 #[should_panic(expected = "Zakura refuses to run past the last supported Mainnet height")]
 fn end_of_support_panic() {
+    let (_logs, dispatch) = log_capture::capture_logs();
+    let _log_guard = tracing::dispatcher::set_default(&dispatch);
     // We are in panic
     let panic = last_supported_height().0 + 1;
 
@@ -99,6 +101,8 @@ fn end_of_support_function() {
 /// Test that end of support is only reported and enforced on Mainnet.
 #[test]
 fn end_of_support_height_per_network() {
+    let (_logs, dispatch) = log_capture::capture_logs();
+    let _log_guard = tracing::dispatcher::set_default(&dispatch);
     let last_supported_height = last_supported_height();
     assert_eq!(
         end_of_support::end_of_support_height(&Network::Mainnet),
@@ -305,6 +309,32 @@ async fn end_of_support_task() -> Result<()> {
     Ok(())
 }
 
+/// Check that the task halts the node once the tip is past the support window,
+/// unless the halt is turned off.
+#[tokio::test(start_paused = true)]
+async fn end_of_support_task_halts_past_the_support_window() -> Result<()> {
+    let (_logs, dispatch) = log_capture::capture_logs();
+    let (latest_chain_tip, latest_chain_tip_sender) = MockChainTip::new();
+    latest_chain_tip_sender.send_best_tip_height(Height(last_supported_height().0 + 1));
+
+    let eos_task = tokio::spawn(
+        end_of_support::start(Config::default(), Some(mainnet_window()), latest_chain_tip)
+            .with_subscriber(dispatch),
+    );
+
+    let halt = tokio::time::timeout(Duration::from_secs(15), eos_task)
+        .await
+        .expect("the first check runs soon after the task starts")
+        .expect_err("the task panics past the support window");
+    let panic_message = halt
+        .into_panic()
+        .downcast::<String>()
+        .expect("the halt panics with a formatted message");
+    assert!(panic_message.contains(EOS_PANIC_MESSAGE_HEADER));
+
+    Ok(())
+}
+
 /// Check that the task of a release that runs unsupported warns about a network
 /// upgrade ahead soon after it starts, and again at every check.
 ///
@@ -395,11 +425,13 @@ const UPGRADE_ACTIVATED_UNSUPPORTED: &str = "end_of_support.upgrade_activated_un
 async fn halting_task_reports_its_support_window() -> Result<()> {
     let gauges = gauge_capture::CapturedGauges::default();
     let _gauge_guard = metrics::set_default_local_recorder(&gauges);
+    let (_logs, dispatch) = log_capture::capture_logs();
     let (latest_chain_tip, latest_chain_tip_sender) = MockChainTip::new();
     latest_chain_tip_sender.send_best_tip_height(Height(10));
 
     let eos_future =
-        end_of_support::start(Config::default(), Some(mainnet_window()), latest_chain_tip);
+        end_of_support::start(Config::default(), Some(mainnet_window()), latest_chain_tip)
+            .with_subscriber(dispatch);
     tokio::time::timeout(Duration::from_secs(15), eos_future)
         .await
         .expect_err("the task keeps running while the release is supported");
@@ -425,16 +457,16 @@ async fn halting_task_reports_its_support_window() -> Result<()> {
 async fn task_that_keeps_running_reports_the_upgrade_after_its_window() -> Result<()> {
     let gauges = gauge_capture::CapturedGauges::default();
     let _gauge_guard = metrics::set_default_local_recorder(&gauges);
+    let (_logs, dispatch) = log_capture::capture_logs();
     let window = window_ending_before_last_upgrade(1_000);
     let activation_height = last_mainnet_activation_height();
     let (latest_chain_tip, latest_chain_tip_sender) = MockChainTip::new();
     latest_chain_tip_sender.send_best_tip_height(Height(activation_height.0 - 100));
 
-    let eos_task = tokio::spawn(end_of_support::start(
-        KEEPS_RUNNING,
-        Some(window),
-        latest_chain_tip,
-    ));
+    let eos_task = tokio::spawn(
+        end_of_support::start(KEEPS_RUNNING, Some(window), latest_chain_tip)
+            .with_subscriber(dispatch),
+    );
 
     // The tip is 900 blocks past the window and 100 before the upgrade.
     tokio::time::sleep(Duration::from_secs(15)).await;

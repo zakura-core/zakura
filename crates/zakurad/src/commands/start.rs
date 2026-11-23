@@ -1067,6 +1067,10 @@ impl StartCmd {
         // Create a channel to send mined blocks to the gossip task
         let submit_block_channel = EarlyMinedBlockChannel::new();
 
+        // The RPC server reports the end of this window, and a task checks the tip against it.
+        let support_window =
+            sync::end_of_support::SupportWindow::of_release(&config.network.network);
+
         // Launch RPC server
         let (rpc_impl, rpc_tx_queue_handle) = zakura_rpc::node::new_rpc_impl(
             config.network.network.clone(),
@@ -1092,7 +1096,9 @@ impl StartCmd {
             LAST_WARN_ERROR_LOG_SENDER.subscribe(),
             Some(submit_block_channel.sender()),
             pending_blocks,
-            sync::end_of_support::end_of_support_height(&config.network.network),
+            support_window
+                .as_ref()
+                .map(sync::end_of_support::SupportWindow::last_supported_height),
         );
         let rpc_impl = rpc_impl
             .with_template_trace(template_path_trace)
@@ -1298,7 +1304,7 @@ impl StartCmd {
         let end_of_support_task_handle = spawn_erased(
             sync::end_of_support::start(
                 config.end_of_support,
-                sync::end_of_support::SupportWindow::of_release(&config.network.network),
+                support_window,
                 latest_chain_tip.clone(),
             )
             .in_current_span(),

@@ -4409,7 +4409,7 @@ fn retired_seed_ids_never_stop_startup() -> Result<()> {
     let retired = "1398f62c6d1a457c51ba6a4b5f3dbd2f69fca93216218dc8997e416bd17d93ca";
     let current = "a5f148b592404c5fcdc27f06919681c1dceddb274336abf5c91e70780471bc12";
     let retired_entry = format!("{retired}@127.0.0.1:1");
-    let rewritten = regex::escape("rewrote zakura.bootstrap_peers in the config file");
+    let rewritten = regex::escape("rewrote default seeds' retired node IDs");
     let not_rewritten = regex::escape("could not rewrite the config file");
     let warning = regex::escape("names a default seed by the node ID it had before");
 
@@ -4443,7 +4443,7 @@ fn retired_seed_ids_never_stop_startup() -> Result<()> {
         Ok(matched)
     };
 
-    // A file with a retired ID is rewritten, and nothing is left to warn about.
+    // A file with a retired ID is rewritten in place, and nothing is left to warn about.
     let mut config = default_test_config(&Mainnet);
     config.network.zakura.bootstrap_peers = vec![retired_entry.clone()];
     let dir = testdir()?.with_config(&mut config)?;
@@ -4455,7 +4455,6 @@ fn retired_seed_ids_never_stop_startup() -> Result<()> {
     assert!(matched[1].contains("Starting zakurad"), "{}", matched[1]);
     let file = fs::read_to_string(dir.path().join("zakura.toml"))?;
     assert!(file.contains(current) && !file.contains(retired), "{file}");
-    assert!(dir.path().join("zakura.toml.pre-pq-seed-ids.bak").exists());
 
     // A file the rewrite cannot read as UTF-8 still loads, since the loader is lossy.
     // Startup warns, leaves the file alone and dials the current ID.
@@ -4489,7 +4488,6 @@ fn retired_seed_ids_never_stop_startup() -> Result<()> {
         &[warning.as_str(), "Starting zakurad"],
     )?;
     assert_eq!(fs::read(&config_path)?, before, "the file is left alone");
-    assert!(!dir.path().join("zakura.toml.pre-pq-seed-ids.bak").exists());
 
     Ok(())
 }

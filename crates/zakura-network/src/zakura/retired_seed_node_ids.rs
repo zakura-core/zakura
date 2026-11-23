@@ -75,30 +75,46 @@ const RETIRED_ZAKURA_SEED_NODE_IDS: &[(&str, &str)] = &[
     ),
 ];
 
-/// Returns `entry`, a `node_id@direct_addr` bootstrap peer, with a default seed's retired
-/// node ID replaced by its current one. The address stays as written, since a node ID
-/// names a key rather than an address.
+/// Returns, for each of `entries`, the `node_id@direct_addr` bootstrap peers of one list,
+/// the entry with a default seed's retired node ID replaced by the seed's current ID, or
+/// `None` to keep the entry as it is. The address stays as written, since a node ID names
+/// a key rather than an address.
 ///
-/// Returns `None` for any other entry, including one that does not parse.
+/// An entry is kept when the list already names that seed by its current ID. Its
+/// addresses would otherwise join the current ID's into one wider bootstrap dial, which
+/// startup can refuse; the kept entry only fails its identity check, as it already does.
+/// Entries that do not parse are kept.
 #[doc(hidden)]
-pub fn replace_retired_seed_node_id(entry: &str) -> Option<String> {
-    let (node_id, direct_addr) = entry.split_once('@')?;
-    let node_id = NodeId::from_str(node_id).ok()?;
-    RETIRED_ZAKURA_SEED_NODE_IDS
+pub fn retired_seed_replacements(entries: &[&str]) -> Vec<Option<String>> {
+    let node_id = |entry: &str| NodeId::from_str(entry.split_once('@')?.0).ok();
+    let listed: Vec<NodeId> = entries.iter().filter_map(|entry| node_id(entry)).collect();
+
+    entries
         .iter()
-        .find(|(retired, _)| NodeId::from_str(retired).ok() == Some(node_id))
-        .map(|(_, current)| format!("{current}@{direct_addr}"))
+        .map(|entry| {
+            let id = node_id(entry)?;
+            let (_, direct_addr) = entry.split_once('@')?;
+            let current = RETIRED_ZAKURA_SEED_NODE_IDS
+                .iter()
+                .find(|(retired, _)| NodeId::from_str(retired).ok() == Some(id))
+                .map(|(_, current)| *current)?;
+            let current_id = NodeId::from_str(current).ok()?;
+            (!listed.contains(&current_id)).then(|| format!("{current}@{direct_addr}"))
+        })
+        .collect()
 }
 
 impl ZakuraConfig {
     /// Replaces each bootstrap peer that names a default seed by its retired node ID with
-    /// the seed's current ID, see [`replace_retired_seed_node_id`].
+    /// the seed's current ID, see [`retired_seed_replacements`].
     ///
     /// Returns the `(old, new)` entries it replaced, in list order.
     pub fn replace_retired_seed_node_ids(&mut self) -> Vec<(String, String)> {
+        let entries: Vec<&str> = self.bootstrap_peers.iter().map(String::as_str).collect();
+        let replacements = retired_seed_replacements(&entries);
         let mut replaced = Vec::new();
-        for entry in &mut self.bootstrap_peers {
-            if let Some(current) = replace_retired_seed_node_id(entry) {
+        for (entry, replacement) in self.bootstrap_peers.iter_mut().zip(replacements) {
+            if let Some(current) = replacement {
                 replaced.push((std::mem::replace(entry, current.clone()), current));
             }
         }

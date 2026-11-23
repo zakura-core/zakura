@@ -42,8 +42,8 @@ fn config_file(text: &str) -> (tempfile::TempDir, PathBuf) {
     (dir, path)
 }
 
-/// In each layout, only the retired IDs change, the rest of the file stays byte for
-/// byte, and the backup holds the original.
+/// In each layout, only the retired IDs change and the rest of the file stays byte for
+/// byte, with no other file created.
 #[test]
 fn rewrite_replaces_only_retired_ids_in_every_layout() {
     let (old_a, new_a) = retired_entry(0, "192.0.2.1:8234");
@@ -60,12 +60,10 @@ fn rewrite_replaces_only_retired_ids_in_every_layout() {
     ];
 
     for original in layouts {
-        let (_dir, path) = config_file(&original);
+        let (dir, path) = config_file(&original);
 
         let outcome = rewrite_config_file(&path).expect("rewrite succeeds");
 
-        let path = fs::canonicalize(&path).expect("config exists");
-        let backup = with_suffix(&path, BACKUP_SUFFIX);
         assert_eq!(
             outcome,
             RewriteOutcome::Rewrote {
@@ -74,12 +72,15 @@ fn rewrite_replaces_only_retired_ids_in_every_layout() {
                     (old_a.clone(), new_a.clone()),
                     (old_b.clone(), new_b.clone())
                 ],
-                backup: backup.clone(),
             }
         );
         let expected = original.replace(&old_a, &new_a).replace(&old_b, &new_b);
         assert_eq!(fs::read_to_string(&path).unwrap(), expected);
-        assert_eq!(fs::read_to_string(&backup).unwrap(), original);
+        assert_eq!(
+            fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "no other file"
+        );
 
         assert_eq!(
             rewrite_config_file(&path).expect("second rewrite succeeds"),
@@ -88,7 +89,7 @@ fn rewrite_replaces_only_retired_ids_in_every_layout() {
     }
 }
 
-/// A file without retired IDs, or without the setting, is not written and gets no backup.
+/// A file without retired IDs, or without the setting, is not written.
 #[test]
 fn rewrite_leaves_other_files_alone() {
     let current = DEFAULT_ENTRY.to_string();
@@ -97,32 +98,62 @@ fn rewrite_leaves_other_files_alone() {
         "[network]\nnetwork = \"Testnet\"\n".to_string(),
         String::new(),
     ] {
-        let (dir, path) = config_file(&original);
+        let (_dir, path) = config_file(&original);
 
         assert_eq!(
             rewrite_config_file(&path).unwrap(),
             RewriteOutcome::Unchanged
         );
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
-        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1, "no backup");
     }
 }
 
-/// An earlier backup is the first original, so a later rewrite keeps it.
+/// A file that already names a seed by its current ID keeps the seed's retired entry, so
+/// the two never join into one wider bootstrap dial.
 #[test]
-fn rewrite_keeps_an_existing_backup() {
-    let (old, new) = retired_entry(1, "192.0.2.1:8234");
-    let original = one_entry_file(&old);
+fn rewrite_keeps_a_retired_entry_when_the_current_id_is_listed() {
+    let (old, _) = retired_entry(0, "192.0.2.1:8234");
+    let (_, new) = retired_entry(0, "192.0.2.2:8234");
+    let original = format!("network.zakura.bootstrap_peers = [\"{old}\", \"{new}\"]\n");
     let (_dir, path) = config_file(&original);
-    let backup = with_suffix(&fs::canonicalize(&path).unwrap(), BACKUP_SUFFIX);
-    fs::write(&backup, "first original").unwrap();
+
+    assert_eq!(
+        rewrite_config_file(&path).unwrap(),
+        RewriteOutcome::Unchanged
+    );
+    assert_eq!(fs::read_to_string(&path).unwrap(), original);
+}
+
+/// The file is written in place, so it keeps its inode and with it its owner, permissions
+/// and access control lists.
+#[cfg(unix)]
+#[test]
+fn rewrite_keeps_the_file() {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let (old, _new) = retired_entry(0, "192.0.2.1:8234");
+    let (_dir, path) = config_file(&one_entry_file(&old));
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+    let before = fs::metadata(&path).unwrap();
 
     rewrite_config_file(&path).expect("rewrite succeeds");
 
-    assert_eq!(fs::read_to_string(&backup).unwrap(), "first original");
+    let after = fs::metadata(&path).unwrap();
     assert_eq!(
-        fs::read_to_string(&path).unwrap(),
-        original.replace(&old, &new)
+        (
+            after.dev(),
+            after.ino(),
+            after.uid(),
+            after.gid(),
+            after.mode()
+        ),
+        (
+            before.dev(),
+            before.ino(),
+            before.uid(),
+            before.gid(),
+            before.mode()
+        ),
     );
 }
 
@@ -163,22 +194,21 @@ fn rewrite_keeps_a_byte_order_mark() {
     );
 }
 
-/// A failed write reports an error, leaves the config as it was, and removes the backup
-/// it made.
+/// A file that changed after it was read, for example because a new config was installed,
+/// is not written.
 #[test]
-fn failed_write_leaves_the_file_alone() {
+fn changed_file_is_not_written() {
     let (old, _new) = retired_entry(1, "192.0.2.1:8234");
     let original = one_entry_file(&old);
     let (_dir, path) = config_file(&original);
-    // A directory where the temp file goes makes the write fail, even for root.
-    let temp = format!(".tmp.{}", std::process::id());
-    fs::create_dir(with_suffix(&fs::canonicalize(&path).unwrap(), &temp)).unwrap();
+    let (edits, _) = id_edits(&original).unwrap();
+    let installed = one_entry_file(&format!("{}@192.0.2.5:8234", "ab".repeat(32)));
+    fs::write(&path, &installed).unwrap();
 
-    let error = rewrite_config_file(&path).expect_err("the temp file cannot be written");
+    let error = write_if_unchanged(&path, &original, &edits).expect_err("the file changed");
 
-    assert!(matches!(error, RewriteError::Io { .. }), "{error}");
-    assert_eq!(fs::read_to_string(&path).unwrap(), original);
-    assert!(!with_suffix(&fs::canonicalize(&path).unwrap(), BACKUP_SUFFIX).exists());
+    assert!(matches!(error, RewriteError::Changed { .. }), "{error}");
+    assert_eq!(fs::read_to_string(&path).unwrap(), installed);
 }
 
 /// A read-only config is the operator's to change, so it is left alone.
@@ -186,66 +216,23 @@ fn failed_write_leaves_the_file_alone() {
 fn rewrite_leaves_a_read_only_file_alone() {
     let (old, _new) = retired_entry(0, "192.0.2.1:8234");
     let original = one_entry_file(&old);
-    let (dir, path) = config_file(&original);
+    let (_dir, path) = config_file(&original);
     let mut permissions = fs::metadata(&path).unwrap().permissions();
     permissions.set_readonly(true);
     fs::set_permissions(&path, permissions).unwrap();
 
+    // Root can open a read-only file for writing, so the explicit check refuses it;
+    // anyone else is refused by the open.
     let error = rewrite_config_file(&path).expect_err("the file is read-only");
 
-    assert!(matches!(error, RewriteError::ReadOnly { .. }), "{error}");
+    assert!(
+        matches!(
+            error,
+            RewriteError::ReadOnly { .. } | RewriteError::Io { .. }
+        ),
+        "{error}"
+    );
     assert_eq!(fs::read_to_string(&path).unwrap(), original);
-    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1, "no backup");
-}
-
-/// The rewritten file keeps its owner. Changing a file's owner needs root, so this only
-/// checks anything when the tests run as root.
-#[cfg(unix)]
-#[test]
-fn rewrite_keeps_the_owner() {
-    use std::os::unix::fs::MetadataExt as _;
-
-    let (old, _new) = retired_entry(0, "192.0.2.1:8234");
-    let (_dir, path) = config_file(&one_entry_file(&old));
-    if std::os::unix::fs::chown(&path, Some(4321), Some(4321)).is_err() {
-        return;
-    }
-
-    rewrite_config_file(&path).expect("rewrite succeeds");
-
-    let metadata = fs::metadata(&path).unwrap();
-    assert_eq!((metadata.uid(), metadata.gid()), (4321, 4321));
-}
-
-/// The loaded config gets the same replacement as the file, and an entry the file does not
-/// hold, such as one from an environment override, is replaced too.
-#[test]
-fn loaded_config_follows_the_file() {
-    let (old_file, new_file) = retired_entry(0, "192.0.2.1:8234");
-    let (old_env, new_env) = retired_entry(2, "192.0.2.2:8234");
-    let (_dir, path) = config_file(&one_entry_file(&old_file));
-    let mut zakura = ZakuraConfig {
-        bootstrap_peers: vec![old_file, old_env.clone()],
-        ..ZakuraConfig::default()
-    };
-
-    replace_retired_seed_ids(Some(&path), &mut zakura);
-
-    assert_eq!(
-        zakura.bootstrap_peers,
-        vec![new_file.clone(), new_env.clone()]
-    );
-    assert_eq!(
-        fs::read_to_string(&path).unwrap(),
-        one_entry_file(&new_file)
-    );
-
-    let mut without_file = ZakuraConfig {
-        bootstrap_peers: vec![old_env],
-        ..ZakuraConfig::default()
-    };
-    replace_retired_seed_ids(None, &mut without_file);
-    assert_eq!(without_file.bootstrap_peers, vec![new_env]);
 }
 
 /// A file that does not parse is reported, not rewritten.
@@ -312,15 +299,17 @@ fn rewrite_touches_only_matched_bootstrap_ids() {
 }
 
 /// The check before writing accepts only a file that loads like the original with the
-/// seed IDs replaced.
+/// given entries replaced.
 #[test]
 fn rewrite_is_checked_against_the_loader() {
     let (old, new) = retired_entry(1, "192.0.2.1:8234");
     let original = format!("{}other = 1\n", one_entry_file(&old));
+    let replaced = [(old.clone(), new.clone())];
 
-    assert!(loads_as_original_with_ids_replaced(
+    assert!(loads_as_original_with_replacements(
         &original,
-        &original.replace(&old, &new)
+        &original.replace(&old, &new),
+        &replaced,
     ));
     for wrong in [
         original.clone(),
@@ -332,44 +321,44 @@ fn rewrite_is_checked_against_the_loader() {
         "not toml [".to_string(),
     ] {
         assert!(
-            !loads_as_original_with_ids_replaced(&original, &wrong),
+            !loads_as_original_with_replacements(&original, &wrong, &replaced),
             "{wrong}"
         );
     }
 }
 
-/// Symlinks someone else placed at the temp or backup path are never written through.
-#[cfg(unix)]
+/// The loaded config gets the same replacement as the file, and an entry the file does not
+/// hold, such as one from an environment override, is replaced too.
 #[test]
-fn rewrite_never_writes_through_a_planted_symlink() {
-    let (old, new) = retired_entry(0, "192.0.2.1:8234");
-    let original = one_entry_file(&old);
-    let (dir, path) = config_file(&original);
-    let path = fs::canonicalize(&path).unwrap();
-    let victim = dir.path().join("victim");
-    fs::write(&victim, "victim").unwrap();
-    let temp = with_suffix(&path, &format!(".tmp.{}", std::process::id()));
-    std::os::unix::fs::symlink(&victim, &temp).unwrap();
+fn loaded_config_follows_the_file() {
+    let (old_file, new_file) = retired_entry(0, "192.0.2.1:8234");
+    let (old_env, new_env) = retired_entry(2, "192.0.2.2:8234");
+    let (_dir, path) = config_file(&one_entry_file(&old_file));
+    let mut zakura = ZakuraConfig {
+        bootstrap_peers: vec![old_file, old_env.clone()],
+        ..ZakuraConfig::default()
+    };
 
-    rewrite_config_file(&path).expect_err("the temp path is taken");
+    replace_retired_seed_ids(Some(&path), &mut zakura);
 
-    assert_eq!(fs::read_to_string(&victim).unwrap(), "victim");
-    assert_eq!(fs::read_to_string(&path).unwrap(), original);
-
-    // A dangling symlink at the backup path counts as an earlier backup.
-    let elsewhere = dir.path().join("elsewhere");
-    std::os::unix::fs::symlink(&elsewhere, with_suffix(&path, BACKUP_SUFFIX)).unwrap();
-
-    rewrite_config_file(&path).expect("rewrite succeeds");
-
-    assert!(!elsewhere.exists());
+    assert_eq!(
+        zakura.bootstrap_peers,
+        vec![new_file.clone(), new_env.clone()]
+    );
     assert_eq!(
         fs::read_to_string(&path).unwrap(),
-        original.replace(&old, &new)
+        one_entry_file(&new_file)
     );
+
+    let mut without_file = ZakuraConfig {
+        bootstrap_peers: vec![old_env],
+        ..ZakuraConfig::default()
+    };
+    replace_retired_seed_ids(None, &mut without_file);
+    assert_eq!(without_file.bootstrap_peers, vec![new_env]);
 }
 
-/// An ID spelled with escapes cannot be swapped in place, so the file keeps it for the
+/// An ID spelled with escapes cannot be overwritten in place, so the file keeps it for the
 /// operator to fix, and the loaded config is still switched to the current ID.
 #[test]
 fn escaped_id_is_left_in_the_file() {

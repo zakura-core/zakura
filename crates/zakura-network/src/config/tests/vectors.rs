@@ -28,7 +28,7 @@ use crate::{
         INBOUND_PEER_LIMIT_MULTIPLIER, OUTBOUND_PEER_LIMIT_DIVISOR, OUTBOUND_PEER_LIMIT_MULTIPLIER,
     },
     zakura::{
-        replace_retired_seed_node_id, ZakuraConfig, ZakuraLocalLimits, DEFAULT_HS_RANGE,
+        retired_seed_replacements, ZakuraConfig, ZakuraLocalLimits, DEFAULT_HS_RANGE,
         DEFAULT_MAINNET_ZAKURA_BOOTSTRAP_PEERS, DEFAULT_TESTNET_ZAKURA_BOOTSTRAP_PEERS,
         DEFAULT_ZAKURA_BOOTSTRAP_PEERS, DEFAULT_ZAKURA_BUDGETED_CONNECTIONS,
         DEFAULT_ZAKURA_LISTEN_ADDR, DEFAULT_ZAKURA_MAX_CONNS_PER_IP,
@@ -3045,6 +3045,11 @@ const RETIRED_TESTNET_DEFAULTS: [&str; 3] = [
     "50999835f48f4a048c0e9042e5332844c9673943d7fab1f7e993bae698c27ea3@206.189.148.0:8234",
 ];
 
+/// Replaces `entry` as the only entry of a list.
+fn replace_one(entry: &str) -> Option<String> {
+    retired_seed_replacements(&[entry]).remove(0)
+}
+
 /// Each seed's old default entry becomes its current default entry, on both networks,
 /// and a current entry is left alone.
 #[test]
@@ -3057,12 +3062,8 @@ fn retired_default_entries_map_onto_the_current_defaults() {
         .chain(DEFAULT_TESTNET_ZAKURA_BOOTSTRAP_PEERS);
 
     for (old, current) in old.zip(current) {
-        assert_eq!(
-            replace_retired_seed_node_id(old).as_deref(),
-            Some(*current),
-            "{old}"
-        );
-        assert_eq!(replace_retired_seed_node_id(current), None, "{current}");
+        assert_eq!(replace_one(old).as_deref(), Some(*current), "{old}");
+        assert_eq!(replace_one(current), None, "{current}");
     }
 }
 
@@ -3074,11 +3075,11 @@ fn replace_retired_seed_node_id_keeps_the_written_address() {
         .unwrap();
 
     assert_eq!(
-        replace_retired_seed_node_id(&format!("{retired}@192.0.2.7:9000")),
+        replace_one(&format!("{retired}@192.0.2.7:9000")),
         Some(format!("{current}@192.0.2.7:9000")),
     );
     assert_eq!(
-        replace_retired_seed_node_id(&format!("{}@192.0.2.7:9000", retired.to_uppercase())),
+        replace_one(&format!("{}@192.0.2.7:9000", retired.to_uppercase())),
         Some(format!("{current}@192.0.2.7:9000")),
         "node IDs compare as values, not as text",
     );
@@ -3088,11 +3089,7 @@ fn replace_retired_seed_node_id_keeps_the_written_address() {
         retired.to_string(),
         "not-a-node-id@192.0.2.7:9000".to_string(),
     ] {
-        assert_eq!(
-            replace_retired_seed_node_id(&untouched),
-            None,
-            "{untouched}"
-        );
+        assert_eq!(replace_one(&untouched), None, "{untouched}");
     }
 }
 
@@ -3153,5 +3150,27 @@ fn retired_mainnet_defaults_follow_the_network() {
     assert_eq!(
         parse("Mainnet").zakura.bootstrap_peers,
         RETIRED_MAINNET_DEFAULTS.map(String::from)
+    );
+}
+
+/// A list that already names a seed by its current ID keeps the seed's retired entry, so
+/// the two never join into one wider bootstrap dial.
+#[test]
+fn retired_entry_is_kept_when_the_current_id_is_listed() {
+    let (retired, _) = RETIRED_MAINNET_DEFAULTS[0].split_once('@').unwrap();
+    let (current, _) = DEFAULT_MAINNET_ZAKURA_BOOTSTRAP_PEERS[0]
+        .split_once('@')
+        .unwrap();
+    let other_seed = RETIRED_MAINNET_DEFAULTS[1];
+    let retired_entry = format!("{retired}@192.0.2.1:8234");
+    let current_entry = format!("{current}@192.0.2.2:8234");
+
+    assert_eq!(
+        retired_seed_replacements(&[&retired_entry, &current_entry, other_seed]),
+        vec![
+            None,
+            None,
+            Some(DEFAULT_MAINNET_ZAKURA_BOOTSTRAP_PEERS[1].to_string())
+        ],
     );
 }

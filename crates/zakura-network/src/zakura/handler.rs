@@ -655,12 +655,11 @@ impl ZakuraConfig {
         if network.kind() == NetworkKind::Mainnet {
             return;
         }
-        let is_mainnet_default = self
-            .bootstrap_peers
-            .iter()
-            .map(|entry| {
-                super::replace_retired_seed_node_id(entry).unwrap_or_else(|| entry.clone())
-            })
+        let entries: Vec<&str> = self.bootstrap_peers.iter().map(String::as_str).collect();
+        let is_mainnet_default = super::retired_seed_replacements(&entries)
+            .into_iter()
+            .zip(&entries)
+            .map(|(replacement, entry)| replacement.unwrap_or_else(|| entry.to_string()))
             .eq(DEFAULT_MAINNET_ZAKURA_BOOTSTRAP_PEERS
                 .iter()
                 .map(ToString::to_string));

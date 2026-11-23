@@ -51,7 +51,7 @@ pub use peer_memory::*;
 pub use regulation::{replay_cadence_bytes, CadenceReplaySummary};
 #[cfg(zakura_sim)]
 pub use regulation::{FreeSlots, SessionOwnership, SessionSlotsProbe};
-pub use retired_seed_node_ids::replace_retired_seed_node_id;
+pub use retired_seed_node_ids::retired_seed_replacements;
 pub use trace::{
     commit_state_trace, peer_label as zakura_trace_peer_label,
     reject_reason_label as zakura_trace_reject_reason_label, ZakuraTrace, ZakuraTraceEvent,

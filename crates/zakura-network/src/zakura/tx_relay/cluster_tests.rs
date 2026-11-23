@@ -109,12 +109,12 @@ fn id(tx: &VerifiedUnminedTx) -> UnminedTxId {
     tx.transaction.id()
 }
 
-/// The serialized size of `tx`, as an `Inv` announces it.
+/// The serialized size of `tx`, as a `Have` announces it.
 fn size(tx: &VerifiedUnminedTx) -> u32 {
     u32::try_from(tx.transaction.size()).expect("test bodies fit the protocol's size")
 }
 
-/// The `Inv` entry for `tx`.
+/// The `Have` entry for `tx`.
 fn entry(tx: &VerifiedUnminedTx) -> (UnminedTxId, u32) {
     (id(tx), size(tx))
 }
@@ -541,11 +541,11 @@ impl RawRelay {
         Ok(())
     }
 
-    /// Waits for an `Inv` that names `id` on the data stream, skipping
+    /// Waits for a `Have` that names `id` on the data stream, skipping
     /// anything else.
     async fn announced(&mut self, id: UnminedTxId) -> Result<(), BoxError> {
         loop {
-            if let TxRelayMessage::Inv(entries) = self.next_data().await? {
+            if let TxRelayMessage::Have(entries) = self.next_data().await? {
                 if entries.iter().any(|(announced, _)| *announced == id) {
                     return Ok(());
                 }
@@ -799,7 +799,7 @@ async fn a_late_answer_on_an_ended_sessions_stream_reaches_nothing() -> Result<(
 
     let mut peer = RawRelay::connect(&victim, 1_143).await?;
     peer.start().await?;
-    peer.send(&TxRelayMessage::Inv(vec![entry(&tx)])).await?;
+    peer.send(&TxRelayMessage::Have(vec![entry(&tx)])).await?;
     peer.asked(id(&tx)).await?;
 
     // The peer ends the session with the request unanswered, keeping the
@@ -874,7 +874,7 @@ async fn a_redial_that_evicts_the_old_connection_takes_over_its_session() -> Res
     .await?;
 
     let tx = transaction();
-    new.send(&TxRelayMessage::Inv(vec![entry(&tx)])).await?;
+    new.send(&TxRelayMessage::Have(vec![entry(&tx)])).await?;
     new.asked(id(&tx)).await?;
     new.send(&answer(&tx)).await?;
     let pool = victim.pool.as_ref().expect("the node runs tx-relay");
@@ -1107,7 +1107,7 @@ async fn this_nodes_wants_flow_while_a_peer_pulls_large_bodies() -> Result<(), B
         blocked_uploads(110, MAX_SERVES, MAX_SERVES).await?;
 
     let wanted = transaction();
-    peer.send(&TxRelayMessage::Inv(vec![entry(&wanted)]))
+    peer.send(&TxRelayMessage::Have(vec![entry(&wanted)]))
         .await?;
     peer.asked(id(&wanted)).await?;
     peer.send(&answer(&wanted)).await?;
@@ -1163,7 +1163,7 @@ async fn not_found_answers_and_wants_flow_while_the_data_stream_is_held_back(
     }
 
     let wanted = transaction();
-    peer.send(&TxRelayMessage::Inv(vec![entry(&wanted)]))
+    peer.send(&TxRelayMessage::Have(vec![entry(&wanted)]))
         .await?;
     peer.asked(id(&wanted)).await?;
     assert!(!peer.is_closed());
@@ -1191,17 +1191,17 @@ async fn not_found_answers_and_wants_flow_while_the_data_stream_is_held_back(
 /// The slowest link a request's deadline allows for.
 const SLOW_RATE: usize = 100_000;
 
-/// `count` `Inv` frames of 1,024 entries each, all naming `held`, which the
+/// `count` `Have` frames of 1,024 entries each, all naming `held`, which the
 /// node already holds and so never requests.
-fn inv_backlog(held: &VerifiedUnminedTx, count: usize) -> Vec<TxRelayMessage> {
+fn have_backlog(held: &VerifiedUnminedTx, count: usize) -> Vec<TxRelayMessage> {
     (0..count)
-        .map(|_| TxRelayMessage::Inv(vec![entry(held); 1_024]))
+        .map(|_| TxRelayMessage::Have(vec![entry(held); 1_024]))
         .collect()
 }
 
 /// Slow but honest: five bodies from one peer over a link of 100 KB/s, the
 /// slowest a deadline allows for, answered in reverse order behind a
-/// backlog of `Inv` frames, are all accepted, with no charge.
+/// backlog of `Have` frames, are all accepted, with no charge.
 ///
 /// The link is simulated by the peer pacing its own data stream writes at
 /// that rate. The bodies are 200 KB, so the case takes about 15 seconds.
@@ -1223,12 +1223,12 @@ async fn a_slow_honest_peer_has_every_body_accepted() -> Result<(), BoxError> {
     peer.start().await?;
 
     let bodies: Vec<VerifiedUnminedTx> = (0..5).map(|n| large(n, script)).collect();
-    peer.send(&TxRelayMessage::Inv(bodies.iter().map(entry).collect()))
+    peer.send(&TxRelayMessage::Have(bodies.iter().map(entry).collect()))
         .await?;
     peer.asked_all(&bodies.iter().map(id).collect::<Vec<_>>())
         .await?;
     // Seven frames of about 70 KB, under the 512 KiB sender allowance.
-    let mut paced = inv_backlog(&held, 7);
+    let mut paced = have_backlog(&held, 7);
     paced.extend(bodies.iter().rev().map(answer));
     peer.send_paced(&paced, SLOW_RATE).await?;
 
@@ -1249,7 +1249,7 @@ async fn a_slow_honest_peer_has_every_body_accepted() -> Result<(), BoxError> {
 }
 
 /// Slow but honest: a sole announcer on a link of half the slowest rate,
-/// whose answer sits behind more `Inv` bytes than the deadline covers,
+/// whose answer sits behind more `Have` bytes than the deadline covers,
 /// misses its deadline. Its late body is dropped unread and nothing is
 /// charged, and when it announces the id again it is asked again and its
 /// body is accepted.
@@ -1270,13 +1270,13 @@ async fn a_sole_announcer_behind_a_deep_backlog_is_asked_again_without_charge(
     peer.start().await?;
 
     let body = large(9, 10_000);
-    peer.send(&TxRelayMessage::Inv(vec![entry(&body)])).await?;
+    peer.send(&TxRelayMessage::Have(vec![entry(&body)])).await?;
     peer.asked(id(&body)).await?;
     // About 770 KB at 50 KB/s, so the body arrives about 15.5 seconds after
     // the ask: past its 13.3 second deadline, before the second one.
-    let mut paced = inv_backlog(&held, 11);
+    let mut paced = have_backlog(&held, 11);
     paced.push(answer(&body));
-    paced.push(TxRelayMessage::Inv(vec![entry(&body)]));
+    paced.push(TxRelayMessage::Have(vec![entry(&body)]));
     peer.send_paced(&paced, SLOW_RATE / 2).await?;
 
     peer.asked(id(&body)).await?;
@@ -1455,7 +1455,7 @@ async fn a_stall_costs_the_session_not_the_connection() -> Result<(), BoxError> 
     let silent = async {
         let mut peer = silent;
         peer.start().await?;
-        peer.send(&TxRelayMessage::Inv(vec![entry(&silent_tx)]))
+        peer.send(&TxRelayMessage::Have(vec![entry(&silent_tx)]))
             .await?;
         peer.asked(id(&silent_tx)).await?;
         // Two deadlines of about 13 seconds each.
@@ -1506,6 +1506,11 @@ async fn a_small_transaction_reaches_the_window_at_once_and_the_rest_after_the_d
         observed_node(120, TestPool::new(Held::default()), cools(), 64).await?;
     let mut peers = Vec::with_capacity(PEERS);
     for n in 0..PEERS {
+        // The node refuses a handshake once one host has started more than
+        // its limit refills. One dial per refill never reaches that limit,
+        // however fast this machine dials.
+        tokio::time::sleep(crate::zakura::transport::node_handshake_cadence().refill_interval)
+            .await;
         let mut peer = RawRelay::connect(&victim, 1_200 + u64::try_from(n)?).await?;
         peer.start().await?;
         peers.push(peer);
@@ -1556,7 +1561,7 @@ async fn reaches(victim: &RelayNode, tx: &VerifiedUnminedTx) -> Result<(), BoxEr
 
 /// A peer announces `tx`, is asked for it and answers with its body.
 async fn supply(peer: &mut RawRelay, tx: &VerifiedUnminedTx) -> Result<(), BoxError> {
-    peer.send(&TxRelayMessage::Inv(vec![entry(tx)])).await?;
+    peer.send(&TxRelayMessage::Have(vec![entry(tx)])).await?;
     peer.asked(id(tx)).await?;
     peer.send(&answer(tx)).await
 }
@@ -1586,11 +1591,11 @@ async fn a_cooldown_cools_the_supplier_not_the_announcer_across_a_reconnect() ->
     // The announcer is asked first and has nothing, so the supplier is
     // asked next and supplies the body.
     announcer
-        .send(&TxRelayMessage::Inv(vec![entry(&bad)]))
+        .send(&TxRelayMessage::Have(vec![entry(&bad)]))
         .await?;
     announcer.asked(id(&bad)).await?;
     supplier
-        .send(&TxRelayMessage::Inv(vec![entry(&bad)]))
+        .send(&TxRelayMessage::Have(vec![entry(&bad)]))
         .await?;
     announcer.send(&TxRelayMessage::NotFound(id(&bad))).await?;
     supplier.asked(id(&bad)).await?;
@@ -1603,11 +1608,11 @@ async fn a_cooldown_cools_the_supplier_not_the_announcer_across_a_reconnect() ->
     // The supplier cools: its announcement is not fetched. The announcer
     // does not.
     supplier
-        .send(&TxRelayMessage::Inv(vec![entry(&later)]))
+        .send(&TxRelayMessage::Have(vec![entry(&later)]))
         .await?;
     supplier.not_asked(id(&later)).await?;
     announcer
-        .send(&TxRelayMessage::Inv(vec![entry(&later)]))
+        .send(&TxRelayMessage::Have(vec![entry(&later)]))
         .await?;
     announcer.asked(id(&later)).await?;
 
@@ -1620,7 +1625,7 @@ async fn a_cooldown_cools_the_supplier_not_the_announcer_across_a_reconnect() ->
     .await?;
     let mut supplier = RawRelay::reconnect(&victim, 1_123).await?;
     supplier
-        .send(&TxRelayMessage::Inv(vec![entry(&after)]))
+        .send(&TxRelayMessage::Have(vec![entry(&after)]))
         .await?;
     supplier.not_asked(id(&after)).await?;
 
@@ -1665,7 +1670,8 @@ async fn a_cooldown_waits_for_a_current_node_at_the_verdicts_tip() -> Result<(),
     })
     .await?;
 
-    peer.send(&TxRelayMessage::Inv(vec![entry(&after)])).await?;
+    peer.send(&TxRelayMessage::Have(vec![entry(&after)]))
+        .await?;
     peer.not_asked(id(&after)).await?;
 
     peer.shutdown().await;
@@ -1748,7 +1754,7 @@ async fn a_wire_violation_closes_the_connection() -> Result<(), BoxError> {
     let mut resized = RawRelay::connect(&victim, 1_129).await?;
     resized.start().await?;
     resized
-        .send(&TxRelayMessage::Inv(vec![(id(&tx), size(&tx) + 1)]))
+        .send(&TxRelayMessage::Have(vec![(id(&tx), size(&tx) + 1)]))
         .await?;
     resized.asked(id(&tx)).await?;
     resized.send(&answer(&tx)).await?;
@@ -1776,7 +1782,7 @@ async fn an_undecodable_body_closes_the_connection() -> Result<(), BoxError> {
     let garbage = unknown(1);
     let mut peer = RawRelay::connect(&victim, 1_145).await?;
     peer.start().await?;
-    peer.send(&TxRelayMessage::Inv(vec![(garbage, 200)]))
+    peer.send(&TxRelayMessage::Have(vec![(garbage, 200)]))
         .await?;
     peer.asked(garbage).await?;
     peer.send(&TxRelayMessage::Tx {
@@ -1797,7 +1803,7 @@ async fn an_undecodable_body_closes_the_connection() -> Result<(), BoxError> {
     let mut trailing = RawRelay::connect(&victim, 1_146).await?;
     trailing.start().await?;
     trailing
-        .send(&TxRelayMessage::Inv(vec![(id(&tx), size(&tx) + 1)]))
+        .send(&TxRelayMessage::Have(vec![(id(&tx), size(&tx) + 1)]))
         .await?;
     trailing.asked(id(&tx)).await?;
     trailing
@@ -1838,7 +1844,7 @@ async fn an_answer_nobody_asked_for_closes_the_connection() -> Result<(), BoxErr
     // A `Tx`, then a `NotFound` for the same request.
     let mut both = RawRelay::connect(&victim, 1_131).await?;
     both.start().await?;
-    both.send(&TxRelayMessage::Inv(vec![entry(&txs[0])]))
+    both.send(&TxRelayMessage::Have(vec![entry(&txs[0])]))
         .await?;
     both.asked(id(&txs[0])).await?;
     both.send(&answer(&txs[0])).await?;
@@ -1858,7 +1864,7 @@ async fn an_answer_nobody_asked_for_closes_the_connection() -> Result<(), BoxErr
     let mut twice = RawRelay::connect(&victim, 1_132).await?;
     twice.start().await?;
     twice
-        .send(&TxRelayMessage::Inv(vec![entry(&txs[1])]))
+        .send(&TxRelayMessage::Have(vec![entry(&txs[1])]))
         .await?;
     twice.asked(id(&txs[1])).await?;
     twice.send(&answer(&txs[1])).await?;
@@ -1910,7 +1916,7 @@ async fn two_large_bodies_at_once_while_the_pool_is_slow_are_both_handed_over(
     peer.start().await?;
 
     let bodies = [large(1, 1_500_000), large(2, 1_500_000)];
-    peer.send(&TxRelayMessage::Inv(bodies.iter().map(entry).collect()))
+    peer.send(&TxRelayMessage::Have(bodies.iter().map(entry).collect()))
         .await?;
     peer.asked_all(&bodies.iter().map(id).collect::<Vec<_>>())
         .await?;

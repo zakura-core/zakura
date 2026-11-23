@@ -215,3 +215,52 @@ admission permit.
 
 These targets check pure policies. They do not check worker cancellation or
 connection ownership across scheduled IO.
+
+## Handshake parser targets
+
+| Target | Property | Decoder |
+| --- | --- | --- |
+| `credential_parse` | `credential/canonical-encoding`, `credential/node-id`, `credential/bounded-parse` | 1 |
+| `key_list_decode` | `key-list/canonical-encoding`, `key-list/stable-id` | 1 |
+| `composite_verify` | `composite/tamper-refused` | 1 |
+
+These targets feed peer-chosen bytes to what `zakura-quic` parses before a v2
+TLS handshake authenticates the peer, not machine histories. The drivers and
+their checks live in `crates/zakura-quic/src/fuzz.rs` behind the crate's
+`p2p-fuzz` feature, so `NodeCredential::from_spki` and `composite::verify` stay
+private to the crate.
+
+`credential_parse` reads its whole input both as a TLS raw public key
+(`NodeCredential::from_spki`) and as a bare credential encoding
+(`NodeCredential::decode`). An accepted credential re-encodes to exactly the
+input and decodes back to itself. The driver rebuilds an accepted SPKI's
+canonical DER, and the node ID from the ID-12 key fingerprints, from the spec
+rather than with the code under test, and compares them with the input and the
+credential's ID. The target
+installs `MeteredAllocator` from this package's library, and no single
+allocation of the two parses may exceed the input's length by more than 256
+bytes.
+
+`key_list_decode` decodes its input as a key list, as discovery does with a
+peer's record. An accepted list re-encodes to exactly the input, and its node
+ID is the ID-9 hash of the input's bytes.
+
+`composite_verify` runs the Ed25519 + ML-DSA-44 verifier once per input. An
+input whose first byte is even carries an Ed25519 key, a `u16`-prefixed
+ML-DSA-44 key, a `u16`-prefixed message and the signature. An odd first byte
+makes the rest four-byte edits of an honest signature, signed once per
+process, so an empty corpus still explores near-valid signatures. The honest
+signature must verify, and every edit of it must fail. A raw input checks only
+that the verifier doesn't panic. ML-DSA verification
+makes this target far slower per input than the others.
+
+The campaign corpus isn't committed. To start a local campaign from the unit
+tests' valid and malformed values, write the seeds first:
+
+```console
+cargo +nightly-2026-07-15 run --example handshake_seeds
+cargo +nightly-2026-07-15 fuzz run --fuzz-dir . credential_parse
+```
+
+`zakura-quic`'s unit tests replay every seed and check that a seed named
+`valid-` is accepted and one named `invalid-` is refused.

@@ -1,6 +1,7 @@
 import importlib.util
 import os
 import re
+import subprocess
 import sys
 import threading
 import tempfile
@@ -153,33 +154,108 @@ class BuildCacheTests(unittest.TestCase):
 
 
 class MainnetWorkflowSuppressionTests(unittest.TestCase):
-    def test_suppression_is_scoped_to_compatibility_restarts(self):
-        workflow = (
+    def setUp(self):
+        self.workflow = (
             SCRIPT_DIR.parent.parent
             / ".github/workflows/zakura-mainnet-deploy.yml"
         ).read_text()
-        suppression_step = workflow.split(
-            "      - name: Suppress compatibility watchdog alerts during deploy\n",
-            1,
-        )[1].split("      - name: Deploy fleet\n", 1)[0]
 
-        self.assertIn(
-            "inputs.node == '' || inputs.node == 'zakura-compat'",
-            suppression_step,
-        )
-        self.assertIn("!inputs.no_restart", suppression_step)
-        self.assertIn("root@159.203.113.196", suppression_step)
-        self.assertIn(
-            "/run/zakura-watchdog/deployment-suppressed-until",
-            suppression_step,
-        )
-        self.assertIn(
-            "if ! timeout --signal=TERM --kill-after=5s 60s \\",
-            suppression_step,
-        )
-        self.assertNotIn("systemctl", suppression_step)
-        self.assertIn("continuing deploy", suppression_step)
-        self.assertNotIn("tomllib", suppression_step)
+    def step(self, name):
+        return self.workflow.split(f"      - name: {name}\n", 1)[1].split("      - name:", 1)[0]
+
+    def test_compatibility_mute_and_readiness_only_run_for_compatibility_restarts(self):
+        for name in ("Suppress compatibility watchdog alerts during deploy",
+                     "Wait for the compatibility sidecar to sync"):
+            with self.subTest(step=name):
+                self.assertIn(
+                    "if: ${{ inputs.operation == 'deploy' && !inputs.no_restart "
+                    "&& (inputs.node == '' || inputs.node == 'zakura-compat') }}",
+                    self.step(name),
+                )
+        self.assertIn("zakura-monitoring-deploy.py check-compat-readiness",
+                      self.step("Wait for the compatibility sidecar to sync"))
+        self.assertNotIn("continue-on-error", self.step("Wait for the compatibility sidecar to sync"))
+
+    def test_both_mutes_are_cleared_even_if_deploy_or_readiness_fails(self):
+        steps = [
+            "Install profiler and prepare trace files",
+            "Suppress fleet watchdog alerts during deploy",
+            "Suppress compatibility watchdog alerts during deploy",
+            "Deploy fleet",
+            "Install fleet watchdog",
+            "Wait for the compatibility sidecar to sync",
+            "Restore compatibility watchdog alerts",
+            "Restore fleet watchdog alerts",
+        ]
+        positions = [self.workflow.index(f"      - name: {name}\n") for name in steps]
+        self.assertEqual(positions, sorted(positions))
+        for label, target in (("compatibility", "compat"), ("fleet", "fleet")):
+            with self.subTest(marker=target):
+                restore = self.step(f"Restore {label} watchdog alerts")
+                self.assertIn(f"always() && steps.mute_{target}.outputs.expires_at != ''", restore)
+                self.assertIn(f'watchdog-mute.sh clear-{target} "$EXPIRES_AT"', restore)
+
+    def test_cleanup_only_removes_the_timestamp_owned_by_the_run(self):
+        script = SCRIPT_DIR / "mainnet" / "watchdog-mute.sh"
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = Path(tmp) / "deploy-suppressed-until"
+            expires_at = subprocess.check_output(
+                ["bash", str(script), "arm-marker", str(marker)], text=True, timeout=5,
+            ).strip()
+            clear = ["bash", str(script), "clear-marker", str(marker), expires_at]
+            self.assertEqual(marker.read_text(), expires_at + "\n")
+
+            newer = str(int(expires_at) + 1) + "\n"
+            marker.write_text(newer)
+            subprocess.run(clear, check=True, timeout=5)
+            self.assertEqual(marker.read_text(), newer)
+
+            marker.write_text(expires_at + "\n")
+            subprocess.run(clear, check=True, timeout=5)
+            self.assertFalse(marker.exists())
+            subprocess.run(clear, check=True, timeout=5)
+
+    def test_fleet_mute_requires_effective_runtime_directory_preservation(self):
+        script = SCRIPT_DIR / "mainnet" / "watchdog-mute.sh"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            marker = root / "deploy-suppressed-until"
+            drop_in = root / "60-deploy-mute.conf"
+            sudo = root / "sudo"
+            sudo.write_text(
+                '#!/bin/bash\n'
+                'case "$2" in\n'
+                '    install) cat > "$MOCK_DROP_IN" ;;\n'
+                '    systemctl) grep -qx RuntimeDirectoryPreserve=restart "$MOCK_DROP_IN" ;;\n'
+                '    bash) exec bash "$3" "$4" "$MOCK_MARKER" ;;\n'
+                '    *) exit 2 ;;\n'
+                'esac\n'
+            )
+            systemctl = root / "systemctl"
+            systemctl.write_text(
+                '#!/bin/bash\n'
+                'case "$2" in\n'
+                '    --property=LoadState) echo loaded ;;\n'
+                '    --property=RuntimeDirectoryPreserve) echo "$MOCK_PRESERVE" ;;\n'
+                '    *) exit 2 ;;\n'
+                'esac\n'
+            )
+            sudo.chmod(0o755)
+            systemctl.chmod(0o755)
+            env = {**os.environ, "PATH": f"{root}{os.pathsep}{os.environ['PATH']}",
+                   "MOCK_DROP_IN": str(drop_in), "MOCK_MARKER": str(marker)}
+            arm = ["bash", str(script), "arm-fleet"]
+
+            blocked = subprocess.run(arm, env={**env, "MOCK_PRESERVE": "no"},
+                                     capture_output=True, text=True, timeout=5)
+            self.assertNotEqual(blocked.returncode, 0)
+            self.assertIn("would remove its mute file on restart", blocked.stderr)
+            self.assertFalse(marker.exists())
+
+            armed = subprocess.check_output(arm, env={**env, "MOCK_PRESERVE": "restart"},
+                                            text=True, timeout=5)
+            self.assertEqual(drop_in.read_text(), "[Service]\nRuntimeDirectoryPreserve=restart\n")
+            self.assertEqual(marker.read_text(), armed)
 
 
 class MainnetWorkflowMonitoringTests(unittest.TestCase):

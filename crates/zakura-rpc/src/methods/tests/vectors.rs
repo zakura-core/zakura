@@ -4017,6 +4017,7 @@ async fn zip234_mining_rpcs_include_the_reissuance_bonus() {
                     miner_memo: None,
                     internal_miner: true,
                     optimistic_block_inventory: true,
+                    miner_mesh: false,
                 },
                 Default::default(),
                 "0.0.1",
@@ -4605,6 +4606,7 @@ async fn gbt_with(net: Network, addr: ZcashAddress) {
         miner_memo: None,
         internal_miner: true,
         optimistic_block_inventory: true,
+        miner_mesh: false,
     };
 
     // nu5 block height
@@ -5349,9 +5351,17 @@ async fn rpc_client_proposal_can_submit_solution() {
         "the event carries the submitted block's size"
     );
     assert_eq!(submission_method, MinedBlockSubmission::CompactHeader);
-    assert_eq!(
-        pending_blocks.get(candidate_hash).map(|block| block.hash()),
-        Some(candidate_hash),
+    let served = pending_blocks
+        .get_for_peer(candidate_hash)
+        .expect("state admitted this body for early relay");
+    assert_eq!(served.hash(), candidate_hash);
+    let permit = served
+        .pending_send
+        .expect("pending writes remain revocable");
+    assert_eq!(permit, pending.send_permit());
+    assert!(
+        permit.attempt_checksum().is_none(),
+        "the admitted body can use its shared checksum"
     );
     assert!(pending.is_valid());
 
@@ -5367,6 +5377,91 @@ async fn rpc_client_proposal_can_submit_solution() {
     );
 }
 
+/// Disabling optimistic relay keeps admitted ordinary submissions out of temporary serving,
+/// while preserving verification, response mapping, and reservation cleanup on either outcome.
+#[tokio::test(start_paused = true)]
+async fn ordinary_submission_without_optimistic_relay_still_validates_and_releases_capacity() {
+    let _init_guard = zakura_test::init();
+    let candidate: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let mut verifier: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let channel = types::submit_block::EarlyMinedBlockChannel::new();
+    let sender = channel.sender();
+    let mut events = channel.receiver();
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (rpc, queue) = TestRpcImpl::new_for_tests(
+        Mainnet,
+        crate::config::mining::Config {
+            optimistic_block_inventory: false,
+            ..Default::default()
+        },
+        false,
+        "0.0.1",
+        "disabled early relay test",
+        MockService::build().for_unit_tests(),
+        MockService::build().for_unit_tests(),
+        MockService::build().for_unit_tests(),
+        verifier.clone(),
+        MockSyncStatus::default(),
+        NoChainTip,
+        MockAddressBookPeers::default(),
+        rx,
+        Some(sender),
+    );
+    for accepted in [false, true] {
+        let submission = tokio::spawn({
+            let rpc = rpc.clone();
+            let candidate = candidate.clone();
+            async move {
+                rpc.run_mined_block_lifecycle(
+                    candidate,
+                    std::time::Instant::now(),
+                    MinedBlockSubmission::FullBlock,
+                )
+                .await
+            }
+        });
+        let response = verifier
+            .expect_request_that(|request| {
+                matches!(request, zakura_consensus::Request::CommitMined { .. })
+            })
+            .await;
+        let zakura_consensus::Request::CommitMined { admission, .. } = response.request() else {
+            unreachable!("the matcher requires normal mined verification")
+        };
+        admission.authorize_optimistic_relay();
+        admission.admit_for_test();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), events.recv())
+                .await
+                .is_err(),
+            "authorization and admission cannot bypass the disabled relay setting"
+        );
+        assert!(rpc.gbt.pending_blocks().get(candidate.hash()).is_none());
+        assert!(
+            !submission.is_finished(),
+            "ordinary submission still waits for verification"
+        );
+        if accepted {
+            response.respond(candidate.hash());
+        } else {
+            response.respond_error("contextual verification rejected the block".into());
+        }
+        assert_eq!(
+            submission.await.unwrap().unwrap(),
+            if accepted {
+                SubmitBlockResponse::Accepted
+            } else {
+                SubmitBlockErrorResponse::Rejected.into()
+            }
+        );
+        assert!(rpc.gbt.pending_blocks().get(candidate.hash()).is_none());
+        assert!(events.try_recv().is_err());
+    }
+    queue.abort();
+}
+
 /// A verifier that completes in the same poll as admission must never advertise a pending body.
 #[tokio::test]
 async fn completed_mined_verification_precedes_admission() {
@@ -5374,7 +5469,7 @@ async fn completed_mined_verification_precedes_admission() {
     let candidate: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
         .zcash_deserialize_into()
         .expect("the genesis block is valid");
-    for committed in [true, false] {
+    for (trusted, committed) in [(false, true), (false, false), (true, true), (true, false)] {
         let verifier = tower::service_fn(move |request: zakura_consensus::Request| async move {
             let zakura_consensus::Request::CommitMined {
                 block, admission, ..
@@ -5387,7 +5482,10 @@ async fn completed_mined_verification_precedes_admission() {
             if committed {
                 Ok::<_, BoxError>(block.hash())
             } else {
-                Err("contextual verification rejected the block".into())
+                Err(RouterError::from(zakura_consensus::VerifyBlockError::from(
+                    zakura_consensus::BlockError::DuplicateTransaction,
+                ))
+                .into())
             }
         });
         let channel = types::submit_block::EarlyMinedBlockChannel::new();
@@ -5410,14 +5508,21 @@ async fn completed_mined_verification_precedes_admission() {
             rx,
             Some(sender),
         );
-        let result = rpc
-            .run_mined_block_lifecycle(
+        let result = if trusted {
+            rpc.submit_trusted_block(&candidate.zcash_serialize_to_vec().unwrap())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("the fixture is structurally valid and capacity is available")
+                })
+        } else {
+            rpc.run_mined_block_lifecycle(
                 candidate.clone(),
                 std::time::Instant::now(),
                 MinedBlockSubmission::CompactHeader,
             )
             .await
-            .expect("the RPC returns its verification response");
+            .expect("the RPC returns its verification response")
+        };
         if committed {
             assert_eq!(result, SubmitBlockResponse::Accepted);
         } else {
@@ -5739,6 +5844,7 @@ async fn rpc_getdifficulty() {
         miner_memo: None,
         internal_miner: true,
         optimistic_block_inventory: true,
+        miner_mesh: false,
     };
 
     // nu5 block height

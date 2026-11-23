@@ -32,21 +32,20 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use chrono::{DateTime, Utc};
 use zakura_chain::{
     block::{self, Height},
-    ironwood, orchard, sapling, sprout,
-    transaction::{self, Transaction, UnminedTx, UnminedTxId, VerifiedUnminedTx},
+    transaction::{self, UnminedTx, UnminedTxId, VerifiedUnminedTx},
     transparent::OutPoint,
 };
 use zakura_node_services::mempool::port::{
     ChainReason, ChainTip, Change, ChangeSeq, Charge, ConnectedBlock, LocalFault, PoolSnapshot,
     Rejection, RejectionDetail, RejectionScope, RemovalReason, ReservationId, Unreserved, Verdict,
-    MAX_PENDING, MAX_READMITTING, T_PARK, T_VERIFY,
+    MAX_PENDING, MAX_READMITTING, MAX_RELAYED, T_PARK, T_VERIFY,
 };
 use zakura_rt::collections::{HashMap, HashSet};
 
 use crate::{
     config::Config,
     storage::{
-        ExactTipRejectionError, RejectionError, SameEffectsChainRejectionError,
+        BlockRemovals, ExactTipRejectionError, RejectionError, SameEffectsChainRejectionError,
         SameEffectsTipRejectionError, Storage, StorageStats, MAX_MEMPOOL_ANCESTORS,
     },
     Instant, MempoolError,
@@ -200,6 +199,8 @@ pub struct Limits {
     /// Slots for pooled transactions verified again after a reset,
     /// [`MAX_READMITTING`].
     pub readmitting: usize,
+    /// Slots `tx-relay` fetches can hold, [`MAX_RELAYED`].
+    pub relayed: usize,
 }
 
 impl Default for Limits {
@@ -207,6 +208,7 @@ impl Default for Limits {
         Self {
             pending: MAX_PENDING,
             readmitting: MAX_READMITTING,
+            relayed: MAX_RELAYED,
         }
     }
 }
@@ -230,6 +232,8 @@ struct Admission<E> {
     /// body until `body` is set. `None` for a pooled transaction that a
     /// reset sent back through admission: nobody waits for its verdict.
     owner: Option<ReservationId>,
+    /// Whether a `tx-relay` fetch reserved it. See [`Limits::relayed`].
+    relayed: bool,
     body: Option<UnminedTx>,
     /// The submission that brought the body, which gets the verdict.
     waiter: Option<WaiterId>,
@@ -283,18 +287,6 @@ impl<E> Admission<E> {
     }
 }
 
-/// What the machine keeps about a pooled transaction, whose body is in
-/// storage.
-#[derive(Clone, Debug)]
-struct Pooled {
-    id: UnminedTxId,
-    /// The transactions whose outputs it spends.
-    parents: Vec<transaction::Hash>,
-    expiry: Option<Height>,
-    /// The machine's event count when it entered the pool.
-    added_at: u64,
-}
-
 /// A pooled transaction that a reset took out of the pool, waiting for a
 /// slot to be verified again.
 #[derive(Clone, Debug)]
@@ -310,55 +302,8 @@ struct Lease {
     tx_id: UnminedTxId,
     /// The verdict its admission got, which its caller gets too.
     verdict: Verdict,
-}
-
-/// The spends and nullifiers of a set of transactions, to find what conflicts
-/// with them.
-#[derive(Default)]
-struct Spends {
-    outpoints: HashSet<OutPoint>,
-    sprout: HashSet<sprout::Nullifier>,
-    sapling: HashSet<sapling::Nullifier>,
-    orchard: HashSet<orchard::Nullifier>,
-    ironwood: HashSet<ironwood::Nullifier>,
-}
-
-impl Spends {
-    /// The spends of `transactions`.
-    fn of<'a>(transactions: impl IntoIterator<Item = &'a Transaction>) -> Self {
-        let mut spends = Self::default();
-        for tx in transactions {
-            spends.add(tx);
-        }
-        spends
-    }
-
-    /// Adds the spends of `tx`.
-    fn add(&mut self, tx: &Transaction) {
-        self.outpoints.extend(tx.spent_outpoints());
-        self.sprout.extend(tx.sprout_nullifiers().copied());
-        self.sapling.extend(tx.sapling_nullifiers().copied());
-        self.orchard.extend(tx.orchard_nullifiers().copied());
-        self.ironwood.extend(tx.ironwood_nullifiers().copied());
-    }
-
-    /// Whether `tx` spends an output or reveals a nullifier these do.
-    fn conflict_with(&self, tx: &Transaction) -> bool {
-        tx.spent_outpoints()
-            .any(|outpoint| self.outpoints.contains(&outpoint))
-            || tx
-                .sprout_nullifiers()
-                .any(|nullifier| self.sprout.contains(nullifier))
-            || tx
-                .sapling_nullifiers()
-                .any(|nullifier| self.sapling.contains(nullifier))
-            || tx
-                .orchard_nullifiers()
-                .any(|nullifier| self.orchard.contains(nullifier))
-            || tx
-                .ironwood_nullifiers()
-                .any(|nullifier| self.ironwood.contains(nullifier))
-    }
+    /// Whether a `tx-relay` fetch holds it. See [`Limits::relayed`].
+    relayed: bool,
 }
 
 /// The tip before the chain names one. The pool is off until then.
@@ -405,16 +350,11 @@ pub struct MempoolState<E> {
     queued_cost: u64,
     /// The re-admissions under way. Each holds a slot.
     readmitting: usize,
-    /// Every pooled transaction, oldest first.
-    pool: BTreeMap<u64, Pooled>,
-    pooled: HashMap<transaction::Hash, u64>,
-    /// The pooled transactions that spend each transaction's outputs, so a
-    /// removal finds its dependents without a scan. Keyed by pool key, so a
-    /// removal is logarithmic however many children one confirmed parent
-    /// has, and dependents are found oldest first.
-    children: HashMap<transaction::Hash, BTreeMap<u64, transaction::Hash>>,
-    /// Each job's transaction, with the event count when it started.
-    jobs: HashMap<JobId, (UnminedTxId, u64)>,
+    /// The admissions and leases `tx-relay` fetches hold.
+    relaying: usize,
+    /// Each job's transaction, with the event count when it started and
+    /// storage's insertion count then. See [`Self::arrived_since`].
+    jobs: HashMap<JobId, (UnminedTxId, u64, u64)>,
     /// Changes returned in earlier steps. Each step is one batch of the log,
     /// so this is the log position of the last one.
     logged: u64,
@@ -443,9 +383,7 @@ impl<E: VerifyError> MempoolState<E> {
             queued: HashMap::default(),
             queued_cost: 0,
             readmitting: 0,
-            pool: BTreeMap::new(),
-            pooled: HashMap::default(),
-            children: HashMap::default(),
+            relaying: 0,
             jobs: HashMap::default(),
             logged: 0,
             step: Step::default(),
@@ -468,19 +406,31 @@ impl<E: VerifyError> MempoolState<E> {
         now: Instant,
     ) -> (Result<ReservationId, Unreserved>, Step) {
         self.enter(now);
-        let answer = self.grant(tx_id);
+        let answer = self.grant(tx_id, false);
+        (answer, self.take_step())
+    }
+
+    /// [`Self::reserve`] for a `tx-relay` fetch, which also needs room under
+    /// [`Limits::relayed`].
+    pub fn reserve_relayed(
+        &mut self,
+        tx_id: UnminedTxId,
+        now: Instant,
+    ) -> (Result<ReservationId, Unreserved>, Step) {
+        self.enter(now);
+        let answer = self.grant(tx_id, true);
         (answer, self.take_step())
     }
 
     /// Grants a reservation for `tx_id`, or says why not.
-    fn grant(&mut self, tx_id: UnminedTxId) -> Result<ReservationId, Unreserved> {
+    fn grant(&mut self, tx_id: UnminedTxId, relayed: bool) -> Result<ReservationId, Unreserved> {
         if !self.active {
             return Err(Unreserved::Inactive);
         }
         // A slot a deadline just freed goes to a re-admission that was
         // already waiting for one, before this reservation counts slots.
         self.start_queued();
-        if self.pooled.contains_key(&tx_id.mined_id()) {
+        if self.storage.contains(&tx_id.mined_id()) {
             return Err(Unreserved::Pooled);
         }
         if let Some(error) = self.cached_rejection(tx_id) {
@@ -497,7 +447,9 @@ impl<E: VerifyError> MempoolState<E> {
         if self.admission_of.contains_key(&tx_id) || self.queued.contains_key(&tx_id.mined_id()) {
             return Err(Unreserved::Pending);
         }
-        if self.slots_in_use() >= self.limits.pending {
+        if self.slots_in_use() >= self.limits.pending
+            || (relayed && self.relaying >= self.limits.relayed)
+        {
             return Err(Unreserved::NoRoom);
         }
         let owner = ReservationId(self.fresh());
@@ -507,6 +459,7 @@ impl<E: VerifyError> MempoolState<E> {
             Admission {
                 tx_id,
                 owner: Some(owner),
+                relayed,
                 body: None,
                 waiter: None,
                 stage: Stage::Reserved,
@@ -522,6 +475,9 @@ impl<E: VerifyError> MempoolState<E> {
         );
         self.admission_of.insert(tx_id, key);
         self.owners.insert(owner, key);
+        if relayed {
+            self.relaying = self.relaying.saturating_add(1);
+        }
         Ok(owner)
     }
 
@@ -575,7 +531,7 @@ impl<E: VerifyError> MempoolState<E> {
             // The admission this reservation was granted for ended while
             // its fetch was out. The caller gets that admission's verdict,
             // as if it had come in time.
-            let verdict = match self.leases.remove(&reservation) {
+            let verdict = match self.take_lease(reservation) {
                 Some(lease) => lease.verdict,
                 None => self.stale_verdict(tx_id),
             };
@@ -610,7 +566,7 @@ impl<E: VerifyError> MempoolState<E> {
         wall: DateTime<Utc>,
     ) -> Step {
         self.enter(now);
-        let Some((tx_id, started_at)) = self.jobs.remove(&job) else {
+        let Some((tx_id, started_at, insertions)) = self.jobs.remove(&job) else {
             // Cancelled, or timed out.
             return self.take_step();
         };
@@ -618,7 +574,7 @@ impl<E: VerifyError> MempoolState<E> {
         if started_at < self.tip_at {
             self.start_admission(key);
         } else {
-            self.admission_outcome(key, outcome, started_at, wall);
+            self.admission_outcome(key, outcome, insertions, wall);
         }
         self.take_step()
     }
@@ -636,31 +592,28 @@ impl<E: VerifyError> MempoolState<E> {
         }
         let now = self.now;
         self.storage.clear_tip_rejections();
-        // What the block mined, and what in the pool conflicts with it, are
-        // worked out before anything is removed. A pooled transaction that
-        // conflicts with a later block transaction is then found even if an
-        // earlier one already took its parent away.
         let mined = block.transaction_hashes;
         let mined_set: HashSet<transaction::Hash> = mined.iter().copied().collect();
-        let spends = Spends::of(block.transactions.iter().map(|tx| &**tx));
-        let conflicting: Vec<UnminedTxId> = self
-            .pool
-            .values()
-            .filter(|pooled| !mined_set.contains(&pooled.id.mined_id()))
-            .filter(|pooled| spends.conflict_with(self.transaction_of(pooled)))
-            .map(|pooled| pooled.id)
-            .collect();
+        // Storage removes what the block mined, keeping what depends on it:
+        // its parent is on the chain now. It then removes what conflicts
+        // with the block and what has expired, with what depends on them,
+        // and caches each. Expired ones here were not mined, because the
+        // block was seen.
+        let BlockRemovals {
+            mined: removed,
+            dropped,
+        } = self.storage.connect_block(
+            &mined,
+            block.transactions.iter().map(|tx| &**tx),
+            block.height,
+            now,
+        );
+        self.log_removed(removed.into_iter().map(|id| (id, RemovalReason::Mined)));
         for hash in mined.iter() {
-            if let Some(key) = self.pooled.get(hash).copied() {
-                // Its dependents stay. Their parent is on the chain now.
-                self.remove_one(key, RemovalReason::Mined);
-            }
             // Its removal at the reset is logged already.
             if let Some(key) = self.queued.get(hash).copied() {
                 self.unqueue(key);
             }
-            self.storage
-                .reject_effects_chain(*hash, SameEffectsChainRejectionError::Mined, now);
         }
         // Today's pool cancels the download and verification of anything a
         // block mined. The undecided ones end here, and a fetch still out is
@@ -683,18 +636,7 @@ impl<E: VerifyError> MempoolState<E> {
                 Charge::None,
             );
         }
-        for conflict in conflicting {
-            self.remove_with_dependents(conflict.mined_id(), RemovalReason::Conflicted);
-            self.storage.reject_effects_chain(
-                conflict.mined_id(),
-                SameEffectsChainRejectionError::DuplicateSpend,
-                now,
-            );
-        }
-        // The block was seen, and what it mined is gone already. So an
-        // expired transaction here was not mined, and what depends on it goes
-        // with it.
-        self.remove_expired();
+        self.log_removed(dropped);
         // One pass over the parked lists, which can be long: an unknown input
         // parks a transaction on every transparent spend.
         self.wake(|parent| mined_set.contains(parent));
@@ -719,23 +661,13 @@ impl<E: VerifyError> MempoolState<E> {
         }
         self.mark_reset();
         self.storage.clear_rejections();
-        let mut bodies: HashMap<transaction::Hash, VerifiedUnminedTx> = self
-            .storage
-            .take_all()
-            .into_iter()
-            .map(|tx| (tx.transaction.id().mined_id(), tx))
-            .collect();
-        self.pooled.clear();
-        self.children.clear();
-        for pooled in std::mem::take(&mut self.pool).into_values() {
-            let hash = pooled.id.mined_id();
-            let body = bodies
-                .remove(&hash)
-                .expect("storage holds every pooled transaction");
+        for body in self.storage.take_all() {
+            let id = body.transaction.id();
+            let hash = id.mined_id();
             // Expiry needs no verifier, only the new tip.
-            if self.reached(pooled.expiry) {
+            if self.reached(body.transaction.transaction().expiry_height()) {
                 self.step.changes.push(Change::Removed {
-                    id: pooled.id,
+                    id,
                     reason: RemovalReason::Expired,
                 });
                 self.storage.reject_effects_chain(
@@ -746,7 +678,7 @@ impl<E: VerifyError> MempoolState<E> {
                 continue;
             }
             self.step.changes.push(Change::Removed {
-                id: pooled.id,
+                id,
                 reason: RemovalReason::Reset,
             });
             let key = self.fresh();
@@ -796,7 +728,7 @@ impl<E: VerifyError> MempoolState<E> {
     pub fn known_ids(&self, mut ids: HashSet<UnminedTxId>, now: Instant) -> HashSet<UnminedTxId> {
         let now = now.max(self.now);
         ids.retain(|id| {
-            self.pooled.contains_key(&id.mined_id())
+            self.storage.contains(&id.mined_id())
                 || self.admission_of.contains_key(id)
                 || self.queued.contains_key(&id.mined_id())
                 || self.storage.rejection(id, now).is_some()
@@ -862,7 +794,7 @@ impl<E: VerifyError> MempoolState<E> {
     /// What the pool holds, for its size gauges.
     pub fn pool_counts(&self) -> PoolCounts {
         PoolCounts {
-            pooled: self.pool.len(),
+            pooled: self.storage.transaction_count(),
             readmitting: self.queue.len().saturating_add(self.readmitting),
         }
     }
@@ -899,12 +831,12 @@ impl<E: VerifyError> MempoolState<E> {
     /// The pool, oldest first.
     #[cfg(test)]
     pub(crate) fn pooled_ids(&self) -> Vec<UnminedTxId> {
-        self.pool.values().map(|pooled| pooled.id).collect()
+        self.storage.pooled_ids()
     }
 
     /// How many transactions are pooled.
     pub fn pooled_count(&self) -> usize {
-        self.pool.len()
+        self.storage.transaction_count()
     }
 
     /// How many transactions are undecided: reserved, fetched or being
@@ -1007,7 +939,7 @@ impl<E: VerifyError> MempoolState<E> {
                 "the queue is indexed by mined id"
             );
             assert!(
-                !self.pooled.contains_key(&queued.tx.id().mined_id()),
+                !self.storage.contains(&queued.tx.id().mined_id()),
                 "nothing pooled also waits to be verified again"
             );
         }
@@ -1029,46 +961,32 @@ impl<E: VerifyError> MempoolState<E> {
             self.readmitting <= self.limits.readmitting,
             "pool/readmission-within-limit: the re-admission share"
         );
+        let relaying = self
+            .admissions
+            .values()
+            .filter(|admission| admission.relayed)
+            .count()
+            + self.leases.values().filter(|lease| lease.relayed).count();
+        assert_eq!(
+            relaying, self.relaying,
+            "the tx-relay count matches the admissions and leases"
+        );
+        assert!(
+            self.relaying <= self.limits.relayed,
+            "pool/relayed-within-limit: the tx-relay share"
+        );
         assert!(
             self.storage.total_cost().saturating_add(self.queued_cost) <= self.storage.cost_limit(),
             "pool/cost-within-limit: the pool and the queue together stay within the cost limit"
         );
-        for (key, pooled) in &self.pool {
-            let hash = pooled.id.mined_id();
-            let expected: BTreeMap<u64, transaction::Hash> = self
-                .pool
-                .iter()
-                .filter(|(_, child)| child.parents.contains(&hash))
-                .map(|(child_key, child)| (*child_key, child.id.mined_id()))
-                .collect();
-            let indexed = self.children.get(&hash).cloned().unwrap_or_default();
-            assert_eq!(
-                indexed, expected,
-                "the children index matches the pool at {key}"
-            );
-            assert_eq!(
-                self.pooled.get(&hash),
-                Some(key),
-                "the pool is indexed by id"
-            );
+        for tx in self.storage.transactions().values() {
             assert!(
-                pooled.expiry.is_none_or(|expiry| self.tip.height < expiry),
+                tx.transaction
+                    .transaction()
+                    .expiry_height()
+                    .is_none_or(|expiry| self.tip.height < expiry),
                 "pool/consistent: no expired transaction"
             );
-        }
-        assert_eq!(
-            self.storage.transaction_count(),
-            self.pool.len(),
-            "storage holds exactly the pool"
-        );
-        let mut spends = Spends::default();
-        for pooled in self.pool.values() {
-            let tx = self.transaction_of(pooled);
-            assert!(
-                !spends.conflict_with(tx),
-                "pool/consistent: no two pooled transactions conflict"
-            );
-            spends.add(tx);
         }
         self.storage.assert_invariants();
         // Nothing that can start is left waiting, and nothing past its
@@ -1220,7 +1138,16 @@ impl<E: VerifyError> MempoolState<E> {
         if let Some(key) = self.owners.remove(&reservation) {
             self.end(key);
         }
-        self.leases.remove(&reservation);
+        self.take_lease(reservation);
+    }
+
+    /// Frees `reservation`'s lease, if it has one.
+    fn take_lease(&mut self, reservation: ReservationId) -> Option<Lease> {
+        let lease = self.leases.remove(&reservation)?;
+        if lease.relayed {
+            self.relaying = self.relaying.saturating_sub(1);
+        }
+        Some(lease)
     }
 
     /// Applies a fresh outcome to an undecided transaction.
@@ -1228,7 +1155,7 @@ impl<E: VerifyError> MempoolState<E> {
         &mut self,
         key: u64,
         outcome: Outcome<E>,
-        started_at: u64,
+        insertions: u64,
         wall: DateTime<Utc>,
     ) {
         let now = self.now;
@@ -1256,7 +1183,7 @@ impl<E: VerifyError> MempoolState<E> {
                 // set of authorizing data for the same effects got in while
                 // this one was verified. That is a duplicate, not a conflict,
                 // and nothing is cached against the transaction the pool holds.
-                if self.pooled.contains_key(&hash) {
+                if self.storage.contains(&hash) {
                     self.refuse(key, MempoolError::InMempool);
                     return;
                 }
@@ -1295,31 +1222,14 @@ impl<E: VerifyError> MempoolState<E> {
                     now,
                     wall,
                 );
-                self.forget_evicted(evicted);
+                // Storage has removed and cached what it evicted.
+                self.log_removed(evicted.into_iter().map(|id| (id, RemovalReason::Evicted)));
                 if let Err(error) = result {
                     // Storage has cached what it refused.
                     self.refuse(key, error);
                     return;
                 }
                 self.step.changes.push(Change::Added(tx.transaction.id()));
-                let pool_key = self.fresh();
-                let parents = parents_of(tx.transaction.transaction());
-                for parent in &parents {
-                    self.children
-                        .entry(*parent)
-                        .or_default()
-                        .insert(pool_key, hash);
-                }
-                self.pool.insert(
-                    pool_key,
-                    Pooled {
-                        id: tx.transaction.id(),
-                        parents,
-                        expiry: tx.transaction.transaction().expiry_height(),
-                        added_at: pool_key,
-                    },
-                );
-                self.pooled.insert(hash, pool_key);
                 self.decide(key, Verdict::Admitted);
                 // Another authorization of these effects that a reset left
                 // waiting has nothing to come back to.
@@ -1352,7 +1262,7 @@ impl<E: VerifyError> MempoolState<E> {
                 // nothing would wake this transaction. It runs again at once.
                 let arrived = missing
                     .iter()
-                    .any(|outpoint| self.arrived_since(outpoint, started_at));
+                    .any(|outpoint| self.arrived_since(outpoint, insertions));
                 let admission = self.admission_at(key);
                 admission.missing_error = Some(error.clone());
                 let since = *admission.missing_since.get_or_insert(now);
@@ -1444,8 +1354,12 @@ impl<E: VerifyError> MempoolState<E> {
                     Lease {
                         tx_id: admission.tx_id,
                         verdict: verdict.clone(),
+                        relayed: admission.relayed,
                     },
                 );
+                if admission.relayed {
+                    self.relaying = self.relaying.saturating_add(1);
+                }
             }
         }
         if let Some(waiter) = admission.waiter {
@@ -1462,6 +1376,9 @@ impl<E: VerifyError> MempoolState<E> {
         self.admission_of.remove(&admission.tx_id);
         if admission.owner.is_none() {
             self.readmitting = self.readmitting.saturating_sub(1);
+        }
+        if admission.relayed {
+            self.relaying = self.relaying.saturating_sub(1);
         }
         admission
     }
@@ -1483,6 +1400,7 @@ impl<E: VerifyError> MempoolState<E> {
                 Admission {
                     tx_id,
                     owner: None,
+                    relayed: false,
                     body: Some(tx),
                     waiter: None,
                     stage: Stage::Reserved,
@@ -1528,7 +1446,7 @@ impl<E: VerifyError> MempoolState<E> {
 
     /// The answer to a body whose reservation no longer names an admission.
     fn stale_verdict(&self, tx_id: UnminedTxId) -> Verdict {
-        if self.pooled.contains_key(&tx_id.mined_id()) {
+        if self.storage.contains(&tx_id.mined_id()) {
             return Verdict::Rejected(rejection(
                 self.tip,
                 RejectionScope::Uncached,
@@ -1563,7 +1481,8 @@ impl<E: VerifyError> MempoolState<E> {
             .body
             .clone()
             .expect("an admission is verified only once it holds its body");
-        self.jobs.insert(job, (tx_id, job.0));
+        self.jobs
+            .insert(job, (tx_id, job.0, self.storage.insertions()));
         self.step.effects.push(Effect::Start {
             job,
             tx,
@@ -1623,25 +1542,6 @@ impl<E: VerifyError> MempoolState<E> {
         }
     }
 
-    /// Removes every pooled transaction whose expiry height the tip has
-    /// reached, with what depends on it, and remembers each as expired.
-    fn remove_expired(&mut self) {
-        let expired: Vec<transaction::Hash> = self
-            .pool
-            .values()
-            .filter(|pooled| self.reached(pooled.expiry))
-            .map(|pooled| pooled.id.mined_id())
-            .collect();
-        for hash in expired {
-            self.remove_with_dependents(hash, RemovalReason::Expired);
-            self.storage.reject_effects_chain(
-                hash,
-                SameEffectsChainRejectionError::Expired,
-                self.now,
-            );
-        }
-    }
-
     /// Marks every undecided transaction as reset. See [`Effect::Start`].
     fn mark_reset(&mut self) {
         for admission in self.admissions.values_mut() {
@@ -1671,72 +1571,13 @@ impl<E: VerifyError> MempoolState<E> {
         self.decide(key, Verdict::LocalFault(fault));
     }
 
-    /// Takes the pooled transaction at `key` off its parents' lists of
-    /// children.
-    fn forget_parents(&mut self, key: u64, parents: &[transaction::Hash]) {
-        for parent in parents {
-            if let Some(children) = self.children.get_mut(parent) {
-                children.remove(&key);
-                if children.is_empty() {
-                    self.children.remove(parent);
-                }
-            }
-        }
-    }
-
-    /// Removes one pooled transaction and logs it. What depends on it stays.
-    fn remove_one(&mut self, key: u64, reason: RemovalReason) {
-        let Some(pooled) = self.pool.remove(&key) else {
-            return;
-        };
-        let hash = pooled.id.mined_id();
-        self.pooled.remove(&hash);
-        self.forget_parents(key, &pooled.parents);
-        self.storage.remove_one(&hash);
-        self.step.changes.push(Change::Removed {
-            id: pooled.id,
-            reason,
-        });
-    }
-
-    /// Removes a pooled transaction and everything in the pool that spends its
-    /// outputs. The dependents leave as invalidated.
-    fn remove_with_dependents(&mut self, hash: transaction::Hash, reason: RemovalReason) {
-        let Some(key) = self.pooled.get(&hash).copied() else {
-            return;
-        };
-        self.remove_one(key, reason);
-        let dependents: Vec<transaction::Hash> = self
-            .children
-            .get(&hash)
-            .map(|children| children.values().copied().collect())
-            .unwrap_or_default();
-        for dependent in dependents {
-            self.remove_with_dependents(dependent, RemovalReason::Invalidated);
-        }
-    }
-
-    /// Forgets the transactions storage evicted to make room, and logs them.
-    /// Storage has removed them and cached each one.
-    fn forget_evicted(&mut self, evicted: HashSet<UnminedTxId>) {
-        let mut keys: Vec<u64> = evicted
-            .iter()
-            .filter_map(|id| self.pooled.get(&id.mined_id()).copied())
-            .collect();
-        keys.sort_unstable();
-        for key in keys {
-            let pooled = self
-                .pool
-                .remove(&key)
-                .expect("storage evicts only what the pool holds");
-            let hash = pooled.id.mined_id();
-            self.pooled.remove(&hash);
-            self.forget_parents(key, &pooled.parents);
-            self.step.changes.push(Change::Removed {
-                id: pooled.id,
-                reason: RemovalReason::Evicted,
-            });
-        }
+    /// Logs what storage removed, in its order.
+    fn log_removed(&mut self, removed: impl IntoIterator<Item = (UnminedTxId, RemovalReason)>) {
+        self.step.changes.extend(
+            removed
+                .into_iter()
+                .map(|(id, reason)| Change::Removed { id, reason }),
+        );
     }
 
     /// The cached rejection that covers `tx_id` now, if any.
@@ -1749,30 +1590,20 @@ impl<E: VerifyError> MempoolState<E> {
         expiry.is_some_and(|expiry| self.tip.height >= expiry)
     }
 
-    /// Whether `outpoint` became available after the event count
-    /// `started_at`: its transaction is pooled now, creates that output, and
-    /// entered the pool after that count.
-    fn arrived_since(&self, outpoint: &OutPoint, started_at: u64) -> bool {
+    /// Whether `outpoint` became available after storage's insertion count
+    /// was `insertions`: its transaction is pooled now, creates that output,
+    /// and entered the pool after that count.
+    fn arrived_since(&self, outpoint: &OutPoint, insertions: u64) -> bool {
         self.offers(outpoint)
             && self
-                .pooled
-                .get(&outpoint.hash)
-                .is_some_and(|key| self.pool[key].added_at > started_at)
+                .storage
+                .added_at(&outpoint.hash)
+                .is_some_and(|added_at| added_at > insertions)
     }
 
     /// Whether the pool offers `outpoint`.
     fn offers(&self, outpoint: &OutPoint) -> bool {
         self.storage.created_output(outpoint).is_some()
-    }
-
-    /// A pooled transaction's body, which storage holds.
-    fn transaction_of(&self, pooled: &Pooled) -> &Transaction {
-        self.storage
-            .transactions()
-            .get(&pooled.id.mined_id())
-            .expect("storage holds every pooled transaction")
-            .transaction
-            .transaction()
     }
 
     fn admission_at(&mut self, key: u64) -> &mut Admission<E> {
@@ -1821,22 +1652,17 @@ impl<E: VerifyError> MempoolState<E> {
             .effects
             .extend(fetching.into_iter().map(Effect::CancelFetch));
         self.owners.clear();
-        let keys: Vec<u64> = self.pool.keys().copied().collect();
-        for key in keys {
-            self.remove_one(key, RemovalReason::Deactivated);
-        }
+        let removed = self.storage.take_all();
+        self.log_removed(
+            removed
+                .iter()
+                .map(|tx| (tx.transaction.id(), RemovalReason::Deactivated)),
+        );
         // What a reset took out left the pool then, and that is logged.
         self.queue.clear();
         self.queued.clear();
         self.queued_cost = 0;
-        // Every pooled transaction was removed, so storage is empty and only
-        // its rejection lists are left.
         self.storage.clear_rejections();
-        debug_assert_eq!(
-            self.storage.transaction_count(),
-            0,
-            "storage held only the pool"
-        );
         self.active = false;
     }
 
@@ -1878,15 +1704,4 @@ fn scope_of<E>(error: &MempoolError<E>) -> RejectionScope {
         | MempoolError::FullQueue
         | MempoolError::Disabled => RejectionScope::Uncached,
     }
-}
-
-/// The transactions whose outputs `tx` spends.
-fn parents_of(tx: &Transaction) -> Vec<transaction::Hash> {
-    let mut parents: Vec<transaction::Hash> = Vec::new();
-    for outpoint in tx.spent_outpoints() {
-        if !parents.contains(&outpoint.hash) {
-            parents.push(outpoint.hash);
-        }
-    }
-    parents
 }

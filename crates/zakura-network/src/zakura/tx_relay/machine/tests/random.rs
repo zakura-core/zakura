@@ -50,8 +50,8 @@ const BAD: u64 = 4;
 const SESSIONS: usize = 7;
 
 /// The coverage list: every kind the runs must reach, `;`-separated.
-const REACHED: &str = "reserve; ask; submit; release; fetch failed; advert; inv taken;
-    inv child waited; serve;
+const REACHED: &str = "reserve; ask; submit; release; fetch failed; advert; have taken;
+    have child waited; serve;
     answer not found; close Violation(HelloTwice); close Violation(BadHello);
     close Violation(NoHelloFirst); close Violation(Unrequested); close Violation(WrongSize);
     close Violation(WrongId); close Violation(Undecodable); close Violation(RequestedTwice);
@@ -200,7 +200,7 @@ impl Run {
         (!open.is_empty()).then(|| open[self.rng.below(open.len())])
     }
 
-    /// The ids that went out to `session` in an `Inv` and still stand.
+    /// The ids that went out to `session` in a `Have` and still stand.
     fn sent(&self, session: SessionId) -> Vec<UnminedTxId> {
         let open = self.bench.tracker.open.get(&session);
         open.map(|open| open.sent.iter().copied().collect())
@@ -284,7 +284,7 @@ impl Run {
         match self.rng.below(50) {
             0..=3 => self.connect(),
             4 => self.hello(),
-            5..=12 => self.inv(),
+            5..=12 => self.have(),
             13..=19 => self.answer_request(),
             20 if self.rng.one_in(3) => self.unrequested(),
             21 | 22 => self.get_txs(),
@@ -299,7 +299,7 @@ impl Run {
             40 | 41 => self.change(),
             42 => self.chain(),
             43 => self.toggle(),
-            44 | 45 => self.take_inv(),
+            44 | 45 => self.take_have(),
             46 => self.rtt(),
             47 if self.stops(near_end, 2) => {
                 self.note(|_| "the IO sees the core stop".to_owned());
@@ -367,7 +367,7 @@ impl Run {
 
     /// A session's peer announces a few ids: some pooled, some it was sent,
     /// some twice, some at a wrong size.
-    fn inv(&mut self) {
+    fn have(&mut self) {
         let Some(session) = self.session() else {
             return self.tick();
         };
@@ -394,7 +394,7 @@ impl Run {
                 .collect();
             format!("{} announces {named:?}", session.0)
         });
-        self.bench.inv_sized(session, &entries);
+        self.bench.have_sized(session, &entries);
     }
 
     /// A peer answers one of its requests, as its behaviour says.
@@ -688,22 +688,22 @@ impl Run {
     }
 
     /// A session's IO takes some of its queued adverts.
-    fn take_inv(&mut self) {
+    fn take_have(&mut self) {
         let Some(session) = self.session() else {
             return self.tick();
         };
         let taken = if self.rng.one_in(2) {
-            self.bench.take_inv(session, 1 + self.rng.below(4))
+            self.bench.take_have(session, 1 + self.rng.below(4))
         } else {
             // The IO's paced path, with a writer short of room now and then,
-            // its last `Inv` unwritten, or the byte rate short.
+            // its last `Have` unwritten, or the byte rate short.
             let free = MAX_SERVES + self.rng.below(3);
             let paid = match self.rng.below(4) {
                 0 => Paid::Unwritten,
                 1 => Paid::At(self.bench.now + self.rng.millis(2_000)),
                 _ => Paid::Now,
             };
-            self.bench.send_inv(session, free, paid)
+            self.bench.send_have(session, free, paid)
         };
         self.note(|run| {
             let named = taken.iter().map(|id| run.name(*id));

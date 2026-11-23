@@ -28,6 +28,10 @@ impl Queries {
     ) -> Result<Option<Asked>, ClaimRefused> {
         self.claim(message_type, payload_len)
             .map(|answer| answer.map(|answer| answer.admitted.asked.clone()))
+            .map_err(|unclaimed| match unclaimed {
+                Unclaimed::Refused(refused) => refused,
+                Unclaimed::Retired => panic!("the session's queries are live"),
+            })
     }
 }
 
@@ -452,6 +456,46 @@ async fn retiring_closes_the_connection_only_for_an_unanswered_written_query() {
     assert_eq!(pool.held(), 0, "retiring returns every reservation");
 }
 
+/// The transport reader can queue an answer just before the session retires
+/// its queries, and the reader can take it just after (#2632). The claim
+/// finds the queries retired and judges nothing, so a conformant peer's
+/// answer neither trips the queue's ledger nor counts as unsolicited. The
+/// same holds for an answer whose header the transport reader checks after
+/// the retirement.
+#[tokio::test]
+async fn an_answer_queued_before_retirement_claims_nothing() {
+    let pool = reservation_pool();
+    let slot = PrecheckSlot::default();
+    let (_peer, recv) = framed_channel(1);
+    let recv = recv.with_precheck(slot.clone());
+    let Session {
+        queries,
+        mut written,
+        ..
+    } = session_with(pool.clone(), &recv);
+    queries.send_get_peers(get_peers(1)).await.unwrap();
+    written.recv().await.expect("the query is written");
+    let precheck = slot.get().expect("the session attached its precheck");
+    precheck
+        .check(PEERS, peers_len(1))
+        .expect("the transport admits the owed answer");
+
+    queries.retire();
+    assert!(matches!(
+        queries.claim(PEERS, peers_len(1)),
+        Err(Unclaimed::Retired)
+    ));
+    assert_eq!(pool.held(), 0, "retiring returns every reservation");
+
+    // A transport reader inside a read can check the next answer's header
+    // after the retirement too. It reaches the reader, which drops it.
+    assert_eq!(precheck.check(PEERS, peers_len(1)), Ok(()));
+    assert!(matches!(
+        queries.claim(PEERS, peers_len(1)),
+        Err(Unclaimed::Retired)
+    ));
+}
+
 /// A claim ends the query's protocol authority. The answer keeps the pool
 /// entry and its kind until it settles, so a refresh cannot stack a second
 /// answer behind one that waits for verification.
@@ -473,7 +517,7 @@ async fn a_claimed_answer_holds_its_entry_and_kind_until_it_settles() {
     assert_eq!(pool.held(), 1, "the claimed answer keeps its pool entry");
     assert!(matches!(
         queries.claim(PEERS, 2),
-        Err(ClaimRefused::Unsolicited { .. })
+        Err(Unclaimed::Refused(ClaimRefused::Unsolicited { .. }))
     ));
     assert!(
         matches!(

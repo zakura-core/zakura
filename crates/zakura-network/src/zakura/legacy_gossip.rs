@@ -828,15 +828,27 @@ impl LegacyResponseCodec {
                 for block in blocks {
                     match block {
                         InventoryResponse::Available((block, _)) => {
-                            push_chunked_response(
-                                &mut frames,
-                                &mut budget,
-                                MSG_RESPONSE_BLOCK,
-                                request_id,
-                                max_frame_bytes,
-                                max_message_bytes,
-                                block.zcash_serialize_to_vec()?,
-                            )?;
+                            // A withdrawn temporary body is reported missing, as on legacy TCP.
+                            // Encoding is this transport's write start: frames are queued to the
+                            // stream only after it.
+                            let encoded = match block.pending_send() {
+                                Some(permit) => {
+                                    permit.try_start_write(|| block.zcash_serialize_to_vec())
+                                }
+                                None => Some(block.zcash_serialize_to_vec()),
+                            };
+                            match encoded {
+                                Some(bytes) => push_chunked_response(
+                                    &mut frames,
+                                    &mut budget,
+                                    MSG_RESPONSE_BLOCK,
+                                    request_id,
+                                    max_frame_bytes,
+                                    max_message_bytes,
+                                    bytes?,
+                                )?,
+                                None => missing.push(block.hash()),
+                            }
                         }
                         InventoryResponse::Missing(hash) => missing.push(hash),
                     }
@@ -7815,6 +7827,66 @@ mod tests {
             blocks.as_slice(),
             [InventoryResponse::Available((received, None))] if received.hash() == block.hash()
         ));
+
+        Ok(())
+    }
+
+    /// The v2 compatibility adapter applies the same withdrawal as legacy TCP: a temporary body
+    /// whose submission failed before encoding is reported missing, while a committed one is sent.
+    #[test]
+    fn encode_response_reports_withdrawn_pending_bodies_missing() -> Result<(), BoxError> {
+        use zakura_node_services::block_relay::{
+            PendingBlockSendPermit, PendingBlockStatus, ServedBlock,
+        };
+
+        let block = Arc::new(Block::zcash_deserialize(
+            BLOCK_TESTNET_141042_BYTES.as_slice(),
+        )?);
+        let cap = u32::try_from(MAX_PROTOCOL_MESSAGE_LEN)?;
+        let encode = |permit: PendingBlockSendPermit| {
+            LegacyResponseCodec::encode_response(
+                9,
+                Response::Blocks(vec![InventoryResponse::Available((
+                    ServedBlock {
+                        block: block.clone().into(),
+                        pending_send: Some(permit),
+                    }
+                    .into(),
+                    None,
+                ))]),
+                cap,
+                cap,
+            )
+        };
+
+        let (status, withdrawn) = PendingBlockSendPermit::channel();
+        status.send_replace(PendingBlockStatus::Failed);
+        let frames = encode(withdrawn)?;
+        assert_eq!(
+            frames
+                .iter()
+                .map(|frame| frame.message_type)
+                .collect::<Vec<_>>(),
+            vec![MSG_RESPONSE_MISSING_BLOCKS],
+            "a withdrawn body is never encoded"
+        );
+        let Response::Blocks(blocks) =
+            LegacyResponseCodec::decode_response(9, LegacyRequestKind::Blocks, frames, None)?
+        else {
+            panic!("a block request decodes as a block response");
+        };
+        assert_eq!(blocks, vec![InventoryResponse::Missing(block.hash())]);
+
+        let (status, committed) = PendingBlockSendPermit::channel();
+        status.send_replace(PendingBlockStatus::Committed);
+        // A same-hash retry has its own permit, unaffected by the withdrawn attempt.
+        let (_retry_status, retry) = PendingBlockSendPermit::channel();
+        for permit in [committed, retry] {
+            let frames = encode(permit)?;
+            assert!(frames
+                .iter()
+                .all(|frame| frame.message_type == MSG_RESPONSE_BLOCK));
+        }
 
         Ok(())
     }

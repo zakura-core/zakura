@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
-"""Inventory retained mutation bindings without applying patches or running builds."""
+"""Inventory retained mutation bindings without applying patches or running builds.
+
+The patches and their case files live in the QA store (`scripts/qa_store.py`),
+`--store` or `$ZAKURA_QA_STORE`. The code they patch and the checks they name
+live in the repository."""
 
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -36,8 +41,8 @@ def sha256(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def typed_binding(root, patch, case):
-    """Check a typed case's committed scenario and Plan bytes, if any. No fuzz target runs one.
+def typed_binding(root, store, patch, case):
+    """Check a typed case's stored scenario and Plan bytes, if any. No fuzz target runs one.
 
     A typed case without Plan bytes runs the empty Plan."""
     typed = case["typed"]
@@ -46,7 +51,7 @@ def typed_binding(root, patch, case):
     for name in ("scenario", "plan"):
         if name not in typed:
             continue
-        path = root / typed[name]
+        path = store / typed[name]
         if path.is_file():
             files[name] = sha256(path)
         else:
@@ -55,7 +60,7 @@ def typed_binding(root, patch, case):
         if not (root / check).exists():
             errors.append(f"missing dependency path: {check}")
     return {
-        "property": patch.parent.relative_to(root / "qa/planted").as_posix(),
+        "property": patch.parent.relative_to(store / "qa/planted").as_posix(),
         "seed": None,
         "scenario": typed["scenario"],
         "scenario_sha256": files.get("scenario"),
@@ -68,7 +73,7 @@ def typed_binding(root, patch, case):
     }
 
 
-def planted_binding(root, patch):
+def planted_binding(root, store, patch):
     """Check the case's form, its typed files or seed name, and its checks.
 
     A seed case names a seed of the simulator's registry, which builds the
@@ -79,7 +84,7 @@ def planted_binding(root, patch):
     if ("seed" in case) == ("typed" in case):
         raise ValueError("a case names either `seed` or `[typed]`")
     if "typed" in case:
-        return typed_binding(root, patch, case)
+        return typed_binding(root, store, patch, case)
     errors = []
     if not case["seed"].strip():
         errors.append("the case names an empty seed")
@@ -87,7 +92,7 @@ def planted_binding(root, patch):
         if not (root / check).exists():
             errors.append(f"missing dependency path: {check}")
     return {
-        "property": patch.parent.relative_to(root / "qa/planted").as_posix(),
+        "property": patch.parent.relative_to(store / "qa/planted").as_posix(),
         "seed": case["seed"],
         "harness": None,
         "fuzz_targets": [],
@@ -275,14 +280,14 @@ def work_list_ids(work_list):
     return entries
 
 
-def witness_binding(root, witness):
+def witness_binding(root, store, witness):
     """Check one loop witness: a planted case's witness, a seed by name, or
     one `zakura-sim` integration test. Returns its errors."""
     forms = [key for key in ("planted", "seed", "test") if key in witness]
     if len(forms) != 1:
         return [f"a witness names exactly one of planted, seed or test, not {forms}"]
     if "planted" in witness:
-        path = root / witness["planted"]
+        path = store / witness["planted"]
         if not path.is_file():
             return [f"missing planted case: {witness['planted']}"]
         case = tomllib.loads(path.read_text())
@@ -302,7 +307,7 @@ def witness_binding(root, witness):
     return errors
 
 
-def loop_binding(root, patch, cases, work_list):
+def loop_binding(root, store, patch, cases, work_list):
     """Check a loop patch: it changes production files only, its README
     names each ID it must fail, and each `cases.json` entry names one of
     those IDs, a work-list entry covering it, and one witness."""
@@ -343,7 +348,7 @@ def loop_binding(root, patch, cases, work_list):
                 errors.append(f"{property_id}: entry {case['entry']} doesn't cover it")
         if "fault_class" in case and case["fault_class"] not in FAULT_CLASSES:
             errors.append(f"{property_id}: unknown fault class {case['fault_class']}")
-        errors.extend(f"{property_id}: {error}" for error in witness_binding(root, case.get("witness", {})))
+        errors.extend(f"{property_id}: {error}" for error in witness_binding(root, store, case.get("witness", {})))
     if sorted(named) != sorted(required):
         errors.append(f"cases.json names {sorted(named)}, the README {sorted(required)}")
     return {
@@ -370,18 +375,20 @@ def witness_errors(root):
     return errors
 
 
-def inventory(root, loop_only=False, cases_dir=None):
-    """Return one row per retained patch and every static validation failure.
+def inventory(root, loop_only=False, cases_dir=None, store=None):
+    """Return one row per retained patch of the QA store `store` (`root`
+    without one) and every static validation failure.
     With `loop_only`, only the mutation loop's patches: those whose
     `cases.json` entries name a property. With `cases_dir`, every patch of
     that directory, such as a generator's output before triage, against the
     directory's own `cases.json`, whose patch paths are relative to it; each
     patch must have a loop mapping."""
-    native_dir = Path(cases_dir) if cases_dir is not None else root / "qa/native-mutations"
+    store = Path(store) if store is not None else root
+    native_dir = Path(cases_dir) if cases_dir is not None else store / "qa/native-mutations"
     native = json.loads((native_dir / "cases.json").read_text())
     work_list = (
-        tomllib.loads((root / WORK_LIST).read_text())
-        if (root / WORK_LIST).is_file() else {"entry": []}
+        tomllib.loads((store / WORK_LIST).read_text())
+        if (store / WORK_LIST).is_file() else {"entry": []}
     )
     mappings = {}
     loops = {}
@@ -389,7 +396,7 @@ def inventory(root, loop_only=False, cases_dir=None):
     def patch_path(name):
         full = native_dir / name
         try:
-            return full.relative_to(root).as_posix()
+            return full.relative_to(store).as_posix()
         except ValueError:
             return full.as_posix()
 
@@ -405,8 +412,8 @@ def inventory(root, loop_only=False, cases_dir=None):
             errors.append(f"duplicate native mapping: {path}")
         mappings[path] = case
     patches = sorted([
-        *(root / "qa/planted").rglob("*.patch"),
-        *(root / "qa/native-mutations").rglob("*.patch"),
+        *(store / "qa/planted").rglob("*.patch"),
+        *(store / "qa/native-mutations").rglob("*.patch"),
     ])
     if cases_dir is not None:
         # Every generated patch is a loop case: one with no loop mapping, or
@@ -432,9 +439,9 @@ def inventory(root, loop_only=False, cases_dir=None):
         row["apply_error"] = checked.stderr.strip() or None
         try:
             if path.startswith("qa/planted/"):
-                row.update(planted_binding(root, patch))
+                row.update(planted_binding(root, store, patch))
             elif path in loops:
-                row.update(loop_binding(root, patch, loops.pop(path), work_list))
+                row.update(loop_binding(root, store, patch, loops.pop(path), work_list))
             else:
                 row.update(native_binding(root, mappings.pop(path)))
         except (OSError, KeyError, ValueError, StopIteration) as error:
@@ -465,9 +472,17 @@ def main(argv=None):
         "--cases", type=Path,
         help="check the loop patches of this directory's cases.json instead",
     )
+    parser.add_argument(
+        "--store", type=Path, default=os.environ.get("ZAKURA_QA_STORE") or None,
+        help="the QA store that holds the cases; $ZAKURA_QA_STORE by default",
+    )
     args = parser.parse_args(argv)
+    if args.store is None:
+        parser.error("name the QA store with --store or $ZAKURA_QA_STORE (scripts/qa_store.py pull)")
     root = Path(__file__).resolve().parents[1]
-    report = inventory(root, loop_only=args.loop, cases_dir=args.cases and args.cases.resolve())
+    report = inventory(
+        root, loop_only=args.loop, cases_dir=args.cases and args.cases.resolve(), store=args.store.resolve(),
+    )
     args.output.write_text(json.dumps(report, indent=2) + "\n")
     failures = len(report["errors"]) + sum(
         bool(row["errors"]) or row["apply"] != "passed" for row in report["cases"]

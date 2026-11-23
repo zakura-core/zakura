@@ -3,8 +3,8 @@
 //! - conn-21: a replaced registration keeps its per-IP charge, and each of
 //!   its holders keeps its own charge, until that holder ends.
 //! - conn-22: after a disconnect, a panic and a cancellation, the IP slots,
-//!   frame grants, queued output, owners and admission permits return to
-//!   the values they had before the peer arrived.
+//!   frame grants, queued output, owners, connection slots and handshake
+//!   permits return to the values they had before the peer arrived.
 
 use super::*;
 use crate::zakura::transport::OwnerCounts;
@@ -317,8 +317,6 @@ impl HoldingNode {
             output_bytes: usage.output_bytes(),
             compat_bytes: usage.compat_response_bytes,
             permits: [
-                handler.admission.available_permits(),
-                handler.inbound_admission.available_permits(),
                 handler.pending_handshakes.available_permits(),
                 handler.inbound_handshakes.available_permits(),
             ],
@@ -364,9 +362,8 @@ struct TransportLevel {
     raw_bytes: u64,
     output_bytes: u64,
     compat_bytes: u64,
-    /// Available connection, inbound connection, handshake and inbound
-    /// handshake permits.
-    permits: [usize; 4],
+    /// Available handshake and inbound handshake permits.
+    permits: [usize; 2],
 }
 
 /// How the peer leaves.
@@ -414,7 +411,7 @@ async fn charges_return_after(exit: Exit, seed: u64) -> Result<(), BoxError> {
         "the held frame keeps its grant: {held:?}"
     );
     assert!(held.owners.installed > 0);
-    assert_ne!(held.permits, baseline.permits);
+    assert_ne!(held.connections, baseline.connections);
 
     match exit {
         Exit::RemoteDisconnect => {

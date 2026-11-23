@@ -2479,6 +2479,7 @@ fn block_advert(
         crate::peer::block_gossip::BlockAdvert {
             hash,
             push: false,
+            pending_send: None,
             result,
         },
         delivery,

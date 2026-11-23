@@ -12,11 +12,13 @@
 use std::{
     collections::BTreeMap,
     fmt,
-    sync::{Arc, Mutex, MutexGuard, PoisonError, Weak},
+    sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak},
     time::Duration,
 };
 
-use crate::{inputs::ProviderWatch, EndpointInputs, NodeSecretKey, KEY_LENGTH};
+use crate::{
+    inputs::ProviderWatch, tls::hybrid::X25519MlKem768, EndpointInputs, NodeSecretKey, KEY_LENGTH,
+};
 use curve25519_dalek::montgomery::MontgomeryPoint;
 use quinn_proto::{ConnectionId, ConnectionIdGenerator, InvalidCid};
 use ring::{digest, hkdf, hmac};
@@ -64,7 +66,8 @@ pub enum Source {
     TokenKey,
     /// TLS handshake randoms.
     TlsRandom,
-    /// X25519 ephemeral secrets, one per key exchange.
+    /// Key-exchange secrets: one draw per X25519 secret, per ML-KEM key pair
+    /// and per ML-KEM encapsulation.
     KeyExchange,
 }
 
@@ -89,7 +92,7 @@ impl Source {
             Source::InitialDstCid => "quic/initial_dst_cid",
             Source::TokenKey => "quic/token_key",
             Source::TlsRandom => "quic/tls_random",
-            Source::KeyExchange => "quic/kx_x25519",
+            Source::KeyExchange => "quic/kx",
         }
     }
 
@@ -286,7 +289,9 @@ impl SeededInputs {
             inputs = inputs.tls_random(self.streams.slot);
         }
         if set(Source::KeyExchange) {
-            inputs = inputs.kx_groups(vec![self.streams.slot as &'static dyn SupportedKxGroup]);
+            // The one group a production endpoint offers: the hybrid, built
+            // on the slot's seeded X25519.
+            inputs = inputs.kx_groups(vec![self.streams.slot.hybrid()]);
         }
         inputs.provider_watch(self.lease.clone())
     }
@@ -365,9 +370,11 @@ impl ConnectionIdGenerator for SeededCidGenerator {
     }
 }
 
-/// The TLS random source and X25519 group of one node.
+/// The TLS random source and key-exchange groups of one node: X25519, which
+/// the slot is itself, and the hybrid X25519MLKEM768 built on it
+/// ([`TlsSlot::hybrid`]).
 ///
-/// rustls holds both as `&'static`, so each slot is leaked once and reused.
+/// rustls holds them as `&'static`, so each slot is leaked once and reused.
 /// A node takes a slot when it starts and keeps it while its
 /// [`SeededInputs`], any [`EndpointInputs`] made from them, or any TLS
 /// provider built on the slot is alive. Every rustls config and session
@@ -376,6 +383,8 @@ impl ConnectionIdGenerator for SeededCidGenerator {
 /// stream.
 struct TlsSlot {
     state: Mutex<SlotState>,
+    /// The hybrid group, leaked on first use and kept for the slot's life.
+    hybrid: OnceLock<&'static X25519MlKem768>,
 }
 
 /// Who holds a slot.
@@ -405,6 +414,30 @@ impl TlsSlot {
     /// The streams the slot draws from, once a node has taken it.
     fn streams(&self) -> Option<Arc<Streams>> {
         self.state().streams.clone()
+    }
+
+    /// The seeded X25519MLKEM768: the production combiner over this slot's
+    /// X25519 group, with ML-KEM drawing from the same key-exchange stream.
+    fn hybrid(&'static self) -> &'static dyn SupportedKxGroup {
+        *self.hybrid.get_or_init(|| {
+            let random: &'static KeyExchangeRandom = Box::leak(Box::new(KeyExchangeRandom(self)));
+            Box::leak(Box::new(X25519MlKem768::new(self, random)))
+        })
+    }
+}
+
+/// A slot's key-exchange stream as a random source, for ML-KEM's draws.
+#[derive(Debug)]
+struct KeyExchangeRandom(&'static TlsSlot);
+
+impl SecureRandom for KeyExchangeRandom {
+    /// Fills `buf` with one draw of the key-exchange stream.
+    fn fill(&self, buf: &mut [u8]) -> Result<(), GetRandomFailed> {
+        self.0
+            .streams()
+            .ok_or(GetRandomFailed)?
+            .draw(Source::KeyExchange, buf);
+        Ok(())
     }
 }
 
@@ -542,6 +575,7 @@ impl SlotPool {
                     leased: true,
                     users: Vec::new(),
                 }),
+                hybrid: OnceLock::new(),
             }));
             slots.push(slot);
             slot

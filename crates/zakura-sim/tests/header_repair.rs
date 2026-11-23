@@ -7,7 +7,7 @@
 //! succeeds. Each fixture also makes one ordinary stale prepare, so the
 //! property applies and holds.
 //!
-//! `header-sync/outstanding-work-bounded` holds on every committed input
+//! `header-sync/outstanding-work-bounded` holds on every searched input
 //! too. On the supplier-pruned input, whose supplier lacks the tree records
 //! so the repair retires `HistoryPruned` and never applies, it judges the
 //! repair requirement's source sets through a charge and a departure.
@@ -27,6 +27,7 @@ use std::{
 };
 
 use serde_json::Value;
+use support::header_inputs::repair_input;
 use tempfile::TempDir;
 use zakura_chain::block;
 use zakura_header_chain::BodyWorkAuthority;
@@ -44,20 +45,16 @@ use zakura_sim::{
     },
     observe::{Observation, ReactorCall, ReactorFact},
     record::RecordSink,
-    seed,
     trace::{replay_with, ReplayOptions, TraceReader},
     witness::Expect,
     MemorySink, NullSink, Outcome, Plan, PlanInput, PropertyOutcome, RunReport,
 };
 use zakura_storage::header::controlled::ControlledPort;
 
-/// The seeds, `header-repair-*` in `zakura_sim::seed`, with their
-/// fixtures. Each input is the fixture's scenario byte, then Plan bytes.
-/// The first three repair, and the supplier-pruned one doesn't. Each
-/// fixture's history waits on control steps with no deadline, such as the
-/// stale peer's close, so a Plan that keeps one waiting until the step
-/// budget never reaches the rest of it. The seeds' Plans and the generated
-/// ones reach every fixture's history.
+/// The fixtures, each with the name its input goes by. Each input is the
+/// fixture's scenario byte, then the Plan
+/// [`header_inputs::repair_input`] finds. The first three repair, and the
+/// supplier-pruned one doesn't.
 const SEEDS: [(&str, RepairScenario); 4] = [
     ("header-repair-applied", RepairScenario::Applied),
     (
@@ -71,22 +68,15 @@ const SEEDS: [(&str, RepairScenario); 4] = [
     ),
 ];
 
-/// The input of the seed named `name`.
-fn seed_input(name: &str) -> Vec<u8> {
-    seed::find(name)
-        .unwrap_or_else(|| panic!("{name} is registered"))
-        .input()
-        .to_vec()
-}
-
-/// Each seed's name, fixture and input, in the order of [`SEEDS`].
+/// Each fixture's name, scenario and searched input, in the order of
+/// [`SEEDS`].
 fn seeds() -> impl Iterator<Item = (&'static str, RepairScenario, Vec<u8>)> {
     SEEDS
         .into_iter()
-        .map(|(name, scenario)| (name, scenario, seed_input(name)))
+        .map(|(name, scenario)| (name, scenario, repair_input(scenario)))
 }
 
-/// The seeds whose repair applies.
+/// The fixtures whose repair applies.
 fn repairing() -> impl Iterator<Item = (&'static str, RepairScenario, Vec<u8>)> {
     seeds().filter(|(_, scenario, _)| *scenario != RepairScenario::SupplierPruned)
 }
@@ -277,7 +267,7 @@ fn repaired(run: &Run) {
     assert_eq!(context.selected_header_count(), 1);
 }
 
-/// `header-sync/stale-completion-inert` holds on each repairing seed
+/// `header-sync/stale-completion-inert` holds on each repairing input
 /// through the registered harness, and each run repairs as
 /// [`repaired`] checks.
 #[test]
@@ -298,7 +288,7 @@ fn the_repair_seeds_hold_stale_completion_inert() {
 }
 
 /// Each repairing fixture repairs and holds under generated plans, not only
-/// the seeds' ones, and the supplier-pruned one makes its charged
+/// the searched ones, and the supplier-pruned one makes its charged
 /// history under them as [`charged`] checks.
 #[test]
 fn the_repair_fixtures_hold_under_every_plan() {
@@ -310,8 +300,8 @@ fn the_repair_fixtures_hold_under_every_plan() {
     }
 }
 
-/// `header-sync/outstanding-work-bounded` holds on every seed through the
-/// registered harness.
+/// `header-sync/outstanding-work-bounded` holds on every searched input
+/// through the registered harness.
 #[test]
 fn the_repair_seeds_hold_outstanding_work_bounded() {
     let entry = harness::find(RepairHarness::NAME).expect("the harness is registered");
@@ -328,7 +318,7 @@ fn the_repair_seeds_hold_outstanding_work_bounded() {
     }
     charged(&run(
         RepairScenario::SupplierPruned,
-        plan(&seed_input("header-repair-supplier-pruned")),
+        plan(&repair_input(RepairScenario::SupplierPruned)),
     ));
 }
 
@@ -387,11 +377,11 @@ fn the_scenario_byte_picks_the_fixture() {
 }
 
 /// The stale calls, the property's report and the full log depend only on
-/// the plan: the prepare-departs seed's plan A twice, then B, then A
+/// the plan: the prepare-departs input's plan A twice, then B, then A
 /// again, gives A's every time, and B's log differs.
 #[test]
 fn repair_evidence_repeats_a_a_and_a_b_a() {
-    let prepare_departs = seed_input("header-repair-prepare-departs");
+    let prepare_departs = repair_input(RepairScenario::PrepareDeparts);
     let plans: [&[u8]; 2] = [&prepare_departs[RepairHarness::SCENARIO_BYTES..], &[7; 256]];
     let runs: Vec<(String, String)> = [plans[0], plans[0], plans[1], plans[0]]
         .into_iter()
@@ -447,7 +437,7 @@ fn captured() -> String {
     format!("{:?}\n", stale.windows())
 }
 
-/// Each seed, recorded in this process and replayed exactly in
+/// Each searched input, recorded in this process and replayed exactly in
 /// a fresh process of the same test binary, finds the same stale calls at
 /// the same drains.
 #[test]
@@ -492,8 +482,8 @@ fn the_repair_witnesses_replay_in_a_fresh_process() {
     }
 }
 
-/// Each seed draws its fixture, and runs through the registered harness to
-/// a defined end that the explorer classifies clean.
+/// Each searched input draws its fixture, and runs through the registered
+/// harness to a defined end that the explorer classifies clean.
 #[test]
 fn the_seeds_draw_their_fixtures_and_run_clean() {
     let entry = harness::find(RepairHarness::NAME).expect("the harness is registered");

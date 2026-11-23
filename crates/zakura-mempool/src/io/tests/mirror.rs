@@ -193,6 +193,7 @@ impl Mirror {
         let limits = Limits {
             pending: 4,
             readmitting: 2,
+            relayed: 4,
         };
         // The core tells its machine the node is near the tip when it
         // starts, and so does the test.

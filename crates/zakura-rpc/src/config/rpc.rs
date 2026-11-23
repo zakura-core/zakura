@@ -131,6 +131,14 @@ pub struct Config {
     /// RPCs remain available.
     pub enable_cookie_auth: bool,
 
+    /// Allow binary block submissions to relay before local validation.
+    ///
+    /// The caller should first validate the exact block on a trusted full node. Peers can
+    /// ban this node for relaying an invalid block. Requires a primary listener and follows
+    /// [`Self::enable_cookie_auth`]. When authentication is disabled, restrict access to trusted
+    /// clients using a firewall or private network.
+    pub enable_trusted_block_submission: bool,
+
     /// Allow administrative methods on the unauthenticated primary listener.
     ///
     /// Defaults to `false`. Takes effect when [`Self::enable_cookie_auth`] is
@@ -207,6 +215,7 @@ impl Default for Config {
 
             // Enable cookie-based authentication by default.
             enable_cookie_auth: true,
+            enable_trusted_block_submission: false,
             allow_unauthenticated_admin: false,
 
             // 50 MiB
@@ -221,6 +230,9 @@ impl Default for Config {
 impl Config {
     /// Validates the relationship between the primary and admin RPC listeners.
     pub fn validate(&self) -> Result<(), String> {
+        if self.enable_trusted_block_submission && self.listen_addr.is_none() {
+            return Err("rpc.enable_trusted_block_submission requires rpc.listen_addr".to_string());
+        }
         let Some(admin_listen_addr) = self.admin_listen_addr else {
             return Ok(());
         };

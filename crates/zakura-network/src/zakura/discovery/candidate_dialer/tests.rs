@@ -579,7 +579,7 @@ async fn connected_elsewhere_leaves_the_record_unconfirmed() -> Result<(), crate
         connected,
     )?;
     let record = (*candidate.current_self_record()).clone();
-    let node = record.body.node_id;
+    let node = record.body.node_id();
     let dialed = record.body.direct_addrs.first().copied();
     handle
         .import_peer_records([record], Some(node_id(82)))
@@ -1359,11 +1359,11 @@ async fn the_dialer_loop_sleeps_until_the_round_deadline_after_a_completion() {
         .await
         .expect("dialer spawns");
     let discovery = node.discovery();
-    // Two silent IPs: the second address starts one dial stagger after the
+    // Two silent addresses: the second starts one dial stagger after the
     // round, so the dial fails one stagger past a round deadline.
     let mut silent = Vec::new();
-    for ip in ["127.0.0.1:0", "127.0.0.2:0"] {
-        silent.push(tokio::net::UdpSocket::bind(ip).await.unwrap());
+    for _ in 0..2 {
+        silent.push(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
     }
     discovery
         .insert_static_candidate(NodeAddr::with_addrs(
@@ -1403,10 +1403,10 @@ async fn the_dialer_loop_sleeps_until_the_round_deadline_after_a_completion() {
     node.shutdown().await;
 }
 
-// V12 F-583: each dial holds one of the handler's admission permits from its
+// V12 F-583: each dial holds one of the handler's connection slots from its
 // start. A round that counted only the transport's free slots could admit
-// more dials than free permits, and the extra workers then failed as local
-// limits. The round now admits at most one candidate per free permit.
+// more dials than free slots, and the extra workers then failed as local
+// limits. The round now admits at most one candidate per free slot.
 #[tokio::test]
 async fn a_round_admits_no_more_dials_than_free_admission_permits() {
     let node = crate::zakura::testkit::ZakuraTestNode::builder(9217)
@@ -1415,8 +1415,7 @@ async fn a_round_admits_no_more_dials_than_free_admission_permits() {
         .expect("dialer spawns");
     let endpoint = node.endpoint();
     let permits = endpoint.discovery_dial_permits();
-    let held = endpoint
-        .hold_admission_permits(u32::try_from(permits - 1).expect("the test node has few permits"));
+    let held = endpoint.hold_connection_slots(permits - 1);
     assert_eq!(endpoint.discovery_dial_permits(), 1);
     assert!(
         endpoint.discovery_admission_capacity() >= 3,

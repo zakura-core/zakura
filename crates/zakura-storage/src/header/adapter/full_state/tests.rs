@@ -80,14 +80,26 @@ fn commits_grow_reset_and_publish_views() {
     assert_eq!(port.view().snapshot, port.snapshot());
     assert_eq!(verified_best(&port), main[0].frontier());
 
+    assert_eq!(installed.view.body_download_anchor, main[0].frontier());
+    let slow_subscriber = port.subscribe_views();
+    let before_switch = port.view().body_work_epoch;
     // The longer fork's headers move the selected chain, which starts an epoch.
     insert(&port, anchor, &fork);
     let epoch = port.view().body_work_epoch;
 
+    assert_eq!(epoch, before_switch.checked_next().unwrap());
+    assert_eq!(port.view().body_download_anchor, anchor);
     // A one-block fork is a side path: the verified tip stays.
     let side = commit(&port, &fork[0], 2);
     assert_eq!(side.cause, None);
     assert_eq!(verified_best(&port), main[0].frontier());
+
+    // The subscriber reads only after the switch and the compatible side commit.
+    assert!(slow_subscriber.has_changed().unwrap());
+    assert_eq!(
+        slow_subscriber.borrow().as_ref().unwrap().body_work_epoch,
+        epoch
+    );
 
     // A longer fork resets the verified chain and starts the next epoch.
     let reset = commit(&port, &fork[1], 3);
@@ -121,13 +133,16 @@ fn an_earlier_receipt_wins_an_equal_work_tie() {
     insert(&port, anchor, std::slice::from_ref(&b));
 
     // A was received first, B committed first. The selected chain ends at A,
-    // so B's commit moves the verified tip off it and starts an epoch too.
+    // so B's commit leaves the shared download anchor at their parent.
+    let epoch = port.view().body_work_epoch;
     let first = commit(&port, &b, 2);
     assert_eq!(first.cause, Some(VerifiedChangeCause::Grow));
     assert_eq!(verified_best(&port), b.frontier());
     let installed = first.installed.expect("a grow installs");
-    assert!(installed.effect.invalidates_body_work());
-    let epoch = installed.view.body_work_epoch;
+    assert!(!installed.effect.invalidates_body_work());
+    assert_eq!(installed.view.body_work_epoch, epoch);
+    assert_eq!(installed.view.frontiers.header_best, a.frontier());
+    assert_eq!(installed.view.body_download_anchor, anchor);
     let second = commit(&port, &a, 1);
     assert_eq!(second.cause, Some(VerifiedChangeCause::Reset));
     assert_eq!(verified_best(&port), a.frontier());

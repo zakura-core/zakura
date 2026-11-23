@@ -60,12 +60,16 @@ class FakeCampaignTool:
         self.versions = versions
         self.calls = []
         self.counter = itertools.count()
+        self.fuzz_cwds = []
 
     def digest(self, value):
         return hashlib.sha256(json.dumps([value, next(self.counter)]).encode()).hexdigest()
 
     def __call__(self, argv, cwd, log, env=None):
         self.calls.append(argv)
+        if argv[2:4] == ["fuzz", "run"]:
+            self.fuzz_cwds.append(cwd)
+            return suite.Ran(0, "#2 INITED\nDone 1234 runs in 10 second(s)\n")
         if argv[2] != "sim-campaign":
             return suite.Ran(0, "")
         store = Path(flag(argv, "--store"))
@@ -182,23 +186,37 @@ class RunTests(unittest.TestCase):
             _, record = self.run_suite(temp, tool, "--target", "sync_wire", "--target", "cadence")
         self.assertTrue(record["subset"])
         self.assertEqual(record["omitted"], ["target/sim/race_fixtures", "target/header-chain/fork_transitions"])
-        self.assertEqual([target["id"] for target in record["targets"]], ["target/sim/sync_wire"])
-        self.assertEqual([entry["id"] for entry in record["not_run"]], ["target/p2p/cadence"])
+        self.assertEqual([target["id"] for target in record["targets"]], ["target/sim/sync_wire", "target/p2p/cadence"])
+        self.assertEqual(record["not_run"], [])
 
-    def test_rows_the_campaign_tool_cant_build_are_not_run_with_a_reason(self):
+    def test_machine_targets_run_in_a_plain_libfuzzer_lane(self):
         tool = FakeCampaignTool()
         with tempfile.TemporaryDirectory() as temp:
             status, record = self.run_suite(temp, tool)
-        self.assertEqual(status, 0)
-        self.assertFalse(record["subset"])
-        self.assertEqual(record["omitted"], [])
-        self.assertEqual(record["pinned"], "a" * 40)
-        self.assertEqual([target["target"] for target in record["targets"]], ["sync_wire", "race_fixtures"])
-        reasons = {entry["id"]: entry["reason"] for entry in record["not_run"]}
-        self.assertEqual(set(reasons), {"target/p2p/cadence", "target/header-chain/fork_transitions"})
-        self.assertIn("qa/fuzz/p2p", reasons["target/p2p/cadence"])
-        built = {flag(argv, "--target") for argv in tool.commands("sim-campaign", "build")}
-        self.assertEqual(built, {"sync_wire", "race_fixtures"})
+            self.assertEqual(status, 0)
+            self.assertFalse(record["subset"])
+            self.assertEqual(record["omitted"], [])
+            self.assertEqual(record["pinned"], "a" * 40)
+            self.assertEqual(record["not_run"], [])
+            targets = {target["target"]: target for target in record["targets"]}
+            self.assertEqual(set(targets), {"sync_wire", "race_fixtures", "cadence", "fork_transitions"})
+            built = {flag(argv, "--target") for argv in tool.commands("sim-campaign", "build")}
+            self.assertEqual(built, {"sync_wire", "race_fixtures"})
+            cadence = targets["cadence"]
+            self.assertEqual(cadence["lane"], "libfuzzer")
+            self.assertEqual(cadence["end_status"], "complete")
+            self.assertEqual(cadence["store"], str(Path(temp).resolve() / "state" / "corpora" / "p2p" / "cadence"))
+            evidence = json.loads(Path(cadence["evidence"]).read_text())
+            self.assertEqual(evidence["runs"], 1234)
+            self.assertEqual(suite.evidence_gaps(cadence["evidence"]), [])
+        runs = [argv for argv in tool.calls if argv[2:4] == ["fuzz", "run"]]
+        self.assertEqual({argv[6] for argv in runs}, {"cadence", "fork_transitions"})
+        self.assertEqual({Path(cwd).name for cwd in tool.fuzz_cwds}, {"p2p", "header-chain"})
+        cadence_run = next(argv for argv in runs if argv[6] == "cadence")
+        # qa/suite.toml's [campaign.p2p] and the cadence row's limits.
+        self.assertIn("-max_total_time=900", cadence_run)
+        self.assertIn("-max_len=512", cadence_run)
+        self.assertIn("-rss_limit_mb=2048", cadence_run)
 
     def test_budgets_come_from_the_suite_unless_overridden(self):
         tool = FakeCampaignTool()
@@ -425,6 +443,87 @@ class CompletenessTests(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertIn("test/zakura-sim/lib", {entry["id"] for entry in report["ran"]})
         self.assertEqual(missing, 2)
+
+
+class ReachTests(unittest.TestCase):
+    """Per-property reach: every run that applied a property, and the free runs alone."""
+
+    GENERATORS = {"p/both": ["h/one", "h/two"], "p/planned": ["h/one"], "p/lost": ["h/three"]}
+
+    def search(self, properties, random_properties):
+        return {"executed": 30, "random_runs": 10, "modes": {"cycle/plan": 10, "cycle/pct": 10, "free/pct": 10},
+                "stop": {"kind": "clean"}, "millis": 5, "properties": properties,
+                "random_properties": random_properties}
+
+    def test_a_property_no_free_run_applied_is_unreached(self):
+        searches = {
+            "h/one": self.search({"p/both": {"held": 4}, "p/planned": {"held": 2, "violated": 1}},
+                                 {"p/both": {"held": 1}, "p/planned": {"not_applicable": 3}}),
+            "h/two": self.search({"p/both": {"held": 5}}, {"p/both": {"held": 2, "violated": 0}}),
+            "h/three": None,
+        }
+        record = suite.reach_report(self.GENERATORS, searches, 7, 30)
+        self.assertEqual(record["properties"]["p/both"]["runs"], 9)
+        self.assertEqual(record["properties"]["p/both"]["random_runs"], 3)
+        self.assertEqual(record["properties"]["p/planned"]["runs"], 3)
+        self.assertEqual(record["properties"]["p/planned"]["random_runs"], 0)
+        self.assertEqual(record["properties"]["p/lost"]["unsearched"], ["h/three"])
+        self.assertEqual(record["unreached"], ["p/lost", "p/planned"])
+        self.assertFalse(record["harnesses"]["h/three"]["searched"])
+        self.assertEqual(suite.reach_harnesses(self.GENERATORS), ["h/one", "h/three", "h/two"])
+
+    def test_completeness_carries_the_reach(self):
+        record = suite.reach_report(self.GENERATORS, {"h/one": self.search({}, {}), "h/two": None, "h/three": None},
+                                    7, 30)
+        manifest = {"build": {"git": "a" * 40}}
+        written = suite.completeness(manifest, {}, None, None, record)
+        self.assertEqual(written["unreached"], ["p/both", "p/lost", "p/planned"])
+        self.assertEqual(written["reach"]["p/both"]["unsearched"], ["h/two"])
+        self.assertNotIn("reach", suite.completeness(manifest, {}, None, None))
+
+    def test_a_search_that_exits_nonzero_writes_no_report_or_stops_early_fails(self):
+        clean = self.search({}, {})
+        self.assertIsNone(suite.search_failure(0, clean))
+        self.assertIn("exited 1", suite.search_failure(1, clean))
+        self.assertIn("no generate.json", suite.search_failure(0, None))
+        for stop in ({"kind": "violation", "property": "p/both"}, {"kind": "panic", "message": "boom"},
+                     {"kind": "harness-failure", "reason": "r"}, {"kind": "abandoned", "leaked": 1}):
+            self.assertIn(stop["kind"], suite.search_failure(0, {**clean, "stop": stop}))
+
+    def test_the_reach_command_fails_on_a_failed_search(self):
+        """`reach` writes its record, lists each failed search, and exits 1."""
+        outcomes = {
+            "h/one": (0, self.search({}, {"p/both": {"held": 1}, "p/planned": {"held": 1}})),
+            "h/two": (0, {**self.search({}, {}), "stop": {"kind": "violation", "property": "p/both"}}),
+            "h/three": (1, None),
+        }
+
+        def run_logged(argv, cwd, log):
+            name = argv[argv.index("--sim") + 1]
+            code, report = outcomes[name]
+            if report is not None:
+                suite.write_json(Path(argv[argv.index("--out") + 1]) / suite.GENERATE_FILE, report)
+            return suite.Ran(code, "")
+
+        listed = mock.Mock(returncode=0, stdout=json.dumps(self.GENERATORS))
+        with tempfile.TemporaryDirectory() as temp, \
+                mock.patch.object(suite, "build_sim", return_value="sim"), \
+                mock.patch.object(suite.subprocess, "run", return_value=listed), \
+                mock.patch.object(suite, "run_logged", side_effect=run_logged), \
+                contextlib.redirect_stderr(io.StringIO()):
+            status = suite.main(["reach", "--checkout", temp, "--out", temp, "--seed", "7"])
+            record = json.loads((Path(temp) / suite.REACH_FILE).read_text())
+        self.assertEqual(status, 1)
+        self.assertEqual(sorted(record["failed"]), ["h/three", "h/two"])
+        self.assertIn("violation", record["failed"]["h/two"])
+        self.assertIn("exited 1", record["failed"]["h/three"])
+        self.assertEqual(record["unreached"], ["p/lost"])
+        outcomes["h/two"], outcomes["h/three"] = (0, self.search({}, {})), (0, self.search({}, {"p/lost": {"held": 1}}))
+        with tempfile.TemporaryDirectory() as temp, \
+                mock.patch.object(suite, "build_sim", return_value="sim"), \
+                mock.patch.object(suite.subprocess, "run", return_value=listed), \
+                mock.patch.object(suite, "run_logged", side_effect=run_logged):
+            self.assertEqual(suite.main(["reach", "--checkout", temp, "--out", temp, "--seed", "7"]), 0)
 
 
 if __name__ == "__main__":

@@ -2,20 +2,21 @@
 //! patch still makes its property fail (properties.md, Planted bugs and
 //! evidence).
 //!
-//! A planted case is `qa/planted/<property-id>/<name>.patch`, a production
-//! change that bypasses the property's guard, with `<name>.toml` beside it
-//! naming what must find the bug, in one of three ways:
+//! A planted case is `qa/planted/<property-id>/<name>.patch` in the QA
+//! store, whose local copy `ZAKURA_QA_STORE` names (`planted_layout`). It is
+//! a production change that bypasses the property's guard, with
+//! `<name>.toml` beside it naming what must find the bug, in one of three
+//! ways:
 //!
-//! - a seed, by its name in the simulator's seed registry, which names the
-//!   seed's harness and builds its input;
-//! - a typed case, a `[typed]` table naming the harness, a committed
-//!   scenario as that harness's JSON and, optionally, the Plan it runs
-//!   under: either Plan bytes (`plan`) or a scripted Plan as JSON
-//!   (`script`), never both. A typed case with neither runs the empty Plan.
-//!   A typed case is for a scenario the harness's grammar can't encode, such
-//!   as one with a control step or more mirrors than the grammar takes, and
-//!   a script is for a history no Plan bytes reach, such as one a test
-//!   steers to;
+//! - a seed, by its name in the store's seeds, which names the seed's
+//!   harness and holds its input;
+//! - a typed case, a `[typed]` table naming the harness, a stored scenario
+//!   as that harness's JSON and, optionally, the Plan it runs under: either
+//!   Plan bytes (`plan`) or a scripted Plan as JSON (`script`), never both.
+//!   A typed case with neither runs the empty Plan. A typed case is for a
+//!   scenario the harness's grammar can't encode, such as one with a control
+//!   step or more mirrors than the grammar takes, and a script is for a
+//!   history no Plan bytes reach, such as one a test steers to;
 //! - a search case, a `[search]` table naming the harness and a
 //!   `zakura-sim generate` search on it: its `seed`, its `runs` and,
 //!   optionally, its `draws` (`uniform` or `cycle`) and its `schedule`
@@ -38,19 +39,19 @@
 //! `target/planted/`, and builds the unpatched simulator there once. Every
 //! recording build uses the workspace's `planted` profile in
 //! `target/planted/target`, apart from the checkout's own target directory.
-//! The unpatched build lists the seed registry ([`seeds`]), and a case
-//! naming a seed that the registry lacks or rejects fails the run. Then for
+//! The unpatched build lists the store's seeds ([`seeds`]), and a case
+//! naming a seed that the store lacks or the build rejects fails the run. Then for
 //! each case it:
 //!
 //! 1. records the witness with the unpatched build, which must hold the
 //!    property with no violation of any property and pass its witness test
 //!    expecting `holds`. A seed's witness is the input the unpatched build
-//!    writes, since a seed's builder can run the code the patch changes. A
-//!    search case first applies the patch, builds it and runs its search
-//!    (step 2's build), and its witness is the input the search found;
+//!    writes from the store. A search case first applies the patch, builds
+//!    it and runs its search (step 2's build), and its witness is the input
+//!    the search found;
 //! 2. applies the patch, which must not change, delete or rename the
-//!    case's witness files (the seed registry's source, or its scenario and
-//!    Plan bytes), so both runs read the same witness. It then rebuilds and
+//!    case's witness files, so both runs read the same witness. The witness
+//!    files live in the store, outside the checkout the patch changes. It then rebuilds and
 //!    records the witness again, which must violate the case's property and
 //!    no property outside the case's `also_violates`, and pass its witness
 //!    test expecting `violated` beside those;
@@ -110,11 +111,13 @@
 //! the whole catalogue (qa/fuzz/sim's README, Long runs).
 //!
 //! `--changed-since <rev>` runs only the cases a change since `rev` can
-//! affect: those whose patch, case file, witness files, patched files or
-//! listed checks changed, or every case if the shared machinery changed:
-//! this runner, the simulator that records and judges each run and builds
-//! each seed, its scheduler and runtime, or the build configuration. A
-//! renamed file counts as a change to its old and its new path.
+//! affect: those whose patched files or listed checks changed, or every
+//! case if the shared machinery changed: this runner, the simulator that
+//! records and judges each run, its scheduler and runtime, or the build
+//! configuration. A renamed file counts as a change to its old and its new
+//! path. Git can't see a change to the store, so `--store-changed <file>`
+//! names the store's changed paths, one per line, relative to its root: a
+//! case whose patch, case file or witness files it lists runs too.
 //!
 //! `cargo xtask planted pilot (sensitivity|discovery)` runs the mutation
 //! pilot's paired experiments on the reviewed catalogue's cases; see
@@ -164,6 +167,7 @@ mod planted_layout;
 pub(super) use mutation_loop::{run as mutation_loop, triage};
 use outcome::EndOutcome;
 pub(super) use pilot::run as pilot;
+pub(super) use planted_layout::require_store;
 use planted_layout::PLANTED_DIR;
 use seeds::Registry;
 
@@ -282,13 +286,13 @@ struct Case {
     untriggered: bool,
 }
 
-/// What a case runs, with paths relative to the repository root.
+/// What a case runs, with paths relative to the store's root.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Witness {
-    /// A seed of the simulator's registry, by name. The registry names its
-    /// harness and builds its input.
+    /// A seed of the store, by name. The store names its harness and holds
+    /// its input.
     Seed(String),
-    /// A committed scenario, as `harness`'s JSON, run under the Plan in
+    /// A stored scenario, as `harness`'s JSON, run under the Plan in
     /// `plan`, or the empty Plan without one.
     Typed {
         /// The harness.
@@ -409,12 +413,12 @@ impl Witness {
         }
     }
 
-    /// The committed files it reads: the seed registry's source, or the
-    /// scenario and the Plan file. A search reads none: it runs the
-    /// simulator's generator, which [`SHARED`] holds.
+    /// The store's files it reads, relative to the store's root: the seed's
+    /// input, or the scenario and the Plan file. A search reads none: it
+    /// runs the simulator's generator, which [`SHARED`] holds.
     fn files(&self) -> Vec<PathBuf> {
         match self {
-            Witness::Seed(_) => vec![PathBuf::from(seeds::REGISTRY)],
+            Witness::Seed(name) => vec![seeds::input_path(name)],
             Witness::Typed { scenario, plan, .. } => std::iter::once(scenario.clone())
                 .chain(plan.as_ref().map(|plan| plan.path().to_path_buf()))
                 .collect(),
@@ -422,8 +426,9 @@ impl Witness {
         }
     }
 
-    /// What [`record`] runs, with a typed case's files under `root`, or
-    /// `None` for a search case, whose input only its search finds.
+    /// What [`record`] runs, with a typed case's files under `root`, the
+    /// store's root, or `None` for a search case, whose input only its
+    /// search finds.
     fn located(&self, root: &Path) -> Option<Located> {
         match self {
             Witness::Seed(name) => Some(Located::Seed(name.clone())),
@@ -458,13 +463,12 @@ pub(super) enum Located {
 struct TypedFile {
     /// The harness the scenario runs on.
     harness: String,
-    /// The scenario, as the harness's JSON, relative to the repository
-    /// root.
+    /// The scenario, as the harness's JSON, relative to the store's root.
     scenario: PathBuf,
-    /// The Plan bytes, relative to the repository root. A typed case names
+    /// The Plan bytes, relative to the store's root. A typed case names
     /// this or `script`, never both, and runs the empty Plan without either.
     plan: Option<PathBuf>,
-    /// A scripted Plan as JSON, relative to the repository root, for a
+    /// A scripted Plan as JSON, relative to the store's root, for a
     /// history no Plan bytes reach.
     script: Option<PathBuf>,
 }
@@ -488,7 +492,7 @@ impl TypedFile {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CaseFile {
-    /// The seed's name in the simulator's registry.
+    /// The seed's name in the store's seeds.
     seed: Option<String>,
     /// The typed case, for a scenario the harness's grammar can't encode.
     typed: Option<TypedFile>,
@@ -676,20 +680,21 @@ impl fmt::Display for Verdict {
     }
 }
 
-/// Runs every planted case, or only `property`'s, and fails unless each is
-/// caught. With `shard`, it runs only that shard's cases, and fails if
+/// Runs every planted case of the QA store `store`, or only `property`'s,
+/// and fails unless each is caught. With `shard`, it runs only that shard's cases, and fails if
 /// the shard has none. With `changed_since`, it runs only the cases a
 /// change since that revision affects, and passes if none is. With
 /// `targets`, it runs only the cases a simulator fuzz target runs, and
 /// confirms each through its target.
 pub(super) fn run(
     repo_root: &Path,
+    store: &Path,
     property: Option<&str>,
     shard: Option<Shard>,
-    changed_since: Option<&str>,
+    changed_since: Option<Changed<'_>>,
     targets: bool,
 ) -> Result<(), BoxError> {
-    let cases: Vec<Case> = cases(repo_root)?
+    let cases: Vec<Case> = cases(store)?
         .into_iter()
         .filter(|case| property.is_none_or(|p| case.property == p))
         .collect();
@@ -703,7 +708,7 @@ pub(super) fn run(
     };
     // Only `--targets` needs the unpatched build before it picks the cases.
     let mut baseline = None;
-    let picked = pick(repo_root, &work, cases, &select, &mut baseline);
+    let picked = pick(repo_root, store, &work, cases, &select, &mut baseline);
     let mut cases = match picked {
         Ok(Some(cases)) => cases,
         Ok(None) => return remove_worktree(repo_root, &worktree),
@@ -715,7 +720,7 @@ pub(super) fn run(
     let failed = (|| -> Result<usize, BoxError> {
         let baseline = match baseline {
             Some(baseline) => baseline,
-            None => Baseline::build(repo_root, &work)?,
+            None => Baseline::build(repo_root, store, &work)?,
         };
         check_seeds(&baseline.registry, &cases)?;
         mark_untriggered(&baseline, &mut cases)?;
@@ -735,8 +740,8 @@ struct Select<'a> {
     property: Option<&'a str>,
     /// Only this shard of them.
     shard: Option<Shard>,
-    /// Only those a change since this revision affects.
-    changed_since: Option<&'a str>,
+    /// Only those a change since this revision, or in the store, affects.
+    changed_since: Option<Changed<'a>>,
     /// Only those a simulator fuzz target runs.
     targets: bool,
 }
@@ -748,6 +753,7 @@ struct Select<'a> {
 /// seed's harness. Fails on zero cases before the change filter.
 fn pick(
     repo_root: &Path,
+    store: &Path,
     work: &Path,
     mut cases: Vec<Case>,
     select: &Select<'_>,
@@ -759,7 +765,9 @@ fn pick(
             .iter()
             .any(|case| matches!(case.witness, Witness::Seed(_)))
         {
-            let registry = &baseline.insert(Baseline::build(repo_root, work)?).registry;
+            let registry = &baseline
+                .insert(Baseline::build(repo_root, store, work)?)
+                .registry;
             assign_targets(&mut cases, &harnesses, registry)?;
         }
         let skipped;
@@ -810,37 +818,43 @@ fn pick(
         }
         None => cases,
     };
-    let Some(rev) = select.changed_since else {
+    let Some(since) = select.changed_since else {
         return Ok(Some(cases));
     };
-    let changed = changed_since_rev(repo_root, rev)?;
+    let changed = since.paths(repo_root)?;
     let mut affected = Vec::new();
     for case in cases {
-        if is_affected(&watched(repo_root, &case)?, &changed) {
+        if is_affected(&watched(repo_root, store, &case)?, &changed) {
             affected.push(case);
         }
     }
     if affected.is_empty() {
-        println!("no planted case is affected by the changes since {rev}");
+        println!(
+            "no planted case is affected by the changes since {}",
+            since.rev
+        );
         return Ok(None);
     }
     Ok(Some(affected))
 }
 
-/// The scratch worktree's unpatched build, and the seed registry it lists.
+/// The scratch worktree's unpatched build, the store's seeds it lists, and
+/// the store.
 struct Baseline {
     /// A copy of the unpatched `zakura-sim`, which the patched builds in the
     /// same target directory don't overwrite.
     binary: PathBuf,
     /// Every seed, as the unpatched build lists it.
     registry: Registry,
+    /// The QA store's root, which holds the cases' witness files.
+    store: PathBuf,
 }
 
 impl Baseline {
     /// Checks `HEAD` out in the scratch worktree under `work`, builds the
     /// unpatched simulator there in `work`'s target directory, copies the
-    /// binary, and lists the seed registry with it.
-    fn build(repo_root: &Path, work: &Path) -> Result<Baseline, BoxError> {
+    /// binary, and lists the seeds of `store`, the QA store, with it.
+    fn build(repo_root: &Path, store: &Path, work: &Path) -> Result<Baseline, BoxError> {
         let worktree = work.join("worktree");
         remove_worktree(repo_root, &worktree)?;
         fs::create_dir_all(work)?;
@@ -864,7 +878,11 @@ impl Baseline {
             .into());
         }
         let registry = Registry::read(&binary, &work.join("seeds"))?;
-        Ok(Baseline { binary, registry })
+        Ok(Baseline {
+            binary,
+            registry,
+            store: store.to_owned(),
+        })
     }
 }
 
@@ -957,9 +975,9 @@ fn through_targets(cases: Vec<Case>) -> (Vec<Case>, Vec<(Case, String)>) {
     (confirmed, skipped)
 }
 
-/// Every case under `repo_root`'s [`PLANTED_DIR`], in path order.
-fn cases(repo_root: &Path) -> Result<Vec<Case>, BoxError> {
-    let root = repo_root.join(PLANTED_DIR);
+/// Every case under the store `store`'s [`PLANTED_DIR`], in path order.
+fn cases(store: &Path) -> Result<Vec<Case>, BoxError> {
+    let root = store.join(PLANTED_DIR);
     planted_layout::files(&root, "patch")?
         .into_iter()
         .map(|patch| {
@@ -1007,14 +1025,7 @@ fn cases(repo_root: &Path) -> Result<Vec<Case>, BoxError> {
             };
             let files = witness.files();
             for path in files.iter().chain(&checks) {
-                if !is_plain_relative(path) {
-                    return Err(format!(
-                        "{}: {} isn't a plain path relative to the repository root",
-                        case_file.display(),
-                        path.display()
-                    )
-                    .into());
-                }
+                require_plain_relative(&case_file, path)?;
             }
             if no_target
                 .as_deref()
@@ -1036,6 +1047,22 @@ fn cases(repo_root: &Path) -> Result<Vec<Case>, BoxError> {
         .collect()
 }
 
+/// An error unless `path`, which `case_file` names, is plain and relative
+/// ([`is_plain_relative`]), so that joining it to a root stays under that
+/// root.
+fn require_plain_relative(case_file: &Path, path: &Path) -> Result<(), BoxError> {
+    if is_plain_relative(path) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{}: {} isn't a plain path relative to its root",
+            case_file.display(),
+            path.display()
+        )
+        .into())
+    }
+}
+
 /// True if `path` is non-empty and made only of ordinary names, so that it
 /// compares with `git diff`'s repository-relative paths component by
 /// component.
@@ -1044,6 +1071,48 @@ fn is_plain_relative(path: &Path) -> bool {
         && path
             .components()
             .all(|component| matches!(component, Component::Normal(_)))
+}
+
+/// What `--changed-since` and `--store-changed` name: a revision, and the
+/// file that lists the store's changed paths, if any.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Changed<'a> {
+    /// The revision whose changes count.
+    pub(super) rev: &'a str,
+    /// The file that lists the store's changed paths, one per line, relative
+    /// to its root.
+    pub(super) store: Option<&'a Path>,
+}
+
+impl Changed<'_> {
+    /// The repository's paths `git diff` reports changed since `rev`
+    /// ([`changed_since_rev`]), then the store's paths the store file lists.
+    pub(super) fn paths(&self, repo_root: &Path) -> Result<Vec<PathBuf>, BoxError> {
+        let mut changed = changed_since_rev(repo_root, self.rev)?;
+        if let Some(file) = self.store {
+            changed.extend(store_changes(file)?);
+        }
+        Ok(changed)
+    }
+}
+
+/// The store's changed paths that `file` lists, one per line, relative to
+/// the store's root. Blank lines don't count. Fails on a path that isn't
+/// plain and relative.
+pub(super) fn store_changes(file: &Path) -> Result<Vec<PathBuf>, BoxError> {
+    let text = fs::read_to_string(file).map_err(|error| format!("{}: {error}", file.display()))?;
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let path = PathBuf::from(line);
+            if is_plain_relative(&path) {
+                Ok(path)
+            } else {
+                Err(format!("{}: `{line}` isn't a plain relative path", file.display()).into())
+            }
+        })
+        .collect()
 }
 
 /// The paths `git diff` reports changed between `rev`'s merge base with
@@ -1091,14 +1160,15 @@ fn changed_since_rev(repo_root: &Path, rev: &str) -> Result<Vec<PathBuf>, BoxErr
         .collect())
 }
 
-/// Every path whose change can break `case`'s catch, relative to
-/// `repo_root`: the patch and its case file, the witness's files, the files
-/// the patch changes, the case's checks, and [`SHARED`].
-fn watched(repo_root: &Path, case: &Case) -> Result<Vec<PathBuf>, BoxError> {
+/// Every path whose change can break `case`'s catch: the patch and its
+/// case file and the witness's files, relative to `store`, and the files
+/// the patch changes, the case's checks and [`SHARED`], relative to
+/// `repo_root`. The store's paths and the repository's don't overlap.
+fn watched(repo_root: &Path, store: &Path, case: &Case) -> Result<Vec<PathBuf>, BoxError> {
     let relative = |path: &Path| {
-        path.strip_prefix(repo_root)
+        path.strip_prefix(store)
             .map(Path::to_path_buf)
-            .map_err(|_| format!("{} isn't under the repository", path.display()))
+            .map_err(|_| format!("{} isn't under the QA store", path.display()))
     };
     let mut watched = vec![
         relative(&case.patch)?,
@@ -1214,7 +1284,7 @@ fn check_case(
         )?),
         Witness::Typed { .. } => case
             .witness
-            .located(worktree)
+            .located(&baseline.store)
             .ok_or("a typed case has its files")?,
         Witness::Search(search) => {
             let binary = match build_patched(worktree, target, case)? {
@@ -2373,17 +2443,45 @@ mod tests {
         assert!(!is_affected(&watched, &[]));
     }
 
-    /// A change to the shared machinery affects the committed case, though
-    /// it touches none of the case's own files.
+    /// A store holding one discovery case, `ID/case`, whose patch changes
+    /// `crates/zakura-network/src/zakura/discovery/mod.rs` and whose checks
+    /// name the transport and the wire codec, beside a typed case,
+    /// `typed/case`, and the case's cases.
+    fn discovery_store() -> (tempfile::TempDir, Vec<Case>) {
+        let store = tempfile::tempdir().expect("a temporary store");
+        let write = |path: &str, text: &str| {
+            let path = store.path().join(path);
+            fs::create_dir_all(path.parent().expect("a parent")).unwrap();
+            fs::write(path, text).unwrap();
+        };
+        let file = "crates/zakura-network/src/zakura/discovery/mod.rs";
+        let patch = format!("--- a/{file}\n+++ b/{file}\n@@ -1 +1 @@\n-a\n+b\n");
+        write(&format!("{PLANTED_DIR}/{ID}/case.patch"), &patch);
+        write(
+            &format!("{PLANTED_DIR}/{ID}/case.toml"),
+            "seed = \"discovery-wait-complete\"\nchecks = [\"crates/zakura-network/src/zakura/transport\", \"crates/zakura-network/src/zakura/wire_codec\"]\n",
+        );
+        write(&format!("{PLANTED_DIR}/typed/case.patch"), &patch);
+        write(
+            &format!("{PLANTED_DIR}/typed/case.toml"),
+            "[typed]\nharness = \"discovery/wire\"\nscenario = \"fixtures/s.json\"\n",
+        );
+        let cases = cases(store.path()).expect("the stored cases parse");
+        (store, cases)
+    }
+
+    /// A change to the shared machinery affects a stored case, though it
+    /// touches none of the case's own files, and so does a change to the
+    /// case's own files in the store.
     #[test]
-    fn shared_changes_affect_the_committed_case() {
+    fn shared_changes_affect_a_stored_case() {
         let repo_root = crate::repo_root().expect("xtask lives in the workspace");
-        let cases = cases(&repo_root).expect("the planted cases parse");
+        let (store, cases) = discovery_store();
         let case = cases
             .iter()
-            .find(|case| case.property.starts_with("discovery/"))
-            .expect("a committed discovery case");
-        let watched = watched(&repo_root, case).expect("the case's files exist");
+            .find(|case| case.property == ID)
+            .expect("the discovery case");
+        let watched = watched(&repo_root, store.path(), case).expect("the case's files exist");
         for path in [
             "crates/xtask/src/sim.rs",
             "crates/xtask/src/main.rs",
@@ -2393,17 +2491,34 @@ mod tests {
             "crates/zakura-rt/src/sim/sync/notify.rs",
             "Cargo.lock",
             ".cargo/config.toml",
-        ] {
-            assert!(is_affected(&watched, &[PathBuf::from(path)]), "{path}");
-        }
-        // The harness also drives the transport under discovery, which the
-        // case's checks cover.
-        for path in [
+            "crates/zakura-network/src/zakura/discovery/mod.rs",
             "crates/zakura-network/src/zakura/transport/io.rs",
             "crates/zakura-network/src/zakura/wire_codec/message.rs",
+            "qa/planted/discovery/wait-complete-wakes/case.patch",
+            "qa/planted/discovery/wait-complete-wakes/case.toml",
+            "seeds/discovery-wait-complete.bin",
         ] {
             assert!(is_affected(&watched, &[PathBuf::from(path)]), "{path}");
         }
+        assert!(!is_affected(&watched, &[PathBuf::from("seeds/other.bin")]));
+    }
+
+    /// `--store-changed` lists the store's changed paths, one per line, and
+    /// refuses a path that isn't plain and relative.
+    #[test]
+    fn store_changes_read_plain_paths() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let file = dir.path().join("changed.txt");
+        fs::write(&file, "qa/planted/a/b.toml\n\nseeds/x.bin\n").unwrap();
+        assert_eq!(
+            store_changes(&file).expect("the list reads"),
+            [
+                PathBuf::from("qa/planted/a/b.toml"),
+                PathBuf::from("seeds/x.bin")
+            ]
+        );
+        fs::write(&file, "../escape\n").unwrap();
+        assert!(store_changes(&file).is_err());
     }
 
     /// A registry row for the admitted seed `name` on `harness`.
@@ -2423,14 +2538,10 @@ mod tests {
     /// `discovery_wait_complete`, and a typed case runs through none. A
     /// seed the registry lacks fails.
     #[test]
-    fn committed_cases_run_through_the_target_of_their_harness() {
+    fn stored_cases_run_through_the_target_of_their_harness() {
         let repo_root = crate::repo_root().expect("xtask lives in the workspace");
         let harnesses = sim_minimize::fuzz_targets(&repo_root).expect("cargo metadata reads it");
-        let mut cases: Vec<Case> = cases(&repo_root)
-            .expect("the planted cases parse")
-            .into_iter()
-            .filter(|case| case.property == ID || matches!(case.witness, Witness::Typed { .. }))
-            .collect();
+        let (_store, mut cases) = discovery_store();
         let registry = Registry::from_rows([seed_row(
             "discovery-wait-complete",
             "discovery/wait-complete",
@@ -2484,17 +2595,6 @@ mod tests {
             ["p/slow"]
         );
         assert_eq!(skipped[0].1, "too slow");
-
-        let repo_root = crate::repo_root().expect("xtask lives in the workspace");
-        for case in cases(&repo_root).expect("the planted cases parse") {
-            if case.no_target.is_some() {
-                assert!(
-                    matches!(case.witness, Witness::Seed(_)),
-                    "{}: a typed case runs on no target",
-                    case.property
-                );
-            }
-        }
     }
 
     /// A harness maps to the first target by name that runs it, and a
@@ -2615,7 +2715,7 @@ mod tests {
             ("s.json", "{}\n"),
             ("p.bin", "plan\n"),
             ("p.json", "{}\n"),
-            ("crates/zakura-sim/src/seed/mod.rs", "fn seeds() {}\n"),
+            ("seeds/a.bin", "fn seeds() {}\n"),
         ] {
             fs::create_dir_all(root.join(path).parent().expect("a parent"))
                 .expect("the directory is created");
@@ -2651,12 +2751,9 @@ mod tests {
         let moved = patch("moved.patch", &|| {
             fs::rename(root.join("s.json"), root.join("t.json")).unwrap()
         });
-        let registry = patch(
-            "registry.patch",
-            &write("crates/zakura-sim/src/seed/mod.rs"),
-        );
+        let registry = patch("registry.patch", &write("seeds/a.bin"));
         let removed = patch("removed.patch", &|| {
-            fs::remove_file(root.join("crates/zakura-sim/src/seed/mod.rs")).unwrap()
+            fs::remove_file(root.join("seeds/a.bin")).unwrap()
         });
         let typed = Case {
             property: ID.to_owned(),
@@ -2711,12 +2808,12 @@ mod tests {
         );
         assert_eq!(judge(&typed, &moved), touches(&["s.json"]));
         assert_eq!(judge(&scripted, &moved), touches(&["s.json"]));
-        assert_eq!(judge(&seed, &registry), touches(&[seeds::REGISTRY]));
-        assert_eq!(judge(&seed, &removed), touches(&[seeds::REGISTRY]));
+        assert_eq!(judge(&seed, &registry), touches(&["seeds/a.bin"]));
+        assert_eq!(judge(&seed, &removed), touches(&["seeds/a.bin"]));
         assert_eq!(
             judge(&typed, &registry),
             None,
-            "the seed registry isn't a typed case's witness"
+            "a seed's input isn't a typed case's witness"
         );
     }
 
@@ -2782,6 +2879,7 @@ mod tests {
         write_cases(repo.path(), &[("a", "one"), ("a", "two")]);
         let error = super::run(
             repo.path(),
+            repo.path(),
             None,
             Some(Shard { index: 2, count: 7 }),
             None,
@@ -2834,65 +2932,6 @@ mod tests {
             "crates/zakura-network/src/zakura/discovery/../discovery",
         ] {
             assert!(!is_plain_relative(Path::new(path)), "{path}");
-        }
-    }
-
-    /// Each committed case patches only production code, and watches its
-    /// patch's files and its listed checks, which all exist.
-    #[test]
-    fn committed_cases_watch_existing_files() {
-        let repo_root = crate::repo_root().expect("xtask lives in the workspace");
-        for case in cases(&repo_root).expect("the planted cases parse") {
-            let watched = watched(&repo_root, &case).expect("the case's files exist");
-            for path in &watched {
-                assert!(
-                    repo_root.join(path).exists(),
-                    "{}: {} doesn't exist",
-                    case.patch.display(),
-                    path.display()
-                );
-            }
-            assert!(!case.checks.is_empty(), "{}", case.patch.display());
-            let patched = patched_files(&repo_root, &case.patch).expect("the patch parses");
-            assert!(
-                !patched.is_empty(),
-                "{} changes no file",
-                case.patch.display()
-            );
-            for path in &patched {
-                assert!(
-                    path.starts_with("crates")
-                        && !path.starts_with("crates/zakura-sim")
-                        && !path.starts_with("crates/xtask")
-                        && !path.components().any(|part| part.as_os_str() == "tests"),
-                    "{} patches {}, which isn't production code",
-                    case.patch.display(),
-                    path.display()
-                );
-            }
-        }
-    }
-
-    /// The committed cases parse, and each names a seed, or a typed case's
-    /// committed files. Which seeds the registry holds only a built
-    /// simulator lists, so [`run`] checks each name.
-    #[test]
-    fn committed_cases_name_their_witnesses() {
-        let repo_root = crate::repo_root().expect("xtask lives in the workspace");
-        let cases = cases(&repo_root).expect("the planted cases parse");
-        assert!(cases.iter().any(|case| case.property == ID));
-        for case in &cases {
-            if let Witness::Seed(name) = &case.witness {
-                assert!(!name.trim().is_empty(), "{}", case.patch.display());
-            }
-            for file in case.witness.files() {
-                assert!(
-                    repo_root.join(&file).exists(),
-                    "{}: {} is committed",
-                    case.patch.display(),
-                    file.display()
-                );
-            }
         }
     }
 
@@ -3495,7 +3534,7 @@ mod tests {
             ]
         );
         let seed = Witness::Seed("a".to_owned());
-        assert_eq!(seed.files(), vec![PathBuf::from(seeds::REGISTRY)]);
+        assert_eq!(seed.files(), vec![PathBuf::from("seeds/a.bin")]);
         let registry = Registry::from_rows([seed_row("a", "discovery/wire")]).expect("one row");
         assert_eq!(seed.harness(&registry).unwrap(), "discovery/wire");
         assert_eq!(

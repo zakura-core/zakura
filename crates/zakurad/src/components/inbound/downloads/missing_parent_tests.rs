@@ -218,8 +218,6 @@ impl Harness {
 
             async move {
                 match request {
-                    // Gossip always fetches the body, so the state never reports it present.
-                    zs::Request::AnyChainBlock(_) => Ok(zs::Response::Block(None)),
                     zs::Request::KnownBlock(hash) => Ok(zs::Response::KnownBlock(
                         known
                             .borrow()

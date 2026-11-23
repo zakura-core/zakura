@@ -1348,13 +1348,19 @@ mod tests {
         let mut cluster = ZakuraTestCluster::new();
         let victim_idx = cluster.spawn_traced_node(1, &mut capture).await?;
         let victim = cluster.node(victim_idx);
+        // Seed 3's node ID sorts below the victim's, so this peer is the side
+        // that opens the stream.
         let hostile = HostilePeer::connect_native_with_capabilities(
             victim,
-            2,
+            3,
             ZAKURA_CAP_BLOCK_SYNC_REGULATED,
         )
         .await?;
         let hostile_peer = hostile.id()?;
+        assert!(
+            LocalEndpointFactory::secret_key(3).public() < LocalEndpointFactory::secret_key(1).public(),
+            "the hostile peer must open the stream"
+        );
         let peer_set = victim.supervisor().subscribe();
 
         await_until("block-sync peer registered", Duration::from_secs(5), || {
@@ -1412,13 +1418,19 @@ mod tests {
         let mut cluster = ZakuraTestCluster::new();
         let victim_idx = cluster.spawn_traced_node(1, &mut capture).await?;
         let victim = cluster.node(victim_idx);
+        // Seed 3's node ID sorts below the victim's, so this peer is the side
+        // that opens the stream.
         let hostile = HostilePeer::connect_native_with_capabilities(
             victim,
-            2,
+            3,
             ZAKURA_CAP_BLOCK_SYNC_REGULATED,
         )
         .await?;
         let hostile_peer = hostile.id()?;
+        assert!(
+            LocalEndpointFactory::secret_key(3).public() < LocalEndpointFactory::secret_key(1).public(),
+            "the hostile peer must open the stream"
+        );
         let peer_set = victim.supervisor().subscribe();
 
         await_until("block-sync peer registered", Duration::from_secs(5), || {
@@ -2712,7 +2724,7 @@ mod tests {
             .await??;
             match crate::zakura::wire_codec::decode_frame::<DiscoveryMessage>(&frame)? {
                 DiscoveryMessage::Hello { record } => {
-                    assert_eq!(record.body.node_id, victim_node_id);
+                    assert_eq!(record.body.node_id(), victim_node_id);
                     saw_hello = true;
                 }
                 DiscoveryMessage::Peers { records } => {

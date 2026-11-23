@@ -69,6 +69,8 @@ pub struct BodySizeHintBatch {
 pub struct CommittedHeaderChainView {
     /// Exact durable header-chain snapshot.
     pub snapshot: EngineSnapshot,
+    /// Highest verified block on the selected header chain.
+    pub body_download_anchor: crate::Frontier,
     /// Process-local selected-lineage epoch.
     pub body_work_epoch: BodyWorkEpoch,
     /// Process-local correction revision. Consumers refresh queued estimates when it changes.
@@ -81,10 +83,15 @@ pub struct CommittedHeaderChainView {
 
 impl CommittedHeaderChainView {
     /// Construct a committed view at one body-work epoch.
-    pub const fn new(snapshot: EngineSnapshot, body_work_epoch: BodyWorkEpoch) -> Self {
+    pub const fn new(
+        body_download_anchor: crate::Frontier,
+        snapshot: EngineSnapshot,
+        body_work_epoch: BodyWorkEpoch,
+    ) -> Self {
         Self {
             snapshot,
             body_work_epoch,
+            body_download_anchor,
             body_size_hint_revision: 0,
             body_size_hint_batches: None,
         }

@@ -870,7 +870,7 @@ fn arguments_need_explicit_budgets_and_a_known_target() {
              discovery_verification_capacity, discovery_wait_complete, discovery_wire, \
              handshake_counts, handshake_wire, header_publisher_policy, \
              header_reactor_policy, header_sync_storage, header_sync_wire, race_fixtures, \
-             sync_composed, sync_storage, sync_wire",
+             sync_composed, sync_storage, sync_wire, tx_relay_wire",
         ),
         (format!("{full} --runs 1"), "--runs given twice"),
         (

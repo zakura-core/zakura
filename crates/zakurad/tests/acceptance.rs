@@ -2691,6 +2691,11 @@ async fn regtest_coinbase() -> Result<()> {
     common::coinbase::regtest_coinbase().await
 }
 
+#[tokio::test]
+async fn regtest_coinbase_names_the_gateway() -> Result<()> {
+    common::coinbase::regtest_coinbase_names_the_gateway().await
+}
+
 #[cfg(feature = "indexer-rpc")]
 #[tokio::test(flavor = "multi_thread")]
 async fn trusted_chain_sync_handles_forks_correctly() -> Result<()> {

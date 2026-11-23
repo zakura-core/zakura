@@ -1,6 +1,6 @@
 [package]
 name = "zakura-quic"
-version = "1.1.0"
+version = "2.0.0"
 authors.workspace = true
 description = "Direct QUIC transport for Zakura's native P2P stack, built on quinn-proto. Internal crate, published to support cargo install zakura"
 license.workspace = true
@@ -15,13 +15,18 @@ default = []
 # `Conn::shared_id`, for other crates' unit tests. A simulator build gets it
 # from `--cfg zakura_sim`.
 test-support = []
+# The handshake parsers' fuzz drivers, for `qa/fuzz/p2p`. Not for production.
+p2p-fuzz = []
 
 [dependencies]
 # SPEC DEP-2 lists every allowed direct dependency. Adding one needs a spec change.
+blake2b_simd = { workspace = true }
 bytes = { workspace = true }
 curve25519-dalek = { workspace = true }
 futures = { workspace = true }
 hex = { workspace = true }
+libcrux-ml-dsa = { workspace = true }
+libcrux-ml-kem = { workspace = true }
 metrics = { workspace = true }
 quinn-proto = { workspace = true }
 ring = { workspace = true }
@@ -39,6 +44,7 @@ zeroize = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]
+serde_json = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "test-util", "time"] }
 sha2 = { workspace = true }
 toml = { workspace = true }

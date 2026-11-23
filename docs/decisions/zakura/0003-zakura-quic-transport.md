@@ -72,6 +72,12 @@ The profile keeps TLS 1.3 with raw public keys both ways, datagrams off and
 `grease_quic_bit` off. The server allows migration and closes a connection
 that migrates to a banned IP. It sends no NEW_TOKEN frames.
 
+Since version 0.25 of the spec the direct backend uses ALPN `p2p-v2/4`: a
+node's ID became the hash of the key list in the credential it proves in
+TLS, which changed every node ID once, and the handshake requires the hybrid
+key exchange. Key files did not change; bootstrap entries, which name node
+IDs, did.
+
 A node on this release and a node on an older release reach each other only
 over the legacy protocol. Dual-stack nodes bridge the two cohorts.
 

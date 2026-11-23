@@ -120,9 +120,10 @@ fn try_main() -> Result<(), BoxError> {
             }
             if args.peek().map(String::as_str) == Some("triage") {
                 args.next();
-                return planted::triage(&repo_root()?, args);
+                return planted::triage(args);
             }
             let mut changed_since = None;
+            let mut store_changed = None;
             let mut property = None;
             let mut shard = None;
             let mut targets = false;
@@ -150,6 +151,16 @@ fn try_main() -> Result<(), BoxError> {
                         args.next()
                             .ok_or(UsageError("expected a revision after `--changed-since`"))?,
                     );
+                } else if arg == "--store-changed" {
+                    if store_changed.is_some() {
+                        return Err(Box::new(UsageError(
+                            "expected at most one `--store-changed`",
+                        )));
+                    }
+                    store_changed = Some(PathBuf::from(
+                        args.next()
+                            .ok_or(UsageError("expected a file after `--store-changed`"))?,
+                    ));
                 } else if property.is_none() {
                     property = Some(arg);
                 } else {
@@ -158,11 +169,22 @@ fn try_main() -> Result<(), BoxError> {
                     )));
                 }
             }
+            if store_changed.is_some() && changed_since.is_none() {
+                return Err(Box::new(UsageError(
+                    "`--store-changed` adds to `--changed-since`, which is missing",
+                )));
+            }
+            let changed = changed_since.as_deref().map(|rev| planted::Changed {
+                rev,
+                store: store_changed.as_deref(),
+            });
+            let store = planted::require_store()?;
             planted::run(
                 &repo_root()?,
+                &store,
                 property.as_deref(),
                 shard,
-                changed_since.as_deref(),
+                changed,
                 targets,
             )
         }
@@ -501,8 +523,9 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
     writeln!(output)?;
     writeln!(
         output,
-        "Applies each bypass patch under qa/planted/ in a scratch worktree, and checks that"
+        "Applies each bypass patch under the QA store's qa/planted/ ($ZAKURA_QA_STORE) in a"
     )?;
+    writeln!(output, "scratch worktree, and checks that")?;
     writeln!(
         output,
         "its seed or typed scenario holds the property unpatched and violates exactly it patched."
@@ -515,6 +538,10 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
     writeln!(
         output,
         "With --changed-since, it runs only the cases the changes since that revision affect."
+    )?;
+    writeln!(
+        output,
+        "--store-changed <file> adds the store's changed paths, one per line, to those changes."
     )?;
     writeln!(
         output,
@@ -559,7 +586,7 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
     )?;
     writeln!(
         output,
-        "`planted loop` runs the mutation loop's cases (qa/native-mutations/PROMPT.md) on a"
+        "`planted loop` runs the mutation loop's cases (the store's qa/native-mutations) on a"
     )?;
     writeln!(
         output,
@@ -571,7 +598,7 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
     )?;
     writeln!(
         output,
-        "`planted triage` applies qa/native-mutations/triage.toml afresh to a loop report,"
+        "`planted triage` applies the store's qa/native-mutations/triage.toml afresh to a report,"
     )?;
     writeln!(
         output,

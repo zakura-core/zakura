@@ -1651,7 +1651,7 @@ impl Subsystem for Storage {
     /// vary its runs.
     fn families() -> Vec<ScenarioFamily> {
         vec![
-            ScenarioFamily::new("grammar", [grammar::LAYOUT.version]),
+            ScenarioFamily::free("grammar", [grammar::LAYOUT.version]),
             ScenarioFamily::new(
                 "serving-churn",
                 grammar::encode(&StorageScenario::serving_churn())

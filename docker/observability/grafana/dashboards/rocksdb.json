@@ -110,6 +110,15 @@
           "expr": "zakura_state_rocksdb_live_data_size_bytes{job=~\"$job\"}",
           "legendFormat": "Live Data Size",
           "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "zakura-prometheus"
+          },
+          "expr": "zakura_state_static_files_total_disk_size_bytes{job=~\"$job\"}",
+          "legendFormat": "Static Files Size",
+          "refId": "C"
         }
       ],
       "title": "Database Disk Size",

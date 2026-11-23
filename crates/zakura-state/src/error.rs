@@ -234,6 +234,33 @@ pub enum StateInitError {
         source: BoxError,
     },
 
+    /// The transaction static files could not be opened or repaired.
+    #[error("cannot open transaction static files at {path:?}: {source}")]
+    StaticFiles {
+        /// The static file directory.
+        path: PathBuf,
+        /// The static file error.
+        source: BoxError,
+    },
+
+    /// The transaction static files are missing a block the database recorded as moved.
+    ///
+    /// Static files are synced before the database records them, so this means
+    /// files were damaged or deleted, and those bodies are gone.
+    #[error(
+        "transaction static files at {path:?} are missing block {first_missing:?}, but the \
+         database moved bodies up to {database_tip:?}. Hint: restore the state directory from \
+         a backup or resync"
+    )]
+    StaticFilesMissingBlocks {
+        /// The static file directory.
+        path: PathBuf,
+        /// The lowest retained block that is in neither store.
+        first_missing: zakura_chain::block::Height,
+        /// The highest block the database recorded as moved.
+        database_tip: zakura_chain::block::Height,
+    },
+
     /// A read-only state was requested, but the configured cache directory is
     /// missing or unreadable.
     ///

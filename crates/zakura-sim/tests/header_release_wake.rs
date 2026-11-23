@@ -40,38 +40,35 @@ use zakura_sim::{
     observe::{ReactorFact, StorageFact, StorageRequest, StorageState},
     property::{CheckEvent, EndViolation, HasView, Lifecycle, Property, Sources},
     record::RecordSink,
-    seed,
     trace::{replay_with, ReplayOptions, TraceReader},
     witness::Expect,
     Checker, MemorySink, NullSink, Observation, ObservationLog, Outcome, Plan, PlanInput,
     PropertyOutcome, PropertyReport, RunConfig, RunEnd, RunReport, Sim, StepCtx, Violation,
 };
 
-/// The release seed's input, `header-release-wake`:
-/// [`WakeScenario::Release`]'s scenario byte, then Plan bytes. Its run's
-/// release comes from a completion drained at the top of the reactor's
-/// loop, so only the budget's release wake gets the reactor back to the
-/// waiting offer. `cargo xtask planted header-sync/capacity-release-wakes`
-/// checks that removing that wake violates the property on it.
+/// `scenario`'s scenario byte.
+fn scenario_byte(scenario: WakeScenario) -> u8 {
+    match scenario {
+        WakeScenario::Release => 0,
+        WakeScenario::Deferred => 1,
+    }
+}
+
+/// The release input: [`WakeScenario::Release`]'s scenario byte and the
+/// empty Plan. Every Plan reaches the release fixture's history
+/// ([`the_wake_fixtures_hold_under_every_plan`]), so the input needs no
+/// search. Its release defers no cached pass before the waiting offer's
+/// read.
 fn release_input() -> Vec<u8> {
-    seed_input("header-release-wake")
+    vec![scenario_byte(WakeScenario::Release)]
 }
 
-/// The deferred seed's input, `header-release-wake-deferred`:
-/// [`WakeScenario::Deferred`]'s scenario byte, then Plan bytes. The
-/// release's cached pass is deferred to the refill, and the planted cases
-/// that drop the refill deadline or the refill itself violate the property
-/// on it.
+/// The deferred input: [`WakeScenario::Deferred`]'s scenario byte and the
+/// empty Plan. Every Plan reaches the deferred fixture's history, so the
+/// input needs no search. Its release's cached pass is deferred to the
+/// refill.
 fn deferred_input() -> Vec<u8> {
-    seed_input("header-release-wake-deferred")
-}
-
-/// The input of the seed named `name`.
-fn seed_input(name: &str) -> Vec<u8> {
-    seed::find(name)
-        .unwrap_or_else(|| panic!("{name} is registered"))
-        .input()
-        .to_vec()
+    vec![scenario_byte(WakeScenario::Deferred)]
 }
 
 /// `input`'s Plan, after its scenario byte.
@@ -129,7 +126,7 @@ fn deferred(facts: &[(u64, WakeFact)]) -> bool {
 /// `header-sync/capacity-release-wakes` holds on `input` through the
 /// registered harness, and the run reaches its trigger history. Returns
 /// the facts between the wake and the waiting offer's read.
-fn committed_input_holds(scenario: WakeScenario, input: &[u8]) -> Vec<(u64, WakeFact)> {
+fn input_holds(scenario: WakeScenario, input: &[u8]) -> Vec<(u64, WakeFact)> {
     let entry = harness::find(ReleaseWake::NAME).expect("the harness is registered");
     let result = (entry.witness)(
         &entry.scenario(&input[..ReleaseWake::SCENARIO_BYTES]),
@@ -148,7 +145,7 @@ fn committed_input_holds(scenario: WakeScenario, input: &[u8]) -> Vec<(u64, Wake
 /// waiting offer's read.
 #[test]
 fn the_release_wake_input_holds_capacity_release_wakes() {
-    let between = committed_input_holds(WakeScenario::Release, &release_input());
+    let between = input_holds(WakeScenario::Release, &release_input());
     assert!(!deferred(&between), "{between:?}");
 }
 
@@ -156,13 +153,13 @@ fn the_release_wake_input_holds_capacity_release_wakes() {
 /// deferred to the refill before the waiting offer's read.
 #[test]
 fn the_deferred_wake_input_holds_capacity_release_wakes() {
-    let between = committed_input_holds(WakeScenario::Deferred, &deferred_input());
+    let between = input_holds(WakeScenario::Deferred, &deferred_input());
     assert!(deferred(&between), "{between:?}");
 }
 
 /// Each fixture opens a wake, gets the waiting offer's locator read to
-/// storage and holds the property under every plan, not only the committed
-/// ones. In the deferred fixture a deferral comes between every time. Each
+/// storage and holds the property under every plan, not only the empty
+/// one. In the deferred fixture a deferral comes between every time. Each
 /// run then ends settled ([`stuck`]).
 #[test]
 fn the_wake_fixtures_hold_under_every_plan() {
@@ -514,7 +511,7 @@ where
 /// only its drain, which retires the hold the fixture doesn't own, runs it.
 #[test]
 fn the_fixtures_settle_after_their_measured_boundary_and_not_before() {
-    let committed = [
+    let inputs = [
         (WakeScenario::Release, plan(&release_input())),
         (WakeScenario::Deferred, plan(&deferred_input())),
     ];
@@ -524,7 +521,7 @@ fn the_fixtures_settle_after_their_measured_boundary_and_not_before() {
             (WakeScenario::Deferred, input),
         ]
     });
-    for (scenario, input) in committed.into_iter().chain(plans) {
+    for (scenario, input) in inputs.into_iter().chain(plans) {
         let (settled, after) = measured::<ReleaseWake>(scenario, input.clone());
         let (unsettled, before) = measured::<Unsettled>(scenario, input);
         let Some(Offered {
@@ -937,7 +934,7 @@ fn the_scenario_byte_picks_the_fixture() {
 }
 
 /// The wake facts, the property's report and the full log depend only on
-/// the plan: the committed release plan A twice, then B, then A again,
+/// the plan: the release input's empty plan A twice, then B, then A again,
 /// gives A's every time, and B's log differs.
 #[test]
 fn wake_evidence_repeats_a_a_and_a_b_a() {
@@ -997,7 +994,7 @@ fn captured() -> String {
     format!("{:?}\n", wake.facts())
 }
 
-/// Each committed input, recorded in this process and replayed exactly in
+/// Each fixture's input, recorded in this process and replayed exactly in
 /// a fresh process of the same test binary, finds the same wake facts with
 /// the same stamps.
 #[test]
@@ -1042,8 +1039,8 @@ fn the_wake_witnesses_replay_in_a_fresh_process() {
     }
 }
 
-/// Each seed draws its fixture, and runs through the registered harness to
-/// a defined end that the explorer classifies clean.
+/// Each fixture's input draws its fixture, and runs through the registered
+/// harness to a defined end that the explorer classifies clean.
 #[test]
 fn the_seeds_draw_their_fixtures_and_run_clean() {
     let entry = harness::find(ReleaseWake::NAME).expect("the harness is registered");

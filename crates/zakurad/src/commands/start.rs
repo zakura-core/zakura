@@ -95,7 +95,11 @@ use tokio_util::sync::CancellationToken;
 use tower::{load_shed::LoadShed, timeout::Timeout, util::BoxService, ServiceExt};
 use tracing::Instrument;
 
-use zakura_chain::block::{self, genesis::regtest_genesis_block};
+use zakura_chain::{
+    block::{self, genesis::regtest_genesis_block},
+    chain_tip::ChainTip,
+    miner_mesh::MinerMeshCommitment,
+};
 use zakura_consensus::router::BackgroundTaskHandles;
 use zakura_jsonl_trace::{JsonlEventEmitter, JsonlTracer};
 use zakura_network::types::PeerServices;
@@ -114,6 +118,7 @@ use crate::{
         health,
         inbound::{self, InboundSetupData, MAX_INBOUND_RESPONSE_TIME},
         mempool::{self, Mempool},
+        miner_mesh,
         sync::{self, show_block_chain_progress, VERIFICATION_PIPELINE_SCALING_MULTIPLIER},
         tokio::{new_runtime, RuntimeRun},
         zcashd_compat, ChainSync, Inbound,
@@ -222,6 +227,23 @@ fn use_zakura_block_sync(config: &zakura_network::Config) -> bool {
     config.v2_p2p()
 }
 
+/// Claims receipt order in `announcement_claims` for each block a legacy peer newly announces,
+/// so legacy-only blocks follow the same equal-work rule as blocks whose headers arrive first.
+///
+/// The best chain tip stands in for header sync's verified tip, which a node without native
+/// header sync never reports.
+fn legacy_block_announcement_hook(
+    announcement_claims: zakura_consensus::AnnouncementClaims,
+    latest_chain_tip: impl ChainTip + Send + Sync + 'static,
+) -> zakura_network::BlockAnnouncementHook {
+    zakura_network::BlockAnnouncementHook::new(move |hash| {
+        // Before the first block is committed there is no tip to place a claim above.
+        if let Some(verified_tip) = latest_chain_tip.best_tip_height() {
+            announcement_claims.note_announcement(hash, verified_tip);
+        }
+    })
+}
+
 /// The tasks spawned by the `start` command, which are all aborted when this is dropped.
 #[derive(Default)]
 struct NodeTasks {
@@ -320,6 +342,59 @@ impl StartCmd {
             .consensus
             .validate()
             .map_err(|error| eyre!("invalid consensus configuration: {error}"))
+    }
+
+    /// Refuses `mining.miner_mesh` on a node that cannot be a gateway, and warns when the
+    /// gateway it names would be of no use to other miners.
+    ///
+    /// Other miners find the gateway by its v2 node ID, so it needs the v2 stack.
+    fn validate_miner_mesh_config(config: &ZakuradConfig) -> Result<(), Report> {
+        if !config.mining.miner_mesh {
+            return Ok(());
+        }
+
+        if !config.network.v2_p2p() {
+            return Err(eyre!(
+                "mining.miner_mesh requires the Zakura P2P v2 stack; set network.p2p_stack to \
+                 \"zakura\" or \"dual\""
+            ));
+        }
+
+        // An unset address also binds loopback only.
+        if config
+            .network
+            .zakura
+            .listen_addr
+            .is_none_or(|addr| addr.ip().is_loopback())
+        {
+            warn!(
+                "mining.miner_mesh is set but network.zakura.listen_addr is unset or loopback, \
+                 so other miners cannot dial this gateway"
+            );
+        }
+
+        if config.mining.miner_address.is_none() {
+            warn!(
+                "mining.miner_mesh is set but mining.miner_address is not, so this node builds \
+                 no coinbase and names no gateway"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Prepares the endpoint config, pinning a persistent identity for an announcing gateway.
+    fn network_config_for_start(config: &ZakuradConfig) -> Result<zakura_network::Config, Report> {
+        let mut network = config.network.clone();
+        if config.mining.miner_mesh {
+            network.pin_stable_zakura_identity().map_err(|error| {
+                eyre!(
+                    "mining.miner_mesh needs a node key that stays the same across restarts: \
+                     {error}"
+                )
+            })?;
+        }
+        Ok(network)
     }
 
     fn validate_debug_blocksync_throughput_config(config: &ZakuradConfig) -> Result<(), Report> {
@@ -461,6 +536,8 @@ impl StartCmd {
 
         Self::validate_consensus_config(&config)?;
         Self::validate_debug_blocksync_throughput_config(&config)?;
+        Self::validate_miner_mesh_config(&config)?;
+        let mut network_config = Self::network_config_for_start(&config)?;
         config.rpc.validate().map_err(|error| eyre!(error))?;
         let backend_verifications = config
             .sync
@@ -614,6 +691,9 @@ impl StartCmd {
             zakura::SyncCoordinator::new()
         };
 
+        // Header sync and legacy block `inv`s claim blocks announced first, and the block
+        // verifier ranks equal-work bodies by those claims.
+        let announcement_claims = zakura_consensus::AnnouncementClaims::default();
         let zakura_header_sync_driver_startup = if config.network.v2_p2p() {
             Some(
                 zakura_header_sync_driver_startup(
@@ -622,6 +702,7 @@ impl StartCmd {
                     header_chain_body_evidence.clone(),
                     &config.network.network,
                     &zakura_block_sync_handoff,
+                    announcement_claims.clone(),
                 )
                 .boxed()
                 .await?,
@@ -717,7 +798,6 @@ impl StartCmd {
 
         // The network counts `tx-relay`'s memory shares only when it is
         // registered, not merely enabled.
-        let mut network_config = config.network.clone();
         network_config.zakura.tx_relay.enabled = tx_relay_port.is_some();
         // The service is registered on the v2 endpoint, which a legacy-only
         // stack never starts.
@@ -743,6 +823,10 @@ impl StartCmd {
                 zcashd_compat_block_gossip_peer_ips.clone(),
                 zakura_header_sync_driver_startup,
                 custom_services,
+                legacy_block_announcement_hook(
+                    announcement_claims.clone(),
+                    latest_chain_tip.clone(),
+                ),
             )
             .await
             .map_err(|error| eyre!(error))?;
@@ -778,6 +862,8 @@ impl StartCmd {
                 state.clone(),
                 read_only_state_service.clone(),
                 tx_verifier_setup_rx,
+                announcement_claims,
+                read_only_state_service.subscribe_non_finalized_state(),
             )
             .boxed()
             .await;
@@ -958,6 +1044,20 @@ impl StartCmd {
         let rpc_impl = rpc_impl
             .with_template_trace(template_path_trace)
             .with_local_services(config.network.handshake_services(advertised_services));
+        let rpc_impl = if config.mining.miner_mesh {
+            let gateway = zakura_endpoint
+                .as_ref()
+                .ok_or_else(|| {
+                    eyre!("mining.miner_mesh is set but the v2 endpoint is not running")
+                })?
+                .local_node_id();
+            if config.mining.miner_address.is_some() {
+                info!(%gateway, "coinbases this node builds name it as the miner's gateway");
+            }
+            rpc_impl.with_mesh_commitment(MinerMeshCommitment::new(*gateway.as_bytes()))
+        } else {
+            rpc_impl
+        };
         node_tasks.supervise("rpc transaction queue", rpc_tx_queue_handle, Ok);
 
         let node_services = ready.as_ref().map(|_| crate::node::NodeServices {
@@ -1165,6 +1265,14 @@ impl StartCmd {
             mempool_crawler_task_handle,
             error_exit_status,
         );
+
+        // A mining node counts the gateways recent blocks name, to choose which mining
+        // gateways to stay connected to.
+        if config.mining.miner_address.is_some() {
+            let miner_mesh_task_handle =
+                miner_mesh::spawn(read_only_state_service.clone(), chain_tip_change.clone());
+            node_tasks.supervise("miner mesh tracker", miner_mesh_task_handle, |()| Ok(()));
+        }
 
         info!("spawning syncer task");
         // In regtest, commit the genesis block directly (bypassing the syncer's genesis
@@ -1591,6 +1699,7 @@ impl StartCmd {
 
         Self::validate_consensus_config(&config).map_err(config_error)?;
         Self::validate_debug_blocksync_throughput_config(&config).map_err(config_error)?;
+        Self::validate_miner_mesh_config(&config).map_err(config_error)?;
         config.rpc.validate().map_err(config_error)?;
 
         Ok(config)

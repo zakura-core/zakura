@@ -80,9 +80,14 @@
 //!   most what the peer's `Hello` serves. It grows by one, up to that, on
 //!   each admission of a body the session fetched while the window was
 //!   full, and halves, to no less than one, when requests miss their
-//!   deadlines, as block sync's window dips on a timeout. So a peer gets
+//!   deadlines, as block sync's window dips on a timeout. A `NotFound` for a
+//!   fetch that still holds its reservation, or any verdict but an
+//!   admission, takes one off a window above [`INITIAL_WINDOW`], so a peer
+//!   can't keep a grown window's pool slots at no cost with orphans that
+//!   park or a `NotFound` sent just before each deadline. So a peer gets
 //!   more than [`INITIAL_WINDOW`] bodies verified at once only after
-//!   bodies it supplied were admitted, and a new session starts again at
+//!   bodies it supplied were admitted, each slot past it costs one more
+//!   admission, and a new session starts again at
 //!   [`INITIAL_WINDOW`]. What the session asks for at once also stays
 //!   within [`MAX_OUTSTANDING_BYTES`] of announced sizes: the oldest ready
 //!   id that would pass it waits for bytes to free, so the deadline cap
@@ -218,12 +223,12 @@
 //! - **Announce what the pool admits, once, and never back to its source.**
 //!   A session announces an added id the pool holds, unless it already did
 //!   or its peer announced or supplied it. Sessions inside the id's window
-//!   announce at once, the rest after [`FanOut::advert_delay`]. An `Inv`
+//!   announce at once, the rest after [`FanOut::advert_delay`]. A `Have`
 //!   carries an id only once none of its in-pool parents still waits to go
 //!   out to that session.
-//! - **An `Inv` waits for room.** One goes only while the data writer keeps
+//! - **A `Have` waits for room.** One goes only while the data writer keeps
 //!   room for every body the peer may have requested, once the session's
-//!   last `Inv` is written, and once the byte rate pays for it.
+//!   last `Have` is written, and once the byte rate pays for it.
 //! - **Serve only what was announced, within our `Hello`.** A `GetTxs` gets
 //!   the body only for an exact id this session announced and the pool
 //!   still holds. A peer has at most [`MAX_SERVES`] requests whose answers
@@ -231,7 +236,7 @@
 //!
 //! Every close is a row of the spec's `tx-relay` close table, which names
 //! its owner. Left out, because the IO and the transport own them: paying
-//! the `Inv` byte rate and charging it on receipt, and decoding and writing
+//! the `Have` byte rate and charging it on receipt, and decoding and writing
 //! frames.
 
 pub(crate) mod peer;
@@ -314,7 +319,7 @@ pub(crate) const BASE_DEADLINE: Duration = Duration::from_secs(8);
 /// The slowest link a deadline allows for, in bytes a second.
 pub(crate) const MIN_RATE: u64 = 100_000;
 
-/// Paid `Inv` bytes a sender may hold that are not yet written to QUIC.
+/// Paid `Have` bytes a sender may hold that are not yet written to QUIC.
 pub(crate) const SENDER_ALLOWANCE: u64 = 512 * 1024;
 
 /// The first retry delay for an id, doubling to [`RETRY_MAX`].
@@ -339,10 +344,10 @@ pub(crate) const RANDOM_EVERY: usize = 4;
 /// How long a session outside an id's window waits to announce it.
 pub(crate) const ADVERT_DELAY: Duration = Duration::from_secs(2);
 
-/// How long a session waits to try its next `Inv` again while its last one
+/// How long a session waits to try its next `Have` again while its last one
 /// is unwritten or its data writer has no room. A write frees both, and
 /// wakes nothing.
-pub(crate) const INV_RETRY: Duration = Duration::from_millis(50);
+pub(crate) const HAVE_RETRY: Duration = Duration::from_millis(50);
 
 /// The window for the smallest transactions.
 pub(crate) const WINDOW_SMALL: usize = 16;
@@ -583,7 +588,7 @@ pub(crate) enum RelayEffect {
         /// The id.
         id: UnminedTxId,
     },
-    /// Announce `id` in an `Inv`.
+    /// Announce `id` in a `Have`.
     Advert {
         /// The session.
         session: SessionId,
@@ -647,7 +652,7 @@ pub(crate) enum RelayEffect {
     },
 }
 
-/// When the connection's `Inv` byte rate lets a frame go, as the IO's
+/// When the connection's `Have` byte rate lets a frame go, as the IO's
 /// metered sender answers.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum Paid {
@@ -655,13 +660,13 @@ pub(crate) enum Paid {
     Now,
     /// Once the rate pays for the frame, at this time.
     At(Time),
-    /// Once this session's last `Inv` is written.
+    /// Once this session's last `Have` is written.
     Unwritten,
 }
 
-/// What the IO knows when the machine decides whether an `Inv` goes now.
-/// See [`PeerMachine::next_inv`].
-pub(crate) struct InvRoom<F> {
+/// What the IO knows when the machine decides whether a `Have` goes now.
+/// See [`PeerMachine::next_have`].
+pub(crate) struct HaveRoom<F> {
     /// Places free in the data writer's queue.
     pub(crate) free: usize,
     /// When the byte rate pays for a frame of so many payload bytes.
@@ -1326,10 +1331,10 @@ impl RelayMachine {
         });
     }
 
-    /// An `Inv` arrived with these ids and sizes.
-    pub(crate) fn inv(&mut self, session: SessionId, entries: &[(UnminedTxId, u32)], now: Time) {
+    /// A `Have` arrived with these ids and sizes.
+    pub(crate) fn have(&mut self, session: SessionId, entries: &[(UnminedTxId, u32)], now: Time) {
         self.on(session, now, |machine, shared, pool, now| {
-            machine.inv(shared, pool, entries, now);
+            machine.have(shared, pool, entries, now);
         });
     }
 
@@ -1567,35 +1572,35 @@ impl RelayMachine {
 
     // Outputs and observations.
 
-    /// The `Inv` `session` may send now. See [`PeerMachine::next_inv`].
-    pub(crate) fn next_inv(
+    /// The `Have` `session` may send now. See [`PeerMachine::next_have`].
+    pub(crate) fn next_have(
         &mut self,
         session: SessionId,
-        room: InvRoom<impl FnOnce(u64) -> Paid>,
+        room: HaveRoom<impl FnOnce(u64) -> Paid>,
         now: Time,
     ) -> Vec<(UnminedTxId, u32)> {
         let (pool, now) = (&self.pool, self.now.max(now));
         self.machines
             .get_mut(&session)
-            .map(|machine| machine.next_inv(pool, room, now))
+            .map(|machine| machine.next_have(pool, room, now))
             .unwrap_or_default()
     }
 
     /// Takes up to `max` of `session`'s queued announcements. See
-    /// [`PeerMachine::take_inv`].
-    pub(crate) fn take_inv(&mut self, session: SessionId, max: usize) -> Vec<(UnminedTxId, u32)> {
+    /// [`PeerMachine::take_have`].
+    pub(crate) fn take_have(&mut self, session: SessionId, max: usize) -> Vec<(UnminedTxId, u32)> {
         let pool = &self.pool;
         self.machines
             .get_mut(&session)
-            .map(|machine| machine.take_inv(pool, max))
+            .map(|machine| machine.take_have(pool, max))
             .unwrap_or_default()
     }
 
-    /// How many of `session`'s announcements wait for an `Inv`.
-    pub(crate) fn queued_inv(&self, session: SessionId) -> usize {
+    /// How many of `session`'s announcements wait for a `Have`.
+    pub(crate) fn queued_have(&self, session: SessionId) -> usize {
         self.machines
             .get(&session)
-            .map_or(0, PeerMachine::queued_inv)
+            .map_or(0, PeerMachine::queued_have)
     }
 
     /// What `tx-relay` did since the last call, in order.

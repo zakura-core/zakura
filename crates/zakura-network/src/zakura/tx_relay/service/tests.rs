@@ -105,7 +105,7 @@ async fn a_body_evicted_while_its_job_waits_is_answered_not_found() {
     // next holds the writer, so the job waits behind them.
     let filler = || {
         Outgoing::Frame(
-            encode_frame(&TxRelayMessage::Inv(vec![(id, 1)])).expect("a valid frame"),
+            encode_frame(&TxRelayMessage::Have(vec![(id, 1)])).expect("a valid frame"),
             None,
         )
     };
@@ -168,9 +168,11 @@ fn wiring(pool: PoolHandle) -> (Wiring, mpsc::UnboundedReceiver<Calls>) {
         handoff,
         owned: Owned::default(),
         record: TxRelaySessions::default(),
-        inv_buckets: InvBuckets::default(),
+        have_buckets: HaveBuckets::default(),
         base: Instant::now(),
         unconditional: UnconditionalPeers::default(),
+        #[cfg(zakura_sim)]
+        observer: None,
     };
     (wiring, handed)
 }
@@ -201,8 +203,8 @@ impl Session {
         let (state, state_recv) = mpsc::channel(STATE_QUEUE);
         let (reports, reports_rx) = mpsc::unbounded_channel();
         let (close, cause, cancel) = closer();
-        let inv = MeteredSender::new(open_inv_bucket(&wiring.inv_buckets, &connection()));
-        let io = SessionIo::new(data, state, close, reports_rx, inv, connection());
+        let have = MeteredSender::new(open_have_bucket(&wiring.have_buckets, &connection()));
+        let io = SessionIo::new(data, state, close, reports_rx, have, connection());
         let mut routine = Routine::open(
             wiring.clone(),
             PeerKey(1),
@@ -234,7 +236,7 @@ impl Session {
 /// A routine with a pool of `count` transactions, and one session on
 /// connection 1 whose writers the test holds and never reads, as a peer
 /// that stopped reading. The session's peer has sent its `Hello`, and every
-/// id has gone out to it in one `Inv`.
+/// id has gone out to it in one `Have`.
 struct Serving {
     session: Session,
     wiring: Wiring,
@@ -268,8 +270,8 @@ impl Serving {
                 .try_recv()
                 .expect("the session announces the pool"),
         ) {
-            TxRelayMessage::Inv(entries) => assert_eq!(entries.len(), ids.len()),
-            other => panic!("expected an Inv, got {other:?}"),
+            TxRelayMessage::Have(entries) => assert_eq!(entries.len(), ids.len()),
+            other => panic!("expected a Have, got {other:?}"),
         }
         Self {
             session,
@@ -282,12 +284,12 @@ impl Serving {
 }
 
 /// A session that replaces another on the same connection, even before the
-/// old one has ended, pays the same `Inv` bucket.
+/// old one has ended, pays the same `Have` bucket.
 #[tokio::test]
-async fn sessions_on_one_connection_share_one_inv_bucket() {
+async fn sessions_on_one_connection_share_one_have_bucket() {
     let serving = Serving::new(1).await;
     let sessions = |wiring: &Wiring| {
-        let buckets = wiring.inv_buckets.lock().expect("never poisoned");
+        let buckets = wiring.have_buckets.lock().expect("never poisoned");
         assert_eq!(buckets.len(), 1);
         buckets[&connection()].sessions
     };
@@ -366,11 +368,13 @@ fn a_body_keeps_the_exemption_its_supplier_had_when_it_arrived() {
                     max_tx_bytes: MAX_TX_BYTES,
                 })
                 .await;
-            session.deliver(TxRelayMessage::Inv(vec![(id, size)])).await;
+            session
+                .deliver(TxRelayMessage::Have(vec![(id, size)]))
+                .await;
 
             // The core grants the fetch.
             let grant = async {
-                let Some(PoolCommand::Reserve { tx_id, reply }) = inbox.next().await else {
+                let Some(PoolCommand::Reserve { tx_id, reply, .. }) = inbox.next().await else {
                     panic!("the session reserves the id it was offered");
                 };
                 let reservation = inbox.grant(ReservationId(1), tx_id, CancellationToken::new());
@@ -463,4 +467,57 @@ fn a_connection_stays_owned_through_the_reopen_gap() {
     let ownership = &owned[&connection];
     assert!(ownership.claims(ended + Duration::from_secs(8)));
     assert!(!ownership.claims(ended + REOPEN_GAP));
+}
+
+/// `Have` frames queued on the data stream reach the machine as one `Have`,
+/// so a peer that sends one-entry frames costs one lock step per queued
+/// run. The frame after them is still handled, after them: here a body
+/// nobody asked for, which closes the peer only once all three ids are
+/// taken.
+#[tokio::test]
+async fn queued_have_frames_reach_the_machine_as_one() {
+    let (handle, inbox) = pool_port();
+    publish(&inbox, Vec::new(), Vec::new());
+    let (wiring, _handed) = wiring(handle);
+    let mut session = Session::open(&wiring);
+    session
+        .deliver(TxRelayMessage::Hello {
+            serves: 16,
+            max_tx_bytes: MAX_TX_BYTES,
+        })
+        .await;
+
+    let announced = transactions(4);
+    let frame = |message: &TxRelayMessage| encode_frame(message).expect("a valid frame");
+    let have = |tx: &VerifiedUnminedTx| {
+        let size = u32::try_from(tx.transaction.size()).expect("a test body is small");
+        frame(&TxRelayMessage::Have(vec![(tx.transaction.id(), size)]))
+    };
+    let (send, mut data) = framed_channel(8);
+    for tx in &announced[1..3] {
+        send.try_send(have(tx)).expect("the queue has room");
+    }
+    let unrequested = TxRelayMessage::Tx {
+        id: announced[3].transaction.id(),
+        body: vec![0],
+    };
+    send.try_send(frame(&unrequested))
+        .expect("the queue has room");
+
+    let open = session
+        .routine
+        .data_frame(&have(&announced[0]), &mut data)
+        .await;
+    assert!(open, "every frame decodes");
+    assert!(data.try_recv().is_err(), "every queued frame is taken");
+    assert_eq!(
+        session.routine.calls.len(),
+        3,
+        "each announced id is reserved"
+    );
+    assert_eq!(
+        session.cause.get(),
+        Some(fault(CloseRow::RELAY_CLOSE_9)),
+        "the unrequested body closes the peer"
+    );
 }

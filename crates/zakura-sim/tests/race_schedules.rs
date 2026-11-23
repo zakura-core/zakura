@@ -1,24 +1,27 @@
-//! sched-4 S4.4 and S4.5: each race fixture's saved violating schedule.
+//! sched-4 S4.4 and S4.5: each race fixture's violating schedule.
 //!
-//! Each fixture has one seed, `race-schedule-<name>`: the planted race on 2
-//! workers, then Plan bytes that reach the race's trigger history. They sit
-//! in the known failures, outside the seed corpus, because they fail by
-//! design: a fuzz campaign seeded with one would find its race at once.
+//! Each fixture has one schedule: the planted race on 2 workers, then Plan
+//! bytes that reach the race's trigger history. A bounded search finds the
+//! Plan bytes (`support::race_schedule`). The schedules fail by design, so
+//! no fuzz campaign starts from one: it would find its race at once.
 //!
-//! - S4.4: each saved schedule reproduces its race's violation with the
-//!   race's trigger history, and the fix holds on the same Plan bytes. This
-//!   file checks the seeds and runs their violation witnesses through the
-//!   registered harnesses. The witness tests in `race_fixtures.rs` run the
-//!   same Plan bytes on the race and on the fix.
+//! - S4.4: each schedule reproduces its race's violation with the race's
+//!   trigger history, and the fix holds on the same Plan bytes. This file
+//!   runs their violation witnesses through the registered harnesses. The
+//!   witness tests in `race_fixtures.rs` run the same Plan bytes on the race
+//!   and on the fix.
 //! - S4.5: a fresh process replays each one's trace exactly and records the
-//!   same trace from the saved bytes, and Exact replay on changed code
+//!   same trace from the same bytes, and Exact replay on changed code
 //!   reports a divergence.
 #![cfg(zakura_sim)]
+
+mod support;
 
 use std::{
     collections::BTreeMap, marker::PhantomData, path::Path, process::Command, time::Duration,
 };
 
+use support::race_schedule::schedule_input;
 use tempfile::TempDir;
 use zakura_scheduler::Status;
 use zakura_sim::{
@@ -32,73 +35,44 @@ use zakura_sim::{
     },
     property::{CheckCtx, HasView, Kind, Property, PropertyId, Source, Sources, TriggerHistory},
     property::{Status as PropertyStatus, Verdict},
-    seed::{self, Seed, SeedSet},
     trace::{replay, replay_with, ReplayError, ReplayOptions, Trace, TraceReader},
+    witness::Expect,
     Divergence, RunConfig, Sim,
 };
 
-/// Every saved schedule, by its fixture's property. Each must validate as a
-/// known-failure seed of its fixture's own harness and decode to the
-/// planted race on 2 workers.
-fn saved() -> BTreeMap<&'static str, Seed> {
-    let report = seed::load(SeedSet::KnownFailure, None);
-    let ours = |seed: &Seed| seed.name.starts_with("race-schedule-");
-    let rejected: Vec<_> = report
-        .rejected
-        .iter()
-        .filter(|failed| ours(&failed.seed))
-        .collect();
-    assert!(rejected.is_empty(), "{rejected:?}");
-    let race = serde_json::to_value(Scenario {
-        variant: Variant::Base,
-        workers: 2,
-    })
-    .unwrap();
-    let mut saved = BTreeMap::new();
-    for seed in report.admitted.into_iter().filter(ours) {
-        let fixture = Which::ALL
-            .into_iter()
-            .find(|which| which.property() == seed.harness)
-            .unwrap_or_else(|| panic!("{}: not a race fixture", seed.name));
-        assert_eq!(
-            seed.name.strip_prefix("race-schedule-"),
-            fixture.property().strip_prefix("race/"),
-            "each schedule is named for its fixture"
-        );
-        assert_eq!(
-            seed::decode(harness::find(&seed.harness).unwrap(), seed.input()),
-            Ok(seed::scenario_sha256(&race)),
-            "{}: the planted race on 2 workers",
-            seed.name
-        );
-        let witnesses: Vec<(&str, &str)> = seed
-            .witness
-            .iter()
-            .map(|w| (w.property.as_str(), w.expect.as_str()))
-            .collect();
-        assert_eq!(witnesses, [(fixture.property(), "violated")]);
-        assert!(saved.insert(fixture.property(), seed).is_none());
-    }
-    assert_eq!(saved.len(), Which::ALL.len(), "one schedule per fixture");
-    saved
+/// Every fixture's schedule, as a full fuzz input of the fixture's own
+/// harness, by its fixture's property.
+fn schedules() -> BTreeMap<&'static str, Vec<u8>> {
+    Which::ALL
+        .into_iter()
+        .map(|fixture| {
+            let input = match fixture {
+                Which::LostUpdate => schedule_input::<LostUpdate>(),
+                Which::SnapshotReserve => schedule_input::<SnapshotReserve>(),
+                Which::MissedNotify => schedule_input::<MissedNotify>(),
+                Which::TimerCancel => schedule_input::<TimerCancel>(),
+                Which::AbBa => schedule_input::<AbBa>(),
+                Which::AbortWithoutJoin => schedule_input::<AbortWithoutJoin>(),
+            };
+            (fixture.property(), input)
+        })
+        .collect()
 }
 
-/// S4.4: one saved schedule per race fixture, each a valid seed of the
-/// fixture's own harness that decodes to the planted race on 2 workers, and
-/// whose witness, run through the registered harness, sees the violation.
+/// S4.4: one schedule per race fixture, whose violation witness, run
+/// through the fixture's registered harness, sees the violation.
 /// `race_fixtures.rs`'s witness tests also run each one's Plan bytes on the
 /// fix, which holds.
 #[test]
 fn each_race_has_a_saved_schedule() {
-    for (name, seed) in saved() {
-        let witness = &seed.witness[0];
+    for (name, input) in schedules() {
         let dir = TempDir::new().unwrap();
         let (_, result) = record_witness(
             harness::find(name).unwrap(),
-            RecordInput::Input(seed.input()),
+            RecordInput::Input(&input),
             dir.path(),
-            &witness.property,
-            witness.expect.parse().unwrap(),
+            name,
+            Expect::Violated,
             &[],
         )
         .unwrap_or_else(|error| panic!("{name}: {error}"));
@@ -113,16 +87,16 @@ const CHILD: &str = "ZAKURA_SIM_RACE_SCHEDULE_CHILD";
 /// What the child prints once every check passed.
 const VERIFIED: &str = "zakura-sim-race-schedules-verified";
 
-/// Records every saved schedule under `root`, one directory per fixture.
+/// Records every schedule under `root`, one directory per fixture.
 fn record_all(root: &Path) -> BTreeMap<&'static str, Trace> {
-    saved()
+    schedules()
         .into_iter()
-        .map(|(name, seed)| {
+        .map(|(name, input)| {
             let dir = root.join(name.replace('/', "-"));
             std::fs::create_dir(&dir).unwrap();
             let trace = record(
                 harness::find(name).unwrap(),
-                RecordInput::Input(seed.input()),
+                RecordInput::Input(&input),
                 &dir,
             )
             .unwrap();
@@ -133,7 +107,7 @@ fn record_all(root: &Path) -> BTreeMap<&'static str, Trace> {
 
 /// When run as the child, checks each trace under the root [`CHILD`] names
 /// against this process's own run: an Exact replay of the parent's trace
-/// verifies, and a recording of the committed bytes gives the same `init`,
+/// verifies, and a recording of the same bytes gives the same `init`,
 /// steps and `end`. Does nothing otherwise.
 #[test]
 fn race_schedule_child() {
@@ -162,9 +136,9 @@ fn race_schedule_child() {
     }
 }
 
-/// S4.5: two fresh processes each replay every saved schedule's trace with
-/// the same decisions and violation, and record the same trace from the
-/// committed bytes.
+/// S4.5: two fresh processes each replay every schedule's trace with the
+/// same decisions and violation, and record the same trace from the same
+/// bytes.
 #[test]
 fn fresh_processes_reproduce_each_saved_violation() {
     let root = TempDir::new().unwrap();
@@ -387,11 +361,13 @@ fn replayed_on_changes<F: Fixture>(trace: &Trace) -> Vec<(Variant, Left)> {
         .collect()
 }
 
-/// S4.5: an Exact replay of each saved schedule's trace on code with the
+/// S4.5: an Exact replay of each schedule's trace on code with the
 /// fix, an unrelated task, or an extra point of either kind reports where
 /// it left the recorded schedule, never a verified replay. The registered
 /// harness and the wrapper without a change both replay the same trace
-/// verified, so the change is what diverges.
+/// verified, so the change is what diverges. The expected steps belong to
+/// the schedules the search finds; a change that moves a search result
+/// moves its row.
 #[test]
 fn changed_code_replay_reports_divergence() {
     use Left::{Options, Pick};
@@ -403,14 +379,11 @@ fn changed_code_replay_reports_divergence() {
             [Options(6), Options(1), Pick(3), Pick(5)],
         ),
         (MissedNotify::NAME, [Pick(3), Options(1), Pick(3), Pick(5)]),
-        (
-            TimerCancel::NAME,
-            [Pick(5), Options(1), Pick(2), Options(3)],
-        ),
+        (TimerCancel::NAME, [Pick(4), Options(1), Pick(2), Pick(2)]),
         (AbBa::NAME, [Options(5), Options(1), Pick(3), Options(6)]),
         (
             AbortWithoutJoin::NAME,
-            [Pick(9), Options(1), Pick(3), Options(4)],
+            [Pick(9), Options(1), Pick(2), Options(3)],
         ),
     ]);
     let root = TempDir::new().unwrap();

@@ -28,6 +28,7 @@
 //! [`generate`] draws inputs from a seed and runs them in this process until
 //! the first `Active` violation, without libFuzzer (mutation plan, mut-4.1).
 
+pub mod enumerate;
 pub mod feedback;
 pub mod generate;
 pub mod pct;

@@ -37,7 +37,7 @@ use zakura_rt::task::JoinHandle;
 use zakura_state as zs;
 
 use crate::{
-    block::{Request, SemanticBlockVerifier, VerifyBlockError},
+    block::{AnnouncementClaims, Request, SemanticBlockVerifier, VerifyBlockError},
     checkpoint::{CheckpointVerifier, VerifyCheckpointError},
     error::{BlockError, TransactionError},
     transaction, BoxError, Config,
@@ -300,6 +300,70 @@ impl From<VerifyBlockError> for RouterError {
 }
 
 impl RouterError {
+    /// Whether local service failure or missing state prevented a mined-block verdict.
+    /// A bad header can be retryable for body download but still rejects the submitted block.
+    pub fn is_verification_unavailable(&self) -> bool {
+        use zakura_header_chain::{
+            BodyVerificationClass::Retryable,
+            TransientBodyFailureKind::{MissingContext, Storage},
+        };
+
+        let missing_state = |error: &zs::ValidateContextError| {
+            !matches!(error, zs::ValidateContextError::NonSequentialBlock { .. })
+                && matches!(
+                    error.body_verification_class(),
+                    Retryable(MissingContext | Storage)
+                )
+        };
+        let commit_unavailable = |error: &zs::CommitBlockError| match error {
+            zs::CommitBlockError::ValidateContextError(error) => missing_state(error),
+            _ => matches!(error.body_verification_class(), Retryable(_)),
+        };
+
+        let block_error = match self {
+            Self::Block { source } => source.as_ref(),
+            Self::Checkpoint { source } => match source.as_ref() {
+                VerifyCheckpointError::VerifyBlock(error) => error,
+                VerifyCheckpointError::CommitCheckpointVerified(source) => {
+                    return source
+                        .downcast_ref::<zs::CommitCheckpointVerifiedError>()
+                        .map(zs::CommitCheckpointVerifiedError::inner)
+                        .or_else(|| source.downcast_ref::<zs::CommitBlockError>())
+                        .is_none_or(commit_unavailable);
+                }
+                VerifyCheckpointError::Finished
+                | VerifyCheckpointError::Dropped
+                | VerifyCheckpointError::Tip(_)
+                | VerifyCheckpointError::CheckpointList(_)
+                | VerifyCheckpointError::QueuedLimit
+                | VerifyCheckpointError::ShuttingDown => return true,
+                _ => return false,
+            },
+        };
+        match block_error {
+            VerifyBlockError::Depth { .. }
+            | VerifyBlockError::StateService { .. }
+            | VerifyBlockError::PowPolicy(_)
+            | VerifyBlockError::ParentUnavailable { .. } => true,
+            // This wrapper retains a verification error for the exact submitted bytes.
+            // Only attributing that failure to the header needed more state.
+            VerifyBlockError::AuthDataUnconfirmed { .. } => false,
+            VerifyBlockError::Commit(error) => commit_unavailable(error),
+            VerifyBlockError::Transaction(error)
+            | VerifyBlockError::Block {
+                source: BlockError::Transaction(error),
+            } => match error {
+                TransactionError::StateUnavailable(_)
+                | TransactionError::InternalDowncastError(_)
+                | TransactionError::SproutVerifierNotBuilt
+                | TransactionError::TransparentInputNotFound => true,
+                TransactionError::ValidateContextError(error) => missing_state(error),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
     /// Classify the concrete verifier failure selected by the routing boundary.
     pub fn body_verification_class(&self) -> zakura_header_chain::BodyVerificationClass {
         match self {
@@ -474,13 +538,14 @@ where
 /// Block and transaction verification requests should be wrapped in a timeout,
 /// so that out-of-order and invalid requests do not hang indefinitely.
 /// See the [`router`](`crate::router`) module documentation for details.
-#[instrument(skip(state_service, transaction_state, mempool))]
+#[instrument(skip(state_service, transaction_state, mempool, announcement_claims))]
 async fn init_with_transaction_state<S, TransactionState, Mempool>(
     config: Config,
     network: &Network,
     mut state_service: S,
     transaction_state: TransactionState,
     mempool: oneshot::Receiver<Mempool>,
+    announcement_claims: Option<(AnnouncementClaims, zs::WatchReceiver<zs::NonFinalizedState>)>,
 ) -> (
     Buffer<Request, futures::future::BoxFuture<'static, Result<block::Hash, RouterError>>>,
     Buffer<
@@ -616,7 +681,10 @@ where
         "initializing block verifier router"
     );
 
-    let block = SemanticBlockVerifier::new(network, state_service.clone(), transaction.clone());
+    let mut block = SemanticBlockVerifier::new(network, state_service.clone(), transaction.clone());
+    if let Some((claims, chains)) = announcement_claims {
+        block = block.with_announcement_claims(claims, chains);
+    }
     let checkpoint = CheckpointVerifier::from_checkpoint_list(
         list,
         network,
@@ -666,16 +734,29 @@ where
     Mempool::Future: Send + 'static,
 {
     let transaction_state = state_service.clone();
-    init_with_transaction_state(config, network, state_service, transaction_state, mempool).await
+    init_with_transaction_state(
+        config,
+        network,
+        state_service,
+        transaction_state,
+        mempool,
+        None,
+    )
+    .await
 }
 
 /// Initializes verification and routes transaction read-only queries through `read_state_service`.
+///
+/// The block verifier ranks equal-work blocks by the claims in `announcement_claims`. Pass the
+/// table that header sync writes to and the committed chains published by the same state service.
 pub async fn init_with_read_state<S, R, Mempool>(
     config: Config,
     network: &Network,
     state_service: S,
     read_state_service: R,
     mempool: oneshot::Receiver<Mempool>,
+    announcement_claims: AnnouncementClaims,
+    committed_chains: zs::WatchReceiver<zs::NonFinalizedState>,
 ) -> (
     Buffer<Request, futures::future::BoxFuture<'static, Result<block::Hash, RouterError>>>,
     Buffer<
@@ -700,7 +781,15 @@ where
     Mempool::Future: Send + 'static,
 {
     let transaction_state = TransactionStateRouter::new(state_service.clone(), read_state_service);
-    init_with_transaction_state(config, network, state_service, transaction_state, mempool).await
+    init_with_transaction_state(
+        config,
+        network,
+        state_service,
+        transaction_state,
+        mempool,
+        Some((announcement_claims, committed_chains)),
+    )
+    .await
 }
 
 /// Parses the checkpoint list for `network` and `config`.

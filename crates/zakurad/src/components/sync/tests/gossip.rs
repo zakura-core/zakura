@@ -240,21 +240,26 @@ async fn mined_block_broadcast_timeout_uses_committed_tip_fallback() {
 async fn early_broadcast_does_not_suppress_the_committed_tip_fallback() {
     let (mut sender, mut gossip) = setup().await;
     let local = block(2);
+    let pending = PendingBlockSignal::valid_for_tests();
+    let mut early = with_size(&local);
+    early.pending_send = Some(pending.send_permit());
     gossip
         .early_sender
         .send(EarlyMinedBlock {
-            admission: zakura_state::BlockAdmission::pending(),
+            relay: zakura_rpc::EarlyBlockRelay::StateAdmission(
+                zakura_state::BlockAdmission::pending(),
+            ),
             hash: local.hash(),
             height: local.coinbase_height().unwrap(),
             size: local.zcash_serialized_size(),
             submitted_at: std::time::Instant::now(),
             submission: MinedBlockSubmission::FullBlock,
-            pending: PendingBlockSignal::valid_for_tests(),
+            pending,
         })
         .unwrap();
     gossip
         .peer_set
-        .expect_request(Request::AdvertiseMinedBlock(with_size(&local)))
+        .expect_request(Request::AdvertiseMinedBlock(early))
         .await
         .respond(Response::Nil);
     local_commit(&mut sender, local.clone());
@@ -264,6 +269,59 @@ async fn early_broadcast_does_not_suppress_the_committed_tip_fallback() {
         .await;
     tokio::time::sleep(BLOCK_GOSSIP_TIMEOUT + Duration::from_secs(1)).await;
     drop(slow);
+    gossip
+        .peer_set
+        .expect_request(Request::AdvertiseMinedBlock(with_size(&local)))
+        .await
+        .respond(Response::Nil);
+}
+
+#[tokio::test(start_paused = true)]
+async fn resolved_trusted_announcement_is_cancelled_and_failure_does_not_disable_next_one() {
+    let (mut sender, mut gossip) = setup().await;
+    let registry = zakura_rpc::PendingBlockRegistry::default();
+    let local = block(2);
+    for committed in [false, true] {
+        let registration = registry.insert(local.clone()).unwrap();
+        let event = EarlyMinedBlock {
+            relay: zakura_rpc::EarlyBlockRelay::TrustedSubmission,
+            hash: local.hash(),
+            height: local.coinbase_height().unwrap(),
+            size: local.zcash_serialized_size(),
+            submitted_at: std::time::Instant::now(),
+            submission: MinedBlockSubmission::TrustedBlock,
+            pending: registration.signal(),
+        };
+        registration.resolve(if committed {
+            Ok(local.clone())
+        } else {
+            Err(())
+        });
+        gossip.early_sender.send(event).unwrap();
+        gossip.peer_set.expect_no_requests().await;
+    }
+    let registration = registry.insert(local.clone()).unwrap();
+    let mut early = with_size(&local);
+    early.pending_send = Some(registration.signal().send_permit());
+    gossip
+        .early_sender
+        .send(EarlyMinedBlock {
+            relay: zakura_rpc::EarlyBlockRelay::TrustedSubmission,
+            hash: local.hash(),
+            height: local.coinbase_height().unwrap(),
+            size: local.zcash_serialized_size(),
+            submitted_at: std::time::Instant::now(),
+            submission: MinedBlockSubmission::TrustedBlock,
+            pending: registration.signal(),
+        })
+        .unwrap();
+    gossip
+        .peer_set
+        .expect_request(Request::AdvertiseBlock(early, None))
+        .await
+        .respond_error("relay failed".into());
+    registration.resolve(Ok(local.clone()));
+    local_commit(&mut sender, local.clone());
     gossip
         .peer_set
         .expect_request(Request::AdvertiseMinedBlock(with_size(&local)))

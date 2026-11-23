@@ -3,12 +3,18 @@
 //! (traces.md, Replay).
 #![cfg(zakura_sim)]
 
+mod support;
+
 use std::{
     cell::Cell,
     path::Path,
     process::Command,
     sync::OnceLock,
     time::{Duration, Instant},
+};
+use support::machine_tapes::{
+    DECODED_RETENTION, HEADER_REACTOR_POLICY, PUBLISHER_POLICY, REACTOR_POLICY, WORK_FUNDING,
+    WORK_OWNERSHIP,
 };
 
 use serde::{Deserialize, Serialize};
@@ -1352,17 +1358,9 @@ fn a_foreign_storage_failure_replays_exactly() {
     assert!(report.verified(), "{report:?}");
 }
 
-/// Block seed `name`'s op tape.
-fn block_seed(name: &str) -> Vec<u8> {
-    zakura_sim::seed::find(name)
-        .unwrap_or_else(|| panic!("{name} is a registered seed"))
-        .input()
-        .to_vec()
-}
-
-/// `block/work-ownership`'s seed.
+/// `block/work-ownership`'s op tape.
 fn work_input() -> Vec<u8> {
-    block_seed("block-work-ownership")
+    WORK_OWNERSHIP.to_vec()
 }
 
 #[test]
@@ -1483,14 +1481,14 @@ fn work_machine_prefix_and_missing_evidence_never_verify() {
     ));
 }
 
-/// `block/work-funding`'s seed.
+/// `block/work-funding`'s op tape.
 fn funding_input() -> Vec<u8> {
-    block_seed("block-work-funding")
+    WORK_FUNDING.to_vec()
 }
 
-/// `block/decoded-retention`'s seed.
+/// `block/decoded-retention`'s op tape.
 fn retention_input() -> Vec<u8> {
-    block_seed("block-decoded-retention")
+    DECODED_RETENTION.to_vec()
 }
 
 #[test]
@@ -1745,12 +1743,9 @@ fn work_funding_missing_evidence_and_drain_cannot_verify() {
     assert!(report.end.is_none());
 }
 
-/// The `header-reactor-policy` seed's op tape.
+/// `header/reactor-policy`'s op tape.
 fn reactor_input() -> Vec<u8> {
-    zakura_sim::seed::find("header-reactor-policy")
-        .expect("the header reactor's seed is registered")
-        .input()
-        .to_vec()
+    HEADER_REACTOR_POLICY.to_vec()
 }
 
 #[test]
@@ -1806,12 +1801,9 @@ fn reactor_machine_records_and_replays_without_transport() {
     ));
 }
 
-/// The `header-publisher-policy` seed's op tape.
+/// `header/publisher-policy`'s op tape.
 fn publisher_input() -> Vec<u8> {
-    zakura_sim::seed::find("header-publisher-policy")
-        .expect("the header publisher's seed is registered")
-        .input()
-        .to_vec()
+    PUBLISHER_POLICY.to_vec()
 }
 
 #[test]
@@ -1869,9 +1861,9 @@ fn reactor_machine_preserves_empty_and_short_inputs() {
     }
 }
 
-/// `block/reactor-policy`'s seed.
+/// `block/reactor-policy`'s op tape.
 fn block_reactor_input() -> Vec<u8> {
-    block_seed("block-reactor-policy")
+    REACTOR_POLICY.to_vec()
 }
 
 #[test]

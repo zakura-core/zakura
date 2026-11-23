@@ -178,7 +178,7 @@ pub(in crate::planted) fn needs_triage(class: Class) -> bool {
     matches!(class, Class::Survived | Class::KilledByOtherRule)
 }
 
-/// The records in `root`'s [`TRIAGE_FILE`], or none if it has no such
+/// The records in the QA store `root`'s [`TRIAGE_FILE`], or none if it has no such
 /// file. A malformed record is an error.
 pub(super) fn read(root: &Path) -> Result<Vec<Record>, BoxError> {
     #[derive(Deserialize)]
@@ -314,13 +314,10 @@ fn set_triage(value: &mut Value, triage: Option<&Triage>) -> Result<(), BoxError
 }
 
 /// Runs `cargo xtask planted triage --report <file> [--out <file>]`: applies
-/// `repo_root`'s [`TRIAGE_FILE`] to the report afresh ([`reapply`]), writes
+/// the QA store's [`TRIAGE_FILE`] to the report afresh ([`reapply`]), writes
 /// it to `--out`, or back to `--report` without one, and prints the stale
 /// records and the lanes still untriaged.
-pub(crate) fn run(
-    repo_root: &Path,
-    mut args: impl Iterator<Item = String>,
-) -> Result<(), BoxError> {
+pub(crate) fn run(mut args: impl Iterator<Item = String>) -> Result<(), BoxError> {
     let (mut report, mut out) = (None, None);
     while let Some(flag) = args.next() {
         let value = args.next().ok_or_else(|| format!("{flag} needs a value"))?;
@@ -332,7 +329,7 @@ pub(crate) fn run(
     }
     let report = report.ok_or(crate::UsageError("`planted triage` needs --report <file>"))?;
     let out = out.unwrap_or_else(|| report.clone());
-    let records = read(repo_root)?;
+    let records = read(&super::super::planted_layout::require_store()?)?;
     let mut value: Value = serde_json::from_slice(&fs::read(&report)?)
         .map_err(|error| format!("{report}: {error}"))?;
     for stale in reapply(&mut value, &records)? {

@@ -6,7 +6,10 @@ use std::{
     sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
-use zakura_node_services::block_memory::BlockHandle;
+use zakura_node_services::{
+    block_memory::BlockHandle,
+    block_relay::{PendingBlockSendPermit, ServedBlock},
+};
 
 #[cfg(any(test, feature = "proptest-impl"))]
 use zakura_chain::block::Block;
@@ -25,10 +28,10 @@ use proptest_derive::Arbitrary;
 
 use InventoryResponse::*;
 
-/// A received body together with the connection's optional timing observation.
+/// A block body with any write permission or delivery timing attached to it.
 #[derive(Clone, Debug)]
 pub struct DeliveredBlock {
-    block: BlockHandle,
+    served: ServedBlock,
     observation: Option<Arc<BlockObservation>>,
 }
 
@@ -45,7 +48,17 @@ struct BlockObservation {
 impl DeliveredBlock {
     /// Returns the body with its original decoded-memory ownership.
     pub fn into_block(self) -> BlockHandle {
-        self.block
+        self.served.block
+    }
+
+    /// Retains the permission needed to write a temporary block to a peer.
+    pub(crate) fn into_served(self) -> ServedBlock {
+        self.served
+    }
+
+    /// Returns the submission permission if the body came from temporary storage.
+    pub(crate) fn pending_send(&self) -> Option<&PendingBlockSendPermit> {
+        self.served.pending_send.as_ref()
     }
 
     /// Credits a legacy delivery once its exact body has passed verification.
@@ -69,7 +82,7 @@ impl DeliveredBlock {
 
     /// Credits a competing delivery only if it matches the complete verified body.
     pub fn record_verified_copy(&self, verified: &BlockHandle) {
-        if self.observation.is_some() && self.block == *verified {
+        if self.observation.is_some() && self.served.block == *verified {
             self.record_verified();
         }
     }
@@ -78,14 +91,14 @@ impl DeliveredBlock {
 impl Deref for DeliveredBlock {
     type Target = BlockHandle;
     fn deref(&self) -> &BlockHandle {
-        &self.block
+        &self.served.block
     }
 }
 
-impl<T: Into<BlockHandle>> From<T> for DeliveredBlock {
+impl<T: Into<ServedBlock>> From<T> for DeliveredBlock {
     fn from(block: T) -> Self {
         Self {
-            block: block.into(),
+            served: block.into(),
             observation: None,
         }
     }
@@ -93,7 +106,7 @@ impl<T: Into<BlockHandle>> From<T> for DeliveredBlock {
 
 impl PartialEq for DeliveredBlock {
     fn eq(&self, other: &Self) -> bool {
-        self.block == other.block
+        self.served == other.served
     }
 }
 impl Eq for DeliveredBlock {}

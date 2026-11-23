@@ -11,6 +11,262 @@ independently.
 
 ## [Unreleased]
 
+## [1.9.0-rc1] - 2026-11-21
+
+### Changed
+
+- Finalized transaction bodies now move out of RocksDB into append-only
+  static files in the state directory, in the background and at least 50
+  blocks at a time. On first start the node upgrades its database in place
+  to state format v32. Older releases can't open the upgraded database, so
+  going back means a fresh sync or restoring a backup from before the
+  upgrade ([#2146](https://github.com/zakura-core/zakura/pull/2146)).
+- A Mainnet archive node grows by about 11 GB at the peak of the move,
+  because the new static files sit next to the old RocksDB data until
+  RocksDB frees it. Leave that much free disk. If a static file write
+  fails, for example on a full disk, moves stop until zakurad restarts, so
+  free space and restart it
+  ([#2146](https://github.com/zakura-core/zakura/pull/2146)).
+- Back up the `static_files` directory along with RocksDB, because a
+  RocksDB checkpoint no longer holds finalized transaction bodies. Copy the
+  whole state directory with zakurad stopped or take a filesystem snapshot,
+  and don't hard link static files into a restore
+  ([#2146](https://github.com/zakura-core/zakura/pull/2146)).
+- Upgrade read-only RPC secondaries together with their primary, and stop
+  them around `zakurad rollback-state`. A v31 secondary can't follow a v32
+  primary, and rollback shortens static files in place
+  ([#2146](https://github.com/zakura-core/zakura/pull/2146)).
+- A pruned node that started as an archive used to keep serving old
+  transaction bodies below its pruning marker. After the first static file
+  move it treats them as pruned
+  ([#2146](https://github.com/zakura-core/zakura/pull/2146)).
+- With the experimental core mempool, a new block no longer scans the whole
+  pool for conflicting and expired transactions, so its cost follows the
+  block's size instead of the pool's
+  ([#2636](https://github.com/zakura-core/zakura/pull/2636)).
+- With the experimental `tx-relay` enabled, the
+  `zakura.p2p.tx_relay.inv_ids` counter is now
+  `zakura.p2p.tx_relay.have_ids`, because the announcement message is now
+  called `Have`. Update dashboards that read the old name. The wire format
+  is unchanged ([#2665](https://github.com/zakura-core/zakura/pull/2665)).
+
+### Fixed
+
+- Header sync now takes equal peer offers in arrival order, so peers that
+  reconnect under fresh keys or overstate their chain work can't keep an
+  honest peer's headers from being requested
+  ([#2638](https://github.com/zakura-core/zakura/pull/2638)).
+- With the experimental `tx-relay` enabled, a new connection accepts at
+  most its peer's 544 KB `Have` opening allowance plus what 256 KB/s earns
+  since the handshake, instead of about 44 MB
+  ([#2637](https://github.com/zakura-core/zakura/pull/2637)).
+
+### Security
+
+- With the experimental `tx-relay` enabled, orphan transactions and late
+  `notfound` answers now shrink a peer's request window, and tx-relay
+  fetches can hold at most 250 of the pool core's 500 slots, so peers can't
+  crowd out local submissions, legacy peers or re-admissions after a reset
+  ([#2634](https://github.com/zakura-core/zakura/pull/2634)).
+
+## [1.9.0-rc0] - 2026-11-20
+
+### Added
+
+- Mining nodes push newly mined blocks to peers in the initial announcement
+  group that advertise `NODE_BLOCK_PUSH`, saving one request round trip.
+  The opt-in `network.push_relayed_blocks` setting also pushes blocks this
+  node relays after it commits them, which can send an extra copy to a
+  peer that already has the block
+  ([#2537](https://github.com/zakura-core/zakura/pull/2537)).
+- Added the binary `/submittrustedblock` endpoint, enabled through
+  `rpc.enable_trusted_block_submission`. It can start relaying a new block
+  before local validation and follows the RPC listener's cookie-authentication
+  setting. Submit only final block bytes verified by a trusted full node,
+  because peers can ban a relay that sends an invalid block. Zakura withdraws
+  pending announcements and responses when a submission is rejected or
+  times out. The endpoint returns `inconclusive` when it cannot establish
+  the result, so the caller can retry
+  ([#2534](https://github.com/zakura-core/zakura/pull/2534)).
+- Added the opt-in `[network.block_download_score_and_hedge]` setting.
+  With `enabled = true`, Zakura picks a legacy peer using recent response
+  times and can send one backup request when a later announcer is likely
+  to deliver sooner or the first request stalls. Peer and request events
+  can trigger the backup. If you tried the feature in a development build,
+  replace `[network.block_source_score]` and remove its `second_request`
+  key
+  ([#2572](https://github.com/zakura-core/zakura/pull/2572),
+  [#2595](https://github.com/zakura-core/zakura/pull/2595),
+  [#2596](https://github.com/zakura-core/zakura/pull/2596)).
+- Added the `[mempool] implementation` setting. `default` and `classic` keep
+  the pool nodes run today. `core` runs the new pool core, which is
+  experimental
+  ([#2502](https://github.com/zakura-core/zakura/pull/2502)).
+- Added `tx-relay`, an experimental v2 P2P service that moves transactions
+  between Zakura peers and hands them to the pool core. It is off by
+  default. It runs only with `[network.zakura.tx_relay] enabled = true`, the
+  v2 stack on, and `[mempool] implementation = "core"`. While a peer has a
+  live `tx-relay` session, the legacy adapter leaves that peer's
+  transactions to it. New `zakura.p2p.tx_relay.*` metrics count what it
+  moves, and the existing `zakura.p2p.legacy.inbound.refused` counter gains
+  a `type` label. The experimental `advert_delay` (2 s),
+  `advert_window_full_tx` (4) and `advert_window_small_tx` (16) keys tune
+  its fan-out
+  ([#2503](https://github.com/zakura-core/zakura/pull/2503)).
+- Added mempool metrics for canaries: the pool core exports how many
+  transactions it pools and how many a reset took out that are not back
+  yet, and `mempool.implementation` shows which pool the node resolved to
+  ([#2506](https://github.com/zakura-core/zakura/pull/2506)).
+- Added `zakura.p2p.tx_relay.registered`, which says whether the node
+  registered `tx-relay`
+  ([#2506](https://github.com/zakura-core/zakura/pull/2506)).
+
+### Changed
+
+- With `trace_dir` set, the legacy request rows in `legacy_peer_request.jsonl` now follow
+  `network.expose_peer_addresses`: they hold the peer's address when it is set and stay
+  redacted when it is not. Each row also carries the peer's user agent, and a peer upgraded
+  to Zakura gets one `peer_upgraded` row in `handshake.jsonl` with its trace label, its
+  address under the same setting, and its user agent. The rows' `peer_id` column is now
+  `connection_id`, the same number the connection's `legacy_gossip.jsonl` rows carry
+  ([#2455](https://github.com/zakura-core/zakura/pull/2455)).
+- Serving a block to several legacy peers uses less CPU by reusing its
+  serialized bytes and sharing its checksum across requests
+  ([#2556](https://github.com/zakura-core/zakura/pull/2556),
+  [#2557](https://github.com/zakura-core/zakura/pull/2557)).
+- When Zakura is still verifying a locally submitted block, it waits to
+  download a peer's copy until local verification fails or five seconds
+  pass. The wait leaves the peer-download slot available. Its duration
+  and outcome are recorded in metrics and, when enabled, in
+  `commit_state.jsonl`
+  ([#2562](https://github.com/zakura-core/zakura/pull/2562)).
+- The experimental core mempool builds each snapshot from the previous one,
+  reducing CPU use as the pool fills
+  ([#2591](https://github.com/zakura-core/zakura/pull/2591)).
+- The `pool.route_inv.hedge.not_yet.count` and
+  `pool.route_inv.hedge.no_candidate.count` metrics count decisions to send
+  a backup block request. `pool.route_inv.hedge.held` shows how many
+  downloads are waiting for one
+  ([#2596](https://github.com/zakura-core/zakura/pull/2596)).
+- A stalled v2 frame read now resets its session or one-shot request. Sibling
+  services can keep using the connection. Header sync counts an unanswered
+  subscription `Close` from the completion of its write. A second header-sync or
+  block-sync stall on the same connection can close it without a peer fault
+  ([#2604](https://github.com/zakura-core/zakura/pull/2604)).
+- Inbound v2 handshakes now share a node-wide rate of 24 starts a second for
+  each source validation state. The last 8 tokens go only to an address within
+  its share of 3 starts a second, so a few busy addresses can't refuse the rest.
+  The 10-second handshake deadline now starts when the connection is accepted.
+  Every TLS start keeps its node and address charges
+  ([#2604](https://github.com/zakura-core/zakura/pull/2604)).
+- Discovery dispatch uses a wall-clock budget even when its receive queue fills.
+  Header sync meters peer `Status` messages and locator walks for new
+  subscriptions per connection, so reopening a session gets no fresh burst
+  ([#2604](https://github.com/zakura-core/zakura/pull/2604)).
+- The experimental `tx-relay` service uses less memory with many connected
+  peers. It sizes each peer's request window based on recent deliveries
+  and announces new transactions to the lowest-latency peers first
+  ([#2623](https://github.com/zakura-core/zakura/pull/2623)).
+
+### Fixed
+
+- Count inbound TLS attempts and control handshakes against one pending budget,
+  so outbound dials cannot exceed the limit while inbound TLS attempts remain
+  pending ([#2337](https://github.com/zakura-core/zakura/pull/2337)).
+- Limit the entire v2 control handshake to ten seconds in both directions, so
+  peers cannot extend an inbound claim or a dial's pending-handshake permit by
+  pacing successive control steps
+  ([#2337](https://github.com/zakura-core/zakura/pull/2337)).
+- Close v2 connections neutrally when their handshake captures an obsolete
+  capability generation, so an in-flight handshake cannot miss header-sync
+  renegotiation ([#2337](https://github.com/zakura-core/zakura/pull/2337)).
+- Limit failed inbound v2 handshake attempts per address with a refundable
+  cadence derived from the connection limit and dialer backoff: sixteen tokens
+  and sixteen tokens per second by default. Validated and unvalidated sources
+  have separate ledgers, so spoofed Initials can't lock out an honest
+  address. An empty bucket answers an unvalidated source with Retry and a
+  validated one with Refuse, counted by `zakura.p2p.conn.retried.cadence`
+  and `zakura.p2p.conn.rejected.cadence`
+  ([#2337](https://github.com/zakura-core/zakura/pull/2337)).
+- Drop a closed v2 QUIC connection's state within three seconds, so a peer
+  with a long or delayed return path cannot hold a closing-connection slot for
+  three of its probe timeouts
+  ([#2337](https://github.com/zakura-core/zakura/pull/2337)).
+- Nodes start successfully when `ZAKURA_TRACE_PEER_NAMES` names fleet peers for
+  the gossip trace, instead of rejecting it as an unknown configuration field
+  ([#2455](https://github.com/zakura-core/zakura/pull/2455)).
+- The mempool no longer remembers a transaction as rejected when its
+  verification failed on this node, such as a failed median-time lookup, so
+  resending it before the next block can admit it
+  ([#2502](https://github.com/zakura-core/zakura/pull/2502)).
+- On macOS, the raw trace endpoint returns HTTP 403 when a requested table is a
+  Unix socket ([#2534](https://github.com/zakura-core/zakura/pull/2534)).
+- Preserve a concurrent block announcement from another peer when a pushed
+  body is rejected
+  ([#2537](https://github.com/zakura-core/zakura/pull/2537)).
+- Fixed Windows nodes ignoring the existing state database after a major
+  database format upgrade and syncing from genesis instead
+  ([#2563](https://github.com/zakura-core/zakura/pull/2563)).
+- The internal miner now switches from a coinbase-only block template to one with
+  transactions on the same tip, instead of mining an empty block whenever the first
+  template after a new tip had no transactions
+  ([#2586](https://github.com/zakura-core/zakura/pull/2586)).
+- The internal miner no longer keeps solving a replaced block template when the
+  update arrives during an Equihash attempt that finds no solutions
+  ([#2586](https://github.com/zakura-core/zakura/pull/2586)).
+- Stop Zakura block sync from requesting a block it already verified after a
+  reorg moves the verified tip past queued downloads. The reset now drops that
+  retired work instead of leaving it queued until the next block commits
+  ([#2597](https://github.com/zakura-core/zakura/pull/2597)).
+- Block sync keeps an in-flight download when a competing block commits at the
+  same height and the requested block is still on the selected header chain.
+  While the chains diverge, peers are offered blocks through their shared parent.
+  ([#2598](https://github.com/zakura-core/zakura/pull/2598)).
+- The block-sync liveness deadline allows the next body a peer owes to transfer
+  at 256 KiB/s. Returned ranges and new requests add no time, so re-issuing work
+  cannot move it ([#2604](https://github.com/zakura-core/zakura/pull/2604)).
+- Fixed a delayed block-verification verdict penalizing a peer's replacement
+  connection; the verdict now applies to the connection that supplied the block
+  ([#2604](https://github.com/zakura-core/zakura/pull/2604)).
+- Fixed a peer's answer from another chain after a reorg closing its whole v2
+  connection; the node now resets only the block-sync session and requeues the
+  heights ([#2604](https://github.com/zakura-core/zakura/pull/2604)).
+- Fixed the discovery dial history growing without a cap; it now keeps at most
+  32,768 entries ([#2604](https://github.com/zakura-core/zakura/pull/2604)).
+- Fixed a replaced v2 connection releasing its per-IP slot while the old
+  connection still ran
+  ([#2604](https://github.com/zakura-core/zakura/pull/2604)).
+- Fixed nodes with pruned storage downloading old blocks they had already
+  finalized each time a peer announced them
+  ([#2612](https://github.com/zakura-core/zakura/pull/2612)).
+- Fixed legacy transaction downloads failing with `notfound` when the peer that
+  advertised the transaction was busy: the download now waits up to 2 s for that
+  peer instead of asking a peer that doesn't have the transaction yet
+  ([#2617](https://github.com/zakura-core/zakura/pull/2617)).
+- With `[mempool] implementation = "core"`, a legacy peer can no longer hold
+  more than five undecided transactions by sending children whose parents
+  are missing: the pool core now ends an admission at the peer's 73 s
+  deadline before its slot is freed. A peer re-advertising ids that are
+  already being fetched no longer loses its new ids for lack of a slot
+  ([#2619](https://github.com/zakura-core/zakura/pull/2619)).
+- With `[mempool] implementation = "core"`, a transaction waiting on missing
+  parents is checked again at once for the first two parents to arrive per
+  block, then at most every 10 s, instead of once per arriving parent
+  ([#2619](https://github.com/zakura-core/zakura/pull/2619)).
+
+### Security
+
+- Header sync counts a filled page reservation as progress only after the round
+  stages a fair share of headers (250), so a peer that advertises one-header
+  pages can't hold its round with one header per request timeout. A round that
+  starts its validation gets a fresh request deadline
+  ([#2604](https://github.com/zakura-core/zakura/pull/2604)).
+
+- Header sync now stops starting Equihash checks after the first invalid header
+  and checks a page's credit before hashing it, and discovery checks a `Hello`'s
+  network and chain before its signature
+  ([#2604](https://github.com/zakura-core/zakura/pull/2604)).
+
 ## [1.8.9] - 2026-11-16
 
 ### Added

@@ -18,6 +18,11 @@ enum RollbackStorageMode {
 }
 
 /// Roll back Zebra's finalized state to a previous height
+///
+/// Stop the node and every read-only RPC secondary that shares the state
+/// directory first, and restart the secondaries afterwards. Rollback deletes
+/// and shortens transaction static files in place, and a secondary that stays
+/// open keeps reading the files it already has open.
 #[derive(Debug, Default, Parser)]
 pub struct RollbackStateCmd {
     /// Roll back finalized state to this block height.
@@ -115,6 +120,10 @@ impl RollbackStateCmd {
 
         let summary = zakura_state::rollback_finalized_state(state_config, &self.network, options)?;
         print_summary("rollback complete", &summary);
+        println!(
+            "  restart any read-only RPC secondaries that share this state directory before they \
+             serve requests"
+        );
 
         Ok(())
     }

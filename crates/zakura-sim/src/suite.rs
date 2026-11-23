@@ -89,6 +89,11 @@ pub const SIM_FUZZ_PACKAGE: &str = "sim";
 /// What a command's `{evidence}` stands for.
 pub const EVIDENCE: &str = "{evidence}";
 
+/// The reason a planted bypass's witness row is excluded from a manifest
+/// built without the QA store, which holds the planted cases.
+pub const NO_STORE: &str =
+    "The QA store holds this planted case, and the manifest was built without one.";
+
 /// `qa/suite.toml`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
@@ -126,6 +131,9 @@ pub struct SuiteFile {
     /// The harnesses no target runs yet.
     #[serde(default)]
     pub missing_target: Vec<MissingTarget>,
+    /// The harnesses no target runs by design, each with its reason.
+    #[serde(default)]
+    pub excluded_harness: Vec<ExcludedHarness>,
     /// The planned rows nothing implements yet.
     #[serde(default)]
     pub pending: Vec<Pending>,
@@ -256,6 +264,17 @@ pub struct ExcludedTarget {
     /// The target's `[[bin]]` name.
     pub name: String,
     /// Why.
+    pub reason: String,
+}
+
+/// A harness no target runs by design, such as a fixed fixture whose
+/// scenario no fuzz input can vary.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct ExcludedHarness {
+    /// The harness.
+    pub harness: String,
+    /// Why no target runs it.
     pub reason: String,
 }
 
@@ -575,6 +594,8 @@ pub struct HarnessRow {
     pub seed_set: String,
     /// Its missing-target row, if no target runs it.
     pub missing_target: Option<String>,
+    /// Its excluded-harness row, if no target runs it by design.
+    pub excluded: Option<String>,
 }
 
 /// A property one harness reports.
@@ -776,7 +797,8 @@ pub struct PendingRow {
 /// An ignored test or fuzz target the suite leaves out.
 #[derive(Clone, Debug, Serialize)]
 pub struct ExcludedRow {
-    /// `excluded/<file>/<test>` or `excluded/target/<package>/<name>`.
+    /// `excluded/<file>/<test>`, `excluded/target/<package>/<name>` or
+    /// `excluded/harness/<harness>`.
     pub id: String,
     /// [`Expect::Excluded`].
     pub expect: Expect,
@@ -817,14 +839,28 @@ pub fn manifest_from(root: &Path, text: &str) -> Result<Manifest, Problems> {
 }
 
 /// The manifest of the checkout at `root`, with `suite` as its parsed
-/// `qa/suite.toml`, whose SHA-256 is `suite_sha256`.
+/// `qa/suite.toml`, whose SHA-256 is `suite_sha256`, and the planted cases
+/// and seeds of the QA store that [`planted::STORE_ENV`] names, if any.
 pub fn manifest_of(
     root: &Path,
     suite: &SuiteFile,
     suite_sha256: String,
 ) -> Result<Manifest, Problems> {
+    manifest_in(root, planted::store_root().as_deref(), suite, suite_sha256)
+}
+
+/// [`manifest_of`] with the planted cases of the QA store at `store`, or
+/// none without one. Without a store, the manifest has no planted rows, and
+/// a coverage row's planted bypass goes unchecked.
+pub fn manifest_in(
+    root: &Path,
+    store: Option<&Path>,
+    suite: &SuiteFile,
+    suite_sha256: String,
+) -> Result<Manifest, Problems> {
     let mut builder = Builder {
         root,
+        store,
         canonical_root: root.canonicalize().unwrap_or_else(|_| root.to_owned()),
         suite,
         problems: Vec::new(),
@@ -841,6 +877,8 @@ pub fn manifest_of(
 /// The state of one [`manifest_from`] call.
 struct Builder<'a> {
     root: &'a Path,
+    /// The QA store's local copy, which holds the planted cases.
+    store: Option<&'a Path>,
     /// `root` with symbolic links resolved, as `cargo metadata` reports
     /// paths.
     canonical_root: PathBuf,
@@ -893,11 +931,15 @@ impl Builder<'_> {
         let (targets, excluded_targets, fuzz_lockfiles) = self.targets();
         let witnesses = self.witnesses(&tests, &planted);
         let pending = self.pending();
+        let excluded_harnesses = self.excluded_harnesses();
         let (harnesses, properties) =
             self.harnesses(&witnesses, &seed_witnesses, &targets, &pending);
         let coverage = coverage_rows(&harnesses, &properties, &targets);
-        let excluded: Vec<ExcludedRow> =
-            excluded_tests.into_iter().chain(excluded_targets).collect();
+        let excluded: Vec<ExcludedRow> = excluded_tests
+            .into_iter()
+            .chain(excluded_targets)
+            .chain(excluded_harnesses)
+            .collect();
         let mut counts = Counts {
             harnesses: harnesses.len(),
             properties: properties.len(),
@@ -1337,11 +1379,15 @@ impl Builder<'_> {
         relative(&self.canonical_root, &path)
     }
 
-    /// One row per property directory under `qa/planted/`, each running
-    /// its patches.
+    /// One row per property directory under the QA store's `qa/planted/`,
+    /// each running its patches, or none without a store.
     fn planted(&mut self) -> Vec<PlantedRow> {
         let mut by_property: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for file in files(self.root, PLANTED_DIR, "patch") {
+        let files = self
+            .store
+            .map(|store| files(store, PLANTED_DIR, "patch"))
+            .unwrap_or_default();
+        for file in files {
             let path = Path::new(&file);
             let property = planted::property_id(Path::new(PLANTED_DIR), path).unwrap_or_default();
             let name = path
@@ -1375,7 +1421,15 @@ impl Builder<'_> {
     /// One seed-set row per harness, one row per witness an admitted corpus
     /// seed carries, and the seed report. A rejected seed is a problem.
     fn seeds(&mut self) -> (Vec<SeedSetRow>, Vec<SeedWitnessRow>, seed::Report) {
-        let report = seed::load(SeedSet::Corpus, None);
+        let seeds = match self.store.map(seed::read) {
+            Some(Ok(seeds)) => seeds,
+            Some(Err(error)) => {
+                self.problem(format!("the QA store's seeds: {error}"));
+                Vec::new()
+            }
+            None => Vec::new(),
+        };
+        let report = seed::load_in(seeds, SeedSet::Corpus, None);
         for failed in &report.rejected {
             self.problem(format!(
                 "the seed {} fails validation: {}",
@@ -1402,12 +1456,6 @@ impl Builder<'_> {
         }
         let mut witnesses = Vec::new();
         for seed in &report.admitted {
-            if !self.root.join(&seed.source).exists() {
-                self.problem(format!(
-                    "the seed {} names the source `{}`, which doesn't exist",
-                    seed.name, seed.source
-                ));
-            }
             for witness in &seed.witness {
                 let id = self.id(format!("seed-witness/{}/{}", seed.name, witness.property));
                 let command = Build::SimPlanted.command(
@@ -1737,21 +1785,27 @@ impl Builder<'_> {
                         .iter()
                         .find(|case| case.property == row.property)
                         .filter(|case| case.patches.iter().any(|patch| patch == name));
-                    if case.is_none() {
+                    // Without a store, the manifest can't see the cases, so
+                    // the row is excluded with that reason.
+                    if case.is_none() && self.store.is_some() {
                         self.problem(format!(
                             "`{}`'s bypass is {PLANTED_DIR}/{}/{name}.patch, which doesn't exist",
                             row.property, row.property
                         ));
                     }
+                    let (expect, pending) = match self.store {
+                        Some(_) => (Expect::Pass, None),
+                        None => (Expect::Excluded, Some(NO_STORE)),
+                    };
                     WitnessRow {
                         id,
-                        expect: Expect::Pass,
+                        expect,
                         property: row.property.to_owned(),
                         role: "bypass",
                         test: None,
                         unreachable: None,
                         patch: Some(name),
-                        pending: None,
+                        pending,
                         decided_by: case.map(|case| case.id.clone()),
                     }
                 }
@@ -1808,6 +1862,40 @@ impl Builder<'_> {
             ));
         }
         found.map(|row| row.id.clone())
+    }
+
+    /// The excluded-harness rows. A row for a harness that isn't
+    /// registered, or for one that a missing-target row also names, is a
+    /// problem.
+    fn excluded_harnesses(&mut self) -> Vec<ExcludedRow> {
+        let mut rows = Vec::new();
+        for excluded in self.suite.excluded_harness.clone() {
+            if !HARNESSES.iter().any(|entry| entry.name == excluded.harness) {
+                self.problem(format!(
+                    "{SUITE_FILE} excludes the harness `{}`, which isn't registered",
+                    excluded.harness
+                ));
+            }
+            if self
+                .suite
+                .missing_target
+                .iter()
+                .any(|missing| missing.harness == excluded.harness)
+            {
+                self.problem(format!(
+                    "{SUITE_FILE} both excludes the harness `{}` and lists it as a missing \
+                     target",
+                    excluded.harness
+                ));
+            }
+            let id = self.id(format!("excluded/harness/{}", excluded.harness));
+            rows.push(ExcludedRow {
+                id,
+                expect: Expect::Excluded,
+                reason: excluded.reason,
+            });
+        }
+        rows
     }
 
     /// The missing-target and pending rows. A pending property or harness
@@ -1894,10 +1982,22 @@ impl Builder<'_> {
                 .iter()
                 .any(|row| row.id == missing_id)
                 .then_some(missing_id);
+            let excluded = self
+                .suite
+                .excluded_harness
+                .iter()
+                .any(|row| row.harness == entry.name);
+            if excluded && !running.is_empty() {
+                self.problem(format!(
+                    "a target runs the harness `{}`, and {SUITE_FILE} still excludes it",
+                    entry.name
+                ));
+            }
             match (running.is_empty(), &missing) {
+                (true, None) if excluded => {}
                 (true, None) => self.problem(format!(
                     "no target runs the harness `{}`, and {SUITE_FILE} has no \
-                     `[[missing-target]]` row for it",
+                     `[[missing-target]]` or `[[excluded-harness]]` row for it",
                     entry.name
                 )),
                 (false, Some(_)) => self.problem(format!(
@@ -1947,6 +2047,7 @@ impl Builder<'_> {
                 targets: running,
                 seed_set,
                 missing_target: missing,
+                excluded: excluded.then(|| format!("excluded/harness/{}", entry.name)),
             });
         }
         (harnesses, properties)
@@ -2676,6 +2777,7 @@ mod tests {
         let mut builder = Builder {
             root: Path::new("."),
             canonical_root: PathBuf::from("."),
+            store: None,
             suite: &suite,
             problems: Vec::new(),
             ids: BTreeSet::new(),

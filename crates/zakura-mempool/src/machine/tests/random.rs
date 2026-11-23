@@ -49,6 +49,7 @@ const RUN_TIME: Duration = Duration::from_secs(9 * 60);
 const LIMITS: Limits = Limits {
     pending: 6,
     readmitting: 3,
+    relayed: 3,
 };
 
 /// A number below `n`.
@@ -237,7 +238,12 @@ impl Run {
             pick(&mut self.rng, self.txs.len())
         };
         let body = self.txs[tx].clone();
-        let (answer, step) = self.bench.reserve(&body);
+        let relayed = chance(&mut self.rng, 2);
+        let (answer, step) = if relayed {
+            self.bench.reserve_relayed(&body)
+        } else {
+            self.bench.reserve(&body)
+        };
         self.took("reserve", &step);
         // The answer was made after the step's deadlines were applied, so
         // the log as it stands now is the pool the answer saw.
@@ -264,6 +270,13 @@ impl Run {
                             "the log does not hold the id the pool said it holds"
                         );
                         "Pooled"
+                    }
+                    Unreserved::NoRoom if self.bench.machine.slots_in_use() < LIMITS.pending => {
+                        assert!(
+                            relayed && self.bench.machine.relaying == LIMITS.relayed,
+                            "no room, with slots free"
+                        );
+                        "NoRoom relayed"
                     }
                     Unreserved::NoRoom => {
                         assert_eq!(
@@ -615,6 +628,7 @@ fn random_runs_keep_the_invariants_and_drain() {
             "a remembered rejection held",
             "unreserved Inactive",
             "unreserved NoRoom",
+            "unreserved NoRoom relayed",
         ] {
             assert!(
                 seen.get(kind).is_some_and(|count| *count > 0),

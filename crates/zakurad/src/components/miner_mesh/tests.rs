@@ -28,7 +28,7 @@ use zakura_state::{
 use zakura_test::vectors::BLOCK_MAINNET_1_BYTES;
 
 use super::{
-    ranking::ranking_channel,
+    ranking::{ranking_channel, MIN_GATEWAY_BLOCKS},
     tracker::{
         gateway_block_counts, run, GatewayBlockCounts, TipMove, Tracker, REPUBLISH_INTERVAL,
     },
@@ -672,17 +672,18 @@ async fn a_new_tip_retries_the_block_that_could_not_be_read() {
     assert!(tracker.snapshot().is_complete());
 }
 
-/// A gateway a newly mined block names reaches the network once 100 more
-/// blocks are mined on top of it, and not before.
+/// A gateway newly mined blocks name reaches the network once the tenth of
+/// them has 100 more blocks on top of it, and not before.
 ///
 /// The clock is paused, so each sleep returns only once the task has handled
 /// everything it was sent.
 #[tokio::test(start_paused = true)]
-async fn a_mined_gateway_reaches_the_network_once_100_blocks_deep() {
+async fn a_mined_gateway_reaches_the_network_once_its_tenth_block_is_100_deep() {
     let chain = FakeChain::default();
-    chain.set(0..=TIP + 101, 1, None);
     let mined = TIP + 1;
-    chain.set([mined], 1, Some(7));
+    let tenth = mined + MIN_GATEWAY_BLOCKS - 1;
+    chain.set(0..=tenth + 100, 1, None);
+    chain.set(mined..=tenth, 1, Some(7));
 
     let (mut tip_sender, latest_tip, tip_change) = ChainTipSender::new(None, &regtest());
     tip_sender.set_finalized_tip(Some(tip_block(1, TIP)));
@@ -693,24 +694,25 @@ async fn a_mined_gateway_reaches_the_network_once_100_blocks_deep() {
         run(&mut tracker, tip_change, &publisher).await;
     });
 
-    // Mine the block that names the gateway, then 99 more: it is 99 deep.
-    for height in mined..TIP + 101 {
+    // Mine the blocks that name the gateway, then 99 more: nine of them count,
+    // and the tenth is 99 deep.
+    for height in mined..tenth + 100 {
         tip_sender.set_best_non_finalized_tip(Some(tip_block(1, height)));
         tokio::task::yield_now().await;
     }
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(ranked(&ranking).is_empty());
 
-    // One more block puts it 100 deep.
-    tip_sender.set_best_non_finalized_tip(Some(tip_block(1, TIP + 101)));
+    // One more block puts the tenth 100 deep.
+    tip_sender.set_best_non_finalized_tip(Some(tip_block(1, tenth + 100)));
     tokio::time::timeout(
         Duration::from_secs(10),
         ranking.wait_for(|ranking| !ranking.gateways.is_empty()),
     )
     .await
-    .expect("the gateway is published once its block is 100 deep")
+    .expect("the gateway is published once its tenth block is 100 deep")
     .expect("the tracker is still running");
-    assert_eq!(ranked(&ranking), [(7, 1)]);
+    assert_eq!(ranked(&ranking), [(7, MIN_GATEWAY_BLOCKS)]);
 
     drop(tip_sender);
     tokio::time::timeout(Duration::from_secs(10), task)

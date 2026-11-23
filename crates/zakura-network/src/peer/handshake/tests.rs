@@ -13,6 +13,7 @@ use std::{
 
 use super::*;
 use crate::{
+    peer::BlockAnnouncements,
     peer_set::ActiveConnectionCounter,
     zakura::{
         Peer as ZakuraServicePeer, Service as ZakuraService, Stream, ZakuraPeerId,
@@ -1218,7 +1219,7 @@ fn only_a_single_block_inv_is_traced_as_an_announcement() {
             connected_addr,
             &broadcast::channel(16).0,
             &AnnouncedBlocks::default(),
-            &mut Default::default(),
+            &Default::default(),
             &trace.for_peer(&connected_addr),
         )
         .expect("the filter passes the message through");
@@ -1280,7 +1281,7 @@ fn inbound_invs_record_announced_blocks() {
             connected_addr,
             &broadcast::channel(16).0,
             &announced,
-            &mut Default::default(),
+            &Default::default(),
             &Default::default(),
         )
         .expect("the filter passes the message through");
@@ -1305,7 +1306,7 @@ fn inbound_invs_record_announced_blocks() {
         ConnectedAddr::new_inbound_direct(peer_addr(38233)),
         &broadcast::channel(16).0,
         &announced,
-        &mut Default::default(),
+        &Default::default(),
         &Default::default(),
     )
     .expect("the filter passes the message through");
@@ -1320,7 +1321,7 @@ fn only_a_single_block_inv_reaches_the_block_announcement_hook() {
     let blocks: Vec<_> = (1..=3).map(|byte| block::Hash([byte; 32])).collect();
     let transaction = InventoryHash::Tx(zakura_chain::transaction::Hash([9; 32]));
     let (hook, announced) = recording_hook();
-    let mut block_announcements = hook.for_connection();
+    let block_announcements = hook.for_connection();
 
     for message in [
         Message::Inv(vec![InventoryHash::Block(blocks[0])]),
@@ -1341,7 +1342,7 @@ fn only_a_single_block_inv_reaches_the_block_announcement_hook() {
             ConnectedAddr::new_inbound_direct(peer_addr(38233)),
             &broadcast::channel(16).0,
             &AnnouncedBlocks::default(),
-            &mut block_announcements,
+            &block_announcements,
             &Default::default(),
         )
         .expect("the filter passes the message through");
@@ -1350,13 +1351,13 @@ fn only_a_single_block_inv_reaches_the_block_announcement_hook() {
     assert_eq!(*announced.lock().unwrap(), [blocks[0]]);
 }
 
-/// One connection hands the hook at most four announcements per two-second window, and each
+/// One connection hands the hook at most three announcements per two-second window, and each
 /// connection has its own allowance.
 #[tokio::test(start_paused = true)]
 async fn the_block_announcement_hook_is_limited_per_connection() {
     let (hook, announced) = recording_hook();
-    let mut connection = hook.for_connection();
-    let announce = |connection: &mut ConnectionAnnouncements, byte: u8| {
+    let connection = hook.for_connection();
+    let announce = |connection: &ConnectionAnnouncements, byte: u8| {
         register_inventory_status(
             Ok(Message::Inv(vec![InventoryHash::Block(block::Hash(
                 [byte; 32],
@@ -1370,27 +1371,104 @@ async fn the_block_announcement_hook_is_limited_per_connection() {
     };
     let count = || announced.lock().unwrap().len();
 
-    for byte in 1..=5 {
-        announce(&mut connection, byte).expect("passed through");
+    for byte in 1..=4 {
+        announce(&connection, byte).expect("passed through");
     }
     assert_eq!(
         count(),
-        4,
-        "the fifth announcement in the window does not reach the hook"
+        3,
+        "the fourth announcement in the window does not reach the hook"
     );
 
-    announce(&mut hook.for_connection(), 6).expect("passed through");
-    assert_eq!(count(), 5, "another connection has its own allowance");
+    announce(&hook.for_connection(), 6).expect("passed through");
+    assert_eq!(count(), 4, "another connection has its own allowance");
 
     tokio::time::advance(std::time::Duration::from_millis(1_999)).await;
-    announce(&mut connection, 7).expect("passed through");
-    assert_eq!(count(), 5, "the window has not ended");
+    announce(&connection, 7).expect("passed through");
+    assert_eq!(count(), 4, "the window has not ended");
 
     tokio::time::advance(std::time::Duration::from_millis(1)).await;
-    for byte in 8..=12 {
-        announce(&mut connection, byte).expect("passed through");
+    for byte in 8..=11 {
+        announce(&connection, byte).expect("passed through");
     }
-    assert_eq!(count(), 9, "a new window allows four more announcements");
+    assert_eq!(count(), 7, "a new window allows three more announcements");
+}
+
+/// The block headers a connection's decoder sees and the `inv`s its message filter sees draw on
+/// the same three blocks per window. A block shown twice in a window is counted and passed on
+/// once, so a peer that announces a block and then sends it uses one place.
+#[tokio::test(start_paused = true)]
+async fn block_headers_and_announcements_share_one_connection_allowance() {
+    let node = RecordingNode::default();
+    let (announced, headers) = (node.announced.clone(), node.headers.clone());
+    let connection = BlockAnnouncementHook::new(node).for_connection();
+    let header_arrived = connection
+        .block_header_hook()
+        .expect("a set hook gives the decoder a function to call");
+    let hash = |byte: u8| block::Hash([byte; 32]);
+    let announce = |byte: u8| {
+        register_inventory_status(
+            Ok(Message::Inv(vec![InventoryHash::Block(hash(byte))])),
+            ConnectedAddr::new_isolated(),
+            &broadcast::channel(16).0,
+            &AnnouncedBlocks::default(),
+            &connection,
+            &Default::default(),
+        )
+        .expect("passed through");
+    };
+
+    // An announced block that is then sent, and a pushed block that is then announced.
+    announce(1);
+    header_arrived(hash(1));
+    header_arrived(hash(2));
+    announce(2);
+    assert_eq!(*announced.lock().unwrap(), [hash(1)]);
+    assert_eq!(*headers.lock().unwrap(), [hash(2)]);
+
+    for byte in 3..=5 {
+        header_arrived(hash(byte));
+    }
+    announce(7);
+    assert_eq!(
+        *headers.lock().unwrap(),
+        [hash(2), hash(3)],
+        "the two earlier blocks left room for one more",
+    );
+    assert_eq!(
+        *announced.lock().unwrap(),
+        [hash(1)],
+        "block headers used up the allowance the announcement shares",
+    );
+
+    tokio::time::advance(std::time::Duration::from_secs(2)).await;
+    header_arrived(hash(8));
+    assert_eq!(headers.lock().unwrap().last(), Some(&hash(8)));
+
+    assert!(
+        BlockAnnouncementHook::default()
+            .for_connection()
+            .block_header_hook()
+            .is_none(),
+        "an unset hook leaves the decoder nothing to call",
+    );
+}
+
+/// A node that records the blocks it is told about.
+#[derive(Clone, Default)]
+struct RecordingNode {
+    announced: Arc<std::sync::Mutex<Vec<block::Hash>>>,
+    headers: Arc<std::sync::Mutex<Vec<block::Hash>>>,
+}
+
+impl BlockAnnouncements for RecordingNode {
+    fn announced(&self, hash: block::Hash) {
+        self.announced.lock().unwrap().push(hash);
+    }
+
+    fn block_header_arrived(&self, hash: block::Hash) {
+        self.headers.lock().unwrap().push(hash);
+    }
 }
 
 /// A hook that records the hashes it is called with.
@@ -1398,10 +1476,9 @@ fn recording_hook() -> (
     BlockAnnouncementHook,
     Arc<std::sync::Mutex<Vec<block::Hash>>>,
 ) {
-    let announced = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let recorded = announced.clone();
-    let hook = BlockAnnouncementHook::new(move |hash| recorded.lock().unwrap().push(hash));
-    (hook, announced)
+    let node = RecordingNode::default();
+    let announced = node.announced.clone();
+    (BlockAnnouncementHook::new(node), announced)
 }
 
 /// A body request contradicts only the requested blocks' earlier announcements.
@@ -1428,7 +1505,7 @@ fn body_requests_withdraw_only_requested_block_announcements() {
                 connected_addr,
                 &broadcast::channel(16).0,
                 &announced,
-                &mut Default::default(),
+                &Default::default(),
                 &Default::default(),
             )
             .expect("the filter passes the request through");

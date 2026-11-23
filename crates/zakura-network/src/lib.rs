@@ -192,8 +192,8 @@ pub use crate::{
     config::{CacheDir, Config, P2pStack, UnconditionalPeerName, UnconditionalPeers},
     meta_addr::{PeerAddrState, PeerSocketAddr},
     peer::{
-        BlockAnnouncementHook, Client, ConnectedAddr, ConnectionInfo, HandshakeError,
-        NoFasterBlockSource, NotFoundClass, PeerError, SharedPeerError,
+        BlockAnnouncementHook, BlockAnnouncements, Client, ConnectedAddr, ConnectionInfo,
+        HandshakeError, NoFasterBlockSource, NotFoundClass, PeerError, SharedPeerError,
     },
     peer_registry::ConnectedPeer,
     peer_set::init_with_zakura,

@@ -1,7 +1,8 @@
 //! Claims on receipt order made when a block is announced, and the deadline for its body.
 //!
-//! A block is announced when native header sync admits its header, or when a legacy peer first
-//! sends an `inv` for it. The `announced` child holds the `inv` sightings.
+//! A block is announced when native header sync admits its header, when a legacy peer first
+//! sends an `inv` for it, or when the block header at the start of a legacy `block` message
+//! carrying it arrives. The `announced` child holds the legacy sightings.
 
 use std::{
     collections::HashMap,
@@ -17,9 +18,9 @@ use super::order;
 mod announced;
 mod resolution;
 
-pub(super) use resolution::ClaimOutcome;
 #[cfg(test)]
-pub(super) use resolution::{size_label, ClaimSource};
+pub(super) use resolution::size_label;
+pub(super) use resolution::{ClaimOutcome, ClaimSource};
 
 use announced::Announcements;
 #[cfg(test)]
@@ -97,7 +98,7 @@ struct ClaimTable {
     /// ranked by arrival until the tip passes it again.
     floor: block::Height,
     by_hash: HashMap<block::Hash, Claim>,
-    /// The first legacy `inv` for each block. Its height is only known once the body arrives.
+    /// The first legacy sighting of each block. Its height is only known once the body arrives.
     announced: Announcements,
     /// Mined blocks that are verifying or verified, by hash. Failed ones are removed, and
     /// verified ones are retired by [`ClaimTable::retire_mined`].
@@ -127,7 +128,7 @@ impl ClaimTable {
         let floor = self.floor;
         self.by_hash.retain(|hash, claim| {
             if claim.height < floor {
-                self.announced.discard_after_header(*hash, claim.order);
+                self.announced.discard_header_fallback(*hash);
                 return false;
             }
             true
@@ -147,10 +148,12 @@ impl ClaimTable {
 /// Receipt-order claims for blocks announced before their bodies arrived.
 ///
 /// Header sync creates claims with [`AnnouncementClaims::begin`], legacy block `inv`s with
-/// [`AnnouncementClaims::note_announcement`], and the block verifier reads them by block hash,
-/// so every body transport follows the same rule. An accepted header claim keeps its original
-/// order and deadline. Repeated `inv`s keep the original announcement while its entry is
-/// retained. After that entry is pruned, a new `inv` can claim a fresh place.
+/// [`AnnouncementClaims::note_announcement`], legacy `block` messages with
+/// [`AnnouncementClaims::note_block_header`], and the block verifier reads them by block hash,
+/// so every body transport follows the same rule. The first sighting sets the order and
+/// deadline for as long as it is held. A provisional header releases its place if every
+/// covering apply fails. Once a legacy sighting expires from the store, a new sighting can
+/// claim a fresh place, even if the old entry has yet to be pruned.
 #[derive(Clone, Debug, Default)]
 pub struct AnnouncementClaims(Arc<Mutex<ClaimTable>>);
 
@@ -168,7 +171,9 @@ pub struct PendingClaims {
 
 impl AnnouncementClaims {
     /// Reserves a place in receipt order for each of `headers` that is one or two blocks above
-    /// the highest verified tip seen, including `verified_tip`, and has no claim yet.
+    /// the highest verified tip seen, including `verified_tip`, and has no claim yet. A header
+    /// whose block has a legacy sighting that still counts reserves nothing: that sighting
+    /// already set the block's order and deadline.
     ///
     /// Call this when a header apply starts and commit the result once the header chain has
     /// accepted the headers. The order and time are taken now, and bodies take them from now
@@ -205,6 +210,10 @@ impl AnnouncementClaims {
                 }
                 continue;
             }
+            // A legacy sighting that still counts already set this hash's order and deadline.
+            if table.announced.get(hash, now).is_some() {
+                continue;
+            }
             if table.by_hash.len() >= MAX_ANNOUNCEMENT_CLAIMS {
                 refused = refused.saturating_add(1);
                 continue;
@@ -231,14 +240,16 @@ impl AnnouncementClaims {
         }
     }
 
-    /// Records the first legacy `inv` for `hash`, so its body can take the order it was announced
-    /// in, and raises the verified tip to `verified_tip` as [`AnnouncementClaims::begin`] does.
+    /// Records a legacy `inv` for `hash` as the block's legacy sighting, if it has none yet, so
+    /// its body can take the order it was announced in. Raises the verified tip to
+    /// `verified_tip` as [`AnnouncementClaims::begin`] does.
     ///
-    /// An accepted header needs no announcement. An `inv` received during a pending header apply
-    /// is a fallback if every apply fails. Repeats keep the original announcement. The body
-    /// takes the announcement's order only if it
-    /// arrives within the deadline, its height was one or two above the tip at announcement,
-    /// and the highest tip seen since then has not passed that height.
+    /// An accepted header needs no legacy sighting. One made during a pending header apply is a
+    /// fallback if every apply fails. A block keeps its legacy sighting until the sighting
+    /// expires, so announcing or sending it again before then never renews its claim. The body
+    /// takes the sighting's order only if it arrives within the deadline, its height was one or
+    /// two above the tip at the sighting, and the highest tip seen since then has not passed
+    /// that height.
     ///
     /// No header check is needed here: a valid block hash cannot exist before its proof of work,
     /// and the order only ranks a block after it is fully verified.
@@ -252,18 +263,55 @@ impl AnnouncementClaims {
         verified_tip: block::Height,
         now: Instant,
     ) {
+        self.note_sighting(hash, verified_tip, ClaimSource::Inv, now)
+    }
+
+    /// Records that the block header at the start of a legacy `block` message arrived and
+    /// hashes to `hash`, as the block's legacy sighting, if it has none yet.
+    ///
+    /// This is the same sighting an `inv` makes, under the same rules, taken before the block's
+    /// transactions arrive. A large block therefore ranks ahead of a rival announced while it
+    /// is still being received, and the place is in force at once, whichever copy of the block
+    /// reaches the verifier first.
+    ///
+    /// `hash` is read from header bytes the node already holds, so, as with an `inv`, a place
+    /// cannot be taken for a block that is mined later.
+    pub fn note_block_header(&self, hash: block::Hash, verified_tip: block::Height) {
+        self.note_block_header_at(hash, verified_tip, Instant::now())
+    }
+
+    pub(super) fn note_block_header_at(
+        &self,
+        hash: block::Hash,
+        verified_tip: block::Height,
+        now: Instant,
+    ) {
+        self.note_sighting(hash, verified_tip, ClaimSource::BlockMessage, now)
+    }
+
+    /// Records the legacy sighting of `hash` made through `source` at `now`.
+    fn note_sighting(
+        &self,
+        hash: block::Hash,
+        verified_tip: block::Height,
+        source: ClaimSource,
+        now: Instant,
+    ) {
         let mut table = self.table();
         table.raise_floor(verified_tip);
         if table.by_hash.get(&hash).is_some_and(|claim| claim.accepted) {
             return;
         }
         let tip_at_announcement = table.floor;
-        let noted = table.announced.note(hash, tip_at_announcement, now);
+        let noted = table.announced.note(hash, tip_at_announcement, source, now);
         drop(table);
 
         if !noted {
-            metrics::counter!("sync.block.announcement_claim.refused", "source" => "inv")
-                .increment(1);
+            metrics::counter!(
+                "sync.block.announcement_claim.refused",
+                "source" => source.label(),
+            )
+            .increment(1);
         }
     }
 
@@ -310,6 +358,15 @@ impl AnnouncementClaims {
         }
     }
 
+    /// The most legacy sightings held at once. A block first sighted while that many are held
+    /// is ranked by body arrival.
+    #[cfg(any(test, feature = "proptest-impl"))]
+    pub const MAX_LEGACY_SIGHTINGS: usize = announced::MAX_ANNOUNCED_BLOCKS;
+
+    /// How long a legacy sighting counts towards [`Self::MAX_LEGACY_SIGHTINGS`].
+    #[cfg(any(test, feature = "proptest-impl"))]
+    pub const LEGACY_SIGHTING_LIFETIME: Duration = announced::ANNOUNCEMENT_LIFETIME;
+
     /// Whether a claim is held for `hash`.
     #[cfg(any(test, feature = "proptest-impl"))]
     pub fn is_claimed(&self, hash: block::Hash) -> bool {
@@ -322,13 +379,10 @@ impl AnnouncementClaims {
         self.table().by_hash.get(&hash).map(|claim| claim.order)
     }
 
-    /// The order of the first announcement held for `hash`.
+    /// The order of the legacy sighting stored for `hash`, expired or not.
     #[cfg(test)]
     pub(super) fn announced_order(&self, hash: block::Hash) -> Option<u64> {
-        self.table()
-            .announced
-            .get(hash)
-            .map(|announced| announced.order)
+        self.table().announced.stored_order(hash)
     }
 
     /// How many mined blocks have a record.
@@ -363,8 +417,7 @@ impl PendingClaims {
             claim.applies = claim.applies.saturating_sub(1);
             claim.accepted |= accepted;
             if accepted {
-                let header_order = claim.order;
-                table.announced.discard_after_header(hash, header_order);
+                table.announced.discard_header_fallback(hash);
             } else if claim.applies == 0 && !claim.accepted {
                 table.by_hash.remove(&hash);
             }

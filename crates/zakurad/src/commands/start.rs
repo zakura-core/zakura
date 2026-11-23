@@ -227,21 +227,32 @@ fn use_zakura_block_sync(config: &zakura_network::Config) -> bool {
     config.v2_p2p()
 }
 
-/// Claims receipt order in `announcement_claims` for each block a legacy peer newly announces,
-/// so legacy-only blocks follow the same equal-work rule as blocks whose headers arrive first.
+/// Claims receipt order in `claims` for each block a legacy peer newly announces, or whose block
+/// header arrives at the start of a `block` message, so legacy-only blocks follow the same
+/// equal-work rule as blocks whose headers arrive first.
 ///
 /// The best chain tip stands in for header sync's verified tip, which a node without native
 /// header sync never reports.
-fn legacy_block_announcement_hook(
-    announcement_claims: zakura_consensus::AnnouncementClaims,
-    latest_chain_tip: impl ChainTip + Send + Sync + 'static,
-) -> zakura_network::BlockAnnouncementHook {
-    zakura_network::BlockAnnouncementHook::new(move |hash| {
+struct LegacyBlockClaims<Tip> {
+    claims: zakura_consensus::AnnouncementClaims,
+    latest_chain_tip: Tip,
+}
+
+impl<Tip: ChainTip + Send + Sync> zakura_network::BlockAnnouncements for LegacyBlockClaims<Tip> {
+    fn announced(&self, hash: block::Hash) {
         // Before the first block is committed there is no tip to place a claim above.
-        if let Some(verified_tip) = latest_chain_tip.best_tip_height() {
-            announcement_claims.note_announcement(hash, verified_tip);
+        if let Some(verified_tip) = self.latest_chain_tip.best_tip_height() {
+            self.claims.note_announcement(hash, verified_tip);
         }
-    })
+    }
+
+    fn block_header_arrived(&self, hash: block::Hash) {
+        // The tip is read when the block header arrives, so a rival committed while the rest
+        // of this block arrives does not move it out of the claim window.
+        if let Some(verified_tip) = self.latest_chain_tip.best_tip_height() {
+            self.claims.note_block_header(hash, verified_tip);
+        }
+    }
 }
 
 /// The tasks spawned by the `start` command, which are all aborted when this is dropped.
@@ -691,8 +702,9 @@ impl StartCmd {
             zakura::SyncCoordinator::new()
         };
 
-        // Header sync and legacy block `inv`s claim blocks announced first, and the block
-        // verifier ranks equal-work bodies by those claims.
+        // Header sync, legacy block `inv`s and the block headers of legacy `block` messages
+        // claim blocks announced first, and the block verifier ranks equal-work bodies by those
+        // claims.
         let announcement_claims = zakura_consensus::AnnouncementClaims::default();
         let zakura_header_sync_driver_startup = if config.network.v2_p2p() {
             Some(
@@ -823,10 +835,10 @@ impl StartCmd {
                 zcashd_compat_block_gossip_peer_ips.clone(),
                 zakura_header_sync_driver_startup,
                 custom_services,
-                legacy_block_announcement_hook(
-                    announcement_claims.clone(),
-                    latest_chain_tip.clone(),
-                ),
+                zakura_network::BlockAnnouncementHook::new(LegacyBlockClaims {
+                    claims: announcement_claims.clone(),
+                    latest_chain_tip: latest_chain_tip.clone(),
+                }),
             )
             .await
             .map_err(|error| eyre!(error))?;

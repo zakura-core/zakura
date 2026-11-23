@@ -15,14 +15,15 @@ A block's receipt order is drawn when its complete body reaches the full-block
 verifier, before looking up announcements or other active deliveries. An
 announcement can supply its earlier order only if it was recorded before the
 body drew its order and the body arrived within the announcement's deadline.
-A block is announced when native header sync admits its header, or
-when a legacy peer sends the first `inv` for it.
+A block is announced when native header sync admits its header, when a legacy
+peer sends the first `inv` for it, or when the block header at the start of a
+legacy `block` message carrying it arrives.
 
 Without this, a block full of transactions can lose an equal-work race to an
 empty block announced later, because the larger body takes longer to transfer.
 That penalizes including transactions.
 
-The reservation is called a claim. Five rules define it:
+The reservation is called a claim. Six rules define it:
 
 - **A header claim needs a fully validated header.** Native header sync
   reserves the order and the time when it starts applying a header, so a body
@@ -48,33 +49,85 @@ The reservation is called a claim. Five rules define it:
   once the highest verified tip passes the body's height. On a node
   without native header sync, the best chain tip at `inv` time stands in for
   the verified tip.
-- **A recorded claim keeps its original order and deadline.** Delivering an
-  accepted header again leaves its claim in place. An accepted header ignores
-  later `inv`s. While a header apply is pending, the first later `inv` is saved
-  with its original order, time and observed tip. It becomes usable if every
-  apply fails and is discarded if any succeeds. Repeated `inv`s keep the
-  original announcement while its entry is retained. Reading a claim does not
-  use it up, so an invalid body under the same hash cannot take it. If a block
-  has both kinds of claim, its body takes the earlier order among those still in
-  force, so an `inv` never makes the outcome worse than the header claim alone.
+- **A legacy `block` message claims from its block header.** The block
+  header is the first 1,487 bytes of the message body. When it has arrived,
+  before the transactions, the connection hashes it and records the hash
+  exactly as it would record a single-block `inv`: the next order, the time
+  and the highest verified tip seen. The same height window, deadline, floor
+  and mined-block rules then apply. The deadline counts from the header's
+  arrival, and the window uses the tip at that time, so a rival committed
+  while the block arrives does not push it out. This applies to every `block`
+  message, requested or pushed, once the peer has completed its handshake.
+  The record is in force at once, so it also ranks a copy of the block that
+  reaches the verifier afterwards by a faster route.
+
+  Without it, a miner's own neighbours could switch to a rival. A Zakura miner
+  pushes the full block to its first peers before its `inv`, so they had no
+  claim until the whole body arrived. A rival's `inv` arriving during the
+  transfer drew an earlier order. In a lab at 20 Mbit with a 2 MB block, about
+  0.8 s of transfer, the miner's neighbour kept the miner's block in 0 of 10
+  races with claims on, and 10 of 10 with claims off.
+
+  This is as safe as an `inv` claim, for the same reason. The hash is read
+  from header bytes the node already holds, and the hash of a valid block
+  cannot be known before its proof of work is done, so a peer cannot take a
+  place and fill it in with a block it mines later. The 24-byte message
+  header would not be enough: it ties the message to its body only by a
+  four-byte checksum, which a sender can match by padding a later block. The
+  record is made before the message's checksum is checked, which changes
+  nothing: an `inv` proves no more than a header does, and only a fully
+  verified block with that hash can use the place in an equal-work tie.
+- **The first recorded sighting sets the order and the two-second deadline.**
+  A legacy `inv`, the header of a legacy `block` message, and a native header
+  apply all follow this rule. While the first record is held, switching paths
+  cannot give the body a later deadline. If the body misses that deadline, it
+  takes its own arrival order. For example, a native header received 1.5 seconds
+  after an `inv` cannot give a body delivered at 2.1 seconds announcement credit.
+  Reading a claim does not use it up, so an invalid body under the same hash
+  cannot take it.
+
+  A native header apply is provisional. If it started first and a legacy
+  sighting arrives during the apply, the node saves that sighting with its own
+  order, time and observed tip. It becomes the first remaining sighting only
+  if every covering apply fails. If any succeeds, the node discards the saved
+  sighting and keeps the original header deadline.
 
   The header table holds 64 claims. When it is full it refuses new claims and
   never drops old ones. A claim is removed when no apply covering it
-  succeeds, or at the first header apply or legacy `inv` after the verified
+  succeeds, or at the first header apply or legacy record after the verified
   tip passes its height, where no new claim can be made. That floor is the
   highest verified tip seen and never goes down, so after a rollback blocks at
   or below it get no claim and are ranked by arrival until the tip passes it
   again.
 
-  The `inv` store holds 512 blocks. Entries older than 4 seconds, twice the
-  body deadline, are dropped when a new block is recorded, so a late body is
-  still counted as expired. A store full of newer entries refuses new blocks.
-  Each legacy connection passes at most 4 `inv`s per 2 seconds to the store,
-  leaving room for both blocks in a tip race and for repeated or bunched
-  announcements. One connection cannot fill the store. A sustained flood can
-  at worst return blocks to arrival order. An `inv` received after its entry was
-  pruned can reserve a fresh place with a new deadline. A rival that already
-  holds a usable claim keeps its earlier place.
+  The legacy store holds 5,000 blocks. An entry counts for 4 seconds, twice
+  the body deadline, so a late body is still counted as expired. An older
+  entry is ignored wherever it is read, whether or not it has been removed
+  yet, so what a block can claim does not depend on which other blocks were
+  recorded in the meantime. After that the block can be recorded afresh, by a
+  legacy peer or by a native header apply, with a new and later order. A rival
+  that already holds a usable claim keeps its earlier place. A store full of
+  newer entries refuses new blocks.
+  Each legacy connection passes at most 3 blocks per 2 seconds to the store,
+  whether it announced them or sent their headers, leaving room for both
+  blocks in a tip race and one more. A block it shows again in the same 2
+  seconds, such as an announced block it then sends, is counted once.
+
+  The store's size follows from those numbers, so that peers cannot fill it at
+  the default connection limits. One connection holds at most 9 unexpired
+  entries: three windows' worth, when the first was filled exactly 4 seconds
+  before the last. The default limits allow 450 connections at once. Every
+  new connection has a fresh allowance, and within those 4 seconds at most
+  about 73 can be opened: 32 inbound, which are accepted in bursts of 16, and
+  41 outbound, which are dialed at most ten a second. So at most 523
+  connections hold 4,707 entries. The bound stops holding once the configured
+  connection limit passes about 480, which is a `peerset_initial_target_size`
+  of about 107 against the default 100. Such a node can still be filled.
+
+  A block's height is not known when its header arrives, so blocks a peer
+  serves during catch-up use the allowance and the store too, within the same
+  bound. Where the store can be filled, a sustained flood can at worst return
+  blocks to arrival order, and the store clears four seconds after it stops.
 - **The body has a deadline.** It is `CLAIM_BODY_DEADLINE`, a flat 2 seconds
   for every block, whatever its size. A body that arrives later draws a fresh
   order, as if its header had never been seen.
@@ -101,7 +154,7 @@ The deadline is what keeps the rule safe. A miner can announce a real header
 and withhold its body. With no bound, that miner would win every equal-work
 tie against blocks found while it withheld, which makes withholding profitable
 at any hashrate. A failed download or a repeated announcement while the claim's
-entry is retained leaves its deadline in place. To inherit a place, the body
+entry still counts leaves its deadline in place. To inherit a place, the body
 must arrive within two seconds of the announcement that reserved it. Inside
 that deadline, withholding is indistinguishable from slow honest delivery, so
 the deadline limits how long a miner can hold back the body and keep that place.
@@ -138,9 +191,9 @@ The 2 seconds is an estimate of honest delivery, not a measurement. The
 `sync.block.announcement_claim` counter records how each body resolved
 (`used`, `expired`, `voided` by a mined block, or `none`), and the
 `sync.block.announcement_claim.age.seconds` histogram records the age of the
-claim at body arrival, both labelled by block size and by `source`, `header`
-or `inv`. The `sync.block.announcement_claim.refused` counter records claims
-refused by a full table or store, labelled by `source`.
+claim at body arrival, both labelled by block size and by `source`: `header`,
+`inv` or `block`. The `sync.block.announcement_claim.refused` counter records
+claims refused by a full table or store, labelled by `source`.
 
 For example, A's header is admitted before B's, but B's smaller body arrives
 and validates first. Mining uses B until A validates. If A's body arrived
@@ -155,10 +208,10 @@ Some blocks have no claim and are ranked by body arrival:
   fill the table, which then refuses claims until the verified tip passes the
   flooded heights.
 - A block a legacy peer announced only in a multi-block `inv`, or announced
-  past its connection's limit, with no header claim.
+  and sent past its connection's limits, with no header claim.
 
-An `inv` claim only removes the last hop's delay. Legacy relays store and
-forward, so each upstream hop has already received and verified the whole
+An `inv` or `block` message claim only removes the last hop's delay. Legacy
+relays store and forward, so each upstream hop has already received and verified the whole
 body before announcing it, and that time is not recovered. Header claims from
 native header sync arrive before the bodies at every hop.
 

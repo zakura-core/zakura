@@ -654,7 +654,8 @@ impl ZakuraBlockSyncConfig {
         // The block-sync share sets the QUIC stream receive window, which
         // can't exceed QUIC's ceiling.
         match block_sync_reactor_budget(self.bbr_max_cwnd_bytes, self.floor_bypass_slots) {
-            Ok(budget) if budget.receive <= zakura_quic::MAX_STREAM_RECEIVE_WINDOW_BYTES => {}
+            Ok(budget)
+                if budget.receive_total() <= zakura_quic::MAX_STREAM_RECEIVE_WINDOW_BYTES => {}
             _ => {
                 return Err(
                     "bbr_max_cwnd_bytes and floor_bypass_slots must keep the block-sync \
@@ -866,7 +867,7 @@ mod owner_cap_tests {
 
     #[test]
     fn validation_keeps_the_block_sync_share_within_the_quic_stream_window() {
-        let fixed = BLOCK_SYNC_REACTOR_BUDGET.receive - DEFAULT_BS_BBR_MAX_CWND_BYTES;
+        let fixed = BLOCK_SYNC_REACTOR_BUDGET.receive_total() - DEFAULT_BS_BBR_MAX_CWND_BYTES;
         let largest_cwnd = zakura_quic::MAX_STREAM_RECEIVE_WINDOW_BYTES - fixed;
         let mut config = ZakuraBlockSyncConfig {
             bbr_max_cwnd_bytes: largest_cwnd,

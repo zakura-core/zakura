@@ -32,12 +32,12 @@ fn shares() -> ReactorShares {
         kinds: vec![(
             HEADERS.kind,
             ReactorBudget {
-                receive: 20,
+                receive: ReceiveBudget::unsolicited_only(20),
                 output: 1024,
             },
         )],
         other: ReactorBudget {
-            receive: 30,
+            receive: ReceiveBudget::unsolicited_only(30),
             output: 2048,
         },
     }
@@ -185,7 +185,7 @@ fn quic_shares_keep_the_configured_windows() {
 fn an_output_share_below_its_largest_frame_is_refused() {
     let small = ReactorShares {
         other: ReactorBudget {
-            receive: 20,
+            receive: ReceiveBudget::unsolicited_only(20),
             output: 19,
         },
         ..shares()
@@ -200,7 +200,7 @@ fn an_output_share_below_its_largest_frame_is_refused() {
 fn a_receive_share_below_its_largest_frame_is_refused() {
     let small = ReactorShares {
         other: ReactorBudget {
-            receive: 19,
+            receive: ReceiveBudget::unsolicited_only(19),
             output: 20,
         },
         ..shares()
@@ -214,7 +214,7 @@ fn the_envelope_sums_the_shares_of_every_connection() {
         max_open_streams: 1024,
         control_receive_bytes: 32 * MIB,
         connection_shares: ReactorBudget {
-            receive: 48 * MIB,
+            receive: ReceiveBudget::unsolicited_only(48 * MIB),
             output: 96 * MIB,
         },
         compat_exchange_bytes: 20 * MIB,
@@ -277,7 +277,7 @@ fn compat_exchanges_use_their_connections_own_gate() {
     let node = node();
     let connection = node.connection(HEADERS.capability | BLOCKS.capability);
     let headers = connection.stream(HEADERS.kind, connection.owner()).unwrap();
-    let capacity = COMPAT_EXCHANGE_BUDGET.receive;
+    let capacity = COMPAT_EXCHANGE_BUDGET.receive_total();
 
     // A kind share of twenty bytes does not limit a whole exchange.
     let held = connection
@@ -326,7 +326,7 @@ fn the_compat_exchange_budget_holds_one_worst_case_exchange() {
     assert_eq!(
         COMPAT_EXCHANGE_BUDGET,
         ReactorBudget {
-            receive: 20 * MIB,
+            receive: ReceiveBudget::unsolicited_only(20 * MIB),
             output: 0,
         }
     );

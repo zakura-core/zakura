@@ -17,7 +17,7 @@ use crate::{
             ConnectionResources, NodeResources, OwnerCounts, OwnerPhase, StreamResources,
             TransportLimits,
         },
-        ReactorBudget, ReactorShares, Stream,
+        ReactorBudget, ReactorShares, ReceiveBudget, Stream,
     },
 };
 
@@ -46,7 +46,7 @@ fn shares() -> ReactorShares {
         control_receive_bytes: WINDOW,
         kinds: Vec::new(),
         other: ReactorBudget {
-            receive: WINDOW,
+            receive: ReceiveBudget::unsolicited_only(WINDOW),
             output: WINDOW,
         },
     }
@@ -57,7 +57,7 @@ fn limits() -> TransportLimits {
         max_open_streams: MAX_OPEN_STREAMS,
         control_receive_bytes: WINDOW,
         connection_shares: ReactorBudget {
-            receive: 3 * WINDOW,
+            receive: ReceiveBudget::unsolicited_only(3 * WINDOW),
             output: 3 * WINDOW,
         },
         compat_exchange_bytes: 0,
@@ -168,11 +168,11 @@ fn the_default_envelope_sums_the_reactor_shares() {
     // The connection window and the stream window that carry the shares.
     assert_eq!(
         shares.receive_window(shares.kinds.iter().map(|(kind, _)| *kind)),
-        crate::zakura::CONTROL_RECEIVE_BYTES + 74_836_259
+        crate::zakura::CONTROL_RECEIVE_BYTES + 74_836_267
     );
     assert_eq!(
         u64::from(limits.quic.stream_receive_window_bytes),
-        crate::zakura::BLOCK_SYNC_REACTOR_BUDGET.receive
+        crate::zakura::BLOCK_SYNC_REACTOR_BUDGET.receive_total()
     );
     assert_eq!(
         u64::from(limits.quic.receive_window_bytes),
@@ -188,11 +188,11 @@ fn the_default_envelope_sums_the_reactor_shares() {
     let transport = ResourceEnvelope::new(
         limits.transport_limits_for_kinds(shares.kinds.iter().map(|(kind, _)| *kind)),
     );
-    // Per connection: 74,836,259 B of receive shares (counted inside QUIC
+    // Per connection: 74,836,267 B of receive shares (counted inside QUIC
     // receive credit via CreditHold) and 128 MiB of unguarded output shares
     // (legacy gossip + legacy requests; discovery, header sync and block sync
     // use guarded Serve/Push output counted in `serve_output_bytes`).
-    assert_eq!(transport.connection_raw_bytes, 74_836_259);
+    assert_eq!(transport.connection_raw_bytes, 74_836_267);
     assert_eq!(transport.connection_output_bytes, 128 * MIB);
     // The shared compatibility client holds at most 288 exchanges at once.
     assert_eq!(transport.compat_response_bytes, 288 * 20 * MIB);
@@ -200,8 +200,8 @@ fn the_default_envelope_sums_the_reactor_shares() {
         envelope.transport_bytes,
         92 * u128::from(128 * MIB) + u128::from(288 * 20 * MIB)
     );
-    // 92 × 108,456,227 + 32 × 128 KiB + 256 MiB.
-    assert_eq!(envelope.quic_bytes, 10_250_602_644);
+    // 92 × 108,456,235 + 32 × 128 KiB + 256 MiB.
+    assert_eq!(envelope.quic_bytes, 10_250_603_380);
 }
 
 /// A custom stream kind takes the `other` share on a live connection, so the peer
@@ -222,7 +222,7 @@ fn custom_stream_kinds_charge_the_peer_memory_budget() {
     );
 
     // Widening usize to u128 is lossless on supported targets.
-    let other = u128::from(config.zakura.reactor_shares(&network).other.receive);
+    let other = u128::from(config.zakura.reactor_shares(&network).other.receive_total());
     assert_eq!(
         config.zakura.quic_memory_bytes(&network, native, CUSTOM),
         native_quic + native as u128 * other

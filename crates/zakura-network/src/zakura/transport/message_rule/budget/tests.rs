@@ -170,7 +170,10 @@ fn a_bound_past_u64_is_an_overflow() {
 #[test]
 fn a_receive_share_below_the_frame_cap_is_refused() {
     let budget = ReactorBudget {
-        receive: 1023,
+        receive: ReceiveBudget {
+            unsolicited: 1023,
+            per_request: 10_000,
+        },
         output: 0,
     };
     assert_eq!(
@@ -183,17 +186,49 @@ fn a_receive_share_below_the_frame_cap_is_refused() {
     assert_eq!(budget.check_frame_cap(1023), Ok(budget));
 
     const EXACT: ReactorBudget = ReactorBudget {
-        receive: 1024,
+        receive: ReceiveBudget::unsolicited_only(1024),
         output: 0,
     }
     .assert_frame_cap(1024);
-    assert_eq!(EXACT.receive, 1024);
+    assert_eq!(EXACT.receive.unsolicited, 1024);
+}
+
+#[test]
+fn receive_bound_split_separates_unsolicited_from_per_request() {
+    let layout = [stream(64, Some(&[STATUS, GET, DONE, MISSING]))];
+    assert_eq!(
+        Stream::receive_bound_split(&layout, LocalRole::Requester),
+        Ok(ReceiveBudget {
+            unsolicited: 176,
+            per_request: 200,
+        })
+    );
+    assert_eq!(
+        Stream::receive_bound_split(&layout, LocalRole::Responder),
+        Ok(ReceiveBudget {
+            unsolicited: 176 + 16,
+            per_request: 0,
+        })
+    );
+    assert_eq!(
+        Stream::receive_bound_split(&layout, LocalRole::Both),
+        Ok(ReceiveBudget {
+            unsolicited: 176 + 16,
+            per_request: 200,
+        })
+    );
 }
 
 /// Budgets that mix small values, whose sums fit, with any `u64`.
 fn budget() -> impl Strategy<Value = ReactorBudget> {
     let bytes = || prop_oneof![0..1u64 << 40, any::<u64>()];
-    (bytes(), bytes()).prop_map(|(receive, output)| ReactorBudget { receive, output })
+    (bytes(), bytes(), bytes()).prop_map(|(unsolicited, per_request, output)| ReactorBudget {
+        receive: ReceiveBudget {
+            unsolicited,
+            per_request,
+        },
+        output,
+    })
 }
 
 /// `value` if it fits in `u64`.
@@ -204,11 +239,19 @@ fn fits(value: u128) -> Option<u64> {
 proptest! {
     #[test]
     fn checked_sums_are_exact_or_none(budgets in prop::collection::vec(budget(), 0..4)) {
-        let receive: u128 = budgets.iter().map(|budget| u128::from(budget.receive)).sum();
+        let unsolicited: u128 = budgets.iter().map(|budget| u128::from(budget.receive.unsolicited)).sum();
+        let per_request: u128 = budgets.iter().map(|budget| u128::from(budget.receive.per_request)).sum();
         let output: u128 = budgets.iter().map(|budget| u128::from(budget.output)).sum();
-        let expected = fits(receive)
+        let expected = fits(unsolicited)
+            .zip(fits(per_request))
             .zip(fits(output))
-            .map(|(receive, output)| ReactorBudget { receive, output });
+            .map(|((unsolicited, per_request), output)| ReactorBudget {
+                receive: ReceiveBudget {
+                    unsolicited,
+                    per_request,
+                },
+                output,
+            });
         prop_assert_eq!(ReactorBudget::checked_sum(&budgets), expected);
     }
 
@@ -216,9 +259,16 @@ proptest! {
     fn checked_products_are_exact_or_none(budget in budget(), connections in any::<u32>()) {
         // Widening u32 to usize and u128 is lossless.
         let times = |bytes: u64| fits(u128::from(bytes) * u128::from(connections));
-        let expected = times(budget.receive)
+        let expected = times(budget.receive.unsolicited)
+            .zip(times(budget.receive.per_request))
             .zip(times(budget.output))
-            .map(|(receive, output)| ReactorBudget { receive, output });
+            .map(|((unsolicited, per_request), output)| ReactorBudget {
+                receive: ReceiveBudget {
+                    unsolicited,
+                    per_request,
+                },
+                output,
+            });
         prop_assert_eq!(budget.checked_mul(connections as usize), expected);
     }
 }

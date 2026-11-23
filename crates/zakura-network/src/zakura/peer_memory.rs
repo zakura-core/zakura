@@ -56,8 +56,8 @@ const GIB: u64 = 1024 * 1024 * 1024;
 /// 15,666,767,700 B.
 pub const DEFAULT_ZAKURA_PEER_MEMORY_BUDGET_BYTES: u64 = {
     const fn with_tx(mut mem: ConnectionMemory) -> ConnectionMemory {
-        let tx_relay = super::tx_relay::wire::TX_RELAY_DATA_BUDGET.receive
-            + super::tx_relay::wire::TX_RELAY_STATE_BUDGET.receive;
+        let tx_relay = super::tx_relay::wire::TX_RELAY_DATA_BUDGET.receive_total()
+            + super::tx_relay::wire::TX_RELAY_STATE_BUDGET.receive_total();
         mem.admitted_bytes = mem.admitted_bytes.saturating_add(tx_relay);
         mem
     }
@@ -161,11 +161,11 @@ pub const fn default_connection_memory(header_sync: ReactorBudget) -> Connection
     ConnectionMemory::with_handshake_send(
         CONTROL_RECEIVE_BYTES,
         HANDSHAKE_SEND_WINDOW_BYTES,
-        LEGACY_GOSSIP_BUDGET.receive
-            + LEGACY_REQUESTS_BUDGET.receive
-            + DISCOVERY_BUDGET.receive
-            + header_sync.receive
-            + BLOCK_SYNC_REACTOR_BUDGET.receive,
+        LEGACY_GOSSIP_BUDGET.receive_total()
+            + LEGACY_REQUESTS_BUDGET.receive_total()
+            + DISCOVERY_BUDGET.receive_total()
+            + header_sync.receive_total()
+            + BLOCK_SYNC_REACTOR_BUDGET.receive_total(),
         DEFAULT_ZAKURA_SEND_WINDOW,
     )
 }
@@ -309,7 +309,7 @@ mod tests {
     const MIB: u64 = 1024 * 1024;
     const KIB: u64 = 1024;
     /// One admitted Mainnet connection at the derived control share and default shares.
-    const CONNECTION: u64 = 108_456_227;
+    const CONNECTION: u64 = 108_456_235;
     /// One pending handshake: 64 KiB control receive + 64 KiB handshake send.
     const HANDSHAKE: u64 = 128 * KIB;
 
@@ -359,7 +359,7 @@ mod tests {
         );
         assert_eq!(
             default_connection_memory(RegtestMessage::BUDGET).admitted_bytes,
-            110_549_837
+            110_549_845
         );
         let config = ZakuraConfig::default();
         assert_eq!(config.connection_memory(&mainnet(), &[]), mainnet_memory);
@@ -389,7 +389,7 @@ mod tests {
         }
         assert_eq!(
             config.quic_memory_bytes(&mainnet(), DEFAULT_ZAKURA_MAX_CONNECTIONS, &[]),
-            10_250_602_644
+            10_250_603_380
         );
         assert_eq!(
             config.quic_memory_bytes(
@@ -397,7 +397,7 @@ mod tests {
                 DEFAULT_ZAKURA_MAX_CONNECTIONS,
                 &[],
             ),
-            10_443_214_764
+            10_443_215_500
         );
     }
 

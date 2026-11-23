@@ -67,8 +67,9 @@ use super::transport::{
     worker_framed_channel, AdmittedFrame, CloseOutcome, CloseRow, CompatResponseGrant,
     ConnectionResources, FrameGate, FrameGrant, FramedWorkerRecv, HandshakeCounts, IpAdmission,
     NeutralCause, NodeResources, OrderedStreamFailure, OrderedStreamFailureCause, OwnerBound,
-    OwnerGuard, OwnerPhase, ReactorBudget, ReactorShares, ResourceEnvelope, SessionLayout,
-    StreamResources, TransportLimits, COMPAT_EXCHANGE_BUDGET, COMPAT_RESPONSE_MAX_AGGREGATE_BYTES,
+    OwnerGuard, OwnerPhase, ReactorBudget, ReactorShares, ReceiveBudget, ResourceEnvelope,
+    SessionLayout, StreamResources, TransportLimits, COMPAT_EXCHANGE_BUDGET,
+    COMPAT_RESPONSE_MAX_AGGREGATE_BYTES,
 };
 #[cfg(any(test, feature = "zakura-testkit"))]
 use crate::zakura::drive_header_sync_actions;
@@ -570,7 +571,10 @@ impl ZakuraConfig {
             self.block_sync.floor_bypass_slots,
         )
         .unwrap_or(ReactorBudget {
-            receive: u64::MAX,
+            receive: ReceiveBudget {
+                unsolicited: u64::MAX,
+                per_request: 0,
+            },
             output: u64::MAX,
         });
         let mut kinds = vec![
@@ -632,8 +636,12 @@ impl ZakuraConfig {
         let kinds = shares
             .kinds
             .iter()
-            .map(|(_, share)| share.receive)
-            .chain(custom_kinds.iter().map(|kind| shares.share(*kind).receive))
+            .map(|(_, share)| share.receive_total())
+            .chain(
+                custom_kinds
+                    .iter()
+                    .map(|kind| shares.share(*kind).receive_total()),
+            )
             .fold(0_u64, u64::saturating_add);
         ConnectionMemory::with_handshake_send(
             shares.control_receive_bytes,
@@ -944,7 +952,7 @@ impl ZakuraLocalLimits {
         let compat_exchange_bytes = if kinds.contains(&LEGACY_REQUEST_STREAM_KIND) {
             // Widening usize to u64 is lossless on supported targets.
             COMPAT_EXCHANGE_BUDGET
-                .receive
+                .receive_total()
                 .saturating_mul(super::legacy_gossip::LEGACY_CLIENT_REQUEST_SLOTS as u64)
         } else {
             0
@@ -10377,7 +10385,7 @@ mod tests {
     #[test]
     fn the_largest_valid_cwnd_cap_derives_a_bindable_stream_window() {
         let mut config = Config::default();
-        let fixed = super::super::BLOCK_SYNC_REACTOR_BUDGET.receive
+        let fixed = super::super::BLOCK_SYNC_REACTOR_BUDGET.receive_total()
             - config.zakura.block_sync.bbr_max_cwnd_bytes;
         config.zakura.block_sync.bbr_max_cwnd_bytes =
             zakura_quic::MAX_STREAM_RECEIVE_WINDOW_BYTES - fixed;

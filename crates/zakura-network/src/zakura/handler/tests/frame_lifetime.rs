@@ -61,7 +61,10 @@ fn connection_gates(streams: &[Stream], receive: u64, output: u64) -> Connection
     let shares = ReactorShares {
         control_receive_bytes: 1 << 20,
         kinds: Vec::new(),
-        other: ReactorBudget { receive, output },
+        other: ReactorBudget {
+            receive: ReceiveBudget::unsolicited_only(receive),
+            output,
+        },
     };
     let capabilities = streams
         .iter()
@@ -157,7 +160,7 @@ async fn a_full_kind_leaves_its_unread_frame_out_of_the_usage_report() -> Result
         control_receive_bytes: 1 << 20,
         kinds: Vec::new(),
         other: ReactorBudget {
-            receive: 1024,
+            receive: ReceiveBudget::unsolicited_only(1024),
             output: 1024,
         },
     };

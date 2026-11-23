@@ -60,7 +60,7 @@ const _: () = Stream::validate_layout(&DISCOVERY_SERVICE_STREAMS);
 /// largest answers on each request row, the per-peer serve output that the
 /// serving limits set.
 pub const DISCOVERY_BUDGET: ReactorBudget = {
-    let receive = match Stream::receive_bound(&DISCOVERY_SERVICE_STREAMS, LocalRole::Both) {
+    let receive = match Stream::receive_bound_split(&DISCOVERY_SERVICE_STREAMS, LocalRole::Both) {
         Ok(bytes) => bytes,
         Err(error) => panic!("{}", error.rule()),
     };
@@ -1030,16 +1030,28 @@ mod tests {
     /// frame headers included.
     #[test]
     fn the_discovery_budget_holds_each_row() {
-        let receive = 42 * 753 + 8_470 + 1_090 + 24_098 + 2_394;
+        let unsolicited = 42 * 753 + 8_470 + 1_090;
+        let per_request = 24_098 + 2_394;
         let output = 2 * (24_098 + 8) + 2 * (2_394 + 8);
         assert_eq!(
             DISCOVERY_BUDGET,
             ReactorBudget {
-                receive: 67_678,
+                receive: crate::zakura::ReceiveBudget {
+                    unsolicited: 41_186,
+                    per_request: 26_492,
+                },
                 output: 53_016,
             }
         );
-        assert_eq!((receive, output), (67_678, 53_016));
+        assert_eq!(
+            (
+                unsolicited,
+                per_request,
+                DISCOVERY_BUDGET.receive_total(),
+                output
+            ),
+            (41_186, 26_492, 67_678, 53_016)
+        );
     }
 
     #[test]

@@ -868,7 +868,7 @@ pub(crate) async fn paused_siblings<A: StreamConformance>(
     let registered_stream_window = layout
         .iter()
         .chain(&SIBLINGS)
-        .map(|stream| shares.share(stream.kind).receive)
+        .map(|stream| shares.share(stream.kind).receive_total())
         .fold(u64::from(DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW), u64::max);
     limits.quic.stream_receive_window_bytes =
         u32::try_from(registered_stream_window).unwrap_or(u32::MAX);

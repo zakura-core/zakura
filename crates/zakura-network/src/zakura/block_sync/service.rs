@@ -9,10 +9,10 @@ use super::{
 };
 use crate::zakura::{
     handle_pipe_exit, spawn_supervised_pipe, BudgetError, CloseOutcome, FramedRecv, FramedSend,
-    LocalRole, NeutralCause, OrderedSendError, Peer, PeerStreamSession, ReactorBudget, Service,
-    ServicePeerSnapshot, SessionDemand, SessionOpening, SessionPolicy, SinkReject, Stream,
-    StreamQueueDepths, ZakuraBlockSyncCandidateState, ZakuraConnId, ZakuraPeerId,
-    FRAME_HEADER_BYTES,
+    LocalRole, NeutralCause, OrderedSendError, Peer, PeerStreamSession, ReactorBudget,
+    ReceiveBudget, Service, ServicePeerSnapshot, SessionDemand, SessionOpening, SessionPolicy,
+    SinkReject, Stream, StreamQueueDepths, ZakuraBlockSyncCandidateState, ZakuraConnId,
+    ZakuraPeerId, FRAME_HEADER_BYTES,
 };
 
 /// Maximum frame bytes for one stream-6 body frame plus protocol framing.
@@ -83,26 +83,39 @@ pub const fn block_sync_reactor_budget(
         // A u8 discriminator always fits in u16.
         message_type: MSG_BS_BLOCK as u16,
     };
-    let table = match Stream::receive_bound(&BLOCK_SYNC_SERVICE_STREAMS, LocalRole::Responder) {
+    let table = match Stream::receive_bound_split(&BLOCK_SYNC_SERVICE_STREAMS, LocalRole::Responder)
+    {
         Ok(table) => table,
         Err(error) => return Err(error),
     };
+    // One maximal frame stays in `unsolicited` so block sync always passes
+    // `check_frame_cap` with zero active requests; `max_cwnd_bytes` plus
+    // `floor_bypass_slots` frames live in `per_request`.
+    let Some(unsolicited) = table.unsolicited.checked_add(MAX_BS_FRAME_BYTES as u64) else {
+        return Err(OVERFLOW);
+    };
     // Widening u32 to u64 is lossless.
-    let frames = floor_bypass_slots as u64 + 1;
-    let Some(frame_bytes) = frames.checked_mul(MAX_BS_FRAME_BYTES as u64) else {
+    let Some(bypass_bytes) = (floor_bypass_slots as u64).checked_mul(MAX_BS_FRAME_BYTES as u64)
+    else {
         return Err(OVERFLOW);
     };
-    let Some(receive) = table.checked_add(max_cwnd_bytes) else {
+    let Some(per_request) = max_cwnd_bytes.checked_add(bypass_bytes) else {
         return Err(OVERFLOW);
     };
-    let Some(receive) = receive.checked_add(frame_bytes) else {
+    if unsolicited.checked_add(per_request).is_none() {
         return Err(OVERFLOW);
-    };
+    }
     let largest = super::regulated::wire::LARGEST_SERVED_RESPONSE.output_bytes();
     let Some(output) = largest.checked_add(max_cwnd_bytes) else {
         return Err(OVERFLOW);
     };
-    Ok(ReactorBudget { receive, output })
+    Ok(ReactorBudget {
+        receive: ReceiveBudget {
+            unsolicited,
+            per_request,
+        },
+        output,
+    })
 }
 
 /// [`block_sync_reactor_budget`] at the default cwnd cap
@@ -1789,11 +1802,14 @@ mod reactor_budget_tests {
         assert_eq!(
             BLOCK_SYNC_REACTOR_BUDGET,
             ReactorBudget {
-                receive: table + 32 * 1024 * 1024 + 3 * frame,
+                receive: ReceiveBudget {
+                    unsolicited: table + frame,
+                    per_request: 32 * 1024 * 1024 + 2 * frame,
+                },
                 output: response + 32 * 1024 * 1024,
             }
         );
-        assert_eq!(BLOCK_SYNC_REACTOR_BUDGET.receive, 43_287_718);
+        assert_eq!(BLOCK_SYNC_REACTOR_BUDGET.receive_total(), 43_287_718);
         assert_eq!(BLOCK_SYNC_REACTOR_BUDGET.output, 35_554_458);
         let config = ZakuraBlockSyncConfig::default();
         assert_eq!(
@@ -1809,8 +1825,9 @@ mod reactor_budget_tests {
         let zero = block_sync_reactor_budget(0, 0).unwrap();
         assert!(zero.check_frame_cap(MAX_BS_FRAME_BYTES).is_ok());
         let more = block_sync_reactor_budget(1000, 4).unwrap();
+        assert_eq!(more.receive.unsolicited, zero.receive.unsolicited);
         assert_eq!(
-            more.receive - zero.receive,
+            more.receive.per_request - zero.receive.per_request,
             1000 + 4 * u64::from(MAX_BS_FRAME_BYTES)
         );
         assert_eq!(more.output - zero.output, 1000);

@@ -28,8 +28,8 @@ use crate::zakura::{
         BlockHash, Bool, BoundedReader, HeightLe, LeU16, LeU32, LeU64, List, Wire, WireError,
         WireMessage, U8,
     },
-    Cadence, Credit, LocalRole, MessageRole, MessageRule, PayloadLen, ReactorBudget, Stream,
-    StreamQueueDepths, FRAME_HEADER_BYTES, ZAKURA_CAP_HEADER_SYNC,
+    Cadence, Credit, LocalRole, MessageRole, MessageRule, PayloadLen, ReactorBudget, ReceiveBudget,
+    Stream, StreamQueueDepths, FRAME_HEADER_BYTES, ZAKURA_CAP_HEADER_SYNC,
 };
 
 /// The header sync stream version this module encodes.
@@ -275,18 +275,34 @@ pub fn budget(network: &zakura_chain::parameters::Network) -> ReactorBudget {
 /// The budget of `layout`, the version 9 layout of a network whose headers
 /// take `header_bytes`. [`Message::BUDGET`] explains each term.
 const fn layout_budget(layout: &[Stream], header_bytes: usize) -> ReactorBudget {
-    let subscriber = match Stream::receive_bound(layout, LocalRole::Requester) {
+    let subscriber = match Stream::receive_bound_split(layout, LocalRole::Requester) {
         Ok(bytes) => bytes,
         Err(error) => panic!("{}", error.rule()),
     };
-    let Some(receive) = subscriber.checked_add(update_bytes(header_bytes)) else {
-        panic!("the header sync receive share fits u64");
+    let Some(unsolicited) = subscriber
+        .unsolicited
+        .checked_add(update_bytes(header_bytes))
+    else {
+        panic!("the header sync unsolicited receive share fits u64");
     };
+    // Keep one maximal frame in `unsolicited` so header sync always passes
+    // `check_frame_cap` even with zero open subscription leases; move that
+    // largest page out of `per_request` so total credit stays unchanged.
+    let frame = largest_page(header_bytes) as u64 + FRAME_HEADER_BYTES as u64;
+    let Some(unsolicited) = unsolicited.checked_add(frame) else {
+        panic!("the header sync unsolicited receive share fits u64");
+    };
+    let per_request = subscriber
+        .per_request
+        .saturating_sub(largest_page(header_bytes) as u64);
     ReactorBudget {
-        receive,
+        receive: ReceiveBudget {
+            unsolicited,
+            per_request,
+        },
         output: serve_output_bytes(header_bytes),
     }
-    .assert_frame_cap(FRAME_CAP)
+    .assert_frame_cap(frame as u32)
 }
 
 /// Encoded bytes of the pages that the publisher may hold unwritten for one

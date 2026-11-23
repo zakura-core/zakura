@@ -639,7 +639,7 @@ async fn raw_connection() -> Result<(QuicEndpoint, QuicEndpoint, Connection, Con
 async fn serving_sets_the_window_to_the_negotiated_shares() -> Result<(), BoxError> {
     const KIB: u64 = 1024;
     let budget = |receive| ReactorBudget {
-        receive,
+        receive: ReceiveBudget::unsolicited_only(receive),
         output: 4 << 20,
     };
     let shares = ReactorShares {
@@ -1625,7 +1625,7 @@ async fn a_compat_response_stays_funded_until_its_frames_drop() -> Result<(), Bo
     let resources = node.connection(stream.capability);
 
     // A full exchange gate holds the exchange back before its stream opens.
-    let capacity = COMPAT_EXCHANGE_BUDGET.receive;
+    let capacity = COMPAT_EXCHANGE_BUDGET.receive_total();
     let saturated = resources.admit_compat_response(capacity).await;
     let blocked = write_outbound_request_frame(
         &connection,

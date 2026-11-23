@@ -37,7 +37,7 @@ use crate::zakura::{
         sample::WireSample,
         BlockHash, HeightLe, WireError,
     },
-    Cadence, Credit, Frame, MessageRole, MessageRule, PayloadLen, ReactorBudget,
+    Cadence, Credit, Frame, MessageRole, MessageRule, PayloadLen, ReactorBudget, ReceiveBudget,
 };
 
 /// The three networks. Mainnet and Testnet share a header size.
@@ -857,20 +857,26 @@ fn every_budget_holds_its_terms() {
     assert_eq!(
         CommonMessage::BUDGET,
         ReactorBudget {
-            receive: status + credit + 2_096_713 + 999_154,
+            receive: ReceiveBudget {
+                unsolicited: status + 999_154 + 2_096_713 + 8,
+                per_request: credit,
+            },
             output: 2 * (credit + 2_096_713),
         }
     );
-    assert_eq!(CommonMessage::BUDGET.receive, 11_557_919);
+    assert_eq!(CommonMessage::BUDGET.receive_total(), 11_557_927);
     assert_eq!(HEADER_SYNC_BUDGET, CommonMessage::BUDGET);
     assert_eq!(
         RegtestMessage::BUDGET,
         ReactorBudget {
-            receive: status + credit + 1_348_082 + 3_841_395,
+            receive: ReceiveBudget {
+                unsolicited: status + 3_841_395 + 1_348_082 + 8,
+                per_request: credit,
+            },
             output: 2 * (credit + 1_348_082),
         }
     );
-    assert_eq!(RegtestMessage::BUDGET.receive, 13_651_529);
+    assert_eq!(RegtestMessage::BUDGET.receive_total(), 13_651_537);
     assert_eq!(
         (CommonMessage::BUDGET.output, RegtestMessage::BUDGET.output),
         (20_970_642, 19_473_380)

@@ -56,7 +56,7 @@ use zakura_rt::{
 
 use crate::zakura::{
     regulation::{OutputByteBudget, OutputGrant, WeakOutputByteBudget},
-    ReactorBudget, Stream, FRAME_HEADER_BYTES,
+    ReactorBudget, ReceiveBudget, Stream, FRAME_HEADER_BYTES,
 };
 use zakura_chain::serialization::MAX_PROTOCOL_MESSAGE_LEN;
 
@@ -93,7 +93,7 @@ pub(crate) const COMPAT_EXCHANGE_MAX_BYTES: u64 =
 /// from the compatibility client's concurrent requests, which each hold at most
 /// one grant, not from the connection count.
 pub const COMPAT_EXCHANGE_BUDGET: ReactorBudget = ReactorBudget {
-    receive: COMPAT_EXCHANGE_MAX_BYTES,
+    receive: ReceiveBudget::unsolicited_only(COMPAT_EXCHANGE_MAX_BYTES),
     output: 0,
 };
 
@@ -127,7 +127,9 @@ impl ReactorShares {
             control_receive_bytes: u64::from(quic.receive_window_bytes),
             kinds: Vec::new(),
             other: ReactorBudget {
-                receive: u64::from(quic.stream_receive_window_bytes),
+                receive: ReceiveBudget::unsolicited_only(u64::from(
+                    quic.stream_receive_window_bytes,
+                )),
                 output: DEFAULT_REACTOR_OUTPUT_BYTES,
             },
         }
@@ -142,22 +144,32 @@ impl ReactorShares {
     }
 
     /// The QUIC receive window of a connection that negotiated `kinds`: the
-    /// handshake window plus each kind's receive share.
+    /// control share plus each kind's total receive share.
     pub fn receive_window(&self, kinds: impl IntoIterator<Item = u16>) -> u64 {
         kinds
             .into_iter()
             .fold(self.control_receive_bytes, |window, kind| {
-                window.saturating_add(self.share(kind).receive)
+                window.saturating_add(self.share(kind).receive_total())
             })
     }
 
-    /// The QUIC stream receive window: the largest receive share, so one
+    /// The static base receive window of a connection that negotiated `kinds`:
+    /// the control share plus each kind's unsolicited receive bytes.
+    pub fn base_receive_window(&self, kinds: impl IntoIterator<Item = u16>) -> u64 {
+        kinds
+            .into_iter()
+            .fold(self.control_receive_bytes, |window, kind| {
+                window.saturating_add(self.share(kind).receive.unsolicited)
+            })
+    }
+
+    /// The QUIC stream receive window: the largest total receive share, so one
     /// stream can carry its whole kind's share.
     pub fn stream_receive_window(&self) -> u64 {
         self.kinds
             .iter()
-            .map(|(_, share)| share.receive)
-            .fold(self.other.receive, u64::max)
+            .map(|(_, share)| share.receive_total())
+            .fold(self.other.receive_total(), u64::max)
     }
 }
 
@@ -222,13 +234,14 @@ impl ResourceEnvelope {
         let node_bytes =
             |connection_bytes: u64| connection_bytes.saturating_mul(connections as u64);
         let shares = limits.connection_shares;
+        let receive_total = shares.receive_total();
         let admitted_window =
-            u128::from(limits.control_receive_bytes.saturating_add(shares.receive))
+            u128::from(limits.control_receive_bytes.saturating_add(receive_total))
                 + u128::from(limits.send_window);
         let handshake_window =
             u128::from(limits.control_receive_bytes) + u128::from(limits.handshake_send_window);
         Self {
-            connection_raw_bytes: shares.receive,
+            connection_raw_bytes: receive_total,
             connection_output_bytes: shares.output,
             node_output_bytes: node_bytes(shares.output),
             compat_response_bytes: limits.compat_exchange_bytes,
@@ -308,7 +321,7 @@ fn check_kind_shares(
 ) -> Result<(), ShareBelowFrame> {
     for &(kind, _, frame) in kinds {
         let ReactorBudget { receive, output } = shares.share(kind);
-        for (direction, share) in [("receive", receive), ("output", output)] {
+        for (direction, share) in [("receive", receive.unsolicited), ("output", output)] {
             if share < frame {
                 return Err(ShareBelowFrame {
                     kind,
@@ -441,7 +454,7 @@ impl NodeResources {
             .filter(|(_, kind_capabilities, _)| capabilities & kind_capabilities != 0)
             .map(|(kind, ..)| (*kind, KindGates::new(self.shares.share(*kind))))
             .collect();
-        let compat_exchanges = FrameGate::new(COMPAT_EXCHANGE_BUDGET.receive);
+        let compat_exchanges = FrameGate::new(COMPAT_EXCHANGE_BUDGET.receive_total());
         self.live
             .lock()
             .expect("no usage report panics")
@@ -490,7 +503,7 @@ struct KindGates {
 impl KindGates {
     fn new(share: ReactorBudget) -> Self {
         Self {
-            raw: FrameGate::new(share.receive),
+            raw: FrameGate::new(share.receive_total()),
             output: FrameGate::new(share.output),
         }
     }
@@ -620,7 +633,7 @@ impl ConnectionResources {
     /// behavior.
     pub(crate) fn unconstrained(kinds: &[u16]) -> Self {
         let share = ReactorBudget {
-            receive: 1 << 30,
+            receive: ReceiveBudget::unsolicited_only(1 << 30),
             output: 1 << 30,
         };
         Self {
@@ -632,7 +645,7 @@ impl ConnectionResources {
                 .map(|kind| (*kind, KindGates::new(share)))
                 .collect(),
             receive_window: u64::MAX,
-            compat_exchanges: FrameGate::new(COMPAT_EXCHANGE_BUDGET.receive),
+            compat_exchanges: FrameGate::new(COMPAT_EXCHANGE_BUDGET.receive_total()),
         }
     }
 }

@@ -90,6 +90,22 @@ async fn prepared_delivery(confirm: bool) {
     .await
     .unwrap();
     assert_eq!(relay.tip.best_tip_height(), Some(Height(0)));
+    // A cache hit releases its admission slot even when this handle stays live.
+    let worker = tower::service_fn(|_| async { Ok::<_, BoxError>(Response::Nil) });
+    let mut buffer = Buffer::new(worker, 1);
+    let mut reads = PreparedReads::new(buffer.clone(), relay.pending.clone(), relay.tip.clone());
+    let reply = tower::Service::call(
+        reads.ready().await.unwrap(),
+        Request::BlocksByHash([solved.hash()].into_iter().collect()),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(reply, Response::Blocks(blocks) if blocks.len() == 1));
+    timeout(Duration::from_secs(2), buffer.ready())
+        .await
+        .expect("a prepared reply releases the reserved inbound slot")
+        .unwrap();
+
     let zakura_state::Response::Block(Some(fetched)) = receiver
         .state
         .clone()

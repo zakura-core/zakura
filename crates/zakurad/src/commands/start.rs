@@ -733,7 +733,7 @@ impl StartCmd {
                 .unwrap_or_else(JsonlTracer::noop),
             zakura_jsonl_trace::node_id(),
         );
-        let inbound = LoadShed::new(spawn_buffer(
+        let inbound_buffer = spawn_buffer(
             Timeout::new(
                 Inbound::new(
                     config.sync.full_verify_concurrency_limit,
@@ -748,6 +748,11 @@ impl StartCmd {
                 MAX_INBOUND_RESPONSE_TIME,
             ),
             inbound::downloads::MAX_INBOUND_CONCURRENCY,
+        );
+        let inbound = LoadShed::new(inbound::PreparedReads::new(
+            inbound_buffer,
+            pending_blocks.clone(),
+            latest_chain_tip.clone(),
         ));
 
         let advertised_services = Self::advertised_services(&config);

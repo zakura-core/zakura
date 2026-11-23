@@ -46,6 +46,8 @@ use super::sync::{BLOCK_DOWNLOAD_TIMEOUT, BLOCK_VERIFY_TIMEOUT};
 use InventoryResponse::*;
 
 mod cached_peer_addr_response;
+mod prepared_reads;
+pub(crate) use prepared_reads::PreparedReads;
 pub(crate) mod downloads;
 
 use cached_peer_addr_response::CachedPeerAddrResponse;
@@ -241,12 +243,10 @@ async fn block_by_hash_or_pending(
     hash: block::Hash,
 ) -> Result<Option<ServedBlock>, zn::BoxError> {
     let pending = pending_blocks.get_for_peer(hash);
-    let prepared = pending.as_ref().is_some_and(|body| {
-        body.pending_send
-            .as_ref()
-            .is_some_and(|permit| permit.prepared_bytes().is_some())
-    });
-    if prepared && latest_chain_tip.best_tip_hash() != Some(hash) {
+    if pending
+        .as_ref()
+        .is_some_and(|body| prepared_reads::can_serve(body, &latest_chain_tip, hash))
+    {
         return Ok(pending);
     }
 

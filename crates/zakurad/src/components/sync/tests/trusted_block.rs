@@ -40,7 +40,7 @@ use zakura_rpc::{
 
 use crate::{
     components::{
-        inbound::{Inbound, InboundSetupData},
+        inbound::{Inbound, InboundSetupData, PreparedReads},
         mempool::{Config as MempoolConfig, Mempool},
         sync::{gossip::gossip_best_tip_block_hashes, RecentSyncLengths, SyncStatus},
     },
@@ -216,6 +216,7 @@ impl Node {
             ),
             16,
         );
+        let inbound = PreparedReads::new(inbound, pending.clone(), tip.clone());
         let (advertisement_tx, advertisements) = mpsc::unbounded_channel();
         let (hold_body, body_held) = watch::channel(false);
         let (body_requested, body_requests) = mpsc::unbounded_channel();

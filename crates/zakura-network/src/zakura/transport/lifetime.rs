@@ -175,8 +175,10 @@ pub(crate) struct TransportLimits {
     /// compatibility client on a node that registers the legacy request kind, and
     /// zero otherwise.
     pub(crate) compat_exchange_bytes: u64,
-    /// The QUIC send window of one connection.
+    /// The QUIC send window of one admitted connection.
     pub(crate) send_window: u64,
+    /// The QUIC send window of one pending handshake connection.
+    pub(crate) handshake_send_window: u64,
     /// Connections the node admits.
     pub(crate) max_connections: usize,
     /// QUIC connections the node holds beyond the admitted ones.
@@ -220,16 +222,19 @@ impl ResourceEnvelope {
         let node_bytes =
             |connection_bytes: u64| connection_bytes.saturating_mul(connections as u64);
         let shares = limits.connection_shares;
-        let window = |receive: u64| u128::from(receive) + u128::from(limits.send_window);
+        let admitted_window =
+            u128::from(limits.control_receive_bytes.saturating_add(shares.receive))
+                + u128::from(limits.send_window);
+        let handshake_window =
+            u128::from(limits.control_receive_bytes) + u128::from(limits.handshake_send_window);
         Self {
             connection_raw_bytes: shares.receive,
             connection_output_bytes: shares.output,
             node_output_bytes: node_bytes(shares.output),
             compat_response_bytes: limits.compat_exchange_bytes,
             request_executions: connections.saturating_mul(usize::from(limits.max_open_streams)),
-            transport_credit_bytes: connections as u128
-                * window(limits.control_receive_bytes.saturating_add(shares.receive))
-                + limits.max_pending_handshakes as u128 * window(limits.control_receive_bytes),
+            transport_credit_bytes: connections as u128 * admitted_window
+                + limits.max_pending_handshakes as u128 * handshake_window,
         }
     }
 

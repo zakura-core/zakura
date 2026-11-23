@@ -152,6 +152,12 @@ impl ConnLimits {
         self.receive_window = Some(bytes);
         self
     }
+
+    /// Sets the connection-level send window.
+    pub fn with_send_window(mut self, bytes: u64) -> Self {
+        self.send_window = Some(bytes);
+        self
+    }
 }
 
 /// A connection's buffer and traffic state, published by its connection task

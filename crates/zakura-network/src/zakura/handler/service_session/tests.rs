@@ -670,12 +670,17 @@ async fn serving_sets_the_window_to_the_negotiated_shares() -> Result<(), BoxErr
     let remote = timeout(TEST_TIMEOUT, connections.recv())
         .await?
         .ok_or("missing connection")?;
-    // The handshake is over, and nothing raised the window yet.
+    // The handshake is over, and nothing raised the windows yet.
     tokio::time::sleep(zakura_quic::LOAD_INTERVAL * 2).await;
     assert_eq!(
         remote.load().receive_window,
         256 * KIB,
-        "the handshake share"
+        "the handshake receive share"
+    );
+    assert_eq!(
+        remote.load().send_window,
+        HANDSHAKE_SEND_WINDOW_BYTES,
+        "the small handshake send window"
     );
 
     let (sessions, _sessions) = mpsc::channel(1);
@@ -709,6 +714,7 @@ async fn serving_sets_the_window_to_the_negotiated_shares() -> Result<(), BoxErr
     );
     let remote_ip = Some(remote.admitted_ip());
     let served = remote.clone();
+    let admitted_send_window = local.admitted_send_window_bytes;
     let serving = AbortOnDropHandle::new(tokio::spawn(async move {
         handler
             .register_and_serve(
@@ -733,7 +739,9 @@ async fn serving_sets_the_window_to_the_negotiated_shares() -> Result<(), BoxErr
             .await
     }));
     timeout(TEST_TIMEOUT, async {
-        while remote.load().receive_window != (256 + 3 * 1024) * KIB {
+        while remote.load().receive_window != (256 + 3 * 1024) * KIB
+            || remote.load().send_window != admitted_send_window
+        {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })

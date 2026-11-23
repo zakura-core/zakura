@@ -94,8 +94,7 @@ pub use reactor::spawn_block_sync_reactor;
 pub(crate) use regulated::session::serving_limits as getblocks_serving_limits;
 pub use request::BlockSizeEstimate;
 pub(crate) use service::BLOCK_SYNC_SERVICE_STREAMS;
-#[cfg(test)]
-pub(crate) use service::MAX_BS_FRAME_BYTES;
+pub use service::MAX_BS_FRAME_BYTES;
 pub use service::{
     block_sync_reactor_budget, BlockSyncPeerSession, BlockSyncService, BLOCK_SYNC_REACTOR_BUDGET,
 };

@@ -219,6 +219,7 @@ fn the_envelope_sums_the_shares_of_every_connection() {
         },
         compat_exchange_bytes: 20 * MIB,
         send_window: 16 * MIB,
+        handshake_send_window: 16 * MIB,
         max_connections: 256,
         max_pending_handshakes: 32,
     });
@@ -335,6 +336,7 @@ fn the_compat_exchange_budget_holds_one_worst_case_exchange() {
         connection_shares: ReactorBudget::ZERO,
         compat_exchange_bytes,
         send_window: MIB,
+        handshake_send_window: MIB,
         max_connections: 92,
         max_pending_handshakes: 32,
     };

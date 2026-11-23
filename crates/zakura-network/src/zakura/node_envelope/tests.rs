@@ -62,6 +62,7 @@ fn limits() -> TransportLimits {
         },
         compat_exchange_bytes: 0,
         send_window: WINDOW,
+        handshake_send_window: WINDOW,
         max_connections: MAX_CONNECTIONS,
         max_pending_handshakes: 1,
     }
@@ -160,17 +161,27 @@ fn the_default_envelope_sums_the_reactor_shares() {
     assert_eq!(share(4), crate::zakura::DISCOVERY_BUDGET);
     assert_eq!(share(5), crate::zakura::HEADER_SYNC_BUDGET);
     assert_eq!(share(6), crate::zakura::BLOCK_SYNC_REACTOR_BUDGET);
-    assert_eq!(shares.control_receive_bytes, 32 * MIB);
+    assert_eq!(
+        shares.control_receive_bytes,
+        crate::zakura::CONTROL_RECEIVE_BYTES
+    );
     // The connection window and the stream window that carry the shares.
     assert_eq!(
         shares.receive_window(shares.kinds.iter().map(|(kind, _)| *kind)),
-        32 * MIB + 74_836_259
+        crate::zakura::CONTROL_RECEIVE_BYTES + 74_836_259
     );
     assert_eq!(
         u64::from(limits.quic.stream_receive_window_bytes),
         crate::zakura::BLOCK_SYNC_REACTOR_BUDGET.receive
     );
-    assert_eq!(u64::from(limits.quic.receive_window_bytes), 32 * MIB);
+    assert_eq!(
+        u64::from(limits.quic.receive_window_bytes),
+        crate::zakura::CONTROL_RECEIVE_BYTES
+    );
+    assert_eq!(
+        limits.quic.send_window_bytes,
+        crate::zakura::HANDSHAKE_SEND_WINDOW_BYTES
+    );
 
     let envelope =
         NodeEnvelope::for_node(&config, &limits, &[], 16).expect("the default config fits");
@@ -189,8 +200,8 @@ fn the_default_envelope_sums_the_reactor_shares() {
         envelope.transport_bytes,
         92 * u128::from(128 * MIB) + u128::from(288 * 20 * MIB)
     );
-    // 92 × 141,945,123 + 32 × 64 MiB + 256 MiB.
-    assert_eq!(envelope.quic_bytes, 15_474_870_420);
+    // 92 × 108,456,227 + 32 × 128 KiB + 256 MiB.
+    assert_eq!(envelope.quic_bytes, 10_250_602_644);
 }
 
 /// A custom stream kind takes the `other` share on a live connection, so the peer

@@ -37,9 +37,10 @@ use zakura_quic::SOCKET_DATAGRAM_QUEUE_BYTES;
 use super::{
     discovery::effective_discovery_connection_headroom,
     header_sync::v9::{CommonMessage, RegtestMessage},
-    ReactorBudget, BLOCK_SYNC_REACTOR_BUDGET, DEFAULT_ZAKURA_MAX_CONNECTIONS,
-    DEFAULT_ZAKURA_MAX_PENDING_HANDSHAKES, DEFAULT_ZAKURA_RECEIVE_WINDOW,
-    DEFAULT_ZAKURA_SEND_WINDOW, DISCOVERY_BUDGET, LEGACY_GOSSIP_BUDGET, LEGACY_REQUESTS_BUDGET,
+    ReactorBudget, BLOCK_SYNC_REACTOR_BUDGET, CONTROL_RECEIVE_BYTES,
+    DEFAULT_ZAKURA_MAX_CONNECTIONS, DEFAULT_ZAKURA_MAX_PENDING_HANDSHAKES,
+    DEFAULT_ZAKURA_SEND_WINDOW, DISCOVERY_BUDGET, HANDSHAKE_SEND_WINDOW_BYTES,
+    LEGACY_GOSSIP_BUDGET, LEGACY_REQUESTS_BUDGET,
 };
 
 const GIB: u64 = 1024 * 1024 * 1024;
@@ -54,10 +55,16 @@ const GIB: u64 = 1024 * 1024 * 1024;
 /// share needs the most: 256 MiB + 32 × 64 MiB + 92 × 144,030,963 B =
 /// 15,666,767,700 B.
 pub const DEFAULT_ZAKURA_PEER_MEMORY_BUDGET_BYTES: u64 = {
-    let mainnet = default_budget_need(default_connection_memory(CommonMessage::BUDGET));
-    let regtest = default_budget_need(default_connection_memory(RegtestMessage::BUDGET));
+    const fn with_tx(mut mem: ConnectionMemory) -> ConnectionMemory {
+        let tx_relay = super::tx_relay::wire::TX_RELAY_DATA_BUDGET.receive
+            + super::tx_relay::wire::TX_RELAY_STATE_BUDGET.receive;
+        mem.admitted_bytes = mem.admitted_bytes.saturating_add(tx_relay);
+        mem
+    }
+    let mainnet = default_budget_need(with_tx(default_connection_memory(CommonMessage::BUDGET)));
+    let regtest = default_budget_need(with_tx(default_connection_memory(RegtestMessage::BUDGET)));
     let need = if mainnet > regtest { mainnet } else { regtest };
-    // Widening u64 to u128 is lossless. The need is about 15 GiB, so its GiB
+    // Widening u64 to u128 is lossless. The need is about 11 GiB, so its GiB
     // count fits in u64.
     need.div_ceil(GIB as u128) as u64 * GIB
 };
@@ -112,27 +119,48 @@ pub struct ConnectionMemory {
 impl ConnectionMemory {
     /// The cost of a connection with these windows, where every admitted
     /// connection negotiates reactors whose receive shares sum to
-    /// `shares_receive_bytes`.
+    /// `shares_receive_bytes`, and handshakes share `send_window_bytes`.
     pub const fn new(
         handshake_receive_bytes: u64,
         shares_receive_bytes: u64,
         send_window_bytes: u64,
     ) -> Self {
-        let handshake_bytes = handshake_receive_bytes.saturating_add(send_window_bytes);
+        Self::with_handshake_send(
+            handshake_receive_bytes,
+            send_window_bytes,
+            shares_receive_bytes,
+            send_window_bytes,
+        )
+    }
+
+    /// The cost of a connection whose unauthenticated handshake holds
+    /// `handshake_receive_bytes + handshake_send_bytes`, and whose admitted
+    /// state holds `handshake_receive_bytes + shares_receive_bytes + admitted_send_bytes`.
+    pub const fn with_handshake_send(
+        handshake_receive_bytes: u64,
+        handshake_send_bytes: u64,
+        shares_receive_bytes: u64,
+        admitted_send_bytes: u64,
+    ) -> Self {
+        let handshake_bytes = handshake_receive_bytes.saturating_add(handshake_send_bytes);
+        let admitted_bytes = handshake_receive_bytes
+            .saturating_add(shares_receive_bytes)
+            .saturating_add(admitted_send_bytes);
         Self {
-            admitted_bytes: handshake_bytes.saturating_add(shares_receive_bytes),
+            admitted_bytes,
             handshake_bytes,
         }
     }
 }
 
-/// The cost of one connection at the default windows and reactor shares,
-/// with `header_sync` as the header sync share: 141,937,353 B on Mainnet and
-/// Testnet, and 144,030,963 B on Regtest.
+/// The cost of one connection at the derived control share, small handshake
+/// send window, and default reactor shares, with `header_sync` as the header
+/// sync share: 108,456,227 B on Mainnet and Testnet, and 110,549,837 B on
+/// Regtest, with 128 KiB per pending handshake.
 pub const fn default_connection_memory(header_sync: ReactorBudget) -> ConnectionMemory {
-    // Widening u32 to u64 is lossless.
-    ConnectionMemory::new(
-        DEFAULT_ZAKURA_RECEIVE_WINDOW as u64,
+    ConnectionMemory::with_handshake_send(
+        CONTROL_RECEIVE_BYTES,
+        HANDSHAKE_SEND_WINDOW_BYTES,
         LEGACY_GOSSIP_BUDGET.receive
             + LEGACY_REQUESTS_BUDGET.receive
             + DISCOVERY_BUDGET.receive
@@ -279,10 +307,11 @@ mod tests {
     use crate::{zakura::ZakuraLocalLimits, Config};
 
     const MIB: u64 = 1024 * 1024;
-    /// One admitted Mainnet connection at the default windows and shares.
-    const CONNECTION: u64 = 141_945_123;
-    /// One handshake at the default windows.
-    const HANDSHAKE: u64 = 64 * MIB;
+    const KIB: u64 = 1024;
+    /// One admitted Mainnet connection at the derived control share and default shares.
+    const CONNECTION: u64 = 108_456_227;
+    /// One pending handshake: 64 KiB control receive + 64 KiB handshake send.
+    const HANDSHAKE: u64 = 128 * KIB;
 
     fn mainnet() -> Network {
         Network::Mainnet
@@ -330,16 +359,16 @@ mod tests {
         );
         assert_eq!(
             default_connection_memory(RegtestMessage::BUDGET).admitted_bytes,
-            144_038_733
+            110_549_837
         );
         let config = ZakuraConfig::default();
         assert_eq!(config.connection_memory(&mainnet(), &[]), mainnet_memory);
-        assert_eq!(QuicConfig::default().connection_memory_bytes(), HANDSHAKE);
+        assert_eq!(QuicConfig::default().connection_memory_bytes(), 64 * MIB);
 
         assert_eq!(DEFAULT_ZAKURA_MAX_CONNECTIONS, 92);
-        // Regtest's need, 15,666,767,700 B, rounded up to a whole GiB.
-        assert_eq!(DEFAULT_ZAKURA_PEER_MEMORY_BUDGET_BYTES, 16_106_127_360);
-        assert_eq!(DEFAULT_ZAKURA_BUDGETED_CONNECTIONS, 96);
+        // Regtest + tx-relay need (~10.09 GiB), rounded up to a whole GiB (11 GiB).
+        assert_eq!(DEFAULT_ZAKURA_PEER_MEMORY_BUDGET_BYTES, 11 * GIB);
+        assert_eq!(DEFAULT_ZAKURA_BUDGETED_CONNECTIONS, 106);
         // Every admitted connection at its full window, every handshake, and the
         // one socket the default `listen_addr` binds fit on every network.
         for network in [
@@ -360,7 +389,7 @@ mod tests {
         }
         assert_eq!(
             config.quic_memory_bytes(&mainnet(), DEFAULT_ZAKURA_MAX_CONNECTIONS, &[]),
-            15_474_870_420
+            10_250_602_644
         );
         assert_eq!(
             config.quic_memory_bytes(
@@ -368,7 +397,7 @@ mod tests {
                 DEFAULT_ZAKURA_MAX_CONNECTIONS,
                 &[],
             ),
-            15_667_482_540
+            10_443_214_764
         );
     }
 
@@ -379,19 +408,19 @@ mod tests {
             max_connections: 256,
             ..ZakuraConfig::default()
         };
-        assert_eq!(config.budgeted_max_connections(&mainnet()), Ok(96));
+        assert_eq!(config.budgeted_max_connections(&mainnet()), Ok(106));
 
         // Without `listen_addr` the endpoint binds IPv4 and IPv6 loopback, so it
-        // reserves two socket queues: (15 GiB - 512 MiB - 32 × 64 MiB) / 141,937,353.
+        // reserves two socket queues.
         let config = ZakuraConfig {
             max_connections: 256,
             listen_addr: None,
             ..ZakuraConfig::default()
         };
-        assert_eq!(config.budgeted_max_connections(&mainnet()), Ok(94));
+        assert_eq!(config.budgeted_max_connections(&mainnet()), Ok(103));
 
         // Raising the windows lowers the cap instead of the throughput:
-        // (15 GiB - 256 MiB - 32 × 96 MiB) / (141,937,353 + 32 MiB).
+        // (11 GiB - 256 MiB - 32 × (64 MiB + 64 KiB)) / (64 MiB + 74,836,259 + 32 MiB).
         let config = ZakuraConfig {
             max_connections: 256,
             quic: QuicConfig {
@@ -400,16 +429,15 @@ mod tests {
             },
             ..ZakuraConfig::default()
         };
-        assert_eq!(config.budgeted_max_connections(&mainnet()), Ok(71));
+        assert_eq!(config.budgeted_max_connections(&mainnet()), Ok(53));
 
-        // So does raising the handshake headroom:
-        // (15 GiB - 256 MiB - 64 × 64 MiB) / 141,937,353.
+        // So does raising the handshake headroom (each handshake is only 128 KiB now).
         let config = ZakuraConfig {
             max_connections: 256,
-            max_pending_handshakes: 64,
+            max_pending_handshakes: 1024,
             ..ZakuraConfig::default()
         };
-        assert_eq!(config.budgeted_max_connections(&mainnet()), Ok(81));
+        assert_eq!(config.budgeted_max_connections(&mainnet()), Ok(105));
 
         // So does a larger reactor share: a 64 MiB cwnd cap adds 32 MiB.
         let mut config = ZakuraConfig {
@@ -421,7 +449,7 @@ mod tests {
             config.connection_memory(&mainnet(), &[]).admitted_bytes,
             CONNECTION + (32 << 20)
         );
-        assert!(config.budgeted_max_connections(&mainnet()).unwrap() < 96);
+        assert!(config.budgeted_max_connections(&mainnet()).unwrap() < 106);
 
         // A smaller cap stays as configured.
         let config = ZakuraConfig {
@@ -613,9 +641,9 @@ mod tests {
             ..ZakuraConfig::default()
         };
         let error = config.budgeted_max_connections(&mainnet()).unwrap_err();
-        // 32 handshakes of (1024 + 32) MiB alone exceed the 15 GiB budget.
+        // 32 handshakes of (1024 MiB + 64 KiB) alone exceed the 10 GiB budget.
         assert_eq!((error.headroom, error.admitted), (32, 0));
-        assert_eq!(error.handshake_bytes, (1024 + 32) * MIB);
+        assert_eq!(error.handshake_bytes, 1024 * MIB + 64 * KIB);
         // Mainnet's 9 bootstrap peers, counting one as possibly this node.
         assert_eq!(error.required, 17);
         assert!(error

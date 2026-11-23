@@ -140,6 +140,7 @@ fn limits(shares: &ReactorShares, peers: usize) -> TransportLimits {
         },
         compat_exchange_bytes: 0,
         send_window: u64::from(DEFAULT_ZAKURA_RECEIVE_WINDOW),
+        handshake_send_window: u64::from(DEFAULT_ZAKURA_RECEIVE_WINDOW),
         max_connections: peers,
         max_pending_handshakes: 1,
     }

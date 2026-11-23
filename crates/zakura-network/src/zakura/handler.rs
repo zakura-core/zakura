@@ -190,12 +190,77 @@ pub const ZAKURA_DUPLICATE_EVICT_MIN_AGE: Duration = Duration::from_secs(300);
 /// resolution (milliseconds) so a genuine race keeps the transcript-tiebreak
 /// winner instead of flapping.
 pub const ZAKURA_SAME_IP_DUPLICATE_EVICT_MIN_AGE: Duration = Duration::from_secs(5);
+/// Minimum QUIC receive or send window allowed by `QuicConfig::validate` (64 KiB).
+pub const MIN_QUIC_WINDOW_BYTES: u64 = 64 * 1024;
+
+/// Control stream rules for the handshake (`ControlHello` + `ControlAck`),
+/// each bounded by [`MAX_CONTROL_PAYLOAD_BYTES`] plus its 4-byte length prefix.
+const CONTROL_FRAME_CAP_BYTES: usize = MAX_CONTROL_PAYLOAD_BYTES + CONTROL_LENGTH_BYTES;
+const CONTROL_RULES: [super::MessageRule; 2] = [
+    super::MessageRule {
+        name: "control-hello",
+        message_type: 1,
+        payload: super::PayloadLen::between(1, CONTROL_FRAME_CAP_BYTES),
+        role: super::MessageRole::Request {
+            max_in_flight: 1,
+            cadence: None,
+        },
+    },
+    super::MessageRule {
+        name: "control-ack",
+        message_type: 2,
+        payload: super::PayloadLen::between(1, CONTROL_FRAME_CAP_BYTES),
+        role: super::MessageRole::Response {
+            request: 1,
+            ends_exchange: true,
+        },
+    },
+];
+
+/// Control stream layout used to derive [`CONTROL_RECEIVE_BYTES`] through
+/// [`Stream::receive_bound`].
+const CONTROL_STREAM_LAYOUT: [Stream; 1] = [Stream {
+    kind: 0,
+    version: 1,
+    frame_cap: (CONTROL_FRAME_CAP_BYTES + FRAME_HEADER_BYTES) as u32,
+    capability: 0,
+    messages: Some(&CONTROL_RULES),
+    ..Stream::PERSISTENT
+}];
+
+const _: () = Stream::validate_layout(&CONTROL_STREAM_LAYOUT);
+
+/// Control stream receive bound derived directly from [`CONTROL_STREAM_LAYOUT`]
+/// via [`Stream::receive_bound`] (`32,776 B`).
+pub const DERIVED_CONTROL_RECEIVE_BYTES: u64 =
+    match Stream::receive_bound(&CONTROL_STREAM_LAYOUT, super::LocalRole::Both) {
+        Ok(bytes) => bytes,
+        Err(error) => panic!("{}", error.rule()),
+    };
+
+/// Control share of a connection's receive window: [`DERIVED_CONTROL_RECEIVE_BYTES`]
+/// floored to QUIC's [`MIN_QUIC_WINDOW_BYTES`] (`64 KiB`), replacing the 32 MiB
+/// `DEFAULT_ZAKURA_RECEIVE_WINDOW` for Zakura connections.
+pub const CONTROL_RECEIVE_BYTES: u64 = if DERIVED_CONTROL_RECEIVE_BYTES > MIN_QUIC_WINDOW_BYTES {
+    DERIVED_CONTROL_RECEIVE_BYTES
+} else {
+    MIN_QUIC_WINDOW_BYTES
+};
+
+/// Send window held by an unauthenticated pending handshake (`64 KiB`).
+///
+/// Before authentication finishes, only `ControlHello` / `ControlAck` (capped at
+/// 16 KiB) are sent; `serve_connection` raises the send window once the peer is
+/// admitted.
+pub const HANDSHAKE_SEND_WINDOW_BYTES: u64 = MIN_QUIC_WINDOW_BYTES;
+
 /// A paused stream may consume at most half the connection receive window,
 /// leaving credit for another service stream.
 pub const DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW: u32 = 16 * 1024 * 1024;
-/// QUIC connection receive window used by Zakura endpoints.
+/// Default `QuicConfig` connection receive window (32 MiB). Zakura connections
+/// replace this with [`CONTROL_RECEIVE_BYTES`] unless explicitly overridden.
 pub const DEFAULT_ZAKURA_RECEIVE_WINDOW: u32 = 32 * 1024 * 1024;
-/// QUIC send window used by Zakura endpoints.
+/// QUIC send window used by Zakura endpoints after admission.
 pub const DEFAULT_ZAKURA_SEND_WINDOW: u64 = 32 * 1024 * 1024;
 /// Minimum wait before redialing a peer that answered with another ALPN, so a
 /// node doesn't redial another protocol cohort in a loop (zakura-quic DIAL-5).
@@ -537,10 +602,22 @@ impl ZakuraConfig {
             kinds.push((BPV1_CONTROL_KIND, BPV1_CONTROL_BUDGET));
             kinds.push((BPV1_DATA_KIND, BPV1_DATA_BUDGET));
         }
+        let control_receive_bytes =
+            if self.quic.receive_window_bytes == DEFAULT_ZAKURA_RECEIVE_WINDOW {
+                CONTROL_RECEIVE_BYTES
+            } else {
+                u64::from(self.quic.receive_window_bytes)
+            };
         ReactorShares {
+            control_receive_bytes,
             kinds,
             ..ReactorShares::from_quic(&self.quic)
         }
+    }
+
+    /// The QUIC send window held while a connection is still in its handshake.
+    pub fn handshake_send_window_bytes(&self) -> u64 {
+        HANDSHAKE_SEND_WINDOW_BYTES.min(self.quic.send_window_bytes)
     }
 
     /// What one connection on `network` costs the peer memory budget, when it
@@ -558,8 +635,9 @@ impl ZakuraConfig {
             .map(|(_, share)| share.receive)
             .chain(custom_kinds.iter().map(|kind| shares.share(*kind).receive))
             .fold(0_u64, u64::saturating_add);
-        ConnectionMemory::new(
+        ConnectionMemory::with_handshake_send(
             shares.control_receive_bytes,
+            self.handshake_send_window_bytes(),
             kinds,
             self.quic.send_window_bytes,
         )
@@ -705,6 +783,10 @@ pub struct ZakuraLocalLimits {
     /// Each stream kind's receive and output share on one connection. Unset,
     /// [`ReactorShares::from_quic`] derives them from `quic`'s windows.
     pub reactor_shares: Option<ReactorShares>,
+    /// Connection-level QUIC send window applied once a connection finishes its
+    /// control handshake and is admitted. While handshaking, `quic.send_window_bytes`
+    /// stays small ([`HANDSHAKE_SEND_WINDOW_BYTES`]).
+    pub admitted_send_window_bytes: u64,
 }
 
 impl ZakuraLocalLimits {
@@ -718,6 +800,7 @@ impl ZakuraLocalLimits {
     /// The peer memory budget charges each connection for them.
     pub fn for_node(config: &Config, custom_kinds: &[u16]) -> Self {
         let handshake = ZakuraHandshakeConfig::for_network(&config.network);
+        let admitted_send_window_bytes = config.zakura.quic.send_window_bytes;
         Self {
             quic: config.zakura.quic.clone(),
             // The floor only decides whether endpoint startup refuses the
@@ -746,13 +829,14 @@ impl ZakuraLocalLimits {
             max_open_streams: handshake.max_open_streams,
             max_inbound_queue_depth: handshake.max_inbound_queue_depth,
             reactor_shares: None,
+            admitted_send_window_bytes,
         }
         .with_reactor_shares(config.zakura.reactor_shares(&config.network))
     }
 
     /// These limits with `shares`, and the QUIC windows that carry them: the
-    /// connection window starts at the handshake share, and the stream window
-    /// holds the largest receive share.
+    /// connection receive and send windows start at the small handshake shares,
+    /// and the stream receive window holds the largest receive share.
     ///
     /// The connection cap stays, so only [`Self::for_node`] calls this, with
     /// the shares that the cap was budgeted from.
@@ -761,6 +845,8 @@ impl ZakuraLocalLimits {
             u32::try_from(shares.control_receive_bytes).unwrap_or(u32::MAX);
         self.quic.stream_receive_window_bytes =
             u32::try_from(shares.stream_receive_window()).unwrap_or(u32::MAX);
+        self.quic.send_window_bytes =
+            HANDSHAKE_SEND_WINDOW_BYTES.min(self.admitted_send_window_bytes);
         self.reactor_shares = Some(shares);
         self
     }
@@ -868,7 +954,8 @@ impl ZakuraLocalLimits {
             control_receive_bytes: shares.control_receive_bytes,
             connection_shares,
             compat_exchange_bytes,
-            send_window: self.quic.send_window_bytes,
+            send_window: self.admitted_send_window_bytes,
+            handshake_send_window: self.quic.send_window_bytes,
             max_connections: self.max_connections,
             max_pending_handshakes: self.max_pending_handshakes,
         }
@@ -3944,11 +4031,12 @@ impl ZakuraProtocolHandler {
                 connection_resources.probe(connection.load_probe(), &stream_sem, limits),
             );
         }
-        // Set once, for the kinds this connection negotiated (zakura-quic
-        // API-9). The handshake window stays inside it for the control stream.
+        // Raise the receive and send windows once the peer is admitted
+        // (zakura-quic API-9). The control share stays inside the receive window.
         let _ = connection.set_limits(
             zakura_quic::ConnLimits::default()
-                .with_receive_window(connection_resources.receive_window()),
+                .with_receive_window(connection_resources.receive_window())
+                .with_send_window(self.limits.admitted_send_window_bytes),
         );
         let mut workers = JoinSet::new();
         let (session_exit_tx, mut session_exit_rx) = mpsc::unbounded_channel();

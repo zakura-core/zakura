@@ -123,7 +123,10 @@ pub(super) async fn run<S, Tip>(
             Step::Republish => true,
         };
 
-        if report || Instant::now() >= republish_at {
+        // Whether the tip is fresh enough to mine on depends on the clock, so a
+        // long run of reads must not keep the ranking from being published again.
+        let republish_due = Instant::now() >= republish_at;
+        if report || republish_due {
             let snapshot = tracker.snapshot();
             record_metrics(&snapshot);
             publisher.publish(&snapshot);

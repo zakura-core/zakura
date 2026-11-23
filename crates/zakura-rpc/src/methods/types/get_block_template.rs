@@ -1247,9 +1247,9 @@ pub fn synced_to_tip(
 /// Returns an error if the local best tip's block time is more than
 /// [`MAX_TIME_SINCE_CHAIN_TIP`] older than the local clock.
 ///
-/// Returns early with `Ok(())` on test networks.
-/// This error might be incorrect if the local clock is skewed.
-/// [`synced_to_tip`] decides.
+/// [`synced_to_tip`] decides; this turns its answer into the RPC error and
+/// logs a tip that is too old. It returns early with `Ok(())` on test
+/// networks, and the error might be incorrect if the local clock is skewed.
 pub fn check_synced_to_tip<Tip>(network: &Network, latest_chain_tip: Tip) -> RpcResult<()>
 where
     Tip: ChainTip + Clone + Send + Sync + 'static,

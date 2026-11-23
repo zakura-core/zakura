@@ -28,7 +28,13 @@ async fn primary_confirmation_serves_solved_bytes_while_proposal_and_commit_are_
 async fn prepared_delivery(confirm: bool) {
     let _init = zakura_test::init();
     let mut relay = Node::new(None).await;
-    let receiver = Node::new(Some(relay.p2p)).await;
+    let mut receiver = Node::with_stack(
+        Some(relay.p2p),
+        P2pStack::Legacy,
+        PeerServices::NODE_NETWORK | PeerServices::NODE_BLOCK_PUSH,
+    )
+    .await;
+    let mut requesting_peer = wire::WirePeer::connect(&relay).await;
     relay.connected().await;
     receiver.connected().await;
     let candidate = relay.template().await;
@@ -76,12 +82,30 @@ async fn prepared_delivery(confirm: bool) {
         .await
         .unwrap();
         assert!(relay.pending.get(solved.hash()).is_none());
-        assert_eq!(post(&relay, "confirm", receipt).await, StatusCode::ACCEPTED);
+        for _ in 0..2 {
+            assert_eq!(
+                post(&relay, "confirm", receipt.clone()).await,
+                StatusCode::ACCEPTED
+            );
+        }
     } else {
         relay.hold_proposal.send_replace(false);
     }
     assert_eq!(relay.gate.entered().await, solved.hash());
     assert_eq!(post(&relay, "solve", header).await, StatusCode::ACCEPTED);
+    // Only an unsolicited wire block becomes an inbound PushBlock request.
+    assert_eq!(
+        timeout(Duration::from_secs(20), receiver.pushed_blocks.recv())
+            .await
+            .unwrap(),
+        Some(bytes.clone())
+    );
+    requesting_peer.announced(solved.hash()).await;
+    assert_eq!(requesting_peer.count(solved.hash(), "getdata"), 0);
+    assert_eq!(requesting_peer.count(solved.hash(), "block"), 0);
+    requesting_peer.fetch(&solved).await;
+    assert_eq!(requesting_peer.count(solved.hash(), "getdata"), 1);
+    assert_eq!(requesting_peer.count(solved.hash(), "block"), 1);
     timeout(Duration::from_secs(20), async {
         while receiver.tip.best_tip_hash() != Some(solved.hash()) {
             tokio::task::yield_now().await;

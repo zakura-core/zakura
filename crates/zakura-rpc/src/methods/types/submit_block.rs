@@ -126,6 +126,15 @@ impl MinedBlockSubmission {
     }
 }
 
+/// The trusted endpoint operation that released the block for early delivery.
+#[derive(Clone, Copy, Debug)]
+pub enum TrustedBlockSource {
+    /// A full-block POST follows the configured relay push policy.
+    CompletePost,
+    /// A solved, released mining job uses the mined-block push policy.
+    PreparedJob,
+}
+
 /// The authority for relaying a local submission before commit.
 ///
 /// State-authorized relay stops waiting for readiness at commitment, but a dispatched broadcast
@@ -136,8 +145,8 @@ impl MinedBlockSubmission {
 pub enum EarlyBlockRelay {
     /// Consensus authorized relay and state admitted the candidate.
     StateAdmission(zakura_state::BlockAdmission),
-    /// An operator explicitly authorized relay before validation.
-    TrustedSubmission,
+    /// A trusted submission can be sent while local commitment is pending.
+    TrustedSubmission(TrustedBlockSource),
 }
 
 /// A local block eligible for announcement before commit.

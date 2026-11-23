@@ -83,7 +83,7 @@ pub(super) enum RelayPolicy {
         /// A complete POST establishes both by state lookups. A prepared job establishes them
         /// by requiring the parent to be the best tip, which does not exclude a copy still in
         /// the write queue; the duplicate verdict below settles that case.
-        early_relay: bool,
+        early_relay: Option<crate::TrustedBlockSource>,
         /// A duplicate verdict proves only that the header hash is known, not that the submitted
         /// transactions match the committed block, so it is resolved against the committed body.
         committed_block: CommittedBlockLookup,
@@ -100,7 +100,11 @@ impl RelayPolicy {
         }
     }
 
-    async fn wait_for_relay(&self, admission: &BlockAdmission, started: Instant) -> bool {
+    async fn wait_for_relay(
+        &self,
+        admission: &BlockAdmission,
+        started: Instant,
+    ) -> Option<EarlyBlockRelay> {
         match self {
             Self::AfterStateAdmission {
                 optimistic_block_inventory,
@@ -109,9 +113,12 @@ impl RelayPolicy {
                 let admitted = admission.wait().await;
                 metrics::histogram!("mining.state_admission.duration_seconds")
                     .record(started.elapsed().as_secs_f64());
-                admitted && admission.optimistic_relay_authorized() && *optimistic_block_inventory
+                (admitted && admission.optimistic_relay_authorized() && *optimistic_block_inventory)
+                    .then(|| EarlyBlockRelay::StateAdmission(admission.clone()))
             }
-            Self::TrustedSubmission { early_relay, .. } => *early_relay,
+            Self::TrustedSubmission { early_relay, .. } => {
+                early_relay.map(EarlyBlockRelay::TrustedSubmission)
+            }
         }
     }
 }
@@ -228,14 +235,14 @@ impl Submission {
                 // A completed verification supersedes the opportunity to relay early.
                 result = &mut verification => result,
                 authorized = policy.wait_for_relay(&admission, admission_start) => {
-                    if authorized {
-                        let (relay, registration) = match &policy {
+                    if let Some(relay) = authorized {
+                        let registration = match &policy {
                             RelayPolicy::AfterStateAdmission { pending_blocks, .. } => {
                                 admitted_registration = pending_blocks.insert_state_admitted(self.block.clone());
-                                (EarlyBlockRelay::StateAdmission(admission), admitted_registration.as_ref())
+                                admitted_registration.as_ref()
                             }
                             RelayPolicy::TrustedSubmission { registration, .. } => {
-                                (EarlyBlockRelay::TrustedSubmission, Some(registration))
+                                Some(registration)
                             }
                         };
                         if let Some(registration) = registration {

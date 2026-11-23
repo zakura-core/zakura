@@ -28,5 +28,6 @@ pub use methods::types::{
     submit_block::{
         EarlyBlockRelay, EarlyMinedBlock, EarlyMinedBlockChannel, MinedBlockSubmission,
         PendingBlockRegistration, PendingBlockRegistry, PendingBlockResolution, PendingBlockSignal,
+        TrustedBlockSource,
     },
 };

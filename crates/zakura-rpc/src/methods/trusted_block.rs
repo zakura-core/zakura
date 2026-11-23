@@ -3,7 +3,7 @@
 use super::*;
 
 pub(crate) mod jobs;
-use crate::server::trusted_block::TrustedSubmissionError;
+use crate::{server::trusted_block::TrustedSubmissionError, TrustedBlockSource};
 
 use super::submission_lifecycle::{
     committed_block_lookup, DuplicateBody, RelayPolicy, Submission, VerificationOutcome,
@@ -130,10 +130,13 @@ where
         };
         let registry = self.gbt.pending_blocks();
         let (registration, early_relay) = match body {
-            PeerBody::Prepared(bytes) => (registry.insert_prepared(block.clone(), bytes), true),
+            PeerBody::Prepared(bytes) => (
+                registry.insert_prepared(block.clone(), bytes),
+                Some(TrustedBlockSource::PreparedJob),
+            ),
             PeerBody::Serialized { early_relay } => (
                 registry.insert_trusted(block.clone(), early_relay),
-                early_relay,
+                early_relay.then_some(TrustedBlockSource::CompletePost),
             ),
         };
         let registration = registration.ok_or(TrustedSubmissionError::Capacity)?;

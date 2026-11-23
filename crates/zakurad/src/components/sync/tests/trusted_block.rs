@@ -101,6 +101,7 @@ struct Node {
     native_startup: Option<zakura_network::zakura::ZakuraHeaderSyncDriverStartup>,
     native_violations: mpsc::UnboundedReceiver<zakura_network::zakura::BlockSyncMisbehavior>,
     advertisements: mpsc::UnboundedReceiver<zakura_chain::block::Hash>,
+    pushed_blocks: mpsc::UnboundedReceiver<Vec<u8>>,
     state: State,
     verifier: Verifier,
     tip: zakura_state::LatestChainTip,
@@ -131,10 +132,10 @@ impl Drop for Node {
 
 impl Node {
     async fn new(seed: Option<SocketAddr>) -> Self {
-        Self::with_stack(seed, P2pStack::Legacy).await
+        Self::with_stack(seed, P2pStack::Legacy, PeerServices::NODE_NETWORK).await
     }
 
-    async fn with_stack(seed: Option<SocketAddr>, stack: P2pStack) -> Self {
+    async fn with_stack(seed: Option<SocketAddr>, stack: P2pStack, services: PeerServices) -> Self {
         let network = Network::new_regtest(
             ConfiguredActivationHeights {
                 nu5: Some(1),
@@ -145,6 +146,7 @@ impl Node {
         Self::with_network(
             seed,
             stack,
+            services,
             network,
             zakura_chain::block::genesis::regtest_genesis_block(),
         )
@@ -154,6 +156,7 @@ impl Node {
     async fn with_network(
         seed: Option<SocketAddr>,
         stack: P2pStack,
+        services: PeerServices,
         network: Network,
         genesis: Arc<Block>,
     ) -> Self {
@@ -216,6 +219,7 @@ impl Node {
             ),
             16,
         );
+        let (pushed, pushed_blocks) = mpsc::unbounded_channel();
         let (advertisement_tx, advertisements) = mpsc::unbounded_channel();
         let (hold_body, body_held) = watch::channel(false);
         let (body_requested, body_requests) = mpsc::unbounded_channel();
@@ -225,6 +229,11 @@ impl Node {
                 // Fixture bootstrap can advertise genesis before the submitted block.
                 if block.hash != genesis_hash {
                     let _ = advertisement_tx.send(block.hash);
+                }
+            }
+            if let Request::PushBlock(block, _) = &request {
+                if block.hash() != genesis_hash {
+                    let _ = pushed.send(block.zcash_serialize_to_vec().unwrap());
                 }
             }
             let body = matches!(&request, Request::BlocksByHash(_));
@@ -259,6 +268,7 @@ impl Node {
                 bootstrap_peers: vec![],
                 ..Default::default()
             },
+            push_relayed_blocks: false,
             max_connections_per_ip: 8,
             ..Default::default()
         };
@@ -267,7 +277,7 @@ impl Node {
             inbound,
             tip.clone(),
             "trusted submission test".into(),
-            PeerServices::NODE_NETWORK,
+            services,
             vec![],
             native_startup.clone(),
         )
@@ -521,6 +531,7 @@ impl Node {
             native_startup,
             native_violations,
             advertisements,
+            pushed_blocks,
             state,
             verifier: gated,
             tip,
@@ -596,7 +607,12 @@ fn faulty_body(block: &Block) -> Block {
 async fn trusted_rejection_cancels_held_relay_and_withdraws_body_before_peer_delivery() {
     let _init = zakura_test::init();
     let mut relay = Node::new(None).await;
-    let mut receiver = Node::new(Some(relay.p2p)).await;
+    let mut receiver = Node::with_stack(
+        Some(relay.p2p),
+        P2pStack::Legacy,
+        PeerServices::NODE_NETWORK | PeerServices::NODE_BLOCK_PUSH,
+    )
+    .await;
     relay.connected().await;
     receiver.connected().await;
     let valid = relay.template().await;
@@ -694,6 +710,7 @@ async fn trusted_rejection_cancels_held_relay_and_withdraws_body_before_peer_del
         panic!("the corrected body is fetched and committed by the receiver")
     };
     assert_eq!(fetched.zcash_serialize_to_vec().unwrap(), bytes);
+    assert!(receiver.pushed_blocks.try_recv().is_err());
     assert_eq!(relay.tip.best_tip_height(), Some(Height(0)));
     assert!(!retry.is_finished());
     relay.gate.release();
@@ -989,8 +1006,8 @@ async fn trusted_relay_after_gbt_validation() {
 #[tokio::test(flavor = "multi_thread")]
 async fn faulty_trusted_block_over_v2_compatibility_is_rejected_without_legacy_ip_ban() {
     let _init = zakura_test::init();
-    let mut relay = Node::with_stack(None, P2pStack::Dual).await;
-    let mut receiver = Node::with_stack(None, P2pStack::Dual).await;
+    let mut relay = Node::with_stack(None, P2pStack::Dual, PeerServices::NODE_NETWORK).await;
+    let mut receiver = Node::with_stack(None, P2pStack::Dual, PeerServices::NODE_NETWORK).await;
     let relay_endpoint = relay.endpoint.as_ref().unwrap();
     let receiver_endpoint = receiver.endpoint.as_ref().unwrap();
     let dial = relay_endpoint.spawn_native_dial(receiver_endpoint.node_addr().await);

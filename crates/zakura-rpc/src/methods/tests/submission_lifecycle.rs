@@ -62,7 +62,7 @@ async fn resolve_duplicate(reads_before_commit: Option<usize>) -> (Option<Duplic
         sender,
         RelayPolicy::TrustedSubmission {
             registration,
-            early_relay: false,
+            early_relay: None,
             committed_block: committed_block_lookup(read_state),
         },
         |outcome| outcome.duplicate_body,

@@ -515,25 +515,33 @@ where
         };
         let solved = bind_header(candidate, header)?;
         let header = solved.header.clone();
-        let (wire, confirmation) =
-            tokio::task::spawn_blocking(move || -> std::result::Result<_, JobError> {
-                let mut wire = header
-                    .zcash_serialize_to_vec()
-                    .map_err(|_| JobError::Invalid)?;
-                if wire.len().saturating_add(transactions.len())
-                    > usize::try_from(block::MAX_BLOCK_BYTES)
-                        .expect("block limit fits supported platforms")
-                {
-                    return Err(JobError::Invalid);
-                }
-                wire.extend_from_slice(&transactions);
-                let mut confirmation = [0; CONFIRMATION_BYTES];
-                confirmation[..32].copy_from_slice(&header.hash().0);
-                confirmation[32..].copy_from_slice(&Sha256::digest(&wire));
-                Ok((Arc::<[u8]>::from(wire), confirmation))
-            })
-            .await
-            .map_err(blocking_task_failed)??;
+        // The header has a fixed size for each network. Bound the transaction bytes we
+        // copy and hash here so small solves can skip a second blocking-pool round trip.
+        const INLINE_TRANSACTION_BYTES: usize = 4096;
+        let small = transactions.len() <= INLINE_TRANSACTION_BYTES;
+        let assemble = move || -> std::result::Result<_, JobError> {
+            let mut wire = header
+                .zcash_serialize_to_vec()
+                .map_err(|_| JobError::Invalid)?;
+            if wire.len().saturating_add(transactions.len())
+                > usize::try_from(block::MAX_BLOCK_BYTES)
+                    .expect("block limit fits supported platforms")
+            {
+                return Err(JobError::Invalid);
+            }
+            wire.extend_from_slice(&transactions);
+            let mut confirmation = [0; CONFIRMATION_BYTES];
+            confirmation[..32].copy_from_slice(&header.hash().0);
+            confirmation[32..].copy_from_slice(&Sha256::digest(&wire));
+            Ok((Arc::<[u8]>::from(wire), confirmation))
+        };
+        let (wire, confirmation) = if small {
+            assemble()
+        } else {
+            tokio::task::spawn_blocking(assemble)
+                .await
+                .map_err(blocking_task_failed)?
+        }?;
         sender.send_modify(|parts| {
             parts.expected_confirmation = Some(confirmation);
             // A confirmation that arrived before the solved bytes were known is kept only if

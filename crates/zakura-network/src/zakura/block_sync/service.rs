@@ -645,8 +645,8 @@ impl BlockSyncService {
             .filter(|record| record.direction == direction)
             .count();
         let cap = match direction {
-            ServicePeerDirection::Inbound => self.inner.config.peer_limits.max_inbound_peers,
-            ServicePeerDirection::Outbound => self.inner.config.peer_limits.max_outbound_peers,
+            ServicePeerDirection::Inbound => self.inner.config.peer_limits.max_inbound(),
+            ServicePeerDirection::Outbound => self.inner.config.peer_limits.max_outbound(),
         };
         count < cap
     }
@@ -830,12 +830,8 @@ impl Service for BlockSyncService {
                     .filter(|record| record.direction == peer.direction)
                     .count();
                 let cap = match peer.direction {
-                    ServicePeerDirection::Inbound => {
-                        self.inner.config.peer_limits.max_inbound_peers
-                    }
-                    ServicePeerDirection::Outbound => {
-                        self.inner.config.peer_limits.max_outbound_peers
-                    }
+                    ServicePeerDirection::Inbound => self.inner.config.peer_limits.max_inbound(),
+                    ServicePeerDirection::Outbound => self.inner.config.peer_limits.max_outbound(),
                 };
                 if count >= cap {
                     service_cancel_token.cancel();
@@ -1201,42 +1197,39 @@ mod requester_session_tests {
 
     fn with_session_slots(inbound: usize, outbound: usize) -> ZakuraBlockSyncConfig {
         let mut config = ZakuraBlockSyncConfig::default();
-        config.peer_limits.max_inbound_peers = inbound;
-        config.peer_limits.max_outbound_peers = outbound;
+        config.peer_limits.max_inbound_peers = Some(inbound);
+        config.peer_limits.max_outbound_peers = Some(outbound);
         config
     }
 
-    /// 3,633 slots fund one advertised request each; 3,634 cannot, so neither the
-    /// reactor nor the service starts and nothing is advertised.
+    /// Overflowing session slot counts still fail before either the reactor or
+    /// the service starts, while finite counts like `3,000 + 634` now succeed
+    /// because serving bookkeeping lives per-session inside `b_block_sync`
+    /// (`02 §8`) instead of dividing one fixed node-wide pool across sessions.
     #[tokio::test]
     async fn an_unfundable_config_fails_before_the_reactor_or_service_starts() {
-        for config in [
-            with_session_slots(3_000, 634),
-            with_session_slots(usize::MAX, usize::MAX),
-        ] {
-            assert!(matches!(
-                BlockSyncStartup::inert(
-                    config.clone(),
-                    crate::zakura::BlockSyncMemory::for_tests()
-                )
-                .and_then(spawn_block_sync_reactor),
-                Err(BlockSyncStartError::InvalidConfig(_))
-            ));
-            assert!(matches!(
-                BlockSyncService::new(config, crate::zakura::BlockSyncMemory::for_tests()),
-                Err(BlockSyncStartError::InvalidConfig(_))
-            ));
-        }
+        let overflowing = with_session_slots(usize::MAX, usize::MAX);
+        assert!(matches!(
+            BlockSyncStartup::inert(
+                overflowing.clone(),
+                crate::zakura::BlockSyncMemory::for_tests()
+            )
+            .and_then(spawn_block_sync_reactor),
+            Err(BlockSyncStartError::InvalidConfig(_))
+        ));
+        assert!(matches!(
+            BlockSyncService::new(overflowing, crate::zakura::BlockSyncMemory::for_tests()),
+            Err(BlockSyncStartError::InvalidConfig(_))
+        ));
 
         let service = BlockSyncService::new(
-            with_session_slots(3_000, 633),
+            with_session_slots(3_000, 634),
             crate::zakura::BlockSyncMemory::for_tests(),
         )
-        .expect("3,633 slots fund one request each");
+        .expect("per-session bookkeeping funds each session independently");
         let wiring = service.inner.routine_wiring.as_ref().unwrap();
-        assert_eq!(
-            super::super::regulated::session::serving_max_inflight_requests(&wiring.config),
-            1
+        assert!(
+            super::super::regulated::session::serving_max_inflight_requests(&wiring.config) >= 1
         );
     }
 
@@ -1759,8 +1752,8 @@ mod regulated_frame_tests {
     #[tokio::test]
     async fn reserved_regulated_session_uses_the_last_slot_in_either_direction() {
         let mut config = ZakuraBlockSyncConfig::default();
-        config.peer_limits.max_inbound_peers = 1;
-        config.peer_limits.max_outbound_peers = 1;
+        config.peer_limits.max_inbound_peers = Some(1);
+        config.peer_limits.max_outbound_peers = Some(1);
         config.peer_limits.max_pending_escalations = 2;
         let service = BlockSyncService::new_with_startup(
             BlockSyncStartup::inert(config, crate::zakura::BlockSyncMemory::for_tests())

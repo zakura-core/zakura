@@ -1073,7 +1073,7 @@ fn p2p_v2_old_config_without_zakura_fields_uses_safe_defaults() {
         default_testnet_zakura_bootstrap_peers()
     );
     assert!(!config.zakura.nat_traversal);
-    assert!(config.zakura.max_connections > 0);
+    assert!(config.zakura.effective_max_connections() > 0);
     assert_eq!(
         config.zakura.max_connections_per_ip,
         DEFAULT_ZAKURA_MAX_CONNS_PER_IP
@@ -1323,7 +1323,7 @@ fn zakura_bootstrap_peers_parse_in_nested_config() {
     assert!(config.v2_p2p());
     assert!(config.legacy_p2p());
     assert_eq!(config.zakura.bootstrap_peers.len(), 1);
-    assert_eq!(config.zakura.max_connections, 4);
+    assert_eq!(config.zakura.max_connections, Some(4));
     assert_eq!(
         config.zakura.max_connections_per_ip,
         DEFAULT_ZAKURA_MAX_CONNS_PER_IP
@@ -1346,7 +1346,7 @@ fn zakura_peer_memory_budget_lowers_or_refuses_at_load() {
         "#,
     )
     .unwrap();
-    assert_eq!(config.zakura.max_connections, 256);
+    assert_eq!(config.zakura.max_connections, Some(256));
     assert_eq!(
         config.zakura.budgeted_max_connections(&config.network),
         Ok(DEFAULT_ZAKURA_BUDGETED_CONNECTIONS)
@@ -1393,7 +1393,7 @@ fn zakura_peer_memory_budget_lowers_or_refuses_at_load() {
             bind.max_inbound_connections,
             bind.max_closing_connections
         ),
-        (124, 8, Some(93), 248)
+        (138, 8, Some(104), 276)
     );
 
     // With a 1 GiB receive window, the handshake headroom alone exceeds the
@@ -2743,13 +2743,11 @@ fn loaded_block_sync_session_slots_must_fund_one_request_each() {
 
     assert!(load(256, 256).is_ok(), "defaults load");
     assert!(load(0, 0).is_ok(), "zero slots load and serve nobody");
+    // Serving bookkeeping now lives in each session's `b_block_sync` lease
+    // (`02 §8`), so large explicit reactor caps validate cleanly while the
+    // memory pool caps how many sessions actually open.
     assert!(load(3_000, 633).is_ok());
-    for (inbound, outbound) in [(3_000, 634), (i64::MAX as u64, i64::MAX as u64)] {
-        let error = load(inbound, outbound)
-            .expect_err("unfundable session slots must not load")
-            .to_string();
-        assert!(error.contains("at most 3,633"), "unexpected error: {error}");
-    }
+    assert!(load(3_000, 634).is_ok());
 }
 
 /// The TCP ingress partition follows the connection limit and cannot overflow.

@@ -367,7 +367,7 @@ async fn maximum_sessions_continuous_serving_probe() {
     };
     let peers = env_or(
         "ZAKURA_PROBE_SESSIONS",
-        config.peer_limits.max_inbound_peers + config.peer_limits.max_outbound_peers,
+        config.peer_limits.max_inbound() + config.peer_limits.max_outbound(),
     );
     let window = env_or(
         "ZAKURA_PROBE_WINDOW",

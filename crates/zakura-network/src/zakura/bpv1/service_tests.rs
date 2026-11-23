@@ -70,7 +70,7 @@ fn config_default_is_opt_in_and_disabled_adds_zero_envelope_bytes() {
     assert!(cfg.zakura.bpv1.validate().is_ok());
     // Hold max_connections fixed under a generous peer memory budget so both
     // envelopes compare the exact same connection count.
-    cfg.zakura.max_connections = 8;
+    cfg.zakura.max_connections = Some(8);
 
     let limits = ZakuraLocalLimits::from_config(&cfg);
     let env_disabled = NodeEnvelope::for_node(&cfg, &limits, &[], 0).expect("disabled envelope");

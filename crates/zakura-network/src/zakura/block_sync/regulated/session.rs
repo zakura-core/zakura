@@ -18,16 +18,13 @@ use crate::zakura::{
     FramedSend, SinkReject, ZakuraPeerId,
 };
 
-/// Node-wide budget for queued GetBlocks bookkeeping across every live or retiring
-/// regulated session. Encoded output, storage reads, and transport buffers are
-/// budgeted separately.
-const BOOKKEEPING_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
 /// Per-session fixed and worker allowance, from the lifecycle allocation regression.
 const SESSION_ALLOWANCE_BYTES: u64 = 144 * 1024;
 /// Per-request ceiling from the lifecycle allocation regression.
 const BYTES_PER_REQUEST: u64 = 160;
-/// Per-session serving bookkeeping slot moved from the static 512 MiB cap
-/// into `b_block_sync` (`02 §8`: 512 MiB / 512 slots = 1 MiB per session).
+/// Per-session serving bookkeeping slot carried inside `b_block_sync` (`02 §8`:
+/// 1 MiB per block-sync session, replacing the old fixed 512 MiB node-wide cap
+/// divided across 512 static slots).
 pub(crate) const BLOCK_SYNC_SESSION_BOOKKEEPING_BYTES: u64 = 1024 * 1024;
 /// Node-wide read-and-encode jobs. A storage probe on cloned Mainnet and
 /// Testnet state (16 vCPUs, one block per response) reached 94% or more of
@@ -78,43 +75,46 @@ pub(crate) fn derived_serving_limits(
 
 /// The in-flight limit advertised to and enforced on regulated GetBlocks peers.
 ///
-/// A session's reservation outlives its queued jobs, so the inbound plus outbound
-/// session slots bound every session that can hold bookkeeping, including
-/// replacements still cleaning up. Each may hold `2 × limit` commitments (see
-/// `Serve`'s margin), so the limit is the configured advertisement capped at
-/// what fits [`BOOKKEEPING_BUDGET_BYTES`] across those sessions. The reactor
-/// refuses to start with a config that [`serving_sessions_fit_budget`] rejects,
-/// so a served limit is never zero. Local outbound sizing and older peers keep
-/// the configured value.
+/// Each block-sync session funds its own [`BLOCK_SYNC_SESSION_BOOKKEEPING_BYTES`]
+/// slot inside `b_block_sync` (`02 §8`). Each session may hold up to `2 × limit`
+/// commitments (see `Serve`'s margin), so the advertised limit is capped at what
+/// fits one session's bookkeeping slot (`2,816` requests per session).
 pub(crate) fn serving_max_inflight_requests(config: &ZakuraBlockSyncConfig) -> u32 {
     let configured = config.advertised_max_inflight_requests();
-    budgeted_inflight_requests(serving_sessions(config))
-        .map_or(configured, |budget| configured.min(budget))
+    if serving_sessions(config) == 0 {
+        configured
+    } else {
+        configured.min(per_session_budgeted_inflight_requests())
+    }
 }
 
-/// Whether even one request per session fits the bookkeeping budget, which
-/// holds for at most 3,633 inbound plus outbound session slots.
-pub(crate) fn serving_sessions_fit_budget(config: &ZakuraBlockSyncConfig) -> bool {
-    budgeted_inflight_requests(serving_sessions(config)) != Some(0)
+/// Whether serving sessions fit their per-session bookkeeping slot (`02 §8`).
+///
+/// Because each session brings its own [`BLOCK_SYNC_SESSION_BOOKKEEPING_BYTES`]
+/// slot inside `b_block_sync` instead of dividing a static 512 MiB pool, one
+/// session's bookkeeping always fits.
+pub(crate) fn serving_sessions_fit_budget(_config: &ZakuraBlockSyncConfig) -> bool {
+    per_session_budgeted_inflight_requests() > 0
 }
 
 /// Inbound plus outbound block-sync session slots.
 fn serving_sessions(config: &ZakuraBlockSyncConfig) -> usize {
     config
         .peer_limits
-        .max_inbound_peers
-        .saturating_add(config.peer_limits.max_outbound_peers)
+        .max_inbound()
+        .saturating_add(config.peer_limits.max_outbound())
 }
 
-/// The largest limit whose `2 × limit` commitments per session fit the budget
-/// across `sessions`. Zero when even one request per session exceeds it, and
-/// `None` when no session can be served.
-fn budgeted_inflight_requests(sessions: usize) -> Option<u32> {
-    let sessions = u64::try_from(sessions)
-        .ok()
-        .filter(|&sessions| sessions > 0)?;
-    let per_session = (BOOKKEEPING_BUDGET_BYTES / sessions).saturating_sub(SESSION_ALLOWANCE_BYTES);
-    Some(u32::try_from(per_session / (2 * BYTES_PER_REQUEST)).unwrap_or(u32::MAX))
+/// Largest advertised request limit whose `2 × limit` commitments plus fixed
+/// session allowance fit within [`BLOCK_SYNC_SESSION_BOOKKEEPING_BYTES`] (`2,816`).
+pub(crate) const fn per_session_budgeted_inflight_requests() -> u32 {
+    let per_session = BLOCK_SYNC_SESSION_BOOKKEEPING_BYTES.saturating_sub(SESSION_ALLOWANCE_BYTES);
+    let max_requests = per_session / (2 * BYTES_PER_REQUEST);
+    if max_requests > u32::MAX as u64 {
+        u32::MAX
+    } else {
+        max_requests as u32
+    }
 }
 
 /// One shared capacity pool for every production GetBlocks session.

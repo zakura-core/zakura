@@ -287,12 +287,7 @@ fn a_late_fault_cools_down_the_peer_and_refuses_its_redial() {
             ),
             "plan {index}: {session_facts:?}"
         );
-        assert!(
-            ZakuraHeaderSyncConfig::default()
-                .peer_limits
-                .max_inbound_peers
-                > 0
-        );
+        assert!(ZakuraHeaderSyncConfig::default().peer_limits.max_inbound() > 0);
         assert!(
             !session_facts.iter().any(|fact| matches!(
                 fact,

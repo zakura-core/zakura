@@ -1157,13 +1157,13 @@ async fn the_backed_off_set_is_sorted_for_the_services_search() {
 #[tokio::test(start_paused = true)]
 async fn faulting_identities_past_the_admitted_connections_keep_the_cooldown_cap() {
     let mut fixture = eviction_fixture(1, 7);
-    fixture.reactor.startup.config.peer_limits.max_inbound_peers = 1 << 20;
+    fixture.reactor.startup.config.peer_limits.max_inbound_peers = Some(1 << 20);
     fixture
         .reactor
         .startup
         .config
         .peer_limits
-        .max_outbound_peers = 1 << 20;
+        .max_outbound_peers = Some(1 << 20);
     fixture.reactor.startup.max_connections = 10;
     let limit = fixture.reactor.admitted_peer_limit();
     assert_eq!(limit, 10, "the admitted connections clamp the peer limits");
@@ -1217,8 +1217,8 @@ async fn the_peer_identity_cap_follows_the_smaller_limit_with_a_floor() {
     ];
     for (inbound, outbound, connections, cap) in cases {
         let startup = &mut fixture.reactor.startup;
-        startup.config.peer_limits.max_inbound_peers = inbound;
-        startup.config.peer_limits.max_outbound_peers = outbound;
+        startup.config.peer_limits.max_inbound_peers = Some(inbound);
+        startup.config.peer_limits.max_outbound_peers = Some(outbound);
         startup.max_connections = connections;
         assert_eq!(
             fixture.reactor.admitted_peer_limit(),
@@ -1242,8 +1242,8 @@ fn serving_and_lifecycle_follow_the_admitted_header_peers() {
     ];
     for (inbound, outbound, connections, peers) in cases {
         let mut startup = startup(CancellationToken::new());
-        startup.config.peer_limits.max_inbound_peers = inbound;
-        startup.config.peer_limits.max_outbound_peers = outbound;
+        startup.config.peer_limits.max_inbound_peers = Some(inbound);
+        startup.config.peer_limits.max_outbound_peers = Some(outbound);
         startup.max_connections = connections;
         let (handle, _actions, _reactor) =
             build_header_sync_reactor(startup).expect("the sizing fixture builds");

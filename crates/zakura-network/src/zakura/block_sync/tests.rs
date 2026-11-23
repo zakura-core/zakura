@@ -2207,14 +2207,13 @@ fn config_validate_rejects_degenerate_values() {
     };
     assert!(config.validate().is_err());
 
-    // Above 3,633 session slots, even one request per session exceeds the
-    // GetBlocks bookkeeping budget.
+    // Serving GetBlocks bookkeeping now comes from each session's own
+    // `b_block_sync` lease (`02 §8`), so large peer limits still validate and
+    // each admitted session funds its own fixed request cap.
     config = ZakuraBlockSyncConfig::default();
-    config.peer_limits.max_inbound_peers = 3_000;
-    config.peer_limits.max_outbound_peers = 633;
+    config.peer_limits.max_inbound_peers = Some(3_000);
+    config.peer_limits.max_outbound_peers = Some(634);
     assert!(config.validate().is_ok());
-    config.peer_limits.max_outbound_peers = 634;
-    assert!(config.validate().is_err());
 }
 
 #[test]
@@ -7920,7 +7919,7 @@ async fn disconnect_of_a_skipped_replacement_removes_the_older_handle() {
 #[tokio::test]
 async fn a_rejected_session_leaves_its_registry_entry_to_its_teardown() {
     let mut config = ZakuraBlockSyncConfig::default();
-    config.peer_limits.max_outbound_peers = 1;
+    config.peer_limits.max_outbound_peers = Some(1);
     let mut relayed = RelayedBlockSync::spawn(config);
     let (holder, rejected) = (peer(0x54), peer(0x55));
 
@@ -8157,8 +8156,8 @@ async fn registry_add_peer_requires_negotiated_block_sync_capability() {
 async fn wants_peer_rejects_when_configured_slot_cap_is_reached() {
     let config = ZakuraBlockSyncConfig {
         peer_limits: ServicePeerLimits {
-            max_inbound_peers: 0,
-            max_outbound_peers: 2,
+            max_inbound_peers: Some(0),
+            max_outbound_peers: Some(2),
             ..ServicePeerLimits::default()
         },
         ..ZakuraBlockSyncConfig::default()
@@ -8823,8 +8822,8 @@ fn add_outbound_block_sync_peer(
 #[tokio::test]
 async fn block_sync_add_peer_replaces_same_peer_even_at_full_cap() {
     let mut config = immediate_body_download_config();
-    config.peer_limits.max_outbound_peers = 1;
-    config.peer_limits.max_inbound_peers = 0;
+    config.peer_limits.max_outbound_peers = Some(1);
+    config.peer_limits.max_inbound_peers = Some(0);
     let (service, mut events) = BlockSyncService::new_for_test(config);
 
     // Keep every stream handle alive so the per-peer pipes are not torn down.
@@ -9662,7 +9661,7 @@ async fn routine_disconnect_returns_outstanding_and_releases_budget() {
     // be offered it.
     let mut config = immediate_body_download_config();
     config.request_timeout = Duration::from_secs(300);
-    config.peer_limits.max_outbound_peers = 4;
+    config.peer_limits.max_outbound_peers = Some(4);
     let blocks = mainnet_blocks_1_to_3();
     let (tip_tx, handle, mut actions, reactor_task, service) = spawn_genesis_service(config);
     let (peer_a, _a_in, mut a_out) = connect_peer_with_status(
@@ -9894,7 +9893,7 @@ async fn reactor_keeps_block_sync_peer_after_catch_up_and_reuses_later() {
     // bodies, so closing the stream after every local catch-up would starve fresh
     // Zakura-only nodes between checkpoint windows.
     let mut config = fill_loop_mechanics_config();
-    config.peer_limits.max_outbound_peers = 1;
+    config.peer_limits.max_outbound_peers = Some(1);
     let (_tip_tx, tip_rx) = watch::channel((block::Height(4), block::Hash([4; 32])));
     let startup = header_tip_startup(
         genesis_frontiers(),
@@ -10479,7 +10478,7 @@ async fn checkpoint_hole_disconnect_retries_first_missing_height_with_fresh_peer
     let mut config = immediate_body_download_config();
     config.max_inflight_block_bytes = Some(u64::MAX);
     config.request_timeout = Duration::from_secs(300);
-    config.peer_limits.max_outbound_peers = 1;
+    config.peer_limits.max_outbound_peers = Some(1);
     config.peer_limits.inbound_queue_depth = 128;
     // Keep the outbound queue wide enough that a fill pass never overflows it
     // and cancels the peer.

@@ -1573,8 +1573,8 @@ pub(super) fn admission_decision(
         return ServiceAdmissionDecision::Admit;
     }
     let cap = match direction {
-        ServicePeerDirection::Inbound => limits.max_inbound_peers,
-        ServicePeerDirection::Outbound => limits.max_outbound_peers,
+        ServicePeerDirection::Inbound => limits.max_inbound(),
+        ServicePeerDirection::Outbound => limits.max_outbound(),
     };
     if admitted_in_direction >= cap {
         ServiceAdmissionDecision::RejectFull

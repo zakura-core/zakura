@@ -378,7 +378,8 @@ const ZAKURA_CLOSE_OVERSIZE: u32 = 4;
 const ZAKURA_CLOSE_UNKNOWN_STREAM: u32 = 5;
 
 /// Native Zakura endpoint and handler configuration.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
 pub struct ZakuraConfig {
     /// Native Zakura bootstrap peers as `node_id@direct_addr`.
     ///
@@ -407,17 +408,28 @@ pub struct ZakuraConfig {
     /// The defaults reproduce the previous transport's behavior. See
     /// `docs/specs/zakura-quic.md` section 9 for every key and its range.
     pub quic: QuicConfig,
-    /// Total concurrent Zakura connections, inbound plus outbound.
+    /// Optional total concurrent Zakura connection policy cap (`N_cap`, `02 §8`).
     ///
+    /// When unset (`None`), defaults to `DEFAULT_SERVICE_MAX_PEERS` (256).
+    /// Operators may raise or lower it; `[memory] budget` funds live sessions
+    /// dynamically through `Consumer::Sessions`.
     /// Inbound peers leave a quarter of it, rounded down but at least one
     /// slot once it is 2 or more, free for this node's dials (see
     /// [`ZakuraLocalLimits::max_inbound_connections`]).
-    /// `[memory] budget` lowers a larger value at startup.
-    pub max_connections: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_connections: Option<usize>,
     /// Pre-resolved `[memory]` budget passed in from `zakurad` (`02 §2`,
     /// decision-2). Never serialized under `[network.zakura]`.
     #[serde(skip)]
     pub memory_budget: super::memory::ResolvedMemoryBudget,
+    /// Removed: the QUIC-only peer memory budget. `[memory] budget` replaces it.
+    #[serde(
+        rename = "peer_memory_budget_bytes",
+        skip_serializing,
+        deserialize_with = "reject_peer_memory_budget_bytes"
+    )]
+    #[doc(hidden)]
+    pub removed_peer_memory_budget_bytes: RemovedSetting,
     /// Maximum established Zakura connections admitted from one source IP.
     ///
     /// A global unicast IPv6 source counts by its /64, since one host can hold
@@ -483,82 +495,22 @@ pub struct ZakuraConfig {
     pub dev_network: Option<String>,
 }
 
-/// Deserialization shadow for [`ZakuraConfig`] so setting the removed
-/// `peer_memory_budget_bytes` key fails with a clear message naming
-/// `[memory] budget` (`02 §2`).
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields, default)]
-struct DZakuraConfig {
-    bootstrap_peers: Vec<String>,
-    listen_addr: Option<SocketAddr>,
-    nat_traversal: bool,
-    quic: QuicConfig,
-    max_connections: usize,
-    peer_memory_budget_bytes: Option<serde::de::IgnoredAny>,
-    max_connections_per_ip: usize,
-    max_pending_handshakes: usize,
-    stream_open_rate_per_second: u32,
-    message_rate_per_second: u32,
-    trace_dir: Option<PathBuf>,
-    trace_peer_names: BTreeMap<IpAddr, String>,
-    header_sync: ZakuraHeaderSyncConfig,
-    block_sync: ZakuraBlockSyncConfig,
-    tx_relay: super::ZakuraTxRelayConfig,
-    dev_network: Option<String>,
-}
+/// The place of a removed setting in a config struct. Every value fails to
+/// deserialize, so a config that still sets the key fails to load.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RemovedSetting;
 
-impl Default for DZakuraConfig {
-    fn default() -> Self {
-        let defaults = ZakuraConfig::default();
-        Self {
-            bootstrap_peers: defaults.bootstrap_peers,
-            listen_addr: defaults.listen_addr,
-            nat_traversal: defaults.nat_traversal,
-            quic: defaults.quic,
-            max_connections: defaults.max_connections,
-            peer_memory_budget_bytes: None,
-            max_connections_per_ip: defaults.max_connections_per_ip,
-            max_pending_handshakes: defaults.max_pending_handshakes,
-            stream_open_rate_per_second: defaults.stream_open_rate_per_second,
-            message_rate_per_second: defaults.message_rate_per_second,
-            trace_dir: defaults.trace_dir,
-            trace_peer_names: defaults.trace_peer_names,
-            header_sync: defaults.header_sync,
-            block_sync: defaults.block_sync,
-            tx_relay: defaults.tx_relay,
-            dev_network: defaults.dev_network,
-        }
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for ZakuraConfig {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let raw = <DZakuraConfig as serde::Deserialize>::deserialize(deserializer)?;
-        if raw.peer_memory_budget_bytes.is_some() {
-            return Err(serde::de::Error::custom(
-                "[network.zakura] peer_memory_budget_bytes has been removed; \
-                 configure [memory] budget instead",
-            ));
-        }
-        Ok(Self {
-            bootstrap_peers: raw.bootstrap_peers,
-            listen_addr: raw.listen_addr,
-            nat_traversal: raw.nat_traversal,
-            quic: raw.quic,
-            max_connections: raw.max_connections,
-            memory_budget: super::memory::ResolvedMemoryBudget::default(),
-            max_connections_per_ip: raw.max_connections_per_ip,
-            max_pending_handshakes: raw.max_pending_handshakes,
-            stream_open_rate_per_second: raw.stream_open_rate_per_second,
-            message_rate_per_second: raw.message_rate_per_second,
-            trace_dir: raw.trace_dir,
-            trace_peer_names: raw.trace_peer_names,
-            header_sync: raw.header_sync,
-            block_sync: raw.block_sync,
-            tx_relay: raw.tx_relay,
-            dev_network: raw.dev_network,
-        })
-    }
+/// Refuse `[network.zakura] peer_memory_budget_bytes` and name its
+/// replacement, `[memory] budget` (`02 §2`).
+fn reject_peer_memory_budget_bytes<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<RemovedSetting, D::Error> {
+    <serde::de::IgnoredAny as serde::Deserialize>::deserialize(deserializer)?;
+    Err(serde::de::Error::custom(
+        "[network.zakura] peer_memory_budget_bytes has been removed; \
+         configure [memory] budget instead",
+    ))
 }
 
 impl Default for ZakuraConfig {
@@ -571,8 +523,9 @@ impl Default for ZakuraConfig {
             listen_addr: Some(DEFAULT_ZAKURA_LISTEN_ADDR),
             nat_traversal: false,
             quic: QuicConfig::default(),
-            max_connections: DEFAULT_ZAKURA_MAX_CONNECTIONS,
+            max_connections: None,
             memory_budget: super::memory::ResolvedMemoryBudget::default(),
+            removed_peer_memory_budget_bytes: RemovedSetting,
             max_connections_per_ip: DEFAULT_ZAKURA_MAX_CONNS_PER_IP,
             max_pending_handshakes: DEFAULT_ZAKURA_MAX_PENDING_HANDSHAKES,
             stream_open_rate_per_second: DEFAULT_ZAKURA_STREAM_OPEN_RATE_PER_SECOND,
@@ -607,6 +560,14 @@ impl ZakuraConfig {
             key: "stream_receive_window_bytes",
             reason: format!("{error}; a stream window must hold the largest native frame"),
         })
+    }
+
+    /// Effective connection policy ceiling `N_cap` (`DEFAULT_SERVICE_MAX_PEERS` = 256
+    /// when unset, `02 §8`).
+    pub fn effective_max_connections(&self) -> usize {
+        self.max_connections
+            .unwrap_or(super::DEFAULT_SERVICE_MAX_PEERS)
+            .max(1)
     }
 
     /// Return the effective per-IP admission cap, preserving a non-zero limit.
@@ -768,7 +729,7 @@ impl ZakuraConfig {
         custom_kinds: &[u16],
     ) -> Result<usize, PeerMemoryBudgetError> {
         budgeted_max_connections(
-            self.max_connections,
+            self.effective_max_connections(),
             self.memory_budget.p2p_budget_b(),
             self.bound_socket_count(),
             self.connection_memory(network, custom_kinds),
@@ -877,18 +838,16 @@ impl ZakuraLocalLimits {
             quic: config.zakura.quic.clone(),
             // The floor only decides whether endpoint startup refuses the
             // config, so the cap is the budget's count either way.
-            max_connections: config
-                .zakura
-                .max_connections
-                .max(1)
-                .min(budget_admitted_connections(
+            max_connections: config.zakura.effective_max_connections().min(
+                budget_admitted_connections(
                     config.zakura.memory_budget.p2p_budget_b(),
                     config.zakura.bound_socket_count(),
                     config
                         .zakura
                         .connection_memory(&config.network, custom_kinds),
                     config.zakura.max_pending_handshakes.max(1),
-                )),
+                ),
+            ),
             max_pending_handshakes: config.zakura.max_pending_handshakes.max(1),
             quic_idle_timeout: config.zakura.quic.idle_timeout(),
             keep_alive_interval: config.zakura.quic.keep_alive_interval(),
@@ -1292,7 +1251,7 @@ impl ZakuraEndpoint {
     /// Returns the startup memory sizing plan enforced by this endpoint, if started
     /// through the production startup path.
     pub fn memory_plan(&self) -> Option<super::memory::MemoryPlan> {
-        self.memory_plan
+        self.memory_plan.clone()
     }
 
     /// Returns the node-wide memory pool owned by this endpoint.
@@ -1610,7 +1569,7 @@ impl ZakuraEndpoint {
     /// It doesn't serve inbound connections itself. Pass `handler` to
     /// `quic.serve` for those, and dial with [`Self::dial`].
     pub fn new(quic: QuicEndpoint, handler: ZakuraProtocolHandler) -> Self {
-        let memory_plan = handler.memory_plan;
+        let memory_plan = handler.memory_plan.clone();
         let memory_pool = handler.memory_pool.clone();
         Self {
             quic,
@@ -1674,7 +1633,7 @@ impl ZakuraEndpoint {
         header_sync_actions: Option<mpsc::Receiver<HeaderSyncAction>>,
         block_sync_actions: Option<mpsc::Receiver<BlockSyncAction>>,
     ) -> Self {
-        let memory_plan = handler.memory_plan;
+        let memory_plan = handler.memory_plan.clone();
         let memory_pool = handler.memory_pool.clone();
         Self {
             quic,
@@ -1715,6 +1674,9 @@ pub struct ZakuraSupervisorHandle {
     /// `tx-relay`'s live-session record, or `None` when `tx-relay` is not
     /// registered.
     tx_relay_sessions: Option<super::TxRelaySessions>,
+    /// The next connection ID. Admission reserves one before it leases
+    /// session memory, so the leases and the registration share it.
+    next_registration_id: Arc<zakura_rt::sync::atomic::AtomicU64>,
 }
 
 /// Connections charged to each source IP: registered connections, and inbound
@@ -1934,7 +1896,6 @@ struct ZakuraSupervisorState {
     ip_charges: HashMap<ZakuraConnId, IpAddr>,
     next_handoff_id: ZakuraHandoffId,
     max_connections_per_ip: usize,
-    next_registration_id: ZakuraConnId,
 }
 
 #[derive(Debug)]
@@ -2185,7 +2146,6 @@ impl ZakuraSupervisorHandle {
                 ip_charges: HashMap::new(),
                 next_handoff_id: 1,
                 max_connections_per_ip,
-                next_registration_id: 1,
             })),
             shutdown: CancellationToken::new(),
             peer_set_tx: watch::channel(Vec::new()).0,
@@ -2195,7 +2155,19 @@ impl ZakuraSupervisorHandle {
             ip_slots,
             max_connections_per_ip,
             tx_relay_sessions: None,
+            next_registration_id: Arc::new(zakura_rt::sync::atomic::AtomicU64::new(1)),
         }
+    }
+
+    /// Reserve the next connection ID, or `None` once IDs run out.
+    fn reserve_conn_id(&self) -> Option<ZakuraConnId> {
+        self.next_registration_id
+            .fetch_update(
+                zakura_rt::sync::atomic::Ordering::Relaxed,
+                zakura_rt::sync::atomic::Ordering::Relaxed,
+                |id| (id < u64::MAX).then(|| id + 1),
+            )
+            .ok()
     }
 
     /// This supervisor with `tx-relay`'s live-session record, which the
@@ -2346,10 +2318,38 @@ impl ZakuraSupervisorHandle {
         }
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     async fn register(
         &self,
         _trace_conn_id: ZakuraConnId,
+        peer_id: ZakuraPeerId,
+        remote_ip: Option<IpAddr>,
+        transcript_hash: [u8; TRANSCRIPT_HASH_BYTES],
+        outbound_handle: ZakuraPeerHandle,
+        disconnect_token: CancellationToken,
+        close_cause: CloseCause,
+        accepted_capabilities: u64,
+    ) -> ZakuraRegistration {
+        self.register_with_reserved_conn_id(
+            self.reserve_conn_id(),
+            peer_id,
+            remote_ip,
+            transcript_hash,
+            outbound_handle,
+            disconnect_token,
+            close_cause,
+            accepted_capabilities,
+        )
+        .await
+    }
+
+    /// Register an authenticated connection under `conn_id`, which
+    /// [`Self::reserve_conn_id`] reserved. `None` means IDs ran out.
+    #[allow(clippy::too_many_arguments)]
+    async fn register_with_reserved_conn_id(
+        &self,
+        conn_id: Option<ZakuraConnId>,
         peer_id: ZakuraPeerId,
         remote_ip: Option<IpAddr>,
         transcript_hash: [u8; TRANSCRIPT_HASH_BYTES],
@@ -2385,18 +2385,16 @@ impl ZakuraSupervisorHandle {
                 return ZakuraRegistration::Rejected(ZakuraRejectReason::ResourceLimit);
             }
         }
-        if state.next_registration_id == u64::MAX {
+        let Some(conn_id) = conn_id else {
             metrics::counter!("zakura.p2p.conn.rejected.admission").increment(1);
             return ZakuraRegistration::Rejected(ZakuraRejectReason::TemporaryUnavailable);
-        }
+        };
 
         match state
             .supervisor
             .register_authenticated(peer_id.clone(), transcript_hash)
         {
             AuthenticatedPeerRegistration::Registered => {
-                let conn_id = state.next_registration_id;
-                state.next_registration_id += 1;
                 self.pending_handoffs
                     .lock()
                     .expect("Zakura pending handoff mutex is never poisoned")
@@ -2557,6 +2555,7 @@ struct RegisteredPeerCleanupGuard {
     conn_id: ZakuraConnId,
     disconnect_token: CancellationToken,
     admitted_capabilities: u64,
+    session_funding: Option<Arc<SessionFunding>>,
     armed: bool,
 }
 
@@ -2575,7 +2574,21 @@ impl RegisteredPeerCleanupGuard {
             conn_id,
             disconnect_token,
             admitted_capabilities: 0,
+            session_funding: None,
             armed: true,
+        }
+    }
+
+    fn with_session_funding(mut self, session_funding: Option<Arc<SessionFunding>>) -> Self {
+        self.session_funding = session_funding;
+        self
+    }
+
+    /// Return the connection's session leases. Session workers may still hold
+    /// the funding, so this releases its leases rather than dropping it.
+    fn release_session_funding(&mut self) {
+        if let Some(funding) = self.session_funding.take() {
+            funding.release();
         }
     }
 
@@ -2598,6 +2611,7 @@ impl RegisteredPeerCleanupGuard {
             self.supervisor
                 .deregister(&self.peer_id, self.conn_id)
                 .await;
+            self.release_session_funding();
             self.armed = false;
         }
     }
@@ -2611,6 +2625,7 @@ impl Drop for RegisteredPeerCleanupGuard {
 
         self.disconnect_token.cancel();
         self.remove_admitted_services();
+        self.release_session_funding();
 
         let supervisor = self.supervisor.clone();
         let peer_id = self.peer_id.clone();
@@ -2619,6 +2634,161 @@ impl Drop for RegisteredPeerCleanupGuard {
             supervisor.deregister(&peer_id, conn_id).await;
         }));
     }
+}
+
+/// Why [`SessionFunding`] refused a connection or a session.
+#[derive(Debug, Error)]
+enum SessionFundingRefusal {
+    /// Connections in this direction hold all the sessions share they may
+    /// lease: inbound ones stop short of the dial reserve (`02 §8` rule 1).
+    #[error("connections in this direction hold their part of the sessions share")]
+    DirectionFull,
+    /// The pool refused the lease.
+    #[error("the memory pool refused the lease: {0:?}")]
+    Pool(super::memory::LeaseDenied),
+    /// The connection released its funding before the session arrived.
+    #[error("the connection released its session leases")]
+    Released,
+}
+
+/// One connection's `Consumer::Sessions` leases (`02 §8`): the bases its
+/// admission funded, plus each reactor's session part that a service
+/// admitted later. Releasing it, or dropping the last handle, returns every
+/// lease and the connection's charge in the direction ledger.
+#[derive(Debug)]
+struct SessionFunding {
+    pool: super::memory::MemoryPool,
+    directions: Arc<zakura_rt::sync::Mutex<super::memory::SessionDirections>>,
+    bases: super::memory::SessionBases,
+    sessions_share: u64,
+    conn_id: ZakuraConnId,
+    direction: ServicePeerDirection,
+    held: zakura_rt::sync::Mutex<HeldSessionLeases>,
+}
+
+#[derive(Debug)]
+struct HeldSessionLeases {
+    admission: Option<super::memory::ConnectionSessionLeases>,
+    top_ups: Vec<super::memory::PoolLease>,
+    /// The reactor capabilities whose session parts the leases hold.
+    funded_sessions: u64,
+    /// Bytes this connection charged to the direction ledger.
+    charged: u64,
+    released: bool,
+}
+
+impl SessionFunding {
+    /// Fund `cost`, which holds the session parts of `funded_sessions`, for
+    /// connection `conn_id` in `direction`: charge the direction ledger, then
+    /// lease every base together from the pool, waiting up to `wait_timeout`
+    /// for borrowed bytes to return.
+    #[allow(clippy::too_many_arguments)]
+    async fn acquire(
+        pool: &super::memory::MemoryPool,
+        plan: &super::memory::MemoryPlan,
+        directions: &Arc<zakura_rt::sync::Mutex<super::memory::SessionDirections>>,
+        conn_id: ZakuraConnId,
+        direction: ServicePeerDirection,
+        cost: super::memory::ConnectionSessionCost,
+        funded_sessions: u64,
+        shutdown: &CancellationToken,
+        wait_timeout: Duration,
+    ) -> Result<Self, SessionFundingRefusal> {
+        let charged = cost.total();
+        if !lock_session_directions(directions).try_charge(direction, charged, plan.sessions_share)
+        {
+            return Err(SessionFundingRefusal::DirectionFull);
+        }
+        // From here, dropping `funding` returns the charge.
+        let funding = Self {
+            pool: pool.clone(),
+            directions: directions.clone(),
+            bases: plan.bases,
+            sessions_share: plan.sessions_share,
+            conn_id,
+            direction,
+            held: zakura_rt::sync::Mutex::new(HeldSessionLeases {
+                admission: None,
+                top_ups: Vec::new(),
+                funded_sessions,
+                charged,
+                released: false,
+            }),
+        };
+        let leases = pool
+            .acquire_connection_session_leases(conn_id, cost, shutdown, wait_timeout)
+            .await
+            .map_err(SessionFundingRefusal::Pool)?;
+        funding.lock_held().admission = Some(leases);
+        Ok(funding)
+    }
+
+    /// Fund the session part of the reactor that `capability` names, after
+    /// its service admitted a session that admission didn't fund. A
+    /// connection funds each reactor once and keeps it until it closes.
+    fn fund_session(&self, capability: u64) -> Result<(), SessionFundingRefusal> {
+        let mut held = self.lock_held();
+        if held.released {
+            return Err(SessionFundingRefusal::Released);
+        }
+        let Some((reactor, bytes)) = self.bases.session_top_up(held.funded_sessions, capability)
+        else {
+            return Ok(());
+        };
+        if !lock_session_directions(&self.directions).try_charge(
+            self.direction,
+            bytes,
+            self.sessions_share,
+        ) {
+            return Err(SessionFundingRefusal::DirectionFull);
+        }
+        match self
+            .pool
+            .try_acquire(super::memory::Consumer::Sessions, Some(self.conn_id), bytes)
+        {
+            Ok(lease) => {
+                held.top_ups.push(lease);
+                held.funded_sessions |= reactor;
+                held.charged = held.charged.saturating_add(bytes);
+                Ok(())
+            }
+            Err(denied) => {
+                lock_session_directions(&self.directions).release(self.direction, bytes);
+                Err(SessionFundingRefusal::Pool(denied))
+            }
+        }
+    }
+
+    /// Return every lease and the direction charge. Later calls do nothing.
+    fn release(&self) {
+        let mut held = self.lock_held();
+        held.released = true;
+        held.admission = None;
+        held.top_ups.clear();
+        let charged = std::mem::take(&mut held.charged);
+        drop(held);
+        lock_session_directions(&self.directions).release(self.direction, charged);
+    }
+
+    fn lock_held(&self) -> zakura_rt::sync::MutexGuard<'_, HeldSessionLeases> {
+        self.held
+            .lock()
+            .unwrap_or_else(zakura_rt::sync::PoisonError::into_inner)
+    }
+}
+
+impl Drop for SessionFunding {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+fn lock_session_directions(
+    directions: &zakura_rt::sync::Mutex<super::memory::SessionDirections>,
+) -> zakura_rt::sync::MutexGuard<'_, super::memory::SessionDirections> {
+    directions
+        .lock()
+        .unwrap_or_else(zakura_rt::sync::PoisonError::into_inner)
 }
 
 struct IncomingStreamSetup {
@@ -2648,6 +2818,8 @@ struct StreamAdmission<'a> {
     connection_token: CancellationToken,
     close_cause: CloseCause,
     freshness_tx: watch::Sender<Instant>,
+    /// The connection's session leases, when a memory pool funds them.
+    session_funding: Option<&'a SessionFunding>,
 }
 
 struct ConnectionServeContext {
@@ -3107,6 +3279,8 @@ struct SessionOpenContext<'a> {
     peer_id: ZakuraPeerId,
     direction: ServicePeerDirection,
     session_exit_tx: mpsc::UnboundedSender<SessionExit>,
+    /// The connection's session leases, when a memory pool funds them.
+    session_funding: Option<&'a SessionFunding>,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -3381,6 +3555,9 @@ pub struct ZakuraProtocolHandler {
     serving_pool: Option<super::memory::ServingPool>,
     /// Startup memory plan enforced for this handler.
     memory_plan: Option<super::memory::MemoryPlan>,
+    /// `Consumer::Sessions` bytes leased by inbound and by outbound
+    /// connections, which keeps the dial reserve (`02 §8` rule 1).
+    session_directions: Arc<zakura_rt::sync::Mutex<super::memory::SessionDirections>>,
     /// Receives this handler's transport events.
     #[cfg(any(test, zakura_sim))]
     transport_observer: Option<Arc<dyn super::TransportObserver>>,
@@ -3495,6 +3672,7 @@ impl ZakuraProtocolHandler {
             memory_pool: None,
             serving_pool: None,
             memory_plan: None,
+            session_directions: Arc::default(),
             #[cfg(any(test, zakura_sim))]
             transport_observer: None,
         }
@@ -4141,6 +4319,7 @@ impl ZakuraProtocolHandler {
         let connection_token = context.connection_token;
         let close_cause = context.close_cause;
         let accepted_capabilities = context.accepted_capabilities;
+        let session_funding = cleanup_guard.session_funding.clone();
         let stream_sem = Arc::new(Semaphore::new(usize::from(limits.max_open_streams)));
         let limits_owner_bound = self.limits.owner_bound();
         let connection_resources = self.resources.connection(accepted_capabilities);
@@ -4313,6 +4492,7 @@ impl ZakuraProtocolHandler {
             peer_id: peer_id.clone(),
             direction: context.direction,
             session_exit_tx: session_exit_tx.clone(),
+            session_funding: session_funding.as_deref(),
         };
 
         if negotiated_ordered_streams.is_empty() {
@@ -4588,6 +4768,7 @@ impl ZakuraProtocolHandler {
                         connection_token: connection_token.clone(),
                         close_cause: close_cause.clone(),
                         freshness_tx: freshness_tx.clone(),
+                        session_funding: session_funding.as_deref(),
                     };
                     if let Some(admitted) = self.finish_bi_stream_setup(
                         setup, &mut admission, per_stream_queue_depth,
@@ -4695,6 +4876,7 @@ impl ZakuraProtocolHandler {
                                 connection_token: connection_token.clone(),
                                 close_cause: close_cause.clone(),
                                 freshness_tx: freshness_tx.clone(),
+                                session_funding: session_funding.as_deref(),
                             };
                             incoming_setup = self.begin_bi_stream_setup(send, recv, &mut admission);
                         }
@@ -4878,6 +5060,12 @@ impl ZakuraProtocolHandler {
             .expect("a selected stream has an owning service")
             .reserve_session(open.direction)
             .map_err(|_| ZakuraHandlerError::SessionFull)?;
+        // The service admitted the session, so its base is held now.
+        if let Some(funding) = open.session_funding {
+            funding
+                .fund_session(stream.capability)
+                .map_err(|_| ZakuraHandlerError::SessionFull)?;
+        }
         let prepared = members.into_iter().map(|member| {
             let mut member = self.prepare_opened_stream(
                 member,
@@ -5182,7 +5370,19 @@ impl ZakuraProtocolHandler {
             return None;
         };
         let resources = if let Some((layout, _)) = &session {
-            match pending_sessions.reserve_or_share(layout, &self.registry, admission.direction) {
+            let reserved = pending_sessions
+                .reserve_or_share(layout, &self.registry, admission.direction)
+                .and_then(|resources| {
+                    // The service admitted the session, so its base is held now.
+                    match admission.session_funding {
+                        Some(funding) => funding
+                            .fund_session(layout.primary().capability)
+                            .map(|()| resources)
+                            .map_err(|_| crate::zakura::SessionFull),
+                        None => Ok(resources),
+                    }
+                });
+            match reserved {
                 Ok(resources) => resources,
                 Err(_) => {
                     let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_RESOURCE));
@@ -5284,14 +5484,12 @@ impl ZakuraProtocolHandler {
 
         // Bound the precheck by the demanded service sessions that this connection can admit.
         // Count each symmetric session regardless of which endpoint opens it.
-        let ordered_stream_count = self
-            .registry
-            .persistent_streams_for_escalation(
-                context.accepted_capabilities,
-                &peer_id,
-                context.direction,
-            )
-            .len();
+        let escalation_streams = self.registry.persistent_streams_for_escalation(
+            context.accepted_capabilities,
+            &peer_id,
+            context.direction,
+        );
+        let ordered_stream_count = escalation_streams.len();
         if ordered_stream_count > usize::from(context.limits.max_open_streams) {
             debug!(
                 max_open_streams = context.limits.max_open_streams,
@@ -5321,6 +5519,70 @@ impl ZakuraProtocolHandler {
             return Ok(());
         }
 
+        // One counter names the connection, so its session leases and its
+        // registration share the ID. `None` means IDs ran out, and
+        // registration below refuses the connection.
+        let reserved_conn_id = self.supervisor.reserve_conn_id();
+        let session_funding = if let (Some(pool), Some(plan), Some(conn_id)) =
+            (&self.memory_pool, &self.memory_plan, reserved_conn_id)
+        {
+            let admitted_sessions = escalation_streams
+                .iter()
+                .fold(0, |capabilities, stream| capabilities | stream.capability);
+            let custom_kinds_negotiated = self
+                .registry
+                .services_for_negotiated(context.accepted_capabilities)
+                .iter()
+                .flat_map(|service| service.streams().iter())
+                .any(|stream| {
+                    stream.capability & context.accepted_capabilities != 0
+                        && plan.custom_kinds.contains(&stream.kind)
+                });
+            let cost = plan.bases.connection_cost(
+                context.accepted_capabilities,
+                admitted_sessions,
+                custom_kinds_negotiated,
+            );
+            let funded_sessions = super::memory::SessionBases::funded_sessions(
+                context.accepted_capabilities,
+                admitted_sessions,
+            );
+            match SessionFunding::acquire(
+                pool,
+                plan,
+                &self.session_directions,
+                conn_id,
+                context.direction,
+                cost,
+                funded_sessions,
+                &self.shutdown,
+                self.limits.control_timeout,
+            )
+            .await
+            {
+                Ok(funding) => Some(Arc::new(funding)),
+                Err(refusal) => {
+                    debug!(
+                        ?peer_id,
+                        %refusal,
+                        direction = context.direction.trace_label(),
+                        requested_bytes = cost.total(),
+                        "rejecting Zakura peer because Consumer::Sessions cannot fund transport and reactor session bases together"
+                    );
+                    metrics::counter!("zakura.p2p.conn.rejected.session_memory").increment(1);
+                    #[cfg(any(test, zakura_sim))]
+                    self.handshake_refused(&connection, "session_memory");
+                    connection.close(VarInt::from_u32(ZAKURA_CLOSE_RESOURCE), b"session memory");
+                    if let Some(report) = context.registration_report {
+                        let _ = report.send(DialRegistration::LocalLimit);
+                    }
+                    return Ok(());
+                }
+            }
+        } else {
+            None
+        };
+
         let (outbound_tx, outbound_rx) =
             mpsc::channel(usize::from(context.limits.max_inbound_queue_depth));
         let close_cause = CloseCause::new();
@@ -5337,8 +5599,8 @@ impl ZakuraProtocolHandler {
         close_cause.decide_when_cancelled(&connection_token);
         let registration = self
             .supervisor
-            .register(
-                context.conn.id,
+            .register_with_reserved_conn_id(
+                reserved_conn_id,
                 peer_id,
                 remote_ip,
                 context.transcript_hash,
@@ -5449,7 +5711,8 @@ impl ZakuraProtocolHandler {
                     peer_id.clone(),
                     conn_id,
                     disconnect_token.clone(),
-                );
+                )
+                .with_session_funding(session_funding);
                 self.serve_connection(
                     connection,
                     peer_id,
@@ -5962,8 +6225,8 @@ async fn spawn_zakura_endpoint_inner(
             .map(super::memory::ByteSize::bytes),
     );
     info!(plan = %memory_plan, "sized and enforced Zakura startup memory plan");
-    let limits = ZakuraLocalLimits::for_node(config, &custom_kinds);
-    let node_envelope = crate::zakura::node_envelope::NodeEnvelope::for_node(
+    let limits = memory_plan.local_limits(config);
+    let node_envelope = crate::zakura::node_envelope::NodeEnvelope::for_memory_plan(
         config,
         &limits,
         &custom_kinds,
@@ -6215,7 +6478,7 @@ async fn spawn_zakura_endpoint_inner(
         trace,
     )
     .with_local_node_id(local_node_id)
-    .with_memory_pool(memory_plan, memory_pool.clone(), serving_pool);
+    .with_memory_pool(memory_plan.clone(), memory_pool.clone(), serving_pool);
     handler.set_header_sync_enabled(header_sync_ready);
     if handler.trace.is_enabled() {
         let trace = handler.trace.clone();
@@ -9587,7 +9850,7 @@ mod tests {
                 discovery_direct_addrs(config, local_node_id),
                 Vec::new(),
                 &ZakuraHandshakeConfig::for_network_with_dev_cohort(&config.network, None),
-                config.zakura.max_connections,
+                config.zakura.effective_max_connections(),
                 0,
                 connected,
             )
@@ -10409,10 +10672,9 @@ mod tests {
         let supervisor = ZakuraSupervisorHandle::new(2);
         let peer = test_peer(25);
 
-        {
-            let mut state = supervisor.inner.lock().await;
-            state.next_registration_id = u64::MAX;
-        }
+        supervisor
+            .next_registration_id
+            .store(u64::MAX, zakura_rt::sync::atomic::Ordering::Relaxed);
 
         let registration = register_test_peer_with_hash_and_ip(
             &supervisor,
@@ -10661,8 +10923,7 @@ mod tests {
     async fn an_unfundable_block_sync_config_fails_before_the_endpoint_binds() {
         let _guard = zakura_test::init();
         let mut config = Config::for_test(P2pStack::Dual);
-        config.zakura.block_sync.peer_limits.max_inbound_peers = 3_000;
-        config.zakura.block_sync.peer_limits.max_outbound_peers = 634;
+        config.zakura.block_sync.max_reorder_lookahead_bytes = 0;
 
         let error = spawn_zakura_endpoint(&config, |_supervisor, _trace| {
             Arc::new(NoopService) as Arc<dyn Service>
@@ -10812,7 +11073,7 @@ mod tests {
         let mut config = Config::for_test(P2pStack::Dual);
         // No bootstrap dials, so nothing else takes a connection slot.
         config.zakura.bootstrap_peers = Vec::new();
-        config.zakura.max_connections = 2;
+        config.zakura.max_connections = Some(2);
         config.zakura.max_pending_handshakes = 1;
         let endpoint = spawn_zakura_endpoint(&config, |_supervisor, _trace| {
             Arc::new(NoopService) as Arc<dyn Service>
@@ -11295,8 +11556,8 @@ mod tests {
         let shutdown = CancellationToken::new();
         let mut startup = header_sync_startup(shutdown.clone());
         startup.config.peer_limits = ServicePeerLimits {
-            max_inbound_peers: 0,
-            max_outbound_peers: 1,
+            max_inbound_peers: Some(0),
+            max_outbound_peers: Some(1),
             ..ServicePeerLimits::default()
         };
         let (header_sync, _actions, reactor_task) = spawn_header_sync_reactor(startup)?;
@@ -14079,6 +14340,7 @@ mod tests {
             connection_token: connection_token.clone(),
             close_cause: CloseCause::new(),
             freshness_tx,
+            session_funding: None,
         };
         let (session_exit_tx, _session_exit_rx) = mpsc::unbounded_channel();
         let admitted = handler
@@ -15809,13 +16071,86 @@ mod tests {
         assert_eq!(handler.admit(&attempt("2001:db8:a:c::3")), Admit::Accept);
     }
 
+    /// fix-32 and fix-37: inbound connections lease at most the inbound part
+    /// of the sessions share, so a dial still funds its bases. A session that
+    /// a service admits later adds its session part once, and closing the
+    /// connection returns every byte.
+    #[tokio::test]
+    async fn session_funding_keeps_the_dial_reserve_and_releases_everything() {
+        use crate::zakura::memory::{inbound_sessions_share, MemoryPlan, SessionDirections};
+
+        let config = Config::default();
+        let plan = MemoryPlan::size(64 << 30, &config, &Network::Mainnet)
+            .expect("64 GiB fits the default plan");
+        let pool = plan.build_pool();
+        let directions = Arc::new(zakura_rt::sync::Mutex::new(SessionDirections::default()));
+        let shutdown = CancellationToken::new();
+        let negotiated = ZAKURA_CAP_HEADER_SYNC | ZAKURA_CAP_BLOCK_SYNC_REGULATED;
+        let cost = plan
+            .bases
+            .connection_cost(negotiated, ZAKURA_CAP_HEADER_SYNC, false);
+        let fund = |conn_id, direction| {
+            SessionFunding::acquire(
+                &pool,
+                &plan,
+                &directions,
+                conn_id,
+                direction,
+                cost,
+                ZAKURA_CAP_HEADER_SYNC,
+                &shutdown,
+                Duration::from_millis(10),
+            )
+        };
+
+        let mut inbound = Vec::new();
+        loop {
+            match fund(inbound.len() as ZakuraConnId, ServicePeerDirection::Inbound).await {
+                Ok(funding) => inbound.push(funding),
+                Err(SessionFundingRefusal::DirectionFull) => break,
+                Err(other) => panic!("inbound refused by {other} before the dial reserve"),
+            }
+        }
+        assert!(!inbound.is_empty());
+        let inbound_bytes = lock_session_directions(&directions).inbound;
+        assert!(inbound_bytes <= inbound_sessions_share(plan.sessions_share));
+        assert!(inbound_bytes + cost.total() > inbound_sessions_share(plan.sessions_share));
+
+        let dial = fund(u64::MAX, ServicePeerDirection::Outbound)
+            .await
+            .expect("the dial reserve funds a dial");
+        let leased = pool.snapshot().total_leased;
+        dial.fund_session(ZAKURA_CAP_BLOCK_SYNC_REGULATED)
+            .expect("the share funds the block-sync session");
+        dial.fund_session(ZAKURA_CAP_BLOCK_SYNC_REGULATED)
+            .expect("a funded session owes nothing");
+        assert_eq!(
+            pool.snapshot().total_leased,
+            leased + plan.bases.block_sync.session
+        );
+
+        dial.release();
+        drop(dial);
+        drop(inbound);
+        assert_eq!(pool.snapshot().total_leased, 0);
+        assert_eq!(
+            *lock_session_directions(&directions),
+            SessionDirections::default()
+        );
+    }
+
     /// ADM-3's inbound share (#1367): once inbound connections or inbound
     /// handshakes fill three quarters of their caps, the acceptor turns new
     /// inbound attempts away, and a dial still finds the reserved quarter.
     #[test]
     fn inbound_load_leaves_the_outbound_reserve() {
-        let limits = ZakuraLocalLimits::from_config(&Config::default());
-        assert_eq!(limits.max_inbound_connections(), 69);
+        // The limits production binds with: the plan's connection cap `N_cap`.
+        let config = Config::default();
+        let plan = crate::zakura::memory::MemoryPlan::size(64 << 30, &config, &Network::Mainnet)
+            .expect("64 GiB fits the default plan");
+        let limits = plan.local_limits(&config);
+        assert_eq!(limits.max_connections, 256);
+        assert_eq!(limits.max_inbound_connections(), 192);
         assert_eq!(limits.max_inbound_handshakes(), 24);
         let handler = ZakuraProtocolHandler::new(
             ZakuraSupervisorHandle::new(limits.max_connections),
@@ -15850,7 +16185,7 @@ mod tests {
         drop(inbound_handshakes);
 
         // Inbound connections stop at their share, and dials keep the rest.
-        let inbound: Vec<_> = (0..69)
+        let inbound: Vec<_> = (0..192)
             .map(|_| {
                 handler
                     .claim_connection(NodeSecretKey::generate().public(), true)
@@ -15862,10 +16197,10 @@ mod tests {
             .is_none());
         assert_eq!(
             handler.supervisor.ip_slots.counts().inbound_connections(),
-            69
+            192
         );
         assert_eq!(handler.admit(&attempt(true, 0)), Admit::Refuse);
-        let dials: Vec<_> = (0..23)
+        let dials: Vec<_> = (0..64)
             .map(|_| {
                 handler
                     .claim_connection(NodeSecretKey::generate().public(), false)
@@ -15875,7 +16210,7 @@ mod tests {
         assert!(handler
             .claim_connection(NodeSecretKey::generate().public(), false)
             .is_none());
-        assert_eq!(handler.supervisor.ip_slots.counts().connections(), 92);
+        assert_eq!(handler.supervisor.ip_slots.counts().connections(), 256);
         assert_eq!(handler.free_connection_slots(), 0);
         drop((inbound, dials));
         assert_eq!(handler.supervisor.ip_slots.counts().connections(), 0);

@@ -269,11 +269,14 @@ impl TakenRequest {
                 return Err(AdmitRefusal::OwnerCap);
             }
         }
-        let lease = self
+        #[cfg_attr(not(any(test, zakura_sim)), allow(unused_mut))]
+        let mut lease = self
             .work
             .memory_pool
             .try_acquire(consumer, Some(conn_id), bytes)
             .map_err(|_| AdmitRefusal::Capacity(consumer))?;
+        #[cfg(any(test, zakura_sim))]
+        lease.label_height(first_height.0);
         let funding = self
             .work
             .budget

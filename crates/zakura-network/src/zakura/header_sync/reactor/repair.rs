@@ -331,9 +331,7 @@ impl HeaderSyncReactor {
             &connected_sources,
             Instant::now(),
             self.startup.config.unproductive_peer_cooldown,
-            limits
-                .max_inbound_peers
-                .saturating_add(limits.max_outbound_peers),
+            limits.max_inbound().saturating_add(limits.max_outbound()),
         );
     }
 

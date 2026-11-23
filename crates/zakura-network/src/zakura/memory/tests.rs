@@ -15,8 +15,9 @@ use zakura_rt::time::Instant;
 
 use super::peer_pool::PeerSubPool;
 use super::{
-    Consumer, ConsumerSpec, LeaseDenied, MemoryPool, MemoryPoolMachine, OverrunReport, PoolConfig,
-    PoolEvent, PoolObserver, Priority, Refusal, WakeClass, OVERRUN_WARN_INTERVAL,
+    ConnectionSessionCost, Consumer, ConsumerSpec, LeaseDenied, MemoryPool, MemoryPoolMachine,
+    OverrunReport, PoolConfig, PoolEvent, PoolObserver, Priority, Refusal, WakeClass,
+    OVERRUN_WARN_INTERVAL,
 };
 use crate::zakura::ZakuraPeerId;
 
@@ -844,7 +845,7 @@ fn replay_gauge(events: &[PoolEvent]) -> HashMap<u64, (Consumer, u64)> {
                 assert_eq!(c, consumer);
                 assert_eq!(b, bytes);
             }
-            PoolEvent::Waited { .. } => {}
+            PoolEvent::Labeled { .. } | PoolEvent::Waited { .. } => {}
         }
     }
     live
@@ -1008,6 +1009,161 @@ async fn async_acquire_wakes_below_share_first_and_unblocks_borrowers_on_cancel(
 }
 
 #[tokio::test]
+async fn session_admission_refuses_atomically_past_share_without_borrowing() {
+    // mem-13: Sessions never borrows idle S past its protected share, and
+    // refuses atomically rather than admitting a partial reactor set.
+    let cost = ConnectionSessionCost {
+        transport_base: 512 * KIB,
+        header_sync: 512 * KIB,
+        block_sync: MIB,
+        tx_relay: 0,
+        legacy_compat: 0,
+        custom_kinds: 0,
+    };
+    assert_eq!(cost.total(), 2 * MIB);
+
+    // Budget = 10 MiB, fixed = 0, Sessions floor = 2 MiB, BlockSync floor = 2 MiB -> S = 6 MiB.
+    // Equal weights (1, 1) -> each share = 3 MiB -> Sessions protected_share = 5 MiB.
+    // Two full connections (4 MiB) fit; a third (6 MiB > 5 MiB) MUST be refused
+    // immediately with ShareExceeded even though 6 MiB of S is completely idle!
+    let config = PoolConfig::new(10 * MIB, 0)
+        .with_consumer(Consumer::Sessions, ConsumerSpec::bulk(2 * MIB, 10 * MIB, 1))
+        .with_consumer(
+            Consumer::BlockSync,
+            ConsumerSpec::bulk(2 * MIB, 10 * MIB, 1),
+        );
+    let observer = Arc::new(RecordingObserver::default());
+    let pool = MemoryPool::new(config).with_observer(Some(observer.clone()));
+    let shutdown = zakura_rt::sync::CancellationToken::new();
+
+    let lease_1 = pool
+        .acquire_connection_session_leases(1, cost, &shutdown, Duration::from_secs(1))
+        .await
+        .expect("first connection fits under Sessions share");
+    let lease_2 = pool
+        .acquire_connection_session_leases(2, cost, &shutdown, Duration::from_secs(1))
+        .await
+        .expect("second connection fits under Sessions share");
+    assert_eq!(lease_1.total_bytes(), 2 * MIB);
+    assert_eq!(lease_2.total_bytes(), 2 * MIB);
+    assert_eq!(
+        pool.snapshot().consumers[Consumer::Sessions.index()].leased,
+        4 * MIB
+    );
+
+    // Third connection needs 2 MiB (total 6 MiB > protected_share 5 MiB): must
+    // fail immediately with ShareExceeded, leaving zero partial leases and no
+    // lingering waiter state.
+    let err = pool
+        .acquire_connection_session_leases(3, cost, &shutdown, Duration::from_secs(5))
+        .await
+        .expect_err("third connection must not borrow past Sessions protected share");
+    assert_eq!(err, LeaseDenied::ShareExceeded);
+    let snap = pool.snapshot();
+    assert_eq!(snap.consumers[Consumer::Sessions.index()].leased, 4 * MIB);
+    assert!(!snap.consumers[Consumer::Sessions.index()].waiting);
+
+    // Disconnecting both peers drops every split lease cleanly back to zero.
+    drop(lease_1);
+    drop(lease_2);
+    assert_eq!(pool.snapshot().total_leased, 0);
+    let live = replay_gauge(&observer.events());
+    assert!(
+        live.is_empty(),
+        "dropping session leases returns every lease to zero: {live:?}"
+    );
+}
+
+#[tokio::test]
+async fn session_admission_reclaims_borrowed_shared_memory_and_cleans_up_on_timeout() {
+    // mem-13: when bulk temporarily borrowed S, Sessions below its protected
+    // share registers a below-share waiter, reclaims S as soon as bulk shrinks,
+    // and splits into transport + negotiated reactor leases atomically.
+    let cost = ConnectionSessionCost {
+        transport_base: 512 * KIB,
+        header_sync: 512 * KIB,
+        block_sync: MIB,
+        tx_relay: 256 * KIB,
+        legacy_compat: 0,
+        custom_kinds: 0,
+    };
+    let total = cost.total();
+
+    let config = PoolConfig::new(10 * MIB, 0)
+        .with_consumer(Consumer::Sessions, ConsumerSpec::bulk(2 * MIB, 10 * MIB, 1))
+        .with_consumer(
+            Consumer::BlockSync,
+            ConsumerSpec::bulk(2 * MIB, 10 * MIB, 1),
+        );
+    let pool = MemoryPool::new(config);
+    let shutdown = zakura_rt::sync::CancellationToken::new();
+
+    // BlockSync borrows the entire 6 MiB shared pool (total 8 MiB).
+    let mut bulk = pool
+        .try_acquire(Consumer::BlockSync, Some(99), 8 * MIB)
+        .expect("BlockSync borrows full S");
+
+    // Sessions still has its 2 MiB floor guaranteed, so a 2 MiB connection
+    // could use floor, while `total` (2.25 MiB) needs 256 KiB from S and must
+    // wait for BlockSync to yield borrowed shared memory.
+    let pool_for_task = pool.clone();
+    let shutdown_for_task = shutdown.clone();
+    let admit = tokio::spawn(async move {
+        pool_for_task
+            .acquire_connection_session_leases(7, cost, &shutdown_for_task, Duration::from_secs(2))
+            .await
+    });
+
+    for _ in 0..20 {
+        if pool.snapshot().consumers[Consumer::Sessions.index()].waiting {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        pool.snapshot().consumers[Consumer::Sessions.index()].waiting,
+        "Sessions registers a below-share waiter while bulk holds borrowed S"
+    );
+
+    // BlockSync shrinks by 1 MiB -> Sessions wakes and splits the grant.
+    bulk.shrink_by(MIB);
+    let leases = tokio::time::timeout(Duration::from_secs(2), admit)
+        .await
+        .expect("Sessions woke promptly")
+        .expect("task succeeded")
+        .expect("Sessions reclaimed its share from bulk");
+    assert_eq!(leases.total_bytes(), total);
+    assert_eq!(
+        pool.snapshot().consumers[Consumer::Sessions.index()].leased,
+        total
+    );
+    assert!(!pool.snapshot().consumers[Consumer::Sessions.index()].waiting);
+
+    // Now test timeout cleanup when bulk refuses to yield S: must return
+    // PoolFull without wedging `waiting` so future borrowers aren't starved.
+    let mut bulk2 = pool
+        .try_acquire(Consumer::BlockSync, Some(98), 768 * KIB)
+        .expect("BlockSync fills remaining S");
+    let err = pool
+        .acquire_connection_session_leases(8, cost, &shutdown, Duration::from_millis(25))
+        .await
+        .expect_err("timed-out session admission refuses neutrally");
+    assert_eq!(err, LeaseDenied::PoolFull);
+    assert!(
+        !pool.snapshot().consumers[Consumer::Sessions.index()].waiting,
+        "waiter guard must clear Sessions waiting state on timeout"
+    );
+
+    bulk2.shrink_to(0);
+    drop(bulk2);
+    drop(bulk);
+    drop(leases);
+    assert_eq!(pool.snapshot().total_leased, 0);
+}
+
+/// fix-2: a refused plain try marks nothing waiting but arms one notifier
+/// broadcast for pollers; a wait token marks waiting until it drops.
+#[tokio::test]
 async fn plain_try_marks_nothing_and_wait_token_marks_waiting_until_dropped() {
     let config = PoolConfig::new(10 * MIB, 0)
         .with_consumer(Consumer::BlockSync, ConsumerSpec::bulk(MIB, 10 * MIB, 1))
@@ -1135,4 +1291,48 @@ async fn woken_waiter_that_does_not_fit_passes_its_turn_on() {
     big.abort();
     let _ = big.await;
     assert!(!pool.snapshot().consumers[Consumer::BlockSync.index()].waiting);
+}
+
+/// `mem-15`'s labels: a split or moved lease keeps its height, a regrant
+/// from zero reports it again, and a move that leaves bytes behind clears
+/// the source's height.
+#[test]
+fn lease_heights_follow_splits_moves_and_regrants() {
+    // S is zero, so block sync can take only its 1 MiB floor.
+    let config = PoolConfig::new(3 * MIB, 0)
+        .with_consumer(Consumer::Consensus, ConsumerSpec::reserved(2 * MIB))
+        .with_consumer(Consumer::BlockSync, ConsumerSpec::bulk(MIB, MIB, 1));
+    let observer = Arc::new(RecordingObserver::default());
+    let pool = MemoryPool::new(config).with_observer(Some(observer.clone()));
+    let mut lease = pool
+        .try_acquire(Consumer::Consensus, Some(1), 2 * MIB)
+        .expect("the reserve fits");
+    lease.label_height(7);
+    let mut drain = lease.split(MIB + MIB / 2).expect("the lease holds it");
+    assert_eq!(drain.height(), Some(7));
+    let moved = drain.move_to(Consumer::BlockSync);
+    assert_eq!((moved.bytes(), moved.height()), (MIB, Some(7)));
+    assert_eq!((drain.bytes(), drain.height()), (MIB / 2, None));
+    let labels: Vec<_> = observer
+        .events()
+        .into_iter()
+        .filter_map(|event| match event {
+            PoolEvent::Labeled { lease_id, height } => Some((lease_id, height)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        labels,
+        [(lease.lease_id(), Some(7)), (drain.lease_id(), None)]
+    );
+
+    lease.shrink_to(0);
+    lease.try_grow_to(MIB / 4).expect("the reserve has room");
+    assert_eq!(
+        observer.events().last(),
+        Some(&PoolEvent::Labeled {
+            lease_id: lease.lease_id(),
+            height: Some(7),
+        })
+    );
 }

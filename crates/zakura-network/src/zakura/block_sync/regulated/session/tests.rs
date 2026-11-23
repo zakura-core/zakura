@@ -526,25 +526,24 @@ fn one_block_sizing_keeps_the_default_serving_limits() {
     assert_eq!((limits.node_execution, limits.peer_execution), (24, 12));
 }
 
-/// Default peer limits budget 2816 requests, so 512 sessions fill exactly 512 MiB.
+/// Each block-sync session funds its own 1 MiB bookkeeping slot inside `b_block_sync`
+/// (`02 §8`), budgeting 2,816 requests per session.
 #[test]
 fn the_default_serving_limit_fits_the_bookkeeping_budget() {
     let config = ZakuraBlockSyncConfig::default();
     let limit = serving_max_inflight_requests(&config);
     assert_eq!(serving_sessions(&config), 512);
     assert_eq!(limit, 2816);
-    let sessions = u64::try_from(serving_sessions(&config)).unwrap();
-    let envelope = sessions * (SESSION_ALLOWANCE_BYTES + 2 * u64::from(limit) * BYTES_PER_REQUEST);
-    assert!(envelope <= BOOKKEEPING_BUDGET_BYTES);
-    let one_more =
-        sessions * (SESSION_ALLOWANCE_BYTES + 2 * u64::from(limit + 1) * BYTES_PER_REQUEST);
-    assert!(one_more > BOOKKEEPING_BUDGET_BYTES);
+    let per_session = SESSION_ALLOWANCE_BYTES + 2 * u64::from(limit) * BYTES_PER_REQUEST;
+    assert!(per_session <= BLOCK_SYNC_SESSION_BOOKKEEPING_BYTES);
+    let one_more = SESSION_ALLOWANCE_BYTES + 2 * u64::from(limit + 1) * BYTES_PER_REQUEST;
+    assert!(one_more > BLOCK_SYNC_SESSION_BOOKKEEPING_BYTES);
     // Local download sizing keeps the configured advertisement.
     assert_eq!(config.advertised_max_inflight_requests(), 32_000);
 }
 
-/// Fewer sessions keep the configured limit; more sessions shrink it. Past 3,633
-/// slots nothing fits, and the reactor refuses that config before serving.
+/// Every serving session gets its own per-session bookkeeping slot (`02 §8`),
+/// capped by the configured advertisement or 2,816 requests per session.
 #[test]
 fn the_serving_limit_follows_session_slots_and_configuration() {
     let with = |inbound, outbound, configured| {
@@ -552,19 +551,15 @@ fn the_serving_limit_follows_session_slots_and_configuration() {
             max_inflight_requests: configured,
             ..Default::default()
         };
-        config.peer_limits.max_inbound_peers = inbound;
-        config.peer_limits.max_outbound_peers = outbound;
+        config.peer_limits.max_inbound_peers = Some(inbound);
+        config.peer_limits.max_outbound_peers = Some(outbound);
         serving_max_inflight_requests(&config)
     };
-    assert_eq!(with(8, 8, 32_000), 32_000);
+    assert_eq!(with(8, 8, 32_000), 2_816);
     assert_eq!(with(256, 256, 100), 100);
     assert_eq!(with(0, 0, 32_000), 32_000);
-    assert_eq!(budgeted_inflight_requests(0), None);
-    assert_eq!(budgeted_inflight_requests(3633), Some(1));
-    assert_eq!(budgeted_inflight_requests(3634), Some(0));
-    assert_eq!(with(3633, 0, 32_000), 1);
-    assert_eq!(with(3634, 0, 32_000), 0);
-    assert_eq!(with(usize::MAX, usize::MAX, 32_000), 0);
+    assert_eq!(with(3634, 0, 32_000), 2_816);
+    assert_eq!(per_session_budgeted_inflight_requests(), 2_816);
 }
 
 /// Serving enforces the advertised limit: `2 × limit` open requests are served, one more faults.

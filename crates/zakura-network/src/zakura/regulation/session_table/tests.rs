@@ -64,8 +64,8 @@ fn replacement_keeps_capacity_until_retired_snapshot_owners_drop() {
     let capacity = SessionCapacity::new(
         "replacement-test",
         &ServicePeerLimits {
-            max_inbound_peers: 2,
-            max_outbound_peers: 0,
+            max_inbound_peers: Some(2),
+            max_outbound_peers: Some(0),
             max_pending_escalations: 2,
             ..ServicePeerLimits::default()
         },

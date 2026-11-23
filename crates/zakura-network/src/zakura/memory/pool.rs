@@ -916,6 +916,15 @@ pub enum PoolEvent {
         /// Pool-wide lease limit (`total_floors + S`).
         pool_limit: u64,
     },
+    /// A block-sync lease named the block height it funds, or stopped funding
+    /// one. The simulator joins leases to heights through it (`mem-15`).
+    Labeled {
+        /// Lease identifier.
+        lease_id: u64,
+        /// The height the lease funds. `None` marks a drain that a move left
+        /// on its consumer because the target had no room.
+        height: Option<u32>,
+    },
     /// A caller started waiting on pool contention.
     Waited {
         /// Consumer that waits.
@@ -1237,6 +1246,8 @@ impl MemoryPool {
             bytes: 0,
             #[cfg(any(test, zakura_sim))]
             lease_id: 0,
+            #[cfg(any(test, zakura_sim))]
+            height: None,
         }
     }
 
@@ -1278,6 +1289,63 @@ impl MemoryPool {
         };
         self.wait_for_lease(&request, std::future::pending::<LeaseDenied>())
             .await
+    }
+
+    /// Acquire a connection's transport base `t` and negotiated reactor session
+    /// bases `b_r` atomically from `Consumer::Sessions` (`02 §8` rules 1–3, `mem-13`).
+    ///
+    /// - Refuses at once when `Sessions` is at its share or cap: it never waits
+    ///   for healthy connections to disconnect.
+    /// - When `Sessions` is below its share but short-lived bulk consumers
+    ///   borrowed `S`, waits on contention until `S` returns, `wait_timeout`
+    ///   expires, or `shutdown` cancels; the last two refuse with `PoolFull`.
+    /// - Splits the grant into a `transport` lease and one lease per reactor
+    ///   (zero net change to pool totals), so each lease drops to zero with
+    ///   its owner.
+    pub async fn acquire_connection_session_leases(
+        &self,
+        conn_id: ZakuraConnId,
+        cost: super::ConnectionSessionCost,
+        shutdown: &zakura_rt::sync::CancellationToken,
+        wait_timeout: std::time::Duration,
+    ) -> Result<ConnectionSessionLeases, LeaseDenied> {
+        let request = Request {
+            consumer: Consumer::Sessions,
+            conn: Some(conn_id),
+            serving: None,
+            bytes: cost.total(),
+        };
+        let stop = async {
+            zakura_rt::select! {
+                () = shutdown.cancelled() => {}
+                () = zakura_rt::time::sleep(wait_timeout) => {}
+            }
+            LeaseDenied::PoolFull
+        };
+        let mut combined = self.wait_for_lease(&request, stop).await?;
+
+        let mut split = |bytes: u64| {
+            (bytes > 0).then(|| {
+                combined
+                    .split(bytes)
+                    .expect("the combined lease covers every reactor base")
+            })
+        };
+        let header_sync = split(cost.header_sync);
+        let block_sync = split(cost.block_sync);
+        let tx_relay = split(cost.tx_relay);
+        let legacy_compat = split(cost.legacy_compat);
+        let custom_kinds = split(cost.custom_kinds);
+        debug_assert_eq!(combined.bytes(), cost.transport_base);
+
+        Ok(ConnectionSessionLeases {
+            transport: combined,
+            header_sync,
+            block_sync,
+            tx_relay,
+            legacy_compat,
+            custom_kinds,
+        })
     }
 
     /// Mark `consumer` waiting on pool contention until the token drops.
@@ -1597,6 +1665,8 @@ impl MemoryPool {
             bytes: request.bytes,
             #[cfg(any(test, zakura_sim))]
             lease_id,
+            #[cfg(any(test, zakura_sim))]
+            height: None,
         }
     }
 
@@ -1837,6 +1907,41 @@ impl Drop for PoolWaitToken {
     }
 }
 
+/// Transport base (`t`) and negotiated reactor session base (`b_r`) leases
+/// owned by one admitted connection (`02 §8`, `mem-13`).
+///
+/// Dropping this struct on connection teardown returns every transport and
+/// reactor session lease to `Consumer::Sessions`.
+#[derive(Debug)]
+#[must_use = "retain ConnectionSessionLeases for the lifetime of the admitted connection"]
+pub struct ConnectionSessionLeases {
+    /// Transport base `t` (control receive + base send window + discovery).
+    pub transport: PoolLease,
+    /// Header-sync session base `b_header_sync`, if negotiated.
+    pub header_sync: Option<PoolLease>,
+    /// Block-sync session base `b_block_sync`, if negotiated.
+    pub block_sync: Option<PoolLease>,
+    /// `tx-relay` session base `b_tx_relay`, if negotiated.
+    pub tx_relay: Option<PoolLease>,
+    /// Legacy compatibility session base `b_legacy_compat`, if negotiated.
+    pub legacy_compat: Option<PoolLease>,
+    /// Embedder custom kinds base, if negotiated.
+    pub custom_kinds: Option<PoolLease>,
+}
+
+impl ConnectionSessionLeases {
+    /// Total bytes held across the transport base and every negotiated reactor session base.
+    pub fn total_bytes(&self) -> u64 {
+        self.transport
+            .bytes()
+            .saturating_add(self.header_sync.as_ref().map_or(0, PoolLease::bytes))
+            .saturating_add(self.block_sync.as_ref().map_or(0, PoolLease::bytes))
+            .saturating_add(self.tx_relay.as_ref().map_or(0, PoolLease::bytes))
+            .saturating_add(self.legacy_compat.as_ref().map_or(0, PoolLease::bytes))
+            .saturating_add(self.custom_kinds.as_ref().map_or(0, PoolLease::bytes))
+    }
+}
+
 /// RAII handle owning a logical-byte lease in a [`MemoryPool`].
 ///
 /// Dropping a `PoolLease` returns its bytes to the pool and wakes waiters
@@ -1851,6 +1956,9 @@ pub struct PoolLease {
     bytes: u64,
     #[cfg(any(test, zakura_sim))]
     lease_id: u64,
+    /// The block height this lease funds, for the simulator's `mem-15` check.
+    #[cfg(any(test, zakura_sim))]
+    height: Option<u32>,
 }
 
 impl fmt::Debug for PoolLease {
@@ -1895,6 +2003,36 @@ impl PoolLease {
         self.lease_id
     }
 
+    /// Name `height` as the block height this lease funds, and report it to
+    /// the observer. Splits, moves and regrants keep the name.
+    #[cfg(any(test, zakura_sim))]
+    pub fn label_height(&mut self, height: u32) {
+        self.height = Some(height);
+        self.report_height();
+    }
+
+    /// The block height this lease funds, if a caller named one.
+    #[cfg(any(test, zakura_sim))]
+    pub fn height(&self) -> Option<u32> {
+        self.height
+    }
+
+    /// Report this lease's height to the observer, if the lease is live.
+    ///
+    /// Only the lease's owner reports its label, so the report needs no
+    /// lock to stay in order with the lease's other events. Taking none adds
+    /// no scheduling point to a simulated run.
+    #[cfg(any(test, zakura_sim))]
+    fn report_height(&self) {
+        if self.lease_id == 0 {
+            return;
+        }
+        self.pool.emit(PoolEvent::Labeled {
+            lease_id: self.lease_id,
+            height: self.height,
+        });
+    }
+
     /// Shrink this lease down to `new_bytes`, returning the excess to the pool.
     ///
     /// A `new_bytes >= self.bytes` is a no-op (zero locks).
@@ -1933,7 +2071,13 @@ impl PoolLease {
                 serving: serving.as_ref().map(ServingTarget::existing),
                 bytes: target_bytes,
             };
+            #[cfg(any(test, zakura_sim))]
+            let height = self.height;
             *self = self.pool.try_request(&request)?;
+            #[cfg(any(test, zakura_sim))]
+            if let Some(height) = height {
+                self.label_height(height);
+            }
             return Ok(());
         }
         self.pool.grow_lease(self, target_bytes)?;
@@ -1979,6 +2123,8 @@ impl PoolLease {
             bytes,
             #[cfg(any(test, zakura_sim))]
             lease_id: to_lease_id,
+            #[cfg(any(test, zakura_sim))]
+            height: self.height,
         })
     }
 
@@ -2004,6 +2150,7 @@ impl PoolLease {
             #[cfg(any(test, zakura_sim))]
             {
                 self.lease_id = other_id;
+                self.height = other.height;
             }
             return;
         }
@@ -2036,9 +2183,15 @@ impl PoolLease {
         let (moved, _to_lease_id) = self.pool.move_lease(self, to);
         self.bytes -= moved;
         #[cfg(any(test, zakura_sim))]
+        let height = self.height;
+        #[cfg(any(test, zakura_sim))]
         if self.bytes == 0 {
             // The move took every byte, which closes the source lease.
             self.lease_id = 0;
+        } else if height.is_some() {
+            // The bytes left here are a drain the target had no room for.
+            self.height = None;
+            self.report_height();
         }
         if moved == 0 {
             return self.pool.empty_lease(to, self.peer);
@@ -2051,6 +2204,8 @@ impl PoolLease {
             bytes: moved,
             #[cfg(any(test, zakura_sim))]
             lease_id: _to_lease_id,
+            #[cfg(any(test, zakura_sim))]
+            height,
         }
     }
 }

@@ -782,8 +782,8 @@ impl SessionLayouts {
         Self {
             capacity: zakura_network::zakura::testkit::regulation::SessionCapacityHandle::new(
                 &zakura_network::zakura::ServicePeerLimits {
-                    max_inbound_peers: 4,
-                    max_outbound_peers: 1,
+                    max_inbound_peers: Some(4),
+                    max_outbound_peers: Some(1),
                     max_pending_escalations: 2,
                     ..Default::default()
                 },

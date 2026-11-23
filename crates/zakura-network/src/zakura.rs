@@ -109,13 +109,19 @@ pub const DEFAULT_SERVICE_OUTBOUND_QUEUE_DEPTH: usize = 128;
 pub const DEFAULT_SERVICE_MAX_PENDING_ESCALATIONS: usize = 32;
 
 /// Per-service peer and queue limits owned by a Zakura service reactor.
+///
+/// `max_inbound_peers` and `max_outbound_peers` default to `None` (unset),
+/// meaning the node's connection cap `N_cap` (`DEFAULT_SERVICE_MAX_PEERS` = 256
+/// when `[network.zakura] max_connections` is also unset, `02 §8`).
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ServicePeerLimits {
-    /// Maximum inbound peers this service admits.
-    pub max_inbound_peers: usize,
-    /// Maximum outbound peers this service admits.
-    pub max_outbound_peers: usize,
+    /// Maximum inbound peers this service admits (`None` = node connection cap `N_cap`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_inbound_peers: Option<usize>,
+    /// Maximum outbound peers this service admits (`None` = node connection cap `N_cap`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_outbound_peers: Option<usize>,
     /// Inbound queue depth reserved for this service.
     ///
     /// Reserved for future transport queue wiring; not enforced in this phase.
@@ -133,12 +139,62 @@ pub struct ServicePeerLimits {
 impl Default for ServicePeerLimits {
     fn default() -> Self {
         Self {
-            max_inbound_peers: DEFAULT_SERVICE_MAX_PEERS,
-            max_outbound_peers: DEFAULT_SERVICE_MAX_PEERS,
+            max_inbound_peers: None,
+            max_outbound_peers: None,
             inbound_queue_depth: DEFAULT_SERVICE_INBOUND_QUEUE_DEPTH,
             outbound_queue_depth: DEFAULT_SERVICE_OUTBOUND_QUEUE_DEPTH,
             max_pending_escalations: DEFAULT_SERVICE_MAX_PENDING_ESCALATIONS,
         }
+    }
+}
+
+impl ServicePeerLimits {
+    /// Effective inbound peer cap when the node connection cap is `connection_cap`.
+    #[inline]
+    pub const fn effective_max_inbound_peers(&self, connection_cap: usize) -> usize {
+        match self.max_inbound_peers {
+            Some(limit) => limit,
+            None => connection_cap,
+        }
+    }
+
+    /// Effective outbound peer cap when the node connection cap is `connection_cap`.
+    #[inline]
+    pub const fn effective_max_outbound_peers(&self, connection_cap: usize) -> usize {
+        match self.max_outbound_peers {
+            Some(limit) => limit,
+            None => connection_cap,
+        }
+    }
+
+    /// Effective inbound peer cap using [`DEFAULT_SERVICE_MAX_PEERS`] when unset.
+    #[inline]
+    pub const fn max_inbound(&self) -> usize {
+        self.effective_max_inbound_peers(DEFAULT_SERVICE_MAX_PEERS)
+    }
+
+    /// Effective outbound peer cap using [`DEFAULT_SERVICE_MAX_PEERS`] when unset.
+    #[inline]
+    pub const fn max_outbound(&self) -> usize {
+        self.effective_max_outbound_peers(DEFAULT_SERVICE_MAX_PEERS)
+    }
+
+    /// Whether the operator explicitly configured either inbound or outbound peer limits.
+    #[inline]
+    pub const fn has_explicit_peer_caps(&self) -> bool {
+        self.max_inbound_peers.is_some() || self.max_outbound_peers.is_some()
+    }
+
+    /// Resolve unset (`None`) peer caps to `connection_cap` (`02 §8`).
+    #[inline]
+    pub const fn resolved_for_connections(mut self, connection_cap: usize) -> Self {
+        if self.max_inbound_peers.is_none() {
+            self.max_inbound_peers = Some(connection_cap);
+        }
+        if self.max_outbound_peers.is_none() {
+            self.max_outbound_peers = Some(connection_cap);
+        }
+        self
     }
 }
 
@@ -193,8 +249,8 @@ impl ServicePeerSnapshot {
         Self {
             inbound_peers,
             outbound_peers,
-            inbound_slots_free: limits.max_inbound_peers.saturating_sub(inbound_peers),
-            outbound_slots_free: limits.max_outbound_peers.saturating_sub(outbound_peers),
+            inbound_slots_free: limits.max_inbound().saturating_sub(inbound_peers),
+            outbound_slots_free: limits.max_outbound().saturating_sub(outbound_peers),
         }
     }
 }

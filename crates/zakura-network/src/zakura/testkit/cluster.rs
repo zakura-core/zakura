@@ -2119,12 +2119,12 @@ mod tests {
             request_timeout: Duration::from_secs(300),
             peer_limits: ServicePeerLimits {
                 max_inbound_peers: if one_session_slot {
-                    1
+                    Some(1)
                 } else {
                     ServicePeerLimits::default().max_inbound_peers
                 },
                 max_outbound_peers: if one_session_slot {
-                    1
+                    Some(1)
                 } else {
                     ServicePeerLimits::default().max_outbound_peers
                 },

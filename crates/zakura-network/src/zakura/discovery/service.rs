@@ -1243,7 +1243,7 @@ mod tests {
             },
             ZakuraDiscoveryConfig {
                 peer_limits: ServicePeerLimits {
-                    max_inbound_peers: 4,
+                    max_inbound_peers: Some(4),
                     ..ServicePeerLimits::default()
                 },
                 ..ZakuraDiscoveryConfig::default()

@@ -114,7 +114,7 @@ fn the_default_node_config_composes() {
 
     assert_eq!(
         limits.max_connections,
-        crate::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS
+        crate::zakura::DEFAULT_ZAKURA_BUDGETED_CONNECTIONS
     );
     assert_eq!(envelope.owners, limits.owner_bound());
     assert_eq!(
@@ -126,10 +126,11 @@ fn the_default_node_config_composes() {
             .expect("the default allowance fits")
             .get()
     );
-    // Block sync and header sync each fund 92 sessions × 64 MiB; discovery adds its
-    // answers.
-    assert!(envelope.serve_output_bytes >= 2 * 92 * (64 << 20));
-    assert!(envelope.serve_output_bytes < 2 * 92 * (64 << 20) + (1 << 30));
+    // Block sync and header sync each fund `limits.max_connections` sessions × 64 MiB;
+    // discovery adds its answers.
+    let sessions = limits.max_connections as u128;
+    assert!(envelope.serve_output_bytes >= 2 * sessions * (64 << 20));
+    assert!(envelope.serve_output_bytes < 2 * sessions * (64 << 20) + (1 << 30));
     // The QUIC term is the derived one, within the peer memory budget.
     assert_eq!(
         envelope.quic_bytes,
@@ -196,12 +197,16 @@ fn the_default_envelope_sums_the_reactor_shares() {
     assert_eq!(transport.connection_output_bytes, 128 * MIB);
     // The shared compatibility client holds at most 288 exchanges at once.
     assert_eq!(transport.compat_response_bytes, 288 * 20 * MIB);
+    let conns = limits.max_connections as u128;
     assert_eq!(
         envelope.transport_bytes,
-        92 * u128::from(128 * MIB) + u128::from(288 * 20 * MIB)
+        conns * u128::from(128 * MIB) + u128::from(288 * 20 * MIB)
     );
-    // 92 × 108,456,235 + 32 × 128 KiB + 256 MiB.
-    assert_eq!(envelope.quic_bytes, 10_250_603_380);
+    // `conns` × 108,456,235 + 32 × 128 KiB + 256 MiB.
+    assert_eq!(
+        envelope.quic_bytes,
+        conns * 108_456_235 + 32 * u128::from(128u64 << 10) + u128::from(256 * MIB)
+    );
 }
 
 /// A custom stream kind takes the `other` share on a live connection, so the peer
@@ -299,15 +304,20 @@ fn configured_serving_budgets_set_the_serve_output_bound() {
     let configured = NodeEnvelope::for_node(&config, &limits, &[], 16)
         .expect("the configured budgets fit")
         .serve_output_bytes;
-    assert_eq!(derived - configured, 2 * (92 * (64 << 20) - (1 << 30)));
+    assert_eq!(
+        derived - configured,
+        2 * (limits.max_connections as u128 * (64 << 20) - (1 << 30))
+    );
 }
 
 /// With `tx-relay` on, the serve output bound adds, for each admitted connection,
 /// the built `Tx` and the unwritten `Inv` a session holds outside its output gate.
-/// The default config still fits, and the admitted connections are unchanged.
+/// The default config still fits, and with a fixed connection cap the admitted
+/// connections are unchanged.
 #[test]
 fn tx_relay_counts_what_it_holds_outside_its_output_gate() {
     let mut config = Config::default();
+    config.zakura.max_connections = Some(crate::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS);
     let off_limits = ZakuraLocalLimits::from_config(&config);
     let off = NodeEnvelope::for_node(&config, &off_limits, &[], 16)
         .expect("the default config fits")
@@ -338,7 +348,7 @@ fn serving_output_counts_admitted_sessions() {
         connections as u64,
         u128::from(discovery_serving_output_bytes(connections)),
     );
-    assert!(config.zakura.block_sync.peer_limits.max_inbound_peers > connections);
+    assert!(config.zakura.block_sync.peer_limits.max_inbound() > connections);
 
     // The reactors build their pools from the node's configs.
     let block_sync = config
@@ -376,8 +386,8 @@ fn serving_output_counts_admitted_sessions() {
         &mut config.zakura.block_sync.peer_limits,
         &mut config.zakura.header_sync.peer_limits,
     ] {
-        peer_limits.max_inbound_peers = 3;
-        peer_limits.max_outbound_peers = 2;
+        peer_limits.max_inbound_peers = Some(3);
+        peer_limits.max_outbound_peers = Some(2);
     }
     let envelope =
         NodeEnvelope::for_node(&config, &limits, &[], 16).expect("the smaller pools fit");

@@ -39,8 +39,10 @@ use crate::{
         peer_memory::min_budgeted_connections,
         tx_relay::wire::{
             MAX_TX_BYTES, SESSION_HELD_OUTPUT_BYTES, TX_RELAY_DATA_BUDGET, TX_RELAY_STATE_BUDGET,
+            ZAKURA_CAP_TX_RELAY,
         },
-        MAX_BS_FRAME_BYTES,
+        ServicePeerDirection, ZakuraLocalLimits, MAX_BS_FRAME_BYTES,
+        ZAKURA_CAP_BLOCK_SYNC_REGULATED, ZAKURA_CAP_HEADER_SYNC, ZAKURA_CAP_LEGACY_GOSSIP,
     },
 };
 
@@ -178,6 +180,12 @@ pub struct SessionBases {
     pub custom_kinds: ReactorBase,
 }
 
+/// The reactors whose session bases [`SessionBases`] names, by capability bit.
+const SESSION_REACTOR_CAPABILITIES: u64 = ZAKURA_CAP_HEADER_SYNC
+    | ZAKURA_CAP_BLOCK_SYNC_REGULATED
+    | ZAKURA_CAP_TX_RELAY
+    | ZAKURA_CAP_LEGACY_GOSSIP;
+
 impl SessionBases {
     /// Cost of one connection carrying the reactors required to follow the chain:
     /// discovery (in `t`), header sync, and block sync.
@@ -194,6 +202,211 @@ impl SessionBases {
             .saturating_add(self.tx_relay.total())
             .saturating_add(self.legacy_compat.total())
             .saturating_add(self.custom_kinds.total())
+    }
+
+    /// The bases that `Consumer::Sessions` funds when it admits a connection
+    /// (`02 §8` rule 3).
+    ///
+    /// - `negotiated`: the capabilities both sides accepted. The connection's
+    ///   receive credit covers each negotiated reactor's unsolicited bytes, so
+    ///   each one adds its `receive` part.
+    /// - `admitted`: the capabilities whose services take a session from this
+    ///   peer now. Each one adds its `session` part. A service that admits a
+    ///   session later funds it then, through [`Self::session_top_up`].
+    /// - `custom_kinds_negotiated`: whether the connection negotiated any
+    ///   embedder custom kind.
+    pub const fn connection_cost(
+        &self,
+        negotiated: u64,
+        admitted: u64,
+        custom_kinds_negotiated: bool,
+    ) -> ConnectionSessionCost {
+        let admitted = admitted & negotiated;
+        ConnectionSessionCost {
+            transport_base: self.transport_base,
+            header_sync: reactor_cost(
+                self.header_sync,
+                negotiated,
+                admitted,
+                ZAKURA_CAP_HEADER_SYNC,
+            ),
+            block_sync: reactor_cost(
+                self.block_sync,
+                negotiated,
+                admitted,
+                ZAKURA_CAP_BLOCK_SYNC_REGULATED,
+            ),
+            tx_relay: reactor_cost(self.tx_relay, negotiated, admitted, ZAKURA_CAP_TX_RELAY),
+            legacy_compat: reactor_cost(
+                self.legacy_compat,
+                negotiated,
+                admitted,
+                ZAKURA_CAP_LEGACY_GOSSIP,
+            ),
+            custom_kinds: if custom_kinds_negotiated {
+                self.custom_kinds.total()
+            } else {
+                0
+            },
+        }
+    }
+
+    /// The reactor capabilities whose `session` parts
+    /// [`Self::connection_cost`] funds for the same `negotiated` and
+    /// `admitted` capabilities.
+    pub const fn funded_sessions(negotiated: u64, admitted: u64) -> u64 {
+        admitted & negotiated & SESSION_REACTOR_CAPABILITIES
+    }
+
+    /// The `session` part a connection still owes when a service admits a
+    /// session for `capability`, given the reactor sessions it has funded so
+    /// far. Returns the reactor's capability bit and the bytes, or `None` when
+    /// nothing is owed: the reactor is funded, has no session part, or isn't
+    /// one of the reactors these bases name.
+    pub const fn session_top_up(
+        &self,
+        funded_sessions: u64,
+        capability: u64,
+    ) -> Option<(u64, u64)> {
+        let (bit, base) = if capability & ZAKURA_CAP_HEADER_SYNC != 0 {
+            (ZAKURA_CAP_HEADER_SYNC, self.header_sync)
+        } else if capability & ZAKURA_CAP_BLOCK_SYNC_REGULATED != 0 {
+            (ZAKURA_CAP_BLOCK_SYNC_REGULATED, self.block_sync)
+        } else if capability & ZAKURA_CAP_TX_RELAY != 0 {
+            (ZAKURA_CAP_TX_RELAY, self.tx_relay)
+        } else if capability & ZAKURA_CAP_LEGACY_GOSSIP != 0 {
+            (ZAKURA_CAP_LEGACY_GOSSIP, self.legacy_compat)
+        } else {
+            return None;
+        };
+        if funded_sessions & bit != 0 || base.session == 0 {
+            None
+        } else {
+            Some((bit, base.session))
+        }
+    }
+}
+
+/// One reactor's admission charge: its receive part when negotiated, plus its
+/// session part when its service admits the peer.
+const fn reactor_cost(base: ReactorBase, negotiated: u64, admitted: u64, capability: u64) -> u64 {
+    let receive = if negotiated & capability != 0 {
+        base.receive
+    } else {
+        0
+    };
+    let session = if admitted & capability != 0 {
+        base.session
+    } else {
+        0
+    };
+    receive.saturating_add(session)
+}
+
+/// Exact transport base `t` and reactor session bases `b_r` required to admit
+/// one connection (`02 §8`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConnectionSessionCost {
+    /// Transport base `t`.
+    pub transport_base: u64,
+    /// Header-sync base (0 if not negotiated).
+    pub header_sync: u64,
+    /// Block-sync base (0 if not negotiated).
+    pub block_sync: u64,
+    /// `tx-relay` base (0 if not negotiated or disabled).
+    pub tx_relay: u64,
+    /// Legacy compatibility base (0 if not negotiated).
+    pub legacy_compat: u64,
+    /// Embedder custom kinds base (0 if none negotiated).
+    pub custom_kinds: u64,
+}
+
+impl ConnectionSessionCost {
+    /// Total bytes (`t + Σ_r b_r`) that `Consumer::Sessions` must fund together
+    /// before admitting the connection (`02 §8` rule 3).
+    pub const fn total(&self) -> u64 {
+        self.transport_base
+            .saturating_add(self.header_sync)
+            .saturating_add(self.block_sync)
+            .saturating_add(self.tx_relay)
+            .saturating_add(self.legacy_compat)
+            .saturating_add(self.custom_kinds)
+    }
+}
+
+/// Bytes of `Consumer::Sessions`' protected share that inbound connections may
+/// lease: all but a quarter, which stays for this node's dials (`02 §8` rule
+/// 1). The transport keeps the same quarter of its connection slots
+/// ([`crate::zakura::ZakuraLocalLimits::max_inbound_connections`]).
+pub const fn inbound_sessions_share(sessions_share: u64) -> u64 {
+    sessions_share - sessions_share / 4
+}
+
+/// Bytes `Consumer::Sessions` has leased, by the direction of the connection
+/// that holds them (`02 §8` rule 1).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SessionDirections {
+    /// Bytes leased for connections the remote peer dialed.
+    pub inbound: u64,
+    /// Bytes leased for connections this node dialed.
+    pub outbound: u64,
+}
+
+impl SessionDirections {
+    /// Whether a connection in `direction` may lease `cost` more bytes of
+    /// `sessions_share`, the sessions consumer's protected share.
+    ///
+    /// Both directions stay within the share (`02 §5` rule 4). Inbound
+    /// connections also stop at [`inbound_sessions_share`], so inbound peers
+    /// can't take the dial reserve.
+    pub const fn admits(
+        &self,
+        direction: ServicePeerDirection,
+        cost: u64,
+        sessions_share: u64,
+    ) -> bool {
+        let total = self
+            .inbound
+            .saturating_add(self.outbound)
+            .saturating_add(cost);
+        if total > sessions_share {
+            return false;
+        }
+        match direction {
+            ServicePeerDirection::Inbound => {
+                self.inbound.saturating_add(cost) <= inbound_sessions_share(sessions_share)
+            }
+            ServicePeerDirection::Outbound => true,
+        }
+    }
+
+    /// Record `cost` bytes leased in `direction` if [`Self::admits`] allows them.
+    pub fn try_charge(
+        &mut self,
+        direction: ServicePeerDirection,
+        cost: u64,
+        sessions_share: u64,
+    ) -> bool {
+        if !self.admits(direction, cost, sessions_share) {
+            return false;
+        }
+        let held = self.direction_mut(direction);
+        *held = held.saturating_add(cost);
+        true
+    }
+
+    /// Return `cost` bytes that a connection in `direction` released.
+    pub fn release(&mut self, direction: ServicePeerDirection, cost: u64) {
+        let held = self.direction_mut(direction);
+        debug_assert!(*held >= cost, "a connection releases only bytes it charged");
+        *held = held.saturating_sub(cost);
+    }
+
+    fn direction_mut(&mut self, direction: ServicePeerDirection) -> &mut u64 {
+        match direction {
+            ServicePeerDirection::Inbound => &mut self.inbound,
+            ServicePeerDirection::Outbound => &mut self.outbound,
+        }
     }
 }
 
@@ -305,7 +518,7 @@ pub enum MemoryPlanError {
 }
 
 /// Complete, pure startup memory sizing plan (`02 §8`).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MemoryPlan {
     /// Derivation of `B` from host/configured budget (`budget`, `base`, `sidecar`, `ρ`, `B`).
     pub derivation: BudgetDerivation,
@@ -317,6 +530,11 @@ pub struct MemoryPlan {
     pub fixed: FixedTerms,
     /// Per-connection transport base `t` and per-reactor session bases `b_r`.
     pub bases: SessionBases,
+    /// Embedder custom stream kinds that [`SessionBases::custom_kinds`] covers.
+    pub custom_kinds: Vec<u16>,
+    /// The most `Consumer::Sessions`' leases may hold: its protected share
+    /// (`02 §5` rule 4), or its cap when that is lower.
+    pub sessions_share: u64,
     /// Resulting pool configuration passed directly to [`MemoryPool::new`].
     pub pool_config: PoolConfig,
     /// Minimum chain-following connections funded by the sessions floor.
@@ -448,6 +666,8 @@ impl MemoryPlan {
             network_name,
             fixed,
             bases,
+            custom_kinds: custom_kinds.to_vec(),
+            sessions_share: sessions_protected.min(cap_sessions),
             pool_config,
             min_connections,
             connection_cap,
@@ -487,6 +707,15 @@ impl MemoryPlan {
     /// Consumer's protected total (`floor + share_of_S`).
     pub fn consumer_protected_share(&self, consumer: Consumer) -> u64 {
         super::MemoryPoolMachine::new(self.pool_config).protected_share(consumer)
+    }
+
+    /// The endpoint's local limits under this plan: the configured limits with
+    /// the connection cap `N_cap` (`02 §8`). `Consumer::Sessions` decides how
+    /// many connections memory funds below that cap.
+    pub fn local_limits(&self, config: &Config) -> ZakuraLocalLimits {
+        let mut limits = ZakuraLocalLimits::for_node(config, &self.custom_kinds);
+        limits.max_connections = self.connection_cap.max(1);
+        limits
     }
 
     /// Construct a live [`MemoryPool`] sized from this plan.
@@ -596,7 +825,7 @@ impl PlanTerms {
         let memory = &config.zakura.memory_budget;
         let shares = config.zakura.reactor_shares(network);
 
-        let connection_cap = config.zakura.max_connections.max(1);
+        let connection_cap = config.zakura.effective_max_connections();
         let bootstrap_peers =
             remote_bootstrap_peer_count(&config.zakura.bootstrap_peers, local_node_id);
         let min_connections = min_budgeted_connections(bootstrap_peers).min(connection_cap);
@@ -724,8 +953,24 @@ impl PlanTerms {
         // together (`02 §8` rules 3 and 4). Reactor caps and `N_cap` are
         // ceilings, not reservations, so they never raise the floor.
         let floor_sessions = (min_connections as u64).saturating_mul(bases.full_connection_bytes());
+        let header_sync_cap = config.zakura.header_sync.serving_sessions(connection_cap);
+        let block_sync_cap = config
+            .zakura
+            .block_sync
+            .block_sync_connections(connection_cap);
+        // Receive parts follow negotiation, so every connection may hold
+        // them. Session parts follow each reactor's sessions.
+        let every_connection = bases
+            .transport_base
+            .saturating_add(bases.header_sync.receive)
+            .saturating_add(bases.block_sync.receive)
+            .saturating_add(bases.tx_relay.total())
+            .saturating_add(bases.legacy_compat.total())
+            .saturating_add(bases.custom_kinds.total());
         let cap_sessions = (connection_cap as u64)
-            .saturating_mul(bases.full_connection_bytes())
+            .saturating_mul(every_connection)
+            .saturating_add((header_sync_cap as u64).saturating_mul(bases.header_sync.session))
+            .saturating_add((block_sync_cap as u64).saturating_mul(bases.block_sync.session))
             .max(floor_sessions);
 
         let floor_tx = u64::from(MAX_TX_BYTES);
@@ -843,6 +1088,92 @@ mod tests {
     use crate::zakura::memory::draft::resolved_p2p_budget_bytes;
 
     const GIB: u64 = 1024 * MIB;
+
+    fn bases() -> SessionBases {
+        let base = |receive, session| ReactorBase { receive, session };
+        SessionBases {
+            transport_base: 320 * KIB,
+            header_sync: base(256 * KIB, 256 * KIB),
+            block_sync: base(MIB, 4 * KIB),
+            tx_relay: base(64 * KIB, 32 * KIB),
+            legacy_compat: base(128 * KIB, 0),
+            custom_kinds: base(256 * KIB, 0),
+        }
+    }
+
+    const KIB: u64 = 1024;
+
+    /// fix-37: a negotiated reactor adds its receive part, because receive
+    /// credit covers it, and its session part only when its service admits
+    /// the peer. Custom kinds count only when negotiated.
+    #[test]
+    fn connection_cost_charges_sessions_only_for_admitted_reactors() {
+        let bases = bases();
+        let all = SESSION_REACTOR_CAPABILITIES;
+
+        let minimal = bases.connection_cost(0, all, false);
+        assert_eq!(minimal.total(), bases.transport_base);
+
+        let negotiated_only = bases.connection_cost(all, 0, false);
+        assert_eq!(
+            negotiated_only.total(),
+            320 * KIB + 256 * KIB + MIB + 64 * KIB + 128 * KIB
+        );
+        assert_eq!(SessionBases::funded_sessions(all, 0), 0);
+
+        let admitted = ZAKURA_CAP_HEADER_SYNC | ZAKURA_CAP_BLOCK_SYNC_REGULATED;
+        let cost = bases.connection_cost(all, admitted, false);
+        assert_eq!(cost.header_sync, bases.header_sync.total());
+        assert_eq!(cost.block_sync, bases.block_sync.total());
+        assert_eq!(cost.tx_relay, bases.tx_relay.receive);
+        assert_eq!(cost.custom_kinds, 0);
+        assert_eq!(SessionBases::funded_sessions(all, admitted), admitted);
+
+        let everything = bases.connection_cost(all, all, true);
+        assert_eq!(everything.total(), bases.full_connection_bytes());
+    }
+
+    /// fix-37: a service that admits a session after admission funds its
+    /// session part once.
+    #[test]
+    fn session_top_up_funds_each_reactor_once() {
+        let bases = bases();
+        let funded = ZAKURA_CAP_HEADER_SYNC;
+        assert_eq!(bases.session_top_up(funded, ZAKURA_CAP_HEADER_SYNC), None);
+        assert_eq!(
+            bases.session_top_up(funded, ZAKURA_CAP_TX_RELAY),
+            Some((ZAKURA_CAP_TX_RELAY, 32 * KIB))
+        );
+        // No session part, or no reactor these bases name.
+        assert_eq!(bases.session_top_up(0, ZAKURA_CAP_LEGACY_GOSSIP), None);
+        assert_eq!(bases.session_top_up(0, 0), None);
+    }
+
+    /// fix-32: inbound connections stop at three quarters of the sessions
+    /// share, so the last quarter stays for dials; both directions stay within
+    /// the share.
+    #[test]
+    fn session_directions_keep_the_dial_reserve() {
+        let share = 400;
+        let mut directions = SessionDirections::default();
+        assert!(directions.try_charge(ServicePeerDirection::Inbound, 300, share));
+        assert!(!directions.try_charge(ServicePeerDirection::Inbound, 1, share));
+        assert!(directions.try_charge(ServicePeerDirection::Outbound, 100, share));
+        assert!(!directions.try_charge(ServicePeerDirection::Outbound, 1, share));
+        assert_eq!(directions.inbound + directions.outbound, share);
+
+        directions.release(ServicePeerDirection::Inbound, 300);
+        // Outbound connections may use the inbound part too.
+        assert!(directions.try_charge(ServicePeerDirection::Outbound, 300, share));
+        assert!(!directions.try_charge(ServicePeerDirection::Inbound, 1, share));
+        assert_eq!(
+            directions,
+            SessionDirections {
+                inbound: 0,
+                outbound: 400
+            }
+        );
+    }
 
     /// fix-33: the smallest accepted budget funds `min_connections` connections
     /// carrying every reactor.

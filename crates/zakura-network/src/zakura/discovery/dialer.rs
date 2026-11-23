@@ -211,7 +211,7 @@ mod tests {
         };
         let reserve = |connections: usize, pending: usize| {
             let mut config = Config::default();
-            config.zakura.max_connections = connections;
+            config.zakura.max_connections = Some(connections);
             config.zakura.max_pending_handshakes = pending;
             ZakuraLocalLimits::from_config(&config)
                 .quic_bind_config(Vec::new())

@@ -381,10 +381,15 @@ mod tests {
                 quic <= u128::from(DEFAULT_ZAKURA_PEER_MEMORY_BUDGET_BYTES),
                 "{network:?}"
             );
-            assert_eq!(
-                config.budgeted_max_connections(&network),
-                Ok(DEFAULT_ZAKURA_MAX_CONNECTIONS),
-                "{network:?}"
+            // Unset `max_connections` defaults to `N_cap = 256` (`02 §8`), so the
+            // standalone 11 GiB budget funds at least the legacy 92 connections
+            // (106 on Mainnet/Testnet, 104 on Regtest).
+            let budgeted = config
+                .budgeted_max_connections(&network)
+                .expect("default budget fits");
+            assert!(
+                budgeted >= DEFAULT_ZAKURA_MAX_CONNECTIONS,
+                "{network:?}: budgeted={budgeted}"
             );
         }
         assert_eq!(
@@ -405,7 +410,7 @@ mod tests {
     fn the_budget_lowers_a_larger_connection_cap() {
         // A config generated before the budget existed still says 256.
         let config = ZakuraConfig {
-            max_connections: 256,
+            max_connections: Some(256),
             ..ZakuraConfig::default()
         };
         assert_eq!(config.budgeted_max_connections(&mainnet()), Ok(106));
@@ -413,7 +418,7 @@ mod tests {
         // Without `listen_addr` the endpoint binds IPv4 and IPv6 loopback, so it
         // reserves two socket queues.
         let config = ZakuraConfig {
-            max_connections: 256,
+            max_connections: Some(256),
             listen_addr: None,
             ..ZakuraConfig::default()
         };
@@ -422,7 +427,7 @@ mod tests {
         // Raising the windows lowers the cap instead of the throughput:
         // (11 GiB - 256 MiB - 32 × (64 MiB + 64 KiB)) / (64 MiB + 74,836,259 + 32 MiB).
         let config = ZakuraConfig {
-            max_connections: 256,
+            max_connections: Some(256),
             quic: QuicConfig {
                 receive_window_bytes: 64 << 20,
                 ..QuicConfig::default()
@@ -433,7 +438,7 @@ mod tests {
 
         // So does raising the handshake headroom (each handshake is only 128 KiB now).
         let config = ZakuraConfig {
-            max_connections: 256,
+            max_connections: Some(256),
             max_pending_handshakes: 1024,
             ..ZakuraConfig::default()
         };
@@ -441,7 +446,7 @@ mod tests {
 
         // So does a larger reactor share: a 64 MiB cwnd cap adds 32 MiB.
         let mut config = ZakuraConfig {
-            max_connections: 256,
+            max_connections: Some(256),
             ..ZakuraConfig::default()
         };
         config.block_sync.bbr_max_cwnd_bytes = 64 << 20;
@@ -453,7 +458,7 @@ mod tests {
 
         // A smaller cap stays as configured.
         let config = ZakuraConfig {
-            max_connections: 4,
+            max_connections: Some(4),
             ..ZakuraConfig::default()
         };
         assert_eq!(config.budgeted_max_connections(&mainnet()), Ok(4));
@@ -544,7 +549,7 @@ mod tests {
             (1, 1, 1),
         ] {
             let mut config = Config::default();
-            config.zakura.max_connections = connections;
+            config.zakura.max_connections = Some(connections);
             config.zakura.max_pending_handshakes = pending;
             let bind = ZakuraLocalLimits::from_config(&config).quic_bind_config(Vec::new());
             assert_eq!(
@@ -564,7 +569,7 @@ mod tests {
         for max_connections in 1..=160 {
             for max_pending_handshakes in 1..=64 {
                 let mut config = Config::default();
-                config.zakura.max_connections = max_connections;
+                config.zakura.max_connections = Some(max_connections);
                 config.zakura.max_pending_handshakes = max_pending_handshakes;
                 let limits = ZakuraLocalLimits::from_config(&config);
                 let bind = limits.quic_bind_config(Vec::new());
@@ -601,7 +606,7 @@ mod tests {
                 bind.dial_reserve,
                 bind.max_inbound_connections
             ),
-            (124, 8, Some(93))
+            (138, 8, Some(104))
         );
     }
 
@@ -618,7 +623,7 @@ mod tests {
             .iter()
             .map(|node_id| format!("{node_id}@192.0.2.1:8234"))
             .collect();
-        config.zakura.max_connections = 256;
+        config.zakura.max_connections = Some(256);
         config.zakura.memory_budget =
             crate::zakura::memory::ResolvedMemoryBudget::from_p2p_budget_b(budget_for(18));
         assert_eq!(config.zakura.budgeted_max_connections(&mainnet()), Ok(18));
@@ -677,7 +682,7 @@ mod tests {
         // A cap below the floor only needs the budget to cover that cap and
         // its headroom.
         let config = ZakuraConfig {
-            max_connections: 2,
+            max_connections: Some(2),
             memory_budget: crate::zakura::memory::ResolvedMemoryBudget::from_p2p_budget_b(
                 budget_for(2),
             ),

@@ -1085,11 +1085,9 @@ impl HeaderSyncReactor {
         let at_capacity = !replaces_same_direction
             && self.admitted_count(direction)
                 >= match direction {
-                    ServicePeerDirection::Inbound => {
-                        self.startup.config.peer_limits.max_inbound_peers
-                    }
+                    ServicePeerDirection::Inbound => self.startup.config.peer_limits.max_inbound(),
                     ServicePeerDirection::Outbound => {
-                        self.startup.config.peer_limits.max_outbound_peers
+                        self.startup.config.peer_limits.max_outbound()
                     }
                 };
         if at_capacity {

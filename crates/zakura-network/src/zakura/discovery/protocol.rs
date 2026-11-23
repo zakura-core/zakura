@@ -4733,7 +4733,7 @@ mod tests {
     #[test]
     fn block_sync_summary_uses_live_peer_slots() {
         let limits = ServicePeerLimits {
-            max_inbound_peers: 2,
+            max_inbound_peers: Some(2),
             ..ServicePeerLimits::default()
         };
         let status = block_sync_status();

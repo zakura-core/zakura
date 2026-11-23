@@ -58,6 +58,7 @@ pub(crate) enum NodeEnvelopeError {
     DecodedAllowance(&'static str),
     /// The connections' QUIC windows and the sockets' queues exceed the peer
     /// memory budget.
+    #[cfg(test)]
     #[error(
         "the Zakura QUIC envelope of {quic_bytes} bytes exceeds \
          the resolved [memory] budget ({budget_bytes} bytes)"
@@ -123,6 +124,7 @@ impl NodeEnvelope {
     /// The envelope of a node with this configuration that also serves
     /// `custom_kinds`, or an error if the peer memory budget can't fund its
     /// connections.
+    #[cfg(test)]
     pub(crate) fn for_node(
         config: &Config,
         limits: &ZakuraLocalLimits,
@@ -141,6 +143,39 @@ impl NodeEnvelope {
                 budget_bytes,
             });
         }
+        Self::new(
+            limits.transport_limits_for_kinds(
+                limits
+                    .reactor_shares()
+                    .kinds
+                    .iter()
+                    .map(|(kind, _)| *kind)
+                    .chain(custom_kinds.iter().copied()),
+            ),
+            quic_bytes,
+            config.tcp_ingress_bound_bytes(),
+            block_sync
+                .decoded_block_allowance(decoded_backend_blocks)
+                .map_err(NodeEnvelopeError::DecodedAllowance)?,
+            block_sync.decoded_pipeline_byte_bound(),
+            serve_output_bytes(config, limits),
+        )
+    }
+
+    /// Compose node envelope diagnostics when [`MemoryPlan`](crate::zakura::memory::MemoryPlan)
+    /// already enforced the full node memory ledger (`02 §8`), checking owner
+    /// bounds and decoded-block allowance without the legacy static QUIC cap.
+    pub(crate) fn for_memory_plan(
+        config: &Config,
+        limits: &ZakuraLocalLimits,
+        custom_kinds: &[u16],
+        decoded_backend_blocks: u64,
+    ) -> Result<Self, NodeEnvelopeError> {
+        let block_sync = &config.zakura.block_sync;
+        let quic_bytes =
+            config
+                .zakura
+                .quic_memory_bytes(&config.network, limits.max_connections, custom_kinds);
         Self::new(
             limits.transport_limits_for_kinds(
                 limits

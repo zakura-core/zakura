@@ -583,7 +583,7 @@ fn live_serving(source: Arc<Store>, max_bytes: u32) -> LiveServing {
     let config = ZakuraBlockSyncConfig {
         max_response_bytes: max_bytes,
         peer_limits: crate::zakura::ServicePeerLimits {
-            max_outbound_peers: 1,
+            max_outbound_peers: Some(1),
             ..Default::default()
         },
         ..Default::default()

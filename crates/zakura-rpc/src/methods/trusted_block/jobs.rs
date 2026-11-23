@@ -585,27 +585,14 @@ async fn local_approval(
     }
 }
 
-/// Whether a proposal verification error is a verdict on the proposal, as opposed to a failure
-/// to reach one.
+/// Whether proposal verification proved the proposal invalid, as opposed to failing to reach
+/// a verdict. The proposal's contextual check reports a failed state call, an uncommitted
+/// parent and a parent that is no longer the best tip as errors too; none of them is a verdict.
 fn is_proposal_rejection(error: &tower::BoxError) -> bool {
-    let Some(error) = error.downcast_ref::<RouterError>() else {
-        return false;
-    };
-    if error.is_verification_unavailable() {
-        return false;
-    }
-    match error {
-        RouterError::Block { source } => match source.as_ref() {
-            // The proposal's contextual check reports a failed state call, an uncommitted
-            // parent and a parent that is no longer the best tip through this same variant.
-            // Only a contextual rule failure is a verdict on the proposal.
-            zakura_consensus::VerifyBlockError::ValidateProposal(source) => source
-                .downcast_ref::<zakura_state::ValidateContextError>()
-                .is_some(),
-            _ => true,
-        },
-        RouterError::Checkpoint { .. } => true,
-    }
+    matches!(
+        error.downcast_ref::<RouterError>(),
+        Some(RouterError::Block { source }) if source.rejects_template()
+    )
 }
 
 /// Reports a blocking task that panicked or was cancelled. The job cannot reach an outcome.
@@ -662,12 +649,16 @@ mod tests {
                 "proposal is not based on the current best chain tip".into(),
             )),
             error(VerifyBlockError::ValidateProposal(
-                "state service is unavailable".into(),
+                "proposal state service is unavailable".into(),
             )),
             error(VerifyBlockError::Depth {
                 source: "state lookup failed".into(),
                 hash,
             }),
+            // A contextual error that does not prove this proposal invalid.
+            error(VerifyBlockError::ValidateProposal(Box::new(
+                zakura_state::ValidateContextError::InvalidAncestorBlock(hash),
+            ))),
         ];
         for error in no_verdict {
             assert!(!is_proposal_rejection(&error), "{error}");
@@ -676,9 +667,7 @@ mod tests {
                 .is_none());
         }
         let rejections = [
-            error(VerifyBlockError::ValidateProposal(Box::new(
-                zakura_state::ValidateContextError::InvalidAncestorBlock(hash),
-            ))),
+            error(VerifyBlockError::from(BlockError::MissingHeight(hash))),
             error(VerifyBlockError::from(BlockError::NoTransactions)),
         ];
         for error in rejections {

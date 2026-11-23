@@ -31,8 +31,13 @@ fn handler(ordinary: usize, extra: usize) -> ZakuraProtocolHandler {
     handler_from_config(&config)
 }
 
+/// A fresh node ID. Slots and rankings key on its 32 bytes alone, so no key
+/// is generated: deriving a node key pair is slow enough in debug builds for
+/// the wall-clock handshake cadence to refill a token in the middle of a test.
 fn new_node() -> NodeId {
-    NodeSecretKey::generate().public()
+    let mut bytes = [0; 32];
+    rand_10::Rng::fill_bytes(&mut zakura_rt::rand::rng(), &mut bytes);
+    NodeId::from_bytes(&bytes)
 }
 
 /// Publishes `ranking`, highest first, with the hold limit of the

@@ -118,7 +118,8 @@ the solved bytes is acknowledged and silently discarded if it names other bytes.
 
 If local verification cannot reach a verdict, for example because a state
 read failed, the relay does not retry it: the job keeps acknowledging inputs
-and releases only on a confirmation. The node logs this at info level.
+and releases only on a confirmation. The node logs this at info level and
+counts it in `rpc.trusted_submission.job.no_local_verdict`.
 
 A job waits up to 120 seconds from its first input for the rest of its inputs
 and for authority to release. A released job then follows the validation
@@ -289,8 +290,10 @@ Monitor `rpc.trusted_submission.*` metrics and rejection logs.
 `rpc.trusted_submission.job.saturated` counts first inputs refused because 16
 jobs were unfinished, and `rpc.trusted_submission.job.release.duration_seconds`
 records the time from receipt of the solved header to release, labelled by
-whether local verification or the confirmation authorized it. The receipt
-counter and histogram include job inputs.
+whether local verification or the confirmation authorized it.
+`rpc.trusted_submission.job.no_local_verdict` counts jobs whose local
+verification failed without proving the proposal invalid, which then depend on
+a confirmation. The receipt counter and histogram include job inputs.
 `rpc.trusted_submission.relay_requested_without_commit`, labelled by outcome,
 counts every submission whose early relay was requested but that this submission
 did not commit, with a warning log. `rpc.trusted_submission.duplicate_body`

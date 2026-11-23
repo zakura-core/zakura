@@ -567,8 +567,9 @@ async fn tip_leaves(tip: &mut impl ChainTip, parent: block::Hash) {
     }
 }
 
-/// An unavailable verifier gives no local verdict. Keep the primary confirmation eligible
-/// until the job deadline. An actual rejection vetoes early relay.
+/// A verification that fails without proving the proposal invalid gives no local verdict.
+/// Keep the primary confirmation eligible until the job deadline. An actual rejection vetoes
+/// early relay.
 async fn local_approval(
     verify: impl std::future::Future<Output = std::result::Result<block::Hash, tower::BoxError>>,
 ) -> std::result::Result<(), JobError> {
@@ -579,7 +580,8 @@ async fn local_approval(
             Err(JobError::Invalid)
         }
         Err(error) => {
-            tracing::info!(%error, "local proposal verification unavailable; awaiting primary confirmation");
+            metrics::counter!("rpc.trusted_submission.job.no_local_verdict").increment(1);
+            tracing::info!(%error, "local proposal verification reached no verdict; awaiting primary confirmation");
             std::future::pending().await
         }
     }

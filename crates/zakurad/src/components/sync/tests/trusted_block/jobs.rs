@@ -262,3 +262,51 @@ async fn committed_block_is_served_in_place_of_a_differing_prepared_body() {
         StatusCode::ACCEPTED
     );
 }
+
+/// A proposal that the relay's own contextual validation rejects never releases, even with a
+/// confirmation. The rejection travels from the real state service through the verifier, so
+/// this pins the error type the job's veto depends on.
+#[tokio::test(flavor = "multi_thread")]
+async fn proposal_rejected_by_contextual_validation_vetoes_the_job() {
+    let _init = zakura_test::init();
+    let relay = Node::new(None).await;
+    let mut invalid = relay.template().await;
+    // The header no longer commits to the block's chain history and authorizing data.
+    Arc::make_mut(&mut invalid.header).commitment_bytes[0] ^= 1;
+    let proposal = invalid.zcash_serialize_to_vec().unwrap();
+    let id = "33333333333333333333333333333333";
+    assert_eq!(
+        post_as(&relay, id, "prepare", proposal.clone()).await,
+        StatusCode::ACCEPTED
+    );
+    timeout(Duration::from_secs(20), async {
+        loop {
+            match post_as(&relay, id, "prepare", proposal.clone()).await {
+                StatusCode::BAD_REQUEST => break,
+                StatusCode::ACCEPTED => tokio::time::sleep(Duration::from_millis(10)).await,
+                status => panic!("unexpected response to a replayed proposal: {status}"),
+            }
+        }
+    })
+    .await
+    .expect("local verification rejects the proposal");
+
+    let mut receipt = invalid.hash().0.to_vec();
+    receipt.extend_from_slice(&Sha256::digest(&proposal));
+    assert_eq!(
+        post_as(
+            &relay,
+            id,
+            "solve",
+            invalid.header.zcash_serialize_to_vec().unwrap()
+        )
+        .await,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        post_as(&relay, id, "confirm", receipt).await,
+        StatusCode::BAD_REQUEST
+    );
+    assert!(relay.pending.get(invalid.hash()).is_none());
+    assert_eq!(relay.tip.best_tip_height(), Some(Height(0)));
+}

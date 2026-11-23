@@ -472,10 +472,11 @@ async fn solved_header_of_another_proposal_conflicts_and_ends_the_job() {
 async fn local_rejection_vetoes_release_even_with_a_confirmation() {
     let mut relay = Relay::at_parent();
     assert_eq!(relay.prepare().await, Ok(()));
-    relay
-        .proposal_verification()
-        .await
-        .respond_error(rejection());
+    let verification = relay.proposal_verification().await;
+    // The confirmation is already stored when the rejection arrives. The solved header is
+    // not, so the confirmation cannot have released the job first.
+    assert_eq!(relay.confirm().await, Ok(()));
+    verification.respond_error(rejection());
     assert_eq!(relay.outcome().await, Err(JobError::Invalid));
     assert_eq!(relay.solve().await, Err(JobError::Invalid));
     assert_eq!(relay.confirm().await, Err(JobError::Invalid));
@@ -610,6 +611,19 @@ async fn verification_failure_caused_by_a_moved_tip_ends_the_job_as_expired() {
             "proposal is not based on the current best chain tip".into(),
         ),
     )));
+    assert_eq!(relay.outcome().await, Err(JobError::Expired));
+}
+
+/// The worker sees the moved tip and a rejection at once. The tip decides: a verdict reached
+/// against a parent that is no longer the tip says nothing about the proposal.
+#[tokio::test(start_paused = true)]
+async fn moved_tip_takes_precedence_over_a_simultaneous_rejection() {
+    let mut relay = Relay::at_parent();
+    assert_eq!(relay.prepare().await, Ok(()));
+    let verification = relay.proposal_verification().await;
+    // Both happen before the worker runs again.
+    relay.set_tip(Height(1), block::Hash([9; 32]));
+    verification.respond_error(rejection());
     assert_eq!(relay.outcome().await, Err(JobError::Expired));
 }
 

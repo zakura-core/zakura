@@ -256,7 +256,7 @@ async fn committed_block_is_served_in_place_of_a_differing_prepared_body() {
         fetch_from_peer(&relay, valid.hash()).await,
         Some(valid_bytes)
     );
-    // The header hash is committed, so the job ended as committed.
+    // The header hash is committed, so inputs for the job are still acknowledged.
     assert_eq!(
         post_as(&relay, id, "confirm", receipt).await,
         StatusCode::ACCEPTED

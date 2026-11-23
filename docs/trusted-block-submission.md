@@ -109,12 +109,16 @@ ID. Job responses are:
 | 429 | Sixteen jobs are unfinished, or the relay's pending-body or submission capacity is exhausted. |
 | 503 | The relay could not establish an outcome. |
 
-Once a job has ended, every later input for its ID gets the job's outcome, for
-120 seconds after it ended. The relay remembers the 64 most recently ended IDs.
+Once a job has ended, every later well-formed input for its ID gets the job's
+outcome, for 120 seconds after it ended. The relay remembers the 64 most recently ended IDs.
 An input for an ID it no longer remembers starts a new job, which can never
 release without its proposal, so do not send inputs for a job more than
 120 seconds after it ended. A confirmation that arrives before the relay knows
 the solved bytes is acknowledged and silently discarded if it names other bytes.
+
+If local verification cannot reach a verdict, for example because a state
+read failed, the relay does not retry it: the job keeps acknowledging inputs
+and releases only on a confirmation. The node logs this at info level.
 
 A job waits up to 120 seconds from its first input for the rest of its inputs
 and for authority to release. A released job then follows the validation

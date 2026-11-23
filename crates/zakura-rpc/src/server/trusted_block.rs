@@ -30,8 +30,11 @@ pub(super) type Submit = Arc<dyn Fn(Bytes) -> SubmissionFuture + Send + Sync>;
 pub(super) type JobFuture = Pin<Box<dyn Future<Output = Result<(), JobError>> + Send>>;
 pub(super) type SubmitJob = Arc<dyn Fn(JobId, Operation, Bytes) -> JobFuture + Send + Sync>;
 
+/// What an admitted request submits.
 enum Route {
+    /// One complete block, answered with its validation outcome.
     Full(Submit),
+    /// One input of a prepared job, acknowledged on receipt.
     Job(JobId, Operation, SubmitJob),
 }
 
@@ -80,6 +83,7 @@ impl<S> TrustedBlockHttpService<S> {
         }
     }
 
+    /// Routes the `op` query's job operations to `jobs`. Without it they answer 404.
     pub(super) fn with_jobs(mut self, jobs: Option<SubmitJob>) -> Self {
         self.jobs = jobs;
         self

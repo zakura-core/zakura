@@ -195,6 +195,17 @@ fn turning_off_the_end_of_support_halt_is_refused_on_a_mining_node() {
     // Support does not end outside Mainnet, so there is no halt for a miner to keep.
     config.end_of_support.halt = false;
     config.network.network = Network::new_default_testnet();
+    config.mining = mining::Config {
+        miner_address: Some(
+            default_miner_address(
+                config.network.network.kind(),
+                &MinerAddressType::Transparent,
+            )
+            .parse()
+            .expect("the default miner address is valid"),
+        ),
+        ..Default::default()
+    };
     cmd.override_config(config)
         .expect("a Testnet miner has no halt to turn off");
 }

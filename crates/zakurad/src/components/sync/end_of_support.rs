@@ -226,7 +226,7 @@ impl SupportWindow {
 /// A network upgrade that this release implements and that has not activated yet.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UpgradeAhead {
-    /// The next network upgrade after the tip.
+    /// The network upgrade.
     pub upgrade: NetworkUpgrade,
     /// The height at which it activates.
     pub activation_height: Height,
@@ -234,27 +234,12 @@ pub struct UpgradeAhead {
     pub remaining_blocks: u32,
 }
 
-/// Returns the next network upgrade that activates after `tip_height` on `network`.
+/// Returns the network upgrade that a release which keeps running past `window`
+/// will reach unsupported: the first upgrade that activates after both
+/// `tip_height` and the window.
 ///
 /// Only upgrades with an activation height in this release are known. An upgrade
 /// that was scheduled after this release was built is not reported.
-pub fn upgrade_ahead(tip_height: Height, network: &Network) -> Option<UpgradeAhead> {
-    let (activation_height, upgrade) = network
-        .activation_list()
-        .range((Bound::Excluded(tip_height), Bound::Unbounded))
-        .map(|(activation_height, upgrade)| (*activation_height, *upgrade))
-        .next()?;
-
-    Some(UpgradeAhead {
-        upgrade,
-        activation_height,
-        remaining_blocks: activation_height.0.saturating_sub(tip_height.0),
-    })
-}
-
-/// Returns the network upgrade that a release which keeps running past `window`
-/// will reach unsupported: the next upgrade ahead of `tip_height`, if it
-/// activates after the window.
 ///
 /// Returns `None` while the end of the window is not close, and for a release
 /// that halts at the end of its window.
@@ -268,8 +253,19 @@ pub fn unsupported_upgrade_ahead(
         return None;
     }
 
-    upgrade_ahead(tip_height, network)
-        .filter(|upgrade_ahead| upgrade_ahead.activation_height > window.last_supported_height)
+    // An upgrade that activates inside the window is supported, so skip to the
+    // end of the window when the tip has not reached it.
+    let after_height = tip_height.max(window.last_supported_height);
+
+    network
+        .activation_list()
+        .range((Bound::Excluded(after_height), Bound::Unbounded))
+        .next()
+        .map(|(activation_height, upgrade)| UpgradeAhead {
+            upgrade: *upgrade,
+            activation_height: *activation_height,
+            remaining_blocks: activation_height.0.saturating_sub(tip_height.0),
+        })
 }
 
 /// A network upgrade that activated while the release was unsupported.
@@ -596,65 +592,49 @@ mod tests {
     }
 
     #[test]
-    fn upgrade_ahead_is_the_next_known_activation() {
+    fn upgrade_ahead_is_the_first_one_a_release_reaches_unsupported() {
         let _init_guard = zakura_test::init();
         let network = Network::Mainnet;
         let (activation_height, upgrade) = last_mainnet_upgrade();
-
-        assert_eq!(
-            upgrade_ahead(Height(activation_height.0 - 100), &network),
-            Some(UpgradeAhead {
-                upgrade,
-                activation_height,
-                remaining_blocks: 100,
-            }),
-        );
-        assert_eq!(
-            upgrade_ahead(Height(activation_height.0 - 1), &network),
-            Some(UpgradeAhead {
-                upgrade,
-                activation_height,
-                remaining_blocks: 1,
-            }),
-        );
-
-        // The upgrade is no longer ahead once it activates, and this release
-        // knows no upgrade after its last one.
-        assert_eq!(upgrade_ahead(activation_height, &network), None);
-        assert_eq!(upgrade_ahead(Height::MAX, &network), None);
-    }
-
-    #[test]
-    fn upgrade_ahead_only_concerns_a_release_that_reaches_it_unsupported() {
-        let _init_guard = zakura_test::init();
-        let network = Network::Mainnet;
-        let (activation_height, _) = last_mainnet_upgrade();
         let window = SupportWindow::ending_at(Height(activation_height.0 - 1_000), &network);
-        let unsupported_tip = Height(activation_height.0 - 100);
         let expiring_tip = window.last_supported_height();
         let keeps_running = Config { halt: false };
+        let ahead = |tip_height: Height| {
+            Some(UpgradeAhead {
+                upgrade,
+                activation_height,
+                remaining_blocks: activation_height.0 - tip_height.0,
+            })
+        };
 
-        assert!(upgrade_ahead(unsupported_tip, &network).is_some());
-        assert_eq!(
-            unsupported_upgrade_ahead(unsupported_tip, &window, &network, keeps_running),
-            upgrade_ahead(unsupported_tip, &network),
-        );
-        // The upgrade is already named while the window is about to end.
+        // The upgrade is named from the last days of the window until it activates.
         assert_eq!(window.status(expiring_tip), SupportStatus::Expiring);
         assert_eq!(
             unsupported_upgrade_ahead(expiring_tip, &window, &network, keeps_running),
-            upgrade_ahead(expiring_tip, &network),
+            ahead(expiring_tip),
         );
+        for blocks_before_activation in [100, 1] {
+            let unsupported_tip = Height(activation_height.0 - blocks_before_activation);
+            assert_eq!(
+                unsupported_upgrade_ahead(unsupported_tip, &window, &network, keeps_running),
+                ahead(unsupported_tip),
+            );
+            assert_eq!(
+                ahead(unsupported_tip).map(|ahead| ahead.remaining_blocks),
+                Some(blocks_before_activation),
+            );
 
-        // A release that halts never runs unsupported.
-        assert_eq!(
-            unsupported_upgrade_ahead(unsupported_tip, &window, &network, Config::default()),
-            None,
-        );
+            // A release that halts never runs unsupported.
+            assert_eq!(
+                unsupported_upgrade_ahead(unsupported_tip, &window, &network, Config::default()),
+                None,
+            );
+        }
         assert_eq!(
             unsupported_upgrade_ahead(expiring_tip, &window, &network, Config::default()),
             None,
         );
+
         // Nothing is reported while the end of the window is not close.
         assert_eq!(window.status(Height(0)), SupportStatus::Supported);
         assert_eq!(
@@ -666,10 +646,43 @@ mod tests {
             unsupported_upgrade_ahead(activation_height, &window, &network, keeps_running),
             None,
         );
+        assert_eq!(
+            unsupported_upgrade_ahead(Height::MAX, &window, &network, keeps_running),
+            None,
+        );
+    }
 
-        // A release is supported at an upgrade that activates inside its window.
-        let window = SupportWindow::ending_at(Height(activation_height.0 + 1_000), &network);
-        let expiring_tip = Height(activation_height.0 - 10);
+    #[test]
+    fn upgrade_ahead_skips_upgrades_inside_the_support_window() {
+        let _init_guard = zakura_test::init();
+        let network = Network::Mainnet;
+        let keeps_running = Config { halt: false };
+        let upgrades = network.full_activation_list();
+        let [.., (supported_activation, _), (unsupported_activation, unsupported_upgrade)] =
+            upgrades[..]
+        else {
+            panic!("Mainnet has at least two network upgrades");
+        };
+
+        // The window ends between the last two upgrades, and the tip is before both.
+        let window = SupportWindow::ending_at(Height(supported_activation.0 + 100), &network);
+        let expiring_tip = Height(supported_activation.0 - 10);
+        assert!(window.last_supported_height() < unsupported_activation);
+        assert_eq!(window.status(expiring_tip), SupportStatus::Expiring);
+
+        // The release is supported at the first upgrade, so the second is reported.
+        assert_eq!(
+            unsupported_upgrade_ahead(expiring_tip, &window, &network, keeps_running),
+            Some(UpgradeAhead {
+                upgrade: unsupported_upgrade,
+                activation_height: unsupported_activation,
+                remaining_blocks: unsupported_activation.0 - expiring_tip.0,
+            }),
+        );
+
+        // No upgrade is reported when the last one activates inside the window.
+        let window = SupportWindow::ending_at(Height(unsupported_activation.0 + 1_000), &network);
+        let expiring_tip = Height(unsupported_activation.0 - 10);
         assert_eq!(window.status(expiring_tip), SupportStatus::Expiring);
         assert_eq!(
             unsupported_upgrade_ahead(expiring_tip, &window, &network, keeps_running),

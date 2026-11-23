@@ -337,7 +337,7 @@ fn configs(
 ) -> (zakura_network::Config, zakura_network::Config) {
     let (mut node, mut mirror) = (wire_config_for(network), wire_config_for(network));
     if let Some(windows) = windows {
-        node.zakura.quic.receive_window_bytes = windows.node_receive_window_bytes;
+        node.zakura.quic.receive_window_bytes = Some(windows.node_receive_window_bytes);
         mirror.zakura.quic.send_window_bytes = windows.mirror_send_window_bytes;
     }
     (node, mirror)

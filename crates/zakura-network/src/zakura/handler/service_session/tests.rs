@@ -612,7 +612,7 @@ async fn raw_connection() -> Result<(QuicEndpoint, QuicEndpoint, Connection, Con
     let factory = || {
         LocalEndpointFactory::with_limits(&local).quic_config(QuicConfig {
             stream_receive_window_bytes: 64 * 1024,
-            receive_window_bytes: 128 * 1024,
+            receive_window_bytes: Some(128 * 1024),
             send_window_bytes: 64 * 1024,
             ..local.quic.clone()
         })
@@ -649,7 +649,7 @@ async fn serving_sets_the_window_to_the_negotiated_shares() -> Result<(), BoxErr
         other: budget(2 * 1024 * KIB),
     };
     let local = ZakuraLocalLimits::from_config(&Config::default()).with_reactor_shares(shares);
-    assert_eq!(u64::from(local.quic.receive_window_bytes), 256 * KIB);
+    assert_eq!(u64::from(local.quic.receive_window()), 256 * KIB);
     assert_eq!(
         u64::from(local.quic.stream_receive_window_bytes),
         3 * 1024 * KIB

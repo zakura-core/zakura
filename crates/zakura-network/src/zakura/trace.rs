@@ -547,6 +547,11 @@ impl ZakuraTrace {
                 Some(plan.derivation.rho_denominator),
             );
             insert_optional_u64(row, "budget_b", Some(plan.pool_config.budget_b));
+            insert_optional_u64(
+                row,
+                "override_warnings_count",
+                u64::try_from(plan.override_warnings.len()).ok(),
+            );
             insert_optional_u64(row, "fixed_total", Some(plan.fixed.total()));
             insert_optional_u64(row, "fixed_socket_queues", Some(plan.fixed.socket_queues));
             insert_optional_u64(

@@ -68,10 +68,10 @@ impl RawLayoutPeer {
         // Raw test peers do not run `serve_connection`, so raise handshake-sized
         // windows to admitted defaults after the control handshake succeeds.
         let receive_window =
-            if u64::from(limits.quic.receive_window_bytes) == CONTROL_RECEIVE_BYTES {
+            if u64::from(limits.quic.receive_window()) == CONTROL_RECEIVE_BYTES {
                 u64::from(DEFAULT_ZAKURA_RECEIVE_WINDOW)
             } else {
-                u64::from(limits.quic.receive_window_bytes)
+                u64::from(limits.quic.receive_window())
             };
         let _ = connection.set_limits(
             zakura_quic::ConnLimits::default()

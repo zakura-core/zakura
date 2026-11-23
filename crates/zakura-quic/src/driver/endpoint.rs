@@ -300,7 +300,7 @@ impl<F: SocketFactory> EndpointTask<F> {
         );
         let config = &self.shared.config;
         let limits = CurrentLimits {
-            receive_window: u64::from(config.receive_window_bytes),
+            receive_window: u64::from(config.receive_window()),
             send_window: config.send_window_bytes,
             max_bidi_streams: u64::from(self.shared.max_bidi_streams),
         };

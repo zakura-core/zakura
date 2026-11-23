@@ -826,7 +826,7 @@ Rules for every key:
 | CTRL-3 | `congestion_controller` | enum `cubic` \| `new_reno` | `cubic` | — | `congestion_controller_factory` | MUST be set explicitly, even for the default. Changing the default needs the PLAN step 12 fleet A/B and a spec change. The driver wraps the factory per connection to observe the controller (OBS-12). |
 | CTRL-4 | `initial_window_bytes` | optional u64 | unset (`quinn-proto` default for the controller) | 14,720 – 16 MiB | `{Cubic,NewReno}Config::initial_window` | |
 | CTRL-5 | `stream_receive_window_bytes` | u32 | 16 MiB | 64 KiB – 256 MiB | `stream_receive_window` | The Iroh backend's constant |
-| CTRL-6 | `receive_window_bytes` | u32 | 32 MiB | 64 KiB – 1 GiB | `receive_window` | The Iroh backend's constant; the window each connection starts with, which may be below CTRL-5 |
+| CTRL-6 | `receive_window_bytes` | optional u32 | unset (32 MiB) | 64 KiB – 1 GiB | `receive_window` | The Iroh backend's constant; the window each connection starts with, which may be below CTRL-5. Unset lets an application choose a smaller handshake window, as Zakura's control share does |
 | CTRL-7 | `send_window_bytes` | u64 | 32 MiB | 64 KiB – 1 GiB | `send_window` | The Iroh backend's constant |
 | CTRL-9 | `ack_frequency` | bool | `false` | — | `ack_frequency_config` | Sends ACK_FREQUENCY frames when `true` (WIRE-9) |
 | CTRL-10 | `idle_timeout_secs` | u32 | 150 | 30 – 600 | `max_idle_timeout` | The Iroh backend's constant. MUST exceed `keep_alive_interval_secs` × 3. |

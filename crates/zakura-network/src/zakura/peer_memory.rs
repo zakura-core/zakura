@@ -429,7 +429,7 @@ mod tests {
         let config = ZakuraConfig {
             max_connections: Some(256),
             quic: QuicConfig {
-                receive_window_bytes: 64 << 20,
+                receive_window_bytes: Some(64 << 20),
                 ..QuicConfig::default()
             },
             ..ZakuraConfig::default()
@@ -646,7 +646,7 @@ mod tests {
     fn a_budget_below_the_floor_names_the_key() {
         let config = ZakuraConfig {
             quic: QuicConfig {
-                receive_window_bytes: 1 << 30,
+                receive_window_bytes: Some(1 << 30),
                 ..QuicConfig::default()
             },
             ..ZakuraConfig::default()

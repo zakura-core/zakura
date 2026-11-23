@@ -1614,7 +1614,7 @@ async fn releasing_a_credit_hold_unblocks_the_sender() {
     tokio::time::timeout(TEST_TIMEOUT, async {
         let config = QuicConfig {
             // usize fits in u32 for this constant.
-            receive_window_bytes: WINDOW as u32,
+            receive_window_bytes: Some(WINDOW as u32),
             // A larger stream window, so the connection window blocks.
             stream_receive_window_bytes: 4 * WINDOW as u32,
             ..test_config()
@@ -1769,7 +1769,7 @@ async fn final_sample_names_the_local_close_cause() {
 fn small_windows() -> QuicConfig {
     QuicConfig {
         stream_receive_window_bytes: 64 * 1024,
-        receive_window_bytes: 128 * 1024,
+        receive_window_bytes: Some(128 * 1024),
         send_window_bytes: 64 * 1024,
         ..test_config()
     }

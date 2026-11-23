@@ -486,7 +486,7 @@ async fn a_stalled_response_strands_at_most_its_kinds_output_share() -> Result<(
     // The peer's small stream window stalls a response of 400 frames.
     let peer = LocalEndpointFactory::new().quic_config(QuicConfig {
         stream_receive_window_bytes: 64 * 1024,
-        receive_window_bytes: 128 * 1024,
+        receive_window_bytes: Some(128 * 1024),
         ..QuicConfig::default()
     });
     let mut link = Link::connect_with(peer).await?;
@@ -599,7 +599,7 @@ async fn cancelling_the_connection_ends_a_stalled_response_write() -> Result<(),
     // The peer's small stream window stalls a response of 400 frames.
     let peer = LocalEndpointFactory::new().quic_config(QuicConfig {
         stream_receive_window_bytes: 64 * 1024,
-        receive_window_bytes: 128 * 1024,
+        receive_window_bytes: Some(128 * 1024),
         ..QuicConfig::default()
     });
     let mut link = Link::connect_with(peer).await?;
@@ -1389,7 +1389,7 @@ async fn received_frame_bytes_stay_inside_receive_credit_until_release() -> Resu
     // only QUIC credit withholding can stop the peer once 64 KiB are held.
     let server = LocalEndpointFactory::new().quic_config(QuicConfig {
         stream_receive_window_bytes: WINDOW,
-        receive_window_bytes: WINDOW,
+        receive_window_bytes: Some(WINDOW),
         ..QuicConfig::default()
     });
     let mut link = Link::connect_pair(server, LocalEndpointFactory::new()).await?;

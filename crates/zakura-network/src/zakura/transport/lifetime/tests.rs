@@ -167,7 +167,7 @@ fn quic_shares_keep_the_configured_windows() {
     let shares = ReactorShares::from_quic(&quic);
     assert_eq!(
         shares.control_receive_bytes,
-        u64::from(quic.receive_window_bytes)
+        u64::from(quic.receive_window())
     );
     assert_eq!(
         shares.stream_receive_window(),
@@ -176,7 +176,7 @@ fn quic_shares_keep_the_configured_windows() {
     assert_eq!(shares.share(7).output, DEFAULT_REACTOR_OUTPUT_BYTES);
     assert_eq!(
         shares.receive_window([5, 6]),
-        u64::from(quic.receive_window_bytes) + 2 * u64::from(quic.stream_receive_window_bytes)
+        u64::from(quic.receive_window()) + 2 * u64::from(quic.stream_receive_window_bytes)
     );
 }
 

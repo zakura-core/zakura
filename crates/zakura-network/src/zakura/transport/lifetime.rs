@@ -124,7 +124,7 @@ impl ReactorShares {
     /// of received frames and [`DEFAULT_REACTOR_OUTPUT_BYTES`] of output.
     pub fn from_quic(quic: &QuicConfig) -> Self {
         Self {
-            control_receive_bytes: u64::from(quic.receive_window_bytes),
+            control_receive_bytes: u64::from(quic.receive_window()),
             kinds: Vec::new(),
             other: ReactorBudget {
                 receive: ReceiveBudget::unsolicited_only(u64::from(

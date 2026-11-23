@@ -582,7 +582,8 @@ impl ZakuraConfig {
     /// Each reactor's receive and output share on one connection on
     /// `network`, keyed by its stream kind.
     ///
-    /// The handshake share is the `[network.zakura.quic]` receive window. The
+    /// The handshake share is the `[network.zakura.quic]` receive window if
+    /// set, and [`CONTROL_RECEIVE_BYTES`] if not. The
     /// kinds are legacy gossip (2), legacy requests (3), discovery (4), header
     /// sync (5) and block sync (6), and `tx-relay`'s data (9) and state (10)
     /// when it is enabled. The compatibility exchanges and TCP ingress
@@ -631,12 +632,12 @@ impl ZakuraConfig {
             kinds.push((BPV1_CONTROL_KIND, BPV1_CONTROL_BUDGET));
             kinds.push((BPV1_DATA_KIND, BPV1_DATA_BUDGET));
         }
-        let control_receive_bytes =
-            if self.quic.receive_window_bytes == DEFAULT_ZAKURA_RECEIVE_WINDOW {
-                CONTROL_RECEIVE_BYTES
-            } else {
-                u64::from(self.quic.receive_window_bytes)
-            };
+        // An unset window gets the derived control share; a set one is the
+        // operator's handshake window, even if it equals the default.
+        let control_receive_bytes = self
+            .quic
+            .receive_window_bytes
+            .map_or(CONTROL_RECEIVE_BYTES, u64::from);
         ReactorShares {
             control_receive_bytes,
             kinds,
@@ -873,7 +874,7 @@ impl ZakuraLocalLimits {
     /// the shares that the cap was budgeted from.
     fn with_reactor_shares(mut self, shares: ReactorShares) -> Self {
         self.quic.receive_window_bytes =
-            u32::try_from(shares.control_receive_bytes).unwrap_or(u32::MAX);
+            Some(u32::try_from(shares.control_receive_bytes).unwrap_or(u32::MAX));
         self.quic.stream_receive_window_bytes =
             u32::try_from(shares.stream_receive_window()).unwrap_or(u32::MAX);
         self.quic.send_window_bytes =
@@ -6225,6 +6226,16 @@ async fn spawn_zakura_endpoint_inner(
             .map(super::memory::ByteSize::bytes),
     );
     info!(plan = %memory_plan, "sized and enforced Zakura startup memory plan");
+    for warning in &memory_plan.override_warnings {
+        warn!(
+            setting = %warning.setting,
+            configured = %warning.configured_value,
+            excess_bytes = warning.excess_bytes,
+            plan_value = %warning.plan_value,
+            budget_b = memory_plan.pool_config.budget_b,
+            "operator setting can exceed [memory] budget: {warning}"
+        );
+    }
     let limits = memory_plan.local_limits(config);
     let node_envelope = crate::zakura::node_envelope::NodeEnvelope::for_memory_plan(
         config,
@@ -10699,6 +10710,23 @@ mod tests {
         );
     }
 
+    /// fix-18: an operator who sets the default receive window keeps it as the
+    /// handshake share; only an unset window takes the control share.
+    #[test]
+    fn a_set_receive_window_is_the_handshake_share_even_at_the_default() {
+        let network = Network::Mainnet;
+        let mut config = ZakuraConfig::default();
+        assert_eq!(
+            config.reactor_shares(&network).control_receive_bytes,
+            CONTROL_RECEIVE_BYTES
+        );
+        config.quic.receive_window_bytes = Some(DEFAULT_ZAKURA_RECEIVE_WINDOW);
+        assert_eq!(
+            config.reactor_shares(&network).control_receive_bytes,
+            u64::from(DEFAULT_ZAKURA_RECEIVE_WINDOW)
+        );
+    }
+
     /// The `[network.zakura.quic]` defaults must keep the transport values
     /// that regulation sizing and the stream-conformance properties assume.
     #[test]
@@ -10708,7 +10736,7 @@ mod tests {
             quic.stream_receive_window_bytes,
             DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW
         );
-        assert_eq!(quic.receive_window_bytes, DEFAULT_ZAKURA_RECEIVE_WINDOW);
+        assert_eq!(quic.receive_window(), DEFAULT_ZAKURA_RECEIVE_WINDOW);
         assert_eq!(quic.send_window_bytes, DEFAULT_ZAKURA_SEND_WINDOW);
         assert_eq!(quic.idle_timeout(), DEFAULT_ZAKURA_QUIC_IDLE_TIMEOUT);
         assert_eq!(
@@ -12323,10 +12351,12 @@ mod tests {
         // largest stream window, so a paused stream leaves sibling credit.
         let server = LocalEndpointFactory::with_limits(&local)
             .quic_config(QuicConfig {
-                receive_window_bytes: local
-                    .quic
-                    .receive_window_bytes
-                    .saturating_add(local.quic.stream_receive_window_bytes),
+                receive_window_bytes: Some(
+                    local
+                        .quic
+                        .receive_window()
+                        .saturating_add(local.quic.stream_receive_window_bytes),
+                ),
                 ..local.quic.clone()
             })
             .endpoint(52)

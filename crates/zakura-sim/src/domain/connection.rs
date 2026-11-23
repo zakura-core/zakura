@@ -480,7 +480,7 @@ impl ConnectionFold {
     /// trigger histories of it and [`CREDIT_ISOLATED`] read.
     fn shares(&mut self, bounds: &WireBounds, connection: u64, kinds: &[crate::observe::KindLoad]) {
         let shares = bounds.node.reactor_shares();
-        let handshake = u64::from(bounds.node.quic.receive_window_bytes);
+        let handshake = u64::from(bounds.node.quic.receive_window());
         self.holding.remove(&connection);
         self.findings.shares.judged = true;
         for load in kinds {

@@ -1563,7 +1563,7 @@ mod tests {
 
         let quic = QuicConfig {
             stream_receive_window_bytes: 64 * 1024,
-            receive_window_bytes: 128 * 1024,
+            receive_window_bytes: Some(128 * 1024),
             ..victim.limits().quic.clone()
         };
         assert!(block_size(&large) > quic.stream_receive_window_bytes);
@@ -2162,7 +2162,7 @@ mod tests {
         // unread must stall the serving writer while downloads still progress.
         let quic = QuicConfig {
             stream_receive_window_bytes: 64 * 1024,
-            receive_window_bytes: 128 * 1024,
+            receive_window_bytes: Some(128 * 1024),
             ..victim.limits().quic.clone()
         };
         assert!(block_size(&large) > quic.stream_receive_window_bytes);

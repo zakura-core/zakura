@@ -176,7 +176,7 @@ fn the_default_envelope_sums_the_reactor_shares() {
         crate::zakura::BLOCK_SYNC_REACTOR_BUDGET.receive_total()
     );
     assert_eq!(
-        u64::from(limits.quic.receive_window_bytes),
+        u64::from(limits.quic.receive_window()),
         crate::zakura::CONTROL_RECEIVE_BYTES
     );
     assert_eq!(

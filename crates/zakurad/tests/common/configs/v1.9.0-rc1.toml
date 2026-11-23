@@ -168,7 +168,6 @@ keep_alive_interval_secs = 10
 kernel_drop_poll_secs = 10
 max_incoming = 65536
 mtu_discovery = true
-receive_window_bytes = 33554432
 recv_buffer_bytes = 7340032
 retry_threshold = 8
 send_buffer_bytes = 7340032

@@ -281,7 +281,7 @@ async fn start_test_zakura_endpoint_with_registry() -> (crate::zakura::ZakuraEnd
     let key_byte = u8::try_from(key_index).expect("key index is in 1..=255 due to modulo");
     let secret = format!("{key_byte:02x}").repeat(32);
     let mut config: Config = toml::from_str(&format!(
-        "p2p_stack = 'dual'\nzakura_node_secret_key = '{secret}'\n[zakura]\nlisten_addr = '127.0.0.1:0'"
+        "p2p_stack = 'dual'\ncache_dir = false\nzakura_node_secret_key = '{secret}'\n[zakura]\nlisten_addr = '127.0.0.1:0'"
     ))
     .expect("test Zakura config with explicit identity key must parse");
     config.identity_dir = crate::config::test_identity_dir();

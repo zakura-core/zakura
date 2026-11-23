@@ -5997,6 +5997,17 @@ async fn spawn_zakura_endpoint_inner(
         endpoint.push_header_sync_task(task).await;
     }
 
+    // Restore the peers the previous run knew before the dialer starts, so a
+    // restart reconnects to them instead of only to the bootstrap peers.
+    if let Some(saver) = discovery::start_discovery_book_cache(
+        &discovery,
+        config,
+        endpoint.background_shutdown_token(),
+    )
+    .await
+    {
+        endpoint.push_header_sync_task(saver).await;
+    }
     super::discovery::insert_static_bootstrap_candidates(
         &discovery,
         &config.zakura.bootstrap_peers,

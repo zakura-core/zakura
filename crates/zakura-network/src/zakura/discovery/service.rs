@@ -4586,4 +4586,104 @@ mod tests {
         assert!(answered, "the node answers the GetPeers before it closes");
         Ok(())
     }
+
+    /// A node's discovery book survives a restart: the saver writes it when the
+    /// endpoint shuts down, and the next start imports it before dialing.
+    #[tokio::test]
+    async fn discovery_book_saved_at_shutdown_reloads_on_the_next_start(
+    ) -> Result<(), crate::BoxError> {
+        use crate::{
+            config::CacheDir,
+            zakura::discovery::{start_discovery_book_cache, ZakuraDiscoveryPersistedEntry},
+            Config, P2pStack,
+        };
+
+        let handshake = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
+        let local_secret = NodeSecretKey::generate();
+        let new_handle = || {
+            let (_connected_tx, connected_rx) = watch::channel(Vec::new());
+            ZakuraDiscoveryHandle::new(
+                ZakuraDiscoveryLocalConfig {
+                    secret_key: local_secret.clone(),
+                    direct_addrs: Vec::new(),
+                    services: vec![ZakuraServiceId::discovery()],
+                    zakura_protocol_min: handshake.zakura_protocol_min,
+                    zakura_protocol_max: handshake.zakura_protocol_max,
+                    network_id: handshake.network_id,
+                    chain_id: handshake.chain_id,
+                    last_authored_sequence: None,
+                },
+                ZakuraDiscoveryConfig::default(),
+                connected_rx,
+            )
+        };
+
+        let peer_record = signed_discovery_record(&NodeSecretKey::generate(), &handshake)?;
+        let peer_node_id = peer_record.body.node_id();
+        let now = current_test_unix_secs();
+        let first_run = new_handle()?;
+        let outcome = first_run
+            .import_persisted_entries([ZakuraDiscoveryPersistedEntry {
+                record: peer_record.clone(),
+                source: None,
+                is_static: false,
+                last_seen: now,
+                last_dial_attempt: Some(now),
+                last_success: Some(now),
+                confirmed_addrs: peer_record.body.direct_addrs.clone(),
+                dialed_addrs: peer_record.body.direct_addrs.clone(),
+                failure_count: 0,
+            }])
+            .await;
+        assert_eq!(outcome.added, 1, "the first run knows the peer");
+
+        let dir = tempfile::tempdir()?;
+        let mut config = Config {
+            cache_dir: CacheDir::custom_path(dir.path()),
+            ..Config::for_test(P2pStack::Zakura)
+        };
+        let shutdown = CancellationToken::new();
+        let saver = start_discovery_book_cache(&first_run, &config, shutdown.clone())
+            .await
+            .expect("an enabled cache starts its saver");
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), saver)
+            .await
+            .expect("the saver finishes promptly after shutdown")?;
+
+        let filename = format!("mainnet.{}.zakura-discovery-book", local_secret.public());
+        let path = dir.path().join("network").join(&filename);
+        let saved = std::fs::read(&path)?;
+        assert!(!saved.is_empty());
+        assert!(!config.identity_dir.join(&filename).exists());
+
+        let second_run = new_handle()?;
+        let shutdown = CancellationToken::new();
+        let saver = start_discovery_book_cache(&second_run, &config, shutdown.clone())
+            .await
+            .expect("the enabled cache is restored");
+        assert_eq!(
+            second_run.record_for(peer_node_id).await,
+            Some(peer_record),
+            "the restarted node knows the peer before it dials"
+        );
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), saver).await??;
+
+        config.cache_dir = CacheDir::disabled();
+        let disabled_run = new_handle()?;
+        assert!(
+            start_discovery_book_cache(&disabled_run, &config, CancellationToken::new())
+                .await
+                .is_none(),
+            "disabled caching starts no writer"
+        );
+        assert_eq!(
+            disabled_run.record_for(peer_node_id).await,
+            None,
+            "disabled caching does not import the existing file"
+        );
+        assert!(!config.identity_dir.join(filename).exists());
+        Ok(())
+    }
 }

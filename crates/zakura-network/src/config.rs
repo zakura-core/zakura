@@ -268,7 +268,7 @@ pub struct Config {
     /// The peer cache is a list of the addresses of some recently useful peers.
     ///
     /// Line order preserves measured RTT preference; unmeasured peers are shuffled.
-    /// Individual RTT measurements and connection timestamps are not stored, but
+    /// The legacy peer list stores neither RTT measurements nor connection timestamps, but
     /// cooperating endpoints can observe their relative startup dial order.
     ///
     /// Deleting or modifying the peer cache can impact your node's:
@@ -301,6 +301,9 @@ pub struct Config {
     /// Each network has a separate peer list, which is updated regularly from the current
     /// address book. These lists are stored in `network/mainnet.peers` and
     /// `network/testnet.peers` files, underneath the `cache_dir` path.
+    ///
+    /// Native discovery stores signed records and their dial history, including
+    /// timestamps, in `network/<network>.<node_id>.zakura-discovery-book`.
     ///
     /// Previous peer lists are automatically loaded at startup, and used to populate the
     /// initial peer set and address book.
@@ -1157,7 +1160,8 @@ impl Config {
     /// `p2p_stack`, so the stack is never re-derived from the network's binary defaults.
     ///
     /// [`identity_dir`](Self::identity_dir) is a fresh [`test_identity_dir`], so a test
-    /// endpoint never reads or overwrites a real node's identity files.
+    /// endpoint never reads or overwrites a real node's identity files. Its peer
+    /// cache is also isolated from other tests and the user's cache.
     ///
     /// Override other fields with struct-update syntax, e.g.
     /// `Config { network, ..Config::for_test(P2pStack::Dual) }`.
@@ -1174,9 +1178,11 @@ impl Config {
             "tests must pin an explicit P2P stack",
         );
 
+        let identity_dir = test_identity_dir();
         Config {
             p2p_stack,
-            identity_dir: test_identity_dir(),
+            cache_dir: CacheDir::custom_path(identity_dir.join("cache")),
+            identity_dir,
             zakura: ZakuraConfig {
                 listen_addr: Some("127.0.0.1:0".parse().expect("valid test bind address")),
                 ..ZakuraConfig::default()

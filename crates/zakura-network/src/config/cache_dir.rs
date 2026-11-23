@@ -97,6 +97,18 @@ impl CacheDir {
         )
     }
 
+    /// Returns this node's native discovery cache file when peer caching is enabled.
+    pub(crate) fn discovery_book_file_path(
+        &self,
+        network: &Network,
+        node_id: &zakura_quic::NodeId,
+    ) -> Option<PathBuf> {
+        Some(self.cache_dir()?.join("network").join(format!(
+            "{}.{node_id}.zakura-discovery-book",
+            network.lowercase_name()
+        )))
+    }
+
     /// Returns the default persistent Zakura iroh secret-key file path for `network`.
     ///
     /// This path is intentionally independent from the peer cache directory so

@@ -4862,10 +4862,10 @@ impl GetInfoResponse {
     }
 }
 
-/// Seconds subtracted from `getdeprecationinfo`'s estimated halt time.
+/// Seconds subtracted from `getdeprecationinfo`'s estimated end-of-support time.
 ///
-/// Block times vary, so the halt can happen earlier than a spacing-based
-/// estimate. Reporting it a day early gives consumers time to act.
+/// Block times vary, so the tip can pass the last supported height earlier than
+/// a spacing-based estimate. Reporting it a day early gives consumers time to act.
 const END_OF_SERVICE_ESTIMATE_SAFETY_MARGIN: i64 = 24 * 60 * 60;
 
 /// Returns the target time to mine the blocks above `from` up to `to` on

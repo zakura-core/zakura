@@ -1299,7 +1299,6 @@ impl StartCmd {
             sync::end_of_support::start(
                 config.end_of_support,
                 sync::end_of_support::SupportWindow::of_release(&config.network.network),
-                config.network.network.clone(),
                 latest_chain_tip.clone(),
             )
             .in_current_span(),

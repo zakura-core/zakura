@@ -224,7 +224,6 @@ fn the_envelope_sums_the_shares_of_every_connection() {
     });
     assert_eq!(envelope.connection_raw_bytes, 48 * MIB);
     assert_eq!(envelope.connection_output_bytes, 96 * MIB);
-    assert_eq!(envelope.node_raw_bytes, 256 * 48 * MIB);
     assert_eq!(envelope.node_output_bytes, 256 * 96 * MIB);
     assert_eq!(
         envelope.compat_response_bytes,
@@ -237,9 +236,12 @@ fn the_envelope_sums_the_shares_of_every_connection() {
         u128::from(256 * (32 + 48 + 16) * MIB + 32 * (32 + 16) * MIB)
     );
     assert_eq!(
+        envelope.retained_frame_bytes(),
+        u128::from(envelope.node_output_bytes) + u128::from(envelope.compat_response_bytes),
+    );
+    assert_eq!(
         envelope.transport_memory_bytes(),
-        u128::from(envelope.node_raw_bytes)
-            + u128::from(envelope.node_output_bytes)
+        u128::from(envelope.node_output_bytes)
             + u128::from(envelope.compat_response_bytes)
             + envelope.transport_credit_bytes,
     );

@@ -426,7 +426,7 @@ fn composed_owners_stay_within_their_tolerances() {
                          composed={composed:?} baseline={baseline:?}"
                     );
                     let bound =
-                        ResourceEnvelope::new(limits(&shares, peers)).retained_frame_bytes();
+                        ResourceEnvelope::new(limits(&shares, peers)).transport_memory_bytes();
                     for problem in tolerance_problems(&composed, &baseline, bound) {
                         problems.push(format!(
                             "{scenario:?} peers={peers} bytes={bytes} delay={delay:?}: {problem}"

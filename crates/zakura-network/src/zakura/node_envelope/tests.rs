@@ -177,16 +177,19 @@ fn the_default_envelope_sums_the_reactor_shares() {
     let transport = ResourceEnvelope::new(
         limits.transport_limits_for_kinds(shares.kinds.iter().map(|(kind, _)| *kind)),
     );
-    // Per connection: 74,828,489 B of receive shares and 180,303,803 B of output shares.
+    // Per connection: 74,836,259 B of receive shares (counted inside QUIC
+    // receive credit via CreditHold) and 128 MiB of unguarded output shares
+    // (legacy gossip + legacy requests; discovery, header sync and block sync
+    // use guarded Serve/Push output counted in `serve_output_bytes`).
     assert_eq!(transport.connection_raw_bytes, 74_836_259);
-    assert_eq!(transport.connection_output_bytes, 180_310_523);
+    assert_eq!(transport.connection_output_bytes, 128 * MIB);
     // The shared compatibility client holds at most 288 exchanges at once.
     assert_eq!(transport.compat_response_bytes, 288 * 20 * MIB);
     assert_eq!(
         envelope.transport_bytes,
-        92 * u128::from(74_836_259_u64 + 180_310_523) + u128::from(288 * 20 * MIB)
+        92 * u128::from(128 * MIB) + u128::from(288 * 20 * MIB)
     );
-    // 92 × 141,937,353 + 32 × 64 MiB + 256 MiB.
+    // 92 × 141,945,123 + 32 × 64 MiB + 256 MiB.
     assert_eq!(envelope.quic_bytes, 15_474_870_420);
 }
 
@@ -474,8 +477,10 @@ async fn mixed_family_saturation_leaves_every_other_owner_available() {
         assert_eq!(usage.compat_response_bytes, 1);
         assert!(
             u128::from(usage.raw_bytes())
-                + u128::from(usage.output_bytes())
-                + u128::from(usage.compat_response_bytes)
+                <= u128::from(transport().connection_raw_bytes) * MAX_CONNECTIONS as u128
+        );
+        assert!(
+            u128::from(usage.output_bytes()) + u128::from(usage.compat_response_bytes)
                 <= retained_bound()
         );
 

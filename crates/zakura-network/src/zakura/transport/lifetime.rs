@@ -186,13 +186,18 @@ pub(crate) struct TransportLimits {
 /// The node's transport byte bounds, derived from its transport limits.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ResourceEnvelope {
-    /// Raw inbound frame bytes that one connection may retain.
+    /// Raw inbound frame bytes that one connection's raw gates may retain.
+    ///
+    /// Every held raw frame carries a QUIC `CreditHold` (API-10), so its bytes
+    /// sit inside [`Self::transport_credit_bytes`] and are not counted again in
+    /// [`Self::retained_frame_bytes`].
     pub(crate) connection_raw_bytes: u64,
-    /// Raw inbound frame bytes that all connections may retain together.
-    pub(crate) node_raw_bytes: u64,
-    /// Queued frame bytes without another owner that one connection may retain.
+    /// Queued unguarded frame bytes that one connection may retain.
+    ///
+    /// Guarded `Serve` and `Push` frames skip `FrameGate.output` and are counted
+    /// once in the serving envelope instead.
     pub(crate) connection_output_bytes: u64,
-    /// Queued frame bytes without another owner that the node may retain.
+    /// Queued unguarded frame bytes that the node may retain.
     pub(crate) node_output_bytes: u64,
     /// Outbound compatibility exchange bytes that the node may retain.
     pub(crate) compat_response_bytes: u64,
@@ -218,7 +223,6 @@ impl ResourceEnvelope {
         let window = |receive: u64| u128::from(receive) + u128::from(limits.send_window);
         Self {
             connection_raw_bytes: shares.receive,
-            node_raw_bytes: node_bytes(shares.receive),
             connection_output_bytes: shares.output,
             node_output_bytes: node_bytes(shares.output),
             compat_response_bytes: limits.compat_exchange_bytes,
@@ -229,20 +233,19 @@ impl ResourceEnvelope {
         }
     }
 
-    /// The most frame bytes these bounds allow this module's owners to retain:
-    /// the kinds' gates and the compatibility exchange gates.
+    /// The most frame bytes these bounds allow this module's owners to retain
+    /// outside QUIC receive credit: unguarded output gates and compatibility
+    /// exchange gates.
+    ///
+    /// Held raw frames sit inside [`Self::transport_credit_bytes`] via API-10
+    /// `CreditHold`, so they are counted once there.
     pub(crate) fn retained_frame_bytes(&self) -> u128 {
-        u128::from(self.node_raw_bytes)
-            + u128::from(self.node_output_bytes)
-            + u128::from(self.compat_response_bytes)
+        u128::from(self.node_output_bytes) + u128::from(self.compat_response_bytes)
     }
 
-    /// The most transport memory these bounds allow: retained frames, plus the
-    /// bytes QUIC buffers under the windows.
-    ///
-    /// A held raw frame's bytes also sit inside its connection's receive
-    /// window, so the sum counts them twice. The second count funds a payload
-    /// buffer that the reader allocates before its bytes arrive.
+    /// The most transport memory these bounds allow: unguarded retained output
+    /// and compatibility exchange frames, plus the QUIC credit windows that also
+    /// cover held raw frames.
     pub(crate) fn transport_memory_bytes(&self) -> u128 {
         self.retained_frame_bytes() + self.transport_credit_bytes
     }

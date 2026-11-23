@@ -1372,3 +1372,90 @@ fn dropped_stream_resources_leave_no_owner() {
     drop(setup);
     assert_eq!(node.owners().counts().total(), 0);
 }
+
+/// Property mem-2 (`lease-follows-bytes`): held raw frames carry a QUIC
+/// `CreditHold` (API-10), so unread QUIC bytes and held raw frames share the
+/// connection's single receive window and are never double-counted. Dropping
+/// the held frames releases both the raw gate and the QUIC credit together.
+#[tokio::test]
+async fn received_frame_bytes_stay_inside_receive_credit_until_release() -> Result<(), BoxError> {
+    const WINDOW: u32 = 64 * 1024;
+    const PAYLOAD_LEN: usize = 1000;
+    const FILL_FRAMES: usize = 64;
+    // Server has a 64 KiB receive window and a larger raw gate (128 KiB), so
+    // only QUIC credit withholding can stop the peer once 64 KiB are held.
+    let server = LocalEndpointFactory::new().quic_config(QuicConfig {
+        stream_receive_window_bytes: WINDOW,
+        receive_window_bytes: WINDOW,
+        ..QuicConfig::default()
+    });
+    let mut link = Link::connect_pair(server, LocalEndpointFactory::new()).await?;
+    let mut context = tabled_context(None, 256);
+    let (gate, budget) = raw_gate(u64::from(WINDOW) * 2);
+    context.resources.raw = gate;
+    let first = frame_bytes(1, PAYLOAD_LEN);
+    let (mut peer_send, _peer_recv, send, recv) = link.open(&first).await?;
+    let (worker, mut inbound, _outbound, cancel) = spawn_stream_worker(send, recv, context);
+
+    // Send 64 frames (~64.5 KiB wire, 64 KiB payload) and hold every admitted
+    // frame in memory so its `FrameGrant` + `CreditHold` stay live.
+    let mut held = Vec::with_capacity(FILL_FRAMES);
+    held.push(
+        timeout(TEST_TIMEOUT, inbound.recv())
+            .await?
+            .ok_or("missing first frame")?,
+    );
+    let wire_frame = frame_bytes(1, PAYLOAD_LEN);
+    let mut peer_writer = tokio::spawn(async move {
+        // Send enough frames to fill the 64 KiB window plus 32 KiB more that
+        // can only flow once held frames release their CreditHold.
+        for _ in 1..(FILL_FRAMES + 32) {
+            peer_send.write_all(&wire_frame).await?;
+        }
+        Ok::<_, BoxError>(peer_send)
+    });
+
+    // Drain every frame QUIC flow control permits while holding all admitted
+    // frames. Because each held frame's `CreditHold` withholds its payload
+    // credit from the single 64 KiB receive window, the peer cannot deliver
+    // all 96 KiB until held frames drop.
+    while let Ok(Some(next)) = timeout(HELD, inbound.recv()).await {
+        held.push(next);
+        if held.len() == FILL_FRAMES + 32 {
+            break;
+        }
+    }
+    assert!(
+        held.len() < FILL_FRAMES + 16,
+        "held {} frames (~{} KiB) without releasing CreditHold on a 64 KiB receive window",
+        held.len(),
+        held.len() * (PAYLOAD_LEN + FRAME_HEADER_BYTES) / 1024,
+    );
+    let held_bytes = u64::try_from(held.len())? * frame_wire_bytes(PAYLOAD_LEN);
+    let one_frame = frame_wire_bytes(PAYLOAD_LEN);
+    assert!(
+        budget.granted() == held_bytes || budget.granted() == held_bytes + one_frame,
+        "granted {} must cover only the {} held frames ({held_bytes}) plus at most one in-progress read ({one_frame})",
+        budget.granted(),
+        held.len(),
+    );
+
+    // Releasing the held frames drops their raw grants and CreditHolds, letting
+    // the remaining frames flow through.
+    let mut received = held.len();
+    held.clear();
+    while received < FILL_FRAMES + 32 {
+        let frame = timeout(TEST_TIMEOUT, inbound.recv())
+            .await?
+            .ok_or("missing released frame")?;
+        drop(frame);
+        received += 1;
+    }
+    let _peer_send = timeout(TEST_TIMEOUT, &mut peer_writer).await???;
+    assert_eq!(budget.granted(), 0);
+
+    cancel.cancel();
+    timeout(TEST_TIMEOUT, worker).await??;
+    link.close().await;
+    Ok(())
+}

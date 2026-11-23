@@ -842,9 +842,17 @@ impl ZakuraLocalLimits {
         kinds.dedup();
         let connection_shares = kinds.iter().fold(ReactorBudget::ZERO, |sum, kind| {
             let share = shares.share(*kind);
+            // Guarded `Serve` and `Push` frames carry their own `FrameGuard` and
+            // skip `FrameGate.output`; count only unguarded kinds here so serving
+            // output is accounted once in `serve_output_bytes`.
+            let unguarded_output = if Self::is_guarded_output_kind(*kind) {
+                0
+            } else {
+                share.output
+            };
             ReactorBudget {
                 receive: sum.receive.saturating_add(share.receive),
-                output: sum.output.saturating_add(share.output),
+                output: sum.output.saturating_add(unguarded_output),
             }
         });
         let compat_exchange_bytes = if kinds.contains(&LEGACY_REQUEST_STREAM_KIND) {
@@ -864,6 +872,15 @@ impl ZakuraLocalLimits {
             max_connections: self.max_connections,
             max_pending_handshakes: self.max_pending_handshakes,
         }
+    }
+
+    /// Returns `true` for stream kinds whose outbound frames are guarded by `Serve`
+    /// or `Push` (or cadence/request guards) and therefore bypass `FrameGate.output`.
+    pub(crate) const fn is_guarded_output_kind(kind: u16) -> bool {
+        matches!(
+            kind,
+            DISCOVERY_STREAM_KIND | HEADER_SYNC_STREAM_KIND | ZAKURA_STREAM_BLOCK_SYNC
+        )
     }
 
     /// The most owners that these limits allow at once.
@@ -7428,8 +7445,7 @@ where
     let mut admission = admit(frame_wire_bytes(payload_len)).await;
     // Before the payload read, so the hold rides in that read's command.
     admission.hold_credit(recv, payload_len);
-    let mut payload = vec![0; payload_len];
-    read_frame_payload(recv, &mut payload, read_timeout).await?;
+    let payload = read_frame_payload(recv, payload_len, read_timeout).await?;
     #[cfg(any(test, zakura_sim))]
     filter.frame_read();
     Ok((
@@ -7442,16 +7458,36 @@ where
     ))
 }
 
+/// Reads a frame's `payload_len` payload bytes.
+///
+/// The buffer grows as bytes arrive, at most doubling and never past
+/// `payload_len`. A peer that announces a large frame and stalls makes the
+/// node hold only about twice what it sent, which QUIC credit already
+/// covers, instead of the whole announced length.
 async fn read_frame_payload(
     recv: &mut RecvStream,
-    payload: &mut [u8],
+    payload_len: usize,
     read_timeout: Duration,
-) -> Result<(), ZakuraHandlerError> {
-    match timeout(read_timeout, recv.read_exact(payload))
+) -> Result<Vec<u8>, ZakuraHandlerError> {
+    let read = async {
+        let mut payload = Vec::new();
+        while payload.len() < payload_len {
+            let remaining = payload_len - payload.len();
+            let Some(chunk) = recv.read_chunk(remaining).await? else {
+                return Err(zakura_quic::ReadExactError::FinishedEarly(payload.len()));
+            };
+            if payload.capacity() - payload.len() < chunk.len() {
+                payload.reserve_exact(payload.len().max(chunk.len()).min(remaining));
+            }
+            payload.extend_from_slice(&chunk);
+        }
+        Ok(payload)
+    };
+    match timeout(read_timeout, read)
         .await
         .map_err(|_| ZakuraHandlerError::Timeout("frame payload"))?
     {
-        Ok(()) => Ok(()),
+        Ok(payload) => Ok(payload),
         // A peer can reset a pair during a partial frame. Reset ends that stream;
         // a normal FIN with a truncated payload still reports a protocol error.
         Err(zakura_quic::ReadExactError::ReadError(zakura_quic::ReadError::Reset(_))) => {
@@ -13414,8 +13450,71 @@ mod tests {
         Ok(())
     }
 
+    /// fix-15: the payload buffer grows as bytes arrive, so a frame sent in
+    /// many small writes reads back whole and in order.
+    #[tokio::test]
+    async fn a_payload_sent_in_pieces_reads_back_whole() -> Result<(), BoxError> {
+        const ALPN: &[u8] = b"/zakura/testkit/payload-in-pieces/0";
+        const PIECE: usize = 1000;
+        const PAYLOAD_LEN: usize = 40 * PIECE + 7;
+        let _guard = zakura_test::init();
+        let server = LocalEndpointFactory::new().endpoint(74).await?;
+        let (conn_tx, _conn_rx) = mpsc::channel(2);
+        let (stream_tx, mut stream_rx) = mpsc::channel(4);
+        server.serve(CaptureConnection {
+            alpn: ALPN,
+            connection_tx: conn_tx,
+            stream_tx,
+        })?;
+        let client = LocalEndpointFactory::new().endpoint(75).await?;
+        let server_addr = LocalEndpointFactory::node_addr(&server).await;
+        let connection = timeout(
+            Duration::from_secs(10),
+            client.connect(server_addr, &[ALPN]),
+        )
+        .await??;
+        let (mut send, _recv) = timeout(Duration::from_secs(1), connection.open_bi()).await??;
+
+        // usize payload lengths below 2^32 fit u32.
+        let mut header = Vec::with_capacity(FRAME_HEADER_BYTES);
+        header.extend_from_slice(&0u16.to_le_bytes());
+        header.extend_from_slice(&0u16.to_le_bytes());
+        header.extend_from_slice(&(PAYLOAD_LEN as u32).to_le_bytes());
+        timeout(Duration::from_secs(1), send.write_all(&header)).await??;
+        let (_, mut recv) = timeout(Duration::from_secs(2), stream_rx.recv())
+            .await?
+            .expect("the capture forwards the stream");
+
+        // usize indices below 256 fit u8.
+        let payload: Vec<u8> = (0..PAYLOAD_LEN).map(|i| (i % 251) as u8).collect();
+        let writing = tokio_util::task::AbortOnDropHandle::new(tokio::spawn({
+            let payload = payload.clone();
+            async move {
+                for piece in payload.chunks(PIECE) {
+                    send.write_all(piece).await.unwrap();
+                    tokio::task::yield_now().await;
+                }
+                send
+            }
+        }));
+        let frame = timeout(
+            Duration::from_secs(5),
+            read_frame(
+                &mut recv,
+                u32::try_from(FRAME_HEADER_BYTES + PAYLOAD_LEN)?,
+                FrameFilter::new(None, InboundReader::Persistent),
+                Duration::from_secs(5),
+                None,
+            ),
+        )
+        .await??;
+        assert_eq!(frame.payload, payload);
+        drop(writing);
+        Ok(())
+    }
+
     // claude-late-message-cap-allocation: read_frame checks only
-    // frame_len > max_frame_bytes before `vec![0; payload_len]`, while the smaller
+    // frame_len > max_frame_bytes before it reads the payload, while the smaller
     // max_message_bytes is enforced later in admit_inbound_message. A peer can
     // negotiate max_frame_bytes > max_message_bytes (the caps are clamped
     // independently), so on every admitted ordered/request stream it could force
@@ -13522,7 +13621,7 @@ mod tests {
 
         // Stream 2: the SAME oversized header read with the raw frame cap an
         // unfixed path used. It passes the frame-cap size check, so read_frame
-        // allocates `vec![0; payload_len]` and reads the body (failing only because
+        // reads the body (failing only because
         // the body was never sent) -- i.e. NOT rejected as Oversize. This is the
         // allocate-before-reject amplification the fix removes.
         let (mut raw_send, _raw_recv) = timeout(Duration::from_secs(1), conn_a.open_bi())

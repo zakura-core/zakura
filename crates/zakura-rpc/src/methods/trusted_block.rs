@@ -26,6 +26,14 @@ enum SubmittedHash {
     Unconfirmed,
 }
 
+/// How peers obtain a trusted submission's body before it commits.
+enum PeerBody {
+    /// Each send serializes the block. Without `early_relay`, peers see it only after commit.
+    Serialized { early_relay: bool },
+    /// Each send writes these exact bytes, which are the block's serialization. Relayed early.
+    Prepared(Arc<[u8]>),
+}
+
 impl<Mempool, State, ReadState, Tip, AddressBook, BlockVerifierRouter, SyncStatus>
     RpcImpl<Mempool, State, ReadState, Tip, AddressBook, BlockVerifierRouter, SyncStatus>
 where
@@ -95,20 +103,22 @@ where
             height,
             bytes.len(),
             submitted_at,
-            skipped.is_none(),
-            None,
+            PeerBody::Serialized {
+                early_relay: skipped.is_none(),
+            },
         )
         .await
     }
 
+    /// Registers `block` as a pending body, relays it early if `body` allows, and returns the
+    /// outcome of its normal verification and commit.
     async fn relay_trusted_block(
         &self,
         block: Arc<Block>,
         height: Height,
         size: usize,
         submitted_at: std::time::Instant,
-        early_relay: bool,
-        prepared: Option<Arc<[u8]>>,
+        body: PeerBody,
     ) -> std::result::Result<SubmitBlockResponse, TrustedSubmissionError> {
         let hash = block.hash();
         let submission = match self.gbt.reserve_mined_submission(hash) {
@@ -119,11 +129,14 @@ where
             Err(response) => return Ok(response.into()),
         };
         let registry = self.gbt.pending_blocks();
-        let registration = match prepared {
-            Some(bytes) => registry.insert_prepared(block.clone(), bytes),
-            None => registry.insert_trusted(block.clone(), early_relay),
-        }
-        .ok_or(TrustedSubmissionError::Capacity)?;
+        let (registration, early_relay) = match body {
+            PeerBody::Prepared(bytes) => (registry.insert_prepared(block.clone(), bytes), true),
+            PeerBody::Serialized { early_relay } => (
+                registry.insert_trusted(block.clone(), early_relay),
+                early_relay,
+            ),
+        };
+        let registration = registration.ok_or(TrustedSubmissionError::Capacity)?;
         let submission = Submission {
             block,
             hash,

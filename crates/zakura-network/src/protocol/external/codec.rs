@@ -619,6 +619,7 @@ impl Codec {
                 v1_addrs.zcash_serialize(writer)?
             }
             Message::GetAddr => { /* Empty payload -- no-op */ }
+            // A prepared attempt carries the block's exact serialization.
             Message::UncachedBlock(block, attempt) => match attempt.prepared_bytes() {
                 Some(bytes) => writer.write_all(bytes)?,
                 None => block.zcash_serialize(writer)?,

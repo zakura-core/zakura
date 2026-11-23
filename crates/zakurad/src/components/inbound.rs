@@ -28,6 +28,7 @@ use zakura_state::{self as zs};
 
 use zakura_chain::{
     block::{self},
+    chain_tip::ChainTip,
     parameters::Network,
     serialization::ZcashSerialize,
     transaction::UnminedTxId,
@@ -220,25 +221,31 @@ async fn retained_block_height(mut state: State, hash: block::Hash) -> Option<bl
     }
 }
 
-/// Serves an exact authorized prepared body directly. Other requests prefer committed state.
+/// Returns a committed block from any active chain, or else a pending block.
 ///
 /// Peers can request a hash on any active chain, even when this node does not consider it best.
 /// A pending body can be unvalidated and differ from a committed block with the same header
 /// hash, so committed state wins. A registration is removed only after its block commits, so
 /// a pending miss followed by state is never a gap.
+///
+/// A prepared body is the exception: it is served from memory without reading state, because
+/// state can be busy committing that very block while peers wait for it. The best tip decides
+/// whether to skip the read. Once `hash` is the best tip, state has a committed copy and wins as
+/// above. A copy committed to a side chain is not noticed here; the submission's own duplicate
+/// verdict withdraws a prepared body that differs from it.
 async fn block_by_hash_or_pending(
     mut state: State,
     pending_blocks: PendingBlockRegistry,
+    latest_chain_tip: impl ChainTip,
     hash: block::Hash,
 ) -> Result<Option<ServedBlock>, zn::BoxError> {
     let pending = pending_blocks.get_for_peer(hash);
-    if pending.as_ref().is_some_and(|body| {
+    let prepared = pending.as_ref().is_some_and(|body| {
         body.pending_send
             .as_ref()
-            .and_then(|permit| permit.attempt_checksum())
-            .and_then(|attempt| attempt.prepared_bytes())
-            .is_some()
-    }) {
+            .is_some_and(|permit| permit.prepared_bytes().is_some())
+    });
+    if prepared && latest_chain_tip.best_tip_hash() != Some(hash) {
         return Ok(pending);
     }
 
@@ -333,6 +340,9 @@ pub enum Setup {
 
         /// A service that manages cached blockchain state.
         state: State,
+
+        /// The best tip, read to decide whether state holds a block that is also pending.
+        latest_chain_tip: zs::LatestChainTip,
 
         /// Scores peer misbehavior, and bans peers whose score reaches the ban threshold.
         misbehavior: zn::MisbehaviorReporter,
@@ -517,7 +527,7 @@ impl Service<zn::Request> for Inbound {
                             Timeout::new(block_download_peer_set, BLOCK_DOWNLOAD_TIMEOUT),
                             Timeout::new(block_verifier, BLOCK_VERIFY_TIMEOUT),
                             state.clone(),
-                            latest_chain_tip,
+                            latest_chain_tip.clone(),
                             network,
                         )
                         .with_second_block_request(self.second_block_request)
@@ -531,6 +541,7 @@ impl Service<zn::Request> for Inbound {
                         block_downloads,
                         mempool,
                         state,
+                        latest_chain_tip,
                         misbehavior,
                     }
                 }
@@ -567,6 +578,7 @@ impl Service<zn::Request> for Inbound {
                 mut block_downloads,
                 mempool,
                 state,
+                latest_chain_tip,
                 misbehavior,
             } => {
                 // # Correctness
@@ -606,6 +618,7 @@ impl Service<zn::Request> for Inbound {
                     block_downloads,
                     mempool,
                     state,
+                    latest_chain_tip,
                     misbehavior,
                 }
             }
@@ -636,19 +649,27 @@ impl Service<zn::Request> for Inbound {
     fn call(&mut self, req: zn::Request) -> Self::Future {
         let pruned_block_not_found_logger = self.pruned_block_not_found_logger.clone();
         let pending_blocks = self.pending_blocks.clone();
-        let (cached_peer_addr_response, block_downloads, mempool, state) = match &mut self.setup {
-            Setup::Initialized {
-                cached_peer_addr_response,
-                block_downloads,
-                mempool,
-                state,
-                misbehavior: _,
-            } => (cached_peer_addr_response, block_downloads, mempool, state),
-            _ => {
-                debug!("ignoring request from remote peer during setup");
-                return async { Ok(zn::Response::Nil) }.boxed();
-            }
-        };
+        let (cached_peer_addr_response, block_downloads, mempool, state, latest_chain_tip) =
+            match &mut self.setup {
+                Setup::Initialized {
+                    cached_peer_addr_response,
+                    block_downloads,
+                    mempool,
+                    state,
+                    latest_chain_tip,
+                    misbehavior: _,
+                } => (
+                    cached_peer_addr_response,
+                    block_downloads,
+                    mempool,
+                    state,
+                    latest_chain_tip,
+                ),
+                _ => {
+                    debug!("ignoring request from remote peer during setup");
+                    return async { Ok(zn::Response::Nil) }.boxed();
+                }
+            };
 
         let response = match req {
             zn::Request::Peers => {
@@ -694,6 +715,7 @@ impl Service<zn::Request> for Inbound {
                 }
 
                 let state = state.clone();
+                let latest_chain_tip = latest_chain_tip.clone();
 
                 async move {
                     let mut blocks: Vec<InventoryResponse<(zn::DeliveredBlock, Option<PeerSocketAddr>), block::Hash>> = Vec::new();
@@ -709,6 +731,7 @@ impl Service<zn::Request> for Inbound {
                         let block = match block_by_hash_or_pending(
                             state.clone(),
                             pending_blocks.clone(),
+                            latest_chain_tip.clone(),
                             hash,
                         )
                         .await

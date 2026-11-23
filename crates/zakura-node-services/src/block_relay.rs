@@ -39,6 +39,9 @@ impl PendingBlockSendPermit {
     }
 
     /// Creates a revocable permission carrying the exact bytes authorized for direct peer reads.
+    ///
+    /// `bytes` must be the serialization of the block this permission is registered with:
+    /// transports write them without consulting the block.
     pub fn prepared_channel(bytes: Arc<[u8]>) -> (watch::Sender<PendingBlockStatus>, Self) {
         Self::with_checksum(Some(AttemptChecksum {
             prepared: Some(bytes),
@@ -78,6 +81,14 @@ impl PendingBlockSendPermit {
         self.checksum.as_ref()
     }
 
+    /// The exact serialized body, when the submission supplied it for direct peer writes.
+    ///
+    /// A transport writes these bytes in place of serializing the block. Whoever creates the
+    /// permit guarantees that they are the block's serialization.
+    pub fn prepared_bytes(&self) -> Option<&[u8]> {
+        self.checksum.as_ref()?.prepared_bytes()
+    }
+
     /// Runs a synchronous write start unless this submission has been withdrawn.
     ///
     /// The watch read lock orders the callback against resolution's write lock, so resolution
@@ -109,10 +120,14 @@ impl Hash for PendingBlockSendPermit {
     }
 }
 
-/// The checksum of one submission attempt's exact serialized body, computed by its first send.
+/// What the sends of one submission attempt share: the checksum of its exact serialized body,
+/// computed by its first send, and that body itself when the submission supplied it.
+///
+/// Identity is the attempt, so clones are equal and a retry of the same block is not.
 #[derive(Clone, Default)]
 pub struct AttemptChecksum {
     checksum: Arc<OnceLock<(usize, sha256d::Checksum)>>,
+    /// The attempt's serialized body, written to peers in place of serializing the block.
     prepared: Option<Arc<[u8]>>,
 }
 
@@ -125,7 +140,7 @@ impl std::fmt::Debug for AttemptChecksum {
 }
 
 impl AttemptChecksum {
-    /// Exact solved bytes, when the submission authorized serving directly from memory.
+    /// The attempt's exact serialized body, when the submission supplied it.
     pub fn prepared_bytes(&self) -> Option<&[u8]> {
         self.prepared.as_deref()
     }
@@ -198,6 +213,24 @@ mod tests {
         assert_ne!(retained, retry);
         assert_eq!(retry.try_start_write(|| 2), Some(2));
         assert!(retained.try_start_write(|| ()).is_none());
+    }
+
+    #[test]
+    fn prepared_bytes_follow_the_permit_and_its_withdrawal() {
+        let bytes: Arc<[u8]> = Arc::from(&b"exact body"[..]);
+        let (status, permit) = PendingBlockSendPermit::prepared_channel(bytes.clone());
+        assert_eq!(permit.prepared_bytes(), Some(&bytes[..]));
+        assert_eq!(permit.clone().prepared_bytes(), Some(&bytes[..]));
+        assert!(format!("{permit:?}").contains("prepared_len: Some(10)"));
+        status.send_replace(PendingBlockStatus::Failed);
+        assert!(permit
+            .try_start_write(|| panic!("withdrawn prepared bytes cannot start a write"))
+            .is_none());
+
+        let (_, serialized) = PendingBlockSendPermit::channel();
+        assert_eq!(serialized.prepared_bytes(), None);
+        let (_, admitted) = PendingBlockSendPermit::state_admitted_channel();
+        assert_eq!(admitted.prepared_bytes(), None);
     }
 
     #[test]

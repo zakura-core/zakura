@@ -1,6 +1,7 @@
 //! Legacy Zebra gossip compatibility over Zakura streams.
 
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet, VecDeque},
     fmt,
     future::Future,
@@ -832,16 +833,14 @@ impl LegacyResponseCodec {
                             // Encoding is this transport's write start: frames are queued to the
                             // stream only after it.
                             let encoded = match block.pending_send() {
-                                Some(permit) => permit.try_start_write(|| {
-                                    match permit
-                                        .attempt_checksum()
-                                        .and_then(|attempt| attempt.prepared_bytes())
-                                    {
-                                        Some(bytes) => Ok(bytes.to_vec()),
-                                        None => block.zcash_serialize_to_vec(),
-                                    }
-                                }),
-                                None => Some(block.zcash_serialize_to_vec()),
+                                // A prepared body is chunked from its shared buffer.
+                                Some(permit) => {
+                                    permit.try_start_write(|| match permit.prepared_bytes() {
+                                        Some(bytes) => Ok(Cow::Borrowed(bytes)),
+                                        None => block.zcash_serialize_to_vec().map(Cow::Owned),
+                                    })
+                                }
+                                None => Some(block.zcash_serialize_to_vec().map(Cow::Owned)),
                             };
                             match encoded {
                                 Some(bytes) => push_chunked_response(
@@ -851,7 +850,7 @@ impl LegacyResponseCodec {
                                     request_id,
                                     max_frame_bytes,
                                     max_message_bytes,
-                                    bytes?,
+                                    &bytes?,
                                 )?,
                                 None => missing.push(block.hash()),
                             }
@@ -879,7 +878,7 @@ impl LegacyResponseCodec {
                                 request_id,
                                 max_frame_bytes,
                                 max_message_bytes,
-                                transaction.transaction().zcash_serialize_to_vec()?,
+                                &transaction.transaction().zcash_serialize_to_vec()?,
                             )?;
                         }
                         InventoryResponse::Missing(id) => missing.push(id),
@@ -1418,7 +1417,7 @@ fn push_chunked_response(
     request_id: u64,
     max_frame_bytes: u32,
     max_message_bytes: u32,
-    bytes: Vec<u8>,
+    bytes: &[u8],
 ) -> Result<(), LegacyGossipError> {
     if bytes.len() > MAX_PROTOCOL_MESSAGE_LEN {
         return Err(LegacyGossipError::OversizedResponse(bytes.len()));
@@ -7893,6 +7892,69 @@ mod tests {
                 .iter()
                 .all(|frame| frame.message_type == MSG_RESPONSE_BLOCK));
         }
+
+        Ok(())
+    }
+
+    /// A prepared body is chunked from its exact bytes instead of a serialization of the block,
+    /// and is withdrawn like any other temporary body.
+    #[test]
+    fn encode_response_sends_prepared_bytes_verbatim_and_withholds_them_once_withdrawn(
+    ) -> Result<(), BoxError> {
+        use zakura_node_services::block_relay::{
+            PendingBlockSendPermit, PendingBlockStatus, ServedBlock,
+        };
+
+        let block = Arc::new(Block::zcash_deserialize(
+            BLOCK_TESTNET_141042_BYTES.as_slice(),
+        )?);
+        // Bytes no serialization of `block` produces, so an adapter that serialized it would
+        // differ.
+        let mut prepared = block.zcash_serialize_to_vec()?;
+        prepared.extend_from_slice(b"prepared, not serialized");
+        let (status, permit) = PendingBlockSendPermit::prepared_channel(prepared.clone().into());
+        let encode = |max_frame_bytes: u32| {
+            LegacyResponseCodec::encode_response(
+                9,
+                Response::Blocks(vec![InventoryResponse::Available((
+                    ServedBlock {
+                        block: block.clone().into(),
+                        pending_send: Some(permit.clone()),
+                    }
+                    .into(),
+                    None,
+                ))]),
+                max_frame_bytes,
+                u32::try_from(MAX_PROTOCOL_MESSAGE_LEN)?,
+            )
+        };
+
+        // A frame limit far below the body forces several chunks.
+        let frames = encode(256)?;
+        assert!(frames.len() > 1);
+        let mut received = Vec::new();
+        for (index, frame) in frames.iter().enumerate() {
+            assert_eq!(frame.message_type, MSG_RESPONSE_BLOCK);
+            assert_eq!(frame.payload[..8], 9u64.to_le_bytes());
+            assert_eq!(
+                frame.payload[8],
+                u8::from(index + 1 == frames.len()),
+                "only the last chunk is marked final"
+            );
+            received.extend_from_slice(&frame.payload[RESPONSE_CHUNK_HEADER_BYTES..]);
+        }
+        assert_eq!(received, prepared);
+
+        status.send_replace(PendingBlockStatus::Failed);
+        let frames = encode(256)?;
+        assert_eq!(
+            frames
+                .iter()
+                .map(|frame| frame.message_type)
+                .collect::<Vec<_>>(),
+            vec![MSG_RESPONSE_MISSING_BLOCKS],
+            "withdrawn prepared bytes are never encoded"
+        );
 
         Ok(())
     }

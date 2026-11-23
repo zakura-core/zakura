@@ -79,6 +79,10 @@ pub(super) enum RelayPolicy {
         /// an unknown parent can later become valid under the same hash, and peers that requested
         /// it in between ignore this node's announcements of that hash for up to two minutes. A
         /// hash another path is already committing is announced by that path.
+        ///
+        /// A complete POST establishes both by state lookups. A prepared job establishes them
+        /// by requiring the parent to be the best tip, which does not exclude a copy still in
+        /// the write queue; the duplicate verdict below settles that case.
         early_relay: bool,
         /// A duplicate verdict proves only that the header hash is known, not that the submitted
         /// transactions match the committed block, so it is resolved against the committed body.

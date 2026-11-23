@@ -12,7 +12,7 @@ use super::{
     http::{HttpBody, HttpRequest, HttpResponse},
     http_request_compatibility::HttpRequestMiddleware,
 };
-use crate::methods::trusted_block::jobs::{JobError, JobId, Operation};
+use crate::methods::trusted_block::jobs::{JobError, JobId, Operation, CONFIRMATION_BYTES};
 use crate::methods::types::submit_block::{SubmitBlockErrorResponse, SubmitBlockResponse};
 
 /// Failures before a block is submitted to validation.
@@ -35,14 +35,20 @@ enum Route {
     Job(JobId, Operation, SubmitJob),
 }
 
+/// The largest serialized block header: 140 fixed bytes, a 3-byte length, and the 1,344-byte
+/// Equihash solution of the public networks.
+const MAX_SOLVED_HEADER_BYTES: usize = 1_487;
+
 impl Route {
+    /// The largest request body this route reads.
     fn limit(&self) -> usize {
         match self {
-            // The largest Zcash solved header is 1,487 bytes.
-            Self::Job(_, Operation::Solve, _) => 1_487,
-            Self::Job(_, Operation::Confirm, _) => 64,
-            _ => usize::try_from(zakura_chain::block::MAX_BLOCK_BYTES)
-                .expect("block limit fits supported platforms"),
+            Self::Job(_, Operation::Solve, _) => MAX_SOLVED_HEADER_BYTES,
+            Self::Job(_, Operation::Confirm, _) => CONFIRMATION_BYTES,
+            Self::Full(_) | Self::Job(_, Operation::Prepare, _) => {
+                usize::try_from(zakura_chain::block::MAX_BLOCK_BYTES)
+                    .expect("block limit fits supported platforms")
+            }
         }
     }
 }
@@ -179,6 +185,7 @@ impl<S> TrustedBlockHttpService<S> {
                 Route::Job(key, op, jobs)
             }
         };
+        let limit = route.limit();
         let Ok(slot) = self.body_slots.clone().try_acquire_owned() else {
             return Err(response(
                 StatusCode::TOO_MANY_REQUESTS,
@@ -190,9 +197,9 @@ impl<S> TrustedBlockHttpService<S> {
             .get(header::CONTENT_LENGTH)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<u64>().ok())
-            .is_some_and(|length| length > route.limit() as u64)
+            .is_some_and(|length| usize::try_from(length).map_or(true, |length| length > limit))
         {
-            return Err(response(StatusCode::PAYLOAD_TOO_LARGE, "block too large"));
+            return Err(response(StatusCode::PAYLOAD_TOO_LARGE, "body too large"));
         }
         Ok((route, slot))
     }
@@ -214,7 +221,7 @@ where
             Err(_) => return response(StatusCode::REQUEST_TIMEOUT, "body receipt timed out"),
             Ok(Err(error)) => {
                 return if error.is::<http_body_util::LengthLimitError>() {
-                    response(StatusCode::PAYLOAD_TOO_LARGE, "block too large")
+                    response(StatusCode::PAYLOAD_TOO_LARGE, "body too large")
                 } else {
                     response(StatusCode::BAD_REQUEST, "body receipt failed")
                 };

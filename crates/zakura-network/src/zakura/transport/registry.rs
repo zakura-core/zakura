@@ -578,6 +578,7 @@ impl ServiceRegistry {
     pub fn add_escalated_peer(&self, peer: Peer) -> u64 {
         let load = peer.load().cloned();
         let rtt = peer.rtt_reader();
+        let credit = peer.connection_credit();
         let (
             peer_id,
             conn_id,
@@ -623,7 +624,8 @@ impl ServiceRegistry {
                 service_cancel_token,
                 close_cause.clone(),
             )
-            .with_rtt_reader(rtt.clone());
+            .with_rtt_reader(rtt.clone())
+            .with_connection_credit(credit.clone());
             if let Some(load) = &load {
                 service_peer = service_peer.with_load(load.clone());
             }

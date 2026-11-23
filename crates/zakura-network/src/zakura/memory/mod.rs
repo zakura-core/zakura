@@ -19,6 +19,7 @@
 //! machine's wakeups.
 
 mod config;
+mod credit;
 pub mod draft;
 mod peer_pool;
 mod plan;
@@ -32,6 +33,7 @@ pub use config::{
     ByteSize, ByteSizeParseError, MemoryBudget, MemoryCaps, MemoryConfig, MemoryWeights,
     ResolvedMemoryBudget,
 };
+pub(crate) use credit::{CloseCreditOnDrop, ConnectionCredit};
 pub use draft::{derive_p2p_budget, resolved_p2p_budget_bytes, BudgetDerivation};
 pub use plan::{
     derived_read_result_byte_limit, FixedTerms, MemoryPlan, MemoryPlanError, SessionBases,

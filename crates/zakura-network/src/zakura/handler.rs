@@ -3301,6 +3301,7 @@ pub(crate) fn service_registry(
     header_sync: Option<super::HeaderSyncHandle>,
     block_sync: Option<BlockSyncHandle>,
     block_sync_config: ZakuraBlockSyncConfig,
+    block_sync_memory: super::BlockSyncMemory,
     legacy_service: Arc<dyn Service>,
     discovery_service: Arc<super::DiscoveryService>,
     service_demand: Option<
@@ -3323,8 +3324,9 @@ pub(crate) fn service_registry(
             Some(header_sync) => BlockSyncService::new_with_header_tip(
                 block_sync_config,
                 header_sync.subscribe_tip(),
+                block_sync_memory,
             )?,
-            None => BlockSyncService::new(block_sync_config)?,
+            None => BlockSyncService::new(block_sync_config, block_sync_memory)?,
         },
     };
     let block_sync = Arc::new(block_sync.with_service_demand(service_demand)) as Arc<dyn Service>;
@@ -4137,20 +4139,40 @@ impl ZakuraProtocolHandler {
         self.resources.report_usage(limits_owner_bound);
         // Services such as BPv1 read this connection's path load.
         let load = connection.subscribe_load();
+        let conn_credit = self.memory_pool.as_ref().map(|_| {
+            super::memory::ConnectionCredit::new_quic(
+                conn_id,
+                connection.clone(),
+                connection_resources.base_receive_window(),
+                self.limits.admitted_send_window_bytes,
+            )
+        });
+        let _close_credit = super::memory::CloseCreditOnDrop(conn_credit.clone());
         #[cfg(zakura_sim)]
         if let Some(observer) = &self.transport_observer {
             observer.connection(
                 conn_id,
-                connection_resources.probe(connection.load_probe(), &stream_sem, limits),
+                connection_resources.probe(
+                    connection.load_probe(),
+                    conn_credit
+                        .as_ref()
+                        .map(super::memory::ConnectionCredit::live_receive_window_atomic),
+                    &stream_sem,
+                    limits,
+                ),
             );
         }
-        // Raise the receive and send windows once the peer is admitted
-        // (zakura-quic API-9). The control share stays inside the receive window.
-        let _ = connection.set_limits(
-            zakura_quic::ConnLimits::default()
-                .with_receive_window(connection_resources.receive_window())
-                .with_send_window(self.limits.admitted_send_window_bytes),
-        );
+        // When running without a MemoryPool (standalone transport handler tests),
+        // raise the static receive and send windows once the peer is admitted
+        // (zakura-quic API-9). Pool-backed connections start at their static base
+        // receive window above and raise it per leased request (`02 §3`).
+        if conn_credit.is_none() {
+            let _ = connection.set_limits(
+                zakura_quic::ConnLimits::default()
+                    .with_receive_window(connection_resources.receive_window())
+                    .with_send_window(self.limits.admitted_send_window_bytes),
+            );
+        }
         let mut workers = JoinSet::new();
         let (session_exit_tx, mut session_exit_rx) = mpsc::unbounded_channel();
         let mut pending_sessions = PendingSessions::default();
@@ -4350,7 +4372,8 @@ impl ZakuraProtocolHandler {
                         close_cause.clone(),
                     )
                     .with_load(load.clone())
-                    .with_rtt_reader(Some(connection.rtt_reader())),
+                    .with_rtt_reader(Some(connection.rtt_reader()))
+                    .with_connection_credit(conn_credit.clone()),
                 );
                 cleanup_guard.add_admitted_capabilities(admitted_capabilities);
             }
@@ -4371,11 +4394,22 @@ impl ZakuraProtocolHandler {
         // Local reopens whose transport IO is in flight, created on the first
         // reopen.
         let mut local_opens: Option<FuturesUnordered<BoxFuture<'_, _>>> = None;
+        let mut credit_drain_ticks = zakura_rt::time::interval(Duration::from_millis(50));
+        credit_drain_ticks.set_missed_tick_behavior(zakura_rt::time::MissedTickBehavior::Skip);
         loop {
             let session_deadline = pending_sessions.deadline();
             zakura_rt::select! {
                 biased;
                 _ = connection_token.cancelled() => break,
+                _ = credit_drain_ticks.tick(),
+                    if conn_credit
+                        .as_ref()
+                        .is_some_and(super::memory::ConnectionCredit::has_draining) =>
+                {
+                    if let Some(credit) = &conn_credit {
+                        credit.poll_drain();
+                    }
+                }
                 _ = async {
                     match session_deadline {
                         Some(deadline) => zakura_rt::time::sleep_until(deadline).await,
@@ -4473,7 +4507,8 @@ impl ZakuraProtocolHandler {
                                     close_cause.clone(),
                                 )
                                 .with_load(load.clone())
-                                .with_rtt_reader(Some(connection.rtt_reader())),
+                                .with_rtt_reader(Some(connection.rtt_reader()))
+                                .with_connection_credit(conn_credit.clone()),
                             );
                             cleanup_guard.add_admitted_capabilities(admitted_capabilities);
                         }
@@ -4602,7 +4637,8 @@ impl ZakuraProtocolHandler {
                                 close_cause.clone(),
                             )
                             .with_load(load.clone())
-                            .with_rtt_reader(Some(connection.rtt_reader())),
+                            .with_rtt_reader(Some(connection.rtt_reader()))
+                            .with_connection_credit(conn_credit.clone()),
                         );
                         cleanup_guard.add_admitted_capabilities(admitted_capabilities);
                     }
@@ -5879,6 +5915,15 @@ async fn spawn_zakura_endpoint_inner(
     )?;
     memory_plan.publish_metrics();
     let memory_pool = memory_plan.build_pool();
+    let block_sync_memory = super::BlockSyncMemory::new(
+        memory_pool.clone(),
+        config
+            .zakura
+            .memory_budget
+            .caps
+            .look_ahead
+            .map(super::memory::ByteSize::bytes),
+    );
     info!(plan = %memory_plan, "sized and enforced Zakura startup memory plan");
     let limits = ZakuraLocalLimits::for_node(config, &custom_kinds);
     let node_envelope = crate::zakura::node_envelope::NodeEnvelope::for_node(
@@ -6013,6 +6058,7 @@ async fn spawn_zakura_endpoint_inner(
                     .block_sync
                     .clone()
                     .for_node_connections(limits.max_connections),
+                block_sync_memory.clone(),
             )
             .with_range_source(driver_startup.block_range_source.clone());
             startup.shutdown = header_sync_shutdown.clone();
@@ -6052,6 +6098,7 @@ async fn spawn_zakura_endpoint_inner(
             .block_sync
             .clone()
             .for_node_connections(limits.max_connections),
+        block_sync_memory,
         legacy_service,
         discovery_service,
         service_demand.clone(),

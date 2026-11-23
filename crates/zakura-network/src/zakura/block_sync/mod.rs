@@ -111,7 +111,7 @@ pub use source::DetachedReadSession;
 pub use source::{BlockRangeRead, BlockRangeReadLease, BlockRangeReadResult, BlockRangeSource};
 #[cfg(any(test, zakura_sim, feature = "zakura-testkit"))]
 pub use state::DetachedHandleEvents;
-pub use state::{BlockSyncFrontiers, BlockSyncHandle, BlockSyncStartup};
+pub use state::{BlockSyncFrontiers, BlockSyncHandle, BlockSyncMemory, BlockSyncStartup};
 #[cfg(any(test, zakura_sim, feature = "zakura-testkit"))]
 pub use wire::decode_block_payload_for_test;
 pub use wire::{

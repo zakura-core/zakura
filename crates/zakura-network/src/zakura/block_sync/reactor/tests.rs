@@ -106,7 +106,7 @@ proptest! {
         let config = ZakuraBlockSyncConfig::default();
         let start = Instant::now();
         let registry = PeerRegistry::new();
-        let work = Arc::new(WorkQueue::new(block::Height(0), ByteBudget::new(10 * BYTES)));
+        let work = Arc::new(WorkQueue::with_test_pool(block::Height(0), ByteBudget::new(10 * BYTES)));
         work.set_estimate_floor_for_tests(1);
         let _ = work.extend(
             test_work_scope(),
@@ -148,7 +148,7 @@ proptest! {
                     );
                     prop_assert_eq!(taken.items().len(), 1);
                     let request = taken
-                        .admit(block::Height(0), CancellationToken::new())
+                        .admit_for_connection(block::Height(0), block::Height(0), 0, None, CancellationToken::new())
                         .expect("the test budget covers every height");
                     let owner = request.owner();
                     let deadline = start + Duration::from_millis(deadline_ms);

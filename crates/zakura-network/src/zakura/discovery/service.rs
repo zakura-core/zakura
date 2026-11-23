@@ -1334,6 +1334,7 @@ mod tests {
                     .decoded_block_pool(10_000)
                     .expect("fixture decoded allowance fits"),
                 ZakuraBlockSyncConfig::default(),
+                crate::zakura::BlockSyncMemory::for_tests(),
             ))
             .expect("valid block-sync config");
         let service = DiscoveryService::with_sync_services(

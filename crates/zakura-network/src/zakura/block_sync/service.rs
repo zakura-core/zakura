@@ -420,8 +420,11 @@ impl BlockSyncServiceInner {
 }
 
 impl BlockSyncService {
-    pub(crate) fn new(config: ZakuraBlockSyncConfig) -> Result<Self, BlockSyncStartError> {
-        Self::new_with_startup(BlockSyncStartup::inert(config)?)
+    pub(crate) fn new(
+        config: ZakuraBlockSyncConfig,
+        memory: super::BlockSyncMemory,
+    ) -> Result<Self, BlockSyncStartError> {
+        Self::new_with_startup(BlockSyncStartup::inert(config, memory)?)
     }
 
     /// Builds the service that admits block-sync sessions for the reactor
@@ -464,6 +467,7 @@ impl BlockSyncService {
     pub(crate) fn new_with_header_tip(
         config: ZakuraBlockSyncConfig,
         header_tip: watch::Receiver<(block::Height, block::Hash)>,
+        memory: super::BlockSyncMemory,
     ) -> Result<Self, BlockSyncStartError> {
         let best_header_tip = *header_tip.borrow();
         let startup = BlockSyncStartup::new(
@@ -478,6 +482,7 @@ impl BlockSyncService {
                 .decoded_block_pool(0)
                 .map_err(BlockSyncStartError::InvalidConfig)?,
             config,
+            memory,
         );
         Self::new_with_startup(startup)
     }
@@ -769,6 +774,7 @@ impl Service for BlockSyncService {
         let service_cancel_token = session.cancel_token();
         let connection_cancel_token = peer.cancel_token();
         let close_cause = peer.close_cause();
+        let conn_credit = peer.connection_credit();
         let mut block_sync_session = BlockSyncPeerSession::new(&session, peer.direction);
         let session_id = self.inner.next_session_id.fetch_add(1, Ordering::Relaxed);
         let conn_id = peer.conn_id;
@@ -1013,6 +1019,7 @@ impl Service for BlockSyncService {
                             wiring.trace,
                             wiring.decoded_pool.clone(),
                         );
+                        let routine = routine.with_conn_credit(conn_credit);
                         #[cfg(any(test, zakura_sim))]
                         let routine = routine.with_observer(wiring.observer);
                         zakura_rt::select! {
@@ -1208,17 +1215,24 @@ mod requester_session_tests {
             with_session_slots(usize::MAX, usize::MAX),
         ] {
             assert!(matches!(
-                BlockSyncStartup::inert(config.clone()).and_then(spawn_block_sync_reactor),
+                BlockSyncStartup::inert(
+                    config.clone(),
+                    crate::zakura::BlockSyncMemory::for_tests()
+                )
+                .and_then(spawn_block_sync_reactor),
                 Err(BlockSyncStartError::InvalidConfig(_))
             ));
             assert!(matches!(
-                BlockSyncService::new(config),
+                BlockSyncService::new(config, crate::zakura::BlockSyncMemory::for_tests()),
                 Err(BlockSyncStartError::InvalidConfig(_))
             ));
         }
 
-        let service = BlockSyncService::new(with_session_slots(3_000, 633))
-            .expect("3,633 slots fund one request each");
+        let service = BlockSyncService::new(
+            with_session_slots(3_000, 633),
+            crate::zakura::BlockSyncMemory::for_tests(),
+        )
+        .expect("3,633 slots fund one request each");
         let wiring = service.inner.routine_wiring.as_ref().unwrap();
         assert_eq!(
             super::super::regulated::session::serving_max_inflight_requests(&wiring.config),
@@ -1230,9 +1244,11 @@ mod requester_session_tests {
     #[tokio::test]
     async fn a_handle_serves_with_the_config_its_reactor_validated() {
         let config = with_session_slots(7, 9);
-        let (handle, _actions, _task) =
-            spawn_block_sync_reactor(BlockSyncStartup::inert(config.clone()).unwrap())
-                .expect("valid block-sync config");
+        let (handle, _actions, _task) = spawn_block_sync_reactor(
+            BlockSyncStartup::inert(config.clone(), crate::zakura::BlockSyncMemory::for_tests())
+                .unwrap(),
+        )
+        .expect("valid block-sync config");
         let service = BlockSyncService::new_with_handle(handle);
         assert_eq!(service.inner.config.peer_limits, config.peer_limits);
     }
@@ -1241,8 +1257,11 @@ mod requester_session_tests {
     /// direction.
     #[tokio::test]
     async fn zero_session_slots_admit_no_serving_session() {
-        let service =
-            BlockSyncService::new(with_session_slots(0, 0)).expect("zero slots are valid");
+        let service = BlockSyncService::new(
+            with_session_slots(0, 0),
+            crate::zakura::BlockSyncMemory::for_tests(),
+        )
+        .expect("zero slots are valid");
         let peer = ZakuraPeerId::new(vec![42; 32]).unwrap();
         for direction in [
             ServicePeerDirection::Inbound,
@@ -1255,8 +1274,11 @@ mod requester_session_tests {
 
     #[tokio::test]
     async fn connection_removal_retires_and_removes_its_requester_fence() {
-        let service = BlockSyncService::new(ZakuraBlockSyncConfig::default())
-            .expect("valid block-sync config");
+        let service = BlockSyncService::new(
+            ZakuraBlockSyncConfig::default(),
+            crate::zakura::BlockSyncMemory::for_tests(),
+        )
+        .expect("valid block-sync config");
         let peer = ZakuraPeerId::new(vec![41; 32]).unwrap();
         let connection = CancellationToken::new();
         let cancel = connection.child_token();
@@ -1385,9 +1407,12 @@ mod regulated_frame_tests {
     #[tokio::test]
     async fn an_older_connection_cannot_clear_a_newer_gap_claim() {
         let service = BlockSyncService::new_with_startup(
-            BlockSyncStartup::inert(ZakuraBlockSyncConfig::default())
-                .unwrap()
-                .with_range_source(Arc::new(EmptySource)),
+            BlockSyncStartup::inert(
+                ZakuraBlockSyncConfig::default(),
+                crate::zakura::BlockSyncMemory::for_tests(),
+            )
+            .unwrap()
+            .with_range_source(Arc::new(EmptySource)),
         )
         .expect("valid block-sync config");
         let peer = ZakuraPeerId::new(vec![44; 32]).unwrap();
@@ -1447,9 +1472,12 @@ mod regulated_frame_tests {
     #[tokio::test]
     async fn status_cadence_survives_session_replacement_and_ends_with_its_connection() {
         let service = BlockSyncService::new_with_startup(
-            BlockSyncStartup::inert(ZakuraBlockSyncConfig::default())
-                .unwrap()
-                .with_range_source(Arc::new(EmptySource)),
+            BlockSyncStartup::inert(
+                ZakuraBlockSyncConfig::default(),
+                crate::zakura::BlockSyncMemory::for_tests(),
+            )
+            .unwrap()
+            .with_range_source(Arc::new(EmptySource)),
         )
         .expect("valid block-sync config");
         let peer = ZakuraPeerId::new(vec![42; 32]).unwrap();
@@ -1538,9 +1566,12 @@ mod regulated_frame_tests {
     #[tokio::test]
     async fn reconnect_churn_returns_block_sync_maps_to_baseline() {
         let service = BlockSyncService::new_with_startup(
-            BlockSyncStartup::inert(ZakuraBlockSyncConfig::default())
-                .unwrap()
-                .with_range_source(Arc::new(EmptySource)),
+            BlockSyncStartup::inert(
+                ZakuraBlockSyncConfig::default(),
+                crate::zakura::BlockSyncMemory::for_tests(),
+            )
+            .unwrap()
+            .with_range_source(Arc::new(EmptySource)),
         )
         .expect("valid block-sync config");
         let peer = ZakuraPeerId::new(vec![43; 32]).unwrap();
@@ -1636,9 +1667,12 @@ mod regulated_frame_tests {
     async fn negotiation_requires_the_regulated_capability() {
         let service = Arc::new(
             BlockSyncService::new_with_startup(
-                BlockSyncStartup::inert(ZakuraBlockSyncConfig::default())
-                    .unwrap()
-                    .with_range_source(Arc::new(EmptySource)),
+                BlockSyncStartup::inert(
+                    ZakuraBlockSyncConfig::default(),
+                    crate::zakura::BlockSyncMemory::for_tests(),
+                )
+                .unwrap()
+                .with_range_source(Arc::new(EmptySource)),
             )
             .expect("valid block-sync config"),
         );
@@ -1659,8 +1693,11 @@ mod regulated_frame_tests {
             );
             assert!(streams[0].messages.is_some());
         }
-        let default = BlockSyncService::new(ZakuraBlockSyncConfig::default())
-            .expect("valid block-sync config");
+        let default = BlockSyncService::new(
+            ZakuraBlockSyncConfig::default(),
+            crate::zakura::BlockSyncMemory::for_tests(),
+        )
+        .expect("valid block-sync config");
         assert_eq!(default.streams(), &BLOCK_SYNC_SERVICE_STREAMS);
     }
 
@@ -1668,9 +1705,12 @@ mod regulated_frame_tests {
     async fn sessions_install_fences_and_reject_version_two_or_one_slot() {
         for (version, depth) in [(2, 2), (3, 1), (3, 2)] {
             let service = BlockSyncService::new_with_startup(
-                BlockSyncStartup::inert(ZakuraBlockSyncConfig::default())
-                    .unwrap()
-                    .with_range_source(Arc::new(EmptySource)),
+                BlockSyncStartup::inert(
+                    ZakuraBlockSyncConfig::default(),
+                    crate::zakura::BlockSyncMemory::for_tests(),
+                )
+                .unwrap()
+                .with_range_source(Arc::new(EmptySource)),
             )
             .expect("valid block-sync config");
             let peer = ZakuraPeerId::new(vec![45; 32]).unwrap();
@@ -1723,7 +1763,7 @@ mod regulated_frame_tests {
         config.peer_limits.max_outbound_peers = 1;
         config.peer_limits.max_pending_escalations = 2;
         let service = BlockSyncService::new_with_startup(
-            BlockSyncStartup::inert(config)
+            BlockSyncStartup::inert(config, crate::zakura::BlockSyncMemory::for_tests())
                 .unwrap()
                 .with_range_source(Arc::new(EmptySource)),
         )

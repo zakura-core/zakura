@@ -76,6 +76,11 @@ pub(super) struct SequencedBody {
     pub(super) admitted_estimate_bytes: Option<u64>,
     pub(super) supplier: BlockSupplier,
     pub(super) received_at: Instant,
+    /// Pool lease carried from request credit through sequencer retention
+    /// (`decision-4`). `None` when block sync runs without a `MemoryPool`.
+    pub(super) body_lease: Option<crate::zakura::memory::PoolLease>,
+    /// How long the request this body completed took, for the look-ahead cap.
+    pub(super) fetch_elapsed: Option<Duration>,
     queue_accounting: SequencerInputAccounting,
 }
 
@@ -202,6 +207,8 @@ impl SequencedBody {
             admitted_estimate_bytes,
             supplier,
             received_at,
+            body_lease: None,
+            fetch_elapsed: None,
             queue_accounting: SequencerInputAccounting::new(
                 input_bytes,
                 bytes,
@@ -209,6 +216,21 @@ impl SequencedBody {
                 decoded_attributed_memory_size_bytes,
             ),
         }
+    }
+
+    /// Attach the pool lease transferred from the work queue for this body.
+    pub(super) fn with_body_lease(
+        mut self,
+        body_lease: Option<crate::zakura::memory::PoolLease>,
+    ) -> Self {
+        self.body_lease = body_lease;
+        self
+    }
+
+    /// This body, completing a request that took `fetch_elapsed`.
+    pub(super) fn with_fetch_elapsed(mut self, fetch_elapsed: Option<Duration>) -> Self {
+        self.fetch_elapsed = fetch_elapsed;
+        self
     }
 
     /// Transfer this body out of queue ownership before processing it.
@@ -469,15 +491,29 @@ impl state::SequencerEvidence {
     }
 }
 
+/// Pool lease shrink/release operations deferred until after holder-release
+/// observation so payloads drop and report release before `PoolLease::drop`.
+#[derive(Default)]
+pub(super) struct DeferredLeaseSettlement {
+    released: Vec<crate::zakura::memory::PoolLease>,
+    shrink_to_wire: Vec<super::reorder::BodyId>,
+}
+
 /// Runtime payload storage. Policy receives only identities and measured facts.
 #[derive(Debug, Default)]
 pub(super) struct SequencerPayloads {
     entries: std::collections::BTreeMap<super::reorder::BodyId, BufferedBlockBody>,
+    /// Per-payload pool leases (`(wire_bytes, lease)`) following retained bodies
+    /// until `PayloadChange::Release` or teardown (`decision-4`).
+    leases:
+        std::collections::BTreeMap<super::reorder::BodyId, (u64, crate::zakura::memory::PoolLease)>,
     next_id: u64,
     /// The last raw payload the pool refused for capacity, with its admission
     /// and its decoded size. Decoding it again before the pool has room for
     /// that size would only repeat the refusal.
     capacity_refused: Option<(super::reorder::BodyId, Admission, u64)>,
+    /// The consumer that refused the last decoded body's lease growth.
+    lease_refused: Option<crate::zakura::memory::Consumer>,
 }
 
 pub(super) struct MaterializedBody {
@@ -492,7 +528,14 @@ impl SequencerPayloads {
         self.entries.keys().copied()
     }
 
-    pub(super) fn insert(&mut self, body: BufferedBlockBody) -> super::reorder::BodyFacts {
+    /// Retain `body` and the lease that covers its `wire_bytes` and any
+    /// decoded copy.
+    pub(super) fn insert(
+        &mut self,
+        body: BufferedBlockBody,
+        wire_bytes: u64,
+        lease: Option<crate::zakura::memory::PoolLease>,
+    ) -> super::reorder::BodyFacts {
         use super::reorder::{BodyFacts, BodyId};
         self.next_id = self
             .next_id
@@ -516,39 +559,73 @@ impl SequencerPayloads {
             self.entries.insert(id, body).is_none(),
             "payload identities never repeat"
         );
+        if let Some(lease) = lease {
+            self.leases.insert(id, (wire_bytes, lease));
+        }
         facts
     }
 
-    pub(super) fn release(&mut self, id: super::reorder::BodyId) {
-        self.entries
-            .remove(&id)
-            .expect("policy releases a retained payload exactly once");
-    }
-
-    pub(super) fn apply(&mut self, changes: Vec<super::reorder::PayloadChange>) {
+    /// Mutate/drop the payload entries without releasing or shrinking their
+    /// pool leases yet, so callers can report holder releases before
+    /// `PoolLease::drop` (which takes the pool mutex).
+    pub(super) fn apply_entries(
+        &mut self,
+        changes: Vec<super::reorder::PayloadChange>,
+    ) -> DeferredLeaseSettlement {
         use super::reorder::PayloadChange;
+        let mut deferred = DeferredLeaseSettlement::default();
         for change in changes {
             match change {
-                PayloadChange::KeepRaw(id) => self
-                    .entries
-                    .get_mut(&id)
-                    .expect("policy downgrades a retained payload")
-                    .retain_for_backlog_in_place(),
-                PayloadChange::Release(id) => self.release(id),
+                PayloadChange::KeepRaw(id) => {
+                    self.entries
+                        .get_mut(&id)
+                        .expect("policy downgrades a retained payload")
+                        .retain_for_backlog_in_place();
+                    deferred.shrink_to_wire.push(id);
+                }
+                PayloadChange::Release(id) => {
+                    self.entries
+                        .remove(&id)
+                        .expect("policy releases a retained payload exactly once");
+                    if let Some((_, lease)) = self.leases.remove(&id) {
+                        deferred.released.push(lease);
+                    }
+                }
             }
         }
+        deferred
+    }
+
+    /// Finish shrinking and dropping pool leases whose payloads have already
+    /// been downgraded or released by [`Self::apply_entries`].
+    pub(super) fn settle_leases(&mut self, deferred: DeferredLeaseSettlement) {
+        for id in deferred.shrink_to_wire {
+            if let Some((wire_bytes, lease)) = self.leases.get_mut(&id) {
+                if lease.bytes() > *wire_bytes {
+                    lease.shrink_to(*wire_bytes);
+                }
+            }
+        }
+        drop(deferred.released);
     }
 
     /// Decode the payload `id` under `admission` when it is still raw, and borrow
     /// its charged block for a submission. A payload the pool refused for
     /// capacity is not decoded again until the pool has room for its decoded
     /// size, so the caller reads the pool's capacity version before this call.
+    ///
+    /// The body's lease grows to cover the decoded copy (`decision-4`). A
+    /// commit-window body moves its lease to the reserved `Consumer::Consensus`
+    /// first. When neither lease can grow, the body stays raw, its lease
+    /// returns to its wire bytes, and [`Self::take_lease_refusal`] names the
+    /// consumer to wait on.
     #[allow(clippy::unwrap_in_result)] // Ownership invariants must fail loudly.
     pub(super) fn materialize(
         &mut self,
         id: super::reorder::BodyId,
         pool: &DecodedBlockPool,
         admission: Admission,
+        memory_pool: &crate::zakura::memory::MemoryPool,
     ) -> Result<MaterializedBody, AdmissionFailure> {
         let body = self
             .entries
@@ -576,12 +653,75 @@ impl SequencerPayloads {
                 return Err(refusal.reason);
             }
         };
+        let decoded_bytes = body.decoded_attributed_memory_size_bytes();
+        if let Some((wire_bytes, lease)) = self.leases.get_mut(&id) {
+            let target = wire_bytes.saturating_add(decoded_bytes);
+            if let Err(refused) = lease_decoded_body(lease, target, admission, memory_pool) {
+                body.retain_for_backlog_in_place();
+                lease.shrink_to(*wire_bytes);
+                self.lease_refused = Some(refused);
+                return Err(AdmissionFailure::Capacity);
+            }
+        }
         Ok(MaterializedBody {
             block,
-            decoded_bytes: body.decoded_attributed_memory_size_bytes(),
+            decoded_bytes,
             newly_decoded_wire_bytes,
         })
     }
+
+    /// The consumer whose refusal kept the last materialized body raw.
+    pub(super) fn take_lease_refusal(&mut self) -> Option<crate::zakura::memory::Consumer> {
+        self.lease_refused.take()
+    }
+}
+
+/// Grow `lease` to `target` bytes for a decoded body, and return the consumer
+/// that refused.
+///
+/// A commit-window body (`PipelineExempt`) holds a Consensus lease, so commit
+/// progress never waits on bulk capacity (decision-6). A bulk lease moves to
+/// Consensus here. Consensus holds one lease per height, and admission's
+/// charge covers the decoded body, so the reserve always fits it (mem-15). A
+/// Consensus refusal is an invariant breach: block sync counts it, the
+/// simulator asserts it, and the body waits on its bulk lease.
+fn lease_decoded_body(
+    lease: &mut crate::zakura::memory::PoolLease,
+    target: u64,
+    admission: Admission,
+    memory_pool: &crate::zakura::memory::MemoryPool,
+) -> Result<(), crate::zakura::memory::Consumer> {
+    use crate::zakura::memory::Consumer;
+    let exempt = admission == Admission::PipelineExempt;
+    if exempt && lease.consumer() == Consumer::BlockSync {
+        match memory_pool.try_acquire(Consumer::Consensus, lease.peer(), target.max(lease.bytes()))
+        {
+            Ok(consensus) => {
+                *lease = consensus;
+                return Ok(());
+            }
+            Err(_) => consensus_lease_refused(target),
+        }
+    }
+    if target <= lease.bytes() {
+        return Ok(());
+    }
+    let consumer = lease.consumer();
+    lease.try_grow_to(target).map_err(|_| {
+        if exempt && consumer == Consumer::Consensus {
+            consensus_lease_refused(target);
+        }
+        consumer
+    })
+}
+
+/// Count a Consensus refusal for a commit-window body, which mem-15 rules out.
+fn consensus_lease_refused(target: u64) {
+    metrics::counter!("sync.block.consensus.lease_refused").increment(1);
+    #[cfg(zakura_sim)]
+    panic!("Consensus refused a {target}-byte commit-window body lease (mem-15)");
+    #[cfg(not(zakura_sim))]
+    let _ = target;
 }
 
 /// The serial commit-pipeline task's IO half. Owns [`SequencerState`], an
@@ -594,6 +734,16 @@ pub(super) struct SequencerIO {
     payloads: SequencerPayloads,
     decoded_pool: DecodedBlockPool,
     decoded_capacity_blocked: Option<u64>,
+    memory_pool: crate::zakura::memory::MemoryPool,
+    /// The pool's capacity version when a lease refusal kept a body raw, and
+    /// the wait token that marks the refused consumer waiting (`02 §5`).
+    pool_capacity_blocked: Option<(
+        u64,
+        crate::zakura::memory::Consumer,
+        crate::zakura::memory::PoolWaitToken,
+    )>,
+    /// `Consumer::BlockSync`'s benefit cap inputs, refreshed on `cap_ticks`.
+    look_ahead: LookAheadCap,
     retry_clock: Arc<dyn zakura_header_chain::Clock>,
     work: Arc<WorkQueue>,
     registry: Arc<PeerRegistry>,
@@ -625,18 +775,21 @@ impl Drop for SequencerIO {
             super::block_sync_observe::BlockEvent::SequencerClosed
         );
         self.body_input_rx.close();
-        #[cfg(any(test, zakura_sim))]
-        {
-            // Each body left in the input drops here, with no next holder.
-            while let Ok(body) = self.body_input_rx.try_recv() {
-                self.observe_dequeued(&body);
+        let mut dropped_leases = Vec::new();
+        while let Ok(mut body) = self.body_input_rx.try_recv() {
+            #[cfg(any(test, zakura_sim))]
+            self.observe_dequeued(&body);
+            if let Some(lease) = body.body_lease.take() {
+                dropped_leases.push(lease);
             }
-            self.observe_holders();
         }
-        while self.body_input_rx.try_recv().is_ok() {}
+        #[cfg(any(test, zakura_sim))]
+        self.observe_holders();
         self.payloads.entries.clear();
         #[cfg(any(test, zakura_sim))]
         self.observe_teardown();
+        self.payloads.leases.clear();
+        drop(dropped_leases);
     }
 }
 
@@ -664,6 +817,9 @@ impl SequencerIO {
         Self {
             decoded_pool,
             decoded_capacity_blocked: None,
+            memory_pool: work.memory_pool().clone(),
+            pool_capacity_blocked: None,
+            look_ahead: LookAheadCap::new(None),
             state: SequencerState::new(sequencer, frontiers, current_scope, retry_jitter),
             payloads: SequencerPayloads::default(),
             retry_clock,
@@ -780,9 +936,24 @@ impl SequencerIO {
         );
     }
 
-    pub(super) fn with_retained_body_limit(mut self, limit: u64) -> Self {
-        self.state.set_retained_body_limit(limit);
+    /// This task, lowering the derived look-ahead to `[memory.cap] look_ahead`.
+    pub(super) fn with_look_ahead_cap(mut self, cap_override: Option<u64>) -> Self {
+        self.look_ahead = LookAheadCap::new(cap_override);
         self
+    }
+
+    /// Set `Consumer::BlockSync`'s benefit cap from the peers' congestion
+    /// windows and the smoothed look-ahead (`02 §4`). Runs once per
+    /// [`LOOK_AHEAD_CAP_TICK`].
+    fn refresh_look_ahead_cap(&mut self) {
+        self.committed_throughput
+            .sample_at_interval(Instant::now(), LOOK_AHEAD_CAP_TICK);
+        let cap = self.look_ahead.tick(
+            self.committed_throughput.bytes_per_sec(),
+            self.registry.sum_bbr_cwnd_bytes(),
+        );
+        self.memory_pool
+            .set_cap(crate::zakura::memory::Consumer::BlockSync, cap);
     }
 
     /// Seed the synchronous state-write coordinate from the startup snapshot.
@@ -801,6 +972,8 @@ impl SequencerIO {
         let mut control_open = true;
         let mut body_open = true;
         let pool = self.decoded_pool.clone();
+        let mut cap_ticks = time::interval(LOOK_AHEAD_CAP_TICK);
+        cap_ticks.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
         loop {
             if pool.is_closed() {
                 self.publish_view();
@@ -811,9 +984,24 @@ impl SequencerIO {
                 break;
             }
             let refused_version = self.decoded_capacity_blocked;
+            let pool_refused = self
+                .pool_capacity_blocked
+                .as_ref()
+                .map(|(version, consumer, _)| (*version, *consumer));
+            let mem_pool = self.memory_pool.clone();
             let capacity = async {
                 let changed = pool.capacity().notified();
                 if pool.is_closed() || Some(pool.capacity_version()) != refused_version {
+                    return;
+                }
+                changed.await;
+            };
+            let pool_capacity = async {
+                let Some((version, consumer)) = pool_refused else {
+                    return;
+                };
+                let changed = mem_pool.notifier(consumer).notified();
+                if mem_pool.capacity_version() != version {
                     return;
                 }
                 changed.await;
@@ -836,6 +1024,11 @@ impl SequencerIO {
                     self.publish_view();
                 }
 
+                _ = pool_capacity, if pool_refused.is_some() => {
+                    self.submit_pending_blocks().await;
+                    self.publish_view();
+                }
+
                 _ = time::sleep_until(submission_retry_at.unwrap_or_else(time::Instant::now)),
                     if submission_retry_at.is_some() =>
                 {
@@ -843,6 +1036,8 @@ impl SequencerIO {
                     self.submit_pending_blocks().await;
                     self.publish_view();
                 }
+
+                _ = cap_ticks.tick() => self.refresh_look_ahead_cap(),
 
                 body = self.body_input_rx.recv(), if body_open => {
                     match body {
@@ -888,17 +1083,19 @@ impl SequencerIO {
             _ => None,
         };
         let outputs = self.state.on_control_input(input, wall_now);
-        let needs_reaction = self.apply_control_outputs(outputs).await;
         #[cfg(any(test, zakura_sim))]
         if let Some(event) = applied {
             observe!(self.observer, event);
         }
-        needs_reaction
+        self.apply_control_outputs(outputs).await
     }
 
     /// Record one control transition's diagnostics and run its operations.
     async fn apply_control_outputs(&mut self, outputs: state::ControlOutputs) -> bool {
-        self.payloads.apply(outputs.payload_changes);
+        let deferred = self.payloads.apply_entries(outputs.payload_changes);
+        #[cfg(any(test, zakura_sim))]
+        self.observe_holders();
+        self.payloads.settle_leases(deferred);
         self.publish_state_metrics();
         if let Some(classified) = outputs.frontier_reset {
             if classified.kind != state::FrontierResetKind::Growth {
@@ -925,7 +1122,10 @@ impl SequencerIO {
             owner: body.owner,
             bytes: body.bytes,
         };
-        let facts = self.payloads.insert(body.body);
+        if let Some(elapsed) = body.fetch_elapsed {
+            self.look_ahead.record_fetch(elapsed);
+        }
+        let facts = self.payloads.insert(body.body, body.bytes, body.body_lease);
         let state::BodyAccepted {
             acceptance,
             payload_changes,
@@ -940,7 +1140,10 @@ impl SequencerIO {
             admitted_estimate_bytes: body.admitted_estimate_bytes,
             supplier: body.supplier,
         });
-        self.payloads.apply(payload_changes);
+        let deferred = self.payloads.apply_entries(payload_changes);
+        #[cfg(any(test, zakura_sim))]
+        self.observe_holders();
+        self.payloads.settle_leases(deferred);
         #[cfg(any(test, zakura_sim))]
         if acceptance == BodyAcceptance::StaleScope {
             observe!(
@@ -1018,6 +1221,7 @@ impl SequencerIO {
 
     async fn submit_pending_blocks(&mut self) {
         self.decoded_capacity_blocked = None;
+        self.pool_capacity_blocked = None;
         if self.decoded_pool.is_closed() {
             return;
         }
@@ -1037,6 +1241,7 @@ impl SequencerIO {
                 self.publish_decoded_ownership_view_with(decode_charge);
             }
             let capacity_version = self.decoded_pool.capacity_version();
+            let pool_version = self.memory_pool.capacity_version();
             let Some(submission) = self.state.submission_body(height) else {
                 self.publish_decoded_ownership_view();
                 continue;
@@ -1045,10 +1250,20 @@ impl SequencerIO {
                 submission.id,
                 &self.decoded_pool,
                 submission.admission,
+                &self.memory_pool,
             ) {
                 Ok(materialized) => materialized,
                 Err(AdmissionFailure::Capacity) => {
-                    self.decoded_capacity_blocked = Some(capacity_version);
+                    match self.payloads.take_lease_refusal() {
+                        Some(consumer) => {
+                            self.pool_capacity_blocked = Some((
+                                pool_version,
+                                consumer,
+                                self.memory_pool.wait_token(consumer),
+                            ));
+                        }
+                        None => self.decoded_capacity_blocked = Some(capacity_version),
+                    }
                     self.publish_decoded_ownership_view();
                     break;
                 }
@@ -1096,7 +1311,10 @@ impl SequencerIO {
                     metrics::counter!("sync.block.submit.retry.scheduled").increment(1);
                     self.trace_submission_retry_scheduled(height);
                 }
-                self.payloads.apply(refused.payload_changes);
+                let deferred = self.payloads.apply_entries(refused.payload_changes);
+                #[cfg(any(test, zakura_sim))]
+                self.observe_holders();
+                self.payloads.settle_leases(deferred);
                 self.publish_state_metrics();
                 return;
             }
@@ -1245,11 +1463,8 @@ impl SequencerIO {
             self.observe_holders();
             self.work.observe_items();
         }
-        #[cfg(feature = "sync-metrics")]
         self.committed_throughput
-            .sample_at_interval(Instant::now(), Duration::from_secs(1));
-        #[cfg(not(feature = "sync-metrics"))]
-        self.committed_throughput.sample(Instant::now());
+            .sample_at_interval(Instant::now(), LOOK_AHEAD_CAP_TICK);
         let sequencer_input_decoded_attributed_memory_bytes = self
             .body_input_decoded_attributed_memory_bytes
             .load(Ordering::Relaxed);
@@ -1421,9 +1636,7 @@ mod tests {
     use zakura_chain::serialization::ZcashDeserializeInto;
     use zakura_test::vectors::BLOCK_MAINNET_1_BYTES;
 
-    use super::super::{
-        reactor::BS_ACTION_CONTROL_RESERVE, tests::genesis_frontiers, wire::DecodedBlockPayload,
-    };
+    use super::super::{reactor::BS_ACTION_CONTROL_RESERVE, tests::genesis_frontiers};
     use super::*;
 
     fn test_view() -> SequencerView {
@@ -1609,7 +1822,28 @@ mod tests {
         );
     }
 
-    fn retention_test_task(limit: u64) -> SequencerIO {
+    /// mem-15: a commit-window body on a bulk lease moves to Consensus at
+    /// decode and grows to `wire + decoded` there.
+    #[test]
+    fn commit_window_body_moves_to_consensus_at_decode() {
+        use crate::zakura::memory::{Consumer, ConsumerSpec, MemoryPool, PoolConfig};
+
+        let mb = 1_000_000u64;
+        let config = PoolConfig::new(10 * mb, 0)
+            .with_consumer(Consumer::Consensus, ConsumerSpec::reserved(5 * mb))
+            .with_consumer(Consumer::BlockSync, ConsumerSpec::bulk(mb, mb, 1));
+        let pool = MemoryPool::new(config);
+        let mut lease = pool
+            .try_acquire(Consumer::BlockSync, Some(1), mb)
+            .expect("an above-window request leases block sync");
+        super::lease_decoded_body(&mut lease, 5 * mb, Admission::PipelineExempt, &pool)
+            .expect("the Consensus reserve fits one height");
+        assert_eq!(lease.consumer(), Consumer::Consensus);
+        assert_eq!(lease.bytes(), 5 * mb);
+        assert_eq!(pool.consumer_leased(Consumer::BlockSync), 0);
+    }
+
+    fn retention_test_task() -> SequencerIO {
         let frontiers = genesis_frontiers();
         let (_body_tx, body_rx) = mpsc::channel(1);
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
@@ -1618,7 +1852,7 @@ mod tests {
         let budget = ByteBudget::new(1_000_000);
         SequencerIO::new(
             Sequencer::new(block::Height(0), 1),
-            Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
+            Arc::new(WorkQueue::with_test_pool(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions,
             ThroughputMeter::new(Instant::now()),
@@ -1635,137 +1869,6 @@ mod tests {
             ZakuraTrace::noop(),
             super::test_decoded_pool(),
         )
-        .with_retained_body_limit(limit)
-    }
-
-    fn received_test_block() -> (Arc<block::Block>, DecodedBlockPayload) {
-        let block: Arc<block::Block> = Arc::new(
-            zakura_test::vectors::BLOCK_MAINNET_982681_BYTES
-                .zcash_deserialize_into()
-                .unwrap(),
-        );
-        let raw = DecodedBlockPayload::of_block(&block);
-        (block, raw)
-    }
-
-    /// Wire size of every body [`received_test_body`] builds.
-    fn received_test_body_bytes() -> u64 {
-        u64::try_from(received_test_block().1.block_len()).unwrap()
-    }
-
-    // Use a real serialized block. Only the scheduling height is synthetic.
-    fn received_test_body(task: &mut SequencerIO, height: u32, estimate: u64) -> SequencedBody {
-        let (block, raw) = received_test_block();
-        let bytes = u64::try_from(raw.block_len()).unwrap();
-        let height = block::Height(height);
-        task.work.extend(
-            super::test_work_scope(),
-            [(
-                height,
-                block.hash(),
-                super::super::request::BlockSizeEstimate::Advertised(
-                    u32::try_from(estimate).unwrap(),
-                ),
-            )],
-        );
-        let owner = task.work.publish_fixture(height.0..=height.0);
-        drop(
-            task.work
-                .begin_receipt_for_owner(owner, height)
-                .unwrap()
-                .expect("the test published this owner's reservation"),
-        );
-        let mut body = SequencedBody::new_queued(
-            owner,
-            zakura_header_chain::SourceId::from_digest([1; 32]),
-            height,
-            block.hash(),
-            block.header.previous_block_hash,
-            BufferedBlockBody::from_decoded_block(block, Some(raw)),
-            bytes,
-            None,
-            ZakuraPeerId::new(vec![1; 32]).unwrap(),
-            Instant::now(),
-            task._body_input_bytes.clone(),
-            task.body_input_decoded_attributed_memory_bytes.clone(),
-        );
-        body.leave_queue();
-        body
-    }
-
-    #[test]
-    fn actual_retention_refuses_understated_body_and_defers_exact_attempt() {
-        let mut task = retention_test_task(2_048);
-        let body = received_test_body(&mut task, 500, 1_024);
-        let bytes = body.bytes;
-        assert!(bytes > 2_048);
-        let owner = body.owner;
-        let hash = body.hash;
-        task.handle_accept_body(body);
-        assert_eq!(task.state.sequencer().reorder_buffered_bytes(), 0);
-        assert_eq!(task.work.reserved_bytes(), 0);
-        assert_eq!(task.work.budget().reserved(), 0);
-        assert!(task.work.pending_contains(block::Height(500)));
-        assert!(task
-            .work
-            .take_in_range(block::Height(500), block::Height(500), 1)
-            .is_empty());
-        assert!(!task.work.defer_received_for_owner(
-            owner,
-            block::Height(500),
-            hash,
-            bytes,
-            block::Height(0)
-        ));
-        task.work.advance_floor(block::Height(1));
-        let retry = task.work.take_request(
-            block::Height(500),
-            block::Height(500),
-            1,
-            bytes,
-            99,
-            std::num::NonZeroU64::new(2).unwrap(),
-        );
-        assert_eq!(retry.items()[0].1.estimated_bytes, bytes);
-        assert!(!task.work.defer_received_for_owner(
-            owner,
-            block::Height(500),
-            hash,
-            bytes,
-            block::Height(1)
-        ));
-    }
-
-    #[tokio::test]
-    async fn actual_retention_serializes_arrivals_and_preserves_checkpoint_progress() {
-        let bytes = received_test_body_bytes();
-        let mut task = retention_test_task(bytes);
-        let first = received_test_body(&mut task, 500, 1_024);
-        assert_eq!(first.bytes, bytes);
-        let second = received_test_body(&mut task, 501, 1_024);
-        // Both replies were issued before the first was retained.
-        task.handle_accept_body(first);
-        task.handle_accept_body(second);
-        assert_eq!(task.state.sequencer().reorder_buffered_bytes(), bytes);
-        assert_eq!(task.state.sequencer().reorder_len(), 1);
-        assert!(task.work.pending_contains(block::Height(501)));
-        // A full speculative backlog cannot prevent assembling the checkpoint.
-        let checkpoint = received_test_body(&mut task, 401, 1_024);
-        task.handle_accept_body(checkpoint);
-        assert_eq!(task.state.sequencer().reorder_buffered_bytes(), 2 * bytes);
-        // A reset to the verified tip, with no successor work anchored, is destructive.
-        task.handle_control_input(SequencerControlInput::FrontierReset {
-            frontiers: genesis_frontiers(),
-            preserve_active_successors: false,
-            peer_has_successor_after: false,
-            peer_outstanding_conflicts_at_tip: false,
-        })
-        .await;
-        assert_eq!(task.state.reset_epoch(), 1);
-        assert_eq!(task.state.sequencer().reorder_buffered_bytes(), 0);
-        let after_reset = received_test_body(&mut task, 502, 1_024);
-        task.handle_accept_body(after_reset);
-        assert_eq!(task.state.sequencer().reorder_buffered_bytes(), bytes);
     }
 
     #[tokio::test]
@@ -1779,7 +1882,7 @@ mod tests {
         let budget = ByteBudget::new(123);
         let mut task = SequencerIO::new(
             Sequencer::new(block::Height(0), 1),
-            Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
+            Arc::new(WorkQueue::with_test_pool(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions,
             ThroughputMeter::new(Instant::now()),
@@ -1825,7 +1928,7 @@ mod tests {
         let budget = ByteBudget::new(123);
         let mut task = SequencerIO::new(
             Sequencer::new(block::Height(0), 1),
-            Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
+            Arc::new(WorkQueue::with_test_pool(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions,
             ThroughputMeter::new(Instant::now()),
@@ -1870,7 +1973,10 @@ mod tests {
     async fn body_invalid_reselection_resets_block_pipeline() {
         let frontiers = genesis_frontiers();
         let old_authority = super::test_work_scope();
-        let work = Arc::new(WorkQueue::new(block::Height(0), ByteBudget::new(u64::MAX)));
+        let work = Arc::new(WorkQueue::with_test_pool(
+            block::Height(0),
+            ByteBudget::new(u64::MAX),
+        ));
         work.extend(
             old_authority,
             [(
@@ -1941,7 +2047,7 @@ mod tests {
         let budget = ByteBudget::new(123);
         let mut task = SequencerIO::new(
             Sequencer::new(block::Height(0), 1),
-            Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
+            Arc::new(WorkQueue::with_test_pool(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions,
             ThroughputMeter::new(Instant::now()),
@@ -2054,7 +2160,10 @@ mod tests {
         let refusals = Arc::new(Refusals::default());
         let mut task = SequencerIO::new(
             Sequencer::new(block::Height(0), 1),
-            Arc::new(WorkQueue::new(block::Height(0), ByteBudget::new(123))),
+            Arc::new(WorkQueue::with_test_pool(
+                block::Height(0),
+                ByteBudget::new(123),
+            )),
             Arc::new(PeerRegistry::new()),
             actions,
             ThroughputMeter::new(Instant::now()),
@@ -2116,7 +2225,7 @@ mod tests {
         let budget = ByteBudget::new(123);
         let mut task = SequencerIO::new(
             Sequencer::new(block::Height(0), 1),
-            Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
+            Arc::new(WorkQueue::with_test_pool(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions,
             ThroughputMeter::new(Instant::now()),
@@ -2237,7 +2346,7 @@ mod tests {
         let budget = ByteBudget::new(123);
         let mut task = SequencerIO::new(
             Sequencer::new(block::Height(0), 1),
-            Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
+            Arc::new(WorkQueue::with_test_pool(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions,
             ThroughputMeter::new(Instant::now()),
@@ -2363,7 +2472,7 @@ mod tests {
         let budget = ByteBudget::new(123);
         let mut task = SequencerIO::new(
             Sequencer::new(block::Height(0), 1),
-            Arc::new(WorkQueue::new(block::Height(0), budget)),
+            Arc::new(WorkQueue::with_test_pool(block::Height(0), budget)),
             registry.clone(),
             actions,
             ThroughputMeter::new(Instant::now()),
@@ -2445,7 +2554,7 @@ mod tests {
         let budget = ByteBudget::new(123);
         let mut task = SequencerIO::new(
             Sequencer::new(block::Height(0), 1),
-            Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
+            Arc::new(WorkQueue::with_test_pool(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions,
             ThroughputMeter::new(Instant::now()),
@@ -2547,7 +2656,7 @@ mod tests {
                 let budget = ByteBudget::new(123);
                 let mut task = SequencerIO::new(
                     Sequencer::new(block::Height(0), 1),
-                    Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
+                    Arc::new(WorkQueue::with_test_pool(block::Height(0), budget.clone())),
                     Arc::new(PeerRegistry::new()),
                     actions,
                     ThroughputMeter::new(Instant::now()),
@@ -2656,7 +2765,10 @@ mod tests {
         let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
         let mut task = SequencerIO::new(
             Sequencer::new(block::Height(0), 1),
-            Arc::new(WorkQueue::new(block::Height(0), ByteBudget::new(123))),
+            Arc::new(WorkQueue::with_test_pool(
+                block::Height(0),
+                ByteBudget::new(123),
+            )),
             registry.clone(),
             actions,
             ThroughputMeter::new(Instant::now()),
@@ -2762,7 +2874,7 @@ mod tests {
             let budget = ByteBudget::new(123);
             let mut task = SequencerIO::new(
                 Sequencer::new(block::Height(0), 1),
-                Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
+                Arc::new(WorkQueue::with_test_pool(block::Height(0), budget.clone())),
                 Arc::new(PeerRegistry::new()),
                 actions.clone(),
                 ThroughputMeter::new(Instant::now()),
@@ -2901,7 +3013,7 @@ mod tests {
             let budget = ByteBudget::new(123);
             let mut task = SequencerIO::new(
                 Sequencer::new(block::Height(0), 1),
-                Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
+                Arc::new(WorkQueue::with_test_pool(block::Height(0), budget.clone())),
                 Arc::new(PeerRegistry::new()),
                 actions,
                 ThroughputMeter::new(Instant::now()),
@@ -3028,7 +3140,7 @@ mod tests {
         let budget = ByteBudget::new(123);
         let task = SequencerIO::new(
             Sequencer::new(block::Height(0), 1),
-            Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
+            Arc::new(WorkQueue::with_test_pool(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions,
             ThroughputMeter::new(Instant::now()),
@@ -3121,7 +3233,7 @@ mod tests {
         let budget = ByteBudget::new(123);
         let mut task = SequencerIO::new(
             Sequencer::new(block::Height(0), 1),
-            Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
+            Arc::new(WorkQueue::with_test_pool(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions,
             ThroughputMeter::new(Instant::now()),
@@ -3179,7 +3291,7 @@ mod tests {
         let budget = ByteBudget::new(1);
         let task = SequencerIO::new(
             Sequencer::new(block::Height(0), 1),
-            Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
+            Arc::new(WorkQueue::with_test_pool(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions,
             ThroughputMeter::new(Instant::now()),
@@ -3247,7 +3359,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn accounting_closure_is_published_and_wakes_view_watchers() {
-        let mut task = retention_test_task(u64::MAX);
+        let mut task = retention_test_task();
         let mut view = task.view_tx.subscribe();
         assert!(!view.borrow_and_update().accounting_closed);
         task.work.set_estimate_floor_for_tests(1);
@@ -3269,7 +3381,13 @@ mod tests {
                 7,
                 std::num::NonZeroU64::new(1).unwrap(),
             )
-            .admit(block::Height(0), zakura_rt::sync::CancellationToken::new())
+            .admit_for_connection(
+                block::Height(0),
+                block::Height(0),
+                0,
+                None,
+                zakura_rt::sync::CancellationToken::new(),
+            )
             .unwrap()
             .publish(|_| {})
             .unwrap();

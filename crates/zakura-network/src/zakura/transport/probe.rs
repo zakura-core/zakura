@@ -12,7 +12,7 @@ use zakura_quic::{ConnLoad, LoadProbe};
 use zakura_rt::{
     sim::in_boundary_read,
     sync::{
-        counter::{AtomicUsize, Ordering},
+        counter::{AtomicU64, AtomicUsize, Ordering},
         Semaphore,
     },
 };
@@ -121,6 +121,7 @@ impl HandshakeProbe {
 pub struct ConnectionProbe {
     quic: LoadProbe,
     receive_window: u64,
+    live_receive_window: Option<Weak<AtomicU64>>,
     kinds: Vec<KindProbe>,
     streams: Weak<Semaphore>,
     stream_owners: Weak<[AtomicUsize; OWNER_PHASES]>,
@@ -224,6 +225,7 @@ impl ConnectionProbe {
     pub(crate) fn new<'g>(
         quic: LoadProbe,
         receive_window: u64,
+        live_receive_window: Option<Arc<AtomicU64>>,
         streams: &Arc<Semaphore>,
         stream_owners: &Arc<[AtomicUsize; OWNER_PHASES]>,
         stream_limits: super::super::ZakuraConnectionLimits,
@@ -232,6 +234,7 @@ impl ConnectionProbe {
         ConnectionProbe {
             quic,
             receive_window,
+            live_receive_window: live_receive_window.map(|rw| Arc::downgrade(&rw)),
             streams: Arc::downgrade(streams),
             stream_owners: Arc::downgrade(stream_owners),
             stream_limits,
@@ -277,7 +280,11 @@ impl ConnectionProbe {
                 capacity,
                 rate: self.stream_limits.stream_open_rate_per_second,
             },
-            receive_window: self.receive_window,
+            receive_window: self
+                .live_receive_window
+                .as_ref()
+                .and_then(|live| live.upgrade())
+                .map_or(self.receive_window, |live| live.load(Ordering::Relaxed)),
             quic: self.quic.read(),
             kinds: self
                 .kinds

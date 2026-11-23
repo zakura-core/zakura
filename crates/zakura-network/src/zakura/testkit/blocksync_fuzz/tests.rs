@@ -896,38 +896,36 @@ async fn fuzz_commit_stall() {
         }),
     };
     scenario.deadline = Duration::from_secs(60);
+    // The pool caps retained above-window wire bytes at block sync's cap.
+    let (_, block_sync_cap) = scenario.block_sync_memory_bytes();
     let (_, report) = run_checked("fuzz_commit_stall", scenario, 64).await;
 
     // Budget plus the commit-window exemption and request-boundary margin.
     let window_slack = (MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES as u64)
-        .saturating_mul(body_bytes as u64)
-        .saturating_mul(DESERIALIZED_MEM_FACTOR);
+        .saturating_mul(body_bytes as u64);
     let margin = (body_bytes as u64)
-        .saturating_mul(16)
-        .saturating_mul(DESERIALIZED_MEM_FACTOR);
-    let peak_retained_resident = report
-        .peak_retained_pipeline_wire_bytes
-        .saturating_mul(DESERIALIZED_MEM_FACTOR);
-    let bound = resident_budget
+        .saturating_mul(16);
+    let peak_retained_resident = report.peak_retained_pipeline_wire_bytes;
+    let bound = block_sync_cap
         .saturating_add(window_slack)
         .saturating_add(margin);
     assert!(
         peak_retained_resident <= bound,
-        "peak retained resident cost {} must stay within the {} B budget \
+        "peak retained wire bytes {} must stay within the {} B block-sync cap \
          (+{} B commit-window slack, +{} B margin); the apply backlog is bounded by \
          the resident gate, not unbounded by the commit stall",
         peak_retained_resident,
-        resident_budget,
+        block_sync_cap,
         window_slack,
         margin,
     );
     // Ensure the bound is exercised.
     assert!(
-        peak_retained_resident >= resident_budget / 2,
+        peak_retained_resident >= block_sync_cap / 2,
         "the commit stall should have created real retained-memory pressure \
          (retained {} of the {} B budget)",
         peak_retained_resident,
-        resident_budget,
+        block_sync_cap,
     );
     tracing::info!(
         peak_retained_pipeline_wire_bytes = report.peak_retained_pipeline_wire_bytes,
@@ -977,6 +975,8 @@ async fn fuzz_commit_stall_resident_plateau() {
         }),
     };
     scenario.deadline = Duration::from_secs(120);
+    // The pool caps retained above-window wire bytes at block sync's cap.
+    let (_, block_sync_cap) = scenario.block_sync_memory_bytes();
     let (_, report) = run_checked("fuzz_commit_stall_resident_plateau", scenario, 64).await;
 
     // Peak retained resident cost stays within the budget, plus the commit-window
@@ -986,39 +986,35 @@ async fn fuzz_commit_stall_resident_plateau() {
     // the full ~150 MB resident chain instead.
     // `usize → u64` widenings are lossless on all supported (64-bit) targets.
     let window_slack = (MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES as u64)
-        .saturating_mul(body_bytes as u64)
-        .saturating_mul(DESERIALIZED_MEM_FACTOR);
+        .saturating_mul(body_bytes as u64);
     let margin = (body_bytes as u64)
-        .saturating_mul(16)
-        .saturating_mul(DESERIALIZED_MEM_FACTOR);
-    let peak_retained_resident = report
-        .peak_retained_pipeline_wire_bytes
-        .saturating_mul(DESERIALIZED_MEM_FACTOR);
-    let bound = resident_budget
+        .saturating_mul(16);
+    let peak_retained_resident = report.peak_retained_pipeline_wire_bytes;
+    let bound = block_sync_cap
         .saturating_add(window_slack)
         .saturating_add(margin);
     assert!(
         peak_retained_resident <= bound,
-        "peak retained resident cost {} must stay within the {} B budget \
+        "peak retained wire bytes {} must stay within the {} B block-sync cap \
          (+{} B commit-window slack, +{} B margin)",
         peak_retained_resident,
-        resident_budget,
+        block_sync_cap,
         window_slack,
         margin,
     );
     // Non-vacuous: the stall actually pushed retention past the gated budget alone, so
     // the bound above is doing real work.
     assert!(
-        peak_retained_resident >= resident_budget / 2,
+        peak_retained_resident >= block_sync_cap / 2,
         "the commit stall should have created real retained-memory pressure \
          (retained {} of the {} B budget)",
         peak_retained_resident,
-        resident_budget,
+        block_sync_cap,
     );
     tracing::info!(
         peak_retained_pipeline_wire_bytes = report.peak_retained_pipeline_wire_bytes,
         peak_retained_resident,
-        resident_budget,
+        block_sync_cap,
         window_slack,
         "commit_stall resident-plateau observation",
     );

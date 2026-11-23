@@ -261,6 +261,7 @@ impl PeerState {
             // requests stops advertising a stale-low RTprop to the cross-peer
             // floor-preference comparison.
             bbr_rtprop_ms: self.window.bbr_rtprop_ms(now),
+            bbr_cwnd_bytes: self.window.bbr_effective_cwnd_bytes().unwrap_or(0),
         }
     }
 

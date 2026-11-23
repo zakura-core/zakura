@@ -251,7 +251,7 @@ pub fn spawn_block_sync_reactor(
         startup.decoded_pool.clone(),
     )
     .with_initial_state_version(initial_state_version)
-    .with_retained_body_limit(startup.config.effective_max_reorder_lookahead_bytes());
+    .with_look_ahead_cap(startup.memory.look_ahead_cap);
     #[cfg(any(test, zakura_sim))]
     let sequencer_task = sequencer_task.with_observer(startup.observer.clone());
     spawn_erased_named("block_sync_sequencer", sequencer_task.run());

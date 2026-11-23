@@ -23,7 +23,6 @@ use crate::zakura::{
         config::MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES,
         request::BlockSizeEstimate,
         work_queue::{WorkItem, WorkQueue},
-        ZakuraBlockSyncConfig,
     },
     machine_test::MAX_HISTORY_BYTES,
     transport::ByteBudget,
@@ -52,17 +51,15 @@ fn estimate(byte: u8) -> BlockSizeEstimate {
 }
 
 /// Fund `keep` of the items above `floor + raced` through the production queue.
-/// A separate exhausted-budget queue reports whether the run may overdraft.
 fn fund_retained(
     floor: u32,
     raced: u32,
     bytes: &[u8],
     keep: std::ops::Range<usize>,
-    budget_bytes: u64,
 ) -> Option<(Vec<(block::Height, WorkItem)>, Funding)> {
-    let work = Arc::new(WorkQueue::new(
+    let work = Arc::new(WorkQueue::with_test_pool(
         block::Height(floor),
-        ByteBudget::new(budget_bytes),
+        ByteBudget::new(u64::MAX / 2),
     ));
     let first = floor + 1;
     let rival: Vec<_> = (first..first + raced)
@@ -127,18 +124,12 @@ fn replay(
         if let Some(run) = actual.keep {
             let start =
                 floor + 1 + raced + u32::try_from(run.start).expect("a case has at most 30 items");
-            let (items, mut funding) =
-                fund_retained(floor, raced, &case[2..], run.clone(), u64::MAX / 2)
-                    .expect("an ample budget funds any retained run");
+            let (items, mut funding) = fund_retained(floor, raced, &case[2..], run.clone())
+                .expect("an ample budget funds any retained run");
             after_funding(&mut funding);
             // Only a run that starts in the floor-rescue window is floor work,
             // wherever the probe or the rival take left the floor.
             let floor_priority = block::Height(start) <= floor_rescue_high(block::Height(floor));
-            assert_eq!(
-                fund_retained(floor, raced, &case[2..], run.clone(), 0).is_some(),
-                floor_priority,
-                "{FUNDING}: actual retained start"
-            );
             assert_eq!(
                 funding.priority,
                 if floor_priority {
@@ -190,15 +181,11 @@ fn replay(
             reserved_above_floor_bytes: 0,
             reserved_above_floor_blocks: 0,
             budget_available: 4096,
+            consensus_available: 4096,
         };
-        let mut grant = plan_floor(
-            &ZakuraBlockSyncConfig::default(),
-            &limits,
-            snapshot,
-            Some(block::Height(floor + 1)),
-        )
-        .expect("an empty pipeline admits floor work")
-        .expect("the floor exists");
+        let mut grant = plan_floor(&limits, snapshot, Some(block::Height(floor + 1)))
+            .expect("an empty pipeline admits floor work")
+            .expect("the floor exists");
         after_plan(&mut grant);
         assert_eq!(
             grant.high,

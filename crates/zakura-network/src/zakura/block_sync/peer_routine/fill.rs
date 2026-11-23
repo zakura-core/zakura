@@ -164,6 +164,8 @@ struct RequestCapacity<'a> {
 struct TakenWork {
     /// The download floor that both lanes planned against.
     download_floor: block::Height,
+    /// The verified tip that planned the commit-window boundary.
+    verified_tip: block::Height,
     request: TakenRequest,
 }
 
@@ -254,6 +256,7 @@ impl PeerRoutine {
         // Selection: the floor lane, then the above-floor lane.
         let TakenWork {
             download_floor,
+            verified_tip,
             mut request,
         } = self.select_work(&limits, request_id, now)?;
         // Retry filter: keep the first allowed contiguous run.
@@ -266,7 +269,7 @@ impl PeerRoutine {
 
         // Funding: the queue derives the charge and floor exception from the
         // retained run, never from the probe.
-        let unpublished = self.io.fund(request, download_floor)?;
+        let unpublished = self.io.fund(request, download_floor, verified_tip)?;
         self.trace_request_funded(&unpublished);
 
         // Preparation: the request, its response authorization, and its frame.
@@ -380,7 +383,6 @@ impl PeerRoutine {
     ) -> Result<TakenWork, FillStop> {
         let mut taken = None;
         plan::take_lanes(
-            &self.config,
             limits,
             snapshot,
             floor_start,
@@ -403,6 +405,7 @@ impl PeerRoutine {
         )?;
         Ok(TakenWork {
             download_floor: snapshot.download_floor,
+            verified_tip: snapshot.verified_block_tip,
             request: taken.expect("`take_lanes` succeeds only after a take returned work"),
         })
     }
@@ -658,12 +661,24 @@ impl PeerIO {
         &self,
         request: TakenRequest,
         download_floor: block::Height,
+        verified_tip: block::Height,
     ) -> Result<UnpublishedRequest, FillStop> {
-        request
-            .admit(download_floor, self.session.cancel_token())
+        let funded = request
+            .admit_for_connection(
+                download_floor,
+                verified_tip,
+                self.conn_id,
+                self.conn_credit.clone(),
+                self.session.cancel_token(),
+            )
             .map_err(|refusal| match refusal {
                 AdmitRefusal::AccountingClosed => FillStop::AccountingClosed,
-                AdmitRefusal::Capacity => FillStop::Budget,
+                AdmitRefusal::Capacity(consumer) => {
+                    // The routine retries when the pool changes, so it holds
+                    // a wait token for rule 3 until a request leases (`02 §5`).
+                    self.hold_pool_wait(consumer);
+                    FillStop::Budget
+                }
                 AdmitRefusal::Cancelled => FillStop::Cancelled,
                 AdmitRefusal::StaleClaim => FillStop::StaleWork,
                 // The owner cap is the byte cwnd's hard ceiling.
@@ -671,7 +686,9 @@ impl PeerIO {
                 AdmitRefusal::Empty | AdmitRefusal::MissingOwner | AdmitRefusal::AmountOverflow => {
                     FillStop::Internal
                 }
-            })
+            })?;
+        self.release_pool_wait();
+        Ok(funded)
     }
 
     /// Reserve response authorization for `request`, up to this peer's

@@ -100,7 +100,7 @@ fn admitted_request(count: u32, bytes: u32) -> (Arc<WorkQueue>, ByteBudget, Unpu
 fn pending_work(count: u32, bytes: u32, limit: u64) -> (Arc<WorkQueue>, ByteBudget) {
     assert!(count > 0 && bytes >= 1024);
     let budget = ByteBudget::new(limit);
-    let work = Arc::new(WorkQueue::new(block::Height(0), budget.clone()));
+    let work = Arc::new(WorkQueue::with_test_pool(block::Height(0), budget.clone()));
     let authority = zakura_header_chain::BodyWorkAuthority {
         header: zakura_header_chain::HeaderWorkAuthority {
             header_generation: zakura_header_chain::HeaderGeneration::new(1),

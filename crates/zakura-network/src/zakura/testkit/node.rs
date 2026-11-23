@@ -518,6 +518,8 @@ impl ZakuraTestNodeBuilder {
 
         let mut header_sync_handle = None;
         let mut header_sync_actions = None;
+        // One memory for the node's block-sync reactor and service.
+        let block_sync_memory = crate::zakura::BlockSyncMemory::for_tests();
         let mut block_sync_handle = None;
         let mut block_sync_actions = None;
         let mut header_sync_tasks = Vec::new();
@@ -609,6 +611,7 @@ impl ZakuraTestNodeBuilder {
                     .decoded_block_pool(10_000)
                     .expect("fixture decoded allowance fits"),
                 self.block_sync_config.clone(),
+                block_sync_memory.clone(),
             );
             // Block sync schedules body work only under committed authority.
             startup.committed_views =
@@ -653,6 +656,7 @@ impl ZakuraTestNodeBuilder {
             header_sync,
             block_sync_handle.clone(),
             self.block_sync_config.clone(),
+            block_sync_memory,
             base_service,
             discovery_service,
             None,

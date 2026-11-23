@@ -11,11 +11,15 @@ use zakura_rt::{
     time::Instant,
 };
 
-use super::super::admission::{request_priority, RequestPriority};
-use super::{block, WorkItem, WorkQueue};
+use super::super::admission::{commit_window_top, request_priority, RequestPriority};
+use super::{block, OwnerLease, WorkItem, WorkQueue};
 #[cfg(any(test, zakura_sim))]
 use crate::zakura::block_sync::block_sync_observe::{BlockEvent, RequestStep};
-use crate::zakura::transport::{BudgetClosure, ByteReservation, FrameWriteClaim};
+use crate::zakura::{
+    memory::{ConnectionCredit, Consumer},
+    transport::{BudgetClosure, ByteReservation, FrameWriteClaim},
+    ZakuraConnId,
+};
 
 const UNPUBLISHED: u8 = 0;
 const QUEUED: u8 = 1;
@@ -192,7 +196,8 @@ pub(in crate::zakura::block_sync) enum AdmitRefusal {
     StaleClaim,
     /// The session's published reservations would pass its owner cap.
     OwnerCap,
-    Capacity,
+    /// The pool refused the consumer the request leases from.
+    Capacity(Consumer),
 }
 
 impl TakenRequest {
@@ -220,16 +225,27 @@ impl TakenRequest {
         self.items.drain(..keep.start);
     }
 
-    /// Admit the retained take against its queue's budget. Derive the charge and
-    /// floor exception from its actual items and the supplied download-floor view.
-    pub(in crate::zakura::block_sync) fn admit(
+    /// Admit the retained take for `conn_id`. A take that starts in the
+    /// commit window (`height <= verified_tip + 401`) leases from the reserved
+    /// `Consumer::Consensus`; one above it leases from bulk `Consumer::BlockSync`
+    /// (`02 §4`). The pool call runs after the queue lock is released; publication
+    /// rechecks the claim under the lock.
+    pub(in crate::zakura::block_sync) fn admit_for_connection(
         mut self,
         download_floor: block::Height,
+        verified_tip: block::Height,
+        conn_id: ZakuraConnId,
+        conn_credit: Option<ConnectionCredit>,
         cancel: CancellationToken,
     ) -> Result<UnpublishedRequest, AdmitRefusal> {
         let (first_height, first_item) = self.items.first().ok_or(AdmitRefusal::Empty)?;
         let owner = first_item.owner.ok_or(AdmitRefusal::MissingOwner)?;
         let priority = request_priority(download_floor, *first_height);
+        let consumer = if *first_height <= commit_window_top(verified_tip) {
+            Consumer::Consensus
+        } else {
+            Consumer::BlockSync
+        };
         let bytes = self
             .items
             .iter()
@@ -237,7 +253,7 @@ impl TakenRequest {
                 total.checked_add(item.estimated_bytes)
             })
             .ok_or(AdmitRefusal::AmountOverflow)?;
-        let funding = {
+        {
             let inner = self.work.lock();
             if self.work.budget.is_closed() {
                 return Err(AdmitRefusal::AccountingClosed);
@@ -252,20 +268,17 @@ impl TakenRequest {
             if !self.work.owner_cap.admits(held, bytes, priority) {
                 return Err(AdmitRefusal::OwnerCap);
             }
-            match self.work.budget.reserve_owned(bytes) {
-                Some(funding) => funding,
-                None if priority == RequestPriority::Floor => {
-                    let funding = self
-                        .work
-                        .budget
-                        .charge_owned(bytes)
-                        .ok_or_else(|| self.funding_refusal())?;
-                    metrics::counter!("sync.block.budget.floor_overdraft").increment(1);
-                    funding
-                }
-                None => return Err(self.funding_refusal()),
-            }
-        };
+        }
+        let lease = self
+            .work
+            .memory_pool
+            .try_acquire(consumer, Some(conn_id), bytes)
+            .map_err(|_| AdmitRefusal::Capacity(consumer))?;
+        let funding = self
+            .work
+            .budget
+            .charge_owned(bytes)
+            .ok_or_else(|| self.funding_refusal())?;
         self.reporter = RequestReporter::new(&self.work, owner, &self.items, bytes);
         report!(self.reporter, RequestStep::Funded);
         Ok(UnpublishedRequest {
@@ -273,15 +286,17 @@ impl TakenRequest {
             owner,
             priority,
             funding,
+            lease: OwnerLease { lease, conn_credit },
             cancel,
         })
     }
 
+    /// The ledger refuses a charge only when it closed or would overflow.
     fn funding_refusal(&self) -> AdmitRefusal {
         if self.work.budget.is_closed() {
             AdmitRefusal::AccountingClosed
         } else {
-            AdmitRefusal::Capacity
+            AdmitRefusal::AmountOverflow
         }
     }
 }
@@ -305,6 +320,7 @@ pub(in crate::zakura::block_sync) struct UnpublishedRequest {
     owner: BodyWorkOwner,
     priority: RequestPriority,
     funding: ByteReservation,
+    lease: OwnerLease,
     cancel: CancellationToken,
 }
 
@@ -335,6 +351,7 @@ impl UnpublishedRequest {
             mut taken,
             owner,
             mut funding,
+            lease,
             cancel,
             ..
         } = self;
@@ -346,44 +363,67 @@ impl UnpublishedRequest {
             cancel,
             state: Arc::new(AtomicU8::new(UNPUBLISHED)),
         });
-        {
+        // Raise the receive window before the request can reach the peer, and
+        // outside the queue lock. A rejected publication returns the credit
+        // with its whole lease unspent.
+        if let Some(credit) = &lease.conn_credit {
+            credit.add_receive_credit(lease.lease.bytes());
+        }
+        let mut rejected_lease = None;
+        let published = {
             let mut inner = claim.work.lock();
             if claim.work.budget.is_closed()
                 || claim.cancel.is_cancelled()
                 || !inner.state.is_unpublished_claim(claim.owner, &claim.items)
             {
-                return None;
+                rejected_lease = Some(lease);
+                false
+            } else {
+                let funded_bytes = funding.bytes();
+                if inner.funding.merge(&mut funding).is_err() {
+                    rejected_lease = Some(lease);
+                    false
+                } else {
+                    let transferred = inner.state.publish_claim(&claim.items);
+                    if transferred != Some(funded_bytes) {
+                        claim.work.budget.close(BudgetClosure::Funding {
+                            logical: inner.state.reserved_bytes(),
+                            funded: inner.funding.bytes(),
+                        });
+                        rejected_lease = Some(lease);
+                        false
+                    } else {
+                        inner.owner_leases.insert(claim.owner, lease);
+                        inner.request_writes.insert(
+                            claim.owner,
+                            RequestWriteRegistration {
+                                claim: downgrade(&claim),
+                                status: claim.status(),
+                            },
+                        );
+                        claim.state.store(QUEUED, Ordering::Release);
+                        report!(claim.reporter, RequestStep::Published);
+                        // The queue transition is complete. Release its lock before unwinding
+                        // a callback so claim cleanup can settle the published reservation.
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            publish(&claim)
+                        }));
+                        drop(inner);
+                        if let Err(panic) = result {
+                            std::panic::resume_unwind(panic);
+                        }
+                        true
+                    }
+                }
             }
-            let funded_bytes = funding.bytes();
-            if inner.funding.merge(&mut funding).is_err() {
-                return None;
-            }
-            let transferred = inner.state.publish_claim(&claim.items);
-            if transferred != Some(funded_bytes) {
-                claim.work.budget.close(BudgetClosure::Funding {
-                    logical: inner.state.reserved_bytes(),
-                    funded: inner.funding.bytes(),
-                });
-                return None;
-            }
-            inner.request_writes.insert(
-                claim.owner,
-                RequestWriteRegistration {
-                    claim: downgrade(&claim),
-                    status: claim.status(),
-                },
-            );
-            claim.state.store(QUEUED, Ordering::Release);
-            report!(claim.reporter, RequestStep::Published);
-            // The queue transition is complete. Release its lock before unwinding
-            // a callback so claim cleanup can settle the published reservation.
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| publish(&claim)));
-            drop(inner);
-            if let Err(panic) = result {
-                std::panic::resume_unwind(panic);
+        };
+        if let Some(OwnerLease { lease, conn_credit }) = rejected_lease {
+            match conn_credit {
+                Some(credit) => super::finish_receive_credit(&credit, lease.bytes(), Some(lease)),
+                None => drop(lease),
             }
         }
-        Some(claim)
+        published.then_some(claim)
     }
 }
 

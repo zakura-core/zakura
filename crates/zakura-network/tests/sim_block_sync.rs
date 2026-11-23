@@ -188,6 +188,7 @@ fn startup(
             .decoded_block_pool(10_000)
             .expect("fixture decoded allowance fits"),
         ZakuraBlockSyncConfig::default(),
+        zakura_network::zakura::BlockSyncMemory::for_tests(),
     );
     assert!(startup.state_queries_enabled, "the constructor's default");
     startup.shutdown = shutdown;

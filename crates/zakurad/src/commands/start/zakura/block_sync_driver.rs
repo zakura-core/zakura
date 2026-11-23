@@ -1971,6 +1971,7 @@ mod tests {
                 .decoded_block_pool(10_000)
                 .expect("fixture decoded allowance fits"),
             zakura_network::zakura::ZakuraBlockSyncConfig::default(),
+            zakura_network::zakura::BlockSyncMemory::for_tests(),
         );
         let (block_sync, _reactor_actions, reactor_task) =
             zakura_network::zakura::spawn_block_sync_reactor(startup)

@@ -239,7 +239,6 @@ impl zakura_header_chain::Clock for WallClock {
 #[derive(Debug)]
 pub(super) struct SequencerState {
     sequencer: Sequencer,
-    retained_body_limit: u64,
     /// Tracks the finalized height so the published view carries it forward; the
     /// reactor folds it into its `finalized_height` mirror with a `max`.
     finalized_height: block::Height,
@@ -265,8 +264,6 @@ impl SequencerState {
     ) -> Self {
         Self {
             sequencer,
-            retained_body_limit: ZakuraBlockSyncConfig::default()
-                .effective_max_reorder_lookahead_bytes(),
             finalized_height: frontiers.finalized_height,
             verified_block_hash: frontiers.verified_block_hash,
             reset_epoch: 0,
@@ -279,10 +276,6 @@ impl SequencerState {
             submission_retry: SubmissionRetry::default(),
             pending_evidence: VecDeque::new(),
         }
-    }
-
-    pub(super) fn set_retained_body_limit(&mut self, limit: u64) {
-        self.retained_body_limit = limit;
     }
 
     /// Seed the synchronous state-write coordinate from the startup snapshot.
@@ -430,11 +423,7 @@ impl SequencerState {
             return BodyAcceptance::StaleScope;
         }
         if !super::super::admission::retain_received_body(
-            self.retained_body_limit,
             self.sequencer.verified_tip(),
-            self.sequencer
-                .reorder_buffered_bytes()
-                .saturating_add(self.sequencer.applying_buffered_bytes()),
             u64::try_from(
                 self.sequencer
                     .reorder_len()
@@ -442,7 +431,6 @@ impl SequencerState {
             )
             .unwrap_or(u64::MAX),
             body.height,
-            body.bytes,
         ) && !self.sequencer.already_retains(body.height, body.hash)
         {
             return BodyAcceptance::RetentionDeferred {

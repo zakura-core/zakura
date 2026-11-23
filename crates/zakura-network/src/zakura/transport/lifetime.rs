@@ -478,6 +478,9 @@ impl NodeResources {
             receive_window: self
                 .shares
                 .receive_window(gates.iter().map(|(kind, _)| *kind)),
+            base_receive_window: self
+                .shares
+                .base_receive_window(gates.iter().map(|(kind, _)| *kind)),
             gates: gates.into(),
             compat_exchanges,
         }
@@ -524,6 +527,7 @@ pub(crate) struct ConnectionResources {
     stream_owners: Arc<[AtomicUsize; OWNER_PHASES]>,
     gates: Arc<[(u16, KindGates)]>,
     receive_window: u64,
+    base_receive_window: u64,
     /// Funds this connection's outbound compatibility exchanges.
     compat_exchanges: FrameGate,
 }
@@ -535,18 +539,26 @@ impl ConnectionResources {
         self.receive_window
     }
 
+    /// The static base QUIC receive window for pool-backed connections (`02 §3`):
+    /// the control share plus each negotiated kind's unsolicited receive bytes.
+    pub(crate) fn base_receive_window(&self) -> u64 {
+        self.base_receive_window
+    }
+
     /// A probe of this connection's gates and of `quic`, the connection's
     /// QUIC load.
     #[cfg(zakura_sim)]
     pub(crate) fn probe(
         &self,
         quic: zakura_quic::LoadProbe,
+        live_receive_window: Option<Arc<zakura_rt::sync::counter::AtomicU64>>,
         streams: &Arc<zakura_rt::sync::Semaphore>,
         limits: super::super::ZakuraConnectionLimits,
     ) -> super::ConnectionProbe {
         super::ConnectionProbe::new(
             quic,
             self.receive_window,
+            live_receive_window,
             streams,
             &self.stream_owners,
             limits,
@@ -645,6 +657,7 @@ impl ConnectionResources {
                 .map(|kind| (*kind, KindGates::new(share)))
                 .collect(),
             receive_window: u64::MAX,
+            base_receive_window: u64::MAX,
             compat_exchanges: FrameGate::new(COMPAT_EXCHANGE_BUDGET.receive_total()),
         }
     }

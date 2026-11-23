@@ -54,10 +54,11 @@ use zakura_network::{
     zakura::{
         block_sync_observe::BlockSyncObserver, framed_channel, spawn_block_sync_reactor,
         BlockRangeRead, BlockRangeReadResult, BlockRangeSource, BlockSyncAction,
-        BlockSyncFrontiers, BlockSyncHandle, BlockSyncService, BlockSyncStartup, CloseCauseReader,
-        FramedSend, Peer, Service, ServicePeerDirection, SessionFull, SessionSlotsProbe,
-        StreamReader, ZakuraBlockSyncConfig, ZakuraPeerId, ZAKURA_CAP_BLOCK_SYNC_REGULATED,
-        ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION, ZAKURA_STREAM_BLOCK_SYNC,
+        BlockSyncFrontiers, BlockSyncHandle, BlockSyncMemory, BlockSyncService, BlockSyncStartup,
+        CloseCauseReader, FramedSend, Peer, Service, ServicePeerDirection, SessionFull,
+        SessionSlotsProbe, StreamReader, ZakuraBlockSyncConfig, ZakuraPeerId,
+        ZAKURA_CAP_BLOCK_SYNC_REGULATED, ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
+        ZAKURA_STREAM_BLOCK_SYNC,
     },
     BoxError,
 };
@@ -884,6 +885,7 @@ impl BlockNode {
                 .decoded_block_pool(10_000)
                 .expect("fixture decoded allowance fits"),
             config,
+            BlockSyncMemory::for_tests(),
         );
         startup.max_checkpoint_height = Some(LAST_CHECKPOINT);
         startup.observer.0 = observer;

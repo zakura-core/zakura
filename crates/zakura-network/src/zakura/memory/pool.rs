@@ -1287,6 +1287,20 @@ impl MemoryPool {
         self.lock().machine.available_ceiling(consumer)
     }
 
+    /// Bytes currently leased by `consumer`.
+    pub fn consumer_leased(&self, consumer: Consumer) -> u64 {
+        self.lock().machine.leased(consumer)
+    }
+
+    /// Additional bytes `consumer` can currently acquire under its live ceiling.
+    pub fn available_for(&self, consumer: Consumer) -> u64 {
+        let state = self.lock();
+        state
+            .machine
+            .available_ceiling(consumer)
+            .saturating_sub(state.machine.leased(consumer))
+    }
+
     /// Take an immutable snapshot of the pool state.
     pub fn snapshot(&self) -> PoolSnapshot {
         self.lock().machine.snapshot()

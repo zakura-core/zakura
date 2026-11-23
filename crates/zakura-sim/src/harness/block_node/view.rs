@@ -408,7 +408,7 @@ mod tests {
     fn a_budget_change_from_another_count_is_an_anomaly() {
         let mut view = BlockSyncView::default();
         view.fold(&BlockEvent::Budget(BudgetChange {
-            kind: BudgetChangeKind::Reserved,
+            kind: BudgetChangeKind::Charged,
             before: 0,
             after: 100,
             limit: 1_000,

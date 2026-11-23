@@ -83,7 +83,15 @@ pub(super) fn fund_through_queue(
     let mut take = work.take_request(low, high, wanted.len(), u64::MAX, 2, id(2));
     take.retain_range(keep);
     let items = take.items().to_vec();
-    let funded = take.admit(download_floor, CancellationToken::new()).ok()?;
+    let funded = take
+        .admit_for_connection(
+            download_floor,
+            download_floor,
+            0,
+            None,
+            CancellationToken::new(),
+        )
+        .ok()?;
     let funding = Funding {
         priority: funded.priority(),
         reserved_bytes: funded.bytes(),

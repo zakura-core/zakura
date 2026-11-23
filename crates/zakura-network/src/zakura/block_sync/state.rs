@@ -1,6 +1,8 @@
 use zakura_node_services::block_memory::DecodedBlockPool;
 use zakura_rt::sync::{atomic::AtomicU64, Mutex};
 
+use crate::zakura::memory::MemoryPool;
+
 use super::{
     admission::min_rate_transfer_time,
     bbr::{rounded_usize, BbrState},
@@ -45,6 +47,56 @@ pub(super) struct NeededBlocksQueryFailure {
     pub(super) scope: zakura_header_chain::BodyWorkAuthority,
 }
 
+/// Block sync's leases from the node-wide memory pool (`02 §3–5`).
+///
+/// Requests above the commit window, and the bodies that answer them, lease
+/// from `Consumer::BlockSync`. Commit-window requests lease from the reserved
+/// `Consumer::Consensus`.
+#[derive(Clone, Debug)]
+pub struct BlockSyncMemory {
+    pub(super) pool: MemoryPool,
+    /// `[memory.cap] look_ahead`, which lowers the derived look-ahead cap.
+    pub(super) look_ahead_cap: Option<u64>,
+}
+
+impl BlockSyncMemory {
+    /// Block sync's memory from the node's `pool`.
+    pub fn new(pool: MemoryPool, look_ahead_cap: Option<u64>) -> Self {
+        Self {
+            pool,
+            look_ahead_cap,
+        }
+    }
+
+    /// Block sync's memory on the plan a default Mainnet node sizes at
+    /// `budget_b`, built by the plan and pool constructors the node uses.
+    #[cfg(any(test, zakura_sim, feature = "zakura-testkit"))]
+    pub fn for_default_node(budget_b: u64) -> Self {
+        let config = crate::Config::default();
+        let plan = crate::zakura::memory::MemoryPlan::size(budget_b, &config, &config.network)
+            .expect("a default node's plan fits the test budget");
+        Self::new(plan.build_pool(), None)
+    }
+
+    /// Block sync's memory on a pool that reserves `consensus` bytes and caps
+    /// block sync at `block_sync` bytes, for tests and fuzzers that bound
+    /// block sync's leases.
+    #[cfg(any(test, zakura_sim, feature = "zakura-testkit"))]
+    pub fn with_block_bytes(consensus: u64, block_sync: u64) -> Self {
+        use crate::zakura::memory::{Consumer, ConsumerSpec, PoolConfig};
+        let config = PoolConfig::new(consensus.saturating_add(block_sync), 0)
+            .with_consumer(Consumer::Consensus, ConsumerSpec::reserved(consensus))
+            .with_consumer(Consumer::BlockSync, ConsumerSpec::bulk(0, block_sync, 1));
+        Self::new(MemoryPool::new(config), None)
+    }
+
+    /// Block sync's memory on a 16 GiB default node's plan, for tests.
+    #[cfg(any(test, zakura_sim, feature = "zakura-testkit"))]
+    pub fn for_tests() -> Self {
+        Self::for_default_node(16 << 30)
+    }
+}
+
 /// Startup inputs for the dependency-neutral block-sync reactor.
 #[derive(Clone, Debug)]
 pub struct BlockSyncStartup {
@@ -77,6 +129,8 @@ pub struct BlockSyncStartup {
     /// Native block sync skips any hash with an unexpired claim and re-queries
     /// when a claim releases with `Fallback` or expires.
     pub body_claims: Option<zakura_node_services::body_claims::SharedBodyClaims>,
+    /// Block sync's leases from the node-wide memory pool.
+    pub memory: BlockSyncMemory,
     /// Receives block sync's events in test and simulator builds.
     #[cfg(any(test, zakura_sim))]
     pub observer: super::block_sync_observe::ObserverSlot,
@@ -92,6 +146,7 @@ impl BlockSyncStartup {
         header_tip: watch::Receiver<(block::Height, block::Hash)>,
         decoded_pool: DecodedBlockPool,
         config: ZakuraBlockSyncConfig,
+        memory: BlockSyncMemory,
     ) -> Self {
         Self {
             body_retention: None,
@@ -107,6 +162,7 @@ impl BlockSyncStartup {
             trace: ZakuraTrace::noop(),
             max_checkpoint_height: None,
             body_claims: None,
+            memory,
             #[cfg(any(test, zakura_sim))]
             observer: Default::default(),
         }
@@ -121,6 +177,7 @@ impl BlockSyncStartup {
         committed_views: watch::Receiver<Option<zakura_header_chain::CommittedHeaderChainView>>,
         decoded_pool: DecodedBlockPool,
         config: ZakuraBlockSyncConfig,
+        memory: BlockSyncMemory,
     ) -> Self {
         Self {
             body_retention: None,
@@ -136,6 +193,7 @@ impl BlockSyncStartup {
             trace: ZakuraTrace::noop(),
             max_checkpoint_height: None,
             body_claims: None,
+            memory,
             #[cfg(any(test, zakura_sim))]
             observer: Default::default(),
         }
@@ -175,7 +233,10 @@ impl BlockSyncStartup {
         self
     }
 
-    pub(super) fn inert(config: ZakuraBlockSyncConfig) -> Result<Self, BlockSyncStartError> {
+    pub(super) fn inert(
+        config: ZakuraBlockSyncConfig,
+        memory: BlockSyncMemory,
+    ) -> Result<Self, BlockSyncStartError> {
         let decoded_pool = config
             .decoded_block_pool(0)
             .map_err(BlockSyncStartError::InvalidConfig)?;
@@ -197,6 +258,7 @@ impl BlockSyncStartup {
             trace: ZakuraTrace::noop(),
             max_checkpoint_height: None,
             body_claims: None,
+            memory,
             #[cfg(any(test, zakura_sim))]
             observer: Default::default(),
         })
@@ -505,12 +567,18 @@ pub(super) struct BlockSyncState {
 
 impl BlockSyncState {
     pub(super) fn new(startup: &BlockSyncStartup) -> Self {
-        let budget = ByteBudget::new(startup.config.inflight_block_bytes());
+        // The budget is the request owners' settlement ledger (03 §4). The
+        // pool bounds the bytes, so the ledger has no limit of its own.
+        let budget = ByteBudget::new(u64::MAX);
         #[cfg(any(test, zakura_sim))]
         let budget = budget.with_observer(startup.observer.budget_observer());
-        let work_queue = WorkQueue::new(startup.frontiers.verified_block_tip, budget)
-            .with_owner_cap(startup.config.owner_reservation_cap())
-            .with_body_claims(startup.body_claims.clone());
+        let work_queue = WorkQueue::new(
+            startup.frontiers.verified_block_tip,
+            budget,
+            startup.memory.pool.clone(),
+        )
+        .with_owner_cap(startup.config.owner_reservation_cap())
+        .with_body_claims(startup.body_claims.clone());
         #[cfg(any(test, zakura_sim))]
         let work_queue = work_queue.with_observer(startup.observer.clone());
         let work_queue = Arc::new(work_queue);
@@ -1306,7 +1374,6 @@ impl ThroughputMeter {
     }
 
     /// Keep frequent queue updates from draining an incomplete rate window.
-    #[cfg(feature = "sync-metrics")]
     pub(super) fn sample_at_interval(&mut self, now: Instant, interval: Duration) {
         if now.saturating_duration_since(self.window_start) >= interval {
             self.sample(now);
@@ -1338,6 +1405,131 @@ impl ThroughputMeter {
 
     pub(super) fn blocks_per_sec(&self) -> u64 {
         self.last_blocks_per_sec
+    }
+}
+
+/// Number of recent completed range-fetch durations retained for the node-wide
+/// p99 range-fetch-time measurement (`02 §4`).
+const RANGE_FETCH_LATENCY_WINDOW: usize = 256;
+
+/// Fixed-size ring buffer measuring the node-wide p99 range fetch time
+/// (`02 §4`), used to size block sync's benefit-derived look-ahead cap:
+/// `2 × commit_rate × p99_range_fetch_time`.
+#[derive(Clone, Debug)]
+pub(super) struct RangeFetchLatencyTracker {
+    samples_us: [u64; RANGE_FETCH_LATENCY_WINDOW],
+    len: usize,
+    cursor: usize,
+}
+
+impl Default for RangeFetchLatencyTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RangeFetchLatencyTracker {
+    pub(super) const fn new() -> Self {
+        Self {
+            samples_us: [0; RANGE_FETCH_LATENCY_WINDOW],
+            len: 0,
+            cursor: 0,
+        }
+    }
+
+    /// Record one completed block-range fetch duration (`O(1)`, zero allocation).
+    pub(super) fn record(&mut self, elapsed: Duration) {
+        let us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        self.samples_us[self.cursor] = us;
+        self.cursor = (self.cursor + 1) % RANGE_FETCH_LATENCY_WINDOW;
+        if self.len < RANGE_FETCH_LATENCY_WINDOW {
+            self.len += 1;
+        }
+    }
+
+    /// 99th percentile of the retained range-fetch durations, or `None` before
+    /// any range fetch has completed.
+    pub(super) fn p99(&self) -> Option<Duration> {
+        if self.len == 0 {
+            return None;
+        }
+        let mut sorted = [0u64; RANGE_FETCH_LATENCY_WINDOW];
+        let slice = &mut sorted[..self.len];
+        slice.copy_from_slice(&self.samples_us[..self.len]);
+        slice.sort_unstable();
+        let rank = (self.len.saturating_mul(99)).div_ceil(100);
+        let idx = rank.saturating_sub(1).min(self.len - 1);
+        Some(Duration::from_micros(slice[idx]))
+    }
+}
+
+/// Derive the look-ahead byte cap from measured commit throughput and p99
+/// range-fetch latency (`02 §4`): `2 × commit_rate × p99_range_fetch_time`,
+/// optionally lowered by `[memory.cap] look_ahead`.
+pub(super) fn derived_look_ahead_bytes(
+    commit_bytes_per_sec: u64,
+    p99_range_fetch_time: Duration,
+    cap_override: Option<u64>,
+) -> u64 {
+    let p99_us = p99_range_fetch_time.as_micros();
+    let raw = 2u128
+        .saturating_mul(u128::from(commit_bytes_per_sec))
+        .saturating_mul(p99_us)
+        / 1_000_000;
+    let derived = u64::try_from(raw).unwrap_or(u64::MAX);
+    match cap_override {
+        Some(cap) => derived.min(cap),
+        None => derived,
+    }
+}
+
+/// How often the sequencer refreshes `Consumer::BlockSync`'s benefit cap.
+pub(super) const LOOK_AHEAD_CAP_TICK: Duration = Duration::from_secs(1);
+
+/// Per-tick decay of the smoothed commit rate: the peak loses `1/43` of
+/// itself each [`LOOK_AHEAD_CAP_TICK`], a half-life of about 30 seconds.
+const COMMIT_RATE_DECAY_DIVISOR: u64 = 43;
+
+/// `Consumer::BlockSync`'s benefit cap (`02 §4`):
+/// `sum(peer BBR cwnds) + 2 × commit_rate × p99_range_fetch_time`, floored at
+/// `DEFAULT_BS_BBR_MIN_CWND_BYTES`. The sequencer owns it and refreshes it on
+/// its own tick.
+///
+/// The commit rate is a decaying peak, so a floor stall that stops commits for
+/// a few seconds doesn't collapse the look-ahead that would end the stall.
+#[derive(Clone, Debug)]
+pub(super) struct LookAheadCap {
+    fetch_latency: RangeFetchLatencyTracker,
+    commit_rate_peak: u64,
+    /// `[memory.cap] look_ahead`, which lowers the derived look-ahead.
+    cap_override: Option<u64>,
+}
+
+impl LookAheadCap {
+    pub(super) fn new(cap_override: Option<u64>) -> Self {
+        Self {
+            fetch_latency: RangeFetchLatencyTracker::new(),
+            commit_rate_peak: 0,
+            cap_override,
+        }
+    }
+
+    /// Record one completed block-range fetch.
+    pub(super) fn record_fetch(&mut self, elapsed: Duration) {
+        self.fetch_latency.record(elapsed);
+    }
+
+    /// Fold one tick's commit rate into the decaying peak, and return the
+    /// benefit cap for peers whose congestion windows sum to `sum_cwnd`.
+    pub(super) fn tick(&mut self, commit_bytes_per_sec: u64, sum_cwnd: u64) -> u64 {
+        let decayed = self.commit_rate_peak - self.commit_rate_peak / COMMIT_RATE_DECAY_DIVISOR;
+        self.commit_rate_peak = commit_bytes_per_sec.max(decayed);
+        let look_ahead = self.fetch_latency.p99().map_or(0, |p99| {
+            derived_look_ahead_bytes(self.commit_rate_peak, p99, self.cap_override)
+        });
+        sum_cwnd
+            .saturating_add(look_ahead)
+            .max(DEFAULT_BS_BBR_MIN_CWND_BYTES)
     }
 }
 

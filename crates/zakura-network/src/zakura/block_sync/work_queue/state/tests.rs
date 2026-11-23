@@ -195,7 +195,7 @@ fn a_competing_receipt_ends_only_a_published_reservation() {
     );
     assert_eq!(state.reserved_bytes(), 0);
     let wake = state
-        .defer_received(owner, height(1), hash(1), 100, block::Height(0))
+        .defer_received(owner, height(1), hash(1), 100, Some(block::Height(0)))
         .expect("the owner still holds its received height");
     assert!(
         wake.revocation,
@@ -363,7 +363,7 @@ fn in_flight_tally_underflow_latches_a_fault() {
 #[test]
 fn ledger_fault_closes_admission_under_the_lock_and_stays_closed() {
     let budget = crate::zakura::transport::ByteBudget::new(1_000);
-    let queue = super::super::WorkQueue::new(height(0), budget.clone());
+    let queue = super::super::WorkQueue::with_test_pool(height(0), budget.clone());
     queue.set_estimate_floor_for_tests(1);
     queue.extend(
         authority(0),
@@ -381,7 +381,7 @@ fn ledger_fault_closes_admission_under_the_lock_and_stays_closed() {
 
     assert!(budget.is_closed(), "the fault closes without an audit");
     assert_eq!(budget.available(), 0);
-    assert!(budget.reserve_owned(1).is_none());
+    assert!(budget.charge_owned(1).is_none());
     assert!(budget.charge_owned(1).is_none());
     assert_eq!(
         budget.reserved(),
@@ -502,7 +502,7 @@ fn a_committed_received_height_cannot_be_deferred() {
     let _ = state.reset_above(height(2));
     assert!(!state.in_flight_contains(height(1)));
     assert_eq!(
-        state.defer_received(owner, height(1), hash(1), 100, height(0)),
+        state.defer_received(owner, height(1), hash(1), 100, Some(height(0))),
         None
     );
     assert!(!state.pending_contains(height(1)));
@@ -821,16 +821,18 @@ fn apply(state: &mut WorkQueueState, book: &mut Bookkeeping, op: Op) -> (u64, u6
         Op::AdvanceFloor(floor) => {
             let floor = state.floor.0.max(floor);
             let delta = state.advance_floor(height(floor));
+            let released = delta.released_bytes;
             check_removal(&before, state, delta, |raw| raw <= floor);
-            (0, delta.released_bytes)
+            (0, released)
         }
         Op::Reset(floor) => {
             book.generation += 1;
             let delta = state.reset_above(height(floor));
+            let released = delta.released_bytes;
             // Every height is above the old floor, so a reset drops them all:
             // those above `floor`, and those at or below a raised floor.
             check_removal(&before, state, delta, |_| true);
-            (0, delta.released_bytes)
+            (0, released)
         }
         Op::RefreshAuthority => {
             book.generation += 1;

@@ -2,7 +2,9 @@ use super::*;
 use std::collections::BTreeMap;
 use zakura_node_services::block_memory::Admission;
 
-use crate::zakura::block_sync::{reorder::RetainedBody, wire::DecodedBlockPayload};
+use crate::zakura::block_sync::{
+    reorder::RetainedBody, wire::DecodedBlockPayload, work_queue::test_memory_pool,
+};
 
 use zakura_test::vectors::{BLOCK_MAINNET_2_BYTES, BLOCK_MAINNET_3_BYTES, BLOCK_MAINNET_5_BYTES};
 
@@ -26,7 +28,7 @@ async fn byte_gauges_and_view_follow_sequencer_owners() {
     let budget = ByteBudget::new(1);
     let mut task = SequencerIO::new(
         Sequencer::new(block::Height(0), 2),
-        Arc::new(WorkQueue::new(block::Height(0), budget)),
+        Arc::new(WorkQueue::with_test_pool(block::Height(0), budget)),
         Arc::new(PeerRegistry::new()),
         actions,
         ThroughputMeter::new(Instant::now()),
@@ -45,7 +47,8 @@ async fn byte_gauges_and_view_follow_sequencer_owners() {
     );
     let check = |task: &mut SequencerIO, label: &str| {
         let changes = task.state.sequencer_mut().take_payload_changes();
-        task.payloads.apply(changes);
+        let deferred = task.payloads.apply_entries(changes);
+        task.payloads.settle_leases(deferred);
         let owners = task
             .state
             .sequencer()
@@ -274,7 +277,7 @@ async fn dropping_the_task_releases_its_queued_bodies_after_it_closes() {
     let budget = ByteBudget::new(1);
     let mut task = SequencerIO::new(
         Sequencer::new(block::Height(0), 2),
-        Arc::new(WorkQueue::new(block::Height(0), budget)),
+        Arc::new(WorkQueue::with_test_pool(block::Height(0), budget)),
         Arc::new(PeerRegistry::new()),
         actions,
         ThroughputMeter::new(Instant::now()),
@@ -310,6 +313,8 @@ async fn dropping_the_task_releases_its_queued_bodies_after_it_closes() {
     accepted.leave_queue();
     task.handle_accept_body(accepted);
     assert!(log.retained.upgrade().is_some());
+    // Clear setup observations so the assertion below checks only drop events.
+    log.events.lock().unwrap().clear();
 
     let block: Arc<block::Block> =
         Arc::new(BLOCK_MAINNET_2_BYTES.zcash_deserialize_into().unwrap());
@@ -376,7 +381,11 @@ fn runtime_payload(
     let previous = block.header.previous_block_hash;
     let bytes = u64::try_from(raw.block_len()).unwrap();
     let mut payloads = SequencerPayloads::default();
-    let facts = payloads.insert(BufferedBlockBody::from_decoded_block(block, Some(raw)));
+    let facts = payloads.insert(
+        BufferedBlockBody::from_decoded_block(block, Some(raw)),
+        0,
+        None,
+    );
     let mut policy = Sequencer::new(block::Height(0), 1);
     assert!(matches!(
         policy.accept_buffered_body(
@@ -396,7 +405,8 @@ fn runtime_payload(
         super::super::sequencer::AcceptOutcome::Buffered { .. }
     ));
     policy.drain_ready_into_applying();
-    payloads.apply(policy.take_payload_changes());
+    let deferred = payloads.apply_entries(policy.take_payload_changes());
+    payloads.settle_leases(deferred);
     (policy, payloads, weak)
 }
 
@@ -421,7 +431,12 @@ fn capacity_refused_payload_waits_for_room_for_its_size() {
         hold(BLOCK_MAINNET_5_BYTES.as_slice()),
     );
 
-    let refused = payloads.materialize(id, &pool, Admission::WithinLimit);
+    let refused = payloads.materialize(
+        id,
+        &pool,
+        Admission::WithinLimit,
+        &test_memory_pool(1 << 40),
+    );
     assert!(matches!(refused, Err(AdmissionFailure::Capacity)));
     assert_eq!(
         payloads.capacity_refused,
@@ -434,12 +449,22 @@ fn capacity_refused_payload_waits_for_room_for_its_size() {
         !pool.has_room_for(size, Admission::WithinLimit),
         "the release leaves too little room"
     );
-    let skipped = payloads.materialize(id, &pool, Admission::WithinLimit);
+    let skipped = payloads.materialize(
+        id,
+        &pool,
+        Admission::WithinLimit,
+        &test_memory_pool(1 << 40),
+    );
     assert!(matches!(skipped, Err(AdmissionFailure::Capacity)));
 
     second.leave_pipeline();
     assert!(pool.has_room_for(size, Admission::WithinLimit));
-    let admitted = payloads.materialize(id, &pool, Admission::WithinLimit);
+    let admitted = payloads.materialize(
+        id,
+        &pool,
+        Admission::WithinLimit,
+        &test_memory_pool(1 << 40),
+    );
     assert_eq!(admitted.unwrap().decoded_bytes, size);
 }
 
@@ -472,6 +497,7 @@ fn runtime_payload_reset_preserves_driver_copy_but_policy_clones_retain_no_paylo
             facts.id,
             &DecodedBlockPool::for_pipeline(std::num::NonZeroU64::MAX, u64::MAX),
             Admission::WithinLimit,
+            &test_memory_pool(1 << 40),
         )
         .unwrap();
     policy
@@ -485,7 +511,8 @@ fn runtime_payload_reset_preserves_driver_copy_but_policy_clones_retain_no_paylo
     drop(original);
     let policy_snapshot = policy.clone();
     policy.reset_to(block::Height(0), false);
-    payloads.apply(policy.take_payload_changes());
+    let deferred = payloads.apply_entries(policy.take_payload_changes());
+    payloads.settle_leases(deferred);
     assert!(
         weak.upgrade().is_some(),
         "the driver still holds its submitted copy"
@@ -510,7 +537,7 @@ fn runtime_payload_inventory_tracks_reset_and_untracked_clone() {
         .ownership_snapshot(&payloads.entries)
         .payloads_match_policy());
     let retained = payloads.entries.values().next().unwrap().clone();
-    let untracked = payloads.insert(retained);
+    let untracked = payloads.insert(retained, 0, None);
     let snapshot = policy.ownership_snapshot(&payloads.entries);
     assert_eq!(snapshot.payloads.len(), 2);
     assert_eq!(snapshot.applying.len(), 1);
@@ -518,12 +545,15 @@ fn runtime_payload_inventory_tracks_reset_and_untracked_clone() {
         !snapshot.payloads_match_policy(),
         "capture must see an untracked shared allocation"
     );
-    payloads.release(untracked.id);
+    let deferred =
+        payloads.apply_entries(vec![super::reorder::PayloadChange::Release(untracked.id)]);
+    payloads.settle_leases(deferred);
     assert!(policy
         .ownership_snapshot(&payloads.entries)
         .payloads_match_policy());
     policy.reset_to(block::Height(0), false);
-    payloads.apply(policy.take_payload_changes());
+    let deferred = payloads.apply_entries(policy.take_payload_changes());
+    payloads.settle_leases(deferred);
     assert!(
         policy
             .ownership_snapshot(&payloads.entries)
@@ -564,7 +594,7 @@ async fn decoded_capacity_release_retries_pending_body_without_apply_completion(
             .unwrap();
         let retained = BlockHandle::Owned(blocker).transaction(0).unwrap();
         let expected_hash = retained.hash();
-        let mut task = retention_test_task(u64::MAX);
+        let mut task = retention_test_task();
         task.decoded_pool = pool.clone();
         let (actions, mut actions_rx) = mpsc::channel(1);
         task.actions = actions;
@@ -683,7 +713,7 @@ async fn commit_window_body_submits_at_a_full_decoded_byte_bound() {
         )
         .unwrap();
     let blocker_bytes = blocker.decoded_bytes();
-    let mut task = retention_test_task(u64::MAX);
+    let mut task = retention_test_task();
     task.decoded_pool = pool.clone();
     let (actions, mut actions_rx) = mpsc::channel(1);
     task.actions = actions;
@@ -743,7 +773,7 @@ async fn commit_window_body_submits_at_a_full_decoded_byte_bound() {
 #[tokio::test]
 async fn teardown_keeps_decoded_view_and_charge_while_the_driver_holds_a_submission() {
     let pool = DecodedBlockPool::for_block_count(std::num::NonZeroU64::new(8).unwrap());
-    let mut task = retention_test_task(u64::MAX);
+    let mut task = retention_test_task();
     task.decoded_pool = pool.clone();
     let (actions, mut actions_rx) = mpsc::channel(1);
     task.actions = actions;

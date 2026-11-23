@@ -164,7 +164,7 @@ pub struct SupportWindow {
 
 /// Where a tip height falls in a [`SupportWindow`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SupportStatus {
+enum SupportStatus {
     /// The release is supported, and the end of its window is not close.
     Supported,
     /// The release is supported, but the end of its window is close.
@@ -208,7 +208,7 @@ impl SupportWindow {
     }
 
     /// Returns where `tip_height` falls in this window.
-    pub fn status(&self, tip_height: Height) -> SupportStatus {
+    fn status(&self, tip_height: Height) -> SupportStatus {
         if tip_height > self.last_supported_height {
             SupportStatus::Expired
         } else if tip_height > self.warn_height {
@@ -228,13 +228,13 @@ impl SupportWindow {
 
 /// A network upgrade that this release implements and that has not activated yet.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct UpgradeAhead {
+struct UpgradeAhead {
     /// The network upgrade.
-    pub upgrade: NetworkUpgrade,
+    upgrade: NetworkUpgrade,
     /// The height at which it activates.
-    pub activation_height: Height,
+    activation_height: Height,
     /// The number of blocks between the tip and the activation height.
-    pub remaining_blocks: u32,
+    remaining_blocks: u32,
 }
 
 /// Returns the network upgrade that a release which keeps running past `window`
@@ -246,7 +246,7 @@ pub struct UpgradeAhead {
 ///
 /// Returns `None` while the end of the window is not close, and for a release
 /// that halts at the end of its window.
-pub fn unsupported_upgrade_ahead(
+fn unsupported_upgrade_ahead(
     tip_height: Height,
     window: &SupportWindow,
     config: Config,
@@ -276,11 +276,11 @@ pub fn unsupported_upgrade_ahead(
 
 /// A network upgrade that activated while the release was unsupported.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct UpgradeActivated {
+struct UpgradeActivated {
     /// The latest network upgrade that activated after the support window.
-    pub upgrade: NetworkUpgrade,
+    upgrade: NetworkUpgrade,
     /// The height at which it activated.
-    pub activation_height: Height,
+    activation_height: Height,
 }
 
 /// Returns the latest network upgrade that a release which keeps running past
@@ -288,7 +288,7 @@ pub struct UpgradeActivated {
 /// at or below `tip_height`.
 ///
 /// Returns `None` for a release that halts at the end of its window.
-pub fn unsupported_upgrade_activated(
+fn unsupported_upgrade_activated(
     tip_height: Height,
     window: &SupportWindow,
     config: Config,

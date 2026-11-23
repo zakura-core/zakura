@@ -98,7 +98,7 @@ fn end_of_support_function() {
     // Panic is tested in `end_of_support_panic`
 }
 
-/// Test that end of support is only reported and enforced on Mainnet.
+/// Test that a release only has a support window on Mainnet.
 #[test]
 fn end_of_support_height_per_network() {
     let (_logs, dispatch) = log_capture::capture_logs();
@@ -263,7 +263,7 @@ fn mainnet_end_of_support_targets_december_5() {
         .activation_height(&network)
         .expect("NU7 activates on Mainnet");
     let first_unsupported_height = end_of_support::end_of_support_height(&network)
-        .expect("Mainnet enforces end of support")
+        .expect("support ends on Mainnet")
         .next()
         .expect("the support window ends below the maximum height");
 
@@ -310,9 +310,11 @@ async fn end_of_support_task() -> Result<()> {
 }
 
 /// Check that the task halts the node once the tip is past the support window,
-/// unless the halt is turned off.
+/// after reporting how far past it is.
 #[tokio::test(start_paused = true)]
 async fn end_of_support_task_halts_past_the_support_window() -> Result<()> {
+    let gauges = gauge_capture::CapturedGauges::default();
+    let _gauge_guard = metrics::set_default_local_recorder(&gauges);
     let (_logs, dispatch) = log_capture::capture_logs();
     let (latest_chain_tip, latest_chain_tip_sender) = MockChainTip::new();
     latest_chain_tip_sender.send_best_tip_height(Height(last_supported_height().0 + 1));
@@ -331,6 +333,8 @@ async fn end_of_support_task_halts_past_the_support_window() -> Result<()> {
         .downcast::<String>()
         .expect("the halt panics with a formatted message");
     assert!(panic_message.contains(EOS_PANIC_MESSAGE_HEADER));
+    // The halted node's last scrape shows why it stopped.
+    assert_eq!(gauges.value(REMAINING_BLOCKS), Some(-1.0));
 
     Ok(())
 }

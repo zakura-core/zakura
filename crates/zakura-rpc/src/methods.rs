@@ -1095,7 +1095,7 @@ where
     /// The RPC methods and OpenRPC schema exposed by this instance.
     rpc_surface: RpcSurface,
 
-    /// The estimated last height this release supports, if enforced.
+    /// The estimated last height this release supports, on networks where support ends.
     end_of_support_height: Option<Height>,
 
     /// The services this node sends in its legacy P2P handshake, reported by `getnetworkinfo`.

@@ -97,6 +97,18 @@ impl CacheDir {
         )
     }
 
+    /// Returns this node's native discovery cache file when peer caching is enabled.
+    pub(crate) fn discovery_book_file_path(
+        &self,
+        network: &Network,
+        node_id: &zakura_quic::NodeId,
+    ) -> Option<PathBuf> {
+        Some(self.cache_dir()?.join("network").join(format!(
+            "{}.{node_id}.zakura-discovery-book",
+            network.lowercase_name()
+        )))
+    }
+
     /// Returns the default persistent Zakura iroh secret-key file path for `network`.
     ///
     /// This path is intentionally independent from the peer cache directory so
@@ -132,21 +144,6 @@ pub(crate) fn default_network_identity_dir() -> PathBuf {
 pub(crate) fn zakura_node_secret_key_file_path(identity_dir: &Path, network: &Network) -> PathBuf {
     identity_dir.join(format!(
         "{}.zakura-iroh-secret-key",
-        network.lowercase_name()
-    ))
-}
-
-/// Returns the file under `identity_dir` that holds the discovery book `node_id`
-/// saved on `network`, so a restart can dial the peers it knew. It sits beside
-/// the authored sequence because both are this identity's discovery state, and
-/// test configs already isolate `identity_dir`.
-pub(crate) fn zakura_discovery_book_file_path(
-    identity_dir: &Path,
-    network: &Network,
-    node_id: &zakura_quic::NodeId,
-) -> PathBuf {
-    identity_dir.join(format!(
-        "{}.{node_id}.zakura-discovery-book",
         network.lowercase_name()
     ))
 }

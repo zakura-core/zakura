@@ -4592,9 +4592,10 @@ mod tests {
     #[tokio::test]
     async fn discovery_book_saved_at_shutdown_reloads_on_the_next_start(
     ) -> Result<(), crate::BoxError> {
-        use crate::zakura::discovery::{
-            load_saved_discovery_book, spawn_discovery_book_saver, DiscoveryBookFile,
-            ZakuraDiscoveryPersistedEntry,
+        use crate::{
+            config::CacheDir,
+            zakura::discovery::{start_discovery_book_cache, ZakuraDiscoveryPersistedEntry},
+            Config, P2pStack,
         };
 
         let handshake = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
@@ -4637,22 +4638,52 @@ mod tests {
         assert_eq!(outcome.added, 1, "the first run knows the peer");
 
         let dir = tempfile::tempdir()?;
-        let file = DiscoveryBookFile::new(dir.path().join("book"));
+        let mut config = Config {
+            cache_dir: CacheDir::custom_path(dir.path()),
+            ..Config::for_test(P2pStack::Zakura)
+        };
         let shutdown = CancellationToken::new();
-        let saver = spawn_discovery_book_saver(first_run, file.clone(), shutdown.clone());
+        let saver = start_discovery_book_cache(&first_run, &config, shutdown.clone())
+            .await
+            .expect("an enabled cache starts its saver");
         shutdown.cancel();
         tokio::time::timeout(Duration::from_secs(5), saver)
             .await
             .expect("the saver finishes promptly after shutdown")?;
 
+        let filename = format!("mainnet.{}.zakura-discovery-book", local_secret.public());
+        let path = dir.path().join("network").join(&filename);
+        let saved = std::fs::read(&path)?;
+        assert!(!saved.is_empty());
+        assert!(!config.identity_dir.join(&filename).exists());
+
         let second_run = new_handle()?;
-        assert_eq!(second_run.record_for(peer_node_id).await, None);
-        load_saved_discovery_book(&second_run, &file).await;
+        let shutdown = CancellationToken::new();
+        let saver = start_discovery_book_cache(&second_run, &config, shutdown.clone())
+            .await
+            .expect("the enabled cache is restored");
         assert_eq!(
             second_run.record_for(peer_node_id).await,
             Some(peer_record),
             "the restarted node knows the peer before it dials"
         );
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), saver).await??;
+
+        config.cache_dir = CacheDir::disabled();
+        let disabled_run = new_handle()?;
+        assert!(
+            start_discovery_book_cache(&disabled_run, &config, CancellationToken::new())
+                .await
+                .is_none(),
+            "disabled caching starts no writer"
+        );
+        assert_eq!(
+            disabled_run.record_for(peer_node_id).await,
+            None,
+            "disabled caching does not import the existing file"
+        );
+        assert!(!config.identity_dir.join(filename).exists());
         Ok(())
     }
 }

@@ -2247,7 +2247,7 @@ impl ZakuraDiscoveryHandle {
             .map(|entry| entry.record().clone())
     }
 
-    /// Returns owned entries suitable for a future Zakura-specific persistent cache writer.
+    /// Returns owned entries for the native discovery cache.
     pub async fn persisted_entries(&self) -> Vec<ZakuraDiscoveryPersistedEntry> {
         let state = self.inner.lock().await;
         state.book().persisted_entries()
@@ -3528,7 +3528,7 @@ fn update_existing_entry(
     (outcome, newly_confirmed)
 }
 
-fn current_unix_secs() -> u64 {
+pub(super) fn current_unix_secs() -> u64 {
     utc_now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
@@ -7496,7 +7496,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = DiscoveryBookFile::new(dir.path().join("book"));
         assert!(file.load().is_empty(), "a missing file loads as empty");
-        file.store(book.persisted_entries()).unwrap();
+        file.store(book.persisted_entries(), NOW).unwrap();
 
         let mut reloaded = ZakuraDiscoveryBook::default();
         let outcome = reloaded.import_persisted_entries(file.load(), NOW, &context());
@@ -7509,7 +7509,7 @@ mod tests {
         // A record altered on disk fails its signature check on reload.
         let mut tampered = book.persisted_entries();
         tampered[0].record.body.sequence += 1;
-        file.store(tampered).unwrap();
+        file.store(tampered, NOW).unwrap();
         let mut reloaded = ZakuraDiscoveryBook::default();
         let outcome = reloaded.import_persisted_entries(file.load(), NOW, &context());
         assert_eq!((outcome.added, outcome.rejected), (0, 1));
@@ -7519,7 +7519,7 @@ mod tests {
     /// ordinary peers, and a run with nothing to save keeps the previous file.
     #[test]
     fn discovery_book_file_keeps_useful_entries_and_the_previous_file() {
-        use super::super::book_file::{DiscoveryBookFile, MAX_PERSISTED_DISCOVERY_ENTRIES};
+        use super::super::{book_file::DiscoveryBookFile, wire::MAX_PERSISTED_DISCOVERY_ENTRIES};
 
         let entry =
             |index: u8, last_success: Option<u64>, is_static: bool| ZakuraDiscoveryPersistedEntry {
@@ -7543,7 +7543,11 @@ mod tests {
         let bootstrap = entry(3, Some(NOW + 1), true);
         entries.push(recent.clone());
         entries.push(bootstrap.clone());
-        file.store(entries).unwrap();
+        // These historical successes must not displace live, never-dialed peers.
+        let mut expired = entry(4, Some(NOW + 2), false);
+        expired.record.body.expires_at_unix_secs = NOW - 1;
+        entries.extend(vec![expired; MAX_PERSISTED_DISCOVERY_ENTRIES]);
+        file.store(entries, NOW).unwrap();
 
         let saved = file.load();
         assert_eq!(saved.len(), MAX_PERSISTED_DISCOVERY_ENTRIES);
@@ -7557,7 +7561,7 @@ mod tests {
         );
         assert_eq!(saved[1], recent);
 
-        file.store(Vec::new()).unwrap();
+        file.store(Vec::new(), NOW).unwrap();
         assert_eq!(
             file.load().len(),
             MAX_PERSISTED_DISCOVERY_ENTRIES,
@@ -7586,6 +7590,13 @@ mod tests {
 
         let bytes = encode_persisted_entries(&entries, 2).unwrap();
         assert_eq!(decode_persisted_entries(&bytes, 2).unwrap(), entries);
+        let mut configured = entries.clone();
+        configured[0].is_static = true;
+        assert_eq!(
+            encode_persisted_entries(&configured, 2).unwrap(),
+            bytes,
+            "the file format cannot convey static trust"
+        );
         assert!(decode_persisted_entries(&bytes, 1).is_err());
 
         let mut trailing = bytes;

@@ -782,6 +782,22 @@ fn read_envelope(reader: &mut BoundedReader<'_>) -> Result<ServiceSummaryEnvelop
 /// The header of an encoded discovery book file: a tag and a format version.
 const PERSISTED_BOOK_MAGIC: &[u8; 8] = b"ZKDBOOK\x01";
 
+/// The book file holds at most this many signed records plus their dial history.
+pub(super) const MAX_PERSISTED_DISCOVERY_ENTRIES: usize = 256;
+
+/// Maximum bytes for a record, optional source, timestamps, two address lists,
+/// and failure count. Each optional value has a one-byte presence tag.
+const MAX_PERSISTED_ENTRY_BYTES: usize = MAX_NODE_RECORD_BYTES
+    + (1 + NODE_ID_BYTES)
+    + 8
+    + 2 * (1 + 8)
+    + 2 * (2 + MAX_DIRECT_ADDRS_PER_RECORD * SOCKET_ADDR_V6_BYTES)
+    + 4;
+
+/// Header and entry count followed by the largest possible entries.
+pub(super) const MAX_BOOK_FILE_BYTES: usize =
+    PERSISTED_BOOK_MAGIC.len() + 2 + MAX_PERSISTED_DISCOVERY_ENTRIES * MAX_PERSISTED_ENTRY_BYTES;
+
 /// Encodes at most `max_entries` discovery book entries for the local book
 /// file. Each record keeps its wire encoding, so a loaded record carries the
 /// exact bytes its signature covers.
@@ -810,7 +826,6 @@ pub(crate) fn encode_persisted_entries(
             }
             None => out.push(0),
         }
-        out.push(u8::from(entry.is_static));
         out.extend_from_slice(&entry.last_seen.to_le_bytes());
         write_optional_u64(entry.last_dial_attempt, &mut out);
         write_optional_u64(entry.last_success, &mut out);
@@ -862,11 +877,6 @@ fn read_persisted_entry(
         [1] => Some(read_node_id(reader, "entry source")?),
         _ => return Err(WireError::OutOfRange("entry source flag")),
     };
-    let is_static = match reader.array::<1>("entry static flag")? {
-        [0] => false,
-        [1] => true,
-        _ => return Err(WireError::OutOfRange("entry static flag")),
-    };
     let last_seen = read_u64(reader, "entry last seen")?;
     let last_dial_attempt = read_optional_u64(reader, "entry last dial attempt")?;
     let last_success = read_optional_u64(reader, "entry last success")?;
@@ -885,7 +895,8 @@ fn read_persisted_entry(
     Ok(ZakuraDiscoveryPersistedEntry {
         record,
         source,
-        is_static,
+        // Only configuration can grant static trust. The file has no such field.
+        is_static: false,
         last_seen,
         last_dial_attempt,
         last_success,

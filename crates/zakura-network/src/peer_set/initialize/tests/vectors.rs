@@ -61,12 +61,12 @@ use crate::{
 
 use Network::*;
 
-/// [`Config::default`] with a temporary identity directory, so a test that starts a
-/// Zakura endpoint never loads the real `~/.zakura` key or overwrites its discovery
-/// sequence.
+/// Default network settings with isolated identity and peer-cache files.
 fn test_defaults() -> Config {
+    let identity_dir = crate::config::test_identity_dir();
     Config {
-        identity_dir: crate::config::test_identity_dir(),
+        cache_dir: CacheDir::custom_path(identity_dir.join("cache")),
+        identity_dir,
         ..Config::default()
     }
 }

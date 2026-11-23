@@ -33,9 +33,7 @@ pub(crate) mod wire;
 #[cfg(test)]
 mod wire_tests;
 
-pub(crate) use book_file::{
-    load_saved_discovery_book, spawn_discovery_book_saver, DiscoveryBookFile,
-};
+pub(crate) use book_file::start_discovery_book_cache;
 #[cfg(any(test, feature = "zakura-testkit"))]
 pub(crate) use candidate_dialer::run_native_discovery_dialer;
 pub(crate) use candidate_dialer::{

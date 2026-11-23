@@ -422,6 +422,22 @@ impl LatestChainTip {
         }
     }
 
+    /// Checks a cached body against the exact transactions of the current committed tip.
+    /// A different authorization under the same transaction ID must also compare unequal.
+    pub fn matches_tip_body(&self, candidate: &block::Block) -> bool {
+        // Compare outside the watch lock so peer reads cannot delay publishing a new tip.
+        let tip = self.receiver.cloned_watch_data();
+        tip.is_some_and(|tip| {
+            tip.hash == candidate.hash()
+                && tip.transactions.len() == candidate.transactions.len()
+                && tip
+                    .transactions
+                    .iter()
+                    .zip(&candidate.transactions)
+                    .all(|(committed, cached)| committed.as_ref() == cached.as_ref())
+        })
+    }
+
     /// Maps the current data `ChainTipData` to `Option<U>`
     /// by applying a function to the watched value,
     /// while holding the receiver lock as briefly as possible.

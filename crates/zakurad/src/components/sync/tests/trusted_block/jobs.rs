@@ -124,6 +124,15 @@ async fn prepared_delivery(confirm: bool) {
             .unwrap(),
         Some((solved.hash(), true))
     );
+    let cached = relay
+        .pending
+        .committed_prepared_tip(&relay.tip, solved.hash())
+        .expect("the exact small body remains readable after its pending entry is removed");
+    assert_eq!(cached.zcash_serialize_to_vec().unwrap(), bytes);
+    assert!(
+        cached.pending_send.is_none(),
+        "the tip proves this is the committed body"
+    );
 }
 
 /// Posts one job input under an explicit job ID.
@@ -248,6 +257,13 @@ async fn committed_block_is_served_in_place_of_a_differing_prepared_body() {
         .await
         .unwrap();
     assert_eq!(relay.tip.best_tip_hash(), Some(valid.hash()));
+    assert!(
+        relay
+            .pending
+            .committed_prepared_tip(&relay.tip, valid.hash())
+            .is_none(),
+        "a different body under the same committed header cannot be read from this cache"
+    );
     assert!(relay.pending.get(valid.hash()).is_some());
     assert_eq!(
         fetch_from_peer(&relay, valid.hash()).await,

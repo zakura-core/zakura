@@ -22,14 +22,18 @@ pub(super) fn can_serve(body: &ServedBlock, tip: &impl ChainTip, hash: Hash) -> 
 /// A peer asking for the block just announced can read its authorized bytes without waiting
 /// for the buffer's worker to run alongside the local commit.
 #[derive(Clone)]
-pub(crate) struct PreparedReads<S, T> {
+pub(crate) struct PreparedReads<S> {
     buffer: S,
     pending: PendingBlockRegistry,
-    tip: T,
+    tip: zakura_state::LatestChainTip,
 }
 
-impl<S, T> PreparedReads<S, T> {
-    pub(crate) fn new(buffer: S, pending: PendingBlockRegistry, tip: T) -> Self {
+impl<S> PreparedReads<S> {
+    pub(crate) fn new(
+        buffer: S,
+        pending: PendingBlockRegistry,
+        tip: zakura_state::LatestChainTip,
+    ) -> Self {
         Self {
             buffer,
             pending,
@@ -38,10 +42,9 @@ impl<S, T> PreparedReads<S, T> {
     }
 }
 
-impl<S, T> Service<Request> for PreparedReads<S, T>
+impl<S> Service<Request> for PreparedReads<S>
 where
     S: Service<Request, Response = Response> + Clone,
-    T: ChainTip,
 {
     type Response = Response;
     type Error = S::Error;
@@ -65,6 +68,7 @@ where
             .pending
             .get_for_peer(hash)
             .filter(|body| can_serve(body, &self.tip, hash))
+            .or_else(|| self.pending.committed_prepared_tip(&self.tip, hash))
         {
             // Buffer clones own no reservation. Drop this handle's unused permit now so other
             // peers have exactly the same capacity as after a request through the worker.

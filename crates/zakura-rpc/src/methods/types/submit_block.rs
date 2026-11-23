@@ -172,6 +172,9 @@ struct PendingBlock {
 struct PendingBlockRegistryInner {
     entries: Mutex<HashMap<block::Hash, PendingBlock>>,
     next_owner_id: AtomicU64,
+    /// One small serialized candidate's decoded body, retained across local commitment.
+    /// Peer reads of this slot must match the current tip's complete transactions.
+    small_prepared: Mutex<Option<(block::Hash, Arc<block::Block>)>>,
 }
 
 /// Tracks local submissions through verification. Only bodies authorized for early relay
@@ -184,6 +187,7 @@ impl Default for PendingBlockRegistry {
         Self(Arc::new(PendingBlockRegistryInner {
             entries: Mutex::new(HashMap::new()),
             next_owner_id: AtomicU64::new(1),
+            small_prepared: Mutex::default(),
         }))
     }
 }
@@ -343,9 +347,40 @@ impl PendingBlockRegistry {
         block: Arc<block::Block>,
         bytes: Arc<[u8]>,
     ) -> Option<PendingBlockRegistration> {
-        self.register(block, true, || {
+        // Keep a single small body so a peer that answers our announcement just after commit
+        // can still read it without a separate state request.
+        const MAX_CACHED_BYTES: usize = 4 * 1024;
+        let small = bytes.len() <= MAX_CACHED_BYTES;
+        let registration = self.register(block.clone(), true, || {
             PendingBlockSendPermit::prepared_channel(bytes)
-        })
+        })?;
+        if small {
+            *self
+                .0
+                .small_prepared
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some((registration.hash, block));
+        }
+        Some(registration)
+    }
+
+    /// Returns a previously prepared body only if it matches the current committed tip in full.
+    /// A matching header hash alone never authorizes the saved transactions.
+    pub fn committed_prepared_tip(
+        &self,
+        tip: &zakura_state::LatestChainTip,
+        hash: block::Hash,
+    ) -> Option<ServedBlock> {
+        let cached = self
+            .0
+            .small_prepared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .filter(|(key, _)| *key == hash)
+            .map(|(_, block)| block.clone())?;
+        tip.matches_tip_body(&cached).then(|| cached.into())
     }
 
     pub(crate) fn insert_state_admitted(

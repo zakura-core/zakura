@@ -321,11 +321,7 @@ async fn local_approval(
 ) -> std::result::Result<(), JobError> {
     match verify.await {
         Ok(_) => Ok(()),
-        Err(error)
-            if error
-                .downcast_ref::<RouterError>()
-                .is_some_and(|e| !e.is_verification_unavailable()) =>
-        {
+        Err(error) if matches!(error.downcast_ref::<RouterError>(), Some(RouterError::Block { source }) if source.rejects_template()) => {
             Err(JobError::Invalid)
         }
         Err(error) => {
@@ -364,6 +360,16 @@ mod tests {
         use futures::FutureExt;
         let unavailable = std::future::ready(Err("verifier service is closed".into()));
         assert!(local_approval(unavailable).now_or_never().is_none());
+        let service_error = zakura_consensus::VerifyBlockError::ValidateProposal(
+            "proposal state service is unavailable".into(),
+        );
+        let unavailable = std::future::ready(Err(RouterError::from(service_error).into()));
+        assert!(local_approval(unavailable).now_or_never().is_none());
+        let invalid = zakura_consensus::VerifyBlockError::from(
+            zakura_consensus::error::BlockError::MissingHeight(block::Hash([0; 32])),
+        );
+        let rejected = std::future::ready(Err(RouterError::from(invalid).into()));
+        assert_eq!(local_approval(rejected).await, Err(JobError::Invalid));
         let authorized = std::future::ready(Ok(block::Hash([0; 32])));
         assert_eq!(local_approval(authorized).await, Ok(()));
     }

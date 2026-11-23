@@ -96,8 +96,10 @@ verification or primary confirmation released the job. A primary-confirmed
 block can reach a peer before the relay finishes verifying it locally. Failure
 withdraws writes that have yet to start.
 
-Ordinary full-block POSTs to `/submittrustedblock` and other relayed blocks
-follow `[network].push_relayed_blocks`, which defaults to `false`.
+For an ordinary full-block POST to `/submittrustedblock`, early delivery
+follows `[network].push_relayed_blocks`, which defaults to `false`. The same
+setting controls pushes of blocks relayed from the network. After commitment,
+local submissions use the existing mined-block broadcast path.
 
 A proposal may arrive before the relay has committed its parent, for example
 right after the primary issues a template on a new tip. The job then waits for

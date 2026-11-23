@@ -451,6 +451,7 @@ proptest! {
 
             // TipPoolValues failed, so the NSM counter is omitted rather than reported as zero.
             prop_assert_eq!(response.nsm_value_balance_zat(), None);
+            prop_assert_eq!(response.nsm_value_balance(), &None);
             prop_assert_eq!(
                 response.best_block_hash,
                 genesis_hash
@@ -574,6 +575,10 @@ proptest! {
                     // TipPoolValues succeeded with a known zero NSM balance; report Some(0),
                     // which must stay distinguishable from omitting the field.
                     prop_assert_eq!(info.nsm_value_balance_zat(), Some(Amount::zero()));
+                    prop_assert_eq!(
+                        info.nsm_value_balance(),
+                        &Some(GetBlockchainInfoBalance::nsm(&network, block_height, Amount::zero(), None))
+                    );
                     prop_assert_eq!(info.chain, network.bip70_network_name());
                     prop_assert_eq!(info.blocks, block_height);
                     prop_assert_eq!(info.best_block_hash, block_hash);
@@ -698,6 +703,7 @@ proptest! {
 
             // TipPoolValues failed, so the NSM counter is omitted rather than reported as zero.
             prop_assert_eq!(response.nsm_value_balance_zat(), None);
+            prop_assert_eq!(response.nsm_value_balance(), &None);
             prop_assert_eq!(response.best_block_hash, genesis_block.header.hash());
             prop_assert_eq!(response.chain, network.bip70_network_name());
             prop_assert_eq!(response.blocks, Height::MIN);

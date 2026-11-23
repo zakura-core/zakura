@@ -179,8 +179,14 @@ fn turning_off_the_end_of_support_halt_is_refused_on_a_mining_node() {
 
     // Miners start as long as they keep the halt.
     config.end_of_support.halt = true;
-    cmd.override_config(config)
+    cmd.override_config(config.clone())
         .expect("a mining node that keeps the halt is valid");
+
+    // Support does not end outside Mainnet, so there is no halt for a miner to keep.
+    config.end_of_support.halt = false;
+    config.network.network = zakura_chain::parameters::Network::new_default_testnet();
+    cmd.override_config(config)
+        .expect("a Testnet miner has no halt to turn off");
 }
 
 #[test]

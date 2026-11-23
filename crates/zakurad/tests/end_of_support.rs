@@ -19,9 +19,9 @@ use zakura_chain::{
     },
 };
 use zakurad::components::sync::end_of_support::{
-    self, Config, SupportWindow, EOS_KEEPS_RUNNING_MESSAGE_HEADER, EOS_PANIC_MESSAGE_HEADER,
-    EOS_UNSUPPORTED_MESSAGE_HEADER, EOS_UPGRADE_AHEAD_MESSAGE_HEADER, EOS_WARN_MESSAGE_HEADER,
-    ESTIMATED_RELEASE_HEIGHT,
+    self, Config, SupportWindow, CHECK_INTERVAL, EOS_KEEPS_RUNNING_MESSAGE_HEADER,
+    EOS_PANIC_MESSAGE_HEADER, EOS_UNSUPPORTED_MESSAGE_HEADER, EOS_UPGRADE_AHEAD_MESSAGE_HEADER,
+    EOS_WARN_MESSAGE_HEADER, ESTIMATED_RELEASE_HEIGHT,
 };
 
 /// The release supports this height and halts at the next block.
@@ -32,9 +32,6 @@ fn last_supported_height() -> Height {
 /// The number of blocks per day at the halt height, which is past the ZIP 259
 /// NU7 activation.
 const EOS_BLOCKS_PER_DAY: u32 = 24 * 60 * 60 / POST_NU7_POW_TARGET_SPACING;
-
-/// The time between two checks of the end of support task.
-const CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 /// A config that keeps the node running past the end of its release's support.
 const KEEPS_RUNNING: Config = Config { halt: false };
@@ -193,38 +190,34 @@ fn unsupported_release_is_warned_about_an_upgrade_ahead() {
 /// Test the end of support values reported to the metrics endpoint.
 #[test]
 fn end_of_support_remaining_blocks() {
+    let window = mainnet_window();
     let last_supported_height = last_supported_height();
     let warning_height = Height(last_supported_height.0 - 3 * EOS_BLOCKS_PER_DAY);
 
     assert_eq!(
-        end_of_support::remaining_blocks(Height(ESTIMATED_RELEASE_HEIGHT), &Network::Mainnet),
-        Some(i64::from(
-            last_supported_height.0 - ESTIMATED_RELEASE_HEIGHT
-        )),
+        window.remaining_blocks(Height(ESTIMATED_RELEASE_HEIGHT)),
+        i64::from(last_supported_height.0 - ESTIMATED_RELEASE_HEIGHT),
     );
     assert_eq!(
-        end_of_support::remaining_blocks(warning_height, &Network::Mainnet),
-        Some(i64::from(3 * EOS_BLOCKS_PER_DAY)),
+        window.remaining_blocks(warning_height),
+        i64::from(3 * EOS_BLOCKS_PER_DAY),
     );
     assert_eq!(
-        end_of_support::remaining_blocks(Height(warning_height.0 + 1), &Network::Mainnet),
-        Some(i64::from(3 * EOS_BLOCKS_PER_DAY) - 1),
+        window.remaining_blocks(Height(warning_height.0 + 1)),
+        i64::from(3 * EOS_BLOCKS_PER_DAY) - 1,
     );
-    assert_eq!(
-        end_of_support::remaining_blocks(last_supported_height, &Network::Mainnet),
-        Some(0),
-    );
+    assert_eq!(window.remaining_blocks(last_supported_height), 0);
 
     // The count goes negative at the height that halts the node.
     assert_eq!(
-        end_of_support::remaining_blocks(Height(last_supported_height.0 + 1), &Network::Mainnet),
-        Some(-1),
+        window.remaining_blocks(Height(last_supported_height.0 + 1)),
+        -1,
     );
 
-    // Support is not enforced outside Mainnet, so there is nothing to report.
+    // Support does not end outside Mainnet, so there is nothing to report.
     assert_eq!(
-        end_of_support::remaining_blocks(last_supported_height, &Network::new_default_testnet()),
-        None,
+        SupportWindow::of_release(&Network::new_default_testnet()),
+        None
     );
 }
 

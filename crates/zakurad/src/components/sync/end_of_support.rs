@@ -1,6 +1,6 @@
 //! End of support checking task.
 
-use std::time::Duration;
+use std::{ops::Bound, time::Duration};
 
 use eyre::Report;
 use serde::{Deserialize, Serialize};
@@ -80,7 +80,7 @@ pub const EOS_UPGRADE_AHEAD_MESSAGE_HEADER: &str =
 const LATEST_RELEASE_URL: &str = "https://github.com/zakura-core/zakura/releases/latest";
 
 /// The amount of time between end of support checks.
-const CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
+pub const CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 /// Wait a few seconds at startup so `best_tip_height` is usually `Some`.
 const INITIAL_WAIT: Duration = Duration::from_secs(10);
@@ -111,7 +111,9 @@ const EOS_REMAINING_BLOCKS_METRIC: &str = "end_of_support.remaining_blocks";
 /// The metric that reports how many blocks are left before the next network
 /// upgrade, while an unsupported release keeps running ahead of it.
 ///
-/// Only set on networks where support ends. It is `0` in every other state.
+/// Only set on networks where support ends. It is `0` in every other state. Like
+/// the other gauges it is refreshed at each check, so it can lag the tip by up
+/// to [`CHECK_INTERVAL`].
 const EOS_BLOCKS_UNTIL_UPGRADE_METRIC: &str = "end_of_support.blocks_until_next_upgrade";
 
 /// End of support configuration section.
@@ -126,12 +128,11 @@ pub struct Config {
     /// release might not follow the network's consensus rules after a network
     /// upgrade it was built without, so the operator has to track upgrades.
     ///
-    /// Mining nodes always halt: `false` is rejected when `mining.miner_address`
-    /// or `mining.internal_miner` is set.
+    /// Mining nodes always halt: on a network where support ends, `false` is
+    /// rejected when `mining.miner_address` or `mining.internal_miner` is set.
     pub halt: bool,
 }
 
-#[allow(clippy::derivable_impls)]
 impl Default for Config {
     fn default() -> Self {
         Self { halt: true }
@@ -226,8 +227,11 @@ pub struct UpgradeAhead {
 /// Only upgrades with an activation height in this release are known. An upgrade
 /// that was scheduled after this release was built is not reported.
 pub fn upgrade_ahead(tip_height: Height, network: &Network) -> Option<UpgradeAhead> {
-    let upgrade = NetworkUpgrade::next(network, tip_height)?;
-    let activation_height = upgrade.activation_height(network)?;
+    let (activation_height, upgrade) = network
+        .activation_list()
+        .range((Bound::Excluded(tip_height), Bound::Unbounded))
+        .map(|(activation_height, upgrade)| (*activation_height, *upgrade))
+        .next()?;
 
     Some(UpgradeAhead {
         upgrade,
@@ -353,14 +357,6 @@ fn estimated_height_after_release(network: &Network, days: u32) -> Height {
     Height(u32::try_from(height).expect("the support window ends below the maximum height"))
 }
 
-/// Returns the number of blocks left in this release's support window on
-/// `network`, or `None` where support does not end.
-///
-/// The count is negative once `tip_height` goes past the last supported height.
-pub fn remaining_blocks(tip_height: Height, network: &Network) -> Option<i64> {
-    SupportWindow::of_release(network).map(|window| window.remaining_blocks(tip_height))
-}
-
 /// Reports where `tip_height` falls in `window`, and panics if the release is
 /// too old and [`Config::halt`] is on.
 ///
@@ -397,14 +393,16 @@ pub fn check(tip_height: Height, window: &SupportWindow, network: &Network, conf
             "{EOS_UNSUPPORTED_MESSAGE_HEADER}: the chain tip is past block \
             {last_supported_height}, the last height it supports. It keeps running because \
             end_of_support.halt is off, but it might not follow the network's consensus \
-            rules after a network upgrade. \n{release} \n{hint}"
+            rules after a network upgrade. It cannot warn about an upgrade that was \
+            scheduled after it was built. \n{release} \n{hint}"
         ),
     }
 
     if let Some(upgrade_ahead) = unsupported_upgrade_ahead(tip_height, window, network, config) {
         warn!(
             "{EOS_UPGRADE_AHEAD_MESSAGE_HEADER}: {} activates at block {}, in {} blocks. \
-            Install a supported release before then. \n{release} \n{hint}",
+            Later releases can change how the upgrade is handled, so install a supported \
+            release before then. \n{release} \n{hint}",
             upgrade_ahead.upgrade,
             upgrade_ahead.activation_height.0,
             upgrade_ahead.remaining_blocks,

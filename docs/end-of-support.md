@@ -42,16 +42,19 @@ on the old rules and falls off the network. Turning the halt off makes the
 operator responsible for tracking network upgrades.
 
 The warning about an upgrade ahead only covers upgrades whose activation
-height is built into the running release. An upgrade that was scheduled after
-the release was built is invisible to it.
+height is built into the running release. The release implements those
+upgrades as they were when it was built, and later releases can change how
+they are handled. An upgrade that was scheduled after the release was built is
+invisible to it, and no warning or alert can report it.
 
 ### Mining nodes
 
 Mining nodes always halt. A miner on outdated rules can build blocks that the
 network rejects, or extend a chain the network has left. A node counts as a
 mining node when `mining.miner_address` is set, because it can then build
-block templates, or when `mining.internal_miner` is on. Such a node refuses to
-start with `end_of_support.halt = false`.
+block templates, or when `mining.internal_miner` is on. On Mainnet such a node
+refuses to start with `end_of_support.halt = false`. Other networks have no
+end of support, so the setting has no effect there and miners are not refused.
 
 ## Monitoring
 
@@ -63,6 +66,7 @@ start with `end_of_support.halt = false`.
 | `end_of_support.blocks_until_next_upgrade` | Blocks left before the next network upgrade while the release runs unsupported, and `0` otherwise. Mainnet only. |
 
 The bundled Prometheus rules in
-`docker/observability/prometheus/rules/zakura_alerts.yml` alert before a halt,
-when a release runs past its end of support, and when an unsupported release
-is ahead of a network upgrade.
+`docker/observability/prometheus/rules/zakura_alerts.yml` alert before the end
+of support, when a release runs past it, and when an unsupported release is
+within three days of a network upgrade. The node refreshes these metrics at
+each hourly check, so they can lag the chain tip by up to an hour.

@@ -484,6 +484,31 @@ async fn local_rejection_vetoes_release_even_with_a_confirmation() {
     assert!(relay.early.try_recv().is_err());
 }
 
+/// The solved header is bound and the worker is waiting for either authority. A rejection and
+/// the matching confirmation arrive together, and the rejection decides.
+#[tokio::test(start_paused = true)]
+async fn local_rejection_takes_precedence_over_a_simultaneous_confirmation() {
+    let mut relay = Relay::at_parent();
+    assert_eq!(relay.prepare().await, Ok(()));
+    assert_eq!(relay.solve().await, Ok(()));
+    let verification = relay.proposal_verification().await;
+    // Long enough for the worker to bind the header and wait for an authority.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let mut other = relay.confirmation();
+    other[63] ^= 1;
+    assert_eq!(
+        relay.send(JOB, Operation::Confirm, other.to_vec()).await,
+        Err(JobError::Conflict),
+        "the worker knows the solved bytes"
+    );
+    // Both happen before the worker runs again.
+    assert_eq!(relay.confirm().await, Ok(()));
+    verification.respond_error(rejection());
+    assert_eq!(relay.outcome().await, Err(JobError::Invalid));
+    assert!(!relay.is_released());
+    assert!(relay.early.try_recv().is_err());
+}
+
 #[tokio::test(start_paused = true)]
 async fn unavailable_local_verification_leaves_the_confirmation_path_open() {
     let mut relay = Relay::at_parent();
@@ -614,8 +639,9 @@ async fn verification_failure_caused_by_a_moved_tip_ends_the_job_as_expired() {
     assert_eq!(relay.outcome().await, Err(JobError::Expired));
 }
 
-/// The worker sees the moved tip and a rejection at once. The tip decides: a verdict reached
-/// against a parent that is no longer the tip says nothing about the proposal.
+/// The worker sees the moved tip and a rejection at once. The tip decides: verification of a
+/// proposal whose parent stopped being the tip can fail for that reason alone, so the job is
+/// reported as stale.
 #[tokio::test(start_paused = true)]
 async fn moved_tip_takes_precedence_over_a_simultaneous_rejection() {
     let mut relay = Relay::at_parent();

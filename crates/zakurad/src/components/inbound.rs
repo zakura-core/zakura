@@ -231,8 +231,9 @@ async fn retained_block_height(mut state: State, hash: block::Hash) -> Option<bl
 /// A prepared body is the exception: it is served from memory without reading state, because
 /// state can be busy committing that very block while peers wait for it. The best tip decides
 /// whether to skip the read. Once `hash` is the best tip, state has a committed copy and wins as
-/// above. A copy committed to a side chain is not noticed here; the submission's own duplicate
-/// verdict withdraws a prepared body that differs from it.
+/// above. A copy committed to a side chain, or to the best chain below a newer tip, is not
+/// noticed here; the submission's own duplicate verdict withdraws a prepared body that differs
+/// from it.
 async fn block_by_hash_or_pending(
     mut state: State,
     pending_blocks: PendingBlockRegistry,

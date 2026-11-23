@@ -111,12 +111,18 @@ where
         // read every frame hyper queued before it failed the connection on the client's close.
         // A body that ends abnormally reports an error, so it is never mistaken for a complete
         // one. The task keeps the slot until the submission finishes.
+        // A complete submission reports an unknown outcome in its 200 body. A job input has
+        // no such body, and its 2xx would read as an acknowledgement.
+        let unknown_outcome = match &submit {
+            Route::Full(_) => StatusCode::OK,
+            Route::Job(..) => StatusCode::SERVICE_UNAVAILABLE,
+        };
         let submission = tokio::spawn(receive_and_submit(submit, slot, request.into_body()));
         // The task is never aborted, so a join error is a panic or runtime shutdown.
         Box::pin(async move {
             Ok(submission
                 .await
-                .unwrap_or_else(|_| response(StatusCode::OK, "inconclusive")))
+                .unwrap_or_else(|_| response(unknown_outcome, "inconclusive")))
         })
     }
 }

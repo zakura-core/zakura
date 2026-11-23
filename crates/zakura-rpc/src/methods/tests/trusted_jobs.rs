@@ -232,6 +232,21 @@ impl Relay {
         Ok(())
     }
 
+    /// Waits up to a second for the job to end as committed.
+    ///
+    /// Only an ended job acknowledges an input that contradicts its proposal: a live job
+    /// refuses it as a conflict, and a job that ended otherwise reports its error.
+    async fn committed(&self) -> bool {
+        for _ in 0..1_000 {
+            match self.send(JOB, Operation::Prepare, vec![0xee]).await {
+                Ok(()) => return true,
+                Err(JobError::Conflict) => tokio::time::sleep(Duration::from_millis(1)).await,
+                Err(_) => return false,
+            }
+        }
+        false
+    }
+
     /// Whether `count` new jobs can start, which shows how many slots are free.
     async fn can_start(&self, count: u8) -> bool {
         for index in 0..count {
@@ -264,8 +279,13 @@ async fn verified_proposal_releases_the_exact_solved_bytes_then_commits() {
     assert_eq!(relay.released().await, relay.solved_bytes());
     // Inputs replayed while the commit runs are acknowledged.
     assert_eq!(relay.solve().await, Ok(()));
+    assert_eq!(
+        relay.send(JOB, Operation::Prepare, vec![0xee]).await,
+        Err(JobError::Conflict),
+        "the job is still live while its commit runs"
+    );
     relay.commit().await.respond(relay.solved.hash());
-    assert_eq!(relay.outcome().await, Ok(()));
+    assert!(relay.committed().await);
     assert_eq!(relay.confirm().await, Ok(()));
     assert!(
         relay.can_start(16).await,
@@ -286,7 +306,7 @@ async fn confirmation_releases_while_local_verification_is_still_running() {
     // The abandoned proposal verification cannot veto or delay the commit.
     verification.respond_error(rejection());
     relay.commit().await.respond(relay.solved.hash());
-    assert_eq!(relay.outcome().await, Ok(()));
+    assert!(relay.committed().await);
 }
 
 #[tokio::test(start_paused = true)]
@@ -524,22 +544,92 @@ async fn block_committed_by_another_path_ends_the_job_as_committed() {
         .respond_error(tower::BoxError::from(RouterError::from(
             VerifyBlockError::from(BlockError::AlreadyInChain(hash, KnownBlock::BestChain)),
         )));
-    for _ in 0..1_000 {
-        if !relay.is_released() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(1)).await;
-    }
+    assert!(
+        relay.committed().await,
+        "a header hash committed elsewhere ends the job as committed"
+    );
     assert!(
         !relay.is_released(),
         "the duplicate verdict resolves the job"
     );
+    assert_eq!(relay.solve().await, Ok(()));
+    assert_eq!(relay.confirm().await, Ok(()));
+}
+
+/// The lifetime bounds the wait for a release. A commit that is still running when it passes
+/// keeps its own verdict.
+#[tokio::test(start_paused = true)]
+async fn commit_that_outlives_the_job_lifetime_still_reports_its_own_outcome() {
+    let mut relay = Relay::at_parent();
+    assert_eq!(relay.prepare().await, Ok(()));
+    relay
+        .proposal_verification()
+        .await
+        .respond(relay.proposal_hash());
+    // The miner finds its solution shortly before the job would expire.
+    tokio::time::sleep(Duration::from_secs(110)).await;
+    assert_eq!(relay.solve().await, Ok(()));
+    assert_eq!(relay.released().await, relay.solved_bytes());
+    let commit = relay.commit().await;
+    tokio::time::sleep(Duration::from_secs(30)).await;
     assert_eq!(
         relay.solve().await,
         Ok(()),
-        "a committed block is a success"
+        "the job is past its lifetime and still committing"
     );
+    assert!(relay.is_released());
+    commit.respond(relay.solved.hash());
+    assert!(relay.committed().await);
+}
+
+/// A released job follows the complete POST's validation deadline.
+#[tokio::test(start_paused = true)]
+async fn commit_that_misses_the_validation_deadline_withdraws_the_body_as_unavailable() {
+    let mut relay = Relay::at_parent();
+    assert_eq!(relay.prepare().await, Ok(()));
+    assert_eq!(relay.solve().await, Ok(()));
     assert_eq!(relay.confirm().await, Ok(()));
+    let _verification = relay.proposal_verification().await;
+    assert_eq!(relay.released().await, relay.solved_bytes());
+    let _commit = relay.commit().await;
+    tokio::time::sleep(Duration::from_secs(61)).await;
+    assert_eq!(relay.outcome().await, Err(JobError::Unavailable));
+    assert!(!relay.is_released());
+}
+
+/// The parent stops being the tip while the proposal is in verification, and verification
+/// fails for that reason. The job is stale, not invalid.
+#[tokio::test(start_paused = true)]
+async fn verification_failure_caused_by_a_moved_tip_ends_the_job_as_expired() {
+    let mut relay = Relay::at_parent();
+    assert_eq!(relay.prepare().await, Ok(()));
+    let verification = relay.proposal_verification().await;
+    relay.set_tip(Height(1), block::Hash([9; 32]));
+    verification.respond_error(tower::BoxError::from(RouterError::from(
+        VerifyBlockError::ValidateProposal(
+            "proposal is not based on the current best chain tip".into(),
+        ),
+    )));
+    assert_eq!(relay.outcome().await, Err(JobError::Expired));
+}
+
+/// A failed state call during proposal verification is no verdict on the proposal.
+#[tokio::test(start_paused = true)]
+async fn state_failure_during_proposal_verification_leaves_the_confirmation_path_open() {
+    let mut relay = Relay::at_parent();
+    assert_eq!(relay.prepare().await, Ok(()));
+    assert_eq!(relay.solve().await, Ok(()));
+    relay
+        .proposal_verification()
+        .await
+        .respond_error(tower::BoxError::from(RouterError::from(
+            VerifyBlockError::ValidateProposal("state service is unavailable".into()),
+        )));
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(!relay.is_released());
+    assert_eq!(relay.prepare().await, Ok(()), "the job is still waiting");
+    assert_eq!(relay.confirm().await, Ok(()));
+    assert_eq!(relay.released().await, relay.solved_bytes());
 }
 
 #[tokio::test(start_paused = true)]

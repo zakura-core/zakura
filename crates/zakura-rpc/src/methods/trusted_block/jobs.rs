@@ -308,7 +308,7 @@ where
                     Ok(Arc::new(header))
                 })
                 .await
-                .map_err(|_| JobError::Unavailable)??;
+                .map_err(blocking_task_failed)??;
                 Update::Solve(header)
             }
             Operation::Confirm => {
@@ -428,15 +428,17 @@ where
             Ok((Arc::new(block), transactions))
         })
         .await
-        .map_err(|_| JobError::Unavailable)??;
+        .map_err(blocking_task_failed)??;
         let parent = candidate.header.previous_block_hash;
         let height = candidate.coinbase_height().ok_or(JobError::Invalid)?;
         let mut tip = self.latest_chain_tip.clone();
         parent_becomes_tip(&mut tip, parent, height).await?;
         let (block, wire, authority) = tokio::select! {
             biased;
-            authorized = self.authorize(sender, inputs, &candidate, transactions) => authorized?,
+            // Checked first: verification of a proposal whose parent stopped being the tip
+            // fails for that reason, and the job is then stale, not invalid.
             () = tip_leaves(&mut tip, parent) => return Err(JobError::Expired),
+            authorized = self.authorize(sender, inputs, &candidate, transactions) => authorized?,
         };
         Ok(Release {
             block,
@@ -506,7 +508,7 @@ where
                 Ok((Arc::<[u8]>::from(wire), confirmation))
             })
             .await
-            .map_err(|_| JobError::Unavailable)??;
+            .map_err(blocking_task_failed)??;
         sender.send_modify(|parts| {
             parts.expected_confirmation = Some(confirmation);
             // A confirmation that arrived before the solved bytes were known is kept only if
@@ -572,11 +574,7 @@ async fn local_approval(
 ) -> std::result::Result<(), JobError> {
     match verify.await {
         Ok(_) => Ok(()),
-        Err(error)
-            if error
-                .downcast_ref::<RouterError>()
-                .is_some_and(|e| !e.is_verification_unavailable()) =>
-        {
+        Err(error) if is_proposal_rejection(&error) => {
             tracing::info!(%error, "local verification rejected the prepared proposal");
             Err(JobError::Invalid)
         }
@@ -585,6 +583,35 @@ async fn local_approval(
             std::future::pending().await
         }
     }
+}
+
+/// Whether a proposal verification error is a verdict on the proposal, as opposed to a failure
+/// to reach one.
+fn is_proposal_rejection(error: &tower::BoxError) -> bool {
+    let Some(error) = error.downcast_ref::<RouterError>() else {
+        return false;
+    };
+    if error.is_verification_unavailable() {
+        return false;
+    }
+    match error {
+        RouterError::Block { source } => match source.as_ref() {
+            // The proposal's contextual check reports a failed state call, an uncommitted
+            // parent and a parent that is no longer the best tip through this same variant.
+            // Only a contextual rule failure is a verdict on the proposal.
+            zakura_consensus::VerifyBlockError::ValidateProposal(source) => source
+                .downcast_ref::<zakura_state::ValidateContextError>()
+                .is_some(),
+            _ => true,
+        },
+        RouterError::Checkpoint { .. } => true,
+    }
+}
+
+/// Reports a blocking task that panicked or was cancelled. The job cannot reach an outcome.
+fn blocking_task_failed(error: tokio::task::JoinError) -> JobError {
+    tracing::error!(%error, "prepared trusted job task failed");
+    JobError::Unavailable
 }
 
 /// Proposal mode skips work on the nonce and solution. Every other header field, including
@@ -618,6 +645,49 @@ mod tests {
         assert!(local_approval(unavailable).now_or_never().is_none());
         let authorized = std::future::ready(Ok(block::Hash([0; 32])));
         assert_eq!(local_approval(authorized).await, Ok(()));
+    }
+
+    /// Proposal verification reports state failures and a moved tip through the variant that
+    /// also carries contextual rejections. Only a rejection vetoes the confirmation path.
+    #[tokio::test]
+    async fn only_a_verdict_on_the_proposal_vetoes_release() {
+        use futures::FutureExt;
+        use zakura_consensus::{BlockError, VerifyBlockError};
+
+        let hash = block::Hash([0; 32]);
+        let error =
+            |error: VerifyBlockError| -> tower::BoxError { RouterError::from(error).into() };
+        let no_verdict = [
+            error(VerifyBlockError::ValidateProposal(
+                "proposal is not based on the current best chain tip".into(),
+            )),
+            error(VerifyBlockError::ValidateProposal(
+                "state service is unavailable".into(),
+            )),
+            error(VerifyBlockError::Depth {
+                source: "state lookup failed".into(),
+                hash,
+            }),
+        ];
+        for error in no_verdict {
+            assert!(!is_proposal_rejection(&error), "{error}");
+            assert!(local_approval(std::future::ready(Err(error)))
+                .now_or_never()
+                .is_none());
+        }
+        let rejections = [
+            error(VerifyBlockError::ValidateProposal(Box::new(
+                zakura_state::ValidateContextError::InvalidAncestorBlock(hash),
+            ))),
+            error(VerifyBlockError::from(BlockError::NoTransactions)),
+        ];
+        for error in rejections {
+            assert!(is_proposal_rejection(&error), "{error}");
+            assert_eq!(
+                local_approval(std::future::ready(Err(error))).await,
+                Err(JobError::Invalid)
+            );
+        }
     }
 
     #[test]

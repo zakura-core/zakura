@@ -102,7 +102,7 @@ ID. Job responses are:
 
 | Status | Meaning |
 | --- | --- |
-| 202 | The input was received, or its job already committed the block. |
+| 202 | The input was received, or its job ended with the block's header hash committed. |
 | 400 | The input is malformed, the solved header fails proof of work, or local verification rejected the proposal or the solved block. |
 | 409 | The input contradicts one already received for this job: a different proposal, a different solved header, or a confirmation of other bytes. The job keeps the input it already has. A job whose solved header changes more than the proposal's nonce and solution ends with this status. |
 | 410 | The job ended as stale or passed its lifetime. |
@@ -121,8 +121,10 @@ and for authority to release. A released job then follows the validation
 deadline of a complete POST. The relay holds at most 16 unfinished jobs, each
 with its proposal in memory; a job frees its slot as soon as it ends. A miner
 that prepares a job for every template refresh can therefore keep about one job
-per 7.5 seconds alive on one parent. A refused `prepare` returns 429 at once, so
-the miner knows that candidate needs the complete POST.
+per 7.5 seconds alive on one parent. A refused `prepare` returns 429 when its
+upload completes, so the miner knows that candidate needs the complete POST. A
+template mined for longer than 120 seconds must be prepared again under a new
+ID: its first job has expired, and that job's ID answers 410.
 
 For a job that ended without committing, or to recover from an inconclusive
 attempt, use the complete POST after the primary has accepted the exact bytes.
@@ -238,10 +240,12 @@ state instead once the hash is its best tip, so a block committed to the best
 chain through another path is served in place of the job's body. A released job
 also skips the duplicate lookup that a complete POST performs: it requires the
 parent to be the best tip, which a block already committed to the best chain
-cannot satisfy. Two cases remain. A copy still in the state's write queue does
-not stop the job's early relay, and a copy committed to a side chain is not
-noticed when serving. In both, the job's own validation reports the duplicate
-and the comparison below settles the body. For an honest caller the bytes are
+cannot satisfy. Three cases remain. A copy still in the state's write queue
+does not stop the job's early relay. A copy committed to a side chain is not
+noticed when serving. A copy committed to the best chain stops being noticed
+once a child block becomes the best tip, until the job's own validation ends.
+In each, that validation reports the duplicate and the comparison below settles
+the body. For an honest caller the bytes are
 the same either way: a job's body is either locally verified or bound to the
 primary's accepted bytes by the confirmation digest.
 

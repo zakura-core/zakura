@@ -766,3 +766,21 @@ async fn prepared_job_body_limit_applies_to_a_stream_without_a_declared_length()
         StatusCode::PAYLOAD_TOO_LARGE
     );
 }
+
+/// A job handler that panics has no outcome. Its status must not read as an acknowledgement.
+#[tokio::test]
+async fn prepared_job_handler_panic_is_not_acknowledged() {
+    let (cookie, auth) = credentials();
+    let json = tower::service_fn(|_| async { Ok::<_, tower::BoxError>(HttpResponse::default()) });
+    let service = TrustedBlockHttpService::new(
+        json,
+        Some(cookie),
+        Some(Arc::new(|_| panic!("a job must use the job handler"))),
+    )
+    .with_jobs(Some(Arc::new(|_, _, _| panic!("the job handler failed"))));
+    let request = job_request(&auth, "?op=solve", &[JOB_ID], 140);
+    assert_eq!(
+        send(service, request).await.unwrap().status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+}

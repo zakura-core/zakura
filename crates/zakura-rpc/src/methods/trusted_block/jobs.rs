@@ -476,8 +476,8 @@ where
 
     /// Binds the solved header to `candidate` and waits for authority to relay the result.
     ///
-    /// The proposal verification lives only as long as this wait. A confirmation that arrives
-    /// first cancels it, so it does not compete with the solved block's own verification.
+    /// If confirmation authorizes relay first, the worker stops waiting for proposal verification.
+    /// Checks already dispatched by the verifier can still run alongside verification of the solved block.
     async fn authorize(
         &self,
         sender: &JobSender,

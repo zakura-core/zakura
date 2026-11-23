@@ -114,6 +114,8 @@ enum Committed {
 
 #[derive(Default)]
 struct Inputs {
+    /// Cleared when the worker hands the block to validation, which has its own deadline.
+    release_deadline: Option<Instant>,
     body: Option<Bytes>,
     header: Option<Arc<Header>>,
     /// When the solved header arrived, for the release latency metric.
@@ -130,8 +132,16 @@ enum Update {
 }
 
 impl Inputs {
+    fn expired(&self) -> bool {
+        self.release_deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+    }
+
     /// Stores an input. Returns whether it is new: a replay of the stored input changes nothing.
     fn update(&mut self, update: Update) -> std::result::Result<bool, JobError> {
+        if self.expired() {
+            return Err(JobError::Expired);
+        }
         fn set<T: Eq>(slot: &mut Option<T>, value: T) -> std::result::Result<bool, JobError> {
             match slot {
                 Some(old) if old == &value => Ok(false),
@@ -226,11 +236,15 @@ impl Jobs {
             metrics::counter!("rpc.trusted_submission.job.saturated").increment(1);
             return Err(JobError::Capacity);
         }
-        let mut inputs = Inputs::default();
+        let deadline = now + LIFETIME;
+        let mut inputs = Inputs {
+            release_deadline: Some(deadline),
+            ..Inputs::default()
+        };
         inputs.update(update)?;
         let (sender, receiver) = watch::channel(inputs);
         jobs.live.insert(id, sender.clone());
-        Ok(Some((sender, receiver, now + LIFETIME)))
+        Ok(Some((sender, receiver, deadline)))
     }
 
     /// Frees an unfinished job's slot and remembers its outcome.
@@ -357,6 +371,17 @@ where
             .await
             .unwrap_or(Err(JobError::Expired))?;
         if self.latest_chain_tip.best_tip_hash() != Some(release.parent) {
+            return Err(JobError::Expired);
+        }
+        // Authorization and the timer can become ready on the same poll. Order the
+        // handoff against incoming inputs under the same lock that admits them.
+        if !sender.send_if_modified(|parts| {
+            if parts.expired() {
+                return false;
+            }
+            parts.release_deadline = None;
+            true
+        }) {
             return Err(JobError::Expired);
         }
         let hash = release.block.hash();
@@ -703,6 +728,18 @@ mod tests {
         assert!(matches!(
             jobs.register([0; 16], Update::Prepare(Bytes::from_static(b"second"))),
             Err(JobError::Conflict)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn input_at_the_deadline_is_refused_before_the_worker_processes_expiry() {
+        let jobs = Jobs::default();
+        let input = || Update::Confirm([0; 64]);
+        let (_, _, deadline) = jobs.register([0; 16], input()).unwrap().unwrap();
+        tokio::time::sleep_until(deadline).await;
+        assert!(matches!(
+            jobs.register([0; 16], input()),
+            Err(JobError::Expired)
         ));
     }
 

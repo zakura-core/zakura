@@ -391,6 +391,40 @@ async fn tip_change_expires_a_job_that_is_waiting_for_its_solution() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn confirmation_ready_on_the_release_deadline_cannot_publish() {
+    let mut relay = Relay::at_parent();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    relay.prepare().await.unwrap();
+    let _verification = relay.proposal_verification().await;
+    relay.solve().await.unwrap();
+
+    // A conflicting digest is refused once the worker has bound the solved bytes.
+    let mut wrong = relay.confirmation();
+    wrong[63] ^= 1;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let result = relay.send(JOB, Operation::Confirm, wrong.to_vec()).await;
+            if result == Err(JobError::Conflict) {
+                break;
+            }
+            result.unwrap();
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    // Registering a confirmation does not yield. Advance the clock before the
+    // worker gets to poll either the matching confirmation or its deadline.
+    relay.confirm().await.unwrap();
+    tokio::time::advance(deadline - tokio::time::Instant::now()).await;
+    relay.verifier.expect_no_requests().await;
+    assert_eq!(relay.outcome().await, Err(JobError::Expired));
+    assert!(!relay.is_released());
+    assert!(relay.early.try_recv().is_err());
+}
+
+#[tokio::test(start_paused = true)]
 async fn inputs_for_a_job_past_its_lifetime_report_expiry_instead_of_starting_a_job() {
     let relay = Relay::at_parent();
     assert_eq!(relay.prepare().await, Ok(()));
@@ -597,7 +631,7 @@ async fn commit_that_outlives_the_job_lifetime_still_reports_its_own_outcome() {
     assert_eq!(relay.solve().await, Ok(()));
     assert_eq!(relay.released().await, relay.solved_bytes());
     let commit = relay.commit().await;
-    tokio::time::sleep(Duration::from_secs(30)).await;
+    tokio::time::sleep(Duration::from_secs(59)).await;
     assert_eq!(
         relay.solve().await,
         Ok(()),

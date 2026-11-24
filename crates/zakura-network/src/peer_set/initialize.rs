@@ -176,6 +176,7 @@ where
         header_sync_driver_startup,
         Vec::new(),
         peer::BlockAnnouncementHook::default(),
+        None,
     )
     .await
     .map(
@@ -190,6 +191,10 @@ where
 ///
 /// Legacy connections pass each block a peer announces in a single-block `inv` to
 /// `block_announcement_hook`.
+///
+/// `miner_gateways` ranks the mining gateways the v2 discovery dialer prefers
+/// to stay connected to. Without it, or once its sender is gone, the dialer
+/// prefers none.
 #[allow(clippy::too_many_arguments)]
 pub async fn init_with_zakura<S, C>(
     config: Config,
@@ -201,6 +206,7 @@ pub async fn init_with_zakura<S, C>(
     header_sync_driver_startup: Option<ZakuraHeaderSyncDriverStartup>,
     custom_services: Vec<CustomService>,
     block_announcement_hook: peer::BlockAnnouncementHook,
+    miner_gateways: Option<zakura_rt::sync::watch::Receiver<crate::zakura::MinerGatewayRanking>>,
 ) -> Result<
     (
         BoxCloneSyncService<Request, Response, BoxError>,
@@ -248,6 +254,7 @@ where
         header_sync_driver_startup,
         custom_services,
         peer_registry.clone(),
+        miner_gateways,
     )
     .boxed()
     .await?;

@@ -839,6 +839,7 @@ impl StartCmd {
                     claims: announcement_claims.clone(),
                     latest_chain_tip: latest_chain_tip.clone(),
                 }),
+                None,
             )
             .await
             .map_err(|error| eyre!(error))?;

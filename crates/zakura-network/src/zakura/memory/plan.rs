@@ -29,7 +29,10 @@ use crate::{
             BLOCK_SYNC_SESSION_BOOKKEEPING_BYTES, BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES,
             DEFAULT_BS_BBR_MIN_CWND_BYTES, LARGEST_SERVED_BLOCK_RESPONSE_BYTES,
         },
-        bpv1::{PropagationReserve, SessionBase as Bpv1SessionBase, NODE_PROFILE, ZAKURA_CAP_BPV1},
+        bpv1::{
+            PropagationReserve, SessionBase as Bpv1SessionBase, ZakuraBpv1Config, NODE_PROFILE,
+            ZAKURA_CAP_BPV1,
+        },
         discovery::{discovery_serving_output_bytes, DISCOVERY_BUDGET},
         handler::{
             remote_bootstrap_peer_count, BASE_SEND_WINDOW_BYTES,
@@ -468,6 +471,21 @@ pub struct BudgetTooSmall {
     pub floors: [u64; Consumer::COUNT],
     /// Minimum budgeted connections required for discovery + chain following.
     pub min_connections: usize,
+    /// Operator settings raised above their defaults that raise a reserve.
+    /// A reserve is held in full, so it never starts with a warning: the
+    /// refusal names these settings instead (BP-pt-2).
+    pub raised_reserve_settings: Vec<RaisedSetting>,
+}
+
+/// One operator setting above its default that a [`BudgetTooSmall`] names.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RaisedSetting {
+    /// TOML setting path.
+    pub setting: &'static str,
+    /// Operator-configured value.
+    pub configured_value: String,
+    /// Default value.
+    pub default_value: String,
 }
 
 impl fmt::Display for BudgetTooSmall {
@@ -519,7 +537,19 @@ impl fmt::Display for BudgetTooSmall {
         for (name, _, base) in self.bases.entries() {
             write!(f, ", {name}={} B", base.total())?;
         }
-        f.write_str("]); raise [memory] budget or add host RAM")
+        f.write_str("]); ")?;
+        for raised in &self.raised_reserve_settings {
+            write!(
+                f,
+                "{} = {} raises a reserve (default {}); ",
+                raised.setting, raised.configured_value, raised.default_value
+            )?;
+        }
+        f.write_str("raise [memory] budget or add host RAM")?;
+        if !self.raised_reserve_settings.is_empty() {
+            f.write_str(", or lower the raised settings")?;
+        }
+        Ok(())
     }
 }
 
@@ -673,7 +703,7 @@ impl MemoryPlan {
             };
             if smallest.required_bytes() > budget_b {
                 return Err(MemoryPlanError::BudgetTooSmall(Box::new(
-                    smallest.budget_too_small(derivation, budget_b),
+                    smallest.budget_too_small(config, derivation, budget_b),
                 )));
             }
         }
@@ -1070,7 +1100,12 @@ impl PlanTerms {
         )
     }
 
-    fn budget_too_small(&self, derivation: BudgetDerivation, budget_b: u64) -> BudgetTooSmall {
+    fn budget_too_small(
+        &self,
+        config: &Config,
+        derivation: BudgetDerivation,
+        budget_b: u64,
+    ) -> BudgetTooSmall {
         BudgetTooSmall {
             derivation,
             budget_b,
@@ -1079,8 +1114,36 @@ impl PlanTerms {
             bases: self.bases,
             floors: self.consumers.map(|spec| spec.floor),
             min_connections: self.min_connections,
+            raised_reserve_settings: raised_reserve_settings(config),
         }
     }
+}
+
+/// The settings in `config` above their defaults that raise a reserve. With
+/// BPv1 on, its part buffer and its concurrent blocks size the `Propagation`
+/// reserve ([`PropagationReserve`]).
+fn raised_reserve_settings(config: &Config) -> Vec<RaisedSetting> {
+    let bpv1 = &config.zakura.bpv1;
+    if !bpv1.enabled {
+        return Vec::new();
+    }
+    let default = ZakuraBpv1Config::default();
+    let mut raised = Vec::new();
+    if bpv1.part_retention_budget_bytes > default.part_retention_budget_bytes {
+        raised.push(RaisedSetting {
+            setting: "[network.zakura.bpv1] part_retention_budget_bytes",
+            configured_value: ByteSize(bpv1.part_retention_budget_bytes).to_string(),
+            default_value: ByteSize(default.part_retention_budget_bytes).to_string(),
+        });
+    }
+    if bpv1.max_concurrent_blocks > default.max_concurrent_blocks {
+        raised.push(RaisedSetting {
+            setting: "[network.zakura.bpv1] max_concurrent_blocks",
+            configured_value: bpv1.max_concurrent_blocks.to_string(),
+            default_value: default.max_concurrent_blocks.to_string(),
+        });
+    }
+    raised
 }
 
 /// The most sessions the reactor with `capability` runs at once under a
@@ -1917,6 +1980,56 @@ mod tests {
                 plan.override_warnings
             );
         }
+    }
+
+    /// BP-pt-2: a raised BPv1 setting that grows the `Propagation` reserve past
+    /// `B` still refuses, because a reserve is held in full, but the refusal
+    /// names the setting and its value. A default BPv1 refusal names none.
+    #[test]
+    fn a_raised_bpv1_reserve_refuses_and_names_its_setting() {
+        let mut on = zakura_cfg(&Network::Mainnet);
+        on.zakura.bpv1.enabled = true;
+        let budget_b = resolved_p2p_budget_bytes(16 * GIB, false);
+        MemoryPlan::size(budget_b, &on, &Network::Mainnet).expect("the default reserve fits");
+
+        let refusal =
+            |config: &Config, budget_b| match MemoryPlan::size(budget_b, config, &Network::Mainnet)
+            {
+                Err(MemoryPlanError::BudgetTooSmall(refusal)) => refusal,
+                other => panic!("expected a refusal: {other:?}"),
+            };
+        let mut part_buffer = on.clone();
+        part_buffer.zakura.bpv1.part_retention_budget_bytes = 12 * GIB;
+        let mut blocks = on.clone();
+        blocks.zakura.bpv1.max_concurrent_blocks = 2_000;
+        for (config, setting, value) in [
+            (
+                &part_buffer,
+                "[network.zakura.bpv1] part_retention_budget_bytes",
+                "12 GiB",
+            ),
+            (
+                &blocks,
+                "[network.zakura.bpv1] max_concurrent_blocks",
+                "2000",
+            ),
+        ] {
+            let refusal = refusal(config, budget_b);
+            assert_eq!(
+                refusal
+                    .raised_reserve_settings
+                    .iter()
+                    .map(|raised| (raised.setting, raised.configured_value.as_str()))
+                    .collect::<Vec<_>>(),
+                [(setting, value)]
+            );
+            let message = refusal.to_string();
+            assert!(
+                message.contains(&format!("{setting} = {value} raises a reserve")),
+                "{message}"
+            );
+        }
+        assert!(refusal(&on, GIB).raised_reserve_settings.is_empty());
     }
 
     /// mem-14 (`overrides-warn`):

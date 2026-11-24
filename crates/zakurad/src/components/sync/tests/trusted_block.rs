@@ -450,7 +450,8 @@ impl Node {
                 if let Request::AdvertiseMinedBlock(block) | Request::AdvertiseBlock(block, None) =
                     &request
                 {
-                    if held {
+                    // Startup gossip can announce genesis after the test enables the hold.
+                    if held && block.hash != genesis_hash {
                         let (release, released) = oneshot::channel();
                         let (finished, cancelled) = oneshot::channel();
                         relay_tx

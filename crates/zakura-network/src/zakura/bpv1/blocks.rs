@@ -1730,12 +1730,17 @@ impl BlockTable {
                     .admitting
                     .remove(&block_id)
                     .expect("admitting entry verified present");
-                step.outputs.push(BlockOutput::ClosePeer {
-                    peer: entry.from_peer,
-                    session_gen: entry.session_gen,
-                    row: Bpv1CloseRow::Row3InvalidHeader,
-                });
-                reject_also(step, block_id, &entry.also_from);
+                // `block_id` is the hash of the header bytes, so every session
+                // in `also_from` sent this same invalid header.
+                for (peer, session_gen) in
+                    std::iter::once((entry.from_peer, entry.session_gen)).chain(entry.also_from)
+                {
+                    step.outputs.push(BlockOutput::ClosePeer {
+                        peer,
+                        session_gen,
+                        row: Bpv1CloseRow::Row3InvalidHeader,
+                    });
+                }
             }
             HeaderAdmissionResult::LocalError => {
                 if let Some(removed) = self.admitting.remove(&block_id) {

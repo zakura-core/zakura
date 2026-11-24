@@ -2,6 +2,7 @@
 //! level-5 named scenarios, tool-4 deterministic
 //! `MachineMesh` (up to 16 nodes), tool-6 adversaries, and tool-9 scripted paths.
 
+use super::close::Bpv1CloseRow;
 use std::time::Duration;
 
 use proptest::prelude::*;
@@ -429,6 +430,93 @@ fn bpv1_75_headers_with_unknown_parents_never_refuse_viable_metadata() {
         .collect();
     assert_eq!(evicted.len(), 1);
     assert_ne!(evicted[0], honest);
+    table.assert_invariants();
+}
+
+/// Returns the sessions the step closed with `row`.
+fn closed_sessions(step: &BlockStep, row: Bpv1CloseRow) -> Vec<(NodeId, u64)> {
+    let mut closed: Vec<(NodeId, u64)> = step
+        .outputs
+        .iter()
+        .filter_map(|o| match o {
+            BlockOutput::ClosePeer {
+                peer,
+                session_gen,
+                row: r,
+            } if *r == row => Some((*peer, *session_gen)),
+            _ => None,
+        })
+        .collect();
+    closed.sort();
+    closed
+}
+
+/// A header that headerchain rejects as the sender's fault closes every
+/// session that sent it, also after it waited for its parent: the block id
+/// hashes the header bytes, so each sent the same invalid header.
+#[test]
+fn invalid_header_closes_every_session_that_sent_it() {
+    let now = Instant::now();
+    let coding = Profile::TINY.derive_coding(64, 2).unwrap();
+    let first = (node_id(2), 1);
+    let second = (node_id(3), 7);
+    let mut both = vec![first, second];
+    both.sort();
+    let send_twice = |table: &mut BlockTable, block_id| {
+        let s = receive(
+            table,
+            now,
+            make_envelope(block_id, coding, [0xAA; 32], node_id(1)),
+        );
+        table.step(
+            now,
+            BlockInput::MetaReceived {
+                envelope: make_envelope(block_id, coding, [0xAA; 32], node_id(1)),
+                from_peer: second.0,
+                session_gen: second.1,
+            },
+        );
+        s
+    };
+
+    // Known parent: admission refuses the header at once.
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let direct = block::Hash([0x31; 32]);
+    let s = send_twice(&mut table, direct);
+    let refused = header_result(&mut table, now, &s, HeaderAdmissionResult::PeerInvalid);
+    assert_eq!(
+        closed_sessions(&refused, Bpv1CloseRow::Row3InvalidHeader),
+        both
+    );
+    table.assert_invariants();
+
+    // Unknown parent: the header waits, its parent arrives, and admission
+    // then refuses it.
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let parent = block::Hash([0x30; 32]);
+    let parked = block::Hash([0x32; 32]);
+    let s = send_twice(&mut table, parked);
+    header_result(
+        &mut table,
+        now,
+        &s,
+        HeaderAdmissionResult::MissingParent {
+            parent_hash: parent,
+        },
+    );
+    let woken = table.step(
+        now,
+        BlockInput::ParentAdmitted {
+            hash: parent,
+            height: 10,
+        },
+    );
+    let refused = header_result(&mut table, now, &woken, HeaderAdmissionResult::PeerInvalid);
+    assert_eq!(
+        closed_sessions(&refused, Bpv1CloseRow::Row3InvalidHeader),
+        both
+    );
+    assert_eq!(table.pending_meta_len(), 0);
     table.assert_invariants();
 }
 

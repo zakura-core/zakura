@@ -78,6 +78,11 @@ TLS, which changed every node ID once, and the handshake requires the hybrid
 key exchange. Key files did not change; bootstrap entries, which name node
 IDs, did.
 
+Since version 0.29 the ALPN is `p2p-v2/5`. The handshake moved to NIST
+security category 5, ML-KEM-1024 in the hybrid key exchange and ML-DSA-87 in
+the composite signature, which changed every node ID again. Key files did
+not change this time either.
+
 A node on this release and a node on an older release reach each other only
 over the legacy protocol. Dual-stack nodes bridge the two cohorts.
 

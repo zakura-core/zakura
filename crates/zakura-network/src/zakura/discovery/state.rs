@@ -22,10 +22,9 @@ use super::protocol::{
     MAX_DISCOVERY_EXCLUDED_NODE_IDS, MAX_SERVICE_SUMMARIES_PER_RESPONSE,
 };
 use super::verified::VerifiedRecord;
-use crate::zakura::GatewayMatch;
 use crate::zakura::{
-    CloseRow, ServiceAdmissionDecision, ServicePeerDirection, ServicePeerSnapshot, ZakuraConnId,
-    ZakuraNetworkId, ZakuraPeerId,
+    CloseRow, GatewayMatch, ServiceAdmissionDecision, ServicePeerDirection, ServicePeerSnapshot,
+    ZakuraConnId, ZakuraNetworkId, ZakuraPeerId,
 };
 
 /// The identity of one discovery stream session: its peer, its connection,

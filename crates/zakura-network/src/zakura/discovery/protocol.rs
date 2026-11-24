@@ -24,13 +24,12 @@ use super::sequence_file::AuthoredSequenceFile;
 use super::state::{DiscoverySessionKey, DiscoveryState, LocalRecordState, SessionRecordError};
 use super::verified::VerifiedRecord;
 use super::wire::{record_len, write_record_body, NODE_ID_BYTES, SIGNATURE_BYTES};
-use crate::zakura::GatewayMatch;
 use crate::zakura::{
     canonical_ip,
     regulation::{SlotBudget, SlotPermit},
-    BlockSyncStatus, HeldPlaces, ServiceAdmissionDecision, ServicePeerDirection, ServicePeerLimits,
-    ServicePeerSnapshot, ZakuraConnId, ZakuraNetworkId, ZakuraPeerId, MAX_BS_BLOCKS_PER_REQUEST,
-    MAX_BS_RESPONSE_BYTES, ZAKURA_ALPN_MISMATCH_BACKOFF,
+    BlockSyncStatus, GatewayMatch, HeldPlaces, ServiceAdmissionDecision, ServicePeerDirection,
+    ServicePeerLimits, ServicePeerSnapshot, ZakuraConnId, ZakuraNetworkId, ZakuraPeerId,
+    MAX_BS_BLOCKS_PER_REQUEST, MAX_BS_RESPONSE_BYTES, ZAKURA_ALPN_MISMATCH_BACKOFF,
 };
 
 mod eviction;

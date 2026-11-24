@@ -34,14 +34,10 @@ impl GatewayIndex {
     /// Returns the nodes the book holds whose ID starts with `gateway`.
     pub(super) fn find(&self, gateway: &GatewayId) -> GatewayMatch<NodeId> {
         let (lowest, highest) = gateway.node_id_bounds();
-        let mut nodes = self
-            .nodes
-            .range(NodeId::from_bytes(&lowest)..=NodeId::from_bytes(&highest));
-        match (nodes.next(), nodes.next()) {
-            (None, _) => GatewayMatch::None,
-            (Some(node), None) => GatewayMatch::One(*node),
-            (Some(_), Some(_)) => GatewayMatch::Several,
-        }
+        self.nodes
+            .range(NodeId::from_bytes(&lowest)..=NodeId::from_bytes(&highest))
+            .take(2)
+            .fold(GatewayMatch::None, |found, node| found.with(*node))
     }
 }
 

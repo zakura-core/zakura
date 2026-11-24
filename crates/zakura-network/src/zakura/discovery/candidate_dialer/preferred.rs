@@ -181,6 +181,11 @@ pub(super) async fn classify_gateways(
         let gateways: Vec<GatewayId> = ranked.iter().map(RankedGateway::gateway).collect();
         discovery.gateway_targets(&gateways).await
     };
+    assert_eq!(
+        book_answers.len(),
+        ranked.len(),
+        "the book answers once per gateway asked, in order",
+    );
 
     let mut classified = ClassifiedGateways::default();
     for (gateway, book_answer) in ranked.iter().zip(book_answers) {

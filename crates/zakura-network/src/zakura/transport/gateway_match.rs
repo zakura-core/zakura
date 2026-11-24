@@ -49,8 +49,8 @@ impl<T: PartialEq> GatewayMatch<T> {
         }
     }
 
-    /// Returns the match for the nodes both `self` and `other` know, which
-    /// all have the same gateway ID.
+    /// Returns the match for the nodes either `self` or `other` knows, each
+    /// counted once. All of them have the same gateway ID.
     pub fn merge(self, other: Self) -> Self {
         match other {
             Self::None => self,

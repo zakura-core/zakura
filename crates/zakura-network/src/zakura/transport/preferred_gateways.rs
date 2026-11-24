@@ -16,9 +16,9 @@
 
 use zakura_chain::miner_mesh::GatewayId;
 use zakura_quic::NodeId;
+use zakura_rt::collections::{HashMap, HashSet};
 
 use super::GatewayMatch;
-use zakura_rt::collections::{HashMap, HashSet};
 
 /// The most connection places a node holds for preferred gateways.
 pub const MAX_PREFERRED_GATEWAYS: usize = 10;

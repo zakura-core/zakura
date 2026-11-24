@@ -10,10 +10,15 @@
 //!
 //! The tests use the Prometheus endpoint to verify admission refusals and
 //! detect replacement connections. Builds without it still check mesh state.
+//!
+//! The longer scenarios in [`extended`] run under the
+//! `miner-mesh-regtest-extended` profile instead.
 
 #![allow(clippy::unwrap_in_result)]
 
 mod common;
+#[path = "miner_mesh_regtest/extended.rs"]
+mod extended;
 
 use std::{collections::HashMap, time::Duration};
 
@@ -23,10 +28,7 @@ use zakura_rpc::client::MeshGatewayState;
 
 #[cfg(feature = "prometheus")]
 use common::regtest_net::FillerRefusal;
-use common::regtest_net::{NodeSpec, RegtestNet, Role};
-
-/// The blocks above a marker before the gateway it names counts.
-const QUALIFYING_DEPTH: u32 = 100;
+use common::regtest_net::{NodeSpec, RegtestNet, Role, QUALIFYING_DEPTH};
 
 /// How long nodes get to learn each other's addresses by peer exchange and
 /// connect.

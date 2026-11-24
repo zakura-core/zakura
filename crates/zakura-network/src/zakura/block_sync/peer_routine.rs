@@ -281,7 +281,7 @@ impl PeerRoutine {
                 trace,
                 memory_pool,
                 conn_credit: None,
-                pool_wait: Mutex::new(None),
+                pool_wait: None,
                 #[cfg(any(test, zakura_sim))]
                 observer: Default::default(),
                 #[cfg(any(test, zakura_sim))]
@@ -434,11 +434,12 @@ impl PeerRoutine {
             if self.io.cancel.is_cancelled() {
                 return Ok(());
             }
-            // missed-wake safety: register all `Notify`s via
-            // `Notified::enable()` BEFORE the fill attempt. These
-            // `Notify`s use `notify_waiters` (no stored permit), so a
-            // release/extend that lands between the fill-check and the await
-            // would be lost if we registered after — the routine would stall.
+            // missed-wake safety: create every `Notified` BEFORE the fill
+            // attempt. These `Notify`s use `notify_waiters` (no stored
+            // permit), which wakes every `Notified` created before the call,
+            // polled or not. A release/extend that lands between the
+            // fill-check and the await therefore still wakes the routine; a
+            // `Notified` created after it would miss it and stall the routine.
             let pool_version_before = memory_pool.capacity_version();
             let capacity = budget.subscribe_capacity().notified();
             let available = work.subscribe_available().notified();

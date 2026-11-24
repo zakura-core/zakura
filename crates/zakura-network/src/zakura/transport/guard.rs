@@ -267,27 +267,21 @@ impl ByteBudget {
         if self.is_closed() {
             return None;
         }
-        let mut reserved = self.inner.reserved_bytes.load(Ordering::Acquire);
-        loop {
-            let next = reserved.checked_add(bytes)?;
-            match self.inner.reserved_bytes.compare_exchange_weak(
-                reserved,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    publish_reserved_change(reserved, next);
-                    #[cfg(any(test, zakura_sim))]
-                    self.observe(BudgetChangeKind::Charged, reserved, next);
-                    return Some(ByteReservation {
-                        budget: self.clone(),
-                        bytes,
-                    });
-                }
-                Err(observed) => reserved = observed,
-            }
-        }
+        let reserved = self
+            .inner
+            .reserved_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |reserved| {
+                reserved.checked_add(bytes)
+            })
+            .ok()?;
+        let next = reserved + bytes;
+        publish_reserved_change(reserved, next);
+        #[cfg(any(test, zakura_sim))]
+        self.observe(BudgetChangeKind::Charged, reserved, next);
+        Some(ByteReservation {
+            budget: self.clone(),
+            bytes,
+        })
     }
 
     pub(crate) fn new(max_bytes: u64) -> Self {
@@ -378,26 +372,18 @@ impl ByteBudget {
         if bytes == 0 {
             return;
         }
-        let mut reserved = self.inner.reserved_bytes.load(Ordering::Acquire);
-        loop {
-            let Some(next) = reserved.checked_sub(bytes) else {
-                self.close(BudgetClosure::CounterUnderflow { release: bytes });
-                break;
-            };
-            match self.inner.reserved_bytes.compare_exchange_weak(
-                reserved,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    publish_reserved_change(reserved, next);
-                    #[cfg(any(test, zakura_sim))]
-                    self.observe(BudgetChangeKind::Released, reserved, next);
-                    break;
-                }
-                Err(observed) => reserved = observed,
+        match self.inner.reserved_bytes.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |reserved| reserved.checked_sub(bytes),
+        ) {
+            Ok(reserved) => {
+                let next = reserved - bytes;
+                publish_reserved_change(reserved, next);
+                #[cfg(any(test, zakura_sim))]
+                self.observe(BudgetChangeKind::Released, reserved, next);
             }
+            Err(_) => self.close(BudgetClosure::CounterUnderflow { release: bytes }),
         }
         released();
         self.inner.capacity.notify_waiters();

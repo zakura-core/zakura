@@ -437,7 +437,10 @@ fn capacity_refused_payload_waits_for_room_for_its_size() {
         Admission::WithinLimit,
         &test_memory_pool(1 << 40),
     );
-    assert!(matches!(refused, Err(AdmissionFailure::Capacity)));
+    assert!(matches!(
+        refused,
+        Err(MaterializeError::Admission(AdmissionFailure::Capacity))
+    ));
     assert_eq!(
         payloads.capacity_refused,
         Some((id, Admission::WithinLimit, size)),
@@ -455,7 +458,10 @@ fn capacity_refused_payload_waits_for_room_for_its_size() {
         Admission::WithinLimit,
         &test_memory_pool(1 << 40),
     );
-    assert!(matches!(skipped, Err(AdmissionFailure::Capacity)));
+    assert!(matches!(
+        skipped,
+        Err(MaterializeError::Admission(AdmissionFailure::Capacity))
+    ));
 
     second.leave_pipeline();
     assert!(pool.has_room_for(size, Admission::WithinLimit));

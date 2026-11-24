@@ -658,7 +658,7 @@ impl PeerIO {
     /// into a take/return spin, and any peer waiting on budget capacity wakes
     /// when capacity actually returns.
     fn fund(
-        &self,
+        &mut self,
         request: TakenRequest,
         download_floor: block::Height,
         verified_tip: block::Height,

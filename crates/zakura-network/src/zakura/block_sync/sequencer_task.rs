@@ -218,21 +218,6 @@ impl SequencedBody {
         }
     }
 
-    /// Attach the pool lease transferred from the work queue for this body.
-    pub(super) fn with_body_lease(
-        mut self,
-        body_lease: Option<crate::zakura::memory::PoolLease>,
-    ) -> Self {
-        self.body_lease = body_lease;
-        self
-    }
-
-    /// This body, completing a request that took `fetch_elapsed`.
-    pub(super) fn with_fetch_elapsed(mut self, fetch_elapsed: Option<Duration>) -> Self {
-        self.fetch_elapsed = fetch_elapsed;
-        self
-    }
-
     /// Transfer this body out of queue ownership before processing it.
     #[cfg(test)]
     pub(super) fn leave_queue(&mut self) {
@@ -512,8 +497,16 @@ pub(super) struct SequencerPayloads {
     /// and its decoded size. Decoding it again before the pool has room for
     /// that size would only repeat the refusal.
     capacity_refused: Option<(super::reorder::BodyId, Admission, u64)>,
-    /// The consumer that refused the last decoded body's lease growth.
-    lease_refused: Option<crate::zakura::memory::Consumer>,
+}
+
+/// Why [`SequencerPayloads::materialize`] could not hand out a decoded body.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum MaterializeError {
+    /// The decoded-block pool refused the body.
+    Admission(AdmissionFailure),
+    /// This consumer refused to grow the body's lease to cover the decoded
+    /// copy. The body stays raw, and the caller waits on the consumer.
+    LeaseRefused(crate::zakura::memory::Consumer),
 }
 
 pub(super) struct MaterializedBody {
@@ -617,8 +610,8 @@ impl SequencerPayloads {
     /// The body's lease grows to cover the decoded copy (`decision-4`). A
     /// commit-window body moves its lease to the reserved `Consumer::Consensus`
     /// first. When neither lease can grow, the body stays raw, its lease
-    /// returns to its wire bytes, and [`Self::take_lease_refusal`] names the
-    /// consumer to wait on.
+    /// returns to its wire bytes, and the error names the consumer to wait
+    /// on.
     #[allow(clippy::unwrap_in_result)] // Ownership invariants must fail loudly.
     pub(super) fn materialize(
         &mut self,
@@ -626,7 +619,7 @@ impl SequencerPayloads {
         pool: &DecodedBlockPool,
         admission: Admission,
         memory_pool: &crate::zakura::memory::MemoryPool,
-    ) -> Result<MaterializedBody, AdmissionFailure> {
+    ) -> Result<MaterializedBody, MaterializeError> {
         let body = self
             .entries
             .get_mut(&id)
@@ -641,7 +634,7 @@ impl SequencerPayloads {
                 && !pool.is_closed()
                 && !pool.has_room_for(decoded_bytes, admission)
             {
-                return Err(AdmissionFailure::Capacity);
+                return Err(MaterializeError::Admission(AdmissionFailure::Capacity));
             }
         }
         let block = match body.decoded_block(pool, admission) {
@@ -650,7 +643,7 @@ impl SequencerPayloads {
                 if refusal.reason == AdmissionFailure::Capacity {
                     self.capacity_refused = Some((id, admission, refusal.decoded_bytes));
                 }
-                return Err(refusal.reason);
+                return Err(MaterializeError::Admission(refusal.reason));
             }
         };
         let decoded_bytes = body.decoded_attributed_memory_size_bytes();
@@ -659,8 +652,7 @@ impl SequencerPayloads {
             if let Err(refused) = lease_decoded_body(lease, target, admission, memory_pool) {
                 body.retain_for_backlog_in_place();
                 lease.shrink_to(*wire_bytes);
-                self.lease_refused = Some(refused);
-                return Err(AdmissionFailure::Capacity);
+                return Err(MaterializeError::LeaseRefused(refused));
             }
         }
         Ok(MaterializedBody {
@@ -668,11 +660,6 @@ impl SequencerPayloads {
             decoded_bytes,
             newly_decoded_wire_bytes,
         })
-    }
-
-    /// The consumer whose refusal kept the last materialized body raw.
-    pub(super) fn take_lease_refusal(&mut self) -> Option<crate::zakura::memory::Consumer> {
-        self.lease_refused.take()
     }
 }
 
@@ -877,6 +864,15 @@ impl SequencerIO {
                 change: HolderChange::Released,
             }
         );
+    }
+
+    /// Apply the policy's payload changes. The observer sees each holder
+    /// change before the lease it frees returns to the pool.
+    fn apply_payload_changes(&mut self, changes: Vec<super::reorder::PayloadChange>) {
+        let deferred = self.payloads.apply_entries(changes);
+        #[cfg(any(test, zakura_sim))]
+        self.observe_holders();
+        self.payloads.settle_leases(deferred);
     }
 
     /// Reports every holder change since the last report, then the
@@ -1097,10 +1093,7 @@ impl SequencerIO {
 
     /// Record one control transition's diagnostics and run its operations.
     async fn apply_control_outputs(&mut self, outputs: state::ControlOutputs) -> bool {
-        let deferred = self.payloads.apply_entries(outputs.payload_changes);
-        #[cfg(any(test, zakura_sim))]
-        self.observe_holders();
-        self.payloads.settle_leases(deferred);
+        self.apply_payload_changes(outputs.payload_changes);
         self.publish_state_metrics();
         if let Some(classified) = outputs.frontier_reset {
             if classified.kind != state::FrontierResetKind::Growth {
@@ -1145,10 +1138,7 @@ impl SequencerIO {
             admitted_estimate_bytes: body.admitted_estimate_bytes,
             supplier: body.supplier,
         });
-        let deferred = self.payloads.apply_entries(payload_changes);
-        #[cfg(any(test, zakura_sim))]
-        self.observe_holders();
-        self.payloads.settle_leases(deferred);
+        self.apply_payload_changes(payload_changes);
         #[cfg(any(test, zakura_sim))]
         if acceptance == BodyAcceptance::StaleScope {
             observe!(
@@ -1258,21 +1248,21 @@ impl SequencerIO {
                 &self.memory_pool,
             ) {
                 Ok(materialized) => materialized,
-                Err(AdmissionFailure::Capacity) => {
-                    match self.payloads.take_lease_refusal() {
-                        Some(consumer) => {
-                            self.pool_capacity_blocked = Some((
-                                pool_version,
-                                consumer,
-                                self.memory_pool.wait_token(consumer),
-                            ));
-                        }
-                        None => self.decoded_capacity_blocked = Some(capacity_version),
-                    }
+                Err(MaterializeError::LeaseRefused(consumer)) => {
+                    self.pool_capacity_blocked = Some((
+                        pool_version,
+                        consumer,
+                        self.memory_pool.wait_token(consumer),
+                    ));
                     self.publish_decoded_ownership_view();
                     break;
                 }
-                Err(_) => {
+                Err(MaterializeError::Admission(AdmissionFailure::Capacity)) => {
+                    self.decoded_capacity_blocked = Some(capacity_version);
+                    self.publish_decoded_ownership_view();
+                    break;
+                }
+                Err(MaterializeError::Admission(_)) => {
                     self.decoded_pool.close();
                     self.publish_decoded_ownership_view();
                     break;
@@ -1316,10 +1306,7 @@ impl SequencerIO {
                     metrics::counter!("sync.block.submit.retry.scheduled").increment(1);
                     self.trace_submission_retry_scheduled(height);
                 }
-                let deferred = self.payloads.apply_entries(refused.payload_changes);
-                #[cfg(any(test, zakura_sim))]
-                self.observe_holders();
-                self.payloads.settle_leases(deferred);
+                self.apply_payload_changes(refused.payload_changes);
                 self.publish_state_metrics();
                 return;
             }

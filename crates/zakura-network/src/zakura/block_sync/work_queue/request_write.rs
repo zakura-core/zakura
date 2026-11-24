@@ -372,61 +372,54 @@ impl UnpublishedRequest {
         if let Some(credit) = &lease.conn_credit {
             credit.add_receive_credit(lease.lease.bytes());
         }
-        let mut rejected_lease = None;
-        let published = {
+        // A rejection returns the lease from the block, so it settles after
+        // the queue lock drops at the block's end.
+        let published = 'publish: {
             let mut inner = claim.work.lock();
             if claim.work.budget.is_closed()
                 || claim.cancel.is_cancelled()
                 || !inner.state.is_unpublished_claim(claim.owner, &claim.items)
             {
-                rejected_lease = Some(lease);
-                false
-            } else {
-                let funded_bytes = funding.bytes();
-                if inner.funding.merge(&mut funding).is_err() {
-                    rejected_lease = Some(lease);
-                    false
-                } else {
-                    let transferred = inner.state.publish_claim(&claim.items);
-                    if transferred != Some(funded_bytes) {
-                        claim.work.budget.close(BudgetClosure::Funding {
-                            logical: inner.state.reserved_bytes(),
-                            funded: inner.funding.bytes(),
-                        });
-                        rejected_lease = Some(lease);
-                        false
-                    } else {
-                        inner.owner_leases.insert(claim.owner, lease);
-                        inner.request_writes.insert(
-                            claim.owner,
-                            RequestWriteRegistration {
-                                claim: downgrade(&claim),
-                                status: claim.status(),
-                            },
-                        );
-                        claim.state.store(QUEUED, Ordering::Release);
-                        report!(claim.reporter, RequestStep::Published);
-                        // The queue transition is complete. Release its lock before unwinding
-                        // a callback so claim cleanup can settle the published reservation.
-                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            publish(&claim)
-                        }));
-                        drop(inner);
-                        if let Err(panic) = result {
-                            std::panic::resume_unwind(panic);
-                        }
-                        true
-                    }
-                }
+                break 'publish Err(lease);
             }
+            let funded_bytes = funding.bytes();
+            if inner.funding.merge(&mut funding).is_err() {
+                break 'publish Err(lease);
+            }
+            if inner.state.publish_claim(&claim.items) != Some(funded_bytes) {
+                claim.work.budget.close(BudgetClosure::Funding {
+                    logical: inner.state.reserved_bytes(),
+                    funded: inner.funding.bytes(),
+                });
+                break 'publish Err(lease);
+            }
+            inner.owner_leases.insert(claim.owner, lease);
+            inner.request_writes.insert(
+                claim.owner,
+                RequestWriteRegistration {
+                    claim: downgrade(&claim),
+                    status: claim.status(),
+                },
+            );
+            claim.state.store(QUEUED, Ordering::Release);
+            report!(claim.reporter, RequestStep::Published);
+            // The queue transition is complete. Release its lock before unwinding
+            // a callback so claim cleanup can settle the published reservation.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| publish(&claim)));
+            drop(inner);
+            if let Err(panic) = result {
+                std::panic::resume_unwind(panic);
+            }
+            Ok(())
         };
-        if let Some(OwnerLease { lease, conn_credit }) = rejected_lease {
+        if let Err(OwnerLease { lease, conn_credit }) = published {
             match conn_credit {
                 Some(credit) => super::finish_receive_credit(&credit, lease.bytes(), Some(lease)),
                 None => drop(lease),
             }
+            return None;
         }
-        published.then_some(claim)
+        Some(claim)
     }
 }
 

@@ -1419,77 +1419,6 @@ impl ThroughputMeter {
 /// p99 range-fetch-time measurement (`02 §4`).
 const RANGE_FETCH_LATENCY_WINDOW: usize = 256;
 
-/// Fixed-size ring buffer measuring the node-wide p99 range fetch time
-/// (`02 §4`), used to size block sync's benefit-derived look-ahead cap:
-/// `2 × commit_rate × p99_range_fetch_time`.
-#[derive(Clone, Debug)]
-pub(super) struct RangeFetchLatencyTracker {
-    samples_us: [u64; RANGE_FETCH_LATENCY_WINDOW],
-    len: usize,
-    cursor: usize,
-}
-
-impl Default for RangeFetchLatencyTracker {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl RangeFetchLatencyTracker {
-    pub(super) const fn new() -> Self {
-        Self {
-            samples_us: [0; RANGE_FETCH_LATENCY_WINDOW],
-            len: 0,
-            cursor: 0,
-        }
-    }
-
-    /// Record one completed block-range fetch duration (`O(1)`, zero allocation).
-    pub(super) fn record(&mut self, elapsed: Duration) {
-        let us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
-        self.samples_us[self.cursor] = us;
-        self.cursor = (self.cursor + 1) % RANGE_FETCH_LATENCY_WINDOW;
-        if self.len < RANGE_FETCH_LATENCY_WINDOW {
-            self.len += 1;
-        }
-    }
-
-    /// 99th percentile of the retained range-fetch durations, or `None` before
-    /// any range fetch has completed.
-    pub(super) fn p99(&self) -> Option<Duration> {
-        if self.len == 0 {
-            return None;
-        }
-        let mut sorted = [0u64; RANGE_FETCH_LATENCY_WINDOW];
-        let slice = &mut sorted[..self.len];
-        slice.copy_from_slice(&self.samples_us[..self.len]);
-        slice.sort_unstable();
-        let rank = (self.len.saturating_mul(99)).div_ceil(100);
-        let idx = rank.saturating_sub(1).min(self.len - 1);
-        Some(Duration::from_micros(slice[idx]))
-    }
-}
-
-/// Derive the look-ahead byte cap from measured commit throughput and p99
-/// range-fetch latency (`02 §4`): `2 × commit_rate × p99_range_fetch_time`,
-/// optionally lowered by `[memory.cap] look_ahead`.
-pub(super) fn derived_look_ahead_bytes(
-    commit_bytes_per_sec: u64,
-    p99_range_fetch_time: Duration,
-    cap_override: Option<u64>,
-) -> u64 {
-    let p99_us = p99_range_fetch_time.as_micros();
-    let raw = 2u128
-        .saturating_mul(u128::from(commit_bytes_per_sec))
-        .saturating_mul(p99_us)
-        / 1_000_000;
-    let derived = u64::try_from(raw).unwrap_or(u64::MAX);
-    match cap_override {
-        Some(cap) => derived.min(cap),
-        None => derived,
-    }
-}
-
 /// How often the sequencer refreshes `Consumer::BlockSync`'s benefit cap.
 pub(super) const LOOK_AHEAD_CAP_TICK: Duration = Duration::from_secs(1);
 
@@ -1506,7 +1435,11 @@ const COMMIT_RATE_DECAY_DIVISOR: u64 = 43;
 /// a few seconds doesn't collapse the look-ahead that would end the stall.
 #[derive(Clone, Debug)]
 pub(super) struct LookAheadCap {
-    fetch_latency: RangeFetchLatencyTracker,
+    /// A ring of the last [`RANGE_FETCH_LATENCY_WINDOW`] completed range-fetch
+    /// durations, in microseconds.
+    fetch_samples_us: [u64; RANGE_FETCH_LATENCY_WINDOW],
+    fetch_samples: usize,
+    fetch_cursor: usize,
     commit_rate_peak: u64,
     /// `[memory.cap] look_ahead`, which lowers the derived look-ahead.
     cap_override: Option<u64>,
@@ -1515,15 +1448,22 @@ pub(super) struct LookAheadCap {
 impl LookAheadCap {
     pub(super) fn new(cap_override: Option<u64>) -> Self {
         Self {
-            fetch_latency: RangeFetchLatencyTracker::new(),
+            fetch_samples_us: [0; RANGE_FETCH_LATENCY_WINDOW],
+            fetch_samples: 0,
+            fetch_cursor: 0,
             commit_rate_peak: 0,
             cap_override,
         }
     }
 
-    /// Record one completed block-range fetch.
+    /// Record one completed block-range fetch (`O(1)`, zero allocation).
     pub(super) fn record_fetch(&mut self, elapsed: Duration) {
-        self.fetch_latency.record(elapsed);
+        let us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        self.fetch_samples_us[self.fetch_cursor] = us;
+        self.fetch_cursor = (self.fetch_cursor + 1) % RANGE_FETCH_LATENCY_WINDOW;
+        if self.fetch_samples < RANGE_FETCH_LATENCY_WINDOW {
+            self.fetch_samples += 1;
+        }
     }
 
     /// Fold one tick's commit rate into the decaying peak, and return the
@@ -1531,12 +1471,40 @@ impl LookAheadCap {
     pub(super) fn tick(&mut self, commit_bytes_per_sec: u64, sum_cwnd: u64) -> u64 {
         let decayed = self.commit_rate_peak - self.commit_rate_peak / COMMIT_RATE_DECAY_DIVISOR;
         self.commit_rate_peak = commit_bytes_per_sec.max(decayed);
-        let look_ahead = self.fetch_latency.p99().map_or(0, |p99| {
-            derived_look_ahead_bytes(self.commit_rate_peak, p99, self.cap_override)
-        });
         sum_cwnd
-            .saturating_add(look_ahead)
+            .saturating_add(self.look_ahead_bytes())
             .max(DEFAULT_BS_BBR_MIN_CWND_BYTES)
+    }
+
+    /// 99th percentile of the retained range-fetch durations, or `None` before
+    /// any range fetch has completed.
+    pub(super) fn p99_fetch_time(&self) -> Option<Duration> {
+        if self.fetch_samples == 0 {
+            return None;
+        }
+        let mut samples = self.fetch_samples_us;
+        let samples = &mut samples[..self.fetch_samples];
+        let rank = (self.fetch_samples.saturating_mul(99)).div_ceil(100);
+        let idx = rank.saturating_sub(1).min(self.fetch_samples - 1);
+        Some(Duration::from_micros(*samples.select_nth_unstable(idx).1))
+    }
+
+    /// The look-ahead from the commit-rate peak and the p99 range-fetch time
+    /// (`02 §4`): `2 × commit_rate × p99_range_fetch_time`, optionally lowered
+    /// by `[memory.cap] look_ahead`. Zero before any range fetch completed.
+    pub(super) fn look_ahead_bytes(&self) -> u64 {
+        let Some(p99) = self.p99_fetch_time() else {
+            return 0;
+        };
+        let raw = 2u128
+            .saturating_mul(u128::from(self.commit_rate_peak))
+            .saturating_mul(p99.as_micros())
+            / 1_000_000;
+        let derived = u64::try_from(raw).unwrap_or(u64::MAX);
+        match self.cap_override {
+            Some(cap) => derived.min(cap),
+            None => derived,
+        }
     }
 }
 

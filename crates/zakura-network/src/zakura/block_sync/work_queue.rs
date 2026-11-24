@@ -1016,7 +1016,7 @@ mod memory_pool_tests {
 
     use super::*;
     use crate::zakura::{
-        block_sync::state::{derived_look_ahead_bytes, LookAheadCap, RangeFetchLatencyTracker},
+        block_sync::state::LookAheadCap,
         memory::{Consumer, ConsumerSpec, MemoryPool, PoolConfig},
     };
 
@@ -1226,33 +1226,33 @@ mod memory_pool_tests {
 
     #[test]
     fn range_fetch_p99_and_derived_look_ahead_cap() {
-        let mut tracker = RangeFetchLatencyTracker::new();
-        assert_eq!(tracker.p99(), None);
+        let mut cap = LookAheadCap::new(None);
+        assert_eq!(cap.p99_fetch_time(), None);
 
         // 99 fast samples at 100 ms + 1 slow tail sample at 2000 ms -> p99 = 100 ms,
         // then 2 slow samples at 2000 ms -> p99 = 2000 ms.
         for _ in 0..99 {
-            tracker.record(Duration::from_millis(100));
+            cap.record_fetch(Duration::from_millis(100));
         }
-        tracker.record(Duration::from_millis(2_000));
-        assert_eq!(tracker.p99(), Some(Duration::from_millis(100)));
+        cap.record_fetch(Duration::from_millis(2_000));
+        assert_eq!(cap.p99_fetch_time(), Some(Duration::from_millis(100)));
 
-        tracker.record(Duration::from_millis(2_000));
-        assert_eq!(tracker.p99(), Some(Duration::from_millis(2_000)));
+        cap.record_fetch(Duration::from_millis(2_000));
+        assert_eq!(cap.p99_fetch_time(), Some(Duration::from_millis(2_000)));
+
+        // Idle at tip (commit_rate == 0) yields 0 look-ahead.
+        assert_eq!(cap.look_ahead_bytes(), 0);
 
         // 2 × 100 MB/s × 2.0 s = 400 MB.
         let rate = 100 * 1024 * 1024;
-        assert_eq!(
-            derived_look_ahead_bytes(rate, Duration::from_secs(2), None),
-            400 * 1024 * 1024
-        );
+        cap.tick(rate, 0);
+        assert_eq!(cap.look_ahead_bytes(), 400 * 1024 * 1024);
+
         // [memory.cap] look_ahead lowers the derived cap.
-        assert_eq!(
-            derived_look_ahead_bytes(rate, Duration::from_secs(2), Some(256 * 1024 * 1024)),
-            256 * 1024 * 1024
-        );
-        // Idle at tip (commit_rate == 0) yields 0 look-ahead.
-        assert_eq!(derived_look_ahead_bytes(0, Duration::from_secs(2), None), 0);
+        let mut capped = LookAheadCap::new(Some(256 * 1024 * 1024));
+        capped.record_fetch(Duration::from_secs(2));
+        capped.tick(rate, 0);
+        assert_eq!(capped.look_ahead_bytes(), 256 * 1024 * 1024);
     }
 
     /// A floor stall that stops commits for a few ticks keeps most of the

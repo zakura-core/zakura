@@ -90,7 +90,7 @@ pub(super) struct PeerIO {
     pub(super) conn_credit: Option<ConnectionCredit>,
     /// Marks the consumer whose refusal stopped the last fill waiting, until
     /// a request leases again. The routine polls that consumer's notifier.
-    pub(super) pool_wait: Mutex<Option<(Consumer, PoolWaitToken)>>,
+    pub(super) pool_wait: Option<(Consumer, PoolWaitToken)>,
     /// Receives the routine's events and snapshots, in test and simulator
     /// builds.
     #[cfg(any(test, zakura_sim))]
@@ -222,36 +222,24 @@ impl PeerIO {
     }
 
     /// Mark `consumer` waiting after its refusal stopped a fill (`02 §5`).
-    pub(super) fn hold_pool_wait(&self, consumer: Consumer) {
-        let mut wait = self
+    pub(super) fn hold_pool_wait(&mut self, consumer: Consumer) {
+        if self
             .pool_wait
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if wait
             .as_ref()
             .is_none_or(|(waiting, _)| *waiting != consumer)
         {
-            *wait = Some((consumer, self.memory_pool.wait_token(consumer)));
+            self.pool_wait = Some((consumer, self.memory_pool.wait_token(consumer)));
         }
     }
 
     /// End the wait after a request leased.
-    pub(super) fn release_pool_wait(&self) {
-        let token = self
-            .pool_wait
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
-        drop(token);
+    pub(super) fn release_pool_wait(&mut self) {
+        self.pool_wait = None;
     }
 
     /// The consumer this routine waits on, if a refusal stopped its fill.
     pub(super) fn pool_wait_consumer(&self) -> Option<Consumer> {
-        self.pool_wait
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .as_ref()
-            .map(|(consumer, _)| *consumer)
+        self.pool_wait.as_ref().map(|(consumer, _)| *consumer)
     }
 
     /// Transition a request's receive-credit lease to a received body lease
@@ -482,7 +470,7 @@ impl PeerIO {
             }
             None => BufferedBlockBody::RawFramePayload(raw_payload),
         };
-        let body = SequencedBody::new_handed_off(
+        let mut body = SequencedBody::new_handed_off(
             owner,
             self.source,
             height,
@@ -498,9 +486,9 @@ impl PeerIO {
             received_at,
             self.sequencer_input_bytes.clone(),
             self.sequencer_input_decoded_attributed_memory_bytes.clone(),
-        )
-        .with_body_lease(Some(body_lease))
-        .with_fetch_elapsed(fetch_elapsed);
+        );
+        body.body_lease = Some(body_lease);
+        body.fetch_elapsed = fetch_elapsed;
 
         // Report retention before sending because the sequencer can dequeue
         // the body immediately on another thread.

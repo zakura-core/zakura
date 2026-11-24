@@ -8,7 +8,7 @@
 //! both directions, mandatory client authentication and no SNI. It differs
 //! from Iroh on the wire in two ways: the raw public key is the node's
 //! credential, its full key list (TLS-3), and the only key-exchange group is
-//! the hybrid X25519MLKEM768 (TLS-9). It also differs in two local choices
+//! the hybrid X25519MLKEM1024 (TLS-9). It also differs in two local choices
 //! that don't change what a peer sees on a full handshake: the server refuses
 //! 0-RTT and issues no session tickets, and the client never resumes
 //! (TLS-10).
@@ -208,14 +208,14 @@ impl TlsConfig {
 
 /// The crypto provider of an endpoint with no injected inputs (TLS-9):
 /// rustls' ring provider whose only key-exchange group is the hybrid
-/// X25519MLKEM768.
+/// X25519MLKEM1024.
 ///
-/// Every `p2p-v2/4` node offers the hybrid, so a classical fallback would
+/// Every node since `p2p-v2/4` offers a hybrid, so a classical fallback would
 /// protect no connection. A peer that offers only classical groups fails the
 /// handshake.
 pub(crate) fn production_provider() -> rustls::crypto::CryptoProvider {
     let mut provider = rustls::crypto::ring::default_provider();
-    provider.kx_groups = vec![hybrid::x25519_mlkem768()];
+    provider.kx_groups = vec![hybrid::x25519_mlkem1024()];
     provider
 }
 
@@ -351,10 +351,7 @@ mod tests {
     fn the_production_provider_is_rings_with_only_the_hybrid_group() {
         let ring = rustls::crypto::ring::default_provider();
         let production = production_provider();
-        assert_eq!(
-            group_names(&production),
-            [rustls::NamedGroup::X25519MLKEM768]
-        );
+        assert_eq!(group_names(&production), [hybrid::X25519_MLKEM1024]);
         assert_eq!(
             format!("{:?}", production.cipher_suites),
             format!("{:?}", ring.cipher_suites)
@@ -396,13 +393,13 @@ mod tests {
 
     impl rustls::crypto::SupportedKxGroup for Altered {
         fn start(&self) -> Result<Box<dyn rustls::crypto::ActiveKeyExchange>, rustls::Error> {
-            let exchange = hybrid::x25519_mlkem768().start()?;
+            let exchange = hybrid::x25519_mlkem1024().start()?;
             let share = (self.alter)(exchange.pub_key().to_vec());
             Ok(Box::new(AlteredExchange { exchange, share }))
         }
 
         fn name(&self) -> rustls::NamedGroup {
-            rustls::NamedGroup::X25519MLKEM768
+            hybrid::X25519_MLKEM1024
         }
     }
 
@@ -575,10 +572,7 @@ mod tests {
     fn two_production_endpoints_use_the_hybrid_group() {
         assert_eq!(
             handshake(TlsConfig::new, TlsConfig::new),
-            (
-                rustls::NamedGroup::X25519MLKEM768,
-                rustls::HandshakeKind::Full
-            )
+            (hybrid::X25519_MLKEM1024, rustls::HandshakeKind::Full)
         );
     }
 
@@ -632,7 +626,7 @@ mod tests {
         };
         let credential = NodeCredential::from_entries([
             own(crate::ED25519_KEY_TAG),
-            own(crate::ML_DSA_44_KEY_TAG),
+            own(crate::ML_DSA_87_KEY_TAG),
             (0x0102, vec![0x5A; 1_312]),
         ])
         .unwrap();

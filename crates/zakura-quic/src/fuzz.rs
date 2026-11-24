@@ -11,7 +11,7 @@ use std::sync::OnceLock;
 use blake2b_simd::Params;
 
 use crate::{
-    composite::{self, COMPOSITE_SIGNATURE_BYTES, ML_DSA_44_KEY_TAG, ML_DSA_44_SIGNATURE_BYTES},
+    composite::{self, COMPOSITE_SIGNATURE_BYTES, ML_DSA_87_KEY_TAG, ML_DSA_87_SIGNATURE_BYTES},
     credential::{NodeCredential, MAX_CREDENTIAL_KEY_BYTES},
     key::{NodeId, NodeKey, NodeSecretKey, KEY_LENGTH},
     key_list::{NodeKeyList, ED25519_KEY_TAG},
@@ -46,14 +46,14 @@ const CREDENTIAL_ALGORITHM_DER: &[u8] = &[
 ];
 
 /// Length of the Ed25519 half of a composite signature.
-const ED25519_SIGNATURE_BYTES: usize = COMPOSITE_SIGNATURE_BYTES - ML_DSA_44_SIGNATURE_BYTES;
+const ED25519_SIGNATURE_BYTES: usize = COMPOSITE_SIGNATURE_BYTES - ML_DSA_87_SIGNATURE_BYTES;
 
 /// The most edits one composite input applies to the honest witness.
 const MAX_WITNESS_EDITS: usize = 64;
 
 /// The longest field a witness edit can resize to, in bytes. It exceeds every
 /// length the verifier accepts.
-const MAX_WITNESS_FIELD_BYTES: usize = 4_096;
+const MAX_WITNESS_FIELD_BYTES: usize = 8_192;
 
 /// The seed of the node whose signature is the honest witness.
 const WITNESS_SEED: [u8; KEY_LENGTH] = [7; KEY_LENGTH];
@@ -288,7 +288,7 @@ pub enum CompositeReplay {
 /// Verifies one composite signature that `data` describes.
 ///
 /// The first byte's low bit picks the layout. With it clear, the rest is an
-/// Ed25519 key, a `u16`-prefixed ML-DSA-44 key, a `u16`-prefixed message and
+/// Ed25519 key, a `u16`-prefixed ML-DSA-87 key, a `u16`-prefixed message and
 /// the signature, each length cut to the bytes left. With it set, the rest is
 /// up to [`MAX_WITNESS_EDITS`] four-byte edits of an honest signature, so a
 /// campaign explores near-valid signatures without a corpus. Each input
@@ -347,8 +347,8 @@ fn witness() -> &'static Witness {
             ed25519: *secret.public_key().as_bytes(),
             ml_dsa: secret
                 .credential()
-                .key(ML_DSA_44_KEY_TAG)
-                .expect("a seed-derived credential holds its ML-DSA-44 key")
+                .key(ML_DSA_87_KEY_TAG)
+                .expect("a seed-derived credential holds its ML-DSA-87 key")
                 .to_vec(),
             message: WITNESS_MESSAGE.to_vec(),
             signature: secret
@@ -361,9 +361,9 @@ fn witness() -> &'static Witness {
 /// Applies `data`'s edits to the witness and verifies the result.
 ///
 /// Each edit is four bytes: a field selector, a little-endian `u16` and a
-/// value. Selectors 0 to 3 XOR the value into the Ed25519 key, the ML-DSA-44
+/// value. Selectors 0 to 3 XOR the value into the Ed25519 key, the ML-DSA-87
 /// key, the message or the signature at the `u16`'s offset; 4 to 6 resize the
-/// ML-DSA-44 key, the message or the signature to the `u16`'s length, up to
+/// ML-DSA-87 key, the message or the signature to the `u16`'s length, up to
 /// [`MAX_WITNESS_FIELD_BYTES`], filling with the value.
 fn replay_witness(data: &[u8]) -> CompositeReplay {
     let honest = witness();
@@ -515,7 +515,7 @@ fn credential_seeds() -> Vec<Seed> {
                 2,
                 &[
                     (ED25519_KEY_TAG, &ed),
-                    (ML_DSA_44_KEY_TAG, &[2; KEY_LENGTH]),
+                    (ML_DSA_87_KEY_TAG, &[2; KEY_LENGTH]),
                 ],
             ),
         ),
@@ -599,7 +599,7 @@ fn composite_seeds() -> Vec<Seed> {
         bytes.extend_from_slice(&honest.signature);
         bytes
     };
-    // Selector 3 flips a bit of the signature's ML-DSA-44 half; 6 truncates it.
+    // Selector 3 flips a bit of the signature's ML-DSA-87 half; 6 truncates it.
     let ml_dsa_half = u16::try_from(ED25519_SIGNATURE_BYTES).expect("64 fits a u16");
     let [low, high] = ml_dsa_half.to_le_bytes();
 

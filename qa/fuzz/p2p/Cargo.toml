@@ -28,7 +28,7 @@ discovery_query = { decoder = 1, properties = ["discovery/query-ownership", "dis
 discovery_candidate = { decoder = 2, properties = ["discovery/dial-attempts", "discovery/preferred-dials"] }
 credential_parse = { decoder = 1, properties = ["credential/canonical-encoding", "credential/node-id", "credential/bounded-parse"] }
 key_list_decode = { decoder = 1, properties = ["key-list/canonical-encoding", "key-list/stable-id"] }
-composite_verify = { decoder = 1, properties = ["composite/tamper-refused"] }
+composite_verify = { decoder = 2, properties = ["composite/tamper-refused"] }
 
 [dependencies]
 libfuzzer-sys = "0.4"

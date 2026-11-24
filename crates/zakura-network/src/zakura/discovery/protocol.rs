@@ -4416,7 +4416,7 @@ mod tests {
     use std::{net::IpAddr, time::Duration};
 
     use rand_10::{rngs::StdRng, SeedableRng};
-    use zakura_quic::{NodeCredential, NodeSecretKey, ED25519_KEY_TAG, ML_DSA_44_KEY_TAG};
+    use zakura_quic::{NodeCredential, NodeSecretKey, ED25519_KEY_TAG, ML_DSA_87_KEY_TAG};
 
     use super::*;
     use crate::zakura::{
@@ -9142,7 +9142,7 @@ mod tests {
         let own = |tag| (tag, signer.credential().key(tag).unwrap().to_vec());
         let credential = NodeCredential::from_entries([
             own(ED25519_KEY_TAG),
-            own(ML_DSA_44_KEY_TAG),
+            own(ML_DSA_87_KEY_TAG),
             (UNREADABLE_KEY_TAG, vec![0x55; 1_312]),
         ])
         .expect("two entries in increasing tag order are a valid credential");

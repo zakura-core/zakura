@@ -17,7 +17,7 @@ use std::{
 };
 
 use crate::{
-    inputs::ProviderWatch, tls::hybrid::X25519MlKem768, EndpointInputs, NodeSecretKey, KEY_LENGTH,
+    inputs::ProviderWatch, tls::hybrid::X25519MlKem1024, EndpointInputs, NodeSecretKey, KEY_LENGTH,
 };
 use curve25519_dalek::montgomery::MontgomeryPoint;
 use quinn_proto::{ConnectionId, ConnectionIdGenerator, InvalidCid};
@@ -371,7 +371,7 @@ impl ConnectionIdGenerator for SeededCidGenerator {
 }
 
 /// The TLS random source and key-exchange groups of one node: X25519, which
-/// the slot is itself, and the hybrid X25519MLKEM768 built on it
+/// the slot is itself, and the hybrid X25519MLKEM1024 built on it
 /// ([`TlsSlot::hybrid`]).
 ///
 /// rustls holds them as `&'static`, so each slot is leaked once and reused.
@@ -384,7 +384,7 @@ impl ConnectionIdGenerator for SeededCidGenerator {
 struct TlsSlot {
     state: Mutex<SlotState>,
     /// The hybrid group, leaked on first use and kept for the slot's life.
-    hybrid: OnceLock<&'static X25519MlKem768>,
+    hybrid: OnceLock<&'static X25519MlKem1024>,
 }
 
 /// Who holds a slot.
@@ -416,12 +416,12 @@ impl TlsSlot {
         self.state().streams.clone()
     }
 
-    /// The seeded X25519MLKEM768: the production combiner over this slot's
+    /// The seeded X25519MLKEM1024: the production combiner over this slot's
     /// X25519 group, with ML-KEM drawing from the same key-exchange stream.
     fn hybrid(&'static self) -> &'static dyn SupportedKxGroup {
         *self.hybrid.get_or_init(|| {
             let random: &'static KeyExchangeRandom = Box::leak(Box::new(KeyExchangeRandom(self)));
-            Box::leak(Box::new(X25519MlKem768::new(self, random)))
+            Box::leak(Box::new(X25519MlKem1024::new(self, random)))
         })
     }
 }

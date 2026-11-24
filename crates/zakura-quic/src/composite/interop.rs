@@ -1,11 +1,11 @@
-//! The composite's ML-DSA-44 half against an independent implementation,
+//! The composite's ML-DSA-87 half against an independent implementation,
 //! RustCrypto's `ml-dsa`, through bytes it produced once, offline.
 //!
-//! `rustcrypto_ml_dsa_44.json` was recorded on 2026-11-22 by a throwaway
+//! `rustcrypto_ml_dsa_87.json` was recorded on 2026-11-24 by a throwaway
 //! program outside this repository, built on `ml-dsa` 0.1.2 from crates.io
 //! with default features off. It isn't a dependency here. From the file's
 //! `mlDsaSeed` (the ID-13 seed of the node seed `seed`) the program took
-//! `SigningKey::<MlDsa44>::from_seed`, and recorded:
+//! `SigningKey::<MlDsa87>::from_seed`, and recorded:
 //!
 //! - `publicKey`: `verifying_key().encode()`;
 //! - the hedged signature: `expanded_key().sign_internal(&[&[0, 35], CONTEXT,
@@ -14,11 +14,10 @@
 //! - the deterministic signature: `expanded_key().sign_deterministic(message,
 //!   CONTEXT)`.
 //!
-//! `CONTEXT` is the TLS-4 context. The same program also checked our side:
-//! `verify_with_context` accepted the ML-DSA half of
-//! `ed25519_mldsa44_kat.json` under `CONTEXT` and refused it under the empty
-//! context, and `sign_internal` with that file's randomness reproduced the
-//! half byte for byte.
+//! `CONTEXT` is the TLS-4 context. The same program made the ML-DSA half of
+//! `ed25519_mldsa87_kat.json`, with `sign_internal` and that file's
+//! randomness, and checked that `verify_with_context` accepts each recorded
+//! signature under `CONTEXT` and refuses it under the empty context.
 
 use serde::Deserialize;
 
@@ -47,7 +46,7 @@ struct RecordedSignature {
 }
 
 fn recorded() -> Recorded {
-    serde_json::from_str(include_str!("rustcrypto_ml_dsa_44.json")).unwrap()
+    serde_json::from_str(include_str!("rustcrypto_ml_dsa_87.json")).unwrap()
 }
 
 /// Decodes a hex field of a fixed length.
@@ -55,7 +54,7 @@ fn array<const N: usize>(text: &str) -> [u8; N] {
     hex::decode(text).unwrap().try_into().unwrap()
 }
 
-/// Both implementations derive the same ML-DSA-44 public key from the same
+/// Both implementations derive the same ML-DSA-87 public key from the same
 /// seed, and the recorded context is the one the composite signs under.
 #[test]
 fn rustcrypto_derives_the_same_public_key() {

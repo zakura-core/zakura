@@ -36,7 +36,8 @@ mod eviction;
 mod gateway_index;
 
 use eviction::EvictionIndex;
-use gateway_index::{GatewayIndex, GatewayMatch};
+use gateway_index::GatewayIndex;
+pub(crate) use gateway_index::GatewayMatch;
 
 /// Native discovery stream kind.
 pub const ZAKURA_STREAM_DISCOVERY: u16 = 4;

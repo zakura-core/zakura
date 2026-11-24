@@ -78,7 +78,9 @@ impl ConnectionPlaces {
                 gateway_id: gateway.gateway,
                 blocks: gateway.blocks,
                 place,
-                connected: gateway.node.is_some_and(|node| registered.contains(&node)),
+                connected: gateway
+                    .node()
+                    .is_some_and(|node| registered.contains(&node)),
             })
             .collect();
         let mut peers: Vec<ConnectedPeer> = registered

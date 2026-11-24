@@ -23,9 +23,8 @@ fn raw_node(prefix: u8, last: u8) -> NodeId {
 fn unresolved(node: NodeId, blocks: u32) -> RankedGateway {
     RankedGateway {
         gateway: GatewayId::from_node_id(node.as_bytes()),
-        node: None,
         blocks,
-        standing: GatewayStanding::Unmatched,
+        resolution: GatewayResolution::Unknown,
     }
 }
 
@@ -47,7 +46,7 @@ fn places_read_each_standing_against_the_set() {
 
     let places: Vec<_> = formed
         .places()
-        .map(|(gateway, place)| (gateway.node, place))
+        .map(|(gateway, place)| (gateway.node(), place))
         .collect();
     assert_eq!(
         places,
@@ -197,15 +196,14 @@ proptest! {
             .map(|&(seed, blocks, standing)| gateway(seed, blocks, standing))
             .collect();
         let formed = PreferredGateways::form(ranking, hold_limit);
-        let matched = formed.ranking.iter().filter(|g| g.standing.matched()).count();
+        let matched = formed.ranking.iter().filter(|g| g.is_matched()).count();
         prop_assert!(formed.hold() <= hold_limit.min(MAX_PREFERRED_GATEWAYS));
         prop_assert!(formed.hold() <= matched);
         prop_assert!(formed.set().len() <= formed.hold());
         let available: Vec<NodeId> = formed
             .ranking
             .iter()
-            .filter(|g| g.standing.available())
-            .filter_map(|g| g.node)
+            .filter_map(RankedGateway::available_node)
             .collect();
         prop_assert_eq!(formed.set(), &available[..formed.hold().min(available.len())]);
         prop_assert!(formed
@@ -249,8 +247,8 @@ proptest! {
         let formed = PreferredGateways::form(ranking, hold_limit);
         let caller = node(caller);
         let mut ranking = formed.ranking.clone();
-        if let Some(entry) = ranking.iter_mut().find(|entry| entry.node == Some(caller)) {
-            entry.standing = GatewayStanding::Connected;
+        if let Some(entry) = ranking.iter_mut().find(|entry| entry.node() == Some(caller)) {
+            entry.resolution = GatewayResolution::Node(caller, GatewayStanding::Connected);
         }
         let expected = PreferredGateways::form(ranking, hold_limit);
         let actual = formed.with_connected(&caller).unwrap_or(formed);
@@ -275,7 +273,7 @@ fn a_connecting_node_resolves_its_gateway_id() {
     assert_eq!(
         connected
             .places()
-            .map(|(gateway, place)| (gateway.node, place))
+            .map(|(gateway, place)| (gateway.node(), place))
             .collect::<Vec<_>>(),
         vec![(Some(caller), GatewayPlace::Preferred)]
     );
@@ -322,7 +320,7 @@ fn a_second_node_with_one_gateway_id_fails_closed() {
     assert_eq!(
         shared
             .places()
-            .map(|(gateway, place)| (gateway.node, place))
+            .map(|(gateway, place)| (gateway.node(), place))
             .collect::<Vec<_>>(),
         vec![(None, GatewayPlace::Ambiguous)]
     );
@@ -330,5 +328,37 @@ fn a_second_node_with_one_gateway_id_fails_closed() {
         shared.with_connected(&member),
         None,
         "an ambiguous gateway stays ambiguous"
+    );
+}
+
+/// Only a proved connection resolves a gateway: a node that keeps an
+/// unproved outbound slot changes no gateway that does not already name it.
+#[test]
+fn an_unproved_dial_resolves_no_gateway() {
+    let dialed = raw_node(1, 0x00);
+    let sharing = raw_node(1, 0xff);
+
+    let unknown = PreferredGateways::form([unresolved(dialed, 5)], 1);
+    assert_eq!(unknown.with_dialing(&dialed), None);
+
+    let named = PreferredGateways::form(
+        [RankedGateway::of_node(
+            dialed,
+            5,
+            GatewayStanding::Connected,
+        )],
+        1,
+    );
+    assert_eq!(named.with_dialing(&sharing), None);
+
+    let dialing = named
+        .with_dialing(&dialed)
+        .expect("the gateway already names the dialed node");
+    assert_eq!(
+        dialing
+            .places()
+            .map(|(gateway, _)| gateway.resolution)
+            .collect::<Vec<_>>(),
+        vec![GatewayResolution::Node(dialed, GatewayStanding::Dialing)]
     );
 }

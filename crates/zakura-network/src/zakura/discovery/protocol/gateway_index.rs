@@ -21,6 +21,17 @@ pub(crate) enum GatewayMatch {
     Several,
 }
 
+impl GatewayMatch {
+    /// Returns the match once `node`, which has the gateway ID, is known too.
+    pub(crate) fn with(self, node: NodeId) -> Self {
+        match self {
+            Self::None => Self::One(node),
+            Self::One(known) if known == node => self,
+            Self::One(_) | Self::Several => Self::Several,
+        }
+    }
+}
+
 /// Every node the book holds, by a signed record or as a static candidate.
 ///
 /// A `NodeId` orders as its bytes, so the node IDs a gateway ID is a prefix

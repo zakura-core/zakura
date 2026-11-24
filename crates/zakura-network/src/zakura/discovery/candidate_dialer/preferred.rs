@@ -20,11 +20,11 @@ use zakura_rt::{
 };
 
 use super::super::protocol::{
-    DialTarget, GatewayTarget, ZakuraDiscoveryDialCandidate, ZakuraDiscoveryHandle,
+    DialTarget, GatewayMatch, GatewayTarget, ZakuraDiscoveryDialCandidate, ZakuraDiscoveryHandle,
 };
 use super::discovery_node_addr_with_reserved_ip_capacity;
 use super::state::{CandidateDialerState, DialAttemptKey};
-use crate::zakura::{GatewayStanding, RankedGateway, MAX_RANKED_GATEWAYS};
+use crate::zakura::{GatewayResolution, GatewayStanding, RankedGateway, MAX_RANKED_GATEWAYS};
 
 /// Mining gateways ranked by how many recent best-chain blocks name them.
 ///
@@ -53,8 +53,9 @@ pub struct MinerGateway {
 }
 
 /// Converts `ranking` to the gateways the dialer can rank, best first, at
-/// most [`MAX_RANKED_GATEWAYS`] plus ties at the cutoff. Their standings are
-/// [`GatewayStanding::Unmatched`] until [`classify_gateways`] reads them.
+/// most [`MAX_RANKED_GATEWAYS`] plus ties at the cutoff. Each one names no
+/// node ([`GatewayResolution::Unknown`]) until [`classify_gateways`] resolves
+/// it.
 ///
 /// It drops entries with no blocks, the gateway ID of `local_node_id`, and
 /// repeats of an ID, keeping the repeat with the most blocks. A node never
@@ -82,9 +83,8 @@ fn rank_gateways(ranking: &MinerGatewayRanking, local_node_id: NodeId) -> Vec<Ra
         .filter(|gateway| gateway.gateway_id != local_gateway)
         .map(|gateway| RankedGateway {
             gateway: gateway.gateway_id,
-            node: None,
             blocks: gateway.blocks,
-            standing: GatewayStanding::Unmatched,
+            resolution: GatewayResolution::Unknown,
         })
         .collect();
     // Admission resolves cutoff ties against the live authenticated connections.
@@ -171,55 +171,61 @@ pub(super) async fn classify_gateways(
     let registered: HashSet<NodeId> = registered.iter().copied().collect();
     let in_flight: HashSet<NodeId> = state.in_flight_node_ids().into_iter().collect();
 
-    let (candidates, tied) = ranked.split_at(ranked.len().min(MAX_RANKED_GATEWAYS));
-    let mut resolved = candidates.to_vec();
-    let by_gateway: HashMap<GatewayId, usize> = resolved
-        .iter()
-        .enumerate()
-        .map(|(index, gateway)| (gateway.gateway, index))
-        .collect();
+    // The registered and in-flight nodes each ranked gateway ID names.
+    let ranked_ids: HashSet<GatewayId> = ranked.iter().map(|gateway| gateway.gateway).collect();
+    let mut local: HashMap<GatewayId, GatewayMatch> = HashMap::default();
     for node in registered.iter().chain(&in_flight) {
-        if let Some(&index) = by_gateway.get(&GatewayId::from_node_id(node.as_bytes())) {
-            resolved[index] = resolved[index].with_node(*node);
+        let gateway = GatewayId::from_node_id(node.as_bytes());
+        if ranked_ids.contains(&gateway) {
+            let known = local.entry(gateway).or_insert(GatewayMatch::None);
+            *known = known.with(*node);
         }
     }
 
-    let gateways: Vec<GatewayId> = resolved.iter().map(|gateway| gateway.gateway).collect();
-    let book_answers = if gateways.is_empty() {
+    let book_answers = if ranked.is_empty() {
         Vec::new()
     } else {
+        let gateways: Vec<GatewayId> = ranked.iter().map(|gateway| gateway.gateway).collect();
         discovery.gateway_targets(&gateways).await
     };
 
     let mut classified = ClassifiedGateways::default();
-    for (gateway, book_answer) in resolved.into_iter().zip(book_answers) {
-        let (mut gateway, book_target) = match book_answer {
-            GatewayTarget::Unknown => (gateway, None),
-            GatewayTarget::Ambiguous => (gateway.into_ambiguous(), None),
-            GatewayTarget::Node(node, target) => (gateway.with_node(node), Some(target)),
-        };
-        if let Some(node) = gateway.node {
-            gateway.standing = if registered.contains(&node) {
-                GatewayStanding::Connected
-            } else if in_flight.contains(&node) {
-                GatewayStanding::Dialing
-            } else {
-                let target = book_target.expect(
-                    "a node that is neither registered nor in flight came from the book, \
-                     which said how to dial it",
-                );
+    for (gateway, book_answer) in ranked.iter().zip(book_answers) {
+        let local = local
+            .get(&gateway.gateway)
+            .copied()
+            .unwrap_or(GatewayMatch::None);
+        let resolution = match (local, book_answer) {
+            (GatewayMatch::Several, _) | (_, GatewayTarget::Ambiguous) => {
+                GatewayResolution::Ambiguous
+            }
+            (GatewayMatch::One(node), GatewayTarget::Node(booked, _)) if booked != node => {
+                GatewayResolution::Ambiguous
+            }
+            (GatewayMatch::One(node), _) => {
+                let standing = if registered.contains(&node) {
+                    GatewayStanding::Connected
+                } else {
+                    GatewayStanding::Dialing
+                };
+                GatewayResolution::Node(node, standing)
+            }
+            (GatewayMatch::None, GatewayTarget::Node(node, target)) => {
                 let standing = dialer_standing(state, &target, now);
                 if let (GatewayStanding::Dialable, DialTarget::Dialable(candidate)) =
                     (standing, target)
                 {
                     classified.dialable.insert(node, candidate);
                 }
-                standing
-            };
-        }
-        classified.ranking.push(gateway);
+                GatewayResolution::Node(node, standing)
+            }
+            (GatewayMatch::None, GatewayTarget::Unknown) => GatewayResolution::Unknown,
+        };
+        classified.ranking.push(RankedGateway {
+            resolution,
+            ..*gateway
+        });
     }
-    classified.ranking.extend_from_slice(tied);
     classified
 }
 
@@ -537,9 +543,8 @@ mod tests {
     fn unresolved(node_id: NodeId, blocks: u32) -> RankedGateway {
         RankedGateway {
             gateway: gateway_id(node_id),
-            node: None,
             blocks,
-            standing: GatewayStanding::Unmatched,
+            resolution: GatewayResolution::Unknown,
         }
     }
 
@@ -751,38 +756,21 @@ mod tests {
         )
         .await;
 
-        let standings: Vec<_> = classified
+        let resolutions: Vec<_> = classified
             .ranking
             .iter()
-            .map(|gateway| gateway.standing)
+            .map(|gateway| gateway.resolution)
             .collect();
         assert_eq!(
-            standings,
+            resolutions,
             vec![
-                GatewayStanding::Connected,
-                GatewayStanding::Dialing,
-                GatewayStanding::Dialable,
-                GatewayStanding::Backoff,
-                GatewayStanding::Unmatched,
-                GatewayStanding::Connected,
-                GatewayStanding::Backoff,
-            ]
-        );
-        let nodes: Vec<_> = classified
-            .ranking
-            .iter()
-            .map(|gateway| gateway.node)
-            .collect();
-        assert_eq!(
-            nodes,
-            vec![
-                Some(connected),
-                Some(dialing),
-                Some(dialable),
-                Some(backoff),
-                None,
-                Some(connected_and_dialing),
-                Some(dialer_backoff),
+                GatewayResolution::Node(connected, GatewayStanding::Connected),
+                GatewayResolution::Node(dialing, GatewayStanding::Dialing),
+                GatewayResolution::Node(dialable, GatewayStanding::Dialable),
+                GatewayResolution::Node(backoff, GatewayStanding::Backoff),
+                GatewayResolution::Unknown,
+                GatewayResolution::Node(connected_and_dialing, GatewayStanding::Connected),
+                GatewayResolution::Node(dialer_backoff, GatewayStanding::Backoff),
             ],
             "each gateway ID resolves to the one known node that starts with it",
         );
@@ -826,8 +814,10 @@ mod tests {
 
         let classified = classify_with(&[unresolved(named, 1)], &[other], &[named]).await;
 
-        assert_eq!(classified.ranking[0].node, Some(named));
-        assert_eq!(classified.ranking[0].standing, GatewayStanding::Dialable);
+        assert_eq!(
+            classified.ranking[0].resolution,
+            GatewayResolution::Node(named, GatewayStanding::Dialable)
+        );
         assert_eq!(
             classified.dialable.keys().copied().collect::<Vec<_>>(),
             vec![named]
@@ -835,8 +825,7 @@ mod tests {
 
         let classified = classify_with(&[unresolved(named, 1)], &[other], &[other]).await;
 
-        assert_eq!(classified.ranking[0].node, None);
-        assert_eq!(classified.ranking[0].standing, GatewayStanding::Unmatched);
+        assert_eq!(classified.ranking[0].resolution, GatewayResolution::Unknown);
         assert!(classified.dialable.is_empty());
     }
 
@@ -857,11 +846,31 @@ mod tests {
             let classified = classify_with(&ranked, &registered, &book).await;
 
             assert_eq!(
-                (classified.ranking[0].node, classified.ranking[0].standing),
-                (None, GatewayStanding::Ambiguous),
+                classified.ranking[0].resolution,
+                GatewayResolution::Ambiguous,
                 "registered {registered:?}, book {book:?}",
             );
             assert!(classified.dialable.is_empty());
         }
+    }
+
+    /// A gateway tied at the cutoff, past the first 256, resolves through the
+    /// book too, so a gateway ID two booked nodes share fails closed there.
+    #[tokio::test]
+    async fn a_gateway_tied_at_the_cutoff_resolves_like_the_others() {
+        let tied = raw_node_id(1, 0x00);
+        let sharing = raw_node_id(1, 0xff);
+        let mut ranked: Vec<_> = (0..MAX_RANKED_GATEWAYS)
+            .map(|_| unresolved(NodeSecretKey::generate().public(), 1))
+            .collect();
+        ranked.push(unresolved(tied, 1));
+
+        let classified = classify_with(&ranked, &[], &[tied, sharing]).await;
+
+        assert_eq!(classified.ranking.len(), MAX_RANKED_GATEWAYS + 1);
+        assert_eq!(
+            classified.ranking[MAX_RANKED_GATEWAYS].resolution,
+            GatewayResolution::Ambiguous
+        );
     }
 }

@@ -10,7 +10,7 @@ mod slots;
 use slots::ConnectionSlots;
 pub use slots::{SlotClass, SlotCount, SlotRefusal, SlotSplit};
 
-use super::{GatewayRanking, GatewayStanding, PreferredGateways};
+use super::{GatewayRanking, GatewayResolution, GatewayStanding, PreferredGateways};
 use crate::zakura::regulation::Bucket;
 use crate::zakura::{admission_host, Cadence, DEFAULT_ZAKURA_REDIAL_INITIAL_BACKOFF};
 
@@ -352,8 +352,21 @@ impl HandshakeCounts {
             .copied()
             .collect();
         let mut live = ranking.candidates(owners.iter());
-        // An owner that connected after discovery took its snapshot names
-        // the gateway with its gateway ID, or makes it ambiguous.
+        // A node discovery found connected may have lost its proof since.
+        for gateway in &mut live {
+            if let GatewayResolution::Node(node, standing) = &mut gateway.resolution {
+                if *standing == GatewayStanding::Connected && !authenticated(node) {
+                    *standing = if self.connections.of_node(node).outbound > 0 {
+                        GatewayStanding::Dialing
+                    } else {
+                        GatewayStanding::Backoff
+                    };
+                }
+            }
+        }
+        // Every proved owner connects the gateway its ID names. An owner that
+        // connected after discovery's snapshot resolves that gateway, or makes
+        // it ambiguous when the snapshot named another node.
         let by_gateway: HashMap<GatewayId, usize> = live
             .iter()
             .enumerate()
@@ -361,21 +374,7 @@ impl HandshakeCounts {
             .collect();
         for owner in &owners {
             if let Some(&index) = by_gateway.get(&GatewayId::from_node_id(owner.as_bytes())) {
-                live[index] = live[index].with_node(*owner);
-            }
-        }
-        for gateway in &mut live {
-            let Some(node) = gateway.node else {
-                continue;
-            };
-            if authenticated(&node) {
-                gateway.standing = GatewayStanding::Connected;
-            } else if gateway.standing == GatewayStanding::Connected {
-                gateway.standing = if self.connections.of_node(&node).outbound > 0 {
-                    GatewayStanding::Dialing
-                } else {
-                    GatewayStanding::Backoff
-                };
+                live[index] = live[index].connected_as(*owner);
             }
         }
         self.preferred =
@@ -417,8 +416,7 @@ impl HandshakeCounts {
         let updated = if slots.total() == 0 {
             self.preferred.with_released(&node)
         } else if slots.inbound == 0 && !self.authenticated_dials.contains_key(&node) {
-            self.preferred
-                .with_standing(&node, GatewayStanding::Dialing)
+            self.preferred.with_dialing(&node)
         } else {
             None
         };

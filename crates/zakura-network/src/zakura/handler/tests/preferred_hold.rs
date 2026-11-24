@@ -7,7 +7,9 @@
 //! target's node ID the same way, so an outbound claim stands for each.
 
 use super::*;
-use crate::zakura::{GatewayStanding, RankedGateway, SlotSplit};
+use zakura_chain::miner_mesh::GatewayId;
+
+use crate::zakura::{GatewayResolution, GatewayStanding, RankedGateway, SlotSplit};
 
 fn handler_from_config(config: &Config) -> ZakuraProtocolHandler {
     let limits = ZakuraLocalLimits::from_config(config);
@@ -554,7 +556,8 @@ fn ranking_publication_reconciles_authenticated_slots() {
         drop(slot);
         assert_eq!(preferred_set(&handler), [challenger]);
         let mut stale_connected = stale;
-        stale_connected[1].standing = GatewayStanding::Connected;
+        stale_connected[1].resolution =
+            GatewayResolution::Node(incumbent, GatewayStanding::Connected);
         handler.publish_gateway_ranking(stale_connected);
         assert_eq!(preferred_set(&handler), [challenger]);
     }
@@ -756,4 +759,51 @@ fn a_dialing_or_dialable_member_leaves_the_set_with_its_last_slot() {
         assert_eq!(preferred_set(&handler), [next], "{standing:?}");
         assert_eq!(hold(&handler), 1);
     }
+}
+
+/// A node ID whose first 20 bytes are `prefix` and the rest `last`, so two
+/// such IDs can share a gateway ID.
+fn node_with_prefix(prefix: u8, last: u8) -> NodeId {
+    let mut bytes = [last; 32];
+    bytes[..20].fill(prefix);
+    NodeId::from_bytes(&bytes)
+}
+
+/// A node whose connection was proved after discovery's snapshot found no
+/// node with the gateway ID: publication resolves the gateway to it, and it
+/// takes the held place.
+#[test]
+fn publication_resolves_a_gateway_to_an_owner_proved_after_the_snapshot() {
+    let handler = handler(40, 1);
+    let gateway = node_with_prefix(1, 0x00);
+    let _inbound = handler
+        .claim_connection(gateway, true)
+        .expect("room for an ordinary inbound peer");
+
+    handler.publish_gateway_ranking([RankedGateway {
+        gateway: GatewayId::from_node_id(gateway.as_bytes()),
+        blocks: 1,
+        resolution: GatewayResolution::Unknown,
+    }]);
+
+    assert_eq!(preferred_set(&handler), [gateway]);
+    assert_eq!(hold(&handler), 1);
+}
+
+/// A proved owner that shares the gateway ID of the node discovery's
+/// snapshot named makes the gateway ambiguous: neither node is preferred and
+/// no place is held.
+#[test]
+fn publication_fails_closed_when_a_proved_owner_shares_a_resolved_gateway_id() {
+    let handler = handler(40, 1);
+    let named = node_with_prefix(1, 0x00);
+    let sharing = node_with_prefix(1, 0xff);
+    let _inbound = handler
+        .claim_connection(sharing, true)
+        .expect("room for an ordinary inbound peer");
+
+    handler.publish_gateway_ranking([RankedGateway::of_node(named, 1, GatewayStanding::Dialable)]);
+
+    assert!(preferred_set(&handler).is_empty());
+    assert_eq!(hold(&handler), 0);
 }

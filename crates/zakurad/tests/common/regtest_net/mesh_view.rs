@@ -4,7 +4,7 @@
 //! The harness checks each node's report. Scenarios check changes between
 //! reports when they control the event that should cause the change.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use zakura_rpc::client::{GetMinerMeshInfoResponse, MeshGateway, MeshGatewayState, MeshPeer};
 
@@ -49,6 +49,16 @@ impl MeshView {
     /// Whether the node is connected to `id` now.
     pub fn is_connected_to(&self, id: &GatewayId) -> bool {
         self.peer(id).is_some()
+    }
+
+    /// The gateways in the preferred set, connected or not.
+    pub fn preferred(&self) -> HashSet<GatewayId> {
+        self.info
+            .gateways
+            .iter()
+            .filter(|gateway| gateway.state == MeshGatewayState::Preferred)
+            .map(|gateway| decode_id(&gateway.node_id))
+            .collect()
     }
 
     /// Whether the gateway with `id` is preferred and connected.

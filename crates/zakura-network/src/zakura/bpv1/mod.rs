@@ -28,7 +28,21 @@ pub mod tree;
 pub mod wire;
 
 #[cfg(test)]
+mod blocks_tests;
+#[cfg(all(test, not(zakura_sim)))]
+mod conformance_tests;
+#[cfg(all(test, not(zakura_sim)))]
+mod integration_tests;
+#[cfg(test)]
+mod peer_tests;
+#[cfg(test)]
+mod ports_tests;
+#[cfg(test)]
+mod service_tests;
+#[cfg(test)]
 mod test_support;
+#[cfg(test)]
+mod tests;
 
 pub use assemble::{assemble_block, AssembleError};
 #[cfg(any(test, feature = "p2p-fuzz"))]

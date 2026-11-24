@@ -44,6 +44,7 @@ zeroize = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "test-util", "time"] }
 sha2 = { workspace = true }
@@ -53,6 +54,10 @@ toml = { workspace = true }
 # `RUSTFLAGS="--cfg zakura_sim"`. It's unpublished, so it has no version.
 [target.'cfg(zakura_sim)'.dev-dependencies]
 zakura-scheduler = { path = "../zakura-scheduler" }
+
+[[bench]]
+name = "handshake"
+harness = false
 
 [lints]
 workspace = true

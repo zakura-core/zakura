@@ -1,6 +1,6 @@
 # Spec: `zakura-quic` transport
 
-Status: draft for review, 2026-11-22. Version 0.28.
+Status: draft for review, 2026-11-24. Version 0.29.
 This document is authoritative for the `zakura-quic` crate, its configuration,
 its wire behavior and its `quinn-proto` dependency policy.
 [Decision 0003](../decisions/zakura/0003-zakura-quic-transport.md) records the
@@ -66,7 +66,11 @@ a node completes by group and the handshake signatures it verifies by
 scheme; it changes OBS-1, OBS-2 and §16, and §17y lists each change.
 Version 0.28 checks the composite's ML-DSA-44 half against published
 known answers and publishes one for the whole composite; it changes TLS-4
-and §16, and §17z lists each change.
+and §16, and §17z lists each change. Version 0.29 moves the handshake to
+NIST security category 5, ML-KEM-1024 and ML-DSA-87, which changes every
+node ID again and the ALPN to `p2p-v2/5`; it changes DEP-2, ID-8, ID-11,
+ID-12, ID-13, TLS-4, TLS-9, ADM-1, OBS-1, API-1, §13, SEC-1, SEC-2 and §16,
+and §17aa lists each change.
 
 ## 0. Conventions
 
@@ -121,9 +125,9 @@ Terms:
   `libcrux-ml-dsa`, `libcrux-ml-kem`, `metrics`, `quinn-proto`, `ring`,
   `rustls`, `rustls-pki-types`, `serde`, `socket2`, `thiserror`, `tokio`,
   `tracing`, `zakura-rt` and `zeroize`.
-  - `libcrux-ml-kem` MUST enable its `mlkem768` feature and no others, with
+  - `libcrux-ml-kem` MUST enable its `mlkem1024` feature and no others, with
     default features off.
-  - `libcrux-ml-dsa` MUST enable its `mldsa44` feature and no others, with
+  - `libcrux-ml-dsa` MUST enable its `mldsa87` feature and no others, with
     default features off.
   - `data-encoding` MAY be added only if step 3 of PLAN §6 finds a deployed base32 key.
   - Any other dependency needs a spec change.
@@ -198,8 +202,9 @@ Terms:
   tag (little-endian) and its 32 bytes, so a list is 35 to 137 bytes. Tag 1
   is Ed25519 and its 32 bytes are a `NodeKey`. Any other nonzero tag's 32
   bytes are the fingerprint of the full key in the node's credential
-  (ID-12); tag 2 is ML-DSA-44 (ID-13), and the rest are opaque to this
-  release. Decoding MUST reject, and only reject:
+  (ID-12); tag 3 is ML-DSA-87 (ID-13), and the rest are opaque to this
+  release. Tag 2 was ML-DSA-44 in `p2p-v2/4`, and this release reads it as
+  any other unknown tag. Decoding MUST reject, and only reject:
   - a count of 0 or above 4;
   - a length other than 1 + 34 × count bytes;
   - a tag of 0, or a tag that doesn't exceed the one before it;
@@ -221,14 +226,14 @@ Terms:
   conformant relay passes on lists it can't read (ID-10). Every later release
   MUST keep this rule, or a newer node would punish older relays. This
   release authenticates a peer only by the composite of its Ed25519 and
-  ML-DSA-44 keys (TLS-4), so it connects only to nodes whose credential
+  ML-DSA-87 keys (TLS-4), so it connects only to nodes whose credential
   holds both, and a record carries one Ed25519 signature.
 - **ID-12.** A node's credential holds its public keys in full, in the key
   list's tag order and under its count and tag rules (ID-8). The encoding is
   the entry count as a `u8`, then each entry as its tag (`u16`
   little-endian), its length (`u16` little-endian) and its bytes. An Ed25519
-  entry is exactly 32 bytes and passes ID-1, an ML-DSA-44 entry (ID-13) is
-  exactly 1,312 bytes, and any other entry is 1 to 2,592 bytes (an
+  entry is exactly 32 bytes and passes ID-1, an ML-DSA-87 entry (ID-13) is
+  exactly 2,592 bytes, and any other entry is 1 to 2,592 bytes (an
   ML-DSA-87 public key, the largest NIST signature key). The
   credential's key list maps each entry to 32 bytes: an Ed25519 key is its
   own entry, and any other key is its fingerprint, the BLAKE2b-256 hash of
@@ -236,12 +241,12 @@ Terms:
   `Zakura_KeyFpr_v1`. A node's `NodeId` is the ID-9 hash of that list. So
   a discovery record stays small, the node ID still commits to every key,
   and a reader keeps an unknown key (ID-10) by its fingerprint.
-- **ID-13.** Tag 2 is ML-DSA-44 (FIPS 204); its credential entry is the
-  1,312-byte public key. A node's ML-DSA-44 key pair is generated from the
-  32-byte seed that BLAKE2b-256 derives from its Ed25519 seed, used as the
-  key and personalised `Zakura_MLDSA44v1`, over no data. One key file
-  therefore yields both keys, and a node's credential is its Ed25519 key
-  and its ML-DSA-44 key. The ML-DSA seed is derived once, when the node
+- **ID-13.** Tag 3 is ML-DSA-87 (FIPS 204, security category 5); its
+  credential entry is the 2,592-byte public key. A node's ML-DSA-87 key
+  pair is generated from the 32-byte seed that BLAKE2b-256 derives from its
+  Ed25519 seed, used as the key and personalised `Zakura_MLDSA87v1`, over no
+  data. One key file therefore yields both keys, and a node's credential is
+  its Ed25519 key and its ML-DSA-87 key. The ML-DSA seed is derived once, when the node
   loads its key, and held beside the Ed25519 seed, zeroized on drop (ID-3).
   The signing key is regenerated from it for each signature and its bytes
   zeroized after. As with `ring`'s expanded Ed25519 key, some copies are
@@ -271,16 +276,16 @@ at fork tag `zakura-iroh-v1.1.0-rc.1`, and it keeps their MIT/Apache-2.0 notices
   refuse any other algorithm, a non-canonical DER encoding, trailing bytes,
   and a credential ID-12 refuses.
 - **TLS-4.** The only signature scheme is the composite of Ed25519 and
-  ML-DSA-44, private-use code point `0xFE44`. The signature is the Ed25519
-  signature (64 bytes) followed by the ML-DSA-44 signature (2,420 bytes),
+  ML-DSA-87, private-use code point `0xFE87`. The signature is the Ed25519
+  signature (64 bytes) followed by the ML-DSA-87 signature (4,627 bytes),
   both over the TLS message the scheme signs; the ML-DSA signature uses the
-  FIPS 204 context `Zakura TLS 1.3 Ed25519+ML-DSA-44 v1` and is hedged with
+  FIPS 204 context `Zakura TLS 1.3 Ed25519+ML-DSA-87 v1` and is hedged with
   32 bytes from the endpoint's TLS random source. A verifier MUST refuse a
   signature of another length and MUST accept only when the Ed25519 half
-  verifies under ID-6 with the credential's Ed25519 key and the ML-DSA-44
-  half verifies with its ML-DSA-44 key. A credential without both keys
+  verifies under ID-6 with the credential's Ed25519 key and the ML-DSA-87
+  half verifies with its ML-DSA-87 key. A credential without both keys
   can't be authenticated, so the handshake fails (ID-11). The file
-  `crates/zakura-quic/src/composite/ed25519_mldsa44_kat.json` gives a
+  `crates/zakura-quic/src/composite/ed25519_mldsa87_kat.json` gives a
   seed, message and hedging randomness with the composite signature and
   node ID they produce, so another implementation can check its signer
   against this one.
@@ -296,20 +301,23 @@ at fork tag `zakura-iroh-v1.1.0-rc.1`, and it keeps their MIT/Apache-2.0 notices
   list (ID-12). `Conn::remote_id()` returns that ID, `Conn::remote_key_list()`
   the key list and `Conn::remote_key()` the Ed25519 key that signed.
 - **TLS-9.** The crypto provider is rustls' `ring` provider with its default
-  TLS 1.3 cipher suites, and its only key-exchange group is X25519MLKEM768
-  (`draft-ietf-tls-ecdhe-mlkem`, group 0x11ec). A peer that offers only
-  classical groups shares no group, and the handshake fails.
-  - The group runs ring's X25519 and ML-KEM-768 (FIPS 203, from
-    `libcrux-ml-kem`). Both secrets go into the session keys, so the keys
-    stay secret while either algorithm holds.
+  TLS 1.3 cipher suites, and its only key-exchange group is X25519MLKEM1024,
+  private-use code point 0xFE24. No standard pairs X25519 with ML-KEM-1024
+  (`draft-ietf-tls-ecdhe-mlkem` pairs it with P-384), so only Zakura nodes
+  speak this group. A peer that offers only classical groups shares no
+  group, and the handshake fails.
+  - The group runs ring's X25519 and ML-KEM-1024 (FIPS 203, security
+    category 5, from `libcrux-ml-kem`). Both secrets go into the session
+    keys, so the keys stay secret while either algorithm holds.
   - Each share and the secret are the ML-KEM part followed by the X25519
-    part: 1,184 + 32 bytes from the dialer, 1,088 + 32 bytes from the
-    listener, and a 32 + 32 byte secret.
+    part, the layout `draft-ietf-tls-ecdhe-mlkem` fixes for X25519MLKEM768:
+    1,568 + 32 bytes from the dialer, 1,568 + 32 bytes from the listener,
+    and a 32 + 32 byte secret.
   - The listener MUST refuse a share of another length and an ML-KEM key
     that fails the FIPS 203 §7.2 modulus check. The dialer MUST refuse a
     share of another length. Either half failing fails the handshake.
   - The production dialer's ClientHello carries one key share, for
-    X25519MLKEM768. The X25519 public value is part of that hybrid share.
+    X25519MLKEM1024. The X25519 public value is part of that hybrid share.
 
   `bind` uses this provider unchanged. An endpoint built with `bind_with`
   MAY replace the provider's random source and key-exchange groups, and
@@ -525,7 +533,7 @@ is today's Zakura logic.
     IP)` (ADM-7).
 
   An `Incoming` is one Initial datagram that belongs to no connection the
-  endpoint holds. A dialer that offers X25519MLKEM768 (TLS-9) sends a hello
+  endpoint holds. A dialer that offers X25519MLKEM1024 (TLS-9) sends a hello
   that spans two Initial datagrams. After `Accept` the second joins the
   connection. After any other outcome the second is another `Incoming`:
   `admit` runs again, and a retried or refused dialer gets a second answer,
@@ -954,8 +962,8 @@ These are not configurable. Changing one needs a spec change.
 | `zakura.quic.incoming.accepted` / `.refused` / `.retried` / `.ignored` | counter | ADM-2 outcomes, one per `Incoming` (ADM-1) |
 | `zakura.quic.handshake.completed` / `.failed` / `.timed_out` | counter | Handshake results |
 | `zakura.quic.handshake.duration_seconds` | histogram | Accept or dial to handshake complete |
-| `zakura.quic.tls.key_exchange` | counter | TLS key exchanges completed, labelled `group` with rustls' name for the group: `X25519MLKEM768` (TLS-9), or `X25519` for the hybrid's classical half, which a production endpoint never completes. An exchange completes before the peer is authenticated, so its handshake can still fail |
-| `zakura.quic.tls.signature_verified` | counter | Peer handshake signatures verified, labelled `scheme`: `ed25519_mldsa44` for the TLS-4 composite, counted once both halves verify |
+| `zakura.quic.tls.key_exchange` | counter | TLS key exchanges completed, labelled `group`: `X25519MLKEM1024` for the hybrid (TLS-9), which rustls has no name for, or rustls' name `X25519` for the hybrid's classical half, which a production endpoint never completes. An exchange completes before the peer is authenticated, so its handshake can still fail |
+| `zakura.quic.tls.signature_verified` | counter | Peer handshake signatures verified, labelled `scheme`: `ed25519_mldsa87` for the TLS-4 composite, counted once both halves verify |
 | `zakura.quic.connections` | gauge | Open connections |
 | `zakura.quic.connections.held` | gauge | ADM-12 live slots held: handshakes, dial attempts and open connections |
 | `zakura.quic.connections.closing` | gauge | ADM-13 closed connections not yet drained |
@@ -1024,7 +1032,7 @@ The public surface of `zakura-quic`. Changing it is a semver change of the crate
 - **API-1.** Identity: `NodeId`, `NodeKey`, `NodeKeyList`, `NodeCredential`,
   `NodeSecretKey` and `NodeAddr { id, direct: Vec<SocketAddr> }`. A dial
   requires a credential that derives `id` (TLS-7). A `NodeSecretKey` carries
-  the node's credential: its Ed25519 and ML-DSA-44 keys (ID-13), or one set
+  the node's credential: its Ed25519 and ML-DSA-87 keys (ID-13), or one set
   with `with_credential`, which MUST hold both.
 - **API-2.** `QuicEndpoint`:
   - `bind(secret, &QuicBindConfig, &QuicConfig) -> Result<QuicEndpoint, BindError>`;
@@ -1183,6 +1191,13 @@ release doesn't keep `p2p-v2/3` in its range as COMPAT-12 suggests, because
 a node would be known by a different ID on each version. Nodes on the two
 ALPNs reach each other over the legacy protocol, as above.
 
+Version 0.29 moves the key exchange to ML-KEM-1024 and the signature to
+ML-DSA-87 (TLS-4, TLS-9, ID-13), which changes every node's ID again, so the
+ALPN moved from `p2p-v2/4` to `p2p-v2/5` under COMPAT-8. For the same reason
+as before, this release doesn't keep `p2p-v2/4` in its range. A release that
+speaks `p2p-v2/4`, such as v1.9.0-rc2, reaches this one only over the legacy
+protocol.
+
 - **COMPAT-4.** A wire break (a WIRE-13 change, a moved `quinn-proto`
   codepoint, or a `quinn-proto` release that changes the transport
   parameters) MUST bump the ALPN to the next `p2p-v2/N`. The endpoint MUST NOT
@@ -1196,8 +1211,9 @@ ALPNs reach each other over the legacy protocol, as above.
 
 ### 13.1 Extensibility
 
-The `p2p-v2/4` cohort is the last native hard break that every later change
-has to ride. These rules let a later release make a soft change, one that
+The `p2p-v2/5` cohort is the native hard break that every later change has
+to ride; version 0.29 broke `p2p-v2/4` on purpose, to raise the handshake to
+security category 5 while only our own fleet spoke it. These rules let a later release make a soft change, one that
 this release tolerates, and keep each hard change explicit.
 
 - **COMPAT-8.** A hard break MUST bump the Zakura protocol version and the
@@ -1239,7 +1255,7 @@ this release tolerates, and keep each hard change explicit.
   - small-order `R` points, `R` points with a torsion component, and
     non-canonical `S` scalars refused (ID-6);
   - honest keys and signatures accepted;
-  - a subset of Project Wycheproof's ML-KEM-768 vectors for key
+  - a subset of Project Wycheproof's ML-KEM-1024 vectors for key
     generation, encapsulation and decapsulation, including encapsulation
     keys that fail the modulus check (TLS-9).
 - **SEC-2.** These handshakes MUST fail:
@@ -1248,9 +1264,10 @@ this release tolerates, and keep each hard change explicit.
   - a client without a key;
   - TLS 1.2;
   - an X.509 certificate instead of a raw public key;
-  - any signature scheme other than the Ed25519 + ML-DSA-44 composite
-    (`0xFE44`, TLS-4), including standalone Ed25519;
-  - an X25519MLKEM768 key share of the wrong length, or one whose ML-KEM
+  - any signature scheme other than the Ed25519 + ML-DSA-87 composite
+    (`0xFE87`, TLS-4), including standalone Ed25519 and the `p2p-v2/4`
+    composite `0xFE44`;
+  - an X25519MLKEM1024 key share of the wrong length, or one whose ML-KEM
     key fails the modulus check (TLS-9).
 - **SEC-3.** For a refused or ignored IP, no `Connecting` may exist. A test
   asserts that `quinn-proto` created no connection state.
@@ -1301,19 +1318,19 @@ this release tolerates, and keep each hard change explicit.
 | Control-message round trip, and every truncated or lying control message parses to nothing | SOCK-13 |
 | Loopback transfer through the SOCK-13 fast path beats the plain path on the same host | SOCK-13 |
 | An endpoint on injected sockets binds, completes a handshake, rebinds and shuts down without opening an OS socket or starting the kernel drop poller, the GSO probe or the interface watcher | SOCK-3–SOCK-5, SOCK-7, SOCK-9, SOCK-13 |
-| `bind` keeps the secure inputs: each socket's endpoint config has no seed and the production keys, the TLS provider is ring's with X25519MLKEM768 as its only key-exchange group, and the dependency graph excludes the deterministic test provider. A `bind_with` handshake uses every injected input, and an injected provider keeps ring's cipher suites | API-2, TLS-9, ADM-10 |
-| ML-KEM-768 gives a subset of Project Wycheproof's known answers for key generation, encapsulation and decapsulation; it refuses a key that fails the modulus check and a share of another length before drawing randomness; an altered ciphertext gives an unrelated secret | TLS-9, SEC-1 |
-| X25519MLKEM768's shares and secret are the ML-KEM part then the X25519 part, checked in each role against `libcrux-ml-kem` and `curve25519-dalek` used directly; fed an independent implementation's recorded shares, it gives back the shares and secrets that implementation recorded, in both roles; a bad half or a failed random source fails the exchange | TLS-9 |
+| `bind` keeps the secure inputs: each socket's endpoint config has no seed and the production keys, the TLS provider is ring's with X25519MLKEM1024 as its only key-exchange group, and the dependency graph excludes the deterministic test provider. A `bind_with` handshake uses every injected input, and an injected provider keeps ring's cipher suites | API-2, TLS-9, ADM-10 |
+| ML-KEM-1024 gives a subset of Project Wycheproof's known answers for key generation, encapsulation and decapsulation; it refuses a key that fails the modulus check and a share of another length before drawing randomness; an altered ciphertext gives an unrelated secret | TLS-9, SEC-1 |
+| X25519MLKEM1024's shares and secret are the ML-KEM part then the X25519 part, checked in each role against `libcrux-ml-kem` and `curve25519-dalek` used directly; fed the shares an independent implementation (RustCrypto `ml-kem` and graviola's X25519) recorded, it gives back the shares and secrets that implementation recorded, in both roles; a bad half or a failed random source fails the exchange | TLS-9 |
 | A production listener refuses a handshake whose hybrid share is one byte short or carries an ML-KEM key that fails the modulus check | TLS-9, SEC-2 |
 | A peer that offers only classical groups is refused in either direction, and two production endpoints agree on the hybrid | TLS-9 |
 | A credential with an unknown long key derives the same ID on both ends; a bare Ed25519 SubjectPublicKeyInfo, a credential whose ID isn't the dialed one, and a client presenting a credential it can't sign for are refused | TLS-3, TLS-4, TLS-7, TLS-8, ID-12 |
-| A composite signature verifies only whole: a tampered Ed25519 or ML-DSA half, a truncated signature, another node's key in either half, and a credential without an ML-DSA-44 key are refused; the ML-DSA seed derivation has a known answer | TLS-4, ID-11, ID-13 |
-| ML-DSA-44 key generation, signing and verification give a subset of Project Wycheproof's and NIST ACVP's known answers, each under its own context: seeded keys and deterministic and hedged signatures match, and a 256-byte context, wrong-length keys and signatures, a flipped commitment hash, a bad hint encoding and an out-of-bound response are refused | TLS-4, ID-13 |
+| A composite signature verifies only whole: a tampered Ed25519 or ML-DSA half, a truncated signature, another node's key in either half, and a credential without an ML-DSA-87 key are refused; the ML-DSA seed derivation has a known answer | TLS-4, ID-11, ID-13 |
+| ML-DSA-87 key generation, signing and verification give a subset of Project Wycheproof's and NIST ACVP's known answers, each under its own context: seeded keys and deterministic and hedged signatures match, and a 256-byte context, wrong-length keys and signatures, a flipped commitment hash, a bad hint encoding and an out-of-bound response are refused | TLS-4, ID-13 |
 | Signatures that RustCrypto `ml-dsa` 0.1.2 made under the TLS-4 context, recorded offline, are reproduced byte for byte and verify, and its public key for the same seed matches | TLS-4, ID-13 |
-| The published composite known answer: a fixed seed, message and randomness give the recorded Ed25519 key, ML-DSA-44 key, node ID and composite signature, which verifies | TLS-4, ID-9, ID-12, ID-13 |
-| In a simulated handshake the listener's first flight stays within three times the 2,400-byte hybrid hello, and the dialer completes on it alone | TLS-4, ADM-1 |
-| The seeded X25519MLKEM768 completes against the production group in both roles and replays its shares for the same seed and node | TLS-9, API-2 |
-| A dialer that offers X25519MLKEM768 sends its hello as two 1,200-byte Initial datagrams. A refused dial is decided and answered once per datagram, and a retried one decided once per datagram. A hello refused at its first datagram and accepted at its second keeps its charge and holds a pending handshake until the deadline. A one-datagram hello, which only a dialer with classical groups alone sends, is refused at its first datagram and cancelled; a hello with no ALPN in common, which spans two, fails as a handshake | ADM-1, ADM-3, ADM-7, API-3 |
+| The published composite known answer: a fixed seed, message and randomness give the recorded Ed25519 key, ML-DSA-87 key, node ID and composite signature, which verifies. The known answer was made without this crate, with Python's `cryptography` and `hashlib` and RustCrypto `ml-dsa` | TLS-4, ID-9, ID-12, ID-13 |
+| In a simulated handshake the listener's first flight stops at three times the 2,400-byte hybrid hello, finishing the datagram it started, and the dialer can't complete on it; once the dialer's reply validates its address, the listener sends the rest and the dialer completes, one round trip later and no more | TLS-4, TLS-9, ADM-1 |
+| The seeded X25519MLKEM1024 completes against the production group in both roles and replays its shares for the same seed and node | TLS-9, API-2 |
+| A dialer that offers X25519MLKEM1024 sends its hello as two 1,200-byte Initial datagrams. A refused dial is decided and answered once per datagram, and a retried one decided once per datagram. A hello refused at its first datagram and accepted at its second keeps its charge and holds a pending handshake until the deadline. A one-datagram hello, which only a dialer with classical groups alone sends, is refused at its first datagram and cancelled; a hello with no ALPN in common, which spans two, fails as a handshake | ADM-1, ADM-3, ADM-7, API-3 |
 | On the deterministic scheduler, with no tokio runtime, two `bind_with` endpoints with the same seeded inputs, plan and UTC origin send byte-identical datagrams through a Retry handshake and an echoed stream, in one process and in fresh processes. Leaving out any seeded input, or changing the seed or the UTC origin, changes the bytes, and host time doesn't | API-2, TLS-9, ADM-10, DEP-2 |
 | Cancelled reads lose no data; cancelled writes keep their order; concurrent streams keep their data apart; a transfer larger than the receive window completes | DRV-4–DRV-6 |
 | Dropping the last `Conn` closes the connection | DRV-7 |
@@ -1345,7 +1362,7 @@ this release tolerates, and keep each hard change explicit.
 | Congestion controller is Cubic when unset | CTRL-3 |
 | Stats report the controller, driver and socket counters | OBS-4, OBS-12 |
 | Metrics presence and no per-peer labels | OBS-1, OBS-2 |
-| Each side of a loopback handshake, on its own thread and recorder, counts one `X25519MLKEM768` key exchange and one `ed25519_mldsa44` signature and no other group or scheme; the group labels are rustls' names | OBS-1, TLS-4, TLS-9 |
+| Each side of a loopback handshake, on its own thread and recorder, counts one `X25519MLKEM1024` key exchange and one `ed25519_mldsa87` signature and no other group or scheme; the hybrid's label is its own name, since rustls has none for a private-use group, and X25519's is rustls' name | OBS-1, TLS-4, TLS-9 |
 | Shutdown order and the 3 s bound; drop without `shutdown` frees the port | API-7 |
 | The focused `zakura-network` tests and the full workspace suite with Iroh deleted | No regression |
 | Fleet throughput: one 1 GiB transfer and 64 concurrent streams match or beat the noq build in throughput, at no more CPU per GB | G7, PLAN §8 |
@@ -2024,3 +2041,52 @@ Changed:
 - **TLS-4.** Names the composite known-answer file.
 - **§16.** Adds the rows for the ML-DSA-44 known answers, the recorded
   RustCrypto signatures and the composite known answer.
+
+## 17aa. Changes in version 0.29
+
+The handshake used NIST security category 1 and 3 parameters: ML-DSA-44 for
+the composite signature and ML-KEM-768 for the hybrid key exchange. Both
+rest on lattice problems, and a quantum attack that gains even a modest
+speedup against them would cut into those margins first. The handshake now
+uses the category 5 sets, ML-KEM-1024 and ML-DSA-87, so a much larger speedup
+still leaves a wide margin. The classical halves, X25519 and Ed25519, are
+unchanged: they guard against a flaw in the young post-quantum code, not
+against a quantum computer.
+
+The ML-DSA key still derives from the node's seed, so key files don't
+change, but every node ID changes again and the ALPN moves to `p2p-v2/5`.
+Only our own fleet spoke `p2p-v2/4`.
+
+A handshake moves about 21.4 KB in place of 12.5 KB. The listener's first
+flight grows from about 5.8 KB to about 9.9 KB, past the 7.2 KB QUIC lets it
+send before the dialer's address is validated, so a dial takes one more
+round trip to complete. `docs/design/pq-handshake-parameters.md` measures the sizes, the
+CPU cost and the added latency.
+
+Changed:
+
+- **DEP-2.** `libcrux-ml-kem` enables `mlkem1024` instead of `mlkem768`, and
+  `libcrux-ml-dsa` enables `mldsa87` instead of `mldsa44`. The crate versions
+  and the dependency graph don't change.
+- **TLS-9.** The only group is X25519MLKEM1024 under the private-use code
+  point 0xFE24, with the X25519MLKEM768 share layout and 1,600-byte shares.
+  No standard pairs X25519 with ML-KEM-1024. The standard category 5 hybrid,
+  SecP384r1MLKEM1024, would spend P-384 work on every unauthenticated hello,
+  and its deterministic simulation would need a new P-384 dependency, since
+  ring takes no injected randomness.
+- **TLS-4.** The composite is Ed25519 + ML-DSA-87, `0xFE87`, 4,691 bytes,
+  under the FIPS 204 context `Zakura TLS 1.3 Ed25519+ML-DSA-87 v1`. The
+  composite known answer moves to `ed25519_mldsa87_kat.json`.
+- **ID-8, ID-12, ID-13.** Tag 3 is ML-DSA-87, a 2,592-byte credential entry
+  generated from a seed personalised `Zakura_MLDSA87v1`. Tag 2 is no longer
+  defined, so a reader keeps it as an unknown entry (ID-10).
+- **ID-11, API-1.** A credential needs the Ed25519 and ML-DSA-87 keys. The
+  exported constants become `ML_DSA_87_KEY_TAG`, `ML_DSA_87_KEY_BYTES` and
+  `ML_DSA_87_SIGNATURE_BYTES`.
+- **ADM-1.** The hybrid hello still spans two Initial datagrams.
+- **OBS-1.** The labels are `X25519MLKEM1024` and `ed25519_mldsa87`.
+- **§13.** The ALPN moves to `p2p-v2/5`, a hard break under COMPAT-8.
+- **SEC-1, SEC-2, §16.** The known answers move to ML-KEM-1024 and
+  ML-DSA-87. The independent X25519MLKEM1024 answers come from RustCrypto
+  `ml-kem` and graviola's X25519, since no TLS library speaks the group. The
+  first-flight test now pins the one added round trip.

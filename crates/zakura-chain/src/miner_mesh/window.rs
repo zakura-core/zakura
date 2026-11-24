@@ -12,9 +12,12 @@ use crate::{
 /// Reorgs deeper than a few blocks are rare, so a block this deep almost
 /// always stays on the best chain and the counts change little when the tip
 /// moves. When a reorg does reach a counted block, the owner of the counts
-/// compares them with the new best chain and drops the displaced blocks, so a
-/// shallower depth means more repairs, not wrong counts. At 25-second blocks a
-/// block starts counting about four minutes after it is mined.
+/// compares them with the new best chain and drops the displaced blocks. A
+/// shallower depth makes those repairs more frequent, and makes one rare miss a
+/// little less rare: a block read from a chain that was best only briefly, and
+/// lost again before the owner saw the switch, stays counted until it leaves
+/// the window. At 25-second blocks a block starts counting about four minutes
+/// after it is mined.
 pub const QUALIFYING_DEPTH: u32 = 10;
 
 /// How long a block keeps counting: two days at the target block spacing.

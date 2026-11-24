@@ -80,8 +80,10 @@ at a 25-second spacing (2,304 at the 75-second spacing before NU7). The node
 reads each block as it reaches 10 deep, reads older blocks in the window when
 it has nothing newer to do, and repairs its counts after a reorg. At 25-second
 blocks a block starts counting about four minutes after it is mined. Reorgs
-deeper than a few blocks are rare, and the repair keeps the counts right when
-one reaches a counted block.
+that reach a counted block are rare, and the repair drops the blocks they
+displace. The one exception is a block read from a chain that was best only
+briefly: if the node switches to that chain and back before the tracker sees
+the switch, the block stays counted until it leaves the window.
 
 While its tip is recent enough to mine on, the node hands v2 networking the
 gateways named in at least 10 counted blocks. Networking ranks them by block

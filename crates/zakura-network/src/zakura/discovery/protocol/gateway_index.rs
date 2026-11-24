@@ -9,28 +9,7 @@ use std::collections::BTreeSet;
 use zakura_chain::miner_mesh::GatewayId;
 use zakura_quic::NodeId;
 
-/// The nodes the book knows a gateway ID names.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum GatewayMatch {
-    /// The book knows no node with the gateway ID.
-    None,
-    /// The book knows exactly this node with the gateway ID.
-    One(NodeId),
-    /// The book knows two or more nodes with the gateway ID, so it cannot
-    /// tell which one the miners named.
-    Several,
-}
-
-impl GatewayMatch {
-    /// Returns the match once `node`, which has the gateway ID, is known too.
-    pub(crate) fn with(self, node: NodeId) -> Self {
-        match self {
-            Self::None => Self::One(node),
-            Self::One(known) if known == node => self,
-            Self::One(_) | Self::Several => Self::Several,
-        }
-    }
-}
+use crate::zakura::GatewayMatch;
 
 /// Every node the book holds, by a signed record or as a static candidate.
 ///
@@ -53,7 +32,7 @@ impl GatewayIndex {
     }
 
     /// Returns the nodes the book holds whose ID starts with `gateway`.
-    pub(super) fn find(&self, gateway: &GatewayId) -> GatewayMatch {
+    pub(super) fn find(&self, gateway: &GatewayId) -> GatewayMatch<NodeId> {
         let (lowest, highest) = gateway.node_id_bounds();
         let mut nodes = self
             .nodes

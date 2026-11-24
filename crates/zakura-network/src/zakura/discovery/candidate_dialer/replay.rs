@@ -560,7 +560,7 @@ fn rank(
         })
         .collect();
     let ranking = (0..NODES).map(|node| {
-        RankedGateway::of_node(
+        RankedGateway::resolved(
             nodes[node],
             // `NODES` is a small constant, so the count fits.
             (NODES - node) as u32,

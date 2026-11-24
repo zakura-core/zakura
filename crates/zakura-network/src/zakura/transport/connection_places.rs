@@ -75,8 +75,8 @@ impl ConnectionPlaces {
         let gateways = preferred
             .places()
             .map(|(gateway, place)| PlacedGateway {
-                gateway_id: gateway.gateway,
-                blocks: gateway.blocks,
+                gateway_id: gateway.gateway(),
+                blocks: gateway.blocks(),
                 place,
                 connected: gateway
                     .node()

@@ -341,7 +341,7 @@ mod tests {
         let mut slots = ConnectionSlots::default();
         let member = node(1);
         let preferred = PreferredGateways::form(
-            [RankedGateway::of_node(
+            [RankedGateway::resolved(
                 member,
                 1,
                 GatewayStanding::Connected,

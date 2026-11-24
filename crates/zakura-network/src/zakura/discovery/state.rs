@@ -13,15 +13,16 @@ use zakura_rt::collections::{HashMap, HashSet};
 use super::protocol::{
     advertised_services, entry_is_expired, hello_verdict, normalize_direct_addrs,
     normalize_services, push_unique_service, AddressScope, BookChange, DialAdmission,
-    DialCandidateExclusions, DisclosureKey, DiscoveryBookError, DiscoveryRecordError,
-    DiscoveryRecordValidationContext, DiscoveryWireError, GatewayTarget, ImportBatchOutcome,
-    ImportOutcome, RecordVerdict, Services, ZakuraCachedLiveServiceSummary, ZakuraDiscoveryBook,
+    DialCandidateExclusions, DialTarget, DisclosureKey, DiscoveryBookError, DiscoveryRecordError,
+    DiscoveryRecordValidationContext, DiscoveryWireError, ImportBatchOutcome, ImportOutcome,
+    RecordVerdict, Services, ZakuraCachedLiveServiceSummary, ZakuraDiscoveryBook,
     ZakuraDiscoveryConfig, ZakuraDiscoveryDialCandidate, ZakuraDiscoveryEntry,
     ZakuraDiscoveryLocalConfig, ZakuraDiscoveryPersistedEntry, ZakuraNodeRecord,
     ZakuraNodeRecordBody, ZakuraServiceId, DEFAULT_LIVE_SERVICE_SUMMARY_TTL,
     MAX_DISCOVERY_EXCLUDED_NODE_IDS, MAX_SERVICE_SUMMARIES_PER_RESPONSE,
 };
 use super::verified::VerifiedRecord;
+use crate::zakura::GatewayMatch;
 use crate::zakura::{
     CloseRow, ServiceAdmissionDecision, ServicePeerDirection, ServicePeerSnapshot, ZakuraConnId,
     ZakuraNetworkId, ZakuraPeerId,
@@ -802,7 +803,11 @@ impl DiscoveryState {
     /// What the book knows about the node `gateway` names and dialing it at
     /// `now`, under the configured dial backoff, as
     /// [`ZakuraDiscoveryBook::gateway_target`] says.
-    pub(super) fn gateway_target(&self, gateway: &GatewayId, now: u64) -> GatewayTarget {
+    pub(super) fn gateway_target(
+        &self,
+        gateway: &GatewayId,
+        now: u64,
+    ) -> GatewayMatch<(NodeId, DialTarget)> {
         self.book.gateway_target(
             gateway,
             now,

@@ -8,7 +8,7 @@ fn node(seed: u8) -> NodeId {
 }
 
 fn gateway(seed: u8, blocks: u32, standing: GatewayStanding) -> RankedGateway {
-    RankedGateway::of_node(node(seed), blocks, standing)
+    RankedGateway::resolved(node(seed), blocks, standing)
 }
 
 /// A node ID made of `prefix` in its first 20 bytes and `last` in the rest,
@@ -21,11 +21,7 @@ fn raw_node(prefix: u8, last: u8) -> NodeId {
 
 /// The ranked entry for `node`'s gateway ID before any node is known.
 fn unresolved(node: NodeId, blocks: u32) -> RankedGateway {
-    RankedGateway {
-        gateway: GatewayId::from_node_id(node.as_bytes()),
-        blocks,
-        resolution: GatewayResolution::Unknown,
-    }
+    RankedGateway::unresolved(GatewayId::from_node_id(node.as_bytes()), blocks)
 }
 
 /// Each ranked gateway's place, in rank order: with one place held, a
@@ -217,7 +213,7 @@ proptest! {
 #[test]
 fn a_long_ranking_keeps_its_highest_counts() {
     let ranking = (0..300u32).map(|index| {
-        RankedGateway::of_node(
+        RankedGateway::resolved(
             NodeSecretKey::generate().public(),
             index,
             GatewayStanding::Dialable,
@@ -226,7 +222,7 @@ fn a_long_ranking_keeps_its_highest_counts() {
     let formed = PreferredGateways::form(ranking, MAX_PREFERRED_GATEWAYS);
     assert_eq!(formed.ranking.len(), MAX_RANKED_GATEWAYS);
     assert_eq!(
-        formed.ranking.last().map(|gateway| gateway.blocks),
+        formed.ranking.last().map(|gateway| gateway.blocks()),
         Some(44)
     );
     assert_eq!(formed.hold(), MAX_PREFERRED_GATEWAYS);
@@ -248,7 +244,7 @@ proptest! {
         let caller = node(caller);
         let mut ranking = formed.ranking.clone();
         if let Some(entry) = ranking.iter_mut().find(|entry| entry.node() == Some(caller)) {
-            entry.resolution = GatewayResolution::Node(caller, GatewayStanding::Connected);
+            *entry = entry.with_standing(GatewayStanding::Connected);
         }
         let expected = PreferredGateways::form(ranking, hold_limit);
         let actual = formed.with_connected(&caller).unwrap_or(formed);
@@ -284,7 +280,7 @@ fn a_connecting_node_resolves_its_gateway_id() {
 fn a_node_with_another_gateway_id_is_ignored() {
     let member = raw_node(1, 0x00);
     let formed = PreferredGateways::form(
-        [RankedGateway::of_node(
+        [RankedGateway::resolved(
             member,
             5,
             GatewayStanding::Connected,
@@ -302,7 +298,7 @@ fn a_second_node_with_one_gateway_id_fails_closed() {
     let member = raw_node(1, 0x00);
     let sharing = raw_node(1, 0xff);
     let formed = PreferredGateways::form(
-        [RankedGateway::of_node(
+        [RankedGateway::resolved(
             member,
             5,
             GatewayStanding::Connected,
@@ -342,7 +338,7 @@ fn an_unproved_dial_resolves_no_gateway() {
     assert_eq!(unknown.with_dialing(&dialed), None);
 
     let named = PreferredGateways::form(
-        [RankedGateway::of_node(
+        [RankedGateway::resolved(
             dialed,
             5,
             GatewayStanding::Connected,
@@ -357,8 +353,8 @@ fn an_unproved_dial_resolves_no_gateway() {
     assert_eq!(
         dialing
             .places()
-            .map(|(gateway, _)| gateway.resolution)
+            .map(|(gateway, _)| gateway.resolution())
             .collect::<Vec<_>>(),
-        vec![GatewayResolution::Node(dialed, GatewayStanding::Dialing)]
+        vec![GatewayMatch::One((dialed, GatewayStanding::Dialing))]
     );
 }

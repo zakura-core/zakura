@@ -9,7 +9,7 @@
 use super::*;
 use zakura_chain::miner_mesh::GatewayId;
 
-use crate::zakura::{GatewayResolution, GatewayStanding, RankedGateway, SlotSplit};
+use crate::zakura::{GatewayStanding, RankedGateway, SlotSplit};
 
 fn handler_from_config(config: &Config) -> ZakuraProtocolHandler {
     let limits = ZakuraLocalLimits::from_config(config);
@@ -49,7 +49,7 @@ fn publish(handler: &ZakuraProtocolHandler, ranking: &[(NodeId, GatewayStanding)
     let ranked = ranking
         .iter()
         .zip((1..=count).rev())
-        .map(|(&(node, standing), blocks)| RankedGateway::of_node(node, blocks, standing));
+        .map(|(&(node, standing), blocks)| RankedGateway::resolved(node, blocks, standing));
     handler.publish_gateway_ranking(ranked);
 }
 
@@ -476,7 +476,7 @@ fn simultaneous_claims_never_pass_the_ordinary_limit() {
 
 fn publish_tied_gateways(handler: &ZakuraProtocolHandler, first: NodeId, second: NodeId) {
     let ranking =
-        [first, second].map(|node| RankedGateway::of_node(node, 1, GatewayStanding::Dialable));
+        [first, second].map(|node| RankedGateway::resolved(node, 1, GatewayStanding::Dialable));
     handler.publish_gateway_ranking(ranking);
 }
 
@@ -539,7 +539,7 @@ fn ranking_publication_reconciles_authenticated_slots() {
         let challenger = new_node();
         publish_tied_gateways(&handler, incumbent, challenger);
         let stale = [challenger, incumbent]
-            .map(|node| RankedGateway::of_node(node, 1, GatewayStanding::Dialable));
+            .map(|node| RankedGateway::resolved(node, 1, GatewayStanding::Dialable));
         let mut slot = handler.claim_connection(incumbent, inbound).unwrap();
         if !inbound {
             slot.outbound_connected();
@@ -556,8 +556,7 @@ fn ranking_publication_reconciles_authenticated_slots() {
         drop(slot);
         assert_eq!(preferred_set(&handler), [challenger]);
         let mut stale_connected = stale;
-        stale_connected[1].resolution =
-            GatewayResolution::Node(incumbent, GatewayStanding::Connected);
+        stale_connected[1] = stale_connected[1].with_standing(GatewayStanding::Connected);
         handler.publish_gateway_ranking(stale_connected);
         assert_eq!(preferred_set(&handler), [challenger]);
     }
@@ -597,7 +596,7 @@ fn publication_checks_live_owners_at_the_ranking_cutoff() {
     let _lower = handler.claim_connection(lower, true).unwrap();
     let _tied = handler.claim_connection(tied, true).unwrap();
     handler.publish_gateway_ranking(nodes.into_iter().map(|node| {
-        RankedGateway::of_node(
+        RankedGateway::resolved(
             node,
             if node == lower { 1 } else { 2 },
             GatewayStanding::Dialable,
@@ -780,11 +779,10 @@ fn publication_resolves_a_gateway_to_an_owner_proved_after_the_snapshot() {
         .claim_connection(gateway, true)
         .expect("room for an ordinary inbound peer");
 
-    handler.publish_gateway_ranking([RankedGateway {
-        gateway: GatewayId::from_node_id(gateway.as_bytes()),
-        blocks: 1,
-        resolution: GatewayResolution::Unknown,
-    }]);
+    handler.publish_gateway_ranking([RankedGateway::unresolved(
+        GatewayId::from_node_id(gateway.as_bytes()),
+        1,
+    )]);
 
     assert_eq!(preferred_set(&handler), [gateway]);
     assert_eq!(hold(&handler), 1);
@@ -802,7 +800,7 @@ fn publication_fails_closed_when_a_proved_owner_shares_a_resolved_gateway_id() {
         .claim_connection(sharing, true)
         .expect("room for an ordinary inbound peer");
 
-    handler.publish_gateway_ranking([RankedGateway::of_node(named, 1, GatewayStanding::Dialable)]);
+    handler.publish_gateway_ranking([RankedGateway::resolved(named, 1, GatewayStanding::Dialable)]);
 
     assert!(preferred_set(&handler).is_empty());
     assert_eq!(hold(&handler), 0);

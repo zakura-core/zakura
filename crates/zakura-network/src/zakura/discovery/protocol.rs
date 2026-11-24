@@ -24,6 +24,7 @@ use super::sequence_file::AuthoredSequenceFile;
 use super::state::{DiscoverySessionKey, DiscoveryState, LocalRecordState, SessionRecordError};
 use super::verified::VerifiedRecord;
 use super::wire::{record_len, write_record_body, NODE_ID_BYTES, SIGNATURE_BYTES};
+use crate::zakura::GatewayMatch;
 use crate::zakura::{
     canonical_ip,
     regulation::{SlotBudget, SlotPermit},
@@ -37,7 +38,6 @@ mod gateway_index;
 
 use eviction::EvictionIndex;
 use gateway_index::GatewayIndex;
-pub(crate) use gateway_index::GatewayMatch;
 
 /// Native discovery stream kind.
 pub const ZAKURA_STREAM_DISCOVERY: u16 = 4;
@@ -995,20 +995,6 @@ impl ZakuraDiscoveryDialCandidate {
             direct: self.direct_addrs.clone(),
         }
     }
-}
-
-/// What the discovery book knows about the node a miner mesh gateway ID
-/// names.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum GatewayTarget {
-    /// The book holds no node whose ID starts with the gateway ID.
-    Unknown,
-    /// The book holds two or more nodes whose IDs start with the gateway ID,
-    /// so it cannot tell which one the miners named.
-    Ambiguous,
-    /// The book holds exactly this node with the gateway ID, and can dial it
-    /// as the target says.
-    Node(NodeId, DialTarget),
 }
 
 /// Header-sync candidate selection hints owned by the header-sync reactor.
@@ -2106,7 +2092,10 @@ impl ZakuraDiscoveryHandle {
     ///
     /// It looks at the book only: the caller accounts for registered peers
     /// and dials in flight. The book stays locked for the whole list.
-    pub(crate) async fn gateway_targets(&self, gateways: &[GatewayId]) -> Vec<GatewayTarget> {
+    pub(crate) async fn gateway_targets(
+        &self,
+        gateways: &[GatewayId],
+    ) -> Vec<GatewayMatch<(NodeId, DialTarget)>> {
         let now = current_unix_secs();
         let state = self.inner.lock().await;
         gateways
@@ -2945,22 +2934,18 @@ impl ZakuraDiscoveryBook {
         }
     }
 
-    /// What the book knows about the node `gateway` names at `now`: none,
+    /// The nodes the book holds whose IDs start with `gateway`: none,
     /// several, or exactly one, with what [`Self::dial_target`] says about
-    /// dialing it.
+    /// dialing it at `now`.
     pub(crate) fn gateway_target(
         &self,
         gateway: &GatewayId,
         now: u64,
         dial_backoff: (Duration, Duration),
-    ) -> GatewayTarget {
-        match self.gateways.find(gateway) {
-            GatewayMatch::None => GatewayTarget::Unknown,
-            GatewayMatch::Several => GatewayTarget::Ambiguous,
-            GatewayMatch::One(node_id) => {
-                GatewayTarget::Node(node_id, self.dial_target(&node_id, now, dial_backoff))
-            }
-        }
+    ) -> GatewayMatch<(NodeId, DialTarget)> {
+        self.gateways
+            .find(gateway)
+            .map(|node_id| (node_id, self.dial_target(&node_id, now, dial_backoff)))
     }
 
     /// Marks a dial attempt for `node_id`.

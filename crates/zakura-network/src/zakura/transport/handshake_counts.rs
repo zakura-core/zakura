@@ -10,7 +10,7 @@ mod slots;
 use slots::ConnectionSlots;
 pub use slots::{SlotClass, SlotCount, SlotRefusal, SlotSplit};
 
-use super::{GatewayRanking, GatewayResolution, GatewayStanding, PreferredGateways};
+use super::{GatewayMatch, GatewayRanking, GatewayStanding, PreferredGateways};
 use crate::zakura::regulation::Bucket;
 use crate::zakura::{admission_host, Cadence, DEFAULT_ZAKURA_REDIAL_INITIAL_BACKOFF};
 
@@ -354,13 +354,14 @@ impl HandshakeCounts {
         let mut live = ranking.candidates(owners.iter());
         // A node discovery found connected may have lost its proof since.
         for gateway in &mut live {
-            if let GatewayResolution::Node(node, standing) = &mut gateway.resolution {
-                if *standing == GatewayStanding::Connected && !authenticated(node) {
-                    *standing = if self.connections.of_node(node).outbound > 0 {
+            if let GatewayMatch::One((node, GatewayStanding::Connected)) = gateway.resolution() {
+                if !authenticated(&node) {
+                    let standing = if self.connections.of_node(&node).outbound > 0 {
                         GatewayStanding::Dialing
                     } else {
                         GatewayStanding::Backoff
                     };
+                    *gateway = gateway.with_standing(standing);
                 }
             }
         }
@@ -370,7 +371,7 @@ impl HandshakeCounts {
         let by_gateway: HashMap<GatewayId, usize> = live
             .iter()
             .enumerate()
-            .map(|(index, gateway)| (gateway.gateway, index))
+            .map(|(index, gateway)| (gateway.gateway(), index))
             .collect();
         for owner in &owners {
             if let Some(&index) = by_gateway.get(&GatewayId::from_node_id(owner.as_bytes())) {

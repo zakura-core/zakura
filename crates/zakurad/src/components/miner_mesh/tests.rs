@@ -11,20 +11,26 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
+use tokio::sync::watch;
 use tower::Service;
 use zakura_chain::{
     block::{self, Block, Height},
+    chain_tip::mock::MockChainTip,
     miner_mesh::MinerMeshCommitment,
     parameters::Network,
     serialization::ZcashDeserializeInto,
     transaction::{self, Transaction},
 };
+use zakura_network::zakura::MinerGatewayRanking;
 use zakura_state::{
     ChainTipBlock, ChainTipSender, HashOrHeight, MinedTx, ReadRequest, ReadResponse,
 };
 use zakura_test::vectors::BLOCK_MAINNET_1_BYTES;
 
-use super::tracker::{run, TipMove, Tracker};
+use super::{
+    ranking::ranking_channel,
+    tracker::{run, TipMove, Tracker, REPUBLISH_INTERVAL},
+};
 use crate::BoxError;
 
 /// The tip used by most tests. On Regtest, whose blocks are 75 seconds apart,
@@ -270,6 +276,16 @@ where
         .collect()
 }
 
+/// The gateways in a published ranking, as (first ID byte, blocks).
+fn ranked(ranking: &watch::Receiver<MinerGatewayRanking>) -> Vec<(u8, u32)> {
+    ranking
+        .borrow()
+        .gateways
+        .iter()
+        .map(|gateway| (gateway.gateway_id[0], gateway.blocks))
+        .collect()
+}
+
 /// Reads until the tracker has nothing more it can read.
 async fn read_all<S>(tracker: &mut Tracker<S>)
 where
@@ -504,17 +520,23 @@ async fn a_failed_read_leaves_the_height_to_read_again() {
 async fn the_task_reads_the_window_and_ends_when_the_state_stops() {
     let chain = FakeChain::default();
     chain.set(0..=TIP, 1, Some(7));
-    let (mut tip_sender, _latest_tip, tip_change) = ChainTipSender::new(None, &regtest());
+    let (mut tip_sender, latest_tip, tip_change) = ChainTipSender::new(None, &regtest());
     tip_sender.set_finalized_tip(Some(tip_block(1, TIP)));
     drop(tip_sender);
+    let (ranking, publisher) = ranking_channel(true, regtest(), latest_tip);
+    let publisher = publisher.expect("a mining node gets a publisher");
 
     let mut tracker = tracker(&chain);
-    tokio::time::timeout(Duration::from_secs(10), run(&mut tracker, tip_change))
-        .await
-        .expect("the task ends once the tip sender is gone");
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        run(&mut tracker, tip_change, &publisher),
+    )
+    .await
+    .expect("the task ends once the tip sender is gone");
 
     assert_eq!(counts(&tracker), [(7, 51)]);
     assert!(tracker.snapshot().is_complete());
+    assert_eq!(ranked(&ranking), [(7, 51)]);
 }
 
 /// A repair compares every read block a reorg could reach, below the lowest
@@ -598,16 +620,21 @@ async fn a_comparison_that_fails_part_way_forgets_every_block_it_could_not_clear
 async fn the_task_follows_a_new_tip_before_reading_older_blocks() {
     let chain = FakeChain::default();
     chain.set(0..=TIP + 1, 1, None);
-    let (mut tip_sender, _latest_tip, tip_change) = ChainTipSender::new(None, &regtest());
+    let (mut tip_sender, latest_tip, tip_change) = ChainTipSender::new(None, &regtest());
     tip_sender.set_finalized_tip(Some(tip_block(1, TIP)));
     chain.on_hash_read(40, move || {
         tip_sender.set_best_non_finalized_tip(Some(tip_block(1, TIP + 1)));
     });
+    let (_ranking, publisher) = ranking_channel(true, regtest(), latest_tip);
+    let publisher = publisher.expect("a mining node gets a publisher");
 
     let mut tracker = tracker(&chain);
-    tokio::time::timeout(Duration::from_secs(10), run(&mut tracker, tip_change))
-        .await
-        .expect("the task ends once the tip sender is gone");
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        run(&mut tracker, tip_change, &publisher),
+    )
+    .await
+    .expect("the task ends once the tip sender is gone");
 
     let reads = chain.take_hash_reads();
     assert_eq!(
@@ -641,4 +668,96 @@ async fn a_new_tip_retries_the_block_that_could_not_be_read() {
 
     assert_eq!(counts(&tracker), [(7, 52)]);
     assert!(tracker.snapshot().is_complete());
+}
+
+/// A gateway a newly mined block names reaches the network once 100 more
+/// blocks are mined on top of it, and not before.
+///
+/// The clock is paused, so each sleep returns only once the task has handled
+/// everything it was sent.
+#[tokio::test(start_paused = true)]
+async fn a_mined_gateway_reaches_the_network_once_100_blocks_deep() {
+    let chain = FakeChain::default();
+    chain.set(0..=TIP + 101, 1, None);
+    let mined = TIP + 1;
+    chain.set([mined], 1, Some(7));
+
+    let (mut tip_sender, latest_tip, tip_change) = ChainTipSender::new(None, &regtest());
+    tip_sender.set_finalized_tip(Some(tip_block(1, TIP)));
+    let (mut ranking, publisher) = ranking_channel(true, regtest(), latest_tip);
+    let publisher = publisher.expect("a mining node gets a publisher");
+    let task = tokio::spawn(async move {
+        let mut tracker = tracker(&chain);
+        run(&mut tracker, tip_change, &publisher).await;
+    });
+
+    // Mine the block that names the gateway, then 99 more: it is 99 deep.
+    for height in mined..TIP + 101 {
+        tip_sender.set_best_non_finalized_tip(Some(tip_block(1, height)));
+        tokio::task::yield_now().await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(ranked(&ranking).is_empty());
+
+    // One more block puts it 100 deep.
+    tip_sender.set_best_non_finalized_tip(Some(tip_block(1, TIP + 101)));
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        ranking.wait_for(|ranking| !ranking.gateways.is_empty()),
+    )
+    .await
+    .expect("the gateway is published once its block is 100 deep")
+    .expect("the tracker is still running");
+    assert_eq!(ranked(&ranking), [(7, 1)]);
+
+    drop(tip_sender);
+    tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("the task ends once the tip sender is gone")
+        .expect("the task does not panic");
+}
+
+/// Whether the tip is recent enough depends on the clock, so a node whose tip
+/// grows too old stops preferring gateways without a new tip.
+#[tokio::test(start_paused = true)]
+async fn the_task_publishes_an_empty_ranking_once_the_tip_is_too_old() {
+    let chain = FakeChain::default();
+    chain.set(0..=TIP, 1, Some(7));
+    let (mut tip_sender, _latest_tip, tip_change) = ChainTipSender::new(None, &Network::Mainnet);
+    tip_sender.set_finalized_tip(Some(tip_block(1, TIP)));
+    // The tip the sync check reads, which the test can age without a tip change.
+    let (sync_tip, sync_tip_sender) = MockChainTip::new();
+    sync_tip_sender.send_best_tip_height(Height(TIP));
+    sync_tip_sender.send_best_tip_block_time(Utc::now());
+    let (mut ranking, publisher) = ranking_channel(true, Network::Mainnet, sync_tip);
+    let publisher = publisher.expect("a mining node gets a publisher");
+    let task = tokio::spawn(async move {
+        let mut tracker = Tracker::new(Network::Mainnet, chain.service());
+        run(&mut tracker, tip_change, &publisher).await;
+    });
+
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        ranking.wait_for(|ranking| !ranking.gateways.is_empty()),
+    )
+    .await
+    .expect("a synced node publishes the counted gateways")
+    .expect("the tracker is still running");
+    assert_eq!(ranked(&ranking), [(7, 51)]);
+
+    // More than six hours behind the local clock.
+    sync_tip_sender.send_best_tip_block_time(Utc::now() - chrono::Duration::hours(7));
+    tokio::time::timeout(
+        REPUBLISH_INTERVAL * 2,
+        ranking.wait_for(|ranking| ranking.gateways.is_empty()),
+    )
+    .await
+    .expect("the task publishes again within the republish interval")
+    .expect("the tracker is still running");
+
+    drop(tip_sender);
+    tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("the task ends once the tip sender is gone")
+        .expect("the task does not panic");
 }

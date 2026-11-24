@@ -67,7 +67,7 @@ use crate::{
         long_poll::LongPollId,
         transaction::{coinbase_needs_proof, TransactionTemplate},
     },
-    server::error::{LegacyCode, MapError, OkOrError},
+    server::error::{LegacyCode, MapError},
     EarlyMinedBlock, EarlyMinedBlockChannel, PendingBlockRegistry,
 };
 
@@ -1200,44 +1200,88 @@ where
 
 // - State and syncer checks
 
-/// Returns an error if the local best tip's block time is more than
-/// [`MAX_TIME_SINCE_CHAIN_TIP`] older than the local clock.
+/// Why the local best tip is too old to mine on.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum NotSyncedToTip {
+    /// The state has no best tip yet.
+    NoTip,
+    /// The best tip's block time is more than [`MAX_TIME_SINCE_CHAIN_TIP`]
+    /// older than the local clock.
+    TipTooOld {
+        /// The height of the local best tip.
+        local_tip_height: block::Height,
+        /// How much older the tip's block time is than the local clock.
+        time_since_tip: chrono::Duration,
+    },
+}
+
+/// Returns `Ok` if the local best tip's block time is at most
+/// [`MAX_TIME_SINCE_CHAIN_TIP`] older than the local clock, so the node is
+/// synced enough to mine.
 ///
-/// Returns early with `Ok(())` on test networks.
-/// This error might be incorrect if the local clock is skewed.
-pub fn check_synced_to_tip<Tip>(network: &Network, latest_chain_tip: Tip) -> RpcResult<()>
-where
-    Tip: ChainTip + Clone + Send + Sync + 'static,
-{
+/// Always `Ok` on test networks. The answer may be wrong if the local clock
+/// is skewed, and it changes as the clock moves even when the tip does not.
+pub fn synced_to_tip(
+    network: &Network,
+    latest_chain_tip: &impl ChainTip,
+) -> Result<(), NotSyncedToTip> {
     if network.is_a_test_network() {
         return Ok(());
     }
 
     let (local_tip_height, local_tip_time) = latest_chain_tip
         .best_tip_height_and_block_time()
-        .ok_or_misc_error("no chain tip available yet")?;
+        .ok_or(NotSyncedToTip::NoTip)?;
     let time_since_tip = chrono::Utc::now() - local_tip_time;
 
     if time_since_tip > MAX_TIME_SINCE_CHAIN_TIP {
-        tracing::info!(
-            ?time_since_tip,
-            ?local_tip_height,
-            "Zakura has not synced to the chain tip. \
-             Hint: check your network connection, clock, and time zone settings."
-        );
-
-        return Err(ErrorObject::new(
-            NOT_SYNCED_ERROR_CODE,
-            format!(
-                "Zakura has not synced to the chain tip, \
-                 time since local tip: {time_since_tip}, \
-                 local tip: {local_tip_height:?}. \
-                 Hint: check your network connection, clock, and time zone settings."
-            ),
-        ));
+        return Err(NotSyncedToTip::TipTooOld {
+            local_tip_height,
+            time_since_tip,
+        });
     }
 
     Ok(())
+}
+
+/// Returns an error if the local best tip's block time is more than
+/// [`MAX_TIME_SINCE_CHAIN_TIP`] older than the local clock.
+///
+/// [`synced_to_tip`] decides; this turns its answer into the RPC error and
+/// logs a tip that is too old. It returns early with `Ok(())` on test
+/// networks, and the error might be incorrect if the local clock is skewed.
+pub fn check_synced_to_tip<Tip>(network: &Network, latest_chain_tip: Tip) -> RpcResult<()>
+where
+    Tip: ChainTip + Clone + Send + Sync + 'static,
+{
+    match synced_to_tip(network, &latest_chain_tip) {
+        Ok(()) => Ok(()),
+        Err(NotSyncedToTip::NoTip) => Err(ErrorObject::new(
+            LegacyCode::Misc,
+            "no chain tip available yet",
+        )),
+        Err(NotSyncedToTip::TipTooOld {
+            local_tip_height,
+            time_since_tip,
+        }) => {
+            tracing::info!(
+                ?time_since_tip,
+                ?local_tip_height,
+                "Zakura has not synced to the chain tip. \
+                 Hint: check your network connection, clock, and time zone settings."
+            );
+
+            Err(ErrorObject::new(
+                NOT_SYNCED_ERROR_CODE,
+                format!(
+                    "Zakura has not synced to the chain tip, \
+                     time since local tip: {time_since_tip}, \
+                     local tip: {local_tip_height:?}. \
+                     Hint: check your network connection, clock, and time zone settings."
+                ),
+            ))
+        }
+    }
 }
 
 // - State and mempool data fetches

@@ -1476,6 +1476,102 @@ fn bpv1_2_reused_encoding_keeps_c_and_each_solve_finds_its_light_client_root() {
     assert!(unknown.outputs.is_empty());
 }
 
+/// A failed encode ends the body's pending entry. Its templates get no
+/// commitment, a late completion for it is stale, and the next template for
+/// the body starts a fresh encode instead of joining the dead one.
+#[test]
+fn failed_encode_lets_the_next_template_for_its_body_encode() {
+    let body = vec![0x66; 128];
+    let body_identity = compute_body_identity(2, &body);
+    let mut proposer = ProposerState::new(ProposerConfig::new([0x33; 32], node_id(1)));
+    let build = |proposer: &mut ProposerState, id: u64| {
+        proposer.step(ProposerInput::TemplateBuilt {
+            template_id: TemplateId(id),
+            body_identity,
+            light_client_root: [0; 32],
+        })
+    };
+
+    let first = start_encode(&build(&mut proposer, 1).outputs).expect("a new body encodes");
+    assert!(
+        build(&mut proposer, 2).outputs.is_empty(),
+        "a template for the same body joins the encode"
+    );
+    let failed = proposer.step(ProposerInput::EncodeFailed { work_id: first });
+    assert!(
+        failed.outputs.is_empty(),
+        "the failed encode commits nothing"
+    );
+    let late = proposer.step(ProposerInput::EncodeDone {
+        work_id: first,
+        encoded: encode_body(&Profile::TINY, &body, 2).unwrap(),
+    });
+    assert!(
+        late.outputs.is_empty(),
+        "a completion after the failure is stale"
+    );
+    assert_eq!(proposer.prepared_bytes(), 0);
+
+    let retry = start_encode(&build(&mut proposer, 3).outputs)
+        .expect("the next template starts a fresh encode");
+    let done = proposer.step(ProposerInput::EncodeDone {
+        work_id: retry,
+        encoded: encode_body(&Profile::TINY, &body, 2).unwrap(),
+    });
+    let committed: Vec<TemplateId> = done
+        .outputs
+        .iter()
+        .filter_map(|o| match o {
+            ProposerOutput::SetCommitment { template_id, .. } => Some(*template_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        committed,
+        [TemplateId(3)],
+        "only the retry's template commits"
+    );
+}
+
+/// mem-5: the `Propagation` reserve funds `MAX_PREPARED_ENCODINGS` encodes
+/// in flight. A template for another body gets no encode until one of them
+/// ends, so the shell never holds more encode leases than the reserve covers.
+#[test]
+fn mem5_encodes_in_flight_stay_within_the_reserve() {
+    let mut proposer = ProposerState::new(ProposerConfig::new([0x44; 32], node_id(1)));
+    let build = |proposer: &mut ProposerState, body: u8| {
+        proposer.step(ProposerInput::TemplateBuilt {
+            template_id: TemplateId(u64::from(body)),
+            body_identity: compute_body_identity(2, &[body; 128]),
+            light_client_root: [0; 32],
+        })
+    };
+    let max = u8::try_from(MAX_PREPARED_ENCODINGS).unwrap();
+    let in_flight: Vec<WorkId> = (0..max)
+        .map(|body| start_encode(&build(&mut proposer, body).outputs).expect("room to encode"))
+        .collect();
+    assert!(
+        build(&mut proposer, max).outputs.is_empty(),
+        "a body past the bound gets no encode"
+    );
+
+    proposer.step(ProposerInput::EncodeFailed {
+        work_id: in_flight[0],
+    });
+    assert!(
+        start_encode(&build(&mut proposer, max).outputs).is_some(),
+        "an ended encode frees its place"
+    );
+}
+
+/// The work id of the `StartEncode` in `outputs`, if any.
+fn start_encode(outputs: &[ProposerOutput]) -> Option<WorkId> {
+    outputs.iter().find_map(|o| match o {
+        ProposerOutput::StartEncode { work_id } => Some(*work_id),
+        _ => None,
+    })
+}
+
 /// A proposer that built template 1 for `body` under `light_client_root`
 /// and encoded it on `profile`. Returns the proposer and its commitment.
 fn encoded_proposer(

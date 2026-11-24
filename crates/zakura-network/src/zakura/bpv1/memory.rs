@@ -43,7 +43,8 @@ pub struct PropagationReserve {
     /// budget, and a largest `HeaderMeta` and local encoding per concurrent
     /// block ([`BlockTable::retained_bound`]).
     pub table: u64,
-    /// The proposer's prepared encodings plus as many encodes in flight.
+    /// The proposer's prepared encodings plus as many encodes in flight,
+    /// which [`ProposerState`] bounds.
     pub proposer: u64,
     /// One assembled block per concurrent block, until its verdict.
     pub assembled: u64,

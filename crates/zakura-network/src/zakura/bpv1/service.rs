@@ -65,7 +65,7 @@ use super::{
     },
 };
 use crate::zakura::{
-    memory::MemoryPool,
+    memory::{MemoryPool, PoolLease},
     wire_codec::{decode_frame, encode_frame, BlockHash, BoundedReader, LeU32, WireError},
     CustomService, Frame, FramedRecv, FramedSend, Peer, Service, ServicePeerDirection,
     SessionOpening, SessionPolicy, Stream, ZakuraConnId, ZakuraPeerId, ZakuraServiceId,
@@ -202,6 +202,18 @@ impl SharedNode {
     /// what its prepared encodings hold, under the same lock.
     fn step_proposer(&self, input: ProposerInput) -> ProposerStep {
         self.lock_proposer().change(|proposer| proposer.step(input))
+    }
+
+    /// Steps the end of an encode with `input`, then releases the encode's
+    /// `lease` under the proposer lock, once the proposer's lease covers the
+    /// encoding. The proposer counts a new encode under the same lock before
+    /// its lease is taken, so the shell never holds more encode leases than
+    /// the proposer has encodes in flight (mem-5).
+    fn finish_encode(&self, input: ProposerInput, lease: Option<PoolLease>) -> ProposerStep {
+        let mut proposer = self.lock_proposer();
+        let step = proposer.change(|proposer| proposer.step(input));
+        drop(lease);
+        step
     }
 
     fn lock_sessions(&self) -> MutexGuard<'_, HashMap<NodeId, LiveSession>> {
@@ -765,15 +777,23 @@ impl Bpv1Handle {
                     let encoded = encode_lease.as_ref().and_then(|_| {
                         encode_body(&self.node.profile, body_after_coinbase, tx_count).ok()
                     });
-                    let done_step = encoded.map(|encoded| {
-                        self.node
-                            .step_proposer(ProposerInput::EncodeDone { work_id, encoded })
-                    });
-                    drop(encode_lease);
-                    lock(&self.node.encodes).remove(&body_identity);
-                    // A failed encode leaves the results empty, so joined
+                    let input = match encoded {
+                        Some(encoded) => ProposerInput::EncodeDone { work_id, encoded },
+                        None => ProposerInput::EncodeFailed { work_id },
+                    };
+                    let done_step = self.node.finish_encode(input, encode_lease);
+                    // After a failed encode, another template may already
+                    // have started the body's next encode under this key.
+                    let mut encodes = lock(&self.node.encodes);
+                    if encodes
+                        .get(&body_identity)
+                        .is_some_and(|ours| Arc::ptr_eq(ours, &results))
+                    {
+                        encodes.remove(&body_identity);
+                    }
+                    drop(encodes);
+                    // A failed encode issues no commitment, so joined
                     // templates get `None`.
-                    let done_step = done_step?;
                     for ev in &done_step.events {
                         record_proposer_event(ev);
                     }

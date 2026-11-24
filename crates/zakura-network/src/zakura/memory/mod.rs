@@ -125,10 +125,7 @@ impl Consumer {
     /// holds long-lived leases that cannot return quickly (rule 4, `02 §5`).
     #[inline]
     pub const fn can_borrow(self) -> bool {
-        match self {
-            Self::BlockSync | Self::Serving | Self::Tx => true,
-            Self::Control | Self::Propagation | Self::Consensus | Self::Sessions => false,
-        }
+        matches!(self.priority(), Priority::Bulk) && !self.long_lived()
     }
 
     /// Whether this consumer's leases are long-lived, so a request its own

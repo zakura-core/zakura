@@ -683,9 +683,7 @@ fn lease_decoded_body(
     if exempt && lease.consumer() == Consumer::BlockSync {
         match memory_pool.try_acquire(Consumer::Consensus, lease.peer(), target.max(lease.bytes()))
         {
-            #[cfg_attr(not(any(test, zakura_sim)), allow(unused_mut))]
             Ok(mut consensus) => {
-                #[cfg(any(test, zakura_sim))]
                 if let Some(height) = lease.height() {
                     consensus.label_height(height);
                 }

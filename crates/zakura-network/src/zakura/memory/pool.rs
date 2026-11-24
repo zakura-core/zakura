@@ -20,7 +20,7 @@ use zakura_rt::{
 
 use super::{
     peer_pool::{serving_ceiling, try_serving_lease, Level, PeerKey, PeerSubPool},
-    Consumer, ConsumerSpec, PoolConfig, Priority, OVERRUN_WARN_INTERVAL,
+    Consumer, PoolConfig, Priority, OVERRUN_WARN_INTERVAL,
 };
 use crate::zakura::{ZakuraConnId, ZakuraPeerId};
 
@@ -90,13 +90,6 @@ pub(crate) struct PoolRuleInput {
     pub(crate) other_below_share_waiting: bool,
 }
 
-/// What a granted request draws from `S`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct PoolRuleGrant {
-    /// Bytes drawn from `S` (0 when the floor covers the request).
-    pub(crate) need_from_shared: u64,
-}
-
 /// Evaluates the pool rule (`02 §5`) for a non-empty request:
 ///
 /// 1. The requester stays within its cap.
@@ -106,8 +99,11 @@ pub(crate) struct PoolRuleGrant {
 ///
 /// Rule 3 binds only a requester at or above its share, so two requesters
 /// below their shares never refuse each other.
+///
+/// A grant returns the bytes it draws from `S` (0 when the floor covers the
+/// request).
 #[inline]
-pub(crate) fn check_pool_rule(input: PoolRuleInput) -> Result<PoolRuleGrant, Refusal> {
+pub(crate) fn check_pool_rule(input: PoolRuleInput) -> Result<u64, Refusal> {
     let protected = input.floor.saturating_add(input.share_of_s);
     let own_limit = |reason| {
         if input.long_lived {
@@ -151,7 +147,7 @@ pub(crate) fn check_pool_rule(input: PoolRuleInput) -> Result<PoolRuleGrant, Ref
         }
     }
 
-    Ok(PoolRuleGrant { need_from_shared })
+    Ok(need_from_shared)
 }
 
 /// Report returned by [`MemoryPoolMachine::check_overrun`] when live memory
@@ -237,14 +233,12 @@ impl WakeClass {
     }
 }
 
-/// Internal per-consumer state stored inline in `[ConsumerState; 7]`.
+/// Internal per-consumer runtime state stored inline in `[ConsumerState; 7]`.
+/// The floor, weight and planned cap stay in the machine's [`PoolConfig`].
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct ConsumerState {
-    floor: u64,
+    /// The dynamic cap, between the floor and the plan's cap.
     cap: u64,
-    /// The plan's cap: [`MemoryPoolMachine::set_cap`] never raises past it.
-    planned_cap: u64,
-    weight: u64,
     leased: u64,
     /// Waiters on pool contention, wait tokens included. Rule 3 counts them.
     contended: u32,
@@ -257,31 +251,6 @@ struct ConsumerState {
     tokens: u32,
     /// A refused `try_lease` armed one broadcast on [`MemoryPool::notifier`].
     poll_armed: bool,
-}
-
-impl ConsumerState {
-    #[inline]
-    fn from_spec(consumer: Consumer, spec: ConsumerSpec) -> Self {
-        let cap = match consumer.priority() {
-            Priority::Reserved => spec.floor,
-            Priority::Bulk => spec.cap.max(spec.floor),
-        };
-        Self {
-            floor: spec.floor,
-            cap,
-            planned_cap: cap,
-            weight: match consumer.priority() {
-                Priority::Reserved => 0,
-                Priority::Bulk => spec.weight,
-            },
-            ..Self::default()
-        }
-    }
-
-    #[inline]
-    fn shared_bytes(&self) -> u64 {
-        self.leased.saturating_sub(self.floor)
-    }
 }
 
 /// Bitmask of consumers (`1 << consumer.index()`).
@@ -348,8 +317,11 @@ pub struct Released {
 /// secondary model (decision-15).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MemoryPoolMachine {
-    budget_b: u64,
-    fixed_bytes: u64,
+    /// The plan, normalized as [`PoolConfig::with_consumer`] does: a reserved
+    /// consumer's cap is its floor and it has no weight, and a bulk cap is at
+    /// least its floor. Each spec's cap is the plan's cap, which
+    /// [`Self::set_cap`] never raises past.
+    config: PoolConfig,
     shared_capacity: u64,
     shared_used: u64,
     total_leased: u64,
@@ -362,26 +334,25 @@ pub struct MemoryPoolMachine {
 impl MemoryPoolMachine {
     /// Construct a new pool machine from `config`.
     pub fn new(config: PoolConfig) -> Self {
-        let mut consumers = [ConsumerState::default(); Consumer::COUNT];
-        let mut total_floors = 0u64;
-        let mut total_weight = 0u128;
-
-        for consumer in Consumer::ALL {
-            let state = ConsumerState::from_spec(consumer, config.consumers[consumer.index()]);
-            total_floors = total_floors.saturating_add(state.floor);
-            total_weight = total_weight.saturating_add(u128::from(state.weight));
-            consumers[consumer.index()] = state;
-        }
-
+        let config = Consumer::ALL.into_iter().fold(config, |config, consumer| {
+            config.with_consumer(consumer, config.consumers[consumer.index()])
+        });
+        let total_weight = config
+            .consumers
+            .iter()
+            .map(|spec| u128::from(spec.weight))
+            .sum();
         Self {
-            budget_b: config.budget_b,
-            fixed_bytes: config.fixed_bytes,
             shared_capacity: config.shared_capacity(),
             shared_used: 0,
             total_leased: 0,
-            total_floors,
+            total_floors: config.total_floors(),
             total_weight,
-            consumers,
+            consumers: Consumer::ALL.map(|consumer| ConsumerState {
+                cap: config.consumers[consumer.index()].cap,
+                ..ConsumerState::default()
+            }),
+            config,
             last_overrun_warn: None,
         }
     }
@@ -389,13 +360,13 @@ impl MemoryPoolMachine {
     /// Total P2P budget `B`.
     #[inline]
     pub fn budget_b(&self) -> u64 {
-        self.budget_b
+        self.config.budget_b
     }
 
     /// Non-leased fixed bytes.
     #[inline]
     pub fn fixed_bytes(&self) -> u64 {
-        self.fixed_bytes
+        self.config.fixed_bytes
     }
 
     /// Total shared capacity `S = B - fixed - reserves - Σ bulk_floors`
@@ -438,7 +409,7 @@ impl MemoryPoolMachine {
     /// Reserved floor of `consumer`.
     #[inline]
     pub fn floor(&self, consumer: Consumer) -> u64 {
-        self.consumers[consumer.index()].floor
+        self.config.consumers[consumer.index()].floor
     }
 
     /// Effective cap of `consumer` (`>= floor`).
@@ -450,7 +421,13 @@ impl MemoryPoolMachine {
     /// The plan's cap for `consumer`, which bounds [`Self::set_cap`].
     #[inline]
     pub fn planned_cap(&self, consumer: Consumer) -> u64 {
-        self.consumers[consumer.index()].planned_cap
+        self.config.consumers[consumer.index()].cap
+    }
+
+    /// Bytes `consumer` holds above its floor, which it draws from `S`.
+    #[inline]
+    fn shared_bytes(&self, consumer: Consumer) -> u64 {
+        self.leased(consumer).saturating_sub(self.floor(consumer))
     }
 
     /// Consumer's weighted share of `S` (bytes above its floor).
@@ -459,7 +436,7 @@ impl MemoryPoolMachine {
         if self.total_weight == 0 {
             return 0;
         }
-        let weight = u128::from(self.consumers[consumer.index()].weight);
+        let weight = u128::from(self.config.consumers[consumer.index()].weight);
         let share = u128::from(self.shared_capacity).saturating_mul(weight) / self.total_weight;
         // `share <= self.shared_capacity <= u64::MAX` always holds.
         u64::try_from(share).unwrap_or(u64::MAX)
@@ -468,8 +445,7 @@ impl MemoryPoolMachine {
     /// Consumer's protected total (`floor + share_of_S`).
     #[inline]
     pub fn protected_share(&self, consumer: Consumer) -> u64 {
-        self.consumers[consumer.index()]
-            .floor
+        self.floor(consumer)
             .saturating_add(self.share_of_s(consumer))
     }
 
@@ -492,22 +468,14 @@ impl MemoryPoolMachine {
         self.consumers[consumer.index()].waiters[class.index()]
     }
 
-    /// Whether a consumer other than `requester` waits on contention below
-    /// its share.
+    /// Whether a consumer other than `skip` waits on contention below its
+    /// share. Such a waiter holds every other consumer at or above its share
+    /// to it (rule 3).
     #[inline]
-    pub fn any_other_below_share_waiting(&self, requester: Consumer) -> bool {
-        Consumer::BULK.iter().any(|&other| {
-            other != requester && self.is_waiting(other) && self.is_below_share(other)
+    pub fn any_below_share_waiting_except(&self, skip: Option<Consumer>) -> bool {
+        Consumer::BULK.iter().any(|&consumer| {
+            Some(consumer) != skip && self.is_waiting(consumer) && self.is_below_share(consumer)
         })
-    }
-
-    /// Whether any consumer waits on contention below its share, which holds
-    /// every other consumer at or above its share to it (rule 3).
-    #[inline]
-    pub fn any_below_share_waiting(&self) -> bool {
-        Consumer::BULK
-            .iter()
-            .any(|&consumer| self.is_waiting(consumer) && self.is_below_share(consumer))
     }
 
     /// Set the dynamic cap of a bulk consumer, clamped between its floor and
@@ -519,8 +487,8 @@ impl MemoryPoolMachine {
         if consumer.priority() == Priority::Reserved {
             return;
         }
-        let state = &mut self.consumers[consumer.index()];
-        state.cap = new_cap.clamp(state.floor, state.planned_cap);
+        self.consumers[consumer.index()].cap =
+            new_cap.clamp(self.floor(consumer), self.planned_cap(consumer));
     }
 
     /// Decide a lease of `bytes` for `consumer` under the pool rule (`02 §5`),
@@ -535,31 +503,30 @@ impl MemoryPoolMachine {
             return Ok(());
         }
         let state = self.consumers[consumer.index()];
+        let floor = self.floor(consumer);
         let protected = self.protected_share(consumer);
         let reachable = if consumer.can_borrow() {
-            state
-                .cap
-                .min(state.floor.saturating_add(self.shared_capacity))
+            state.cap.min(floor.saturating_add(self.shared_capacity))
         } else {
             state.cap.min(protected)
         };
         let input = PoolRuleInput {
             leased: state.leased,
             request: bytes,
-            floor: state.floor,
+            floor,
             cap: state.cap,
-            share_of_s: protected - state.floor,
+            share_of_s: protected - floor,
             shared_free: Some(self.shared_free()),
             reachable,
             can_borrow: consumer.can_borrow(),
             long_lived: consumer.long_lived(),
-            other_below_share_waiting: self.any_other_below_share_waiting(consumer),
+            other_below_share_waiting: self.any_below_share_waiting_except(Some(consumer)),
         };
 
         match check_pool_rule(input) {
-            Ok(grant) => {
+            Ok(need_from_shared) => {
                 self.consumers[consumer.index()].leased += bytes;
-                self.shared_used += grant.need_from_shared;
+                self.shared_used += need_from_shared;
                 self.total_leased += bytes;
                 debug_assert!(self.shared_used <= self.shared_capacity);
                 debug_assert!(self.total_leased <= self.lease_limit());
@@ -578,6 +545,7 @@ impl MemoryPoolMachine {
     ///
     /// Clamps to `leased` in release builds and debug-asserts `bytes <= leased`.
     pub fn release(&mut self, consumer: Consumer, bytes: u64) -> Released {
+        let old_shared = self.shared_bytes(consumer);
         let state = &mut self.consumers[consumer.index()];
         debug_assert!(
             bytes <= state.leased,
@@ -586,9 +554,8 @@ impl MemoryPoolMachine {
             state.leased
         );
         let actual = bytes.min(state.leased);
-        let old_shared = state.shared_bytes();
         state.leased -= actual;
-        let freed_shared = old_shared - state.shared_bytes();
+        let freed_shared = old_shared - self.shared_bytes(consumer);
         self.shared_used -= freed_shared;
         self.total_leased -= actual;
         Released {
@@ -607,25 +574,22 @@ impl MemoryPoolMachine {
         if from == to {
             return 0;
         }
-        let source = self.consumers[from.index()];
-        let target = self.consumers[to.index()];
-        let floor_room = target.floor.saturating_sub(target.leased);
+        let floor_room = self.floor(to).saturating_sub(self.leased(to));
         // A bulk `to` takes free `S` plus the `S` bytes `from` returns.
         let room = match to.priority() {
             Priority::Reserved => floor_room,
             Priority::Bulk => floor_room
                 .saturating_add(self.shared_free())
-                .saturating_add(source.shared_bytes()),
+                .saturating_add(self.shared_bytes(from)),
         };
-        let moved = bytes.min(source.leased).min(room);
+        let moved = bytes.min(self.leased(from)).min(room);
         if moved == 0 {
             return 0;
         }
         let released = self.release(from, moved);
-        let state = &mut self.consumers[to.index()];
-        let old_shared = state.shared_bytes();
-        state.leased += released.bytes;
-        let taken_shared = state.shared_bytes() - old_shared;
+        let old_shared = self.shared_bytes(to);
+        self.consumers[to.index()].leased += released.bytes;
+        let taken_shared = self.shared_bytes(to) - old_shared;
         self.shared_used += taken_shared;
         self.total_leased += released.bytes;
         debug_assert!(self.shared_used <= self.shared_capacity);
@@ -687,7 +651,7 @@ impl MemoryPoolMachine {
         if let Some(consumer) = released_by {
             self.wake_consumer(consumer, &mut wake);
         }
-        let rule3_now = self.any_below_share_waiting();
+        let rule3_now = self.any_below_share_waiting_except(None);
         if freed_shared || (rule3_before && !rule3_now) {
             for consumer in Consumer::BULK {
                 if Some(consumer) != released_by && (!rule3_now || self.is_below_share(consumer)) {
@@ -729,15 +693,14 @@ impl MemoryPoolMachine {
     /// If another consumer below its share is waiting, caps at `protected_share`;
     /// otherwise includes `shared_free`, bounded by `cap`.
     pub fn available_ceiling(&self, consumer: Consumer) -> u64 {
-        let state = &self.consumers[consumer.index()];
-        if !consumer.can_borrow() || self.any_other_below_share_waiting(consumer) {
-            self.protected_share(consumer).min(state.cap)
+        let cap = self.cap(consumer);
+        if !consumer.can_borrow() || self.any_below_share_waiting_except(Some(consumer)) {
+            self.protected_share(consumer).min(cap)
         } else {
-            state
-                .floor
-                .saturating_add(state.shared_bytes())
+            self.floor(consumer)
+                .saturating_add(self.shared_bytes(consumer))
                 .saturating_add(self.shared_free())
-                .min(state.cap)
+                .min(cap)
         }
     }
 
@@ -745,7 +708,7 @@ impl MemoryPoolMachine {
     /// only operator overrides allow.
     #[inline]
     pub fn is_over_budget(&self) -> bool {
-        self.fixed_bytes.saturating_add(self.total_leased) > self.budget_b
+        self.fixed_bytes().saturating_add(self.total_leased) > self.budget_b()
     }
 
     /// Check whether live memory (`fixed_bytes + total_leased`) exceeds `B`.
@@ -755,8 +718,9 @@ impl MemoryPoolMachine {
     /// settings where `fixed + reserves + Σ floors <= B`, live memory never
     /// exceeds `B`, so this always returns `None`.
     pub fn check_overrun(&mut self, now: Instant) -> Option<OverrunReport> {
-        let live_bytes = self.fixed_bytes.saturating_add(self.total_leased);
-        if live_bytes <= self.budget_b {
+        let budget_bytes = self.budget_b();
+        let live_bytes = self.fixed_bytes().saturating_add(self.total_leased);
+        if live_bytes <= budget_bytes {
             return None;
         }
         if let Some(last) = self.last_overrun_warn {
@@ -767,31 +731,28 @@ impl MemoryPoolMachine {
         self.last_overrun_warn = Some(now);
         Some(OverrunReport {
             live_bytes,
-            budget_bytes: self.budget_b,
-            excess_bytes: live_bytes - self.budget_b,
+            budget_bytes,
+            excess_bytes: live_bytes - budget_bytes,
         })
     }
 
     /// Take an immutable snapshot of all counters and consumer states.
     pub fn snapshot(&self) -> PoolSnapshot {
         PoolSnapshot {
-            budget_b: self.budget_b,
-            fixed_bytes: self.fixed_bytes,
+            budget_b: self.budget_b(),
+            fixed_bytes: self.fixed_bytes(),
             shared_capacity: self.shared_capacity,
             shared_used: self.shared_used,
             total_leased: self.total_leased,
             lease_limit: self.lease_limit(),
-            consumers: Consumer::ALL.map(|consumer| {
-                let state = &self.consumers[consumer.index()];
-                ConsumerSnapshot {
-                    consumer,
-                    leased: state.leased,
-                    floor: state.floor,
-                    cap: state.cap,
-                    weight: state.weight,
-                    protected_share: self.protected_share(consumer),
-                    waiting: self.is_waiting(consumer),
-                }
+            consumers: Consumer::ALL.map(|consumer| ConsumerSnapshot {
+                consumer,
+                leased: self.leased(consumer),
+                floor: self.floor(consumer),
+                cap: self.cap(consumer),
+                weight: self.config.consumers[consumer.index()].weight,
+                protected_share: self.protected_share(consumer),
+                waiting: self.is_waiting(consumer),
             }),
         }
     }
@@ -960,6 +921,28 @@ struct Request<'a> {
     bytes: u64,
 }
 
+impl<'a> Request<'a> {
+    /// A request of `bytes` for `consumer` outside serving.
+    fn new(consumer: Consumer, conn: Option<ZakuraConnId>, bytes: u64) -> Self {
+        Self {
+            consumer,
+            conn,
+            serving: None,
+            bytes,
+        }
+    }
+
+    /// A request to grow `lease` by `bytes`.
+    fn regrow(lease: &'a PoolLease, bytes: u64) -> Self {
+        Self {
+            consumer: lease.consumer,
+            conn: lease.peer,
+            serving: lease.serving.as_ref().map(ServingTarget::existing),
+            bytes,
+        }
+    }
+}
+
 /// The serving peer a `Consumer::Serving` request charges.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ServingTarget<'a> {
@@ -1070,6 +1053,16 @@ impl PoolState {
         }
     }
 
+    /// The tag of a newly granted lease.
+    fn grant_tag(&mut self) -> LeaseTag {
+        LeaseTag {
+            #[cfg(any(test, zakura_sim))]
+            id: self.alloc_lease_id(),
+            #[cfg(any(test, zakura_sim))]
+            height: None,
+        }
+    }
+
     #[cfg(any(test, zakura_sim))]
     fn alloc_lease_id(&mut self) -> u64 {
         let id = self.next_lease_id;
@@ -1101,12 +1094,20 @@ impl PoolMetrics {
     }
 }
 
-/// Side effects of one critical section, applied after unlocking.
+/// What one critical section changed, and its side effects, which apply
+/// after unlocking.
 #[derive(Debug, Default)]
 struct Effects {
+    /// A consumer that returned bytes or gained room (see
+    /// [`MemoryPoolMachine::wake`]).
+    released_by: Option<Consumer>,
+    /// Whether bytes returned to `S`.
+    freed_shared: bool,
     wake: Wake,
     /// A consumer's leased bytes to publish.
     leased: Option<(Consumer, u64)>,
+    /// A consumer's cap to publish.
+    cap: Option<(Consumer, u64)>,
     /// The leased bytes of the consumer a move filled, to publish.
     moved_into: Option<(Consumer, u64)>,
     /// A consumer that started waiting on contention.
@@ -1238,17 +1239,7 @@ impl MemoryPool {
     /// Create a zero-byte lease bound to this pool without locking or emitting
     /// an observer event.
     pub fn empty_lease(&self, consumer: Consumer, peer: Option<ZakuraConnId>) -> PoolLease {
-        PoolLease {
-            pool: self.clone(),
-            consumer,
-            peer,
-            serving: None,
-            bytes: 0,
-            #[cfg(any(test, zakura_sim))]
-            lease_id: 0,
-            #[cfg(any(test, zakura_sim))]
-            height: None,
-        }
+        PoolLease::new(self, consumer, peer, None, 0, LeaseTag::default())
     }
 
     /// Try to acquire a lease of `bytes` for `consumer` without waiting.
@@ -1261,12 +1252,7 @@ impl MemoryPool {
         peer: Option<ZakuraConnId>,
         bytes: u64,
     ) -> Result<PoolLease, LeaseDenied> {
-        self.try_request(&Request {
-            consumer,
-            conn: peer,
-            serving: None,
-            bytes,
-        })
+        self.try_request(&Request::new(consumer, peer, bytes))
     }
 
     /// Wait until `bytes` can be leased for `consumer`, without holding any
@@ -1281,12 +1267,7 @@ impl MemoryPool {
         peer: Option<ZakuraConnId>,
         bytes: u64,
     ) -> Result<PoolLease, LeaseDenied> {
-        let request = Request {
-            consumer,
-            conn: peer,
-            serving: None,
-            bytes,
-        };
+        let request = Request::new(consumer, peer, bytes);
         self.wait_for_lease(&request, std::future::pending::<LeaseDenied>())
             .await
     }
@@ -1310,12 +1291,7 @@ impl MemoryPool {
         shutdown: &zakura_rt::sync::CancellationToken,
         wait_timeout: std::time::Duration,
     ) -> Result<PoolLease, LeaseDenied> {
-        let request = Request {
-            consumer: Consumer::Sessions,
-            conn: Some(conn_id),
-            serving: None,
-            bytes,
-        };
+        let request = Request::new(Consumer::Sessions, Some(conn_id), bytes);
         let stop = async {
             zakura_rt::select! {
                 () = shutdown.cancelled() => {}
@@ -1345,18 +1321,13 @@ impl MemoryPool {
     ///
     /// Raising a cap wakes `consumer`; lowering one revokes no live lease.
     pub fn set_cap(&self, consumer: Consumer, new_cap: u64) {
-        let (cap, wake) = {
-            let mut state = self.lock();
-            let machine = &mut state.machine;
-            let old_cap = machine.cap(consumer);
-            let rule3_before = machine.any_below_share_waiting();
-            machine.set_cap(consumer, new_cap);
-            let cap = machine.cap(consumer);
-            let raised = (cap > old_cap).then_some(consumer);
-            (cap, machine.wake(raised, false, rule3_before))
-        };
-        self.inner.metrics.cap[consumer.index()].set(gauge_value(cap));
-        self.wake(wake);
+        self.with_state(|state, effects| {
+            let old_cap = state.machine.cap(consumer);
+            state.machine.set_cap(consumer, new_cap);
+            let cap = state.machine.cap(consumer);
+            effects.cap = Some((consumer, cap));
+            effects.released_by = (cap > old_cap).then_some(consumer);
+        });
     }
 
     /// Current live ceiling available to `consumer`.
@@ -1405,29 +1376,20 @@ impl MemoryPool {
     /// Unregister one serving connection of `peer`. The other peers' parts
     /// grow, so serving's waiters wake.
     pub(crate) fn unregister_serving_peer(&self, peer: &ZakuraPeerId) {
-        let wake = {
-            let mut state = self.lock();
-            let rule3_before = state.machine.any_below_share_waiting();
+        self.with_state(|state, effects| {
             state.serving.unregister(peer);
-            state
-                .machine
-                .wake(Some(Consumer::Serving), false, rule3_before)
-        };
-        self.wake(wake);
+            effects.released_by = Some(Consumer::Serving);
+        });
     }
 
     /// Set `peer`'s serving cap. Raising it wakes serving's waiters.
     pub(crate) fn set_serving_peer_cap(&self, peer: &ZakuraPeerId, cap: u64) {
-        let wake = {
-            let mut state = self.lock();
-            let rule3_before = state.machine.any_below_share_waiting();
-            let raised = state
+        self.with_state(|state, effects| {
+            effects.released_by = state
                 .serving
                 .set_cap(peer, cap)
                 .then_some(Consumer::Serving);
-            state.machine.wake(raised, false, rule3_before)
-        };
-        self.wake(wake);
+        });
     }
 
     /// Bytes `peer` holds in serving's sub-pool.
@@ -1478,24 +1440,16 @@ impl MemoryPool {
         if request.bytes == 0 {
             return Ok(self.empty_lease(request.consumer, request.conn));
         }
-        let mut effects = Effects::default();
-        let result = {
-            let mut state = self.lock();
-            let rule3_before = state.machine.any_below_share_waiting();
+        self.with_state(|state, effects| {
             let result = match state.lease(request) {
-                Ok(serving) => Ok(self.grant(&mut state, request, serving, &mut effects)),
+                Ok(serving) => Ok(self.grant(state, request, serving, effects)),
                 Err((refusal, _)) => Err(refusal.reason()),
             };
             if let Some(target) = request.serving {
                 state.serving.remove_if_idle(target.peer);
             }
-            effects
-                .wake
-                .merge(state.machine.wake(None, false, rule3_before));
             result
-        };
-        self.apply(effects);
-        result
+        })
     }
 
     /// The one wait loop: try, register as a waiter on refusal, and sleep
@@ -1547,14 +1501,11 @@ impl MemoryPool {
         slot: &mut Option<WaitSlot>,
         woken: bool,
     ) -> (Attempt, u64) {
-        let mut effects = Effects::default();
-        let (attempt, version) = {
-            let mut state = self.lock();
+        self.with_state(|state, effects| {
             let version = self.inner.capacity_version.load(Ordering::Acquire);
-            let rule3_before = state.machine.any_below_share_waiting();
             let attempt = match state.lease(request) {
                 Ok(serving) => {
-                    let lease = self.grant(&mut state, request, serving, &mut effects);
+                    let lease = self.grant(state, request, serving, effects);
                     if let Some(old) = slot.take() {
                         state.remove_slot(&old);
                     }
@@ -1598,13 +1549,8 @@ impl MemoryPool {
                     .wake
                     .merge(state.machine.take_turn(request.consumer));
             }
-            effects
-                .wake
-                .merge(state.machine.wake(None, false, rule3_before));
             (attempt, version)
-        };
-        self.apply(effects);
-        (attempt, version)
+        })
     }
 
     /// Build the lease for a granted `request` and record the grant.
@@ -1616,44 +1562,26 @@ impl MemoryPool {
         effects: &mut Effects,
     ) -> PoolLease {
         let consumer = request.consumer;
-        let consumer_leased = state.machine.leased(consumer);
-        effects.leased = Some((consumer, consumer_leased));
-        if state.machine.is_over_budget() {
-            effects.overrun = state.machine.check_overrun(Instant::now());
-        }
-        #[cfg(any(test, zakura_sim))]
-        let lease_id = state.alloc_lease_id();
+        let _consumer_leased = record_grant(state, consumer, effects);
+        let tag = state.grant_tag();
         #[cfg(any(test, zakura_sim))]
         self.emit(PoolEvent::Granted {
-            lease_id,
+            lease_id: tag.id,
             consumer,
             peer: request.conn,
             bytes: request.bytes,
-            consumer_leased,
+            consumer_leased: _consumer_leased,
             consumer_cap: state.machine.cap(consumer),
             consumer_share: state.machine.protected_share(consumer),
             total_leased: state.machine.total_leased(),
             pool_limit: state.machine.lease_limit(),
         });
-        PoolLease {
-            pool: self.clone(),
-            consumer,
-            peer: request.conn,
-            serving,
-            bytes: request.bytes,
-            #[cfg(any(test, zakura_sim))]
-            lease_id,
-            #[cfg(any(test, zakura_sim))]
-            height: None,
-        }
+        PoolLease::new(self, consumer, request.conn, serving, request.bytes, tag)
     }
 
     /// Return `lease`'s bytes above `new_bytes` to the pool.
     fn shrink_lease(&self, lease: &PoolLease, new_bytes: u64) {
-        let mut effects = Effects::default();
-        {
-            let mut state = self.lock();
-            let rule3_before = state.machine.any_below_share_waiting();
+        self.with_state(|state, effects| {
             let released = state.release(
                 lease.consumer,
                 lease.serving.as_ref(),
@@ -1661,10 +1589,12 @@ impl MemoryPool {
             );
             let consumer_leased = state.machine.leased(lease.consumer);
             effects.leased = Some((lease.consumer, consumer_leased));
+            effects.released_by = Some(lease.consumer);
+            effects.freed_shared = released.freed_shared > 0;
             #[cfg(any(test, zakura_sim))]
             self.emit(if new_bytes == 0 {
                 PoolEvent::Released {
-                    lease_id: lease.lease_id,
+                    lease_id: lease.tag.id,
                     consumer: lease.consumer,
                     peer: lease.peer,
                     bytes: released.bytes,
@@ -1674,7 +1604,7 @@ impl MemoryPool {
                 }
             } else {
                 PoolEvent::Resized {
-                    lease_id: lease.lease_id,
+                    lease_id: lease.tag.id,
                     consumer: lease.consumer,
                     peer: lease.peer,
                     old_bytes: lease.bytes,
@@ -1686,71 +1616,53 @@ impl MemoryPool {
                     pool_limit: state.machine.lease_limit(),
                 }
             });
-            effects.wake = state.machine.wake(
-                Some(lease.consumer),
-                released.freed_shared > 0,
-                rule3_before,
-            );
-        }
-        self.apply(effects);
+        });
     }
 
     /// Grow `lease` to `new_bytes` without waiting.
     fn grow_lease(&self, lease: &PoolLease, new_bytes: u64) -> Result<(), LeaseDenied> {
-        let request = Request {
-            consumer: lease.consumer,
-            conn: lease.peer,
-            serving: lease.serving.as_ref().map(ServingTarget::existing),
-            bytes: new_bytes - lease.bytes,
-        };
-        let mut effects = Effects::default();
-        let result = {
-            let mut state = self.lock();
-            let rule3_before = state.machine.any_below_share_waiting();
-            let result = state.lease(&request).map(|_| {
-                let consumer_leased = state.machine.leased(lease.consumer);
-                effects.leased = Some((lease.consumer, consumer_leased));
-                if state.machine.is_over_budget() {
-                    effects.overrun = state.machine.check_overrun(Instant::now());
-                }
-                #[cfg(any(test, zakura_sim))]
-                self.emit(PoolEvent::Resized {
-                    lease_id: lease.lease_id,
-                    consumer: lease.consumer,
-                    peer: lease.peer,
-                    old_bytes: lease.bytes,
-                    new_bytes,
-                    consumer_leased,
-                    consumer_cap: state.machine.cap(lease.consumer),
-                    consumer_share: state.machine.protected_share(lease.consumer),
-                    total_leased: state.machine.total_leased(),
-                    pool_limit: state.machine.lease_limit(),
-                });
+        let request = Request::regrow(lease, new_bytes - lease.bytes);
+        self.with_state(|state, effects| {
+            state
+                .lease(&request)
+                .map_err(|(refusal, _)| refusal.reason())?;
+            let _consumer_leased = record_grant(state, lease.consumer, effects);
+            #[cfg(any(test, zakura_sim))]
+            self.emit(PoolEvent::Resized {
+                lease_id: lease.tag.id,
+                consumer: lease.consumer,
+                peer: lease.peer,
+                old_bytes: lease.bytes,
+                new_bytes,
+                consumer_leased: _consumer_leased,
+                consumer_cap: state.machine.cap(lease.consumer),
+                consumer_share: state.machine.protected_share(lease.consumer),
+                total_leased: state.machine.total_leased(),
+                pool_limit: state.machine.lease_limit(),
             });
-            effects
-                .wake
-                .merge(state.machine.wake(None, false, rule3_before));
-            result.map_err(|(refusal, _)| refusal.reason())
-        };
-        self.apply(effects);
-        result
+            Ok(())
+        })
     }
 
     /// Move up to `lease`'s bytes to `to` (see [`MemoryPoolMachine::transfer`]),
     /// and return the bytes moved and the new lease's identifier.
     fn move_lease(&self, lease: &PoolLease, to: Consumer) -> (u64, u64) {
         debug_assert!(lease.serving.is_none(), "serving leases never move");
-        let mut effects = Effects::default();
-        let outcome = {
-            let mut state = self.lock();
-            let rule3_before = state.machine.any_below_share_waiting();
+        self.with_state(|state, effects| {
             let shared_before = state.machine.shared_used();
             let moved = state.machine.transfer(lease.consumer, to, lease.bytes);
+            if moved == 0 {
+                return (0, 0);
+            }
+            effects.leased = Some((lease.consumer, state.machine.leased(lease.consumer)));
+            effects.moved_into = Some((to, state.machine.leased(to)));
+            effects.released_by = Some(lease.consumer);
+            effects.freed_shared = state.machine.shared_used() < shared_before;
             #[cfg(any(test, zakura_sim))]
-            let to_lease_id = if moved > 0 {
+            let to_lease_id = {
                 let to_lease_id = state.alloc_lease_id();
                 self.emit(PoolEvent::Moved {
-                    from_lease_id: lease.lease_id,
+                    from_lease_id: lease.tag.id,
                     to_lease_id,
                     from: lease.consumer,
                     to,
@@ -1762,35 +1674,33 @@ impl MemoryPool {
                     pool_limit: state.machine.lease_limit(),
                 });
                 to_lease_id
-            } else {
-                0
             };
             #[cfg(not(any(test, zakura_sim)))]
             let to_lease_id = 0;
-            if moved > 0 {
-                effects.leased = Some((lease.consumer, state.machine.leased(lease.consumer)));
-                effects.moved_into = Some((to, state.machine.leased(to)));
-                let freed_shared = state.machine.shared_used() < shared_before;
-                effects.wake = state
-                    .machine
-                    .wake(Some(lease.consumer), freed_shared, rule3_before);
-            }
             (moved, to_lease_id)
-        };
-        self.apply(effects);
-        outcome
+        })
     }
 
-    /// Unregister a waiter that stopped waiting, waking consumers that rule 3
-    /// held back for it.
-    fn unregister(&self, unregister: impl FnOnce(&mut PoolState)) {
-        let wake = {
+    /// Run one critical section. `change` updates the pool state and records
+    /// what it changed in `effects`. Then, under the same lock, the machine
+    /// decides whose waiters the change wakes: rule 3's state before the
+    /// change is read first, so a change that stops rule 3 holding consumers
+    /// back wakes them. Metrics, the overrun warning and wakeups apply after
+    /// unlocking.
+    fn with_state<R>(&self, change: impl FnOnce(&mut PoolState, &mut Effects) -> R) -> R {
+        let mut effects = Effects::default();
+        let out = {
             let mut state = self.lock();
-            let rule3_before = state.machine.any_below_share_waiting();
-            unregister(&mut state);
-            state.machine.wake(None, false, rule3_before)
+            let rule3_before = state.machine.any_below_share_waiting_except(None);
+            let out = change(&mut state, &mut effects);
+            let wake = state
+                .machine
+                .wake(effects.released_by, effects.freed_shared, rule3_before);
+            effects.wake.merge(wake);
+            out
         };
-        self.wake(wake);
+        self.apply(effects);
+        out
     }
 
     #[inline]
@@ -1805,6 +1715,9 @@ impl MemoryPool {
         let metrics = &self.inner.metrics;
         for (consumer, bytes) in effects.leased.into_iter().chain(effects.moved_into) {
             metrics.leased[consumer.index()].set(gauge_value(bytes));
+        }
+        if let Some((consumer, cap)) = effects.cap {
+            metrics.cap[consumer.index()].set(gauge_value(cap));
         }
         if let Some(consumer) = effects.waited {
             metrics.waits[consumer.index()].increment(1);
@@ -1862,7 +1775,8 @@ struct WaitRegistration<'a> {
 impl Drop for WaitRegistration<'_> {
     fn drop(&mut self) {
         if let Some(slot) = self.slot.take() {
-            self.pool.unregister(|state| state.remove_slot(&slot));
+            // Rule 3 may have held consumers back for this waiter.
+            self.pool.with_state(|state, _| state.remove_slot(&slot));
         }
     }
 }
@@ -1880,9 +1794,22 @@ pub struct PoolWaitToken {
 impl Drop for PoolWaitToken {
     fn drop(&mut self) {
         let consumer = self.consumer;
+        // Rule 3 may have held consumers back for this token.
         self.pool
-            .unregister(|state| state.machine.remove_token(consumer));
+            .with_state(|state, _| state.machine.remove_token(consumer));
     }
+}
+
+/// A lease's identity for test and simulator observers. Production builds
+/// carry nothing.
+#[derive(Clone, Copy, Debug, Default)]
+struct LeaseTag {
+    /// Unique lease identifier within the pool, 0 while the lease is empty.
+    #[cfg(any(test, zakura_sim))]
+    id: u64,
+    /// The block height this lease funds, for the simulator's `mem-15` check.
+    #[cfg(any(test, zakura_sim))]
+    height: Option<u32>,
 }
 
 /// RAII handle owning a logical-byte lease in a [`MemoryPool`].
@@ -1897,11 +1824,7 @@ pub struct PoolLease {
     /// The serving peer whose part of serving also holds these bytes.
     serving: Option<PeerKey>,
     bytes: u64,
-    #[cfg(any(test, zakura_sim))]
-    lease_id: u64,
-    /// The block height this lease funds, for the simulator's `mem-15` check.
-    #[cfg(any(test, zakura_sim))]
-    height: Option<u32>,
+    tag: LeaseTag,
 }
 
 impl fmt::Debug for PoolLease {
@@ -1915,6 +1838,25 @@ impl fmt::Debug for PoolLease {
 }
 
 impl PoolLease {
+    /// A handle for `bytes` that `pool` already charged to `consumer`.
+    fn new(
+        pool: &MemoryPool,
+        consumer: Consumer,
+        peer: Option<ZakuraConnId>,
+        serving: Option<PeerKey>,
+        bytes: u64,
+        tag: LeaseTag,
+    ) -> Self {
+        Self {
+            pool: pool.clone(),
+            consumer,
+            peer,
+            serving,
+            bytes,
+            tag,
+        }
+    }
+
     /// Consumer charged for this lease.
     #[inline]
     pub fn consumer(&self) -> Consumer {
@@ -1943,21 +1885,31 @@ impl PoolLease {
     #[cfg(any(test, zakura_sim))]
     #[inline]
     pub fn lease_id(&self) -> u64 {
-        self.lease_id
+        self.tag.id
     }
 
     /// Name `height` as the block height this lease funds, and report it to
-    /// the observer. Splits, moves and regrants keep the name.
-    #[cfg(any(test, zakura_sim))]
+    /// the observer. Splits, moves and regrants keep the name. Only test and
+    /// simulator builds keep it, for the simulator's `mem-15` check.
+    #[inline]
     pub fn label_height(&mut self, height: u32) {
-        self.height = Some(height);
-        self.report_height();
+        #[cfg(any(test, zakura_sim))]
+        {
+            self.tag.height = Some(height);
+            self.report_height();
+        }
+        #[cfg(not(any(test, zakura_sim)))]
+        let _ = height;
     }
 
-    /// The block height this lease funds, if a caller named one.
-    #[cfg(any(test, zakura_sim))]
+    /// The block height this lease funds, if a caller named one. Production
+    /// builds keep no label, so they always return `None`.
+    #[inline]
     pub fn height(&self) -> Option<u32> {
-        self.height
+        #[cfg(any(test, zakura_sim))]
+        return self.tag.height;
+        #[cfg(not(any(test, zakura_sim)))]
+        None
     }
 
     /// Report this lease's height to the observer, if the lease is live.
@@ -1967,12 +1919,12 @@ impl PoolLease {
     /// no scheduling point to a simulated run.
     #[cfg(any(test, zakura_sim))]
     fn report_height(&self) {
-        if self.lease_id == 0 {
+        if self.tag.id == 0 {
             return;
         }
         self.pool.emit(PoolEvent::Labeled {
-            lease_id: self.lease_id,
-            height: self.height,
+            lease_id: self.tag.id,
+            height: self.tag.height,
         });
     }
 
@@ -1987,7 +1939,7 @@ impl PoolLease {
         self.bytes = new_bytes;
         #[cfg(any(test, zakura_sim))]
         if new_bytes == 0 {
-            self.lease_id = 0;
+            self.tag.id = 0;
         }
     }
 
@@ -2007,17 +1959,12 @@ impl PoolLease {
             return Ok(());
         }
         if self.bytes == 0 {
-            let serving = self.serving.clone();
-            let request = Request {
-                consumer: self.consumer,
-                conn: self.peer,
-                serving: serving.as_ref().map(ServingTarget::existing),
-                bytes: target_bytes,
-            };
-            #[cfg(any(test, zakura_sim))]
-            let height = self.height;
-            *self = self.pool.try_request(&request)?;
-            #[cfg(any(test, zakura_sim))]
+            // A regrant from zero is a new lease with a fresh identifier,
+            // which keeps the height label.
+            let height = self.height();
+            *self = self
+                .pool
+                .try_request(&Request::regrow(self, target_bytes))?;
             if let Some(height) = height {
                 self.label_height(height);
             }
@@ -2041,11 +1988,11 @@ impl PoolLease {
         self.bytes = remaining;
 
         #[cfg(any(test, zakura_sim))]
-        let to_lease_id = {
+        let tag = {
             let mut state = self.pool.lock();
             let to_lease_id = state.alloc_lease_id();
             self.pool.emit(PoolEvent::Split {
-                from_lease_id: self.lease_id,
+                from_lease_id: self.tag.id,
                 to_lease_id,
                 consumer: self.consumer,
                 peer: self.peer,
@@ -2053,22 +2000,24 @@ impl PoolLease {
             });
             if remaining == 0 {
                 // The split moved every byte, which closes the source lease.
-                self.lease_id = 0;
+                self.tag.id = 0;
             }
-            to_lease_id
+            LeaseTag {
+                id: to_lease_id,
+                height: self.tag.height,
+            }
         };
+        #[cfg(not(any(test, zakura_sim)))]
+        let tag = LeaseTag::default();
 
-        Some(Self {
-            pool: self.pool.clone(),
-            consumer: self.consumer,
-            peer: self.peer,
-            serving: self.serving.clone(),
+        Some(Self::new(
+            &self.pool,
+            self.consumer,
+            self.peer,
+            self.serving.clone(),
             bytes,
-            #[cfg(any(test, zakura_sim))]
-            lease_id: to_lease_id,
-            #[cfg(any(test, zakura_sim))]
-            height: self.height,
-        })
+            tag,
+        ))
     }
 
     /// Merge `other` into `self` without releasing and reacquiring capacity.
@@ -2084,17 +2033,11 @@ impl PoolLease {
         if moved == 0 {
             return;
         }
-        #[cfg(any(test, zakura_sim))]
-        let other_id = std::mem::take(&mut other.lease_id);
 
         if self.bytes == 0 {
             self.bytes = moved;
             self.serving = other.serving.take();
-            #[cfg(any(test, zakura_sim))]
-            {
-                self.lease_id = other_id;
-                self.height = other.height;
-            }
+            self.tag = other.tag;
             return;
         }
 
@@ -2104,8 +2047,8 @@ impl PoolLease {
         {
             let _state = self.pool.lock();
             self.pool.emit(PoolEvent::Merged {
-                into_lease_id: self.lease_id,
-                from_lease_id: other_id,
+                into_lease_id: self.tag.id,
+                from_lease_id: other.tag.id,
                 consumer: self.consumer,
                 peer: self.peer,
                 bytes: moved,
@@ -2125,31 +2068,25 @@ impl PoolLease {
         }
         let (moved, _to_lease_id) = self.pool.move_lease(self, to);
         self.bytes -= moved;
-        #[cfg(any(test, zakura_sim))]
-        let height = self.height;
+        let tag = self.tag;
         #[cfg(any(test, zakura_sim))]
         if self.bytes == 0 {
             // The move took every byte, which closes the source lease.
-            self.lease_id = 0;
-        } else if height.is_some() {
+            self.tag.id = 0;
+        } else if tag.height.is_some() {
             // The bytes left here are a drain the target had no room for.
-            self.height = None;
+            self.tag.height = None;
             self.report_height();
         }
         if moved == 0 {
             return self.pool.empty_lease(to, self.peer);
         }
-        Self {
-            pool: self.pool.clone(),
-            consumer: to,
-            peer: self.peer,
-            serving: None,
-            bytes: moved,
-            #[cfg(any(test, zakura_sim))]
-            lease_id: _to_lease_id,
-            #[cfg(any(test, zakura_sim))]
-            height,
-        }
+        #[cfg(any(test, zakura_sim))]
+        let tag = LeaseTag {
+            id: _to_lease_id,
+            ..tag
+        };
+        Self::new(&self.pool, to, self.peer, None, moved, tag)
     }
 }
 
@@ -2160,6 +2097,17 @@ impl Drop for PoolLease {
             self.bytes = 0;
         }
     }
+}
+
+/// Publish `consumer`'s leased bytes after a grant and check for an overrun.
+/// Returns the consumer's leased bytes.
+fn record_grant(state: &mut PoolState, consumer: Consumer, effects: &mut Effects) -> u64 {
+    let consumer_leased = state.machine.leased(consumer);
+    effects.leased = Some((consumer, consumer_leased));
+    if state.machine.is_over_budget() {
+        effects.overrun = state.machine.check_overrun(Instant::now());
+    }
+    consumer_leased
 }
 
 /// A byte count as a gauge value.

@@ -1240,7 +1240,6 @@ impl PeerRoutine {
             receipt_settlement.pool_lease,
             receipt_settlement.conn_credit,
         );
-        #[cfg(any(test, zakura_sim))]
         if let Some(lease) = body_lease.as_mut() {
             lease.label_height(height.0);
         }
@@ -1345,7 +1344,6 @@ impl PeerRoutine {
             settlement.pool_lease,
             settlement.conn_credit,
         );
-        #[cfg(any(test, zakura_sim))]
         if let Some(lease) = body_lease.as_mut() {
             lease.label_height(height.0);
         }

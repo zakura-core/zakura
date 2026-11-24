@@ -215,7 +215,7 @@ proptest! {
                 Op::Lease { consumer_idx, bytes } => {
                     let consumer = Consumer::ALL[consumer_idx];
                     let before_leased = machine.leased(consumer);
-                    let other_below_waiting = machine.any_other_below_share_waiting(consumer);
+                    let other_below_waiting = machine.any_below_share_waiting_except(Some(consumer));
                     let was_below_share = machine.is_below_share(consumer);
                     let was_waiting = machine.is_waiting(consumer);
                     let cap = machine.cap(consumer);
@@ -311,7 +311,7 @@ proptest! {
                 Op::RemoveWaiter { slot } => {
                     if !waiters.is_empty() {
                         let (consumer, class, contended) = waiters.swap_remove(slot % waiters.len());
-                        let rule3_before = machine.any_below_share_waiting();
+                        let rule3_before = machine.any_below_share_waiting_except(None);
                         machine.remove_waiter(consumer, class, contended);
                         let wake = machine.wake(None, false, rule3_before);
                         assert_wake_targets_waiters(&machine, wake);
@@ -319,7 +319,7 @@ proptest! {
                 }
                 Op::Wake { released_by, freed_shared } => {
                     let released_by = released_by.map(|idx| Consumer::ALL[idx]);
-                    let rule3 = machine.any_below_share_waiting();
+                    let rule3 = machine.any_below_share_waiting_except(None);
                     let wake = machine.wake(released_by, freed_shared, rule3);
                     assert_wake_targets_waiters(&machine, wake);
                     // A consumer above its share never wakes while one below

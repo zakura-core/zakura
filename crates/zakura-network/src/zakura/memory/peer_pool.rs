@@ -20,8 +20,8 @@ use super::{
 use crate::zakura::ZakuraPeerId;
 
 /// A serving peer's authenticated id, shared by the peer's leases without
-/// copying the id's bytes.
-#[derive(Clone, Debug)]
+/// copying the id's bytes. Ids compare by their bytes.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PeerKey(Arc<ZakuraPeerId>);
 
 impl PeerKey {
@@ -30,14 +30,6 @@ impl PeerKey {
         &self.0
     }
 }
-
-impl PartialEq for PeerKey {
-    fn eq(&self, other: &Self) -> bool {
-        self.0.as_bytes() == other.0.as_bytes()
-    }
-}
-
-impl Eq for PeerKey {}
 
 impl PartialOrd for PeerKey {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
@@ -106,31 +98,30 @@ impl PeerSubPool {
     /// A new peer starts with cap `cap`.
     pub(crate) fn register(&mut self, peer: &ZakuraPeerId, floor: u64, cap: u64) {
         self.ensure(peer, floor, cap);
-        if let Some(state) = self.peers.get_mut(peer.as_bytes()) {
+        self.update(peer, |state| {
             state.registrations = state.registrations.saturating_add(1);
-        }
+        });
     }
 
     /// Unregister one connection of `peer`. The peer leaves once it has no
     /// registration, lease or waiter.
     pub(crate) fn unregister(&mut self, peer: &ZakuraPeerId) {
-        if let Some(state) = self.peers.get_mut(peer.as_bytes()) {
+        self.update(peer, |state| {
             state.registrations = state.registrations.saturating_sub(1);
-        }
+        });
         self.remove_if_idle(peer);
     }
 
     /// Add `peer` if it is missing, and raise its floor to `floor`. A new peer
     /// starts with cap `cap`.
     pub(crate) fn ensure(&mut self, peer: &ZakuraPeerId, floor: u64, cap: u64) {
-        if self.peers.contains_key(peer.as_bytes()) {
-            self.update(peer, |state| {
-                if floor > state.floor {
-                    state.floor = floor;
-                    state.cap = state.cap.max(floor);
-                }
-            });
-        } else {
+        let present = self.update(peer, |state| {
+            if floor > state.floor {
+                state.floor = floor;
+                state.cap = state.cap.max(floor);
+            }
+        });
+        if present.is_none() {
             self.peers.insert(
                 PeerKey(Arc::new(peer.clone())),
                 PeerState {
@@ -146,13 +137,13 @@ impl PeerSubPool {
 
     /// Set `peer`'s cap, floored at its floor. Returns whether the cap rose.
     pub(crate) fn set_cap(&mut self, peer: &ZakuraPeerId, cap: u64) -> bool {
-        let Some(state) = self.peers.get_mut(peer.as_bytes()) else {
-            return false;
-        };
-        let next = cap.max(state.floor);
-        let raised = next > state.cap;
-        state.cap = next;
-        raised
+        self.update(peer, |state| {
+            let next = cap.max(state.floor);
+            let raised = next > state.cap;
+            state.cap = next;
+            raised
+        })
+        .unwrap_or(false)
     }
 
     /// The key a lease of `peer` keeps, if `peer` is present.
@@ -169,6 +160,7 @@ impl PeerSubPool {
     }
 
     /// Bytes leased by `peer` (0 if absent).
+    #[cfg(test)]
     pub(crate) fn peer_leased(&self, peer: &ZakuraPeerId) -> u64 {
         self.peers
             .get(peer.as_bytes())
@@ -253,45 +245,57 @@ impl PeerSubPool {
 
     /// Release `bytes` leased by `peer`. Returns the bytes released.
     pub(crate) fn release(&mut self, peer: &ZakuraPeerId, bytes: u64) -> u64 {
-        let leased = self.peer_leased(peer);
-        debug_assert!(
-            bytes <= leased,
-            "peer sub-pool release underflow for peer {peer:?}: releasing {bytes} > leased {leased}"
-        );
-        let actual = bytes.min(leased);
-        self.update(peer, |state| state.leased -= actual);
+        let released = self.update(peer, |state| {
+            debug_assert!(
+                bytes <= state.leased,
+                "peer sub-pool release underflow for peer {peer:?}: releasing {bytes} > leased {}",
+                state.leased
+            );
+            let actual = bytes.min(state.leased);
+            state.leased -= actual;
+            actual
+        });
+        let Some(actual) = released else {
+            debug_assert_eq!(bytes, 0, "releasing bytes of absent peer {peer:?}");
+            return 0;
+        };
         self.remove_if_idle(peer);
         actual
     }
 
     /// Register one contention waiter for `peer`.
     pub(crate) fn add_waiter(&mut self, peer: &ZakuraPeerId) {
-        if let Some(state) = self.peers.get_mut(peer.as_bytes()) {
-            if state.waiters == 0 {
-                self.waiting_peers += 1;
-            }
-            state.waiters = state.waiters.saturating_add(1);
-        }
+        self.update(peer, |state| {
+            state.waiters = state.waiters.saturating_add(1)
+        });
     }
 
     /// Unregister one contention waiter for `peer`.
     pub(crate) fn remove_waiter(&mut self, peer: &ZakuraPeerId) {
-        if let Some(state) = self.peers.get_mut(peer.as_bytes()) {
-            state.waiters = state.waiters.saturating_sub(1);
-            if state.waiters == 0 {
-                self.waiting_peers -= 1;
-            }
-        }
+        self.update(peer, |state| {
+            state.waiters = state.waiters.saturating_sub(1)
+        });
         self.remove_if_idle(peer);
     }
 
-    /// Change `peer`'s state, keeping `floor_usage` in step.
-    fn update(&mut self, peer: &ZakuraPeerId, change: impl FnOnce(&mut PeerState)) {
-        if let Some(state) = self.peers.get_mut(peer.as_bytes()) {
-            self.floor_usage -= state.floor_use();
-            change(state);
-            self.floor_usage += state.floor_use();
+    /// Change `peer`'s state, keeping `floor_usage` and `waiting_peers` in
+    /// step. Returns `None` when `peer` is absent.
+    fn update<R>(
+        &mut self,
+        peer: &ZakuraPeerId,
+        change: impl FnOnce(&mut PeerState) -> R,
+    ) -> Option<R> {
+        let state = self.peers.get_mut(peer.as_bytes())?;
+        let was_waiting = state.waiters > 0;
+        self.floor_usage -= state.floor_use();
+        let out = change(state);
+        self.floor_usage += state.floor_use();
+        match (was_waiting, state.waiters > 0) {
+            (false, true) => self.waiting_peers += 1,
+            (true, false) => self.waiting_peers -= 1,
+            _ => {}
         }
+        Some(out)
     }
 
     /// Remove `peer` once it has no registration, lease or waiter.

@@ -61,6 +61,97 @@ This sequence is an operator recommendation, not an endpoint prerequisite.
 Access to the endpoint authorizes relay; it does not establish prior validation.
 The endpoint does not accept or verify a validation certificate.
 
+## Preparing a job while mining
+
+A miner can upload the unsolved proposal while it mines. Use a fresh random
+16-byte job ID for each candidate, encoded as 32 lowercase hex characters in
+the `X-Job-Id` header. All three operations use the same endpoint, credentials,
+and binary content type. Independent connections let the short messages arrive
+while the upload is still in progress.
+
+1. Send the complete serialized proposal to `/submittrustedblock?op=prepare`.
+   Mining can start as soon as the primary issues the job. The relay starts
+   checking the proposal in the background.
+2. Send the complete binary solved header to `/submittrustedblock?op=solve`
+   when sending the solution to the primary. Only the nonce and Equihash
+   solution may differ from the uploaded header. The relay checks proof of
+   work under its network's rules. If the proposal passes local verification
+   before or after the solve, the relay can announce without another message.
+3. After the primary accepts these exact solved bytes, send
+   `/submittrustedblock?op=confirm` with the 32-byte solved header hash in
+   Zcash wire order followed by the 32-byte SHA-256 digest of the complete
+   serialized solved block. This allows release while local proposal verification
+   is still pending. The confirmation is an assertion by the authorized caller.
+
+The relay requires the complete body, matching solved header and current parent
+for either release path. An observing legacy or compatibility peer can request
+the exact bytes from memory while local consensus verification and commitment
+proceed. A failed commit withdraws outstanding permission to send that copy.
+
+A released prepared job uses the same delivery policy as `submitsolution`.
+Legacy TCP peers in the initial broadcast group that advertised `NODE_BLOCK_PUSH`
+receive the solved block directly. Other peers receive an announcement and can
+request the same bytes with `getdata`. This applies whether local proposal
+verification or primary confirmation released the job. A primary-confirmed
+block can reach a peer before the relay finishes verifying it locally. Failure
+withdraws writes that have yet to start.
+
+For an ordinary full-block POST to `/submittrustedblock`, early delivery
+follows `[network].push_relayed_blocks`, which defaults to `false`. The same
+setting controls pushes of blocks relayed from the network. After commitment,
+local submissions use the existing mined-block broadcast path.
+
+A proposal may arrive before the relay has committed its parent, for example
+right after the primary issues a template on a new tip. The job then waits for
+the parent to become the relay's best tip. A job ends as stale as soon as the
+best tip is at or above the proposal's height on another block, or moves off
+the parent before release.
+
+The three inputs may arrive in any order. HTTP 202 acknowledges receipt of an
+input; it does not say that the job released. Proposal verification runs in the background. Normally the relay also
+decodes the proposal after acknowledging receipt, and a malformed proposal
+ends its job as invalid. When admission requires replacing a job, the relay
+checks the complete encoding first. A malformed replacement returns 400 and
+leaves the existing jobs intact. The miner can retry the same input with the same
+ID. Job responses are:
+
+| Status | Meaning |
+| --- | --- |
+| 202 | The input was received, or its job ended with the block's header hash committed. |
+| 400 | The input is malformed, the solved header fails proof of work, or local verification rejected the proposal or the solved block. |
+| 409 | The input contradicts one already received for this job: a different proposal, a different solved header, or a confirmation of other bytes. The job keeps the input it already has. A job whose solved header changes more than the proposal's nonce and solution ends with this status. |
+| 410 | The job ended as stale, was replaced by a newer proposal, or passed its lifetime. |
+| 429 | All 16 job slots are occupied and none can be replaced, or the relay's pending-body or submission capacity is exhausted. |
+| 503 | The relay could not establish an outcome. |
+
+Once a job has ended, every later well-formed input for its ID gets the job's
+outcome, for 120 seconds after it ended. The relay remembers the 64 most recently ended IDs.
+An input for an ID it no longer remembers starts a new job, which can never
+release without its proposal, so do not send inputs for a job more than
+120 seconds after it ended. A confirmation that arrives before the relay knows
+the solved bytes is acknowledged and silently discarded if it names other bytes.
+
+If local verification cannot reach a verdict, for example because a state
+read failed, the relay does not retry it: the job keeps acknowledging inputs
+and releases only on a confirmation. The node logs this at info level and
+counts it in `rpc.trusted_submission.job.no_local_verdict`.
+
+A job waits up to 120 seconds from its first input for the rest of its inputs
+and for authority to release. A released job then follows the validation
+deadline of a complete POST. The relay holds at most 16 unfinished jobs, each
+with its proposal in memory. When all slots are occupied, a new prepare can
+replace the oldest idle proposal on the same parent. A proposal is idle once
+its local verification has finished and it has received neither a solve nor a
+confirmation. A late solve for a replaced proposal returns 410. If that
+proposal wins, use the complete POST after the primary accepts the block. A 429 on `prepare` also tells the miner to use the complete POST. A
+template mined for longer than 120 seconds must be prepared again under a new
+ID: its first job has expired, and that job's ID answers 410.
+
+For a job that ended without committing, or to recover from an inconclusive
+attempt, use the complete POST after the primary has accepted the exact bytes.
+A primary rejection, timeout or duplicate response does not authorize a
+confirmation.
+
 ## Request and response
 
 Send `Content-Type: application/octet-stream` with exactly one complete block in
@@ -108,7 +199,8 @@ received and submitted by a task that the HTTP connection does not own. A client
 disconnect from then on does not abandon the submission: receipt, decoding, the
 state lookups, validation and relay continue without the client. The task keeps
 its slot until the submission finishes, so at most 16 bodies are buffered whether
-or not their clients stay connected. A body that ends early, because the client
+or not their clients stay connected. A job input releases its slot once it is
+stored; the up to 16 unfinished jobs keep their proposals outside these slots. A body that ends early, because the client
 disconnected mid-body or the 30-second receipt deadline passed, is never
 submitted and frees its slot. A client that disconnects gets no response, so it
 cannot learn the outcome.
@@ -124,7 +216,11 @@ Transport errors use HTTP 400 for malformed blocks, 401 for missing or invalid
 credentials when cookie authentication is enabled, 403 for browser requests,
 404 when disabled, 405 for a method other than POST, 408 for body receipt timeout,
 413 for oversized bodies, 415 for the wrong content type, and 429 when submission
-capacity is exhausted.
+capacity is exhausted. A query string other than a job operation, or a job
+operation without exactly one valid `X-Job-Id`, returns 400. Job operations
+return the statuses listed under [Preparing a job while mining](#preparing-a-job-while-mining);
+their body limits are the block size for `prepare`, 1,487 bytes for `solve`
+and 64 bytes for `confirm`.
 
 A commit preserves announcements already dispatched to peers. The normal committed
 broadcast shares their per-connection delivery tracking, avoiding a second inventory
@@ -154,9 +250,25 @@ failure still withdraws its queued writes.
 
 An invalid submission does not disable early relay for later submissions.
 
-A pending body is never served in place of a committed block. When a peer asks for
-a hash, the relay serves the committed block if state has one, and the pending body
-only if early relay was authorized and state has no committed copy.
+A pending body from a complete POST is never served in place of a committed block.
+When a peer asks for a hash, the relay serves the committed block if state has one,
+and the pending body only if early relay was authorized and state has no committed
+copy.
+
+A released job's body is served from memory without that state read, because state
+can be busy committing the same block while peers wait for it. The relay reads
+state instead once the hash is its best tip, so a block committed to the best
+chain through another path is served in place of the job's body. A released job
+also skips the duplicate lookup that a complete POST performs: it requires the
+parent to be the best tip, which a block already committed to the best chain
+cannot satisfy. Three cases remain. A copy still in the state's write queue
+does not stop the job's early relay. A copy committed to a side chain is not
+noticed when serving. A copy committed to the best chain stops being noticed
+once a child block becomes the best tip, until the job's own validation ends.
+In each, that validation reports the duplicate and the comparison below settles
+the body. For an honest caller the bytes are
+the same either way: a job's body is either locally verified or bound to the
+primary's accepted bytes by the confirmation digest.
 
 The duplicate lookup cannot close every race: the same block can commit through
 another path, for example gossip from the GBT node, after the lookup and before the
@@ -189,6 +301,16 @@ from other peers that announce it. The recommended sequence avoids this except
 when the committed block cannot be read to settle a duplicate.
 
 Monitor `rpc.trusted_submission.*` metrics and rejection logs.
+`rpc.trusted_submission.job.outcomes` counts ended jobs by outcome (`committed`,
+`duplicate`, `invalid`, `conflict`, `capacity`, `expired`, `unavailable`),
+`rpc.trusted_submission.job.saturated` counts first inputs refused because 16
+jobs were unfinished and none could be replaced.
+`rpc.trusted_submission.job.evicted` counts proposals replaced to admit a new one, and `rpc.trusted_submission.job.release.duration_seconds`
+records the time from receipt of the solved header to release, labelled by
+whether local verification or the confirmation authorized it.
+`rpc.trusted_submission.job.no_local_verdict` counts jobs whose local
+verification failed without proving the proposal invalid, which then depend on
+a confirmation. The receipt counter and histogram include job inputs.
 `rpc.trusted_submission.relay_requested_without_commit`, labelled by outcome,
 counts every submission whose early relay was requested but that this submission
 did not commit, with a warning log. `rpc.trusted_submission.duplicate_body`

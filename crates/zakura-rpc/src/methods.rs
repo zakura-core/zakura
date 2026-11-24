@@ -6510,4 +6510,4 @@ pub enum AddNodeCommand {
 pub struct GetTxOutResponse(Option<types::transaction::OutputObject>);
 
 mod submission_lifecycle;
-mod trusted_block;
+pub(crate) mod trusted_block;

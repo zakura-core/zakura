@@ -38,6 +38,17 @@ impl PendingBlockSendPermit {
         Self::with_checksum(Some(AttemptChecksum::default()))
     }
 
+    /// Creates a revocable permission carrying the exact bytes authorized for direct peer reads.
+    ///
+    /// `bytes` must be the serialization of the block this permission is registered with:
+    /// transports write them without consulting the block.
+    pub fn prepared_channel(bytes: Arc<[u8]>) -> (watch::Sender<PendingBlockStatus>, Self) {
+        Self::with_checksum(Some(AttemptChecksum {
+            prepared: Some(bytes),
+            ..Default::default()
+        }))
+    }
+
     /// Creates a revocable permission for a body whose commitments were checked before
     /// state admission. Legacy sends can safely share its checksum by header hash.
     pub fn state_admitted_channel() -> (watch::Sender<PendingBlockStatus>, Self) {
@@ -68,6 +79,14 @@ impl PendingBlockSendPermit {
     /// cache keyed by header hash, where a different body under the same hash could poison it.
     pub fn attempt_checksum(&self) -> Option<&AttemptChecksum> {
         self.checksum.as_ref()
+    }
+
+    /// The exact serialized body, when the submission supplied it for direct peer writes.
+    ///
+    /// A transport writes these bytes in place of serializing the block. Whoever creates the
+    /// permit guarantees that they are the block's serialization.
+    pub fn prepared_bytes(&self) -> Option<&[u8]> {
+        self.checksum.as_ref()?.prepared_bytes()
     }
 
     /// Runs a synchronous write start unless this submission has been withdrawn.
@@ -101,11 +120,31 @@ impl Hash for PendingBlockSendPermit {
     }
 }
 
-/// The checksum of one submission attempt's exact serialized body, computed by its first send.
-#[derive(Clone, Debug, Default)]
-pub struct AttemptChecksum(Arc<OnceLock<(usize, sha256d::Checksum)>>);
+/// What the sends of one submission attempt share: the checksum of its exact serialized body,
+/// computed by its first send, and that body itself when the submission supplied it.
+///
+/// Identity is the attempt, so clones are equal and a retry of the same block is not.
+#[derive(Clone, Default)]
+pub struct AttemptChecksum {
+    checksum: Arc<OnceLock<(usize, sha256d::Checksum)>>,
+    /// The attempt's serialized body, written to peers in place of serializing the block.
+    prepared: Option<Arc<[u8]>>,
+}
+
+impl std::fmt::Debug for AttemptChecksum {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AttemptChecksum")
+            .field("prepared_len", &self.prepared_bytes().map(<[u8]>::len))
+            .finish_non_exhaustive()
+    }
+}
 
 impl AttemptChecksum {
+    /// The attempt's exact serialized body, when the submission supplied it.
+    pub fn prepared_bytes(&self) -> Option<&[u8]> {
+        self.prepared.as_deref()
+    }
+
     /// Returns the checksum of `body`, computing it on the attempt's first send.
     ///
     /// The length guards the invariant that an attempt serializes to one body: a mismatch is
@@ -115,7 +154,7 @@ impl AttemptChecksum {
         body: &[u8],
         compute: impl Fn(&[u8]) -> sha256d::Checksum,
     ) -> sha256d::Checksum {
-        let (len, checksum) = *self.0.get_or_init(|| (body.len(), compute(body)));
+        let (len, checksum) = *self.checksum.get_or_init(|| (body.len(), compute(body)));
         if len == body.len() {
             checksum
         } else {
@@ -126,7 +165,7 @@ impl AttemptChecksum {
 
 impl PartialEq for AttemptChecksum {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
+        Arc::ptr_eq(&self.checksum, &other.checksum)
     }
 }
 
@@ -174,6 +213,24 @@ mod tests {
         assert_ne!(retained, retry);
         assert_eq!(retry.try_start_write(|| 2), Some(2));
         assert!(retained.try_start_write(|| ()).is_none());
+    }
+
+    #[test]
+    fn prepared_bytes_follow_the_permit_and_its_withdrawal() {
+        let bytes: Arc<[u8]> = Arc::from(&b"exact body"[..]);
+        let (status, permit) = PendingBlockSendPermit::prepared_channel(bytes.clone());
+        assert_eq!(permit.prepared_bytes(), Some(&bytes[..]));
+        assert_eq!(permit.clone().prepared_bytes(), Some(&bytes[..]));
+        assert!(format!("{permit:?}").contains("prepared_len: Some(10)"));
+        status.send_replace(PendingBlockStatus::Failed);
+        assert!(permit
+            .try_start_write(|| panic!("withdrawn prepared bytes cannot start a write"))
+            .is_none());
+
+        let (_, serialized) = PendingBlockSendPermit::channel();
+        assert_eq!(serialized.prepared_bytes(), None);
+        let (_, admitted) = PendingBlockSendPermit::state_admitted_channel();
+        assert_eq!(admitted.prepared_bytes(), None);
     }
 
     #[test]

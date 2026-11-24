@@ -6,5 +6,6 @@ mod mining;
 mod prop;
 mod snapshot;
 mod submission_lifecycle;
+mod trusted_jobs;
 pub mod utils;
 mod vectors;

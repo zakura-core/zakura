@@ -82,7 +82,11 @@ pub(super) enum RelayPolicy {
         /// an unknown parent can later become valid under the same hash, and peers that requested
         /// it in between ignore this node's announcements of that hash for up to two minutes. A
         /// hash another path is already committing is announced by that path.
-        early_relay: bool,
+        ///
+        /// A complete POST establishes both by state lookups. A prepared job establishes them
+        /// by requiring the parent to be the best tip, which does not exclude a copy still in
+        /// the write queue; the duplicate verdict below settles that case.
+        early_relay: Option<crate::TrustedBlockSource>,
         /// A duplicate verdict proves only that the header hash is known, not that the submitted
         /// transactions match the committed block, so it is resolved against the committed body.
         committed_block: CommittedBlockLookup,
@@ -100,16 +104,23 @@ impl RelayPolicy {
     }
 
     /// Waits until the block may relay before its commit: state admission authorized it, or
-    /// the trusted submitter's parent check did.
-    async fn wait_for_relay(&self, admission: &BlockAdmission, started: Instant) -> bool {
+    /// the trusted submitter's parent check did. Returns how it relays.
+    async fn wait_for_relay(
+        &self,
+        admission: &BlockAdmission,
+        started: Instant,
+    ) -> Option<EarlyBlockRelay> {
         match self {
             Self::AfterStateAdmission { .. } => {
                 let admitted = admission.wait().await;
                 metrics::histogram!("mining.state_admission.duration_seconds")
                     .record(started.elapsed().as_secs_f64());
-                admitted && admission.optimistic_relay_authorized()
+                (admitted && admission.optimistic_relay_authorized())
+                    .then(|| EarlyBlockRelay::StateAdmission(admission.clone()))
             }
-            Self::TrustedSubmission { early_relay, .. } => *early_relay,
+            Self::TrustedSubmission { early_relay, .. } => {
+                early_relay.map(EarlyBlockRelay::TrustedSubmission)
+            }
         }
     }
 
@@ -249,37 +260,37 @@ impl Submission {
                 // A completed verification supersedes the opportunity to relay early.
                 result = &mut verification => result,
                 authorized = policy.wait_for_relay(&admission, admission_start) => {
-                    if authorized {
+                    if let Some(relay) = authorized {
                         policy.publish_bpv1(&self.block, self.hash, self.height, "admitted");
                         bpv1_attempted = true;
-                    }
-                    if authorized && policy.announces_early() {
-                        let (relay, registration) = match &policy {
-                            RelayPolicy::AfterStateAdmission { pending_blocks, .. } => {
-                                admitted_registration = pending_blocks.insert_state_admitted(self.block.clone());
-                                (EarlyBlockRelay::StateAdmission(admission), admitted_registration.as_ref())
+                        if policy.announces_early() {
+                            let registration = match &policy {
+                                RelayPolicy::AfterStateAdmission { pending_blocks, .. } => {
+                                    admitted_registration = pending_blocks.insert_state_admitted(self.block.clone());
+                                    admitted_registration.as_ref()
+                                }
+                                RelayPolicy::TrustedSubmission { registration, .. } => {
+                                    Some(registration)
+                                }
+                            };
+                            if let Some(registration) = registration {
+                                let pending = registration.signal();
+                                relay_signal = Some(pending.clone());
+                                relay_requested = sender.send(EarlyMinedBlock {
+                                    relay,
+                                    hash: self.hash,
+                                    height: self.height,
+                                    size: self.size,
+                                    submitted_at: self.submitted_at,
+                                    submission: self.method,
+                                    pending,
+                                }).is_ok();
                             }
-                            RelayPolicy::TrustedSubmission { registration, .. } => {
-                                (EarlyBlockRelay::TrustedSubmission, Some(registration))
+                            // Ordinary submission withdraws immediately if no consumer accepted the
+                            // event. Trusted submission retains its pre-reserved body until validation.
+                            if !relay_requested {
+                                admitted_registration.take();
                             }
-                        };
-                        if let Some(registration) = registration {
-                            let pending = registration.signal();
-                            relay_signal = Some(pending.clone());
-                            relay_requested = sender.send(EarlyMinedBlock {
-                                relay,
-                                hash: self.hash,
-                                height: self.height,
-                                size: self.size,
-                                submitted_at: self.submitted_at,
-                                submission: self.method,
-                                pending,
-                            }).is_ok();
-                        }
-                        // Ordinary submission withdraws immediately if no consumer accepted the
-                        // event. Trusted submission retains its pre-reserved body until validation.
-                        if !relay_requested {
-                            admitted_registration.take();
                         }
                     }
                     verification.await

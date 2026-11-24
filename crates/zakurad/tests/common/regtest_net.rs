@@ -109,12 +109,12 @@ const LOG_TAIL_LINES: usize = 40;
 const CONNECTION_TRACE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The start of the lock script of a coinbase output that names a gateway:
-/// `OP_RETURN`, a push of the next 37 bytes, the tag `MESH` and version 1. The
+/// `OP_RETURN`, a push of the next 35 bytes, the tag `MR` and version 1. The
 /// 32-byte gateway ID follows.
 ///
 /// The bytes are written out here, not taken from `zakura-chain`, so the
 /// harness's count checks the node's parser instead of repeating it.
-const GATEWAY_MARKER_PREFIX: [u8; 7] = [0x6a, 0x25, b'M', b'E', b'S', b'H', 0x01];
+const GATEWAY_MARKER_PREFIX: [u8; 5] = [0x6a, 0x23, b'M', b'R', 0x01];
 
 /// The blocks above a marker before the gateway it names counts.
 pub const QUALIFYING_DEPTH: u32 = 100;

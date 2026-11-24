@@ -1505,6 +1505,10 @@ where
     /// worker failures to RPC errors.
     ///
     /// Also returns how long the build waited to start and how long it ran.
+    ///
+    /// `bpv1_proposer` comes from the same
+    /// [`GetBlockTemplateHandler::template_bpv1_proposer`] answer that sized the selection of
+    /// `mempool_txs`, so the build never adds a commitment output the selection did not reserve.
     #[allow(clippy::too_many_arguments)]
     async fn build_mining_template(
         &self,
@@ -1514,9 +1518,12 @@ where
         long_poll_id: types::long_poll::LongPollId,
         mempool_txs: Vec<types::get_block_template::zip317::SelectedMempoolTx>,
         submit_old: Option<bool>,
+        bpv1_proposer: Option<Arc<dyn zakura_node_services::bpv1_proposer::Bpv1ProposerHook>>,
     ) -> Result<(BlockTemplateResponse, BuildTimes)> {
-        // An empty template with a completed coinbase has no proof work to queue.
-        if precomputed_coinbase.is_some() && mempool_txs.is_empty() {
+        let bpv1_active = bpv1_proposer.is_some();
+        // An empty template with a completed coinbase has no proof work to queue
+        // (unless BPv1 is active at this height, in which case we embed the commitment output).
+        if precomputed_coinbase.is_some() && mempool_txs.is_empty() && !bpv1_active {
             let started = std::time::Instant::now();
             let template = BlockTemplateResponse::new_internal(
                 &self.network,
@@ -1526,6 +1533,7 @@ where
                 long_poll_id,
                 mempool_txs,
                 submit_old,
+                None,
             )
             .map_misc_error()?;
             let times = BuildTimes {
@@ -1535,13 +1543,20 @@ where
             return Ok((template, times));
         }
 
-        let work = match (&precomputed_coinbase, chain_info.tip_height.next()) {
-            (None, Ok(height)) => {
-                TemplateBuildWork::for_coinbase(&self.network, height, miner_params)
+        // When BPv1 encoding is active, run template construction
+        // on the blocking pool (`TemplateBuildWork::Proof`) even for transparent
+        // miners so Reed–Solomon encoding never blocks an async worker thread.
+        let work = if bpv1_active {
+            TemplateBuildWork::Proof
+        } else {
+            match (&precomputed_coinbase, chain_info.tip_height.next()) {
+                (None, Ok(height)) => {
+                    TemplateBuildWork::for_coinbase(&self.network, height, miner_params)
+                }
+                // A coinbase that is already built leaves no proof to create, and neither does a
+                // parent with no next height, which the build rejects.
+                _ => TemplateBuildWork::ProofFree,
             }
-            // A coinbase that is already built leaves no proof to create, and neither does a
-            // parent with no next height, which the build rejects.
-            _ => TemplateBuildWork::ProofFree,
         };
         let network = self.network.clone();
         let miner_params = miner_params.clone();
@@ -1559,6 +1574,7 @@ where
                     long_poll_id,
                     mempool_txs,
                     submit_old,
+                    bpv1_proposer.as_ref(),
                 );
                 let times = BuildTimes {
                     wait: started.saturating_duration_since(requested),
@@ -1652,6 +1668,18 @@ where
             .await
     }
 
+    /// Returns the BPv1 proposer for a template with no mempool transactions.
+    ///
+    /// Such a template has no selection, and the commitment output always fits beside its
+    /// coinbase, so this is the template's only eligibility decision.
+    fn empty_template_bpv1_proposer(
+        &self,
+        chain_info: &zakura_state::GetBlockTemplateChainInfo,
+    ) -> Option<Arc<dyn zakura_node_services::bpv1_proposer::Bpv1ProposerHook>> {
+        let height = chain_info.tip_height.next().ok()?;
+        self.gbt.template_bpv1_proposer(height)
+    }
+
     /// Builds the coinbase-only template a long poll returns once it sees a new tip.
     ///
     /// Miners want work on the new tip before the mempool has caught up with it, so this
@@ -1689,6 +1717,7 @@ where
                 long_poll_id,
                 vec![],
                 submit_old,
+                self.empty_template_bpv1_proposer(chain_info),
             )
             .await?;
         let response = self
@@ -1730,6 +1759,7 @@ where
                 long_poll_id,
                 vec![],
                 submit_old,
+                self.empty_template_bpv1_proposer(chain_info),
             )
             .await?;
 
@@ -1911,6 +1941,7 @@ where
             submission_lifecycle::RelayPolicy::AfterStateAdmission {
                 pending_blocks: self.gbt.pending_blocks(),
                 optimistic_block_inventory: self.gbt.optimistic_block_inventory(),
+                bpv1_proposer: self.gbt.bpv1_proposer(),
             },
             move |outcome| {
                 let submission_lifecycle::VerificationOutcome::Completed(result) =
@@ -2034,6 +2065,16 @@ where
     /// Shares one pending-block registry with peer serving.
     pub fn with_pending_blocks(mut self, pending_blocks: PendingBlockRegistry) -> Self {
         self.gbt.set_pending_blocks(pending_blocks);
+        self
+    }
+
+    /// Attaches the optional BPv1 proposer hook for template-time commitment
+    /// embedding and solved-block publication.
+    pub fn with_bpv1_proposer(
+        mut self,
+        proposer: Arc<dyn zakura_node_services::bpv1_proposer::Bpv1ProposerHook>,
+    ) -> Self {
+        self.gbt.set_bpv1_proposer(proposer);
         self
     }
 
@@ -3531,7 +3572,7 @@ where
     ) -> Result<GetBlockTemplateResponse> {
         use types::get_block_template::{
             check_parameters, check_synced_to_tip, fetch_chain_info, fetch_mempool_transactions,
-            validate_block_proposal, zip317::select_mempool_transactions,
+            validate_block_proposal,
         };
 
         // Clone Services
@@ -3753,6 +3794,7 @@ where
                                 &params,
                                 Amount::zero(),
                                 None,
+                                None,
                             )
                         })
                     };
@@ -3912,8 +3954,17 @@ where
             let height = chain_info.tip_height.next().map_misc_error()?;
 
             // Select mempool transactions by ancestor-package priority.
+            // BPv1 eligibility is decided once, here. Selection reserves the 48-byte
+            // `OP_RETURN BPV1 01 C` coinbase output, and the build receives the same
+            // answer, so the commitment output never pushes a template past `MAX_BLOCK_BYTES`.
+            // This reservation must share one coinbase size estimate with the 48-byte miner
+            // mesh output (#2666), so a template can carry both.
+            let bpv1_proposer = self.gbt.template_bpv1_proposer(height);
+            let extra_coinbase_null_data_len = bpv1_proposer
+                .as_ref()
+                .map(|_| zakura_node_services::bpv1_proposer::BPV1_COMMITMENT_NULL_DATA_LEN);
             let selection_started = std::time::Instant::now();
-            let mempool_txs = select_mempool_transactions(
+            let mempool_txs = types::get_block_template::zip317::select_mempool_transactions(
                 &self.network,
                 height,
                 miner_params,
@@ -3927,6 +3978,7 @@ where
                 },
                 mempool_txs,
                 mempool_tx_deps,
+                extra_coinbase_null_data_len,
             )
             .map_misc_error()?;
             let selection = selection_started.elapsed();
@@ -3949,6 +4001,7 @@ where
                     server_long_poll_id,
                     mempool_txs,
                     submit_old,
+                    bpv1_proposer,
                 )
                 .await?;
             if let Some(response) = self

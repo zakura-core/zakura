@@ -9,7 +9,7 @@ use tokio::{sync::mpsc, task::JoinHandle};
 use tower::{BoxError, ServiceExt};
 use zakura_chain::block::{self, Block, Height};
 use zakura_consensus::{router::service_trait::BlockVerifierService, RouterError};
-use zakura_node_services::block_memory::BlockHandle;
+use zakura_node_services::{block_memory::BlockHandle, bpv1_proposer::Bpv1ProposerHook};
 use zakura_state::{BlockAdmission, ReadRequest, ReadResponse, ReadState as ReadStateService};
 
 use super::types::submit_block::{
@@ -72,6 +72,9 @@ pub(super) enum RelayPolicy {
     AfterStateAdmission {
         pending_blocks: PendingBlockRegistry,
         optimistic_block_inventory: bool,
+        /// Publishes the block over BPv1 once, when state admission authorizes relay or, if it
+        /// never does, when the block commits.
+        bpv1_proposer: Option<Arc<dyn Bpv1ProposerHook>>,
     },
     TrustedSubmission {
         registration: PendingBlockRegistration,
@@ -96,18 +99,39 @@ impl RelayPolicy {
         }
     }
 
+    /// Waits until the block may relay before its commit: state admission authorized it, or
+    /// the trusted submitter's parent check did.
     async fn wait_for_relay(&self, admission: &BlockAdmission, started: Instant) -> bool {
+        match self {
+            Self::AfterStateAdmission { .. } => {
+                let admitted = admission.wait().await;
+                metrics::histogram!("mining.state_admission.duration_seconds")
+                    .record(started.elapsed().as_secs_f64());
+                admitted && admission.optimistic_relay_authorized()
+            }
+            Self::TrustedSubmission { early_relay, .. } => *early_relay,
+        }
+    }
+
+    /// Whether a block authorized to relay is announced to peers before its commit.
+    fn announces_early(&self) -> bool {
         match self {
             Self::AfterStateAdmission {
                 optimistic_block_inventory,
                 ..
-            } => {
-                let admitted = admission.wait().await;
-                metrics::histogram!("mining.state_admission.duration_seconds")
-                    .record(started.elapsed().as_secs_f64());
-                admitted && admission.optimistic_relay_authorized() && *optimistic_block_inventory
-            }
-            Self::TrustedSubmission { early_relay, .. } => *early_relay,
+            } => *optimistic_block_inventory,
+            Self::TrustedSubmission { .. } => true,
+        }
+    }
+
+    fn publish_bpv1(&self, block: &Arc<Block>, hash: block::Hash, height: Height, stage: &str) {
+        if let Self::AfterStateAdmission {
+            bpv1_proposer: Some(bpv1),
+            ..
+        } = self
+        {
+            let published = bpv1.publish_solved_block(block.clone(), height);
+            tracing::debug!(?hash, ?height, published, stage, "bpv1 solved-block hook");
         }
     }
 }
@@ -219,12 +243,17 @@ impl Submission {
             let mut admitted_registration = None;
             let mut relay_signal = None;
             let mut relay_requested = false;
+            let mut bpv1_attempted = false;
             let result = tokio::select! {
                 biased;
                 // A completed verification supersedes the opportunity to relay early.
                 result = &mut verification => result,
                 authorized = policy.wait_for_relay(&admission, admission_start) => {
                     if authorized {
+                        policy.publish_bpv1(&self.block, self.hash, self.height, "admitted");
+                        bpv1_attempted = true;
+                    }
+                    if authorized && policy.announces_early() {
                         let (relay, registration) = match &policy {
                             RelayPolicy::AfterStateAdmission { pending_blocks, .. } => {
                                 admitted_registration = pending_blocks.insert_state_admitted(self.block.clone());
@@ -256,6 +285,9 @@ impl Submission {
                     verification.await
                 }
             };
+            if !bpv1_attempted && matches!(result, VerificationOutcome::Completed(Ok(_))) {
+                policy.publish_bpv1(&self.block, self.hash, self.height, "committed");
+            }
             let (registration, duplicate_body) = match policy {
                 RelayPolicy::AfterStateAdmission { .. } => (admitted_registration, None),
                 RelayPolicy::TrustedSubmission {

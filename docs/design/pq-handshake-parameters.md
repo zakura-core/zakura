@@ -86,33 +86,44 @@ the allowance is 7,200 bytes.
   Handshake acknowledgement validates its address. A dial completes after
   two round trips.
 
+The dialer therefore pads its first flight (spec DIAL-8). Right after the
+hello it sends one more Initial datagram, a PING that quinn-proto pads to
+1,200 bytes. The listener has then received 3,600 bytes, its allowance is
+10,800, and its whole first flight fits.
+
 Measured in the simulator with a fixed one-way delay:
 
-| RTT | `p2p-v2/4` dial | `p2p-v2/5` dial |
-|---|---|---|
-| 2 ms | 2 ms | 4 ms |
-| 50 ms | 50 ms | 100 ms |
-| 124 ms (Mainnet fleet median) | 124 ms | 248 ms |
-| 250 ms (Mainnet fleet p90) | 250 ms | 500 ms |
+| RTT | `p2p-v2/4` dial | `p2p-v2/5`, unpadded | `p2p-v2/5`, padded |
+|---|---|---|---|
+| 2 ms | 2 ms | 4 ms | 2 ms |
+| 50 ms | 50 ms | 100 ms | 50 ms |
+| 124 ms (Mainnet fleet median) | 124 ms | 248 ms | 124 ms |
+| 250 ms (Mainnet fleet p90) | 250 ms | 500 ms | 250 ms |
 
-The cost is one added RTT per new v2 connection, about 124 ms at the fleet's
-median. Peer connections last hours, so this changes how fast a node fills
-its peer set after a restart and how fast it replaces a lost peer, not steady
-state. A pending handshake also holds its admission slot (ADM-7) one RTT
-longer.
+Without the padding the cost would be one added RTT per new v2 connection,
+about 124 ms at the fleet's median.
 
-The flight overshoots the allowance by about 670 bytes. Only a category 2
-signature would bring it back under (§5). The two ways to remove the round
-trip are both larger changes:
+The padding costs:
 
-- pad the dialer's hello to three datagrams, which raises the allowance to
-  10.8 KB but changes ADM-1's per-datagram admission accounting and adds
-  1.2 KB to every dial;
-- validate the dialer's address first with a Retry, which costs the same
-  round trip.
+- **Upload:** a completed dial sends 48 bytes more, 11,549 bytes in 11
+  datagrams in place of 11,501. The padding datagram stands in for the
+  acknowledgement the dialer would have sent, and padded to 1,200 bytes,
+  while the listener waited. A dial the listener refuses or never answers
+  sends the full 1,200 bytes more.
+- **Headroom:** about 880 bytes. The flight is ~9,920 bytes against a 10,800
+  byte allowance, so a later change that grows the listener's flight past
+  that brings the second round trip back.
+  `the_listeners_first_flight_fits_the_padded_allowance` fails if it does.
+- **Admission:** a refused or retried hybrid dial is now decided and
+  answered three times, once per datagram, in place of twice (ADM-1).
+- **Classical hellos:** a one-datagram hello isn't padded. A listener keeps
+  no state for a hello it refuses at the first packet, so a padding datagram
+  would start an attempt of its own with no hello in it.
 
-The test `the_listeners_first_flight_waits_one_round_trip_for_validation`
-pins the behaviour: one added round trip, and no more.
+Trimming couldn't have avoided the round trip. Category 5 signatures alone
+outgrow the unpadded allowance: ML-DSA-87 with ML-KEM-768 would still send
+about 9.4 KB, from the measured flight less the 480-byte smaller ciphertext.
+Validating the address first with a Retry would cost the same round trip.
 
 ## 4. CPU
 

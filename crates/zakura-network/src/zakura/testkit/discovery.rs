@@ -68,5 +68,5 @@ pub fn spawn_native_discovery_dialer(
     limits: ZakuraLocalLimits,
     sought_services: Vec<ZakuraServiceId>,
 ) -> JoinHandle<()> {
-    discovery::spawn_native_discovery_dialer(endpoint, discovery, limits, sought_services)
+    discovery::spawn_native_discovery_dialer(endpoint, discovery, limits, sought_services, None)
 }

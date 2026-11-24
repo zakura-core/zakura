@@ -10,7 +10,7 @@ use crate::BoxError;
 /// Methods whose result schema is generated from their declared `Result<T>` type.
 ///
 /// Every other method keeps the inherited OpenRPC meta-schema result placeholder.
-const TYPED_RESULT_METHODS: &[&str] = &["preciousblock"];
+const TYPED_RESULT_METHODS: &[&str] = &["getminermeshinfo", "preciousblock"];
 
 pub(super) fn generate(source: &Path, output_dir: &Path) -> Result<(), BoxError> {
     let source = syn::parse_file(&fs::read_to_string(source)?)?;

@@ -129,10 +129,11 @@ impl NodeEnvelope {
         decoded_backend_blocks: u64,
     ) -> Result<Self, NodeEnvelopeError> {
         let block_sync = &config.zakura.block_sync;
-        let quic_bytes =
-            config
-                .zakura
-                .quic_memory_bytes(&config.network, limits.max_connections, custom_kinds);
+        let quic_bytes = config.zakura.quic_memory_bytes(
+            &config.network,
+            limits.total_connections(),
+            custom_kinds,
+        );
         let budget_bytes = config.zakura.peer_memory_budget_bytes;
         if quic_bytes > u128::from(budget_bytes) {
             return Err(NodeEnvelopeError::PeerMemoryBudget {
@@ -171,7 +172,7 @@ impl NodeEnvelope {
 /// The node output budgets of every serving family on a node with this
 /// configuration and `limits`' admitted connections, summed.
 fn serve_output_bytes(config: &Config, limits: &ZakuraLocalLimits) -> u128 {
-    let connections = limits.max_connections;
+    let connections = limits.total_connections();
     let block_sync = config
         .zakura
         .block_sync
@@ -190,7 +191,7 @@ fn serve_output_bytes(config: &Config, limits: &ZakuraLocalLimits) -> u128 {
             headers.node_serve_output_bytes,
         )
         .node_output_bytes,
-        discovery_serving_output_bytes(limits.max_connections),
+        discovery_serving_output_bytes(limits.total_connections()),
     ]
     .into_iter()
     .map(u128::from)
@@ -206,7 +207,7 @@ fn tx_relay_held_output_bytes(config: &Config, limits: &ZakuraLocalLimits) -> u1
     if !config.zakura.tx_relay.enabled {
         return 0;
     }
-    u128::try_from(limits.max_connections)
+    u128::try_from(limits.total_connections())
         .unwrap_or(u128::MAX)
         .saturating_mul(u128::from(
             crate::zakura::tx_relay::wire::SESSION_HELD_OUTPUT_BYTES,

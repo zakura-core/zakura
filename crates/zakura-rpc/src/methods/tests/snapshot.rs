@@ -947,6 +947,16 @@ fn snapshot_rpc_getpeerinfo(get_peer_info: Vec<PeerInfo>, settings: &insta::Sett
     });
 }
 
+/// Snapshot `getminermeshinfo` response, using `cargo insta` and JSON serialization.
+fn snapshot_rpc_getminermeshinfo(
+    get_miner_mesh_info: GetMinerMeshInfoResponse,
+    settings: &insta::Settings,
+) {
+    settings.bind(|| {
+        insta::assert_json_snapshot!("get_miner_mesh_info", get_miner_mesh_info);
+    });
+}
+
 /// Snapshot `getnetworksolps` response, using `cargo insta` and JSON serialization.
 fn snapshot_rpc_getnetworksolps(get_network_sol_ps: u64, settings: &insta::Settings) {
     settings.bind(|| {
@@ -1197,6 +1207,14 @@ pub async fn test_mining_rpcs<State, ReadState>(
         .await
         .expect("We should have a success response");
     snapshot_rpc_getpeerinfo(get_peer_info, &settings);
+
+    // `getminermeshinfo`, with a miner address but no gateway counter or v2
+    // networking wired in
+    let get_miner_mesh_info = rpc
+        .get_miner_mesh_info()
+        .await
+        .expect("We should have a success response");
+    snapshot_rpc_getminermeshinfo(get_miner_mesh_info, &settings);
 
     // `getnetworksolps` (and `getnetworkhashps`)
     //

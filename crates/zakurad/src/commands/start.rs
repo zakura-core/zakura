@@ -884,6 +884,14 @@ impl StartCmd {
             0.0
         });
 
+        // A mining node prefers to stay connected to the mining gateways that recent
+        // blocks name; the tracker started below fills the ranking.
+        let (miner_gateways, miner_gateway_publisher) = miner_mesh::ranking_channel(
+            config.mining.miner_address.is_some(),
+            config.network.network.clone(),
+            latest_chain_tip.clone(),
+        );
+
         let (peer_set, address_book, misbehavior, zakura_endpoint, block_adverts) =
             zakura_network::init_with_zakura(
                 network_config,
@@ -898,6 +906,7 @@ impl StartCmd {
                     claims: announcement_claims.clone(),
                     latest_chain_tip: latest_chain_tip.clone(),
                 }),
+                Some(miner_gateways),
             )
             .await
             .map_err(|error| eyre!(error))?;
@@ -1090,6 +1099,12 @@ impl StartCmd {
                 sync_status: zakura_rpc::node::NodeSyncStatus::new(sync_status.clone()),
                 latest_chain_tip: latest_chain_tip.clone(),
                 address_book: address_book.clone(),
+                miner_mesh: zakura_rpc::MinerMeshSources {
+                    coverage: miner_gateway_publisher
+                        .as_ref()
+                        .map(|publisher| publisher.coverage()),
+                    endpoint: zakura_endpoint.clone(),
+                },
             },
             LAST_WARN_ERROR_LOG_SENDER.subscribe(),
             Some(submit_block_channel.sender()),
@@ -1328,9 +1343,12 @@ impl StartCmd {
 
         // A mining node counts the gateways recent blocks name, to choose which mining
         // gateways to stay connected to.
-        if config.mining.miner_address.is_some() {
-            let miner_mesh_task_handle =
-                miner_mesh::spawn(read_only_state_service.clone(), chain_tip_change.clone());
+        if let Some(publisher) = miner_gateway_publisher {
+            let miner_mesh_task_handle = miner_mesh::spawn(
+                read_only_state_service.clone(),
+                chain_tip_change.clone(),
+                publisher,
+            );
             node_tasks.supervise("miner mesh tracker", miner_mesh_task_handle, |()| Ok(()));
         }
 

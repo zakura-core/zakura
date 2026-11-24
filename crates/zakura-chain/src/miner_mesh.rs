@@ -19,4 +19,4 @@ mod window;
 mod tests;
 
 pub use commitment::MinerMeshCommitment;
-pub use recent_set::{GatewayBlocks, MinerSetSnapshot, RecentMinerSet};
+pub use recent_set::{GatewayBlocks, MinerSetCoverage, MinerSetSnapshot, RecentMinerSet};

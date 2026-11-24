@@ -45,19 +45,19 @@ use super::{
 const GIB: u64 = 1024 * 1024 * 1024;
 
 /// Default budget for native QUIC connections' flow-control credit and the
-/// bound sockets' datagram queues: 15 GiB. CTRL-26 in the zakura-quic spec
+/// bound sockets' datagram queues: 16 GiB. CTRL-26 in the zakura-quic spec
 /// lists what it leaves out.
 ///
-/// It is what admission charges for [`DEFAULT_ZAKURA_MAX_CONNECTIONS`] at the
+/// It funds the default ordinary connections and ten preferred gateways at the
 /// default windows and reactor shares on the one socket the default
 /// `listen_addr` binds, rounded up to a whole GiB. Regtest's larger header
-/// share needs the most: 256 MiB + 32 × 64 MiB + 92 × 144,030,963 B =
-/// 15,666,767,700 B.
+/// share needs the most: 256 MiB + 32 × 64 MiB + 102 × 144,038,733 B =
+/// 17,107,869,870 B.
 pub const DEFAULT_ZAKURA_PEER_MEMORY_BUDGET_BYTES: u64 = {
     let mainnet = default_budget_need(default_connection_memory(CommonMessage::BUDGET));
     let regtest = default_budget_need(default_connection_memory(RegtestMessage::BUDGET));
     let need = if mainnet > regtest { mainnet } else { regtest };
-    // Widening u64 to u128 is lossless. The need is about 15 GiB, so its GiB
+    // Widening u64 to u128 is lossless. The need is about 16 GiB, so its GiB
     // count fits in u64.
     need.div_ceil(GIB as u128) as u64 * GIB
 };
@@ -68,7 +68,7 @@ const fn default_budget_need(memory: ConnectionMemory) -> u128 {
     budgeted_quic_bytes(
         1,
         memory,
-        DEFAULT_ZAKURA_MAX_CONNECTIONS,
+        DEFAULT_ZAKURA_MAX_CONNECTIONS + super::MAX_PREFERRED_GATEWAYS,
         DEFAULT_ZAKURA_MAX_PENDING_HANDSHAKES,
     )
 }
@@ -127,8 +127,8 @@ impl ConnectionMemory {
 }
 
 /// The cost of one connection at the default windows and reactor shares,
-/// with `header_sync` as the header sync share: 141,937,353 B on Mainnet and
-/// Testnet, and 144,030,963 B on Regtest.
+/// with `header_sync` as the header sync share: 141,945,123 B on Mainnet and
+/// Testnet, and 144,038,733 B on Regtest.
 pub const fn default_connection_memory(header_sync: ReactorBudget) -> ConnectionMemory {
     // Widening u32 to u64 is lossless.
     ConnectionMemory::new(
@@ -143,7 +143,7 @@ pub const fn default_connection_memory(header_sync: ReactorBudget) -> Connection
 }
 
 /// Connections the default budget admits at the default windows and shares,
-/// with the one socket the default `listen_addr` binds: 96 on Mainnet.
+/// with the one socket the default `listen_addr` binds: 104 on Mainnet.
 pub const DEFAULT_ZAKURA_BUDGETED_CONNECTIONS: usize = budget_admitted_connections(
     DEFAULT_ZAKURA_PEER_MEMORY_BUDGET_BYTES,
     1,
@@ -153,13 +153,14 @@ pub const DEFAULT_ZAKURA_BUDGETED_CONNECTIONS: usize = budget_admitted_connectio
 
 // The default budget funds the default connection count on every network.
 const _: () = assert!(
-    DEFAULT_ZAKURA_BUDGETED_CONNECTIONS >= DEFAULT_ZAKURA_MAX_CONNECTIONS
+    DEFAULT_ZAKURA_BUDGETED_CONNECTIONS
+        >= DEFAULT_ZAKURA_MAX_CONNECTIONS + super::MAX_PREFERRED_GATEWAYS
         && budget_admitted_connections(
             DEFAULT_ZAKURA_PEER_MEMORY_BUDGET_BYTES,
             1,
             default_connection_memory(RegtestMessage::BUDGET),
             DEFAULT_ZAKURA_MAX_PENDING_HANDSHAKES,
-        ) >= DEFAULT_ZAKURA_MAX_CONNECTIONS,
+        ) >= DEFAULT_ZAKURA_MAX_CONNECTIONS + super::MAX_PREFERRED_GATEWAYS,
     "the default peer memory budget funds the default connection count"
 );
 
@@ -337,9 +338,9 @@ mod tests {
         assert_eq!(QuicConfig::default().connection_memory_bytes(), HANDSHAKE);
 
         assert_eq!(DEFAULT_ZAKURA_MAX_CONNECTIONS, 92);
-        // Regtest's need, 15,666,767,700 B, rounded up to a whole GiB.
-        assert_eq!(DEFAULT_ZAKURA_PEER_MEMORY_BUDGET_BYTES, 16_106_127_360);
-        assert_eq!(DEFAULT_ZAKURA_BUDGETED_CONNECTIONS, 96);
+        // Regtest's need for 102 connections, rounded up to a whole GiB.
+        assert_eq!(DEFAULT_ZAKURA_PEER_MEMORY_BUDGET_BYTES, 17_179_869_184);
+        assert_eq!(DEFAULT_ZAKURA_BUDGETED_CONNECTIONS, 104);
         // Every admitted connection at its full window, every handshake, and the
         // one socket the default `listen_addr` binds fit on every network.
         for network in [
@@ -347,7 +348,8 @@ mod tests {
             Network::new_default_testnet(),
             Network::new_regtest(Default::default()),
         ] {
-            let quic = config.quic_memory_bytes(&network, DEFAULT_ZAKURA_MAX_CONNECTIONS, &[]);
+            let total = DEFAULT_ZAKURA_MAX_CONNECTIONS + super::super::MAX_PREFERRED_GATEWAYS;
+            let quic = config.quic_memory_bytes(&network, total, &[]);
             assert!(
                 quic <= u128::from(DEFAULT_ZAKURA_PEER_MEMORY_BUDGET_BYTES),
                 "{network:?}"
@@ -377,6 +379,7 @@ mod tests {
         // A config generated before the budget existed still says 256.
         let config = ZakuraConfig {
             max_connections: 256,
+            peer_memory_budget_bytes: 15 * GIB,
             ..ZakuraConfig::default()
         };
         assert_eq!(config.budgeted_max_connections(&mainnet()), Ok(96));
@@ -385,6 +388,7 @@ mod tests {
         // reserves two socket queues: (15 GiB - 512 MiB - 32 × 64 MiB) / 141,937,353.
         let config = ZakuraConfig {
             max_connections: 256,
+            peer_memory_budget_bytes: 15 * GIB,
             listen_addr: None,
             ..ZakuraConfig::default()
         };
@@ -394,6 +398,7 @@ mod tests {
         // (15 GiB - 256 MiB - 32 × 96 MiB) / (141,937,353 + 32 MiB).
         let config = ZakuraConfig {
             max_connections: 256,
+            peer_memory_budget_bytes: 15 * GIB,
             quic: QuicConfig {
                 receive_window_bytes: 64 << 20,
                 ..QuicConfig::default()
@@ -406,6 +411,7 @@ mod tests {
         // (15 GiB - 256 MiB - 64 × 64 MiB) / 141,937,353.
         let config = ZakuraConfig {
             max_connections: 256,
+            peer_memory_budget_bytes: 15 * GIB,
             max_pending_handshakes: 64,
             ..ZakuraConfig::default()
         };
@@ -414,6 +420,7 @@ mod tests {
         // So does a larger reactor share: a 64 MiB cwnd cap adds 32 MiB.
         let mut config = ZakuraConfig {
             max_connections: 256,
+            peer_memory_budget_bytes: 15 * GIB,
             ..ZakuraConfig::default()
         };
         config.block_sync.bbr_max_cwnd_bytes = 64 << 20;
@@ -541,7 +548,9 @@ mod tests {
                 let inbound_full = bind.max_inbound_connections.expect("Zakura caps inbound");
                 assert_eq!(
                     inbound_full,
-                    limits.max_inbound_connections() + limits.max_inbound_handshakes(),
+                    limits.max_inbound_connections()
+                        + limits.max_preferred_connections
+                        + limits.max_inbound_handshakes(),
                     "{label}"
                 );
                 // With inbound at its cap, discovery stops only at the reserve.
@@ -569,7 +578,7 @@ mod tests {
                 bind.dial_reserve,
                 bind.max_inbound_connections
             ),
-            (124, 8, Some(93))
+            (134, 8, Some(103))
         );
     }
 
@@ -613,7 +622,7 @@ mod tests {
             ..ZakuraConfig::default()
         };
         let error = config.budgeted_max_connections(&mainnet()).unwrap_err();
-        // 32 handshakes of (1024 + 32) MiB alone exceed the 15 GiB budget.
+        // 32 handshakes of (1024 + 32) MiB alone exceed the 16 GiB budget.
         assert_eq!((error.headroom, error.admitted), (32, 0));
         assert_eq!(error.handshake_bytes, (1024 + 32) * MIB);
         // Mainnet's 9 bootstrap peers, counting one as possibly this node.

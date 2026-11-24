@@ -18,6 +18,10 @@ use crate::methods::{
             GetBlockTemplateCapability, GetBlockTemplateParameters, GetBlockTemplateRequestMode,
         },
         long_poll::LongPollId,
+        miner_mesh_info::{
+            GetMinerMeshInfoResponse, MeshGateway, MeshGatewayState, MeshPeer, MeshSlots,
+            MeshWindow,
+        },
         submit_block::{SubmitBlockParameters, SubmitSolutionParameters},
     },
     AddNodeCommand, GetAddressBalanceRequest, GetAddressTxIdsRequest, GetAddressUtxosRequest,
@@ -57,6 +61,7 @@ inline_schema! {
     String => { "type": "string" },
     u8 => { "type": "integer", "format": "uint8", "minimum": 0, "maximum": 255 },
     u32 => { "type": "integer", "format": "uint32", "minimum": 0 },
+    usize => { "type": "integer", "minimum": 0 },
     i32 => { "type": "integer", "format": "int32" },
 }
 
@@ -100,6 +105,7 @@ fn string_enum(description: &str, variants: &[(&str, &str)]) -> Value {
 }
 
 component_schema! {
+    MeshGatewayState => { "type": "string", "enum": ["preferred", "standby", "backoff", "unmatched"] },
     HexData => {
         "description": "Deserialize hex-encoded strings to bytes.",
         "type": "string",
@@ -367,6 +373,97 @@ impl RpcSchema for SubmitSolutionParameters {
                 ),
             },
             "required": ["workid", "header"],
+        })
+    }
+}
+
+impl RpcSchema for MeshWindow {
+    const COMPONENT: Option<&'static str> = Some("MeshWindow");
+
+    fn schema(generator: &mut Generator) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "tip": generator.subschema_for::<Option<u32>>(),
+                "newest": generator.subschema_for::<Option<u32>>(),
+                "oldest": generator.subschema_for::<Option<u32>>(),
+                "checked": generator.subschema_for::<usize>(),
+                "coverage": { "type": "number", "minimum": 0, "maximum": 1 },
+            },
+            "required": ["tip", "newest", "oldest", "checked", "coverage"],
+        })
+    }
+}
+
+impl RpcSchema for MeshGateway {
+    const COMPONENT: Option<&'static str> = Some("MeshGateway");
+
+    fn schema(generator: &mut Generator) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "node_id": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+                "blocks": generator.subschema_for::<u32>(),
+                "state": generator.subschema_for::<MeshGatewayState>(),
+                "connected": generator.subschema_for::<bool>(),
+            },
+            "required": ["node_id", "blocks", "state", "connected"],
+        })
+    }
+}
+
+impl RpcSchema for MeshSlots {
+    const COMPONENT: Option<&'static str> = Some("MeshSlots");
+
+    fn schema(generator: &mut Generator) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "limit": generator.subschema_for::<usize>(),
+                "in_use": generator.subschema_for::<usize>(),
+                "preferred": generator.subschema_for::<usize>(),
+                "ordinary": generator.subschema_for::<usize>(),
+                "inbound": generator.subschema_for::<usize>(),
+            },
+            "required": ["limit", "in_use", "preferred", "ordinary", "inbound"],
+        })
+    }
+}
+
+impl RpcSchema for MeshPeer {
+    const COMPONENT: Option<&'static str> = Some("MeshPeer");
+
+    fn schema(generator: &mut Generator) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "node_id": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+                "inbound": generator.subschema_for::<bool>(),
+                "preferred": generator.subschema_for::<bool>(),
+            },
+            "required": ["node_id", "inbound", "preferred"],
+        })
+    }
+}
+
+impl RpcSchema for GetMinerMeshInfoResponse {
+    const COMPONENT: Option<&'static str> = Some("GetMinerMeshInfoResponse");
+
+    fn schema(generator: &mut Generator) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "node_id": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$" },
+                "announcing": generator.subschema_for::<bool>(),
+                "mining": generator.subschema_for::<bool>(),
+                "synced": generator.subschema_for::<bool>(),
+                "window": generator.subschema_for::<Option<MeshWindow>>(),
+                "gateways": generator.subschema_for::<Vec<MeshGateway>>(),
+                "hold": generator.subschema_for::<usize>(),
+                "slots": generator.subschema_for::<Option<MeshSlots>>(),
+                "peers": generator.subschema_for::<Vec<MeshPeer>>(),
+            },
+            "required": ["node_id", "announcing", "mining", "synced", "window", "gateways", "hold", "slots", "peers"],
         })
     }
 }

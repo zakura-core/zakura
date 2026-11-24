@@ -18,6 +18,7 @@ use crate::{
 };
 
 mod block_sync;
+pub mod bpv1;
 mod discovery;
 #[cfg(all(test, not(zakura_sim)))]
 mod example_reactor;

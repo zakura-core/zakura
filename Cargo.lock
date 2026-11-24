@@ -123,7 +123,7 @@ dependencies = [
  "regex",
  "rustc-hash",
  "shlex",
- "syn 2.0.118",
+ "syn 3.0.10",
 ]
 
 [[package]]
@@ -155,6 +155,20 @@ dependencies = [
  "arrayref",
  "arrayvec",
  "constant_time_eq",
+]
+
+[[package]]
+name = "blake3"
+version = "1.8.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0aa83c34e62843d924f905e0f5c866eb1dd6545fc4d719e803d9ba6030371fce"
+dependencies = [
+ "arrayref",
+ "arrayvec",
+ "cc",
+ "cfg-if",
+ "constant_time_eq",
+ "cpufeatures 0.3.0",
 ]
 
 [[package]]
@@ -1942,6 +1956,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "readme-rustdocifier"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08ad765b21a08b1a8e5cdce052719188a23772bcbefb3c439f0baaf62c56ceac"
+
+[[package]]
+name = "reed-solomon-simd"
+version = "3.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cffef0520d30fbd4151fb20e262947ae47fb0ab276a744a19b6398438105a072"
+dependencies = [
+ "cpufeatures 0.2.17",
+ "fixedbitset",
+ "once_cell",
+ "readme-rustdocifier",
+]
+
+[[package]]
 name = "ref-cast"
 version = "1.0.25"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2342,7 +2374,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -3370,6 +3402,7 @@ version = "19.0.0"
 dependencies = [
  "bitflags",
  "blake2b_simd",
+ "blake3",
  "byteorder",
  "bytes",
  "chrono",
@@ -3386,6 +3419,7 @@ dependencies = [
  "proptest-derive",
  "rand 0.10.2",
  "rayon",
+ "reed-solomon-simd",
  "ring",
  "serde",
  "serde_json",

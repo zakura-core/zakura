@@ -333,9 +333,19 @@ version = "0.10.0"
 criteria = "safe-to-deploy"
 notes = "Introduced by the Zakura Common fork migration; retain this exact-version exemption pending dedicated review."
 
+[[exemptions.readme-rustdocifier]]
+version = "0.1.1"
+criteria = "safe-to-deploy"
+notes = "Build-time only: the build script of reed-solomon-simd, the BPv1 erasure codec, rewrites its README into crate docs. Exact-version exemption pending dedicated package review. This exemption is not an audit certification."
+
 [[exemptions.redox_users]]
 version = "0.4.5"
 criteria = "safe-to-deploy"
+
+[[exemptions.reed-solomon-simd]]
+version = "3.1.0"
+criteria = "safe-to-deploy"
+notes = "Introduced with BPv1 block propagation (zakura-network bpv1), which erasure-codes block bodies with this Reed-Solomon codec. Exact-version exemption pending dedicated package review. This exemption is not an audit certification."
 
 [[exemptions.rgb]]
 version = "0.8.53"

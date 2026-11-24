@@ -40,3 +40,4 @@ pub use item::{BlockHash, Bool, HeightLe, LeU16, LeU32, LeU64, Wire, U8};
 pub use list::List;
 pub use message::{decode_frame, encode_frame, WireMessage};
 pub use reader::BoundedReader;
+pub(crate) use reader::{compact_size_len, write_compact_size};

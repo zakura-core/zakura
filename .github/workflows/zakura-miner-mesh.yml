@@ -1,0 +1,85 @@
+name: Zakura miner mesh regtest
+
+# Runs the miner mesh scenarios in crates/zakurad/tests/miner_mesh_regtest.rs:
+# Regtest networks of real zakurad processes on loopback, some of them mining,
+# that check how mining nodes find and keep connections to each other's
+# gateways.
+#
+# It runs for pull requests that change the miner mesh code, the v2 connection
+# places, dialer and admission it drives, the block template and mining RPCs
+# the scenarios mine with, node startup, the tests or this workflow, and on
+# demand.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/zakura-miner-mesh.yml"
+      - ".github/actions/setup-zakura-build/**"
+      - ".config/nextest.toml"
+      - "crates/zakura-chain/src/miner_mesh.rs"
+      - "crates/zakura-chain/src/miner_mesh/**"
+      - "crates/zakura-network/src/zakura/discovery/**"
+      - "crates/zakura-network/src/zakura/regulation/**"
+      - "crates/zakura-network/src/zakura/transport/**"
+      - "crates/zakura-network/src/zakura/handler.rs"
+      - "crates/zakura-network/src/zakura/testkit/**"
+      - "crates/zakura-quic/**"
+      - "crates/zakura-rpc/src/config/mining.rs"
+      - "crates/zakura-rpc/src/methods.rs"
+      - "crates/zakura-rpc/src/methods/types/get_block_template.rs"
+      - "crates/zakura-rpc/src/methods/types/get_block_template/**"
+      - "crates/zakura-rpc/src/methods/types/miner_mesh_info.rs"
+      - "crates/zakura-rpc/src/methods/types/miner_mesh_info/**"
+      - "crates/zakurad/src/commands/start.rs"
+      - "crates/zakurad/src/components/miner_mesh.rs"
+      - "crates/zakurad/src/components/miner_mesh/**"
+      - "crates/zakurad/Cargo.toml"
+      - "crates/zakurad/tests/miner_mesh_regtest.rs"
+      - "crates/zakurad/tests/common/config.rs"
+      - "crates/zakurad/tests/common/launch.rs"
+      - "crates/zakurad/tests/common/mod.rs"
+      - "crates/zakurad/tests/common/regtest.rs"
+      - "crates/zakurad/tests/common/regtest_net.rs"
+      - "crates/zakurad/tests/common/regtest_net/**"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  RUST_LIB_BACKTRACE: 1
+  RUST_LOG: info
+  COLORBT_SHOW_HIDDEN: 1
+
+jobs:
+  miner-mesh-regtest:
+    name: Miner mesh regtest scenarios
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    # The scenarios take a few minutes together; a cold zakurad debug build is
+    # the long pole.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 #v1.17.0 # zizmor: ignore[cache-poisoning] -- CI integration job; publishes nothing
+        with:
+          toolchain: stable
+          # Same debug + default-release-binaries workspace build as the unit
+          # acceptance jobs, so it shares their consolidated build cache.
+          cache-shared-key: zakura-drb-debug
+          cache-on-failure: true
+          cache-save-if: false
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 #v2.90.3
+        with:
+          tool: cargo-nextest
+      - uses: ./.github/actions/setup-zakura-build
+      - name: Run the miner mesh regtest profile
+        run: cargo nextest run --profile miner-mesh-regtest --locked --features default-release-binaries --run-ignored=all -p zakura

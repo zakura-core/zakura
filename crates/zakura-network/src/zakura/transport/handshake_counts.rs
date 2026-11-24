@@ -7,8 +7,9 @@ use zakura_rt::{collections::HashMap, time::Instant};
 mod slots;
 
 use slots::ConnectionSlots;
-pub use slots::SlotCount;
+pub use slots::{SlotClass, SlotCount, SlotRefusal, SlotSplit};
 
+use super::{GatewayRanking, GatewayStanding, PreferredGateways};
 use crate::zakura::regulation::Bucket;
 use crate::zakura::{admission_host, Cadence, DEFAULT_ZAKURA_REDIAL_INITIAL_BACKOFF};
 
@@ -98,6 +99,12 @@ pub struct HandshakeCounts {
     inbound_reservations: usize,
     /// Connection slots, by the remote node that holds them.
     connections: ConnectionSlots,
+    /// Outbound slots whose TLS handshake has proved the target identity.
+    authenticated_dials: HashMap<NodeId, usize>,
+    /// The gateways connection places are held for. It sits under the same
+    /// lock as the slots, so a check never sees a set and slot counts from
+    /// different moments.
+    preferred: PreferredGateways,
     /// Charges of attempts whose source address was validated, by a Retry
     /// token, before TLS.
     validated_cadence: CadenceLedger,
@@ -278,21 +285,125 @@ impl HandshakeCounts {
         self.connections.inbound()
     }
 
-    /// Checks whether the connection budget can admit this direction.
-    pub fn connections_full(&self, inbound: bool, cap: usize) -> bool {
-        self.connections.full(inbound, cap)
+    /// Whether a slot within `cap` may be free for an inbound caller whose
+    /// node ID is not known yet: an ordinary inbound slot, or a held place
+    /// that no preferred gateway fills. With no hold this is the ordinary
+    /// inbound check alone.
+    pub fn inbound_place_free(&self, cap: usize) -> bool {
+        self.connections.inbound_place_free(cap, &self.preferred)
     }
 
-    /// Charges a connection slot to `node` while preserving the dial
-    /// reserve: the total stays within `cap`, and inbound slots within its
-    /// inbound share. The check and the charge are one step.
-    pub fn claim_connection(&mut self, node: NodeId, inbound: bool, cap: usize) -> bool {
-        self.connections.claim(node, inbound, cap)
+    /// Connection slots within `cap` that a dial to a node outside the
+    /// preferred set may claim now.
+    pub fn free_ordinary_connections(&self, cap: usize) -> usize {
+        self.connections.free_ordinary(cap, &self.preferred)
+    }
+
+    /// Charges a connection slot to `node` while keeping the dial reserve
+    /// and the held places: the total stays within `cap` plus the hold, ordinary slots
+    /// within `cap`, and ordinary inbound slots within the
+    /// inbound share. A preferred gateway's first slot takes a held place.
+    /// The check and the charge are one step.
+    ///
+    /// A granted inbound claim records the authenticated gateway as connected
+    /// for later cutoff ties. A refusal restores the previous ranking. Each member
+    /// counts one preferred slot, so preferred slots never pass the hold. A member the
+    /// caller displaces keeps its slot, now ordinary, which can leave the
+    /// ordinary slots one over `cap` until a slot frees. That
+    /// is bounded by the hold and passes, as after a published set change.
+    pub fn claim_connection(
+        &mut self,
+        node: NodeId,
+        inbound: bool,
+        cap: usize,
+    ) -> Result<SlotClass, SlotRefusal> {
+        let before = inbound
+            .then(|| self.preferred.with_connected(&node))
+            .flatten()
+            .map(|formed| std::mem::replace(&mut self.preferred, formed));
+        let claim = self.connections.claim(node, inbound, cap, &self.preferred);
+        if let (Err(_), Some(before)) = (claim, before) {
+            self.preferred = before;
+        }
+        claim
+    }
+
+    /// Records a dial target as connected once the outbound transport proves its ID.
+    pub(crate) fn outbound_connected(&mut self, node: NodeId) {
+        *self.authenticated_dials.entry(node).or_default() += 1;
+        if let Some(formed) = self.preferred.with_connected(&node) {
+            self.preferred = formed;
+        }
+    }
+
+    /// Replaces the preferred gateways the slot checks use. Slots already
+    /// held stay held; only how they count changes.
+    /// TLS ownership is sampled here, since discovery prepared its snapshot before this lock.
+    pub fn publish_gateway_ranking(&mut self, ranking: &GatewayRanking, hold_limit: usize) {
+        let authenticated = |node: &NodeId| {
+            self.connections.of_node(node).inbound > 0
+                || self.authenticated_dials.contains_key(node)
+        };
+        let owners = self.connections.nodes().filter(|node| authenticated(node));
+        let mut live = ranking.candidates(owners);
+        for gateway in &mut live {
+            if authenticated(&gateway.node) {
+                gateway.standing = GatewayStanding::Connected;
+            } else if gateway.standing == GatewayStanding::Connected {
+                gateway.standing = if self.connections.of_node(&gateway.node).outbound > 0 {
+                    GatewayStanding::Dialing
+                } else {
+                    GatewayStanding::Backoff
+                };
+            }
+        }
+        self.preferred =
+            PreferredGateways::form_with_incumbents(live, hold_limit, self.preferred.set());
+    }
+
+    /// The preferred gateways the slot checks use now.
+    pub fn preferred_gateways(&self) -> &PreferredGateways {
+        &self.preferred
+    }
+
+    /// The slots in use, split into preferred and ordinary ones by the
+    /// current preferred set.
+    pub fn slot_split(&self) -> SlotSplit {
+        self.connections.split(&self.preferred)
+    }
+
+    /// Removes the TLS proof belonging to this outbound slot before releasing it.
+    pub(crate) fn release_authenticated_dial(&mut self, node: NodeId) {
+        let count = self
+            .authenticated_dials
+            .get_mut(&node)
+            .expect("the authenticated dial guard owns its TLS proof");
+        *count -= 1;
+        if *count == 0 {
+            self.authenticated_dials.remove(&node);
+        }
+        self.release_connection(node, false);
     }
 
     /// Releases the slot that `claim_connection` charged to `node`.
+    ///
+    /// A gateway that loses its last connection slot counts as in backoff
+    /// until the next published ranking, so a dropped caller or member
+    /// doesn't stay preferred in the meantime.
     pub fn release_connection(&mut self, node: NodeId, inbound: bool) {
         self.connections.release(node, inbound);
+        let slots = self.connections.of_node(&node);
+        let updated = if slots.total() == 0 {
+            self.preferred.with_released(&node)
+        } else if slots.inbound == 0 && !self.authenticated_dials.contains_key(&node) {
+            self.preferred
+                .with_standing(&node, GatewayStanding::Dialing)
+        } else {
+            None
+        };
+        if let Some(formed) = updated {
+            self.preferred = formed;
+        }
     }
 
     /// The connection slots `node` holds now.

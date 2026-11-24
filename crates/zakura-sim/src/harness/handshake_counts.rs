@@ -7,7 +7,10 @@ use std::{
 };
 use zakura_rt::time::Instant;
 
-use zakura_network::zakura::{HandshakeCadenceAdmission, HandshakeCounts, IpAdmission};
+use zakura_network::zakura::{
+    GatewayRanking, GatewayStanding, HandshakeCadenceAdmission, HandshakeCounts, IpAdmission,
+    RankedGateway, SlotClass, SlotRefusal, SlotSplit,
+};
 use zakura_quic::{NodeId, NodeSecretKey};
 
 use super::{machine::Machine, HarnessEntry};
@@ -68,12 +71,12 @@ const MACHINE: Machine = Machine {
         ),
         (
             RESERVE,
-            "Inbound connections and handshakes preserve the dial reserve.",
+            "Inbound connections and handshakes preserve the dial reserve, and no ordinary slot is granted at or above the ordinary limit.",
             Status::Active,
         ),
         (
             COUNTS,
-            "Machine charges equal the live connection, handshake, and registration owners.",
+            "Machine charges equal the live connection, handshake, and registration owners, and so does their split into one preferred slot per preferred gateway holding any, within the hold, and ordinary slots.",
             Status::Active,
         ),
     ],
@@ -204,6 +207,108 @@ fn release_handshake(counts: &mut HandshakeCounts, owner: Owner) {
         }
         Phase::Registered => counts.remove_registered(owner.ip),
     }
+}
+
+/// The live owners' connection slots of `node` in one direction.
+fn live_slots(owners: &[Option<Owner>; SLOTS], node: NodeId, inbound: bool) -> usize {
+    owners
+        .iter()
+        .flatten()
+        .filter(|owner| {
+            owner.node == node
+                && owner.inbound == inbound
+                && (!owner.inbound || owner.phase != Phase::Quic)
+        })
+        .count()
+}
+
+/// The live owners' slots split by `set`, counted from the owners alone:
+/// one preferred slot per member holding any, inbound if it holds an
+/// inbound one.
+fn owner_split(owners: &[Option<Owner>; SLOTS], set: &[NodeId]) -> SlotSplit {
+    let view = expected(owners);
+    let holding = |inbound_only: bool| {
+        set.iter()
+            .filter(|&&member| {
+                live_slots(owners, member, true) > 0
+                    || (!inbound_only && live_slots(owners, member, false) > 0)
+            })
+            .count()
+    };
+    SlotSplit {
+        preferred: holding(false),
+        ordinary: view.connections - holding(false),
+        ordinary_inbound: view.inbound_connections - holding(true),
+    }
+}
+
+/// Judges one connection claim against the owners before it, under the
+/// preferred set the claim was decided with.
+fn check_claim(
+    failures: &mut Vec<(String, MachineFailure)>,
+    owners: &[Option<Owner>; SLOTS],
+    counts: &HandshakeCounts,
+    node: NodeId,
+    inbound: bool,
+    claim: Result<SlotClass, SlotRefusal>,
+) {
+    let preferred = counts.preferred_gateways();
+    let before = owner_split(owners, preferred.set());
+    if claim.is_ok() && before.ordinary + before.preferred >= CONNECTION_CAP + preferred.hold() {
+        failure(
+            failures,
+            RESERVE,
+            "a slot was granted above the ordinary limit plus the active gateway places",
+        );
+    }
+    match claim {
+        Ok(SlotClass::Ordinary) => {
+            if before.ordinary >= CONNECTION_CAP {
+                failure(
+                    failures,
+                    RESERVE,
+                    "an ordinary slot was granted at or above the ordinary limit",
+                );
+            }
+            if inbound && before.ordinary_inbound >= INBOUND_CONNECTION_CAP {
+                failure(
+                    failures,
+                    RESERVE,
+                    "an ordinary inbound slot was granted past the inbound share",
+                );
+            }
+        }
+        Ok(SlotClass::Preferred) => {
+            if !preferred.contains(&node)
+                || live_slots(owners, node, true) + live_slots(owners, node, false) > 0
+            {
+                failure(
+                    failures,
+                    COUNTS,
+                    "a preferred slot went to a node that is not a member holding no slot",
+                );
+            }
+        }
+        Err(_) => {}
+    }
+}
+
+/// Ranks the table in order. The low four bits mark dialable nodes.
+fn ranking_from(nodes: &[NodeId; NODES], arg: u8) -> GatewayRanking {
+    nodes
+        .iter()
+        .enumerate()
+        .map(|(index, &node)| RankedGateway {
+            node,
+            // The table holds four nodes, so the count fits.
+            blocks: (NODES - index) as u32,
+            standing: if arg & (1 << index) != 0 {
+                GatewayStanding::Dialable
+            } else {
+                GatewayStanding::Unmatched
+            },
+        })
+        .collect()
 }
 
 fn failure(failures: &mut Vec<(String, MachineFailure)>, id: &str, message: impl Into<String>) {
@@ -346,8 +451,11 @@ fn history(input: &[u8]) -> Vec<(usize, MachineStep)> {
     let mut owners = [None; SLOTS];
     let mut history = Vec::new();
     let mut active = false;
+    // Whether a preferred set was ever published. Until then every inbound
+    // slot is ordinary, so the inbound share bounds them all.
+    let mut published = false;
     for (index, bytes) in operations(input).chunks(3).enumerate() {
-        let op = bytes[0] % 10;
+        let op = bytes[0] % 11;
         let slot = usize::from(*bytes.get(1).unwrap_or(&0)) % SLOTS;
         let arg = *bytes.get(2).unwrap_or(&0);
         let (host, ip) = address(arg);
@@ -370,8 +478,13 @@ fn history(input: &[u8]) -> Vec<(usize, MachineStep)> {
                     .flatten()
                     .filter(|owner| owner.inbound && owner.phase == Phase::Quic)
                     .count();
+                let claim =
+                    (!inbound).then(|| counts.claim_connection(node, false, CONNECTION_CAP));
+                if let Some(claim) = claim {
+                    check_claim(&mut failures, &owners, &counts, node, false, claim);
+                }
                 let admitted = if inbound {
-                    !counts.connections_full(true, CONNECTION_CAP)
+                    counts.inbound_place_free(CONNECTION_CAP)
                         && (counts.ip_admission(
                             ip,
                             quic_host,
@@ -381,7 +494,7 @@ fn history(input: &[u8]) -> Vec<(usize, MachineStep)> {
                         ) == IpAdmission::Open
                             && !counts.pending_full(quic_total, PENDING_CAP))
                 } else {
-                    counts.claim_connection(node, false, CONNECTION_CAP)
+                    claim.is_some_and(|claim| claim.is_ok())
                 };
                 active |= admitted;
                 let admitted =
@@ -398,22 +511,43 @@ fn history(input: &[u8]) -> Vec<(usize, MachineStep)> {
                     });
                     active = true;
                 }
-                if !inbound
-                    && !admitted
-                    && view.connections - view.inbound_connections
-                        < CONNECTION_CAP - INBOUND_CONNECTION_CAP
-                {
-                    failure(
-                        &mut failures,
-                        RESERVE,
-                        "inbound load refused a dial before TLS",
-                    );
+                // A refused dial must be one the limits explain: a member's
+                // first slot is refused only at the limit, and an ordinary
+                // dial only once ordinary dials fill the reserve or ordinary inbound slots pass their share.
+                if !inbound && !admitted {
+                    let preferred = counts.preferred_gateways();
+                    let split = owner_split(&owners, preferred.set());
+                    let fresh_member = preferred.contains(&node)
+                        && live_slots(&owners, node, true) + live_slots(&owners, node, false) == 0;
+                    let ordinary_outbound = split.ordinary - split.ordinary_inbound;
+                    if (fresh_member && view.connections < CONNECTION_CAP + preferred.hold())
+                        || (split.ordinary_inbound <= INBOUND_CONNECTION_CAP
+                            && ordinary_outbound < CONNECTION_CAP - INBOUND_CONNECTION_CAP
+                            && view.connections < CONNECTION_CAP + preferred.hold())
+                    {
+                        failure(
+                            &mut failures,
+                            RESERVE,
+                            "inbound load refused a dial before TLS",
+                        );
+                    }
                 }
             }
             (2, Some(mut owner)) if owner.phase == Phase::Quic => {
                 let view = expected(&owners);
-                let connection_claimed =
-                    !owner.inbound || counts.claim_connection(owner.node, true, CONNECTION_CAP);
+                let set_before = counts.preferred_gateways().clone();
+                let connection_claimed = !owner.inbound || {
+                    let claim = counts.claim_connection(owner.node, true, CONNECTION_CAP);
+                    check_claim(&mut failures, &owners, &counts, owner.node, true, claim);
+                    if claim.is_err() && *counts.preferred_gateways() != set_before {
+                        failure(
+                            &mut failures,
+                            COUNTS,
+                            "a refused claim changed the preferred set",
+                        );
+                    }
+                    claim.is_ok()
+                };
                 let claimed = connection_claimed
                     && if owner.inbound {
                         counts.claim_transferred_pending();
@@ -492,6 +626,12 @@ fn history(input: &[u8]) -> Vec<(usize, MachineStep)> {
                 release(&mut counts, owner);
                 owners[slot] = None;
             }
+            (10, _) => {
+                // The ranking changes. Slots already held stay held.
+                counts
+                    .publish_gateway_ranking(&ranking_from(&nodes, arg), usize::from(arg >> 4) % 4);
+                published = true;
+            }
             _ => {}
         }
         let actual = actual(&counts);
@@ -515,23 +655,13 @@ fn history(input: &[u8]) -> Vec<(usize, MachineStep)> {
                 "transport reservations differ from live owners",
             );
         }
-        let live_slots = |node: NodeId, inbound: bool| {
-            owners
-                .iter()
-                .flatten()
-                .filter(|owner| {
-                    owner.node == node
-                        && owner.inbound == inbound
-                        && (!owner.inbound || owner.phase != Phase::Quic)
-                })
-                .count()
-        };
         let by_node = counts.summed_node_connections();
         if by_node.total() != actual.connections
             || by_node.inbound != actual.inbound_connections
             || nodes.iter().any(|&node| {
                 let slots = counts.node_connections(&node);
-                slots.inbound != live_slots(node, true) || slots.outbound != live_slots(node, false)
+                slots.inbound != live_slots(&owners, node, true)
+                    || slots.outbound != live_slots(&owners, node, false)
             })
         {
             failure(
@@ -558,8 +688,33 @@ fn history(input: &[u8]) -> Vec<(usize, MachineStep)> {
                 "live handshake owners exceed a pending bound",
             );
         }
-        if actual.connections > CONNECTION_CAP
-            || actual.inbound_connections > INBOUND_CONNECTION_CAP
+        let preferred = counts.preferred_gateways();
+        let split = counts.slot_split();
+        let owners_split = owner_split(&owners, preferred.set());
+        if split.preferred + split.ordinary != actual.connections
+            || split.ordinary != owners_split.ordinary
+            || split.ordinary_inbound != owners_split.ordinary_inbound
+            || split.preferred > preferred.hold()
+            || preferred.set().len() > preferred.hold()
+        {
+            failure(
+                &mut failures,
+                COUNTS,
+                format!(
+                    "split {split:?} differs from owners {owners_split:?} or passes the hold {}",
+                    preferred.hold()
+                ),
+            );
+        }
+        if split.preferred != owners_split.preferred {
+            failure(
+                &mut failures,
+                COUNTS,
+                "preferred slots differ from the members holding a slot",
+            );
+        }
+        if actual.connections > CONNECTION_CAP + NODES
+            || (!published && actual.inbound_connections > INBOUND_CONNECTION_CAP)
         {
             failure(
                 &mut failures,
@@ -708,6 +863,39 @@ mod tests {
             &mut crate::NullSink,
         )
         .unwrap();
+    }
+
+    /// A published hold keeps one place for its gateway: ordinary dials
+    /// fill the ordinary limit, the gateway's dial takes an extra place, and a
+    /// ranked caller unknown to v2 takes a place it outranks.
+    #[test]
+    fn a_published_hold_keeps_a_place_for_its_gateway() {
+        // A hold limit of one; nodes 1 to 3 dialable, node 0 unknown.
+        let mut input = vec![10, 0, 0x1e];
+        for slot in 0..92 {
+            input.extend([1, slot, 0x30]);
+        }
+        input.extend([1, 92, 0x30, 1, 93, 0x10]);
+        let steps = history(&input);
+        holds(&input);
+        assert!(steps.iter().any(|(_, step)| matches!(step,
+            MachineStep::Handshake(step) if step.actual.connections == CONNECTION_CAP + 1)));
+
+        // Node 0 calls in at the ordinary limit and outranks the member.
+        let mut input = vec![10, 0, 0x1e];
+        for slot in 0..92 {
+            input.extend([1, slot, 0x30]);
+        }
+        input.extend([0, 92, 0x00, 2, 92, 0]);
+        let steps = history(&input);
+        holds(&input);
+        let (claimed, _) = steps.last().expect("the history ends with its teardown");
+        // The claim is the last op, before the teardown step: it fills the
+        // limit only if the caller was granted the held place.
+        assert!(steps.iter().any(|(number, step)| matches!(step,
+            MachineStep::Handshake(step) if *number == claimed - 1
+                && step.actual.connections == CONNECTION_CAP + 1
+                && step.actual.inbound_connections == 1)));
     }
 
     #[test]

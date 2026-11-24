@@ -2141,8 +2141,10 @@ pub enum TransportFact {
         node_connections: usize,
         /// Inbound connection slots summed over the machine's per-node record.
         inbound_node_connections: usize,
-        /// Total connection capacity.
+        /// Ordinary connection capacity.
         connection_cap: usize,
+        /// Additional memory-funded gateway places.
+        gateway_capacity: usize,
         /// The configured registered-connection limit per address.
         address_cap: usize,
         /// Transfers during which QUIC and the handler may both charge one address.

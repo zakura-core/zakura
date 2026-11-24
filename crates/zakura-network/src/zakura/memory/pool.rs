@@ -33,6 +33,11 @@ use crate::zakura::{ZakuraConnId, ZakuraPeerId};
 
 /// Why a lease request was refused by the pool rule (`02 §5`).
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[cfg_attr(
+    any(test, zakura_sim),
+    derive(serde::Serialize),
+    serde(rename_all = "kebab-case")
+)]
 pub enum LeaseDenied {
     /// Taking the lease would exceed the consumer's cap (rule 1).
     CapExceeded,
@@ -772,9 +777,10 @@ impl MemoryPoolMachine {
 }
 
 /// One pool lease event reported to a test or simulator [`PoolObserver`]
-/// (`03 §4`).
+/// (`03 §4`). The simulator records it as it serializes.
 #[cfg(any(test, zakura_sim))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(tag = "event", rename_all = "kebab-case")]
 pub enum PoolEvent {
     /// A new lease was granted.
     Granted {
@@ -783,6 +789,7 @@ pub enum PoolEvent {
         /// Consumer owning the lease.
         consumer: Consumer,
         /// Peer connection associated with this lease, if any.
+        #[serde(skip_serializing_if = "Option::is_none")]
         peer: Option<ZakuraConnId>,
         /// Bytes granted.
         bytes: u64,
@@ -804,6 +811,7 @@ pub enum PoolEvent {
         /// Consumer owning the lease.
         consumer: Consumer,
         /// Peer connection associated with this lease, if any.
+        #[serde(skip_serializing_if = "Option::is_none")]
         peer: Option<ZakuraConnId>,
         /// Bytes before resize.
         old_bytes: u64,
@@ -830,6 +838,7 @@ pub enum PoolEvent {
         /// Consumer owning both leases.
         consumer: Consumer,
         /// Peer connection associated with the child lease, if any.
+        #[serde(skip_serializing_if = "Option::is_none")]
         peer: Option<ZakuraConnId>,
         /// Bytes moved to `to_lease_id`.
         bytes: u64,
@@ -844,6 +853,7 @@ pub enum PoolEvent {
         /// Consumer owning both leases.
         consumer: Consumer,
         /// Peer connection associated with the surviving lease, if any.
+        #[serde(skip_serializing_if = "Option::is_none")]
         peer: Option<ZakuraConnId>,
         /// Bytes moved into `into_lease_id`.
         bytes: u64,
@@ -861,6 +871,7 @@ pub enum PoolEvent {
         /// Consumer that took the bytes.
         to: Consumer,
         /// Peer connection associated with both leases, if any.
+        #[serde(skip_serializing_if = "Option::is_none")]
         peer: Option<ZakuraConnId>,
         /// Bytes moved to `to_lease_id`.
         bytes: u64,
@@ -880,6 +891,7 @@ pub enum PoolEvent {
         /// Consumer owning the lease.
         consumer: Consumer,
         /// Peer connection associated with this lease, if any.
+        #[serde(skip_serializing_if = "Option::is_none")]
         peer: Option<ZakuraConnId>,
         /// Bytes returned.
         bytes: u64,
@@ -904,6 +916,7 @@ pub enum PoolEvent {
         /// Consumer that waits.
         consumer: Consumer,
         /// Peer connection associated with the attempt, if any.
+        #[serde(skip_serializing_if = "Option::is_none")]
         peer: Option<ZakuraConnId>,
         /// Bytes requested.
         requested_bytes: u64,

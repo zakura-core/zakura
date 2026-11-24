@@ -61,8 +61,15 @@ pub enum Priority {
 }
 
 /// One consumer accounted by the node-wide memory pool (`02 §4`).
+///
+/// Test and simulator builds serialize it as its [`Self::label`].
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[cfg_attr(
+    any(test, zakura_sim),
+    derive(serde::Serialize),
+    serde(rename_all = "snake_case")
+)]
 pub enum Consumer {
     /// Control shares and discovery serving base.
     Control = 0,

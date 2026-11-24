@@ -3,9 +3,10 @@
 //!
 //! - `mem-5` (`memory/tip-never-waits`): with bulk consumers saturated by
 //!   stalled readers and withheld responses, consensus and control reach
-//!   their bounds without waiting on the pool. Nothing on main takes a
-//!   `Propagation` lease, so only the direct pool run reaches it; its sim
-//!   witness arrives with BPv1.
+//!   their bounds without waiting on the pool. No simulated run takes a
+//!   `Propagation` lease, so only the direct pool run reaches it here.
+//!   BPv1's `zakura-network` integration test witnesses `Propagation` with
+//!   real BPv1 leases.
 //! - `mem-9` (`pressure-never-faults`): at the smallest accepted budget `B`,
 //!   no local memory limit causes a fault close or a penalty
 //!   (`session/honest-never-punished`).
@@ -17,91 +18,43 @@
 mod support;
 
 use std::{
-    collections::BTreeMap,
     rc::Rc,
     sync::{Arc, Mutex},
 };
 
-use support::memory::{held, outcome, smallest_accepted_budget_b};
+use support::memory::{
+    assert_held, assert_witness_holds, mirror, run, smallest_accepted_budget_b, wire_scenario,
+};
 use zakura_chain::parameters::Network;
 use zakura_network::{
-    zakura::memory::{Consumer, LeaseDenied, MemoryPlan, PoolEvent, PoolObserver},
+    zakura::memory::{Consumer, LeaseDenied, MemoryPlan, PoolEvent, PoolObserver, Priority},
     Config,
 };
 use zakura_scheduler::{SimInstant, Status as SchedulerStatus};
 use zakura_sim::{
-    check::{Checker, Phase, StepCtx, Violation},
+    check::{Checker, Phase, StepCtx},
     domain::{
         block_sync::{BUDGET_LEDGERS_AGREE, RETAINED_BYTE_BOUND},
-        memory_pool::{
-            fact_from_event, is_reserved_consumer, pool_bounded, tip_never_waits, PoolGaugeModel,
-            PoolView, POOL_BOUNDED, SESSIONS_WITHIN_SHARE, TIP_NEVER_WAITS,
-        },
+        memory_pool::{PoolGaugeModel, POOL_BOUNDED, SESSIONS_WITHIN_SHARE, TIP_NEVER_WAITS},
         session::{honest_never_punished, HonestPeers, HONEST_NEVER_PUNISHED},
     },
     harness::{
         block_node::policy::{BlockAllow, BlockKind, Hold, Select, Trigger},
         block_sync::{BlockScenario, Storage},
         header_sync::Dialer,
-        run_prepared,
-        sync::{MirrorServices, SyncMirror, SyncScenario},
-        sync_wire::{SyncWire, SyncWireScenario},
-        HarnessError, NetScenario, Subsystem,
+        sync::MirrorServices,
+        sync_wire::SyncWire,
+        Subsystem,
     },
     observe::{PoolFact, TransportFact},
     property::{
-        Assume, AssumeRecord, Assumptions, HasView, Property, Registry, RegistryChecker, Source,
-        Sources,
+        Assume, AssumeRecord, Assumptions, HasView, Registry, RegistryChecker, Source, Sources,
     },
-    witness::{check_witness, Expect, WitnessScenario},
-    Identity, MemorySink, Observation, ObservationLog, Outcome, Plan, PropertyOutcome, RunEnd,
+    Identity, Observation, ObservationLog, Outcome, PropertyOutcome, RunEnd,
 };
 
 const GIB: u64 = 1024 * 1024 * 1024;
 const MIB: u64 = 1024 * 1024;
-
-#[derive(Clone)]
-struct PoolOnlyView(Rc<PoolGaugeModel>);
-
-struct PoolOnlyHarness(PoolOnlyView);
-
-impl HasView for PoolOnlyHarness {
-    type View = PoolOnlyView;
-
-    fn view(&self) -> Self::View {
-        self.0.clone()
-    }
-}
-
-impl PoolView for PoolOnlyView {
-    fn read_pool<T>(&self, read: impl FnOnce(&PoolGaugeModel) -> T) -> T {
-        read(&self.0)
-    }
-}
-
-fn eval_pool_property(
-    pool: PoolGaugeModel,
-    property: Property<PoolOnlyHarness>,
-) -> Option<Violation> {
-    let harness = Rc::new(PoolOnlyHarness(PoolOnlyView(Rc::new(pool))));
-    let registry = Registry::new(vec![property]).expect("single scripted property registers");
-    let sources = Sources::observed(&[Source::View]);
-    let mut checker = RegistryChecker::new(registry, harness, Assumptions::none(), &sources);
-    let log = ObservationLog::default();
-    let pick = Identity::advance_time(SimInstant::ZERO);
-    let step = StepCtx {
-        step: 1,
-        pick: &pick,
-        enabled: &[],
-        phase: Phase::Live,
-        budget: u64::MAX,
-        now: SimInstant::ZERO,
-        status: SchedulerStatus::Quiescent,
-        quiescent: true,
-        log: &log,
-    };
-    checker.after_step(&step)
-}
 
 #[derive(Debug, Default)]
 struct RecordingPoolObserver {
@@ -144,25 +97,8 @@ fn tip_never_waits_under_full_bulk_saturation() {
         deadline_ms: None,
     });
     let ports = Storage::prepare(&scenario);
-    let report = run_prepared::<Storage>(
-        &scenario,
-        ports.clone(),
-        Plan::from_fuzz(&[]),
-        &mut MemorySink::default(),
-        None,
-    )
-    .unwrap_or_else(|error| panic!("{error}"));
-    assert_eq!(report.end.violation, None, "{:?}", report.end);
-    assert!(
-        held(&report, TIP_NEVER_WAITS),
-        "{:?}",
-        outcome(&report, TIP_NEVER_WAITS)
-    );
-    assert!(
-        held(&report, POOL_BOUNDED),
-        "{:?}",
-        outcome(&report, POOL_BOUNDED)
-    );
+    let report = run::<Storage>(&scenario, ports.clone());
+    assert_held(&report, &[TIP_NEVER_WAITS, POOL_BOUNDED]);
     assert!(
         ports
             .view
@@ -173,15 +109,15 @@ fn tip_never_waits_under_full_bulk_saturation() {
             .is_empty(),
         "no reserved consumer may wait during stalled serving + withheld block sync"
     );
-    let bulk_waits: Vec<&str> = report
+    let bulk_waits: Vec<Consumer> = report
         .log
         .entries()
         .iter()
-        .filter_map(|entry| match &entry.obs {
+        .filter_map(|entry| match entry.obs {
             Observation::Pool {
                 event: PoolFact::Waited { consumer, .. },
                 ..
-            } if !is_reserved_consumer(consumer) => Some(consumer.as_str()),
+            } if consumer.priority() == Priority::Bulk => Some(consumer),
             _ => None,
         })
         .collect();
@@ -190,14 +126,7 @@ fn tip_never_waits_under_full_bulk_saturation() {
         "two 1.5 MB responses overrun serving's floor with S at zero, so serving waits on \
          contention"
     );
-    check_witness(
-        WitnessScenario::<Storage> {
-            scenario,
-            input: Plan::from_fuzz(&[]),
-        },
-        TIP_NEVER_WAITS,
-        Expect::Holds,
-    );
+    assert_witness_holds::<Storage>(&report, TIP_NEVER_WAITS);
 
     // Part 2: Full saturation of EVERY bulk consumer (`Serving`, `BlockSync`,
     // `Tx`, `Sessions`) to 100% of `S + floors` while proving `Propagation`,
@@ -293,7 +222,7 @@ fn tip_never_waits_under_full_bulk_saturation() {
         true,
     );
     for event in events.iter() {
-        gauge.observe(&fact_from_event(event));
+        gauge.observe(event);
     }
     assert_eq!(gauge.total_leased(), 0);
     assert_eq!(gauge.live_lease_count(), 0);
@@ -306,8 +235,11 @@ fn tip_never_waits_under_full_bulk_saturation() {
         gauge.reserved_grants_observed() >= 3,
         "expected Control, Propagation, and Consensus grants"
     );
-    assert_eq!(eval_pool_property(gauge.clone(), tip_never_waits()), None);
-    assert_eq!(eval_pool_property(gauge, pool_bounded()), None);
+    assert!(
+        gauge.bound_violations().is_empty(),
+        "{POOL_BOUNDED}: {:?}",
+        gauge.bound_violations()
+    );
 }
 
 /// View marking every mirror peer in `SyncWire` as `HonestPeer` for evaluating
@@ -406,50 +338,15 @@ fn smallest_accepted_budget_never_faults_honest_peers() {
     // budgeted connection floor so local `session_memory` limits actively fire
     // neutral refusals while admitted honest peers sync cleanly).
     let mirrors = vec![
-        SyncMirror {
-            dialer: Dialer::Mirror,
-            services: Some(MirrorServices::All),
-        },
-        SyncMirror {
-            dialer: Dialer::Node,
-            services: Some(MirrorServices::All),
-        },
-        SyncMirror {
-            dialer: Dialer::Mirror,
-            services: Some(MirrorServices::All),
-        },
-        SyncMirror {
-            dialer: Dialer::Node,
-            services: Some(MirrorServices::All),
-        },
+        mirror(Dialer::Mirror, MirrorServices::All),
+        mirror(Dialer::Node, MirrorServices::All),
+        mirror(Dialer::Mirror, MirrorServices::All),
+        mirror(Dialer::Node, MirrorServices::All),
     ];
     let mirror_count = mirrors.len();
-    let scenario = SyncWireScenario {
-        net: NetScenario::default(),
-        sync: SyncScenario {
-            blocks: 6,
-            body_bytes: 2_000,
-            mirrors,
-            steps: Some(45_000),
-            ..SyncScenario::default()
-        },
-        windows: None,
-        superseded_hold: None,
-        memory_budget_bytes: Some(min_b),
-    };
+    let scenario = wire_scenario(6, 2_000, mirrors, 45_000, min_b);
     let ports = SyncWire::prepare(&scenario);
-    let report = match run_prepared::<SyncWire>(
-        &scenario,
-        ports.clone(),
-        Plan::from_fuzz(&[]),
-        &mut MemorySink::default(),
-        None,
-    ) {
-        Ok(report) => report,
-        Err(HarnessError::Run { failure, report }) => panic!("{failure}: {:?}", report.end),
-        Err(error) => panic!("{error}"),
-    };
-    assert_eq!(report.end.violation, None, "{:?}", report.end);
+    let report = run::<SyncWire>(&scenario, ports.clone());
 
     // Verify `session/honest-never-punished` applies and holds across the run.
     let honest_outcome = check_honest_never_punished_on_log(&report.log, mirror_count);
@@ -483,15 +380,16 @@ fn smallest_accepted_budget_never_faults_honest_peers() {
         }
     }
 
-    for id in [
-        POOL_BOUNDED,
-        SESSIONS_WITHIN_SHARE,
-        TIP_NEVER_WAITS,
-        RETAINED_BYTE_BOUND,
-        BUDGET_LEDGERS_AGREE,
-    ] {
-        assert!(held(&report, id), "{id}: {:?}", outcome(&report, id));
-    }
+    assert_held(
+        &report,
+        &[
+            POOL_BOUNDED,
+            SESSIONS_WITHIN_SHARE,
+            TIP_NEVER_WAITS,
+            RETAINED_BYTE_BOUND,
+            BUDGET_LEDGERS_AGREE,
+        ],
+    );
 
     // Confirm the node still synced to the mirrors' tip at `min_b`.
     let tip = ports.mirror_tip();
@@ -503,16 +401,12 @@ fn smallest_accepted_budget_never_faults_honest_peers() {
 }
 
 /// Each consumer's peak leased bytes and the cap the pool reported at that
-/// peak, and the peak retained wire bytes.
-type Demand = (BTreeMap<String, u64>, BTreeMap<String, u64>, u64);
+/// peak, by [`Consumer::index`], and the peak retained wire bytes.
+type Demand = ([u64; Consumer::COUNT], [Option<u64>; Consumer::COUNT], u64);
 
 /// Read a run's [`Demand`] from its pool gauge and owner model.
 fn demand(pool: &PoolGaugeModel, retained_peak: u64) -> Demand {
-    (
-        pool.peaks_by_consumer().clone(),
-        pool.caps_at_peak().clone(),
-        retained_peak,
-    )
+    (pool.peaks_by_consumer(), pool.caps_at_peak(), retained_peak)
 }
 
 /// Each consumer's peak stays within the cap the pool reported at that peak,
@@ -520,14 +414,21 @@ fn demand(pool: &PoolGaugeModel, retained_peak: u64) -> Demand {
 /// byte count.
 fn assert_use_tracks_demand(workload: &str, at_64: &Demand, at_256: &Demand) {
     let (peaks, caps, _) = at_64;
-    assert!(!peaks.is_empty(), "{workload}: the pool granted leases");
-    for (consumer, peak) in peaks {
-        let cap = caps
-            .get(consumer)
-            .unwrap_or_else(|| panic!("{workload}: `{consumer}` peaked without a reported cap"));
+    assert!(
+        peaks.iter().any(|peak| *peak > 0),
+        "{workload}: the pool granted leases"
+    );
+    for consumer in Consumer::ALL {
+        let peak = &peaks[consumer.index()];
+        if *peak == 0 {
+            continue;
+        }
+        let cap = caps[consumer.index()]
+            .as_ref()
+            .unwrap_or_else(|| panic!("{workload}: `{consumer:?}` peaked without a reported cap"));
         assert!(
             peak <= cap,
-            "{workload}: `{consumer}` peaked at {peak} B above its cap {cap} B at B = 64 GiB"
+            "{workload}: `{consumer:?}` peaked at {peak} B above its cap {cap} B at B = 64 GiB"
         );
     }
     assert_eq!(
@@ -545,41 +446,13 @@ fn assert_use_tracks_demand(workload: &str, at_64: &Demand, at_256: &Demand) {
 fn use_tracks_demand_between_64_and_256_gib() {
     // A `sync/wire` workload: header sync, block sync and discovery.
     let run_wire = |budget_b: u64| {
-        let scenario = SyncWireScenario {
-            net: NetScenario::default(),
-            sync: SyncScenario {
-                blocks: 8,
-                body_bytes: 8_000,
-                mirrors: vec![
-                    SyncMirror {
-                        dialer: Dialer::Mirror,
-                        services: Some(MirrorServices::All),
-                    },
-                    SyncMirror {
-                        dialer: Dialer::Node,
-                        services: Some(MirrorServices::All),
-                    },
-                ],
-                steps: Some(60_000),
-                ..SyncScenario::default()
-            },
-            windows: None,
-            superseded_hold: None,
-            memory_budget_bytes: Some(budget_b),
-        };
+        let mirrors = vec![
+            mirror(Dialer::Mirror, MirrorServices::All),
+            mirror(Dialer::Node, MirrorServices::All),
+        ];
+        let scenario = wire_scenario(8, 8_000, mirrors, 60_000, budget_b);
         let ports = SyncWire::prepare(&scenario);
-        let report = match run_prepared::<SyncWire>(
-            &scenario,
-            ports.clone(),
-            Plan::from_fuzz(&[]),
-            &mut MemorySink::default(),
-            None,
-        ) {
-            Ok(report) => report,
-            Err(HarnessError::Run { failure, report }) => panic!("{failure}: {:?}", report.end),
-            Err(error) => panic!("{error}"),
-        };
-        assert_eq!(report.end.violation, None, "{:?}", report.end);
+        run::<SyncWire>(&scenario, ports.clone());
         let tip = ports.mirror_tip();
         assert_eq!(ports.tips(), (tip, tip), "wire sync reached tip");
         let view = ports.view.borrow();
@@ -594,15 +467,7 @@ fn use_tracks_demand_between_64_and_256_gib() {
         let mut scenario = BlockScenario::peers_leave_served();
         scenario.memory_budget_bytes = Some(budget_b);
         let ports = Storage::prepare(&scenario);
-        let report = run_prepared::<Storage>(
-            &scenario,
-            ports.clone(),
-            Plan::from_fuzz(&[]),
-            &mut MemorySink::default(),
-            None,
-        )
-        .unwrap_or_else(|error| panic!("{error}"));
-        assert_eq!(report.end.violation, None, "{:?}", report.end);
+        run::<Storage>(&scenario, ports.clone());
         let view = ports.view.borrow();
         let pool = view.pool.borrow();
         demand(&pool, view.owners.peaks().retained)

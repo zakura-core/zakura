@@ -1864,6 +1864,8 @@ mod tests {
     /// Pins the memory-pool observation encoding added in format version 47.
     #[test]
     fn pool_observation_encoding_is_pinned() {
+        use zakura_network::zakura::memory::Consumer;
+
         use crate::observe::PoolFact;
 
         let obs = [
@@ -1873,7 +1875,7 @@ mod tests {
                 node: "node".into(),
                 event: PoolFact::Granted {
                     lease_id: 1,
-                    consumer: "block_sync".into(),
+                    consumer: Consumer::BlockSync,
                     peer: Some(4),
                     bytes: 2_000,
                     consumer_leased: 2_000,
@@ -1889,7 +1891,7 @@ mod tests {
                 node: "node".into(),
                 event: PoolFact::Released {
                     lease_id: 1,
-                    consumer: "block_sync".into(),
+                    consumer: Consumer::BlockSync,
                     peer: Some(4),
                     bytes: 2_000,
                     consumer_leased: 0,

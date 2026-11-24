@@ -23,6 +23,39 @@ use crate::zakura::ZakuraPeerId;
 const KIB: u64 = 1024;
 const MIB: u64 = 1024 * 1024;
 
+/// A 10 MiB pool of `BlockSync` (capped at `block_sync_cap`) and `Serving`,
+/// each with a 1 MiB floor and equal weight. `S` is 8 MiB, so each protected
+/// share is 5 MiB.
+fn two_bulk_config(block_sync_cap: u64) -> PoolConfig {
+    PoolConfig::new(10 * MIB, 0)
+        .with_consumer(
+            Consumer::BlockSync,
+            ConsumerSpec::bulk(MIB, block_sync_cap, 1),
+        )
+        .with_consumer(Consumer::Serving, ConsumerSpec::bulk(MIB, 10 * MIB, 1))
+}
+
+/// Yield until `pool` reports a waiter of `consumer`. Panics if no waiter
+/// registers within 100 yields.
+async fn wait_until_waiting(pool: &MemoryPool, consumer: Consumer) {
+    for _ in 0..100 {
+        if pool.snapshot().consumers[consumer.index()].waiting {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("no {consumer:?} waiter registered");
+}
+
+/// What `task` returns within 5 seconds. Panics with `why`, the event that
+/// should have ended it, if it is still running then.
+async fn joined<T>(task: tokio::task::JoinHandle<T>, why: &str) -> T {
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap_or_else(|_| panic!("{why}"))
+        .expect("the task doesn't panic")
+}
+
 #[derive(Clone, Debug)]
 enum Op {
     Lease {
@@ -901,11 +934,7 @@ fn pool_lease_raii_shrink_grow_split_merge_and_observer_replay() {
 
 #[tokio::test]
 async fn async_acquire_wakes_below_share_first_and_unblocks_borrowers_on_cancel() {
-    let config = PoolConfig::new(10 * MIB, 0)
-        .with_consumer(Consumer::BlockSync, ConsumerSpec::bulk(MIB, 10 * MIB, 1))
-        .with_consumer(Consumer::Serving, ConsumerSpec::bulk(MIB, 10 * MIB, 1));
-    // S = 8 MiB -> share = 4 MiB each -> protected = 5 MiB each.
-    let pool = MemoryPool::new(config);
+    let pool = MemoryPool::new(two_bulk_config(10 * MIB));
 
     // BlockSync borrows the full 9 MiB (1 floor + 8 shared).
     let mut holder = pool
@@ -931,33 +960,22 @@ async fn async_acquire_wakes_below_share_first_and_unblocks_borrowers_on_cancel(
     });
 
     // Give both spawned tasks a chance to register their WaitGuards.
-    for _ in 0..20 {
-        let snap = pool.snapshot();
-        if snap.consumers[Consumer::Serving.index()].waiting
-            && snap.consumers[Consumer::BlockSync.index()].waiting
-        {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
-    assert!(pool.snapshot().consumers[Consumer::Serving.index()].waiting);
-    assert!(pool.snapshot().consumers[Consumer::BlockSync.index()].waiting);
+    wait_until_waiting(&pool, Consumer::Serving).await;
+    wait_until_waiting(&pool, Consumer::BlockSync).await;
 
     // Release 2 MiB from BlockSync -> Serving (below share) wakes and takes it;
     // BlockSync waiter (above share) must remain pending until more frees up.
     holder.shrink_by(2 * MIB);
-    let serving_lease = tokio::time::timeout(Duration::from_secs(2), serving_waiter)
-        .await
-        .expect("serving woke promptly")
-        .expect("serving task succeeded");
+    let serving_lease = joined(serving_waiter, "serving woke promptly").await;
     assert_eq!(serving_lease.bytes(), 2 * MIB);
 
     // Now Serving is no longer waiting, so releasing 1 more MiB unblocks BlockSync!
     holder.shrink_by(MIB);
-    let blocksync_lease = tokio::time::timeout(Duration::from_secs(2), blocksync_waiter)
-        .await
-        .expect("blocksync woke once below-share waiter finished")
-        .expect("blocksync task succeeded");
+    let blocksync_lease = joined(
+        blocksync_waiter,
+        "blocksync woke once below-share waiter finished",
+    )
+    .await;
     assert_eq!(blocksync_lease.bytes(), MIB);
 
     drop(serving_lease);
@@ -973,12 +991,7 @@ async fn async_acquire_wakes_below_share_first_and_unblocks_borrowers_on_cancel(
     let cancelled_serving = tokio::spawn(async move {
         let _ = pool_s2.acquire(Consumer::Serving, None, 4 * MIB).await;
     });
-    for _ in 0..20 {
-        if pool.snapshot().consumers[Consumer::Serving.index()].waiting {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
+    wait_until_waiting(&pool, Consumer::Serving).await;
     let pool_b2 = pool.clone();
     let borrower = tokio::spawn(async move {
         pool_b2
@@ -986,20 +999,16 @@ async fn async_acquire_wakes_below_share_first_and_unblocks_borrowers_on_cancel(
             .await
             .expect("borrower wakes after cancellation")
     });
-    for _ in 0..20 {
-        if pool.snapshot().consumers[Consumer::BlockSync.index()].waiting {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
+    wait_until_waiting(&pool, Consumer::BlockSync).await;
 
     // Cancel the below-share waiter -> WaitGuard drop wakes the borrower!
     cancelled_serving.abort();
     let _ = cancelled_serving.await;
-    let borrowed = tokio::time::timeout(Duration::from_secs(2), borrower)
-        .await
-        .expect("borrower unblocked when below-share waiter dropped")
-        .expect("borrower task succeeded");
+    let borrowed = joined(
+        borrower,
+        "borrower unblocked when below-share waiter dropped",
+    )
+    .await;
     assert_eq!(borrowed.bytes(), MIB);
     holder2.shrink_to(0);
     drop(holder2);
@@ -1098,23 +1107,13 @@ async fn session_admission_reclaims_borrowed_shared_memory_and_cleans_up_on_time
             .await
     });
 
-    for _ in 0..20 {
-        if pool.snapshot().consumers[Consumer::Sessions.index()].waiting {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
-    assert!(
-        pool.snapshot().consumers[Consumer::Sessions.index()].waiting,
-        "Sessions registers a below-share waiter while bulk holds borrowed S"
-    );
+    // Sessions registers a below-share waiter while bulk holds borrowed S.
+    wait_until_waiting(&pool, Consumer::Sessions).await;
 
     // BlockSync shrinks by 1 MiB -> Sessions wakes and takes the grant.
     bulk.shrink_by(MIB);
-    let lease = tokio::time::timeout(Duration::from_secs(2), admit)
+    let lease = joined(admit, "Sessions woke promptly")
         .await
-        .expect("Sessions woke promptly")
-        .expect("task succeeded")
         .expect("Sessions reclaimed its share from bulk");
     assert_eq!(lease.bytes(), total);
     assert_eq!(
@@ -1149,11 +1148,7 @@ async fn session_admission_reclaims_borrowed_shared_memory_and_cleans_up_on_time
 /// broadcast for pollers; a wait token marks waiting until it drops.
 #[tokio::test]
 async fn plain_try_marks_nothing_and_wait_token_marks_waiting_until_dropped() {
-    let config = PoolConfig::new(10 * MIB, 0)
-        .with_consumer(Consumer::BlockSync, ConsumerSpec::bulk(MIB, 10 * MIB, 1))
-        .with_consumer(Consumer::Serving, ConsumerSpec::bulk(MIB, 10 * MIB, 1));
-    // S = 8 MiB -> share = 4 MiB each -> protected = 5 MiB each.
-    let pool = MemoryPool::new(config);
+    let pool = MemoryPool::new(two_bulk_config(10 * MIB));
     let waiting = |consumer: Consumer| pool.snapshot().consumers[consumer.index()].waiting;
     let mut holder = pool
         .try_acquire(Consumer::Serving, None, 9 * MIB)
@@ -1201,11 +1196,8 @@ async fn plain_try_marks_nothing_and_wait_token_marks_waiting_until_dropped() {
 /// consumer waiting or reporting a wait, and its own release wakes it.
 #[tokio::test]
 async fn own_cap_wait_marks_nothing_and_wakes_on_own_release() {
-    let config = PoolConfig::new(10 * MIB, 0)
-        .with_consumer(Consumer::BlockSync, ConsumerSpec::bulk(MIB, 4 * MIB, 1))
-        .with_consumer(Consumer::Serving, ConsumerSpec::bulk(MIB, 10 * MIB, 1));
     let observer = Arc::new(RecordingObserver::default());
-    let pool = MemoryPool::new(config).with_observer(Some(observer.clone()));
+    let pool = MemoryPool::new(two_bulk_config(4 * MIB)).with_observer(Some(observer.clone()));
     let mut holder = pool
         .try_acquire(Consumer::BlockSync, None, 4 * MIB)
         .expect("BlockSync fills its cap");
@@ -1224,10 +1216,8 @@ async fn own_cap_wait_marks_nothing_and_wakes_on_own_release() {
         .expect("Serving borrows");
 
     holder.shrink_by(MIB);
-    let lease = tokio::time::timeout(Duration::from_secs(2), waiter)
+    let lease = joined(waiter, "BlockSync's own release wakes its waiter")
         .await
-        .expect("BlockSync's own release wakes its waiter")
-        .expect("the waiter task doesn't panic")
         .expect("the waiter gets its lease");
     assert_eq!(lease.bytes(), MIB);
     assert!(!observer
@@ -1242,10 +1232,7 @@ async fn own_cap_wait_marks_nothing_and_wakes_on_own_release() {
 /// doesn't fit passes its turn on, so a smaller request behind it gets bytes.
 #[tokio::test]
 async fn woken_waiter_that_does_not_fit_passes_its_turn_on() {
-    let config = PoolConfig::new(10 * MIB, 0)
-        .with_consumer(Consumer::BlockSync, ConsumerSpec::bulk(MIB, 10 * MIB, 1))
-        .with_consumer(Consumer::Serving, ConsumerSpec::bulk(MIB, 10 * MIB, 1));
-    let pool = MemoryPool::new(config);
+    let pool = MemoryPool::new(two_bulk_config(10 * MIB));
     let mut holder = pool
         .try_acquire(Consumer::Serving, None, 9 * MIB)
         .expect("Serving borrows all of S");
@@ -1253,9 +1240,7 @@ async fn woken_waiter_that_does_not_fit_passes_its_turn_on() {
     let pool_big = pool.clone();
     let big =
         tokio::spawn(async move { pool_big.acquire(Consumer::BlockSync, None, 5 * MIB).await });
-    while !pool.snapshot().consumers[Consumer::BlockSync.index()].waiting {
-        tokio::task::yield_now().await;
-    }
+    wait_until_waiting(&pool, Consumer::BlockSync).await;
     let pool_small = pool.clone();
     let small =
         tokio::spawn(async move { pool_small.acquire(Consumer::BlockSync, None, 2 * MIB).await });
@@ -1265,10 +1250,8 @@ async fn woken_waiter_that_does_not_fit_passes_its_turn_on() {
 
     // One shared byte block frees: only the 2 MiB request fits.
     holder.shrink_by(MIB);
-    let lease = tokio::time::timeout(Duration::from_secs(2), small)
+    let lease = joined(small, "the turn reaches the smaller waiter")
         .await
-        .expect("the turn reaches the smaller waiter")
-        .expect("the waiter task doesn't panic")
         .expect("the smaller waiter gets its lease");
     assert_eq!(lease.bytes(), 2 * MIB);
     assert!(!big.is_finished());
@@ -1341,25 +1324,6 @@ fn serving_waiting(pool: &MemoryPool) -> bool {
     pool.snapshot().consumers[Consumer::Serving.index()].waiting
 }
 
-/// Yield until `pool` reports a waiter of `consumer`.
-async fn wait_until_waiting(pool: &MemoryPool, consumer: Consumer) {
-    while !pool.snapshot().consumers[consumer.index()].waiting {
-        tokio::task::yield_now().await;
-    }
-}
-
-/// The lease `waiter` returns within 5 seconds.
-async fn await_lease(
-    waiter: tokio::task::JoinHandle<Result<super::PoolLease, LeaseDenied>>,
-    why: &str,
-) -> super::PoolLease {
-    tokio::time::timeout(Duration::from_secs(5), waiter)
-        .await
-        .unwrap_or_else(|_| panic!("{why}"))
-        .expect("the waiter task doesn't panic")
-        .expect("the waiter gets its lease")
-}
-
 #[test]
 fn serving_pool_caps_stalled_reader_and_shrinks_cleanly() {
     // Serving floor = 2 MiB, S = 18 MiB -> Serving ceiling = 20 MiB.
@@ -1427,7 +1391,9 @@ async fn waiting_peer_below_its_part_holds_back_a_peer_above_its_part() {
     );
 
     stalled.shrink_to(2 * MIB);
-    let lease = await_lease(waiter, "the shrink wakes peer 2").await;
+    let lease = joined(waiter, "the shrink wakes peer 2")
+        .await
+        .expect("peer 2 gets its lease");
     assert_eq!(lease.bytes(), 8 * MIB);
     assert!(!serving_waiting(&pool));
 }
@@ -1468,7 +1434,9 @@ async fn serving_below_share_waiter_holds_back_block_sync_above_its_share() {
     );
 
     drop(bs);
-    let s2 = await_lease(waiter, "BlockSync's release wakes serving").await;
+    let s2 = joined(waiter, "BlockSync's release wakes serving")
+        .await
+        .expect("serving peer 2 gets its lease");
     drop(s1);
     drop(s2);
     assert_eq!(pool.consumer_leased(Consumer::Serving), 0);

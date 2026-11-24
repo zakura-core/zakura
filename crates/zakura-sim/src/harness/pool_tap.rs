@@ -18,10 +18,7 @@ use zakura_scheduler::SimInstant;
 
 use super::block_node::view::BlockSyncView;
 use crate::{
-    domain::{
-        block_sync::OwnerInput,
-        memory_pool::{fact_from_event, PoolGaugeModel},
-    },
+    domain::{block_sync::OwnerInput, memory_pool::PoolGaugeModel},
     evidence::{Checkpoint, EvidenceId, EvidenceKind, LiveEvidence},
     ActionSource, Boundary, Identity, Observation, ObservationLog, Sim,
 };
@@ -171,16 +168,13 @@ impl ActionSource for PoolTap {
         let events = mem::take(&mut self.state.buffer().events);
         let last = events.last().map_or(self.delivered, |(seq, _)| *seq);
         let mut sent = Vec::with_capacity(events.len());
-        let mut facts = Vec::with_capacity(events.len());
         for (seq, event) in &events {
-            let fact = fact_from_event(event);
             sent.push(Observation::Pool {
                 instance: self.id.index,
                 seq: *seq,
                 node: self.node.clone(),
-                event: fact.clone(),
+                event: *event,
             });
-            facts.push(fact);
         }
         for obs in &sent {
             log.push(obs.clone());
@@ -190,8 +184,8 @@ impl ActionSource for PoolTap {
 
         let block_leased = {
             let mut gauge = self.pool.borrow_mut();
-            for fact in &facts {
-                gauge.observe(fact);
+            for (_, event) in &events {
+                gauge.observe(event);
             }
             let entries = log.entries();
             for entry in &entries[self.scanned_sessions..] {

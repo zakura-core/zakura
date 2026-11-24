@@ -1409,7 +1409,7 @@ mod tests {
         let mut pool = PoolGaugeModel::default();
         pool.observe(&PoolFact::Granted {
             lease_id: 1,
-            consumer: "block_sync".into(),
+            consumer: zakura_network::zakura::memory::Consumer::BlockSync,
             peer: Some(1),
             bytes: 2_000,
             consumer_leased: 2_000,

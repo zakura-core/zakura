@@ -14,7 +14,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use zakura_network::zakura::memory::{Consumer, LeaseDenied, PoolEvent, Priority};
+use zakura_network::zakura::memory::{Consumer, LeaseDenied, Priority};
 
 use crate::{
     domain::block_sync::OwnerView,
@@ -51,187 +51,26 @@ pub const TIP_NEVER_WAITS: &str = "memory/tip-never-waits";
 /// (`mem-15`).
 pub const CONSENSUS_ONCE_PER_HEIGHT: &str = "memory/consensus-once-per-height";
 
-/// Fixed label for `Consumer::Sessions`.
-const SESSIONS_LABEL: &str = Consumer::Sessions.label();
-/// Fixed label for `Consumer::BlockSync`.
-const BLOCK_SYNC_LABEL: &str = Consumer::BlockSync.label();
-/// Fixed label for `Consumer::Consensus`.
-const CONSENSUS_LABEL: &str = Consumer::Consensus.label();
-
-/// Whether the consumer labelled `consumer` has [`Priority::Reserved`].
-pub fn is_reserved_consumer(consumer: &str) -> bool {
-    Consumer::ALL
-        .iter()
-        .any(|spec| spec.label() == consumer && spec.priority() == Priority::Reserved)
-}
-
-/// Convert a production [`PoolEvent`] into a serializable [`PoolFact`].
-pub fn fact_from_event(event: &PoolEvent) -> PoolFact {
-    match event {
-        PoolEvent::Granted {
-            lease_id,
-            consumer,
-            peer,
-            bytes,
-            consumer_leased,
-            consumer_cap,
-            consumer_share,
-            total_leased,
-            pool_limit,
-        } => PoolFact::Granted {
-            lease_id: *lease_id,
-            consumer: consumer.label().to_owned(),
-            peer: *peer,
-            bytes: *bytes,
-            consumer_leased: *consumer_leased,
-            consumer_cap: *consumer_cap,
-            consumer_share: *consumer_share,
-            total_leased: *total_leased,
-            pool_limit: *pool_limit,
-        },
-        PoolEvent::Resized {
-            lease_id,
-            consumer,
-            peer,
-            old_bytes,
-            new_bytes,
-            consumer_leased,
-            consumer_cap,
-            consumer_share,
-            total_leased,
-            pool_limit,
-        } => PoolFact::Resized {
-            lease_id: *lease_id,
-            consumer: consumer.label().to_owned(),
-            peer: *peer,
-            old_bytes: *old_bytes,
-            new_bytes: *new_bytes,
-            consumer_leased: *consumer_leased,
-            consumer_cap: *consumer_cap,
-            consumer_share: *consumer_share,
-            total_leased: *total_leased,
-            pool_limit: *pool_limit,
-        },
-        PoolEvent::Split {
-            from_lease_id,
-            to_lease_id,
-            consumer,
-            peer,
-            bytes,
-        } => PoolFact::Split {
-            from_lease_id: *from_lease_id,
-            to_lease_id: *to_lease_id,
-            consumer: consumer.label().to_owned(),
-            peer: *peer,
-            bytes: *bytes,
-        },
-        PoolEvent::Merged {
-            into_lease_id,
-            from_lease_id,
-            consumer,
-            peer,
-            bytes,
-        } => PoolFact::Merged {
-            into_lease_id: *into_lease_id,
-            from_lease_id: *from_lease_id,
-            consumer: consumer.label().to_owned(),
-            peer: *peer,
-            bytes: *bytes,
-        },
-        PoolEvent::Moved {
-            from_lease_id,
-            to_lease_id,
-            from,
-            to,
-            peer,
-            bytes,
-            from_leased,
-            to_leased,
-            total_leased,
-            pool_limit,
-        } => PoolFact::Moved {
-            from_lease_id: *from_lease_id,
-            to_lease_id: *to_lease_id,
-            from: from.label().to_owned(),
-            to: to.label().to_owned(),
-            peer: *peer,
-            bytes: *bytes,
-            from_leased: *from_leased,
-            to_leased: *to_leased,
-            total_leased: *total_leased,
-            pool_limit: *pool_limit,
-        },
-        PoolEvent::Released {
-            lease_id,
-            consumer,
-            peer,
-            bytes,
-            consumer_leased,
-            total_leased,
-            pool_limit,
-        } => PoolFact::Released {
-            lease_id: *lease_id,
-            consumer: consumer.label().to_owned(),
-            peer: *peer,
-            bytes: *bytes,
-            consumer_leased: *consumer_leased,
-            total_leased: *total_leased,
-            pool_limit: *pool_limit,
-        },
-        PoolEvent::Labeled { lease_id, height } => PoolFact::Labeled {
-            lease_id: *lease_id,
-            height: *height,
-        },
-        PoolEvent::Waited {
-            consumer,
-            peer,
-            requested_bytes,
-            reason,
-        } => PoolFact::Waited {
-            consumer: consumer.label().to_owned(),
-            peer: *peer,
-            requested_bytes: *requested_bytes,
-            reason: denial_label(*reason).to_owned(),
-        },
-    }
-}
-
-/// Stable kebab-case label for [`LeaseDenied`].
-pub const fn denial_label(reason: LeaseDenied) -> &'static str {
-    match reason {
-        LeaseDenied::CapExceeded => "cap-exceeded",
-        LeaseDenied::PoolFull => "pool-full",
-        LeaseDenied::BelowShareWaiting => "below-share-waiting",
-        LeaseDenied::ShareExceeded => "share-exceeded",
-    }
-}
-
 /// Live lease gauge folded from [`PoolFact`] observations.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct PoolGaugeModel {
-    /// Every live lease, by `lease_id`: `(consumer_label, bytes)`.
-    leases: BTreeMap<u64, (String, u64)>,
+    /// Every live lease, by `lease_id`: its consumer and bytes.
+    leases: BTreeMap<u64, (Consumer, u64)>,
     /// Live leased bytes per consumer, summed from `leases`.
-    by_consumer: BTreeMap<String, u64>,
+    by_consumer: [u64; Consumer::COUNT],
     /// Live leased bytes across every consumer.
     total_leased: u64,
     /// Peak leased bytes per consumer over the run.
-    peaks_by_consumer: BTreeMap<String, u64>,
+    peaks_by_consumer: [u64; Consumer::COUNT],
     /// Peak total leased bytes over the run.
     peak_total: u64,
-    /// Latest pool limit (`total_floors + S`) reported by the pool.
-    pool_limit: Option<u64>,
-    /// Latest effective cap reported per consumer.
-    last_cap: BTreeMap<String, u64>,
     /// The cap each consumer's latest peak was granted under.
-    caps_at_peak: BTreeMap<String, u64>,
-    /// Latest protected share reported per consumer.
-    last_share: BTreeMap<String, u64>,
+    caps_at_peak: [Option<u64>; Consumer::COUNT],
     /// Configured `Sessions` floor bytes for `mem-13` floor preservation.
     sessions_floor: u64,
-    /// Whether the node runs with default session settings (so `Sessions` must
-    /// never exceed its protected share).
-    default_session_settings: bool,
+    /// Whether the node overrides the default session settings. Only with
+    /// the defaults must `Sessions` stay within its protected share.
+    session_overrides: bool,
     /// Total `PoolFact` events folded.
     events_observed: u64,
     /// Total `Sessions` events folded.
@@ -248,7 +87,7 @@ pub struct PoolGaugeModel {
     /// `mem-13` (`memory/sessions-within-share`) violations found while folding.
     session_violations: Vec<(String, String)>,
     /// `PoolFact::Waited` events recorded on reserved consumers (for `mem-5`).
-    waited_reserved: Vec<(String, u64, String)>,
+    waited_reserved: Vec<(Consumer, u64, LeaseDenied)>,
     /// Number of `PoolFact::Granted` events recorded on reserved consumers (`mem-5`).
     reserved_grants_observed: u64,
     /// The height each labeled live lease funds, by `lease_id`. `None` marks
@@ -256,10 +95,10 @@ pub struct PoolGaugeModel {
     heights: BTreeMap<u64, Option<u32>>,
 }
 
-impl Default for PoolGaugeModel {
-    fn default() -> Self {
-        Self::new(0, true)
-    }
+/// Whether `consumer` holds a fixed reserve (`control`, `propagation`,
+/// `consensus`).
+fn is_reserved(consumer: Consumer) -> bool {
+    consumer.priority() == Priority::Reserved
 }
 
 impl PoolGaugeModel {
@@ -267,33 +106,16 @@ impl PoolGaugeModel {
     /// node uses default session settings.
     pub fn new(sessions_floor: u64, default_session_settings: bool) -> Self {
         Self {
-            leases: BTreeMap::new(),
-            by_consumer: BTreeMap::new(),
-            total_leased: 0,
-            peaks_by_consumer: BTreeMap::new(),
-            peak_total: 0,
-            pool_limit: None,
-            last_cap: BTreeMap::new(),
-            caps_at_peak: BTreeMap::new(),
-            last_share: BTreeMap::new(),
             sessions_floor,
-            default_session_settings,
-            events_observed: 0,
-            sessions_events_observed: 0,
-            sessions_waiting_conns: BTreeSet::new(),
-            admitted_session_conns: BTreeSet::new(),
-            bound_violations: Vec::new(),
-            session_violations: Vec::new(),
-            waited_reserved: Vec::new(),
-            reserved_grants_observed: 0,
-            heights: BTreeMap::new(),
+            session_overrides: !default_session_settings,
+            ..Self::default()
         }
     }
 
     /// Fold one [`PoolFact`] into the gauge.
     pub fn observe(&mut self, fact: &PoolFact) {
         self.events_observed = self.events_observed.saturating_add(1);
-        match fact {
+        match *fact {
             PoolFact::Granted {
                 lease_id,
                 consumer,
@@ -304,38 +126,32 @@ impl PoolGaugeModel {
                 consumer_share,
                 total_leased,
                 pool_limit,
-                ..
             } => {
-                if consumer == SESSIONS_LABEL {
-                    self.sessions_events_observed = self.sessions_events_observed.saturating_add(1);
-                }
-                if is_reserved_consumer(consumer) {
+                self.count_sessions_event(consumer);
+                if is_reserved(consumer) {
                     self.reserved_grants_observed = self.reserved_grants_observed.saturating_add(1);
                 }
-                if self
-                    .leases
-                    .insert(*lease_id, (consumer.clone(), *bytes))
-                    .is_some()
-                {
-                    self.bound_violations.push((
-                        "each granted lease carries a fresh lease_id".to_owned(),
+                if self.leases.insert(lease_id, (consumer, bytes)).is_some() {
+                    self.bound_violation(
+                        "each granted lease carries a fresh lease_id",
                         format!(
-                            "lease_id {lease_id} for consumer `{consumer}` ({bytes} B) was already live"
+                            "lease_id {lease_id} for consumer `{}` ({bytes} B) was already live",
+                            consumer.label()
                         ),
-                    ));
+                    );
                 }
-                self.add_bytes(consumer, *bytes);
-                if consumer == SESSIONS_LABEL {
+                self.add_bytes(consumer, bytes);
+                if consumer == Consumer::Sessions {
                     if let Some(conn_id) = peer {
-                        self.sessions_waiting_conns.remove(conn_id);
+                        self.sessions_waiting_conns.remove(&conn_id);
                     }
                 }
                 self.check_reported_bounds(
                     consumer,
-                    *consumer_leased,
-                    Some((*consumer_cap, *consumer_share, true)),
-                    *total_leased,
-                    *pool_limit,
+                    consumer_leased,
+                    Some((consumer_cap, consumer_share, true)),
+                    total_leased,
+                    pool_limit,
                 );
             }
             PoolFact::Resized {
@@ -350,48 +166,46 @@ impl PoolGaugeModel {
                 pool_limit,
                 ..
             } => {
-                if consumer == SESSIONS_LABEL {
-                    self.sessions_events_observed = self.sessions_events_observed.saturating_add(1);
-                }
-                match self.leases.get_mut(lease_id) {
+                self.count_sessions_event(consumer);
+                let label = consumer.label();
+                match self.leases.get_mut(&lease_id) {
                     Some((live_consumer, live_bytes)) => {
-                        if live_consumer != consumer || *live_bytes != *old_bytes {
-                            self.bound_violations.push((
+                        let (live_consumer, held) = (*live_consumer, *live_bytes);
+                        *live_bytes = new_bytes;
+                        if live_consumer != consumer || held != old_bytes {
+                            self.bound_violation(
                                 format!(
-                                    "resize of lease {lease_id} matches live consumer `{live_consumer}` and {live_bytes} B"
+                                    "resize of lease {lease_id} matches live consumer `{}` and {held} B",
+                                    live_consumer.label()
                                 ),
                                 format!(
-                                    "reported `{consumer}` resizing from {old_bytes} B to {new_bytes} B"
+                                    "reported `{label}` resizing from {old_bytes} B to {new_bytes} B"
                                 ),
-                            ));
+                            );
                         }
-                        if *new_bytes >= *old_bytes {
-                            let delta = new_bytes - old_bytes;
-                            *live_bytes = *new_bytes;
-                            self.add_bytes(consumer, delta);
+                        if new_bytes >= old_bytes {
+                            self.add_bytes(consumer, new_bytes - old_bytes);
                         } else {
-                            let delta = old_bytes - new_bytes;
-                            *live_bytes = *new_bytes;
-                            self.sub_bytes(consumer, delta);
+                            self.sub_bytes(consumer, old_bytes - new_bytes);
                         }
                     }
                     None => {
-                        self.bound_violations.push((
-                            "only a live lease is resized".to_owned(),
+                        self.bound_violation(
+                            "only a live lease is resized",
                             format!(
-                                "lease_id {lease_id} for `{consumer}` resized from {old_bytes} to {new_bytes} without being live"
+                                "lease_id {lease_id} for `{label}` resized from {old_bytes} to {new_bytes} without being live"
                             ),
-                        ));
+                        );
                     }
                 }
                 // `set_cap` may lower a cap below what a consumer holds, so
                 // only a resize that grows the lease must fit the cap.
                 self.check_reported_bounds(
                     consumer,
-                    *consumer_leased,
-                    Some((*consumer_cap, *consumer_share, new_bytes > old_bytes)),
-                    *total_leased,
-                    *pool_limit,
+                    consumer_leased,
+                    Some((consumer_cap, consumer_share, new_bytes > old_bytes)),
+                    total_leased,
+                    pool_limit,
                 );
             }
             PoolFact::Split {
@@ -401,39 +215,35 @@ impl PoolGaugeModel {
                 bytes,
                 ..
             } => {
-                if consumer == SESSIONS_LABEL {
-                    self.sessions_events_observed = self.sessions_events_observed.saturating_add(1);
-                }
-                match self.leases.get_mut(from_lease_id) {
+                self.count_sessions_event(consumer);
+                let label = consumer.label();
+                match self.leases.get_mut(&from_lease_id) {
                     Some((live_consumer, live_bytes))
-                        if live_consumer == consumer && *live_bytes >= *bytes =>
+                        if *live_consumer == consumer && *live_bytes >= bytes =>
                     {
-                        *live_bytes -= *bytes;
+                        *live_bytes -= bytes;
                         if *live_bytes == 0 {
-                            self.leases.remove(from_lease_id);
+                            self.leases.remove(&from_lease_id);
                         }
                     }
                     other => {
-                        self.bound_violations.push((
+                        let other = format!("source lease state was {other:?}");
+                        self.bound_violation(
                             format!(
-                                "split of {bytes} B from lease {from_lease_id} (`{consumer}`) takes from a live lease with at least {bytes} B"
+                                "split of {bytes} B from lease {from_lease_id} (`{label}`) takes from a live lease with at least {bytes} B"
                             ),
-                            format!("source lease state was {other:?}"),
-                        ));
+                            other,
+                        );
                     }
                 }
-                if let Some(height) = self.heights.get(from_lease_id).copied() {
-                    self.heights.insert(*to_lease_id, height);
+                if let Some(height) = self.heights.get(&from_lease_id).copied() {
+                    self.heights.insert(to_lease_id, height);
                 }
-                if self
-                    .leases
-                    .insert(*to_lease_id, (consumer.clone(), *bytes))
-                    .is_some()
-                {
-                    self.bound_violations.push((
-                        "split creates a child lease with a fresh lease_id".to_owned(),
-                        format!("child lease_id {to_lease_id} for `{consumer}` was already live"),
-                    ));
+                if self.leases.insert(to_lease_id, (consumer, bytes)).is_some() {
+                    self.bound_violation(
+                        "split creates a child lease with a fresh lease_id",
+                        format!("child lease_id {to_lease_id} for `{label}` was already live"),
+                    );
                 }
             }
             PoolFact::Merged {
@@ -443,33 +253,33 @@ impl PoolGaugeModel {
                 bytes,
                 ..
             } => {
-                if consumer == SESSIONS_LABEL {
-                    self.sessions_events_observed = self.sessions_events_observed.saturating_add(1);
-                }
-                match self.leases.remove(from_lease_id) {
+                self.count_sessions_event(consumer);
+                let label = consumer.label();
+                match self.leases.remove(&from_lease_id) {
                     Some((from_consumer, from_bytes))
-                        if from_consumer == *consumer && from_bytes == *bytes => {}
+                        if from_consumer == consumer && from_bytes == bytes => {}
                     other => {
-                        self.bound_violations.push((
+                        self.bound_violation(
                             format!(
-                                "merge consumes live lease {from_lease_id} (`{consumer}`, {bytes} B)"
+                                "merge consumes live lease {from_lease_id} (`{label}`, {bytes} B)"
                             ),
                             format!("removed source lease was {other:?}"),
-                        ));
+                        );
                     }
                 }
-                if let Some(height) = self.heights.remove(from_lease_id) {
-                    self.heights.entry(*into_lease_id).or_insert(height);
+                if let Some(height) = self.heights.remove(&from_lease_id) {
+                    self.heights.entry(into_lease_id).or_insert(height);
                 }
-                match self.leases.get_mut(into_lease_id) {
-                    Some((into_consumer, into_bytes)) if into_consumer == consumer => {
-                        *into_bytes = into_bytes.saturating_add(*bytes);
+                match self.leases.get_mut(&into_lease_id) {
+                    Some((into_consumer, into_bytes)) if *into_consumer == consumer => {
+                        *into_bytes = into_bytes.saturating_add(bytes);
                     }
                     other => {
-                        self.bound_violations.push((
-                            format!("merge target lease {into_lease_id} (`{consumer}`) is live"),
-                            format!("target lease was {other:?}"),
-                        ));
+                        let other = format!("target lease was {other:?}");
+                        self.bound_violation(
+                            format!("merge target lease {into_lease_id} (`{label}`) is live"),
+                            other,
+                        );
                     }
                 }
             }
@@ -485,43 +295,44 @@ impl PoolGaugeModel {
                 pool_limit,
                 ..
             } => {
-                match self.leases.get_mut(from_lease_id) {
+                match self.leases.get_mut(&from_lease_id) {
                     Some((live_consumer, live_bytes))
-                        if live_consumer == from && *live_bytes >= *bytes =>
+                        if *live_consumer == from && *live_bytes >= bytes =>
                     {
-                        *live_bytes -= *bytes;
+                        *live_bytes -= bytes;
                         if *live_bytes == 0 {
-                            self.leases.remove(from_lease_id);
+                            self.leases.remove(&from_lease_id);
                         }
                     }
                     other => {
-                        self.bound_violations.push((
+                        let other = format!("source lease state was {other:?}");
+                        self.bound_violation(
                             format!(
-                                "move of {bytes} B from lease {from_lease_id} (`{from}`) takes from a live lease with at least {bytes} B"
+                                "move of {bytes} B from lease {from_lease_id} (`{}`) takes from a live lease with at least {bytes} B",
+                                from.label()
                             ),
-                            format!("source lease state was {other:?}"),
-                        ));
+                            other,
+                        );
                     }
                 }
-                if let Some(height) = self.heights.get(from_lease_id).copied() {
-                    self.heights.insert(*to_lease_id, height);
+                if let Some(height) = self.heights.get(&from_lease_id).copied() {
+                    self.heights.insert(to_lease_id, height);
                 }
-                if self
-                    .leases
-                    .insert(*to_lease_id, (to.clone(), *bytes))
-                    .is_some()
-                {
-                    self.bound_violations.push((
-                        "a move creates a lease with a fresh lease_id".to_owned(),
-                        format!("lease_id {to_lease_id} for `{to}` was already live"),
-                    ));
+                if self.leases.insert(to_lease_id, (to, bytes)).is_some() {
+                    self.bound_violation(
+                        "a move creates a lease with a fresh lease_id",
+                        format!(
+                            "lease_id {to_lease_id} for `{}` was already live",
+                            to.label()
+                        ),
+                    );
                 }
-                self.sub_bytes(from, *bytes);
-                self.add_bytes(to, *bytes);
+                self.sub_bytes(from, bytes);
+                self.add_bytes(to, bytes);
                 // A move adds no ledger bytes, so it checks totals but not
                 // the target's cap.
-                self.check_reported_bounds(from, *from_leased, None, *total_leased, *pool_limit);
-                self.check_reported_bounds(to, *to_leased, None, *total_leased, *pool_limit);
+                self.check_reported_bounds(from, from_leased, None, total_leased, pool_limit);
+                self.check_reported_bounds(to, to_leased, None, total_leased, pool_limit);
             }
             PoolFact::Released {
                 lease_id,
@@ -532,41 +343,41 @@ impl PoolGaugeModel {
                 pool_limit,
                 ..
             } => {
-                if consumer == SESSIONS_LABEL {
-                    self.sessions_events_observed = self.sessions_events_observed.saturating_add(1);
-                }
-                self.heights.remove(lease_id);
-                match self.leases.remove(lease_id) {
+                self.count_sessions_event(consumer);
+                self.heights.remove(&lease_id);
+                let label = consumer.label();
+                match self.leases.remove(&lease_id) {
                     Some((live_consumer, live_bytes)) => {
-                        if live_consumer != *consumer || live_bytes != *bytes {
-                            self.bound_violations.push((
+                        if live_consumer != consumer || live_bytes != bytes {
+                            self.bound_violation(
                                 format!(
-                                    "released lease {lease_id} matches live consumer `{live_consumer}` and {live_bytes} B"
+                                    "released lease {lease_id} matches live consumer `{}` and {live_bytes} B",
+                                    live_consumer.label()
                                 ),
-                                format!("released `{consumer}` with {bytes} B"),
-                            ));
+                                format!("released `{label}` with {bytes} B"),
+                            );
                         }
-                        self.sub_bytes(consumer, *bytes);
+                        self.sub_bytes(consumer, bytes);
                     }
                     None => {
-                        self.bound_violations.push((
-                            "only a live lease is released".to_owned(),
+                        self.bound_violation(
+                            "only a live lease is released",
                             format!(
-                                "lease_id {lease_id} for `{consumer}` ({bytes} B) released without being live"
+                                "lease_id {lease_id} for `{label}` ({bytes} B) released without being live"
                             ),
-                        ));
+                        );
                     }
                 }
                 self.check_reported_bounds(
                     consumer,
-                    *consumer_leased,
+                    consumer_leased,
                     None,
-                    *total_leased,
-                    *pool_limit,
+                    total_leased,
+                    pool_limit,
                 );
             }
             PoolFact::Labeled { lease_id, height } => {
-                self.heights.insert(*lease_id, *height);
+                self.heights.insert(lease_id, height);
             }
             PoolFact::Waited {
                 consumer,
@@ -574,29 +385,30 @@ impl PoolGaugeModel {
                 requested_bytes,
                 reason,
             } => {
-                if is_reserved_consumer(consumer) {
+                if is_reserved(consumer) {
                     self.waited_reserved
-                        .push((consumer.clone(), *requested_bytes, reason.clone()));
+                        .push((consumer, requested_bytes, reason));
                 }
-                if consumer == SESSIONS_LABEL {
+                if consumer == Consumer::Sessions {
                     self.sessions_events_observed = self.sessions_events_observed.saturating_add(1);
                     if let Some(conn_id) = peer {
-                        self.sessions_waiting_conns.insert(*conn_id);
-                        if self.admitted_session_conns.contains(conn_id) {
+                        self.sessions_waiting_conns.insert(conn_id);
+                        if self.admitted_session_conns.contains(&conn_id) {
                             self.session_violations.push((
                                 "a connection waits for Sessions memory only before it admits a session".to_owned(),
                                 format!(
-                                    "connection {conn_id} admitted service sessions, then its Sessions admission waited ({reason})"
+                                    "connection {conn_id} admitted service sessions, then its Sessions admission waited ({reason:?})"
                                 ),
                             ));
                         }
                     }
                     // Floor preservation: live sessions must never be blocked
-                    // below floor by pool contention (`pool-full` or
-                    // `below-share-waiting`).
-                    let current = self.leased(SESSIONS_LABEL);
-                    if matches!(reason.as_str(), "pool-full" | "below-share-waiting")
-                        && current.saturating_add(*requested_bytes) <= self.sessions_floor
+                    // below floor by pool contention.
+                    let current = self.by_consumer[Consumer::Sessions.index()];
+                    if matches!(
+                        reason,
+                        LeaseDenied::PoolFull | LeaseDenied::BelowShareWaiting
+                    ) && current.saturating_add(requested_bytes) <= self.sessions_floor
                     {
                         self.session_violations.push((
                             format!(
@@ -604,7 +416,7 @@ impl PoolGaugeModel {
                                 self.sessions_floor
                             ),
                             format!(
-                                "Sessions waited with `{reason}` while requesting {requested_bytes} B at {current} B leased"
+                                "Sessions waited with `{reason:?}` while requesting {requested_bytes} B at {current} B leased"
                             ),
                         ));
                     }
@@ -631,33 +443,41 @@ impl PoolGaugeModel {
         }
     }
 
-    fn add_bytes(&mut self, consumer: &str, bytes: u64) {
-        let entry = self.by_consumer.entry(consumer.to_owned()).or_default();
-        *entry = entry.saturating_add(bytes);
-        let c_val = *entry;
-        let peak = self
-            .peaks_by_consumer
-            .entry(consumer.to_owned())
-            .or_default();
-        *peak = (*peak).max(c_val);
+    fn count_sessions_event(&mut self, consumer: Consumer) {
+        if consumer == Consumer::Sessions {
+            self.sessions_events_observed = self.sessions_events_observed.saturating_add(1);
+        }
+    }
+
+    fn bound_violation(&mut self, expected: impl Into<String>, actual: String) {
+        self.bound_violations.push((expected.into(), actual));
+    }
+
+    fn add_bytes(&mut self, consumer: Consumer, bytes: u64) {
+        let index = consumer.index();
+        self.by_consumer[index] = self.by_consumer[index].saturating_add(bytes);
+        self.peaks_by_consumer[index] = self.peaks_by_consumer[index].max(self.by_consumer[index]);
         self.total_leased = self.total_leased.saturating_add(bytes);
         self.peak_total = self.peak_total.max(self.total_leased);
     }
 
-    fn sub_bytes(&mut self, consumer: &str, bytes: u64) {
-        let entry = self.by_consumer.entry(consumer.to_owned()).or_default();
-        if *entry < bytes {
-            self.bound_violations.push((
-                format!("consumer `{consumer}` never releases more bytes than it holds"),
-                format!("held {} B, released {bytes} B", *entry),
-            ));
+    fn sub_bytes(&mut self, consumer: Consumer, bytes: u64) {
+        let held = self.by_consumer[consumer.index()];
+        if held < bytes {
+            self.bound_violation(
+                format!(
+                    "consumer `{}` never releases more bytes than it holds",
+                    consumer.label()
+                ),
+                format!("held {held} B, released {bytes} B"),
+            );
         }
-        *entry = entry.saturating_sub(bytes);
+        self.by_consumer[consumer.index()] = held.saturating_sub(bytes);
         if self.total_leased < bytes {
-            self.bound_violations.push((
-                "pool total never underflows on release".to_owned(),
+            self.bound_violation(
+                "pool total never underflows on release",
                 format!("total {} B, released {bytes} B", self.total_leased),
-            ));
+            );
         }
         self.total_leased = self.total_leased.saturating_sub(bytes);
     }
@@ -669,59 +489,54 @@ impl PoolGaugeModel {
     /// reports the lower cap.
     fn check_reported_bounds(
         &mut self,
-        consumer: &str,
+        consumer: Consumer,
         reported_consumer: u64,
         limits: Option<(u64, u64, bool)>,
         reported_total: u64,
         pool_limit: u64,
     ) {
-        self.pool_limit = Some(pool_limit);
-        let folded_consumer = self.leased(consumer);
+        let label = consumer.label();
+        let folded_consumer = self.by_consumer[consumer.index()];
         if folded_consumer != reported_consumer {
-            self.bound_violations.push((
+            self.bound_violation(
                 format!(
-                    "folded live leases for `{consumer}` ({folded_consumer} B) match reported consumer total"
+                    "folded live leases for `{label}` ({folded_consumer} B) match reported consumer total"
                 ),
                 format!("pool reported {reported_consumer} B"),
-            ));
+            );
         }
         if self.total_leased != reported_total {
-            self.bound_violations.push((
+            self.bound_violation(
                 format!(
                     "folded pool total ({} B) matches reported total",
                     self.total_leased
                 ),
                 format!("pool reported {reported_total} B"),
-            ));
+            );
         }
         if reported_total > pool_limit || self.total_leased > pool_limit {
-            self.bound_violations.push((
+            self.bound_violation(
                 format!("live pool leases stay within S + floors ({pool_limit} B)"),
                 format!(
                     "reported total {reported_total} B (folded {} B)",
                     self.total_leased
                 ),
-            ));
+            );
         }
-        let Some((cap, share, grew)) = limits else {
+        let Some((cap, share, true)) = limits else {
             return;
         };
-        self.last_cap.insert(consumer.to_owned(), cap);
-        self.last_share.insert(consumer.to_owned(), share);
-        if !grew {
-            return;
-        }
-        if self.peaks_by_consumer.get(consumer) == Some(&folded_consumer) {
-            self.caps_at_peak.insert(consumer.to_owned(), cap);
+        if self.peaks_by_consumer[consumer.index()] == folded_consumer {
+            self.caps_at_peak[consumer.index()] = Some(cap);
         }
         if reported_consumer > cap || folded_consumer > cap {
-            self.bound_violations.push((
-                format!("consumer `{consumer}` stays within its cap ({cap} B)"),
+            self.bound_violation(
+                format!("consumer `{label}` stays within its cap ({cap} B)"),
                 format!("reported {reported_consumer} B (folded {folded_consumer} B)"),
-            ));
+            );
         }
-        if consumer == SESSIONS_LABEL
-            && self.default_session_settings
+        if consumer == Consumer::Sessions
+            && !self.session_overrides
             && (reported_consumer > share || folded_consumer > share)
         {
             self.session_violations.push((
@@ -733,16 +548,11 @@ impl PoolGaugeModel {
         }
     }
 
-    /// Live leased bytes for `consumer` (0 if none).
-    pub fn leased(&self, consumer: &str) -> u64 {
-        self.by_consumer.get(consumer).copied().unwrap_or(0)
-    }
-
     /// Combined live leased bytes for `BlockSync` + `Consensus` (block sync's
     /// requests and retained bodies across commit-window and look-ahead).
     pub fn block_sync_total_leased(&self) -> u64 {
-        self.leased(BLOCK_SYNC_LABEL)
-            .saturating_add(self.leased(CONSENSUS_LABEL))
+        self.by_consumer[Consumer::BlockSync.index()]
+            .saturating_add(self.by_consumer[Consumer::Consensus.index()])
     }
 
     /// Total live leased bytes across every consumer.
@@ -755,53 +565,15 @@ impl PoolGaugeModel {
         self.leases.len()
     }
 
-    /// Every consumer with a non-zero live balance.
-    pub fn nonzero_consumers(&self) -> Vec<(String, u64)> {
-        self.by_consumer
-            .iter()
-            .filter(|(_, bytes)| **bytes > 0)
-            .map(|(consumer, bytes)| (consumer.clone(), *bytes))
-            .collect()
+    /// Peak leased bytes recorded per consumer, by [`Consumer::index`].
+    pub fn peaks_by_consumer(&self) -> [u64; Consumer::COUNT] {
+        self.peaks_by_consumer
     }
 
-    /// Peak leased bytes recorded per consumer.
-    pub fn peaks_by_consumer(&self) -> &BTreeMap<String, u64> {
-        &self.peaks_by_consumer
-    }
-
-    /// Peak total leased bytes recorded across the pool.
-    pub fn peak_total(&self) -> u64 {
-        self.peak_total
-    }
-
-    /// Latest reported pool limit (`total_floors + S`).
-    pub fn pool_limit(&self) -> Option<u64> {
-        self.pool_limit
-    }
-
-    /// Latest reported cap for `consumer`.
-    pub fn last_cap(&self, consumer: &str) -> Option<u64> {
-        self.last_cap.get(consumer).copied()
-    }
-
-    /// The cap each consumer's peak was granted under.
-    pub fn caps_at_peak(&self) -> &BTreeMap<String, u64> {
-        &self.caps_at_peak
-    }
-
-    /// Latest reported protected share for `consumer`.
-    pub fn last_share(&self, consumer: &str) -> Option<u64> {
-        self.last_share.get(consumer).copied()
-    }
-
-    /// Total `PoolFact` events folded.
-    pub fn events_observed(&self) -> u64 {
-        self.events_observed
-    }
-
-    /// Total `Sessions` events folded.
-    pub fn sessions_events_observed(&self) -> u64 {
-        self.sessions_events_observed
+    /// The cap each consumer's peak was granted under, by
+    /// [`Consumer::index`].
+    pub fn caps_at_peak(&self) -> [Option<u64>; Consumer::COUNT] {
+        self.caps_at_peak
     }
 
     /// G1 (`memory/pool-bounded`) violations folded so far.
@@ -809,13 +581,8 @@ impl PoolGaugeModel {
         &self.bound_violations
     }
 
-    /// `mem-13` (`memory/sessions-within-share`) violations folded so far.
-    pub fn session_violations(&self) -> &[(String, String)] {
-        &self.session_violations
-    }
-
     /// Reserved-consumer waits folded so far (`(consumer, requested_bytes, reason)`).
-    pub fn waited_reserved(&self) -> &[(String, u64, String)] {
+    pub fn waited_reserved(&self) -> &[(Consumer, u64, LeaseDenied)] {
         &self.waited_reserved
     }
 
@@ -831,7 +598,7 @@ impl PoolGaugeModel {
         let mut heights = Vec::new();
         let mut unlabeled = None;
         for (lease_id, (consumer, bytes)) in &self.leases {
-            if consumer != CONSENSUS_LABEL || *bytes == 0 {
+            if *consumer != Consumer::Consensus || *bytes == 0 {
                 continue;
             }
             match self.heights.get(lease_id) {
@@ -844,23 +611,6 @@ impl PoolGaugeModel {
         }
         heights.sort_unstable();
         (heights, unlabeled)
-    }
-
-    /// Fold every `Observation::Pool` and `Observation::Session` in `log`.
-    pub fn of_log(
-        log: &ObservationLog,
-        sessions_floor: u64,
-        default_session_settings: bool,
-    ) -> Self {
-        let mut model = Self::new(sessions_floor, default_session_settings);
-        for entry in log.entries() {
-            match &entry.obs {
-                Observation::Pool { event, .. } => model.observe(event),
-                Observation::Session { connection, .. } => model.observe_session(*connection),
-                _ => {}
-            }
-        }
-        model
     }
 }
 
@@ -1030,7 +780,7 @@ pub fn consensus_height_reissued(log: &ObservationLog) -> bool {
                         lease_id, consumer, ..
                     },
                 ..
-            } if consumer == CONSENSUS_LABEL => {
+            } if *consumer == Consumer::Consensus => {
                 consensus.insert(*lease_id);
             }
             Observation::Pool {
@@ -1047,41 +797,51 @@ pub fn consensus_height_reissued(log: &ObservationLog) -> bool {
     false
 }
 
+/// Fail with the first of `violations`, recording the rest, or hold when
+/// there are none.
+fn report_violations<S: HasView>(
+    cx: &mut CheckCtx<'_, S>,
+    violations: Vec<(String, String)>,
+) -> Verdict {
+    let mut violations = violations.into_iter();
+    let Some((expected, actual)) = violations.next() else {
+        return Verdict::Holds;
+    };
+    for (expected, actual) in violations {
+        cx.record_violation(expected, actual);
+    }
+    cx.violated(expected, actual)
+}
+
 fn check_pool_bounded<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict
 where
     S::View: PoolView,
 {
     let (observed, peak_total, peaks_by_consumer, violations) = cx.view().read_pool(|pool| {
         (
-            pool.events_observed(),
-            pool.peak_total(),
-            pool.peaks_by_consumer().clone(),
-            pool.bound_violations().to_vec(),
+            pool.events_observed,
+            pool.peak_total,
+            pool.peaks_by_consumer,
+            pool.bound_violations.clone(),
         )
     });
     if observed == 0 {
         return Verdict::NotApplicable;
     }
     cx.peak("pool-leased-bytes", peak_total);
-    for (label, key) in [
-        ("block_sync", "block-sync-leased-bytes"),
-        ("consensus", "consensus-leased-bytes"),
-        ("serving", "serving-leased-bytes"),
-        ("sessions", "sessions-leased-bytes"),
-        ("tx", "tx-leased-bytes"),
+    for (consumer, key) in [
+        (Consumer::BlockSync, "block-sync-leased-bytes"),
+        (Consumer::Consensus, "consensus-leased-bytes"),
+        (Consumer::Serving, "serving-leased-bytes"),
+        (Consumer::Sessions, "sessions-leased-bytes"),
+        (Consumer::Tx, "tx-leased-bytes"),
     ] {
-        if let Some(&peak) = peaks_by_consumer.get(label) {
+        let peak = peaks_by_consumer[consumer.index()];
+        if peak > 0 {
             cx.peak(key, peak);
         }
     }
-    let mut violations = violations.into_iter();
-    if let Some((expected, actual)) = violations.next() {
-        for (exp, act) in violations {
-            cx.record_violation(exp, act);
-        }
-        return cx.violated(expected, actual);
-    }
-    Verdict::Holds
+    report_violations(cx, violations)
 }
 
 fn check_teardown_returns_zero<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict
@@ -1126,11 +886,12 @@ where
     }
 
     let (total_leased, live_leases, nonzero) = cx.view().read_pool(|pool| {
-        (
-            pool.total_leased(),
-            pool.live_lease_count(),
-            pool.nonzero_consumers(),
-        )
+        let nonzero: Vec<_> = Consumer::ALL
+            .into_iter()
+            .map(|consumer| (consumer, pool.by_consumer[consumer.index()]))
+            .filter(|(_, bytes)| *bytes > 0)
+            .collect();
+        (pool.total_leased, pool.leases.len(), nonzero)
     });
     if total_leased > 0 || live_leases > 0 {
         return cx.violated(
@@ -1155,55 +916,39 @@ where
 {
     let (observed, peak_sessions, violations) = cx.view().read_pool(|pool| {
         (
-            pool.sessions_events_observed(),
-            pool.peaks_by_consumer()
-                .get(SESSIONS_LABEL)
-                .copied()
-                .unwrap_or(0),
-            pool.session_violations().to_vec(),
+            pool.sessions_events_observed,
+            pool.peaks_by_consumer[Consumer::Sessions.index()],
+            pool.session_violations.clone(),
         )
     });
     if observed == 0 {
         return Verdict::NotApplicable;
     }
     cx.peak("sessions-leased-bytes", peak_sessions);
-    let mut violations = violations.into_iter();
-    if let Some((expected, actual)) = violations.next() {
-        for (exp, act) in violations {
-            cx.record_violation(exp, act);
-        }
-        return cx.violated(expected, actual);
-    }
-    Verdict::Holds
+    report_violations(cx, violations)
 }
 
 fn check_tip_never_waits<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict
 where
     S::View: PoolView,
 {
-    let (reserved_grants, waited) = cx.view().read_pool(|pool| {
-        (
-            pool.reserved_grants_observed(),
-            pool.waited_reserved().to_vec(),
-        )
-    });
+    let (reserved_grants, waited) = cx
+        .view()
+        .read_pool(|pool| (pool.reserved_grants_observed, pool.waited_reserved.clone()));
     if reserved_grants == 0 && waited.is_empty() {
         return Verdict::NotApplicable;
     }
-    let mut waited = waited.into_iter();
-    if let Some((consumer, bytes, reason)) = waited.next() {
-        for (c, b, r) in waited {
-            cx.record_violation(
-                format!("reserved consumer `{c}` never waits on the memory pool"),
-                format!("`{c}` waited for {b} B ({r})"),
-            );
-        }
-        return cx.violated(
-            format!("reserved consumer `{consumer}` never waits on the memory pool"),
-            format!("`{consumer}` waited for {bytes} B ({reason})"),
-        );
-    }
-    Verdict::Holds
+    let violations = waited
+        .into_iter()
+        .map(|(consumer, bytes, reason)| {
+            let consumer = consumer.label();
+            (
+                format!("reserved consumer `{consumer}` never waits on the memory pool"),
+                format!("`{consumer}` waited for {bytes} B ({reason:?})"),
+            )
+        })
+        .collect();
+    report_violations(cx, violations)
 }
 
 /// [`TIP_NEVER_WAITS`]'s trigger history: the pool recorded at least one grant
@@ -1215,7 +960,7 @@ pub fn reserved_lease_observed(log: &ObservationLog) -> bool {
             Observation::Pool {
                 event: PoolFact::Granted { consumer, .. } | PoolFact::Waited { consumer, .. },
                 ..
-            } if is_reserved_consumer(consumer)
+            } if is_reserved(*consumer)
         )
     })
 }
@@ -1278,7 +1023,7 @@ pub fn sessions_lease_observed(log: &ObservationLog) -> bool {
                     | PoolFact::Released { consumer, .. }
                     | PoolFact::Waited { consumer, .. },
                 ..
-            } if consumer == SESSIONS_LABEL
+            } if *consumer == Consumer::Sessions
         )
     })
 }
@@ -1288,10 +1033,10 @@ mod tests {
     use super::*;
 
     /// A grant of `bytes` to `consumer` as lease `lease_id`.
-    fn granted(lease_id: u64, consumer: &str, bytes: u64) -> PoolFact {
+    fn granted(lease_id: u64, consumer: Consumer, bytes: u64) -> PoolFact {
         PoolFact::Granted {
             lease_id,
-            consumer: consumer.to_owned(),
+            consumer,
             peer: Some(1),
             bytes,
             consumer_leased: bytes,
@@ -1312,15 +1057,15 @@ mod tests {
     #[test]
     fn consensus_heights_join_labels_to_live_leases() {
         let mut pool = PoolGaugeModel::default();
-        pool.observe(&granted(1, CONSENSUS_LABEL, 10));
+        pool.observe(&granted(1, Consumer::Consensus, 10));
         assert_eq!(pool.consensus_heights(), (Vec::new(), Some(1)));
         pool.observe(&labeled(1, Some(7)));
-        pool.observe(&granted(2, CONSENSUS_LABEL, 10));
+        pool.observe(&granted(2, Consumer::Consensus, 10));
         pool.observe(&labeled(2, Some(7)));
         assert_eq!(pool.consensus_heights(), (vec![(7, 1), (7, 2)], None));
         pool.observe(&labeled(2, None));
         assert_eq!(pool.consensus_heights(), (vec![(7, 1)], None));
-        pool.observe(&granted(3, BLOCK_SYNC_LABEL, 10));
+        pool.observe(&granted(3, Consumer::BlockSync, 10));
         pool.observe(&labeled(3, Some(7)));
         assert_eq!(pool.consensus_heights(), (vec![(7, 1)], None));
     }
@@ -1330,12 +1075,12 @@ mod tests {
     #[test]
     fn a_split_drain_keeps_its_height_until_it_moves() {
         let mut pool = PoolGaugeModel::default();
-        pool.observe(&granted(1, CONSENSUS_LABEL, 10));
+        pool.observe(&granted(1, Consumer::Consensus, 10));
         pool.observe(&labeled(1, Some(7)));
         pool.observe(&PoolFact::Split {
             from_lease_id: 1,
             to_lease_id: 2,
-            consumer: CONSENSUS_LABEL.to_owned(),
+            consumer: Consumer::Consensus,
             peer: Some(1),
             bytes: 4,
         });
@@ -1343,8 +1088,8 @@ mod tests {
         pool.observe(&PoolFact::Moved {
             from_lease_id: 2,
             to_lease_id: 3,
-            from: CONSENSUS_LABEL.to_owned(),
-            to: BLOCK_SYNC_LABEL.to_owned(),
+            from: Consumer::Consensus,
+            to: Consumer::BlockSync,
             peer: Some(1),
             bytes: 4,
             from_leased: 6,

@@ -1489,7 +1489,7 @@ fn validate_reactor_unsolicited_frame_caps(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::zakura::memory::draft::resolved_p2p_budget_bytes;
+    use crate::zakura::memory::draft::derive_p2p_budget;
 
     const GIB: u64 = 1024 * MIB;
 
@@ -1507,6 +1507,11 @@ mod tests {
     }
 
     const KIB: u64 = 1024;
+
+    /// The P2P budget `B` that `host_budget_bytes` derives without a sidecar.
+    fn host_b(host_budget_bytes: u64) -> u64 {
+        derive_p2p_budget(host_budget_bytes, false).p2p_budget_b
+    }
 
     /// A Zakura-only config on `network`.
     fn zakura_cfg(network: &Network) -> Config {
@@ -1903,7 +1908,7 @@ mod tests {
 
         // 4 GiB and 8 GiB refuse under draft Stage 0 base (~4.6 GiB) + worst checkpoint window (~3.7 GiB).
         for small_gib in [4u64, 8] {
-            let b = resolved_p2p_budget_bytes(small_gib * GIB, false);
+            let b = host_b(small_gib * GIB);
             assert!(
                 matches!(
                     MemoryPlan::size(b, &config, &Network::Mainnet),
@@ -1917,7 +1922,7 @@ mod tests {
         let mut prev_s = 0u64;
         let mut prev_n = 0usize;
         for host_gib in [16u64, 32, 64] {
-            let b = resolved_p2p_budget_bytes(host_gib * GIB, false);
+            let b = host_b(host_gib * GIB);
             let plan = MemoryPlan::size(b, &config, &Network::Mainnet)
                 .unwrap_or_else(|err| panic!("{host_gib} GiB must fit: {err}"));
             assert!(plan.override_warnings.is_empty());
@@ -1939,7 +1944,7 @@ mod tests {
         let off = zakura_cfg(&Network::Mainnet);
         let mut on = off.clone();
         on.zakura.bpv1.enabled = true;
-        let budget_b = resolved_p2p_budget_bytes(16 * GIB, false);
+        let budget_b = host_b(16 * GIB);
         let off_plan = MemoryPlan::size(budget_b, &off, &Network::Mainnet).expect("16 GiB fits");
         let on_plan = MemoryPlan::size(budget_b, &on, &Network::Mainnet).expect("16 GiB fits");
 
@@ -1989,7 +1994,7 @@ mod tests {
     fn a_raised_bpv1_reserve_refuses_and_names_its_setting() {
         let mut on = zakura_cfg(&Network::Mainnet);
         on.zakura.bpv1.enabled = true;
-        let budget_b = resolved_p2p_budget_bytes(16 * GIB, false);
+        let budget_b = host_b(16 * GIB);
         MemoryPlan::size(budget_b, &on, &Network::Mainnet).expect("the default reserve fits");
 
         let refusal =
@@ -2049,7 +2054,7 @@ mod tests {
 
         use crate::zakura::memory::MemoryPoolMachine;
 
-        let budget_16g = resolved_p2p_budget_bytes(16 * GIB, false);
+        let budget_16g = host_b(16 * GIB);
 
         // 1. Default settings fit with zero warnings and never overrun live.
         let default_cfg = zakura_cfg(&Network::Mainnet);

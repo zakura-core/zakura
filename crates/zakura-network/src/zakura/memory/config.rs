@@ -58,18 +58,18 @@ impl FromStr for ByteSize {
     type Err = ByteSizeParseError;
 
     fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        let err = |reason| ByteSizeParseError {
+            input: raw.to_owned(),
+            reason,
+        };
         let trimmed = raw.trim();
         if trimmed.is_empty() {
-            return Err(ByteSizeParseError {
-                input: raw.to_owned(),
-                reason: "expected a byte count such as \"16 GiB\", \"256 MiB\", or 4096",
-            });
+            return Err(err(
+                "expected a byte count such as \"16 GiB\", \"256 MiB\", or 4096",
+            ));
         }
         if trimmed.starts_with('-') {
-            return Err(ByteSizeParseError {
-                input: raw.to_owned(),
-                reason: "byte size cannot be negative",
-            });
+            return Err(err("byte size cannot be negative"));
         }
 
         let number_end = trimmed
@@ -84,16 +84,12 @@ impl FromStr for ByteSize {
         let whole: String = whole_part.chars().filter(|&c| c != '_').collect();
         let fraction: String = fraction_part.chars().filter(|&c| c != '_').collect();
         if whole.is_empty() && fraction.is_empty() {
-            return Err(ByteSizeParseError {
-                input: raw.to_owned(),
-                reason: "missing numeric value",
-            });
+            return Err(err("missing numeric value"));
         }
         if fraction.contains('.') || fraction.len() > MAX_FRACTION_DIGITS {
-            return Err(ByteSizeParseError {
-                input: raw.to_owned(),
-                reason: "expected at most one decimal point and 18 decimal digits",
-            });
+            return Err(err(
+                "expected at most one decimal point and 18 decimal digits",
+            ));
         }
 
         // Single-letter units are binary, like the repo's other sizes and
@@ -110,29 +106,24 @@ impl FromStr for ByteSize {
             "gb" => GB,
             "tb" => TB,
             _ => {
-                return Err(ByteSizeParseError {
-                    input: raw.to_owned(),
-                    reason: "unknown unit (use B, KiB, MiB, GiB, TiB, KB, MB, GB, or TB)",
-                });
+                return Err(err(
+                    "unknown unit (use B, KiB, MiB, GiB, TiB, KB, MB, GB, or TB)",
+                ));
             }
         };
 
-        let overflow = || ByteSizeParseError {
-            input: raw.to_owned(),
-            reason: "byte size overflows u64",
+        let overflow = || err("byte size overflows u64");
+        let parse = |digits: &str| -> Result<u128, ByteSizeParseError> {
+            if digits.is_empty() {
+                Ok(0)
+            } else {
+                digits.parse().map_err(|_| overflow())
+            }
         };
-        let whole: u128 = if whole.is_empty() {
-            0
-        } else {
-            whole.parse().map_err(|_| overflow())?
-        };
+        let whole = parse(&whole)?;
         // `fraction` has at most 18 digits, so it and its scale fit in u128.
         let fraction_scale = 10u128.pow(fraction.len() as u32);
-        let fraction: u128 = if fraction.is_empty() {
-            0
-        } else {
-            fraction.parse().map_err(|_| overflow())?
-        };
+        let fraction = parse(&fraction)?;
         // A fraction of a byte rounds down.
         let bytes = whole
             .checked_mul(u128::from(multiplier))
@@ -167,32 +158,61 @@ impl Serialize for ByteSize {
 
 impl<'de> Deserialize<'de> for ByteSize {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct ByteSizeVisitor;
+        deserialize_size(
+            deserializer,
+            "a byte size string (e.g. \"16 GiB\") or non-negative integer",
+            "byte size cannot be negative",
+            ByteSize,
+            ByteSize::from_str,
+        )
+    }
+}
 
-        impl Visitor<'_> for ByteSizeVisitor {
-            type Value = ByteSize;
+/// Deserializes a size from a non-negative integer, which `from_bytes`
+/// wraps, or a string, which `parse` reads. A negative integer fails with
+/// `negative`.
+fn deserialize_size<'de, D: Deserializer<'de>, T>(
+    deserializer: D,
+    expecting: &'static str,
+    negative: &'static str,
+    from_bytes: fn(u64) -> T,
+    parse: fn(&str) -> Result<T, ByteSizeParseError>,
+) -> Result<T, D::Error> {
+    struct SizeVisitor<T> {
+        expecting: &'static str,
+        negative: &'static str,
+        from_bytes: fn(u64) -> T,
+        parse: fn(&str) -> Result<T, ByteSizeParseError>,
+    }
 
-            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("a byte size string (e.g. \"16 GiB\") or non-negative integer")
-            }
+    impl<T> Visitor<'_> for SizeVisitor<T> {
+        type Value = T;
 
-            fn visit_u64<E: de::Error>(self, value: u64) -> Result<Self::Value, E> {
-                Ok(ByteSize(value))
-            }
-
-            fn visit_i64<E: de::Error>(self, value: i64) -> Result<Self::Value, E> {
-                u64::try_from(value)
-                    .map(ByteSize)
-                    .map_err(|_| E::custom("byte size cannot be negative"))
-            }
-
-            fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
-                ByteSize::from_str(value).map_err(E::custom)
-            }
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str(self.expecting)
         }
 
-        deserializer.deserialize_any(ByteSizeVisitor)
+        fn visit_u64<E: de::Error>(self, value: u64) -> Result<T, E> {
+            Ok((self.from_bytes)(value))
+        }
+
+        fn visit_i64<E: de::Error>(self, value: i64) -> Result<T, E> {
+            u64::try_from(value)
+                .map(self.from_bytes)
+                .map_err(|_| E::custom(self.negative))
+        }
+
+        fn visit_str<E: de::Error>(self, value: &str) -> Result<T, E> {
+            (self.parse)(value).map_err(E::custom)
+        }
     }
+
+    deserializer.deserialize_any(SizeVisitor {
+        expecting,
+        negative,
+        from_bytes,
+        parse,
+    })
 }
 
 /// Value for `[memory] budget`: `"auto"` (detect host/cgroup memory) or an
@@ -226,36 +246,19 @@ impl Serialize for MemoryBudget {
 
 impl<'de> Deserialize<'de> for MemoryBudget {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct MemoryBudgetVisitor;
-
-        impl Visitor<'_> for MemoryBudgetVisitor {
-            type Value = MemoryBudget;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("\"auto\", a byte size string (e.g. \"16 GiB\"), or bytes")
-            }
-
-            fn visit_u64<E: de::Error>(self, value: u64) -> Result<Self::Value, E> {
-                Ok(MemoryBudget::Fixed(ByteSize(value)))
-            }
-
-            fn visit_i64<E: de::Error>(self, value: i64) -> Result<Self::Value, E> {
-                u64::try_from(value)
-                    .map(|bytes| MemoryBudget::Fixed(ByteSize(bytes)))
-                    .map_err(|_| E::custom("[memory] budget cannot be negative"))
-            }
-
-            fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+        deserialize_size(
+            deserializer,
+            "\"auto\", a byte size string (e.g. \"16 GiB\"), or bytes",
+            "[memory] budget cannot be negative",
+            |bytes| MemoryBudget::Fixed(ByteSize(bytes)),
+            |value| {
                 if value.trim().eq_ignore_ascii_case("auto") {
-                    return Ok(MemoryBudget::Auto);
+                    Ok(MemoryBudget::Auto)
+                } else {
+                    ByteSize::from_str(value).map(MemoryBudget::Fixed)
                 }
-                ByteSize::from_str(value)
-                    .map(MemoryBudget::Fixed)
-                    .map_err(E::custom)
-            }
-        }
-
-        deserializer.deserialize_any(MemoryBudgetVisitor)
+            },
+        )
     }
 }
 
@@ -343,7 +346,7 @@ pub struct MemoryCaps {
 impl MemoryCaps {
     /// True when no optional cap override is configured.
     pub fn is_empty(&self) -> bool {
-        self.look_ahead.is_none() && self.serving_per_peer.is_none() && self.tx.is_none()
+        *self == Self::default()
     }
 }
 
@@ -383,16 +386,12 @@ impl MemoryConfig {
         source: &'static str,
         managed_zcashd: bool,
     ) -> ResolvedMemoryBudget {
-        let derivation = derive_p2p_budget(host_budget_bytes, managed_zcashd);
-        ResolvedMemoryBudget {
-            derivation,
+        ResolvedMemoryBudget::with_derivation(
+            derive_p2p_budget(host_budget_bytes, managed_zcashd),
             source,
-            weights: self.weight,
-            caps: self.cap,
-            mempool_tx_cost_limit: super::plan::DEFAULT_MEMPOOL_TX_COST_LIMIT_BYTES,
-            state_read_parser_bytes: super::plan::DEFAULT_STATE_READ_PARSER_BYTES,
-            read_result_byte_limit: None,
-        }
+            self.weight,
+            self.cap,
+        )
     }
 }
 
@@ -420,11 +419,30 @@ pub struct ResolvedMemoryBudget {
 }
 
 impl ResolvedMemoryBudget {
+    /// A resolved budget from `derivation`, with the default mempool, state
+    /// read and read limit terms, which `zakurad` sets from its own config.
+    const fn with_derivation(
+        derivation: BudgetDerivation,
+        source: &'static str,
+        weights: MemoryWeights,
+        caps: MemoryCaps,
+    ) -> Self {
+        Self {
+            derivation,
+            source,
+            weights,
+            caps,
+            mempool_tx_cost_limit: super::plan::DEFAULT_MEMPOOL_TX_COST_LIMIT_BYTES,
+            state_read_parser_bytes: super::plan::DEFAULT_STATE_READ_PARSER_BYTES,
+            read_result_byte_limit: None,
+        }
+    }
+
     /// Construct a resolved budget directly from a pure logical P2P budget `B`
     /// (for tests, simulator harnesses, and standalone `zakura-network` callers).
     pub const fn from_p2p_budget_b(p2p_budget_b: u64) -> Self {
-        Self {
-            derivation: BudgetDerivation {
+        Self::with_derivation(
+            BudgetDerivation {
                 host_budget_bytes: p2p_budget_b,
                 base_bytes: 0,
                 sidecar_bytes: 0,
@@ -432,22 +450,19 @@ impl ResolvedMemoryBudget {
                 rho_denominator: 1,
                 p2p_budget_b,
             },
-            source: "config",
-            weights: MemoryWeights {
+            "config",
+            MemoryWeights {
                 block_sync: 1,
                 serving: 1,
                 tx: 1,
                 sessions: 1,
             },
-            caps: MemoryCaps {
+            MemoryCaps {
                 look_ahead: None,
                 serving_per_peer: None,
                 tx: None,
             },
-            mempool_tx_cost_limit: super::plan::DEFAULT_MEMPOOL_TX_COST_LIMIT_BYTES,
-            state_read_parser_bytes: super::plan::DEFAULT_STATE_READ_PARSER_BYTES,
-            read_result_byte_limit: None,
-        }
+        )
     }
 
     /// Logical-byte P2P budget `B`.
@@ -469,8 +484,8 @@ impl Default for ResolvedMemoryBudget {
             )
             .unwrap_or(u64::MAX),
         );
-        Self {
-            derivation: BudgetDerivation {
+        Self::with_derivation(
+            BudgetDerivation {
                 host_budget_bytes,
                 base_bytes: DRAFT_NON_P2P_BASE_BYTES,
                 sidecar_bytes: 0,
@@ -478,13 +493,10 @@ impl Default for ResolvedMemoryBudget {
                 rho_denominator: DRAFT_RHO_DENOMINATOR,
                 p2p_budget_b,
             },
-            source: "auto",
-            weights: MemoryWeights::default(),
-            caps: MemoryCaps::default(),
-            mempool_tx_cost_limit: super::plan::DEFAULT_MEMPOOL_TX_COST_LIMIT_BYTES,
-            state_read_parser_bytes: super::plan::DEFAULT_STATE_READ_PARSER_BYTES,
-            read_result_byte_limit: None,
-        }
+            "auto",
+            MemoryWeights::default(),
+            MemoryCaps::default(),
+        )
     }
 }
 

@@ -35,7 +35,7 @@ pub use config::{
     ResolvedMemoryBudget,
 };
 pub(crate) use credit::{CloseCreditOnDrop, ConnectionCredit};
-pub use draft::{derive_p2p_budget, resolved_p2p_budget_bytes, BudgetDerivation};
+pub use draft::{derive_p2p_budget, BudgetDerivation};
 pub use plan::{
     derived_read_result_byte_limit, inbound_sessions_share, BudgetTooSmall, ConnectionSessionCost,
     FixedTerms, MemoryPlan, MemoryPlanError, OverrideWarning, ReactorBase, SessionBases,

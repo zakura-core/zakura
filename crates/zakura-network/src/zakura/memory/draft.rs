@@ -139,11 +139,6 @@ pub const fn derive_p2p_budget(host_budget_bytes: u64, managed_zcashd: bool) -> 
     }
 }
 
-/// Convenience helper returning only `B` from [`derive_p2p_budget`].
-pub const fn resolved_p2p_budget_bytes(host_budget_bytes: u64, managed_zcashd: bool) -> u64 {
-    derive_p2p_budget(host_budget_bytes, managed_zcashd).p2p_budget_b
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

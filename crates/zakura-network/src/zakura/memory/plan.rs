@@ -1089,7 +1089,7 @@ impl MemoryPlan {
     /// the connection cap `N_cap` (`02 §8`). `Consumer::Sessions` decides how
     /// many connections memory funds below that cap.
     pub fn local_limits(&self, config: &Config) -> ZakuraLocalLimits {
-        let mut limits = ZakuraLocalLimits::for_node(config, &self.custom_kinds);
+        let mut limits = ZakuraLocalLimits::from_config(config);
         limits.max_connections = self.connection_cap.max(1);
         limits
     }
@@ -1661,6 +1661,49 @@ mod tests {
             MemoryPlan::size_for_node(64 * GIB, &config, &Network::Mainnet, Some(outsider), &[])
                 .expect("fits");
         assert_eq!(without_id.min_connections, outside_node.min_connections);
+    }
+
+    /// The floor counts distinct parseable bootstrap identities other than
+    /// this node's own, exactly as discovery does.
+    #[test]
+    fn the_bootstrap_floor_counts_each_remote_identity_once() {
+        use zakura_quic::NodeSecretKey;
+
+        let ids: Vec<NodeId> = (1..=16)
+            .map(|seed| NodeSecretKey::from_bytes(&[seed; 32]).public())
+            .collect();
+        let entry = |id: &NodeId, port: u16| format!("{id}@192.0.2.1:{port}");
+        let min_connections = |bootstrap_peers: Vec<String>, local_node_id: NodeId| {
+            let mut config = Config {
+                network: Network::Mainnet,
+                p2p_stack: P2pStack::Zakura,
+                ..Config::default()
+            };
+            config.zakura.bootstrap_peers = bootstrap_peers;
+            MemoryPlan::size_for_node(
+                256 * GIB,
+                &config,
+                &Network::Mainnet,
+                Some(local_node_id),
+                &[],
+            )
+            .expect("256 GiB fits")
+            .min_connections
+        };
+        let outsider = NodeSecretKey::from_bytes(&[99; 32]).public();
+        let listed: Vec<String> = ids.iter().map(|id| entry(id, 8234)).collect();
+
+        // 16 remote identities need 33 connections.
+        assert_eq!(min_connections(listed.clone(), outsider), 33);
+        // Leaving this node's own entry out lowers the floor to match discovery.
+        assert_eq!(min_connections(listed, ids[0]), 31);
+        // Extra addresses of one identity and unparsable entries don't count.
+        let repeated = ids
+            .iter()
+            .flat_map(|id| [entry(id, 8234), entry(id, 8235)])
+            .chain(["not a bootstrap peer".to_owned()])
+            .collect();
+        assert_eq!(min_connections(repeated, outsider), 33);
     }
 
     /// fix-35 and fix-36: an override never lets startup pass a budget the

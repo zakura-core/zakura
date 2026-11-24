@@ -2000,13 +2000,6 @@ impl<'de> Deserialize<'de> for Config {
                 .validate_stream_receive_window()
                 .map_err(de::Error::custom)?;
         }
-        if p2p_stack.resolve(&network).runs_zakura() {
-            // Legacy-only nodes create no QUIC endpoint. For v2, the endpoint
-            // lowers a larger cap after tracing starts so its warning is logged.
-            zakura
-                .budgeted_max_connections(&network)
-                .map_err(de::Error::custom)?;
-        }
         // Unconditional peers are dialed on the legacy stack, and only a P2P v2
         // connection proves a node ID, so a pin needs both stacks.
         let runs_both_stacks = {

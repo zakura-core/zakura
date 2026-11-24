@@ -29,8 +29,8 @@ use crate::{
     },
     zakura::{
         ZakuraLocalLimits, DEFAULT_HS_RANGE, DEFAULT_TESTNET_ZAKURA_BOOTSTRAP_PEERS,
-        DEFAULT_ZAKURA_BOOTSTRAP_PEERS, DEFAULT_ZAKURA_BUDGETED_CONNECTIONS,
-        DEFAULT_ZAKURA_LISTEN_ADDR, DEFAULT_ZAKURA_MAX_CONNS_PER_IP,
+        DEFAULT_ZAKURA_BOOTSTRAP_PEERS, DEFAULT_ZAKURA_LISTEN_ADDR,
+        DEFAULT_ZAKURA_MAX_CONNS_PER_IP,
     },
     CacheDir, Config, P2pStack, PeerSocketAddr, UnconditionalPeers,
 };
@@ -1333,12 +1333,14 @@ fn zakura_bootstrap_peers_parse_in_nested_config() {
     assert_eq!(config.zakura.message_rate_per_second, 5);
 }
 
+/// The transport holds the admitted connections and the headroom, keeps one
+/// discovery record's 8 addresses for dials, lets inbound hold its connection
+/// and handshake shares (zakura-quic ADM-12), and keeps two closing connections
+/// per live slot (ADM-13). A config that predates `[memory]` keeps loading.
 #[test]
-fn zakura_peer_memory_budget_lowers_or_refuses_at_load() {
+fn zakura_connection_cap_sets_the_transport_slots() {
     let _init_guard = zakura_test::init();
 
-    // A config generated before the budget existed keeps loading. The endpoint
-    // lowers its cap to what the default budget admits.
     let config: Config = toml::from_str(
         r#"
         [zakura]
@@ -1347,69 +1349,64 @@ fn zakura_peer_memory_budget_lowers_or_refuses_at_load() {
     )
     .unwrap();
     assert_eq!(config.zakura.max_connections, Some(256));
-    assert_eq!(
-        config.zakura.budgeted_max_connections(&config.network),
-        Ok(DEFAULT_ZAKURA_BUDGETED_CONNECTIONS)
-    );
-    assert_eq!(
-        ZakuraLocalLimits::from_config(&config).max_connections,
-        DEFAULT_ZAKURA_BUDGETED_CONNECTIONS
-    );
+    for config in [config, Config::default()] {
+        let bind = ZakuraLocalLimits::from_config(&config).quic_bind_config(Vec::new());
+        assert_eq!(
+            (
+                bind.max_connections,
+                bind.dial_reserve,
+                bind.max_inbound_connections,
+                bind.max_closing_connections
+            ),
+            (288, 8, Some(216), 576)
+        );
+    }
+}
 
-    let mut config: Config = toml::from_str(
-        r#"
-        [zakura]
-        max_connections = 256
-        "#,
-    )
-    .unwrap();
-    config.zakura.memory_budget =
-        crate::zakura::memory::ResolvedMemoryBudget::from_p2p_budget_b(38_753_870_592);
-    // One 256 MiB socket queue, 32 handshakes, and 256 admitted connections.
-    assert_eq!(
-        config.zakura.budgeted_max_connections(&config.network),
-        Ok(256)
-    );
+/// mem-14: config load never sizes memory, because `zakurad` resolves
+/// `[memory] budget` after it. A raised QUIC window loads on every stack, and
+/// the memory plan then warns or refuses against the resolved `B`.
+#[test]
+fn a_raised_quic_window_loads_and_the_plan_sizes_it_against_the_budget() {
+    use crate::zakura::memory::{MemoryPlan, MemoryPlanError};
 
-    // The transport holds the admitted connections and the headroom, keeps
-    // one discovery record's 8 addresses for dials, lets inbound hold its
-    // connection and handshake shares (zakura-quic ADM-12), and keeps two
-    // closing connections per live slot (ADM-13).
-    let bind = ZakuraLocalLimits::from_config(&config).quic_bind_config(Vec::new());
-    assert_eq!(
-        (
-            bind.max_connections,
-            bind.dial_reserve,
-            bind.max_inbound_connections,
-            bind.max_closing_connections
-        ),
-        (288, 8, Some(216), 576)
-    );
-    let bind = ZakuraLocalLimits::from_config(&Config::default()).quic_bind_config(Vec::new());
-    assert_eq!(
-        (
-            bind.max_connections,
-            bind.dial_reserve,
-            bind.max_inbound_connections,
-            bind.max_closing_connections
-        ),
-        (138, 8, Some(104), 276)
-    );
+    let _init_guard = zakura_test::init();
 
-    // With a 1 GiB receive window, the handshake headroom alone exceeds the
-    // default budget.
-    let error = toml::from_str::<Config>(
-        r#"
-        p2p_stack = "dual"
+    const GIB: u64 = 1 << 30;
+    for stack in ["zakura", "dual"] {
+        let config: Config = toml::from_str(&format!(
+            r#"
+            p2p_stack = "{stack}"
 
-        [zakura.quic]
-        receive_window_bytes = 1073741824
-        "#,
-    )
-    .unwrap_err()
-    .to_string();
-    assert!(error.contains("[memory] budget"), "{error}");
-    assert!(error.contains("receive_window_bytes"), "{error}");
+            [zakura.quic]
+            receive_window_bytes = 268435456
+            "#
+        ))
+        .unwrap_or_else(|error| panic!("{stack}: {error}"));
+        let network = config.network.clone();
+
+        let warned = MemoryPlan::size(16 * GIB, &config, &network)
+            .expect("the unraised settings fit 16 GiB");
+        assert!(
+            warned
+                .override_warnings
+                .iter()
+                .any(|warning| warning.setting == "[network.zakura.quic] receive_window_bytes"),
+            "{stack}: {:?}",
+            warned.override_warnings
+        );
+        let funded =
+            MemoryPlan::size(64 * GIB, &config, &network).expect("64 GiB funds the raised window");
+        assert!(
+            funded.override_warnings.is_empty(),
+            "{stack}: {:?}",
+            funded.override_warnings
+        );
+        match MemoryPlan::size(GIB, &config, &network) {
+            Err(MemoryPlanError::BudgetTooSmall(error)) => assert_eq!(error.budget_b, GIB),
+            other => panic!("{stack}: 1 GiB must refuse: {other:?}"),
+        }
+    }
 }
 
 /// `[network.zakura] peer_memory_budget_bytes` was removed with no back-compat:

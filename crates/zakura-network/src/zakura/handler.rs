@@ -56,8 +56,7 @@ use super::discovery::{
 };
 use super::legacy_gossip::LegacyResponseItem;
 use super::peer_memory::{
-    budget_admitted_connections, budgeted_max_connections, budgeted_quic_bytes, ConnectionMemory,
-    PeerMemoryBudgetError, ZAKURA_CLOSING_CONNECTIONS_PER_LIVE,
+    budgeted_quic_bytes, ConnectionMemory, ZAKURA_CLOSING_CONNECTIONS_PER_LIVE,
 };
 use super::regulation::{parks_on_exhaustion, CadenceBuckets, CadenceCharge, PrecheckSlot};
 use super::trace::{reject_reason_label, ZakuraTrace};
@@ -651,7 +650,7 @@ impl ZakuraConfig {
         HANDSHAKE_SEND_WINDOW_BYTES.min(self.quic.send_window_bytes)
     }
 
-    /// What one connection on `network` costs the peer memory budget, when it
+    /// What one connection on `network` can make QUIC hold, when it
     /// negotiates every reactor in [`Self::reactor_shares`] and every stream
     /// kind in `custom_kinds`.
     ///
@@ -681,7 +680,7 @@ impl ZakuraConfig {
     /// The QUIC memory the node can hold on `network` with `max_connections`
     /// admitted: every admitted connection, the handshake headroom, and the
     /// bound sockets' queues. Each connection negotiates the native kinds and
-    /// `custom_kinds`. The peer memory budget is its ceiling.
+    /// `custom_kinds`.
     pub fn quic_memory_bytes(
         &self,
         network: &Network,
@@ -692,56 +691,6 @@ impl ZakuraConfig {
             self.bound_socket_count(),
             self.connection_memory(network, custom_kinds),
             max_connections,
-            self.max_pending_handshakes.max(1),
-        )
-    }
-
-    /// Return the connection cap on `network` after the peer memory budget
-    /// (see [`budgeted_max_connections`]), or an error naming the keys when
-    /// the budget admits too few connections.
-    ///
-    /// The floor counts distinct bootstrap identities, as discovery does.
-    /// Without the node key it can't tell whether one of them is this node, so
-    /// it counts one fewer. It also charges only the native stream kinds. With
-    /// both choices, it never refuses a config that
-    /// [`Self::budgeted_max_connections_for_node`] accepts.
-    pub fn budgeted_max_connections(
-        &self,
-        network: &Network,
-    ) -> Result<usize, PeerMemoryBudgetError> {
-        self.budgeted_max_connections_excluding(network, None, &[])
-    }
-
-    /// Like [`Self::budgeted_max_connections`], but leaves `local_node_id` out
-    /// of the bootstrap count, exactly as discovery does, and charges each
-    /// connection for `custom_kinds` too.
-    pub fn budgeted_max_connections_for_node(
-        &self,
-        network: &Network,
-        local_node_id: NodeId,
-        custom_kinds: &[u16],
-    ) -> Result<usize, PeerMemoryBudgetError> {
-        self.budgeted_max_connections_excluding(network, Some(local_node_id), custom_kinds)
-    }
-
-    fn budgeted_max_connections_excluding(
-        &self,
-        network: &Network,
-        local_node_id: Option<NodeId>,
-        custom_kinds: &[u16],
-    ) -> Result<usize, PeerMemoryBudgetError> {
-        budgeted_max_connections(
-            self.effective_max_connections(),
-            self.memory_budget.p2p_budget_b(),
-            self.bound_socket_count(),
-            self.connection_memory(network, custom_kinds),
-            match local_node_id {
-                Some(local_node_id) => {
-                    remote_bootstrap_peer_count(&self.bootstrap_peers, local_node_id)
-                }
-                // One entry may be this node's own.
-                None => remote_bootstrap_peer_count(&self.bootstrap_peers, None).saturating_sub(1),
-            },
             self.max_pending_handshakes.max(1),
         )
     }
@@ -827,29 +776,16 @@ pub struct ZakuraLocalLimits {
 impl ZakuraLocalLimits {
     /// Build local handler limits from network configuration and handshake
     /// policy, for a node that serves only the native stream kinds.
+    ///
+    /// The connection cap is the configured `N_cap`. Endpoint startup takes
+    /// these limits from `MemoryPlan::local_limits`, and `Consumer::Sessions`
+    /// decides how many connections memory funds below that cap.
     pub fn from_config(config: &Config) -> Self {
-        Self::for_node(config, &[])
-    }
-
-    /// Like [`Self::from_config`], for a node that also serves `custom_kinds`.
-    /// The peer memory budget charges each connection for them.
-    pub fn for_node(config: &Config, custom_kinds: &[u16]) -> Self {
         let handshake = ZakuraHandshakeConfig::for_network(&config.network);
         let admitted_send_window_bytes = config.zakura.quic.send_window_bytes;
         Self {
             quic: config.zakura.quic.clone(),
-            // The floor only decides whether endpoint startup refuses the
-            // config, so the cap is the budget's count either way.
-            max_connections: config.zakura.effective_max_connections().min(
-                budget_admitted_connections(
-                    config.zakura.memory_budget.p2p_budget_b(),
-                    config.zakura.bound_socket_count(),
-                    config
-                        .zakura
-                        .connection_memory(&config.network, custom_kinds),
-                    config.zakura.max_pending_handshakes.max(1),
-                ),
-            ),
+            max_connections: config.zakura.effective_max_connections(),
             max_pending_handshakes: config.zakura.max_pending_handshakes.max(1),
             quic_idle_timeout: config.zakura.quic.idle_timeout(),
             keep_alive_interval: config.zakura.quic.keep_alive_interval(),
@@ -870,9 +806,6 @@ impl ZakuraLocalLimits {
     /// These limits with `shares`, and the QUIC windows that carry them: the
     /// connection receive and send windows start at the small handshake shares,
     /// and the stream receive window holds the largest receive share.
-    ///
-    /// The connection cap stays, so only [`Self::for_node`] calls this, with
-    /// the shares that the cap was budgeted from.
     fn with_reactor_shares(mut self, shares: ReactorShares) -> Self {
         self.quic.receive_window_bytes =
             Some(u32::try_from(shares.control_receive_bytes).unwrap_or(u32::MAX));

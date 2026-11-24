@@ -4,15 +4,15 @@
 //! only joins their bounds, so a configuration that no owner can fund fails before
 //! the node binds a socket. It coordinates nothing at runtime. Zero limits never reach
 //! it: `QuicConfig::validate` refuses zero windows, `ZakuraLocalLimits::from_config`
-//! clamps connections and handshakes, handshake constants fund frames and streams, and
-//! `budgeted_max_connections_for_node` refuses a budget below one connection.
+//! clamps connections and handshakes, and handshake constants fund frames and streams.
+//! `MemoryPlan` checks the node's memory against `[memory] budget` before this.
 //!
 //! Every byte bound derives from the reactors' shares (`ReactorShares`): each admitted
 //! connection holds the handshake window, every reactor's receive share and the send
 //! window in QUIC, and each kind's raw and output gates hold that kind's shares of
 //! frames. Handshakes hold the handshake and send windows, and each bound socket its
-//! datagram queue. The peer memory budget is the ceiling on the QUIC part. An
-//! embedder's custom stream kinds take the `other` share, as on a live connection.
+//! datagram queue. An embedder's custom stream kinds take the `other` share, as on a
+//! live connection.
 //!
 //! A held raw frame carries a QUIC `CreditHold` (API-10), so its bytes sit
 //! inside `quic_bytes` and are counted once there rather than again in
@@ -56,19 +56,6 @@ pub(crate) enum NodeEnvelopeError {
     /// The block-sync limits cannot size the decoded block pool.
     #[error("the decoded block allowance is invalid: {0}")]
     DecodedAllowance(&'static str),
-    /// The connections' QUIC windows and the sockets' queues exceed the peer
-    /// memory budget.
-    #[cfg(test)]
-    #[error(
-        "the Zakura QUIC envelope of {quic_bytes} bytes exceeds \
-         the resolved [memory] budget ({budget_bytes} bytes)"
-    )]
-    PeerMemoryBudget {
-        /// The connections' QUIC windows and the sockets' queues.
-        quic_bytes: u128,
-        /// The configured budget.
-        budget_bytes: u64,
-    },
 }
 
 /// The bounds of every owner family on one node.
@@ -121,50 +108,10 @@ impl NodeEnvelope {
         })
     }
 
-    /// The envelope of a node with this configuration that also serves
-    /// `custom_kinds`, or an error if the peer memory budget can't fund its
-    /// connections.
-    #[cfg(test)]
-    pub(crate) fn for_node(
-        config: &Config,
-        limits: &ZakuraLocalLimits,
-        custom_kinds: &[u16],
-        decoded_backend_blocks: u64,
-    ) -> Result<Self, NodeEnvelopeError> {
-        let block_sync = &config.zakura.block_sync;
-        let quic_bytes =
-            config
-                .zakura
-                .quic_memory_bytes(&config.network, limits.max_connections, custom_kinds);
-        let budget_bytes = config.zakura.memory_budget.p2p_budget_b();
-        if quic_bytes > u128::from(budget_bytes) {
-            return Err(NodeEnvelopeError::PeerMemoryBudget {
-                quic_bytes,
-                budget_bytes,
-            });
-        }
-        Self::new(
-            limits.transport_limits_for_kinds(
-                limits
-                    .reactor_shares()
-                    .kinds
-                    .iter()
-                    .map(|(kind, _)| *kind)
-                    .chain(custom_kinds.iter().copied()),
-            ),
-            quic_bytes,
-            config.tcp_ingress_bound_bytes(),
-            block_sync
-                .decoded_block_allowance(decoded_backend_blocks)
-                .map_err(NodeEnvelopeError::DecodedAllowance)?,
-            block_sync.decoded_pipeline_byte_bound(),
-            serve_output_bytes(config, limits),
-        )
-    }
-
-    /// Compose node envelope diagnostics when [`MemoryPlan`](crate::zakura::memory::MemoryPlan)
-    /// already enforced the full node memory ledger (`02 §8`), checking owner
-    /// bounds and decoded-block allowance without the legacy static QUIC cap.
+    /// The envelope of a node with this configuration and `limits` that also
+    /// serves `custom_kinds`. [`MemoryPlan`](crate::zakura::memory::MemoryPlan)
+    /// already enforced the node memory ledger (`02 §8`), so this checks only
+    /// the owner bound and the decoded-block allowance.
     pub(crate) fn for_memory_plan(
         config: &Config,
         limits: &ZakuraLocalLimits,

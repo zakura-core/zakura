@@ -351,11 +351,11 @@ fn the_compat_exchange_budget_holds_one_worst_case_exchange() {
     );
 }
 
-/// The peer memory budget funds every admitted connection's whole window at the
+/// The node's QUIC term counts every admitted connection's whole window at the
 /// default shares, its send window, every handshake, and the socket queue. The
-/// transport envelope's QUIC term is the budget's charge without the socket.
+/// transport envelope's QUIC term is that charge without the socket.
 #[test]
-fn the_peer_memory_budget_funds_the_whole_windows() {
+fn the_quic_term_counts_the_whole_windows() {
     let config = crate::Config::default();
     let limits = crate::zakura::ZakuraLocalLimits::from_config(&config);
     let shares = limits.reactor_shares();
@@ -369,8 +369,6 @@ fn the_peer_memory_budget_funds_the_whole_windows() {
         envelope.transport_credit_bytes + u128::from(zakura_quic::SOCKET_DATAGRAM_QUEUE_BYTES),
         quic
     );
-    let budget = u128::from(crate::zakura::DEFAULT_ZAKURA_PEER_MEMORY_BUDGET_BYTES);
-    assert!(quic <= budget, "{quic} of {budget}");
 }
 
 #[derive(Debug, Clone)]

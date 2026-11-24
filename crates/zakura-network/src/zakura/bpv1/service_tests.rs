@@ -73,15 +73,16 @@ fn config_default_is_opt_in_and_disabled_adds_zero_envelope_bytes() {
     cfg.zakura.max_connections = Some(8);
 
     let limits = ZakuraLocalLimits::from_config(&cfg);
-    let env_disabled = NodeEnvelope::for_node(&cfg, &limits, &[], 0).expect("disabled envelope");
+    let env_disabled =
+        NodeEnvelope::for_memory_plan(&cfg, &limits, &[], 0).expect("disabled envelope");
     assert!(env_disabled.quic_bytes > 0);
 
     let mut cfg_enabled = cfg.clone();
     cfg_enabled.zakura.bpv1.enabled = true;
     let limits_enabled = ZakuraLocalLimits::from_config(&cfg_enabled);
     assert_eq!(limits.max_connections, limits_enabled.max_connections);
-    let env_enabled =
-        NodeEnvelope::for_node(&cfg_enabled, &limits_enabled, &[], 0).expect("enabled envelope");
+    let env_enabled = NodeEnvelope::for_memory_plan(&cfg_enabled, &limits_enabled, &[], 0)
+        .expect("enabled envelope");
 
     // Each stream's writer holds one encoded frame outside its output gate.
     assert_eq!(

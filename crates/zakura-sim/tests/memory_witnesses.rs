@@ -311,9 +311,11 @@ fn check_honest_never_punished_on_log(
 
 /// Witness for `mem-9` (`pressure-never-faults`): at the exact smallest
 /// accepted budget `B` (where `B - 1` is refused by `MemoryPlan::size_for_node`),
-/// honest peers syncing headers, blocks, and discovery — including extra honest
-/// peers that hit the tight `Sessions` floor limit — suffer zero fault closes
-/// and zero `Misbehavior` penalties (`session/honest-never-punished` holds).
+/// honest peers syncing headers, blocks, and discovery suffer zero fault
+/// closes and zero `Misbehavior` penalties (`session/honest-never-punished`
+/// holds). With `S` at zero, every lease above a floor waits or is refused,
+/// but no `Sessions` limit fires: four mirrors fit the plan's connection
+/// floor.
 #[test]
 fn smallest_accepted_budget_never_faults_honest_peers() {
     let network = Network::new_regtest(Default::default());
@@ -334,9 +336,9 @@ fn smallest_accepted_budget_never_faults_honest_peers() {
         "at the exact smallest accepted B, shared space S should be 0 (maximum pressure)"
     );
 
-    // Connect 4 honest mirrors at `min_b` (exceeding Regtest's minimum
-    // budgeted connection floor so local `session_memory` limits actively fire
-    // neutral refusals while admitted honest peers sync cleanly).
+    // Connect 4 honest mirrors at `min_b`. The plan's connection floor at
+    // `min_b` is above 4, so every mirror is admitted and syncs with `S` at
+    // zero.
     let mirrors = vec![
         mirror(Dialer::Mirror, MirrorServices::All),
         mirror(Dialer::Node, MirrorServices::All),
@@ -357,11 +359,26 @@ fn smallest_accepted_budget_never_faults_honest_peers() {
 
     // Verify directly that zero fault closes, zero Misbehavior, and zero
     // handshake validation faults occurred even under maximum memory pressure.
+    // The wire tier records no `ConnectionClosed`: the node's transport tap
+    // reports each close it decides, so the scan reads that, and counts the
+    // registrations to show the tap saw every mirror's connection.
+    let mut registered = 0;
     for entry in report.log.entries() {
         match &entry.obs {
             Observation::ConnectionClosed { connection, cause } if cause.is_fault() => {
                 panic!("fault close on honest peer connection {connection} at min_b: {cause}");
             }
+            Observation::Transport {
+                remote,
+                event: TransportFact::CloseDecided { cause: Some(cause) },
+                ..
+            } if cause.is_fault() => {
+                panic!("the node closed honest {remote} with a fault at min_b: {cause}");
+            }
+            Observation::Transport {
+                event: TransportFact::Registered,
+                ..
+            } => registered += 1,
             Observation::Misbehavior { connection } => {
                 panic!("Misbehavior recorded on honest peer connection {connection} at min_b");
             }
@@ -379,6 +396,10 @@ fn smallest_accepted_budget_never_faults_honest_peers() {
             _ => {}
         }
     }
+    assert!(
+        registered >= mirror_count,
+        "the transport tap registered {registered} of {mirror_count} mirror connections"
+    );
 
     assert_held(
         &report,

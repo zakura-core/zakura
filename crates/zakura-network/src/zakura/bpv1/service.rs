@@ -2365,6 +2365,9 @@ fn record_block_event(event: &BlockEvent) {
         BlockEvent::MetaPendingAged { .. } => {
             metrics::counter!("zakura.p2p.bpv1.pending_meta.aged").increment(1);
         }
+        BlockEvent::MetaPendingDropped { .. } => {
+            metrics::counter!("zakura.p2p.bpv1.pending_meta.dropped").increment(1);
+        }
         BlockEvent::BlockAdmitted { block_id } => {
             tracing::debug!(target: "bpv1_stage", %block_id, "block_admitted");
         }

@@ -122,9 +122,9 @@ fn the_default_node_config_composes() {
             .expect("the default allowance fits")
             .get()
     );
-    // Block sync and header sync each fund `limits.max_connections` sessions × 64 MiB;
+    // Block sync and header sync each fund `limits.total_connections()` sessions × 64 MiB;
     // discovery adds its answers.
-    let sessions = limits.max_connections as u128;
+    let sessions = limits.total_connections() as u128;
     assert!(envelope.serve_output_bytes >= 2 * sessions * (64 << 20));
     assert!(envelope.serve_output_bytes < 2 * sessions * (64 << 20) + (1 << 30));
     // The QUIC term is the derived one.
@@ -132,7 +132,7 @@ fn the_default_node_config_composes() {
         envelope.quic_bytes,
         config
             .zakura
-            .quic_memory_bytes(&config.network, limits.max_connections, &[])
+            .quic_memory_bytes(&config.network, limits.total_connections(), &[])
     );
     assert_eq!(
         envelope.retained_bytes_bound(),
@@ -192,7 +192,7 @@ fn the_default_envelope_sums_the_reactor_shares() {
     assert_eq!(transport.connection_output_bytes, 128 * MIB);
     // The shared compatibility client holds at most 288 exchanges at once.
     assert_eq!(transport.compat_response_bytes, 288 * 20 * MIB);
-    let conns = limits.max_connections as u128;
+    let conns = limits.total_connections() as u128;
     assert_eq!(
         envelope.transport_bytes,
         conns * u128::from(128 * MIB) + u128::from(288 * 20 * MIB)
@@ -212,7 +212,7 @@ fn custom_stream_kinds_take_the_other_share() {
     let config = Config::default();
     let network = config.network.clone();
     let limits = ZakuraLocalLimits::from_config(&config);
-    let connections = limits.max_connections;
+    let connections = limits.total_connections();
 
     // Widening usize to u128 is lossless on supported targets.
     let other = u128::from(config.zakura.reactor_shares(&network).other.receive_total());
@@ -275,7 +275,7 @@ fn configured_serving_budgets_set_the_serve_output_bound() {
         .serve_output_bytes;
     assert_eq!(
         derived - configured,
-        2 * (limits.max_connections as u128 * (64 << 20) - (1 << 30))
+        2 * (limits.total_connections() as u128 * (64 << 20) - (1 << 30))
     );
 }
 
@@ -293,12 +293,12 @@ fn tx_relay_counts_what_it_holds_outside_its_output_gate() {
         .serve_output_bytes;
     config.zakura.tx_relay.enabled = true;
     let limits = ZakuraLocalLimits::from_config(&config);
-    assert_eq!(limits.max_connections, off_limits.max_connections);
+    assert_eq!(limits.total_connections(), off_limits.total_connections());
     let on = NodeEnvelope::for_memory_plan(&config, &limits, &[], 16)
         .expect("the default config fits with tx-relay on")
         .serve_output_bytes;
     let per_session = u128::from(crate::zakura::tx_relay::wire::SESSION_HELD_OUTPUT_BYTES);
-    let connections = u128::try_from(limits.max_connections).expect("a connection count fits");
+    let connections = u128::try_from(limits.total_connections()).expect("a connection count fits");
     assert_eq!(on - off, connections * per_session);
 }
 
@@ -312,7 +312,7 @@ fn serving_output_counts_admitted_sessions() {
     let mut config = Config::default();
     config.zakura.max_connections = Some(crate::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS);
     let limits = ZakuraLocalLimits::from_config(&config);
-    let connections = limits.max_connections;
+    let connections = limits.total_connections();
     // Widening usize to u64 and u128 is lossless on supported targets.
     let (sessions, discovery) = (
         connections as u64,

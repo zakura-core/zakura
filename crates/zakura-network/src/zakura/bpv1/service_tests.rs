@@ -80,7 +80,10 @@ fn config_default_is_opt_in_and_disabled_adds_zero_envelope_bytes() {
     let mut cfg_enabled = cfg.clone();
     cfg_enabled.zakura.bpv1.enabled = true;
     let limits_enabled = ZakuraLocalLimits::from_config(&cfg_enabled);
-    assert_eq!(limits.max_connections, limits_enabled.max_connections);
+    assert_eq!(
+        limits.total_connections(),
+        limits_enabled.total_connections()
+    );
     let env_enabled = NodeEnvelope::for_memory_plan(&cfg_enabled, &limits_enabled, &[], 0)
         .expect("enabled envelope");
 
@@ -89,7 +92,7 @@ fn config_default_is_opt_in_and_disabled_adds_zero_envelope_bytes() {
         super::config::BPV1_SESSION_HELD_OUTPUT_BYTES,
         u64::from(super::wire::CONTROL_FRAME_CAP) + u64::from(super::wire::DATA_FRAME_CAP),
     );
-    let expected_delta = u128::from(limits_enabled.max_connections as u64)
+    let expected_delta = u128::from(limits_enabled.total_connections() as u64)
         * u128::from(super::config::BPV1_SESSION_HELD_OUTPUT_BYTES);
     assert_eq!(
         env_enabled.serve_output_bytes - env_disabled.serve_output_bytes,
@@ -105,7 +108,7 @@ fn config_default_is_opt_in_and_disabled_adds_zero_envelope_bytes() {
     // envelope registers per session and both output gates.
     let base = super::memory::SessionBase::new(&cfg_enabled.zakura.bpv1);
     let held_per_session = (env_enabled.serve_output_bytes - env_disabled.serve_output_bytes)
-        / u128::from(limits_enabled.max_connections as u64);
+        / u128::from(limits_enabled.total_connections() as u64);
     let gates = super::wire::BPV1_CONTROL_BUDGET.output + super::wire::BPV1_DATA_BUDGET.output;
     assert!(
         u128::from(base.session) >= held_per_session + u128::from(gates),

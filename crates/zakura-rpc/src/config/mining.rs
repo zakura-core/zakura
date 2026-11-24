@@ -72,7 +72,7 @@ pub struct Config {
     ///
     /// The coinbase gets one extra zero-value output that carries this node's v2 node ID, so
     /// other mining nodes can find the node and keep a direct connection to it. The output
-    /// takes 48 bytes of the block.
+    /// takes 46 bytes of the block.
     ///
     /// Needs the v2 P2P stack and a node key that stays the same across restarts: `zakurad`
     /// refuses to start with this set unless it has both.

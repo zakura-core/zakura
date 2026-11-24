@@ -6,9 +6,7 @@ use blake2b_simd::Params as Blake2bParams;
 use zakura_quic::{NodeAddr, NodeSecretKey, QuicBindConfig, QuicConfig, QuicEndpoint};
 
 use crate::{
-    zakura::{
-        ZakuraLocalLimits, DEFAULT_ZAKURA_MAX_CONNECTIONS, DEFAULT_ZAKURA_MAX_PENDING_HANDSHAKES,
-    },
+    zakura::ZakuraLocalLimits,
     BoxError,
 };
 
@@ -31,14 +29,8 @@ impl LocalEndpointFactory {
         Self {
             quic: QuicConfig::default(),
             bind: QuicBindConfig {
-                addrs: Vec::new(),
                 max_bidi_streams: DEFAULT_TEST_MAX_BIDI_STREAMS,
-                max_connections: DEFAULT_ZAKURA_MAX_CONNECTIONS
-                    + DEFAULT_ZAKURA_MAX_PENDING_HANDSHAKES,
-                dial_reserve: default_bind.dial_reserve,
-                max_inbound_connections: default_bind.max_inbound_connections,
-                max_closing_connections: 2
-                    * (DEFAULT_ZAKURA_MAX_CONNECTIONS + DEFAULT_ZAKURA_MAX_PENDING_HANDSHAKES),
+                ..default_bind
             },
         }
     }

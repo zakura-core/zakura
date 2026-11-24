@@ -90,7 +90,13 @@ route measurements before full header admission and metadata authentication.
 Bounded parsing, verification, and the early record in section 3 are the
 necessary exceptions. If parent context is missing, the node MAY retain a
 bounded metadata envelope while headerchain recovers that context. It MUST apply
-independent count, byte, work, and time limits to this pending state.
+independent count, byte, work, and time limits to this pending state, both per
+peer and node-wide. Headerchain answers a missing parent before it checks proof
+of work, so a pending entry costs its sender only bytes. Pending metadata MUST
+NOT take space from metadata whose parent the node holds. When the node-wide
+pending limit is full, the node SHOULD drop an entry of the peer holding the
+most pending metadata, not refuse a peer holding less. A dropped entry is not a
+violation, and the block arrives through header sync and block download.
 
 Header admission does not validate the block body. Reconstructed blocks MUST
 enter the existing consensus block-validation path.
@@ -743,7 +749,7 @@ Section 8 lists every field in transmission order.
   - at most one `HeaderMeta` per block per connection
   - capacity = 64 messages; refill = 16 messages/s; on_empty = record and
     forward
-  - headerchain's per-peer pending-header bounds
+  - the per-peer and node-wide pending-metadata bounds in section 1
 
 A node MUST send `HeaderMeta` for a block at most once per connection. It
 MUST forward only metadata it admitted, and only within the propagation window
@@ -1385,6 +1391,7 @@ registry.
 | Early record per peer; node-wide; `EARLY_AGE` | `TBD`; experiments used a 64 MiB node-wide buffer | Messages about unknown blocks. |
 | Peer-view and advert retention | `TBD`; `ADV_KEEP` = 64 blocks | Learning bounds. |
 | Concurrent blocks | `TBD`; experiments used 4 | Assembly bound. |
+| Metadata in admission; pending metadata | 64 entries and 8 MiB each; pending also 4 entries per peer and 15 s | Separate budgets, so headers with unknown parents never refuse viable metadata. |
 | Subscription cadence | capacity 64; refill 32/s | Candidate. Exhaustion is recorded, not enforced. |
 
 #### Routing policy

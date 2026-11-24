@@ -138,11 +138,7 @@ pub fn verify_commitment(
         return Err(CommitmentError::UnsupportedNetworkUpgrade);
     }
 
-    // The coinbase byte bound also bounds the parsed coinbase's outputs and
-    // script bytes. The exact path depth is at most 32 for any `u32` count.
-    if binding.coinbase.is_empty() || binding.coinbase.len() > W2_MAX_COINBASE_BYTES {
-        return Err(CommitmentError::CoinbaseOutOfBounds);
-    }
+    // The exact path depth is at most 32 for any `u32` count.
     let expected_depth = expected_tx_path_depth(fields.coding.tx_count);
     if binding.txid_siblings.len() != expected_depth
         || binding.auth_siblings.len() != expected_depth
@@ -154,21 +150,7 @@ pub fn verify_commitment(
         });
     }
 
-    // Parse coinbase with bounded canonical deserialization and exact consumption.
-    let mut cursor = binding.coinbase.as_slice();
-    let coinbase = Transaction::zcash_deserialize_bounded(&mut cursor)
-        .map_err(|_| CommitmentError::InvalidCoinbaseEncoding)?;
-    if !cursor.is_empty() {
-        return Err(CommitmentError::TrailingCoinbaseBytes);
-    }
-
-    // decision-9: require a v6 coinbase transaction.
-    if !matches!(coinbase, Transaction::V6 { .. }) {
-        return Err(CommitmentError::UnsupportedCoinbaseVersion);
-    }
-    if !coinbase.is_coinbase() {
-        return Err(CommitmentError::NotCoinbase);
-    }
+    let coinbase = decode_coinbase(&binding.coinbase)?;
 
     // check-2: coinbase txid at index 0 reaches `header.merkle_root`.
     let txid = coinbase.hash().0;
@@ -193,6 +175,31 @@ pub fn verify_commitment(
         return Err(CommitmentError::CommitmentHashMismatch);
     }
 
+    Ok(coinbase)
+}
+
+/// Decodes the coinbase a `HeaderMeta` binds: a canonical v6 coinbase
+/// transaction of at most `W2_MAX_COINBASE_BYTES` (decision-9).
+///
+/// The proposer runs this check before it announces a block, so a coinbase
+/// that receivers refuse never leaves through BPv1.
+pub fn decode_coinbase(bytes: &[u8]) -> Result<Transaction, CommitmentError> {
+    // The byte bound also bounds the parsed coinbase's outputs and script bytes.
+    if bytes.is_empty() || bytes.len() > W2_MAX_COINBASE_BYTES {
+        return Err(CommitmentError::CoinbaseOutOfBounds);
+    }
+    let mut cursor = bytes;
+    let coinbase = Transaction::zcash_deserialize_bounded(&mut cursor)
+        .map_err(|_| CommitmentError::InvalidCoinbaseEncoding)?;
+    if !cursor.is_empty() {
+        return Err(CommitmentError::TrailingCoinbaseBytes);
+    }
+    if !matches!(coinbase, Transaction::V6 { .. }) {
+        return Err(CommitmentError::UnsupportedCoinbaseVersion);
+    }
+    if !coinbase.is_coinbase() {
+        return Err(CommitmentError::NotCoinbase);
+    }
     Ok(coinbase)
 }
 

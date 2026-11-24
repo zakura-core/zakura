@@ -266,6 +266,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(10), async {
             let limits = ZakuraLocalLimits {
                 max_connections: 1,
+                max_preferred_connections: 0,
                 max_pending_handshakes: 1,
                 ..ZakuraLocalLimits::from_config(&Config::default())
             };

@@ -1,0 +1,15 @@
+---
+source: crates/zakura-rpc/src/methods/tests/snapshot.rs
+expression: get_miner_mesh_info
+---
+{
+  "node_id": null,
+  "announcing": false,
+  "mining": true,
+  "synced": true,
+  "window": null,
+  "gateways": [],
+  "hold": 0,
+  "slots": null,
+  "peers": []
+}

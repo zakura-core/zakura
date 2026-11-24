@@ -58,14 +58,28 @@ pub fn stall_base(paths: &PeerPaths, coding: &Coding) -> Duration {
 /// It is the only recovery bound (decision-17).
 pub const RECONSTRUCTION_DEADLINE: Duration = Duration::from_secs(15);
 
-/// Maximum metadata entries admitting or waiting on missing parents (`bpv1-11`).
+/// Maximum metadata entries in header admission or the commitment check.
+/// Pending metadata never counts here (`bpv1-75`).
+pub const MAX_ADMITTING_META_COUNT: usize = 64;
+
+/// Maximum bytes held in metadata in header admission or the commitment check.
+pub const MAX_ADMITTING_META_BYTES: usize = 8 * 1024 * 1024;
+
+/// Maximum metadata entries waiting on missing parents (`bpv1-11`).
 pub const MAX_PENDING_META_COUNT: usize = 64;
 
-/// Maximum bytes held in admitting and pending metadata (`bpv1-11`).
+/// Maximum bytes held in metadata waiting on missing parents (`bpv1-11`).
 pub const MAX_PENDING_META_BYTES: usize = 8 * 1024 * 1024;
 
-// decision-23: the pending budget holds at least four maximum `HeaderMeta`
+/// Maximum metadata entries one peer keeps waiting on missing parents
+/// (`bpv1-11`). Header sync normally delivers a parent before its child's
+/// metadata arrives, so an honest peer rarely has more than one waiting; a
+/// block whose metadata does not fit arrives through block sync instead.
+pub const MAX_PENDING_META_PER_PEER: usize = 4;
+
+// decision-23: each metadata budget holds at least four maximum `HeaderMeta`
 // envelopes, whose coinbase may reach `MAX_BLOCK_BYTES`.
+const _: () = assert!(MAX_ADMITTING_META_BYTES >= 4 * MetaEnvelope::MAX_ESTIMATED_BYTES);
 const _: () = assert!(MAX_PENDING_META_BYTES >= 4 * MetaEnvelope::MAX_ESTIMATED_BYTES);
 
 /// Maximum age of an unresolved pending metadata entry (`bpv1-11`).
@@ -691,6 +705,12 @@ pub enum StripeJob {
 pub enum BlockEvent {
     /// Pending metadata aged out and dropped.
     MetaPendingAged {
+        /// Block hash.
+        block_id: block::Hash,
+    },
+    /// Pending metadata was dropped, or refused a place, to keep the pending
+    /// budget's per-peer and node-wide bounds (`bpv1-11`).
+    MetaPendingDropped {
         /// Block hash.
         block_id: block::Hash,
     },
@@ -1661,19 +1681,14 @@ impl BlockTable {
             reject_also(step, block_id, &also_from);
             return;
         }
-        // Bound admitting + pending count and bytes BEFORE queueing
-        // headerchain admission so floods cannot bypass pending caps in-flight.
-        let inflight_bytes: usize = self
-            .admitting
-            .values()
-            .map(|e| e.envelope.estimated_bytes())
-            .sum();
-        if self.admitting.len().saturating_add(self.pending.len()) >= MAX_PENDING_META_COUNT
+        // Bound admitting count and bytes before queueing headerchain
+        // admission. Pending metadata has its own budget, so headers with
+        // unknown parents never take space from viable metadata (bpv1-75).
+        if self.admitting.len() >= MAX_ADMITTING_META_COUNT
             || self
-                .pending_bytes
-                .saturating_add(inflight_bytes)
+                .admitting_bytes()
                 .saturating_add(envelope.estimated_bytes())
-                > MAX_PENDING_META_BYTES
+                > MAX_ADMITTING_META_BYTES
         {
             reject_meta(step, block_id, from_peer, session_gen);
             reject_also(step, block_id, &also_from);
@@ -1757,12 +1772,7 @@ impl BlockTable {
                     .admitting
                     .remove(&block_id)
                     .expect("admitting entry verified present");
-                // bpv1-11: `handle_meta_received` counted this entry against the
-                // pending caps while it was admitting, so moving it cannot exceed them.
-                self.pending_bytes = self
-                    .pending_bytes
-                    .saturating_add(entry.envelope.estimated_bytes());
-                self.pending.insert(
+                self.insert_pending(
                     block_id,
                     PendingMetaEntry {
                         envelope: entry.envelope,
@@ -1773,6 +1783,7 @@ impl BlockTable {
                         parent_hash,
                         received_at: now,
                     },
+                    step,
                 );
             }
             HeaderAdmissionResult::PeerInvalid => {
@@ -1780,12 +1791,17 @@ impl BlockTable {
                     .admitting
                     .remove(&block_id)
                     .expect("admitting entry verified present");
-                step.outputs.push(BlockOutput::ClosePeer {
-                    peer: entry.from_peer,
-                    session_gen: entry.session_gen,
-                    row: Bpv1CloseRow::Row3InvalidHeader,
-                });
-                reject_also(step, block_id, &entry.also_from);
+                // `block_id` is the hash of the header bytes, so every session
+                // in `also_from` sent this same invalid header.
+                for (peer, session_gen) in
+                    std::iter::once((entry.from_peer, entry.session_gen)).chain(entry.also_from)
+                {
+                    step.outputs.push(BlockOutput::ClosePeer {
+                        peer,
+                        session_gen,
+                        row: Bpv1CloseRow::Row3InvalidHeader,
+                    });
+                }
             }
             HeaderAdmissionResult::LocalError => {
                 if let Some(removed) = self.admitting.remove(&block_id) {
@@ -1793,6 +1809,93 @@ impl BlockTable {
                     reject_also(step, block_id, &removed.also_from);
                 }
             }
+        }
+    }
+
+    /// Bytes held in metadata in header admission or the commitment check.
+    fn admitting_bytes(&self) -> usize {
+        self.admitting
+            .values()
+            .map(|e| e.envelope.estimated_bytes())
+            .sum()
+    }
+
+    /// Pending entries and bytes that `peer` holds.
+    fn pending_held_by(&self, peer: NodeId) -> (usize, usize) {
+        self.pending
+            .values()
+            .filter(|e| e.from_peer == peer)
+            .fold((0, 0), |(count, bytes), e| {
+                (count + 1, bytes + e.envelope.estimated_bytes())
+            })
+    }
+
+    /// Parks metadata whose parent header is unknown (`bpv1-11`).
+    ///
+    /// A peer keeps at most [`MAX_PENDING_META_PER_PEER`] entries waiting. When
+    /// the node-wide budget is full, the peer holding the most pending entries,
+    /// then bytes, loses its oldest entry; if no other peer holds more than the
+    /// sender would, the new entry is refused instead. So a peer flooding
+    /// headers with unknown parents displaces only its own entries, and every
+    /// dropped entry falls back to header sync and block sync.
+    fn insert_pending(
+        &mut self,
+        block_id: block::Hash,
+        entry: PendingMetaEntry,
+        step: &mut BlockStep,
+    ) {
+        let bytes = entry.envelope.estimated_bytes();
+        let (held, _) = self.pending_held_by(entry.from_peer);
+        let mut admit = held < MAX_PENDING_META_PER_PEER;
+        while admit
+            && (self.pending.len() >= MAX_PENDING_META_COUNT
+                || self.pending_bytes.saturating_add(bytes) > MAX_PENDING_META_BYTES)
+        {
+            let (own_count, own_bytes) = self.pending_held_by(entry.from_peer);
+            let after_insert = (own_count + 1, own_bytes.saturating_add(bytes));
+            let heaviest = self
+                .pending
+                .values()
+                .map(|e| e.from_peer)
+                .filter(|&peer| peer != entry.from_peer)
+                .map(|peer| (self.pending_held_by(peer), peer))
+                .max();
+            match heaviest {
+                Some((weight, peer)) if weight > after_insert => {
+                    let oldest = self
+                        .pending
+                        .iter()
+                        .filter(|(_, e)| e.from_peer == peer)
+                        .min_by_key(|(id, e)| (e.received_at, id.0))
+                        .map(|(id, _)| *id)
+                        .expect("the heaviest peer holds at least one pending entry");
+                    self.drop_pending(oldest, step);
+                }
+                _ => admit = false,
+            }
+        }
+        if !admit {
+            step.events
+                .push(BlockEvent::MetaPendingDropped { block_id });
+            reject_meta(step, block_id, entry.from_peer, entry.session_gen);
+            reject_also(step, block_id, &entry.also_from);
+            return;
+        }
+        self.pending_bytes = self.pending_bytes.saturating_add(bytes);
+        self.pending.insert(block_id, entry);
+    }
+
+    /// Drops a pending entry for the pending budget and rejects it for each
+    /// session that sent it.
+    fn drop_pending(&mut self, block_id: block::Hash, step: &mut BlockStep) {
+        if let Some(entry) = self.pending.remove(&block_id) {
+            self.pending_bytes = self
+                .pending_bytes
+                .saturating_sub(entry.envelope.estimated_bytes());
+            step.events
+                .push(BlockEvent::MetaPendingDropped { block_id });
+            reject_meta(step, block_id, entry.from_peer, entry.session_gen);
+            reject_also(step, block_id, &entry.also_from);
         }
     }
 

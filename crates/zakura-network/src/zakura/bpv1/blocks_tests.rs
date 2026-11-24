@@ -2,6 +2,7 @@
 //! level-5 named scenarios, tool-4 deterministic
 //! `MachineMesh` (up to 16 nodes), tool-6 adversaries, and tool-9 scripted paths.
 
+use super::close::Bpv1CloseRow;
 use std::time::Duration;
 
 use proptest::prelude::*;
@@ -10,6 +11,7 @@ use zakura_chain::{
         self, genesis::regtest_genesis_block, merkle::AuthDataRoot,
         ChainHistoryBlockTxAuthCommitmentHash, ChainHistoryMmrRootHash, Height,
     },
+    parameters::NetworkUpgrade,
     serialization::ZcashSerialize,
     transaction::Transaction,
 };
@@ -321,6 +323,201 @@ fn scenario_missing_parent_then_parent_arrives_defers_commitment() {
         .events
         .contains(&BlockEvent::BlockAdmitted { block_id: child }));
     assert_eq!(table.block_phase(&child), Some(BlockPhase::Collecting));
+    table.assert_invariants();
+}
+
+/// Sends `block_id`'s metadata from `peer` and answers its header admission
+/// with a missing parent.
+fn park_unknown_parent(
+    table: &mut BlockTable,
+    now: Instant,
+    peer: NodeId,
+    block_id: block::Hash,
+) -> BlockStep {
+    let coding = Profile::TINY.derive_coding(64, 2).unwrap();
+    let received = table.step(
+        now,
+        BlockInput::MetaReceived {
+            envelope: make_envelope(block_id, coding, [0xAA; 32], peer),
+            from_peer: peer,
+            session_gen: 1,
+        },
+    );
+    let parked = header_result(
+        table,
+        now,
+        &received,
+        HeaderAdmissionResult::MissingParent {
+            parent_hash: block::Hash([0xEE; 32]),
+        },
+    );
+    table.assert_invariants();
+    parked
+}
+
+/// A made-up header with an unknown parent costs its sender only bytes, so
+/// waiting metadata is bounded per peer and per node (bpv1-11), and it never
+/// costs viable metadata its place (bpv1-75). Here sixteen peers fill the
+/// node-wide pending budget with unknown parents, and a new peer still gets
+/// both a viable block admitted and its own missing-parent entry parked.
+#[test]
+fn bpv1_75_headers_with_unknown_parents_never_refuse_viable_metadata() {
+    let now = Instant::now();
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let fake = |peer: u8, i: u8| {
+        block::Hash([
+            peer, i, 0xF1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0,
+        ])
+    };
+
+    // One peer keeps at most its share waiting; the rest are refused neutrally.
+    let flooder = node_id(100);
+    for i in 0..10 {
+        let step = park_unknown_parent(&mut table, now, flooder, fake(100, i));
+        let refused = !rejected_sessions(&step, fake(100, i)).is_empty();
+        assert_eq!(refused, usize::from(i) >= MAX_PENDING_META_PER_PEER);
+        assert!(!step
+            .outputs
+            .iter()
+            .any(|o| matches!(o, BlockOutput::ClosePeer { .. })));
+    }
+    assert_eq!(table.pending_meta_len(), MAX_PENDING_META_PER_PEER);
+
+    // More flooders fill the node-wide pending budget.
+    let flooders = (MAX_PENDING_META_COUNT / MAX_PENDING_META_PER_PEER) as u8;
+    for peer in 101..100 + flooders {
+        for i in 0..MAX_PENDING_META_PER_PEER as u8 {
+            park_unknown_parent(&mut table, now, node_id(peer), fake(peer, i));
+        }
+    }
+    assert_eq!(table.pending_meta_len(), MAX_PENDING_META_COUNT);
+
+    // An honest peer's viable metadata is admitted despite the full budget.
+    let honest = node_id(7);
+    let coding = Profile::TINY.derive_coding(64, 2).unwrap();
+    let viable = block::Hash([0x77; 32]);
+    let received = table.step(
+        now,
+        BlockInput::MetaReceived {
+            envelope: make_envelope(viable, coding, [0xAA; 32], honest),
+            from_peer: honest,
+            session_gen: 1,
+        },
+    );
+    let admitted = header_result(
+        &mut table,
+        now,
+        &received,
+        HeaderAdmissionResult::Admitted { height: 11 },
+    );
+    let committed = commitment_ok(&mut table, now, &admitted);
+    assert!(committed
+        .events
+        .contains(&BlockEvent::BlockAdmitted { block_id: viable }));
+
+    // Its own missing-parent entry takes the place of a flooder's oldest.
+    let honest_wait = block::Hash([0x78; 32]);
+    let parked = park_unknown_parent(&mut table, now, honest, honest_wait);
+    assert!(rejected_sessions(&parked, honest_wait).is_empty());
+    assert_eq!(table.pending_meta_len(), MAX_PENDING_META_COUNT);
+    let evicted: Vec<_> = parked
+        .outputs
+        .iter()
+        .filter_map(|o| match o {
+            BlockOutput::MetaRejected { peer, .. } => Some(*peer),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(evicted.len(), 1);
+    assert_ne!(evicted[0], honest);
+    table.assert_invariants();
+}
+
+/// Returns the sessions the step closed with `row`.
+fn closed_sessions(step: &BlockStep, row: Bpv1CloseRow) -> Vec<(NodeId, u64)> {
+    let mut closed: Vec<(NodeId, u64)> = step
+        .outputs
+        .iter()
+        .filter_map(|o| match o {
+            BlockOutput::ClosePeer {
+                peer,
+                session_gen,
+                row: r,
+            } if *r == row => Some((*peer, *session_gen)),
+            _ => None,
+        })
+        .collect();
+    closed.sort();
+    closed
+}
+
+/// A header that headerchain rejects as the sender's fault closes every
+/// session that sent it, also after it waited for its parent: the block id
+/// hashes the header bytes, so each sent the same invalid header.
+#[test]
+fn invalid_header_closes_every_session_that_sent_it() {
+    let now = Instant::now();
+    let coding = Profile::TINY.derive_coding(64, 2).unwrap();
+    let first = (node_id(2), 1);
+    let second = (node_id(3), 7);
+    let mut both = vec![first, second];
+    both.sort();
+    let send_twice = |table: &mut BlockTable, block_id| {
+        let s = receive(
+            table,
+            now,
+            make_envelope(block_id, coding, [0xAA; 32], node_id(1)),
+        );
+        table.step(
+            now,
+            BlockInput::MetaReceived {
+                envelope: make_envelope(block_id, coding, [0xAA; 32], node_id(1)),
+                from_peer: second.0,
+                session_gen: second.1,
+            },
+        );
+        s
+    };
+
+    // Known parent: admission refuses the header at once.
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let direct = block::Hash([0x31; 32]);
+    let s = send_twice(&mut table, direct);
+    let refused = header_result(&mut table, now, &s, HeaderAdmissionResult::PeerInvalid);
+    assert_eq!(
+        closed_sessions(&refused, Bpv1CloseRow::Row3InvalidHeader),
+        both
+    );
+    table.assert_invariants();
+
+    // Unknown parent: the header waits, its parent arrives, and admission
+    // then refuses it.
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let parent = block::Hash([0x30; 32]);
+    let parked = block::Hash([0x32; 32]);
+    let s = send_twice(&mut table, parked);
+    header_result(
+        &mut table,
+        now,
+        &s,
+        HeaderAdmissionResult::MissingParent {
+            parent_hash: parent,
+        },
+    );
+    let woken = table.step(
+        now,
+        BlockInput::ParentAdmitted {
+            hash: parent,
+            height: 10,
+        },
+    );
+    let refused = header_result(&mut table, now, &woken, HeaderAdmissionResult::PeerInvalid);
+    assert_eq!(
+        closed_sessions(&refused, Bpv1CloseRow::Row3InvalidHeader),
+        both
+    );
+    assert_eq!(table.pending_meta_len(), 0);
     table.assert_invariants();
 }
 
@@ -775,6 +972,63 @@ fn scenario_proposer_reuse_recompute_entry_filter_solve_and_disconnect() {
     }
 }
 
+/// A pool that keeps the commitment but rebuilds the coinbase as v5 gets no
+/// BPv1 publication. Receivers require a v6 coinbase and close the sender of
+/// any other version (decision-9), so the block goes out through existing
+/// relay instead.
+#[test]
+fn proposer_does_not_publish_a_v5_coinbase_that_receivers_refuse() {
+    let config = ProposerConfig::new([0x11; 32], node_id(1));
+    let body = vec![0xAA; 128];
+    let body_identity = compute_body_identity(2, &body);
+    let (mut proposer, commitment) = encoded_proposer(config, &Profile::TINY, &body, [0; 32]);
+    let peers = [node_id(2), node_id(3)];
+    let mut paths = PeerPaths::new();
+    for peer in peers {
+        paths.observe(
+            peer,
+            PathEstimate {
+                min_rtt: Some(Duration::from_millis(20)),
+                rate_in: None,
+                rate_out: Some(10_000_000),
+            },
+        );
+    }
+
+    let Transaction::V6 {
+        lock_time,
+        expiry_height,
+        inputs,
+        outputs,
+        ..
+    } = commit_coinbase(commitment.commitment_hash)
+    else {
+        unreachable!("commit_coinbase builds a v6 coinbase");
+    };
+    let v5 = Transaction::V5 {
+        network_upgrade: NetworkUpgrade::Nu7,
+        lock_time,
+        expiry_height,
+        inputs,
+        outputs,
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+    };
+    let solved = proposer.step(ProposerInput::Solved {
+        block_id: block::Hash([0xCC; 32]),
+        height: 100,
+        header_bytes: solved_header(&v5, commitment.light_client_root),
+        coinbase_bytes: v5.zcash_serialize_to_vec().unwrap(),
+        txid_siblings: Vec::new(),
+        auth_siblings: Vec::new(),
+        body_identity,
+        peers: peers.to_vec(),
+        paths: Box::new(paths),
+    });
+    assert!(solved.outputs.is_empty(), "a v5 coinbase publishes nothing");
+    assert!(solved.events.is_empty());
+}
+
 #[test]
 fn tool4_sixteen_node_mesh_seeded_pull_converges_with_adversary_and_wrong_estimate() {
     // 16 nodes:
@@ -1004,6 +1258,58 @@ fn bpv1_57_partial_progress_falls_back_once_at_the_unmoved_deadline() {
         .block_events
         .iter()
         .any(|(_, e)| matches!(e, BlockEvent::PartInserted { .. })));
+}
+
+/// bpv1-28 budgets pulls, so it binds only a block that still pulls. A part
+/// that arrives while a stripe decodes is kept, and the reconstruction
+/// deadline then ends the decode. The block in `Fallback` keeps its verified
+/// parts to serve and pulls nothing, so it may hold more than `k` (#2714).
+#[test]
+fn bpv1_28_pull_budget_binds_only_a_collecting_block() {
+    let now = Instant::now();
+    let encoded = encode_body(&Profile::TINY, &[0x5A; 128], 2).unwrap();
+    let k = encoded.coding.k as usize;
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let block_id = block::Hash([0x27; 32]);
+    admit(&mut table, now, block_id, encoded.coding, encoded.part_root);
+    // `k - 1` source parts and one parity part start a decode.
+    let mut parts: Vec<_> = encoded.parts[..k - 1].to_vec();
+    parts.push(encoded.parts[k].clone());
+    let mut decode = None;
+    for part in &parts {
+        for o in insert(
+            &mut table,
+            now,
+            block_id,
+            part,
+            node_id(2),
+            PartAuth::Want(1),
+        )
+        .outputs
+        {
+            if let BlockOutput::StartStripeJob {
+                work_id,
+                kind: StripeJob::Decode,
+                ..
+            } = o
+            {
+                decode = Some(work_id);
+            }
+        }
+    }
+    assert!(decode.is_some(), "a parity part starts a decode");
+    insert(
+        &mut table,
+        now,
+        block_id,
+        &encoded.parts[k + 1],
+        node_id(3),
+        PartAuth::Want(1),
+    );
+    table.assert_invariants();
+    tick(&mut table, now + RECONSTRUCTION_DEADLINE, &[]);
+    assert_eq!(table.block_phase(&block_id), Some(BlockPhase::Fallback));
+    table.assert_invariants();
 }
 
 /// An empty body has no parts, so admission hands the block to the verifier
@@ -1979,7 +2285,7 @@ fn fix6_rejected_metadata_leaves_no_state_and_arrival_lives_in_the_entry() {
         }));
         table.assert_invariants();
     }
-    assert!(admissions.len() <= MAX_PENDING_META_COUNT);
+    assert!(admissions.len() <= MAX_ADMITTING_META_COUNT);
     for work_id in admissions {
         table.step(
             t0,

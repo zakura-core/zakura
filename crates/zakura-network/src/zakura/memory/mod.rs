@@ -38,8 +38,9 @@ pub use draft::{derive_p2p_budget, BudgetDerivation};
 pub use plan::{
     derived_read_result_byte_limit, inbound_sessions_share, BudgetTooSmall, ConnectionSessionCost,
     FixedTerms, MemoryPlan, MemoryPlanError, OverrideWarning, ReactorBase, SessionBases,
-    SessionDirections, DEFAULT_MEMPOOL_TX_COST_LIMIT_BYTES, DEFAULT_STATE_READ_PARSER_BYTES,
-    DISCOVERY_TABLES_FIXED_BYTES, PROPAGATION_RESERVE_BYTES, TX_RELAY_MAPS_FIXED_BYTES,
+    SessionDirections, SessionSide, DEFAULT_MEMPOOL_TX_COST_LIMIT_BYTES,
+    DEFAULT_STATE_READ_PARSER_BYTES, DISCOVERY_TABLES_FIXED_BYTES, PROPAGATION_RESERVE_BYTES,
+    TX_RELAY_MAPS_FIXED_BYTES,
 };
 pub use pool::{
     ConsumerSnapshot, LeaseDenied, MemoryPool, MemoryPoolMachine, OverrunReport, PoolLease,

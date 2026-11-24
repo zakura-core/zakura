@@ -386,70 +386,97 @@ pub const fn inbound_sessions_share(sessions_share: u64) -> u64 {
     sessions_share - sessions_share / 4
 }
 
-/// Bytes `Consumer::Sessions` has leased, by the direction of the connection
-/// that holds them (`02 §8` rule 1).
+/// The part of `Consumer::Sessions`' protected share a connection leases
+/// from (`02 §8` rule 1): its direction, or the places held for preferred
+/// gateways.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionSide {
+    /// A connection the remote peer dialed.
+    Inbound,
+    /// A connection this node dialed.
+    Outbound,
+    /// A connection to a preferred mining gateway, in either direction.
+    Gateway,
+}
+
+impl SessionSide {
+    /// The side of a connection in `direction`, to a preferred gateway when
+    /// `gateway` is set.
+    pub const fn new(direction: ServicePeerDirection, gateway: bool) -> Self {
+        match (gateway, direction) {
+            (true, _) => Self::Gateway,
+            (false, ServicePeerDirection::Inbound) => Self::Inbound,
+            (false, ServicePeerDirection::Outbound) => Self::Outbound,
+        }
+    }
+}
+
+/// Bytes `Consumer::Sessions` has leased, by the [`SessionSide`] of the
+/// connection that holds them (`02 §8` rule 1).
+///
+/// It mirrors the connection-slot checks. Ordinary connections leave
+/// [`Self::gateway_reserve`] bytes free for the places held for preferred
+/// gateways, and inbound ones also leave a quarter of the rest for dials. A
+/// gateway may lease anything left in the share.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SessionDirections {
-    /// Bytes leased for connections the remote peer dialed.
+    /// Bytes leased for ordinary connections the remote peer dialed.
     pub inbound: u64,
-    /// Bytes leased for connections this node dialed.
+    /// Bytes leased for ordinary connections this node dialed.
     pub outbound: u64,
+    /// Bytes leased for connections to preferred gateways.
+    pub gateways: u64,
+    /// Bytes that ordinary connections leave for the held gateway places
+    /// ([`MemoryPlan::gateway_reserve`]).
+    pub gateway_reserve: u64,
 }
 
 impl SessionDirections {
-    /// Whether a connection in `direction` may lease `cost` more bytes of
+    /// Whether a connection on `side` may lease `cost` more bytes of
     /// `sessions_share`, the sessions consumer's protected share.
     ///
-    /// Both directions stay within the share (`02 §5` rule 4). Inbound
-    /// connections also stop at [`inbound_sessions_share`], so inbound peers
+    /// Every side stays within the share (`02 §5` rule 4). Ordinary
+    /// connections also stop short of the gateway reserve, and inbound ones
+    /// at [`inbound_sessions_share`] of what that leaves, so inbound peers
     /// can't take the dial reserve.
-    pub const fn admits(
-        &self,
-        direction: ServicePeerDirection,
-        cost: u64,
-        sessions_share: u64,
-    ) -> bool {
-        let total = self
-            .inbound
-            .saturating_add(self.outbound)
-            .saturating_add(cost);
-        if total > sessions_share {
+    pub const fn admits(&self, side: SessionSide, cost: u64, sessions_share: u64) -> bool {
+        let ordinary = self.inbound.saturating_add(self.outbound);
+        if ordinary.saturating_add(self.gateways).saturating_add(cost) > sessions_share {
             return false;
         }
-        match direction {
-            ServicePeerDirection::Inbound => {
-                self.inbound.saturating_add(cost) <= inbound_sessions_share(sessions_share)
+        let ordinary_share = sessions_share.saturating_sub(self.gateway_reserve);
+        match side {
+            SessionSide::Gateway => true,
+            SessionSide::Outbound => ordinary.saturating_add(cost) <= ordinary_share,
+            SessionSide::Inbound => {
+                ordinary.saturating_add(cost) <= ordinary_share
+                    && self.inbound.saturating_add(cost) <= inbound_sessions_share(ordinary_share)
             }
-            ServicePeerDirection::Outbound => true,
         }
     }
 
-    /// Record `cost` bytes leased in `direction` if [`Self::admits`] allows them.
-    pub fn try_charge(
-        &mut self,
-        direction: ServicePeerDirection,
-        cost: u64,
-        sessions_share: u64,
-    ) -> bool {
-        if !self.admits(direction, cost, sessions_share) {
+    /// Record `cost` bytes leased on `side` if [`Self::admits`] allows them.
+    pub fn try_charge(&mut self, side: SessionSide, cost: u64, sessions_share: u64) -> bool {
+        if !self.admits(side, cost, sessions_share) {
             return false;
         }
-        let held = self.direction_mut(direction);
+        let held = self.side_mut(side);
         *held = held.saturating_add(cost);
         true
     }
 
-    /// Return `cost` bytes that a connection in `direction` released.
-    pub fn release(&mut self, direction: ServicePeerDirection, cost: u64) {
-        let held = self.direction_mut(direction);
+    /// Return `cost` bytes that a connection on `side` released.
+    pub fn release(&mut self, side: SessionSide, cost: u64) {
+        let held = self.side_mut(side);
         debug_assert!(*held >= cost, "a connection releases only bytes it charged");
         *held = held.saturating_sub(cost);
     }
 
-    fn direction_mut(&mut self, direction: ServicePeerDirection) -> &mut u64 {
-        match direction {
-            ServicePeerDirection::Inbound => &mut self.inbound,
-            ServicePeerDirection::Outbound => &mut self.outbound,
+    fn side_mut(&mut self, side: SessionSide) -> &mut u64 {
+        match side {
+            SessionSide::Inbound => &mut self.inbound,
+            SessionSide::Outbound => &mut self.outbound,
+            SessionSide::Gateway => &mut self.gateways,
         }
     }
 }
@@ -784,6 +811,17 @@ impl MemoryPlan {
         limits
     }
 
+    /// Bytes of the sessions share that ordinary connections leave for
+    /// `hold` places held for preferred gateways: one full connection each,
+    /// but never so much that the share funds fewer than `min_connections`
+    /// ordinary ones.
+    pub fn gateway_reserve(&self, hold: usize) -> u64 {
+        let floor = self.consumer_spec(Consumer::Sessions).floor;
+        (hold as u64)
+            .saturating_mul(self.bases.full_connection_bytes())
+            .min(self.sessions_share.saturating_sub(floor))
+    }
+
     /// Construct a live [`MemoryPool`] sized from this plan.
     pub fn build_pool(&self) -> MemoryPool {
         MemoryPool::new(self.pool_config)
@@ -885,6 +923,9 @@ impl PlanTerms {
         let bootstrap_peers =
             remote_bootstrap_peer_count(&config.zakura.bootstrap_peers, local_node_id);
         let min_connections = min_budgeted_connections(bootstrap_peers).min(connection_cap);
+        // Preferred gateways connect above `N_cap`, so the caps that scale
+        // with connections count their held places too.
+        let admitted_cap = connection_cap.saturating_add(super::super::MAX_PREFERRED_GATEWAYS);
 
         let bound_sockets = config.zakura.bound_socket_count();
         let handshakes_count =
@@ -992,7 +1033,7 @@ impl PlanTerms {
             .map_or(default_look_ahead, ByteSize::bytes)
             .max(floor_block_sync);
         let block_sync_inflight_cap =
-            (connection_cap as u64).saturating_mul(config.zakura.block_sync.bbr_max_cwnd_bytes);
+            (admitted_cap as u64).saturating_mul(config.zakura.block_sync.bbr_max_cwnd_bytes);
         let cap_block_sync = block_sync_inflight_cap.saturating_add(look_ahead_cap);
 
         let floor_serving = LARGEST_SERVED_BLOCK_RESPONSE_BYTES;
@@ -1003,7 +1044,7 @@ impl PlanTerms {
             .serving_per_peer
             .map_or(default_serving_per_peer, ByteSize::bytes)
             .max(floor_serving);
-        let cap_serving = (connection_cap as u64).saturating_mul(serving_per_peer_cap);
+        let cap_serving = (admitted_cap as u64).saturating_mul(serving_per_peer_cap);
 
         // The floor funds `min_connections` connections that each run every
         // reactor, because admission funds every reactor a peer supports
@@ -1013,10 +1054,10 @@ impl PlanTerms {
         // Receive parts follow negotiation, so every connection may hold
         // them. Session parts follow each reactor's sessions.
         let cap_sessions = bases.entries().into_iter().fold(
-            (connection_cap as u64).saturating_mul(bases.transport_base),
+            (admitted_cap as u64).saturating_mul(bases.transport_base),
             |cap, (_, capability, base)| {
-                let sessions = reactor_session_cap(config, capability, connection_cap) as u64;
-                cap.saturating_add((connection_cap as u64).saturating_mul(base.receive))
+                let sessions = reactor_session_cap(config, capability, admitted_cap) as u64;
+                cap.saturating_add((admitted_cap as u64).saturating_mul(base.receive))
                     .saturating_add(sessions.saturating_mul(base.session))
             },
         );
@@ -1037,7 +1078,7 @@ impl PlanTerms {
         for (consumer, floor, cap) in [
             (
                 Consumer::Control,
-                discovery_serving_output_bytes(connection_cap),
+                discovery_serving_output_bytes(admitted_cap),
                 0,
             ),
             (Consumer::Propagation, reserve_propagation, 0),
@@ -1591,22 +1632,71 @@ mod tests {
     fn session_directions_keep_the_dial_reserve() {
         let share = 400;
         let mut directions = SessionDirections::default();
-        assert!(directions.try_charge(ServicePeerDirection::Inbound, 300, share));
-        assert!(!directions.try_charge(ServicePeerDirection::Inbound, 1, share));
-        assert!(directions.try_charge(ServicePeerDirection::Outbound, 100, share));
-        assert!(!directions.try_charge(ServicePeerDirection::Outbound, 1, share));
+        assert!(directions.try_charge(SessionSide::Inbound, 300, share));
+        assert!(!directions.try_charge(SessionSide::Inbound, 1, share));
+        assert!(directions.try_charge(SessionSide::Outbound, 100, share));
+        assert!(!directions.try_charge(SessionSide::Outbound, 1, share));
         assert_eq!(directions.inbound + directions.outbound, share);
 
-        directions.release(ServicePeerDirection::Inbound, 300);
+        directions.release(SessionSide::Inbound, 300);
         // Outbound connections may use the inbound part too.
-        assert!(directions.try_charge(ServicePeerDirection::Outbound, 300, share));
-        assert!(!directions.try_charge(ServicePeerDirection::Inbound, 1, share));
+        assert!(directions.try_charge(SessionSide::Outbound, 300, share));
+        assert!(!directions.try_charge(SessionSide::Inbound, 1, share));
         assert_eq!(
             directions,
             SessionDirections {
-                inbound: 0,
-                outbound: 400
+                outbound: 400,
+                ..SessionDirections::default()
             }
+        );
+    }
+
+    /// Ordinary connections leave the gateway reserve free, as ordinary
+    /// slots leave the held places, and inbound ones keep their quarter for
+    /// dials out of what remains. A gateway may lease all that is left in
+    /// the share, in either direction.
+    #[test]
+    fn session_directions_keep_the_gateway_reserve() {
+        let share = 400;
+        let mut directions = SessionDirections {
+            gateway_reserve: 200,
+            ..SessionDirections::default()
+        };
+        assert!(directions.try_charge(SessionSide::Inbound, 150, share));
+        assert!(!directions.try_charge(SessionSide::Inbound, 1, share));
+        assert!(directions.try_charge(SessionSide::Outbound, 50, share));
+        assert!(!directions.try_charge(SessionSide::Outbound, 1, share));
+        assert!(directions.try_charge(SessionSide::Gateway, 200, share));
+        assert!(!directions.try_charge(SessionSide::Gateway, 1, share));
+
+        // A smaller hold frees its reserve to ordinary connections, but the
+        // gateways already admitted keep their bytes.
+        directions.gateway_reserve = 0;
+        assert!(!directions.try_charge(SessionSide::Outbound, 1, share));
+        directions.release(SessionSide::Gateway, 200);
+        assert!(directions.try_charge(SessionSide::Outbound, 200, share));
+    }
+
+    /// The reserve funds one full connection per held place, but never
+    /// takes the floor that funds `min_connections` ordinary connections.
+    #[test]
+    fn the_gateway_reserve_keeps_the_sessions_floor() {
+        let config = zakura_cfg(&Network::Mainnet);
+        for budget in [8 * GIB, 16 * GIB, 64 * GIB] {
+            let plan = MemoryPlan::size(budget, &config, &Network::Mainnet).expect("fits");
+            let floor = plan.consumer_spec(Consumer::Sessions).floor;
+            let full = plan.bases.full_connection_bytes();
+            assert_eq!(plan.gateway_reserve(0), 0);
+            for hold in 1..=crate::zakura::MAX_PREFERRED_GATEWAYS {
+                let reserve = plan.gateway_reserve(hold);
+                assert!(reserve <= hold as u64 * full, "{budget}");
+                assert!(plan.sessions_share - reserve >= floor, "{budget}");
+            }
+        }
+        let plan = MemoryPlan::size(64 * GIB, &config, &Network::Mainnet).expect("fits");
+        assert_eq!(
+            plan.gateway_reserve(crate::zakura::MAX_PREFERRED_GATEWAYS),
+            crate::zakura::MAX_PREFERRED_GATEWAYS as u64 * plan.bases.full_connection_bytes()
         );
     }
 

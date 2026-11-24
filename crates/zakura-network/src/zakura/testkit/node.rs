@@ -121,6 +121,7 @@ impl ZakuraTestNode {
             self.discovery.clone(),
             self.limits.clone(),
             Vec::new(),
+            None,
         ))
     }
 
@@ -539,9 +540,9 @@ impl ZakuraTestNodeBuilder {
                 best_header_tip,
                 self.header_sync_config
                     .clone()
-                    .for_node_connections(self.limits.max_connections),
+                    .for_node_connections(self.limits.total_connections()),
                 self.limits.max_frame_bytes,
-                self.limits.max_connections,
+                self.limits.total_connections(),
             );
             if let Some(request_timeout) = self.header_sync_request_timeout {
                 startup.request_timeout = request_timeout;
@@ -643,12 +644,12 @@ impl ZakuraTestNodeBuilder {
                 header_sync.clone(),
                 block_sync_handle.clone(),
                 ZakuraTrace::new(self.tracer.clone(), seed_label(self.seed)),
-                self.limits.max_connections,
+                self.limits.total_connections(),
             ))
         } else {
             Arc::new(DiscoveryService::with_max_connections(
                 discovery.clone(),
-                self.limits.max_connections,
+                self.limits.total_connections(),
             ))
         };
         let registry = service_registry(

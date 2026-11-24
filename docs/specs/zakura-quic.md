@@ -599,7 +599,7 @@ is today's Zakura logic.
   every node the per-IP cap allows behind one address can redial once a
   second. It keeps one ledger for validated sources and one for unvalidated
   sources, each bounded at `max_connections + max_pending_handshakes`
-  addresses (124 at the defaults). A ledger drops only full buckets, so
+  addresses (134 at the defaults). A ledger drops only full buckets, so
   address churn can't erase debt. When the source's bucket is empty, or its
   ledger is full without it, the acceptor returns `Retry` for an unvalidated
   source and `Refuse` for a validated one. A spoofed Initial is never
@@ -720,14 +720,15 @@ is today's Zakura logic.
     peer forever. Without these, a full transport with free connection slots
     made the dialer spin.
 
-  Zakura sets `max_connections` to its admitted-connection ceiling plus
-  `max_pending_handshakes`: 256 + 32 = 288 when `[network.zakura]
+  Zakura sets `max_connections` to its admitted-connection ceiling, the
+  ordinary cap plus ten places held for preferred gateways, plus
+  `max_pending_handshakes`: 256 + 10 + 32 = 298 when `[network.zakura]
   max_connections` is unset (CTRL-26). The pool's `Sessions` consumer
-  decides how many of those connections memory funds. It
-  sets `max_inbound_connections` to its inbound connection and handshake shares
-  (ADM-3) together. It sets `dial_reserve` to the slots inbound can't
-  hold, capped at one discovery record's 8 addresses and at least one slot:
-  8 at the defaults. With inbound full, discovery's ceiling leaves it
+  decides how many of those connections memory funds. It sets
+  `max_inbound_connections` to its inbound connection and handshake shares
+  plus the gateway places (ADM-3). It sets `dial_reserve` to the slots
+  inbound can't hold, capped at one discovery record's 8 addresses and at
+  least one slot: 8 at the defaults. With inbound full, discovery's ceiling leaves it
   the whole outbound share, and the reserve still fits one maintained
   dial of a full record. That holds whenever the handshake reserve is at
   least 8, so from 32 pending handshakes up. Below that the reserve keeps its
@@ -934,6 +935,12 @@ and the error names `[memory] budget`, which replaces it.
     and its early records. BPv1 adds 22.9 MiB to a full connection, so a
     16 GiB Mainnet host funds 33 full connections, not 63, and the smallest
     Mainnet host grows from about 12.8 GiB to about 13.4 GiB.
+  - **Preferred gateways.** A mining node holds up to ten connection places
+    above `max_connections` for the mining gateways it ranks highest. While
+    places are held, ordinary connections leave one full connection's bases
+    of the `Sessions` share free for each, but never so much that the share
+    funds fewer connections than its floor. A gateway may lease anything left
+    in the share. The caps that scale with connections count the held places.
   - **Operator settings.** The node refuses to start when the plan exceeds
     `B` with every raised setting at its default. A lowered setting stays
     lowered in that check. A raised setting (`max_connections`, a reactor's

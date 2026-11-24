@@ -1358,7 +1358,7 @@ fn zakura_connection_cap_sets_the_transport_slots() {
                 bind.max_inbound_connections,
                 bind.max_closing_connections
             ),
-            (288, 8, Some(216), 576)
+            (298, 8, Some(226), 596)
         );
     }
 }

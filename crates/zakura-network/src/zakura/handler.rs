@@ -63,11 +63,11 @@ use super::trace::{reject_reason_label, ZakuraTrace};
 use super::transport::{
     check_reactor_shares, frame_wire_bytes, sim_arg, sim_chain, transport_observe,
     worker_framed_channel, AdmittedFrame, CloseOutcome, CloseRow, CompatResponseGrant,
-    ConnectionResources, FrameGate, FrameGrant, FramedWorkerRecv, HandshakeCounts, IpAdmission,
-    NeutralCause, NodeResources, OrderedStreamFailure, OrderedStreamFailureCause, OwnerBound,
-    OwnerGuard, OwnerPhase, ReactorBudget, ReactorShares, ReceiveBudget, ResourceEnvelope,
-    SessionLayout, StreamResources, TransportLimits, COMPAT_EXCHANGE_BUDGET,
-    COMPAT_RESPONSE_MAX_AGGREGATE_BYTES,
+    ConnectionPlaces, ConnectionResources, FrameGate, FrameGrant, FramedWorkerRecv,
+    HandshakeCounts, HeldPlaces, IpAdmission, NeutralCause, NodeResources, OrderedStreamFailure,
+    OrderedStreamFailureCause, OwnerBound, OwnerGuard, OwnerPhase, ReactorBudget, ReactorShares,
+    ReceiveBudget, ResourceEnvelope, SessionLayout, SlotClass, SlotRefusal, StreamResources,
+    TransportLimits, COMPAT_EXCHANGE_BUDGET, COMPAT_RESPONSE_MAX_AGGREGATE_BYTES,
 };
 #[cfg(any(test, feature = "zakura-testkit"))]
 use crate::zakura::drive_header_sync_actions;
@@ -408,7 +408,9 @@ pub struct ZakuraConfig {
     /// The defaults reproduce the previous transport's behavior. See
     /// `docs/specs/zakura-quic.md` section 9 for every key and its range.
     pub quic: QuicConfig,
-    /// Optional total concurrent Zakura connection policy cap (`N_cap`, `02 §8`).
+    /// Optional cap on ordinary concurrent Zakura connections, inbound plus
+    /// outbound (`N_cap`, `02 §8`). Up to ten preferred gateways may connect
+    /// in addition, when `Consumer::Sessions` can fund them.
     ///
     /// When unset (`None`), defaults to `DEFAULT_SERVICE_MAX_PEERS` (256).
     /// Operators may raise or lower it; `[memory] budget` funds live sessions
@@ -738,8 +740,10 @@ fn bootstrap_peers_to_strings(peers: &[&str]) -> Vec<String> {
 pub struct ZakuraLocalLimits {
     /// Native QUIC transport settings.
     pub quic: QuicConfig,
-    /// Total concurrent Zakura connection cap.
+    /// Memory-funded cap for ordinary connections.
     pub max_connections: usize,
+    /// Additional connections the peer memory budget funds for preferred gateways.
+    pub max_preferred_connections: usize,
     /// Concurrent control handshakes cap.
     pub max_pending_handshakes: usize,
     /// Per-connection QUIC/app idle timeout.
@@ -786,6 +790,7 @@ impl ZakuraLocalLimits {
         Self {
             quic: config.zakura.quic.clone(),
             max_connections: config.zakura.effective_max_connections(),
+            max_preferred_connections: super::MAX_PREFERRED_GATEWAYS,
             max_pending_handshakes: config.zakura.max_pending_handshakes.max(1),
             quic_idle_timeout: config.zakura.quic.idle_timeout(),
             keep_alive_interval: config.zakura.quic.keep_alive_interval(),
@@ -922,7 +927,7 @@ impl ZakuraLocalLimits {
             compat_exchange_bytes,
             send_window: self.admitted_send_window_bytes,
             handshake_send_window: self.quic.send_window_bytes,
-            max_connections: self.max_connections,
+            max_connections: self.total_connections(),
             max_pending_handshakes: self.max_pending_handshakes,
         }
     }
@@ -936,11 +941,17 @@ impl ZakuraLocalLimits {
         )
     }
 
+    /// Total admitted connections for sizing transport and serving resources.
+    pub fn total_connections(&self) -> usize {
+        self.max_connections
+            .saturating_add(self.max_preferred_connections)
+    }
+
     /// The most owners that these limits allow at once.
     pub(crate) fn owner_bound(&self) -> OwnerBound {
         OwnerBound::new(
             self.max_pending_handshakes,
-            self.max_connections,
+            self.total_connections(),
             self.max_open_streams,
         )
         .expect("the node envelope refused these limits at startup if they overflow")
@@ -952,7 +963,8 @@ impl ZakuraLocalLimits {
     /// `max_pending_handshakes` more live ones, and two closing connections
     /// per live slot (see `peer_memory`). Inbound attempts may hold
     /// [`Self::max_inbound_connections`] plus [`Self::max_inbound_handshakes`]
-    /// of the live slots (93 at the defaults), counted until each connection
+    /// plus the funded gateway places
+    /// of the live slots (103 at the defaults), counted until each connection
     /// closes, so a peer that this node closes right after its TLS handshake
     /// still counts until the close finishes.
     ///
@@ -964,10 +976,11 @@ impl ZakuraLocalLimits {
     /// at least the address cap, which holds from 32 pending handshakes up.
     pub fn quic_bind_config(&self, addrs: Vec<SocketAddr>) -> QuicBindConfig {
         let max_connections = self
-            .max_connections
+            .total_connections()
             .saturating_add(self.max_pending_handshakes);
         let max_inbound_connections = self
             .max_inbound_connections()
+            .saturating_add(self.max_preferred_connections)
             .saturating_add(self.max_inbound_handshakes());
         let outbound_slots = max_connections.saturating_sub(max_inbound_connections);
         QuicBindConfig {
@@ -1459,21 +1472,97 @@ impl ZakuraEndpoint {
         self.quic.discovery_capacity()
     }
 
-    /// How many dials discovery can start now: the handler's free connection
-    /// slots. Each dial holds one slot from its start, or fails as a local
-    /// limit without one.
+    /// Select preferred gateways within this endpoint's funded extra capacity.
+    pub fn publish_gateway_ranking(&self, ranking: impl IntoIterator<Item = super::RankedGateway>) {
+        self.handler.publish_gateway_ranking(ranking);
+    }
+
+    /// The places the connection-slot checks hold for preferred gateways
+    /// now, and the gateways that fill them. Discovery keeps its ordinary
+    /// dials out of them.
+    pub(crate) fn held_places(&self) -> HeldPlaces {
+        self.handler
+            .supervisor
+            .ip_slots
+            .counts()
+            .preferred_gateways()
+            .held_places()
+    }
+
+    /// The places held for preferred mining gateways, how the connection
+    /// slots are used, and the v2 peers registered now.
+    ///
+    /// The peers are read just before the slot counts, so a connection that
+    /// registers or closes in between can show in one and not the other.
+    pub fn connection_places(&self) -> ConnectionPlaces {
+        let registered: HashSet<NodeId> = self
+            .supervisor
+            .subscribe()
+            .borrow()
+            .iter()
+            .filter_map(ZakuraPeerId::node_id)
+            .collect();
+        ConnectionPlaces::read(
+            || self.handler.supervisor.ip_slots.counts(),
+            self.handler.limits.total_connections(),
+            &registered,
+        )
+    }
+
+    /// How many dials discovery can start now: the handler's free ordinary
+    /// connection slots, which leave the places held for preferred gateways.
+    /// Each dial holds one slot from its start, or fails as a local limit
+    /// without one.
     pub(crate) fn discovery_dial_permits(&self) -> usize {
         self.handler.free_connection_slots()
     }
 
-    /// Holds `count` of the handler's connection slots, as dials to
-    /// unrelated nodes, until the returned guards drop.
+    /// How many dials to preferred gateways can start now: every free
+    /// connection slot, since a member that holds no slot takes a held
+    /// place.
+    pub(crate) fn preferred_dial_permits(&self) -> usize {
+        self.handler
+            .limits
+            .total_connections()
+            .saturating_sub(self.handler.supervisor.ip_slots.counts().connections())
+    }
+
+    /// How many address attempts dials to preferred gateways can start now:
+    /// none without a free connection slot, otherwise the room under
+    /// discovery's transport ceiling, which leaves the dial reserve to
+    /// bootstrap and maintained dials.
+    ///
+    /// With `max_pending_handshakes` below its default of 32, that ceiling
+    /// can leave fewer free attempts than places to fill while the inbound
+    /// share is not full, so some held places may stay empty until inbound
+    /// handshakes finish. The defaults leave room for all ten.
+    pub(crate) fn preferred_dial_capacity(&self) -> usize {
+        if self.preferred_dial_permits() == 0 {
+            return 0;
+        }
+        self.quic.discovery_capacity()
+    }
+
+    /// Holds an inbound slot for the authenticated peer named by a dial-round test.
     #[cfg(test)]
-    pub(crate) fn hold_connection_slots(&self, count: usize) -> Vec<ConnectionAdmissionGuard> {
+    pub(crate) fn hold_inbound_gateway(&self, node: NodeId) -> ConnectionAdmissionGuard {
+        self.handler
+            .claim_connection(node, true)
+            .expect("the test has a free inbound slot")
+    }
+
+    /// Holds `count` of the handler's connection slots, as connections with
+    /// unrelated nodes, inbound or dialed, until the returned guards drop.
+    #[cfg(test)]
+    pub(crate) fn hold_connection_slots(
+        &self,
+        count: usize,
+        inbound: bool,
+    ) -> Vec<ConnectionAdmissionGuard> {
         (0..count)
             .map(|_| {
                 self.handler
-                    .claim_connection(NodeSecretKey::generate().public(), false)
+                    .claim_connection(NodeSecretKey::generate().public(), inbound)
                     .expect("the test holds free connection slots")
             })
             .collect()
@@ -1727,6 +1816,7 @@ impl Drop for PendingHandshakeGuard {
 /// Holds one connection slot of `node` in one direction, and releases
 /// exactly that slot when it drops.
 pub(crate) struct ConnectionAdmissionGuard {
+    authenticated_dial: bool,
     slots: IpSlots,
     node: NodeId,
     inbound: bool,
@@ -1734,11 +1824,24 @@ pub(crate) struct ConnectionAdmissionGuard {
     observation: Option<HandshakeObservation>,
 }
 
+impl ConnectionAdmissionGuard {
+    /// The outbound QUIC connection has authenticated this guard's dial target.
+    fn outbound_connected(&mut self) {
+        assert!(!self.inbound && !self.authenticated_dial);
+        self.slots.counts().outbound_connected(self.node);
+        self.authenticated_dial = true;
+    }
+}
+
 impl Drop for ConnectionAdmissionGuard {
     fn drop(&mut self) {
-        self.slots
-            .counts()
-            .release_connection(self.node, self.inbound);
+        if self.authenticated_dial {
+            self.slots.counts().release_authenticated_dial(self.node);
+        } else {
+            self.slots
+                .counts()
+                .release_connection(self.node, self.inbound);
+        }
         #[cfg(any(test, zakura_sim))]
         if let Some(observation) = &self.observation {
             observation.released("connection-released", None);
@@ -2592,7 +2695,7 @@ struct SessionFunding {
     directions: Arc<zakura_rt::sync::Mutex<super::memory::SessionDirections>>,
     bases: super::memory::SessionBases,
     sessions_share: u64,
-    direction: ServicePeerDirection,
+    side: super::memory::SessionSide,
     held: zakura_rt::sync::Mutex<HeldSessionLeases>,
 }
 
@@ -2609,7 +2712,7 @@ struct HeldSessionLeases {
 
 impl SessionFunding {
     /// Fund `cost` bytes, which hold the session parts of `funded_sessions`,
-    /// for connection `conn_id` in `direction`: charge the direction ledger,
+    /// for connection `conn_id` on `side`: charge the direction ledger,
     /// then lease every base together from the pool, waiting up to
     /// `wait_timeout` for borrowed bytes to return.
     #[allow(clippy::too_many_arguments)]
@@ -2618,13 +2721,13 @@ impl SessionFunding {
         plan: &super::memory::MemoryPlan,
         directions: &Arc<zakura_rt::sync::Mutex<super::memory::SessionDirections>>,
         conn_id: ZakuraConnId,
-        direction: ServicePeerDirection,
+        side: super::memory::SessionSide,
         cost: u64,
         funded_sessions: u64,
         shutdown: &CancellationToken,
         wait_timeout: Duration,
     ) -> Result<Self, SessionFundingRefusal> {
-        if !lock_session_directions(directions).try_charge(direction, cost, plan.sessions_share) {
+        if !lock_session_directions(directions).try_charge(side, cost, plan.sessions_share) {
             return Err(SessionFundingRefusal::DirectionFull);
         }
         // From here, dropping `funding` returns the charge.
@@ -2632,7 +2735,7 @@ impl SessionFunding {
             directions: directions.clone(),
             bases: plan.bases,
             sessions_share: plan.sessions_share,
-            direction,
+            side,
             held: zakura_rt::sync::Mutex::new(HeldSessionLeases {
                 lease: pool.empty_lease(super::memory::Consumer::Sessions, Some(conn_id)),
                 funded_sessions,
@@ -2661,7 +2764,7 @@ impl SessionFunding {
             return Ok(());
         };
         if !lock_session_directions(&self.directions).try_charge(
-            self.direction,
+            self.side,
             bytes,
             self.sessions_share,
         ) {
@@ -2675,7 +2778,7 @@ impl SessionFunding {
                 Ok(())
             }
             Err(denied) => {
-                lock_session_directions(&self.directions).release(self.direction, bytes);
+                lock_session_directions(&self.directions).release(self.side, bytes);
                 Err(SessionFundingRefusal::Pool(denied))
             }
         }
@@ -2688,7 +2791,7 @@ impl SessionFunding {
         held.lease.shrink_to(0);
         let charged = std::mem::take(&mut held.charged);
         drop(held);
-        lock_session_directions(&self.directions).release(self.direction, charged);
+        lock_session_directions(&self.directions).release(self.side, charged);
     }
 
     fn lock_held(&self) -> zakura_rt::sync::MutexGuard<'_, HeldSessionLeases> {
@@ -3619,9 +3722,8 @@ impl ZakuraProtocolHandler {
             &self.supervisor.ip_slots.0,
             &self.pending_handshakes,
             &self.inbound_handshakes,
-            self.limits.max_pending_handshakes,
             self.supervisor.max_connections_per_ip,
-            self.limits.max_connections,
+            &self.limits,
         ));
         self.transport_observer = Some(observer);
         self
@@ -3786,7 +3888,7 @@ impl ZakuraProtocolHandler {
                 hosts,
                 host_limit: self
                     .limits
-                    .max_connections
+                    .total_connections()
                     .saturating_add(self.limits.max_pending_handshakes),
             }
         );
@@ -3872,7 +3974,10 @@ impl ZakuraProtocolHandler {
         );
         let admission = self
             .claim_connection(connection.remote_id(), true)
-            .ok_or(InboundRefusal::Admission)?;
+            .map_err(|refusal| match refusal {
+                SlotRefusal::Hold => InboundRefusal::Hold,
+                SlotRefusal::Full | SlotRefusal::InboundShare => InboundRefusal::Admission,
+            })?;
         let pending = self
             .claim_pending_handshake_with_transfer(true, transfer)
             .ok_or(InboundRefusal::PendingHandshake)?;
@@ -3991,6 +4096,10 @@ impl ZakuraProtocolHandler {
                 metrics::counter!("zakura.p2p.conn.rejected.admission").increment(1);
                 ("admission", ADMISSION_LIMIT)
             }
+            InboundRefusal::Hold => {
+                metrics::counter!("zakura.p2p.conn.rejected.hold").increment(1);
+                ("hold", ADMISSION_LIMIT)
+            }
             InboundRefusal::PendingHandshake => {
                 metrics::counter!("zakura.p2p.conn.rejected.pending_handshake").increment(1);
                 ("pending_handshake", PENDING_HANDSHAKE_LIMIT)
@@ -3998,7 +4107,9 @@ impl ZakuraProtocolHandler {
         };
         #[cfg(any(test, zakura_sim))]
         match refusal {
-            InboundRefusal::Admission => self.handshake_refused(connection, label),
+            InboundRefusal::Admission | InboundRefusal::Hold => {
+                self.handshake_refused(connection, label)
+            }
             InboundRefusal::PendingHandshake => {
                 self.handshake_refused(connection, ZakuraHandlerError::ResourceLimit(error))
             }
@@ -4019,17 +4130,51 @@ impl ZakuraProtocolHandler {
         );
     }
 
+    fn publish_gateway_ranking(&self, ranking: impl IntoIterator<Item = super::RankedGateway>) {
+        let ranking = ranking.into_iter().collect();
+        let mut counts = self.supervisor.ip_slots.counts();
+        counts.publish_gateway_ranking(&ranking, self.limits.max_preferred_connections);
+        let hold = counts.preferred_gateways().hold();
+        let split = counts.slot_split();
+        drop(counts);
+        if let Some(plan) = &self.memory_plan {
+            lock_session_directions(&self.session_directions).gateway_reserve =
+                plan.gateway_reserve(hold);
+        }
+        // These counts are bounded by the funded connection budget and fit exactly in f64.
+        metrics::gauge!("zakura.p2p.conn.slots.hold").set(hold as f64);
+        metrics::gauge!("zakura.p2p.conn.slots.preferred").set(split.preferred as f64);
+        metrics::gauge!("zakura.p2p.conn.slots.ordinary").set(split.ordinary as f64);
+    }
+
     /// Claims a connection slot for `node`, the dial target or the proven
     /// remote of an inbound connection, as one locked check and charge.
-    fn claim_connection(&self, node: NodeId, inbound: bool) -> Option<ConnectionAdmissionGuard> {
-        if !self.supervisor.ip_slots.counts().claim_connection(
-            node,
-            inbound,
-            self.limits.max_connections,
-        ) {
-            return None;
+    fn claim_connection(
+        &self,
+        node: NodeId,
+        inbound: bool,
+    ) -> Result<ConnectionAdmissionGuard, SlotRefusal> {
+        let mut counts = self.supervisor.ip_slots.counts();
+        let preferred_dial = !inbound
+            && counts.preferred_gateways().contains(&node)
+            && counts.node_connections(&node).total() == 0;
+        let claim = counts.claim_connection(node, inbound, self.limits.max_connections);
+        drop(counts);
+        match claim {
+            Ok(SlotClass::Preferred) if inbound => {
+                metrics::counter!("zakura.p2p.conn.accepted.preferred").increment(1);
+            }
+            Err(SlotRefusal::Hold) if !inbound => {
+                metrics::counter!("zakura.p2p.conn.dial.refused.hold").increment(1);
+            }
+            _ => {}
         }
-        Some(ConnectionAdmissionGuard {
+        if preferred_dial && claim.is_err() {
+            metrics::counter!("zakura.p2p.conn.dial.refused.preferred").increment(1);
+        }
+        claim?;
+        Ok(ConnectionAdmissionGuard {
+            authenticated_dial: false,
             #[cfg(any(test, zakura_sim))]
             observation: None,
             slots: self.supervisor.ip_slots.clone(),
@@ -4038,11 +4183,13 @@ impl ZakuraProtocolHandler {
         })
     }
 
-    /// Connection slots not held by any connection or dial.
+    /// Connection slots a dial to a node outside the preferred set may
+    /// claim now.
     fn free_connection_slots(&self) -> usize {
-        self.limits
-            .max_connections
-            .saturating_sub(self.supervisor.ip_slots.counts().connections())
+        self.supervisor
+            .ip_slots
+            .counts()
+            .free_ordinary_connections(self.limits.max_connections)
     }
 
     /// Charges the machine and semaphore together without an await.
@@ -5448,12 +5595,21 @@ impl ZakuraProtocolHandler {
                 context.accepted_capabilities,
                 admitted_sessions,
             );
+            // A preferred gateway leases from the places held for it, as it
+            // claims a held connection slot.
+            let gateway = peer_id.node_id().is_some_and(|node| {
+                self.supervisor
+                    .ip_slots
+                    .counts()
+                    .preferred_gateways()
+                    .contains(&node)
+            });
             match SessionFunding::acquire(
                 pool,
                 plan,
                 &self.session_directions,
                 conn_id,
-                context.direction,
+                super::memory::SessionSide::new(context.direction, gateway),
                 cost.total(),
                 funded_sessions,
                 &self.shutdown,
@@ -5730,7 +5886,14 @@ impl Acceptor for ZakuraProtocolHandler {
                 "zakura.p2p.conn.rejected.pending_handshake",
             );
         }
-        if counts.connections_full(true, self.limits.max_connections) {
+        // TLS 1.3 proves the caller's node ID only in its last flight, after
+        // this node has done its handshake work, so a held place that no
+        // preferred gateway fills has to admit callers whose ID is not known
+        // yet. The claim after the handshake (`claim_inbound`) decides by the
+        // proven ID: a caller that turns out to be ordinary is refused there
+        // and keeps its cadence charges, so held places give no free
+        // handshakes.
+        if !counts.inbound_place_free(self.limits.max_connections) {
             metrics::counter!("zakura.p2p.conn.rejected.admission").increment(1);
             return Admit::Refuse;
         }
@@ -5752,7 +5915,7 @@ impl Acceptor for ZakuraProtocolHandler {
             incoming.validated,
             self.supervisor.max_connections_per_ip,
             self.limits
-                .max_connections
+                .total_connections()
                 .saturating_add(self.limits.max_pending_handshakes),
             Instant::now(),
         );
@@ -5827,6 +5990,8 @@ impl Acceptor for ZakuraProtocolHandler {
 enum InboundRefusal {
     /// The connection cap or its inbound share.
     Admission,
+    /// The ordinary slots, with the rest held for preferred gateways.
+    Hold,
     /// The pending-handshake budget or its inbound share.
     PendingHandshake,
 }
@@ -6052,12 +6217,15 @@ pub async fn spawn_zakura_endpoint_with_services(
         None,
         None,
         None,
+        None,
     )
     .await
 }
 
 /// Start a Zakura endpoint on `peer_registry`, with `tx-relay` if
-/// `tx_relay` is given and BPv1 if `bpv1` is given.
+/// `tx_relay` is given and BPv1 if `bpv1` is given. The discovery dialer
+/// prefers the mining gateways `miner_gateways` ranks, or none without it.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn spawn_zakura_endpoint_with_peer_registry(
     config: &Config,
     sink_factory: impl FnOnce(ZakuraSupervisorHandle, ZakuraTrace) -> Arc<dyn Service> + Send + 'static,
@@ -6066,6 +6234,7 @@ pub(crate) async fn spawn_zakura_endpoint_with_peer_registry(
     tx_relay: Option<super::TxRelayStartup>,
     bpv1: Option<super::Bpv1Startup>,
     peer_registry: PeerRegistry,
+    miner_gateways: Option<watch::Receiver<super::MinerGatewayRanking>>,
 ) -> Result<Option<ZakuraEndpoint>, BoxError> {
     spawn_zakura_endpoint_inner(
         config,
@@ -6075,6 +6244,7 @@ pub(crate) async fn spawn_zakura_endpoint_with_peer_registry(
         tx_relay,
         bpv1,
         Some(peer_registry),
+        miner_gateways,
     )
     .await
 }
@@ -6082,6 +6252,7 @@ pub(crate) async fn spawn_zakura_endpoint_with_peer_registry(
 /// Starts the endpoint. `sink_factory` is boxed so this large function is compiled once for
 /// every caller's factory type. `tx_relay` and `bpv1` start once the memory pool they lease
 /// from exists.
+#[allow(clippy::too_many_arguments)]
 async fn spawn_zakura_endpoint_inner(
     config: &Config,
     sink_factory: Box<dyn FnOnce(ZakuraSupervisorHandle, ZakuraTrace) -> Arc<dyn Service> + Send>,
@@ -6090,6 +6261,7 @@ async fn spawn_zakura_endpoint_inner(
     tx_relay: Option<super::TxRelayStartup>,
     bpv1: Option<super::Bpv1Startup>,
     peer_registry: Option<PeerRegistry>,
+    miner_gateways: Option<watch::Receiver<super::MinerGatewayRanking>>,
 ) -> Result<Option<ZakuraEndpoint>, BoxError> {
     if !config.v2_p2p() {
         return Ok(None);
@@ -6247,9 +6419,9 @@ async fn spawn_zakura_endpoint_inner(
             .zakura
             .header_sync
             .clone()
-            .for_node_connections(limits.max_connections),
+            .for_node_connections(limits.total_connections()),
         limits.max_frame_bytes,
-        limits.max_connections,
+        limits.total_connections(),
     );
     let (header_sync_fatal_tx, header_sync_fatal_rx) = mpsc::unbounded_channel();
     startup.fatal_events = Some(header_sync_fatal_tx);
@@ -6288,7 +6460,7 @@ async fn spawn_zakura_endpoint_inner(
                     .zakura
                     .block_sync
                     .clone()
-                    .for_node_connections(limits.max_connections),
+                    .for_node_connections(limits.total_connections()),
                 block_sync_memory.clone(),
             )
             .with_range_source(driver_startup.block_range_source.clone());
@@ -6315,7 +6487,7 @@ async fn spawn_zakura_endpoint_inner(
             header_sync.clone(),
             block_sync.clone(),
             trace.clone(),
-            limits.max_connections,
+            limits.total_connections(),
         )
         .with_memory_pool(memory_pool.clone()),
     );
@@ -6331,7 +6503,7 @@ async fn spawn_zakura_endpoint_inner(
             .zakura
             .block_sync
             .clone()
-            .for_node_connections(limits.max_connections),
+            .for_node_connections(limits.total_connections()),
         block_sync_memory,
         legacy_service,
         discovery_service,
@@ -6550,6 +6722,7 @@ async fn spawn_zakura_endpoint_inner(
         discovery,
         limits,
         sought_services,
+        miner_gateways,
     );
     endpoint.push_header_sync_task(discovery_dialer).await;
     startup_shutdown.disarm();
@@ -6685,10 +6858,10 @@ pub(crate) async fn serve_reported_native_dial_connection(
     report: Option<DialReport>,
     kind: NativeDialKind,
 ) -> Result<(), ZakuraHandlerError> {
-    let _admission = endpoint
+    let mut admission = endpoint
         .handler
         .claim_connection(node_addr.id, false)
-        .ok_or(ZakuraHandlerError::ResourceLimit(ADMISSION_LIMIT))?;
+        .map_err(|_| ZakuraHandlerError::ResourceLimit(ADMISSION_LIMIT))?;
     let dial_timeout = native_dial_timeout(
         endpoint.quic.config(),
         node_addr.direct.len(),
@@ -6719,17 +6892,16 @@ pub(crate) async fn serve_reported_native_dial_connection(
     #[cfg(zakura_sim)]
     endpoint.handler.observe_handshake_slot(&connection);
     #[cfg(any(test, zakura_sim))]
-    let _admission = {
-        let mut guard = _admission;
-        guard.observation = endpoint.handler.handshake_observation(&connection);
-        guard
-    };
+    {
+        admission.observation = endpoint.handler.handshake_observation(&connection);
+    }
     let registration_report = report.map(|report| {
         // The receiver is gone when the caller stopped waiting for the result.
         let _ = report.admitted_addr.send(connection.admitted_addr());
         report.registration
     });
     let remote_node_id = connection.remote_id();
+    admission.outbound_connected();
     let peer_id = ZakuraPeerId::from_node_id(remote_node_id);
     let conn = ZakuraConnTrace::new(
         &endpoint.handler.trace,
@@ -9427,6 +9599,7 @@ mod tests {
     mod frame_lifetime;
     #[cfg(not(zakura_sim))]
     mod handshake_cost;
+    mod preferred_hold;
     mod quic_progress;
     mod read_close_cause;
     mod teardown;
@@ -11028,20 +11201,22 @@ mod tests {
         .expect("v2_p2p is enabled in test config");
         assert!(endpoint.discovery_admission_capacity() > 0);
 
-        // Three dials to a socket that never answers hold every live slot.
+        // Dials to a socket that never answers hold every live slot: two
+        // ordinary connections, the held gateway places and one handshake.
+        let live = 2 + crate::zakura::MAX_PREFERRED_GATEWAYS + 1;
         let silent = std::net::UdpSocket::bind("127.0.0.1:0")?;
         let target = NodeAddr::with_addrs(
             zakura_quic::NodeSecretKey::generate().public(),
             vec![silent.local_addr()?],
         );
         let mut dials = Vec::new();
-        for _ in 0..3 {
+        for _ in 0..live {
             let (quic, target) = (endpoint.quic.clone(), target.clone());
             dials.push(tokio::spawn(async move {
                 quic.connect(target, &[P2P_V2_ALPN]).await
             }));
         }
-        while endpoint.quic.connection_count() < 3 {
+        while endpoint.quic.connection_count() < live {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
@@ -11168,6 +11343,7 @@ mod tests {
             discovery,
             limits,
             Vec::new(),
+            None,
         );
 
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -15990,7 +16166,12 @@ mod tests {
 
         let mut inbound = Vec::new();
         loop {
-            match fund(inbound.len() as ZakuraConnId, ServicePeerDirection::Inbound).await {
+            match fund(
+                inbound.len() as ZakuraConnId,
+                crate::zakura::memory::SessionSide::Inbound,
+            )
+            .await
+            {
                 Ok(funding) => inbound.push(funding),
                 Err(SessionFundingRefusal::DirectionFull) => break,
                 Err(other) => panic!("inbound refused by {other} before the dial reserve"),
@@ -16001,7 +16182,7 @@ mod tests {
         assert!(inbound_bytes <= inbound_sessions_share(plan.sessions_share));
         assert!(inbound_bytes + cost.total() > inbound_sessions_share(plan.sessions_share));
 
-        let dial = fund(u64::MAX, ServicePeerDirection::Outbound)
+        let dial = fund(u64::MAX, crate::zakura::memory::SessionSide::Outbound)
             .await
             .expect("the dial reserve funds a dial");
         let leased = pool.snapshot().total_leased;
@@ -16048,7 +16229,7 @@ mod tests {
             &plan,
             &directions,
             1,
-            ServicePeerDirection::Outbound,
+            crate::zakura::memory::SessionSide::Outbound,
             cost.total(),
             SessionBases::funded_sessions(negotiated, negotiated),
             &CancellationToken::new(),
@@ -16121,7 +16302,7 @@ mod tests {
             .collect();
         assert!(handler
             .claim_connection(NodeSecretKey::generate().public(), true)
-            .is_none());
+            .is_err());
         assert_eq!(
             handler.supervisor.ip_slots.counts().inbound_connections(),
             192
@@ -16136,7 +16317,7 @@ mod tests {
             .collect();
         assert!(handler
             .claim_connection(NodeSecretKey::generate().public(), false)
-            .is_none());
+            .is_err());
         assert_eq!(handler.supervisor.ip_slots.counts().connections(), 256);
         assert_eq!(handler.free_connection_slots(), 0);
         drop((inbound, dials));

@@ -5,6 +5,7 @@
 
 mod clock;
 mod close;
+mod connection_places;
 mod frame;
 mod guard;
 mod handshake_counts;
@@ -14,6 +15,7 @@ mod message_rule;
 #[cfg(any(test, zakura_sim))]
 mod observe;
 mod pipe;
+mod preferred_gateways;
 #[cfg(zakura_sim)]
 mod probe;
 mod registry;
@@ -24,11 +26,17 @@ mod sim_reader;
 
 pub use clock::{Clock, RealClock};
 pub use close::{CloseOutcome, CloseRow, NeutralCause};
+pub use connection_places::{ConnectedPeer, ConnectionPlaces, PlacedGateway};
 pub use frame::{Frame, StreamPrelude, ZakuraTrace};
 pub use handshake_counts::{
     handshake_cadence, inbound_share, node_handshake_cadence, HandshakeCadenceAdmission,
-    HandshakeCounts, IpAdmission,
+    HandshakeCounts, IpAdmission, SlotClass, SlotRefusal, SlotSplit,
 };
+pub use preferred_gateways::{
+    GatewayPlace, GatewayRanking, GatewayStanding, PreferredGateways, RankedGateway,
+    MAX_PREFERRED_GATEWAYS,
+};
+pub(crate) use preferred_gateways::{HeldPlaces, MAX_RANKED_GATEWAYS};
 // `SessionGuard` and `ByteBudget` are imported through this re-export; `Admit`
 // and `PeerMeters` are reached directly via the `guard` module path, so they are
 // unused *here* until a later service imports them through `crate::zakura`.

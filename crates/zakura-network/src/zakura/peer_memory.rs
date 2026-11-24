@@ -219,7 +219,9 @@ mod tests {
                 let inbound_full = bind.max_inbound_connections.expect("Zakura caps inbound");
                 assert_eq!(
                     inbound_full,
-                    limits.max_inbound_connections() + limits.max_inbound_handshakes(),
+                    limits.max_inbound_connections()
+                        + limits.max_preferred_connections
+                        + limits.max_inbound_handshakes(),
                     "{label}"
                 );
                 // With inbound at its cap, discovery stops only at the reserve.
@@ -247,7 +249,7 @@ mod tests {
                 bind.dial_reserve,
                 bind.max_inbound_connections
             ),
-            (288, 8, Some(216))
+            (298, 8, Some(226))
         );
     }
 }

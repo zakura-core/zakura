@@ -3,11 +3,51 @@
 //! A slot is held from admission until the connection's serving task exits.
 //! Keeping each node's slots, not only the totals, lets a caller ask how a
 //! connected node is counted while it stays connected.
+//!
+//! Slots split into preferred and ordinary ones. Each member of the
+//! preferred set that holds a slot counts one preferred slot, and every
+//! other slot is ordinary. The split is derived from the set at each check
+//! and never stored, so a set change only changes how held slots count.
 
 use zakura_quic::NodeId;
 use zakura_rt::collections::HashMap;
 
 use super::inbound_share;
+use crate::zakura::transport::PreferredGateways;
+
+/// How a granted connection slot was counted when it was claimed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SlotClass {
+    /// The first slot of a preferred-set member, in a held place.
+    Preferred,
+    /// Any other slot.
+    Ordinary,
+}
+
+/// Why a connection slot was refused.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SlotRefusal {
+    /// Every slot is in use.
+    Full,
+    /// The ordinary slots are full: the rest are held for preferred
+    /// gateways.
+    Hold,
+    /// The ordinary inbound slots fill the inbound share of the limit.
+    InboundShare,
+}
+
+/// Slots in use, split into preferred and ordinary ones.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SlotSplit {
+    /// Preferred-set members that hold a slot, one each.
+    pub preferred: usize,
+    /// Every other slot.
+    pub ordinary: usize,
+    /// The inbound slots among the ordinary ones. By convention a member
+    /// that holds any inbound slot counts its preferred slot as inbound, so
+    /// a gateway above the inbound share takes none of the share's slots.
+    pub ordinary_inbound: usize,
+}
 
 /// The connection slots one remote node holds, by direction.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -42,6 +82,10 @@ pub(super) struct ConnectionSlots {
 }
 
 impl ConnectionSlots {
+    pub(super) fn nodes(&self) -> impl Iterator<Item = &NodeId> {
+        self.by_node.keys()
+    }
+
     pub(super) fn total(&self) -> usize {
         self.total
     }
@@ -50,24 +94,83 @@ impl ConnectionSlots {
         self.inbound
     }
 
-    /// Whether a slot in this direction would exceed `cap` or, for an
-    /// inbound slot, the inbound share of `cap`.
-    pub(super) fn full(&self, inbound: bool, cap: usize) -> bool {
-        self.total >= cap || (inbound && self.inbound >= inbound_share(cap))
+    /// Splits the slots in use by `preferred`'s set, with one lookup per
+    /// member.
+    pub(super) fn split(&self, preferred: &PreferredGateways) -> SlotSplit {
+        let (mut members, mut inbound_members) = (0usize, 0usize);
+        for member in preferred.set() {
+            let slots = self.of_node(member);
+            if slots.total() > 0 {
+                members += 1;
+                if slots.inbound > 0 {
+                    inbound_members += 1;
+                }
+            }
+        }
+        SlotSplit {
+            preferred: members,
+            ordinary: self
+                .total
+                .checked_sub(members)
+                .expect("each counted member holds at least one slot"),
+            ordinary_inbound: self
+                .inbound
+                .checked_sub(inbound_members)
+                .expect("each counted inbound member holds at least one inbound slot"),
+        }
+    }
+
+    /// Whether a slot is free for an inbound caller whose node ID is not
+    /// known yet: an ordinary inbound slot, or a held place that no member
+    /// fills. With no hold this is the ordinary inbound check alone.
+    pub(super) fn inbound_place_free(&self, cap: usize, preferred: &PreferredGateways) -> bool {
+        if self.total >= cap.saturating_add(preferred.hold()) {
+            return false;
+        }
+        let split = self.split(preferred);
+        let ordinary_free = split.ordinary < cap && split.ordinary_inbound < inbound_share(cap);
+        ordinary_free || split.preferred < preferred.hold()
+    }
+
+    /// Remaining ordinary places after counting live connections under the current ranking.
+    pub(super) fn free_ordinary(&self, cap: usize, preferred: &PreferredGateways) -> usize {
+        cap.saturating_sub(self.split(preferred).ordinary)
     }
 
     /// Checks the limits and charges one slot to `node` in one step, so
     /// claims made under one lock never exceed them.
-    pub(super) fn claim(&mut self, node: NodeId, inbound: bool, cap: usize) -> bool {
-        if self.full(inbound, cap) {
-            return false;
+    ///
+    /// A claim may bring the total up to the ordinary cap plus the active hold.
+    /// Each preferred gateway can use one additional place. Ordinary claims
+    /// also respect the ordinary cap and, for inbound calls, its inbound share.
+    pub(super) fn claim(
+        &mut self,
+        node: NodeId,
+        inbound: bool,
+        cap: usize,
+        preferred: &PreferredGateways,
+    ) -> Result<SlotClass, SlotRefusal> {
+        if self.total >= cap.saturating_add(preferred.hold()) {
+            return Err(SlotRefusal::Full);
         }
+        let class = if preferred.contains(&node) && self.of_node(&node).total() == 0 {
+            SlotClass::Preferred
+        } else {
+            let split = self.split(preferred);
+            if split.ordinary >= cap {
+                return Err(SlotRefusal::Hold);
+            }
+            if inbound && split.ordinary_inbound >= inbound_share(cap) {
+                return Err(SlotRefusal::InboundShare);
+            }
+            SlotClass::Ordinary
+        };
         *self.by_node.entry(node).or_default().of(inbound) += 1;
         self.total += 1;
         if inbound {
             self.inbound += 1;
         }
-        true
+        Ok(class)
     }
 
     /// Releases one slot that [`Self::claim`] charged to `node`.
@@ -120,11 +223,18 @@ mod tests {
         zakura_quic::NodeSecretKey::from_bytes(&[seed; 32]).public()
     }
 
+    /// Claims with no preferred set, as every claim did before held places.
+    fn claim(slots: &mut ConnectionSlots, node: NodeId, inbound: bool, cap: usize) -> bool {
+        slots
+            .claim(node, inbound, cap, &PreferredGateways::default())
+            .is_ok()
+    }
+
     #[test]
     fn claim_and_release_track_one_node() {
         let mut slots = ConnectionSlots::default();
         let a = node(1);
-        assert!(slots.claim(a, true, 8));
+        assert!(claim(&mut slots, a, true, 8));
         assert_eq!(
             slots.of_node(&a),
             SlotCount {
@@ -147,10 +257,10 @@ mod tests {
         let mut slots = ConnectionSlots::default();
         let a = node(1);
         let b = node(2);
-        assert!(slots.claim(a, true, 8));
-        assert!(slots.claim(a, false, 8));
-        assert!(slots.claim(a, false, 8));
-        assert!(slots.claim(b, false, 8));
+        assert!(claim(&mut slots, a, true, 8));
+        assert!(claim(&mut slots, a, false, 8));
+        assert!(claim(&mut slots, a, false, 8));
+        assert!(claim(&mut slots, b, false, 8));
         assert_eq!(
             slots.of_node(&a),
             SlotCount {
@@ -200,19 +310,69 @@ mod tests {
         let mut slots = ConnectionSlots::default();
         assert_eq!(inbound_share(8), 6);
         for seed in 0..6 {
-            assert!(slots.claim(node(seed), true, 8));
+            assert!(claim(&mut slots, node(seed), true, 8));
         }
-        assert!(!slots.claim(node(6), true, 8), "the inbound share is full");
+        assert!(
+            !claim(&mut slots, node(6), true, 8),
+            "the inbound share is full"
+        );
         assert_eq!(slots.of_node(&node(6)), SlotCount::default());
-        assert!(slots.claim(node(6), false, 8));
-        assert!(slots.claim(node(7), false, 8));
-        assert!(!slots.claim(node(8), false, 8), "the total cap is full");
+        assert!(claim(&mut slots, node(6), false, 8));
+        assert!(claim(&mut slots, node(7), false, 8));
+        assert!(
+            !claim(&mut slots, node(8), false, 8),
+            "the total cap is full"
+        );
         assert_eq!((slots.total(), slots.inbound()), (8, 6));
 
         // Releasing one inbound slot makes room for exactly one more.
         slots.release(node(0), true);
-        assert!(slots.claim(node(9), true, 8));
-        assert!(!slots.claim(node(10), false, 8));
+        assert!(claim(&mut slots, node(9), true, 8));
+        assert!(!claim(&mut slots, node(10), false, 8));
         assert_eq!(slots.summed().total(), slots.total());
+    }
+
+    /// A member counts one preferred slot however many it holds, and that
+    /// slot is inbound when the member holds an inbound one.
+    #[test]
+    fn a_member_counts_one_preferred_slot() {
+        use crate::zakura::transport::{GatewayStanding, RankedGateway};
+
+        let mut slots = ConnectionSlots::default();
+        let member = node(1);
+        let preferred = PreferredGateways::form(
+            [RankedGateway {
+                node: member,
+                blocks: 1,
+                standing: GatewayStanding::Connected,
+            }],
+            1,
+        );
+        assert_eq!(
+            slots.claim(member, false, 8, &preferred),
+            Ok(SlotClass::Preferred)
+        );
+        assert_eq!(
+            slots.claim(member, true, 8, &preferred),
+            Ok(SlotClass::Ordinary),
+            "a second slot of a member is ordinary"
+        );
+        assert_eq!(
+            slots.split(&preferred),
+            SlotSplit {
+                preferred: 1,
+                ordinary: 1,
+                ordinary_inbound: 0,
+            }
+        );
+        assert_eq!(
+            slots.split(&PreferredGateways::default()),
+            SlotSplit {
+                preferred: 0,
+                ordinary: 2,
+                ordinary_inbound: 1,
+            },
+            "with no set every slot is ordinary"
+        );
     }
 }

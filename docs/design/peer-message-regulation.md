@@ -56,7 +56,9 @@ request leases its receive credit before it goes out (API-9), and `Serving` leas
 growth while output waits. With BPv1 on, the `Propagation` reserve funds what BPv1 retains. Proof
 of work bounds those bytes, so their leases never wait behind bulk. Each BPv1 session funds its base
 from `Sessions`. Its receive credit stays unsolicited, because pushed and pulled parts share the
-data stream's `Part` row and BPv1 raises no credit per `Want`. CTRL-26, ADM-12 and ADM-13 in the
+data stream's `Part` row and BPv1 raises no credit per `Want`. A mining node holds up to ten
+connection places above `max_connections` for its preferred gateways, and ordinary connections
+leave those places' bases free in `Sessions`. CTRL-26, ADM-12 and ADM-13 in the
 [`zakura-quic` spec](../specs/zakura-quic.md) state the rules and their numbers.
 
 Configuration loading checks the startup memory plan only when the resolved P2P stack runs v2.

@@ -32,13 +32,25 @@ impl BlockTable {
             "{BLOCK_REPLAY}: pending_bytes accounting mismatch"
         );
 
-        // Every admitting or pending entry counts against the metadata caps.
+        for entry in self.pending.values() {
+            let (held, _) = self.pending_held_by(entry.from_peer);
+            assert!(
+                held <= MAX_PENDING_META_PER_PEER,
+                "{BLOCK_REPLAY}: bpv1-11 peer holds {held} pending meta > cap {}",
+                MAX_PENDING_META_PER_PEER
+            );
+        }
         assert!(
-            self.admitting.len() + self.pending.len() <= MAX_PENDING_META_COUNT,
-            "{BLOCK_REPLAY}: bpv1-11 admitting {} + pending {} > cap {}",
+            self.admitting.len() <= MAX_ADMITTING_META_COUNT,
+            "{BLOCK_REPLAY}: bpv1-10 admitting meta count {} > cap {}",
             self.admitting.len(),
-            self.pending.len(),
-            MAX_PENDING_META_COUNT
+            MAX_ADMITTING_META_COUNT
+        );
+        assert!(
+            self.admitting_bytes() <= MAX_ADMITTING_META_BYTES,
+            "{BLOCK_REPLAY}: bpv1-10 admitting meta bytes {} > cap {}",
+            self.admitting_bytes(),
+            MAX_ADMITTING_META_BYTES
         );
         // bpv1-52: charged part bytes stay within the part buffer budget.
         assert!(
@@ -126,7 +138,10 @@ impl BlockTable {
                 assert!(!block.body_claimed);
             }
             for st in &block.stripes {
-                if !st.assemblable && !st.decoding() {
+                // bpv1-28 budgets pulls. A decode may end with more than `k`
+                // parts held, and a `Fallback` block keeps them to serve but
+                // pulls nothing, so only a collecting stripe is bound.
+                if block.phase == BlockPhase::Collecting && !st.assemblable && !st.decoding() {
                     assert!(
                         st.held_count.saturating_add(st.claims.len() as u32) <= block.meta.coding.k,
                         "{BLOCK_REPLAY}: bpv1-28 held ({}) + pending ({}) > k ({})",

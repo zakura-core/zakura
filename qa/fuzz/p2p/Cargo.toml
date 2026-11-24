@@ -25,7 +25,7 @@ block_sequencer_evidence = { decoder = 1, properties = ["block/required-evidence
 discovery_session = { decoder = 1, properties = ["discovery/session-policy"] }
 discovery_redial = { decoder = 2, properties = ["discovery/redial-policy"] }
 discovery_query = { decoder = 1, properties = ["discovery/query-ownership", "discovery/answer-settlement"] }
-discovery_candidate = { decoder = 1, properties = ["discovery/dial-attempts"] }
+discovery_candidate = { decoder = 2, properties = ["discovery/dial-attempts", "discovery/preferred-dials"] }
 bpv1_peer = { decoder = 1, properties = ["bpv1/peer-replay"] }
 bpv1_block = { decoder = 2, properties = ["bpv1/block-replay"] }
 credential_parse = { decoder = 1, properties = ["credential/canonical-encoding", "credential/node-id", "credential/bounded-parse"] }

@@ -14,7 +14,6 @@ use std::{cmp::Reverse, time::Duration};
 use zakura_chain::{
     block::{self, Header},
     serialization::ZcashDeserialize,
-    transaction::Transaction,
 };
 use zakura_quic::NodeId;
 use zakura_rt::collections::{HashMap, HashSet};
@@ -23,11 +22,11 @@ use super::{
     blocks::{MetaEnvelope, WorkId},
     codec::EncodedBody,
     commitment::{
-        check_block_commitments, commit_hash, commitment_script, extract_single_commitment,
-        CoinbaseBinding, CommitmentFields, COMMITMENT_SCRIPT_LEN,
+        check_block_commitments, commit_hash, commitment_script, decode_coinbase,
+        extract_single_commitment, CoinbaseBinding, CommitmentFields, COMMITMENT_SCRIPT_LEN,
     },
     paths::PeerPaths,
-    profile::{Coding, W2_MAX_COINBASE_BYTES, W2_PROFILE_ID},
+    profile::{Coding, W2_PROFILE_ID},
     tree::VerifiedPart,
 };
 
@@ -386,16 +385,11 @@ impl ProposerState {
                     return step;
                 };
                 // bpv1-9 & 06 §1: verify coinbase holds a committed hash C from this prepared entry.
-                if coinbase_bytes.len() > W2_MAX_COINBASE_BYTES {
-                    return step;
-                }
-                let mut cb_slice = coinbase_bytes.as_slice();
-                let Ok(coinbase_tx) = Transaction::zcash_deserialize_bounded(&mut cb_slice) else {
+                // A pool may rebuild the coinbase in a form receivers refuse,
+                // such as v5; that block goes out through existing relay.
+                let Ok(coinbase_tx) = decode_coinbase(&coinbase_bytes) else {
                     return step;
                 };
-                if !cb_slice.is_empty() {
-                    return step;
-                }
                 let Ok(found_commit) = extract_single_commitment(&coinbase_tx) else {
                     return step;
                 };

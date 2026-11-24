@@ -11,6 +11,7 @@ use zakura_chain::{
         self, genesis::regtest_genesis_block, merkle::AuthDataRoot,
         ChainHistoryBlockTxAuthCommitmentHash, ChainHistoryMmrRootHash, Height,
     },
+    parameters::NetworkUpgrade,
     serialization::ZcashSerialize,
     transaction::Transaction,
 };
@@ -969,6 +970,63 @@ fn scenario_proposer_reuse_recompute_entry_filter_solve_and_disconnect() {
             assert!(seeded.insert(*peer), "one seed batch per neighbour");
         }
     }
+}
+
+/// A pool that keeps the commitment but rebuilds the coinbase as v5 gets no
+/// BPv1 publication. Receivers require a v6 coinbase and close the sender of
+/// any other version (decision-9), so the block goes out through existing
+/// relay instead.
+#[test]
+fn proposer_does_not_publish_a_v5_coinbase_that_receivers_refuse() {
+    let config = ProposerConfig::new([0x11; 32], node_id(1));
+    let body = vec![0xAA; 128];
+    let body_identity = compute_body_identity(2, &body);
+    let (mut proposer, commitment) = encoded_proposer(config, &Profile::TINY, &body, [0; 32]);
+    let peers = [node_id(2), node_id(3)];
+    let mut paths = PeerPaths::new();
+    for peer in peers {
+        paths.observe(
+            peer,
+            PathEstimate {
+                min_rtt: Some(Duration::from_millis(20)),
+                rate_in: None,
+                rate_out: Some(10_000_000),
+            },
+        );
+    }
+
+    let Transaction::V6 {
+        lock_time,
+        expiry_height,
+        inputs,
+        outputs,
+        ..
+    } = commit_coinbase(commitment.commitment_hash)
+    else {
+        unreachable!("commit_coinbase builds a v6 coinbase");
+    };
+    let v5 = Transaction::V5 {
+        network_upgrade: NetworkUpgrade::Nu7,
+        lock_time,
+        expiry_height,
+        inputs,
+        outputs,
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+    };
+    let solved = proposer.step(ProposerInput::Solved {
+        block_id: block::Hash([0xCC; 32]),
+        height: 100,
+        header_bytes: solved_header(&v5, commitment.light_client_root),
+        coinbase_bytes: v5.zcash_serialize_to_vec().unwrap(),
+        txid_siblings: Vec::new(),
+        auth_siblings: Vec::new(),
+        body_identity,
+        peers: peers.to_vec(),
+        paths: Box::new(paths),
+    });
+    assert!(solved.outputs.is_empty(), "a v5 coinbase publishes nothing");
+    assert!(solved.events.is_empty());
 }
 
 #[test]

@@ -11,8 +11,8 @@ use crate::{
 /// Opcodes `0x01` to `0x4b` push that many bytes, and the payload is 35 bytes.
 const SCRIPT_OPCODES: [u8; 2] = [0x6a, 0x23];
 
-/// The start of every payload: the tag `MR`, then the version this node
-/// writes and reads.
+/// The start of every payload: the tag `MR` (short for "Miner Record"), then
+/// the version this node writes and reads.
 const PAYLOAD_PREFIX: [u8; 3] = [b'M', b'R', 0x01];
 
 /// The bytes in a gateway ID.

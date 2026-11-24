@@ -3,7 +3,6 @@
 use std::{ops::Bound, time::Duration};
 
 use eyre::Report;
-use serde::{Deserialize, Serialize};
 
 use zakura_chain::{
     block::Height,
@@ -32,7 +31,7 @@ pub const ESTIMATED_BLOCKS_PER_DAY: u32 = 24 * 60 * 60 / POST_BLOSSOM_POW_TARGET
 ///
 /// - Zakura will exit with a panic if the current tip height is bigger than
 ///   [`ESTIMATED_RELEASE_HEIGHT`] plus this number of days at the target spacing,
-///   unless [`Config::halt`] is off.
+///   unless it was started with [`KEEP_RUNNING_FLAG`].
 /// - The support window is capped by [`MAINNET_EOS_HEIGHT`]. This window
 ///   deliberately overshoots the cap, so the cap fixes the halt date.
 pub const EOS_PANIC_AFTER: u32 = 45;
@@ -98,7 +97,8 @@ const TIP_RETRY_INTERVAL: Duration = INITIAL_WAIT;
 
 /// The metric that reports whether this node halts at the end of its release's support.
 ///
-/// Set to `1` on Mainnet unless [`Config::halt`] is off, and `0` otherwise.
+/// Set to `1` on Mainnet unless the node was started with [`KEEP_RUNNING_FLAG`],
+/// and `0` otherwise.
 const EOS_ENFORCED_METRIC: &str = "end_of_support.enforced";
 
 /// The metric that reports the last height this release supports.
@@ -109,8 +109,8 @@ const EOS_HEIGHT_METRIC: &str = "end_of_support.last_supported_height";
 /// The metric that reports how many blocks are left in this release's support window.
 ///
 /// Only set on networks where support ends. It is negative once the tip goes
-/// past the last supported height, which halts the node unless [`Config::halt`]
-/// is off.
+/// past the last supported height, which halts the node unless it was started
+/// with [`KEEP_RUNNING_FLAG`].
 const EOS_REMAINING_BLOCKS_METRIC: &str = "end_of_support.remaining_blocks";
 
 /// The metric that reports how many blocks are left before a network upgrade
@@ -128,27 +128,29 @@ const EOS_BLOCKS_UNTIL_UPGRADE_METRIC: &str = "end_of_support.blocks_until_next_
 /// otherwise.
 const EOS_UPGRADE_ACTIVATED_METRIC: &str = "end_of_support.upgrade_activated_unsupported";
 
-/// End of support configuration section.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct Config {
-    /// Stop the node when the chain tip passes the last height its release supports.
+/// The `zakurad start` flag that keeps a node running past the end of its
+/// release's support, see [`PastSupport::KeepRunning`].
+///
+/// It is a flag and not a config setting, so each launch of an unsupported
+/// release states the choice.
+pub const KEEP_RUNNING_FLAG: &str = "--unsafe-ignore-end-of-support";
+
+/// What a node does once the chain tip passes the last height its release supports.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PastSupport {
+    /// Stop the node.
     ///
     /// Releases are only supported for a limited time, so that nodes do not keep
-    /// following outdated consensus rules. Set this to `false` to keep running an
-    /// unsupported release, with warnings instead of a halt. An unsupported
-    /// release might not follow the network's consensus rules after a network
-    /// upgrade it was built without, so the operator has to track upgrades.
-    ///
-    /// Mining nodes always halt: on a network where support ends, `false` is
-    /// rejected when `mining.miner_address` is set or the internal miner runs.
-    pub halt: bool,
-}
+    /// following outdated consensus rules.
+    #[default]
+    Halt,
 
-impl Default for Config {
-    fn default() -> Self {
-        Self { halt: true }
-    }
+    /// Keep running, with warnings instead of a halt.
+    ///
+    /// An unsupported release might not follow the network's consensus rules
+    /// after a network upgrade it was built without, so the operator has to
+    /// track upgrades. Mining nodes are refused at startup.
+    KeepRunning,
 }
 
 /// The heights that bound a release's support on one network.
@@ -249,9 +251,9 @@ struct UpgradeAhead {
 fn unsupported_upgrade_ahead(
     tip_height: Height,
     window: &SupportWindow,
-    config: Config,
+    past_support: PastSupport,
 ) -> Option<UpgradeAhead> {
-    if config.halt || window.status(tip_height) == SupportStatus::Supported {
+    if past_support == PastSupport::Halt || window.status(tip_height) == SupportStatus::Supported {
         return None;
     }
 
@@ -291,9 +293,9 @@ struct UpgradeActivated {
 fn unsupported_upgrade_activated(
     tip_height: Height,
     window: &SupportWindow,
-    config: Config,
+    past_support: PastSupport,
 ) -> Option<UpgradeActivated> {
-    if config.halt || window.status(tip_height) != SupportStatus::Expired {
+    if past_support == PastSupport::Halt || window.status(tip_height) != SupportStatus::Expired {
         return None;
     }
 
@@ -318,10 +320,10 @@ fn unsupported_upgrade_activated(
 /// so each start of the node reports where its release stands. On networks
 /// without a window there is nothing to check.
 ///
-/// Never returns. It panics when the tip is past the window and [`Config::halt`]
-/// is on, which halts the node.
+/// Never returns. It panics when the tip is past the window, which halts the
+/// node, unless `past_support` is [`PastSupport::KeepRunning`].
 pub async fn start(
-    config: Config,
+    past_support: PastSupport,
     window: Option<SupportWindow>,
     latest_chain_tip: impl ChainTip + std::fmt::Debug,
 ) -> Result<(), Report> {
@@ -335,11 +337,14 @@ pub async fn start(
         }
     };
 
-    metrics::gauge!(EOS_ENFORCED_METRIC).set(if config.halt { 1.0 } else { 0.0 });
+    metrics::gauge!(EOS_ENFORCED_METRIC).set(match past_support {
+        PastSupport::Halt => 1.0,
+        PastSupport::KeepRunning => 0.0,
+    });
     metrics::gauge!(EOS_HEIGHT_METRIC).set(f64::from(window.last_supported_height.0));
-    if !config.halt {
+    if past_support == PastSupport::KeepRunning {
         warn!(
-            "end_of_support.halt is off: this node keeps running after block {}, \
+            "{KEEP_RUNNING_FLAG} is set: this node keeps running after block {}, \
             the last height its release supports",
             window.last_supported_height.0
         );
@@ -353,7 +358,7 @@ pub async fn start(
             continue;
         };
 
-        check(tip_height, &window, config);
+        check(tip_height, &window, past_support);
 
         tokio::time::sleep(CHECK_INTERVAL).await;
     }
@@ -363,7 +368,7 @@ pub async fn start(
 /// not end.
 ///
 /// The node runs at this height. When the tip goes past it the node halts,
-/// unless [`Config::halt`] is off. This matches zcashd's
+/// unless it was started with [`KEEP_RUNNING_FLAG`]. This matches zcashd's
 /// `end_of_service.block_height` threshold semantics.
 pub fn end_of_support_height(network: &Network) -> Option<Height> {
     (network == &Network::Mainnet)
@@ -407,16 +412,17 @@ fn estimated_height_after_release(network: &Network, days: u32) -> Height {
 }
 
 /// Reports where `tip_height` falls in `window` through logs and metrics, and
-/// panics if the release is too old and [`Config::halt`] is on.
+/// panics if the release is too old, unless `past_support` is
+/// [`PastSupport::KeepRunning`].
 ///
-/// With the halt off, a release past its window gets a warning instead. Further
+/// A release that keeps running past its window gets a warning instead. Further
 /// warnings name a network upgrade that the release will reach unsupported, and
 /// one it has already gone through unsupported.
-pub fn check(tip_height: Height, window: &SupportWindow, config: Config) {
+pub fn check(tip_height: Height, window: &SupportWindow, past_support: PastSupport) {
     info!("Checking if Zakura release is inside support range ...");
 
-    let upgrade_ahead = unsupported_upgrade_ahead(tip_height, window, config);
-    let upgrade_activated = unsupported_upgrade_activated(tip_height, window, config);
+    let upgrade_ahead = unsupported_upgrade_ahead(tip_height, window, past_support);
+    let upgrade_activated = unsupported_upgrade_activated(tip_height, window, past_support);
 
     // The gauges are set before the halt, so its last scrape shows the cause.
     // A difference between two u32 heights is exactly representable as f64.
@@ -440,26 +446,26 @@ pub fn check(tip_height: Height, window: &SupportWindow, config: Config) {
     let hint =
         format!("Hint: Download and install the latest Zakura release from: {LATEST_RELEASE_URL}");
 
-    match (window.status(tip_height), config.halt) {
+    match (window.status(tip_height), past_support) {
         (SupportStatus::Supported, _) => info!(
             "Zakura release is supported until block {last_supported_height}, \
             please report bugs at https://github.com/zakura-core/zakura/issues"
         ),
-        (SupportStatus::Expiring, true) => warn!(
+        (SupportStatus::Expiring, PastSupport::Halt) => warn!(
             "{EOS_WARN_MESSAGE_HEADER} at block {last_supported_height}. \n{release} \n{hint}"
         ),
-        (SupportStatus::Expiring, false) => warn!(
+        (SupportStatus::Expiring, PastSupport::KeepRunning) => warn!(
             "{EOS_KEEPS_RUNNING_MESSAGE_HEADER} after block {last_supported_height}. \
-            It will keep running because end_of_support.halt is off. \n{release} \n{hint}"
+            It will keep running because {KEEP_RUNNING_FLAG} is set. \n{release} \n{hint}"
         ),
-        (SupportStatus::Expired, true) => panic!(
+        (SupportStatus::Expired, PastSupport::Halt) => panic!(
             "{EOS_PANIC_MESSAGE_HEADER} past the last supported Mainnet height \
             {last_supported_height}. \n{release} \n{hint}"
         ),
-        (SupportStatus::Expired, false) => warn!(
+        (SupportStatus::Expired, PastSupport::KeepRunning) => warn!(
             "{EOS_UNSUPPORTED_MESSAGE_HEADER}: the chain tip is past block \
             {last_supported_height}, the last height it supports. It keeps running because \
-            end_of_support.halt is off, but it might not follow the network's consensus \
+            {KEEP_RUNNING_FLAG} is set, but it might not follow the network's consensus \
             rules after a network upgrade. It cannot warn about an upgrade that was \
             scheduled after it was built. \n{release} \n{hint}"
         ),
@@ -529,23 +535,6 @@ mod tests {
     }
 
     #[test]
-    fn config_halts_unless_turned_off() {
-        let _init_guard = zakura_test::init();
-
-        assert!(Config::default().halt);
-        assert_eq!(
-            toml::from_str::<Config>("").expect("an empty section is valid"),
-            Config::default(),
-        );
-        assert!(
-            !toml::from_str::<Config>("halt = false")
-                .expect("the halt can be turned off")
-                .halt
-        );
-        assert!(toml::from_str::<Config>("halt_height = 1").is_err());
-    }
-
-    #[test]
     fn support_window_status_changes_at_its_heights() {
         let _init_guard = zakura_test::init();
         let network = Network::Mainnet;
@@ -604,7 +593,7 @@ mod tests {
         let (activation_height, upgrade) = last_mainnet_upgrade();
         let window = SupportWindow::ending_at(Height(activation_height.0 - 1_000), &network);
         let expiring_tip = window.last_supported_height();
-        let keeps_running = Config { halt: false };
+        let keeps_running = PastSupport::KeepRunning;
         let ahead = |tip_height: Height| {
             Some(UpgradeAhead {
                 upgrade,
@@ -632,12 +621,12 @@ mod tests {
 
             // A release that halts never runs unsupported.
             assert_eq!(
-                unsupported_upgrade_ahead(unsupported_tip, &window, Config::default()),
+                unsupported_upgrade_ahead(unsupported_tip, &window, PastSupport::Halt),
                 None,
             );
         }
         assert_eq!(
-            unsupported_upgrade_ahead(expiring_tip, &window, Config::default()),
+            unsupported_upgrade_ahead(expiring_tip, &window, PastSupport::Halt),
             None,
         );
 
@@ -662,7 +651,7 @@ mod tests {
     fn upgrade_ahead_skips_upgrades_inside_the_support_window() {
         let _init_guard = zakura_test::init();
         let network = Network::Mainnet;
-        let keeps_running = Config { halt: false };
+        let keeps_running = PastSupport::KeepRunning;
         let upgrades = network.full_activation_list();
         let [.., (supported_activation, _), (unsupported_activation, unsupported_upgrade)] =
             upgrades[..]
@@ -702,7 +691,7 @@ mod tests {
         let network = Network::Mainnet;
         let (activation_height, upgrade) = last_mainnet_upgrade();
         let window = SupportWindow::ending_at(Height(activation_height.0 - 1_000), &network);
-        let keeps_running = Config { halt: false };
+        let keeps_running = PastSupport::KeepRunning;
         let activated = Some(UpgradeActivated {
             upgrade,
             activation_height,
@@ -730,7 +719,7 @@ mod tests {
         );
         // A release that halts never runs unsupported.
         assert_eq!(
-            unsupported_upgrade_activated(Height::MAX, &window, Config::default()),
+            unsupported_upgrade_activated(Height::MAX, &window, PastSupport::Halt),
             None,
         );
 
@@ -746,7 +735,7 @@ mod tests {
     fn upgrades_after_the_support_window_are_reported_in_activation_order() {
         let _init_guard = zakura_test::init();
         let network = Network::Mainnet;
-        let keeps_running = Config { halt: false };
+        let keeps_running = PastSupport::KeepRunning;
         let upgrades = network.full_activation_list();
         let [.., (supported_activation, _), (first_activation, first_upgrade), (last_activation, last_upgrade)] =
             upgrades[..]

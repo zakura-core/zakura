@@ -187,6 +187,12 @@ pub struct StartCmd {
     /// Continue startup even when zcashd-compat preflight detects minimum hardware shortfalls.
     #[clap(long = "unsafe-low-specs")]
     unsafe_low_specs: bool,
+
+    /// Keep running, with warnings, after the chain tip passes the last height this release
+    /// supports. An unsupported release might not follow the network after a network upgrade.
+    /// Refused on a mining node.
+    #[clap(long = "unsafe-ignore-end-of-support")]
+    unsafe_ignore_end_of_support: bool,
 }
 
 /// Warns if Linux TCP slow-start-after-idle is enabled, which significantly
@@ -355,26 +361,36 @@ impl StartCmd {
             .map_err(|error| eyre!("invalid consensus configuration: {error}"))
     }
 
-    /// Refuses to turn off the end of support halt on a mining node.
+    /// Returns what this node does once the tip passes the last height its release supports.
+    fn past_support(&self) -> sync::end_of_support::PastSupport {
+        if self.unsafe_ignore_end_of_support {
+            sync::end_of_support::PastSupport::KeepRunning
+        } else {
+            sync::end_of_support::PastSupport::Halt
+        }
+    }
+
+    /// Refuses to keep a mining node running past the end of its release's support.
     ///
     /// A miner on an unsupported release can build blocks on outdated consensus rules, so
     /// miners keep the halt. A node counts as a miner when it can build block templates
     /// (`mining.miner_address`) or runs the internal miner. Networks where support does not
     /// end have no halt to keep, so miners there are not refused.
-    fn validate_end_of_support_config(config: &ZakuradConfig) -> Result<(), Report> {
+    fn validate_end_of_support(&self, config: &ZakuradConfig) -> Result<(), Report> {
+        use sync::end_of_support::{PastSupport, SupportWindow, KEEP_RUNNING_FLAG};
+
         #[cfg(feature = "internal-miner")]
         let runs_internal_miner = config.mining.is_internal_miner_enabled();
         #[cfg(not(feature = "internal-miner"))]
         let runs_internal_miner = false;
         let is_miner = config.mining.miner_address.is_some() || runs_internal_miner;
-        let support_ends =
-            sync::end_of_support::SupportWindow::of_release(&config.network.network).is_some();
+        let support_ends = SupportWindow::of_release(&config.network.network).is_some();
 
-        if !config.end_of_support.halt && is_miner && support_ends {
+        if self.past_support() == PastSupport::KeepRunning && is_miner && support_ends {
             return Err(eyre!(
-                "end_of_support.halt = false is not allowed on a mining node; remove \
-                 mining.miner_address and turn off mining.internal_miner, or set \
-                 end_of_support.halt to true"
+                "{KEEP_RUNNING_FLAG} is not allowed on a mining node; remove \
+                 mining.miner_address and turn off mining.internal_miner, or start without \
+                 the flag"
             ));
         }
 
@@ -574,7 +590,7 @@ impl StartCmd {
         Self::validate_consensus_config(&config)?;
         Self::validate_debug_blocksync_throughput_config(&config)?;
         Self::validate_miner_mesh_config(&config)?;
-        Self::validate_end_of_support_config(&config)?;
+        self.validate_end_of_support(&config)?;
         let network_config = Self::network_config_for_start(&config)?;
         config.rpc.validate().map_err(|error| eyre!(error))?;
         let backend_verifications = config
@@ -1303,7 +1319,7 @@ impl StartCmd {
         info!("spawning end of support checking task");
         let end_of_support_task_handle = spawn_erased(
             sync::end_of_support::start(
-                config.end_of_support,
+                self.past_support(),
                 support_window,
                 latest_chain_tip.clone(),
             )
@@ -1771,7 +1787,8 @@ impl StartCmd {
         Self::validate_consensus_config(&config).map_err(config_error)?;
         Self::validate_debug_blocksync_throughput_config(&config).map_err(config_error)?;
         Self::validate_miner_mesh_config(&config).map_err(config_error)?;
-        Self::validate_end_of_support_config(&config).map_err(config_error)?;
+        self.validate_end_of_support(&config)
+            .map_err(config_error)?;
         config.rpc.validate().map_err(config_error)?;
 
         Ok(config)

@@ -18,17 +18,20 @@ same height.
 
 ## Running past the end of support
 
-Upgrading is the operator's decision, so a node can be told to keep running an
-unsupported release:
+Upgrading is the operator's decision, so a node can be started to keep running
+an unsupported release:
 
-```toml
-[end_of_support]
-halt = false
+```sh
+zakurad start --unsafe-ignore-end-of-support
 ```
 
-With the halt off, the node warns where it used to halt:
+This is a flag and not a config setting, so each launch of an unsupported
+release states the choice. There is no config key or environment variable for
+it. In Docker, pass it as the container's command arguments.
 
-- At startup, that the halt is off.
+With the flag, the node warns where it used to halt:
+
+- At startup, that the flag is set.
 - In the last three days of the window, that the release will be unsupported.
 - Past the last supported height, every hour and after every restart, that the
   release is unsupported.
@@ -42,7 +45,7 @@ With the halt off, the node warns where it used to halt:
 
 The halt exists to make an outdated node fail loudly. Without it, an
 unsupported release that reaches a network upgrade it does not implement stays
-on the old rules and falls off the network. Turning the halt off makes the
+on the old rules and falls off the network. Starting with the flag makes the
 operator responsible for tracking network upgrades.
 
 The warnings about network upgrades only cover upgrades whose activation
@@ -57,21 +60,21 @@ Mining nodes always halt. A miner on outdated rules can build blocks that the
 network rejects, or extend a chain the network has left. A node counts as a
 mining node when `mining.miner_address` is set, because it can then build
 block templates, or when it runs the internal miner. On Mainnet such a node
-refuses to start with `end_of_support.halt = false`. Other networks have no
-end of support, so the setting has no effect there and miners are not refused.
+refuses to start with `--unsafe-ignore-end-of-support`. Other networks have no
+end of support, so the flag has no effect there and miners are not refused.
 
 ### zcashd-compat mode
 
 The zcashd sidecar build has its own end-of-support halt disabled and relies
 on Zakura for consensus safety, see [zcashd compatibility](zcashd-compat.md).
-With `end_of_support.halt = false`, nothing in that stack halts on an
+With `--unsafe-ignore-end-of-support`, nothing in that stack halts on an
 unsupported release.
 
 ## Monitoring
 
 | Metric | Meaning |
 | --- | --- |
-| `end_of_support.enforced` | `1` when the node halts at the end of support: Mainnet with the halt on. |
+| `end_of_support.enforced` | `1` when the node halts at the end of support: Mainnet without the flag. |
 | `end_of_support.last_supported_height` | The last height the release supports. Mainnet only. |
 | `end_of_support.remaining_blocks` | Blocks left in the support window. Negative once the release runs unsupported. Mainnet only. |
 | `end_of_support.blocks_until_next_upgrade` | Blocks left before a network upgrade that the release will reach unsupported, reported from the last three days of the window, and `0` otherwise. Mainnet only. |

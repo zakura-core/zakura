@@ -45,9 +45,6 @@
 [consensus]
 checkpoint_sync = true
 
-[end_of_support]
-halt = true
-
 [health]
 enforce_on_test_networks = false
 min_connected_peers = 1

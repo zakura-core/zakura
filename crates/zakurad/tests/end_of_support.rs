@@ -21,9 +21,10 @@ use zakura_chain::{
     },
 };
 use zakurad::components::sync::end_of_support::{
-    self, Config, SupportWindow, CHECK_INTERVAL, EOS_KEEPS_RUNNING_MESSAGE_HEADER,
+    self, PastSupport, SupportWindow, CHECK_INTERVAL, EOS_KEEPS_RUNNING_MESSAGE_HEADER,
     EOS_PANIC_MESSAGE_HEADER, EOS_UNSUPPORTED_MESSAGE_HEADER, EOS_UPGRADE_ACTIVATED_MESSAGE_HEADER,
     EOS_UPGRADE_AHEAD_MESSAGE_HEADER, EOS_WARN_MESSAGE_HEADER, ESTIMATED_RELEASE_HEIGHT,
+    KEEP_RUNNING_FLAG,
 };
 
 /// The release supports this height and halts at the next block.
@@ -34,9 +35,6 @@ fn last_supported_height() -> Height {
 /// The number of blocks per day at the halt height, which is past the ZIP 259
 /// NU7 activation.
 const EOS_BLOCKS_PER_DAY: u32 = 24 * 60 * 60 / POST_NU7_POW_TARGET_SPACING;
-
-/// A config that keeps the node running past the end of its release's support.
-const KEEPS_RUNNING: Config = Config { halt: false };
 
 /// The support window of this release on Mainnet.
 fn mainnet_window() -> SupportWindow {
@@ -71,7 +69,7 @@ fn end_of_support_panic() {
     // We are in panic
     let panic = last_supported_height().0 + 1;
 
-    end_of_support::check(Height(panic), &mainnet_window(), Config::default());
+    end_of_support::check(Height(panic), &mainnet_window(), PastSupport::Halt);
 }
 
 /// Test that the `end_of_support` function is working as expected.
@@ -82,7 +80,7 @@ fn end_of_support_function() {
     // We are away from warn or panic
     let no_warn = last_supported_height().0 - 3 * EOS_BLOCKS_PER_DAY;
 
-    end_of_support::check(Height(no_warn), &mainnet_window(), Config::default());
+    end_of_support::check(Height(no_warn), &mainnet_window(), PastSupport::Halt);
     assert!(logs.contains("Checking if Zakura release is inside support range ..."));
     assert!(logs.contains("Zakura release is supported"));
 
@@ -91,7 +89,7 @@ fn end_of_support_function() {
     // We are in warn range
     let warn = no_warn + 1;
 
-    end_of_support::check(Height(warn), &mainnet_window(), Config::default());
+    end_of_support::check(Height(warn), &mainnet_window(), PastSupport::Halt);
     assert!(logs.contains("Checking if Zakura release is inside support range ..."));
     assert!(logs.contains("Your Zakura release is too old and it will stop running at block"));
 
@@ -108,31 +106,37 @@ fn end_of_support_height_per_network() {
         end_of_support::end_of_support_height(&Network::Mainnet),
         Some(last_supported_height)
     );
-    end_of_support::check(last_supported_height, &mainnet_window(), Config::default());
+    end_of_support::check(last_supported_height, &mainnet_window(), PastSupport::Halt);
 
     let testnet = Network::new_default_testnet();
     assert_eq!(end_of_support::end_of_support_height(&testnet), None);
     assert_eq!(SupportWindow::of_release(&testnet), None);
 }
 
-/// Test that a release past its support window keeps running when the halt is off.
+/// Test that a release past its support window keeps running when told to.
 #[test]
-fn end_of_support_halt_can_be_turned_off() {
+fn release_can_keep_running_past_its_support_window() {
     let (logs, dispatch) = log_capture::capture_logs();
     let _log_guard = tracing::dispatcher::set_default(&dispatch);
     let window = mainnet_window();
     let last_supported_height = last_supported_height();
 
     // Close to the end of the window, the warning does not announce a halt.
-    end_of_support::check(last_supported_height, &window, KEEPS_RUNNING);
+    end_of_support::check(last_supported_height, &window, PastSupport::KeepRunning);
     assert!(logs.contains(EOS_KEEPS_RUNNING_MESSAGE_HEADER));
     assert!(!logs.contains(EOS_WARN_MESSAGE_HEADER));
     assert!(!logs.contains(EOS_UNSUPPORTED_MESSAGE_HEADER));
 
     // Past the window, the check warns where `end_of_support_panic` panics.
-    end_of_support::check(Height(last_supported_height.0 + 1), &window, KEEPS_RUNNING);
+    end_of_support::check(
+        Height(last_supported_height.0 + 1),
+        &window,
+        PastSupport::KeepRunning,
+    );
     assert!(logs.contains(EOS_UNSUPPORTED_MESSAGE_HEADER));
-    assert!(logs.contains("It keeps running because end_of_support.halt is off"));
+    assert!(logs.contains(&format!(
+        "It keeps running because {KEEP_RUNNING_FLAG} is set"
+    )));
     assert!(!logs.contains(EOS_PANIC_MESSAGE_HEADER));
 }
 
@@ -151,7 +155,11 @@ fn release_that_keeps_running_is_warned_about_an_upgrade_after_its_window() {
     // The upgrade is already named while the window is about to end.
     let (logs, dispatch) = log_capture::capture_logs();
     tracing::dispatcher::with_default(&dispatch, || {
-        end_of_support::check(window.last_supported_height(), &window, KEEPS_RUNNING);
+        end_of_support::check(
+            window.last_supported_height(),
+            &window,
+            PastSupport::KeepRunning,
+        );
     });
     assert!(logs.contains(EOS_KEEPS_RUNNING_MESSAGE_HEADER));
     assert!(logs.contains(&format!("{ahead}, in 1000 blocks")));
@@ -160,7 +168,11 @@ fn release_that_keeps_running_is_warned_about_an_upgrade_after_its_window() {
     // Past the window, it is named until it activates.
     let (logs, dispatch) = log_capture::capture_logs();
     tracing::dispatcher::with_default(&dispatch, || {
-        end_of_support::check(Height(activation_height.0 - 100), &window, KEEPS_RUNNING);
+        end_of_support::check(
+            Height(activation_height.0 - 100),
+            &window,
+            PastSupport::KeepRunning,
+        );
     });
     assert!(logs.contains(EOS_UNSUPPORTED_MESSAGE_HEADER));
     assert!(logs.contains(&format!("{ahead}, in 100 blocks")));
@@ -171,7 +183,7 @@ fn release_that_keeps_running_is_warned_about_an_upgrade_after_its_window() {
     for tip_height in [activation_height, Height(activation_height.0 + 50_000)] {
         let (logs, dispatch) = log_capture::capture_logs();
         tracing::dispatcher::with_default(&dispatch, || {
-            end_of_support::check(tip_height, &window, KEEPS_RUNNING);
+            end_of_support::check(tip_height, &window, PastSupport::KeepRunning);
         });
         assert!(logs.contains(EOS_UNSUPPORTED_MESSAGE_HEADER));
         assert!(!logs.contains(EOS_UPGRADE_AHEAD_MESSAGE_HEADER));
@@ -185,7 +197,7 @@ fn release_that_keeps_running_is_warned_about_an_upgrade_after_its_window() {
     // A release that is still supported is not warned about its own upgrades.
     let (logs, dispatch) = log_capture::capture_logs();
     tracing::dispatcher::with_default(&dispatch, || {
-        end_of_support::check(Height(0), &window, KEEPS_RUNNING);
+        end_of_support::check(Height(0), &window, PastSupport::KeepRunning);
     });
     assert!(!logs.contains(EOS_UPGRADE_AHEAD_MESSAGE_HEADER));
     assert!(!logs.contains(EOS_UPGRADE_ACTIVATED_MESSAGE_HEADER));
@@ -236,7 +248,7 @@ fn end_of_support_date() {
     // Get the last one we have and use it as tip.
     let higher_checkpoint = list.max_height();
 
-    end_of_support::check(higher_checkpoint, &mainnet_window(), Config::default());
+    end_of_support::check(higher_checkpoint, &mainnet_window(), PastSupport::Halt);
     assert!(logs.contains("Checking if Zakura release is inside support range ..."));
     assert!(!logs.contains(EOS_WARN_MESSAGE_HEADER));
 }
@@ -293,7 +305,7 @@ async fn end_of_support_task() -> Result<()> {
     latest_chain_tip_sender.send_best_tip_height(Height(10));
 
     let eos_future =
-        end_of_support::start(Config::default(), Some(mainnet_window()), latest_chain_tip)
+        end_of_support::start(PastSupport::Halt, Some(mainnet_window()), latest_chain_tip)
             .with_subscriber(dispatch);
 
     tokio::time::timeout(Duration::from_secs(15), eos_future)
@@ -320,7 +332,7 @@ async fn end_of_support_task_halts_past_the_support_window() -> Result<()> {
     latest_chain_tip_sender.send_best_tip_height(Height(last_supported_height().0 + 1));
 
     let eos_task = tokio::spawn(
-        end_of_support::start(Config::default(), Some(mainnet_window()), latest_chain_tip)
+        end_of_support::start(PastSupport::Halt, Some(mainnet_window()), latest_chain_tip)
             .with_subscriber(dispatch),
     );
 
@@ -353,14 +365,21 @@ async fn unsupported_task_warns_about_an_upgrade_ahead_on_every_start() -> Resul
     let (latest_chain_tip, latest_chain_tip_sender) = MockChainTip::new();
     latest_chain_tip_sender.send_best_tip_height(unsupported_tip);
 
-    let eos_future = end_of_support::start(KEEPS_RUNNING, Some(window.clone()), latest_chain_tip)
-        .with_subscriber(dispatch);
+    let eos_future = end_of_support::start(
+        PastSupport::KeepRunning,
+        Some(window.clone()),
+        latest_chain_tip,
+    )
+    .with_subscriber(dispatch);
 
     tokio::time::timeout(Duration::from_secs(15), eos_future)
         .await
-        .expect_err("the task keeps running past the support window when the halt is off");
+        .expect_err("the task keeps running past the support window when told to");
 
-    assert_eq!(logs.count("end_of_support.halt is off: this node"), 1);
+    assert_eq!(
+        logs.count(&format!("{KEEP_RUNNING_FLAG} is set: this node")),
+        1
+    );
     assert_eq!(logs.count(EOS_UNSUPPORTED_MESSAGE_HEADER), 1);
     assert_eq!(logs.count(EOS_UPGRADE_AHEAD_MESSAGE_HEADER), 1);
 
@@ -369,12 +388,16 @@ async fn unsupported_task_warns_about_an_upgrade_ahead_on_every_start() -> Resul
     let (latest_chain_tip, latest_chain_tip_sender) = MockChainTip::new();
     latest_chain_tip_sender.send_best_tip_height(unsupported_tip);
 
-    let eos_future = end_of_support::start(KEEPS_RUNNING, Some(window.clone()), latest_chain_tip)
-        .with_subscriber(dispatch);
+    let eos_future = end_of_support::start(
+        PastSupport::KeepRunning,
+        Some(window.clone()),
+        latest_chain_tip,
+    )
+    .with_subscriber(dispatch);
 
     tokio::time::timeout(CHECK_INTERVAL + Duration::from_secs(15), eos_future)
         .await
-        .expect_err("the task keeps running past the support window when the halt is off");
+        .expect_err("the task keeps running past the support window when told to");
 
     assert_eq!(logs.count(EOS_UNSUPPORTED_MESSAGE_HEADER), 2);
     assert_eq!(logs.count(EOS_UPGRADE_AHEAD_MESSAGE_HEADER), 2);
@@ -390,7 +413,7 @@ async fn end_of_support_task_checks_once_the_tip_is_known() -> Result<()> {
     let (latest_chain_tip, latest_chain_tip_sender) = MockChainTip::new();
 
     let eos_task = tokio::spawn(
-        end_of_support::start(Config::default(), Some(mainnet_window()), latest_chain_tip)
+        end_of_support::start(PastSupport::Halt, Some(mainnet_window()), latest_chain_tip)
             .with_subscriber(dispatch),
     );
 
@@ -434,7 +457,7 @@ async fn halting_task_reports_its_support_window() -> Result<()> {
     latest_chain_tip_sender.send_best_tip_height(Height(10));
 
     let eos_future =
-        end_of_support::start(Config::default(), Some(mainnet_window()), latest_chain_tip)
+        end_of_support::start(PastSupport::Halt, Some(mainnet_window()), latest_chain_tip)
             .with_subscriber(dispatch);
     tokio::time::timeout(Duration::from_secs(15), eos_future)
         .await
@@ -468,7 +491,7 @@ async fn task_that_keeps_running_reports_the_upgrade_after_its_window() -> Resul
     latest_chain_tip_sender.send_best_tip_height(Height(activation_height.0 - 100));
 
     let eos_task = tokio::spawn(
-        end_of_support::start(KEEPS_RUNNING, Some(window), latest_chain_tip)
+        end_of_support::start(PastSupport::KeepRunning, Some(window), latest_chain_tip)
             .with_subscriber(dispatch),
     );
 
@@ -489,7 +512,7 @@ async fn task_that_keeps_running_reports_the_upgrade_after_its_window() -> Resul
 
     assert!(
         !eos_task.is_finished(),
-        "the task keeps running past the support window when the halt is off"
+        "the task keeps running past the support window when told to"
     );
     eos_task.abort();
 
@@ -507,7 +530,7 @@ async fn task_without_a_support_window_keeps_running() -> Result<()> {
     latest_chain_tip_sender.send_best_tip_height(Height::MAX);
 
     let eos_future =
-        end_of_support::start(Config::default(), None, latest_chain_tip).with_subscriber(dispatch);
+        end_of_support::start(PastSupport::Halt, None, latest_chain_tip).with_subscriber(dispatch);
     tokio::time::timeout(CHECK_INTERVAL * 3, eos_future)
         .await
         .expect_err("the task keeps running until Zakura exits");

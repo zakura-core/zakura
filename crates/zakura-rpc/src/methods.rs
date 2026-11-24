@@ -347,8 +347,8 @@ pub trait RpcServer {
     /// As in zcashd, the `end_of_service` object is only present on Mainnet,
     /// where releases reach an end of support. Zakura reports the estimated last
     /// height this release supports in `end_of_service.block_height`; the node
-    /// halts when the tip goes past it, unless `end_of_support.halt` is off in
-    /// its config.
+    /// halts when the tip goes past it, unless it was started with
+    /// `--unsafe-ignore-end-of-support`.
     ///
     /// Some fields from the zcashd response are missing from Zakura's response:
     /// `version` and `subversion` are available from `getinfo`,
@@ -4917,8 +4917,8 @@ pub struct GetDeprecationInfoResponse {
 pub struct EndOfService {
     /// The estimated last height this server version supports.
     ///
-    /// The node halts when the chain tip goes past this height, unless
-    /// `end_of_support.halt` is off in its config.
+    /// The node halts when the chain tip goes past this height, unless it was
+    /// started with `--unsafe-ignore-end-of-support`.
     #[getset(get_copy = "pub")]
     block_height: u32,
 

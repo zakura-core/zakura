@@ -71,8 +71,8 @@ groups:
           summary: "Release reaches end of service in under 3 days"
           description: "This Zakura release reaches its end of service in {{ $value }} blocks. Install the latest release before then."
 
-      # The node halts at its end of service height unless `end_of_support.halt` is off,
-      # which reports `end_of_support_enforced` as 0.
+      # The node halts at its end of service height unless it was started with
+      # `--unsafe-ignore-end-of-support`, which reports `end_of_support_enforced` as 0.
       - alert: ZakuraEndOfServiceImminent
         expr: end_of_support_remaining_blocks < 3456 and end_of_support_enforced == 1
         for: 15m
@@ -82,7 +82,8 @@ groups:
           summary: "Release reaches end of service in under 1 day"
           description: "This Zakura release halts in {{ $value }} blocks. Install the latest release now."
 
-      # With `end_of_support.halt` off, the release keeps running past its end of service.
+      # Started with `--unsafe-ignore-end-of-support`, the release keeps running past its
+      # end of service.
       - alert: ZakuraRunningUnsupportedRelease
         expr: end_of_support_remaining_blocks < 0 and end_of_support_enforced == 0
         for: 15m

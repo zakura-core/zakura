@@ -1,6 +1,6 @@
 # Spec: `zakura-quic` transport
 
-Status: draft for review, 2026-11-24. Version 0.30.
+Status: draft for review, 2026-11-24. Version 0.31.
 This document is authoritative for the `zakura-quic` crate, its configuration,
 its wire behavior and its `quinn-proto` dependency policy.
 [Decision 0003](../decisions/zakura/0003-zakura-quic-transport.md) records the
@@ -75,6 +75,9 @@ Version 0.30 has the dialer pad its first flight with a third Initial
 datagram, so the listener's post-quantum flight fits QUIC's
 anti-amplification allowance and a dial completes in one round trip again;
 it adds DIAL-8, changes ADM-1, API-3 and §16, and §17ab lists each change.
+Version 0.31 sends address-validation tokens, so a redial is validated at
+its first datagram and skips the Retry a loaded listener sends; it changes
+WIRE-14, ADM-3, SEC-1 and §16, and §17ac lists each change.
 
 ## 0. Conventions
 
@@ -363,10 +366,24 @@ at fork tag `zakura-iroh-v1.1.0-rc.1`, and it keeps their MIT/Apache-2.0 notices
   races separate handshakes instead (DIAL-3).
 - **WIRE-13.** Any change to WIRE-1, WIRE-2, WIRE-5, WIRE-6, WIRE-7 or WIRE-14
   is a wire break. A wire break MUST bump the ALPN (COMPAT-4).
-- **WIRE-14.** The server MUST NOT send NEW_TOKEN frames
-  (`ValidationTokenConfig::sent(0)`). Without its `bloom` feature,
-  `quinn-proto` can't detect token reuse, so it ignores received tokens anyway.
-  Retry (ADM-2) still validates addresses.
+- **WIRE-14.** Address-validation tokens (RFC 9000 §8.1.3):
+  - A listener MUST send 2 NEW_TOKEN frames on each connection once it has
+    validated the dialer's address (`ValidationTokenConfig::sent(2)`), valid
+    for 24 hours. `quinn-proto` makes each token, binds it to the dialer's
+    IP and encrypts it with the listener's token key, which lives as long as
+    its endpoint.
+  - The listener MUST accept each token once. Its log of presented tokens
+    holds at most 32,768, each until it expires. While it's full of
+    unexpired tokens, every token is refused. `quinn-proto` treats a
+    refused, expired, foreign or undecryptable token as no token: the
+    attempt is unvalidated, never refused.
+  - A dialer MUST keep the tokens a listener sent under that listener's
+    `NodeId`, and present them only on a dial to that node. Every dial uses
+    one fixed TLS server name (TLS-6), so `quinn-proto`'s own store, keyed
+    by server name, would hand one node's token to another. A dialer keeps
+    at most 2 tokens for each of at most 1,024 nodes, dropping the node it
+    stored tokens for longest ago, and presents its newest token first.
+  - Retry (ADM-2) still validates first dials.
 
 ## 6. Endpoint and sockets
 
@@ -571,7 +588,8 @@ is today's Zakura logic.
      handshakes in progress;
   4. `Refuse` when the endpoint has `max_pending_handshakes` handshakes in progress;
   5. `Retry` when `retry_threshold` is set, `validated` is false, and pending
-     handshakes reach `retry_threshold`;
+     handshakes reach `retry_threshold`. A dial that presents a valid token
+     (WIRE-14) is validated, so it gets no Retry;
   6. `Accept` otherwise.
   Rules apply in that order. Zakura counts every per-IP rule by the source's
   admission host: an IPv4 address, after IPv4 transition encodings fold to it,
@@ -1288,6 +1306,8 @@ this release tolerates, and keep each hard change explicit.
   - a subset of Project Wycheproof's ML-KEM-1024 vectors for key
     generation, encapsulation and decapsulation, including encapsulation
     keys that fail the modulus check (TLS-9).
+  - an address-validation token presented twice is accepted once, and the
+    token log stays within its bound (WIRE-14).
 - **SEC-2.** These handshakes MUST fail:
   - a dial that names a `NodeId` and reaches a server whose credential
     derives another ID;
@@ -1340,7 +1360,7 @@ this release tolerates, and keep each hard change explicit.
 | Identity known-answer and key-file round trip | ID-1–ID-7, SEC-1 |
 | Key list round trip, each ID-8 refusal, byte-for-byte re-encoding of an unknown entry, and node-ID known answers | ID-8–ID-11 |
 | TLS refusal matrix | TLS-1–TLS-8, SEC-2 |
-| Transport-profile snapshot: the transport, endpoint and server configs match a field-by-field snapshot; the congestion controller follows the config; the TLS configs refuse early data, tickets and SNI | WIRE-5–WIRE-10, WIRE-14, ADM-5, CTRL-3, TLS-10, TLS-11 |
+| Transport-profile snapshot: the transport, endpoint and server configs match a field-by-field snapshot, including the token count and lifetime; the congestion controller follows the config; the TLS configs refuse early data, tickets and SNI | WIRE-5–WIRE-10, WIRE-14, ADM-5, CTRL-3, TLS-10, TLS-11 |
 | Buffer read-back and clamp warning: bind under a lowered `rmem_max` in a user namespace | SOCK-3–SOCK-5 |
 | Busy-socket loopback run: zero `lost_packets` caused by the sender, bidirectional, 64 MiB | SOCK-6, G7 |
 | `/proc/net/udp` drop counter with a deliberately slow receiver | SOCK-7 |
@@ -1348,6 +1368,8 @@ this release tolerates, and keep each hard change explicit.
 | Control-message round trip, and every truncated or lying control message parses to nothing | SOCK-13 |
 | Loopback transfer through the SOCK-13 fast path beats the plain path on the same host | SOCK-13 |
 | An endpoint on injected sockets binds, completes a handshake, rebinds and shuts down without opening an OS socket or starting the kernel drop poller, the GSO probe or the interface watcher | SOCK-3–SOCK-5, SOCK-7, SOCK-9, SOCK-13 |
+| A redial to a listener that sends unvalidated dials a Retry presents the listener's token, is validated at its first datagram and gets no Retry; another listener sees no token from that dialer | WIRE-14, ADM-3 |
+| A dialer returns a token only to the node that issued it, keeps the newest 2 per node and forgets the oldest node past 1,024; the listener's log refuses a reused token and, when full of unexpired ones, every token until some expire | WIRE-14, SEC-1 |
 | `bind` keeps the secure inputs: each socket's endpoint config has no seed and the production keys, the TLS provider is ring's with X25519MLKEM1024 as its only key-exchange group, and the dependency graph excludes the deterministic test provider. A `bind_with` handshake uses every injected input, and an injected provider keeps ring's cipher suites | API-2, TLS-9, ADM-10 |
 | ML-KEM-1024 gives a subset of Project Wycheproof's known answers for key generation, encapsulation and decapsulation; it refuses a key that fails the modulus check and a share of another length before drawing randomness; an altered ciphertext gives an unrelated secret | TLS-9, SEC-1 |
 | X25519MLKEM1024's shares and secret are the ML-KEM part then the X25519 part, checked in each role against `libcrux-ml-kem` and `curve25519-dalek` used directly; fed the shares an independent implementation (RustCrypto `ml-kem` and graviola's X25519) recorded, it gives back the shares and secrets that implementation recorded, in both roles; a bad half or a failed random source fails the exchange | TLS-9 |
@@ -2157,3 +2179,29 @@ Changed:
 - **§16.** The first-flight test requires one round trip, and the admission
   tests count three datagrams. A new test pads a hello whose first send
   finds the send buffer full.
+
+## 17ac. Changes in version 0.31
+
+A listener under load (`retry_threshold`, ADM-3) sends every unvalidated
+dial a Retry, which costs a round trip on top of the handshake. Listeners
+now send address-validation tokens, so a node redialing a peer it reached
+before is validated at its first datagram and skips that Retry. In the
+simulator at 124 ms RTT, with Retry forced, a first dial takes 248 ms and a
+redial with a token 124 ms.
+
+The listener checks each token once against its own bounded log, not
+`quinn-proto`'s `bloom` feature, so no dependency is added. The dialer
+stores tokens by node ID, because every dial uses one fixed TLS server name.
+The ALPN stays `p2p-v2/5`: WIRE-13 counts a WIRE-14 change as a wire break,
+and this lands before any release of `p2p-v2/5`. A `p2p-v2/5` node from
+before this change sends no tokens and ignores the ones it gets, so the two
+still connect.
+
+Changed:
+
+- **WIRE-14.** Listeners send 2 tokens per connection, valid for 24 hours
+  and accepted once. Dialers keep them by node.
+- **ADM-3.** A dial with a valid token is validated, so rule 5 sends it no
+  Retry.
+- **SEC-1.** The token log refuses a reused token and stays bounded.
+- **§16.** Adds the rows for the redial and the token bounds.

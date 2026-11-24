@@ -123,6 +123,15 @@ The padding costs:
   no state for a hello it refuses at the first packet, so a padding datagram
   would start an attempt of its own with no hello in it.
 
+A listener under load sends unvalidated dials a Retry (ADM-3), which costs
+a round trip of its own. Listeners therefore also send address-validation
+tokens (spec WIRE-14). A node redialing a peer it reached before presents
+the peer's token and is validated at its first datagram. In the simulator
+at 124 ms RTT, with Retry forced, a first dial takes 248 ms and a redial
+with a token 124 ms. A token is valid for 24 hours, is accepted once, and
+dies with the listener's endpoint, so a restarted listener sees its older
+tokens as none.
+
 The unpadded flight overshoots the allowance by about 670 bytes, and only a
 category 2 signature would have brought it back under (§5). Validating the
 address first with a Retry would cost the same round trip.

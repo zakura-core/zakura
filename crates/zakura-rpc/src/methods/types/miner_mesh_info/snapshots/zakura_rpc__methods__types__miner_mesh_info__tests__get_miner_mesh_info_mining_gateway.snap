@@ -16,27 +16,33 @@ expression: response
   },
   "gateways": [
     {
-      "node_id": "4d70dccee88cea83ef71f9f870489b10f5c6c112d9c49725dc38d2979f6db690",
+      "node_id": "4d70dccee88cea83ef71f9f870489b10f5c6c112",
       "blocks": 40,
       "state": "preferred",
       "connected": true
     },
     {
-      "node_id": "67bb6f072c1140d0d2198e9f937d24aeeb8d644600205bec46c90592b7f9f112",
+      "node_id": "67bb6f072c1140d0d2198e9f937d24aeeb8d6446",
       "blocks": 12,
       "state": "backoff",
       "connected": false
     },
     {
-      "node_id": "96ddfe87e3074e921304847fa147e7ee97ea3b7e430722916378ebe3ae5193ed",
+      "node_id": "96ddfe87e3074e921304847fa147e7ee97ea3b7e",
       "blocks": 7,
       "state": "standby",
       "connected": true
     },
     {
-      "node_id": "ccc7a088afe130bbb69492031e9fa86cce4628852cc966a62ad73423e20bd947",
+      "node_id": "ccc7a088afe130bbb69492031e9fa86cce462885",
       "blocks": 3,
       "state": "unmatched",
+      "connected": false
+    },
+    {
+      "node_id": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4",
+      "blocks": 2,
+      "state": "ambiguous",
       "connected": false
     }
   ],

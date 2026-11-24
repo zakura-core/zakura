@@ -98,7 +98,7 @@ use tracing::Instrument;
 use zakura_chain::{
     block::{self, genesis::regtest_genesis_block},
     chain_tip::ChainTip,
-    miner_mesh::MinerMeshCommitment,
+    miner_mesh::{GatewayId, MinerMeshCommitment},
 };
 use zakura_consensus::router::BackgroundTaskHandles;
 use zakura_jsonl_trace::{JsonlEventEmitter, JsonlTracer};
@@ -1081,7 +1081,9 @@ impl StartCmd {
             if config.mining.miner_address.is_some() {
                 info!(%gateway, "coinbases this node builds name it as the miner's gateway");
             }
-            rpc_impl.with_mesh_commitment(MinerMeshCommitment::new(*gateway.as_bytes()))
+            rpc_impl.with_mesh_commitment(MinerMeshCommitment::new(GatewayId::from_node_id(
+                gateway.as_bytes(),
+            )))
         } else {
             rpc_impl
         };

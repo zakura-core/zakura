@@ -16,7 +16,7 @@ use tower::Service;
 use zakura_chain::{
     block::{self, Block, Height},
     chain_tip::mock::MockChainTip,
-    miner_mesh::MinerMeshCommitment,
+    miner_mesh::{GatewayId, MinerMeshCommitment},
     parameters::Network,
     serialization::ZcashDeserializeInto,
     transaction::{self, Transaction},
@@ -203,7 +203,7 @@ fn mined_coinbase(gateway: Option<u8>) -> MinedTx {
     if let Some(gateway) = gateway {
         coinbase
             .outputs_mut()
-            .push(MinerMeshCommitment::new([gateway; 32]).to_output());
+            .push(MinerMeshCommitment::new(GatewayId::from_bytes([gateway; 20])).to_output());
     }
     MinedTx::new(
         Arc::new(coinbase).into(),
@@ -272,7 +272,7 @@ where
         .snapshot()
         .gateways
         .iter()
-        .map(|gateway| (gateway.gateway_id[0], gateway.blocks))
+        .map(|gateway| (gateway.gateway_id.as_bytes()[0], gateway.blocks))
         .collect()
 }
 
@@ -282,7 +282,7 @@ fn ranked(ranking: &watch::Receiver<MinerGatewayRanking>) -> Vec<(u8, u32)> {
         .borrow()
         .gateways
         .iter()
-        .map(|gateway| (gateway.gateway_id[0], gateway.blocks))
+        .map(|gateway| (gateway.gateway_id.as_bytes()[0], gateway.blocks))
         .collect()
 }
 

@@ -106,7 +106,9 @@ pub struct MeshWindow {
 /// One ranked gateway.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MeshGateway {
-    /// The gateway's v2 node ID in hex.
+    /// The ID the blocks name the gateway by, in hex: the first 20 bytes of
+    /// its v2 node ID. The gateway is the one known node whose node ID
+    /// starts with these bytes.
     pub node_id: String,
 
     /// Counted blocks that name the gateway.
@@ -135,6 +137,9 @@ pub enum MeshGatewayState {
     Backoff,
     /// v2 networking has no usable dial address for it, so no place is held for it.
     Unmatched,
+    /// v2 networking knows two or more nodes whose node IDs start with the
+    /// gateway ID, so it prefers none of them and holds no place for it.
+    Ambiguous,
 }
 
 /// How the connection slots are used.
@@ -226,7 +231,7 @@ impl From<&MinerSetCoverage> for MeshWindow {
 impl From<&PlacedGateway> for MeshGateway {
     fn from(gateway: &PlacedGateway) -> Self {
         Self {
-            node_id: hex::encode(gateway.node_id),
+            node_id: gateway.gateway_id.to_string(),
             blocks: gateway.blocks,
             state: gateway.place.into(),
             connected: gateway.connected,
@@ -241,6 +246,7 @@ impl From<GatewayPlace> for MeshGatewayState {
             GatewayPlace::Standby => Self::Standby,
             GatewayPlace::Backoff => Self::Backoff,
             GatewayPlace::Unmatched => Self::Unmatched,
+            GatewayPlace::Ambiguous => Self::Ambiguous,
         }
     }
 }

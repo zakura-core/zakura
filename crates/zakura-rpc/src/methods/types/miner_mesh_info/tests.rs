@@ -6,7 +6,10 @@
 //! (`connection_places_report_the_ranking_and_the_peers`); building one here
 //! would need a running endpoint and a dialer this crate cannot reach.
 
-use zakura_chain::{block::Height, miner_mesh::MinerSetCoverage};
+use zakura_chain::{
+    block::Height,
+    miner_mesh::{GatewayId, MinerSetCoverage},
+};
 use zakura_network::zakura::{
     ConnectedPeer, ConnectionPlaces, GatewayPlace, PlacedGateway, SlotSplit,
 };
@@ -26,6 +29,9 @@ const UNMATCHED_GATEWAY: [u8; 32] =
     node_id(b"ccc7a088afe130bbb69492031e9fa86cce4628852cc966a62ad73423e20bd947");
 const ORDINARY_PEER: [u8; 32] =
     node_id(b"ce2480c5c1da2c6c9d28b1a6f119b1eafb5993be37b2ad01728f3d286d5d93ea");
+/// A gateway whose ID two known nodes share. It is not a peer.
+const AMBIGUOUS_GATEWAY: [u8; 32] =
+    node_id(b"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
 
 const fn node_id(hex: &[u8]) -> [u8; 32] {
     match const_hex::const_decode_to_array(hex) {
@@ -56,7 +62,7 @@ fn coverage() -> MinerSetCoverage {
 
 fn gateway(node_id: [u8; 32], blocks: u32, place: GatewayPlace, connected: bool) -> PlacedGateway {
     PlacedGateway {
-        node_id,
+        gateway_id: GatewayId::from_node_id(&node_id),
         blocks,
         place,
         connected,
@@ -71,6 +77,7 @@ fn places() -> ConnectionPlaces {
             gateway(BACKOFF_GATEWAY, 12, GatewayPlace::Backoff, false),
             gateway(STANDBY_GATEWAY, 7, GatewayPlace::Standby, true),
             gateway(UNMATCHED_GATEWAY, 3, GatewayPlace::Unmatched, false),
+            gateway(AMBIGUOUS_GATEWAY, 2, GatewayPlace::Ambiguous, false),
         ],
         hold: 1,
         slot_limit: 40,
@@ -123,10 +130,22 @@ fn each_place_maps_to_its_state_in_rank_order() {
             (12, MeshGatewayState::Backoff, false),
             (7, MeshGatewayState::Standby, true),
             (3, MeshGatewayState::Unmatched, false),
+            (2, MeshGatewayState::Ambiguous, false),
         ]
     );
     let slots = response.slots.expect("the node runs v2 networking");
     assert_eq!((slots.in_use, slots.preferred, slots.ordinary), (3, 1, 2));
+}
+
+#[test]
+fn gateways_report_their_20_byte_id_and_peers_their_whole_node_id() {
+    let response = GetMinerMeshInfoResponse::new(node(), Some(&coverage()), Some(&places()));
+
+    assert_eq!(
+        response.gateways[0].node_id,
+        hex::encode(&PREFERRED_GATEWAY[..20])
+    );
+    assert_eq!(response.peers[0].node_id, hex::encode(PREFERRED_GATEWAY));
 }
 
 #[test]

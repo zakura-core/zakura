@@ -12,7 +12,7 @@ use std::{
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use rand_10::seq::SliceRandom;
 use thiserror::Error;
-use zakura_chain::block;
+use zakura_chain::{block, miner_mesh::GatewayId};
 use zakura_quic::{NodeAddr, NodeId, NodeKeyList, NodeSecretKey};
 use zakura_rt::{
     collections::{hash_map, HashMap, HashSet},
@@ -33,8 +33,10 @@ use crate::zakura::{
 };
 
 mod eviction;
+mod gateway_index;
 
 use eviction::EvictionIndex;
+use gateway_index::{GatewayIndex, GatewayMatch};
 
 /// Native discovery stream kind.
 pub const ZAKURA_STREAM_DISCOVERY: u16 = 4;
@@ -994,6 +996,20 @@ impl ZakuraDiscoveryDialCandidate {
     }
 }
 
+/// What the discovery book knows about the node a miner mesh gateway ID
+/// names.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum GatewayTarget {
+    /// The book holds no node whose ID starts with the gateway ID.
+    Unknown,
+    /// The book holds two or more nodes whose IDs start with the gateway ID,
+    /// so it cannot tell which one the miners named.
+    Ambiguous,
+    /// The book holds exactly this node with the gateway ID, and can dial it
+    /// as the target says.
+    Node(NodeId, DialTarget),
+}
+
 /// Header-sync candidate selection hints owned by the header-sync reactor.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ZakuraHeaderSyncCandidateState {
@@ -1303,6 +1319,9 @@ pub struct ZakuraDiscoveryBook {
     /// The non-static entries in eviction order. Every change to an entry
     /// updates it.
     eviction: EvictionIndex,
+    /// Every node in `entries` or `static_candidates`, so a gateway ID finds
+    /// its nodes without a scan.
+    gateways: GatewayIndex,
     /// Which addresses records learned from peers may carry.
     address_scope: AddressScope,
 }
@@ -2080,17 +2099,18 @@ impl ZakuraDiscoveryHandle {
         selected
     }
 
-    /// Returns what the book knows about dialing each of `node_ids`, in the
-    /// same order, by the checks the ordinary dial candidates pass.
+    /// Returns what the book knows about the node each of `gateways` names,
+    /// in the same order, and about dialing it by the checks the ordinary
+    /// dial candidates pass.
     ///
     /// It looks at the book only: the caller accounts for registered peers
     /// and dials in flight. The book stays locked for the whole list.
-    pub(crate) async fn dial_targets(&self, node_ids: &[NodeId]) -> Vec<DialTarget> {
+    pub(crate) async fn gateway_targets(&self, gateways: &[GatewayId]) -> Vec<GatewayTarget> {
         let now = current_unix_secs();
         let state = self.inner.lock().await;
-        node_ids
+        gateways
             .iter()
-            .map(|node_id| state.dial_target(node_id, now))
+            .map(|gateway| state.gateway_target(gateway, now))
             .collect()
     }
 
@@ -2346,6 +2366,7 @@ impl ZakuraDiscoveryBook {
             generation: 0,
             relayed: HashMap::new(),
             eviction: EvictionIndex::default(),
+            gateways: GatewayIndex::default(),
             address_scope: AddressScope::default(),
         }
     }
@@ -2504,6 +2525,7 @@ impl ZakuraDiscoveryBook {
             }
         }
 
+        self.gateways.insert(node_addr.id);
         let candidate = self
             .static_candidates
             .entry(node_addr.id)
@@ -2912,6 +2934,24 @@ impl ZakuraDiscoveryBook {
         }
     }
 
+    /// What the book knows about the node `gateway` names at `now`: none,
+    /// several, or exactly one, with what [`Self::dial_target`] says about
+    /// dialing it.
+    pub(crate) fn gateway_target(
+        &self,
+        gateway: &GatewayId,
+        now: u64,
+        dial_backoff: (Duration, Duration),
+    ) -> GatewayTarget {
+        match self.gateways.find(gateway) {
+            GatewayMatch::None => GatewayTarget::Unknown,
+            GatewayMatch::Several => GatewayTarget::Ambiguous,
+            GatewayMatch::One(node_id) => {
+                GatewayTarget::Node(node_id, self.dial_target(&node_id, now, dial_backoff))
+            }
+        }
+    }
+
     /// Marks a dial attempt for `node_id`.
     pub fn mark_dial_attempt(&mut self, node_id: &NodeId, now: u64) {
         if let Some(entry) = self.entries.get_mut(node_id) {
@@ -3192,6 +3232,7 @@ impl ZakuraDiscoveryBook {
             self.generation += 1;
         }
         self.eviction.insert(node_id, &entry);
+        self.gateways.insert(node_id);
         self.entries.insert(node_id, entry);
         self.evict_to_limits(now, changes);
         if !self.entries.contains_key(&node_id) {
@@ -3254,6 +3295,9 @@ impl ZakuraDiscoveryBook {
     ) {
         if let Some(entry) = self.entries.remove(node_id) {
             self.eviction.remove(*node_id, &entry);
+            if !self.static_candidates.contains_key(node_id) {
+                self.gateways.remove(node_id);
+            }
             self.unattribute(relay_of(entry.source, *node_id));
             changes.push(BookChange::Evicted {
                 node_id: *node_id,

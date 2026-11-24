@@ -47,11 +47,7 @@ fn publish(handler: &ZakuraProtocolHandler, ranking: &[(NodeId, GatewayStanding)
     let ranked = ranking
         .iter()
         .zip((1..=count).rev())
-        .map(|(&(node, standing), blocks)| RankedGateway {
-            node,
-            blocks,
-            standing,
-        });
+        .map(|(&(node, standing), blocks)| RankedGateway::of_node(node, blocks, standing));
     handler.publish_gateway_ranking(ranked);
 }
 
@@ -477,11 +473,8 @@ fn simultaneous_claims_never_pass_the_ordinary_limit() {
 }
 
 fn publish_tied_gateways(handler: &ZakuraProtocolHandler, first: NodeId, second: NodeId) {
-    let ranking = [first, second].map(|node| RankedGateway {
-        node,
-        blocks: 1,
-        standing: GatewayStanding::Dialable,
-    });
+    let ranking =
+        [first, second].map(|node| RankedGateway::of_node(node, 1, GatewayStanding::Dialable));
     handler.publish_gateway_ranking(ranking);
 }
 
@@ -543,11 +536,8 @@ fn ranking_publication_reconciles_authenticated_slots() {
         let incumbent = new_node();
         let challenger = new_node();
         publish_tied_gateways(&handler, incumbent, challenger);
-        let stale = [challenger, incumbent].map(|node| RankedGateway {
-            node,
-            blocks: 1,
-            standing: GatewayStanding::Dialable,
-        });
+        let stale = [challenger, incumbent]
+            .map(|node| RankedGateway::of_node(node, 1, GatewayStanding::Dialable));
         let mut slot = handler.claim_connection(incumbent, inbound).unwrap();
         if !inbound {
             slot.outbound_connected();
@@ -603,10 +593,12 @@ fn publication_checks_live_owners_at_the_ranking_cutoff() {
     let lower = nodes[257];
     let _lower = handler.claim_connection(lower, true).unwrap();
     let _tied = handler.claim_connection(tied, true).unwrap();
-    handler.publish_gateway_ranking(nodes.into_iter().map(|node| RankedGateway {
-        node,
-        blocks: if node == lower { 1 } else { 2 },
-        standing: GatewayStanding::Dialable,
+    handler.publish_gateway_ranking(nodes.into_iter().map(|node| {
+        RankedGateway::of_node(
+            node,
+            if node == lower { 1 } else { 2 },
+            GatewayStanding::Dialable,
+        )
     }));
     assert_eq!(preferred_set(&handler), [tied]);
 }

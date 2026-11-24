@@ -8,6 +8,7 @@
 
 use std::cmp::Ordering;
 
+use zakura_chain::miner_mesh::GatewayId;
 use zakura_rt::sync::watch;
 
 use super::super::preferred::MUTUAL_DIAL_GRACE;
@@ -103,7 +104,7 @@ fn ranking(gateways: &[NodeId]) -> MinerGatewayRanking {
             .iter()
             .zip((1..=count).rev())
             .map(|(gateway, blocks)| MinerGateway {
-                gateway_id: *gateway.as_bytes(),
+                gateway_id: GatewayId::from_node_id(gateway.as_bytes()),
                 blocks,
             })
             .collect(),

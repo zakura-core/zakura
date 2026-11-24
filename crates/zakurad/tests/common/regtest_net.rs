@@ -109,12 +109,12 @@ const LOG_TAIL_LINES: usize = 40;
 const CONNECTION_TRACE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The start of the lock script of a coinbase output that names a gateway:
-/// `OP_RETURN`, a push of the next 35 bytes, the tag `MR` and version 1. The
-/// 32-byte gateway ID follows.
+/// `OP_RETURN`, a push of the next 23 bytes, the tag `MR` and version 1. The
+/// 20-byte gateway ID follows.
 ///
 /// The bytes are written out here, not taken from `zakura-chain`, so the
 /// harness's count checks the node's parser instead of repeating it.
-const GATEWAY_MARKER_PREFIX: [u8; 5] = [0x6a, 0x23, b'M', b'R', 0x01];
+const GATEWAY_MARKER_PREFIX: [u8; 5] = [0x6a, 0x17, b'M', b'R', 0x01];
 
 /// The blocks above a marker before the gateway it names counts.
 pub const QUALIFYING_DEPTH: u32 = 100;
@@ -126,8 +126,8 @@ pub const MIN_GATEWAY_BLOCKS: u32 = 10;
 /// blocks at Regtest's 75 second spacing.
 pub const WINDOW_BLOCKS: u32 = 2 * 24 * 60 * 60 / 75;
 
-/// A v2 node ID, as a coinbase names a gateway.
-pub type GatewayId = [u8; 32];
+/// The first 20 bytes of a v2 node ID, as a coinbase names a gateway.
+pub type GatewayId = [u8; 20];
 
 /// A node's best block.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -461,9 +461,12 @@ impl RegtestNet {
         self.nodes[node].node_id
     }
 
-    /// The gateway ID a coinbase names when `node` is a pool.
+    /// The gateway ID a coinbase names when `node` is a pool: the first 20
+    /// bytes of its node ID.
     pub fn gateway_id(&self, node: usize) -> GatewayId {
-        *self.nodes[node].node_id.as_bytes()
+        self.nodes[node].node_id.as_bytes()[..20]
+            .try_into()
+            .expect("a node ID is longer than a gateway ID")
     }
 
     /// The gateway IDs of `nodes`, in order.
@@ -957,10 +960,17 @@ impl RegtestNet {
                 continue;
             };
             let mut line = format!("node {index}: {}", view.describe());
+            // Whole node IDs first, then the gateway IDs they start with.
             for (other, other_node) in self.nodes.iter().enumerate() {
                 line = line.replace(
                     &hex::encode(other_node.node_id.as_bytes()),
                     &format!("node {other}"),
+                );
+            }
+            for other in 0..self.nodes.len() {
+                line = line.replace(
+                    &hex::encode(self.gateway_id(other)),
+                    &format!("gateway {other}"),
                 );
             }
             text.push_str(&line);
@@ -973,7 +983,7 @@ impl RegtestNet {
 /// The gateway `block`'s coinbase names, if it names exactly one.
 ///
 /// A naming output holds zero value and its lock script is the marker prefix
-/// followed by the 32-byte gateway ID, and nothing else. A coinbase with two or
+/// followed by the 20-byte gateway ID, and nothing else. A coinbase with two or
 /// more naming outputs names no gateway.
 fn named_gateway(block: &Block) -> Option<GatewayId> {
     let coinbase = block.transactions.first()?;

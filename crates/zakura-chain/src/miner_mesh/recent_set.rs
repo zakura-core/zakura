@@ -10,7 +10,7 @@ use crate::{
     parameters::Network,
 };
 
-use super::{window::window, MinerMeshCommitment};
+use super::{window::window, GatewayId, MinerMeshCommitment};
 
 /// The gateways named by the best chain's recent blocks, with a count each.
 ///
@@ -40,14 +40,14 @@ pub struct RecentMinerSet {
 #[derive(Copy, Clone, Debug)]
 struct CheckedBlock {
     hash: block::Hash,
-    gateway_id: Option<[u8; 32]>,
+    gateway_id: Option<GatewayId>,
 }
 
 /// A gateway and the number of counted blocks that name it.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct GatewayBlocks {
     /// The gateway ID exactly as the blocks wrote it.
-    pub gateway_id: [u8; 32],
+    pub gateway_id: GatewayId,
     /// How many counted blocks name this gateway. Never zero.
     pub blocks: u32,
 }
@@ -188,7 +188,7 @@ impl RecentMinerSet {
     /// include displaced blocks until the owner has removed them, so the
     /// owner repairs the set before it takes a snapshot.
     pub fn snapshot(&self) -> MinerSetSnapshot {
-        let mut blocks_by_gateway: HashMap<[u8; 32], u32> = HashMap::new();
+        let mut blocks_by_gateway: HashMap<GatewayId, u32> = HashMap::new();
         for gateway_id in self.checked.values().filter_map(|block| block.gateway_id) {
             *blocks_by_gateway.entry(gateway_id).or_default() += 1;
         }

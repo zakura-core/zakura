@@ -6,15 +6,16 @@ use std::{
 };
 
 use thiserror::Error;
+use zakura_chain::miner_mesh::GatewayId;
 use zakura_quic::{NodeId, NodeKeyList};
 use zakura_rt::collections::{HashMap, HashSet};
 
 use super::protocol::{
     advertised_services, entry_is_expired, hello_verdict, normalize_direct_addrs,
     normalize_services, push_unique_service, AddressScope, BookChange, DialAdmission,
-    DialCandidateExclusions, DialTarget, DisclosureKey, DiscoveryBookError, DiscoveryRecordError,
-    DiscoveryRecordValidationContext, DiscoveryWireError, ImportBatchOutcome, ImportOutcome,
-    RecordVerdict, Services, ZakuraCachedLiveServiceSummary, ZakuraDiscoveryBook,
+    DialCandidateExclusions, DisclosureKey, DiscoveryBookError, DiscoveryRecordError,
+    DiscoveryRecordValidationContext, DiscoveryWireError, GatewayTarget, ImportBatchOutcome,
+    ImportOutcome, RecordVerdict, Services, ZakuraCachedLiveServiceSummary, ZakuraDiscoveryBook,
     ZakuraDiscoveryConfig, ZakuraDiscoveryDialCandidate, ZakuraDiscoveryEntry,
     ZakuraDiscoveryLocalConfig, ZakuraDiscoveryPersistedEntry, ZakuraNodeRecord,
     ZakuraNodeRecordBody, ZakuraServiceId, DEFAULT_LIVE_SERVICE_SUMMARY_TTL,
@@ -798,11 +799,12 @@ impl DiscoveryState {
         );
     }
 
-    /// What the book knows about dialing `node_id` at `now`, under the
-    /// configured dial backoff, as [`ZakuraDiscoveryBook::dial_target`] says.
-    pub(super) fn dial_target(&self, node_id: &NodeId, now: u64) -> DialTarget {
-        self.book.dial_target(
-            node_id,
+    /// What the book knows about the node `gateway` names and dialing it at
+    /// `now`, under the configured dial backoff, as
+    /// [`ZakuraDiscoveryBook::gateway_target`] says.
+    pub(super) fn gateway_target(&self, gateway: &GatewayId, now: u64) -> GatewayTarget {
+        self.book.gateway_target(
+            gateway,
             now,
             (self.config.dial_backoff_base, self.config.dial_backoff_max),
         )

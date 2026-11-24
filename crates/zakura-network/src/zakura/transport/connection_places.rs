@@ -2,6 +2,7 @@
 //! connection slots are used, and who holds them, read so an operator can see
 //! them.
 
+use zakura_chain::miner_mesh::GatewayId;
 use zakura_quic::NodeId;
 use zakura_rt::{collections::HashSet, sync::MutexGuard};
 
@@ -30,8 +31,9 @@ pub struct ConnectionPlaces {
 /// One ranked gateway and where it stands.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PlacedGateway {
-    /// The gateway's v2 node ID.
-    pub node_id: [u8; 32],
+    /// The ID the blocks name the gateway by: the first 20 bytes of its v2
+    /// node ID.
+    pub gateway_id: GatewayId,
     /// Recent blocks that name the gateway.
     pub blocks: u32,
     /// Where the gateway stands against the held places.
@@ -73,10 +75,10 @@ impl ConnectionPlaces {
         let gateways = preferred
             .places()
             .map(|(gateway, place)| PlacedGateway {
-                node_id: *gateway.node.as_bytes(),
+                gateway_id: gateway.gateway,
                 blocks: gateway.blocks,
                 place,
-                connected: registered.contains(&gateway.node),
+                connected: gateway.node.is_some_and(|node| registered.contains(&node)),
             })
             .collect();
         let mut peers: Vec<ConnectedPeer> = registered

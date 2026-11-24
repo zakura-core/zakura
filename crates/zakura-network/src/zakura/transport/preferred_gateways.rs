@@ -1,14 +1,20 @@
 //! The mining gateways this node holds connection places for.
 //!
-//! Mining pools name their gateway's v2 node ID in their coinbases, and a
-//! mining node ranks those IDs by how many recent blocks name them. The node
-//! keeps up to [`MAX_PREFERRED_GATEWAYS`] connection places that ordinary
-//! peers cannot fill, for the highest-ranked gateways it can reach.
+//! Mining pools name their gateway in their coinbases by a [`GatewayId`], the
+//! first 20 bytes of its v2 node ID, and a mining node ranks those IDs by how
+//! many recent blocks name them. The node keeps up to
+//! [`MAX_PREFERRED_GATEWAYS`] connection places that ordinary peers cannot
+//! fill, for the highest-ranked gateways it can reach.
+//!
+//! A ranked gateway ID names whichever node v2 networking knows with an ID
+//! that starts with it. When it knows two or more, it cannot tell which one
+//! the miners named, so it prefers none of them: the gateway is ambiguous.
 //!
 //! This module only decides how many places are held and which gateways may
 //! fill them. The connection-slot checks in `handshake_counts` apply that
 //! decision, and with an empty ranking they hold nothing.
 
+use zakura_chain::miner_mesh::GatewayId;
 use zakura_quic::NodeId;
 use zakura_rt::collections::{HashMap, HashSet};
 
@@ -25,6 +31,9 @@ pub(crate) const MAX_RANKED_GATEWAYS: usize = 256;
 pub enum GatewayStanding {
     /// v2 networking has no connection or usable dial address for the gateway.
     Unmatched,
+    /// v2 networking knows two or more nodes with the gateway ID, so it
+    /// prefers none of them.
+    Ambiguous,
     /// Known, but waiting out a failed dial before the next one.
     Backoff,
     /// Known, and may be dialed now.
@@ -39,9 +48,9 @@ pub enum GatewayStanding {
 }
 
 impl GatewayStanding {
-    /// Known to v2 networking, so it counts towards the hold.
+    /// Known to v2 networking as one node, so it counts towards the hold.
     fn matched(self) -> bool {
-        self != Self::Unmatched
+        !matches!(self, Self::Unmatched | Self::Ambiguous)
     }
 
     /// Reachable now, so it may fill a held place.
@@ -64,17 +73,67 @@ pub enum GatewayPlace {
     Backoff,
     /// v2 networking has no connection or usable dial address for it, so it takes no place.
     Unmatched,
+    /// v2 networking knows two or more nodes with its gateway ID, so it takes
+    /// no place.
+    Ambiguous,
 }
 
 /// One gateway of the ranking.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RankedGateway {
-    /// The gateway's v2 node ID.
-    pub node: NodeId,
+    /// The ID the blocks name the gateway by.
+    pub gateway: GatewayId,
+    /// The v2 node ID of the one node v2 networking knows with the gateway
+    /// ID, or `None` while it knows none, or two or more.
+    ///
+    /// A gateway that is dialable, being dialed, connected or in backoff
+    /// always has one.
+    pub node: Option<NodeId>,
     /// Recent blocks that name the gateway.
     pub blocks: u32,
     /// What v2 networking knows about the gateway.
     pub standing: GatewayStanding,
+}
+
+impl RankedGateway {
+    /// Returns this gateway once v2 networking knows `node`, whose ID starts
+    /// with this gateway ID.
+    ///
+    /// The gateway names `node` when it named no node or `node` already.
+    /// When it named another node, two known nodes share the gateway ID, so
+    /// it becomes [`GatewayStanding::Ambiguous`] and names neither. An
+    /// ambiguous gateway stays ambiguous.
+    pub(crate) fn with_node(mut self, node: NodeId) -> Self {
+        debug_assert!(self.gateway.is_prefix_of(node.as_bytes()));
+        match self.node {
+            _ if self.standing == GatewayStanding::Ambiguous => self,
+            None => {
+                self.node = Some(node);
+                self
+            }
+            Some(known) if known == node => self,
+            Some(_) => self.into_ambiguous(),
+        }
+    }
+
+    /// Returns this gateway once v2 networking knows two or more nodes with
+    /// its gateway ID: it names none of them.
+    pub(crate) fn into_ambiguous(mut self) -> Self {
+        self.node = None;
+        self.standing = GatewayStanding::Ambiguous;
+        self
+    }
+
+    /// A gateway named by `node`'s gateway ID and known as `node`.
+    #[cfg(any(test, feature = "p2p-fuzz"))]
+    pub(crate) fn of_node(node: NodeId, blocks: u32, standing: GatewayStanding) -> Self {
+        Self {
+            gateway: GatewayId::from_node_id(node.as_bytes()),
+            node: Some(node),
+            blocks,
+            standing,
+        }
+    }
 }
 
 /// A discovery snapshot prepared before taking the connection admission lock.
@@ -82,14 +141,14 @@ pub struct RankedGateway {
 pub struct GatewayRanking {
     candidates: Vec<RankedGateway>,
     /// Only a TLS-proven connection can lift one of these ties above the cutoff.
-    tied_at_cutoff: HashMap<NodeId, RankedGateway>,
+    tied_at_cutoff: HashMap<GatewayId, RankedGateway>,
 }
 
 fn unique_gateways(ranking: impl IntoIterator<Item = RankedGateway>) -> Vec<RankedGateway> {
-    let mut seen: HashSet<NodeId> = HashSet::default();
+    let mut seen: HashSet<GatewayId> = HashSet::default();
     ranking
         .into_iter()
-        .filter(|gateway| seen.insert(gateway.node))
+        .filter(|gateway| seen.insert(gateway.gateway))
         .collect()
 }
 
@@ -103,14 +162,14 @@ impl FromIterator<RankedGateway> for GatewayRanking {
             candidates.sort_unstable_by(|a, b| {
                 b.blocks
                     .cmp(&a.blocks)
-                    .then_with(|| a.node.as_bytes().cmp(b.node.as_bytes()))
+                    .then_with(|| a.gateway.cmp(&b.gateway))
             });
             let cutoff = candidates[MAX_RANKED_GATEWAYS - 1].blocks;
             tied_at_cutoff.extend(
                 candidates
                     .drain(MAX_RANKED_GATEWAYS..)
                     .take_while(|gateway| gateway.blocks == cutoff)
-                    .map(|gateway| (gateway.node, gateway)),
+                    .map(|gateway| (gateway.gateway, gateway)),
             );
         }
         Self {
@@ -121,17 +180,22 @@ impl FromIterator<RankedGateway> for GatewayRanking {
 }
 
 impl GatewayRanking {
-    /// At publication, look up only live owners among the tied overflow entries.
-    /// Entries below the cutoff score cannot advance even if they authenticated.
+    /// At publication, look up only live owners among the tied overflow entries,
+    /// by their gateway IDs. Each tied entry joins once, however many owners
+    /// share its gateway ID. Entries below the cutoff score cannot advance even
+    /// if they authenticated.
     pub(super) fn candidates<'a>(
         &self,
         authenticated: impl Iterator<Item = &'a NodeId>,
     ) -> Vec<RankedGateway> {
         let mut candidates = self.candidates.clone();
         if !self.tied_at_cutoff.is_empty() {
+            let mut joined: HashSet<GatewayId> = HashSet::default();
             candidates.extend(
                 authenticated
-                    .filter_map(|node| self.tied_at_cutoff.get(node))
+                    .map(|node| GatewayId::from_node_id(node.as_bytes()))
+                    .filter_map(|gateway| self.tied_at_cutoff.get(&gateway))
+                    .filter(|gateway| joined.insert(gateway.gateway))
                     .copied(),
             );
         }
@@ -166,7 +230,7 @@ impl PreferredGateways {
     ///
     /// Of a ranking longer than [`MAX_RANKED_GATEWAYS`], only that many are
     /// kept: the highest block counts, then connected gateways, then the
-    /// lowest node ID bytes.
+    /// lowest gateway ID bytes.
     ///
     /// The hold is the matched gateways, up to the ceiling, so a gateway in
     /// backoff still counts toward the shared hold. The set is the available
@@ -186,14 +250,14 @@ impl PreferredGateways {
             (
                 gateway.blocks,
                 connected(gateway),
-                connected(gateway) && incumbents.contains(&gateway.node),
+                connected(gateway) && gateway.node.is_some_and(|node| incumbents.contains(&node)),
             )
         };
         if ranking.len() > MAX_RANKED_GATEWAYS {
             ranking.sort_unstable_by(|a, b| {
                 priority(b)
                     .cmp(&priority(a))
-                    .then_with(|| a.node.as_bytes().cmp(b.node.as_bytes()))
+                    .then_with(|| a.gateway.cmp(&b.gateway))
             });
             ranking.truncate(MAX_RANKED_GATEWAYS);
         }
@@ -208,7 +272,7 @@ impl PreferredGateways {
         let set = ranking
             .iter()
             .filter(|gateway| gateway.standing.available())
-            .map(|gateway| gateway.node)
+            .filter_map(|gateway| gateway.node)
             .take(hold)
             .collect();
         Self {
@@ -241,11 +305,12 @@ impl PreferredGateways {
         self.ranking.iter().map(|gateway| {
             let place = match gateway.standing {
                 GatewayStanding::Unmatched => GatewayPlace::Unmatched,
+                GatewayStanding::Ambiguous => GatewayPlace::Ambiguous,
                 GatewayStanding::Backoff => GatewayPlace::Backoff,
                 GatewayStanding::Dialable
                 | GatewayStanding::Dialing
                 | GatewayStanding::Connected => {
-                    if self.contains(&gateway.node) {
+                    if gateway.node.is_some_and(|node| self.contains(&node)) {
                         GatewayPlace::Preferred
                     } else {
                         GatewayPlace::Standby
@@ -269,13 +334,29 @@ impl PreferredGateways {
         self.with_standing(node, GatewayStanding::Connected)
     }
 
+    /// The set re-formed with the gateway that `node`'s gateway ID names in
+    /// `standing`, once that gateway names `node`; `None` when nothing
+    /// changes.
+    ///
+    /// A gateway that named no node now names `node`. A gateway that named
+    /// another node becomes ambiguous instead, as [`RankedGateway::with_node`]
+    /// says, and `standing` is not applied.
     pub(super) fn with_standing(&self, node: &NodeId, standing: GatewayStanding) -> Option<Self> {
+        let gateway_id = GatewayId::from_node_id(node.as_bytes());
         let index = self
             .ranking
             .iter()
-            .position(|gateway| gateway.node == *node && gateway.standing != standing)?;
+            .position(|gateway| gateway.gateway == gateway_id)?;
+        let current = self.ranking[index];
+        let mut updated = current.with_node(*node);
+        if updated.node == Some(*node) {
+            updated.standing = standing;
+        }
+        if updated == current {
+            return None;
+        }
         let mut ranking = self.ranking.clone();
-        ranking[index].standing = standing;
+        ranking[index] = updated;
         Some(Self::form(ranking, self.hold_limit))
     }
 
@@ -291,7 +372,7 @@ impl PreferredGateways {
         let index = self
             .ranking
             .iter()
-            .position(|gateway| gateway.node == *node && gateway.standing.available())?;
+            .position(|gateway| gateway.node == Some(*node) && gateway.standing.available())?;
         let mut ranking = self.ranking.clone();
         ranking[index].standing = GatewayStanding::Backoff;
         Some(Self::form(ranking, self.hold_limit))

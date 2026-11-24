@@ -2,13 +2,16 @@
 //! discovery dialer sees them.
 //!
 //! The node ranks gateways by how many recent blocks name them and hands the
-//! ranking to the dialer as a [`MinerGatewayRanking`]. The dialer converts it
-//! to node IDs once per change ([`PreferredGatewayInput`]), then each round
-//! classifies every ranked gateway from the registered peers, its own dials
-//! in flight and the discovery book ([`classify_gateways`]).
+//! ranking to the dialer as a [`MinerGatewayRanking`]. The dialer ranks it
+//! once per change ([`PreferredGatewayInput`]), then each round resolves
+//! every ranked gateway ID to the one node it names and classifies it, from
+//! the registered peers, its own dials in flight and the discovery book
+//! ([`classify_gateways`]). Those node IDs feed the preferred dial pass and
+//! the places the connection-slot checks hold.
 
 use std::{net::IpAddr, time::Duration};
 
+use zakura_chain::miner_mesh::GatewayId;
 use zakura_quic::{NodeAddr, NodeId};
 use zakura_rt::{
     collections::{HashMap, HashSet},
@@ -16,7 +19,9 @@ use zakura_rt::{
     time::Instant,
 };
 
-use super::super::protocol::{DialTarget, ZakuraDiscoveryDialCandidate, ZakuraDiscoveryHandle};
+use super::super::protocol::{
+    DialTarget, GatewayTarget, ZakuraDiscoveryDialCandidate, ZakuraDiscoveryHandle,
+};
 use super::discovery_node_addr_with_reserved_ip_capacity;
 use super::state::{CandidateDialerState, DialAttemptKey};
 use crate::zakura::{GatewayStanding, RankedGateway, MAX_RANKED_GATEWAYS};
@@ -24,11 +29,12 @@ use crate::zakura::{GatewayStanding, RankedGateway, MAX_RANKED_GATEWAYS};
 /// Mining gateways ranked by how many recent best-chain blocks name them.
 ///
 /// The list may be in any order. The dialer ranks gateways by block count,
-/// most first, and by lower ID bytes among equal counts, and considers only
-/// the first 256 by rank. zakurad converts the chain crate's gateway counts
-/// into this type in one place. It is the node's raw input; the dialer turns
-/// it into [`RankedGateway`]s, which carry each gateway's [`GatewayStanding`]
-/// for the connection-slot checks.
+/// most first, and by lower gateway ID bytes among equal counts, and
+/// considers only the first 256 by rank. zakurad converts the chain crate's
+/// gateway counts into this type in one place. It is the node's raw input;
+/// the dialer turns it into [`RankedGateway`]s, which carry the node each
+/// gateway ID names and each gateway's [`GatewayStanding`] for the
+/// connection-slot checks.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MinerGatewayRanking {
     /// The gateways named in enough counted blocks for the node to prefer
@@ -39,8 +45,9 @@ pub struct MinerGatewayRanking {
 /// One gateway in a [`MinerGatewayRanking`].
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct MinerGateway {
-    /// The gateway's node ID exactly as the blocks wrote it.
-    pub gateway_id: [u8; 32],
+    /// The gateway ID exactly as the blocks wrote it: the first 20 bytes of
+    /// the gateway's v2 node ID.
+    pub gateway_id: GatewayId,
     /// How many counted blocks name this gateway.
     pub blocks: u32,
 }
@@ -49,11 +56,14 @@ pub struct MinerGateway {
 /// most [`MAX_RANKED_GATEWAYS`] plus ties at the cutoff. Their standings are
 /// [`GatewayStanding::Unmatched`] until [`classify_gateways`] reads them.
 ///
-/// It drops entries with no blocks, `local_node_id`, and repeats of an ID,
-/// keeping the repeat with the most blocks. It ranks before it drops or caps
+/// It drops entries with no blocks, the gateway ID of `local_node_id`, and
+/// repeats of an ID, keeping the repeat with the most blocks. A node never
+/// prefers a gateway ID that its own node ID starts with, even when another
+/// node shares it. It ranks before it drops or caps
 /// anything, so a dropped entry takes no place and lower-ranked entries can't
 /// push out a better one.
 fn rank_gateways(ranking: &MinerGatewayRanking, local_node_id: NodeId) -> Vec<RankedGateway> {
+    let local_gateway = GatewayId::from_node_id(local_node_id.as_bytes());
     let mut gateways: Vec<MinerGateway> = ranking
         .gateways
         .iter()
@@ -69,12 +79,13 @@ fn rank_gateways(ranking: &MinerGatewayRanking, local_node_id: NodeId) -> Vec<Ra
     let mut ranked: Vec<_> = gateways
         .into_iter()
         .filter(|gateway| seen.insert(gateway.gateway_id))
+        .filter(|gateway| gateway.gateway_id != local_gateway)
         .map(|gateway| RankedGateway {
-            node: NodeId::from_bytes(&gateway.gateway_id),
+            gateway: gateway.gateway_id,
+            node: None,
             blocks: gateway.blocks,
             standing: GatewayStanding::Unmatched,
         })
-        .filter(|gateway| gateway.node != local_node_id)
         .collect();
     // Admission resolves cutoff ties against the live authenticated connections.
     if let Some(cutoff) = ranked.get(MAX_RANKED_GATEWAYS - 1) {
@@ -138,12 +149,17 @@ pub(super) struct ClassifiedGateways {
     pub(super) dialable: HashMap<NodeId, ZakuraDiscoveryDialCandidate>,
 }
 
-/// Classifies each of `ranked`, in its order, at `now`.
+/// Resolves each of `ranked`, in its order, to the one node its gateway ID
+/// names, and classifies it at `now`.
 ///
-/// A gateway in `registered` is connected, even while a dial to it is still
-/// in flight; one the dialer `state` has in flight is being dialed; the
-/// discovery book answers for the rest in one lookup, which an empty ranking
-/// skips, and [`dialer_standing`] adds the dialer's own backoff to its
+/// The nodes a gateway ID can name are the peers in `registered`, the nodes
+/// the dialer `state` has in flight and the nodes the discovery book holds,
+/// which the book answers for in one lookup that an empty ranking skips.
+/// When those hold two or more nodes with one gateway ID, the gateway is
+/// ambiguous and names none of them. Otherwise a gateway whose node is
+/// registered is connected, even while a dial to it is still in flight; one
+/// the dialer has in flight is being dialed; and the book answers for the
+/// rest, with [`dialer_standing`] adding the dialer's own backoff to its
 /// answer.
 pub(super) async fn classify_gateways(
     ranked: &[RankedGateway],
@@ -154,46 +170,54 @@ pub(super) async fn classify_gateways(
 ) -> ClassifiedGateways {
     let registered: HashSet<NodeId> = registered.iter().copied().collect();
     let in_flight: HashSet<NodeId> = state.in_flight_node_ids().into_iter().collect();
-    let local_standing = |gateway: &RankedGateway| {
-        if registered.contains(&gateway.node) {
-            Some(GatewayStanding::Connected)
-        } else if in_flight.contains(&gateway.node) {
-            Some(GatewayStanding::Dialing)
-        } else {
-            None
-        }
-    };
 
     let (candidates, tied) = ranked.split_at(ranked.len().min(MAX_RANKED_GATEWAYS));
-    let unresolved: Vec<NodeId> = candidates
+    let mut resolved = candidates.to_vec();
+    let by_gateway: HashMap<GatewayId, usize> = resolved
         .iter()
-        .filter(|gateway| local_standing(gateway).is_none())
-        .map(|gateway| gateway.node)
+        .enumerate()
+        .map(|(index, gateway)| (gateway.gateway, index))
         .collect();
-    let book_answers = if unresolved.is_empty() {
+    for node in registered.iter().chain(&in_flight) {
+        if let Some(&index) = by_gateway.get(&GatewayId::from_node_id(node.as_bytes())) {
+            resolved[index] = resolved[index].with_node(*node);
+        }
+    }
+
+    let gateways: Vec<GatewayId> = resolved.iter().map(|gateway| gateway.gateway).collect();
+    let book_answers = if gateways.is_empty() {
         Vec::new()
     } else {
-        discovery.dial_targets(&unresolved).await
+        discovery.gateway_targets(&gateways).await
     };
-    let mut book_answers = book_answers.into_iter();
 
     let mut classified = ClassifiedGateways::default();
-    for gateway in candidates {
-        let standing = local_standing(gateway).unwrap_or_else(|| {
-            let target = book_answers
-                .next()
-                .expect("the book answers once for every unresolved gateway, in order");
-            let standing = dialer_standing(state, &target, now);
-            if let (GatewayStanding::Dialable, DialTarget::Dialable(candidate)) = (standing, target)
-            {
-                classified.dialable.insert(gateway.node, candidate);
-            }
-            standing
-        });
-        classified.ranking.push(RankedGateway {
-            standing,
-            ..*gateway
-        });
+    for (gateway, book_answer) in resolved.into_iter().zip(book_answers) {
+        let (mut gateway, book_target) = match book_answer {
+            GatewayTarget::Unknown => (gateway, None),
+            GatewayTarget::Ambiguous => (gateway.into_ambiguous(), None),
+            GatewayTarget::Node(node, target) => (gateway.with_node(node), Some(target)),
+        };
+        if let Some(node) = gateway.node {
+            gateway.standing = if registered.contains(&node) {
+                GatewayStanding::Connected
+            } else if in_flight.contains(&node) {
+                GatewayStanding::Dialing
+            } else {
+                let target = book_target.expect(
+                    "a node that is neither registered nor in flight came from the book, \
+                     which said how to dial it",
+                );
+                let standing = dialer_standing(state, &target, now);
+                if let (GatewayStanding::Dialable, DialTarget::Dialable(candidate)) =
+                    (standing, target)
+                {
+                    classified.dialable.insert(node, candidate);
+                }
+                standing
+            };
+        }
+        classified.ranking.push(gateway);
     }
     classified.ranking.extend_from_slice(tied);
     classified
@@ -490,10 +514,32 @@ mod tests {
         NodeSecretKey::from_bytes(&[byte; 32]).public()
     }
 
+    /// A node ID made of `prefix` in its first 20 bytes and `last` in the
+    /// rest, so two such IDs can share a gateway ID.
+    fn raw_node_id(prefix: u8, last: u8) -> NodeId {
+        let mut bytes = [last; 32];
+        bytes[..20].fill(prefix);
+        NodeId::from_bytes(&bytes)
+    }
+
+    fn gateway_id(node_id: NodeId) -> GatewayId {
+        GatewayId::from_node_id(node_id.as_bytes())
+    }
+
     fn gateway(node_id: NodeId, blocks: u32) -> MinerGateway {
         MinerGateway {
-            gateway_id: *node_id.as_bytes(),
+            gateway_id: gateway_id(node_id),
             blocks,
+        }
+    }
+
+    /// The ranked entry for `node_id`'s gateway ID before it is resolved.
+    fn unresolved(node_id: NodeId, blocks: u32) -> RankedGateway {
+        RankedGateway {
+            gateway: gateway_id(node_id),
+            node: None,
+            blocks,
+            standing: GatewayStanding::Unmatched,
         }
     }
 
@@ -501,8 +547,12 @@ mod tests {
         MinerGatewayRanking { gateways }
     }
 
-    fn ranked_ids(ranked: &[RankedGateway]) -> Vec<NodeId> {
-        ranked.iter().map(|gateway| gateway.node).collect()
+    fn ranked_ids(ranked: &[RankedGateway]) -> Vec<GatewayId> {
+        ranked.iter().map(|gateway| gateway.gateway).collect()
+    }
+
+    fn gateway_ids(node_ids: &[NodeId]) -> Vec<GatewayId> {
+        node_ids.iter().copied().map(gateway_id).collect()
     }
 
     fn discovery_handle() -> ZakuraDiscoveryHandle {
@@ -539,7 +589,7 @@ mod tests {
             node_id(99),
         );
 
-        assert_eq!(ranked_ids(&ranked), vec![c, tied[0], tied[1]]);
+        assert_eq!(ranked_ids(&ranked), gateway_ids(&[c, tied[0], tied[1]]));
         assert_eq!(
             ranked
                 .iter()
@@ -550,12 +600,27 @@ mod tests {
     }
 
     #[test]
-    fn ranking_drops_the_local_node() {
+    fn ranking_drops_the_local_gateway_id() {
         let local = node_id(1);
         let other = node_id(2);
         let ranked = rank_gateways(&ranking(vec![gateway(local, 50), gateway(other, 3)]), local);
 
-        assert_eq!(ranked_ids(&ranked), vec![other]);
+        assert_eq!(ranked_ids(&ranked), gateway_ids(&[other]));
+    }
+
+    /// A gateway ID that the local node ID starts with is dropped even when
+    /// the miners meant another node that shares it.
+    #[test]
+    fn ranking_drops_a_gateway_id_the_local_node_shares() {
+        let local = raw_node_id(1, 0x00);
+        let sharing = raw_node_id(1, 0xff);
+        let other = raw_node_id(2, 0x00);
+        let ranked = rank_gateways(
+            &ranking(vec![gateway(sharing, 50), gateway(other, 3)]),
+            local,
+        );
+
+        assert_eq!(ranked_ids(&ranked), gateway_ids(&[other]));
     }
 
     #[test]
@@ -566,14 +631,7 @@ mod tests {
             node_id(99),
         );
 
-        assert_eq!(
-            ranked,
-            vec![RankedGateway {
-                node: a,
-                blocks: 7,
-                standing: GatewayStanding::Unmatched,
-            }]
-        );
+        assert_eq!(ranked, vec![unresolved(a, 7)]);
     }
 
     #[test]
@@ -587,7 +645,7 @@ mod tests {
     fn ranking_drops_gateways_with_no_blocks() {
         let (a, b) = (node_id(1), node_id(2));
         let ranked = rank_gateways(&ranking(vec![gateway(a, 0), gateway(b, 1)]), node_id(99));
-        assert_eq!(ranked_ids(&ranked), vec![b]);
+        assert_eq!(ranked_ids(&ranked), gateway_ids(&[b]));
     }
 
     #[test]
@@ -608,7 +666,10 @@ mod tests {
         let ranked = rank_gateways(&ranking(gateways), node_id(99));
 
         assert_eq!(ranked.len(), MAX_RANKED_GATEWAYS);
-        assert_eq!(ranked_ids(&ranked), ids[..MAX_RANKED_GATEWAYS].to_vec());
+        assert_eq!(
+            ranked_ids(&ranked),
+            gateway_ids(&ids[..MAX_RANKED_GATEWAYS])
+        );
     }
 
     #[test]
@@ -616,10 +677,10 @@ mod tests {
         let (a, b) = (node_id(1), node_id(2));
         let (sender, receiver) = watch::channel(ranking(vec![gateway(a, 1)]));
         let mut input = PreferredGatewayInput::new(Some(receiver), node_id(99));
-        assert_eq!(ranked_ids(input.current()), vec![a]);
+        assert_eq!(ranked_ids(input.current()), gateway_ids(&[a]));
 
         sender.send_replace(ranking(vec![gateway(a, 1), gateway(b, 2)]));
-        assert_eq!(ranked_ids(input.current()), vec![b, a]);
+        assert_eq!(ranked_ids(input.current()), gateway_ids(&[b, a]));
 
         drop(sender);
         assert!(input.current().is_empty());
@@ -679,11 +740,7 @@ mod tests {
             dialer_backoff,
         ]
         .into_iter()
-        .map(|node| RankedGateway {
-            node,
-            blocks: 1,
-            standing: GatewayStanding::Unmatched,
-        })
+        .map(|node| unresolved(node, 1))
         .collect();
         let classified = classify_gateways(
             &ranked,
@@ -711,6 +768,24 @@ mod tests {
                 GatewayStanding::Backoff,
             ]
         );
+        let nodes: Vec<_> = classified
+            .ranking
+            .iter()
+            .map(|gateway| gateway.node)
+            .collect();
+        assert_eq!(
+            nodes,
+            vec![
+                Some(connected),
+                Some(dialing),
+                Some(dialable),
+                Some(backoff),
+                None,
+                Some(connected_and_dialing),
+                Some(dialer_backoff),
+            ],
+            "each gateway ID resolves to the one known node that starts with it",
+        );
         assert_eq!(
             classified.dialable,
             HashMap::from_iter([(
@@ -722,5 +797,71 @@ mod tests {
                 }
             )])
         );
+    }
+
+    /// Classifies `ranked` with nothing in flight, given the peers
+    /// `registered` and the static candidates `book`.
+    async fn classify_with(
+        ranked: &[RankedGateway],
+        registered: &[NodeId],
+        book: &[NodeId],
+    ) -> ClassifiedGateways {
+        let discovery = discovery_handle();
+        for (index, node) in book.iter().enumerate() {
+            let last = u8::try_from(index + 1).expect("a test book holds few nodes");
+            discovery
+                .insert_static_candidate(NodeAddr::with_addrs(*node, [addr(last)]))
+                .await
+                .expect("the static candidate is valid");
+        }
+        let state =
+            CandidateDialerState::new((Duration::from_secs(60), Duration::from_secs(3_600)));
+        classify_gateways(ranked, registered, &state, &discovery, Instant::now()).await
+    }
+
+    #[tokio::test]
+    async fn a_gateway_id_resolves_only_to_a_node_that_starts_with_it() {
+        let named = raw_node_id(1, 0x00);
+        let other = raw_node_id(2, 0x00);
+
+        let classified = classify_with(&[unresolved(named, 1)], &[other], &[named]).await;
+
+        assert_eq!(classified.ranking[0].node, Some(named));
+        assert_eq!(classified.ranking[0].standing, GatewayStanding::Dialable);
+        assert_eq!(
+            classified.dialable.keys().copied().collect::<Vec<_>>(),
+            vec![named]
+        );
+
+        let classified = classify_with(&[unresolved(named, 1)], &[other], &[other]).await;
+
+        assert_eq!(classified.ranking[0].node, None);
+        assert_eq!(classified.ranking[0].standing, GatewayStanding::Unmatched);
+        assert!(classified.dialable.is_empty());
+    }
+
+    /// Two known nodes that share a ranked gateway ID leave it ambiguous,
+    /// whether the book holds both or one is a registered peer, and neither
+    /// is dialed.
+    #[tokio::test]
+    async fn a_gateway_id_two_known_nodes_share_is_ambiguous() {
+        let first = raw_node_id(1, 0x00);
+        let second = raw_node_id(1, 0xff);
+        let ranked = [unresolved(first, 1)];
+
+        for (registered, book) in [
+            (vec![], vec![first, second]),
+            (vec![first], vec![second]),
+            (vec![first, second], vec![]),
+        ] {
+            let classified = classify_with(&ranked, &registered, &book).await;
+
+            assert_eq!(
+                (classified.ranking[0].node, classified.ranking[0].standing),
+                (None, GatewayStanding::Ambiguous),
+                "registered {registered:?}, book {book:?}",
+            );
+            assert!(classified.dialable.is_empty());
+        }
     }
 }

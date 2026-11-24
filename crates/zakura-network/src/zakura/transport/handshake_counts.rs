@@ -1,6 +1,7 @@
 //! Pure admission decisions and charges shared by QUIC and control handshakes.
 
 use std::{net::IpAddr, time::Duration};
+use zakura_chain::miner_mesh::GatewayId;
 use zakura_quic::NodeId;
 use zakura_rt::{collections::HashMap, time::Instant};
 
@@ -344,13 +345,33 @@ impl HandshakeCounts {
             self.connections.of_node(node).inbound > 0
                 || self.authenticated_dials.contains_key(node)
         };
-        let owners = self.connections.nodes().filter(|node| authenticated(node));
-        let mut live = ranking.candidates(owners);
+        let owners: Vec<NodeId> = self
+            .connections
+            .nodes()
+            .filter(|node| authenticated(node))
+            .copied()
+            .collect();
+        let mut live = ranking.candidates(owners.iter());
+        // An owner that connected after discovery took its snapshot names
+        // the gateway with its gateway ID, or makes it ambiguous.
+        let by_gateway: HashMap<GatewayId, usize> = live
+            .iter()
+            .enumerate()
+            .map(|(index, gateway)| (gateway.gateway, index))
+            .collect();
+        for owner in &owners {
+            if let Some(&index) = by_gateway.get(&GatewayId::from_node_id(owner.as_bytes())) {
+                live[index] = live[index].with_node(*owner);
+            }
+        }
         for gateway in &mut live {
-            if authenticated(&gateway.node) {
+            let Some(node) = gateway.node else {
+                continue;
+            };
+            if authenticated(&node) {
                 gateway.standing = GatewayStanding::Connected;
             } else if gateway.standing == GatewayStanding::Connected {
-                gateway.standing = if self.connections.of_node(&gateway.node).outbound > 0 {
+                gateway.standing = if self.connections.of_node(&node).outbound > 0 {
                     GatewayStanding::Dialing
                 } else {
                     GatewayStanding::Backoff

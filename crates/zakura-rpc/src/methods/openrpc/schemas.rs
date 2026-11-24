@@ -105,7 +105,7 @@ fn string_enum(description: &str, variants: &[(&str, &str)]) -> Value {
 }
 
 component_schema! {
-    MeshGatewayState => { "type": "string", "enum": ["preferred", "standby", "backoff", "unmatched"] },
+    MeshGatewayState => { "type": "string", "enum": ["preferred", "standby", "backoff", "unmatched", "ambiguous"] },
     HexData => {
         "description": "Deserialize hex-encoded strings to bytes.",
         "type": "string",

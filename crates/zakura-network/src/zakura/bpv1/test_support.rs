@@ -23,7 +23,7 @@ use zakura_node_services::{
     block_memory::{DecodedBlockPool, OwnedBlock},
     body_claims::SharedBodyClaims,
 };
-use zakura_quic::{ConnLoad, NodeId, NodeSecretKey};
+use zakura_quic::{ConnLoad, NodeId};
 use zakura_rt::{
     collections::{HashMap, HashSet},
     sync::{watch, CancellationToken, Mutex},
@@ -72,8 +72,10 @@ pub(super) fn part_frame(coding: &Coding, index: u32) -> Vec<u8> {
     vec![0; part_payload_len(coding, index).unwrap_or(36)]
 }
 
+/// A node id of 32 `b` bytes. It skips key derivation, which costs milliseconds
+/// in an unoptimized build. BPv1 machines only compare and hash node ids.
 pub(super) fn node_id(b: u8) -> NodeId {
-    NodeSecretKey::from_bytes(&[b; 32]).public()
+    NodeId::from_bytes(&[b; 32])
 }
 
 /// Regtest with NU7 active from height 1.

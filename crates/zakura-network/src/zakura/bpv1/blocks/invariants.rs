@@ -112,7 +112,10 @@ impl BlockTable {
                 assert!(!block.body_claimed);
             }
             for st in &block.stripes {
-                if !st.assemblable && !st.decoding() {
+                // bpv1-28 budgets pulls. A decode may end with more than `k`
+                // parts held, and a `Fallback` block keeps them to serve but
+                // pulls nothing, so only a collecting stripe is bound.
+                if block.phase == BlockPhase::Collecting && !st.assemblable && !st.decoding() {
                     assert!(
                         st.held_count.saturating_add(st.claims.len() as u32) <= block.meta.coding.k,
                         "{BLOCK_REPLAY}: bpv1-28 held ({}) + pending ({}) > k ({})",

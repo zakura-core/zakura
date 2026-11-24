@@ -1202,6 +1202,58 @@ fn bpv1_57_partial_progress_falls_back_once_at_the_unmoved_deadline() {
         .any(|(_, e)| matches!(e, BlockEvent::PartInserted { .. })));
 }
 
+/// bpv1-28 budgets pulls, so it binds only a block that still pulls. A part
+/// that arrives while a stripe decodes is kept, and the reconstruction
+/// deadline then ends the decode. The block in `Fallback` keeps its verified
+/// parts to serve and pulls nothing, so it may hold more than `k` (#2714).
+#[test]
+fn bpv1_28_pull_budget_binds_only_a_collecting_block() {
+    let now = Instant::now();
+    let encoded = encode_body(&Profile::TINY, &[0x5A; 128], 2).unwrap();
+    let k = encoded.coding.k as usize;
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let block_id = block::Hash([0x27; 32]);
+    admit(&mut table, now, block_id, encoded.coding, encoded.part_root);
+    // `k - 1` source parts and one parity part start a decode.
+    let mut parts: Vec<_> = encoded.parts[..k - 1].to_vec();
+    parts.push(encoded.parts[k].clone());
+    let mut decode = None;
+    for part in &parts {
+        for o in insert(
+            &mut table,
+            now,
+            block_id,
+            part,
+            node_id(2),
+            PartAuth::Want(1),
+        )
+        .outputs
+        {
+            if let BlockOutput::StartStripeJob {
+                work_id,
+                kind: StripeJob::Decode,
+                ..
+            } = o
+            {
+                decode = Some(work_id);
+            }
+        }
+    }
+    assert!(decode.is_some(), "a parity part starts a decode");
+    insert(
+        &mut table,
+        now,
+        block_id,
+        &encoded.parts[k + 1],
+        node_id(3),
+        PartAuth::Want(1),
+    );
+    table.assert_invariants();
+    tick(&mut table, now + RECONSTRUCTION_DEADLINE, &[]);
+    assert_eq!(table.block_phase(&block_id), Some(BlockPhase::Fallback));
+    table.assert_invariants();
+}
+
 /// An empty body has no parts, so admission hands the block to the verifier
 /// at once: no pull, no `StripeDone`, and `BlockDone` after assembly, as for
 /// any assembled block. A `Have` for it plans nothing.

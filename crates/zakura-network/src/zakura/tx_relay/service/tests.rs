@@ -18,6 +18,7 @@ use zakura_node_services::mempool::{
 };
 
 use super::*;
+use crate::zakura::tx_relay::ZakuraTxRelayConfig;
 use crate::zakura::{framed_channel, transport::CloseCause};
 
 /// Distinct Mainnet transactions, each at most the protocol's size.
@@ -531,6 +532,37 @@ async fn queued_have_frames_reach_the_machine_as_one() {
     );
 }
 
+/// Answers the core's next reservation with `answer` while `session` applies
+/// its pool calls up to the reservation's result, after checking that the
+/// reservation asks for `tx_id` and says `relayed`.
+async fn answer_reserve(
+    session: &mut Session,
+    inbox: &mut PoolInbox,
+    tx_id: UnminedTxId,
+    relayed: RelayedFetch,
+    answer: Result<Reservation, PortUnreserved>,
+) {
+    let core = async {
+        let Some(PoolCommand::Reserve {
+            tx_id: asked,
+            relayed: said,
+            reply,
+        }) = inbox.next().await
+        else {
+            panic!("the fetch asks the core for a reservation");
+        };
+        assert_eq!((asked, said), (tx_id, Some(relayed)));
+        let _ = reply.send(answer);
+    };
+    let reserved = apply_calls(session, |r| matches!(r, PoolResult::Reserved { .. }));
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        futures::future::join(reserved, core),
+    )
+    .await
+    .expect("the reservation's answer comes back promptly");
+}
+
 /// `02 §7` item 7, `mem-7`:
 /// - A fetch leases its announced size from `Consumer::Tx` before it asks
 ///   the core for a reservation, and holds the lease until the core ends it,
@@ -583,35 +615,12 @@ async fn a_fetch_holds_its_tx_lease_until_the_core_ends_it() {
         .deliver(TxRelayMessage::Have(vec![(id_a, size_a)]))
         .await;
     assert_eq!(tx_leased(), u64::from(size_a));
-    let grant = async {
-        let Some(PoolCommand::Reserve {
-            tx_id,
-            relayed,
-            reply,
-        }) = inbox.next().await
-        else {
-            panic!("the fetch asks the core for a reservation");
-        };
-        assert_eq!(tx_id, id_a);
-        assert_eq!(
-            relayed,
-            Some(RelayedFetch {
-                announced_size: u64::from(size_a),
-                leased_bytes: u64::from(size_a),
-            })
-        );
-        let (reservation, hold) =
-            inbox.grant_relayed(ReservationId(1), tx_id, CancellationToken::new());
-        let _ = reply.send(Ok(reservation));
-        hold
+    let (reservation, hold) = inbox.grant_relayed(ReservationId(1), id_a, CancellationToken::new());
+    let leased = RelayedFetch {
+        announced_size: u64::from(size_a),
+        leased_bytes: u64::from(size_a),
     };
-    let reserved = apply_calls(&mut session, |r| matches!(r, PoolResult::Reserved { .. }));
-    let ((), hold) = tokio::time::timeout(
-        Duration::from_secs(5),
-        futures::future::join(reserved, grant),
-    )
-    .await
-    .expect("the reservation completes promptly");
+    answer_reserve(&mut session, &mut inbox, id_a, leased, Ok(reservation)).await;
     assert_eq!(
         tx_leased(),
         u64::from(size_a),
@@ -622,26 +631,12 @@ async fn a_fetch_holds_its_tx_lease_until_the_core_ends_it() {
     session
         .deliver(TxRelayMessage::Have(vec![(id_b, size_b)]))
         .await;
-    let refuse = async {
-        let Some(PoolCommand::Reserve { relayed, reply, .. }) = inbox.next().await else {
-            panic!("a fetch without a lease still asks the core");
-        };
-        assert_eq!(
-            relayed,
-            Some(RelayedFetch {
-                announced_size: u64::from(size_b),
-                leased_bytes: 0,
-            })
-        );
-        let _ = reply.send(Err(PortUnreserved::NoRoom));
+    let unleased = RelayedFetch {
+        announced_size: u64::from(size_b),
+        leased_bytes: 0,
     };
-    let refused = apply_calls(&mut session, |r| matches!(r, PoolResult::Reserved { .. }));
-    tokio::time::timeout(
-        Duration::from_secs(5),
-        futures::future::join(refused, refuse),
-    )
-    .await
-    .expect("the refusal comes back promptly");
+    let refusal = Err(PortUnreserved::NoRoom);
+    answer_reserve(&mut session, &mut inbox, id_b, unleased, refusal).await;
     assert_eq!(tx_leased(), u64::from(size_a));
 
     // The core ends `tx_a`'s lease, and the lease goes back.

@@ -14061,69 +14061,6 @@ mod tests {
         Ok(())
     }
 
-    /// fix-15: the payload buffer grows as bytes arrive, so a frame sent in
-    /// many small writes reads back whole and in order.
-    #[tokio::test]
-    async fn a_payload_sent_in_pieces_reads_back_whole() -> Result<(), BoxError> {
-        const ALPN: &[u8] = b"/zakura/testkit/payload-in-pieces/0";
-        const PIECE: usize = 1000;
-        const PAYLOAD_LEN: usize = 40 * PIECE + 7;
-        let _guard = zakura_test::init();
-        let server = LocalEndpointFactory::new().endpoint(74).await?;
-        let (conn_tx, _conn_rx) = mpsc::channel(2);
-        let (stream_tx, mut stream_rx) = mpsc::channel(4);
-        server.serve(CaptureConnection {
-            alpn: ALPN,
-            connection_tx: conn_tx,
-            stream_tx,
-        })?;
-        let client = LocalEndpointFactory::new().endpoint(75).await?;
-        let server_addr = LocalEndpointFactory::node_addr(&server).await;
-        let connection = timeout(
-            Duration::from_secs(10),
-            client.connect(server_addr, &[ALPN]),
-        )
-        .await??;
-        let (mut send, _recv) = timeout(Duration::from_secs(1), connection.open_bi()).await??;
-
-        // usize payload lengths below 2^32 fit u32.
-        let mut header = Vec::with_capacity(FRAME_HEADER_BYTES);
-        header.extend_from_slice(&0u16.to_le_bytes());
-        header.extend_from_slice(&0u16.to_le_bytes());
-        header.extend_from_slice(&(PAYLOAD_LEN as u32).to_le_bytes());
-        timeout(Duration::from_secs(1), send.write_all(&header)).await??;
-        let (_, mut recv) = timeout(Duration::from_secs(2), stream_rx.recv())
-            .await?
-            .expect("the capture forwards the stream");
-
-        // usize indices below 256 fit u8.
-        let payload: Vec<u8> = (0..PAYLOAD_LEN).map(|i| (i % 251) as u8).collect();
-        let writing = tokio_util::task::AbortOnDropHandle::new(tokio::spawn({
-            let payload = payload.clone();
-            async move {
-                for piece in payload.chunks(PIECE) {
-                    send.write_all(piece).await.unwrap();
-                    tokio::task::yield_now().await;
-                }
-                send
-            }
-        }));
-        let frame = timeout(
-            Duration::from_secs(5),
-            read_frame(
-                &mut recv,
-                u32::try_from(FRAME_HEADER_BYTES + PAYLOAD_LEN)?,
-                FrameFilter::new(None, InboundReader::Persistent),
-                Duration::from_secs(5),
-                None,
-            ),
-        )
-        .await??;
-        assert_eq!(frame.payload, payload);
-        drop(writing);
-        Ok(())
-    }
-
     // claude-late-message-cap-allocation: read_frame checks only
     // frame_len > max_frame_bytes before it reads the payload, while the smaller
     // max_message_bytes is enforced later in admit_inbound_message. A peer can

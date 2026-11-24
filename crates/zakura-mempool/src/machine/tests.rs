@@ -509,11 +509,13 @@ fn ends_tx_lease(step: &Step, reservation: ReservationId) -> bool {
 ///   transaction, gets `NoRoom`.
 /// - A leased fetch's lease stays counted through verification, and ends
 ///   when the transaction is decided or the reservation is dropped.
+/// - A body larger than the memory lease its fetch announced is not the body
+///   announced. It never reaches a verifier, and its lease ends.
 #[test]
-fn mem7_only_an_empty_pool_takes_an_unleased_relayed_transaction() {
+fn mem7_relayed_lease_lifecycle_and_oversized_body() {
     let mut bench = Bench::new();
     let mut runner = TestRunner::deterministic();
-    let txs: Vec<Tx> = (0..3).map(|_| build(&mut runner, &[], 0, None)).collect();
+    let txs: Vec<Tx> = (0..4).map(|_| build(&mut runner, &[], 0, None)).collect();
 
     let (unleased, step) = bench.reserve_relayed(&txs[0], size(&txs[0]), 0);
     let unleased = unleased.expect("a pool that holds nothing takes one unleased fetch");
@@ -552,21 +554,13 @@ fn mem7_only_an_empty_pool_takes_an_unleased_relayed_transaction() {
         .0
         .expect("a leased fetch is reserved");
     assert!(ends_tx_lease(&bench.release(leased), leased));
-}
 
-/// mem-7: a body larger than the memory lease its fetch announced is not
-/// the body announced. It never reaches a verifier, and its lease ends.
-#[test]
-fn mem7_a_body_above_its_lease_is_the_wrong_transaction() {
-    let mut bench = Bench::new();
-    let mut runner = TestRunner::deterministic();
-    let tx = build(&mut runner, &[], 0, None);
-    let announced = size(&tx) - 1;
+    let announced = size(&txs[3]) - 1;
     let reservation = bench
-        .reserve_relayed(&tx, announced, announced)
+        .reserve_relayed(&txs[3], announced, announced)
         .0
         .expect("a leased fetch is reserved");
-    let (waiter, step) = bench.submit(reservation, &tx);
+    let (waiter, step) = bench.submit(reservation, &txs[3]);
     assert!(started(&step).is_empty());
     assert!(matches!(
         step.verdict(waiter),

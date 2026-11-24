@@ -644,10 +644,7 @@ impl BlockSyncService {
             .values()
             .filter(|record| record.direction == direction)
             .count();
-        let cap = match direction {
-            ServicePeerDirection::Inbound => self.inner.config.peer_limits.max_inbound(),
-            ServicePeerDirection::Outbound => self.inner.config.peer_limits.max_outbound(),
-        };
+        let cap = self.inner.config.peer_limits.max_for(direction);
         count < cap
     }
 
@@ -829,10 +826,7 @@ impl Service for BlockSyncService {
                     .values()
                     .filter(|record| record.direction == peer.direction)
                     .count();
-                let cap = match peer.direction {
-                    ServicePeerDirection::Inbound => self.inner.config.peer_limits.max_inbound(),
-                    ServicePeerDirection::Outbound => self.inner.config.peer_limits.max_outbound(),
-                };
+                let cap = self.inner.config.peer_limits.max_for(peer.direction);
                 if count >= cap {
                     service_cancel_token.cancel();
                     return;

@@ -33,12 +33,6 @@ macro_rules! ok {
     };
 }
 
-/// One reactor's memory share on one connection, in bytes.
-///
-/// `receive` bounds the payload bytes a conformant peer may have sent the
-/// reactor that the node has not released. `output` bounds the encoded bytes
-/// the reactor may queue for the peer. Node totals are checked sums and
-/// products of these values.
 /// Split of a reactor's per-connection receive bytes into static unsolicited
 /// bytes (charged in the connection's base) and request-answered bytes (funded
 /// by request leases at request time).
@@ -318,39 +312,6 @@ impl std::error::Error for BudgetError {}
 
 impl Stream {
     /// The most payload bytes a conformant peer may send this node over
-    /// `layout` on one connection, when this node takes the `local` side.
-    ///
-    /// Only frames the peer sends count:
-    ///
-    /// - every announcement row, at its cadence: `capacity × max payload`;
-    /// - if this node serves, the peer's requests and subscription updates:
-    ///   `max_in_flight × max payload` per request row, and
-    ///   `capacity × max payload` of each subscription row's cadence;
-    /// - if this node requests, the answers: `max_in_flight × the largest
-    ///   response` per request row, and `max_live × (credit bytes + the
-    ///   largest response)` per subscription row: the credit plus one more
-    ///   page or the terminal outcome.
-    ///
-    /// Response rows add nothing themselves: their request row counts them.
-    /// The bound excludes frame headers, as [`PayloadLen`] does.
-    ///
-    /// A cadence term counts what a conformant sender queues across a
-    /// connection-wide outage of up to [`Cadence::MAX_OUTAGE`]. A longer read
-    /// pause on one stream lets the sender keep queuing that row's messages
-    /// past the term. QUIC's stream and connection receive windows bound those
-    /// bytes, and the peer memory budget charges those windows (CTRL-26), so
-    /// the node's memory bound holds. The excess spends connection credit
-    /// that sibling rows would otherwise use.
-    ///
-    /// [`Cadence::MAX_OUTAGE`]: super::Cadence::MAX_OUTAGE
-    ///
-    /// The result is an error, never a default, when the table does not bound
-    /// a count: a request this node sends whose responses need not end the
-    /// exchange, or a subscription this node publishes without an update
-    /// cadence. The reactor then computes that term itself.
-    ///
-    /// [`PayloadLen`]: super::PayloadLen
-    /// The most payload bytes a conformant peer may send this node over
     /// `layout` on one connection, split into `unsolicited` and `per_request`
     /// bytes.
     ///
@@ -361,6 +322,11 @@ impl Stream {
     /// - `per_request`: when `local.requests()`, the answers to our requests
     ///   (`max_in_flight × largest response`) and subscriptions
     ///   (`max_live × (credit bytes + largest response)`).
+    ///
+    /// Response rows add nothing themselves: their request row counts them.
+    /// The bound excludes frame headers, as [`PayloadLen`] does.
+    ///
+    /// [`PayloadLen`]: super::PayloadLen
     pub const fn receive_bound_split(
         layout: &[Stream],
         local: LocalRole,
@@ -391,6 +357,21 @@ impl Stream {
 
     /// Total receive bound (`unsolicited + per_request`), derived from
     /// [`Self::receive_bound_split`].
+    ///
+    /// A cadence term counts what a conformant sender queues across a
+    /// connection-wide outage of up to [`Cadence::MAX_OUTAGE`]. A longer read
+    /// pause on one stream lets the sender keep queuing that row's messages
+    /// past the term. QUIC's stream and connection receive windows bound those
+    /// bytes, and the peer memory budget charges those windows (CTRL-26), so
+    /// the node's memory bound holds. The excess spends connection credit
+    /// that sibling rows would otherwise use.
+    ///
+    /// [`Cadence::MAX_OUTAGE`]: super::Cadence::MAX_OUTAGE
+    ///
+    /// The result is an error, never a default, when the table does not bound
+    /// a count: a request this node sends whose responses need not end the
+    /// exchange, or a subscription this node publishes without an update
+    /// cadence. The reactor then computes that term itself.
     pub const fn receive_bound(layout: &[Stream], local: LocalRole) -> Result<u64, BudgetError> {
         let split = ok!(Self::receive_bound_split(layout, local));
         match split.checked_total() {

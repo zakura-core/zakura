@@ -115,6 +115,50 @@ fn spawn_stream_worker(
 
 /// The reader stops after a checked header until capacity returns. A worker's
 /// frame stays charged until its consumer receives and releases it.
+/// fix-15: the payload buffer grows as bytes arrive, so a frame sent in
+/// many small writes reads back whole and in order.
+#[tokio::test]
+async fn a_payload_sent_in_pieces_reads_back_whole() -> Result<(), BoxError> {
+    const PIECE: usize = 1000;
+    const PAYLOAD_LEN: usize = 40 * PIECE + 7;
+    let mut link = Link::connect().await?;
+    // usize indices below 256 fit u8.
+    let payload: Vec<u8> = (0..PAYLOAD_LEN).map(|i| (i % 251) as u8).collect();
+    let max_frame_bytes = u32::try_from(FRAME_HEADER_BYTES + PAYLOAD_LEN)?;
+    let bytes = Frame {
+        message_type: 0,
+        flags: 0,
+        payload: payload.clone(),
+    }
+    .encode(max_frame_bytes)?;
+    let (header, body) = bytes.split_at(FRAME_HEADER_BYTES);
+    let (mut peer_send, _peer_recv, _send, mut recv) = link.open(header).await?;
+
+    let body = body.to_vec();
+    let writing = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+        for piece in body.chunks(PIECE) {
+            peer_send.write_all(piece).await.unwrap();
+            tokio::task::yield_now().await;
+        }
+        peer_send
+    }));
+    let frame = timeout(
+        TEST_TIMEOUT,
+        read_frame(
+            &mut recv,
+            max_frame_bytes,
+            FrameFilter::new(None, InboundReader::Persistent),
+            TEST_TIMEOUT,
+            None,
+        ),
+    )
+    .await??;
+    assert_eq!(frame.payload, payload);
+    drop(writing);
+    link.close().await;
+    Ok(())
+}
+
 #[tokio::test]
 async fn a_saturated_gate_holds_the_payload_until_capacity_returns() -> Result<(), BoxError> {
     let mut link = Link::connect().await?;

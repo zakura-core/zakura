@@ -59,27 +59,31 @@ pub struct TxRelayStartup {
 }
 
 impl TxRelayStartup {
-    /// Starts `tx-relay`, funding its fetches from `memory_pool`.
+    /// Starts `tx-relay` with its config's fan-out and returns it as a
+    /// service to register. Each fetch leases its announced bytes from
+    /// `memory_pool`'s `Consumer::Tx`. A session whose address is in
+    /// [`Self::unconditional`] is never charged for a body, as
+    /// `network.unconditional_peers` promises.
+    ///
+    /// The service carries its live-session record, so the legacy adapter
+    /// stops moving transactions for each peer that has a live `tx-relay`
+    /// session.
     pub(crate) fn start(self, memory_pool: MemoryPool) -> CustomService {
-        tx_relay_service(
-            self.pool,
-            memory_pool,
-            self.may_cool,
-            &self.config,
-            self.unconditional,
-        )
+        let sessions = TxRelaySessions::default();
+        let service: Arc<TxRelayService> =
+            TxRelayService::spawn(self, memory_pool, sessions.clone());
+        CustomService {
+            service,
+            provides: vec![tx_relay_service_id()],
+            seeks: vec![tx_relay_service_id()],
+            tx_relay_sessions: Some(sessions),
+        }
     }
 }
 
-/// Starts `tx-relay` on `pool` with `config`'s fan-out and returns it as a
-/// service to register. Each fetch leases its announced bytes from
-/// `memory_pool`'s `Consumer::Tx`. `may_cool` says whether a verdict at a
-/// height may start a cooldown. A session whose address is in
-/// `unconditional` is never charged for a body, as
-/// `network.unconditional_peers` promises.
-///
-/// The service carries its live-session record, so the legacy adapter stops
-/// moving transactions for each peer that has a live `tx-relay` session.
+/// Starts `tx-relay` on `pool` with `config`, funding its fetches from
+/// `memory_pool`, as [`TxRelayStartup::start`] does. `may_cool` says whether a
+/// verdict at a height may start a cooldown.
 pub fn tx_relay_service(
     pool: PoolHandle,
     memory_pool: MemoryPool,
@@ -87,21 +91,13 @@ pub fn tx_relay_service(
     config: &ZakuraTxRelayConfig,
     unconditional: crate::UnconditionalPeers,
 ) -> CustomService {
-    let sessions = TxRelaySessions::default();
-    let service: Arc<TxRelayService> = TxRelayService::spawn(
+    TxRelayStartup {
         pool,
-        memory_pool,
         may_cool,
-        config,
+        config: config.clone(),
         unconditional,
-        sessions.clone(),
-    );
-    CustomService {
-        service,
-        provides: vec![tx_relay_service_id()],
-        seeks: vec![tx_relay_service_id()],
-        tx_relay_sessions: Some(sessions),
     }
+    .start(memory_pool)
 }
 
 /// A memory pool whose `Consumer::Tx` funds every fetch a test makes, so no

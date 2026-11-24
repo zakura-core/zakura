@@ -18,7 +18,7 @@ use super::{
     machine,
     service::{MayCool, TxRelayService},
     sessions::TxRelaySessions,
-    tx_relay_service_id, ZakuraTxRelayConfig,
+    tx_relay_service_id, TxRelayStartup, ZakuraTxRelayConfig,
 };
 use crate::zakura::{memory::MemoryPool, CloseOutcome, CustomService, ZakuraPeerId};
 
@@ -165,15 +165,14 @@ pub fn tx_relay_service_observed(
     observer: TxRelayObserver,
 ) -> CustomService {
     let sessions = TxRelaySessions::default();
-    let service: Arc<TxRelayService> = TxRelayService::spawn_observed(
+    let startup = TxRelayStartup {
         pool,
-        memory_pool,
         may_cool,
-        config,
-        Default::default(),
-        sessions.clone(),
-        observer,
-    );
+        config: config.clone(),
+        unconditional: Default::default(),
+    };
+    let service: Arc<TxRelayService> =
+        TxRelayService::spawn_observed(startup, memory_pool, sessions.clone(), observer);
     CustomService {
         service,
         provides: vec![tx_relay_service_id()],

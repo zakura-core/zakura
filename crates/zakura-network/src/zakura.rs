@@ -180,6 +180,16 @@ impl ServicePeerLimits {
         self.effective_max_outbound_peers(DEFAULT_SERVICE_MAX_PEERS)
     }
 
+    /// Effective peer cap in `direction`, using [`DEFAULT_SERVICE_MAX_PEERS`]
+    /// when unset.
+    #[inline]
+    pub const fn max_for(&self, direction: ServicePeerDirection) -> usize {
+        match direction {
+            ServicePeerDirection::Inbound => self.max_inbound(),
+            ServicePeerDirection::Outbound => self.max_outbound(),
+        }
+    }
+
     /// Whether the operator explicitly configured either inbound or outbound peer limits.
     #[inline]
     pub const fn has_explicit_peer_caps(&self) -> bool {

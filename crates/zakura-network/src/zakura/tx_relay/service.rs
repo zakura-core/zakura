@@ -47,7 +47,7 @@ use super::{
         tx_frame, TxRelayMessage, HAVE_RATE, MAX_HAVE_ENTRIES, MAX_TX_BYTES, TX_RELAY_DATA_KIND,
         TX_RELAY_STATE_KIND, TX_RELAY_STREAMS,
     },
-    ZakuraTxRelayConfig,
+    TxRelayStartup,
 };
 use crate::{
     config::UnconditionalPeers,
@@ -247,56 +247,42 @@ impl fmt::Debug for TxRelayService {
 }
 
 impl TxRelayService {
-    /// Starts the reactor task on `pool` with `config`'s fan-out and returns
-    /// the service to register. Each fetch leases its announced bytes from
-    /// `memory_pool`'s `Consumer::Tx`. A body whose supplier's address is in
-    /// `unconditional` when it arrives is never charged. Each session is
-    /// published in `sessions` from when its routine holds a view of the
-    /// pool until the session ends or the pool stops.
+    /// Starts the reactor task on `startup`'s pool with its config's fan-out
+    /// and returns the service to register. Each fetch leases its announced
+    /// bytes from `memory_pool`'s `Consumer::Tx`. A body whose supplier's
+    /// address is in `startup`'s unconditional peers when it arrives is never
+    /// charged. Each session is published in `sessions` from when its routine
+    /// holds a view of the pool until the session ends or the pool stops.
     pub fn spawn(
-        pool: PoolHandle,
+        startup: TxRelayStartup,
         memory_pool: MemoryPool,
-        may_cool: MayCool,
-        config: &ZakuraTxRelayConfig,
-        unconditional: UnconditionalPeers,
         sessions: TxRelaySessions,
     ) -> Arc<Self> {
-        Arc::new(Self::start(
-            pool,
-            memory_pool,
-            may_cool,
-            config,
-            unconditional,
-            sessions,
-        ))
+        Arc::new(Self::start(startup, memory_pool, sessions))
     }
 
     /// [`Self::spawn`], with every session reporting its steps to
     /// `observer`.
     #[cfg(zakura_sim)]
     pub(crate) fn spawn_observed(
-        pool: PoolHandle,
+        startup: TxRelayStartup,
         memory_pool: MemoryPool,
-        may_cool: MayCool,
-        config: &ZakuraTxRelayConfig,
-        unconditional: UnconditionalPeers,
         sessions: TxRelaySessions,
         observer: TxRelayObserver,
     ) -> Arc<Self> {
-        let mut service = Self::start(pool, memory_pool, may_cool, config, unconditional, sessions);
+        let mut service = Self::start(startup, memory_pool, sessions);
         service.wiring.observer = Some(observer);
         Arc::new(service)
     }
 
     /// Starts the reactor task and returns the service. See [`Self::spawn`].
-    fn start(
-        pool: PoolHandle,
-        memory_pool: MemoryPool,
-        may_cool: MayCool,
-        config: &ZakuraTxRelayConfig,
-        unconditional: UnconditionalPeers,
-        sessions: TxRelaySessions,
-    ) -> Self {
+    fn start(startup: TxRelayStartup, memory_pool: MemoryPool, sessions: TxRelaySessions) -> Self {
+        let TxRelayStartup {
+            pool,
+            may_cool,
+            config,
+            unconditional,
+        } = startup;
         let mut key = [0; 8];
         zakura_rt::rand::rng().fill_bytes(&mut key);
         let node = Node {

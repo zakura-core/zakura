@@ -83,7 +83,8 @@ blocks a block starts counting about four minutes after it is mined. Reorgs
 that reach a counted block are rare, and the repair drops the blocks they
 displace. The one exception is a block read from a chain that was best only
 briefly: if the node switches to that chain and back before the tracker sees
-the switch, the block stays counted until it leaves the window.
+the switch (a reorg of more than 10 blocks that switches away and back), the
+block stays counted until it leaves the window.
 
 While its tip is recent enough to mine on, the node hands v2 networking the
 gateways named in at least 10 counted blocks. Networking ranks them by block

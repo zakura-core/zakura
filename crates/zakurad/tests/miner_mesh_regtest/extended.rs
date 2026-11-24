@@ -172,10 +172,11 @@ async fn gateway_restart_keeps_its_id() -> Result<()> {
 
 /// Two islands that cannot reach each other mine apart until a relay joins
 /// them: A's island mines enough blocks naming A for twice the minimum of them
-/// to count, and B's island twice as many naming B. A's island reorganises onto
-/// B's longer chain in a reorg `A_BLOCKS` deep: past the qualifying depth,
-/// within the 1,000 blocks a node can reorganise. Every mining node then ranks
-/// B alone, and A's miner keeps its connection to A as an ordinary one.
+/// to count, and B's island mines twice as many blocks naming B. A's island
+/// reorganises onto B's longer chain in a reorg `A_BLOCKS` deep: past the
+/// qualifying depth, within the 1,000 blocks a node can reorganise. Every
+/// mining node then ranks B alone, and A's miner keeps its connection to A as
+/// an ordinary one.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "starts zakurad children: run with the miner-mesh-regtest-extended nextest profile"]
 async fn deep_reorg_moves_the_ranking() -> Result<()> {

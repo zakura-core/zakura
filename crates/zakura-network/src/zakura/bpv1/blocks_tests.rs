@@ -324,6 +324,114 @@ fn scenario_missing_parent_then_parent_arrives_defers_commitment() {
     table.assert_invariants();
 }
 
+/// Sends `block_id`'s metadata from `peer` and answers its header admission
+/// with a missing parent.
+fn park_unknown_parent(
+    table: &mut BlockTable,
+    now: Instant,
+    peer: NodeId,
+    block_id: block::Hash,
+) -> BlockStep {
+    let coding = Profile::TINY.derive_coding(64, 2).unwrap();
+    let received = table.step(
+        now,
+        BlockInput::MetaReceived {
+            envelope: make_envelope(block_id, coding, [0xAA; 32], peer),
+            from_peer: peer,
+            session_gen: 1,
+        },
+    );
+    let parked = header_result(
+        table,
+        now,
+        &received,
+        HeaderAdmissionResult::MissingParent {
+            parent_hash: block::Hash([0xEE; 32]),
+        },
+    );
+    table.assert_invariants();
+    parked
+}
+
+/// A made-up header with an unknown parent costs its sender only bytes, so
+/// waiting metadata is bounded per peer and per node (bpv1-11), and it never
+/// costs viable metadata its place (bpv1-75). Here sixteen peers fill the
+/// node-wide pending budget with unknown parents, and a new peer still gets
+/// both a viable block admitted and its own missing-parent entry parked.
+#[test]
+fn bpv1_75_headers_with_unknown_parents_never_refuse_viable_metadata() {
+    let now = Instant::now();
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let fake = |peer: u8, i: u8| {
+        block::Hash([
+            peer, i, 0xF1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0,
+        ])
+    };
+
+    // One peer keeps at most its share waiting; the rest are refused neutrally.
+    let flooder = node_id(100);
+    for i in 0..10 {
+        let step = park_unknown_parent(&mut table, now, flooder, fake(100, i));
+        let refused = !rejected_sessions(&step, fake(100, i)).is_empty();
+        assert_eq!(refused, usize::from(i) >= MAX_PENDING_META_PER_PEER);
+        assert!(!step
+            .outputs
+            .iter()
+            .any(|o| matches!(o, BlockOutput::ClosePeer { .. })));
+    }
+    assert_eq!(table.pending_meta_len(), MAX_PENDING_META_PER_PEER);
+
+    // More flooders fill the node-wide pending budget.
+    let flooders = (MAX_PENDING_META_COUNT / MAX_PENDING_META_PER_PEER) as u8;
+    for peer in 101..100 + flooders {
+        for i in 0..MAX_PENDING_META_PER_PEER as u8 {
+            park_unknown_parent(&mut table, now, node_id(peer), fake(peer, i));
+        }
+    }
+    assert_eq!(table.pending_meta_len(), MAX_PENDING_META_COUNT);
+
+    // An honest peer's viable metadata is admitted despite the full budget.
+    let honest = node_id(7);
+    let coding = Profile::TINY.derive_coding(64, 2).unwrap();
+    let viable = block::Hash([0x77; 32]);
+    let received = table.step(
+        now,
+        BlockInput::MetaReceived {
+            envelope: make_envelope(viable, coding, [0xAA; 32], honest),
+            from_peer: honest,
+            session_gen: 1,
+        },
+    );
+    let admitted = header_result(
+        &mut table,
+        now,
+        &received,
+        HeaderAdmissionResult::Admitted { height: 11 },
+    );
+    let committed = commitment_ok(&mut table, now, &admitted);
+    assert!(committed
+        .events
+        .contains(&BlockEvent::BlockAdmitted { block_id: viable }));
+
+    // Its own missing-parent entry takes the place of a flooder's oldest.
+    let honest_wait = block::Hash([0x78; 32]);
+    let parked = park_unknown_parent(&mut table, now, honest, honest_wait);
+    assert!(rejected_sessions(&parked, honest_wait).is_empty());
+    assert_eq!(table.pending_meta_len(), MAX_PENDING_META_COUNT);
+    let evicted: Vec<_> = parked
+        .outputs
+        .iter()
+        .filter_map(|o| match o {
+            BlockOutput::MetaRejected { peer, .. } => Some(*peer),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(evicted.len(), 1);
+    assert_ne!(evicted[0], honest);
+    table.assert_invariants();
+}
+
 /// Returns the sessions the step rejected `block_id`'s metadata for.
 fn rejected_sessions(step: &BlockStep, block_id: block::Hash) -> Vec<(NodeId, u64)> {
     let mut rejected: Vec<(NodeId, u64)> = step
@@ -1804,7 +1912,7 @@ fn fix6_rejected_metadata_leaves_no_state_and_arrival_lives_in_the_entry() {
         }));
         table.assert_invariants();
     }
-    assert!(admissions.len() <= MAX_PENDING_META_COUNT);
+    assert!(admissions.len() <= MAX_ADMITTING_META_COUNT);
     for work_id in admissions {
         table.step(
             t0,

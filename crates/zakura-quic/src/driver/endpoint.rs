@@ -727,6 +727,8 @@ mod tests {
             network: watch::Sender::new(0),
             network_changes: counter::AtomicU64::new(0),
             inputs: crate::EndpointInputs::default(),
+            peer_tokens: Arc::default(),
+            used_tokens: Arc::default(),
         });
         let addr: SocketAddr = "10.0.0.1:4000".parse().unwrap();
         let slot = Arc::new(SocketSlot {

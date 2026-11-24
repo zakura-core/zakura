@@ -23,6 +23,7 @@ pub mod fuzz;
 mod key;
 mod key_list;
 mod tls;
+mod tokens;
 
 pub use composite::{
     COMPOSITE_SIGNATURE_BYTES, ML_DSA_65_KEY_BYTES, ML_DSA_65_KEY_TAG, ML_DSA_65_SIGNATURE_BYTES,

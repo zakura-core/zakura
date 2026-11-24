@@ -905,6 +905,49 @@ async fn retry_threshold_validates_before_accepting() {
     .unwrap();
 }
 
+/// WIRE-14: a listener gives a dialer whose address it validated a token,
+/// and the dialer's next dial to it presents the token. That dial is
+/// validated at its first datagram, so it gets no Retry even though every
+/// unvalidated attempt does. The token isn't offered to another listener.
+#[tokio::test]
+async fn a_redial_presents_its_token_and_skips_the_retry() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let config = QuicConfig {
+            retry_threshold: Some(0),
+            ..test_config()
+        };
+        let mut server = server_with(&config, &loopback(), &[ALPN], |_| Admit::Accept);
+        let client = client();
+        let validated = |server: &Server| -> Vec<bool> {
+            let seen = server.seen.lock().unwrap();
+            seen.iter().map(|info| info.validated).collect()
+        };
+
+        let first = client.connect(server.addr(), &[ALPN]).await.unwrap();
+        server.handled.recv().await.unwrap();
+        // NEW_TOKEN follows the handshake; a round trip on a stream delivers
+        // it.
+        assert_eq!(echo(&first, b"token").await, b"token");
+        assert_eq!(validated(&server), [false, false, false, true]);
+
+        let again = client.connect(server.addr(), &[ALPN]).await.unwrap();
+        server.handled.recv().await.unwrap();
+        assert_eq!(
+            validated(&server),
+            [false, false, false, true, true],
+            "the redial was validated by its token, with no Retry"
+        );
+        assert_eq!(echo(&again, b"again").await, b"again");
+
+        let mut other = server_with(&config, &loopback(), &[ALPN], |_| Admit::Accept);
+        client.connect(other.addr(), &[ALPN]).await.unwrap();
+        other.handled.recv().await.unwrap();
+        assert!(!validated(&other)[0], "another listener sees no token");
+    })
+    .await
+    .unwrap();
+}
+
 /// V12 F-305590: without Retry, spoofed Initials held every pending slot until
 /// the idle timeout, and an acceptor that refuses at its budget then refused
 /// every honest peer. The default threshold sends unvalidated sources a Retry

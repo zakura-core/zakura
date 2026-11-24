@@ -33,6 +33,7 @@ use crate::{
     socket::{SocketBuffers, SocketFactory, UdpFactory, UdpIo},
     sys::{canonical_addr, local_interface_ips},
     tls::{RuntimeUtc, TlsConfig},
+    tokens::{PeerTokens, UsedTokens},
 };
 
 /// Whether a `zakura_sim` run is active on this thread. Always false in a
@@ -178,6 +179,12 @@ pub(crate) struct Shared {
     /// The injected randomness. Applied where each config is built: socket
     /// endpoint configs, `serve` and every dial.
     pub(crate) inputs: EndpointInputs,
+    /// Address-validation tokens listeners gave this endpoint, by node
+    /// (WIRE-14).
+    pub(crate) peer_tokens: Arc<PeerTokens>,
+    /// Tokens dialers presented to this endpoint, each accepted once
+    /// (WIRE-14).
+    pub(crate) used_tokens: Arc<UsedTokens>,
 }
 
 impl Shared {
@@ -310,6 +317,8 @@ impl QuicEndpoint {
             network: watch::Sender::new(0),
             network_changes: counter::AtomicU64::new(0),
             inputs,
+            peer_tokens: Arc::default(),
+            used_tokens: Arc::default(),
         });
         let factory = Arc::new(factory);
         let mut bound = Vec::with_capacity(bind.addrs.len());
@@ -488,7 +497,10 @@ impl QuicEndpoint {
         let alpns = acceptor.alpns();
         let crypto = self.inner.shared.tls.server_config(alpns.clone())?;
         let mut server = self.inner.shared.inputs.server_config(Arc::new(crypto));
-        self.inner.shared.config.apply_server_limits(&mut server);
+        let shared = &self.inner.shared;
+        shared
+            .config
+            .apply_server_limits(&mut server, shared.used_tokens.clone());
         // Retry tokens carry their issue time, so they read the runtime's UTC.
         server.time_source(Arc::new(RuntimeUtc));
         let server = Arc::new(server);
@@ -597,7 +609,9 @@ impl QuicEndpoint {
                 }
                 metrics::counter!("zakura.quic.dial.attempts").increment(1);
                 let started = Instant::now();
-                let result = self.dial_once(socket, crypto, target, deadline, slot).await;
+                let result = self
+                    .dial_once(socket, crypto, addr.id, target, deadline, slot)
+                    .await;
                 record_handshake(&result, started);
                 (target, started, result)
             });
@@ -631,6 +645,7 @@ impl QuicEndpoint {
         &self,
         socket: &SocketHandle,
         crypto: Arc<quinn_proto::crypto::rustls::QuicClientConfig>,
+        peer: NodeId,
         target: SocketAddr,
         deadline: Option<Duration>,
         slot: Arc<ConnectionSlot>,
@@ -638,6 +653,7 @@ impl QuicEndpoint {
         let probe = Arc::new(CongestionProbe::default());
         let mut client = ClientConfig::new(crypto);
         self.inner.shared.inputs.apply_client(&mut client);
+        client.token_store(self.inner.shared.peer_tokens.for_peer(peer));
         client.transport_config(
             self.inner
                 .shared
@@ -715,7 +731,9 @@ impl QuicEndpoint {
             .connections
             .claim_dial()
             .ok_or(ConnectError::ConnectionLimit)?;
-        self.dial_once(socket, Arc::new(crypto), target, deadline, slot)
+        // A hand-built dial names no node, so it gets the tokens of none.
+        let peer = NodeSecretKey::generate().public();
+        self.dial_once(socket, Arc::new(crypto), peer, target, deadline, slot)
             .await
     }
 

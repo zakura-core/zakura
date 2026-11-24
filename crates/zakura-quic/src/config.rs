@@ -332,12 +332,19 @@ impl QuicConfig {
         }
     }
 
-    /// Applies the incoming-attempt limits to a server config (ADM-5).
-    pub(crate) fn apply_server_limits(&self, server: &mut quinn_proto::ServerConfig) {
+    /// Applies the incoming-attempt limits to a server config (ADM-5), and
+    /// the address-validation tokens it sends and checks against `used`
+    /// (WIRE-14).
+    pub(crate) fn apply_server_limits(
+        &self,
+        server: &mut quinn_proto::ServerConfig,
+        used: Arc<dyn quinn_proto::TokenLog>,
+    ) {
         let mut tokens = ValidationTokenConfig::default();
-        // WIRE-14: send no NEW_TOKEN frames. Without the `bloom` feature,
-        // quinn-proto can't detect token reuse, so it ignores tokens anyway.
-        tokens.sent(0);
+        tokens
+            .sent(crate::tokens::TOKENS_SENT)
+            .lifetime(crate::tokens::TOKEN_LIFETIME)
+            .log(used);
         server
             .max_incoming(self.max_incoming as usize)
             .incoming_buffer_size(self.incoming_buffer_bytes)
@@ -415,10 +422,11 @@ mod tests {
         let mut server = quinn_proto::ServerConfig::with_crypto(Arc::new(
             tls.server_config(vec![b"p2p-v2/3".to_vec()]).unwrap(),
         ));
-        config.apply_server_limits(&mut server);
+        config.apply_server_limits(&mut server, Arc::new(crate::tokens::UsedTokens::default()));
         let server = format!("{server:?}");
         for field in [
-            "sent: 0",
+            "sent: 2",
+            "lifetime: 86400s",
             "migration: true",
             "max_incoming: 65536",
             "incoming_buffer_size: 10485760",

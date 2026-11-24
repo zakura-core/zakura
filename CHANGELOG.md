@@ -44,6 +44,10 @@ independently.
   `zakura.quic.tls.signature_verified` counts peer signatures by `scheme`
   (`ed25519_mldsa44`) after both signature checks pass
   ([#2682](https://github.com/zakura-core/zakura/pull/2682)).
+- The trusted block endpoint can retain a mining proposal and serve the exact
+  solved block to peers after local proposal verification or primary
+  confirmation. Released jobs push the solved block directly to capable peers
+  in the initial broadcast group by default. [#2702](https://github.com/zakura-core/zakura/pull/2702)
 
 ### Changed
 

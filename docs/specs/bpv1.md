@@ -55,7 +55,9 @@ the BPv1 implementation decisions:
   and seed plans compare estimated arrival time `now + rtt + (ahead + bytes) / bw`
   with `SLOW_X = 2` late release.
   Unanswered `Want`s use deadline `8 s + outstanding_bytes / 100 KB/s`, parking
-  the session on first stall and closing neutrally on repeat stall.
+  the session on first stall and closing neutrally on repeat stall. A control
+  frame that waits `4 × (8 s + frame_bytes / 100 KB/s)` for its stream also
+  closes the session neutrally.
 
 The [design document](../design/bpv1.md) explains the background choices.
 Section 8 fixes candidate payload profile W2.
@@ -230,8 +232,11 @@ BPv1 message. Because `C` is embedded in the mined coinbase inside the PoW
 header, Ed25519 proposer signatures, variant identifiers, and metadata conflict
 rules are unnecessary and removed in revision 3.
 
-Coded propagation covers only recent blocks. Let `top` be the highest block
-height this node has admitted, which never decreases. A node MUST NOT admit
+Coded propagation covers only recent blocks. Let `top` be the highest of this
+node's verified tip height, its best header-valid height, and the height of a
+block it proposed. `top` never decreases. A header that headerchain retains
+but has not selected, such as a fork or a future-dated header, does not raise
+`top`. A node MUST NOT admit
 metadata for a block at or below `top - PROPAGATION_DEPTH` (strictly
 `height + PROPAGATION_DEPTH > top`). Such a block uses the existing
 block-download path.
@@ -1116,8 +1121,9 @@ sample   = bytes / transfer
 ```
 
 `t_sent` is when the node queued the `Want`; `t_first` and `t_last` are when the
-first and last attributed parts arrived. A sample counts for one to two
-`RATE_WINDOW`s, `PROPAGATION_DEPTH` times the target block spacing (20 minutes),
+first and last attributed parts arrived. A sample counts until a later sample,
+one to two `RATE_WINDOW`s on, replaces it, or until the session ends.
+`RATE_WINDOW` is `PROPAGATION_DEPTH` times the target block spacing (20 minutes),
 so the estimate spans many blocks.
 
 A pull is a `Want` whose allowed set holds the announced indices the node still

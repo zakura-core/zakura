@@ -139,14 +139,14 @@ impl AsyncWrite for ObservedSocket {
     }
 }
 
-struct WirePeer {
+pub(super) struct WirePeer {
     client: Peers,
     events: Arc<Mutex<Vec<WireEvent>>>,
     advertisements: mpsc::UnboundedReceiver<zakura_chain::block::Hash>,
 }
 
 impl WirePeer {
-    async fn connect(relay: &Node) -> Self {
+    pub(super) async fn connect(relay: &Node) -> Self {
         let events = Arc::new(Mutex::new(Vec::new()));
         let socket = ObservedSocket {
             socket: tokio::net::TcpStream::connect(relay.p2p).await.unwrap(),
@@ -181,7 +181,7 @@ impl WirePeer {
         }
     }
 
-    async fn announced(&mut self, hash: zakura_chain::block::Hash) {
+    pub(super) async fn announced(&mut self, hash: zakura_chain::block::Hash) {
         timeout(Duration::from_secs(20), async {
             while self.advertisements.recv().await.unwrap() != hash {}
         })
@@ -189,7 +189,7 @@ impl WirePeer {
         .unwrap();
     }
 
-    async fn fetch(&self, block: &Block) {
+    pub(super) async fn fetch(&self, block: &Block) {
         let Response::Blocks(blocks) = timeout(
             Duration::from_secs(20),
             self.client
@@ -209,7 +209,7 @@ impl WirePeer {
         );
     }
 
-    fn count(&self, hash: zakura_chain::block::Hash, kind: &str) -> usize {
+    pub(super) fn count(&self, hash: zakura_chain::block::Hash, kind: &str) -> usize {
         self.events
             .lock()
             .unwrap()

@@ -28,6 +28,8 @@ use zakura_rt::{
     time::Instant,
 };
 
+use crate::zakura::{transport::Service, ZakuraPeerId};
+
 use super::{
     blocks::{BlockPhase, VerifierVerdict},
     config::ZakuraBpv1Config,
@@ -120,8 +122,12 @@ async fn proposer_to_receiver_end_to_end(
     assert!(!claims_b.is_claimed(expected_hash, Instant::now()));
     assert_eq!(handle_b.path_entries(), 1, "B measured its path to A");
 
+    // The handler's disconnect cancels the connection and then removes the
+    // peer before the session sees the cancel, so removal wins the race.
     cancel_a.cancel();
+    svc_a.remove_peer(&ZakuraPeerId::from_node_id(id_b), 1);
     cancel_b.cancel();
+    svc_b.remove_peer(&ZakuraPeerId::from_node_id(id_a), 2);
     wait_until(
         "bpv1-62: both sides drain their sessions, and bpv1-65: B drops its path entry",
         || handle_a.live_sessions() + handle_b.live_sessions() == 0 && handle_b.path_entries() == 0,

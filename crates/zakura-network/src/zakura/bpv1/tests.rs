@@ -474,6 +474,54 @@ fn corrupted_parity_under_valid_proofs_fails_reencode_check() {
 }
 
 #[test]
+fn restored_source_part_with_a_nonzero_tail_fails_reencode_check() {
+    // A malicious proposer commits a consistent codeword whose trimmed source
+    // part has nonzero bytes past its wire length. That part never verifies on
+    // the wire, so every node restores it from parity.
+    let body = vec![0x5Au8; 10];
+    let encoded = encode_body(&Profile::TINY, &body, 2).expect("encode succeeds");
+    let coding = encoded.coding;
+    assert_eq!(coding.stripes, 1);
+    let k = coding.k as usize;
+    let n = coding.n as usize;
+    // Widening usize to u32 is lossless: `slot < k`.
+    let trimmed = (0..k)
+        .find(|&slot| coding.wire_len(slot as u32) < Some(coding.part_bytes))
+        .expect("the body does not fill its last source part");
+
+    let mut sources: Vec<Vec<u8>> = encoded.parts[..k]
+        .iter()
+        .map(|p| p.payload().to_vec())
+        .collect();
+    *sources[trimmed].last_mut().expect("parts are not empty") = 0xFF;
+    let parity = reed_solomon_simd::encode(k, n - k, &sources).expect("encode succeeds");
+    let payloads = sources
+        .into_iter()
+        .chain(parity)
+        .map(|p| Arc::from(p.as_slice()))
+        .collect();
+    let enc_id = encoding_id(&coding);
+    let (root, parts) =
+        build_part_tree(&coding, &enc_id, payloads).expect("malicious proposer builds valid tree");
+
+    let mut held: Vec<Option<VerifiedPart>> = vec![None; n];
+    for (slot, part) in parts.iter().enumerate() {
+        let index = part.index();
+        let proof = part.siblings().to_vec();
+        let verified =
+            verify_part_proof(&coding, &enc_id, &root, index, proof, part.wire_payload());
+        if slot == trimmed {
+            assert_eq!(verified.unwrap_err(), ProofError::RootMismatch);
+        } else {
+            held[slot] = Some(verified.expect("proof is valid against the committed root"));
+        }
+    }
+
+    let result = decode_and_check_stripe(&coding, &enc_id, 0, &held);
+    assert_eq!(result.unwrap_err(), CodecError::CodewordCheckFailed);
+}
+
+#[test]
 fn assemble_rejects_nonzero_padding() {
     let committed = build_committed_nu7_block(&Profile::TINY, 1);
     let Committed {

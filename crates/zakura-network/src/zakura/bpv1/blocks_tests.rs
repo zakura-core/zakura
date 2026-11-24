@@ -324,6 +324,83 @@ fn scenario_missing_parent_then_parent_arrives_defers_commitment() {
     table.assert_invariants();
 }
 
+/// Returns the sessions the step rejected `block_id`'s metadata for.
+fn rejected_sessions(step: &BlockStep, block_id: block::Hash) -> Vec<(NodeId, u64)> {
+    let mut rejected: Vec<(NodeId, u64)> = step
+        .outputs
+        .iter()
+        .filter_map(|o| match o {
+            BlockOutput::MetaRejected {
+                block_id: id,
+                peer,
+                session_gen,
+            } if *id == block_id => Some((*peer, *session_gen)),
+            _ => None,
+        })
+        .collect();
+    rejected.sort();
+    rejected
+}
+
+/// A `HeaderMeta` that a second session sends while the first copy waits
+/// leaves that session a received marker. Every end that does not admit the
+/// block rejects it for both sessions, so neither marker outlives the entry.
+#[test]
+fn duplicate_metadata_is_rejected_for_every_session_that_sent_it() {
+    let now = Instant::now();
+    let coding = Profile::TINY.derive_coding(64, 2).unwrap();
+    let first = (node_id(2), 1);
+    let second = (node_id(3), 7);
+    let mut both = vec![first, second];
+    both.sort();
+    let send_twice = |table: &mut BlockTable, block_id| {
+        let s = receive(
+            table,
+            now,
+            make_envelope(block_id, coding, [0xAA; 32], node_id(1)),
+        );
+        let duplicate = table.step(
+            now,
+            BlockInput::MetaReceived {
+                envelope: make_envelope(block_id, coding, [0xAA; 32], node_id(1)),
+                from_peer: second.0,
+                session_gen: second.1,
+            },
+        );
+        assert!(duplicate.outputs.is_empty());
+        s
+    };
+
+    // Missing parent: the pending entry ages out.
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let pending = block::Hash([0x21; 32]);
+    let s = send_twice(&mut table, pending);
+    header_result(
+        &mut table,
+        now,
+        &s,
+        HeaderAdmissionResult::MissingParent {
+            parent_hash: block::Hash([0x20; 32]),
+        },
+    );
+    let aged = tick(&mut table, now + PENDING_META_AGE, &[]);
+    assert_eq!(rejected_sessions(&aged, pending), both);
+
+    // Below the window: header admission ends the entry at once.
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    table.step(now, BlockInput::TipHeight { height: 100 });
+    let old = block::Hash([0x22; 32]);
+    let s = send_twice(&mut table, old);
+    let refused = header_result(
+        &mut table,
+        now,
+        &s,
+        HeaderAdmissionResult::Admitted { height: 50 },
+    );
+    assert_eq!(rejected_sessions(&refused, old), both);
+    table.assert_invariants();
+}
+
 /// decision-10, bpv1-41: `k` source parts assemble the block at once and
 /// queue a re-encode check. A failed check falls back and retires the
 /// encoding, so its parts stop circulating and no pull is planned.
@@ -1294,7 +1371,10 @@ fn bpv1_57_fallback_blocks_yield_to_a_new_block_at_the_cap() {
     assert_eq!(table.block_phase(&h(60)), Some(BlockPhase::Retired));
 }
 
-/// A Valid verdict is terminal over a late failed stripe check.
+/// A Valid verdict is terminal over a late failed stripe check: the block
+/// starts no fallback and no second verification (bpv1-44). The failed check
+/// still stops coded propagation (bpv1-41), so the encoding retires and its
+/// parts stop circulating.
 #[test]
 fn bpv1_44_valid_verdict_is_terminal_over_a_late_check_failure() {
     let now = Instant::now();
@@ -1322,7 +1402,6 @@ fn bpv1_44_valid_verdict_is_terminal_over_a_late_check_failure() {
             result: Err(()),
         },
     );
-    assert_eq!(table.block_phase(&b_ok), Some(BlockPhase::Done));
     assert!(
         !late
             .events
@@ -1330,6 +1409,9 @@ fn bpv1_44_valid_verdict_is_terminal_over_a_late_check_failure() {
             .any(|e| matches!(e, BlockEvent::FallbackStarted { .. })),
         "committed Done block is terminal over late CheckDone failure"
     );
+    assert_eq!(table.block_phase(&b_ok), Some(BlockPhase::Retired));
+    assert!(table.get_part(&b_ok, 0).is_none());
+    table.assert_invariants();
 }
 
 /// `C` commits neither a timestamp nor the light-client root, so a template
@@ -1868,9 +1950,10 @@ fn fix2_raising_top_retires_out_of_window_blocks() {
     assert!(step.events.contains(&BlockEvent::Retired { block_id: old }));
     assert_eq!(table.block_phase(&old), Some(BlockPhase::Retired));
 
-    // A header admitted past the window retires the blocks below it.
-    let mid = block::Hash([0xB3; 32]);
-    admit_block(&mut table, t0, mid, parent_height, coding, [0x21; 32]);
+    // An admitted header proves only that headerchain retained it: a fork
+    // or a future-dated header admits too. It moves no window, so a block
+    // at the selected height still admits after it.
+    let high_height = parent_height + PROPAGATION_DEPTH + 1;
     let high = make_envelope(block::Hash([0xB4; 32]), coding, [0x21; 32], node_id(1));
     let received = receive(&mut table, t0, high);
     let step = header_result(
@@ -1878,7 +1961,22 @@ fn fix2_raising_top_retires_out_of_window_blocks() {
         t0,
         &received,
         HeaderAdmissionResult::Admitted {
-            height: parent_height + PROPAGATION_DEPTH + 1,
+            height: high_height,
+        },
+    );
+    assert!(step
+        .outputs
+        .iter()
+        .any(|o| matches!(o, BlockOutput::VerifyCommitment { .. })));
+    let mid = block::Hash([0xB3; 32]);
+    admit_block(&mut table, t0, mid, parent_height, coding, [0x21; 32]);
+    assert_eq!(table.block_phase(&mid), Some(BlockPhase::Collecting));
+
+    // The verified tip moving past the window retires the blocks below it.
+    let step = table.step(
+        t0,
+        BlockInput::TipHeight {
+            height: high_height,
         },
     );
     assert!(step.events.contains(&BlockEvent::Retired { block_id: mid }));

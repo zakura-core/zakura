@@ -1216,6 +1216,69 @@ fn temporary_block_checksum_is_bound_to_exact_body_bytes() {
     assert_eq!(frame[20..HEADER_LEN], remembered.0);
 }
 
+/// A prepared attempt's bytes are the message body: the codec writes them instead of
+/// serializing the block, and frames them with their own length and checksum.
+#[test]
+fn prepared_block_bytes_are_written_verbatim_with_their_length_and_checksum() {
+    let _init_guard = zakura_test::init();
+    let block = large_block();
+    // Bytes no serialization of `block` produces, so a codec that serialized it would differ.
+    let mut prepared = block.zcash_serialize_to_vec().unwrap();
+    prepared.extend_from_slice(b"prepared, not serialized");
+    assert!(prepared.len() >= MIN_SHARED_CHECKSUM_BODY_LEN);
+    let (_status, permit) =
+        zakura_node_services::block_relay::PendingBlockSendPermit::prepared_channel(
+            prepared.clone().into(),
+        );
+    let attempt = permit.attempt_checksum().unwrap().clone();
+
+    let shared = BlockChecksums::default();
+    let mut codec = Codec::builder()
+        .with_block_checksums(shared.clone())
+        .finish();
+    codec.reconfigure_full_body_len();
+    let mut frame = BytesMut::new();
+    codec
+        .encode(
+            Message::UncachedBlock(block.clone().into(), attempt.clone()),
+            &mut frame,
+        )
+        .unwrap();
+    assert_eq!(&frame[HEADER_LEN..], prepared.as_slice());
+    assert_eq!(
+        frame[16..20],
+        u32::try_from(prepared.len()).unwrap().to_le_bytes()
+    );
+    assert_eq!(
+        frame[20..HEADER_LEN],
+        sha256d::Checksum::from(prepared.as_slice()).0
+    );
+    assert!(
+        shared.get(block.hash()).is_none(),
+        "a prepared body stays out of the checksum cache shared by header hash"
+    );
+
+    // Another connection's send of the same attempt writes the same frame and reuses its hash.
+    let mut other = Codec::builder().with_block_checksums(shared).finish();
+    other.reconfigure_full_body_len();
+    let mut repeated = BytesMut::new();
+    other
+        .encode(
+            Message::UncachedBlock(block.into(), attempt.clone()),
+            &mut repeated,
+        )
+        .unwrap();
+    assert_eq!(repeated, frame);
+    assert_eq!(
+        attempt
+            .get_or_compute(&frame[HEADER_LEN..], |_| panic!(
+                "the attempt already hashed"
+            ))
+            .0,
+        frame[20..HEADER_LEN]
+    );
+}
+
 /// A block sent through connections that share checksums is byte-for-byte the block a
 /// connection on its own sends, on the first send and on the ones that reuse its checksum.
 #[test]

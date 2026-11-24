@@ -424,6 +424,9 @@ pub enum PeerInput {
     /// [`PeerState::has_copies`] holds: release the next batch of direct
     /// copies (decision-19).
     DataIdle,
+    /// The control frame in flight has waited [`stall_timeout`] for its bytes:
+    /// the peer stopped reading the control stream (bpv1-58).
+    ControlStalled,
     /// Session ended; drain all per-peer state.
     SessionEnd,
 }
@@ -582,6 +585,16 @@ pub enum PeerOutput {
     CloseProtocol(Bpv1CloseCause),
     /// Close the connection neutrally after a repeat liveness stall (bpv1-58).
     CloseNeutralStall,
+}
+
+/// How long a transfer of `bytes` may make no progress before the session
+/// stalls: `4 × (REQUEST_BASE_TIMEOUT + bytes / REQUEST_MIN_RATE_BPS)`
+/// (decision-3, bpv1-58).
+pub fn stall_timeout(bytes: u64) -> Duration {
+    let transfer_ms = bytes.saturating_mul(1000).div_ceil(REQUEST_MIN_RATE_BPS);
+    REQUEST_BASE_TIMEOUT
+        .saturating_add(Duration::from_millis(transfer_ms))
+        .saturating_mul(4)
 }
 
 /// Typed events emitted beside [`PeerOutput`]s.
@@ -1128,15 +1141,9 @@ impl PeerState {
             && (self.wants_out.len() as u32) < MAX_WANTS_INFLIGHT
     }
 
-    /// Current liveness stall timeout (`4 × (base_timeout + outstanding_bytes / min_rate)`).
+    /// Current liveness stall timeout for the bytes this session waits for.
     fn liveness_timeout(&self) -> Duration {
-        let transfer_ms = self
-            .outstanding_bytes()
-            .saturating_mul(1000)
-            .div_ceil(REQUEST_MIN_RATE_BPS);
-        let request_timeout =
-            REQUEST_BASE_TIMEOUT.saturating_add(Duration::from_millis(transfer_ms));
-        request_timeout.saturating_mul(4)
+        stall_timeout(self.outstanding_bytes())
     }
 
     /// Earliest future timer deadline for this session (`Tick` wakeup).
@@ -1255,6 +1262,12 @@ impl PeerState {
             }
             PeerInput::Tick => self.handle_tick(now, &mut step),
             PeerInput::DataIdle => self.handle_data_idle(&mut step),
+            PeerInput::ControlStalled => {
+                // A peer that never reads control gets the repeat-stall close:
+                // nothing it sent is a protocol violation.
+                self.closed = Some(SessionClose::NeutralStall);
+                step.outputs.push(PeerOutput::CloseNeutralStall);
+            }
             PeerInput::SessionEnd => unreachable!("handled above"),
         }
         self.unwritten_ends += step

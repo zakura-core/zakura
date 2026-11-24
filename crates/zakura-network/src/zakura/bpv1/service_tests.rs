@@ -68,6 +68,15 @@ fn config_default_is_opt_in_and_disabled_adds_zero_envelope_bytes() {
     let mut cfg = Config::default();
     assert!(!cfg.zakura.bpv1.enabled, "BPv1 must be opt-in by default");
     assert!(cfg.zakura.bpv1.validate().is_ok());
+    // `max_sessions` is unset by default, so memory decides the session
+    // count. A set value is a reactor cap, and zero is invalid.
+    assert_eq!(cfg.zakura.bpv1.max_sessions, None);
+    assert!(cfg.zakura.bpv1.admits_session(10_000));
+    let mut capped = cfg.zakura.bpv1.clone();
+    capped.max_sessions = Some(2);
+    assert!(capped.admits_session(1) && !capped.admits_session(2));
+    capped.max_sessions = Some(0);
+    assert!(capped.validate().is_err());
     // Hold max_connections fixed under a generous peer memory budget so both
     // envelopes compare the exact same connection count.
     cfg.zakura.max_connections = Some(8);
@@ -98,6 +107,24 @@ fn config_default_is_opt_in_and_disabled_adds_zero_envelope_bytes() {
     assert!(
         env_enabled.quic_bytes > env_disabled.quic_bytes,
         "enabled BPv1 registers its two persistent stream kinds in reactor_shares"
+    );
+
+    // The memory plan's session base `b_bpv1` funds the same held output per
+    // session, plus both output gates and the session's early records.
+    let base = super::memory::SessionBase::new(&cfg_enabled.zakura.bpv1);
+    assert_eq!(
+        base.session,
+        super::wire::BPV1_CONTROL_BUDGET.output
+            + super::wire::BPV1_DATA_BUDGET.output
+            + super::config::BPV1_SESSION_HELD_OUTPUT_BYTES
+            + cfg_enabled.zakura.bpv1.early_node_bytes_cap(1)
+            + super::peer::EARLY_CONTROL_BYTES,
+    );
+    assert_eq!(
+        cfg_enabled.zakura.bpv1.early_node_bytes_cap(3),
+        3 * u64::try_from(cfg_enabled.zakura.bpv1.early_peer_bytes_cap)
+            .expect("the default cap fits in u64"),
+        "the node's early-record cap is sessions × early_peer_bytes_cap"
     );
 }
 

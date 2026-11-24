@@ -48,6 +48,17 @@ impl BlockTable {
             self.config.part_buffer_bytes
         );
 
+        // The `Propagation` lease the IO shell holds covers every retained
+        // byte, and the reserve sized from `retained_bound` covers the lease.
+        assert!(
+            self.retained_bytes() <= self.lease_bytes()
+                && self.lease_bytes() <= Self::retained_bound(&self.config),
+            "{BLOCK_REPLAY}: retained bytes {} > lease {} or lease > bound {}",
+            self.retained_bytes(),
+            self.lease_bytes(),
+            Self::retained_bound(&self.config)
+        );
+
         // bpv1-50: every indexed header or commitment job belongs to its
         // admitting entry, so finished or abandoned work leaves no lease.
         for (work_id, block_id) in &self.work_to_block {

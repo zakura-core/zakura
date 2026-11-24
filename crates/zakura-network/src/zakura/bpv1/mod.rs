@@ -16,6 +16,7 @@ pub mod close;
 pub mod codec;
 pub mod commitment;
 pub mod config;
+pub mod memory;
 pub mod paths;
 pub mod peer;
 pub mod ports;
@@ -60,6 +61,7 @@ pub use commitment::{
     CommitmentFields, COMMITMENT_PAYLOAD_LEN, COMMITMENT_SCRIPT_LEN, COMMITMENT_SCRIPT_PREFIX,
 };
 pub use config::{HavePacing, ZakuraBpv1Config, BPV1_SESSION_HELD_OUTPUT_BYTES};
+pub use memory::{block_push_bytes, PropagationReserve, SessionBase, ASSEMBLED_BLOCK_BYTES};
 pub use paths::{
     arrival_duration, Arrival, PathDirection, PathEstimate, PeerPaths, DEFAULT_UNMEASURED_RATE_BPS,
 };
@@ -74,12 +76,12 @@ pub use ports::{
     classify_body_verification_class, BlockFallbackPort, BlockVerifierPort, BodyStorePort,
     HeaderAdmissionPort, HeaderChainAdmissionAdapter, MemoryBodyStore, PortFuture,
 };
-pub use profile::{Coding, LayoutError, Profile, W2_PROFILE_ID};
+pub use profile::{Coding, LayoutError, Profile, NODE_PROFILE, W2_PROFILE_ID};
 pub use proposer::{
     compute_body_identity, seed_plan, PreparedCommitment, ProposerConfig, ProposerEvent,
     ProposerInput, ProposerOutput, ProposerState, ProposerStep, SeedPlan, TemplateId,
 };
-pub use service::{bpv1_custom_service, bpv1_service_id, Bpv1Handle, Bpv1Ports, Bpv1Service};
+pub use service::{bpv1_service_id, Bpv1Handle, Bpv1Ports, Bpv1Service, Bpv1Startup};
 pub use tree::{
     build_part_tree, encoding_id, pad_hash, verify_part_proof, Bpv1Hash, ProofError, VerifiedPart,
 };

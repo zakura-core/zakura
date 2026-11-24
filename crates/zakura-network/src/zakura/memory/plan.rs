@@ -29,6 +29,7 @@ use crate::{
             BLOCK_SYNC_SESSION_BOOKKEEPING_BYTES, BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES,
             DEFAULT_BS_BBR_MIN_CWND_BYTES, LARGEST_SERVED_BLOCK_RESPONSE_BYTES,
         },
+        bpv1::{PropagationReserve, SessionBase as Bpv1SessionBase, NODE_PROFILE, ZAKURA_CAP_BPV1},
         discovery::{discovery_serving_output_bytes, DISCOVERY_BUDGET},
         handler::{
             remote_bootstrap_peer_count, BASE_SEND_WINDOW_BYTES,
@@ -95,13 +96,12 @@ pub const DISCOVERY_TABLES_FIXED_BYTES: u64 = 25 * MIB;
 /// (`01 §1`, `#2623`: ~150 MiB when `tx-relay` is enabled).
 pub const TX_RELAY_MAPS_FIXED_BYTES: u64 = 150 * MIB;
 
-/// Maximum concurrent tip blocks reserved for propagation paths on `main`
-/// (before BPv1 lands in Commit 15).
+/// Maximum concurrent tip blocks reserved for propagation paths with BPv1 off.
 const MAX_CONCURRENT_TIP_BLOCKS: u64 = 4;
 
-/// Proof-of-work-bounded propagation reserve covering tip-block paths on `main`
-/// (`goal-impl.md`: `4 × 4 × MAX_BLOCK_BYTES = 32 MB`). Commit 15 extends this
-/// with BPv1 parts, early records, and prepared encodings when BPv1 merges.
+/// Proof-of-work-bounded propagation reserve covering tip-block paths with
+/// BPv1 off (`goal-impl.md`: `4 × 4 × MAX_BLOCK_BYTES = 32 MB`). With BPv1 on,
+/// [`PropagationReserve`] sizes the reserve from BPv1's own bounds.
 pub const PROPAGATION_RESERVE_BYTES: u64 = MAX_CONCURRENT_TIP_BLOCKS * 4 * MAX_BLOCK_BYTES;
 
 /// Non-leased fixed memory terms accounted in the startup plan (`02 §4`).
@@ -179,6 +179,10 @@ pub struct SessionBases {
     pub tx_relay: ReactorBase,
     /// Legacy compatibility streams base `b_legacy_compat` (kinds 2 and 3 unsolicited receive).
     pub legacy_compat: ReactorBase,
+    /// BPv1 session base `b_bpv1` (0 when disabled): control and data
+    /// unsolicited receive, plus the output gates, held frames and early
+    /// records of one session ([`Bpv1SessionBase`]).
+    pub bpv1: ReactorBase,
     /// Sum of unsolicited receive shares for any embedder custom stream kinds.
     pub custom_kinds: ReactorBase,
 }
@@ -187,7 +191,8 @@ pub struct SessionBases {
 const SESSION_REACTOR_CAPABILITIES: u64 = ZAKURA_CAP_HEADER_SYNC
     | ZAKURA_CAP_BLOCK_SYNC_REGULATED
     | ZAKURA_CAP_TX_RELAY
-    | ZAKURA_CAP_LEGACY_GOSSIP;
+    | ZAKURA_CAP_LEGACY_GOSSIP
+    | ZAKURA_CAP_BPV1;
 
 impl SessionBases {
     /// Cost of one connection carrying the reactors required to follow the chain:
@@ -204,6 +209,7 @@ impl SessionBases {
         self.required_chain_connection_bytes()
             .saturating_add(self.tx_relay.total())
             .saturating_add(self.legacy_compat.total())
+            .saturating_add(self.bpv1.total())
             .saturating_add(self.custom_kinds.total())
     }
 
@@ -246,6 +252,7 @@ impl SessionBases {
                 admitted,
                 ZAKURA_CAP_LEGACY_GOSSIP,
             ),
+            bpv1: reactor_cost(self.bpv1, negotiated, admitted, ZAKURA_CAP_BPV1),
             custom_kinds: if custom_kinds_negotiated {
                 self.custom_kinds.total()
             } else {
@@ -279,6 +286,8 @@ impl SessionBases {
             (ZAKURA_CAP_TX_RELAY, self.tx_relay)
         } else if capability & ZAKURA_CAP_LEGACY_GOSSIP != 0 {
             (ZAKURA_CAP_LEGACY_GOSSIP, self.legacy_compat)
+        } else if capability & ZAKURA_CAP_BPV1 != 0 {
+            (ZAKURA_CAP_BPV1, self.bpv1)
         } else {
             return None;
         };
@@ -320,6 +329,8 @@ pub struct ConnectionSessionCost {
     pub tx_relay: u64,
     /// Legacy compatibility base (0 if not negotiated).
     pub legacy_compat: u64,
+    /// BPv1 base (0 if not negotiated or disabled).
+    pub bpv1: u64,
     /// Embedder custom kinds base (0 if none negotiated).
     pub custom_kinds: u64,
 }
@@ -333,6 +344,7 @@ impl ConnectionSessionCost {
             .saturating_add(self.block_sync)
             .saturating_add(self.tx_relay)
             .saturating_add(self.legacy_compat)
+            .saturating_add(self.bpv1)
             .saturating_add(self.custom_kinds)
     }
 }
@@ -461,7 +473,7 @@ impl fmt::Display for BudgetTooSmall {
              reserves={} B [control={} B, propagation={} B, consensus={} B], \
              floors={} B [block_sync={} B, serving={} B, sessions={} B ({} min conns × {} B), tx={} B], \
              connection bases [t={} B, header_sync={} B, block_sync={} B, tx_relay={} B, \
-             legacy_compat={} B, custom_kinds={} B]); \
+             legacy_compat={} B, bpv1={} B, custom_kinds={} B]); \
              raise [memory] budget or add host RAM",
             self.derivation.host_budget_bytes,
             self.derivation.base_bytes,
@@ -496,6 +508,7 @@ impl fmt::Display for BudgetTooSmall {
             bases.block_sync.total(),
             bases.tx_relay.total(),
             bases.legacy_compat.total(),
+            bases.bpv1.total(),
             bases.custom_kinds.total(),
         )
     }
@@ -778,6 +791,18 @@ impl MemoryPlan {
                     setting: "[network.zakura.block_sync.peer_limits]".to_owned(),
                     configured_value: format!("{effective_bsync} sessions"),
                     excess_bytes: bsync_worst - budget_b,
+                    plan_value: format!("unset (plan funds {plan_default_full_connections})"),
+                });
+            }
+        }
+        if let Some(configured) = config.zakura.bpv1.max_sessions {
+            let effective_bpv1 = configured.min(connection_cap);
+            let bpv1_worst = non_session_static.saturating_add(cap_sessions);
+            if effective_bpv1 > plan_default_full_connections && bpv1_worst > budget_b {
+                override_warnings.push(OverrideWarning {
+                    setting: "[network.zakura.bpv1] max_sessions".to_owned(),
+                    configured_value: format!("{effective_bpv1} sessions"),
+                    excess_bytes: bpv1_worst - budget_b,
                     plan_value: format!("unset (plan funds {plan_default_full_connections})"),
                 });
             }
@@ -1076,7 +1101,7 @@ impl MemoryPlan {
 
     /// Publish `zakura.memory.plan_bytes{term}` startup gauges (`03 §5`).
     pub fn publish_metrics(&self) {
-        let terms: [(&'static str, u64); 25] = [
+        let terms: [(&'static str, u64); 26] = [
             ("budget_b", self.pool_config.budget_b),
             ("fixed_total", self.fixed.total()),
             ("fixed_socket_queues", self.fixed.socket_queues),
@@ -1116,6 +1141,7 @@ impl MemoryPlan {
             ("session_block_sync", self.bases.block_sync.total()),
             ("session_tx_relay", self.bases.tx_relay.total()),
             ("session_legacy_compat", self.bases.legacy_compat.total()),
+            ("session_bpv1", self.bases.bpv1.total()),
             ("full_connection_base", self.bases.full_connection_bytes()),
         ];
         for (term, bytes) in terms {
@@ -1128,14 +1154,17 @@ impl fmt::Display for MemoryPlan {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "MemoryPlan(network={}, B={} B, fixed={} B, floors+reserves={} B, S={} B, \
-             t={} B, full_conn={} B, planned_full_conns={}/{})",
+            "MemoryPlan(network={}, B={} B, fixed={} B, floors+reserves={} B, \
+             propagation={} B, S={} B, t={} B, bpv1_session={} B, full_conn={} B, \
+             planned_full_conns={}/{})",
             self.network_name,
             self.pool_config.budget_b,
             self.fixed.total(),
             self.pool_config.total_floors(),
+            self.consumer_spec(Consumer::Propagation).floor,
             self.shared_capacity(),
             self.bases.transport_base,
+            self.bases.bpv1.total(),
             self.bases.full_connection_bytes(),
             self.planned_full_connections,
             self.connection_cap,
@@ -1268,6 +1297,15 @@ impl PlanTerms {
                     .saturating_add(LEGACY_REQUESTS_BUDGET.receive.unsolicited),
                 session: 0,
             },
+            bpv1: if config.zakura.bpv1.enabled {
+                let base = Bpv1SessionBase::new(&config.zakura.bpv1);
+                ReactorBase {
+                    receive: base.receive,
+                    session: base.session,
+                }
+            } else {
+                ReactorBase::default()
+            },
             custom_kinds: ReactorBase {
                 receive: custom_kinds_receive,
                 session: 0,
@@ -1310,6 +1348,11 @@ impl PlanTerms {
             .zakura
             .block_sync
             .block_sync_connections(connection_cap);
+        let bpv1_cap = config
+            .zakura
+            .bpv1
+            .max_sessions
+            .map_or(connection_cap, |max| max.min(connection_cap));
         // Receive parts follow negotiation, so every connection may hold
         // them. Session parts follow each reactor's sessions.
         let every_connection = bases
@@ -1318,11 +1361,13 @@ impl PlanTerms {
             .saturating_add(bases.block_sync.receive)
             .saturating_add(bases.tx_relay.total())
             .saturating_add(bases.legacy_compat.total())
+            .saturating_add(bases.bpv1.receive)
             .saturating_add(bases.custom_kinds.total());
         let cap_sessions = (connection_cap as u64)
             .saturating_mul(every_connection)
             .saturating_add((header_sync_cap as u64).saturating_mul(bases.header_sync.session))
             .saturating_add((block_sync_cap as u64).saturating_mul(bases.block_sync.session))
+            .saturating_add((bpv1_cap as u64).saturating_mul(bases.bpv1.session))
             .max(floor_sessions);
 
         let floor_tx = u64::from(MAX_TX_BYTES);
@@ -1342,7 +1387,11 @@ impl PlanTerms {
             bases,
             // Reserved consumers (`Priority::Reserved`, `floor == cap`, `02 §4`).
             reserve_control: discovery_serving_output_bytes(connection_cap),
-            reserve_propagation: PROPAGATION_RESERVE_BYTES,
+            reserve_propagation: if config.zakura.bpv1.enabled {
+                PropagationReserve::new(&config.zakura.bpv1, NODE_PROFILE).total()
+            } else {
+                PROPAGATION_RESERVE_BYTES
+            },
             reserve_consensus: draft_worst_checkpoint_window_bytes(network)
                 .max(BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES),
             floor_block_sync,
@@ -1491,6 +1540,7 @@ mod tests {
             block_sync: base(MIB, 4 * KIB),
             tx_relay: base(64 * KIB, 32 * KIB),
             legacy_compat: base(128 * KIB, 0),
+            bpv1: base(512 * KIB, 96 * KIB),
             custom_kinds: base(256 * KIB, 0),
         }
     }
@@ -1511,7 +1561,7 @@ mod tests {
         let negotiated_only = bases.connection_cost(all, 0, false);
         assert_eq!(
             negotiated_only.total(),
-            320 * KIB + 256 * KIB + MIB + 64 * KIB + 128 * KIB
+            320 * KIB + 256 * KIB + MIB + 64 * KIB + 128 * KIB + 512 * KIB
         );
         assert_eq!(SessionBases::funded_sessions(all, 0), 0);
 
@@ -1520,6 +1570,7 @@ mod tests {
         assert_eq!(cost.header_sync, bases.header_sync.total());
         assert_eq!(cost.block_sync, bases.block_sync.total());
         assert_eq!(cost.tx_relay, bases.tx_relay.receive);
+        assert_eq!(cost.bpv1, bases.bpv1.receive);
         assert_eq!(cost.custom_kinds, 0);
         assert_eq!(SessionBases::funded_sessions(all, admitted), admitted);
 
@@ -1537,6 +1588,11 @@ mod tests {
         assert_eq!(
             bases.session_top_up(funded, ZAKURA_CAP_TX_RELAY),
             Some((ZAKURA_CAP_TX_RELAY, 32 * KIB))
+        );
+        // BPv1's session base follows each admitted session (`b_bpv1`).
+        assert_eq!(
+            bases.session_top_up(funded, ZAKURA_CAP_BPV1),
+            Some((ZAKURA_CAP_BPV1, 96 * KIB))
         );
         // No session part, or no reactor these bases name.
         assert_eq!(bases.session_top_up(0, ZAKURA_CAP_LEGACY_GOSSIP), None);
@@ -1762,10 +1818,11 @@ mod tests {
         ];
 
         for network in networks {
-            for (stack, tx_relay) in [
-                (P2pStack::Zakura, false),
-                (P2pStack::Zakura, true),
-                (P2pStack::Dual, false),
+            for (stack, tx_relay, bpv1) in [
+                (P2pStack::Zakura, false, false),
+                (P2pStack::Zakura, true, false),
+                (P2pStack::Zakura, true, true),
+                (P2pStack::Dual, false, false),
             ] {
                 let mut config = Config {
                     network: network.clone(),
@@ -1774,6 +1831,7 @@ mod tests {
                 };
                 config.zakura.apply_network_defaults(&network);
                 config.zakura.tx_relay.enabled = tx_relay;
+                config.zakura.bpv1.enabled = bpv1;
 
                 let mut first_accepted: Option<MemoryPlan> = None;
                 let mut prev_full_n = 0usize;
@@ -1860,14 +1918,23 @@ mod tests {
     }
 
     /// Sanity check the Mainnet host budgets listed in `03 §2` (4, 8, 16, 32, 64 GiB)
-    /// under draft Stage 0 values and D2 (chain sets minimum host).
+    /// under draft Stage 0 values and D2 (chain sets minimum host), with BPv1
+    /// off and on.
     #[test]
     fn mainnet_host_budget_progression_matches_d2() {
-        let config = Config {
-            network: Network::Mainnet,
-            p2p_stack: P2pStack::Zakura,
-            ..Config::default()
-        };
+        for bpv1 in [false, true] {
+            let mut config = Config {
+                network: Network::Mainnet,
+                p2p_stack: P2pStack::Zakura,
+                ..Config::default()
+            };
+            config.zakura.bpv1.enabled = bpv1;
+            host_budget_progression(&config);
+        }
+    }
+
+    fn host_budget_progression(config: &Config) {
+        let config = config.clone();
 
         // 4 GiB and 8 GiB refuse under draft Stage 0 base (~4.6 GiB) + worst checkpoint window (~3.7 GiB).
         for small_gib in [4u64, 8] {
@@ -1893,6 +1960,64 @@ mod tests {
             assert!(plan.planned_full_connections >= prev_n);
             prev_s = plan.shared_capacity();
             prev_n = plan.planned_full_connections;
+        }
+    }
+
+    /// With BPv1 on, the `Propagation` reserve is BPv1's retained
+    /// bound and each BPv1 session funds `b_bpv1`. The base send window
+    /// already holds one block's BPv1 parts. With BPv1 off, every term stays
+    /// as before.
+    #[test]
+    fn bpv1_sizes_its_reserve_session_base_and_send_window() {
+        use crate::zakura::bpv1::block_push_bytes;
+
+        let off = Config {
+            network: Network::Mainnet,
+            p2p_stack: P2pStack::Zakura,
+            ..Config::default()
+        };
+        let mut on = off.clone();
+        on.zakura.bpv1.enabled = true;
+        let budget_b = resolved_p2p_budget_bytes(16 * GIB, false);
+        let off_plan = MemoryPlan::size(budget_b, &off, &Network::Mainnet).expect("16 GiB fits");
+        let on_plan = MemoryPlan::size(budget_b, &on, &Network::Mainnet).expect("16 GiB fits");
+
+        assert_eq!(
+            off_plan.consumer_spec(Consumer::Propagation),
+            ConsumerSpec::reserved(PROPAGATION_RESERVE_BYTES)
+        );
+        assert_eq!(off_plan.bases.bpv1, ReactorBase::default());
+        assert_eq!(
+            on_plan.consumer_spec(Consumer::Propagation),
+            ConsumerSpec::reserved(PropagationReserve::new(&on.zakura.bpv1, NODE_PROFILE).total())
+        );
+        let base = Bpv1SessionBase::new(&on.zakura.bpv1);
+        assert_eq!(
+            on_plan.bases.bpv1,
+            ReactorBase {
+                receive: base.receive,
+                session: base.session,
+            }
+        );
+        assert!(BASE_SEND_WINDOW_BYTES >= block_push_bytes(NODE_PROFILE));
+        assert_eq!(on_plan.bases.transport_base, off_plan.bases.transport_base);
+
+        // `max_sessions` is unset by default, so it never warns. Set above
+        // what the plan funds, it warns when its worst case passes `B`; set
+        // below, it never does.
+        assert!(on_plan.override_warnings.is_empty());
+        for (max_sessions, warns) in [(256, true), (8, false)] {
+            let mut capped = on.clone();
+            capped.zakura.bpv1.max_sessions = Some(max_sessions);
+            let plan = MemoryPlan::size(budget_b, &capped, &Network::Mainnet).expect("fits");
+            assert_eq!(
+                plan.override_warnings
+                    .iter()
+                    .any(|warning| warning.setting == "[network.zakura.bpv1] max_sessions"),
+                warns,
+                "max_sessions = {max_sessions}: {:?}",
+                plan.override_warnings
+            );
         }
     }
 

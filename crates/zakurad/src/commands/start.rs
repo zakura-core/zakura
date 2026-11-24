@@ -560,7 +560,7 @@ impl StartCmd {
     pub(crate) async fn start(
         &self,
         config: Arc<ZakuradConfig>,
-        mut custom_services: Vec<zakura_network::zakura::CustomService>,
+        custom_services: Vec<zakura_network::zakura::CustomService>,
         ready: Option<tokio::sync::oneshot::Sender<crate::node::NodeServices>>,
         shutdown: CancellationToken,
         shutdown_cleanup_required: CancellationToken,
@@ -904,7 +904,7 @@ impl StartCmd {
         // BPv1 runs only when explicitly enabled AND headerchain is attached
         // (`Zakura` or `Dual` p2p_stack — strictly absent in `Legacy`, `dual-1`).
         let mut zakura_header_sync_driver_startup = zakura_header_sync_driver_startup;
-        let bpv1_handle = if config.network.zakura.bpv1.enabled {
+        let bpv1 = if config.network.zakura.bpv1.enabled {
             if let Some(driver_startup) = zakura_header_sync_driver_startup.as_mut() {
                 config
                     .network
@@ -917,7 +917,7 @@ impl StartCmd {
                     .zakura_secret_key()
                     .map_err(|error| eyre!(error))?;
                 network_config.zakura_node_secret_key = Some((&secret_key).into());
-                let (svc, handle) = zakura::bpv1_wiring::build_bpv1_service(
+                Some(zakura::bpv1_wiring::bpv1_startup(
                     &config.network.zakura.bpv1,
                     // decision-26: `Have`s follow block gossip's advertisement pacing.
                     zakura_network::zakura::bpv1::HavePacing::from_network_config(&config.network),
@@ -929,9 +929,7 @@ impl StartCmd {
                     driver_startup,
                     // Child token so disabling/shutting down BPv1 never shuts down the daemon.
                     shutdown.child_token(),
-                );
-                custom_services.push(svc);
-                Some(handle)
+                ))
             } else {
                 warn!(
                     "bpv1 requires `Zakura` or `Dual` p2p_stack (headerchain attached), so it stays off"
@@ -945,7 +943,7 @@ impl StartCmd {
         // The network counts `tx-relay` and `bpv1` memory shares only when they are
         // registered, not merely enabled.
         network_config.zakura.tx_relay.enabled = tx_relay_port.is_some();
-        network_config.zakura.bpv1.enabled = bpv1_handle.is_some();
+        network_config.zakura.bpv1.enabled = bpv1.is_some();
         // The service is registered on the v2 endpoint, which a legacy-only
         // stack never starts.
         let tx_relay_registered = tx_relay_port.is_some() && config.network.v2_p2p();
@@ -975,9 +973,14 @@ impl StartCmd {
                     latest_chain_tip: latest_chain_tip.clone(),
                 }),
                 tx_relay,
+                bpv1,
             )
             .await
             .map_err(|error| eyre!(error))?;
+        // The endpoint starts BPv1 once it has built the memory pool BPv1 leases from.
+        let bpv1_handle = zakura_endpoint
+            .as_ref()
+            .and_then(zakura_network::zakura::ZakuraEndpoint::bpv1);
 
         let mut header_sync_fatal_events = match zakura_endpoint.as_ref() {
             Some(endpoint) => endpoint.take_header_sync_fatal_events().await,

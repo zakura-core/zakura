@@ -255,8 +255,9 @@ pub const CONTROL_RECEIVE_BYTES: u64 = if DERIVED_CONTROL_RECEIVE_BYTES > MIN_QU
 pub const HANDSHAKE_SEND_WINDOW_BYTES: u64 = MIN_QUIC_WINDOW_BYTES;
 
 /// Base send window for an admitted connection: the largest native frame
-/// (`MAX_BS_FRAME_BYTES`), so propagation never needs to lease window growth to
-/// send one block.
+/// (`MAX_BS_FRAME_BYTES`), which also holds every part of one largest BPv1
+/// block ([`super::bpv1::block_push_bytes`]), so propagation never needs to
+/// lease window growth to send one block.
 pub const BASE_SEND_WINDOW_BYTES: u64 = super::MAX_BS_FRAME_BYTES as u64;
 
 /// A paused stream may consume at most half the connection receive window,
@@ -1144,6 +1145,8 @@ pub struct ZakuraEndpoint {
     memory_plan: Option<super::memory::MemoryPlan>,
     /// Node-wide logical-byte memory pool sized from [`Self::memory_plan`].
     memory_pool: Option<super::memory::MemoryPool>,
+    /// BPv1's handle, when the endpoint started BPv1.
+    bpv1: Option<super::Bpv1Handle>,
     /// Maintained native dials started by the legacy->Zakura upgrade hand-off,
     /// keyed by the advertised peer id. See [`Self::start_upgrade_native_dial`]
     /// and [`Self::cancel_upgrade_native_dial`].
@@ -1258,6 +1261,11 @@ impl ZakuraEndpoint {
     /// Returns the node-wide memory pool owned by this endpoint.
     pub fn memory_pool(&self) -> Option<super::memory::MemoryPool> {
         self.memory_pool.clone()
+    }
+
+    /// Returns BPv1's handle when this endpoint started BPv1.
+    pub fn bpv1(&self) -> Option<super::Bpv1Handle> {
+        self.bpv1.clone()
     }
 
     /// Returns the header-sync handle when native header sync is active.
@@ -1588,6 +1596,7 @@ impl ZakuraEndpoint {
             block_sync_actions: None,
             memory_plan,
             memory_pool,
+            bpv1: None,
             upgrade_dials: Arc::new(StdMutex::new(HashMap::new())),
             upgrade_alpn_floors: Arc::new(StdMutex::new(HashMap::new())),
         }
@@ -1653,6 +1662,7 @@ impl ZakuraEndpoint {
                 .map(|actions| Arc::new(AsyncMutex::new(Some(actions)))),
             memory_plan,
             memory_pool,
+            bpv1: None,
             upgrade_dials: Arc::new(StdMutex::new(HashMap::new())),
             upgrade_alpn_floors: Arc::new(StdMutex::new(HashMap::new())),
         }
@@ -6151,18 +6161,20 @@ pub async fn spawn_zakura_endpoint_with_services(
         custom_services,
         None,
         None,
+        None,
     )
     .await
 }
 
 /// Start a Zakura endpoint on `peer_registry`, with `tx-relay` if
-/// `tx_relay` is given.
+/// `tx_relay` is given and BPv1 if `bpv1` is given.
 pub(crate) async fn spawn_zakura_endpoint_with_peer_registry(
     config: &Config,
     sink_factory: impl FnOnce(ZakuraSupervisorHandle, ZakuraTrace) -> Arc<dyn Service> + Send + 'static,
     header_sync_driver_startup: Option<ZakuraHeaderSyncDriverStartup>,
     custom_services: Vec<CustomService>,
     tx_relay: Option<super::TxRelayStartup>,
+    bpv1: Option<super::Bpv1Startup>,
     peer_registry: PeerRegistry,
 ) -> Result<Option<ZakuraEndpoint>, BoxError> {
     spawn_zakura_endpoint_inner(
@@ -6171,20 +6183,22 @@ pub(crate) async fn spawn_zakura_endpoint_with_peer_registry(
         header_sync_driver_startup,
         custom_services,
         tx_relay,
+        bpv1,
         Some(peer_registry),
     )
     .await
 }
 
 /// Starts the endpoint. `sink_factory` is boxed so this large function is compiled once for
-/// every caller's factory type. `tx_relay` starts once the memory pool its fetches lease from
-/// exists.
+/// every caller's factory type. `tx_relay` and `bpv1` start once the memory pool they lease
+/// from exists.
 async fn spawn_zakura_endpoint_inner(
     config: &Config,
     sink_factory: Box<dyn FnOnce(ZakuraSupervisorHandle, ZakuraTrace) -> Arc<dyn Service> + Send>,
     header_sync_driver_startup: Option<ZakuraHeaderSyncDriverStartup>,
     mut custom_services: Vec<CustomService>,
     tx_relay: Option<super::TxRelayStartup>,
+    bpv1: Option<super::Bpv1Startup>,
     peer_registry: Option<PeerRegistry>,
 ) -> Result<Option<ZakuraEndpoint>, BoxError> {
     if !config.v2_p2p() {
@@ -6226,6 +6240,11 @@ async fn spawn_zakura_endpoint_inner(
     memory_plan.publish_metrics();
     let memory_pool = memory_plan.build_pool();
     custom_services.extend(tx_relay.map(|startup| startup.start(memory_pool.clone())));
+    let bpv1 = bpv1.map(|startup| {
+        let (service, handle) = startup.start(memory_pool.clone());
+        custom_services.push(service);
+        handle
+    });
     let serving_pool =
         super::memory::ServingPool::new(memory_pool.clone(), memory_plan.serving_per_peer_cap);
     let block_sync_memory = super::BlockSyncMemory::new(
@@ -6528,6 +6547,7 @@ async fn spawn_zakura_endpoint_inner(
         block_sync_actions,
         memory_plan: Some(memory_plan),
         memory_pool: Some(memory_pool),
+        bpv1,
         upgrade_dials: Arc::new(StdMutex::new(HashMap::new())),
         upgrade_alpn_floors: Arc::new(StdMutex::new(HashMap::new())),
     };

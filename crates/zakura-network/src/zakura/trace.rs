@@ -591,6 +591,7 @@ impl ZakuraTrace {
                 "session_legacy_compat",
                 Some(plan.bases.legacy_compat.total()),
             );
+            insert_optional_u64(row, "session_bpv1", Some(plan.bases.bpv1.total()));
             insert_optional_u64(
                 row,
                 "session_custom_kinds",

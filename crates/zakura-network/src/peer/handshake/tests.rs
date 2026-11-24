@@ -293,6 +293,7 @@ async fn start_test_zakura_endpoint_with_registry() -> (crate::zakura::ZakuraEnd
         None,
         Vec::new(),
         None,
+        None,
         peer_registry.clone(),
     )
     .await

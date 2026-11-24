@@ -1018,6 +1018,7 @@ async fn session_admission_refuses_atomically_past_share_without_borrowing() {
         block_sync: MIB,
         tx_relay: 0,
         legacy_compat: 0,
+        bpv1: 0,
         custom_kinds: 0,
     };
     assert_eq!(cost.total(), 2 * MIB);
@@ -1085,6 +1086,7 @@ async fn session_admission_reclaims_borrowed_shared_memory_and_cleans_up_on_time
         block_sync: MIB,
         tx_relay: 256 * KIB,
         legacy_compat: 0,
+        bpv1: 0,
         custom_kinds: 0,
     };
     let total = cost.total();

@@ -1333,6 +1333,62 @@ impl BlockTable {
         self.blocks.values().map(ActiveBlock::charged_bytes).sum()
     }
 
+    /// Bytes the table retains: part charges, pending and admitting metadata,
+    /// each admitted block's `HeaderMeta`, and the parts of blocks this node
+    /// proposed, which it stores without a charge.
+    pub fn retained_bytes(&self) -> u64 {
+        let blocks = self
+            .blocks
+            .values()
+            .filter(|block| block.phase != BlockPhase::Retired)
+            .map(|block| {
+                // Widening usize to u64 is lossless on supported targets.
+                let meta = block.meta.estimated_bytes() as u64;
+                let local = if block.as_proposer {
+                    block.meta.coding.encoded_bytes()
+                } else {
+                    0
+                };
+                block
+                    .charged_bytes()
+                    .saturating_add(meta)
+                    .saturating_add(local)
+            })
+            .fold(0, u64::saturating_add);
+        let admitting: usize = self
+            .admitting
+            .values()
+            .map(|entry| entry.envelope.estimated_bytes())
+            .sum();
+        // Widening usize to u64 is lossless on supported targets.
+        blocks.saturating_add(self.pending_bytes.saturating_add(admitting) as u64)
+    }
+
+    /// The most bytes [`Self::retained_bytes`] reaches under `config`: the part
+    /// buffer budget, the metadata budget, and, for every concurrent block, a
+    /// largest `HeaderMeta` and a largest local encoding.
+    pub fn retained_bound(config: &BlockConfig) -> u64 {
+        // Widening usize to u64 is lossless on supported targets.
+        let per_block = (MetaEnvelope::MAX_ESTIMATED_BYTES as u64)
+            .saturating_add(config.profile.max_coding().encoded_bytes());
+        config
+            .part_buffer_bytes
+            .saturating_add(MAX_PENDING_META_BYTES as u64)
+            .saturating_add((config.max_concurrent_blocks as u64).saturating_mul(per_block))
+    }
+
+    /// The `Propagation` lease that covers [`Self::retained_bytes`]: the
+    /// retained bytes rounded up to a whole largest block's parts, so the IO
+    /// shell resizes its lease a few times per block, not once per part, and
+    /// never past [`Self::retained_bound`].
+    pub fn lease_bytes(&self) -> u64 {
+        let step = self.config.profile.max_coding().encoded_bytes().max(1);
+        self.retained_bytes()
+            .div_ceil(step)
+            .saturating_mul(step)
+            .min(Self::retained_bound(&self.config))
+    }
+
     /// Returns the number of retained parts across all non-retired blocks.
     pub fn retained_part_count(&self) -> usize {
         self.blocks

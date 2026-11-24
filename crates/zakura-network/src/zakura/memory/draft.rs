@@ -46,7 +46,7 @@ pub const DRAFT_MANAGED_ZCASHD_SIDECAR_BYTES: u64 = 4 * GIB;
 /// `wire + max(4 × wire, decoded)` (`block_sync/admission.rs`, whose
 /// `DESERIALIZED_MEM_FACTOR` is the 4) at `MAX_BLOCK_BYTES`, or
 /// `5 × 2,000,000 B`.
-const ADMISSION_CHARGE_PER_MAX_BLOCK: u64 = 5 * MAX_BLOCK_BYTES;
+pub const ADMISSION_CHARGE_PER_MAX_BLOCK: u64 = 5 * MAX_BLOCK_BYTES;
 
 /// Draft worst 401-block checkpoint window charge on Mainnet (`decision-12`).
 ///

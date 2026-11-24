@@ -296,6 +296,16 @@ impl ProposerState {
         }
     }
 
+    /// The bytes the prepared encodings hold: each encoding's parts at
+    /// [`Coding::encoded_bytes`]. An encode in flight holds its bytes outside
+    /// the machine until [`ProposerInput::EncodeDone`].
+    pub fn prepared_bytes(&self) -> u64 {
+        self.prepared
+            .iter()
+            .map(|entry| entry.encoded.coding.encoded_bytes())
+            .fold(0, u64::saturating_add)
+    }
+
     /// Executes one synchronous proposer transition.
     pub fn step(&mut self, input: ProposerInput) -> ProposerStep {
         let mut step = ProposerStep::default();

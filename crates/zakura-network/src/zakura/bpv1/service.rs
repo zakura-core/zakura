@@ -40,6 +40,7 @@ use super::{
         CommitmentFields, COMMITMENT_PAYLOAD_LEN,
     },
     config::{HavePacing, ZakuraBpv1Config, PATH_POLL_INTERVAL},
+    memory::{Bpv1Memory, ASSEMBLED_BLOCK_BYTES},
     paths::{Arrival, PathEstimate},
     peer::{
         DropReason, PartAuth, PartToken, PeerEvent, PeerInput, PeerOutput, PeerState, PeerStep,
@@ -50,7 +51,7 @@ use super::{
     profile::{Coding, Profile, W2_PROFILE_ID},
     proposer::{
         compute_body_identity, PreparedCommitment, ProposerConfig, ProposerEvent, ProposerInput,
-        ProposerOutput, ProposerState, SeedDeal, TemplateId,
+        ProposerOutput, ProposerState, ProposerStep, SeedDeal, TemplateId,
     },
     pull_trace::{is_sampled_part, PullOutcome, PullTraceRecord},
     route::{
@@ -64,6 +65,7 @@ use super::{
     },
 };
 use crate::zakura::{
+    memory::MemoryPool,
     wire_codec::{decode_frame, encode_frame, BlockHash, BoundedReader, LeU32, WireError},
     CustomService, Frame, FramedRecv, FramedSend, Peer, Service, ServicePeerDirection,
     SessionOpening, SessionPolicy, Stream, ZakuraConnId, ZakuraPeerId, ZakuraServiceId,
@@ -160,6 +162,9 @@ struct SharedNode {
     /// In-flight encodes that other templates can join, keyed by
     /// body identity.
     encodes: Mutex<HashMap<[u8; 32], EncodeResults>>,
+    /// The `Propagation` leases that cover what the table and the proposer
+    /// hold.
+    memory: Bpv1Memory,
 }
 
 impl fmt::Debug for SharedNode {
@@ -181,8 +186,26 @@ impl SharedNode {
         lock(&self.table)
     }
 
+    /// Runs `change` on the table, then resizes the table's lease to what the
+    /// table now holds, under the same lock.
+    fn change_table<R>(&self, change: impl FnOnce(&mut BlockTable) -> R) -> R {
+        let mut table = self.lock_table();
+        let result = change(&mut table);
+        self.memory.fund_table(table.lease_bytes());
+        result
+    }
+
     fn lock_proposer(&self) -> MutexGuard<'_, ProposerState> {
         lock(&self.proposer)
+    }
+
+    /// Steps the proposer with `input`, then resizes the proposer's lease to
+    /// what its prepared encodings hold, under the same lock.
+    fn step_proposer(&self, input: ProposerInput) -> ProposerStep {
+        let mut proposer = self.lock_proposer();
+        let step = proposer.step(input);
+        self.memory.fund_proposer(proposer.prepared_bytes());
+        step
     }
 
     fn lock_sessions(&self) -> MutexGuard<'_, HashMap<NodeId, LiveSession>> {
@@ -317,8 +340,7 @@ impl SharedNode {
     }
 
     fn apply_block_input(self: &Arc<Self>, input: BlockInput) {
-        let step = {
-            let mut table = self.lock_table();
+        let step = self.change_table(|table| {
             let step = table.step(Instant::now(), input);
             metrics::gauge!("zakura.p2p.bpv1.pending_meta.count")
                 .set(table.pending_meta_len() as f64);
@@ -328,7 +350,7 @@ impl SharedNode {
             metrics::gauge!("zakura.p2p.bpv1.part_buffer.bytes")
                 .set(table.part_buffer_bytes() as f64);
             step
-        };
+        });
         self.dispatch_block_step(step);
     }
 
@@ -497,6 +519,16 @@ impl SharedNode {
             } => {
                 let node = Arc::clone(self);
                 drop(task::spawn_named("bpv1-assemble-verify", async move {
+                    // The lease covers the assembled block until its verdict.
+                    // Without one, the block falls back as a local limit.
+                    let Some(_assembled_lease) = node.memory.lease(ASSEMBLED_BLOCK_BYTES) else {
+                        node.drive(BlockInput::VerifierVerdict {
+                            work_id,
+                            block_id,
+                            verdict: VerifierVerdict::LocalCapacity,
+                        });
+                        return;
+                    };
                     let assembled = parse_header(&header_bytes).and_then(|header| {
                         assemble_block(
                             &node.profile,
@@ -606,7 +638,7 @@ impl Bpv1Handle {
         let peers: Vec<NodeId> = self.node.lock_sessions().keys().copied().collect();
         let paths = self.node.lock_table().paths().clone();
 
-        let step = self.node.lock_proposer().step(ProposerInput::Solved {
+        let step = self.node.step_proposer(ProposerInput::Solved {
             block_id,
             height,
             header_bytes,
@@ -654,6 +686,14 @@ impl Bpv1Handle {
         self.node.lock_table().part_buffer_bytes()
     }
 
+    /// Bytes the block table and the proposer hold, which BPv1's
+    /// `Propagation` leases cover.
+    #[cfg(any(test, zakura_sim))]
+    pub fn held_bytes(&self) -> u64 {
+        let table = self.node.lock_table().retained_bytes();
+        table.saturating_add(self.node.lock_proposer().prepared_bytes())
+    }
+
     /// Prepares the commitment for a post-NU7 mining template (`decision-1`).
     /// A template whose body is already encoding
     /// waits for that encode instead of starting another.
@@ -682,8 +722,7 @@ impl Bpv1Handle {
         let results = EncodeResults::default();
         let mut own_results = lock(&results);
         let (step, joined) = {
-            let mut proposer = self.node.lock_proposer();
-            let step = proposer.step(ProposerInput::TemplateBuilt {
+            let step = self.node.step_proposer(ProposerInput::TemplateBuilt {
                 template_id,
                 body_identity,
                 light_client_root,
@@ -718,12 +757,23 @@ impl Bpv1Handle {
             match out {
                 ProposerOutput::SetCommitment { commitment, .. } => own = Some(commitment),
                 ProposerOutput::StartEncode { work_id, .. } => {
-                    let encoded = encode_body(&self.node.profile, body_after_coinbase, tx_count);
-                    let done_step = encoded.ok().map(|encoded| {
-                        self.node
-                            .lock_proposer()
-                            .step(ProposerInput::EncodeDone { work_id, encoded })
+                    // The encode's lease covers its parts until the proposer
+                    // holds them under its own lease.
+                    let encoding_bytes = self
+                        .node
+                        .profile
+                        // Widening usize to u64 is lossless on supported targets.
+                        .derive_coding(body_after_coinbase.len() as u64, tx_count)
+                        .map_or(0, |coding| coding.encoded_bytes());
+                    let encode_lease = self.node.memory.lease(encoding_bytes);
+                    let encoded = encode_lease.as_ref().and_then(|_| {
+                        encode_body(&self.node.profile, body_after_coinbase, tx_count).ok()
                     });
+                    let done_step = encoded.map(|encoded| {
+                        self.node
+                            .step_proposer(ProposerInput::EncodeDone { work_id, encoded })
+                    });
+                    drop(encode_lease);
                     lock(&self.node.encodes).remove(&body_identity);
                     // A failed encode leaves the results empty, so joined
                     // templates get `None`.
@@ -789,18 +839,56 @@ impl fmt::Debug for Bpv1Service {
     }
 }
 
+/// What BPv1 needs to start, apart from the memory pool. The endpoint starts
+/// BPv1 once it has built the pool that funds it (`02 §4`).
+pub struct Bpv1Startup {
+    /// The operator's `[network.zakura.bpv1]` settings.
+    pub config: ZakuraBpv1Config,
+    /// Block gossip's advertisement pacing, which unflagged `Have`s follow
+    /// (decision-26).
+    pub have_pacing: HavePacing,
+    /// The coding profile.
+    pub profile: Profile,
+    /// The network the node runs on.
+    pub network: Network,
+    /// The endpoint's node id.
+    pub local_node: NodeId,
+    /// The node-service ports.
+    pub ports: Bpv1Ports,
+    /// Ends BPv1's tasks.
+    pub shutdown: CancellationToken,
+}
+
+impl Bpv1Startup {
+    /// Starts BPv1, funding what it holds from `memory_pool`'s
+    /// `Consumer::Propagation`, and returns it as a [`CustomService`] with its
+    /// [`Bpv1Handle`].
+    pub fn start(self, memory_pool: MemoryPool) -> (CustomService, Bpv1Handle) {
+        let (service, handle) = Bpv1Service::start(self, memory_pool);
+        let custom = CustomService {
+            service,
+            provides: vec![bpv1_service_id()],
+            seeks: vec![bpv1_service_id()],
+            tx_relay_sessions: None,
+        };
+        (custom, handle)
+    }
+}
+
 impl Bpv1Service {
     /// Creates a new [`Bpv1Service`] and its control [`Bpv1Handle`], spawning the
-    /// node-wide BPv1 driver task.
-    pub fn start(
-        config: ZakuraBpv1Config,
-        have_pacing: HavePacing,
-        profile: Profile,
-        network: Network,
-        local_node: NodeId,
-        ports: Bpv1Ports,
-        shutdown: CancellationToken,
-    ) -> (Arc<Self>, Bpv1Handle) {
+    /// node-wide BPv1 driver task. What the service holds leases from
+    /// `memory_pool`'s `Consumer::Propagation`.
+    pub fn start(startup: Bpv1Startup, memory_pool: MemoryPool) -> (Arc<Self>, Bpv1Handle) {
+        let Bpv1Startup {
+            config,
+            have_pacing,
+            profile,
+            network,
+            local_node,
+            ports,
+            shutdown,
+        } = startup;
         let chain_id = network.genesis_hash().0;
         let (driver_tx, driver_rx) = mpsc::unbounded_channel();
         let node = Arc::new(SharedNode {
@@ -826,6 +914,7 @@ impl Bpv1Service {
             shutdown,
             next_template_id: AtomicU64::new(1),
             encodes: Mutex::new(HashMap::new()),
+            memory: Bpv1Memory::new(memory_pool),
         });
 
         let driver_node = Arc::clone(&node);
@@ -844,36 +933,6 @@ impl Bpv1Service {
 /// Service identifier advertised in Zakura discovery records for BPv1.
 pub fn bpv1_service_id() -> ZakuraServiceId {
     ZakuraServiceId::try_from("bpv1").expect("the bpv1 service id is non-empty bounded ASCII")
-}
-
-/// Starts a [`Bpv1Service`] for the endpoint whose node id is `local_node`
-/// and returns it as a [`CustomService`] with its [`Bpv1Handle`]. Unflagged
-/// `Have`s follow `have_pacing` (decision-26).
-pub fn bpv1_custom_service(
-    config: ZakuraBpv1Config,
-    have_pacing: HavePacing,
-    profile: Profile,
-    network: Network,
-    local_node: NodeId,
-    ports: Bpv1Ports,
-    shutdown: CancellationToken,
-) -> (CustomService, Bpv1Handle) {
-    let (service, handle) = Bpv1Service::start(
-        config,
-        have_pacing,
-        profile,
-        network,
-        local_node,
-        ports,
-        shutdown,
-    );
-    let custom = CustomService {
-        service,
-        provides: vec![bpv1_service_id()],
-        seeks: vec![bpv1_service_id()],
-        tx_relay_sessions: None,
-    };
-    (custom, handle)
 }
 
 impl Service for Bpv1Service {
@@ -898,7 +957,9 @@ impl Service for Bpv1Service {
         _negotiated: u64,
         _direction: ServicePeerDirection,
     ) -> bool {
-        self.node.lock_sessions().len() < self.node.config.max_sessions
+        self.node
+            .config
+            .admits_session(self.node.lock_sessions().len())
     }
 
     fn owns_connection_for_peer(&self, peer: &ZakuraPeerId, conn_id: ZakuraConnId) -> bool {
@@ -947,7 +1008,8 @@ impl Service for Bpv1Service {
 
         {
             let mut sessions = self.node.lock_sessions();
-            if sessions.len() >= self.node.config.max_sessions && !sessions.contains_key(&peer_node)
+            if !self.node.config.admits_session(sessions.len())
+                && !sessions.contains_key(&peer_node)
             {
                 session_cancel.cancel();
                 return;
@@ -1135,6 +1197,7 @@ async fn run_bpv1_driver(
                         .set(table.paths().len() as f64);
                     metrics::gauge!("zakura.p2p.bpv1.path.unmeasured_peers")
                         .set(table.paths().unmeasured_pull_peers() as f64);
+                    node.memory.fund_table(table.lease_bytes());
                     out
                 };
                 for step in steps {
@@ -1430,8 +1493,8 @@ impl Session {
                 // `(coding, part_root)` from the block table's admitted descriptor.
                 // usize -> u64 widens on every supported target.
                 let bytes = payload.len() as u64;
-                let charge =
-                    charge_part(&mut node.lock_table(), Instant::now(), peer, token, bytes);
+                let charge = node
+                    .change_table(|table| charge_part(table, Instant::now(), peer, token, bytes));
                 let (coding, part_root) = match charge {
                     Ok(descriptor) => descriptor,
                     // A refusal only clears the attempt and records the drop.
@@ -2263,15 +2326,17 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().expect("test runtime starts");
         let _guard = runtime.enter();
         let endpoint_node = zakura_quic::NodeSecretKey::from_bytes(&[7; 32]).public();
-        let (_svc, handle) = bpv1_custom_service(
-            ZakuraBpv1Config::default(),
-            HavePacing::default(),
+        let (_svc, handle) = super::super::test_support::startup(
             Profile::TINY,
             zakura_chain::parameters::Network::new_regtest(Default::default()),
             endpoint_node,
             Bpv1Ports::default(),
-            CancellationToken::new(),
-        );
+            &CancellationToken::new(),
+        )
+        .start(super::super::test_support::propagation_pool(
+            &ZakuraBpv1Config::default(),
+            Profile::TINY,
+        ));
         assert_eq!(handle.node.local_node, endpoint_node);
     }
 
@@ -2309,14 +2374,12 @@ mod tests {
         );
         let local = zakura_quic::NodeSecretKey::from_bytes(&[1; 32]).public();
         let peer = zakura_quic::NodeSecretKey::from_bytes(&[2; 32]).public();
-        let (_svc, handle) = Bpv1Service::start(
-            ZakuraBpv1Config::default(),
-            HavePacing::default(),
+        let (_svc, handle) = super::super::test_support::start(
             Profile::TINY,
             network,
             local,
             Bpv1Ports::default(),
-            CancellationToken::new(),
+            &CancellationToken::new(),
         );
         let (inputs, _inputs_rx) = mpsc::unbounded_channel();
         handle.node.lock_sessions().insert(

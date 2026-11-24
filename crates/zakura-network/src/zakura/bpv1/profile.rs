@@ -13,6 +13,10 @@ use crate::zakura::wire_codec::compact_size_len;
 /// Wire profile identifier for W2.
 pub const W2_PROFILE_ID: u16 = 2;
 
+/// The profile a node runs BPv1 under, which the memory plan sizes
+/// (decision-4).
+pub const NODE_PROFILE: Profile = Profile::W2;
+
 /// W2 codec identifier (`reed-solomon-simd` 3.1 systematic RS over GF(2^16)).
 pub const W2_CODEC_ID: u16 = 2;
 
@@ -55,6 +59,10 @@ pub const W2_MAX_COMMITMENT_PATH_DEPTH: usize = 32;
 /// Size in bytes of a serialized [`Coding`] tuple:
 /// `u16(codec_id) || u64(body_bytes) || u32(tx_count) || u32(part_bytes) || u32(stripes) || u32(k) || u32(n)`.
 pub const CODING_BYTES: usize = 30;
+
+/// Bytes of the deepest W2 part proof (`W2_MAX_PROOF_DEPTH` 32-byte siblings).
+// Widening usize to u64 is lossless on supported targets.
+pub const PART_PROOF_BYTES: u64 = (W2_MAX_PROOF_DEPTH * 32) as u64;
 
 /// The coding geometry of a BPv1 profile (01 §4, decision-4).
 ///
@@ -187,6 +195,29 @@ impl Profile {
         })
     }
 
+    /// The coding of the largest body this profile accepts, with every stripe
+    /// at the largest `n`. Every block's parts fit in its
+    /// [`Coding::encoded_bytes`], because `S` and the stripe count never
+    /// shrink as the body grows.
+    pub fn max_coding(&self) -> Coding {
+        let part_bytes = self.part_bytes_for(self.max_block_bytes);
+        let stripes = self
+            .max_block_bytes
+            .div_ceil(u64::from(part_bytes))
+            .div_ceil(u64::from(self.stripe_k))
+            .min(u64::from(self.max_stripes));
+        Coding {
+            codec_id: W2_CODEC_ID,
+            body_bytes: self.max_block_bytes,
+            tx_count: 2,
+            part_bytes,
+            // `max_stripes` is a u32, so the clamped count fits.
+            stripes: stripes as u32,
+            k: self.stripe_k,
+            n: self.max_n(),
+        }
+    }
+
     /// Validates an untrusted [`Coding`] tuple against this profile, the
     /// header length, and the coinbase length using checked arithmetic (bpv1-10).
     pub fn validate_coding(
@@ -298,6 +329,14 @@ impl Coding {
     /// Total coded parts (`stripes * n`).
     pub fn total_parts(&self) -> Option<u32> {
         self.stripes.checked_mul(self.n)
+    }
+
+    /// The most bytes this coding's parts hold: every coded part padded to
+    /// `S`, each with a proof of the deepest W2 depth.
+    pub fn encoded_bytes(&self) -> u64 {
+        u64::from(self.stripes)
+            .saturating_mul(u64::from(self.n))
+            .saturating_mul(u64::from(self.part_bytes).saturating_add(PART_PROOF_BYTES))
     }
 
     /// Total padded source bytes (`stripes * k * S`).

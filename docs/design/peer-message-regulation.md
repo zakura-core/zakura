@@ -50,41 +50,14 @@ faults or penalizes a peer.
 Paused reads leave a peer's data in QUIC's receive window, so the windows are memory every peer
 can fill. The node used to reserve worst-case windows for every peer and bound the total by holding
 fewer connections. Now receive credit follows the node's own requests, and send windows follow the
-node's own congestion window:
-
-- A connection in its handshake holds 128 KiB of windows (`CONTROL_RECEIVE_BYTES` and
-  `HANDSHAKE_SEND_WINDOW_BYTES`), not 64 MiB.
-- Admission leases each connection's transport base `t` from the pool's `Sessions` consumer: the
-  control receive share, one maximal block-sync frame of send window and discovery's unsolicited
-  receive share. It adds each negotiated reactor's unsolicited receive bytes, and the serving and
-  bookkeeping part of each reactor whose service admits the peer. `Sessions` never borrows past its
-  share. An idle peer holds only its bases.
-- A reactor that sends a request (block sync or `tx-relay`) first leases the expected response
-  bytes and raises the connection's receive window by them (API-9). Reads move those bytes onto the
-  same lease (`CreditHold`, API-10). A request that ends short keeps its unspent credit leased until
-  the peer can no longer spend it, or until the connection closes.
-- With BPv1 on, the `Propagation` reserve holds what BPv1 retains for its concurrent blocks: the
-  block table's parts and metadata, the proposer's encodings and each assembled block until its
-  verdict. Proof of work bounds each one, so BPv1 holds them as `Propagation` leases that never wait
-  behind bulk. Each BPv1 session funds its base `b_bpv1` from `Sessions`: unsolicited receive
-  credit, output gates, held frames and early records. BPv1's receive credit stays unsolicited,
-  because pushed and pulled parts share the data stream's `Part` row and BPv1 raises no credit per
-  `Want`.
-- While serving output waits on a connection's send window, the `Serving` consumer leases growth
-  toward `min(2 × cwnd, serving_per_peer)`, and `PeerSubPool` shares it fairly across peers. After
-  four idle ticks of 50 ms, the window shrinks back to its base. A connection ticks only while its
-  window is above the base or output waits. The base holds one maximal block-sync frame and keeps
-  no room free; stream priority decides which stream gets the room that acknowledgments free. The shrunk lease drains once the
-  connection accepts a byte, or once it closes.
-- One `[memory] budget` replaces `[network.zakura] peer_memory_budget_bytes`. Its default `"auto"`
-  reads the tightest of host RAM and the cgroup limit, and the node derives
-  `B = (budget − base − sidecar) / ρ`. `B` bounds the ledger, and the process's total RSS is a
-  target, because `base` and `ρ` are measured. The `Consensus` reserve holds the chain's worst
-  401-block checkpoint window, so the chain sets the smallest host that can run. With the draft
-  values and `p2p_stack = "zakura"`, Mainnet needs about 12.8 GiB: 4 GiB and 8 GiB hosts refuse to
-  start, and 16 GiB hosts run. A raised operator setting whose worst case exceeds `B` starts the node with one
-  warning per setting. While the node runs, it warns about an overrun at most once every 10
-  minutes. CTRL-26, ADM-12 and ADM-13 in the `zakura-quic` spec state the transport rules.
+node's own congestion window. One `[memory] budget` funds every v2 P2P term. A pending handshake
+holds only QUIC's minimum windows. Admission leases each connection's bases from `Sessions`, a
+request leases its receive credit before it goes out (API-9), and `Serving` leases send-window
+growth while output waits. With BPv1 on, the `Propagation` reserve funds what BPv1 retains. Proof
+of work bounds those bytes, so their leases never wait behind bulk. Each BPv1 session funds its base
+from `Sessions`. Its receive credit stays unsolicited, because pushed and pulled parts share the
+data stream's `Part` row and BPv1 raises no credit per `Want`. CTRL-26, ADM-12 and ADM-13 in the
+[`zakura-quic` spec](../specs/zakura-quic.md) state the rules and their numbers.
 
 Configuration loading checks the startup memory plan only when the resolved P2P stack runs v2.
 Legacy-only nodes create no QUIC endpoint.

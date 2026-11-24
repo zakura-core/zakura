@@ -21,30 +21,16 @@ never waits behind bulk work.
 
 ## Node budget
 
-Every term counts one physical allocation once, under one node-wide memory budget. `[memory]
-budget` sets it, and its default `"auto"` reads the tightest of host RAM and the cgroup limit. The
-node derives the P2P budget `B = (budget − base − sidecar) / ρ` at startup.
-`[network.zakura] peer_memory_budget_bytes` is removed. `B` bounds every byte in this ledger.
-`base` and `ρ` are measured peaks, not bounds, so the process's total RSS is a target.
+Every term counts one physical allocation once, under one node-wide memory budget. The node
+derives the P2P budget `B` from `[memory] budget` at startup, and `B` bounds every byte in this
+ledger. CTRL-26 in the [`zakura-quic` spec](../specs/zakura-quic.md) states how `B` is derived,
+which hosts can start, and how the node treats raised operator settings and overruns.
 
-`[network.zakura] max_connections` and each reactor's `peer_limits` are unset by default. Then 256
-connections is a ceiling, and the `Sessions` consumer's share of the pool decides how many
-connections and sessions the node funds. The `Sessions` floor funds 19 full connections on
-Mainnet. The `Consensus` reserve holds the network's worst 401-block checkpoint window at
-admission's charge per block, so the chain sets the smallest host that can run. With the draft
-values in `memory/draft.rs` and `p2p_stack = "zakura"`, that host has about 12.8 GiB on Mainnet.
-A smaller host refuses to start with default settings.
-
-A pending handshake holds 128 KiB of windows (`CONTROL_RECEIVE_BYTES` and
-`HANDSHAKE_SEND_WINDOW_BYTES`). Admission leases each connection's transport base `t` and its
-reactors' bases from `Sessions`. Closed connections release their stream buffers and drain in a
-separate allowance (ADM-13). Each request leases its receive credit above the base (API-9). A
-request that ends short keeps its unspent credit leased until the peer can no longer spend it. A
-send window grows from its base toward `min(2 × cwnd, serving_per_peer)` while output waits, and
-the `Serving` consumer leases the growth (`PeerSubPool` per peer). The base send window holds one
-maximal block-sync frame, so one block always fits. The base keeps no room free in the window:
-stream priority (CTRL-40 in the `zakura-quic` spec) decides which stream gets the room that
-acknowledgments free.
+For block sync, admission leases each connection's transport base `t` and its reactors' bases from
+`Sessions`, and each request leases its receive credit above the base (API-9). The base send window
+holds one maximal block-sync frame, so one block always fits, and the `Serving` consumer leases
+growth toward `min(2 × cwnd, serving_per_peer)` while output waits. Stream priority (CTRL-40)
+decides which stream gets the room that acknowledgments free.
 
 | Term | Pool consumer | Bound comes from |
 | --- | --- | --- |
@@ -60,9 +46,7 @@ acknowledgments free.
 | Commit-window bodies (`≤ verified_tip + 401`) | `Consensus` (reserved) | Reserved in full for the worst checkpoint window at admission's charge, `wire + max(4 × wire, decoded)` per block. The draft value is `401 × 5 × MAX_BLOCK_BYTES` (3.73 GiB) until a scan of the chain measures it. Each height holds at most one `Consensus` lease. It never waits on bulk. |
 | Control state | Fixed | 8,192 supplier cooldowns. `Status` keeps the latest value. |
 
-Startup checks every term against `B`, and the pool enforces the leases while the node runs. A
-raised operator setting whose worst case exceeds `B` starts the node with one warning per setting.
-While the node runs, it warns about an overrun at most once every 10 minutes.
+Startup checks every term against `B`, and the pool enforces the leases while the node runs.
 
 ## Serving
 

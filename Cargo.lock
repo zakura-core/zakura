@@ -3551,6 +3551,7 @@ version = "2.0.0"
 dependencies = [
  "blake2b_simd",
  "bytes",
+ "criterion",
  "curve25519-dalek",
  "futures",
  "hex",

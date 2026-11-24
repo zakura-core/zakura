@@ -121,6 +121,7 @@ use types::{
             ZCASHD_FUNDING_STREAM_ORDER,
         },
         proposal::proposal_block_from_template,
+        synced_to_tip,
         trace::{next_request_id, BuildTimes, MiningTemplateTrace, WaitReason},
         BlockTemplateResponse, BlockTemplateTimeSource, GetBlockTemplateHandler,
         GetBlockTemplateParameters, GetBlockTemplateResponse, TemplateBuildWork,
@@ -131,6 +132,7 @@ use types::{
     get_raw_mempool::{self, GetRawMempoolResponse},
     get_standard_fee::GetStandardFeeResponse,
     long_poll::LongPollInput,
+    miner_mesh_info::{GetMinerMeshInfoResponse, MeshNode, MinerMeshSources},
     network_info::{GetNetworkInfoResponse, NetworkInfo},
     peer_info::PeerInfo,
     submit_block::{
@@ -251,6 +253,7 @@ pub(crate) const RPC_METHOD_ACCESS: &[(&str, RpcAccess)] = &[
     ("invalidateblock", RpcAccess::Admin),
     ("reconsiderblock", RpcAccess::Admin),
     ("preciousblock", RpcAccess::Admin),
+    ("getminermeshinfo", RpcAccess::Admin),
     ("generate", RpcAccess::Test),
     ("addnode", RpcAccess::Test),
     ("rpc.discover", RpcAccess::Unauthenticated),
@@ -295,6 +298,8 @@ pub(super) const PARAM_VERBOSITY_DESC: &str = "Whether to include verbose output
 pub(super) const PARAM_N_DESC: &str = "The output index in the transaction.";
 pub(super) const PARAM_INCLUDE_MEMPOOL_DESC: &str =
     "Whether to include mempool transactions in the response.";
+pub(super) const RESULT_GETMINERMESHINFO_DESC: &str =
+    "The node's miner mesh window, ranked gateways, connection slots, and registered peers.";
 pub(super) const RESULT_PRECIOUSBLOCK_DESC: &str =
     "Always null. Errors are returned as JSON-RPC errors.";
 
@@ -829,6 +834,34 @@ pub trait RpcServer {
     #[method(name = "getpeerinfo")]
     async fn get_peer_info(&self) -> Result<Vec<PeerInfo>>;
 
+    /// Returns this node's view of the miner mesh.
+    ///
+    /// The response is a [`GetMinerMeshInfoResponse`] JSON struct: the
+    /// gateways recent blocks name, the connection places this node holds for
+    /// the best of them, and its v2 peers.
+    ///
+    /// Zakura-specific.
+    /// method: post
+    /// tags: network
+    ///
+    /// # Notes
+    ///
+    /// A mining node counts the gateways that recent best-chain coinbases
+    /// name, and while it is synced, v2 networking holds up to ten connection
+    /// places that ordinary peers cannot fill for the highest-ranked gateways
+    /// it can reach. Each gateway's `state` is `preferred` when it may fill a
+    /// held place, `standby` when it is reachable but ranked below those,
+    /// `backoff` when it is known but waiting out a failed dial or a lost
+    /// connection, and `unmatched` when v2 networking has no usable dial address for it.
+    ///
+    /// `synced` is evaluated at request time. The ranking and held places reflect
+    /// the last update applied by networking and can lag a change in tip freshness.
+    ///
+    /// `window` is null on a node that does not mine, and `slots` is null on
+    /// a node that runs no v2 networking.
+    #[method(name = "getminermeshinfo")]
+    async fn get_miner_mesh_info(&self) -> Result<GetMinerMeshInfoResponse>;
+
     /// Requests that a ping be sent to all other nodes, to measure ping time.
     ///
     /// Results provided in getpeerinfo, pingtime and pingwait fields are decimal seconds.
@@ -1061,6 +1094,9 @@ where
 
     /// The services this node sends in its legacy P2P handshake, reported by `getnetworkinfo`.
     local_services: PeerServices,
+
+    /// Where `getminermeshinfo` reads the miner mesh state.
+    miner_mesh: MinerMeshSources,
 
     // Services
     //
@@ -1434,6 +1470,7 @@ where
             rpc_surface: RpcSurface::Full,
             end_of_support_height: None,
             local_services: PeerServices::NODE_NETWORK,
+            miner_mesh: MinerMeshSources::default(),
             mempool: mempool.clone(),
             state: state.clone(),
             read_state: read_state.clone(),
@@ -2058,6 +2095,14 @@ where
     /// When unset, `getnetworkinfo` reports [`PeerServices::NODE_NETWORK`].
     pub fn with_local_services(mut self, local_services: PeerServices) -> Self {
         self.local_services = local_services;
+        self
+    }
+
+    /// Sets where `getminermeshinfo` reads the miner mesh state.
+    ///
+    /// When unset, it reports no counts and no v2 networking.
+    pub fn with_miner_mesh(mut self, miner_mesh: MinerMeshSources) -> Self {
+        self.miner_mesh = miner_mesh;
         self
     }
 
@@ -4195,6 +4240,29 @@ where
             .into_iter()
             .map(PeerInfo::from)
             .collect())
+    }
+
+    async fn get_miner_mesh_info(&self) -> Result<GetMinerMeshInfoResponse> {
+        let MinerMeshSources { coverage, endpoint } = &self.miner_mesh;
+        let miner_params = self.gbt.miner_params();
+        let node = MeshNode {
+            node_id: endpoint
+                .as_ref()
+                .map(|endpoint| *endpoint.local_node_id().as_bytes()),
+            announcing: miner_params.is_some_and(|params| params.mesh_commitment().is_some()),
+            mining: miner_params.is_some(),
+            synced: synced_to_tip(&self.network, &self.latest_chain_tip).is_ok(),
+        };
+        let places = endpoint
+            .as_ref()
+            .map(|endpoint| endpoint.connection_places());
+        let coverage = coverage.as_ref().map(|coverage| coverage.borrow().clone());
+
+        Ok(GetMinerMeshInfoResponse::new(
+            node,
+            coverage.as_ref(),
+            places.as_ref(),
+        ))
     }
 
     async fn ping(&self) -> Result<()> {

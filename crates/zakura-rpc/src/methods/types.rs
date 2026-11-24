@@ -9,6 +9,7 @@ pub mod get_mining_info;
 pub mod get_raw_mempool;
 pub mod get_standard_fee;
 pub mod long_poll;
+pub mod miner_mesh_info;
 pub mod network_info;
 pub mod peer_info;
 pub mod submit_block;

@@ -301,5 +301,5 @@ fn record_metrics(snapshot: &MinerSetSnapshot) {
     // Each is at most the number of heights in a two-day window.
     metrics::gauge!("mining.mesh.gateways").set(snapshot.gateways.len() as f64);
     metrics::gauge!("mining.mesh.window.checked").set(snapshot.checked as f64);
-    metrics::gauge!("mining.mesh.window.total").set(snapshot.window_len as f64);
+    metrics::gauge!("mining.mesh.window.total").set(snapshot.window_len() as f64);
 }

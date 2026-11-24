@@ -7,13 +7,14 @@
 
 use std::{collections::BTreeSet, time::Duration};
 
+use zakura_quic::NodeSecretKey;
 use zakura_rt::sync::watch;
 
 use super::*;
 use crate::zakura::{
     inbound_share,
     testkit::{await_until, TraceCapture, ZakuraTestNode},
-    ZakuraPeerId,
+    ConnectedPeer, ConnectionPlaces, GatewayPlace, PlacedGateway, SlotSplit, ZakuraPeerId,
 };
 
 const MAX_CONNECTIONS: usize = 92;
@@ -219,6 +220,92 @@ async fn a_gateway_leaving_the_set_stays_connected_and_its_replacement_is_dialed
     dialer_node.shutdown().await;
     first.shutdown().await;
     second.shutdown().await;
+}
+
+// What an operator reads from each endpoint: the dialing node reports the
+// gateway it connected to as preferred, connected and in a held place, a
+// ranked gateway v2 has no record of as unmatched, and the gateway reports
+// the dialing node as an ordinary inbound peer.
+#[tokio::test]
+async fn connection_places_report_the_ranking_and_the_peers() {
+    let _guard = zakura_test::init();
+    let dialer_node = node(9250, None).await;
+    let gateway = node(9251, None).await;
+    let gateway_id = dialer_node
+        .insert_static_discovery_candidate(&gateway)
+        .await
+        .expect("the gateway inserts");
+    let dialer_id = dialer_node.endpoint().local_node_id();
+    let unknown = NodeSecretKey::generate().public();
+    let (dialer, ranking_tx) = spawn_dialer(&dialer_node);
+    ranking_tx.send_replace(MinerGatewayRanking {
+        gateways: vec![
+            MinerGateway {
+                gateway_id: *gateway_id.as_bytes(),
+                blocks: 2,
+            },
+            MinerGateway {
+                gateway_id: *unknown.as_bytes(),
+                blocks: 1,
+            },
+        ],
+    });
+
+    let expected = ConnectionPlaces {
+        gateways: vec![
+            PlacedGateway {
+                node_id: *gateway_id.as_bytes(),
+                blocks: 2,
+                place: GatewayPlace::Preferred,
+                connected: true,
+            },
+            PlacedGateway {
+                node_id: *unknown.as_bytes(),
+                blocks: 1,
+                place: GatewayPlace::Unmatched,
+                connected: false,
+            },
+        ],
+        hold: 1,
+        slot_limit: dialer_node.limits().total_connections(),
+        slots: SlotSplit {
+            preferred: 1,
+            ordinary: 0,
+            ordinary_inbound: 0,
+        },
+        inbound_slots: 0,
+        peers: vec![ConnectedPeer {
+            node_id: *gateway_id.as_bytes(),
+            inbound: false,
+            preferred: true,
+        }],
+    };
+    // A connection's slot and its registration settle a moment apart.
+    let _ = await_until(
+        "the dialing node reports the gateway",
+        CONNECT_TIMEOUT,
+        || dialer_node.endpoint().connection_places() == expected,
+    )
+    .await;
+    assert_eq!(dialer_node.endpoint().connection_places(), expected);
+
+    await_registered(&gateway, dialer_id, "the dialing node registers").await;
+    let seen_by_gateway = gateway.endpoint().connection_places();
+    assert!(seen_by_gateway.gateways.is_empty());
+    assert_eq!(seen_by_gateway.hold, 0);
+    assert_eq!(seen_by_gateway.inbound_slots, 1);
+    assert_eq!(
+        seen_by_gateway.peers,
+        vec![ConnectedPeer {
+            node_id: *dialer_id.as_bytes(),
+            inbound: true,
+            preferred: false,
+        }]
+    );
+
+    dialer.abort();
+    dialer_node.shutdown().await;
+    gateway.shutdown().await;
 }
 
 /// Asserts every discovery trace row is one of the events, with the fields,

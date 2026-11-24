@@ -31,7 +31,7 @@ use zakura_state::{LatestChainTip, ReadStateService};
 use crate::indexer;
 use crate::{
     config,
-    methods::{LoggedLastEvent, RpcImpl},
+    methods::{types::miner_mesh_info::MinerMeshSources, LoggedLastEvent, RpcImpl},
     server::RpcServer,
     EarlyMinedBlock, PendingBlockRegistry,
 };
@@ -98,12 +98,15 @@ pub struct NodeRpcServices {
     pub latest_chain_tip: LatestChainTip,
     /// The peer address book.
     pub address_book: NodeAddressBook,
+    /// Where `getminermeshinfo` reads the miner mesh state.
+    pub miner_mesh: MinerMeshSources,
 }
 
 /// Creates the node's RPC implementation and spawns its transaction queue.
 ///
-/// See [`RpcImpl::new`], [`RpcImpl::with_pending_blocks`] and
-/// [`RpcImpl::with_end_of_support_height`] for the arguments.
+/// See [`RpcImpl::new`], [`RpcImpl::with_pending_blocks`],
+/// [`RpcImpl::with_end_of_support_height`] and [`RpcImpl::with_miner_mesh`]
+/// for the arguments.
 #[allow(clippy::too_many_arguments)]
 pub fn new_rpc_impl(
     network: Network,
@@ -125,6 +128,7 @@ pub fn new_rpc_impl(
         sync_status,
         latest_chain_tip,
         address_book,
+        miner_mesh,
     } = services;
 
     let (rpc_impl, rpc_tx_queue_handle) = RpcImpl::new(
@@ -146,7 +150,8 @@ pub fn new_rpc_impl(
 
     let rpc_impl = rpc_impl
         .with_pending_blocks(pending_blocks)
-        .with_end_of_support_height(end_of_support_height);
+        .with_end_of_support_height(end_of_support_height)
+        .with_miner_mesh(miner_mesh);
 
     (rpc_impl, rpc_tx_queue_handle)
 }

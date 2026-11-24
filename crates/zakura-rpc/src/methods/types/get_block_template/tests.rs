@@ -198,7 +198,7 @@ fn transparent_coinbase() -> anyhow::Result<()> {
 const GATEWAY_ID: [u8; 32] = [0xac; 32];
 
 /// A miner that announces a gateway pays the same outputs as one that does not,
-/// then names the gateway in one more output that takes 48 bytes of the block.
+/// then names the gateway in one more output that takes 46 bytes of the block.
 #[test]
 fn announcing_coinbase_names_the_gateway_in_one_extra_output() -> anyhow::Result<()> {
     let commitment = MinerMeshCommitment::new(GATEWAY_ID);
@@ -243,7 +243,7 @@ fn announcing_coinbase_names_the_gateway_in_one_extra_output() -> anyhow::Result
                     .max_serialized_size,
                 TransactionTemplate::coinbase_resource_usage(&net, height, &quiet, None)?
                     .max_serialized_size
-                    + 48,
+                    + 46,
             );
         }
     }

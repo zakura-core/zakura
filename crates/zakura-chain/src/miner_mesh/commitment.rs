@@ -6,14 +6,14 @@ use crate::{
 };
 
 /// The opcodes before the payload: `OP_RETURN`, which makes the output
-/// unspendable, and the opcode that pushes the next 37 bytes as data.
+/// unspendable, and the opcode that pushes the next 35 bytes as data.
 ///
-/// Opcodes `0x01` to `0x4b` push that many bytes, and the payload is 37 bytes.
-const SCRIPT_OPCODES: [u8; 2] = [0x6a, 0x25];
+/// Opcodes `0x01` to `0x4b` push that many bytes, and the payload is 35 bytes.
+const SCRIPT_OPCODES: [u8; 2] = [0x6a, 0x23];
 
-/// The start of every payload: the tag `MESH`, then the version this node
+/// The start of every payload: the tag `MR`, then the version this node
 /// writes and reads.
-const PAYLOAD_PREFIX: [u8; 5] = [b'M', b'E', b'S', b'H', 0x01];
+const PAYLOAD_PREFIX: [u8; 3] = [b'M', b'R', 0x01];
 
 /// The bytes in a gateway ID.
 const GATEWAY_ID_LEN: usize = 32;
@@ -26,10 +26,10 @@ const PAYLOAD_LEN: usize = PAYLOAD_PREFIX.len() + GATEWAY_ID_LEN;
 /// It is a claim, not a proof: nothing ties the named gateway to the miner.
 ///
 /// On chain it is a zero-value transparent coinbase output whose lock script
-/// is exactly these 39 bytes:
+/// is exactly these 37 bytes:
 ///
 /// ```text
-/// 6a 25 || "MESH" || 01 || gateway_id[32]
+/// 6a 23 || "MR" || 01 || gateway_id[32]
 /// ```
 ///
 /// An output with another version byte, another length or a nonzero value is

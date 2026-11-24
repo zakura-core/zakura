@@ -9,11 +9,11 @@ use crate::{
 };
 
 /// The bytes in a commitment's lock script.
-const SCRIPT_LEN: usize = 39;
+const SCRIPT_LEN: usize = 37;
 
 /// The lock script bytes before the gateway ID: two opcodes, the tag and the
 /// version.
-const HEADER_LEN: usize = 7;
+const HEADER_LEN: usize = 5;
 
 /// Outputs that are not commitments, because a commitment's script is never
 /// shorter than [`SCRIPT_LEN`].

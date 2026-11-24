@@ -855,9 +855,9 @@ pub trait RpcServer {
     /// connection, `unmatched` when v2 networking has no usable dial address for it,
     /// and `ambiguous` when v2 networking knows two or more nodes with its ID.
     ///
-    /// A gateway's `node_id` is the 20-byte ID the blocks name it by, the first
-    /// 20 bytes of its v2 node ID. Each peer's `node_id` is its full 32-byte v2
-    /// node ID.
+    /// A gateway's `gateway_id` is the 20-byte ID the blocks name it by, the
+    /// first 20 bytes of its v2 node ID. Each peer's `node_id` is its full
+    /// 32-byte v2 node ID.
     ///
     /// `synced` is evaluated at request time. The ranking and held places reflect
     /// the last update applied by networking and can lag a change in tip freshness.

@@ -139,10 +139,10 @@ counts, the places it holds, and its v2 peers. In this example the node has
     "coverage": 0.5
   },
   "gateways": [
-    { "node_id": "4d70...c112", "blocks": 40, "state": "preferred", "connected": true },
-    { "node_id": "67bb...6446", "blocks": 12, "state": "backoff", "connected": false },
-    { "node_id": "96dd...3b7e", "blocks": 11, "state": "standby", "connected": true },
-    { "node_id": "ccc7...2885", "blocks": 10, "state": "unmatched", "connected": false }
+    { "gateway_id": "4d70...c112", "blocks": 40, "state": "preferred", "connected": true },
+    { "gateway_id": "67bb...6446", "blocks": 12, "state": "backoff", "connected": false },
+    { "gateway_id": "96dd...3b7e", "blocks": 11, "state": "standby", "connected": true },
+    { "gateway_id": "ccc7...2885", "blocks": 10, "state": "unmatched", "connected": false }
   ],
   "hold": 1,
   "slots": { "limit": 40, "in_use": 3, "preferred": 1, "ordinary": 2, "inbound": 2 },
@@ -166,7 +166,7 @@ counts, the places it holds, and its v2 peers. In this example the node has
 | `window.checked` | Heights in the window read so far. |
 | `window.coverage` | The share of the window read, from 0 to 1. Below 1 the counts are a lower bound, as on a pruned node. A tip below 100 has an empty window, which reports 1. |
 | `gateways` | The last ranking applied by v2 networking, best first, at most 256 gateways. Only gateways named in at least 10 counted blocks are ranked, and the gateway ID this node's own ID starts with is left out. |
-| `gateways[].node_id` | The gateway ID in hex: the 20 bytes the blocks name, the first 20 bytes of the gateway's v2 node ID. Peers report their full 32-byte node IDs. |
+| `gateways[].gateway_id` | The gateway ID in hex: the 20 bytes the blocks name, the first 20 bytes of the gateway's v2 node ID. Peers report their full 32-byte node IDs as `node_id`. |
 | `gateways[].state` | See below. |
 | `gateways[].connected` | The gateway is a v2 peer now. |
 | `hold` | The connection places held for preferred gateways. |

@@ -23,7 +23,7 @@ impl MeshView {
         self.info
             .gateways
             .iter()
-            .find(|gateway| gateway.node_id == id)
+            .find(|gateway| gateway.gateway_id == id)
     }
 
     /// Where the node places the gateway with `id`, if it ranks it.
@@ -36,7 +36,7 @@ impl MeshView {
         self.info
             .gateways
             .iter()
-            .map(|gateway| decode_id(&gateway.node_id))
+            .map(|gateway| decode_id(&gateway.gateway_id))
             .collect()
     }
 
@@ -61,7 +61,7 @@ impl MeshView {
             .gateways
             .iter()
             .filter(|gateway| gateway.state == MeshGatewayState::Preferred)
-            .map(|gateway| decode_id(&gateway.node_id))
+            .map(|gateway| decode_id(&gateway.gateway_id))
             .collect()
     }
 
@@ -75,7 +75,7 @@ impl MeshView {
         self.info
             .gateways
             .iter()
-            .map(|gateway| (decode_id(&gateway.node_id), gateway.blocks))
+            .map(|gateway| (decode_id(&gateway.gateway_id), gateway.blocks))
             .collect()
     }
 
@@ -88,7 +88,7 @@ impl MeshView {
             .map(|gateway| {
                 format!(
                     "{} {} blocks {:?}{}",
-                    gateway.node_id,
+                    gateway.gateway_id,
                     gateway.blocks,
                     gateway.state,
                     if gateway.connected { " connected" } else { "" }
@@ -210,7 +210,7 @@ pub(super) fn check_view(view: &MeshView, facts: &NodeFacts) -> Vec<String> {
     if info
         .gateways
         .iter()
-        .any(|gateway| own_id.starts_with(&gateway.node_id))
+        .any(|gateway| own_id.starts_with(&gateway.gateway_id))
     {
         broken.push("4: the node ranks its own ID".into());
     }

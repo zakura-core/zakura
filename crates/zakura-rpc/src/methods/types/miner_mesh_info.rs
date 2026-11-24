@@ -109,7 +109,7 @@ pub struct MeshGateway {
     /// The ID the blocks name the gateway by, in hex: the first 20 bytes of
     /// its v2 node ID. The gateway is the one known node whose node ID
     /// starts with these bytes.
-    pub node_id: String,
+    pub gateway_id: String,
 
     /// Counted blocks that name the gateway.
     pub blocks: u32,
@@ -231,7 +231,7 @@ impl From<&MinerSetCoverage> for MeshWindow {
 impl From<&PlacedGateway> for MeshGateway {
     fn from(gateway: &PlacedGateway) -> Self {
         Self {
-            node_id: gateway.gateway_id.to_string(),
+            gateway_id: gateway.gateway_id.to_string(),
             blocks: gateway.blocks,
             state: gateway.place.into(),
             connected: gateway.connected,

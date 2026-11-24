@@ -142,7 +142,7 @@ fn gateways_report_their_20_byte_id_and_peers_their_whole_node_id() {
     let response = GetMinerMeshInfoResponse::new(node(), Some(&coverage()), Some(&places()));
 
     assert_eq!(
-        response.gateways[0].node_id,
+        response.gateways[0].gateway_id,
         hex::encode(&PREFERRED_GATEWAY[..20])
     );
     assert_eq!(response.peers[0].node_id, hex::encode(PREFERRED_GATEWAY));

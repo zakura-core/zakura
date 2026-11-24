@@ -27,7 +27,9 @@ zakurad start --unsafe-ignore-end-of-support
 
 This is a flag and not a config setting, so each launch of an unsupported
 release states the choice. There is no config key or environment variable for
-it. In Docker, pass it as the container's command arguments.
+it. In Docker, give the container the full command,
+`zakurad start --unsafe-ignore-end-of-support`. The image's entrypoint does
+not pass a flag on to `zakurad` when the flag is the first argument.
 
 With the flag, the node warns where it used to halt:
 

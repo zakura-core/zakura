@@ -136,13 +136,12 @@ const EOS_UPGRADE_ACTIVATED_METRIC: &str = "end_of_support.upgrade_activated_uns
 pub const KEEP_RUNNING_FLAG: &str = "--unsafe-ignore-end-of-support";
 
 /// What a node does once the chain tip passes the last height its release supports.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PastSupport {
     /// Stop the node.
     ///
     /// Releases are only supported for a limited time, so that nodes do not keep
     /// following outdated consensus rules.
-    #[default]
     Halt,
 
     /// Keep running, with warnings instead of a halt.

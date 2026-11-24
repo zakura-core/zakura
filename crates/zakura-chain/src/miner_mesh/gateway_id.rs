@@ -11,12 +11,9 @@ const NODE_ID_LEN: usize = 32;
 /// The ID a [`MinerMeshCommitment`](super::MinerMeshCommitment) names a
 /// gateway by: the first 20 bytes of the gateway's 32-byte v2 node ID.
 ///
-/// The networking layer knows nodes by their full node ID, so it matches a
-/// gateway ID against the node IDs it knows by prefix. Taking a specific
-/// gateway's place means finding a node key whose ID starts with that
-/// gateway's 20 bytes, about 2^160 work. Two nodes can share a prefix: a pair
-/// made on purpose takes about 2^80 work. The networking layer then prefers
-/// neither of them.
+/// Finding a node key whose ID starts with a given gateway ID takes about
+/// 2^160 work. Finding two node keys whose IDs share some gateway ID takes
+/// about 2^80 work.
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct GatewayId([u8; GATEWAY_ID_LEN]);
 

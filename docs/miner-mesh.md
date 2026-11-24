@@ -65,12 +65,8 @@ closed: it neither dials nor prefers any of them, holds no place for the
 gateway, and reports it as `ambiguous`. A node also never ranks the gateway ID
 its own node ID starts with.
 
-Moving v2 networking to protocol 4 gave every node a new ID. A block mined
-before a gateway upgraded names its old ID, which no node has any more. Such
-an ID stays unmatched: it takes no connection place, and it leaves the counts
-once its blocks fall out of the two-day window. A gateway's new ID counts only
-the blocks mined since it upgraded, so for up to two days the ranking can show
-its old and new IDs side by side.
+A block whose coinbase carries a marker in an earlier format names no
+gateway: the node ignores the marker and counts the block as naming none.
 
 Only nodes on the current v2 protocol make v2 connections to each other, so a
 gateway and the miners that prefer it must all run it to form a mesh.

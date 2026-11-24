@@ -11,14 +11,27 @@
 //! - [`wire`]: seven-message wire grammar, message tables, `WireMessage`, and FIFO data writer
 
 pub mod assemble;
+pub mod blocks;
 pub mod close;
 pub mod codec;
 pub mod commitment;
+pub mod config;
+pub mod paths;
+pub mod peer;
 pub mod profile;
+pub mod proposer;
+mod pull_trace;
 pub mod tree;
 pub mod wire;
 
 pub use assemble::{assemble_block, AssembleError};
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use blocks::{replay_bpv1_block_bytes, BlockReplaySummary};
+pub use blocks::{
+    AdmittedBlock, BlockConfig, BlockEvent, BlockInput, BlockOutcome, BlockOutput, BlockPhase,
+    BlockStep, BlockTable, ClaimRelease, FallbackReason, HeaderAdmissionResult, MetaEnvelope,
+    PartRefusal, PartSource, PullPeerState, ReleaseReason, StripeJob, VerifierVerdict, WorkId,
+};
 pub use close::{Bpv1CloseCause, Bpv1CloseRow};
 pub use codec::{decode_and_check_stripe, encode_body, CodecError, EncodedBody};
 pub use commitment::{
@@ -26,7 +39,22 @@ pub use commitment::{
     extract_single_commitment, verify_commitment, CoinbaseBinding, CommitmentError,
     CommitmentFields, COMMITMENT_PAYLOAD_LEN, COMMITMENT_SCRIPT_LEN, COMMITMENT_SCRIPT_PREFIX,
 };
+pub use config::{HavePacing, ZakuraBpv1Config, BPV1_SESSION_HELD_OUTPUT_BYTES};
+pub use paths::{
+    arrival_duration, Arrival, PathDirection, PathEstimate, PeerPaths, DEFAULT_UNMEASURED_RATE_BPS,
+};
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use peer::{replay_bpv1_peer_bytes, PeerReplaySummary};
+pub use peer::{
+    BitSet, BlockAdmitted, DropReason, PartAuth, PartToken, PeerConfig, PeerEvent, PeerInput,
+    PeerOutput, PeerState, PeerStep, PullGranted, RecvHave, RecvPartPrefix, RecvWant, RecvWantEnd,
+    Retire, Seed, Seeds, ServeDone, ServePartQueued, LIVENESS_COOLDOWN, PULL_WINDOW, SLOW_X,
+};
 pub use profile::{Coding, LayoutError, Profile, W2_PROFILE_ID};
+pub use proposer::{
+    compute_body_identity, seed_plan, PreparedCommitment, ProposerConfig, ProposerEvent,
+    ProposerInput, ProposerOutput, ProposerState, ProposerStep, SeedPlan, TemplateId,
+};
 pub use tree::{
     build_part_tree, encoding_id, pad_hash, verify_part_proof, Bpv1Hash, ProofError, VerifiedPart,
 };

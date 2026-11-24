@@ -12,10 +12,11 @@
 //! peer can no longer use the credit. A lowered send window keeps its lease
 //! until the connection accepts a byte after the shrink.
 //!
-//! [`CreditMachine`] decides all of this from inputs and returns effects. It
-//! holds no lease, lock or connection. [`ConnectionCredit`] is the IO shell: it
-//! holds the leases by [`CreditLeaseId`], applies `set_limits`, feeds
-//! `ConnLoad` snapshots in, and drops released leases after its lock.
+//! [`CreditMachine`] decides all of this: each method takes one input and
+//! returns what the shell applies. It holds no lease, lock or connection.
+//! [`ConnectionCredit`] is the IO shell: it holds the leases in the order of
+//! the machine's drain queues, applies `set_limits`, feeds `ConnLoad`
+//! snapshots in, and drops released leases after its lock.
 //!
 //! The machine also says when it next needs a snapshot ([`CreditWake`]). It
 //! ticks every [`CREDIT_TICK`] only while its send window is above the base
@@ -31,7 +32,7 @@ use zakura_rt::sync::{watch, Mutex, Notify};
 use super::{PoolLease, ServingLease, ServingPool};
 use crate::zakura::{ZakuraConnId, ZakuraPeerId};
 
-/// How often the connection task feeds [`CreditInput::Tick`] while the
+/// How often the connection task calls [`CreditMachine::tick`] while the
 /// machine asks for [`CreditWake::Tick`]: one `ConnLoad` publish interval, so
 /// each tick can see a new snapshot.
 pub(crate) const CREDIT_TICK: std::time::Duration = zakura_quic::LOAD_INTERVAL;
@@ -41,9 +42,6 @@ pub(crate) const CREDIT_TICK: std::time::Duration = zakura_quic::LOAD_INTERVAL;
 /// this keeps the window, so a serving connection doesn't regrow it per
 /// response.
 pub(crate) const SEND_IDLE_TICKS: u32 = 4;
-
-/// Identifies a lease the shell holds for the machine.
-pub(crate) type CreditLeaseId = u64;
 
 /// The [`ConnLoad`] fields the credit machine reads.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -76,60 +74,54 @@ impl From<ConnLoad> for CreditLoad {
     }
 }
 
-/// One input to [`CreditMachine::step`].
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CreditInput {
-    /// A request leased `bytes` of response credit.
-    AddReceive { bytes: u64 },
-    /// A request that added `total` bytes of credit ended. `unspent` names the
-    /// lease the shell holds for the bytes the peer didn't deliver.
-    FinishReceive {
-        total: u64,
-        unspent: Option<(CreditLeaseId, u64)>,
-    },
-    /// The shell sent the last [`CreditEffect::SetLimits`] as `set_limits`
-    /// call `seq`.
-    LimitsSent { seq: u64 },
-    /// A load snapshot, read to release drained leases.
-    Drain(CreditLoad),
-    /// A periodic load snapshot, read to release drained leases and to size
-    /// the send window.
-    Tick {
-        load: CreditLoad,
-        /// The serving per-peer cap (`[memory.cap] serving_per_peer`).
-        per_peer_cap: u64,
-        /// The peer's serving floor: one largest response.
-        peer_floor: u64,
-    },
-    /// The serving pool granted the last [`CreditEffect::GrowSend`] as lease
-    /// `id` of `bytes`.
-    SendGrown { id: CreditLeaseId, bytes: u64 },
-    /// The serving pool refused the last [`CreditEffect::GrowSend`].
-    SendRefused,
-    /// The connection closed: no credit it granted can be spent any more.
-    Closed,
+/// The leases a [`CreditMachine`] step releases. Each drain queue releases
+/// from its front, so a count names the leases.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[must_use]
+pub(crate) struct DrainRelease {
+    /// Receive drains to release, oldest first.
+    pub(crate) receive: usize,
+    /// Send drains to release, oldest first.
+    pub(crate) send: usize,
+    /// Whether the active send-window lease releases.
+    pub(crate) active_send: bool,
 }
 
-/// One effect of [`CreditMachine::step`], which the shell applies in order.
+/// What [`CreditMachine::finish_receive`] decided.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CreditEffect {
-    /// Call `set_limits` with these limits, then feed back
-    /// [`CreditInput::LimitsSent`], or [`CreditInput::Closed`] if it failed.
-    SetLimits(ConnLimits),
-    /// Set the peer's serving cap.
-    SetPeerCap(u64),
-    /// Try to lease `bytes` more send window from the serving pool, then feed
-    /// back [`CreditInput::SendGrown`] or [`CreditInput::SendRefused`].
-    GrowSend(u64),
-    /// Merge growth lease `id` into the active send-window lease.
-    MergeSend(CreditLeaseId),
-    /// Move `bytes` off the active send-window lease into lease `id`, which
-    /// drains.
-    DrainSend { id: CreditLeaseId, bytes: u64 },
-    /// Release the active send-window lease.
-    ReleaseActiveSend,
-    /// Release lease `id`.
-    Release(CreditLeaseId),
+#[must_use]
+pub(crate) struct FinishReceive {
+    /// The limits to apply with `set_limits`, if they changed.
+    pub(crate) limits: Option<ConnLimits>,
+    /// Whether the unspent lease joins the back of the receive drains.
+    /// Otherwise it releases at once: the connection closed, or it holds no
+    /// bytes.
+    pub(crate) drains: bool,
+}
+
+/// How a [`CreditMachine::tick`] changes the send window.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum SendStep {
+    /// The window stays.
+    #[default]
+    Keep,
+    /// Try to lease this many more bytes of send window from the serving
+    /// pool, then call [`CreditMachine::send_grown`] or
+    /// [`CreditMachine::send_refused`].
+    Grow(u64),
+    /// Move `bytes` off the active send-window lease into a new lease at the
+    /// back of the send drains, then apply `limits`.
+    Shrink { bytes: u64, limits: ConnLimits },
+}
+
+/// What one [`CreditMachine::tick`] decided.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[must_use]
+pub(crate) struct TickStep {
+    pub(crate) release: DrainRelease,
+    /// The peer's new serving cap, if it changed.
+    pub(crate) peer_cap: Option<u64>,
+    pub(crate) send: SendStep,
 }
 
 /// When the connection task next steps a [`CreditMachine`] with a snapshot.
@@ -167,7 +159,6 @@ impl CreditWake {
 /// A lease that stays charged after its window shrank.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Drain {
-    id: CreditLeaseId,
     bytes: u64,
     /// The `set_limits` call that applied the shrink, once the shell sent it.
     seq: Option<u64>,
@@ -177,9 +168,8 @@ struct Drain {
 }
 
 impl Drain {
-    fn new(id: CreditLeaseId, bytes: u64) -> Self {
+    fn new(bytes: u64) -> Self {
         Self {
-            id,
             bytes,
             seq: None,
             accepted_at_shrink: None,
@@ -204,6 +194,10 @@ impl Drain {
 ///   [`SEND_IDLE_TICKS`] ticks with no waiting output and no accepted bytes.
 ///   A shrunk lease drains until the connection accepts a byte after a
 ///   snapshot reflected the shrink.
+///
+/// Drains queue in order: each method that adds one adds it at the back, and
+/// each release takes from the front. The shell holds its leases in the same
+/// order.
 #[derive(Clone, Debug)]
 pub(crate) struct CreditMachine {
     base_receive_window: u64,
@@ -212,7 +206,7 @@ pub(crate) struct CreditMachine {
     base_send_window: u64,
     active_send: u64,
     send_drains: VecDeque<Drain>,
-    /// A [`CreditEffect::GrowSend`] awaits its answer.
+    /// A [`SendStep::Grow`] awaits its answer.
     growing: bool,
     /// The serving cap last set for the peer.
     peer_cap: Option<u64>,
@@ -222,7 +216,6 @@ pub(crate) struct CreditMachine {
     last_load: Option<CreditLoad>,
     idle_ticks: u32,
     closed: bool,
-    next_lease: CreditLeaseId,
 }
 
 impl CreditMachine {
@@ -240,15 +233,7 @@ impl CreditMachine {
             last_load: None,
             idle_ticks: 0,
             closed: false,
-            next_lease: 0,
         }
-    }
-
-    /// A fresh ID for a lease the shell hands in.
-    pub(crate) fn lease_id(&mut self) -> CreditLeaseId {
-        let id = self.next_lease;
-        self.next_lease += 1;
-        id
     }
 
     /// The receive window: the base plus live request credit.
@@ -289,94 +274,122 @@ impl CreditMachine {
         }
     }
 
-    /// Takes one input and returns the effects the shell applies, in order.
-    pub(crate) fn step(&mut self, input: CreditInput) -> Vec<CreditEffect> {
-        let mut effects = Vec::new();
-        match input {
-            CreditInput::AddReceive { bytes } => {
-                if !self.closed && bytes > 0 {
-                    self.active_receive_credit = self.active_receive_credit.saturating_add(bytes);
-                    effects.push(CreditEffect::SetLimits(self.limits()));
-                }
-            }
-            CreditInput::FinishReceive { total, unspent } => {
-                self.active_receive_credit = self.active_receive_credit.saturating_sub(total);
-                let mut drains = false;
-                if let Some((id, bytes)) = unspent {
-                    if self.closed || bytes == 0 {
-                        effects.push(CreditEffect::Release(id));
-                    } else {
-                        self.receive_drains.push_back(Drain::new(id, bytes));
-                        drains = true;
-                    }
-                }
-                if !self.closed && (total > 0 || drains) {
-                    effects.push(CreditEffect::SetLimits(self.limits()));
-                }
-            }
-            CreditInput::LimitsSent { seq } => {
-                // Untagged drains are the newest, at the back of each queue.
-                for drain in self
-                    .receive_drains
-                    .iter_mut()
-                    .rev()
-                    .chain(self.send_drains.iter_mut().rev())
-                    .filter(|drain| drain.seq.is_none())
-                {
-                    drain.seq = Some(seq);
-                }
-            }
-            CreditInput::Drain(load) => {
-                if !self.closed {
-                    self.last_load = Some(load);
-                    self.release_drained(&load, &mut effects);
-                }
-            }
-            CreditInput::Tick {
-                load,
-                per_peer_cap,
-                peer_floor,
-            } => {
-                if !self.closed {
-                    self.last_load = Some(load);
-                    self.release_drained(&load, &mut effects);
-                    self.size_send_window(&load, per_peer_cap, peer_floor, &mut effects);
-                }
-            }
-            CreditInput::SendGrown { id, bytes } => {
-                self.growing = false;
-                if self.closed {
-                    effects.push(CreditEffect::Release(id));
-                } else {
-                    self.active_send = self.active_send.saturating_add(bytes);
-                    effects.push(CreditEffect::MergeSend(id));
-                    effects.push(CreditEffect::SetLimits(self.limits()));
-                }
-            }
-            CreditInput::SendRefused => self.growing = false,
-            CreditInput::Closed => {
-                if !self.closed {
-                    self.closed = true;
-                    effects.extend(
-                        self.receive_drains
-                            .drain(..)
-                            .chain(self.send_drains.drain(..))
-                            .map(|drain| CreditEffect::Release(drain.id)),
-                    );
-                    if self.active_send > 0 {
-                        self.active_send = 0;
-                        effects.push(CreditEffect::ReleaseActiveSend);
-                    }
-                }
-            }
+    /// A request leased `bytes` of response credit. Returns the limits to
+    /// apply, if they changed.
+    pub(crate) fn add_receive(&mut self, bytes: u64) -> Option<ConnLimits> {
+        if self.closed || bytes == 0 {
+            return None;
         }
-        effects
+        self.active_receive_credit = self.active_receive_credit.saturating_add(bytes);
+        Some(self.limits())
+    }
+
+    /// A request that added `total` bytes of credit ended. `unspent` is the
+    /// size of the lease the shell holds for the bytes the peer didn't
+    /// deliver.
+    pub(crate) fn finish_receive(&mut self, total: u64, unspent: Option<u64>) -> FinishReceive {
+        self.active_receive_credit = self.active_receive_credit.saturating_sub(total);
+        let drains = match unspent {
+            Some(bytes) if !self.closed && bytes > 0 => {
+                self.receive_drains.push_back(Drain::new(bytes));
+                true
+            }
+            _ => false,
+        };
+        FinishReceive {
+            limits: (!self.closed && (total > 0 || drains)).then(|| self.limits()),
+            drains,
+        }
+    }
+
+    /// The shell applied the last limits as `set_limits` call `seq`. If the
+    /// call failed, the shell calls [`Self::close`] instead.
+    pub(crate) fn limits_sent(&mut self, seq: u64) {
+        // Untagged drains are the newest, at the back of each queue.
+        for drain in self
+            .receive_drains
+            .iter_mut()
+            .rev()
+            .chain(self.send_drains.iter_mut().rev())
+            .filter(|drain| drain.seq.is_none())
+        {
+            drain.seq = Some(seq);
+        }
+    }
+
+    /// Reads a load snapshot to release drained leases.
+    pub(crate) fn drain(&mut self, load: CreditLoad) -> DrainRelease {
+        if self.closed {
+            return DrainRelease::default();
+        }
+        self.last_load = Some(load);
+        self.release_drained(&load)
+    }
+
+    /// Reads a periodic load snapshot to release drained leases and to size
+    /// the send window. `per_peer_cap` is the serving per-peer cap
+    /// (`[memory.cap] serving_per_peer`), and `peer_floor` the peer's serving
+    /// floor: one largest response.
+    pub(crate) fn tick(
+        &mut self,
+        load: CreditLoad,
+        per_peer_cap: u64,
+        peer_floor: u64,
+    ) -> TickStep {
+        if self.closed {
+            return TickStep::default();
+        }
+        self.last_load = Some(load);
+        let release = self.release_drained(&load);
+        let (peer_cap, send) = self.size_send_window(&load, per_peer_cap, peer_floor);
+        TickStep {
+            release,
+            peer_cap,
+            send,
+        }
+    }
+
+    /// The serving pool granted the last [`SendStep::Grow`] as a lease of
+    /// `bytes`. Returns the limits to apply once the shell merges the lease
+    /// into the active send-window lease, or `None` if the connection closed
+    /// and the lease releases.
+    pub(crate) fn send_grown(&mut self, bytes: u64) -> Option<ConnLimits> {
+        self.growing = false;
+        if self.closed {
+            return None;
+        }
+        self.active_send = self.active_send.saturating_add(bytes);
+        Some(self.limits())
+    }
+
+    /// The serving pool refused the last [`SendStep::Grow`].
+    pub(crate) fn send_refused(&mut self) {
+        self.growing = false;
+    }
+
+    /// The connection closed: no credit it granted can be spent any more, so
+    /// every lease releases.
+    pub(crate) fn close(&mut self) -> DrainRelease {
+        if self.closed {
+            return DrainRelease::default();
+        }
+        self.closed = true;
+        let release = DrainRelease {
+            receive: self.receive_drains.len(),
+            send: self.send_drains.len(),
+            active_send: self.active_send > 0,
+        };
+        self.receive_drains.clear();
+        self.send_drains.clear();
+        self.active_send = 0;
+        release
     }
 
     /// Releases receive drains the snapshot's excess no longer needs, oldest
     /// first, and send drains whose connection accepted a byte since a
     /// snapshot reflected their shrink.
-    fn release_drained(&mut self, load: &CreditLoad, effects: &mut Vec<CreditEffect>) {
+    fn release_drained(&mut self, load: &CreditLoad) -> DrainRelease {
+        let mut release = DrainRelease::default();
         let applied = load.limits_applied;
         // A drain whose shrink the snapshot doesn't reflect isn't in its
         // excess, so only reflected drains (a prefix) cover the excess.
@@ -392,8 +405,8 @@ impl CreditMachine {
                 break;
             }
             reflected -= front.bytes;
-            effects.push(CreditEffect::Release(front.id));
             self.receive_drains.pop_front();
+            release.receive += 1;
         }
 
         for drain in self
@@ -412,21 +425,22 @@ impl CreditMachine {
             {
                 break;
             }
-            effects.push(CreditEffect::Release(front.id));
             self.send_drains.pop_front();
+            release.send += 1;
         }
+        release
     }
 
     /// Targets `min(2 × cwnd, per_peer_cap)` while output waits, keeps the
     /// window while bytes flow, and returns to the base after
-    /// [`SEND_IDLE_TICKS`] idle ticks.
+    /// [`SEND_IDLE_TICKS`] idle ticks. Returns the peer's new serving cap, if
+    /// it changed, and the window's change.
     fn size_send_window(
         &mut self,
         load: &CreditLoad,
         per_peer_cap: u64,
         peer_floor: u64,
-        effects: &mut Vec<CreditEffect>,
-    ) {
+    ) -> (Option<u64>, SendStep) {
         let base = self.base_send_window;
         let two_cwnd = load.cwnd.saturating_mul(2);
         let waiting = load.output_waits();
@@ -453,22 +467,24 @@ impl CreditMachine {
             .max(two_cwnd)
             .saturating_add(target)
             .min(per_peer_cap);
-        if self.peer_cap != Some(cap) {
-            self.peer_cap = Some(cap);
-            effects.push(CreditEffect::SetPeerCap(cap));
-        }
+        let peer_cap = (self.peer_cap != Some(cap)).then_some(cap);
+        self.peer_cap = Some(cap);
 
-        if target < self.active_send {
+        let send = if target < self.active_send {
             let bytes = self.active_send - target;
-            let id = self.lease_id();
             self.active_send = target;
-            self.send_drains.push_back(Drain::new(id, bytes));
-            effects.push(CreditEffect::DrainSend { id, bytes });
-            effects.push(CreditEffect::SetLimits(self.limits()));
+            self.send_drains.push_back(Drain::new(bytes));
+            SendStep::Shrink {
+                bytes,
+                limits: self.limits(),
+            }
         } else if target > self.active_send && !self.growing {
             self.growing = true;
-            effects.push(CreditEffect::GrowSend(target - self.active_send));
-        }
+            SendStep::Grow(target - self.active_send)
+        } else {
+            SendStep::Keep
+        };
+        (peer_cap, send)
     }
 }
 
@@ -498,94 +514,98 @@ impl Drop for DrainingReceive {
     }
 }
 
-/// The leases the shell holds for its machine.
-#[derive(Debug, Default)]
-struct HeldLeases {
-    receive: Vec<(CreditLeaseId, DrainingReceive)>,
-    send: Vec<(CreditLeaseId, ServingLease)>,
-    active_send: Option<ServingLease>,
-    growth: Option<(CreditLeaseId, ServingLease)>,
-}
-
-/// What the shell applies after it unlocks: lease drops and pool calls.
+/// Leases a step released, which the shell drops after its lock so their
+/// pool releases and wakeups run outside it.
 #[derive(Debug, Default)]
 #[must_use]
-struct Unlocked {
-    released_receive: Vec<DrainingReceive>,
-    released_send: Vec<ServingLease>,
-    peer_cap: Option<u64>,
-    grow: Option<u64>,
+struct Released {
+    receive: Vec<DrainingReceive>,
+    send: Vec<ServingLease>,
 }
 
+/// A [`CreditMachine`] and the leases it decides on, held in the order of
+/// the machine's drain queues.
 #[derive(Debug)]
 struct CreditShell {
     machine: CreditMachine,
-    held: HeldLeases,
+    receive: VecDeque<DrainingReceive>,
+    send: VecDeque<ServingLease>,
+    active_send: Option<ServingLease>,
 }
 
 impl CreditShell {
-    /// Steps the machine with `input` and applies its effects, feeding back
-    /// the inputs `set_limits` answers with.
-    fn run(&mut self, connection: &QuicConn, input: CreditInput, unlocked: &mut Unlocked) {
-        let mut next = Some(input);
-        while let Some(input) = next.take() {
-            for effect in self.machine.step(input) {
-                match effect {
-                    CreditEffect::SetLimits(limits) => {
-                        debug_assert!(next.is_none(), "one set_limits per step");
-                        next = Some(match connection.set_limits(limits) {
-                            Ok(seq) => CreditInput::LimitsSent { seq },
-                            Err(_) => CreditInput::Closed,
-                        });
-                    }
-                    CreditEffect::SetPeerCap(cap) => unlocked.peer_cap = Some(cap),
-                    CreditEffect::GrowSend(bytes) => unlocked.grow = Some(bytes),
-                    CreditEffect::MergeSend(id) => {
-                        let Some((_, grown)) = self.held.growth.take_if(|(held, _)| *held == id)
-                        else {
-                            debug_assert!(false, "the machine merges only the growth it was given");
-                            continue;
-                        };
-                        match &mut self.held.active_send {
-                            Some(active) => active.merge(grown),
-                            None => self.held.active_send = Some(grown),
-                        }
-                    }
-                    CreditEffect::DrainSend { id, bytes } => {
-                        let drained = match &mut self.held.active_send {
-                            Some(active) if active.bytes() == bytes => self.held.active_send.take(),
-                            Some(active) => active.split(bytes),
-                            None => None,
-                        };
-                        debug_assert!(
-                            drained.is_some(),
-                            "the machine drains only bytes the active lease holds"
-                        );
-                        if let Some(drained) = drained {
-                            self.held.send.push((id, drained));
-                        }
-                    }
-                    CreditEffect::ReleaseActiveSend => {
-                        unlocked.released_send.extend(self.held.active_send.take());
-                    }
-                    CreditEffect::Release(id) => self.release(id, unlocked),
-                }
-            }
+    /// Applies `limits` with `set_limits` and tells the machine the call, or
+    /// closes the machine if the connection is gone.
+    fn set_limits(
+        &mut self,
+        connection: &QuicConn,
+        limits: Option<ConnLimits>,
+        released: &mut Released,
+    ) {
+        let Some(limits) = limits else {
+            return;
+        };
+        match connection.set_limits(limits) {
+            Ok(seq) => self.machine.limits_sent(seq),
+            Err(_) => self.close(released),
         }
     }
 
-    fn release(&mut self, id: CreditLeaseId, unlocked: &mut Unlocked) {
-        if let Some(index) = self.held.receive.iter().position(|(held, _)| *held == id) {
-            unlocked
-                .released_receive
-                .push(self.held.receive.remove(index).1);
-        } else if let Some(index) = self.held.send.iter().position(|(held, _)| *held == id) {
-            unlocked.released_send.push(self.held.send.remove(index).1);
-        } else if let Some((_, grown)) = self.held.growth.take_if(|(held, _)| *held == id) {
-            unlocked.released_send.push(grown);
-        } else {
-            debug_assert!(false, "the machine releases only leases it was given");
+    /// Moves the leases the machine released into `released`.
+    fn release(&mut self, release: DrainRelease, released: &mut Released) {
+        released
+            .receive
+            .extend(self.receive.drain(..release.receive));
+        released.send.extend(self.send.drain(..release.send));
+        if release.active_send {
+            released.send.extend(self.active_send.take());
         }
+    }
+
+    fn close(&mut self, released: &mut Released) {
+        let release = self.machine.close();
+        self.release(release, released);
+    }
+
+    /// Moves `bytes` off the active send-window lease to the back of the send
+    /// drains.
+    fn drain_send(&mut self, bytes: u64) {
+        let drained = match &mut self.active_send {
+            Some(active) if active.bytes() == bytes => self.active_send.take(),
+            Some(active) => active.split(bytes),
+            None => None,
+        };
+        debug_assert!(
+            drained.is_some(),
+            "the machine drains only bytes the active lease holds"
+        );
+        self.send.extend(drained);
+    }
+
+    /// Merges a granted growth lease into the active send-window lease, or
+    /// releases it if the connection closed.
+    fn send_grown(&mut self, connection: &QuicConn, grown: ServingLease, released: &mut Released) {
+        let Some(limits) = self.machine.send_grown(grown.bytes()) else {
+            released.send.push(grown);
+            return;
+        };
+        match &mut self.active_send {
+            Some(active) => active.merge(grown),
+            None => self.active_send = Some(grown),
+        }
+        self.set_limits(connection, Some(limits), released);
+    }
+
+    /// Checks that the shell holds one lease per machine drain, and an active
+    /// send-window lease of the machine's size. The shell releases by
+    /// position, so a misalignment would release the wrong leases.
+    fn debug_assert_aligned(&self) {
+        debug_assert_eq!(self.machine.receive_drains.len(), self.receive.len());
+        debug_assert_eq!(self.machine.send_drains.len(), self.send.len());
+        debug_assert_eq!(
+            self.machine.active_send,
+            self.active_send.as_ref().map_or(0, ServingLease::bytes)
+        );
     }
 }
 
@@ -629,7 +649,9 @@ impl ConnectionCredit {
                 )),
                 shell: Mutex::new(CreditShell {
                     machine,
-                    held: HeldLeases::default(),
+                    receive: VecDeque::new(),
+                    send: VecDeque::new(),
+                    active_send: None,
                 }),
                 wake_changed: Notify::new(),
             }),
@@ -645,7 +667,10 @@ impl ConnectionCredit {
     /// Raise the connection's QUIC receive window by `bytes` before sending a
     /// leased request (`02 §3`).
     pub(crate) fn add_receive_credit(&self, bytes: u64) {
-        self.step(CreditInput::AddReceive { bytes }).drop_leases();
+        self.step(|shell, connection, released| {
+            let limits = shell.machine.add_receive(bytes);
+            shell.set_limits(connection, limits, released);
+        });
     }
 
     /// Lower the connection's QUIC receive window by `total_credit` when a
@@ -659,39 +684,37 @@ impl ConnectionCredit {
         total_credit: u64,
         unspent_lease: Option<PoolLease>,
     ) {
-        let unlocked = {
-            let mut shell = self.lock();
+        self.step(|shell, connection, released| {
             let wake = shell.machine.wake();
-            let unspent = unspent_lease.map(|lease| {
-                let id = shell.machine.lease_id();
-                let bytes = lease.bytes();
-                shell.held.receive.push((id, DrainingReceive::new(lease)));
-                (id, bytes)
-            });
-            let unlocked = self.run_locked(
-                &mut shell,
-                CreditInput::FinishReceive {
-                    total: total_credit,
-                    unspent,
-                },
-            );
+            let finish = shell
+                .machine
+                .finish_receive(total_credit, unspent_lease.as_ref().map(PoolLease::bytes));
+            if let Some(lease) = unspent_lease {
+                let lease = DrainingReceive::new(lease);
+                if finish.drains {
+                    shell.receive.push_back(lease);
+                } else {
+                    released.receive.push(lease);
+                }
+            }
+            shell.set_limits(connection, finish.limits, released);
             // A new drain needs the connection task to watch snapshots.
             if shell.machine.wake() != wake {
                 self.inner.wake_changed.notify_one();
             }
-            unlocked
-        };
-        unlocked.drop_leases();
+        });
     }
 
     /// Release the drained credit leases the latest `ConnLoad` allows.
     pub(crate) fn poll_drain(&self) {
-        let unlocked = {
-            let mut shell = self.lock();
-            let input = self.load().map_or(CreditInput::Closed, CreditInput::Drain);
-            self.run_locked(&mut shell, input)
-        };
-        unlocked.drop_leases();
+        let load = self.load();
+        self.step(|shell, _, released| {
+            let release = match load {
+                Some(load) => shell.machine.drain(load),
+                None => shell.machine.close(),
+            };
+            shell.release(release, released);
+        });
     }
 
     /// Run one [`CREDIT_TICK`]: release drained leases, set the peer's serving
@@ -702,39 +725,33 @@ impl ConnectionCredit {
         peer: &ZakuraPeerId,
         peer_floor: u64,
     ) {
-        let input = match self.load() {
-            Some(load) => CreditInput::Tick {
-                load,
-                per_peer_cap: serving_pool.default_per_peer_cap(),
-                peer_floor,
-            },
-            None => CreditInput::Closed,
+        let Some(load) = self.load() else {
+            self.close();
+            return;
         };
-        let mut unlocked = self.step(input);
-        let grow = unlocked.grow.take();
-        if let Some(cap) = unlocked.peer_cap.take() {
+        let per_peer_cap = serving_pool.default_per_peer_cap();
+        let (step, released) = self.locked(|shell, connection, released| {
+            let step = shell.machine.tick(load, per_peer_cap, peer_floor);
+            shell.release(step.release, released);
+            if let SendStep::Shrink { bytes, limits } = step.send {
+                shell.drain_send(bytes);
+                shell.set_limits(connection, Some(limits), released);
+            }
+            step
+        });
+        if let Some(cap) = step.peer_cap {
             serving_pool.set_peer_cap(peer, cap);
         }
-        unlocked.drop_leases();
+        drop(released);
 
-        let Some(need) = grow else {
+        let SendStep::Grow(need) = step.send else {
             return;
         };
         let grown = serving_pool.try_acquire(peer, Some(self.inner.conn_id), peer_floor, need);
-        let unlocked = {
-            let mut shell = self.lock();
-            let input = match grown {
-                Ok(lease) => {
-                    let id = shell.machine.lease_id();
-                    let bytes = lease.bytes();
-                    shell.held.growth = Some((id, lease));
-                    CreditInput::SendGrown { id, bytes }
-                }
-                Err(_) => CreditInput::SendRefused,
-            };
-            self.run_locked(&mut shell, input)
-        };
-        unlocked.drop_leases();
+        self.step(|shell, connection, released| match grown {
+            Ok(lease) => shell.send_grown(connection, lease, released),
+            Err(_) => shell.machine.send_refused(),
+        });
     }
 
     /// A waiter for this connection's next credit step, for the connection
@@ -752,7 +769,7 @@ impl ConnectionCredit {
 
     /// Release every credit lease on connection close (`02 §6`).
     pub(crate) fn close(&self) {
-        self.step(CreditInput::Closed).drop_leases();
+        self.step(|shell, _, released| shell.close(released));
     }
 
     /// The latest load snapshot, or `None` once the connection closed.
@@ -764,20 +781,29 @@ impl ConnectionCredit {
             .then(|| CreditLoad::from(connection.load()))
     }
 
-    fn step(&self, input: CreditInput) -> Unlocked {
-        let mut shell = self.lock();
-        self.run_locked(&mut shell, input)
+    /// Runs `step` under the shell's lock, then drops the leases it released.
+    fn step<T>(&self, step: impl FnOnce(&mut CreditShell, &QuicConn, &mut Released) -> T) -> T {
+        let (out, released) = self.locked(step);
+        drop(released);
+        out
     }
 
-    fn run_locked(&self, shell: &mut CreditShell, input: CreditInput) -> Unlocked {
-        let mut unlocked = Unlocked::default();
-        shell.run(&self.inner.connection, input, &mut unlocked);
+    /// Runs `step` under the shell's lock and returns the leases it released,
+    /// for the caller to drop after the lock.
+    fn locked<T>(
+        &self,
+        step: impl FnOnce(&mut CreditShell, &QuicConn, &mut Released) -> T,
+    ) -> (T, Released) {
+        let mut released = Released::default();
+        let mut shell = self.lock();
+        let out = step(&mut shell, &self.inner.connection, &mut released);
+        shell.debug_assert_aligned();
         #[cfg(zakura_sim)]
         self.inner.live_receive_window.store(
             shell.machine.receive_window(),
             zakura_rt::sync::counter::Ordering::Relaxed,
         );
-        unlocked
+        (out, released)
     }
 
     fn lock(&self) -> zakura_rt::sync::MutexGuard<'_, CreditShell> {
@@ -785,16 +811,6 @@ impl ConnectionCredit {
             .shell
             .lock()
             .expect("no credit step panics while holding the shell lock")
-    }
-}
-
-impl Unlocked {
-    /// Drops the released leases, after the shell's lock, so their pool
-    /// releases and wakeups run outside it.
-    fn drop_leases(self) {
-        debug_assert!(self.peer_cap.is_none() && self.grow.is_none());
-        drop(self.released_receive);
-        drop(self.released_send);
     }
 }
 

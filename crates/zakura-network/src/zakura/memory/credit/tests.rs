@@ -1,6 +1,6 @@
-//! Tests drive [`CreditMachine`] directly: inputs in, effects out, no sink.
+//! Tests drive [`CreditMachine`] directly: inputs in, decisions out, no sink.
 
-use std::collections::HashMap;
+use std::collections::VecDeque;
 
 use proptest::prelude::*;
 
@@ -26,46 +26,47 @@ impl Harness {
         }
     }
 
-    /// Steps `input`, answers each `SetLimits` with the next sequence number,
-    /// and returns every effect.
-    fn step(&mut self, input: CreditInput) -> Vec<CreditEffect> {
-        let mut effects = self.machine.step(input);
-        if effects
-            .iter()
-            .any(|effect| matches!(effect, CreditEffect::SetLimits(_)))
-        {
+    /// Answers `limits`, if any, with the next `set_limits` call.
+    fn sent(&mut self, limits: Option<ConnLimits>) -> Option<ConnLimits> {
+        if limits.is_some() {
             self.seq += 1;
-            effects.extend(self.machine.step(CreditInput::LimitsSent { seq: self.seq }));
+            self.machine.limits_sent(self.seq);
         }
-        effects
+        limits
     }
 
-    fn finish(&mut self, total: u64, unspent: u64) -> CreditLeaseId {
-        let id = self.machine.lease_id();
-        self.step(CreditInput::FinishReceive {
-            total,
-            unspent: Some((id, unspent)),
-        });
-        id
+    fn add(&mut self, bytes: u64) -> Option<ConnLimits> {
+        let limits = self.machine.add_receive(bytes);
+        self.sent(limits)
     }
 
-    fn tick(&mut self, load: CreditLoad) -> Vec<CreditEffect> {
-        self.step(CreditInput::Tick {
-            load,
-            per_peer_cap: PER_PEER_CAP,
-            peer_floor: PEER_FLOOR,
-        })
+    /// Finishes a request of `total` bytes with `unspent` of them leased, and
+    /// returns whether the lease drains.
+    fn finish(&mut self, total: u64, unspent: u64) -> bool {
+        let finish = self.machine.finish_receive(total, Some(unspent));
+        self.sent(finish.limits);
+        finish.drains
+    }
+
+    fn tick(&mut self, load: CreditLoad) -> TickStep {
+        let step = self.machine.tick(load, PER_PEER_CAP, PEER_FLOOR);
+        if let SendStep::Shrink { limits, .. } = step.send {
+            self.sent(Some(limits));
+        }
+        step
+    }
+
+    fn grown(&mut self, bytes: u64) -> Option<ConnLimits> {
+        let limits = self.machine.send_grown(bytes);
+        self.sent(limits)
     }
 }
 
-fn released(effects: &[CreditEffect]) -> Vec<CreditLeaseId> {
-    effects
-        .iter()
-        .filter_map(|effect| match effect {
-            CreditEffect::Release(id) => Some(*id),
-            _ => None,
-        })
-        .collect()
+fn receive(count: usize) -> DrainRelease {
+    DrainRelease {
+        receive: count,
+        ..DrainRelease::default()
+    }
 }
 
 fn snapshot(limits_applied: u64, receive_credit_excess: u64) -> CreditLoad {
@@ -79,92 +80,76 @@ fn snapshot(limits_applied: u64, receive_credit_excess: u64) -> CreditLoad {
 #[test]
 fn receive_credit_raises_the_window_and_drains_unspent_credit_against_the_excess() {
     let mut harness = Harness::new();
-    let effects = harness.step(CreditInput::AddReceive { bytes: 2 * MIB });
     assert_eq!(
-        effects,
-        vec![CreditEffect::SetLimits(
+        harness.add(2 * MIB),
+        Some(
             ConnLimits::default()
                 .with_receive_window(BASE_RECEIVE + 2 * MIB)
                 .with_send_window(BASE_SEND)
-        )]
+        )
     );
 
     // RangeUnavailable: the window drops at once, the lease drains.
-    let first = harness.finish(2 * MIB, 2 * MIB);
+    assert!(harness.finish(2 * MIB, 2 * MIB));
     assert_eq!(harness.machine.receive_window(), BASE_RECEIVE);
     let first_seq = harness.seq;
 
-    harness.step(CreditInput::AddReceive { bytes: MIB });
-    let second = harness.finish(MIB, MIB);
+    harness.add(MIB);
+    assert!(harness.finish(MIB, MIB));
 
     // The peer may still spend all 3 MiB, then 2 MiB: only both drains
     // together cover that.
-    assert!(released(&harness.step(CreditInput::Drain(snapshot(harness.seq, 3 * MIB)))).is_empty());
-    assert!(released(&harness.step(CreditInput::Drain(snapshot(harness.seq, 2 * MIB)))).is_empty());
-    assert!(released(&harness.step(CreditInput::Drain(snapshot(harness.seq, MIB + 1)))).is_empty());
+    let none = DrainRelease::default();
+    assert_eq!(harness.machine.drain(snapshot(harness.seq, 3 * MIB)), none);
+    assert_eq!(harness.machine.drain(snapshot(harness.seq, 2 * MIB)), none);
+    assert_eq!(harness.machine.drain(snapshot(harness.seq, MIB + 1)), none);
     // 1 MiB remains: the later drain covers it, so the oldest releases.
     assert_eq!(
-        released(&harness.step(CreditInput::Drain(snapshot(harness.seq, MIB)))),
-        vec![first]
+        harness.machine.drain(snapshot(harness.seq, MIB)),
+        receive(1)
     );
-    // A snapshot of the first shrink alone can't release the second.
-    assert!(released(&harness.step(CreditInput::Drain(snapshot(first_seq, 0)))).is_empty());
-    assert_eq!(
-        released(&harness.step(CreditInput::Drain(snapshot(harness.seq, 0)))),
-        vec![second]
-    );
+    // fix-11: a snapshot older than the shrink shows the excess before the
+    // shrink, so a snapshot of the first shrink alone can't release the
+    // second.
+    assert_eq!(harness.machine.drain(snapshot(first_seq, 0)), none);
+    assert_eq!(harness.machine.drain(snapshot(harness.seq, 0)), receive(1));
     assert!(!harness.machine.has_drains());
-}
-
-/// fix-11: a snapshot older than the shrink shows the excess before the
-/// shrink, so it releases nothing.
-#[test]
-fn a_snapshot_from_before_the_shrink_releases_nothing() {
-    let mut harness = Harness::new();
-    harness.step(CreditInput::AddReceive { bytes: MIB });
-    let before = harness.seq;
-    let id = harness.finish(MIB, MIB);
-    assert!(released(&harness.step(CreditInput::Drain(snapshot(before, 0)))).is_empty());
-    assert_eq!(
-        released(&harness.step(CreditInput::Drain(snapshot(harness.seq, 0)))),
-        vec![id]
-    );
 }
 
 #[test]
 fn close_releases_every_lease_and_every_later_one() {
     let mut harness = Harness::new();
-    harness.step(CreditInput::AddReceive { bytes: MIB });
-    let id = harness.finish(MIB, MIB);
-    harness.tick(CreditLoad {
+    harness.add(MIB);
+    assert!(harness.finish(MIB, MIB));
+    let step = harness.tick(CreditLoad {
         cwnd: 4 * MIB,
         queued_send_bytes: 1,
         ..CreditLoad::default()
     });
-    let grown = harness.machine.lease_id();
-    harness.step(CreditInput::SendGrown {
-        id: grown,
-        bytes: 6 * MIB,
-    });
+    assert_eq!(step.send, SendStep::Grow(6 * MIB));
+    harness.grown(6 * MIB);
 
-    let effects = harness.step(CreditInput::Closed);
-    assert_eq!(released(&effects), vec![id]);
-    assert!(effects.contains(&CreditEffect::ReleaseActiveSend));
+    assert_eq!(
+        harness.machine.close(),
+        DrainRelease {
+            receive: 1,
+            send: 0,
+            active_send: true,
+        }
+    );
     assert!(!harness.machine.has_drains());
 
     // After close, a handed lease releases at once and credit changes
     // nothing.
-    assert!(harness
-        .step(CreditInput::AddReceive { bytes: MIB })
-        .is_empty());
-    let late = harness.machine.lease_id();
+    assert_eq!(harness.add(MIB), None);
     assert_eq!(
-        harness.step(CreditInput::FinishReceive {
-            total: MIB,
-            unspent: Some((late, MIB)),
-        }),
-        vec![CreditEffect::Release(late)]
+        harness.machine.finish_receive(MIB, Some(MIB)),
+        FinishReceive {
+            limits: None,
+            drains: false,
+        }
     );
+    assert_eq!(harness.machine.send_grown(MIB), None);
 }
 
 #[test]
@@ -176,21 +161,13 @@ fn send_window_grows_to_two_cwnd_and_drains_after_an_accepted_byte() {
         send_blocked_streams: 1,
         ..CreditLoad::default()
     };
-    let effects = harness.tick(waiting);
+    let step = harness.tick(waiting);
     // 2 × cwnd = 10 MiB within the 16 MiB cap: 8 MiB above the base.
-    assert!(effects.contains(&CreditEffect::GrowSend(8 * MIB)));
-    assert!(effects.contains(&CreditEffect::SetPeerCap(PER_PEER_CAP)));
+    assert_eq!(step.send, SendStep::Grow(8 * MIB));
+    assert_eq!(step.peer_cap, Some(PER_PEER_CAP));
     // A second tick before the answer asks for nothing more.
-    assert!(!harness
-        .tick(waiting)
-        .iter()
-        .any(|effect| matches!(effect, CreditEffect::GrowSend(_))));
-    let grown = harness.machine.lease_id();
-    let effects = harness.step(CreditInput::SendGrown {
-        id: grown,
-        bytes: 8 * MIB,
-    });
-    assert_eq!(effects[0], CreditEffect::MergeSend(grown));
+    assert_eq!(harness.tick(waiting).send, SendStep::Keep);
+    assert!(harness.grown(8 * MIB).is_some());
     assert_eq!(harness.machine.send_window(), 10 * MIB);
 
     // Idle for SEND_IDLE_TICKS ticks: the window returns to the base.
@@ -199,16 +176,13 @@ fn send_window_grows_to_two_cwnd_and_drains_after_an_accepted_byte() {
         limits_applied: harness.seq,
         ..CreditLoad::default()
     };
-    let mut drained = None;
+    let mut shrunk = None;
     for _ in 0..SEND_IDLE_TICKS {
-        for effect in harness.tick(idle) {
-            if let CreditEffect::DrainSend { id, bytes } = effect {
-                assert_eq!(bytes, 8 * MIB);
-                drained = Some(id);
-            }
+        if let SendStep::Shrink { bytes, .. } = harness.tick(idle).send {
+            shrunk = Some(bytes);
         }
     }
-    let drained = drained.expect("the idle window shrinks");
+    assert_eq!(shrunk, Some(8 * MIB), "the idle window shrinks");
     assert_eq!(harness.machine.send_window(), BASE_SEND);
 
     // The snapshot that reflects the shrink sets its baseline; a byte
@@ -217,13 +191,18 @@ fn send_window_grows_to_two_cwnd_and_drains_after_an_accepted_byte() {
         limits_applied: harness.seq,
         ..idle
     };
-    assert!(released(&harness.tick(reflected)).is_empty());
+    assert_eq!(harness.tick(reflected).release, DrainRelease::default());
     assert_eq!(
-        released(&harness.tick(CreditLoad {
-            accepted_send_bytes: 1,
-            ..reflected
-        })),
-        vec![drained]
+        harness
+            .tick(CreditLoad {
+                accepted_send_bytes: 1,
+                ..reflected
+            })
+            .release,
+        DrainRelease {
+            send: 1,
+            ..DrainRelease::default()
+        }
     );
 }
 
@@ -232,21 +211,17 @@ fn send_window_grows_to_two_cwnd_and_drains_after_an_accepted_byte() {
 #[test]
 fn a_short_pause_keeps_the_send_window() {
     let mut harness = Harness::new();
-    harness.tick(CreditLoad {
+    let _ = harness.tick(CreditLoad {
         cwnd: 4 * MIB,
         queued_send_bytes: 1,
         ..CreditLoad::default()
     });
-    let grown = harness.machine.lease_id();
-    harness.step(CreditInput::SendGrown {
-        id: grown,
-        bytes: 6 * MIB,
-    });
+    harness.grown(6 * MIB);
     let window = harness.machine.send_window();
 
     // The queue reads empty while the connection keeps accepting bytes.
     for accepted in 1..=20 {
-        harness.tick(CreditLoad {
+        let _ = harness.tick(CreditLoad {
             cwnd: 4 * MIB,
             accepted_send_bytes: accepted * MIB,
             ..CreditLoad::default()
@@ -255,7 +230,7 @@ fn a_short_pause_keeps_the_send_window() {
     }
     // A pause shorter than SEND_IDLE_TICKS keeps it too.
     for _ in 1..SEND_IDLE_TICKS {
-        harness.tick(CreditLoad {
+        let _ = harness.tick(CreditLoad {
             cwnd: 4 * MIB,
             accepted_send_bytes: 20 * MIB,
             ..CreditLoad::default()
@@ -273,7 +248,7 @@ fn the_machine_ticks_only_while_it_has_credit_work() {
     let idle = CreditWake::Load { drains_seen: None };
     assert_eq!(harness.machine.wake(), idle);
     // A live request needs no snapshot.
-    harness.step(CreditInput::AddReceive { bytes: MIB });
+    harness.add(MIB);
     assert_eq!(harness.machine.wake(), idle);
     let quiet = snapshot(harness.seq, 0);
     assert!(!idle.wakes_on(&quiet));
@@ -292,34 +267,30 @@ fn the_machine_ticks_only_while_it_has_credit_work() {
         }
     ));
     assert!(drain_wake.wakes_on(&snapshot(harness.seq, 0)));
-    harness.step(CreditInput::Drain(snapshot(harness.seq, 0)));
+    assert_eq!(harness.machine.drain(snapshot(harness.seq, 0)), receive(1));
     assert_eq!(harness.machine.wake(), idle);
 
     // Waiting output grows the window, which ticks until it drains back.
-    harness.tick(CreditLoad {
+    let _ = harness.tick(CreditLoad {
         cwnd: 4 * MIB,
         queued_send_bytes: 1,
         ..quiet
     });
     assert_eq!(harness.machine.wake(), CreditWake::Tick);
-    let grown = harness.machine.lease_id();
-    harness.step(CreditInput::SendGrown {
-        id: grown,
-        bytes: 6 * MIB,
-    });
+    harness.grown(6 * MIB);
     let idle_load = CreditLoad {
         cwnd: 4 * MIB,
         ..snapshot(harness.seq, 0)
     };
     for _ in 0..SEND_IDLE_TICKS {
         assert_eq!(harness.machine.wake(), CreditWake::Tick);
-        harness.tick(idle_load);
+        let _ = harness.tick(idle_load);
     }
     let shrunk = CreditLoad {
         limits_applied: harness.seq,
         ..idle_load
     };
-    harness.tick(shrunk);
+    let _ = harness.tick(shrunk);
     let drain_wake = harness.machine.wake();
     assert!(matches!(
         drain_wake,
@@ -334,10 +305,10 @@ fn the_machine_ticks_only_while_it_has_credit_work() {
         ..shrunk
     };
     assert!(drain_wake.wakes_on(&accepted));
-    harness.tick(accepted);
+    let _ = harness.tick(accepted);
     assert_eq!(harness.machine.wake(), idle);
 
-    harness.step(CreditInput::Closed);
+    let _ = harness.machine.close();
     assert_eq!(harness.machine.wake(), CreditWake::Never);
 }
 
@@ -346,17 +317,13 @@ enum Op {
     Add(u64),
     /// Finish the oldest live request, with this part unspent (per mille).
     Finish(u64),
-    /// A snapshot `lag` set_limits calls old, with this excess.
-    Drain {
+    /// A snapshot `lag` set_limits calls old, with this receive excess. A
+    /// tick's snapshot also carries a cwnd, queued output and newly accepted
+    /// bytes.
+    Load {
         lag: u64,
         excess: u64,
-    },
-    Tick {
-        lag: u64,
-        excess: u64,
-        cwnd: u64,
-        queued: u64,
-        accepted: u64,
+        tick: Option<(u64, u64, u64)>,
     },
     /// Answer an outstanding growth request.
     Grow(bool),
@@ -369,46 +336,65 @@ fn excess() -> impl Strategy<Value = u64> {
 }
 
 fn op() -> impl Strategy<Value = Op> {
+    let tick = (0..8 * MIB, 0..2u64, 0..2u64);
     prop_oneof![
         3 => (1..4 * MIB).prop_map(Op::Add),
         3 => (0..=1000u64).prop_map(Op::Finish),
-        3 => (0..3u64, excess()).prop_map(|(lag, excess)| Op::Drain { lag, excess }),
-        3 => (0..3u64, excess(), 0..8 * MIB, 0..2u64, 0..2u64).prop_map(
-            |(lag, excess, cwnd, queued, accepted)| Op::Tick { lag, excess, cwnd, queued, accepted }
-        ),
+        6 => (0..3u64, excess(), proptest::option::of(tick))
+            .prop_map(|(lag, excess, tick)| Op::Load { lag, excess, tick }),
         2 => any::<bool>().prop_map(Op::Grow),
         1 => Just(Op::Close),
     ]
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Kind {
-    /// An unspent receive lease; `Some(seq)` once a `set_limits` call
-    /// applied its shrink.
-    Receive(Option<u64>),
-    Growth,
-    SendDrain,
-}
-
-/// The leases the test handed the machine, as a shell would hold them.
+/// The leases the test handed the machine, in queue order, as a shell would
+/// hold them.
 #[derive(Default)]
 struct Ledger {
-    held: HashMap<CreditLeaseId, (Kind, u64)>,
+    /// Unspent receive leases: their bytes and, once a `set_limits` call
+    /// applied their shrink, its sequence number.
+    receive: VecDeque<(u64, Option<u64>)>,
+    send: VecDeque<u64>,
     active_send: u64,
-    requests: Vec<u64>,
+    requests: VecDeque<u64>,
     growth_asked: bool,
     accepted: u64,
 }
 
 impl Ledger {
+    /// Takes the leases `release` names. A receive drain released against
+    /// `load` must be one the snapshot reflects.
+    fn release(
+        &mut self,
+        release: DrainRelease,
+        load: Option<CreditLoad>,
+    ) -> Result<(), TestCaseError> {
+        prop_assert!(
+            release.receive <= self.receive.len() && release.send <= self.send.len(),
+            "released a lease it doesn't hold"
+        );
+        for (_, seq) in self.receive.drain(..release.receive) {
+            if let Some(load) = load {
+                prop_assert!(
+                    seq.is_some_and(|seq| seq <= load.limits_applied),
+                    "released a drain against a snapshot that misses its shrink"
+                );
+            }
+        }
+        self.send.drain(..release.send);
+        if release.active_send {
+            prop_assert!(self.active_send > 0);
+            self.active_send = 0;
+        }
+        Ok(())
+    }
+
     /// Bytes of held receive drains that a snapshot of call `applied` reflects.
     fn reflected_receive(&self, applied: u64) -> u64 {
-        self.held
-            .values()
-            .filter_map(|(kind, bytes)| match kind {
-                Kind::Receive(Some(seq)) if *seq <= applied => Some(*bytes),
-                _ => None,
-            })
+        self.receive
+            .iter()
+            .filter(|(_, seq)| seq.is_some_and(|seq| seq <= applied))
+            .map(|(bytes, _)| bytes)
             .sum()
     }
 }
@@ -417,11 +403,12 @@ proptest! {
     /// After every input: the machine releases only leases it holds, once; it
     /// releases a receive drain only against a snapshot that reflects its
     /// shrink, and keeps reflected drains that cover the snapshot's excess; its
-    /// send window matches the lease it keeps active; it asks for one growth
-    /// at a time; its last `SetLimits` is its current limits; and once closed
-    /// it holds nothing. Its wake ticks while the send window is above its
-    /// base, never ticks an idle connection, watches snapshots while leases
-    /// drain, and never matches the snapshot it just read (no busy loop).
+    /// queues match the leases a shell holds; its send window matches the
+    /// lease it keeps active; it asks for one growth at a time; its last
+    /// limits are its current limits; and once closed it holds nothing. Its
+    /// wake ticks while the send window is above its base, never ticks an idle
+    /// connection, watches snapshots while leases drain, and never matches the
+    /// snapshot it just read (no busy loop).
     #[test]
     fn credit_machine_invariants(ops in proptest::collection::vec(op(), 1..160)) {
         let mut harness = Harness::new();
@@ -429,36 +416,60 @@ proptest! {
         let mut output_waits = false;
         for op in ops {
             let mut load_seen = None;
-            let input = match op {
+            let mut release = DrainRelease::default();
+            let mut last_limits = None;
+            let closing = matches!(op, Op::Close);
+            let seq_before = harness.seq;
+            match op {
                 Op::Add(bytes) => {
-                    ledger.requests.push(bytes);
-                    CreditInput::AddReceive { bytes }
+                    ledger.requests.push_back(bytes);
+                    last_limits = harness.add(bytes);
                 }
                 Op::Finish(per_mille) => {
-                    if ledger.requests.is_empty() {
+                    let Some(total) = ledger.requests.pop_front() else {
                         continue;
-                    }
-                    let total = ledger.requests.remove(0);
+                    };
                     let unspent = total * per_mille / 1000;
-                    let id = harness.machine.lease_id();
-                    ledger.held.insert(id, (Kind::Receive(None), unspent));
-                    CreditInput::FinishReceive { total, unspent: Some((id, unspent)) }
+                    let finish = harness.machine.finish_receive(total, Some(unspent));
+                    if finish.drains {
+                        ledger.receive.push_back((unspent, None));
+                    }
+                    last_limits = harness.sent(finish.limits);
                 }
-                Op::Drain { lag, excess } => {
-                    let load = snapshot(harness.seq.saturating_sub(lag), excess);
-                    load_seen = Some(load);
-                    CreditInput::Drain(load)
-                }
-                Op::Tick { lag, excess, cwnd, queued, accepted } => {
-                    ledger.accepted += accepted;
-                    let load = CreditLoad {
-                        cwnd,
-                        queued_send_bytes: queued,
-                        accepted_send_bytes: ledger.accepted,
-                        ..snapshot(harness.seq.saturating_sub(lag), excess)
+                Op::Load { lag, excess, tick } => {
+                    let mut load = snapshot(harness.seq.saturating_sub(lag), excess);
+                    let step = match tick {
+                        Some((cwnd, queued, accepted)) => {
+                            ledger.accepted += accepted;
+                            load.cwnd = cwnd;
+                            load.queued_send_bytes = queued;
+                            load.accepted_send_bytes = ledger.accepted;
+                            harness.tick(load)
+                        }
+                        None => TickStep {
+                            release: harness.machine.drain(load),
+                            ..TickStep::default()
+                        },
                     };
                     load_seen = Some(load);
-                    CreditInput::Tick { load, per_peer_cap: PER_PEER_CAP, peer_floor: PEER_FLOOR }
+                    release = step.release;
+                    ledger.release(release, load_seen)?;
+                    if let Some(cap) = step.peer_cap {
+                        prop_assert!(cap <= PER_PEER_CAP);
+                    }
+                    match step.send {
+                        SendStep::Keep => {}
+                        SendStep::Grow(bytes) => {
+                            prop_assert!(bytes > 0 && !ledger.growth_asked);
+                            ledger.growth_asked = true;
+                        }
+                        SendStep::Shrink { bytes, limits } => {
+                            prop_assert!(bytes > 0 && bytes <= ledger.active_send);
+                            ledger.active_send -= bytes;
+                            ledger.send.push_back(bytes);
+                            last_limits = Some(limits);
+                        }
+                    }
                 }
                 Op::Grow(granted) => {
                     if !ledger.growth_asked {
@@ -466,77 +477,39 @@ proptest! {
                     }
                     ledger.growth_asked = false;
                     if granted {
-                        let id = harness.machine.lease_id();
-                        ledger.held.insert(id, (Kind::Growth, MIB));
-                        CreditInput::SendGrown { id, bytes: MIB }
-                    } else {
-                        CreditInput::SendRefused
-                    }
-                }
-                Op::Close => CreditInput::Closed,
-            };
-            let closing = input == CreditInput::Closed;
-            let seq_before = harness.seq;
-            let effects = harness.step(input);
-
-            let mut released_receive = false;
-            let mut last_limits = None;
-            for effect in &effects {
-                match *effect {
-                    CreditEffect::Release(id) => {
-                        let held = ledger.held.remove(&id);
-                        prop_assert!(held.is_some(), "released {id}, which it doesn't hold");
-                        if let (Some((Kind::Receive(seq), _)), Some(load)) = (held, load_seen) {
-                            released_receive = true;
-                            prop_assert!(
-                                seq.is_some_and(|seq| seq <= load.limits_applied),
-                                "released {id} against a snapshot that misses its shrink"
-                            );
+                        last_limits = harness.grown(MIB);
+                        if last_limits.is_some() {
+                            ledger.active_send += MIB;
                         }
+                    } else {
+                        harness.machine.send_refused();
                     }
-                    CreditEffect::MergeSend(id) => {
-                        let held = ledger.held.remove(&id);
-                        prop_assert!(matches!(held, Some((Kind::Growth, _))));
-                        ledger.active_send += held.map_or(0, |(_, bytes)| bytes);
-                    }
-                    CreditEffect::DrainSend { id, bytes } => {
-                        prop_assert!(bytes > 0 && bytes <= ledger.active_send);
-                        ledger.active_send -= bytes;
-                        ledger.held.insert(id, (Kind::SendDrain, bytes));
-                    }
-                    CreditEffect::ReleaseActiveSend => {
-                        prop_assert!(ledger.active_send > 0);
-                        ledger.active_send = 0;
-                    }
-                    CreditEffect::GrowSend(bytes) => {
-                        prop_assert!(bytes > 0 && !ledger.growth_asked);
-                        ledger.growth_asked = true;
-                    }
-                    CreditEffect::SetLimits(limits) => last_limits = Some(limits),
-                    CreditEffect::SetPeerCap(cap) => prop_assert!(cap <= PER_PEER_CAP),
+                }
+                Op::Close => {
+                    release = harness.machine.close();
+                    ledger.release(release, None)?;
                 }
             }
-            // The step's set_limits call applied every shrink it made.
+            // The op's set_limits call applied every shrink it made.
             if harness.seq > seq_before {
-                for (kind, _) in ledger.held.values_mut() {
-                    if *kind == Kind::Receive(None) {
-                        *kind = Kind::Receive(Some(harness.seq));
-                    }
+                for (_, seq) in ledger.receive.iter_mut().filter(|(_, seq)| seq.is_none()) {
+                    *seq = Some(harness.seq);
                 }
-            }
-            if released_receive {
-                let load = load_seen.expect("only a snapshot releases a drain before close");
-                prop_assert!(ledger.reflected_receive(load.limits_applied) >= load.receive_credit_excess);
             }
             if let Some(limits) = last_limits {
                 prop_assert_eq!(limits, harness.machine.limits());
             }
+            if let Some(load) = load_seen.filter(|_| release.receive > 0) {
+                prop_assert!(ledger.reflected_receive(load.limits_applied) >= load.receive_credit_excess);
+            }
+            prop_assert_eq!(harness.machine.receive_drains.len(), ledger.receive.len());
+            prop_assert_eq!(harness.machine.send_drains.len(), ledger.send.len());
             prop_assert_eq!(harness.machine.send_window(), BASE_SEND + ledger.active_send);
             if let Some(load) = load_seen {
-                output_waits = load.queued_send_bytes > 0 || load.send_blocked_streams > 0;
+                output_waits = load.output_waits();
             }
             let wake = harness.machine.wake();
-            let drains = ledger.held.values().any(|(kind, _)| *kind != Kind::Growth);
+            let drains = !ledger.receive.is_empty() || !ledger.send.is_empty();
             if harness.machine.has_drains() || ledger.active_send > 0 || output_waits {
                 prop_assert_ne!(wake, CreditWake::Load { drains_seen: None });
             }
@@ -551,7 +524,7 @@ proptest! {
             }
             if closing {
                 prop_assert_eq!(wake, CreditWake::Never);
-                prop_assert!(ledger.held.values().all(|(kind, _)| *kind == Kind::Growth));
+                prop_assert!(ledger.receive.is_empty() && ledger.send.is_empty());
                 prop_assert_eq!(ledger.active_send, 0);
                 prop_assert!(!harness.machine.has_drains());
             }

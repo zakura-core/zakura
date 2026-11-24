@@ -1636,6 +1636,16 @@ mod tests {
             took
         }
 
+        /// Fills the window like [`Self::fill`], then has the task accept the
+        /// stream.
+        async fn fill_and_accept(&mut self) -> u64 {
+            let took = self.fill();
+            let (reply, accepted) = oneshot::channel();
+            self.task.handle_cmd(ConnCmd::AcceptBi { reply });
+            assert_eq!(accepted.await.unwrap().unwrap(), self.stream);
+            took
+        }
+
         /// Reads up to `max` bytes straight from quinn-proto, bypassing the
         /// task, and delivers the credit the read frees.
         fn read_direct(&mut self, max: u64) -> u64 {
@@ -1756,10 +1766,7 @@ mod tests {
     async fn held_credit_bounds_a_greedy_peer() {
         for seed in 1..=8u64 {
             let mut pair = CreditPair::connected();
-            pair.fill();
-            let (reply, accepted) = oneshot::channel();
-            pair.task.handle_cmd(ConnCmd::AcceptBi { reply });
-            assert_eq!(accepted.await.unwrap().unwrap(), pair.stream);
+            pair.fill_and_accept().await;
 
             let mut rng = seed;
             let mut next = |bound: u64| {
@@ -1930,10 +1937,7 @@ mod tests {
     #[tokio::test]
     async fn a_stop_repays_the_shrink_debt_of_its_discarded_bytes() {
         let mut pair = CreditPair::connected();
-        assert_eq!(pair.fill(), WINDOW);
-        let (reply, accepted) = oneshot::channel();
-        pair.task.handle_cmd(ConnCmd::AcceptBi { reply });
-        assert_eq!(accepted.await.unwrap().unwrap(), pair.stream);
+        assert_eq!(pair.fill_and_accept().await, WINDOW);
 
         // Halving the window under unread bytes leaves half the credit with
         // the peer until reads repay it.
@@ -1966,10 +1970,7 @@ mod tests {
     #[tokio::test]
     async fn shrink_then_grow_receive_window_does_not_leak_credit() {
         let mut pair = CreditPair::connected();
-        assert_eq!(pair.fill(), WINDOW);
-        let (reply, accepted) = oneshot::channel();
-        pair.task.handle_cmd(ConnCmd::AcceptBi { reply });
-        assert_eq!(accepted.await.unwrap().unwrap(), pair.stream);
+        assert_eq!(pair.fill_and_accept().await, WINDOW);
 
         // Shrink by half and grow back 10 times with zero reads in between.
         for _ in 0..10 {

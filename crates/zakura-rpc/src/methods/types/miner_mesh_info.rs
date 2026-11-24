@@ -86,8 +86,8 @@ pub struct MeshWindow {
     /// The best tip height the counts follow, or null before the first tip.
     pub tip: Option<u32>,
 
-    /// The newest height that counts, 100 below the tip, or null while the
-    /// tip is below 100.
+    /// The newest height that counts, 10 below the tip, or null while the
+    /// tip is below 10.
     pub newest: Option<u32>,
 
     /// The oldest height that counts: about two days of blocks below
@@ -98,7 +98,7 @@ pub struct MeshWindow {
     pub checked: usize,
 
     /// The share of the window read, from 0 to 1. Until it reaches 1 the
-    /// block counts are a lower bound. A tip below 100 has an empty window,
+    /// block counts are a lower bound. A tip below 10 has an empty window,
     /// which is complete, so it reports 1.
     pub coverage: f64,
 }

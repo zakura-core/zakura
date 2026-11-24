@@ -4,7 +4,7 @@ use proptest::prelude::*;
 
 use crate::{
     block::Height,
-    miner_mesh::window::window,
+    miner_mesh::window::{window, QUALIFYING_DEPTH},
     parameters::{
         testnet::{ConfiguredActivationHeights, RegtestParameters},
         Network, NetworkUpgrade,
@@ -18,7 +18,8 @@ const TWO_DAYS: i64 = 172_800;
 
 /// The number of heights in the window at `tip`.
 fn window_len(network: &Network, tip: u32) -> usize {
-    let window = window(network, Height(tip)).expect("the tip is at height 100 or above");
+    let window = window(network, Height(tip))
+        .expect("every tip these tests use is at least the qualifying depth");
     (window.start().0..=window.end().0).count()
 }
 
@@ -41,21 +42,24 @@ fn oldest_by_walking(network: &Network, newest: u32) -> u32 {
 }
 
 #[test]
-fn nothing_counts_until_the_tip_reaches_height_100() {
+fn nothing_counts_until_the_tip_reaches_the_qualifying_depth() {
     let network = network_with_nu7(None);
 
     assert_eq!(window(&network, Height(0)), None);
-    assert_eq!(window(&network, Height(99)), None);
-    assert_eq!(window(&network, Height(100)), Some(Height(0)..=Height(0)));
+    assert_eq!(window(&network, Height(QUALIFYING_DEPTH - 1)), None);
+    assert_eq!(
+        window(&network, Height(QUALIFYING_DEPTH)),
+        Some(Height(0)..=Height(0)),
+    );
 }
 
 #[test]
-fn the_newest_counted_block_is_100_below_the_tip() {
+fn the_newest_counted_block_is_10_below_the_tip() {
     let network = network_with_nu7(None);
 
     assert_eq!(
         window(&network, Height(10_000)),
-        Some(Height(7_597)..=Height(9_900)),
+        Some(Height(7_687)..=Height(9_990)),
     );
 }
 
@@ -63,7 +67,10 @@ fn the_newest_counted_block_is_100_below_the_tip() {
 fn a_young_chain_counts_back_to_genesis() {
     let network = network_with_nu7(None);
 
-    assert_eq!(window(&network, Height(150)), Some(Height(0)..=Height(50)));
+    assert_eq!(
+        window(&network, Height(50 + QUALIFYING_DEPTH)),
+        Some(Height(0)..=Height(50)),
+    );
 }
 
 #[test]
@@ -84,14 +91,17 @@ fn the_window_grows_block_by_block_after_the_spacing_shortens() {
     let network = network_with_nu7(Some(Height(nu7)));
 
     // The newest block is the last one before NU7: nothing has changed yet.
-    assert_eq!(window_len(&network, nu7 - 1 + 100), 2_304);
+    assert_eq!(window_len(&network, nu7 - 1 + QUALIFYING_DEPTH), 2_304);
     // Three 25-second blocks stand in for one 75-second block, so the window
     // gains two heights for every three blocks after NU7.
-    assert_eq!(window_len(&network, nu7 + 2 + 100), 2_304 + 2);
-    assert_eq!(window_len(&network, nu7 + 299 + 100), 2_304 + 200);
+    assert_eq!(window_len(&network, nu7 + 2 + QUALIFYING_DEPTH), 2_304 + 2);
+    assert_eq!(
+        window_len(&network, nu7 + 299 + QUALIFYING_DEPTH),
+        2_304 + 200
+    );
     // Two days after NU7 every counted block is 25 seconds from its parent.
-    assert_eq!(window_len(&network, nu7 + 6_911 + 100), 6_912);
-    assert_eq!(window_len(&network, nu7 + 6_912 + 100), 6_912);
+    assert_eq!(window_len(&network, nu7 + 6_911 + QUALIFYING_DEPTH), 6_912);
+    assert_eq!(window_len(&network, nu7 + 6_912 + QUALIFYING_DEPTH), 6_912);
 }
 
 /// The window matches a block-by-block walk on the public networks around
@@ -125,7 +135,7 @@ fn the_window_matches_a_block_by_block_walk_on_real_networks() {
             // point where the window no longer reaches back to it.
             for newest in (change.saturating_sub(3)..change + 7_000).step_by(97) {
                 assert_eq!(
-                    window(&network, Height(newest + 100)),
+                    window(&network, Height(newest + QUALIFYING_DEPTH)),
                     Some(Height(oldest_by_walking(&network, newest))..=Height(newest)),
                     "{network} with the newest counted block at {newest}",
                 );
@@ -140,10 +150,10 @@ proptest! {
     #[test]
     fn the_window_matches_a_block_by_block_walk(
         nu7 in 3..12_000u32,
-        tip in 100..24_000u32,
+        tip in QUALIFYING_DEPTH..24_000u32,
     ) {
         let network = network_with_nu7(Some(Height(nu7)));
-        let newest = tip - 100;
+        let newest = tip - QUALIFYING_DEPTH;
 
         prop_assert_eq!(
             window(&network, Height(tip)),

@@ -6,13 +6,13 @@ use proptest::{collection::vec, prelude::*};
 
 use crate::{
     block::{self, Height},
-    miner_mesh::{GatewayBlocks, GatewayId, MinerMeshCommitment, RecentMinerSet},
+    miner_mesh::{GatewayBlocks, GatewayId, MinerMeshCommitment, RecentMinerSet, QUALIFYING_DEPTH},
 };
 
 use super::network_with_nu7;
 
 /// A tip whose window is the 2,304 heights from 7,597 to 9,900.
-const TIP: Height = Height(10_000);
+const TIP: Height = Height(NEWEST.0 + QUALIFYING_DEPTH);
 const OLDEST: Height = Height(7_597);
 const NEWEST: Height = Height(9_900);
 
@@ -239,13 +239,14 @@ fn coverage_is_complete_only_when_every_height_is_read() {
     assert!(!set.snapshot().is_complete());
     assert_eq!(set.snapshot().window_len(), 0);
 
-    // A tip below height 100 has nothing to read.
-    set.set_tip(Height(99), hash(0));
+    // A tip below the qualifying depth has nothing to read.
+    set.set_tip(Height(QUALIFYING_DEPTH - 1), hash(0));
     assert!(set.snapshot().is_complete());
     assert_eq!(set.snapshot().window_len(), 0);
 
     // The window is the six heights from genesis to 5.
-    set.set_tip(Height(105), hash(0));
+    let tip = Height(5 + QUALIFYING_DEPTH);
+    set.set_tip(tip, hash(0));
     for height in 0..5 {
         set.record(Height(height), hash(1), None);
     }
@@ -258,7 +259,7 @@ fn coverage_is_complete_only_when_every_height_is_read() {
     let complete = set.snapshot();
     assert!(complete.is_complete());
     assert_eq!(complete.gateways, []);
-    assert_eq!(complete.tip, Some((Height(105), hash(0))));
+    assert_eq!(complete.tip, Some((tip, hash(0))));
 }
 
 #[test]
@@ -266,7 +267,7 @@ fn unread_heights_are_listed_newest_first() {
     let mut set = RecentMinerSet::new(network_with_nu7(None));
     assert_eq!(set.unchecked_heights().next(), None);
 
-    set.set_tip(Height(105), hash(0));
+    set.set_tip(Height(5 + QUALIFYING_DEPTH), hash(0));
     set.record(Height(4), hash(1), None);
     set.record(Height(1), hash(1), None);
 
@@ -322,9 +323,10 @@ proptest! {
                     model.retain(|checked, _| *checked <= height);
                 }
             }
-            // A height counts from 100 below the tip back 2,304 blocks.
+            // A height counts from the qualifying depth below the tip back
+            // 2,304 blocks.
             let counts = |height: u32| {
-                tip.and_then(|tip: u32| tip.checked_sub(100))
+                tip.and_then(|tip: u32| tip.checked_sub(QUALIFYING_DEPTH))
                     .is_some_and(|newest| height <= newest && newest - height < 2_304)
             };
             model.retain(|height, _| counts(*height));

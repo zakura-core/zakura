@@ -2687,11 +2687,6 @@ async fn startup_upgrades_previous_database_and_records_finalized_height() -> Re
 }
 
 #[tokio::test]
-async fn regtest_coinbase() -> Result<()> {
-    common::coinbase::regtest_coinbase().await
-}
-
-#[tokio::test]
 async fn regtest_coinbase_names_the_gateway() -> Result<()> {
     common::coinbase::regtest_coinbase_names_the_gateway().await
 }

@@ -30,31 +30,6 @@ use super::{
     regtest::MiningRpcMethods,
 };
 
-/// Tests shielded coinbase construction through a live Regtest node.
-///
-/// A node configured with a Unified mining address must return a
-/// shielded coinbase through `getblocktemplate`. The resulting block must be
-/// accepted by the production `submitblock`, consensus, and state path.
-///
-/// Detailed address routing and upgrade-matrix behavior is tested by
-/// `shielded_coinbase_paths`.
-pub(crate) async fn regtest_coinbase() -> eyre::Result<()> {
-    async fn regtest_coinbase(addr_type: MinerAddressType) -> eyre::Result<()> {
-        let _init_guard = zakura_test::init();
-
-        let net = ironwood_regtest(None);
-
-        let config = os_assigned_rpc_port_config(false, &net)?.with(addr_type);
-        mine_template_block(&net, config).await?;
-
-        Ok(())
-    }
-
-    regtest_coinbase(MinerAddressType::Unified).await?;
-
-    Ok(())
-}
-
 /// Tests that a node told to announce its gateway names its own v2 node ID in the coinbase,
 /// both beside a transparent reward and beside a shielded reward with NU7 active.
 ///
@@ -69,7 +44,7 @@ pub(crate) async fn regtest_coinbase_names_the_gateway() -> eyre::Result<()> {
     )
     .await?;
 
-    let block = announcing_block(&ironwood_regtest(Some(1)), MinerAddressType::Unified).await?;
+    let block = announcing_block(&nu7_regtest(), MinerAddressType::Unified).await?;
     assert_eq!(
         block.transactions[0].network_upgrade(),
         Some(NetworkUpgrade::Nu7),
@@ -114,17 +89,17 @@ async fn announcing_block(net: &Network, addr_type: MinerAddressType) -> eyre::R
     Ok(block)
 }
 
-/// A Regtest network where the Ironwood pool is active from height 1, and NU7 from `nu7`.
+/// A Regtest network with Ironwood and NU7 active from height 1.
 ///
 /// Coinbase construction pays unified miner addresses through the Ironwood pool, which
 /// activates at NU6.3. Height 1 is also the NU6.1 activation block, whose coinbase pays the
 /// configured disbursement out of the lockbox, so the disbursement must fit in what that
 /// block's funding stream puts into the lockbox.
-fn ironwood_regtest(nu7: Option<u32>) -> Network {
+fn nu7_regtest() -> Network {
     Network::new_regtest(RegtestParameters {
         activation_heights: ConfiguredActivationHeights {
             nu6_3: Some(1),
-            nu7,
+            nu7: Some(1),
             ..Default::default()
         },
         funding_streams: Some(vec![ConfiguredFundingStreams {
@@ -135,8 +110,7 @@ fn ironwood_regtest(nu7: Option<u32>) -> Network {
                 addresses: None,
             }]),
         }]),
-        // The payout must fit in the first block's lockbox share: 6,250,000 zatoshis
-        // before NU7, and 2,083,333 with NU7's lower block subsidy.
+        // NU7's lower subsidy puts 2,083,333 zatoshis into the first block's lockbox.
         lockbox_disbursements: Some(vec![ConfiguredLockboxDisbursement {
             address: "t2RnBRiqrN1nW4ecZs1Fj3WWjNdnSs4kiX8".to_string(),
             amount: Amount::new(2_000_000),

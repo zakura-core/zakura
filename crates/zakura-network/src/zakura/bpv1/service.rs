@@ -40,7 +40,7 @@ use super::{
         CommitmentFields, COMMITMENT_PAYLOAD_LEN,
     },
     config::{HavePacing, ZakuraBpv1Config, PATH_POLL_INTERVAL},
-    memory::{Bpv1Memory, ASSEMBLED_BLOCK_BYTES},
+    memory::{Bpv1Memory, Leased, ASSEMBLED_BLOCK_BYTES},
     paths::{Arrival, PathEstimate},
     peer::{
         stall_timeout, DropReason, PartAuth, PartToken, PeerEvent, PeerInput, PeerOutput,
@@ -146,8 +146,11 @@ struct SharedNode {
     chain_id: [u8; 32],
     local_node: NodeId,
     next_session_gen: AtomicU64,
-    table: Mutex<BlockTable>,
-    proposer: Mutex<ProposerState>,
+    /// The block table beside the `Propagation` lease that covers it.
+    table: Mutex<Leased<BlockTable>>,
+    /// The proposer beside the `Propagation` lease that covers its prepared
+    /// encodings.
+    proposer: Mutex<Leased<ProposerState>>,
     sessions: Mutex<HashMap<NodeId, LiveSession>>,
     header_admission: Arc<dyn HeaderAdmissionPort>,
     body_store: Arc<dyn BodyStorePort>,
@@ -162,8 +165,7 @@ struct SharedNode {
     /// In-flight encodes that other templates can join, keyed by
     /// body identity.
     encodes: Mutex<HashMap<[u8; 32], EncodeResults>>,
-    /// The `Propagation` leases that cover what the table and the proposer
-    /// hold.
+    /// The pool that leases each encode and each assembled block.
     memory: Bpv1Memory,
 }
 
@@ -182,30 +184,24 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl SharedNode {
-    fn lock_table(&self) -> MutexGuard<'_, BlockTable> {
+    fn lock_table(&self) -> MutexGuard<'_, Leased<BlockTable>> {
         lock(&self.table)
     }
 
     /// Runs `change` on the table, then resizes the table's lease to what the
     /// table now holds, under the same lock.
     fn change_table<R>(&self, change: impl FnOnce(&mut BlockTable) -> R) -> R {
-        let mut table = self.lock_table();
-        let result = change(&mut table);
-        self.memory.fund_table(table.lease_bytes());
-        result
+        self.lock_table().change(change)
     }
 
-    fn lock_proposer(&self) -> MutexGuard<'_, ProposerState> {
+    fn lock_proposer(&self) -> MutexGuard<'_, Leased<ProposerState>> {
         lock(&self.proposer)
     }
 
     /// Steps the proposer with `input`, then resizes the proposer's lease to
     /// what its prepared encodings hold, under the same lock.
     fn step_proposer(&self, input: ProposerInput) -> ProposerStep {
-        let mut proposer = self.lock_proposer();
-        let step = proposer.step(input);
-        self.memory.fund_proposer(proposer.prepared_bytes());
-        step
+        self.lock_proposer().change(|proposer| proposer.step(input))
     }
 
     fn lock_sessions(&self) -> MutexGuard<'_, HashMap<NodeId, LiveSession>> {
@@ -891,12 +887,15 @@ impl Bpv1Service {
         } = startup;
         let chain_id = network.genesis_hash().0;
         let (driver_tx, driver_rx) = mpsc::unbounded_channel();
+        let memory = Bpv1Memory::new(memory_pool);
         let node = Arc::new(SharedNode {
-            table: Mutex::new(BlockTable::new(config.block_config(profile, have_pacing))),
-            proposer: Mutex::new(ProposerState::new(ProposerConfig {
+            table: Mutex::new(
+                memory.leased(BlockTable::new(config.block_config(profile, have_pacing))),
+            ),
+            proposer: Mutex::new(memory.leased(ProposerState::new(ProposerConfig {
                 direct_copies: config.proposer_direct_copies,
                 ..ProposerConfig::new(chain_id, local_node)
-            })),
+            }))),
             sessions: Mutex::new(HashMap::new()),
             header_admission: ports.header_admission,
             body_store: ports.body_store,
@@ -914,7 +913,7 @@ impl Bpv1Service {
             shutdown,
             next_template_id: AtomicU64::new(1),
             encodes: Mutex::new(HashMap::new()),
-            memory: Bpv1Memory::new(memory_pool),
+            memory,
         });
 
         let driver_node = Arc::clone(&node);
@@ -1178,7 +1177,7 @@ async fn run_bpv1_driver(
                 // race past a peer's `SessionEnded` cleanup (`bpv1-65`).
                 let steps: Vec<BlockStep> = {
                     let sessions = node.lock_sessions();
-                    let mut table = node.lock_table();
+                    node.change_table(|table| {
                     let now = Instant::now();
                     let mut out = Vec::new();
                     for (peer, live) in sessions.iter() {
@@ -1197,8 +1196,8 @@ async fn run_bpv1_driver(
                         .set(table.paths().len() as f64);
                     metrics::gauge!("zakura.p2p.bpv1.path.unmeasured_peers")
                         .set(table.paths().unmeasured_pull_peers() as f64);
-                    node.memory.fund_table(table.lease_bytes());
                     out
+                    })
                 };
                 for step in steps {
                     node.dispatch_block_step(step);

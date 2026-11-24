@@ -7,20 +7,19 @@
 //! - Each admitted session holds its base from `Consumer::Sessions`: its
 //!   unsolicited receive credit, its output gates for `Want` serving and
 //!   pushes, its held frames and its early records.
-//! - [`Bpv1Memory`] is the IO shell's side: it holds the `Propagation`
-//!   leases and resizes them to the sizes the machines report.
+//! - [`Leased`] is the IO shell's side: it holds each machine beside the
+//!   `Propagation` lease that covers it and resizes the lease to the size
+//!   the machine reports. [`Bpv1Memory`] leases each encode and each
+//!   assembled block.
 
-use zakura_rt::sync::{
-    atomic::{AtomicU64, Ordering},
-    Mutex, MutexGuard, PoisonError,
-};
+use std::ops::Deref;
 
 use super::{
     blocks::BlockTable,
     config::{ZakuraBpv1Config, BPV1_SESSION_HELD_OUTPUT_BYTES},
     peer::EARLY_CONTROL_BYTES,
     profile::{Profile, PART_PROOF_BYTES},
-    proposer::MAX_PREPARED_ENCODINGS,
+    proposer::{ProposerState, MAX_PREPARED_ENCODINGS},
     wire::{BPV1_CONTROL_BUDGET, BPV1_DATA_BUDGET},
 };
 use crate::zakura::{
@@ -118,49 +117,24 @@ pub fn block_push_bytes(profile: Profile) -> u64 {
         .saturating_mul(frame)
 }
 
-/// The `Propagation` leases BPv1's IO shell holds, by what they cover.
-///
-/// The machines report the bytes they hold, and the shell resizes the
-/// matching lease. The reserve covers every lease, so a refusal of the table
-/// or proposer lease is a sizing bug: it counts
-/// `zakura.p2p.bpv1.propagation.lease_refused` and the simulator asserts it.
+/// The pool that funds BPv1's `Propagation` leases.
 pub(super) struct Bpv1Memory {
     pool: MemoryPool,
-    /// What `table` holds, read under the table lock to skip `table`'s lock
-    /// while the size doesn't change.
-    table_bytes: AtomicU64,
-    /// Covers [`BlockTable::lease_bytes`].
-    table: Mutex<PoolLease>,
-    /// Covers [`super::proposer::ProposerState::prepared_bytes`].
-    proposer: Mutex<PoolLease>,
 }
 
 impl Bpv1Memory {
-    /// Leases that fund BPv1 from `pool`'s `Consumer::Propagation`.
+    /// Funds BPv1 from `pool`'s `Consumer::Propagation`.
     pub(super) fn new(pool: MemoryPool) -> Self {
-        Self {
-            table_bytes: AtomicU64::new(0),
-            table: Mutex::new(pool.empty_lease(Consumer::Propagation, None)),
-            proposer: Mutex::new(pool.empty_lease(Consumer::Propagation, None)),
-            pool,
-        }
+        Self { pool }
     }
 
-    /// Resizes the table lease to `bytes`. The caller holds the table lock,
-    /// so sizes apply in the order the table reports them.
-    pub(super) fn fund_table(&self, bytes: u64) {
-        if self.table_bytes.load(Ordering::Acquire) == bytes {
-            return;
+    /// `machine` with an empty `Propagation` lease, which its first change
+    /// sizes.
+    pub(super) fn leased<M>(&self, machine: M) -> Leased<M> {
+        Leased {
+            machine,
+            lease: self.pool.empty_lease(Consumer::Propagation, None),
         }
-        let mut lease = lock(&self.table);
-        resize(&mut lease, bytes);
-        self.table_bytes.store(lease.bytes(), Ordering::Release);
-    }
-
-    /// Resizes the proposer lease to `bytes`. The caller holds the proposer
-    /// lock, so sizes apply in the order the proposer reports them.
-    pub(super) fn fund_proposer(&self, bytes: u64) {
-        resize(&mut lock(&self.proposer), bytes);
     }
 
     /// A lease of `bytes` for one encode or one assembled block, or `None`
@@ -179,16 +153,59 @@ impl Bpv1Memory {
     }
 }
 
-/// Resizes `lease` to `bytes`, keeping its size when the reserve refuses.
-fn resize(lease: &mut PoolLease, bytes: u64) {
-    if lease.try_grow_to(bytes).is_err() {
-        metrics::counter!("zakura.p2p.bpv1.propagation.lease_refused").increment(1);
-        #[cfg(zakura_sim)]
-        panic!("Propagation refused a {bytes}-byte BPv1 lease that its reserve covers (mem-5)");
+/// A pure machine whose held bytes one `Propagation` lease covers.
+pub(super) trait LeaseSized {
+    /// The bytes the machine's lease covers now.
+    fn lease_bytes(&self) -> u64;
+}
+
+impl LeaseSized for BlockTable {
+    fn lease_bytes(&self) -> u64 {
+        BlockTable::lease_bytes(self)
     }
 }
 
-/// Locks `mutex`, taking the value even if a panicking holder poisoned it.
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+impl LeaseSized for ProposerState {
+    fn lease_bytes(&self) -> u64 {
+        self.prepared_bytes()
+    }
+}
+
+/// A machine and the `Propagation` lease that covers what it holds.
+///
+/// The shell keeps it inside the machine's lock, so the lock order is
+/// structural: the machine's lock, then the pool's. Reads go through
+/// `Deref`. Only [`Self::change`] changes the machine, and it resizes the
+/// lease before it returns, so sizes apply in the order the machine reports
+/// them.
+///
+/// The reserve covers every such lease, so a refused resize is a sizing bug:
+/// it counts `zakura.p2p.bpv1.propagation.lease_refused` and the simulator
+/// asserts it.
+pub(super) struct Leased<M> {
+    machine: M,
+    lease: PoolLease,
+}
+
+impl<M: LeaseSized> Leased<M> {
+    /// Runs `change` on the machine, then resizes the lease to what the
+    /// machine now holds. A refused resize keeps the lease's size.
+    pub(super) fn change<R>(&mut self, change: impl FnOnce(&mut M) -> R) -> R {
+        let result = change(&mut self.machine);
+        let bytes = self.machine.lease_bytes();
+        if self.lease.bytes() != bytes && self.lease.try_grow_to(bytes).is_err() {
+            metrics::counter!("zakura.p2p.bpv1.propagation.lease_refused").increment(1);
+            #[cfg(zakura_sim)]
+            panic!("Propagation refused a {bytes}-byte BPv1 lease that its reserve covers (mem-5)");
+        }
+        result
+    }
+}
+
+impl<M> Deref for Leased<M> {
+    type Target = M;
+
+    fn deref(&self) -> &M {
+        &self.machine
+    }
 }

@@ -332,9 +332,9 @@ pub struct PullPeerState {
 /// Synchronous input to [`BlockTable::step`].
 #[derive(Clone, Debug)]
 pub enum BlockInput {
-    /// Headerchain / chain tip height updated (`bpv1-7`, `bpv1-46`).
+    /// The verified chain tip moved (`bpv1-7`, `bpv1-46`, `bpv1-76`).
     TipHeight {
-        /// New tip height.
+        /// Height of the new verified tip.
         height: u32,
     },
     /// A parent header was admitted into headerchain, waking pending metadata (`bpv1-11`).
@@ -1212,6 +1212,9 @@ pub struct BlockTable {
     config: BlockConfig,
     next_work_id: u64,
     top: u32,
+    /// Height of the verified tip. Metadata more than `PROPAGATION_DEPTH` above it belongs to
+    /// block sync (`bpv1-76`).
+    verified: u32,
     paths: PeerPaths,
     /// Metadata currently in `HeaderAdmission` or `VerifyCommitment`.
     admitting: HashMap<block::Hash, AdmittingEntry>,
@@ -1232,6 +1235,7 @@ impl BlockTable {
             config,
             next_work_id: 1,
             top: 0,
+            verified: 0,
             paths: PeerPaths::new(),
             admitting: HashMap::new(),
             work_to_block: HashMap::new(),
@@ -1405,7 +1409,10 @@ impl BlockTable {
     pub fn step(&mut self, now: Instant, input: BlockInput) -> BlockStep {
         let mut step = BlockStep::default();
         match input {
-            BlockInput::TipHeight { height } => self.raise_top(height, &mut step),
+            BlockInput::TipHeight { height } => {
+                self.verified = height;
+                self.raise_top(height, &mut step);
+            }
             BlockInput::ParentAdmitted { hash, height } => {
                 self.raise_top(height, &mut step);
                 self.wake_pending_for_parent(hash, &mut step);
@@ -1572,6 +1579,18 @@ impl BlockTable {
         height.saturating_add(PROPAGATION_DEPTH) > self.top
     }
 
+    /// Whether BPv1 may admit a block at `height`: inside the propagation window
+    /// (`bpv1-7`) and at most `PROPAGATION_DEPTH` above the verified tip (`bpv1-76`).
+    ///
+    /// While a node catches up, header sync runs near the network tip and raises
+    /// `top` far above the verified tip. A block that high cannot commit until block
+    /// sync delivers its ancestors, so block sync owns it, as legacy gossip's
+    /// verified-tip lookahead does.
+    fn admissible_height(&self, height: u32) -> bool {
+        self.in_propagation_window(height)
+            && height <= self.verified.saturating_add(PROPAGATION_DEPTH)
+    }
+
     fn handle_meta_received(
         &mut self,
         arrived_at: Instant,
@@ -1680,7 +1699,7 @@ impl BlockTable {
                 // An admitted header need not be selected: headerchain also
                 // retains forks and future-dated headers. Only the verified tip,
                 // the best header-valid height, and local solved blocks raise `top`.
-                if !self.in_propagation_window(height) {
+                if !self.admissible_height(height) {
                     if let Some(removed) = self.admitting.remove(&block_id) {
                         reject_meta(step, block_id, removed.from_peer, removed.session_gen);
                         reject_also(step, block_id, &removed.also_from);
@@ -1898,9 +1917,9 @@ impl BlockTable {
         }
 
         let height = entry.height.unwrap_or(self.top);
-        // Recheck propagation window after async commitment work
+        // Recheck the window after async commitment work
         // in case `top` advanced while commitment verification was running.
-        if !self.in_propagation_window(height) {
+        if !self.admissible_height(height) {
             reject_meta(step, block_id, entry.from_peer, entry.session_gen);
             reject_also(step, block_id, &entry.also_from);
             return;
@@ -2912,11 +2931,11 @@ impl BlockTable {
     }
 
     fn retire_out_of_window(&mut self, step: &mut BlockStep) {
-        let min_keep = self.top.saturating_sub(PROPAGATION_DEPTH);
+        // bpv1-7: retire exactly the heights admission refuses.
         let to_retire: Vec<block::Hash> = self
             .blocks
             .values()
-            .filter(|b| b.phase != BlockPhase::Retired && b.height < min_keep)
+            .filter(|b| b.phase != BlockPhase::Retired && !self.in_propagation_window(b.height))
             .map(|b| b.meta.block_id)
             .collect();
         for id in to_retire {

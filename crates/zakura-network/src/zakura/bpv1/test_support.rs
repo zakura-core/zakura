@@ -279,8 +279,34 @@ impl BlockVerifierPort for ScriptedVerifier {
     }
 }
 
+/// A committed snapshot whose verified tip and best header are both at `height`.
+fn snapshot_at(height: u32) -> zakura_header_chain::EngineSnapshot {
+    let tip = zakura_header_chain::Frontier {
+        height: Height(height),
+        hash: block::Hash([0xEE; 32]),
+    };
+    zakura_header_chain::EngineSnapshot {
+        mode: zakura_header_chain::EngineMode::Integrated,
+        state_version: zakura_header_chain::StateVersion::new(1),
+        header_generation: zakura_header_chain::HeaderGeneration::new(1),
+        verified_generation: zakura_header_chain::VerifiedGeneration::new(1),
+        frontiers: zakura_header_chain::FrontierSet {
+            finalized: tip,
+            header_best: tip,
+            verified_best: tip,
+        },
+        header_best_score: zakura_header_chain::ChainScore::new(
+            zakura_header_chain::SuffixWork::zero(),
+            tip.hash,
+        ),
+        oldest_retained_height: tip.height,
+        alarms: zakura_header_chain::AlarmSet::default(),
+    }
+}
+
 /// Ports that admit every header at `height`, keep bodies in a four-block
-/// pool, verify with `verifier`, and claim bodies in `claims`.
+/// pool, verify with `verifier`, and claim bodies in `claims`. The committed
+/// snapshot puts the verified tip at the parent height.
 pub(super) fn ports(
     height: u32,
     verifier: impl BlockVerifierPort,
@@ -293,7 +319,7 @@ pub(super) fn ports(
         ))),
         verifier: Arc::new(verifier),
         fallback: Arc::new(claims),
-        committed_snapshots: watch::channel(None).1,
+        committed_snapshots: watch::channel(Some(snapshot_at(height.saturating_sub(1)))).1,
     }
 }
 

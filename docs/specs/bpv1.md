@@ -244,8 +244,11 @@ block it proposed. `top` never decreases. A header that headerchain retains
 but has not selected, such as a fork or a future-dated header, does not raise
 `top`. A node MUST NOT admit
 metadata for a block at or below `top - PROPAGATION_DEPTH` (strictly
-`height + PROPAGATION_DEPTH > top`). Such a block uses the existing
-block-download path.
+`height + PROPAGATION_DEPTH > top`). A node also MUST NOT admit metadata for a
+block more than `PROPAGATION_DEPTH` above its verified tip. While a node catches
+up, header sync raises `top` far above the verified tip, and such a block cannot
+commit until its ancestors arrive. A node retires a block once it falls out of
+the window admission uses. Such blocks use the existing block-download path.
 
 The coinbase commitment binds `proposer_node` to the block. A node therefore
 accepts relay flags only from the connection authenticated as `proposer_node`,

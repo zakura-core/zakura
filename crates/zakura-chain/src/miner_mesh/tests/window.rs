@@ -54,12 +54,11 @@ fn nothing_counts_until_the_tip_reaches_the_qualifying_depth() {
 }
 
 #[test]
-fn the_newest_counted_block_is_10_below_the_tip() {
-    let network = network_with_nu7(None);
-
+fn mainnet_counts_two_days_of_25_second_blocks_ending_10_below_the_tip() {
+    // The first full window starting at NU7 has 6,912 heights and ten blocks above it.
     assert_eq!(
-        window(&network, Height(10_000)),
-        Some(Height(7_687)..=Height(9_990)),
+        window(&Network::Mainnet, Height(3_550_326)),
+        Some(Height(3_543_405)..=Height(3_550_316)),
     );
 }
 

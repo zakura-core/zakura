@@ -238,15 +238,7 @@ impl Fixture {
             NonZeroU64::new(id).unwrap(),
         );
         assert_eq!(taken.items().len(), 2);
-        taken
-            .admit_for_connection(
-                block::Height(0),
-                block::Height(0),
-                0,
-                None,
-                self.cancel.clone(),
-            )
-            .unwrap()
+        admit(taken, self.cancel.clone()).unwrap()
     }
 
     fn expire(&mut self, owner: BodyWorkOwner) {
@@ -436,6 +428,15 @@ fn batched_ownership_filter_follows_publication_receipt_and_replacement() {
         vec![(block::Height(2), (replacement.owner(), 22))],
         "a later stale entry for the same height must not hide its current owner",
     );
+}
+
+/// Admits `taken` for connection 0, with the floor and the verified tip at
+/// genesis.
+fn admit(
+    taken: TakenRequest,
+    cancel: CancellationToken,
+) -> Result<UnpublishedRequest, AdmitRefusal> {
+    taken.admit_for_connection(block::Height(0), block::Height(0), 0, None, cancel)
 }
 
 fn publish(claim: UnpublishedRequest, sender: &FramedSend) -> Arc<RequestWrite> {
@@ -1081,9 +1082,7 @@ fn answered_elsewhere_returns_the_settled_requests_charge() {
     let take = |id, bytes| {
         let taken = work.take_request(height, height, 1, 10_000, 7, NonZeroU64::new(id).unwrap());
         assert_eq!(taken.items().len(), 1);
-        let request = taken
-            .admit_for_connection(block::Height(0), block::Height(0), 0, None, cancel.clone())
-            .unwrap();
+        let request = admit(taken, cancel.clone()).unwrap();
         assert_eq!(request.bytes(), bytes);
         request.publish(|_| {}).unwrap()
     };
@@ -1289,15 +1288,7 @@ fn dropping_unfunded_take_returns_work_without_charging() {
         7,
         NonZeroU64::new(1).unwrap(),
     );
-    let admission = async move {
-        taken.admit_for_connection(
-            block::Height(0),
-            block::Height(0),
-            0,
-            None,
-            CancellationToken::new(),
-        )
-    };
+    let admission = async move { admit(taken, CancellationToken::new()) };
     assert_eq!(f.work.in_flight_len(), 2);
     assert_eq!(f.budget.reserved(), 0);
     drop(admission);
@@ -1329,15 +1320,7 @@ fn filtered_take_derives_funding_and_priority_from_retained_items() {
     taken.retain_range(1..2);
     assert!(f.work.pending_contains(block::Height(1)));
     assert!(f.work.pending_contains(block::Height(3)));
-    let request = taken
-        .admit_for_connection(
-            block::Height(0),
-            block::Height(0),
-            0,
-            None,
-            f.cancel.clone(),
-        )
-        .unwrap();
+    let request = admit(taken, f.cancel.clone()).unwrap();
     assert_eq!(request.items().len(), 1);
     assert_eq!(request.items()[0].0, block::Height(2));
     assert_eq!(request.priority(), RequestPriority::AboveFloor);
@@ -1372,28 +1355,13 @@ fn stale_take_cannot_fund_or_return_replacement_work() {
         NonZeroU64::new(2).unwrap(),
     );
     assert_eq!(
-        old.admit_for_connection(
-            block::Height(0),
-            block::Height(0),
-            0,
-            None,
-            f.cancel.clone()
-        )
-        .unwrap_err(),
+        admit(old, f.cancel.clone()).unwrap_err(),
         AdmitRefusal::StaleClaim
     );
     assert_eq!(f.budget.reserved(), 0);
     assert_eq!(f.work.in_flight_len(), 2);
     assert_eq!(f.work.pending_len(), 0);
-    let request = replacement
-        .admit_for_connection(
-            block::Height(0),
-            block::Height(0),
-            0,
-            None,
-            f.cancel.clone(),
-        )
-        .unwrap();
+    let request = admit(replacement, f.cancel.clone()).unwrap();
     assert_eq!(f.budget.reserved(), 200);
     drop(request);
     assert_eq!(f.budget.reserved(), 0);
@@ -1918,15 +1886,7 @@ fn poisoned_queue_owner_unwind_does_not_abort() {
     if phase == "taken" {
         unwind_owner(taken, &f.work);
     } else {
-        let admitted = taken
-            .admit_for_connection(
-                block::Height(0),
-                block::Height(0),
-                0,
-                None,
-                f.cancel.clone(),
-            )
-            .unwrap();
+        let admitted = admit(taken, f.cancel.clone()).unwrap();
         assert_eq!(f.budget.reserved(), 317);
         if phase == "admitted" {
             unwind_owner(admitted, &f.work);
@@ -1963,13 +1923,7 @@ fn poisoned_queue_owner_unwind_does_not_abort() {
         NonZeroU64::new(3).unwrap(),
     );
     assert!(matches!(
-        replacement.admit_for_connection(
-            block::Height(0),
-            block::Height(0),
-            0,
-            None,
-            CancellationToken::new()
-        ),
+        admit(replacement, CancellationToken::new()),
         Err(AdmitRefusal::AccountingClosed)
     ));
     f.reset();

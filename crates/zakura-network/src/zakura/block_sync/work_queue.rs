@@ -1024,10 +1024,59 @@ mod memory_pool_tests {
         crate::zakura::block_sync::test_work_scope()
     }
 
+    const MB: u64 = 1_000_000;
+
     fn hash(height: u32) -> block::Hash {
         let mut bytes = [0u8; 32];
         bytes[..4].copy_from_slice(&height.to_le_bytes());
         block::Hash(bytes)
+    }
+
+    /// A queue over `pool` with a confirmed 2 MB block at each of `heights`.
+    fn queue_with(pool: &MemoryPool, heights: &[u32]) -> Arc<WorkQueue> {
+        let queue = Arc::new(WorkQueue::new(
+            block::Height(0),
+            ByteBudget::new(u64::MAX),
+            pool.clone(),
+        ));
+        queue.extend(
+            test_scope(),
+            heights.iter().map(|&height| {
+                (
+                    block::Height(height),
+                    hash(height),
+                    BlockSizeEstimate::Confirmed(2_000_000),
+                )
+            }),
+        );
+        queue
+    }
+
+    /// Takes `height` as request `id` and admits it for connection `conn_id`,
+    /// with the floor and the verified tip at genesis.
+    fn admit(
+        queue: &Arc<WorkQueue>,
+        height: u32,
+        id: u64,
+        conn_id: u64,
+        cancel: &CancellationToken,
+    ) -> Result<UnpublishedRequest, AdmitRefusal> {
+        queue
+            .take_request(
+                block::Height(height),
+                block::Height(height),
+                1,
+                2 * MB,
+                1,
+                NonZeroU64::new(id).unwrap(),
+            )
+            .admit_for_connection(
+                block::Height(0),
+                block::Height(0),
+                conn_id,
+                None,
+                cancel.clone(),
+            )
     }
 
     /// mem-15: a withheld commit-window drain moves to block sync, so the
@@ -1036,59 +1085,31 @@ mod memory_pool_tests {
     /// the re-issued request waits.
     #[test]
     fn withheld_consensus_drain_moves_to_block_sync_before_reissue() {
-        let mb = 1_000_000u64;
         for pool_full in [false, true] {
             // Consensus reserves exactly one 2 MB height. S = 4 MB.
-            let config = PoolConfig::new(7 * mb, 0)
-                .with_consumer(Consumer::Consensus, ConsumerSpec::reserved(2 * mb))
-                .with_consumer(Consumer::BlockSync, ConsumerSpec::bulk(mb, mb, 1))
-                .with_consumer(Consumer::Serving, ConsumerSpec::bulk(0, 4 * mb, 1));
+            let config = PoolConfig::new(7 * MB, 0)
+                .with_consumer(Consumer::Consensus, ConsumerSpec::reserved(2 * MB))
+                .with_consumer(Consumer::BlockSync, ConsumerSpec::bulk(MB, MB, 1))
+                .with_consumer(Consumer::Serving, ConsumerSpec::bulk(0, 4 * MB, 1));
             let pool = MemoryPool::new(config);
             let _bulk = pool
-                .try_acquire(Consumer::BlockSync, Some(1), mb)
+                .try_acquire(Consumer::BlockSync, Some(1), MB)
                 .expect("block sync fills its cap");
             let _serving = pool_full.then(|| {
-                pool.try_acquire(Consumer::Serving, Some(2), 4 * mb)
+                pool.try_acquire(Consumer::Serving, Some(2), 4 * MB)
                     .expect("serving fills S")
             });
-            let queue = Arc::new(WorkQueue::new(
-                block::Height(0),
-                ByteBudget::new(u64::MAX),
-                pool.clone(),
-            ));
-            queue.extend(
-                test_scope(),
-                [(
-                    block::Height(100),
-                    hash(100),
-                    BlockSizeEstimate::Confirmed((2 * mb) as u32),
-                )],
-            );
+            let queue = queue_with(&pool, &[100]);
             // The withheld request's unspent credit lease.
             let withheld = pool
-                .try_acquire(Consumer::Consensus, Some(42), 2 * mb)
+                .try_acquire(Consumer::Consensus, Some(42), 2 * MB)
                 .expect("the first request leases the height from Consensus");
 
             let (drain, left) = drain_on_block_sync(withheld);
-            let reissue = queue
-                .take_request(
-                    block::Height(100),
-                    block::Height(100),
-                    1,
-                    2 * mb,
-                    1,
-                    NonZeroU64::new(1).unwrap(),
-                )
-                .admit_for_connection(
-                    block::Height(0),
-                    block::Height(0),
-                    43,
-                    None,
-                    CancellationToken::new(),
-                );
+            let reissue = admit(&queue, 100, 1, 43, &CancellationToken::new());
             if pool_full {
                 assert_eq!(drain.bytes(), 0);
-                assert_eq!(left.as_ref().map(PoolLease::bytes), Some(2 * mb));
+                assert_eq!(left.as_ref().map(PoolLease::bytes), Some(2 * MB));
                 assert_eq!(
                     reissue.map(|_| ()).unwrap_err(),
                     AdmitRefusal::Capacity(Consumer::Consensus)
@@ -1096,12 +1117,12 @@ mod memory_pool_tests {
             } else {
                 assert!(left.is_none());
                 assert_eq!(drain.consumer(), Consumer::BlockSync);
-                assert_eq!(drain.bytes(), 2 * mb);
-                assert_eq!(pool.consumer_leased(Consumer::BlockSync), 3 * mb);
+                assert_eq!(drain.bytes(), 2 * MB);
+                assert_eq!(pool.consumer_leased(Consumer::BlockSync), 3 * MB);
                 let reissue =
                     reissue.expect("the re-issued request takes the only Consensus lease");
                 let _claim = reissue.publish(|_| {}).expect("publish the re-issue");
-                assert_eq!(pool.consumer_leased(Consumer::Consensus), 2 * mb);
+                assert_eq!(pool.consumer_leased(Consumer::Consensus), 2 * MB);
             }
             assert!(pool.snapshot().total_leased <= pool.snapshot().lease_limit);
         }
@@ -1109,96 +1130,47 @@ mod memory_pool_tests {
 
     #[test]
     fn commit_window_uses_consensus_reserve_even_when_bulk_pool_is_saturated() {
-        let mb = 1_000_000u64;
         // Shared space S = 8 MB; Consensus reserved = 8 MB; BlockSync floor = 2 MB, cap = 4 MB.
-        let config = PoolConfig::new(20 * mb, 0)
-            .with_consumer(Consumer::Consensus, ConsumerSpec::reserved(8 * mb))
-            .with_consumer(Consumer::BlockSync, ConsumerSpec::bulk(2 * mb, 4 * mb, 1))
-            .with_consumer(Consumer::Serving, ConsumerSpec::bulk(2 * mb, 10 * mb, 1));
+        let config = PoolConfig::new(20 * MB, 0)
+            .with_consumer(Consumer::Consensus, ConsumerSpec::reserved(8 * MB))
+            .with_consumer(Consumer::BlockSync, ConsumerSpec::bulk(2 * MB, 4 * MB, 1))
+            .with_consumer(Consumer::Serving, ConsumerSpec::bulk(2 * MB, 10 * MB, 1));
         let pool = MemoryPool::new(config);
 
         // Saturate bulk completely (BlockSync floor + cap and Serving taking all of S).
         let bulk_block_sync = pool
-            .try_acquire(Consumer::BlockSync, Some(1), 4 * mb)
+            .try_acquire(Consumer::BlockSync, Some(1), 4 * MB)
             .expect("fill block sync to cap");
         let bulk_serving = pool
-            .try_acquire(Consumer::Serving, Some(2), 8 * mb)
+            .try_acquire(Consumer::Serving, Some(2), 8 * MB)
             .expect("drain remaining shared space S");
         assert_eq!(pool.available_for(Consumer::BlockSync), 0);
 
-        let queue = Arc::new(WorkQueue::new(
-            block::Height(0),
-            ByteBudget::new(u64::MAX),
-            pool.clone(),
-        ));
         // Height 100 is inside commit window above verified_tip=0 (0..=401);
         // Height 500 is above the commit window.
-        queue.extend(
-            test_scope(),
-            [
-                (
-                    block::Height(100),
-                    hash(100),
-                    BlockSizeEstimate::Confirmed((2 * mb) as u32),
-                ),
-                (
-                    block::Height(500),
-                    hash(500),
-                    BlockSizeEstimate::Confirmed((2 * mb) as u32),
-                ),
-            ],
-        );
-
+        let queue = queue_with(&pool, &[100, 500]);
         let cancel = CancellationToken::new();
         // 1. Commit-window request succeeds on Consumer::Consensus without waiting on bulk!
-        let taken_in_window = queue.take_request(
-            block::Height(100),
-            block::Height(100),
-            1,
-            2 * mb,
-            1,
-            NonZeroU64::new(1).unwrap(),
-        );
-        let unpublished_in = taken_in_window
-            .admit_for_connection(block::Height(0), block::Height(0), 42, None, cancel.clone())
+        let unpublished_in = admit(&queue, 100, 1, 42, &cancel)
             .expect("commit-window height must lease from Consensus reserve");
         let owner_in = unpublished_in.owner();
         let _claim_in = unpublished_in.publish(|_| {}).expect("publish in-window");
-        assert_eq!(pool.consumer_leased(Consumer::Consensus), 2 * mb);
+        assert_eq!(pool.consumer_leased(Consumer::Consensus), 2 * MB);
 
         // 2. Above-window request is refused cleanly while bulk is full.
-        let taken_above = queue.take_request(
-            block::Height(500),
-            block::Height(500),
-            1,
-            2 * mb,
-            1,
-            NonZeroU64::new(2).unwrap(),
-        );
-        let err = taken_above
-            .admit_for_connection(block::Height(0), block::Height(0), 42, None, cancel.clone())
+        let err = admit(&queue, 500, 2, 42, &cancel)
             .expect_err("above-window request must defer when bulk is saturated");
         assert_eq!(err, AdmitRefusal::Capacity(Consumer::BlockSync));
 
         // 3. Releasing bulk leases unblocks above-window requests on Consumer::BlockSync.
         drop(bulk_block_sync);
         drop(bulk_serving);
-        let taken_above = queue.take_request(
-            block::Height(500),
-            block::Height(500),
-            1,
-            2 * mb,
-            1,
-            NonZeroU64::new(3).unwrap(),
-        );
-        let unpublished_above = taken_above
-            .admit_for_connection(block::Height(0), block::Height(0), 42, None, cancel)
+        let unpublished_above = admit(&queue, 500, 3, 42, &cancel)
             .expect("above-window request leases from BlockSync once room opens");
-        let owner_above = unpublished_above.owner();
         let _claim_above = unpublished_above
             .publish(|_| {})
             .expect("publish above-window");
-        assert_eq!(pool.consumer_leased(Consumer::BlockSync), 2 * mb);
+        assert_eq!(pool.consumer_leased(Consumer::BlockSync), 2 * MB);
 
         // 4. Receipt transfers the Consensus lease out of WorkQueue; dropping it returns to 0.
         let ended = queue
@@ -1207,18 +1179,17 @@ mod memory_pool_tests {
             .expect("owner held height 100");
         assert_eq!(
             ended.pool_lease.as_ref().map(PoolLease::bytes),
-            Some(2 * mb)
+            Some(2 * MB)
         );
         assert_eq!(
             ended.pool_lease.as_ref().map(PoolLease::consumer),
             Some(Consumer::Consensus)
         );
-        assert_eq!(pool.consumer_leased(Consumer::Consensus), 2 * mb);
+        assert_eq!(pool.consumer_leased(Consumer::Consensus), 2 * MB);
         drop(ended);
         assert_eq!(pool.consumer_leased(Consumer::Consensus), 0);
 
         // 5. Returning unreceived work releases the BlockSync lease back to 0.
-        let _ = owner_above;
         queue.reset_above(block::Height(0));
         assert_eq!(pool.consumer_leased(Consumer::BlockSync), 0);
         assert!(queue.audit_funding());

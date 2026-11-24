@@ -122,7 +122,7 @@ async fn completed_ranges_are_reusable_before_earlier_output_drains() {
     let serving = Serving::new(
         source.clone(),
         &ZakuraBlockSyncConfig::default(),
-        crate::zakura::BlockSyncMemory::for_tests().serving,
+        test_serving(),
     );
     let cancel = CancellationToken::new();
     let (send, mut output) = framed_channel(4);
@@ -179,7 +179,7 @@ async fn cancelled_sessions_do_not_complete_replacement_ranges() {
     let serving = Serving::new(
         source.clone(),
         &ZakuraBlockSyncConfig::default(),
-        crate::zakura::BlockSyncMemory::for_tests().serving,
+        test_serving(),
     );
     let peer = ZakuraPeerId::new(vec![62; 32]).unwrap();
     let old_cancel = CancellationToken::new();
@@ -241,28 +241,14 @@ async fn cancelled_sessions_do_not_complete_replacement_ranges() {
     cancel.cancel();
 }
 
-/// A session for `source` with the production serving limits, whose output
-/// holds `queue` frames.
-fn ready_session(
-    source: &Arc<ControlledSource>,
-    peer: u8,
-    queue: usize,
-) -> (
-    Serving,
-    ServingSession,
-    crate::zakura::FramedRecv,
-    CancellationToken,
-) {
-    ready_session_in(
-        source,
-        peer,
-        queue,
-        crate::zakura::BlockSyncMemory::for_tests().serving,
-    )
+/// The production serving pool of block sync's test memory.
+fn test_serving() -> crate::zakura::memory::ServingPool {
+    crate::zakura::BlockSyncMemory::for_tests().serving
 }
 
-/// [`ready_session`] whose output leases from `serving_pool`.
-fn ready_session_in(
+/// A session for `source` with the production serving limits, whose output
+/// holds `queue` frames and leases from `serving_pool`.
+fn ready_session(
     source: &Arc<ControlledSource>,
     peer: u8,
     queue: usize,
@@ -304,7 +290,7 @@ async fn a_ready_range_is_sent_while_an_earlier_read_is_blocked() {
         .lock()
         .unwrap()
         .insert(Height(2), blocked.clone());
-    let (_serving, mut session, mut output, cancel) = ready_session(&source, 64, 4);
+    let (_serving, mut session, mut output, cancel) = ready_session(&source, 64, 4, test_serving());
     session.admit(Range::new(Height(2), 1).unwrap()).unwrap();
     session.admit(Range::new(Height(1), 1).unwrap()).unwrap();
     assert_eq!(served(&mut output).await, Served::Block(Height(1)));
@@ -339,7 +325,7 @@ async fn live_ranges_and_leases_follow_a_blocked_read() {
         .unwrap()
         .insert(Height(2), blocked.clone());
     let peer = ZakuraPeerId::new(vec![65; 32]).unwrap();
-    let (serving, mut session, mut output, cancel) = ready_session(&source, 65, 4);
+    let (serving, mut session, mut output, cancel) = ready_session(&source, 65, 4, test_serving());
     session.admit(Range::new(Height(2), 1).unwrap()).unwrap();
     session.admit(Range::new(Height(1), 1).unwrap()).unwrap();
     assert_eq!(served(&mut output).await, Served::Block(Height(1)));
@@ -388,7 +374,7 @@ async fn concurrent_multi_block_requests_get_one_block_prefixes() {
         blocks: mainnet_blocks(1..=10),
         ..Default::default()
     });
-    let (_serving, mut session, mut output, cancel) = ready_session(&source, 65, 4);
+    let (_serving, mut session, mut output, cancel) = ready_session(&source, 65, 4, test_serving());
     for _round in 0..16 {
         // Every range from the last round has ended, so each admission reuses its heights.
         for (start, count) in RANGES {
@@ -442,9 +428,9 @@ async fn a_same_height_replacement_never_precedes_the_old_ranges_output() {
         ..Default::default()
     });
     // One transport slot that nobody reads holds the old output back.
-    let serving_pool = crate::zakura::BlockSyncMemory::for_tests().serving;
+    let serving_pool = test_serving();
     let (_serving, mut session, mut output, cancel) =
-        ready_session_in(&source, 66, 1, serving_pool.clone());
+        ready_session(&source, 66, 1, serving_pool.clone());
     session.admit(Range::new(Height(1), 3).unwrap()).unwrap();
     wait_completed(&mut session, Height(1)).await;
     assert!(
@@ -572,11 +558,7 @@ async fn serving_enforces_the_budgeted_limit() {
     });
     let config = ZakuraBlockSyncConfig::default();
     let limit = serving_max_inflight_requests(&config);
-    let serving = Serving::new(
-        source,
-        &config,
-        crate::zakura::BlockSyncMemory::for_tests().serving,
-    );
+    let serving = Serving::new(source, &config, test_serving());
     let cancel = CancellationToken::new();
     let (send, _output) = framed_channel(4);
     let mut session = serving.session(
@@ -606,11 +588,7 @@ async fn adjacent_ranges_are_admitted_and_any_overlap_disconnects() {
         default_gate: Some(Arc::new(Semaphore::new(0))),
         ..Default::default()
     });
-    let serving = Serving::new(
-        source,
-        &ZakuraBlockSyncConfig::default(),
-        crate::zakura::BlockSyncMemory::for_tests().serving,
-    );
+    let serving = Serving::new(source, &ZakuraBlockSyncConfig::default(), test_serving());
     let cancel = CancellationToken::new();
     let (send, _output) = framed_channel(4);
     let mut session = serving.session(
@@ -663,7 +641,7 @@ async fn admitted_ranges_leave_owner_state_unchanged() {
         blocks: mainnet_blocks(1..=1),
         ..Default::default()
     });
-    let (_serving, mut session, mut output, cancel) = ready_session(&source, 65, 4);
+    let (_serving, mut session, mut output, cancel) = ready_session(&source, 65, 4, test_serving());
     session.admit(Range::new(Height(1), 1).unwrap()).unwrap();
     assert_eq!(served(&mut output).await, Served::Block(Height(1)));
     assert_eq!(served(&mut output).await, done(1, 1));
@@ -700,7 +678,7 @@ async fn serving_bounds_commitments_workers_and_outputs() {
     let limit = serving_max_inflight_requests(&config);
     let limits = serving_limits(&config);
     let peer = ZakuraPeerId::new(vec![66; 32]).unwrap();
-    let (serving, mut session, _output, cancel) = ready_session(&source, 66, 4);
+    let (serving, mut session, _output, cancel) = ready_session(&source, 66, 4, test_serving());
     assert!(
         usize::try_from(2 * limit).unwrap() > limits.peer_execution,
         "the commitment margin exceeds the workers, so the worker bound is visible"

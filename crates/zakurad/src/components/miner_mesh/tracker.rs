@@ -206,8 +206,9 @@ where
     /// them while the node catches up.
     ///
     /// The checks see the best chain as it is now. A block read from a chain
-    /// that was briefly best and is gone again by the next tip change stays
-    /// counted until it leaves the window. This needs a reorg of more than
+    /// that was briefly best and is gone again by the next tip change can stay
+    /// counted until it leaves the window or a later reorg's repair finds it.
+    /// This needs a reorg of more than
     /// [`QUALIFYING_DEPTH`](zakura_chain::miner_mesh::QUALIFYING_DEPTH) blocks
     /// that switches away and back before the tracker handles the next tip
     /// change.

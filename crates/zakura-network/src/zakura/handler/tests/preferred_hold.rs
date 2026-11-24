@@ -9,7 +9,7 @@
 use super::*;
 use zakura_chain::miner_mesh::GatewayId;
 
-use crate::zakura::{GatewayStanding, RankedGateway, SlotSplit};
+use crate::zakura::{GatewayStanding, RankedGateway, SlotSplit, MAX_RANKED_GATEWAYS};
 
 fn handler_from_config(config: &Config) -> ZakuraProtocolHandler {
     let limits = ZakuraLocalLimits::from_config(config);
@@ -783,6 +783,32 @@ fn publication_resolves_a_gateway_to_an_owner_proved_after_the_snapshot() {
         GatewayId::from_node_id(gateway.as_bytes()),
         1,
     )]);
+
+    assert_eq!(preferred_set(&handler), [gateway]);
+    assert_eq!(hold(&handler), 1);
+}
+
+/// A gateway tied at the ranking cutoff that discovery's snapshot could not
+/// resolve joins at publication once a proved owner has its gateway ID, like
+/// a gateway above the cutoff.
+#[test]
+fn publication_resolves_a_tied_gateway_to_an_owner_proved_after_the_snapshot() {
+    let handler = handler(40, 1);
+    // The highest gateway ID sorts after the others, so it is the one tied
+    // entry left past the cutoff.
+    let gateway = node_with_prefix(0xff, 0x00);
+    let _inbound = handler
+        .claim_connection(gateway, true)
+        .expect("room for an ordinary inbound peer");
+
+    let others = (0..MAX_RANKED_GATEWAYS).map(|index| {
+        let mut id = [0; 20];
+        // The ranking holds at most 256 gateways, so the index fits in two bytes.
+        id[18..].copy_from_slice(&(index as u16).to_be_bytes());
+        RankedGateway::unresolved(GatewayId::from_bytes(id), 1)
+    });
+    let tied = RankedGateway::unresolved(GatewayId::from_node_id(gateway.as_bytes()), 1);
+    handler.publish_gateway_ranking(others.chain([tied]).collect::<Vec<_>>());
 
     assert_eq!(preferred_set(&handler), [gateway]);
     assert_eq!(hold(&handler), 1);

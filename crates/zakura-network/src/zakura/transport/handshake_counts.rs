@@ -365,9 +365,10 @@ impl HandshakeCounts {
                 }
             }
         }
-        // Every proved owner connects the gateway its ID names. An owner that
-        // connected after discovery's snapshot resolves that gateway, or makes
-        // it ambiguous when the snapshot named another node.
+        // Every proved owner connects the gateway its ID names, tied at the
+        // cutoff or not. An owner that connected after discovery's snapshot
+        // resolves that gateway, or makes it ambiguous when the snapshot
+        // named another node.
         let by_gateway: HashMap<GatewayId, usize> = live
             .iter()
             .enumerate()

@@ -246,18 +246,26 @@ impl FromIterator<RankedGateway> for GatewayRanking {
 
 impl GatewayRanking {
     /// At publication, look up only live owners among the tied overflow entries:
-    /// a tied entry joins when it names an authenticated owner. Entries below
-    /// the cutoff score cannot advance even if they authenticated.
+    /// a tied entry joins, once, when an authenticated owner has its gateway ID
+    /// and the entry names no node or that owner. Publication then resolves it
+    /// with the owners like every other gateway. Entries below the cutoff score
+    /// cannot advance even if they authenticated.
     pub(super) fn candidates<'a>(
         &self,
         authenticated: impl Iterator<Item = &'a NodeId>,
     ) -> Vec<RankedGateway> {
         let mut candidates = self.candidates.clone();
         if !self.tied_at_cutoff.is_empty() {
+            let mut joined: HashSet<GatewayId> = HashSet::default();
             candidates.extend(authenticated.filter_map(|node| {
                 self.tied_at_cutoff
                     .get(&GatewayId::from_node_id(node.as_bytes()))
-                    .filter(|gateway| gateway.node() == Some(*node))
+                    .filter(|gateway| match gateway.resolution {
+                        GatewayMatch::None => true,
+                        GatewayMatch::One((named, _)) => named == *node,
+                        GatewayMatch::Several => false,
+                    })
+                    .filter(|gateway| joined.insert(gateway.gateway))
                     .copied()
             }));
         }

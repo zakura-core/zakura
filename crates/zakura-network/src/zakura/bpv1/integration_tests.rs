@@ -269,8 +269,8 @@ fn propagation_leased(pool: &MemoryPool) -> u64 {
 
 /// mem-5: BPv1 funds what it holds from the `Propagation` reserve, so a
 /// near-limit W2 block propagates and commits while bulk consumers hold all
-/// of `S`. Each node's leases cover what its table and proposer hold, stay
-/// within the reserve, and return every byte at teardown.
+/// of `S`. Each node's leases cover what its table and proposer hold at
+/// every step, and return every byte at teardown.
 #[tokio::test]
 async fn mem5_propagation_leases_fund_a_block_beside_saturated_bulk() {
     let height = Height(20);
@@ -279,7 +279,6 @@ async fn mem5_propagation_leases_fund_a_block_beside_saturated_bulk() {
     let (peak_a, peak_b) = (Arc::default(), Arc::default());
     let (pool_a, _bulk_a) = pool_with_saturated_bulk(&peak_a);
     let (pool_b, _bulk_b) = pool_with_saturated_bulk(&peak_b);
-    let reserve = pool_a.snapshot().consumers[Consumer::Propagation.index()].cap;
 
     let valid = ScriptedVerifier::new(VerifierVerdict::Valid);
     let ports_a = ports(height.0, valid.clone(), SharedBodyClaims::new());
@@ -301,21 +300,28 @@ async fn mem5_propagation_leases_fund_a_block_beside_saturated_bulk() {
     let solved = solved_block_of(&handle_a, height, txs);
     let block_id = solved.hash();
     assert!(handle_a.publish_solved_block(&solved, height.0));
+    // At every poll, each node's leases cover what its table and proposer
+    // hold.
+    let funded = || {
+        for (node, handle) in [("A", &handle_a), ("B", &handle_b)] {
+            assert_eq!(
+                handle.unfunded_bytes(),
+                0,
+                "{node}'s leases cover what its table and proposer hold"
+            );
+        }
+    };
     wait_until("B commits the block beside saturated bulk", || {
+        funded();
         handle_b.block_phase(&block_id) == Some(BlockPhase::Done)
     })
     .await;
+    funded();
 
-    for (node, pool, peak, handle) in [
-        ("A", &pool_a, &peak_a, &handle_a),
-        ("B", &pool_b, &peak_b, &handle_b),
-    ] {
-        let peak = peak.0.load(Ordering::Relaxed);
-        assert!(peak > 0, "{node} leased from Propagation");
-        assert!(peak <= reserve, "{node} stayed within the reserve");
+    for (node, peak) in [("A", &peak_a), ("B", &peak_b)] {
         assert!(
-            propagation_leased(pool) >= handle.held_bytes(),
-            "{node}'s leases cover what its table and proposer hold"
+            peak.0.load(Ordering::Relaxed) > 0,
+            "{node} leased from Propagation"
         );
     }
 

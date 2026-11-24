@@ -105,7 +105,8 @@ impl SessionBase {
 
 /// The most frame bytes one block's parts take on one connection, when one
 /// peer pushes or serves every coded part of the largest block. The base
-/// send window holds this much, so one block never waits on window growth.
+/// send window holds this much, so one block never waits on window growth;
+/// BPv1 checks that when it starts.
 pub fn block_push_bytes(profile: Profile) -> u64 {
     let coding = profile.max_coding();
     // Widening usize to u64 is lossless on supported targets.
@@ -181,8 +182,8 @@ impl LeaseSized for ProposerState {
 /// them.
 ///
 /// The reserve covers every such lease, so a refused resize is a sizing bug:
-/// it counts `zakura.p2p.bpv1.propagation.lease_refused` and the simulator
-/// asserts it.
+/// it counts `zakura.p2p.bpv1.propagation.lease_refused`, and tests and the
+/// simulator panic on it.
 pub(super) struct Leased<M> {
     machine: M,
     lease: PoolLease,
@@ -196,10 +197,19 @@ impl<M: LeaseSized> Leased<M> {
         let bytes = self.machine.lease_bytes();
         if self.lease.bytes() != bytes && self.lease.try_grow_to(bytes).is_err() {
             metrics::counter!("zakura.p2p.bpv1.propagation.lease_refused").increment(1);
-            #[cfg(zakura_sim)]
+            #[cfg(any(test, zakura_sim))]
             panic!("Propagation refused a {bytes}-byte BPv1 lease that its reserve covers (mem-5)");
         }
         result
+    }
+
+    /// The bytes the machine holds beyond its lease, which only a refused
+    /// resize leaves.
+    #[cfg(any(test, zakura_sim))]
+    pub(super) fn unfunded_bytes(&self) -> u64 {
+        self.machine
+            .lease_bytes()
+            .saturating_sub(self.lease.bytes())
     }
 }
 

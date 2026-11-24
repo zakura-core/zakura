@@ -40,7 +40,7 @@ use super::{
         CommitmentFields, COMMITMENT_PAYLOAD_LEN,
     },
     config::{HavePacing, ZakuraBpv1Config, PATH_POLL_INTERVAL},
-    memory::{Bpv1Memory, Leased, ASSEMBLED_BLOCK_BYTES},
+    memory::{block_push_bytes, Bpv1Memory, Leased, ASSEMBLED_BLOCK_BYTES},
     paths::{Arrival, PathEstimate},
     peer::{
         stall_timeout, DropReason, PartAuth, PartToken, PeerEvent, PeerInput, PeerOutput,
@@ -697,12 +697,13 @@ impl Bpv1Handle {
         self.node.lock_table().part_buffer_bytes()
     }
 
-    /// Bytes the block table and the proposer hold, which BPv1's
-    /// `Propagation` leases cover.
+    /// Bytes the block table and the proposer hold beyond their
+    /// `Propagation` leases, read under each machine's lock. Only a refused
+    /// resize leaves any.
     #[cfg(any(test, zakura_sim))]
-    pub fn held_bytes(&self) -> u64 {
-        let table = self.node.lock_table().retained_bytes();
-        table.saturating_add(self.node.lock_proposer().prepared_bytes())
+    pub fn unfunded_bytes(&self) -> u64 {
+        let table = self.node.lock_table().unfunded_bytes();
+        table.saturating_add(self.node.lock_proposer().unfunded_bytes())
     }
 
     /// Prepares the commitment for a post-NU7 mining template (`decision-1`).
@@ -908,6 +909,10 @@ impl Bpv1Service {
             ports,
             shutdown,
         } = startup;
+        debug_assert!(
+            crate::zakura::BASE_SEND_WINDOW_BYTES >= block_push_bytes(profile),
+            "the base send window holds every part of one largest block"
+        );
         let chain_id = network.genesis_hash().0;
         let (driver_tx, driver_rx) = mpsc::unbounded_channel();
         let memory = Bpv1Memory::new(memory_pool);

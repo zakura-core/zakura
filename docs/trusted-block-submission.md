@@ -108,9 +108,11 @@ best tip is at or above the proposal's height on another block, or moves off
 the parent before release.
 
 The three inputs may arrive in any order. HTTP 202 acknowledges receipt of an
-input; it does not say that the job released. The proposal is decoded and
-verified in the background, so a malformed proposal is also acknowledged, and
-its job then ends as invalid. The miner can retry the same input with the same
+input; it does not say that the job released. Proposal verification runs in the background. Normally the relay also
+decodes the proposal after acknowledging receipt, and a malformed proposal
+ends its job as invalid. When admission requires replacing a job, the relay
+checks the complete encoding first. A malformed replacement returns 400 and
+leaves the existing jobs intact. The miner can retry the same input with the same
 ID. Job responses are:
 
 | Status | Meaning |
@@ -118,8 +120,8 @@ ID. Job responses are:
 | 202 | The input was received, or its job ended with the block's header hash committed. |
 | 400 | The input is malformed, the solved header fails proof of work, or local verification rejected the proposal or the solved block. |
 | 409 | The input contradicts one already received for this job: a different proposal, a different solved header, or a confirmation of other bytes. The job keeps the input it already has. A job whose solved header changes more than the proposal's nonce and solution ends with this status. |
-| 410 | The job ended as stale or passed its lifetime. |
-| 429 | Sixteen jobs are unfinished, or the relay's pending-body or submission capacity is exhausted. |
+| 410 | The job ended as stale, was replaced by a newer proposal, or passed its lifetime. |
+| 429 | All 16 job slots are occupied and none can be replaced, or the relay's pending-body or submission capacity is exhausted. |
 | 503 | The relay could not establish an outcome. |
 
 Once a job has ended, every later well-formed input for its ID gets the job's
@@ -137,10 +139,11 @@ counts it in `rpc.trusted_submission.job.no_local_verdict`.
 A job waits up to 120 seconds from its first input for the rest of its inputs
 and for authority to release. A released job then follows the validation
 deadline of a complete POST. The relay holds at most 16 unfinished jobs, each
-with its proposal in memory; a job frees its slot as soon as it ends. A miner
-that prepares a job for every template refresh can therefore keep about one job
-per 7.5 seconds alive on one parent. A refused `prepare` returns 429 when its
-upload completes, so the miner knows that candidate needs the complete POST. A
+with its proposal in memory. When all slots are occupied, a new prepare can
+replace the oldest idle proposal on the same parent. A proposal is idle once
+its local verification has finished and it has received neither a solve nor a
+confirmation. A late solve for a replaced proposal returns 410. If that
+proposal wins, use the complete POST after the primary accepts the block. A 429 on `prepare` also tells the miner to use the complete POST. A
 template mined for longer than 120 seconds must be prepared again under a new
 ID: its first job has expired, and that job's ID answers 410.
 
@@ -301,7 +304,8 @@ Monitor `rpc.trusted_submission.*` metrics and rejection logs.
 `rpc.trusted_submission.job.outcomes` counts ended jobs by outcome (`committed`,
 `duplicate`, `invalid`, `conflict`, `capacity`, `expired`, `unavailable`),
 `rpc.trusted_submission.job.saturated` counts first inputs refused because 16
-jobs were unfinished, and `rpc.trusted_submission.job.release.duration_seconds`
+jobs were unfinished and none could be replaced.
+`rpc.trusted_submission.job.evicted` counts proposals replaced to admit a new one, and `rpc.trusted_submission.job.release.duration_seconds`
 records the time from receipt of the solved header to release, labelled by
 whether local verification or the confirmation authorized it.
 `rpc.trusted_submission.job.no_local_verdict` counts jobs whose local

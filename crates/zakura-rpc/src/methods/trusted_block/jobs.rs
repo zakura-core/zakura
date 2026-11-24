@@ -116,6 +116,8 @@ enum Committed {
 struct Inputs {
     /// Cleared when the worker hands the block to validation, which has its own deadline.
     release_deadline: Option<Instant>,
+    /// Set once local verification has finished and replacement cannot abandon verifier work.
+    replaceable_parent: Option<block::Hash>,
     body: Option<Bytes>,
     header: Option<Arc<Header>>,
     /// When the solved header arrived, for the release latency metric.
@@ -125,6 +127,7 @@ struct Inputs {
     expected_confirmation: Option<Confirmation>,
 }
 
+#[derive(Clone)]
 enum Update {
     Prepare(Bytes),
     Solve(Arc<Header>),
@@ -132,6 +135,12 @@ enum Update {
 }
 
 impl Inputs {
+    /// The parent of a proposal that can be replaced without losing a solve or confirmation.
+    fn idle_parent(&self) -> Option<block::Hash> {
+        self.replaceable_parent
+            .filter(|_| self.header.is_none() && self.confirmation.is_none())
+    }
+
     fn expired(&self) -> bool {
         self.release_deadline
             .is_some_and(|deadline| Instant::now() >= deadline)
@@ -177,6 +186,13 @@ impl Inputs {
 type JobSender = watch::Sender<Inputs>;
 type JobReceiver = watch::Receiver<Inputs>;
 
+enum Registration {
+    Handled,
+    Start(JobSender, JobReceiver, Instant),
+    /// A complete decode is required before a new prepare can displace another job.
+    CheckReplacement(Bytes),
+}
+
 /// An ended job's remembered outcome.
 struct Ended {
     id: JobId,
@@ -186,10 +202,41 @@ struct Ended {
 
 #[derive(Default)]
 struct Registry {
-    /// Unfinished jobs, each owned by one worker.
-    live: HashMap<JobId, JobSender>,
+    /// Unfinished jobs in admission order, each owned by one worker.
+    live: IndexMap<JobId, JobSender>,
     /// Ended jobs, oldest first.
     ended: VecDeque<Ended>,
+}
+
+impl Registry {
+    /// Only a new proposal can displace an idle proposal for the same parent.
+    fn evict_for(&mut self, parent: block::Hash) -> bool {
+        let victim = self.live.iter().find_map(|(id, sender)| {
+            (sender.borrow().idle_parent() == Some(parent)).then_some(*id)
+        });
+        let Some(id) = victim else { return false };
+        // Registration holds the registry lock, so a solve or confirmation cannot slip
+        // between selection and removal. Wake the worker waiting for a solved header.
+        self.live[&id].send_modify(|parts| parts.release_deadline = Some(Instant::now()));
+        self.end(id, Err(JobError::Expired));
+        metrics::counter!("rpc.trusted_submission.job.evicted").increment(1);
+        true
+    }
+
+    /// Removes the live slot and records the result for late inputs.
+    fn end(&mut self, id: JobId, outcome: std::result::Result<(), JobError>) {
+        if self.live.shift_remove(&id).is_none() {
+            return;
+        }
+        if self.ended.len() >= ENDED_CAPACITY {
+            self.ended.pop_front();
+        }
+        self.ended.push_back(Ended {
+            id,
+            outcome,
+            forget_at: Instant::now() + ENDED_RETENTION,
+        });
+    }
 }
 
 /// The listener's jobs: at most [`CAPACITY`] unfinished and [`ENDED_CAPACITY`] remembered.
@@ -211,7 +258,8 @@ impl Jobs {
         &self,
         id: JobId,
         update: Update,
-    ) -> std::result::Result<Option<(JobSender, JobReceiver, Instant)>, JobError> {
+        decoded: Option<&DecodedProposal>,
+    ) -> std::result::Result<Registration, JobError> {
         let now = Instant::now();
         let mut jobs = self.lock();
         while jobs
@@ -227,14 +275,28 @@ impl Jobs {
                 result = inputs.update(update);
                 matches!(result, Ok(true))
             });
-            return result.map(|_| None);
+            return result.map(|_| Registration::Handled);
         }
         if let Some(ended) = jobs.ended.iter().rev().find(|ended| ended.id == id) {
-            return ended.outcome.map(|()| None);
+            return ended.outcome.map(|()| Registration::Handled);
         }
         if jobs.live.len() >= CAPACITY {
-            metrics::counter!("rpc.trusted_submission.job.saturated").increment(1);
-            return Err(JobError::Capacity);
+            if let Update::Prepare(body) = &update {
+                if decoded.is_none()
+                    && jobs
+                        .live
+                        .values()
+                        .any(|job| job.borrow().idle_parent().is_some())
+                {
+                    return Ok(Registration::CheckReplacement(body.clone()));
+                }
+            }
+            if !decoded
+                .is_some_and(|proposal| jobs.evict_for(proposal.block.header.previous_block_hash))
+            {
+                metrics::counter!("rpc.trusted_submission.job.saturated").increment(1);
+                return Err(JobError::Capacity);
+            }
         }
         let deadline = now + LIFETIME;
         let mut inputs = Inputs {
@@ -244,36 +306,33 @@ impl Jobs {
         inputs.update(update)?;
         let (sender, receiver) = watch::channel(inputs);
         jobs.live.insert(id, sender.clone());
-        Ok(Some((sender, receiver, deadline)))
+        Ok(Registration::Start(sender, receiver, deadline))
     }
 
     /// Frees an unfinished job's slot and remembers its outcome.
-    fn finish(&self, id: JobId, outcome: std::result::Result<(), JobError>) {
+    fn finish(&self, id: JobId, sender: &JobSender, outcome: std::result::Result<(), JobError>) {
         let mut jobs = self.lock();
-        if jobs.live.remove(&id).is_none() {
-            return;
+        if jobs
+            .live
+            .get(&id)
+            .is_some_and(|live| live.same_channel(sender))
+        {
+            jobs.end(id, outcome);
         }
-        if jobs.ended.len() >= ENDED_CAPACITY {
-            jobs.ended.pop_front();
-        }
-        jobs.ended.push_back(Ended {
-            id,
-            outcome,
-            forget_at: Instant::now() + ENDED_RETENTION,
-        });
     }
 }
 
 /// Ends a job when its worker stops, including by panic, so its slot cannot leak.
 struct Slot {
     jobs: Jobs,
+    sender: JobSender,
     id: JobId,
     outcome: std::result::Result<(), JobError>,
 }
 
 impl Drop for Slot {
     fn drop(&mut self) {
-        self.jobs.finish(self.id, self.outcome);
+        self.jobs.finish(self.id, &self.sender, self.outcome);
     }
 }
 
@@ -329,31 +388,46 @@ where
                 Update::Confirm(bytes.as_ref().try_into().map_err(|_| JobError::Invalid)?)
             }
         };
-        if let Some((sender, receiver, deadline)) = jobs.register(id, update)? {
-            let rpc = self.clone();
-            let span = tracing::info_span!("trusted_job", id = %hex::encode(id));
-            tokio::spawn(
-                async move {
-                    let mut slot = Slot {
-                        jobs,
-                        id,
-                        // Replaced below unless the worker panics.
-                        outcome: Err(JobError::Unavailable),
-                    };
-                    let result = rpc.run_trusted_job(&sender, receiver, deadline).await;
-                    let label = match result {
-                        Ok(Committed::Here) => "committed",
-                        Ok(Committed::Elsewhere) => "duplicate",
-                        Err(error) => error.label(),
-                    };
-                    metrics::counter!("rpc.trusted_submission.job.outcomes", "outcome" => label)
-                        .increment(1);
-                    tracing::info!(outcome = label, "prepared trusted job ended");
-                    slot.outcome = result.map(|_| ());
+        let mut decoded = None;
+        let (sender, receiver, deadline) = loop {
+            match jobs.register(id, update.clone(), decoded.as_ref())? {
+                Registration::Handled => return Ok(()),
+                Registration::Start(sender, receiver, deadline) => {
+                    break (sender, receiver, deadline)
                 }
-                .instrument(span),
-            );
-        }
+                Registration::CheckReplacement(body) => {
+                    // The request holds a body permit. Decode outside the registry lock,
+                    // then recheck the ID and eligible jobs before replacing anything.
+                    decoded = Some(decode_proposal(body).await?);
+                }
+            }
+        };
+        let rpc = self.clone();
+        let span = tracing::info_span!("trusted_job", id = %hex::encode(id));
+        tokio::spawn(
+            async move {
+                let mut slot = Slot {
+                    jobs,
+                    sender: sender.clone(),
+                    id,
+                    // Replaced below unless the worker panics.
+                    outcome: Err(JobError::Unavailable),
+                };
+                let result = rpc
+                    .run_trusted_job(&sender, receiver, deadline, decoded)
+                    .await;
+                let label = match result {
+                    Ok(Committed::Here) => "committed",
+                    Ok(Committed::Elsewhere) => "duplicate",
+                    Err(error) => error.label(),
+                };
+                metrics::counter!("rpc.trusted_submission.job.outcomes", "outcome" => label)
+                    .increment(1);
+                tracing::info!(outcome = label, "prepared trusted job ended");
+                slot.outcome = result.map(|_| ());
+            }
+            .instrument(span),
+        );
         Ok(())
     }
 
@@ -366,10 +440,12 @@ where
         sender: &JobSender,
         inputs: JobReceiver,
         deadline: Instant,
+        decoded: Option<DecodedProposal>,
     ) -> std::result::Result<Committed, JobError> {
-        let release = tokio::time::timeout_at(deadline, self.await_release(sender, inputs))
-            .await
-            .unwrap_or(Err(JobError::Expired))?;
+        let release =
+            tokio::time::timeout_at(deadline, self.await_release(sender, inputs, decoded))
+                .await
+                .unwrap_or(Err(JobError::Expired))?;
         if self.latest_chain_tip.best_tip_hash() != Some(release.parent) {
             return Err(JobError::Expired);
         }
@@ -428,34 +504,26 @@ where
         &self,
         sender: &JobSender,
         mut inputs: JobReceiver,
+        decoded: Option<DecodedProposal>,
     ) -> std::result::Result<Release, JobError> {
-        let body = inputs
-            .wait_for(|parts| parts.body.is_some())
-            .await
-            .map_err(|_| JobError::Expired)?
-            .body
-            .clone()
-            .expect("waited for the body");
-        let (candidate, transactions) = tokio::task::spawn_blocking(move || {
-            let mut remaining = body.as_ref();
-            let block =
-                Block::zcash_deserialize_bounded(&mut remaining).map_err(|_| JobError::Invalid)?;
-            // Proposal verification and the peer must see exactly the same transaction encoding.
-            if !remaining.is_empty()
-                || block
-                    .zcash_serialize_to_vec()
-                    .map_err(|_| JobError::Invalid)?
-                    != body
-            {
-                return Err(JobError::Invalid);
+        let DecodedProposal {
+            block: candidate,
+            transactions,
+            height,
+        } = match decoded {
+            Some(proposal) => proposal,
+            None => {
+                let body = inputs
+                    .wait_for(|parts| parts.body.is_some())
+                    .await
+                    .map_err(|_| JobError::Expired)?
+                    .body
+                    .clone()
+                    .expect("waited for the body");
+                decode_proposal(body).await?
             }
-            let transactions = body.slice(block.header.zcash_serialized_size()..);
-            Ok((Arc::new(block), transactions))
-        })
-        .await
-        .map_err(blocking_task_failed)??;
+        };
         let parent = candidate.header.previous_block_hash;
-        let height = candidate.coinbase_height().ok_or(JobError::Invalid)?;
         let mut tip = self.latest_chain_tip.clone();
         parent_becomes_tip(&mut tip, parent, height).await?;
         let (block, wire, authority) = tokio::select! {
@@ -492,17 +560,15 @@ where
                     block: candidate.clone().into(),
                     source: zakura_consensus::PreparedCandidateSource::ClientProposal,
                 });
-        let verify = local_approval(request);
+        let verify = local_approval(request, || {
+            sender.send_modify(|parts| {
+                parts.replaceable_parent = Some(candidate.header.previous_block_hash);
+            });
+        });
         tokio::pin!(verify);
         let mut authority = None;
         let mut solve_inputs = inputs.clone();
-        let solve = async {
-            solve_inputs
-                .wait_for(|parts| parts.header.is_some())
-                .await
-                .map_err(|_| JobError::Expired)
-                .map(|parts| parts.header.clone().expect("waited for the solved header"))
-        };
+        let solve = wait_for_solve(&mut solve_inputs);
         tokio::pin!(solve);
         let header = tokio::select! {
             biased;
@@ -571,6 +637,50 @@ where
     }
 }
 
+struct DecodedProposal {
+    block: Arc<Block>,
+    transactions: Bytes,
+    height: Height,
+}
+
+/// Checks the complete wire encoding before a proposal can replace another job or be verified.
+async fn decode_proposal(body: Bytes) -> std::result::Result<DecodedProposal, JobError> {
+    tokio::task::spawn_blocking(move || {
+        let mut remaining = body.as_ref();
+        let block =
+            Block::zcash_deserialize_bounded(&mut remaining).map_err(|_| JobError::Invalid)?;
+        // Proposal verification and the peer must see exactly the same transaction encoding.
+        if !remaining.is_empty()
+            || block
+                .zcash_serialize_to_vec()
+                .map_err(|_| JobError::Invalid)?
+                != body
+        {
+            return Err(JobError::Invalid);
+        }
+        let transactions = body.slice(block.header.zcash_serialized_size()..);
+        let height = block.coinbase_height().ok_or(JobError::Invalid)?;
+        Ok(DecodedProposal {
+            block: Arc::new(block),
+            transactions,
+            height,
+        })
+    })
+    .await
+    .map_err(blocking_task_failed)?
+}
+
+/// Eviction wakes this wait even if no further input arrives for the job.
+async fn wait_for_solve(inputs: &mut JobReceiver) -> std::result::Result<Arc<Header>, JobError> {
+    inputs
+        .wait_for(|parts| parts.header.is_some() || parts.expired())
+        .await
+        .map_err(|_| JobError::Expired)?
+        .header
+        .clone()
+        .ok_or(JobError::Expired)
+}
+
 /// Waits until `parent` is the best tip, so a miner can prepare a candidate while this node is
 /// still committing its parent. A tip at or above the candidate's `height` makes the job stale.
 async fn parent_becomes_tip(
@@ -605,14 +715,19 @@ async fn tip_leaves(tip: &mut impl ChainTip, parent: block::Hash) {
 /// early relay.
 async fn local_approval(
     verify: impl std::future::Future<Output = std::result::Result<block::Hash, tower::BoxError>>,
+    finished: impl FnOnce(),
 ) -> std::result::Result<(), JobError> {
     match verify.await {
-        Ok(_) => Ok(()),
+        Ok(_) => {
+            finished();
+            Ok(())
+        }
         Err(error) if is_proposal_rejection(&error) => {
             tracing::info!(%error, "local verification rejected the prepared proposal");
             Err(JobError::Invalid)
         }
         Err(error) => {
+            finished();
             metrics::counter!("rpc.trusted_submission.job.no_local_verdict").increment(1);
             tracing::info!(%error, "local proposal verification reached no verdict; awaiting primary confirmation");
             std::future::pending().await
@@ -664,9 +779,9 @@ mod tests {
     async fn unavailable_verifier_leaves_confirmation_eligible() {
         use futures::FutureExt;
         let unavailable = std::future::ready(Err("verifier service is closed".into()));
-        assert!(local_approval(unavailable).now_or_never().is_none());
+        assert!(local_approval(unavailable, || {}).now_or_never().is_none());
         let authorized = std::future::ready(Ok(block::Hash([0; 32])));
-        assert_eq!(local_approval(authorized).await, Ok(()));
+        assert_eq!(local_approval(authorized, || {}).await, Ok(()));
     }
 
     /// Proposal verification reports state failures and a moved tip through the variant that
@@ -697,7 +812,7 @@ mod tests {
         ];
         for error in no_verdict {
             assert!(!is_proposal_rejection(&error), "{error}");
-            assert!(local_approval(std::future::ready(Err(error)))
+            assert!(local_approval(std::future::ready(Err(error)), || {})
                 .now_or_never()
                 .is_none());
         }
@@ -708,7 +823,7 @@ mod tests {
         for error in rejections {
             assert!(is_proposal_rejection(&error), "{error}");
             assert_eq!(
-                local_approval(std::future::ready(Err(error))).await,
+                local_approval(std::future::ready(Err(error)), || {}).await,
                 Err(JobError::Invalid)
             );
         }
@@ -720,33 +835,76 @@ mod tests {
         let body = Bytes::from_static(b"first");
         for id in 0..CAPACITY {
             let id = [u8::try_from(id).unwrap(); 16];
-            assert!(jobs
-                .register(id, Update::Prepare(body.clone()))
-                .unwrap()
-                .is_some());
+            assert!(matches!(
+                jobs.register(id, Update::Prepare(body.clone()), None),
+                Ok(Registration::Start(..))
+            ));
         }
         assert!(matches!(
-            jobs.register([0xff; 16], Update::Prepare(body.clone())),
+            jobs.register([0xff; 16], Update::Prepare(body.clone()), None),
             Err(JobError::Capacity)
         ));
-        assert!(jobs
-            .register([0; 16], Update::Prepare(body))
-            .unwrap()
-            .is_none());
         assert!(matches!(
-            jobs.register([0; 16], Update::Prepare(Bytes::from_static(b"second"))),
+            jobs.register([0; 16], Update::Prepare(body), None),
+            Ok(Registration::Handled)
+        ));
+        assert!(matches!(
+            jobs.register(
+                [0; 16],
+                Update::Prepare(Bytes::from_static(b"second")),
+                None
+            ),
             Err(JobError::Conflict)
         ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn eviction_wakes_the_worker_and_its_cleanup_cannot_end_a_reused_id() {
+        use futures::FutureExt;
+
+        let jobs = Jobs::default();
+        let id = [0; 16];
+        let block = zakura_chain::block::genesis::regtest_genesis_block();
+        let proposal = decode_proposal(block.zcash_serialize_to_vec().unwrap().into())
+            .await
+            .unwrap();
+        let parent = proposal.block.header.previous_block_hash;
+        let prepare = || Update::Prepare(Bytes::from_static(b"stored proposal"));
+        let Registration::Start(old, mut inputs, _) = jobs.register(id, prepare(), None).unwrap()
+        else {
+            panic!("new ID starts a worker")
+        };
+        old.send_modify(|parts| parts.replaceable_parent = Some(parent));
+        let wait = wait_for_solve(&mut inputs);
+        tokio::pin!(wait);
+        assert!(wait.as_mut().now_or_never().is_none());
+        for n in 1..CAPACITY {
+            jobs.register([u8::try_from(n).unwrap(); 16], prepare(), None)
+                .unwrap();
+        }
+        jobs.register([255; 16], prepare(), Some(&proposal))
+            .unwrap();
+        assert_eq!(wait.now_or_never(), Some(Err(JobError::Expired)));
+        tokio::time::advance(ENDED_RETENTION).await;
+        jobs.lock().end([255; 16], Err(JobError::Expired));
+        let Registration::Start(new, _, _) = jobs.register(id, prepare(), None).unwrap() else {
+            panic!("new ID starts a worker")
+        };
+        jobs.finish(id, &old, Err(JobError::Expired));
+        assert!(jobs.lock().live[&id].same_channel(&new));
     }
 
     #[tokio::test(start_paused = true)]
     async fn input_at_the_deadline_is_refused_before_the_worker_processes_expiry() {
         let jobs = Jobs::default();
         let input = || Update::Confirm([0; 64]);
-        let (_, _, deadline) = jobs.register([0; 16], input()).unwrap().unwrap();
+        let Registration::Start(_, _, deadline) = jobs.register([0; 16], input(), None).unwrap()
+        else {
+            panic!("new ID starts a worker")
+        };
         tokio::time::sleep_until(deadline).await;
         assert!(matches!(
-            jobs.register([0; 16], input()),
+            jobs.register([0; 16], input(), None),
             Err(JobError::Expired)
         ));
     }
@@ -757,29 +915,35 @@ mod tests {
         let input = || Update::Prepare(Bytes::from_static(b"body"));
         for id in 0..CAPACITY {
             let id = [u8::try_from(id).unwrap(); 16];
-            assert!(jobs.register(id, input()).unwrap().is_some());
+            assert!(matches!(
+                jobs.register(id, input(), None),
+                Ok(Registration::Start(..))
+            ));
         }
-        jobs.finish([0; 16], Err(JobError::Expired));
-        jobs.finish([1; 16], Ok(()));
+        jobs.lock().end([0; 16], Err(JobError::Expired));
+        jobs.lock().end([1; 16], Ok(()));
         // Ending twice, as a worker that both reports and unwinds would, changes nothing.
-        jobs.finish([1; 16], Err(JobError::Unavailable));
+        jobs.lock().end([1; 16], Err(JobError::Unavailable));
         assert_eq!(jobs.lock().live.len(), CAPACITY - 2);
         assert_eq!(jobs.lock().ended.len(), 2);
 
         // Any input for an ended job reports its outcome and starts nothing.
         assert!(matches!(
-            jobs.register([0; 16], Update::Confirm([0; 64])),
+            jobs.register([0; 16], Update::Confirm([0; 64]), None),
             Err(JobError::Expired)
         ));
-        assert!(jobs
-            .register([1; 16], Update::Confirm([0; 64]))
-            .unwrap()
-            .is_none());
+        assert!(matches!(
+            jobs.register([1; 16], Update::Confirm([0; 64]), None),
+            Ok(Registration::Handled)
+        ));
         assert_eq!(jobs.lock().live.len(), CAPACITY - 2);
 
         tokio::time::advance(ENDED_RETENTION).await;
         assert!(
-            jobs.register([0; 16], input()).unwrap().is_some(),
+            matches!(
+                jobs.register([0; 16], input(), None),
+                Ok(Registration::Start(..))
+            ),
             "a forgotten ID starts a new job"
         );
         assert!(jobs.lock().ended.is_empty());
@@ -790,11 +954,11 @@ mod tests {
         let jobs = Jobs::default();
         for id in 0..=ENDED_CAPACITY {
             let id = [u8::try_from(id).unwrap(); 16];
-            assert!(jobs
-                .register(id, Update::Confirm([0; 64]))
-                .unwrap()
-                .is_some());
-            jobs.finish(id, Err(JobError::Invalid));
+            assert!(matches!(
+                jobs.register(id, Update::Confirm([0; 64]), None),
+                Ok(Registration::Start(..))
+            ));
+            jobs.lock().end(id, Err(JobError::Invalid));
         }
         let registry = jobs.lock();
         assert!(registry.live.is_empty());
@@ -805,12 +969,13 @@ mod tests {
     #[test]
     fn worker_that_unwinds_still_ends_its_job() {
         let jobs = Jobs::default();
-        assert!(jobs
-            .register([5; 16], Update::Confirm([0; 64]))
-            .unwrap()
-            .is_some());
+        assert!(matches!(
+            jobs.register([5; 16], Update::Confirm([0; 64]), None),
+            Ok(Registration::Start(..))
+        ));
         let slot = Slot {
             jobs: jobs.clone(),
+            sender: jobs.lock().live[&[5; 16]].clone(),
             id: [5; 16],
             outcome: Err(JobError::Unavailable),
         };
@@ -821,7 +986,7 @@ mod tests {
         assert!(unwound.is_err());
         assert!(jobs.lock().live.is_empty());
         assert!(matches!(
-            jobs.register([5; 16], Update::Confirm([0; 64])),
+            jobs.register([5; 16], Update::Confirm([0; 64]), None),
             Err(JobError::Unavailable)
         ));
     }

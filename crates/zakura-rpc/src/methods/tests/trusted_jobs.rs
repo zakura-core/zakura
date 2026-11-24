@@ -264,6 +264,109 @@ fn rejection() -> tower::BoxError {
 }
 
 #[tokio::test(start_paused = true)]
+async fn new_template_replaces_the_oldest_idle_job_on_its_parent() {
+    let mut relay = Relay::at_parent();
+    let proposal = relay.proposal.clone();
+    let mut pending_verifications = Vec::new();
+    for id in 0..16 {
+        relay
+            .send([id; 16], Operation::Prepare, proposal.clone())
+            .await
+            .unwrap();
+        let verification = relay.proposal_verification().await;
+        if id == 0 {
+            pending_verifications.push(verification);
+        } else {
+            verification.respond(relay.proposal_hash());
+        }
+    }
+    relay
+        .send([1; 16], Operation::Confirm, relay.confirmation().to_vec())
+        .await
+        .unwrap();
+    relay
+        .send([2; 16], Operation::Solve, relay.solved_header())
+        .await
+        .unwrap();
+
+    let mut other = (*relay.solved).clone();
+    Arc::make_mut(&mut other.header).previous_block_hash = block::Hash([9; 32]);
+    let fresh = [16; 16];
+    let mut truncated = proposal.clone();
+    truncated.pop();
+    assert_eq!(
+        relay.send(fresh, Operation::Prepare, truncated).await,
+        Err(JobError::Invalid)
+    );
+    assert_eq!(
+        relay
+            .send([3; 16], Operation::Prepare, proposal.clone())
+            .await,
+        Ok(())
+    );
+
+    assert_eq!(
+        relay
+            .send(
+                fresh,
+                Operation::Prepare,
+                other.zcash_serialize_to_vec().unwrap()
+            )
+            .await,
+        Err(JobError::Capacity)
+    );
+    assert_eq!(
+        relay.send(fresh, Operation::Confirm, vec![0; 64]).await,
+        Err(JobError::Capacity)
+    );
+    relay
+        .send(fresh, Operation::Prepare, proposal.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        relay
+            .send([3; 16], Operation::Solve, relay.solved_header())
+            .await,
+        Err(JobError::Expired)
+    );
+    for id in [0, 1, 2, 4, 16] {
+        assert_eq!(
+            relay
+                .send([id; 16], Operation::Prepare, proposal.clone())
+                .await,
+            Ok(())
+        );
+    }
+    assert!(!relay.can_start(1).await);
+}
+
+#[tokio::test(start_paused = true)]
+async fn prepare_replay_returns_the_original_submission_capacity_failure() {
+    let mut relay = Relay::at_parent();
+    let reservations: Vec<_> = (0..=u8::MAX)
+        .map_while(|n| {
+            relay
+                .rpc
+                .gbt
+                .reserve_mined_submission(block::Hash([n; 32]))
+                .ok()
+        })
+        .collect();
+    relay.prepare().await.unwrap();
+    relay
+        .proposal_verification()
+        .await
+        .respond(relay.proposal_hash());
+    relay.solve().await.unwrap();
+    assert_eq!(relay.outcome().await, Err(JobError::Capacity));
+    drop(reservations);
+    assert_eq!(
+        relay.send(JOB, Operation::Prepare, vec![]).await,
+        Err(JobError::Capacity)
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn verified_proposal_releases_the_exact_solved_bytes_then_commits() {
     let mut relay = Relay::at_parent();
     assert_eq!(relay.prepare().await, Ok(()));

@@ -20,6 +20,15 @@ pub enum GatewayMatch<T> {
 }
 
 impl<T> GatewayMatch<T> {
+    /// Borrows what is known about the one node.
+    pub fn as_ref(&self) -> GatewayMatch<&T> {
+        match self {
+            Self::None => GatewayMatch::None,
+            Self::One(one) => GatewayMatch::One(one),
+            Self::Several => GatewayMatch::Several,
+        }
+    }
+
     /// Keeps the count and converts what is known about the one node.
     pub fn map<U>(self, f: impl FnOnce(T) -> U) -> GatewayMatch<U> {
         match self {
@@ -39,6 +48,16 @@ impl<T: PartialEq> GatewayMatch<T> {
             Self::One(_) | Self::Several => Self::Several,
         }
     }
+
+    /// Returns the match for the nodes both `self` and `other` know, which
+    /// all have the same gateway ID.
+    pub fn merge(self, other: Self) -> Self {
+        match other {
+            Self::None => self,
+            Self::One(node) => self.with(node),
+            Self::Several => Self::Several,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -52,5 +71,24 @@ mod tests {
         assert_eq!(none.with(1).with(1), GatewayMatch::One(1));
         assert_eq!(none.with(1).with(2), GatewayMatch::Several);
         assert_eq!(none.with(1).with(2).with(1), GatewayMatch::Several);
+    }
+
+    #[test]
+    fn merging_two_answers_counts_each_distinct_node_once() {
+        use GatewayMatch::{None, One, Several};
+        let answers = [
+            (None, None, None),
+            (None, One(1), One(1)),
+            (One(1), None, One(1)),
+            (One(1), One(1), One(1)),
+            (One(1), One(2), Several),
+            (Several, None, Several),
+            (None, Several, Several),
+            (One(1), Several, Several),
+            (Several, One(1), Several),
+        ];
+        for (left, right, merged) in answers {
+            assert_eq!(left.merge(right), merged, "{left:?} merged with {right:?}");
+        }
     }
 }

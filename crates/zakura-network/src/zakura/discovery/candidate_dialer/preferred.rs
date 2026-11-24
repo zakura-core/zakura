@@ -188,30 +188,28 @@ pub(super) async fn classify_gateways(
             .get(&gateway.gateway())
             .copied()
             .unwrap_or(GatewayMatch::None);
-        let blocks = gateway.blocks();
-        let resolved = match (local, book_answer) {
-            (GatewayMatch::Several, _) | (_, GatewayMatch::Several) => gateway.into_ambiguous(),
-            (GatewayMatch::One(node), GatewayMatch::One((booked, _))) if booked != node => {
-                gateway.into_ambiguous()
-            }
-            (GatewayMatch::One(node), _) => {
+        let resolved = match local.merge(book_answer.as_ref().map(|(node, _)| *node)) {
+            GatewayMatch::None => *gateway,
+            GatewayMatch::Several => gateway.into_ambiguous(),
+            GatewayMatch::One(node) => {
                 let standing = if registered.contains(&node) {
                     GatewayStanding::Connected
-                } else {
+                } else if in_flight.contains(&node) {
                     GatewayStanding::Dialing
+                } else {
+                    let GatewayMatch::One((_, target)) = book_answer else {
+                        unreachable!("a node neither registered nor in flight came from the book");
+                    };
+                    let standing = dialer_standing(state, &target, now);
+                    if let (GatewayStanding::Dialable, DialTarget::Dialable(candidate)) =
+                        (standing, target)
+                    {
+                        classified.dialable.insert(node, candidate);
+                    }
+                    standing
                 };
-                RankedGateway::resolved(node, blocks, standing)
+                RankedGateway::resolved(node, gateway.blocks(), standing)
             }
-            (GatewayMatch::None, GatewayMatch::One((node, target))) => {
-                let standing = dialer_standing(state, &target, now);
-                if let (GatewayStanding::Dialable, DialTarget::Dialable(candidate)) =
-                    (standing, target)
-                {
-                    classified.dialable.insert(node, candidate);
-                }
-                RankedGateway::resolved(node, blocks, standing)
-            }
-            (GatewayMatch::None, GatewayMatch::None) => *gateway,
         };
         classified.ranking.push(resolved);
     }

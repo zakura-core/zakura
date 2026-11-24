@@ -140,6 +140,11 @@ impl RankedGateway {
         }
     }
 
+    /// The known nodes with this gateway ID, without how to reach them.
+    fn nodes(&self) -> GatewayMatch<NodeId> {
+        self.resolution.map(|(node, _)| node)
+    }
+
     /// Returns this gateway once two or more known nodes have its gateway
     /// ID: it names none of them.
     pub(crate) fn into_ambiguous(mut self) -> Self {
@@ -190,13 +195,10 @@ impl RankedGateway {
         if !self.gateway.is_prefix_of(node.as_bytes()) {
             return self;
         }
-        self.resolution = match self.resolution {
-            GatewayMatch::None => GatewayMatch::One((node, GatewayStanding::Connected)),
-            GatewayMatch::One((known, _)) if known == node => {
-                GatewayMatch::One((node, GatewayStanding::Connected))
-            }
-            GatewayMatch::One(_) | GatewayMatch::Several => GatewayMatch::Several,
-        };
+        self.resolution = self
+            .nodes()
+            .with(node)
+            .map(|node| (node, GatewayStanding::Connected));
         self
     }
 }
@@ -260,11 +262,7 @@ impl GatewayRanking {
             candidates.extend(authenticated.filter_map(|node| {
                 self.tied_at_cutoff
                     .get(&GatewayId::from_node_id(node.as_bytes()))
-                    .filter(|gateway| match gateway.resolution {
-                        GatewayMatch::None => true,
-                        GatewayMatch::One((named, _)) => named == *node,
-                        GatewayMatch::Several => false,
-                    })
+                    .filter(|gateway| gateway.nodes().with(*node) == GatewayMatch::One(*node))
                     .filter(|gateway| joined.insert(gateway.gateway))
                     .copied()
             }));

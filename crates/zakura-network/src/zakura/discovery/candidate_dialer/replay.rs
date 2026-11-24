@@ -229,7 +229,7 @@ const PROPERTY: &str = "discovery/dial-attempts";
 const PREFERRED_PROPERTY: &str = "discovery/preferred-dials";
 
 /// The seed of [`local_node_id`].
-const LOCAL_NODE_SEED: u8 = 16;
+const LOCAL_NODE_SEED: u8 = 15;
 
 /// Applicable transitions in a decoder-v2 candidate dial history.
 #[derive(Debug, Default, Eq, PartialEq)]

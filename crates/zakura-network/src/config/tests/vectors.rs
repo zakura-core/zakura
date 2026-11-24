@@ -1789,8 +1789,8 @@ fn zakura_secret_key_text_forms_keep_their_node_id() {
     const SEED_HEX: &str = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60";
     const SEED_BASE32: &str = "TVQ3DHPP7VNGBOUEJL2JF3BMYRCETRLJPMZGSGLQHOWAGHFOP5QA";
     // The node ID of the key list that holds that public key, `d75a98...511a`,
-    // and the fingerprint of the ML-DSA-44 key the same seed derives.
-    const NODE_ID: &str = "78333d017dc319f798578d82bcdafb434f582cf38b98bc85e4b17bfde89a4c53";
+    // and the fingerprint of the ML-DSA-87 key the same seed derives.
+    const NODE_ID: &str = "9eafa75f94d9c03181ba7cc5454bc8349db27564dbd01f59078db77b7e950398";
 
     let key_dir = tempfile::tempdir().expect("failed to create temp key dir");
     let key_file = key_dir.path().join("mainnet.zakura-iroh-secret-key");

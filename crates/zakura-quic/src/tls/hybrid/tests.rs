@@ -1,19 +1,19 @@
-//! X25519MLKEM768: the layout of its shares and secret, refused inputs, the
+//! X25519MLKEM1024: the layout of its shares and secret, refused inputs, the
 //! plain X25519 fallback and agreement with another implementation's
 //! recorded answers.
 
 use curve25519_dalek::montgomery::MontgomeryPoint;
-use libcrux_ml_kem::mlkem768::{self, MlKem768PublicKey};
+use libcrux_ml_kem::mlkem1024::{self, MlKem1024PublicKey};
 use rustls::crypto::GetRandomFailed;
 use serde::Deserialize;
 
 use super::*;
 
 /// The dialer's share: an ML-KEM encapsulation key, then an X25519 key.
-const DIALER_SHARE_LEN: usize = 1216;
+const DIALER_SHARE_LEN: usize = 1600;
 
 /// The listener's share: an ML-KEM ciphertext, then an X25519 key.
-const LISTENER_SHARE_LEN: usize = 1120;
+const LISTENER_SHARE_LEN: usize = 1600;
 
 /// The hybrid secret: 32 bytes from each half.
 const SECRET_LEN: usize = 64;
@@ -96,8 +96,8 @@ fn ring_x25519() -> &'static dyn SupportedKxGroup {
 
 /// The hybrid whose ML-KEM half draws [`FIXED_BYTE`]s. Its X25519 half is
 /// ring's, which draws from the operating system.
-fn fixed_mlkem() -> X25519MlKem768 {
-    X25519MlKem768::new(ring_x25519(), &FIXED)
+fn fixed_mlkem() -> X25519MlKem1024 {
+    X25519MlKem1024::new(ring_x25519(), &FIXED)
 }
 
 /// An X25519 key pair computed with curve25519-dalek, independently of ring.
@@ -116,10 +116,10 @@ fn x25519_secret(scalar: [u8; 32], peer: &[u8]) -> [u8; 32] {
 /// secrets, which the caller compares.
 fn exchange(dialer: &dyn SupportedKxGroup, listener: &dyn SupportedKxGroup) -> (Vec<u8>, Vec<u8>) {
     let started = dialer.start().unwrap();
-    assert_eq!(started.group(), NamedGroup::X25519MLKEM768);
+    assert_eq!(started.group(), X25519_MLKEM1024);
     assert_eq!(started.pub_key().len(), DIALER_SHARE_LEN);
     let answered = listener.start_and_complete(started.pub_key()).unwrap();
-    assert_eq!(answered.group, NamedGroup::X25519MLKEM768);
+    assert_eq!(answered.group, X25519_MLKEM1024);
     assert_eq!(answered.pub_key.len(), LISTENER_SHARE_LEN);
     let dialer_secret = started.complete(&answered.pub_key).unwrap();
     (
@@ -132,7 +132,7 @@ fn exchange(dialer: &dyn SupportedKxGroup, listener: &dyn SupportedKxGroup) -> (
 /// exchange.
 #[test]
 fn both_sides_agree_on_the_secret() {
-    let group = x25519_mlkem768();
+    let group = x25519_mlkem1024();
     let (dialer, listener) = exchange(group, group);
     assert_eq!(dialer, listener);
     assert_eq!(dialer.len(), SECRET_LEN);
@@ -150,11 +150,11 @@ fn the_dialers_share_and_secret_are_the_ml_kem_part_then_the_x25519_part() {
     let (encapsulation_key, dialer_x25519) = share.split_at(mlkem::ENCAPSULATION_KEY_LEN);
     assert_eq!(
         encapsulation_key,
-        mlkem768::generate_key_pair([FIXED_BYTE; 64]).pk()
+        mlkem1024::generate_key_pair([FIXED_BYTE; 64]).pk()
     );
 
-    let (ciphertext, mlkem768_secret) = mlkem768::encapsulate(
-        &MlKem768PublicKey::try_from(encapsulation_key).unwrap(),
+    let (ciphertext, mlkem1024_secret) = mlkem1024::encapsulate(
+        &MlKem1024PublicKey::try_from(encapsulation_key).unwrap(),
         [7; 32],
     );
     let (scalar, listener_x25519) = x25519_pair([9; 32]);
@@ -164,7 +164,7 @@ fn the_dialers_share_and_secret_are_the_ml_kem_part_then_the_x25519_part() {
     let secret = dialer.complete(&listener_share).unwrap();
     assert_eq!(
         secret.secret_bytes(),
-        [mlkem768_secret, x25519_secret(scalar, dialer_x25519)].concat()
+        [mlkem1024_secret, x25519_secret(scalar, dialer_x25519)].concat()
     );
 }
 
@@ -173,23 +173,23 @@ fn the_dialers_share_and_secret_are_the_ml_kem_part_then_the_x25519_part() {
 /// curve25519-dalek used directly.
 #[test]
 fn the_listeners_share_and_secret_are_the_ml_kem_part_then_the_x25519_part() {
-    let key_pair = mlkem768::generate_key_pair([5; 64]);
+    let key_pair = mlkem1024::generate_key_pair([5; 64]);
     let (scalar, dialer_x25519) = x25519_pair([3; 32]);
     let dialer_share = [key_pair.pk().as_slice(), &dialer_x25519].concat();
     assert_eq!(dialer_share.len(), DIALER_SHARE_LEN);
 
     let answered = fixed_mlkem().start_and_complete(&dialer_share).unwrap();
     let (ciphertext, listener_x25519) = answered.pub_key.split_at(mlkem::CIPHERTEXT_LEN);
-    let (expected_ciphertext, _) = mlkem768::encapsulate(key_pair.public_key(), [FIXED_BYTE; 32]);
+    let (expected_ciphertext, _) = mlkem1024::encapsulate(key_pair.public_key(), [FIXED_BYTE; 32]);
     assert_eq!(ciphertext, expected_ciphertext.as_slice());
 
-    let mlkem768_secret = mlkem768::decapsulate(
+    let mlkem1024_secret = mlkem1024::decapsulate(
         key_pair.private_key(),
-        &mlkem768::MlKem768Ciphertext::try_from(ciphertext).unwrap(),
+        &mlkem1024::MlKem1024Ciphertext::try_from(ciphertext).unwrap(),
     );
     assert_eq!(
         answered.secret.secret_bytes(),
-        [mlkem768_secret, x25519_secret(scalar, listener_x25519)].concat()
+        [mlkem1024_secret, x25519_secret(scalar, listener_x25519)].concat()
     );
 }
 
@@ -197,7 +197,7 @@ fn the_listeners_share_and_secret_are_the_ml_kem_part_then_the_x25519_part() {
 /// includes a share holding only one of the two parts.
 #[test]
 fn shares_of_the_wrong_length_are_refused() {
-    let group = x25519_mlkem768();
+    let group = x25519_mlkem1024();
     for len in [
         0,
         X25519_LEN,
@@ -236,14 +236,14 @@ fn shares_of_the_wrong_length_are_refused() {
 /// that gives the all-zero secret.
 #[test]
 fn a_bad_half_fails_the_exchange() {
-    let group = x25519_mlkem768();
+    let group = x25519_mlkem1024();
     let good = group.start().unwrap().pub_key().to_vec();
 
     // The first 12-bit coefficient becomes 4095, above the modulus 3329.
-    let mut bad_mlkem768 = good.clone();
-    bad_mlkem768[..2].fill(0xff);
+    let mut bad_mlkem1024 = good.clone();
+    bad_mlkem1024[..2].fill(0xff);
     assert_eq!(
-        group.start_and_complete(&bad_mlkem768).err(),
+        group.start_and_complete(&bad_mlkem1024).err(),
         Some(INVALID_KEY_SHARE)
     );
 
@@ -265,15 +265,15 @@ fn a_bad_half_fails_the_exchange() {
 /// the handshake fails at its first authenticated message.
 #[test]
 fn an_altered_ciphertext_gives_the_dialer_another_secret() {
-    let group = x25519_mlkem768();
+    let group = x25519_mlkem1024();
     let dialer = group.start().unwrap();
     let answered = group.start_and_complete(dialer.pub_key()).unwrap();
     let mut altered = answered.pub_key.clone();
     altered[0] ^= 1;
     let secret = dialer.complete(&altered).unwrap();
-    let (dialer_mlkem768, dialer_x25519) = secret.secret_bytes().split_at(32);
-    let (listener_mlkem768, listener_x25519) = answered.secret.secret_bytes().split_at(32);
-    assert_ne!(dialer_mlkem768, listener_mlkem768);
+    let (dialer_mlkem1024, dialer_x25519) = secret.secret_bytes().split_at(32);
+    let (listener_mlkem1024, listener_x25519) = answered.secret.secret_bytes().split_at(32);
+    assert_ne!(dialer_mlkem1024, listener_mlkem1024);
     assert_eq!(dialer_x25519, listener_x25519);
 }
 
@@ -281,7 +281,7 @@ fn an_altered_ciphertext_gives_the_dialer_another_secret() {
 /// X25519 half for that exchange.
 #[test]
 fn the_x25519_half_completes_against_a_plain_x25519_listener() {
-    let dialer = x25519_mlkem768().start().unwrap();
+    let dialer = x25519_mlkem1024().start().unwrap();
     let (group, share) = dialer.hybrid_component().unwrap();
     assert_eq!(group, NamedGroup::X25519);
     assert_eq!(share, &dialer.pub_key()[mlkem::ENCAPSULATION_KEY_LEN..]);
@@ -292,42 +292,45 @@ fn the_x25519_half_completes_against_a_plain_x25519_listener() {
     assert_eq!(secret.secret_bytes().len(), X25519_LEN);
 }
 
-/// The group names itself X25519MLKEM768 and is offered with TLS 1.3 only.
+/// The group names itself by its private-use code point and is offered with
+/// TLS 1.3 only.
 #[test]
-fn the_group_is_x25519mlkem768_for_tls13_only() {
-    let group = x25519_mlkem768();
-    assert_eq!(group.name(), NamedGroup::X25519MLKEM768);
-    assert_eq!(u16::from(group.name()), 0x11ec);
+fn the_group_is_x25519mlkem1024_for_tls13_only() {
+    let group = x25519_mlkem1024();
+    assert_eq!(group.name(), X25519_MLKEM1024);
+    assert_eq!(u16::from(group.name()), 0xfe24);
     assert!(group.usable_for_version(ProtocolVersion::TLSv1_3));
     assert!(!group.usable_for_version(ProtocolVersion::TLSv1_2));
     assert!(group.ffdhe_group().is_none());
     assert!(group.start().unwrap().ffdhe_group().is_none());
 }
 
-/// The metric labels are rustls' names for the groups, which operators
-/// match on (OBS-1).
+/// The metric labels operators match on (OBS-1): rustls' name for plain
+/// X25519, and the hybrid's own name, since rustls has none for a
+/// private-use group.
 #[test]
-fn the_group_labels_are_rustls_names() {
-    assert_eq!(NamedGroup::X25519MLKEM768.as_str(), Some(HYBRID_LABEL));
+fn the_group_labels_name_the_groups() {
+    assert_eq!(X25519_MLKEM1024.as_str(), None);
+    assert_eq!(HYBRID_LABEL, "X25519MLKEM1024");
     assert_eq!(NamedGroup::X25519.as_str(), Some(X25519_LABEL));
 }
 
 /// When ML-KEM's random source fails, neither side produces a share.
 #[test]
 fn a_failed_random_source_fails_the_exchange() {
-    let failing = X25519MlKem768::new(ring_x25519(), &FAILING);
+    let failing = X25519MlKem1024::new(ring_x25519(), &FAILING);
     assert_eq!(
         failing.start().err(),
         Some(rustls::Error::FailedToGetRandomBytes)
     );
-    let share = x25519_mlkem768().start().unwrap().pub_key().to_vec();
+    let share = x25519_mlkem1024().start().unwrap().pub_key().to_vec();
     assert_eq!(
         failing.start_and_complete(&share).err(),
         Some(rustls::Error::FailedToGetRandomBytes)
     );
 }
 
-/// Exchanges an independent X25519MLKEM768 implementation recorded with
+/// Exchanges an independent X25519MLKEM1024 implementation recorded with
 /// our group, one in each role. Shares and secrets are hex, and the file's
 /// `comment` says how they were recorded.
 #[derive(Deserialize)]
@@ -371,7 +374,7 @@ fn from_hex<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>
 fn the_group_agrees_with_an_independent_implementation() {
     let recorded: Recorded =
         serde_json::from_str(include_str!("independent_answers.json")).unwrap();
-    let ours = X25519MlKem768::new(&FIXED_X25519, &FIXED);
+    let ours = X25519MlKem1024::new(&FIXED_X25519, &FIXED);
     assert_eq!(u16::from(ours.name()), recorded.group);
 
     let they_dial = recorded.they_dial;

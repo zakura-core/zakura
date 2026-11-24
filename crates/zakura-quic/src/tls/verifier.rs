@@ -7,7 +7,7 @@
 //! synthetic server name; Zakura builds one verifier per dial that holds the
 //! expected [`NodeId`] in memory (TLS-6). And the raw public key is the
 //! node's credential, not a bare Ed25519 key (TLS-3), and the signature is a
-//! composite of Ed25519 and ML-DSA-44 (TLS-4), so both verifiers read the
+//! composite of Ed25519 and ML-DSA-87 (TLS-4), so both verifiers read the
 //! credential through [`super::credential_from_cert`] and check the
 //! signature with its two keys themselves.
 
@@ -20,7 +20,7 @@ use rustls::{
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 
 use crate::{
-    composite::{self, COMPOSITE_SCHEME, COMPOSITE_SCHEME_LABEL, ML_DSA_44_KEY_TAG},
+    composite::{self, COMPOSITE_SCHEME, COMPOSITE_SCHEME_LABEL, ML_DSA_87_KEY_TAG},
     credential::NodeCredential,
     key::NodeId,
 };
@@ -150,7 +150,7 @@ impl ClientCertVerifier for ClientCertificateVerifier {
 }
 
 /// Reads a peer's credential and checks this release can authenticate it: it
-/// stands alone and holds both an Ed25519 and an ML-DSA-44 key (TLS-3,
+/// stands alone and holds both an Ed25519 and an ML-DSA-87 key (TLS-3,
 /// TLS-4, ID-11).
 fn verifiable_credential(
     end_entity: &CertificateDer<'_>,
@@ -166,7 +166,7 @@ fn verifiable_credential(
     )?;
     // A well-formed credential without both keys this release signs with
     // is unverifiable, not malformed (ID-11): the handshake fails either way.
-    if credential.ed25519().is_none() || credential.key(ML_DSA_44_KEY_TAG).is_none() {
+    if credential.ed25519().is_none() || credential.key(ML_DSA_87_KEY_TAG).is_none() {
         return Err(rustls::Error::InvalidCertificate(
             CertificateError::ApplicationVerificationFailure,
         ));
@@ -175,7 +175,7 @@ fn verifiable_credential(
 }
 
 /// Checks the peer's composite handshake signature with its credential's
-/// Ed25519 key, under ID-6's strict rules, and its ML-DSA-44 key (TLS-4).
+/// Ed25519 key, under ID-6's strict rules, and its ML-DSA-87 key (TLS-4).
 fn verify_signature(
     message: &[u8],
     cert: &CertificateDer<'_>,
@@ -190,7 +190,7 @@ fn verify_signature(
     // credential parses and holds both keys.
     let bad_encoding = rustls::Error::InvalidCertificate(CertificateError::BadEncoding);
     let credential = super::credential_from_cert(cert.as_ref()).ok_or(bad_encoding.clone())?;
-    let (Some(ed25519), Some(ml_dsa)) = (credential.ed25519(), credential.key(ML_DSA_44_KEY_TAG))
+    let (Some(ed25519), Some(ml_dsa)) = (credential.ed25519(), credential.key(ML_DSA_87_KEY_TAG))
     else {
         return Err(bad_encoding);
     };
@@ -228,6 +228,25 @@ mod tests {
         assert!(verifiable_credential(&cert(secret.credential()), &[]).is_ok());
     }
 
+    /// ID-10, ID-11, ID-13: a `p2p-v2/4` credential, whose ML-DSA-44 key sits
+    /// under tag 2, still decodes and names its node, but tag 2 is an
+    /// unknown entry now, so it holds no key this release authenticates with.
+    #[test]
+    fn a_p2p_v2_4_credential_decodes_but_is_refused() {
+        let secret = NodeSecretKey::generate();
+        let previous = NodeCredential::from_entries([
+            (ED25519_KEY_TAG, secret.public_key().as_bytes().to_vec()),
+            (2, vec![0x44; 1_312]),
+        ])
+        .expect("an Ed25519 key and an unknown entry form a credential");
+        assert_eq!(
+            NodeCredential::decode(&previous.encode()),
+            Ok(previous.clone())
+        );
+        assert_eq!(previous.key(ML_DSA_87_KEY_TAG), None);
+        assert!(verifiable_credential(&cert(&previous), &[]).is_err());
+    }
+
     /// TLS-4: a credential that pairs this node's Ed25519 key with another
     /// node's ML-DSA key fails the ML-DSA half of the composite.
     #[test]
@@ -237,20 +256,20 @@ mod tests {
         let message = b"transcript";
         let signature = secret.sign_composite(message, [3; 32]).unwrap();
         let ml_dsa =
-            |node: &NodeSecretKey| node.credential().key(ML_DSA_44_KEY_TAG).unwrap().to_vec();
+            |node: &NodeSecretKey| node.credential().key(ML_DSA_87_KEY_TAG).unwrap().to_vec();
         assert!(
             composite::verify(&secret.public_key(), &ml_dsa(&secret), message, &signature).is_ok()
         );
 
         let swapped = NodeCredential::from_entries([
             (ED25519_KEY_TAG, secret.public_key().as_bytes().to_vec()),
-            (ML_DSA_44_KEY_TAG, ml_dsa(&other)),
+            (ML_DSA_87_KEY_TAG, ml_dsa(&other)),
         ])
         .unwrap();
         assert!(verifiable_credential(&cert(&swapped), &[]).is_ok());
         assert!(composite::verify(
             &secret.public_key(),
-            swapped.key(ML_DSA_44_KEY_TAG).unwrap(),
+            swapped.key(ML_DSA_87_KEY_TAG).unwrap(),
             message,
             &signature
         )

@@ -62,10 +62,10 @@ pub(crate) async fn regtest_coinbase_names_the_gateway() -> eyre::Result<()> {
 /// checks that the coinbase names the node's own ID, and returns the block.
 async fn announcing_block(net: &Network, addr_type: MinerAddressType) -> eyre::Result<Block> {
     // RFC 8032 section 7.1, test 1, as the node's secret key. The node ID is the hash of
-    // the key list that seed derives: its Ed25519 public key and its ML-DSA-44 key.
+    // the key list that seed derives: its Ed25519 public key and its ML-DSA-87 key.
     const NODE_SECRET_KEY: &str =
         "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60";
-    const NODE_ID: &str = "78333d017dc319f798578d82bcdafb434f582cf38b98bc85e4b17bfde89a4c53";
+    const NODE_ID: &str = "9eafa75f94d9c03181ba7cc5454bc8349db27564dbd01f59078db77b7e950398";
 
     let identity_dir = tempfile::tempdir()?;
     std::fs::write(

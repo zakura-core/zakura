@@ -1,6 +1,6 @@
 # Zakura mixed-version e2e: NEW v2-only node (the binary under test).
 #
-# Joins only by dialing new-dual natively over p2p-v2/4. Blocks mined on an old
+# Joins only by dialing new-dual natively over p2p-v2/5. Blocks mined on an old
 # node reach it only through new-dual's legacy link to the old cohort.
 
 [network]

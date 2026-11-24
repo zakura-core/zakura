@@ -3240,7 +3240,7 @@ fn registry_streams(registry: &ServiceRegistry) -> impl Iterator<Item = Stream> 
         .flat_map(|service| service.streams().iter().copied())
 }
 
-/// zakura-quic acceptor for the Zakura `p2p-v2/4` ALPN.
+/// zakura-quic acceptor for the Zakura `p2p-v2/5` ALPN.
 #[derive(Debug, Clone)]
 pub struct ZakuraProtocolHandler {
     supervisor: ZakuraSupervisorHandle,

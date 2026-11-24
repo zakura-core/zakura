@@ -96,14 +96,15 @@ itertools = "0.14"
 jubjub = { version = "=5.4.0", package = "zakura-jubjub" }
 async-trait = "0.1.89"
 libc = "0.2"
-# SPEC TLS-9: ML-KEM-768 for the hybrid key-exchange group. Rust with no C;
+# SPEC TLS-9: ML-KEM-1024 for the hybrid key-exchange group. Rust with no C;
 # its portable and AVX2 code is formally verified, its NEON code (used on
 # aarch64) is not. Its build script compiles the NEON or AVX2 path for the
-# target, picked at run time. Only the 768 parameter set, with its
+# target, picked at run time. Only the 1024 parameter set, with its
 # `rand` feature off: the caller passes the randomness in, so a simulation can
 # seed it.
-libcrux-ml-kem = { version = "0.0.12", default-features = false, features = ["mlkem768"] }
-libcrux-ml-dsa = { version = "0.0.12", default-features = false, features = ["mldsa44"] }
+libcrux-ml-kem = { version = "0.0.12", default-features = false, features = ["mlkem1024"] }
+# SPEC TLS-4: ML-DSA-87 for the composite handshake signature.
+libcrux-ml-dsa = { version = "0.0.12", default-features = false, features = ["mldsa87"] }
 memchr = "2.8"
 metrics = "0.24"
 pin-project = "1.1.10"
@@ -303,6 +304,34 @@ incremental = false
 codegen-units = 16
 
 [profile.dev.package.sha2]
+opt-level = 3
+debug-assertions = false
+overflow-checks = false
+incremental = false
+codegen-units = 16
+
+[profile.dev.package.libcrux-ml-dsa]
+opt-level = 3
+debug-assertions = false
+overflow-checks = false
+incremental = false
+codegen-units = 16
+
+[profile.dev.package.libcrux-ml-kem]
+opt-level = 3
+debug-assertions = false
+overflow-checks = false
+incremental = false
+codegen-units = 16
+
+[profile.dev.package.libcrux-sha3]
+opt-level = 3
+debug-assertions = false
+overflow-checks = false
+incremental = false
+codegen-units = 16
+
+[profile.dev.package.libcrux-intrinsics]
 opt-level = 3
 debug-assertions = false
 overflow-checks = false

@@ -12,7 +12,7 @@ use blake2b_simd::Params;
 use rustls_pki_types::{AlgorithmIdentifier, SubjectPublicKeyInfoDer};
 
 use crate::{
-    composite::{ML_DSA_44_KEY_BYTES, ML_DSA_44_KEY_TAG},
+    composite::{ML_DSA_87_KEY_BYTES, ML_DSA_87_KEY_TAG},
     key::{NodeId, NodeKey, KEY_LENGTH},
     key_list::{KeyListError, NodeKeyList, ED25519_KEY_TAG, MAX_NODE_KEYS},
 };
@@ -48,7 +48,7 @@ pub enum CredentialError {
     #[error(transparent)]
     KeyList(#[from] KeyListError),
     /// A key is empty, longer than [`MAX_CREDENTIAL_KEY_BYTES`], or not the
-    /// length its tag fixes (32 bytes for Ed25519, 1,312 for ML-DSA-44).
+    /// length its tag fixes (32 bytes for Ed25519, 2,592 for ML-DSA-87).
     #[error("a credential key has the wrong length")]
     KeyLength,
 }
@@ -82,7 +82,7 @@ impl NodeCredential {
         for (tag, key) in &entries {
             let fixed = match *tag {
                 ED25519_KEY_TAG => Some(KEY_LENGTH),
-                ML_DSA_44_KEY_TAG => Some(ML_DSA_44_KEY_BYTES),
+                ML_DSA_87_KEY_TAG => Some(ML_DSA_87_KEY_BYTES),
                 _ => None,
             };
             let fits = match fixed {
@@ -305,14 +305,14 @@ mod tests {
 
     /// The Regtest e2e harness names its seed node by this ID
     /// (`docker/zakura-regtest-e2e/node2.toml`). Computed with Python's
-    /// `hashlib.blake2b`: the ML-DSA-44 key's fingerprint under
+    /// `hashlib.blake2b`: the ML-DSA-87 key's fingerprint under
     /// `Zakura_KeyFpr_v1`, then the two-entry list under `Zakura_NodeId_v1`.
     #[test]
     fn the_e2e_seed_nodes_id_has_its_known_value() {
         let secret = NodeSecretKey::from_bytes(&[1; KEY_LENGTH]);
         assert_eq!(
             secret.public().to_string(),
-            "aefd494144d9d64d7a45c4946c5af2adeb2c9242ccf7325c05904c40456b1797"
+            "b6a03f0bb251c17e8ecbf067ad5684a2915d22302422cb112f9be012b2aa5ceb"
         );
     }
 

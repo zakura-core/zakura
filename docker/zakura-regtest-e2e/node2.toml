@@ -33,7 +33,7 @@ listen_addr = "127.0.0.1:18334"
 # Dial node 1's stable Zakura endpoint (its fixed node id @ its fixed QUIC port).
 # This is the only way this node joins the network.
 bootstrap_peers = [
-  "aefd494144d9d64d7a45c4946c5af2adeb2c9242ccf7325c05904c40456b1797@127.0.0.1:18234",
+  "b6a03f0bb251c17e8ecbf067ad5684a2915d22302422cb112f9be012b2aa5ceb@127.0.0.1:18234",
 ]
 trace_dir = "/traces/node2"
 

@@ -17,7 +17,7 @@ use ring::signature::{Ed25519KeyPair, KeyPair as _, UnparsedPublicKey, ED25519};
 use zeroize::Zeroize as _;
 
 use crate::{
-    composite::{self, ML_DSA_44_KEY_TAG},
+    composite::{self, ML_DSA_87_KEY_TAG},
     NodeCredential, NodeKeyList, ED25519_KEY_TAG,
 };
 
@@ -232,9 +232,9 @@ pub struct SignatureError;
 
 /// A node's Ed25519 secret seed (ID-3).
 ///
-/// It holds the seed, the ML-DSA-44 seed derived from it, the public keys
+/// It holds the seed, the ML-DSA-87 seed derived from it, the public keys
 /// and the credential that names the node, and zeroizes both seeds on drop.
-/// The seed derives both the Ed25519 key (ID-4) and the ML-DSA-44 key
+/// The seed derives both the Ed25519 key (ID-4) and the ML-DSA-87 key
 /// (ID-13). [`sign`](Self::sign) expands the seed for each signature, and
 /// `ring` does not zeroize that expanded key when the call returns; the
 /// ML-DSA signing key is regenerated for each signature, and ID-13 lists the
@@ -243,7 +243,7 @@ pub struct SignatureError;
 #[derive(Clone)]
 pub struct NodeSecretKey {
     seed: [u8; KEY_LENGTH],
-    /// The ML-DSA-44 key generation seed derived from `seed` (ID-13).
+    /// The ML-DSA-87 key generation seed derived from `seed` (ID-13).
     ml_dsa_seed: [u8; KEY_LENGTH],
     public: NodeKey,
     /// The keys the node proves in TLS. `public` is the Ed25519 key among
@@ -273,11 +273,11 @@ impl NodeSecretKey {
         let credential = NodeCredential::from_entries([
             (ED25519_KEY_TAG, public.as_bytes().to_vec()),
             (
-                ML_DSA_44_KEY_TAG,
+                ML_DSA_87_KEY_TAG,
                 composite::ml_dsa_public_key(&ml_dsa_seed).to_vec(),
             ),
         ])
-        .expect("a valid Ed25519 key and an ML-DSA-44 key form a credential");
+        .expect("a valid Ed25519 key and an ML-DSA-87 key form a credential");
         Self {
             seed: *seed,
             ml_dsa_seed,
@@ -322,20 +322,20 @@ impl NodeSecretKey {
 
     /// Returns the keys the node presents in TLS. Unless
     /// [`Self::with_credential`] replaced it, this holds the node's Ed25519
-    /// and ML-DSA-44 keys.
+    /// and ML-DSA-87 keys.
     pub fn credential(&self) -> &NodeCredential {
         &self.credential
     }
 
     /// Presents `credential` in TLS instead of the derived one, which
     /// changes the node ID. `credential` must hold this node's Ed25519 and
-    /// ML-DSA-44 keys, the two it signs with.
+    /// ML-DSA-87 keys, the two it signs with.
     ///
     /// The other entries are opaque here, and a peer accepts them by their
     /// fingerprints.
     pub fn with_credential(mut self, credential: NodeCredential) -> Result<Self, ForeignKeyList> {
         let own = |tag| self.credential.key(tag) == credential.key(tag);
-        if credential.ed25519() != Some(self.public) || !own(ML_DSA_44_KEY_TAG) {
+        if credential.ed25519() != Some(self.public) || !own(ML_DSA_87_KEY_TAG) {
             return Err(ForeignKeyList);
         }
         self.credential = credential;
@@ -357,7 +357,7 @@ impl NodeSecretKey {
     }
 
     /// Signs `message` with the composite of both keys (TLS-4): the Ed25519
-    /// signature, then the ML-DSA-44 signature hedged with `randomness`.
+    /// signature, then the ML-DSA-87 signature hedged with `randomness`.
     pub(crate) fn sign_composite(
         &self,
         message: &[u8],
@@ -374,7 +374,7 @@ impl NodeSecretKey {
     }
 }
 
-/// A credential that does not hold the secret key's Ed25519 and ML-DSA-44
+/// A credential that does not hold the secret key's Ed25519 and ML-DSA-87
 /// public keys, so the secret key cannot prove it is the node it names.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 #[error("the credential does not hold this secret key's public keys")]

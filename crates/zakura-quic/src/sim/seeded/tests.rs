@@ -149,8 +149,8 @@ fn the_seeded_group_agrees_with_rings_x25519() {
 fn the_seeded_hybrid_agrees_with_the_production_hybrid() {
     let inputs = SeededInputs::new(SEED, 1);
     let seeded = inputs.streams.slot.hybrid();
-    let production = crate::tls::hybrid::x25519_mlkem768();
-    assert_eq!(seeded.name(), NamedGroup::X25519MLKEM768);
+    let production = crate::tls::hybrid::x25519_mlkem1024();
+    assert_eq!(seeded.name(), crate::tls::hybrid::X25519_MLKEM1024);
     assert_eq!(seeded.name(), production.name());
 
     let dialer = seeded.start().unwrap();

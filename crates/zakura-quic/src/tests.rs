@@ -368,7 +368,7 @@ fn assert_counted_one_post_quantum_handshake(side: &str, counters: &Counters) {
     assert_eq!(
         counters.series("zakura.quic.tls.key_exchange"),
         BTreeMap::from([(
-            r#"zakura.quic.tls.key_exchange{group="X25519MLKEM768"}"#.to_string(),
+            r#"zakura.quic.tls.key_exchange{group="X25519MLKEM1024"}"#.to_string(),
             1
         )]),
         "{side} key exchanges"
@@ -381,7 +381,7 @@ fn assert_verified_signatures(side: &str, counters: &Counters, expected: u64) {
     assert_eq!(
         counters.series("zakura.quic.tls.signature_verified"),
         BTreeMap::from([(
-            r#"zakura.quic.tls.signature_verified{scheme="ed25519_mldsa44"}"#.to_string(),
+            r#"zakura.quic.tls.signature_verified{scheme="ed25519_mldsa87"}"#.to_string(),
             expected
         )]),
         "{side} verified signatures"
@@ -3134,7 +3134,7 @@ async fn pump(net: SimNet) {
     }
 }
 
-/// The dialer's hello carries the hybrid key share, 1,216 bytes, so its first
+/// The dialer's hello carries the hybrid key share, 1,600 bytes, so its first
 /// flight is two full Initial datagrams where a hello with ring's groups
 /// needed one (TLS-9). Both leave before any reply. The server accepts the
 /// first, the second joins that connection, and the handshake completes.
@@ -3169,13 +3169,16 @@ async fn the_hybrid_hello_leaves_as_two_initial_datagrams() {
     .unwrap();
 }
 
-/// TLS-4, ADM-1: with the composite credential and signature, the
-/// listener's whole first flight still fits QUIC's allowance before the
-/// dialer's address is validated, three times the 2,400 bytes of the hybrid
-/// hello. The dialer completes its handshake on that flight alone, so the
-/// larger signature adds no round trip.
+/// TLS-4, TLS-9, ADM-1: the listener's whole first flight, with its
+/// ML-KEM-1024 ciphertext, ML-DSA-87 credential and composite signature, is
+/// larger than QUIC's allowance before the dialer's address is validated:
+/// three times the 2,400 bytes of the hybrid hello. quinn-proto stops at the
+/// allowance, finishing the datagram it started (quinn issue 1082), and sends
+/// the rest once the dialer's acknowledgements validate the address. A dial
+/// therefore completes one round trip later than on the smaller `p2p-v2/4`
+/// handshake, and no later.
 #[tokio::test(start_paused = true)]
-async fn the_listeners_first_flight_fits_the_amplification_limit() {
+async fn the_listeners_first_flight_waits_one_round_trip_for_validation() {
     tokio::time::timeout(SIM_TEST_TIMEOUT, async {
         let net = sim_net();
         let _server =
@@ -3198,25 +3201,44 @@ async fn the_listeners_first_flight_fits_the_amplification_limit() {
                 }
             }
         };
+        let sent = |src: SocketAddr| -> usize { sent_lengths(&net, src).iter().sum() };
+        // One round trip: let the delay pass, deliver what `src` sent, and let
+        // the receiver answer.
+        let round = |src: SocketAddr| async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            deliver_from(src);
+            settle().await;
+        };
+        let mtu = usize::from(test_config().initial_mtu);
 
         settle().await;
-        let hello: usize = sent_lengths(&net, sim_addr(2)).iter().sum();
+        let hello = sent(sim_addr(2));
         assert_eq!(hello, 2_400, "the hybrid hello is two full datagrams");
-        tokio::time::sleep(Duration::from_millis(5)).await;
-        deliver_from(sim_addr(2));
-        settle().await;
 
-        let flight: usize = sent_lengths(&net, sim_addr(1)).iter().sum();
+        round(sim_addr(2)).await;
+        let first = sent(sim_addr(1));
         assert!(
-            flight <= 3 * hello,
-            "the listener sent {flight} bytes before validation"
+            first > 3 * hello - mtu && first < 3 * hello + mtu,
+            "the listener sent {first} bytes before validation, which is not the allowance"
         );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-        deliver_from(sim_addr(1));
-        settle().await;
+
+        round(sim_addr(1)).await;
+        assert!(
+            !dial.is_finished(),
+            "the dialer can't complete on the first {first} bytes"
+        );
+
+        round(sim_addr(2)).await;
+        let rest = sent(sim_addr(1)) - first;
+        assert!(
+            rest > 0,
+            "the validated listener sends the rest of its flight"
+        );
+
+        round(sim_addr(1)).await;
         assert!(
             dial.is_finished(),
-            "the dialer completed on the listener's first flight of {flight} bytes"
+            "the dialer completed on the listener's {first} + {rest} bytes"
         );
         let (_client, result) = dial.await.unwrap();
         result.unwrap();

@@ -10,14 +10,10 @@ use crate::{
 /// How many blocks below the tip the newest counted block sits.
 ///
 /// Reorgs deeper than a few blocks are rare, so a block this deep almost
-/// always stays on the best chain and the counts change little when the tip
-/// moves. When a reorg does reach a counted block, the owner of the counts
-/// compares them with the new best chain and drops the displaced blocks.
-///
-/// Counted blocks leave the best chain in any reorg deeper than
-/// `QUALIFYING_DEPTH`. The tracker drops them, except a block read from a chain
-/// that was best only briefly (see zakurad's tracker). At 25-second blocks a
-/// block starts counting about four minutes after it is mined.
+/// always stays on the best chain. A reorg deeper than `QUALIFYING_DEPTH`
+/// displaces counted blocks, which the owner of the counts must repair. At
+/// 25-second blocks a block starts counting about four minutes after it is
+/// mined.
 pub const QUALIFYING_DEPTH: u32 = 10;
 
 /// How long a block keeps counting: two days at the target block spacing.

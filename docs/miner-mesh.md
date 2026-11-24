@@ -132,8 +132,8 @@ counts, the places it holds, and its v2 peers. In this example the node has
   "synced": true,
   "window": {
     "tip": 3000000,
-    "newest": 2999900,
-    "oldest": 2997597,
+    "newest": 2999990,
+    "oldest": 2997687,
     "checked": 1152,
     "coverage": 0.5
   },

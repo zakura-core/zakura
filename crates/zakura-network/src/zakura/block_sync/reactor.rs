@@ -414,6 +414,11 @@ impl ReactorIO {
         let mut header_tip = self.startup.header_tip.clone();
         let mut header_tip_open = header_tip.is_some();
         let mut committed_views = self.startup.committed_views.clone();
+        let mut body_claim_generation = self
+            .startup
+            .body_claims
+            .as_ref()
+            .map(|claims| claims.subscribe());
         let mut retained_height = self
             .body_retention
             .as_ref()
@@ -451,8 +456,48 @@ impl ReactorIO {
                 }
             };
             zakura_rt::pin!(status_refresh);
+            let body_claim_expiry_at = self
+                .startup
+                .body_claims
+                .as_ref()
+                .and_then(|claims| claims.next_expiry());
+            let body_claim_expiry = async move {
+                match body_claim_expiry_at {
+                    Some(deadline) => time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            };
+            zakura_rt::pin!(body_claim_expiry);
             zakura_rt::select! {
                 _ = self.startup.shutdown.cancelled() => break,
+                // `Some` is a generation change: a fallback release, or a new
+                // claim with an earlier expiry, which the next
+                // iteration re-arms `body_claim_expiry` for. `None` is that timer.
+                wake = async {
+                    let generation = async {
+                        match body_claim_generation.as_mut() {
+                            Some(rx) => rx.changed().await,
+                            None => std::future::pending().await,
+                        }
+                    };
+                    zakura_rt::select! {
+                        changed = generation => Some(changed),
+                        () = &mut body_claim_expiry => None,
+                    }
+                } => {
+                    if let Some(Err(_)) = wake {
+                        body_claim_generation = None;
+                    }
+                    if let Some(claims) = self.startup.body_claims.as_ref() {
+                        let expired = claims.prune_expired(Instant::now()) > 0;
+                        // A release or expiry can free a pending height that
+                        // selection skipped, so wake the routines.
+                        if expired || !matches!(wake, Some(Err(_))) {
+                            self.resources.work_queue.wake_after_body_claim_change();
+                            self.query_needed_blocks_with_options(true).await;
+                        }
+                    }
+                }
                 event = self.lifecycle.recv() => {
                     let Some(event) = event else { break };
                     self.handle_event(event).await;
@@ -1135,6 +1180,7 @@ impl ReactorIO {
         // are sufficient: `BodyWorkEpochChanged` bumps `reset_epoch`, and every
         // routine clears its outstanding in place on that bump, so no entry from an
         // invalidated lineage survives into the current epoch.
+        let now = Instant::now();
         let blocks: Vec<_> = blocks
             .into_iter()
             .filter(|block| {
@@ -1143,6 +1189,11 @@ impl ReactorIO {
                     && !self
                         .registry
                         .has_outstanding_request(block.height, block.hash)
+                    && !self
+                        .startup
+                        .body_claims
+                        .as_ref()
+                        .is_some_and(|claims| claims.is_claimed(block.hash, now))
             })
             .collect();
 

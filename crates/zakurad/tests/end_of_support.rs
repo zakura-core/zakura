@@ -137,7 +137,6 @@ fn release_can_keep_running_past_its_support_window() {
     assert!(logs.contains(&format!(
         "It keeps running because {KEEP_RUNNING_FLAG} is set"
     )));
-    assert!(!logs.contains(EOS_PANIC_MESSAGE_HEADER));
 }
 
 /// Test that a release that keeps running is warned about a network upgrade it

@@ -1946,8 +1946,8 @@ fn end_of_support_is_checked_at_start() -> Result<()> {
     Ok(())
 }
 
-/// Check that a node only keeps running past the end of its release's support when it is
-/// started with the flag for that, and that a mining node is refused the flag.
+/// Check that the flag which keeps a node running past the end of its release's support
+/// reaches the end of support task, and that a mining node is refused the flag.
 #[test]
 fn end_of_support_is_only_ignored_with_its_flag() -> Result<()> {
     use zakurad::components::sync::end_of_support::KEEP_RUNNING_FLAG;
@@ -1985,13 +1985,12 @@ fn end_of_support_is_only_ignored_with_its_flag() -> Result<()> {
         "a node started without {KEEP_RUNNING_FLAG} keeps the halt"
     );
 
-    // A mining node does not start with the flag.
-    let child = testdir()?
+    // A mining node does not start with the flag. A node that starts anyway is stopped at
+    // the timeout, which fails the test.
+    testdir()?
         .with_config(&mut mining_config.clone())?
         .spawn_child(args!["start", KEEP_RUNNING_FLAG])?
-        .with_timeout(EXTENDED_LAUNCH_DELAY);
-    child
-        .wait_with_output()?
+        .wait_with_output_or_timeout(EXTENDED_LAUNCH_DELAY)?
         .assert_failure()?
         .stderr_contains(&format!(
             "{KEEP_RUNNING_FLAG} is not allowed on a mining node"

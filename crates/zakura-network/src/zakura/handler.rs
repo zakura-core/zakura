@@ -3904,6 +3904,8 @@ impl ZakuraProtocolHandler {
         let limits_owner_bound = self.limits.owner_bound();
         let connection_resources = self.resources.connection(accepted_capabilities);
         self.resources.report_usage(limits_owner_bound);
+        // Services such as BPv1 read this connection's path load.
+        let load = connection.subscribe_load();
         #[cfg(zakura_sim)]
         if let Some(observer) = &self.transport_observer {
             observer.connection(
@@ -4038,8 +4040,8 @@ impl ZakuraProtocolHandler {
         };
 
         if negotiated_ordered_streams.is_empty() {
-            self.registry
-                .add_peer(Peer::new_with_conn_id_and_direction_and_close_cause(
+            self.registry.add_peer(
+                Peer::new_with_conn_id_and_direction_and_close_cause(
                     conn_id,
                     peer_id.clone(),
                     remote_ip,
@@ -4048,7 +4050,9 @@ impl ZakuraProtocolHandler {
                     HashMap::new(),
                     connection_token.clone(),
                     close_cause.clone(),
-                ));
+                )
+                .with_load(load.clone()),
+            );
             cleanup_guard.add_admitted_capabilities(accepted_capabilities);
         } else if !connection_token.is_cancelled() {
             let mut opened_capabilities = 0;
@@ -4113,6 +4117,7 @@ impl ZakuraProtocolHandler {
                         connection_token.clone(),
                         close_cause.clone(),
                     )
+                    .with_load(load.clone())
                     .with_rtt_reader(Some(connection.rtt_reader())),
                 );
                 cleanup_guard.add_admitted_capabilities(admitted_capabilities);
@@ -4235,6 +4240,7 @@ impl ZakuraProtocolHandler {
                                     connection_token.clone(),
                                     close_cause.clone(),
                                 )
+                                .with_load(load.clone())
                                 .with_rtt_reader(Some(connection.rtt_reader())),
                             );
                             cleanup_guard.add_admitted_capabilities(admitted_capabilities);
@@ -4363,6 +4369,7 @@ impl ZakuraProtocolHandler {
                                 connection_token.clone(),
                                 close_cause.clone(),
                             )
+                            .with_load(load.clone())
                             .with_rtt_reader(Some(connection.rtt_reader())),
                         );
                         cleanup_guard.add_admitted_capabilities(admitted_capabilities);

@@ -3,7 +3,12 @@
 use std::{fmt, future::Future, net::IpAddr, pin::Pin, time::Duration};
 
 use thiserror::Error;
-use zakura_rt::{collections::HashMap, sync::CancellationToken, time::Instant};
+use zakura_quic::ConnLoad;
+use zakura_rt::{
+    collections::HashMap,
+    sync::{watch, CancellationToken},
+    time::Instant,
+};
 
 use super::{CloseCause, CloseRow, FramedRecv, FramedSend, MessageRule};
 use crate::{
@@ -329,6 +334,7 @@ pub struct Peer {
     cancel_token: CancellationToken,
     service_cancel_token: CancellationToken,
     close_cause: CloseCause,
+    load: Option<watch::Receiver<ConnLoad>>,
     /// Reads the connection's smoothed round-trip time, when the transport
     /// has a QUIC connection to read it from.
     rtt: Option<zakura_quic::RttReader>,
@@ -525,8 +531,20 @@ impl Peer {
             cancel_token,
             service_cancel_token,
             close_cause,
+            load: None,
             rtt: None,
         }
+    }
+
+    /// This peer, reporting its connection's path load through `load`.
+    pub fn with_load(mut self, load: watch::Receiver<ConnLoad>) -> Self {
+        self.load = Some(load);
+        self
+    }
+
+    /// The connection's path load, when the transport reports one.
+    pub fn load(&self) -> Option<&watch::Receiver<ConnLoad>> {
+        self.load.as_ref()
     }
 
     /// This peer, reading its connection's round-trip time from `rtt`.

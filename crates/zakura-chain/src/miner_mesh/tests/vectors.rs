@@ -14,8 +14,8 @@ const GATEWAY_ID: [u8; 32] = [
 ];
 
 /// The lock script of a commitment to [`GATEWAY_ID`].
-const SCRIPT_HEX: &str = "6a254d45534801\
-                          000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+const SCRIPT_HEX: &str = "6a234d5201\
+                      000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
 
 fn commitment() -> MinerMeshCommitment {
     MinerMeshCommitment::new(GATEWAY_ID)
@@ -50,14 +50,14 @@ fn output_has_the_documented_bytes() {
         commitment().payload().as_slice(),
         &output.lock_script.as_raw_bytes()[2..],
     );
-    assert_eq!(commitment().payload().len(), 37);
+    assert_eq!(commitment().payload().len(), 35);
     assert_eq!(
         output
             .zcash_serialize_to_vec()
             .expect("serializing to a vector never fails")
             .len(),
-        48,
-        "the output costs 48 bytes: an 8-byte value, a 1-byte length and the 39-byte script",
+        46,
+        "the output costs 46 bytes: an 8-byte value, a 1-byte length and the 37-byte script",
     );
 }
 
@@ -107,7 +107,7 @@ fn two_commitments_are_ambiguous() {
 fn another_version_is_not_a_commitment() {
     for version in [0x00, 0x02, 0xff] {
         let mut script = commitment_script();
-        script[6] = version;
+        script[4] = version;
 
         assert_eq!(
             MinerMeshCommitment::from_coinbase_outputs(&[zero_value_output(&script)]),
@@ -136,8 +136,8 @@ fn another_script_shape_is_not_a_commitment() {
     let mut not_op_return = script.clone();
     not_op_return[0] = 0x00;
 
-    // The same payload behind OP_PUSHDATA1, a second way to push 37 bytes.
-    let mut long_form_push = vec![0x6a, 0x4c, 0x25];
+    // The same payload behind OP_PUSHDATA1, a second way to push 35 bytes.
+    let mut long_form_push = vec![0x6a, 0x4c, 0x23];
     long_form_push.extend(&script[2..]);
 
     let mut trailing_byte = script.clone();
@@ -163,7 +163,7 @@ fn another_script_shape_is_not_a_commitment() {
 #[test]
 fn outputs_that_are_not_commitments_do_not_make_one_ambiguous() {
     let mut other_version = commitment_script();
-    other_version[6] = 0x02;
+    other_version[4] = 0x02;
 
     let nonzero_value = Output::new(
         Amount::try_from(1).expect("one zatoshi is within the money range"),

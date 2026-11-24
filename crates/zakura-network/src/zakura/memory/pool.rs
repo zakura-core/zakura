@@ -1292,28 +1292,29 @@ impl MemoryPool {
     }
 
     /// Acquire a connection's transport base `t` and negotiated reactor session
-    /// bases `b_r` atomically from `Consumer::Sessions` (`02 §8` rules 1–3, `mem-13`).
+    /// bases `b_r`, `bytes` in all, as one `Consumer::Sessions` lease
+    /// (`02 §8` rules 1–3, `mem-13`).
     ///
     /// - Refuses at once when `Sessions` is at its share or cap: it never waits
     ///   for healthy connections to disconnect.
     /// - When `Sessions` is below its share but short-lived bulk consumers
     ///   borrowed `S`, waits on contention until `S` returns, `wait_timeout`
     ///   expires, or `shutdown` cancels; the last two refuse with `PoolFull`.
-    /// - Splits the grant into a `transport` lease and one lease per reactor
-    ///   (zero net change to pool totals), so each lease drops to zero with
-    ///   its owner.
-    pub async fn acquire_connection_session_leases(
+    ///
+    /// The connection holds the lease until it closes. A session that a
+    /// service admits later grows it ([`PoolLease::try_grow_to`]).
+    pub async fn acquire_session_lease(
         &self,
         conn_id: ZakuraConnId,
-        cost: super::ConnectionSessionCost,
+        bytes: u64,
         shutdown: &zakura_rt::sync::CancellationToken,
         wait_timeout: std::time::Duration,
-    ) -> Result<ConnectionSessionLeases, LeaseDenied> {
+    ) -> Result<PoolLease, LeaseDenied> {
         let request = Request {
             consumer: Consumer::Sessions,
             conn: Some(conn_id),
             serving: None,
-            bytes: cost.total(),
+            bytes,
         };
         let stop = async {
             zakura_rt::select! {
@@ -1322,30 +1323,7 @@ impl MemoryPool {
             }
             LeaseDenied::PoolFull
         };
-        let mut combined = self.wait_for_lease(&request, stop).await?;
-
-        let mut split = |bytes: u64| {
-            (bytes > 0).then(|| {
-                combined
-                    .split(bytes)
-                    .expect("the combined lease covers every reactor base")
-            })
-        };
-        let header_sync = split(cost.header_sync);
-        let block_sync = split(cost.block_sync);
-        let tx_relay = split(cost.tx_relay);
-        let legacy_compat = split(cost.legacy_compat);
-        let custom_kinds = split(cost.custom_kinds);
-        debug_assert_eq!(combined.bytes(), cost.transport_base);
-
-        Ok(ConnectionSessionLeases {
-            transport: combined,
-            header_sync,
-            block_sync,
-            tx_relay,
-            legacy_compat,
-            custom_kinds,
-        })
+        self.wait_for_lease(&request, stop).await
     }
 
     /// Mark `consumer` waiting on pool contention until the token drops.
@@ -1904,41 +1882,6 @@ impl Drop for PoolWaitToken {
         let consumer = self.consumer;
         self.pool
             .unregister(|state| state.machine.remove_token(consumer));
-    }
-}
-
-/// Transport base (`t`) and negotiated reactor session base (`b_r`) leases
-/// owned by one admitted connection (`02 §8`, `mem-13`).
-///
-/// Dropping this struct on connection teardown returns every transport and
-/// reactor session lease to `Consumer::Sessions`.
-#[derive(Debug)]
-#[must_use = "retain ConnectionSessionLeases for the lifetime of the admitted connection"]
-pub struct ConnectionSessionLeases {
-    /// Transport base `t` (control receive + base send window + discovery).
-    pub transport: PoolLease,
-    /// Header-sync session base `b_header_sync`, if negotiated.
-    pub header_sync: Option<PoolLease>,
-    /// Block-sync session base `b_block_sync`, if negotiated.
-    pub block_sync: Option<PoolLease>,
-    /// `tx-relay` session base `b_tx_relay`, if negotiated.
-    pub tx_relay: Option<PoolLease>,
-    /// Legacy compatibility session base `b_legacy_compat`, if negotiated.
-    pub legacy_compat: Option<PoolLease>,
-    /// Embedder custom kinds base, if negotiated.
-    pub custom_kinds: Option<PoolLease>,
-}
-
-impl ConnectionSessionLeases {
-    /// Total bytes held across the transport base and every negotiated reactor session base.
-    pub fn total_bytes(&self) -> u64 {
-        self.transport
-            .bytes()
-            .saturating_add(self.header_sync.as_ref().map_or(0, PoolLease::bytes))
-            .saturating_add(self.block_sync.as_ref().map_or(0, PoolLease::bytes))
-            .saturating_add(self.tx_relay.as_ref().map_or(0, PoolLease::bytes))
-            .saturating_add(self.legacy_compat.as_ref().map_or(0, PoolLease::bytes))
-            .saturating_add(self.custom_kinds.as_ref().map_or(0, PoolLease::bytes))
     }
 }
 

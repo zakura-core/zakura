@@ -43,8 +43,8 @@ pub use plan::{
     DISCOVERY_TABLES_FIXED_BYTES, PROPAGATION_RESERVE_BYTES, TX_RELAY_MAPS_FIXED_BYTES,
 };
 pub use pool::{
-    ConnectionSessionLeases, ConsumerSnapshot, LeaseDenied, MemoryPool, MemoryPoolMachine,
-    OverrunReport, PoolLease, PoolSnapshot, PoolWaitToken, Refusal, Released, Wake, WakeClass,
+    ConsumerSnapshot, LeaseDenied, MemoryPool, MemoryPoolMachine, OverrunReport, PoolLease,
+    PoolSnapshot, PoolWaitToken, Refusal, Released, Wake, WakeClass,
 };
 #[cfg(any(test, zakura_sim))]
 pub use pool::{PoolEvent, PoolObserver};

@@ -1074,10 +1074,6 @@ pub struct ZakuraEndpoint {
     #[cfg(any(test, feature = "zakura-testkit"))]
     header_sync_actions: Option<Arc<AsyncMutex<Option<mpsc::Receiver<HeaderSyncAction>>>>>,
     block_sync_actions: Option<Arc<AsyncMutex<Option<mpsc::Receiver<BlockSyncAction>>>>>,
-    /// Startup memory sizing plan enforced by this endpoint (`02 §8`).
-    memory_plan: Option<super::memory::MemoryPlan>,
-    /// Node-wide logical-byte memory pool sized from [`Self::memory_plan`].
-    memory_pool: Option<super::memory::MemoryPool>,
     /// BPv1's handle, when the endpoint started BPv1.
     bpv1: Option<super::Bpv1Handle>,
     /// Maintained native dials started by the legacy->Zakura upgrade hand-off,
@@ -1188,12 +1184,12 @@ impl ZakuraEndpoint {
     /// Returns the startup memory sizing plan enforced by this endpoint, if started
     /// through the production startup path.
     pub fn memory_plan(&self) -> Option<super::memory::MemoryPlan> {
-        self.memory_plan.clone()
+        self.handler.memory_plan.clone()
     }
 
     /// Returns the node-wide memory pool owned by this endpoint.
     pub fn memory_pool(&self) -> Option<super::memory::MemoryPool> {
-        self.memory_pool.clone()
+        self.handler.memory_pool.clone()
     }
 
     /// Returns BPv1's handle when this endpoint started BPv1.
@@ -1511,8 +1507,6 @@ impl ZakuraEndpoint {
     /// It doesn't serve inbound connections itself. Pass `handler` to
     /// `quic.serve` for those, and dial with [`Self::dial`].
     pub fn new(quic: QuicEndpoint, handler: ZakuraProtocolHandler) -> Self {
-        let memory_plan = handler.memory_plan.clone();
-        let memory_pool = handler.memory_pool.clone();
         Self {
             quic,
             supervisor: handler.supervisor.clone(),
@@ -1527,8 +1521,6 @@ impl ZakuraEndpoint {
             #[cfg(any(test, feature = "zakura-testkit"))]
             header_sync_actions: None,
             block_sync_actions: None,
-            memory_plan,
-            memory_pool,
             bpv1: None,
             upgrade_dials: Arc::new(StdMutex::new(HashMap::new())),
             upgrade_alpn_floors: Arc::new(StdMutex::new(HashMap::new())),
@@ -1576,8 +1568,6 @@ impl ZakuraEndpoint {
         header_sync_actions: Option<mpsc::Receiver<HeaderSyncAction>>,
         block_sync_actions: Option<mpsc::Receiver<BlockSyncAction>>,
     ) -> Self {
-        let memory_plan = handler.memory_plan.clone();
-        let memory_pool = handler.memory_pool.clone();
         Self {
             quic,
             supervisor,
@@ -1593,8 +1583,6 @@ impl ZakuraEndpoint {
                 .map(|actions| Arc::new(AsyncMutex::new(Some(actions)))),
             block_sync_actions: block_sync_actions
                 .map(|actions| Arc::new(AsyncMutex::new(Some(actions)))),
-            memory_plan,
-            memory_pool,
             bpv1: None,
             upgrade_dials: Arc::new(StdMutex::new(HashMap::new())),
             upgrade_alpn_floors: Arc::new(StdMutex::new(HashMap::new())),
@@ -2595,26 +2583,24 @@ enum SessionFundingRefusal {
     Released,
 }
 
-/// One connection's `Consumer::Sessions` leases (`02 §8`): the bases its
+/// One connection's `Consumer::Sessions` lease (`02 §8`): the bases its
 /// admission funded, plus each reactor's session part that a service
-/// admitted later. Releasing it, or dropping the last handle, returns every
+/// admitted later. Releasing it, or dropping the last handle, returns the
 /// lease and the connection's charge in the direction ledger.
 #[derive(Debug)]
 struct SessionFunding {
-    pool: super::memory::MemoryPool,
     directions: Arc<zakura_rt::sync::Mutex<super::memory::SessionDirections>>,
     bases: super::memory::SessionBases,
     sessions_share: u64,
-    conn_id: ZakuraConnId,
     direction: ServicePeerDirection,
     held: zakura_rt::sync::Mutex<HeldSessionLeases>,
 }
 
 #[derive(Debug)]
 struct HeldSessionLeases {
-    admission: Option<super::memory::ConnectionSessionLeases>,
-    top_ups: Vec<super::memory::PoolLease>,
-    /// The reactor capabilities whose session parts the leases hold.
+    /// The connection's one lease. Each later session part grows it.
+    lease: super::memory::PoolLease,
+    /// The reactor capabilities whose session parts the lease holds.
     funded_sessions: u64,
     /// Bytes this connection charged to the direction ledger.
     charged: u64,
@@ -2622,10 +2608,10 @@ struct HeldSessionLeases {
 }
 
 impl SessionFunding {
-    /// Fund `cost`, which holds the session parts of `funded_sessions`, for
-    /// connection `conn_id` in `direction`: charge the direction ledger, then
-    /// lease every base together from the pool, waiting up to `wait_timeout`
-    /// for borrowed bytes to return.
+    /// Fund `cost` bytes, which hold the session parts of `funded_sessions`,
+    /// for connection `conn_id` in `direction`: charge the direction ledger,
+    /// then lease every base together from the pool, waiting up to
+    /// `wait_timeout` for borrowed bytes to return.
     #[allow(clippy::too_many_arguments)]
     async fn acquire(
         pool: &super::memory::MemoryPool,
@@ -2633,37 +2619,32 @@ impl SessionFunding {
         directions: &Arc<zakura_rt::sync::Mutex<super::memory::SessionDirections>>,
         conn_id: ZakuraConnId,
         direction: ServicePeerDirection,
-        cost: super::memory::ConnectionSessionCost,
+        cost: u64,
         funded_sessions: u64,
         shutdown: &CancellationToken,
         wait_timeout: Duration,
     ) -> Result<Self, SessionFundingRefusal> {
-        let charged = cost.total();
-        if !lock_session_directions(directions).try_charge(direction, charged, plan.sessions_share)
-        {
+        if !lock_session_directions(directions).try_charge(direction, cost, plan.sessions_share) {
             return Err(SessionFundingRefusal::DirectionFull);
         }
         // From here, dropping `funding` returns the charge.
         let funding = Self {
-            pool: pool.clone(),
             directions: directions.clone(),
             bases: plan.bases,
             sessions_share: plan.sessions_share,
-            conn_id,
             direction,
             held: zakura_rt::sync::Mutex::new(HeldSessionLeases {
-                admission: None,
-                top_ups: Vec::new(),
+                lease: pool.empty_lease(super::memory::Consumer::Sessions, Some(conn_id)),
                 funded_sessions,
-                charged,
+                charged: cost,
                 released: false,
             }),
         };
-        let leases = pool
-            .acquire_connection_session_leases(conn_id, cost, shutdown, wait_timeout)
+        let lease = pool
+            .acquire_session_lease(conn_id, cost, shutdown, wait_timeout)
             .await
             .map_err(SessionFundingRefusal::Pool)?;
-        funding.lock_held().admission = Some(leases);
+        funding.lock_held().lease = lease;
         Ok(funding)
     }
 
@@ -2686,12 +2667,9 @@ impl SessionFunding {
         ) {
             return Err(SessionFundingRefusal::DirectionFull);
         }
-        match self
-            .pool
-            .try_acquire(super::memory::Consumer::Sessions, Some(self.conn_id), bytes)
-        {
-            Ok(lease) => {
-                held.top_ups.push(lease);
+        let grown = held.lease.bytes().saturating_add(bytes);
+        match held.lease.try_grow_to(grown) {
+            Ok(()) => {
                 held.funded_sessions |= reactor;
                 held.charged = held.charged.saturating_add(bytes);
                 Ok(())
@@ -2703,12 +2681,11 @@ impl SessionFunding {
         }
     }
 
-    /// Return every lease and the direction charge. Later calls do nothing.
+    /// Return the lease and the direction charge. Later calls do nothing.
     fn release(&self) {
         let mut held = self.lock_held();
         held.released = true;
-        held.admission = None;
-        held.top_ups.clear();
+        held.lease.shrink_to(0);
         let charged = std::mem::take(&mut held.charged);
         drop(held);
         lock_session_directions(&self.directions).release(self.direction, charged);
@@ -5497,7 +5474,7 @@ impl ZakuraProtocolHandler {
                 &self.session_directions,
                 conn_id,
                 context.direction,
-                cost,
+                cost.total(),
                 funded_sessions,
                 &self.shutdown,
                 self.limits.control_timeout,
@@ -6454,7 +6431,7 @@ async fn spawn_zakura_endpoint_inner(
         trace,
     )
     .with_local_node_id(local_node_id)
-    .with_memory_pool(memory_plan.clone(), memory_pool.clone(), serving_pool);
+    .with_memory_pool(memory_plan, memory_pool, serving_pool);
     handler.set_header_sync_enabled(header_sync_ready);
     if handler.trace.is_enabled() {
         let trace = handler.trace.clone();
@@ -6478,8 +6455,6 @@ async fn spawn_zakura_endpoint_inner(
         #[cfg(any(test, feature = "zakura-testkit"))]
         header_sync_actions,
         block_sync_actions,
-        memory_plan: Some(memory_plan),
-        memory_pool: Some(memory_pool),
         bpv1,
         upgrade_dials: Arc::new(StdMutex::new(HashMap::new())),
         upgrade_alpn_floors: Arc::new(StdMutex::new(HashMap::new())),
@@ -16029,7 +16004,7 @@ mod tests {
                 &directions,
                 conn_id,
                 direction,
-                cost,
+                cost.total(),
                 ZAKURA_CAP_HEADER_SYNC,
                 &shutdown,
                 Duration::from_millis(10),
@@ -16070,6 +16045,48 @@ mod tests {
             *lock_session_directions(&directions),
             SessionDirections::default()
         );
+    }
+
+    /// BP-c-1: a connection that negotiates BPv1 funds BPv1's session base in
+    /// its one sessions lease, and closing it returns every byte.
+    #[tokio::test]
+    async fn session_funding_admits_a_bpv1_connection() {
+        use crate::zakura::{
+            memory::{Consumer, MemoryPlan, SessionBases, SessionDirections},
+            ZAKURA_CAP_BPV1,
+        };
+
+        let mut config = Config::default();
+        config.zakura.bpv1.enabled = true;
+        let plan = MemoryPlan::size(64 << 30, &config, &Network::Mainnet)
+            .expect("64 GiB fits the BPv1 plan");
+        assert!(plan.bases.bpv1.session > 0);
+        let pool = plan.build_pool();
+        let directions = Arc::new(zakura_rt::sync::Mutex::new(SessionDirections::default()));
+        let negotiated = ZAKURA_CAP_HEADER_SYNC | ZAKURA_CAP_BPV1;
+        let cost = plan.bases.connection_cost(negotiated, negotiated, false);
+
+        let funding = SessionFunding::acquire(
+            &pool,
+            &plan,
+            &directions,
+            1,
+            ServicePeerDirection::Outbound,
+            cost.total(),
+            SessionBases::funded_sessions(negotiated, negotiated),
+            &CancellationToken::new(),
+            Duration::from_millis(10),
+        )
+        .await
+        .expect("the plan funds a BPv1 connection");
+        assert_eq!(pool.consumer_leased(Consumer::Sessions), cost.total());
+        funding
+            .fund_session(ZAKURA_CAP_BPV1)
+            .expect("admission funded BPv1's session");
+        assert_eq!(pool.consumer_leased(Consumer::Sessions), cost.total());
+
+        drop(funding);
+        assert_eq!(pool.snapshot().total_leased, 0);
     }
 
     /// ADM-3's inbound share (#1367): once inbound connections or inbound

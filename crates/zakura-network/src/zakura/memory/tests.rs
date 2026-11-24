@@ -15,9 +15,8 @@ use zakura_rt::time::Instant;
 
 use super::peer_pool::PeerSubPool;
 use super::{
-    ConnectionSessionCost, Consumer, ConsumerSpec, LeaseDenied, MemoryPool, MemoryPoolMachine,
-    OverrunReport, PoolConfig, PoolEvent, PoolObserver, Priority, Refusal, WakeClass,
-    OVERRUN_WARN_INTERVAL,
+    Consumer, ConsumerSpec, LeaseDenied, MemoryPool, MemoryPoolMachine, OverrunReport, PoolConfig,
+    PoolEvent, PoolObserver, Priority, Refusal, WakeClass, OVERRUN_WARN_INTERVAL,
 };
 use crate::zakura::ZakuraPeerId;
 
@@ -1011,17 +1010,9 @@ async fn async_acquire_wakes_below_share_first_and_unblocks_borrowers_on_cancel(
 #[tokio::test]
 async fn session_admission_refuses_atomically_past_share_without_borrowing() {
     // mem-13: Sessions never borrows idle S past its protected share, and
-    // refuses atomically rather than admitting a partial reactor set.
-    let cost = ConnectionSessionCost {
-        transport_base: 512 * KIB,
-        header_sync: 512 * KIB,
-        block_sync: MIB,
-        tx_relay: 0,
-        legacy_compat: 0,
-        bpv1: 0,
-        custom_kinds: 0,
-    };
-    assert_eq!(cost.total(), 2 * MIB);
+    // refuses atomically rather than admitting a partial reactor set. Each
+    // connection costs 2 MiB: its transport base plus its reactor bases.
+    let cost = 2 * MIB;
 
     // Budget = 10 MiB, fixed = 0, Sessions floor = 2 MiB, BlockSync floor = 2 MiB -> S = 6 MiB.
     // Equal weights (1, 1) -> each share = 3 MiB -> Sessions protected_share = 5 MiB.
@@ -1038,15 +1029,15 @@ async fn session_admission_refuses_atomically_past_share_without_borrowing() {
     let shutdown = zakura_rt::sync::CancellationToken::new();
 
     let lease_1 = pool
-        .acquire_connection_session_leases(1, cost, &shutdown, Duration::from_secs(1))
+        .acquire_session_lease(1, cost, &shutdown, Duration::from_secs(1))
         .await
         .expect("first connection fits under Sessions share");
     let lease_2 = pool
-        .acquire_connection_session_leases(2, cost, &shutdown, Duration::from_secs(1))
+        .acquire_session_lease(2, cost, &shutdown, Duration::from_secs(1))
         .await
         .expect("second connection fits under Sessions share");
-    assert_eq!(lease_1.total_bytes(), 2 * MIB);
-    assert_eq!(lease_2.total_bytes(), 2 * MIB);
+    assert_eq!(lease_1.bytes(), 2 * MIB);
+    assert_eq!(lease_2.bytes(), 2 * MIB);
     assert_eq!(
         pool.snapshot().consumers[Consumer::Sessions.index()].leased,
         4 * MIB
@@ -1056,7 +1047,7 @@ async fn session_admission_refuses_atomically_past_share_without_borrowing() {
     // fail immediately with ShareExceeded, leaving zero partial leases and no
     // lingering waiter state.
     let err = pool
-        .acquire_connection_session_leases(3, cost, &shutdown, Duration::from_secs(5))
+        .acquire_session_lease(3, cost, &shutdown, Duration::from_secs(5))
         .await
         .expect_err("third connection must not borrow past Sessions protected share");
     assert_eq!(err, LeaseDenied::ShareExceeded);
@@ -1064,7 +1055,7 @@ async fn session_admission_refuses_atomically_past_share_without_borrowing() {
     assert_eq!(snap.consumers[Consumer::Sessions.index()].leased, 4 * MIB);
     assert!(!snap.consumers[Consumer::Sessions.index()].waiting);
 
-    // Disconnecting both peers drops every split lease cleanly back to zero.
+    // Disconnecting both peers returns every lease to zero.
     drop(lease_1);
     drop(lease_2);
     assert_eq!(pool.snapshot().total_leased, 0);
@@ -1079,17 +1070,8 @@ async fn session_admission_refuses_atomically_past_share_without_borrowing() {
 async fn session_admission_reclaims_borrowed_shared_memory_and_cleans_up_on_timeout() {
     // mem-13: when bulk temporarily borrowed S, Sessions below its protected
     // share registers a below-share waiter, reclaims S as soon as bulk shrinks,
-    // and splits into transport + negotiated reactor leases atomically.
-    let cost = ConnectionSessionCost {
-        transport_base: 512 * KIB,
-        header_sync: 512 * KIB,
-        block_sync: MIB,
-        tx_relay: 256 * KIB,
-        legacy_compat: 0,
-        bpv1: 0,
-        custom_kinds: 0,
-    };
-    let total = cost.total();
+    // and takes the connection's whole cost at once.
+    let total = 2 * MIB + 256 * KIB;
 
     let config = PoolConfig::new(10 * MIB, 0)
         .with_consumer(Consumer::Sessions, ConsumerSpec::bulk(2 * MIB, 10 * MIB, 1))
@@ -1112,7 +1094,7 @@ async fn session_admission_reclaims_borrowed_shared_memory_and_cleans_up_on_time
     let shutdown_for_task = shutdown.clone();
     let admit = tokio::spawn(async move {
         pool_for_task
-            .acquire_connection_session_leases(7, cost, &shutdown_for_task, Duration::from_secs(2))
+            .acquire_session_lease(7, total, &shutdown_for_task, Duration::from_secs(2))
             .await
     });
 
@@ -1127,14 +1109,14 @@ async fn session_admission_reclaims_borrowed_shared_memory_and_cleans_up_on_time
         "Sessions registers a below-share waiter while bulk holds borrowed S"
     );
 
-    // BlockSync shrinks by 1 MiB -> Sessions wakes and splits the grant.
+    // BlockSync shrinks by 1 MiB -> Sessions wakes and takes the grant.
     bulk.shrink_by(MIB);
-    let leases = tokio::time::timeout(Duration::from_secs(2), admit)
+    let lease = tokio::time::timeout(Duration::from_secs(2), admit)
         .await
         .expect("Sessions woke promptly")
         .expect("task succeeded")
         .expect("Sessions reclaimed its share from bulk");
-    assert_eq!(leases.total_bytes(), total);
+    assert_eq!(lease.bytes(), total);
     assert_eq!(
         pool.snapshot().consumers[Consumer::Sessions.index()].leased,
         total
@@ -1147,7 +1129,7 @@ async fn session_admission_reclaims_borrowed_shared_memory_and_cleans_up_on_time
         .try_acquire(Consumer::BlockSync, Some(98), 768 * KIB)
         .expect("BlockSync fills remaining S");
     let err = pool
-        .acquire_connection_session_leases(8, cost, &shutdown, Duration::from_millis(25))
+        .acquire_session_lease(8, total, &shutdown, Duration::from_millis(25))
         .await
         .expect_err("timed-out session admission refuses neutrally");
     assert_eq!(err, LeaseDenied::PoolFull);
@@ -1159,7 +1141,7 @@ async fn session_admission_reclaims_borrowed_shared_memory_and_cleans_up_on_time
     bulk2.shrink_to(0);
     drop(bulk2);
     drop(bulk);
-    drop(leases);
+    drop(lease);
     assert_eq!(pool.snapshot().total_leased, 0);
 }
 

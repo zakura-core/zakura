@@ -38,7 +38,10 @@ use zakura_chain::{
 };
 use zakura_network::{
     self as zn,
-    zakura::{self, testkit::ZakuraTestNode, LegacyGossipSink, ZakuraSupervisorHandle},
+    zakura::{
+        self, testkit::ZakuraTestNode, zakura_trace_peer_label, LegacyGossipSink, ZakuraPeerId,
+        ZakuraSupervisorHandle, CONN_TABLE,
+    },
     P2pStack,
 };
 use zakura_node_services::rpc_client::RpcRequestClient;
@@ -102,6 +105,9 @@ const FIRST_FILLER_SEED: u64 = 1_000;
 /// The lines of a node's log a startup failure report includes.
 const LOG_TAIL_LINES: usize = 40;
 
+/// How long a peer's accepted connection record can take to reach the trace file.
+const CONNECTION_TRACE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// The start of the lock script of a coinbase output that names a gateway:
 /// `OP_RETURN`, a push of the next 35 bytes, the tag `MR` and version 1. The
 /// 32-byte gateway ID follows.
@@ -109,6 +115,13 @@ const LOG_TAIL_LINES: usize = 40;
 /// The bytes are written out here, not taken from `zakura-chain`, so the
 /// harness's count checks the node's parser instead of repeating it.
 const GATEWAY_MARKER_PREFIX: [u8; 5] = [0x6a, 0x23, b'M', b'R', 0x01];
+
+/// The blocks above a marker before the gateway it names counts.
+pub const QUALIFYING_DEPTH: u32 = 100;
+
+/// The heights a node counts, the newest at the qualifying depth: two days of
+/// blocks at Regtest's 75 second spacing.
+pub const WINDOW_BLOCKS: u32 = 2 * 24 * 60 * 60 / 75;
 
 /// A v2 node ID, as a coinbase names a gateway.
 pub type GatewayId = [u8; 32];
@@ -139,6 +152,7 @@ pub struct NodeSpec {
     max_connections: Option<usize>,
     gateway_capacity: Option<usize>,
     start_later: bool,
+    trace_connections: bool,
 }
 
 impl NodeSpec {
@@ -150,6 +164,7 @@ impl NodeSpec {
             max_connections: None,
             gateway_capacity: None,
             start_later: false,
+            trace_connections: false,
         }
     }
 
@@ -177,6 +192,19 @@ impl NodeSpec {
         self.start_later = true;
         self
     }
+
+    /// Enables the node's trace so a test can identify its accepted connections.
+    pub fn trace_connections(mut self) -> Self {
+        self.trace_connections = true;
+        self
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ConnectionTrace {
+    event: String,
+    peer: Option<String>,
+    conn: u64,
 }
 
 /// One `zakurad` child.
@@ -196,8 +224,7 @@ struct RegtestNode {
     #[cfg(feature = "prometheus")]
     metrics: RpcRequestClient,
     facts: NodeFacts,
-    /// The node's report at the last invariant check, or `None` when a node
-    /// of the net started or stopped since.
+    /// The node's report at the last invariant check, if still available.
     last_view: Option<MeshView>,
 }
 
@@ -381,6 +408,9 @@ impl RegtestNet {
                 log_file(dir.path()),
                 bootstrap_peers,
             );
+            if spec.trace_connections {
+                config.network.zakura.trace_dir = Some(dir.path().join("trace"));
+            }
             dir.path().to_path_buf().with_config(&mut config)?;
 
             let rpc_addr = config
@@ -441,6 +471,45 @@ impl RegtestNet {
             .collect()
     }
 
+    /// Returns the most recently accepted connection ID for this peer.
+    ///
+    /// The trace writer flushes asynchronously, so wait for the initial record.
+    /// When comparing IDs across a transition, hold the final peer state long
+    /// enough for any replacement to be written before reading again.
+    pub async fn accepted_connection_id(&self, node: usize, peer: usize) -> Result<u64> {
+        let label = zakura_trace_peer_label(&ZakuraPeerId::from_node_id(self.node_id(peer)));
+        let path = self.nodes[node]
+            .dir
+            .path()
+            .join("trace")
+            .join(CONN_TABLE.file_name());
+        let deadline = Instant::now() + CONNECTION_TRACE_TIMEOUT;
+        loop {
+            match tokio::fs::read_to_string(&path).await {
+                Ok(trace) => {
+                    // A concurrent write can leave a partial last row.
+                    let complete = trace.rsplit_once('\n').map_or("", |(rows, _)| rows);
+                    for line in complete.lines().rev() {
+                        let row: ConnectionTrace = serde_json::from_str(line)
+                            .wrap_err_with(|| format!("reading {}", path.display()))?;
+                        if row.event == "accepted" && row.peer.as_deref() == Some(label.as_str()) {
+                            return Ok(row.conn);
+                        }
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).wrap_err_with(|| format!("reading {}", path.display()))
+                }
+            }
+            eyre::ensure!(
+                Instant::now() < deadline,
+                "node {node} did not trace an accepted connection to node {peer}"
+            );
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
     /// `node`'s report at the last invariant check.
     ///
     /// # Panics
@@ -455,29 +524,41 @@ impl RegtestNet {
 
     /// Mines `count` blocks on `node`, then [settles](Self::settle) the net.
     pub async fn mine(&mut self, node: usize, count: u32) -> Result<Tip> {
-        if self.nodes[node].role == Role::Relay {
-            return Err(eyre!("node {node} is a relay, so it has no miner address"));
-        }
-
-        let mut left = count;
-        while left > 0 {
-            let blocks = left.min(BLOCKS_PER_GENERATE);
-            self.rpc(node)
-                .generate(blocks)
-                .await
-                .wrap_err_with(|| format!("node {node} could not mine {blocks} blocks"))?;
-            left -= blocks;
-        }
-
+        self.generate(node, count).await?;
         self.settle().await
+    }
+
+    /// Mines `count` blocks on `node`, then [settles](Self::settle_island)
+    /// `island` alone, which holds `node`. Nodes outside it may follow other
+    /// chains.
+    pub async fn mine_on_island(
+        &mut self,
+        node: usize,
+        count: u32,
+        island: &[usize],
+    ) -> Result<Tip> {
+        if !island.contains(&node) {
+            return Err(eyre!("node {node} mines outside its island {island:?}"));
+        }
+        self.generate(node, count).await?;
+        self.settle_island(island).await
     }
 
     /// Waits until every running node has the same best block and every
     /// mining node's gateway counts match the harness's own count of that
     /// chain, then checks the standing invariants. Returns the best block.
     pub async fn settle(&mut self) -> Result<Tip> {
-        let tip = self.wait_for_one_tip().await?;
-        self.wait_for_matching_counts(tip).await?;
+        let everyone: Vec<usize> = (0..self.nodes.len()).collect();
+        self.settle_island(&everyone).await
+    }
+
+    /// [Settles](Self::settle) the running nodes of `island` only: they reach
+    /// one best block and count its gateways, whatever chains the other
+    /// nodes follow. The standing invariants are still checked on every
+    /// running node.
+    pub async fn settle_island(&mut self, island: &[usize]) -> Result<Tip> {
+        let tip = self.wait_for_one_tip(island).await?;
+        self.wait_for_matching_counts(tip, island).await?;
         self.check_invariants().await?;
         Ok(tip)
     }
@@ -529,6 +610,7 @@ impl RegtestNet {
 
     /// Starts `node`, which was made with [`NodeSpec::start_later`] or
     /// stopped, and waits until it answers RPC requests.
+    ///
     pub async fn start_node(&mut self, node: usize) -> Result<()> {
         if self.nodes[node].is_running(node)? {
             return Err(eyre!("node {node} is already running"));
@@ -689,12 +771,31 @@ impl RegtestNet {
             .count()
     }
 
-    /// Waits until every running node has the same best block.
-    async fn wait_for_one_tip(&mut self) -> Result<Tip> {
+    /// Mines `count` blocks on `node`, a few per RPC request.
+    async fn generate(&self, node: usize, count: u32) -> Result<()> {
+        if self.nodes[node].role == Role::Relay {
+            return Err(eyre!("node {node} is a relay, so it has no miner address"));
+        }
+
+        let mut left = count;
+        while left > 0 {
+            let blocks = left.min(BLOCKS_PER_GENERATE);
+            self.rpc(node)
+                .generate(blocks)
+                .await
+                .wrap_err_with(|| format!("node {node} could not mine {blocks} blocks"))?;
+            left -= blocks;
+        }
+        Ok(())
+    }
+
+    /// Waits until every running node of `island` has the same best block.
+    async fn wait_for_one_tip(&mut self, island: &[usize]) -> Result<Tip> {
         let deadline = Instant::now() + SETTLE_TIMEOUT;
         loop {
             let mut tips = Vec::new();
-            for (index, node) in self.nodes.iter_mut().enumerate() {
+            for &index in island {
+                let node = &mut self.nodes[index];
                 if node.is_running(index)? {
                     tips.push((index, node.tip().await.map_err(|error| error.to_string())));
                 }
@@ -716,15 +817,21 @@ impl RegtestNet {
         }
     }
 
-    /// Waits until every running mining node has read its whole window at
-    /// `tip`, and reports for each gateway the count the harness finds in
-    /// the same blocks: standing invariant 6. A node never ranks its own ID.
-    async fn wait_for_matching_counts(&mut self, tip: Tip) -> Result<()> {
-        let mut recounts: HashMap<(u32, u32), HashMap<GatewayId, u32>> = HashMap::new();
+    /// Waits until every running mining node of `island` has read its whole
+    /// window at `tip`, and reports for each gateway the count the harness
+    /// finds in the same blocks: standing invariant 6. A node never ranks its
+    /// own ID.
+    async fn wait_for_matching_counts(&mut self, tip: Tip, island: &[usize]) -> Result<()> {
+        let newest = tip.height.0.checked_sub(QUALIFYING_DEPTH);
+        let oldest = newest.map(|height| height.saturating_sub(WINDOW_BLOCKS - 1));
+        let bounds = oldest.zip(newest);
+        let checked = bounds.map_or(0, |(oldest, newest)| newest - oldest + 1);
+        let checked = usize::try_from(checked).expect("the Regtest window fits in usize");
+        let mut recounted = None;
         let deadline = Instant::now() + MESH_TIMEOUT;
         loop {
             let mut behind = Vec::new();
-            for index in 0..self.nodes.len() {
+            for &index in island {
                 if !self.nodes[index].is_running(index)? || !self.nodes[index].facts.mining {
                     continue;
                 }
@@ -733,21 +840,23 @@ impl RegtestNet {
                     behind.push(format!("node {index} reports no window"));
                     continue;
                 };
-                if window.tip != Some(tip.height.0) || window.coverage < 1.0 {
+                if window.tip != Some(tip.height.0)
+                    || window.oldest != oldest
+                    || window.newest != newest
+                    || window.checked != checked
+                    || window.coverage != 1.0
+                {
                     behind.push(format!("node {index} has read {window:?}"));
                     continue;
                 }
-                let mut expected = match (window.oldest, window.newest) {
-                    (Some(oldest), Some(newest)) => match recounts.get(&(oldest, newest)) {
-                        Some(counts) => counts.clone(),
-                        None => {
-                            let counts = self.recount(index, oldest..=newest).await?;
-                            recounts.insert((oldest, newest), counts.clone());
-                            counts
-                        }
-                    },
-                    _ => HashMap::new(),
+                let counts = match &recounted {
+                    Some(counts) => counts,
+                    None => recounted.insert(match bounds {
+                        Some((oldest, newest)) => self.recount(index, oldest..=newest).await?,
+                        None => HashMap::new(),
+                    }),
                 };
+                let mut expected = counts.clone();
                 expected.remove(&self.gateway_id(index));
                 if view.counts() != expected {
                     behind.push(format!(
@@ -762,7 +871,8 @@ impl RegtestNet {
             }
             if Instant::now() >= deadline {
                 return Err(eyre!(
-                    "6: the gateway counts did not match the blocks within {MESH_TIMEOUT:?}:\n{}\n{}",
+                    "6: the gateway counts did not match the blocks at {tip:?} in {bounds:?} \
+                     within {MESH_TIMEOUT:?}:\n{}\n{}",
                     behind.join("\n"),
                     self.describe_failure()
                 ));

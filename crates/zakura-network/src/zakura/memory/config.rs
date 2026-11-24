@@ -304,6 +304,19 @@ impl MemoryWeights {
         Ok(())
     }
 
+    /// The weight of `consumer` in `S`, or 0 for a reserved consumer.
+    pub const fn of(&self, consumer: super::Consumer) -> u64 {
+        match consumer {
+            super::Consumer::BlockSync => self.block_sync,
+            super::Consumer::Serving => self.serving,
+            super::Consumer::Sessions => self.sessions,
+            super::Consumer::Tx => self.tx,
+            super::Consumer::Control
+            | super::Consumer::Propagation
+            | super::Consumer::Consensus => 0,
+        }
+    }
+
     /// True if all weights match the default equal-weight policy (D1).
     pub fn is_default(&self) -> bool {
         *self == Self::default()

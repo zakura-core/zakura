@@ -414,6 +414,8 @@ pub struct ZakuraConfig {
     pub block_sync: ZakuraBlockSyncConfig,
     /// `tx-relay` settings (`[network.zakura.tx_relay]`).
     pub tx_relay: super::ZakuraTxRelayConfig,
+    /// BPv1 block propagation settings (`[network.zakura.bpv1]`, opt-in).
+    pub bpv1: super::ZakuraBpv1Config,
     /// Optional private dev-network cohort tag.
     ///
     /// When set, this node only forms Zakura (v2) connections with peers
@@ -450,6 +452,7 @@ impl Default for ZakuraConfig {
             header_sync: ZakuraHeaderSyncConfig::default(),
             block_sync: ZakuraBlockSyncConfig::default(),
             tx_relay: super::ZakuraTxRelayConfig::default(),
+            bpv1: super::ZakuraBpv1Config::default(),
             dev_network: None,
         }
     }
@@ -524,6 +527,15 @@ impl ZakuraConfig {
             };
             kinds.push((TX_RELAY_DATA_KIND, TX_RELAY_DATA_BUDGET));
             kinds.push((TX_RELAY_STATE_KIND, TX_RELAY_STATE_BUDGET));
+        }
+        // BPv1's kinds are listed only when enabled, so disabled nodes budget
+        // identically to before (`dual-6`).
+        if self.bpv1.enabled {
+            use super::bpv1::wire::{
+                BPV1_CONTROL_BUDGET, BPV1_CONTROL_KIND, BPV1_DATA_BUDGET, BPV1_DATA_KIND,
+            };
+            kinds.push((BPV1_CONTROL_KIND, BPV1_CONTROL_BUDGET));
+            kinds.push((BPV1_DATA_KIND, BPV1_DATA_BUDGET));
         }
         ReactorShares {
             kinds,
@@ -8528,6 +8540,8 @@ fn stream_kind_label(stream_kind: u16) -> &'static str {
         ZAKURA_STREAM_BLOCK_SYNC => "block_sync",
         super::tx_relay::wire::TX_RELAY_DATA_KIND => "tx_relay_data",
         super::tx_relay::wire::TX_RELAY_STATE_KIND => "tx_relay_state",
+        super::bpv1::wire::BPV1_CONTROL_KIND => "bpv1_control",
+        super::bpv1::wire::BPV1_DATA_KIND => "bpv1_data",
         _ => "unknown",
     }
 }

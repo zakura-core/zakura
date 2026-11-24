@@ -18,11 +18,17 @@ pub mod commitment;
 pub mod config;
 pub mod paths;
 pub mod peer;
+pub mod ports;
 pub mod profile;
 pub mod proposer;
 mod pull_trace;
+mod route;
+pub mod service;
 pub mod tree;
 pub mod wire;
+
+#[cfg(test)]
+mod test_support;
 
 pub use assemble::{assemble_block, AssembleError};
 #[cfg(any(test, feature = "p2p-fuzz"))]
@@ -50,11 +56,16 @@ pub use peer::{
     PeerOutput, PeerState, PeerStep, PullGranted, RecvHave, RecvPartPrefix, RecvWant, RecvWantEnd,
     Retire, Seed, Seeds, ServeDone, ServePartQueued, LIVENESS_COOLDOWN, PULL_WINDOW, SLOW_X,
 };
+pub use ports::{
+    classify_body_verification_class, BlockFallbackPort, BlockVerifierPort, BodyStorePort,
+    HeaderAdmissionPort, HeaderChainAdmissionAdapter, MemoryBodyStore, PortFuture,
+};
 pub use profile::{Coding, LayoutError, Profile, W2_PROFILE_ID};
 pub use proposer::{
     compute_body_identity, seed_plan, PreparedCommitment, ProposerConfig, ProposerEvent,
     ProposerInput, ProposerOutput, ProposerState, ProposerStep, SeedPlan, TemplateId,
 };
+pub use service::{bpv1_custom_service, bpv1_service_id, Bpv1Handle, Bpv1Ports, Bpv1Service};
 pub use tree::{
     build_part_tree, encoding_id, pad_hash, verify_part_proof, Bpv1Hash, ProofError, VerifiedPart,
 };

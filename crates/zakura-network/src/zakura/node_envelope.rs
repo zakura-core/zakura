@@ -196,6 +196,7 @@ fn serve_output_bytes(config: &Config, limits: &ZakuraLocalLimits) -> u128 {
     .map(u128::from)
     .sum::<u128>()
         + tx_relay_held_output_bytes(config, limits)
+        + bpv1_held_output_bytes(config, limits)
 }
 
 /// What `tx-relay` holds for the transport outside its output gates on a node
@@ -209,5 +210,18 @@ fn tx_relay_held_output_bytes(config: &Config, limits: &ZakuraLocalLimits) -> u1
         .unwrap_or(u128::MAX)
         .saturating_mul(u128::from(
             crate::zakura::tx_relay::wire::SESSION_HELD_OUTPUT_BYTES,
+        ))
+}
+
+/// What BPv1 holds for the transport outside its output gates on a node with
+/// `limits`' admitted connections, or nothing while it is off (`dual-6`).
+fn bpv1_held_output_bytes(config: &Config, limits: &ZakuraLocalLimits) -> u128 {
+    if !config.zakura.bpv1.enabled {
+        return 0;
+    }
+    u128::try_from(limits.max_connections)
+        .unwrap_or(u128::MAX)
+        .saturating_mul(u128::from(
+            crate::zakura::bpv1::BPV1_SESSION_HELD_OUTPUT_BYTES,
         ))
 }

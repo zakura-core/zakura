@@ -21,6 +21,7 @@ pub mod failure_messages;
 pub mod get_block_template_rpcs;
 pub mod launch;
 pub mod regtest;
+pub mod regtest_net;
 pub mod sync;
 pub mod test_type;
 pub mod zcashd_compat;

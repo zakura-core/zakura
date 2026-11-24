@@ -1,7 +1,9 @@
 //! Trusted submission: relay a pending body, then verify it through normal consensus.
 
 use super::*;
-use crate::server::trusted_block::TrustedSubmissionError;
+
+pub(crate) mod jobs;
+use crate::{server::trusted_block::TrustedSubmissionError, TrustedBlockSource};
 
 use super::submission_lifecycle::{
     committed_block_lookup, DuplicateBody, RelayPolicy, Submission, VerificationOutcome,
@@ -22,6 +24,14 @@ enum SubmittedHash {
     InFlight,
     /// The lookup failed or missed its deadline.
     Unconfirmed,
+}
+
+/// How peers obtain a trusted submission's body before it commits.
+enum PeerBody {
+    /// Each send serializes the block. Without `early_relay`, peers see it only after commit.
+    Serialized { early_relay: bool },
+    /// Each send writes these exact bytes, which are the block's serialization. Relayed early.
+    Prepared(Arc<[u8]>),
 }
 
 impl<Mempool, State, ReadState, Tip, AddressBook, BlockVerifierRouter, SyncStatus>
@@ -88,6 +98,29 @@ where
                 .increment(1);
             tracing::info!(?hash, "{message}");
         }
+        self.relay_trusted_block(
+            block,
+            height,
+            bytes.len(),
+            submitted_at,
+            PeerBody::Serialized {
+                early_relay: skipped.is_none(),
+            },
+        )
+        .await
+    }
+
+    /// Registers `block` as a pending body, relays it early if `body` allows, and returns the
+    /// outcome of its normal verification and commit.
+    async fn relay_trusted_block(
+        &self,
+        block: Arc<Block>,
+        height: Height,
+        size: usize,
+        submitted_at: std::time::Instant,
+        body: PeerBody,
+    ) -> std::result::Result<SubmitBlockResponse, TrustedSubmissionError> {
+        let hash = block.hash();
         let submission = match self.gbt.reserve_mined_submission(hash) {
             Ok(guard) => guard,
             Err(SubmitBlockErrorResponse::Inconclusive) => {
@@ -95,17 +128,23 @@ where
             }
             Err(response) => return Ok(response.into()),
         };
-        let early_relay = skipped.is_none();
-        let registration = self
-            .gbt
-            .pending_blocks()
-            .insert_trusted(block.clone(), early_relay)
-            .ok_or(TrustedSubmissionError::Capacity)?;
+        let registry = self.gbt.pending_blocks();
+        let (registration, early_relay) = match body {
+            PeerBody::Prepared(bytes) => (
+                registry.insert_prepared(block.clone(), bytes),
+                Some(TrustedBlockSource::PreparedJob),
+            ),
+            PeerBody::Serialized { early_relay } => (
+                registry.insert_trusted(block.clone(), early_relay),
+                early_relay.then_some(TrustedBlockSource::CompletePost),
+            ),
+        };
+        let registration = registration.ok_or(TrustedSubmissionError::Capacity)?;
         let submission = Submission {
             block,
             hash,
             height,
-            size: bytes.len(),
+            size,
             submitted_at,
             method: MinedBlockSubmission::TrustedBlock,
             reservation: submission,

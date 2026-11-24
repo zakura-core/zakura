@@ -573,3 +573,214 @@ async fn trusted_and_json_routes_answer_over_http2() {
     connection.abort();
     server.abort();
 }
+
+#[tokio::test]
+async fn prepared_job_controls_require_credentials_unique_id_and_bounded_body() {
+    let (cookie, auth) = credentials();
+    let json = tower::service_fn(|_| async { Ok::<_, tower::BoxError>(HttpResponse::default()) });
+    let service = TrustedBlockHttpService::new(
+        json,
+        Some(cookie),
+        Some(Arc::new(|_| panic!("a job must use the job handler"))),
+    )
+    .with_jobs(Some(Arc::new(|id, _, bytes| {
+        assert_eq!(id, [0xab; 16]);
+        assert_eq!(bytes.len(), 64);
+        Box::pin(async { Ok(()) })
+    })));
+    let valid = "abababababababababababababababab";
+    for (credential, id, size, status) in [
+        ("wrong", valid, 64, StatusCode::UNAUTHORIZED),
+        (auth.as_str(), "abcd", 64, StatusCode::BAD_REQUEST),
+        (auth.as_str(), valid, 65, StatusCode::PAYLOAD_TOO_LARGE),
+        (auth.as_str(), valid, 64, StatusCode::ACCEPTED),
+    ] {
+        let req = Request::post("/submittrustedblock?op=confirm")
+            .header("Content-Type", "application/octet-stream")
+            .header("Authorization", credential)
+            .header("X-Job-Id", id)
+            .body(Full::new(Bytes::from(vec![0; size])))
+            .unwrap();
+        assert_eq!(send(service.clone(), req).await.unwrap().status(), status);
+    }
+}
+
+const JOB_ID: &str = "abababababababababababababababab";
+
+/// A listener whose job handler answers every input with `outcome`.
+fn job_service(
+    cookie: Cookie,
+    outcome: Result<(), crate::methods::trusted_block::jobs::JobError>,
+) -> TrustedBlockHttpService<
+    impl tower::Service<
+            Request<Full<Bytes>>,
+            Response = HttpResponse,
+            Error = tower::BoxError,
+            Future: Send,
+        > + Clone
+        + Send
+        + 'static,
+> {
+    let json = tower::service_fn(|_| async { Ok::<_, tower::BoxError>(HttpResponse::default()) });
+    TrustedBlockHttpService::new(
+        json,
+        Some(cookie),
+        Some(Arc::new(|_| panic!("a job must use the job handler"))),
+    )
+    .with_jobs(Some(Arc::new(move |_, _, _| {
+        Box::pin(async move { outcome })
+    })))
+}
+
+fn job_request(auth: &str, query: &str, ids: &[&str], size: usize) -> Request<Full<Bytes>> {
+    let mut request = Request::post(format!("/submittrustedblock{query}"))
+        .header("Content-Type", "application/octet-stream")
+        .header("Authorization", auth);
+    for id in ids {
+        request = request.header("X-Job-Id", *id);
+    }
+    request.body(Full::new(Bytes::from(vec![0; size]))).unwrap()
+}
+
+#[tokio::test]
+async fn prepared_job_outcomes_map_to_distinct_statuses() {
+    use crate::methods::trusted_block::jobs::JobError;
+    let (cookie, auth) = credentials();
+    for (outcome, status) in [
+        (Ok(()), StatusCode::ACCEPTED),
+        (Err(JobError::Invalid), StatusCode::BAD_REQUEST),
+        (Err(JobError::Conflict), StatusCode::CONFLICT),
+        (Err(JobError::Capacity), StatusCode::TOO_MANY_REQUESTS),
+        (Err(JobError::Expired), StatusCode::GONE),
+        (Err(JobError::Unavailable), StatusCode::SERVICE_UNAVAILABLE),
+    ] {
+        let service = job_service(cookie.clone(), outcome);
+        let request = job_request(&auth, "?op=solve", &[JOB_ID], 140);
+        assert_eq!(send(service, request).await.unwrap().status(), status);
+    }
+}
+
+#[tokio::test]
+async fn prepared_job_requests_are_refused_before_their_body_is_read() {
+    let (cookie, auth) = credentials();
+    let service = job_service(cookie.clone(), Ok(()));
+    let block_limit = usize::try_from(zakura_chain::block::MAX_BLOCK_BYTES).unwrap();
+    for (query, ids, size, status) in [
+        // The operation and the job ID are exact.
+        ("?op=cancel", vec![JOB_ID], 64, StatusCode::BAD_REQUEST),
+        ("?", vec![JOB_ID], 64, StatusCode::BAD_REQUEST),
+        ("?op=solve&x=1", vec![JOB_ID], 64, StatusCode::BAD_REQUEST),
+        ("?op=solve", vec![], 64, StatusCode::BAD_REQUEST),
+        (
+            "?op=solve",
+            vec![JOB_ID, JOB_ID],
+            64,
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "?op=solve",
+            vec!["ABABABABABABABABABABABABABABABAB"],
+            64,
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "?op=solve",
+            vec!["abababababababababababababababa"],
+            64,
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "?op=solve",
+            vec!["abababababababababababababababzz"],
+            64,
+            StatusCode::BAD_REQUEST,
+        ),
+        // Each operation has its own body limit.
+        ("?op=confirm", vec![JOB_ID], 64, StatusCode::ACCEPTED),
+        (
+            "?op=confirm",
+            vec![JOB_ID],
+            65,
+            StatusCode::PAYLOAD_TOO_LARGE,
+        ),
+        ("?op=solve", vec![JOB_ID], 1_487, StatusCode::ACCEPTED),
+        (
+            "?op=solve",
+            vec![JOB_ID],
+            1_488,
+            StatusCode::PAYLOAD_TOO_LARGE,
+        ),
+        (
+            "?op=prepare",
+            vec![JOB_ID],
+            block_limit,
+            StatusCode::ACCEPTED,
+        ),
+        (
+            "?op=prepare",
+            vec![JOB_ID],
+            block_limit + 1,
+            StatusCode::PAYLOAD_TOO_LARGE,
+        ),
+    ] {
+        let request = job_request(&auth, query, &ids, size);
+        assert_eq!(
+            send(service.clone(), request).await.unwrap().status(),
+            status,
+            "{query} with IDs {ids:?} and {size} bytes"
+        );
+    }
+
+    // A listener without trusted submission exposes no job operation either.
+    let json = tower::service_fn(|_| async { Ok::<_, tower::BoxError>(HttpResponse::default()) });
+    let disabled = TrustedBlockHttpService::new(json, Some(cookie), None);
+    let request = job_request(&auth, "?op=solve", &[JOB_ID], 64);
+    assert_eq!(
+        send(disabled, request).await.unwrap().status(),
+        StatusCode::NOT_FOUND
+    );
+}
+
+/// The job body limit also holds when the client declares no length.
+#[tokio::test]
+async fn prepared_job_body_limit_applies_to_a_stream_without_a_declared_length() {
+    let (cookie, auth) = credentials();
+    let json = tower::service_fn(|_| async { Ok::<_, tower::BoxError>(HttpResponse::default()) });
+    let service = TrustedBlockHttpService::new(
+        json,
+        Some(cookie),
+        Some(Arc::new(|_| panic!("a job must use the job handler"))),
+    )
+    .with_jobs(Some(Arc::new(|_, _, _| {
+        panic!("an oversized input never reaches the job")
+    })));
+    let frames = (0..3).map(|_| Ok::<_, std::io::Error>(Frame::data(Bytes::from(vec![0; 40]))));
+    let request = Request::post("/submittrustedblock?op=confirm")
+        .header("Content-Type", "application/octet-stream")
+        .header("Authorization", auth)
+        .header("X-Job-Id", JOB_ID)
+        .body(StreamBody::new(futures::stream::iter(frames)))
+        .unwrap();
+    assert_eq!(
+        send(service, request).await.unwrap().status(),
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+}
+
+/// A job handler that panics has no outcome. Its status must not read as an acknowledgement.
+#[tokio::test]
+async fn prepared_job_handler_panic_is_not_acknowledged() {
+    let (cookie, auth) = credentials();
+    let json = tower::service_fn(|_| async { Ok::<_, tower::BoxError>(HttpResponse::default()) });
+    let service = TrustedBlockHttpService::new(
+        json,
+        Some(cookie),
+        Some(Arc::new(|_| panic!("a job must use the job handler"))),
+    )
+    .with_jobs(Some(Arc::new(|_, _, _| panic!("the job handler failed"))));
+    let request = job_request(&auth, "?op=solve", &[JOB_ID], 140);
+    assert_eq!(
+        send(service, request).await.unwrap().status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+}

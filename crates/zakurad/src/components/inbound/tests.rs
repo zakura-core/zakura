@@ -5,6 +5,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use zakura_chain::chain_tip::NoChainTip;
+
 use super::{
     block_by_hash_or_pending, block_misbehavior, canonical_ip, PrunedBlockNotFoundLogger,
     ZCASHD_COMPAT_PRUNED_BLOCK_LOG_INTERVAL,
@@ -34,7 +36,7 @@ async fn peer_block_lookup_queries_all_active_chains() {
     let state = Buffer::new(BoxService::new(state), 1);
 
     assert_eq!(
-        block_by_hash_or_pending(state, PendingBlockRegistry::default(), hash)
+        block_by_hash_or_pending(state, PendingBlockRegistry::default(), NoChainTip, hash)
             .await
             .expect("the state lookup succeeds"),
         Some(block.into()),
@@ -63,7 +65,7 @@ async fn peer_block_lookup_serves_pending_block_only_when_state_lacks_it() {
         .insert(block.clone())
         .expect("the registry accepts the admitted block");
 
-    let retained = block_by_hash_or_pending(state, pending_blocks, hash)
+    let retained = block_by_hash_or_pending(state, pending_blocks, NoChainTip, hash)
         .await
         .expect("the pending lookup succeeds")
         .unwrap();
@@ -107,7 +109,7 @@ async fn peer_block_lookup_prefers_a_committed_block_over_a_pending_body() {
         .insert(Arc::new(pending_body))
         .expect("the registry accepts the pending body");
 
-    let served = block_by_hash_or_pending(state, pending_blocks, hash)
+    let served = block_by_hash_or_pending(state, pending_blocks, NoChainTip, hash)
         .await
         .expect("the state lookup succeeds")
         .unwrap();

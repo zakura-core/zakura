@@ -285,7 +285,8 @@ pub enum Message {
     /// Encodes as the ordinary `block` command and decodes as [`Self::Block`]. Pending
     /// bodies can differ under the same header hash, so they must neither read nor populate
     /// the shared checksum cache. Sends of one submission attempt share its checksum instead.
-    /// Only outbound serving constructs this variant.
+    /// An attempt that carries its exact serialized body is written from those bytes, without
+    /// serializing the block. Only outbound serving constructs this variant.
     #[cfg_attr(any(test, feature = "proptest-impl"), proptest(skip))]
     UncachedBlock(
         HashedBlock,

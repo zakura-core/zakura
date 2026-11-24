@@ -1203,6 +1203,10 @@ pub struct BlockTable {
     pending_bytes: usize,
     /// Admitted (and retired-in-window) blocks.
     blocks: HashMap<block::Hash, ActiveBlock>,
+    /// Verifier work of retired blocks whose verdict has not arrived. Each
+    /// still holds an assembled block's lease, so it keeps a slot from peer
+    /// blocks until its verdict (mem-5).
+    owed_verdicts: HashSet<WorkId>,
 }
 
 impl BlockTable {
@@ -1218,6 +1222,7 @@ impl BlockTable {
             pending: HashMap::new(),
             pending_bytes: 0,
             blocks: HashMap::new(),
+            owed_verdicts: HashSet::new(),
         }
     }
 
@@ -1911,35 +1916,41 @@ impl BlockTable {
     /// Retires the lowest `Done` block, else the lowest `Fallback` block so a
     /// stalled fallback never wedges admission. With `force`, retires the lowest
     /// non-retired block as a last resort. Returns whether a slot is free.
+    ///
+    /// A peer block may assemble, so its slots also count each owed verdict,
+    /// which holds an assembled block's lease (mem-5). A `force` admission is
+    /// a local solve, which assembles nothing, so it counts only live blocks.
     fn evict_for_slot(&mut self, force: bool, step: &mut BlockStep) -> bool {
-        let lowest = |phases: &[BlockPhase]| {
-            self.blocks
+        loop {
+            let lowest = |phases: &[BlockPhase]| {
+                self.blocks
+                    .values()
+                    .filter(|b| phases.contains(&b.phase))
+                    .min_by_key(|b| b.height)
+                    .map(|b| b.meta.block_id)
+            };
+            let active = self
+                .blocks
                 .values()
-                .filter(|b| phases.contains(&b.phase))
-                .min_by_key(|b| b.height)
-                .map(|b| b.meta.block_id)
-        };
-        let active = self
-            .blocks
-            .values()
-            .filter(|b| b.phase != BlockPhase::Retired)
-            .count();
-        if active < self.config.max_concurrent_blocks {
-            return true;
-        }
-        let victim = lowest(&[BlockPhase::Done])
-            .or_else(|| lowest(&[BlockPhase::Fallback]))
-            .or_else(|| {
-                force
-                    .then(|| lowest(&[BlockPhase::Collecting, BlockPhase::Verifying]))
-                    .flatten()
-            });
-        match victim {
-            Some(id) => {
-                self.retire_block(id, step);
-                true
+                .filter(|b| b.phase != BlockPhase::Retired)
+                .count();
+            let owed = if force { 0 } else { self.owed_verdicts.len() };
+            if active.saturating_add(owed) < self.config.max_concurrent_blocks {
+                return true;
             }
-            None => false,
+            let victim = lowest(&[BlockPhase::Done])
+                .or_else(|| lowest(&[BlockPhase::Fallback]))
+                .or_else(|| {
+                    force
+                        .then(|| lowest(&[BlockPhase::Collecting, BlockPhase::Verifying]))
+                        .flatten()
+                });
+            // Retiring a block whose verdict is owed frees no slot for a peer
+            // block, so the loop retires the next one.
+            match victim {
+                Some(id) => self.retire_block(id, step),
+                None => return false,
+            }
         }
     }
 
@@ -2640,6 +2651,10 @@ impl BlockTable {
         verdict: VerifierVerdict,
         step: &mut BlockStep,
     ) {
+        // The block retired before its verdict, which now frees its slot.
+        if self.owed_verdicts.remove(&work_id) {
+            return;
+        }
         let Some(block) = self.blocks.get_mut(&block_id) else {
             return;
         };
@@ -2902,7 +2917,9 @@ impl BlockTable {
         let stripes = block.meta.coding.stripes;
         let n = block.meta.coding.n;
         let release_claim = std::mem::take(&mut block.body_claimed);
-        block.verify_work_id = None;
+        if let Some(work_id) = block.verify_work_id.take() {
+            self.owed_verdicts.insert(work_id);
+        }
         for st in &mut block.stripes {
             st.clear_buffers();
         }

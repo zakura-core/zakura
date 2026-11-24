@@ -1371,6 +1371,85 @@ fn bpv1_57_fallback_blocks_yield_to_a_new_block_at_the_cap() {
     assert_eq!(table.block_phase(&h(60)), Some(BlockPhase::Retired));
 }
 
+/// mem-5: the `Propagation` reserve funds one assembled block per concurrent
+/// block until its verdict. A block retired while its verdict is owed still
+/// holds its assembled lease, so it keeps its slot from peer blocks until
+/// the verdict arrives. A local solve assembles nothing and still admits.
+#[test]
+fn mem5_a_retired_block_keeps_its_slot_until_its_verdict() {
+    let now = Instant::now();
+    let encoded = encode_body(&Profile::TINY, &[0x56; 128], 2).unwrap();
+    let mut cfg = BlockConfig::for_profile(Profile::TINY);
+    cfg.max_concurrent_blocks = 1;
+    let mut table = BlockTable::new(cfg);
+    let verifying = block::Hash([0x71; 32]);
+    admit(
+        &mut table,
+        now,
+        verifying,
+        encoded.coding,
+        encoded.part_root,
+    );
+    let (verify, _) = assemble(&mut table, now, verifying, &encoded);
+
+    // A local solve takes the only slot and retires the verifying block.
+    let solved = block::Hash([0x72; 32]);
+    table.step(
+        now,
+        BlockInput::BlockAdmittedLocal {
+            height: 2,
+            envelope: make_envelope(solved, encoded.coding, encoded.part_root, node_id(1)),
+            parts: encoded.parts.clone(),
+        },
+    );
+    assert_eq!(table.block_phase(&verifying), Some(BlockPhase::Retired));
+    assert_eq!(table.block_phase(&solved), Some(BlockPhase::Done));
+
+    // The retired block's verdict is owed, so a peer block finds no slot.
+    let peer_block = || {
+        make_envelope(
+            block::Hash([0x73; 32]),
+            encoded.coding,
+            encoded.part_root,
+            node_id(1),
+        )
+    };
+    let try_admit = |table: &mut BlockTable| {
+        let received = receive(table, now, peer_block());
+        let admitted = header_result(
+            table,
+            now,
+            &received,
+            HeaderAdmissionResult::Admitted { height: 3 },
+        );
+        commitment_ok(table, now, &admitted)
+    };
+    let refused = try_admit(&mut table);
+    assert!(
+        !refused
+            .events
+            .iter()
+            .any(|e| matches!(e, BlockEvent::BlockAdmitted { .. })),
+        "an owed verdict holds the slot"
+    );
+    table.assert_invariants();
+
+    // The verdict frees the slot.
+    table.step(
+        now,
+        BlockInput::VerifierVerdict {
+            work_id: verify,
+            block_id: verifying,
+            verdict: VerifierVerdict::Valid,
+        },
+    );
+    let admitted = try_admit(&mut table);
+    assert!(admitted.events.contains(&BlockEvent::BlockAdmitted {
+        block_id: block::Hash([0x73; 32])
+    }));
+    table.assert_invariants();
+}
+
 /// A Valid verdict is terminal over a late failed stripe check: the block
 /// starts no fallback and no second verification (bpv1-44). The failed check
 /// still stops coded propagation (bpv1-41), so the encoding retires and its

@@ -529,7 +529,7 @@ impl SharedNode {
                 drop(task::spawn_named("bpv1-assemble-verify", async move {
                     // The lease covers the assembled block until its verdict.
                     // Without one, the block falls back as a local limit.
-                    let Some(_assembled_lease) = node.memory.lease(ASSEMBLED_BLOCK_BYTES) else {
+                    let Some(assembled_lease) = node.memory.lease(ASSEMBLED_BLOCK_BYTES) else {
                         node.drive(BlockInput::VerifierVerdict {
                             work_id,
                             block_id,
@@ -566,6 +566,9 @@ impl SharedNode {
                         None => VerifierVerdict::RootMismatch,
                     };
                     tracing::info!(target: "bpv1_measure", %block_id, ?verdict, "bpv1_verifier_result");
+                    // The verdict frees the block's slot, so the lease ends
+                    // first and the slot's next block finds it free.
+                    drop(assembled_lease);
                     node.drive(BlockInput::VerifierVerdict {
                         work_id,
                         block_id,

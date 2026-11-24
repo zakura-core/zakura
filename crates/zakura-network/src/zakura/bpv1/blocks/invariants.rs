@@ -82,6 +82,21 @@ impl BlockTable {
             self.config.max_concurrent_blocks
         );
 
+        // mem-5: the reserve funds one assembled block per concurrent block
+        // until its verdict.
+        let verdicts = self
+            .blocks
+            .values()
+            .filter(|b| b.verify_work_id.is_some())
+            .count()
+            .saturating_add(self.owed_verdicts.len());
+        assert!(
+            verdicts <= self.config.max_concurrent_blocks,
+            "{BLOCK_REPLAY}: owed verdicts {} > cap {}",
+            verdicts,
+            self.config.max_concurrent_blocks
+        );
+
         for block in self.blocks.values() {
             if block.phase == BlockPhase::Retired {
                 assert_eq!(

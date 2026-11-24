@@ -737,6 +737,23 @@ impl StartCmd {
             node_tasks.track(&task);
         }
 
+        // BPv1 takes the block verifier when it is built, before the network starts.
+        info!("initializing verifiers");
+        let (tx_verifier_setup_tx, tx_verifier_setup_rx) = oneshot::channel();
+        let (block_verifier_router, tx_verifier, consensus_task_handles, max_checkpoint_height) =
+            zakura_consensus::router::init_with_read_state(
+                config.consensus.clone(),
+                &config.network.network,
+                state.clone(),
+                read_only_state_service.clone(),
+                tx_verifier_setup_rx,
+                announcement_claims.clone(),
+                read_only_state_service.subscribe_non_finalized_state(),
+            )
+            .boxed()
+            .await;
+        node_tasks.track(&consensus_task_handles.state_checkpoint_verify_handle);
+
         info!("initializing network");
         // The service that our node uses to respond to requests by peers. The
         // load_shed middleware ensures that we reduce the size of the peer set
@@ -808,9 +825,51 @@ impl StartCmd {
             None
         };
 
-        // The network counts `tx-relay`'s memory shares only when it is
+        // BPv1 runs only when explicitly enabled AND headerchain is attached
+        // (`Zakura` or `Dual` p2p_stack — strictly absent in `Legacy`, `dual-1`).
+        let mut zakura_header_sync_driver_startup = zakura_header_sync_driver_startup;
+        let bpv1_handle = if config.network.zakura.bpv1.enabled {
+            if let Some(driver_startup) = zakura_header_sync_driver_startup.as_mut() {
+                config
+                    .network
+                    .zakura
+                    .bpv1
+                    .validate()
+                    .map_err(|reason| eyre!("invalid [network.zakura.bpv1] config: {reason}"))?;
+                // Resolve the node key once, so BPv1 and the endpoint share one node id.
+                let secret_key = network_config
+                    .zakura_secret_key()
+                    .map_err(|error| eyre!(error))?;
+                network_config.zakura_node_secret_key = Some((&secret_key).into());
+                let (svc, handle) = zakura::bpv1_wiring::build_bpv1_service(
+                    &config.network.zakura.bpv1,
+                    // decision-26: `Have`s follow block gossip's advertisement pacing.
+                    zakura_network::zakura::bpv1::HavePacing::from_network_config(&config.network),
+                    config.network.network.clone(),
+                    secret_key.public(),
+                    Arc::new(zakura::bpv1_wiring::RouterBlockVerifierAdapter::new(
+                        block_verifier_router.clone(),
+                    )),
+                    driver_startup,
+                    // Child token so disabling/shutting down BPv1 never shuts down the daemon.
+                    shutdown.child_token(),
+                );
+                custom_services.push(svc);
+                Some(handle)
+            } else {
+                warn!(
+                    "bpv1 requires `Zakura` or `Dual` p2p_stack (headerchain attached), so it stays off"
+                );
+                None
+            }
+        } else {
+            None
+        };
+
+        // The network counts `tx-relay` and `bpv1` memory shares only when they are
         // registered, not merely enabled.
         network_config.zakura.tx_relay.enabled = tx_relay_port.is_some();
+        network_config.zakura.bpv1.enabled = bpv1_handle.is_some();
         // The service is registered on the v2 endpoint, which a legacy-only
         // stack never starts.
         let tx_relay_registered = tx_relay_port.is_some() && config.network.v2_p2p();
@@ -864,22 +923,6 @@ impl StartCmd {
         };
 
         // Start health server if configured (after sync_status is available)
-
-        info!("initializing verifiers");
-        let (tx_verifier_setup_tx, tx_verifier_setup_rx) = oneshot::channel();
-        let (block_verifier_router, tx_verifier, consensus_task_handles, max_checkpoint_height) =
-            zakura_consensus::router::init_with_read_state(
-                config.consensus.clone(),
-                &config.network.network,
-                state.clone(),
-                read_only_state_service.clone(),
-                tx_verifier_setup_rx,
-                announcement_claims,
-                read_only_state_service.subscribe_non_finalized_state(),
-            )
-            .boxed()
-            .await;
-        node_tasks.track(&consensus_task_handles.state_checkpoint_verify_handle);
 
         if let Some(endpoint) = zakura_endpoint.clone() {
             let trace = endpoint.trace();
@@ -1056,6 +1099,11 @@ impl StartCmd {
         let rpc_impl = rpc_impl
             .with_template_trace(template_path_trace)
             .with_local_services(config.network.handshake_services(advertised_services));
+        let rpc_impl = if let Some(bpv1) = bpv1_handle.as_ref() {
+            rpc_impl.with_bpv1_proposer(Arc::new(bpv1.clone()))
+        } else {
+            rpc_impl
+        };
         let rpc_impl = if config.mining.miner_mesh {
             let gateway = zakura_endpoint
                 .as_ref()

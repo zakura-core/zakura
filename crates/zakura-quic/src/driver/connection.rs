@@ -335,6 +335,8 @@ pub(crate) async fn run<S: UdpIo>(params: ConnTaskParams<S>) {
             VarInt::from_u32(0),
             Bytes::from_static(b"endpoint shutdown"),
         );
+    } else if task.conn.side().is_client() {
+        task.pad_hello();
     }
 
     loop {
@@ -587,6 +589,31 @@ impl<S: UdpIo> ConnTask<S> {
             metrics::counter!("zakura.quic.paths.closed_banned").increment(1);
             tracing::debug!(target: "zakura_quic", %ip, "closing a connection that migrated to a banned IP");
             self.close(VarInt::from_u32(0), Bytes::from_static(b"banned path"));
+        }
+    }
+
+    /// Sends the dialer's hello, then one more Initial datagram (ADM-1).
+    ///
+    /// Before it validates the dialer's address, a listener may send only
+    /// three times what it received (RFC 9000 §8.1). The hello is two
+    /// 1,200-byte datagrams, which allows 7,200 bytes, and the listener's
+    /// first flight, with its ML-KEM-1024 ciphertext, ML-DSA-87 key and
+    /// composite signature (TLS-4, TLS-9), is about 9.9 KB. A third datagram
+    /// raises the allowance to 10,800 bytes, so the listener sends its whole
+    /// flight at once and the dial completes in one round trip instead of
+    /// two. quinn-proto puts the PING in the Initial space and pads every
+    /// datagram that carries a dialer's Initial packet to 1,200 bytes. The
+    /// hello must leave first, or the PING would ride in its last datagram.
+    ///
+    /// A hello that fits one datagram, which only a dialer without the
+    /// hybrid group sends, gets no padding. A listener refuses such a hello
+    /// at its first packet and keeps no state for it, so a padding datagram
+    /// would arrive as an attempt of its own, with no hello, and hold a
+    /// pending handshake until the deadline.
+    fn pad_hello(&mut self) {
+        self.drive();
+        if self.counters.datagrams_sent >= 2 {
+            self.conn.ping();
         }
     }
 

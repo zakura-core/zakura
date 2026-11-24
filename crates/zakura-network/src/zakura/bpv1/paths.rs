@@ -91,8 +91,11 @@ pub struct RateSample {
     pub last_at: Instant,
 }
 
-/// A windowed max over delivery-rate samples in two `RATE_WINDOW` slots, so
-/// a sample counts for one to two windows in constant space.
+/// A windowed max over delivery-rate samples in two `RATE_WINDOW` slots, in
+/// constant space. A new sample rotates the slots, so a sample counts until a
+/// sample one to two windows later replaces it, or the session ends. A peer
+/// that stops delivering keeps its last rate; the late timer and the liveness
+/// rule, not this window, handle that peer.
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 struct RateWindow {
     current_from: Option<Instant>,

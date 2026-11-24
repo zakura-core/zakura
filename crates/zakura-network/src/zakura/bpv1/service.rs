@@ -42,9 +42,9 @@ use super::{
     config::{HavePacing, ZakuraBpv1Config, PATH_POLL_INTERVAL},
     paths::{Arrival, PathEstimate},
     peer::{
-        DropReason, PartAuth, PartToken, PeerEvent, PeerInput, PeerOutput, PeerState, PeerStep,
-        RecvHave, RecvPartPrefix, RecvWant, RecvWantEnd, Seed, Seeds, ServeDone, ServePartQueued,
-        PULL_WINDOW,
+        stall_timeout, DropReason, PartAuth, PartToken, PeerEvent, PeerInput, PeerOutput,
+        PeerState, PeerStep, RecvHave, RecvPartPrefix, RecvWant, RecvWantEnd, Seed, Seeds,
+        ServeDone, ServePartQueued, PULL_WINDOW,
     },
     ports::{BlockFallbackPort, BlockVerifierPort, BodyStorePort, HeaderAdmissionPort},
     profile::{Coding, Profile, W2_PROFILE_ID},
@@ -1156,7 +1156,7 @@ struct Session {
     node: Arc<SharedNode>,
     state: PeerState,
     peer_node: NodeId,
-    ctrl_send: FramedSend,
+    ctrl: ControlWriter,
     data: DataWriter,
     verify_tx: mpsc::UnboundedSender<(PartToken, Option<VerifiedPart>)>,
     pulls: PullTelemetry,
@@ -1314,35 +1314,11 @@ impl Session {
         };
         match output {
             PeerOutput::SendControl(msg) => {
-                let meta_block_id = match msg.as_ref() {
-                    Bpv1Message::HeaderMeta { header, .. } if tracing::enabled!(target: "bpv1_stage", tracing::Level::DEBUG) => {
-                        parse_header(header).map(|parsed| parsed.hash())
-                    }
-                    _ => None,
-                };
-                if let Ok(frame) = encode_frame(msg.as_ref()) {
-                    if let Some(block_id) = meta_block_id {
-                        tracing::debug!(target: "bpv1_stage", %block_id, ?peer,
-                            session_gen = self.state.session_gen(), "header_meta_send_started");
-                    }
-                    if self.ctrl_send.send(frame).await.is_err() {
-                        return false;
-                    }
-                    if let Some(block_id) = meta_block_id {
-                        tracing::debug!(target: "bpv1_stage", %block_id, ?peer,
-                            session_gen = self.state.session_gen(), "header_meta_written");
-                    }
-                    if let Bpv1Message::Want {
-                        block_id,
-                        want_id,
-                        stripe,
-                        requested,
-                    } = msg.as_ref()
-                    {
-                        tracing::debug!(target: "bpv1_stage", %block_id, ?peer, want_id, stripe,
-                            ?requested, session_gen = self.state.session_gen(), "want_written");
-                    }
+                if let Some(block_id) = header_meta_trace_id(&msg) {
+                    tracing::debug!(target: "bpv1_stage", %block_id, ?peer,
+                        session_gen = self.state.session_gen(), "header_meta_send_started");
                 }
+                self.ctrl.push(msg);
             }
             PeerOutput::SendHave {
                 block_id,
@@ -1415,7 +1391,10 @@ impl Session {
             PeerOutput::ServeWant { .. } => unreachable!("Session::execute serves wants"),
             PeerOutput::SubmitHeaderMeta { block_id, message } => {
                 if let Some(env) = decode_meta_envelope(block_id, *message) {
-                    node.drive(BlockInput::MetaReceived {
+                    // The table checks its metadata caps before this session
+                    // reads its next frame, so a flood waits in the sender's
+                    // stream window instead of the driver's queue.
+                    node.apply_block_input(BlockInput::MetaReceived {
                         envelope: env,
                         from_peer: peer,
                         session_gen: self.state.session_gen(),
@@ -1454,15 +1433,7 @@ impl Session {
                     tracing::debug!(target: "bpv1_stage", block_id = %token.block_id, ?peer,
                         index = token.index, session_gen = token.session_gen,
                         ok = verified.is_some(), "part_proof_finished");
-                    if verified.is_none() {
-                        let _ =
-                            release_tx.send(DriverMsg::BlockInput(BlockInput::ReleasePartCharge {
-                                block_id: token.block_id,
-                                index: token.index,
-                                from_peer: peer,
-                            }));
-                    }
-                    let _ = tx.send((token, verified));
+                    finish_part_proof(&tx, &release_tx, peer, token, verified);
                 }));
             }
             PeerOutput::CancelQueuedPush { block_id, index } => {
@@ -1600,6 +1571,129 @@ impl Written {
 /// its grant. A full gate makes the queue wait; nothing is dropped.
 /// The session's routine drives the write in its own `select!`, so a blocked
 /// write never stalls control reads, timers, or shutdown (`bpv1-54`).
+/// The `bpv1-header-meta-want` stream's FIFO writer (decision-7). The session
+/// loop polls it, so a peer that stops reading control stops only this
+/// writer. A frame that waits [`stall_timeout`] for its bytes ends the session.
+struct ControlWriter {
+    send: FramedSend,
+    queue: VecDeque<Box<Bpv1Message>>,
+    in_flight: Option<ControlWrite>,
+}
+
+struct ControlWrite {
+    msg: Box<Bpv1Message>,
+    stall_at: Instant,
+    write: BoxFuture<'static, bool>,
+}
+
+impl ControlWriter {
+    fn new(send: FramedSend) -> Self {
+        Self {
+            send,
+            queue: VecDeque::new(),
+            in_flight: None,
+        }
+    }
+
+    /// Queues `msg` behind every queued message and starts writing if idle.
+    fn push(&mut self, msg: Box<Bpv1Message>) {
+        self.queue.push_back(msg);
+        self.start();
+    }
+
+    /// Starts writing the head of the queue unless a frame is in flight.
+    fn start(&mut self) {
+        if self.in_flight.is_some() {
+            return;
+        }
+        while let Some(msg) = self.queue.pop_front() {
+            let Ok(frame) = encode_frame(msg.as_ref()) else {
+                continue;
+            };
+            // Widening usize to u64 is lossless on supported targets.
+            let stall_at = Instant::now() + stall_timeout(frame.payload.len() as u64);
+            let send = self.send.clone();
+            let write = Box::pin(async move { send.send(frame).await.is_ok() });
+            self.in_flight = Some(ControlWrite {
+                msg,
+                stall_at,
+                write,
+            });
+            return;
+        }
+    }
+
+    fn is_writing(&self) -> bool {
+        self.in_flight.is_some()
+    }
+
+    /// When the frame in flight stalls, if one is in flight.
+    fn stall_at(&self) -> Option<Instant> {
+        self.in_flight.as_ref().map(|write| write.stall_at)
+    }
+
+    /// Waits until the frame in flight enters the transport's queue. Returns
+    /// its message, or `None` once the stream closed. Cancel-safe: the frame
+    /// stays in flight until this completes.
+    async fn written(&mut self) -> Option<Box<Bpv1Message>> {
+        let ok = (&mut self.in_flight.as_mut()?.write).await;
+        let write = self.in_flight.take()?;
+        ok.then_some(write.msg)
+    }
+}
+
+/// Hands a proof result to its session. A failed proof, or a result its ended
+/// session never reads, releases the part's charge; a delivered part's insert
+/// takes the charge instead.
+fn finish_part_proof(
+    session: &mpsc::UnboundedSender<(PartToken, Option<VerifiedPart>)>,
+    driver: &mpsc::UnboundedSender<DriverMsg>,
+    peer: NodeId,
+    token: PartToken,
+    verified: Option<VerifiedPart>,
+) {
+    let failed = verified.is_none();
+    if session.send((token, verified)).is_err() || failed {
+        let _ = driver.send(DriverMsg::BlockInput(BlockInput::ReleasePartCharge {
+            block_id: token.block_id,
+            index: token.index,
+            from_peer: peer,
+        }));
+    }
+}
+
+/// The block a `HeaderMeta` names, when stage tracing is on.
+fn header_meta_trace_id(msg: &Bpv1Message) -> Option<block::Hash> {
+    match msg {
+        Bpv1Message::HeaderMeta { header, .. } if tracing::enabled!(target: "bpv1_stage", tracing::Level::DEBUG) => {
+            parse_header(header).map(|parsed| parsed.hash())
+        }
+        _ => None,
+    }
+}
+
+/// Traces a control message the transport just queued.
+fn trace_control_written(msg: &Bpv1Message, peer: NodeId, session_gen: u64) {
+    match msg {
+        Bpv1Message::HeaderMeta { .. } => {
+            if let Some(block_id) = header_meta_trace_id(msg) {
+                tracing::debug!(target: "bpv1_stage", %block_id, ?peer, session_gen,
+                    "header_meta_written");
+            }
+        }
+        Bpv1Message::Want {
+            block_id,
+            want_id,
+            stripe,
+            requested,
+        } => {
+            tracing::debug!(target: "bpv1_stage", %block_id, ?peer, want_id, stripe,
+                ?requested, session_gen, "want_written");
+        }
+        _ => {}
+    }
+}
+
 pub(super) struct DataWriter {
     send: FramedSend,
     pub(super) queue: Bpv1FifoQueue,
@@ -1753,7 +1847,7 @@ async fn run_peer_routine(
         state: PeerState::new(peer_cfg, node.local_node, peer_node, session_gen),
         node: Arc::clone(&node),
         peer_node,
-        ctrl_send,
+        ctrl: ControlWriter::new(ctrl_send),
         data: DataWriter::new(data_send),
         verify_tx,
         pulls: PullTelemetry::default(),
@@ -1786,6 +1880,14 @@ async fn run_peer_routine(
             }
         };
         zakura_rt::pin!(tick_sleep);
+        let ctrl_stall_at = session.ctrl.stall_at();
+        let ctrl_stall = async move {
+            match ctrl_stall_at {
+                Some(at) => time::sleep_until(at).await,
+                None => std::future::pending().await,
+            }
+        };
+        zakura_rt::pin!(ctrl_stall);
 
         let input = zakura_rt::select! {
             _ = node.shutdown.cancelled() => break,
@@ -1840,6 +1942,13 @@ async fn run_peer_routine(
                     }
                 }
             }
+            written = session.ctrl.written(), if session.ctrl.is_writing() => {
+                let Some(msg) = written else { break };
+                trace_control_written(&msg, peer_node, session_gen);
+                session.ctrl.start();
+                continue;
+            }
+            _ = &mut ctrl_stall => PeerInput::ControlStalled,
             written = session.data.written(), if session.data.is_writing() => {
                 let Some(written) = written else { break };
                 if !session.written(written).await {
@@ -1856,29 +1965,54 @@ async fn run_peer_routine(
 
     // Unified close & teardown (`bpv1-62`):
     // cancel peer on protocol close or repeat neutral stall, stop & join data writer,
-    // and ONLY emit `SessionEnded` if THIS session generation still owns `peer_node`.
+    // and emit `SessionEnded` unless a newer session already owns `peer_node`.
     if session.state.close_cause().is_some() || session.state.is_closed_neutral() {
         peer_cancel.cancel();
     }
     session_cancel.cancel();
 
+    // Proof results this session will never insert release their part charges.
+    // Closing first sends every later result back to its worker, which
+    // releases its own charge.
+    verify_rx.close();
+    while let Ok((token, verified)) = verify_rx.try_recv() {
+        if verified.is_some() {
+            node.drive(BlockInput::ReleasePartCharge {
+                block_id: token.block_id,
+                index: token.index,
+                from_peer: peer_node,
+            });
+        }
+    }
+
     let end_step = session.state.step(Instant::now(), PeerInput::SessionEnd);
     for ev in &end_step.events {
         record_peer_event(ev, &peer_node);
     }
-    let was_active_generation = {
+    // `remove_peer` may have taken this session's entry first, as the handler's
+    // disconnect does. Its state in the table is still this session's to end.
+    let replaced = {
         let mut sessions = node.lock_sessions();
-        if sessions
-            .get(&peer_node)
-            .is_some_and(|s| s.conn_id == conn_id && s.session_gen == session_gen)
-        {
-            sessions.remove(&peer_node);
-            true
-        } else {
-            false
+        match sessions.get(&peer_node) {
+            Some(s) if s.conn_id == conn_id && s.session_gen == session_gen => {
+                sessions.remove(&peer_node);
+                false
+            }
+            Some(_) => true,
+            None => false,
         }
     };
-    if was_active_generation {
+    if replaced {
+        // The newer session keeps the paths and samples keyed by `peer_node`.
+        // This session still releases its own pull claims.
+        for output in end_step.outputs {
+            if let PeerRoute::Table(input) =
+                route_peer_output(peer_node, output, || node.collect_peer_states())
+            {
+                node.drive(input);
+            }
+        }
+    } else {
         node.drive(BlockInput::SessionEnded {
             peer: peer_node,
             peer_states: node.collect_peer_states(),
@@ -2273,6 +2407,71 @@ mod tests {
             CancellationToken::new(),
         );
         assert_eq!(handle.node.local_node, endpoint_node);
+    }
+
+    /// A peer that stops reading control stops only the control writer: later
+    /// messages queue behind the frame in flight, which reports when it stalls.
+    #[tokio::test]
+    async fn control_writer_queues_behind_an_unread_frame_and_reports_its_stall() {
+        use super::super::peer::REQUEST_BASE_TIMEOUT;
+        use std::time::Duration;
+        let (send, _unread) = crate::zakura::transport::framed_channel(1);
+        let mut ctrl = ControlWriter::new(send);
+        let done = |b| {
+            Box::new(Bpv1Message::BlockDone {
+                block_id: block::Hash([b; 32]),
+            })
+        };
+        ctrl.push(done(1));
+        assert!(
+            ctrl.written().await.is_some(),
+            "the first frame fills the queue"
+        );
+        ctrl.start();
+        let before = Instant::now();
+        ctrl.push(done(2));
+        ctrl.push(done(3));
+        let stall_at = ctrl.stall_at().expect("the second frame is in flight");
+        assert!(stall_at >= before + REQUEST_BASE_TIMEOUT * 4);
+        assert_eq!(ctrl.queue.len(), 1, "the third waits behind it");
+        let blocked = tokio::time::timeout(Duration::from_millis(50), ctrl.written()).await;
+        assert!(blocked.is_err(), "the unread stream holds the second frame");
+        assert!(
+            ctrl.is_writing(),
+            "a timed-out wait keeps the frame in flight"
+        );
+    }
+
+    /// A verified part whose session already ended releases its charge, as a
+    /// failed proof does; a delivered part keeps it for its insert.
+    #[test]
+    fn a_proof_result_its_session_never_reads_releases_the_charge() {
+        let encoded =
+            super::super::codec::encode_body(&Profile::TINY, &[0x11; 64], 2).expect("encodes");
+        let part = encoded.parts[0].clone();
+        let token = PartToken {
+            block_id: block::Hash([4; 32]),
+            index: part.index(),
+            session_gen: 1,
+            attempt: 1,
+        };
+        let peer = NodeId::from_bytes(&[5; 32]);
+        let (driver, mut released) = mpsc::unbounded_channel();
+        let releases = |released: &mut mpsc::UnboundedReceiver<DriverMsg>| {
+            std::iter::from_fn(|| released.try_recv().ok()).count()
+        };
+
+        let (session, mut results) = mpsc::unbounded_channel();
+        finish_part_proof(&session, &driver, peer, token, Some(part.clone()));
+        assert!(results.try_recv().is_ok());
+        assert_eq!(releases(&mut released), 0, "the insert takes the charge");
+
+        finish_part_proof(&session, &driver, peer, token, None);
+        assert_eq!(releases(&mut released), 1, "a failed proof releases it");
+
+        drop(results);
+        finish_part_proof(&session, &driver, peer, token, Some(part));
+        assert_eq!(releases(&mut released), 1, "an unread result releases it");
     }
 
     #[test]

@@ -252,6 +252,26 @@ fn scenario_part_after_want_end_closes_14_and_after_block_done_drops_surplus() {
     assert_closed(&peer, Bpv1CloseRow::Row14UnwantedOrDuplicatePart);
 }
 
+/// bpv1-58: a peer that stops reading control gets the repeat-stall close,
+/// with no protocol close row, and its pull claims release at session end.
+#[test]
+fn control_stall_closes_neutrally_and_releases_claims() {
+    let t0 = Instant::now();
+    let block_id = block::Hash([0x34; 32]);
+    let mut peer = tiny_session(block_id, t0);
+    peer.step(t0, pull(block_id, 0, &[0], t0));
+
+    let closed = peer.step(t0, PeerInput::ControlStalled);
+    assert!(closed.outputs.contains(&PeerOutput::CloseNeutralStall));
+    assert!(peer.is_closed_neutral());
+    assert_eq!(peer.close_cause(), None);
+    let ended = peer.step(t0, PeerInput::SessionEnd);
+    assert!(ended
+        .outputs
+        .iter()
+        .any(|o| matches!(o, PeerOutput::ReleaseClaims { .. })));
+}
+
 #[test]
 fn scenario_unanswered_want_deadline_park_and_repeat_stall_close() {
     let t0 = Instant::now();

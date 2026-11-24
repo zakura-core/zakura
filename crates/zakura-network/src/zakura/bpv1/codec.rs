@@ -153,7 +153,20 @@ pub fn decode_and_check_stripe(
             Some(part) => Some(part.payload_arc()),
             // Widening usize to u32 is lossless: `slot < k <= u32::MAX`.
             None if is_padding(slot as u32) => Some(Arc::from(zeros.as_slice())),
-            None => restored.remove(&slot).map(Arc::from),
+            None => restored.remove(&slot).map(|mut payload| {
+                // A trimmed source part crosses the wire without its tail, and every
+                // receiver hashes the tail as zeros (decision-18). Zeroing the restored
+                // tail makes the root check below refuse a codeword whose tail is not
+                // zero, so this node never forwards a part no receiver can verify.
+                // Widening usize to u32 is lossless: `slot < k <= u32::MAX`.
+                let wire_len = coding
+                    .wire_index(stripe, slot as u32)
+                    .and_then(|index| coding.wire_len(index))
+                    .expect("the stripe and slot are in range, checked above");
+                // Widening u32 to usize is lossless on supported targets.
+                payload[wire_len as usize..].fill(0);
+                Arc::from(payload)
+            }),
         })
         .collect::<Option<Vec<Arc<[u8]>>>>()
         .ok_or(CodecError::CodewordCheckFailed)?;

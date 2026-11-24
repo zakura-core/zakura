@@ -842,6 +842,10 @@ struct AdmittingEntry {
     arrived_at: Instant,
     from_peer: NodeId,
     session_gen: u64,
+    /// Other sessions that sent the same `HeaderMeta` while this entry waited.
+    /// Each session holds a received marker until the table rejects or admits
+    /// the block.
+    also_from: Vec<(NodeId, u64)>,
     height: Option<u32>,
     stage: AdmittingStage,
 }
@@ -859,6 +863,8 @@ struct PendingMetaEntry {
     arrived_at: Instant,
     from_peer: NodeId,
     session_gen: u64,
+    /// See [`AdmittingEntry::also_from`].
+    also_from: Vec<(NodeId, u64)>,
     parent_hash: block::Hash,
     received_at: Instant,
 }
@@ -1166,6 +1172,13 @@ fn reject_meta(step: &mut BlockStep, block_id: block::Hash, peer: NodeId, sessio
     });
 }
 
+/// Rejects the metadata for every session in `also_from`.
+fn reject_also(step: &mut BlockStep, block_id: block::Hash, also_from: &[(NodeId, u64)]) {
+    for &(peer, session_gen) in also_from {
+        reject_meta(step, block_id, peer, session_gen);
+    }
+}
+
 /// Returns the next work identity from `counter`, skipping zero.
 fn alloc_work_id(counter: &mut u64) -> WorkId {
     let id = WorkId(*counter);
@@ -1382,7 +1395,14 @@ impl BlockTable {
                 from_peer,
                 session_gen,
             } => {
-                self.handle_meta_received(now, envelope, from_peer, session_gen, &mut step);
+                self.handle_meta_received(
+                    now,
+                    envelope,
+                    from_peer,
+                    session_gen,
+                    Vec::new(),
+                    &mut step,
+                );
             }
             BlockInput::HeaderAdmitted { work_id, result } => {
                 self.handle_header_admitted(now, work_id, result, &mut step);
@@ -1538,14 +1558,26 @@ impl BlockTable {
         envelope: Box<MetaEnvelope>,
         from_peer: NodeId,
         session_gen: u64,
+        mut also_from: Vec<(NodeId, u64)>,
         step: &mut BlockStep,
     ) {
         let block_id = envelope.block_id;
-        // Exact duplicate of already admitting, pending, or admitted/retired block is a no-op.
-        if self.blocks.contains_key(&block_id)
-            || self.admitting.contains_key(&block_id)
-            || self.pending.contains_key(&block_id)
-        {
+        // An admitted or retired block's admission already cleared every
+        // session's received marker. A block still admitting or pending records
+        // this sender, so whatever ends the entry also answers this session.
+        if self.blocks.contains_key(&block_id) {
+            return;
+        }
+        let waiting = match self.admitting.get_mut(&block_id) {
+            Some(entry) => Some(&mut entry.also_from),
+            None => self
+                .pending
+                .get_mut(&block_id)
+                .map(|entry| &mut entry.also_from),
+        };
+        if let Some(waiting) = waiting {
+            waiting.push((from_peer, session_gen));
+            waiting.append(&mut also_from);
             return;
         }
         // bpv1-10: validate canonical coding tuple against the local
@@ -1565,6 +1597,7 @@ impl BlockTable {
                 session_gen,
                 row: Bpv1CloseRow::Row4BadMetaOrCommitment,
             });
+            reject_also(step, block_id, &also_from);
             return;
         }
         // Bound admitting + pending count and bytes BEFORE queueing
@@ -1582,6 +1615,7 @@ impl BlockTable {
                 > MAX_PENDING_META_BYTES
         {
             reject_meta(step, block_id, from_peer, session_gen);
+            reject_also(step, block_id, &also_from);
             return;
         }
         let work_id = alloc_work_id(&mut self.next_work_id);
@@ -1594,6 +1628,7 @@ impl BlockTable {
                 arrived_at,
                 from_peer,
                 session_gen,
+                also_from,
                 height: None,
                 stage: AdmittingStage::WaitingHeader,
             },
@@ -1627,10 +1662,13 @@ impl BlockTable {
 
         match result {
             HeaderAdmissionResult::Admitted { height } => {
-                self.raise_top(height, step);
+                // An admitted header need not be selected: headerchain also
+                // retains forks and future-dated headers. Only the verified tip,
+                // the best header-valid height, and local solved blocks raise `top`.
                 if !self.in_propagation_window(height) {
                     if let Some(removed) = self.admitting.remove(&block_id) {
                         reject_meta(step, block_id, removed.from_peer, removed.session_gen);
+                        reject_also(step, block_id, &removed.also_from);
                     }
                     return;
                 }
@@ -1670,6 +1708,7 @@ impl BlockTable {
                         arrived_at: entry.arrived_at,
                         from_peer: entry.from_peer,
                         session_gen: entry.session_gen,
+                        also_from: entry.also_from,
                         parent_hash,
                         received_at: now,
                     },
@@ -1685,10 +1724,12 @@ impl BlockTable {
                     session_gen: entry.session_gen,
                     row: Bpv1CloseRow::Row3InvalidHeader,
                 });
+                reject_also(step, block_id, &entry.also_from);
             }
             HeaderAdmissionResult::LocalError => {
                 if let Some(removed) = self.admitting.remove(&block_id) {
                     reject_meta(step, block_id, removed.from_peer, removed.session_gen);
+                    reject_also(step, block_id, &removed.also_from);
                 }
             }
         }
@@ -1711,6 +1752,7 @@ impl BlockTable {
                     pending.envelope,
                     pending.from_peer,
                     pending.session_gen,
+                    pending.also_from,
                     step,
                 );
             }
@@ -1746,6 +1788,9 @@ impl BlockTable {
                 session_gen: entry.session_gen,
                 row: Bpv1CloseRow::Row4BadMetaOrCommitment,
             });
+            // Another sender's envelope may differ under the same hash, so it is
+            // not faulted for this one's commitment.
+            reject_also(step, block_id, &entry.also_from);
             return;
         }
 
@@ -1754,11 +1799,13 @@ impl BlockTable {
         // in case `top` advanced while commitment verification was running.
         if !self.in_propagation_window(height) {
             reject_meta(step, block_id, entry.from_peer, entry.session_gen);
+            reject_also(step, block_id, &entry.also_from);
             return;
         }
         // All concurrent slots actively collecting: drop cleanly without faulting the peer.
         if !self.evict_for_slot(false, step) {
             reject_meta(step, block_id, entry.from_peer, entry.session_gen);
+            reject_also(step, block_id, &entry.also_from);
             return;
         }
 
@@ -2456,8 +2503,12 @@ impl BlockTable {
         }
 
         if should_fallback {
-            // bpv1-41: a re-encode failure falls back even after assembly.
+            // bpv1-41: a re-encode failure stops coded propagation. Before commit
+            // the block falls back, which retires it. A committed block needs no
+            // fallback, but its encoding is retired too, so its parts stop
+            // circulating.
             self.enter_fallback(block_id, FallbackReason::ReencodeFailed, step);
+            self.retire_block(block_id, step);
         } else {
             self.maybe_assemble_and_verify(block_id, step);
         }
@@ -2642,6 +2693,7 @@ impl BlockTable {
                 step.events
                     .push(BlockEvent::MetaPendingAged { block_id: id });
                 reject_meta(step, id, entry.from_peer, entry.session_gen);
+                reject_also(step, id, &entry.also_from);
             }
         }
 

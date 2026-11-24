@@ -160,6 +160,7 @@ pub fn replay_bpv1_peer_bytes(bytes: &[u8]) -> PeerReplaySummary {
                 now += Duration::from_secs(u64::from(arg % 15));
                 PeerInput::Tick
             }
+            14 if arg == 0xFF => PeerInput::ControlStalled,
             _ => {
                 now += HAVE_FLUSH_INTERVAL;
                 PeerInput::Tick

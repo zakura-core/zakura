@@ -1041,6 +1041,8 @@ pub struct ZakuraHeaderSyncDriverStartup {
     pub vct_root_repairs: Option<watch::Receiver<zakura_header_chain::VctRootRepairStatus>>,
     /// Typed header-chain operations used directly by the reactor.
     pub header_chain_port: Arc<dyn zakura_node_services::header_chain::Port>,
+    /// Optional shared body claims coordinating native block sync with BPv1.
+    pub body_claims: Option<zakura_node_services::body_claims::SharedBodyClaims>,
 }
 
 impl ZakuraEndpoint {
@@ -5790,6 +5792,9 @@ async fn spawn_zakura_endpoint_inner(
             .with_range_source(driver_startup.block_range_source.clone());
             startup.shutdown = header_sync_shutdown.clone();
             startup.trace = trace.clone();
+            if let Some(claims) = driver_startup.body_claims.clone() {
+                startup = startup.with_body_claims(claims);
+            }
             // With `checkpoint_sync = false` the verifier stops checkpointing
             // lower than this, so the cap only ever misses heights, never caps
             // a checkpoint range.

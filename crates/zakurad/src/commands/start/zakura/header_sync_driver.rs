@@ -133,6 +133,7 @@ where
             committed_snapshots,
             announcement_claims,
         )),
+        body_claims: None,
     })
 }
 
@@ -500,6 +501,110 @@ where
         let read_state = self.read_state.clone();
         Box::pin(async move { selected_chain_contains(read_state, hash).await })
     }
+
+    fn admit_exact_header(
+        &self,
+        header: Arc<block::Header>,
+        source: zakura_header_chain::SourceId,
+        session_id: u64,
+        request_id: std::num::NonZeroU64,
+    ) -> HeaderChainFuture<'_, Result<port::ExactHeaderAdmission, PortError>> {
+        let state = self.state.clone();
+        let read_state = self.read_state.clone();
+        let authority = self.authority.clone();
+        let adapter_key = self.adapter_key.clone();
+        let announcement_claims = self.announcement_claims.clone();
+        let selected_chain = self.selected_chain.clone();
+        Box::pin(async move {
+            let hash = header.hash();
+            // Coalesce by hash with header sync: a header already retained on
+            // the selected chain or a retained fork is admitted as known.
+            if let Ok(Some(lease)) = read_validation_lease(read_state.clone(), hash).await {
+                return Ok(already_known(&lease));
+            }
+
+            let parent_hash = header.previous_block_hash;
+            let parent_frontier = match read_validation_lease(read_state.clone(), parent_hash).await
+            {
+                Ok(Some(lease)) => lease.parent(),
+                Ok(None) => {
+                    return Ok(port::ExactHeaderAdmission::MissingParent { parent_hash });
+                }
+                Err(failure) => {
+                    tracing::debug!(target: "bpv1_stage", block_id = %hash, %parent_hash,
+                        ?failure, "exact_header_parent_read_failed");
+                    return Ok(port::ExactHeaderAdmission::LocalError);
+                }
+            };
+
+            let request = {
+                let selected = selected_chain.borrow();
+                let Some(snapshot) = selected.as_ref() else {
+                    tracing::debug!(target: "bpv1_stage", block_id = %hash,
+                        "exact_header_snapshot_missing");
+                    return Ok(port::ExactHeaderAdmission::LocalError);
+                };
+                port::PrepareHeaderTarget::exact_header(
+                    header,
+                    parent_frontier,
+                    snapshot,
+                    source,
+                    session_id,
+                    request_id,
+                )
+            };
+            let request = match request {
+                Ok(request) => request,
+                Err(admission) => {
+                    tracing::debug!(target: "bpv1_stage", block_id = %hash, ?admission,
+                        "exact_header_target_rejected");
+                    return Ok(admission);
+                }
+            };
+            let height = request.target.height;
+            let prepared =
+                match prepare_header_target(read_state.clone(), adapter_key.clone(), request).await
+                {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        tracing::debug!(target: "bpv1_stage", block_id = %hash, ?error,
+                            "exact_header_prepare_failed");
+                        return Ok(port::ExactHeaderAdmission::target_failure(&error));
+                    }
+                };
+
+            match apply_header_target(
+                state,
+                authority,
+                adapter_key,
+                announcement_claims,
+                selected_chain,
+                prepared,
+            )
+            .await
+            {
+                Ok(outcome) => {
+                    if let port::ApplyHeaderTargetOutcome::ResourceStalled(receipt) = &outcome {
+                        tracing::debug!(target: "bpv1_stage", block_id = %hash, ?receipt,
+                            "exact_header_apply_stalled");
+                    }
+                    Ok(port::ExactHeaderAdmission::applied(outcome, height))
+                }
+                Err(error) => match port::ExactHeaderAdmission::target_failure(&error) {
+                    // Re-check whether a concurrent admission retained `hash`.
+                    port::ExactHeaderAdmission::LocalError => {
+                        tracing::debug!(target: "bpv1_stage", block_id = %hash, ?error,
+                            "exact_header_apply_failed");
+                        match read_validation_lease(read_state, hash).await {
+                            Ok(Some(lease)) => Ok(already_known(&lease)),
+                            _ => Ok(port::ExactHeaderAdmission::LocalError),
+                        }
+                    }
+                    admission => Ok(admission),
+                },
+            }
+        })
+    }
 }
 
 fn header_failure_evidence(
@@ -603,6 +708,40 @@ fn classify_body_size_hint_failure(
         source,
         Some(Box::new(error)),
     )
+}
+
+/// Reads the validation lease anchored at `hash`, within the driver timeout.
+/// `Err` describes a failed or timed-out read.
+async fn read_validation_lease<ReadState>(
+    read_state: ReadState,
+    hash: block::Hash,
+) -> Result<Option<zakura_header_chain::ValidationLease>, String>
+where
+    ReadState: Service<
+            zakura_state::ReadRequest,
+            Response = zakura_state::ReadResponse,
+            Error = zakura_state::BoxError,
+        > + Send
+        + 'static,
+    ReadState::Future: Send + 'static,
+{
+    match tokio::time::timeout(
+        ZAKURA_HEADER_SYNC_DRIVER_TIMEOUT,
+        read_state.oneshot(zakura_state::ReadRequest::HeaderValidationLease { parent_hash: hash }),
+    )
+    .await
+    {
+        Ok(Ok(zakura_state::ReadResponse::HeaderValidationLease(lease))) => Ok(lease),
+        failure => Err(format!("{failure:?}")),
+    }
+}
+
+/// An exact header that state already retains.
+fn already_known(lease: &zakura_header_chain::ValidationLease) -> port::ExactHeaderAdmission {
+    port::ExactHeaderAdmission::Admitted {
+        height: lease.parent().height,
+        already_known: true,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

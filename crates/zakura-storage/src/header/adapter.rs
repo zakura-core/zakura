@@ -1247,6 +1247,79 @@ impl Port for EnginePort {
     ) -> HeaderChainFuture<'_, Result<SelectedChainMembership, PortError>> {
         self.run_on_poll(HeaderRequest::SelectedChainContains { hash })
     }
+
+    fn admit_exact_header(
+        &self,
+        header: Arc<block::Header>,
+        source: SourceId,
+        session_id: u64,
+        request_id: std::num::NonZeroU64,
+    ) -> HeaderChainFuture<
+        '_,
+        Result<zakura_node_services::header_chain::ExactHeaderAdmission, PortError>,
+    > {
+        Box::pin(async move {
+            use zakura_node_services::header_chain::ExactHeaderAdmission;
+
+            let hash = header.hash();
+            // Coalesce by hash with header sync: already-retained headers (selected
+            // chain OR retained fork) succeed without re-validating.
+            let (parent_frontier, snapshot) = {
+                let engine = self.engine();
+                if let Some(node) = engine.graph().header_node(hash) {
+                    return Ok(ExactHeaderAdmission::Admitted {
+                        height: node.height,
+                        already_known: true,
+                    });
+                }
+                let Some(parent) = engine.graph().header_node(header.previous_block_hash) else {
+                    return Ok(ExactHeaderAdmission::MissingParent {
+                        parent_hash: header.previous_block_hash,
+                    });
+                };
+                (
+                    zakura_header_chain::Frontier::new(parent.height, parent.hash),
+                    engine.snapshot(),
+                )
+            };
+
+            let request = match PrepareHeaderTarget::exact_header(
+                header,
+                parent_frontier,
+                &snapshot,
+                source,
+                session_id,
+                request_id,
+            ) {
+                Ok(request) => request,
+                Err(admission) => return Ok(admission),
+            };
+            let height = request.target.height;
+            let prepared = match self.prepare(request) {
+                Ok(prepared) => prepared,
+                Err(error) => return Ok(ExactHeaderAdmission::target_failure(&error)),
+            };
+
+            match self.apply(prepared) {
+                Ok(outcome) => Ok(ExactHeaderAdmission::applied(outcome, height)),
+                Err(error) => match ExactHeaderAdmission::target_failure(&error) {
+                    // Re-check whether a concurrent admission retained `hash`.
+                    ExactHeaderAdmission::LocalError => {
+                        let engine = self.engine();
+                        if let Some(node) = engine.graph().header_node(hash) {
+                            Ok(ExactHeaderAdmission::Admitted {
+                                height: node.height,
+                                already_known: true,
+                            })
+                        } else {
+                            Ok(ExactHeaderAdmission::LocalError)
+                        }
+                    }
+                    admission => Ok(admission),
+                },
+            }
+        })
+    }
 }
 
 /// What [`EnginePort::execute`] did.

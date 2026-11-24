@@ -105,11 +105,12 @@ impl PeerState {
                     "{PEER_REPLAY}: bpv1-71 pushed to the proposer"
                 );
                 // bpv1-73: before the advertisement deadline, only flagged
-                // `Have`s go out.
+                // `Have`s go out, except to the proposer (decision-32).
                 assert!(
                     block.have_held_until.is_none()
                         || !block.local_have_sent.get(i)
-                        || block.local_flagged.get(i),
+                        || block.local_flagged.get(i)
+                        || self.remote_node == block.proposer_node,
                     "{PEER_REPLAY}: bpv1-73 plain Have for index {i} of {block_id:?} before the deadline"
                 );
             }

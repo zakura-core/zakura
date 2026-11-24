@@ -939,6 +939,32 @@ impl MachineMesh {
         flagged
     }
 
+    /// Indices `from` announced to `to`, flagged or not.
+    pub(super) fn announced(&self, from: usize, to: usize, block_id: &block::Hash) -> Vec<u32> {
+        let mut announced: Vec<u32> = self
+            .wire
+            .announced
+            .iter()
+            .filter(|&&(f, t, b, _)| f == from && t == to && b == *block_id)
+            .map(|&(.., index)| index)
+            .collect();
+        announced.sort_unstable();
+        announced
+    }
+
+    /// Indices whose parts `from` sent to `to`.
+    pub(super) fn sent_parts(&self, from: usize, to: usize, block_id: &block::Hash) -> Vec<u32> {
+        let mut sent: Vec<u32> = self
+            .wire
+            .parts
+            .iter()
+            .filter(|&&(f, t, b, _)| f == from && t == to && b == *block_id)
+            .map(|&(.., index)| index)
+            .collect();
+        sent.sort_unstable();
+        sent
+    }
+
     pub(super) fn verified(&self, node: usize, block_id: &block::Hash) -> bool {
         self.nodes[node].verified.contains_key(block_id)
     }

@@ -1972,6 +1972,96 @@ fn proposer_seeds_ahead_of_its_header_meta_are_accepted_and_relayed() {
     }
 }
 
+/// decision-32: every neighbour announces to the proposer each part it
+/// holds verified, received or reconstructed, that the proposer did not send
+/// it, and never sends the proposer a part. The proposer keeps every link open.
+#[test]
+fn decision32_neighbours_announce_to_the_proposer_the_parts_it_did_not_send_them() {
+    let peer_cfg = PeerConfig::for_profile(Profile::TINY);
+    let mut mesh = MachineMesh::new(4, BlockConfig::for_profile(Profile::TINY));
+    let p = 0;
+    let fast = LinkProfile::new(Duration::from_millis(5), 1_000_000);
+    for (a, b) in [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)] {
+        mesh.connect(a, b, fast, fast, peer_cfg, None, None);
+    }
+    let block_id = block::Hash([0x9B; 32]);
+    let encoded = encode_body(&Profile::TINY, &[0x3B; 256], 2).unwrap();
+    let total = encoded.coding.total_parts().unwrap();
+    let envelope = make_envelope(
+        block_id,
+        encoded.coding,
+        encoded.part_root,
+        mesh.nodes[p].id,
+    );
+    mesh.propose(p, envelope, encoded.parts);
+    let start = mesh.now;
+    mesh.run_until(start + Duration::from_secs(3));
+
+    mesh.assert_honest_links_open();
+    let mut heard_from_others = 0;
+    for neighbour in 1..4 {
+        assert!(mesh.verified(neighbour, &block_id));
+        assert!(
+            mesh.sent_parts(neighbour, p, &block_id).is_empty(),
+            "neighbour {neighbour} never sends the proposer a part"
+        );
+        let from_proposer = mesh.sent_parts(p, neighbour, &block_id);
+        let announced = mesh.announced(neighbour, p, &block_id);
+        assert!(
+            announced.iter().all(|index| !from_proposer.contains(index)),
+            "neighbour {neighbour} announced a part the proposer sent it"
+        );
+        // A neighbour that decoded holds every part, so it announces every
+        // index the proposer did not send it.
+        let held: Vec<u32> = (0..total)
+            .filter(|index| !from_proposer.contains(index))
+            .collect();
+        assert_eq!(
+            announced, held,
+            "neighbour {neighbour} announced every part the proposer lacks a record of sending"
+        );
+        heard_from_others += announced.len();
+    }
+    assert!(
+        heard_from_others > 0,
+        "some neighbour took a part from another peer"
+    );
+}
+
+/// decision-32: the proposer's session takes a neighbour's plain `Have`s
+/// without asking for parts or faulting the neighbour, before and after
+/// it retires the block.
+#[test]
+fn decision32_the_proposer_hears_haves_without_closing() {
+    let block_id = block::Hash([0x6C; 32]);
+    let now = Instant::now();
+    let mut proposer = session(node_id(2), now, proposing(block_id, tiny()));
+    proposer.step(now, recv_meta(block_id));
+
+    let step = proposer.step(now, have_with(block_id, HaveFlags::Plain, vec![0, 2]));
+    assert!(step.events.contains(&PeerEvent::ProposerHeardHave {
+        block_id,
+        indices: vec![0, 2],
+    }));
+    assert!(!step.outputs.iter().any(|o| matches!(
+        o,
+        PeerOutput::PeerHas { .. } | PeerOutput::CloseProtocol(_) | PeerOutput::CloseNeutralStall
+    )));
+    proposer.assert_invariants();
+
+    proposer.step(
+        now,
+        PeerInput::Retire(Retire {
+            block_id,
+            stripes: tiny().stripes,
+            n: tiny().n,
+        }),
+    );
+    proposer.step(now, have_with(block_id, HaveFlags::Plain, vec![1, 3]));
+    assert!(proposer.close_cause().is_none());
+    proposer.assert_invariants();
+}
+
 /// An index this session already announced with a plain `Have`, sent or
 /// pending, never gets a second, flagged `Have` (bpv1-25, bpv1-72).
 #[test]

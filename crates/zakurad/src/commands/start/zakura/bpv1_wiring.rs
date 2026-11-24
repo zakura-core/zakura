@@ -4,7 +4,7 @@
 //! (strictly absent in `Legacy`, zero changes under `peer/`, `peer_set/`,
 //! `inbound/`, or `ChainSync` per `dual-1`).
 
-use std::{num::NonZeroU64, sync::Arc};
+use std::{num::NonZeroU64, sync::Arc, time::Duration};
 
 use tokio_util::sync::CancellationToken;
 use tower::{Service, ServiceExt};
@@ -23,7 +23,16 @@ use zakura_network::zakura::{
     CustomService, ZakuraHeaderSyncDriverStartup,
 };
 
-use super::block_verify_error_class;
+use super::{block_verify_error_class, BlockApplyTerminal, SyncCoordinator};
+
+/// Bounds one BPv1 submission to the router.
+///
+/// A block whose parent is missing can wait in the verifier for its parent's block
+/// info, its UTXOs, or a place in the state's orphan queue. This bound matches the
+/// verifier's 2-minute wait for another delivery's pending commit. A timeout returns
+/// [`VerifierVerdict::LocalCapacity`], so the block falls back to block sync and frees
+/// its BPv1 slot (#2718).
+const SUBMIT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Production [`BlockVerifierPort`] wrapping `zakurad`'s shared `block_verifier_router`
 /// (`dual-2`, `dual-4`, `decision-8`).
@@ -31,13 +40,23 @@ use super::block_verify_error_class;
 /// Maps `BodyVerificationClass::PayloadMismatch` (bad tx Merkle root OR bad ZIP 244
 /// auth-data root) to [`VerifierVerdict::RootMismatch`] without ever marking the header
 /// invalid (`bpv1-43`).
+///
+/// BPv1 applies blocks under the same ownership rule as native block sync. It submits
+/// only while native sync owns block applies, and each submission is an apply the
+/// coordinator counts, so the legacy fallback drain waits for it. In `LegacyBootstrap`
+/// and during the legacy fallback the adapter submits nothing and returns
+/// [`VerifierVerdict::LocalCapacity`]: BPv1 releases the block, and legacy delivers it.
 pub(crate) struct RouterBlockVerifierAdapter<V> {
     router: V,
+    coordinator: Arc<SyncCoordinator>,
 }
 
 impl<V> RouterBlockVerifierAdapter<V> {
-    pub(crate) fn new(router: V) -> Self {
-        Self { router }
+    pub(crate) fn new(router: V, coordinator: Arc<SyncCoordinator>) -> Self {
+        Self {
+            router,
+            coordinator,
+        }
     }
 }
 
@@ -49,17 +68,36 @@ where
 {
     fn submit(&self, block: OwnedBlock, _work_id: WorkId) -> PortFuture<'_, VerifierVerdict> {
         let router = self.router.clone();
+        let apply = self
+            .coordinator
+            .queue_apply()
+            .and_then(|operation| operation.accept());
         Box::pin(async move {
-            match router
-                .oneshot(zakura_consensus::Request::Commit(BlockHandle::Owned(block)))
-                .await
-            {
-                Ok(_) => VerifierVerdict::Valid,
-                Err(error) => {
-                    let class = block_verify_error_class(&error);
-                    classify_body_verification_class(class)
+            let Some(apply) = apply else {
+                metrics::counter!("sync.bpv1.submit.not_native").increment(1);
+                return VerifierVerdict::LocalCapacity;
+            };
+            let commit =
+                router.oneshot(zakura_consensus::Request::Commit(BlockHandle::Owned(block)));
+            let verdict = match tokio::time::timeout(SUBMIT_TIMEOUT, commit).await {
+                Ok(Ok(_)) => VerifierVerdict::Valid,
+                Ok(Err(error)) => {
+                    classify_body_verification_class(block_verify_error_class(&error))
                 }
-            }
+                Err(_elapsed) => {
+                    metrics::counter!("sync.bpv1.submit.timeout").increment(1);
+                    VerifierVerdict::LocalCapacity
+                }
+            };
+            apply.complete(match verdict {
+                VerifierVerdict::Valid | VerifierVerdict::Duplicate => {
+                    BlockApplyTerminal::Committed
+                }
+                VerifierVerdict::RootMismatch
+                | VerifierVerdict::LocalCapacity
+                | VerifierVerdict::Invalid => BlockApplyTerminal::Rejected,
+            });
+            verdict
         })
     }
 }
@@ -113,4 +151,174 @@ pub(crate) fn build_bpv1_service(
         ports,
         shutdown,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        num::NonZeroU64,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
+
+    use tokio::sync::oneshot;
+    use tower::service_fn;
+    use zakura_chain::{block::Block, serialization::ZcashDeserializeInto};
+    use zakura_network::zakura::bpv1::{BlockVerifierPort, VerifierVerdict, WorkId};
+    use zakura_node_services::block_memory::{Admission, DecodedBlockPool, OwnedBlock};
+
+    use super::{RouterBlockVerifierAdapter, SyncCoordinator, SUBMIT_TIMEOUT};
+
+    fn owned_genesis() -> OwnedBlock {
+        let block: Block = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+            .zcash_deserialize_into()
+            .expect("the genesis vector deserializes");
+        DecodedBlockPool::for_block_count(NonZeroU64::new(4).expect("4 is non-zero"))
+            .try_admit(block, Admission::WithinLimit)
+            .expect("an empty pool admits one block")
+    }
+
+    /// A router that counts its calls and answers each with `answer`.
+    fn counting_router<F>(
+        answer: F,
+    ) -> (
+        impl tower::Service<
+                zakura_consensus::Request,
+                Response = zakura_chain::block::Hash,
+                Error = zakura_consensus::BoxError,
+                Future = impl Send,
+            > + Clone
+            + Send
+            + Sync
+            + 'static,
+        Arc<AtomicUsize>,
+    )
+    where
+        F: Fn(
+                zakura_chain::block::Hash,
+            ) -> futures::future::BoxFuture<
+                'static,
+                Result<zakura_chain::block::Hash, zakura_consensus::BoxError>,
+            > + Clone
+            + Send
+            + Sync
+            + 'static,
+    {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let router = service_fn({
+            let calls = calls.clone();
+            move |request: zakura_consensus::Request| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                answer(request.block().hash())
+            }
+        });
+        (router, calls)
+    }
+
+    /// BPv1 submits while native sync owns block applies.
+    #[tokio::test]
+    async fn submits_while_native_sync_owns_applies() {
+        let _init_guard = zakura_test::init();
+        let (router, calls) = counting_router(|hash| Box::pin(async move { Ok(hash) }));
+        let adapter = RouterBlockVerifierAdapter::new(router, SyncCoordinator::new());
+
+        let verdict = adapter.submit(owned_genesis(), WorkId(1)).await;
+
+        assert_eq!(verdict, VerifierVerdict::Valid);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// In the legacy bootstrap, legacy owns applies, so BPv1 submits nothing and
+    /// releases the block.
+    #[tokio::test]
+    async fn submits_nothing_while_legacy_owns_applies() {
+        let _init_guard = zakura_test::init();
+        let (router, calls) = counting_router(|hash| Box::pin(async move { Ok(hash) }));
+        let adapter =
+            RouterBlockVerifierAdapter::new(router, SyncCoordinator::new_legacy_bootstrap());
+
+        let verdict = adapter.submit(owned_genesis(), WorkId(1)).await;
+
+        assert_eq!(verdict, VerifierVerdict::LocalCapacity);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// A submission the router never answers ends at the timeout, so the block
+    /// falls back and frees its slot.
+    #[tokio::test(start_paused = true)]
+    async fn a_stuck_submission_times_out_into_fallback() {
+        let _init_guard = zakura_test::init();
+        let (router, _calls) =
+            counting_router(|_hash| Box::pin(std::future::pending::<Result<_, _>>()));
+        let adapter = RouterBlockVerifierAdapter::new(router, SyncCoordinator::new());
+
+        let started = tokio::time::Instant::now();
+        let verdict = adapter.submit(owned_genesis(), WorkId(1)).await;
+
+        assert_eq!(verdict, VerifierVerdict::LocalCapacity);
+        assert_eq!(started.elapsed(), SUBMIT_TIMEOUT);
+    }
+
+    /// The legacy fallback drain waits for a BPv1 submission, as it does for native
+    /// block sync's applies, so no BPv1 commit lands after legacy takes over.
+    #[tokio::test]
+    async fn the_legacy_fallback_drain_waits_for_a_bpv1_submission() {
+        let _init_guard = zakura_test::init();
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let release_rx = Arc::new(std::sync::Mutex::new(Some(release_rx)));
+        let (router, calls) = counting_router(move |hash| {
+            let release = release_rx
+                .lock()
+                .expect("the test holds the lock briefly")
+                .take()
+                .expect("the router answers one submission");
+            Box::pin(async move {
+                let _ = release.await;
+                Ok(hash)
+            })
+        });
+        let coordinator = SyncCoordinator::new();
+        let adapter = Arc::new(RouterBlockVerifierAdapter::new(router, coordinator.clone()));
+
+        let submission = tokio::spawn({
+            let adapter = adapter.clone();
+            async move { adapter.submit(owned_genesis(), WorkId(1)).await }
+        });
+        while calls.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        let fallback = tokio::spawn({
+            let coordinator = coordinator.clone();
+            async move {
+                coordinator
+                    .acquire_legacy_fallback(Duration::from_secs(60))
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !fallback.is_finished(),
+            "the drain waits for the BPv1 submission"
+        );
+
+        release_tx.send(()).expect("the router still waits");
+        assert_eq!(
+            submission.await.expect("the submission task finishes"),
+            VerifierVerdict::Valid
+        );
+        let lease = tokio::time::timeout(Duration::from_secs(10), fallback)
+            .await
+            .expect("the drain finishes once the submission completes")
+            .expect("the fallback task finishes");
+        assert!(lease.is_ok());
+        // A BPv1 submission while legacy owns applies submits nothing.
+        assert_eq!(
+            adapter.submit(owned_genesis(), WorkId(2)).await,
+            VerifierVerdict::LocalCapacity
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
 }

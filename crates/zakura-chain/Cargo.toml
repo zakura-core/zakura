@@ -72,8 +72,8 @@ bech32 = { workspace = true }
 zcash_script.workspace = true
 
 # ECC deps
-halo2 = { workspace = true }
 orchard.workspace = true
+pasta_curves = { workspace = true }
 zakura-mmr-tree.workspace = true
 zcash_note_encryption = { workspace = true }
 zcash_primitives.workspace = true
@@ -179,3 +179,9 @@ windows-sys = { version = "0.61", features = ["Win32_UI_Shell", "Win32_Globaliza
 # dependency supports these native build targets. Other targets keep the portable backend.
 [target.'cfg(all(target_arch = "aarch64", target_endian = "little", any(target_os = "linux", target_os = "macos")))'.dependencies]
 sha2 = { workspace = true, features = ["asm"] }
+
+# Pasta assembly on AArch64, previously activated through zakura-halo2-proofs'
+# own target dependency. The same arithmetic backs Sensei/Udon through Orchard's
+# target dependency; this entry covers the node's direct Pasta use.
+[target.'cfg(all(target_arch = "aarch64", target_family = "unix"))'.dependencies]
+pasta_curves = { workspace = true, features = ["aarch64-asm"] }

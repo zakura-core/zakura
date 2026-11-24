@@ -1197,7 +1197,7 @@ mod tests {
     fn pallas_tree(count: u8) -> Arc<orchard::tree::NoteCommitmentTree> {
         let mut tree = orchard::tree::NoteCommitmentTree::default();
         for value in 1..=count {
-            tree.append(halo2::pasta::pallas::Base::from(u64::from(value)))
+            tree.append(pasta_curves::pallas::Base::from(u64::from(value)))
                 .expect("test tree is not full");
         }
         Arc::new(tree)

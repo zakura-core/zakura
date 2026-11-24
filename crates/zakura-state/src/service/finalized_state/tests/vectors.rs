@@ -7,7 +7,7 @@
 use hex::FromHex;
 use rand_10::random;
 
-use halo2::pasta::{group::ff::PrimeField, pallas};
+use pasta_curves::{group::ff::PrimeField, pallas};
 
 use zakura_chain::{
     block::Height,

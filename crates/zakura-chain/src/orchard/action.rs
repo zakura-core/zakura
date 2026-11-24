@@ -1,7 +1,7 @@
 use crate::serialization::ZcashReader;
 use std::io;
 
-use halo2::pasta::pallas;
+use pasta_curves::pallas;
 use reddsa::orchard::SpendAuth;
 
 use crate::serialization::{

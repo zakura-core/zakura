@@ -2390,6 +2390,8 @@ impl ZakuraDiscoveryBook {
     /// - each entry sits under its record's author;
     /// - each relay's attribution counts exactly its third-party entries, and
     ///   stays within the per-relay quota;
+    /// - the eviction index holds exactly the entries, and the gateway index
+    ///   exactly the entries and static candidates;
     /// - the discovered entries stay within the record limit;
     /// - an entry's confirmed addresses are ones its record lists, and its
     ///   dialed addresses are confirmed;
@@ -2436,6 +2438,14 @@ impl ZakuraDiscoveryBook {
         assert!(
             self.eviction == eviction,
             "{PROPERTY}: the eviction index disagrees with the entries"
+        );
+        let mut gateways = GatewayIndex::default();
+        for node_id in self.entries.keys().chain(self.static_candidates.keys()) {
+            gateways.insert(*node_id);
+        }
+        assert!(
+            self.gateways == gateways,
+            "{PROPERTY}: the gateway index disagrees with the entries and static candidates"
         );
         let busiest = relayed.values().copied().max().unwrap_or(0);
         assert!(

@@ -689,7 +689,12 @@ async fn faulty_trusted_block_bans_relay_and_closes_connections_then_valid_retry
     .await
     .unwrap();
     let observer = Buffer::new(observer, 4);
-    observer.clone().oneshot(Request::Peers).await.unwrap();
+    // A ping checks the socket even when the node has no addresses to advertise.
+    observer
+        .clone()
+        .oneshot(Request::Ping(Default::default()))
+        .await
+        .expect("the observer socket answers a ping before the ban");
     let valid = relay.template().await;
     let invalid = faulty_body(&valid);
     relay.gate.hold();
@@ -700,11 +705,14 @@ async fn faulty_trusted_block_bans_relay_and_closes_connections_then_valid_retry
         true,
     ));
     assert_eq!(relay.gate.entered().await, invalid.hash());
+    let genesis_request =
+        Request::BlocksByHash([receiver.network.genesis_hash()].into_iter().collect());
     timeout(Duration::from_secs(20), async {
         while !receiver.bans.is_banned(relay.p2p.ip()) {
-            // Poll the production inbound service while its download completes.
-            let _ = observer.clone().oneshot(Request::Peers).await;
-            tokio::task::yield_now().await;
+            // The inbound service reports completed downloads when it is polled.
+            // Genesis is already in the fixture's state, so this request gets a reply.
+            let _ = observer.clone().oneshot(genesis_request.clone()).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
@@ -714,10 +722,15 @@ async fn faulty_trusted_block_bans_relay_and_closes_connections_then_valid_retry
     assert!(!submission.is_finished());
     timeout(Duration::from_secs(10), async {
         loop {
-            if observer.clone().oneshot(Request::Peers).await.is_err() {
+            if observer
+                .clone()
+                .oneshot(Request::Ping(Default::default()))
+                .await
+                .is_err()
+            {
                 break;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
@@ -853,7 +866,11 @@ async fn faulty_trusted_block_bans_relay_and_closes_connections_then_valid_retry
     assert_eq!(relay.tip.best_tip_height(), Some(Height(2)));
     assert!(relay.pending.get(child.hash()).is_none());
     assert!(!fresh_receiver.bans.is_banned(relay.p2p.ip()));
-    progress_peer.clone().oneshot(Request::Peers).await.unwrap();
+    progress_peer
+        .clone()
+        .oneshot(Request::Ping(Default::default()))
+        .await
+        .expect("the recovery observer socket still answers a ping");
 }
 
 /// The documented pool workflow forwards the original byte buffer only on acceptance.

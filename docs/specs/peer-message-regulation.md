@@ -19,7 +19,8 @@ delay serving output, hold a send window below `2 × cwnd`, or refuse a connecti
 bounds the budget's ledger at the cost of a peer's throughput. The budget's non-P2P base and
 allocator overhead are measured, not bounded, so the process's total resident memory is a target. A local memory limit MUST NOT count as a
 peer violation or cause a penalty. Reserved consumers (control, tip propagation and the consensus
-commit window) MUST NOT wait behind bulk demand.
+commit window) MUST NOT wait behind bulk demand. With BPv1 on, tip propagation's reserve MUST cover
+every byte BPv1 retains for its concurrent blocks.
 
 This specification does not require application-level byte-rate buckets, response-byte charges,
 refunds, or serving-rate refill timers. A future rate limit requires a measured resource cost that

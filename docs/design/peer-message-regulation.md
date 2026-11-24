@@ -63,6 +63,13 @@ node's own congestion window:
   bytes and raises the connection's receive window by them (API-9). Reads move those bytes onto the
   same lease (`CreditHold`, API-10). A request that ends short keeps its unspent credit leased until
   the peer can no longer spend it, or until the connection closes.
+- With BPv1 on, the `Propagation` reserve holds what BPv1 retains for its concurrent blocks: the
+  block table's parts and metadata, the proposer's encodings and each assembled block until its
+  verdict. Proof of work bounds each one, so BPv1 holds them as `Propagation` leases that never wait
+  behind bulk. Each BPv1 session funds its base `b_bpv1` from `Sessions`: unsolicited receive
+  credit, output gates, held frames and early records. BPv1's receive credit stays unsolicited,
+  because pushed and pulled parts share the data stream's `Part` row and BPv1 raises no credit per
+  `Want`.
 - While serving output waits on a connection's send window, the `Serving` consumer leases growth
   toward `min(2 × cwnd, serving_per_peer)`, and `PeerSubPool` shares it fairly across peers. After
   four idle ticks of 50 ms, the window shrinks back to its base. A connection ticks only while its

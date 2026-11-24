@@ -921,12 +921,25 @@ and the error names `[memory] budget`, which replaces it.
     and one legacy read add 1.2 GiB of fixed terms, and Mainnet needs about
     14.2 GiB. Below its minimum, the node refuses to start and lists every
     term.
+  - **BPv1.** With `[network.zakura.bpv1] enabled = true`, the `Propagation`
+    reserve covers what BPv1 retains for its concurrent blocks, in place of
+    the tip-block term. It holds the block table's part and metadata budgets,
+    one largest `HeaderMeta` and local encoding per concurrent block, the
+    proposer's prepared encodings plus as many encodes in flight, and one
+    assembled block per concurrent block until its verdict. On Mainnet that
+    is 122,793,984 B, not 32,000,000 B. BPv1 holds these bytes as
+    `Propagation` leases, so they never wait behind bulk consumers. Each
+    BPv1 session funds its base `b_bpv1` from `Sessions` when BPv1 admits the
+    peer: its unsolicited receive credit, its output gates, its held frames
+    and its early records. BPv1 adds 22.9 MiB to a full connection, so a
+    16 GiB Mainnet host funds 33 full connections, not 63, and the smallest
+    Mainnet host grows from about 12.8 GiB to about 13.4 GiB.
   - **Operator settings.** The node refuses to start when the plan exceeds
     `B` with every raised setting at its default. A lowered setting stays
     lowered in that check. A raised setting (`max_connections`, a reactor's
-    `peer_limits`, `[memory.cap]`, `[memory.weight]`, larger static windows
-    or more handshakes) whose worst case exceeds `B` starts the node with one
-    warning per setting. While the node runs, it warns about an overrun at
+    `peer_limits`, BPv1's `max_sessions`, `[memory.cap]`, `[memory.weight]`,
+    larger static windows or more handshakes) whose worst case exceeds `B`
+    starts the node with one warning per setting. While the node runs, it warns about an overrun at
     most once every 10 minutes, and short-lived leases stay within what
     remains of `B`.
   - **Throughput.** A budget below the workload's demand can delay a peer's
@@ -2110,9 +2123,10 @@ Changed:
   pending handshake holds 128 KiB of windows. Admission leases each
   connection's bases, requests lease their receive credit, and send windows
   grow toward `2 × cwnd`. The chain's worst checkpoint window sets the
-  smallest host that can run. A raised setting that can exceed the budget
-  warns at startup. A budget below demand can cost a peer throughput, and
-  never faults or penalizes it.
+  smallest host that can run. With BPv1 on, the `Propagation` reserve covers
+  what BPv1 retains, and each BPv1 session funds its own base. A raised
+  setting that can exceed the budget warns at startup. A budget below demand
+  can cost a peer throughput, and never faults or penalizes it.
 - **API-9, §16.** `ConnLoad` adds `cwnd`, `accepted_send_bytes`,
   `limits_applied` and `receive_credit_excess`. `set_limits` returns its
   sequence number. The connection task absorbs shrink debt before it grows

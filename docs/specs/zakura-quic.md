@@ -1,6 +1,6 @@
 # Spec: `zakura-quic` transport
 
-Status: draft for review, 2026-11-24. Version 0.29.
+Status: draft for review, 2026-11-24. Version 0.30.
 This document is authoritative for the `zakura-quic` crate, its configuration,
 its wire behavior and its `quinn-proto` dependency policy.
 [Decision 0003](../decisions/zakura/0003-zakura-quic-transport.md) records the
@@ -71,6 +71,10 @@ to ML-KEM-1024 (NIST security category 5) and the signature to ML-DSA-65
 (category 3), which changes every node ID again and the ALPN to
 `p2p-v2/5`; it changes DEP-2, ID-8, ID-11, ID-12, ID-13, TLS-4, TLS-9,
 ADM-1, OBS-1, API-1, §13, SEC-1, SEC-2 and §16, and §17aa lists each change.
+Version 0.30 has the dialer pad its first flight with a third Initial
+datagram, so the listener's category 5 flight fits QUIC's
+anti-amplification allowance and a dial completes in one round trip again;
+it adds DIAL-8, changes ADM-1, API-3 and §16, and §17ab lists each change.
 
 ## 0. Conventions
 
@@ -535,15 +539,17 @@ is today's Zakura logic.
 
   An `Incoming` is one Initial datagram that belongs to no connection the
   endpoint holds. A dialer that offers X25519MLKEM1024 (TLS-9) sends a hello
-  that spans two Initial datagrams. After `Accept` the second joins the
-  connection. After any other outcome the second is another `Incoming`:
-  `admit` runs again, and a retried or refused dialer gets a second answer,
-  which it discards. The endpoint remembers no answered attempt, so it
-  doesn't suppress the second answer, and the outcome counters (OBS-1) and
-  the acceptor's own count each decision, so such a dial counts twice. If
-  the outcome changes to `Accept` between the two, the second datagram alone
-  starts TLS: it keeps its admission charge (API-3) and holds a pending
-  handshake until `handshake_timeout_secs`, as any unfinished hello does.
+  that spans two Initial datagrams, then a padding datagram (DIAL-8). After
+  `Accept` the later two join the connection. After any other outcome each
+  is another `Incoming`: `admit` runs again, and a retried or refused dialer
+  gets another answer, which it discards. The endpoint remembers no answered
+  attempt, so it doesn't suppress the later answers, and the outcome
+  counters (OBS-1) and the acceptor's own count each decision, so such a
+  dial counts three times. If the outcome changes to `Accept` after the
+  first datagram, a later datagram alone starts the connection: it keeps its
+  admission charge (API-3) and holds a pending handshake until
+  `handshake_timeout_secs`, as any unfinished hello does.
+
   Until the client's address is validated, the listener MUST limit its UDP
   payload bytes sent to three times the bytes received from that address
   for the connection (RFC 9000 §8.1). The driver holds any complete datagram
@@ -817,6 +823,19 @@ is today's Zakura logic.
   and address set only.
 - **DIAL-6.** The dialer's admitted IP is the address of the winning attempt.
 - **DIAL-7.** A connection uses one path. `quinn-proto` has no multipath.
+- **DIAL-8.** When its hello spans two or more Initial datagrams, the dialer
+  MUST send one more Initial datagram right after it: a PING, which
+  `quinn-proto` pads to 1,200 bytes like every datagram that carries a
+  dialer's Initial packet. Until it validates the dialer's address, a
+  listener may send only three times what it received (RFC 9000 §8.1). The
+  hello's 2,400 bytes allow 7,200, short of the listener's first flight of
+  about 9.9 KB (TLS-4, TLS-9). With the padding the allowance is 10,800
+  bytes, so the listener sends its whole flight at once and the dial
+  completes in one round trip. A one-datagram hello isn't padded: a
+  listener refuses it at its first packet and keeps no state, so a padding
+  datagram would start an attempt of its own with no hello in it (ADM-1).
+  The PING is sent only once, before any reply arrives, so a retried
+  hello, which carries its Retry token and is validated, isn't padded.
 
 ## 9. Transport control
 
@@ -1336,9 +1355,9 @@ this release tolerates, and keep each hard change explicit.
 | ML-DSA-65 key generation, signing and verification give a subset of Project Wycheproof's and NIST ACVP's known answers, each under its own context: seeded keys and deterministic and hedged signatures match, and a 256-byte context, wrong-length keys and signatures, a flipped commitment hash, a bad hint encoding and an out-of-bound response are refused | TLS-4, ID-13 |
 | Signatures that RustCrypto `ml-dsa` 0.1.2 made under the TLS-4 context, recorded offline, are reproduced byte for byte and verify, and its public key for the same seed matches | TLS-4, ID-13 |
 | The published composite known answer: a fixed seed, message and randomness give the recorded Ed25519 key, ML-DSA-65 key, node ID and composite signature, which verifies. The known answer was made without this crate, with Python's `cryptography` and `hashlib` and RustCrypto `ml-dsa` | TLS-4, ID-9, ID-12, ID-13 |
-| In a simulated handshake the listener's first flight stays within three times the 2,400-byte hybrid hello, and the dialer can't complete on it; once the dialer's reply validates its address, the listener sends the rest and the dialer completes, one round trip later and no more | TLS-4, TLS-9, ADM-1 |
+| In a simulated handshake the dialer's first flight is 3,600 bytes; the listener's first flight is larger than three times the 2,400-byte hello but within three times 3,600, and the dialer completes on it alone, in one round trip | TLS-4, TLS-9, ADM-1, DIAL-8 |
 | The seeded X25519MLKEM1024 completes against the production group in both roles and replays its shares for the same seed and node | TLS-9, API-2 |
-| A dialer that offers X25519MLKEM1024 sends its hello as two 1,200-byte Initial datagrams. A refused dial is decided and answered once per datagram, and a retried one decided once per datagram. A hello refused at its first datagram and accepted at its second keeps its charge and holds a pending handshake until the deadline. A one-datagram hello, which only a dialer with classical groups alone sends, is refused at its first datagram and cancelled; a hello with no ALPN in common, which spans two, fails as a handshake | ADM-1, ADM-3, ADM-7, API-3 |
+| A dialer that offers X25519MLKEM1024 sends its hello as two 1,200-byte Initial datagrams and pads it with a third (DIAL-8). A refused dial is decided and answered once per datagram, and a retried one decided once per datagram. A hello refused at its first datagram and accepted at its second keeps its charge and holds a pending handshake until the deadline. A one-datagram hello, which only a dialer with classical groups alone sends, is refused at its first datagram and cancelled, and leaves no other attempt behind past the handshake deadline; a hello with no ALPN in common, which spans two, fails as a handshake | ADM-1, ADM-3, ADM-7, API-3 |
 | On the deterministic scheduler, with no tokio runtime, two `bind_with` endpoints with the same seeded inputs, plan and UTC origin send byte-identical datagrams through a Retry handshake and an echoed stream, in one process and in fresh processes. Leaving out any seeded input, or changing the seed or the UTC origin, changes the bytes, and host time doesn't | API-2, TLS-9, ADM-10, DEP-2 |
 | Cancelled reads lose no data; cancelled writes keep their order; concurrent streams keep their data apart; a transfer larger than the receive window completes | DRV-4–DRV-6 |
 | Dropping the last `Conn` closes the connection | DRV-7 |
@@ -2106,3 +2125,29 @@ Changed:
   ML-DSA-65. The independent X25519MLKEM1024 answers come from RustCrypto
   `ml-kem` and graviola's X25519, since no TLS library speaks the group. The
   first-flight test now pins the one added round trip.
+
+## 17ab. Changes in version 0.30
+
+With ML-KEM-1024 and ML-DSA-87 (§17aa), the listener's first flight, about
+9.9 KB, outgrew the 7.2 KB QUIC lets it send before it validates the
+dialer's address, so every dial took two round trips. The dialer now sends
+one more padded Initial datagram right after its hello, which raises the
+allowance to 10.8 KB. The whole flight fits again, so a dial completes in
+one round trip, measured from 2 to 250 ms RTT in the simulator. A
+completed dial sends only 48 bytes more, since the padding stands in for an
+acknowledgement the dialer would have padded anyway; a refused or unanswered
+dial sends 1,200 more. The listener's flight has about 880 bytes of headroom
+under the new allowance. The signature schemes and the listener don't
+change, so this isn't a wire break and the ALPN stays `p2p-v2/5`.
+
+Added:
+
+- **DIAL-8.** The padding datagram, and why a one-datagram hello gets none.
+
+Changed:
+
+- **ADM-1.** A hybrid dial's first flight is three datagrams, so a refused
+  or retried dial is decided and answered three times, and a later
+  datagram accepted alone holds a pending handshake until the deadline.
+- **§16.** The first-flight test requires one round trip, and the admission
+  tests count three datagrams.

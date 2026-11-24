@@ -29,7 +29,7 @@ use std::{collections::VecDeque, future, sync::Arc};
 use zakura_quic::{Conn as QuicConn, ConnLimits, ConnLoad};
 use zakura_rt::sync::{watch, Mutex, Notify};
 
-use super::{PoolLease, ServingLease, ServingPool};
+use super::{MemoryPool, PoolLease};
 use crate::zakura::{ZakuraConnId, ZakuraPeerId};
 
 /// How often the connection task calls [`CreditMachine::tick`] while the
@@ -520,7 +520,7 @@ impl Drop for DrainingReceive {
 #[must_use]
 struct Released {
     receive: Vec<DrainingReceive>,
-    send: Vec<ServingLease>,
+    send: Vec<PoolLease>,
 }
 
 /// A [`CreditMachine`] and the leases it decides on, held in the order of
@@ -529,8 +529,8 @@ struct Released {
 struct CreditShell {
     machine: CreditMachine,
     receive: VecDeque<DrainingReceive>,
-    send: VecDeque<ServingLease>,
-    active_send: Option<ServingLease>,
+    send: VecDeque<PoolLease>,
+    active_send: Option<PoolLease>,
 }
 
 impl CreditShell {
@@ -584,7 +584,7 @@ impl CreditShell {
 
     /// Merges a granted growth lease into the active send-window lease, or
     /// releases it if the connection closed.
-    fn send_grown(&mut self, connection: &QuicConn, grown: ServingLease, released: &mut Released) {
+    fn send_grown(&mut self, connection: &QuicConn, grown: PoolLease, released: &mut Released) {
         let Some(limits) = self.machine.send_grown(grown.bytes()) else {
             released.send.push(grown);
             return;
@@ -604,7 +604,7 @@ impl CreditShell {
         debug_assert_eq!(self.machine.send_drains.len(), self.send.len());
         debug_assert_eq!(
             self.machine.active_send,
-            self.active_send.as_ref().map_or(0, ServingLease::bytes)
+            self.active_send.as_ref().map_or(0, PoolLease::bytes)
         );
     }
 }
@@ -718,18 +718,13 @@ impl ConnectionCredit {
     }
 
     /// Run one [`CREDIT_TICK`]: release drained leases, set the peer's serving
-    /// cap and size the send window, leasing growth from `serving_pool`.
-    pub(crate) fn tick_send_window(
-        &self,
-        serving_pool: &ServingPool,
-        peer: &ZakuraPeerId,
-        peer_floor: u64,
-    ) {
+    /// cap and size the send window, leasing growth from serving in `pool`.
+    pub(crate) fn tick_send_window(&self, pool: &MemoryPool, peer: &ZakuraPeerId, peer_floor: u64) {
         let Some(load) = self.load() else {
             self.close();
             return;
         };
-        let per_peer_cap = serving_pool.default_per_peer_cap();
+        let per_peer_cap = pool.serving_per_peer_cap();
         let (step, released) = self.locked(|shell, connection, released| {
             let step = shell.machine.tick(load, per_peer_cap, peer_floor);
             shell.release(step.release, released);
@@ -740,14 +735,14 @@ impl ConnectionCredit {
             step
         });
         if let Some(cap) = step.peer_cap {
-            serving_pool.set_peer_cap(peer, cap);
+            pool.set_serving_peer_cap(peer, cap);
         }
         drop(released);
 
         let SendStep::Grow(need) = step.send else {
             return;
         };
-        let grown = serving_pool.try_acquire(peer, Some(self.inner.conn_id), peer_floor, need);
+        let grown = pool.try_acquire_serving(peer, Some(self.inner.conn_id), peer_floor, need);
         self.step(|shell, connection, released| match grown {
             Ok(lease) => shell.send_grown(connection, lease, released),
             Err(_) => shell.machine.send_refused(),

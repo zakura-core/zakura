@@ -1088,16 +1088,19 @@ impl PlanTerms {
 
     /// The pool these terms size under `budget_b`, sharing `S` by `weights`.
     fn pool_config(&self, budget_b: u64, weights: MemoryWeights) -> PoolConfig {
-        Consumer::ALL.into_iter().fold(
-            PoolConfig::new(budget_b, self.fixed.total()),
-            |pool, consumer| {
-                let ConsumerSpec { floor, cap, .. } = self.consumers[consumer.index()];
-                pool.with_consumer(
-                    consumer,
-                    ConsumerSpec::bulk(floor, cap, weights.of(consumer)),
-                )
-            },
-        )
+        Consumer::ALL
+            .into_iter()
+            .fold(
+                PoolConfig::new(budget_b, self.fixed.total()),
+                |pool, consumer| {
+                    let ConsumerSpec { floor, cap, .. } = self.consumers[consumer.index()];
+                    pool.with_consumer(
+                        consumer,
+                        ConsumerSpec::bulk(floor, cap, weights.of(consumer)),
+                    )
+                },
+            )
+            .with_serving_per_peer_cap(self.serving_per_peer_cap)
     }
 
     fn budget_too_small(

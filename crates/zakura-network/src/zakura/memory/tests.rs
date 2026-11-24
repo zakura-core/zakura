@@ -1320,3 +1320,168 @@ fn lease_heights_follow_splits_moves_and_regrants() {
         })
     );
 }
+
+// Serving's two levels: the node machine and the per-peer sub-pool (#1888).
+
+fn serving_peer(byte: u8) -> ZakuraPeerId {
+    ZakuraPeerId::new(vec![byte; 32]).expect("32 bytes is a valid peer id")
+}
+
+/// A 20 MiB pool whose serving has a 2 MiB floor and caps each peer at
+/// `per_peer_cap`, after `config` adds other consumers.
+fn serving_pool(per_peer_cap: u64, config: impl FnOnce(PoolConfig) -> PoolConfig) -> MemoryPool {
+    MemoryPool::new(
+        config(PoolConfig::new(20 * MIB, 0))
+            .with_consumer(Consumer::Serving, ConsumerSpec::bulk(2 * MIB, 40 * MIB, 1))
+            .with_serving_per_peer_cap(per_peer_cap),
+    )
+}
+
+fn serving_waiting(pool: &MemoryPool) -> bool {
+    pool.snapshot().consumers[Consumer::Serving.index()].waiting
+}
+
+/// Yield until `pool` reports a waiter of `consumer`.
+async fn wait_until_waiting(pool: &MemoryPool, consumer: Consumer) {
+    while !pool.snapshot().consumers[consumer.index()].waiting {
+        tokio::task::yield_now().await;
+    }
+}
+
+/// The lease `waiter` returns within 5 seconds.
+async fn await_lease(
+    waiter: tokio::task::JoinHandle<Result<super::PoolLease, LeaseDenied>>,
+    why: &str,
+) -> super::PoolLease {
+    tokio::time::timeout(Duration::from_secs(5), waiter)
+        .await
+        .unwrap_or_else(|_| panic!("{why}"))
+        .expect("the waiter task doesn't panic")
+        .expect("the waiter gets its lease")
+}
+
+#[test]
+fn serving_pool_caps_stalled_reader_and_shrinks_cleanly() {
+    // Serving floor = 2 MiB, S = 18 MiB -> Serving ceiling = 20 MiB.
+    let pool = serving_pool(16 * MIB, |config| config);
+    let (p1, p2) = (serving_peer(1), serving_peer(2));
+    let _reg1 = pool.register_serving_connection(&p1, 2 * MIB);
+    let _reg2 = pool.register_serving_connection(&p2, 2 * MIB);
+
+    // Peer 1 (stalled reader) borrows 14 MiB while peer 2 is idle; peer 2's
+    // unused floor is lent too.
+    let mut stalled = pool
+        .try_acquire_serving(&p1, Some(1), 2 * MIB, 14 * MIB)
+        .expect("peer 1 can borrow when peer 2 is idle");
+    assert_eq!(pool.serving_peer_leased(&p1), 14 * MIB);
+    assert_eq!(pool.consumer_leased(Consumer::Serving), 14 * MIB);
+
+    // Peer 2 wants 8 MiB (within its part) but only 6 MiB remain. A plain
+    // try marks nothing waiting.
+    assert_eq!(
+        pool.try_acquire_serving(&p2, Some(2), 2 * MIB, 8 * MIB)
+            .unwrap_err(),
+        LeaseDenied::PoolFull
+    );
+    assert!(!serving_waiting(&pool));
+
+    // Shrinking peer 1's lease frees bytes on both levels.
+    stalled.shrink_to(2 * MIB);
+    assert_eq!(pool.serving_peer_leased(&p1), 2 * MIB);
+    assert_eq!(pool.consumer_leased(Consumer::Serving), 2 * MIB);
+
+    let peer2 = pool
+        .try_acquire_serving(&p2, Some(2), 2 * MIB, 8 * MIB)
+        .expect("peer 2 fits after the shrink");
+    assert_eq!(pool.serving_total_leased(), 10 * MIB);
+
+    drop(stalled);
+    drop(peer2);
+    assert_eq!(pool.serving_total_leased(), 0);
+    assert_eq!(pool.consumer_leased(Consumer::Serving), 0);
+}
+
+#[tokio::test]
+async fn waiting_peer_below_its_part_holds_back_a_peer_above_its_part() {
+    let pool = serving_pool(16 * MIB, |config| config);
+    let (p1, p2) = (serving_peer(1), serving_peer(2));
+    let _reg1 = pool.register_serving_connection(&p1, 2 * MIB);
+    let _reg2 = pool.register_serving_connection(&p2, 2 * MIB);
+
+    let mut stalled = pool
+        .try_acquire_serving(&p1, Some(1), 2 * MIB, 14 * MIB)
+        .expect("peer 1 can borrow when peer 2 is idle");
+
+    let waiter = {
+        let pool = pool.clone();
+        let p2 = p2.clone();
+        tokio::spawn(async move { pool.acquire_serving(&p2, Some(2), 2 * MIB, 8 * MIB).await })
+    };
+    wait_until_waiting(&pool, Consumer::Serving).await;
+
+    // Peer 1 is above its part while peer 2 waits below its part (#1888).
+    assert_eq!(
+        pool.try_acquire_serving(&p1, Some(1), 2 * MIB, MIB)
+            .unwrap_err(),
+        LeaseDenied::BelowShareWaiting
+    );
+
+    stalled.shrink_to(2 * MIB);
+    let lease = await_lease(waiter, "the shrink wakes peer 2").await;
+    assert_eq!(lease.bytes(), 8 * MIB);
+    assert!(!serving_waiting(&pool));
+}
+
+#[tokio::test]
+async fn serving_below_share_waiter_holds_back_block_sync_above_its_share() {
+    // Equal weights: S = 16 MiB -> each gets 8 MiB share above 2 MiB floor (10 MiB protected).
+    let pool = serving_pool(16 * MIB, |config| {
+        config.with_consumer(
+            Consumer::BlockSync,
+            ConsumerSpec::bulk(2 * MIB, 20 * MIB, 1),
+        )
+    });
+    let (p1, p2) = (serving_peer(1), serving_peer(2));
+    let _reg1 = pool.register_serving_connection(&p1, 2 * MIB);
+    let _reg2 = pool.register_serving_connection(&p2, 2 * MIB);
+
+    // BlockSync borrows all of S (18 MiB = 2 MiB floor + 16 MiB S).
+    let bs = pool
+        .try_acquire(Consumer::BlockSync, Some(10), 18 * MIB)
+        .expect("block sync borrows S");
+    let s1 = pool
+        .try_acquire_serving(&p1, Some(1), 2 * MIB, 2 * MIB)
+        .expect("serving's floor fits");
+
+    let waiter = {
+        let pool = pool.clone();
+        let p2 = p2.clone();
+        tokio::spawn(async move { pool.acquire_serving(&p2, Some(2), 2 * MIB, 2 * MIB).await })
+    };
+    wait_until_waiting(&pool, Consumer::Serving).await;
+
+    // BlockSync, above its share, can't borrow more while Serving waits.
+    assert_eq!(
+        pool.try_acquire(Consumer::BlockSync, Some(10), MIB)
+            .unwrap_err(),
+        LeaseDenied::BelowShareWaiting
+    );
+
+    drop(bs);
+    let s2 = await_lease(waiter, "BlockSync's release wakes serving").await;
+    drop(s1);
+    drop(s2);
+    assert_eq!(pool.consumer_leased(Consumer::Serving), 0);
+    assert_eq!(pool.serving_total_leased(), 0);
+}
+
+#[tokio::test]
+async fn request_above_the_peer_cap_is_refused_at_once() {
+    let pool = serving_pool(4 * MIB, |config| config);
+    let p1 = serving_peer(1);
+    let _reg = pool.register_serving_connection(&p1, MIB);
+
+    let refused = pool.acquire_serving(&p1, Some(1), MIB, 5 * MIB).await;
+    assert_eq!(refused.unwrap_err(), LeaseDenied::CapExceeded);
+    assert_eq!(pool.serving_total_leased(), 0);
+}

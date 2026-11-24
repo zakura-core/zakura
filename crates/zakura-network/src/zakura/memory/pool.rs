@@ -5,6 +5,13 @@
 //! wait or refuse, and whose waiters a change wakes. [`MemoryPool`] holds both
 //! machines under one lock, applies their effects after unlocking (wakeups,
 //! metrics, the overrun warning), and owns the one async wait loop.
+//!
+//! `Consumer::Serving` has two levels: the node-wide machine and the per-peer
+//! sub-pool (`02 §4–5`, `#1888`). Serving output leases (`Serve`, `Push`) and
+//! per-connection send-window growth leases (`ConnectionCredit`) draw from
+//! both. Every serving peer has equal weight, a floor of one largest
+//! response, and a dynamic per-peer cap (`max(largest_response, 2 × cwnd)`
+//! plus send window), bounded by [`PoolConfig::serving_per_peer_cap`].
 
 use std::{fmt, future::Future, sync::Arc};
 
@@ -367,6 +374,12 @@ impl MemoryPoolMachine {
     #[inline]
     pub fn fixed_bytes(&self) -> u64 {
         self.config.fixed_bytes
+    }
+
+    /// The cap on one serving peer's part.
+    #[inline]
+    pub fn serving_per_peer_cap(&self) -> u64 {
+        self.config.serving_per_peer_cap
     }
 
     /// Total shared capacity `S = B - fixed - reserves - Σ bulk_floors`
@@ -932,12 +945,29 @@ impl<'a> Request<'a> {
         }
     }
 
+    /// A `Consumer::Serving` request of `bytes` for `peer`, whose floor is
+    /// one largest response of the requesting reactor.
+    fn serving(peer: &'a ZakuraPeerId, conn: Option<ZakuraConnId>, floor: u64, bytes: u64) -> Self {
+        Self {
+            consumer: Consumer::Serving,
+            conn,
+            serving: Some(ServingTarget {
+                peer,
+                floor: Some(floor),
+            }),
+            bytes,
+        }
+    }
+
     /// A request to grow `lease` by `bytes`.
     fn regrow(lease: &'a PoolLease, bytes: u64) -> Self {
         Self {
             consumer: lease.consumer,
             conn: lease.peer,
-            serving: lease.serving.as_ref().map(ServingTarget::existing),
+            serving: lease.serving.as_ref().map(|key| ServingTarget {
+                peer: key.peer(),
+                floor: None,
+            }),
             bytes,
         }
     }
@@ -945,13 +975,13 @@ impl<'a> Request<'a> {
 
 /// The serving peer a `Consumer::Serving` request charges.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct ServingTarget<'a> {
+struct ServingTarget<'a> {
     /// The peer the response goes to.
-    pub(crate) peer: &'a ZakuraPeerId,
-    /// The peer's floor: one largest response of the requesting reactor.
-    pub(crate) floor: u64,
-    /// The cap a newly seen peer starts with.
-    pub(crate) cap: u64,
+    peer: &'a ZakuraPeerId,
+    /// The peer's floor for a new lease: one largest response of the
+    /// requesting reactor. A new lease adds a missing peer with the plan's
+    /// per-peer cap. Growing an existing lease (`None`) never adds the peer.
+    floor: Option<u64>,
 }
 
 /// One async waiter's registration in [`PoolState`].
@@ -994,7 +1024,10 @@ impl PoolState {
                 .map_err(|refusal| (refusal, Level::Node)),
             Some(target) => {
                 debug_assert_eq!(request.consumer, Consumer::Serving);
-                self.serving.ensure(target.peer, target.floor, target.cap);
+                if let Some(floor) = target.floor {
+                    let cap = self.machine.serving_per_peer_cap();
+                    self.serving.ensure(target.peer, floor, cap);
+                }
                 try_serving_lease(
                     &mut self.machine,
                     &mut self.serving,
@@ -1368,23 +1401,49 @@ impl MemoryPool {
         report
     }
 
-    /// Register one serving connection of `peer` (see [`super::ServingPool`]).
-    pub(crate) fn register_serving_peer(&self, peer: &ZakuraPeerId, floor: u64, cap: u64) {
-        self.lock().serving.register(peer, floor, cap);
+    /// Register one live serving connection of `peer` with the floor `floor`.
+    /// A new peer's cap starts at the plan's per-peer cap. Dropping the
+    /// returned guard unregisters the connection. The peer leaves serving's
+    /// sub-pool once its leases drain.
+    ///
+    /// Serving's per-peer sub-pool keys peers by their authenticated id, so
+    /// a reconnecting peer's retiring and replacement sessions share one part.
+    pub(crate) fn register_serving_connection(
+        &self,
+        peer: &ZakuraPeerId,
+        floor: u64,
+    ) -> ServingPeerRegistration {
+        {
+            let mut state = self.lock();
+            let cap = state.machine.serving_per_peer_cap();
+            state.serving.register(peer, floor, cap);
+        }
+        ServingPeerRegistration {
+            pool: self.clone(),
+            peer: peer.clone(),
+        }
+    }
+
+    /// The plan's cap on one serving peer's part (`[memory.cap]
+    /// serving_per_peer`).
+    pub(crate) fn serving_per_peer_cap(&self) -> u64 {
+        self.lock().machine.serving_per_peer_cap()
     }
 
     /// Unregister one serving connection of `peer`. The other peers' parts
     /// grow, so serving's waiters wake.
-    pub(crate) fn unregister_serving_peer(&self, peer: &ZakuraPeerId) {
+    fn unregister_serving_peer(&self, peer: &ZakuraPeerId) {
         self.with_state(|state, effects| {
             state.serving.unregister(peer);
             effects.released_by = Some(Consumer::Serving);
         });
     }
 
-    /// Set `peer`'s serving cap. Raising it wakes serving's waiters.
+    /// Set `peer`'s dynamic serving cap, bounded by the plan's per-peer cap.
+    /// Raising it wakes serving's waiters.
     pub(crate) fn set_serving_peer_cap(&self, peer: &ZakuraPeerId, cap: u64) {
         self.with_state(|state, effects| {
+            let cap = cap.min(state.machine.serving_per_peer_cap());
             effects.released_by = state
                 .serving
                 .set_cap(peer, cap)
@@ -1404,34 +1463,30 @@ impl MemoryPool {
         self.lock().serving.total_leased()
     }
 
-    /// Try a serving lease for `target` without waiting.
+    /// Try to lease `bytes` of `Consumer::Serving` for `peer` from both
+    /// levels without waiting. `peer_floor` is one largest response of the
+    /// requesting reactor. A refusal marks nothing waiting.
     pub(crate) fn try_acquire_serving(
         &self,
-        target: ServingTarget<'_>,
+        peer: &ZakuraPeerId,
         conn: Option<ZakuraConnId>,
+        peer_floor: u64,
         bytes: u64,
     ) -> Result<PoolLease, LeaseDenied> {
-        self.try_request(&Request {
-            consumer: Consumer::Serving,
-            conn,
-            serving: Some(target),
-            bytes,
-        })
+        self.try_request(&Request::serving(peer, conn, peer_floor, bytes))
     }
 
-    /// Wait for a serving lease for `target` (see [`Self::acquire`]).
+    /// Wait until `bytes` of `Consumer::Serving` can be leased for `peer`
+    /// from both levels (see [`Self::acquire`]). Refuses at once when waiting
+    /// can never help, such as `bytes` above the peer's cap.
     pub(crate) async fn acquire_serving(
         &self,
-        target: ServingTarget<'_>,
+        peer: &ZakuraPeerId,
         conn: Option<ZakuraConnId>,
+        peer_floor: u64,
         bytes: u64,
     ) -> Result<PoolLease, LeaseDenied> {
-        let request = Request {
-            consumer: Consumer::Serving,
-            conn,
-            serving: Some(target),
-            bytes,
-        };
+        let request = Request::serving(peer, conn, peer_floor, bytes);
         self.wait_for_lease(&request, std::future::pending::<LeaseDenied>())
             .await
     }
@@ -1754,14 +1809,17 @@ impl MemoryPool {
     }
 }
 
-impl<'a> ServingTarget<'a> {
-    /// The target of growing a lease that `key`'s peer already holds.
-    fn existing(key: &'a PeerKey) -> Self {
-        Self {
-            peer: key.peer(),
-            floor: 0,
-            cap: 0,
-        }
+/// Keeps a connected peer registered in serving's sub-pool until disconnect
+/// (see [`MemoryPool::register_serving_connection`]).
+#[derive(Debug)]
+pub(crate) struct ServingPeerRegistration {
+    pool: MemoryPool,
+    peer: ZakuraPeerId,
+}
+
+impl Drop for ServingPeerRegistration {
+    fn drop(&mut self) {
+        self.pool.unregister_serving_peer(&self.peer);
     }
 }
 

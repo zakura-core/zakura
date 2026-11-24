@@ -24,7 +24,6 @@ pub mod draft;
 mod peer_pool;
 mod plan;
 mod pool;
-mod serving_pool;
 #[cfg(test)]
 mod tests;
 
@@ -48,8 +47,6 @@ pub use pool::{
 };
 #[cfg(any(test, zakura_sim))]
 pub use pool::{PoolEvent, PoolObserver};
-pub(crate) use serving_pool::ServingLease;
-pub use serving_pool::ServingPool;
 
 /// Minimum interval between runtime budget-overrun warnings (`02 §8`, mem-14).
 pub const OVERRUN_WARN_INTERVAL: Duration = Duration::from_secs(10 * 60);
@@ -192,6 +189,9 @@ pub struct PoolConfig {
     pub fixed_bytes: u64,
     /// Per-consumer specifications, indexed by [`Consumer::index`].
     pub consumers: [ConsumerSpec; Consumer::COUNT],
+    /// The cap on one serving peer's part (`[memory.cap] serving_per_peer`),
+    /// at least 1 byte. It bounds every per-peer cap the pool sets.
+    pub serving_per_peer_cap: u64,
 }
 
 impl PoolConfig {
@@ -205,7 +205,15 @@ impl PoolConfig {
                 cap: 0,
                 weight: 0,
             }; Consumer::COUNT],
+            serving_per_peer_cap: u64::MAX,
         }
+    }
+
+    /// Bound every serving peer's part at `cap` bytes, at least 1
+    /// (builder-style).
+    pub const fn with_serving_per_peer_cap(mut self, cap: u64) -> Self {
+        self.serving_per_peer_cap = if cap == 0 { 1 } else { cap };
+        self
     }
 
     /// Set the specification for `consumer` (builder-style).

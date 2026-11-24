@@ -136,7 +136,7 @@ impl Serving {
     pub(crate) fn new(
         source: Arc<dyn Source>,
         config: &ZakuraBlockSyncConfig,
-        serving_pool: crate::zakura::memory::ServingPool,
+        serving_pool: crate::zakura::memory::MemoryPool,
     ) -> Self {
         let limits = serving_limits(config);
         debug_assert!(

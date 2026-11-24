@@ -307,10 +307,9 @@ impl WireEndpoint {
     }
 
     /// [`WireEndpoint::spawn_configured`], optionally attaching a
-    /// [`MemoryPlan`](zakura_network::zakura::memory::MemoryPlan), its live
-    /// [`MemoryPool`](zakura_network::zakura::memory::MemoryPool) and the
-    /// [`ServingPool`](zakura_network::zakura::memory::ServingPool) the
-    /// node's block sync also serves from to the handler (`02 §8`,
+    /// [`MemoryPlan`](zakura_network::zakura::memory::MemoryPlan) and its live
+    /// [`MemoryPool`](zakura_network::zakura::memory::MemoryPool), which the
+    /// node's block sync also serves from, to the handler (`02 §8`,
     /// `mem-13`).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn spawn_with_memory<T, F, K>(
@@ -325,7 +324,6 @@ impl WireEndpoint {
         memory: Option<(
             zakura_network::zakura::memory::MemoryPlan,
             zakura_network::zakura::memory::MemoryPool,
-            zakura_network::zakura::memory::ServingPool,
         )>,
         services: impl FnOnce(&ZakuraSupervisorHandle, &ZakuraLocalLimits) -> (Vec<Arc<dyn Service>>, T)
             + Send
@@ -368,8 +366,8 @@ impl WireEndpoint {
             )
             .with_local_node_id(quic.local_id())
             .with_transport_observer(observer);
-            if let Some((plan, pool, serving)) = memory {
-                handler = handler.with_memory_pool(plan, pool, serving);
+            if let Some((plan, pool)) = memory {
+                handler = handler.with_memory_pool(plan, pool);
             }
             quic.serve(handler.clone()).expect("the node serves");
             let endpoint = ZakuraEndpoint::new(quic, handler);

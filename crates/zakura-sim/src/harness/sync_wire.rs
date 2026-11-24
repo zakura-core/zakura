@@ -506,7 +506,6 @@ impl Subsystem for SyncWire {
         let header = actors.header.clone();
         let memory_plan = actors.memory_plan.clone();
         let memory_pool = actors.memory_pool.clone();
-        let serving_pool = actors.serving_pool.clone();
         let names: Vec<String> = (0..scenario.sync.mirrors.len())
             .map(|index| format!("mirror-{index}"))
             .collect();
@@ -583,11 +582,7 @@ impl Subsystem for SyncWire {
                         observer.clone(),
                         Some(dials.clone()),
                         node_config.clone(),
-                        Some((
-                            memory_plan.clone(),
-                            memory_pool.clone(),
-                            serving_pool.clone(),
-                        )),
+                        Some((memory_plan.clone(), memory_pool.clone())),
                     ),
                     Some(peer) => (
                         mirror_observers

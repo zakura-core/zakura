@@ -186,29 +186,12 @@ impl Drop for Tally {
 pub(crate) enum ServePoolBacking {
     /// Bulk serving consumer (`Consumer::Serving`) with per-peer fairness (`PeerSubPool`, `#1888`).
     Serving {
-        pool: crate::zakura::memory::ServingPool,
+        pool: crate::zakura::memory::MemoryPool,
         /// Per-peer floor (one largest response for this reactor).
         peer_floor: u64,
     },
     /// Reserved control consumer (`Consumer::Control`, e.g. discovery serving).
     Control(crate::zakura::memory::MemoryPool),
-}
-
-/// Output byte lease held on [`ResponseGrants`](super::ResponseGrants) when
-/// [`ServeCapacity`] is backed by the node-wide memory pool.
-#[derive(Debug)]
-pub(super) enum ServeOutputLease {
-    Serving(crate::zakura::memory::ServingLease),
-    Control(crate::zakura::memory::PoolLease),
-}
-
-impl ServeOutputLease {
-    pub(super) fn shrink_to(&mut self, bytes: u64) {
-        match self {
-            Self::Serving(lease) => lease.shrink_to(bytes),
-            Self::Control(lease) => lease.shrink_to(bytes),
-        }
-    }
 }
 
 /// Serving capacity for one request row, shared by every session of the node.
@@ -334,16 +317,15 @@ impl ServeCapacity {
         backing: &ServePoolBacking,
         peer: &ZakuraPeerId,
         bytes: u64,
-    ) -> ServeOutputLease {
+    ) -> crate::zakura::memory::PoolLease {
         let leased = match backing {
-            ServePoolBacking::Serving { pool, peer_floor } => pool
-                .acquire(peer, None, *peer_floor, bytes)
-                .await
-                .map(ServeOutputLease::Serving),
-            ServePoolBacking::Control(pool) => pool
-                .acquire(crate::zakura::memory::Consumer::Control, None, bytes)
-                .await
-                .map(ServeOutputLease::Control),
+            ServePoolBacking::Serving { pool, peer_floor } => {
+                pool.acquire_serving(peer, None, *peer_floor, bytes).await
+            }
+            ServePoolBacking::Control(pool) => {
+                pool.acquire(crate::zakura::memory::Consumer::Control, None, bytes)
+                    .await
+            }
         };
         match leased {
             Ok(lease) => lease,

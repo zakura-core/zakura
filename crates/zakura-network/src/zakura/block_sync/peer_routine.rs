@@ -1705,7 +1705,7 @@ mod tests {
         let serving = Serving::new(
             Arc::new(EmptyBlockRangeSource),
             config,
-            crate::zakura::BlockSyncMemory::for_tests().serving,
+            crate::zakura::BlockSyncMemory::for_tests().pool,
         )
         .session(
             session.peer_id(),

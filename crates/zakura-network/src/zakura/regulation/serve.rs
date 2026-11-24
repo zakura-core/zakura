@@ -118,12 +118,12 @@ pub use push::ServeInUse;
 pub(crate) use push::{Push, PushPermit, PushSend};
 pub(crate) use sink::{Responded, ResponseCap, ResponseSink, SinkError, SinkProgress};
 
-use capacity::{PeerBudgets, ServeMetrics, ServeOutputLease};
+use capacity::{PeerBudgets, ServeMetrics};
 pub(super) use sink::ending_reserve;
 use sink::{ResponseFrame, SinkCore};
 
 use super::{OutputGrant, SlotPermit};
-use crate::zakura::{wire_codec::WireMessage, FramedSend, ZakuraPeerId};
+use crate::zakura::{memory::PoolLease, wire_codec::WireMessage, FramedSend, ZakuraPeerId};
 
 /// A reactor's serving logic for one request row.
 pub(crate) trait Produce: Send + Sync + 'static {
@@ -308,13 +308,42 @@ impl Drop for Commitment {
 }
 
 /// Mutable output byte grants held together under one lock so `ResponseGrants`
-/// stays compact and preserves drop order (`pool_lease`, then `node`, then `peer`).
+/// stays compact and preserves drop order (`node`, then `peer`).
 #[derive(Debug)]
 pub(super) struct OutputGrants {
-    pool_lease: Option<Box<ServeOutputLease>>,
-    /// The node-wide static grant, taken only without a memory pool.
-    node: Option<OutputGrant>,
+    node: NodeOutputGrant,
     peer: OutputGrant,
+}
+
+/// A response's node-wide output bytes.
+#[derive(Debug)]
+enum NodeOutputGrant {
+    /// The memory pool's lease, which replaces the node-wide output and
+    /// response gates.
+    Pool(PoolLease),
+    /// The node-wide static grant, taken only without a memory pool.
+    Static(OutputGrant),
+}
+
+impl NodeOutputGrant {
+    fn shrink_to(&mut self, bytes: u64) {
+        match self {
+            Self::Pool(lease) => lease.shrink_to(bytes),
+            Self::Static(grant) => grant.shrink_to(bytes),
+        }
+    }
+}
+
+/// How [`ResponseGrants::acquire`] waits at each gate.
+trait GateWait {
+    /// Await `acquire` at the gate `bound`, counting a delay if it is not
+    /// ready at once. `None` ends the acquisition, which releases every grant
+    /// taken before it.
+    async fn wait<T>(&self, bound: &'static str, acquire: impl Future<Output = T>) -> Option<T>;
+
+    /// Told right after a gate granted a budget that [`Push::in_use`] reads.
+    #[cfg(any(test, zakura_sim))]
+    fn took_budget(&self) {}
 }
 
 /// The peer and node output bytes of one response.
@@ -334,24 +363,89 @@ pub(super) struct ResponseGrants {
 
 impl ResponseGrants {
     fn new(
-        pool_lease: Option<ServeOutputLease>,
-        node: Option<OutputGrant>,
+        node: NodeOutputGrant,
         node_response: Option<SlotPermit>,
         peer: OutputGrant,
         peer_response: SlotPermit,
         peer_budgets: PeerBudgets,
     ) -> Self {
         Self {
-            output: Mutex::new(OutputGrants {
-                pool_lease: pool_lease.map(Box::new),
-                node,
-                peer,
-            }),
+            output: Mutex::new(OutputGrants { node, peer }),
             _node_response: node_response,
             _peer_response: peer_response,
             _peer_budgets: peer_budgets,
             _unwritten: None,
         }
+    }
+
+    /// Take the response slots and output bytes of a response of `bytes` to
+    /// `peer_id`, in the order every served and pushed response takes them:
+    /// the peer's response slot, the node's, the peer's output bytes, then
+    /// the node's. A gate whose wait ends without a grant releases every
+    /// grant taken and returns `None`.
+    ///
+    /// With a memory pool, the pool's lease replaces the node-wide response
+    /// and output gates, so a stalled reader holds only its own peer's gates
+    /// and its pool part while it waits (`#1888`). The per-peer gates stay.
+    async fn acquire(
+        capacity: &ServeCapacity,
+        peer: &PeerBudgets,
+        peer_id: &ZakuraPeerId,
+        bytes: u64,
+        gates: &impl GateWait,
+    ) -> Option<Self> {
+        let backing = capacity.pool_backing.as_deref();
+        let peer_response = gates
+            .wait("peer_output_responses", peer.output_responses.reserve())
+            .await?;
+        #[cfg(any(test, zakura_sim))]
+        gates.took_budget();
+        let node_response = match backing {
+            Some(_) => None,
+            None => {
+                let node_response = gates
+                    .wait(
+                        "node_output_responses",
+                        capacity.node_output_responses.reserve(),
+                    )
+                    .await?;
+                #[cfg(any(test, zakura_sim))]
+                gates.took_budget();
+                Some(node_response)
+            }
+        };
+        let peer_output = gates
+            .wait("peer_output", peer.output.grant(peer.output.clamp(bytes)))
+            .await?;
+        #[cfg(any(test, zakura_sim))]
+        gates.took_budget();
+        let node = match backing {
+            // The pool's lease changes no budget that `Push::in_use` reads.
+            Some(backing) => NodeOutputGrant::Pool(
+                gates
+                    .wait(
+                        "memory_pool_output",
+                        ServeCapacity::acquire_pool_lease(backing, peer_id, bytes),
+                    )
+                    .await?,
+            ),
+            None => {
+                let node_output = &capacity.node_output;
+                let grant = gates
+                    .wait("node_output", node_output.grant(node_output.clamp(bytes)))
+                    .await?;
+                #[cfg(any(test, zakura_sim))]
+                gates.took_budget();
+                NodeOutputGrant::Static(grant)
+            }
+        };
+        Some(Self::new(
+            node,
+            node_response,
+            peer_output,
+            peer_response,
+            peer.clone(),
+        ))
     }
 
     /// Shrink all output grants (and any backing memory-pool lease) to `bytes`,
@@ -374,13 +468,8 @@ impl ResponseGrants {
 
 impl OutputGrants {
     fn shrink_to(&mut self, bytes: u64) {
-        // Release pool surplus first, then node, then peer, matching drop order.
-        if let Some(lease) = self.pool_lease.as_mut() {
-            lease.shrink_to(bytes);
-        }
-        if let Some(node) = self.node.as_mut() {
-            node.shrink_to(bytes);
-        }
+        // Release node surplus first, then peer, matching drop order.
+        self.node.shrink_to(bytes);
         self.peer.shrink_to(bytes);
     }
 }
@@ -754,63 +843,18 @@ impl<P: Produce> Dispatch<P> {
         }
     }
 
-    /// Take response slots, output bytes, then execution slots. Returns `None`
-    /// if cancellation wins, releasing every acquired grant.
-    ///
-    /// With a memory pool, the pool's lease replaces the node-wide response
-    /// and output gates, so a stalled reader holds only its own peer's gates
-    /// and its pool part while it waits (`#1888`). The per-peer gates stay.
+    /// Take response slots, output bytes, then execution slots (see
+    /// [`ResponseGrants::acquire`]). Returns `None` if cancellation wins,
+    /// releasing every acquired grant.
     async fn acquire(&self, cap: ResponseCap) -> Option<(ResponseGrants, ExecutionSlots)> {
-        let backing = self.capacity.pool_backing.as_deref();
-        let peer_response = self
-            .wait(
-                "peer_output_responses",
-                self.peer.output_responses.reserve(),
-            )
-            .await?;
-        let node_response = match backing {
-            Some(_) => None,
-            None => Some(
-                self.wait(
-                    "node_output_responses",
-                    self.capacity.node_output_responses.reserve(),
-                )
-                .await?,
-            ),
-        };
-        let bytes = cap.output_bytes();
-        let peer_output = &self.peer.output;
-        let node_output = &self.capacity.node_output;
-        let peer = self
-            .wait("peer_output", peer_output.grant(peer_output.clamp(bytes)))
-            .await?;
-        let (node, pool_lease) = match backing {
-            Some(backing) => (
-                None,
-                Some(
-                    self.wait(
-                        "memory_pool_output",
-                        ServeCapacity::acquire_pool_lease(backing, &self.tasks.peer, bytes),
-                    )
-                    .await?,
-                ),
-            ),
-            None => (
-                Some(
-                    self.wait("node_output", node_output.grant(node_output.clamp(bytes)))
-                        .await?,
-                ),
-                None,
-            ),
-        };
-        let grants = ResponseGrants::new(
-            pool_lease,
-            node,
-            node_response,
-            peer,
-            peer_response,
-            self.peer.clone(),
-        );
+        let grants = ResponseGrants::acquire(
+            &self.capacity,
+            &self.peer,
+            &self.tasks.peer,
+            cap.output_bytes(),
+            self,
+        )
+        .await?;
         let peer = self
             .wait("peer_execution", self.peer.execution.reserve())
             .await?;
@@ -819,7 +863,10 @@ impl<P: Produce> Dispatch<P> {
             .await?;
         Some((grants, ExecutionSlots::new(peer, node, self.peer.clone())))
     }
+}
 
+/// Dispatch's waits end when the session is cancelled.
+impl<P: Produce> GateWait for Dispatch<P> {
     async fn wait<T>(&self, bound: &'static str, acquire: impl Future<Output = T>) -> Option<T> {
         zakura_rt::pin!(acquire);
         if let Some(ready) = futures::FutureExt::now_or_never(&mut acquire) {

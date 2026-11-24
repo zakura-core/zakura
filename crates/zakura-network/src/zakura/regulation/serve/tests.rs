@@ -986,8 +986,7 @@ fn sink_and_core(
         cap,
         frames,
         Arc::new(ResponseGrants::new(
-            None,
-            Some(grant()),
+            super::NodeOutputGrant::Static(grant()),
             Some(SlotBudget::new(1).unwrap().try_reserve().unwrap()),
             grant(),
             SlotBudget::new(1).unwrap().try_reserve().unwrap(),
@@ -1775,7 +1774,7 @@ async fn queuing_an_ending_shrinks_both_output_grants_to_encoded_bytes() {
 
 #[tokio::test]
 async fn serve_output_leases_from_serving_pool_before_execution_and_shrinks_at_ending() {
-    use crate::zakura::memory::{Consumer, ConsumerSpec, MemoryPool, PoolConfig, ServingPool};
+    use crate::zakura::memory::{Consumer, ConsumerSpec, MemoryPool, PoolConfig};
 
     let request = Job {
         parts: 8,
@@ -1786,12 +1785,13 @@ async fn serve_output_leases_from_serving_pool_before_execution_and_shrinks_at_e
     let cap_bytes = Scripted.response_cap(&request).output_bytes();
     // Pool holds just enough for one response cap at a time (floor == cap_bytes, S == 0),
     // proving a second request waits on the serving pool BEFORE taking an execution slot.
-    let pool_cfg = PoolConfig::new(cap_bytes, 0).with_consumer(
-        Consumer::Serving,
-        ConsumerSpec::bulk(cap_bytes, cap_bytes, 1),
-    );
+    let pool_cfg = PoolConfig::new(cap_bytes, 0)
+        .with_consumer(
+            Consumer::Serving,
+            ConsumerSpec::bulk(cap_bytes, cap_bytes, 1),
+        )
+        .with_serving_per_peer_cap(cap_bytes * 2);
     let mem_pool = MemoryPool::new(pool_cfg);
-    let serving_pool = ServingPool::new(mem_pool.clone(), cap_bytes * 2);
 
     let capacity = capacity(ServeLimits {
         node_output_responses: 4,
@@ -1802,7 +1802,7 @@ async fn serve_output_leases_from_serving_pool_before_execution_and_shrinks_at_e
         node_output_bytes: cap_bytes * 4,
     })
     .with_pool_backing(ServePoolBacking::Serving {
-        pool: serving_pool.clone(),
+        pool: mem_pool.clone(),
         peer_floor: cap_bytes,
     });
 
@@ -1849,14 +1849,14 @@ async fn serve_output_leases_from_serving_pool_before_execution_and_shrinks_at_e
         mem_pool.consumer_leased(Consumer::Serving) < cap_bytes / 2,
         "peer 1's serving-pool lease shrank at ending"
     );
-    assert_eq!(serving_pool.peer_leased(&peer2), 0);
+    assert_eq!(mem_pool.serving_peer_leased(&peer2), 0);
 
     // Draining peer 1's frames returns all pool leases to 0.
     assert_eq!(next(&mut s1.output).await, Probe::Part(vec![7; 64]));
     assert_eq!(next(&mut s1.output).await, Probe::Failed(1));
     settle().await;
     assert_eq!(mem_pool.consumer_leased(Consumer::Serving), 0);
-    assert_eq!(serving_pool.peer_leased(&peer1), 0);
+    assert_eq!(mem_pool.serving_peer_leased(&peer1), 0);
 
     s1.cancel.cancel();
     s2.cancel.cancel();

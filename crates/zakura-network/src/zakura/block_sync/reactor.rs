@@ -273,7 +273,7 @@ pub fn spawn_block_sync_reactor(
         serving: Arc::new(super::regulated::session::Serving::new(
             startup.range_source.clone(),
             &startup.config,
-            startup.memory.serving.clone(),
+            startup.memory.pool.clone(),
         )),
         config: startup.config.clone(),
         work: state.work_queue.clone(),

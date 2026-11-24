@@ -65,7 +65,7 @@ pub struct HeaderSyncStartup {
     pub(crate) fatal_events: Option<mpsc::UnboundedSender<HeaderSyncFatalEvent>>,
     /// Optional shared per-peer serving pool (`02 §4–5`, `#1888`) funding
     /// published header-sync pages from `Consumer::Serving`.
-    pub(crate) serving_pool: Option<crate::zakura::memory::ServingPool>,
+    pub(crate) serving_pool: Option<crate::zakura::memory::MemoryPool>,
     /// Receives the reactor's events in test and simulator builds.
     #[cfg(any(test, zakura_sim))]
     pub observer: super::observe::ObserverSlot,

@@ -113,7 +113,7 @@ fn concurrent_sessions_share_bounded_capacity_without_refill_waits() {
             let serving = Serving::new(
                 Arc::new(source),
                 &ZakuraBlockSyncConfig::default(),
-                crate::zakura::BlockSyncMemory::for_tests().serving,
+                crate::zakura::BlockSyncMemory::for_tests().pool,
             );
             assert!(PEERS * usize::try_from(WINDOW).unwrap() > limits.node_execution);
             assert!(usize::try_from(WINDOW).unwrap() > limits.peer_execution);
@@ -391,7 +391,7 @@ async fn maximum_sessions_continuous_serving_probe() {
     let mut serving = Serving::new(
         Arc::new(source),
         &config,
-        crate::zakura::BlockSyncMemory::for_tests().serving,
+        crate::zakura::BlockSyncMemory::for_tests().pool,
     );
     // Production serves one block per response. The probe can still measure
     // larger responses by lifting the session limit directly.

@@ -6,9 +6,11 @@
 //! every node-wide and per-peer bound. With a memory pool, the pool's lease
 //! replaces the node-wide response and output gates.
 
-use std::sync::Arc;
+use std::{future::Future, sync::Arc};
 
-use super::{capacity::PeerBudgets, lease::ExecutionSlots, ResponseGrants, ServeCapacity};
+use super::{
+    capacity::PeerBudgets, lease::ExecutionSlots, GateWait, ResponseGrants, ServeCapacity,
+};
 use crate::zakura::{Frame, FrameGuard, FramedSend, ZakuraPeerId, FRAME_HEADER_BYTES};
 
 /// One peer's budgets for pushed frames.
@@ -76,66 +78,15 @@ impl Push {
     }
 
     /// Wait for output for a frame of `payload_len` bytes and for execution
-    /// slots. Cancelling the wait takes nothing.
+    /// slots (see [`ResponseGrants::acquire`]). Cancelling the wait takes
+    /// nothing.
     pub(crate) async fn acquire(&self, payload_len: usize) -> PushPermit {
         // Widening usize to u64 is lossless on supported targets.
         let bytes = (payload_len + FRAME_HEADER_BYTES) as u64;
-        let delayed = |bound| self.capacity.metrics.delayed(bound);
-        let backing = self.capacity.pool_backing.as_deref();
-        let peer_response = wait(self.peer.output_responses.reserve(), || {
-            delayed("peer_output_responses")
-        })
-        .await;
-        #[cfg(any(test, zakura_sim))]
-        self.report_acquired();
-        // With a memory pool, its lease replaces the node-wide gates.
-        let node_response = match backing {
-            Some(_) => None,
-            None => {
-                let node_response = wait(self.capacity.node_output_responses.reserve(), || {
-                    delayed("node_output_responses")
-                })
-                .await;
-                #[cfg(any(test, zakura_sim))]
-                self.report_acquired();
-                Some(node_response)
-            }
-        };
-        let peer_output = &self.peer.output;
-        let node_output = &self.capacity.node_output;
-        let peer = wait(peer_output.grant(peer_output.clamp(bytes)), || {
-            delayed("peer_output")
-        })
-        .await;
-        #[cfg(any(test, zakura_sim))]
-        self.report_acquired();
-        let (node, pool_lease) = match backing {
-            Some(backing) => {
-                let lease = wait(
-                    ServeCapacity::acquire_pool_lease(backing, &self.peer_id, bytes),
-                    || delayed("memory_pool_output"),
-                )
-                .await;
-                (None, Some(lease))
-            }
-            None => {
-                let node = wait(node_output.grant(node_output.clamp(bytes)), || {
-                    delayed("node_output")
-                })
-                .await;
-                #[cfg(any(test, zakura_sim))]
-                self.report_acquired();
-                (Some(node), None)
-            }
-        };
-        let grants = ResponseGrants::new(
-            pool_lease,
-            node,
-            node_response,
-            peer,
-            peer_response,
-            self.peer.clone(),
-        );
+        let grants =
+            ResponseGrants::acquire(&self.capacity, &self.peer, &self.peer_id, bytes, self)
+                .await
+                .expect("a push's gates wait until they grant");
         PushPermit {
             grants,
             execution: self.execution().await,
@@ -208,8 +159,20 @@ impl PushSend<'_> {
     }
 }
 
+/// A push's waits never end before their grant.
+impl GateWait for Push {
+    async fn wait<T>(&self, bound: &'static str, acquire: impl Future<Output = T>) -> Option<T> {
+        Some(wait(acquire, || self.capacity.metrics.delayed(bound)).await)
+    }
+
+    #[cfg(any(test, zakura_sim))]
+    fn took_budget(&self) {
+        self.report_acquired();
+    }
+}
+
 /// Await `acquire`, counting a delay if it is not ready at once.
-async fn wait<T>(acquire: impl std::future::Future<Output = T>, delayed: impl FnOnce()) -> T {
+async fn wait<T>(acquire: impl Future<Output = T>, delayed: impl FnOnce()) -> T {
     zakura_rt::pin!(acquire);
     if let Some(ready) = futures::FutureExt::now_or_never(&mut acquire) {
         return ready;

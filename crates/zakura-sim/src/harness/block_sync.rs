@@ -29,7 +29,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use zakura_network::zakura::{
     block_sync_serving_limit, block_sync_streams,
-    memory::{ByteSize, Consumer, MemoryPlan, MemoryPool, ServingPool},
+    memory::{ByteSize, Consumer, MemoryPlan, MemoryPool},
     BlockSyncMemory, ZakuraBlockSyncConfig,
 };
 use zakura_scheduler::{At, SchedulerConfig, TaskId};
@@ -802,12 +802,8 @@ impl Subsystem for Storage {
             ports.reads.clone(),
             predicates.clone(),
         )));
-        let serving_pool = ServingPool::new(memory_pool.clone(), memory_plan.serving_per_peer_cap);
-        let block_memory = BlockSyncMemory::new(
-            memory_pool.clone(),
-            serving_pool,
-            scenario.max_reorder_lookahead_bytes,
-        );
+        let block_memory =
+            BlockSyncMemory::new(memory_pool.clone(), scenario.max_reorder_lookahead_bytes);
         let mut nodes = vec![BlockNode::spawn_with_memory(
             sim,
             "node",

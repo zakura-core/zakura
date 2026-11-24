@@ -1,7 +1,7 @@
 use zakura_node_services::block_memory::DecodedBlockPool;
 use zakura_rt::sync::{atomic::AtomicU64, Mutex};
 
-use crate::zakura::memory::{MemoryPool, ServingPool};
+use crate::zakura::memory::MemoryPool;
 
 use super::{
     admission::min_rate_transfer_time,
@@ -55,17 +55,15 @@ pub(super) struct NeededBlocksQueryFailure {
 #[derive(Clone, Debug)]
 pub struct BlockSyncMemory {
     pub(super) pool: MemoryPool,
-    pub(super) serving: ServingPool,
     /// `[memory.cap] look_ahead`, which lowers the derived look-ahead cap.
     pub(super) look_ahead_cap: Option<u64>,
 }
 
 impl BlockSyncMemory {
-    /// Block sync's memory from the node's `pool` and `serving` pool.
-    pub fn new(pool: MemoryPool, serving: ServingPool, look_ahead_cap: Option<u64>) -> Self {
+    /// Block sync's memory from the node's `pool`.
+    pub fn new(pool: MemoryPool, look_ahead_cap: Option<u64>) -> Self {
         Self {
             pool,
-            serving,
             look_ahead_cap,
         }
     }
@@ -77,9 +75,7 @@ impl BlockSyncMemory {
         let config = crate::Config::default();
         let plan = crate::zakura::memory::MemoryPlan::size(budget_b, &config, &config.network)
             .expect("a default node's plan fits the test budget");
-        let pool = plan.build_pool();
-        let serving = ServingPool::new(pool.clone(), plan.serving_per_peer_cap);
-        Self::new(pool, serving, None)
+        Self::new(plan.build_pool(), None)
     }
 
     /// Block sync's memory on a pool that reserves `consensus` bytes and caps
@@ -91,10 +87,9 @@ impl BlockSyncMemory {
         let config = PoolConfig::new(consensus.saturating_add(block_sync.saturating_mul(2)), 0)
             .with_consumer(Consumer::Consensus, ConsumerSpec::reserved(consensus))
             .with_consumer(Consumer::BlockSync, ConsumerSpec::bulk(0, block_sync, 1))
-            .with_consumer(Consumer::Serving, ConsumerSpec::bulk(0, block_sync, 1));
-        let pool = MemoryPool::new(config);
-        let serving = ServingPool::new(pool.clone(), block_sync);
-        Self::new(pool, serving, None)
+            .with_consumer(Consumer::Serving, ConsumerSpec::bulk(0, block_sync, 1))
+            .with_serving_per_peer_cap(block_sync);
+        Self::new(MemoryPool::new(config), None)
     }
 
     /// Block sync's memory on a 16 GiB default node's plan, for tests.

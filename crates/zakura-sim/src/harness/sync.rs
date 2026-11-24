@@ -41,7 +41,7 @@ use zakura_chain::block;
 use zakura_header_chain::{BodyWorkAuthority, Frontier};
 use zakura_network::zakura::{
     block_sync_serving_limit, framed_channel,
-    memory::{Consumer, MemoryPlan, MemoryPool, ServingPool},
+    memory::{Consumer, MemoryPlan, MemoryPool},
     BlockSyncMemory, CloseCauseReader, FramedRecv, FramedSend, Peer, Service, ServicePeerDirection,
     SessionOrigin, ZakuraBlockSyncConfig, ZakuraPeerId, ZakuraSupervisorHandle,
     ZAKURA_CAP_BLOCK_SYNC_REGULATED, ZAKURA_CAP_HEADER_SYNC, ZAKURA_HEADER_SYNC_STREAM_VERSION,
@@ -1225,11 +1225,8 @@ pub(crate) struct Actors {
     /// Startup memory plan sized for the node under test.
     pub(crate) memory_plan: MemoryPlan,
     /// Live node-wide memory pool shared by the node's block sync and (on wire)
-    /// transport handler.
+    /// transport handler, as zakurad builds it.
     pub(crate) memory_pool: MemoryPool,
-    /// The one serving pool the node's block sync and (on wire) handler
-    /// share, as zakurad builds it.
-    pub(crate) serving_pool: ServingPool,
 }
 
 /// Spawns the node's two services on its storages, each under its policy
@@ -1361,12 +1358,7 @@ pub(crate) fn spawn_actors_with_memory(
         .caps
         .look_ahead
         .map(zakura_network::zakura::memory::ByteSize::bytes);
-    let serving_pool = ServingPool::new(memory_pool.clone(), memory_plan.serving_per_peer_cap);
-    let block_memory = BlockSyncMemory::new(
-        memory_pool.clone(),
-        serving_pool.clone(),
-        look_ahead_override,
-    );
+    let block_memory = BlockSyncMemory::new(memory_pool.clone(), look_ahead_override);
     let node = SyncNode {
         name: "node".to_owned(),
         header: HeaderNode::spawn(
@@ -1440,7 +1432,6 @@ pub(crate) fn spawn_actors_with_memory(
             routines,
             memory_plan,
             memory_pool,
-            serving_pool,
         },
         predicates,
         pool_tap,

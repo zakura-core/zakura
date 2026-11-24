@@ -241,9 +241,9 @@ async fn cancelled_sessions_do_not_complete_replacement_ranges() {
     cancel.cancel();
 }
 
-/// The production serving pool of block sync's test memory.
-fn test_serving() -> crate::zakura::memory::ServingPool {
-    crate::zakura::BlockSyncMemory::for_tests().serving
+/// The memory pool of block sync's test memory, which serving leases from.
+fn test_serving() -> crate::zakura::memory::MemoryPool {
+    crate::zakura::BlockSyncMemory::for_tests().pool
 }
 
 /// A session for `source` with the production serving limits, whose output
@@ -252,7 +252,7 @@ fn ready_session(
     source: &Arc<ControlledSource>,
     peer: u8,
     queue: usize,
-    serving_pool: crate::zakura::memory::ServingPool,
+    serving_pool: crate::zakura::memory::MemoryPool,
 ) -> (
     Serving,
     ServingSession,
@@ -434,7 +434,7 @@ async fn a_same_height_replacement_never_precedes_the_old_ranges_output() {
     session.admit(Range::new(Height(1), 3).unwrap()).unwrap();
     wait_completed(&mut session, Height(1)).await;
     assert!(
-        serving_pool.total_leased() > 0,
+        serving_pool.serving_total_leased() > 0,
         "the old range's output is not all written"
     );
     session.admit(Range::new(Height(1), 3).unwrap()).unwrap();

@@ -12,7 +12,7 @@ use std::{
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use rand_10::seq::SliceRandom;
 use thiserror::Error;
-use zakura_chain::block;
+use zakura_chain::{block, miner_mesh::GatewayId};
 use zakura_quic::{NodeAddr, NodeId, NodeKeyList, NodeSecretKey};
 use zakura_rt::{
     collections::{hash_map, HashMap, HashSet},
@@ -27,14 +27,16 @@ use super::wire::{record_len, write_record_body, NODE_ID_BYTES, SIGNATURE_BYTES}
 use crate::zakura::{
     canonical_ip,
     regulation::{SlotBudget, SlotPermit},
-    BlockSyncStatus, HeldPlaces, ServiceAdmissionDecision, ServicePeerDirection, ServicePeerLimits,
-    ServicePeerSnapshot, ZakuraConnId, ZakuraNetworkId, ZakuraPeerId, MAX_BS_BLOCKS_PER_REQUEST,
-    MAX_BS_RESPONSE_BYTES, ZAKURA_ALPN_MISMATCH_BACKOFF,
+    BlockSyncStatus, GatewayMatch, HeldPlaces, ServiceAdmissionDecision, ServicePeerDirection,
+    ServicePeerLimits, ServicePeerSnapshot, ZakuraConnId, ZakuraNetworkId, ZakuraPeerId,
+    MAX_BS_BLOCKS_PER_REQUEST, MAX_BS_RESPONSE_BYTES, ZAKURA_ALPN_MISMATCH_BACKOFF,
 };
 
 mod eviction;
+mod gateway_index;
 
 use eviction::EvictionIndex;
+use gateway_index::GatewayIndex;
 
 /// Native discovery stream kind.
 pub const ZAKURA_STREAM_DISCOVERY: u16 = 4;
@@ -1303,6 +1305,9 @@ pub struct ZakuraDiscoveryBook {
     /// The non-static entries in eviction order. Every change to an entry
     /// updates it.
     eviction: EvictionIndex,
+    /// Every node in `entries` or `static_candidates`, so a gateway ID finds
+    /// its nodes without a scan.
+    gateways: GatewayIndex,
     /// Which addresses records learned from peers may carry.
     address_scope: AddressScope,
 }
@@ -2080,17 +2085,21 @@ impl ZakuraDiscoveryHandle {
         selected
     }
 
-    /// Returns what the book knows about dialing each of `node_ids`, in the
-    /// same order, by the checks the ordinary dial candidates pass.
+    /// Returns what the book knows about the node each of `gateways` names,
+    /// in the same order, and about dialing it by the checks the ordinary
+    /// dial candidates pass.
     ///
     /// It looks at the book only: the caller accounts for registered peers
     /// and dials in flight. The book stays locked for the whole list.
-    pub(crate) async fn dial_targets(&self, node_ids: &[NodeId]) -> Vec<DialTarget> {
+    pub(crate) async fn gateway_targets(
+        &self,
+        gateways: &[GatewayId],
+    ) -> Vec<GatewayMatch<(NodeId, DialTarget)>> {
         let now = current_unix_secs();
         let state = self.inner.lock().await;
-        node_ids
+        gateways
             .iter()
-            .map(|node_id| state.dial_target(node_id, now))
+            .map(|gateway| state.gateway_target(gateway, now))
             .collect()
     }
 
@@ -2346,6 +2355,7 @@ impl ZakuraDiscoveryBook {
             generation: 0,
             relayed: HashMap::new(),
             eviction: EvictionIndex::default(),
+            gateways: GatewayIndex::default(),
             address_scope: AddressScope::default(),
         }
     }
@@ -2368,6 +2378,8 @@ impl ZakuraDiscoveryBook {
     /// - each entry sits under its record's author;
     /// - each relay's attribution counts exactly its third-party entries, and
     ///   stays within the per-relay quota;
+    /// - the eviction index holds exactly the entries, and the gateway index
+    ///   exactly the entries and static candidates;
     /// - the discovered entries stay within the record limit;
     /// - an entry's confirmed addresses are ones its record lists, and its
     ///   dialed addresses are confirmed;
@@ -2414,6 +2426,14 @@ impl ZakuraDiscoveryBook {
         assert!(
             self.eviction == eviction,
             "{PROPERTY}: the eviction index disagrees with the entries"
+        );
+        let mut gateways = GatewayIndex::default();
+        for node_id in self.entries.keys().chain(self.static_candidates.keys()) {
+            gateways.insert(*node_id);
+        }
+        assert!(
+            self.gateways == gateways,
+            "{PROPERTY}: the gateway index disagrees with the entries and static candidates"
         );
         let busiest = relayed.values().copied().max().unwrap_or(0);
         assert!(
@@ -2504,6 +2524,7 @@ impl ZakuraDiscoveryBook {
             }
         }
 
+        self.gateways.insert(node_addr.id);
         let candidate = self
             .static_candidates
             .entry(node_addr.id)
@@ -2912,6 +2933,20 @@ impl ZakuraDiscoveryBook {
         }
     }
 
+    /// The nodes the book holds whose IDs start with `gateway`: none,
+    /// several, or exactly one, with what [`Self::dial_target`] says about
+    /// dialing it at `now`.
+    pub(crate) fn gateway_target(
+        &self,
+        gateway: &GatewayId,
+        now: u64,
+        dial_backoff: (Duration, Duration),
+    ) -> GatewayMatch<(NodeId, DialTarget)> {
+        self.gateways
+            .find(gateway)
+            .map(|node_id| (node_id, self.dial_target(&node_id, now, dial_backoff)))
+    }
+
     /// Marks a dial attempt for `node_id`.
     pub fn mark_dial_attempt(&mut self, node_id: &NodeId, now: u64) {
         if let Some(entry) = self.entries.get_mut(node_id) {
@@ -3192,6 +3227,7 @@ impl ZakuraDiscoveryBook {
             self.generation += 1;
         }
         self.eviction.insert(node_id, &entry);
+        self.gateways.insert(node_id);
         self.entries.insert(node_id, entry);
         self.evict_to_limits(now, changes);
         if !self.entries.contains_key(&node_id) {
@@ -3254,6 +3290,9 @@ impl ZakuraDiscoveryBook {
     ) {
         if let Some(entry) = self.entries.remove(node_id) {
             self.eviction.remove(*node_id, &entry);
+            if !self.static_candidates.contains_key(node_id) {
+                self.gateways.remove(node_id);
+            }
             self.unattribute(relay_of(entry.source, *node_id));
             changes.push(BookChange::Evicted {
                 node_id: *node_id,

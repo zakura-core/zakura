@@ -20,14 +20,12 @@ x-zakura-node: &zakura-node
   stop_grace_period: 5s
   cpu_shares: 256
   mem_swappiness: 0
-  memswap_limit: 1536m
   tmpfs:
     - /tmp
   deploy:
     resources:
       limits:
         cpus: "2"
-        memory: 1536m
         pids: 256
 
 services:

@@ -1438,7 +1438,8 @@ where
                          legacy ChainSync as the body-sync driver while Zakura keeps serving \
                          peers and following local commits"
                     );
-                    self.run_legacy_fallback_round(&block_sync_handoff).await?;
+                    self.run_legacy_fallback_round(&block_sync_handoff, None)
+                        .await?;
                     let resumed_tip = self.latest_chain_tip.best_tip_height();
                     tracker = ZakuraStallTracker::new(resumed_tip);
                     legacy_probe = ZakuraLegacyProbe::new(resumed_tip);
@@ -1463,7 +1464,12 @@ where
                              resuming legacy ChainSync as the body-sync driver \
                              while Zakura keeps serving peers and following local commits"
                         );
-                        self.run_legacy_fallback_round(&block_sync_handoff).await?;
+                        let recover_to = probe
+                            .extends_verified_tip
+                            .then(|| verified_height.and_then(|height| height + 2))
+                            .flatten();
+                        self.run_legacy_fallback_round(&block_sync_handoff, recover_to)
+                            .await?;
                         let resumed_tip = self.latest_chain_tip.best_tip_height();
                         tracker = ZakuraStallTracker::new(resumed_tip);
                         legacy_probe = ZakuraLegacyProbe::new(resumed_tip);
@@ -1474,9 +1480,15 @@ where
     }
 
     /// Runs one fully drained legacy recovery round, then returns apply ownership to Zakura.
+    ///
+    /// `recover_to` is the height of the second header behind a near-tip trigger.
+    /// `obtain_tips` drops the last hash of a two-hash `FindBlocks` reply, so the
+    /// first pass can stop one block short. A second pass under the same lease
+    /// fetches it, because a single-hash reply is kept.
     async fn run_legacy_fallback_round(
         &mut self,
         block_sync_handoff: &std::sync::Arc<crate::commands::start::zakura::SyncCoordinator>,
+        recover_to: Option<Height>,
     ) -> Result<(), Report> {
         let Some(lease) = handle_legacy_fallback_acquisition(
             engage_legacy_fallback_alongside_zakura(block_sync_handoff).await,
@@ -1484,8 +1496,17 @@ where
         else {
             return Ok(());
         };
-        if self.try_to_sync(None).await.is_err() {
-            self.downloads.cancel_all();
+        for _ in 0..2 {
+            let before = self.latest_chain_tip.best_tip_height();
+            // Gossip can commit a queued block mid-pass, which fails the pass
+            // after progress was made, so check progress either way.
+            if self.try_to_sync(None).await.is_err() {
+                self.downloads.cancel_all();
+            }
+            let after = self.latest_chain_tip.best_tip_height();
+            if after <= before || recover_to.is_none_or(|target| after >= Some(target)) {
+                break;
+            }
         }
         self.update_metrics();
         drop(lease);

@@ -4,25 +4,34 @@
 //! These exercise the pure decision function [`zakura_block_sync_stalled`] directly,
 //! so they are deterministic and need no clock, services, or live `ChainTip`.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use indexmap::IndexSet;
 use zakura_chain::{
     block::{self, Height},
     chain_sync_status::ChainSyncStatus,
+    chain_tip::{
+        mock::{MockChainTip, MockChainTipSender},
+        ChainTip,
+    },
     parameters::Network,
     serialization::ZcashDeserializeInto,
 };
-use zakura_network as zn;
+use zakura_network::{self as zn, InventoryResponse::Available};
 use zakura_state as zs;
-use zakura_test::vectors::{BLOCK_MAINNET_1_BYTES, BLOCK_MAINNET_2_BYTES};
+use zakura_test::vectors::{
+    BLOCK_MAINNET_1_BYTES, BLOCK_MAINNET_2_BYTES, BLOCK_MAINNET_GENESIS_BYTES,
+};
 
 use super::super::{
     cap_checkpoint_bootstrap_hashes, checkpoint_bootstrap_hash_limit,
     engage_legacy_fallback_alongside_zakura, handle_legacy_fallback_acquisition,
     zakura_block_sync_stalled, zakura_sync_status_length, zakura_watchdog_action, ChainSync,
     LegacyProbeResult, SyncStatus, ZakuraLegacyProbe, ZakuraStallTracker, ZakuraWatchdogAction,
-    ZAKURA_LEGACY_BEHIND_THRESHOLD,
+    FANOUT, ZAKURA_LEGACY_BEHIND_THRESHOLD,
 };
 
 #[test]
@@ -674,6 +683,164 @@ async fn frozen_native_tip_recovers_on_two_linked_legacy_headers_with_work() {
         let probe = sync.legacy_peers_blocks_ahead(Some(tip)).await;
         assert_eq!(probe.blocks_ahead, Some(expected_ahead));
         assert_eq!(probe.supports_fallback(), expected_fallback);
+    }
+}
+
+/// A near-tip round must commit both blocks that triggered it, even though
+/// `obtain_tips` drops the last hash of a two-hash `FindBlocks` reply. Without a
+/// target, or without progress, the round keeps its single pass.
+#[tokio::test]
+async fn near_tip_fallback_round_recovers_both_blocks_ahead() {
+    /// Commits `hash` as the next block of `chain` and publishes it as the best tip.
+    fn commit_next(
+        chain: &[Arc<block::Block>],
+        committed: &Mutex<usize>,
+        tip_sender: &MockChainTipSender,
+        hash: block::Hash,
+    ) {
+        let mut committed = committed.lock().unwrap();
+        assert_eq!(chain[*committed].hash(), hash, "blocks commit in order");
+        let height = u32::try_from(*committed).expect("the test chain is tiny");
+        *committed += 1;
+        tip_sender.send_best_tip_height(Height(height));
+        tip_sender.send_best_tip_hash(hash);
+    }
+
+    let chain: Vec<Arc<block::Block>> = [
+        &*BLOCK_MAINNET_GENESIS_BYTES,
+        &*BLOCK_MAINNET_1_BYTES,
+        &*BLOCK_MAINNET_2_BYTES,
+    ]
+    .into_iter()
+    .map(|bytes| bytes.zcash_deserialize_into().expect("valid mainnet block"))
+    .collect();
+    let first_hash = chain[1].hash();
+
+    // `gossip_commits_first` commits the first block outside the round, on the
+    // state check `obtain_tips` runs after every reply was scanned. That check
+    // then fails the first pass after it made progress.
+    for (recover_to, commits, gossip_commits_first, expected_tip, expected_passes) in [
+        (Some(Height(2)), true, false, Height(2), 2),
+        (Some(Height(2)), true, true, Height(2), 2),
+        (None, true, false, Height(1), 1),
+        (Some(Height(2)), false, false, Height(0), 1),
+    ] {
+        let (chain_tip, tip_sender) = MockChainTip::new();
+        tip_sender.send_best_tip_height(Height(0));
+        tip_sender.send_best_tip_hash(chain[0].hash());
+        let tip_sender = Arc::new(tip_sender);
+        // Blocks are committed in chain order, so this is the committed prefix length.
+        let committed = Arc::new(Mutex::new(1_usize));
+        let find_blocks_requests = Arc::new(Mutex::new(0_usize));
+        let first_block_checks = Arc::new(Mutex::new(0_usize));
+
+        let peer = tower::service_fn({
+            let chain = chain.clone();
+            let find_blocks_requests = find_blocks_requests.clone();
+            move |request| {
+                let response = match request {
+                    zn::Request::FindBlocks { known_blocks, .. } => {
+                        *find_blocks_requests.lock().unwrap() += 1;
+                        let next = chain
+                            .iter()
+                            .position(|block| block.hash() == known_blocks[0])
+                            .expect("the locator starts on the test chain")
+                            + 1;
+                        zn::Response::BlockHashes(
+                            chain[next..].iter().map(|block| block.hash()).collect(),
+                        )
+                    }
+                    zn::Request::BlocksByHash(hashes) => zn::Response::Blocks(
+                        hashes
+                            .into_iter()
+                            .map(|hash| {
+                                let block = chain
+                                    .iter()
+                                    .find(|block| block.hash() == hash)
+                                    .expect("peers are asked only for test chain blocks");
+                                Available((block.clone().into(), None))
+                            })
+                            .collect(),
+                    ),
+                    request => unreachable!("unexpected peer request: {request:?}"),
+                };
+                futures::future::ok(response)
+            }
+        });
+        let state = tower::service_fn({
+            let chain = chain.clone();
+            let committed = committed.clone();
+            let tip_sender = tip_sender.clone();
+            let first_block_checks = first_block_checks.clone();
+            move |request| {
+                if gossip_commits_first && request == zs::Request::KnownBlock(first_hash) {
+                    let mut checks = first_block_checks.lock().unwrap();
+                    *checks += 1;
+                    // One check per `FindBlocks` reply, then the final check.
+                    if *checks == FANOUT + 1 {
+                        commit_next(&chain, &committed, &tip_sender, first_hash);
+                    }
+                }
+                let committed = &chain[..*committed.lock().unwrap()];
+                let response = match request {
+                    zs::Request::BlockLocator => zs::Response::BlockLocator(
+                        committed.iter().rev().map(|block| block.hash()).collect(),
+                    ),
+                    zs::Request::KnownBlock(hash) => zs::Response::KnownBlock(
+                        committed
+                            .iter()
+                            .any(|block| block.hash() == hash)
+                            .then_some(zs::KnownBlock::BestChain),
+                    ),
+                    request => unreachable!("unexpected state request: {request:?}"),
+                };
+                futures::future::ok(response)
+            }
+        });
+        let verifier = tower::service_fn({
+            let chain = chain.clone();
+            let committed = committed.clone();
+            let tip_sender = tip_sender.clone();
+            move |request: zakura_consensus::Request| {
+                let hash = request.block().hash();
+                if !commits {
+                    return futures::future::err::<block::Hash, crate::BoxError>(
+                        "synthetic invalid block".into(),
+                    );
+                }
+                commit_next(&chain, &committed, &tip_sender, hash);
+                futures::future::ok(hash)
+            }
+        });
+
+        let (mut sync, _) = ChainSync::new(
+            &crate::config::ZakuradConfig::default(),
+            Height(0),
+            peer,
+            verifier,
+            state,
+            chain_tip.clone(),
+            crate::components::test_misbehavior::reporter(),
+        );
+        let handoff = crate::commands::start::zakura::SyncCoordinator::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            sync.run_legacy_fallback_round(&handoff, recover_to),
+        )
+        .await
+        .expect("the fallback round finishes")
+        .expect("the fallback round returns cleanly");
+
+        assert_eq!(chain_tip.best_tip_height(), Some(expected_tip));
+        // Each pass sends one `FindBlocks` per fanout peer.
+        assert_eq!(
+            *find_blocks_requests.lock().unwrap(),
+            expected_passes * FANOUT
+        );
+        assert!(
+            handoff.begin_apply().is_some(),
+            "the round returns apply ownership to Zakura"
+        );
     }
 }
 

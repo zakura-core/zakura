@@ -513,6 +513,64 @@ fn close_4_failed_unknown_parent_binding_checks_the_alternate() {
     table.assert_invariants();
 }
 
+/// An alternate that takes over a failed unknown-parent binding keeps the
+/// entry's best-header count. The best header moved during the first copy's
+/// checks, and no wake reached the entry, so the alternate retries header
+/// admission when its checks pass.
+#[test]
+fn close_4_unknown_parent_alternate_retries_after_the_best_header_moved() {
+    let now = Instant::now();
+    let parent = block::Hash([0x3A; 32]);
+    let block_id = block::Hash([0x3B; 32]);
+    let [a, b, ..] = sessions();
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let first = copy_from(
+        &mut table,
+        now,
+        make_envelope(block_id, tiny(), [0xA1; 32], node_id(1)),
+        a,
+    );
+    copy_from(
+        &mut table,
+        now,
+        make_envelope(block_id, tiny(), [0xA2; 32], node_id(1)),
+        b,
+    );
+    let checking = header_result(
+        &mut table,
+        now,
+        &first,
+        HeaderAdmissionResult::MissingParent {
+            parent_hash: parent,
+        },
+    );
+    table.step(
+        now,
+        BlockInput::ParentAdmitted {
+            hash: parent,
+            height: 1,
+        },
+    );
+    let failed = unknown_parent_checked(
+        &mut table,
+        now,
+        &checking,
+        UnknownParentVerdict::Invalid(Bpv1CloseRow::Row4BadMetaOrCommitment),
+    );
+    assert_eq!(
+        closed_sessions(&failed, Bpv1CloseRow::Row4BadMetaOrCommitment),
+        vec![a]
+    );
+
+    let retried = unknown_parent_checked(&mut table, now, &failed, UnknownParentVerdict::Park);
+    assert_eq!(table.pending_meta_len(), 0);
+    assert!(retried
+        .outputs
+        .iter()
+        .any(|o| matches!(o, BlockOutput::AdmitHeader { .. })));
+    table.assert_invariants();
+}
+
 /// The alternate envelope waits with its entry while the parent header is
 /// unknown, and gets its check once the parent arrives.
 #[test]

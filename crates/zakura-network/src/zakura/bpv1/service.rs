@@ -582,7 +582,9 @@ impl SharedNode {
     }
 }
 
-fn verify_envelope_commitment(
+/// Whether `envelope`'s coinbase commits its layout under `chain_id` at
+/// `admitted_height` (bpv1-2, check-3).
+pub(super) fn verify_envelope_commitment(
     network: &Network,
     admitted_height: Height,
     chain_id: [u8; 32],
@@ -2131,7 +2133,10 @@ async fn run_peer_routine(
     }
 }
 
-fn parse_and_verify_part_frame(
+/// Parses a `Part` frame payload and verifies its proof for `expected_index`
+/// under `part_root` (bpv1-12). Returns `None` for any malformed or unproven
+/// frame.
+pub(super) fn parse_and_verify_part_frame(
     payload: &[u8],
     coding: &Coding,
     part_root: [u8; 32],
@@ -2166,7 +2171,12 @@ fn parse_header(bytes: &[u8]) -> Option<Header> {
     slice.is_empty().then_some(header)
 }
 
-fn decode_meta_envelope(block_id: block::Hash, message: Bpv1Message) -> Option<Box<MetaEnvelope>> {
+/// The table's envelope of a decoded `HeaderMeta`, or `None` for another
+/// message or a header that does not parse.
+pub(super) fn decode_meta_envelope(
+    block_id: block::Hash,
+    message: Bpv1Message,
+) -> Option<Box<MetaEnvelope>> {
     let Bpv1Message::HeaderMeta {
         header,
         binding,

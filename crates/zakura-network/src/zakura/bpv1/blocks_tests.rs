@@ -275,7 +275,7 @@ pub(super) fn missing_parent(
 }
 
 /// Completes the step's unknown-parent check with `verdict`.
-fn unknown_parent_checked(
+pub(super) fn unknown_parent_checked(
     table: &mut BlockTable,
     now: Instant,
     checking: &BlockStep,
@@ -796,7 +796,8 @@ fn invalid_header_closes_every_session_that_sent_it() {
 /// Metadata whose parent header is unknown parks only after its checks pass
 /// (#2715). An out-of-range height or a target above the bound drops it
 /// without fault. A failed proof of work closes every session that sent the
-/// header, and a failed binding closes only the sender whose binding failed.
+/// header, and a failed binding closes every session that sent that same
+/// binding (bpv1-61).
 #[test]
 fn unknown_parent_verdicts_park_drop_or_close() {
     let now = Instant::now();
@@ -870,9 +871,9 @@ fn unknown_parent_verdicts_park_drop_or_close() {
     assert_eq!(table.pending_meta_len(), 0);
     assert_eq!(
         closed_sessions(&closed, Bpv1CloseRow::Row4BadMetaOrCommitment),
-        vec![first]
+        both
     );
-    assert_eq!(rejected_sessions(&closed, bad_binding), vec![second]);
+    assert!(rejected_sessions(&closed, bad_binding).is_empty());
 }
 
 /// Returns the sessions the step rejected `block_id`'s metadata for.
@@ -3005,6 +3006,61 @@ fn fix8_part_charge_before_proof_bounds_the_part_buffer() {
     // The invariants check that a retired block holds no charge.
     table.assert_invariants();
     assert_eq!(table.block_phase(&block_id), Some(BlockPhase::Retired));
+}
+
+/// A retired block's tombstone stays until `top` passes it by more than
+/// twice the propagation window. Then the table drops it and tells every
+/// session to drop its own (`PublishEvictRetired`).
+#[test]
+fn retired_tombstone_evicts_past_twice_the_window() {
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let t0 = Instant::now();
+    let coding = Profile::TINY.derive_coding(128, 2).unwrap();
+    let old = block::Hash([0xB5; 32]);
+    table.step(
+        t0,
+        BlockInput::TipHeight {
+            height: 49,
+            hash: TEST_TIP_HASH,
+        },
+    );
+    admit_block(&mut table, t0, old, 50, coding, [0x21; 32]);
+    let evicts = |step: &BlockStep| {
+        step.outputs
+            .iter()
+            .any(|o| matches!(o, BlockOutput::PublishEvictRetired { block_id } if *block_id == old))
+    };
+
+    let step = table.step(
+        t0,
+        BlockInput::TipHeight {
+            height: 50 + PROPAGATION_DEPTH + 1,
+            hash: TEST_TIP_HASH,
+        },
+    );
+    assert!(!evicts(&step));
+    assert_eq!(table.block_phase(&old), Some(BlockPhase::Retired));
+
+    let step = table.step(
+        t0,
+        BlockInput::TipHeight {
+            height: 50 + 2 * PROPAGATION_DEPTH,
+            hash: TEST_TIP_HASH,
+        },
+    );
+    assert!(!evicts(&step));
+    assert_eq!(table.block_phase(&old), Some(BlockPhase::Retired));
+
+    let step = table.step(
+        t0,
+        BlockInput::TipHeight {
+            height: 50 + 2 * PROPAGATION_DEPTH + 1,
+            hash: TEST_TIP_HASH,
+        },
+    );
+    assert!(evicts(&step));
+    assert_eq!(table.block_phase(&old), None);
+    table.assert_invariants();
 }
 
 /// Every input that raises `top` retires the blocks it pushes out of

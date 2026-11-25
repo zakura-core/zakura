@@ -6,8 +6,9 @@ names its gateway node in the coinbase of each block it mines, and every synced
 mining node keeps direct v2 connections to the gateways that recent blocks name
 most often.
 
-This page covers the `mining.miner_mesh` setting, the `getminermeshinfo` RPC,
-and what a node does for the gateways it prefers.
+This page covers the `mining.miner_mesh` and `mining.miner_mesh_gateways`
+settings, the `getminermeshinfo` RPC, and what a node does for the gateways it
+prefers.
 
 ## Announce a gateway
 
@@ -44,8 +45,65 @@ The output's lock script is `OP_RETURN`, a push of 23 bytes, the tag `MR`
   `network.identity_dir` can be read or created.
 
 It warns, and starts anyway, when `network.zakura.listen_addr` is unset or
-loopback (other miners cannot dial the gateway) or when `mining.miner_address`
-is unset (the node builds no coinbase, so it names no gateway).
+loopback, since other miners cannot dial the gateway. A node with
+`miner_mesh` set and no `mining.miner_address` builds no coinbase, but it
+still acts as a gateway that other coinbases can name, and it prefers other
+gateways: see [Name a relay node](#name-a-relay-node).
+
+### Name a relay node
+
+A pool often builds its block templates on an internal node and runs separate
+public nodes that other pools can reach. With `mining.miner_mesh_gateways`,
+the coinbases the template node builds name a public relay node instead of
+the template node itself:
+
+```toml
+# The template node.
+[mining]
+miner_address = "t1..."
+miner_mesh = true
+miner_mesh_gateways = ["<the relay's node_id>"]
+```
+
+```toml
+# The relay node.
+[mining]
+miner_mesh = true
+
+[network]
+p2p_stack = "dual"
+
+[network.zakura]
+listen_addr = "0.0.0.0:8234"
+```
+
+Each entry is the relay's v2 node ID in hex, the `node_id` its
+`getminermeshinfo` reports, or the first 40 hex digits of it, its gateway ID.
+For now the list takes one entry: `zakurad` refuses to start with more. An
+empty list, the default, names the node itself.
+
+The two nodes need different things:
+
+- The relay is the gateway. It needs what any gateway needs: v2 networking,
+  a node key that stays the same across restarts, and a listen address other
+  pools can dial. With `miner_mesh` set and no miner address, it counts the
+  gateways recent blocks name and holds places for the best of them, as a
+  mining node does, so it stays connected to the other pools' gateways.
+- The template node is not a gateway, so `zakurad` asks neither v2 networking
+  nor a lasting node key of it, and does not warn about its listen address.
+  It refuses to start with `miner_mesh_gateways` set unless `miner_mesh` is
+  set too, and warns when it has no miner address, since then it builds no
+  coinbase to name the relay in.
+
+The template node ranks the relay like any other gateway: once its own blocks
+name the relay in at least 10 counted blocks, it holds a place for the relay
+and dials it, so the two stay connected with no extra peer settings. A
+template node that runs only the legacy stack holds no places, so it reaches
+the relay only through its ordinary legacy peers. A node only ever leaves out
+the gateway ID its own node ID starts with.
+
+`getminermeshinfo` on the template node lists the relay's gateway ID in
+`announced_gateways`, which is how an operator confirms the setting.
 
 ### The gateway's ID
 
@@ -73,8 +131,9 @@ gateway and the miners that prefer it must all run it to form a mesh.
 
 ## Prefer announced gateways
 
-Every node with `mining.miner_address` set counts the gateways named in the best
-chain's recent blocks, whether or not it announces one itself. The window is two
+Every node with `mining.miner_address` or `mining.miner_mesh` set counts the
+gateways named in the best chain's recent blocks, whether or not it announces
+one itself. The window is two
 days of blocks ending 10 blocks below the tip, so it holds about 6,912 blocks
 at a 25-second spacing (2,304 at the 75-second spacing before NU7). The node
 reads each block as it reaches 10 deep, reads older blocks in the window when
@@ -94,8 +153,8 @@ node neither dials it nor holds a place for it. Ten blocks is about 0.15% of the
 25-second window: a pool that mines that rarely does not take a place, and a node that
 names another node's ID in its blocks must keep mining to hold that node a
 place. When the tracker next checks a stale tip, it publishes an empty ranking.
-Networking releases the held places when it applies that update. A node without
-a miner address holds no places.
+Networking releases the held places when it applies that update. A node with
+neither a miner address nor `miner_mesh` holds no places.
 
 ### What a held place grants
 
@@ -131,6 +190,7 @@ counts, the places it holds, and its v2 peers. In this example the node has
 {
   "node_id": "2840...36c7",
   "announcing": true,
+  "announced_gateways": ["2840...3793"],
   "mining": true,
   "synced": true,
   "window": {
@@ -159,10 +219,11 @@ counts, the places it holds, and its v2 peers. In this example the node has
 | Field | Meaning |
 | --- | --- |
 | `node_id` | This node's v2 node ID in hex, or null without v2 networking. |
-| `announcing` | The coinbases this node builds name its gateway. |
+| `announcing` | The coinbases this node builds name a gateway. |
+| `announced_gateways` | The gateway IDs in hex that the coinbases this node builds name: its own, or the relay `mining.miner_mesh_gateways` names. Empty when the node does not announce, and one entry for now. |
 | `mining` | The node has a miner address. |
 | `synced` | The tip is recent enough to prefer gateways when this request is served. Always true on test networks. |
-| `window` | The counted heights, or null on a node that does not mine. |
+| `window` | The counted heights, or null on a node that does not prefer gateways: one with neither a miner address nor `miner_mesh`. |
 | `window.tip` | The best tip height the counts follow. |
 | `window.newest`, `window.oldest` | The heights that count, or null while the tip is below 10. |
 | `window.checked` | Heights in the window read so far. |

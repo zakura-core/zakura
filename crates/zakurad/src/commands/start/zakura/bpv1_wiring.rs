@@ -42,9 +42,12 @@ const SUBMIT_TIMEOUT: Duration = VERIFY_DEADLINE;
 ///
 /// BPv1 applies blocks under the same ownership rule as native block sync. It submits
 /// only while native sync owns block applies, and each submission is an apply the
-/// coordinator counts, so the legacy fallback drain waits for it. In `LegacyBootstrap`
-/// and during the legacy fallback the adapter submits nothing and returns
-/// [`VerifierVerdict::LocalCapacity`]: BPv1 releases the block, and legacy delivers it.
+/// coordinator counts, so the legacy fallback drain waits for it. When the fallback
+/// starts, the adapter stops waiting and transfers the submission to legacy, as native
+/// block sync does: a block that waits for its parent would otherwise hold the drain
+/// until the submit timeout. In `LegacyBootstrap` and during the legacy fallback the
+/// adapter submits nothing. Both cases return [`VerifierVerdict::LocalCapacity`]: BPv1
+/// releases the block, and legacy delivers it.
 pub(crate) struct RouterBlockVerifierAdapter<V> {
     router: V,
     coordinator: Arc<SyncCoordinator>,
@@ -67,8 +70,8 @@ where
 {
     fn submit(&self, block: OwnedBlock, _work_id: WorkId) -> PortFuture<'_, VerifierVerdict> {
         let router = self.router.clone();
-        let apply = self
-            .coordinator
+        let coordinator = self.coordinator.clone();
+        let apply = coordinator
             .queue_apply()
             .and_then(|operation| operation.accept());
         Box::pin(async move {
@@ -78,14 +81,22 @@ where
             };
             let commit =
                 router.oneshot(zakura_consensus::Request::Commit(BlockHandle::Owned(block)));
-            let verdict = match tokio::time::timeout(SUBMIT_TIMEOUT, commit).await {
-                Ok(Ok(_)) => VerifierVerdict::Valid,
-                Ok(Err(error)) => {
-                    classify_body_verification_class(block_verify_error_class(&error))
-                }
-                Err(_elapsed) => {
-                    metrics::counter!("sync.bpv1.submit.timeout").increment(1);
-                    VerifierVerdict::LocalCapacity
+            let verdict = tokio::select! {
+                biased;
+                result = tokio::time::timeout(SUBMIT_TIMEOUT, commit) => match result {
+                    Ok(Ok(_)) => VerifierVerdict::Valid,
+                    Ok(Err(error)) => {
+                        classify_body_verification_class(block_verify_error_class(&error))
+                    }
+                    Err(_elapsed) => {
+                        metrics::counter!("sync.bpv1.submit.timeout").increment(1);
+                        VerifierVerdict::LocalCapacity
+                    }
+                },
+                () = coordinator.wait_for_legacy_yield() => {
+                    metrics::counter!("sync.bpv1.submit.transferred_to_legacy").increment(1);
+                    apply.complete(BlockApplyTerminal::TransferredToLegacy);
+                    return VerifierVerdict::LocalCapacity;
                 }
             };
             apply.complete(match verdict {
@@ -163,7 +174,6 @@ mod tests {
         time::Duration,
     };
 
-    use tokio::sync::oneshot;
     use tower::service_fn;
     use zakura_chain::{block::Block, serialization::ZcashDeserializeInto};
     use zakura_network::zakura::bpv1::{BlockVerifierPort, VerifierVerdict, WorkId};
@@ -261,24 +271,14 @@ mod tests {
         assert_eq!(started.elapsed(), SUBMIT_TIMEOUT);
     }
 
-    /// The legacy fallback drain waits for a BPv1 submission, as it does for native
-    /// block sync's applies, so no BPv1 commit lands after legacy takes over.
+    /// The legacy fallback transfers a BPv1 submission that waits in the verifier, as it
+    /// does native block sync's applies, so the drain ends at once instead of at the
+    /// submit timeout. Once legacy owns applies, BPv1 submits nothing.
     #[tokio::test]
-    async fn the_legacy_fallback_drain_waits_for_a_bpv1_submission() {
+    async fn a_waiting_bpv1_submission_transfers_to_the_legacy_fallback() {
         let _init_guard = zakura_test::init();
-        let (release_tx, release_rx) = oneshot::channel::<()>();
-        let release_rx = Arc::new(std::sync::Mutex::new(Some(release_rx)));
-        let (router, calls) = counting_router(move |hash| {
-            let release = release_rx
-                .lock()
-                .expect("the test holds the lock briefly")
-                .take()
-                .expect("the router answers one submission");
-            Box::pin(async move {
-                let _ = release.await;
-                Ok(hash)
-            })
-        });
+        let (router, calls) =
+            counting_router(|_hash| Box::pin(std::future::pending::<Result<_, _>>()));
         let coordinator = SyncCoordinator::new();
         let adapter = Arc::new(RouterBlockVerifierAdapter::new(router, coordinator.clone()));
 
@@ -289,31 +289,17 @@ mod tests {
         while calls.load(Ordering::SeqCst) == 0 {
             tokio::task::yield_now().await;
         }
-        let fallback = tokio::spawn({
-            let coordinator = coordinator.clone();
-            async move {
-                coordinator
-                    .acquire_legacy_fallback(Duration::from_secs(60))
-                    .await
-            }
-        });
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(
-            !fallback.is_finished(),
-            "the drain waits for the BPv1 submission"
-        );
-
-        release_tx.send(()).expect("the router still waits");
+        let lease = tokio::time::timeout(
+            Duration::from_secs(10),
+            coordinator.acquire_legacy_fallback(Duration::from_secs(60)),
+        )
+        .await
+        .expect("the drain ends once the waiting submission transfers");
+        assert!(lease.is_ok());
         assert_eq!(
             submission.await.expect("the submission task finishes"),
-            VerifierVerdict::Valid
+            VerifierVerdict::LocalCapacity
         );
-        let lease = tokio::time::timeout(Duration::from_secs(10), fallback)
-            .await
-            .expect("the drain finishes once the submission completes")
-            .expect("the fallback task finishes");
-        assert!(lease.is_ok());
-        // A BPv1 submission while legacy owns applies submits nothing.
         assert_eq!(
             adapter.submit(owned_genesis(), WorkId(2)).await,
             VerifierVerdict::LocalCapacity

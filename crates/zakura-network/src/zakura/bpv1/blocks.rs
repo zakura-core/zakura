@@ -1955,7 +1955,7 @@ impl BlockTable {
             return;
         }
         // All concurrent slots actively collecting: drop cleanly without faulting the peer.
-        if !self.evict_for_slot(false, step) {
+        if !self.evict_for_slot(false, step) && !self.displace_for_next_block(height, step) {
             reject_meta(step, block_id, entry.from_peer, entry.session_gen);
             reject_also(step, block_id, &entry.also_from);
             return;
@@ -2030,6 +2030,34 @@ impl BlockTable {
                     .then(|| lowest(&[BlockPhase::Collecting, BlockPhase::Verifying]))
                     .flatten()
             });
+        match victim {
+            Some(id) => {
+                self.retire_block(id, step);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Frees a slot for the block whose parent is the verified tip (`bpv1-78`).
+    ///
+    /// That block is the next one the chain can commit, and every block above it
+    /// waits on it. When every slot is busy, it retires the highest block whose
+    /// parent is not committed, and block sync fetches that one instead. Returns
+    /// whether a slot is free.
+    fn displace_for_next_block(&mut self, height: u32, step: &mut BlockStep) -> bool {
+        if height != self.verified.saturating_add(1) {
+            return false;
+        }
+        let victim = self
+            .blocks
+            .values()
+            .filter(|b| {
+                matches!(b.phase, BlockPhase::Collecting | BlockPhase::Verifying)
+                    && b.height > height
+            })
+            .max_by_key(|b| b.height)
+            .map(|b| b.meta.block_id);
         match victim {
             Some(id) => {
                 self.retire_block(id, step);

@@ -3347,6 +3347,8 @@ fn decision19_push_crossing_a_direct_copy_drops_as_surplus() {
 //   the body, and BPv1 resubmits it once the parent commits. A resubmission's
 //   parent is always committed, so only a block's first submission can wait in
 //   the state's orphan queue.
+// - bpv1-78: in-window metadata whose parent is the verified tip is never
+//   refused because slots hold blocks waiting on parents.
 //
 // `service_tests` runs the handoff through the service, and `ports_tests` checks
 // that block sync wakes when a claim expires and that no retryable verdict
@@ -3580,6 +3582,54 @@ fn bpv1_77_verification_ends_by_its_deadline_and_frees_the_slot() {
     assert!(
         was_admitted(&freed, blocked),
         "a fallback block yields its slot"
+    );
+    table.assert_invariants();
+}
+
+/// bpv1-78: with every slot verifying blocks that wait on their parents, the
+/// block whose parent is the verified tip retires the highest of them. Other
+/// metadata displaces nothing.
+#[test]
+fn bpv1_78_the_next_block_displaces_a_block_waiting_on_its_parent() {
+    let t0 = Instant::now();
+    let empty = encode_body(&Profile::TINY, &[], 1).unwrap();
+    let (coding, root) = (empty.coding, empty.part_root);
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let verified = 100;
+    table.step(t0, BlockInput::TipHeight { height: verified });
+    for i in 0..4u8 {
+        let block_id = block::Hash([0xC2 + i; 32]);
+        let step = offer(
+            &mut table,
+            t0,
+            block_id,
+            verified + 2 + u32::from(i),
+            coding,
+            root,
+        );
+        assert!(was_admitted(&step, block_id));
+    }
+    let highest = block::Hash([0xC5; 32]);
+
+    let other = block::Hash([0xCE; 32]);
+    let refused = offer(&mut table, t0, other, verified + 3, coding, root);
+    assert!(!was_admitted(&refused, other));
+
+    let next = block::Hash([0xC1; 32]);
+    let step = offer(&mut table, t0, next, verified + 1, coding, root);
+    assert!(was_admitted(&step, next));
+    assert!(step
+        .events
+        .contains(&BlockEvent::Retired { block_id: highest }));
+    assert!(step.outputs.iter().any(|o| matches!(
+        o,
+        BlockOutput::ReleaseBodyClaim { block_id, reason: ClaimRelease::Retired }
+            if *block_id == highest
+    )));
+    assert_eq!(
+        submissions(&step).len(),
+        1,
+        "the next block verifies at once"
     );
     table.assert_invariants();
 }

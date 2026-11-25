@@ -2690,7 +2690,10 @@ async fn churn(bind: QuicBindConfig) -> (usize, usize) {
         stop.store(true, Ordering::Relaxed);
         sampler.await.unwrap();
 
-        tokio::time::timeout(Duration::from_secs(5), async {
+        // A later Initial can be admitted after the start of its hello was
+        // refused. That slot waits for its handshake deadline before draining.
+        let drain_timeout = test_config().handshake_timeout().unwrap() + Duration::from_secs(5);
+        tokio::time::timeout(drain_timeout, async {
             while server.connection_count() + server.closing_connection_count() > 0 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -3184,6 +3187,16 @@ async fn the_hybrid_hello_leaves_as_three_initial_datagrams() {
 /// completes its handshake on it alone, in one round trip.
 #[tokio::test(start_paused = true)]
 async fn the_listeners_first_flight_fits_the_padded_allowance() {
+    check_listener_first_flight(false).await;
+}
+
+/// Until the padding arrives, only the first 2,400 bytes can fund a reply.
+#[tokio::test(start_paused = true)]
+async fn the_listener_stays_within_the_byte_limit_until_padding_arrives() {
+    check_listener_first_flight(true).await;
+}
+
+async fn check_listener_first_flight(delay_padding: bool) {
     tokio::time::timeout(SIM_TEST_TIMEOUT, async {
         let net = sim_net();
         let _server =
@@ -3215,7 +3228,25 @@ async fn the_listeners_first_flight_fits_the_padded_allowance() {
             "the hello's two datagrams and the padding datagram"
         );
         tokio::time::sleep(Duration::from_millis(5)).await;
-        deliver_from(sim_addr(2));
+        if delay_padding {
+            let mut hello = net.deliverable();
+            hello.sort_by_key(|id| id.seq);
+            let [first, second, padding] = hello.as_slice() else {
+                panic!("expected the dialer's two hello datagrams and its padding");
+            };
+            net.deliver(*first).unwrap();
+            net.deliver(*second).unwrap();
+            settle().await;
+            let reply = sent(sim_addr(1));
+            assert!(reply > 0, "the listener can start replying to the hello");
+            assert!(
+                reply <= 3 * 2_400,
+                "sent {reply} bytes before padding arrived"
+            );
+            net.deliver(*padding).unwrap();
+        } else {
+            deliver_from(sim_addr(2));
+        }
         settle().await;
 
         let flight = sent(sim_addr(1));

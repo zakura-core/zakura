@@ -46,8 +46,9 @@ const SUBMIT_TIMEOUT: Duration = VERIFY_DEADLINE;
 /// starts, the adapter stops waiting and transfers the submission to legacy, as native
 /// block sync does: a block that waits for its parent would otherwise hold the drain
 /// until the submit timeout. In `LegacyBootstrap` and during the legacy fallback the
-/// adapter submits nothing. Both cases return [`VerifierVerdict::LocalCapacity`]: BPv1
-/// releases the block, and legacy delivers it.
+/// adapter submits nothing. Both cases return [`VerifierVerdict::LocalCapacity`], and
+/// legacy delivers the block. BPv1 releases it, or parks it while its parent is not
+/// committed (`bpv1-84`).
 pub(crate) struct RouterBlockVerifierAdapter<V> {
     router: V,
     coordinator: Arc<SyncCoordinator>,
@@ -162,6 +163,9 @@ pub(crate) fn build_bpv1_service(
         shutdown,
     )
 }
+
+#[cfg(test)]
+mod router_tests;
 
 #[cfg(test)]
 mod tests {

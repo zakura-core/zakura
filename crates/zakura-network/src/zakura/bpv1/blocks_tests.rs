@@ -3617,18 +3617,18 @@ fn decision19_push_crossing_a_direct_copy_drops_as_surplus() {
 //
 // - bpv1-76: BPv1 never admits or submits a block more than `PROPAGATION_DEPTH`
 //   above the verified tip.
-// - bpv1-77: every `Verifying` block reaches a verdict or its verification
+// - bpv1-82: every `Verifying` block reaches a verdict or its verification
 //   deadline, then frees its slot.
 // - bpv1-44: for a block BPv1 admits, block sync fetches no body until BPv1
 //   releases the claim by fallback, repair, retirement, or commit.
 // - bpv1-57: when BPv1 fails a block, it releases the claim at the deadline of
 //   the block's phase, so block sync fetches it within one fetch.
-// - bpv1-79: a retryable verdict on a block whose parent is not committed keeps
+// - bpv1-83: in-window metadata whose parent is the verified tip is never
+//   refused because slots hold blocks waiting on parents.
+// - bpv1-84: a retryable verdict on a block whose parent is not committed keeps
 //   the body, and BPv1 resubmits it once the parent commits. A resubmission's
 //   parent is always committed, so only a block's first submission can wait in
 //   the state's orphan queue.
-// - bpv1-78: in-window metadata whose parent is the verified tip is never
-//   refused because slots hold blocks waiting on parents.
 //
 // `service_tests` runs the handoff through the service, and `ports_tests` checks
 // that block sync wakes when a claim expires and that no retryable verdict
@@ -3775,13 +3775,13 @@ fn bpv1_44_the_body_claim_covers_verification() {
     table.assert_invariants();
 }
 
-/// bpv1-76 and bpv1-77 during catch-up: the best header runs 20 blocks ahead of
+/// bpv1-76 and bpv1-82 during catch-up: the best header runs 20 blocks ahead of
 /// the verified tip. BPv1 refuses the tip block, and four blocks inside both
 /// windows wait on a verifier that never answers. At the verification deadline each
 /// falls back, releases its claim, and frees its slot, and a late verdict
 /// changes nothing.
 #[test]
-fn bpv1_77_verification_ends_by_its_deadline_and_frees_the_slot() {
+fn bpv1_82_verification_ends_by_its_deadline_and_frees_the_slot() {
     let t0 = Instant::now();
     let claims = SharedBodyClaims::new();
     let empty = encode_body(&Profile::TINY, &[], 1).unwrap();
@@ -3866,11 +3866,11 @@ fn bpv1_77_verification_ends_by_its_deadline_and_frees_the_slot() {
     table.assert_invariants();
 }
 
-/// bpv1-78: with every slot verifying blocks that wait on their parents, the
+/// bpv1-83: with every slot verifying blocks that wait on their parents, the
 /// block whose parent is the verified tip retires the highest of them. Other
 /// metadata displaces nothing.
 #[test]
-fn bpv1_78_the_next_block_displaces_a_block_waiting_on_its_parent() {
+fn bpv1_83_the_next_block_displaces_a_block_waiting_on_its_parent() {
     let t0 = Instant::now();
     let empty = encode_body(&Profile::TINY, &[], 1).unwrap();
     let (coding, root) = (empty.coding, empty.part_root);
@@ -3914,12 +3914,73 @@ fn bpv1_78_the_next_block_displaces_a_block_waiting_on_its_parent() {
     table.assert_invariants();
 }
 
-/// bpv1-79: a retryable verdict on a block whose parent is not committed keeps
+/// bpv1-83 bounds what competing metadata at the next height can evict. Each
+/// sibling retires one block above that height, a retired block never takes a
+/// slot again, and siblings never displace each other.
+#[test]
+fn bpv1_83_siblings_of_the_next_block_evict_each_block_above_it_once() {
+    let t0 = Instant::now();
+    let empty = encode_body(&Profile::TINY, &[], 1).unwrap();
+    let (coding, root) = (empty.coding, empty.part_root);
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let verified = 100;
+    table.step(t0, BlockInput::TipHeight { height: verified });
+    let above: Vec<block::Hash> = (0..4u8).map(|i| block::Hash([0xF2 + i; 32])).collect();
+    for (i, &block_id) in above.iter().enumerate() {
+        let height = verified + 2 + u32::try_from(i).unwrap();
+        assert!(was_admitted(
+            &offer(&mut table, t0, block_id, height, coding, root),
+            block_id
+        ));
+    }
+
+    let mut retired = Vec::new();
+    for i in 0..4u8 {
+        let sibling = block::Hash([0xE0 + i; 32]);
+        let step = offer(&mut table, t0, sibling, verified + 1, coding, root);
+        assert!(was_admitted(&step, sibling));
+        retired.extend(step.events.iter().filter_map(|e| match e {
+            BlockEvent::Retired { block_id } => Some(*block_id),
+            _ => None,
+        }));
+    }
+    let highest_first: Vec<block::Hash> = above.iter().rev().copied().collect();
+    assert_eq!(
+        retired, highest_first,
+        "each block above, highest first, once"
+    );
+
+    let fifth = block::Hash([0xE9; 32]);
+    let refused = offer(&mut table, t0, fifth, verified + 1, coding, root);
+    assert!(
+        !was_admitted(&refused, fifth),
+        "a sibling displaces no sibling"
+    );
+    assert!(!refused
+        .events
+        .iter()
+        .any(|e| matches!(e, BlockEvent::Retired { .. })));
+
+    // A retired block's metadata starts no admission, so it cannot thrash.
+    let again = table.step(
+        t0,
+        BlockInput::MetaReceived {
+            envelope: make_envelope(above[3], coding, root, node_id(1)),
+            from_peer: node_id(1),
+            session_gen: 1,
+        },
+    );
+    assert!(again.outputs.is_empty() && again.events.is_empty());
+    assert_eq!(table.block_phase(&above[3]), Some(BlockPhase::Retired));
+    table.assert_invariants();
+}
+
+/// bpv1-84: a retryable verdict on a block whose parent is not committed keeps
 /// the assembled body and the claim. BPv1 resubmits the same body once the
 /// verified tip reaches the parent, and not before. A retryable verdict with the
 /// parent committed falls back.
 #[test]
-fn bpv1_79_a_retryable_verdict_keeps_the_body_until_the_parent_commits() {
+fn bpv1_84_a_retryable_verdict_keeps_the_body_until_the_parent_commits() {
     let t0 = Instant::now();
     let claims = SharedBodyClaims::new();
     let encoded = encode_body(&Profile::TINY, &[0x66; 128], 2).unwrap();
@@ -4028,10 +4089,10 @@ fn bpv1_79_a_retryable_verdict_keeps_the_body_until_the_parent_commits() {
     table.assert_invariants();
 }
 
-/// bpv1-77: a parked block whose parent never commits falls back at its
+/// bpv1-82: a parked block whose parent never commits falls back at its
 /// verification deadline.
 #[test]
-fn bpv1_77_a_parked_block_falls_back_at_its_verification_deadline() {
+fn bpv1_82_a_parked_block_falls_back_at_its_verification_deadline() {
     let t0 = Instant::now();
     let empty = encode_body(&Profile::TINY, &[], 1).unwrap();
     let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));

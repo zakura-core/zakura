@@ -335,7 +335,7 @@ async fn fix4_committed_snapshot_ends_a_fallback_block() {
     let shutdown = CancellationToken::new();
     let (handle_a, handle_b, snapshots_b) =
         proposer_and_follower(VerifierVerdict::LocalCapacity, &shutdown);
-    // With its parent committed, a retryable verdict falls back (bpv1-79).
+    // With its parent committed, a retryable verdict falls back (bpv1-84).
     let parent = Frontier::new(Height(9), block::Hash([0x09; 32]));
     snapshots_b.send_replace(Some(engine_snapshot(parent, parent)));
 
@@ -496,13 +496,13 @@ impl BlockVerifierPort for ParentWaitingVerifier {
     }
 }
 
-/// The catch-up handoff (bpv1-76, bpv1-44, bpv1-77): while B's verified tip is
+/// The catch-up handoff (bpv1-76, bpv1-44, bpv1-82): while B's verified tip is
 /// more than `PROPAGATION_DEPTH` below a tip block, B leaves the block to block
 /// sync. Once block sync brings the verified tip close, B admits the next tip
 /// block and submits it once. The body claim covers the verifier's wait for the
 /// parent, and the block commits when the parent does.
 #[tokio::test]
-async fn bpv1_77_a_caught_up_node_verifies_the_next_tip_block_once() {
+async fn bpv1_82_a_caught_up_node_verifies_the_next_tip_block_once() {
     let shutdown = CancellationToken::new();
     let height = 40;
     let header_best = Frontier::new(Height(height - 1), block::Hash([0x27; 32]));

@@ -410,6 +410,60 @@ fn best_header_jumping_past_the_parent_wakes_the_child() {
     table.assert_invariants();
 }
 
+/// The best header can move past the parent while the child's admission or
+/// unknown-parent checks run, before the child parks. That move woke nothing,
+/// so the child retries admission instead of parking until it ages out.
+#[test]
+fn best_header_moving_during_the_checks_retries_admission() {
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let now = Instant::now();
+    let parent = block::Hash([0x55; 32]);
+    let child = block::Hash([0x56; 32]);
+    let coding = Profile::TINY.derive_coding(64, 2).unwrap();
+    table.step(
+        now,
+        BlockInput::ParentAdmitted {
+            hash: block::Hash([0x54; 32]),
+            height: 9,
+        },
+    );
+    let received = receive(
+        &mut table,
+        now,
+        make_envelope(child, coding, [0xAA; 32], node_id(1)),
+    );
+    let checking = header_result(
+        &mut table,
+        now,
+        &received,
+        HeaderAdmissionResult::MissingParent {
+            parent_hash: parent,
+        },
+    );
+    let moved = table.step(
+        now,
+        BlockInput::ParentAdmitted {
+            hash: child,
+            height: 11,
+        },
+    );
+    assert!(moved.outputs.is_empty(), "nothing is pending yet");
+
+    let retried = unknown_parent_checked(&mut table, now, &checking, UnknownParentVerdict::Park);
+    assert_eq!(table.pending_meta_len(), 0);
+    let admitted = header_result(
+        &mut table,
+        now,
+        &retried,
+        HeaderAdmissionResult::Admitted { height: 11 },
+    );
+    let committed = commitment_ok(&mut table, now, &admitted);
+    assert!(committed
+        .events
+        .contains(&BlockEvent::BlockAdmitted { block_id: child }));
+    table.assert_invariants();
+}
+
 /// An entry that a wake retries and that parks again keeps its first
 /// deadline, so retries never extend its life, and it skips the checks it
 /// already passed.
@@ -649,9 +703,10 @@ fn invalid_header_closes_every_session_that_sent_it() {
 }
 
 /// Metadata whose parent header is unknown parks only after its checks pass
-/// (#2715). An out-of-range height drops it without fault. A failed target or
-/// proof of work closes every session that sent the header, and a failed
-/// binding closes every session that sent that same binding (bpv1-61).
+/// (#2715). An out-of-range height or a target above the bound drops it
+/// without fault. A failed proof of work closes every session that sent the
+/// header, and a failed binding closes every session that sent that same
+/// binding (bpv1-61).
 #[test]
 fn unknown_parent_verdicts_park_drop_or_close() {
     let now = Instant::now();
@@ -697,7 +752,7 @@ fn unknown_parent_verdicts_park_drop_or_close() {
     assert!(parked.outputs.is_empty());
 
     let dropped_id = block::Hash([0x42; 32]);
-    let (table, dropped) = check(UnknownParentVerdict::OutOfRange, dropped_id);
+    let (table, dropped) = check(UnknownParentVerdict::Drop, dropped_id);
     assert_eq!(table.pending_meta_len(), 0);
     assert_eq!(table.admitting_meta_len(), 0);
     assert_eq!(rejected_sessions(&dropped, dropped_id), both);

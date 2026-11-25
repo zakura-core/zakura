@@ -38,7 +38,7 @@ pub enum Bpv1CloseRow {
     /// header that does not parse.
     Row2Decode = 2,
     /// `bpv1-close-3`: `HeaderMeta` whose header headerchain classifies as peer-invalid,
-    /// or whose target or proof of work fails while its parent is unknown.
+    /// or whose proof of work fails while its parent is unknown.
     Row3InvalidHeader = 3,
     /// `bpv1-close-4`: `HeaderMeta` layout mismatch or failed coinbase
     /// commitment. It closes every session whose copy equals the failing

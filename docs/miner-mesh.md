@@ -190,9 +190,13 @@ counts, the places it holds, and its v2 peers. In this example the node has
 
 A gateway that blocks name by an earlier node ID is reported as connected,
 and in its place, while a connection that proved that ID lasts, in either
-direction and even after the earlier address record is evicted. `peers` lists
-the connection under the node ID the gateway has now. Two distinct known IDs
-with the same gateway prefix still make it ambiguous.
+direction and even after the earlier address record is evicted. While a dial
+to the earlier ID is still in flight, the report follows that dial. `peers`
+lists the connection under the node ID the gateway has now. While blocks name
+a gateway by both its earlier and its new node ID, both rows show the one
+connected node, which fills one place and counts once in `hold`. Two distinct
+known IDs with the same gateway prefix still make a gateway ambiguous, and so
+do two connected nodes that proved its ID, until the next ranking is applied.
 
 A gateway's `state` reads its standing in v2 networking together with the
 preferred set:

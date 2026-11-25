@@ -334,26 +334,36 @@ impl HandshakeCounts {
     /// The caller answers for the gateway its node ID names and for the
     /// gateways its earlier IDs name. A granted claim records it as their
     /// connected node for the place and for later cutoff ties. A refusal
-    /// restores the previous ranking. Each member
+    /// leaves the ranking as it was. Each member
     /// counts one preferred slot, so preferred slots never pass the hold. A member the
-    /// caller displaces keeps its slot, now ordinary, which can leave the
+    /// caller outranks keeps its slot, now ordinary, which can leave the
     /// ordinary slots one over `cap` until a slot frees. That
     /// is bounded by the hold and passes, as after a published set change.
+    ///
+    /// A caller that makes a gateway ambiguous is not outranking anyone: a
+    /// second node of one key holder answers for the gateway. It is refused
+    /// when the member's slot would then be an ordinary one above `cap`, as
+    /// a dial is in [`Self::outbound_connected`].
     pub fn claim_inbound_connection(
         &mut self,
         caller: ProvenNode<'_>,
         cap: usize,
     ) -> Result<SlotClass, SlotRefusal> {
-        let before = self
-            .connected_ranking(caller, None)
-            .map(|formed| std::mem::replace(&mut self.preferred, formed));
-        let claim = self
-            .connections
-            .claim(caller.id(), true, cap, &self.preferred);
-        match (claim, before) {
-            (Ok(_), _) => self.record_proof(caller),
-            (Err(_), Some(before)) => self.preferred = before,
-            (Err(_), None) => {}
+        let formed = self.connected_ranking(caller, None);
+        let counted_under = formed.as_ref().unwrap_or(&self.preferred);
+        let disputes = counted_under.ambiguous() > self.preferred.ambiguous();
+        let claim = if disputes {
+            self.connections
+                .claim_disputing(caller.id(), cap, &self.preferred, counted_under)
+        } else {
+            self.connections
+                .claim(caller.id(), true, cap, counted_under)
+        };
+        if claim.is_ok() {
+            if let Some(formed) = formed {
+                self.preferred = formed;
+            }
+            self.record_proof(caller);
         }
         claim
     }

@@ -11,6 +11,10 @@ use zakura_quic::{NodeId, MAX_EARLIER_NODE_IDS};
 /// The node ID a connection's peer has now, and the earlier IDs its
 /// handshake proved it still answers to.
 ///
+/// The earlier IDs are those of every shorter list of the peer's keys that
+/// keeps its signing keys. The IDs the node had before it added keys are
+/// among them, and nobody without the signing keys can prove any of them.
+///
 /// Only zakura-quic decides which earlier IDs a handshake proves, and it
 /// reports at most [`MAX_EARLIER_NODE_IDS`] of them. A node ID alone
 /// converts to a node that proved no earlier ID.

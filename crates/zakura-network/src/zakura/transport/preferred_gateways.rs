@@ -16,7 +16,8 @@
 //! handshake proved ([`ProvenNode`]), and keeps the gateway's place under the
 //! ID it has now. Two connected nodes that answer for one gateway make it
 //! ambiguous like two nodes that share its ID, so one key holder never fills
-//! more than the one place.
+//! more than the one place. A gateway stays ambiguous until the next ranking
+//! is applied, which resolves it again from the nodes connected then.
 //!
 //! This module only decides how many places are held and which gateways may
 //! fill them. The connection-slot checks in `handshake_counts` apply that
@@ -482,6 +483,16 @@ impl PreferredGateways {
     /// The connection places held for the preferred set.
     pub fn hold(&self) -> usize {
         self.hold
+    }
+
+    /// How many ranked gateways are ambiguous. A connection can make a
+    /// gateway ambiguous and only a new ranking resolves it again, so a
+    /// higher count after a proof means the proof disputed a gateway.
+    pub(super) fn ambiguous(&self) -> usize {
+        self.ranking
+            .iter()
+            .filter(|gateway| gateway.resolution == GatewayMatch::Several)
+            .count()
     }
 
     /// The preferred set, in rank order, each node once. It never has more

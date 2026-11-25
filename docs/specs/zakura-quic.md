@@ -399,7 +399,10 @@ at fork tag `zakura-iroh-v1.1.0-rc.1`, and it keeps their MIT/Apache-2.0 notices
   dialed one. `Conn::remote_earlier_ids()` returns the other IDs the
   handshake proved, on a dial and on an accepted connection: each ID that
   TLS-7 would accept for this credential and the keys the peer signed with,
-  apart from `remote_id()`. One enumeration of the credential's lists
+  apart from `remote_id()`. That is the ID of every shorter list of the
+  credential's entries that keeps the signing keys, whether or not the node
+  ever used it, and only the holder of those keys can prove any of them.
+  One enumeration of the credential's lists
   answers both the dial's check and this report, so they can't disagree. A
   credential holds 4 entries and the composite signs with two, so a
   handshake proves at most 3 earlier IDs.
@@ -999,12 +1002,15 @@ is today's Zakura logic.
      ID it has now, on a dial and on a call in. A gateway that two or more
      connected nodes answer for is ambiguous and holds no place, as when
      two nodes share its ID, so one key holder's nodes never fill more
-     than the gateway's one place. Gateways that name one node count once
-     towards the hold and the node fills one place. While a dial to the
-     earlier ID is in flight, the gateway goes on naming that ID and the
-     dial settles it. A caller whose proof would turn a held slot into an
-     ordinary one above the ordinary limit is refused its slot, and a dial
-     closes as DIAL-9 says.
+     than the gateway's one place. An ambiguous gateway is resolved again
+     when the next ranking is applied. Gateways that name one node count
+     once towards the hold and the node fills one place. While a dial to
+     the earlier ID is in flight, the gateway goes on naming that ID and
+     the dial settles it. A proof that makes a gateway ambiguous leaves
+     its member's slot an ordinary one. When that would add an ordinary
+     slot above the ordinary limit, a caller is refused its slot and a
+     dial closes as DIAL-9 says, whichever place the new node itself would
+     fill.
 
   The proven IDs are kept while the connection holds its slot or its
   registration, at most 3 for each. An inbound moved peer isn't linked to
@@ -1656,7 +1662,7 @@ this release tolerates, and keep each hard change explicit.
 | The largest credential a node can authenticate with, 32 entries in 10,385 bytes, completes a handshake in both directions on loopback, and in the simulator when every burst of datagrams arrives in reverse, in two round trips where the listener's flight passes the padded allowance. With 128 bytes standing in for the transport parameters, its flights are 14,035 bytes from the listener and 13,864 from the dialer, inside the 16 KiB `quinn-proto` buffers | ID-12, DIAL-8 |
 | When the datagram that starts the listener's ServerHello is lost, a dial to a listener with this release's credential completes, and a dial to a listener with the largest credential fails at the handshake deadline, with both connections released and a bounded number of bytes sent | ID-12, ADM-6, COMPAT-13 |
 | A dial to a node's earlier ID registers the node once under its ID now, with the connection slot under that ID; a second such dial to a registered node ends before its control handshake and neither end's registered connection changes; an attempt follows the moved node's registration, a bootstrap supervisor and a dial round leave a registered moved node alone, and both of its book entries are credited | DIAL-9 |
-| A gateway named by its earlier ID fills its held place under its new ID with the ordinary slots full, on a dial and on a call in, and takes it again after a restart under either ID; a node that didn't prove the gateway's ID gets no place and no slot above the ordinary limit; two connected nodes that answer for one gateway hold no place, in either order, and the second is refused while that would pass the ordinary limit; a node two gateways name fills one place; a registration carries its proven earlier IDs to the peer registry in both directions, and a pin by an earlier ID counts as connected with its address exempt | DIAL-9, DIAL-10 |
+| A gateway named by its earlier ID fills its held place under its new ID with the ordinary slots full, on a dial and on a call in, and takes it again after a restart under either ID; a node that didn't prove the gateway's ID gets no place and no slot above the ordinary limit; two connected nodes that answer for one gateway hold no place, in either order, and the second is refused while that would pass the ordinary limit, on a call in and on a dial, also when it fills a place of its own; a node two gateways name fills one place; a registration carries its proven earlier IDs to the peer registry in both directions, and a pin by an earlier ID counts as connected with its address exempt | DIAL-9, DIAL-10 |
 | A composite signature verifies only whole: a tampered Ed25519 or ML-DSA half, a truncated signature, another node's key in either half, a credential without an ML-DSA-65 key, and one whose tag-3 entry isn't 1,952 bytes are refused; the ML-DSA seed derivation has a known answer | TLS-4, ID-11, ID-12, ID-13 |
 | ML-DSA-65 key generation, signing and verification give a subset of Project Wycheproof's and NIST ACVP's known answers, each under its own context: seeded keys and deterministic and hedged signatures match, and a 256-byte context, wrong-length keys and signatures, a flipped commitment hash, a bad hint encoding and an out-of-bound response are refused | TLS-4, ID-13 |
 | Signatures that RustCrypto `ml-dsa` 0.1.2 made under the TLS-4 context, recorded offline, are reproduced byte for byte and verify, and its public key for the same seed matches | TLS-4, ID-13 |

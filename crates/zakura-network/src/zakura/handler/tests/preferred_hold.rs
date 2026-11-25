@@ -1000,6 +1000,72 @@ fn the_exact_id_and_a_node_that_proved_it_share_one_place_at_most() {
     }
 }
 
+/// One key holder runs the node with a gateway's exact ID and a second node
+/// that proved that ID, and blocks name the second node's own gateway ID as
+/// well. The second node calls in: it fills its own gateway's place, and its
+/// proof makes the first gateway ambiguous, which would leave the first
+/// node's slot an ordinary one above the limit. The call is refused and
+/// nothing changes, as a dial that reached that node would be. With an
+/// ordinary slot free for the first node, the call is granted.
+#[test]
+fn a_caller_that_makes_another_gateway_ambiguous_adds_no_slot_above_the_ordinary_limit() {
+    let handler = handler(40, 2);
+    let (exact, second, other) = (new_node(), new_node(), new_node());
+    let proved = [exact];
+    let caller = ProvenNode::new(second, &proved);
+    let ranking = [
+        (exact, GatewayStanding::Dialable),
+        (second, GatewayStanding::Dialable),
+        (other, GatewayStanding::Dialable),
+    ];
+    publish(&handler, &ranking);
+    let mut peers = fill(&handler, 40, false);
+    let _exact = handler.claim_connection(exact, true).expect("held place");
+    let one_held = SlotSplit {
+        preferred: 1,
+        ordinary: 40,
+        ordinary_inbound: 0,
+    };
+    assert_eq!(split(&handler), one_held);
+    assert_eq!(preferred_set(&handler), [exact, second]);
+
+    assert_eq!(
+        handler.claim_slot(caller, true).map(drop),
+        Err(SlotRefusal::Hold)
+    );
+    assert_eq!(split(&handler), one_held, "the refusal changed nothing");
+    assert_eq!(preferred_set(&handler), [exact, second]);
+    // A dial that reached the second node meets the same limit.
+    let mut dial = handler
+        .claim_connection(second, false)
+        .expect("the second gateway's held place");
+    assert_eq!(dial.outbound_connected(caller), Err(SlotRefusal::Hold));
+    drop(dial);
+    assert_eq!(split(&handler), one_held);
+
+    peers.pop();
+    let _second = handler
+        .claim_slot(caller, true)
+        .expect("the first node's slot fits in the ordinary slots");
+    assert_eq!(
+        split(&handler),
+        SlotSplit {
+            preferred: 1,
+            ordinary: 40,
+            ordinary_inbound: 1,
+        }
+    );
+    assert_eq!(preferred_set(&handler), [second, other]);
+    assert_eq!(
+        places(&handler),
+        [
+            GatewayPlace::Ambiguous,
+            GatewayPlace::Preferred,
+            GatewayPlace::Preferred
+        ]
+    );
+}
+
 /// While blocks name a node by its earlier ID and by the ID it has now, two
 /// ranked gateways name the one connected node. It fills one place with its
 /// one slot, and the slot counts never disagree with the slots held.

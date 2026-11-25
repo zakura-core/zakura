@@ -284,11 +284,11 @@ impl NodeCredential {
 
     /// The node IDs that a handshake signed with the keys under
     /// `signing_tags` proves this credential's holder answers to (TLS-7):
-    /// the credential's own ID first, then each ID the node had before it
-    /// added its other entries.
+    /// the credential's own ID first, then the ID of each shorter list of
+    /// its entries that includes every signing key. Those are the IDs the
+    /// node had, or could have had, before it added its other entries.
     ///
-    /// Each ID names a list of this credential's entries that includes every
-    /// signing key. An ID whose list leaves a signing key out is not among
+    /// An ID whose list leaves a signing key out is not among
     /// them: whoever added that key to another node's entries could
     /// otherwise sign as that node. Empty unless the credential holds each
     /// signing key in full, since a fingerprint verifies no signature.

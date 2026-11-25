@@ -630,6 +630,16 @@ impl Bpv1Handle {
         true
     }
 
+    /// Retires `block_id` if this node proposed it, because its local commit
+    /// failed after [`Self::publish_solved_block`] started relaying it.
+    ///
+    /// Retirement drops the parts still queued to peers, ends their `Want`s,
+    /// and keeps the block out of the replay to sessions that connect later.
+    pub fn retire_failed_block(&self, block_id: block::Hash) {
+        self.node
+            .apply_block_input(BlockInput::ProposedCommitFailed { block_id });
+    }
+
     /// Number of currently live BPv1 peer sessions.
     #[cfg(any(test, zakura_sim))]
     pub fn live_sessions(&self) -> usize {
@@ -773,6 +783,10 @@ impl zakura_node_services::bpv1_proposer::Bpv1ProposerHook for Bpv1Handle {
 
     fn publish_solved_block(&self, block: Arc<Block>, height: Height) -> bool {
         Bpv1Handle::publish_solved_block(self, &block, height.0)
+    }
+
+    fn retire_failed_block(&self, hash: block::Hash) {
+        Bpv1Handle::retire_failed_block(self, hash);
     }
 }
 

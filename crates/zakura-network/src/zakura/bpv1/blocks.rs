@@ -526,6 +526,12 @@ pub enum BlockInput {
         /// Committed block.
         block_id: block::Hash,
     },
+    /// The local commit of a block this node proposed failed after BPv1
+    /// published it; retires the block so it is no longer served (`bpv1-45`).
+    ProposedCommitFailed {
+        /// The proposed block.
+        block_id: block::Hash,
+    },
     /// Periodic / timer tick: ages pending metadata, advances stall/repair ladder, enforces deadlines.
     Tick {
         /// Snapshot of live peers' pull capacities for repair pulls.
@@ -1551,6 +1557,9 @@ impl BlockTable {
             }
             BlockInput::FallbackDone { block_id } => {
                 self.handle_fallback_done(block_id, &mut step);
+            }
+            BlockInput::ProposedCommitFailed { block_id } => {
+                self.handle_proposed_commit_failed(block_id, &mut step);
             }
             BlockInput::Tick { peer_states } => {
                 self.handle_tick(now, &peer_states, &mut step);
@@ -2775,6 +2784,18 @@ impl BlockTable {
     /// complete body to relay, so it retires at once and frees its slot.
     fn handle_fallback_done(&mut self, block_id: block::Hash, step: &mut BlockStep) {
         if self.block_phase(&block_id) == Some(BlockPhase::Fallback) {
+            self.retire_block(block_id, step);
+        }
+    }
+
+    fn handle_proposed_commit_failed(&mut self, block_id: block::Hash, step: &mut BlockStep) {
+        // Only the proposer's own copy: a peer's copy of the same block has
+        // its own verdict.
+        if self
+            .blocks
+            .get(&block_id)
+            .is_some_and(|block| block.as_proposer)
+        {
             self.retire_block(block_id, step);
         }
     }

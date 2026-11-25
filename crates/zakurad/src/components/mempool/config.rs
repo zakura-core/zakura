@@ -55,10 +55,11 @@ pub struct Config {
 
     /// Which pool the node runs.
     ///
-    /// `default` is the node's choice, which is `classic` in this release. What
-    /// `default` means can change in a later release. `classic` is the pool
-    /// nodes have run so far. `core` runs the pool core, which is new and off
-    /// unless chosen here.
+    /// `default` is the node's choice. In this release that is `core` when the
+    /// P2P stack runs v2 (`dual` or `zakura`), and `classic` on a legacy-only
+    /// stack. What `default` means can change in a later release. `classic`
+    /// is the pool nodes have run so far, and setting it is the rollback.
+    /// `core` runs the pool core on any stack.
     pub implementation: Implementation,
 }
 
@@ -76,9 +77,13 @@ pub enum Implementation {
 }
 
 impl Implementation {
-    /// The pool this setting runs: `Default` resolved for this release.
-    pub fn resolve(self) -> Self {
+    /// The pool this setting runs on a node whose P2P stack runs v2 exactly
+    /// when `v2_p2p` is true. `Default` resolves to `Core` on a v2 stack,
+    /// where `tx-relay` can carry the pool's transactions, and to `Classic`
+    /// on a legacy-only one.
+    pub fn resolve(self, v2_p2p: bool) -> Self {
         match self {
+            Self::Default if v2_p2p => Self::Core,
             Self::Default | Self::Classic => Self::Classic,
             Self::Core => Self::Core,
         }
@@ -127,3 +132,56 @@ pub const DEFAULT_MAX_TRANSACTION_BYTES: u64 = 250_000;
 /// Equivalent to zcashd's `MAX_OP_RETURN_RELAY`:
 /// <https://github.com/zcash/zcash/blob/v6.10.0/src/script/standard.h#L22-L26>
 pub const DEFAULT_MAX_DATACARRIER_BYTES: u32 = 83;
+
+#[cfg(test)]
+mod tests {
+    use zakura_chain::parameters::Network;
+    use zakura_network::{Config as NetworkConfig, P2pStack};
+
+    use super::Implementation;
+
+    /// The pool each setting runs, with each network's default stack and with
+    /// each stack set explicitly.
+    #[test]
+    fn default_runs_the_core_exactly_where_v2_runs() {
+        let networks = [
+            Network::Mainnet,
+            Network::new_default_testnet(),
+            Network::new_regtest(Default::default()),
+        ];
+        for network in networks {
+            for stack in [
+                P2pStack::Default,
+                P2pStack::Legacy,
+                P2pStack::Dual,
+                P2pStack::Zakura,
+            ] {
+                let v2_p2p = NetworkConfig {
+                    network: network.clone(),
+                    p2p_stack: stack,
+                    ..NetworkConfig::default()
+                }
+                .v2_p2p();
+                let legacy_only = matches!(stack, P2pStack::Legacy)
+                    || (matches!(stack, P2pStack::Default) && network == Network::Mainnet);
+                let expected_default = if legacy_only {
+                    Implementation::Classic
+                } else {
+                    Implementation::Core
+                };
+
+                for (setting, expected) in [
+                    (Implementation::Default, expected_default),
+                    (Implementation::Classic, Implementation::Classic),
+                    (Implementation::Core, Implementation::Core),
+                ] {
+                    assert_eq!(
+                        setting.resolve(v2_p2p),
+                        expected,
+                        "{setting:?} on {network:?} with {stack:?}",
+                    );
+                }
+            }
+        }
+    }
+}

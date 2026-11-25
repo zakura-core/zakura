@@ -559,11 +559,13 @@ fn rank(
             }
         })
         .collect();
-    let ranking = (0..NODES).map(|node| RankedGateway {
-        node: nodes[node],
-        // `NODES` is a small constant, so the count fits.
-        blocks: (NODES - node) as u32,
-        standing: standings[node],
+    let ranking = (0..NODES).map(|node| {
+        RankedGateway::resolved(
+            nodes[node],
+            // `NODES` is a small constant, so the count fits.
+            (NODES - node) as u32,
+            standings[node],
+        )
     });
     let formed = PreferredGateways::form(ranking, hold_limit);
     assert!(formed.set().len() <= formed.hold(), "{PREFERRED_PROPERTY}");

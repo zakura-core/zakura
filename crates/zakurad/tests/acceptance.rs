@@ -4390,3 +4390,101 @@ async fn zcashd_compat_reorg_context_zakura_tip_behind_recovers() -> Result<()> 
 async fn zcashd_compat_reorg_churn() -> Result<()> {
     common::zcashd_compat::reorg::churn().await
 }
+
+/// Startup survives every way a default seed's retired v2 node ID can reach the config:
+/// a file zakurad rewrites, a file it cannot rewrite, and an environment override. In
+/// each case the node keeps running until it is killed.
+#[test]
+fn retired_seed_ids_never_stop_startup() -> Result<()> {
+    use std::{fs, io::Write as _, process::Stdio};
+
+    use tempfile::TempDir;
+    use zakura_test::command::{test_cmd, CommandExt as _};
+
+    let _init_guard = zakura_test::init();
+    // asia-0's node ID before and since p2p-v2/4.
+    let retired = "1398f62c6d1a457c51ba6a4b5f3dbd2f69fca93216218dc8997e416bd17d93ca";
+    let current = "a5f148b592404c5fcdc27f06919681c1dceddb274336abf5c91e70780471bc12";
+    let retired_entry = format!("{retired}@127.0.0.1:1");
+    let rewritten = regex::escape("rewrote default seeds' retired node IDs");
+    let not_rewritten = regex::escape("could not rewrite the config file");
+    let warning = regex::escape("names a default seed by the node ID it had before");
+
+    // Runs `start` with `env` and waits for lines matching each of `expected` in order.
+    // The replacement logs before "Starting zakurad", so its lines come first. Killing the
+    // node then shows it was still running. Returns the matched lines.
+    let start = |dir: &TempDir, env: &[(&str, &str)], expected: &[&str]| -> Result<Vec<String>> {
+        let config_path = dir.path().join("zakura.toml");
+        let mut command = test_cmd(&common::zakurad_exe_path(), dir.path())?;
+        command
+            .args([
+                "-c",
+                config_path.to_str().expect("temp path is Unicode"),
+                "start",
+            ])
+            .envs(env.iter().copied())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command
+            .spawn2(dir, common::zakurad_exe_path())?
+            .with_timeout(EXTENDED_LAUNCH_DELAY);
+        let matched = expected
+            .iter()
+            .map(|regex| child.expect_stdout_line_matches(*regex))
+            .collect::<Result<Vec<_>>>()?;
+        child.kill(false)?;
+        child
+            .wait_with_output()?
+            .assert_failure()?
+            .assert_was_killed()?;
+        Ok(matched)
+    };
+
+    // A file with a retired ID is rewritten in place, and nothing is left to warn about.
+    let mut config = default_test_config(&Mainnet);
+    config.network.zakura.bootstrap_peers = vec![retired_entry.clone()];
+    let dir = testdir()?.with_config(&mut config)?;
+    let matched = start(
+        &dir,
+        &[],
+        &[rewritten.as_str(), &format!("{warning}|Starting zakurad")],
+    )?;
+    assert!(matched[1].contains("Starting zakurad"), "{}", matched[1]);
+    let file = fs::read_to_string(dir.path().join("zakura.toml"))?;
+    assert!(file.contains(current) && !file.contains(retired), "{file}");
+
+    // A file the rewrite cannot read as UTF-8 still loads, since the loader is lossy.
+    // Startup warns, leaves the file alone and dials the current ID.
+    let dir = testdir()?.with_config(&mut config)?;
+    let config_path = dir.path().join("zakura.toml");
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&config_path)?
+        .write_all(b"# not UTF-8: \xff\n")?;
+    let before = fs::read(&config_path)?;
+    start(
+        &dir,
+        &[],
+        &[not_rewritten.as_str(), warning.as_str(), "Starting zakurad"],
+    )?;
+    assert_eq!(fs::read(&config_path)?, before, "the file is left alone");
+
+    // An environment override is not in the file, so only the loaded config changes. The
+    // file lists a current seed, and the override replaces that entry.
+    let mut config = default_test_config(&Mainnet);
+    config.network.zakura.bootstrap_peers = vec![format!("{current}@127.0.0.1:1")];
+    let dir = testdir()?.with_config(&mut config)?;
+    let config_path = dir.path().join("zakura.toml");
+    let before = fs::read(&config_path)?;
+    start(
+        &dir,
+        &[(
+            "ZAKURA_NETWORK__ZAKURA__BOOTSTRAP_PEERS[0]",
+            retired_entry.as_str(),
+        )],
+        &[warning.as_str(), "Starting zakurad"],
+    )?;
+    assert_eq!(fs::read(&config_path)?, before, "the file is left alone");
+
+    Ok(())
+}

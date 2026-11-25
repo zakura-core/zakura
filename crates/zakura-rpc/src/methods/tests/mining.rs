@@ -589,6 +589,8 @@ impl zakura_node_services::bpv1_proposer::Bpv1ProposerHook for RecordingBpv1Prop
     ) -> bool {
         false
     }
+
+    fn retire_failed_block(&self, _hash: zakura_chain::block::Hash) {}
 }
 
 /// Whether `template`'s coinbase carries [`BPV1_PAYLOAD`].
@@ -1772,6 +1774,8 @@ fn bpv1_6_submit_block_publishes_only_after_consensus_admission_or_commit() {
             self.published.fetch_add(1, Ordering::AcqRel);
             true
         }
+
+        fn retire_failed_block(&self, _hash: zakura_chain::block::Hash) {}
     }
 
     mining_runtime(async {
@@ -1887,6 +1891,8 @@ fn bpv1_commitment_follows_the_selection_decision() {
         fn publish_solved_block(&self, _block: Arc<Block>, _height: Height) -> bool {
             false
         }
+
+        fn retire_failed_block(&self, _hash: zakura_chain::block::Hash) {}
     }
 
     let commits = |template: &BlockTemplateResponse| {

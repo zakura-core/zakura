@@ -11,7 +11,7 @@ use zakura_chain::{
         merkle::{AuthDataRoot, Root},
         Block, ChainHistoryBlockTxAuthCommitmentHash, ChainHistoryMmrRootHash, Height,
     },
-    miner_mesh::MinerMeshCommitment,
+    miner_mesh::{GatewayId, MinerMeshCommitment},
     parameters::Network,
     serialization::ZcashSerialize,
     transparent::{Output, Script},
@@ -432,7 +432,7 @@ fn commitment_ignores_unusual_outputs_and_needs_exactly_one() {
 /// the other.
 #[test]
 fn commitment_and_miner_mesh_outputs_stay_distinct_in_one_coinbase() {
-    let mesh = MinerMeshCommitment::new([0x77; 32]);
+    let mesh = MinerMeshCommitment::new(GatewayId::from_bytes([0x77; 20]));
     let committed =
         build_committed_nu7_block_with_outputs(&Profile::TINY, 2, vec![mesh.to_output()]);
     assert_eq!(committed.verify(&committed.binding), Ok(()));
@@ -467,11 +467,10 @@ fn commitment_and_miner_mesh_outputs_stay_distinct_in_one_coinbase() {
         Err(CommitmentError::MissingCommitmentOutput)
     );
 
-    // The scripts share their length and push opcode and differ in the tag.
+    // Both scripts are `OP_RETURN` and one push, and differ in the tag.
     let bpv1_script = bpv1.lock_script.as_raw_bytes();
     let mesh_script = mesh_output.lock_script.as_raw_bytes();
-    assert_eq!(bpv1_script.len(), mesh_script.len());
-    assert_eq!(bpv1_script[..2], mesh_script[..2]);
+    assert_eq!(bpv1_script[0], mesh_script[0]);
     assert_eq!(&bpv1_script[2..4], b"BP");
     assert_eq!(&mesh_script[2..4], b"MR");
 }

@@ -14,6 +14,7 @@ use super::{
     blocks::{BlockConfig, BlockInput, BlockOutput, BlockStep, BlockTable, HeaderAdmissionResult},
     blocks_tests::{
         closed_sessions, commitment_ok, header_result, missing_parent, rejected_sessions,
+        unknown_parent_checked,
     },
     close::Bpv1CloseRow,
     codec::encode_body,
@@ -25,6 +26,7 @@ use super::{
     profile::Profile,
     service::{control_input, data_input},
     test_support::{commit_work, make_envelope, node_id, LinkProfile, MachineMesh},
+    unknown_parent::UnknownParentVerdict,
     wire::{HaveFlags, PROPAGATION_DEPTH},
 };
 use crate::zakura::{handshake::Frame, wire_codec::encode_frame};
@@ -408,6 +410,60 @@ fn close_4_failed_commitment_closes_identical_copies_and_checks_the_alternate() 
         .outputs
         .iter()
         .all(|o| !matches!(o, BlockOutput::ClosePeer { .. })));
+}
+
+/// `bpv1-close-4`, unknown parent (bpv1-61): a binding that fails the
+/// unknown-parent checks closes the first sender and each session whose copy
+/// equals it. The alternate gets its own checks, and parks if they pass.
+#[test]
+fn close_4_failed_unknown_parent_binding_checks_the_alternate() {
+    let now = Instant::now();
+    let parent = block::Hash([0x38; 32]);
+    let block_id = block::Hash([0x39; 32]);
+    let [a, b, c, d] = sessions();
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let first = copy_from(
+        &mut table,
+        now,
+        make_envelope(block_id, tiny(), [0xA1; 32], node_id(1)),
+        a,
+    );
+    for (root, from) in [([0xA1; 32], b), ([0xA2; 32], c), ([0xA3; 32], d)] {
+        copy_from(
+            &mut table,
+            now,
+            make_envelope(block_id, tiny(), root, node_id(1)),
+            from,
+        );
+    }
+    let checking = header_result(
+        &mut table,
+        now,
+        &first,
+        HeaderAdmissionResult::MissingParent {
+            parent_hash: parent,
+        },
+    );
+    let failed = unknown_parent_checked(
+        &mut table,
+        now,
+        &checking,
+        UnknownParentVerdict::Invalid(Bpv1CloseRow::Row4BadMetaOrCommitment),
+    );
+    assert_eq!(
+        closed_sessions(&failed, Bpv1CloseRow::Row4BadMetaOrCommitment),
+        sorted(vec![a, b])
+    );
+    assert!(rejected_sessions(&failed, block_id).is_empty());
+    table.assert_invariants();
+
+    let parked = unknown_parent_checked(&mut table, now, &failed, UnknownParentVerdict::Park);
+    assert!(parked
+        .outputs
+        .iter()
+        .all(|o| !matches!(o, BlockOutput::ClosePeer { .. })));
+    assert_eq!(table.pending_meta_len(), 1);
+    table.assert_invariants();
 }
 
 /// The alternate envelope waits with its entry while the parent header is

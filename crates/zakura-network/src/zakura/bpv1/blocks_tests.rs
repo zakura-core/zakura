@@ -263,7 +263,7 @@ pub(super) fn missing_parent(
 }
 
 /// Completes the step's unknown-parent check with `verdict`.
-fn unknown_parent_checked(
+pub(super) fn unknown_parent_checked(
     table: &mut BlockTable,
     now: Instant,
     checking: &BlockStep,
@@ -651,7 +651,7 @@ fn invalid_header_closes_every_session_that_sent_it() {
 /// Metadata whose parent header is unknown parks only after its checks pass
 /// (#2715). An out-of-range height drops it without fault. A failed target or
 /// proof of work closes every session that sent the header, and a failed
-/// binding closes only the sender whose binding failed.
+/// binding closes every session that sent that same binding (bpv1-61).
 #[test]
 fn unknown_parent_verdicts_park_drop_or_close() {
     let now = Instant::now();
@@ -725,9 +725,9 @@ fn unknown_parent_verdicts_park_drop_or_close() {
     assert_eq!(table.pending_meta_len(), 0);
     assert_eq!(
         closed_sessions(&closed, Bpv1CloseRow::Row4BadMetaOrCommitment),
-        vec![first]
+        both
     );
-    assert_eq!(rejected_sessions(&closed, bad_binding), vec![second]);
+    assert!(rejected_sessions(&closed, bad_binding).is_empty());
 }
 
 /// Returns the sessions the step rejected `block_id`'s metadata for.

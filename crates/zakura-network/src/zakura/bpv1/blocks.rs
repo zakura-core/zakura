@@ -2060,28 +2060,22 @@ impl BlockTable {
                 reject_meta(step, block_id, entry.from_peer, entry.session_gen);
                 reject_later(step, block_id, &entry.later);
             }
-            UnknownParentVerdict::Invalid(row) => {
-                step.outputs.push(BlockOutput::ClosePeer {
-                    peer: entry.from_peer,
-                    session_gen: entry.session_gen,
-                    row,
-                });
-                if row == Bpv1CloseRow::Row3InvalidHeader {
-                    // `block_id` is the hash of the header bytes, so every
-                    // later session sent this same invalid header.
-                    for (peer, session_gen) in entry.later.sessions() {
-                        step.outputs.push(BlockOutput::ClosePeer {
-                            peer,
-                            session_gen,
-                            row,
-                        });
-                    }
-                } else {
-                    // Another sender's binding may differ under the same hash,
-                    // so it is not faulted for this one's.
-                    reject_later(step, block_id, &entry.later);
+            // `block_id` is the hash of the header bytes, so every later
+            // session sent this same invalid header.
+            UnknownParentVerdict::Invalid(row @ Bpv1CloseRow::Row3InvalidHeader) => {
+                for (peer, session_gen) in std::iter::once((entry.from_peer, entry.session_gen))
+                    .chain(entry.later.sessions())
+                {
+                    step.outputs.push(BlockOutput::ClosePeer {
+                        peer,
+                        session_gen,
+                        row,
+                    });
                 }
             }
+            // Another sender's binding may differ under the same hash, so
+            // the alternate gets its own check.
+            UnknownParentVerdict::Invalid(_) => self.handle_binding_failed(block_id, entry, step),
         }
     }
 
@@ -2238,7 +2232,7 @@ impl BlockTable {
             .expect("admitting entry verified present");
 
         if !ok {
-            self.handle_commitment_failed(block_id, entry, step);
+            self.handle_binding_failed(block_id, entry, step);
             return;
         }
 
@@ -2299,14 +2293,16 @@ impl BlockTable {
     }
 
     /// Closes every session that sent `entry`'s failed envelope with row 4,
-    /// then checks the alternate envelope, if the entry kept one (bpv1-61).
+    /// then runs the failed check again on the alternate envelope, if the
+    /// entry kept one (bpv1-61). The failed check is the commitment check or,
+    /// for metadata whose parent is unknown, the binding check.
     ///
-    /// The commitment check is a pure function of the envelope and the
-    /// admitted height, so each session whose copy equals the failed envelope
-    /// sent the failed commitment. A session whose copy differs is not
-    /// faulted for it: the block id hashes only the header. An honest relay
-    /// forwards only admitted metadata, so its copy passes.
-    fn handle_commitment_failed(
+    /// Both checks are pure functions of the envelope and the block's header
+    /// or height, so each session whose copy equals the failed envelope sent
+    /// the failed binding. A session whose copy differs is not faulted for
+    /// it: the block id hashes only the header. An honest relay forwards only
+    /// admitted metadata, so its copy passes.
+    fn handle_binding_failed(
         &mut self,
         block_id: block::Hash,
         entry: AdmittingEntry,
@@ -2318,6 +2314,7 @@ impl BlockTable {
             session_gen,
             later,
             height,
+            stage,
             parked_at,
             ..
         } = entry;
@@ -2334,18 +2331,33 @@ impl BlockTable {
             }
             return;
         };
-        let height = height.unwrap_or(self.top);
         let mut senders = senders.into_iter();
         let (from_peer, session_gen) = senders
             .next()
             .expect("the session that sent the alternate envelope is recorded with it");
         let work_id = alloc_work_id(&mut self.next_work_id);
         self.work_to_block.insert(work_id, block_id);
+        let check = match stage {
+            AdmittingStage::CheckingUnknownParent { .. } => BlockOutput::CheckUnknownParent {
+                work_id,
+                block_id,
+                envelope: envelope.clone(),
+                top: self.top,
+            },
+            AdmittingStage::WaitingHeader | AdmittingStage::WaitingCommitment => {
+                BlockOutput::VerifyCommitment {
+                    work_id,
+                    block_id,
+                    height: height.unwrap_or(self.top),
+                    envelope: envelope.clone(),
+                }
+            }
+        };
         self.admitting.insert(
             block_id,
             AdmittingEntry {
                 work_id,
-                envelope: envelope.clone(),
+                envelope,
                 arrived_at,
                 from_peer,
                 session_gen,
@@ -2354,17 +2366,12 @@ impl BlockTable {
                     alternate: None,
                     unkept: later.unkept,
                 },
-                height: Some(height),
-                stage: AdmittingStage::WaitingCommitment,
+                height,
+                stage,
                 parked_at,
             },
         );
-        step.outputs.push(BlockOutput::VerifyCommitment {
-            work_id,
-            block_id,
-            height,
-            envelope,
-        });
+        step.outputs.push(check);
     }
 
     /// Frees a concurrent-block slot if every slot is taken.

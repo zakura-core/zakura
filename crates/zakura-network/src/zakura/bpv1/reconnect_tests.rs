@@ -15,7 +15,8 @@ use super::{
         HeaderAdmissionResult,
     },
     blocks_tests::{commitment_ok, header_result},
-    peer::{PeerConfig, PeerInput, PeerOutput, PeerState},
+    codec::encode_body,
+    peer::{PartAuth, PeerConfig, PeerInput, PeerOutput, PeerState},
     peer_tests::{have_with, recv_meta, tiny},
     profile::Profile,
     route::{
@@ -339,4 +340,66 @@ fn later_sender_reconnecting_during_admission_gets_the_metadata() {
     );
     assert_eq!(node.wrote(q), (1, 1), "one HeaderMeta, then one Want");
     assert_eq!((node.grants_to(q), node.refusals), (1, 0));
+}
+
+/// bpv1-63: a replaced session's stale proof result releases only its own
+/// part charge. The replacement's charge for the same part survives, so
+/// the replacement's verified copy is stored.
+#[test]
+fn a_replaced_sessions_stale_release_keeps_the_replacements_charge() {
+    let encoded = encode_body(&Profile::TINY, &[0x63; 64], 2).unwrap();
+    let block_id = block::Hash([0x63; 32]);
+    let p = node_id(2);
+    let mut node = Node::new(&[p]);
+    let now = node.now;
+    let received = node.table.step(
+        now,
+        BlockInput::MetaReceived {
+            envelope: make_envelope(block_id, encoded.coding, encoded.part_root, node_id(1)),
+            from_peer: p,
+            session_gen: 1,
+        },
+    );
+    let header = admit_header(&mut node, &received);
+    admit(&mut node, &header, block_id);
+    let part = encoded.parts[0].clone();
+    let bytes = part.payload().len() as u64;
+
+    // Session 1 accepted the part, and its proof is still running when
+    // session 2 accepts the same part.
+    for session_gen in [1, 2] {
+        node.table
+            .charge_part(now, &block_id, part.index(), p, session_gen, bytes)
+            .unwrap();
+    }
+    // Session 1 ends, and its proof result releases its charge.
+    node.table.step(
+        now,
+        BlockInput::ReleasePartCharge {
+            block_id,
+            index: part.index(),
+            from_peer: p,
+            session_gen: 1,
+        },
+    );
+    // Session 2's proof passes.
+    let inserted = node.table.step(
+        now,
+        BlockInput::InsertPart {
+            block_id,
+            part,
+            from_peer: p,
+            session_gen: 2,
+            auth: PartAuth::Push,
+            peer_states: Vec::new(),
+        },
+    );
+    assert!(
+        inserted
+            .events
+            .iter()
+            .any(|e| matches!(e, BlockEvent::PartInserted { first: true, .. })),
+        "the replacement's verified part is stored"
+    );
+    node.table.assert_invariants();
 }

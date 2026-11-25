@@ -53,6 +53,7 @@ fn insert(
         &block_id,
         part.index(),
         from_peer,
+        1,
         part.payload().len() as u64,
     );
     table.step(
@@ -61,6 +62,7 @@ fn insert(
             block_id,
             part: part.clone(),
             from_peer,
+            session_gen: 1,
             auth,
             peer_states: Vec::new(),
         },
@@ -2594,6 +2596,7 @@ fn fix6_rejected_metadata_leaves_no_state_and_arrival_lives_in_the_entry() {
             &block_id,
             part.index(),
             sender,
+            1,
             part.payload().len() as u64,
         )
         .unwrap();
@@ -2603,6 +2606,7 @@ fn fix6_rejected_metadata_leaves_no_state_and_arrival_lives_in_the_entry() {
             block_id,
             part,
             from_peer: sender,
+            session_gen: 1,
             auth: PartAuth::Want(1),
             peer_states: Vec::new(),
         },
@@ -2636,6 +2640,7 @@ fn fix8_part_charge_before_proof_bounds_the_part_buffer() {
                 block_id,
                 part: encoded.parts[i].clone(),
                 from_peer,
+                session_gen: 1,
                 auth: PartAuth::Want(1),
                 peer_states: Vec::new(),
             },
@@ -2644,13 +2649,13 @@ fn fix8_part_charge_before_proof_bounds_the_part_buffer() {
     };
 
     assert_eq!(
-        table.charge_part(t0, &block::Hash([0xEE; 32]), 0, a, part_len),
+        table.charge_part(t0, &block::Hash([0xEE; 32]), 0, a, 1, part_len),
         Err(PartRefusal::NotAdmitted)
     );
-    assert!(table.charge_part(t0, &block_id, 0, a, part_len).is_ok());
-    assert!(table.charge_part(t0, &block_id, 1, a, part_len).is_ok());
+    assert!(table.charge_part(t0, &block_id, 0, a, 1, part_len).is_ok());
+    assert!(table.charge_part(t0, &block_id, 1, a, 1, part_len).is_ok());
     assert_eq!(
-        table.charge_part(t0, &block_id, 2, a, part_len),
+        table.charge_part(t0, &block_id, 2, a, 1, part_len),
         Err(PartRefusal::LocalCapacity)
     );
     store(&mut table, 2, a);
@@ -2665,6 +2670,7 @@ fn fix8_part_charge_before_proof_bounds_the_part_buffer() {
             block_id,
             index: 1,
             from_peer: a,
+            session_gen: 1,
         },
     );
     assert_eq!(table.part_buffer_bytes(), part_len, "failed proof releases");
@@ -2677,11 +2683,11 @@ fn fix8_part_charge_before_proof_bounds_the_part_buffer() {
         "a stored part keeps its charge"
     );
 
-    assert!(table.charge_part(t0, &block_id, 0, b, part_len).is_ok());
+    assert!(table.charge_part(t0, &block_id, 0, b, 1, part_len).is_ok());
     store(&mut table, 0, b);
     assert_eq!(table.part_buffer_bytes(), part_len, "a duplicate releases");
 
-    assert!(table.charge_part(t0, &block_id, 1, b, part_len).is_ok());
+    assert!(table.charge_part(t0, &block_id, 1, b, 1, part_len).is_ok());
     table.step(
         t0,
         BlockInput::TipHeight {

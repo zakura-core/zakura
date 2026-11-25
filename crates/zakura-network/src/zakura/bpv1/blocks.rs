@@ -499,8 +499,9 @@ pub enum BlockInput {
     /// Verified part delivered by a peer (`bpv1-22`, `bpv1-23`, `decision-10`).
     ///
     /// The part's bytes must already be charged by [`BlockTable::charge_part`]
-    /// for `(index, from_peer)`; an uncharged part is not stored. Storing the
-    /// part keeps the charge; a duplicate or stale part releases it.
+    /// for `(index, from_peer, session_gen)`; an uncharged part is not stored.
+    /// Storing the part keeps the charge; a duplicate or stale part releases
+    /// it.
     InsertPart {
         /// Target block.
         block_id: block::Hash,
@@ -508,13 +509,15 @@ pub enum BlockInput {
         part: VerifiedPart,
         /// Peer that supplied the part.
         from_peer: NodeId,
+        /// Generation of the session that accepted the part.
+        session_gen: u64,
         /// How the session authorized the part.
         auth: PartAuth,
         /// Snapshot of live peers' pull capacities (used if a stripe still needs parts).
         peer_states: Vec<PullPeerState>,
     },
-    /// Proof verification failed for a part charged by [`BlockTable::charge_part`]:
-    /// release its charge.
+    /// A part charged by [`BlockTable::charge_part`] will not be inserted: its
+    /// proof failed, or its session ended first. Release its charge.
     ReleasePartCharge {
         /// Target block.
         block_id: block::Hash,
@@ -522,6 +525,8 @@ pub enum BlockInput {
         index: u32,
         /// Peer that sent the part.
         from_peer: NodeId,
+        /// Generation of the session that accepted the part.
+        session_gen: u64,
     },
     /// This node uploaded `bytes` of `block_id` part payloads to a peer (`upload.bytes_over_body`).
     PartUploaded {
@@ -1322,8 +1327,10 @@ struct ActiveBlock {
     /// True once `BlockDone` has been announced to routines.
     block_done_notified: bool,
     /// Peer part bytes charged before proof and not yet stored or released,
-    /// keyed by `(index, peer)`.
-    part_charges: HashMap<(u32, NodeId), u64>,
+    /// keyed by `(index, peer, session generation)`. Each charge belongs to
+    /// the session that accepted the part, so a replaced session's stale
+    /// completion never releases its replacement's charge (bpv1-63).
+    part_charges: HashMap<(u32, NodeId, u64), u64>,
     /// Charged bytes of stored peer parts, held until retirement.
     stored_charge: u64,
     /// When `HeaderMeta` arrived, or when the proposer admitted the block.
@@ -1604,13 +1611,15 @@ impl BlockTable {
     /// the answer before it starts proof work. A later `InsertPart` stores the
     /// part under the charge or releases it; `ReleasePartCharge` releases it
     /// after a failed proof; retirement releases every charge of the block. A
-    /// repeated charge for the same `(index, peer)` replaces the earlier one.
+    /// repeated charge for the same `(index, from_peer, session_gen)` replaces
+    /// the earlier one.
     pub fn charge_part(
         &mut self,
         now: Instant,
         block_id: &block::Hash,
         index: u32,
         from_peer: NodeId,
+        session_gen: u64,
         bytes: u64,
     ) -> Result<(Coding, [u8; 32]), PartRefusal> {
         let charged = self.part_buffer_bytes();
@@ -1627,15 +1636,12 @@ impl BlockTable {
             .wire_len(index)
             .map_or(0, |len| block.meta.coding.part_bytes.saturating_sub(len));
         let bytes = bytes.saturating_add(u64::from(padding));
-        let replaced = block
-            .part_charges
-            .get(&(index, from_peer))
-            .copied()
-            .unwrap_or(0);
+        let charge = (index, from_peer, session_gen);
+        let replaced = block.part_charges.get(&charge).copied().unwrap_or(0);
         if charged - replaced + bytes > budget {
             return Err(PartRefusal::LocalCapacity);
         }
-        block.part_charges.insert((index, from_peer), bytes);
+        block.part_charges.insert(charge, bytes);
         block.first_part_at.get_or_insert(now);
         Ok((block.meta.coding, block.meta.part_root))
     }
@@ -1789,6 +1795,7 @@ impl BlockTable {
                 block_id,
                 part,
                 from_peer,
+                session_gen,
                 auth,
                 peer_states,
             } => {
@@ -1796,7 +1803,7 @@ impl BlockTable {
                     now,
                     block_id,
                     part,
-                    from_peer,
+                    (from_peer, session_gen),
                     auth,
                     &peer_states,
                     &mut step,
@@ -1806,9 +1813,10 @@ impl BlockTable {
                 block_id,
                 index,
                 from_peer,
+                session_gen,
             } => {
                 if let Some(block) = self.blocks.get_mut(&block_id) {
-                    block.part_charges.remove(&(index, from_peer));
+                    block.part_charges.remove(&(index, from_peer, session_gen));
                 }
             }
             BlockInput::PartUploaded { block_id, bytes } => {
@@ -3094,7 +3102,7 @@ impl BlockTable {
         now: Instant,
         block_id: block::Hash,
         part: VerifiedPart,
-        from_peer: NodeId,
+        (from_peer, session_gen): (NodeId, u64),
         auth: PartAuth,
         peer_states: &[PullPeerState],
         step: &mut BlockStep,
@@ -3108,7 +3116,7 @@ impl BlockTable {
             };
             // 03 §4: every peer part is charged before proof. Removing the charge
             // here releases it on every early return; storing the part keeps it.
-            let Some(charge) = block.part_charges.remove(&(index, from_peer)) else {
+            let Some(charge) = block.part_charges.remove(&(index, from_peer, session_gen)) else {
                 return;
             };
             if matches!(block.phase, BlockPhase::Retired | BlockPhase::Fallback) {

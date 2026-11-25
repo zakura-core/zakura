@@ -499,6 +499,9 @@ pub enum PeerOutput {
         block_id: block::Hash,
         /// Verified part.
         part: VerifiedPart,
+        /// Generation of the session that accepted the part, which owns its
+        /// charge.
+        session_gen: u64,
         /// How the part was authorized.
         auth: PartAuth,
     },
@@ -1625,6 +1628,7 @@ impl PeerState {
         step.outputs.push(PeerOutput::InsertPart {
             block_id: token.block_id,
             part,
+            session_gen: token.session_gen,
             auth: inflight.auth,
         });
     }

@@ -166,11 +166,12 @@ pub fn replay_bpv1_block_bytes(bytes: &[u8]) -> BlockReplaySummary {
                 let part = encoded.parts[usize::from(b) % encoded.parts.len()].clone();
                 // usize -> u64 widens on every supported target.
                 let bytes = part.payload().len() as u64;
-                let _ = table.charge_part(now, &block_id, part.index(), peer, bytes);
+                let _ = table.charge_part(now, &block_id, part.index(), peer, 1, bytes);
                 BlockInput::InsertPart {
                     block_id,
                     part,
                     from_peer: peer,
+                    session_gen: 1,
                     auth: [PartAuth::Seed, PartAuth::Push, PartAuth::Want(1)][usize::from(a % 3)],
                     peer_states,
                 }

@@ -1732,6 +1732,7 @@ fn finish_part_proof(
             block_id: token.block_id,
             index: token.index,
             from_peer: peer,
+            session_gen: token.session_gen,
         }));
     }
 }
@@ -2055,6 +2056,7 @@ async fn run_peer_routine(
                 block_id: token.block_id,
                 index: token.index,
                 from_peer: peer_node,
+                session_gen: token.session_gen,
             });
         }
     }

@@ -53,11 +53,13 @@ pub(crate) fn route_peer_output(
         PeerOutput::InsertPart {
             block_id,
             part,
+            session_gen,
             auth,
         } => BlockInput::InsertPart {
             block_id,
             part,
             from_peer: peer,
+            session_gen,
             auth,
             peer_states: peer_states(),
         },
@@ -153,7 +155,14 @@ pub(crate) fn charge_part(
     bytes: u64,
 ) -> Result<(Coding, [u8; 32]), PeerInput> {
     table
-        .charge_part(now, &token.block_id, token.index, peer, bytes)
+        .charge_part(
+            now,
+            &token.block_id,
+            token.index,
+            peer,
+            token.session_gen,
+            bytes,
+        )
         .map_err(|refusal| PeerInput::PartRefused {
             token,
             reason: match refusal {

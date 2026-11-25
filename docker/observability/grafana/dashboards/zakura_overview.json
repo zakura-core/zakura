@@ -146,7 +146,7 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "zakura-prometheus" },
-      "description": "Blocks left before this release reaches its end of service, where it halts unless it was started with --unsafe-ignore-end-of-support. Negative once the release runs unsupported. Mainnet only: other networks report NOT ENFORCED.",
+      "description": "Blocks left before this release reaches its end of service and halts. Mainnet only: other networks report NOT ENFORCED.",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "thresholds" },
@@ -157,8 +157,8 @@
             "mode": "absolute",
             "steps": [
               { "color": "red", "value": null },
-              { "color": "orange", "value": 3456 },
-              { "color": "green", "value": 10368 }
+              { "color": "orange", "value": 1152 },
+              { "color": "green", "value": 3456 }
             ]
           },
           "unit": "none"

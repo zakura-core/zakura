@@ -21,11 +21,7 @@ pub(crate) enum TrustedSubmissionError {
     Malformed,
     /// All bounded submission or pending-body slots are occupied.
     Capacity,
-    /// The best tip passed the release's last supported mining height.
-    EndOfSupport,
 }
-
-const MINING_END_OF_SUPPORT: &str = "mining is disabled past the last supported height";
 
 pub(super) type SubmissionFuture =
     Pin<Box<dyn Future<Output = Result<SubmitBlockResponse, TrustedSubmissionError>> + Send>>;
@@ -256,9 +252,6 @@ where
                     response(StatusCode::TOO_MANY_REQUESTS, "capacity exhausted")
                 }
                 Err(JobError::Expired) => response(StatusCode::GONE, "stale job"),
-                Err(JobError::EndOfSupport) => {
-                    response(StatusCode::FORBIDDEN, MINING_END_OF_SUPPORT)
-                }
                 Err(JobError::Unavailable) => {
                     response(StatusCode::SERVICE_UNAVAILABLE, "inconclusive")
                 }
@@ -271,9 +264,6 @@ where
         }
         Err(TrustedSubmissionError::Capacity) => {
             response(StatusCode::TOO_MANY_REQUESTS, "capacity exhausted")
-        }
-        Err(TrustedSubmissionError::EndOfSupport) => {
-            response(StatusCode::FORBIDDEN, MINING_END_OF_SUPPORT)
         }
         Ok(result) => response(StatusCode::OK, outcome(&result)),
     }

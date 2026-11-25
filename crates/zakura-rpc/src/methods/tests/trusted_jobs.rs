@@ -1,7 +1,7 @@
 //! Prepared trusted jobs against a mock verifier and chain tip, on a paused clock.
 //!
 //! The network is Mainnet, so the solved header is checked against real proof of work: the
-//! proposals are Mainnet blocks with their nonces cleared, and the solutions are their headers.
+//! proposal is Mainnet block 1 with its nonce cleared, and the solution is that block's header.
 
 use std::sync::Arc;
 
@@ -20,7 +20,6 @@ use zakura_test::mock_service::{MockService, PanicAssertion};
 
 use crate::{
     methods::trusted_block::jobs::{JobError, JobId, Jobs, Operation},
-    server::trusted_block::TrustedSubmissionError,
     tests::test_rpc::TestRpcImpl,
     EarlyMinedBlock,
 };
@@ -58,29 +57,24 @@ impl Relay {
     }
 
     fn without_tip() -> Self {
-        Self::with_block(&zakura_test::vectors::BLOCK_MAINNET_1_BYTES)
-    }
-
-    fn with_block(bytes: &[u8]) -> Self {
-        let solved: Arc<Block> = bytes
+        let solved: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
             .zcash_deserialize_into()
-            .expect("the Mainnet block test vector is valid");
+            .expect("the block 1 test vector is valid");
         let mut unsolved = (*solved).clone();
         Arc::make_mut(&mut unsolved.header).nonce = Default::default();
         let committed = solved.clone();
         let read_state = tower::service_fn(move |request: ReadRequest| {
-            let response = match request {
-                ReadRequest::BlockInfo(_) => ReadResponse::BlockInfo(Some(Default::default())),
-                ReadRequest::AnyChainBlock(_) => {
-                    ReadResponse::Block(Some(committed.clone().into()))
-                }
-                _ => panic!("unexpected read state request: {request:?}"),
-            };
-            async move { Ok::<_, tower::BoxError>(response) }
+            // Only a duplicate verdict reads state, to compare bodies.
+            assert!(matches!(request, ReadRequest::AnyChainBlock(_)));
+            let block = committed.clone().into();
+            async move { Ok::<_, tower::BoxError>(ReadResponse::Block(Some(block))) }
         });
         let state = tower::service_fn(|request: zakura_state::Request| async move {
-            assert!(matches!(request, zakura_state::Request::KnownBlock(_)));
-            Ok::<_, tower::BoxError>(zakura_state::Response::KnownBlock(None))
+            panic!("a job never calls the write state service, got {request:?}");
+            #[allow(unreachable_code)]
+            Ok::<zakura_state::Response, tower::BoxError>(zakura_state::Response::Committed(
+                block::Hash([0; 32]),
+            ))
         });
         let mempool: MockService<_, _, _, tower::BoxError> = MockService::build().for_unit_tests();
         let verifier: Verifier = MockService::build().for_unit_tests();
@@ -497,47 +491,6 @@ async fn tip_change_expires_a_job_that_is_waiting_for_its_solution() {
     assert!(!relay.is_released());
     assert!(relay.early.try_recv().is_err());
     assert!(relay.can_start(16).await);
-}
-
-#[tokio::test(start_paused = true)]
-async fn mining_support_cutoff_refuses_a_complete_trusted_block() {
-    let mut relay = Relay::with_block(&zakura_test::vectors::BLOCK_MAINNET_2_BYTES);
-    relay.rpc = relay
-        .rpc
-        .clone()
-        .with_end_of_support_height(Some(Height(0)));
-    relay.set_tip(Height(1), relay.parent);
-
-    assert!(matches!(
-        relay.rpc.submit_trusted_block(&relay.solved_bytes()).await,
-        Err(TrustedSubmissionError::EndOfSupport)
-    ));
-    relay.verifier.expect_no_requests().await;
-    assert!(!relay.is_released());
-    assert!(relay.early.try_recv().is_err());
-}
-
-#[tokio::test(start_paused = true)]
-async fn mining_support_cutoff_refuses_a_job_solved_after_its_parent_arrives() {
-    let mut relay = Relay::with_block(&zakura_test::vectors::BLOCK_MAINNET_2_BYTES);
-    relay.rpc = relay
-        .rpc
-        .clone()
-        .with_end_of_support_height(Some(Height(0)));
-    relay.set_tip(Height(0), Network::Mainnet.genesis_hash());
-    relay.prepare().await.unwrap();
-
-    relay.set_tip(Height(1), relay.parent);
-    relay
-        .proposal_verification()
-        .await
-        .respond(relay.proposal_hash());
-    relay.solve().await.unwrap();
-
-    assert_eq!(relay.outcome().await, Err(JobError::EndOfSupport));
-    relay.verifier.expect_no_requests().await;
-    assert!(!relay.is_released());
-    assert!(relay.early.try_recv().is_err());
 }
 
 #[tokio::test(start_paused = true)]

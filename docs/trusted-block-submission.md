@@ -119,7 +119,6 @@ ID. Job responses are:
 | --- | --- |
 | 202 | The input was received, or its job ended with the block's header hash committed. |
 | 400 | The input is malformed, the solved header fails proof of work, or local verification rejected the proposal or the solved block. |
-| 403 | The job reached release after the Mainnet tip passed the node release's last supported height. |
 | 409 | The input contradicts one already received for this job: a different proposal, a different solved header, or a confirmation of other bytes. The job keeps the input it already has. A job whose solved header changes more than the proposal's nonce and solution ends with this status. |
 | 410 | The job ended as stale, was replaced by a newer proposal, or passed its lifetime. |
 | 429 | All 16 job slots are occupied and none can be replaced, or the relay's pending-body or submission capacity is exhausted. |
@@ -176,9 +175,9 @@ duplicate check.
   validation. Local downloads can still wait for the submission to finish. The
   verifier still runs its own duplicate check.
 
-A block whose parent is still missing returns `inconclusive`. Once the Mainnet
-tip passes the node release's last supported height, a new block receives HTTP
-403 before relay or verification. HTTP 200 has a plain-text body:
+A block whose parent is still missing returns `inconclusive`. In every case
+except an already committed hash, the HTTP response waits for the local result.
+HTTP 200 has a plain-text body:
 
 | Result | Meaning |
 | --- | --- |

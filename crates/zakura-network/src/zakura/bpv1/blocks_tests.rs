@@ -2589,6 +2589,100 @@ fn an_old_sessions_end_releases_only_its_own_pending_pushes() {
     table.assert_invariants();
 }
 
+/// decision-24, bpv1-89: a slot that a peer flags again on its live session
+/// moves to that session. Session 1 and session 2 of `p` both flag slot 0.
+/// Session 1's end keeps slot 0 pending, so `q` is not asked for it.
+#[test]
+fn a_replacement_sessions_push_flag_survives_the_old_sessions_end() {
+    let coding = Profile::TINY.derive_coding(128, 2).unwrap();
+    let block_id = block::Hash([0xA7; 32]);
+    let (p, q) = (node_id(2), node_id(3));
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let t0 = Instant::now();
+    admit(&mut table, t0, block_id, coding, [0xA7; 32]);
+    observe(&mut table, t0, p, 5, 10_000_000);
+    observe(&mut table, t0, q, 40, 1_000_000);
+    let index = coding.wire_index(0, 0).unwrap();
+    announce(&mut table, t0, q, block_id, vec![index], &[]);
+    for session_gen in [1, 2] {
+        table.step(
+            t0,
+            BlockInput::PushFlagged {
+                peer: p,
+                session_gen,
+                block_id,
+                indices: vec![index],
+                relay: false,
+            },
+        );
+    }
+
+    let session_2 = PullPeerState {
+        session_gen: 2,
+        ..pull_state(p)
+    };
+    let ended = table.step(
+        t0,
+        BlockInput::SessionEnded {
+            peer: p,
+            session_gen: 1,
+            peer_states: vec![session_2, pull_state(q)],
+        },
+    );
+    assert!(
+        granted_slots(&ended, q).is_empty(),
+        "the old session's end dropped the live push: {:?}",
+        ended.outputs
+    );
+    table.assert_invariants();
+}
+
+/// decision-24, bpv1-89: a push flag says nothing about the node, so its
+/// session's end leaves the reconnected peer eligible. Session 1 of `p`
+/// flagged slot 0, which `p` announced. Session 1's end grants slot 0 to
+/// session 2.
+#[test]
+fn an_ended_push_leaves_the_replacement_session_eligible() {
+    let coding = Profile::TINY.derive_coding(128, 2).unwrap();
+    let block_id = block::Hash([0xA8; 32]);
+    let p = node_id(2);
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let t0 = Instant::now();
+    admit(&mut table, t0, block_id, coding, [0xA8; 32]);
+    observe(&mut table, t0, p, 5, 10_000_000);
+    let index = coding.wire_index(0, 0).unwrap();
+    announce(&mut table, t0, p, block_id, vec![index], &[]);
+    flag_push(&mut table, t0, p, block_id, vec![index], false);
+
+    let session_2 = PullPeerState {
+        session_gen: 2,
+        ..pull_state(p)
+    };
+    let ended = table.step(
+        t0,
+        BlockInput::SessionEnded {
+            peer: p,
+            session_gen: 1,
+            peer_states: vec![session_2],
+        },
+    );
+    let grants: Vec<(u64, Vec<u32>)> = ended
+        .outputs
+        .iter()
+        .filter_map(|o| match o {
+            BlockOutput::GrantPull {
+                peer,
+                session_gen,
+                requested,
+                ..
+            } if *peer == p => Some((*session_gen, requested.iter().collect())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(grants, vec![(2, vec![0])], "{:?}", ended.outputs);
+    table.assert_invariants();
+}
+
 /// Repair rounds repeat every `base × 2^r`,
 /// with `base = SLOW_X ×` one part's estimated arrival, until the monotonic
 /// deadline, which is the only bound and the only way into fallback. Only the

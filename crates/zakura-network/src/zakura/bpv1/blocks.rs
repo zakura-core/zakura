@@ -2857,11 +2857,15 @@ impl BlockTable {
         }
     }
 
-    /// Records `peer`'s flagged pushes as pending claims held by `peer` and
-    /// arms their late timer (decision-24, bpv1-64). The planner never asks
-    /// `peer` for a part it is pushing. Relay-flagged indices, which only the
-    /// proposer sends, become this node's pushed seeds: it pushes each onward
-    /// once it holds it, and one already held goes out now (bpv1-71).
+    /// Records `peer`'s flagged pushes as pending claims held by the flagging
+    /// session and arms their late timer (decision-24, bpv1-64). The planner
+    /// skips a slot while its push is pending, and the session refuses a
+    /// grant for a part its peer is pushing (bpv1-69). Neither marks `peer`
+    /// tried: only a late push or a failed pull does, because a push that
+    /// ends with its session says nothing about the node. Relay-flagged
+    /// indices, which only the proposer sends, become this node's pushed
+    /// seeds: it pushes each onward once it holds it, and one already held
+    /// goes out now (bpv1-71).
     fn handle_push_flagged(
         &mut self,
         now: Instant,
@@ -2882,7 +2886,6 @@ impl BlockTable {
         for &index in indices {
             if let Some((stripe, slot)) = block.meta.coding.split_index(index) {
                 let st = &mut block.stripes[stripe as usize];
-                st.tried[slot as usize].insert(peer);
                 if relay && peer == block.meta.proposer_node {
                     st.pushed.insert(slot);
                     if st.held[slot as usize].is_some() {
@@ -2902,10 +2905,13 @@ impl BlockTable {
     }
 
     /// Marks each of `indices` that the block lacks and that no claim or
-    /// earlier sender covers as pending from session `session_gen` of
+    /// other peer's push covers as pending from session `session_gen` of
     /// `peer`. They turn late at `SLOW_X` × the estimated arrival of this
-    /// batch. A later batch from `peer` keeps its own late time, so it never
-    /// delays this one (bpv1-64).
+    /// batch. A later batch from the same session keeps its own late time,
+    /// so it never delays this one (bpv1-64). A slot pending from another
+    /// session of `peer` moves to this session: the peer flagged it again
+    /// on its live connection, and the other session's end must not drop
+    /// the live push (bpv1-89).
     fn expect_incoming(
         &mut self,
         now: Instant,
@@ -2926,11 +2932,15 @@ impl BlockTable {
                 continue;
             };
             let st = &block.stripes[stripe as usize];
+            let pending_elsewhere = st
+                .incoming
+                .get(&slot)
+                .is_some_and(|pending| pending.sender.0 != peer || pending.sender.1 == session_gen);
             if st.assemblable
                 || st.decoding()
                 || st.has(slot, coding.k)
                 || st.claims.contains_key(&slot)
-                || st.incoming.contains_key(&slot)
+                || pending_elsewhere
             {
                 continue;
             }

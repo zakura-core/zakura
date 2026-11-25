@@ -1362,6 +1362,7 @@ fn decision32_a_pushed_seed_is_announced_to_the_proposer_not_pushed() {
         vec![PeerOutput::SendHave {
             block_id,
             flags: HaveFlags::Plain,
+            form: HaveForm::smaller(tiny().total_parts().unwrap(), 1),
             indices: vec![0],
         }]
     );

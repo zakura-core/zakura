@@ -6,7 +6,7 @@ use zakura_chain::miner_mesh::GatewayId;
 use zakura_quic::NodeId;
 use zakura_rt::{collections::HashSet, sync::MutexGuard};
 
-use super::{GatewayPlace, HandshakeCounts, SlotSplit};
+use super::{GatewayPlace, HandshakeCounts, MovedNodeIds, SlotSplit};
 
 /// What the connection-slot checks hold for preferred mining gateways, and
 /// the v2 peers connected now.
@@ -69,18 +69,28 @@ impl ConnectionPlaces {
         lock_counts: impl FnOnce() -> MutexGuard<'a, HandshakeCounts>,
         slot_limit: usize,
         registered: &HashSet<NodeId>,
+        moved: &MovedNodeIds,
     ) -> Self {
         let counts = lock_counts();
         let preferred = counts.preferred_gateways();
         let gateways = preferred
             .places()
-            .map(|(gateway, place)| PlacedGateway {
-                gateway_id: gateway.gateway(),
-                blocks: gateway.blocks(),
-                place,
-                connected: gateway
-                    .node()
-                    .is_some_and(|node| registered.contains(&node)),
+            .map(|(gateway, place)| {
+                let (place, connected) = match gateway.node() {
+                    Some(id) if registered.contains(&id) => (place, true),
+                    // The slot belongs to the current ID. The gateway named
+                    // by its earlier ID is reachable but uses no held place.
+                    Some(id) if registered.contains(&moved.current(id)) => {
+                        (GatewayPlace::Standby, true)
+                    }
+                    _ => (place, false),
+                };
+                PlacedGateway {
+                    gateway_id: gateway.gateway(),
+                    blocks: gateway.blocks(),
+                    place,
+                    connected,
+                }
             })
             .collect();
         let mut peers: Vec<ConnectedPeer> = registered

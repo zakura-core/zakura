@@ -881,29 +881,27 @@ is today's Zakura logic.
      control handshake and end as a local limit, with no failure recorded.
      Otherwise one gateway could answer each dial under a new ID and turn
      every held place into an ordinary slot of its own. A dial to an ID
-     known to have moved claims its slot under the ID the node has now, so
-     it is refused before the handshake;
+     known to have moved first claims under the last authenticated ID.
+     If ordinary capacity is full, a preferred gateway may retry under its
+     original ID once per 30 seconds to detect a rollback. The same limits
+     apply after TLS on every retry;
   2. record no failure and no backoff against the dialed ID in the
      discovery book, and count the registration as a success for the book's
-     entries of both IDs. The second ID is the one the attempt's own
-     handshake authenticated, not what another dial to the same ID found;
+     entries of both IDs. Once TLS authenticates the peer, discovery tracks
+     registration health and credits the result using that attempt's peer ID;
   3. treat the node as connected, under either ID, wherever it decides
      whether to dial: a maintained bootstrap peer, a discovery candidate
      and a preferred gateway named by the earlier ID are left alone while
      the node is registered;
-  4. when the node already has a registered connection, close the new one
-     with application code 0 before its control handshake. The listener
-     registers a connection once it has acknowledged that handshake, and
-     the duplicate rule would then replace the connection already
-     registered. A dial to an earlier ID comes from a stale record or
-     config entry and MUST NOT replace a live connection. A discovery
+  4. if the dialer sees the authenticated ID registered at its check after
+     TLS, close the new connection with application code 0 before sending
+     the control handshake. A discovery
      attempt closed this way ends as connected elsewhere, with no failure.
      A maintained dial treats it as it treats any closed duplicate: it
      waits on the registered connection, and counts a failure only if that
-     connection ends before it is healthy. This rule covers what only a
-     dial to an earlier ID can't know before TLS. A connection that
-     registers while this dial runs its control handshake meets it under
-     the duplicate rule, as it would meet a dial to the node's own ID.
+     connection ends before it is healthy. Registrations visible only to
+     the listener, and registrations made after the dialer's check, follow
+     the ordinary duplicate policy.
 
   The dialer remembers moves in memory, at most 1,024, and learns one again
   with one dial after a restart. It keeps the book's entry of the earlier
@@ -2325,8 +2323,9 @@ still holds at most 4 entries, so discovery records don't change.
 Added:
 
 - **DIAL-9.** A dial that reaches its node under another ID is a move, not
-  a failure, never replaces a registered connection, and takes no slot the
-  limits would refuse the ID the node answers with.
+  a failure. It closes before the control handshake if the dialer already
+  sees the peer registered, and takes a slot only within the limits for
+  the authenticated ID.
 - **COMPAT-13.** What the release that adds a signature scheme does.
 
 Changed:

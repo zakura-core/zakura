@@ -181,7 +181,7 @@ preferred set:
 | State | Meaning |
 | --- | --- |
 | `preferred` | Reachable and among the highest-ranked: it may fill a held place. |
-| `standby` | Known and reachable (it can be dialed, is being dialed, or is connected), but ranked below the gateways that fill the held places. |
+| `standby` | Known and reachable (it can be dialed, is being dialed, or is connected), but ranked below the gateways that fill the held places, or connected under a newer node ID than the one blocks name. |
 | `backoff` | Known, but waiting out a failed dial or a lost connection. It still counts toward the shared hold and may connect inbound during backoff. |
 | `unmatched` | Networking found no connection or usable dial address for this gateway when it ranked it. A missing or expired address record can produce this state. Gateways are usually learned through v2 peer exchange. |
 | `ambiguous` | Networking knows two or more nodes whose node IDs start with this gateway ID, so it prefers none of them and holds no place for the gateway. |

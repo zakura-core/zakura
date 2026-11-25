@@ -1,6 +1,6 @@
 //! A dial to a node's earlier ID reaches the node under the ID it has now
 //! (zakura-quic TLS-7). The dialer registers it once, under that ID, and
-//! never lets such a dial replace a connection the node already has.
+//! closes a redundant dial if the peer is already registered at the local check.
 
 use super::*;
 use crate::zakura::testkit::{ZakuraTestNode, TEST_NET_TIMEOUT};
@@ -276,14 +276,61 @@ async fn a_dial_to_a_moved_gateway_waits_for_an_ordinary_slot() {
 
     ordinary.pop();
     endpoint.handler.publish_gateway_ranking(ranking());
-    dialer
-        .connect_native_to_addr(earlier.clone(), TEST_NET_TIMEOUT)
-        .await
-        .expect("an ordinary slot is free for the moved gateway");
+    // One dial to this address. A maintained dial would keep retrying the old
+    // listener and compete with our rollback dial after the listener stops.
+    let serving = tokio::spawn(dial(earlier.clone()));
     registers(&dialer, &[current]).await;
     assert_eq!(slots(&dialer, &current), 1);
 
+    let report = endpoint.connection_places();
+    assert!(
+        report.gateways[0].connected,
+        "the earlier gateway ID reaches the registered peer"
+    );
+    assert_eq!(
+        report.gateways[0].place,
+        crate::zakura::GatewayPlace::Standby
+    );
+    assert_eq!(report.slots.preferred, 0, "the peer uses an ordinary slot");
+
+    listener.shutdown().await;
+    serving
+        .await
+        .expect("the first dial task finishes")
+        .expect("the first connection closes");
+    registers(&dialer, &[]).await;
+    let rolled_back = ZakuraTestNode::builder(9310)
+        .spawn()
+        .await
+        .expect("listener restarts with its original keys");
+    let restored = rolled_back.node_addr().await;
+    assert_eq!(restored.id, earlier.id);
+    ordinary.push(
+        endpoint
+            .handler
+            .claim_connection(NodeId::from_bytes(&[0xB6; 32]), false)
+            .expect("the last ordinary place is free"),
+    );
+    endpoint.handler.publish_gateway_ranking(ranking());
+    assert!(is_local_limit(&dial(restored.clone()).await));
+
+    tokio::time::pause();
+    tokio::time::advance(DEFAULT_ZAKURA_REDIAL_MAX_BACKOFF).await;
+    tokio::time::resume();
+    endpoint.handler.publish_gateway_ranking(ranking());
+    let mut restored_connection = tokio::spawn(dial(restored));
+    let original_id = [earlier.id];
+    tokio::select! {
+        () = registers(&dialer, &original_id) => {}
+        result = &mut restored_connection => panic!("the rollback dial ended before registration: {result:?}"),
+    }
+    assert_eq!(moved.borrow().current(earlier.id), earlier.id);
+    rolled_back.shutdown().await;
+    restored_connection
+        .await
+        .expect("the rollback dial task finishes")
+        .expect("the restored connection closes");
+
     drop(ordinary);
     dialer.shutdown().await;
-    listener.shutdown().await;
 }

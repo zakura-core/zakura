@@ -1433,6 +1433,7 @@ impl ZakuraEndpoint {
             || self.handler.supervisor.ip_slots.counts(),
             self.handler.limits.total_connections(),
             &registered,
+            &self.supervisor.moved_tx.borrow(),
         )
     }
 
@@ -3895,6 +3896,33 @@ impl ZakuraProtocolHandler {
         metrics::gauge!("zakura.p2p.conn.slots.ordinary").set(split.ordinary as f64);
     }
 
+    /// Charges a dial to the last authenticated ID. When its ordinary slot is
+    /// unavailable, periodically let the original preferred ID try its held place.
+    /// TLS must still prove which ID can keep the slot.
+    fn claim_dial_connection(
+        &self,
+        dialed: NodeId,
+    ) -> Result<ConnectionAdmissionGuard, SlotRefusal> {
+        let moves = &self.supervisor.moved_tx;
+        let expected = moves.borrow().current(dialed);
+        let claim = self.claim_connection(expected, false);
+        if expected == dialed || !matches!(claim, Err(SlotRefusal::Hold)) {
+            return claim;
+        }
+        let preferred = self
+            .supervisor
+            .ip_slots
+            .counts()
+            .preferred_gateways()
+            .contains(&dialed);
+        if preferred
+            && moves.send_if_modified(|moves| moves.take_recheck(dialed, expected, Instant::now()))
+        {
+            return self.claim_connection(dialed, false);
+        }
+        claim
+    }
+
     /// Claims a connection slot for `node`, the dial target or the proven
     /// remote of an inbound connection, as one locked check and charge.
     fn claim_connection(
@@ -3908,14 +3936,8 @@ impl ZakuraProtocolHandler {
             && counts.node_connections(&node).total() == 0;
         let claim = counts.claim_connection(node, inbound, self.limits.max_connections);
         drop(counts);
-        match claim {
-            Ok(SlotClass::Preferred) if inbound => {
-                metrics::counter!("zakura.p2p.conn.accepted.preferred").increment(1);
-            }
-            Err(SlotRefusal::Hold) if !inbound => {
-                metrics::counter!("zakura.p2p.conn.dial.refused.hold").increment(1);
-            }
-            _ => {}
+        if inbound && matches!(claim, Ok(SlotClass::Preferred)) {
+            metrics::counter!("zakura.p2p.conn.accepted.preferred").increment(1);
         }
         if preferred_dial && claim.is_err() {
             metrics::counter!("zakura.p2p.conn.dial.refused.preferred").increment(1);
@@ -6446,17 +6468,15 @@ pub(crate) async fn serve_reported_native_dial_connection(
     kind: NativeDialKind,
 ) -> Result<(), ZakuraHandlerError> {
     let dialed = node_addr.id;
-    // A node known to have moved on from `dialed` is charged under the ID it
-    // has now, so a dial the limits would refuse after TLS ends here.
-    let expected = endpoint
-        .supervisor
-        .moved_node_ids()
-        .borrow()
-        .current(dialed);
     let mut admission = endpoint
         .handler
-        .claim_connection(expected, false)
-        .map_err(|_| ZakuraHandlerError::ResourceLimit(ADMISSION_LIMIT))?;
+        .claim_dial_connection(dialed)
+        .map_err(|refusal| {
+            if refusal == SlotRefusal::Hold {
+                metrics::counter!("zakura.p2p.conn.dial.refused.hold").increment(1);
+            }
+            ZakuraHandlerError::ResourceLimit(ADMISSION_LIMIT)
+        })?;
     let dial_timeout = native_dial_timeout(
         endpoint.quic.config(),
         node_addr.direct.len(),
@@ -6512,8 +6532,7 @@ pub(crate) async fn serve_reported_native_dial_connection(
             // its duplicate rule would then cancel its side of the registered
             // one, once that is older than
             // `ZAKURA_SAME_IP_DUPLICATE_EVICT_MIN_AGE`. A dial to an earlier
-            // ID comes from a stale record or config entry, and must not
-            // replace a live connection.
+            // ID must leave this locally visible registration alone.
             #[cfg(any(test, zakura_sim))]
             endpoint
                 .handler

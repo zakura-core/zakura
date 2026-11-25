@@ -12,9 +12,9 @@
 use std::collections::VecDeque;
 
 use zakura_quic::NodeId;
-use zakura_rt::{collections::HashMap, sync::watch};
+use zakura_rt::{collections::HashMap, sync::watch, time::Instant};
 
-use crate::zakura::ZakuraPeerId;
+use crate::zakura::{ZakuraPeerId, DEFAULT_ZAKURA_REDIAL_MAX_BACKOFF};
 
 /// The most moves the table remembers. A forgotten move costs one redundant
 /// dial, which is closed as soon as it shows the node is already connected.
@@ -23,16 +23,23 @@ pub(crate) const MAX_MOVED_NODE_IDS: usize = 1_024;
 /// The ID each moved node answered a dial with, by the ID that was dialed.
 #[derive(Debug, Default)]
 pub(crate) struct MovedNodeIds {
-    current: HashMap<NodeId, NodeId>,
+    current: HashMap<NodeId, LearnedMove>,
     /// The dialed IDs in `current`, oldest first.
     learned: VecDeque<NodeId>,
+}
+
+#[derive(Debug)]
+struct LearnedMove {
+    connected: NodeId,
+    /// Earliest time a held place may be used to check whether this move still applies.
+    recheck_after: Instant,
 }
 
 impl MovedNodeIds {
     /// The ID that the node dialed as `id` last answered with, or `id` when
     /// no dial has found it under another.
     pub(crate) fn current(&self, id: NodeId) -> NodeId {
-        self.current.get(&id).copied().unwrap_or(id)
+        self.current.get(&id).map_or(id, |entry| entry.connected)
     }
 
     /// Records that a dial to `dialed` reached the node whose ID is
@@ -43,8 +50,12 @@ impl MovedNodeIds {
         if dialed == connected {
             return self.forget(&dialed);
         }
-        match self.current.insert(dialed, connected) {
-            Some(previous) => previous != connected,
+        let entry = LearnedMove {
+            connected,
+            recheck_after: Instant::now() + DEFAULT_ZAKURA_REDIAL_MAX_BACKOFF,
+        };
+        match self.current.insert(dialed, entry) {
+            Some(previous) => previous.connected != connected,
             None => {
                 self.learned.push_back(dialed);
                 if self.learned.len() > MAX_MOVED_NODE_IDS {
@@ -57,6 +68,20 @@ impl MovedNodeIds {
                 true
             }
         }
+    }
+
+    /// Grants at most one retry per backoff interval under the original ID.
+    /// A preferred gateway can then reclaim its place after a key rollback,
+    /// even if the ordinary slots needed by its last known ID stay full.
+    pub(crate) fn take_recheck(&mut self, dialed: NodeId, expected: NodeId, now: Instant) -> bool {
+        let Some(entry) = self.current.get_mut(&dialed) else {
+            return false;
+        };
+        if entry.connected != expected || now < entry.recheck_after {
+            return false;
+        }
+        entry.recheck_after = now + DEFAULT_ZAKURA_REDIAL_MAX_BACKOFF;
+        true
     }
 
     /// Forgets the move learned for `id`. Returns whether there was one.
@@ -73,7 +98,11 @@ impl MovedNodeIds {
     /// node known by an ID is connected, in flight or otherwise accounted
     /// for, since the accounts are kept under the ID a node answers with.
     pub(crate) fn under_either_id(&self, id: NodeId, holds: impl Fn(&NodeId) -> bool) -> bool {
-        holds(&id) || self.current.get(&id).is_some_and(holds)
+        holds(&id)
+            || self
+                .current
+                .get(&id)
+                .is_some_and(|entry| holds(&entry.connected))
     }
 
     /// Whether the node known as `peer` is among `registered`, under that ID
@@ -133,6 +162,19 @@ impl RegisteredPeers {
             .names_registered(peer, &self.registered.borrow_and_update())
     }
 
+    /// Marks registrations seen before sampling an attempt's TLS report and checking its peer.
+    pub(crate) fn mark_seen(&mut self) {
+        self.registered.borrow_and_update();
+    }
+
+    /// Whether the exact ID authenticated by this dial is registered.
+    pub(crate) fn contains_authenticated(&self, id: NodeId) -> bool {
+        self.registered
+            .borrow()
+            .iter()
+            .any(|peer| peer.node_id() == Some(id))
+    }
+
     /// Waits until the registered peers change. Fails once the supervisor is
     /// gone.
     pub(crate) async fn changed(&mut self) -> Result<(), watch::error::RecvError> {
@@ -173,6 +215,21 @@ pub(crate) mod tests {
         // The node added another key: a dial to the first ID finds the third.
         assert!(moved.learn(id(1), id(3)));
         assert_eq!(moved.current(id(1)), id(3));
+    }
+
+    #[test]
+    fn only_one_dial_can_recheck_a_move_after_the_backoff() {
+        let mut moves = MovedNodeIds::default();
+        let (old, current) = (id(1), id(2));
+        moves.learn(old, current);
+        let now = Instant::now();
+        assert!(!moves.take_recheck(old, current, now));
+        let due = now + DEFAULT_ZAKURA_REDIAL_MAX_BACKOFF;
+        assert!(!moves.take_recheck(old, id(3), due));
+        assert!(moves.take_recheck(old, current, due));
+        assert!(!moves.take_recheck(old, current, due));
+        assert_eq!(moves.current(old), current);
+        assert!(moves.take_recheck(old, current, due + DEFAULT_ZAKURA_REDIAL_MAX_BACKOFF));
     }
 
     #[test]

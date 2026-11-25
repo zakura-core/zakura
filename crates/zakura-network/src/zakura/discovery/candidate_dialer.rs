@@ -709,14 +709,26 @@ impl DialWatch {
                         return Some(DialObservation::WatchClosed);
                     }
                 }
-                _ = &mut healthy => return Some(DialObservation::RegistrationHealthy),
+                _ = &mut healthy => {
+                    return Some(if self.peer_is_registered() {
+                        DialObservation::RegistrationHealthy
+                    } else {
+                        DialObservation::RegistrationEnded
+                    });
+                }
             }
         }
     }
 
     /// Whether the peer is registered now, marking the watch seen.
     fn peer_is_registered(&mut self) -> bool {
-        self.registered.names_and_mark_seen(&self.peer_id)
+        // Mark the snapshot seen before reading the TLS report. A registration
+        // published after this point must still wake the worker.
+        self.registered.mark_seen();
+        match self.authenticated() {
+            Some(proved) => self.registered.contains_authenticated(proved.node_id),
+            None => self.registered.names(&self.peer_id),
+        }
     }
 
     fn registration_began(&mut self) {

@@ -1028,13 +1028,15 @@ fn moved_to(dialed: u8, connected: u8) -> watch::Receiver<MovedNodeIds> {
 
 /// The node dialed as 7 answers as 8. The attempt's own dial registered it,
 /// under 8, so the attempt follows that registration and ends as registered
-/// once it is healthy. Without the move it would never see its peer
-/// registered, and would end as a short-lived exchange when the connection
-/// closed, however long that had served.
+/// once it is healthy, even if another dial changes the remembered ID.
 #[tokio::test(start_paused = true)]
 async fn an_attempt_follows_a_moved_node_to_its_registration() {
+    let (moves, moved) = watch::channel(MovedNodeIds::default());
+    moves.send_modify(|moves| {
+        moves.learn(answered_as(7).node_id, answered_as(8).node_id);
+    });
     let (watch, registered_tx, report) =
-        dial_watch_with_moves(7, Vec::new(), moved_to(7, 8), std::future::pending());
+        dial_watch_with_moves(7, Vec::new(), moved, std::future::pending());
     report.authenticated.send(answered_as(8)).unwrap();
     report
         .registration
@@ -1049,6 +1051,10 @@ async fn an_attempt_follows_a_moved_node_to_its_registration() {
         "the registration is not yet healthy"
     );
 
+    moves.send_modify(|moves| {
+        moves.learn(answered_as(7).node_id, answered_as(9).node_id);
+    });
+    registered_tx.send_replace(vec![peer_id(8), peer_id(10)]);
     let outcome = settled.await.unwrap();
     assert_eq!(outcome.result, DiscoveryDialResult::Registered);
     assert_eq!(outcome.authenticated, Some(answered_as(8)));

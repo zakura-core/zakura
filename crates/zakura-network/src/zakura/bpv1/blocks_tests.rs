@@ -3634,6 +3634,67 @@ fn bpv1_83_the_next_block_displaces_a_block_waiting_on_its_parent() {
     table.assert_invariants();
 }
 
+/// bpv1-83 bounds what competing metadata at the next height can evict. Each
+/// sibling retires one block above that height, a retired block never takes a
+/// slot again, and siblings never displace each other.
+#[test]
+fn bpv1_83_siblings_of_the_next_block_evict_each_block_above_it_once() {
+    let t0 = Instant::now();
+    let empty = encode_body(&Profile::TINY, &[], 1).unwrap();
+    let (coding, root) = (empty.coding, empty.part_root);
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let verified = 100;
+    table.step(t0, BlockInput::TipHeight { height: verified });
+    let above: Vec<block::Hash> = (0..4u8).map(|i| block::Hash([0xF2 + i; 32])).collect();
+    for (i, &block_id) in above.iter().enumerate() {
+        let height = verified + 2 + u32::try_from(i).unwrap();
+        assert!(was_admitted(
+            &offer(&mut table, t0, block_id, height, coding, root),
+            block_id
+        ));
+    }
+
+    let mut retired = Vec::new();
+    for i in 0..4u8 {
+        let sibling = block::Hash([0xE0 + i; 32]);
+        let step = offer(&mut table, t0, sibling, verified + 1, coding, root);
+        assert!(was_admitted(&step, sibling));
+        retired.extend(step.events.iter().filter_map(|e| match e {
+            BlockEvent::Retired { block_id } => Some(*block_id),
+            _ => None,
+        }));
+    }
+    let highest_first: Vec<block::Hash> = above.iter().rev().copied().collect();
+    assert_eq!(
+        retired, highest_first,
+        "each block above, highest first, once"
+    );
+
+    let fifth = block::Hash([0xE9; 32]);
+    let refused = offer(&mut table, t0, fifth, verified + 1, coding, root);
+    assert!(
+        !was_admitted(&refused, fifth),
+        "a sibling displaces no sibling"
+    );
+    assert!(!refused
+        .events
+        .iter()
+        .any(|e| matches!(e, BlockEvent::Retired { .. })));
+
+    // A retired block's metadata starts no admission, so it cannot thrash.
+    let again = table.step(
+        t0,
+        BlockInput::MetaReceived {
+            envelope: make_envelope(above[3], coding, root, node_id(1)),
+            from_peer: node_id(1),
+            session_gen: 1,
+        },
+    );
+    assert!(again.outputs.is_empty() && again.events.is_empty());
+    assert_eq!(table.block_phase(&above[3]), Some(BlockPhase::Retired));
+    table.assert_invariants();
+}
+
 /// bpv1-84: a retryable verdict on a block whose parent is not committed keeps
 /// the assembled body and the claim. BPv1 resubmits the same body once the
 /// verified tip reaches the parent, and not before. A retryable verdict with the

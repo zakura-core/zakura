@@ -380,6 +380,16 @@ impl StartCmd {
             return Ok(());
         }
 
+        // The coinbase names a gateway only when the RPC can build coinbases from this config,
+        // so a node that would announce must have one it accepts.
+        if mining.miner_address.is_some() {
+            zakura_rpc::MinerParams::new(&config.network.network, mining.clone()).map_err(
+                |error| {
+                    eyre!("mining.miner_mesh needs a mining config that builds coinbases: {error}")
+                },
+            )?;
+        }
+
         if let Some(gateway) = mining.miner_mesh_gateways.first() {
             if mining.miner_address.is_none() {
                 warn!(
@@ -443,6 +453,9 @@ impl StartCmd {
     /// announces it.
     ///
     /// `own_node_id` is this node's v2 node ID, or `None` when the v2 endpoint is not running.
+    /// A node that lists its own ID in `mining.miner_mesh_gateways` is refused, since it would
+    /// name itself without the checks a gateway needs. Without a v2 endpoint the node cannot
+    /// be that gateway anyway, so its entry is not compared.
     fn local_mesh_gateway(
         config: &ZakuradConfig,
         own_node_id: Option<&[u8; 32]>,
@@ -451,11 +464,17 @@ impl StartCmd {
         if !mining.miner_mesh {
             return Ok(miner_mesh::LocalGateway::default());
         }
+        let own_gateway = own_node_id.map(GatewayId::from_node_id);
         let stands_for = match mining.miner_mesh_gateways.first() {
+            Some(relay) if Some(*relay) == own_gateway => {
+                return Err(eyre!(
+                    "mining.miner_mesh_gateways names this node; leave it empty to name this node"
+                ));
+            }
             Some(relay) => *relay,
-            None => GatewayId::from_node_id(own_node_id.ok_or_else(|| {
+            None => own_gateway.ok_or_else(|| {
                 eyre!("mining.miner_mesh is set but the v2 endpoint is not running")
-            })?),
+            })?,
         };
         let announced = mining.miner_address.is_some().then_some(stands_for);
         Ok(miner_mesh::LocalGateway {

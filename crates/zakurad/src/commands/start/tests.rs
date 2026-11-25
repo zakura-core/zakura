@@ -386,6 +386,62 @@ fn a_node_without_a_miner_address_announces_nothing() {
     );
 }
 
+/// A node that lists its own ID would name itself while skipping the checks a gateway needs.
+#[test]
+fn naming_this_node_in_its_gateway_list_is_refused() {
+    let mut config = announcing_config();
+    config.mining.miner_mesh_gateways = vec![GatewayId::from_node_id(&OWN_NODE_ID)];
+
+    let error = StartCmd::local_mesh_gateway(&config, Some(&OWN_NODE_ID))
+        .expect_err("the node would name itself as if it were a relay");
+    assert!(
+        error
+            .to_string()
+            .contains("mining.miner_mesh_gateways names this node"),
+        "unexpected error: {error}"
+    );
+}
+
+/// A mesh node whose miner settings the RPC rejects would build no coinbase, so it is refused
+/// rather than reporting a gateway its blocks never name. Without the mesh the node starts as
+/// before.
+#[test]
+fn a_mesh_node_with_a_miner_address_for_another_network_is_refused() {
+    let mut config = ZakuradConfig::default();
+    config.network.p2p_stack = P2pStack::Dual;
+    config.mining.miner_address = Some(
+        "tmJymvcUCn1ctbghvTJpXBwHiMEB8P6wxNV"
+            .parse()
+            .expect("a valid Testnet transparent address"),
+    );
+
+    plain_start()
+        .override_config(config.clone())
+        .expect("a node without the mesh keeps its earlier checks");
+
+    config.mining.miner_mesh = true;
+    let error = plain_start()
+        .override_config(config.clone())
+        .expect_err("a Mainnet node cannot pay a Testnet address");
+    assert!(
+        error
+            .to_string()
+            .contains("mining.miner_mesh needs a mining config that builds coinbases"),
+        "unexpected error: {error}"
+    );
+
+    config.mining.miner_mesh_gateways = vec![RELAY];
+    let error = plain_start()
+        .override_config(config)
+        .expect_err("a template node naming a relay is checked the same way");
+    assert!(
+        error
+            .to_string()
+            .contains("mining.miner_mesh needs a mining config that builds coinbases"),
+        "unexpected error: {error}"
+    );
+}
+
 #[test]
 fn a_miner_or_a_node_running_the_miner_mesh_prefers_gateways() {
     let mut config = ZakuradConfig::default();

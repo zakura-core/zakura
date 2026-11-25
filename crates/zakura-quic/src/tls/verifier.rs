@@ -300,6 +300,77 @@ mod tests {
         );
     }
 
+    /// ID-8, ID-12, SEC-2: a credential past either limit is a bad encoding
+    /// to both verifiers, so a dialer refuses it from a listener and a
+    /// listener from a dialer. Each is one step past a credential both
+    /// verifiers read.
+    #[test]
+    fn a_credential_past_a_limit_is_refused_in_both_directions() {
+        let secret = NodeSecretKey::generate();
+        // The node's two keys, then `added` entries of a tag, a length and
+        // bytes. A length with its top bit set marks a fingerprint.
+        let with = |added: &[(u16, u16, usize)]| {
+            let mut bytes = secret.credential().encode();
+            bytes[0] += u8::try_from(added.len()).unwrap();
+            for (tag, length, value) in added {
+                bytes.extend_from_slice(&tag.to_le_bytes());
+                bytes.extend_from_slice(&length.to_le_bytes());
+                bytes.extend(vec![0x5a; *value]);
+            }
+            crate::credential::spki_of(&bytes)
+        };
+        let fingerprints =
+            |count: u16| -> Vec<_> { (4..4 + count).map(|tag| (tag, 0x8020, 32)).collect() };
+        let keys = |last: u16| {
+            let longest = |tag| (tag, 2_592, 2_592);
+            [
+                longest(4),
+                longest(5),
+                longest(6),
+                (7, last, usize::from(last)),
+            ]
+        };
+        // 32 entries and 10,385 bytes are within the limits.
+        let within = [with(&fingerprints(30)), with(&keys(600))];
+        assert_eq!(
+            NodeCredential::from_spki(within[1].as_ref())
+                .map(|credential| credential.encode().len()),
+            Ok(crate::MAX_CREDENTIAL_BYTES)
+        );
+        let past = [with(&fingerprints(31)), with(&keys(601))];
+
+        let name = ServerName::try_from(super::super::UNSENT_SERVER_NAME).unwrap();
+        let dialer_reads = |spki: &[u8], dialed: NodeId| {
+            ServerCertificateVerifier::new(dialed)
+                .verify_server_cert(
+                    &CertificateDer::from(spki),
+                    &[],
+                    &name,
+                    &[],
+                    UnixTime::now(),
+                )
+                .map(|_| ())
+        };
+        let listener_reads = |spki: &[u8]| {
+            ClientCertificateVerifier
+                .verify_client_cert(&CertificateDer::from(spki), &[], UnixTime::now())
+                .map(|_| ())
+        };
+        let bad_encoding = Err(rustls::Error::InvalidCertificate(
+            CertificateError::BadEncoding,
+        ));
+
+        // The ID of the node's two keys names a prefix of each credential.
+        for spki in &within {
+            assert_eq!(dialer_reads(spki.as_ref(), secret.public()), Ok(()));
+            assert_eq!(listener_reads(spki.as_ref()), Ok(()));
+        }
+        for spki in &past {
+            assert_eq!(dialer_reads(spki.as_ref(), secret.public()), bad_encoding);
+            assert_eq!(listener_reads(spki.as_ref()), bad_encoding);
+        }
+    }
+
     fn accepts(dialed: NodeId, presented: &NodeCredential) -> bool {
         let name = ServerName::try_from(super::super::UNSENT_SERVER_NAME).unwrap();
         ServerCertificateVerifier::new(dialed)

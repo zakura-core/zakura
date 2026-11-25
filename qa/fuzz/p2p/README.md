@@ -224,8 +224,8 @@ connection ownership across scheduled IO.
 
 | Target | Property | Decoder |
 | --- | --- | --- |
-| `credential_parse` | `credential/canonical-encoding`, `credential/node-id`, `credential/bounded-parse` | 2 |
-| `key_list_decode` | `key-list/canonical-encoding`, `key-list/stable-id` | 1 |
+| `credential_parse` | `credential/canonical-encoding`, `credential/node-id`, `credential/bounded-parse` | 3 |
+| `key_list_decode` | `key-list/canonical-encoding`, `key-list/stable-id` | 2 |
 | `composite_verify` | `composite/tamper-refused` | 3 |
 
 These targets feed peer-chosen bytes to what `zakura-quic` parses before a v2
@@ -242,12 +242,16 @@ canonical DER, and the node ID from the ID-12 key fingerprints, from the spec
 rather than with the code under test, and compares them with the input and the
 credential's ID. The target
 installs `MeteredAllocator` from this package's library, and no single
-allocation of the two parses may exceed the input's length by more than 256
-bytes.
+allocation of the two parses may exceed the input's length by more than 2,048
+bytes, which covers a table of 33 entries. Decoder 3 accepts credentials of
+up to 32 entries and 10,385 bytes. Decoder 2 refused more than 4 entries and
+bounded a credential by its entry count alone, so inputs it refused are valid
+now.
 
 `key_list_decode` decodes its input as a key list, as discovery does with a
 peer's record. An accepted list re-encodes to exactly the input, and its node
-ID is the ID-9 hash of the input's bytes.
+ID is the ID-9 hash of the input's bytes. Decoder 2 accepts lists of up to 32
+entries, where decoder 1 refused more than 4.
 
 `composite_verify` runs the Ed25519 + ML-DSA-65 verifier once per input. An
 input whose first byte is even carries an Ed25519 key, a `u16`-prefixed

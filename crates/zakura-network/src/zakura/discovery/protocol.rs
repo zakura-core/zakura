@@ -61,7 +61,11 @@ pub const MSG_DISCOVERY_SERVICES: u8 = 5;
 /// protocol range, network, chain, sequence and expiry, and
 /// [`MAX_DIRECT_ADDRS_PER_RECORD`] IPv6 addresses and
 /// [`MAX_SERVICES_PER_RECORD`] maximal service ids.
-pub const MAX_NODE_RECORD_FIELDS_BYTES: usize = 685;
+///
+/// The key list is 1,089 of these bytes: a record carries all 32 entries a
+/// node's list may hold (zakura-quic ID-8), so a reader can derive the
+/// author's node ID. The wire module asserts the sum.
+pub const MAX_NODE_RECORD_FIELDS_BYTES: usize = 1_637;
 
 /// The header of one extension in a record's extension area: a `u16` type
 /// and a `u16` length.
@@ -111,9 +115,10 @@ const SLH_DSA_128S_SIGNATURE_BYTES: usize = 7_856;
 ///
 /// What it costs: any node may fill the area in its own records, so every
 /// bound that scales with a record grows now, not when a signature arrives.
-/// The largest record goes from 753 to 8,649 bytes and a full `Peers`
-/// answer from 24,098 to 276,770 bytes. The row for this limit in
-/// `docs/changelog/params.md` lists the memory bounds that follow.
+/// The room is 7,896 of the 9,601 bytes of the largest record, and of each
+/// of the 32 records in a full `Peers` answer of 307,234 bytes. The row for
+/// this limit in `docs/changelog/params.md` lists the memory bounds that
+/// follow.
 pub const RECORD_SIGNATURE_EXTENSION_BYTES: usize =
     2 * RECORD_EXTENSION_HEADER_BYTES + SLH_DSA_128S_KEY_BYTES + SLH_DSA_128S_SIGNATURE_BYTES;
 
@@ -4540,7 +4545,9 @@ mod tests {
     use std::{net::IpAddr, time::Duration};
 
     use rand_10::{rngs::StdRng, SeedableRng};
-    use zakura_quic::{NodeCredential, NodeSecretKey, ED25519_KEY_TAG, ML_DSA_65_KEY_TAG};
+    use zakura_quic::{
+        CredentialKey, NodeCredential, NodeSecretKey, ED25519_KEY_TAG, ML_DSA_65_KEY_TAG,
+    };
 
     use super::*;
     use crate::zakura::{
@@ -6057,17 +6064,27 @@ mod tests {
     fn a_key_and_signature_fit_beside_the_largest_fields() {
         use super::super::book_file::DiscoveryBookFile;
 
-        // The longest key list: the signer's two keys and two entries this
-        // release cannot read.
+        // The longest key list: the signer's two keys and 30 entries this
+        // release cannot read, each a key given as its fingerprint.
         let signer = secret_key();
-        let own = |tag| (tag, signer.credential().key(tag).unwrap().to_vec());
-        let credential = NodeCredential::from_entries([
-            own(ED25519_KEY_TAG),
-            own(ML_DSA_65_KEY_TAG),
-            (UNREADABLE_KEY_TAG, vec![0x55; 1_312]),
-            (UNREADABLE_KEY_TAG + 1, vec![0x66; 1_312]),
-        ])
-        .expect("four entries in increasing tag order are a valid credential");
+        let own = |tag| {
+            let key = signer.credential().key(tag).unwrap().to_vec();
+            (tag, CredentialKey::Full(key))
+        };
+        let unreadable = (0..30u8).map(|index| {
+            let fingerprint = CredentialKey::Fingerprint([index; 32]);
+            (UNREADABLE_KEY_TAG + u16::from(index), fingerprint)
+        });
+        let credential = NodeCredential::from_entries(
+            [own(ED25519_KEY_TAG), own(ML_DSA_65_KEY_TAG)]
+                .into_iter()
+                .chain(unreadable),
+        )
+        .expect("32 entries in increasing tag order are a valid credential");
+        assert_eq!(
+            credential.key_list().encoded_len(),
+            zakura_quic::MAX_NODE_KEY_LIST_BYTES
+        );
         let signer = signer
             .with_credential(credential)
             .expect("the credential holds the signer's own keys");

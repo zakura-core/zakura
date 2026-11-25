@@ -20,6 +20,7 @@ mod pipe;
 mod preferred_gateways;
 #[cfg(zakura_sim)]
 mod probe;
+mod proven_node;
 mod registry;
 mod service;
 mod session;
@@ -40,6 +41,7 @@ pub use preferred_gateways::{
     RankedGateway, MAX_PREFERRED_GATEWAYS,
 };
 pub(crate) use preferred_gateways::{HeldPlaces, MAX_RANKED_GATEWAYS};
+pub use proven_node::ProvenNode;
 // `SessionGuard` and `ByteBudget` are imported through this re-export; `Admit`
 // and `PeerMeters` are reached directly via the `guard` module path, so they are
 // unused *here* until a later service imports them through `crate::zakura`.

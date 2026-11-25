@@ -68,8 +68,8 @@ use super::transport::{
     ConnectionPlaces, ConnectionResources, FrameGate, FrameGrant, FramedWorkerRecv,
     HandshakeCounts, HeldPlaces, IpAdmission, MovedNodeIds, NeutralCause, NodeResources,
     OrderedStreamFailure, OrderedStreamFailureCause, OwnerBound, OwnerGuard, OwnerPhase,
-    ReactorBudget, ReactorShares, RegisteredPeers, ResourceEnvelope, SessionLayout, SlotClass,
-    SlotRefusal, StreamResources, TransportLimits, COMPAT_EXCHANGE_BUDGET,
+    ProvenNode, ReactorBudget, ReactorShares, RegisteredPeers, ResourceEnvelope, SessionLayout,
+    SlotClass, SlotRefusal, StreamResources, TransportLimits, COMPAT_EXCHANGE_BUDGET,
     COMPAT_RESPONSE_MAX_AGGREGATE_BYTES,
 };
 #[cfg(any(test, feature = "zakura-testkit"))]
@@ -1443,7 +1443,6 @@ impl ZakuraEndpoint {
             || self.handler.supervisor.ip_slots.counts(),
             self.handler.limits.total_connections(),
             &registered,
-            &self.supervisor.moved_tx.borrow(),
         )
     }
 
@@ -1768,18 +1767,21 @@ pub(crate) struct ConnectionAdmissionGuard {
 
 impl ConnectionAdmissionGuard {
     /// The outbound QUIC connection has authenticated the node this guard's
-    /// dial reached, whose ID is `connected`. When that isn't the ID the slot
-    /// was claimed for, the guard holds its slot under `connected` from here
-    /// on.
+    /// dial reached, `connected`. When its ID isn't the one the slot was
+    /// claimed for, the guard holds its slot under that ID from here on.
     ///
     /// The limits apply to `connected` as they did to the claim. A refusal
     /// leaves the guard as it was, and the caller closes the connection.
-    fn outbound_connected(&mut self, connected: NodeId) -> Result<(), SlotRefusal> {
+    fn outbound_connected<'a>(
+        &mut self,
+        connected: impl Into<ProvenNode<'a>>,
+    ) -> Result<(), SlotRefusal> {
         assert!(!self.inbound && !self.authenticated_dial);
+        let connected = connected.into();
         self.slots
             .counts()
             .outbound_connected(self.node, connected, self.ordinary_cap)?;
-        self.node = connected;
+        self.node = connected.id();
         self.authenticated_dial = true;
         Ok(())
     }
@@ -2095,6 +2097,7 @@ impl ZakuraSupervisorHandle {
             .register(
                 1,
                 handle.peer_id().clone(),
+                &[],
                 Some("192.0.2.6".parse().expect("test IP parses")),
                 [6; TRANSCRIPT_HASH_BYTES],
                 handle,
@@ -2330,11 +2333,15 @@ impl ZakuraSupervisorHandle {
         }
     }
 
+    /// Registers the authenticated connection of `peer_id`, whose handshake
+    /// also proved the node IDs `proven_earlier` that the peer had before it
+    /// added keys (zakura-quic TLS-7).
     #[allow(clippy::too_many_arguments)]
     async fn register(
         &self,
         _trace_conn_id: ZakuraConnId,
         peer_id: ZakuraPeerId,
+        proven_earlier: &[NodeId],
         remote_ip: Option<IpAddr>,
         transcript_hash: [u8; TRANSCRIPT_HASH_BYTES],
         outbound_handle: ZakuraPeerHandle,
@@ -2411,7 +2418,12 @@ impl ZakuraSupervisorHandle {
                 set_active_connection_gauge(registered_ids.len());
                 self.peer_set_tx.send_replace(registered_ids);
                 if let Some(peer_registry) = &self.peer_registry {
-                    peer_registry.register_native_connection(peer_id.clone(), conn_id, remote_ip);
+                    peer_registry.register_native_connection(
+                        peer_id.clone(),
+                        conn_id,
+                        remote_ip,
+                        proven_earlier,
+                    );
                 }
                 let _ = self.registration_tx.send(ZakuraConnectionRegistration {
                     peer_id: peer_id.clone(),
@@ -3738,8 +3750,9 @@ impl ZakuraProtocolHandler {
                 elapsed: None,
             }
         );
+        let earlier = connection.remote_earlier_ids();
         let admission = self
-            .claim_connection(connection.remote_id(), true)
+            .claim_slot(ProvenNode::new(connection.remote_id(), &earlier), true)
             .map_err(|refusal| match refusal {
                 SlotRefusal::Hold => InboundRefusal::Hold,
                 SlotRefusal::Full | SlotRefusal::InboundShare => InboundRefusal::Admission,
@@ -3929,7 +3942,7 @@ impl ZakuraProtocolHandler {
     ) -> Result<ConnectionAdmissionGuard, SlotRefusal> {
         let moves = &self.supervisor.moved_tx;
         let expected = moves.borrow().current(dialed);
-        let claim = self.claim_connection_with_ordinary_cap(expected, false, ordinary_cap);
+        let claim = self.claim_slot_with_ordinary_cap(expected.into(), false, ordinary_cap);
         if expected == dialed || !matches!(claim, Err(SlotRefusal::Hold)) {
             return claim;
         }
@@ -3942,38 +3955,55 @@ impl ZakuraProtocolHandler {
         if preferred
             && moves.send_if_modified(|moves| moves.take_recheck(dialed, expected, Instant::now()))
         {
-            return self.claim_connection_with_ordinary_cap(dialed, false, ordinary_cap);
+            return self.claim_slot_with_ordinary_cap(dialed.into(), false, ordinary_cap);
         }
         claim
     }
 
-    /// Claims a connection slot for `node`, the dial target or the proven
-    /// remote of an inbound connection, as one locked check and charge.
+    /// Claims a connection slot for `node`, a dial's target or an inbound
+    /// caller that proved no earlier ID, as one locked check and charge.
+    #[cfg(test)]
     fn claim_connection(
         &self,
         node: NodeId,
         inbound: bool,
     ) -> Result<ConnectionAdmissionGuard, SlotRefusal> {
-        self.claim_connection_with_ordinary_cap(node, inbound, self.limits.max_connections)
+        self.claim_slot(node.into(), inbound)
     }
 
-    fn claim_connection_with_ordinary_cap(
+    /// Claims a connection slot for `node`, as one locked check and charge.
+    /// `node` is a dial's target, which has proved nothing yet, or the
+    /// remote an inbound connection proved, with its earlier IDs.
+    fn claim_slot(
         &self,
-        node: NodeId,
+        node: ProvenNode<'_>,
+        inbound: bool,
+    ) -> Result<ConnectionAdmissionGuard, SlotRefusal> {
+        self.claim_slot_with_ordinary_cap(node, inbound, self.limits.max_connections)
+    }
+
+    /// Keeps discovery's ordinary dials below the ceiling that leaves bootstrap room.
+    fn claim_slot_with_ordinary_cap(
+        &self,
+        node: ProvenNode<'_>,
         inbound: bool,
         ordinary_cap: usize,
     ) -> Result<ConnectionAdmissionGuard, SlotRefusal> {
         let mut counts = self.supervisor.ip_slots.counts();
         let preferred_dial = !inbound
-            && counts.preferred_gateways().contains(&node)
-            && counts.node_connections(&node).total() == 0;
+            && counts.preferred_gateways().contains(&node.id())
+            && counts.node_connections(&node.id()).total() == 0;
         if !preferred_dial
             && ordinary_cap < self.limits.max_connections
             && counts.free_ordinary_connections(ordinary_cap) == 0
         {
             return Err(SlotRefusal::Hold);
         }
-        let claim = counts.claim_connection(node, inbound, self.limits.max_connections);
+        let claim = if inbound {
+            counts.claim_inbound_connection(node, self.limits.max_connections)
+        } else {
+            counts.claim_connection(node.id(), false, self.limits.max_connections)
+        };
         drop(counts);
         if inbound && matches!(claim, Ok(SlotClass::Preferred)) {
             metrics::counter!("zakura.p2p.conn.accepted.preferred").increment(1);
@@ -3987,7 +4017,7 @@ impl ZakuraProtocolHandler {
             #[cfg(any(test, zakura_sim))]
             observation: None,
             slots: self.supervisor.ip_slots.clone(),
-            node,
+            node: node.id(),
             inbound,
             ordinary_cap,
         })
@@ -5329,6 +5359,7 @@ impl ZakuraProtocolHandler {
             .register(
                 context.conn.id,
                 peer_id,
+                &connection.remote_earlier_ids(),
                 remote_ip,
                 context.transcript_hash,
                 outbound_handle,
@@ -6594,9 +6625,12 @@ pub(crate) async fn serve_reported_native_dial_connection(
         // A connection to the node that is still in its own handshake meets
         // this one in `register`, like any simultaneous open.
     }
-    if admission.outbound_connected(remote_node_id).is_err() {
-        // The dial claimed a preferred gateway's held place, which the ID
-        // the node answers with doesn't keep, and no ordinary slot is free.
+    let earlier = connection.remote_earlier_ids();
+    let proven = ProvenNode::new(remote_node_id, &earlier);
+    if admission.outbound_connected(proven).is_err() {
+        // The dial claimed a held place for a gateway the node doesn't
+        // answer for, or the node makes its gateway ambiguous, and no
+        // ordinary slot is free.
         metrics::counter!("zakura.p2p.conn.dial.refused.hold").increment(1);
         #[cfg(any(test, zakura_sim))]
         endpoint
@@ -9938,6 +9972,7 @@ mod tests {
             .register(
                 test_conn_id(),
                 peer_id.clone(),
+                &[],
                 Some("192.0.2.6".parse().expect("test IP parses")),
                 [6; TRANSCRIPT_HASH_BYTES],
                 ZakuraPeerHandle::new_for_tests(peer_id.clone(), outbound_tx),
@@ -10026,6 +10061,7 @@ mod tests {
                 .register(
                     test_conn_id(),
                     peer.clone(),
+                    &[],
                     Some("203.0.113.12".parse().expect("test ip parses")),
                     [0; TRANSCRIPT_HASH_BYTES],
                     ZakuraPeerHandle::new_for_tests(peer.clone(), outbound_tx),
@@ -10068,6 +10104,7 @@ mod tests {
                 .register(
                     conn_id,
                     peer.clone(),
+                    &[],
                     Some(remote_ip),
                     transcript_hash,
                     outbound_handle,
@@ -10567,6 +10604,7 @@ mod tests {
             .register(
                 test_conn_id(),
                 peer.clone(),
+                &[],
                 None,
                 [peer.as_bytes()[0]; TRANSCRIPT_HASH_BYTES],
                 outbound_handle,
@@ -10593,6 +10631,7 @@ mod tests {
             .register(
                 conn_id,
                 peer.clone(),
+                &[],
                 remote_ip,
                 transcript_hash,
                 outbound_handle,
@@ -11676,6 +11715,7 @@ mod tests {
                 .register(
                     test_conn_id(),
                     peer.clone(),
+                    &[],
                     None,
                     [peer.as_bytes()[0]; TRANSCRIPT_HASH_BYTES],
                     outbound_handle,
@@ -11747,6 +11787,7 @@ mod tests {
                 .register(
                     test_conn_id(),
                     peer.clone(),
+                    &[],
                     Some(ip),
                     [peer.as_bytes()[0]; TRANSCRIPT_HASH_BYTES],
                     outbound_handle,
@@ -11810,6 +11851,7 @@ mod tests {
                 .register(
                     test_conn_id(),
                     peer.clone(),
+                    &[],
                     Some(ip),
                     [peer.as_bytes()[0]; TRANSCRIPT_HASH_BYTES],
                     outbound_handle,
@@ -11878,6 +11920,7 @@ mod tests {
                 .register(
                     test_conn_id(),
                     peer.clone(),
+                    &[],
                     ip,
                     [peer.as_bytes()[0]; TRANSCRIPT_HASH_BYTES],
                     outbound_handle,
@@ -12089,6 +12132,7 @@ mod tests {
                 .register(
                     test_conn_id(),
                     peer.clone(),
+                    &[],
                     None,
                     [0; TRANSCRIPT_HASH_BYTES],
                     ZakuraPeerHandle::new_for_tests(peer.clone(), outbound),
@@ -15352,6 +15396,7 @@ mod tests {
                 .register(
                     test_conn_id(),
                     peer.clone(),
+                    &[],
                     remote_ip,
                     [peer.as_bytes()[0]; TRANSCRIPT_HASH_BYTES],
                     outbound_handle,
@@ -15533,6 +15578,7 @@ mod tests {
             .register(
                 test_conn_id(),
                 peer.clone(),
+                &[],
                 Some(ip),
                 [1; TRANSCRIPT_HASH_BYTES],
                 ZakuraPeerHandle::new_for_tests(peer, outbound_tx),
@@ -15693,6 +15739,7 @@ mod tests {
             .register(
                 test_conn_id(),
                 peer.clone(),
+                &[],
                 Some(ip.parse().expect("test ip parses")),
                 [peer.as_bytes()[0]; TRANSCRIPT_HASH_BYTES],
                 ZakuraPeerHandle::new_for_tests(peer.clone(), outbound_tx),

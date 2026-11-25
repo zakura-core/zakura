@@ -24,6 +24,33 @@ fn unresolved(node: NodeId, blocks: u32) -> RankedGateway {
     RankedGateway::unresolved(GatewayId::from_node_id(node.as_bytes()), blocks)
 }
 
+/// A set as one more connection changes it, for the tests of one owner at a
+/// time.
+trait Connecting {
+    /// The set re-formed once a connection has proved `node`, which proved
+    /// no earlier ID, while no other ID holds a slot.
+    fn with_connected(&self, node: &NodeId) -> Option<PreferredGateways>;
+}
+
+impl Connecting for PreferredGateways {
+    fn with_connected(&self, node: &NodeId) -> Option<PreferredGateways> {
+        self.with_owners([ProvenNode::from(*node)], |_| false)
+    }
+}
+
+/// Each gateway's resolution, in rank order.
+fn resolutions(formed: &PreferredGateways) -> Vec<GatewayResolution> {
+    formed
+        .places()
+        .map(|(gateway, _)| gateway.resolution())
+        .collect()
+}
+
+/// No node ID holds a connection slot.
+fn no_slots(_: &NodeId) -> bool {
+    false
+}
+
 /// Each ranked gateway's place, in rank order: with one place held, a
 /// gateway in backoff counts towards the hold but leaves the set to the best
 /// dialable gateway, the next dialable gateway waits on standby, and an
@@ -357,4 +384,231 @@ fn an_unproved_dial_resolves_no_gateway() {
             .collect::<Vec<_>>(),
         vec![GatewayMatch::One((dialed, GatewayStanding::Dialing))]
     );
+}
+
+/// Blocks name a gateway by the node ID it had before it added a key. The
+/// connected node that proved that ID fills the gateway's place under the ID
+/// it has now, whether the gateway named the earlier ID or nobody.
+#[test]
+fn a_node_that_proved_an_earlier_id_fills_that_gateways_place() {
+    let (earlier, current, other) = (raw_node(1, 0x00), raw_node(2, 0x00), raw_node(3, 0x00));
+    let proved = [earlier];
+    let owner = ProvenNode::new(current, &proved);
+    let connected = GatewayMatch::One((current, GatewayStanding::Connected));
+
+    for named in [
+        unresolved(earlier, 5),
+        RankedGateway::resolved(earlier, 5, GatewayStanding::Dialable),
+        RankedGateway::resolved(earlier, 5, GatewayStanding::Backoff),
+    ] {
+        let formed = PreferredGateways::form([named], 1);
+        let moved = formed
+            .with_owners([owner], no_slots)
+            .expect("the owner answers for the gateway");
+        assert_eq!(resolutions(&moved), [connected]);
+        assert_eq!(moved.set(), [current]);
+        assert_eq!(moved.hold(), 1);
+        assert_eq!(
+            moved.places().map(|(_, place)| place).collect::<Vec<_>>(),
+            [GatewayPlace::Preferred]
+        );
+        assert_eq!(moved.with_owners([owner], no_slots), None, "nothing new");
+
+        // A node that proved no earlier ID, or another one, answers for
+        // nothing here.
+        assert_eq!(
+            formed.with_owners([ProvenNode::from(current)], no_slots),
+            None
+        );
+        let unrelated = [other];
+        assert_eq!(
+            formed.with_owners([ProvenNode::new(current, &unrelated)], no_slots),
+            None
+        );
+    }
+}
+
+/// While a dial to the earlier ID is still in flight, the gateway goes on
+/// naming that ID: the dial holds the gateway's place and settles the
+/// gateway when TLS shows which node it reached.
+#[test]
+fn an_earlier_id_with_a_dial_in_flight_keeps_its_gateway() {
+    let (earlier, current) = (raw_node(1, 0x00), raw_node(2, 0x00));
+    let proved = [earlier];
+    let owner = ProvenNode::new(current, &proved);
+    let formed = PreferredGateways::form(
+        [RankedGateway::resolved(
+            earlier,
+            5,
+            GatewayStanding::Dialing,
+        )],
+        1,
+    );
+
+    assert_eq!(formed.with_owners([owner], |id| *id == earlier), None);
+    let settled = formed
+        .with_owners([owner], no_slots)
+        .expect("the dial's slot has left the earlier ID");
+    assert_eq!(settled.set(), [current]);
+}
+
+/// Two connected nodes that answer for one gateway make it ambiguous,
+/// whichever is seen first and whether both proved its ID as an earlier one
+/// or one of them still has it. A key holder that runs two nodes fills no
+/// place with either, so it never holds more than the gateway's one.
+#[test]
+fn two_connected_nodes_that_answer_for_one_gateway_make_it_ambiguous() {
+    let (earlier, first, second) = (raw_node(1, 0x00), raw_node(2, 0x00), raw_node(3, 0x00));
+    let proved = [earlier];
+    let moved = [
+        ProvenNode::new(first, &proved),
+        ProvenNode::new(second, &proved),
+    ];
+    let with_exact = [ProvenNode::from(earlier), ProvenNode::new(first, &proved)];
+
+    // The gateway as the first owner alone resolves it: it names that owner.
+    let named_first = PreferredGateways::form([unresolved(earlier, 5)], 1)
+        .with_owners([moved[0]], no_slots)
+        .expect("one owner fills the place")
+        .ranking[0];
+    for named in [
+        unresolved(earlier, 5),
+        RankedGateway::resolved(earlier, 5, GatewayStanding::Dialable),
+        RankedGateway::resolved(earlier, 5, GatewayStanding::Connected),
+        named_first,
+    ] {
+        let formed = PreferredGateways::form([named], 1);
+        for owners in [moved, with_exact] {
+            for owners in [owners, [owners[1], owners[0]]] {
+                let both = formed
+                    .with_owners(owners, |id| owners.iter().any(|owner| owner.id() == *id))
+                    .expect("two owners change the gateway");
+                assert_eq!(resolutions(&both), [GatewayMatch::Several], "{owners:?}");
+                assert!(both.set().is_empty());
+                assert_eq!(both.hold(), 0);
+            }
+        }
+    }
+
+    // One at a time: the first owner fills the place, and the second makes
+    // the gateway ambiguous when it is told about both.
+    let formed = PreferredGateways::form([unresolved(earlier, 5)], 1);
+    let one = formed.with_owners([moved[0]], no_slots).expect("one owner");
+    assert_eq!(one.set(), [first]);
+    let both = one
+        .with_owners(moved, |id| *id == first)
+        .expect("a second owner");
+    assert_eq!(resolutions(&both), [GatewayMatch::Several]);
+}
+
+/// A gateway resolved to a node through an earlier ID, which has since
+/// lost its connection, is taken over by the next node that proves the ID.
+/// A node with the gateway's own prefix is another matter: nothing says it
+/// is the same key holder, so the gateway becomes ambiguous.
+#[test]
+fn a_node_that_left_gives_its_gateway_to_the_next_node_that_proves_the_id() {
+    let (earlier, left, next) = (raw_node(1, 0x00), raw_node(2, 0x00), raw_node(3, 0x00));
+    let proved = [earlier];
+    let formed = PreferredGateways::form([unresolved(earlier, 5)], 1)
+        .with_owners([ProvenNode::new(left, &proved)], no_slots)
+        .expect("the first node fills the place");
+    let released = formed.with_released(&left).expect("the node left");
+    assert_eq!(
+        resolutions(&released),
+        [GatewayMatch::One((left, GatewayStanding::Backoff))]
+    );
+
+    let taken = released
+        .with_owners([ProvenNode::new(next, &proved)], no_slots)
+        .expect("the next node answers for the gateway");
+    assert_eq!(taken.set(), [next]);
+
+    let sharing = raw_node(1, 0xff);
+    let named = PreferredGateways::form(
+        [RankedGateway::resolved(
+            sharing,
+            5,
+            GatewayStanding::Backoff,
+        )],
+        1,
+    );
+    let ambiguous = named
+        .with_owners([ProvenNode::new(next, &proved)], no_slots)
+        .expect("another node has the gateway's own ID");
+    assert_eq!(resolutions(&ambiguous), [GatewayMatch::Several]);
+}
+
+/// While blocks name a node by an earlier ID and by its new one, two ranked
+/// gateways name the one node. It counts once towards the hold and fills
+/// one place, and the next gateway keeps its own.
+#[test]
+fn a_node_that_two_gateways_name_fills_one_place() {
+    let (earlier, current, other) = (raw_node(1, 0x00), raw_node(2, 0x00), raw_node(3, 0x00));
+    let proved = [earlier];
+    let formed = PreferredGateways::form(
+        [
+            unresolved(earlier, 9),
+            RankedGateway::resolved(current, 8, GatewayStanding::Dialable),
+            RankedGateway::resolved(other, 7, GatewayStanding::Dialable),
+        ],
+        MAX_PREFERRED_GATEWAYS,
+    );
+    assert_eq!((formed.hold(), formed.set()), (2, &[current, other][..]));
+
+    let connected = formed
+        .with_owners([ProvenNode::new(current, &proved)], no_slots)
+        .expect("the node answers for both gateways");
+    assert_eq!(connected.hold(), 2, "one place for each node");
+    assert_eq!(connected.set(), [current, other]);
+    assert_eq!(
+        connected
+            .places()
+            .map(|(gateway, place)| (gateway.node(), place))
+            .collect::<Vec<_>>(),
+        [
+            (Some(current), GatewayPlace::Preferred),
+            (Some(current), GatewayPlace::Preferred),
+            (Some(other), GatewayPlace::Preferred),
+        ]
+    );
+
+    // With one place, the node fills it once and the next gateway waits.
+    let one = PreferredGateways::form(connected.ranking.clone(), 1);
+    assert_eq!((one.hold(), one.set()), (1, &[current][..]));
+
+    // Losing its connection puts both of its gateways in backoff.
+    let released = connected.with_released(&current).expect("the node left");
+    assert_eq!(released.set(), [other]);
+    assert_eq!(
+        resolutions(&released)[..2],
+        [GatewayMatch::One((current, GatewayStanding::Backoff)); 2]
+    );
+}
+
+/// A gateway tied at the ranking cutoff joins when a connected node answers
+/// for it through an earlier ID, as it does for a node with its own ID.
+#[test]
+fn a_tied_gateway_joins_for_a_node_that_proved_its_earlier_id() {
+    let (earlier, current) = (raw_node(0xEE, 0x00), raw_node(0xEF, 0x00));
+    let proved = [earlier];
+    let ranked = (0..MAX_RANKED_GATEWAYS)
+        .map(|index| {
+            let mut bytes = [0; 32];
+            // The index fits two bytes: a ranking keeps 256 gateways.
+            bytes[..2].copy_from_slice(&(index as u16).to_be_bytes());
+            unresolved(NodeId::from_bytes(&bytes), 1)
+        })
+        .chain([unresolved(earlier, 1)]);
+    let ranking: GatewayRanking = ranked.collect();
+    let gateway = GatewayId::from_node_id(earlier.as_bytes());
+    let joins = |owner: ProvenNode<'_>| {
+        ranking
+            .candidates([owner].into_iter())
+            .iter()
+            .any(|candidate| candidate.gateway() == gateway)
+    };
+
+    assert!(joins(ProvenNode::new(current, &proved)));
+    assert!(joins(ProvenNode::from(earlier)));
+    assert!(!joins(ProvenNode::from(current)));
 }

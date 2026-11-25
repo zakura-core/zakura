@@ -9,6 +9,7 @@ use std::{
 
 use futures::task::AtomicWaker;
 use zakura_chain::block;
+use zakura_quic::{NodeId, MAX_EARLIER_NODE_IDS};
 
 mod delivery;
 mod delivery_trace;
@@ -74,7 +75,7 @@ struct RegistryState {
 }
 
 /// The current authenticated native connection of one peer.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct NativeConnection {
     /// The connection's id.
     conn_id: ZakuraConnId,
@@ -82,6 +83,24 @@ struct NativeConnection {
     /// The remote IP of the QUIC connection that proved the peer's node ID, if the
     /// transport reported one.
     remote_ip: Option<IpAddr>,
+
+    /// The node IDs the peer had before it added keys, which the connection's handshake
+    /// proved as well (zakura-quic TLS-7). At most [`MAX_EARLIER_NODE_IDS`].
+    earlier: Vec<NodeId>,
+}
+
+/// The native connection that proves a peer is the node known by some node ID.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NativeProof {
+    /// The remote IP of the QUIC connection, if the transport reported one. It is the
+    /// connection's own, not the legacy handshake address attached to it, which a peer
+    /// that only relayed the upgrade could have supplied.
+    pub(crate) remote_ip: Option<IpAddr>,
+
+    /// The peer id the connection is registered under, when it is not the one asked
+    /// for. The peer has added keys since it had that node ID, and its handshake proved
+    /// it still holds the keys that ID names.
+    pub(crate) moved_to: Option<ZakuraPeerId>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -123,19 +142,37 @@ impl PeerRegistry {
             .collect()
     }
 
-    /// Returns the remote IP of the authenticated native connection of `peer_id`.
+    /// Returns the authenticated native connection that proves its peer is the node
+    /// known as `peer_id`, or `None` when no native connection does.
     ///
-    /// Returns `None` when no native connection proves `peer_id`, and `Some(None)` when
-    /// one does but the transport reported no remote IP. The IP is the QUIC connection's
-    /// own, not the legacy handshake address attached to it, which a peer that only
-    /// relayed the upgrade could have supplied.
-    pub(crate) fn native_connection_ip(&self, peer_id: &ZakuraPeerId) -> Option<Option<IpAddr>> {
-        self.inner
+    /// That is the connection registered under `peer_id`. Without one, it is a connection
+    /// whose handshake proved `peer_id` as a node ID the peer had before it added keys:
+    /// the peer holds the keys `peer_id` names and signed with them. When several such
+    /// connections exist, the one registered first answers, so the answer doesn't move
+    /// between them.
+    pub(crate) fn native_connection_proving(&self, peer_id: &ZakuraPeerId) -> Option<NativeProof> {
+        let state = self
+            .inner
             .lock()
-            .expect("peer registry mutex is never poisoned")
+            .expect("peer registry mutex is never poisoned");
+        if let Some(connection) = state.native_connections.get(peer_id) {
+            return Some(NativeProof {
+                remote_ip: connection.remote_ip,
+                moved_to: None,
+            });
+        }
+        // Only a moved or disconnected peer gets here. The scan reads at most
+        // `MAX_EARLIER_NODE_IDS` IDs for each native connection.
+        let earlier = peer_id.node_id()?;
+        state
             .native_connections
-            .get(peer_id)
-            .map(|connection| connection.remote_ip)
+            .iter()
+            .filter(|(_, connection)| connection.earlier.contains(&earlier))
+            .min_by_key(|(_, connection)| connection.conn_id)
+            .map(|(current, connection)| NativeProof {
+                remote_ip: connection.remote_ip,
+                moved_to: Some(current.clone()),
+            })
     }
 
     /// Register one legacy connection until the returned guard drops.
@@ -206,7 +243,8 @@ impl PeerRegistry {
     }
 
     /// Register one authenticated native `conn_id`, whose QUIC connection comes from
-    /// `remote_ip`, if the transport reported it.
+    /// `remote_ip`, if the transport reported it. `proven_earlier` are the node IDs the
+    /// peer had before it added keys, as far as the connection's handshake proved them.
     ///
     /// Retained outbound metadata follows a reconnect to its new `conn_id`.
     pub(crate) fn register_native_connection(
@@ -214,12 +252,22 @@ impl PeerRegistry {
         peer_id: ZakuraPeerId,
         conn_id: ZakuraConnId,
         remote_ip: Option<IpAddr>,
+        proven_earlier: &[NodeId],
     ) {
         let mut state = self
             .inner
             .lock()
             .expect("peer registry mutex is never poisoned");
-        let connection = NativeConnection { conn_id, remote_ip };
+        let connection = NativeConnection {
+            conn_id,
+            remote_ip,
+            // A handshake proves no more, so the bound doesn't rest on the caller.
+            earlier: proven_earlier
+                .iter()
+                .take(MAX_EARLIER_NODE_IDS)
+                .copied()
+                .collect(),
+        };
         if let Some(previous) = state.native_connections.insert(peer_id.clone(), connection) {
             state
                 .active_connections
@@ -475,9 +523,9 @@ mod tests {
     fn native_replacement_ignores_stale_disconnect() {
         let registry = PeerRegistry::default();
         let peer_id = peer_id(1);
-        registry.register_native_connection(peer_id.clone(), 1, None);
+        registry.register_native_connection(peer_id.clone(), 1, None, &[]);
         assert!(registry.attach_native_metadata(peer_id.clone(), 1, peer(1), true));
-        registry.register_native_connection(peer_id.clone(), 2, None);
+        registry.register_native_connection(peer_id.clone(), 2, None, &[]);
 
         registry.deregister_native_connection(&peer_id, 1);
         assert_eq!(registry.connected_peers(), vec![peer(1)]);
@@ -561,11 +609,83 @@ mod tests {
         );
     }
 
+    /// A pin or any other caller that knows a peer by a node ID finds the connection
+    /// registered under it, or one whose handshake proved it as an earlier ID. A
+    /// connection that proved neither answers for nothing.
+    #[test]
+    fn a_native_connection_proves_its_id_and_the_earlier_ids_of_its_handshake() {
+        let node = |byte: u8| NodeId::from_bytes(&[byte; 32]);
+        let id = |byte: u8| ZakuraPeerId::from_node_id(node(byte));
+        let ip = |last: u8| Some(IpAddr::from([192, 0, 2, last]));
+        let registry = PeerRegistry::default();
+        assert_eq!(registry.native_connection_proving(&id(1)), None);
+
+        // The peer known as 1 added a key and registers as 2.
+        registry.register_native_connection(id(2), 7, ip(2), &[node(1)]);
+        assert_eq!(
+            registry.native_connection_proving(&id(2)),
+            Some(NativeProof {
+                remote_ip: ip(2),
+                moved_to: None,
+            })
+        );
+        assert_eq!(
+            registry.native_connection_proving(&id(1)),
+            Some(NativeProof {
+                remote_ip: ip(2),
+                moved_to: Some(id(2)),
+            })
+        );
+        assert_eq!(registry.native_connection_proving(&id(3)), None);
+        // A legacy peer id is not a node ID, so no handshake proved it.
+        let legacy = ZakuraPeerId::new(vec![1; 20]).expect("test peer id is valid");
+        assert_eq!(registry.native_connection_proving(&legacy), None);
+
+        // A connection registered under the exact ID answers first.
+        registry.register_native_connection(id(1), 9, ip(1), &[]);
+        assert_eq!(
+            registry.native_connection_proving(&id(1)),
+            Some(NativeProof {
+                remote_ip: ip(1),
+                moved_to: None,
+            })
+        );
+        registry.deregister_native_connection(&id(1), 9);
+
+        // Of two connections that prove the ID, the one registered first, which has
+        // the lower connection id, answers.
+        registry.register_native_connection(id(4), 3, ip(4), &[node(1)]);
+        assert_eq!(
+            registry
+                .native_connection_proving(&id(1))
+                .and_then(|proof| proof.moved_to),
+            Some(id(4))
+        );
+        registry.deregister_native_connection(&id(4), 3);
+        registry.deregister_native_connection(&id(2), 7);
+        assert_eq!(registry.native_connection_proving(&id(1)), None);
+    }
+
+    /// The registry keeps no more earlier IDs for a connection than a handshake proves.
+    #[test]
+    fn a_native_connection_keeps_a_bounded_number_of_earlier_ids() {
+        let node = |byte: u8| NodeId::from_bytes(&[byte; 32]);
+        let registry = PeerRegistry::default();
+        let many: Vec<NodeId> = (1..=10).map(node).collect();
+        registry.register_native_connection(peer_id(0xFF), 1, None, &many);
+
+        let state = registry.inner.lock().expect("the mutex is not poisoned");
+        assert_eq!(
+            state.native_connections[&peer_id(0xFF)].earlier,
+            many[..MAX_EARLIER_NODE_IDS]
+        );
+    }
+
     #[test]
     fn native_metadata_can_arrive_after_registration() {
         let registry = PeerRegistry::default();
         let peer_id = peer_id(2);
-        registry.register_native_connection(peer_id.clone(), 1, None);
+        registry.register_native_connection(peer_id.clone(), 1, None, &[]);
         assert!(registry.connected_peers().is_empty());
 
         assert!(registry.attach_native_metadata(peer_id, 1, peer(1), true));
@@ -576,15 +696,15 @@ mod tests {
     fn stale_native_metadata_cannot_replace_active_or_retained_metadata() {
         let registry = PeerRegistry::default();
         let peer_id = peer_id(3);
-        registry.register_native_connection(peer_id.clone(), 1, None);
+        registry.register_native_connection(peer_id.clone(), 1, None, &[]);
         assert!(registry.attach_native_metadata(peer_id.clone(), 1, peer(1), true));
-        registry.register_native_connection(peer_id.clone(), 2, None);
+        registry.register_native_connection(peer_id.clone(), 2, None, &[]);
 
         assert!(!registry.attach_native_metadata(peer_id.clone(), 1, peer(2), true));
         assert_eq!(registry.connected_peers(), vec![peer(1)]);
 
         registry.deregister_native_connection(&peer_id, 2);
-        registry.register_native_connection(peer_id, 3, None);
+        registry.register_native_connection(peer_id, 3, None, &[]);
         assert_eq!(registry.connected_peers(), vec![peer(1)]);
     }
 
@@ -592,12 +712,12 @@ mod tests {
     fn transient_native_metadata_does_not_survive_reconnect() {
         let registry = PeerRegistry::default();
         let peer_id = peer_id(4);
-        registry.register_native_connection(peer_id.clone(), 1, None);
+        registry.register_native_connection(peer_id.clone(), 1, None, &[]);
         assert!(registry.attach_native_metadata(peer_id.clone(), 1, peer(1), false));
         assert_eq!(registry.connected_peers(), vec![peer(1)]);
 
         registry.deregister_native_connection(&peer_id, 1);
-        registry.register_native_connection(peer_id, 2, None);
+        registry.register_native_connection(peer_id, 2, None, &[]);
         assert!(registry.connected_peers().is_empty());
     }
 

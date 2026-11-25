@@ -65,6 +65,17 @@ closed: it neither dials nor prefers any of them, holds no place for the
 gateway, and reports it as `ambiguous`. A node also never ranks the gateway ID
 its own node ID starts with.
 
+A gateway that adds a key to its node credential, as a later release may do
+for a new signature scheme, has a new node ID, while blocks go on naming the
+earlier one until its miners update. Its connections still prove the earlier
+ID, because it signs with the keys that ID was made from. Networking
+therefore takes a connected node for the gateway its node ID names and for
+the gateway each earlier ID it proved names, whichever side opened the
+connection, and the gateway keeps its held place under its new node ID. Only
+the holder of the gateway's keys can prove its earlier ID. When two connected
+nodes answer for one gateway ID, networking prefers neither, as with two
+nodes that share the ID.
+
 A block whose coinbase carries a marker in an earlier format names no
 gateway: the node ignores the marker and counts the block as naming none.
 
@@ -170,17 +181,18 @@ counts, the places it holds, and its v2 peers. In this example the node has
 | `window.checked` | Heights in the window read so far. |
 | `window.coverage` | The share of the window read, from 0 to 1. Below 1 the counts are a lower bound, as on a pruned node. A tip below 10 has an empty window, which reports 1. |
 | `gateways` | The last ranking applied by v2 networking, best first, at most 256 gateways. Only gateways named in at least 10 counted blocks are ranked, and the gateway ID this node's own ID starts with is left out. |
-| `gateways[].gateway_id` | The gateway ID in hex: the 20 bytes the blocks name, the first 20 bytes of the gateway's v2 node ID. Peers report their full 32-byte node IDs as `node_id`. |
+| `gateways[].gateway_id` | The gateway ID in hex: the 20 bytes the blocks name, the first 20 bytes of the gateway's v2 node ID, or of the node ID it had before it added a key. Peers report their full 32-byte node IDs as `node_id`. |
 | `gateways[].state` | See below. |
 | `gateways[].connected` | The gateway is a v2 peer now. |
 | `hold` | The connection places held for preferred gateways. |
 | `slots` | How connection slots are used, or null without v2 networking. `limit` includes all funded ordinary and gateway places. `in_use` is `preferred` plus `ordinary`; `preferred` counts one slot per preferred gateway connected; `inbound` counts slots of connections the remote node opened. |
 | `peers` | Every v2 peer connected now, ordered by node ID, at most the connection limit. A peer connected both ways counts as inbound. |
 
-If a node dials a gateway by an earlier ID and authenticates its newer ID,
-the earlier gateway remains connected in this report while the connection and
-the remembered move last, even after the earlier address record is evicted.
-Two distinct known IDs with the same gateway prefix still make it ambiguous.
+A gateway that blocks name by an earlier node ID is reported as connected,
+and in its place, while a connection that proved that ID lasts, in either
+direction and even after the earlier address record is evicted. `peers` lists
+the connection under the node ID the gateway has now. Two distinct known IDs
+with the same gateway prefix still make it ambiguous.
 
 A gateway's `state` reads its standing in v2 networking together with the
 preferred set:
@@ -188,10 +200,10 @@ preferred set:
 | State | Meaning |
 | --- | --- |
 | `preferred` | Reachable and among the highest-ranked: it may fill a held place. |
-| `standby` | Known and reachable (it can be dialed, is being dialed, or is connected), but ranked below the gateways that fill the held places, or connected under a newer node ID than the one blocks name. |
+| `standby` | Known and reachable (it can be dialed, is being dialed, or is connected), but ranked below the gateways that fill the held places. |
 | `backoff` | Known, but waiting out a failed dial or a lost connection. It still counts toward the shared hold and may connect inbound during backoff. |
 | `unmatched` | Networking found no connection or usable dial address for this gateway when it ranked it. A missing or expired address record can produce this state. Gateways are usually learned through v2 peer exchange. |
-| `ambiguous` | Networking knows two or more nodes whose node IDs start with this gateway ID, so it prefers none of them and holds no place for the gateway. |
+| `ambiguous` | Networking knows two or more nodes whose node IDs start with this gateway ID, or two connected nodes that proved a node ID that does, so it prefers none of them and holds no place for the gateway. |
 
 On Mainnet, `synced` can turn false while `gateways` and `hold` still show the
 previous ranking. The tracker rechecks tip freshness on progress and at

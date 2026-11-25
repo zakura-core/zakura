@@ -433,25 +433,35 @@ impl StartCmd {
         config.mining.miner_address.is_some() || config.mining.miner_mesh
     }
 
-    /// Returns the gateway the coinbases this node builds name, or `None` when
-    /// `mining.miner_mesh` is off.
+    /// Returns this node's part in the miner mesh: the gateway its coinbases name, if any, and
+    /// the gateway it stands for, if any.
     ///
-    /// That is the gateway `mining.miner_mesh_gateways` names when it names one, and otherwise
-    /// this node, by `own_node_id`: its v2 node ID, or `None` when the v2 endpoint is not
-    /// running.
-    fn announced_gateway(
+    /// A node announces a gateway only when it builds coinbases, so it needs a miner address
+    /// and `mining.miner_mesh`. It announces the gateway `mining.miner_mesh_gateways` names,
+    /// or else itself. A node that names itself stands for itself, with or without a miner
+    /// address, as a relay does; a node that names a relay stands for the relay while it
+    /// announces it.
+    ///
+    /// `own_node_id` is this node's v2 node ID, or `None` when the v2 endpoint is not running.
+    fn local_mesh_gateway(
         config: &ZakuradConfig,
         own_node_id: Option<&[u8; 32]>,
-    ) -> Result<Option<GatewayId>, Report> {
-        if !config.mining.miner_mesh {
-            return Ok(None);
+    ) -> Result<miner_mesh::LocalGateway, Report> {
+        let mining = &config.mining;
+        if !mining.miner_mesh {
+            return Ok(miner_mesh::LocalGateway::default());
         }
-        if let Some(gateway) = config.mining.miner_mesh_gateways.first() {
-            return Ok(Some(*gateway));
-        }
-        let own_node_id = own_node_id
-            .ok_or_else(|| eyre!("mining.miner_mesh is set but the v2 endpoint is not running"))?;
-        Ok(Some(GatewayId::from_node_id(own_node_id)))
+        let stands_for = match mining.miner_mesh_gateways.first() {
+            Some(relay) => *relay,
+            None => GatewayId::from_node_id(own_node_id.ok_or_else(|| {
+                eyre!("mining.miner_mesh is set but the v2 endpoint is not running")
+            })?),
+        };
+        let announced = mining.miner_address.is_some().then_some(stands_for);
+        Ok(miner_mesh::LocalGateway {
+            announced,
+            stands_for: (announced.is_some() || Self::names_itself(config)).then_some(stands_for),
+        })
     }
 
     /// Prepares the endpoint config, pinning a persistent identity for a node that coinbases
@@ -1182,15 +1192,12 @@ impl StartCmd {
         } else {
             rpc_impl
         };
-        // The gateway ID this node's coinbases name, when it runs the miner mesh.
         let own_node_id = zakura_endpoint
             .as_ref()
             .map(|endpoint| *endpoint.local_node_id().as_bytes());
-        let local_mesh_gateway = Self::announced_gateway(&config, own_node_id.as_ref())?;
-        let rpc_impl = if let Some(gateway) = local_mesh_gateway {
-            if config.mining.miner_address.is_some() {
-                info!(%gateway, "coinbases this node builds name this miner's gateway");
-            }
+        let local_mesh_gateway = Self::local_mesh_gateway(&config, own_node_id.as_ref())?;
+        let rpc_impl = if let Some(gateway) = local_mesh_gateway.announced {
+            info!(%gateway, "coinbases this node builds name this miner's gateway");
             rpc_impl.with_mesh_commitment(MinerMeshCommitment::new(gateway))
         } else {
             rpc_impl

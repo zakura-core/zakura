@@ -32,7 +32,7 @@ use zakura_test::vectors::BLOCK_MAINNET_1_BYTES;
 use super::{
     ranking::{ranking_channel, MIN_GATEWAY_BLOCKS},
     tracker::{
-        gateway_block_counts, run, GatewayBlockCounts, TipMove, Tracker, REPUBLISH_INTERVAL,
+        gateway_metrics, run, GatewayMetrics, LocalGateway, TipMove, Tracker, REPUBLISH_INTERVAL,
     },
 };
 use crate::BoxError;
@@ -786,39 +786,74 @@ fn snapshot_naming(gateways: &[(u8, u32)]) -> MinerSetSnapshot {
     }
 }
 
+/// A node that announces the gateway with ID bytes `id`.
+fn announcing(id: u8) -> LocalGateway {
+    let gateway = Some(GatewayId::from_bytes([id; 20]));
+    LocalGateway {
+        announced: gateway,
+        stands_for: gateway,
+    }
+}
+
 #[test]
 fn gateway_metrics_report_the_busiest_gateway_and_the_local_one() {
     let snapshot = snapshot_naming(&[(7, 5), (3, 2), (9, 1)]);
 
     assert_eq!(
-        gateway_block_counts(&snapshot, Some(GatewayId::from_bytes([3; 20]))),
-        GatewayBlockCounts { top: 5, local: 2 },
+        gateway_metrics(&snapshot, announcing(3)),
+        GatewayMetrics {
+            top: 5,
+            announcing: true,
+            stood_for_blocks: Some(2)
+        },
         "the local gateway is counted by its own blocks, not the busiest gateway's"
     );
     assert_eq!(
-        gateway_block_counts(&snapshot, Some(GatewayId::from_bytes([7; 20]))),
-        GatewayBlockCounts { top: 5, local: 5 },
+        gateway_metrics(&snapshot, announcing(7)).stood_for_blocks,
+        Some(5),
+    );
+}
+
+#[test]
+fn a_relay_announces_nothing_but_counts_the_blocks_that_name_it() {
+    let relay = LocalGateway {
+        announced: None,
+        stands_for: Some(GatewayId::from_bytes([3; 20])),
+    };
+
+    assert_eq!(
+        gateway_metrics(&snapshot_naming(&[(7, 5), (3, 2)]), relay),
+        GatewayMetrics {
+            top: 5,
+            announcing: false,
+            stood_for_blocks: Some(2)
+        },
     );
 }
 
 #[test]
 fn gateway_metrics_are_zero_when_nothing_matches() {
     assert_eq!(
-        gateway_block_counts(&snapshot_naming(&[]), Some(GatewayId::from_bytes([3; 20]))),
-        GatewayBlockCounts { top: 0, local: 0 },
+        gateway_metrics(&snapshot_naming(&[]), announcing(3)),
+        GatewayMetrics {
+            top: 0,
+            announcing: true,
+            stood_for_blocks: Some(0)
+        },
         "an empty window names no gateway, including this node's"
     );
     assert_eq!(
-        gateway_block_counts(
-            &snapshot_naming(&[(7, 5)]),
-            Some(GatewayId::from_bytes([3; 20]))
-        ),
-        GatewayBlockCounts { top: 5, local: 0 },
+        gateway_metrics(&snapshot_naming(&[(7, 5)]), announcing(3)).stood_for_blocks,
+        Some(0),
         "a local gateway that no block names has no blocks"
     );
     assert_eq!(
-        gateway_block_counts(&snapshot_naming(&[(7, 5)]), None),
-        GatewayBlockCounts { top: 5, local: 0 },
-        "a node that does not announce has no local gateway to count"
+        gateway_metrics(&snapshot_naming(&[(7, 5)]), LocalGateway::default()),
+        GatewayMetrics {
+            top: 5,
+            announcing: false,
+            stood_for_blocks: None
+        },
+        "a node that stands for no gateway has no local gateway to count"
     );
 }

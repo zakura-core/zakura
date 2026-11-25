@@ -872,6 +872,9 @@ impl PeerBlockState {
 struct RetiredCounters {
     part_remaining: u32,
     have_remaining: u32,
+    /// Whether the peer sent the block's `HeaderMeta` on this connection, so
+    /// a repeat closes with row 5 while the block stays retired (bpv1-4).
+    meta_received: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1365,9 +1368,11 @@ impl PeerState {
         message: Box<Bpv1Message>,
         step: &mut PeerStep,
     ) {
-        // bpv1-4 / close-5: a second HeaderMeta for one block on one connection closes 5.
+        // bpv1-4 / close-5: a second HeaderMeta for one block on one connection
+        // closes 5 while this node keeps the block pending, admitted, or retired.
         let duplicate = self.meta_received_pending.contains(&block_id)
-            || self.blocks.get(&block_id).is_some_and(|b| b.meta_received);
+            || self.blocks.get(&block_id).is_some_and(|b| b.meta_received)
+            || self.retired.get(&block_id).is_some_and(|r| r.meta_received);
         if duplicate {
             self.close_protocol(
                 BPV1_CONTROL_KIND,
@@ -1380,7 +1385,9 @@ impl PeerState {
             block.meta_received = true;
             // Parts that waited for this `HeaderMeta` (bpv1-14) can now be accepted.
             self.replay_early_for_block(now, block_id, step);
-        } else if !self.retired.contains_key(&block_id) {
+        } else if let Some(retired) = self.retired.get_mut(&block_id) {
+            retired.meta_received = true;
+        } else {
             self.meta_received_pending.insert(block_id);
         }
         step.events.push(PeerEvent::MetaReceived(block_id));
@@ -2416,7 +2423,7 @@ impl PeerState {
             stripes,
             n,
         } = retire;
-        self.meta_received_pending.remove(&block_id);
+        let meta_pending = self.meta_received_pending.remove(&block_id);
         self.inflight_verify.retain(|_, v| v.block_id != block_id);
         let total = stripes.saturating_mul(n);
 
@@ -2426,11 +2433,13 @@ impl PeerState {
             RetiredCounters {
                 part_remaining: total_parts.saturating_sub(block.recv_record.count_ones()),
                 have_remaining: total_parts.saturating_sub(block.peer_have.count_ones()),
+                meta_received: block.meta_received || meta_pending,
             }
         } else {
             RetiredCounters {
                 part_remaining: total,
                 have_remaining: total,
+                meta_received: meta_pending,
             }
         };
         self.retired.insert(block_id, counters);

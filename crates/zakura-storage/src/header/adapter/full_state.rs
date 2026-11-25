@@ -1,8 +1,6 @@
 //! [`EnginePort`]'s full state: committed blocks, body evidence and the
 //! committed views, as zakura-state's writer and readers provide them.
 
-use std::sync::Arc;
-
 #[cfg(test)]
 mod tests;
 
@@ -134,7 +132,8 @@ impl EnginePort {
     /// Commits `blocks`, each after its parent, to a port no block service
     /// commits through: before a run, so full state holds them when a node
     /// starts, as the header side's preload commits headers, or to a peer
-    /// whose storage the run doesn't control. Each counts as received at
+    /// whose storage the run doesn't control, such as a node whose verifier
+    /// the harness models itself. Each counts as received at
     /// receipt 0, as genesis does, so it ranks before any body a service
     /// admits, and equal-work tips among preloaded bodies fall to the
     /// greater hash. A node under test commits only through its block
@@ -150,7 +149,7 @@ impl EnginePort {
     /// facts the preload would skip.
     pub fn preload_blocks(
         &self,
-        blocks: impl IntoIterator<Item = Arc<block::Block>>,
+        blocks: impl IntoIterator<Item = impl Into<BlockHandle>>,
     ) -> Result<(), StateError> {
         assert!(
             !self.has_block_service(),

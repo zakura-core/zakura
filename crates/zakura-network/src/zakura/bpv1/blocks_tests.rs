@@ -33,6 +33,7 @@ use super::{
         LinkProfile, MachineMesh, TEST_TIP_HASH,
     },
     tree::VerifiedPart,
+    unknown_parent::UnknownParentVerdict,
     wire::PROPAGATION_DEPTH,
 };
 
@@ -243,6 +244,54 @@ fn header_result(
     )
 }
 
+/// Answers the received step's header admission with `parent_hash` missing,
+/// then passes the unknown-parent checks, as for an honest child that
+/// arrives before its parent. Returns both steps' effects. A refused entry
+/// starts no checks.
+fn missing_parent(
+    table: &mut BlockTable,
+    now: Instant,
+    received: &BlockStep,
+    parent_hash: block::Hash,
+) -> BlockStep {
+    let mut step = header_result(
+        table,
+        now,
+        received,
+        HeaderAdmissionResult::MissingParent { parent_hash },
+    );
+    if step
+        .outputs
+        .iter()
+        .any(|o| matches!(o, BlockOutput::CheckUnknownParent { .. }))
+    {
+        let checked = unknown_parent_checked(table, now, &step, UnknownParentVerdict::Park);
+        step.outputs
+            .retain(|o| !matches!(o, BlockOutput::CheckUnknownParent { .. }));
+        step.outputs.extend(checked.outputs);
+        step.events.extend(checked.events);
+    }
+    step
+}
+
+/// Completes the step's unknown-parent check with `verdict`.
+fn unknown_parent_checked(
+    table: &mut BlockTable,
+    now: Instant,
+    checking: &BlockStep,
+    verdict: UnknownParentVerdict,
+) -> BlockStep {
+    let work_id = checking
+        .outputs
+        .iter()
+        .find_map(|o| match o {
+            BlockOutput::CheckUnknownParent { work_id, .. } => Some(*work_id),
+            _ => None,
+        })
+        .expect("the step checks metadata with an unknown parent");
+    table.step(now, BlockInput::UnknownParentChecked { work_id, verdict })
+}
+
 /// Records that `peer` flagged `indices` of `block_id` as pushes.
 fn flag_push(
     table: &mut BlockTable,
@@ -290,14 +339,7 @@ fn scenario_missing_parent_then_parent_arrives_defers_commitment() {
     );
 
     // A missing parent parks the metadata and starts no commitment work (bpv1-1, -11).
-    let s2 = header_result(
-        &mut table,
-        now,
-        &s1,
-        HeaderAdmissionResult::MissingParent {
-            parent_hash: parent,
-        },
-    );
+    let s2 = missing_parent(&mut table, now, &s1, parent);
     assert!(!s2
         .outputs
         .iter()
@@ -331,6 +373,171 @@ fn scenario_missing_parent_then_parent_arrives_defers_commitment() {
     table.assert_invariants();
 }
 
+/// Header sync usually fetches a missing parent `P` together with the waiting
+/// child `C`, so the best header jumps from below `P` straight to `C` (#2716).
+/// The new best header wakes `C`'s own entry, whose admission then finds the
+/// header already known, so the block still arrives through BPv1.
+#[test]
+fn best_header_jumping_past_the_parent_wakes_the_child() {
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let now = Instant::now();
+    let parent = block::Hash([0x51; 32]);
+    let child = block::Hash([0x52; 32]);
+    let coding = Profile::TINY.derive_coding(64, 2).unwrap();
+    table.step(
+        now,
+        BlockInput::ParentAdmitted {
+            hash: block::Hash([0x50; 32]),
+            height: 9,
+        },
+    );
+    let received = receive(
+        &mut table,
+        now,
+        make_envelope(child, coding, [0xAA; 32], node_id(1)),
+    );
+    missing_parent(&mut table, now, &received, parent);
+    assert_eq!(table.pending_meta_len(), 1);
+
+    let at = now + Duration::from_millis(50);
+    let woken = table.step(
+        at,
+        BlockInput::ParentAdmitted {
+            hash: child,
+            height: 11,
+        },
+    );
+    assert_eq!(table.pending_meta_len(), 0);
+    let admitted = header_result(
+        &mut table,
+        at,
+        &woken,
+        HeaderAdmissionResult::Admitted {
+            height: 11,
+            parent_hash: parent,
+        },
+    );
+    let committed = commitment_ok(&mut table, at, &admitted);
+    assert!(committed
+        .events
+        .contains(&BlockEvent::BlockAdmitted { block_id: child }));
+    table.assert_invariants();
+}
+
+/// The best header can move past the parent while the child's admission or
+/// unknown-parent checks run, before the child parks. That move woke nothing,
+/// so the child retries admission instead of parking until it ages out.
+#[test]
+fn best_header_moving_during_the_checks_retries_admission() {
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let now = Instant::now();
+    let parent = block::Hash([0x55; 32]);
+    let child = block::Hash([0x56; 32]);
+    let coding = Profile::TINY.derive_coding(64, 2).unwrap();
+    table.step(
+        now,
+        BlockInput::ParentAdmitted {
+            hash: block::Hash([0x54; 32]),
+            height: 9,
+        },
+    );
+    let received = receive(
+        &mut table,
+        now,
+        make_envelope(child, coding, [0xAA; 32], node_id(1)),
+    );
+    let checking = header_result(
+        &mut table,
+        now,
+        &received,
+        HeaderAdmissionResult::MissingParent {
+            parent_hash: parent,
+        },
+    );
+    let moved = table.step(
+        now,
+        BlockInput::ParentAdmitted {
+            hash: child,
+            height: 11,
+        },
+    );
+    assert!(moved.outputs.is_empty(), "nothing is pending yet");
+
+    let retried = unknown_parent_checked(&mut table, now, &checking, UnknownParentVerdict::Park);
+    assert_eq!(table.pending_meta_len(), 0);
+    let admitted = header_result(
+        &mut table,
+        now,
+        &retried,
+        HeaderAdmissionResult::Admitted {
+            height: 11,
+            parent_hash: parent,
+        },
+    );
+    let committed = commitment_ok(&mut table, now, &admitted);
+    assert!(committed
+        .events
+        .contains(&BlockEvent::BlockAdmitted { block_id: child }));
+    table.assert_invariants();
+}
+
+/// An entry that a wake retries and that parks again keeps its first
+/// deadline, so retries never extend its life, and it skips the checks it
+/// already passed.
+#[test]
+fn retried_pending_entry_ages_out_at_its_first_deadline() {
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let now = Instant::now();
+    let parent = block::Hash([0x61; 32]);
+    let child = block::Hash([0x62; 32]);
+    let coding = Profile::TINY.derive_coding(64, 2).unwrap();
+    let received = receive(
+        &mut table,
+        now,
+        make_envelope(child, coding, [0xAA; 32], node_id(1)),
+    );
+    missing_parent(&mut table, now, &received, parent);
+
+    // The parent wakes the child, but headerchain still lacks an ancestor.
+    let retried_at = now + Duration::from_secs(10);
+    let woken = table.step(
+        retried_at,
+        BlockInput::ParentAdmitted {
+            hash: parent,
+            height: 10,
+        },
+    );
+    let reparked = header_result(
+        &mut table,
+        retried_at,
+        &woken,
+        HeaderAdmissionResult::MissingParent {
+            parent_hash: block::Hash([0x60; 32]),
+        },
+    );
+    assert!(!reparked
+        .outputs
+        .iter()
+        .any(|o| matches!(o, BlockOutput::CheckUnknownParent { .. })));
+    assert_eq!(table.pending_meta_len(), 1);
+    assert_eq!(table.next_deadline(), Some(now + PENDING_META_AGE));
+
+    let before = tick(
+        &mut table,
+        now + PENDING_META_AGE - Duration::from_millis(1),
+        &[],
+    );
+    assert!(!before
+        .events
+        .contains(&BlockEvent::MetaPendingAged { block_id: child }));
+    let aged = tick(&mut table, now + PENDING_META_AGE, &[]);
+    assert!(aged
+        .events
+        .contains(&BlockEvent::MetaPendingAged { block_id: child }));
+    assert_eq!(table.pending_meta_len(), 0);
+    table.assert_invariants();
+}
+
 /// Sends `block_id`'s metadata from `peer` and answers its header admission
 /// with a missing parent.
 fn park_unknown_parent(
@@ -348,16 +555,76 @@ fn park_unknown_parent(
             session_gen: 1,
         },
     );
-    let parked = header_result(
-        table,
-        now,
-        &received,
-        HeaderAdmissionResult::MissingParent {
-            parent_hash: block::Hash([0xEE; 32]),
-        },
-    );
+    let parked = missing_parent(table, now, &received, block::Hash([0xEE; 32]));
     table.assert_invariants();
     parked
+}
+
+/// Unknown-parent checks run under the pending budget, so a peer whose fakes
+/// keep their checks running holds at most its pending share and never fills
+/// the admission budget that viable metadata needs (bpv1-75).
+#[test]
+fn bpv1_75_running_unknown_parent_checks_never_refuse_viable_metadata() {
+    let now = Instant::now();
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let coding = Profile::TINY.derive_coding(64, 2).unwrap();
+    let flooder = node_id(100);
+    let mut checks = 0;
+    for i in 0..=u8::try_from(MAX_ADMITTING_META_COUNT).unwrap() {
+        let fake = block::Hash([
+            0xF2, i, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0,
+        ]);
+        let received = table.step(
+            now,
+            BlockInput::MetaReceived {
+                envelope: make_envelope(fake, coding, [0xAA; 32], flooder),
+                from_peer: flooder,
+                session_gen: 1,
+            },
+        );
+        // The checks never finish.
+        let checking = header_result(
+            &mut table,
+            now,
+            &received,
+            HeaderAdmissionResult::MissingParent {
+                parent_hash: block::Hash([0xEE; 32]),
+            },
+        );
+        checks += checking
+            .outputs
+            .iter()
+            .filter(|o| matches!(o, BlockOutput::CheckUnknownParent { .. }))
+            .count();
+    }
+    assert_eq!(checks, MAX_PENDING_META_PER_PEER);
+    assert_eq!(table.admitting_meta_len(), 0);
+
+    let honest = node_id(7);
+    let viable = block::Hash([0x79; 32]);
+    let received = table.step(
+        now,
+        BlockInput::MetaReceived {
+            envelope: make_envelope(viable, coding, [0xAA; 32], honest),
+            from_peer: honest,
+            session_gen: 1,
+        },
+    );
+    let admitted = header_result(
+        &mut table,
+        now,
+        &received,
+        HeaderAdmissionResult::Admitted {
+            height: 11,
+            parent_hash: TEST_TIP_HASH,
+        },
+    );
+    let committed = commitment_ok(&mut table, now, &admitted);
+    assert!(committed
+        .events
+        .contains(&BlockEvent::BlockAdmitted { block_id: viable }));
+    table.assert_invariants();
 }
 
 /// A made-up header with an unknown parent costs its sender only bytes, so
@@ -505,14 +772,7 @@ fn invalid_header_closes_every_session_that_sent_it() {
     let parent = block::Hash([0x30; 32]);
     let parked = block::Hash([0x32; 32]);
     let s = send_twice(&mut table, parked);
-    header_result(
-        &mut table,
-        now,
-        &s,
-        HeaderAdmissionResult::MissingParent {
-            parent_hash: parent,
-        },
-    );
+    missing_parent(&mut table, now, &s, parent);
     let woken = table.step(
         now,
         BlockInput::ParentAdmitted {
@@ -527,6 +787,88 @@ fn invalid_header_closes_every_session_that_sent_it() {
     );
     assert_eq!(table.pending_meta_len(), 0);
     table.assert_invariants();
+}
+
+/// Metadata whose parent header is unknown parks only after its checks pass
+/// (#2715). An out-of-range height or a target above the bound drops it
+/// without fault. A failed proof of work closes every session that sent the
+/// header, and a failed binding closes only the sender whose binding failed.
+#[test]
+fn unknown_parent_verdicts_park_drop_or_close() {
+    let now = Instant::now();
+    let coding = Profile::TINY.derive_coding(64, 2).unwrap();
+    let first = (node_id(2), 1);
+    let second = (node_id(3), 7);
+    let mut both = vec![first, second];
+    both.sort();
+    let check = |verdict, block_id| {
+        let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+        let received = receive(
+            &mut table,
+            now,
+            make_envelope(block_id, coding, [0xAA; 32], node_id(1)),
+        );
+        table.step(
+            now,
+            BlockInput::MetaReceived {
+                envelope: make_envelope(block_id, coding, [0xAA; 32], node_id(1)),
+                from_peer: second.0,
+                session_gen: second.1,
+            },
+        );
+        let checking = header_result(
+            &mut table,
+            now,
+            &received,
+            HeaderAdmissionResult::MissingParent {
+                parent_hash: block::Hash([0x40; 32]),
+            },
+        );
+        // The checks run under the pending budget, not the admission budget.
+        assert_eq!(table.pending_meta_len(), 1);
+        assert_eq!(table.admitting_meta_len(), 0);
+        let checked = unknown_parent_checked(&mut table, now, &checking, verdict);
+        table.assert_invariants();
+        (table, checked)
+    };
+
+    let parked_id = block::Hash([0x41; 32]);
+    let (table, parked) = check(UnknownParentVerdict::Park, parked_id);
+    assert_eq!(table.pending_meta_len(), 1);
+    assert!(parked.outputs.is_empty());
+
+    let dropped_id = block::Hash([0x42; 32]);
+    let (table, dropped) = check(UnknownParentVerdict::Drop, dropped_id);
+    assert_eq!(table.pending_meta_len(), 0);
+    assert_eq!(table.admitting_meta_len(), 0);
+    assert_eq!(rejected_sessions(&dropped, dropped_id), both);
+    assert!(!dropped
+        .outputs
+        .iter()
+        .any(|o| matches!(o, BlockOutput::ClosePeer { .. })));
+
+    let fake_header = block::Hash([0x43; 32]);
+    let (table, closed) = check(
+        UnknownParentVerdict::Invalid(Bpv1CloseRow::Row3InvalidHeader),
+        fake_header,
+    );
+    assert_eq!(table.pending_meta_len(), 0);
+    assert_eq!(
+        closed_sessions(&closed, Bpv1CloseRow::Row3InvalidHeader),
+        both
+    );
+
+    let bad_binding = block::Hash([0x44; 32]);
+    let (table, closed) = check(
+        UnknownParentVerdict::Invalid(Bpv1CloseRow::Row4BadMetaOrCommitment),
+        bad_binding,
+    );
+    assert_eq!(table.pending_meta_len(), 0);
+    assert_eq!(
+        closed_sessions(&closed, Bpv1CloseRow::Row4BadMetaOrCommitment),
+        vec![first]
+    );
+    assert_eq!(rejected_sessions(&closed, bad_binding), vec![second]);
 }
 
 /// Returns the sessions the step rejected `block_id`'s metadata for.
@@ -580,14 +922,7 @@ fn duplicate_metadata_is_rejected_for_every_session_that_sent_it() {
     let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
     let pending = block::Hash([0x21; 32]);
     let s = send_twice(&mut table, pending);
-    header_result(
-        &mut table,
-        now,
-        &s,
-        HeaderAdmissionResult::MissingParent {
-            parent_hash: block::Hash([0x20; 32]),
-        },
-    );
+    missing_parent(&mut table, now, &s, block::Hash([0x20; 32]));
     let aged = tick(&mut table, now + PENDING_META_AGE, &[]);
     assert_eq!(rejected_sessions(&aged, pending), both);
 

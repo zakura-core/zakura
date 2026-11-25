@@ -6,7 +6,7 @@ the BPv1 implementation decisions:
 
 - **Coinbase commitment (decision-1, decision-9, decision-25):** The proposer
   commits `C` in one zero-value post-NU7 v6 coinbase `OP_RETURN` output
-  (`6a 25 "BPV1" 01 C`), proven via both txid and ZIP 244 auth-data index-0
+  (`6a 23 "BP" 01 C`), proven via both txid and ZIP 244 auth-data index-0
   paths plus `hashBlockCommitments`. The byte after the tag is the format
   version. Readers ignore every output in another form. `block_id` is the
   consensus block hash; Ed25519 signatures, variant identifiers, and the
@@ -96,8 +96,21 @@ necessary exceptions. If parent context is missing, the node MAY retain a
 bounded metadata envelope while headerchain recovers that context. It MUST apply
 independent count, byte, work, and time limits to this pending state, both per
 peer and node-wide. Headerchain answers a missing parent before it checks proof
-of work, so a pending entry costs its sender only bytes. Pending metadata MUST
-NOT take space from metadata whose parent the node holds. When the node-wide
+of work. So before the node retains the envelope, it MUST check that the
+binding's coinbase txid reaches the header's Merkle root, that the coinbase's
+authorizing data reaches the header's block commitments (the txid leaves out
+the coinbase script, which holds the height), that the coinbase
+height lies above `top` (section 2) and at most
+`PROPAGATION_DEPTH` above it, and that the header meets its own target with a
+valid solution. Where no minimum-difficulty rule applies, it MUST then check
+that the target is at most `(1 + PoWMaxAdjustDown)^k` times the highest target
+in the widest averaging window ending at its best header, for a header `k`
+blocks above that header. A pending entry then costs its sender about as much
+work as a real block that far ahead. The target bound holds only for a chain
+that extends the best header, and an honest header on a fork with less hash
+rate can exceed it. So a target above the bound is not a violation. Pending metadata MUST
+NOT take space from metadata whose parent the node holds, including while these
+checks run. When the node-wide
 pending limit is full, the node SHOULD drop an entry of the peer holding the
 most pending metadata, not refuse a peer holding less. A dropped entry is not a
 violation, and the block arrives through header sync and block download.
@@ -280,12 +293,12 @@ in a single zero-value transparent `OP_RETURN` output of the post-NU7 v6
 coinbase transaction before mining:
 
 ```text
-6a 25 || ASCII("BPV1") || 01 || C[32]
+6a 23 || ASCII("BP") || 01 || C[32]
 ```
 
-`6a` is `OP_RETURN`; `25` directly pushes the following 37 bytes (total script
-length 39 bytes, serialized transparent output 48 bytes). The byte after
-`"BPV1"` is the commitment format version (decision-25). BPv1 defines version
+`6a` is `OP_RETURN`; `23` directly pushes the following 35 bytes (total script
+length 37 bytes, serialized transparent output 46 bytes). The byte after
+`"BP"` is the commitment format version (decision-25). BPv1 defines version
 `01` only; the profile lives inside `C`, not in this byte.
 
 An output is a version-01 commitment only if its value is zero and its script
@@ -299,9 +312,11 @@ only the versions it supports.
 
 A miner mesh coinbase MAY also carry its own output
 ([#2666](https://github.com/zakura-core/zakura/pull/2666)), which names a
-gateway. BPv1 ignores that output, and it grants no BPv1 rights. When one node
-both builds the template and announces the gateway, `proposer_node` equals the
-gateway identity.
+gateway. That output has the same form with the tag `"MR"`
+([#2709](https://github.com/zakura-core/zakura/pull/2709)), so the two outputs
+never match each other's reader. BPv1 ignores that output, and it grants no BPv1
+rights. When one node both builds the template and announces the gateway,
+`proposer_node` equals the gateway identity.
 
 `CoinbaseBinding` carries the canonical v6 coinbase transaction, its index-0
 txid Merkle path, its index-0 ZIP 244 authorizing-data Merkle path, and
@@ -782,7 +797,9 @@ every peer before it writes any part.
 
 A header that headerchain rejects returns `Disconnect` when headerchain
 classifies the failure as peer-caused. A missing parent invokes bounded
-recovery and is not a violation. A layout mismatch, invalid binding, or failed
+recovery and is not a violation. With a missing parent, a height outside the
+range in section 1 or a target above the section 1 bound returns `Drop`, and a
+proof of work that fails the section 1 checks returns `Disconnect`. A layout mismatch, invalid binding, or failed
 commitment returns `Disconnect`: an honest relay forwards only admitted
 metadata. A repeat of a block's metadata from the same peer returns `Disconnect`
 while this node keeps the block admitted or retired. The sender keeps the block
@@ -1466,7 +1483,7 @@ The profile MUST fix these before implementations claim interoperability:
 | Part payload and stripes | W2 fixes `S_MIN`, `S_MAX`, `ALIGN`, `STRIPE_K`, and `parity_parts` |
 | Codec construction | Candidate `reed-solomon-simd` 3.1 construction; vectors `TBD` |
 | Hashing | W2 fixes BLAKE3 key derivation with BPv1 contexts; vectors `TBD` |
-| Proposer authentication | W2 fixes the `BPV1 01` coinbase commitment; supported chain formats and admission adapter remain `TBD` |
+| Proposer authentication | W2 fixes the `BP 01` coinbase commitment; supported chain formats and admission adapter remain `TBD` |
 | Serialization | W2 fixes payload encoding; service identifier, capability, stream kinds, and negotiation remain `TBD` |
 | Resource bounds | W2 fixes syntax limits; accept limits, early-record, retention, and work bounds remain `TBD` |
 

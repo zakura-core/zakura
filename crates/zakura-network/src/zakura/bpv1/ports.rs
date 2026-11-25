@@ -19,7 +19,10 @@ use zakura_node_services::{
 use zakura_quic::NodeId;
 use zakura_rt::time::Instant;
 
-use super::blocks::{ClaimRelease, HeaderAdmissionResult, VerifierVerdict, WorkId};
+use super::{
+    blocks::{ClaimRelease, HeaderAdmissionResult, VerifierVerdict, WorkId},
+    unknown_parent::TargetBound,
+};
 
 /// Boxed future returned by async BPv1 port operations.
 pub type PortFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -38,6 +41,12 @@ pub trait HeaderAdmissionPort: Send + Sync + 'static {
         session_gen: u64,
         work_id: WorkId,
     ) -> PortFuture<'_, HeaderAdmissionResult>;
+
+    /// The target bound above headerchain's best header, or `None` when
+    /// headerchain holds no context for it. The default holds none.
+    fn target_bound(&self) -> PortFuture<'_, Option<TargetBound>> {
+        Box::pin(async { None })
+    }
 }
 
 /// Production header admission adapter over `zakura_node_services::header_chain::Port`.
@@ -85,6 +94,22 @@ impl HeaderAdmissionPort for HeaderChainAdmissionAdapter {
                 metrics::counter!("zakura.p2p.bpv1.header.duplicate_bytes").increment(header_len);
             }
             admission_result(admission, parent_hash)
+        })
+    }
+
+    /// Reads the validation lease for a child of the best header that the
+    /// latest committed snapshot names.
+    fn target_bound(&self) -> PortFuture<'_, Option<TargetBound>> {
+        let best = self
+            .port
+            .selected_chain()
+            .borrow()
+            .as_ref()
+            .map(|snapshot| snapshot.frontiers.header_best);
+        let port = self.port.clone();
+        Box::pin(async move {
+            let lease = port.header_validation_lease(best?.hash).await.ok()??;
+            TargetBound::from_lease(&lease)
         })
     }
 }

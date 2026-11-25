@@ -197,6 +197,17 @@ impl ReceiptGuard {
             }
         }
     }
+
+    /// Takes the turn only if no other delivery of this body is verifying, and never waits.
+    ///
+    /// A miner's own submission must not wait behind a network copy of its block: it would lose
+    /// its prepared fast path and return a duplicate that never publishes over BPv1. When it is
+    /// first, later deliveries still wait for it as [`Self::verification_turn`] describes.
+    pub(in crate::block) fn try_verification_turn(
+        &self,
+    ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        self.turn.clone()?.try_lock_owned().ok()
+    }
 }
 
 impl Drop for ReceiptGuard {

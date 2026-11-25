@@ -86,8 +86,8 @@ pub(super) fn block_template_overhead_bytes(net: &Network) -> usize {
 /// generating a zero-fee shielded proof.
 ///
 /// `extra_coinbase_null_data_len` reserves space for one zero-value `OP_RETURN`
-/// coinbase output with that many payload bytes; the 37-byte BPv1 commitment
-/// payload takes 48 serialized bytes.
+/// coinbase output with that many payload bytes; the 35-byte BPv1 commitment
+/// payload takes 46 serialized bytes.
 ///
 /// Returns selected transactions from `mempool_txs`, or an error if coinbase
 /// resource usage cannot be calculated from the parent balance.

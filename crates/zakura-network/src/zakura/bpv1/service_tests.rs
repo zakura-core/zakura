@@ -47,7 +47,7 @@ use crate::{
 };
 
 /// A durable header-chain snapshot with the given best header and verified tip.
-fn engine_snapshot(header_best: Frontier, verified_best: Frontier) -> EngineSnapshot {
+pub(super) fn engine_snapshot(header_best: Frontier, verified_best: Frontier) -> EngineSnapshot {
     EngineSnapshot {
         mode: EngineMode::Integrated,
         state_version: StateVersion::default(),

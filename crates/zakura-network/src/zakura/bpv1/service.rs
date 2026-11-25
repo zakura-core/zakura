@@ -30,8 +30,8 @@ use zakura_rt::{
 use super::{
     assemble::assemble_block,
     blocks::{
-        BlockEvent, BlockInput, BlockOutcome, BlockOutput, BlockStep, BlockTable, FallbackReason,
-        MetaEnvelope, PartSource, PullPeerState, StripeJob, VerifierVerdict,
+        BlockEvent, BlockInput, BlockOutcome, BlockOutput, BlockPhase, BlockStep, BlockTable,
+        FallbackReason, MetaEnvelope, PartSource, PullPeerState, StripeJob, VerifierVerdict,
     },
     close::{Bpv1CloseCause, Bpv1CloseRow},
     codec::{decode_and_check_stripe, encode_body},
@@ -265,8 +265,10 @@ impl SharedNode {
         snaps.into_iter().map(|s| *lock(&s)).collect()
     }
 
-    /// Executes `outputs` of a proposer step in order.
-    fn run_proposer_outputs(self: &Arc<Self>, outputs: Vec<ProposerOutput>) {
+    /// Executes `outputs` of a proposer step in order. Returns whether the
+    /// block table holds the solved block as this node's proposal; when it
+    /// does not, no seed goes out (bpv1-88).
+    fn run_proposer_outputs(self: &Arc<Self>, outputs: Vec<ProposerOutput>) -> bool {
         for out in outputs {
             match out {
                 ProposerOutput::AdmitSolvedLocal {
@@ -274,11 +276,18 @@ impl SharedNode {
                     envelope,
                     parts,
                 } => {
-                    self.apply_block_input(BlockInput::BlockAdmittedLocal {
-                        height,
-                        envelope,
-                        parts,
-                    });
+                    let block_id = envelope.block_id;
+                    let proposing = self.apply_block_input_then(
+                        BlockInput::BlockAdmittedLocal {
+                            height,
+                            envelope,
+                            parts,
+                        },
+                        |table| table.is_proposer(&block_id),
+                    );
+                    if !proposing {
+                        return false;
+                    }
                 }
                 ProposerOutput::QueueSeeds {
                     peer,
@@ -318,10 +327,21 @@ impl SharedNode {
                 ProposerOutput::StartEncode { .. } | ProposerOutput::SetCommitment { .. } => {}
             }
         }
+        true
     }
 
     fn apply_block_input(self: &Arc<Self>, input: BlockInput) {
-        let step = {
+        self.apply_block_input_then(input, |_| ());
+    }
+
+    /// Steps the block table with `input`, reads `read` from the table under
+    /// the same lock, then dispatches the step's effects.
+    fn apply_block_input_then<T>(
+        self: &Arc<Self>,
+        input: BlockInput,
+        read: impl FnOnce(&BlockTable) -> T,
+    ) -> T {
+        let (step, value) = {
             let mut table = self.lock_table();
             let step = table.step(Instant::now(), input);
             metrics::gauge!("zakura.p2p.bpv1.pending_meta.count")
@@ -331,9 +351,11 @@ impl SharedNode {
                 .set(table.paths().unmeasured_pull_peers() as f64);
             metrics::gauge!("zakura.p2p.bpv1.part_buffer.bytes")
                 .set(table.part_buffer_bytes() as f64);
-            step
+            let value = read(&table);
+            (step, value)
         };
         self.dispatch_block_step(step);
+        value
     }
 
     fn dispatch_block_step(self: &Arc<Self>, step: BlockStep) {
@@ -630,7 +652,9 @@ impl Bpv1Handle {
     /// prepared commitment.
     ///
     /// Returns `true` when BPv1 publication started; `false` when the block has
-    /// no matching commitment (e.g., pool-built coinbase -> existing relay).
+    /// no matching commitment (e.g., pool-built coinbase -> existing relay),
+    /// or when the block table holds the block retired, so this node does not
+    /// propose it (bpv1-88).
     pub fn publish_solved_block(&self, block: &Block, height: u32) -> bool {
         // O(1) coinbase commitment pre-check BEFORE building
         // Merkle sibling paths or serializing block transactions so pool-built
@@ -681,8 +705,7 @@ impl Bpv1Handle {
 
         // Execute outputs in order: `AdmitSolvedLocal` publishes `HeaderMeta` and
         // `BlockDone` to every peer before any `QueueSeeds`.
-        self.node.run_proposer_outputs(step.outputs);
-        true
+        self.node.run_proposer_outputs(step.outputs)
     }
 
     /// Retires `block_id` if this node proposed it, because its local commit
@@ -2405,6 +2428,17 @@ fn record_block_event(event: &BlockEvent) {
             };
             tracing::debug!(target: "bpv1_stage", %block_id, reason = label, "fallback_started");
             metrics::counter!("zakura.p2p.bpv1.fallback.reason", "reason" => label).increment(1);
+        }
+        BlockEvent::ProposerTakeover { block_id, from } => {
+            let label = match from {
+                BlockPhase::Collecting => "collecting",
+                BlockPhase::Verifying => "verifying",
+                BlockPhase::Done => "done",
+                BlockPhase::Fallback => "fallback",
+                BlockPhase::Retired => "retired",
+            };
+            tracing::info!(target: "bpv1_stage", %block_id, from = label, "proposer_takeover");
+            metrics::counter!("zakura.p2p.bpv1.proposer.takeover", "from" => label).increment(1);
         }
         BlockEvent::Parked { block_id } => {
             tracing::debug!(target: "bpv1_stage", %block_id, "verify_parked");

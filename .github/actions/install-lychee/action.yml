@@ -25,5 +25,6 @@ runs:
 
         lychee_bin="${tmp_dir}/lychee-x86_64-unknown-linux-gnu/lychee"
         test -f "${lychee_bin}"
-        install -Dm755 "${lychee_bin}" "${RUNNER_TEMP}/lychee/bin/lychee"
-        echo "${RUNNER_TEMP}/lychee/bin" >> "${GITHUB_PATH}"
+        # Install onto the default PATH rather than appending to GITHUB_PATH,
+        # which zizmor flags as an environment-file injection risk.
+        sudo install -m755 "${lychee_bin}" /usr/local/bin/lychee

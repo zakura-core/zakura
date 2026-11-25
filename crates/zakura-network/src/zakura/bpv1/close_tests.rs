@@ -27,7 +27,7 @@ use super::{
     },
     profile::Profile,
     service::{control_input, data_input},
-    test_support::{commit_work, make_envelope, node_id, LinkProfile, MachineMesh},
+    test_support::{commit_work, make_envelope, node_id, LinkProfile, MachineMesh, TEST_TIP_HASH},
     wire::{HaveFlags, PROPAGATION_DEPTH},
 };
 use crate::zakura::{handshake::Frame, wire_codec::encode_frame};
@@ -263,7 +263,10 @@ fn close_3_invalid_header_closes_every_sender_of_any_copy() {
         &mut table,
         now,
         &first,
-        HeaderAdmissionResult::Admitted { height: 1 },
+        HeaderAdmissionResult::Admitted {
+            height: 1,
+            parent_hash: TEST_TIP_HASH,
+        },
     );
     assert!(header
         .outputs
@@ -302,7 +305,10 @@ fn close_4_bad_later_layout_closes_only_its_sender() {
         &mut table,
         now,
         &first,
-        HeaderAdmissionResult::Admitted { height: 1 },
+        HeaderAdmissionResult::Admitted {
+            height: 1,
+            parent_hash: TEST_TIP_HASH,
+        },
     );
     assert!(admits(&commitment_ok(&mut table, now, &header), block_id));
     table.assert_invariants();
@@ -348,7 +354,10 @@ fn close_4_failed_commitment_closes_identical_copies_and_checks_the_alternate() 
             table,
             now,
             &first,
-            HeaderAdmissionResult::Admitted { height: 1 },
+            HeaderAdmissionResult::Admitted {
+                height: 1,
+                parent_hash: TEST_TIP_HASH,
+            },
         )
     };
 
@@ -420,7 +429,10 @@ fn close_4_failed_commitment_closes_identical_copies_and_checks_the_alternate() 
         &mut table,
         now,
         &first,
-        HeaderAdmissionResult::Admitted { height: 1 },
+        HeaderAdmissionResult::Admitted {
+            height: 1,
+            parent_hash: TEST_TIP_HASH,
+        },
     );
     let ok = commitment(&mut table, now, &header, true);
     assert!(admits(&ok, block_id));
@@ -466,7 +478,10 @@ fn close_4_alternate_survives_a_wait_for_the_parent() {
         &mut table,
         now,
         &woke,
-        HeaderAdmissionResult::Admitted { height: 2 },
+        HeaderAdmissionResult::Admitted {
+            height: 2,
+            parent_hash: parent,
+        },
     );
     let failed = commitment(&mut table, now, &header, false);
     assert_eq!(
@@ -519,7 +534,10 @@ fn alternates_never_take_admitting_room_from_a_first_copy() {
         &mut table,
         now,
         &first,
-        HeaderAdmissionResult::Admitted { height: 1 },
+        HeaderAdmissionResult::Admitted {
+            height: 1,
+            parent_hash: TEST_TIP_HASH,
+        },
     );
     let failed = commitment(&mut table, now, &header, false);
     assert_eq!(
@@ -655,7 +673,10 @@ fn a_refused_pending_copy_keeps_every_alternate() {
         &mut table,
         now,
         &woke,
-        HeaderAdmissionResult::Admitted { height: 2 },
+        HeaderAdmissionResult::Admitted {
+            height: 2,
+            parent_hash: alternate_parent,
+        },
     );
     let failed = commitment(&mut table, now, &header, false);
     assert!(verifies(&failed), "the relay's copy gets its check");
@@ -717,7 +738,10 @@ fn an_ended_session_leaves_no_sender_record() {
         &mut table,
         now,
         &woke,
-        HeaderAdmissionResult::Admitted { height: 2 },
+        HeaderAdmissionResult::Admitted {
+            height: 2,
+            parent_hash: parent,
+        },
     );
     let failed = commitment(&mut table, now, &header, false);
     assert_eq!(
@@ -1106,7 +1130,10 @@ proptest! {
             mesh.run_until(start + Duration::from_millis(after));
             mesh.step_table(
                 node,
-                BlockInput::TipHeight { height: super::test_support::MESH_HEIGHT + PROPAGATION_DEPTH + 1 },
+                BlockInput::TipHeight {
+                    height: super::test_support::MESH_HEIGHT + PROPAGATION_DEPTH + 1,
+                    hash: TEST_TIP_HASH,
+                },
             );
         }
         mesh.run_until(start + Duration::from_secs(3));

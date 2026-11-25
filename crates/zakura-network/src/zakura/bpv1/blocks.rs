@@ -2519,6 +2519,7 @@ impl BlockTable {
             session_gen,
             mut later,
             height,
+            parent_hash,
             parked_at,
             best_moves,
             ..
@@ -2558,6 +2559,7 @@ impl BlockTable {
                     unkept: later.unkept,
                 },
                 height: Some(height),
+                parent_hash,
                 stage: AdmittingStage::WaitingCommitment,
                 parked_at,
                 best_moves,

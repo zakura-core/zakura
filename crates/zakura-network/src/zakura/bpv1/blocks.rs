@@ -2152,7 +2152,11 @@ impl BlockTable {
         step: &mut BlockStep,
     ) {
         let block_id = envelope.block_id;
-        // Make local solved-block admission idempotent by hash.
+        // Make local solved-block admission idempotent by hash. A peer's copy
+        // cannot come first: the coinbase commitment names this node as
+        // proposer, and only this node's prepared template publishes it, after
+        // this admission. A copy relayed from before a restart has no prepared
+        // template behind it, so it never reaches here.
         if self.blocks.contains_key(&block_id) {
             return;
         }
@@ -3119,7 +3123,8 @@ impl BlockTable {
     }
 
     fn retire_out_of_window(&mut self, step: &mut BlockStep) {
-        // bpv1-7: retire exactly the heights admission refuses.
+        // bpv1-7: retire exactly the heights the propagation window refuses.
+        // The verified-tip bound (bpv1-76) gates admission only.
         let to_retire: Vec<block::Hash> = self
             .blocks
             .values()

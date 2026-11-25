@@ -173,6 +173,23 @@ impl ConnectionSlots {
         Ok(class)
     }
 
+    /// Moves one outbound slot from `from` to `to`: a dial to `from` reached
+    /// the node whose ID is `to`. The totals don't change.
+    pub(super) fn move_outbound(&mut self, from: NodeId, to: NodeId) {
+        let slots = self
+            .by_node
+            .get_mut(&from)
+            .expect("a dial's target keeps its slot entry until the dial's slot leaves");
+        slots.outbound = slots
+            .outbound
+            .checked_sub(1)
+            .expect("a dial owns its outbound slot");
+        if slots.total() == 0 {
+            self.by_node.remove(&from);
+        }
+        self.by_node.entry(to).or_default().outbound += 1;
+    }
+
     /// Releases one slot that [`Self::claim`] charged to `node`.
     pub(super) fn release(&mut self, node: NodeId, inbound: bool) {
         let slots = self
@@ -250,6 +267,56 @@ mod tests {
             slots.by_node.is_empty(),
             "a node with no slots is forgotten"
         );
+    }
+
+    /// A dial to `a` reached the node whose ID is `b`: the dial's slot moves
+    /// to `b`, the totals stay, and the slot releases under `b`.
+    #[test]
+    fn a_moved_outbound_slot_keeps_the_totals_and_releases_under_its_new_node() {
+        let mut slots = ConnectionSlots::default();
+        let (a, b) = (node(1), node(2));
+        assert!(claim(&mut slots, a, false, 8));
+        assert!(claim(&mut slots, a, true, 8));
+        assert!(claim(&mut slots, b, true, 8));
+
+        slots.move_outbound(a, b);
+        assert_eq!(
+            slots.of_node(&a),
+            SlotCount {
+                inbound: 1,
+                outbound: 0
+            }
+        );
+        assert_eq!(
+            slots.of_node(&b),
+            SlotCount {
+                inbound: 1,
+                outbound: 1
+            }
+        );
+        assert_eq!((slots.total(), slots.inbound()), (3, 2));
+        assert_eq!(slots.summed().total(), slots.total());
+
+        slots.release(b, false);
+        slots.release(a, true);
+        assert_eq!(slots.of_node(&a), SlotCount::default());
+        assert!(
+            !slots.by_node.contains_key(&a),
+            "a node with no slots is forgotten"
+        );
+        assert_eq!((slots.total(), slots.inbound()), (1, 1));
+    }
+
+    /// The only slot of the dialed node moves away, and the node is forgotten.
+    #[test]
+    fn moving_a_nodes_last_slot_forgets_the_node() {
+        let mut slots = ConnectionSlots::default();
+        let (a, b) = (node(1), node(2));
+        assert!(claim(&mut slots, a, false, 8));
+        slots.move_outbound(a, b);
+        assert!(!slots.by_node.contains_key(&a));
+        assert_eq!(slots.of_node(&b).outbound, 1);
+        assert_eq!(slots.total(), 1);
     }
 
     #[test]

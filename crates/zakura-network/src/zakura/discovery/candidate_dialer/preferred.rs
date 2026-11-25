@@ -22,7 +22,9 @@ use zakura_rt::{
 use super::super::protocol::{DialTarget, ZakuraDiscoveryDialCandidate, ZakuraDiscoveryHandle};
 use super::discovery_node_addr_with_reserved_ip_capacity;
 use super::state::{CandidateDialerState, DialAttemptKey};
-use crate::zakura::{GatewayMatch, GatewayStanding, RankedGateway, MAX_RANKED_GATEWAYS};
+use crate::zakura::{
+    transport::MovedNodeIds, GatewayMatch, GatewayStanding, RankedGateway, MAX_RANKED_GATEWAYS,
+};
 
 /// Mining gateways ranked by how many recent best-chain blocks name them.
 ///
@@ -154,9 +156,17 @@ pub(super) struct ClassifiedGateways {
 /// the dialer has in flight is being dialed; and the book answers for the
 /// rest, with [`dialer_standing`] adding the dialer's own backoff to its
 /// answer.
+///
+/// A node that `moved` says answers under a new ID is connected or being
+/// dialed when that ID is, so the round never dials a gateway it already
+/// reaches. The gateway keeps resolving to the node's earlier ID, the one
+/// its gateway ID is made from. That ID holds no connection slot, so the
+/// slot checks hold no place for it: the node's connection counts as an
+/// ordinary one until blocks name the gateway by its new ID.
 pub(super) async fn classify_gateways(
     ranked: &[RankedGateway],
     registered: &[NodeId],
+    moved: &watch::Receiver<MovedNodeIds>,
     state: &CandidateDialerState,
     discovery: &ZakuraDiscoveryHandle,
     now: Instant,
@@ -197,9 +207,10 @@ pub(super) async fn classify_gateways(
             GatewayMatch::None => *gateway,
             GatewayMatch::Several => gateway.into_ambiguous(),
             GatewayMatch::One(node) => {
-                let standing = if registered.contains(&node) {
+                let answers_as = moved.borrow().current(node);
+                let standing = if registered.contains(&node) || registered.contains(&answers_as) {
                     GatewayStanding::Connected
-                } else if in_flight.contains(&node) {
+                } else if in_flight.contains(&node) || in_flight.contains(&answers_as) {
                     GatewayStanding::Dialing
                 } else {
                     let GatewayMatch::One((_, target)) = book_answer else {
@@ -505,6 +516,7 @@ mod tests {
     use super::*;
     use crate::zakura::{
         discovery::{build_discovery_handle, default_advertised_services},
+        transport::no_moves,
         ZakuraHandshakeConfig, ZakuraPeerId,
     };
 
@@ -738,6 +750,7 @@ mod tests {
         let classified = classify_gateways(
             &ranked,
             &[connected, connected_and_dialing],
+            &no_moves(),
             &state,
             &discovery,
             now,
@@ -782,6 +795,16 @@ mod tests {
         registered: &[NodeId],
         book: &[NodeId],
     ) -> ClassifiedGateways {
+        classify_with_moves(ranked, registered, book, &no_moves()).await
+    }
+
+    /// [`classify_with`] for a dialer whose earlier dials learned `moved`.
+    async fn classify_with_moves(
+        ranked: &[RankedGateway],
+        registered: &[NodeId],
+        book: &[NodeId],
+        moved: &watch::Receiver<MovedNodeIds>,
+    ) -> ClassifiedGateways {
         let discovery = discovery_handle();
         for (index, node) in book.iter().enumerate() {
             let last = u8::try_from(index + 1).expect("a test book holds few nodes");
@@ -792,7 +815,45 @@ mod tests {
         }
         let state =
             CandidateDialerState::new((Duration::from_secs(60), Duration::from_secs(3_600)));
-        classify_gateways(ranked, registered, &state, &discovery, Instant::now()).await
+        classify_gateways(
+            ranked,
+            registered,
+            moved,
+            &state,
+            &discovery,
+            Instant::now(),
+        )
+        .await
+    }
+
+    /// Blocks still name a gateway by the ID its node had before it added a
+    /// key, and the book still lists that ID. The node is registered under
+    /// the ID it has now, so the gateway is connected and the round has
+    /// nothing to dial for it. Without the move the round would dial the
+    /// earlier ID again and again.
+    #[tokio::test]
+    async fn a_moved_gateway_is_connected_while_its_node_is_registered() {
+        let earlier = raw_node_id(1, 0x00);
+        let current = raw_node_id(2, 0x00);
+        let mut moves = MovedNodeIds::default();
+        moves.learn(earlier, current);
+        let moved = watch::channel(moves).1;
+        let ranked = [unresolved(earlier, 1)];
+
+        let classified = classify_with_moves(&ranked, &[current], &[earlier], &moved).await;
+        assert_eq!(
+            classified.ranking[0].resolution(),
+            GatewayMatch::One((earlier, GatewayStanding::Connected))
+        );
+        assert!(classified.dialable.is_empty());
+
+        // Once the node is gone, its earlier ID is dialable again: a dial to
+        // it still reaches the node.
+        let classified = classify_with_moves(&ranked, &[], &[earlier], &moved).await;
+        assert_eq!(
+            classified.ranking[0].resolution(),
+            GatewayMatch::One((earlier, GatewayStanding::Dialable))
+        );
     }
 
     #[tokio::test]

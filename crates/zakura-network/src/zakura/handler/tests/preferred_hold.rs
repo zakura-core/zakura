@@ -518,7 +518,7 @@ fn outbound_gateway_keeps_a_tied_place_after_authentication() {
         publish_tied_gateways(&handler, target, caller);
         let mut dial = handler.claim_connection(target, false).expect("held place");
         if authenticated {
-            dial.outbound_connected();
+            dial.outbound_connected(target);
         }
         let _inbound = handler
             .claim_connection(caller, true)
@@ -542,7 +542,7 @@ fn ranking_publication_reconciles_authenticated_slots() {
             .map(|node| RankedGateway::resolved(node, 1, GatewayStanding::Dialable));
         let mut slot = handler.claim_connection(incumbent, inbound).unwrap();
         if !inbound {
-            slot.outbound_connected();
+            slot.outbound_connected(incumbent);
         }
         handler.publish_gateway_ranking(stale);
         assert_eq!(preferred_set(&handler), [incumbent]);
@@ -574,14 +574,48 @@ fn a_stale_connected_snapshot_cannot_restore_a_closed_dial() {
     ];
     let mut first = handler.claim_connection(gateway, false).unwrap();
     let mut second = handler.claim_connection(gateway, false).unwrap();
-    first.outbound_connected();
-    second.outbound_connected();
+    first.outbound_connected(gateway);
+    second.outbound_connected(gateway);
     drop(first);
     publish(&handler, &snapshot);
     assert_eq!(preferred_set(&handler), [gateway]);
     drop(second);
     publish(&handler, &snapshot);
     assert_eq!(preferred_set(&handler), [other]);
+}
+
+/// A dial to a gateway's earlier node ID reaches the node under the ID it
+/// has now. The slot the dial took in the gateway's held place moves to that
+/// ID, where it is an ordinary one, and releases from there.
+#[test]
+fn a_dial_that_reached_a_moved_gateway_gives_its_place_back() {
+    let handler = handler(40, 1);
+    let earlier = new_node();
+    let current = new_node();
+    let slots = |node: &NodeId| {
+        let counts = handler.supervisor.ip_slots.counts();
+        counts.node_connections(node).total()
+    };
+    publish(&handler, &[(earlier, GatewayStanding::Dialable)]);
+    let mut dial = handler
+        .claim_connection(earlier, false)
+        .expect("held place");
+    assert_eq!(split(&handler).preferred, 1);
+
+    dial.outbound_connected(current);
+    assert_eq!((slots(&earlier), slots(&current)), (0, 1));
+    assert_eq!(
+        split(&handler),
+        SlotSplit {
+            preferred: 0,
+            ordinary: 1,
+            ordinary_inbound: 0,
+        }
+    );
+
+    drop(dial);
+    assert_eq!((slots(&earlier), slots(&current)), (0, 0));
+    assert_eq!(split(&handler), SlotSplit::default());
 }
 
 /// An authenticated owner at the truncation boundary beats its equally scored peers,

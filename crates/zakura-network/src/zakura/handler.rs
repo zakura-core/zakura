@@ -66,10 +66,11 @@ use super::transport::{
     check_reactor_shares, frame_wire_bytes, sim_arg, sim_chain, transport_observe,
     worker_framed_channel, AdmittedFrame, CloseOutcome, CloseRow, CompatResponseGrant,
     ConnectionPlaces, ConnectionResources, FrameGate, FrameGrant, FramedWorkerRecv,
-    HandshakeCounts, HeldPlaces, IpAdmission, NeutralCause, NodeResources, OrderedStreamFailure,
-    OrderedStreamFailureCause, OwnerBound, OwnerGuard, OwnerPhase, ReactorBudget, ReactorShares,
-    ResourceEnvelope, SessionLayout, SlotClass, SlotRefusal, StreamResources, TransportLimits,
-    COMPAT_EXCHANGE_BUDGET, COMPAT_RESPONSE_MAX_AGGREGATE_BYTES,
+    HandshakeCounts, HeldPlaces, IpAdmission, MovedNodeIds, NeutralCause, NodeResources,
+    OrderedStreamFailure, OrderedStreamFailureCause, OwnerBound, OwnerGuard, OwnerPhase,
+    ReactorBudget, ReactorShares, RegisteredPeers, ResourceEnvelope, SessionLayout, SlotClass,
+    SlotRefusal, StreamResources, TransportLimits, COMPAT_EXCHANGE_BUDGET,
+    COMPAT_RESPONSE_MAX_AGGREGATE_BYTES,
 };
 #[cfg(any(test, feature = "zakura-testkit"))]
 use crate::zakura::drive_header_sync_actions;
@@ -1610,6 +1611,10 @@ pub struct ZakuraSupervisorHandle {
     inner: Arc<AsyncMutex<ZakuraSupervisorState>>,
     shutdown: CancellationToken,
     peer_set_tx: watch::Sender<Vec<ZakuraPeerId>>,
+    /// The earlier IDs of nodes that this node's dials found under a new ID.
+    /// A dial writes it before its connection registers, so a reader woken by
+    /// `peer_set_tx` already sees the move behind a new registration.
+    moved_tx: watch::Sender<MovedNodeIds>,
     registration_tx: broadcast::Sender<ZakuraConnectionRegistration>,
     pending_handoffs: Arc<StdMutex<HashMap<ZakuraPeerId, ZakuraHandoffId>>>,
     peer_registry: Option<PeerRegistry>,
@@ -1746,10 +1751,13 @@ pub(crate) struct ConnectionAdmissionGuard {
 }
 
 impl ConnectionAdmissionGuard {
-    /// The outbound QUIC connection has authenticated this guard's dial target.
-    fn outbound_connected(&mut self) {
+    /// The outbound QUIC connection has authenticated the node this guard's
+    /// dial reached, whose ID is `connected`. When that isn't the dialed ID,
+    /// the guard holds its slot under `connected` from here on.
+    fn outbound_connected(&mut self, connected: NodeId) {
         assert!(!self.inbound && !self.authenticated_dial);
-        self.slots.counts().outbound_connected(self.node);
+        self.slots.counts().outbound_connected(self.node, connected);
+        self.node = connected;
         self.authenticated_dial = true;
     }
 }
@@ -2107,6 +2115,7 @@ impl ZakuraSupervisorHandle {
             })),
             shutdown: CancellationToken::new(),
             peer_set_tx: watch::channel(Vec::new()).0,
+            moved_tx: watch::channel(MovedNodeIds::default()).0,
             registration_tx,
             pending_handoffs: Arc::new(StdMutex::new(HashMap::new())),
             peer_registry,
@@ -2167,6 +2176,40 @@ impl ZakuraSupervisorHandle {
     /// Subscribe to peer-set changes for event-driven tests and diagnostics.
     pub fn subscribe(&self) -> watch::Receiver<Vec<ZakuraPeerId>> {
         self.peer_set_tx.subscribe()
+    }
+
+    /// The node IDs that this node's dials found their nodes have moved on
+    /// from.
+    pub(crate) fn moved_node_ids(&self) -> watch::Receiver<MovedNodeIds> {
+        self.moved_tx.subscribe()
+    }
+
+    /// The registered peers, for a caller that asks whether a node it knows
+    /// by ID is registered. Unlike [`Self::subscribe`]'s peer set, it finds a
+    /// node that has moved on from that ID.
+    pub(crate) fn registered_peers(&self) -> RegisteredPeers {
+        RegisteredPeers::new(self.peer_set_tx.subscribe(), self.moved_tx.subscribe())
+    }
+
+    /// Records that a dial to `dialed` reached the node whose ID is now
+    /// `connected`.
+    fn learn_move(&self, dialed: NodeId, connected: NodeId) {
+        metrics::counter!("zakura.p2p.conn.dial.moved").increment(1);
+        let news = self
+            .moved_tx
+            .send_if_modified(|moved| moved.learn(dialed, connected));
+        if news {
+            info!(
+                %dialed,
+                connected_as = %connected,
+                "A Zakura peer answered a dial to its earlier node ID under a new one"
+            );
+        }
+    }
+
+    /// Whether a connection of `peer_id` is registered now.
+    pub(crate) fn is_registered(&self, peer_id: &ZakuraPeerId) -> bool {
+        self.peer_set_tx.borrow().contains(peer_id)
     }
 
     /// Start an atomic wait for the next connection generation of `peer_id`.
@@ -2335,6 +2378,12 @@ impl ZakuraSupervisorHandle {
                 }
                 state.charge_ip(conn_id, host);
                 state.debug_assert_accounting();
+                // A node registered under an ID has not moved on from it,
+                // whatever an earlier dial found.
+                if let Some(node_id) = peer_id.node_id() {
+                    self.moved_tx
+                        .send_if_modified(|moved| moved.forget(&node_id));
+                }
                 let registered_ids: Vec<_> = state.active_by_peer.keys().cloned().collect();
                 set_active_connection_gauge(registered_ids.len());
                 self.peer_set_tx.send_replace(registered_ids);
@@ -6377,9 +6426,10 @@ pub(crate) async fn serve_reported_native_dial_connection(
     report: Option<DialReport>,
     kind: NativeDialKind,
 ) -> Result<(), ZakuraHandlerError> {
+    let dialed = node_addr.id;
     let mut admission = endpoint
         .handler
-        .claim_connection(node_addr.id, false)
+        .claim_connection(dialed, false)
         .map_err(|_| ZakuraHandlerError::ResourceLimit(ADMISSION_LIMIT))?;
     let dial_timeout = native_dial_timeout(
         endpoint.quic.config(),
@@ -6420,8 +6470,19 @@ pub(crate) async fn serve_reported_native_dial_connection(
         report.registration
     });
     let remote_node_id = connection.remote_id();
-    admission.outbound_connected();
     let peer_id = ZakuraPeerId::from_node_id(remote_node_id);
+    if remote_node_id != dialed {
+        // The node added keys since this node learned `dialed`, and answers
+        // under the ID it has now (zakura-quic TLS-7). If a connection to it
+        // is in its own handshake, the two meet in `register` like any
+        // simultaneous open.
+        endpoint.supervisor.learn_move(dialed, remote_node_id);
+        if endpoint.supervisor.is_registered(&peer_id) {
+            close_redundant_dial(endpoint, &connection);
+            return Ok(());
+        }
+    }
+    admission.outbound_connected(remote_node_id);
     let conn = ZakuraConnTrace::new(
         &endpoint.handler.trace,
         trace_conn_id(&connection),
@@ -6518,6 +6579,26 @@ pub(crate) async fn serve_reported_native_dial_connection(
             },
         )
         .await
+}
+
+/// Closes a dial's connection to a node that already has a registered one.
+/// The dial was to an earlier ID of the node, so nothing stopped it before
+/// TLS showed which node it reached.
+///
+/// The caller closes before the control handshake. The other end registers
+/// a connection as soon as it has acknowledged that handshake, and its
+/// duplicate rule would then cancel its side of the connection already
+/// registered, once that is older than
+/// [`ZAKURA_SAME_IP_DUPLICATE_EVICT_MIN_AGE`]. A dial to an earlier ID comes
+/// from a stale record or config entry, and must not replace a live connection.
+fn close_redundant_dial(endpoint: &ZakuraEndpoint, connection: &Connection) {
+    #[cfg(any(test, zakura_sim))]
+    endpoint
+        .handler
+        .handshake_refused(connection, "moved-peer-already-registered");
+    #[cfg(not(any(test, zakura_sim)))]
+    let _ = endpoint;
+    connection.close(VarInt::from_u32(ZAKURA_CLOSE_NEUTRAL), b"duplicate");
 }
 
 /// The protocol version the connection's ALPN selected (COMPAT-8). Both
@@ -9099,6 +9180,7 @@ mod tests {
     mod frame_lifetime;
     #[cfg(not(zakura_sim))]
     mod handshake_cost;
+    mod moved_identity;
     mod preferred_hold;
     mod quic_progress;
     mod read_close_cause;

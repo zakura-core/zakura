@@ -22,6 +22,7 @@ use tracing::debug;
 use zakura_node_services::task::spawn_erased_named;
 use zakura_quic::{NodeAddr, NodeId};
 use zakura_rt::{
+    collections::HashSet,
     sync::{oneshot, watch},
     task::{AbortOnDropHandle, JoinHandle},
     time::Instant,
@@ -33,6 +34,7 @@ use super::redial::ZAKURA_REDIAL_HEALTHY_CONNECTION;
 use super::trace::{DialOwner, DialPhase, DiscoveryDialPhaseEvent, DiscoveryDialResultEvent};
 use crate::zakura::{
     handler::{DialRegistration, DialReport},
+    transport::RegisteredPeers,
     ZakuraEndpoint, ZakuraHandlerError, ZakuraLocalLimits, ZakuraPeerId, ZakuraServiceId,
     ZakuraTrace,
 };
@@ -305,6 +307,7 @@ impl CandidateDialerIO {
         let classified = classify_gateways(
             self.preferred.ranked(),
             registered,
+            &self.endpoint.supervisor().moved_node_ids(),
             state,
             &self.discovery,
             now,
@@ -356,9 +359,18 @@ impl CandidateDialerIO {
         if preferred {
             count_preferred_dial_result(outcome.result);
         }
+        let connected = self
+            .endpoint
+            .supervisor()
+            .moved_node_ids()
+            .borrow()
+            .current(attempt.node_id);
         apply_discovery_dial_result(
             &self.discovery,
-            &attempt.node_id,
+            DialedNode {
+                dialed: attempt.node_id,
+                connected,
+            },
             outcome.result,
             outcome.admitted_addr,
             &self.trace,
@@ -467,6 +479,12 @@ async fn admit_dial_round(
     let supervisor = endpoint.supervisor();
     let in_flight_node_ids = state.in_flight_node_ids();
     let held_places = endpoint.held_places();
+    // The book lists a moved node under its earlier ID and, once it has the
+    // node's new record, under its ID now. One dial reaches the node either
+    // way, so the round compares candidates by the ID each answers with.
+    let moved = supervisor.moved_node_ids();
+    let current = |node: NodeId| moved.borrow().current(node);
+    let mut dialing: HashSet<NodeId> = in_flight_node_ids.iter().map(|id| current(*id)).collect();
     let mut admitted = Vec::new();
     discovery
         .admit_dial_candidates_preferring_any_service(
@@ -477,7 +495,15 @@ async fn admit_dial_round(
                 if free_slots == 0 || free_permits == 0 {
                     return DialAdmission::Exhausted;
                 }
-                if held_places.members.contains(&candidate.node_id) {
+                let answers_as = current(candidate.node_id);
+                if held_places.members.contains(&candidate.node_id)
+                    || held_places.members.contains(&answers_as)
+                {
+                    return DialAdmission::Skipped;
+                }
+                let moved_and_registered = answers_as != candidate.node_id
+                    && supervisor.is_registered(&ZakuraPeerId::from_node_id(answers_as));
+                if moved_and_registered || dialing.contains(&answers_as) {
                     return DialAdmission::Skipped;
                 }
                 let Some((node_addr, reserved_ips)) = discovery_node_addr_with_reserved_ip_capacity(
@@ -497,6 +523,7 @@ async fn admit_dial_round(
                 };
                 free_slots -= claimed_slots;
                 free_permits -= 1;
+                dialing.insert(answers_as);
                 admitted.push((attempt, node_addr));
                 DialAdmission::Admitted
             },
@@ -546,8 +573,8 @@ async fn run_discovery_dial_once(
     let Ok(peer_id) = ZakuraPeerId::new(attempt.node_id.as_bytes().to_vec()) else {
         return finished(DiscoveryDialResult::Failed);
     };
-    let mut registered = endpoint.supervisor().subscribe();
-    if registered.borrow_and_update().contains(&peer_id) {
+    let mut registered = endpoint.supervisor().registered_peers();
+    if registered.names_and_mark_seen(&peer_id) {
         return finished(DiscoveryDialResult::ConnectedElsewhere);
     }
 
@@ -582,7 +609,9 @@ async fn run_discovery_dial_once(
 struct DialWatch {
     attempt: DialAttemptKey,
     peer_id: ZakuraPeerId,
-    registered: watch::Receiver<Vec<ZakuraPeerId>>,
+    /// Finds the peer under the ID it dialed or the one the node has moved
+    /// to, so an attempt that reached a moved node follows its registration.
+    registered: RegisteredPeers,
     dial: AbortOnDropHandle<Result<(), ZakuraHandlerError>>,
     /// Carries the address whose handshake TLS authenticated. The dial task
     /// sends it before it registers the peer.
@@ -674,7 +703,7 @@ impl DialWatch {
 
     /// Whether the peer is registered now, marking the watch seen.
     fn peer_is_registered(&mut self) -> bool {
-        self.registered.borrow_and_update().contains(&self.peer_id)
+        self.registered.names_and_mark_seen(&self.peer_id)
     }
 
     fn registration_began(&mut self) {
@@ -777,18 +806,54 @@ fn count_preferred_dial_result(result: DiscoveryDialResult) {
     }
 }
 
+/// The node one attempt dialed, by the ID it dialed and the ID the node
+/// answers with now. They differ when the node has added keys since the
+/// book learned `dialed` (zakura-quic TLS-7).
+#[derive(Clone, Copy, Debug)]
+struct DialedNode {
+    dialed: NodeId,
+    connected: NodeId,
+}
+
+impl DialedNode {
+    /// The book entries a served connection speaks for: the dialed ID's and,
+    /// for a node that has moved on from it, the entry of its ID now. TLS
+    /// proved the node holds both.
+    fn entries(&self) -> impl Iterator<Item = &NodeId> {
+        let moved = (self.connected != self.dialed).then_some(&self.connected);
+        std::iter::once(&self.dialed).chain(moved)
+    }
+}
+
+/// Records `result` of a dial to `node` in the discovery book, the trace and
+/// the metrics.
+///
+/// A registration counts for both of a moved node's book entries, and so
+/// does one that ended early, or the entry left out would be dialed at once.
+/// A failure counts against the dialed ID alone: nothing was proved about
+/// the other.
 async fn apply_discovery_dial_result(
     discovery: &ZakuraDiscoveryHandle,
-    node_id: &NodeId,
+    node: DialedNode,
     result: DiscoveryDialResult,
     admitted_addr: Option<SocketAddr>,
     trace: &ZakuraTrace,
 ) {
-    trace.emit_event(|| DiscoveryDialResultEvent::new(node_id.as_bytes(), result));
+    let node_id = &node.dialed;
+    trace.emit_event(|| {
+        let connected_as = (node.connected != node.dialed).then(|| node.connected.as_bytes());
+        DiscoveryDialResultEvent::new(
+            node_id.as_bytes(),
+            connected_as.map(<[u8; 32]>::as_slice),
+            result,
+        )
+    });
 
     match result {
         DiscoveryDialResult::Registered => {
-            discovery.mark_dial_success(node_id, admitted_addr).await;
+            for entry in node.entries() {
+                discovery.mark_dial_success(entry, admitted_addr).await;
+            }
             metrics::counter!("zakura.p2p.discovery.dial.succeeded").increment(1);
         }
         // Another connection's registration proves none of this record's
@@ -797,7 +862,9 @@ async fn apply_discovery_dial_result(
             metrics::counter!("zakura.p2p.discovery.dial.connected_elsewhere").increment(1);
         }
         DiscoveryDialResult::ShortLivedRegistered => {
-            discovery.mark_short_lived_exchange(node_id).await;
+            for entry in node.entries() {
+                discovery.mark_short_lived_exchange(entry).await;
+            }
             metrics::counter!("zakura.p2p.discovery.dial.short_lived_registered").increment(1);
         }
         DiscoveryDialResult::Failed => {

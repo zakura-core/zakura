@@ -6,13 +6,14 @@ use zakura_node_services::task::spawn_erased_named;
 use zakura_quic::{NodeAddr, NodeId};
 use zakura_rt::{
     collections::HashMap,
-    sync::{oneshot, CancellationToken},
+    sync::{oneshot, watch, CancellationToken},
     task::JoinHandle,
 };
 
 use super::{native_dial_supervised, RedialPolicy};
 use crate::zakura::{
     handler::{DialRegistration, DialReport},
+    transport::MovedNodeIds,
     ZakuraEndpoint, ZakuraHandlerError, ZakuraLocalLimits, DEFAULT_ZAKURA_REDIAL_INITIAL_BACKOFF,
     DEFAULT_ZAKURA_REDIAL_MAX_BACKOFF,
 };
@@ -47,17 +48,46 @@ pub(crate) fn spawn_native_bootstrap_dialer(
         let endpoint = endpoint.clone();
         let limits = limits.clone();
         tasks.push(spawn_erased_named("bootstrap_dial", async move {
-            native_dial_supervised(
+            let moved = warn_when_moved(endpoint.supervisor().moved_node_ids(), node_addr.id);
+            let dial = native_dial_supervised(
                 endpoint,
                 node_addr,
                 limits,
                 policy,
                 CancellationToken::new(),
-            )
-            .await;
+            );
+            zakura_rt::pin!(dial, moved);
+            zakura_rt::select! {
+                _ = &mut dial => return,
+                () = &mut moved => {}
+            }
+            dial.await;
         }));
     }
     tasks
+}
+
+/// Waits until a dial finds the bootstrap peer configured as `configured`
+/// under another node ID, and tells the operator once.
+///
+/// The peer added keys, and still answers to the configured ID
+/// (zakura-quic TLS-7), so the maintained dial keeps working. It stops
+/// working if the peer later drops a key the configured ID was made from,
+/// which is why the entry should be updated. Returns without a warning when
+/// the supervisor is gone.
+async fn warn_when_moved(mut moved: watch::Receiver<MovedNodeIds>, configured: NodeId) {
+    let Ok(moved) = moved
+        .wait_for(|moved| moved.current(configured) != configured)
+        .await
+    else {
+        return;
+    };
+    tracing::warn!(
+        %configured,
+        current = %moved.current(configured),
+        "a zakura.bootstrap_peers entry names a peer by an earlier node ID; \
+         replace it with the peer's current node ID"
+    );
 }
 
 /// Refuses a remote bootstrap identity, grouped as the bootstrap dialer groups

@@ -5,11 +5,16 @@
 //! invariants after every attempt (see `replay.rs`). The scenarios pin each
 //! rule with literal inputs and outputs.
 
+use zakura_rt::sync::watch;
+
 use super::replay::*;
 use super::state::{RedialNext, RedialStart, RedialState};
 use super::*;
 use crate::zakura::{
-    machine_test::machine_target_tests, trace::peer_label, ZAKURA_ALPN_MISMATCH_BACKOFF,
+    machine_test::machine_target_tests,
+    trace::peer_label,
+    transport::{no_moves, MovedNodeIds, RegisteredPeers},
+    ZAKURA_ALPN_MISMATCH_BACKOFF,
 };
 
 const HEALTHY: Duration = ZAKURA_REDIAL_HEALTHY_CONNECTION;
@@ -249,7 +254,7 @@ where
 {
     run_dial_supervisor(
         peer_id,
-        registered,
+        RegisteredPeers::new(registered, no_moves()),
         ZakuraTrace::noop(),
         policy,
         CancellationToken::new(),
@@ -344,6 +349,53 @@ async fn dial_supervisor_connect_once_skips_stably_registered_peer() {
     .expect("an already-connected connect-once peer returns immediately");
 
     assert_eq!(dial_count(&calls), 0);
+}
+
+/// A supervisor that maintains a peer by an earlier node ID leaves it alone
+/// while the node is registered under the ID it moved to, and dials again
+/// once that registration ends.
+#[tokio::test]
+async fn dial_supervisor_follows_a_peer_to_the_id_it_moved_to() {
+    let earlier = redial_test_peer_id();
+    let now = ZakuraPeerId::new(vec![10u8; 32]).expect("32-byte node id is valid");
+    let node_id = |peer: &ZakuraPeerId| peer.node_id().expect("32 bytes are a node ID");
+    let mut moves = MovedNodeIds::default();
+    moves.learn(node_id(&earlier), node_id(&now));
+    let (_moved_tx, moved) = watch::channel(moves);
+    let (registered_tx, registered) = watch::channel(vec![now.clone()]);
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let policy = RedialPolicy::connect_once_with_registered_settle(
+        Duration::from_millis(1),
+        Duration::from_millis(1),
+        3,
+        Duration::from_secs(1),
+    );
+
+    let supervisor = tokio::spawn(run_dial_supervisor(
+        earlier,
+        RegisteredPeers::new(registered, moved),
+        ZakuraTrace::noop(),
+        policy,
+        CancellationToken::new(),
+        count_dial(&calls, DialResult::Healthy),
+    ));
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        dial_count(&calls),
+        0,
+        "the node is registered under the ID it moved to"
+    );
+
+    registered_tx
+        .send(Vec::new())
+        .expect("dial supervisor still watches registrations");
+    tokio::time::timeout(Duration::from_secs(5), supervisor)
+        .await
+        .expect("the supervisor dials once the registration ends")
+        .expect("dial supervisor task must not panic");
+    assert_eq!(dial_count(&calls), 1);
 }
 
 /// A connect-once upgrade hand-off must not give up just because the peer
@@ -744,7 +796,7 @@ async fn a_stopped_supervisor_starts_no_new_attempt() {
         Duration::from_secs(60),
         run_dial_supervisor(
             redial_test_peer_id(),
-            registered,
+            RegisteredPeers::new(registered, no_moves()),
             ZakuraTrace::noop(),
             RedialPolicy::maintain(Duration::from_secs(1), Duration::from_secs(30)),
             stop,
@@ -835,7 +887,7 @@ async fn redial_attempts_trace_their_registration_phases() {
         Duration::from_secs(5),
         run_dial_supervisor(
             peer_id,
-            registered,
+            RegisteredPeers::new(registered, no_moves()),
             trace,
             RedialPolicy::connect_once(Duration::from_millis(1), Duration::from_millis(1), 2),
             CancellationToken::new(),
@@ -869,7 +921,7 @@ async fn a_scored_registration_traces_no_dial() {
     let (trace, mut rows) = captured_trace();
     let supervisor = tokio::spawn(run_dial_supervisor(
         peer_id,
-        registered,
+        RegisteredPeers::new(registered, no_moves()),
         trace,
         RedialPolicy::maintain_bounded(Duration::from_secs(1), Duration::from_secs(1), 1),
         CancellationToken::new(),
@@ -899,7 +951,7 @@ async fn a_dropped_supervisor_traces_a_cancelled_dial() {
         || Box::pin(std::future::pending()) as Pin<Box<dyn Future<Output = DialResult> + Send>>;
     let supervised = run_dial_supervisor(
         redial_test_peer_id(),
-        registered,
+        RegisteredPeers::new(registered, no_moves()),
         trace,
         RedialPolicy::maintain(Duration::from_secs(1), Duration::from_secs(1)),
         CancellationToken::new(),
@@ -927,7 +979,7 @@ async fn a_panicking_dial_traces_its_end() {
     };
     let supervisor = tokio::spawn(run_dial_supervisor(
         redial_test_peer_id(),
-        registered,
+        RegisteredPeers::new(registered, no_moves()),
         trace,
         RedialPolicy::maintain(Duration::from_secs(1), Duration::from_secs(1)),
         CancellationToken::new(),

@@ -13,6 +13,7 @@ mod handshake_counts;
 mod io;
 mod lifetime;
 mod message_rule;
+mod moved_ids;
 #[cfg(any(test, zakura_sim))]
 mod observe;
 mod pipe;
@@ -77,6 +78,9 @@ pub use message_rule::{
     layout::LayoutError,
     ByteRate, Cadence, Credit, MessageRole, MessageRule, PayloadLen,
 };
+#[cfg(test)]
+pub(crate) use moved_ids::tests::no_moves;
+pub(crate) use moved_ids::{MovedNodeIds, RegisteredPeers};
 #[cfg(any(test, zakura_sim))]
 pub(crate) use observe::{ConnTap, RegulationTap, StreamTap};
 #[cfg(zakura_sim)]

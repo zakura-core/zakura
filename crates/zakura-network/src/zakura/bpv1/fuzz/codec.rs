@@ -13,8 +13,8 @@
 //!   proof rebuilds the same part;
 //! - every `k`-subset of a stripe decodes and re-encodes to the stripe's
 //!   `n` parts, and `k - 1` parts never decode;
-//! - a lying proposer's stripe never passes the re-encode check from any
-//!   `k`-subset;
+//! - a lying proposer's stripe never passes the re-encode check from the
+//!   `k`-subset the input picks;
 //! - a tampered wire payload never proves;
 //! - assembly either refuses or returns `header || compactsize(tx_count)
 //!   || coinbase || body`.
@@ -201,8 +201,9 @@ fn check_decodes(encoded: &EncodedBody, choice: &[u8], reached: &mut Reached) ->
 }
 
 /// A proposer who swaps one part's payload and builds an honest tree over
-/// the result: every part proves, but no `k`-subset passes the re-encode
-/// check (bpv1-41).
+/// the result: every part proves, but the `k`-subset the input picks fails
+/// the re-encode check (bpv1-41). One subset per input keeps this mode as
+/// cheap as the others; the fuzzer varies the subset across inputs.
 fn check_lying_proposer(
     encoded: &EncodedBody,
     choice: &[u8],
@@ -240,15 +241,13 @@ fn check_lying_proposer(
         .split_index(victim.index())
         .expect("the victim is a part of this layout");
     let parts = stripe_parts(&lying, coding, stripe);
-    for rotate in 0..choice.len() {
-        let mut rotated = choice.to_vec();
-        rotated.rotate_left(rotate);
-        let held = subset(coding, stripe, parts, &rotated, coding.k);
-        assert!(
-            decode_and_check_stripe(coding, &encoded.encoding_id, stripe, &held).is_err(),
-            "{CODEC}: bpv1-41 a lying stripe passed the re-encode check"
-        );
-    }
+    let mut rotated = choice.to_vec();
+    rotated.rotate_left(usize::from(tamper_at) % choice.len().max(1));
+    let held = subset(coding, stripe, parts, &rotated, coding.k);
+    assert!(
+        decode_and_check_stripe(coding, &encoded.encoding_id, stripe, &held).is_err(),
+        "{CODEC}: bpv1-41 a lying stripe passed the re-encode check"
+    );
     reached.hit("decode:lying-caught");
 }
 

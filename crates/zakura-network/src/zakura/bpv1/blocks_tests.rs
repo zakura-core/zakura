@@ -2699,8 +2699,48 @@ fn bpv1_76_metadata_far_above_the_verified_tip_belongs_to_block_sync() {
     table.assert_invariants();
 }
 
-/// bpv1-7: retirement and admission use one window, so a block admission
-/// refuses is never kept, and a block it accepts is never retired.
+/// bpv1-76: the verified-tip bound gates admission only. A reorg that lowers
+/// the verified tip keeps a block admitted above the new bound, and refuses new
+/// metadata at that height.
+#[test]
+fn bpv1_76_a_verified_tip_rollback_keeps_admitted_blocks() {
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let t0 = Instant::now();
+    let coding = Profile::TINY.derive_coding(128, 2).unwrap();
+    let verified = 100;
+    let height = verified + PROPAGATION_DEPTH;
+    table.step(t0, BlockInput::TipHeight { height: verified });
+    let admitted = block::Hash([0xE1; 32]);
+    admit_block(&mut table, t0, admitted, height, coding, [0x21; 32]);
+
+    let step = table.step(
+        t0,
+        BlockInput::TipHeight {
+            height: verified - 2,
+        },
+    );
+    assert!(!step
+        .events
+        .contains(&BlockEvent::Retired { block_id: admitted }));
+    assert_eq!(table.block_phase(&admitted), Some(BlockPhase::Collecting));
+
+    let late = make_envelope(block::Hash([0xE2; 32]), coding, [0x21; 32], node_id(1));
+    let received = receive(&mut table, t0, late);
+    let step = header_result(
+        &mut table,
+        t0,
+        &received,
+        HeaderAdmissionResult::Admitted { height },
+    );
+    assert!(!step
+        .outputs
+        .iter()
+        .any(|o| matches!(o, BlockOutput::VerifyCommitment { .. })));
+    table.assert_invariants();
+}
+
+/// bpv1-7: retirement and admission use one propagation window, so a block
+/// the window refuses is never kept, and a block it accepts is never retired.
 #[test]
 fn bpv1_7_retirement_matches_the_admission_window() {
     let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));

@@ -100,7 +100,8 @@ proptest! {
         block_time in datetime_full(),
         relative_source_fund_heights in vec(0.0..1.0, 1..=MAX_TRANSPARENT_INPUTS),
         transaction_version in 4_u8..=5,
-        relative_unlock_height in 0.0..1.0,
+        // A zero offset exercises the block at the lock height itself.
+        relative_unlock_height in prop_oneof![Just(0.0), 0.0..1.0],
     ) {
         let _init_guard = zakura_test::init();
 
@@ -156,7 +157,7 @@ proptest! {
         );
     }
 
-    /// Test if a transaction unlocked at an earlier block time is accepted.
+    /// Test if a transaction unlocked at an earlier block height is accepted.
     #[test]
     fn transaction_with_lock_height_is_accepted(
         (network, block_height) in sapling_onwards_strategy(),
@@ -167,11 +168,7 @@ proptest! {
     ) {
         let _init_guard = zakura_test::init();
 
-        // Because `scale_block_height` uses the range `[min, max)`, with `max` being
-        // non-inclusive, we have to use `block_height + 1` as the upper bound in order to test
-        // verifying at a block height equal to the lock height.
-        let exclusive_max_height = block::Height(block_height.0 + 1);
-        let unlock_height = scale_block_height(None, exclusive_max_height, relative_unlock_height);
+        let unlock_height = scale_block_height(None, block_height, relative_unlock_height);
         let lock_time = LockTime::Height(unlock_height);
 
         let (transaction, known_utxos) = mock_transparent_transaction(

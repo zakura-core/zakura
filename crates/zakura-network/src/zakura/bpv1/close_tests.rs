@@ -649,12 +649,7 @@ fn a_refused_pending_copy_keeps_every_alternate() {
     let alternate_parent = block::Hash([0x6F; 32]);
     let park = |table: &mut BlockTable, envelope, from: (NodeId, u64), parent_hash| {
         let received = copy_from(table, now, envelope, from);
-        header_result(
-            table,
-            now,
-            &received,
-            HeaderAdmissionResult::MissingParent { parent_hash },
-        )
+        missing_parent(table, now, &received, parent_hash)
     };
     let heavy = (node_id(10), 10);
     let relay = (node_id(11), 11);
@@ -743,14 +738,7 @@ fn an_ended_session_leaves_no_sender_record() {
         make_envelope(block_id, tiny(), [0xA1; 32], node_id(1)),
         a,
     );
-    header_result(
-        &mut table,
-        now,
-        &first,
-        HeaderAdmissionResult::MissingParent {
-            parent_hash: parent,
-        },
-    );
+    missing_parent(&mut table, now, &first, parent);
     copy_from(
         &mut table,
         now,

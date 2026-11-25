@@ -1945,6 +1945,13 @@ impl BlockTable {
             reject_also(step, block_id, &entry.also_from);
             return;
         }
+        // This node admitted the block itself while the check ran: its miner
+        // solved the block that a peer's copy also carries. That admission
+        // published the block to every session, so this copy ends here.
+        // Admitting it again would replace the solved block's entry.
+        if self.blocks.contains_key(&block_id) {
+            return;
+        }
 
         let height = entry.height.unwrap_or(self.top);
         // Recheck the window after async commitment work

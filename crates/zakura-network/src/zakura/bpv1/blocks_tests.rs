@@ -2471,6 +2471,52 @@ fn fix8_part_charge_before_proof_bounds_the_part_buffer() {
     assert_eq!(table.block_phase(&block_id), Some(BlockPhase::Retired));
 }
 
+/// A retired block's tombstone stays until `top` passes it by more than
+/// twice the propagation window. Then the table drops it and tells every
+/// session to drop its own (`PublishEvictRetired`).
+#[test]
+fn retired_tombstone_evicts_past_twice_the_window() {
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let t0 = Instant::now();
+    let coding = Profile::TINY.derive_coding(128, 2).unwrap();
+    let old = block::Hash([0xB5; 32]);
+    table.step(t0, BlockInput::TipHeight { height: 49 });
+    admit_block(&mut table, t0, old, 50, coding, [0x21; 32]);
+    let evicts = |step: &BlockStep| {
+        step.outputs
+            .iter()
+            .any(|o| matches!(o, BlockOutput::PublishEvictRetired { block_id } if *block_id == old))
+    };
+
+    let step = table.step(
+        t0,
+        BlockInput::TipHeight {
+            height: 50 + PROPAGATION_DEPTH + 1,
+        },
+    );
+    assert!(!evicts(&step));
+    assert_eq!(table.block_phase(&old), Some(BlockPhase::Retired));
+
+    let step = table.step(
+        t0,
+        BlockInput::TipHeight {
+            height: 50 + 2 * PROPAGATION_DEPTH,
+        },
+    );
+    assert!(!evicts(&step));
+    assert_eq!(table.block_phase(&old), Some(BlockPhase::Retired));
+
+    let step = table.step(
+        t0,
+        BlockInput::TipHeight {
+            height: 50 + 2 * PROPAGATION_DEPTH + 1,
+        },
+    );
+    assert!(evicts(&step));
+    assert_eq!(table.block_phase(&old), None);
+    table.assert_invariants();
+}
+
 /// Every input that raises `top` retires the blocks it pushes out of
 /// the propagation window.
 #[test]

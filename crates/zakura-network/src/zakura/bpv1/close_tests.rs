@@ -628,6 +628,27 @@ fn close_5_repeated_header_meta_closes_while_the_block_is_known() {
     assert_closed(&peer, Bpv1CloseRow::Row5DuplicateHeaderMeta);
 }
 
+/// `EvictRetired` drops the session's tombstone of a retired block. A
+/// `HeaderMeta` for the block then reaches the table, whose window refuses
+/// it, instead of closing 5 as a repeat.
+#[test]
+fn evicted_tombstone_forgets_the_retired_block() {
+    let now = Instant::now();
+    let block_id = block::Hash([0x56; 32]);
+    let mut peer = tiny_session(block_id, now);
+    peer.step(now, recv_meta(block_id));
+    peer.step(now, retire(block_id));
+    peer.step(now, PeerInput::EvictRetired { block_id });
+    peer.assert_invariants();
+
+    let step = peer.step(now, recv_meta(block_id));
+    assert!(peer.close_cause().is_none());
+    assert!(step.outputs.iter().any(
+        |o| matches!(o, PeerOutput::SubmitHeaderMeta { block_id: id, .. } if *id == block_id)
+    ));
+    peer.assert_invariants();
+}
+
 /// `bpv1-close-8`: a `Want` stripe or slot outside the admitted layout
 /// closes 8. The last stripe and the last slot are in range.
 #[test]

@@ -1202,6 +1202,102 @@ fn decision19_proposer_flags_its_seeds_ahead_of_them_once() {
     peer.assert_invariants();
 }
 
+/// bpv1-88: a session that learned the block from a peer's copy takes the
+/// proposer role when this node's own admission of the block arrives. It
+/// sends `BlockDone` once and no second `HeaderMeta`, drops its held `Have`s,
+/// and queues the seed plan. Each case is one session's state at the
+/// takeover: it sent `HeaderMeta`, it received it, or it already sent
+/// `BlockDone` for an assembled copy.
+#[test]
+fn bpv1_88_a_peer_admitted_session_takes_the_proposer_role() {
+    let encoded = encode_body(&Profile::TINY, &[0x5B; 64], 2).unwrap();
+    let block_id = block::Hash([0x58; 32]);
+    let t0 = Instant::now();
+    let deadline = t0 + Duration::from_millis(500);
+    let block_dones = |step: &PeerStep| {
+        step.outputs
+            .iter()
+            .filter(|o| {
+                matches!(o, PeerOutput::SendControl(msg)
+                    if matches!(**msg, Bpv1Message::BlockDone { .. }))
+            })
+            .count()
+    };
+    for (sent_meta, assembled) in [(true, false), (false, false), (true, true)] {
+        // The peer's copy names this node, node 1, as its proposer.
+        let mut peer = session(
+            node_id(2),
+            t0,
+            PeerInput::BlockAdmitted(BlockAdmitted {
+                header_meta: sent_meta.then(|| dummy_meta(block_id)),
+                have_held_until: Some(deadline),
+                ..block_admitted(block_id, encoded.coding, node_id(1))
+            }),
+        );
+        if !sent_meta {
+            peer.step(t0, recv_meta(block_id));
+        }
+        // A verified part waits for the advertisement deadline.
+        peer.step(t0, ready(block_id, vec![0], false));
+        assert!(peer.next_deadline().is_some(), "the relay holds a Have");
+        if assembled {
+            let done = peer.step(t0, PeerInput::LocalBlockDone { block_id });
+            assert_eq!(block_dones(&done), 1);
+        }
+
+        let took = peer.step(t0, proposing(block_id, encoded.coding));
+        assert!(!queues_meta(&took), "bpv1-4: one HeaderMeta per connection");
+        assert_eq!(
+            block_dones(&took),
+            usize::from(!assembled),
+            "bpv1-39: the proposer sends BlockDone once"
+        );
+        assert_eq!(
+            peer.next_deadline(),
+            None,
+            "decision-20: the proposer drops its held Have"
+        );
+        let seeded = peer.step(
+            t0,
+            PeerInput::Seeds(Seeds {
+                block_id,
+                seeds: vec![Seed {
+                    part: encoded.parts[1].clone(),
+                    relay: true,
+                }],
+                copies: Vec::new(),
+            }),
+        );
+        assert!(
+            matches!(
+                seeded.outputs.as_slice(),
+                [
+                    PeerOutput::SendHave {
+                        flags: HaveFlags::Relay,
+                        ..
+                    },
+                    PeerOutput::SendSeedPart { .. }
+                ]
+            ),
+            "the seed plan goes out: {:?}",
+            seeded.outputs
+        );
+        let again = peer.step(
+            t0 + Duration::from_secs(1),
+            proposing(block_id, encoded.coding),
+        );
+        assert!(again.outputs.is_empty(), "a repeat changes nothing");
+        assert!(
+            peer.step(t0 + Duration::from_secs(1), PeerInput::Tick)
+                .outputs
+                .iter()
+                .all(|o| !matches!(o, PeerOutput::SendHave { .. })),
+            "decision-20: no Have after the takeover"
+        );
+        peer.assert_invariants();
+    }
+}
+
 /// decision-20 / bpv1-9: a proposer's session never announces its own block.
 #[test]
 fn decision20_proposer_session_never_sends_have() {

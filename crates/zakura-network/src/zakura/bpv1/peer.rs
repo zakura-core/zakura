@@ -1361,6 +1361,15 @@ impl PeerState {
             state.have_held_until = have_held_until;
             state.have_delayed = have_held_until.is_some();
         }
+        // bpv1-88: this node solved a block that a peer's copy admitted
+        // first. The role only grows, and the proposer announces nothing
+        // (decision-20), so its held `Have`s drop.
+        if as_proposer && !state.as_proposer {
+            state.as_proposer = true;
+            state.pending_have.clear();
+            state.pending_have_since = None;
+            state.have_held_until = None;
+        }
         state.flags_lost |= flags_lost;
         if received {
             state.meta_received = true;

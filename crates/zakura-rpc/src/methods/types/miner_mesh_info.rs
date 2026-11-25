@@ -86,8 +86,8 @@ pub struct MeshWindow {
     /// The best tip height the counts follow, or null before the first tip.
     pub tip: Option<u32>,
 
-    /// The newest height that counts, 100 below the tip, or null while the
-    /// tip is below 100.
+    /// The newest height that counts, 10 below the tip, or null while the
+    /// tip is below 10.
     pub newest: Option<u32>,
 
     /// The oldest height that counts: about two days of blocks below
@@ -98,7 +98,7 @@ pub struct MeshWindow {
     pub checked: usize,
 
     /// The share of the window read, from 0 to 1. Until it reaches 1 the
-    /// block counts are a lower bound. A tip below 100 has an empty window,
+    /// block counts are a lower bound. A tip below 10 has an empty window,
     /// which is complete, so it reports 1.
     pub coverage: f64,
 }
@@ -106,8 +106,10 @@ pub struct MeshWindow {
 /// One ranked gateway.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MeshGateway {
-    /// The gateway's v2 node ID in hex.
-    pub node_id: String,
+    /// The ID the blocks name the gateway by, in hex: the first 20 bytes of
+    /// its v2 node ID. The gateway is the one known node whose node ID
+    /// starts with these bytes.
+    pub gateway_id: String,
 
     /// Counted blocks that name the gateway.
     pub blocks: u32,
@@ -135,6 +137,9 @@ pub enum MeshGatewayState {
     Backoff,
     /// v2 networking has no usable dial address for it, so no place is held for it.
     Unmatched,
+    /// v2 networking knows two or more nodes whose node IDs start with the
+    /// gateway ID, so it prefers none of them and holds no place for it.
+    Ambiguous,
 }
 
 /// How the connection slots are used.
@@ -226,7 +231,7 @@ impl From<&MinerSetCoverage> for MeshWindow {
 impl From<&PlacedGateway> for MeshGateway {
     fn from(gateway: &PlacedGateway) -> Self {
         Self {
-            node_id: hex::encode(gateway.node_id),
+            gateway_id: gateway.gateway_id.to_string(),
             blocks: gateway.blocks,
             state: gateway.place.into(),
             connected: gateway.connected,
@@ -241,6 +246,7 @@ impl From<GatewayPlace> for MeshGatewayState {
             GatewayPlace::Standby => Self::Standby,
             GatewayPlace::Backoff => Self::Backoff,
             GatewayPlace::Unmatched => Self::Unmatched,
+            GatewayPlace::Ambiguous => Self::Ambiguous,
         }
     }
 }

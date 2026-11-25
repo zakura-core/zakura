@@ -7,6 +7,7 @@
 
 use std::{collections::BTreeSet, time::Duration};
 
+use zakura_chain::miner_mesh::GatewayId;
 use zakura_quic::NodeSecretKey;
 use zakura_rt::sync::watch;
 
@@ -55,7 +56,7 @@ fn spawn_dialer(
 fn ranking(gateway: NodeId) -> MinerGatewayRanking {
     MinerGatewayRanking {
         gateways: vec![MinerGateway {
-            gateway_id: *gateway.as_bytes(),
+            gateway_id: GatewayId::from_node_id(gateway.as_bytes()),
             blocks: 1,
         }],
     }
@@ -241,11 +242,11 @@ async fn connection_places_report_the_ranking_and_the_peers() {
     ranking_tx.send_replace(MinerGatewayRanking {
         gateways: vec![
             MinerGateway {
-                gateway_id: *gateway_id.as_bytes(),
+                gateway_id: GatewayId::from_node_id(gateway_id.as_bytes()),
                 blocks: 2,
             },
             MinerGateway {
-                gateway_id: *unknown.as_bytes(),
+                gateway_id: GatewayId::from_node_id(unknown.as_bytes()),
                 blocks: 1,
             },
         ],
@@ -254,13 +255,13 @@ async fn connection_places_report_the_ranking_and_the_peers() {
     let expected = ConnectionPlaces {
         gateways: vec![
             PlacedGateway {
-                node_id: *gateway_id.as_bytes(),
+                gateway_id: GatewayId::from_node_id(gateway_id.as_bytes()),
                 blocks: 2,
                 place: GatewayPlace::Preferred,
                 connected: true,
             },
             PlacedGateway {
-                node_id: *unknown.as_bytes(),
+                gateway_id: GatewayId::from_node_id(unknown.as_bytes()),
                 blocks: 1,
                 place: GatewayPlace::Unmatched,
                 connected: false,

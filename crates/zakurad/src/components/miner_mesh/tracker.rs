@@ -8,7 +8,7 @@ use tracing::{info, warn, Instrument};
 use zakura_chain::{
     block::{self, Height},
     chain_tip::ChainTip,
-    miner_mesh::{MinerSetSnapshot, RecentMinerSet},
+    miner_mesh::{GatewayId, MinerSetSnapshot, RecentMinerSet},
     parameters::Network,
 };
 use zakura_state::{ChainTipChange, ReadRequest, ReadResponse, TipAction, MAX_BLOCK_REORG_HEIGHT};
@@ -30,14 +30,14 @@ pub(super) const REPUBLISH_INTERVAL: Duration = Duration::from_secs(60);
 /// Starts the task that counts the gateways named in recent best-chain blocks,
 /// reports the counts as metrics and hands the ranking to `publisher`.
 ///
-/// `local_gateway` is the node ID this node's own coinbases name, if it announces one. The
+/// `local_gateway` is the gateway ID this node's own coinbases name, if it announces one. The
 /// tracker reports how many counted blocks name it.
 ///
 /// The task runs until the state stops publishing tip changes.
 pub fn spawn<S, Tip>(
     state: S,
     tip_change: ChainTipChange,
-    local_gateway: Option<[u8; 32]>,
+    local_gateway: Option<GatewayId>,
     publisher: RankingPublisher<Tip>,
 ) -> JoinHandle<()>
 where
@@ -178,7 +178,7 @@ pub(super) struct Tracker<S> {
     /// block costs one failed read per tip change.
     unreadable_from: Option<Height>,
     /// The gateway this node's own coinbases name, if it announces one.
-    local_gateway: Option<[u8; 32]>,
+    local_gateway: Option<GatewayId>,
 }
 
 impl<S> Tracker<S>
@@ -196,7 +196,7 @@ where
     }
 
     /// Reports how many counted blocks name `local_gateway`, this node's own gateway.
-    pub(super) fn with_local_gateway(mut self, local_gateway: Option<[u8; 32]>) -> Self {
+    pub(super) fn with_local_gateway(mut self, local_gateway: Option<GatewayId>) -> Self {
         self.local_gateway = local_gateway;
         self
     }
@@ -219,8 +219,12 @@ where
     /// them while the node catches up.
     ///
     /// The checks see the best chain as it is now. A block read from a chain
-    /// that was briefly best and is gone again by the next tip change stays
-    /// counted until it leaves the window.
+    /// that was briefly best and is gone again by the next tip change can stay
+    /// counted until it leaves the window or a later reorg's repair finds it.
+    /// This needs a reorg of more than
+    /// [`QUALIFYING_DEPTH`](zakura_chain::miner_mesh::QUALIFYING_DEPTH) blocks
+    /// that switches away and back before the tracker handles the next tip
+    /// change.
     ///
     /// If a read fails, every block a reorg could have reached is forgotten,
     /// so the counts never include a block the repair could not check.
@@ -311,7 +315,7 @@ where
 
 /// Reports how many gateways are named, how much of the window is read, how many blocks the
 /// busiest gateway has, and how many name this node's own gateway.
-fn record_metrics(snapshot: &MinerSetSnapshot, local_gateway: Option<[u8; 32]>) {
+fn record_metrics(snapshot: &MinerSetSnapshot, local_gateway: Option<GatewayId>) {
     // Each is at most the number of heights in a two-day window.
     metrics::gauge!("mining.mesh.gateways").set(snapshot.gateways.len() as f64);
     metrics::gauge!("mining.mesh.window.checked").set(snapshot.checked as f64);
@@ -337,7 +341,7 @@ pub(super) struct GatewayBlockCounts {
 /// Reads the busiest gateway's count and this node's own gateway's count from `snapshot`.
 pub(super) fn gateway_block_counts(
     snapshot: &MinerSetSnapshot,
-    local_gateway: Option<[u8; 32]>,
+    local_gateway: Option<GatewayId>,
 ) -> GatewayBlockCounts {
     // The snapshot lists the gateway named in the most blocks first.
     let top = snapshot

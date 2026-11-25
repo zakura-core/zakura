@@ -5,25 +5,30 @@ use chrono::{Duration, Utc};
 use zakura_chain::{
     block::Height,
     chain_tip::mock::{MockChainTip, MockChainTipSender},
-    miner_mesh::{GatewayBlocks, MinerSetCoverage, MinerSetSnapshot},
+    miner_mesh::{GatewayBlocks, GatewayId, MinerSetCoverage, MinerSetSnapshot},
     parameters::Network,
 };
 use zakura_network::zakura::{MinerGateway, MinerGatewayRanking};
 
 use super::{ranking_channel, MIN_GATEWAY_BLOCKS};
 
+/// The gateway ID whose bytes are all `byte`.
+fn id(byte: u8) -> GatewayId {
+    GatewayId::from_bytes([byte; 20])
+}
+
 /// Counts naming three gateways, the last one block short of the minimum.
 fn snapshot() -> MinerSetSnapshot {
     snapshot_with([
-        ([7; 32], MIN_GATEWAY_BLOCKS + 2),
-        ([9; 32], MIN_GATEWAY_BLOCKS),
-        ([8; 32], MIN_GATEWAY_BLOCKS - 1),
+        (id(7), MIN_GATEWAY_BLOCKS + 2),
+        (id(9), MIN_GATEWAY_BLOCKS),
+        (id(8), MIN_GATEWAY_BLOCKS - 1),
     ])
 }
 
 /// Counts naming each gateway in `gateways`, best first, in a window of 30
 /// blocks.
-fn snapshot_with<const N: usize>(gateways: [([u8; 32], u32); N]) -> MinerSetSnapshot {
+fn snapshot_with<const N: usize>(gateways: [(GatewayId, u32); N]) -> MinerSetSnapshot {
     MinerSetSnapshot {
         tip: None,
         gateways: gateways
@@ -41,11 +46,11 @@ fn expected_ranking() -> MinerGatewayRanking {
     MinerGatewayRanking {
         gateways: vec![
             MinerGateway {
-                gateway_id: [7; 32],
+                gateway_id: id(7),
                 blocks: MIN_GATEWAY_BLOCKS + 2,
             },
             MinerGateway {
-                gateway_id: [9; 32],
+                gateway_id: id(9),
                 blocks: MIN_GATEWAY_BLOCKS,
             },
         ],
@@ -85,10 +90,10 @@ fn a_gateway_whose_count_falls_below_the_minimum_leaves_the_ranking() {
     let (tip, _sender) = tip_aged(Duration::minutes(5));
     let (mut ranking, publisher) = ranking_channel(true, Network::Mainnet, tip);
     let publisher = publisher.expect("a mining node gets a publisher");
-    publisher.publish(&snapshot_with([([9; 32], MIN_GATEWAY_BLOCKS)]));
+    publisher.publish(&snapshot_with([(id(9), MIN_GATEWAY_BLOCKS)]));
     ranking.mark_unchanged();
 
-    publisher.publish(&snapshot_with([([9; 32], MIN_GATEWAY_BLOCKS - 1)]));
+    publisher.publish(&snapshot_with([(id(9), MIN_GATEWAY_BLOCKS - 1)]));
 
     assert!(ranking.has_changed().expect("the publisher is alive"));
     assert_eq!(*ranking.borrow(), MinerGatewayRanking::default());

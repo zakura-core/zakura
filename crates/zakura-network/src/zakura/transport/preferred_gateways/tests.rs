@@ -8,11 +8,20 @@ fn node(seed: u8) -> NodeId {
 }
 
 fn gateway(seed: u8, blocks: u32, standing: GatewayStanding) -> RankedGateway {
-    RankedGateway {
-        node: node(seed),
-        blocks,
-        standing,
-    }
+    RankedGateway::resolved(node(seed), blocks, standing)
+}
+
+/// A node ID made of `prefix` in its first 20 bytes and `last` in the rest,
+/// so two such IDs can share a gateway ID.
+fn raw_node(prefix: u8, last: u8) -> NodeId {
+    let mut bytes = [last; 32];
+    bytes[..20].fill(prefix);
+    NodeId::from_bytes(&bytes)
+}
+
+/// The ranked entry for `node`'s gateway ID before any node is known.
+fn unresolved(node: NodeId, blocks: u32) -> RankedGateway {
+    RankedGateway::unresolved(GatewayId::from_node_id(node.as_bytes()), blocks)
 }
 
 /// Each ranked gateway's place, in rank order: with one place held, a
@@ -33,15 +42,15 @@ fn places_read_each_standing_against_the_set() {
 
     let places: Vec<_> = formed
         .places()
-        .map(|(gateway, place)| (gateway.node, place))
+        .map(|(gateway, place)| (gateway.node(), place))
         .collect();
     assert_eq!(
         places,
         vec![
-            (node(1), GatewayPlace::Backoff),
-            (node(2), GatewayPlace::Preferred),
-            (node(3), GatewayPlace::Standby),
-            (node(4), GatewayPlace::Unmatched),
+            (Some(node(1)), GatewayPlace::Backoff),
+            (Some(node(2)), GatewayPlace::Preferred),
+            (Some(node(3)), GatewayPlace::Standby),
+            (Some(node(4)), GatewayPlace::Unmatched),
         ]
     );
     assert_eq!(formed.hold(), 1);
@@ -183,15 +192,14 @@ proptest! {
             .map(|&(seed, blocks, standing)| gateway(seed, blocks, standing))
             .collect();
         let formed = PreferredGateways::form(ranking, hold_limit);
-        let matched = formed.ranking.iter().filter(|g| g.standing.matched()).count();
+        let matched = formed.ranking.iter().filter(|g| g.is_matched()).count();
         prop_assert!(formed.hold() <= hold_limit.min(MAX_PREFERRED_GATEWAYS));
         prop_assert!(formed.hold() <= matched);
         prop_assert!(formed.set().len() <= formed.hold());
         let available: Vec<NodeId> = formed
             .ranking
             .iter()
-            .filter(|g| g.standing.available())
-            .map(|g| g.node)
+            .filter_map(RankedGateway::available_node)
             .collect();
         prop_assert_eq!(formed.set(), &available[..formed.hold().min(available.len())]);
         prop_assert!(formed
@@ -204,15 +212,17 @@ proptest! {
 /// A ranking longer than the bound keeps its highest counts.
 #[test]
 fn a_long_ranking_keeps_its_highest_counts() {
-    let ranking = (0..300u32).map(|index| RankedGateway {
-        node: NodeSecretKey::generate().public(),
-        blocks: index,
-        standing: GatewayStanding::Dialable,
+    let ranking = (0..300u32).map(|index| {
+        RankedGateway::resolved(
+            NodeSecretKey::generate().public(),
+            index,
+            GatewayStanding::Dialable,
+        )
     });
     let formed = PreferredGateways::form(ranking, MAX_PREFERRED_GATEWAYS);
     assert_eq!(formed.ranking.len(), MAX_RANKED_GATEWAYS);
     assert_eq!(
-        formed.ranking.last().map(|gateway| gateway.blocks),
+        formed.ranking.last().map(|gateway| gateway.blocks()),
         Some(44)
     );
     assert_eq!(formed.hold(), MAX_PREFERRED_GATEWAYS);
@@ -233,11 +243,118 @@ proptest! {
         let formed = PreferredGateways::form(ranking, hold_limit);
         let caller = node(caller);
         let mut ranking = formed.ranking.clone();
-        if let Some(entry) = ranking.iter_mut().find(|entry| entry.node == caller) {
-            entry.standing = GatewayStanding::Connected;
+        if let Some(entry) = ranking.iter_mut().find(|entry| entry.node() == Some(caller)) {
+            *entry = entry.with_standing(GatewayStanding::Connected);
         }
         let expected = PreferredGateways::form(ranking, hold_limit);
         let actual = formed.with_connected(&caller).unwrap_or(formed);
         prop_assert_eq!(actual, expected);
     }
+}
+
+/// A node that connects with a ranked gateway ID nobody knew yet fills the
+/// gateway's place: the gateway now names it.
+#[test]
+fn a_connecting_node_resolves_its_gateway_id() {
+    let caller = raw_node(1, 0x00);
+    let formed = PreferredGateways::form([unresolved(caller, 5)], 1);
+    assert_eq!(formed.hold(), 0);
+
+    let connected = formed
+        .with_connected(&caller)
+        .expect("the caller's gateway ID is ranked");
+
+    assert_eq!(connected.set(), &[caller]);
+    assert_eq!(connected.hold(), 1);
+    assert_eq!(
+        connected
+            .places()
+            .map(|(gateway, place)| (gateway.node(), place))
+            .collect::<Vec<_>>(),
+        vec![(Some(caller), GatewayPlace::Preferred)]
+    );
+}
+
+/// A node whose ID starts with no ranked gateway ID changes nothing.
+#[test]
+fn a_node_with_another_gateway_id_is_ignored() {
+    let member = raw_node(1, 0x00);
+    let formed = PreferredGateways::form(
+        [RankedGateway::resolved(
+            member,
+            5,
+            GatewayStanding::Connected,
+        )],
+        1,
+    );
+
+    assert_eq!(formed.with_connected(&raw_node(2, 0x00)), None);
+}
+
+/// A second node with a gateway's ID makes the gateway ambiguous: the member
+/// it named leaves the set, and the gateway holds no place.
+#[test]
+fn a_second_node_with_one_gateway_id_fails_closed() {
+    let member = raw_node(1, 0x00);
+    let sharing = raw_node(1, 0xff);
+    let formed = PreferredGateways::form(
+        [RankedGateway::resolved(
+            member,
+            5,
+            GatewayStanding::Connected,
+        )],
+        1,
+    );
+    assert_eq!(formed.set(), &[member]);
+
+    let shared = formed
+        .with_connected(&sharing)
+        .expect("a second node with the gateway ID changes the gateway");
+
+    assert!(shared.set().is_empty());
+    assert_eq!(shared.hold(), 0);
+    assert_eq!(
+        shared
+            .places()
+            .map(|(gateway, place)| (gateway.node(), place))
+            .collect::<Vec<_>>(),
+        vec![(None, GatewayPlace::Ambiguous)]
+    );
+    assert_eq!(
+        shared.with_connected(&member),
+        None,
+        "an ambiguous gateway stays ambiguous"
+    );
+}
+
+/// Only a proved connection resolves a gateway: a node that keeps an
+/// unproved outbound slot changes no gateway that does not already name it.
+#[test]
+fn an_unproved_dial_resolves_no_gateway() {
+    let dialed = raw_node(1, 0x00);
+    let sharing = raw_node(1, 0xff);
+
+    let unknown = PreferredGateways::form([unresolved(dialed, 5)], 1);
+    assert_eq!(unknown.with_dialing(&dialed), None);
+
+    let named = PreferredGateways::form(
+        [RankedGateway::resolved(
+            dialed,
+            5,
+            GatewayStanding::Connected,
+        )],
+        1,
+    );
+    assert_eq!(named.with_dialing(&sharing), None);
+
+    let dialing = named
+        .with_dialing(&dialed)
+        .expect("the gateway already names the dialed node");
+    assert_eq!(
+        dialing
+            .places()
+            .map(|(gateway, _)| gateway.resolution())
+            .collect::<Vec<_>>(),
+        vec![GatewayMatch::One((dialed, GatewayStanding::Dialing))]
+    );
 }

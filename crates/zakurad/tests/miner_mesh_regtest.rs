@@ -79,7 +79,8 @@ async fn pools_form_a_mesh() -> Result<()> {
     net.mine(A, MIN_GATEWAY_BLOCKS + 2).await?;
     net.mine(B, MIN_GATEWAY_BLOCKS + 1).await?;
     net.mine(C, MIN_GATEWAY_BLOCKS).await?;
-    // C's last block is 99 deep, so C counts one block short of the minimum.
+    // C's last block is one block short of the qualifying depth, so C counts
+    // one block short of the minimum.
     net.mine(M, QUALIFYING_DEPTH - 1).await?;
 
     let prefers_every_other = |net: &RegtestNet, ranked: &[usize]| {

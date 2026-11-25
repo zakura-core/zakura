@@ -404,6 +404,60 @@ fn best_header_jumping_past_the_parent_wakes_the_child() {
     table.assert_invariants();
 }
 
+/// The best header can move past the parent while the child's admission or
+/// unknown-parent checks run, before the child parks. That move woke nothing,
+/// so the child retries admission instead of parking until it ages out.
+#[test]
+fn best_header_moving_during_the_checks_retries_admission() {
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let now = Instant::now();
+    let parent = block::Hash([0x55; 32]);
+    let child = block::Hash([0x56; 32]);
+    let coding = Profile::TINY.derive_coding(64, 2).unwrap();
+    table.step(
+        now,
+        BlockInput::ParentAdmitted {
+            hash: block::Hash([0x54; 32]),
+            height: 9,
+        },
+    );
+    let received = receive(
+        &mut table,
+        now,
+        make_envelope(child, coding, [0xAA; 32], node_id(1)),
+    );
+    let checking = header_result(
+        &mut table,
+        now,
+        &received,
+        HeaderAdmissionResult::MissingParent {
+            parent_hash: parent,
+        },
+    );
+    let moved = table.step(
+        now,
+        BlockInput::ParentAdmitted {
+            hash: child,
+            height: 11,
+        },
+    );
+    assert!(moved.outputs.is_empty(), "nothing is pending yet");
+
+    let retried = unknown_parent_checked(&mut table, now, &checking, UnknownParentVerdict::Park);
+    assert_eq!(table.pending_meta_len(), 0);
+    let admitted = header_result(
+        &mut table,
+        now,
+        &retried,
+        HeaderAdmissionResult::Admitted { height: 11 },
+    );
+    let committed = commitment_ok(&mut table, now, &admitted);
+    assert!(committed
+        .events
+        .contains(&BlockEvent::BlockAdmitted { block_id: child }));
+    table.assert_invariants();
+}
+
 /// An entry that a wake retries and that parks again keeps its first
 /// deadline, so retries never extend its life, and it skips the checks it
 /// already passed.

@@ -895,6 +895,8 @@ struct AdmittingEntry {
     /// already passed the unknown-parent checks, and it keeps its first
     /// deadline if it parks again.
     parked_at: Option<Instant>,
+    /// [`BlockTable::best_moves`] when the entry's header admission started.
+    best_moves: u64,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -1257,6 +1259,10 @@ pub struct BlockTable {
     pending_bytes: usize,
     /// Admitted (and retired-in-window) blocks.
     blocks: HashMap<block::Hash, ActiveBlock>,
+    /// Count of best-header moves (`ParentAdmitted`). A move during an
+    /// entry's admission or checks wakes nothing for it, so the entry retries
+    /// admission instead of parking.
+    best_moves: u64,
 }
 
 impl BlockTable {
@@ -1273,6 +1279,7 @@ impl BlockTable {
             pending: HashMap::new(),
             pending_bytes: 0,
             blocks: HashMap::new(),
+            best_moves: 0,
         }
     }
 
@@ -1445,6 +1452,7 @@ impl BlockTable {
                 self.raise_top(height, &mut step);
             }
             BlockInput::ParentAdmitted { hash, height } => {
+                self.best_moves = self.best_moves.wrapping_add(1);
                 self.raise_top(height, &mut step);
                 self.wake_pending(hash, &mut step);
             }
@@ -1463,7 +1471,7 @@ impl BlockTable {
                 );
             }
             BlockInput::HeaderAdmitted { work_id, result } => {
-                self.handle_header_admitted(work_id, result, &mut step);
+                self.handle_header_admitted(now, work_id, result, &mut step);
             }
             BlockInput::UnknownParentChecked { work_id, verdict } => {
                 self.handle_unknown_parent_checked(now, work_id, verdict, &mut step);
@@ -1700,6 +1708,7 @@ impl BlockTable {
                 height: None,
                 stage: AdmittingStage::WaitingHeader,
                 parked_at,
+                best_moves: self.best_moves,
             },
         );
         self.work_to_block.insert(work_id, block_id);
@@ -1714,6 +1723,7 @@ impl BlockTable {
 
     fn handle_header_admitted(
         &mut self,
+        now: Instant,
         work_id: WorkId,
         result: HeaderAdmissionResult,
         step: &mut BlockStep,
@@ -1765,19 +1775,7 @@ impl BlockTable {
                         .admitting
                         .remove(&block_id)
                         .expect("admitting entry verified present");
-                    self.insert_pending(
-                        block_id,
-                        PendingMetaEntry {
-                            envelope: entry.envelope,
-                            arrived_at: entry.arrived_at,
-                            from_peer: entry.from_peer,
-                            session_gen: entry.session_gen,
-                            also_from: entry.also_from,
-                            parent_hash,
-                            received_at: parked_at,
-                        },
-                        step,
-                    );
+                    self.park(now, block_id, entry, parent_hash, parked_at, step);
                     return;
                 }
                 // Headerchain checked nothing but the parent's hash, so the
@@ -1850,19 +1848,7 @@ impl BlockTable {
             .remove(&block_id)
             .expect("admitting entry verified present");
         match verdict {
-            UnknownParentVerdict::Park => self.insert_pending(
-                block_id,
-                PendingMetaEntry {
-                    envelope: entry.envelope,
-                    arrived_at: entry.arrived_at,
-                    from_peer: entry.from_peer,
-                    session_gen: entry.session_gen,
-                    also_from: entry.also_from,
-                    parent_hash,
-                    received_at: now,
-                },
-                step,
-            ),
+            UnknownParentVerdict::Park => self.park(now, block_id, entry, parent_hash, now, step),
             // Block sync owns the height.
             UnknownParentVerdict::OutOfRange => {
                 reject_meta(step, block_id, entry.from_peer, entry.session_gen);
@@ -1891,6 +1877,51 @@ impl BlockTable {
                 }
             }
         }
+    }
+
+    /// Parks `entry`, whose parent `parent_hash` headerchain lacks, until a new
+    /// best header wakes it.
+    ///
+    /// A best header that moved while the entry's admission or checks ran woke
+    /// nothing for it. Header sync may have admitted the parent or the header
+    /// itself then, so the entry retries admission instead. A retry starts only
+    /// after a move and before the entry's deadline, so retries stay bounded.
+    /// `parked_at` keeps that deadline and skips the checks the entry passed.
+    fn park(
+        &mut self,
+        now: Instant,
+        block_id: block::Hash,
+        entry: AdmittingEntry,
+        parent_hash: block::Hash,
+        parked_at: Instant,
+        step: &mut BlockStep,
+    ) {
+        if entry.best_moves != self.best_moves
+            && now.saturating_duration_since(parked_at) < PENDING_META_AGE
+        {
+            self.handle_meta_received(
+                entry.arrived_at,
+                entry.envelope,
+                (entry.from_peer, entry.session_gen),
+                entry.also_from,
+                Some(parked_at),
+                step,
+            );
+            return;
+        }
+        self.insert_pending(
+            block_id,
+            PendingMetaEntry {
+                envelope: entry.envelope,
+                arrived_at: entry.arrived_at,
+                from_peer: entry.from_peer,
+                session_gen: entry.session_gen,
+                also_from: entry.also_from,
+                parent_hash,
+                received_at: parked_at,
+            },
+            step,
+        );
     }
 
     /// Bytes held in metadata in header admission, its unknown-parent checks,

@@ -20,6 +20,7 @@ use zakura_rt::{
 };
 
 use crate::{
+    composite::COMPOSITE_KEY_TAGS,
     config::{QuicBindConfig, QuicConfig},
     congestion::{CongestionProbe, InstrumentedFactory},
     conn::{Conn, ConnObserver, Hooks},
@@ -788,7 +789,7 @@ fn finish_dial(
     // The verifier already enforced TLS-7; this guards against a verifier bug.
     let Some(remote) = handshake
         .remote
-        .filter(|remote| remote.node_id() == expected)
+        .filter(|remote| remote.proves_dialed_id(expected, &COMPOSITE_KEY_TAGS))
     else {
         close(b"identity");
         return Err(ConnectError::WrongIdentity);
@@ -797,7 +798,15 @@ fn finish_dial(
         close(b"alpn");
         return Err(ConnectError::AlpnMismatch);
     };
-    Ok(Conn::new(conn, remote, target, started, true, alpn))
+    Ok(Conn::new(
+        conn,
+        remote,
+        Some(expected),
+        target,
+        started,
+        true,
+        alpn,
+    ))
 }
 
 /// Waits for a handshake, closing the connection at the deadline (ADM-6,
@@ -858,6 +867,7 @@ pub(crate) async fn inbound_handshake(
     let handled = acceptor.handle(Conn::new(
         conn,
         remote_credential,
+        None,
         remote,
         admitted_at,
         source_validated,

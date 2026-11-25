@@ -79,16 +79,8 @@ impl NodeKeyList {
     /// Wraps entries that already satisfy every rule of
     /// [`Self::from_entries`], and derives their node ID.
     fn from_checked(entries: Vec<(u16, [u8; KEY_LENGTH])>) -> Self {
-        let hash = Params::new()
-            .hash_length(KEY_LENGTH)
-            .personal(NODE_ID_PERSONALISATION)
-            .hash(&encode(&entries));
-        let mut digest = [0; KEY_LENGTH];
-        digest.copy_from_slice(hash.as_bytes());
-        Self {
-            entries,
-            id: NodeId::from_bytes(&digest),
-        }
+        let id = node_id(&entries);
+        Self { entries, id }
     }
 
     /// Builds a list from `(tag, value)` entries, which must already be in
@@ -162,6 +154,50 @@ impl NodeKeyList {
     pub fn node_id(&self) -> NodeId {
         self.id
     }
+
+    /// Whether `id` names this list, or a list of some of its entries, in
+    /// their order, that keeps every entry tagged in `required` (TLS-7).
+    ///
+    /// A node that adds a key to its list is still the node its earlier,
+    /// shorter list named. `required` holds the tags of the keys that prove
+    /// it: an ID whose list leaves one of them out is not proven by them.
+    /// False when this list lacks a required tag.
+    pub(crate) fn contains_list_named(&self, id: NodeId, required: &[u16]) -> bool {
+        let holds = |tag: &u16| self.entries.iter().any(|(held, _)| held == tag);
+        if !required.iter().all(holds) {
+            return false;
+        }
+        if id == self.id {
+            return true;
+        }
+        // Bit `index` of a mask keeps entry `index`. A list holds at most
+        // `MAX_NODE_KEYS` entries, so there are at most 15 masks.
+        (1u32..1 << self.entries.len()).any(|mask| {
+            let kept = |index: usize| mask & (1 << index) != 0;
+            let indexed = || self.entries.iter().enumerate();
+            let keeps_required =
+                indexed().all(|(index, (tag, _))| kept(index) || !required.contains(tag));
+            if !keeps_required {
+                return false;
+            }
+            let entries: Vec<_> = indexed()
+                .filter(|(index, _)| kept(*index))
+                .map(|(_, entry)| *entry)
+                .collect();
+            node_id(&entries) == id
+        })
+    }
+}
+
+/// The node ID of `entries`: the BLAKE2b-256 hash of their encoding (ID-9).
+fn node_id(entries: &[(u16, [u8; KEY_LENGTH])]) -> NodeId {
+    let hash = Params::new()
+        .hash_length(KEY_LENGTH)
+        .personal(NODE_ID_PERSONALISATION)
+        .hash(&encode(entries));
+    let mut digest = [0; KEY_LENGTH];
+    digest.copy_from_slice(hash.as_bytes());
+    NodeId::from_bytes(&digest)
 }
 
 /// Encodes entries as a count byte, then each tag and value.
@@ -290,6 +326,70 @@ mod tests {
             NodeKeyList::decode(&list(1, &[entry(ED25519_KEY_TAG, [0; KEY_LENGTH])])),
             Err(KeyListError::InvalidEd25519Key)
         );
+    }
+
+    /// TLS-7: a list answers to the ID of each shorter list that keeps the
+    /// required entries, and to no other.
+    #[test]
+    fn a_list_contains_the_lists_that_keep_the_required_entries() {
+        let entries = [
+            (ED25519_KEY_TAG, KEY),
+            (2, [2; KEY_LENGTH]),
+            (3, [3; KEY_LENGTH]),
+            (4, [4; KEY_LENGTH]),
+        ];
+        let list = NodeKeyList::from_entries(entries).expect("four increasing tags form a list");
+        let required = [ED25519_KEY_TAG, 3];
+        let named = |kept: &[usize]| {
+            let kept: Vec<_> = kept.iter().map(|index| entries[*index]).collect();
+            node_id(&kept)
+        };
+
+        assert!(list.contains_list_named(list.node_id(), &required));
+        for kept in [&[0, 2][..], &[0, 1, 2], &[0, 2, 3], &[0, 1, 2, 3]] {
+            assert!(
+                list.contains_list_named(named(kept), &required),
+                "entries {kept:?} keep both required tags"
+            );
+        }
+        for kept in [
+            &[0][..],
+            &[2],
+            &[0, 1],
+            &[0, 3],
+            &[1, 2, 3],
+            &[0, 1, 3],
+            &[1, 3],
+        ] {
+            assert!(
+                !list.contains_list_named(named(kept), &required),
+                "entries {kept:?} leave a required tag out"
+            );
+        }
+        // Not lists at all: no entries, entries out of order, one repeated.
+        for kept in [&[][..], &[2, 0], &[0, 0, 2], &[0, 2, 2], &[3, 2, 1, 0]] {
+            assert!(
+                !list.contains_list_named(named(kept), &required),
+                "{kept:?} is not a list of the entries in their order"
+            );
+        }
+        // With nothing required, every shorter list is contained.
+        assert!(list.contains_list_named(named(&[1]), &[]));
+        assert!(!list.contains_list_named(named(&[]), &[]));
+        assert!(!list.contains_list_named(
+            NodeKeyList::from_entries([UNKNOWN])
+                .expect("one entry is a list")
+                .node_id(),
+            &[]
+        ));
+    }
+
+    /// A list that lacks a required tag contains nothing, not even itself.
+    #[test]
+    fn a_list_without_a_required_entry_contains_no_list() {
+        let list = NodeKeyList::single(key());
+        assert!(list.contains_list_named(list.node_id(), &[ED25519_KEY_TAG]));
+        assert!(!list.contains_list_named(list.node_id(), &[ED25519_KEY_TAG, 3]));
     }
 
     #[test]

@@ -175,9 +175,14 @@ fn der(tag: u8, contents: &[u8]) -> Vec<u8> {
     bytes
 }
 
+/// The bit of a credential entry's length that marks it fingerprint-only
+/// (ID-12), restated like the personalisations above.
+const FINGERPRINT_ONLY_FLAG: u16 = 0x8000;
+
 /// The encoded key list naming an accepted credential `encoding` (ID-12): each
 /// Ed25519 key as itself, any other key as BLAKE2b-256 under
-/// [`KEY_FINGERPRINT_PERSONALISATION`] of its little-endian tag and its bytes.
+/// [`KEY_FINGERPRINT_PERSONALISATION`] of its little-endian tag and its bytes,
+/// and a fingerprint-only entry as the 32 bytes it carries.
 fn fingerprinted_key_list(encoding: &[u8]) -> Vec<u8> {
     let (&count, mut rest) = encoding
         .split_first()
@@ -187,11 +192,18 @@ fn fingerprinted_key_list(encoding: &[u8]) -> Vec<u8> {
         let (&[tag_low, tag_high, length_low, length_high], body) = rest
             .split_first_chunk::<4>()
             .expect("an accepted credential holds its counted entries");
-        let length = usize::from(u16::from_le_bytes([length_low, length_high]));
-        let (key, tail) = body.split_at(length);
+        let length = u16::from_le_bytes([length_low, length_high]);
+        let fingerprint_only = length & FINGERPRINT_ONLY_FLAG != 0;
+        let (key, tail) = body.split_at(usize::from(length & !FINGERPRINT_ONLY_FLAG));
         let tag = [tag_low, tag_high];
+        let is_ed25519 = u16::from_le_bytes(tag) == ED25519_KEY_TAG;
+        assert!(
+            !fingerprint_only || (key.len() == KEY_LENGTH && !is_ed25519),
+            "{CREDENTIAL_CANONICAL}: an accepted fingerprint-only entry is not 32 bytes of a \
+             key other than Ed25519"
+        );
         list.extend_from_slice(&tag);
-        if u16::from_le_bytes(tag) == ED25519_KEY_TAG {
+        if is_ed25519 || fingerprint_only {
             list.extend_from_slice(key);
         } else {
             let fingerprint = Params::new()
@@ -467,6 +479,21 @@ fn credential_seeds() -> Vec<Seed> {
     }))
     .expect("four increasing entries form a credential");
 
+    let fingerprint_only = node
+        .credential()
+        .clone()
+        .with_fingerprint_only(ML_DSA_65_KEY_TAG)
+        .expect("the node's ML-DSA-65 key can be given as its fingerprint");
+    // One entry whose length carries the fingerprint-only flag.
+    let flagged = |count: u8, leading: &[(u16, &[u8])], tag: u16, value: &[u8]| {
+        let mut bytes = credential_encoding(count, leading);
+        bytes.extend_from_slice(&tag.to_le_bytes());
+        let length = u16::try_from(value.len()).expect("seed keys are short");
+        bytes.extend_from_slice(&(length | FINGERPRINT_ONLY_FLAG).to_le_bytes());
+        bytes.extend_from_slice(value);
+        bytes
+    };
+
     let spki = single.to_spki().as_ref().to_vec();
     let mut trailing = spki.clone();
     trailing.push(0);
@@ -487,6 +514,42 @@ fn credential_seeds() -> Vec<Seed> {
             unknown.to_spki().as_ref().to_vec(),
         ),
         ("valid-longest-spki", longest.to_spki().as_ref().to_vec()),
+        (
+            "valid-fingerprint-only-spki",
+            fingerprint_only.to_spki().as_ref().to_vec(),
+        ),
+        ("valid-fingerprint-only-encoding", fingerprint_only.encode()),
+        (
+            "valid-fingerprint-only-unknown-tag",
+            flagged(
+                2,
+                &[(ED25519_KEY_TAG, &ed)],
+                UNKNOWN_TAG,
+                &[0xCD; KEY_LENGTH],
+            ),
+        ),
+        (
+            "invalid-fingerprint-only-ed25519",
+            flagged(1, &[], ED25519_KEY_TAG, &ed),
+        ),
+        (
+            "invalid-fingerprint-only-short",
+            flagged(
+                2,
+                &[(ED25519_KEY_TAG, &ed)],
+                UNKNOWN_TAG,
+                &[0xCD; KEY_LENGTH - 1],
+            ),
+        ),
+        (
+            "invalid-fingerprint-only-long",
+            flagged(
+                2,
+                &[(ED25519_KEY_TAG, &ed)],
+                UNKNOWN_TAG,
+                &[0xCD; KEY_LENGTH + 1],
+            ),
+        ),
         ("invalid-trailing-spki", trailing),
         ("invalid-long-form-spki", long_form),
         (

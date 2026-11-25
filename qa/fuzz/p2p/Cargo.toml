@@ -31,7 +31,7 @@ bpv1_block = { decoder = 3, properties = ["bpv1/block-replay"] }
 bpv1_mesh = { decoder = 1, properties = ["bpv1/mesh"] }
 bpv1_wire = { decoder = 1, properties = ["bpv1/wire"] }
 bpv1_codec = { decoder = 1, properties = ["bpv1/codec"] }
-credential_parse = { decoder = 1, properties = ["credential/canonical-encoding", "credential/node-id", "credential/bounded-parse"] }
+credential_parse = { decoder = 2, properties = ["credential/canonical-encoding", "credential/node-id", "credential/bounded-parse"] }
 key_list_decode = { decoder = 1, properties = ["key-list/canonical-encoding", "key-list/stable-id"] }
 composite_verify = { decoder = 3, properties = ["composite/tamper-refused"] }
 

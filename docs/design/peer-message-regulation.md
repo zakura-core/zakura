@@ -46,7 +46,7 @@ today: a 32 MiB connection send window carries about 540 Mbps at 500 ms.
 
 Paused reads leave a peer's data in QUIC's receive window, so the windows are also memory every
 peer can fill. The node bounds that credit by holding fewer connections, not by shrinking windows:
-`peer_memory_budget_bytes` (16 GiB) funds one 256 MiB datagram queue per bound socket,
+`peer_memory_budget_bytes` (17 GiB) funds one 256 MiB datagram queue per bound socket,
 `max_pending_handshakes` (32) connections in their handshakes at 64 MiB of windows each, and
 admitted connections at their raised windows: the handshake window, each negotiated reactor's
 receive share and the send window, 141,937,353 B at the defaults. That funds 92 ordinary peers and

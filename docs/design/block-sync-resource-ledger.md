@@ -22,7 +22,7 @@ it is sized to the throughput target, not below it.
 Every term counts one physical allocation once. Defaults are shown. "Peer" means one
 connection; the node admits up to 92 ordinary peers and ten preferred gateways. The transport holds
 at most 134 live QUIC connections, admitted or not (zakura-quic ADM-12): 102 admitted and 32 of
-headroom for handshakes. `zakura.peer_memory_budget_bytes` = 16 GiB funds them after one 256 MiB
+headroom for handshakes. `zakura.peer_memory_budget_bytes` = 17 GiB funds them after one 256 MiB
 datagram queue for the one bound socket, charging a handshake its 64 MiB of windows and an
 admitted connection its raised window plus send window, 141,937,353 B (CTRL-26). Closed connections release their
 stream buffers and drain in a separate allowance of 268 (ADM-13). The QUIC rows count all 134
@@ -46,7 +46,7 @@ serving bookkeeping, 1.25 GB serving output, 1.3 GB of worst-case serving reads 
 for real blocks), 0.13 GiB requester hashes, 1.8 GB of raw frames awaiting their routines and
 5.6 GB of requested bodies (both derived below). The QUIC windows
 add 11.3 + 4.2 GiB, and the datagram queues 256 MiB more per bound socket, however many
-connections it serves. They are shared with every other service on the connection: the 16 GiB
+connections it serves. They are shared with every other service on the connection: the 17 GiB
 peer memory budget covers all three for every live QUIC connection the transport holds, and is a
 transport budget, not a block-sync choice.
 

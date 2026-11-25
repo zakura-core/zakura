@@ -848,7 +848,7 @@ These keys stay in `[network.zakura]` and keep their meaning:
 IPv4 address or global IPv6 /64, ADM-3),
 `max_pending_handshakes` (32), `stream_open_rate_per_second`,
 `message_rate_per_second` and the handshake's `max_open_streams`.
-`peer_memory_budget_bytes` (16 GiB) joins them under CTRL-26.
+`peer_memory_budget_bytes` (17 GiB) joins them under CTRL-26.
 
 - **CTRL-26.** A QUIC connection in its handshake can make the node hold
   `receive_window_bytes + send_window_bytes` of flow-control credit, 64 MiB

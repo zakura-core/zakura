@@ -421,13 +421,14 @@ fn smallest_accepted_budget_never_faults_honest_peers() {
     );
 }
 
-/// Each consumer's peak leased bytes and the cap the pool reported at that
-/// peak, by [`Consumer::index`], and the peak retained wire bytes.
+/// Each consumer's peak leased bytes at a grant or growing resize and the
+/// cap the pool reported at that peak, by [`Consumer::index`], and the peak
+/// retained wire bytes. Drains a move adds ignore the target's cap by design.
 type Demand = ([u64; Consumer::COUNT], [Option<u64>; Consumer::COUNT], u64);
 
 /// Read a run's [`Demand`] from its pool gauge and owner model.
 fn demand(pool: &PoolGaugeModel, retained_peak: u64) -> Demand {
-    (pool.peaks_by_consumer(), pool.caps_at_peak(), retained_peak)
+    (pool.granted_peaks(), pool.caps_at_peak(), retained_peak)
 }
 
 /// Each consumer's peak stays within the cap the pool reported at that peak,

@@ -64,7 +64,12 @@ pub struct PoolGaugeModel {
     peaks_by_consumer: [u64; Consumer::COUNT],
     /// Peak total leased bytes over the run.
     peak_total: u64,
-    /// The cap each consumer's latest peak was granted under.
+    /// Peak leased bytes per consumer at a growth event (a grant or a
+    /// growing resize), where the pool reports the consumer's cap. A move
+    /// ignores the target's cap, so drains it adds count only once a later
+    /// growth event sees them.
+    granted_peaks: [u64; Consumer::COUNT],
+    /// The cap each consumer's granted peak was granted under.
     caps_at_peak: [Option<u64>; Consumer::COUNT],
     /// Configured `Sessions` floor bytes for `mem-13` floor preservation.
     sessions_floor: u64,
@@ -526,7 +531,8 @@ impl PoolGaugeModel {
         let Some((cap, share, true)) = limits else {
             return;
         };
-        if self.peaks_by_consumer[consumer.index()] == folded_consumer {
+        if folded_consumer >= self.granted_peaks[consumer.index()] {
+            self.granted_peaks[consumer.index()] = folded_consumer;
             self.caps_at_peak[consumer.index()] = Some(cap);
         }
         if reported_consumer > cap || folded_consumer > cap {
@@ -570,7 +576,12 @@ impl PoolGaugeModel {
         self.peaks_by_consumer
     }
 
-    /// The cap each consumer's peak was granted under, by
+    /// Each consumer's peak at a growth event, by [`Consumer::index`].
+    pub fn granted_peaks(&self) -> [u64; Consumer::COUNT] {
+        self.granted_peaks
+    }
+
+    /// The cap each consumer's granted peak was granted under, by
     /// [`Consumer::index`].
     pub fn caps_at_peak(&self) -> [Option<u64>; Consumer::COUNT] {
         self.caps_at_peak

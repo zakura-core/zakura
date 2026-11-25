@@ -1,5 +1,5 @@
 //! A peer that reconnects while its block is in admission or after it
-//! (#2758). Each test joins one `BlockTable` to the peers' live
+//! (#2758, bpv1-89). Each test joins one `BlockTable` to the peers' live
 //! `PeerState` sessions through the production routers in `route`, one
 //! queued input at a time, and never moves the clock.
 
@@ -12,7 +12,7 @@ use zakura_rt::time::Instant;
 use super::{
     blocks::{
         BlockConfig, BlockEvent, BlockInput, BlockOutput, BlockStep, BlockTable,
-        HeaderAdmissionResult,
+        HeaderAdmissionResult, PullPeerState,
     },
     blocks_tests::{commitment_ok, header_result},
     codec::encode_body,
@@ -118,7 +118,7 @@ impl Node {
         }
     }
 
-    fn peer_states(&self) -> Vec<super::blocks::PullPeerState> {
+    fn peer_states(&self) -> Vec<PullPeerState> {
         self.sessions
             .iter()
             .map(|s| pull_state(s, self.now))
@@ -342,7 +342,7 @@ fn later_sender_reconnecting_during_admission_gets_the_metadata() {
     assert_eq!((node.grants_to(q), node.refusals), (1, 0));
 }
 
-/// bpv1-63: a replaced session's stale proof result releases only its own
+/// bpv1-63, bpv1-89: a replaced session's stale proof result releases only its own
 /// part charge. The replacement's charge for the same part survives, so
 /// the replacement's verified copy is stored.
 #[test]

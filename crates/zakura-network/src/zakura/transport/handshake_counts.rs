@@ -10,7 +10,7 @@ mod slots;
 use slots::ConnectionSlots;
 pub use slots::{SlotClass, SlotCount, SlotRefusal, SlotSplit};
 
-use super::{GatewayMatch, GatewayRanking, GatewayStanding, PreferredGateways};
+use super::{GatewayMatch, GatewayRanking, GatewayStanding, MovedNodeIds, PreferredGateways};
 use crate::zakura::regulation::Bucket;
 use crate::zakura::{admission_host, Cadence, DEFAULT_ZAKURA_REDIAL_INITIAL_BACKOFF};
 
@@ -399,6 +399,28 @@ impl HandshakeCounts {
         }
         self.preferred =
             PreferredGateways::form_with_incumbents(live, hold_limit, self.preferred.set());
+    }
+
+    /// Yields places that moved gateways cannot use in this ranking. The
+    /// handler still checks the actual slot and consumes the probe at dial time.
+    pub(crate) fn defer_gateway_rollbacks(
+        &mut self,
+        moves: &MovedNodeIds,
+        cap: usize,
+        now: Instant,
+    ) {
+        if self.free_ordinary_connections(cap) > 0 {
+            return;
+        }
+        let preferred = self.preferred.held_places();
+        self.preferred.defer_dials(|dialed| {
+            moves
+                .cooling_destination(dialed, now)
+                .is_some_and(|current| {
+                    !preferred.members.contains(&current)
+                        || self.connections.of_node(&current).total() > 0
+                })
+        });
     }
 
     /// The preferred gateways the slot checks use now.

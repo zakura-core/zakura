@@ -28,9 +28,20 @@ pub(super) async fn dialer(
     CandidateDialerIO,
     watch::Sender<MinerGatewayRanking>,
 ) {
+    dialer_with_places(seed, 10).await
+}
+
+async fn dialer_with_places(
+    seed: u64,
+    places: usize,
+) -> (
+    ZakuraTestNode,
+    CandidateDialerIO,
+    watch::Sender<MinerGatewayRanking>,
+) {
     let mut limits = ZakuraLocalLimits::from_config(&crate::Config::default());
     limits.max_connections = MAX_CONNECTIONS;
-    limits.max_preferred_connections = 10;
+    limits.max_preferred_connections = places;
     let node = ZakuraTestNode::builder(seed)
         .limits(limits)
         .spawn()
@@ -379,5 +390,69 @@ async fn a_waiting_member_that_calls_in_gets_no_dial() {
         .admit_round(&mut state, &[], gone + MUTUAL_DIAL_GRACE)
         .await;
     assert_eq!(dialed(&fourth.preferred), below);
+    node.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn moved_gateway_yields_the_last_place_until_rollback_can_be_checked() {
+    let (node, mut io, ranks) = dialer_with_places(9234, 1).await;
+    let gateways = known_gateways(&node, 2).await;
+    let (earlier, standby) = (gateways[0], gateways[1]);
+    let current = node_id(0);
+    let endpoint = node.endpoint();
+    let mut slots = endpoint.hold_connection_slots(MAX_CONNECTIONS, false);
+    ranks.send_replace(ranking(&gateways));
+    node.supervisor().learn_move(earlier, current);
+    let now = Instant::now();
+    let due = now + crate::zakura::DEFAULT_ZAKURA_REDIAL_MAX_BACKOFF;
+
+    for (at, expected) in [(now, standby), (due - Duration::from_nanos(1), standby)] {
+        tokio::time::advance(at - Instant::now()).await;
+        let mut state = CandidateDialerState::new(DIAL_BACKOFF);
+        let round = io.admit_round(&mut state, &[], at).await;
+        assert_eq!(dialed(&round.preferred), [expected]);
+        assert_eq!(state.in_flight_node_ids(), [expected]);
+        assert!(!state.is_backed_off(earlier, gateway_ip(earlier), at));
+    }
+    slots.pop();
+    let round = io
+        .admit_round(
+            &mut CandidateDialerState::new(DIAL_BACKOFF),
+            &[],
+            Instant::now(),
+        )
+        .await;
+    assert_eq!(
+        dialed(&round.preferred),
+        [earlier],
+        "a free ordinary slot needs no rollback probe"
+    );
+    slots.extend(endpoint.hold_connection_slots(1, false));
+    tokio::time::advance(due - Instant::now()).await;
+    let round = io
+        .admit_round(&mut CandidateDialerState::new(DIAL_BACKOFF), &[], due)
+        .await;
+    assert_eq!(
+        dialed(&round.preferred),
+        [earlier],
+        "the due gateway can use the held place"
+    );
+    drop(slots);
+    node.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn moved_gateway_ranked_under_both_ids_gets_one_dial_per_round() {
+    let (node, mut io, ranks) = dialer(9234).await;
+    let gateways = known_gateways(&node, 2).await;
+    let (earlier, current) = (gateways[0], gateways[1]);
+    ranks.send_replace(ranking(&gateways));
+    node.supervisor().learn_move(earlier, current);
+    let mut state = CandidateDialerState::new(DIAL_BACKOFF);
+    let round = io.admit_round(&mut state, &[], Instant::now()).await;
+    assert_eq!(dialed(&round.preferred), [earlier]);
+    assert!(round.ordinary.is_empty());
+    let next = io.admit_round(&mut state, &[], Instant::now()).await;
+    assert!(next.preferred.is_empty() && next.ordinary.is_empty());
     node.shutdown().await;
 }

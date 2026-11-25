@@ -2203,7 +2203,7 @@ impl ZakuraSupervisorHandle {
 
     /// Records that a dial to `dialed` reached the node whose ID is now
     /// `connected`.
-    fn learn_move(&self, dialed: NodeId, connected: NodeId) {
+    pub(super) fn learn_move(&self, dialed: NodeId, connected: NodeId) {
         metrics::counter!("zakura.p2p.conn.dial.moved").increment(1);
         let news = self
             .moved_tx
@@ -3885,8 +3885,10 @@ impl ZakuraProtocolHandler {
 
     fn publish_gateway_ranking(&self, ranking: impl IntoIterator<Item = super::RankedGateway>) {
         let ranking = ranking.into_iter().collect();
+        let moved = self.supervisor.moved_tx.borrow();
         let mut counts = self.supervisor.ip_slots.counts();
         counts.publish_gateway_ranking(&ranking, self.limits.max_preferred_connections);
+        counts.defer_gateway_rollbacks(&moved, self.limits.max_connections, Instant::now());
         let hold = counts.preferred_gateways().hold();
         let split = counts.slot_split();
         drop(counts);

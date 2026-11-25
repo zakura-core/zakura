@@ -884,7 +884,10 @@ is today's Zakura logic.
      known to have moved first claims under the last authenticated ID.
      If ordinary capacity is full, a preferred gateway may retry under its
      original ID once per 30 seconds to detect a rollback. The same limits
-     apply after TLS on every retry;
+     apply after TLS on every retry. While a moved gateway waits for that
+     probe and its current ID cannot take a slot, the next reachable gateway
+     may use the held place. Discovery admits at most one attempt per known
+     current ID across its preferred and ordinary passes;
   2. record no failure and no backoff against the dialed ID in the
      discovery book, and count the registration as a success for the book's
      entries of both IDs. Once TLS authenticates the peer, discovery tracks

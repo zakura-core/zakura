@@ -107,7 +107,9 @@ A held place is a connection slot that only a preferred gateway may use:
   gateway's first connection takes a held place even when the ordinary slots
   and the inbound share are full;
 - a gateway in backoff still counts toward the number of places held. The
-  next available gateway can fill a place while the first waits to retry;
+  next available gateway can fill a place while the first waits to retry.
+  This also applies while a moved gateway waits for its 30-second rollback
+  probe and its current ID cannot take a slot;
 - a ranked gateway that connects in takes a place when its rank brings it into
   the preferred set.
 

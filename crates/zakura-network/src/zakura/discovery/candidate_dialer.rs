@@ -282,6 +282,7 @@ impl CandidateDialerIO {
         let (preferred, claims) = self.preferred.admit(
             state,
             &round,
+            &supervisor.moved_node_ids().borrow(),
             room,
             |ip, in_flight| supervisor.can_accept_remote_ip_with_in_flight(ip, in_flight),
             now,

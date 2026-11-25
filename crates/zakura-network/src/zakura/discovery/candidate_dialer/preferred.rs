@@ -378,14 +378,20 @@ pub(super) struct RoundClaims {
 /// connection slot.
 pub(super) fn admit_preferred_dials(
     state: &mut CandidateDialerState,
-    set: &[NodeId],
-    dialable: &HashMap<NodeId, ZakuraDiscoveryDialCandidate>,
+    round: &PreferredRound,
+    moved: &MovedNodeIds,
     deferred: &mut DeferredDials,
     room: PreferredRoom,
     accepts_ip: impl Fn(IpAddr, usize) -> bool,
     now: Instant,
 ) -> (Vec<(DialAttemptKey, NodeAddr)>, RoundClaims) {
+    let PreferredRound { set, dialable } = round;
     deferred.refresh(set, dialable, now);
+    let mut dialing: HashSet<_> = state
+        .in_flight_node_ids()
+        .into_iter()
+        .map(|id| moved.current(id))
+        .collect();
     let mut admitted = Vec::new();
     let mut claims = RoundClaims::default();
     for member in set {
@@ -400,7 +406,8 @@ pub(super) fn admit_preferred_dials(
         let Some(candidate) = dialable.get(member) else {
             continue;
         };
-        if deferred.is_waiting(member, now) {
+        let current = moved.current(*member);
+        if deferred.is_waiting(member, now) || dialing.contains(&current) {
             continue;
         }
         let Some((node_addr, reserved_ips)) =
@@ -415,6 +422,7 @@ pub(super) fn admit_preferred_dials(
         let Some(attempt) = state.record_attempt(*member, reserved_ips) else {
             continue;
         };
+        dialing.insert(current);
         deferred.release(member);
         claims.dials += 1;
         claims.address_attempts += attempts;
@@ -480,14 +488,15 @@ impl PreferredPass {
         &mut self,
         state: &mut CandidateDialerState,
         round: &PreferredRound,
+        moved: &MovedNodeIds,
         room: PreferredRoom,
         accepts_ip: impl Fn(IpAddr, usize) -> bool,
         now: Instant,
     ) -> (Vec<(DialAttemptKey, NodeAddr)>, RoundClaims) {
         admit_preferred_dials(
             state,
-            &round.set,
-            &round.dialable,
+            round,
+            moved,
             &mut self.deferred,
             room,
             accepts_ip,

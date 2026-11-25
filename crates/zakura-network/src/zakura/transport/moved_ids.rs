@@ -35,6 +35,12 @@ struct LearnedMove {
     recheck_after: Instant,
 }
 
+impl LearnedMove {
+    fn recheck_due(&self, now: Instant) -> bool {
+        now >= self.recheck_after
+    }
+}
+
 impl MovedNodeIds {
     /// The ID that the node dialed as `id` last answered with, or `id` when
     /// no dial has found it under another.
@@ -70,6 +76,14 @@ impl MovedNodeIds {
         }
     }
 
+    /// The current ID to try during an earlier ID's rollback cooldown.
+    pub(crate) fn cooling_destination(&self, dialed: NodeId, now: Instant) -> Option<NodeId> {
+        self.current
+            .get(&dialed)
+            .filter(|entry| !entry.recheck_due(now))
+            .map(|entry| entry.connected)
+    }
+
     /// Grants at most one retry per backoff interval under the original ID.
     /// A preferred gateway can then reclaim its place after a key rollback,
     /// even if the ordinary slots needed by its last known ID stay full.
@@ -77,7 +91,7 @@ impl MovedNodeIds {
         let Some(entry) = self.current.get_mut(&dialed) else {
             return false;
         };
-        if entry.connected != expected || now < entry.recheck_after {
+        if entry.connected != expected || !entry.recheck_due(now) {
             return false;
         }
         entry.recheck_after = now + DEFAULT_ZAKURA_REDIAL_MAX_BACKOFF;

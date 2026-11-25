@@ -350,6 +350,30 @@ impl PreferredGateways {
         }
     }
 
+    /// Lets the next ranked gateway take a place while a dialable member waits
+    /// for its rollback probe. A waiting gateway still contributes to the hold.
+    pub(super) fn defer_dials(&mut self, waiting: impl Fn(NodeId) -> bool) {
+        let mut changed = false;
+        for gateway in &mut self.ranking {
+            if let GatewayMatch::One((node, GatewayStanding::Dialable)) = gateway.resolution() {
+                if waiting(node) {
+                    *gateway = gateway.with_standing(GatewayStanding::Backoff);
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            // Only dialable entries moved to backoff. The ordering, including
+            // connected tie breakers, and the number of matched gateways stay.
+            self.set = self
+                .ranking
+                .iter()
+                .filter_map(RankedGateway::available_node)
+                .take(self.hold)
+                .collect();
+        }
+    }
+
     /// The connection places held for the preferred set.
     pub fn hold(&self) -> usize {
         self.hold

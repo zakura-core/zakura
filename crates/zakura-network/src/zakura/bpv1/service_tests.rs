@@ -17,16 +17,17 @@ use zakura_header_chain::{
     ChainScore, EngineMode, EngineSnapshot, Frontier, FrontierSet, HeaderGeneration, StateVersion,
     SuffixWork, VerifiedGeneration,
 };
-use zakura_node_services::body_claims::SharedBodyClaims;
+use zakura_node_services::{block_memory::OwnedBlock, body_claims::SharedBodyClaims};
 use zakura_quic::NodeId;
 use zakura_rt::{
     collections::HashMap,
     sync::{watch, CancellationToken},
+    time::Instant,
 };
 
 use super::{
-    blocks::{BlockPhase, HeaderAdmissionResult, VerifierVerdict, WorkId},
-    ports::{HeaderAdmissionPort, PortFuture},
+    blocks::{BlockPhase, HeaderAdmissionResult, VerifierVerdict, WorkId, RECONSTRUCTION_DEADLINE},
+    ports::{BlockVerifierPort, HeaderAdmissionPort, PortFuture},
     profile::Profile,
     service::{Bpv1Handle, Bpv1Ports},
     test_support::{
@@ -34,7 +35,7 @@ use super::{
         node_id, pair, ports, regtest_nu7, regtest_nu7_at, solved_block, start, wait_until,
         ScriptedVerifier,
     },
-    wire::{BPV1_CONTROL_KIND, BPV1_DATA_KIND, ZAKURA_CAP_BPV1},
+    wire::{BPV1_CONTROL_KIND, BPV1_DATA_KIND, PROPAGATION_DEPTH, ZAKURA_CAP_BPV1},
 };
 use crate::{
     config::Config,
@@ -334,6 +335,9 @@ async fn fix4_committed_snapshot_ends_a_fallback_block() {
     let shutdown = CancellationToken::new();
     let (handle_a, handle_b, snapshots_b) =
         proposer_and_follower(VerifierVerdict::LocalCapacity, &shutdown);
+    // With its parent committed, a retryable verdict falls back (bpv1-79).
+    let parent = Frontier::new(Height(9), block::Hash([0x09; 32]));
+    snapshots_b.send_replace(Some(engine_snapshot(parent, parent)));
 
     let fallen = solved_block(&handle_a, Height(10), 11);
     assert!(handle_a.publish_solved_block(&fallen, 10));
@@ -441,6 +445,120 @@ async fn fix3_parent_admitted_through_snapshots_wakes_pending_child() {
         "B assembled the child itself"
     );
 
+    shutdown.cancel();
+}
+
+/// A verifier that answers a block only once the committed verified tip reaches
+/// `parent`, as the router waits for a missing parent. It records each
+/// submission.
+#[derive(Clone)]
+struct ParentWaitingVerifier {
+    snapshots: watch::Receiver<Option<EngineSnapshot>>,
+    parent: u32,
+    seen: Arc<std::sync::Mutex<Vec<block::Hash>>>,
+}
+
+impl ParentWaitingVerifier {
+    fn seen(&self) -> Vec<block::Hash> {
+        self.seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl BlockVerifierPort for ParentWaitingVerifier {
+    fn submit(&self, block: OwnedBlock, _work_id: WorkId) -> PortFuture<'_, VerifierVerdict> {
+        self.seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(block.hash());
+        let mut snapshots = self.snapshots.clone();
+        let parent = self.parent;
+        Box::pin(async move {
+            let committed = async {
+                while !snapshots
+                    .borrow_and_update()
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.frontiers.verified_best.height.0 >= parent)
+                {
+                    if snapshots.changed().await.is_err() {
+                        return false;
+                    }
+                }
+                true
+            };
+            match tokio::time::timeout(Duration::from_secs(10), committed).await {
+                Ok(true) => VerifierVerdict::Valid,
+                Ok(false) | Err(_) => VerifierVerdict::LocalCapacity,
+            }
+        })
+    }
+}
+
+/// The catch-up handoff (bpv1-76, bpv1-44, bpv1-77): while B's verified tip is
+/// more than `PROPAGATION_DEPTH` below a tip block, B leaves the block to block
+/// sync. Once block sync brings the verified tip close, B admits the next tip
+/// block and submits it once. The body claim covers the verifier's wait for the
+/// parent, and the block commits when the parent does.
+#[tokio::test]
+async fn bpv1_77_a_caught_up_node_verifies_the_next_tip_block_once() {
+    let shutdown = CancellationToken::new();
+    let height = 40;
+    let header_best = Frontier::new(Height(height - 1), block::Hash([0x27; 32]));
+    let verified_at = |h: u32| Frontier::new(Height(h), block::Hash([0x28; 32]));
+    let far_behind = verified_at(height - PROPAGATION_DEPTH - 14);
+    let (snapshots_b, committed_snapshots) =
+        watch::channel(Some(engine_snapshot(header_best, far_behind)));
+    let verifier_b = ParentWaitingVerifier {
+        snapshots: committed_snapshots.clone(),
+        parent: height - 1,
+        seen: Arc::default(),
+    };
+    let claims_b = SharedBodyClaims::new();
+    let ports_b = Bpv1Ports {
+        committed_snapshots,
+        ..ports(height, verifier_b.clone(), claims_b.clone())
+    };
+    let valid = ScriptedVerifier::new(VerifierVerdict::Valid);
+    let (handle_a, handle_b) = pair(
+        Profile::TINY,
+        ports(height, valid, SharedBodyClaims::new()),
+        ports_b,
+        &shutdown,
+    );
+
+    let early = solved_block(&handle_a, Height(height), 21);
+    assert!(handle_a.publish_solved_block(&early, height));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        handle_b.block_phase(&early.hash()),
+        None,
+        "block sync's block"
+    );
+
+    // Block sync brings the verified tip within the window, short of the parent.
+    snapshots_b.send_replace(Some(engine_snapshot(header_best, verified_at(height - 10))));
+    let next = solved_block(&handle_a, Height(height), 22);
+    assert!(handle_a.publish_solved_block(&next, height));
+    wait_until("B submits the block", || !verifier_b.seen().is_empty()).await;
+    assert_eq!(
+        handle_b.block_phase(&next.hash()),
+        Some(BlockPhase::Verifying)
+    );
+    assert!(
+        claims_b
+            .next_expiry()
+            .is_some_and(|expiry| expiry > Instant::now() + RECONSTRUCTION_DEADLINE),
+        "the claim covers verification"
+    );
+
+    snapshots_b.send_replace(Some(engine_snapshot(header_best, verified_at(height - 1))));
+    wait_until("B commits the block", || {
+        handle_b.block_phase(&next.hash()) == Some(BlockPhase::Done)
+    })
+    .await;
+    assert_eq!(verifier_b.seen(), vec![next.hash()], "one submission");
     shutdown.cancel();
 }
 

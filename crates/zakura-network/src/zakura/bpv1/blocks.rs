@@ -58,6 +58,16 @@ pub fn stall_base(paths: &PeerPaths, coding: &Coding) -> Duration {
 /// It is the only recovery bound (decision-17).
 pub const RECONSTRUCTION_DEADLINE: Duration = Duration::from_secs(15);
 
+/// Monotonic verification deadline from a block's first verifier submission
+/// (`bpv1-77`).
+///
+/// The body claim lasts until this deadline while the block verifies
+/// (`bpv1-44`). Past it, the block falls back to block sync and frees its slot.
+/// It matches the verifier's 2-minute wait for another delivery's pending
+/// commit, and the node's verifier adapter cancels its router call at the same
+/// bound.
+pub const VERIFY_DEADLINE: Duration = Duration::from_secs(120);
+
 /// Maximum metadata entries in header admission or the commitment check.
 /// Pending metadata never counts here (`bpv1-75`).
 pub const MAX_ADMITTING_META_COUNT: usize = 64;
@@ -168,6 +178,8 @@ pub enum FallbackReason {
     RootMismatch,
     /// Local decoded-block pool capacity or retryable verifier backpressure.
     LocalCapacity,
+    /// The verification deadline elapsed before a verdict (`bpv1-77`).
+    VerifyDeadline,
 }
 
 /// How a received part was requested (`part.received{source}`).
@@ -782,6 +794,12 @@ pub enum BlockEvent {
         /// Block hash.
         block_id: block::Hash,
     },
+    /// A retryable verdict parked the assembled block until its parent commits
+    /// (`bpv1-79`).
+    Parked {
+        /// Block hash.
+        block_id: block::Hash,
+    },
     /// Verdict received from `BlockVerifier`.
     Verdict {
         /// Block hash.
@@ -1066,8 +1084,13 @@ struct ActiveBlock {
     last_part_at: Instant,
     /// Peers that sent `BlockDone`, which repair may ask for any part (decision-20).
     done_peers: HashSet<NodeId>,
-    /// Active verifier work id if `phase == Verifying`.
+    /// Work id of the submission in flight. `None` while `Verifying` means a
+    /// retryable verdict parked the assembled block until its parent commits
+    /// (`bpv1-79`).
     verify_work_id: Option<WorkId>,
+    /// Monotonic verification deadline, set at the first submission
+    /// (`bpv1-77`).
+    verify_deadline: Option<Instant>,
     /// Whether this block currently holds a body claim in `BlockFallback`.
     body_claimed: bool,
     /// True once `BlockDone` has been announced to routines.
@@ -1117,6 +1140,7 @@ impl ActiveBlock {
             last_part_at: now,
             done_peers: HashSet::new(),
             verify_work_id: None,
+            verify_deadline: None,
             body_claimed: false,
             block_done_notified: false,
             part_charges: HashMap::new(),
@@ -1384,6 +1408,11 @@ impl BlockTable {
             .pending
             .values()
             .map(|entry| entry.received_at + PENDING_META_AGE);
+        let verifying = self
+            .blocks
+            .values()
+            .filter(|b| b.phase == BlockPhase::Verifying)
+            .filter_map(|b| b.verify_deadline);
         let blocks = self
             .blocks
             .values()
@@ -1402,7 +1431,7 @@ impl BlockTable {
                 .into_iter()
                 .flatten()
             });
-        pending.chain(blocks).min()
+        pending.chain(verifying).chain(blocks).min()
     }
 
     /// Executes one synchronous state transition.
@@ -1412,6 +1441,7 @@ impl BlockTable {
             BlockInput::TipHeight { height } => {
                 self.verified = height;
                 self.raise_top(height, &mut step);
+                self.resubmit_parked(now, &mut step);
             }
             BlockInput::ParentAdmitted { hash, height } => {
                 self.raise_top(height, &mut step);
@@ -1544,7 +1574,7 @@ impl BlockTable {
                 stripe,
                 result,
             } => {
-                self.handle_stripe_checked(work_id, block_id, stripe, result, &mut step);
+                self.handle_stripe_checked(now, work_id, block_id, stripe, result, &mut step);
             }
             BlockInput::BlockAssembled { work_id, block_id } => {
                 self.handle_block_assembled(now, work_id, block_id, &mut step);
@@ -1925,7 +1955,7 @@ impl BlockTable {
             return;
         }
         // All concurrent slots actively collecting: drop cleanly without faulting the peer.
-        if !self.evict_for_slot(false, step) {
+        if !self.evict_for_slot(false, step) && !self.displace_for_next_block(height, step) {
             reject_meta(step, block_id, entry.from_peer, entry.session_gen);
             reject_also(step, block_id, &entry.also_from);
             return;
@@ -1969,7 +1999,7 @@ impl BlockTable {
         });
         // An empty body has no stripes, so the block assembles from
         // `HeaderMeta` alone and no part crosses the wire for it.
-        self.maybe_assemble_and_verify(block_id, step);
+        self.maybe_assemble_and_verify(now, block_id, step);
     }
 
     /// Frees a concurrent-block slot if every slot is taken.
@@ -2006,6 +2036,53 @@ impl BlockTable {
                 true
             }
             None => false,
+        }
+    }
+
+    /// Frees a slot for the block whose parent is the verified tip (`bpv1-78`).
+    ///
+    /// That block is the next one the chain can commit, and every block above it
+    /// waits on it. When every slot is busy, it retires the highest block whose
+    /// parent is not committed, and block sync fetches that one instead. Returns
+    /// whether a slot is free.
+    fn displace_for_next_block(&mut self, height: u32, step: &mut BlockStep) -> bool {
+        if height != self.verified.saturating_add(1) {
+            return false;
+        }
+        let victim = self
+            .blocks
+            .values()
+            .filter(|b| {
+                matches!(b.phase, BlockPhase::Collecting | BlockPhase::Verifying)
+                    && b.height > height
+            })
+            .max_by_key(|b| b.height)
+            .map(|b| b.meta.block_id);
+        match victim {
+            Some(id) => {
+                self.retire_block(id, step);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Resubmits each parked block whose parent the verified tip now includes
+    /// (`bpv1-79`).
+    fn resubmit_parked(&mut self, now: Instant, step: &mut BlockStep) {
+        let ready: Vec<block::Hash> = self
+            .blocks
+            .values()
+            .filter(|b| {
+                b.phase == BlockPhase::Verifying
+                    && b.verify_work_id.is_none()
+                    && b.height <= self.verified.saturating_add(1)
+                    && b.verify_deadline.is_some_and(|deadline| now < deadline)
+            })
+            .map(|b| b.meta.block_id)
+            .collect();
+        for block_id in ready {
+            self.submit_assembled(block_id, step);
         }
     }
 
@@ -2555,7 +2632,7 @@ impl BlockTable {
         }
 
         // Check if every stripe is now assemblable (e.g., all-systematic fast path).
-        self.maybe_assemble_and_verify(block_id, step);
+        self.maybe_assemble_and_verify(now, block_id, step);
 
         if let Some(stripe) = replan_stripe {
             self.plan_stripe(now, block_id, stripe, peer_states, step);
@@ -2564,6 +2641,7 @@ impl BlockTable {
 
     fn handle_stripe_checked(
         &mut self,
+        now: Instant,
         work_id: WorkId,
         block_id: block::Hash,
         stripe: u32,
@@ -2632,7 +2710,7 @@ impl BlockTable {
             self.enter_fallback(block_id, FallbackReason::ReencodeFailed, step);
             self.retire_block(block_id, step);
         } else {
-            self.maybe_assemble_and_verify(block_id, step);
+            self.maybe_assemble_and_verify(now, block_id, step);
         }
     }
 
@@ -2654,16 +2732,48 @@ impl BlockTable {
         block.notify_done(now, step);
     }
 
-    fn maybe_assemble_and_verify(&mut self, block_id: block::Hash, step: &mut BlockStep) {
+    fn maybe_assemble_and_verify(
+        &mut self,
+        now: Instant,
+        block_id: block::Hash,
+        step: &mut BlockStep,
+    ) {
         let Some(block) = self.blocks.get_mut(&block_id) else {
             return;
         };
-        // bpv1-44: one verifier submission per ownership episode; `Verifying`
-        // and every later phase are past collection.
-        if block.phase != BlockPhase::Collecting || !block.all_stripes_assemblable() {
+        // bpv1-44: `Verifying` and every later phase are past collection.
+        if block.phase != BlockPhase::Collecting
+            || !block.all_stripes_assemblable()
+            || !self.submit_assembled(block_id, step)
+        {
             return;
         }
+        let block = self
+            .blocks
+            .get_mut(&block_id)
+            .expect("the block exists because it was just submitted");
+        let deadline = now + VERIFY_DEADLINE;
+        block.phase = BlockPhase::Verifying;
+        block.verify_deadline = Some(deadline);
+        // bpv1-44: the body claim covers verification, so block sync fetches no
+        // second copy while the verifier holds this one. The verification
+        // deadline bounds it, as the reconstruction deadline bounds collection.
+        if block.body_claimed {
+            step.outputs
+                .push(BlockOutput::ClaimBody { block_id, deadline });
+        }
+        step.events.push(BlockEvent::Handoff { block_id });
+    }
 
+    /// Submits an assembled block's body to the verifier, and returns whether
+    /// it held every source part.
+    ///
+    /// `BlockTable` keeps every source part of an assembled block, so a parked
+    /// block resubmits without fetching anything (`bpv1-79`).
+    fn submit_assembled(&mut self, block_id: block::Hash, step: &mut BlockStep) -> bool {
+        let Some(block) = self.blocks.get_mut(&block_id) else {
+            return false;
+        };
         let coding = block.meta.coding;
         let mut stripe_sources = Vec::with_capacity(block.stripes.len());
         let mut zeros: Option<Arc<[u8]>> = None;
@@ -2675,7 +2785,7 @@ impl BlockTable {
                     None if st.is_padding(slot, coding.k) => zeros
                         .get_or_insert_with(|| vec![0u8; coding.part_bytes as usize].into())
                         .clone(),
-                    None => return,
+                    None => return false,
                 };
                 sources.push(payload);
             }
@@ -2684,10 +2794,8 @@ impl BlockTable {
 
         let work_id = alloc_work_id(&mut self.next_work_id);
         block.verify_work_id = Some(work_id);
-        block.phase = BlockPhase::Verifying;
 
         // `NotifyBlockDone` waits for `BlockAssembled` or a committed verdict.
-        step.events.push(BlockEvent::Handoff { block_id });
         step.outputs.push(BlockOutput::SubmitVerifier {
             work_id,
             block_id,
@@ -2696,6 +2804,7 @@ impl BlockTable {
             coding,
             stripe_sources,
         });
+        true
     }
 
     fn handle_verifier_verdict(
@@ -2741,7 +2850,13 @@ impl BlockTable {
             VerifierVerdict::RootMismatch => {
                 self.enter_fallback(block_id, FallbackReason::RootMismatch, step);
             }
-            // Local pool capacity is its own fallback reason.
+            // bpv1-79: a retryable verdict says nothing about the body. While the
+            // parent is not committed, the block cannot commit through any path,
+            // so it keeps its body and claim and resubmits once the parent
+            // commits. With the parent committed, it falls back.
+            VerifierVerdict::LocalCapacity if block.height > self.verified.saturating_add(1) => {
+                step.events.push(BlockEvent::Parked { block_id });
+            }
             VerifierVerdict::LocalCapacity => {
                 self.enter_fallback(block_id, FallbackReason::LocalCapacity, step);
             }
@@ -2765,6 +2880,8 @@ impl BlockTable {
         }
         block.repair_round = 0;
         block.phase = BlockPhase::Fallback;
+        // bpv1-63: fallback ends the submission, so a later verdict is stale.
+        block.verify_work_id = None;
         for st in &mut block.stripes {
             st.claims.clear();
             st.job = None;
@@ -2882,7 +2999,18 @@ impl BlockTable {
         let mut to_fallback: Vec<block::Hash> = Vec::new();
         let mut to_repair: Vec<(block::Hash, u32)> = Vec::new();
 
+        let mut verify_expired: Vec<block::Hash> = Vec::new();
+
         for (&block_id, block) in &mut self.blocks {
+            // bpv1-77: verification ends by its deadline, verdict or not.
+            if block.phase == BlockPhase::Verifying
+                && block
+                    .verify_deadline
+                    .is_some_and(|deadline| now >= deadline)
+            {
+                verify_expired.push(block_id);
+                continue;
+            }
             if block.phase != BlockPhase::Collecting {
                 continue;
             }
@@ -2921,6 +3049,9 @@ impl BlockTable {
 
         for block_id in to_fallback {
             self.enter_fallback(block_id, FallbackReason::Deadline, step);
+        }
+        for block_id in verify_expired {
+            self.enter_fallback(block_id, FallbackReason::VerifyDeadline, step);
         }
         for (block_id, stripe) in to_repair {
             self.plan_stripe(now, block_id, stripe, peer_states, step);

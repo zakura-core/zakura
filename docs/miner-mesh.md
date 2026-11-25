@@ -19,10 +19,15 @@ miner_mesh = true
 
 [network]
 p2p_stack = "dual"
+external_addr = "203.0.113.10:8233" # Replace the example IP with the gateway's public IP.
 
 [network.zakura]
 listen_addr = "0.0.0.0:8234"
 ```
+
+For a wildcard listener, v2 discovery advertises the IP from
+`network.external_addr` with the port from `network.zakura.listen_addr`.
+Allow inbound UDP on that port (8234 here).
 
 With `miner_mesh = true`, every coinbase the node builds gets one extra
 zero-value output that names the node by its gateway ID: the first 20 bytes of
@@ -70,6 +75,9 @@ the template node itself:
 miner_address = "t1..."
 miner_mesh = true
 miner_mesh_gateways = ["<the relay's node_id>"]
+
+[network]
+p2p_stack = "dual"
 ```
 
 ```toml
@@ -80,12 +88,18 @@ miner_mesh_template_nodes = ["<the template node's node_id>"]
 
 [network]
 p2p_stack = "dual"
+external_addr = "203.0.113.10:8233" # Replace the example IP with the relay's public IP.
 
 [network.zakura]
 listen_addr = "0.0.0.0:8234"
 ```
 
-Each entry is the relay's v2 node ID in hex, the `node_id` its
+Allow inbound UDP on port 8234 at the relay's public IP. For a new pair,
+enable v2 on both nodes first and read `node_id` from `getminermeshinfo` on
+each. Put the relay's ID on the template node and the template node's ID
+on the relay, then restart both with the mining settings above.
+
+Each `miner_mesh_gateways` entry is the relay's v2 node ID in hex, the `node_id` its
 `getminermeshinfo` reports, or the first 40 hex digits of it, its gateway ID.
 For now the list takes one entry: `zakurad` refuses to start with more, or
 with the node's own ID. An empty list, the default, names the node itself.
@@ -103,22 +117,24 @@ The two nodes need different things:
   pools can dial. With `miner_mesh` set and no miner address, it counts the
   gateways recent blocks name and holds places for the best of them, as a
   mining node does, so it stays connected to the other pools' gateways.
-- The template node is not a gateway, so `zakurad` asks neither v2 networking
-  nor a lasting node key of it, and does not warn about its listen address.
+- The template node can name a relay in its coinbases even on legacy-only
+  Mainnet. To use the relay's reserved v2 place, enable v2 as shown above and
+  preserve the template node's key under `network.identity_dir` across
+  restarts. If its ID changes, update `miner_mesh_template_nodes` on the relay.
   It refuses to start with `miner_mesh_gateways` set unless `miner_mesh` is
   set too, and warns when it has no miner address, since then it builds no
   coinbase to name the relay in.
 
-The template node ranks the relay like any other gateway: once its own blocks
-name the relay in at least 10 counted blocks, it holds a place for the relay
-and dials it. The relay keeps a place for each template node it lists, ahead
-of the gateways it ranks and whether or not the template node is connected,
-so the template node can always connect in, and the relay dials it when it
-knows its address. The two stay connected with no extra peer settings. A
-template node that is offline costs the relay only its own place; the ranked
-gateways fill the rest. A template node that runs only the legacy stack holds
-no places, so it reaches the relay only through its ordinary legacy peers. A
-node only ever leaves out the gateway ID its own node ID starts with.
+A synced template node ranks its relay once at least 10 counted blocks name
+the relay. To get a preferred outbound connection, the relay must rank within
+the places the template node's memory budget funds and have a reachable
+address. More highly ranked gateways can take all those places.
+
+On the relay, each listed template node gets priority over block-ranked
+gateways. Within the funded places, an unambiguous template ID keeps its place
+even while offline, so the template node can call in when ordinary inbound
+places are full. The relay can also dial the template node if it knows a
+reachable address.
 
 `zakurad` refuses to start with `miner_mesh_template_nodes` set unless
 `miner_mesh` is set and the node is its own gateway (`miner_mesh_gateways` is

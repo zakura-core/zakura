@@ -140,6 +140,8 @@ where
             ),
         };
         let registration = registration.ok_or(TrustedSubmissionError::Capacity)?;
+        // A trusted submission skips state admission, so BPv1 publishes it only once it commits.
+        let bpv1_publication = self.gbt.bpv1_proposer().map(|bpv1| (bpv1, block.clone()));
         let submission = Submission {
             block,
             hash,
@@ -176,6 +178,18 @@ where
                         SubmitBlockErrorResponse::Inconclusive.into()
                     }
                 };
+                if response == SubmitBlockResponse::Accepted {
+                    if let Some((bpv1, block)) = bpv1_publication {
+                        let published = bpv1.publish_solved_block(block, height);
+                        tracing::debug!(
+                            ?hash,
+                            ?height,
+                            published,
+                            stage = "committed",
+                            "bpv1 solved-block hook"
+                        );
+                    }
+                }
                 let label = crate::server::trusted_block::outcome(&response);
                 if let Some(body) = outcome.duplicate_body {
                     metrics::counter!("rpc.trusted_submission.duplicate_body", "body" => body.label())

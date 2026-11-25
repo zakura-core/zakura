@@ -1264,7 +1264,12 @@ impl PeerState {
                 indices,
                 push,
             } => {
-                if push {
+                // decision-32: the proposer gets a plain `Have` for a pushed seed too.
+                let to_proposer = self
+                    .blocks
+                    .get(&block_id)
+                    .is_some_and(|block| self.remote_node == block.proposer_node);
+                if push && !to_proposer {
                     self.push_seeds(block_id, indices, &mut step);
                 } else {
                     self.handle_ready(now, block_id, indices, &mut step);

@@ -123,7 +123,7 @@ impl EndpointInputs {
     /// directly, so a seeded [`Self::tls_random`] alone doesn't fix the key
     /// shares.
     ///
-    /// Unset, the endpoint offers only the production group, X25519MLKEM768.
+    /// Unset, the endpoint offers only the production group, X25519MLKEM1024.
     pub fn kx_groups(mut self, groups: Vec<&'static dyn SupportedKxGroup>) -> Self {
         self.kx_groups = Some(groups);
         self

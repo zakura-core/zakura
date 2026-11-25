@@ -485,8 +485,10 @@ where
                 // Keep this receipt registered until verification finishes or is cancelled.
                 let receipt = receipt;
                 // Another delivery of this body may be verifying. Wait for it, so this one
-                // finds the block in state instead of verifying it again.
+                // finds the block in state instead of verifying it again. A mined submission
+                // never waits (see `ReceiptGuard::try_verification_turn`).
                 let _turn = match &receipt {
+                    Some(receipt) if request.is_mined_commit() => receipt.try_verification_turn(),
                     Some(receipt) => receipt.verification_turn().await,
                     None => None,
                 };

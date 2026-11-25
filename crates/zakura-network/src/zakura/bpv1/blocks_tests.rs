@@ -418,7 +418,7 @@ fn best_header_jumping_past_the_parent_wakes_the_child() {
         &woken,
         HeaderAdmissionResult::Admitted {
             height: 11,
-            parent_hash: TEST_TIP_HASH,
+            parent_hash: parent,
         },
     );
     let committed = commitment_ok(&mut table, at, &admitted);
@@ -475,7 +475,7 @@ fn best_header_moving_during_the_checks_retries_admission() {
         &retried,
         HeaderAdmissionResult::Admitted {
             height: 11,
-            parent_hash: TEST_TIP_HASH,
+            parent_hash: parent,
         },
     );
     let committed = commitment_ok(&mut table, now, &admitted);

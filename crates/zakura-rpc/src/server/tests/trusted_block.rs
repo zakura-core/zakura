@@ -14,9 +14,12 @@ use std::sync::{
 use super::super::{
     cookie::{self, Cookie},
     http::HttpResponse,
-    trusted_block::{Submit, TrustedBlockHttpService},
+    trusted_block::{Submit, SubmitJob, TrustedBlockHttpService, TrustedSubmissionError},
 };
-use crate::{config::rpc::Config, methods::types::submit_block::SubmitBlockResponse};
+use crate::{
+    config::rpc::Config,
+    methods::{trusted_block::jobs::JobError, types::submit_block::SubmitBlockResponse},
+};
 
 /// Calls the service the way hyper does when it parses a request head.
 fn send<S, B>(
@@ -55,6 +58,29 @@ fn trusted_submission_requires_a_primary_listener_with_either_auth_policy() {
     assert!(config.validate().is_ok());
     config.listen_addr = None;
     assert!(config.validate().is_err());
+}
+
+#[tokio::test]
+async fn trusted_http_reports_the_mining_support_cutoff_for_blocks_and_jobs() {
+    let submit: Submit =
+        Arc::new(|_| Box::pin(async { Err(TrustedSubmissionError::EndOfSupport) }));
+    let jobs: SubmitJob = Arc::new(|_, _, _| Box::pin(async { Err(JobError::EndOfSupport) }));
+    let json = tower::service_fn(|_| async { Ok::<_, tower::BoxError>(HttpResponse::default()) });
+    let service = TrustedBlockHttpService::new(json, None, Some(submit)).with_jobs(Some(jobs));
+
+    for uri in ["/submittrustedblock", "/submittrustedblock?op=solve"] {
+        let request = Request::post(uri)
+            .header("Content-Type", "application/octet-stream")
+            .header("X-Job-Id", "0123456789abcdef0123456789abcdef")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let response = send(service.clone(), request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            "mining is disabled past the last supported height"
+        );
+    }
 }
 
 #[tokio::test]

@@ -316,9 +316,9 @@ fn the_node_dials_a_listening_static_candidate() {
 
 /// The node's datagrams to `peer` that [`a_redial_the_peer_never_handled`]
 /// drops, by ID on their link, from the log entries `entries`. Each redial
-/// after the node tore its first connection from `peer` down starts with its
-/// hello: [`HELLO_DATAGRAMS`] client Initials, each padded to at least 1,200
-/// bytes. The redial's later datagrams are dropped until the node ends it
+/// after the node tore its first connection from `peer` down starts with
+/// [`FIRST_FLIGHT_DATAGRAMS`] Initial datagrams, each at least 1,200 bytes.
+/// The redial's later datagrams are dropped until the node ends it
 /// with a registration or a failed dial. The first redial the node ends with
 /// a refused handshake is the last one dropped.
 fn dropped_redial(entries: &[zakura_sim::observe::Entry], peer: std::net::SocketAddr) -> Vec<u64> {
@@ -326,7 +326,7 @@ fn dropped_redial(entries: &[zakura_sim::observe::Entry], peer: std::net::Socket
     let to_peer = format!("{NODE_ADDR}->{peer}");
     let mut torn_down = false;
     let mut redialing = false;
-    let mut hello_sent = 0;
+    let mut first_flight_sent = 0;
     let mut dropped = Vec::new();
     for entry in entries {
         match &entry.obs {
@@ -347,13 +347,13 @@ fn dropped_redial(entries: &[zakura_sim::observe::Entry], peer: std::net::Socket
                 outcome: DatagramOutcome::Sent,
                 ..
             } if *link == to_peer && torn_down => {
-                if redialing && hello_sent < HELLO_DATAGRAMS && *len >= 1_200 {
-                    hello_sent += 1;
+                if redialing && first_flight_sent < FIRST_FLIGHT_DATAGRAMS && *len >= 1_200 {
+                    first_flight_sent += 1;
                 } else if redialing {
                     dropped.push(*id);
                 } else if *len >= 1_200 {
                     redialing = true;
-                    hello_sent = 1;
+                    first_flight_sent = 1;
                 }
             }
             _ => {}
@@ -362,9 +362,9 @@ fn dropped_redial(entries: &[zakura_sim::observe::Entry], peer: std::net::Socket
     dropped
 }
 
-/// The datagrams a node's hello spans: it carries the hybrid key share,
-/// which doesn't fit one 1,200-byte Initial.
-const HELLO_DATAGRAMS: usize = 2;
+/// Two Initial datagrams carry the ClientHello, and a third adds padding
+/// so the listener can send its full reply before validating the address.
+const FIRST_FLIGHT_DATAGRAMS: usize = 3;
 
 /// The production QUIC handshake timeout a listening peer accepts with,
 /// from the config the wire node builds.
@@ -381,14 +381,14 @@ fn handshake_timeout_ns() -> u64 {
 }
 
 /// The node redials `peer-0`, which listens, and a focused Plan drops every
-/// datagram the node sends on the redial after its hello, until the node
-/// refuses the redial's handshake, at least the peer's QUIC handshake
-/// timeout after the hello's last datagram. The peer's flight reaches the node, so the node's QUIC
-/// handshake completes, but the node's last flight never reaches the peer,
-/// whose handshake ends before `Acceptor::handle`. So the node refuses
-/// a handshake the peer never counted as a connection. The node's next
-/// connection to the peer registers, the exchange completes on it, and the
-/// peer's frames are placed on it.
+/// datagram the node sends after its padded first flight, until the node
+/// refuses the redial's handshake. The refusal comes at least one QUIC
+/// handshake timeout after the first flight's last datagram. The peer's
+/// flight reaches the node, so the node's QUIC handshake completes. The
+/// node's last flight never reaches the peer, whose handshake ends before
+/// `Acceptor::handle`. The node refuses a handshake the peer never counted
+/// as a connection. The next connection registers, the exchange completes,
+/// and the peer's frames are placed on that connection.
 ///
 /// This fails with `UnplacedRecord` if the node and the peer count the
 /// peer's connections apart (#2160), and if the drops, the refusal or the
@@ -468,7 +468,7 @@ fn a_redial_the_peer_never_handled() {
             } if *from == remote)
         })
         .expect("the node refused the redial's handshake");
-    // The hello's last datagram is the node's datagram to the peer just
+    // The first flight's last datagram is the node's datagram to the peer just
     // before the first one dropped. The peer's handshake timeout runs from
     // its first, which is no later.
     let initial = dropped[0] - 1;

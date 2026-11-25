@@ -90,6 +90,9 @@ pub(super) enum RelayPolicy {
         /// A duplicate verdict proves only that the header hash is known, not that the submitted
         /// transactions match the committed block, so it is resolved against the committed body.
         committed_block: CommittedBlockLookup,
+        /// Publishes the block over BPv1 once it commits. A trusted submission skips state
+        /// admission, and its early relay precedes verification, so nothing publishes earlier.
+        bpv1_proposer: Option<Arc<dyn Bpv1ProposerHook>>,
     },
 }
 
@@ -136,14 +139,19 @@ impl RelayPolicy {
     }
 
     fn publish_bpv1(&self, block: &Arc<Block>, hash: block::Hash, height: Height, stage: &str) {
-        if let Self::AfterStateAdmission {
+        let (Self::AfterStateAdmission {
             bpv1_proposer: Some(bpv1),
             ..
-        } = self
-        {
-            let published = bpv1.publish_solved_block(block.clone(), height);
-            tracing::debug!(?hash, ?height, published, stage, "bpv1 solved-block hook");
         }
+        | Self::TrustedSubmission {
+            bpv1_proposer: Some(bpv1),
+            ..
+        }) = self
+        else {
+            return;
+        };
+        let published = bpv1.publish_solved_block(block.clone(), height);
+        tracing::debug!(?hash, ?height, published, stage, "bpv1 solved-block hook");
     }
 
     fn retire_bpv1(&self, hash: block::Hash) {
@@ -272,6 +280,9 @@ impl Submission {
                 result = &mut verification => result,
                 authorized = policy.wait_for_relay(&admission, admission_start) => {
                     if let Some(relay) = authorized {
+                        // Only state admission publishes before commit: trusted early relay
+                        // precedes verification.
+                        let publish_early = matches!(relay, EarlyBlockRelay::StateAdmission(_));
                         if policy.announces_early() {
                             let registration = match &policy {
                                 RelayPolicy::AfterStateAdmission { pending_blocks, .. } => {
@@ -303,8 +314,10 @@ impl Submission {
                         }
                         // BPv1 serializes and hashes the block before it publishes, so it
                         // runs after the early announcement is queued.
-                        policy.publish_bpv1(&self.block, self.hash, self.height, "admitted");
-                        bpv1_attempted = true;
+                        if publish_early {
+                            policy.publish_bpv1(&self.block, self.hash, self.height, "admitted");
+                            bpv1_attempted = true;
+                        }
                     }
                     verification.await
                 }

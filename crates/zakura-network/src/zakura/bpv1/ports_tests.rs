@@ -271,7 +271,7 @@ async fn body_claim_port_extends_only_a_live_claim() {
     let soon = Instant::now() + Duration::from_millis(20);
     assert!(port.claim(live, Instant::now() + Duration::from_secs(10)));
     assert!(port.claim(expired, soon));
-    tokio::time::sleep_until(soon).await;
+    zakura_rt::time::sleep_until(soon).await;
 
     let later = Instant::now() + Duration::from_secs(120);
     assert!(port.extend(live, later));

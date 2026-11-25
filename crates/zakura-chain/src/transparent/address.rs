@@ -157,9 +157,12 @@ impl std::str::FromStr for Address {
             return Address::zcash_deserialize(&data[..]);
         }
 
-        // Try Bech32 (prefixes: tex, textest)
-        let (hrp, payload) =
-            bech32::decode(s).map_err(|_| SerializationError::Parse("invalid Bech32 encoding"))?;
+        // Try Bech32m (prefixes: tex, textest). ZIP 320 requires the Bech32m
+        // checksum, so a TEX address with a Bech32 checksum is rejected.
+        let decoded = bech32::primitives::decode::CheckedHrpstring::new::<bech32::Bech32m>(s)
+            .map_err(|_| SerializationError::Parse("invalid Bech32m encoding"))?;
+        let hrp = decoded.hrp();
+        let payload: Vec<u8> = decoded.byte_iter().collect();
 
         // We can’t meaningfully call `Address::zcash_deserialize` for Bech32 addresses, because
         // that method is explicitly reading two binary prefix bytes (the Base58Check version) + 20 hash bytes.

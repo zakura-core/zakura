@@ -4394,6 +4394,102 @@ async fn template_trace_records_the_tip_to_template_path() {
 }
 
 #[tokio::test]
+async fn mining_support_cutoff_wakes_an_in_flight_template_long_poll() {
+    let _init_guard = zakura_test::init();
+    let parent = Hash([1; 32]);
+    let last_supported_height = NetworkUpgrade::Nu5.activation_height(&Mainnet).unwrap();
+    let (tip, tip_sender) = MockChainTip::new();
+    tip_sender.send_best_tip_height(last_supported_height);
+    tip_sender.send_best_tip_hash(parent);
+    tip_sender.send_best_tip_block_time(chrono::Utc::now());
+    tip_sender.send_estimated_distance_to_network_chain_tip(Some(0));
+    let mut sync = MockSyncStatus::default();
+    sync.set_is_close_to_tip(true);
+
+    let (mempool_calls, mut calls) = tokio::sync::watch::channel(0);
+    let mempool = tower::service_fn(move |_| {
+        mempool_calls.send_modify(|calls| *calls += 1);
+        async move {
+            Ok::<_, BoxError>(mempool::Response::FullTransactions {
+                transactions: vec![],
+                transaction_dependencies: Default::default(),
+                last_seen_tip_hash: parent,
+            })
+        }
+    });
+    let chain_info = GetBlockTemplateChainInfo {
+        value_pools: Default::default(),
+        expected_difficulty: CompactDifficulty::from(ExpandedDifficulty::from(U256::one())),
+        tip_height: last_supported_height,
+        tip_hash: parent,
+        cur_time: 1654008617.into(),
+        min_time: 1654008606.into(),
+        max_time: 1654008728.into(),
+        chain_history_root: fake_history_tree(&Mainnet).hash(),
+    };
+    let read_state = tower::service_fn(move |_| {
+        let chain_info = chain_info.clone();
+        async move { Ok::<_, BoxError>(ReadResponse::ChainInfo(chain_info)) }
+    });
+    let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let verifier = tower::service_fn(|_| async {
+        Err::<Hash, BoxError>("verifier unavailable in this test".into())
+    });
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (rpc, _queue) = TestRpcImpl::new_for_tests(
+        Mainnet,
+        mining::Config {
+            miner_address: Some(ZcashAddress::from_transparent_p2pkh(
+                NetworkType::Main,
+                [0x7e; 20],
+            )),
+            ..Default::default()
+        },
+        false,
+        "0.0.1",
+        "long poll cutoff test",
+        Buffer::new(mempool, 1),
+        Buffer::new(state, 1),
+        Buffer::new(read_state, 1),
+        Buffer::new(verifier, 1),
+        sync,
+        tip,
+        MockAddressBookPeers::default(),
+        rx,
+        None,
+    );
+    let rpc = rpc.with_end_of_support_height(Some(last_supported_height));
+    let template = rpc
+        .get_block_template(None)
+        .await
+        .unwrap()
+        .try_into_template()
+        .unwrap();
+    let params = GetBlockTemplateParameters::new(
+        GetBlockTemplateRequestMode::Template,
+        None,
+        vec![],
+        Some(template.long_poll_id),
+        None,
+    );
+    let long_poll = tokio::spawn(async move { rpc.get_block_template(Some(params)).await });
+    tokio::time::timeout(Duration::from_secs(2), calls.wait_for(|calls| *calls >= 2))
+        .await
+        .expect("the long poll checks for updated transactions before waiting")
+        .unwrap();
+    assert!(!long_poll.is_finished());
+
+    tip_sender.send_best_tip_height(last_supported_height.next().unwrap());
+    tip_sender.send_best_tip_hash(Hash([2; 32]));
+    let error = tokio::time::timeout(Duration::from_secs(2), long_poll)
+        .await
+        .expect("the tip change wakes the long poll")
+        .unwrap()
+        .expect_err("an expired node must not return work to a waiting miner");
+    assert!(error.message().contains("past the last supported height"));
+}
+
+#[tokio::test]
 async fn template_rejection_wakes_long_poll_and_validates_recovery() {
     check_template_rejection_recovery(false).await;
 }
@@ -5025,6 +5121,66 @@ async fn rpc_commit_is_announced_before_verification_returns_to_rpc() {
     assert!(futures::poll!(Box::pin(announcements.recv(true))).is_pending());
     assert!(early_rx.try_recv().is_err());
     queue_task.abort();
+}
+
+#[tokio::test]
+async fn mining_support_cutoff_allows_submitblock_at_but_not_after_the_last_supported_height() {
+    let _init_guard = zakura_test::init();
+    let last_supported_height = Height(100);
+    let (tip, tip_sender) = MockChainTip::new();
+    tip_sender.send_best_tip_height(last_supported_height);
+    let mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut verifier = MockService::build().for_unit_tests();
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (rpc, _queue) = TestRpcImpl::new_for_tests(
+        Mainnet,
+        Default::default(),
+        false,
+        "0.0.1",
+        "submitblock cutoff test",
+        Buffer::new(mempool, 1),
+        Buffer::new(state, 1),
+        Buffer::new(read_state, 1),
+        verifier.clone(),
+        MockSyncStatus::default(),
+        tip,
+        MockAddressBookPeers::default(),
+        rx,
+        None,
+    );
+    let rpc = rpc.with_end_of_support_height(Some(last_supported_height));
+    let block = HexData(zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES.to_vec());
+
+    let (response, ()) = tokio::join!(rpc.submit_block(block.clone(), None), async {
+        verifier
+            .expect_request_that(|request| {
+                matches!(request, zakura_consensus::Request::CommitMined { .. })
+            })
+            .await
+            .respond(Mainnet.genesis_hash());
+    });
+    assert_eq!(response, Ok(SubmitBlockResponse::Accepted));
+
+    tip_sender.send_best_tip_height(last_supported_height.next().unwrap());
+    let error = rpc
+        .submit_block(block, None)
+        .await
+        .expect_err("an expired node must reject a full block submitted for mining");
+    assert!(error.message().contains("last supported height (100)"));
+    verifier.expect_no_requests().await;
+
+    assert_eq!(rpc.get_block_template(None).await.unwrap_err(), error);
+    assert_eq!(
+        rpc.submit_solution(SubmitSolutionParameters {
+            work_id: String::new(),
+            header: HexData(vec![]),
+        })
+        .await
+        .unwrap_err(),
+        error
+    );
 }
 
 #[tokio::test]

@@ -1,12 +1,14 @@
 use eyre::eyre;
 use tokio_util::sync::CancellationToken;
-use zakura_chain::block;
+use zakura_chain::{block, parameters::Network};
 
 use super::{error_exit_status, supervise_block_sync_driver, NodeTasks, StartCmd};
+use crate::components::sync::end_of_support::{PastSupport, KEEP_RUNNING_FLAG};
 use crate::components::zcashd_compat;
 use crate::config::ZakuradConfig;
 use zakura_network::types::PeerServices;
 use zakura_network::P2pStack;
+use zakura_rpc::config::mining::{self, default_miner_address, MinerAddressType};
 use zakura_state::{PruningConfig, StorageMode};
 
 #[tokio::test]
@@ -83,6 +85,7 @@ fn zcashd_compat_flag_enables_mode() {
         filters: Vec::new(),
         zcashd_compat: true,
         unsafe_low_specs: false,
+        unsafe_ignore_end_of_support: false,
     };
     let mut config = ZakuradConfig::default();
     config.zcashd_compat.manage_zcashd = false;
@@ -100,6 +103,7 @@ fn zcashd_compat_config_enables_mode() {
         filters: Vec::new(),
         zcashd_compat: false,
         unsafe_low_specs: false,
+        unsafe_ignore_end_of_support: false,
     };
     let mut config = ZakuradConfig::default();
     config.zcashd_compat.enabled = true;
@@ -118,6 +122,7 @@ fn blocksync_throughput_probe_requires_v2_p2p() {
         filters: Vec::new(),
         zcashd_compat: false,
         unsafe_low_specs: false,
+        unsafe_ignore_end_of_support: false,
     };
     let mut config = ZakuradConfig::default();
     config.network.p2p_stack = P2pStack::Legacy;
@@ -136,11 +141,101 @@ fn blocksync_throughput_probe_requires_v2_p2p() {
 }
 
 #[test]
+fn the_end_of_support_halt_is_only_turned_off_by_its_flag() {
+    use clap::Parser;
+
+    let halting = StartCmd::try_parse_from(["start"]).expect("start needs no arguments");
+    assert_eq!(halting.past_support(), PastSupport::Halt);
+
+    let keeps_running = StartCmd::try_parse_from(["start", KEEP_RUNNING_FLAG])
+        .expect("the flag named in the warnings is a start flag");
+    assert_eq!(keeps_running.past_support(), PastSupport::KeepRunning);
+
+    // An embedded node starts from the default command, so it always halts.
+    assert_eq!(StartCmd::default().past_support(), PastSupport::Halt);
+}
+
+#[test]
+fn ignoring_the_end_of_support_is_refused_on_a_mining_node() {
+    let halting = StartCmd::default();
+    let keeps_running = StartCmd {
+        unsafe_ignore_end_of_support: true,
+        ..Default::default()
+    };
+    let mining_with_address = mining::Config {
+        miner_address: Some(
+            default_miner_address(Network::Mainnet.kind(), &MinerAddressType::Transparent)
+                .parse()
+                .expect("the default miner address is valid"),
+        ),
+        ..Default::default()
+    };
+    let refused = format!("{KEEP_RUNNING_FLAG} is not allowed on a mining node");
+
+    // Support only ends on Mainnet.
+    let mut config = ZakuradConfig::default();
+    config.network.network = Network::Mainnet;
+    keeps_running
+        .override_config(config.clone())
+        .expect("a node that does not mine can keep running");
+
+    // A node that can build block templates is a miner.
+    config.mining = mining_with_address.clone();
+    let error = keeps_running
+        .override_config(config.clone())
+        .expect_err("a node with a miner address keeps the halt");
+    assert!(
+        error.to_string().contains(&refused),
+        "unexpected error: {error}"
+    );
+
+    // So is a node that runs the internal miner, which needs the `internal-miner` feature.
+    config.mining = mining::Config {
+        internal_miner: true,
+        ..Default::default()
+    };
+    let result = keeps_running.override_config(config.clone());
+    if cfg!(feature = "internal-miner") {
+        let error = result.expect_err("a node with the internal miner keeps the halt");
+        assert!(
+            error.to_string().contains(&refused),
+            "unexpected error: {error}"
+        );
+    } else {
+        result.expect("a build without the internal miner does not mine");
+    }
+
+    // Miners start as long as they keep the halt.
+    config.mining = mining_with_address;
+    halting
+        .override_config(config.clone())
+        .expect("a mining node that keeps the halt is valid");
+
+    // Support does not end outside Mainnet, so there is no halt for a miner to keep.
+    config.network.network = Network::new_default_testnet();
+    config.mining = mining::Config {
+        miner_address: Some(
+            default_miner_address(
+                config.network.network.kind(),
+                &MinerAddressType::Transparent,
+            )
+            .parse()
+            .expect("the default miner address is valid"),
+        ),
+        ..Default::default()
+    };
+    keeps_running
+        .override_config(config)
+        .expect("a Testnet miner has no halt to keep");
+}
+
+#[test]
 fn announcing_a_gateway_requires_v2_p2p() {
     let cmd = StartCmd {
         filters: Vec::new(),
         zcashd_compat: false,
         unsafe_low_specs: false,
+        unsafe_ignore_end_of_support: false,
     };
     let mut config = ZakuradConfig::default();
     config.network.p2p_stack = P2pStack::Legacy;
@@ -228,6 +323,7 @@ fn vct_fast_sync_requires_checkpoint_sync_at_startup() {
         filters: Vec::new(),
         zcashd_compat: false,
         unsafe_low_specs: false,
+        unsafe_ignore_end_of_support: false,
     };
     let mut config = ZakuradConfig::default();
     config.consensus.checkpoint_sync = false;
@@ -250,6 +346,7 @@ fn vct_fast_sync_requires_checkpoint_sync_at_startup() {
         filters: Vec::new(),
         zcashd_compat: false,
         unsafe_low_specs: false,
+        unsafe_ignore_end_of_support: false,
     };
     let mut config = ZakuradConfig::default();
     config.consensus.checkpoint_sync = false;
@@ -265,6 +362,7 @@ fn block_gossip_peer_ips_require_zcashd_compat() {
         filters: Vec::new(),
         zcashd_compat: false,
         unsafe_low_specs: false,
+        unsafe_ignore_end_of_support: false,
     };
     let mut config = ZakuradConfig::default();
     config.zcashd_compat.block_gossip_peer_ips =
@@ -288,6 +386,7 @@ fn zcashd_compat_config_rejects_disabled_legacy_p2p() {
         filters: Vec::new(),
         zcashd_compat: false,
         unsafe_low_specs: false,
+        unsafe_ignore_end_of_support: false,
     };
     let mut config = ZakuradConfig::default();
     config.zcashd_compat.enabled = true;
@@ -311,6 +410,7 @@ fn zcashd_compat_config_rejects_peer_selection_extra_args() {
         filters: Vec::new(),
         zcashd_compat: false,
         unsafe_low_specs: false,
+        unsafe_ignore_end_of_support: false,
     };
     let mut config = ZakuradConfig::default();
     config.zcashd_compat.enabled = true;
@@ -333,6 +433,7 @@ fn zcashd_compat_manage_zcashd_requires_resolvable_path() {
         filters: Vec::new(),
         zcashd_compat: true,
         unsafe_low_specs: false,
+        unsafe_ignore_end_of_support: false,
     };
     let mut config = ZakuradConfig::default();
     config.zcashd_compat.manage_zcashd = true;
@@ -356,6 +457,7 @@ fn zcashd_compat_path_source_requires_explicit_path() {
         filters: Vec::new(),
         zcashd_compat: true,
         unsafe_low_specs: false,
+        unsafe_ignore_end_of_support: false,
     };
     let mut config = ZakuradConfig::default();
     config.zcashd_compat.manage_zcashd = true;
@@ -377,6 +479,7 @@ fn zcashd_compat_embedded_source_allows_missing_local_path() {
         filters: Vec::new(),
         zcashd_compat: true,
         unsafe_low_specs: false,
+        unsafe_ignore_end_of_support: false,
     };
     let mut config = ZakuradConfig::default();
     config.zcashd_compat.manage_zcashd = true;
@@ -393,6 +496,7 @@ fn zcashd_compat_config_manage_zcashd_requires_resolvable_path() {
         filters: Vec::new(),
         zcashd_compat: false,
         unsafe_low_specs: false,
+        unsafe_ignore_end_of_support: false,
     };
     let mut config = ZakuradConfig::default();
     config.zcashd_compat.enabled = true;

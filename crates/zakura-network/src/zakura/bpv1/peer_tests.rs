@@ -1343,13 +1343,27 @@ fn decision24_holder_flags_then_pushes_its_seeds_but_not_to_the_proposer() {
         .step(now, ready(block_id, vec![2], true))
         .outputs
         .is_empty());
+}
 
-    // The proposer's session gets no push.
+/// decision-32: a pushed seed this node got from another peer, or rebuilt,
+/// reaches the proposer as a plain `Have`, never as a push.
+#[test]
+fn decision32_a_pushed_seed_is_announced_to_the_proposer_not_pushed() {
+    let block_id = block::Hash([0x6D; 32]);
+    let now = Instant::now();
+
     let mut to_proposer = push_session(node_id(2), block_id);
-    assert!(to_proposer
-        .step(now, ready(block_id, vec![0], true))
-        .outputs
-        .is_empty());
+    assert_eq!(
+        to_proposer
+            .step(now, ready(block_id, vec![0], true))
+            .outputs,
+        vec![PeerOutput::SendHave {
+            block_id,
+            flags: HaveFlags::Plain,
+            indices: vec![0],
+        }]
+    );
+    to_proposer.assert_invariants();
 }
 
 /// 03 §5.4: when the peer announces or sends a part this node pushes to

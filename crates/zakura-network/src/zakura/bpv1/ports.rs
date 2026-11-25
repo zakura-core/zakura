@@ -209,8 +209,8 @@ pub trait BlockFallbackPort: Send + Sync + 'static {
     /// or released claim stays gone.
     fn extend(&self, hash: block::Hash, deadline: Instant) -> bool;
 
-    /// Releases `hash` with `reason`. `ClaimRelease::Fallback` and
-    /// `ClaimRelease::Repair` wake native block sync.
+    /// Releases `hash` with `reason`. Every reason but
+    /// `ClaimRelease::Committed` wakes native block sync.
     fn release(&self, hash: block::Hash, reason: ClaimRelease) -> bool;
 }
 
@@ -230,7 +230,9 @@ impl BlockFallbackPort for SharedBodyClaims {
             // A repair-round release wakes native block sync to race BPv1
             // (decision-22), as a fallback does.
             ClaimRelease::Fallback | ClaimRelease::Repair => BodyClaimRelease::Fallback,
-            ClaimRelease::Retired => BodyClaimRelease::Retired,
+            // A taken-over block's commit is still pending, so native block
+            // sync rechecks the height as if BPv1 never claimed it.
+            ClaimRelease::Retired | ClaimRelease::Proposed => BodyClaimRelease::Retired,
         };
         SharedBodyClaims::release(self, hash, mapped)
     }

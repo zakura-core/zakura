@@ -246,6 +246,10 @@ pub enum ClaimRelease {
     Repair,
     /// Retired / consensus-invalid / evicted.
     Retired,
+    /// This node solved the block and took over a peer's copy (bpv1-88). It
+    /// holds no claim, like a block it admitted first, so block sync can
+    /// fetch the body if this node's own commit fails.
+    Proposed,
 }
 
 /// Decoded `HeaderMeta` envelope presented to [`BlockTable`].
@@ -2859,12 +2863,13 @@ impl BlockTable {
         }
         step.events
             .push(BlockEvent::ProposerTakeover { block_id, from });
-        // This node holds the body and commits it itself, so block sync
-        // need not fetch it.
+        // A block this node admitted first holds no claim. The commit is
+        // still pending, so the release wakes block sync, which fetches the
+        // body only if the commit fails.
         if std::mem::take(&mut block.body_claimed) {
             step.outputs.push(BlockOutput::ReleaseBodyClaim {
                 block_id,
-                reason: ClaimRelease::Committed,
+                reason: ClaimRelease::Proposed,
             });
         }
         step.outputs.push(BlockOutput::PublishAdmitted {

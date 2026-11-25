@@ -2151,13 +2151,13 @@ fn bpv1_88_a_solved_block_takes_over_the_peer_copy_in_every_phase() {
                 .filter(|o| matches!(
                     o,
                     BlockOutput::ReleaseBodyClaim {
-                        reason: ClaimRelease::Committed,
+                        reason: ClaimRelease::Proposed,
                         ..
                     }
                 ))
                 .count(),
             usize::from(claimed),
-            "{copy:?}: this node holds the body, so a live claim is released as committed"
+            "{copy:?}: a live claim is released with a reason that wakes block sync"
         );
         let published: Vec<&AdmittedBlock> = took
             .outputs

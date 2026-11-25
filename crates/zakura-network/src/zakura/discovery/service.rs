@@ -1023,23 +1023,23 @@ mod tests {
 
     /// The discovery budget holds each row's term exactly.
     ///
-    /// Receive: 42 `Hello`s of 753 bytes (the bucket for a 15-second sender),
+    /// Receive: 42 `Hello`s of 8,649 bytes (the bucket for a 15-second sender),
     /// one `GetPeers` of 8,470 bytes and one `GetServices` of 1,090 bytes
-    /// from the peer, and one `Peers` of 24,098 bytes and one `Services` of
+    /// from the peer, and one `Peers` of 276,770 bytes and one `Services` of
     /// 2,394 bytes answering this node. Output: two of each largest answer,
     /// frame headers included.
     #[test]
     fn the_discovery_budget_holds_each_row() {
-        let receive = 42 * 753 + 8_470 + 1_090 + 24_098 + 2_394;
-        let output = 2 * (24_098 + 8) + 2 * (2_394 + 8);
+        let receive = 42 * 8_649 + 8_470 + 1_090 + 276_770 + 2_394;
+        let output = 2 * (276_770 + 8) + 2 * (2_394 + 8);
         assert_eq!(
             DISCOVERY_BUDGET,
             ReactorBudget {
-                receive: 67_678,
-                output: 53_016,
+                receive: 651_982,
+                output: 558_360,
             }
         );
-        assert_eq!((receive, output), (67_678, 53_016));
+        assert_eq!((receive, output), (651_982, 558_360));
     }
 
     #[test]

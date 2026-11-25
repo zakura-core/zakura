@@ -57,11 +57,78 @@ pub const MSG_DISCOVERY_GET_SERVICES: u8 = 4;
 /// First-party live service summary response.
 pub const MSG_DISCOVERY_SERVICES: u8 = 5;
 
-/// Maximum bytes in an encoded node record body, its extension area included.
+/// The largest fields of a node record body: the longest key list, the
+/// protocol range, network, chain, sequence and expiry, and
+/// [`MAX_DIRECT_ADDRS_PER_RECORD`] IPv6 addresses and
+/// [`MAX_SERVICES_PER_RECORD`] maximal service ids.
+pub const MAX_NODE_RECORD_FIELDS_BYTES: usize = 685;
+
+/// The header of one extension in a record's extension area: a `u16` type
+/// and a `u16` length.
+const RECORD_EXTENSION_HEADER_BYTES: usize = 2 + 2;
+
+/// An ML-DSA-87 public key and signature (FIPS 204, table 2), the largest
+/// of the three ML-DSA parameter sets.
+const ML_DSA_87_KEY_BYTES: usize = 2_592;
+const ML_DSA_87_SIGNATURE_BYTES: usize = 4_627;
+
+/// An SLH-DSA-128s public key and signature (FIPS 205, table 2), the
+/// parameter sets with the smallest SLH-DSA signature.
+const SLH_DSA_128S_KEY_BYTES: usize = 32;
+const SLH_DSA_128S_SIGNATURE_BYTES: usize = 7_856;
+
+/// Room in a record's extension area that this release keeps free for a
+/// second record signature: two extensions, one whose value is a public key
+/// and one whose value is its signature, sized for SLH-DSA-128s. An
+/// ML-DSA-87 key and signature fit in the same room.
 ///
-/// The fixed fields with [`MAX_DIRECT_ADDRS_PER_RECORD`] IPv6 addresses and
-/// [`MAX_SERVICES_PER_RECORD`] maximal service ids fill it exactly.
-pub const MAX_NODE_RECORD_BODY_BYTES: usize = 685;
+/// A record is signed with Ed25519 alone, and nothing in this release reads
+/// or writes a second signature. The room exists because it can't be added
+/// later. A node refuses a record body above [`MAX_NODE_RECORD_BODY_BYTES`],
+/// so a release that wanted a post-quantum record signature would need a
+/// larger body, which every node of this release would drop. With the room
+/// here, that release puts the key and the signature in the extension area.
+/// A node of this release keeps the area byte for byte, checks the Ed25519
+/// signature over it, and relays the record unchanged.
+///
+/// Why the key as well: a record's key list holds every key but the Ed25519
+/// one as a 32-byte fingerprint, and a reader has to verify a relayed record
+/// without asking its author for anything. A signature it can't check
+/// against a full key would protect nothing, so the room holds both.
+///
+/// Why this size:
+/// - It fits ML-DSA at every level. An ML-DSA-87 key and signature take
+///   7,227 bytes with their headers, and the ML-DSA-65 pair that matches the
+///   handshake's key takes 5,269. A later release can sign records at the
+///   handshake's level or raise it without changing this limit, which would
+///   again be a break.
+/// - It fits SLH-DSA-128s, which takes 7,896 bytes and sets the size.
+///   SLH-DSA rests on hash functions alone. The likeliest reason to replace
+///   a record signature is a break of the lattice schemes, and room that fit
+///   only ML-DSA would not cover it. This costs 669 bytes over ML-DSA-87.
+/// - It does not fit the larger SLH-DSA parameter sets. Their smallest
+///   signature after 128s is 16,224 bytes, which would double the room.
+///
+/// What it costs: any node may fill the area in its own records, so every
+/// bound that scales with a record grows now, not when a signature arrives.
+/// The largest record goes from 753 to 8,649 bytes and a full `Peers`
+/// answer from 24,098 to 276,770 bytes. The row for this limit in
+/// `docs/changelog/params.md` lists the memory bounds that follow.
+pub const RECORD_SIGNATURE_EXTENSION_BYTES: usize =
+    2 * RECORD_EXTENSION_HEADER_BYTES + SLH_DSA_128S_KEY_BYTES + SLH_DSA_128S_SIGNATURE_BYTES;
+
+const _: () = assert!(
+    2 * RECORD_EXTENSION_HEADER_BYTES + ML_DSA_87_KEY_BYTES + ML_DSA_87_SIGNATURE_BYTES
+        <= RECORD_SIGNATURE_EXTENSION_BYTES
+);
+
+/// Maximum bytes in an encoded node record body, its extension area included:
+/// the largest fields and the room of [`RECORD_SIGNATURE_EXTENSION_BYTES`].
+///
+/// The bound is on the whole body. A record with shorter fields may use the
+/// difference for other extensions.
+pub const MAX_NODE_RECORD_BODY_BYTES: usize =
+    MAX_NODE_RECORD_FIELDS_BYTES + RECORD_SIGNATURE_EXTENSION_BYTES;
 /// Maximum bytes in an encoded node record: its length, body, and signature.
 pub const MAX_NODE_RECORD_BYTES: usize = 4 + MAX_NODE_RECORD_BODY_BYTES + SIGNATURE_BYTES;
 /// Maximum direct addresses in a node record.
@@ -5931,6 +5998,123 @@ mod tests {
             mutated.verify(&context()),
             Err(DiscoveryRecordError::InvalidSignature)
         ));
+    }
+
+    /// The room the body cap keeps for a second record signature holds an
+    /// SLH-DSA-128s key and signature beside the largest fields, and a
+    /// record that uses all of it is exactly as long as a record may be.
+    /// This release does not know the extensions. It still verifies the
+    /// record, relays it byte for byte, serves it from the book and restores
+    /// it from the book file, which is what lets a later release put a
+    /// signature there without a break. One byte more is refused.
+    #[test]
+    fn a_key_and_signature_fit_beside_the_largest_fields() {
+        use super::super::book_file::DiscoveryBookFile;
+
+        // The longest key list: the signer's two keys and two entries this
+        // release cannot read.
+        let signer = secret_key();
+        let own = |tag| (tag, signer.credential().key(tag).unwrap().to_vec());
+        let credential = NodeCredential::from_entries([
+            own(ED25519_KEY_TAG),
+            own(ML_DSA_65_KEY_TAG),
+            (UNREADABLE_KEY_TAG, vec![0x55; 1_312]),
+            (UNREADABLE_KEY_TAG + 1, vec![0x66; 1_312]),
+        ])
+        .expect("four entries in increasing tag order are a valid credential");
+        let signer = signer
+            .with_credential(credential)
+            .expect("the credential holds the signer's own keys");
+
+        let mut body = body(&signer);
+        body.direct_addrs = (1..=MAX_DIRECT_ADDRS_PER_RECORD)
+            .map(|index| {
+                let host = u16::try_from(index).expect("a record holds a few addresses");
+                SocketAddr::new(
+                    IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, host)),
+                    8233,
+                )
+            })
+            .collect();
+        body.services = (0..MAX_SERVICES_PER_RECORD)
+            .map(|index| {
+                ZakuraServiceId::new(format!("zakura.test.{index:017}.v1"))
+                    .expect("a 32-byte service id is valid")
+            })
+            .collect();
+        let mut fields = Vec::new();
+        write_record_body(&body, &mut fields);
+        assert_eq!(fields.len(), MAX_NODE_RECORD_FIELDS_BYTES);
+
+        // Two extensions this release does not know, types 0x7002 and
+        // 0x7003, with values as long as an SLH-DSA-128s key and signature.
+        // FIPS 205 gives the lengths, restated here so the test does not
+        // take them from the constant it checks.
+        let mut extension = 0x7002u16.to_le_bytes().to_vec();
+        extension.extend_from_slice(&32u16.to_le_bytes());
+        extension.extend_from_slice(&[0xbc; 32]);
+        extension.extend_from_slice(&0x7003u16.to_le_bytes());
+        extension.extend_from_slice(&7_856u16.to_le_bytes());
+        extension.extend_from_slice(&[0xcd; 7_856]);
+        assert_eq!(extension.len(), RECORD_SIGNATURE_EXTENSION_BYTES);
+        // An ML-DSA-87 key and signature (FIPS 204) need less.
+        assert!(4 + 2_592 + 4 + 4_627 <= RECORD_SIGNATURE_EXTENSION_BYTES);
+        body.extensions = extension.clone();
+
+        let mut too_long = body.clone();
+        too_long.extensions.push(0);
+        assert!(matches!(
+            ZakuraNodeRecord::sign(too_long, &signer),
+            Err(DiscoveryWireError::OversizedPayload { .. })
+        ));
+
+        let record = ZakuraNodeRecord::sign(body, &signer).expect("the largest record signs");
+        assert_eq!(record_len(&record), MAX_NODE_RECORD_BYTES);
+        record
+            .verify(&context())
+            .expect("the Ed25519 signature covers the extension");
+
+        let encoded = DiscoveryMessage::Hello {
+            record: record.clone(),
+        }
+        .encode()
+        .expect("the largest record encodes");
+        let DiscoveryMessage::Hello { record: relayed } =
+            DiscoveryMessage::decode(&encoded).expect("the largest record decodes")
+        else {
+            panic!("expected a hello message");
+        };
+        assert_eq!(relayed.body.extensions, extension);
+        assert_eq!(
+            DiscoveryMessage::Hello { record: relayed }
+                .encode()
+                .expect("the relayed record encodes"),
+            encoded,
+            "a relayed record is byte-identical"
+        );
+
+        let node_id = record.body.node_id();
+        let mut book = ZakuraDiscoveryBook::default();
+        import_confirmed_record(&mut book, record.clone()).expect("the largest record imports");
+        assert_eq!(
+            book.sample_peers(1, &[], &[], NOW, test_requester()),
+            [record.clone()],
+            "a `Peers` answer serves the stored record unchanged"
+        );
+        book.mark_dial_success(&node_id, None, NOW);
+        let dir = tempfile::tempdir().unwrap();
+        let file = DiscoveryBookFile::new(dir.path().join("book"));
+        file.store(book.persisted_entries(), NOW).unwrap();
+        let mut reloaded = ZakuraDiscoveryBook::default();
+        let outcome = reloaded.import_persisted_entries(file.load(), NOW, &context());
+        assert_eq!((outcome.added, outcome.rejected), (1, 0));
+        assert_eq!(
+            reloaded
+                .get(&node_id)
+                .expect("the saved record reloads")
+                .record(),
+            &record
+        );
     }
 
     /// A record body this release cannot decode fails the whole `Peers`

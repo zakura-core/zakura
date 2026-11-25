@@ -1,6 +1,6 @@
 # Spec: `zakura-quic` transport
 
-Status: draft for review, 2026-11-25. Version 0.31.
+Status: draft for review, 2026-11-25. Version 0.32.
 This document is authoritative for the `zakura-quic` crate, its configuration,
 its wire behavior and its `quinn-proto` dependency policy.
 [Decision 0003](../decisions/zakura/0003-zakura-quic-transport.md) records the
@@ -80,6 +80,9 @@ key, and lets a credential carry a key as its fingerprint alone, so a later
 signature scheme doesn't change every node ID twice; it adds DIAL-9 and
 COMPAT-13, changes DIAL-1, ID-9, ID-12, TLS-4, TLS-7, TLS-8, API-1, API-4,
 SEC-2 and §16, and §17ac lists each change.
+Version 0.32 keeps room in a discovery record for a second, post-quantum
+signature, so a later release can add one without a break; it changes
+CTRL-26 and COMPAT-13, and §17ad lists each change.
 
 ## 0. Conventions
 
@@ -993,8 +996,8 @@ IPv4 address or global IPv6 /64, ADM-3),
   negotiates its streams, the application raises its receive window once
   (API-9) by the receive share of each stream kind it negotiated, so an
   admitted connection holds that window plus `send_window_bytes`:
-  146,204,963 B at the defaults on Mainnet and Testnet with `tx-relay`
-  registered, and 141,945,123 B without it. Per-stream receive
+  146,789,267 B at the defaults on Mainnet and Testnet with `tx-relay`
+  registered, and 142,529,427 B without it. Per-stream receive
   windows sit inside the connection window and add nothing.
   `zakura_quic::connection_memory_bytes` is the only implementation of the
   handshake cost, and `ConnectionMemory` in `zakura-network` of the admitted
@@ -1006,7 +1009,7 @@ IPv4 address or global IPv6 /64, ADM-3),
   peer_memory_budget_bytes`, one socket queue per bound socket and
   `max_pending_handshakes` connections at the handshake cost. The rest
   divided by the admitted connection's cost is the number of connections it
-  can fund, 108 at Mainnet defaults with one socket. Ordinary peers take
+  can fund, 107 at Mainnet defaults with one socket. Ordinary peers take
   priority up to `max_connections` (92 by default). Up to ten more places
   can be used by preferred gateways if the remaining memory funds them. ADM-12 holds the transport to the
   admitted cap plus the handshake headroom, so every
@@ -1419,6 +1422,27 @@ this release tolerates, and keep each hard change explicit.
   key keeps its entry as a fingerprint, so a node ID's line can take two
   more keys. A key longer than 2,592 bytes is refused (ID-12). An upgrade
   that needs more than either is a hard break (COMPAT-8).
+
+  A discovery record is a separate case. It carries one Ed25519 signature
+  (ID-11), and this release's readers refuse a record without an Ed25519
+  key or with a body above the cap, so the handshake's path doesn't reach
+  it. A record also holds every other key as a fingerprint (ID-8), and its
+  reader verifies it offline (ID-7), so a second signature is of use only
+  with its full key beside it. This release therefore keeps 7,896 bytes of
+  a record's extension area free: room for two extensions, a public key
+  and its signature, sized for SLH-DSA-128s. An ML-DSA key and signature
+  of any level fit in the same room. The peer message regulation spec sets
+  the cap and gives the reasons for the size. A later release that wants a
+  post-quantum record signature adds the key and the signature there, and
+  a node of this release still verifies the Ed25519 signature over the
+  whole body and relays the record byte for byte. That release has to:
+  - raise a record's sequence when it adds the signature, because a node
+    keeps the copy it has of a record with the same sequence;
+  - decide when a node refuses a record without the second signature,
+    because whoever can forge the Ed25519 signature can also leave the
+    extensions out;
+  - keep the Ed25519 signature for as long as nodes of this release are to
+    read the record.
 
 ## 14. Security
 
@@ -2355,3 +2379,24 @@ Changed:
 - **§16.** Tests for the earlier-ID dial and its refusals, fingerprint-only
   entries, the largest credential's handshake, and the dialer's handling of
   a moved node.
+
+## 17ad. Changes in version 0.32
+
+A discovery record is signed with Ed25519 alone, and a node refuses a
+record body above a fixed cap. Version 0.31 left that cap at the size of a
+record's fields, so a later release could not add a post-quantum signature
+to a record without every node of this release dropping it. This version
+raises the cap by 7,896 bytes, the room for two extensions that hold an
+SLH-DSA-128s key and signature, which an ML-DSA key and signature of any
+level also fit. Nothing reads or writes such a signature yet. No release
+has spoken `p2p-v2/5` with the smaller cap, so the ALPN doesn't move.
+
+Changed:
+
+- **CTRL-26.** A record may be 8,649 bytes, not 753, which raises
+  discovery's receive share and so an admitted connection's memory by
+  584,304 B, to 146,789,267 B at the defaults. The default
+  `peer_memory_budget_bytes` of 17 GiB can fund 107 connections at Mainnet
+  defaults, not 108, and still funds the default connection count of 102.
+- **COMPAT-13.** States what the room is for and what the release that
+  uses it has to do.

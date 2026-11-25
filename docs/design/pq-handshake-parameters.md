@@ -94,8 +94,10 @@ The last column is the ML-DSA-87 draft, for comparison (§5).
 
 Each side sends its credential and a signature, because both sides
 authenticate (TLS-5). A handshake moves about 17.5 KB, in place of about
-12.5 KB on `p2p-v2/4` and 21.4 KB with ML-DSA-87. Discovery records don't
-grow: they carry each key as a 32-byte fingerprint (ID-8).
+12.5 KB on `p2p-v2/4` and 21.4 KB with ML-DSA-87. The keys don't make a
+discovery record grow: it carries each as a 32-byte fingerprint (ID-8). The
+largest record a node accepts does grow, from 753 to 8,649 bytes, to keep
+room for a later post-quantum record signature and its key (COMPAT-13).
 
 The listener's figures vary by a few bytes between runs, with the size of
 its acknowledgements: its first flight measured 7,861 to 7,873 bytes.

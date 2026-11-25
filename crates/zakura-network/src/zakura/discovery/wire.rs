@@ -20,10 +20,10 @@ use super::protocol::{
     Services, ZakuraDiscoveryPersistedEntry, ZakuraNodeRecord, ZakuraNodeRecordBody,
     ZakuraServiceId, MAX_DIRECT_ADDRS_PER_RECORD, MAX_DISCOVERY_EXCLUDED_NODE_IDS,
     MAX_DISCOVERY_RECORDS_PER_RESPONSE, MAX_GET_PEERS_WANTED_SERVICES, MAX_GET_SERVICES_WANTED,
-    MAX_NODE_RECORD_BODY_BYTES, MAX_NODE_RECORD_BYTES, MAX_SERVICES_PER_RECORD,
-    MAX_SERVICE_SUMMARIES_PER_RESPONSE, MAX_SERVICE_SUMMARY_BYTES, MAX_ZAKURA_SERVICE_ID_BYTES,
-    MSG_DISCOVERY_GET_PEERS, MSG_DISCOVERY_GET_SERVICES, MSG_DISCOVERY_HELLO, MSG_DISCOVERY_PEERS,
-    MSG_DISCOVERY_SERVICES,
+    MAX_NODE_RECORD_BODY_BYTES, MAX_NODE_RECORD_BYTES, MAX_NODE_RECORD_FIELDS_BYTES,
+    MAX_SERVICES_PER_RECORD, MAX_SERVICE_SUMMARIES_PER_RESPONSE, MAX_SERVICE_SUMMARY_BYTES,
+    MAX_ZAKURA_SERVICE_ID_BYTES, MSG_DISCOVERY_GET_PEERS, MSG_DISCOVERY_GET_SERVICES,
+    MSG_DISCOVERY_HELLO, MSG_DISCOVERY_PEERS, MSG_DISCOVERY_SERVICES,
 };
 use crate::zakura::{
     regulation::ResponseCap,
@@ -133,14 +133,15 @@ pub(crate) fn services_cap(wanted_len: usize) -> ResponseCap {
     }
 }
 
-// The body cap leaves no extension room in a record with the longest key list
-// and the most and largest addresses and services.
+// A record with the longest key list and the most and largest addresses and
+// services fills the fields' share of the body cap exactly, which leaves it
+// the room reserved for a second signature and no more.
 const _: () = assert!(
     MAX_NODE_KEY_LIST_BYTES
         + RECORD_BODY_FIELDS_BYTES
         + MAX_DIRECT_ADDRS_PER_RECORD * SOCKET_ADDR_V6_BYTES
         + MAX_SERVICES_PER_RECORD * SERVICE_ID_MAX_BYTES
-        == MAX_NODE_RECORD_BODY_BYTES
+        == MAX_NODE_RECORD_FIELDS_BYTES
 );
 
 const fn row(

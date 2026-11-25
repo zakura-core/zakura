@@ -57,8 +57,7 @@ proptest! {
         change in 1..=u8::MAX,
     ) {
         let mut script = MinerMeshCommitment::new(gateway_id)
-            .to_output()
-            .lock_script
+            .lock_script()
             .as_raw_bytes()
             .to_vec();
         script[index] ^= change;

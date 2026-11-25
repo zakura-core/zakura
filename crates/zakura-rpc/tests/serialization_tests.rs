@@ -1243,6 +1243,7 @@ fn test_get_block_template_response() -> Result<(), Box<dyn std::error::Error>> 
         })
         .collect::<Vec<_>>();
     let coinbase_txn = template.coinbase_txn().clone();
+    let miner_mesh_output = template.miner_mesh_output().clone();
     // We manually checked all LongPollId fields are extractable
     let long_poll_id = template.long_poll_id();
     let target = template.target().bytes_in_display_order();
@@ -1268,6 +1269,7 @@ fn test_get_block_template_response() -> Result<(), Box<dyn std::error::Error>> 
         default_roots,
         transactions,
         coinbase_txn,
+        miner_mesh_output,
         long_poll_id,
         ExpandedDifficulty::from_bytes_in_display_order(&target),
         min_time.into(),

@@ -1,0 +1,48 @@
+---
+source: crates/zakura-rpc/src/methods/tests/snapshot.rs
+expression: block_template
+---
+{
+  "capabilities": [
+    "proposal",
+    "submitsolution"
+  ],
+  "version": 4,
+  "previousblockhash": "0000000000d723156d9b65ffcf4984da7a19675ed7e2f06d9e5d5188af087bf8",
+  "blockcommitmentshash": "f91d98678ef910b7465018492016677b924b19d20fcdfb6ff723563828574306",
+  "lightclientroothash": "f91d98678ef910b7465018492016677b924b19d20fcdfb6ff723563828574306",
+  "finalsaplingroothash": "f91d98678ef910b7465018492016677b924b19d20fcdfb6ff723563828574306",
+  "defaultroots": {
+    "merkleroot": "ba8ac5b23edfd7ec67022a2d554851c2f1ded2d8f2484059bc1c4d33d8caa9c6",
+    "chainhistoryroot": "03bc75f00c307a05aed2023819e18c2672cbe15fbd3200944997def141967387",
+    "authdataroot": "0fde1393e62dad8d6f56267b26e8204954ca3faa8a6ca7e5830d9f1ae1acc320",
+    "blockcommitmentshash": "f91d98678ef910b7465018492016677b924b19d20fcdfb6ff723563828574306"
+  },
+  "transactions": [],
+  "coinbasetxn": {
+    "data": "050000800a27a726b4d0d6c200000000f51c1c00010000000000000000000000000000000000000000000000000000000000000000ffffffff0903f51c1c04f09f8cb8ffffffff0580b2e60e0000000017a9147e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e87286bee000000000017a9140c0bcca02f3cba01a5d7423ac3903d40586399eb8738c94d010000000017a9144e3f0d9a33a2721604cbae2de8d9171e21f8fbe48740787d010000000017a91471e1df05024288a00802de81e08c437859586c87870000000000000000196a174d52015a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a000000",
+    "hash": "ba8ac5b23edfd7ec67022a2d554851c2f1ded2d8f2484059bc1c4d33d8caa9c6",
+    "authdigest": "0fde1393e62dad8d6f56267b26e8204954ca3faa8a6ca7e5830d9f1ae1acc320",
+    "depends": [],
+    "fee": 0,
+    "sigops": 0,
+    "required": true
+  },
+  "minermeshoutput": "6a174d52015a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+  "longpollid": "00018424203eab7f731654008728000000000000000000",
+  "target": "0555540000000000000000000000000000000000000000000000000000000000",
+  "mintime": 1654008606,
+  "mutable": [
+    "time",
+    "transactions",
+    "prevblock"
+  ],
+  "noncerange": "00000000ffffffff",
+  "sigoplimit": 20000,
+  "sizelimit": 2000000,
+  "curtime": 1654008617,
+  "bits": "20055554",
+  "height": 1842421,
+  "maxtime": 1654008728,
+  "workid": "[WorkId]"
+}

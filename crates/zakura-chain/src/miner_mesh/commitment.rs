@@ -65,10 +65,15 @@ impl MinerMeshCommitment {
         payload
     }
 
+    /// Returns the lock script of the output that carries this commitment:
+    /// the opcodes, then the [payload](Self::payload).
+    pub fn lock_script(&self) -> Script {
+        Script::new(&[SCRIPT_OPCODES.as_slice(), &self.payload()].concat())
+    }
+
     /// Returns the coinbase output that carries this commitment.
     pub fn to_output(&self) -> Output {
-        let script = [SCRIPT_OPCODES.as_slice(), &self.payload()].concat();
-        Output::new(Amount::zero(), Script::new(&script))
+        Output::new(Amount::zero(), self.lock_script())
     }
 
     /// Returns the commitment in a coinbase transaction's `outputs`.

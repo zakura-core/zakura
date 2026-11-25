@@ -44,6 +44,7 @@ use zakura_chain::{
     },
     serialization::DateTime32,
     transaction::VerifiedUnminedTx,
+    transparent::Script,
     work::difficulty::{CompactDifficulty, ExpandedDifficulty},
 };
 use zcash_script::{opcode::PushValue, pv::push_value};
@@ -398,6 +399,21 @@ pub struct BlockTemplateResponse {
     #[getset(get = "pub")]
     pub(crate) coinbase_txn: TransactionTemplate<amount::NegativeOrZero>,
 
+    /// The lock script of the miner mesh output, which names the gateway node
+    /// other miners can connect to. Present only when this node announces one.
+    ///
+    /// The output's value is always zero. `coinbasetxn` already has this
+    /// output, so a pool that submits `coinbasetxn`'s outputs adds nothing. A
+    /// pool that builds its own coinbase outputs adds exactly one zero-value
+    /// output with this lock script.
+    ///
+    /// This field is not in `zcashd` or the Zcash RPC reference.
+    #[serde(rename = "minermeshoutput")]
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[getset(get = "pub")]
+    pub(crate) miner_mesh_output: Option<Script>,
+
     /// An ID that represents the chain tip and mempool contents for this template.
     #[serde(rename = "longpollid")]
     #[getset(get_copy = "pub")]
@@ -514,6 +530,7 @@ impl fmt::Debug for BlockTemplateResponse {
             .field("transaction_count", &self.transactions.len())
             .field("transactions", &transactions_truncated)
             .field("coinbase_txn", &self.coinbase_txn)
+            .field("miner_mesh_output", &self.miner_mesh_output)
             .field("long_poll_id", &self.long_poll_id)
             .field("target", &self.target)
             .field("min_time", &self.min_time)
@@ -688,6 +705,12 @@ impl BlockTemplateResponse {
             transactions: mempool_tx_templates,
 
             coinbase_txn,
+
+            // The coinbase came from the same `miner_params`, whether it was
+            // built here or precomputed, so it carries this output.
+            miner_mesh_output: miner_params
+                .mesh_commitment()
+                .map(|commitment| commitment.lock_script()),
 
             long_poll_id,
 

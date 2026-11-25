@@ -38,14 +38,18 @@ fn zero_value_output(script: &[u8]) -> Output {
 }
 
 fn commitment_script() -> Vec<u8> {
-    commitment().to_output().lock_script.as_raw_bytes().to_vec()
+    commitment().lock_script().as_raw_bytes().to_vec()
 }
 
 #[test]
 fn output_has_the_documented_bytes() {
     let output = commitment().to_output();
 
-    assert_eq!(hex::encode(output.lock_script.as_raw_bytes()), SCRIPT_HEX);
+    assert_eq!(
+        hex::encode(commitment().lock_script().as_raw_bytes()),
+        SCRIPT_HEX
+    );
+    assert_eq!(output.lock_script, commitment().lock_script());
     assert_eq!(output.value, Amount::<NonNegative>::zero());
     assert_eq!(
         commitment().payload().as_slice(),

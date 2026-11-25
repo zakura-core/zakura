@@ -8,7 +8,7 @@
 //! It holds values only: no locks, channels, tasks, or I/O handles. In
 //! production the IO layer wraps `BlockTable` in a short non-awaited `Mutex`.
 
-use std::{sync::Arc, time::Duration};
+use std::{collections::VecDeque, sync::Arc, time::Duration};
 
 use zakura_chain::block;
 use zakura_quic::NodeId;
@@ -906,27 +906,29 @@ impl PendingMetaEntry {
 /// marker until the table rejects or admits the block.
 ///
 /// The block id hashes only the header, so a later copy may carry another
-/// binding, coding, or part root. The table keeps one alternate envelope: the
-/// first later copy that differs from the entry's envelope. The alternate is
-/// charged to the budget of the stage that holds the entry, and it gives way
-/// before any first copy is refused. If the first copy fails its commitment
-/// check, the alternate gets its own check before the table answers its
-/// senders (bpv1-61).
+/// binding, coding, or part root. The table keeps each differing copy as an
+/// alternate envelope, in arrival order, while it fits the budget of the
+/// stage that holds the entry. Alternates use only room that no first copy
+/// needs. If the entry's envelope fails its commitment check, the oldest
+/// alternate gets its own check before the table answers its senders
+/// (bpv1-61). So invalid copies displace an honest relay's copy only by
+/// filling that room.
 #[derive(Clone, Debug, Default)]
 struct LaterCopies {
     /// Sessions whose copy equals the entry's envelope.
     same: Vec<(NodeId, u64)>,
-    /// The alternate envelope, and the sessions whose copy equals it.
-    alternate: Option<(Box<MetaEnvelope>, Vec<(NodeId, u64)>)>,
-    /// Sessions whose copy matched neither kept envelope. The table did not
-    /// keep their copies, so it cannot check them.
+    /// The alternate envelopes, oldest first, each with the sessions whose
+    /// copy equals it.
+    alternates: VecDeque<(Box<MetaEnvelope>, Vec<(NodeId, u64)>)>,
+    /// Sessions whose copy matched no kept envelope. The table did not keep
+    /// their copies, so it cannot check them.
     unkept: Vec<(NodeId, u64)>,
 }
 
 impl LaterCopies {
-    /// Records `sender`'s `copy` beside the entry's `envelope`. A differing
-    /// copy becomes the alternate if none is kept and it fits in `room`
-    /// bytes. Returns the bytes the alternate now charges.
+    /// Records `sender`'s `copy` beside the entry's `envelope`. A new
+    /// differing copy becomes an alternate if it fits in `room` bytes.
+    /// Returns the bytes the new alternate charges.
     fn record(
         &mut self,
         envelope: &MetaEnvelope,
@@ -938,50 +940,64 @@ impl LaterCopies {
             self.same.push(sender);
             return 0;
         }
-        match &mut self.alternate {
-            Some((alternate, senders)) if **alternate == *copy => senders.push(sender),
-            None if copy.estimated_bytes() <= room => {
-                let bytes = copy.estimated_bytes();
-                self.alternate = Some((copy, vec![sender]));
-                return bytes;
-            }
-            _ => self.unkept.push(sender),
+        if let Some((_, senders)) = self.alternates.iter_mut().find(|(alt, _)| **alt == *copy) {
+            senders.push(sender);
+            return 0;
         }
-        0
+        let bytes = copy.estimated_bytes();
+        if bytes > room {
+            self.unkept.push(sender);
+            return 0;
+        }
+        self.alternates.push_back((copy, vec![sender]));
+        bytes
     }
 
-    /// Bytes the alternate envelope charges.
+    /// Bytes the alternate envelopes charge.
     fn alternate_bytes(&self) -> usize {
-        self.alternate
-            .as_ref()
-            .map_or(0, |(envelope, _)| envelope.estimated_bytes())
+        self.alternates
+            .iter()
+            .map(|(envelope, _)| envelope.estimated_bytes())
+            .sum()
     }
 
-    /// Drops the alternate envelope, so its senders become unkept. Returns
-    /// the bytes it freed.
-    fn drop_alternate(&mut self) -> usize {
-        let freed = self.alternate_bytes();
-        if let Some((_, senders)) = self.alternate.take() {
-            self.unkept.extend(senders);
+    /// Drops the newest alternates until they charge at most `room` bytes.
+    /// Their senders become unkept. Returns the bytes freed.
+    fn keep_within(&mut self, room: usize) -> usize {
+        let mut freed = 0;
+        while self.alternate_bytes() > room {
+            let Some(dropped) = self.drop_alternate(self.alternates.len() - 1) else {
+                break;
+            };
+            freed += dropped;
         }
         freed
+    }
+
+    /// Drops the alternate at `position`, so its senders become unkept.
+    /// Returns the bytes it freed.
+    fn drop_alternate(&mut self, position: usize) -> Option<usize> {
+        let (envelope, senders) = self.alternates.remove(position)?;
+        self.unkept.extend(senders);
+        Some(envelope.estimated_bytes())
     }
 
     /// Every later session, whichever copy it sent.
     fn sessions(&self) -> impl Iterator<Item = (NodeId, u64)> + '_ {
         self.same
             .iter()
-            .chain(self.alternate.iter().flat_map(|(_, senders)| senders))
+            .chain(self.alternates.iter().flat_map(|(_, senders)| senders))
             .chain(&self.unkept)
             .copied()
     }
 }
 
-/// Drops alternate envelopes, largest first, until `needed` more bytes fit
-/// beside `used` under `cap` or none is left. Returns the bytes freed.
-/// Alternates use only room that no first copy needs.
-fn shed_alternates<'a>(
-    entries: impl Iterator<Item = (&'a block::Hash, &'a mut LaterCopies)>,
+/// Drops alternate envelopes from `entries`, largest first, until `needed`
+/// more bytes fit beside `used` under `cap` or none is left. Returns the
+/// bytes freed. Alternates use only room that no first copy needs.
+fn shed_alternates<E>(
+    entries: &mut HashMap<block::Hash, E>,
+    later: impl Fn(&mut E) -> &mut LaterCopies,
     used: usize,
     needed: usize,
     cap: usize,
@@ -989,17 +1005,31 @@ fn shed_alternates<'a>(
     if used.saturating_add(needed) <= cap {
         return 0;
     }
-    let mut held: Vec<(usize, block::Hash, &mut LaterCopies)> = entries
-        .filter(|(_, later)| later.alternate.is_some())
-        .map(|(id, later)| (later.alternate_bytes(), *id, later))
-        .collect();
-    held.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1 .0.cmp(&b.1 .0)));
+    let mut held: Vec<(usize, block::Hash, usize)> = Vec::new();
+    for (id, entry) in entries.iter_mut() {
+        for (position, (envelope, _)) in later(entry).alternates.iter().enumerate() {
+            held.push((envelope.estimated_bytes(), *id, position));
+        }
+    }
+    held.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| (a.1 .0, a.2).cmp(&(b.1 .0, b.2)))
+    });
+    let mut shed: Vec<(block::Hash, usize)> = Vec::new();
     let mut freed = 0;
-    for (_, _, later) in held {
+    for (bytes, id, position) in held {
         if used.saturating_sub(freed).saturating_add(needed) <= cap {
             break;
         }
-        freed += later.drop_alternate();
+        freed += bytes;
+        shed.push((id, position));
+    }
+    // Later positions first, so each removal leaves the earlier ones valid.
+    shed.sort_by(|a, b| (b.0 .0, b.1).cmp(&(a.0 .0, a.1)));
+    for (id, position) in shed {
+        if let Some(entry) = entries.get_mut(&id) {
+            later(entry).drop_alternate(position);
+        }
     }
     freed
 }
@@ -1772,39 +1802,31 @@ impl BlockTable {
         // Bound admitting count and bytes before queueing headerchain
         // admission. Pending metadata has its own budget, so headers with
         // unknown parents never take space from viable metadata (bpv1-75).
-        // Alternate envelopes give way to a first copy that fits without
-        // them.
+        // First copies compete only with first copies: alternate envelopes
+        // give way once the table admits this one.
         let needed = envelope.estimated_bytes();
-        let mut used = self.admitting_bytes();
+        let used = self.admitting_bytes();
         let alternates: usize = self
             .admitting
             .values()
             .map(|e| e.later.alternate_bytes())
             .sum();
-        if self.admitting.len() < MAX_ADMITTING_META_COUNT
-            && (used - alternates).saturating_add(needed) <= MAX_ADMITTING_META_BYTES
-        {
-            used -= shed_alternates(
-                self.admitting.iter_mut().map(|(id, e)| (id, &mut e.later)),
-                used,
-                needed,
-                MAX_ADMITTING_META_BYTES,
-            );
-        }
         if self.admitting.len() >= MAX_ADMITTING_META_COUNT
-            || used.saturating_add(needed) > MAX_ADMITTING_META_BYTES
+            || (used - alternates).saturating_add(needed) > MAX_ADMITTING_META_BYTES
         {
             reject_meta(step, block_id, from_peer, session_gen);
             reject_later(step, block_id, &later);
             return;
         }
-        if used
-            .saturating_add(needed)
-            .saturating_add(later.alternate_bytes())
-            > MAX_ADMITTING_META_BYTES
-        {
-            later.drop_alternate();
-        }
+        let used = used
+            - shed_alternates(
+                &mut self.admitting,
+                |e| &mut e.later,
+                used,
+                needed,
+                MAX_ADMITTING_META_BYTES,
+            );
+        later.keep_within(MAX_ADMITTING_META_BYTES.saturating_sub(used.saturating_add(needed)));
         let work_id = alloc_work_id(&mut self.next_work_id);
         let header_bytes = envelope.header_bytes.clone();
         self.admitting.insert(
@@ -1958,19 +1980,19 @@ impl BlockTable {
         let bytes = entry.envelope.estimated_bytes();
         let (held, _) = self.pending_held_by(entry.from_peer);
         let mut admit = held < MAX_PENDING_META_PER_PEER;
-        if admit {
-            // Alternate envelopes give way to a first copy, before any
-            // first copy is evicted.
-            self.pending_bytes -= shed_alternates(
-                self.pending.iter_mut().map(|(id, e)| (id, &mut e.later)),
-                self.pending_bytes,
-                bytes,
-                MAX_PENDING_META_BYTES,
-            );
-        }
+        // First copies compete only with first copies: alternate envelopes
+        // give way once the table admits this one.
+        let first_copy_bytes = |table: &Self| {
+            let alternates: usize = table
+                .pending
+                .values()
+                .map(|e| e.later.alternate_bytes())
+                .sum();
+            table.pending_bytes - alternates
+        };
         while admit
             && (self.pending.len() >= MAX_PENDING_META_COUNT
-                || self.pending_bytes.saturating_add(bytes) > MAX_PENDING_META_BYTES)
+                || first_copy_bytes(self).saturating_add(bytes) > MAX_PENDING_META_BYTES)
         {
             let (own_count, own_bytes) = self.pending_held_by(entry.from_peer);
             let after_insert = (own_count + 1, own_bytes.saturating_add(bytes));
@@ -2002,9 +2024,16 @@ impl BlockTable {
             reject_later(step, block_id, &entry.later);
             return;
         }
-        if self.pending_bytes.saturating_add(entry.charged_bytes()) > MAX_PENDING_META_BYTES {
-            entry.later.drop_alternate();
-        }
+        self.pending_bytes -= shed_alternates(
+            &mut self.pending,
+            |e| &mut e.later,
+            self.pending_bytes,
+            bytes,
+            MAX_PENDING_META_BYTES,
+        );
+        entry.later.keep_within(
+            MAX_PENDING_META_BYTES.saturating_sub(self.pending_bytes.saturating_add(bytes)),
+        );
         self.pending_bytes = self.pending_bytes.saturating_add(entry.charged_bytes());
         self.pending.insert(block_id, entry);
     }
@@ -2134,7 +2163,8 @@ impl BlockTable {
     }
 
     /// Closes every session that sent `entry`'s failed envelope with row 4,
-    /// then checks the alternate envelope, if the entry kept one (bpv1-61).
+    /// then checks the oldest alternate envelope, if the entry kept one
+    /// (bpv1-61). The other alternates wait behind it in arrival order.
     ///
     /// The commitment check is a pure function of the envelope and the
     /// admitted height, so each session whose copy equals the failed envelope
@@ -2151,7 +2181,7 @@ impl BlockTable {
             arrived_at,
             from_peer,
             session_gen,
-            later,
+            mut later,
             height,
             ..
         } = entry;
@@ -2162,7 +2192,7 @@ impl BlockTable {
                 row: Bpv1CloseRow::Row4BadMetaOrCommitment,
             });
         }
-        let Some((envelope, senders)) = later.alternate else {
+        let Some((envelope, senders)) = later.alternates.pop_front() else {
             for &(peer, session_gen) in &later.unkept {
                 reject_meta(step, block_id, peer, session_gen);
             }
@@ -2173,7 +2203,7 @@ impl BlockTable {
         let mut senders = senders.into_iter();
         let (from_peer, session_gen) = senders
             .next()
-            .expect("the session that sent the alternate envelope is recorded with it");
+            .expect("an alternate envelope keeps at least one live sender");
         let work_id = alloc_work_id(&mut self.next_work_id);
         self.work_to_block.insert(work_id, block_id);
         self.admitting.insert(
@@ -2186,7 +2216,7 @@ impl BlockTable {
                 session_gen,
                 later: LaterCopies {
                     same: senders.collect(),
-                    alternate: None,
+                    alternates: later.alternates,
                     unkept: later.unkept,
                 },
                 height: Some(height),

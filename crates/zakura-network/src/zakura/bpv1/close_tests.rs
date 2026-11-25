@@ -308,9 +308,10 @@ fn close_4_bad_later_layout_closes_only_its_sender() {
 
 /// `bpv1-close-4`, commitment (bpv1-61): a failed commitment closes the
 /// first sender and each session whose copy equals the failed envelope. A
-/// differing copy gets its own check. If it passes, the block is admitted
-/// and its senders stay open; if it fails, its senders close too. Copies
-/// that the table did not keep are rejected without a close.
+/// differing copy gets its own check, in arrival order. If it passes, the
+/// block is admitted and its senders stay open; if it fails, its senders
+/// close too. `alternates_never_take_admitting_room_from_a_first_copy`
+/// covers copies that the table did not keep.
 #[test]
 fn close_4_failed_commitment_closes_identical_copies_and_checks_the_alternate() {
     let now = Instant::now();
@@ -368,8 +369,8 @@ fn close_4_failed_commitment_closes_identical_copies_and_checks_the_alternate() 
         .all(|o| !matches!(o, BlockOutput::ClosePeer { .. })));
     table.assert_invariants();
 
-    // The alternate fails too: its sender closes, and the unkept copy is
-    // rejected without a close.
+    // Two differing copies fail before an honest one (F-884): each closes
+    // its own sender, and the honest copy still gets its check.
     let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
     let header = receive_four(&mut table);
     let failed = commitment(&mut table, now, &header, false);
@@ -378,8 +379,24 @@ fn close_4_failed_commitment_closes_identical_copies_and_checks_the_alternate() 
         closed_sessions(&failed_again, Bpv1CloseRow::Row4BadMetaOrCommitment),
         vec![c]
     );
-    assert_eq!(rejected_sessions(&failed_again, block_id), vec![d]);
-    assert!(!verifies(&failed_again));
+    assert!(rejected_sessions(&failed_again, block_id).is_empty());
+    assert!(verifies(&failed_again), "the next alternate gets its check");
+    let honest = commitment(&mut table, now, &failed_again, true);
+    assert!(admits(&honest, block_id));
+    table.assert_invariants();
+
+    // Every kept copy fails: the last sender closes too, and no check is
+    // left.
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let header = receive_four(&mut table);
+    let failed = commitment(&mut table, now, &header, false);
+    let failed_again = commitment(&mut table, now, &failed, false);
+    let failed_last = commitment(&mut table, now, &failed_again, false);
+    assert_eq!(
+        closed_sessions(&failed_last, Bpv1CloseRow::Row4BadMetaOrCommitment),
+        vec![d]
+    );
+    assert!(!verifies(&failed_last));
     assert_eq!(table.admitting_meta_len(), 0);
     table.assert_invariants();
 
@@ -564,6 +581,102 @@ fn pending_alternates_give_way_before_a_first_copy_is_evicted() {
     }
     assert_eq!(table.pending_meta_len(), 4);
     table.assert_invariants();
+}
+
+/// A first copy that the pending stage refuses takes no room, so it sheds
+/// no alternate (F-886). The refused copy competes only with first copies:
+/// the count cap is full and no other peer is heavier.
+#[test]
+fn a_refused_pending_copy_keeps_every_alternate() {
+    let now = Instant::now();
+    let coding = Profile::W2.derive_coding(64, 2).unwrap();
+    let id = |peer: u8, index: u8| {
+        let mut hash = [0x70; 32];
+        hash[0] = peer;
+        hash[1] = index;
+        block::Hash(hash)
+    };
+    let copy = |block_id, root: u8, coinbase: usize| {
+        let mut envelope = make_envelope(block_id, coding, [root; 32], node_id(1));
+        envelope.binding.coinbase = vec![0x01; coinbase];
+        envelope
+    };
+    let parent = block::Hash([0x6E; 32]);
+    let alternate_parent = block::Hash([0x6F; 32]);
+    let park = |table: &mut BlockTable, envelope, from: (NodeId, u64), parent_hash| {
+        let received = copy_from(table, now, envelope, from);
+        header_result(
+            table,
+            now,
+            &received,
+            HeaderAdmissionResult::MissingParent { parent_hash },
+        )
+    };
+    let heavy = (node_id(10), 10);
+    let relay = (node_id(11), 11);
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::W2));
+    // `heavy` parks three large first copies; the first waits on its own
+    // parent, so it can be woken alone.
+    park(
+        &mut table,
+        copy(id(10, 0), 0xA1, 1_900_000),
+        heavy,
+        alternate_parent,
+    );
+    for index in 1..3 {
+        park(
+            &mut table,
+            copy(id(10, index), 0xA1, 1_900_000),
+            heavy,
+            parent,
+        );
+    }
+    // Sixty-one small first copies fill the count cap.
+    for peer in 20..35u8 {
+        for index in 0..4 {
+            park(
+                &mut table,
+                copy(id(peer, index), 0xA1, 3),
+                (node_id(peer), u64::from(peer)),
+                parent,
+            );
+        }
+    }
+    park(
+        &mut table,
+        copy(id(35, 0), 0xA1, 3),
+        (node_id(35), 35),
+        parent,
+    );
+    assert_eq!(table.pending_meta_len(), 64);
+    // An honest relay's differing copy waits beside `heavy`'s first one.
+    copy_from(&mut table, now, copy(id(10, 0), 0xA2, 1_500_000), relay);
+    table.assert_invariants();
+
+    // `heavy`'s fourth copy fits the bytes only without the alternate, but
+    // the count cap refuses it.
+    let refused = park(&mut table, copy(id(10, 3), 0xA1, 1_900_000), heavy, parent);
+    assert_eq!(rejected_sessions(&refused, id(10, 3)), vec![heavy]);
+    assert_eq!(table.pending_meta_len(), 64);
+    table.assert_invariants();
+
+    // The alternate is still kept: it gets its check when the first fails.
+    let woke = table.step(
+        now,
+        BlockInput::ParentAdmitted {
+            hash: alternate_parent,
+            height: 1,
+        },
+    );
+    let header = header_result(
+        &mut table,
+        now,
+        &woke,
+        HeaderAdmissionResult::Admitted { height: 2 },
+    );
+    let failed = commitment(&mut table, now, &header, false);
+    assert!(verifies(&failed), "the relay's copy gets its check");
+    assert!(rejected_sessions(&failed, id(10, 0)).is_empty());
 }
 
 // ============================================================================

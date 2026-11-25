@@ -949,9 +949,8 @@ and the error names `[memory] budget`, which replaces it.
     chain, discovery tables, `tx-relay` maps, state reads, the mempool, the
     decoded legacy compatibility work that the node's one compatibility sink
     holds (128 MiB) and, in `Dual` mode, legacy TCP ingress. State reads are
-    the state's read
-    limit, which the node derives from its read concurrency, plus the
-    state's parser allowance. The reserves fund `Control`, `Propagation` and
+    the state's read limit, which the node derives from its read
+    concurrency, plus the state's parser allowance. The reserves fund `Control`, `Propagation` and
     `Consensus`. The `Consensus` reserve holds the network's worst 401-block
     checkpoint window at admission's charge per block, so the chain sets the
     smallest host that can run. The `Sessions` floor funds 19 full
@@ -974,8 +973,8 @@ and the error names `[memory] budget`, which replaces it.
     BPv1 session funds its base `b_bpv1` from `Sessions` when BPv1 admits the
     peer: its unsolicited receive credit, its output gates, its held frames
     and its early records. BPv1 adds 22.9 MiB to a full connection, so a
-    16 GiB Mainnet host funds 33 full connections, not 63, and the smallest
-    Mainnet host grows from about 12.8 GiB to about 13.4 GiB.
+    16 GiB Mainnet host funds 29 full connections, not 48, and the smallest
+    Mainnet host grows from about 13.2 GiB to about 13.9 GiB.
   - **Preferred gateways.** A mining node holds up to ten connection places
     above `max_connections` for the mining gateways it ranks highest. While
     places are held, ordinary connections leave one full connection's bases

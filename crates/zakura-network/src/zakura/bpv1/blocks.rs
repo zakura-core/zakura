@@ -338,11 +338,13 @@ pub enum BlockInput {
         /// Height of the new verified tip.
         height: u32,
     },
-    /// A parent header was admitted into headerchain, waking pending metadata (`bpv1-11`).
+    /// Headerchain's best header moved to `hash`, waking pending metadata
+    /// (`bpv1-11`): the entries whose parent is `hash`, and the entry for
+    /// `hash` itself, which header sync admitted along with its skipped parent.
     ParentAdmitted {
-        /// Hash of the newly admitted parent header.
+        /// Hash of the new best header.
         hash: block::Hash,
-        /// Height of the admitted parent.
+        /// Height of the new best header.
         height: u32,
     },
     /// Validated-layout `HeaderMeta` received from a peer (`bpv1-1`, `bpv1-3`, `bpv1-7`).
@@ -889,6 +891,10 @@ struct AdmittingEntry {
     also_from: Vec<(NodeId, u64)>,
     height: Option<u32>,
     stage: AdmittingStage,
+    /// When the entry first parked, if a wake retries it. A retried entry
+    /// already passed the unknown-parent checks, and it keeps its first
+    /// deadline if it parks again.
+    parked_at: Option<Instant>,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -1440,7 +1446,7 @@ impl BlockTable {
             }
             BlockInput::ParentAdmitted { hash, height } => {
                 self.raise_top(height, &mut step);
-                self.wake_pending_for_parent(hash, &mut step);
+                self.wake_pending(hash, &mut step);
             }
             BlockInput::MetaReceived {
                 envelope,
@@ -1450,9 +1456,9 @@ impl BlockTable {
                 self.handle_meta_received(
                     now,
                     envelope,
-                    from_peer,
-                    session_gen,
+                    (from_peer, session_gen),
                     Vec::new(),
+                    None,
                     &mut step,
                 );
             }
@@ -1623,9 +1629,9 @@ impl BlockTable {
         &mut self,
         arrived_at: Instant,
         envelope: Box<MetaEnvelope>,
-        from_peer: NodeId,
-        session_gen: u64,
+        (from_peer, session_gen): (NodeId, u64),
         mut also_from: Vec<(NodeId, u64)>,
+        parked_at: Option<Instant>,
         step: &mut BlockStep,
     ) {
         let block_id = envelope.block_id;
@@ -1693,6 +1699,7 @@ impl BlockTable {
                 also_from,
                 height: None,
                 stage: AdmittingStage::WaitingHeader,
+                parked_at,
             },
         );
         self.work_to_block.insert(work_id, block_id);
@@ -1753,6 +1760,26 @@ impl BlockTable {
                 });
             }
             HeaderAdmissionResult::MissingParent { parent_hash } => {
+                if let Some(parked_at) = entry.parked_at {
+                    let entry = self
+                        .admitting
+                        .remove(&block_id)
+                        .expect("admitting entry verified present");
+                    self.insert_pending(
+                        block_id,
+                        PendingMetaEntry {
+                            envelope: entry.envelope,
+                            arrived_at: entry.arrived_at,
+                            from_peer: entry.from_peer,
+                            session_gen: entry.session_gen,
+                            also_from: entry.also_from,
+                            parent_hash,
+                            received_at: parked_at,
+                        },
+                        step,
+                    );
+                    return;
+                }
                 // Headerchain checked nothing but the parent's hash, so the
                 // header's own checks run before it parks.
                 let next_work = alloc_work_id(&mut self.next_work_id);
@@ -1954,11 +1981,19 @@ impl BlockTable {
         }
     }
 
-    fn wake_pending_for_parent(&mut self, parent_hash: block::Hash, step: &mut BlockStep) {
+    /// Retries header admission for the pending entries that the new best
+    /// header `best` may resolve: those whose parent is `best`, and the entry
+    /// for `best` itself.
+    ///
+    /// Header sync usually fetches a missing parent together with the waiting
+    /// child, so the best header can move straight past the parent to the
+    /// child. The child's own entry then wakes, and its admission reports it
+    /// already known.
+    fn wake_pending(&mut self, best: block::Hash, step: &mut BlockStep) {
         let ready: Vec<block::Hash> = self
             .pending
             .iter()
-            .filter(|(_, e)| e.parent_hash == parent_hash)
+            .filter(|(id, e)| e.parent_hash == best || **id == best)
             .map(|(id, _)| *id)
             .collect();
         for block_id in ready {
@@ -1969,9 +2004,9 @@ impl BlockTable {
                 self.handle_meta_received(
                     pending.arrived_at,
                     pending.envelope,
-                    pending.from_peer,
-                    pending.session_gen,
+                    (pending.from_peer, pending.session_gen),
                     pending.also_from,
+                    Some(pending.received_at),
                     step,
                 );
             }

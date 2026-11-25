@@ -356,6 +356,111 @@ fn scenario_missing_parent_then_parent_arrives_defers_commitment() {
     table.assert_invariants();
 }
 
+/// Header sync usually fetches a missing parent `P` together with the waiting
+/// child `C`, so the best header jumps from below `P` straight to `C` (#2716).
+/// The new best header wakes `C`'s own entry, whose admission then finds the
+/// header already known, so the block still arrives through BPv1.
+#[test]
+fn best_header_jumping_past_the_parent_wakes_the_child() {
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let now = Instant::now();
+    let parent = block::Hash([0x51; 32]);
+    let child = block::Hash([0x52; 32]);
+    let coding = Profile::TINY.derive_coding(64, 2).unwrap();
+    table.step(
+        now,
+        BlockInput::ParentAdmitted {
+            hash: block::Hash([0x50; 32]),
+            height: 9,
+        },
+    );
+    let received = receive(
+        &mut table,
+        now,
+        make_envelope(child, coding, [0xAA; 32], node_id(1)),
+    );
+    missing_parent(&mut table, now, &received, parent);
+    assert_eq!(table.pending_meta_len(), 1);
+
+    let at = now + Duration::from_millis(50);
+    let woken = table.step(
+        at,
+        BlockInput::ParentAdmitted {
+            hash: child,
+            height: 11,
+        },
+    );
+    assert_eq!(table.pending_meta_len(), 0);
+    let admitted = header_result(
+        &mut table,
+        at,
+        &woken,
+        HeaderAdmissionResult::Admitted { height: 11 },
+    );
+    let committed = commitment_ok(&mut table, at, &admitted);
+    assert!(committed
+        .events
+        .contains(&BlockEvent::BlockAdmitted { block_id: child }));
+    table.assert_invariants();
+}
+
+/// An entry that a wake retries and that parks again keeps its first
+/// deadline, so retries never extend its life, and it skips the checks it
+/// already passed.
+#[test]
+fn retried_pending_entry_ages_out_at_its_first_deadline() {
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let now = Instant::now();
+    let parent = block::Hash([0x61; 32]);
+    let child = block::Hash([0x62; 32]);
+    let coding = Profile::TINY.derive_coding(64, 2).unwrap();
+    let received = receive(
+        &mut table,
+        now,
+        make_envelope(child, coding, [0xAA; 32], node_id(1)),
+    );
+    missing_parent(&mut table, now, &received, parent);
+
+    // The parent wakes the child, but headerchain still lacks an ancestor.
+    let retried_at = now + Duration::from_secs(10);
+    let woken = table.step(
+        retried_at,
+        BlockInput::ParentAdmitted {
+            hash: parent,
+            height: 10,
+        },
+    );
+    let reparked = header_result(
+        &mut table,
+        retried_at,
+        &woken,
+        HeaderAdmissionResult::MissingParent {
+            parent_hash: block::Hash([0x60; 32]),
+        },
+    );
+    assert!(!reparked
+        .outputs
+        .iter()
+        .any(|o| matches!(o, BlockOutput::CheckUnknownParent { .. })));
+    assert_eq!(table.pending_meta_len(), 1);
+    assert_eq!(table.next_deadline(), Some(now + PENDING_META_AGE));
+
+    let before = tick(
+        &mut table,
+        now + PENDING_META_AGE - Duration::from_millis(1),
+        &[],
+    );
+    assert!(!before
+        .events
+        .contains(&BlockEvent::MetaPendingAged { block_id: child }));
+    let aged = tick(&mut table, now + PENDING_META_AGE, &[]);
+    assert!(aged
+        .events
+        .contains(&BlockEvent::MetaPendingAged { block_id: child }));
+    assert_eq!(table.pending_meta_len(), 0);
+    table.assert_invariants();
+}
+
 /// Sends `block_id`'s metadata from `peer` and answers its header admission
 /// with a missing parent.
 fn park_unknown_parent(

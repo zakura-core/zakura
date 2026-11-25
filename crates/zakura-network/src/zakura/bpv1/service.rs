@@ -1056,9 +1056,10 @@ impl Service for Bpv1Service {
 /// inputs.
 ///
 /// A new verified tip moves the window and ends a fallback block that
-/// native block sync committed. A new best header wakes metadata
-/// pending on it. The watch coalesces, so a hash skipped between two
-/// snapshots leaves through the window or slot eviction instead.
+/// native block sync committed. A new best header wakes the metadata
+/// pending on it, and the metadata for the header itself when the snapshot
+/// skipped its parent. The watch coalesces, so other metadata whose
+/// parent a snapshot skipped ages out instead.
 pub(crate) fn frontier_inputs(last: Option<FrontierSet>, next: FrontierSet) -> Vec<BlockInput> {
     let mut inputs = Vec::new();
     if last.map(|last| last.verified_best) != Some(next.verified_best) {

@@ -254,6 +254,25 @@ async fn native_block_sync_skips_bpv1_claimed_hash_and_fetches_on_fallback_relea
     let _ = task.await;
 }
 
+/// bpv1-44: the port extends a live claim and never reinstalls an expired
+/// one, because block sync may already fetch that body.
+#[tokio::test]
+async fn body_claim_port_extends_only_a_live_claim() {
+    let claims = SharedBodyClaims::new();
+    let port: &dyn BlockFallbackPort = &claims;
+    let (live, expired) = (block::Hash([0x31; 32]), block::Hash([0x32; 32]));
+    let soon = Instant::now() + Duration::from_millis(20);
+    assert!(port.claim(live, Instant::now() + Duration::from_secs(10)));
+    assert!(port.claim(expired, soon));
+    tokio::time::sleep_until(soon.into()).await;
+
+    let later = Instant::now() + Duration::from_secs(120);
+    assert!(port.extend(live, later));
+    assert!(claims.is_claimed(live, later - Duration::from_secs(1)));
+    assert!(!port.extend(expired, later));
+    assert!(!claims.is_claimed(expired, Instant::now()));
+}
+
 /// bpv1-57: a claim that expires, not one BPv1 releases, wakes native block
 /// sync, which then selects the body.
 #[cfg(not(zakura_sim))]

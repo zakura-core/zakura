@@ -588,6 +588,15 @@ pub enum BlockOutput {
         /// Monotonic expiry deadline.
         deadline: Instant,
     },
+    /// Move BPv1's live body claim to the later `deadline` (`bpv1-44`). An
+    /// expired or released claim stays gone, because block sync may already
+    /// own the body.
+    ExtendBodyClaim {
+        /// Claimed block hash.
+        block_id: block::Hash,
+        /// Monotonic expiry deadline.
+        deadline: Instant,
+    },
     /// Release body claim in `BlockFallback`.
     ReleaseBodyClaim {
         /// Block hash.
@@ -2767,7 +2776,7 @@ impl BlockTable {
         // deadline bounds it, as the reconstruction deadline bounds collection.
         if block.body_claimed {
             step.outputs
-                .push(BlockOutput::ClaimBody { block_id, deadline });
+                .push(BlockOutput::ExtendBodyClaim { block_id, deadline });
         }
         step.events.push(BlockEvent::Handoff { block_id });
     }

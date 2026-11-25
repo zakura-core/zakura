@@ -107,9 +107,11 @@ enter the existing consensus block-validation path.
 
 A node MUST keep at most one submission of a block in that path at a time. Its
 body claim keeps native block sync off the block from admission until the
-reconstruction deadline, and from assembly until a verdict or the verification
-deadline, which starts at the first submission. When that deadline passes, the
-node MUST use the existing block-download path. A retryable verdict says nothing
+reconstruction deadline. Assembly extends a live claim until a verdict or the
+verification deadline, which starts at the first submission. It never renews an
+expired claim, because block sync may already fetch the body. When the
+verification deadline passes, the node MUST use the existing block-download
+path. A retryable verdict says nothing
 about the body. If the block's parent is not committed, the node keeps the body
 and the claim, and submits the block again once the parent commits. Otherwise it
 uses the block-download path.

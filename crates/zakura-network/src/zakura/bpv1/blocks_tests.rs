@@ -25,7 +25,7 @@ use super::{
     commitment::commitment_script,
     paths::{PathDirection, PathEstimate, PeerPaths, DEFAULT_UNMEASURED_RATE_BPS},
     peer::{PartAuth, PeerConfig},
-    ports::{claim_body_at, BlockFallbackPort},
+    ports::BlockFallbackPort,
     profile::{Coding, Profile},
     proposer::*,
     test_support::{
@@ -3394,7 +3394,10 @@ fn apply_claims(claims: &SharedBodyClaims, now: Instant, step: &BlockStep) {
     for output in &step.outputs {
         match output {
             BlockOutput::ClaimBody { block_id, deadline } => {
-                claim_body_at(claims, *block_id, *deadline, now);
+                claims.claim_at(*block_id, *deadline, now);
+            }
+            BlockOutput::ExtendBodyClaim { block_id, deadline } => {
+                claims.extend_at(*block_id, *deadline, now);
             }
             BlockOutput::ReleaseBodyClaim { block_id, reason } => {
                 BlockFallbackPort::release(claims, *block_id, *reason);
@@ -3880,5 +3883,48 @@ fn bpv1_82_a_parked_block_falls_back_at_its_verification_deadline() {
     // A late tip move resubmits nothing.
     let moved = table.step(t0 + VERIFY_DEADLINE, BlockInput::TipHeight { height: 104 });
     assert!(submissions(&moved).is_empty());
+    table.assert_invariants();
+}
+
+/// bpv1-44: a block that assembles after its claim expired, before the tick
+/// that falls it back, claims nothing again. Block sync may already fetch the
+/// body, so the verification claim only extends a live claim.
+#[test]
+fn bpv1_44_a_late_assembly_does_not_reclaim_an_expired_body() {
+    let t0 = Instant::now();
+    let claims = SharedBodyClaims::new();
+    let encoded = encode_body(&Profile::TINY, &[0x57; 128], 2).unwrap();
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let block_id = block::Hash([0xA7; 32]);
+    table.step(t0, BlockInput::TipHeight { height: 9 });
+    let admitted = admit_block(
+        &mut table,
+        t0,
+        block_id,
+        10,
+        encoded.coding,
+        encoded.part_root,
+    );
+    apply_claims(&claims, t0, &admitted);
+
+    let late = t0 + RECONSTRUCTION_DEADLINE;
+    let mut work = Vec::new();
+    for part in &encoded.parts[..encoded.coding.k as usize] {
+        let step = insert(
+            &mut table,
+            late,
+            block_id,
+            part,
+            node_id(2),
+            PartAuth::Want(1),
+        );
+        apply_claims(&claims, late, &step);
+        work.extend(submissions(&step));
+    }
+    assert_eq!(work.len(), 1, "the late body still verifies");
+    assert!(
+        !claims.is_claimed(block_id, late),
+        "the expired claim stays expired"
+    );
     table.assert_invariants();
 }

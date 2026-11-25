@@ -173,30 +173,26 @@ pub trait BlockVerifierPort: Send + Sync + 'static {
 
 /// Shared v2 body-claim port coordinating BPv1 and native block sync.
 pub trait BlockFallbackPort: Send + Sync + 'static {
-    /// Claims `hash` until `deadline` so native block sync skips fetching it,
-    /// or moves BPv1's live claim on `hash` to the later `deadline`.
+    /// Claims `hash` until `deadline` so native block sync skips fetching it.
     fn claim(&self, hash: block::Hash, deadline: Instant) -> bool;
+
+    /// Moves BPv1's live claim on `hash` to the later `deadline`. An expired
+    /// or released claim stays gone.
+    fn extend(&self, hash: block::Hash, deadline: Instant) -> bool;
 
     /// Releases `hash` with `reason`. `ClaimRelease::Fallback` and
     /// `ClaimRelease::Repair` wake native block sync.
     fn release(&self, hash: block::Hash, reason: ClaimRelease) -> bool;
 }
 
-/// Claims `hash` in `claims` until `deadline`, or moves BPv1's live claim on
-/// it to the later `deadline`, judging expiry at `now`.
-pub(super) fn claim_body_at(
-    claims: &SharedBodyClaims,
-    hash: block::Hash,
-    deadline: Instant,
-    now: Instant,
-) -> bool {
-    claims.claim_at(hash, deadline, now) || claims.extend_at(hash, deadline, now)
-}
-
 /// The body claims BPv1 shares with native `block_sync`.
 impl BlockFallbackPort for SharedBodyClaims {
     fn claim(&self, hash: block::Hash, deadline: Instant) -> bool {
-        claim_body_at(self, hash, deadline, Instant::now())
+        self.claim_at(hash, deadline, Instant::now())
+    }
+
+    fn extend(&self, hash: block::Hash, deadline: Instant) -> bool {
+        self.extend_at(hash, deadline, Instant::now())
     }
 
     fn release(&self, hash: block::Hash, reason: ClaimRelease) -> bool {

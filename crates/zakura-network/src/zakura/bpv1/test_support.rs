@@ -1149,7 +1149,9 @@ impl MachineMesh {
             BlockOutput::ClosePeer { peer, row, .. } => {
                 panic!("mesh metadata is valid, but the table closed {peer:?} with {row:?}")
             }
-            BlockOutput::ClaimBody { .. } | BlockOutput::ReleaseBodyClaim { .. } => return,
+            BlockOutput::ClaimBody { .. }
+            | BlockOutput::ExtendBodyClaim { .. }
+            | BlockOutput::ReleaseBodyClaim { .. } => return,
             routed => unreachable!("route_block_output keeps {routed:?} off the shell"),
         };
         self.step_table(node, input);

@@ -15,8 +15,9 @@ mod tests;
 /// The fewest counted blocks that must name a gateway before the network
 /// prefers it.
 ///
-/// To keep a place at every mining node for another node's ID, a node must
-/// mine ten blocks naming it every two days. A pool that mines a block now and
+/// To keep a place for another node's ID at every node that prefers gateways
+/// (it mines or sets `mining.miner_mesh`), a node must mine ten blocks naming
+/// it every two days. A pool that mines a block now and
 /// then does not take places meant for regular miners. At 25-second blocks
 /// ten is about 0.15% of a window.
 pub const MIN_GATEWAY_BLOCKS: u32 = 10;

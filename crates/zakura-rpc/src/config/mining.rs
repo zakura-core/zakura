@@ -68,11 +68,12 @@ pub struct Config {
     /// but before contextual commit completes.
     pub optimistic_block_inventory: bool,
 
-    /// Name this node as the miner's gateway in the coinbase of every block Zakura builds.
+    /// Name the miner's gateway in the coinbase of every block Zakura builds: this node, or
+    /// the node [`Self::miner_mesh_gateways`] names.
     ///
-    /// The coinbase gets one extra zero-value output that carries the first 20 bytes of this
-    /// node's v2 node ID, so other mining nodes can find the node and keep a direct connection
-    /// to it. The output takes 34 bytes of the block.
+    /// The coinbase gets one extra zero-value output that carries the first 20 bytes of that
+    /// node's v2 node ID, so other mining nodes can find it and keep a direct connection to
+    /// it. The output takes 34 bytes of the block.
     ///
     /// A node with this set also prefers to stay connected to the gateways that recent blocks
     /// name, with or without a miner address. A relay node that other pools should connect to

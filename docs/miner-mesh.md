@@ -3,8 +3,8 @@
 A mining pool that hears about a new block late keeps mining on the old tip
 until it does. The miner mesh gives pools a direct path to each other: a pool
 names its gateway node in the coinbase of each block it mines, and every synced
-mining node keeps direct v2 connections to the gateways that recent blocks name
-most often.
+node that prefers gateways (it mines or sets `mining.miner_mesh`) keeps direct
+v2 connections to the gateways that recent blocks name most often.
 
 This page covers the `mining.miner_mesh` and `mining.miner_mesh_gateways`
 settings, the `getminermeshinfo` RPC, and what a node does for the gateways it
@@ -104,6 +104,14 @@ the gateway ID its own node ID starts with.
 
 `getminermeshinfo` on the template node lists the relay's gateway ID in
 `announced_gateways`, which is how an operator confirms the setting.
+
+Only a node with a miner address announces a gateway, since only it builds
+coinbases. The `mining.mesh.announcing` metric reports whether this node's own
+coinbases name a gateway, so it reads 0 on the relay. The
+`mining.mesh.gateway.local_blocks` metric counts the blocks that name the
+gateway this node stands for: the one it announces, or itself on a relay. So
+on the relay it counts the template node's blocks, and on the template node it
+counts the same blocks.
 
 ### The gateway's ID
 

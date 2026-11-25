@@ -909,8 +909,10 @@ and the error names `[memory] budget`, which replaces it.
   - **Startup plan.** At startup the node checks that its fixed terms, its
     reserves and the bulk consumers' floors fit in `B`. Fixed terms are the
     socket datagram queues, incoming buffers, pending handshakes, the header
-    chain, discovery tables, `tx-relay` maps, state reads, the mempool and,
-    in `Dual` mode, legacy TCP ingress. State reads are the state's read
+    chain, discovery tables, `tx-relay` maps, state reads, the mempool, the
+    decoded legacy compatibility work that the node's one compatibility sink
+    holds (128 MiB) and, in `Dual` mode, legacy TCP ingress. State reads are
+    the state's read
     limit, which the node derives from its read concurrency, plus the
     state's parser allowance. The reserves fund `Control`, `Propagation` and
     `Consensus`. The `Consensus` reserve holds the network's worst 401-block
@@ -918,9 +920,9 @@ and the error names `[memory] budget`, which replaces it.
     smallest host that can run. The `Sessions` floor funds 19 full
     connections on Mainnet. With the draft values and
     `p2p_stack = "zakura"`, Mainnet and Testnet need a host of about
-    12.8 GiB, and Regtest about 8.9 GiB. In `Dual` mode, legacy TCP ingress
+    13.2 GiB, and Regtest about 9.3 GiB. In `Dual` mode, legacy TCP ingress
     and one legacy read add 1.2 GiB of fixed terms, and Mainnet needs about
-    14.2 GiB. Below its minimum, the node refuses to start and lists every
+    14.7 GiB. Below its minimum, the node refuses to start and lists every
     term.
   - **BPv1.** With `[network.zakura.bpv1] enabled = true`, the `Propagation`
     reserve covers what BPv1 retains for its concurrent blocks, in place of

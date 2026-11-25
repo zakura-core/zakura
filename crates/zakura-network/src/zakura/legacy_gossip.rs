@@ -111,7 +111,10 @@ const LEGACY_REQUEST_IN_FLIGHT_LIMIT: usize = 64;
 /// budget. Queue slots do not bound variable-size payloads. A queued transaction can
 /// be as large as a protocol message, so the in-flight limit binds first for
 /// wire-maximum requests, and the queue holds many more ordinary ones.
-const LEGACY_INBOUND_RETAINED_BYTES: u64 =
+///
+/// Each node runs one sink, so the memory plan counts this budget once, as the
+/// fixed term `legacy_inbound`.
+pub(crate) const LEGACY_INBOUND_RETAINED_BYTES: u64 =
     // Widening usize to u64 is lossless on supported targets.
     (LEGACY_REQUEST_IN_FLIGHT_LIMIT * MAX_PROTOCOL_MESSAGE_LEN) as u64;
 /// Inventory fetches that one request client runs at once, including retries.

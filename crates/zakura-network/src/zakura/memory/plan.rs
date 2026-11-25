@@ -42,7 +42,9 @@ use crate::{
         header_sync::v9::{
             self as header_sync_v9, HEADER_SYNC_SERVE_NODE_EXECUTION, SERVE_PEER_OUTPUT_BYTES,
         },
-        legacy_gossip::{LEGACY_GOSSIP_BUDGET, LEGACY_REQUESTS_BUDGET},
+        legacy_gossip::{
+            LEGACY_GOSSIP_BUDGET, LEGACY_INBOUND_RETAINED_BYTES, LEGACY_REQUESTS_BUDGET,
+        },
         peer_memory::min_budgeted_connections,
         tx_relay::wire::{
             MAX_TX_BYTES, SESSION_HELD_OUTPUT_BYTES, TX_RELAY_DATA_BUDGET, TX_RELAY_STATE_BUDGET,
@@ -130,11 +132,16 @@ pub struct FixedTerms {
     pub mempool_pool: u64,
     /// Legacy TCP ingress buffers (`Dual` mode only; 0 in `Zakura`-only mode).
     pub legacy_tcp_ingress: u64,
+    /// Decoded legacy compatibility work that the node's one compatibility sink
+    /// retains after it drops each frame (`LEGACY_INBOUND_RETAINED_BYTES`).
+    /// Every v2 connection negotiates the compatibility streams, in `Zakura`
+    /// and `Dual` mode alike.
+    pub legacy_inbound: u64,
 }
 
 impl FixedTerms {
     /// Every fixed term by its metric and trace label (`03 §5`).
-    pub const fn entries(&self) -> [(&'static str, u64); 9] {
+    pub const fn entries(&self) -> [(&'static str, u64); 10] {
         [
             ("socket_queues", self.socket_queues),
             ("incoming_buffers", self.incoming_buffers),
@@ -145,6 +152,7 @@ impl FixedTerms {
             ("state_reads", self.state_reads),
             ("mempool_pool", self.mempool_pool),
             ("legacy_tcp_ingress", self.legacy_tcp_ingress),
+            ("legacy_inbound", self.legacy_inbound),
         ]
     }
 
@@ -961,6 +969,7 @@ impl PlanTerms {
             state_reads,
             mempool_pool: memory.mempool_tx_cost_limit,
             legacy_tcp_ingress,
+            legacy_inbound: LEGACY_INBOUND_RETAINED_BYTES,
         };
 
         // Per-connection transport base `t` and per-reactor session bases `b_r` (`02 §8`).
@@ -1810,6 +1819,26 @@ mod tests {
             plan_for(P2pStack::Dual) - plan_for(P2pStack::Zakura),
             READ_RESULT_BLOCKS_PER_PEER * MAX_DECODED_BLOCK_BYTES
         );
+    }
+
+    /// F-904: the compatibility sink's decoded work outlives its frames, so
+    /// neither receive credit nor a lease holds it. The plan counts the sink's
+    /// whole budget as a fixed term on every v2 stack.
+    #[test]
+    fn legacy_inbound_counts_the_compatibility_sink_budget() {
+        for stack in [P2pStack::Zakura, P2pStack::Dual] {
+            let config = Config {
+                network: Network::Mainnet,
+                p2p_stack: stack,
+                ..Config::default()
+            };
+            let plan = MemoryPlan::size(256 * GIB, &config, &Network::Mainnet).expect("fits");
+            assert_eq!(plan.fixed.legacy_inbound, LEGACY_INBOUND_RETAINED_BYTES);
+            assert!(plan
+                .fixed
+                .entries()
+                .contains(&("legacy_inbound", LEGACY_INBOUND_RETAINED_BYTES)));
+        }
     }
 
     /// fix-63: an operator-set read limit above the derived one warns once the

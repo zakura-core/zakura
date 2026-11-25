@@ -74,7 +74,7 @@ retries = 2
 [profile.full-tests]
 fail-fast = false
 failure-output = "immediate"
-default-filter = "not test(check_no_git_dependencies) and not test(=fully_synced_rpc_z_getsubtreesbyindex_snapshot_test) and not test(=rpc_get_block_template) and not test(=rpc_submit_block) and not test(~generate_checkpoints_) and not test(=sync_one_checkpoint_mainnet) and not test(=sync_update_mainnet) and not test(=activate_mempool_mainnet) and not test(=restart_stop_at_height) and not test(=sync_large_checkpoints_mempool_mainnet) and not test(=pruned_storage_mode_prunes_during_regtest_sync) and not test(=pruned_checkpoint_sync_mines_without_transparent_indexes) and not test(=config_tests) and not test(~zakura::testkit::cluster) and not test(~zakura::testkit::blocksync_fuzz) and not test(~service::finalized_state::zakura_db::transparent::contention::utxo_state_contention) and not test(=zakura::node_envelope::comparison::composed_owners_stay_within_their_tolerances)"
+default-filter = "not test(check_no_git_dependencies) and not test(=fully_synced_rpc_z_getsubtreesbyindex_snapshot_test) and not test(=rpc_get_block_template) and not test(=rpc_submit_block) and not test(~generate_checkpoints_) and not test(=sync_one_checkpoint_mainnet) and not test(=sync_update_mainnet) and not test(=activate_mempool_mainnet) and not test(=restart_stop_at_height) and not test(=sync_large_checkpoints_mempool_mainnet) and not test(=pruned_storage_mode_prunes_during_regtest_sync) and not test(=pruned_checkpoint_sync_mines_without_transparent_indexes) and not test(=config_tests) and not test(~zakura::testkit::cluster) and not test(~zakura::testkit::blocksync_fuzz) and not test(~service::finalized_state::zakura_db::transparent::contention::utxo_state_contention) and not test(=zakura::node_envelope::comparison::composed_owners_stay_within_their_tolerances) and not (package(zakura) and binary(miner_mesh_regtest))"
 
 # Retry the real-time Zakura block-sync scenario tests under load (see the note on the
 # `all-tests` override above).
@@ -116,6 +116,28 @@ retries = 2
 slow-timeout = { period = "15m", terminate-after = 1 }
 failure-output = "immediate"
 default-filter = 'package(zakura-network) and test(~zakura::testkit::cluster)'
+
+# Regtest networks of real `zakurad` children (`crates/zakurad/tests/miner_mesh_regtest.rs`).
+# Every test starts several nodes on loopback, so run them one at a time.
+[profile.miner-mesh-regtest]
+test-threads = 1
+fail-fast = false
+retries = 1
+slow-timeout = { period = "15m", terminate-after = 1 }
+failure-output = "immediate"
+default-filter = 'package(zakura) and binary(miner_mesh_regtest) and not test(/^extended::/)'
+
+# Extended miner mesh coverage includes connection transitions, larger networks
+# and longer chains. Successful runs show how long a restarted gateway takes
+# to be preferred again.
+[profile.miner-mesh-regtest-extended]
+test-threads = 1
+fail-fast = false
+retries = 1
+slow-timeout = { period = "30m", terminate-after = 1 }
+failure-output = "immediate"
+success-output = "final"
+default-filter = 'package(zakura) and binary(miner_mesh_regtest) and test(/^extended::/)'
 
 [profile.zakura-blocksync-fuzz]
 fail-fast = false

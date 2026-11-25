@@ -172,12 +172,13 @@ pub fn block_input_name(input: &BlockInput) -> &'static str {
         BlockInput::BlockAssembled { .. } => "block-in:BlockAssembled",
         BlockInput::VerifierVerdict { .. } => "block-in:VerifierVerdict",
         BlockInput::FallbackDone { .. } => "block-in:FallbackDone",
+        BlockInput::ProposedCommitFailed { .. } => "block-in:ProposedCommitFailed",
         BlockInput::Tick { .. } => "block-in:Tick",
     }
 }
 
 /// Every name [`block_input_name`] returns.
-pub const BLOCK_INPUTS: [&str; 24] = [
+pub const BLOCK_INPUTS: [&str; 25] = [
     "block-in:TipHeight",
     "block-in:ParentAdmitted",
     "block-in:MetaReceived",
@@ -201,6 +202,7 @@ pub const BLOCK_INPUTS: [&str; 24] = [
     "block-in:BlockAssembled",
     "block-in:VerifierVerdict",
     "block-in:FallbackDone",
+    "block-in:ProposedCommitFailed",
     "block-in:Tick",
 ];
 

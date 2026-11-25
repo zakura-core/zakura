@@ -73,7 +73,7 @@ pub struct BlockReplaySummary {
 }
 
 /// Operations decoder 3 reads.
-const OPS: u8 = 24;
+const OPS: u8 = 25;
 
 /// The fuzz property the replay's own ledger checks name.
 const BLOCK_REPLAY: &str = "bpv1/block-replay";
@@ -488,10 +488,12 @@ pub fn replay_bpv1_block_bytes(bytes: &[u8]) -> BlockReplaySummary {
                 BlockInput::Tick { peer_states }
             }
             // Up to 255 s: the verification deadline.
-            _ => {
+            23 => {
                 now += Duration::from_secs(u64::from(b));
                 BlockInput::Tick { peer_states }
             }
+            // This node's commit of a block fails; only a proposed block retires.
+            _ => BlockInput::ProposedCommitFailed { block_id: block.id },
         };
         step(&mut table, now, input, &blocks, &mut ledger, &mut summary);
     }

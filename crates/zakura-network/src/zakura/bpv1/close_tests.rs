@@ -902,14 +902,7 @@ fn retire(block_id: block::Hash) -> PeerInput {
 fn close_5_repeated_header_meta_closes_while_the_block_is_known() {
     let now = Instant::now();
     let block_id = block::Hash([0x55; 32]);
-    let new_peer = || {
-        PeerState::new(
-            PeerConfig::for_profile(Profile::TINY),
-            node_id(1),
-            node_id(2),
-            1,
-        )
-    };
+    let new_peer = || PeerState::new(PeerConfig::for_profile(Profile::TINY), node_id(2), 1);
 
     // Pending: the table has not admitted the block yet.
     let mut peer = new_peer();
@@ -998,12 +991,7 @@ fn close_9_want_whose_end_is_unwritten_is_still_live() {
     let unknown = block::Hash([0x59; 32]);
     let retired = block::Hash([0x5A; 32]);
     let new_peer = || {
-        let mut peer = PeerState::new(
-            PeerConfig::for_profile(Profile::TINY),
-            node_id(1),
-            node_id(2),
-            1,
-        );
+        let mut peer = PeerState::new(PeerConfig::for_profile(Profile::TINY), node_id(2), 1);
         peer.step(now, retire(retired));
         peer
     };

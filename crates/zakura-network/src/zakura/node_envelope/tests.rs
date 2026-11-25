@@ -160,11 +160,19 @@ fn the_default_envelope_sums_the_reactor_shares() {
     assert_eq!(share(4), crate::zakura::DISCOVERY_BUDGET);
     assert_eq!(share(5), crate::zakura::HEADER_SYNC_BUDGET);
     assert_eq!(share(6), crate::zakura::BLOCK_SYNC_REACTOR_BUDGET);
+    assert_eq!(
+        share(9),
+        crate::zakura::tx_relay::wire::TX_RELAY_DATA_BUDGET
+    );
+    assert_eq!(
+        share(10),
+        crate::zakura::tx_relay::wire::TX_RELAY_STATE_BUDGET
+    );
     assert_eq!(shares.control_receive_bytes, 32 * MIB);
     // The connection window and the stream window that carry the shares.
     assert_eq!(
         shares.receive_window(shares.kinds.iter().map(|(kind, _)| *kind)),
-        32 * MIB + 74_836_259
+        32 * MIB + 79_096_099
     );
     assert_eq!(
         u64::from(limits.quic.stream_receive_window_bytes),
@@ -177,17 +185,17 @@ fn the_default_envelope_sums_the_reactor_shares() {
     let transport = ResourceEnvelope::new(
         limits.transport_limits_for_kinds(shares.kinds.iter().map(|(kind, _)| *kind)),
     );
-    // Per connection: 74,828,489 B of receive shares and 180,303,803 B of output shares.
-    assert_eq!(transport.connection_raw_bytes, 74_836_259);
-    assert_eq!(transport.connection_output_bytes, 180_310_523);
+    // Per connection: 79,096,099 B of receive shares and 184,570,363 B of output shares.
+    assert_eq!(transport.connection_raw_bytes, 79_096_099);
+    assert_eq!(transport.connection_output_bytes, 184_570_363);
     // The shared compatibility client holds at most 288 exchanges at once.
     assert_eq!(transport.compat_response_bytes, 288 * 20 * MIB);
     assert_eq!(
         envelope.transport_bytes,
-        102 * u128::from(74_836_259_u64 + 180_310_523) + u128::from(288 * 20 * MIB)
+        102 * u128::from(79_096_099_u64 + 184_570_363) + u128::from(288 * 20 * MIB)
     );
-    // 102 × 141,945,123 + 32 × 64 MiB + 256 MiB.
-    assert_eq!(envelope.quic_bytes, 16_894_321_650);
+    // 102 × 146,204,963 + 32 × 64 MiB + 256 MiB.
+    assert_eq!(envelope.quic_bytes, 17_328_825_330);
 }
 
 /// A custom stream kind takes the `other` share on a live connection, so the peer
@@ -295,6 +303,7 @@ fn tx_relay_counts_what_it_holds_outside_its_output_gate() {
     let mut config = Config::default();
     // Keep both runs at the same funded capacity even with the extra reactor.
     config.zakura.peer_memory_budget_bytes = 17 << 30;
+    config.zakura.tx_relay.enabled = false;
     let off_limits = ZakuraLocalLimits::from_config(&config);
     let off = NodeEnvelope::for_node(&config, &off_limits, &[], 16)
         .expect("the default config fits")
@@ -346,9 +355,13 @@ fn serving_output_counts_admitted_sessions() {
 
     let envelope =
         NodeEnvelope::for_node(&config, &limits, &[], 16).expect("the default config fits");
+    // `tx-relay` is on by default, so each connection adds what it holds
+    // outside its output gate.
+    let tx_relay =
+        u128::from(sessions) * u128::from(crate::zakura::tx_relay::wire::SESSION_HELD_OUTPUT_BYTES);
     assert_eq!(
         envelope.serve_output_bytes,
-        2 * u128::from(sessions * SESSION) + discovery
+        2 * u128::from(sessions * SESSION) + discovery + tx_relay
     );
     assert_eq!(
         envelope.retained_bytes_bound(),
@@ -370,7 +383,7 @@ fn serving_output_counts_admitted_sessions() {
         NodeEnvelope::for_node(&config, &limits, &[], 16).expect("the smaller pools fit");
     assert_eq!(
         envelope.serve_output_bytes,
-        2 * u128::from(5 * SESSION) + discovery
+        2 * u128::from(5 * SESSION) + discovery + tx_relay
     );
 }
 

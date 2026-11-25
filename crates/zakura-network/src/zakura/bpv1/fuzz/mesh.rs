@@ -136,7 +136,7 @@ const MAX_OPS: usize = 400;
 
 /// Operations the mesh reads; `tag % OPS` picks one. Delivery and writing
 /// take several slots each, so an arbitrary input mostly moves frames.
-const OPS: u8 = 24;
+const OPS: u8 = 25;
 
 /// A block the proposer may build: its transactions after the coinbase.
 struct Planned {
@@ -410,7 +410,8 @@ impl Mesh {
                 _ => self.sync_past(b),
             },
             22 => self.adversary_crafted(a, b),
-            _ => self.adversary_raw(a, b, input),
+            23 => self.adversary_raw(a, b, input),
+            _ => self.commit_failed(a),
         }
     }
 
@@ -745,6 +746,15 @@ impl Mesh {
 
     /// Solves the planned block `a` picks, once its template has a
     /// commitment, with a coinbase that carries it.
+    /// The proposer's own commit of solved block `a` fails.
+    fn commit_failed(&mut self, a: u8) {
+        let Some(solved) = self.solved.get(usize::from(a) % self.solved.len().max(1)) else {
+            return;
+        };
+        let block_id = solved.id;
+        self.step_table(PROPOSER, BlockInput::ProposedCommitFailed { block_id });
+    }
+
     fn solve(&mut self, a: u8) {
         let at = usize::from(a) % BLOCKS;
         let planned = &self.planned[at];
@@ -1028,7 +1038,6 @@ impl Mesh {
             }
             let state = PeerState::new(
                 PeerConfig::for_profile(self.profile),
-                self.nodes[local].id,
                 self.nodes[remote].id,
                 session_gen,
             );

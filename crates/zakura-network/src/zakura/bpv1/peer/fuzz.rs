@@ -147,7 +147,7 @@ pub fn replay_bpv1_peer_bytes(bytes: &[u8]) -> PeerReplaySummary {
             }
         })
         .collect();
-    let mut peer = PeerState::new(PeerConfig::for_profile(profile), local, remote, 1);
+    let mut peer = PeerState::new(PeerConfig::for_profile(profile), remote, 1);
     let mut now = Instant::now();
     let mut ledger = Ledger::default();
     let mut summary = PeerReplaySummary::default();

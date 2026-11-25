@@ -233,6 +233,7 @@ const BLOCK_VERDICT: u8 = 20;
 const BLOCK_FALLBACK_DONE: u8 = 21;
 const BLOCK_TICK: u8 = 22;
 const BLOCK_TICK_LONG: u8 = 23;
+const BLOCK_COMMIT_FAILED: u8 = 24;
 
 /// The `TINY` exact layout for block 0, empty for the others.
 const BLOCK_EXACT: u8 = 2 << 1;
@@ -331,6 +332,7 @@ fn block_seeds() -> Vec<Bpv1Seed> {
                     (BLOCK_LOCAL, 0, 0),
                     (BLOCK_LOCAL, 4, 0),
                     (BLOCK_LOCAL, 8, 0),
+                    (BLOCK_COMMIT_FAILED, 4, 0),
                     (BLOCK_TIP, 0, 25),
                     (BLOCK_TIP, 0, 39),
                 ],
@@ -357,6 +359,7 @@ const MESH_RECONNECT: u8 = 20;
 const MESH_STALL_OR_FALLBACK: u8 = 21;
 const MESH_ADVERSARY: u8 = 22;
 const MESH_ADVERSARY_RAW: u8 = 23;
+const MESH_COMMIT_FAILED: u8 = 24;
 
 /// One transaction after each block's coinbase.
 const MESH_ONE_TX: u8 = 0b0010_1010;
@@ -489,6 +492,11 @@ fn mesh_seeds() -> Vec<Bpv1Seed> {
         (MESH_COMPLETE, 1, 0),
     ]);
     forged.extend(pump(2));
+    // The proposer's commit fails mid-propagation; it retires the block.
+    let mut commit_failed = propose(0);
+    commit_failed.extend(pump(1));
+    commit_failed.push((MESH_COMMIT_FAILED, 0, 0));
+    commit_failed.extend(pump(3));
     vec![
         seed(target, "honest", ops(MESH_ONE_TX, &honest)),
         seed(target, "orphan", ops(MESH_ONE_TX, &orphan)),
@@ -499,6 +507,7 @@ fn mesh_seeds() -> Vec<Bpv1Seed> {
         seed(target, "stress", ops(MESH_STRESS | MESH_ONE_TX, &stress)),
         seed(target, "forged-push", ops(MESH_ONE_TX, &forged)),
         seed(target, "sync-past", ops(MESH_ONE_TX, &sync_past)),
+        seed(target, "commit-failed", ops(MESH_ONE_TX, &commit_failed)),
         seed(
             target,
             "adversary-raw",

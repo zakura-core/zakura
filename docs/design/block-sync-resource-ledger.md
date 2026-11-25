@@ -30,7 +30,7 @@ live connections; the application rows count the 102 admitted peers.
 
 | Term | Per peer | Node | Bound comes from |
 | --- | --- | --- | --- |
-| QUIC receive buffers | 108,382,921 B connection window once admitted: 32 MiB handshake window plus every reactor's receive share, 43,287,718 B per stream | 11.3 GiB (102 admitted plus 32 handshakes at 32 MiB) | `DEFAULT_ZAKURA_RECEIVE_WINDOW` in `handler.rs` and the reactor budgets in `ZakuraConfig::reactor_shares`, enforced by QUIC flow control |
+| QUIC receive buffers | 112,650,531 B connection window once admitted with `tx-relay` on: 32 MiB handshake window plus every reactor's receive share, 43,287,718 B per stream | 11.7 GiB (102 admitted plus 32 handshakes at 32 MiB) | `DEFAULT_ZAKURA_RECEIVE_WINDOW` in `handler.rs` and the reactor budgets in `ZakuraConfig::reactor_shares`, enforced by QUIC flow control |
 | QUIC send buffers | 32 MiB | 4.2 GiB | `DEFAULT_ZAKURA_SEND_WINDOW`; serving output below sits inside it |
 | Serving bookkeeping | 1 MiB (144 KiB + 2 × 2,816 × 160 B) | 512 MiB | `BOOKKEEPING_BUDGET_BYTES` in `regulated/session.rs`; config validation refuses a config that cannot fund one request per slot |
 | Serving storage results | 12 jobs | 24 jobs × one read (≤ `blocks_per_response` decoded blocks) | `NODE_EXECUTION` / `PEER_EXECUTION`; a lease lives until the blocking read and encode return |
@@ -45,7 +45,7 @@ At defaults, block-sync application memory sums to about 11 GB in the worst case
 serving bookkeeping, 1.25 GB serving output, 1.3 GB of worst-case serving reads (about 170 MB
 for real blocks), 0.13 GiB requester hashes, 1.8 GB of raw frames awaiting their routines and
 5.6 GB of requested bodies (both derived below). The QUIC windows
-add 11.3 + 4.2 GiB, and the datagram queues 256 MiB more per bound socket, however many
+add 11.7 + 4.2 GiB, and the datagram queues 256 MiB more per bound socket, however many
 connections it serves. They are shared with every other service on the connection: the 17 GiB
 peer memory budget covers all three for every live QUIC connection the transport holds, and is a
 transport budget, not a block-sync choice.

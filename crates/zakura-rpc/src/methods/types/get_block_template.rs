@@ -569,7 +569,8 @@ impl BlockTemplateResponse {
     /// `mempool_txs` reserved that output; see [`GetBlockTemplateHandler::template_bpv1_proposer`].
     ///
     /// A `precomputed_coinbase` is used as it is, so the caller passes one only when it
-    /// already carries the commitment output the template needs, and then passes no
+    /// already carries the commitment output the template needs and was built from
+    /// `miner_params`, so it carries the same miner mesh marker, and then passes no
     /// `bpv1_proposer`.
     #[allow(clippy::too_many_arguments, clippy::unwrap_in_result)]
     pub(crate) fn new_internal(
@@ -708,8 +709,8 @@ impl BlockTemplateResponse {
 
             coinbase_txn,
 
-            // The coinbase came from the same `miner_params`, whether it was
-            // built here or precomputed, so it carries this output.
+            // Matches the marker in `coinbasetxn`: a precomputed coinbase is built
+            // from `miner_params` too (see this function's doc).
             miner_mesh_script_pubkey: miner_params
                 .mesh_commitment()
                 .map(|commitment| commitment.lock_script()),

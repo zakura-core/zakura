@@ -1384,6 +1384,15 @@ this release tolerates, and keep each hard change explicit.
   These later steps are a plan, not rules this release implements. This
   release offers one scheme.
 
+  That release also has to teach `zakura-network` that a node's earlier
+  IDs name the node itself. The transport already refuses the dial
+  (DIAL-1), but three places compare a `NodeId` with the local one exactly:
+  dropping the node's own `zakura.bootstrap_peers` entry, taking advertised
+  addresses from such an entry, and refusing its own record at import. Left
+  as they are, a self-entry under an earlier ID is redialed into a
+  self-dial error for as long as it is configured, and its addresses leave
+  the node's advertised record.
+
   The room for this is what this release's readers accept. A list holds 4
   entries (ID-8), two of them the Ed25519 and ML-DSA-65 keys, and a retired
   key keeps its entry as a fingerprint, so a node ID's line can take two

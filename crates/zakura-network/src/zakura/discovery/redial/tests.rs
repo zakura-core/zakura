@@ -364,12 +364,8 @@ async fn dial_supervisor_follows_a_peer_to_the_id_it_moved_to() {
     let (_moved_tx, moved) = watch::channel(moves);
     let (registered_tx, registered) = watch::channel(vec![now.clone()]);
     let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let policy = RedialPolicy::connect_once_with_registered_settle(
-        Duration::from_millis(1),
-        Duration::from_millis(1),
-        3,
-        Duration::from_secs(1),
-    );
+    // The policy of a configured bootstrap peer.
+    let policy = RedialPolicy::maintain(Duration::from_millis(1), Duration::from_millis(1));
 
     let supervisor = tokio::spawn(run_dial_supervisor(
         earlier,
@@ -377,11 +373,9 @@ async fn dial_supervisor_follows_a_peer_to_the_id_it_moved_to() {
         ZakuraTrace::noop(),
         policy,
         CancellationToken::new(),
-        count_dial(&calls, DialResult::Healthy),
+        count_dial(&calls, DialResult::Failed),
     ));
-    for _ in 0..100 {
-        tokio::task::yield_now().await;
-    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(
         dial_count(&calls),
         0,
@@ -391,11 +385,14 @@ async fn dial_supervisor_follows_a_peer_to_the_id_it_moved_to() {
     registered_tx
         .send(Vec::new())
         .expect("dial supervisor still watches registrations");
-    tokio::time::timeout(Duration::from_secs(5), supervisor)
-        .await
-        .expect("the supervisor dials once the registration ends")
-        .expect("dial supervisor task must not panic");
-    assert_eq!(dial_count(&calls), 1);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while dial_count(&calls) == 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the supervisor dials once the registration ends");
+    supervisor.abort();
 }
 
 /// A connect-once upgrade hand-off must not give up just because the peer

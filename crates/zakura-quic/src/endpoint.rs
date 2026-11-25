@@ -562,9 +562,10 @@ impl QuicEndpoint {
         }
         // DIAL-1: this node answers to its own ID and to each ID its
         // credential would prove to a dialer (TLS-7).
-        if shared
-            .credential
-            .proves_dialed_id(addr.id, &COMPOSITE_KEY_TAGS)
+        if addr.id == shared.id
+            || shared
+                .credential
+                .proves_dialed_id(addr.id, &COMPOSITE_KEY_TAGS)
         {
             return Err(ConnectError::SelfDial);
         }

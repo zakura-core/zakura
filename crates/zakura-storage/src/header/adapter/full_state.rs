@@ -52,7 +52,8 @@ impl EnginePort {
     pub fn subscribe_views(&self) -> watch::Receiver<Option<CommittedHeaderChainView>> {
         let sender = {
             let _engine = self.engine();
-            self.views().sender()
+            let views = self.views();
+            views.sender()
         };
         match sender {
             Some(sender) => sender.subscribe(),
@@ -63,13 +64,15 @@ impl EnginePort {
     /// The latest committed view.
     pub fn view(&self) -> CommittedHeaderChainView {
         let _engine = self.engine();
-        self.views().view()
+        let views = self.views();
+        views.view()
     }
 
     /// Runs `read` on full state, read together with the engine.
     pub fn with_full_state<R>(&self, read: impl FnOnce(&VerifiedChain) -> R) -> R {
         let _engine = self.engine();
-        read(&self.full_state())
+        let chain = self.full_state();
+        read(&chain)
     }
 
     /// Commits `block`, which the verifier received `receipt`th, to full
@@ -312,7 +315,8 @@ impl EnginePort {
     pub(crate) fn close_views(&self) {
         let sender = {
             let _engine = self.engine();
-            self.views().close()
+            let mut views = self.views();
+            views.close()
         };
         // Dropped after the locks, since the last sender's drop is a
         // scheduling point.

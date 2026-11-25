@@ -26,8 +26,11 @@ discovery_session = { decoder = 1, properties = ["discovery/session-policy"] }
 discovery_redial = { decoder = 2, properties = ["discovery/redial-policy"] }
 discovery_query = { decoder = 1, properties = ["discovery/query-ownership", "discovery/answer-settlement"] }
 discovery_candidate = { decoder = 2, properties = ["discovery/dial-attempts", "discovery/preferred-dials"] }
-bpv1_peer = { decoder = 1, properties = ["bpv1/peer-replay"] }
-bpv1_block = { decoder = 2, properties = ["bpv1/block-replay"] }
+bpv1_peer = { decoder = 2, properties = ["bpv1/peer-replay"] }
+bpv1_block = { decoder = 3, properties = ["bpv1/block-replay"] }
+bpv1_mesh = { decoder = 1, properties = ["bpv1/mesh"] }
+bpv1_wire = { decoder = 1, properties = ["bpv1/wire"] }
+bpv1_codec = { decoder = 1, properties = ["bpv1/codec"] }
 credential_parse = { decoder = 1, properties = ["credential/canonical-encoding", "credential/node-id", "credential/bounded-parse"] }
 key_list_decode = { decoder = 1, properties = ["key-list/canonical-encoding", "key-list/stable-id"] }
 composite_verify = { decoder = 1, properties = ["composite/tamper-refused"] }
@@ -154,6 +157,27 @@ bench = false
 [[bin]]
 name = "bpv1_block"
 path = "fuzz_targets/bpv1_block.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bpv1_mesh"
+path = "fuzz_targets/bpv1_mesh.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bpv1_wire"
+path = "fuzz_targets/bpv1_wire.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bpv1_codec"
+path = "fuzz_targets/bpv1_codec.rs"
 test = false
 doc = false
 bench = false

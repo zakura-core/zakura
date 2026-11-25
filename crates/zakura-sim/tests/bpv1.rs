@@ -364,6 +364,16 @@ where
     seen
 }
 
+/// Each delivery of `hash` and the node's answer to it.
+fn answers(seen: &Seen, hash: block::Hash) -> Vec<(Via, Answer)> {
+    seen.tally
+        .answers
+        .iter()
+        .filter(|(_, answered, _)| *answered == hash)
+        .map(|(via, _, answer)| (*via, *answer))
+        .collect()
+}
+
 /// One line per mined block, for a failure message.
 fn summary(seen: &Seen) -> String {
     let mut lines = format!(
@@ -504,8 +514,9 @@ fn at_tip() -> MeshScenario {
 
 /// Mirror 0 withholds every part of a block it mines. BPv1 admits the block
 /// and claims its body. Its first repair round releases the claim
-/// (decision-22), block sync fetches the body and commits it first, and
-/// BPv1 never submits the block. The next block commits through BPv1.
+/// (decision-22), and block sync fetches the body once and commits it. When
+/// the parts arrive later, BPv1's copy is a duplicate the node doesn't
+/// verify again. The next block commits through BPv1.
 #[test]
 fn bpv1_57_withheld_parts_fall_back_to_block_sync() {
     let seen = run_mesh(at_tip(), |director| async move {
@@ -526,20 +537,28 @@ fn bpv1_57_withheld_parts_fall_back_to_block_sync() {
         Some(&Via::BlockSync),
         "block sync commits the withheld block\n{summary}"
     );
-    assert_eq!(seen.tally.submissions(Via::Bpv1, withheld.hash), 0);
-    assert_eq!(seen.tally.fetches(withheld.height), 1);
+    assert_eq!(
+        answers(&seen, withheld.hash),
+        [
+            (Via::BlockSync, Answer::Committed),
+            (Via::Bpv1, Answer::Duplicate)
+        ],
+        "block sync commits the withheld block, and BPv1's late copy is a duplicate\n{summary}"
+    );
+    assert_eq!(seen.tally.fetches(withheld.height), 1, "{summary}");
     assert_eq!(
         seen.tally.committed.get(&next.hash),
         Some(&Via::Bpv1),
         "BPv1 commits the next block\n{summary}"
     );
-    assert_eq!(seen.tally.fetches(next.height), 0);
+    assert_eq!(seen.tally.fetches(next.height), 0, "{summary}");
 }
 
 /// Mirror 0 withholds a block's parts until the first repair round
-/// releases the body claim, then sends them. BPv1 and block sync race, and
-/// the first submission wins: the node verifies the block once, commits it
-/// once, and answers any later delivery as a duplicate.
+/// releases the body claim and block sync fetches the body, then sends
+/// them. BPv1 and block sync both deliver the block, and the first
+/// submission wins: the node verifies the block once, commits it once, and
+/// answers the other delivery as a duplicate.
 #[test]
 fn bpv1_57_a_repair_round_race_commits_once() {
     let seen = run_mesh(at_tip(), |director| async move {
@@ -556,31 +575,30 @@ fn bpv1_57_a_repair_round_race_commits_once() {
             || !mesh.node.claims.is_claimed(raced.hash, Instant::now()),
         )
         .await?;
+        until(
+            "block sync fetches the body",
+            Duration::from_secs(15),
+            || mesh.state.tally().fetches(raced.height) > 0,
+        )
+        .await?;
         mesh.hold(0, false);
         director.committed(raced).await
     });
     let summary = summary(&seen);
     assert_clean(&seen);
     let raced = seen.mined[0];
-    let answers: Vec<_> = seen
-        .tally
-        .answers
-        .iter()
-        .filter(|(_, hash, _)| *hash == raced.hash)
-        .map(|(via, _, answer)| (*via, *answer))
-        .collect();
+    let answers = answers(&seen, raced.hash);
+    let delivered = |via| answers.iter().filter(|answer| answer.0 == via).count();
     assert_eq!(
-        answers
-            .iter()
-            .filter(|(_, answer)| *answer == Answer::Committed)
-            .count(),
-        1,
-        "one delivery commits: {answers:?}\n{summary}"
+        (delivered(Via::Bpv1), delivered(Via::BlockSync)),
+        (1, 1),
+        "both paths deliver the block once: {answers:?}\n{summary}"
     );
-    assert!(
-        answers
-            .iter()
-            .all(|(_, answer)| matches!(answer, Answer::Committed | Answer::Duplicate)),
-        "every other delivery is a duplicate: {answers:?}\n{summary}"
+    let mut outcomes: Vec<_> = answers.iter().map(|answer| answer.1).collect();
+    outcomes.sort_by_key(|answer| *answer == Answer::Duplicate);
+    assert_eq!(
+        outcomes,
+        [Answer::Committed, Answer::Duplicate],
+        "the first delivery commits and the other is a duplicate\n{summary}"
     );
 }

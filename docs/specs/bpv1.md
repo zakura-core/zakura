@@ -251,8 +251,11 @@ metadata for a block at or below `top - PROPAGATION_DEPTH` (strictly
 `height + PROPAGATION_DEPTH > top`). A node also MUST NOT admit metadata for a
 block more than `PROPAGATION_DEPTH` above its verified tip. While a node catches
 up, header sync raises `top` far above the verified tip, and such a block cannot
-commit until its ancestors arrive. A node retires a block once it falls out of
-the window admission uses. Such blocks use the existing block-download path.
+commit until its ancestors arrive. Such blocks use the existing block-download
+path. A node retires a block once it falls to or below `top - PROPAGATION_DEPTH`.
+The verified-tip bound applies at admission only. A reorg can lower the verified
+tip, and a block admitted above the new bound keeps its slot until it completes
+or reaches its deadline.
 
 The coinbase commitment binds `proposer_node` to the block. A node therefore
 accepts relay flags only from the connection authenticated as `proposer_node`,

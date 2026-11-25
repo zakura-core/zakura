@@ -12,13 +12,16 @@ use blake2b_simd::Params;
 use rustls_pki_types::{AlgorithmIdentifier, SubjectPublicKeyInfoDer};
 
 use crate::{
-    composite::{ML_DSA_87_KEY_BYTES, ML_DSA_87_KEY_TAG},
+    composite::{ML_DSA_65_KEY_BYTES, ML_DSA_65_KEY_TAG},
     key::{NodeId, NodeKey, KEY_LENGTH},
     key_list::{KeyListError, NodeKeyList, ED25519_KEY_TAG, MAX_NODE_KEYS},
 };
 
 /// The longest key one credential entry may hold, in bytes: an ML-DSA-87
-/// public key, the largest of the NIST signature schemes.
+/// public key, the largest of the NIST signature schemes. It is larger than
+/// the ML-DSA-65 key this release signs with, so this release still reads a
+/// credential that a later release extends with a larger key, keeping that
+/// key as an unknown entry (ID-10, ID-12).
 pub const MAX_CREDENTIAL_KEY_BYTES: usize = 2_592;
 
 /// The longest encoded credential: the count byte, then [`MAX_NODE_KEYS`]
@@ -48,7 +51,7 @@ pub enum CredentialError {
     #[error(transparent)]
     KeyList(#[from] KeyListError),
     /// A key is empty, longer than [`MAX_CREDENTIAL_KEY_BYTES`], or not the
-    /// length its tag fixes (32 bytes for Ed25519, 2,592 for ML-DSA-87).
+    /// length its tag fixes (32 bytes for Ed25519, 1,952 for ML-DSA-65).
     #[error("a credential key has the wrong length")]
     KeyLength,
 }
@@ -82,7 +85,7 @@ impl NodeCredential {
         for (tag, key) in &entries {
             let fixed = match *tag {
                 ED25519_KEY_TAG => Some(KEY_LENGTH),
-                ML_DSA_87_KEY_TAG => Some(ML_DSA_87_KEY_BYTES),
+                ML_DSA_65_KEY_TAG => Some(ML_DSA_65_KEY_BYTES),
                 _ => None,
             };
             let fits = match fixed {
@@ -305,14 +308,14 @@ mod tests {
 
     /// The Regtest e2e harness names its seed node by this ID
     /// (`docker/zakura-regtest-e2e/node2.toml`). Computed with Python's
-    /// `hashlib.blake2b`: the ML-DSA-87 key's fingerprint under
+    /// `hashlib.blake2b`: the ML-DSA-65 key's fingerprint under
     /// `Zakura_KeyFpr_v1`, then the two-entry list under `Zakura_NodeId_v1`.
     #[test]
     fn the_e2e_seed_nodes_id_has_its_known_value() {
         let secret = NodeSecretKey::from_bytes(&[1; KEY_LENGTH]);
         assert_eq!(
             secret.public().to_string(),
-            "b6a03f0bb251c17e8ecbf067ad5684a2915d22302422cb112f9be012b2aa5ceb"
+            "bee4ed7d2e07dd73d681bdc52e8efb8aa4860cfbe832ef5b1479d7b313a9b72f"
         );
     }
 
@@ -386,6 +389,20 @@ mod tests {
             NodeCredential::from_entries([(UNKNOWN_TAG, vec![1; MAX_CREDENTIAL_KEY_BYTES + 1])]),
             Err(CredentialError::KeyLength)
         );
+        for length in [
+            ML_DSA_65_KEY_BYTES - 1,
+            ML_DSA_65_KEY_BYTES + 1,
+            MAX_CREDENTIAL_KEY_BYTES,
+        ] {
+            assert_eq!(
+                NodeCredential::from_entries([
+                    (ED25519_KEY_TAG, ed.clone()),
+                    (ML_DSA_65_KEY_TAG, vec![1; length]),
+                ]),
+                Err(CredentialError::KeyLength),
+                "an ML-DSA-65 key is {ML_DSA_65_KEY_BYTES} bytes, not {length}"
+            );
+        }
         assert_eq!(
             NodeCredential::from_entries([(UNKNOWN_TAG, vec![1]), (ED25519_KEY_TAG, ed.clone())]),
             Err(KeyListError::Tags.into())
@@ -414,7 +431,8 @@ mod tests {
 
     #[test]
     fn the_longest_credential_fits_its_bound() {
-        let entries = [ED25519_KEY_TAG, 3, 4, 5].map(|tag| {
+        // Tag 3 is ML-DSA-65, whose length is fixed below the bound.
+        let entries = [ED25519_KEY_TAG, 4, 5, 6].map(|tag| {
             let key = if tag == ED25519_KEY_TAG {
                 ed25519().as_bytes().to_vec()
             } else {

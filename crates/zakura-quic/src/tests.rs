@@ -381,7 +381,7 @@ fn assert_verified_signatures(side: &str, counters: &Counters, expected: u64) {
     assert_eq!(
         counters.series("zakura.quic.tls.signature_verified"),
         BTreeMap::from([(
-            r#"zakura.quic.tls.signature_verified{scheme="ed25519_mldsa87"}"#.to_string(),
+            r#"zakura.quic.tls.signature_verified{scheme="ed25519_mldsa65"}"#.to_string(),
             expected
         )]),
         "{side} verified signatures"
@@ -2113,7 +2113,7 @@ impl rustls::sign::SigningKey for Impostor {
     }
 
     fn algorithm(&self) -> rustls::SignatureAlgorithm {
-        rustls::SignatureAlgorithm::Unknown(0x44)
+        rustls::SignatureAlgorithm::Unknown(0x65)
     }
 }
 
@@ -3169,9 +3169,9 @@ async fn the_hybrid_hello_leaves_as_two_initial_datagrams() {
     .unwrap();
 }
 
-/// TLS-4, TLS-9, ADM-1: the listener's whole first flight, with its
-/// ML-KEM-1024 ciphertext, ML-DSA-87 credential and composite signature, is
-/// larger than QUIC's allowance before the dialer's address is validated:
+/// TLS-4, TLS-9, ADM-1: the listener's whole first flight, about 7.9 KB with
+/// its ML-KEM-1024 ciphertext, ML-DSA-65 credential and composite signature,
+/// is larger than QUIC's allowance before the dialer's address is validated:
 /// three times the 2,400 bytes of the hybrid hello. quinn-proto stops at the
 /// allowance, finishing the datagram it started (quinn issue 1082), and sends
 /// the rest once the dialer's acknowledgements validate the address. A dial

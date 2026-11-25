@@ -16,7 +16,7 @@ initial_testnet_peers = []
 max_connections_per_ip = 10
 # Fixed iroh identity so the pure-Zakura node (node2) can list this seed in its
 # bootstrap_peers with a known node ID. The node ID for this secret key is
-# b6a03f0bb251c17e8ecbf067ad5684a2915d22302422cb112f9be012b2aa5ceb (regenerate by
+# bee4ed7d2e07dd73d681bdc52e8efb8aa4860cfbe832ef5b1479d7b313a9b72f (regenerate by
 # printing NodeSecretKey::public() if this key ever changes).
 zakura_node_secret_key = "0101010101010101010101010101010101010101010101010101010101010101"
 

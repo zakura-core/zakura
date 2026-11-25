@@ -46,7 +46,7 @@ const UNKNOWN_KEY_TAG: u16 = 0x7f00;
 
 /// The one-entry key list of the `index`th test node's Ed25519 key: the
 /// shortest list the format allows. A node's own list also holds its
-/// ML-DSA-87 key's fingerprint.
+/// ML-DSA-65 key's fingerprint.
 fn keys(index: usize) -> NodeKeyList {
     let mut seed = [0u8; 32];
     seed[..8].copy_from_slice(&(index as u64).to_le_bytes());

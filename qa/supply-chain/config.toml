@@ -242,12 +242,12 @@ notes = "Introduced with the hybrid key-exchange group (zakura-quic TLS-9), now 
 [[exemptions.libcrux-macros]]
 version = "0.0.4"
 criteria = "safe-to-deploy"
-notes = "Introduced with the composite handshake signature (zakura-quic TLS-4), now Ed25519 + ML-DSA-87, which takes ML-DSA-87 from libcrux; exact-version exemption pending dedicated package review. This exemption is not an audit certification."
+notes = "Introduced with the composite handshake signature (zakura-quic TLS-4), now Ed25519 + ML-DSA-65, which takes ML-DSA-65 from libcrux; exact-version exemption pending dedicated package review. This exemption is not an audit certification."
 
 [[exemptions.libcrux-ml-dsa]]
 version = "0.0.12"
 criteria = "safe-to-deploy"
-notes = "Introduced with the composite handshake signature (zakura-quic TLS-4), now Ed25519 + ML-DSA-87, which takes ML-DSA-87 from libcrux; exact-version exemption pending dedicated package review. This exemption is not an audit certification."
+notes = "Introduced with the composite handshake signature (zakura-quic TLS-4), now Ed25519 + ML-DSA-65, which takes ML-DSA-65 from libcrux; exact-version exemption pending dedicated package review. This exemption is not an audit certification."
 
 [[exemptions.libcrux-ml-kem]]
 version = "0.0.12"

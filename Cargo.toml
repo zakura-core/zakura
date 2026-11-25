@@ -103,8 +103,8 @@ libc = "0.2"
 # `rand` feature off: the caller passes the randomness in, so a simulation can
 # seed it.
 libcrux-ml-kem = { version = "0.0.12", default-features = false, features = ["mlkem1024"] }
-# SPEC TLS-4: ML-DSA-87 for the composite handshake signature.
-libcrux-ml-dsa = { version = "0.0.12", default-features = false, features = ["mldsa87"] }
+# SPEC TLS-4: ML-DSA-65 for the composite handshake signature.
+libcrux-ml-dsa = { version = "0.0.12", default-features = false, features = ["mldsa65"] }
 memchr = "2.8"
 metrics = "0.24"
 pin-project = "1.1.10"

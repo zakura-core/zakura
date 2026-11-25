@@ -1,19 +1,19 @@
-//! ML-DSA-87 against published known answers, through the composite's own
+//! ML-DSA-65 against published known answers, through the composite's own
 //! key generation, signing and verification.
 //!
 //! The vectors are subsets of two sources. The files keep the upstream
 //! layout with fewer tests:
 //!
-//! - `wycheproof/`: Project Wycheproof's `testvectors_v1/mldsa_87_sign_seed_test.json`
-//!   and `mldsa_87_verify_test.json` at <https://github.com/C2SP/wycheproof>,
+//! - `wycheproof/`: Project Wycheproof's `testvectors_v1/mldsa_65_sign_seed_test.json`
+//!   and `mldsa_65_verify_test.json` at <https://github.com/C2SP/wycheproof>,
 //!   commit 65ca4947, Apache-2.0. The unused `privateKeyPkcs8` and
 //!   `publicKeyDer` group fields are dropped.
-//! - `acvp/`: the ML-DSA-87 groups of NIST's ACVP-Server
+//! - `acvp/`: the ML-DSA-65 groups of NIST's ACVP-Server
 //!   `gen-val/json-files/ML-DSA-keyGen-FIPS204/internalProjection.json` and
 //!   `ML-DSA-sigGen-FIPS204/internalProjection.json` at
 //!   <https://github.com/usnistgov/ACVP-Server>, commit 975de31e. NIST
 //!   software, provided by NIST as a public service; cut down to the tests
-//!   kept here on 2026-11-22.
+//!   kept here on 2026-11-25.
 //!
 //! A node signs with a key generated from a 32-byte seed, so the Wycheproof
 //! "seed" vectors run through [`ml_dsa_sign_in_context`] and
@@ -134,7 +134,7 @@ struct AcvpSigGen {
     #[serde(deserialize_with = "from_hex")]
     pk: Vec<u8>,
     #[serde(deserialize_with = "from_hex_array")]
-    sk: [u8; ml_dsa_87::MLDSA87SigningKey::len()],
+    sk: [u8; ml_dsa_65::MLDSA65SigningKey::len()],
     #[serde(deserialize_with = "from_hex")]
     context: Vec<u8>,
     #[serde(deserialize_with = "from_hex")]
@@ -154,7 +154,7 @@ fn groups<G: serde::de::DeserializeOwned>(json: &str) -> Vec<G> {
 /// own context. A 256-byte context is refused.
 #[test]
 fn seeded_keys_and_signatures_match_wycheproof() {
-    let groups: Vec<SignGroup> = groups(include_str!("wycheproof/mldsa_87_sign_seed_test.json"));
+    let groups: Vec<SignGroup> = groups(include_str!("wycheproof/mldsa_65_sign_seed_test.json"));
     let mut count = 0;
     for group in groups {
         assert_eq!(ml_dsa_public_key(&group.private_seed), group.public_key[..]);
@@ -197,7 +197,7 @@ fn seeded_keys_and_signatures_match_wycheproof() {
 /// overflowing hint encoding and a response above the norm bound.
 #[test]
 fn verification_matches_wycheproof() {
-    let groups: Vec<VerifyGroup> = groups(include_str!("wycheproof/mldsa_87_verify_test.json"));
+    let groups: Vec<VerifyGroup> = groups(include_str!("wycheproof/mldsa_65_verify_test.json"));
     let mut count = 0;
     for group in groups {
         for test in group.tests {
@@ -224,12 +224,12 @@ fn key_generation_matches_acvp() {
         groups(include_str!("acvp/ML-DSA-keyGen-FIPS204.json"));
     let mut count = 0;
     for group in groups {
-        assert_eq!(group.parameter_set, "ML-DSA-87");
+        assert_eq!(group.parameter_set, "ML-DSA-65");
         for test in group.tests {
             count += 1;
             let id = test.tc_id;
             assert_eq!(ml_dsa_public_key(&test.seed)[..], test.pk, "test {id}");
-            let pair = ml_dsa_87::generate_key_pair(test.seed);
+            let pair = ml_dsa_65::generate_key_pair(test.seed);
             assert_eq!(pair.signing_key.as_slice(), test.sk, "test {id}");
         }
     }
@@ -247,12 +247,12 @@ fn hedged_signing_matches_acvp() {
         groups(include_str!("acvp/ML-DSA-sigGen-FIPS204.json"));
     let mut count = 0;
     for group in groups {
-        assert_eq!(group.parameter_set, "ML-DSA-87");
+        assert_eq!(group.parameter_set, "ML-DSA-65");
         for test in group.tests {
             count += 1;
             let id = test.tc_id;
-            let key = ml_dsa_87::MLDSA87SigningKey::new(test.sk);
-            let signature = ml_dsa_87::sign(&key, &test.message, &test.context, test.rnd).unwrap();
+            let key = ml_dsa_65::MLDSA65SigningKey::new(test.sk);
+            let signature = ml_dsa_65::sign(&key, &test.message, &test.context, test.rnd).unwrap();
             assert_eq!(signature.as_slice(), test.signature, "test {id}");
             assert_eq!(
                 ml_dsa_verify_in_context(&test.pk, &test.message, &test.context, &test.signature),
@@ -269,7 +269,7 @@ fn hedged_signing_matches_acvp() {
     assert_eq!(count, 1);
 }
 
-/// The published composite known answer (`ed25519_mldsa87_kat.json`, TLS-4).
+/// The published composite known answer (`ed25519_mldsa65_kat.json`, TLS-4).
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CompositeFile {
@@ -305,7 +305,7 @@ struct CompositeTest {
 #[test]
 fn the_composite_has_its_published_known_answer() {
     let file: CompositeFile =
-        serde_json::from_str(include_str!("ed25519_mldsa87_kat.json")).unwrap();
+        serde_json::from_str(include_str!("ed25519_mldsa65_kat.json")).unwrap();
     assert_eq!(
         file.scheme,
         format!("0x{:04X}", u16::from(COMPOSITE_SCHEME))
@@ -320,7 +320,7 @@ fn the_composite_has_its_published_known_answer() {
         );
         assert_eq!(hex::encode(ml_dsa_seed(&test.seed)), test.ml_dsa_seed);
         assert_eq!(
-            secret.credential().key(ML_DSA_87_KEY_TAG),
+            secret.credential().key(ML_DSA_65_KEY_TAG),
             Some(test.ml_dsa_public_key.as_slice())
         );
         assert_eq!(secret.public().to_string(), test.node_id);

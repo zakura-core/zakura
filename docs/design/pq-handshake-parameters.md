@@ -81,7 +81,7 @@ the allowance is 7,200 bytes.
 
 - On `p2p-v2/4` the listener's whole first flight, about 5.8 KB, fit. A dial
   completed after one round trip.
-- On `p2p-v2/5` the flight is about 7.9 KB. The listener holds the first datagram
+- On `p2p-v2/5` without padding the flight is about 7.9 KB. The listener holds the first datagram
   that would exceed the allowance. It sends the rest once the dialer's
   Handshake acknowledgement validates its address. A dial completes after
   two round trips.
@@ -89,7 +89,9 @@ the allowance is 7,200 bytes.
 The dialer therefore pads its first flight (spec DIAL-8). Right after the
 hello it sends one more Initial datagram, a PING that quinn-proto pads to
 1,200 bytes. The listener has then received 3,600 bytes, its allowance is
-10,800, and its whole first flight fits.
+10,800, and its whole first flight fits. If the padding arrives late, the
+listener stays within 7,200 bytes until it receives more bytes or validates
+the dialer's address.
 
 Measured in the simulator with a fixed one-way delay:
 

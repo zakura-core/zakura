@@ -219,7 +219,6 @@ counts, the places it holds, and its v2 peers. In this example the node has
 ```json
 {
   "node_id": "2840...36c7",
-  "announcing": true,
   "announced_gateways": ["2840...3793"],
   "mining": true,
   "synced": true,
@@ -249,7 +248,6 @@ counts, the places it holds, and its v2 peers. In this example the node has
 | Field | Meaning |
 | --- | --- |
 | `node_id` | This node's v2 node ID in hex, or null without v2 networking. |
-| `announcing` | The coinbases this node builds name a gateway. |
 | `announced_gateways` | The gateway IDs in hex that the coinbases this node builds name: its own, or the relay `mining.miner_mesh_gateways` names. Empty when the node does not announce, and one entry for now. |
 | `mining` | The node has a miner address. |
 | `synced` | The tip is recent enough to prefer gateways when this request is served. Always true on test networks. |

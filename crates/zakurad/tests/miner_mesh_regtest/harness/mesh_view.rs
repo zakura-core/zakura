@@ -268,10 +268,10 @@ pub(super) fn check_view(view: &MeshView, facts: &NodeFacts) -> Vec<String> {
     // 8. The node's coinbases name the gateway the harness configured: its
     // own node, the relay it names, or none.
     let announced: Vec<String> = facts.announced.iter().map(hex::encode).collect();
-    if info.announced_gateways != announced || info.announcing != facts.announced.is_some() {
+    if info.announced_gateways != announced {
         broken.push(format!(
-            "8: the node announces {:?} (announcing = {}), not {announced:?}",
-            info.announced_gateways, info.announcing
+            "8: the node announces {:?}, not {announced:?}",
+            info.announced_gateways
         ));
     }
 

@@ -60,10 +60,10 @@ impl GatewayId {
 /// The error returned when text names no gateway ID.
 #[derive(Clone, Debug, PartialEq, thiserror::Error)]
 pub enum ParseGatewayIdError {
-    /// The text is neither a v2 node ID nor a gateway ID long.
+    /// The text is the length of neither a v2 node ID nor a gateway ID.
     #[error(
         "expected 64 hex digits (a v2 node ID) or 40 hex digits (a gateway ID), \
-         found {0} characters"
+         found {0} bytes"
     )]
     Length(usize),
     /// The text has the length of an ID but is not hex.
@@ -87,7 +87,7 @@ impl FromStr for GatewayId {
             hex::decode_to_slice(text, &mut gateway_id)?;
             Ok(Self(gateway_id))
         } else {
-            Err(ParseGatewayIdError::Length(text.chars().count()))
+            Err(ParseGatewayIdError::Length(text.len()))
         }
     }
 }

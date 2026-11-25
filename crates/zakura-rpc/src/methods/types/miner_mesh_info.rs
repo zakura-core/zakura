@@ -52,10 +52,6 @@ pub struct GetMinerMeshInfoResponse {
     /// This node's v2 node ID in hex, or null when it runs no v2 networking.
     pub node_id: Option<String>,
 
-    /// Whether the coinbases this node builds name a gateway
-    /// (`mining.miner_mesh` with a miner address).
-    pub announcing: bool,
-
     /// The gateway IDs the coinbases this node builds name, in hex: this
     /// node's own, or the one `mining.miner_mesh_gateways` names. Empty when
     /// the node does not announce, and at most one entry for now.
@@ -201,7 +197,6 @@ impl GetMinerMeshInfoResponse {
         } = node;
         Self {
             node_id: node_id.map(hex::encode),
-            announcing: announced_gateway.is_some(),
             announced_gateways: announced_gateway.iter().map(ToString::to_string).collect(),
             mining,
             synced,

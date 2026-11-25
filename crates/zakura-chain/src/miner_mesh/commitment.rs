@@ -78,12 +78,18 @@ impl MinerMeshCommitment {
 
     /// Returns the commitment in a coinbase transaction's `outputs`.
     ///
-    /// Returns `None` when no output is a commitment, and when two or more
-    /// are, because the miner's choice is then ambiguous.
+    /// When several outputs are commitments to the same gateway, as when a
+    /// pool copies the output into a coinbase that already has it, that
+    /// gateway is the one named.
+    ///
+    /// Returns `None` when no output is a commitment, and when two outputs
+    /// name different gateways, because the miner's choice is then ambiguous.
     pub fn from_coinbase_outputs(outputs: &[Output]) -> Option<Self> {
         let mut commitments = outputs.iter().filter_map(Self::from_output);
         let commitment = commitments.next()?;
-        commitments.next().is_none().then_some(commitment)
+        commitments
+            .all(|other| other == commitment)
+            .then_some(commitment)
     }
 
     /// Returns the commitment `output` carries, if it is one.

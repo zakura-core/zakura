@@ -91,12 +91,30 @@ fn outputs_without_a_commitment_name_no_gateway() {
 }
 
 #[test]
-fn two_commitments_are_ambiguous() {
+fn copies_of_one_commitment_name_its_gateway() {
+    for outputs in [
+        vec![commitment().to_output(), commitment().to_output()],
+        vec![
+            commitment().to_output(),
+            reward_output(),
+            commitment().to_output(),
+            commitment().to_output(),
+        ],
+    ] {
+        assert_eq!(
+            MinerMeshCommitment::from_coinbase_outputs(&outputs),
+            Some(commitment()),
+        );
+    }
+}
+
+#[test]
+fn commitments_to_two_gateways_are_ambiguous() {
     let other = MinerMeshCommitment::new(GatewayId::from_bytes([0xff; 20]));
 
     for outputs in [
         vec![commitment().to_output(), other.to_output()],
-        vec![commitment().to_output(), commitment().to_output()],
+        vec![other.to_output(), reward_output(), commitment().to_output()],
         vec![
             commitment().to_output(),
             reward_output(),

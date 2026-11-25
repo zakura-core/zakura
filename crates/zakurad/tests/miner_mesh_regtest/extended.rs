@@ -1,9 +1,7 @@
-//! Longer miner mesh scenarios: a ranking cut at ten gateways, a gateway
-//! that restarts, a reorg that replaces the counted blocks, and markers that
-//! age out of the window.
+//! Extended miner mesh scenarios, including connection transitions,
+//! ranking, restarts, reorgs and aging.
 //!
-//! They start a dozen nodes or mine thousands of blocks, so they run under
-//! their own profile:
+//! Run them under their own profile:
 //!
 //! ```sh
 //! cargo nextest run --profile miner-mesh-regtest-extended --run-ignored=all -p zakura
@@ -15,6 +13,8 @@ use std::{
 };
 
 use eyre::Result;
+
+use zakura_rpc::client::MeshGatewayState;
 
 use super::harness::{GatewayId, NodeSpec, RegtestNet, Role, QUALIFYING_DEPTH, WINDOW_BLOCKS};
 
@@ -362,4 +362,120 @@ fn is_ordinary_peer(net: &RegtestNet, node: usize, id: &GatewayId, preferred_slo
         && view.peer(id).is_some_and(|peer| !peer.preferred)
         && view.info.hold == preferred_slots
         && view.info.slots.expect("the miner runs v2").preferred == preferred_slots
+}
+
+/// A gateway already connected as an ordinary peer when its marker qualifies
+/// becomes preferred on the same connection, without a new one.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "starts zakurad children: run with the miner-mesh-regtest-extended nextest profile"]
+async fn a_connected_gateway_is_promoted_in_place() -> Result<()> {
+    const A: usize = 0;
+    const B: usize = 1;
+    let _init_guard = zakura_test::init();
+
+    let mut net = RegtestNet::start(vec![
+        NodeSpec::new(Role::Pool),
+        NodeSpec::new(Role::Miner).bootstrap_from([A]),
+    ])
+    .await?;
+    let a = net.gateway_id(A);
+
+    // Either node may end up holding the connection it opened; what matters
+    // is that one connection, in one direction, lasts.
+    net.mine(A, 1).await?;
+    let one_connection = |net: &RegtestNet| {
+        let view = net.view(B);
+        view.is_connected_to(&a)
+            && view.info.slots.expect("B runs v2").in_use == view.info.peers.len()
+    };
+    net.wait_for("A connected to B", DIAL_TIMEOUT, one_connection)
+        .await?;
+    let inbound = |net: &RegtestNet| net.view(B).peer(&a).map(|peer| peer.inbound);
+    let direction = inbound(&net);
+    net.hold_for("A's one connection to B", QUIET_PERIOD, |net| {
+        one_connection(net) && inbound(net) == direction
+    })
+    .await?;
+    assert_eq!(
+        net.view(B).state_of(&a),
+        None,
+        "A's marker is not deep enough yet"
+    );
+
+    net.mine(B, QUALIFYING_DEPTH - 1).await?;
+    assert_eq!(net.view(B).state_of(&a), None);
+    assert!(one_connection(&net) && inbound(&net) == direction);
+    #[cfg(feature = "prometheus")]
+    let accepted = {
+        let accepted = net.counter(B, "zakura_p2p_conn_accepted").await?;
+        assert!(accepted > 0, "B registered its ordinary connection to A");
+        accepted
+    };
+
+    net.mine(B, 1).await?;
+    net.wait_for("B preferring A", DIAL_TIMEOUT, |net| {
+        net.view(B).prefers_and_holds(&a)
+    })
+    .await?;
+    net.hold_for("A preferred on its one connection", QUIET_PERIOD, |net| {
+        net.view(B).prefers_and_holds(&a) && one_connection(net) && inbound(net) == direction
+    })
+    .await?;
+    assert_eq!(net.view(B).info.slots.expect("B runs v2").preferred, 1);
+    #[cfg(feature = "prometheus")]
+    assert_eq!(net.counter(B, "zakura_p2p_conn_accepted").await?, accepted);
+
+    Ok(())
+}
+
+/// A node ranks a gateway it has no address for, holds no place for it and
+/// dials nothing, until the gateway joins the network and the node learns
+/// its address by peer exchange.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "starts zakurad children: run with the miner-mesh-regtest-extended nextest profile"]
+async fn an_unknown_gateway_waits_then_joins() -> Result<()> {
+    const HUB: usize = 0;
+    const B: usize = 1;
+    const A: usize = 2;
+    let _init_guard = zakura_test::init();
+
+    let mut net = RegtestNet::start(vec![
+        NodeSpec::new(Role::Relay).start_later(),
+        NodeSpec::new(Role::Miner)
+            .bootstrap_from([HUB])
+            .start_later(),
+        NodeSpec::new(Role::Pool).bootstrap_from([HUB]),
+    ])
+    .await?;
+    let a = net.gateway_id(A);
+
+    // A mines its marker alone, and the block reaches the hub by RPC, so no
+    // node has a record of A.
+    net.mine(A, 1).await?;
+    let marker = net.block(A, 1).await?;
+    net.stop(A).await;
+    net.start_node(HUB).await?;
+    net.submit_block(HUB, marker).await?;
+    net.start_node(B).await?;
+    net.settle().await?;
+    net.mine(B, QUALIFYING_DEPTH).await?;
+
+    let waits = |net: &RegtestNet| {
+        let view = net.view(B);
+        view.state_of(&a) == Some(MeshGatewayState::Unmatched)
+            && view.info.hold == 0
+            && !view.is_connected_to(&a)
+    };
+    net.wait_for("B ranking A, unmatched", DIAL_TIMEOUT, waits)
+        .await?;
+    net.hold_for("B waiting for A", QUIET_PERIOD, waits).await?;
+
+    net.start_node(A).await?;
+    net.wait_for("B connecting to A", DISCOVERY_TIMEOUT, |net| {
+        net.view(B).prefers_and_holds(&a)
+    })
+    .await?;
+    assert_eq!(net.view(B).info.hold, 1);
+
+    Ok(())
 }

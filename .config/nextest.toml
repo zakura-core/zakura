@@ -127,9 +127,9 @@ slow-timeout = { period = "15m", terminate-after = 1 }
 failure-output = "immediate"
 default-filter = 'package(zakura) and binary(miner_mesh_regtest) and not test(/^extended::/)'
 
-# The longer miner mesh scenarios (`crates/zakurad/tests/miner_mesh_regtest/extended.rs`):
-# a dozen nodes, or thousands of mined blocks. Successful runs show their output,
-# which logs how long a restarted gateway takes to be preferred again.
+# Extended miner mesh coverage includes connection transitions, larger networks
+# and longer chains. Successful runs show how long a restarted gateway takes
+# to be preferred again.
 [profile.miner-mesh-regtest-extended]
 test-threads = 1
 fail-fast = false

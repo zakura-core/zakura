@@ -63,7 +63,7 @@ pub(crate) async fn submit_blocks_test() -> Result<()> {
         .with_timeout(EXTENDED_LAUNCH_DELAY);
 
     let rpc_address = read_listen_addr_from_logs(&mut zakurad, OPENED_RPC_ENDPOINT_MSG)?;
-    zakurad.expect_stdout_line_matches("activating mempool")?;
+    zakurad.expect_stdout_line_matches("mempool activated")?;
 
     let client = RpcRequestClient::new(rpc_address);
 
@@ -127,7 +127,7 @@ pub(crate) async fn startup_upgrades_previous_database_test() -> Result<()> {
         .spawn_child(args!["start"])?
         .with_timeout(EXTENDED_LAUNCH_DELAY);
     let seed_rpc = read_listen_addr_from_logs(&mut seed_node, OPENED_RPC_ENDPOINT_MSG)?;
-    seed_node.expect_stdout_line_matches("activating mempool")?;
+    seed_node.expect_stdout_line_matches("mempool activated")?;
     let saved_block = RpcRequestClient::new(seed_rpc)
         .mine_proposed_block(&net)
         .await?;
@@ -172,7 +172,7 @@ pub(crate) async fn startup_upgrades_previous_database_test() -> Result<()> {
         .with_timeout(EXTENDED_LAUNCH_DELAY);
     zakurad.expect_stdout_line_matches("loaded Zakura state cache.*finalized_tip_height=1")?;
     let rpc_address = read_listen_addr_from_logs(&mut zakurad, OPENED_RPC_ENDPOINT_MSG)?;
-    zakurad.expect_stdout_line_matches("activating mempool")?;
+    zakurad.expect_stdout_line_matches("mempool activated")?;
     let client = RpcRequestClient::new(rpc_address);
     assert!(
         !previous_path.exists(),
@@ -252,7 +252,7 @@ pub(crate) async fn pruned_checkpoint_sync_mining_without_transparent_indexes_te
         .with_timeout(EXTENDED_LAUNCH_DELAY);
     let cache_dir = config.state.cache_dir.clone();
     let rpc_address = read_listen_addr_from_logs(&mut zakurad, OPENED_RPC_ENDPOINT_MSG)?;
-    zakurad.expect_stdout_line_matches("activating mempool")?;
+    zakurad.expect_stdout_line_matches("mempool activated")?;
     let client = RpcRequestClient::new(rpc_address);
 
     // Start with a complete indexed database and finalize at least the height 1 coinbase.
@@ -288,7 +288,7 @@ pub(crate) async fn pruned_checkpoint_sync_mining_without_transparent_indexes_te
         .spawn_child(args!["start"])?
         .with_timeout(EXTENDED_LAUNCH_DELAY);
     let rpc_address = read_listen_addr_from_logs(&mut zakurad, OPENED_RPC_ENDPOINT_MSG)?;
-    zakurad.expect_stdout_line_matches("activating mempool")?;
+    zakurad.expect_stdout_line_matches("mempool activated")?;
     let client = RpcRequestClient::new(rpc_address);
     assert_eq!(
         client.blockchain_info().await?.blocks(),
@@ -355,7 +355,7 @@ pub(crate) async fn pruned_checkpoint_sync_mining_without_transparent_indexes_te
         .spawn_child(args!["start"])?
         .with_timeout(EXTENDED_LAUNCH_DELAY);
     let rpc_address = read_listen_addr_from_logs(&mut zakurad, OPENED_RPC_ENDPOINT_MSG)?;
-    zakurad.expect_stdout_line_matches("activating mempool")?;
+    zakurad.expect_stdout_line_matches("mempool activated")?;
     let client = RpcRequestClient::new(rpc_address);
 
     assert_eq!(

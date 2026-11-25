@@ -1065,7 +1065,7 @@ async fn sync_checkpoints_local() -> Result<()> {
         .spawn_child(args!["start"])?
         .with_timeout(LARGE_CHECKPOINT_TIMEOUT);
     let producer_rpc_addr = read_listen_addr_from_logs(&mut producer, OPENED_RPC_ENDPOINT_MSG)?;
-    producer.expect_stdout_line_matches("activating mempool")?;
+    producer.expect_stdout_line_matches("mempool activated")?;
 
     let producer_rpc =
         RpcRequestClient::new_with_timeout(producer_rpc_addr, Duration::from_secs(15 * 60));
@@ -2353,7 +2353,7 @@ async fn rejected_block_does_not_reject_same_hash_block_children() -> Result<()>
         .spawn_child(args!["start"])?
         .with_timeout(EXTENDED_LAUNCH_DELAY);
     let rpc_address = read_listen_addr_from_logs(&mut block_builder, OPENED_RPC_ENDPOINT_MSG)?;
-    block_builder.expect_stdout_line_matches("activating mempool")?;
+    block_builder.expect_stdout_line_matches("mempool activated")?;
 
     let client = RpcRequestClient::new(rpc_address);
     let mut blocks = Vec::new();
@@ -2373,7 +2373,7 @@ async fn rejected_block_does_not_reject_same_hash_block_children() -> Result<()>
         .spawn_child(args!["start"])?
         .with_timeout(EXTENDED_LAUNCH_DELAY);
     let rpc_address = read_listen_addr_from_logs(&mut zakurad, OPENED_RPC_ENDPOINT_MSG)?;
-    zakurad.expect_stdout_line_matches("activating mempool")?;
+    zakurad.expect_stdout_line_matches("mempool activated")?;
 
     let client = RpcRequestClient::new(rpc_address);
     client.submit_block(blocks[0].clone()).await?;
@@ -2479,7 +2479,7 @@ async fn getrawtransaction_confirmations_include_non_finalized_blocks() -> Resul
         .spawn_child(args!["start"])?;
     let rpc_address = read_listen_addr_from_logs(&mut zakurad, OPENED_RPC_ENDPOINT_MSG)?;
 
-    zakurad.expect_stdout_line_matches("activating mempool")?;
+    zakurad.expect_stdout_line_matches("mempool activated")?;
 
     let client = RpcRequestClient::new(rpc_address);
     client.generate(1).await?;
@@ -2514,7 +2514,7 @@ async fn getrawtransaction_confirmations_include_non_finalized_blocks() -> Resul
         .spawn_child(args!["start"])?;
     let rpc_address = read_listen_addr_from_logs(&mut zakurad, OPENED_RPC_ENDPOINT_MSG)?;
 
-    zakurad.expect_stdout_line_matches("activating mempool")?;
+    zakurad.expect_stdout_line_matches("mempool activated")?;
 
     let client = RpcRequestClient::new(rpc_address);
     client
@@ -2604,7 +2604,7 @@ async fn pruned_storage_mode_prunes_during_regtest_sync() -> Result<()> {
         .take()
         .expect("zakurad should have a test directory");
 
-    zakurad.expect_stdout_line_matches("activating mempool")?;
+    zakurad.expect_stdout_line_matches("mempool activated")?;
 
     let client = RpcRequestClient::new(rpc_address);
 
@@ -3500,7 +3500,7 @@ async fn invalidate_and_reconsider_block() -> Result<()> {
         .spawn_child(args!["start"])?
         .with_timeout(EXTENDED_LAUNCH_DELAY);
     let rpc_address = read_listen_addr_from_logs(&mut child, OPENED_RPC_ENDPOINT_MSG)?;
-    child.expect_stdout_line_matches("activating mempool")?;
+    child.expect_stdout_line_matches("mempool activated")?;
 
     let rpc_client = RpcRequestClient::new(rpc_address);
     let mut blocks = Vec::new();
@@ -3586,7 +3586,7 @@ async fn precious_block_prefers_equal_work_siblings() -> Result<()> {
         .spawn_child(args!["start"])?
         .with_timeout(EXTENDED_LAUNCH_DELAY);
     let rpc_address = read_listen_addr_from_logs(&mut child, OPENED_RPC_ENDPOINT_MSG)?;
-    child.expect_stdout_line_matches("activating mempool")?;
+    child.expect_stdout_line_matches("mempool activated")?;
     let rpc_client = RpcRequestClient::new(rpc_address);
     rpc_client.generate(2).await?;
 
@@ -3675,7 +3675,7 @@ async fn restores_non_finalized_state_and_commits_new_blocks() -> Result<()> {
     let rpc_client = RpcRequestClient::new(rpc_address);
     child.expect_stdout_line_matches("verified final checkpoint")?;
     wake_debug_mempool(&rpc_client).await?;
-    child.expect_stdout_line_matches("activating mempool")?;
+    child.expect_stdout_line_matches("mempool activated")?;
     let generated_block_hashes = rpc_client.generate(INITIAL_NON_FINALIZED_BLOCKS).await?;
 
     child.kill(true)?;
@@ -3717,7 +3717,7 @@ async fn restores_non_finalized_state_and_commits_new_blocks() -> Result<()> {
 
     tracing::info!("checking that Zakura can commit blocks after restoring non-finalized state");
     wake_debug_mempool(&rpc_client).await?;
-    child.expect_stdout_line_matches("activating mempool")?;
+    child.expect_stdout_line_matches("mempool activated")?;
     rpc_client
         .generate(1)
         .await
@@ -3788,7 +3788,7 @@ async fn restores_non_finalized_state_and_commits_new_blocks() -> Result<()> {
     // after checkpoint verification.
 
     wake_debug_mempool(&rpc_client).await?;
-    child.expect_stdout_line_matches("activating mempool")?;
+    child.expect_stdout_line_matches("mempool activated")?;
     rpc_client
         .generate(1)
         .await
@@ -3817,7 +3817,7 @@ async fn restores_non_finalized_state_and_commits_new_blocks() -> Result<()> {
 
     tracing::info!("checking that Zakura commits blocks with empty non-finalized state");
     wake_debug_mempool(&rpc_client).await?;
-    child.expect_stdout_line_matches("activating mempool")?;
+    child.expect_stdout_line_matches("mempool activated")?;
     rpc_client
         .generate(1)
         .await

@@ -138,7 +138,7 @@ fn close_2_decode_errors() {
         ("zero want_id", control_input(&zero_id)),
         ("empty Want bitmap", control_input(&empty_bitmap)),
         ("truncated Want", control_input(&short_want)),
-        ("unparseable header", control_input(&bad_header)),
+        ("unparsable header", control_input(&bad_header)),
     ] {
         assert_eq!(input.err(), Some(Bpv1CloseRow::Row2Decode), "{name}");
     }

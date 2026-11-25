@@ -255,9 +255,10 @@ fn scenario_part_after_want_end_closes_14_and_after_block_done_drops_surplus() {
 }
 
 /// bpv1-58: a peer that stops reading control gets the repeat-stall close,
-/// with no protocol close row, and its pull claims release at session end.
+/// with no protocol close row. Its session end emits nothing: the table's
+/// `SessionEnded` releases its pull claims.
 #[test]
-fn control_stall_closes_neutrally_and_releases_claims() {
+fn control_stall_closes_neutrally() {
     let t0 = Instant::now();
     let block_id = block::Hash([0x34; 32]);
     let mut peer = tiny_session(block_id, t0);
@@ -268,10 +269,7 @@ fn control_stall_closes_neutrally_and_releases_claims() {
     assert!(peer.is_closed_neutral());
     assert_eq!(peer.close_cause(), None);
     let ended = peer.step(t0, PeerInput::SessionEnd);
-    assert!(ended
-        .outputs
-        .iter()
-        .any(|o| matches!(o, PeerOutput::ReleaseClaims { .. })));
+    assert!(ended.outputs.is_empty(), "{:?}", ended.outputs);
 }
 
 #[test]

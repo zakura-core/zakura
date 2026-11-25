@@ -121,7 +121,15 @@ struct LiveSession {
 /// Async completion returned to the BPv1 driver task.
 enum DriverMsg {
     BlockInput(BlockInput),
-    ReplayActiveToPeer { peer_node: NodeId, session_gen: u64 },
+    ReplayActiveToPeer {
+        peer_node: NodeId,
+        session_gen: u64,
+    },
+    /// A session left `sessions`; the driver ends it in the table.
+    SessionEnded {
+        peer_node: NodeId,
+        session_gen: u64,
+    },
     WakeTick,
 }
 
@@ -1180,6 +1188,30 @@ async fn run_bpv1_driver(
                             let _ = node.send_to(&peer_node, Some(session_gen), input);
                         }
                     }
+                    DriverMsg::SessionEnded {
+                        peer_node,
+                        session_gen,
+                    } => {
+                        // Hold `sessions` while the table ends the session.
+                        // A later session of the peer that is already live
+                        // shows in `peer_states` and keeps the node's facts
+                        // (bpv1-89). One that opens later registers after
+                        // this end, so the end never clears what it rebuilt.
+                        let step = {
+                            let sessions = node.lock_sessions();
+                            let peer_states =
+                                sessions.values().map(|s| *lock(&s.snapshot)).collect();
+                            node.lock_table().step(
+                                Instant::now(),
+                                BlockInput::SessionEnded {
+                                    peer: peer_node,
+                                    session_gen,
+                                    peer_states,
+                                },
+                            )
+                        };
+                        node.dispatch_block_step(step);
+                    }
                     DriverMsg::WakeTick => {}
                 }
             }
@@ -2045,7 +2077,7 @@ async fn run_peer_routine(
 
     // Unified close & teardown (`bpv1-62`):
     // cancel peer on protocol close or repeat neutral stall, stop & join data writer,
-    // and emit `SessionEnded` unless a newer session already owns `peer_node`.
+    // and emit `SessionEnded`.
     if session.state.close_cause().is_some() || session.state.is_closed_neutral() {
         peer_cancel.cancel();
     }
@@ -2076,36 +2108,21 @@ async fn run_peer_routine(
         peer: peer_node,
         session_gen,
     });
-    let replaced = {
+    {
         let mut sessions = node.lock_sessions();
-        match sessions.get(&peer_node) {
-            Some(s) if s.conn_id == conn_id && s.session_gen == session_gen => {
-                sessions.remove(&peer_node);
-                false
-            }
-            Some(_) => true,
-            None => false,
+        if sessions
+            .get(&peer_node)
+            .is_some_and(|s| s.conn_id == conn_id && s.session_gen == session_gen)
+        {
+            sessions.remove(&peer_node);
         }
-    };
-    if replaced {
-        // The newer session keeps the paths and samples keyed by `peer_node`.
-        // This session still releases its own pull claims.
-        for output in end_step.outputs {
-            if let PeerRoute::Table(input) =
-                route_peer_output(peer_node, session_gen, output, || {
-                    node.collect_peer_states()
-                })
-            {
-                node.drive(input);
-            }
-        }
-    } else {
-        node.drive(BlockInput::SessionEnded {
-            peer: peer_node,
-            session_gen,
-            peer_states: node.collect_peer_states(),
-        });
     }
+    // `SessionEnded` releases every claim and pending push of this session,
+    // including the claims of grants still queued in its inbox.
+    let _ = node.driver_tx.send(DriverMsg::SessionEnded {
+        peer_node,
+        session_gen,
+    });
 }
 
 /// Parses a `Part` frame payload and verifies its proof for `expected_index`

@@ -70,6 +70,7 @@ pub(crate) fn route_peer_output(
             relay,
         } => BlockInput::PushFlagged {
             peer,
+            session_gen,
             block_id,
             indices,
             relay,

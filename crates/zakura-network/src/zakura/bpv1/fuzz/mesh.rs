@@ -1094,9 +1094,9 @@ impl Mesh {
                 &end.outputs,
             );
             // The shell forgets the session's metadata senders, then ends the
-            // peer in the table. A mesh link never has a newer session that
-            // replaced this one, so the shell drops the session's own outputs:
-            // `SessionEnded` releases everything the peer held.
+            // session in the table. A mesh link never has a newer session
+            // that replaced this one, so `SessionEnded` also drops the
+            // peer's node facts.
             let peer = self.nodes[remote].id;
             let session_gen = session.state.session_gen();
             self.step_table(local, BlockInput::MetaSessionEnded { peer, session_gen });

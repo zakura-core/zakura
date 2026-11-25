@@ -326,7 +326,7 @@ pub enum ReleaseReason {
     /// deadline passed, or the peer already owes it on a live `Want`. The peer
     /// counts as tried.
     Failed,
-    /// A local refusal (parked, window full, mailbox closed) or session end.
+    /// A local refusal (parked, window full, no session took the grant).
     /// The peer never failed the slot, so it stays eligible.
     Refused,
 }
@@ -412,10 +412,13 @@ pub enum BlockInput {
         parts: Vec<VerifiedPart>,
     },
     /// `peer` flagged `indices` for push (decision-24). They count as pending
-    /// claims held by `peer` until they arrive or turn late (bpv1-64).
+    /// claims held by the flagging session until they arrive, turn late
+    /// (bpv1-64), or that session ends.
     PushFlagged {
-        /// The pushing connection.
+        /// The pushing peer.
         peer: NodeId,
+        /// Generation of the session that carries the pushes.
+        session_gen: u64,
         /// Target block.
         block_id: block::Hash,
         /// Flagged wire indices.
@@ -447,15 +450,19 @@ pub enum BlockInput {
         /// The session's generation.
         session_gen: u64,
     },
-    /// Peer session ended: drop path entry and release its pull claims (`bpv1-62`, `bpv1-65`).
+    /// Peer session ended: release its pull claims and pending pushes
+    /// (`bpv1-62`). Without a later live session of `peer`, also drop the
+    /// peer's path entry (`bpv1-65`), announcements, and `BlockDone`.
     SessionEnded {
         /// Disconnected peer.
         peer: NodeId,
-        /// Generation of the ended session. Claims of this session and of
-        /// the peer's earlier sessions are released; a later session's
-        /// claims stay.
+        /// Generation of the ended session. Claims and pending pushes of
+        /// this session and of the peer's earlier sessions are released; a
+        /// later session's stay.
         session_gen: u64,
-        /// Remaining live peers for immediate re-planning.
+        /// Every live session's pull capacity, read when the table takes
+        /// this input. An entry for `peer` with a later generation means
+        /// the peer reconnected, so its node facts stay (bpv1-89).
         peer_states: Vec<PullPeerState>,
     },
     /// `peer` sent `BlockDone` for `block_id`, so it holds every part. Only
@@ -1302,7 +1309,8 @@ impl StripeState {
 /// A slot a peer sends unasked (decision-19, decision-24).
 #[derive(Copy, Clone, Debug)]
 struct Incoming {
-    sender: NodeId,
+    /// The peer and the generation of the session that carries the part.
+    sender: (NodeId, u64),
     /// When the slot turns late: `SLOW_X` × the estimated arrival of the
     /// batch that listed or flagged it (bpv1-64). A later batch from the
     /// same sender never moves it.
@@ -1790,10 +1798,18 @@ impl BlockTable {
             }
             BlockInput::PushFlagged {
                 peer,
+                session_gen,
                 block_id,
                 indices,
                 relay,
-            } => self.handle_push_flagged(now, peer, block_id, &indices, relay, &mut step),
+            } => self.handle_push_flagged(
+                now,
+                (peer, session_gen),
+                block_id,
+                &indices,
+                relay,
+                &mut step,
+            ),
             BlockInput::PathObserved { peer, estimate } => self.paths.observe(peer, estimate),
             BlockInput::RateSample { peer, sample } => {
                 self.paths.record_sample(peer, sample);
@@ -2849,7 +2865,7 @@ impl BlockTable {
     fn handle_push_flagged(
         &mut self,
         now: Instant,
-        peer: NodeId,
+        (peer, session_gen): (NodeId, u64),
         block_id: block::Hash,
         indices: &[u32],
         relay: bool,
@@ -2882,17 +2898,18 @@ impl BlockTable {
                 push: true,
             });
         }
-        self.expect_incoming(now, peer, block_id, indices);
+        self.expect_incoming(now, (peer, session_gen), block_id, indices);
     }
 
     /// Marks each of `indices` that the block lacks and that no claim or
-    /// earlier sender covers as pending from `peer`. They turn late at
-    /// `SLOW_X` × the estimated arrival of this batch. A later batch from
-    /// `peer` keeps its own late time, so it never delays this one (bpv1-64).
+    /// earlier sender covers as pending from session `session_gen` of
+    /// `peer`. They turn late at `SLOW_X` × the estimated arrival of this
+    /// batch. A later batch from `peer` keeps its own late time, so it never
+    /// delays this one (bpv1-64).
     fn expect_incoming(
         &mut self,
         now: Instant,
-        peer: NodeId,
+        (peer, session_gen): (NodeId, u64),
         block_id: block::Hash,
         indices: &[u32],
     ) {
@@ -2933,7 +2950,7 @@ impl BlockTable {
             block.stripes[stripe as usize].incoming.insert(
                 slot,
                 Incoming {
-                    sender: peer,
+                    sender: (peer, session_gen),
                     late_at,
                 },
             );
@@ -2947,27 +2964,37 @@ impl BlockTable {
         peer_states: &[PullPeerState],
         step: &mut BlockStep,
     ) {
+        // bpv1-89: a later live session of `peer` keeps the node's path,
+        // announcements, and `BlockDone`.
+        let reconnected = peer_states
+            .iter()
+            .any(|ps| ps.peer == peer && ps.session_gen > session_gen);
         // bpv1-65: drop path entry with connection.
-        self.paths.remove(&peer);
+        if !reconnected {
+            self.paths.remove(&peer);
+        }
+        // Session generations only grow, so this matches the ended session
+        // and the peer's earlier ones, never a later one.
+        let ended = |(owner, gen): (NodeId, u64)| owner == peer && gen <= session_gen;
 
         let mut replan: Vec<(block::Hash, u32)> = Vec::new();
         for (&block_id, block) in &mut self.blocks {
             if block.phase != BlockPhase::Collecting {
                 continue;
             }
-            block.done_peers.remove(&peer);
-            // A sender's pending seeds and pushes end with its connection.
+            if !reconnected {
+                block.done_peers.remove(&peer);
+            }
+            // A session's claims and pending seeds and pushes end with it.
             for (s_idx, stripe) in block.stripes.iter_mut().enumerate() {
-                for set in &mut stripe.announcers {
-                    set.remove(&peer);
+                if !reconnected {
+                    for set in &mut stripe.announcers {
+                        set.remove(&peer);
+                    }
                 }
                 let before = stripe.pending_count();
-                // Session generations only grow, so a later session of
-                // `peer` keeps its claims.
-                stripe
-                    .claims
-                    .retain(|_, &mut (owner, gen)| owner != peer || gen > session_gen);
-                stripe.incoming.retain(|_, pending| pending.sender != peer);
+                stripe.claims.retain(|_, &mut owner| !ended(owner));
+                stripe.incoming.retain(|_, pending| !ended(pending.sender));
                 if stripe.pending_count() < before {
                     replan.push((block_id, s_idx as u32));
                 }
@@ -3658,16 +3685,17 @@ impl BlockTable {
                 continue;
             }
             // Each slot turns late at its own time (bpv1-64).
-            let mut late: Vec<NodeId> = block
+            let mut late: Vec<(NodeId, u64)> = block
                 .stripes
                 .iter()
                 .flat_map(|st| st.incoming.values())
                 .filter(|pending| now >= pending.late_at)
                 .map(|pending| pending.sender)
                 .collect();
-            late.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+            late.sort_by(|a, b| (a.0.as_bytes(), a.1).cmp(&(b.0.as_bytes(), b.1)));
             late.dedup();
             for sender in late {
+                let peer = sender.0;
                 let mut released = false;
                 for (s_idx, st) in block.stripes.iter_mut().enumerate() {
                     let mut slots: Vec<u32> = st
@@ -3686,22 +3714,19 @@ impl BlockTable {
                         st.incoming.remove(&slot);
                         if st.late_released.insert(slot) {
                             step.events.push(BlockEvent::PullLate {
-                                peer: sender,
+                                peer,
                                 block_id,
                                 stripe,
                                 slot,
                             });
                         }
-                        st.tried[slot as usize].insert(sender);
+                        st.tried[slot as usize].insert(peer);
                     }
                     released = true;
                     late_seeds.push((block_id, stripe));
                 }
-                if released && sender != block.meta.proposer_node {
-                    step.events.push(BlockEvent::PushLate {
-                        peer: sender,
-                        block_id,
-                    });
+                if released && peer != block.meta.proposer_node {
+                    step.events.push(BlockEvent::PushLate { peer, block_id });
                 }
             }
         }

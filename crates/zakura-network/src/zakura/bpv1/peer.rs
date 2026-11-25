@@ -552,7 +552,7 @@ pub enum PeerOutput {
         /// Whether to also purge queued `Have`s (true on retirement).
         include_haves: bool,
     },
-    /// Release node-wide pull claims for undelivered indices (late pull or deadline).
+    /// Release this session's pull claims for undelivered indices (late pull, deadline, or refused grant).
     ReleaseClaims {
         /// Block consensus hash.
         block_id: block::Hash,
@@ -1212,7 +1212,7 @@ impl PeerState {
     pub fn step(&mut self, now: Instant, input: PeerInput) -> PeerStep {
         let mut step = PeerStep::default();
         if matches!(input, PeerInput::SessionEnd) {
-            self.handle_session_end(&mut step);
+            self.handle_session_end();
             return step;
         }
         if self.is_closed() {
@@ -2606,19 +2606,10 @@ impl PeerState {
         }
     }
 
-    fn handle_session_end(&mut self, step: &mut PeerStep) {
-        // Release all outstanding node-wide pull claims before clearing state (bpv1-62).
-        for want in self.wants_out.values() {
-            let slots = want.unreceived_slots();
-            if !slots.is_empty() {
-                step.outputs.push(PeerOutput::ReleaseClaims {
-                    block_id: want.block_id,
-                    stripe: want.stripe,
-                    slots,
-                    reason: ReleaseReason::Refused,
-                });
-            }
-        }
+    /// Clears every per-session record. The table's `SessionEnded` releases
+    /// this session's pull claims and pending pushes (bpv1-62), including
+    /// grants that never reached the session, so the end emits nothing.
+    fn handle_session_end(&mut self) {
         self.blocks.clear();
         self.meta_received_pending.clear();
         self.retired.clear();

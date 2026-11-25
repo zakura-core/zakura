@@ -321,6 +321,7 @@ pub fn replay_bpv1_block_bytes(bytes: &[u8]) -> BlockReplaySummary {
             // `b` bit 0 sets the relay flag; the proposer sends relay flags.
             7 => BlockInput::PushFlagged {
                 peer: if b & 1 != 0 { peers[0] } else { peer },
+                session_gen: 1,
                 block_id: block.id,
                 indices: block.indices(b, a & 0x80 != 0),
                 relay: b & 1 != 0,

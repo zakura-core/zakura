@@ -91,29 +91,28 @@ impl Node {
     }
 
     /// Ends `peer`'s live session and opens its next one, as the service
-    /// does. A `replaced` session ends after its replacement owns the peer,
-    /// so the table keeps the peer's node-wide entries. The new session
-    /// learns every active admitted block.
+    /// does. A `replaced` session's `SessionEnded` reaches the table after
+    /// its replacement owns the peer, so the table keeps the peer's node
+    /// facts. Otherwise the end reaches the table first. Either way the end
+    /// releases the old session's claims and pending pushes, including
+    /// grants still queued for it. The new session learns every active
+    /// admitted block.
     fn reconnect(&mut self, peer: NodeId, replaced: bool) {
         let now = self.now;
         let session_gen = self.session_gen(peer);
-        let end = self.session(peer).step(now, PeerInput::SessionEnd);
+        self.session(peer).step(now, PeerInput::SessionEnd);
         self.to_session.retain(|(to, _)| *to != peer);
         self.written.retain(|(to, _)| *to != peer);
-        *self.session(peer) = session(peer, session_gen + 1);
-        let states = self.peer_states();
-        for output in end.outputs {
-            if let PeerRoute::Table(input) =
-                route_peer_output(peer, session_gen, output, || states.clone())
-            {
-                self.to_table.push_back(input);
-            }
-        }
         self.table
             .step(now, BlockInput::MetaSessionEnded { peer, session_gen });
-        if !replaced {
-            let peer_states = self.peer_states();
-            self.table.step(
+        let end_session = |node: &mut Self| {
+            let peer_states = node
+                .sessions
+                .iter()
+                .filter(|s| s.remote_node() != peer || s.session_gen() != session_gen)
+                .map(|s| pull_state(s, now))
+                .collect();
+            let ended = node.table.step(
                 now,
                 BlockInput::SessionEnded {
                     peer,
@@ -121,10 +120,20 @@ impl Node {
                     peer_states,
                 },
             );
-        }
+            ended.outputs
+        };
+        let ended = if replaced {
+            *self.session(peer) = session(peer, session_gen + 1);
+            end_session(self)
+        } else {
+            let ended = end_session(self);
+            *self.session(peer) = session(peer, session_gen + 1);
+            ended
+        };
         for input in replay_admitted(&self.table) {
             self.to_session.push_back((peer, input));
         }
+        self.route_table(ended);
     }
 
     fn peer_states(&self) -> Vec<PullPeerState> {
@@ -407,6 +416,48 @@ fn a_grant_planned_for_a_replaced_session_returns_to_the_table() {
     node.pump();
     assert_eq!(node.grants_to(q), 1, "part 0 moves to q");
     assert_eq!(node.wrote(q), (0, 1));
+    node.table.assert_invariants();
+}
+
+/// bpv1-62, bpv1-89: a grant still queued for a replaced session never
+/// reaches it. The replaced session's end releases that grant's claim, and
+/// the table grants the slot to the replacement at once.
+#[test]
+fn a_replaced_sessions_queued_grant_releases_at_its_end() {
+    let block_id = block::Hash([0x65; 32]);
+    let (p, q) = (node_id(2), node_id(3));
+    let mut node = Node::new(&[p, q]);
+    let received = node.receive_meta(q, block_id);
+    let header = admit_header(&mut node, &received);
+    admit(&mut node, &header, block_id);
+    node.pump();
+
+    // Session 1 announces part 0, and the table grants it to session 1.
+    let now = node.now;
+    let announced = node
+        .session(p)
+        .step(now, have_with(block_id, HaveFlags::Plain, vec![0]));
+    let states = node.peer_states();
+    for output in announced.outputs {
+        if let PeerRoute::Table(input) = route_peer_output(p, 1, output, || states.clone()) {
+            let granted = node.table.step(now, input);
+            node.route_table(granted.outputs);
+        }
+    }
+    assert!(node
+        .to_session
+        .iter()
+        .any(|(to, input)| *to == p && matches!(input, PeerInput::PullGranted(_))));
+
+    // Session 2 replaces session 1 before session 1 reads the grant.
+    node.reconnect(p, true);
+    let steps = node.pump();
+    assert!(steps < STEP_CAP);
+    assert_eq!(
+        node.wrote(p),
+        (1, 1),
+        "session 2 sends HeaderMeta, then a Want"
+    );
     node.table.assert_invariants();
 }
 

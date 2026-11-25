@@ -80,3 +80,24 @@ fn seeds_replay_and_reach_every_expected_name() {
         );
     }
 }
+
+/// The `Have` seeds double as close-16 tests (decision-33): a bitmap that
+/// fits the layout stays open, and a repeated bitmap index, a padding bit,
+/// a bitmap sized for another layout, and a list index past the layout
+/// each close 16.
+#[test]
+fn have_form_seeds_close_16_only_when_malformed() {
+    let seeds = seed_inputs();
+    let closed_row = |name: &str| {
+        let seed = seeds
+            .iter()
+            .find(|seed| seed.target == "bpv1_peer" && seed.name == name)
+            .unwrap_or_else(|| panic!("no bpv1_peer seed {name}"));
+        crate::zakura::bpv1::peer::replay_bpv1_peer_bytes(&seed.bytes).closed_row
+    };
+    assert_eq!(closed_row("have-bitmap"), None);
+    assert_eq!(closed_row("have-bitmap-repeat"), Some(16));
+    assert_eq!(closed_row("have-bitmap-padding"), Some(16));
+    assert_eq!(closed_row("have-bitmap-misfit"), Some(16));
+    assert_eq!(closed_row("have-past-layout"), Some(16));
+}

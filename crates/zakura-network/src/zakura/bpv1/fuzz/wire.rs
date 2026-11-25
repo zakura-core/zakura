@@ -20,7 +20,10 @@
 //! - `decode_meta_envelope` admits exactly the `HeaderMeta`s whose header
 //!   parses;
 //! - a `Part` frame proves only as the honest part of its index (bpv1-12);
-//! - every data-queue item the decoded frame names encodes to that frame.
+//! - every data-queue item the decoded frame names encodes to that frame;
+//! - a decoded `Have`'s indices re-encode in the smaller form for the
+//!   smallest layout that holds them, and decode back (decision-33).
+//!   The `Have` refusals reach each `OutOfRange` reason by name.
 //!
 //! The target excludes the stream reader that splits bytes into frames. It
 //! is the transport's shared frame reader, which reads every v2 stream and
@@ -33,7 +36,10 @@ use crate::zakura::{
         peer::PeerInput,
         profile::Profile,
         service::{control_input, data_input, decode_meta_envelope, parse_and_verify_part_frame},
-        wire::{encode_part_frame, message_type, Bpv1Message, DataQueueItem},
+        wire::{
+            encode_have_frame, encode_part_frame, message_type, Bpv1Message, DataQueueItem,
+            HaveForm,
+        },
     },
     wire_codec::{decode_frame, encode_frame, WireError, WireMessage},
     Frame,
@@ -69,6 +75,12 @@ pub(super) const EXPECTED: &[&str] = &[
     "part:verified",
     "part:refused",
     "queue:round-trip",
+    "have:list",
+    "have:bitmap",
+    "have:smaller-form",
+    "have index count",
+    "have indices not strictly increasing",
+    "have bitmap length",
 ];
 
 /// The property the wire checks name.
@@ -168,7 +180,20 @@ pub fn replay_bpv1_wire_bytes(
             assert_eq!(again, frame, "{WIRE}: decoding is not canonical");
         }
         Err(WireError::ReservedFlags(_)) => reached.hit("wire:flags-refused"),
-        Err(_) => reached.hit("wire:refused"),
+        Err(error) => {
+            reached.hit("wire:refused");
+            if let (message_type::HAVE, WireError::OutOfRange(reason)) = (frame.message_type, error)
+            {
+                reached.hit(reason);
+            }
+        }
+    }
+    if let Ok(Bpv1Message::Have { form, indices, .. }) = &decoded {
+        reached.hit(match form {
+            HaveForm::List => "have:list",
+            HaveForm::Bitmap { .. } => "have:bitmap",
+        });
+        check_smaller_form(indices, reached);
     }
 
     // 2. The control stream decoder decodes first, then refuses data types
@@ -313,6 +338,42 @@ fn check_part(
         }
         None => reached.hit("part:refused"),
     }
+}
+
+/// For the smallest layout that holds `indices`, the encoder's form is the
+/// shorter of a `u16` list and the layout's bitmap, a tie keeping the list,
+/// and it decodes back to the same indices (decision-33).
+fn check_smaller_form(indices: &[u32], reached: &mut Reached) {
+    let last = *indices.last().expect("a decoded Have lists an index");
+    let total = last + 1;
+    let form = HaveForm::smaller(total, indices.len());
+    let list_len = HaveForm::List.indices_len(indices.len());
+    // Widening u32 to usize is lossless on supported targets.
+    let bitmap_len = total.div_ceil(8) as usize;
+    assert_eq!(
+        form.indices_len(indices.len()),
+        list_len.min(bitmap_len),
+        "{WIRE}: decision-33 the encoder picked the longer form"
+    );
+    assert!(
+        form.fits(total),
+        "{WIRE}: decision-33 the encoder sized a bitmap for another layout"
+    );
+    let block_id = zakura_chain::block::Hash([0x5B; 32]);
+    let frame = encode_have_frame(block_id, Default::default(), form, indices)
+        .unwrap_or_else(|e| panic!("{WIRE}: {form:?} does not encode {indices:?}: {e:?}"));
+    match decode_frame::<Bpv1Message>(&frame) {
+        Ok(Bpv1Message::Have {
+            form: again,
+            indices: decoded,
+            ..
+        }) => {
+            assert_eq!(again, form, "{WIRE}: decision-33 the form changed");
+            assert_eq!(decoded, indices, "{WIRE}: decision-33 the indices changed");
+        }
+        other => panic!("{WIRE}: decision-33 {form:?} decoded as {other:?}"),
+    }
+    reached.hit("have:smaller-form");
 }
 
 /// A decoded `Have` or `WantEnd` is a data-queue item that encodes to the

@@ -396,6 +396,8 @@ mod tests {
             ))
         );
         assert!(verify_composite(&retired, b"transcript", &[0; 3_373]).is_err());
+        // Nor can the node itself be set to present it.
+        assert!(secret.with_credential(retired).is_err());
     }
 
     /// TLS-7: anyone can present a node's public keys beside a key of their

@@ -384,6 +384,64 @@ mod tests {
         ));
     }
 
+    /// TLS-7, exhaustively: for every list of 1 to 4 entries, every set of
+    /// required tags and every sublist, the list contains the sublist's ID
+    /// exactly when the sublist keeps every required entry. No sublist
+    /// passes when a required tag is missing from the list, and no sublist
+    /// of a list that differs in one value passes.
+    #[test]
+    fn a_list_contains_exactly_the_sublists_that_keep_every_required_entry() {
+        /// A tag none of the lists holds.
+        const ABSENT_TAG: u16 = 9;
+        let all = [
+            (ED25519_KEY_TAG, KEY),
+            (2, [2; KEY_LENGTH]),
+            (3, [3; KEY_LENGTH]),
+            (4, [4; KEY_LENGTH]),
+        ];
+        let picked = |entries: &[(u16, [u8; KEY_LENGTH])], mask: u32| -> Vec<_> {
+            let kept = |index: &usize| mask & (1 << index) != 0;
+            (0..entries.len())
+                .filter(kept)
+                .map(|index| entries[index])
+                .collect()
+        };
+        let mut checked = 0;
+        for size in 1..=all.len() {
+            let entries = &all[..size];
+            let list = NodeKeyList::from_entries(entries.iter().copied())
+                .expect("increasing tags form a list");
+            let mut other = entries.to_vec();
+            other[size - 1].1 = [0xEE; KEY_LENGTH];
+            for required_mask in 0u32..1 << size {
+                let required: Vec<u16> = picked(entries, required_mask)
+                    .iter()
+                    .map(|(tag, _)| *tag)
+                    .collect();
+                let mut with_absent = required.clone();
+                with_absent.push(ABSENT_TAG);
+                for kept_mask in 1u32..1 << size {
+                    let id = node_id(&picked(entries, kept_mask));
+                    assert_eq!(
+                        list.contains_list_named(id, &required),
+                        required_mask & !kept_mask == 0,
+                        "{size} entries, required {required_mask:#06b}, kept {kept_mask:#06b}"
+                    );
+                    assert!(!list.contains_list_named(id, &with_absent));
+                    // A sublist with the entry whose value differs names a
+                    // list this one doesn't contain.
+                    if kept_mask & (1 << (size - 1)) != 0 {
+                        let foreign = node_id(&picked(&other, kept_mask));
+                        assert!(!list.contains_list_named(foreign, &required));
+                    }
+                    checked += 1;
+                }
+            }
+        }
+        // 2^n sets of required tags times 2^n - 1 sublists, for n of 1 to 4.
+        assert_eq!(checked, 2 + 12 + 56 + 240);
+    }
+
     /// A list that lacks a required tag contains nothing, not even itself.
     #[test]
     fn a_list_without_a_required_entry_contains_no_list() {

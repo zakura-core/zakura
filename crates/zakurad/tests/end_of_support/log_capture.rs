@@ -20,15 +20,6 @@ impl CapturedLogs {
             .expect("no code panics while holding the log buffer lock");
         String::from_utf8_lossy(&bytes).contains(needle)
     }
-
-    /// Returns how many times `needle` was logged.
-    pub(super) fn count(&self, needle: &str) -> usize {
-        let bytes = self
-            .0
-            .lock()
-            .expect("no code panics while holding the log buffer lock");
-        String::from_utf8_lossy(&bytes).matches(needle).count()
-    }
 }
 
 /// Creates a fresh buffer and a subscriber with deterministic filtering.

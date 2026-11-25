@@ -105,14 +105,15 @@ about 124 ms at the fleet's median.
 
 The padding costs:
 
-- **Upload:** a completed dial sends 48 bytes more, 11,549 bytes in 11
-  datagrams in place of 11,501. The padding datagram stands in for the
+- **Upload:** a completed dial sends 48 bytes more, 9,582 bytes in 11
+  datagrams in place of 9,534. The padding datagram stands in for the
   acknowledgement the dialer would have sent, and padded to 1,200 bytes,
   while the listener waited. A dial the listener refuses or never answers
   sends the full 1,200 bytes more.
-- **Headroom:** about 880 bytes. The flight is ~9,920 bytes against a 10,800
-  byte allowance, so a later change that grows the listener's flight past
-  that brings the second round trip back.
+- **Headroom:** about 2.9 KB. The flight is ~7,870 bytes against a 10,800
+  byte allowance, so a later change that grows the listener's flight by
+  more than that brings the second round trip back. With ML-DSA-87 the
+  headroom would have been about 880 bytes.
   `the_listeners_first_flight_fits_the_padded_allowance` fails if it does.
 - **Admission:** a refused or retried hybrid dial is now decided and
   answered three times, once per datagram, in place of twice (ADM-1).
@@ -120,10 +121,9 @@ The padding costs:
   no state for a hello it refuses at the first packet, so a padding datagram
   would start an attempt of its own with no hello in it.
 
-Trimming couldn't have avoided the round trip. Category 5 signatures alone
-outgrow the unpadded allowance: ML-DSA-87 with ML-KEM-768 would still send
-about 9.4 KB, from the measured flight less the 480-byte smaller ciphertext.
-Validating the address first with a Retry would cost the same round trip.
+The unpadded flight overshoots the allowance by about 670 bytes, and only a
+category 2 signature would have brought it back under (§5). Validating the
+address first with a Retry would cost the same round trip.
 
 ## 4. CPU
 

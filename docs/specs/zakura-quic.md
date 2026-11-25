@@ -72,7 +72,7 @@ to ML-KEM-1024 (NIST security category 5) and the signature to ML-DSA-65
 `p2p-v2/5`; it changes DEP-2, ID-8, ID-11, ID-12, ID-13, TLS-4, TLS-9,
 ADM-1, OBS-1, API-1, §13, SEC-1, SEC-2 and §16, and §17aa lists each change.
 Version 0.30 has the dialer pad its first flight with a third Initial
-datagram, so the listener's category 5 flight fits QUIC's
+datagram, so the listener's post-quantum flight fits QUIC's
 anti-amplification allowance and a dial completes in one round trip again;
 it adds DIAL-8, changes ADM-1, API-3 and §16, and §17ab lists each change.
 
@@ -822,7 +822,7 @@ is today's Zakura logic.
   dialer's Initial packet. Until it validates the dialer's address, a
   listener may send only three times what it received (RFC 9000 §8.1). The
   hello's 2,400 bytes allow 7,200, short of the listener's first flight of
-  about 9.9 KB (TLS-4, TLS-9). With the padding the allowance is 10,800
+  about 7.9 KB (TLS-4, TLS-9). With the padding the allowance is 10,800
   bytes, so the listener sends its whole flight at once and the dial
   completes in one round trip. A one-datagram hello isn't padded: a
   listener refuses it at its first packet and keeps no state, so a padding
@@ -2124,15 +2124,15 @@ Changed:
 
 ## 17ab. Changes in version 0.30
 
-With ML-KEM-1024 and ML-DSA-87 (§17aa), the listener's first flight, about
-9.9 KB, outgrew the 7.2 KB QUIC lets it send before it validates the
+With ML-KEM-1024 and ML-DSA-65 (§17aa), the listener's first flight, about
+7.9 KB, outgrew the 7.2 KB QUIC lets it send before it validates the
 dialer's address, so every dial took two round trips. The dialer now sends
 one more padded Initial datagram right after its hello, which raises the
 allowance to 10.8 KB. The whole flight fits again, so a dial completes in
 one round trip, measured from 2 to 250 ms RTT in the simulator. A
 completed dial sends only 48 bytes more, since the padding stands in for an
 acknowledgement the dialer would have padded anyway; a refused or unanswered
-dial sends 1,200 more. The listener's flight has about 880 bytes of headroom
+dial sends 1,200 more. The listener's flight has about 2.9 KB of headroom
 under the new allowance. The signature schemes and the listener don't
 change, so this isn't a wire break and the ALPN stays `p2p-v2/5`.
 

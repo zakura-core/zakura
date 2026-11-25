@@ -42,6 +42,23 @@ use crate::zakura::bpv1::{
     unknown_parent::UnknownParentVerdict,
 };
 
+/// The hash of the replay chain's block at `height`: block `i` sits at
+/// height `i + 1`, height 0 is its root `[0; 32]`, and every other height
+/// carries a hash no replay block has.
+fn chain_hash(blocks: &[FuzzBlock], height: u32) -> block::Hash {
+    if height == 0 {
+        return block::Hash([0; 32]);
+    }
+    blocks.iter().find(|b| b.height == height).map_or_else(
+        || {
+            let mut hash = [0xE0; 32];
+            hash[..4].copy_from_slice(&height.to_le_bytes());
+            block::Hash(hash)
+        },
+        |b| b.id,
+    )
+}
+
 /// Summary returned by [`replay_bpv1_block_bytes`] (`tool-2`).
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct BlockReplaySummary {
@@ -226,9 +243,19 @@ pub fn replay_bpv1_block_bytes(bytes: &[u8]) -> BlockReplaySummary {
             .collect();
         let reached = &mut summary.reached;
         let input = match tag {
-            0 => BlockInput::TipHeight {
-                height: u32::from(b % 40),
-            },
+            // The tip's hash is the chain's block at that height, or with
+            // `a` bit 7 a fork's, so no block extends it.
+            0 => {
+                let height = u32::from(b % 40);
+                BlockInput::TipHeight {
+                    height,
+                    hash: if a & 0x80 != 0 {
+                        block::Hash([0xF0; 32])
+                    } else {
+                        chain_hash(&blocks, height)
+                    },
+                }
+            }
             1 => BlockInput::ParentAdmitted {
                 hash: block.id,
                 height: block.height,
@@ -243,8 +270,15 @@ pub fn replay_bpv1_block_bytes(bytes: &[u8]) -> BlockReplaySummary {
                 Some((work_id, Work::Header { block })) => BlockInput::HeaderAdmitted {
                     work_id,
                     result: match a % 4 {
+                        // `a` bit 7 admits the header on a fork: its parent
+                        // is not the chain's block below it.
                         0 => HeaderAdmissionResult::Admitted {
                             height: blocks[block].height,
+                            parent_hash: if a & 0x80 != 0 {
+                                block::Hash([0xF1; 32])
+                            } else {
+                                blocks[block].parent
+                            },
                         },
                         1 => HeaderAdmissionResult::MissingParent {
                             parent_hash: blocks[block].parent,
@@ -540,6 +574,13 @@ fn step(
                 if !ledger.claimed.contains(&block_id) {
                     ledger.claimed.push(block_id);
                 }
+                None
+            }
+            BlockOutput::ExtendBodyClaim { block_id, .. } => {
+                assert!(
+                    ledger.claimed.contains(&block_id),
+                    "{BLOCK_REPLAY}: bpv1-44 extended body claim of {block_id:?} it does not hold"
+                );
                 None
             }
             BlockOutput::ReleaseBodyClaim { block_id, .. } => {

@@ -16,7 +16,9 @@ use super::{
     commitment::CoinbaseBinding,
     peer::*,
     profile::{Coding, Profile},
-    test_support::{make_envelope, node_id, part_frame, LinkProfile, MachineMesh, MESH_HEIGHT},
+    test_support::{
+        make_envelope, node_id, part_frame, LinkProfile, MachineMesh, MESH_HEIGHT, TEST_TIP_HASH,
+    },
     tree::VerifiedPart,
     wire::{
         encode_part_frame, Bpv1Message, HaveFlags, WantBitmap, WantEndReason, MAX_WANTS_INFLIGHT,
@@ -495,7 +497,7 @@ proptest! {
         if let Some(after) = retire_after_ms {
             mesh.run_until(start + Duration::from_millis(after));
             // A tip past the propagation window retires the block at A.
-            mesh.step_table(0, BlockInput::TipHeight { height: MESH_HEIGHT + PROPAGATION_DEPTH + 1 });
+            mesh.step_table(0, BlockInput::TipHeight { height: MESH_HEIGHT + PROPAGATION_DEPTH + 1, hash: TEST_TIP_HASH });
         }
         mesh.run_until(start + Duration::from_secs(3));
 

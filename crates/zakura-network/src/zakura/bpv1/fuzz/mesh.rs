@@ -337,12 +337,37 @@ impl Mesh {
             next_gen: 1,
             summary: MeshReplaySummary::default(),
         };
+        // The shell's first frontier sets each table's verified tip: the
+        // regtest genesis block.
+        let genesis = block::Hash(chain_id);
+        for node in (0..NODES).filter(|&n| Self::honest(n)) {
+            mesh.step_table(
+                node,
+                BlockInput::TipHeight {
+                    height: 0,
+                    hash: genesis,
+                },
+            );
+        }
         for i in 0..NODES {
             for j in i + 1..NODES {
                 mesh.connect(i, j);
             }
         }
         mesh
+    }
+
+    /// The hash of the block at `height - 1` in the mesh's chain: the
+    /// regtest genesis block below height 1, else the solved block there.
+    /// A parent the proposer has not solved has a hash no block carries.
+    fn parent_of(&self, height: u32) -> block::Hash {
+        if height <= 1 {
+            return block::Hash(self.chain_id);
+        }
+        self.solved
+            .iter()
+            .find(|p| p.height + 1 == height)
+            .map_or(block::Hash([0; 32]), |p| p.id)
     }
 
     fn honest(node: usize) -> bool {
@@ -506,14 +531,13 @@ impl Mesh {
                     _ if local_failure => HeaderAdmissionResult::LocalError,
                     None => HeaderAdmissionResult::PeerInvalid,
                     Some(s) if self.nodes[node].tip + 1 >= s.height => {
-                        HeaderAdmissionResult::Admitted { height: s.height }
+                        HeaderAdmissionResult::Admitted {
+                            height: s.height,
+                            parent_hash: self.parent_of(s.height),
+                        }
                     }
                     Some(s) => HeaderAdmissionResult::MissingParent {
-                        parent_hash: self
-                            .solved
-                            .iter()
-                            .find(|p| p.height + 1 == s.height)
-                            .map_or(block::Hash([0; 32]), |p| p.id),
+                        parent_hash: self.parent_of(s.height),
                     },
                 };
                 self.step_table(node, BlockInput::HeaderAdmitted { work_id, result });
@@ -1437,6 +1461,10 @@ impl Mesh {
                     n.claimed.push(*block_id);
                 }
             }
+            BlockOutput::ExtendBodyClaim { block_id, .. } => assert!(
+                n.claimed.contains(block_id),
+                "{MESH}: bpv1-44 node {node} extended a body claim it does not hold"
+            ),
             BlockOutput::ReleaseBodyClaim { block_id, .. } => {
                 assert!(
                     n.claimed.contains(block_id),
@@ -1519,7 +1547,9 @@ impl Mesh {
                 return;
             }
             // `check_table_output` keeps the claim ledger.
-            BlockOutput::ClaimBody { .. } | BlockOutput::ReleaseBodyClaim { .. } => return,
+            BlockOutput::ClaimBody { .. }
+            | BlockOutput::ExtendBodyClaim { .. }
+            | BlockOutput::ReleaseBodyClaim { .. } => return,
             routed => unreachable!("route_block_output keeps {routed:?} off the shell"),
         };
         self.nodes[node].jobs.push(job);
@@ -1541,7 +1571,13 @@ impl Mesh {
             return;
         }
         self.nodes[node].tip = height;
-        self.step_table(node, BlockInput::TipHeight { height });
+        self.step_table(
+            node,
+            BlockInput::TipHeight {
+                height,
+                hash: block_id,
+            },
+        );
         self.step_table(node, BlockInput::FallbackDone { block_id });
         self.step_table(
             node,
@@ -1584,7 +1620,7 @@ impl Mesh {
             hash[..4].copy_from_slice(&height.to_le_bytes());
             let hash = block::Hash(hash);
             self.nodes[node].tip = height;
-            self.step_table(node, BlockInput::TipHeight { height });
+            self.step_table(node, BlockInput::TipHeight { height, hash });
             self.step_table(node, BlockInput::FallbackDone { block_id: hash });
             self.step_table(node, BlockInput::ParentAdmitted { hash, height });
         }

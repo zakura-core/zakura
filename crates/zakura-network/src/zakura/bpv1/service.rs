@@ -467,6 +467,10 @@ impl SharedNode {
                 let installed = self.fallback.claim(block_id, deadline);
                 tracing::debug!(target: "bpv1_stage", %block_id, installed, "body_claim_installed");
             }
+            BlockOutput::ExtendBodyClaim { block_id, deadline } => {
+                let extended = self.fallback.extend(block_id, deadline);
+                tracing::debug!(target: "bpv1_stage", %block_id, extended, "body_claim_extended");
+            }
             BlockOutput::ReleaseBodyClaim { block_id, reason } => {
                 let released = self.fallback.release(block_id, reason);
                 tracing::debug!(target: "bpv1_stage", %block_id, ?reason, released,
@@ -1074,6 +1078,7 @@ pub(crate) fn frontier_inputs(last: Option<FrontierSet>, next: FrontierSet) -> V
     if last.map(|last| last.verified_best) != Some(next.verified_best) {
         inputs.push(BlockInput::TipHeight {
             height: next.verified_best.height.0,
+            hash: next.verified_best.hash,
         });
         inputs.push(BlockInput::FallbackDone {
             block_id: next.verified_best.hash,

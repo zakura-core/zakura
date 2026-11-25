@@ -206,6 +206,8 @@ pub enum HeaderAdmissionResult {
     Admitted {
         /// Consensus height of the admitted header.
         height: u32,
+        /// Hash of the header's parent.
+        parent_hash: block::Hash,
     },
     /// Parent header is not yet in headerchain.
     MissingParent {
@@ -349,6 +351,8 @@ pub enum BlockInput {
     TipHeight {
         /// Height of the new verified tip.
         height: u32,
+        /// Hash of the new verified tip.
+        hash: block::Hash,
     },
     /// Headerchain's best header moved to `hash`, waking pending metadata
     /// (`bpv1-11`): the entries whose parent is `hash`, and the entry for
@@ -615,6 +619,15 @@ pub enum BlockOutput {
     },
     /// Claim body ownership in `BlockFallback` so native block sync skips it.
     ClaimBody {
+        /// Claimed block hash.
+        block_id: block::Hash,
+        /// Monotonic expiry deadline.
+        deadline: Instant,
+    },
+    /// Move BPv1's live body claim to the later `deadline` (`bpv1-44`). An
+    /// expired or released claim stays gone, because block sync may already
+    /// own the body.
+    ExtendBodyClaim {
         /// Claimed block hash.
         block_id: block::Hash,
         /// Monotonic expiry deadline.
@@ -915,6 +928,8 @@ struct AdmittingEntry {
     /// The copies other sessions sent while this entry waited.
     later: LaterCopies,
     height: Option<u32>,
+    /// The header's parent, once headerchain admits the header.
+    parent_hash: Option<block::Hash>,
     stage: AdmittingStage,
     /// When the entry first parked, if a wake retries it. A retried entry
     /// already passed the unknown-parent checks, and it keeps its first
@@ -1296,6 +1311,8 @@ struct ActiveBlock {
     /// Monotonic verification deadline, set at the first submission
     /// (`bpv1-82`).
     verify_deadline: Option<Instant>,
+    /// The header's parent. `None` for a local solved block.
+    parent_hash: Option<block::Hash>,
     /// Whether this block currently holds a body claim in `BlockFallback`.
     body_claimed: bool,
     /// True once `BlockDone` has been announced to routines.
@@ -1346,6 +1363,7 @@ impl ActiveBlock {
             done_peers: HashSet::new(),
             verify_work_id: None,
             verify_deadline: None,
+            parent_hash: None,
             body_claimed: false,
             block_done_notified: false,
             part_charges: HashMap::new(),
@@ -1497,6 +1515,9 @@ pub struct BlockTable {
     /// Height of the verified tip. Metadata more than `PROPAGATION_DEPTH` above it belongs to
     /// block sync (`bpv1-76`).
     verified: u32,
+    /// Hash of the verified tip. A block whose parent it is commits next
+    /// (`bpv1-83`, `bpv1-84`).
+    verified_hash: Option<block::Hash>,
     paths: PeerPaths,
     /// Metadata currently in `HeaderAdmission` or `VerifyCommitment`.
     admitting: HashMap<block::Hash, AdmittingEntry>,
@@ -1523,6 +1544,7 @@ impl BlockTable {
             next_work_id: 1,
             top: 0,
             verified: 0,
+            verified_hash: None,
             paths: PeerPaths::new(),
             admitting: HashMap::new(),
             work_to_block: HashMap::new(),
@@ -1702,8 +1724,9 @@ impl BlockTable {
     pub fn step(&mut self, now: Instant, input: BlockInput) -> BlockStep {
         let mut step = BlockStep::default();
         match input {
-            BlockInput::TipHeight { height } => {
+            BlockInput::TipHeight { height, hash } => {
                 self.verified = height;
+                self.verified_hash = Some(hash);
                 self.raise_top(height, &mut step);
                 self.resubmit_parked(now, &mut step);
             }
@@ -2016,6 +2039,7 @@ impl BlockTable {
                 session_gen,
                 later,
                 height: None,
+                parent_hash: None,
                 stage: AdmittingStage::WaitingHeader,
                 parked_at,
                 best_moves: self.best_moves,
@@ -2049,7 +2073,10 @@ impl BlockTable {
         }
 
         match result {
-            HeaderAdmissionResult::Admitted { height } => {
+            HeaderAdmissionResult::Admitted {
+                height,
+                parent_hash,
+            } => {
                 // An admitted header need not be selected: headerchain also
                 // retains forks and future-dated headers. Only the verified tip,
                 // the best header-valid height, and local solved blocks raise `top`.
@@ -2066,6 +2093,7 @@ impl BlockTable {
                     .get_mut(&block_id)
                     .expect("admitting entry verified present");
                 entry.height = Some(height);
+                entry.parent_hash = Some(parent_hash);
                 entry.work_id = next_work;
                 entry.stage = AdmittingStage::WaitingCommitment;
                 let envelope = entry.envelope.clone();
@@ -2445,7 +2473,10 @@ impl BlockTable {
             return;
         }
         // All concurrent slots actively collecting: drop cleanly without faulting the peer.
-        if !self.evict_for_slot(false, step) && !self.displace_for_next_block(height, step) {
+        let next = self.is_next_block(height, entry.parent_hash);
+        if !self.evict_for_slot(false, step)
+            && !(next && self.displace_for_next_block(height, step))
+        {
             reject_meta(step, block_id, entry.from_peer, entry.session_gen);
             reject_later(step, block_id, &entry.later);
             return;
@@ -2455,6 +2486,7 @@ impl BlockTable {
         let mut active =
             ActiveBlock::from_envelope(entry.envelope, height, now, entry.arrived_at, false);
         active.body_claimed = true;
+        active.parent_hash = entry.parent_hash;
         // decision-26: pick the `Have` initial group once, at admission.
         let pacing = self.config.have_pacing;
         let window = pacing.window(active.meta.coding.body_bytes);
@@ -2620,16 +2652,24 @@ impl BlockTable {
         }
     }
 
-    /// Frees a slot for the block whose parent is the verified tip (`bpv1-83`).
+    /// Whether a block at `height` with `parent_hash` extends the verified tip,
+    /// so it is the next block the chain can commit (`bpv1-83`, `bpv1-84`).
     ///
-    /// That block is the next one the chain can commit, and every block above it
-    /// waits on it. When every slot is busy, it retires the highest block whose
-    /// parent is not committed, and block sync fetches that one instead. Returns
-    /// whether a slot is free.
+    /// Headerchain also admits retained forks, so the height alone does not
+    /// show that the parent is committed.
+    fn is_next_block(&self, height: u32, parent_hash: Option<block::Hash>) -> bool {
+        height == self.verified.saturating_add(1)
+            && parent_hash.is_some()
+            && parent_hash == self.verified_hash
+    }
+
+    /// Frees a slot for the next block, the one whose parent is the verified
+    /// tip (`bpv1-83`).
+    ///
+    /// Every block above that height waits on it. When every slot is busy, it
+    /// retires the highest block above it, and block sync fetches that one
+    /// instead. Returns whether a slot is free.
     fn displace_for_next_block(&mut self, height: u32, step: &mut BlockStep) -> bool {
-        if height != self.verified.saturating_add(1) {
-            return false;
-        }
         let victim = self
             .blocks
             .values()
@@ -2648,22 +2688,32 @@ impl BlockTable {
         }
     }
 
-    /// Resubmits each parked block whose parent the verified tip now includes
+    /// Resubmits each parked block whose parent is now the verified tip
     /// (`bpv1-84`).
+    ///
+    /// A parked block whose height the verified tip reached on another branch
+    /// is no longer the next block, so it falls back to block sync.
     fn resubmit_parked(&mut self, now: Instant, step: &mut BlockStep) {
-        let ready: Vec<block::Hash> = self
-            .blocks
-            .values()
-            .filter(|b| {
-                b.phase == BlockPhase::Verifying
-                    && b.verify_work_id.is_none()
-                    && b.height <= self.verified.saturating_add(1)
-                    && b.verify_deadline.is_some_and(|deadline| now < deadline)
-            })
-            .map(|b| b.meta.block_id)
-            .collect();
+        let mut ready = Vec::new();
+        let mut passed = Vec::new();
+        for b in self.blocks.values() {
+            if b.phase != BlockPhase::Verifying
+                || b.verify_work_id.is_some()
+                || !b.verify_deadline.is_some_and(|deadline| now < deadline)
+            {
+                continue;
+            }
+            if self.is_next_block(b.height, b.parent_hash) {
+                ready.push(b.meta.block_id);
+            } else if b.height <= self.verified.saturating_add(1) {
+                passed.push(b.meta.block_id);
+            }
+        }
         for block_id in ready {
             self.submit_assembled(block_id, step);
+        }
+        for block_id in passed {
+            self.enter_fallback(block_id, FallbackReason::LocalCapacity, step);
         }
     }
 
@@ -3345,7 +3395,7 @@ impl BlockTable {
         // deadline bounds it, as the reconstruction deadline bounds collection.
         if block.body_claimed {
             step.outputs
-                .push(BlockOutput::ClaimBody { block_id, deadline });
+                .push(BlockOutput::ExtendBodyClaim { block_id, deadline });
         }
         step.events.push(BlockEvent::Handoff { block_id });
     }

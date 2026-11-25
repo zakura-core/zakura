@@ -212,6 +212,7 @@ pub fn block_output_name(output: &BlockOutput) -> &'static str {
         BlockOutput::VerifyCommitment { .. } => "block-out:VerifyCommitment",
         BlockOutput::ClosePeer { .. } => "block-out:ClosePeer",
         BlockOutput::ClaimBody { .. } => "block-out:ClaimBody",
+        BlockOutput::ExtendBodyClaim { .. } => "block-out:ExtendBodyClaim",
         BlockOutput::ReleaseBodyClaim { .. } => "block-out:ReleaseBodyClaim",
         BlockOutput::PublishAdmitted { .. } => "block-out:PublishAdmitted",
         BlockOutput::GrantPull { .. } => "block-out:GrantPull",

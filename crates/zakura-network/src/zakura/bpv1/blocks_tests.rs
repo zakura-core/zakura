@@ -247,7 +247,7 @@ pub(super) fn header_result(
 /// Answers the received step's header admission with `parent_hash` missing,
 /// then passes the unknown-parent checks, as for an honest child that
 /// arrives before its parent. Returns the step that parks it.
-fn missing_parent(
+pub(super) fn missing_parent(
     table: &mut BlockTable,
     now: Instant,
     received: &BlockStep,

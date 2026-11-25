@@ -12,7 +12,9 @@ use zakura_rt::time::Instant;
 
 use super::{
     blocks::{BlockConfig, BlockInput, BlockOutput, BlockStep, BlockTable, HeaderAdmissionResult},
-    blocks_tests::{closed_sessions, commitment_ok, header_result, rejected_sessions},
+    blocks_tests::{
+        closed_sessions, commitment_ok, header_result, missing_parent, rejected_sessions,
+    },
     close::Bpv1CloseRow,
     codec::encode_body,
     peer::{PeerConfig, PeerInput, PeerOutput, PeerState, RecvWantEnd, Retire},
@@ -423,14 +425,7 @@ fn close_4_alternate_survives_a_wait_for_the_parent() {
         make_envelope(block_id, tiny(), [0xA1; 32], node_id(1)),
         a,
     );
-    header_result(
-        &mut table,
-        now,
-        &first,
-        HeaderAdmissionResult::MissingParent {
-            parent_hash: parent,
-        },
-    );
+    missing_parent(&mut table, now, &first, parent);
     copy_from(
         &mut table,
         now,

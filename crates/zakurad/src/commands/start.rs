@@ -812,9 +812,6 @@ impl StartCmd {
             None
         };
 
-        // The network counts `tx-relay`'s memory shares only when it is
-        // registered, not merely enabled.
-        network_config.zakura.tx_relay.enabled = tx_relay_port.is_some();
         let tx_relay_registered = tx_relay_port.is_some();
         info!(
             configured = config.network.zakura.tx_relay.enabled,

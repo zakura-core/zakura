@@ -58,6 +58,9 @@ use super::{
         route_peer_output, BlockRoute, PeerRoute,
     },
     tree::{verify_part_proof, VerifiedPart},
+    unknown_parent::{
+        check_binding_and_height, check_proof_of_work, target_bound_applies, UnknownParentVerdict,
+    },
     wire::{
         message_type, read_part_prefix, Bpv1FifoQueue, Bpv1Message, DataQueueItem, HaveFlags,
         WantEndReason, BPV1_CONTROL_KIND, BPV1_DATA_KIND, BPV1_STREAMS,
@@ -407,6 +410,20 @@ impl SharedNode {
                     node.drive(BlockInput::HeaderAdmitted { work_id, result });
                 }));
             }
+            BlockOutput::CheckUnknownParent {
+                work_id,
+                block_id,
+                envelope,
+                top,
+            } => {
+                let node = Arc::clone(self);
+                drop(task::spawn_named("bpv1-check-unknown-parent", async move {
+                    let verdict = check_unknown_parent(&node, &envelope, top).await;
+                    tracing::debug!(target: "bpv1_stage", %block_id,
+                        work_id = work_id.0, ?verdict, "unknown_parent_checked");
+                    node.drive(BlockInput::UnknownParentChecked { work_id, verdict });
+                }));
+            }
             BlockOutput::VerifyCommitment {
                 work_id,
                 block_id,
@@ -562,6 +579,33 @@ fn verify_envelope_commitment(
         &fields,
     )
     .is_ok()
+}
+
+/// Runs the checks on `envelope`, whose parent header is unknown, in their
+/// order: the cheap binding and height checks, then the target bound and
+/// proof of work on a blocking thread.
+async fn check_unknown_parent(
+    node: &SharedNode,
+    envelope: &MetaEnvelope,
+    top: u32,
+) -> UnknownParentVerdict {
+    let Some(header) = parse_header(&envelope.header_bytes) else {
+        return UnknownParentVerdict::Invalid(Bpv1CloseRow::Row3InvalidHeader);
+    };
+    let height = match check_binding_and_height(&header, envelope, top) {
+        Ok(height) => height,
+        Err(verdict) => return verdict,
+    };
+    let bound = if target_bound_applies(&node.network, height) {
+        node.header_admission.target_bound().await
+    } else {
+        None
+    };
+    let network = node.network.clone();
+    task::spawn_blocking(move || check_proof_of_work(&network, &header, height, bound))
+        .await
+        // A check that never finished faults no peer: block sync owns the block.
+        .unwrap_or(UnknownParentVerdict::OutOfRange)
 }
 
 /// Cloneable control & proposer handle for a running [`Bpv1Service`].

@@ -29,6 +29,7 @@ use super::{
         Coding, Profile, W2_MAX_COINBASE_BYTES, W2_MAX_COMMITMENT_PATH_DEPTH, W2_MAX_HEADER_BYTES,
     },
     tree::{encoding_id, VerifiedPart},
+    unknown_parent::UnknownParentVerdict,
     wire::{Bpv1Message, WantBitmap, PROPAGATION_DEPTH},
 };
 
@@ -360,6 +361,14 @@ pub enum BlockInput {
         /// Admission outcome.
         result: HeaderAdmissionResult,
     },
+    /// Completion of the checks on metadata whose parent header is unknown
+    /// ([`super::unknown_parent`]).
+    UnknownParentChecked {
+        /// Work identity returned by `CheckUnknownParent`.
+        work_id: WorkId,
+        /// The checks' outcome.
+        verdict: UnknownParentVerdict,
+    },
     /// Completion of coinbase commitment verification (`bpv1-2`, `bpv1-6`, `bpv1-63`).
     CommitmentChecked {
         /// Work identity returned by `VerifyCommitment`.
@@ -548,6 +557,18 @@ pub enum BlockOutput {
         from_peer: NodeId,
         /// Session generation of `from_peer`.
         session_gen: u64,
+    },
+    /// Check the binding, height, target, and proof of work of metadata whose
+    /// parent header is unknown, off the driver ([`super::unknown_parent`]).
+    CheckUnknownParent {
+        /// Work identity.
+        work_id: WorkId,
+        /// Block hash.
+        block_id: block::Hash,
+        /// Metadata envelope to check.
+        envelope: Box<MetaEnvelope>,
+        /// `top` when the check starts. The block's height must lie above it.
+        top: u32,
     },
     /// Verify the coinbase commitment for an admitted header on a worker (`bpv1-2`).
     VerifyCommitment {
@@ -873,6 +894,10 @@ struct AdmittingEntry {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum AdmittingStage {
     WaitingHeader,
+    /// Headerchain lacks `parent_hash`. The entry parks once the checks pass.
+    CheckingUnknownParent {
+        parent_hash: block::Hash,
+    },
     WaitingCommitment,
 }
 
@@ -1216,7 +1241,7 @@ pub struct BlockTable {
     /// block sync (`bpv1-76`).
     verified: u32,
     paths: PeerPaths,
-    /// Metadata currently in `HeaderAdmission` or `VerifyCommitment`.
+    /// Metadata currently in `HeaderAdmission`, `CheckUnknownParent`, or `VerifyCommitment`.
     admitting: HashMap<block::Hash, AdmittingEntry>,
     /// Index from `WorkId` to `block_id` for O(1) stale-work filtering.
     work_to_block: HashMap<WorkId, block::Hash>,
@@ -1432,7 +1457,10 @@ impl BlockTable {
                 );
             }
             BlockInput::HeaderAdmitted { work_id, result } => {
-                self.handle_header_admitted(now, work_id, result, &mut step);
+                self.handle_header_admitted(work_id, result, &mut step);
+            }
+            BlockInput::UnknownParentChecked { work_id, verdict } => {
+                self.handle_unknown_parent_checked(now, work_id, verdict, &mut step);
             }
             BlockInput::CommitmentChecked {
                 work_id,
@@ -1679,7 +1707,6 @@ impl BlockTable {
 
     fn handle_header_admitted(
         &mut self,
-        now: Instant,
         work_id: WorkId,
         result: HeaderAdmissionResult,
         step: &mut BlockStep,
@@ -1726,23 +1753,23 @@ impl BlockTable {
                 });
             }
             HeaderAdmissionResult::MissingParent { parent_hash } => {
+                // Headerchain checked nothing but the parent's hash, so the
+                // header's own checks run before it parks.
+                let next_work = alloc_work_id(&mut self.next_work_id);
                 let entry = self
                     .admitting
-                    .remove(&block_id)
+                    .get_mut(&block_id)
                     .expect("admitting entry verified present");
-                self.insert_pending(
+                entry.work_id = next_work;
+                entry.stage = AdmittingStage::CheckingUnknownParent { parent_hash };
+                let envelope = entry.envelope.clone();
+                self.work_to_block.insert(next_work, block_id);
+                step.outputs.push(BlockOutput::CheckUnknownParent {
+                    work_id: next_work,
                     block_id,
-                    PendingMetaEntry {
-                        envelope: entry.envelope,
-                        arrived_at: entry.arrived_at,
-                        from_peer: entry.from_peer,
-                        session_gen: entry.session_gen,
-                        also_from: entry.also_from,
-                        parent_hash,
-                        received_at: now,
-                    },
-                    step,
-                );
+                    envelope,
+                    top: self.top,
+                });
             }
             HeaderAdmissionResult::PeerInvalid => {
                 let entry = self
@@ -1770,7 +1797,77 @@ impl BlockTable {
         }
     }
 
-    /// Bytes held in metadata in header admission or the commitment check.
+    /// Parks, drops, or closes metadata whose parent header is unknown, as its
+    /// checks decided.
+    fn handle_unknown_parent_checked(
+        &mut self,
+        now: Instant,
+        work_id: WorkId,
+        verdict: UnknownParentVerdict,
+        step: &mut BlockStep,
+    ) {
+        let Some(block_id) = self.work_to_block.remove(&work_id) else {
+            return;
+        };
+        let Some(entry) = self.admitting.get(&block_id) else {
+            return;
+        };
+        let AdmittingStage::CheckingUnknownParent { parent_hash } = entry.stage else {
+            return;
+        };
+        if entry.work_id != work_id {
+            return;
+        }
+        let entry = self
+            .admitting
+            .remove(&block_id)
+            .expect("admitting entry verified present");
+        match verdict {
+            UnknownParentVerdict::Park => self.insert_pending(
+                block_id,
+                PendingMetaEntry {
+                    envelope: entry.envelope,
+                    arrived_at: entry.arrived_at,
+                    from_peer: entry.from_peer,
+                    session_gen: entry.session_gen,
+                    also_from: entry.also_from,
+                    parent_hash,
+                    received_at: now,
+                },
+                step,
+            ),
+            // Block sync owns the height.
+            UnknownParentVerdict::OutOfRange => {
+                reject_meta(step, block_id, entry.from_peer, entry.session_gen);
+                reject_also(step, block_id, &entry.also_from);
+            }
+            UnknownParentVerdict::Invalid(row) => {
+                step.outputs.push(BlockOutput::ClosePeer {
+                    peer: entry.from_peer,
+                    session_gen: entry.session_gen,
+                    row,
+                });
+                if row == Bpv1CloseRow::Row3InvalidHeader {
+                    // `block_id` is the hash of the header bytes, so every
+                    // session in `also_from` sent this same invalid header.
+                    for (peer, session_gen) in entry.also_from {
+                        step.outputs.push(BlockOutput::ClosePeer {
+                            peer,
+                            session_gen,
+                            row,
+                        });
+                    }
+                } else {
+                    // Another sender's binding may differ under the same hash,
+                    // so it is not faulted for this one's.
+                    reject_also(step, block_id, &entry.also_from);
+                }
+            }
+        }
+    }
+
+    /// Bytes held in metadata in header admission, its unknown-parent checks,
+    /// or the commitment check.
     fn admitting_bytes(&self) -> usize {
         self.admitting
             .values()

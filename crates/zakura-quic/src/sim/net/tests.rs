@@ -637,6 +637,19 @@ fn an_injected_receive_failure_wakes_the_reader_once() {
     assert!(would_block(recv(&b)));
 }
 
+#[test]
+fn an_injected_send_failure_drops_one_send() {
+    let net = SimNet::new(fifo(0, 10));
+    let a = net.bind(addr(1)).unwrap();
+    assert!(net.fail_next_send(addr(1), io::ErrorKind::WouldBlock));
+    assert!(!net.fail_next_send(addr(9), io::ErrorKind::WouldBlock));
+    let error = a.try_send(&transmit(addr(2), 3), b"one").unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    assert_eq!(net.in_flight(), []);
+    send(&a, addr(2), b"two");
+    assert_eq!(net.in_flight().len(), 1);
+}
+
 // M2.6
 
 #[test]

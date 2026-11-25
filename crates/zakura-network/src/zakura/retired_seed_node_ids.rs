@@ -1,9 +1,8 @@
-//! The default seeds' node IDs from before p2p-v2/4, and their replacement in
+//! Replaces default seed IDs from p2p-v2/3 with their p2p-v2/5 IDs in
 //! `zakura.bootstrap_peers`.
 //!
-//! p2p-v2/4 derives node IDs from the TLS credential, so every seed's ID changed, and a
-//! config written before then names the seeds by IDs that now fail the identity check.
-//! Drop this module once releases before p2p-v2/4 are no longer supported.
+//! A config from p2p-v2/3 names seeds by their Ed25519 public keys. A p2p-v2/5 dial
+//! expects the ID derived from the seed's TLS credential.
 
 use std::str::FromStr;
 
@@ -11,67 +10,67 @@ use zakura_quic::NodeId;
 
 use super::ZakuraConfig;
 
-/// Each default seed's protocol 3 node ID, its Ed25519 key, paired with its current ID.
+/// Each default seed's protocol 3 node ID, its Ed25519 key, paired with its protocol 5 ID.
 const RETIRED_ZAKURA_SEED_NODE_IDS: &[(&str, &str)] = &[
     // asia-0
     (
         "1398f62c6d1a457c51ba6a4b5f3dbd2f69fca93216218dc8997e416bd17d93ca",
-        "a5f148b592404c5fcdc27f06919681c1dceddb274336abf5c91e70780471bc12",
+        "078a60720f0d474743a51674b152f49f575704a77905c16475683cff9d18f246",
     ),
     // us-0
     (
         "fd1724385aa0c75b64fb78cd602fa1d991fdebf76b13c58ed702eac835e9f618",
-        "10e8b19b6aabb5ccd80d2df14fabc991602aea0cfb82783ebdabb3b1b699e9b7",
+        "1bb8f2f70bdbf9d44ef2ccc3de1a5cbbba56cea2cf371e227d501ce19a8bdeb9",
     ),
     // us-east-0
     (
         "9ec67ad6834bc2ca0d659c240e042d3446c37cabcc092b527d459c87d938b4a4",
-        "ca22584f4392a26c46f9553e45db00fc8de06f1ff8f2c48f5d28b5cd58f134b6",
+        "a98d73e0114f9f8ae3d5a0b4ec0b8cef20b51d715de6898a39fc3f23948196b7",
     ),
     // us-west-0
     (
         "bd3dc5d2a3d44c6bf90e364bf446231dbf9737e38a562ccf9e91ea631ea59b22",
-        "27fec1ed7f52ca389f8ad09e79e896fe6f0097dea6d74b71628dce992cb50b57",
+        "02ef9b05d81ad2f6176a68fd047bda5e4e277d69ac51b3b2536d43ea8f38de1c",
     ),
     // canada-0
     (
         "14ab98fa0c4b07d40119e1dbc9f3c36d20c8f226ae5ba4216218a2034f148e57",
-        "a4ef400514ea1eaceea73e2b1a86f4102264e88cfc8b3ace9da73d43c7ccb7c2",
+        "0018a0f4fc1f3cc3b4a84e8ebcb77008343c9e54fb80f77fd03271c7a33063b7",
     ),
     // europe-west-0
     (
         "681d21b18644cd82ec13256a97f92bec1fff815683ef6f65dc7c993f098a4fe5",
-        "9addeca7e4ea8aced48fcf9e3a9f8ce21056fecf9c0bbce368b61ec35b4e5bdc",
+        "4607c5353e2c07ecd10d73c6c19d0b0de092939328f33e8f04d5ced382fadf7b",
     ),
     // europe-central-0
     (
         "058b3f20dc9bef7bb447f94d7663d793cfbc036720f97e52d7f13661b21818e1",
-        "5f0cc2933a058472140348ebe708ff7a10167cd7e9cd96fa19263ecdf62a3fbe",
+        "8ac35544d02141e7a3cc3c8b8661a3e726985a266673b60cf45f5b33c3f36e73",
     ),
     // asia-south-0
     (
         "291323d78eb7186c3fa225ef5e305e95363e0ef06d42dca91bd4ef0254aed1ae",
-        "6a13975563f5883fda0b8b0b1cee54163dedf786dc8f1b4990d2130e7cc56b51",
+        "42623a00c2632e0cf99d1c10cec024b0217d12d5fecc91947a3a040f142df06b",
     ),
     // asia-pacific-0
     (
         "85e425233a68697d4be91dd5d542305a8a327cd06d992d53c0913cef2fa75084",
-        "a8a2de1c199100dcd1e7985a30a6a07858d45ee3703794d9d214827724067431",
+        "ba06d75332e3a430d4e838b5838a2356338124cf2930bb0f8e2962e01223ed95",
     ),
     // zakura-testnet-1
     (
         "57ad39fad4f0bca46cf1ea831772a99d5027b372fef2be5a0ea68e1b5bb4da49",
-        "672cb8d35831d6020f14e35215de0f7fc1ee771ecd3c9d5fe67c32acb0b53fab",
+        "884eb8c4e0d6005bd3a6e086df064efc12b866632dababa4249b2ceb42d43982",
     ),
     // zakura-testnet-eu
     (
         "2bbb907b5d90598ef49f2e637066586b311a64587479be6ed43e8388587fcd2a",
-        "3783033db00b137ed3d11cf2d30853fce65db4967d3910bb66ff4d14191764c9",
+        "1d0dd618bb699637322dcbf20a0830fe9078733ba13c3ee01768bfb518653064",
     ),
     // zakura-testnet-as
     (
         "50999835f48f4a048c0e9042e5332844c9673943d7fab1f7e993bae698c27ea3",
-        "fe1f7911e1675f0f3cfb17033a71ff2221d03d9f170b0209a73deba439886efe",
+        "b5410aedf93d00bbc9f93405a4c054b30289da9b76269432a5e6e0e132f0480c",
     ),
 ];
 

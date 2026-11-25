@@ -4,7 +4,9 @@
 //! never becomes ready is skipped rather than stalling or failing the run.
 #![cfg(zakura_sim)]
 
-use zakura_network::zakura::{MSG_DISCOVERY_PEERS, MSG_DISCOVERY_SERVICES};
+use zakura_network::zakura::{
+    MSG_DISCOVERY_GET_PEERS, MSG_DISCOVERY_PEERS, MSG_DISCOVERY_SERVICES,
+};
 use zakura_sim::{
     explore::{classify, run_bytes, ExploreOutcome},
     harness::{
@@ -190,17 +192,35 @@ fn a_skipped_act_keeps_the_held_answer() {
     let over_owed = act(DiscoveryAct::OverOwed {
         row: DiscoveryRow::Peers,
     });
-    // Rule-breaking acts allowed; `Peers` held until 500 ms.
-    let report = run_clean(&composed_prefix(0, 0x80, 0b0000_0010, &[over_owed]).unwrap());
-    let skipped = report.log.entries().iter().any(
-        |entry| matches!(&entry.obs, Observation::ActSkipped { act, .. } if act == "over-owed"),
-    );
-    assert!(skipped, "the over-owed act is skipped");
-    let sent = sent(&report);
-    assert!(
-        sent.iter()
-            .any(|(row, label)| row == "peers" && label == "conformant"),
-        "the held Peers still goes out: {sent:?}"
+    // Use 1 to 5 ms links and hold `Peers` until 1.5 s so the handshake and
+    // request can finish while there is still time to act on the held reply.
+    let report = run_clean(&composed_prefix(0x20, 0x80, 0b0000_1010, &[over_owed]).unwrap());
+    let events: Vec<_> = report
+        .log
+        .entries()
+        .iter()
+        .filter_map(|entry| match &entry.obs {
+            Observation::PeerReceived { message_type, .. }
+                if *message_type == u16::from(MSG_DISCOVERY_GET_PEERS) =>
+            {
+                Some("received GetPeers")
+            }
+            Observation::ActSkipped { act, .. } if act == "over-owed" => Some("skipped the act"),
+            Observation::PeerFrame { row, label, .. }
+                if row.as_deref() == Some("peers") && label.name() == "conformant" =>
+            {
+                Some("sent the held Peers")
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        events,
+        [
+            "received GetPeers",
+            "skipped the act",
+            "sent the held Peers"
+        ]
     );
 }
 

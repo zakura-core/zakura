@@ -31,7 +31,7 @@ fn queues_meta(step: &PeerStep) -> bool {
     })
 }
 
-fn dummy_meta(block_id: block::Hash) -> Box<Bpv1Message> {
+pub(super) fn dummy_meta(block_id: block::Hash) -> Box<Bpv1Message> {
     Box::new(Bpv1Message::HeaderMeta {
         header: block_id.0.to_vec(),
         binding: CoinbaseBinding {
@@ -56,7 +56,7 @@ fn proposer_meta(block_id: block::Hash, proposer: NodeId) -> Box<Bpv1Message> {
 }
 
 /// The peer's `HeaderMeta` for `block_id`.
-fn recv_meta(block_id: block::Hash) -> PeerInput {
+pub(super) fn recv_meta(block_id: block::Hash) -> PeerInput {
     PeerInput::RecvHeaderMeta {
         block_id,
         message: dummy_meta(block_id),
@@ -64,7 +64,7 @@ fn recv_meta(block_id: block::Hash) -> PeerInput {
 }
 
 /// An inbound `Have` of `indices` with `flags`.
-fn have_with(block_id: block::Hash, flags: HaveFlags, indices: Vec<u32>) -> PeerInput {
+pub(super) fn have_with(block_id: block::Hash, flags: HaveFlags, indices: Vec<u32>) -> PeerInput {
     PeerInput::RecvHave(RecvHave {
         block_id,
         flags,
@@ -74,7 +74,7 @@ fn have_with(block_id: block::Hash, flags: HaveFlags, indices: Vec<u32>) -> Peer
 }
 
 /// The coding of the 64-byte TINY block most tests admit.
-fn tiny() -> Coding {
+pub(super) fn tiny() -> Coding {
     Profile::TINY.derive_coding(64, 2).unwrap()
 }
 
@@ -91,12 +91,12 @@ fn block_admitted(block_id: block::Hash, coding: Coding, proposer: NodeId) -> Bl
     }
 }
 
-fn admitted(block_id: block::Hash, coding: Coding, proposer: NodeId) -> PeerInput {
+pub(super) fn admitted(block_id: block::Hash, coding: Coding, proposer: NodeId) -> PeerInput {
     PeerInput::BlockAdmitted(block_admitted(block_id, coding, proposer))
 }
 
 /// The admission of node 1's own block.
-fn proposing(block_id: block::Hash, coding: Coding) -> PeerInput {
+pub(super) fn proposing(block_id: block::Hash, coding: Coding) -> PeerInput {
     PeerInput::BlockAdmitted(BlockAdmitted {
         as_proposer: true,
         ..block_admitted(block_id, coding, node_id(1))
@@ -104,7 +104,7 @@ fn proposing(block_id: block::Hash, coding: Coding) -> PeerInput {
 }
 
 /// A TINY session from node 1 to `remote` that stepped `admission`.
-fn session(remote: NodeId, now: Instant, admission: PeerInput) -> PeerState {
+pub(super) fn session(remote: NodeId, now: Instant, admission: PeerInput) -> PeerState {
     let mut peer = PeerState::new(
         PeerConfig::for_profile(Profile::TINY),
         node_id(1),
@@ -117,11 +117,11 @@ fn session(remote: NodeId, now: Instant, admission: PeerInput) -> PeerState {
 
 /// A session from node 1 to node 2 with the 64-byte TINY block admitted;
 /// node 3 proposed it.
-fn tiny_session(block_id: block::Hash, now: Instant) -> PeerState {
+pub(super) fn tiny_session(block_id: block::Hash, now: Instant) -> PeerState {
     session(node_id(2), now, admitted(block_id, tiny(), node_id(3)))
 }
 
-fn bitmap(slots: &[u32]) -> WantBitmap {
+pub(super) fn bitmap(slots: &[u32]) -> WantBitmap {
     let mut bm = WantBitmap::EMPTY;
     for &slot in slots {
         bm.set(slot);
@@ -130,7 +130,7 @@ fn bitmap(slots: &[u32]) -> WantBitmap {
 }
 
 /// The block table's grant of `slots` of `stripe`, due 50 ms after `now`.
-fn pull(block_id: block::Hash, stripe: u32, slots: &[u32], now: Instant) -> PeerInput {
+pub(super) fn pull(block_id: block::Hash, stripe: u32, slots: &[u32], now: Instant) -> PeerInput {
     PeerInput::PullGranted(PullGranted {
         block_id,
         stripe,
@@ -144,7 +144,12 @@ fn pull(block_id: block::Hash, stripe: u32, slots: &[u32], now: Instant) -> Peer
 }
 
 /// The peer's `Want` for `slots` of `stripe`.
-fn recv_want(want_id: u32, block_id: block::Hash, stripe: u32, slots: &[u32]) -> PeerInput {
+pub(super) fn recv_want(
+    want_id: u32,
+    block_id: block::Hash,
+    stripe: u32,
+    slots: &[u32],
+) -> PeerInput {
     PeerInput::RecvWant(RecvWant {
         want_id,
         block_id,
@@ -173,7 +178,7 @@ fn sent_want(step: &PeerStep) -> Option<u32> {
 }
 
 /// The token of the proof job that `step` starts, if any.
-fn verify_token(step: &PeerStep) -> Option<PartToken> {
+pub(super) fn verify_token(step: &PeerStep) -> Option<PartToken> {
     step.outputs.iter().find_map(|o| match o {
         PeerOutput::VerifyPart { token, .. } => Some(*token),
         _ => None,
@@ -181,7 +186,7 @@ fn verify_token(step: &PeerStep) -> Option<PartToken> {
 }
 
 #[track_caller]
-fn assert_closed(peer: &PeerState, row: Bpv1CloseRow) {
+pub(super) fn assert_closed(peer: &PeerState, row: Bpv1CloseRow) {
     assert_eq!(peer.close_cause().map(|c| c.row), Some(row));
 }
 
@@ -1524,7 +1529,7 @@ fn admit_tiny(peer: &mut PeerState, block_id: block::Hash, now: Instant) -> Peer
     peer.step(now, admitted(block_id, tiny(), node_id(2)))
 }
 
-fn tiny_part_prefix(block_id: block::Hash, index: u32) -> PeerInput {
+pub(super) fn tiny_part_prefix(block_id: block::Hash, index: u32) -> PeerInput {
     PeerInput::RecvPartPrefix(RecvPartPrefix {
         block_id,
         index,

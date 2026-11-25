@@ -106,14 +106,17 @@ const LOG_TAIL_LINES: usize = 40;
 const CONNECTION_TRACE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The blocks above a marker before the gateway it names counts.
-pub const QUALIFYING_DEPTH: u32 = 100;
+pub const QUALIFYING_DEPTH: u32 = 10;
+
+/// The fewest counted blocks that must name a gateway before a node ranks it.
+pub const MIN_GATEWAY_BLOCKS: u32 = 10;
 
 /// The heights a node counts, the newest at the qualifying depth: two days of
 /// blocks at Regtest's 75 second spacing.
 pub const WINDOW_BLOCKS: u32 = 2 * 24 * 60 * 60 / 75;
 
-/// A v2 node ID, as a coinbase names a gateway.
-pub type GatewayId = [u8; 32];
+/// The first 20 bytes of a v2 node ID, as a coinbase names a gateway.
+pub type GatewayId = [u8; 20];
 
 /// A node's best block.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -443,9 +446,12 @@ impl RegtestNet {
         self.nodes[node].node_id
     }
 
-    /// The gateway ID a coinbase names when `node` is a pool.
+    /// The gateway ID a coinbase names when `node` is a pool: the first 20
+    /// bytes of its node ID.
     pub fn gateway_id(&self, node: usize) -> GatewayId {
-        *self.nodes[node].node_id.as_bytes()
+        self.nodes[node].node_id.as_bytes()[..20]
+            .try_into()
+            .expect("a node ID is longer than a gateway ID")
     }
 
     /// The gateway IDs of `nodes`, in order.
@@ -753,9 +759,9 @@ impl RegtestNet {
     }
 
     /// Waits until every running mining node of `island` has read its whole
-    /// window at `tip`, and reports for each gateway the count the harness
-    /// finds in the same blocks: standing invariant 6. A node never ranks its
-    /// own ID.
+    /// window at `tip`, and ranks each gateway the harness finds named in at
+    /// least [`MIN_GATEWAY_BLOCKS`] of the same blocks, with that count, and
+    /// no other: standing invariant 6. A node never ranks its own ID.
     async fn wait_for_matching_counts(&mut self, tip: Tip, island: &[usize]) -> Result<()> {
         let newest = tip.height.0.checked_sub(QUALIFYING_DEPTH);
         let oldest = newest.map(|height| height.saturating_sub(WINDOW_BLOCKS - 1));
@@ -792,6 +798,7 @@ impl RegtestNet {
                     }),
                 };
                 let mut expected = counts.clone();
+                expected.retain(|_, blocks| *blocks >= MIN_GATEWAY_BLOCKS);
                 expected.remove(&self.gateway_id(index));
                 if view.counts() != expected {
                     behind.push(format!(
@@ -888,10 +895,17 @@ impl RegtestNet {
                 continue;
             };
             let mut line = format!("node {index}: {}", view.describe());
+            // Whole node IDs first, then the gateway IDs they start with.
             for (other, other_node) in self.nodes.iter().enumerate() {
                 line = line.replace(
                     &hex::encode(other_node.node_id.as_bytes()),
                     &format!("node {other}"),
+                );
+            }
+            for other in 0..self.nodes.len() {
+                line = line.replace(
+                    &hex::encode(self.gateway_id(other)),
+                    &format!("gateway {other}"),
                 );
             }
             text.push_str(&line);
@@ -904,7 +918,8 @@ impl RegtestNet {
 /// The gateway named by the block's coinbase, if it names one.
 fn named_gateway(block: &Block) -> Option<GatewayId> {
     let coinbase = block.transactions.first()?;
-    MinerMeshCommitment::from_coinbase_outputs(coinbase.outputs()).map(|marker| marker.gateway_id())
+    MinerMeshCommitment::from_coinbase_outputs(coinbase.outputs())
+        .map(|marker| *marker.gateway_id().as_bytes())
 }
 
 /// A filler's answer to every request: nothing, as a node with no blocks or

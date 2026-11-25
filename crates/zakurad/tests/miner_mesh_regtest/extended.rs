@@ -16,7 +16,9 @@ use eyre::Result;
 
 use zakura_rpc::client::MeshGatewayState;
 
-use super::harness::{GatewayId, NodeSpec, RegtestNet, Role, QUALIFYING_DEPTH, WINDOW_BLOCKS};
+use super::harness::{
+    GatewayId, NodeSpec, RegtestNet, Role, MIN_GATEWAY_BLOCKS, QUALIFYING_DEPTH, WINDOW_BLOCKS,
+};
 
 use super::{DIAL_TIMEOUT, DISCOVERY_TIMEOUT, QUIET_PERIOD};
 
@@ -35,7 +37,7 @@ const RECONNECT_TIMEOUT: Duration = Duration::from_secs(150);
 /// The blocks mined between two checks while a marker ages.
 const AGING_STEP: u32 = 600;
 
-/// Twelve pools named in 12, 11, ..., 1 blocks: every mining node prefers and
+/// Twelve pools named in 21, 20, ..., 10 blocks: every mining node prefers and
 /// holds the ten highest pools other than itself, and never the rest. When
 /// two connected pools tie at the cutoff, the existing preferred pool keeps
 /// its place through the tie and the dial rounds that follow.
@@ -61,7 +63,8 @@ async fn top_ten_of_twelve_pools() -> Result<()> {
     }
     let incumbent = net.gateway_id(ranked[cutoff]);
     let challenger = net.gateway_id(ranked[cutoff + 1]);
-    for (pool, count) in ranked.into_iter().zip((1..=12).rev()) {
+    let counts = (MIN_GATEWAY_BLOCKS..MIN_GATEWAY_BLOCKS + 12).rev();
+    for (pool, count) in ranked.into_iter().zip(counts) {
         net.mine(pool, count).await?;
     }
     net.mine(M, QUALIFYING_DEPTH).await?;
@@ -100,7 +103,7 @@ async fn top_ten_of_twelve_pools() -> Result<()> {
     let count = |id| view.gateway(id).map(|gateway| gateway.blocks);
     assert_eq!(
         (count(&incumbent), count(&challenger)),
-        (Some(3), Some(3)),
+        (Some(MIN_GATEWAY_BLOCKS + 2), Some(MIN_GATEWAY_BLOCKS + 2)),
         "the connected pools tie for the last preferred place"
     );
     net.hold_for(
@@ -134,8 +137,8 @@ async fn gateway_restart_keeps_its_id() -> Result<()> {
     .await?;
     let (a, b) = (net.gateway_id(A), net.gateway_id(B));
 
-    net.mine(A, 2).await?;
-    net.mine(B, 1).await?;
+    net.mine(A, MIN_GATEWAY_BLOCKS + 1).await?;
+    net.mine(B, MIN_GATEWAY_BLOCKS).await?;
     net.mine(M, QUALIFYING_DEPTH).await?;
     let all_held = |net: &RegtestNet| {
         [B, M]
@@ -167,11 +170,13 @@ async fn gateway_restart_keeps_its_id() -> Result<()> {
     Ok(())
 }
 
-/// Two islands that cannot reach each other mine apart, 120 blocks naming A
-/// on one and 300 naming B on the other, until a relay joins them. A's island
-/// reorganises onto B's chain, 120 blocks deep: past the qualifying depth,
-/// within the 1,000 blocks a node can reorganise. Every mining node then ranks
-/// B alone, and A's miner keeps its connection to A as an ordinary one.
+/// Two islands that cannot reach each other mine apart until a relay joins
+/// them: A's island mines enough blocks naming A for twice the minimum of them
+/// to count, and B's island mines twice as many blocks naming B. A's island
+/// reorganises onto B's longer chain in a reorg `A_BLOCKS` deep: past the
+/// qualifying depth, within the 1,000 blocks a node can reorganise. Every
+/// mining node then ranks B alone, and A's miner keeps its connection to A as
+/// an ordinary one.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "starts zakurad children: run with the miner-mesh-regtest-extended nextest profile"]
 async fn deep_reorg_moves_the_ranking() -> Result<()> {
@@ -181,8 +186,8 @@ async fn deep_reorg_moves_the_ranking() -> Result<()> {
     const B: usize = 3;
     const B_MINER: usize = 4;
     const BRIDGE: usize = 5;
-    const A_BLOCKS: u32 = 120;
-    const B_BLOCKS: u32 = 300;
+    const A_BLOCKS: u32 = QUALIFYING_DEPTH + 2 * MIN_GATEWAY_BLOCKS;
+    const B_BLOCKS: u32 = 2 * A_BLOCKS;
     let _init_guard = zakura_test::init();
 
     // A's miner learns A from a relay rather than bootstrapping from it, so
@@ -268,9 +273,11 @@ async fn deep_reorg_moves_the_ranking() -> Result<()> {
     Ok(())
 }
 
-/// A pool that stops mining leaves every ranking once its last marker is
-/// older than the window: two days of blocks plus the qualifying depth after
-/// it, 2,404 blocks on Regtest. Its connections stay, as ordinary ones.
+/// A pool that stops mining leaves every ranking once fewer than the minimum
+/// of its markers count. Its markers are consecutive, so that is when the
+/// first of them is older than the window: two days of blocks plus the
+/// qualifying depth after it, 2,314 blocks on Regtest. Its connections stay,
+/// as ordinary ones.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "starts zakurad children: run with the miner-mesh-regtest-extended nextest profile"]
 async fn markers_age_out() -> Result<()> {
@@ -293,8 +300,8 @@ async fn markers_age_out() -> Result<()> {
     .await?;
     let (a, b) = (net.gateway_id(A), net.gateway_id(B));
 
-    let last_marker = net.mine(A, 1).await?.height.0;
-    net.mine(B, 1).await?;
+    let first_marker = net.mine(A, MIN_GATEWAY_BLOCKS).await?.height.0 + 1 - MIN_GATEWAY_BLOCKS;
+    net.mine(B, MIN_GATEWAY_BLOCKS).await?;
     let mut tip = net.mine(M, QUALIFYING_DEPTH).await?.height.0;
     net.wait_for("B and M holding A", DISCOVERY_TIMEOUT, |net| {
         [B, M]
@@ -303,18 +310,18 @@ async fn markers_age_out() -> Result<()> {
     })
     .await?;
 
-    // From here only B mines, so B stays ranked while A's marker ages.
-    let last_tip_counting_a = last_marker + QUALIFYING_DEPTH + WINDOW_BLOCKS - 1;
-    while tip < last_tip_counting_a {
-        let step = (last_tip_counting_a - tip).min(AGING_STEP);
+    // From here only B mines, so B stays ranked while A's markers age.
+    let last_tip_counting_all_of_a = first_marker + QUALIFYING_DEPTH + WINDOW_BLOCKS - 1;
+    while tip < last_tip_counting_all_of_a {
+        let step = (last_tip_counting_all_of_a - tip).min(AGING_STEP);
         tip = net.mine(B, step).await?.height.0;
     }
     for node in [B, M] {
         let view = net.view(node);
         assert_eq!(
             view.gateway(&a).map(|gateway| gateway.blocks),
-            Some(1),
-            "node {node} still counts A's marker at the oldest height of its window",
+            Some(MIN_GATEWAY_BLOCKS),
+            "node {node} still counts A's first marker at the oldest height of its window",
         );
         assert!(view.prefers_and_holds(&a), "node {node} still holds A");
     }
@@ -328,7 +335,7 @@ async fn markers_age_out() -> Result<()> {
         assert_eq!(
             net.view(node).gateway(&a),
             None,
-            "node {node} no longer ranks A"
+            "node {node} no longer ranks A, one marker short of the minimum"
         );
     }
     let only_b_is_preferred = |net: &RegtestNet| {
@@ -364,8 +371,9 @@ fn is_ordinary_peer(net: &RegtestNet, node: usize, id: &GatewayId, preferred_slo
         && view.info.slots.expect("the miner runs v2").preferred == preferred_slots
 }
 
-/// A gateway already connected as an ordinary peer when its marker qualifies
-/// becomes preferred on the same connection, without a new one.
+/// A gateway already connected as an ordinary peer when the tenth of its
+/// markers qualifies becomes preferred on the same connection, without a new
+/// one.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "starts zakurad children: run with the miner-mesh-regtest-extended nextest profile"]
 async fn a_connected_gateway_is_promoted_in_place() -> Result<()> {
@@ -382,7 +390,7 @@ async fn a_connected_gateway_is_promoted_in_place() -> Result<()> {
 
     // Either node may end up holding the connection it opened; what matters
     // is that one connection, in one direction, lasts.
-    net.mine(A, 1).await?;
+    net.mine(A, MIN_GATEWAY_BLOCKS).await?;
     let one_connection = |net: &RegtestNet| {
         let view = net.view(B);
         view.is_connected_to(&a)
@@ -399,7 +407,7 @@ async fn a_connected_gateway_is_promoted_in_place() -> Result<()> {
     assert_eq!(
         net.view(B).state_of(&a),
         None,
-        "A's marker is not deep enough yet"
+        "A's markers are not deep enough yet"
     );
 
     net.mine(B, QUALIFYING_DEPTH - 1).await?;
@@ -449,13 +457,18 @@ async fn an_unknown_gateway_waits_then_joins() -> Result<()> {
     .await?;
     let a = net.gateway_id(A);
 
-    // A mines its marker alone, and the block reaches the hub by RPC, so no
+    // A mines its markers alone, and the blocks reach the hub by RPC, so no
     // node has a record of A.
-    net.mine(A, 1).await?;
-    let marker = net.block(A, 1).await?;
+    net.mine(A, MIN_GATEWAY_BLOCKS).await?;
+    let mut markers = Vec::new();
+    for height in 1..=MIN_GATEWAY_BLOCKS {
+        markers.push(net.block(A, height).await?);
+    }
     net.stop(A).await;
     net.start_node(HUB).await?;
-    net.submit_block(HUB, marker).await?;
+    for marker in markers {
+        net.submit_block(HUB, marker).await?;
+    }
     net.start_node(B).await?;
     net.settle().await?;
     net.mine(B, QUALIFYING_DEPTH).await?;

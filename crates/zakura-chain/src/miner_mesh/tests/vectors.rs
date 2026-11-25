@@ -2,23 +2,24 @@
 
 use crate::{
     amount::{Amount, NonNegative},
-    miner_mesh::MinerMeshCommitment,
+    miner_mesh::{GatewayId, MinerMeshCommitment},
     serialization::ZcashSerialize,
     transparent::{Output, Script},
 };
 
-/// A gateway ID with a different value in every byte.
-const GATEWAY_ID: [u8; 32] = [
+/// A v2 node ID with a different value in every byte.
+const NODE_ID: [u8; 32] = [
     0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
     0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
 ];
 
-/// The lock script of a commitment to [`GATEWAY_ID`].
-const SCRIPT_HEX: &str = "6a234d5201\
-                      000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+/// The lock script of a commitment to the gateway whose node ID is
+/// [`NODE_ID`]: only the first 20 bytes of the node ID are written.
+const SCRIPT_HEX: &str = "6a174d5201\
+                      000102030405060708090a0b0c0d0e0f10111213";
 
 fn commitment() -> MinerMeshCommitment {
-    MinerMeshCommitment::new(GATEWAY_ID)
+    MinerMeshCommitment::new(GatewayId::from_node_id(&NODE_ID))
 }
 
 /// A typical miner reward output.
@@ -50,14 +51,14 @@ fn output_has_the_documented_bytes() {
         commitment().payload().as_slice(),
         &output.lock_script.as_raw_bytes()[2..],
     );
-    assert_eq!(commitment().payload().len(), 35);
+    assert_eq!(commitment().payload().len(), 23);
     assert_eq!(
         output
             .zcash_serialize_to_vec()
             .expect("serializing to a vector never fails")
             .len(),
-        46,
-        "the output costs 46 bytes: an 8-byte value, a 1-byte length and the 37-byte script",
+        34,
+        "the output costs 34 bytes: an 8-byte value, a 1-byte length and the 25-byte script",
     );
 }
 
@@ -87,7 +88,7 @@ fn outputs_without_a_commitment_name_no_gateway() {
 
 #[test]
 fn two_commitments_are_ambiguous() {
-    let other = MinerMeshCommitment::new([0xff; 32]);
+    let other = MinerMeshCommitment::new(GatewayId::from_bytes([0xff; 20]));
 
     for outputs in [
         vec![commitment().to_output(), other.to_output()],
@@ -136,8 +137,8 @@ fn another_script_shape_is_not_a_commitment() {
     let mut not_op_return = script.clone();
     not_op_return[0] = 0x00;
 
-    // The same payload behind OP_PUSHDATA1, a second way to push 35 bytes.
-    let mut long_form_push = vec![0x6a, 0x4c, 0x23];
+    // The same payload behind OP_PUSHDATA1, a second way to push 23 bytes.
+    let mut long_form_push = vec![0x6a, 0x4c, 0x17];
     long_form_push.extend(&script[2..]);
 
     let mut trailing_byte = script.clone();
@@ -180,4 +181,42 @@ fn outputs_that_are_not_commitments_do_not_make_one_ambiguous() {
         MinerMeshCommitment::from_coinbase_outputs(&outputs),
         Some(commitment()),
     );
+}
+
+#[test]
+fn a_commitment_to_a_whole_node_id_is_not_read() {
+    // The 32-byte layout this format replaced: the same tag and version
+    // followed by a whole node ID.
+    let mut script = vec![0x6a, 0x23, b'M', b'R', 0x01];
+    script.extend(NODE_ID);
+
+    assert_eq!(
+        MinerMeshCommitment::from_coinbase_outputs(&[zero_value_output(&script)]),
+        None,
+    );
+}
+
+#[test]
+fn a_gateway_id_is_the_first_20_bytes_of_the_node_id() {
+    let gateway_id = GatewayId::from_node_id(&NODE_ID);
+
+    assert_eq!(gateway_id.as_bytes().as_slice(), &NODE_ID[..20]);
+    assert_eq!(
+        gateway_id.to_string(),
+        "000102030405060708090a0b0c0d0e0f10111213"
+    );
+    assert!(gateway_id.is_prefix_of(&NODE_ID));
+
+    // A node ID that differs only after the first 20 bytes has the same
+    // gateway ID.
+    let mut same_prefix = NODE_ID;
+    same_prefix[31] ^= 0xff;
+    assert!(gateway_id.is_prefix_of(&same_prefix));
+    assert_eq!(GatewayId::from_node_id(&same_prefix), gateway_id);
+
+    // A node ID that differs in its 20th byte does not.
+    let mut other_prefix = NODE_ID;
+    other_prefix[19] ^= 0x01;
+    assert!(!gateway_id.is_prefix_of(&other_prefix));
+    assert_ne!(GatewayId::from_node_id(&other_prefix), gateway_id);
 }

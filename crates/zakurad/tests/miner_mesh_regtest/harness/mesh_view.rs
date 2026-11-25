@@ -23,7 +23,7 @@ impl MeshView {
         self.info
             .gateways
             .iter()
-            .find(|gateway| gateway.node_id == id)
+            .find(|gateway| gateway.gateway_id == id)
     }
 
     /// Where the node places the gateway with `id`, if it ranks it.
@@ -36,14 +36,18 @@ impl MeshView {
         self.info
             .gateways
             .iter()
-            .map(|gateway| decode_id(&gateway.node_id))
+            .map(|gateway| decode_id(&gateway.gateway_id))
             .collect()
     }
 
-    /// The v2 peer with `id`, if it is connected now.
+    /// The v2 peer whose node ID starts with the gateway ID `id`, if it is
+    /// connected now.
     pub fn peer(&self, id: &GatewayId) -> Option<&MeshPeer> {
         let id = hex::encode(id);
-        self.info.peers.iter().find(|peer| peer.node_id == id)
+        self.info
+            .peers
+            .iter()
+            .find(|peer| peer.node_id.starts_with(&id))
     }
 
     /// Whether the node is connected to `id` now.
@@ -57,7 +61,7 @@ impl MeshView {
             .gateways
             .iter()
             .filter(|gateway| gateway.state == MeshGatewayState::Preferred)
-            .map(|gateway| decode_id(&gateway.node_id))
+            .map(|gateway| decode_id(&gateway.gateway_id))
             .collect()
     }
 
@@ -71,7 +75,7 @@ impl MeshView {
         self.info
             .gateways
             .iter()
-            .map(|gateway| (decode_id(&gateway.node_id), gateway.blocks))
+            .map(|gateway| (decode_id(&gateway.gateway_id), gateway.blocks))
             .collect()
     }
 
@@ -84,7 +88,7 @@ impl MeshView {
             .map(|gateway| {
                 format!(
                     "{} {} blocks {:?}{}",
-                    gateway.node_id,
+                    gateway.gateway_id,
                     gateway.blocks,
                     gateway.state,
                     if gateway.connected { " connected" } else { "" }
@@ -117,7 +121,8 @@ impl MeshView {
 /// What the harness configured on a node, which its report must agree with.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct NodeFacts {
-    pub node_id: GatewayId,
+    /// The node's whole v2 node ID.
+    pub node_id: [u8; 32],
     /// The node has a miner address, so it counts gateways.
     pub mining: bool,
     pub total_capacity: usize,
@@ -149,7 +154,12 @@ pub(super) fn check_view(view: &MeshView, facts: &NodeFacts) -> Vec<String> {
     let matched = info
         .gateways
         .iter()
-        .filter(|gateway| gateway.state != MeshGatewayState::Unmatched)
+        .filter(|gateway| {
+            !matches!(
+                gateway.state,
+                MeshGatewayState::Unmatched | MeshGatewayState::Ambiguous
+            )
+        })
         .count();
 
     // 1. Preferred and ordinary slots add up to the slots in use, which stay
@@ -193,14 +203,14 @@ pub(super) fn check_view(view: &MeshView, facts: &NodeFacts) -> Vec<String> {
         ));
     }
 
-    // 4. The node never ranks or connects to its own ID.
+    // 4. The node never ranks its own gateway ID or connects to its own ID.
     if info.node_id.as_deref() != Some(own_id.as_str()) {
         broken.push(format!("4: the node reports ID {:?}", info.node_id));
     }
     if info
         .gateways
         .iter()
-        .any(|gateway| gateway.node_id == own_id)
+        .any(|gateway| own_id.starts_with(&gateway.gateway_id))
     {
         broken.push("4: the node ranks its own ID".into());
     }
@@ -209,7 +219,8 @@ pub(super) fn check_view(view: &MeshView, facts: &NodeFacts) -> Vec<String> {
     }
 
     // 5. The preferred set is the first available gateways in rank order, as
-    // many as the hold, skipping only gateways in backoff or unmatched.
+    // many as the hold, skipping only gateways in backoff, unmatched or
+    // ambiguous.
     if info
         .gateways
         .windows(2)
@@ -247,7 +258,8 @@ pub(super) fn check_view(view: &MeshView, facts: &NodeFacts) -> Vec<String> {
 }
 
 fn decode_id(id: &str) -> GatewayId {
-    let mut bytes = [0; 32];
-    hex::decode_to_slice(id, &mut bytes).expect("getminermeshinfo reports IDs as 64 hex digits");
+    let mut bytes = [0; 20];
+    hex::decode_to_slice(id, &mut bytes)
+        .expect("getminermeshinfo reports gateway IDs as 40 hex digits");
     bytes
 }

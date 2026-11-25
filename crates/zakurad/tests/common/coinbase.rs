@@ -34,7 +34,8 @@ use super::{
 /// both beside a transparent reward and beside a shielded reward with NU7 active.
 ///
 /// Each block must be accepted by the production `submitblock`, consensus, and state path,
-/// with exactly one commitment in its coinbase.
+/// with exactly one commitment in its coinbase, which names the gateway by the first 20 bytes
+/// of the node ID.
 pub(crate) async fn regtest_coinbase_names_the_gateway() -> eyre::Result<()> {
     let _init_guard = zakura_test::init();
 
@@ -59,13 +60,16 @@ pub(crate) async fn regtest_coinbase_names_the_gateway() -> eyre::Result<()> {
 }
 
 /// Mines one block on `net` from a node that announces its gateway and pays `addr_type`,
-/// checks that the coinbase names the node's own ID, and returns the block.
+/// checks the gateway ID in the coinbase, and returns the block.
 async fn announcing_block(net: &Network, addr_type: MinerAddressType) -> eyre::Result<Block> {
     // RFC 8032 section 7.1, test 1, as the node's secret key. The node ID is the hash of
     // the key list that seed derives: its Ed25519 public key and its ML-DSA-44 key.
     const NODE_SECRET_KEY: &str =
         "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60";
     const NODE_ID: &str = "78333d017dc319f798578d82bcdafb434f582cf38b98bc85e4b17bfde89a4c53";
+    // The first 20 of the node ID's 32 bytes.
+    const GATEWAY_ID: &str = "78333d017dc319f798578d82bcdafb434f582cf3";
+    assert!(NODE_ID.starts_with(GATEWAY_ID));
 
     let identity_dir = tempfile::tempdir()?;
     std::fs::write(
@@ -83,8 +87,8 @@ async fn announcing_block(net: &Network, addr_type: MinerAddressType) -> eyre::R
     let block = mine_template_block(net, config).await?;
 
     let gateway = MinerMeshCommitment::from_coinbase_outputs(block.transactions[0].outputs())
-        .map(|commitment| hex::encode(commitment.gateway_id()));
-    assert_eq!(gateway.as_deref(), Some(NODE_ID));
+        .map(|commitment| commitment.gateway_id().to_string());
+    assert_eq!(gateway.as_deref(), Some(GATEWAY_ID));
 
     Ok(block)
 }

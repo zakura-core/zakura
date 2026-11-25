@@ -98,7 +98,7 @@ use tracing::Instrument;
 use zakura_chain::{
     block::{self, genesis::regtest_genesis_block},
     chain_tip::ChainTip,
-    miner_mesh::MinerMeshCommitment,
+    miner_mesh::{GatewayId, MinerMeshCommitment},
 };
 use zakura_consensus::router::BackgroundTaskHandles;
 use zakura_jsonl_trace::{JsonlEventEmitter, JsonlTracer};
@@ -1070,7 +1070,7 @@ impl StartCmd {
         let rpc_impl = rpc_impl
             .with_template_trace(template_path_trace)
             .with_local_services(config.network.handshake_services(advertised_services));
-        // The node ID this node's coinbases name, when it announces itself as a gateway.
+        // The gateway ID this node's coinbases name when it announces itself.
         let mut local_mesh_gateway = None;
         let rpc_impl = if config.mining.miner_mesh {
             let gateway = zakura_endpoint
@@ -1082,8 +1082,9 @@ impl StartCmd {
             if config.mining.miner_address.is_some() {
                 info!(%gateway, "coinbases this node builds name it as the miner's gateway");
             }
-            local_mesh_gateway = Some(*gateway.as_bytes());
-            rpc_impl.with_mesh_commitment(MinerMeshCommitment::new(*gateway.as_bytes()))
+            let gateway_id = GatewayId::from_node_id(gateway.as_bytes());
+            local_mesh_gateway = Some(gateway_id);
+            rpc_impl.with_mesh_commitment(MinerMeshCommitment::new(gateway_id))
         } else {
             rpc_impl
         };

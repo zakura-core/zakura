@@ -8,7 +8,7 @@ use tracing::{info, warn, Instrument};
 use zakura_chain::{
     block::{self, Height},
     chain_tip::ChainTip,
-    miner_mesh::{GatewayId, MinerSetSnapshot, RecentMinerSet},
+    miner_mesh::{MinerSetSnapshot, RecentMinerSet},
     parameters::Network,
 };
 use zakura_state::{ChainTipChange, ReadRequest, ReadResponse, TipAction, MAX_BLOCK_REORG_HEIGHT};
@@ -18,6 +18,7 @@ use crate::BoxError;
 use super::{
     chain_reads::{best_chain_hash, read_block},
     ranking::RankingPublisher,
+    LocalGateway,
 };
 
 /// How long the tracker waits after a failed state read before it reads again.
@@ -180,18 +181,6 @@ pub(super) struct Tracker<S> {
     unreadable_from: Option<Height>,
     /// This node's own part in the miner mesh, for the metrics.
     local_gateway: LocalGateway,
-}
-
-/// This node's own part in the miner mesh, as the gateway metrics report it.
-#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
-pub struct LocalGateway {
-    /// The gateway the coinbases this node builds name, if they name one. Only a node with a
-    /// miner address builds coinbases.
-    pub announced: Option<GatewayId>,
-    /// The gateway this node stands for: the one its coinbases name, or its own ID on a relay
-    /// that runs the miner mesh without a miner address. `None` on a node that stands for no
-    /// gateway.
-    pub stands_for: Option<GatewayId>,
 }
 
 impl<S> Tracker<S>

@@ -268,7 +268,7 @@ fn a_named_gateway_without_miner_mesh_is_refused() {
 }
 
 /// A template node that names its relay is not a gateway itself, so it may run only the
-/// legacy stack and keeps no node key.
+/// legacy stack and keeps no node key, with or without a miner address.
 #[test]
 fn a_node_naming_its_relay_needs_neither_v2_nor_a_lasting_key() {
     let dir = tempfile::tempdir().expect("failed to create temp dir");
@@ -276,16 +276,20 @@ fn a_node_naming_its_relay_needs_neither_v2_nor_a_lasting_key() {
     let blocked = dir.path().join("blocked");
     std::fs::write(&blocked, "").expect("write the blocking file");
 
-    let mut config = ZakuradConfig::default();
+    let mut config = announcing_config();
     config.network.p2p_stack = P2pStack::Legacy;
     config.network.identity_dir = blocked;
-    config.mining.miner_mesh = true;
     config.mining.miner_mesh_gateways = vec![RELAY];
 
     plain_start()
         .override_config(config.clone())
-        .expect("a legacy node may name its relay");
+        .expect("a legacy template node may name its relay");
     StartCmd::network_config_for_start(&config).expect("a node naming its relay pins no key");
+
+    config.mining.miner_address = None;
+    plain_start()
+        .override_config(config)
+        .expect("one without a miner address only gets a warning");
 }
 
 #[test]

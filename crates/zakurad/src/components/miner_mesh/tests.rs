@@ -31,9 +31,8 @@ use zakura_test::vectors::BLOCK_MAINNET_1_BYTES;
 
 use super::{
     ranking::{ranking_channel, MIN_GATEWAY_BLOCKS},
-    tracker::{
-        gateway_metrics, run, GatewayMetrics, LocalGateway, TipMove, Tracker, REPUBLISH_INTERVAL,
-    },
+    tracker::{gateway_metrics, run, GatewayMetrics, TipMove, Tracker, REPUBLISH_INTERVAL},
+    LocalGateway,
 };
 use crate::BoxError;
 

@@ -7,10 +7,10 @@
 //! [`MAX_PREFERRED_GATEWAYS`] connection places that ordinary peers cannot
 //! fill, for the highest-ranked gateways it can reach.
 //!
-//! A node can also always prefer a few IDs whatever the blocks say, as a
-//! pool's relay does for its own template nodes. Those rank ahead of every
-//! gateway the blocks name, and each keeps its place even while it is
-//! unreachable, so it can always call in.
+//! The operator can also configure the node to always prefer a few IDs,
+//! whatever the blocks say. Those rank ahead of every gateway the blocks name,
+//! and each keeps its place even while it is unreachable, so it can always
+//! call in.
 //!
 //! A ranked gateway ID names whichever node v2 networking knows with an ID
 //! that starts with it. When it knows two or more, it cannot tell which one
@@ -356,7 +356,9 @@ impl PreferredGateways {
     /// the hold. A gateway the node always prefers keeps its place in that
     /// order even while it is unreachable, so no lower gateway fills it, and
     /// it can call in whenever it connects. An unreachable one costs at most
-    /// that one place.
+    /// that one place. They take places first, so when `hold_limit` is no
+    /// more than their number, as when a small budget funds fewer than the
+    /// ten places the default budget funds, no ranked gateway gets one.
     pub fn form(ranking: impl IntoIterator<Item = RankedGateway>, hold_limit: usize) -> Self {
         Self::form_with_incumbents(unique_gateways(ranking), hold_limit, &[])
     }

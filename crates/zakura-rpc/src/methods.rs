@@ -850,7 +850,8 @@ pub trait RpcServer {
     /// `mining.miner_mesh`, counts the gateways that recent best-chain
     /// coinbases name, and while it is synced, v2 networking holds up to ten connection
     /// places that ordinary peers cannot fill for the highest-ranked gateways
-    /// it can reach. Each gateway's `state` is `preferred` when it may fill a
+    /// it can reach. A relay's template nodes keep their places whether or
+    /// not it is synced. Each gateway's `state` is `preferred` when it may fill a
     /// held place, `standby` when it is reachable but ranked below those,
     /// `backoff` when it is known but waiting out a failed dial or a lost
     /// connection, `unmatched` when v2 networking has no usable dial address for it,

@@ -178,9 +178,10 @@ Terms:
   be told apart by their text. Zakura's peer entries name a node only by its
   `NodeId`: a `NodeKey` names one key of the node, and a dial must check the
   whole credential (TLS-7).
-- **ID-3.** `NodeSecretKey` holds a 32-byte Ed25519 seed. It MUST zeroize on
-  drop. Its `Debug`, `Display` and `Serialize` output MUST NOT contain the seed.
-  Signing expands the seed into a `ring` key pair for each signature, and
+- **ID-3.** `NodeSecretKey` holds a 32-byte Ed25519 seed and shares the ML-DSA
+  signing key (ID-13). It MUST zeroize the seed on drop. Its `Debug`, `Display`
+  and `Serialize` output MUST NOT contain either secret. Ed25519 signing
+  expands the seed into a `ring` key pair for each signature, and
   `ring` does not zeroize that expanded key when it drops.
 - **ID-4.** The public key MUST derive from the seed per RFC 8032, so every
   existing key file yields the same `NodeKey` as on the Iroh backend.
@@ -251,14 +252,13 @@ Terms:
   pair is generated from the 32-byte seed that BLAKE2b-256 derives from its
   Ed25519 seed, used as the key and personalised `Zakura_MLDSA65v1`, over no
   data. One key file therefore yields both keys, and a node's credential is
-  its Ed25519 key and its ML-DSA-65 key. The ML-DSA seed is derived once, when the node
-  loads its key, and held beside the Ed25519 seed, zeroized on drop (ID-3).
-  The signing key is regenerated from it for each signature and its bytes
-  zeroized after. As with `ring`'s expanded Ed25519 key, some copies are
-  not wiped: `blake2b_simd`'s state and output from the one derivation,
-  which hold the Ed25519 seed and the ML-DSA seed, and on every signature
-  `libcrux-ml-dsa`'s key generation and signing state, which holds the
-  ML-DSA seed, its expansion and the secret vectors.
+  its Ed25519 key and its ML-DSA-65 key. Loading the identity derives the ML-DSA
+  seed, generates the key pair once, and zeroizes the derived seed. Clones of
+  the identity share the encoded signing key. Its bytes MUST be zeroized when
+  the last owner drops it. Each signature uses the cached key and fresh hedging
+  randomness. Library temporaries can remain unwiped. These include BLAKE2b
+  state and output during derivation, and `libcrux-ml-dsa` state during key
+  generation and signing.
 
 ## 4. TLS profile
 

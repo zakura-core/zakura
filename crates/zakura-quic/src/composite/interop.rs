@@ -62,8 +62,9 @@ fn rustcrypto_derives_the_same_public_key() {
     let seed: [u8; KEY_LENGTH] = array(&recorded.seed);
     let ml_seed = ml_dsa_seed(&seed);
     assert_eq!(hex::encode(ml_seed), recorded.ml_dsa_seed);
+    let secret = NodeSecretKey::from_bytes(&seed);
     assert_eq!(
-        hex::encode(ml_dsa_public_key(&ml_seed)),
+        hex::encode(secret.credential().key(ML_DSA_65_KEY_TAG).unwrap()),
         recorded.public_key
     );
     assert_eq!(recorded.context.as_bytes(), ML_DSA_CONTEXT);
@@ -91,12 +92,7 @@ fn rustcrypto_signatures_verify_and_match_ours() {
             "{name}"
         );
 
-        let ours = ml_dsa_sign(
-            &ml_dsa_seed(&secret.to_bytes()),
-            &message,
-            array(&entry.rnd),
-        )
-        .unwrap();
-        assert_eq!(ours[..], theirs, "{name}");
+        let ours = secret.sign_composite(&message, array(&entry.rnd)).unwrap();
+        assert_eq!(ours[ED25519_SIGNATURE_BYTES..], theirs, "{name}");
     }
 }

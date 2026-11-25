@@ -148,9 +148,10 @@ For scale: Ed25519 sign 34.8 µs, verify 67.2 µs, X25519 keygen + agree
 88.2 µs. ring's P-384 keygen + agree, the classical half of the standard
 category 5 hybrid, measured 1,180 µs.
 
-`zakura-quic` regenerates the ML-DSA signing key from its seed for each
-signature (ID-13), so that it holds no expanded secret key between
-handshakes. That's why "keygen + sign" is the cost per signature.
+These measurements include regenerating the ML-DSA signing key for each
+signature. The ML-DSA-65 implementation now generates the key once when
+loading the identity and reuses it for handshakes (ID-13). The timings below
+use the earlier per-signature key generation baseline.
 
 ### 4.2 Per handshake
 

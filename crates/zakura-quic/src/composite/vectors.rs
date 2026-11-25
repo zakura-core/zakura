@@ -15,10 +15,9 @@
 //!   software, provided by NIST as a public service; cut down to the tests
 //!   kept here on 2026-11-25.
 //!
-//! A node signs with a key generated from a 32-byte seed, so the Wycheproof
-//! "seed" vectors run through [`ml_dsa_sign_in_context`] and
-//! [`ml_dsa_public_key`]. ACVP's signing vectors give an expanded private key
-//! instead, which the composite never imports, so those sign with
+//! The Wycheproof "seed" vectors generate the signing key from a 32-byte seed
+//! and reuse it across the group's signatures. ACVP's signing vectors supply
+//! an encoded private key, which the composite never imports, so those sign with
 //! `libcrux-ml-dsa` directly. Vectors flagged `Internal`, which give only
 //! μ, and HashML-DSA ("preHash") vectors don't map onto the composite: it
 //! signs pure ML-DSA over the message and a context.
@@ -157,7 +156,8 @@ fn seeded_keys_and_signatures_match_wycheproof() {
     let groups: Vec<SignGroup> = groups(include_str!("wycheproof/mldsa_65_sign_seed_test.json"));
     let mut count = 0;
     for group in groups {
-        assert_eq!(ml_dsa_public_key(&group.private_seed), group.public_key[..]);
+        let (signing_key, public_key) = MlDsaSigningKey::from_seed(&group.private_seed);
+        assert_eq!(public_key, group.public_key[..]);
         for test in group.tests {
             count += 1;
             let id = test.tc_id;
@@ -165,7 +165,7 @@ fn seeded_keys_and_signatures_match_wycheproof() {
             if !test.rnd.is_empty() {
                 rnd.copy_from_slice(&test.rnd);
             }
-            let signed = ml_dsa_sign_in_context(&group.private_seed, &test.msg, &test.ctx, rnd);
+            let signed = signing_key.sign_in_context(&test.msg, &test.ctx, rnd);
             match test.result.as_str() {
                 "valid" => {
                     assert_eq!(signed.unwrap()[..], test.sig, "test {id}");
@@ -215,9 +215,7 @@ fn verification_matches_wycheproof() {
     assert_eq!(count, 7);
 }
 
-/// NIST's key generation answer: the seed gives the published public key
-/// through [`ml_dsa_public_key`], and `libcrux-ml-dsa` the published private
-/// key.
+/// NIST's key generation answer: the seed gives both published keys.
 #[test]
 fn key_generation_matches_acvp() {
     let groups: Vec<AcvpGroup<AcvpKeyGen>> =
@@ -228,9 +226,9 @@ fn key_generation_matches_acvp() {
         for test in group.tests {
             count += 1;
             let id = test.tc_id;
-            assert_eq!(ml_dsa_public_key(&test.seed)[..], test.pk, "test {id}");
-            let pair = ml_dsa_65::generate_key_pair(test.seed);
-            assert_eq!(pair.signing_key.as_slice(), test.sk, "test {id}");
+            let (signing_key, public_key) = MlDsaSigningKey::from_seed(&test.seed);
+            assert_eq!(public_key[..], test.pk, "test {id}");
+            assert_eq!(signing_key.0.as_slice(), test.sk, "test {id}");
         }
     }
     assert_eq!(count, 1);

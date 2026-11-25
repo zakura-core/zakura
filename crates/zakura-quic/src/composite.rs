@@ -9,10 +9,10 @@
 
 use blake2b_simd::Params;
 use libcrux_ml_dsa::{
-    ml_dsa_65::{self, MLDSA65Signature, MLDSA65VerificationKey},
+    ml_dsa_65::{self, MLDSA65Signature, MLDSA65SigningKey, MLDSA65VerificationKey},
     KEY_GENERATION_RANDOMNESS_SIZE, SIGNING_RANDOMNESS_SIZE,
 };
-use zeroize::Zeroize as _;
+use zeroize::{Zeroize as _, Zeroizing};
 
 use crate::key::{NodeKey, SignatureError, KEY_LENGTH};
 
@@ -61,7 +61,7 @@ const ML_DSA_SEED_PERSONALISATION: &[u8; 16] = b"Zakura_MLDSA65v1";
 /// `blake2b_simd` keeps copies of its key, and of the derived seed in its
 /// output, in values it doesn't wipe, so this runs once, when a node loads
 /// its key, not per handshake.
-pub(crate) fn ml_dsa_seed(seed: &[u8; KEY_LENGTH]) -> [u8; KEY_GENERATION_RANDOMNESS_SIZE] {
+fn ml_dsa_seed(seed: &[u8; KEY_LENGTH]) -> [u8; KEY_GENERATION_RANDOMNESS_SIZE] {
     let hash = Params::new()
         .hash_length(KEY_GENERATION_RANDOMNESS_SIZE)
         .key(seed)
@@ -72,47 +72,52 @@ pub(crate) fn ml_dsa_seed(seed: &[u8; KEY_LENGTH]) -> [u8; KEY_GENERATION_RANDOM
     derived
 }
 
-/// The ML-DSA-65 public key generated from `ml_dsa_seed`.
-pub(crate) fn ml_dsa_public_key(
-    ml_dsa_seed: &[u8; KEY_GENERATION_RANDOMNESS_SIZE],
-) -> [u8; ML_DSA_65_KEY_BYTES] {
-    let mut pair = ml_dsa_65::generate_key_pair(*ml_dsa_seed);
-    pair.signing_key.as_mut_slice().zeroize();
-    *pair.verification_key.as_ref()
+/// An ML-DSA-65 signing key whose stored bytes are wiped on drop. Signers
+/// share it so key generation runs only when loading a node's identity.
+pub(crate) struct MlDsaSigningKey(MLDSA65SigningKey);
+
+impl Drop for MlDsaSigningKey {
+    fn drop(&mut self) {
+        self.0.as_mut_slice().zeroize();
+    }
 }
 
-/// Signs `message` with the ML-DSA-65 key generated from `ml_dsa_seed`,
-/// hedged with `randomness`.
-///
-/// The signing key is regenerated for each signature and its bytes wiped
-/// after. `libcrux-ml-dsa` wipes nothing itself: its key generation and
-/// signing leave the expanded seed and secret vectors, and copies of the
-/// seed passed by value, in memory it releases unwiped.
-pub(crate) fn ml_dsa_sign(
-    ml_dsa_seed: &[u8; KEY_GENERATION_RANDOMNESS_SIZE],
-    message: &[u8],
-    randomness: [u8; SIGNING_RANDOMNESS_SIZE],
-) -> Result<[u8; ML_DSA_65_SIGNATURE_BYTES], SignatureError> {
-    // Fails only for a context over 255 bytes, which `ML_DSA_CONTEXT` isn't,
-    // or when rejection sampling runs out of attempts, which FIPS 204 puts
-    // below 2^-256.
-    ml_dsa_sign_in_context(ml_dsa_seed, message, ML_DSA_CONTEXT, randomness)
-}
+impl MlDsaSigningKey {
+    /// Derives the signing key and its matching public key from the node's
+    /// Ed25519 seed (ID-13). The derived ML-DSA seed is wiped after key generation.
+    pub(crate) fn from_identity_seed(seed: &[u8; KEY_LENGTH]) -> (Self, [u8; ML_DSA_65_KEY_BYTES]) {
+        let seed = Zeroizing::new(ml_dsa_seed(seed));
+        Self::from_seed(&seed)
+    }
 
-/// FIPS 204 ML-DSA.Sign with the key generated from `ml_dsa_seed`, under
-/// `context` and hedged with `randomness` (all zeros gives the deterministic
-/// variant). Fails for a context over 255 bytes.
-fn ml_dsa_sign_in_context(
-    ml_dsa_seed: &[u8; KEY_GENERATION_RANDOMNESS_SIZE],
-    message: &[u8],
-    context: &[u8],
-    mut randomness: [u8; SIGNING_RANDOMNESS_SIZE],
-) -> Result<[u8; ML_DSA_65_SIGNATURE_BYTES], SignatureError> {
-    let mut pair = ml_dsa_65::generate_key_pair(*ml_dsa_seed);
-    let signature = ml_dsa_65::sign(&pair.signing_key, message, context, randomness);
-    pair.signing_key.as_mut_slice().zeroize();
-    randomness.zeroize();
-    Ok(*signature.map_err(|_| SignatureError)?.as_ref())
+    /// Generates both keys from the ML-DSA-65 seed.
+    fn from_seed(seed: &[u8; KEY_GENERATION_RANDOMNESS_SIZE]) -> (Self, [u8; ML_DSA_65_KEY_BYTES]) {
+        let pair = ml_dsa_65::generate_key_pair(*seed);
+        (Self(pair.signing_key), *pair.verification_key.as_ref())
+    }
+
+    /// Signs a TLS handshake message, hedged with fresh `randomness`.
+    pub(crate) fn sign(
+        &self,
+        message: &[u8],
+        randomness: [u8; SIGNING_RANDOMNESS_SIZE],
+    ) -> Result<[u8; ML_DSA_65_SIGNATURE_BYTES], SignatureError> {
+        self.sign_in_context(message, ML_DSA_CONTEXT, randomness)
+    }
+
+    /// Signs under `context`, with all-zero `randomness` selecting the
+    /// deterministic variant. Fails for contexts over 255 bytes or if
+    /// libcrux exhausts its rejection-sampling attempts.
+    fn sign_in_context(
+        &self,
+        message: &[u8],
+        context: &[u8],
+        mut randomness: [u8; SIGNING_RANDOMNESS_SIZE],
+    ) -> Result<[u8; ML_DSA_65_SIGNATURE_BYTES], SignatureError> {
+        let signature = ml_dsa_65::sign(&self.0, message, context, randomness);
+        randomness.zeroize();
+        Ok(*signature.map_err(|_| SignatureError)?.as_ref())
+    }
 }
 
 /// Verifies a composite `signature` over `message`: the Ed25519 half under
@@ -165,37 +170,29 @@ mod tests {
 
     const SEED: [u8; KEY_LENGTH] = [7; KEY_LENGTH];
 
-    fn sign(secret: &NodeSecretKey, message: &[u8]) -> Vec<u8> {
-        let mut signature = secret.sign(message).to_vec();
-        signature.extend_from_slice(
-            &ml_dsa_sign(&ml_dsa_seed(&secret.to_bytes()), message, [9; 32]).unwrap(),
-        );
-        signature
-    }
-
     #[test]
     fn a_composite_signature_verifies_only_whole() {
         let secret = NodeSecretKey::from_bytes(&SEED);
-        let ml_dsa = ml_dsa_public_key(&ml_dsa_seed(&SEED));
-        let signature = sign(&secret, b"transcript");
+        let ml_dsa = secret.credential().key(ML_DSA_65_KEY_TAG).unwrap();
+        let signature = secret.sign_composite(b"transcript", [9; 32]).unwrap();
         assert_eq!(signature.len(), COMPOSITE_SIGNATURE_BYTES);
         assert_eq!(
-            verify(&secret.public_key(), &ml_dsa, b"transcript", &signature),
+            verify(&secret.public_key(), ml_dsa, b"transcript", &signature),
             Ok(())
         );
 
-        assert!(verify(&secret.public_key(), &ml_dsa, b"another", &signature).is_err());
+        assert!(verify(&secret.public_key(), ml_dsa, b"another", &signature).is_err());
         for flipped in [0, ED25519_SIGNATURE_BYTES, COMPOSITE_SIGNATURE_BYTES - 1] {
             let mut tampered = signature.clone();
             tampered[flipped] ^= 1;
             assert!(
-                verify(&secret.public_key(), &ml_dsa, b"transcript", &tampered).is_err(),
+                verify(&secret.public_key(), ml_dsa, b"transcript", &tampered).is_err(),
                 "byte {flipped} tampered"
             );
         }
         assert!(verify(
             &secret.public_key(),
-            &ml_dsa,
+            ml_dsa,
             b"transcript",
             &signature[..ED25519_SIGNATURE_BYTES]
         )
@@ -206,17 +203,17 @@ mod tests {
     fn each_half_is_checked_against_its_own_key() {
         let secret = NodeSecretKey::from_bytes(&SEED);
         let other = NodeSecretKey::from_bytes(&[8; KEY_LENGTH]);
-        let signature = sign(&secret, b"transcript");
+        let signature = secret.sign_composite(b"transcript", [9; 32]).unwrap();
         assert!(verify(
             &other.public_key(),
-            &ml_dsa_public_key(&ml_dsa_seed(&SEED)),
+            secret.credential().key(ML_DSA_65_KEY_TAG).unwrap(),
             b"transcript",
             &signature
         )
         .is_err());
         assert!(verify(
             &secret.public_key(),
-            &ml_dsa_public_key(&ml_dsa_seed(&[8; KEY_LENGTH])),
+            other.credential().key(ML_DSA_65_KEY_TAG).unwrap(),
             b"transcript",
             &signature
         )
@@ -226,12 +223,12 @@ mod tests {
     #[test]
     fn the_ml_dsa_key_derives_from_the_seed_alone() {
         assert_eq!(
-            ml_dsa_public_key(&ml_dsa_seed(&SEED)),
-            ml_dsa_public_key(&ml_dsa_seed(&SEED))
+            MlDsaSigningKey::from_identity_seed(&SEED).1,
+            MlDsaSigningKey::from_identity_seed(&SEED).1
         );
         assert_ne!(
-            ml_dsa_public_key(&ml_dsa_seed(&SEED)),
-            ml_dsa_public_key(&ml_dsa_seed(&[8; KEY_LENGTH]))
+            MlDsaSigningKey::from_identity_seed(&SEED).1,
+            MlDsaSigningKey::from_identity_seed(&[8; KEY_LENGTH]).1
         );
         // Computed with Python's `hashlib.blake2b(b"", digest_size=32,
         // key=bytes([7] * 32), person=b"Zakura_MLDSA65v1")`.
@@ -243,17 +240,17 @@ mod tests {
 
     #[test]
     fn hedged_signatures_differ_and_both_verify() {
-        let ml_dsa = ml_dsa_public_key(&ml_dsa_seed(&SEED));
         let secret = NodeSecretKey::from_bytes(&SEED);
-        let ed = secret.sign(b"m");
-        let first = ml_dsa_sign(&ml_dsa_seed(&SEED), b"m", [1; 32]).unwrap();
-        let second = ml_dsa_sign(&ml_dsa_seed(&SEED), b"m", [2; 32]).unwrap();
-        assert_ne!(first, second);
-        for half in [first, second] {
-            let mut signature = ed.to_vec();
-            signature.extend_from_slice(&half);
+        let ml_dsa = secret.credential().key(ML_DSA_65_KEY_TAG).unwrap();
+        let first = secret.sign_composite(b"m", [1; 32]).unwrap();
+        let second = secret.sign_composite(b"m", [2; 32]).unwrap();
+        assert_ne!(
+            first[ED25519_SIGNATURE_BYTES..],
+            second[ED25519_SIGNATURE_BYTES..]
+        );
+        for signature in [first, second] {
             assert_eq!(
-                verify(&secret.public_key(), &ml_dsa, b"m", &signature),
+                verify(&secret.public_key(), ml_dsa, b"m", &signature),
                 Ok(())
             );
         }

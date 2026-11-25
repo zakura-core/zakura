@@ -7,6 +7,7 @@ mod clock;
 mod close;
 mod connection_places;
 mod frame;
+mod gateway_match;
 mod guard;
 mod handshake_counts;
 mod io;
@@ -28,13 +29,14 @@ pub use clock::{Clock, RealClock};
 pub use close::{CloseOutcome, CloseRow, NeutralCause};
 pub use connection_places::{ConnectedPeer, ConnectionPlaces, PlacedGateway};
 pub use frame::{Frame, StreamPrelude, ZakuraTrace};
+pub use gateway_match::GatewayMatch;
 pub use handshake_counts::{
     handshake_cadence, inbound_share, node_handshake_cadence, HandshakeCadenceAdmission,
     HandshakeCounts, IpAdmission, SlotClass, SlotRefusal, SlotSplit,
 };
 pub use preferred_gateways::{
-    GatewayPlace, GatewayRanking, GatewayStanding, PreferredGateways, RankedGateway,
-    MAX_PREFERRED_GATEWAYS,
+    GatewayPlace, GatewayRanking, GatewayResolution, GatewayStanding, PreferredGateways,
+    RankedGateway, MAX_PREFERRED_GATEWAYS,
 };
 pub(crate) use preferred_gateways::{HeldPlaces, MAX_RANKED_GATEWAYS};
 // `SessionGuard` and `ByteBudget` are imported through this re-export; `Admit`

@@ -158,13 +158,21 @@ fn the_default_envelope_sums_the_reactor_shares() {
     assert_eq!(share(5), crate::zakura::HEADER_SYNC_BUDGET);
     assert_eq!(share(6), crate::zakura::BLOCK_SYNC_REACTOR_BUDGET);
     assert_eq!(
+        share(9),
+        crate::zakura::tx_relay::wire::TX_RELAY_DATA_BUDGET
+    );
+    assert_eq!(
+        share(10),
+        crate::zakura::tx_relay::wire::TX_RELAY_STATE_BUDGET
+    );
+    assert_eq!(
         shares.control_receive_bytes,
         crate::zakura::CONTROL_RECEIVE_BYTES
     );
     // The connection window and the stream window that carry the shares.
     assert_eq!(
         shares.receive_window(shares.kinds.iter().map(|(kind, _)| *kind)),
-        crate::zakura::CONTROL_RECEIVE_BYTES + 74_836_267
+        crate::zakura::CONTROL_RECEIVE_BYTES + 79_096_107
     );
     assert_eq!(
         u64::from(limits.quic.stream_receive_window_bytes),
@@ -184,23 +192,24 @@ fn the_default_envelope_sums_the_reactor_shares() {
     let transport = ResourceEnvelope::new(
         limits.transport_limits_for_kinds(shares.kinds.iter().map(|(kind, _)| *kind)),
     );
-    // Per connection: 74,836,267 B of receive shares (counted inside QUIC
-    // receive credit via CreditHold) and 128 MiB of unguarded output shares
-    // (legacy gossip + legacy requests; discovery, header sync and block sync
-    // use guarded Serve/Push output counted in `serve_output_bytes`).
-    assert_eq!(transport.connection_raw_bytes, 74_836_267);
-    assert_eq!(transport.connection_output_bytes, 128 * MIB);
+    // Per connection: 79,096,107 B of receive shares with `tx-relay` on
+    // (counted inside QUIC receive credit via CreditHold), and unguarded output
+    // shares: 128 MiB for legacy gossip and legacy requests plus `tx-relay`'s
+    // 4,259,840 B. Discovery, header sync and block sync use guarded
+    // Serve/Push output counted in `serve_output_bytes`.
+    assert_eq!(transport.connection_raw_bytes, 79_096_107);
+    assert_eq!(transport.connection_output_bytes, 128 * MIB + 4_259_840);
     // The shared compatibility client holds at most 288 exchanges at once.
     assert_eq!(transport.compat_response_bytes, 288 * 20 * MIB);
     let conns = limits.total_connections() as u128;
     assert_eq!(
         envelope.transport_bytes,
-        conns * u128::from(128 * MIB) + u128::from(288 * 20 * MIB)
+        conns * u128::from(128 * MIB + 4_259_840) + u128::from(288 * 20 * MIB)
     );
-    // `conns` × 108,456,235 + 32 × 128 KiB + 256 MiB.
+    // `conns` × 112,716,075 + 32 × 128 KiB + 256 MiB.
     assert_eq!(
         envelope.quic_bytes,
-        conns * 108_456_235 + 32 * u128::from(128u64 << 10) + u128::from(256 * MIB)
+        conns * 112_716_075 + 32 * u128::from(128u64 << 10) + u128::from(256 * MIB)
     );
 }
 
@@ -287,6 +296,7 @@ fn configured_serving_budgets_set_the_serve_output_bound() {
 fn tx_relay_counts_what_it_holds_outside_its_output_gate() {
     let mut config = Config::default();
     config.zakura.max_connections = Some(crate::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS);
+    config.zakura.tx_relay.enabled = false;
     let off_limits = ZakuraLocalLimits::from_config(&config);
     let off = NodeEnvelope::for_memory_plan(&config, &off_limits, &[], 16)
         .expect("the default config fits")
@@ -339,9 +349,13 @@ fn serving_output_counts_admitted_sessions() {
 
     let envelope =
         NodeEnvelope::for_memory_plan(&config, &limits, &[], 16).expect("the default config fits");
+    // `tx-relay` is on by default, so each connection adds what it holds
+    // outside its output gate.
+    let tx_relay =
+        u128::from(sessions) * u128::from(crate::zakura::tx_relay::wire::SESSION_HELD_OUTPUT_BYTES);
     assert_eq!(
         envelope.serve_output_bytes,
-        2 * u128::from(sessions * SESSION) + discovery
+        2 * u128::from(sessions * SESSION) + discovery + tx_relay
     );
     assert_eq!(
         envelope.retained_bytes_bound(),
@@ -363,7 +377,7 @@ fn serving_output_counts_admitted_sessions() {
         NodeEnvelope::for_memory_plan(&config, &limits, &[], 16).expect("the smaller pools fit");
     assert_eq!(
         envelope.serve_output_bytes,
-        2 * u128::from(5 * SESSION) + discovery
+        2 * u128::from(5 * SESSION) + discovery + tx_relay
     );
 }
 

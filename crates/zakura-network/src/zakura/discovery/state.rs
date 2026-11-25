@@ -6,6 +6,7 @@ use std::{
 };
 
 use thiserror::Error;
+use zakura_chain::miner_mesh::GatewayId;
 use zakura_quic::{NodeId, NodeKeyList};
 use zakura_rt::collections::{HashMap, HashSet};
 
@@ -22,8 +23,8 @@ use super::protocol::{
 };
 use super::verified::VerifiedRecord;
 use crate::zakura::{
-    CloseRow, ServiceAdmissionDecision, ServicePeerDirection, ServicePeerSnapshot, ZakuraConnId,
-    ZakuraNetworkId, ZakuraPeerId,
+    CloseRow, GatewayMatch, ServiceAdmissionDecision, ServicePeerDirection, ServicePeerSnapshot,
+    ZakuraConnId, ZakuraNetworkId, ZakuraPeerId,
 };
 
 /// The identity of one discovery stream session: its peer, its connection,
@@ -795,11 +796,16 @@ impl DiscoveryState {
         );
     }
 
-    /// What the book knows about dialing `node_id` at `now`, under the
-    /// configured dial backoff, as [`ZakuraDiscoveryBook::dial_target`] says.
-    pub(super) fn dial_target(&self, node_id: &NodeId, now: u64) -> DialTarget {
-        self.book.dial_target(
-            node_id,
+    /// What the book knows about the node `gateway` names and dialing it at
+    /// `now`, under the configured dial backoff, as
+    /// [`ZakuraDiscoveryBook::gateway_target`] says.
+    pub(super) fn gateway_target(
+        &self,
+        gateway: &GatewayId,
+        now: u64,
+    ) -> GatewayMatch<(NodeId, DialTarget)> {
+        self.book.gateway_target(
+            gateway,
             now,
             (self.config.dial_backoff_base, self.config.dial_backoff_max),
         )

@@ -134,6 +134,7 @@ mod tests {
     #[test]
     fn a_connection_costs_its_windows_and_every_reactor_share() {
         let mut config = ZakuraConfig::default();
+        config.tx_relay.enabled = false;
         assert_eq!(
             config.connection_memory(&Network::Mainnet, &[]),
             ConnectionMemory {

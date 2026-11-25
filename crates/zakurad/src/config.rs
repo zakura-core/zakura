@@ -12,6 +12,9 @@ use zakura_rpc::config::mining::{default_miner_address, MinerAddressType};
 use crate::{components::With, BoxError};
 
 mod loader;
+mod retired_seed_ids;
+
+pub(crate) use retired_seed_ids::replace_retired_seed_ids;
 
 /// Centralized, case-insensitive suffix-based deny-list to ban setting config fields with
 /// environment variables if those config field names end with any of these suffixes.

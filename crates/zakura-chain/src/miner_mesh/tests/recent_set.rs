@@ -6,13 +6,13 @@ use proptest::{collection::vec, prelude::*};
 
 use crate::{
     block::{self, Height},
-    miner_mesh::{GatewayBlocks, MinerMeshCommitment, RecentMinerSet},
+    miner_mesh::{GatewayBlocks, GatewayId, MinerMeshCommitment, RecentMinerSet, QUALIFYING_DEPTH},
 };
 
 use super::network_with_nu7;
 
 /// A tip whose window is the 2,304 heights from 7,597 to 9,900.
-const TIP: Height = Height(10_000);
+const TIP: Height = Height(NEWEST.0 + QUALIFYING_DEPTH);
 const OLDEST: Height = Height(7_597);
 const NEWEST: Height = Height(9_900);
 
@@ -28,7 +28,7 @@ fn hash(byte: u8) -> block::Hash {
 }
 
 fn gateway(byte: u8) -> Option<MinerMeshCommitment> {
-    Some(MinerMeshCommitment::new([byte; 32]))
+    Some(MinerMeshCommitment::new(GatewayId::from_bytes([byte; 20])))
 }
 
 /// The gateways in `set`, as (first ID byte, blocks) in rank order.
@@ -36,7 +36,7 @@ fn ranking(set: &RecentMinerSet) -> Vec<(u8, u32)> {
     set.snapshot()
         .gateways
         .iter()
-        .map(|gateway| (gateway.gateway_id[0], gateway.blocks))
+        .map(|gateway| (gateway.gateway_id.as_bytes()[0], gateway.blocks))
         .collect()
 }
 
@@ -151,12 +151,14 @@ fn checked_blocks_are_listed_newest_first() {
 fn gateways_with_equal_counts_are_ordered_from_the_first_id_byte() {
     let mut set = set_at_tip();
     // The first ID is lower in its first byte and higher in its last.
-    let mut low_first_byte = [5; 32];
+    let mut low_first_byte = [5; 20];
     low_first_byte[0] = 1;
-    low_first_byte[31] = 9;
-    let mut high_first_byte = [5; 32];
+    low_first_byte[19] = 9;
+    let low_first_byte = GatewayId::from_bytes(low_first_byte);
+    let mut high_first_byte = [5; 20];
     high_first_byte[0] = 9;
-    high_first_byte[31] = 1;
+    high_first_byte[19] = 1;
+    let high_first_byte = GatewayId::from_bytes(high_first_byte);
 
     set.record(
         Height(9_000),
@@ -169,7 +171,7 @@ fn gateways_with_equal_counts_are_ordered_from_the_first_id_byte() {
         Some(MinerMeshCommitment::new(low_first_byte)),
     );
 
-    let ids: Vec<[u8; 32]> = set
+    let ids: Vec<GatewayId> = set
         .snapshot()
         .gateways
         .iter()
@@ -209,15 +211,24 @@ fn every_gateway_is_kept_and_ranked_by_blocks_then_id() {
     assert_eq!(gateways.len(), 31);
     let mut expected: Vec<GatewayBlocks> = (0..31u8)
         .map(|id| GatewayBlocks {
-            gateway_id: [id; 32],
+            gateway_id: GatewayId::from_bytes([id; 20]),
             blocks: u32::from(id / 2) + 1,
         })
         .collect();
     expected.sort_by_key(|gateway| (std::cmp::Reverse(gateway.blocks), gateway.gateway_id));
     assert_eq!(gateways, expected);
-    assert_eq!((gateways[0].gateway_id[0], gateways[0].blocks), (30, 16));
-    assert_eq!((gateways[1].gateway_id[0], gateways[1].blocks), (28, 15));
-    assert_eq!((gateways[2].gateway_id[0], gateways[2].blocks), (29, 15));
+    assert_eq!(
+        (gateways[0].gateway_id.as_bytes()[0], gateways[0].blocks),
+        (30, 16)
+    );
+    assert_eq!(
+        (gateways[1].gateway_id.as_bytes()[0], gateways[1].blocks),
+        (28, 15)
+    );
+    assert_eq!(
+        (gateways[2].gateway_id.as_bytes()[0], gateways[2].blocks),
+        (29, 15)
+    );
 }
 
 #[test]
@@ -228,13 +239,14 @@ fn coverage_is_complete_only_when_every_height_is_read() {
     assert!(!set.snapshot().is_complete());
     assert_eq!(set.snapshot().window_len(), 0);
 
-    // A tip below height 100 has nothing to read.
-    set.set_tip(Height(99), hash(0));
+    // A tip below the qualifying depth has nothing to read.
+    set.set_tip(Height(QUALIFYING_DEPTH - 1), hash(0));
     assert!(set.snapshot().is_complete());
     assert_eq!(set.snapshot().window_len(), 0);
 
     // The window is the six heights from genesis to 5.
-    set.set_tip(Height(105), hash(0));
+    let tip = Height(5 + QUALIFYING_DEPTH);
+    set.set_tip(tip, hash(0));
     for height in 0..5 {
         set.record(Height(height), hash(1), None);
     }
@@ -247,7 +259,7 @@ fn coverage_is_complete_only_when_every_height_is_read() {
     let complete = set.snapshot();
     assert!(complete.is_complete());
     assert_eq!(complete.gateways, []);
-    assert_eq!(complete.tip, Some((Height(105), hash(0))));
+    assert_eq!(complete.tip, Some((tip, hash(0))));
 }
 
 #[test]
@@ -255,7 +267,7 @@ fn unread_heights_are_listed_newest_first() {
     let mut set = RecentMinerSet::new(network_with_nu7(None));
     assert_eq!(set.unchecked_heights().next(), None);
 
-    set.set_tip(Height(105), hash(0));
+    set.set_tip(Height(5 + QUALIFYING_DEPTH), hash(0));
     set.record(Height(4), hash(1), None);
     set.record(Height(1), hash(1), None);
 
@@ -311,9 +323,10 @@ proptest! {
                     model.retain(|checked, _| *checked <= height);
                 }
             }
-            // A height counts from 100 below the tip back 2,304 blocks.
+            // A height counts from the qualifying depth below the tip back
+            // 2,304 blocks.
             let counts = |height: u32| {
-                tip.and_then(|tip: u32| tip.checked_sub(100))
+                tip.and_then(|tip: u32| tip.checked_sub(QUALIFYING_DEPTH))
                     .is_some_and(|newest| height <= newest && newest - height < 2_304)
             };
             model.retain(|height, _| counts(*height));
@@ -326,7 +339,7 @@ proptest! {
             let counted: BTreeMap<u8, u32> = snapshot
                 .gateways
                 .iter()
-                .map(|gateway| (gateway.gateway_id[0], gateway.blocks))
+                .map(|gateway| (gateway.gateway_id.as_bytes()[0], gateway.blocks))
                 .collect();
 
             prop_assert_eq!(counted, expected);

@@ -571,8 +571,9 @@ is today's Zakura logic.
   payload bytes sent to three times the bytes received from that address
   for the connection (RFC 9000 §8.1). The driver holds any complete datagram
   that would exceed the remaining allowance. More bytes from the same
-  address add credit. A validated Retry token or a successfully decrypted
-  Handshake packet from the client establishes return reachability.
+  address add credit. The listener validates the address when it accepts a
+  Retry token or a token from an earlier connection (WIRE-14), or successfully
+  decrypts a Handshake packet from the client.
 - **ADM-2.** `admit` returns one of four outcomes, each mapped to a
   `quinn_proto::Endpoint` call:
   - `Accept` → `accept`;

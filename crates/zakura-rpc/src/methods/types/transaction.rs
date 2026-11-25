@@ -304,7 +304,7 @@ impl CoinbasePlan {
         if let Some(payload_len) = extra_null_data_len {
             // Exact serialized size of a zero-value OP_RETURN null-data output
             // (`OP_RETURN <push-opcode> <payload>`), matching `add_transparent_null_data_output`
-            // (48 bytes for the 37-byte BPv1 commitment).
+            // (46 bytes for the 35-byte BPv1 commitment).
             let push_header_len = if payload_len <= 75 { 1 } else { 2 };
             let script_len = 1 + push_header_len + payload_len;
             transparent_output_bytes +=
@@ -411,7 +411,7 @@ impl TransactionTemplate<NegativeOrZero> {
     ///
     /// `txs_fee` is the sum of all non-coinbase fees before the NSM contribution.
     /// `null_data_output` appends one zero-value `OP_RETURN` output with that payload,
-    /// which BPv1 uses to commit `BPV1 || 0x01 || C`.
+    /// which BPv1 uses to commit `BP || 0x01 || C`.
     pub fn new_coinbase(
         net: &Network,
         height: Height,

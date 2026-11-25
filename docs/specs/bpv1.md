@@ -6,7 +6,7 @@ the BPv1 implementation decisions:
 
 - **Coinbase commitment (decision-1, decision-9, decision-25):** The proposer
   commits `C` in one zero-value post-NU7 v6 coinbase `OP_RETURN` output
-  (`6a 25 "BPV1" 01 C`), proven via both txid and ZIP 244 auth-data index-0
+  (`6a 23 "BP" 01 C`), proven via both txid and ZIP 244 auth-data index-0
   paths plus `hashBlockCommitments`. The byte after the tag is the format
   version. Readers ignore every output in another form. `block_id` is the
   consensus block hash; Ed25519 signatures, variant identifiers, and the
@@ -48,6 +48,10 @@ the BPv1 implementation decisions:
 - **The proposer's silence (decision-20):** The proposer sends `HeaderMeta`
   and `BlockDone`, never `Have`. `BlockDone` means the sender holds every
   part. Repair rounds, but not normal pulls, may ask any `BlockDone` peer.
+- **`Have`s to the proposer (decision-32):** Every node announces to the
+  proposer each verified part that the proposer did not send it, at once and
+  unpaced. The proposer never pulls these parts. Its trace then records when
+  each neighbour obtained each part.
 - **Estimate-based repair (decision-22):** Repair starts after `SLOW_X` × one
   part's estimated arrival time without progress, doubling per round. The first
   repair round releases the body claim, so native block sync races.
@@ -244,8 +248,14 @@ block it proposed. `top` never decreases. A header that headerchain retains
 but has not selected, such as a fork or a future-dated header, does not raise
 `top`. A node MUST NOT admit
 metadata for a block at or below `top - PROPAGATION_DEPTH` (strictly
-`height + PROPAGATION_DEPTH > top`). Such a block uses the existing
-block-download path.
+`height + PROPAGATION_DEPTH > top`). A node also MUST NOT admit metadata for a
+block more than `PROPAGATION_DEPTH` above its verified tip. While a node catches
+up, header sync raises `top` far above the verified tip, and such a block cannot
+commit until its ancestors arrive. Such blocks use the existing block-download
+path. A node retires a block once it falls to or below `top - PROPAGATION_DEPTH`.
+The verified-tip bound applies at admission only. A reorg can lower the verified
+tip, and a block admitted above the new bound keeps its slot until it completes
+or reaches its deadline.
 
 The coinbase commitment binds `proposer_node` to the block. A node therefore
 accepts relay flags only from the connection authenticated as `proposer_node`,
@@ -258,12 +268,12 @@ in a single zero-value transparent `OP_RETURN` output of the post-NU7 v6
 coinbase transaction before mining:
 
 ```text
-6a 25 || ASCII("BPV1") || 01 || C[32]
+6a 23 || ASCII("BP") || 01 || C[32]
 ```
 
-`6a` is `OP_RETURN`; `25` directly pushes the following 37 bytes (total script
-length 39 bytes, serialized transparent output 48 bytes). The byte after
-`"BPV1"` is the commitment format version (decision-25). BPv1 defines version
+`6a` is `OP_RETURN`; `23` directly pushes the following 35 bytes (total script
+length 37 bytes, serialized transparent output 46 bytes). The byte after
+`"BP"` is the commitment format version (decision-25). BPv1 defines version
 `01` only; the profile lives inside `C`, not in this byte.
 
 An output is a version-01 commitment only if its value is zero and its script
@@ -277,9 +287,11 @@ only the versions it supports.
 
 A miner mesh coinbase MAY also carry its own output
 ([#2666](https://github.com/zakura-core/zakura/pull/2666)), which names a
-gateway. BPv1 ignores that output, and it grants no BPv1 rights. When one node
-both builds the template and announces the gateway, `proposer_node` equals the
-gateway identity.
+gateway. That output has the same form with the tag `"MR"`
+([#2709](https://github.com/zakura-core/zakura/pull/2709)), so the two outputs
+never match each other's reader. BPv1 ignores that output, and it grants no BPv1
+rights. When one node both builds the template and announces the gateway,
+`proposer_node` equals the gateway identity.
 
 `CoinbaseBinding` carries the canonical v6 coinbase transaction, its index-0
 txid Merkle path, its index-0 ZIP 244 authorizing-data Merkle path, and
@@ -945,6 +957,13 @@ only such parts. It SHOULD batch announcements for at most `HAVE_FLUSH_MS` or
 its own block (decision-20, bpv1-9). The receiver uses `Have`s to choose pulls,
 to skip sends, and to measure lag.
 
+A node SHOULD send the block's proposer an unflagged `Have` for each part it
+verifies, received or reconstructed, unless the proposer sent it that part
+(decision-32). It sends the `Have` at once, without pacing, and also after the
+proposer's `BlockDone`. It MUST NOT push or send the proposer a part. The
+proposer accepts these `Have`s under the usual cadence and retired-counter
+rules, records them for its trace, and never pulls for them.
+
 A `Have` with the push flag states that the sender will push the listed parts
 behind it on the data stream (section 3). A holder sets it for its own pushed
 seeds. The proposer sets it for its seeds and direct copies, and adds the relay
@@ -964,8 +983,8 @@ above `advert_window_full_size_bytes`, and linear between. The node announces
 verified parts to the initial group at once. Every other peer becomes eligible
 at admission plus `advert_delay`, and then receives one `Have` of the parts it
 still lacks. At both times the node skips a part that the peer announced or
-sent, and a stripe or block the peer finished. Flagged `Have`s, seeds, and
-repair are not paced.
+sent, and a stripe or block the peer finished. Flagged `Have`s, `Have`s to the
+proposer, seeds, and repair are not paced.
 
 An out-of-range index or a repeated index returns `Disconnect` while the
 receiver retains the block's peer view. A push flag past the connection's
@@ -1436,7 +1455,7 @@ The profile MUST fix these before implementations claim interoperability:
 | Part payload and stripes | W2 fixes `S_MIN`, `S_MAX`, `ALIGN`, `STRIPE_K`, and `parity_parts` |
 | Codec construction | Candidate `reed-solomon-simd` 3.1 construction; vectors `TBD` |
 | Hashing | W2 fixes BLAKE3 key derivation with BPv1 contexts; vectors `TBD` |
-| Proposer authentication | W2 fixes the `BPV1 01` coinbase commitment; supported chain formats and admission adapter remain `TBD` |
+| Proposer authentication | W2 fixes the `BP 01` coinbase commitment; supported chain formats and admission adapter remain `TBD` |
 | Serialization | W2 fixes payload encoding; service identifier, capability, stream kinds, and negotiation remain `TBD` |
 | Resource bounds | W2 fixes syntax limits; accept limits, early-record, retention, and work bounds remain `TBD` |
 

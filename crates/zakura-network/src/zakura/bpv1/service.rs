@@ -781,6 +781,19 @@ impl zakura_node_services::bpv1_proposer::Bpv1ProposerHook for Bpv1Handle {
             .map(|commitment| commitment_payload(commitment.commitment_hash))
     }
 
+    fn empty_template_commitment(&self, height: Height) -> Option<[u8; COMMITMENT_PAYLOAD_LEN]> {
+        if !self.should_prepare_template(height) {
+            return None;
+        }
+        // An empty body has one transaction, the coinbase, and no bytes after it.
+        let encoded = encode_body(&self.node.profile, &[], 1).ok()?;
+        let commitment_hash = self
+            .node
+            .lock_proposer()
+            .commitment_hash(encoded.coding, encoded.part_root);
+        Some(commitment_payload(commitment_hash))
+    }
+
     fn publish_solved_block(&self, block: Arc<Block>, height: Height) -> bool {
         Bpv1Handle::publish_solved_block(self, &block, height.0)
     }
@@ -2262,6 +2275,16 @@ fn record_peer_event(event: &PeerEvent, peer: &NodeId) {
             // Widening usize to u64 is lossless on supported 64-bit targets.
             metrics::counter!("zakura.p2p.bpv1.have.indices", "group" => group)
                 .increment(*count as u64);
+        }
+        PeerEvent::HaveSentToProposer { block_id, count } => {
+            tracing::debug!(target: "bpv1_stage", %block_id, ?peer, count, "have_to_proposer");
+            // Widening usize to u64 is lossless on supported 64-bit targets.
+            metrics::counter!("zakura.p2p.bpv1.have.indices", "group" => "proposer")
+                .increment(*count as u64);
+        }
+        PeerEvent::ProposerHeardHave { block_id, indices } => {
+            tracing::debug!(target: "bpv1_stage", %block_id, ?peer, ?indices,
+                "proposer_heard_have");
         }
         PeerEvent::CopiesQueued { bytes, .. } => {
             metrics::counter!("zakura.p2p.bpv1.seed.bytes", "deal" => "direct").increment(*bytes);

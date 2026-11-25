@@ -252,7 +252,7 @@ fn announcing_coinbase_names_the_gateway_in_one_extra_output() -> anyhow::Result
                     + 34,
             );
 
-            // A BPv1 commitment beside the gateway takes 48 more bytes, within the size the
+            // A BPv1 commitment beside the gateway takes 46 more bytes, within the size the
             // template reserves for it, and the gateway output stays last.
             let bpv1 = [0x42; zakura_node_services::bpv1_proposer::BPV1_COMMITMENT_NULL_DATA_LEN];
             let both_tx = TransactionTemplate::new_coinbase(
@@ -269,7 +269,7 @@ fn announcing_coinbase_names_the_gateway_in_one_extra_output() -> anyhow::Result
             assert_eq!(both_tx.outputs().last(), Some(&commitment.to_output()));
             assert_eq!(
                 both_tx.zcash_serialized_size(),
-                announcing_tx.zcash_serialized_size() + 48
+                announcing_tx.zcash_serialized_size() + 46
             );
             assert_eq!(
                 TransactionTemplate::coinbase_resource_usage(
@@ -288,8 +288,62 @@ fn announcing_coinbase_names_the_gateway_in_one_extra_output() -> anyhow::Result
                     None
                 )?
                 .max_serialized_size
-                    + 48,
+                    + 46,
             );
+        }
+    }
+
+    Ok(())
+}
+
+/// A coinbase that carries both a BPv1 commitment and a miner mesh output puts
+/// them last, the BPv1 output first, after every paid output.
+#[test]
+fn coinbase_puts_the_bpv1_output_before_the_miner_mesh_output() -> anyhow::Result<()> {
+    use zakura_node_services::bpv1_proposer::BPV1_COMMITMENT_NULL_DATA_LEN;
+
+    let mesh = MinerMeshCommitment::new(GatewayId::from_bytes(GATEWAY_ID));
+    let mut bpv1_payload = [0x42; BPV1_COMMITMENT_NULL_DATA_LEN];
+    bpv1_payload[..3].copy_from_slice(b"BP\x01");
+    // `OP_RETURN`, then a push of the 35-byte payload.
+    let bpv1_script = [&[0x6a, 0x23][..], &bpv1_payload].concat();
+    let bpv1_output =
+        transparent::Output::new(Amount::zero(), transparent::Script::new(&bpv1_script));
+
+    for net in Network::iter() {
+        let quiet = MinerParams::from(
+            MinerAddress::decode(
+                &net,
+                default_miner_address(net.kind(), &MinerAddressType::Transparent),
+            )
+            .ok_or(anyhow!("hard-coded transparent address must be valid"))?,
+        );
+        let mut announcing = quiet.clone();
+        announcing.set_mesh_commitment(mesh);
+
+        for nu in NetworkUpgrade::iter().filter(|nu| nu >= &NetworkUpgrade::Sapling) {
+            let Some(height) = nu.activation_height(&net) else {
+                continue;
+            };
+            let paid = coinbase_transaction(&net, height, &quiet)?;
+            let both = TransactionTemplate::new_coinbase(
+                &net,
+                height,
+                &announcing,
+                Amount::zero(),
+                None,
+                Some(&bpv1_payload),
+            )?
+            .data()
+            .as_ref()
+            .zcash_deserialize_into::<Transaction>()?;
+
+            let [paid_outputs @ .., bpv1, last] = both.outputs() else {
+                panic!("the coinbase holds the BPv1 and miner mesh outputs");
+            };
+            assert_eq!(paid_outputs, paid.outputs(), "{net:?} {nu:?}");
+            assert_eq!(bpv1, &bpv1_output, "{net:?} {nu:?}");
+            assert_eq!(last, &mesh.to_output(), "{net:?} {nu:?}");
         }
     }
 

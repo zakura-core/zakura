@@ -4,20 +4,25 @@
 //! These exercise the pure decision function [`zakura_block_sync_stalled`] directly,
 //! so they are deterministic and need no clock, services, or live `ChainTip`.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use indexmap::IndexSet;
 use zakura_chain::{
     block::{self, Height},
     chain_sync_status::ChainSyncStatus,
+    parameters::Network,
+    serialization::ZcashDeserializeInto,
 };
+use zakura_network as zn;
+use zakura_state as zs;
+use zakura_test::vectors::{BLOCK_MAINNET_1_BYTES, BLOCK_MAINNET_2_BYTES};
 
 use super::super::{
     cap_checkpoint_bootstrap_hashes, checkpoint_bootstrap_hash_limit,
     engage_legacy_fallback_alongside_zakura, handle_legacy_fallback_acquisition,
-    legacy_probe_supports_fallback, zakura_block_sync_stalled, zakura_sync_status_length,
-    zakura_watchdog_action, SyncStatus, ZakuraLegacyProbe, ZakuraStallTracker,
-    ZakuraWatchdogAction, ZAKURA_LEGACY_BEHIND_THRESHOLD,
+    zakura_block_sync_stalled, zakura_sync_status_length, zakura_watchdog_action, ChainSync,
+    LegacyProbeResult, SyncStatus, ZakuraLegacyProbe, ZakuraStallTracker, ZakuraWatchdogAction,
+    ZAKURA_LEGACY_BEHIND_THRESHOLD,
 };
 
 #[test]
@@ -567,7 +572,11 @@ fn frozen_zero_gap_with_legacy_peers_ahead_engages_fallback() {
         "a frozen tip that looks caught up must cross-check legacy peers"
     );
     assert!(
-        legacy_probe_supports_fallback(Some(ZAKURA_LEGACY_BEHIND_THRESHOLD)),
+        LegacyProbeResult {
+            blocks_ahead: Some(ZAKURA_LEGACY_BEHIND_THRESHOLD),
+            ..Default::default()
+        }
+        .supports_fallback(),
         "legacy peers at or above the behind threshold must trigger fallback"
     );
 
@@ -583,13 +592,89 @@ fn frozen_zero_gap_with_legacy_peers_ahead_engages_fallback() {
 #[test]
 fn legacy_probe_below_threshold_keeps_zakura_running() {
     assert!(
-        !legacy_probe_supports_fallback(None),
+        !LegacyProbeResult::default().supports_fallback(),
         "no legacy peer answer must not force a fallback"
     );
     assert!(
-        !legacy_probe_supports_fallback(Some(ZAKURA_LEGACY_BEHIND_THRESHOLD - 1)),
+        !LegacyProbeResult {
+            blocks_ahead: Some(ZAKURA_LEGACY_BEHIND_THRESHOLD - 1),
+            ..Default::default()
+        }
+        .supports_fallback(),
         "legacy peers below the behind threshold must not force a fallback"
     );
+}
+
+/// Reproduce a frozen native frontier with legacy peers two blocks ahead.
+#[tokio::test]
+async fn frozen_native_tip_recovers_on_two_linked_legacy_headers_with_work() {
+    let first: block::Block = BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .expect("valid mainnet block 1");
+    let second: block::Block = BLOCK_MAINNET_2_BYTES
+        .zcash_deserialize_into()
+        .expect("valid mainnet block 2");
+    let tip = (Height(0), first.header.previous_block_hash);
+    let mut tracker = ZakuraStallTracker::new(Some(tip.0));
+    let mut legacy_probe = ZakuraLegacyProbe::new(Some(tip.0));
+    for expected in [
+        ZakuraWatchdogAction::ContinueWaiting,
+        ZakuraWatchdogAction::ContinueWaiting,
+        ZakuraWatchdogAction::ProbeLegacyPeers,
+    ] {
+        let action = zakura_watchdog_action(
+            &mut tracker,
+            &mut legacy_probe,
+            Some(tip.0),
+            Some(tip.0),
+            60,
+            true,
+        );
+        assert_eq!(action, expected);
+    }
+
+    let first = first.header;
+    let second = second.header;
+    let mut invalid_work = second.clone();
+    Arc::make_mut(&mut invalid_work).nonce[0] ^= 1;
+    let mut unlinked = second.clone();
+    Arc::make_mut(&mut unlinked).previous_block_hash = tip.1;
+
+    for (headers, expected_ahead, expected_fallback) in [
+        (vec![first.clone(), second], 2, true),
+        (vec![first.clone()], 1, false),
+        (vec![first.clone(), invalid_work], 2, false),
+        (vec![first, unlinked], 0, false),
+    ] {
+        let headers: Vec<_> = headers.into_iter().map(Into::into).collect();
+        let peer = tower::service_fn(move |request| {
+            assert!(matches!(request, zn::Request::FindHeaders { .. }));
+            futures::future::ok(zn::Response::BlockHeaders(headers.clone()))
+        });
+        let state = tower::service_fn(move |request| {
+            futures::future::ok(match request {
+                zs::Request::BlockLocator => zs::Response::BlockLocator(vec![tip.1]),
+                zs::Request::KnownBlock(hash) => {
+                    zs::Response::KnownBlock((hash == tip.1).then_some(zs::KnownBlock::BestChain))
+                }
+                _ => unreachable!("unexpected state request"),
+            })
+        });
+        let verifier = tower::service_fn(|_| async { unreachable!("the probe only reads state") });
+        let (_, chain_tip, _) = zs::ChainTipSender::new(None, &Network::Mainnet);
+        let (mut sync, _) = ChainSync::new(
+            &crate::config::ZakuradConfig::default(),
+            Height(0),
+            peer,
+            verifier,
+            state,
+            chain_tip,
+            crate::components::test_misbehavior::reporter(),
+        );
+        let probe = sync.legacy_peers_blocks_ahead(Some(tip)).await;
+        assert_eq!(probe.blocks_ahead, Some(expected_ahead));
+        assert_eq!(probe.supports_fallback(), expected_fallback);
+    }
 }
 
 #[test]

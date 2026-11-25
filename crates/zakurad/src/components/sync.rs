@@ -37,6 +37,7 @@ use zakura_chain::{
 };
 use zakura_consensus::{error::TransactionError, RouterError, VerifyBlockError};
 use zakura_network as zn;
+use zakura_node_services::block_memory::HeaderHandle;
 use zakura_state as zs;
 
 use crate::{
@@ -403,21 +404,21 @@ const ZAKURA_BODY_SYNC_STALL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// while watching for Zakura body-sync progress.
 const ZAKURA_BODY_SYNC_STALL_POLL: Duration = Duration::from_secs(10);
 
-/// Gap (in blocks, best-header tip − verified tip) at or below which the node is
-/// treated as caught up to the network frontier. At this distance, gossip keeping
-/// the verified tip current is healthy, so the watchdog never falls back.
+/// Gap (in blocks, best-header tip − verified tip) at or below which the node
+/// checks whether legacy peers have moved beyond its native header frontier.
 const ZAKURA_NEAR_TIP_GAP: HeightDiff = 2;
 
 /// Consecutive polls the verified tip must stay frozen before
 /// [`ChainSync::bootstrap_genesis_then_pause`] runs its legacy-informed
-/// cross-check probe. Bounds how often the watchdog issues a `FindBlocks`
+/// cross-check probe. Bounds how often the watchdog issues a `FindHeaders`
 /// fanout — only a genuinely stuck node pays for it. ~30s is long enough that a
 /// working bulk sync, which advances the verified tip every poll, never trips it.
 const ZAKURA_LEGACY_PROBE_STALL_POLLS: u64 = 3;
 
 /// How far ahead of the verified tip the legacy peer set must report — in block
-/// hashes offered beyond our locator — for the legacy-informed watchdog to treat
-/// the node as materially behind the network and fall back.
+/// headers offered beyond our locator — for the legacy-informed watchdog to treat
+/// the node as materially behind the network and fall back if the response
+/// starts from an older anchor.
 ///
 /// This is the "much higher height" signal for the fleet-restart failure mode:
 /// when every Zakura node restarts together it freezes at a common height with
@@ -532,7 +533,7 @@ fn zakura_watchdog_action(
     }
 
     // The legacy-informed cross-check only exists to trigger the fallback and
-    // issues a `FindBlocks` fanout when it probes, so skip it on Zakura-only nodes.
+    // issues a `FindHeaders` fanout when it probes, so skip it on Zakura-only nodes.
     if !legacy_fallback {
         return ZakuraWatchdogAction::ContinueWaiting;
     }
@@ -554,8 +555,40 @@ fn zakura_watchdog_action(
     }
 }
 
-fn legacy_probe_supports_fallback(blocks_ahead: Option<HeightDiff>) -> bool {
-    matches!(blocks_ahead, Some(blocks_ahead) if blocks_ahead >= ZAKURA_LEGACY_BEHIND_THRESHOLD)
+#[derive(Default)]
+struct LegacyProbeResult {
+    blocks_ahead: Option<HeightDiff>,
+    extends_verified_tip: bool,
+}
+
+impl LegacyProbeResult {
+    fn supports_fallback(&self) -> bool {
+        self.extends_verified_tip || self.blocks_ahead >= Some(ZAKURA_LEGACY_BEHIND_THRESHOLD)
+    }
+}
+
+/// Require two proof-of-work headers that extend the exact verified tip before
+/// engaging early recovery. One header can be a single block still in flight.
+/// The legacy downloader fully verifies the blocks before committing them.
+fn legacy_headers_extend_tip(
+    network: &Network,
+    tip_height: Height,
+    [first, second]: [HeaderHandle; 2],
+) -> bool {
+    let Some((first_height, second_height)) = (tip_height + 1).zip(tip_height + 2) else {
+        return false;
+    };
+    let first_hash = first.hash();
+    if second.previous_block_hash != first_hash {
+        return false;
+    }
+    zakura_consensus::proof_of_work_is_valid(&first, network, &first_height, &first_hash)
+        && zakura_consensus::proof_of_work_is_valid(
+            &second,
+            network,
+            &second_height,
+            &second.hash(),
+        )
 }
 
 /// Converts Zakura's local body/header gap into the legacy sync-status
@@ -1369,7 +1402,8 @@ where
         loop {
             sleep(ZAKURA_BODY_SYNC_STALL_POLL).await;
 
-            let verified_height = self.latest_chain_tip.best_tip_height();
+            let verified_tip = self.latest_chain_tip.best_tip_height_and_hash();
+            let verified_height = verified_tip.map(|(height, _)| height);
             let header_tip_height = best_header_tip_height(&mut read_state).await;
             if let Some(sync_length) = zakura_sync_status_length(verified_height, header_tip_height)
             {
@@ -1410,19 +1444,23 @@ where
                     legacy_probe = ZakuraLegacyProbe::new(resumed_tip);
                 }
                 ZakuraWatchdogAction::ProbeLegacyPeers => {
-                    let blocks_ahead = self.legacy_peers_blocks_ahead().await;
+                    let probe = self.legacy_peers_blocks_ahead(verified_tip).await;
                     info!(
                         verified_tip = ?verified_height,
-                        ?blocks_ahead,
+                        blocks_ahead = ?probe.blocks_ahead,
+                        extends_verified_tip = probe.extends_verified_tip,
                         "Zakura watchdog probed legacy peers for connected blocks ahead"
                     );
-                    if legacy_probe_supports_fallback(blocks_ahead) {
+                    if probe.supports_fallback()
+                        && self.latest_chain_tip.best_tip_height_and_hash() == verified_tip
+                    {
                         warn!(
                             verified_tip = ?verified_height,
                             header_tip = ?header_tip_height,
-                            ?blocks_ahead,
-                            "Zakura body sync is frozen while legacy peers advertise a much \
-                             higher tip; resuming legacy ChainSync as the body-sync driver \
+                            blocks_ahead = ?probe.blocks_ahead,
+                            extends_verified_tip = probe.extends_verified_tip,
+                            "Zakura body sync is frozen while legacy peers have blocks ahead; \
+                             resuming legacy ChainSync as the body-sync driver \
                              while Zakura keeps serving peers and following local commits"
                         );
                         self.run_legacy_fallback_round(&block_sync_handoff).await?;
@@ -1458,9 +1496,9 @@ where
         Ok(())
     }
 
-    /// Probes the legacy peer set for how far ahead the network is on **our**
-    /// chain, returning the longest run of peer-offered headers that extends a
-    /// block we already have (`None` if no peer answered).
+    /// Probes legacy peers for headers ahead of our chain. A valid two-header
+    /// extension of the verified tip can trigger recovery before the full stall
+    /// timeout. Responses that begin at an older anchor need a longer run.
     ///
     /// This is the watchdog's network-truth cross-check. It deliberately uses the
     /// legacy `FindHeaders` path rather than the Zakura header frontier: a fleet
@@ -1479,19 +1517,19 @@ where
     ///
     /// Read-only: unlike [`Self::obtain_tips`] it touches none of the syncer's
     /// download bookkeeping, so it is safe to call from the watchdog loop.
-    async fn legacy_peers_blocks_ahead(&mut self) -> Option<HeightDiff> {
-        let block_locator = self
+    async fn legacy_peers_blocks_ahead(
+        &mut self,
+        verified_tip: Option<(Height, block::Hash)>,
+    ) -> LegacyProbeResult {
+        let mut probe = LegacyProbeResult::default();
+        let Ok(zakura_state::Response::BlockLocator(block_locator)) = self
             .state
-            .ready()
+            .clone()
+            .oneshot(zakura_state::Request::BlockLocator)
             .await
-            .ok()?
-            .call(zakura_state::Request::BlockLocator)
-            .await
-            .ok()
-            .and_then(|response| match response {
-                zakura_state::Response::BlockLocator(block_locator) => Some(block_locator),
-                _ => None,
-            })?;
+        else {
+            return probe;
+        };
 
         let mut requests = FuturesUnordered::new();
         for attempt in 0..FANOUT {
@@ -1499,7 +1537,9 @@ where
                 // Let other tasks run, so we're more likely to choose a different peer.
                 tokio::task::yield_now().await;
             }
-            let ready_tip_network = self.tip_network.ready().await.ok()?;
+            let Ok(ready_tip_network) = self.tip_network.ready().await else {
+                return probe;
+            };
             requests.push(tokio::spawn(ready_tip_network.call(
                 zn::Request::FindHeaders {
                     known_blocks: block_locator.clone(),
@@ -1508,7 +1548,6 @@ where
             )));
         }
 
-        let mut best_ahead: Option<HeightDiff> = None;
         while let Some(res) = requests.next().await {
             let headers = match res {
                 Ok(Ok(zn::Response::BlockHeaders(headers))) => headers,
@@ -1516,6 +1555,29 @@ where
                 // unexpected response, exactly like the obtain_tips fanout does.
                 _ => continue,
             };
+
+            if let Some((tip_height, tip_hash)) = verified_tip {
+                // A response can start below the verified tip. Check only the
+                // first two headers that follow it.
+                if let Some(pair) = headers
+                    .windows(2)
+                    .find(|pair| pair[0].previous_block_hash == tip_hash)
+                {
+                    let pair = [pair[0].clone(), pair[1].clone()];
+                    let network = self.network.clone();
+                    if tokio::task::spawn_blocking(move || {
+                        legacy_headers_extend_tip(&network, tip_height, pair)
+                    })
+                    .await
+                    .unwrap_or(false)
+                    {
+                        return LegacyProbeResult {
+                            blocks_ahead: Some(probe.blocks_ahead.unwrap_or(0).max(2)),
+                            extends_verified_tip: true,
+                        };
+                    }
+                }
+            }
 
             // Count the run of offered headers that extends our own chain: skip
             // any prefix we already have, then require the first unknown header
@@ -1548,13 +1610,14 @@ where
                 ahead += 1;
                 run_parent = Some(hash);
                 if ahead >= ZAKURA_LEGACY_BEHIND_THRESHOLD {
-                    return Some(ahead);
+                    probe.blocks_ahead = Some(ahead);
+                    return probe;
                 }
             }
-            best_ahead = Some(best_ahead.unwrap_or(0).max(ahead));
+            probe.blocks_ahead = Some(probe.blocks_ahead.unwrap_or(0).max(ahead));
         }
 
-        best_ahead
+        probe
     }
 
     /// Tries to synchronize the chain as far as it can.

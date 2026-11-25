@@ -213,9 +213,9 @@ jobs:
           listen_addr = "0.0.0.0:8234"
           ${zakura_trace_line}
           bootstrap_peers = [
-              "672cb8d35831d6020f14e35215de0f7fc1ee771ecd3c9d5fe67c32acb0b53fab@167.99.103.111:8234",
-              "3783033db00b137ed3d11cf2d30853fce65db4967d3910bb66ff4d14191764c9@164.92.209.78:8234",
-              "fe1f7911e1675f0f3cfb17033a71ff2221d03d9f170b0209a73deba439886efe@206.189.148.0:8234",
+              "884eb8c4e0d6005bd3a6e086df064efc12b866632dababa4249b2ceb42d43982@167.99.103.111:8234",
+              "1d0dd618bb699637322dcbf20a0830fe9078733ba13c3ee01768bfb518653064@164.92.209.78:8234",
+              "b5410aedf93d00bbc9f93405a4c054b30289da9b76269432a5e6e0e132f0480c@206.189.148.0:8234",
           ]
 
           [[nodes]]

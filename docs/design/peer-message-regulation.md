@@ -49,7 +49,7 @@ peer can fill. The node bounds that credit by holding fewer connections, not by 
 `peer_memory_budget_bytes` (17 GiB) funds one 256 MiB datagram queue per bound socket,
 `max_pending_handshakes` (32) connections in their handshakes at 64 MiB of windows each, and
 admitted connections at their raised windows: the handshake window, each negotiated reactor's
-receive share and the send window, 141,937,353 B at the defaults. That funds 92 ordinary peers and
+receive share and the send window, 146,204,963 B at the defaults with `tx-relay` on. That funds 92 ordinary peers and
 up to ten additional preferred gateways, plus 32 handshakes for 134 live QUIC connections. A closed connection
 releases its stream buffers and waits out its drain in a separate, cheap allowance, so a peer that
 gets rejected and reconnects can't pile up buffers, and its closed connections take no slot from

@@ -856,7 +856,8 @@ IPv4 address or global IPv6 /64, ADM-3),
   negotiates its streams, the application raises its receive window once
   (API-9) by the receive share of each stream kind it negotiated, so an
   admitted connection holds that window plus `send_window_bytes`:
-  141,945,123 B at the defaults on Mainnet and Testnet. Per-stream receive
+  146,204,963 B at the defaults on Mainnet and Testnet with `tx-relay`
+  registered, and 141,945,123 B without it. Per-stream receive
   windows sit inside the connection window and add nothing.
   `zakura_quic::connection_memory_bytes` is the only implementation of the
   handshake cost, and `ConnectionMemory` in `zakura-network` of the admitted
@@ -868,7 +869,7 @@ IPv4 address or global IPv6 /64, ADM-3),
   peer_memory_budget_bytes`, one socket queue per bound socket and
   `max_pending_handshakes` connections at the handshake cost. The rest
   divided by the admitted connection's cost is the number of connections it
-  can fund, 104 at Mainnet defaults with one socket. Ordinary peers take
+  can fund, 108 at Mainnet defaults with one socket. Ordinary peers take
   priority up to `max_connections` (92 by default). Up to ten more places
   can be used by preferred gateways if the remaining memory funds them. ADM-12 holds the transport to the
   admitted cap plus the handshake headroom, so every

@@ -107,18 +107,16 @@ release.
 The Mainnet deploy only swaps binaries, so the switch is a hand edit.
 
 1. Save the config, as above.
-2. Add the pool setting, and for a dual node `tx-relay`:
+2. Add the pool setting:
 
    ```toml
    [mempool]
    implementation = "core"
-
-   [network.zakura.tx_relay]
-   enabled = true
    ```
 
-   `tx-relay` needs `p2p_stack = "dual"` or `"zakura"` as well. Without the
-   core pool zakurad logs a warning and leaves it off.
+   On a `dual` or `zakura` stack the default already runs the core with
+   `tx-relay`, so this is needed only on a legacy-only node, where `tx-relay`
+   stays off.
 3. `systemctl restart zakurad`, then check the metrics from "Before a stage".
    For `tx-relay` also check that `zakura_p2p_tx_relay_sessions` is above zero
    once a peer with it is connected.
@@ -128,9 +126,18 @@ its `mempool_implementation` and `tx_relay` inputs.
 
 ### Turn a canary back
 
-1. Remove the `[mempool] implementation` and `[network.zakura.tx_relay]` lines.
-2. `systemctl restart zakurad` and check that `mempool_implementation` reads the
-   default pool and `zakura_p2p_tx_relay_registered` reads 0.
+1. Set the classic pool, which also turns `tx-relay` off:
+
+   ```toml
+   [mempool]
+   implementation = "classic"
+   ```
+
+   On a legacy-only node, removing the `[mempool] implementation` line does
+   the same. On a `dual` or `zakura` node it does not, because the default
+   there is the core.
+2. `systemctl restart zakurad` and check that `mempool_implementation` reads
+   `classic` and `zakura_p2p_tx_relay_registered` reads 0.
 
 If the binary misbehaves too, restore the saved config first, then run
 `zakura-mainnet-rollback.yml`, then check that the node started.

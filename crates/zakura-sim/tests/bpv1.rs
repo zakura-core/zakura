@@ -377,8 +377,12 @@ fn answers(seen: &Seen, hash: block::Hash) -> Vec<(Via, Answer)> {
 /// One line per mined block, for a failure message.
 fn summary(seen: &Seen) -> String {
     let mut lines = format!(
-        "node at h{}, tip h{}, queue full {}, records {}\n",
-        seen.node_tip.height.0, seen.tip.height.0, seen.tally.queue_full, seen.tally.records
+        "node at h{}, tip h{}, queue full {}, most queued {}, records {}\n",
+        seen.node_tip.height.0,
+        seen.tip.height.0,
+        seen.tally.queue_full,
+        seen.tally.most_queued,
+        seen.tally.records
     );
     for (block, phase) in seen.mined.iter().zip(&seen.phases) {
         lines.push_str(&format!(
@@ -431,9 +435,11 @@ fn assert_clean(seen: &Seen) {
 ///
 /// A block more than `PROPAGATION_DEPTH` above the verified tip belongs to
 /// block sync (bpv1-76). Every later block commits through BPv1, with one
-/// submission and no block-sync fetch (bpv1-44), even when it arrives
-/// before its parent commits: the verifier holds it until the parent
-/// commits. So BPv1 resumes with the first block inside its window.
+/// submission and no block-sync fetch, even when it arrives before its
+/// parent commits: the verifier holds it until the parent commits. So BPv1
+/// resumes with the first block inside its window. BPv1 outruns block sync
+/// here, so the missing fetch doesn't show the body claim at work;
+/// `bpv1_44_a_slow_verification_keeps_block_sync_off_the_body` does.
 #[test]
 fn bpv1_76_82_a_node_far_behind_catches_up_and_hands_off_to_bpv1() {
     let scenario = MeshScenario {
@@ -510,6 +516,39 @@ fn at_tip() -> MeshScenario {
         body_bytes: 2_000,
         verify_delay: Duration::from_millis(20),
     }
+}
+
+/// Mirror 0 mines a block while the node's verifier takes 20 s, longer than
+/// the 15 s claim BPv1 takes at admission. Block sync learns the header at
+/// once and would fetch the body. BPv1's claim keeps it off, and assembly
+/// extends the claim through verification (bpv1-44), so block sync fetches
+/// nothing and BPv1 commits the block.
+///
+/// The catch-up test can't show this: BPv1 wins every race there by speed,
+/// so its blocks see no fetch even without a claim.
+#[test]
+fn bpv1_44_a_slow_verification_keeps_block_sync_off_the_body() {
+    let scenario = MeshScenario {
+        verify_delay: Duration::from_secs(20),
+        ..at_tip()
+    };
+    let seen = run_mesh(scenario, |director| async move {
+        let block = director.mine().await;
+        director.committed(block).await
+    });
+    let summary = summary(&seen);
+    assert_clean(&seen);
+    let block = seen.mined[0];
+    assert_eq!(
+        answers(&seen, block.hash),
+        [(Via::Bpv1, Answer::Committed)],
+        "BPv1 delivers the block once, and block sync doesn't\n{summary}"
+    );
+    assert_eq!(
+        seen.tally.fetches(block.height),
+        0,
+        "block sync fetches no body\n{summary}"
+    );
 }
 
 /// Mirror 0 withholds every part of a block it mines. BPv1 admits the block

@@ -33,7 +33,7 @@ last stripe never travels.
 ## Authenticate before forwarding
 
 At template time, the proposer encodes the body and commits the part root in a
-zero-value coinbase output, `6a 25 "BPV1" 01 C`. `C` hashes the chain, the
+zero-value coinbase output, `6a 23 "BP" 01 C`. `C` hashes the chain, the
 profile, the coding, the part root, and the proposer's node id. The proof of
 work covers the header, the header commits the coinbase, and the coinbase
 commits `C`. A block therefore has one valid set of metadata, and BPv1 needs no
@@ -127,7 +127,9 @@ finished its stripe. A holder never pushes any other part.
 
 Every node announces the parts it verifies with `Have`. It announces at once to
 an initial group of peers and to the rest after a delay. Main's block gossip
-uses the same pacing and settings.
+uses the same pacing and settings. A node also announces at once to the
+block's proposer every part the proposer did not send it. The proposer never
+pulls these parts. Its trace shows when each neighbour obtained each part.
 
 A node pulls an announced part it lacks with a `Want` that names exact indices.
 It asks the announcer whose copy would arrive first, by that peer's round-trip
@@ -192,6 +194,14 @@ Recovery proceeds in one direction:
 3. **Full-block download:** fall back when the 15 s reconstruction deadline
    from metadata admission expires. Partial progress never resets the
    deadline. A failed re-encode check goes here at once.
+
+An assembled block keeps its body claim while it verifies, so native block sync
+downloads no second copy. A 120 s verification deadline bounds that wait. A
+retryable verdict on a block whose parent is not committed keeps the body until
+the parent is the verified tip, and BPv1 then submits it again. When every slot
+is busy, the block whose parent is the verified tip takes the slot of the
+highest block above it. The table compares parent hashes, not heights, because
+headerchain also admits retained forks.
 
 ### Miner mesh
 

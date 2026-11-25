@@ -4331,6 +4331,8 @@ struct EqualWorkTips {
     b: Arc<Block>,
     tip: zs::LatestChainTip,
     claims: AnnouncementClaims,
+    /// Transaction verifications, one per transaction of each block that is verified.
+    transaction_calls: Arc<std::sync::atomic::AtomicUsize>,
     verifier: SemanticBlockVerifier<
         crate::transaction::TestStateService,
         tower::util::BoxCloneService<tx::Request, tx::Response, BoxError>,
@@ -4369,10 +4371,14 @@ impl EqualWorkTips {
         let mut b = a.as_ref().clone();
         Arc::make_mut(&mut b.header).nonce.0[0] ^= 1;
         let b = Arc::new(b);
-        let transaction =
-            service_fn(
-                |request| async move { Ok::<_, BoxError>(accept_block_transaction(request)) },
-            );
+        let transaction_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let transaction = service_fn({
+            let transaction_calls = transaction_calls.clone();
+            move |request| {
+                transaction_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                async move { Ok::<_, BoxError>(accept_block_transaction(request)) }
+            }
+        });
         let claims = AnnouncementClaims::default();
         let verifier = SemanticBlockVerifier::new(
             &network,
@@ -4386,6 +4392,7 @@ impl EqualWorkTips {
             b,
             tip,
             claims,
+            transaction_calls,
             verifier,
         }
     }
@@ -4405,6 +4412,102 @@ impl EqualWorkTips {
 
         self.tip.best_tip_hash()
     }
+}
+
+/// Legacy gossip, native block sync and BPv1 can deliver the same block at once. Only the first
+/// delivery verifies it. The others wait for it and report a duplicate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn overlapping_deliveries_of_one_body_verify_it_once() {
+    use std::sync::atomic::Ordering;
+
+    let _init_guard = zakura_test::init();
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let mut tips = EqualWorkTips::new().await;
+        let a = tips.a.clone();
+        let deliveries: Vec<_> = (0..3)
+            .map(|_| tips.verifier.call(Request::Commit(a.clone().into())))
+            .collect();
+        let results = futures::future::join_all(deliveries).await;
+
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert!(results
+            .iter()
+            .filter_map(|result| result.as_ref().err())
+            .all(VerifyBlockError::is_duplicate_request));
+        assert_eq!(tips.tip_hash(), Some(a.hash()));
+        assert_eq!(
+            tips.transaction_calls.load(Ordering::Relaxed),
+            a.transactions.len(),
+            "the block's transactions are verified once",
+        );
+    })
+    .await
+    .expect("overlapping deliveries must finish");
+}
+
+/// Deliveries of different bodies under one hash do not wait for each other, so an invalid body
+/// cannot delay the valid one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_different_body_under_the_same_hash_does_not_wait() {
+    let _init_guard = zakura_test::init();
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let tips = EqualWorkTips::new().await;
+        let a = tips.a.clone();
+        let registry = tips.verifier.receipt_orders.clone();
+        let mut variant = a.as_ref().clone();
+        let coinbase = Arc::make_mut(&mut variant.transactions[0]);
+        let zakura_chain::transparent::Input::Coinbase { data, .. } = &mut coinbase.inputs_mut()[0]
+        else {
+            panic!("the fixture starts with a coinbase input");
+        };
+        data.push(1);
+        let variant: BlockHandle = Arc::new(variant).into();
+        let first = registry.register(a.hash(), &a.clone().into());
+        let same = registry.register(a.hash(), &a.clone().into());
+        let other = registry.register(a.hash(), &variant);
+
+        let _held = first.verification_turn().await;
+        assert!(
+            futures::FutureExt::now_or_never(other.verification_turn()).is_some(),
+            "a different body verifies at once",
+        );
+        assert!(
+            futures::FutureExt::now_or_never(same.verification_turn()).is_none(),
+            "an equal body waits for the delivery that is verifying",
+        );
+    })
+    .await
+    .expect("the turn test must finish");
+}
+
+/// A relay can push this node's solved block back while its own submission is in flight. The
+/// submission must not wait for that copy, or it would lose its prepared fast path and return a
+/// duplicate that never publishes the block over BPv1.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_mined_submission_does_not_wait_for_a_network_delivery() {
+    let _init_guard = zakura_test::init();
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let mut tips = EqualWorkTips::new().await;
+        let a = tips.a.clone();
+        let network_copy = tips
+            .verifier
+            .receipt_orders
+            .register(a.hash(), &a.clone().into());
+        let _verifying = network_copy.verification_turn().await;
+
+        let mined = tips.verifier.call(Request::CommitMined {
+            size: a.zcash_serialized_size(),
+            block: a.clone().into(),
+            admission: zs::BlockAdmission::pending(),
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), mined)
+            .await
+            .expect("the mined submission runs while a network copy holds the turn")
+            .unwrap();
+        assert_eq!(tips.tip_hash(), Some(a.hash()));
+    })
+    .await
+    .expect("the mined turn test must finish");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

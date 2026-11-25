@@ -3,7 +3,7 @@
 //! The proposer adds one zero-value transparent `OP_RETURN` output to its
 //! coinbase:
 //! ```text
-//! script = 6a 25 || ASCII("BPV1") || 01 || C
+//! script = 6a 23 || ASCII("BP") || 01 || C
 //! C      = T("commit", chain_id || u16(profile) || coding || part_root
 //!                      || proposer_node)
 //! ```
@@ -33,19 +33,21 @@ use super::{
     tree::COMMIT,
 };
 
-/// Exact 7-byte prefix of a version-01 commitment script:
-/// `OP_RETURN (0x6a) || PUSH_37 (0x25) || "BPV1" || 0x01`.
+/// Exact 5-byte prefix of a version-01 commitment script:
+/// `OP_RETURN (0x6a) || PUSH_35 (0x23) || "BP" || 0x01`.
 ///
 /// The byte after the tag is the commitment format version (decision-25).
-pub const COMMITMENT_SCRIPT_PREFIX: [u8; 7] = [0x6a, 0x25, b'B', b'P', b'V', b'1', 0x01];
+/// The tag differs from the miner mesh tag `MR`, so one coinbase can carry
+/// both outputs.
+pub const COMMITMENT_SCRIPT_PREFIX: [u8; 5] = [0x6a, 0x23, b'B', b'P', 0x01];
 
 /// Byte length of the commitment output's null-data push
-/// (`"BPV1" || 0x01 || C`, `5 + 32 = 37`).
+/// (`"BP" || 0x01 || C`, `3 + 32 = 35`).
 pub const COMMITMENT_PAYLOAD_LEN: usize =
     zakura_node_services::bpv1_proposer::BPV1_COMMITMENT_NULL_DATA_LEN;
 
-/// Exact byte length of a version-01 commitment script: `OP_RETURN`, `PUSH_37`,
-/// and the payload (`2 + 37 = 39`).
+/// Exact byte length of a version-01 commitment script: `OP_RETURN`, `PUSH_35`,
+/// and the payload (`2 + 35 = 37`).
 pub const COMMITMENT_SCRIPT_LEN: usize = 2 + COMMITMENT_PAYLOAD_LEN;
 
 const _: () = assert!(COMMITMENT_SCRIPT_PREFIX[1] as usize == COMMITMENT_PAYLOAD_LEN);
@@ -97,14 +99,14 @@ pub fn commit_hash(fields: &CommitmentFields) -> [u8; 32] {
     ])
 }
 
-/// Builds the 37-byte null-data push committing `c`: `"BPV1" || 0x01 || C`.
+/// Builds the 35-byte null-data push committing `c`: `"BP" || 0x01 || C`.
 pub fn commitment_payload(c: [u8; 32]) -> [u8; COMMITMENT_PAYLOAD_LEN] {
     let mut payload = [0u8; COMMITMENT_PAYLOAD_LEN];
     payload.copy_from_slice(&commitment_script(c)[2..]);
     payload
 }
 
-/// Builds the exact 39-byte `OP_RETURN` locking script committing `c`.
+/// Builds the exact 37-byte `OP_RETURN` locking script committing `c`.
 pub fn commitment_script(c: [u8; 32]) -> [u8; COMMITMENT_SCRIPT_LEN] {
     let mut script = [0u8; COMMITMENT_SCRIPT_LEN];
     script[..COMMITMENT_SCRIPT_PREFIX.len()].copy_from_slice(&COMMITMENT_SCRIPT_PREFIX);
@@ -138,26 +140,7 @@ pub fn verify_commitment(
         return Err(CommitmentError::UnsupportedNetworkUpgrade);
     }
 
-    // The exact path depth is at most 32 for any `u32` count.
-    let expected_depth = expected_tx_path_depth(fields.coding.tx_count);
-    if binding.txid_siblings.len() != expected_depth
-        || binding.auth_siblings.len() != expected_depth
-    {
-        return Err(CommitmentError::WrongPathDepth {
-            expected: expected_depth,
-            txid: binding.txid_siblings.len(),
-            auth: binding.auth_siblings.len(),
-        });
-    }
-
-    let coinbase = decode_coinbase(&binding.coinbase)?;
-
-    // check-2: coinbase txid at index 0 reaches `header.merkle_root`.
-    let txid = coinbase.hash().0;
-    let computed_merkle_root = fold_index0(txid, &binding.txid_siblings, hash_txid_pair);
-    if computed_merkle_root != header.merkle_root.0 {
-        return Err(CommitmentError::TxidPathMismatch);
-    }
+    let coinbase = verify_txid_path(header, binding, fields.coding.tx_count)?;
 
     check_block_commitments(
         header,
@@ -175,6 +158,38 @@ pub fn verify_commitment(
         return Err(CommitmentError::CommitmentHashMismatch);
     }
 
+    Ok(coinbase)
+}
+
+/// check-2: decodes the binding's coinbase and checks that its txid at index 0
+/// reaches `header.merkle_root` through `txid_siblings`.
+///
+/// Both sibling paths must have the depth that `tx_count` transactions give.
+/// The check needs no chain context.
+pub fn verify_txid_path(
+    header: &Header,
+    binding: &CoinbaseBinding,
+    tx_count: u32,
+) -> Result<Transaction, CommitmentError> {
+    // The exact path depth is at most 32 for any `u32` count.
+    let expected_depth = expected_tx_path_depth(tx_count);
+    if binding.txid_siblings.len() != expected_depth
+        || binding.auth_siblings.len() != expected_depth
+    {
+        return Err(CommitmentError::WrongPathDepth {
+            expected: expected_depth,
+            txid: binding.txid_siblings.len(),
+            auth: binding.auth_siblings.len(),
+        });
+    }
+
+    let coinbase = decode_coinbase(&binding.coinbase)?;
+
+    let txid = coinbase.hash().0;
+    let computed_merkle_root = fold_index0(txid, &binding.txid_siblings, hash_txid_pair);
+    if computed_merkle_root != header.merkle_root.0 {
+        return Err(CommitmentError::TxidPathMismatch);
+    }
     Ok(coinbase)
 }
 
@@ -245,7 +260,7 @@ pub fn extract_single_commitment(coinbase: &Transaction) -> Result<[u8; 32], Com
 }
 
 /// Returns `C` if `output` is a version-01 commitment: value zero and a script
-/// of exactly `6a 25 || "BPV1" || 01 || C` (decision-25).
+/// of exactly `6a 23 || "BP" || 01 || C` (decision-25).
 ///
 /// Every other output is not a commitment, including another version, length,
 /// push encoding, or value.

@@ -249,14 +249,18 @@ bytes.
 peer's record. An accepted list re-encodes to exactly the input, and its node
 ID is the ID-9 hash of the input's bytes.
 
-`composite_verify` runs the Ed25519 + ML-DSA-44 verifier once per input. An
+`composite_verify` runs the Ed25519 + ML-DSA-65 verifier once per input. An
 input whose first byte is even carries an Ed25519 key, a `u16`-prefixed
-ML-DSA-44 key, a `u16`-prefixed message and the signature. An odd first byte
+ML-DSA-65 key, a `u16`-prefixed message and the signature. An odd first byte
 makes the rest four-byte edits of an honest signature, signed once per
 process, so an empty corpus still explores near-valid signatures. The honest
 signature must verify, and every edit of it must fail. A raw input checks only
 that the verifier doesn't panic. ML-DSA verification
-makes this target far slower per input than the others.
+makes this target far slower per input than the others. A witness edit
+resizes a field to at most 8,192 bytes, past the 3,373-byte composite.
+Decoder 3 edits the ML-DSA-65 witness. Decoder 1 edited an ML-DSA-44 witness
+and decoder 2 the ML-DSA-87 witness of a draft of `p2p-v2/5`, so their inputs
+no longer mean what they did.
 
 The campaign corpus isn't committed. To start a local campaign from the unit
 tests' valid and malformed values, write the seeds first:
@@ -268,3 +272,56 @@ cargo +nightly-2026-07-15 fuzz run --fuzz-dir . credential_parse
 
 `zakura-quic`'s unit tests replay every seed and check that a seed named
 `valid-` is accepted and one named `invalid-` is refused.
+
+## BPv1 targets
+
+| Target | Property | Decoder |
+| --- | --- | --- |
+| `bpv1_peer` | `bpv1/peer-replay` | 2 |
+| `bpv1_block` | `bpv1/block-replay` | 3 |
+| `bpv1_mesh` | `bpv1/mesh` | 1 |
+| `bpv1_wire` | `bpv1/wire` | 1 |
+| `bpv1_codec` | `bpv1/codec` | 1 |
+
+The drivers and their checks live in
+`crates/zakura-network/src/zakura/bpv1/` behind the `p2p-fuzz` feature:
+`peer/fuzz.rs`, `blocks/fuzz.rs` and the `fuzz/` module.
+
+`bpv1_peer` drives one `PeerState` with every `PeerInput` but `SessionEnd`,
+which ends each replay so the drain check runs. `bpv1_block` drives one
+`BlockTable` with every `BlockInput`. Both answer the work IDs the machine
+issues, at any later step. A completion may answer current work, repeat
+finished work or name work the machine never issued. A part may fail its
+proof or meet a refusal, and a stripe job may fail as a cancelled job does.
+Each replay asserts the machine's invariants after every input.
+
+`bpv1_mesh` runs four nodes' production `PeerState`, `BlockTable` and
+`PeerPaths` machines and one `ProposerState` over in-memory links. The input
+picks which frame or job completion each node takes next, ticks, link loss
+and what node 3, the adversary, sends. Jobs complete with production
+verification and coding. The replay asserts every machine's invariants after
+every step, that no honest link closes with a protocol row, and that every
+ended session drains. One operation lets block sync carry every honest
+tip more than twice the propagation window past the mesh's blocks, so the
+tables evict their tombstones while frames are still in flight.
+
+`bpv1_wire` decodes one arbitrary frame with every BPv1 decoder. A decoded
+frame re-encodes to the same bytes, the largest allocation stays within
+`Bpv1Message::max_heap_bytes`, and each stream decoder closes with the row
+the frame breaks. Only an honest part proves. The target installs
+`MeteredAllocator`. `bpv1_codec` encodes an arbitrary body, decodes each
+stripe from a chosen `k`-subset, refuses `k - 1` parts, catches a lying
+proposer and checks canonical assembly.
+
+To start a local campaign from the in-code seeds, write them first. To see
+which inputs, outputs and close rows the seeds and a short generated run
+reach, print the quality report; it runs no campaign:
+
+```console
+cargo +nightly-2026-07-15 run --example bpv1_seeds
+cargo +nightly-2026-07-15 run --example bpv1_quality -- 200
+cargo +nightly-2026-07-15 fuzz run --fuzz-dir . bpv1_mesh
+```
+
+`zakura-network`'s unit tests replay every seed, check that the seeds reach
+every expected input, and replay generated and edited inputs.

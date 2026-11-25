@@ -15,7 +15,10 @@ use quinn_proto::{
 };
 use zakura_rt::{
     collections::{HashMap, HashSet},
-    sync::{atomic::Ordering, mpsc, oneshot, watch},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, oneshot, watch,
+    },
 };
 
 use super::{ConnCmd, ConnShared, Handshake, ReadReply, READ_BATCH_BYTES};
@@ -56,7 +59,8 @@ pub(crate) struct ConnTaskParams<S> {
     pub(crate) cmds: mpsc::UnboundedReceiver<ConnCmd>,
     /// Routed datagrams with their sizes, which count against the endpoint's
     /// per-connection byte budget until handled.
-    pub(crate) datagrams: mpsc::UnboundedReceiver<(ConnectionEvent, usize)>,
+    pub(crate) datagrams: mpsc::UnboundedReceiver<(ConnectionEvent, usize, SocketAddr)>,
+    pub(super) send_allowance: Option<HandshakeAllowance>,
     pub(crate) control: mpsc::UnboundedReceiver<ConnectionEvent>,
     pub(crate) to_endpoint: mpsc::UnboundedSender<(ConnectionHandle, EndpointEvent)>,
     pub(crate) socket: Arc<SocketCell<S>>,
@@ -69,6 +73,25 @@ pub(crate) struct ConnTaskParams<S> {
     /// The limits the transport config starts the connection with.
     pub(crate) limits: CurrentLimits,
     pub(crate) slot: Arc<ConnectionSlot>,
+}
+
+/// Bytes the listener may send to the original peer before validating its address.
+pub(super) struct HandshakeAllowance {
+    remaining: usize,
+    validated: Arc<AtomicBool>,
+}
+
+impl HandshakeAllowance {
+    pub(super) fn new(initial_bytes: usize, validated: Arc<AtomicBool>) -> Self {
+        Self {
+            remaining: initial_bytes.saturating_mul(3),
+            validated,
+        }
+    }
+
+    fn received(&mut self, bytes: usize) {
+        self.remaining = self.remaining.saturating_add(bytes.saturating_mul(3));
+    }
 }
 
 /// The connection's limits as last set (API-9).
@@ -244,7 +267,10 @@ struct ConnTask<S: UdpIo> {
 
     send_buf: Vec<u8>,
     blocked: Option<(Transmit, Vec<u8>)>,
+    send_allowance: Option<HandshakeAllowance>,
     more_to_send: bool,
+    /// A dialer's hello whose padding (DIAL-8) is still undecided.
+    hello_pad_pending: bool,
     counters: Counters,
     exported: Exported,
     rate_in: RateIn,
@@ -258,6 +284,7 @@ pub(crate) async fn run<S: UdpIo>(params: ConnTaskParams<S>) {
         shared,
         mut cmds,
         mut datagrams,
+        send_allowance,
         mut control,
         to_endpoint,
         socket,
@@ -311,7 +338,9 @@ pub(crate) async fn run<S: UdpIo>(params: ConnTaskParams<S>) {
         slot,
         send_buf: Vec::new(),
         blocked: None,
+        send_allowance,
         more_to_send: false,
+        hello_pad_pending: false,
         counters: Counters::default(),
         exported: Exported::default(),
         rate_in: RateIn::new(now()),
@@ -332,6 +361,8 @@ pub(crate) async fn run<S: UdpIo>(params: ConnTaskParams<S>) {
             VarInt::from_u32(0),
             Bytes::from_static(b"endpoint shutdown"),
         );
+    } else {
+        task.hello_pad_pending = task.conn.side().is_client();
     }
 
     loop {
@@ -382,7 +413,11 @@ pub(crate) async fn run<S: UdpIo>(params: ConnTaskParams<S>) {
             Some(_) => {}
             None => timer_deadline = None,
         }
-        let blocked_io = task.blocked.as_ref().and_then(|_| task.socket.get());
+        let blocked_io = task
+            .blocked
+            .as_ref()
+            .filter(|(tx, _)| task.may_send(tx.size))
+            .and_then(|_| task.socket.get());
         let more_to_send = task.more_to_send;
 
         // Local inputs come before the datagram queue: they are bounded (one
@@ -461,11 +496,11 @@ pub(crate) async fn run<S: UdpIo>(params: ConnTaskParams<S>) {
 impl<S: UdpIo> ConnTask<S> {
     async fn drain_datagrams(
         &self,
-        datagrams: &mut mpsc::UnboundedReceiver<(ConnectionEvent, usize)>,
+        datagrams: &mut mpsc::UnboundedReceiver<(ConnectionEvent, usize, SocketAddr)>,
     ) {
         // Close first so concurrent endpoint sends fail and refund their own charge.
         datagrams.close();
-        while let Some((_, bytes)) = datagrams.recv().await {
+        while let Some((_, bytes, _)) = datagrams.recv().await {
             self.refund_datagram(bytes);
         }
     }
@@ -479,9 +514,23 @@ impl<S: UdpIo> ConnTask<S> {
             .fetch_sub(bytes, Ordering::Relaxed);
     }
 
-    fn on_datagram(&mut self, (event, bytes): (ConnectionEvent, usize)) {
+    fn on_datagram(&mut self, (event, bytes, remote): (ConnectionEvent, usize, SocketAddr)) {
         self.refund_datagram(bytes);
+        if let Some(allowance) = &mut self.send_allowance {
+            // Neither credit nor proof of return reachability transfers between addresses.
+            if remote != self.conn.remote_address() {
+                return;
+            }
+            allowance.received(bytes);
+        }
         self.conn.handle_event(event);
+        if self
+            .send_allowance
+            .as_ref()
+            .is_some_and(|allowance| allowance.validated.load(Ordering::Relaxed))
+        {
+            self.send_allowance = None;
+        }
         self.counters.datagrams_received += 1;
     }
 
@@ -573,6 +622,44 @@ impl<S: UdpIo> ConnTask<S> {
         }
     }
 
+    /// Follows the dialer's hello with one more Initial datagram (DIAL-8),
+    /// once quinn-proto has built the whole hello.
+    ///
+    /// Before it validates the dialer's address, a listener may send only
+    /// three times what it received (RFC 9000 §8.1). The hello is two
+    /// 1,200-byte datagrams, which allows 7,200 bytes, and the listener's
+    /// first flight, with its ML-KEM-1024 ciphertext, ML-DSA-65 key and
+    /// composite signature (TLS-4, TLS-9), is about 7.9 KB. A third datagram
+    /// raises the allowance to 10,800 bytes, so the listener sends its whole
+    /// flight at once and the dial completes in one round trip instead of
+    /// two. quinn-proto puts the PING in the Initial space and pads every
+    /// datagram that carries a dialer's Initial packet to 1,200 bytes.
+    ///
+    /// The PING waits until a send pass ends with quinn-proto out of data.
+    /// A pass that parks a transmit on `WouldBlock` stops polling, and
+    /// without GSO the rest of the hello is then still unbuilt, so a PING
+    /// queued then would ride in the hello's last datagram. The hello's size
+    /// is what quinn-proto built, not what the socket took, so a datagram
+    /// still parked or lost to a send error counts too.
+    ///
+    /// A hello that fits one datagram, which only a dialer without the
+    /// hybrid group sends, gets no padding. A listener refuses such a hello
+    /// at its first packet and keeps no state for it, so a padding datagram
+    /// would arrive as an attempt of its own, with no hello, and hold a
+    /// pending handshake until the deadline. Nor does a hello that drew a
+    /// reply first: a retried hello is validated and needs none.
+    fn pad_hello(&mut self) {
+        if !self.hello_pad_pending || self.blocked.is_some() || self.more_to_send {
+            return;
+        }
+        self.hello_pad_pending = false;
+        let stats = self.conn.stats();
+        if stats.udp_tx.datagrams >= 2 && stats.udp_rx.datagrams == 0 {
+            self.conn.ping();
+            self.transmit();
+        }
+    }
+
     /// Moves every pending output: app events, datagrams and endpoint events.
     fn drive(&mut self) {
         self.update_credit(0);
@@ -589,6 +676,7 @@ impl<S: UdpIo> ConnTask<S> {
         self.check_path(false);
         self.process_events();
         self.transmit();
+        self.pad_hello();
         self.process_events();
         while let Some(event) = self.conn.poll_endpoint_events() {
             self.drained_sent |= event.is_drained();
@@ -612,6 +700,13 @@ impl<S: UdpIo> ConnTask<S> {
             }
             return;
         };
+        if self
+            .blocked
+            .as_ref()
+            .is_some_and(|(tx, _)| !self.may_send(tx.size))
+        {
+            return;
+        }
         if let Some((transmit, contents)) = self.blocked.take() {
             match io.try_send(&transmit, &contents[..transmit.size]) {
                 Ok(()) => self.count_sent(&transmit),
@@ -622,7 +717,12 @@ impl<S: UdpIo> ConnTask<S> {
                 Err(error) => self.send_failed(&error),
             }
         }
-        let max_segments = io.max_transmit_segments();
+        // A batch can exceed the remaining allowance even when its first datagram fits.
+        let max_segments = if self.send_allowance.is_some() {
+            1
+        } else {
+            io.max_transmit_segments()
+        };
         for _ in 0..MAX_TRANSMITS_PER_WAKEUP {
             self.send_buf.clear();
             let Some(transmit) = self
@@ -631,6 +731,12 @@ impl<S: UdpIo> ConnTask<S> {
             else {
                 return;
             };
+            // Quinn accounts a datagram as sent when polled and may round its
+            // three-times limit up. Keep that complete datagram until it fits.
+            if !self.may_send(transmit.size) {
+                self.blocked = Some((transmit, mem::take(&mut self.send_buf)));
+                return;
+            }
             match io.try_send(&transmit, &self.send_buf[..transmit.size]) {
                 Ok(()) => self.count_sent(&transmit),
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -643,7 +749,16 @@ impl<S: UdpIo> ConnTask<S> {
         self.more_to_send = true;
     }
 
+    fn may_send(&self, bytes: usize) -> bool {
+        self.send_allowance
+            .as_ref()
+            .is_none_or(|allowance| bytes <= allowance.remaining)
+    }
+
     fn count_sent(&mut self, transmit: &Transmit) {
+        if let Some(allowance) = &mut self.send_allowance {
+            allowance.remaining -= transmit.size;
+        }
         self.counters.transmits += 1;
         let datagrams = match transmit.segment_size {
             Some(segment) if segment > 0 => transmit.size.div_ceil(segment),
@@ -756,7 +871,7 @@ impl<S: UdpIo> ConnTask<S> {
     /// and the caller then drops the connection's state at once.
     fn enter_closing(
         &mut self,
-        datagrams: &mut mpsc::UnboundedReceiver<(ConnectionEvent, usize)>,
+        datagrams: &mut mpsc::UnboundedReceiver<(ConnectionEvent, usize, SocketAddr)>,
     ) -> bool {
         self.release_streams();
         let slot = self.slot.clone();
@@ -768,7 +883,7 @@ impl<S: UdpIo> ConnTask<S> {
         // handles them as usual.
         slot.begin_closing(|| {
             for _ in 0..datagrams.len() {
-                let Ok((_, bytes)) = datagrams.try_recv() else {
+                let Ok((_, bytes, _)) = datagrams.try_recv() else {
                     break;
                 };
                 self.refund_datagram(bytes);
@@ -1481,7 +1596,9 @@ mod tests {
                 .unwrap(),
             send_buf: Vec::new(),
             blocked: None,
+            send_allowance: None,
             more_to_send: false,
+            hello_pad_pending: false,
             counters: Counters::default(),
             exported: Exported::default(),
             rate_in: RateIn::new(now()),
@@ -2083,7 +2200,7 @@ mod tests {
             task.shared
                 .socket_queued_bytes
                 .fetch_add(data.len(), Ordering::Relaxed);
-            tx.send((event, data.len())).unwrap();
+            tx.send((event, data.len(), remote)).unwrap();
         }
         task.drain_datagrams(&mut rx).await;
         assert!(tx.is_closed());
@@ -2131,7 +2248,7 @@ mod tests {
             task.shared
                 .socket_queued_bytes
                 .fetch_add(charged, Ordering::Relaxed);
-            tx.send((event, charged)).unwrap();
+            tx.send((event, charged, remote)).unwrap();
         }
 
         task.close(VarInt::from_u32(0), Bytes::from_static(b"test"));

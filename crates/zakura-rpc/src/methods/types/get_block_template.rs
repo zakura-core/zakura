@@ -545,9 +545,13 @@ impl BlockTemplateResponse {
     /// the chain tip's value pools make the ZIP 234 NSM value balance negative. Its `expect`s
     /// check invariants that the caller already guarantees.
     ///
-    /// `bpv1_proposer` embeds the BPv1 `OP_RETURN BPV1 01 C` commitment output in
+    /// `bpv1_proposer` embeds the BPv1 `OP_RETURN BP 01 C` commitment output in
     /// post-NU7 v6 coinbases. Pass it only when the selection of
     /// `mempool_txs` reserved that output; see [`GetBlockTemplateHandler::template_bpv1_proposer`].
+    ///
+    /// A `precomputed_coinbase` is used as it is, so the caller passes one only when it
+    /// already carries the commitment output the template needs, and then passes no
+    /// `bpv1_proposer`.
     #[allow(clippy::too_many_arguments, clippy::unwrap_in_result)]
     pub(crate) fn new_internal(
         net: &Network,
@@ -616,40 +620,32 @@ impl BlockTemplateResponse {
             None
         };
 
-        // Selection already reserved the commitment output, so the block stays within
-        // `MAX_BLOCK_BYTES` whatever the proposer returns.
-        let bpv1_commitment_data = bpv1_proposer.and_then(|proposer| {
-            use zakura_chain::serialization::ZcashSerialize;
-
-            let light_client_root: [u8; 32] = chain_info.chain_history_root?.into();
-            let mut body_after_coinbase = Vec::new();
-            for tx in &mempool_txs {
-                tx.transaction
-                    .transaction()
-                    .zcash_serialize(&mut body_after_coinbase)
-                    .ok()?;
+        let coinbase_txn = match precomputed_coinbase {
+            Some(coinbase_txn) => coinbase_txn,
+            None => {
+                // Selection already reserved the commitment output, so the block stays within
+                // `MAX_BLOCK_BYTES` whatever the proposer returns.
+                let bpv1_commitment = bpv1_proposer.and_then(|proposer| {
+                    bpv1_template_commitment(
+                        proposer.as_ref(),
+                        chain_info.chain_history_root,
+                        height,
+                        mempool_txs
+                            .iter()
+                            .map(|tx| tx.transaction.transaction().as_ref()),
+                    )
+                });
+                // ZIP 234 derives the subsidy from the money reserve after the parent, which
+                // is the chain tip this template builds on.
+                TransactionTemplate::new_coinbase(
+                    net,
+                    height,
+                    miner_params,
+                    txs_fee,
+                    nsm_value_balance,
+                    bpv1_commitment.as_ref().map(|c| c.as_slice()),
+                )?
             }
-            let tx_count = u32::try_from(mempool_txs.len().saturating_add(1)).ok()?;
-            proposer.prepare_template_commitment(
-                light_client_root,
-                height,
-                tx_count,
-                &body_after_coinbase,
-            )
-        });
-
-        let coinbase_txn = match (precomputed_coinbase, bpv1_commitment_data) {
-            (Some(coinbase_txn), None) => coinbase_txn,
-            // ZIP 234 derives the subsidy from the money reserve after the parent, which
-            // is the chain tip this template builds on.
-            (_, commitment_data) => TransactionTemplate::new_coinbase(
-                net,
-                height,
-                miner_params,
-                txs_fee,
-                nsm_value_balance,
-                commitment_data.as_ref().map(|d| d.as_slice()),
-            )?,
         };
 
         let default_roots = DefaultRoots::from_coinbase(
@@ -720,6 +716,38 @@ impl BlockTemplateResponse {
             submit_old,
         })
     }
+}
+
+/// A coinbase for an empty block, built while the long poll waits for the block's parent.
+#[derive(Clone, Debug)]
+pub(crate) struct PrecomputedCoinbase {
+    /// The coinbase transaction.
+    pub(crate) coinbase: TransactionTemplate<amount::NegativeOrZero>,
+    /// The BPv1 commitment payload the coinbase carries, if any.
+    pub(crate) bpv1_commitment:
+        Option<[u8; zakura_node_services::bpv1_proposer::BPV1_COMMITMENT_NULL_DATA_LEN]>,
+}
+
+/// Prepares the BPv1 commitment payload for a template at `height` whose transactions after
+/// the coinbase are `body`, on a parent whose light-client root is `light_client_root`.
+///
+/// Returns `None` when the parent has no light-client root, a transaction does not
+/// serialize, or `proposer` declines.
+pub(crate) fn bpv1_template_commitment<'a>(
+    proposer: &dyn zakura_node_services::bpv1_proposer::Bpv1ProposerHook,
+    light_client_root: Option<block::ChainHistoryMmrRootHash>,
+    height: block::Height,
+    body: impl ExactSizeIterator<Item = &'a zakura_chain::transaction::Transaction>,
+) -> Option<[u8; zakura_node_services::bpv1_proposer::BPV1_COMMITMENT_NULL_DATA_LEN]> {
+    use zakura_chain::serialization::ZcashSerialize;
+
+    let light_client_root: [u8; 32] = light_client_root?.into();
+    let tx_count = u32::try_from(body.len().saturating_add(1)).ok()?;
+    let mut body_after_coinbase = Vec::new();
+    for tx in body {
+        tx.zcash_serialize(&mut body_after_coinbase).ok()?;
+    }
+    proposer.prepare_template_commitment(light_client_root, height, tx_count, &body_after_coinbase)
 }
 
 fn new_work_id() -> String {

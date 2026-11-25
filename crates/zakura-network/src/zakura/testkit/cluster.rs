@@ -1348,17 +1348,17 @@ mod tests {
         let mut cluster = ZakuraTestCluster::new();
         let victim_idx = cluster.spawn_traced_node(1, &mut capture).await?;
         let victim = cluster.node(victim_idx);
-        // Seed 3's node ID sorts below the victim's, so this peer is the side
+        // Seed 4's node ID sorts below the victim's, so this peer is the side
         // that opens the stream.
         let hostile = HostilePeer::connect_native_with_capabilities(
             victim,
-            3,
+            4,
             ZAKURA_CAP_BLOCK_SYNC_REGULATED,
         )
         .await?;
         let hostile_peer = hostile.id()?;
         assert!(
-            LocalEndpointFactory::secret_key(3).public() < LocalEndpointFactory::secret_key(1).public(),
+            LocalEndpointFactory::secret_key(4).public() < LocalEndpointFactory::secret_key(1).public(),
             "the hostile peer must open the stream"
         );
         let peer_set = victim.supervisor().subscribe();
@@ -1418,17 +1418,17 @@ mod tests {
         let mut cluster = ZakuraTestCluster::new();
         let victim_idx = cluster.spawn_traced_node(1, &mut capture).await?;
         let victim = cluster.node(victim_idx);
-        // Seed 3's node ID sorts below the victim's, so this peer is the side
+        // Seed 4's node ID sorts below the victim's, so this peer is the side
         // that opens the stream.
         let hostile = HostilePeer::connect_native_with_capabilities(
             victim,
-            3,
+            4,
             ZAKURA_CAP_BLOCK_SYNC_REGULATED,
         )
         .await?;
         let hostile_peer = hostile.id()?;
         assert!(
-            LocalEndpointFactory::secret_key(3).public() < LocalEndpointFactory::secret_key(1).public(),
+            LocalEndpointFactory::secret_key(4).public() < LocalEndpointFactory::secret_key(1).public(),
             "the hostile peer must open the stream"
         );
         let peer_set = victim.supervisor().subscribe();

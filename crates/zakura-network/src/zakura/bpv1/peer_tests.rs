@@ -16,7 +16,9 @@ use super::{
     commitment::CoinbaseBinding,
     peer::*,
     profile::{Coding, Profile},
-    test_support::{make_envelope, node_id, part_frame, LinkProfile, MachineMesh, MESH_HEIGHT},
+    test_support::{
+        make_envelope, node_id, part_frame, LinkProfile, MachineMesh, MESH_HEIGHT, TEST_TIP_HASH,
+    },
     tree::VerifiedPart,
     wire::{
         encode_part_frame, Bpv1Message, HaveFlags, WantBitmap, WantEndReason, MAX_WANTS_INFLIGHT,
@@ -31,7 +33,7 @@ fn queues_meta(step: &PeerStep) -> bool {
     })
 }
 
-fn dummy_meta(block_id: block::Hash) -> Box<Bpv1Message> {
+pub(super) fn dummy_meta(block_id: block::Hash) -> Box<Bpv1Message> {
     Box::new(Bpv1Message::HeaderMeta {
         header: block_id.0.to_vec(),
         binding: CoinbaseBinding {
@@ -56,7 +58,7 @@ fn proposer_meta(block_id: block::Hash, proposer: NodeId) -> Box<Bpv1Message> {
 }
 
 /// The peer's `HeaderMeta` for `block_id`.
-fn recv_meta(block_id: block::Hash) -> PeerInput {
+pub(super) fn recv_meta(block_id: block::Hash) -> PeerInput {
     PeerInput::RecvHeaderMeta {
         block_id,
         message: dummy_meta(block_id),
@@ -64,7 +66,7 @@ fn recv_meta(block_id: block::Hash) -> PeerInput {
 }
 
 /// An inbound `Have` of `indices` with `flags`.
-fn have_with(block_id: block::Hash, flags: HaveFlags, indices: Vec<u32>) -> PeerInput {
+pub(super) fn have_with(block_id: block::Hash, flags: HaveFlags, indices: Vec<u32>) -> PeerInput {
     PeerInput::RecvHave(RecvHave {
         block_id,
         flags,
@@ -74,7 +76,7 @@ fn have_with(block_id: block::Hash, flags: HaveFlags, indices: Vec<u32>) -> Peer
 }
 
 /// The coding of the 64-byte TINY block most tests admit.
-fn tiny() -> Coding {
+pub(super) fn tiny() -> Coding {
     Profile::TINY.derive_coding(64, 2).unwrap()
 }
 
@@ -91,12 +93,12 @@ fn block_admitted(block_id: block::Hash, coding: Coding, proposer: NodeId) -> Bl
     }
 }
 
-fn admitted(block_id: block::Hash, coding: Coding, proposer: NodeId) -> PeerInput {
+pub(super) fn admitted(block_id: block::Hash, coding: Coding, proposer: NodeId) -> PeerInput {
     PeerInput::BlockAdmitted(block_admitted(block_id, coding, proposer))
 }
 
 /// The admission of node 1's own block.
-fn proposing(block_id: block::Hash, coding: Coding) -> PeerInput {
+pub(super) fn proposing(block_id: block::Hash, coding: Coding) -> PeerInput {
     PeerInput::BlockAdmitted(BlockAdmitted {
         as_proposer: true,
         ..block_admitted(block_id, coding, node_id(1))
@@ -104,7 +106,7 @@ fn proposing(block_id: block::Hash, coding: Coding) -> PeerInput {
 }
 
 /// A TINY session from node 1 to `remote` that stepped `admission`.
-fn session(remote: NodeId, now: Instant, admission: PeerInput) -> PeerState {
+pub(super) fn session(remote: NodeId, now: Instant, admission: PeerInput) -> PeerState {
     let mut peer = PeerState::new(PeerConfig::for_profile(Profile::TINY), remote, 1);
     peer.step(now, admission);
     peer
@@ -112,11 +114,11 @@ fn session(remote: NodeId, now: Instant, admission: PeerInput) -> PeerState {
 
 /// A session from node 1 to node 2 with the 64-byte TINY block admitted;
 /// node 3 proposed it.
-fn tiny_session(block_id: block::Hash, now: Instant) -> PeerState {
+pub(super) fn tiny_session(block_id: block::Hash, now: Instant) -> PeerState {
     session(node_id(2), now, admitted(block_id, tiny(), node_id(3)))
 }
 
-fn bitmap(slots: &[u32]) -> WantBitmap {
+pub(super) fn bitmap(slots: &[u32]) -> WantBitmap {
     let mut bm = WantBitmap::EMPTY;
     for &slot in slots {
         bm.set(slot);
@@ -125,7 +127,7 @@ fn bitmap(slots: &[u32]) -> WantBitmap {
 }
 
 /// The block table's grant of `slots` of `stripe`, due 50 ms after `now`.
-fn pull(block_id: block::Hash, stripe: u32, slots: &[u32], now: Instant) -> PeerInput {
+pub(super) fn pull(block_id: block::Hash, stripe: u32, slots: &[u32], now: Instant) -> PeerInput {
     PeerInput::PullGranted(PullGranted {
         block_id,
         stripe,
@@ -139,7 +141,12 @@ fn pull(block_id: block::Hash, stripe: u32, slots: &[u32], now: Instant) -> Peer
 }
 
 /// The peer's `Want` for `slots` of `stripe`.
-fn recv_want(want_id: u32, block_id: block::Hash, stripe: u32, slots: &[u32]) -> PeerInput {
+pub(super) fn recv_want(
+    want_id: u32,
+    block_id: block::Hash,
+    stripe: u32,
+    slots: &[u32],
+) -> PeerInput {
     PeerInput::RecvWant(RecvWant {
         want_id,
         block_id,
@@ -168,7 +175,7 @@ fn sent_want(step: &PeerStep) -> Option<u32> {
 }
 
 /// The token of the proof job that `step` starts, if any.
-fn verify_token(step: &PeerStep) -> Option<PartToken> {
+pub(super) fn verify_token(step: &PeerStep) -> Option<PartToken> {
     step.outputs.iter().find_map(|o| match o {
         PeerOutput::VerifyPart { token, .. } => Some(*token),
         _ => None,
@@ -176,7 +183,7 @@ fn verify_token(step: &PeerStep) -> Option<PartToken> {
 }
 
 #[track_caller]
-fn assert_closed(peer: &PeerState, row: Bpv1CloseRow) {
+pub(super) fn assert_closed(peer: &PeerState, row: Bpv1CloseRow) {
     assert_eq!(peer.close_cause().map(|c| c.row), Some(row));
 }
 
@@ -485,7 +492,7 @@ proptest! {
         if let Some(after) = retire_after_ms {
             mesh.run_until(start + Duration::from_millis(after));
             // A tip past the propagation window retires the block at A.
-            mesh.step_table(0, BlockInput::TipHeight { height: MESH_HEIGHT + PROPAGATION_DEPTH + 1 });
+            mesh.step_table(0, BlockInput::TipHeight { height: MESH_HEIGHT + PROPAGATION_DEPTH + 1, hash: TEST_TIP_HASH });
         }
         mesh.run_until(start + Duration::from_secs(3));
 
@@ -966,7 +973,9 @@ fn unwritten_want_ends_count_against_the_live_want_limit() {
     let config = PeerConfig::for_profile(Profile::TINY);
     let now = Instant::now();
     let unknown = block::Hash([0xAB; 32]);
-    let want = |want_id| recv_want(want_id, unknown, 0, &[0]);
+    // Each `Want` asks for its own stripe: a `Want` whose end is unwritten is
+    // still live, so a repeated set would overlap it.
+    let want = |want_id| recv_want(want_id, unknown, want_id, &[0]);
     let hard_limit = MAX_WANTS_INFLIGHT * 2;
 
     let mut peer = PeerState::new(config, node_id(2), 1);
@@ -1334,13 +1343,27 @@ fn decision24_holder_flags_then_pushes_its_seeds_but_not_to_the_proposer() {
         .step(now, ready(block_id, vec![2], true))
         .outputs
         .is_empty());
+}
 
-    // The proposer's session gets no push.
+/// decision-32: a pushed seed this node got from another peer, or rebuilt,
+/// reaches the proposer as a plain `Have`, never as a push.
+#[test]
+fn decision32_a_pushed_seed_is_announced_to_the_proposer_not_pushed() {
+    let block_id = block::Hash([0x6D; 32]);
+    let now = Instant::now();
+
     let mut to_proposer = push_session(node_id(2), block_id);
-    assert!(to_proposer
-        .step(now, ready(block_id, vec![0], true))
-        .outputs
-        .is_empty());
+    assert_eq!(
+        to_proposer
+            .step(now, ready(block_id, vec![0], true))
+            .outputs,
+        vec![PeerOutput::SendHave {
+            block_id,
+            flags: HaveFlags::Plain,
+            indices: vec![0],
+        }]
+    );
+    to_proposer.assert_invariants();
 }
 
 /// 03 §5.4: when the peer announces or sends a part this node pushes to
@@ -1536,7 +1559,7 @@ fn admit_tiny(peer: &mut PeerState, block_id: block::Hash, now: Instant) -> Peer
     peer.step(now, admitted(block_id, tiny(), node_id(2)))
 }
 
-fn tiny_part_prefix(block_id: block::Hash, index: u32) -> PeerInput {
+pub(super) fn tiny_part_prefix(block_id: block::Hash, index: u32) -> PeerInput {
     PeerInput::RecvPartPrefix(RecvPartPrefix {
         block_id,
         index,
@@ -1978,6 +2001,96 @@ fn proposer_seeds_ahead_of_its_header_meta_are_accepted_and_relayed() {
     for node in [a, h, x] {
         assert!(mesh.verified(node, &block_id), "node {node} assembled");
     }
+}
+
+/// decision-32: every neighbour announces to the proposer each part it
+/// holds verified, received or reconstructed, that the proposer did not send
+/// it, and never sends the proposer a part. The proposer keeps every link open.
+#[test]
+fn decision32_neighbours_announce_to_the_proposer_the_parts_it_did_not_send_them() {
+    let peer_cfg = PeerConfig::for_profile(Profile::TINY);
+    let mut mesh = MachineMesh::new(4, BlockConfig::for_profile(Profile::TINY));
+    let p = 0;
+    let fast = LinkProfile::new(Duration::from_millis(5), 1_000_000);
+    for (a, b) in [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)] {
+        mesh.connect(a, b, fast, fast, peer_cfg, None, None);
+    }
+    let block_id = block::Hash([0x9B; 32]);
+    let encoded = encode_body(&Profile::TINY, &[0x3B; 256], 2).unwrap();
+    let total = encoded.coding.total_parts().unwrap();
+    let envelope = make_envelope(
+        block_id,
+        encoded.coding,
+        encoded.part_root,
+        mesh.nodes[p].id,
+    );
+    mesh.propose(p, envelope, encoded.parts);
+    let start = mesh.now;
+    mesh.run_until(start + Duration::from_secs(3));
+
+    mesh.assert_honest_links_open();
+    let mut heard_from_others = 0;
+    for neighbour in 1..4 {
+        assert!(mesh.verified(neighbour, &block_id));
+        assert!(
+            mesh.sent_parts(neighbour, p, &block_id).is_empty(),
+            "neighbour {neighbour} never sends the proposer a part"
+        );
+        let from_proposer = mesh.sent_parts(p, neighbour, &block_id);
+        let announced = mesh.announced(neighbour, p, &block_id);
+        assert!(
+            announced.iter().all(|index| !from_proposer.contains(index)),
+            "neighbour {neighbour} announced a part the proposer sent it"
+        );
+        // A neighbour that decoded holds every part, so it announces every
+        // index the proposer did not send it.
+        let held: Vec<u32> = (0..total)
+            .filter(|index| !from_proposer.contains(index))
+            .collect();
+        assert_eq!(
+            announced, held,
+            "neighbour {neighbour} announced every part the proposer lacks a record of sending"
+        );
+        heard_from_others += announced.len();
+    }
+    assert!(
+        heard_from_others > 0,
+        "some neighbour took a part from another peer"
+    );
+}
+
+/// decision-32: the proposer's session takes a neighbour's plain `Have`s
+/// without asking for parts or faulting the neighbour, before and after
+/// it retires the block.
+#[test]
+fn decision32_the_proposer_hears_haves_without_closing() {
+    let block_id = block::Hash([0x6C; 32]);
+    let now = Instant::now();
+    let mut proposer = session(node_id(2), now, proposing(block_id, tiny()));
+    proposer.step(now, recv_meta(block_id));
+
+    let step = proposer.step(now, have_with(block_id, HaveFlags::Plain, vec![0, 2]));
+    assert!(step.events.contains(&PeerEvent::ProposerHeardHave {
+        block_id,
+        indices: vec![0, 2],
+    }));
+    assert!(!step.outputs.iter().any(|o| matches!(
+        o,
+        PeerOutput::PeerHas { .. } | PeerOutput::CloseProtocol(_) | PeerOutput::CloseNeutralStall
+    )));
+    proposer.assert_invariants();
+
+    proposer.step(
+        now,
+        PeerInput::Retire(Retire {
+            block_id,
+            stripes: tiny().stripes,
+            n: tiny().n,
+        }),
+    );
+    proposer.step(now, have_with(block_id, HaveFlags::Plain, vec![1, 3]));
+    assert!(proposer.close_cause().is_none());
+    proposer.assert_invariants();
 }
 
 /// An index this session already announced with a plain `Have`, sent or

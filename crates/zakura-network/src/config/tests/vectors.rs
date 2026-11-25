@@ -1770,8 +1770,8 @@ fn zakura_secret_key_text_forms_keep_their_node_id() {
     const SEED_HEX: &str = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60";
     const SEED_BASE32: &str = "TVQ3DHPP7VNGBOUEJL2JF3BMYRCETRLJPMZGSGLQHOWAGHFOP5QA";
     // The node ID of the key list that holds that public key, `d75a98...511a`,
-    // and the fingerprint of the ML-DSA-44 key the same seed derives.
-    const NODE_ID: &str = "78333d017dc319f798578d82bcdafb434f582cf38b98bc85e4b17bfde89a4c53";
+    // and the fingerprint of the ML-DSA-65 key the same seed derives.
+    const NODE_ID: &str = "12ffc5e1bb88a852797a9b981b411a1b6a87f73aa3758e967d3c0d2bada0cddd";
 
     let key_dir = tempfile::tempdir().expect("failed to create temp key dir");
     let key_file = key_dir.path().join("mainnet.zakura-iroh-secret-key");
@@ -3003,7 +3003,7 @@ fn block_download_score_and_hedge_is_off_by_default_and_rejects_unknown_keys() {
     );
 }
 
-/// The Mainnet defaults before p2p-v2/4, as configs written then spell them out.
+/// The p2p-v2/3 Mainnet defaults, as configs written then spell them out.
 const RETIRED_MAINNET_DEFAULTS: [&str; 9] = [
     "1398f62c6d1a457c51ba6a4b5f3dbd2f69fca93216218dc8997e416bd17d93ca@165.22.54.66:8234",
     "fd1724385aa0c75b64fb78cd602fa1d991fdebf76b13c58ed702eac835e9f618@104.131.184.123:8234",
@@ -3016,7 +3016,7 @@ const RETIRED_MAINNET_DEFAULTS: [&str; 9] = [
     "85e425233a68697d4be91dd5d542305a8a327cd06d992d53c0913cef2fa75084@168.144.173.250:8234",
 ];
 
-/// The Testnet defaults before p2p-v2/4.
+/// The p2p-v2/3 Testnet defaults.
 const RETIRED_TESTNET_DEFAULTS: [&str; 3] = [
     "57ad39fad4f0bca46cf1ea831772a99d5027b372fef2be5a0ea68e1b5bb4da49@167.99.103.111:8234",
     "2bbb907b5d90598ef49f2e637066586b311a64587479be6ed43e8388587fcd2a@164.92.209.78:8234",
@@ -3043,6 +3043,13 @@ fn retired_default_entries_map_onto_the_current_defaults() {
         assert_eq!(replace_one(old).as_deref(), Some(*current), "{old}");
         assert_eq!(replace_one(current), None, "{current}");
     }
+}
+
+#[test]
+fn only_the_version_3_seed_pin_is_migrated() {
+    let protocol_4_seed =
+        "a5f148b592404c5fcdc27f06919681c1dceddb274336abf5c91e70780471bc12@165.22.54.66:8234";
+    assert_eq!(replace_one(protocol_4_seed), None);
 }
 
 #[test]

@@ -78,7 +78,7 @@ rpc() {
 
 # metric <port> <series> -> counter value (0 if absent). <series> is a metric
 # name, or a name with its labels exactly as /metrics renders them, such as
-# 'zakura_quic_tls_key_exchange{group="X25519MLKEM768"}'.
+# 'zakura_quic_tls_key_exchange{group="X25519MLKEM1024"}'.
 metric() {
   local port="$1" name="$2"
   container_http "${port}" "/metrics" "" 5 2>/dev/null \
@@ -101,12 +101,12 @@ wait_metric_at_least() {
 
 # The only v2 TLS series a node may export: the hybrid key-exchange group
 # (zakura-quic TLS-9) and the composite signature scheme (TLS-4).
-PQ_KEY_EXCHANGE_SERIES='zakura_quic_tls_key_exchange{group="X25519MLKEM768"}'
-PQ_SIGNATURE_SERIES='zakura_quic_tls_signature_verified{scheme="ed25519_mldsa44"}'
+PQ_KEY_EXCHANGE_SERIES='zakura_quic_tls_key_exchange{group="X25519MLKEM1024"}'
+PQ_SIGNATURE_SERIES='zakura_quic_tls_signature_verified{scheme="ed25519_mldsa65"}'
 
 # assert_post_quantum_handshakes <metrics-port> <label>
-# Requires at least one completed X25519MLKEM768 key exchange and one verified
-# Ed25519+ML-DSA-44 handshake signature, and no other group or scheme.
+# Requires at least one completed X25519MLKEM1024 key exchange and one verified
+# Ed25519+ML-DSA-65 handshake signature, and no other group or scheme.
 assert_post_quantum_handshakes() {
   local port="$1" label="$2" other
   wait_metric_at_least "${port}" "${PQ_KEY_EXCHANGE_SERIES}" 1 "${label}"
@@ -119,7 +119,7 @@ assert_post_quantum_handshakes() {
     || fail "could not read ${label} /metrics"
   printf '  %s other TLS groups or schemes: %s (want none)\n' "${label}" "${other:-none}"
   [[ -z "${other}" ]] || fail \
-    "${label} ran v2 handshakes outside X25519MLKEM768 and Ed25519+ML-DSA-44: ${other}"
+    "${label} ran v2 handshakes outside X25519MLKEM1024 and Ed25519+ML-DSA-65: ${other}"
 }
 
 wait_ready() {

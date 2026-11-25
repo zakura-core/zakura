@@ -11,17 +11,17 @@ const SEED_IDS: [(&str, &str); 3] = [
     // asia-0
     (
         "1398f62c6d1a457c51ba6a4b5f3dbd2f69fca93216218dc8997e416bd17d93ca",
-        "a5f148b592404c5fcdc27f06919681c1dceddb274336abf5c91e70780471bc12",
+        "078a60720f0d474743a51674b152f49f575704a77905c16475683cff9d18f246",
     ),
     // us-east-0
     (
         "9ec67ad6834bc2ca0d659c240e042d3446c37cabcc092b527d459c87d938b4a4",
-        "ca22584f4392a26c46f9553e45db00fc8de06f1ff8f2c48f5d28b5cd58f134b6",
+        "a98d73e0114f9f8ae3d5a0b4ec0b8cef20b51d715de6898a39fc3f23948196b7",
     ),
     // zakura-testnet-1
     (
         "57ad39fad4f0bca46cf1ea831772a99d5027b372fef2be5a0ea68e1b5bb4da49",
-        "672cb8d35831d6020f14e35215de0f7fc1ee771ecd3c9d5fe67c32acb0b53fab",
+        "884eb8c4e0d6005bd3a6e086df064efc12b866632dababa4249b2ceb42d43982",
     ),
 ];
 

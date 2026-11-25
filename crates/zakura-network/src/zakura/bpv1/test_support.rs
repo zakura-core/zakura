@@ -9,15 +9,10 @@ use std::{
 };
 
 use zakura_chain::{
-    amount::Amount,
-    block::{
-        self, genesis::regtest_genesis_block, merkle::AuthDataRoot, Block,
-        ChainHistoryBlockTxAuthCommitmentHash, ChainHistoryMmrRootHash, Header, Height,
-    },
-    parameters::{testnet::ConfiguredActivationHeights, Network, NetworkUpgrade},
+    block::{self, Block, Header, Height},
+    parameters::Network,
     serialization::ZcashSerialize,
-    transaction::{LockTime, Transaction},
-    transparent::{self, Output, Script},
+    transaction::Transaction,
 };
 use zakura_node_services::{
     block_memory::{DecodedBlockPool, OwnedBlock},
@@ -53,6 +48,7 @@ use super::{
     },
     service::{Bpv1Handle, Bpv1Ports, Bpv1Service, Bpv1Startup},
     tree::VerifiedPart,
+    unknown_parent::UnknownParentVerdict,
     wire::{
         encode_part_frame, part_payload_len, Bpv1Message, HaveFlags, WantBitmap, WantEndReason,
         BPV1_CONTROL_KIND, BPV1_DATA_KIND, ZAKURA_CAP_BPV1,
@@ -62,6 +58,11 @@ use crate::zakura::{
     memory::{Consumer, ConsumerSpec, MemoryPool, PoolConfig},
     transport::{framed_channel, Peer, Service},
     ServicePeerDirection, ZakuraPeerId,
+};
+
+use super::fuzz::chain::v6_tx;
+pub(super) use super::fuzz::chain::{
+    block_of, build_v6_coinbase, build_v6_tx, committed_coinbase, regtest_nu7, regtest_nu7_at,
 };
 
 // ============================================================================
@@ -78,98 +79,6 @@ pub(super) fn part_frame(coding: &Coding, index: u32) -> Vec<u8> {
 /// in an unoptimized build. BPv1 machines only compare and hash node ids.
 pub(super) fn node_id(b: u8) -> NodeId {
     NodeId::from_bytes(&[b; 32])
-}
-
-/// Regtest with NU7 active from height 1.
-pub(super) fn regtest_nu7() -> Network {
-    regtest_nu7_at(1)
-}
-
-/// Regtest with NU7 active from `height`.
-pub(super) fn regtest_nu7_at(height: u32) -> Network {
-    Network::new_regtest(
-        ConfiguredActivationHeights {
-            nu7: Some(height),
-            ..Default::default()
-        }
-        .into(),
-    )
-}
-
-/// A synthetic non-coinbase v6 transaction with an identifying tag.
-pub(super) fn build_v6_tx(height: Height, tag: u8) -> Transaction {
-    v6_tx(height, tag, 1_000, &[0x6a, 0x01, tag])
-}
-
-/// A v6 transaction at `height` spending a `tag`-derived outpoint into one
-/// output paying `value` to `script`.
-fn v6_tx(height: Height, tag: u8, value: i64, script: &[u8]) -> Transaction {
-    Transaction::V6 {
-        network_upgrade: NetworkUpgrade::Nu7,
-        lock_time: LockTime::min_lock_time_timestamp(),
-        expiry_height: height,
-        inputs: vec![transparent::Input::PrevOut {
-            outpoint: transparent::OutPoint {
-                hash: zakura_chain::transaction::Hash([tag; 32]),
-                index: 0,
-            },
-            unlock_script: Script::new(&[0x51]),
-            sequence: u32::MAX,
-        }],
-        outputs: vec![Output::new(
-            Amount::try_from(value).expect("valid test zatoshi"),
-            Script::new(script),
-        )],
-        sapling_shielded_data: None,
-        orchard_shielded_data: None,
-        ironwood_shielded_data: None,
-    }
-}
-
-/// A post-NU7 v6 coinbase paying `value` to `script`, then `extra_outputs`,
-/// with `input_extra` appended to the coinbase data.
-pub(super) fn build_v6_coinbase(
-    height: Height,
-    script: &[u8],
-    value: i64,
-    extra_outputs: Vec<Output>,
-    input_extra: &[u8],
-) -> Transaction {
-    let mut outputs = vec![Output::new(
-        Amount::try_from(value).expect("valid test zatoshi"),
-        Script::new(script),
-    )];
-    outputs.extend(extra_outputs);
-    let mut data = vec![0x01, 0x01];
-    data.extend_from_slice(input_extra);
-    Transaction::V6 {
-        network_upgrade: NetworkUpgrade::Nu7,
-        lock_time: LockTime::min_lock_time_timestamp(),
-        expiry_height: height,
-        inputs: vec![transparent::Input::Coinbase {
-            height,
-            data,
-            sequence: u32::MAX,
-        }],
-        outputs,
-        sapling_shielded_data: None,
-        orchard_shielded_data: None,
-        ironwood_shielded_data: None,
-    }
-}
-
-/// A v6 coinbase whose second output carries `commit_script`.
-pub(super) fn committed_coinbase(height: Height, commit_script: &[u8]) -> Transaction {
-    build_v6_coinbase(
-        height,
-        &[0x51],
-        1_000_000,
-        vec![Output::new(
-            Amount::try_from(0).expect("valid test zatoshi"),
-            Script::new(commit_script),
-        )],
-        &[],
-    )
 }
 
 /// A v6 transaction at `height` whose `OP_RETURN` output carries
@@ -213,35 +122,22 @@ pub(super) fn solved_block_of(
     block_of(lcr, txs)
 }
 
-/// A block holding `txs` under a genesis-derived header whose Merkle root and
-/// block commitment cover them and the light-client root `lcr`.
-pub(super) fn block_of(lcr: [u8; 32], txs: Vec<Arc<Transaction>>) -> Block {
-    let block_commitment = ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
-        &ChainHistoryMmrRootHash::from(lcr),
-        &txs.iter().map(|t| t.as_ref()).collect::<AuthDataRoot>(),
-    );
-    let mut header = *regtest_genesis_block().header;
-    header.merkle_root = txs.iter().map(|t| t.as_ref()).collect();
-    *header.commitment_bytes = <[u8; 32]>::from(block_commitment);
-    Block {
-        header: Arc::new(header),
-        transactions: txs,
-    }
-}
-
 /// Header admission that admits every header at the given height.
 pub(super) struct AcceptingHeaderAdmission(pub(super) u32);
 
 impl HeaderAdmissionPort for AcceptingHeaderAdmission {
     fn admit(
         &self,
-        _header: Arc<Header>,
+        header: Arc<Header>,
         _source_peer: NodeId,
         _session_gen: u64,
         _work_id: WorkId,
     ) -> PortFuture<'_, HeaderAdmissionResult> {
-        let height = self.0;
-        Box::pin(async move { HeaderAdmissionResult::Admitted { height } })
+        let result = HeaderAdmissionResult::Admitted {
+            height: self.0,
+            parent_hash: header.previous_block_hash,
+        };
+        Box::pin(async move { result })
     }
 }
 
@@ -281,8 +177,34 @@ impl BlockVerifierPort for ScriptedVerifier {
     }
 }
 
+/// A committed snapshot whose verified tip and best header are both at `height`.
+fn snapshot_at(height: u32) -> zakura_header_chain::EngineSnapshot {
+    let tip = zakura_header_chain::Frontier {
+        height: Height(height),
+        hash: block::Hash([0xEE; 32]),
+    };
+    zakura_header_chain::EngineSnapshot {
+        mode: zakura_header_chain::EngineMode::Integrated,
+        state_version: zakura_header_chain::StateVersion::new(1),
+        header_generation: zakura_header_chain::HeaderGeneration::new(1),
+        verified_generation: zakura_header_chain::VerifiedGeneration::new(1),
+        frontiers: zakura_header_chain::FrontierSet {
+            finalized: tip,
+            header_best: tip,
+            verified_best: tip,
+        },
+        header_best_score: zakura_header_chain::ChainScore::new(
+            zakura_header_chain::SuffixWork::zero(),
+            tip.hash,
+        ),
+        oldest_retained_height: tip.height,
+        alarms: zakura_header_chain::AlarmSet::default(),
+    }
+}
+
 /// Ports that admit every header at `height`, keep bodies in a four-block
-/// pool, verify with `verifier`, and claim bodies in `claims`.
+/// pool, verify with `verifier`, and claim bodies in `claims`. The committed
+/// snapshot puts the verified tip at the parent height.
 pub(super) fn ports(
     height: u32,
     verifier: impl BlockVerifierPort,
@@ -295,7 +217,7 @@ pub(super) fn ports(
         ))),
         verifier: Arc::new(verifier),
         fallback: Arc::new(claims),
-        committed_snapshots: watch::channel(None).1,
+        committed_snapshots: watch::channel(Some(snapshot_at(height.saturating_sub(1)))).1,
     }
 }
 
@@ -463,6 +385,10 @@ pub(super) fn connect_pair(
     svc_b.add_peer(peer_b);
 }
 
+/// The verified tip hash, and the parent hash headerchain reports, in table
+/// tests. A block one above the verified tip then extends it.
+pub(super) const TEST_TIP_HASH: block::Hash = block::Hash([0; 32]);
+
 /// A metadata envelope whose header bytes are the block hash.
 pub(super) fn make_envelope(
     block_id: block::Hash,
@@ -509,7 +435,10 @@ pub(super) fn admit_meta(
         now,
         BlockInput::HeaderAdmitted {
             work_id: admit_work(&s1),
-            result: HeaderAdmissionResult::Admitted { height },
+            result: HeaderAdmissionResult::Admitted {
+                height,
+                parent_hash: TEST_TIP_HASH,
+            },
         },
     );
     let s3 = table.step(
@@ -938,6 +867,32 @@ impl MachineMesh {
         flagged
     }
 
+    /// Indices `from` announced to `to`, flagged or not.
+    pub(super) fn announced(&self, from: usize, to: usize, block_id: &block::Hash) -> Vec<u32> {
+        let mut announced: Vec<u32> = self
+            .wire
+            .announced
+            .iter()
+            .filter(|&&(f, t, b, _)| f == from && t == to && b == *block_id)
+            .map(|&(.., index)| index)
+            .collect();
+        announced.sort_unstable();
+        announced
+    }
+
+    /// Indices whose parts `from` sent to `to`.
+    pub(super) fn sent_parts(&self, from: usize, to: usize, block_id: &block::Hash) -> Vec<u32> {
+        let mut sent: Vec<u32> = self
+            .wire
+            .parts
+            .iter()
+            .filter(|&&(f, t, b, _)| f == from && t == to && b == *block_id)
+            .map(|&(.., index)| index)
+            .collect();
+        sent.sort_unstable();
+        sent
+    }
+
     pub(super) fn verified(&self, node: usize, block_id: &block::Hash) -> bool {
         self.nodes[node].verified.contains_key(block_id)
     }
@@ -1069,8 +1024,8 @@ impl MachineMesh {
         }
     }
 
-    /// The node's shell work, completed at once: header admission and
-    /// commitment checks pass, stripe jobs run inline, and the verifier
+    /// The node's shell work, completed at once: header admission, the
+    /// unknown-parent checks, and commitment checks pass, stripe jobs run inline, and the verifier
     /// accepts.
     fn shell(&mut self, node: usize, output: BlockOutput) {
         let input = match output {
@@ -1078,7 +1033,12 @@ impl MachineMesh {
                 work_id,
                 result: HeaderAdmissionResult::Admitted {
                     height: MESH_HEIGHT,
+                    parent_hash: TEST_TIP_HASH,
                 },
+            },
+            BlockOutput::CheckUnknownParent { work_id, .. } => BlockInput::UnknownParentChecked {
+                work_id,
+                verdict: UnknownParentVerdict::Park,
             },
             BlockOutput::VerifyCommitment { work_id, .. } => {
                 let peers = self.nodes[node]
@@ -1122,7 +1082,9 @@ impl MachineMesh {
             BlockOutput::ClosePeer { peer, row, .. } => {
                 panic!("mesh metadata is valid, but the table closed {peer:?} with {row:?}")
             }
-            BlockOutput::ClaimBody { .. } | BlockOutput::ReleaseBodyClaim { .. } => return,
+            BlockOutput::ClaimBody { .. }
+            | BlockOutput::ExtendBodyClaim { .. }
+            | BlockOutput::ReleaseBodyClaim { .. } => return,
             routed => unreachable!("route_block_output keeps {routed:?} off the shell"),
         };
         self.step_table(node, input);
@@ -1179,7 +1141,10 @@ impl MachineMesh {
                 self.send(node, peer, MeshFrame::Part { block_id, part });
             }
             PeerOutput::SendWantEnd { want_id, sent, .. } => {
-                self.send(node, peer, MeshFrame::WantEnd { want_id, sent })
+                self.send(node, peer, MeshFrame::WantEnd { want_id, sent });
+                // The mesh hands each frame to its link at once, so it
+                // reports the end written, as the data writer does.
+                self.step_peer(node, peer, PeerInput::WantEndWritten);
             }
             PeerOutput::ServeWant {
                 want_id,

@@ -130,25 +130,25 @@ pub const DEFAULT_ZAKURA_LISTEN_ADDR: SocketAddr =
     SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 8234));
 /// Default native Zakura bootstrap peers for Mainnet.
 ///
-/// Entries name each seed by its protocol 4 node ID, which derives from keys
+/// Entries name each seed by its protocol 5 node ID, which derives from keys
 /// only the seed holds. Take a new ID from the line the seed logs at startup;
 /// a stale ID fails the dial's identity check.
 pub const DEFAULT_MAINNET_ZAKURA_BOOTSTRAP_PEERS: &[&str] = &[
-    "a5f148b592404c5fcdc27f06919681c1dceddb274336abf5c91e70780471bc12@165.22.54.66:8234",
-    "10e8b19b6aabb5ccd80d2df14fabc991602aea0cfb82783ebdabb3b1b699e9b7@104.131.184.123:8234",
-    "ca22584f4392a26c46f9553e45db00fc8de06f1ff8f2c48f5d28b5cd58f134b6@159.65.183.89:8234",
-    "27fec1ed7f52ca389f8ad09e79e896fe6f0097dea6d74b71628dce992cb50b57@143.244.184.176:8234",
-    "a4ef400514ea1eaceea73e2b1a86f4102264e88cfc8b3ace9da73d43c7ccb7c2@159.203.38.10:8234",
-    "9addeca7e4ea8aced48fcf9e3a9f8ce21056fecf9c0bbce368b61ec35b4e5bdc@64.227.44.93:8234",
-    "5f0cc2933a058472140348ebe708ff7a10167cd7e9cd96fa19263ecdf62a3fbe@161.35.156.226:8234",
-    "6a13975563f5883fda0b8b0b1cee54163dedf786dc8f1b4990d2130e7cc56b51@139.59.64.115:8234",
-    "a8a2de1c199100dcd1e7985a30a6a07858d45ee3703794d9d214827724067431@168.144.173.250:8234",
+    "078a60720f0d474743a51674b152f49f575704a77905c16475683cff9d18f246@165.22.54.66:8234",
+    "1bb8f2f70bdbf9d44ef2ccc3de1a5cbbba56cea2cf371e227d501ce19a8bdeb9@104.131.184.123:8234",
+    "a98d73e0114f9f8ae3d5a0b4ec0b8cef20b51d715de6898a39fc3f23948196b7@159.65.183.89:8234",
+    "02ef9b05d81ad2f6176a68fd047bda5e4e277d69ac51b3b2536d43ea8f38de1c@143.244.184.176:8234",
+    "0018a0f4fc1f3cc3b4a84e8ebcb77008343c9e54fb80f77fd03271c7a33063b7@159.203.38.10:8234",
+    "4607c5353e2c07ecd10d73c6c19d0b0de092939328f33e8f04d5ced382fadf7b@64.227.44.93:8234",
+    "8ac35544d02141e7a3cc3c8b8661a3e726985a266673b60cf45f5b33c3f36e73@161.35.156.226:8234",
+    "42623a00c2632e0cf99d1c10cec024b0217d12d5fecc91947a3a040f142df06b@139.59.64.115:8234",
+    "ba06d75332e3a430d4e838b5838a2356338124cf2930bb0f8e2962e01223ed95@168.144.173.250:8234",
 ];
 /// Default native Zakura bootstrap peers for Testnet.
 pub const DEFAULT_TESTNET_ZAKURA_BOOTSTRAP_PEERS: &[&str] = &[
-    "672cb8d35831d6020f14e35215de0f7fc1ee771ecd3c9d5fe67c32acb0b53fab@167.99.103.111:8234",
-    "3783033db00b137ed3d11cf2d30853fce65db4967d3910bb66ff4d14191764c9@164.92.209.78:8234",
-    "fe1f7911e1675f0f3cfb17033a71ff2221d03d9f170b0209a73deba439886efe@206.189.148.0:8234",
+    "884eb8c4e0d6005bd3a6e086df064efc12b866632dababa4249b2ceb42d43982@167.99.103.111:8234",
+    "1d0dd618bb699637322dcbf20a0830fe9078733ba13c3ee01768bfb518653064@164.92.209.78:8234",
+    "b5410aedf93d00bbc9f93405a4c054b30289da9b76269432a5e6e0e132f0480c@206.189.148.0:8234",
 ];
 /// Default native Zakura bootstrap peers.
 pub const DEFAULT_ZAKURA_BOOTSTRAP_PEERS: &[&str] = DEFAULT_MAINNET_ZAKURA_BOOTSTRAP_PEERS;
@@ -386,8 +386,8 @@ pub struct ZakuraConfig {
     /// are disabled for Zakura v1. Each entry must contain the peer's 32-byte
     /// node id and a directly reachable socket address.
     ///
-    /// An entry can still name a default seed by the node ID it had before
-    /// p2p-v2/4, which [`replace_retired_seed_node_ids`](Self::replace_retired_seed_node_ids)
+    /// An entry can still name a default seed by its p2p-v2/3 node ID, which
+    /// [`replace_retired_seed_node_ids`](Self::replace_retired_seed_node_ids)
     /// switches to the seed's current ID.
     pub bootstrap_peers: Vec<String>,
     /// Address the native Zakura QUIC endpoint binds to.
@@ -3571,7 +3571,7 @@ fn registry_streams(registry: &ServiceRegistry) -> impl Iterator<Item = Stream> 
         .flat_map(|service| service.streams().iter().copied())
 }
 
-/// zakura-quic acceptor for the Zakura `p2p-v2/4` ALPN.
+/// zakura-quic acceptor for the Zakura `p2p-v2/5` ALPN.
 #[derive(Debug, Clone)]
 pub struct ZakuraProtocolHandler {
     supervisor: ZakuraSupervisorHandle,

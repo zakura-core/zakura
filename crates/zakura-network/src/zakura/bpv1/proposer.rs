@@ -64,7 +64,7 @@ impl ProposerConfig {
 pub struct PreparedCommitment {
     /// 32-byte commitment hash `C`.
     pub commitment_hash: [u8; 32],
-    /// Exact 39-byte `OP_RETURN` script (`6a 25 BPV1 01 C`).
+    /// Exact 37-byte `OP_RETURN` script (`6a 23 BP 01 C`).
     pub script: [u8; COMMITMENT_SCRIPT_LEN],
     /// Coding tuple committed by `C`.
     pub coding: Coding,
@@ -501,6 +501,20 @@ impl ProposerState {
         });
     }
 
+    /// Returns this proposer's `C` for an encoding with `coding` and `part_root`.
+    ///
+    /// It retains nothing, so a solve cannot match it unless a template
+    /// registers the body.
+    pub fn commitment_hash(&self, coding: Coding, part_root: [u8; 32]) -> [u8; 32] {
+        commit_hash(&CommitmentFields {
+            chain_id: self.config.chain_id,
+            profile_id: W2_PROFILE_ID,
+            coding,
+            part_root,
+            proposer_node: self.config.local_node,
+        })
+    }
+
     fn build_commitment(
         &self,
         coding: Coding,
@@ -510,13 +524,7 @@ impl ProposerState {
         let Waiter {
             light_client_root, ..
         } = *waiter;
-        let commitment_hash = commit_hash(&CommitmentFields {
-            chain_id: self.config.chain_id,
-            profile_id: W2_PROFILE_ID,
-            coding,
-            part_root,
-            proposer_node: self.config.local_node,
-        });
+        let commitment_hash = self.commitment_hash(coding, part_root);
         PreparedCommitment {
             commitment_hash,
             script: commitment_script(commitment_hash),

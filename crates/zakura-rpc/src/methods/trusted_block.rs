@@ -156,6 +156,7 @@ where
                 registration,
                 early_relay,
                 committed_block: committed_block_lookup(self.read_state.clone()),
+                bpv1_proposer: self.gbt.bpv1_proposer(),
             },
             move |outcome| {
                 metrics::histogram!("rpc.trusted_submission.validation.duration_seconds")

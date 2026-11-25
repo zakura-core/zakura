@@ -17,16 +17,17 @@ use zakura_header_chain::{
     ChainScore, EngineMode, EngineSnapshot, Frontier, FrontierSet, HeaderGeneration, StateVersion,
     SuffixWork, VerifiedGeneration,
 };
-use zakura_node_services::body_claims::SharedBodyClaims;
+use zakura_node_services::{block_memory::OwnedBlock, body_claims::SharedBodyClaims};
 use zakura_quic::NodeId;
 use zakura_rt::{
     collections::HashMap,
     sync::{watch, CancellationToken},
+    time::Instant,
 };
 
 use super::{
-    blocks::{BlockPhase, HeaderAdmissionResult, VerifierVerdict, WorkId},
-    ports::{HeaderAdmissionPort, PortFuture},
+    blocks::{BlockPhase, HeaderAdmissionResult, VerifierVerdict, WorkId, RECONSTRUCTION_DEADLINE},
+    ports::{BlockVerifierPort, HeaderAdmissionPort, PortFuture},
     profile::Profile,
     service::{Bpv1Handle, Bpv1Ports},
     test_support::{
@@ -34,7 +35,7 @@ use super::{
         node_id, pair, ports, regtest_nu7, regtest_nu7_at, solved_block, start, wait_until,
         ScriptedVerifier,
     },
-    wire::{BPV1_CONTROL_KIND, BPV1_DATA_KIND, ZAKURA_CAP_BPV1},
+    wire::{BPV1_CONTROL_KIND, BPV1_DATA_KIND, PROPAGATION_DEPTH, ZAKURA_CAP_BPV1},
 };
 use crate::{
     config::Config,
@@ -182,17 +183,17 @@ async fn bpv1_proposer_hook_handles_post_nu7_pre_nu7_reuse_and_pool_coinbase() {
         "pre-NU7 template must not receive a BPv1 commitment"
     );
 
-    // 2. Post-NU7 height produces a 37-byte `BPV1 || 0x01 || C` null-data payload.
+    // 2. Post-NU7 height produces a 35-byte `BP || 0x01 || C` null-data payload.
     let payload1 = handle_a
         .prepare_template_commitment(lcr, Height(12), 2, &tx1_bytes)
         .expect("post-NU7 template with live peer gets commitment");
-    assert_eq!(&payload1[..5], b"BPV1\x01");
+    assert_eq!(&payload1[..3], b"BP\x01");
 
     // 3. Second call with same body (header-only template refresh) succeeds via opt-8 reuse.
     let payload2 = handle_a
         .prepare_template_commitment(lcr, Height(12), 2, &tx1_bytes)
         .expect("header-only refresh reuses encoding");
-    assert_eq!(&payload2[..5], b"BPV1\x01");
+    assert_eq!(&payload2[..3], b"BP\x01");
 
     // 4. Pool-built coinbase without a BPv1 commitment returns false (falls back to existing relay).
     let pool_cb = build_v6_coinbase(Height(12), &[0x51], 1_000_000, vec![], &[]);
@@ -205,14 +206,80 @@ async fn bpv1_proposer_hook_handles_post_nu7_pre_nu7_reuse_and_pool_coinbase() {
         "pool-built coinbase without commitment must fall back to existing relay"
     );
 
-    // 5. Solved block carrying the committed OP_RETURN BPV1 01 C output publishes via BPv1!
-    let mut full_script = vec![0x6a, 0x25];
+    // 5. Solved block carrying the committed OP_RETURN BP 01 C output publishes via BPv1!
+    let mut full_script = vec![0x6a, 0x23];
     full_script.extend_from_slice(&payload2);
     let cb = committed_coinbase(Height(12), &full_script);
     let solved = Arc::new(block_of(lcr, vec![Arc::new(cb), Arc::new(tx1)]));
     assert!(
         Bpv1ProposerHook::publish_solved_block(&handle_a, solved, Height(12)),
         "committed post-NU7 block must publish via BPv1ProposerHook"
+    );
+
+    shutdown.cancel();
+}
+
+/// F-880: a long poll's precompute asks for the empty body's payload before
+/// the new tip is known. The answer matches the payload a registered empty
+/// template gets, and it retains nothing, so every issued template still
+/// publishes.
+#[tokio::test]
+async fn empty_template_commitment_matches_and_keeps_issued_templates() {
+    use super::proposer::MAX_PREPARED_ENCODINGS;
+    use zakura_node_services::bpv1_proposer::Bpv1ProposerHook;
+
+    let network = regtest_nu7_at(10);
+    let shutdown = CancellationToken::new();
+    let (id_a, id_b) = (node_id(53), node_id(54));
+    let tiny = |id| {
+        start(
+            Profile::TINY,
+            network.clone(),
+            id,
+            Bpv1Ports::default(),
+            &shutdown,
+        )
+    };
+    let ((svc_a, handle_a), (svc_b, _handle_b)) = (tiny(id_a), tiny(id_b));
+    connect(&svc_a, id_a, &svc_b, id_b, &shutdown);
+
+    assert_eq!(
+        handle_a.empty_template_commitment(Height(5)),
+        None,
+        "pre-NU7"
+    );
+
+    // Issue as many templates as the proposer retains encodings for.
+    let lcr = [0x44; 32];
+    let issued: Vec<_> = (1..=MAX_PREPARED_ENCODINGS)
+        .map(|tag| {
+            let tx = build_v6_tx(Height(12), u8::try_from(tag).unwrap());
+            let tx_bytes = tx.zcash_serialize_to_vec().unwrap();
+            let payload = handle_a
+                .prepare_template_commitment(lcr, Height(12), 2, &tx_bytes)
+                .expect("post-NU7 template with live peer gets commitment");
+            (tx, payload)
+        })
+        .collect();
+
+    let precomputed = handle_a
+        .empty_template_commitment(Height(12))
+        .expect("post-NU7 with a live peer");
+
+    // The oldest issued template still publishes.
+    let (tx, payload) = issued[0].clone();
+    let script = [&[0x6a, 0x23][..], &payload].concat();
+    let cb = committed_coinbase(Height(12), &script);
+    let solved = Arc::new(block_of(lcr, vec![Arc::new(cb), Arc::new(tx)]));
+    assert!(
+        Bpv1ProposerHook::publish_solved_block(&handle_a, solved, Height(12)),
+        "the precompute must not evict an issued template"
+    );
+
+    // A registered empty template on another parent gets the same payload.
+    assert_eq!(
+        handle_a.prepare_template_commitment([0x5a; 32], Height(12), 1, &[]),
+        Some(precomputed)
     );
 
     shutdown.cancel();
@@ -412,6 +479,9 @@ async fn fix4_committed_snapshot_ends_a_fallback_block() {
     let shutdown = CancellationToken::new();
     let (handle_a, handle_b, snapshots_b) =
         proposer_and_follower(VerifierVerdict::LocalCapacity, &shutdown);
+    // With its parent committed, a retryable verdict falls back (bpv1-84).
+    let parent = Frontier::new(Height(9), block::Hash([0x09; 32]));
+    snapshots_b.send_replace(Some(engine_snapshot(parent, parent)));
 
     let fallen = solved_block(&handle_a, Height(10), 11);
     assert!(handle_a.publish_solved_block(&fallen, 10));
@@ -447,7 +517,10 @@ impl HeaderAdmissionPort for ParentGatedHeaderAdmission {
     ) -> PortFuture<'_, HeaderAdmissionResult> {
         self.calls.fetch_add(1, Ordering::AcqRel);
         let result = if self.parent_admitted.load(Ordering::Acquire) {
-            HeaderAdmissionResult::Admitted { height: 10 }
+            HeaderAdmissionResult::Admitted {
+                height: 10,
+                parent_hash: header.previous_block_hash,
+            }
         } else {
             HeaderAdmissionResult::MissingParent {
                 parent_hash: header.previous_block_hash,
@@ -522,6 +595,120 @@ async fn fix3_parent_admitted_through_snapshots_wakes_pending_child() {
     shutdown.cancel();
 }
 
+/// A verifier that answers a block only once the committed verified tip reaches
+/// `parent`, as the router waits for a missing parent. It records each
+/// submission.
+#[derive(Clone)]
+struct ParentWaitingVerifier {
+    snapshots: watch::Receiver<Option<EngineSnapshot>>,
+    parent: u32,
+    seen: Arc<std::sync::Mutex<Vec<block::Hash>>>,
+}
+
+impl ParentWaitingVerifier {
+    fn seen(&self) -> Vec<block::Hash> {
+        self.seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl BlockVerifierPort for ParentWaitingVerifier {
+    fn submit(&self, block: OwnedBlock, _work_id: WorkId) -> PortFuture<'_, VerifierVerdict> {
+        self.seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(block.hash());
+        let mut snapshots = self.snapshots.clone();
+        let parent = self.parent;
+        Box::pin(async move {
+            let committed = async {
+                while !snapshots
+                    .borrow_and_update()
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.frontiers.verified_best.height.0 >= parent)
+                {
+                    if snapshots.changed().await.is_err() {
+                        return false;
+                    }
+                }
+                true
+            };
+            match tokio::time::timeout(Duration::from_secs(10), committed).await {
+                Ok(true) => VerifierVerdict::Valid,
+                Ok(false) | Err(_) => VerifierVerdict::LocalCapacity,
+            }
+        })
+    }
+}
+
+/// The catch-up handoff (bpv1-76, bpv1-44, bpv1-82): while B's verified tip is
+/// more than `PROPAGATION_DEPTH` below a tip block, B leaves the block to block
+/// sync. Once block sync brings the verified tip close, B admits the next tip
+/// block and submits it once. The body claim covers the verifier's wait for the
+/// parent, and the block commits when the parent does.
+#[tokio::test]
+async fn bpv1_82_a_caught_up_node_verifies_the_next_tip_block_once() {
+    let shutdown = CancellationToken::new();
+    let height = 40;
+    let header_best = Frontier::new(Height(height - 1), block::Hash([0x27; 32]));
+    let verified_at = |h: u32| Frontier::new(Height(h), block::Hash([0x28; 32]));
+    let far_behind = verified_at(height - PROPAGATION_DEPTH - 14);
+    let (snapshots_b, committed_snapshots) =
+        watch::channel(Some(engine_snapshot(header_best, far_behind)));
+    let verifier_b = ParentWaitingVerifier {
+        snapshots: committed_snapshots.clone(),
+        parent: height - 1,
+        seen: Arc::default(),
+    };
+    let claims_b = SharedBodyClaims::new();
+    let ports_b = Bpv1Ports {
+        committed_snapshots,
+        ..ports(height, verifier_b.clone(), claims_b.clone())
+    };
+    let valid = ScriptedVerifier::new(VerifierVerdict::Valid);
+    let (handle_a, handle_b) = pair(
+        Profile::TINY,
+        ports(height, valid, SharedBodyClaims::new()),
+        ports_b,
+        &shutdown,
+    );
+
+    let early = solved_block(&handle_a, Height(height), 21);
+    assert!(handle_a.publish_solved_block(&early, height));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        handle_b.block_phase(&early.hash()),
+        None,
+        "block sync's block"
+    );
+
+    // Block sync brings the verified tip within the window, short of the parent.
+    snapshots_b.send_replace(Some(engine_snapshot(header_best, verified_at(height - 10))));
+    let next = solved_block(&handle_a, Height(height), 22);
+    assert!(handle_a.publish_solved_block(&next, height));
+    wait_until("B submits the block", || !verifier_b.seen().is_empty()).await;
+    assert_eq!(
+        handle_b.block_phase(&next.hash()),
+        Some(BlockPhase::Verifying)
+    );
+    assert!(
+        claims_b
+            .next_expiry()
+            .is_some_and(|expiry| expiry > Instant::now() + RECONSTRUCTION_DEADLINE),
+        "the claim covers verification"
+    );
+
+    snapshots_b.send_replace(Some(engine_snapshot(header_best, verified_at(height - 1))));
+    wait_until("B commits the block", || {
+        handle_b.block_phase(&next.hash()) == Some(BlockPhase::Done)
+    })
+    .await;
+    assert_eq!(verifier_b.seen(), vec![next.hash()], "one submission");
+    shutdown.cancel();
+}
+
 /// The driver turns each committed frontier change into the
 /// matching `BlockTable` inputs, and an unchanged frontier into none.
 #[test]
@@ -535,7 +722,7 @@ fn frontier_inputs_follow_committed_frontier_changes() {
         inputs
             .into_iter()
             .map(|input| match input {
-                BlockInput::TipHeight { height } => format!("tip {height}"),
+                BlockInput::TipHeight { height, .. } => format!("tip {height}"),
                 BlockInput::FallbackDone { block_id } => format!("done {}", block_id.0[0]),
                 BlockInput::ParentAdmitted { hash, height } => {
                     format!("parent {} {height}", hash.0[0])

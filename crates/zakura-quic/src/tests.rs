@@ -368,7 +368,7 @@ fn assert_counted_one_post_quantum_handshake(side: &str, counters: &Counters) {
     assert_eq!(
         counters.series("zakura.quic.tls.key_exchange"),
         BTreeMap::from([(
-            r#"zakura.quic.tls.key_exchange{group="X25519MLKEM768"}"#.to_string(),
+            r#"zakura.quic.tls.key_exchange{group="X25519MLKEM1024"}"#.to_string(),
             1
         )]),
         "{side} key exchanges"
@@ -381,7 +381,7 @@ fn assert_verified_signatures(side: &str, counters: &Counters, expected: u64) {
     assert_eq!(
         counters.series("zakura.quic.tls.signature_verified"),
         BTreeMap::from([(
-            r#"zakura.quic.tls.signature_verified{scheme="ed25519_mldsa44"}"#.to_string(),
+            r#"zakura.quic.tls.signature_verified{scheme="ed25519_mldsa65"}"#.to_string(),
             expected
         )]),
         "{side} verified signatures"
@@ -767,6 +767,9 @@ async fn a_classical_one_datagram_hello_is_refused_and_cancelled() {
             .with_client_cert_resolver(Arc::new(rpk));
         crypto.alpn_protocols = vec![ALPN.to_vec()];
         assert!(dial_raw(&server, crypto).await.is_err());
+        // Past the 3 s handshake deadline: an unpadded hello leaves no
+        // stray attempt behind to fail late.
+        tokio::time::sleep(Duration::from_millis(3500)).await;
         assert_eq!(server.seen.lock().unwrap().len(), 1);
         assert_eq!(server.returned.cancelled.load(Ordering::Relaxed), 1);
         assert_eq!(server.returned.finished.load(Ordering::Relaxed), 0);
@@ -847,11 +850,12 @@ async fn refused_attempt_creates_no_connection() {
         ));
         // SEC-3: the acceptor never saw a connection.
         assert!(server.handled.try_recv().is_err());
-        // The hello spans two datagrams. The endpoint decides each one it
-        // doesn't accept on its own (ADM-1), so the dial is refused twice.
-        wait_for_attempts(&server, 2).await;
+        // The hello spans two datagrams and the dialer pads it with a third.
+        // The endpoint decides each one it doesn't accept on its own (ADM-1),
+        // so the dial is refused three times.
+        wait_for_attempts(&server, 3).await;
         tokio::time::sleep(Duration::from_millis(100)).await;
-        assert_eq!(server.seen.lock().unwrap().len(), 2);
+        assert_eq!(server.seen.lock().unwrap().len(), 3);
         assert!(server.handled.try_recv().is_err());
     })
     .await
@@ -885,14 +889,16 @@ async fn retry_threshold_validates_before_accepting() {
         client.connect(server.addr(), &[ALPN]).await.unwrap();
         let inbound = server.handled.recv().await.unwrap();
         assert!(inbound.source_validated(), "the Retry token validated it");
-        // The hello spans two datagrams, and each unvalidated one gets its
-        // own Retry (ADM-1). The dialer answers the first and discards the
-        // second, as RFC 9000 section 17.2.5.2 requires.
+        // The hello spans two datagrams and the dialer pads it with a third.
+        // Each unvalidated one gets its own Retry (ADM-1). The dialer answers
+        // the first and discards the rest, as RFC 9000 section 17.2.5.2
+        // requires. Its retried hello carries the token, so it needs no
+        // padding datagram.
         let seen = server.seen.lock().unwrap().clone();
         assert_eq!(
             seen.iter().map(|info| info.validated).collect::<Vec<_>>(),
-            [false, false, true],
-            "one Retry per datagram of the hello, then the validated attempt"
+            [false, false, false, true],
+            "one Retry per datagram of the first flight, then the validated attempt"
         );
     })
     .await
@@ -2113,7 +2119,7 @@ impl rustls::sign::SigningKey for Impostor {
     }
 
     fn algorithm(&self) -> rustls::SignatureAlgorithm {
-        rustls::SignatureAlgorithm::Unknown(0x44)
+        rustls::SignatureAlgorithm::Unknown(0x65)
     }
 }
 
@@ -2684,7 +2690,10 @@ async fn churn(bind: QuicBindConfig) -> (usize, usize) {
         stop.store(true, Ordering::Relaxed);
         sampler.await.unwrap();
 
-        tokio::time::timeout(Duration::from_secs(5), async {
+        // A later Initial can be admitted after the start of its hello was
+        // refused. That slot waits for its handshake deadline before draining.
+        let drain_timeout = test_config().handshake_timeout().unwrap() + Duration::from_secs(5);
+        tokio::time::timeout(drain_timeout, async {
             while server.connection_count() + server.closing_connection_count() > 0 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -3134,12 +3143,13 @@ async fn pump(net: SimNet) {
     }
 }
 
-/// The dialer's hello carries the hybrid key share, 1,216 bytes, so its first
-/// flight is two full Initial datagrams where a hello with ring's groups
-/// needed one (TLS-9). Both leave before any reply. The server accepts the
-/// first, the second joins that connection, and the handshake completes.
+/// The dialer's hello carries the hybrid key share, 1,600 bytes, so it spans
+/// two full Initial datagrams where a hello with ring's groups needed one
+/// (TLS-9), and the dialer pads its first flight with a third (ADM-1). All
+/// three leave before any reply. The server accepts the first, the others
+/// join that connection, and the handshake completes.
 #[tokio::test(start_paused = true)]
-async fn the_hybrid_hello_leaves_as_two_initial_datagrams() {
+async fn the_hybrid_hello_leaves_as_three_initial_datagrams() {
     tokio::time::timeout(SIM_TEST_TIMEOUT, async {
         let net = sim_net();
         let mut server =
@@ -3156,7 +3166,7 @@ async fn the_hybrid_hello_leaves_as_two_initial_datagrams() {
         for _ in 0..10_000 {
             tokio::task::yield_now().await;
         }
-        assert_eq!(sent_lengths(&net, sim_addr(2)), [1200, 1200]);
+        assert_eq!(sent_lengths(&net, sim_addr(2)), [1200, 1200, 1200]);
 
         let pump = tokio::spawn(pump(net.clone()));
         let (_client, result) = dial.await.unwrap();
@@ -3169,13 +3179,24 @@ async fn the_hybrid_hello_leaves_as_two_initial_datagrams() {
     .unwrap();
 }
 
-/// TLS-4, ADM-1: with the composite credential and signature, the
-/// listener's whole first flight still fits QUIC's allowance before the
-/// dialer's address is validated, three times the 2,400 bytes of the hybrid
-/// hello. The dialer completes its handshake on that flight alone, so the
-/// larger signature adds no round trip.
+/// TLS-4, TLS-9, ADM-1: the listener's whole first flight, about 7.9 KB with
+/// its ML-KEM-1024 ciphertext, ML-DSA-65 credential and composite signature,
+/// is larger than three times the 2,400-byte hello, QUIC's allowance before
+/// the dialer's address is validated. The dialer's padding datagram raises
+/// the allowance to three times 3,600 bytes, the flight fits, and the dialer
+/// completes its handshake on it alone, in one round trip.
 #[tokio::test(start_paused = true)]
-async fn the_listeners_first_flight_fits_the_amplification_limit() {
+async fn the_listeners_first_flight_fits_the_padded_allowance() {
+    check_listener_first_flight(false).await;
+}
+
+/// Until the padding arrives, only the first 2,400 bytes can fund a reply.
+#[tokio::test(start_paused = true)]
+async fn the_listener_stays_within_the_byte_limit_until_padding_arrives() {
+    check_listener_first_flight(true).await;
+}
+
+async fn check_listener_first_flight(delay_padding: bool) {
     tokio::time::timeout(SIM_TEST_TIMEOUT, async {
         let net = sim_net();
         let _server =
@@ -3198,17 +3219,43 @@ async fn the_listeners_first_flight_fits_the_amplification_limit() {
                 }
             }
         };
+        let sent = |src: SocketAddr| -> usize { sent_lengths(&net, src).iter().sum() };
 
         settle().await;
-        let hello: usize = sent_lengths(&net, sim_addr(2)).iter().sum();
-        assert_eq!(hello, 2_400, "the hybrid hello is two full datagrams");
+        let first_flight = sent(sim_addr(2));
+        assert_eq!(
+            first_flight, 3_600,
+            "the hello's two datagrams and the padding datagram"
+        );
         tokio::time::sleep(Duration::from_millis(5)).await;
-        deliver_from(sim_addr(2));
+        if delay_padding {
+            let mut hello = net.deliverable();
+            hello.sort_by_key(|id| id.seq);
+            let [first, second, padding] = hello.as_slice() else {
+                panic!("expected the dialer's two hello datagrams and its padding");
+            };
+            net.deliver(*first).unwrap();
+            net.deliver(*second).unwrap();
+            settle().await;
+            let reply = sent(sim_addr(1));
+            assert!(reply > 0, "the listener can start replying to the hello");
+            assert!(
+                reply <= 3 * 2_400,
+                "sent {reply} bytes before padding arrived"
+            );
+            net.deliver(*padding).unwrap();
+        } else {
+            deliver_from(sim_addr(2));
+        }
         settle().await;
 
-        let flight: usize = sent_lengths(&net, sim_addr(1)).iter().sum();
+        let flight = sent(sim_addr(1));
         assert!(
-            flight <= 3 * hello,
+            flight > 3 * 2_400,
+            "the {flight}-byte flight needs the padding datagram"
+        );
+        assert!(
+            flight <= 3 * first_flight,
             "the listener sent {flight} bytes before validation"
         );
         tokio::time::sleep(Duration::from_millis(5)).await;
@@ -3217,6 +3264,55 @@ async fn the_listeners_first_flight_fits_the_amplification_limit() {
         assert!(
             dial.is_finished(),
             "the dialer completed on the listener's first flight of {flight} bytes"
+        );
+        let (_client, result) = dial.await.unwrap();
+        result.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+/// DIAL-8: a hello whose first datagram meets a full send buffer is still
+/// padded. The driver parks that datagram before quinn-proto builds the
+/// second, waits for the socket, and only then adds the padding datagram,
+/// so the dial still completes in one round trip.
+#[tokio::test(start_paused = true)]
+async fn a_hello_that_meets_a_full_send_buffer_is_still_padded() {
+    tokio::time::timeout(SIM_TEST_TIMEOUT, async {
+        let net = sim_net();
+        let server =
+            serve_test_acceptor(sim_endpoint(&net, sim_addr(1)), &[ALPN], |_| Admit::Accept);
+        let client = sim_endpoint(&net, sim_addr(2));
+        assert!(net.fail_next_send(sim_addr(2), std::io::ErrorKind::WouldBlock));
+        let target = server.addr();
+        let dial = tokio::spawn(async move {
+            let result = client.connect(target, &[ALPN]).await;
+            (client, result)
+        });
+        let settle = || async {
+            for _ in 0..10_000 {
+                tokio::task::yield_now().await;
+            }
+        };
+        let deliver_from = |src: SocketAddr| {
+            for id in net.deliverable() {
+                if id.link.src == src {
+                    net.deliver(id).unwrap();
+                }
+            }
+        };
+
+        settle().await;
+        assert_eq!(sent_lengths(&net, sim_addr(2)), [1200, 1200, 1200]);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        deliver_from(sim_addr(2));
+        settle().await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        deliver_from(sim_addr(1));
+        settle().await;
+        assert!(
+            dial.is_finished(),
+            "the dialer completed on the listener's first flight"
         );
         let (_client, result) = dial.await.unwrap();
         result.unwrap();
@@ -3258,11 +3354,12 @@ async fn a_production_dialer_is_refused_by_a_listener_without_the_hybrid_group()
     .unwrap();
 }
 
-/// A refused dial is answered once per datagram of its hello: the endpoint
-/// keeps no record of the attempt it refused, so the second datagram is a
-/// new attempt and gets its own refusal (ADM-1).
+/// A refused dial is answered once per datagram of its first flight: the
+/// endpoint keeps no record of the attempt it refused, so the hello's second
+/// datagram and the padding datagram are new attempts, each with its own
+/// refusal (ADM-1).
 #[tokio::test(start_paused = true)]
-async fn a_refused_two_datagram_hello_is_answered_twice() {
+async fn a_refused_hello_is_answered_once_per_datagram() {
     tokio::time::timeout(SIM_TEST_TIMEOUT, async {
         let net = sim_net();
         let pump = tokio::spawn(pump(net.clone()));
@@ -3274,10 +3371,10 @@ async fn a_refused_two_datagram_hello_is_answered_twice() {
             client.connect(server.addr(), &[ALPN]).await,
             Err(ConnectError::Refused)
         ));
-        // Long enough for the second datagram and its answer to arrive.
+        // Long enough for the later datagrams and their answers to arrive.
         tokio::time::sleep(Duration::from_secs(1)).await;
-        assert_eq!(server.seen.lock().unwrap().len(), 2);
-        assert_eq!(sent_lengths(&net, sim_addr(1)).len(), 2);
+        assert_eq!(server.seen.lock().unwrap().len(), 3);
+        assert_eq!(sent_lengths(&net, sim_addr(1)).len(), 3);
         assert!(server.handled.try_recv().is_err());
         assert_eq!(server.returned.cancelled.load(Ordering::Relaxed), 0);
         assert_eq!(server.returned.finished.load(Ordering::Relaxed), 0);

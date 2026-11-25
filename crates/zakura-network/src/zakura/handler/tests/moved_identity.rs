@@ -62,6 +62,50 @@ async fn a_dial_to_an_earlier_id_registers_the_node_under_its_current_id() {
     listener.shutdown().await;
 }
 
+/// Only a dial that TLS authenticated says where a node moved. A dial to
+/// an ID the listener can't prove fails in the handshake, registers nothing
+/// and teaches the dialer no move, so no one can point another node's ID at
+/// themselves by answering dials to it.
+#[tokio::test]
+async fn a_dial_the_listener_cannot_prove_learns_no_move() {
+    let listener = ZakuraTestNode::builder(9307)
+        .extended_credential()
+        .spawn()
+        .await
+        .expect("listener spawns");
+    let dialer = ZakuraTestNode::builder(9308)
+        .spawn()
+        .await
+        .expect("dialer spawns");
+    // Another node's ID, at the listener's addresses.
+    let other = crate::zakura::testkit::LocalEndpointFactory::secret_key(9309).public();
+    let claimed = NodeAddr::with_addrs(other, listener.node_addr().await.direct);
+
+    let endpoint = dialer.endpoint();
+    let dial = tokio::time::timeout(
+        TEST_NET_TIMEOUT,
+        serve_reported_native_dial_connection(
+            &endpoint,
+            claimed,
+            dialer.limits(),
+            None,
+            NativeDialKind::Discovery,
+        ),
+    )
+    .await
+    .expect("the dial ends before the timeout");
+    assert!(dial.is_err(), "the listener is not the dialed node");
+
+    let moved = dialer.supervisor().moved_node_ids();
+    assert_eq!(moved.borrow().current(other), other);
+    assert!(dialer.supervisor().subscribe().borrow().is_empty());
+    assert_eq!(slots(&dialer, &other), 0);
+    assert_eq!(slots(&dialer, &listener.node_addr().await.id), 0);
+
+    dialer.shutdown().await;
+    listener.shutdown().await;
+}
+
 /// A node is registered under the ID it has now, and a stale record makes
 /// the dialer dial its earlier ID as well. That dial is closed before its
 /// control handshake and reported as one that registered nothing.

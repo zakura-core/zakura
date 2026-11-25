@@ -434,7 +434,8 @@ fn close_4_failed_commitment_closes_identical_copies_and_checks_the_alternate() 
 
 /// `bpv1-close-4`, unknown parent (bpv1-61): a binding that fails the
 /// unknown-parent checks closes the first sender and each session whose copy
-/// equals it. The alternate gets its own checks, and parks if they pass.
+/// equals it. The kept alternates get their own checks in arrival order,
+/// and the first one that passes parks.
 #[test]
 fn close_4_failed_unknown_parent_binding_checks_the_alternate() {
     let now = Instant::now();
@@ -473,6 +474,20 @@ fn close_4_failed_unknown_parent_binding_checks_the_alternate() {
     assert_eq!(
         closed_sessions(&failed, Bpv1CloseRow::Row4BadMetaOrCommitment),
         sorted(vec![a, b])
+    );
+    assert!(rejected_sessions(&failed, block_id).is_empty());
+    table.assert_invariants();
+
+    // `c`'s copy is the oldest alternate, so it is checked next; `d` waits.
+    let failed = unknown_parent_checked(
+        &mut table,
+        now,
+        &failed,
+        UnknownParentVerdict::Invalid(Bpv1CloseRow::Row4BadMetaOrCommitment),
+    );
+    assert_eq!(
+        closed_sessions(&failed, Bpv1CloseRow::Row4BadMetaOrCommitment),
+        vec![c]
     );
     assert!(rejected_sessions(&failed, block_id).is_empty());
     table.assert_invariants();

@@ -6058,7 +6058,7 @@ mod tests {
         extension.extend_from_slice(&[0xcd; 7_856]);
         assert_eq!(extension.len(), RECORD_SIGNATURE_EXTENSION_BYTES);
         // An ML-DSA-87 key and signature (FIPS 204) need less.
-        assert!(4 + 2_592 + 4 + 4_627 <= RECORD_SIGNATURE_EXTENSION_BYTES);
+        const { assert!(4 + 2_592 + 4 + 4_627 <= RECORD_SIGNATURE_EXTENSION_BYTES) };
         body.extensions = extension.clone();
 
         let mut too_long = body.clone();
@@ -6098,7 +6098,7 @@ mod tests {
         import_confirmed_record(&mut book, record.clone()).expect("the largest record imports");
         assert_eq!(
             book.sample_peers(1, &[], &[], NOW, test_requester()),
-            [record.clone()],
+            std::slice::from_ref(&record),
             "a `Peers` answer serves the stored record unchanged"
         );
         book.mark_dial_success(&node_id, None, NOW);

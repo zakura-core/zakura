@@ -114,16 +114,25 @@ fn out_of_range_height_is_dropped_without_fault() {
         check_binding_and_height(&header, &envelope, 40 - PROPAGATION_DEPTH),
         Ok(40)
     );
+}
 
-    // A best header at or above the block's height also puts it out of range.
-    let bound = TargetBound {
-        best_height: 40,
-        max_target: target_of(&header),
-    };
-    assert_eq!(
-        check_proof_of_work(&regtest_nu7(), &header, 40, Some(bound)),
-        UnknownParentVerdict::OutOfRange
-    );
+/// Header sync can move the best header to the block's height or past it
+/// while the checks run. The bound then says nothing, so an honest block
+/// still parks, and proof of work still decides a fake.
+#[test]
+fn best_header_at_the_block_height_skips_the_bound() {
+    let (header, _) = honest_meta(40);
+    let target = U256::from(target_of(&header));
+    for best_height in [40, 41] {
+        let tight = TargetBound {
+            best_height,
+            max_target: ExpandedDifficulty::from(target / U256::from(2u64)),
+        };
+        assert_eq!(
+            check_proof_of_work(&regtest_nu7(), &header, 40, Some(tight)),
+            UnknownParentVerdict::Park
+        );
+    }
 }
 
 /// A binding whose txid path misses the header's Merkle root closes its

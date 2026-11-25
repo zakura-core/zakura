@@ -166,12 +166,14 @@ pub fn check_proof_of_work(
     let Ok(target) = validate_compact_target(header, network) else {
         return invalid_header;
     };
-    if let Some(bound) = bound.filter(|_| target_bound_applies(network, height)) {
-        match bound.limit_at(height, network.target_difficulty_limit()) {
-            None => return UnknownParentVerdict::OutOfRange,
-            Some(limit) if target > limit => return invalid_header,
-            Some(_) => {}
-        }
+    // A best header at or above `height` bounds nothing. Header sync moved it
+    // there during the checks, so check 4 decides, and the table retries the
+    // admission that may now find the header.
+    let limit = bound
+        .filter(|_| target_bound_applies(network, height))
+        .and_then(|bound| bound.limit_at(height, network.target_difficulty_limit()));
+    if limit.is_some_and(|limit| target > limit) {
+        return invalid_header;
     }
     // A network that cannot waive proof of work validates it, as headerchain does.
     let policy = PowPolicy::for_network(network).unwrap_or_else(|_| PowPolicy::validating(network));

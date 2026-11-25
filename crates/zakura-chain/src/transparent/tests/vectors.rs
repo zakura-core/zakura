@@ -373,7 +373,9 @@ fn tex_addresses_require_bech32m() {
             .expect("a 20-byte payload fits in a Bech32m string");
         assert!(bech32.parse::<Address>().is_err(), "accepted {bech32}");
         assert_eq!(
-            bech32m.parse::<Address>().expect("Bech32m TEX addresses parse"),
+            bech32m
+                .parse::<Address>()
+                .expect("Bech32m TEX addresses parse"),
             Address::Tex {
                 network_kind,
                 validating_key_hash: [0; 20],

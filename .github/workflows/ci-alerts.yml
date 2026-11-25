@@ -34,6 +34,7 @@ on:
       - Zakura continuous genesis sync fleet
       - Zakura E2E
       - Zakura mempool gossip
+      - Zakura miner mesh regtest
       - zakura-mac-cranelift
       - zcashd-compat Regtest
     types: [completed]

@@ -61,6 +61,25 @@ enum LoadError {
     Environment(String),
 }
 
+/// Returns the file that [`load`] reads for `path`: relative to the current directory,
+/// with `.toml` added when `path` names no existing file.
+pub(super) fn resolve_config_file(path: PathBuf) -> std::io::Result<PathBuf> {
+    let mut path = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    if !path.is_file() {
+        // Match legacy extension inference, including trailing separators.
+        // Preserve an existing extension-like part of the file stem.
+        if path.extension().is_some() {
+            path.as_mut_os_string().push(".placeholder");
+        }
+        path.set_extension("toml");
+    }
+    Ok(path)
+}
+
 /// Load the file, then apply prefixes from lowest to highest precedence.
 pub(super) fn load(
     path: Option<PathBuf>,
@@ -68,19 +87,7 @@ pub(super) fn load(
 ) -> Result<ZakuradConfig, BoxError> {
     let mut values = Value::Table(BTreeMap::new());
     if let Some(path) = path {
-        let mut path = if path.is_absolute() {
-            path
-        } else {
-            std::env::current_dir()?.join(path)
-        };
-        if !path.is_file() {
-            // Match legacy extension inference, including trailing separators.
-            // Preserve an existing extension-like part of the file stem.
-            if path.extension().is_some() {
-                path.as_mut_os_string().push(".placeholder");
-            }
-            path.set_extension("toml");
-        }
+        let path = resolve_config_file(path)?;
         let bytes = fs::read(&path).map_err(|source| LoadError::Read {
             path: path.clone(),
             source,

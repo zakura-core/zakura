@@ -98,7 +98,7 @@ use tracing::Instrument;
 use zakura_chain::{
     block::{self, genesis::regtest_genesis_block},
     chain_tip::ChainTip,
-    miner_mesh::MinerMeshCommitment,
+    miner_mesh::{GatewayId, MinerMeshCommitment},
 };
 use zakura_consensus::router::BackgroundTaskHandles;
 use zakura_jsonl_trace::{JsonlEventEmitter, JsonlTracer};
@@ -806,8 +806,11 @@ impl StartCmd {
         // The pool is chosen once, at startup. `tx-relay` needs the pool
         // core's port before the network starts, so it is built here and
         // handed to the core below.
-        let pool_implementation = config.mempool.implementation.resolve();
-        let tx_relay_port = if config.network.zakura.tx_relay.enabled {
+        let v2_p2p = config.network.v2_p2p();
+        let pool_implementation = config.mempool.implementation.resolve(v2_p2p);
+        // The service is registered on the v2 endpoint, which a legacy-only
+        // stack never starts, so a legacy-only core keeps the adapter path.
+        let tx_relay_port = if config.network.zakura.tx_relay.enabled && v2_p2p {
             if pool_implementation == mempool::config::Implementation::Core {
                 let port = mempool::core::TxRelayPort::new();
                 custom_services.push(zakura_network::zakura::tx_relay_service(
@@ -818,7 +821,8 @@ impl StartCmd {
                 ));
                 Some(port)
             } else {
-                warn!("tx-relay needs `[mempool] implementation = \"core\"`, so it stays off");
+                // `tx-relay` is on by default, so this is the `classic` rollback.
+                info!("tx-relay runs only with the pool core, so it stays off");
                 None
             }
         } else {
@@ -866,13 +870,10 @@ impl StartCmd {
             None
         };
 
-        // The network counts `tx-relay` and `bpv1` memory shares only when they are
-        // registered, not merely enabled.
-        network_config.zakura.tx_relay.enabled = tx_relay_port.is_some();
+        // The network counts `bpv1` memory shares only when it is registered,
+        // not merely enabled.
         network_config.zakura.bpv1.enabled = bpv1_handle.is_some();
-        // The service is registered on the v2 endpoint, which a legacy-only
-        // stack never starts.
-        let tx_relay_registered = tx_relay_port.is_some() && config.network.v2_p2p();
+        let tx_relay_registered = tx_relay_port.is_some();
         info!(
             configured = config.network.zakura.tx_relay.enabled,
             registered = tx_relay_registered,
@@ -1119,6 +1120,8 @@ impl StartCmd {
         } else {
             rpc_impl
         };
+        // The gateway ID this node's coinbases name when it announces itself.
+        let mut local_mesh_gateway = None;
         let rpc_impl = if config.mining.miner_mesh {
             let gateway = zakura_endpoint
                 .as_ref()
@@ -1129,7 +1132,9 @@ impl StartCmd {
             if config.mining.miner_address.is_some() {
                 info!(%gateway, "coinbases this node builds name it as the miner's gateway");
             }
-            rpc_impl.with_mesh_commitment(MinerMeshCommitment::new(*gateway.as_bytes()))
+            let gateway_id = GatewayId::from_node_id(gateway.as_bytes());
+            local_mesh_gateway = Some(gateway_id);
+            rpc_impl.with_mesh_commitment(MinerMeshCommitment::new(gateway_id))
         } else {
             rpc_impl
         };
@@ -1347,6 +1352,7 @@ impl StartCmd {
             let miner_mesh_task_handle = miner_mesh::spawn(
                 read_only_state_service.clone(),
                 chain_tip_change.clone(),
+                local_mesh_gateway,
                 publisher,
             );
             node_tasks.supervise("miner mesh tracker", miner_mesh_task_handle, |()| Ok(()));

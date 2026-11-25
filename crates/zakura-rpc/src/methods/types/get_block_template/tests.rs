@@ -13,7 +13,7 @@ use zakura_chain::parameters::testnet::ConfiguredFundingStreamRecipient;
 use zakura_chain::{
     block::Height,
     local_genesis::generate_local_testnet_with_funded_keys,
-    miner_mesh::MinerMeshCommitment,
+    miner_mesh::{GatewayId, MinerMeshCommitment},
     parameters::{
         subsidy::FundingStreamReceiver::{Deferred, Ecc, MajorGrants, ZcashFoundation},
         testnet::{self, ConfiguredActivationHeights, ConfiguredFundingStreams},
@@ -195,13 +195,13 @@ fn transparent_coinbase() -> anyhow::Result<()> {
 
 /// A gateway ID made of `OP_CHECKSIG` bytes: if the pushed ID were ever read as
 /// script, the coinbase's signature operation count would be wrong.
-const GATEWAY_ID: [u8; 32] = [0xac; 32];
+const GATEWAY_ID: [u8; 20] = [0xac; 20];
 
 /// A miner that announces a gateway pays the same outputs as one that does not,
-/// then names the gateway in one more output that takes 46 bytes of the block.
+/// then names the gateway in one more output that takes 34 bytes of the block.
 #[test]
 fn announcing_coinbase_names_the_gateway_in_one_extra_output() -> anyhow::Result<()> {
-    let commitment = MinerMeshCommitment::new(GATEWAY_ID);
+    let commitment = MinerMeshCommitment::new(GatewayId::from_bytes(GATEWAY_ID));
 
     for net in Network::iter() {
         let quiet = MinerParams::from(
@@ -249,7 +249,7 @@ fn announcing_coinbase_names_the_gateway_in_one_extra_output() -> anyhow::Result
                 .max_serialized_size,
                 TransactionTemplate::coinbase_resource_usage(&net, height, &quiet, None, None)?
                     .max_serialized_size
-                    + 46,
+                    + 34,
             );
 
             // A BPv1 commitment beside the gateway takes 48 more bytes, within the size the
@@ -641,7 +641,7 @@ fn announcing_shielded_coinbase_names_the_gateway() -> anyhow::Result<()> {
     let height = NetworkUpgrade::Nu6_3
         .activation_height(&net)
         .expect("NU6.3 activation height is configured");
-    let commitment = MinerMeshCommitment::new(GATEWAY_ID);
+    let commitment = MinerMeshCommitment::new(GatewayId::from_bytes(GATEWAY_ID));
     let mut params = MinerParams::from(
         MinerAddress::decode(
             &net,

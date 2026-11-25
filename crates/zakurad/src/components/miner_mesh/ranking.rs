@@ -12,6 +12,15 @@ use zakura_rpc::synced_to_tip;
 #[cfg(test)]
 mod tests;
 
+/// The fewest counted blocks that must name a gateway before the network
+/// prefers it.
+///
+/// To keep a place at every mining node for another node's ID, a node must
+/// mine ten blocks naming it every two days. A pool that mines a block now and
+/// then does not take places meant for regular miners. At 25-second blocks
+/// ten is about 0.15% of a window.
+pub const MIN_GATEWAY_BLOCKS: u32 = 10;
+
 /// Returns the gateway ranking the network reads, and the publisher that
 /// fills it when the node mines (`is_mining`, set by `mining.miner_address`).
 ///
@@ -55,8 +64,9 @@ impl<Tip: ChainTip> RankingPublisher<Tip> {
         self.coverage.subscribe()
     }
 
-    /// Publishes every gateway counted in `snapshot` while the best tip is
-    /// recent enough to mine on, and an empty ranking otherwise. The
+    /// Publishes the gateways of `snapshot` named in at least
+    /// [`MIN_GATEWAY_BLOCKS`] counted blocks while the best tip is recent
+    /// enough to mine on, and an empty ranking otherwise. The
     /// [`coverage`](Self::coverage) receivers get its coverage either way.
     ///
     /// Whether the tip is recent enough depends on the clock, so the caller
@@ -81,6 +91,7 @@ impl<Tip: ChainTip> RankingPublisher<Tip> {
                 gateways: snapshot
                     .gateways
                     .iter()
+                    .filter(|gateway| gateway.blocks >= MIN_GATEWAY_BLOCKS)
                     .map(|gateway| MinerGateway {
                         gateway_id: gateway.gateway_id,
                         blocks: gateway.blocks,

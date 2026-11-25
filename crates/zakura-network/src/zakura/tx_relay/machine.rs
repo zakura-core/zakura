@@ -301,8 +301,19 @@ pub(crate) const PENDING_PER_PEER: usize = 8_000;
 pub(crate) const PENDING_CAP: usize = 8 * PENDING_PER_PEER;
 
 /// Ids every session may hold pending however many the others hold
-/// (*provisional*).
-pub(crate) const PENDING_SHARE: usize = 256;
+/// (*provisional*). Peers that announce ids they never serve can keep the
+/// node at twice [`PENDING_CAP`] for as long as they stay connected, since a
+/// reopened session refills faster than any age-out could drain it. This
+/// share is the room an honest session keeps anyway, for a new id's first
+/// announcement or a copy of one such a peer announced first.
+///
+/// It must stay small enough that, when honest peers all announce the same
+/// full pool, the copies sessions past the cap spend on their shares fit
+/// between the cap and twice it with [`PENDING_PER_PEER`] first sources to
+/// spare, so every id keeps a source. At the default 92 connections plus
+/// 10 preferred-gateway places, 94 sessions past the cap's eight full sets
+/// spend 94 × 512 = 48,128 of that 64,000-record gap, leaving 15,872.
+pub(crate) const PENDING_SHARE: usize = 512;
 
 /// How many peers the reactor remembers as having tried one wanted entry
 /// before it forgets any. Past that it forgets the oldest peer with no

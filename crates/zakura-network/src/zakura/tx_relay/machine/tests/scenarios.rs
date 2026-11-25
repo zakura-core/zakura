@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use zakura_chain::transaction::UnminedTxId;
+use zakura_chain::transaction::{self, UnminedTxId};
 use zakura_node_services::mempool::port::{
     Change, Charge, LocalFault, RejectionScope, RemovalReason,
 };
@@ -16,7 +16,7 @@ use crate::zakura::tx_relay::machine::{
     CloseReason, FanOut, Paid, PeerKey, RelayEffect, SessionId, Unreserved, Verdict, Violation,
     ADVERT_DELAY, BASE_COOLDOWN, HAVE_RETRY, INITIAL_WINDOW, MAX_COOLDOWN, MAX_COOLDOWN_PEERS,
     MAX_SERVES, MAX_TX_BYTES, NO_ROOM_FIRST, PARK_COOLDOWN, PENDING_CAP, PENDING_PER_PEER,
-    RANK_INTERVAL, RETRY_FIRST, TRIED_PER_ENTRY,
+    PENDING_SHARE, RANK_INTERVAL, RETRY_FIRST, TRIED_PER_ENTRY,
 };
 
 /// A millisecond.
@@ -644,7 +644,7 @@ fn an_id_whose_holder_ended_mid_verdict_is_a_first_source() {
     let pool: Vec<UnminedTxId> = (0..per).map(|n| body(n + 1_000, script).id()).collect();
     // A session past its share, then sessions that fill the cap.
     let late = bench.join(1);
-    bench.have(late, &pool[..300]);
+    bench.have(late, &pool[..PENDING_SHARE + 44]);
     let fillers = u64::try_from(PENDING_CAP / PENDING_PER_PEER).expect("small");
     for peer in 2..=fillers + 1 {
         let session = bench.join(peer);
@@ -660,6 +660,64 @@ fn an_id_whose_holder_ended_mid_verdict_is_a_first_source() {
     bench.verdict(waiter, Verdict::LocalFault(LocalFault::VerifyTimeout));
     let wanted = bench.machine.wanted().entry(id).is_some();
     assert!(wanted && holds(&bench, late, id), "the node keeps a source");
+}
+
+/// Fills twice the node-wide pending cap with made-up ids nobody serves:
+/// peers from `first_peer` on each join and announce a full pending set.
+fn flood(bench: &mut Bench, first_peer: u64) {
+    let per = u32::try_from(PENDING_PER_PEER).expect("fits");
+    let flooders = u32::try_from(2 * PENDING_CAP / PENDING_PER_PEER).expect("small");
+    for flooder in 0..flooders {
+        let made_up: Vec<UnminedTxId> = (flooder * per..(flooder + 1) * per)
+            .map(|n| {
+                let mut hash = [0xff; 32];
+                hash[..4].copy_from_slice(&n.to_le_bytes());
+                UnminedTxId::Legacy(transaction::Hash(hash))
+            })
+            .collect();
+        let session = bench.join(first_peer + u64::from(flooder));
+        bench.have(session, &made_up);
+    }
+    let records = bench.machine.shared.pending;
+    assert!(records >= 2 * PENDING_CAP, "the flood filled the cap");
+}
+
+/// Sessions that fill the node-wide cap with made-up ids they never serve
+/// don't crowd out a first source: an honest session holding 300 ids still
+/// takes the first announcement of an id no session holds.
+#[test]
+fn a_flood_of_unserved_ids_leaves_room_for_a_first_source() {
+    let mut bench = Bench::new();
+    let honest = bench.join(0);
+    bench.have(honest, &ids(0..300));
+    flood(&mut bench, 1);
+
+    let id = bench.id(1_000);
+    bench.have(honest, &[id]);
+    assert!(
+        holds(&bench, honest, id),
+        "a first source past the full cap"
+    );
+}
+
+/// With the cap full of made-up ids, a peer that echoes a real id first
+/// makes the honest announcement a copy. An honest session holding 300 ids
+/// still takes that copy, so the id keeps a source that will serve it.
+#[test]
+fn a_flood_of_unserved_ids_leaves_room_for_an_echoed_copy() {
+    let mut bench = Bench::new();
+    let honest = bench.join(0);
+    bench.have(honest, &ids(0..300));
+    flood(&mut bench, 1);
+
+    let echo = bench.join(100);
+    let id = bench.id(1_000);
+    bench.have(echo, &[id]);
+    bench.have(honest, &[id]);
+    assert!(
+        holds(&bench, echo, id) && holds(&bench, honest, id),
+        "both hold the id"
+    );
 }
 
 /// More colluding sessions than the tried set's cap, all older than honest

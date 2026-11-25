@@ -834,8 +834,11 @@ is today's Zakura logic.
   completes in one round trip. A one-datagram hello isn't padded: a
   listener refuses it at its first packet and keeps no state, so a padding
   datagram would start an attempt of its own with no hello in it (ADM-1).
-  The PING is sent only once, before any reply arrives, so a retried
-  hello, which carries its Retry token and is validated, isn't padded.
+  A hello that waits on a full send buffer is still padded: the dialer
+  counts the datagrams it built, not those its socket took, and queues the
+  PING once the whole hello is built. The PING is sent only once, before
+  any reply arrives, so a retried hello, which carries its Retry token and
+  is validated, isn't padded.
 
 ## 9. Transport control
 
@@ -1356,6 +1359,7 @@ this release tolerates, and keep each hard change explicit.
 | Signatures that RustCrypto `ml-dsa` 0.1.2 made under the TLS-4 context, recorded offline, are reproduced byte for byte and verify, and its public key for the same seed matches | TLS-4, ID-13 |
 | The published composite known answer: a fixed seed, message and randomness give the recorded Ed25519 key, ML-DSA-65 key, node ID and composite signature, which verifies. The known answer was made without this crate, with Python's `cryptography` and `hashlib` and RustCrypto `ml-dsa` | TLS-4, ID-9, ID-12, ID-13 |
 | In a simulated handshake the dialer's first flight is 3,600 bytes; the listener's first flight is larger than three times the 2,400-byte hello but within three times 3,600, and the dialer completes on it alone, in one round trip | TLS-4, TLS-9, ADM-1, DIAL-8 |
+| In a simulated handshake whose first send finds the dialer's send buffer full, the dialer still sends three 1,200-byte Initial datagrams and completes in one round trip | DIAL-8 |
 | The seeded X25519MLKEM1024 completes against the production group in both roles and replays its shares for the same seed and node | TLS-9, API-2 |
 | A dialer that offers X25519MLKEM1024 sends its hello as two 1,200-byte Initial datagrams and pads it with a third (DIAL-8). A refused dial is decided and answered once per datagram, and a retried one decided once per datagram. A hello refused at its first datagram and accepted at its second keeps its charge and holds a pending handshake until the deadline. A one-datagram hello, which only a dialer with classical groups alone sends, is refused at its first datagram and cancelled, and leaves no other attempt behind past the handshake deadline; a hello with no ALPN in common, which spans two, fails as a handshake | ADM-1, ADM-3, ADM-7, API-3 |
 | On the deterministic scheduler, with no tokio runtime, two `bind_with` endpoints with the same seeded inputs, plan and UTC origin send byte-identical datagrams through a Retry handshake and an echoed stream, in one process and in fresh processes. Leaving out any seeded input, or changing the seed or the UTC origin, changes the bytes, and host time doesn't | API-2, TLS-9, ADM-10, DEP-2 |
@@ -2150,4 +2154,5 @@ Changed:
   or retried dial is decided and answered three times, and a later
   datagram accepted alone holds a pending handshake until the deadline.
 - **§16.** The first-flight test requires one round trip, and the admission
-  tests count three datagrams.
+  tests count three datagrams. A new test pads a hello whose first send
+  finds the send buffer full.

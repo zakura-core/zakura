@@ -75,10 +75,16 @@ gateway and the miners that prefer it must all run it to form a mesh.
 
 Every node with `mining.miner_address` set counts the gateways named in the best
 chain's recent blocks, whether or not it announces one itself. The window is two
-days of blocks ending 100 blocks below the tip, so it holds about 6,912 blocks
+days of blocks ending 10 blocks below the tip, so it holds about 6,912 blocks
 at a 25-second spacing (2,304 at the 75-second spacing before NU7). The node
-reads each block as it reaches 100 deep, reads older blocks in the window when
-it has nothing newer to do, and repairs its counts after a reorg.
+reads each block as it reaches 10 deep, reads older blocks in the window when
+it has nothing newer to do, and repairs its counts after a reorg. At 25-second
+blocks a block starts counting about four minutes after it is mined. Reorgs
+that reach a counted block are rare, and the repair drops the blocks they
+displace. The one exception is a block read from a chain that was best only
+briefly: if the node switches to that chain, more than 10 blocks deep, and back
+before the tracker sees the switch, the block can stay counted until it leaves
+the window or a later reorg's repair finds it.
 
 While its tip is recent enough to mine on, the node hands v2 networking the
 gateways named in at least 10 counted blocks. Networking ranks them by block
@@ -129,8 +135,8 @@ counts, the places it holds, and its v2 peers. In this example the node has
   "synced": true,
   "window": {
     "tip": 3000000,
-    "newest": 2999900,
-    "oldest": 2997597,
+    "newest": 2999990,
+    "oldest": 2997687,
     "checked": 1152,
     "coverage": 0.5
   },
@@ -158,9 +164,9 @@ counts, the places it holds, and its v2 peers. In this example the node has
 | `synced` | The tip is recent enough to prefer gateways when this request is served. Always true on test networks. |
 | `window` | The counted heights, or null on a node that does not mine. |
 | `window.tip` | The best tip height the counts follow. |
-| `window.newest`, `window.oldest` | The heights that count, or null while the tip is below 100. |
+| `window.newest`, `window.oldest` | The heights that count, or null while the tip is below 10. |
 | `window.checked` | Heights in the window read so far. |
-| `window.coverage` | The share of the window read, from 0 to 1. Below 1 the counts are a lower bound, as on a pruned node. A tip below 100 has an empty window, which reports 1. |
+| `window.coverage` | The share of the window read, from 0 to 1. Below 1 the counts are a lower bound, as on a pruned node. A tip below 10 has an empty window, which reports 1. |
 | `gateways` | The last ranking applied by v2 networking, best first, at most 256 gateways. Only gateways named in at least 10 counted blocks are ranked, and the gateway ID this node's own ID starts with is left out. |
 | `gateways[].gateway_id` | The gateway ID in hex: the 20 bytes the blocks name, the first 20 bytes of the gateway's v2 node ID. Peers report their full 32-byte node IDs as `node_id`. |
 | `gateways[].state` | See below. |

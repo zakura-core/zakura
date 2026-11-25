@@ -15,10 +15,10 @@ use super::{window::window, GatewayId, MinerMeshCommitment};
 /// The gateways named by the best chain's recent blocks, with a count each.
 ///
 /// The set looks at a window of heights that follows the tip: two days' worth
-/// of blocks ending 100 blocks below it. Its owner tells it where the tip is
-/// with [`set_tip`](Self::set_tip) and reads blocks into it, in any order,
-/// with [`record`](Self::record). A height counts once, however often it is
-/// read.
+/// of blocks ending [`QUALIFYING_DEPTH`](super::QUALIFYING_DEPTH) blocks
+/// below it. Its owner tells it where the tip is with
+/// [`set_tip`](Self::set_tip) and reads blocks into it, in any order, with
+/// [`record`](Self::record). A height counts once, however often it is read.
 ///
 /// The set does not watch the chain itself. After a reorg its owner compares
 /// [`checked_blocks`](Self::checked_blocks) with the best chain and removes
@@ -63,7 +63,8 @@ pub struct MinerSetSnapshot {
     /// How many heights in the window have been read.
     pub checked: usize,
     /// The heights that count at the tip, oldest to newest, or `None` before
-    /// the first tip and while the tip is below height 100.
+    /// the first tip and while the tip is below
+    /// [`QUALIFYING_DEPTH`](super::QUALIFYING_DEPTH).
     pub window: Option<RangeInclusive<Height>>,
 }
 
@@ -126,7 +127,8 @@ impl RecentMinerSet {
     /// Moves the window to follow a best chain whose tip is `height`.
     ///
     /// Blocks that are now too old stop counting. So do blocks that are now
-    /// less than 100 below the tip, which happens when the tip moves back.
+    /// less than [`QUALIFYING_DEPTH`](super::QUALIFYING_DEPTH) below the tip,
+    /// which happens when the tip moves back.
     /// `hash` is only reported back in [`snapshot`](Self::snapshot).
     pub fn set_tip(&mut self, height: Height, hash: block::Hash) {
         self.tip = Some((height, hash));

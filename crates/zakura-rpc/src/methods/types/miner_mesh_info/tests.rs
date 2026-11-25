@@ -8,7 +8,7 @@
 
 use zakura_chain::{
     block::Height,
-    miner_mesh::{GatewayId, MinerSetCoverage},
+    miner_mesh::{GatewayId, MinerSetCoverage, QUALIFYING_DEPTH},
 };
 use zakura_network::zakura::{
     ConnectedPeer, ConnectionPlaces, GatewayPlace, PlacedGateway, SlotSplit,
@@ -50,12 +50,18 @@ fn node() -> MeshNode {
     }
 }
 
-/// Mainnet height 3,000,000, whose window is two days of 75-second blocks,
-/// with half of it read.
+/// The tip of [`coverage`].
+const TIP: u32 = 3_000_000;
+
+/// The newest height that counts at [`TIP`].
+const NEWEST: u32 = TIP - QUALIFYING_DEPTH;
+
+/// A Mainnet tip at height 3,000,000. Its window is two days of 75-second
+/// blocks ending the qualifying depth below the tip, and half of it is read.
 fn coverage() -> MinerSetCoverage {
     MinerSetCoverage {
-        tip: Some(Height(3_000_000)),
-        window: Some(Height(2_999_900 - 2_304 + 1)..=Height(2_999_900)),
+        tip: Some(Height(TIP)),
+        window: Some(Height(NEWEST - 2_304 + 1)..=Height(NEWEST)),
         checked: 1_152,
     }
 }
@@ -173,15 +179,15 @@ fn a_node_without_counts_or_v2_networking_reports_neither() {
 fn the_window_reports_its_heights_and_how_much_is_read() {
     let window = MeshWindow::from(&coverage());
 
-    assert_eq!(window.tip, Some(3_000_000));
-    assert_eq!(window.newest, Some(2_999_900));
-    assert_eq!(window.oldest, Some(2_999_900 - 2_304 + 1));
+    assert_eq!(window.tip, Some(TIP));
+    assert_eq!(window.newest, Some(NEWEST));
+    assert_eq!(window.oldest, Some(NEWEST - 2_304 + 1));
     assert_eq!(window.checked, 1_152);
     assert_eq!(window.coverage, 0.5);
 }
 
 #[test]
-fn a_window_with_no_tip_is_unread_and_one_below_height_100_is_complete() {
+fn a_window_with_no_tip_is_unread_and_one_below_the_qualifying_depth_is_complete() {
     let mut coverage = MinerSetCoverage::default();
     let before_any_tip = MeshWindow::from(&coverage);
     assert_eq!(
@@ -194,11 +200,11 @@ fn a_window_with_no_tip_is_unread_and_one_below_height_100_is_complete() {
     );
     assert_eq!(before_any_tip.coverage, 0.0);
 
-    coverage.tip = Some(Height(99));
+    coverage.tip = Some(Height(QUALIFYING_DEPTH - 1));
     let too_low = MeshWindow::from(&coverage);
     assert_eq!(
         (too_low.tip, too_low.newest, too_low.oldest),
-        (Some(99), None, None)
+        (Some(QUALIFYING_DEPTH - 1), None, None)
     );
     assert_eq!(too_low.coverage, 1.0);
 }

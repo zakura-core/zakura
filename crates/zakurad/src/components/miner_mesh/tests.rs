@@ -16,7 +16,7 @@ use tower::Service;
 use zakura_chain::{
     block::{self, Block, Height},
     chain_tip::mock::MockChainTip,
-    miner_mesh::{GatewayId, MinerMeshCommitment},
+    miner_mesh::{GatewayId, MinerMeshCommitment, QUALIFYING_DEPTH},
     parameters::Network,
     serialization::ZcashDeserializeInto,
     transaction::{self, Transaction},
@@ -35,7 +35,7 @@ use crate::BoxError;
 
 /// The tip used by most tests. On Regtest, whose blocks are 75 seconds apart,
 /// its window is the 51 heights from genesis to 50.
-const TIP: u32 = 150;
+const TIP: u32 = 50 + QUALIFYING_DEPTH;
 
 /// One block of the fake best chain.
 #[derive(Copy, Clone)]
@@ -321,7 +321,7 @@ async fn reads_the_window_newest_first_and_counts_each_gateway() {
 }
 
 #[tokio::test]
-async fn a_new_tip_reads_the_block_that_reached_depth_100() {
+async fn a_new_tip_reads_the_block_that_reached_the_qualifying_depth() {
     let chain = FakeChain::default();
     chain.set(0..=TIP, 1, None);
     let mut tracker = tracker(&chain);
@@ -345,7 +345,7 @@ async fn a_new_tip_reads_the_block_that_reached_depth_100() {
 }
 
 #[tokio::test]
-async fn a_reorg_deeper_than_100_blocks_replaces_the_displaced_counts() {
+async fn a_reorg_that_reaches_counted_blocks_replaces_the_displaced_counts() {
     let chain = FakeChain::default();
     chain.set(0..=TIP, 1, Some(7));
     let mut tracker = tracker(&chain);
@@ -482,7 +482,8 @@ async fn a_failed_repair_keeps_the_blocks_no_reorg_can_reach() {
         .await
         .expect("the fake chain answers");
     read_all(&mut tracker).await;
-    assert_eq!(counts(&tracker), [(7, 1_201)]);
+    // Every height from genesis to the qualifying depth below 1,300 counts.
+    assert_eq!(counts(&tracker), [(7, 1_301 - QUALIFYING_DEPTH)]);
 
     chain.set(1_301..=1_400, 1, Some(7));
     chain.fail_reads();
@@ -615,7 +616,8 @@ async fn a_comparison_that_fails_part_way_forgets_every_block_it_could_not_clear
 }
 
 /// A tip change that arrives while the task fills the window is handled before
-/// the next older block, so the block that just reached depth 100 is read next.
+/// the next older block, so the block that just reached the qualifying depth is
+/// read next.
 #[tokio::test]
 async fn the_task_follows_a_new_tip_before_reading_older_blocks() {
     let chain = FakeChain::default();
@@ -671,16 +673,16 @@ async fn a_new_tip_retries_the_block_that_could_not_be_read() {
 }
 
 /// A gateway newly mined blocks name reaches the network once the tenth of
-/// them has 100 more blocks on top of it, and not before.
+/// them is [`QUALIFYING_DEPTH`] deep, and not before.
 ///
 /// The clock is paused, so each sleep returns only once the task has handled
 /// everything it was sent.
 #[tokio::test(start_paused = true)]
-async fn a_mined_gateway_reaches_the_network_once_its_tenth_block_is_100_deep() {
+async fn a_mined_gateway_reaches_the_network_once_its_tenth_block_counts() {
     let chain = FakeChain::default();
     let mined = TIP + 1;
     let tenth = mined + MIN_GATEWAY_BLOCKS - 1;
-    chain.set(0..=tenth + 100, 1, None);
+    chain.set(0..=tenth + QUALIFYING_DEPTH, 1, None);
     chain.set(mined..=tenth, 1, Some(7));
 
     let (mut tip_sender, latest_tip, tip_change) = ChainTipSender::new(None, &regtest());
@@ -692,23 +694,23 @@ async fn a_mined_gateway_reaches_the_network_once_its_tenth_block_is_100_deep() 
         run(&mut tracker, tip_change, &publisher).await;
     });
 
-    // Mine the blocks that name the gateway, then 99 more: nine of them count,
-    // and the tenth is 99 deep.
-    for height in mined..tenth + 100 {
+    // Mine the blocks that name the gateway, then enough more that nine of
+    // them count and the tenth is one block short of counting.
+    for height in mined..tenth + QUALIFYING_DEPTH {
         tip_sender.set_best_non_finalized_tip(Some(tip_block(1, height)));
         tokio::task::yield_now().await;
     }
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(ranked(&ranking).is_empty());
 
-    // One more block puts the tenth 100 deep.
-    tip_sender.set_best_non_finalized_tip(Some(tip_block(1, tenth + 100)));
+    // One more block puts the tenth at the qualifying depth.
+    tip_sender.set_best_non_finalized_tip(Some(tip_block(1, tenth + QUALIFYING_DEPTH)));
     tokio::time::timeout(
         Duration::from_secs(10),
         ranking.wait_for(|ranking| !ranking.gateways.is_empty()),
     )
     .await
-    .expect("the gateway is published once its tenth block is 100 deep")
+    .expect("the gateway is published once its tenth block counts")
     .expect("the tracker is still running");
     assert_eq!(ranked(&ranking), [(7, MIN_GATEWAY_BLOCKS)]);
 

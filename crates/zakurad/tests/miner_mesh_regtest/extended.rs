@@ -170,11 +170,13 @@ async fn gateway_restart_keeps_its_id() -> Result<()> {
     Ok(())
 }
 
-/// Two islands that cannot reach each other mine apart, 120 blocks naming A
-/// on one and 300 naming B on the other, until a relay joins them. A's island
-/// reorganises onto B's chain, 120 blocks deep: past the qualifying depth,
-/// within the 1,000 blocks a node can reorganise. Every mining node then ranks
-/// B alone, and A's miner keeps its connection to A as an ordinary one.
+/// Two islands that cannot reach each other mine apart until a relay joins
+/// them: A's island mines enough blocks naming A for twice the minimum of them
+/// to count, and B's island mines twice as many blocks naming B. A's island
+/// reorganises onto B's longer chain in a reorg `A_BLOCKS` deep: past the
+/// qualifying depth, within the 1,000 blocks a node can reorganise. Every
+/// mining node then ranks B alone, and A's miner keeps its connection to A as
+/// an ordinary one.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "starts zakurad children: run with the miner-mesh-regtest-extended nextest profile"]
 async fn deep_reorg_moves_the_ranking() -> Result<()> {
@@ -184,8 +186,8 @@ async fn deep_reorg_moves_the_ranking() -> Result<()> {
     const B: usize = 3;
     const B_MINER: usize = 4;
     const BRIDGE: usize = 5;
-    const A_BLOCKS: u32 = 120;
-    const B_BLOCKS: u32 = 300;
+    const A_BLOCKS: u32 = QUALIFYING_DEPTH + 2 * MIN_GATEWAY_BLOCKS;
+    const B_BLOCKS: u32 = 2 * A_BLOCKS;
     let _init_guard = zakura_test::init();
 
     // A's miner learns A from a relay rather than bootstrapping from it, so
@@ -274,7 +276,7 @@ async fn deep_reorg_moves_the_ranking() -> Result<()> {
 /// A pool that stops mining leaves every ranking once fewer than the minimum
 /// of its markers count. Its markers are consecutive, so that is when the
 /// first of them is older than the window: two days of blocks plus the
-/// qualifying depth after it, 2,404 blocks on Regtest. Its connections stay,
+/// qualifying depth after it, 2,314 blocks on Regtest. Its connections stay,
 /// as ordinary ones.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "starts zakurad children: run with the miner-mesh-regtest-extended nextest profile"]

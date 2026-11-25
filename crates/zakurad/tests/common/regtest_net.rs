@@ -117,7 +117,7 @@ const CONNECTION_TRACE_TIMEOUT: Duration = Duration::from_secs(10);
 const GATEWAY_MARKER_PREFIX: [u8; 5] = [0x6a, 0x17, b'M', b'R', 0x01];
 
 /// The blocks above a marker before the gateway it names counts.
-pub const QUALIFYING_DEPTH: u32 = 100;
+pub const QUALIFYING_DEPTH: u32 = 10;
 
 /// The fewest counted blocks that must name a gateway before a node ranks it.
 pub const MIN_GATEWAY_BLOCKS: u32 = 10;

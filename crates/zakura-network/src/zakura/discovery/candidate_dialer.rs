@@ -33,7 +33,7 @@ use super::protocol::{DialAdmission, ZakuraDiscoveryDialCandidate, ZakuraDiscove
 use super::redial::ZAKURA_REDIAL_HEALTHY_CONNECTION;
 use super::trace::{DialOwner, DialPhase, DiscoveryDialPhaseEvent, DiscoveryDialResultEvent};
 use crate::zakura::{
-    handler::{DialRegistration, DialReport},
+    handler::{DialAuthenticated, DialRegistration, DialReport},
     transport::RegisteredPeers,
     ZakuraEndpoint, ZakuraHandlerError, ZakuraLocalLimits, ZakuraPeerId, ZakuraServiceId,
     ZakuraTrace,
@@ -93,12 +93,23 @@ struct DialRound {
 
 #[derive(Debug)]
 struct DiscoveryDialOutcome {
-    /// The address whose handshake TLS authenticated, if this worker's dial got that far.
-    admitted_addr: Option<SocketAddr>,
+    /// What TLS authenticated, if this worker's dial got that far.
+    authenticated: Option<DialAuthenticated>,
     result: DiscoveryDialResult,
     /// How the worker's task ended. Shutdown can abort a task before its first
     /// poll.
     phase: DialPhase,
+}
+
+impl DiscoveryDialOutcome {
+    /// The address whose handshake TLS authenticated.
+    fn admitted_addr(&self) -> Option<SocketAddr> {
+        self.authenticated.map(|proved| proved.addr)
+    }
+
+    fn admitted_ip(&self) -> Option<IpAddr> {
+        self.admitted_addr().map(|addr| addr.ip())
+    }
 }
 
 /// Spawn the long-lived discovery candidate dialer for `endpoint`.
@@ -352,33 +363,22 @@ impl CandidateDialerIO {
     ) {
         trace_dial_phase(&self.trace, attempt, outcome.phase);
         let preferred = self.preferred.settled(&attempt);
-        let admitted_ip = outcome.admitted_addr.map(|addr| addr.ip());
-        if !state.complete(attempt, outcome.result, admitted_ip, Instant::now()) {
+        if !state.complete(
+            attempt,
+            outcome.result,
+            outcome.admitted_ip(),
+            Instant::now(),
+        ) {
             return;
         }
         if preferred {
             count_preferred_dial_result(outcome.result);
         }
-        // Only a dial that registered its connection says which ID the node
-        // answered with. An earlier dial's move says nothing about a dial
-        // that failed.
-        let connected = match outcome.result {
-            DiscoveryDialResult::Registered | DiscoveryDialResult::ShortLivedRegistered => self
-                .endpoint
-                .supervisor()
-                .moved_node_ids()
-                .borrow()
-                .current(attempt.node_id),
-            _ => attempt.node_id,
-        };
         apply_discovery_dial_result(
             &self.discovery,
-            DialedNode {
-                dialed: attempt.node_id,
-                connected,
-            },
+            DialedNode::of(attempt, &outcome),
             outcome.result,
-            outcome.admitted_addr,
+            outcome.admitted_addr(),
             &self.trace,
         )
         .await;
@@ -393,8 +393,12 @@ impl CandidateDialerIO {
         self.preferred.clear();
         while let Some((attempt, outcome)) = self.workers.next().await {
             trace_dial_phase(&self.trace, attempt, outcome.phase);
-            let admitted_ip = outcome.admitted_addr.map(|addr| addr.ip());
-            state.complete(attempt, outcome.result, admitted_ip, Instant::now());
+            state.complete(
+                attempt,
+                outcome.result,
+                outcome.admitted_ip(),
+                Instant::now(),
+            );
         }
     }
 }
@@ -435,7 +439,7 @@ impl Future for DiscoveryDialWorker {
                     DialPhase::WorkerCancelled
                 };
                 DiscoveryDialOutcome {
-                    admitted_addr: None,
+                    authenticated: None,
                     result: DiscoveryDialResult::Failed,
                     phase,
                 }
@@ -575,7 +579,7 @@ async fn run_discovery_dial_once(
     attempt: DialAttemptKey,
 ) -> DiscoveryDialOutcome {
     let finished = |result| DiscoveryDialOutcome {
-        admitted_addr: None,
+        authenticated: None,
         result,
         phase: DialPhase::WorkerFinished,
     };
@@ -588,10 +592,10 @@ async fn run_discovery_dial_once(
     }
 
     let trace = endpoint.trace();
-    let (admitted_addr_tx, admitted_addr_rx) = oneshot::channel();
+    let (authenticated_tx, authenticated_rx) = oneshot::channel();
     let (registration_tx, registration_rx) = oneshot::channel();
     let report = DialReport {
-        admitted_addr: admitted_addr_tx,
+        authenticated: authenticated_tx,
         registration: registration_tx,
     };
     let dial = AbortOnDropHandle::new(spawn_erased_named("discovery_dial", {
@@ -603,8 +607,8 @@ async fn run_discovery_dial_once(
         peer_id,
         registered,
         dial,
-        admitted_addr_rx,
-        admitted_addr: None,
+        authenticated_rx,
+        authenticated: None,
         registration_rx,
         own_registration: None,
         registration: PeerRegistration::Absent,
@@ -622,10 +626,10 @@ struct DialWatch {
     /// to, so an attempt that reached a moved node follows its registration.
     registered: RegisteredPeers,
     dial: AbortOnDropHandle<Result<(), ZakuraHandlerError>>,
-    /// Carries the address whose handshake TLS authenticated. The dial task
-    /// sends it before it registers the peer.
-    admitted_addr_rx: oneshot::Receiver<SocketAddr>,
-    admitted_addr: Option<SocketAddr>,
+    /// Carries what TLS authenticated. The dial task sends it before it
+    /// registers the peer.
+    authenticated_rx: oneshot::Receiver<DialAuthenticated>,
+    authenticated: Option<DialAuthenticated>,
     /// Carries how this attempt's own registration ended. The dial sends it
     /// before it serves the connection, so it is final once the dial ends.
     registration_rx: oneshot::Receiver<DialRegistration>,
@@ -645,12 +649,12 @@ impl DialWatch {
     /// aborts the dial.
     async fn run(mut self) -> DiscoveryDialOutcome {
         let result = self.classified().await;
-        let admitted_addr = self.admitted_addr();
-        if admitted_addr.is_some() {
+        let authenticated = self.authenticated();
+        if authenticated.is_some() {
             drop(self.dial.detach());
         }
         DiscoveryDialOutcome {
-            admitted_addr,
+            authenticated,
             result,
             phase: DialPhase::WorkerFinished,
         }
@@ -744,12 +748,12 @@ impl DialWatch {
         self.own_registration
     }
 
-    /// The address this attempt's dial authenticated, once the dial reported it.
-    fn admitted_addr(&mut self) -> Option<SocketAddr> {
-        if self.admitted_addr.is_none() {
-            self.admitted_addr = self.admitted_addr_rx.try_recv().ok();
+    /// What this attempt's dial authenticated, once the dial reported it.
+    fn authenticated(&mut self) -> Option<DialAuthenticated> {
+        if self.authenticated.is_none() {
+            self.authenticated = self.authenticated_rx.try_recv().ok();
         }
-        self.admitted_addr
+        self.authenticated
     }
 }
 
@@ -816,15 +820,27 @@ fn count_preferred_dial_result(result: DiscoveryDialResult) {
 }
 
 /// The node one attempt dialed, by the ID it dialed and the ID the node
-/// answered with. They differ when the dial registered a node that has
-/// added keys since the book learned `dialed` (zakura-quic TLS-7).
-#[derive(Clone, Copy, Debug)]
+/// answered with. They differ when the dial reached a node that has added
+/// keys since the book learned `dialed` (zakura-quic TLS-7).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct DialedNode {
     dialed: NodeId,
     connected: NodeId,
 }
 
 impl DialedNode {
+    /// The node of `attempt`, which answered with the ID that the attempt's
+    /// own handshake authenticated. What other dials to the same ID found
+    /// says nothing about this one.
+    fn of(attempt: DialAttemptKey, outcome: &DiscoveryDialOutcome) -> Self {
+        Self {
+            dialed: attempt.node_id,
+            connected: outcome
+                .authenticated
+                .map_or(attempt.node_id, |proved| proved.node_id),
+        }
+    }
+
     /// The book entries a served connection speaks for: the dialed ID's and,
     /// for a node that has moved on from it, the entry of its ID now. TLS
     /// proved the node holds both.

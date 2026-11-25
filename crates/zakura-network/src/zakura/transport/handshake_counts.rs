@@ -333,15 +333,26 @@ impl HandshakeCounts {
     /// node's ID. `connected` is that ID. When the node has moved on from the
     /// `dialed` ID, the dial's slot moves to `connected` with it, so the slot
     /// and the proof sit under the ID the connection registers with.
-    pub(crate) fn outbound_connected(&mut self, dialed: NodeId, connected: NodeId) {
+    ///
+    /// A dial to a preferred gateway's earlier ID claimed a held place that
+    /// `connected` doesn't keep. The move is refused, and nothing is
+    /// recorded, when the slot would then be an ordinary one above `cap`.
+    pub(crate) fn outbound_connected(
+        &mut self,
+        dialed: NodeId,
+        connected: NodeId,
+        cap: usize,
+    ) -> Result<(), SlotRefusal> {
         if dialed != connected {
-            self.connections.move_outbound(dialed, connected);
+            self.connections
+                .move_outbound(dialed, connected, cap, &self.preferred)?;
             self.slot_left(dialed);
         }
         *self.authenticated_dials.entry(connected).or_default() += 1;
         if let Some(formed) = self.preferred.with_connected(&connected) {
             self.preferred = formed;
         }
+        Ok(())
     }
 
     /// Replaces the preferred gateways the slot checks use. Slots already

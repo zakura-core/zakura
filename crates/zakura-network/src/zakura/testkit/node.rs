@@ -963,10 +963,10 @@ mod tests {
                 .await
                 .expect("dialer spawns");
             let mut registered = node.supervisor().registered_peers();
-            let (admitted_addr_tx, mut admitted_addr_rx) = tokio::sync::oneshot::channel();
+            let (authenticated_tx, mut authenticated_rx) = tokio::sync::oneshot::channel();
             let (registration_tx, registration_rx) = tokio::sync::oneshot::channel();
             let report = DialReport {
-                admitted_addr: admitted_addr_tx,
+                authenticated: authenticated_tx,
                 registration: registration_tx,
             };
             let endpoint = node.endpoint();
@@ -989,10 +989,11 @@ mod tests {
             .await
             .expect("peer registers before the timeout")
             .expect("peer-set watcher stays open");
-            let admitted_addr = admitted_addr_rx.try_recv().ok();
+            let authenticated = authenticated_rx.try_recv().ok();
             assert!(
-                admitted_addr.is_some_and(|addr| peer_loopback.direct.contains(&addr)),
-                "dialer {seed} reports the loopback path its handshake won, before registration: {admitted_addr:?}",
+                authenticated.is_some_and(|proved| peer_loopback.direct.contains(&proved.addr)
+                    && proved.node_id == peer_loopback.id),
+                "dialer {seed} reports the node and the loopback path its handshake won, before registration: {authenticated:?}",
             );
             assert_eq!(
                 tokio::time::timeout(TEST_NET_TIMEOUT, registration_rx)

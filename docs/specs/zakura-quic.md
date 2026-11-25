@@ -873,10 +873,20 @@ is today's Zakura logic.
   succeeded: the node moved from the dialed ID to the one it answers with.
   `zakura-network` MUST:
   1. register the connection once, under the ID the node answers with, and
-     hold the dial's connection slot under that ID;
+     hold the dial's connection slot under that ID. The connection limits
+     apply to that ID as they applied to the dialed one. A dial to a
+     preferred gateway's earlier ID claims a held place, which the ID the
+     node answers with keeps only if it is a preferred gateway's too. When
+     it isn't, and no ordinary slot is free, the dial MUST close before its
+     control handshake and end as a local limit, with no failure recorded.
+     Otherwise one gateway could answer each dial under a new ID and turn
+     every held place into an ordinary slot of its own. A dial to an ID
+     known to have moved claims its slot under the ID the node has now, so
+     it is refused before the handshake;
   2. record no failure and no backoff against the dialed ID in the
      discovery book, and count the registration as a success for the book's
-     entries of both IDs;
+     entries of both IDs. The second ID is the one the attempt's own
+     handshake authenticated, not what another dial to the same ID found;
   3. treat the node as connected, under either ID, wherever it decides
      whether to dial: a maintained bootstrap peer, a discovery candidate
      and a preferred gateway named by the earlier ID are left alone while
@@ -890,7 +900,10 @@ is today's Zakura logic.
      attempt closed this way ends as connected elsewhere, with no failure.
      A maintained dial treats it as it treats any closed duplicate: it
      waits on the registered connection, and counts a failure only if that
-     connection ends before it is healthy.
+     connection ends before it is healthy. This rule covers what only a
+     dial to an earlier ID can't know before TLS. A connection that
+     registers while this dial runs its control handshake meets it under
+     the duplicate rule, as it would meet a dial to the node's own ID.
 
   The dialer remembers moves in memory, at most 1,024, and learns one again
   with one dial after a restart. It keeps the book's entry of the earlier
@@ -2312,7 +2325,8 @@ still holds at most 4 entries, so discovery records don't change.
 Added:
 
 - **DIAL-9.** A dial that reaches its node under another ID is a move, not
-  a failure, and never replaces a registered connection.
+  a failure, never replaces a registered connection, and takes no slot the
+  limits would refuse the ID the node answers with.
 - **COMPAT-13.** What the release that adds a signature scheme does.
 
 Changed:

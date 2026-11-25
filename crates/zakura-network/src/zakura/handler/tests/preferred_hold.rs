@@ -518,7 +518,7 @@ fn outbound_gateway_keeps_a_tied_place_after_authentication() {
         publish_tied_gateways(&handler, target, caller);
         let mut dial = handler.claim_connection(target, false).expect("held place");
         if authenticated {
-            dial.outbound_connected(target);
+            dial.outbound_connected(target).expect("the same node");
         }
         let _inbound = handler
             .claim_connection(caller, true)
@@ -542,7 +542,7 @@ fn ranking_publication_reconciles_authenticated_slots() {
             .map(|node| RankedGateway::resolved(node, 1, GatewayStanding::Dialable));
         let mut slot = handler.claim_connection(incumbent, inbound).unwrap();
         if !inbound {
-            slot.outbound_connected(incumbent);
+            slot.outbound_connected(incumbent).expect("the same node");
         }
         handler.publish_gateway_ranking(stale);
         assert_eq!(preferred_set(&handler), [incumbent]);
@@ -574,8 +574,8 @@ fn a_stale_connected_snapshot_cannot_restore_a_closed_dial() {
     ];
     let mut first = handler.claim_connection(gateway, false).unwrap();
     let mut second = handler.claim_connection(gateway, false).unwrap();
-    first.outbound_connected(gateway);
-    second.outbound_connected(gateway);
+    first.outbound_connected(gateway).expect("the same node");
+    second.outbound_connected(gateway).expect("the same node");
     drop(first);
     publish(&handler, &snapshot);
     assert_eq!(preferred_set(&handler), [gateway]);
@@ -602,7 +602,8 @@ fn a_dial_that_reached_a_moved_gateway_gives_its_place_back() {
         .expect("held place");
     assert_eq!(split(&handler).preferred, 1);
 
-    dial.outbound_connected(current);
+    dial.outbound_connected(current)
+        .expect("an ordinary slot is free");
     assert_eq!((slots(&earlier), slots(&current)), (0, 1));
     assert_eq!(
         split(&handler),
@@ -616,6 +617,69 @@ fn a_dial_that_reached_a_moved_gateway_gives_its_place_back() {
     drop(dial);
     assert_eq!((slots(&earlier), slots(&current)), (0, 0));
     assert_eq!(split(&handler), SlotSplit::default());
+}
+
+/// A gateway that answers under another ID loses the held place its dial
+/// claimed, and with the ordinary slots full its slot has nowhere to go. The
+/// move is refused and the slot leaves with the dial. Were it allowed, one
+/// gateway could answer each dial under a new ID and turn every held place
+/// into an ordinary slot of its own, above the ordinary limit.
+#[test]
+fn a_moved_gateway_takes_no_slot_above_the_ordinary_limit() {
+    let handler = handler(40, 2);
+    let earlier = new_node();
+    let other = new_node();
+    let ranking = [
+        (earlier, GatewayStanding::Dialable),
+        (other, GatewayStanding::Dialable),
+    ];
+    let mut peers = fill(&handler, 40, false);
+    let full = SlotSplit {
+        preferred: 0,
+        ordinary: 40,
+        ordinary_inbound: 0,
+    };
+
+    for _ in 0..3 {
+        publish(&handler, &ranking);
+        let mut dial = handler
+            .claim_connection(earlier, false)
+            .expect("held place");
+        assert_eq!(
+            dial.outbound_connected(new_node()),
+            Err(SlotRefusal::Hold),
+            "no ordinary slot is free for the ID the gateway answers with"
+        );
+        assert_eq!(
+            split(&handler),
+            SlotSplit {
+                preferred: 1,
+                ..full
+            },
+            "a refused move leaves the slot where the dial claimed it"
+        );
+        drop(dial);
+        assert_eq!(split(&handler), full);
+    }
+
+    // With an ordinary slot free the node connects under its ID now, and
+    // the other gateway still finds its held place.
+    peers.pop();
+    publish(&handler, &ranking);
+    let mut dial = handler
+        .claim_connection(earlier, false)
+        .expect("held place");
+    dial.outbound_connected(new_node())
+        .expect("an ordinary slot is free");
+    assert_eq!(split(&handler), full);
+    let _other = handler.claim_connection(other, false).expect("held place");
+    assert_eq!(
+        split(&handler),
+        SlotSplit {
+            preferred: 1,
+            ..full
+        }
+    );
 }
 
 /// An authenticated owner at the truncation boundary beats its equally scored peers,

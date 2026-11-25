@@ -139,7 +139,7 @@ async fn a_dial_to_an_earlier_id_leaves_the_registered_connection() {
     dialer_peers.mark_unchanged();
     listener_peers.mark_unchanged();
 
-    let (admitted_addr, _admitted_addr) = oneshot::channel();
+    let (authenticated, mut proved) = oneshot::channel();
     let (registration, registered) = oneshot::channel();
     let endpoint = dialer.endpoint();
     tokio::time::timeout(
@@ -149,7 +149,7 @@ async fn a_dial_to_an_earlier_id_leaves_the_registered_connection() {
             earlier.clone(),
             dialer.limits(),
             Some(DialReport {
-                admitted_addr,
+                authenticated,
                 registration,
             }),
             NativeDialKind::Discovery,
@@ -161,6 +161,11 @@ async fn a_dial_to_an_earlier_id_leaves_the_registered_connection() {
     assert!(
         registered.await.is_err(),
         "the redundant dial registered nothing"
+    );
+    assert_eq!(
+        proved.try_recv().map(|proved| proved.node_id),
+        Ok(current),
+        "the dial reports the ID its own handshake authenticated"
     );
     let moved = dialer.supervisor().moved_node_ids();
     assert_eq!(moved.borrow().current(earlier.id), current);
@@ -180,6 +185,105 @@ async fn a_dial_to_an_earlier_id_leaves_the_registered_connection() {
     }
     registers(&dialer, &[current]).await;
 
+    dialer.shutdown().await;
+    listener.shutdown().await;
+}
+
+/// Blocks still name a gateway by its earlier ID, so the dial to it claims a
+/// held place. The node answers under the ID it has now, which no gateway
+/// names, and the ordinary slots are full. The dial ends as a local limit
+/// before the control handshake: neither end registers a peer and no slot
+/// stays charged, but the move is learned. The next dial is charged to the
+/// ID the node has now, and is refused before it reaches the network.
+#[tokio::test]
+async fn a_dial_to_a_moved_gateway_waits_for_an_ordinary_slot() {
+    let listener = ZakuraTestNode::builder(9310)
+        .extended_credential()
+        .spawn()
+        .await
+        .expect("listener spawns");
+    let dialer = ZakuraTestNode::builder(9311)
+        .spawn()
+        .await
+        .expect("dialer spawns");
+    let earlier = listener.earlier_node_addr().await;
+    let current = listener.node_addr().await.id;
+    let endpoint = dialer.endpoint();
+    let ranking = || {
+        [crate::zakura::RankedGateway::resolved(
+            earlier.id,
+            1,
+            crate::zakura::GatewayStanding::Dialable,
+        )]
+    };
+    endpoint.handler.publish_gateway_ranking(ranking());
+    let mut ordinary = Vec::new();
+    for index in 0u32.. {
+        let mut id = [0xA5; 32];
+        id[..4].copy_from_slice(&index.to_be_bytes());
+        match endpoint
+            .handler
+            .claim_connection(NodeId::from_bytes(&id), false)
+        {
+            Ok(slot) => ordinary.push(slot),
+            Err(refusal) => {
+                assert_eq!(
+                    refusal,
+                    SlotRefusal::Hold,
+                    "a place is held for the gateway"
+                );
+                break;
+            }
+        }
+    }
+    let limits = dialer.limits().clone();
+    let dial = |addr: NodeAddr| {
+        let (endpoint, limits) = (endpoint.clone(), limits.clone());
+        async move {
+            tokio::time::timeout(
+                TEST_NET_TIMEOUT,
+                serve_reported_native_dial_connection(
+                    &endpoint,
+                    addr,
+                    &limits,
+                    None,
+                    NativeDialKind::Discovery,
+                ),
+            )
+            .await
+            .expect("the dial ends before the timeout")
+        }
+    };
+    let is_local_limit = |result: &Result<(), ZakuraHandlerError>| matches!(result, Err(ZakuraHandlerError::ResourceLimit(limit)) if *limit == ADMISSION_LIMIT);
+
+    let refused = dial(earlier.clone()).await;
+    assert!(is_local_limit(&refused), "{refused:?}");
+    let moved = dialer.supervisor().moved_node_ids();
+    assert_eq!(moved.borrow().current(earlier.id), current);
+    assert_eq!(
+        (slots(&dialer, &earlier.id), slots(&dialer, &current)),
+        (0, 0)
+    );
+    assert!(dialer.supervisor().subscribe().borrow().is_empty());
+    assert!(listener.supervisor().subscribe().borrow().is_empty());
+
+    // Nothing listens here. The dial is refused before it sends a packet,
+    // or it would end as a failed handshake.
+    let nowhere = NodeAddr::with_addrs(earlier.id, [SocketAddr::from(([127, 0, 0, 1], 9))]);
+    endpoint.handler.publish_gateway_ranking(ranking());
+    let refused = dial(nowhere).await;
+    assert!(is_local_limit(&refused), "{refused:?}");
+
+    ordinary.pop();
+    endpoint.handler.publish_gateway_ranking(ranking());
+    dialer
+        .connect_native_to_addr(earlier.clone(), TEST_NET_TIMEOUT)
+        .await
+        .expect("an ordinary slot is free for the moved gateway");
+    registers(&dialer, &[current]).await;
+    assert_eq!(slots(&dialer, &current), 1);
+
+    drop(ordinary);
     dialer.shutdown().await;
     listener.shutdown().await;
 }

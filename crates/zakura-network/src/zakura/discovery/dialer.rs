@@ -171,9 +171,9 @@ pub(crate) async fn native_bootstrap_dial(
 ) -> Result<(), ZakuraHandlerError> {
     // Only discovery uses the admitted address, to settle per-IP reservations
     // and confirm the record address the dial reached.
-    let (admitted_addr, _) = oneshot::channel();
+    let (authenticated, _) = oneshot::channel();
     let report = DialReport {
-        admitted_addr,
+        authenticated,
         registration,
     };
     crate::zakura::handler::serve_reported_native_dial_connection(
@@ -311,10 +311,10 @@ mod tests {
             );
             let endpoint = node.endpoint();
             assert_eq!(endpoint.discovery_admission_capacity(), 0);
-            let (admitted_addr, _admitted_rx) = tokio::sync::oneshot::channel();
+            let (authenticated, _authenticated_rx) = tokio::sync::oneshot::channel();
             let (registration, _registration_rx) = tokio::sync::oneshot::channel();
             let report = DialReport {
-                admitted_addr,
+                authenticated,
                 registration,
             };
             let result = tokio::time::timeout(

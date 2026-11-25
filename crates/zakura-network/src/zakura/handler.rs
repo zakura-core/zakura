@@ -1746,19 +1746,28 @@ pub(crate) struct ConnectionAdmissionGuard {
     slots: IpSlots,
     node: NodeId,
     inbound: bool,
+    /// The connection limit the slot was claimed under.
+    max_connections: usize,
     #[cfg(any(test, zakura_sim))]
     observation: Option<HandshakeObservation>,
 }
 
 impl ConnectionAdmissionGuard {
     /// The outbound QUIC connection has authenticated the node this guard's
-    /// dial reached, whose ID is `connected`. When that isn't the dialed ID,
-    /// the guard holds its slot under `connected` from here on.
-    fn outbound_connected(&mut self, connected: NodeId) {
+    /// dial reached, whose ID is `connected`. When that isn't the ID the slot
+    /// was claimed for, the guard holds its slot under `connected` from here
+    /// on.
+    ///
+    /// The limits apply to `connected` as they did to the claim. A refusal
+    /// leaves the guard as it was, and the caller closes the connection.
+    fn outbound_connected(&mut self, connected: NodeId) -> Result<(), SlotRefusal> {
         assert!(!self.inbound && !self.authenticated_dial);
-        self.slots.counts().outbound_connected(self.node, connected);
+        self.slots
+            .counts()
+            .outbound_connected(self.node, connected, self.max_connections)?;
         self.node = connected;
         self.authenticated_dial = true;
+        Ok(())
     }
 }
 
@@ -3919,6 +3928,7 @@ impl ZakuraProtocolHandler {
             slots: self.supervisor.ip_slots.clone(),
             node,
             inbound,
+            max_connections: self.limits.max_connections,
         })
     }
 
@@ -6379,11 +6389,20 @@ pub(crate) enum DialRegistration {
     LocalLimit,
 }
 
+/// What TLS proved about the remote end of one dial.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DialAuthenticated {
+    /// The address whose handshake TLS authenticated.
+    pub(crate) addr: SocketAddr,
+    /// The ID the node answered with. It isn't the dialed ID when the node
+    /// has added keys since the dialer learned that one (zakura-quic TLS-7).
+    pub(crate) node_id: NodeId,
+}
+
 /// The channels on which a discovery or maintained dial reports its progress.
 pub(crate) struct DialReport {
-    /// Receives the address whose handshake TLS authenticated, before the
-    /// control handshake starts.
-    pub(crate) admitted_addr: oneshot::Sender<SocketAddr>,
+    /// Receives what TLS authenticated, before the control handshake starts.
+    pub(crate) authenticated: oneshot::Sender<DialAuthenticated>,
     /// Receives how registration ended. The dial drops it unsent when it ends
     /// before registration, or when this node refuses the peer for a reason
     /// other than a local limit.
@@ -6427,9 +6446,16 @@ pub(crate) async fn serve_reported_native_dial_connection(
     kind: NativeDialKind,
 ) -> Result<(), ZakuraHandlerError> {
     let dialed = node_addr.id;
+    // A node known to have moved on from `dialed` is charged under the ID it
+    // has now, so a dial the limits would refuse after TLS ends here.
+    let expected = endpoint
+        .supervisor
+        .moved_node_ids()
+        .borrow()
+        .current(dialed);
     let mut admission = endpoint
         .handler
-        .claim_connection(dialed, false)
+        .claim_connection(expected, false)
         .map_err(|_| ZakuraHandlerError::ResourceLimit(ADMISSION_LIMIT))?;
     let dial_timeout = native_dial_timeout(
         endpoint.quic.config(),
@@ -6464,12 +6490,15 @@ pub(crate) async fn serve_reported_native_dial_connection(
     {
         admission.observation = endpoint.handler.handshake_observation(&connection);
     }
+    let remote_node_id = connection.remote_id();
     let registration_report = report.map(|report| {
         // The receiver is gone when the caller stopped waiting for the result.
-        let _ = report.admitted_addr.send(connection.admitted_addr());
+        let _ = report.authenticated.send(DialAuthenticated {
+            addr: connection.admitted_addr(),
+            node_id: remote_node_id,
+        });
         report.registration
     });
-    let remote_node_id = connection.remote_id();
     let peer_id = ZakuraPeerId::from_node_id(remote_node_id);
     if remote_node_id != dialed {
         // The node added keys since this node learned `dialed`, and answers
@@ -6495,7 +6524,20 @@ pub(crate) async fn serve_reported_native_dial_connection(
         // A connection to the node that is still in its own handshake meets
         // this one in `register`, like any simultaneous open.
     }
-    admission.outbound_connected(remote_node_id);
+    if admission.outbound_connected(remote_node_id).is_err() {
+        // The dial claimed a preferred gateway's held place, which the ID
+        // the node answers with doesn't keep, and no ordinary slot is free.
+        metrics::counter!("zakura.p2p.conn.dial.refused.hold").increment(1);
+        #[cfg(any(test, zakura_sim))]
+        endpoint
+            .handler
+            .handshake_refused(&connection, "moved-peer-hold");
+        connection.close(
+            VarInt::from_u32(ZAKURA_CLOSE_RESOURCE),
+            ADMISSION_LIMIT.as_bytes(),
+        );
+        return Err(ZakuraHandlerError::ResourceLimit(ADMISSION_LIMIT));
+    }
     let conn = ZakuraConnTrace::new(
         &endpoint.handler.trace,
         trace_conn_id(&connection),

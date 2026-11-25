@@ -1546,10 +1546,13 @@ where
     /// `bpv1_proposer` comes from the same
     /// [`GetBlockTemplateHandler::template_bpv1_proposer`] answer that sized the selection of
     /// `mempool_txs`, so the build never adds a commitment output the selection did not reserve.
+    ///
+    /// An empty template keeps `precomputed_coinbase` when the coinbase carries the BPv1
+    /// commitment this template needs, or none when it needs none.
     #[allow(clippy::too_many_arguments)]
     async fn build_mining_template(
         &self,
-        precomputed_coinbase: Option<TransactionTemplate<zakura_chain::amount::NegativeOrZero>>,
+        precomputed_coinbase: Option<types::get_block_template::PrecomputedCoinbase>,
         miner_params: &types::get_block_template::MinerParams,
         chain_info: &zakura_state::GetBlockTemplateChainInfo,
         long_poll_id: types::long_poll::LongPollId,
@@ -1557,14 +1560,30 @@ where
         submit_old: Option<bool>,
         bpv1_proposer: Option<Arc<dyn zakura_node_services::bpv1_proposer::Bpv1ProposerHook>>,
     ) -> Result<(BlockTemplateResponse, BuildTimes)> {
-        let bpv1_active = bpv1_proposer.is_some();
-        // An empty template with a completed coinbase has no proof work to queue
-        // (unless BPv1 is active at this height, in which case we embed the commitment output).
-        if precomputed_coinbase.is_some() && mempool_txs.is_empty() && !bpv1_active {
+        // An empty body's `C` does not depend on the parent, so the commitment matches the
+        // precomputed one unless BPv1 eligibility changed. Preparing it again registers the body
+        // under this parent's light-client root. The empty body's encoding is a few hashes, so
+        // it runs here.
+        let precomputed_coinbase = precomputed_coinbase
+            .filter(|_| mempool_txs.is_empty())
+            .filter(|precomputed| {
+                let bpv1_commitment = bpv1_proposer.as_ref().and_then(|proposer| {
+                    let height = chain_info.tip_height.next().ok()?;
+                    types::get_block_template::bpv1_template_commitment(
+                        proposer.as_ref(),
+                        chain_info.chain_history_root,
+                        height,
+                        std::iter::empty(),
+                    )
+                });
+                bpv1_commitment == precomputed.bpv1_commitment
+            });
+        // An empty template with a completed coinbase has no proof work to queue.
+        if let Some(precomputed) = precomputed_coinbase {
             let started = std::time::Instant::now();
             let template = BlockTemplateResponse::new_internal(
                 &self.network,
-                precomputed_coinbase,
+                Some(precomputed.coinbase),
                 miner_params,
                 chain_info,
                 long_poll_id,
@@ -1583,16 +1602,14 @@ where
         // When BPv1 encoding is active, run template construction
         // on the blocking pool (`TemplateBuildWork::Proof`) even for transparent
         // miners so Reed–Solomon encoding never blocks an async worker thread.
-        let work = if bpv1_active {
+        let work = if bpv1_proposer.is_some() {
             TemplateBuildWork::Proof
         } else {
-            match (&precomputed_coinbase, chain_info.tip_height.next()) {
-                (None, Ok(height)) => {
-                    TemplateBuildWork::for_coinbase(&self.network, height, miner_params)
-                }
-                // A coinbase that is already built leaves no proof to create, and neither does a
-                // parent with no next height, which the build rejects.
-                _ => TemplateBuildWork::ProofFree,
+            match chain_info.tip_height.next() {
+                Ok(height) => TemplateBuildWork::for_coinbase(&self.network, height, miner_params),
+                // A parent with no next height leaves no proof to create, and the build rejects
+                // it.
+                Err(_) => TemplateBuildWork::ProofFree,
             }
         };
         let network = self.network.clone();
@@ -1605,7 +1622,7 @@ where
                 let started = std::time::Instant::now();
                 let template = BlockTemplateResponse::new_internal(
                     &network,
-                    precomputed_coinbase,
+                    None,
                     &miner_params,
                     &chain_info,
                     long_poll_id,
@@ -1728,7 +1745,7 @@ where
     async fn new_tip_template(
         &self,
         request_id: u64,
-        precomputed_coinbase: Option<TransactionTemplate<zakura_chain::amount::NegativeOrZero>>,
+        precomputed_coinbase: Option<types::get_block_template::PrecomputedCoinbase>,
         miner_params: &types::get_block_template::MinerParams,
         chain_info: &zakura_state::GetBlockTemplateChainInfo,
         rejection_state: &types::get_block_template::TemplateRejections,
@@ -3830,17 +3847,38 @@ where
                     // before we start waiting for a new tip since computing the coinbase tx takes a few
                     // seconds if the miner mines to a shielded address, and we want to return fast
                     // when the tip changes.
+                    //
+                    // An empty body's BPv1 commitment `C` does not depend on the parent, so the
+                    // coinbase carries it too. The new tip's light-client root is still unknown,
+                    // so the precompute registers the body under the current parent's root, and
+                    // the new-tip template registers it again under its own.
+                    let light_client_root = chain_info.chain_history_root;
+                    let bpv1_proposer = self.gbt.template_bpv1_proposer(precomputed_height);
                     let precompute_coinbase = |network, height, params| {
                         let work = TemplateBuildWork::for_coinbase(&network, height, &params);
                         self.gbt.run_template_build(work, move || {
+                            let bpv1_commitment = bpv1_proposer.and_then(|proposer| {
+                                types::get_block_template::bpv1_template_commitment(
+                                    proposer.as_ref(),
+                                    light_client_root,
+                                    height,
+                                    std::iter::empty(),
+                                )
+                            });
                             TransactionTemplate::new_coinbase(
                                 &network,
                                 height,
                                 &params,
                                 Amount::zero(),
                                 None,
-                                None,
+                                bpv1_commitment.as_ref().map(|c| c.as_slice()),
                             )
+                            .map(|coinbase| {
+                                types::get_block_template::PrecomputedCoinbase {
+                                    coinbase,
+                                    bpv1_commitment,
+                                }
+                            })
                         })
                     };
 

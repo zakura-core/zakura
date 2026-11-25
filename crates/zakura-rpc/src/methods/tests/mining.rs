@@ -516,7 +516,10 @@ fn precomputed_template_does_not_wait_for_proof_capacity() {
         assert!(futures::poll!(&mut proof).is_pending());
 
         let mut template = Box::pin(rpc.build_mining_template(
-            Some(coinbase),
+            Some(types::get_block_template::PrecomputedCoinbase {
+                coinbase,
+                bpv1_commitment: None,
+            }),
             params,
             &chain,
             template_id(&chain),
@@ -531,6 +534,199 @@ fn precomputed_template_does_not_wait_for_proof_capacity() {
         assert_eq!(template.previous_block_hash, chain.tip_hash);
         gate.release().await;
         bounded(proof).await.unwrap();
+    });
+}
+
+/// The payload [`RecordingBpv1Proposer`] commits every template to.
+const BPV1_PAYLOAD: [u8; zakura_node_services::bpv1_proposer::BPV1_COMMITMENT_NULL_DATA_LEN] =
+    [0x42; zakura_node_services::bpv1_proposer::BPV1_COMMITMENT_NULL_DATA_LEN];
+
+/// One `prepare_template_commitment` call: the light-client root, the height, the transaction
+/// count and the length of the body after the coinbase.
+type PreparedTemplate = ([u8; 32], Height, u32, usize);
+
+/// A BPv1 proposer that accepts every template, commits it to [`BPV1_PAYLOAD`] and records
+/// each preparation.
+#[derive(Debug, Default)]
+struct RecordingBpv1Proposer {
+    prepared: std::sync::Mutex<Vec<PreparedTemplate>>,
+}
+
+impl RecordingBpv1Proposer {
+    fn prepared(&self) -> Vec<PreparedTemplate> {
+        self.prepared.lock().unwrap().clone()
+    }
+}
+
+impl zakura_node_services::bpv1_proposer::Bpv1ProposerHook for RecordingBpv1Proposer {
+    fn prepare_template_commitment(
+        &self,
+        light_client_root: [u8; 32],
+        height: Height,
+        tx_count: u32,
+        body_after_coinbase: &[u8],
+    ) -> Option<[u8; zakura_node_services::bpv1_proposer::BPV1_COMMITMENT_NULL_DATA_LEN]> {
+        self.prepared.lock().unwrap().push((
+            light_client_root,
+            height,
+            tx_count,
+            body_after_coinbase.len(),
+        ));
+        Some(BPV1_PAYLOAD)
+    }
+
+    fn publish_solved_block(
+        &self,
+        _block: Arc<zakura_chain::block::Block>,
+        _height: Height,
+    ) -> bool {
+        false
+    }
+}
+
+/// Whether `template`'s coinbase carries [`BPV1_PAYLOAD`].
+fn commits_bpv1_payload(template: &BlockTemplateResponse) -> bool {
+    template
+        .coinbase_txn
+        .data
+        .as_ref()
+        .windows(BPV1_PAYLOAD.len())
+        .any(|window| window == BPV1_PAYLOAD)
+}
+
+/// With BPv1 active, an empty template keeps a precomputed coinbase that carries its
+/// commitment, so it does not wait for proof capacity. It registers the body under the new
+/// parent's light-client root.
+#[test]
+fn precomputed_bpv1_template_does_not_wait_for_proof_capacity() {
+    mining_runtime(async {
+        let chain = chain_info(1, 1, 0);
+        let (_, info) = watch::channel(chain.clone());
+        let (rpc, _, _) = mining_rpc(info);
+        let proposer = Arc::new(RecordingBpv1Proposer::default());
+        let params = rpc.gbt.miner_params().unwrap();
+        let coinbase = TransactionTemplate::new_coinbase(
+            &network(),
+            Height(2),
+            params,
+            Amount::zero(),
+            None,
+            Some(&BPV1_PAYLOAD),
+        )
+        .unwrap();
+        let expected_coinbase = coinbase.data.clone();
+        let gate = BlockingPoolGate::new().await;
+        let handler = rpc.gbt.clone();
+        let mut proof = Box::pin(handler.run_template_build(TemplateBuildWork::Proof, || ()));
+        assert!(futures::poll!(&mut proof).is_pending());
+
+        let mut template = Box::pin(rpc.build_mining_template(
+            Some(types::get_block_template::PrecomputedCoinbase {
+                coinbase,
+                bpv1_commitment: Some(BPV1_PAYLOAD),
+            }),
+            params,
+            &chain,
+            template_id(&chain),
+            vec![],
+            Some(false),
+            Some(proposer.clone()),
+        ));
+        let Poll::Ready(Ok((template, _))) = futures::poll!(&mut template) else {
+            panic!("a precomputed BPv1 coinbase must not wait behind proof construction");
+        };
+        assert_eq!(template.coinbase_txn.data, expected_coinbase);
+        assert_eq!(template.previous_block_hash, chain.tip_hash);
+        let root: [u8; 32] = chain.chain_history_root.unwrap().into();
+        assert_eq!(proposer.prepared(), vec![(root, Height(2), 1, 0)]);
+        gate.release().await;
+        bounded(proof).await.unwrap();
+    });
+}
+
+/// With BPv1 active, a precomputed coinbase without the commitment is rebuilt with it.
+#[test]
+fn precomputed_coinbase_without_the_bpv1_commitment_is_rebuilt() {
+    mining_runtime(async {
+        let chain = chain_info(1, 1, 0);
+        let (_, info) = watch::channel(chain.clone());
+        let (rpc, _, _) = mining_rpc(info);
+        let proposer = Arc::new(RecordingBpv1Proposer::default());
+        let params = rpc.gbt.miner_params().unwrap();
+        let coinbase = TransactionTemplate::new_coinbase(
+            &network(),
+            Height(2),
+            params,
+            Amount::zero(),
+            None,
+            None,
+        )
+        .unwrap();
+
+        let (template, _) = bounded(rpc.build_mining_template(
+            Some(types::get_block_template::PrecomputedCoinbase {
+                coinbase,
+                bpv1_commitment: None,
+            }),
+            params,
+            &chain,
+            template_id(&chain),
+            vec![],
+            Some(false),
+            Some(proposer),
+        ))
+        .await
+        .unwrap();
+        assert!(commits_bpv1_payload(&template));
+    });
+}
+
+/// A long poll with BPv1 active precomputes the next empty block's coinbase with its
+/// commitment, and returns it on the new tip without waiting for the build slot.
+#[test]
+fn long_poll_keeps_the_precomputed_bpv1_coinbase_on_a_new_parent() {
+    mining_runtime(async {
+        let old = chain_info(0, 1, 0);
+        let (info_tx, info) = watch::channel(old.clone());
+        let (rpc, tip, _) = mining_rpc(info);
+        let proposer = Arc::new(RecordingBpv1Proposer::default());
+        let rpc = rpc.with_bpv1_proposer(proposer.clone());
+        let initial = bounded(rpc.get_block_template(None))
+            .await
+            .unwrap()
+            .try_into_template()
+            .unwrap();
+        assert!(commits_bpv1_payload(&initial));
+        let request = rpc.get_block_template(Some(GetBlockTemplateParameters {
+            long_poll_id: Some(initial.long_poll_id),
+            ..Default::default()
+        }));
+        tokio::pin!(request);
+        assert!(futures::poll!(&mut request).is_pending());
+
+        let gate = TemplateBuildGate::new(&rpc).await;
+        let mut next = chain_info(1, 2, 0);
+        next.chain_history_root = Some([0x5a; 32].into());
+        info_tx.send_replace(next.clone());
+        tip.send_best_tip_height(next.tip_height);
+        tip.send_best_tip_hash(next.tip_hash);
+        let Poll::Ready(response) = futures::poll!(&mut request) else {
+            panic!("a precomputed BPv1 coinbase must not wait for the build slot");
+        };
+        gate.release().await;
+
+        let template = response.unwrap().try_into_template().unwrap();
+        assert_eq!(template.previous_block_hash, next.tip_hash);
+        assert_eq!(template.height, 2);
+        assert!(commits_bpv1_payload(&template));
+        // The precompute registers the empty body under the old parent's root, and the
+        // new-tip template registers it again under the new parent's root.
+        let old_root: [u8; 32] = old.chain_history_root.unwrap().into();
+        let prepared = proposer.prepared();
+        assert_eq!(
+            prepared[prepared.len() - 2..],
+            [(old_root, Height(2), 1, 0), ([0x5a; 32], Height(2), 1, 0)]
+        );
     });
 }
 

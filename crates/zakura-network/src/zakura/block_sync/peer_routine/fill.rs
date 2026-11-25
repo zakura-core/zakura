@@ -323,8 +323,17 @@ impl PeerRoutine {
         }
     }
 
-    /// Attribute the pass's stop and ask for more work if pending work runs low.
+    /// Attribute the pass's stop, end a stale memory wait, and ask for more
+    /// work if pending work runs low.
     fn finish_fill_pass(&mut self, report: FillReport) {
+        // The routine waits on the pool only while its latest pass stopped on
+        // a memory refusal. Any other stop leaves it no refused request, and
+        // its wait would hold other consumers back for nothing (rule 3,
+        // `02 §5`). The requester pool's refusal is the other `Budget` stop.
+        let memory_refused = report.stop == FillStop::Budget && !self.state.request_pool_waiting;
+        if !memory_refused {
+            self.io.release_pool_wait();
+        }
         // A pass that issued nothing is a candidate bubble; the reason + the live
         // slot/budget/work snapshot let a trace tell a legitimate stop (no_work with
         // empty queue, cwnd_saturated) from a recoverable one (slots + budget + work
@@ -675,7 +684,8 @@ impl PeerIO {
                 AdmitRefusal::AccountingClosed => FillStop::AccountingClosed,
                 AdmitRefusal::Capacity(consumer) => {
                     // The routine retries when the pool changes, so it holds
-                    // a wait token for rule 3 until a request leases (`02 §5`).
+                    // a wait token for rule 3 until a request leases or a
+                    // later pass stops for another reason (`02 §5`).
                     self.hold_pool_wait(consumer);
                     FillStop::Budget
                 }

@@ -88,8 +88,8 @@ pub(super) struct PeerIO {
     pub(super) memory_pool: MemoryPool,
     /// Per-connection QUIC receive-credit controller (`02 §3`, `02 §6`).
     pub(super) conn_credit: Option<ConnectionCredit>,
-    /// Marks the consumer whose refusal stopped the last fill waiting, until
-    /// a request leases again. The routine polls that consumer's notifier.
+    /// Marks the consumer whose refusal stopped the last fill pass waiting.
+    /// The routine polls that consumer's notifier.
     pub(super) pool_wait: Option<(Consumer, PoolWaitToken)>,
     /// Receives the routine's events and snapshots, in test and simulator
     /// builds.
@@ -232,7 +232,7 @@ impl PeerIO {
         }
     }
 
-    /// End the wait after a request leased.
+    /// End the wait: a request leased, or a pass stopped for another reason.
     pub(super) fn release_pool_wait(&mut self) {
         self.pool_wait = None;
     }

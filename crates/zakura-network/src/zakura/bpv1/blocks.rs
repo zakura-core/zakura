@@ -2161,7 +2161,8 @@ impl BlockTable {
             }
             return;
         };
-        let height = height.unwrap_or(self.top);
+        let height =
+            height.expect("an entry that waits for its commitment has its admitted height");
         let mut senders = senders.into_iter();
         let (from_peer, session_gen) = senders
             .next()

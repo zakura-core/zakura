@@ -456,13 +456,12 @@ pub enum BlockInput {
     SessionEnded {
         /// Disconnected peer.
         peer: NodeId,
-        /// Generation of the ended session. Claims and pending pushes of
-        /// this session and of the peer's earlier sessions are released; a
-        /// later session's stay.
+        /// Generation of the ended session. Only its claims and pending
+        /// pushes are released; another session's stay.
         session_gen: u64,
         /// Every live session's pull capacity, read when the table takes
-        /// this input. An entry for `peer` with a later generation means
-        /// the peer reconnected, so its node facts stay (bpv1-89).
+        /// this input. An entry for another session of `peer` means the
+        /// peer reconnected, so its node facts stay (bpv1-89).
         peer_states: Vec<PullPeerState>,
     },
     /// `peer` sent `BlockDone` for `block_id`, so it holds every part. Only
@@ -499,8 +498,8 @@ pub enum BlockInput {
     ReleaseClaims {
         /// Peer whose claims are being released.
         peer: NodeId,
-        /// Generation of the session that holds the claims. A claim that a
-        /// later session of `peer` holds stays (bpv1-63).
+        /// Generation of the session that holds the claims. A claim that
+        /// another session of `peer` holds stays (bpv1-63).
         session_gen: u64,
         /// Target block.
         block_id: block::Hash,
@@ -2974,18 +2973,19 @@ impl BlockTable {
         peer_states: &[PullPeerState],
         step: &mut BlockStep,
     ) {
-        // bpv1-89: a later live session of `peer` keeps the node's path,
-        // announcements, and `BlockDone`.
+        // bpv1-89: another live session of `peer` keeps the node's path,
+        // announcements, and `BlockDone`. The table never relies on
+        // generation order, so only identity counts.
         let reconnected = peer_states
             .iter()
-            .any(|ps| ps.peer == peer && ps.session_gen > session_gen);
+            .any(|ps| ps.peer == peer && ps.session_gen != session_gen);
         // bpv1-65: drop path entry with connection.
         if !reconnected {
             self.paths.remove(&peer);
         }
-        // Session generations only grow, so this matches the ended session
-        // and the peer's earlier ones, never a later one.
-        let ended = |(owner, gen): (NodeId, u64)| owner == peer && gen <= session_gen;
+        // Every session's end reaches the table, so each end releases only
+        // its own session's claims and pending pushes.
+        let ended = |owner: (NodeId, u64)| owner == (peer, session_gen);
 
         let mut replan: Vec<(block::Hash, u32)> = Vec::new();
         for (&block_id, block) in &mut self.blocks {

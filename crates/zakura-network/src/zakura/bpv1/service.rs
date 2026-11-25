@@ -1015,40 +1015,41 @@ impl Service for Bpv1Service {
         };
 
         let conn_id = peer.conn_id;
-        let session_gen = self.node.next_session_gen.fetch_add(1, Ordering::AcqRel);
         let peer_cancel = peer.cancel_token();
         let session_cancel = peer_cancel.child_token();
         let (inputs, inputs_rx) = mpsc::unbounded_channel();
 
-        let snapshot = Arc::new(Mutex::new(PullPeerState {
-            peer: peer_node,
-            session_gen,
-            ahead_bytes: 0,
-            can_pull: true,
-            window_remaining: PULL_WINDOW,
-        }));
-
-        let live = LiveSession {
-            conn_id,
-            session_gen,
-            inputs,
-            cancel: session_cancel.clone(),
-            connection: peer_cancel.clone(),
-            load: peer.load().cloned(),
-            snapshot: snapshot.clone(),
-        };
-
-        {
+        // The generation is taken under the sessions lock, so a peer's
+        // sessions enter the map in generation order.
+        let (session_gen, snapshot) = {
             let mut sessions = self.node.lock_sessions();
             if sessions.len() >= self.node.config.max_sessions && !sessions.contains_key(&peer_node)
             {
                 session_cancel.cancel();
                 return;
             }
+            let session_gen = self.node.next_session_gen.fetch_add(1, Ordering::AcqRel);
+            let snapshot = Arc::new(Mutex::new(PullPeerState {
+                peer: peer_node,
+                session_gen,
+                ahead_bytes: 0,
+                can_pull: true,
+                window_remaining: PULL_WINDOW,
+            }));
+            let live = LiveSession {
+                conn_id,
+                session_gen,
+                inputs,
+                cancel: session_cancel.clone(),
+                connection: peer_cancel.clone(),
+                load: peer.load().cloned(),
+                snapshot: snapshot.clone(),
+            };
             if let Some(prev) = sessions.insert(peer_node, live) {
                 prev.cancel.cancel();
             }
-        }
+            (session_gen, snapshot)
+        };
 
         let node = Arc::clone(&self.node);
         // Audit crossing #5: replay currently active admitted blocks so a newly joined
@@ -1193,7 +1194,7 @@ async fn run_bpv1_driver(
                         session_gen,
                     } => {
                         // Hold `sessions` while the table ends the session.
-                        // A later session of the peer that is already live
+                        // Another session of the peer that is already live
                         // shows in `peer_states` and keeps the node's facts
                         // (bpv1-89). One that opens later registers after
                         // this end, so the end never clears what it rebuilt.

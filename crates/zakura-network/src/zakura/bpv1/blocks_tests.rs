@@ -2683,6 +2683,46 @@ fn an_ended_push_leaves_the_replacement_session_eligible() {
     table.assert_invariants();
 }
 
+/// bpv1-89: the table never infers liveness from generation order. Session 1
+/// of `p` is live and holds the claim on slot 0; session 2 registered first
+/// and ended. Session 2's end keeps session 1's claim and `p`'s node facts.
+#[test]
+fn an_ended_later_generation_keeps_a_live_earlier_sessions_claim() {
+    let coding = Profile::TINY.derive_coding(128, 2).unwrap();
+    let block_id = block::Hash([0xA9; 32]);
+    let (p, q) = (node_id(2), node_id(3));
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let t0 = Instant::now();
+    admit(&mut table, t0, block_id, coding, [0xA9; 32]);
+    observe(&mut table, t0, p, 5, 10_000_000);
+    observe(&mut table, t0, q, 40, 1_000_000);
+    let index = coding.wire_index(0, 0).unwrap();
+    let s = announce(&mut table, t0, p, block_id, vec![index], &[pull_state(p)]);
+    assert_eq!(granted_slots(&s, p), vec![0]);
+    let states = vec![pull_state(p), pull_state(q)];
+    let s = announce(&mut table, t0, q, block_id, vec![index], &states);
+    assert!(granted_slots(&s, q).is_empty());
+
+    let ended = table.step(
+        t0,
+        BlockInput::SessionEnded {
+            peer: p,
+            session_gen: 2,
+            peer_states: states,
+        },
+    );
+    assert!(
+        granted_slots(&ended, q).is_empty(),
+        "the ended session released the live session's claim: {:?}",
+        ended.outputs
+    );
+    assert!(
+        table.paths().get(&p).is_some(),
+        "the ended session dropped the live peer's path"
+    );
+    table.assert_invariants();
+}
+
 /// Repair rounds repeat every `base × 2^r`,
 /// with `base = SLOW_X ×` one part's estimated arrival, until the monotonic
 /// deadline, which is the only bound and the only way into fallback. Only the

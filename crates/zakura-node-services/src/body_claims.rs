@@ -83,6 +83,23 @@ impl SharedBodyClaims {
         true
     }
 
+    /// Moves the live claim on `hash` to expire at `deadline`, judging expiry
+    /// at `now`.
+    ///
+    /// Returns `true` if a live claim existed and `deadline` is later than its
+    /// expiry. A later expiry needs no wake: block sync's timer fires at the
+    /// earlier one, finds the hash still claimed, and re-arms.
+    pub fn extend_at(&self, hash: block::Hash, deadline: Instant, now: Instant) -> bool {
+        let mut claims = self.lock();
+        match claims.get_mut(&hash) {
+            Some(expiry) if now < *expiry && *expiry < deadline => {
+                *expiry = deadline;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Releases `hash`. Unless the block committed, notifies subscribers so
     /// native block sync can fetch the body immediately.
     pub fn release(&self, hash: block::Hash, reason: BodyClaimRelease) -> bool {
@@ -186,6 +203,42 @@ mod tests {
         );
         assert!(claims.release(b, BodyClaimRelease::Retired));
         assert!(rx.has_changed().unwrap(), "a retired claim frees the body");
+    }
+
+    #[test]
+    fn extending_a_live_claim_moves_its_expiry_later_only() {
+        let claims = SharedBodyClaims::new();
+        let t0 = Instant::now();
+        let h = block::Hash([0xAA; 32]);
+        let (early, late) = (t0 + Duration::from_secs(10), t0 + Duration::from_secs(30));
+
+        assert!(!claims.extend_at(h, late, t0), "no claim to extend");
+        assert!(claims.claim_at(h, early, t0));
+        let mut rx = claims.subscribe();
+        rx.mark_unchanged();
+        assert!(
+            !claims.extend_at(h, early, t0),
+            "an equal expiry is no extension"
+        );
+        assert!(claims.extend_at(h, late, t0));
+        assert!(!rx.has_changed().unwrap(), "a later expiry wakes nobody");
+        assert!(claims.is_claimed(h, early));
+        assert_eq!(claims.next_expiry(), Some(late));
+        assert!(
+            !claims.extend_at(h, early, t0),
+            "an extension never shortens"
+        );
+
+        assert!(claims.release(h, BodyClaimRelease::Fallback));
+        assert!(
+            !claims.extend_at(h, late, t0),
+            "a released claim stays released"
+        );
+        assert!(claims.claim_at(h, early, t0));
+        assert!(
+            !claims.extend_at(h, late, early),
+            "an expired claim stays expired"
+        );
     }
 
     #[test]

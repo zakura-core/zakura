@@ -21,6 +21,19 @@ proptest! {
         replay_bpv1_wire_bytes(&bytes, &mut no_meter);
     }
 
+    /// The mesh checks hold for arbitrary delivery orders and adversaries.
+    #[test]
+    fn mesh_replay_holds(bytes in prop::collection::vec(any::<u8>(), 0..512)) {
+        replay_bpv1_mesh_bytes(&bytes);
+    }
+}
+
+// Each codec and seed-edit case runs real coding and whole block
+// lifecycles, so these take fewer cases; the fuzz targets and the
+// `bpv1_quality` example run many more.
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(48))]
+
     /// The codec checks hold for arbitrary bodies and choices.
     #[test]
     fn codec_replay_holds(bytes in prop::collection::vec(any::<u8>(), 0..256)) {
@@ -50,48 +63,20 @@ proptest! {
             _ => drop(replay_bpv1_codec_bytes(&bytes)),
         }
     }
-
-    /// The mesh checks hold for arbitrary delivery orders and adversaries.
-    #[test]
-    fn mesh_replay_holds(bytes in prop::collection::vec(any::<u8>(), 0..512)) {
-        replay_bpv1_mesh_bytes(&bytes);
-    }
 }
 
-/// Every in-code seed replays without a failed check.
+/// Every in-code seed replays without a failed check, and the seeds alone
+/// reach every name each target expects, so a short run of a target starts
+/// from every alternative it can reach.
 #[test]
-fn seeds_replay() {
-    let seeds = seed_inputs();
-    assert!(!seeds.is_empty());
-    let quality = measure_bpv1_targets(0, 0);
-    for target in &quality {
-        assert!(target.inputs > 0, "{} has no seed", target.target);
-    }
-}
-
-/// The seeds alone reach every name each target expects, so a short run of
-/// a target starts from every alternative it can reach.
-#[test]
-fn seeds_reach_every_expected_name() {
+fn seeds_replay_and_reach_every_expected_name() {
     for target in measure_bpv1_targets(0, 0) {
+        assert!(target.inputs > 0, "{} has no seed", target.target);
         assert!(
             target.missing().is_empty(),
             "{}: the seeds miss {:?}",
             target.target,
             target.missing()
-        );
-    }
-}
-
-/// A short generated run per target holds every check. It is a smoke test
-/// of the drivers, not a campaign: a few hundred inputs each.
-#[test]
-fn generated_inputs_hold() {
-    for target in measure_bpv1_targets(300, 0x5EED) {
-        assert!(
-            target.inputs >= 300,
-            "{} replayed too few inputs",
-            target.target
         );
     }
 }

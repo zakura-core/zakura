@@ -18,8 +18,8 @@ mod tests;
 
 /// Where `getminermeshinfo` reads the miner mesh state.
 ///
-/// The default has no source, as on a node that does not mine and runs no
-/// v2 networking.
+/// The default has no source, as on a node that neither prefers gateways
+/// (it does not mine or set `mining.miner_mesh`) nor runs v2 networking.
 #[derive(Clone, Debug, Default)]
 pub struct MinerMeshSources {
     /// How much of its window the gateway counter has read, when this node

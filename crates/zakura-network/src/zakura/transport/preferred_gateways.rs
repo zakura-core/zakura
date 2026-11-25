@@ -1,8 +1,9 @@
 //! The mining gateways this node holds connection places for.
 //!
 //! Mining pools name their gateway in their coinbases by a [`GatewayId`], the
-//! first 20 bytes of its v2 node ID, and a mining node ranks those IDs by how
-//! many recent blocks name them. The node keeps up to
+//! first 20 bytes of its v2 node ID, and a node that prefers gateways (it
+//! mines or sets `mining.miner_mesh`) ranks those IDs by how many recent
+//! blocks name them. The node keeps up to
 //! [`MAX_PREFERRED_GATEWAYS`] connection places that ordinary peers cannot
 //! fill, for the highest-ranked gateways it can reach.
 //!

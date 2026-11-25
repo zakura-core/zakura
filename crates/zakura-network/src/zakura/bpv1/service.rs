@@ -2045,6 +2045,10 @@ async fn run_peer_routine(
     }
     // `remove_peer` may have taken this session's entry first, as the handler's
     // disconnect does. Its state in the table is still this session's to end.
+    node.drive(BlockInput::MetaSessionEnded {
+        peer: peer_node,
+        session_gen,
+    });
     let replaced = {
         let mut sessions = node.lock_sessions();
         match sessions.get(&peer_node) {

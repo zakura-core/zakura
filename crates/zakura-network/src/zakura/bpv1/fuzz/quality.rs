@@ -159,6 +159,7 @@ pub fn block_input_name(input: &BlockInput) -> &'static str {
         BlockInput::PushFlagged { .. } => "block-in:PushFlagged",
         BlockInput::PathObserved { .. } => "block-in:PathObserved",
         BlockInput::RateSample { .. } => "block-in:RateSample",
+        BlockInput::MetaSessionEnded { .. } => "block-in:MetaSessionEnded",
         BlockInput::SessionEnded { .. } => "block-in:SessionEnded",
         BlockInput::PeerBlockDone { .. } => "block-in:PeerBlockDone",
         BlockInput::PeerAnnounced { .. } => "block-in:PeerAnnounced",
@@ -176,7 +177,7 @@ pub fn block_input_name(input: &BlockInput) -> &'static str {
 }
 
 /// Every name [`block_input_name`] returns.
-pub const BLOCK_INPUTS: [&str; 23] = [
+pub const BLOCK_INPUTS: [&str; 24] = [
     "block-in:TipHeight",
     "block-in:ParentAdmitted",
     "block-in:MetaReceived",
@@ -187,6 +188,7 @@ pub const BLOCK_INPUTS: [&str; 23] = [
     "block-in:PushFlagged",
     "block-in:PathObserved",
     "block-in:RateSample",
+    "block-in:MetaSessionEnded",
     "block-in:SessionEnded",
     "block-in:PeerBlockDone",
     "block-in:PeerAnnounced",

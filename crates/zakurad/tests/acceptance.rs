@@ -1946,6 +1946,59 @@ fn end_of_support_is_checked_at_start() -> Result<()> {
     Ok(())
 }
 
+/// Check that the flag which keeps a node running past the end of its release's support
+/// reaches the end of support task, and that a mining node is refused the flag.
+#[test]
+fn end_of_support_is_only_ignored_with_its_flag() -> Result<()> {
+    use zakurad::components::sync::end_of_support::KEEP_RUNNING_FLAG;
+
+    let _init_guard = zakura_test::init();
+    let keeps_running = format!("{KEEP_RUNNING_FLAG} is set: this node keeps running");
+    // The default test config can build block templates, so it is a mining node.
+    let mining_config = default_test_config(&Mainnet);
+    let mut config = mining_config.clone();
+    config.mining.miner_address = None;
+
+    // With the flag, the end of support task says so when it starts.
+    let mut child = testdir()?
+        .with_config(&mut config.clone())?
+        .spawn_child(args!["start", KEEP_RUNNING_FLAG])?
+        .with_timeout(EXTENDED_LAUNCH_DELAY);
+    child.expect_stdout_line_matches(keeps_running.as_str())?;
+    child.kill(false)?;
+    child
+        .wait_with_output()?
+        .assert_failure()?
+        .assert_was_killed()?;
+
+    // Without it, the task starts and never says so.
+    let mut child = testdir()?
+        .with_config(&mut config)?
+        .spawn_child(args!["start"])?
+        .with_timeout(EXTENDED_LAUNCH_DELAY);
+    child.expect_stdout_line_matches("Starting end of support task")?;
+    // The task would log the flag right after that line, so give it time to be written.
+    std::thread::sleep(Duration::from_secs(2));
+    let remaining_output = child.kill_and_return_output(false)?;
+    assert!(
+        !remaining_output.contains(&keeps_running),
+        "a node started without {KEEP_RUNNING_FLAG} keeps the halt"
+    );
+
+    // A mining node does not start with the flag. A node that starts anyway is stopped at
+    // the timeout, which fails the test.
+    testdir()?
+        .with_config(&mut mining_config.clone())?
+        .spawn_child(args!["start", KEEP_RUNNING_FLAG])?
+        .wait_with_output_or_timeout(EXTENDED_LAUNCH_DELAY)?
+        .assert_failure()?
+        .stderr_contains(&format!(
+            "{KEEP_RUNNING_FLAG} is not allowed on a mining node"
+        ))?;
+
+    Ok(())
+}
+
 /// Test `zakura-checkpoints` on mainnet.
 ///
 /// If you want to run this test individually, see the module documentation.

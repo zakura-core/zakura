@@ -38,7 +38,7 @@ use crate::zakura::{
         service::{control_input, data_input, decode_meta_envelope, parse_and_verify_part_frame},
         wire::{
             encode_have_frame, encode_part_frame, message_type, Bpv1Message, DataQueueItem,
-            HaveForm,
+            HaveForm, HAVE_BITMAP_MAX_BYTES,
         },
     },
     wire_codec::{decode_frame, encode_frame, WireError, WireMessage},
@@ -350,9 +350,16 @@ fn check_smaller_form(indices: &[u32], reached: &mut Reached) {
     let list_len = HaveForm::List.indices_len(indices.len());
     // Widening u32 to usize is lossless on supported targets.
     let bitmap_len = total.div_ceil(8) as usize;
+    // No layout holds an index at or past `MAX_PARTS`, so only a list
+    // carries one.
+    let expected = if bitmap_len <= HAVE_BITMAP_MAX_BYTES {
+        list_len.min(bitmap_len)
+    } else {
+        list_len
+    };
     assert_eq!(
         form.indices_len(indices.len()),
-        list_len.min(bitmap_len),
+        expected,
         "{WIRE}: decision-33 the encoder picked the longer form"
     );
     assert!(

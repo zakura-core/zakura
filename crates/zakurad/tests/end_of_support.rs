@@ -16,9 +16,7 @@ mod log_capture;
 use zakura_chain::{
     block::Height,
     chain_tip::mock::MockChainTip,
-    parameters::{
-        Network, NetworkUpgrade, POST_BLOSSOM_POW_TARGET_SPACING, POST_NU7_POW_TARGET_SPACING,
-    },
+    parameters::{Network, POST_NU7_POW_TARGET_SPACING},
 };
 use zakurad::components::sync::end_of_support::{
     self, PastSupport, SupportWindow, CHECK_INTERVAL, EOS_KEEPS_RUNNING_MESSAGE_HEADER,
@@ -29,7 +27,7 @@ use zakurad::components::sync::end_of_support::{
 
 /// The release supports this height and halts at the next block.
 fn last_supported_height() -> Height {
-    Height(3_643_309)
+    Height(3_660_343)
 }
 
 /// The number of blocks per day at the halt height, which is past the ZIP 259
@@ -252,40 +250,30 @@ fn end_of_support_date() {
     assert!(!logs.contains(EOS_WARN_MESSAGE_HEADER));
 }
 
-/// Keep Mainnet EOS within one target-spaced block of December 5, 2026.
+/// Keep Mainnet EOS within one target-spaced block of December 10, 2026.
 #[test]
-fn mainnet_end_of_support_targets_december_5() {
+fn mainnet_end_of_support_targets_december_10() {
     let network = Network::Mainnet;
-    // Fixed projection anchor: Mainnet block 3,539,449, hash
-    // 000000000038f877e08b47ee92a5d1d99856b160471d4697dad11344cdc712ba,
-    // read from Mainnet RPC on November 3, 2026 (KST). Keep its block timestamp
-    // independent of release height bumps and later bundle imports so they
-    // cannot move the deadline.
+    // Mainnet block 3,604,646 was published in the November 24 release-state
+    // bundle. Its block timestamp anchors the projection across later releases.
     let reference_time = Utc
-        .with_ymd_and_hms(2026, 11, 2, 15, 49, 5)
+        .with_ymd_and_hms(2026, 11, 23, 21, 12, 46)
         .single()
         .expect("the reference timestamp is valid");
-    let reference_height = Height(3_539_449);
+    let reference_height = Height(3_604_646);
     let deadline = Utc
-        .with_ymd_and_hms(2026, 12, 5, 0, 0, 0)
+        .with_ymd_and_hms(2026, 12, 10, 0, 0, 0)
         .single()
         .expect("the EOS deadline is valid");
-    let nu7_activation_height = NetworkUpgrade::Nu7
-        .activation_height(&network)
-        .expect("NU7 activates on Mainnet");
     let first_unsupported_height = end_of_support::end_of_support_height(&network)
         .expect("support ends on Mainnet")
         .next()
         .expect("the support window ends below the maximum height");
 
-    // Blocks arrive at the post-Blossom spacing through the last pre-NU7
-    // height, and at the post-NU7 spacing from the ZIP 259 activation block.
-    let last_pre_nu7_height = i64::from(nu7_activation_height.0) - 1;
-    let pre_nu7_blocks = last_pre_nu7_height - i64::from(reference_height.0);
-    let post_nu7_blocks = i64::from(first_unsupported_height.0) - last_pre_nu7_height;
+    // All blocks in this projection use the post-NU7 target spacing.
+    let blocks_to_halt = i64::from(first_unsupported_height.0) - i64::from(reference_height.0);
     let estimated_halt = reference_time
-        + chrono::Duration::seconds(pre_nu7_blocks * i64::from(POST_BLOSSOM_POW_TARGET_SPACING))
-        + chrono::Duration::seconds(post_nu7_blocks * i64::from(POST_NU7_POW_TARGET_SPACING));
+        + chrono::Duration::seconds(blocks_to_halt * i64::from(POST_NU7_POW_TARGET_SPACING));
 
     assert!(
         estimated_halt >= deadline

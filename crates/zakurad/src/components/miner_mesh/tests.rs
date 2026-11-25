@@ -48,6 +48,8 @@ struct FakeBlock {
     pruned: bool,
     /// The first byte of the gateway ID the coinbase names, if it names one.
     gateway: Option<u8>,
+    /// How many coinbase outputs name the gateway.
+    marker_copies: usize,
 }
 
 /// A best chain the tests rewrite, answering the reads the tracker makes.
@@ -72,6 +74,18 @@ impl FakeChain {
     /// Puts the blocks of `fork` at `heights` on the best chain, each naming
     /// `gateway`.
     fn set(&self, heights: impl IntoIterator<Item = u32>, fork: u8, gateway: Option<u8>) {
+        self.set_with_copies(heights, fork, gateway, 1);
+    }
+
+    /// Puts the blocks of `fork` at `heights` on the best chain, each naming
+    /// `gateway` in `marker_copies` identical outputs.
+    fn set_with_copies(
+        &self,
+        heights: impl IntoIterator<Item = u32>,
+        fork: u8,
+        gateway: Option<u8>,
+        marker_copies: usize,
+    ) {
         let mut blocks = self
             .blocks
             .lock()
@@ -83,6 +97,7 @@ impl FakeChain {
                     hash: hash(fork, height),
                     pruned: false,
                     gateway,
+                    marker_copies,
                 },
             );
         }
@@ -181,7 +196,8 @@ impl FakeChain {
                 )
             }
             ReadRequest::Transaction(id) => ReadResponse::Transaction(
-                by_hash(block::Hash(id.0)).map(|block| mined_coinbase(block.gateway)),
+                by_hash(block::Hash(id.0))
+                    .map(|block| mined_coinbase(block.gateway, block.marker_copies)),
             ),
             request => {
                 return Err(format!("the tracker made an unexpected read: {request:?}").into())
@@ -197,16 +213,18 @@ fn hash(fork: u8, height: u32) -> block::Hash {
     block::Hash(bytes)
 }
 
-/// A coinbase that names the gateway whose ID starts with `gateway`, if any.
-fn mined_coinbase(gateway: Option<u8>) -> MinedTx {
+/// A coinbase that names the gateway whose ID starts with `gateway`, if any,
+/// in `marker_copies` identical outputs.
+fn mined_coinbase(gateway: Option<u8>, marker_copies: usize) -> MinedTx {
     let block: Block = BLOCK_MAINNET_1_BYTES
         .zcash_deserialize_into()
         .expect("the test vector is a valid block");
     let mut coinbase: Transaction = (*block.transactions[0]).clone();
     if let Some(gateway) = gateway {
+        let marker = MinerMeshCommitment::new(GatewayId::from_bytes([gateway; 20])).to_output();
         coinbase
             .outputs_mut()
-            .push(MinerMeshCommitment::new(GatewayId::from_bytes([gateway; 20])).to_output());
+            .extend(std::iter::repeat_n(marker, marker_copies));
     }
     MinedTx::new(
         Arc::new(coinbase).into(),
@@ -321,6 +339,25 @@ async fn reads_the_window_newest_first_and_counts_each_gateway() {
 
     assert_eq!(counts(&tracker), [(7, 10)]);
     assert!(tracker.snapshot().is_complete());
+}
+
+/// A pool that copies the template's marker output into a coinbase that
+/// already has it still names its gateway, and the block counts once.
+#[tokio::test]
+async fn a_coinbase_that_repeats_its_marker_counts_once() {
+    let chain = FakeChain::default();
+    chain.set(0..=TIP, 1, None);
+    chain.set([10], 1, Some(7));
+    chain.set_with_copies([11], 1, Some(7), 2);
+    let mut tracker = tracker(&chain);
+
+    tracker
+        .follow_tip(reset(1, TIP))
+        .await
+        .expect("the fake chain answers");
+    read_all(&mut tracker).await;
+
+    assert_eq!(counts(&tracker), [(7, 2)]);
 }
 
 #[tokio::test]

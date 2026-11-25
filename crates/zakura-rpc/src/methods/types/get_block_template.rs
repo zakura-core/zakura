@@ -44,6 +44,7 @@ use zakura_chain::{
     },
     serialization::DateTime32,
     transaction::VerifiedUnminedTx,
+    transparent::Script,
     work::difficulty::{CompactDifficulty, ExpandedDifficulty},
 };
 use zcash_script::{opcode::PushValue, pv::push_value};
@@ -398,6 +399,23 @@ pub struct BlockTemplateResponse {
     #[getset(get = "pub")]
     pub(crate) coinbase_txn: TransactionTemplate<amount::NegativeOrZero>,
 
+    /// The scriptPubKey of the zero-value miner mesh output, which names the
+    /// gateway node other miners can connect to. Present only when this node
+    /// announces one.
+    ///
+    /// It is the script alone, not a serialized output: it has no value or
+    /// length prefix. `coinbasetxn` already has the output, so a pool that
+    /// submits `coinbasetxn`'s outputs adds nothing. Only a pool that builds
+    /// its own coinbase outputs adds exactly one output with value zero and
+    /// this scriptPubKey.
+    ///
+    /// This field is not in `zcashd` or the Zcash RPC reference.
+    #[serde(rename = "minermeshscriptpubkey")]
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[getset(get = "pub")]
+    pub(crate) miner_mesh_script_pubkey: Option<Script>,
+
     /// An ID that represents the chain tip and mempool contents for this template.
     #[serde(rename = "longpollid")]
     #[getset(get_copy = "pub")]
@@ -514,6 +532,7 @@ impl fmt::Debug for BlockTemplateResponse {
             .field("transaction_count", &self.transactions.len())
             .field("transactions", &transactions_truncated)
             .field("coinbase_txn", &self.coinbase_txn)
+            .field("miner_mesh_script_pubkey", &self.miner_mesh_script_pubkey)
             .field("long_poll_id", &self.long_poll_id)
             .field("target", &self.target)
             .field("min_time", &self.min_time)
@@ -550,7 +569,8 @@ impl BlockTemplateResponse {
     /// `mempool_txs` reserved that output; see [`GetBlockTemplateHandler::template_bpv1_proposer`].
     ///
     /// A `precomputed_coinbase` is used as it is, so the caller passes one only when it
-    /// already carries the commitment output the template needs, and then passes no
+    /// already carries the commitment output the template needs and was built from
+    /// `miner_params`, so it carries the same miner mesh marker, and then passes no
     /// `bpv1_proposer`.
     #[allow(clippy::too_many_arguments, clippy::unwrap_in_result)]
     pub(crate) fn new_internal(
@@ -688,6 +708,12 @@ impl BlockTemplateResponse {
             transactions: mempool_tx_templates,
 
             coinbase_txn,
+
+            // Matches the marker in `coinbasetxn`: a precomputed coinbase is built
+            // from `miner_params` too (see this function's doc).
+            miner_mesh_script_pubkey: miner_params
+                .mesh_commitment()
+                .map(|commitment| commitment.lock_script()),
 
             long_poll_id,
 

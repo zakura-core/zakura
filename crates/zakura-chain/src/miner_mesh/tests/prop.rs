@@ -57,8 +57,7 @@ proptest! {
         change in 1..=u8::MAX,
     ) {
         let mut script = MinerMeshCommitment::new(gateway_id)
-            .to_output()
-            .lock_script
+            .lock_script()
             .as_raw_bytes()
             .to_vec();
         script[index] ^= change;
@@ -67,17 +66,37 @@ proptest! {
         prop_assert_eq!(MinerMeshCommitment::from_coinbase_outputs(&[output]), None);
     }
 
-    /// Two commitments name no gateway, whatever they commit to.
+    /// Commitments to two different gateways name neither.
     #[test]
-    fn two_commitments_name_no_gateway(
+    fn commitments_to_two_gateways_name_no_gateway(
         first in gateway_id(),
         second in gateway_id(),
         mut outputs in other_outputs(),
     ) {
+        prop_assume!(first != second);
         outputs.push(MinerMeshCommitment::new(first).to_output());
         outputs.insert(0, MinerMeshCommitment::new(second).to_output());
 
         prop_assert_eq!(MinerMeshCommitment::from_coinbase_outputs(&outputs), None);
+    }
+
+    /// Any number of copies of one commitment, wherever they sit among other
+    /// outputs, name its gateway.
+    #[test]
+    fn copies_of_one_commitment_name_its_gateway(
+        gateway_id in gateway_id(),
+        mut outputs in other_outputs(),
+        positions in vec(any::<prop::sample::Index>(), 1..5),
+    ) {
+        let commitment = MinerMeshCommitment::new(gateway_id);
+        for position in positions {
+            outputs.insert(position.index(outputs.len() + 1), commitment.to_output());
+        }
+
+        prop_assert_eq!(
+            MinerMeshCommitment::from_coinbase_outputs(&outputs),
+            Some(commitment),
+        );
     }
 
     /// A gateway ID is the start of the node ID it was cut from, and of no

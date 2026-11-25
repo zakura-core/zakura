@@ -86,9 +86,20 @@ async fn announcing_block(net: &Network, addr_type: MinerAddressType) -> eyre::R
 
     let block = mine_template_block(net, config).await?;
 
-    let gateway = MinerMeshCommitment::from_coinbase_outputs(block.transactions[0].outputs())
-        .map(|commitment| commitment.gateway_id().to_string());
-    assert_eq!(gateway.as_deref(), Some(GATEWAY_ID));
+    let outputs = block.transactions[0].outputs();
+    let commitment = MinerMeshCommitment::from_coinbase_outputs(outputs)
+        .ok_or_else(|| eyre::eyre!("the coinbase names no gateway"))?;
+    assert_eq!(commitment.gateway_id().to_string(), GATEWAY_ID);
+    // The reader accepts repeated copies of one commitment, so count them:
+    // the coinbases this node builds write exactly one.
+    let commitment_outputs = outputs
+        .iter()
+        .filter(|output| output.lock_script == commitment.lock_script())
+        .count();
+    assert_eq!(
+        commitment_outputs, 1,
+        "the coinbase has exactly one commitment"
+    );
 
     Ok(block)
 }

@@ -1282,7 +1282,7 @@ pub async fn test_mining_rpcs<State, ReadState>(
         Buffer::new(mempool.clone(), 1),
         state.clone(),
         read_state.clone(),
-        block_verifier_router,
+        block_verifier_router.clone(),
         mock_sync_status.clone(),
         mock_tip.clone(),
         MockAddressBookPeers::default(),
@@ -1366,6 +1366,58 @@ pub async fn test_mining_rpcs<State, ReadState>(
 
     snapshot_rpc_getblocktemplate(
         "long_poll",
+        (*get_block_template).into(),
+        Some(coinbase_tx),
+        &settings,
+    );
+
+    // Basic variant from a node that names a gateway, so the template has
+    // `minermeshscriptpubkey` and the coinbase has the output it names.
+
+    let (rpc_announcing, _) = TestRpcImpl::new_for_tests(
+        network.clone(),
+        mining_conf.clone(),
+        false,
+        "0.0.1",
+        "RPC test",
+        Buffer::new(mempool.clone(), 1),
+        state.clone(),
+        read_state.clone(),
+        block_verifier_router,
+        mock_sync_status.clone(),
+        mock_tip.clone(),
+        MockAddressBookPeers::default(),
+        rx.clone(),
+        None,
+    );
+    let rpc_announcing = rpc_announcing.with_mesh_commitment(MinerMeshCommitment::new(
+        zakura_chain::miner_mesh::GatewayId::from_bytes([0x5a; 20]),
+    ));
+
+    let mock_read_state_request_handler = make_mock_read_state_request_handler();
+    let mock_mempool_request_handler = make_mock_mempool_request_handler();
+
+    let (get_block_template, ..) = tokio::join!(
+        rpc_announcing.get_block_template(None),
+        mock_mempool_request_handler,
+        mock_read_state_request_handler,
+    );
+
+    let GetBlockTemplateResponse::TemplateMode(get_block_template) =
+        get_block_template.expect("unexpected error in getblocktemplate RPC call")
+    else {
+        panic!("a getblocktemplate call without parameters returns a template");
+    };
+
+    let coinbase_tx: Transaction = get_block_template
+        .coinbase_txn
+        .data
+        .as_ref()
+        .zcash_deserialize_into()
+        .expect("coinbase bytes are valid");
+
+    snapshot_rpc_getblocktemplate(
+        "basic_announcing",
         (*get_block_template).into(),
         Some(coinbase_tx),
         &settings,

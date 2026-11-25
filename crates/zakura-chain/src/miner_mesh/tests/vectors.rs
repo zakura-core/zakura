@@ -38,14 +38,18 @@ fn zero_value_output(script: &[u8]) -> Output {
 }
 
 fn commitment_script() -> Vec<u8> {
-    commitment().to_output().lock_script.as_raw_bytes().to_vec()
+    commitment().lock_script().as_raw_bytes().to_vec()
 }
 
 #[test]
 fn output_has_the_documented_bytes() {
     let output = commitment().to_output();
 
-    assert_eq!(hex::encode(output.lock_script.as_raw_bytes()), SCRIPT_HEX);
+    assert_eq!(
+        hex::encode(commitment().lock_script().as_raw_bytes()),
+        SCRIPT_HEX
+    );
+    assert_eq!(output.lock_script, commitment().lock_script());
     assert_eq!(output.value, Amount::<NonNegative>::zero());
     assert_eq!(
         commitment().payload().as_slice(),
@@ -87,12 +91,30 @@ fn outputs_without_a_commitment_name_no_gateway() {
 }
 
 #[test]
-fn two_commitments_are_ambiguous() {
+fn copies_of_one_commitment_name_its_gateway() {
+    for outputs in [
+        vec![commitment().to_output(), commitment().to_output()],
+        vec![
+            commitment().to_output(),
+            reward_output(),
+            commitment().to_output(),
+            commitment().to_output(),
+        ],
+    ] {
+        assert_eq!(
+            MinerMeshCommitment::from_coinbase_outputs(&outputs),
+            Some(commitment()),
+        );
+    }
+}
+
+#[test]
+fn commitments_to_two_gateways_are_ambiguous() {
     let other = MinerMeshCommitment::new(GatewayId::from_bytes([0xff; 20]));
 
     for outputs in [
         vec![commitment().to_output(), other.to_output()],
-        vec![commitment().to_output(), commitment().to_output()],
+        vec![other.to_output(), reward_output(), commitment().to_output()],
         vec![
             commitment().to_output(),
             reward_output(),

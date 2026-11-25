@@ -664,6 +664,13 @@ impl ConnectionCredit {
         self.inner.live_receive_window.clone()
     }
 
+    /// The receive window the machine sets: the base plus live request
+    /// credit.
+    #[cfg(test)]
+    pub(crate) fn receive_window(&self) -> u64 {
+        self.lock().machine.receive_window()
+    }
+
     /// Raise the connection's QUIC receive window by `bytes` before sending a
     /// leased request (`02 §3`).
     pub(crate) fn add_receive_credit(&self, bytes: u64) {

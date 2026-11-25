@@ -77,6 +77,20 @@ struct TxCreditLease {
 }
 
 impl TxCreditLease {
+    /// A granted fetch holding `lease`, on a connection with `credit`.
+    ///
+    /// Only a leased fetch adds receive credit: credit the peer doesn't
+    /// spend stays charged to the lease until the peer can't spend it
+    /// (`02 §6`). The empty-pool exception's fetch has no lease, so its body
+    /// rides on the maximal `Tx` frame the data stream's static base holds.
+    fn new(lease: Option<PoolLease>, credit: Option<ConnectionCredit>) -> Self {
+        Self {
+            credit: credit.filter(|_| lease.is_some()),
+            lease,
+            unspent_credit: 0,
+        }
+    }
+
     /// A `GetTxs` for `bytes` goes out: the connection's receive window
     /// grows by them.
     fn ask(&mut self, bytes: u64) {
@@ -1208,14 +1222,8 @@ impl Routine {
     fn hold_tx_lease(&mut self, reservation: &mut Reservation, lease: Option<PoolLease>) {
         let id = reservation.id();
         let ended = reservation.take_tx_lease_end();
-        self.tx_leases.insert(
-            id,
-            TxCreditLease {
-                lease,
-                credit: self.io.conn_credit.clone(),
-                unspent_credit: 0,
-            },
-        );
+        self.tx_leases
+            .insert(id, TxCreditLease::new(lease, self.io.conn_credit.clone()));
         self.calls.push(Box::pin(async move {
             ended.ended().await;
             PoolResult::TxLeaseEnded { reservation: id }

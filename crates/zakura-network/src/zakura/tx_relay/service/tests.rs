@@ -209,12 +209,17 @@ impl Session {
     /// Opens a session of peer 1 on [`connection`] from [`peer_ip`], as
     /// `add_peer` does, and lets it read the pool.
     fn open(wiring: &Wiring) -> Self {
+        Self::open_with_credit(wiring, None)
+    }
+
+    /// [`Self::open`] on a connection whose receive credit is `credit`.
+    fn open_with_credit(wiring: &Wiring, credit: Option<ConnectionCredit>) -> Self {
         let (data, data_recv) = mpsc::channel(DATA_QUEUE);
         let (state, state_recv) = mpsc::channel(STATE_QUEUE);
         let (reports, reports_rx) = mpsc::unbounded_channel();
         let (close, cause, cancel) = closer();
         let have = MeteredSender::new(open_have_bucket(&wiring.have_buckets, &connection()));
-        let io = SessionIo::new(data, state, close, reports_rx, have, connection(), None);
+        let io = SessionIo::new(data, state, close, reports_rx, have, connection(), credit);
         let mut routine = Routine::open(
             wiring.clone(),
             PeerKey(1),
@@ -652,4 +657,124 @@ async fn a_fetch_holds_its_tx_lease_until_the_core_ends_it() {
     assert_eq!(tx_leased(), 0);
     drop(borrowed);
     assert_eq!(memory_pool.snapshot().total_leased, 0);
+}
+
+/// Receive credit on a real connection. The simulator has no local QUIC
+/// endpoint.
+#[cfg(not(zakura_sim))]
+mod receive_credit {
+    use super::*;
+
+    /// Accepts every connection on [`CREDIT_ALPN`] and holds it open.
+    struct HoldConnections;
+
+    const CREDIT_ALPN: &[u8] = b"/zakura/test/tx-relay-credit/1";
+
+    impl zakura_quic::Acceptor for HoldConnections {
+        fn admit(&self, _incoming: &zakura_quic::IncomingInfo) -> zakura_quic::Admit {
+            zakura_quic::Admit::Accept
+        }
+
+        fn alpns(&self) -> Vec<Vec<u8>> {
+            vec![CREDIT_ALPN.to_vec()]
+        }
+
+        fn handle(&self, connection: zakura_quic::Conn) -> futures::future::BoxFuture<'static, ()> {
+            Box::pin(async move {
+                connection.closed().await;
+            })
+        }
+    }
+
+    /// `02 §6`, `02 §7` item 7: receive credit beyond the base is always backed
+    /// by a lease. The empty-pool exception's fetch has no lease, so its
+    /// `GetTxs` adds no credit: its body rides on the maximal `Tx` frame in the
+    /// data stream's base. Otherwise a `NotFound` would leave the peer credit
+    /// that no drain covers, once per connection.
+    #[tokio::test]
+    async fn an_unleased_fetch_adds_no_receive_credit() -> Result<(), crate::BoxError> {
+        use crate::zakura::{
+            memory::{ConsumerSpec, PoolConfig},
+            testkit::LocalEndpointFactory,
+        };
+
+        let tx = transactions(1).remove(0).transaction;
+        let (id, size) = (tx.id(), u32::try_from(tx.size()).expect("fits u32"));
+
+        // Block sync borrows all of `S`, so `Consumer::Tx`, with no floor,
+        // leases nothing.
+        let shared = 4 * u64::from(MAX_TX_BYTES);
+        let memory_pool = MemoryPool::new(
+            PoolConfig::new(shared, 0)
+                .with_consumer(Consumer::Tx, ConsumerSpec::bulk(0, shared, 1))
+                .with_consumer(Consumer::BlockSync, ConsumerSpec::bulk(0, shared, 1)),
+        );
+        let _borrowed = memory_pool
+            .try_acquire(Consumer::BlockSync, None, shared)
+            .expect("block sync borrows the shared bytes");
+
+        let server = LocalEndpointFactory::new().endpoint(93401).await?;
+        let client = LocalEndpointFactory::new().endpoint(93402).await?;
+        server.serve(HoldConnections)?;
+        let conn = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.connect(
+                LocalEndpointFactory::node_addr(&server).await,
+                &[CREDIT_ALPN],
+            ),
+        )
+        .await??;
+        let base = 1024 * 1024;
+        let credit = ConnectionCredit::new_quic(connection().1, conn, base, base);
+
+        let (handle, mut inbox) = pool_port();
+        publish(&inbox, Vec::new(), Vec::new());
+        let (wiring, _handed) = wiring_with(handle, memory_pool.clone());
+        let mut session = Session::open_with_credit(&wiring, Some(credit.clone()));
+        session
+            .deliver(TxRelayMessage::Hello {
+                serves: 16,
+                max_tx_bytes: MAX_TX_BYTES,
+            })
+            .await;
+
+        // The empty-pool exception grants the unleased fetch, which asks.
+        session
+            .deliver(TxRelayMessage::Have(vec![(id, size)]))
+            .await;
+        let (reservation, hold) =
+            inbox.grant_relayed(ReservationId(1), id, CancellationToken::new());
+        let unleased = RelayedFetch {
+            announced_size: u64::from(size),
+            leased_bytes: 0,
+        };
+        answer_reserve(&mut session, &mut inbox, id, unleased, Ok(reservation)).await;
+        assert_eq!(
+            memory_pool.snapshot().consumers[Consumer::Tx.index()].leased,
+            0
+        );
+        assert!(
+            session.routine.machine.state.requests.contains_key(&id),
+            "the fetch asked for its body"
+        );
+        assert_eq!(
+            credit.receive_window(),
+            base,
+            "an unleased fetch adds no credit"
+        );
+
+        // The peer has no body. The fetch ends, and the window never grew.
+        session.deliver(TxRelayMessage::NotFound(id)).await;
+        drop(hold);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            apply_calls(&mut session, |r| {
+                matches!(r, PoolResult::TxLeaseEnded { .. })
+            }),
+        )
+        .await
+        .expect("the lease's end reaches the routine promptly");
+        assert_eq!(credit.receive_window(), base);
+        Ok(())
+    }
 }

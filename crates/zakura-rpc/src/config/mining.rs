@@ -95,9 +95,40 @@ pub struct Config {
     /// The list is empty by default, and then the coinbases name this node. For now it may hold
     /// at most one entry: `zakurad` refuses to start with more. It needs
     /// [`Self::miner_mesh`].
-    #[serde(with = "gateway_ids")]
+    #[serde(
+        serialize_with = "gateway_ids::serialize",
+        deserialize_with = "gateway_ids::deserialize_gateways"
+    )]
     pub miner_mesh_gateways: Vec<GatewayId>,
+
+    /// The template nodes this relay node keeps connection places for: the pool's internal
+    /// nodes whose coinbases name this node through their own [`Self::miner_mesh_gateways`].
+    ///
+    /// No block names a template node, so without this the relay holds no place for it, and
+    /// refuses its connection once the ordinary inbound share is full. Each node listed here
+    /// ranks ahead of the gateways recent blocks name and keeps one held place whether or not
+    /// it is connected, so it can always call in. One that is offline costs only its own
+    /// place; the ranked gateways fill the rest.
+    ///
+    /// Each entry is a template node's v2 node ID in hex, as its `getminermeshinfo` reports
+    /// it, or the first 40 hex digits of it.
+    ///
+    /// The list is empty by default. It needs [`Self::miner_mesh`] on a node that is its own
+    /// gateway, so [`Self::miner_mesh_gateways`] must be empty; a node with a miner address
+    /// may set it too. `zakurad` refuses to start when it lists this node, repeats an entry,
+    /// or has more than [`MAX_MINER_MESH_TEMPLATE_NODES`] entries.
+    #[serde(
+        serialize_with = "gateway_ids::serialize",
+        deserialize_with = "gateway_ids::deserialize_template_nodes"
+    )]
+    pub miner_mesh_template_nodes: Vec<GatewayId>,
 }
+
+/// The most template nodes [`Config::miner_mesh_template_nodes`] may list.
+///
+/// Each takes one of the at most ten places a node holds. Four covers a pool's template
+/// nodes and leaves at least six places to the gateways recent blocks name.
+pub const MAX_MINER_MESH_TEMPLATE_NODES: usize = 4;
 
 mod miner_address {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -127,8 +158,8 @@ mod miner_address {
     }
 }
 
-/// Reads and writes gateway IDs as hex strings. This is where the config checks each entry's
-/// format.
+/// Reads and writes lists of gateway IDs as hex strings. This is where the config checks each
+/// entry's format.
 mod gateway_ids {
     use serde::{de, Deserialize, Deserializer, Serializer};
     use zakura_chain::miner_mesh::GatewayId;
@@ -140,16 +171,36 @@ mod gateway_ids {
         serializer.collect_seq(gateways.iter().map(ToString::to_string))
     }
 
-    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<Vec<GatewayId>, D::Error>
+    /// Reads `miner_mesh_gateways`.
+    pub(super) fn deserialize_gateways<'de, D>(deserializer: D) -> Result<Vec<GatewayId>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserialize(deserializer, "miner_mesh_gateways")
+    }
+
+    /// Reads `miner_mesh_template_nodes`.
+    pub(super) fn deserialize_template_nodes<'de, D>(
+        deserializer: D,
+    ) -> Result<Vec<GatewayId>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserialize(deserializer, "miner_mesh_template_nodes")
+    }
+
+    /// Reads the list of gateway IDs in `field`, naming the field and the entry when an entry
+    /// names no gateway ID.
+    fn deserialize<'de, D>(deserializer: D, field: &str) -> Result<Vec<GatewayId>, D::Error>
     where
         D: Deserializer<'de>,
     {
         Vec::<String>::deserialize(deserializer)?
             .iter()
             .map(|entry| {
-                entry.parse().map_err(|error| {
-                    de::Error::custom(format!("miner_mesh_gateways entry {entry:?}: {error}"))
-                })
+                entry
+                    .parse()
+                    .map_err(|error| de::Error::custom(format!("{field} entry {entry:?}: {error}")))
             })
             .collect()
     }
@@ -165,6 +216,7 @@ impl Default for Config {
             optimistic_block_inventory: true,
             miner_mesh: false,
             miner_mesh_gateways: Vec::new(),
+            miner_mesh_template_nodes: Vec::new(),
         }
     }
 }
@@ -331,6 +383,41 @@ mod tests {
         assert!(Config::default().miner_mesh_gateways.is_empty());
         let config: Config = toml::from_str("").unwrap();
         assert!(config.miner_mesh_gateways.is_empty());
+    }
+
+    #[test]
+    fn a_template_node_reads_like_a_gateway_and_writes_as_a_gateway_id() {
+        let expected: GatewayId = GATEWAY_ID.parse().unwrap();
+        for entry in [NODE_ID, GATEWAY_ID] {
+            let config: Config =
+                toml::from_str(&format!("miner_mesh_template_nodes = [{entry:?}]")).unwrap();
+            assert_eq!(config.miner_mesh_template_nodes, vec![expected]);
+            assert!(config.miner_mesh_gateways.is_empty());
+
+            let serialized = toml::to_string(&config).unwrap();
+            assert!(serialized.contains(&format!("miner_mesh_template_nodes = [\"{GATEWAY_ID}\"]")));
+            assert_eq!(toml::from_str::<Config>(&serialized).unwrap(), config);
+        }
+    }
+
+    #[test]
+    fn a_bad_template_node_entry_fails_with_the_setting_and_entry_named() {
+        let entry = &NODE_ID[..63];
+        let error = toml::from_str::<Config>(&format!("miner_mesh_template_nodes = [{entry:?}]"))
+            .expect_err("the entry names no node");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("miner_mesh_template_nodes entry {entry:?}")),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn no_template_node_is_listed_by_default() {
+        assert!(Config::default().miner_mesh_template_nodes.is_empty());
+        let config: Config = toml::from_str("").unwrap();
+        assert!(config.miner_mesh_template_nodes.is_empty());
     }
 
     #[test]

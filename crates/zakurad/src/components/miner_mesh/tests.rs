@@ -527,7 +527,7 @@ async fn the_task_reads_the_window_and_ends_when_the_state_stops() {
     let (mut tip_sender, latest_tip, tip_change) = ChainTipSender::new(None, &regtest());
     tip_sender.set_finalized_tip(Some(tip_block(1, TIP)));
     drop(tip_sender);
-    let (ranking, publisher) = ranking_channel(true, regtest(), latest_tip);
+    let (ranking, publisher) = ranking_channel(true, Vec::new(), regtest(), latest_tip);
     let publisher = publisher.expect("a mining node gets a publisher");
 
     let mut tracker = tracker(&chain);
@@ -630,7 +630,7 @@ async fn the_task_follows_a_new_tip_before_reading_older_blocks() {
     chain.on_hash_read(40, move || {
         tip_sender.set_best_non_finalized_tip(Some(tip_block(1, TIP + 1)));
     });
-    let (_ranking, publisher) = ranking_channel(true, regtest(), latest_tip);
+    let (_ranking, publisher) = ranking_channel(true, Vec::new(), regtest(), latest_tip);
     let publisher = publisher.expect("a mining node gets a publisher");
 
     let mut tracker = tracker(&chain);
@@ -690,7 +690,7 @@ async fn a_mined_gateway_reaches_the_network_once_its_tenth_block_counts() {
 
     let (mut tip_sender, latest_tip, tip_change) = ChainTipSender::new(None, &regtest());
     tip_sender.set_finalized_tip(Some(tip_block(1, TIP)));
-    let (mut ranking, publisher) = ranking_channel(true, regtest(), latest_tip);
+    let (mut ranking, publisher) = ranking_channel(true, Vec::new(), regtest(), latest_tip);
     let publisher = publisher.expect("a mining node gets a publisher");
     let task = tokio::spawn(async move {
         let mut tracker = tracker(&chain);
@@ -736,7 +736,7 @@ async fn the_task_publishes_an_empty_ranking_once_the_tip_is_too_old() {
     let (sync_tip, sync_tip_sender) = MockChainTip::new();
     sync_tip_sender.send_best_tip_height(Height(TIP));
     sync_tip_sender.send_best_tip_block_time(Utc::now());
-    let (mut ranking, publisher) = ranking_channel(true, Network::Mainnet, sync_tip);
+    let (mut ranking, publisher) = ranking_channel(true, Vec::new(), Network::Mainnet, sync_tip);
     let publisher = publisher.expect("a mining node gets a publisher");
     let task = tokio::spawn(async move {
         let mut tracker = Tracker::new(Network::Mainnet, chain.service());

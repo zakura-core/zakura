@@ -616,3 +616,82 @@ fn a_tied_gateway_joins_for_a_node_that_proved_its_earlier_id() {
     assert!(joins(ProvenNode::from(earlier)));
     assert!(!joins(ProvenNode::from(current)));
 }
+
+/// The ID the node always prefers for `node`, before any node is known.
+fn always_preferred(node: NodeId) -> RankedGateway {
+    RankedGateway::always_preferred(GatewayId::from_node_id(node.as_bytes()), 0)
+}
+
+/// An always-preferred ID ranks ahead of every gateway the blocks name, and
+/// keeps its place while v2 networking cannot reach it: a lower gateway does
+/// not fill it, and the ID takes it as soon as it calls in.
+#[test]
+fn an_unreachable_always_preferred_id_keeps_its_place() {
+    let template = raw_node(1, 0x00);
+    let formed = PreferredGateways::form(
+        [
+            gateway(2, 50, GatewayStanding::Dialable),
+            gateway(3, 40, GatewayStanding::Dialable),
+            always_preferred(template),
+        ],
+        2,
+    );
+
+    assert_eq!(formed.hold(), 2);
+    assert_eq!(
+        formed.set(),
+        &[node(2)],
+        "the second place waits for the always-preferred ID"
+    );
+    assert_eq!(
+        formed
+            .places()
+            .map(|(gateway, place)| (gateway.is_always_preferred(), place))
+            .collect::<Vec<_>>(),
+        vec![
+            (true, GatewayPlace::Unmatched),
+            (false, GatewayPlace::Preferred),
+            (false, GatewayPlace::Standby),
+        ]
+    );
+
+    let connected = formed
+        .with_connected(&template)
+        .expect("the caller's gateway ID is ranked");
+    assert_eq!(connected.set(), &[template, node(2)]);
+    assert_eq!(connected.hold(), 2);
+}
+
+/// Unreachable always-preferred IDs cost one place each, and the gateways the
+/// blocks name fill the rest.
+#[test]
+fn always_preferred_ids_take_one_place_each_and_gateways_fill_the_rest() {
+    let formed = PreferredGateways::form(
+        [
+            always_preferred(raw_node(1, 0x00)),
+            always_preferred(raw_node(2, 0x00)),
+            gateway(3, 50, GatewayStanding::Connected),
+            gateway(4, 40, GatewayStanding::Dialable),
+            gateway(5, 30, GatewayStanding::Dialable),
+        ],
+        3,
+    );
+
+    assert_eq!(formed.hold(), 3);
+    assert_eq!(formed.set(), &[node(3)]);
+}
+
+/// An always-preferred ID that two known nodes share fails closed like any
+/// other gateway: it holds no place.
+#[test]
+fn an_ambiguous_always_preferred_id_holds_nothing() {
+    let template = raw_node(1, 0x00);
+    let formed = PreferredGateways::form([always_preferred(template)], 1)
+        .with_connected(&template)
+        .expect("the caller's gateway ID is ranked")
+        .with_connected(&raw_node(1, 0xff))
+        .expect("a second node with the gateway ID changes the gateway");
+
+    assert!(formed.set().is_empty());
+    assert_eq!(formed.hold(), 0);
+}

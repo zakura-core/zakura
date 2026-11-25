@@ -75,6 +75,7 @@
 pub(crate) mod zakura;
 
 use std::{
+    collections::HashSet,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::Path,
     sync::Arc,
@@ -104,7 +105,10 @@ use zakura_consensus::router::BackgroundTaskHandles;
 use zakura_jsonl_trace::{JsonlEventEmitter, JsonlTracer};
 use zakura_network::types::PeerServices;
 use zakura_node_services::task::{spawn_buffer, spawn_erased};
-use zakura_rpc::EarlyMinedBlockChannel;
+use zakura_rpc::{
+    config::mining::{Config as MiningConfig, MAX_MINER_MESH_TEMPLATE_NODES},
+    EarlyMinedBlockChannel,
+};
 use zakura_state::StorageMode;
 
 use zakura::{
@@ -371,6 +375,8 @@ impl StartCmd {
             ));
         }
 
+        Self::validate_miner_mesh_template_nodes(mining)?;
+
         if !mining.miner_mesh {
             if !mining.miner_mesh_gateways.is_empty() {
                 return Err(eyre!(
@@ -431,6 +437,46 @@ impl StartCmd {
         Ok(())
     }
 
+    /// Refuses a `mining.miner_mesh_template_nodes` list that cannot work: on a node that is
+    /// not its own gateway, with repeats, or with more entries than
+    /// [`MAX_MINER_MESH_TEMPLATE_NODES`].
+    ///
+    /// Only a gateway keeps places for template nodes, since the template nodes connect to it
+    /// as the gateway their coinbases name. [`Self::local_mesh_gateway`] refuses a list that
+    /// names this node, once its node ID is known.
+    fn validate_miner_mesh_template_nodes(mining: &MiningConfig) -> Result<(), Report> {
+        let template_nodes = &mining.miner_mesh_template_nodes;
+        if template_nodes.is_empty() {
+            return Ok(());
+        }
+        if !mining.miner_mesh {
+            return Err(eyre!(
+                "mining.miner_mesh_template_nodes has no effect unless mining.miner_mesh is set"
+            ));
+        }
+        if !mining.miner_mesh_gateways.is_empty() {
+            return Err(eyre!(
+                "mining.miner_mesh_template_nodes needs this node to be its own gateway, but \
+                 mining.miner_mesh_gateways names another node; list the template nodes on that \
+                 gateway instead"
+            ));
+        }
+        if template_nodes.len() > MAX_MINER_MESH_TEMPLATE_NODES {
+            return Err(eyre!(
+                "mining.miner_mesh_template_nodes lists {} template nodes, but at most \
+                 {MAX_MINER_MESH_TEMPLATE_NODES} are supported",
+                template_nodes.len()
+            ));
+        }
+        let mut seen = HashSet::new();
+        if let Some(repeated) = template_nodes.iter().find(|node| !seen.insert(*node)) {
+            return Err(eyre!(
+                "mining.miner_mesh_template_nodes lists {repeated} more than once"
+            ));
+        }
+        Ok(())
+    }
+
     /// This node is its own gateway: `mining.miner_mesh` is set and
     /// `mining.miner_mesh_gateways` is empty.
     fn is_own_gateway(config: &ZakuradConfig) -> bool {
@@ -455,7 +501,9 @@ impl StartCmd {
     /// `own_node_id` is this node's v2 node ID, or `None` when the v2 endpoint is not running.
     /// A node that lists its own ID in `mining.miner_mesh_gateways` is refused, since it would
     /// name itself without the checks a gateway needs. Without a v2 endpoint the node cannot
-    /// be that gateway anyway, so its entry is not compared.
+    /// be that gateway anyway, so its entry is not compared. A node that lists its own ID in
+    /// `mining.miner_mesh_template_nodes` is refused too, since it would keep a place for
+    /// itself.
     fn local_mesh_gateway(
         config: &ZakuradConfig,
         own_node_id: Option<&[u8; 32]>,
@@ -465,6 +513,12 @@ impl StartCmd {
             return Ok(miner_mesh::LocalGateway::default());
         }
         let own_gateway = own_node_id.map(GatewayId::from_node_id);
+        if own_gateway.is_some_and(|own| mining.miner_mesh_template_nodes.contains(&own)) {
+            return Err(eyre!(
+                "mining.miner_mesh_template_nodes lists this node; list only the pool's template \
+                 nodes"
+            ));
+        }
         let stands_for = match mining.miner_mesh_gateways.first() {
             Some(relay) if Some(*relay) == own_gateway => {
                 return Err(eyre!(
@@ -977,9 +1031,11 @@ impl StartCmd {
         });
 
         // A mining node, or a relay that runs the miner mesh, prefers to stay connected to the
-        // mining gateways that recent blocks name; the tracker started below fills the ranking.
+        // mining gateways that recent blocks name, and a relay keeps places for its template
+        // nodes; the tracker started below fills the ranking.
         let (miner_gateways, miner_gateway_publisher) = miner_mesh::ranking_channel(
             Self::prefers_gateways(&config),
+            config.mining.miner_mesh_template_nodes.clone(),
             config.network.network.clone(),
             latest_chain_tip.clone(),
         );

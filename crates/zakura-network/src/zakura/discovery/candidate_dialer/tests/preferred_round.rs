@@ -111,6 +111,7 @@ fn gateway_ip(gateway: NodeId) -> IpAddr {
 fn ranking(gateways: &[NodeId]) -> MinerGatewayRanking {
     let count = u32::try_from(gateways.len()).expect("a test ranks few gateways");
     MinerGatewayRanking {
+        always_preferred: Vec::new(),
         gateways: gateways
             .iter()
             .zip((1..=count).rev())

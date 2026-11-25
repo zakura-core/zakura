@@ -71,6 +71,7 @@ fn gateway(node_id: [u8; 32], blocks: u32, place: GatewayPlace, connected: bool)
         gateway_id: GatewayId::from_node_id(&node_id),
         blocks,
         place,
+        always_preferred: false,
         connected,
     }
 }

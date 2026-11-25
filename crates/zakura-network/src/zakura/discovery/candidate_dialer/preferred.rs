@@ -42,8 +42,8 @@ use crate::zakura::{
 /// [`GatewayStanding`] for the connection-slot checks.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MinerGatewayRanking {
-    /// The IDs this node prefers whatever the blocks say, such as a relay's
-    /// own template nodes, each with the counted blocks that name it, which
+    /// The IDs the operator configures the node to always prefer, whatever
+    /// the blocks say, each with the counted blocks that name it, which
     /// may be none. At most [`MAX_PREFERRED_GATEWAYS`] are kept.
     pub always_preferred: Vec<MinerGateway>,
     /// The gateways named in enough counted blocks for the node to prefer

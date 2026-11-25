@@ -124,8 +124,12 @@ node only ever leaves out the gateway ID its own node ID starts with.
 `miner_mesh` is set and the node is its own gateway (`miner_mesh_gateways` is
 empty), since template nodes connect to the gateway their coinbases name. It
 also refuses a list with the node's own ID, a repeated entry, or more than
-four entries, which leaves at least six of the ten places a node can hold to
-the gateways recent blocks name. A gateway with a miner address may list
+four entries, which leaves at least six of the ten places the default budget
+funds to the gateways recent blocks name. A smaller peer memory budget, or a
+larger `network.zakura.max_connections`, funds fewer places, and the template
+nodes may then take all of them: `zakurad` warns at startup when the funded
+places are no more than the template nodes, and when none are funded at all,
+so no template node gets a place. A gateway with a miner address may list
 template nodes too.
 
 `getminermeshinfo` on the template node lists the relay's gateway ID in

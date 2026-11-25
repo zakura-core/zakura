@@ -126,8 +126,11 @@ pub struct Config {
 
 /// The most template nodes [`Config::miner_mesh_template_nodes`] may list.
 ///
-/// Each takes one of the at most ten places a node holds. Four covers a pool's template
-/// nodes and leaves at least six places to the gateways recent blocks name.
+/// Each takes one of the places a node holds, ahead of the gateways recent blocks name. Four
+/// covers a pool's template nodes and leaves at least six of the ten places the default
+/// budget funds to those gateways. A smaller peer memory budget, or a larger
+/// `network.zakura.max_connections`, funds fewer places, and the template nodes may then take
+/// all of them; `zakurad` warns at startup when they do.
 pub const MAX_MINER_MESH_TEMPLATE_NODES: usize = 4;
 
 mod miner_address {

@@ -627,12 +627,12 @@ fn always_preferred(node: NodeId) -> RankedGateway {
 /// not fill it, and the ID takes it as soon as it calls in.
 #[test]
 fn an_unreachable_always_preferred_id_keeps_its_place() {
-    let template = raw_node(1, 0x00);
+    let configured = raw_node(1, 0x00);
     let formed = PreferredGateways::form(
         [
             gateway(2, 50, GatewayStanding::Dialable),
             gateway(3, 40, GatewayStanding::Dialable),
-            always_preferred(template),
+            always_preferred(configured),
         ],
         2,
     );
@@ -656,9 +656,9 @@ fn an_unreachable_always_preferred_id_keeps_its_place() {
     );
 
     let connected = formed
-        .with_connected(&template)
+        .with_connected(&configured)
         .expect("the caller's gateway ID is ranked");
-    assert_eq!(connected.set(), &[template, node(2)]);
+    assert_eq!(connected.set(), &[configured, node(2)]);
     assert_eq!(connected.hold(), 2);
 }
 
@@ -685,13 +685,67 @@ fn always_preferred_ids_take_one_place_each_and_gateways_fill_the_rest() {
 /// other gateway: it holds no place.
 #[test]
 fn an_ambiguous_always_preferred_id_holds_nothing() {
-    let template = raw_node(1, 0x00);
-    let formed = PreferredGateways::form([always_preferred(template)], 1)
-        .with_connected(&template)
+    let configured = raw_node(1, 0x00);
+    let formed = PreferredGateways::form([always_preferred(configured)], 1)
+        .with_connected(&configured)
         .expect("the caller's gateway ID is ranked")
         .with_connected(&raw_node(1, 0xff))
         .expect("a second node with the gateway ID changes the gateway");
 
     assert!(formed.set().is_empty());
     assert_eq!(formed.hold(), 0);
+}
+
+/// An always-preferred ID that disconnects goes into backoff but keeps its
+/// place: the higher gateway keeps the other place, and the lower dialable
+/// gateway stays on standby rather than taking the waiting one.
+#[test]
+fn an_always_preferred_id_that_disconnects_keeps_its_place() {
+    let configured = raw_node(1, 0x00);
+    let formed = PreferredGateways::form(
+        [
+            always_preferred(configured),
+            gateway(2, 50, GatewayStanding::Dialable),
+            gateway(3, 40, GatewayStanding::Dialable),
+        ],
+        2,
+    )
+    .with_connected(&configured)
+    .expect("the caller's gateway ID is ranked");
+    assert_eq!(formed.set(), &[configured, node(2)]);
+
+    let released = formed
+        .with_released(&configured)
+        .expect("the connected ID loses its last slot");
+
+    assert_eq!(released.set(), &[node(2)]);
+    assert_eq!(released.hold(), 2);
+    assert_eq!(
+        released
+            .places()
+            .map(|(gateway, place)| (gateway.node(), place))
+            .collect::<Vec<_>>(),
+        vec![
+            (Some(configured), GatewayPlace::Backoff),
+            (Some(node(2)), GatewayPlace::Preferred),
+            (Some(node(3)), GatewayPlace::Standby),
+        ]
+    );
+}
+
+/// With fewer places than always-preferred IDs, the IDs take every place,
+/// and while they are unreachable the set stays empty.
+#[test]
+fn always_preferred_ids_can_take_every_place() {
+    let formed = PreferredGateways::form(
+        [
+            always_preferred(raw_node(1, 0x00)),
+            always_preferred(raw_node(2, 0x00)),
+            gateway(3, 50, GatewayStanding::Connected),
+        ],
+        1,
+    );
+
+    assert_eq!(formed.hold(), 1);
+    assert!(formed.set().is_empty());
 }

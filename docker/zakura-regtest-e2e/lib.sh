@@ -102,11 +102,11 @@ wait_metric_at_least() {
 # The only v2 TLS series a node may export: the hybrid key-exchange group
 # (zakura-quic TLS-9) and the composite signature scheme (TLS-4).
 PQ_KEY_EXCHANGE_SERIES='zakura_quic_tls_key_exchange{group="X25519MLKEM1024"}'
-PQ_SIGNATURE_SERIES='zakura_quic_tls_signature_verified{scheme="ed25519_mldsa87"}'
+PQ_SIGNATURE_SERIES='zakura_quic_tls_signature_verified{scheme="ed25519_mldsa65"}'
 
 # assert_post_quantum_handshakes <metrics-port> <label>
 # Requires at least one completed X25519MLKEM1024 key exchange and one verified
-# Ed25519+ML-DSA-87 handshake signature, and no other group or scheme.
+# Ed25519+ML-DSA-65 handshake signature, and no other group or scheme.
 assert_post_quantum_handshakes() {
   local port="$1" label="$2" other
   wait_metric_at_least "${port}" "${PQ_KEY_EXCHANGE_SERIES}" 1 "${label}"
@@ -119,7 +119,7 @@ assert_post_quantum_handshakes() {
     || fail "could not read ${label} /metrics"
   printf '  %s other TLS groups or schemes: %s (want none)\n' "${label}" "${other:-none}"
   [[ -z "${other}" ]] || fail \
-    "${label} ran v2 handshakes outside X25519MLKEM1024 and Ed25519+ML-DSA-87: ${other}"
+    "${label} ran v2 handshakes outside X25519MLKEM1024 and Ed25519+ML-DSA-65: ${other}"
 }
 
 wait_ready() {

@@ -17,7 +17,7 @@
 #   3. the legacy->Zakura upgrade ran (zakura_p2p_handshake_upgraded on node1/node4),
 #   3b. every v2 node (node1, node2, and node4 when its upgrade is strict or
 #      live) completed X25519MLKEM1024 key exchanges and verified
-#      Ed25519+ML-DSA-87 handshake signatures, with no other group or scheme; node2 is checked again after its reset catch-up,
+#      Ed25519+ML-DSA-65 handshake signatures, with no other group or scheme; node2 is checked again after its reset catch-up,
 #   4. the pure Zakura-only node2 has zero legacy peers (no legacy stack at all),
 #   4b. the pure Zakura-only node2 bootstraps the genesis block over Zakura: with
 #      the Regtest genesis self-seed disabled (sync.debug_skip_regtest_genesis_self_seed)
@@ -39,7 +39,7 @@
 # (mixed-version.sh, docker-compose.zakura-regtest-e2e-mixed-version.yml, and the
 # configs in mixed-version/). Three nodes run the latest release, v1.8.9 (p2p-v2/3:
 # classical key exchange, node ID = Ed25519 key), and two run the binary under
-# test (p2p-v2/5: hybrid ML-KEM-1024 key exchange, Ed25519 + ML-DSA-87 composite
+# test (p2p-v2/5: hybrid ML-KEM-1024 key exchange, Ed25519 + ML-DSA-65 composite
 # signature, hashed node ID):
 #   old-dual    OLD dual-stack seed                rpc 28232  metrics 29001
 #   old-zakura  OLD v2-only, bootstraps old-dual   rpc 28332  metrics 29002
@@ -58,7 +58,7 @@
 #      connection) and none with any other reason, and a debug build of new-dual
 #      logs the fallback for both prelude roles,
 #   2. same-version v2 works: new-zakura <-> new-dual and old-zakura <-> old-dual,
-#   3. the new nodes' v2 handshakes are all X25519MLKEM1024 and Ed25519+ML-DSA-87
+#   3. the new nodes' v2 handshakes are all X25519MLKEM1024 and Ed25519+ML-DSA-65
 #      (the old binary exports no such metrics),
 #   4. blocks mined on new-dual, old-dual, new-zakura, and old-zakura each reach
 #      all five nodes with the same hash, so blocks cross the version boundary
@@ -1400,7 +1400,7 @@ assert_node4_post_quantum_handshakes() {
   fi
 }
 
-log "asserting post-quantum v2 handshakes (X25519MLKEM1024, Ed25519+ML-DSA-87)"
+log "asserting post-quantum v2 handshakes (X25519MLKEM1024, Ed25519+ML-DSA-65)"
 # Every node that speaks v2 has handshaken by now: node2 with node1 and node4's
 # upgrade with node1. node3 is legacy-only and runs no v2 handshake.
 assert_post_quantum_handshakes 19001 node1

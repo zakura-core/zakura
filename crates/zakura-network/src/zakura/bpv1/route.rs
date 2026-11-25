@@ -306,6 +306,24 @@ pub(crate) fn refused_grant(
     })
 }
 
+/// The inputs that tell a new session of every admitted block still active,
+/// with the parts this node already holds of each.
+pub(crate) fn replay_admitted(table: &BlockTable) -> Vec<PeerInput> {
+    let mut inputs = Vec::new();
+    for (admitted, indices) in table.active_admitted_blocks() {
+        let block_id = admitted.block_id;
+        inputs.push(PeerInput::BlockAdmitted(admitted_input(&admitted)));
+        if !indices.is_empty() {
+            inputs.push(PeerInput::Ready {
+                block_id,
+                indices,
+                push: false,
+            });
+        }
+    }
+    inputs
+}
+
 /// The [`PeerInput::BlockAdmitted`] payload that publishes `admitted`.
 pub(crate) fn admitted_input(admitted: &AdmittedBlock) -> BlockAdmitted {
     BlockAdmitted {

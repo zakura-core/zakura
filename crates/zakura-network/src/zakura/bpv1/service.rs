@@ -54,7 +54,7 @@ use super::{
     },
     pull_trace::{is_sampled_part, PullOutcome, PullTraceRecord},
     route::{
-        admitted_input, charge_part, held_parts, pull_state, refused_grant, route_block_output,
+        charge_part, held_parts, pull_state, refused_grant, replay_admitted, route_block_output,
         route_peer_output, BlockRoute, PeerRoute,
     },
     tree::{verify_part_proof, VerifiedPart},
@@ -1172,19 +1172,9 @@ async fn run_bpv1_driver(
                         peer_node,
                         session_gen,
                     } => {
-                        let active = node.lock_table().active_admitted_blocks();
-                        for (admitted, indices) in active {
-                            let block_id = admitted.block_id;
-                            let input = PeerInput::BlockAdmitted(admitted_input(&admitted));
+                        let inputs = replay_admitted(&node.lock_table());
+                        for input in inputs {
                             let _ = node.send_to(&peer_node, Some(session_gen), input);
-                            if !indices.is_empty() {
-                                let input = PeerInput::Ready {
-                                    block_id,
-                                    indices,
-                                    push: false,
-                                };
-                                let _ = node.send_to(&peer_node, Some(session_gen), input);
-                            }
                         }
                     }
                     DriverMsg::WakeTick => {}

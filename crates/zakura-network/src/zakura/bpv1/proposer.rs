@@ -64,7 +64,7 @@ impl ProposerConfig {
 pub struct PreparedCommitment {
     /// 32-byte commitment hash `C`.
     pub commitment_hash: [u8; 32],
-    /// Exact 39-byte `OP_RETURN` script (`6a 25 BPV1 01 C`).
+    /// Exact 37-byte `OP_RETURN` script (`6a 23 BP 01 C`).
     pub script: [u8; COMMITMENT_SCRIPT_LEN],
     /// Coding tuple committed by `C`.
     pub coding: Coding,

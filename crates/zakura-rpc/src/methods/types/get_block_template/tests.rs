@@ -252,7 +252,7 @@ fn announcing_coinbase_names_the_gateway_in_one_extra_output() -> anyhow::Result
                     + 46,
             );
 
-            // A BPv1 commitment beside the gateway takes 48 more bytes, within the size the
+            // A BPv1 commitment beside the gateway takes 46 more bytes, within the size the
             // template reserves for it, and the gateway output stays last.
             let bpv1 = [0x42; zakura_node_services::bpv1_proposer::BPV1_COMMITMENT_NULL_DATA_LEN];
             let both_tx = TransactionTemplate::new_coinbase(
@@ -269,7 +269,7 @@ fn announcing_coinbase_names_the_gateway_in_one_extra_output() -> anyhow::Result
             assert_eq!(both_tx.outputs().last(), Some(&commitment.to_output()));
             assert_eq!(
                 both_tx.zcash_serialized_size(),
-                announcing_tx.zcash_serialized_size() + 48
+                announcing_tx.zcash_serialized_size() + 46
             );
             assert_eq!(
                 TransactionTemplate::coinbase_resource_usage(
@@ -288,7 +288,7 @@ fn announcing_coinbase_names_the_gateway_in_one_extra_output() -> anyhow::Result
                     None
                 )?
                 .max_serialized_size
-                    + 48,
+                    + 46,
             );
         }
     }

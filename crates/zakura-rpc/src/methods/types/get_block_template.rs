@@ -545,7 +545,7 @@ impl BlockTemplateResponse {
     /// the chain tip's value pools make the ZIP 234 NSM value balance negative. Its `expect`s
     /// check invariants that the caller already guarantees.
     ///
-    /// `bpv1_proposer` embeds the BPv1 `OP_RETURN BPV1 01 C` commitment output in
+    /// `bpv1_proposer` embeds the BPv1 `OP_RETURN BP 01 C` commitment output in
     /// post-NU7 v6 coinbases. Pass it only when the selection of
     /// `mempool_txs` reserved that output; see [`GetBlockTemplateHandler::template_bpv1_proposer`].
     #[allow(clippy::too_many_arguments, clippy::unwrap_in_result)]

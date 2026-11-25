@@ -3999,10 +3999,10 @@ where
             let height = chain_info.tip_height.next().map_misc_error()?;
 
             // Select mempool transactions by ancestor-package priority.
-            // BPv1 eligibility is decided once, here. Selection reserves the 48-byte
-            // `OP_RETURN BPV1 01 C` coinbase output, and the build receives the same
+            // BPv1 eligibility is decided once, here. Selection reserves the 46-byte
+            // `OP_RETURN BP 01 C` coinbase output, and the build receives the same
             // answer, so the commitment output never pushes a template past `MAX_BLOCK_BYTES`.
-            // This reservation must share one coinbase size estimate with the 48-byte miner
+            // This reservation must share one coinbase size estimate with the 46-byte miner
             // mesh output (#2666), so a template can carry both.
             let bpv1_proposer = self.gbt.template_bpv1_proposer(height);
             let extra_coinbase_null_data_len = bpv1_proposer

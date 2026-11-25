@@ -147,17 +147,17 @@ async fn bpv1_proposer_hook_handles_post_nu7_pre_nu7_reuse_and_pool_coinbase() {
         "pre-NU7 template must not receive a BPv1 commitment"
     );
 
-    // 2. Post-NU7 height produces a 37-byte `BPV1 || 0x01 || C` null-data payload.
+    // 2. Post-NU7 height produces a 35-byte `BP || 0x01 || C` null-data payload.
     let payload1 = handle_a
         .prepare_template_commitment(lcr, Height(12), 2, &tx1_bytes)
         .expect("post-NU7 template with live peer gets commitment");
-    assert_eq!(&payload1[..5], b"BPV1\x01");
+    assert_eq!(&payload1[..3], b"BP\x01");
 
     // 3. Second call with same body (header-only template refresh) succeeds via opt-8 reuse.
     let payload2 = handle_a
         .prepare_template_commitment(lcr, Height(12), 2, &tx1_bytes)
         .expect("header-only refresh reuses encoding");
-    assert_eq!(&payload2[..5], b"BPV1\x01");
+    assert_eq!(&payload2[..3], b"BP\x01");
 
     // 4. Pool-built coinbase without a BPv1 commitment returns false (falls back to existing relay).
     let pool_cb = build_v6_coinbase(Height(12), &[0x51], 1_000_000, vec![], &[]);
@@ -170,8 +170,8 @@ async fn bpv1_proposer_hook_handles_post_nu7_pre_nu7_reuse_and_pool_coinbase() {
         "pool-built coinbase without commitment must fall back to existing relay"
     );
 
-    // 5. Solved block carrying the committed OP_RETURN BPV1 01 C output publishes via BPv1!
-    let mut full_script = vec![0x6a, 0x25];
+    // 5. Solved block carrying the committed OP_RETURN BP 01 C output publishes via BPv1!
+    let mut full_script = vec![0x6a, 0x23];
     full_script.extend_from_slice(&payload2);
     let cb = committed_coinbase(Height(12), &full_script);
     let solved = Arc::new(block_of(lcr, vec![Arc::new(cb), Arc::new(tx1)]));

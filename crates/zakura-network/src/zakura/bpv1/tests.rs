@@ -11,6 +11,7 @@ use zakura_chain::{
         merkle::{AuthDataRoot, Root},
         Block, ChainHistoryBlockTxAuthCommitmentHash, ChainHistoryMmrRootHash, Height,
     },
+    miner_mesh::MinerMeshCommitment,
     parameters::Network,
     serialization::ZcashSerialize,
     transparent::{Output, Script},
@@ -376,7 +377,7 @@ fn commitment_rejects_auth_data_mutation_and_coinbase_edge_cases() {
     );
 }
 
-/// bpv1-70 (decision-25): only an exact zero-value `6a 25 "BPV1" 01 C`
+/// bpv1-70 (decision-25): only an exact zero-value `6a 23 "BP" 01 C`
 /// output is a commitment. Readers ignore every other output, and a coinbase
 /// with two commitments has no binding.
 #[test]
@@ -388,21 +389,16 @@ fn commitment_ignores_unusual_outputs_and_needs_exactly_one() {
         committed.verify(&committed.binding)
     };
 
-    // A `MESH 01` miner mesh output beside the `BPV1 01` output.
-    let mut mesh = vec![0x6a, 0x25, b'M', b'E', b'S', b'H', 0x01];
-    mesh.extend_from_slice(&[0x77; 32]);
-    assert_eq!(verify(vec![zero(&mesh)]), Ok(()));
-
-    // `BPV1` outputs of another version, length, push encoding, or value.
+    // `BP 01` outputs of another version, length, push encoding, or value.
     let script = commitment_script(c);
     let mut version_02 = script;
-    version_02[6] = 0x02;
+    version_02[4] = 0x02;
     let mut long = script.to_vec();
     long.push(0x00);
     let short = &script[..script.len() - 1];
-    let mut pushdata1 = vec![0x6a, 0x4c, 0x25];
+    let mut pushdata1 = vec![0x6a, 0x4c, 0x23];
     pushdata1.extend_from_slice(&script[2..]);
-    let mut junk = script[..6].to_vec();
+    let mut junk = script[..4].to_vec();
     junk.extend_from_slice(&[0xee; 40]);
     let unusual = vec![
         zero(&version_02),
@@ -417,18 +413,67 @@ fn commitment_ignores_unusual_outputs_and_needs_exactly_one() {
     }
     assert_eq!(verify(unusual), Ok(()), "all unusual outputs are ignored");
 
-    // Two valid `BPV1 01` outputs: no binding.
+    // Two valid `BP 01` outputs: no binding.
     assert_eq!(
         verify(vec![zero(&script)]),
         Err(CommitmentError::MultipleCommitmentOutputs)
     );
 
     // Only unusual outputs: no binding.
-    let only_unusual = build_v6_coinbase(Height(10), &version_02, 0, vec![zero(&mesh)], &[]);
+    let only_unusual = build_v6_coinbase(Height(10), &version_02, 0, vec![], &[]);
     assert_eq!(
         extract_single_commitment(&only_unusual),
         Err(CommitmentError::MissingCommitmentOutput)
     );
+}
+
+/// A coinbase can carry both a BPv1 commitment and a miner mesh output. Their
+/// tags `BP` and `MR` differ, so each reader finds its own output and ignores
+/// the other.
+#[test]
+fn commitment_and_miner_mesh_outputs_stay_distinct_in_one_coinbase() {
+    let mesh = MinerMeshCommitment::new([0x77; 32]);
+    let committed =
+        build_committed_nu7_block_with_outputs(&Profile::TINY, 2, vec![mesh.to_output()]);
+    assert_eq!(committed.verify(&committed.binding), Ok(()));
+
+    let coinbase = &committed.block.transactions[0];
+    let [bpv1, mesh_output] = coinbase.outputs() else {
+        panic!("the coinbase holds the BPv1 and miner mesh outputs only");
+    };
+    assert_eq!(
+        extract_single_commitment(coinbase),
+        Ok(commit_hash(&committed.fields))
+    );
+    assert_eq!(
+        MinerMeshCommitment::from_coinbase_outputs(coinbase.outputs()),
+        Some(mesh)
+    );
+
+    // Each reader ignores the other's output on its own.
+    assert_eq!(
+        MinerMeshCommitment::from_coinbase_outputs(std::slice::from_ref(bpv1)),
+        None
+    );
+    let mesh_only = build_v6_coinbase(
+        Height(10),
+        mesh_output.lock_script.as_raw_bytes(),
+        0,
+        vec![],
+        &[],
+    );
+    assert_eq!(
+        extract_single_commitment(&mesh_only),
+        Err(CommitmentError::MissingCommitmentOutput)
+    );
+
+    // The scripts share their length and push opcode and differ in the tag.
+    let bpv1_script = bpv1.lock_script.as_raw_bytes();
+    let mesh_script = mesh_output.lock_script.as_raw_bytes();
+    assert_eq!(bpv1_script.len(), mesh_script.len());
+    assert_eq!(bpv1_script[..2], mesh_script[..2]);
+    assert_eq!(&bpv1_script[2..4], b"BP");
+    assert_eq!(&mesh_script[2..4], b"MR");
 }
 
 #[test]
@@ -1065,7 +1110,7 @@ message_suite!(bpv1_wire_suite, Bpv1Message);
 /// Fixed external golden test vectors covering W2 size discontinuities
 /// (`0`, `1_000`, `262_144`, `262_145` bytes: the last body at `S_MIN` and the
 /// first above it, decision-18), BLAKE3 KDF domain separation,
-/// post-NU7 coinbase commitment script (`6a 25 BPV1 01 C`), and the exact
+/// post-NU7 coinbase commitment script (`6a 23 BP 01 C`), and the exact
 /// 51-byte `Want` wire frame (`verification.md` Level 1–3).
 #[test]
 fn golden_external_hex_vectors_for_w2_discontinuities_and_wire() {
@@ -1110,7 +1155,8 @@ fn golden_external_hex_vectors_for_w2_discontinuities_and_wire() {
         "frozen golden W2 part_root vectors at 0, 1000, 262144, and 262145 bytes"
     );
 
-    // 3. Frozen 39-byte `OP_RETURN BPV1 01 C` script and 51-byte `Want` frame hex.
+    // 3. Frozen 37-byte `OP_RETURN BP 01 C` script, 35-byte payload, 46-byte
+    //    output, and 51-byte `Want` frame hex.
     let commit = commit_hash(&CommitmentFields {
         chain_id: [0x11; 32],
         profile_id: W2_PROFILE_ID,
@@ -1125,8 +1171,18 @@ fn golden_external_hex_vectors_for_w2_discontinuities_and_wire() {
         "frozen golden commitment hash C"
     );
     let script = commitment_script(commit);
-    assert_eq!(script.len(), 39);
-    assert_eq!(&hex::encode(&script[..7]), "6a254250563101");
+    assert_eq!(
+        hex::encode(script),
+        "6a23425001ab516914bd83aa8fe57e6a301ae72069af0ffb1776573615c3c1602b79db2888",
+        "frozen golden commitment script"
+    );
+    assert_eq!(commitment_payload(commit), script[2..]);
+    // A zero value, the script length, then the script.
+    let output = Output::new(Amount::zero(), Script::new(&script))
+        .zcash_serialize_to_vec()
+        .expect("an output always serializes");
+    assert_eq!(output.len(), 46);
+    assert_eq!(output, [&[0u8; 8][..], &[0x25], &script].concat());
 
     let mut bm = WantBitmap::EMPTY;
     bm.set(0);

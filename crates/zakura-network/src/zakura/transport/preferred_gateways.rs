@@ -7,6 +7,11 @@
 //! [`MAX_PREFERRED_GATEWAYS`] connection places that ordinary peers cannot
 //! fill, for the highest-ranked gateways it can reach.
 //!
+//! A node can also always prefer a few IDs whatever the blocks say, as a
+//! pool's relay does for its own template nodes. Those rank ahead of every
+//! gateway the blocks name, and each keeps its place even while it is
+//! unreachable, so it can always call in.
+//!
 //! A ranked gateway ID names whichever node v2 networking knows with an ID
 //! that starts with it. When it knows two or more, it cannot tell which one
 //! the miners named, so it prefers none of them: the gateway is ambiguous.
@@ -94,6 +99,9 @@ pub enum GatewayPlace {
 pub struct RankedGateway {
     gateway: GatewayId,
     blocks: u32,
+    /// The node prefers this ID whatever the blocks say, so it ranks ahead of
+    /// every other gateway and keeps a place while it is unreachable.
+    always_preferred: bool,
     resolution: GatewayResolution,
 }
 
@@ -104,18 +112,34 @@ impl RankedGateway {
         Self {
             gateway,
             blocks,
+            always_preferred: false,
             resolution: GatewayMatch::None,
+        }
+    }
+
+    /// A gateway ID the node always prefers, named in `blocks` recent blocks,
+    /// before any node with it is known.
+    pub fn always_preferred(gateway: GatewayId, blocks: u32) -> Self {
+        Self {
+            always_preferred: true,
+            ..Self::unresolved(gateway, blocks)
         }
     }
 
     /// The gateway that `node`'s gateway ID names, named in `blocks` recent
     /// blocks, resolved to `node` and reachable as `standing` says.
     pub fn resolved(node: NodeId, blocks: u32, standing: GatewayStanding) -> Self {
-        Self {
-            gateway: GatewayId::from_node_id(node.as_bytes()),
-            blocks,
-            resolution: GatewayMatch::One((node, standing)),
+        Self::unresolved(GatewayId::from_node_id(node.as_bytes()), blocks)
+            .resolved_as(node, standing)
+    }
+
+    /// Returns this gateway resolved to `node`, reachable as `standing` says.
+    /// A `node` whose ID does not start with this gateway ID changes nothing.
+    pub(crate) fn resolved_as(mut self, node: NodeId, standing: GatewayStanding) -> Self {
+        if self.gateway.is_prefix_of(node.as_bytes()) {
+            self.resolution = GatewayMatch::One((node, standing));
         }
+        self
     }
 
     /// The ID the blocks name the gateway by.
@@ -126,6 +150,17 @@ impl RankedGateway {
     /// Recent blocks that name the gateway.
     pub fn blocks(&self) -> u32 {
         self.blocks
+    }
+
+    /// Whether the node prefers this ID whatever the blocks say.
+    pub fn is_always_preferred(&self) -> bool {
+        self.always_preferred
+    }
+
+    /// The order gateways rank in, highest first: the ones the node always
+    /// prefers, then by block count.
+    fn rank(&self) -> (bool, u32) {
+        (self.always_preferred, self.blocks)
     }
 
     /// The node the gateway ID names, and how v2 networking can reach it.
@@ -166,6 +201,18 @@ impl RankedGateway {
     /// v2 networking knows how to reach.
     fn is_matched(&self) -> bool {
         matches!(self.resolution, GatewayMatch::One((_, standing)) if standing.matched())
+    }
+
+    /// Whether the gateway keeps a held place even while it is unreachable:
+    /// the node always prefers it, and it is not ambiguous. Its place waits
+    /// for it, so it can call in whenever it connects.
+    fn keeps_its_place(&self) -> bool {
+        self.always_preferred && self.resolution != GatewayMatch::Several
+    }
+
+    /// Whether the gateway counts toward the hold.
+    fn counts_toward_hold(&self) -> bool {
+        self.keeps_its_place() || self.is_matched()
     }
 
     /// The node the gateway names, when it is reachable now and so may fill
@@ -228,15 +275,15 @@ impl FromIterator<RankedGateway> for GatewayRanking {
             // Ignore the snapshot's connection status. Only the admission lock can
             // tell which of the tied identities still owns an authenticated slot.
             candidates.sort_unstable_by(|a, b| {
-                b.blocks
-                    .cmp(&a.blocks)
+                b.rank()
+                    .cmp(&a.rank())
                     .then_with(|| a.gateway.cmp(&b.gateway))
             });
-            let cutoff = candidates[MAX_RANKED_GATEWAYS - 1].blocks;
+            let cutoff = candidates[MAX_RANKED_GATEWAYS - 1].rank();
             tied_at_cutoff.extend(
                 candidates
                     .drain(MAX_RANKED_GATEWAYS..)
-                    .take_while(|gateway| gateway.blocks == cutoff)
+                    .take_while(|gateway| gateway.rank() == cutoff)
                     .map(|gateway| (gateway.gateway, gateway)),
             );
         }
@@ -282,7 +329,8 @@ pub struct PreferredGateways {
     ranking: Vec<RankedGateway>,
     /// The hold's ceiling, at most [`MAX_PREFERRED_GATEWAYS`].
     hold_limit: usize,
-    /// The places held: the ceiling, or the matched gateways when fewer.
+    /// The places held: the ceiling, or the matched gateways and the ones the
+    /// node always prefers when fewer.
     hold: usize,
     /// The available gateways that fill the held places, in rank order.
     set: Vec<NodeId>,
@@ -292,18 +340,23 @@ impl PreferredGateways {
     /// Forms the preferred set from `ranking`, with at most `hold_limit`
     /// additional places funded for gateways.
     ///
-    /// Gateways are ranked by block count, highest first. Within one count a
-    /// connected gateway comes first, so a tie at the cutoff keeps the
-    /// gateway already connected from round to round; other ties keep the
-    /// order of `ranking`. A gateway listed twice keeps its first entry.
+    /// The gateways the node always prefers rank first, then the others by
+    /// block count, highest first. Within one rank a connected gateway comes
+    /// first, so a tie at the cutoff keeps the gateway already connected from
+    /// round to round; other ties keep the order of `ranking`. A gateway
+    /// listed twice keeps its first entry.
     ///
     /// Of a ranking longer than [`MAX_RANKED_GATEWAYS`], only that many are
-    /// kept: the highest block counts, then connected gateways, then the
-    /// lowest gateway ID bytes.
+    /// kept: the highest ranks, then connected gateways, then the lowest
+    /// gateway ID bytes.
     ///
-    /// The hold is the matched gateways, up to the ceiling, so a gateway in
-    /// backoff still counts toward the shared hold. The set is the available
-    /// gateways, in rank order, up to the hold.
+    /// The hold is the matched gateways and the ones the node always prefers,
+    /// up to the ceiling, so a gateway in backoff still counts toward the
+    /// shared hold. The set is the available gateways, in rank order, up to
+    /// the hold. A gateway the node always prefers keeps its place in that
+    /// order even while it is unreachable, so no lower gateway fills it, and
+    /// it can call in whenever it connects. An unreachable one costs at most
+    /// that one place.
     pub fn form(ranking: impl IntoIterator<Item = RankedGateway>, hold_limit: usize) -> Self {
         Self::form_with_incumbents(unique_gateways(ranking), hold_limit, &[])
     }
@@ -317,7 +370,7 @@ impl PreferredGateways {
         let priority = |gateway: &RankedGateway| {
             let connected = gateway.connected_node();
             (
-                gateway.blocks,
+                gateway.rank(),
                 connected.is_some(),
                 connected.is_some_and(|node| incumbents.contains(&node)),
             )
@@ -333,16 +386,23 @@ impl PreferredGateways {
         // A stable sort, so equal gateways keep the order they were given.
         ranking.sort_by_key(|gateway| std::cmp::Reverse(priority(gateway)));
         let hold_limit = hold_limit.min(MAX_PREFERRED_GATEWAYS);
-        let matched = ranking
+        let counted = ranking
             .iter()
-            .filter(|gateway| gateway.is_matched())
+            .filter(|gateway| gateway.counts_toward_hold())
             .count();
-        let hold = hold_limit.min(matched);
-        let set = ranking
-            .iter()
-            .filter_map(RankedGateway::available_node)
-            .take(hold)
-            .collect();
+        let hold = hold_limit.min(counted);
+        let mut set = Vec::new();
+        let mut places = 0;
+        for gateway in &ranking {
+            if places == hold {
+                break;
+            }
+            let node = gateway.available_node();
+            if node.is_some() || gateway.keeps_its_place() {
+                places += 1;
+                set.extend(node);
+            }
+        }
         Self {
             ranking,
             hold_limit,
@@ -369,6 +429,9 @@ impl PreferredGateways {
 
     /// Every ranked gateway once, in rank order, with its place. A ranking
     /// keeps at most 256 gateways.
+    ///
+    /// A gateway the node always prefers keeps a held place whatever its
+    /// place reads, unless it is ambiguous.
     pub(crate) fn places(&self) -> impl Iterator<Item = (&RankedGateway, GatewayPlace)> + '_ {
         self.ranking.iter().map(|gateway| {
             let place = match gateway.resolution {

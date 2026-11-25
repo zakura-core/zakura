@@ -831,3 +831,48 @@ fn publication_fails_closed_when_a_proved_owner_shares_a_resolved_gateway_id() {
     assert!(preferred_set(&handler).is_empty());
     assert_eq!(hold(&handler), 0);
 }
+
+/// An ID the node always prefers, such as a relay's own template node, keeps
+/// its place while v2 networking knows nothing of it. With the ordinary
+/// inbound share full, it is admitted before its ID is read and granted the
+/// held place once it is, while an ordinary caller is still refused.
+#[test]
+fn an_always_preferred_caller_passes_a_full_inbound_share() {
+    let handler = handler(40, 2);
+    let template = new_node();
+    let gateway = new_node();
+    handler.publish_gateway_ranking([
+        RankedGateway::resolved(gateway, 10, GatewayStanding::Dialable),
+        RankedGateway::always_preferred(GatewayId::from_node_id(template.as_bytes()), 0),
+    ]);
+    assert_eq!(hold(&handler), 2);
+    assert_eq!(
+        preferred_set(&handler),
+        [gateway],
+        "the template node's place waits for it"
+    );
+    let _gateway = handler.claim_connection(gateway, false).expect("held");
+    let _inbound = fill(&handler, 30, true);
+    assert_eq!(ordinary(&handler, true), Err(SlotRefusal::InboundShare));
+
+    assert!(
+        admits_a_caller(&handler, 1),
+        "the template node's place is free before the caller's ID is known"
+    );
+    let _template = handler
+        .claim_connection(template, true)
+        .expect("the template node calls into its held place");
+    assert_eq!(preferred_set(&handler), [template, gateway]);
+    assert_eq!(
+        split(&handler),
+        SlotSplit {
+            preferred: 2,
+            ordinary: 30,
+            ordinary_inbound: 30,
+        }
+    );
+    assert!(
+        !admits_a_caller(&handler, 2),
+        "no held place is free and the inbound share is full"
+    );
+}

@@ -38,6 +38,9 @@ pub struct PlacedGateway {
     pub blocks: u32,
     /// Where the gateway stands against the held places.
     pub place: GatewayPlace,
+    /// Whether the node prefers this ID whatever the blocks say. It then keeps
+    /// a held place for it, reachable or not, unless it is ambiguous.
+    pub always_preferred: bool,
     /// Whether the gateway is a registered v2 peer now.
     pub connected: bool,
 }
@@ -78,6 +81,7 @@ impl ConnectionPlaces {
                 gateway_id: gateway.gateway(),
                 blocks: gateway.blocks(),
                 place,
+                always_preferred: gateway.is_always_preferred(),
                 connected: gateway
                     .node()
                     .is_some_and(|node| registered.contains(&node)),

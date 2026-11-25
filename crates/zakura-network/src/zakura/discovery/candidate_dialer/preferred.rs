@@ -1,8 +1,9 @@
 //! The mining gateways this node prefers to stay connected to, as the
 //! discovery dialer sees them.
 //!
-//! The node ranks gateways by how many recent blocks name them and hands the
-//! ranking to the dialer as a [`MinerGatewayRanking`]. The dialer ranks it
+//! The node ranks gateways by how many recent blocks name them, puts the IDs
+//! it always prefers ahead of them, and hands the result to the dialer as a
+//! [`MinerGatewayRanking`]. The dialer ranks it
 //! once per change ([`PreferredGatewayInput`]), then each round resolves
 //! every ranked gateway ID to the one node it names and classifies it, from
 //! the registered peers, its own dials in flight and the discovery book
@@ -22,25 +23,35 @@ use zakura_rt::{
 use super::super::protocol::{DialTarget, ZakuraDiscoveryDialCandidate, ZakuraDiscoveryHandle};
 use super::discovery_node_addr_with_reserved_ip_capacity;
 use super::state::{CandidateDialerState, DialAttemptKey};
-use crate::zakura::{GatewayMatch, GatewayStanding, RankedGateway, MAX_RANKED_GATEWAYS};
+use crate::zakura::{
+    GatewayMatch, GatewayStanding, RankedGateway, MAX_PREFERRED_GATEWAYS, MAX_RANKED_GATEWAYS,
+};
 
-/// Mining gateways ranked by how many recent best-chain blocks name them.
+/// The gateways this node keeps connection places for: the IDs it always
+/// prefers, then mining gateways ranked by how many recent best-chain blocks
+/// name them.
 ///
-/// The list may be in any order. The dialer ranks gateways by block count,
-/// most first, and by lower gateway ID bytes among equal counts, and
-/// considers only the first 256 by rank. zakurad converts the chain crate's
-/// gateway counts into this type in one place. It is the node's raw input;
-/// the dialer turns it into [`RankedGateway`]s, which carry the node each
-/// gateway ID names and each gateway's [`GatewayStanding`] for the
-/// connection-slot checks.
+/// The IDs the node always prefers rank first, in the order given, and each
+/// keeps its place even while it is unreachable. The other gateways may be
+/// in any order: the dialer ranks them by block count, most first, and by
+/// lower gateway ID bytes among equal counts. It considers only the first
+/// 256 by rank, always-preferred IDs included. zakurad converts its config
+/// and the chain crate's gateway counts into this type in one place. It is
+/// the node's raw input; the dialer turns it into [`RankedGateway`]s, which
+/// carry the node each gateway ID names and each gateway's
+/// [`GatewayStanding`] for the connection-slot checks.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MinerGatewayRanking {
+    /// The IDs this node prefers whatever the blocks say, such as a relay's
+    /// own template nodes, each with the counted blocks that name it, which
+    /// may be none. At most [`MAX_PREFERRED_GATEWAYS`] are kept.
+    pub always_preferred: Vec<MinerGateway>,
     /// The gateways named in enough counted blocks for the node to prefer
     /// them.
     pub gateways: Vec<MinerGateway>,
 }
 
-/// One gateway in a [`MinerGatewayRanking`].
+/// One entry of a [`MinerGatewayRanking`].
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct MinerGateway {
     /// The gateway ID exactly as the blocks wrote it: the first 20 bytes of
@@ -54,14 +65,26 @@ pub struct MinerGateway {
 /// most [`MAX_RANKED_GATEWAYS`] plus ties at the cutoff. Each one names no
 /// node until [`classify_gateways`] resolves it.
 ///
-/// It drops entries with no blocks, the gateway ID of `local_node_id`, and
-/// repeats of an ID, keeping the repeat with the most blocks. A node never
-/// prefers a gateway ID that its own node ID starts with, even when another
-/// node shares it. It ranks before it drops or caps
-/// anything, so a dropped entry takes no place and lower-ranked entries can't
-/// push out a better one.
+/// The IDs the node always prefers come first, in their order, at most
+/// [`MAX_PREFERRED_GATEWAYS`] of them; a repeat keeps its first entry. The
+/// other gateways follow, ranked by block count, leaving out the IDs already
+/// listed, entries with no blocks and repeats of an ID, keeping the repeat
+/// with the most blocks. Both drop the gateway ID of `local_node_id`: a node
+/// never prefers a gateway ID that its own node ID starts with, even when
+/// another node shares it. It ranks before it drops or caps anything, so a
+/// dropped entry takes no place and lower-ranked entries can't push out a
+/// better one.
 fn rank_gateways(ranking: &MinerGatewayRanking, local_node_id: NodeId) -> Vec<RankedGateway> {
     let local_gateway = GatewayId::from_node_id(local_node_id.as_bytes());
+    let mut seen = HashSet::new();
+    let always_preferred: Vec<RankedGateway> = ranking
+        .always_preferred
+        .iter()
+        .filter(|gateway| gateway.gateway_id != local_gateway)
+        .filter(|gateway| seen.insert(gateway.gateway_id))
+        .take(MAX_PREFERRED_GATEWAYS)
+        .map(|gateway| RankedGateway::always_preferred(gateway.gateway_id, gateway.blocks))
+        .collect();
     let mut gateways: Vec<MinerGateway> = ranking
         .gateways
         .iter()
@@ -73,7 +96,6 @@ fn rank_gateways(ranking: &MinerGatewayRanking, local_node_id: NodeId) -> Vec<Ra
             .cmp(&a.blocks)
             .then_with(|| a.gateway_id.cmp(&b.gateway_id))
     });
-    let mut seen = HashSet::new();
     let mut ranked: Vec<_> = gateways
         .into_iter()
         .filter(|gateway| seen.insert(gateway.gateway_id))
@@ -81,11 +103,11 @@ fn rank_gateways(ranking: &MinerGatewayRanking, local_node_id: NodeId) -> Vec<Ra
         .map(|gateway| RankedGateway::unresolved(gateway.gateway_id, gateway.blocks))
         .collect();
     // Admission resolves cutoff ties against the live authenticated connections.
-    if let Some(cutoff) = ranked.get(MAX_RANKED_GATEWAYS - 1) {
+    if let Some(cutoff) = ranked.get(MAX_RANKED_GATEWAYS - always_preferred.len() - 1) {
         let keep = ranked.partition_point(|gateway| gateway.blocks() >= cutoff.blocks());
         ranked.truncate(keep);
     }
-    ranked
+    always_preferred.into_iter().chain(ranked).collect()
 }
 
 /// The latest ranking the node handed the dialer, converted once per change.
@@ -213,7 +235,7 @@ pub(super) async fn classify_gateways(
                     }
                     standing
                 };
-                RankedGateway::resolved(node, gateway.blocks(), standing)
+                gateway.resolved_as(node, standing)
             }
         };
         classified.ranking.push(resolved);
@@ -537,7 +559,10 @@ mod tests {
     }
 
     fn ranking(gateways: Vec<MinerGateway>) -> MinerGatewayRanking {
-        MinerGatewayRanking { gateways }
+        MinerGatewayRanking {
+            always_preferred: Vec::new(),
+            gateways,
+        }
     }
 
     fn ranked_ids(ranked: &[RankedGateway]) -> Vec<GatewayId> {
@@ -625,6 +650,71 @@ mod tests {
         );
 
         assert_eq!(ranked, vec![unresolved(a, 7)]);
+    }
+
+    /// The IDs the node always prefers come first, in their order and with
+    /// any block count, and the ranked gateways fill the rest without
+    /// repeating them. The node's own ID is never included.
+    #[test]
+    fn always_preferred_ids_rank_first_and_gateways_fill_the_rest() {
+        let local = node_id(1);
+        let (first, second, ranked, repeated) = (node_id(2), node_id(3), node_id(4), node_id(5));
+        let ranked_list = rank_gateways(
+            &MinerGatewayRanking {
+                always_preferred: vec![
+                    gateway(first, 0),
+                    gateway(local, 0),
+                    gateway(repeated, 0),
+                    gateway(second, 3),
+                    gateway(first, 0),
+                ],
+                gateways: vec![
+                    gateway(ranked, 9),
+                    gateway(repeated, 50),
+                    gateway(local, 60),
+                ],
+            },
+            local,
+        );
+
+        assert_eq!(
+            ranked_ids(&ranked_list),
+            gateway_ids(&[first, repeated, second, ranked])
+        );
+        assert_eq!(
+            ranked_list
+                .iter()
+                .map(|gateway| (gateway.is_always_preferred(), gateway.blocks()))
+                .collect::<Vec<_>>(),
+            vec![(true, 0), (true, 0), (true, 3), (false, 9)]
+        );
+    }
+
+    /// The always-preferred IDs count toward the ranking's cap.
+    #[test]
+    fn always_preferred_ids_count_toward_the_cap() {
+        let always: Vec<_> = (0..3)
+            .map(|_| gateway(NodeSecretKey::generate().public(), 0))
+            .collect();
+        let gateways: Vec<_> = (0..300)
+            .map(|blocks| gateway(NodeSecretKey::generate().public(), blocks + 1))
+            .collect();
+        let ranked = rank_gateways(
+            &MinerGatewayRanking {
+                always_preferred: always.clone(),
+                gateways,
+            },
+            node_id(99),
+        );
+
+        assert_eq!(ranked.len(), MAX_RANKED_GATEWAYS);
+        assert_eq!(
+            ranked_ids(&ranked[..3]),
+            always
+                .iter()
+                .map(|gateway| gateway.gateway_id)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

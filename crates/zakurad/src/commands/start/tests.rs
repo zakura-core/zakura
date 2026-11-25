@@ -446,6 +446,94 @@ fn a_mesh_node_with_a_miner_address_for_another_network_is_refused() {
     );
 }
 
+/// The gateway IDs of a pool's template nodes, numbered from `first`.
+fn template_nodes(first: u8, count: u8) -> Vec<GatewayId> {
+    (first..first + count)
+        .map(|byte| GatewayId::from_bytes([byte; 20]))
+        .collect()
+}
+
+/// A relay that is its own gateway may list its template nodes, with or without a miner
+/// address of its own.
+#[test]
+fn a_relay_that_is_its_own_gateway_may_list_its_template_nodes() {
+    let mut config = ZakuradConfig::default();
+    config.network.p2p_stack = P2pStack::Dual;
+    config.mining.miner_mesh = true;
+    config.mining.miner_address = None;
+    config.mining.miner_mesh_template_nodes = template_nodes(1, 4);
+
+    plain_start()
+        .override_config(config.clone())
+        .expect("a relay keeps places for up to four template nodes");
+    StartCmd::local_mesh_gateway(&config, Some(&OWN_NODE_ID))
+        .expect("the relay lists only other nodes");
+
+    config.mining.miner_address = announcing_config().mining.miner_address;
+    plain_start()
+        .override_config(config)
+        .expect("a gateway that also mines may list its other template nodes");
+}
+
+/// Each way a template-node list cannot work refuses to start, naming why.
+#[test]
+fn a_template_node_list_that_cannot_work_is_refused() {
+    let mut relay = ZakuradConfig::default();
+    relay.network.p2p_stack = P2pStack::Dual;
+    relay.mining.miner_mesh = true;
+    relay.mining.miner_address = None;
+
+    let mut without_mesh = relay.clone();
+    without_mesh.mining.miner_mesh = false;
+    without_mesh.mining.miner_mesh_template_nodes = template_nodes(1, 1);
+
+    let mut naming_a_relay = announcing_config();
+    naming_a_relay.mining.miner_mesh_gateways = vec![RELAY];
+    naming_a_relay.mining.miner_mesh_template_nodes = template_nodes(1, 1);
+
+    let mut too_many = relay.clone();
+    too_many.mining.miner_mesh_template_nodes = template_nodes(1, 5);
+
+    let mut repeated = relay.clone();
+    repeated.mining.miner_mesh_template_nodes =
+        [template_nodes(1, 2), template_nodes(1, 1)].concat();
+
+    for (config, expected) in [
+        (
+            without_mesh,
+            "mining.miner_mesh_template_nodes has no effect unless mining.miner_mesh is set",
+        ),
+        (
+            naming_a_relay,
+            "mining.miner_mesh_template_nodes needs this node to be its own gateway",
+        ),
+        (
+            too_many,
+            "mining.miner_mesh_template_nodes lists 5 template nodes, but at most 4",
+        ),
+        (repeated, "more than once"),
+    ] {
+        let error = plain_start()
+            .override_config(config)
+            .expect_err("the list cannot work");
+        assert!(
+            error.to_string().contains(expected),
+            "expected {expected:?}, got: {error}"
+        );
+    }
+
+    let mut listing_itself = relay;
+    listing_itself.mining.miner_mesh_template_nodes = vec![GatewayId::from_node_id(&OWN_NODE_ID)];
+    let error = StartCmd::local_mesh_gateway(&listing_itself, Some(&OWN_NODE_ID))
+        .expect_err("the relay would keep a place for itself");
+    assert!(
+        error
+            .to_string()
+            .contains("mining.miner_mesh_template_nodes lists this node"),
+        "unexpected error: {error}"
+    );
+}
+
 #[test]
 fn a_miner_or_a_node_running_the_miner_mesh_prefers_gateways() {
     let mut config = ZakuradConfig::default();

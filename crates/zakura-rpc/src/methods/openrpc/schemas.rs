@@ -405,9 +405,10 @@ impl RpcSchema for MeshGateway {
                 "gateway_id": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
                 "blocks": generator.subschema_for::<u32>(),
                 "state": generator.subschema_for::<MeshGatewayState>(),
+                "template_node": generator.subschema_for::<bool>(),
                 "connected": generator.subschema_for::<bool>(),
             },
-            "required": ["gateway_id", "blocks", "state", "connected"],
+            "required": ["gateway_id", "blocks", "state", "template_node", "connected"],
         })
     }
 }

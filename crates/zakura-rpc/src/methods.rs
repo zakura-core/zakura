@@ -856,6 +856,11 @@ pub trait RpcServer {
     /// connection, `unmatched` when v2 networking has no usable dial address for it,
     /// and `ambiguous` when v2 networking knows two or more nodes with its ID.
     ///
+    /// A relay's template nodes, the ones `mining.miner_mesh_template_nodes`
+    /// lists, come first in `gateways` with `template_node` true. Each keeps a
+    /// held place whatever its `state`, unless it is `ambiguous`, and
+    /// `connected` says whether it is connected now.
+    ///
     /// A gateway's `gateway_id` is the 20-byte ID the blocks name it by, the
     /// first 20 bytes of its v2 node ID. Each peer's `node_id` is its full
     /// 32-byte v2 node ID.

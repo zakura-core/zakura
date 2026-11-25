@@ -1362,9 +1362,10 @@ impl PeerState {
             state.have_delayed = have_held_until.is_some();
         }
         // bpv1-88: this node solved a block that a peer's copy admitted
-        // first. The role only grows, and the proposer announces nothing
-        // (decision-20), so its held `Have`s drop.
-        if as_proposer && !state.as_proposer {
+        // first. The role only grows, and only for the proposer the block
+        // already names. The proposer announces nothing (decision-20), so
+        // its held `Have`s drop.
+        if as_proposer && !state.as_proposer && state.proposer_node == proposer_node {
             state.as_proposer = true;
             state.pending_have.clear();
             state.pending_have_since = None;
@@ -1386,7 +1387,7 @@ impl PeerState {
 
         // bpv1-9: proposer queues BlockDone right after HeaderMeta so no peer
         // pushes or announces parts back.
-        if as_proposer && state.meta_exchanged() && !state.local_block_done_sent {
+        if state.as_proposer && state.meta_exchanged() && !state.local_block_done_sent {
             state.local_block_done_sent = true;
             step.outputs
                 .push(PeerOutput::SendControl(Box::new(Bpv1Message::BlockDone {

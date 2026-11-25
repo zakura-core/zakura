@@ -1298,6 +1298,46 @@ fn bpv1_88_a_peer_admitted_session_takes_the_proposer_role() {
     }
 }
 
+/// bpv1-88: a session takes the proposer role only for the proposer the
+/// block already names. An admission that names another node leaves the
+/// session a holder, so it never seeds or flags parts to the named proposer
+/// (bpv1-71).
+#[test]
+fn bpv1_88_a_session_keeps_the_proposer_its_block_names() {
+    let encoded = encode_body(&Profile::TINY, &[0x5B; 64], 2).unwrap();
+    let block_id = block::Hash([0x59; 32]);
+    let t0 = Instant::now();
+    // The block names the remote, node 2, as its proposer.
+    let mut peer = session(
+        node_id(2),
+        t0,
+        admitted(block_id, encoded.coding, node_id(2)),
+    );
+    let other = peer.step(t0, proposing(block_id, encoded.coding));
+    assert!(
+        other.outputs.is_empty(),
+        "an admission naming another proposer changes nothing: {:?}",
+        other.outputs
+    );
+    let seeded = peer.step(
+        t0,
+        PeerInput::Seeds(Seeds {
+            block_id,
+            seeds: vec![Seed {
+                part: encoded.parts[1].clone(),
+                relay: true,
+            }],
+            copies: Vec::new(),
+        }),
+    );
+    assert!(
+        seeded.outputs.is_empty(),
+        "a holder sends no seeds: {:?}",
+        seeded.outputs
+    );
+    peer.assert_invariants();
+}
+
 /// decision-20 / bpv1-9: a proposer's session never announces its own block.
 #[test]
 fn decision20_proposer_session_never_sends_have() {

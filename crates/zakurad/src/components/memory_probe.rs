@@ -2,13 +2,14 @@
 //!
 //! Shared by both `[memory] budget = "auto"` and `zcashd-compat` preflight:
 //!
-//! - **Linux:** reads `MemTotal` from `/proc/meminfo`, walks every cgroup v2
-//!   ancestor from the process's cgroup up to `/sys/fs/cgroup` reading both
-//!   `memory.max` and `memory.high`, walks every cgroup v1 `memory` ancestor
-//!   reading `memory.limit_in_bytes` and `memory.stat`'s
-//!   `hierarchical_memory_limit` (ignoring `"max"` and unlimited sentinels),
-//!   and returns the minimum finite limit. Ignores `MemAvailable` and
-//!   `RLIMIT_AS`.
+//! - **Linux:** reads `MemTotal` from `/proc/meminfo`. It finds the cgroup v2
+//!   and v1 `memory` hierarchies in `/proc/self/mountinfo`, maps the process's
+//!   cgroup from `/proc/self/cgroup` into each mount through the mount's root,
+//!   and walks every visible ancestor up to the mount point. It reads both
+//!   `memory.max` and `memory.high` in cgroup v2, and `memory.limit_in_bytes`
+//!   and `memory.stat`'s `hierarchical_memory_limit` in cgroup v1 (ignoring
+//!   `"max"` and unlimited sentinels), and returns the minimum finite limit.
+//!   Ignores `MemAvailable` and `RLIMIT_AS`.
 //! - **Other Unix targets:** queries physical RAM via `sysconf(_SC_PHYS_PAGES)
 //!   * sysconf(_SC_PAGESIZE)`. No container detection.
 //! - **Unreadable / unsupported:** returns an error naming `[memory] budget`.
@@ -99,8 +100,7 @@ mod linux {
     pub(super) struct ProbePaths<'a> {
         pub(super) meminfo: &'a Path,
         pub(super) self_cgroup: &'a Path,
-        pub(super) cgroup_v2_root: &'a Path,
-        pub(super) cgroup_v1_memory_root: &'a Path,
+        pub(super) self_mountinfo: &'a Path,
     }
 
     impl ProbePaths<'static> {
@@ -108,8 +108,7 @@ mod linux {
             Self {
                 meminfo: Path::new("/proc/meminfo"),
                 self_cgroup: Path::new("/proc/self/cgroup"),
-                cgroup_v2_root: Path::new("/sys/fs/cgroup"),
-                cgroup_v1_memory_root: Path::new("/sys/fs/cgroup/memory"),
+                self_mountinfo: Path::new("/proc/self/mountinfo"),
             }
         }
     }
@@ -142,12 +141,19 @@ mod linux {
             return Ok(None);
         };
         let (v2_rel, v1_rel) = parse_self_cgroup_paths(&self_cgroup);
+        if v2_rel.is_none() && v1_rel.is_none() {
+            return Ok(None);
+        }
+        let mountinfo = read_optional(paths.self_mountinfo)?.unwrap_or_default();
+        let mounts = parse_cgroup_mounts(&mountinfo);
         let mut min_limit: Option<u64> = None;
 
         // cgroup v2: read `memory.max` and `memory.high` across EVERY directory
-        // from the process's cgroup up to `/sys/fs/cgroup` inclusive (`02 §2`).
+        // from the process's cgroup up to the mount point inclusive (`02 §2`).
         if let Some(rel) = v2_rel {
-            for dir in cgroup_ancestor_dirs(paths.cgroup_v2_root, &rel) {
+            let dirs = cgroup_dirs(&mounts, CgroupHierarchy::V2, &rel);
+            warn_if_unmounted(&dirs, "v2", &rel);
+            for dir in dirs {
                 for file in ["memory.max", "memory.high"] {
                     tighten(&mut min_limit, parse_cgroup_limit_file(&dir.join(file))?);
                 }
@@ -156,8 +162,12 @@ mod linux {
 
         // cgroup v1: read `memory.limit_in_bytes` and `memory.stat`'s
         // `hierarchical_memory_limit` across every ancestor directory (`02 §2`).
+        // The leaf's `hierarchical_memory_limit` also covers ancestors above
+        // the mount's root.
         if let Some(rel) = v1_rel {
-            for dir in cgroup_ancestor_dirs(paths.cgroup_v1_memory_root, &rel) {
+            let dirs = cgroup_dirs(&mounts, CgroupHierarchy::V1Memory, &rel);
+            warn_if_unmounted(&dirs, "v1 memory", &rel);
+            for dir in dirs {
                 tighten(
                     &mut min_limit,
                     parse_cgroup_limit_file(&dir.join("memory.limit_in_bytes"))?,
@@ -170,6 +180,19 @@ mod linux {
         }
 
         Ok(min_limit)
+    }
+
+    /// Logs that the process's cgroup in `hierarchy` has no visible mount, so
+    /// its limits can't be read.
+    fn warn_if_unmounted(dirs: &[PathBuf], hierarchy: &str, cgroup: &str) {
+        if dirs.is_empty() {
+            tracing::warn!(
+                hierarchy,
+                cgroup,
+                "no cgroup mount covers this process, so its memory limits are unreadable; \
+                 set [memory] budget explicitly if the process has a memory limit"
+            );
+        }
     }
 
     /// Lowers `min_limit` to `limit` when `limit` is finite and smaller.
@@ -204,6 +227,118 @@ mod linux {
         }
 
         (v2_relative_path, v1_memory_relative_path)
+    }
+
+    /// A cgroup hierarchy that can hold memory limits.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum CgroupHierarchy {
+        /// The unified cgroup v2 hierarchy.
+        V2,
+        /// The cgroup v1 hierarchy that carries the `memory` controller.
+        V1Memory,
+    }
+
+    /// One mount of a cgroup hierarchy, from `/proc/self/mountinfo`.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct CgroupMount {
+        hierarchy: CgroupHierarchy,
+        /// The cgroup that the mount point shows, as a path in the hierarchy.
+        root: String,
+        /// Where the hierarchy's `root` cgroup is mounted.
+        mount_point: PathBuf,
+    }
+
+    /// Every cgroup v2 mount and cgroup v1 `memory` mount in `mountinfo`.
+    ///
+    /// Each line is `id parent major:minor root mount_point options
+    /// [optional...] - fstype source super_options` (`proc(5)`).
+    fn parse_cgroup_mounts(mountinfo: &str) -> Vec<CgroupMount> {
+        mountinfo
+            .lines()
+            .filter_map(|line| {
+                let (mount, filesystem) = line.split_once(" - ")?;
+                let mut mount = mount.split(' ');
+                let root = mount.nth(3)?;
+                let mount_point = mount.next()?;
+                let mut filesystem = filesystem.split(' ');
+                let fstype = filesystem.next()?;
+                let super_options = filesystem.nth(1).unwrap_or_default();
+                let hierarchy = match fstype {
+                    "cgroup2" => CgroupHierarchy::V2,
+                    "cgroup" if super_options.split(',').any(|option| option == "memory") => {
+                        CgroupHierarchy::V1Memory
+                    }
+                    _ => return None,
+                };
+                Some(CgroupMount {
+                    hierarchy,
+                    root: unescape_mountinfo(root),
+                    mount_point: PathBuf::from(unescape_mountinfo(mount_point)),
+                })
+            })
+            .collect()
+    }
+
+    /// Decodes the octal escapes (`\040` for a space) that `mountinfo` uses in
+    /// paths.
+    fn unescape_mountinfo(field: &str) -> String {
+        let bytes = field.as_bytes();
+        let mut decoded = Vec::with_capacity(bytes.len());
+        let mut index = 0;
+        while index < bytes.len() {
+            let escape = bytes
+                .get(index + 1..index + 4)
+                .filter(|_| bytes[index] == b'\\')
+                .and_then(|digits| std::str::from_utf8(digits).ok())
+                .and_then(|digits| u8::from_str_radix(digits, 8).ok());
+            match escape {
+                Some(byte) => {
+                    decoded.push(byte);
+                    index += 4;
+                }
+                None => {
+                    decoded.push(bytes[index]);
+                    index += 1;
+                }
+            }
+        }
+        String::from_utf8_lossy(&decoded).into_owned()
+    }
+
+    /// The directories to read for the process's cgroup `cgroup` in
+    /// `hierarchy`: in each mount whose root holds `cgroup`, every directory
+    /// from the mount point down to the cgroup's own.
+    ///
+    /// A mount whose root doesn't hold `cgroup`, such as one made before the
+    /// process moved, gives only its mount point, and only when no mount holds
+    /// `cgroup`. Reading a limit that may not apply can only lower the budget.
+    fn cgroup_dirs(
+        mounts: &[CgroupMount],
+        hierarchy: CgroupHierarchy,
+        cgroup: &str,
+    ) -> Vec<PathBuf> {
+        let mounts = mounts.iter().filter(|mount| mount.hierarchy == hierarchy);
+        let holding: Vec<PathBuf> = mounts
+            .clone()
+            .filter_map(|mount| {
+                let below_root = strip_cgroup_prefix(cgroup, &mount.root)?;
+                Some(cgroup_ancestor_dirs(&mount.mount_point, below_root))
+            })
+            .flatten()
+            .collect();
+        if holding.is_empty() {
+            mounts.map(|mount| mount.mount_point.clone()).collect()
+        } else {
+            holding
+        }
+    }
+
+    /// The part of the cgroup path `cgroup` below `root`, or `None` when
+    /// `root` is not `cgroup` or one of its ancestors.
+    fn strip_cgroup_prefix<'a>(cgroup: &'a str, root: &str) -> Option<&'a str> {
+        let root = root.trim_end_matches('/');
+        let rest = cgroup.strip_prefix(root)?;
+        (rest.is_empty() || rest.starts_with('/')).then_some(rest)
     }
 
     /// Returns every directory from `base` down to `base/<relative_path>`,
@@ -278,13 +413,24 @@ mod tests {
     const GIB: u64 = 1024 * 1024 * 1024;
     const V2: &str = "sys/fs/cgroup";
     const V1: &str = "sys/fs/cgroup/memory";
+    /// A cgroup v1 `memory` hierarchy mounted away from `/sys/fs/cgroup`, at
+    /// a path with a space, which `mountinfo` escapes as `\040`.
+    const MOVED_V1: &str = "cg mem";
+
+    /// `/proc/self/mountinfo` of a standard host. `{tmp}` is the fixture root.
+    const STANDARD_MOUNTS: &str = "\
+22 1 0:21 / /proc rw,nosuid shared:12 - proc proc rw
+30 25 0:26 / {tmp}/sys/fs/cgroup rw,nosuid,nodev,noexec shared:4 - cgroup2 cgroup2 rw,nsdelegate
+31 25 0:27 / {tmp}/sys/fs/cgroup/memory rw,nosuid shared:5 - cgroup cgroup rw,memory
+32 25 0:28 / {tmp}/sys/fs/cgroup/cpu rw,nosuid shared:6 - cgroup cgroup rw,cpu,cpuacct
+";
 
     struct SyntheticTree {
         dir: TempDir,
     }
 
     impl SyntheticTree {
-        fn new(mem_total_gib: u64, self_cgroup: &str) -> Self {
+        fn new(mem_total_gib: u64, self_cgroup: &str, mountinfo: &str) -> Self {
             let dir = TempDir::new().expect("tempdir");
             fs::create_dir_all(dir.path().join("proc/self")).unwrap();
             fs::create_dir_all(dir.path().join(V1)).unwrap();
@@ -295,11 +441,17 @@ mod tests {
             );
             fs::write(dir.path().join("proc/meminfo"), meminfo).unwrap();
             fs::write(dir.path().join("proc/self/cgroup"), self_cgroup).unwrap();
+            let tmp = dir.path().to_str().expect("a UTF-8 tempdir");
+            fs::write(
+                dir.path().join("proc/self/mountinfo"),
+                mountinfo.replace("{tmp}", tmp),
+            )
+            .unwrap();
             Self { dir }
         }
 
-        /// Writes `value` to `file` in the cgroup `rel_dir` under the hierarchy
-        /// `root` ([`V2`] or [`V1`]).
+        /// Writes `value` to `file` in the cgroup `rel_dir` under the fixture
+        /// directory `root` ([`V2`], [`V1`] or [`MOVED_V1`]).
         fn write(&self, root: &str, rel_dir: &str, file: &str, value: &str) {
             let target_dir = self.dir.path().join(root).join(rel_dir.trim_matches('/'));
             fs::create_dir_all(&target_dir).unwrap();
@@ -309,25 +461,25 @@ mod tests {
         fn probe(&self) -> Result<u64, Report> {
             let meminfo = self.dir.path().join("proc/meminfo");
             let self_cgroup = self.dir.path().join("proc/self/cgroup");
-            let v2_root = self.dir.path().join(V2);
-            let v1_root = self.dir.path().join(V1);
+            let self_mountinfo = self.dir.path().join("proc/self/mountinfo");
             detect_memory_bytes(&ProbePaths {
                 meminfo: &meminfo,
                 self_cgroup: &self_cgroup,
-                cgroup_v2_root: &v2_root,
-                cgroup_v1_memory_root: &v1_root,
+                self_mountinfo: &self_mountinfo,
             })
         }
     }
 
-    /// One cgroup file write: hierarchy root, cgroup directory, file, value.
+    /// One cgroup file write: fixture directory, cgroup directory, file, value.
     type Write = (&'static str, &'static str, &'static str, &'static str);
 
-    /// One probe case: name, `MemTotal` in GiB, `/proc/self/cgroup`, and steps
-    /// of writes, each followed by the probe's expected GiB.
+    /// One probe case: name, `MemTotal` in GiB, `/proc/self/cgroup`,
+    /// `/proc/self/mountinfo`, and steps of writes, each followed by the
+    /// probe's expected GiB.
     type Case = (
         &'static str,
         u64,
+        &'static str,
         &'static str,
         &'static [(&'static [Write], u64)],
     );
@@ -339,7 +491,7 @@ mod tests {
     const SENTINEL: &str = "9223372036854771712";
     const I64_MAX: &str = "9223372036854775807";
 
-    const CASES: [Case; 3] = [
+    const CASES: [Case; 6] = [
         // Root unlimited, an intermediate ancestor sets a tight `memory.high`,
         // a deeper parent sets `memory.max`, the leaf is `max`. Then
         // tightening the leaf's `memory.max` wins.
@@ -347,6 +499,7 @@ mod tests {
             "nested v2",
             64,
             "0::/system.slice/zakura.slice/worker.scope\n",
+            STANDARD_MOUNTS,
             &[
                 (
                     &[
@@ -370,6 +523,7 @@ mod tests {
             "nested v1",
             64,
             "4:memory:/kubepods/burstable/pod123\n",
+            STANDARD_MOUNTS,
             &[
                 (
                     &[
@@ -390,6 +544,7 @@ mod tests {
             "hybrid v1 + v2",
             16,
             "0::/user.slice/app.scope\n2:cpu,memory:/containers/app\n",
+            STANDARD_MOUNTS,
             &[
                 (
                     &[
@@ -401,15 +556,69 @@ mod tests {
                 (&[(V1, "/containers", "memory.limit_in_bytes", "10G")], 10),
             ],
         ),
+        // F-905: a container's view, where `/sys/fs/cgroup` mounts the
+        // container's own cgroup, so the mount's root is not `/`. The
+        // process's cgroup maps below the mount point, not at its full path.
+        (
+            "v2 subtree mount",
+            64,
+            "0::/machine.slice/c1.scope/payload/app.service\n",
+            "30 25 0:26 /machine.slice/c1.scope {tmp}/sys/fs/cgroup rw shared:4 - cgroup2 cgroup2 rw\n",
+            &[
+                (
+                    &[
+                        (V2, "/", "memory.max", "16G"),
+                        (V2, "/payload/app.service", "memory.max", "4G"),
+                    ],
+                    4,
+                ),
+                (&[(V2, "/payload", "memory.high", "3G")], 3),
+            ],
+        ),
+        // F-905: the v1 `memory` controller mounted away from
+        // `/sys/fs/cgroup/memory`, beside `cpu`. A limit at the usual path
+        // belongs to no mount, so it doesn't apply.
+        (
+            "v1 memory mounted elsewhere",
+            64,
+            "5:cpu,memory:/kubepods/pod9\n",
+            "40 25 0:30 / {tmp}/cg\\040mem rw shared:7 - cgroup cgroup rw,cpu,memory\n",
+            &[
+                (
+                    &[
+                        (V1, "/kubepods/pod9", "memory.limit_in_bytes", "2G"),
+                        (MOVED_V1, "/kubepods/pod9", "memory.limit_in_bytes", "6G"),
+                    ],
+                    6,
+                ),
+                (&[(MOVED_V1, "/kubepods", "memory.limit_in_bytes", "5G")], 5),
+            ],
+        ),
+        // A mount whose root doesn't hold the process's cgroup gives only its
+        // mount point. With no cgroup mount at all, the probe uses `MemTotal`.
+        (
+            "unmapped cgroup",
+            64,
+            "0::/elsewhere/app\n",
+            "30 25 0:26 /ns-root {tmp}/sys/fs/cgroup rw shared:4 - cgroup2 cgroup2 rw\n",
+            &[(
+                &[
+                    (V2, "/", "memory.max", "10G"),
+                    (V2, "/elsewhere/app", "memory.max", "1G"),
+                ],
+                10,
+            )],
+        ),
     ];
 
     /// mem-8: the probe takes the minimum of `MemTotal` and every finite
-    /// limit across every cgroup v2 and v1 ancestor, ignoring `"max"`, the
-    /// v1 unlimited sentinels and `MemAvailable`.
+    /// limit across every cgroup v2 and v1 ancestor that the mounts in
+    /// `mountinfo` show, ignoring `"max"`, the v1 unlimited sentinels and
+    /// `MemAvailable`.
     #[test]
     fn mem8_probe_takes_the_minimum_across_memtotal_and_cgroup_ancestors() {
-        for (name, mem_total_gib, self_cgroup, steps) in CASES {
-            let tree = SyntheticTree::new(mem_total_gib, self_cgroup);
+        for (name, mem_total_gib, self_cgroup, mountinfo, steps) in CASES {
+            let tree = SyntheticTree::new(mem_total_gib, self_cgroup, mountinfo);
             for &(writes, expected_gib) in steps {
                 for &(root, rel_dir, file, value) in writes {
                     // `N G` is N GiB. `memory.stat` holds the limit among
@@ -430,17 +639,34 @@ mod tests {
         }
     }
 
+    /// A process in a cgroup that no mount shows keeps `MemTotal`.
+    #[test]
+    fn an_unmounted_cgroup_keeps_memtotal() {
+        let tree = SyntheticTree::new(
+            48,
+            "0::/system.slice/zakura.service\n",
+            "22 1 0:21 / /proc rw - proc proc rw\n",
+        );
+        tree.write(
+            V2,
+            "/system.slice/zakura.service",
+            "memory.max",
+            "1073741824",
+        );
+        assert_eq!(tree.probe().unwrap(), 48 * GIB);
+    }
+
     /// Unreadable `/proc/meminfo` fails and names `[memory] budget` (`02 §2`).
     #[test]
     fn unreadable_probe_names_memory_budget_setting() {
         let dir = TempDir::new().expect("tempdir");
         let missing = dir.path().join("no-meminfo");
         let self_cgroup = dir.path().join("no-cgroup");
+        let self_mountinfo = dir.path().join("no-mountinfo");
         let err = detect_memory_bytes(&ProbePaths {
             meminfo: &missing,
             self_cgroup: &self_cgroup,
-            cgroup_v2_root: dir.path(),
-            cgroup_v1_memory_root: dir.path(),
+            self_mountinfo: &self_mountinfo,
         })
         .unwrap_err()
         .to_string();

@@ -431,9 +431,9 @@ impl StartCmd {
         Ok(())
     }
 
-    /// Whether coinbases name this node as a gateway: `mining.miner_mesh` is set and
-    /// `mining.miner_mesh_gateways` names no other node.
-    fn names_itself(config: &ZakuradConfig) -> bool {
+    /// This node is its own gateway: `mining.miner_mesh` is set and
+    /// `mining.miner_mesh_gateways` is empty.
+    fn is_own_gateway(config: &ZakuradConfig) -> bool {
         config.mining.miner_mesh && config.mining.miner_mesh_gateways.is_empty()
     }
 
@@ -479,7 +479,7 @@ impl StartCmd {
         let announced = mining.miner_address.is_some().then_some(stands_for);
         Ok(miner_mesh::LocalGateway {
             announced,
-            stands_for: (announced.is_some() || Self::names_itself(config)).then_some(stands_for),
+            stands_for: (announced.is_some() || Self::is_own_gateway(config)).then_some(stands_for),
         })
     }
 
@@ -487,7 +487,7 @@ impl StartCmd {
     /// name as a gateway.
     fn network_config_for_start(config: &ZakuradConfig) -> Result<zakura_network::Config, Report> {
         let mut network = config.network.clone();
-        if Self::names_itself(config) {
+        if Self::is_own_gateway(config) {
             network.pin_stable_zakura_identity().map_err(|error| {
                 eyre!(
                     "mining.miner_mesh needs a node key that stays the same across restarts: \

@@ -166,7 +166,6 @@ fn a_node_that_names_its_relay_reports_the_relay_as_its_announced_gateway() {
         Some(&places()),
     );
 
-    assert!(response.announcing);
     assert_eq!(response.announced_gateways, vec![relay.to_string()]);
     assert_eq!(
         response.node_id,
@@ -187,7 +186,6 @@ fn a_relay_that_prefers_gateways_reports_its_window_without_announcing() {
         Some(&places()),
     );
 
-    assert!(!response.announcing);
     assert!(response.announced_gateways.is_empty());
     assert_eq!(response.window, Some(MeshWindow::from(&coverage())));
     assert_eq!(response.hold, 1);
@@ -207,7 +205,6 @@ fn a_node_without_counts_or_v2_networking_reports_neither() {
     );
 
     assert_eq!(response.node_id, None);
-    assert!(!response.announcing);
     assert!(response.announced_gateways.is_empty());
     assert_eq!(response.window, None);
     assert!(response.gateways.is_empty());

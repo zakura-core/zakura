@@ -202,7 +202,7 @@ async fn a_pool_names_its_relay_as_its_gateway() -> Result<()> {
     );
 
     let relay_view = net.view(RELAY);
-    assert!(!relay_view.info.mining && !relay_view.info.announcing);
+    assert!(!relay_view.info.mining && relay_view.info.announced_gateways.is_empty());
     assert!(
         relay_view.info.window.is_some(),
         "the relay counts the blocks"

@@ -256,6 +256,11 @@ fn text_of_another_length_or_not_hex_names_no_gateway_id() {
         );
     }
 
+    // The length is counted in bytes, as the parser chooses by it.
+    let error = "é".parse::<GatewayId>().expect_err("two bytes name no ID");
+    assert_eq!(error, ParseGatewayIdError::Length(2));
+    assert!(error.to_string().ends_with("found 2 bytes"), "{error}");
+
     let not_hex = format!("{}zz", &hex::encode(NODE_ID)[2..]);
     assert!(matches!(
         not_hex.parse::<GatewayId>(),

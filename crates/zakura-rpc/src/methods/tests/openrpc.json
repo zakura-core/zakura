@@ -1213,9 +1213,6 @@
             },
             "type": "array"
           },
-          "announcing": {
-            "type": "boolean"
-          },
           "gateways": {
             "items": {
               "$ref": "#/components/schemas/MeshGateway"
@@ -1268,7 +1265,6 @@
         },
         "required": [
           "node_id",
-          "announcing",
           "announced_gateways",
           "mining",
           "synced",

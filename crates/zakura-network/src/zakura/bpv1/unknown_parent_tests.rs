@@ -6,6 +6,7 @@ use zakura_chain::{
     block::{self, Header, Height},
     parameters::{Network, MAX_POW_AVERAGING_WINDOW},
     serialization::ZcashSerialize,
+    transparent,
     work::{
         difficulty::{ExpandedDifficulty, ParameterDifficulty as _, U256},
         equihash::Solution,
@@ -16,7 +17,7 @@ use zakura_header_chain::{validate_hash_filter, Frontier, HeaderContextFact, Val
 use super::{
     blocks::MetaEnvelope,
     close::Bpv1CloseRow,
-    commitment::{coinbase_paths, CoinbaseBinding},
+    commitment::{coinbase_paths, decode_coinbase, CoinbaseBinding},
     profile::Profile,
     test_support::{block_of, build_v6_coinbase, build_v6_tx, node_id, regtest_nu7},
     unknown_parent::{
@@ -152,6 +153,39 @@ fn binding_that_misses_the_merkle_root_closes_row_4() {
 
     let (header, mut envelope) = honest_meta(10);
     envelope.binding.txid_siblings[0][0] ^= 1;
+    assert_eq!(
+        check_binding_and_height(&header, &envelope, 9),
+        Err(INVALID_BINDING)
+    );
+}
+
+/// The txid leaves out the coinbase script, so a sender can change the
+/// coinbase height without moving the Merkle root. The block commitments
+/// cover the script, so the changed height closes the sender with row 4.
+#[test]
+fn changed_coinbase_height_closes_row_4() {
+    let (header, mut envelope) = honest_meta(10);
+    let mut coinbase = decode_coinbase(&envelope.binding.coinbase).expect("the coinbase decodes");
+    let txid = coinbase.hash();
+    match coinbase.inputs_mut().first_mut() {
+        Some(transparent::Input::Coinbase { height, .. }) => *height = Height(12),
+        _ => panic!("the first input is the coinbase input"),
+    }
+    assert_eq!(
+        coinbase.hash(),
+        txid,
+        "the txid leaves out the coinbase script"
+    );
+    envelope.binding.coinbase = coinbase
+        .zcash_serialize_to_vec()
+        .expect("a coinbase serializes");
+    assert_eq!(
+        check_binding_and_height(&header, &envelope, 9),
+        Err(INVALID_BINDING)
+    );
+
+    let (header, mut envelope) = honest_meta(10);
+    envelope.binding.light_client_root[0] ^= 1;
     assert_eq!(
         check_binding_and_height(&header, &envelope, 9),
         Err(INVALID_BINDING)

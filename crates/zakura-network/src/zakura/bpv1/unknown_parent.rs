@@ -5,7 +5,10 @@
 //! parent costs its sender only bytes. The checks need no parent, and they
 //! run in this order:
 //!
-//! 1. The binding's coinbase txid reaches the header's Merkle root.
+//! 1. The binding's coinbase txid reaches the header's Merkle root, and its
+//!    authorizing data reaches the header's block commitments. The txid
+//!    leaves out the coinbase script, so only the second path authenticates
+//!    the height that check 2 reads.
 //! 2. The coinbase height (BIP 34) lies above `top` and at most
 //!    [`PROPAGATION_DEPTH`] above it. Block sync owns every other height.
 //! 3. The header hash meets the header's own target, and the Equihash
@@ -18,7 +21,7 @@
 //! for metadata whose parent is missing.
 //!
 //! Only failures that no chain can contain close the sender. A binding that
-//! misses its header's Merkle root, a target above the proof-of-work limit, a
+//! misses its header's Merkle root or block commitments, a target above the proof-of-work limit, a
 //! hash above its own target, and an invalid solution are invalid on every
 //! chain of the network. Check 4 is not: it assumes the header extends the
 //! best header, and a header with an unknown parent may extend a fork. A fork
@@ -38,7 +41,9 @@ use zakura_header_chain::{
 };
 
 use super::{
-    blocks::MetaEnvelope, close::Bpv1CloseRow, commitment::verify_txid_path,
+    blocks::MetaEnvelope,
+    close::Bpv1CloseRow,
+    commitment::{check_block_commitments, verify_txid_path},
     wire::PROPAGATION_DEPTH,
 };
 
@@ -152,8 +157,16 @@ pub fn check_binding_and_height(
     top: u32,
 ) -> Result<u32, UnknownParentVerdict> {
     let invalid_binding = UnknownParentVerdict::Invalid(Bpv1CloseRow::Row4BadMetaOrCommitment);
-    let coinbase = verify_txid_path(header, &envelope.binding, envelope.coding.tx_count)
-        .map_err(|_| invalid_binding)?;
+    let binding = &envelope.binding;
+    let coinbase =
+        verify_txid_path(header, binding, envelope.coding.tx_count).map_err(|_| invalid_binding)?;
+    check_block_commitments(
+        header,
+        &coinbase,
+        &binding.auth_siblings,
+        binding.light_client_root,
+    )
+    .map_err(|_| invalid_binding)?;
     let height = match coinbase.inputs().first() {
         Some(transparent::Input::Coinbase { height, .. }) => height.0,
         _ => return Err(invalid_binding),

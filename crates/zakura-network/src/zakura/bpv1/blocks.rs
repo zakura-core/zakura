@@ -794,6 +794,12 @@ pub enum BlockEvent {
         /// Block hash.
         block_id: block::Hash,
     },
+    /// A retryable verdict parked the assembled block until its parent commits
+    /// (`bpv1-79`).
+    Parked {
+        /// Block hash.
+        block_id: block::Hash,
+    },
     /// Verdict received from `BlockVerifier`.
     Verdict {
         /// Block hash.
@@ -1078,7 +1084,9 @@ struct ActiveBlock {
     last_part_at: Instant,
     /// Peers that sent `BlockDone`, which repair may ask for any part (decision-20).
     done_peers: HashSet<NodeId>,
-    /// Active verifier work id if `phase == Verifying`.
+    /// Work id of the submission in flight. `None` while `Verifying` means a
+    /// retryable verdict parked the assembled block until its parent commits
+    /// (`bpv1-79`).
     verify_work_id: Option<WorkId>,
     /// Monotonic verification deadline, set at the first submission
     /// (`bpv1-77`).
@@ -1433,6 +1441,7 @@ impl BlockTable {
             BlockInput::TipHeight { height } => {
                 self.verified = height;
                 self.raise_top(height, &mut step);
+                self.resubmit_parked(now, &mut step);
             }
             BlockInput::ParentAdmitted { hash, height } => {
                 self.raise_top(height, &mut step);
@@ -2027,6 +2036,25 @@ impl BlockTable {
                 true
             }
             None => false,
+        }
+    }
+
+    /// Resubmits each parked block whose parent the verified tip now includes
+    /// (`bpv1-79`).
+    fn resubmit_parked(&mut self, now: Instant, step: &mut BlockStep) {
+        let ready: Vec<block::Hash> = self
+            .blocks
+            .values()
+            .filter(|b| {
+                b.phase == BlockPhase::Verifying
+                    && b.verify_work_id.is_none()
+                    && b.height <= self.verified.saturating_add(1)
+                    && b.verify_deadline.is_some_and(|deadline| now < deadline)
+            })
+            .map(|b| b.meta.block_id)
+            .collect();
+        for block_id in ready {
+            self.submit_assembled(block_id, step);
         }
     }
 
@@ -2711,6 +2739,9 @@ impl BlockTable {
 
     /// Submits an assembled block's body to the verifier, and returns whether
     /// it held every source part.
+    ///
+    /// `BlockTable` keeps every source part of an assembled block, so a parked
+    /// block resubmits without fetching anything (`bpv1-79`).
     fn submit_assembled(&mut self, block_id: block::Hash, step: &mut BlockStep) -> bool {
         let Some(block) = self.blocks.get_mut(&block_id) else {
             return false;
@@ -2791,7 +2822,13 @@ impl BlockTable {
             VerifierVerdict::RootMismatch => {
                 self.enter_fallback(block_id, FallbackReason::RootMismatch, step);
             }
-            // Local pool capacity is its own fallback reason.
+            // bpv1-79: a retryable verdict says nothing about the body. While the
+            // parent is not committed, the block cannot commit through any path,
+            // so it keeps its body and claim and resubmits once the parent
+            // commits. With the parent committed, it falls back.
+            VerifierVerdict::LocalCapacity if block.height > self.verified.saturating_add(1) => {
+                step.events.push(BlockEvent::Parked { block_id });
+            }
             VerifierVerdict::LocalCapacity => {
                 self.enter_fallback(block_id, FallbackReason::LocalCapacity, step);
             }

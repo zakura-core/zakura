@@ -335,6 +335,9 @@ async fn fix4_committed_snapshot_ends_a_fallback_block() {
     let shutdown = CancellationToken::new();
     let (handle_a, handle_b, snapshots_b) =
         proposer_and_follower(VerifierVerdict::LocalCapacity, &shutdown);
+    // With its parent committed, a retryable verdict falls back (bpv1-79).
+    let parent = Frontier::new(Height(9), block::Hash([0x09; 32]));
+    snapshots_b.send_replace(Some(engine_snapshot(parent, parent)));
 
     let fallen = solved_block(&handle_a, Height(10), 11);
     assert!(handle_a.publish_solved_block(&fallen, 10));

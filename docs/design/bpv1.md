@@ -196,7 +196,9 @@ Recovery proceeds in one direction:
    deadline. A failed re-encode check goes here at once.
 
 An assembled block keeps its body claim while it verifies, so native block sync
-downloads no second copy. A 120 s verification deadline bounds that wait.
+downloads no second copy. A 120 s verification deadline bounds that wait. A
+retryable verdict on a block whose parent is not committed keeps the body until
+the parent commits, and BPv1 then submits it again.
 
 ### Miner mesh
 

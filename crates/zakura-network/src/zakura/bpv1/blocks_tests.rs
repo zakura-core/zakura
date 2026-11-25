@@ -3343,6 +3343,10 @@ fn decision19_push_crossing_a_direct_copy_drops_as_surplus() {
 //   releases the claim by fallback, repair, retirement, or commit.
 // - bpv1-57: when BPv1 fails a block, it releases the claim at the deadline of
 //   the block's phase, so block sync fetches it within one fetch.
+// - bpv1-79: a retryable verdict on a block whose parent is not committed keeps
+//   the body, and BPv1 resubmits it once the parent commits. A resubmission's
+//   parent is always committed, so only a block's first submission can wait in
+//   the state's orphan queue.
 //
 // `service_tests` runs the handoff through the service, and `ports_tests` checks
 // that block sync wakes when a claim expires and that no retryable verdict
@@ -3577,5 +3581,159 @@ fn bpv1_77_verification_ends_by_its_deadline_and_frees_the_slot() {
         was_admitted(&freed, blocked),
         "a fallback block yields its slot"
     );
+    table.assert_invariants();
+}
+
+/// bpv1-79: a retryable verdict on a block whose parent is not committed keeps
+/// the assembled body and the claim. BPv1 resubmits the same body once the
+/// verified tip reaches the parent, and not before. A retryable verdict with the
+/// parent committed falls back.
+#[test]
+fn bpv1_79_a_retryable_verdict_keeps_the_body_until_the_parent_commits() {
+    let t0 = Instant::now();
+    let claims = SharedBodyClaims::new();
+    let encoded = encode_body(&Profile::TINY, &[0x66; 128], 2).unwrap();
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let block_id = block::Hash([0xD7; 32]);
+    let verified = 100;
+    table.step(t0, BlockInput::TipHeight { height: verified });
+    let admitted = admit_block(
+        &mut table,
+        t0,
+        block_id,
+        verified + 3,
+        encoded.coding,
+        encoded.part_root,
+    );
+    apply_claims(&claims, t0, &admitted);
+    let mut sources = Vec::new();
+    let mut first = None;
+    for part in &encoded.parts[..encoded.coding.k as usize] {
+        let step = insert(
+            &mut table,
+            t0,
+            block_id,
+            part,
+            node_id(2),
+            PartAuth::Want(1),
+        );
+        apply_claims(&claims, t0, &step);
+        for o in step.outputs {
+            if let BlockOutput::SubmitVerifier {
+                work_id,
+                stripe_sources,
+                ..
+            } = o
+            {
+                first = Some(work_id);
+                sources.push(stripe_sources);
+            }
+        }
+    }
+    let first = first.expect("k source parts assemble the block");
+
+    let parked = table.step(
+        t0,
+        BlockInput::VerifierVerdict {
+            work_id: first,
+            block_id,
+            verdict: VerifierVerdict::LocalCapacity,
+        },
+    );
+    apply_claims(&claims, t0, &parked);
+    assert!(parked.events.contains(&BlockEvent::Parked { block_id }));
+    assert!(parked.outputs.is_empty(), "no fallback and no release");
+    assert_eq!(table.block_phase(&block_id), Some(BlockPhase::Verifying));
+    assert!(claims.is_claimed(block_id, t0));
+    table.assert_invariants();
+
+    let grandparent = table.step(
+        t0,
+        BlockInput::TipHeight {
+            height: verified + 1,
+        },
+    );
+    assert!(
+        submissions(&grandparent).is_empty(),
+        "the parent is not committed"
+    );
+
+    let parent = table.step(
+        t0,
+        BlockInput::TipHeight {
+            height: verified + 2,
+        },
+    );
+    let mut resubmitted = None;
+    for o in parent.outputs {
+        if let BlockOutput::SubmitVerifier {
+            work_id,
+            stripe_sources,
+            ..
+        } = o
+        {
+            assert!(resubmitted.is_none(), "one resubmission");
+            resubmitted = Some(work_id);
+            sources.push(stripe_sources);
+        }
+    }
+    let resubmitted = resubmitted.expect("the committed parent resubmits the block");
+    assert_eq!(sources[0], sources[1], "BPv1 resubmits the body it kept");
+
+    // The parent is committed now, so another retryable verdict falls back.
+    let fallen = table.step(
+        t0,
+        BlockInput::VerifierVerdict {
+            work_id: resubmitted,
+            block_id,
+            verdict: VerifierVerdict::LocalCapacity,
+        },
+    );
+    apply_claims(&claims, t0, &fallen);
+    assert!(fallen.events.contains(&BlockEvent::FallbackStarted {
+        block_id,
+        reason: FallbackReason::LocalCapacity,
+    }));
+    assert!(!claims.is_claimed(block_id, t0));
+    table.assert_invariants();
+}
+
+/// bpv1-77: a parked block whose parent never commits falls back at its
+/// verification deadline.
+#[test]
+fn bpv1_77_a_parked_block_falls_back_at_its_verification_deadline() {
+    let t0 = Instant::now();
+    let empty = encode_body(&Profile::TINY, &[], 1).unwrap();
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    table.step(t0, BlockInput::TipHeight { height: 100 });
+    let block_id = block::Hash([0xE7; 32]);
+    let step = offer(&mut table, t0, block_id, 105, empty.coding, empty.part_root);
+    let [work_id] = submissions(&step)[..] else {
+        panic!("an empty body submits at admission");
+    };
+    table.step(
+        t0,
+        BlockInput::VerifierVerdict {
+            work_id,
+            block_id,
+            verdict: VerifierVerdict::LocalCapacity,
+        },
+    );
+    assert_eq!(table.next_deadline(), Some(t0 + VERIFY_DEADLINE));
+    let expired = tick(&mut table, t0 + VERIFY_DEADLINE, &[]);
+    assert!(expired.events.contains(&BlockEvent::FallbackStarted {
+        block_id,
+        reason: FallbackReason::VerifyDeadline,
+    }));
+    assert!(expired.outputs.iter().any(|o| matches!(
+        o,
+        BlockOutput::ReleaseBodyClaim {
+            reason: ClaimRelease::Fallback,
+            ..
+        }
+    )));
+    // A late tip move resubmits nothing.
+    let moved = table.step(t0 + VERIFY_DEADLINE, BlockInput::TipHeight { height: 104 });
+    assert!(submissions(&moved).is_empty());
     table.assert_invariants();
 }

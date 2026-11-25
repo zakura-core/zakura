@@ -2318,6 +2318,10 @@ fn record_block_event(event: &BlockEvent) {
             tracing::debug!(target: "bpv1_stage", %block_id, reason = label, "fallback_started");
             metrics::counter!("zakura.p2p.bpv1.fallback.reason", "reason" => label).increment(1);
         }
+        BlockEvent::Parked { block_id } => {
+            tracing::debug!(target: "bpv1_stage", %block_id, "verify_parked");
+            metrics::counter!("zakura.p2p.bpv1.verify.parked").increment(1);
+        }
         BlockEvent::Assembled { since_meta, .. } => {
             metrics::histogram!("zakura.p2p.bpv1.assembly.seconds")
                 .record(since_meta.as_secs_f64());

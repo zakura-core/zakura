@@ -109,7 +109,10 @@ A node MUST keep at most one submission of a block in that path at a time. Its
 body claim keeps native block sync off the block from admission until the
 reconstruction deadline, and from assembly until a verdict or the verification
 deadline, which starts at the first submission. When that deadline passes, the
-node MUST use the existing block-download path.
+node MUST use the existing block-download path. A retryable verdict says nothing
+about the body. If the block's parent is not committed, the node keeps the body
+and the claim, and submits the block again once the parent commits. Otherwise it
+uses the block-download path.
 
 The [design targets](../design/bpv1.md#performance-targets) define the
 planning workload and the latency goal. These estimates do not change consensus

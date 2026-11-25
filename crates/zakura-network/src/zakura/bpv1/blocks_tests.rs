@@ -21,7 +21,7 @@ use zakura_rt::{collections::HashSet, time::Instant};
 use super::{
     blocks::*,
     codec::{encode_body, EncodedBody},
-    commitment::commitment_script,
+    commitment::{commitment_script, Proposer},
     paths::{PathDirection, PathEstimate, PeerPaths, DEFAULT_UNMEASURED_RATE_BPS},
     peer::{PartAuth, PeerConfig},
     profile::{Coding, Profile},
@@ -267,7 +267,7 @@ fn commitment_ok(table: &mut BlockTable, now: Instant, header_step: &BlockStep) 
         now,
         BlockInput::CommitmentChecked {
             work_id: commit_work(header_step),
-            ok: true,
+            proposer: Some(Proposer::Node(node_id(1))),
             peers: Vec::new(),
             rng_seed: 0,
         },
@@ -913,6 +913,7 @@ fn scenario_proposer_reuse_recompute_entry_filter_solve_and_disconnect() {
         template_id: TemplateId(2),
         body_identity: compute_body_identity(2, &[0xBB; 128]),
         light_client_root: [0; 32],
+        proposer: Proposer::Node(config.local_node),
     });
     assert!(changed.events.iter().any(|e| matches!(
         e,
@@ -1583,6 +1584,7 @@ fn decision20_proposer_admission_announces_nothing() {
                 encoded.part_root,
                 node_id(1),
             ),
+            proposer: Proposer::Node(node_id(1)),
             parts: encoded.parts.clone(),
         },
     );
@@ -1610,6 +1612,7 @@ fn bpv1_45_a_failed_local_commit_retires_only_the_proposed_block() {
         BlockInput::BlockAdmittedLocal {
             height: 2,
             envelope: make_envelope(proposed, encoded.coding, encoded.part_root, node_id(1)),
+            proposer: Proposer::Node(node_id(1)),
             parts: encoded.parts.clone(),
         },
     );
@@ -1780,6 +1783,7 @@ fn bpv1_2_reused_encoding_keeps_c_and_each_solve_finds_its_light_client_root() {
         template_id: TemplateId(2),
         body_identity,
         light_client_root: lcr_new,
+        proposer: Proposer::Node(config.local_node),
     });
     assert_eq!(set_commitment(&refreshed.outputs).commitment_hash, c);
 
@@ -1836,6 +1840,7 @@ fn encoded_proposer(
         template_id: TemplateId(1),
         body_identity: compute_body_identity(2, body),
         light_client_root,
+        proposer: Proposer::Node(config.local_node),
     });
     let work_id = built
         .outputs
@@ -2105,6 +2110,7 @@ fn fix14_templates_during_one_encode_share_it_and_each_get_a_commitment() {
             template_id: TemplateId(t),
             body_identity,
             light_client_root: [0u8; 32],
+            proposer: Proposer::Node(local),
         });
         encodes.extend(s.outputs.iter().filter_map(|o| match o {
             ProposerOutput::StartEncode { work_id, .. } => Some(*work_id),

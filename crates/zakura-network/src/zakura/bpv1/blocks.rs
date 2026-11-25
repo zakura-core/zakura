@@ -21,7 +21,7 @@ use crate::peer::block_gossip::ADVERT_RANDOM_INTERVAL;
 
 use super::{
     close::Bpv1CloseRow,
-    commitment::CoinbaseBinding,
+    commitment::{CoinbaseBinding, Proposer},
     config::HavePacing,
     paths::{arrival_duration, Arrival, PathDirection, PathEstimate, PeerPaths, RateSample},
     peer::{PartAuth, SLOW_X},
@@ -246,8 +246,10 @@ pub struct MetaEnvelope {
     pub coding: Coding,
     /// Committed Merkle root of all coded parts.
     pub part_root: [u8; 32],
-    /// Proposer's transport identity.
-    pub proposer_node: NodeId,
+    /// Proposer's transport identity, as `HeaderMeta` carries it: `None`
+    /// when the coinbase's miner mesh output names the proposer
+    /// (decision-34).
+    pub proposer_node: Option<NodeId>,
 }
 
 impl MetaEnvelope {
@@ -287,8 +289,8 @@ pub struct AdmittedBlock {
     pub block_id: block::Hash,
     /// Block coding layout.
     pub coding: Coding,
-    /// Proposer node identity.
-    pub proposer_node: NodeId,
+    /// The proposer the block names (decision-34).
+    pub proposer: Proposer,
     /// Wire `HeaderMeta` to send to peers that did not send it.
     pub header_meta: Box<Bpv1Message>,
     /// Whether this node is the proposer.
@@ -364,8 +366,9 @@ pub enum BlockInput {
     CommitmentChecked {
         /// Work identity returned by `VerifyCommitment`.
         work_id: WorkId,
-        /// Whether the commitment verified cleanly.
-        ok: bool,
+        /// The proposer the block names, or `None` when the commitment
+        /// failed (decision-34).
+        proposer: Option<Proposer>,
         /// Live peers, among which admission picks the `Have` initial group
         /// (decision-26).
         peers: Vec<NodeId>,
@@ -378,6 +381,8 @@ pub enum BlockInput {
         height: u32,
         /// Metadata envelope for the solved block.
         envelope: Box<MetaEnvelope>,
+        /// The proposer the block names: this node (decision-34).
+        proposer: Proposer,
         /// All `stripes * n` verified parts.
         parts: Vec<VerifiedPart>,
     },
@@ -1056,6 +1061,8 @@ struct Incoming {
 struct ActiveBlock {
     /// The admitted `HeaderMeta`, stored once. Retirement drops its byte fields.
     meta: Box<MetaEnvelope>,
+    /// The proposer the block names (decision-34).
+    proposer: Proposer,
     height: u32,
     as_proposer: bool,
     /// `encoding_id(meta.coding)`, cached for part proofs.
@@ -1103,6 +1110,7 @@ impl ActiveBlock {
     /// A freshly admitted block in `Collecting` with empty stripes.
     fn from_envelope(
         env: Box<MetaEnvelope>,
+        proposer: Proposer,
         height: u32,
         now: Instant,
         meta_arrived_at: Instant,
@@ -1111,6 +1119,7 @@ impl ActiveBlock {
         let coding = env.coding;
         Self {
             meta: env,
+            proposer,
             height,
             as_proposer,
             enc_id: encoding_id(&coding),
@@ -1147,7 +1156,7 @@ impl ActiveBlock {
         AdmittedBlock {
             block_id: self.meta.block_id,
             coding: self.meta.coding,
-            proposer_node: self.meta.proposer_node,
+            proposer: self.proposer,
             header_meta: self.meta.header_meta(),
             as_proposer: self.as_proposer,
             have_group: self.have_group.clone(),
@@ -1435,18 +1444,19 @@ impl BlockTable {
             }
             BlockInput::CommitmentChecked {
                 work_id,
-                ok,
+                proposer,
                 peers,
                 rng_seed,
             } => {
-                self.handle_commitment_checked(now, work_id, ok, &peers, rng_seed, &mut step);
+                self.handle_commitment_checked(now, work_id, proposer, &peers, rng_seed, &mut step);
             }
             BlockInput::BlockAdmittedLocal {
                 height,
                 envelope,
+                proposer,
                 parts,
             } => {
-                self.handle_block_admitted_local(now, height, envelope, parts, &mut step);
+                self.handle_block_admitted_local(now, height, envelope, proposer, parts, &mut step);
             }
             BlockInput::PushFlagged {
                 peer,
@@ -1875,7 +1885,7 @@ impl BlockTable {
         &mut self,
         now: Instant,
         work_id: WorkId,
-        ok: bool,
+        proposer: Option<Proposer>,
         peers: &[NodeId],
         rng_seed: u64,
         step: &mut BlockStep,
@@ -1894,7 +1904,7 @@ impl BlockTable {
             .remove(&block_id)
             .expect("admitting entry verified present");
 
-        if !ok {
+        let Some(proposer) = proposer else {
             step.outputs.push(BlockOutput::ClosePeer {
                 peer: entry.from_peer,
                 session_gen: entry.session_gen,
@@ -1904,7 +1914,7 @@ impl BlockTable {
             // not faulted for this one's commitment.
             reject_also(step, block_id, &entry.also_from);
             return;
-        }
+        };
 
         let height = entry.height.unwrap_or(self.top);
         // Recheck propagation window after async commitment work
@@ -1922,8 +1932,14 @@ impl BlockTable {
         }
 
         let deadline = now + RECONSTRUCTION_DEADLINE;
-        let mut active =
-            ActiveBlock::from_envelope(entry.envelope, height, now, entry.arrived_at, false);
+        let mut active = ActiveBlock::from_envelope(
+            entry.envelope,
+            proposer,
+            height,
+            now,
+            entry.arrived_at,
+            false,
+        );
         active.body_claimed = true;
         // decision-26: pick the `Have` initial group once, at admission.
         let pacing = self.config.have_pacing;
@@ -1931,7 +1947,7 @@ impl BlockTable {
         let candidates: Vec<NodeId> = peers
             .iter()
             .copied()
-            .filter(|peer| *peer != active.meta.proposer_node)
+            .filter(|peer| !proposer.is(peer))
             .collect();
         active.have_group = have_group(
             &self.paths,
@@ -2004,6 +2020,7 @@ impl BlockTable {
         now: Instant,
         height: u32,
         envelope: Box<MetaEnvelope>,
+        proposer: Proposer,
         parts: Vec<VerifiedPart>,
         step: &mut BlockStep,
     ) {
@@ -2016,7 +2033,7 @@ impl BlockTable {
         // A solved block always takes a slot, evicting the lowest block if needed.
         self.evict_for_slot(true, step);
         let coding = envelope.coding;
-        let mut active = ActiveBlock::from_envelope(envelope, height, now, now, true);
+        let mut active = ActiveBlock::from_envelope(envelope, proposer, height, now, now, true);
         active.phase = BlockPhase::Done;
         active.block_done_notified = true;
         for part in parts {
@@ -2089,7 +2106,7 @@ impl BlockTable {
             if let Some((stripe, slot)) = block.meta.coding.split_index(index) {
                 let st = &mut block.stripes[stripe as usize];
                 st.tried[slot as usize].insert(peer);
-                if relay && peer == block.meta.proposer_node {
+                if relay && block.proposer.is(&peer) {
                     st.pushed.insert(slot);
                     if st.held[slot as usize].is_some() {
                         held.push(index);
@@ -2868,7 +2885,7 @@ impl BlockTable {
                     released = true;
                     late_seeds.push((block_id, stripe));
                 }
-                if released && sender != block.meta.proposer_node {
+                if released && !block.proposer.is(&sender) {
                     step.events.push(BlockEvent::PushLate {
                         peer: sender,
                         block_id,

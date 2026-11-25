@@ -14,8 +14,8 @@ use std::{cell::RefCell, rc::Rc, time::Duration};
 use zakura_chain::block;
 use zakura_network::zakura::bpv1::{
     encode_body, encode_part_frame, Arrival, BlockAdmitted, Bpv1Message, CoinbaseBinding,
-    PeerConfig, PeerEvent, PeerInput, PeerOutput, PeerState, PeerStep, Profile, PullGranted,
-    RecvPartPrefix, RecvWantEnd, VerifiedPart, WantBitmap, LIVENESS_COOLDOWN,
+    PeerConfig, PeerEvent, PeerInput, PeerOutput, PeerState, PeerStep, Profile, Proposer,
+    PullGranted, RecvPartPrefix, RecvWantEnd, VerifiedPart, WantBitmap, LIVENESS_COOLDOWN,
 };
 use zakura_quic::{NodeId, NodeSecretKey};
 use zakura_rt::{
@@ -48,14 +48,14 @@ fn session_with_want(peer: u8, block_id: block::Hash) -> (PeerState, u32, Vec<Ve
         },
         coding,
         part_root: encoded.part_root,
-        proposer_node: node_id(9),
+        proposer_node: Some(node_id(9)),
     });
     state.step(
         now,
         PeerInput::BlockAdmitted(BlockAdmitted {
             block_id,
             coding,
-            proposer_node: node_id(9),
+            proposer: Proposer::Node(node_id(9)),
             header_meta: Some(meta),
             as_proposer: false,
             have_held_until: None,

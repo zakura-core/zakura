@@ -239,6 +239,48 @@ impl Wire for NodeIdItem {
     }
 }
 
+/// `HeaderMeta` flag bit 0: `proposer_node` follows the flags byte. The
+/// sender clears it exactly when the coinbase's miner mesh output names the
+/// proposer (decision-34).
+pub const HEADER_META_FLAG_PROPOSER_NODE: u8 = 0b0000_0001;
+
+/// Wire item for `HeaderMeta`'s proposer: a flags byte, then the 32-byte
+/// [`NodeId`] when [`HEADER_META_FLAG_PROPOSER_NODE`] is set (decision-34).
+/// Any other flags value is reserved, which closes with row 1.
+#[derive(Debug)]
+pub struct ProposerNodeItem;
+
+impl Wire for ProposerNodeItem {
+    type Value = Option<NodeId>;
+    const MIN_LEN: usize = 1;
+    const MAX_LEN: usize = 1 + 32;
+
+    fn max_heap_bytes(_input_len: usize) -> usize {
+        0
+    }
+
+    fn encode(value: &Option<NodeId>, out: &mut Vec<u8>) -> Result<(), WireError> {
+        match value {
+            Some(node) => {
+                out.push(HEADER_META_FLAG_PROPOSER_NODE);
+                NodeIdItem::encode(node, out)
+            }
+            None => {
+                out.push(0);
+                Ok(())
+            }
+        }
+    }
+
+    fn decode(reader: &mut BoundedReader<'_>) -> Result<Option<NodeId>, WireError> {
+        match reader.read::<U8>()? {
+            0 => Ok(None),
+            HEADER_META_FLAG_PROPOSER_NODE => reader.read::<NodeIdItem>().map(Some),
+            flags => Err(WireError::ReservedFlags(u16::from(flags))),
+        }
+    }
+}
+
 /// Wire item for a 30-byte [`Coding`] tuple.
 #[derive(Debug)]
 pub struct CodingItem;
@@ -547,7 +589,7 @@ type HeaderMetaPayload = (
     CoinbaseBindingItem,
     CodingItem,
     Hash32Item,
-    NodeIdItem,
+    ProposerNodeItem,
 );
 
 type WantPayload = (NonZeroLeU32, BlockHash, LeU32, WantBitmapItem);
@@ -766,7 +808,8 @@ pub fn read_part_prefix(payload: &[u8]) -> Result<PartPrefix, WireError> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Bpv1Message {
     /// Block header, coinbase commitment binding, coding tuple, `part_root`,
-    /// and `proposer_node`.
+    /// and `proposer_node` unless the coinbase's miner mesh output names the
+    /// proposer (decision-34).
     HeaderMeta {
         /// Serialized consensus block header (always full header, decision-2).
         header: Vec<u8>,
@@ -776,8 +819,9 @@ pub enum Bpv1Message {
         coding: Coding,
         /// Merkle root of all coded parts.
         part_root: [u8; 32],
-        /// Transport identity of the proposer.
-        proposer_node: NodeId,
+        /// Transport identity of the proposer. `None` exactly when the
+        /// coinbase's miner mesh output names the proposer (decision-34).
+        proposer_node: Option<NodeId>,
     },
     /// Exact-index pull request for one stripe (decision-14).
     Want {
@@ -873,7 +917,7 @@ impl WireMessage for Bpv1Message {
                 CoinbaseBindingItem::encode(binding, out)?;
                 CodingItem::encode(coding, out)?;
                 Hash32Item::encode(part_root, out)?;
-                NodeIdItem::encode(proposer_node, out)
+                ProposerNodeItem::encode(proposer_node, out)
             }
             Self::Want {
                 want_id,

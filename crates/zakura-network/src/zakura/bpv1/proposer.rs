@@ -13,6 +13,7 @@ use std::{cmp::Reverse, time::Duration};
 
 use zakura_chain::{
     block::{self, Header},
+    miner_mesh::MinerMeshCommitment,
     serialization::ZcashDeserialize,
 };
 use zakura_quic::NodeId;
@@ -23,7 +24,8 @@ use super::{
     codec::EncodedBody,
     commitment::{
         check_block_commitments, commit_hash, commitment_script, decode_coinbase,
-        extract_single_commitment, CoinbaseBinding, CommitmentFields, COMMITMENT_SCRIPT_LEN,
+        extract_single_commitment, CoinbaseBinding, CommitmentFields, Proposer,
+        COMMITMENT_SCRIPT_LEN,
     },
     paths::PeerPaths,
     profile::{Coding, W2_PROFILE_ID},
@@ -42,7 +44,8 @@ pub struct TemplateId(pub u64);
 pub struct ProposerConfig {
     /// Chain identifier committed in `C`.
     pub chain_id: [u8; 32],
-    /// Local node's transport identity (`proposer_node`).
+    /// Local node's transport identity: `proposer_node`, or the node the
+    /// miner mesh output's gateway ID names (decision-34).
     pub local_node: NodeId,
     /// Permit the experimental deal-3 scheduler to queue direct copies.
     pub direct_copies: bool,
@@ -87,6 +90,9 @@ pub enum ProposerInput {
         body_identity: [u8; 32],
         /// The template's light-client root (`hashLightClientRoot`).
         light_client_root: [u8; 32],
+        /// How the template's coinbase names this node:
+        /// [`Proposer::local`] of its miner mesh output (decision-34).
+        proposer: Proposer,
     },
     /// Background encode worker completed for `work_id`.
     ///
@@ -143,6 +149,8 @@ pub enum ProposerOutput {
         height: u32,
         /// Full metadata envelope.
         envelope: Box<MetaEnvelope>,
+        /// How the block names this node (decision-34).
+        proposer: Proposer,
         /// All `stripes * n` verified parts.
         parts: Vec<VerifiedPart>,
     },
@@ -226,6 +234,7 @@ pub struct ProposerStep {
 struct Waiter {
     template_id: TemplateId,
     light_client_root: [u8; 32],
+    proposer: Proposer,
 }
 
 /// One in-flight encode, shared by every template for its body.
@@ -303,10 +312,12 @@ impl ProposerState {
                 template_id,
                 body_identity,
                 light_client_root,
+                proposer,
             } => {
                 let waiter = Waiter {
                     template_id,
                     light_client_root,
+                    proposer,
                 };
                 if let Some(at) = self
                     .prepared
@@ -393,6 +404,20 @@ impl ProposerState {
                 let Ok(found_commit) = extract_single_commitment(&coinbase_tx) else {
                     return step;
                 };
+                // decision-34: receivers take the proposer from the miner mesh
+                // output when the coinbase holds one. A coinbase that names
+                // another node's gateway goes out through existing relay, and
+                // so does one whose `C` has the other form.
+                let mesh = MinerMeshCommitment::from_coinbase_outputs(coinbase_tx.outputs())
+                    .map(|mesh| mesh.gateway_id());
+                let Some(proposer) = Proposer::local(self.config.local_node, mesh) else {
+                    return step;
+                };
+                if found_commit
+                    != self.commitment_hash(entry.encoded.coding, entry.encoded.part_root, proposer)
+                {
+                    return step;
+                }
                 let mut hdr_slice = header_bytes.as_slice();
                 let Ok(header) = Header::zcash_deserialize(&mut hdr_slice) else {
                     return step;
@@ -429,7 +454,7 @@ impl ProposerState {
                     binding,
                     coding,
                     part_root,
-                    proposer_node: self.config.local_node,
+                    proposer_node: proposer.proposer_node(),
                 });
 
                 let plan = seed_plan(
@@ -456,6 +481,7 @@ impl ProposerState {
                 step.outputs.push(ProposerOutput::AdmitSolvedLocal {
                     height,
                     envelope,
+                    proposer,
                     parts: parts.clone(),
                 });
                 // 2. Each neighbour's seeds and direct copies; its session
@@ -478,17 +504,24 @@ impl ProposerState {
         });
     }
 
-    /// Returns this proposer's `C` for an encoding with `coding` and `part_root`.
+    /// Returns this proposer's `C` for an encoding with `coding` and
+    /// `part_root`, in a coinbase that names it as `proposer`
+    /// (decision-34).
     ///
     /// It retains nothing, so a solve cannot match it unless a template
     /// registers the body.
-    pub fn commitment_hash(&self, coding: Coding, part_root: [u8; 32]) -> [u8; 32] {
+    pub fn commitment_hash(
+        &self,
+        coding: Coding,
+        part_root: [u8; 32],
+        proposer: Proposer,
+    ) -> [u8; 32] {
         commit_hash(&CommitmentFields {
             chain_id: self.config.chain_id,
             profile_id: W2_PROFILE_ID,
             coding,
             part_root,
-            proposer_node: self.config.local_node,
+            proposer_node: proposer.proposer_node(),
         })
     }
 
@@ -499,9 +532,11 @@ impl ProposerState {
         waiter: &Waiter,
     ) -> PreparedCommitment {
         let Waiter {
-            light_client_root, ..
+            light_client_root,
+            proposer,
+            ..
         } = *waiter;
-        let commitment_hash = self.commitment_hash(coding, part_root);
+        let commitment_hash = self.commitment_hash(coding, part_root, proposer);
         PreparedCommitment {
             commitment_hash,
             script: commitment_script(commitment_hash),

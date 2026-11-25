@@ -5,15 +5,22 @@
 //! ```text
 //! script = 6a 23 || ASCII("BP") || 01 || C
 //! C      = T("commit", chain_id || u16(profile) || coding || part_root
-//!                      || proposer_node)
+//!                      [|| proposer_node])
 //! ```
+//!
+//! `C` covers `proposer_node` only when the coinbase holds no single miner
+//! mesh output. With exactly one, the mesh output's gateway ID names the
+//! proposer, and `HeaderMeta` and `C` leave `proposer_node` out
+//! (decision-34).
 //!
 //! Verification checks (in order, after headerchain admits the header):
 //! - **check-2**: v6 coinbase txid + index-0 Merkle path against `header.merkle_root`
 //! - **check-3**: v6 coinbase auth digest + index-0 auth-data path against
 //!   `hashAuthDataRoot`, then `hashBlockCommitments` against `header.commitment_bytes`
 //! - **check-4**: exactly one version-01 commitment output (bpv1-70)
-//! - **check-5**: recomputed `C` matches the output's 32-byte commitment
+//! - **check-5**: `HeaderMeta` names the proposer in the form the coinbase
+//!   asks for (decision-34), and the recomputed `C` matches the output's
+//!   32-byte commitment
 
 use thiserror::Error;
 use zakura_chain::{
@@ -21,6 +28,7 @@ use zakura_chain::{
         merkle::{auth_digest_or_placeholder, hash_auth_data_pair, hash_txid_pair, AuthDataRoot},
         Block, ChainHistoryBlockTxAuthCommitmentHash, ChainHistoryMmrRootHash, Header, Height,
     },
+    miner_mesh::{GatewayId, MinerMeshCommitment},
     parameters::{Network, NetworkUpgrade},
     serialization::ZcashSerialize,
     transaction::Transaction,
@@ -64,8 +72,82 @@ pub struct CommitmentFields {
     pub coding: Coding,
     /// Root of the BPv1 part Merkle tree.
     pub part_root: [u8; 32],
-    /// Transport identity of the proposer (`NodeId`).
-    pub proposer_node: NodeId,
+    /// Transport identity of the proposer, when `HeaderMeta` carries it.
+    /// `None` when the coinbase's miner mesh output names the proposer
+    /// (decision-34).
+    pub proposer_node: Option<NodeId>,
+}
+
+/// The node a block names as its proposer (decision-34).
+///
+/// The proposer's connection may flag up to `n` indices per stripe and set
+/// relay flags (decision-27). Naming a node grants it only that, on its own
+/// connections. It never silences the node.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum Proposer {
+    /// `HeaderMeta` names the node, because the coinbase holds no single
+    /// miner mesh output.
+    Node(NodeId),
+    /// The coinbase's miner mesh output names the node by its gateway ID, the
+    /// first 20 bytes of its node ID, and `HeaderMeta` names no node.
+    Gateway(GatewayId),
+}
+
+impl Proposer {
+    /// Returns how a block whose coinbase holds `mesh` names `local_node`,
+    /// the node that builds the block.
+    ///
+    /// Returns `None` when the mesh output names another node's gateway:
+    /// receivers would then treat this node's seeds as an ordinary peer's
+    /// pushes, so the block cannot use BPv1 (decision-34).
+    pub fn local(local_node: NodeId, mesh: Option<GatewayId>) -> Option<Self> {
+        match mesh {
+            None => Some(Self::Node(local_node)),
+            Some(gateway) => gateway
+                .is_prefix_of(local_node.as_bytes())
+                .then_some(Self::Gateway(gateway)),
+        }
+    }
+
+    /// Returns the proposer a block names: the coinbase's miner mesh output
+    /// if it holds exactly one, else `proposer_node` from `HeaderMeta`.
+    ///
+    /// `HeaderMeta` must carry `proposer_node` exactly when the coinbase holds
+    /// no single miner mesh output (decision-34). Two or more mesh outputs
+    /// name no gateway.
+    pub fn named(
+        coinbase: &Transaction,
+        proposer_node: Option<NodeId>,
+    ) -> Result<Self, CommitmentError> {
+        let mesh = MinerMeshCommitment::from_coinbase_outputs(coinbase.outputs());
+        match (mesh, proposer_node) {
+            (None, Some(node)) => Ok(Self::Node(node)),
+            (Some(mesh), None) => Ok(Self::Gateway(mesh.gateway_id())),
+            (None, None) => Err(CommitmentError::MissingProposer),
+            (Some(_), Some(_)) => Err(CommitmentError::ProposerNamedTwice),
+        }
+    }
+
+    /// Whether `node` is this proposer: the named node, or a node whose ID
+    /// starts with the gateway ID.
+    ///
+    /// Finding a node key whose ID starts with a given gateway ID takes
+    /// about 2^160 work.
+    pub fn is(&self, node: &NodeId) -> bool {
+        match self {
+            Self::Node(proposer) => proposer == node,
+            Self::Gateway(gateway) => gateway.is_prefix_of(node.as_bytes()),
+        }
+    }
+
+    /// The `proposer_node` that `HeaderMeta` and `C` carry: the node, or
+    /// `None` when the miner mesh output names the proposer.
+    pub fn proposer_node(&self) -> Option<NodeId> {
+        match self {
+            Self::Node(node) => Some(*node),
+            Self::Gateway(_) => None,
+        }
+    }
 }
 
 /// Wire binding carried inside `HeaderMeta` to prove the coinbase commitment.
@@ -82,20 +164,28 @@ pub struct CoinbaseBinding {
     pub light_client_root: [u8; 32],
 }
 
-/// Computes `C = T("commit", chain_id || u16(profile) || coding || part_root || proposer_node)`.
+/// Computes `C = T("commit", chain_id || u16(profile) || coding || part_root [|| proposer_node])`.
+///
+/// `C` covers `proposer_node` only when `fields` carries it (decision-34).
+/// The coinbase decides which form a block uses, and the two forms hash
+/// preimages of different lengths.
 ///
 /// `C` names no peer: the proposer picks its seed recipients at solve time
 /// (decision-19).
 pub fn commit_hash(fields: &CommitmentFields) -> [u8; 32] {
     let profile_bytes = fields.profile_id.to_le_bytes();
     let coding_bytes = fields.coding.to_bytes();
+    let proposer_node: &[u8] = match &fields.proposer_node {
+        Some(node) => node.as_bytes(),
+        None => &[],
+    };
 
     COMMIT.hash(&[
         &fields.chain_id,
         &profile_bytes,
         &coding_bytes,
         &fields.part_root,
-        fields.proposer_node.as_bytes(),
+        proposer_node,
     ])
 }
 
@@ -127,14 +217,15 @@ pub const fn expected_tx_path_depth(tx_count: u32) -> usize {
 }
 
 /// Verifies a `HeaderMeta`'s coinbase commitment binding against an already
-/// headerchain-admitted header (bpv1-2, decision-9).
+/// headerchain-admitted header (bpv1-2, decision-9), and returns the
+/// proposer the block names (decision-34).
 pub fn verify_commitment(
     network: &Network,
     admitted_height: Height,
     header: &Header,
     binding: &CoinbaseBinding,
     fields: &CommitmentFields,
-) -> Result<Transaction, CommitmentError> {
+) -> Result<Proposer, CommitmentError> {
     // decision-9: post-NU7 blocks only (v6 coinbases under NU5+ hashBlockCommitments).
     if NetworkUpgrade::current(network, admitted_height) < NetworkUpgrade::Nu7 {
         return Err(CommitmentError::UnsupportedNetworkUpgrade);
@@ -171,13 +262,15 @@ pub fn verify_commitment(
     // check-4: exactly one version-01 commitment output (bpv1-70).
     let found_c = extract_single_commitment(&coinbase)?;
 
-    // check-5: recompute `C` and compare.
+    // check-5: the coinbase decides whether `HeaderMeta` names the proposer
+    // (decision-34); then recompute `C` and compare.
+    let proposer = Proposer::named(&coinbase, fields.proposer_node)?;
     let expected_c = commit_hash(fields);
     if found_c != expected_c {
         return Err(CommitmentError::CommitmentHashMismatch);
     }
 
-    Ok(coinbase)
+    Ok(proposer)
 }
 
 /// Decodes the coinbase a `HeaderMeta` binds: a canonical v6 coinbase
@@ -371,6 +464,14 @@ pub enum CommitmentError {
     /// The coinbase holds two or more version-01 commitment outputs.
     #[error("coinbase has multiple BPv1 version-01 commitment outputs")]
     MultipleCommitmentOutputs,
+    /// The coinbase holds no single miner mesh output, and `HeaderMeta`
+    /// names no proposer (decision-34).
+    #[error("HeaderMeta names no proposer and the coinbase has no miner mesh output")]
+    MissingProposer,
+    /// The coinbase's miner mesh output names the proposer, and `HeaderMeta`
+    /// names one too (decision-34).
+    #[error("HeaderMeta names a proposer that the coinbase's miner mesh output already names")]
+    ProposerNamedTwice,
     /// Recomputed commitment hash `C` did not equal the coinbase output's `C`.
     #[error("recomputed commitment hash C mismatch")]
     CommitmentHashMismatch,

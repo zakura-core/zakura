@@ -142,20 +142,20 @@ async fn bpv1_proposer_hook_handles_post_nu7_pre_nu7_reuse_and_pool_coinbase() {
     // 1. Pre-NU7 height (height 5 < nu7 activation 10) gets no commitment (decision-9).
     assert!(
         handle_a
-            .prepare_template_commitment(lcr, Height(5), 2, &tx1_bytes)
+            .prepare_template_commitment(lcr, Height(5), 2, &tx1_bytes, None)
             .is_none(),
         "pre-NU7 template must not receive a BPv1 commitment"
     );
 
     // 2. Post-NU7 height produces a 35-byte `BP || 0x01 || C` null-data payload.
     let payload1 = handle_a
-        .prepare_template_commitment(lcr, Height(12), 2, &tx1_bytes)
+        .prepare_template_commitment(lcr, Height(12), 2, &tx1_bytes, None)
         .expect("post-NU7 template with live peer gets commitment");
     assert_eq!(&payload1[..3], b"BP\x01");
 
     // 3. Second call with same body (header-only template refresh) succeeds via opt-8 reuse.
     let payload2 = handle_a
-        .prepare_template_commitment(lcr, Height(12), 2, &tx1_bytes)
+        .prepare_template_commitment(lcr, Height(12), 2, &tx1_bytes, None)
         .expect("header-only refresh reuses encoding");
     assert_eq!(&payload2[..3], b"BP\x01");
 
@@ -208,7 +208,7 @@ async fn empty_template_commitment_matches_and_keeps_issued_templates() {
     connect(&svc_a, id_a, &svc_b, id_b, &shutdown);
 
     assert_eq!(
-        handle_a.empty_template_commitment(Height(5)),
+        handle_a.empty_template_commitment(Height(5), None),
         None,
         "pre-NU7"
     );
@@ -220,14 +220,14 @@ async fn empty_template_commitment_matches_and_keeps_issued_templates() {
             let tx = build_v6_tx(Height(12), u8::try_from(tag).unwrap());
             let tx_bytes = tx.zcash_serialize_to_vec().unwrap();
             let payload = handle_a
-                .prepare_template_commitment(lcr, Height(12), 2, &tx_bytes)
+                .prepare_template_commitment(lcr, Height(12), 2, &tx_bytes, None)
                 .expect("post-NU7 template with live peer gets commitment");
             (tx, payload)
         })
         .collect();
 
     let precomputed = handle_a
-        .empty_template_commitment(Height(12))
+        .empty_template_commitment(Height(12), None)
         .expect("post-NU7 with a live peer");
 
     // The oldest issued template still publishes.
@@ -242,7 +242,7 @@ async fn empty_template_commitment_matches_and_keeps_issued_templates() {
 
     // A registered empty template on another parent gets the same payload.
     assert_eq!(
-        handle_a.prepare_template_commitment([0x5a; 32], Height(12), 1, &[]),
+        handle_a.prepare_template_commitment([0x5a; 32], Height(12), 1, &[], None),
         Some(precomputed)
     );
 

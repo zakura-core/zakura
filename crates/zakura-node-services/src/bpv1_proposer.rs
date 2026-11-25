@@ -8,7 +8,10 @@
 
 use std::{fmt, sync::Arc};
 
-use zakura_chain::block::{self, Block, Height};
+use zakura_chain::{
+    block::{self, Block, Height},
+    miner_mesh::GatewayId,
+};
 
 /// Exact null-data push payload length for a BPv1 coinbase commitment
 /// (`ASCII("BP") || 0x01 || C`, 35 bytes -> 37-byte `OP_RETURN` script ->
@@ -36,9 +39,15 @@ pub trait Bpv1ProposerHook: Send + Sync + fmt::Debug {
     /// The commitment keeps `light_client_root`, which the block's
     /// `HeaderMeta` carries once it is solved.
     ///
+    /// `gateway` is the gateway ID that the template's miner mesh output
+    /// names, if the coinbase holds one. Receivers then take the proposer
+    /// from that output, so `C` leaves the proposer's node ID out
+    /// (`decision-34`).
+    ///
     /// Returns `None` when:
     /// - `height` is below NU7 (`decision-9`),
-    /// - no eligible BPv1 peers are connected, or
+    /// - no eligible BPv1 peers are connected,
+    /// - `gateway` names another node (`decision-34`), or
     /// - encoding fails.
     ///
     /// Implementations must NEVER index an unsolved template as a servable block.
@@ -48,10 +57,12 @@ pub trait Bpv1ProposerHook: Send + Sync + fmt::Debug {
         height: Height,
         tx_count: u32,
         body_after_coinbase: &[u8],
+        gateway: Option<GatewayId>,
     ) -> Option<[u8; BPV1_COMMITMENT_NULL_DATA_LEN]>;
 
     /// Returns the payload [`Self::prepare_template_commitment`] would return
-    /// for an empty template at `height`, without registering the body.
+    /// for an empty template at `height` whose coinbase names `gateway`,
+    /// without registering the body.
     ///
     /// An empty body's `C` does not depend on the parent. A long poll uses
     /// this payload to precompute the next empty block's coinbase before the
@@ -63,6 +74,7 @@ pub trait Bpv1ProposerHook: Send + Sync + fmt::Debug {
     fn empty_template_commitment(
         &self,
         height: Height,
+        gateway: Option<GatewayId>,
     ) -> Option<[u8; BPV1_COMMITMENT_NULL_DATA_LEN]>;
 
     /// Publishes a solved block over BPv1 (`HeaderMeta` + `BlockDone` +

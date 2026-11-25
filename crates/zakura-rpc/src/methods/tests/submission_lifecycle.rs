@@ -307,6 +307,7 @@ impl zakura_node_services::bpv1_proposer::Bpv1ProposerHook for RecordingBpv1Prop
         _height: zakura_chain::block::Height,
         _tx_count: u32,
         _body_after_coinbase: &[u8],
+        _gateway: Option<zakura_chain::miner_mesh::GatewayId>,
     ) -> Option<[u8; zakura_node_services::bpv1_proposer::BPV1_COMMITMENT_NULL_DATA_LEN]> {
         None
     }
@@ -314,6 +315,7 @@ impl zakura_node_services::bpv1_proposer::Bpv1ProposerHook for RecordingBpv1Prop
     fn empty_template_commitment(
         &self,
         _height: zakura_chain::block::Height,
+        _gateway: Option<zakura_chain::miner_mesh::GatewayId>,
     ) -> Option<[u8; zakura_node_services::bpv1_proposer::BPV1_COMMITMENT_NULL_DATA_LEN]> {
         None
     }

@@ -41,9 +41,11 @@ pub enum Bpv1CloseRow {
     /// `bpv1-close-18`: `WantEnd` with no live `Want`, `sent` above popcount, or `sent` below attributed parts.
     Row18BadWantEnd = 18,
     /// `bpv1-close-20`: Push flags past the connection's bound in one stripe
-    /// (`n` from `proposer_node`, `n − k` otherwise), relay flags from a
-    /// connection that is not `proposer_node`, or relay flags on more than
-    /// `n − k` indices of one stripe.
+    /// (`n` from the block's proposer, `n − k` otherwise), relay flags from a
+    /// connection that is not the proposer, or relay flags on more than
+    /// `n − k` indices of one stripe. The proposer is `proposer_node`, or the
+    /// node whose ID starts with the miner mesh output's gateway ID
+    /// (decision-34).
     Row20BadPushFlags = 20,
 }
 

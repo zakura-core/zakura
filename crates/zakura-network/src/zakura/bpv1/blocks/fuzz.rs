@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use zakura_chain::block;
+use zakura_chain::{block, miner_mesh::GatewayId};
 use zakura_quic::NodeId;
 use zakura_rt::time::Instant;
 
@@ -12,7 +12,10 @@ use super::{
 };
 use crate::zakura::bpv1::peer::PartAuth;
 use crate::zakura::bpv1::{
-    codec::encode_body, commitment::CoinbaseBinding, paths::PathEstimate, profile::Profile,
+    codec::encode_body,
+    commitment::{CoinbaseBinding, Proposer},
+    paths::PathEstimate,
+    profile::Profile,
 };
 
 /// Summary returned by [`replay_bpv1_block_bytes`] (`tool-2`).
@@ -84,7 +87,7 @@ pub fn replay_bpv1_block_bytes(bytes: &[u8]) -> BlockReplaySummary {
                     },
                     coding: body.coding,
                     part_root: body.part_root,
-                    proposer_node: peers[0],
+                    proposer_node: Some(peers[0]),
                 };
                 BlockInput::MetaReceived {
                     envelope: Box::new(env),
@@ -111,9 +114,16 @@ pub fn replay_bpv1_block_bytes(bytes: &[u8]) -> BlockReplaySummary {
             }
             3 => {
                 let wid = pending_works.pop().unwrap_or(WorkId(u64::from(b)));
+                // Bit 1 of `a` names peer 0 by its gateway ID instead of
+                // its node ID (decision-34).
+                let proposer = if a & 2 == 0 {
+                    Proposer::Node(peers[0])
+                } else {
+                    Proposer::Gateway(GatewayId::from_node_id(peers[0].as_bytes()))
+                };
                 BlockInput::CommitmentChecked {
                     work_id: wid,
-                    ok: (a & 1) == 0,
+                    proposer: (a & 1 == 0).then_some(proposer),
                     peers: peers.to_vec(),
                     rng_seed: u64::from(b),
                 }

@@ -17,6 +17,7 @@ use zakura_rt::{
 use super::{
     blocks::{ReleaseReason, MAX_PENDING_META_COUNT},
     close::{Bpv1CloseCause, Bpv1CloseRow},
+    commitment::Proposer,
     paths::{Arrival, RateSample},
     profile::{Coding, Profile, W2_MAX_HAVE_INDICES},
     tree::VerifiedPart,
@@ -150,7 +151,7 @@ pub struct PartToken {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum PartAuth {
     /// Authorized by a push flag on the connection authenticated as the
-    /// block's `proposer_node`: a proposer seed (bpv1-16).
+    /// block's proposer: a proposer seed (bpv1-16, decision-34).
     Seed,
     /// Authorized by a push slot the peer opened with a flagged `Have`
     /// (decision-24, bpv1-69).
@@ -188,8 +189,8 @@ pub struct BlockAdmitted {
     pub block_id: block::Hash,
     /// Admitted coding tuple.
     pub coding: Coding,
-    /// Committed proposer transport identity.
-    pub proposer_node: NodeId,
+    /// The proposer the block names (decision-34).
+    pub proposer: Proposer,
     /// Full `HeaderMeta` message to forward if this peer did not send it.
     pub header_meta: Option<Box<Bpv1Message>>,
     /// Whether this local node is the block's proposer (queues `BlockDone` right after `HeaderMeta`, bpv1-9).
@@ -704,9 +705,9 @@ pub struct PeerStep {
 #[derive(Clone, Debug)]
 struct PeerBlockState {
     coding: Coding,
-    proposer_node: NodeId,
+    proposer: Proposer,
     /// This node proposed the block: it admitted the block from its own
-    /// solved template (bpv1-9). The miner picks `proposer_node`, so a block
+    /// solved template (bpv1-9). The miner picks the proposer, so a block
     /// can name a node that never proposed it; only this flag says a node did.
     as_proposer: bool,
     /// Push slots the peer opened with flagged `Have`s (decision-24). A slot
@@ -748,12 +749,12 @@ struct PeerBlockState {
 }
 
 impl PeerBlockState {
-    fn new(coding: Coding, proposer_node: NodeId, as_proposer: bool) -> Self {
+    fn new(coding: Coding, proposer: Proposer, as_proposer: bool) -> Self {
         let total = coding.total_parts().unwrap_or(0) as usize;
         let stripes = coding.stripes as usize;
         Self {
             coding,
-            proposer_node,
+            proposer,
             as_proposer,
             peer_flagged: BitSet::with_bits(total),
             peer_relayed: BitSet::with_bits(total),
@@ -795,7 +796,7 @@ impl PeerBlockState {
     /// seeds carry its proof of work and which flags each index once
     /// (bpv1-25), and `n − k` from anyone else.
     fn push_bound(&self, from: NodeId) -> u32 {
-        if from == self.proposer_node {
+        if self.proposer.is(&from) {
             self.coding.n
         } else {
             self.relay_bound()
@@ -1290,7 +1291,7 @@ impl PeerState {
         let BlockAdmitted {
             block_id,
             coding,
-            proposer_node,
+            proposer,
             header_meta,
             as_proposer,
             have_held_until,
@@ -1304,7 +1305,7 @@ impl PeerState {
         let state = self
             .blocks
             .entry(block_id)
-            .or_insert_with(|| PeerBlockState::new(coding, proposer_node, as_proposer));
+            .or_insert_with(|| PeerBlockState::new(coding, proposer, as_proposer));
         // decision-26: the first admission fixes the pacing; a repeat changes
         // nothing.
         if first {
@@ -1441,7 +1442,7 @@ impl PeerState {
         // cannot be a `Want`'s.
         let lost_push = !flagged && block.lost_push_open(stripe, self.remote_node);
         let auth = if flagged || lost_push {
-            Some(if self.remote_node == block.proposer_node {
+            Some(if block.proposer.is(&self.remote_node) {
                 PartAuth::Seed
             } else {
                 PartAuth::Push
@@ -1671,7 +1672,7 @@ impl PeerState {
         // bpv1-8: never queue Have/Part before HeaderMeta crossed.
         if !block.meta_exchanged()
             || block.peer_block_done
-            || self.remote_node == block.proposer_node
+            || block.proposer.is(&self.remote_node)
             || block.as_proposer
         {
             return;
@@ -1781,7 +1782,7 @@ impl PeerState {
         // bound, and only the proposer flags relay, on at most `n − k`.
         let flags = have.flags;
         if flags.push() {
-            let from_proposer = self.remote_node == block.proposer_node;
+            let from_proposer = block.proposer.is(&self.remote_node);
             let push_bound = block.push_bound(self.remote_node);
             let relay_bound = block.relay_bound();
             let over = (0..block.coding.stripes).any(|stripe| {

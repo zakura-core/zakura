@@ -13,7 +13,7 @@ use super::{
     blocks::{BlockConfig, BlockEvent, BlockInput, PartSource, ReleaseReason},
     close::Bpv1CloseRow,
     codec::encode_body,
-    commitment::CoinbaseBinding,
+    commitment::{CoinbaseBinding, Proposer},
     peer::*,
     profile::{Coding, Profile},
     test_support::{make_envelope, node_id, part_frame, LinkProfile, MachineMesh, MESH_HEIGHT},
@@ -42,7 +42,7 @@ fn dummy_meta(block_id: block::Hash) -> Box<Bpv1Message> {
         },
         coding: tiny(),
         part_root: block_id.0,
-        proposer_node: node_id(1),
+        proposer_node: Some(node_id(1)),
     })
 }
 
@@ -50,7 +50,7 @@ fn dummy_meta(block_id: block::Hash) -> Box<Bpv1Message> {
 fn proposer_meta(block_id: block::Hash, proposer: NodeId) -> Box<Bpv1Message> {
     let mut meta = dummy_meta(block_id);
     if let Bpv1Message::HeaderMeta { proposer_node, .. } = meta.as_mut() {
-        *proposer_node = proposer;
+        *proposer_node = Some(proposer);
     }
     meta
 }
@@ -84,7 +84,7 @@ fn block_admitted(block_id: block::Hash, coding: Coding, proposer: NodeId) -> Bl
     BlockAdmitted {
         block_id,
         coding,
-        proposer_node: proposer,
+        proposer: Proposer::Node(proposer),
         header_meta: Some(dummy_meta(block_id)),
         as_proposer: false,
         have_held_until: None,

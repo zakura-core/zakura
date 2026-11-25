@@ -76,6 +76,9 @@ fn build_committed_nu7_block(profile: &Profile, extra_tx_count: usize) -> Commit
 }
 
 /// [`build_committed_nu7_block`] whose coinbase also pays `coinbase_outputs`.
+///
+/// `C` names node 1 by its node ID, unless `coinbase_outputs` hold one miner
+/// mesh output, which then names the proposer (decision-34).
 fn build_committed_nu7_block_with_outputs(
     profile: &Profile,
     extra_tx_count: usize,
@@ -101,7 +104,9 @@ fn build_committed_nu7_block_with_outputs(
         profile_id: W2_PROFILE_ID,
         coding: encoded.coding,
         part_root: encoded.part_root,
-        proposer_node: node_id(1),
+        proposer_node: MinerMeshCommitment::from_coinbase_outputs(&coinbase_outputs)
+            .is_none()
+            .then(|| node_id(1)),
     };
     let script = commitment_script(commit_hash(&fields));
     let coinbase = build_v6_coinbase(height, &script, 0, coinbase_outputs, &[]);
@@ -298,7 +303,7 @@ fn large_coinbase_keeps_the_fast_path() {
         binding: binding.clone(),
         coding: encoded.coding,
         part_root: encoded.part_root,
-        proposer_node: node_id(1),
+        proposer_node: Some(node_id(1)),
     };
     let frame = encode_frame(&meta).unwrap();
     assert_eq!(decode_frame::<Bpv1Message>(&frame).unwrap(), meta);
@@ -856,7 +861,8 @@ impl MessageSample for Bpv1Message {
             },
             coding: sample_coding(),
             part_root: [0x44; 32],
-            proposer_node: node_id(1),
+            // decision-34: the miner mesh output names the proposer.
+            proposer_node: None,
         };
         let max_header_meta = Bpv1Message::HeaderMeta {
             header: vec![0xAA; profile::W2_MAX_HEADER_BYTES],
@@ -868,7 +874,7 @@ impl MessageSample for Bpv1Message {
             },
             coding: sample_coding(),
             part_root: [0x55; 32],
-            proposer_node: NodeSecretKey::from_bytes(&[0u8; 32]).public(),
+            proposer_node: Some(NodeSecretKey::from_bytes(&[0u8; 32]).public()),
         };
 
         let want = Bpv1Message::Want {
@@ -943,17 +949,19 @@ impl MessageSample for Bpv1Message {
 
     fn arbitrary_valid() -> BoxedStrategy<Self> {
         prop_oneof![
-            Just(Bpv1Message::HeaderMeta {
-                header: vec![0x11; 80],
-                binding: CoinbaseBinding {
-                    coinbase: vec![0x22; 64],
-                    txid_siblings: vec![[0x33; 32]],
-                    auth_siblings: vec![[0x44; 32]],
-                    light_client_root: [0x55; 32],
-                },
-                coding: sample_coding(),
-                part_root: [0x66; 32],
-                proposer_node: node_id(1),
+            prop::option::of(any::<[u8; 32]>()).prop_map(|proposer_node| {
+                Bpv1Message::HeaderMeta {
+                    header: vec![0x11; 80],
+                    binding: CoinbaseBinding {
+                        coinbase: vec![0x22; 64],
+                        txid_siblings: vec![[0x33; 32]],
+                        auth_siblings: vec![[0x44; 32]],
+                        light_client_root: [0x55; 32],
+                    },
+                    coding: sample_coding(),
+                    part_root: [0x66; 32],
+                    proposer_node: proposer_node.map(|bytes| NodeId::from_bytes(&bytes)),
+                }
             }),
             (
                 1u32..1000,
@@ -1056,6 +1064,11 @@ impl MessageSample for Bpv1Message {
         let mut relay_without_push = relay_have();
         relay_without_push.payload[32] = 0x02;
 
+        // decision-34: bit 0 is the only defined `HeaderMeta` flag. A
+        // gateway-form `HeaderMeta` ends with its flags byte.
+        let mut reserved_meta_flag = encode_frame(&Self::samples()[0]).unwrap();
+        *reserved_meta_flag.payload.last_mut().unwrap() = 0x02;
+
         let mut bad_want_end_reason = encode_frame(&Bpv1Message::WantEnd {
             want_id: 1,
             sent: 0,
@@ -1098,6 +1111,11 @@ impl MessageSample for Bpv1Message {
             Violation {
                 name: "have relay flag without push",
                 frame: relay_without_push,
+                rejected_by: |e| matches!(e, WireError::ReservedFlags(0x02)),
+            },
+            Violation {
+                name: "header meta flag bit other than proposer node",
+                frame: reserved_meta_flag,
                 rejected_by: |e| matches!(e, WireError::ReservedFlags(0x02)),
             },
         ]
@@ -1162,12 +1180,25 @@ fn golden_external_hex_vectors_for_w2_discontinuities_and_wire() {
         coding: Profile::W2.derive_coding(1_000, 2).unwrap(),
         part_root: [0x22; 32],
         // Raw bytes, so the vector pins BPv1's hash and not the transport's key derivation.
-        proposer_node: NodeId::from_bytes(&[0x33; 32]),
+        proposer_node: Some(NodeId::from_bytes(&[0x33; 32])),
     });
     assert_eq!(
         hex::encode(commit),
         "ab516914bd83aa8fe57e6a301ae72069af0ffb1776573615c3c1602b79db2888",
         "frozen golden commitment hash C"
+    );
+    // decision-34: the same fields when the miner mesh output names the proposer.
+    let gateway_commit = commit_hash(&CommitmentFields {
+        chain_id: [0x11; 32],
+        profile_id: W2_PROFILE_ID,
+        coding: Profile::W2.derive_coding(1_000, 2).unwrap(),
+        part_root: [0x22; 32],
+        proposer_node: None,
+    });
+    assert_eq!(
+        hex::encode(gateway_commit),
+        "82a67295fd3e6390981e98f98994ea6f2558d3b11f8eaa53a171afc164fcd7fd",
+        "frozen golden commitment hash C without proposer_node"
     );
     let script = commitment_script(commit);
     assert_eq!(

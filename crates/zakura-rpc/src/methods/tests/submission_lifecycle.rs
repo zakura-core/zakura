@@ -309,6 +309,13 @@ async fn trusted_rpc_publishes_to_bpv1_only_after_commit() {
             None
         }
 
+        fn empty_template_commitment(
+            &self,
+            _height: Height,
+        ) -> Option<[u8; BPV1_COMMITMENT_NULL_DATA_LEN]> {
+            None
+        }
+
         fn publish_solved_block(&self, _block: Arc<Block>, _height: Height) -> bool {
             self.published.fetch_add(1, Ordering::AcqRel);
             true

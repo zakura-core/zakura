@@ -416,6 +416,17 @@ reaches the neighbour before them, even when the proposer's `HeaderMeta` is
 still in flight on the control stream. A neighbour that admitted the block from
 another peer's `HeaderMeta` therefore accepts the proposer's seeds at once.
 
+A node proposes every block it solved, even when it first admitted the block
+from a peer's `HeaderMeta` (bpv1-88). A peer that gets the solved body early,
+such as over legacy relay before the proposer commits, can rebuild that
+metadata from the body alone. When the node's miner then publishes the block,
+the node keeps the admitted block and its state on each connection, takes
+every part, and ends the block's collection, verification, and body claim. It
+then sends `BlockDone` and its seeds as if it had admitted the block first. It
+never sends a second `HeaderMeta` on a connection (bpv1-4), and it announces
+nothing for the block from then on (decision-20). A block the node already
+retired stays retired, and the node does not seed it.
+
 Two hops push. The proposer pushes seeds to its neighbours, and each holder
 pushes its pushed seeds to its own peers. Every later hop pulls parts that its
 neighbours announce. On a full mesh the two pushed hops reach every node.

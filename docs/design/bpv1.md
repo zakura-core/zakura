@@ -79,6 +79,8 @@ sequenceDiagram
 `StripeDone` and `BlockDone` use the control stream to stop queued sends.
 Parts already in flight count as surplus. The proposer sends `BlockDone` with
 its metadata, so peers never send its own parts back. It sends no `Have`.
+A node that solves a block it already admitted from a peer's metadata takes
+that block over as its own proposal and seeds it.
 
 A proof establishes membership in the committed data. The node checks the
 encoding by re-encoding each decoded stripe and comparing its subtree root with

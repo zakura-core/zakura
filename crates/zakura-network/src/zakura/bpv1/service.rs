@@ -343,7 +343,7 @@ impl SharedNode {
     ) -> T {
         let (step, value) = {
             let mut table = self.lock_table();
-            let step = table.step(Instant::now(), input);
+            let step = step_table(&mut table, self.fallback.as_ref(), Instant::now(), input);
             metrics::gauge!("zakura.p2p.bpv1.pending_meta.count")
                 .set(table.pending_meta_len() as f64);
             metrics::gauge!("zakura.p2p.bpv1.path.entries").set(table.paths().len() as f64);
@@ -485,18 +485,10 @@ impl SharedNode {
                 // Blocks close only for `HeaderMeta` rows 3 and 4, read on control.
                 self.protocol_close(&peer, session_gen, BPV1_CONTROL_KIND, row);
             }
-            BlockOutput::ClaimBody { block_id, deadline } => {
-                let installed = self.fallback.claim(block_id, deadline);
-                tracing::debug!(target: "bpv1_stage", %block_id, installed, "body_claim_installed");
-            }
-            BlockOutput::ExtendBodyClaim { block_id, deadline } => {
-                let extended = self.fallback.extend(block_id, deadline);
-                tracing::debug!(target: "bpv1_stage", %block_id, extended, "body_claim_extended");
-            }
-            BlockOutput::ReleaseBodyClaim { block_id, reason } => {
-                let released = self.fallback.release(block_id, reason);
-                tracing::debug!(target: "bpv1_stage", %block_id, ?reason, released,
-                    "body_claim_released");
+            BlockOutput::ClaimBody { .. }
+            | BlockOutput::ExtendBodyClaim { .. }
+            | BlockOutput::ReleaseBodyClaim { .. } => {
+                unreachable!("step_table applies body claims under the table lock")
             }
             BlockOutput::StartStripeJob {
                 work_id,
@@ -580,6 +572,44 @@ impl SharedNode {
             routed => unreachable!("route_block_output keeps {routed:?} off the shell"),
         }
     }
+}
+
+/// Steps `table` with `input` and applies the step's body-claim effects to
+/// `fallback` before the caller releases the table lock.
+///
+/// Several tasks step the table: the driver, each session, and the miner's
+/// publication. Each dispatches its other effects after it releases the lock,
+/// so two steps' effects can run out of table order. Body claims cannot: a
+/// release that overtakes its claim would leave a claim that no table entry
+/// tracks. Applying them under the lock keeps the shared claims in table
+/// order. The returned step holds the remaining effects.
+pub(super) fn step_table(
+    table: &mut BlockTable,
+    fallback: &dyn BlockFallbackPort,
+    now: Instant,
+    input: BlockInput,
+) -> BlockStep {
+    let mut step = table.step(now, input);
+    step.outputs.retain(|output| match *output {
+        BlockOutput::ClaimBody { block_id, deadline } => {
+            let installed = fallback.claim(block_id, deadline);
+            tracing::debug!(target: "bpv1_stage", %block_id, installed, "body_claim_installed");
+            false
+        }
+        BlockOutput::ExtendBodyClaim { block_id, deadline } => {
+            let extended = fallback.extend(block_id, deadline);
+            tracing::debug!(target: "bpv1_stage", %block_id, extended, "body_claim_extended");
+            false
+        }
+        BlockOutput::ReleaseBodyClaim { block_id, reason } => {
+            let released = fallback.release(block_id, reason);
+            tracing::debug!(target: "bpv1_stage", %block_id, ?reason, released,
+                "body_claim_released");
+            false
+        }
+        _ => true,
+    });
+    step
 }
 
 /// Whether `envelope`'s coinbase commits its layout under `chain_id` at
@@ -1231,7 +1261,9 @@ async fn run_bpv1_driver(
                     for (peer, live) in sessions.iter() {
                         if let Some(load) = &live.load {
                             let estimate = conn_load_to_path_estimate(&load.borrow());
-                            out.push(table.step(
+                            out.push(step_table(
+                                &mut table,
+                                node.fallback.as_ref(),
                                 now,
                                 BlockInput::PathObserved {
                                     peer: *peer,

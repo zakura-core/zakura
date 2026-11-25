@@ -28,6 +28,7 @@ use super::{
     ports::BlockFallbackPort,
     profile::{Coding, Profile},
     proposer::*,
+    service::step_table,
     test_support::{
         admit_meta, admit_work, build_v6_coinbase, commit_work, make_envelope, node_id, Adversary,
         LinkProfile, MachineMesh, TEST_TIP_HASH,
@@ -2264,6 +2265,79 @@ fn bpv1_88_a_solved_block_takes_over_the_peer_copy_in_every_phase() {
         table.step(now, BlockInput::ProposedCommitFailed { block_id });
         assert_eq!(table.block_phase(&block_id), Some(BlockPhase::Retired));
     }
+}
+
+/// bpv1-88: the shared body claims follow the table in step order, whichever
+/// task steps it. A peer copy's claim is installed when its admission step
+/// returns, so the takeover's later release removes it: no claim outlives
+/// the entry that tracked it. The release wakes block sync, because this
+/// node's commit is still pending and block sync must fetch the body if that
+/// commit fails, as for a block this node admitted first.
+#[test]
+fn bpv1_88_the_takeover_releases_the_peer_copy_claim_in_table_order() {
+    let now = Instant::now();
+    let block_id = block::Hash([0x8B; 32]);
+    let encoded = takeover_body();
+    let claims = SharedBodyClaims::new();
+    let mut wakes = claims.subscribe();
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let envelope = make_envelope(block_id, encoded.coding, encoded.part_root, node_id(1));
+    let received = receive(&mut table, now, envelope);
+    let checking = header_result(
+        &mut table,
+        now,
+        &received,
+        HeaderAdmissionResult::Admitted {
+            height: 1,
+            parent_hash: TEST_TIP_HASH,
+        },
+    );
+    let admitted = step_table(
+        &mut table,
+        &claims,
+        now,
+        BlockInput::CommitmentChecked {
+            work_id: commit_work(&checking),
+            ok: true,
+            peers: vec![node_id(2)],
+            rng_seed: 7,
+        },
+    );
+    assert!(
+        claims.is_claimed(block_id, now),
+        "the claim is installed before the table lock is released"
+    );
+    wakes.mark_unchanged();
+
+    let took = step_table(
+        &mut table,
+        &claims,
+        now,
+        BlockInput::BlockAdmittedLocal {
+            height: 1,
+            envelope: make_envelope(block_id, encoded.coding, encoded.part_root, node_id(1)),
+            parts: encoded.parts.clone(),
+        },
+    );
+    assert!(table.is_proposer(&block_id));
+    assert!(!claims.is_claimed(block_id, now));
+    assert!(wakes.has_changed().unwrap(), "the release wakes block sync");
+    // Dispatching the admission's remaining effects after the takeover's
+    // cannot bring the claim back.
+    for step in [took, admitted] {
+        assert!(
+            step.outputs.iter().all(|o| !matches!(
+                o,
+                BlockOutput::ClaimBody { .. }
+                    | BlockOutput::ExtendBodyClaim { .. }
+                    | BlockOutput::ReleaseBodyClaim { .. }
+            )),
+            "{:?}",
+            step.outputs
+        );
+    }
+    assert!(!claims.is_claimed(block_id, now));
+    table.assert_invariants();
 }
 
 /// bpv1-88: a retired peer copy stays retired, because its sessions dropped

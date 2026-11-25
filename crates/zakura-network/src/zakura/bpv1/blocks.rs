@@ -1050,7 +1050,7 @@ fn shed_alternates<E>(
         shed.push((id, position));
     }
     // Later positions first, so each removal leaves the earlier ones valid.
-    shed.sort_by(|a, b| (b.0 .0, b.1).cmp(&(a.0 .0, a.1)));
+    shed.sort_by_key(|&(id, position)| std::cmp::Reverse((id.0, position)));
     for (id, position) in shed {
         if let Some(entry) = entries.get_mut(&id) {
             later(entry).drop_alternate(position);

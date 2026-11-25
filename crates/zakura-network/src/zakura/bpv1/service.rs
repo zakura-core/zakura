@@ -58,6 +58,10 @@ use super::{
         route_peer_output, BlockRoute, PeerRoute,
     },
     tree::{verify_part_proof, VerifiedPart},
+    unknown_parent::{
+        check_binding_and_height, check_proof_of_work, check_target_bound, target_bound_applies,
+        UnknownParentVerdict,
+    },
     wire::{
         message_type, read_part_prefix, Bpv1FifoQueue, Bpv1Message, DataQueueItem, HaveFlags,
         WantEndReason, BPV1_CONTROL_KIND, BPV1_DATA_KIND, BPV1_STREAMS,
@@ -407,6 +411,20 @@ impl SharedNode {
                     node.drive(BlockInput::HeaderAdmitted { work_id, result });
                 }));
             }
+            BlockOutput::CheckUnknownParent {
+                work_id,
+                block_id,
+                envelope,
+                top,
+            } => {
+                let node = Arc::clone(self);
+                drop(task::spawn_named("bpv1-check-unknown-parent", async move {
+                    let verdict = check_unknown_parent(&node, envelope, top).await;
+                    tracing::debug!(target: "bpv1_stage", %block_id,
+                        work_id = work_id.0, ?verdict, "unknown_parent_checked");
+                    node.drive(BlockInput::UnknownParentChecked { work_id, verdict });
+                }));
+            }
             BlockOutput::VerifyCommitment {
                 work_id,
                 block_id,
@@ -562,6 +580,39 @@ fn verify_envelope_commitment(
         &fields,
     )
     .is_ok()
+}
+
+/// Runs the checks on `envelope`, whose parent header is unknown, in their
+/// order: the binding, height, and proof-of-work checks on a blocking thread,
+/// because they decode and hash an untrusted coinbase before any proof of
+/// work, then the target bound.
+async fn check_unknown_parent(
+    node: &SharedNode,
+    envelope: Box<MetaEnvelope>,
+    top: u32,
+) -> UnknownParentVerdict {
+    let network = node.network.clone();
+    let checked = task::spawn_blocking(move || {
+        let header = parse_header(&envelope.header_bytes).ok_or(UnknownParentVerdict::Invalid(
+            Bpv1CloseRow::Row3InvalidHeader,
+        ))?;
+        let height = check_binding_and_height(&header, &envelope, top)?;
+        let target = check_proof_of_work(&network, &header)?;
+        Ok::<_, UnknownParentVerdict>((height, target))
+    })
+    .await;
+    let (height, target) = match checked {
+        Ok(Ok(checked)) => checked,
+        Ok(Err(verdict)) => return verdict,
+        // A check that never finished faults no peer: block sync owns the block.
+        Err(_) => return UnknownParentVerdict::Drop,
+    };
+    let bound = if target_bound_applies(&node.network, height) {
+        node.header_admission.target_bound().await
+    } else {
+        None
+    };
+    check_target_bound(&node.network, target, height, bound)
 }
 
 /// Cloneable control & proposer handle for a running [`Bpv1Service`].
@@ -1039,9 +1090,10 @@ impl Service for Bpv1Service {
 /// inputs.
 ///
 /// A new verified tip moves the window and ends a fallback block that
-/// native block sync committed. A new best header wakes metadata
-/// pending on it. The watch coalesces, so a hash skipped between two
-/// snapshots leaves through the window or slot eviction instead.
+/// native block sync committed. A new best header wakes the metadata
+/// pending on it, and the metadata for the header itself when the snapshot
+/// skipped its parent. The watch coalesces, so other metadata whose
+/// parent a snapshot skipped ages out instead.
 pub(crate) fn frontier_inputs(last: Option<FrontierSet>, next: FrontierSet) -> Vec<BlockInput> {
     let mut inputs = Vec::new();
     if last.map(|last| last.verified_best) != Some(next.verified_best) {

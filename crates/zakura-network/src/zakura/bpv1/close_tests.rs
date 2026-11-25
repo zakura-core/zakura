@@ -679,6 +679,81 @@ fn a_refused_pending_copy_keeps_every_alternate() {
     assert!(rejected_sessions(&failed, id(10, 0)).is_empty());
 }
 
+/// A session that ended leaves no record in metadata still in admission or
+/// pending (F-883). The table frees an alternate that no live session sent,
+/// and it keeps the replacement session of the same peer.
+#[test]
+fn an_ended_session_leaves_no_sender_record() {
+    let now = Instant::now();
+    let parent = block::Hash([0x6D; 32]);
+    let block_id = block::Hash([0x6C; 32]);
+    let [a, b, c, _] = sessions();
+    let replacement = (c.0, c.1 + 100);
+    let ended = |table: &mut BlockTable, (peer, session_gen): (NodeId, u64)| {
+        table.step(now, BlockInput::MetaSessionEnded { peer, session_gen });
+    };
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let first = copy_from(
+        &mut table,
+        now,
+        make_envelope(block_id, tiny(), [0xA1; 32], node_id(1)),
+        a,
+    );
+    header_result(
+        &mut table,
+        now,
+        &first,
+        HeaderAdmissionResult::MissingParent {
+            parent_hash: parent,
+        },
+    );
+    copy_from(
+        &mut table,
+        now,
+        make_envelope(block_id, tiny(), [0xA2; 32], node_id(1)),
+        b,
+    );
+    copy_from(
+        &mut table,
+        now,
+        make_envelope(block_id, tiny(), [0xA1; 32], node_id(1)),
+        c,
+    );
+    ended(&mut table, b);
+    ended(&mut table, c);
+    // The peer reconnects and sends again on its new session.
+    copy_from(
+        &mut table,
+        now,
+        make_envelope(block_id, tiny(), [0xA1; 32], node_id(1)),
+        replacement,
+    );
+    table.assert_invariants();
+
+    let woke = table.step(
+        now,
+        BlockInput::ParentAdmitted {
+            hash: parent,
+            height: 1,
+        },
+    );
+    let header = header_result(
+        &mut table,
+        now,
+        &woke,
+        HeaderAdmissionResult::Admitted { height: 2 },
+    );
+    let failed = commitment(&mut table, now, &header, false);
+    assert_eq!(
+        closed_sessions(&failed, Bpv1CloseRow::Row4BadMetaOrCommitment),
+        sorted(vec![a, replacement])
+    );
+    assert!(!verifies(&failed), "no live session sent the alternate");
+    assert!(rejected_sessions(&failed, block_id).is_empty());
+    assert_eq!(table.admitting_meta_len(), 0);
+    table.assert_invariants();
+}
+
 // ============================================================================
 // Rows 5 to 20: the session machine
 // ============================================================================

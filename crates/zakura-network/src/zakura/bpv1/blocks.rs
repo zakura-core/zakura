@@ -408,6 +408,15 @@ pub enum BlockInput {
         /// The sample's times and bytes.
         sample: RateSample,
     },
+    /// One session ended, whether or not a newer session replaced it. The
+    /// table forgets it as a sender of metadata still in admission: no
+    /// answer can reach it.
+    MetaSessionEnded {
+        /// The peer of the session.
+        peer: NodeId,
+        /// The session's generation.
+        session_gen: u64,
+    },
     /// Peer session ended: drop path entry and release its pull claims (`bpv1-62`, `bpv1-65`).
     SessionEnded {
         /// Disconnected peer.
@@ -980,6 +989,22 @@ impl LaterCopies {
         let (envelope, senders) = self.alternates.remove(position)?;
         self.unkept.extend(senders);
         Some(envelope.estimated_bytes())
+    }
+
+    /// Forgets `session`, which ended: no answer can reach it. An alternate
+    /// that no live session sent goes too. Returns the bytes freed.
+    fn forget(&mut self, session: (NodeId, u64)) -> usize {
+        self.same.retain(|s| *s != session);
+        self.unkept.retain(|s| *s != session);
+        let mut freed = 0;
+        self.alternates.retain_mut(|(envelope, senders)| {
+            senders.retain(|s| *s != session);
+            if senders.is_empty() {
+                freed += envelope.estimated_bytes();
+            }
+            !senders.is_empty()
+        });
+        freed
     }
 
     /// Every later session, whichever copy it sent.
@@ -1597,6 +1622,9 @@ impl BlockTable {
             BlockInput::RateSample { peer, sample } => {
                 self.paths.record_sample(peer, sample);
             }
+            BlockInput::MetaSessionEnded { peer, session_gen } => {
+                self.forget_meta_session((peer, session_gen));
+            }
             BlockInput::SessionEnded { peer, peer_states } => {
                 self.handle_session_ended(now, peer, &peer_states, &mut step);
             }
@@ -1781,6 +1809,18 @@ impl BlockTable {
             return;
         }
         self.start_admission(arrived_at, envelope, sender, LaterCopies::default(), step);
+    }
+
+    /// Forgets `session` in every later-copy record of metadata in admission
+    /// or pending. A first sender stays: its envelope can still admit the
+    /// block for every other session.
+    fn forget_meta_session(&mut self, session: (NodeId, u64)) {
+        for entry in self.admitting.values_mut() {
+            entry.later.forget(session);
+        }
+        for entry in self.pending.values_mut() {
+            self.pending_bytes -= entry.later.forget(session);
+        }
     }
 
     /// Queues headerchain admission for `envelope`, which `from` sent first,

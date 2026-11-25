@@ -87,7 +87,7 @@ fn block_admitted(block_id: block::Hash, coding: Coding, proposer: NodeId) -> Bl
         block_id,
         coding,
         proposer_node: proposer,
-        header_meta: Some(dummy_meta(block_id)),
+        header_meta: dummy_meta(block_id),
         as_proposer: false,
         have_held_until: None,
     }
@@ -369,10 +369,7 @@ fn scenario_early_record_full_pauses_data_only_and_replays_on_admission() {
     // Admission replays the held seed parts and resumes data reads.
     let admit = peer.step(
         t0,
-        PeerInput::BlockAdmitted(BlockAdmitted {
-            header_meta: None,
-            ..block_admitted(block_id, coding, node_id(2))
-        }),
+        PeerInput::BlockAdmitted(block_admitted(block_id, coding, node_id(2))),
     );
     assert!(!peer.is_data_paused());
     assert_eq!(peer.early_data_bytes(), 0);
@@ -522,18 +519,14 @@ fn scenario_partial_want_server_ends_early_without_closing() {
     let mut b = PeerState::new(config, node_id(1), 1);
     let block_id = block::Hash([0xAB; 32]);
     let encoded = encode_body(&Profile::TINY, &[0x21; 64], 2).unwrap();
-    // A sends HeaderMeta; B admits on its own and receives A's.
+    // A sends HeaderMeta; B receives it, then admits and sends none back.
     assert!(queues_meta(
         &a.step(now, admitted(block_id, encoded.coding, node_id(3)))
     ));
-    b.step(
-        now,
-        PeerInput::BlockAdmitted(BlockAdmitted {
-            header_meta: None,
-            ..block_admitted(block_id, encoded.coding, node_id(3))
-        }),
-    );
     b.step(now, recv_meta(block_id));
+    assert!(!queues_meta(
+        &b.step(now, admitted(block_id, encoded.coding, node_id(3)))
+    ));
 
     // B asks for slots 0, 1 and 2.
     let want_id = sent_want(&b.step(now, pull(block_id, 0, &[0, 1, 2], now)))

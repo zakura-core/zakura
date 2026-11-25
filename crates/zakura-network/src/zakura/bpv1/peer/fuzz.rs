@@ -261,7 +261,7 @@ fn decode(
                 block_id: block.id,
                 coding: block.geometry.encoded.coding,
                 proposer_node: proposer,
-                header_meta: (b & 4 == 0).then(|| Box::new(block.meta(proposer, false))),
+                header_meta: Box::new(block.meta(proposer, false)),
                 as_proposer: proposer == local,
                 have_held_until: (b & 8 != 0).then(|| *now + Duration::from_millis(500)),
             })

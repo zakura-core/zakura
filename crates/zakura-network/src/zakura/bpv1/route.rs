@@ -342,7 +342,7 @@ pub(crate) fn admitted_input(admitted: &AdmittedBlock) -> BlockAdmitted {
         block_id: admitted.block_id,
         coding: admitted.coding,
         proposer_node: admitted.proposer_node,
-        header_meta: Some(admitted.header_meta.clone()),
+        header_meta: admitted.header_meta.clone(),
         as_proposer: admitted.as_proposer,
         have_held_until: admitted.have_deadline,
     }

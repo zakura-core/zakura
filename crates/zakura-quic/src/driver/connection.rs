@@ -552,8 +552,8 @@ impl<S: UdpIo> ConnTask<S> {
     /// Before it validates the dialer's address, a listener may send only
     /// three times what it received (RFC 9000 §8.1). The hello is two
     /// 1,200-byte datagrams, which allows 7,200 bytes, and the listener's
-    /// first flight, with its ML-KEM-1024 ciphertext, ML-DSA-87 key and
-    /// composite signature (TLS-4, TLS-9), is about 9.9 KB. A third datagram
+    /// first flight, with its ML-KEM-1024 ciphertext, ML-DSA-65 key and
+    /// composite signature (TLS-4, TLS-9), is about 7.9 KB. A third datagram
     /// raises the allowance to 10,800 bytes, so the listener sends its whole
     /// flight at once and the dial completes in one round trip instead of
     /// two. quinn-proto puts the PING in the Initial space and pads every

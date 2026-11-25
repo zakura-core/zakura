@@ -26,7 +26,8 @@ listen_addr = "0.0.0.0:8234"
 
 With `miner_mesh = true`, every coinbase the node builds gets one extra
 zero-value output that names the node by its gateway ID: the first 20 bytes of
-its v2 node ID. The output takes 34 bytes of the block and has no effect on its
+its v2 node ID, unless `mining.miner_mesh_gateways` names another node (see
+[Name a relay node](#name-a-relay-node)). The output takes 34 bytes of the block and has no effect on its
 validity. It is off by default.
 
 The output's lock script is `OP_RETURN`, a push of 23 bytes, the tag `MR`
@@ -36,13 +37,19 @@ The output's lock script is `OP_RETURN`, a push of 23 bytes, the tag `MR`
 6a 17 || "MR" || 01 || gateway_id[20]
 ```
 
-`zakurad` refuses to start with `miner_mesh` set unless:
+`zakurad` refuses to start with `miner_mesh` set unless both of these hold,
+or `mining.miner_mesh_gateways` names another node (see
+[Name a relay node](#name-a-relay-node)):
 
 - v2 networking runs (`network.p2p_stack` is `"zakura"` or `"dual"`), since
   other miners find the gateway by its v2 node ID;
 - its v2 node key stays the same across restarts: either
   `network.zakura_node_secret_key` is set, or the key file under
   `network.identity_dir` can be read or created.
+
+With a miner address, it also refuses a mining config it cannot build
+coinbases from, such as an address for another network, so the node never
+reports a gateway its blocks do not name.
 
 It warns, and starts anyway, when `network.zakura.listen_addr` is unset or
 loopback, since other miners cannot dial the gateway. A node with
@@ -79,8 +86,8 @@ listen_addr = "0.0.0.0:8234"
 
 Each entry is the relay's v2 node ID in hex, the `node_id` its
 `getminermeshinfo` reports, or the first 40 hex digits of it, its gateway ID.
-For now the list takes one entry: `zakurad` refuses to start with more. An
-empty list, the default, names the node itself.
+For now the list takes one entry: `zakurad` refuses to start with more, or
+with the node's own ID. An empty list, the default, names the node itself.
 
 The two nodes need different things:
 

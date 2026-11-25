@@ -15,8 +15,8 @@ use zakura_chain::block::{self, Block, Height};
 /// 48-byte serialized transparent output; decision-25).
 pub const BPV1_COMMITMENT_NULL_DATA_LEN: usize = 37;
 
-/// Narrow proposer hook connecting `zakura-rpc` (`getblocktemplate` &
-/// `submitblock`) to BPv1's [`ProposerState`].
+/// Narrow proposer hook connecting `zakura-rpc` (`getblocktemplate`,
+/// `submitblock`, and trusted block submission) to BPv1's [`ProposerState`].
 pub trait Bpv1ProposerHook: Send + Sync + fmt::Debug {
     /// Cheap pre-check indicating whether a template at `height` is eligible
     /// for a BPv1 commitment (post-NU7 and at least one live BPv1 session).

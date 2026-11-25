@@ -249,6 +249,8 @@ struct ConnTask<S: UdpIo> {
     blocked: Option<(Transmit, Vec<u8>)>,
     send_allowance: Option<HandshakeAllowance>,
     more_to_send: bool,
+    /// A dialer's hello whose padding (DIAL-8) is still undecided.
+    hello_pad_pending: bool,
     counters: Counters,
     exported: Exported,
     rate_in: RateIn,
@@ -315,6 +317,7 @@ pub(crate) async fn run<S: UdpIo>(params: ConnTaskParams<S>) {
         blocked: None,
         send_allowance,
         more_to_send: false,
+        hello_pad_pending: false,
         counters: Counters::default(),
         exported: Exported::default(),
         rate_in: RateIn::new(now()),
@@ -335,8 +338,8 @@ pub(crate) async fn run<S: UdpIo>(params: ConnTaskParams<S>) {
             VarInt::from_u32(0),
             Bytes::from_static(b"endpoint shutdown"),
         );
-    } else if task.conn.side().is_client() {
-        task.pad_hello();
+    } else {
+        task.hello_pad_pending = task.conn.side().is_client();
     }
 
     loop {
@@ -592,7 +595,8 @@ impl<S: UdpIo> ConnTask<S> {
         }
     }
 
-    /// Sends the dialer's hello, then one more Initial datagram (ADM-1).
+    /// Follows the dialer's hello with one more Initial datagram (DIAL-8),
+    /// once quinn-proto has built the whole hello.
     ///
     /// Before it validates the dialer's address, a listener may send only
     /// three times what it received (RFC 9000 §8.1). The hello is two
@@ -602,18 +606,30 @@ impl<S: UdpIo> ConnTask<S> {
     /// raises the allowance to 10,800 bytes, so the listener sends its whole
     /// flight at once and the dial completes in one round trip instead of
     /// two. quinn-proto puts the PING in the Initial space and pads every
-    /// datagram that carries a dialer's Initial packet to 1,200 bytes. The
-    /// hello must leave first, or the PING would ride in its last datagram.
+    /// datagram that carries a dialer's Initial packet to 1,200 bytes.
+    ///
+    /// The PING waits until a send pass ends with quinn-proto out of data.
+    /// A pass that parks a transmit on `WouldBlock` stops polling, and
+    /// without GSO the rest of the hello is then still unbuilt, so a PING
+    /// queued then would ride in the hello's last datagram. The hello's size
+    /// is what quinn-proto built, not what the socket took, so a datagram
+    /// still parked or lost to a send error counts too.
     ///
     /// A hello that fits one datagram, which only a dialer without the
     /// hybrid group sends, gets no padding. A listener refuses such a hello
     /// at its first packet and keeps no state for it, so a padding datagram
     /// would arrive as an attempt of its own, with no hello, and hold a
-    /// pending handshake until the deadline.
+    /// pending handshake until the deadline. Nor does a hello that drew a
+    /// reply first: a retried hello is validated and needs none.
     fn pad_hello(&mut self) {
-        self.drive();
-        if self.counters.datagrams_sent >= 2 {
+        if !self.hello_pad_pending || self.blocked.is_some() || self.more_to_send {
+            return;
+        }
+        self.hello_pad_pending = false;
+        let stats = self.conn.stats();
+        if stats.udp_tx.datagrams >= 2 && stats.udp_rx.datagrams == 0 {
             self.conn.ping();
+            self.transmit();
         }
     }
 
@@ -633,6 +649,7 @@ impl<S: UdpIo> ConnTask<S> {
         self.check_path(false);
         self.process_events();
         self.transmit();
+        self.pad_hello();
         self.process_events();
         while let Some(event) = self.conn.poll_endpoint_events() {
             self.drained_sent |= event.is_drained();
@@ -1475,6 +1492,7 @@ mod tests {
             blocked: None,
             send_allowance: None,
             more_to_send: false,
+            hello_pad_pending: false,
             counters: Counters::default(),
             exported: Exported::default(),
             rate_in: RateIn::new(now()),

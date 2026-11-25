@@ -24,7 +24,7 @@ listen_addr = "0.0.0.0:8234"
 ```
 
 With `miner_mesh = true`, every coinbase the node builds gets one extra
-zero-value output that carries the node's v2 node ID. The output takes 48 bytes
+zero-value output that carries the node's v2 node ID. The output takes 46 bytes
 of the block and has no effect on its validity. It is off by default.
 
 `zakurad` refuses to start with `miner_mesh` set unless:

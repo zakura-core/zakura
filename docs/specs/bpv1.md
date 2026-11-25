@@ -280,9 +280,8 @@ A miner mesh coinbase MAY also carry its own output
 gateway. That output has the same form with the tag `"MR"`
 ([#2709](https://github.com/zakura-core/zakura/pull/2709)), so the two outputs
 never match each other's reader. BPv1 ignores that output, and it grants no BPv1
-rights. When one node
-both builds the template and announces the gateway, `proposer_node` equals the
-gateway identity.
+rights. When one node both builds the template and announces the gateway,
+`proposer_node` equals the gateway identity.
 
 `CoinbaseBinding` carries the canonical v6 coinbase transaction, its index-0
 txid Merkle path, its index-0 ZIP 244 authorizing-data Merkle path, and

@@ -310,7 +310,6 @@ const TARGETS: [Target; 5] = [
                 .chain(&BLOCK_INPUTS)
                 .chain(&PROPOSER_INPUTS)
                 .copied()
-                .filter(|name| !super::mesh::EXCLUDED.contains(name))
                 .collect()
         },
         max_len: 1024,

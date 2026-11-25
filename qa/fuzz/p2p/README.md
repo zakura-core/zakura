@@ -297,8 +297,9 @@ picks which frame or job completion each node takes next, ticks, link loss
 and what node 3, the adversary, sends. Jobs complete with production
 verification and coding. The replay asserts every machine's invariants after
 every step, that no honest link closes with a protocol row, and that every
-ended session drains. It never sends `EvictRetired`: the mesh's chain is
-three blocks high, so no tombstone ages out.
+ended session drains. One operation lets block sync carry every honest
+tip more than twice the propagation window past the mesh's blocks, so the
+tables evict their tombstones while frames are still in flight.
 
 `bpv1_wire` decodes one arbitrary frame with every BPv1 decoder. A decoded
 frame re-encodes to the same bytes, the largest allocation stays within

@@ -349,6 +349,8 @@ const MESH_TICK_LONG: u8 = 17;
 const MESH_PATH: u8 = 18;
 const MESH_DISCONNECT: u8 = 19;
 const MESH_RECONNECT: u8 = 20;
+/// `b % 3` picks a control stall, a fallback's end, or block sync past
+/// the window.
 const MESH_STALL_OR_FALLBACK: u8 = 21;
 const MESH_ADVERSARY: u8 = 22;
 const MESH_ADVERSARY_RAW: u8 = 23;
@@ -460,6 +462,17 @@ fn mesh_seeds() -> Vec<Bpv1Seed> {
     stress.extend(propose(1));
     stress.push((MESH_STALL_OR_FALLBACK, 0, 0));
     stress.extend(pump(6));
+    // Block sync carries every tip past the window while block 1's frames
+    // are in flight; the tables evict the tombstones.
+    let mut sync_past = propose(0);
+    sync_past.extend(pump(4));
+    sync_past.extend(propose(1));
+    sync_past.extend([
+        (MESH_CONTROL, 0, 0),
+        (MESH_STALL_OR_FALLBACK, 0, 2),
+        (MESH_TICK, 0, 1),
+    ]);
+    sync_past.extend(pump(3));
     // The adversary flags a push to node 1, then sends the part forged.
     let mut forged = propose(0);
     forged.extend([
@@ -482,6 +495,7 @@ fn mesh_seeds() -> Vec<Bpv1Seed> {
         seed(target, "adversary", ops(MESH_ONE_TX, &adversary)),
         seed(target, "stress", ops(MESH_STRESS | MESH_ONE_TX, &stress)),
         seed(target, "forged-push", ops(MESH_ONE_TX, &forged)),
+        seed(target, "sync-past", ops(MESH_ONE_TX, &sync_past)),
         seed(
             target,
             "adversary-raw",

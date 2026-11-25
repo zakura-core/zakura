@@ -31,7 +31,11 @@
 //!
 //! A node commits a block when its verifier accepts it, when block sync
 //! ends its fallback, or (the proposer) when it solves it. Committing steps
-//! `TipHeight` and `ParentAdmitted`.
+//! `TipHeight` and `ParentAdmitted`. Block sync may also carry every honest
+//! node's tip far past the mesh's blocks, as a node catching up does. The
+//! tables then retire the mesh's blocks and, past twice the propagation
+//! window, evict their tombstones (`EvictRetired`) while frames for them
+//! are still in flight.
 //!
 //! Checks after every step: every stepped session's and table's
 //! `assert_invariants`; no honest connection closes with a protocol row,
@@ -94,7 +98,7 @@ use crate::zakura::{
         unknown_parent::UnknownParentVerdict,
         wire::{
             encode_part_frame, message_type, Bpv1FifoQueue, Bpv1Message, DataQueueItem, HaveFlags,
-            WantBitmap, WantEndReason,
+            WantBitmap, WantEndReason, PROPAGATION_DEPTH,
         },
     },
     wire_codec::encode_frame,
@@ -113,14 +117,6 @@ pub struct MeshReplaySummary {
     /// Every input, output, close row and phase the replay reached.
     pub reached: Reached,
 }
-
-/// Inputs the mesh never sends, and why:
-///
-/// - `EvictRetired`: the mesh's chain is three blocks high, and a table
-///   purges a retired block's tombstone only `2 × PROPAGATION_DEPTH` (32)
-///   blocks below its top. The `bpv1_peer` and `bpv1_block` replays drive
-///   it.
-pub(super) const EXCLUDED: &[&str] = &["peer-in:EvictRetired"];
 
 /// The fuzz property the mesh checks name.
 const MESH: &str = "bpv1/mesh";
@@ -383,8 +379,11 @@ impl Mesh {
             18 => self.observe_path(a, b),
             19 => self.disconnect(a),
             20 => self.reconnect(a),
-            21 if b & 1 == 0 => self.control_stalled(a),
-            21 => self.fallback_done(a),
+            21 => match b % 3 {
+                0 => self.control_stalled(a),
+                1 => self.fallback_done(a),
+                _ => self.sync_past(b),
+            },
             22 => self.adversary_crafted(a, b),
             _ => self.adversary_raw(a, b, input),
         }
@@ -1565,6 +1564,29 @@ impl Mesh {
             .collect();
         if let Some(&block_id) = fallen.get(usize::from(a >> 2) % fallen.len().max(1)) {
             self.commit(node, block_id);
+        }
+    }
+
+    /// Block sync commits blocks past the mesh's chain on every honest
+    /// node: the verified tip jumps more than twice the propagation window
+    /// past the highest mesh block, so every table retires the mesh's
+    /// blocks and evicts their tombstones. The committed blocks are not
+    /// mesh blocks, so their hashes are synthetic.
+    fn sync_past(&mut self, b: u8) {
+        let top = self.solved.iter().map(|s| s.height).max().unwrap_or(0);
+        for node in (0..NODES).filter(|&n| Self::honest(n)) {
+            let height = self.nodes[node]
+                .tip
+                .max(top)
+                .saturating_add(2 * PROPAGATION_DEPTH + 1)
+                .saturating_add(u32::from(b >> 2));
+            let mut hash = [0xEE; 32];
+            hash[..4].copy_from_slice(&height.to_le_bytes());
+            let hash = block::Hash(hash);
+            self.nodes[node].tip = height;
+            self.step_table(node, BlockInput::TipHeight { height });
+            self.step_table(node, BlockInput::FallbackDone { block_id: hash });
+            self.step_table(node, BlockInput::ParentAdmitted { hash, height });
         }
     }
 

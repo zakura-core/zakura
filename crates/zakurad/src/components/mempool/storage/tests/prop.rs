@@ -1203,14 +1203,49 @@ proptest! {
         prop_assert_eq!(e.len(), 0);
     }
 
-    /// Check if EvictionList panics if entries are added multiple times.
+    /// Check that inserting a remembered TXID again keeps its first entry,
+    /// so the list's order, capacity and expiry are unchanged.
     #[test]
-    #[should_panic]
-    fn eviction_list_refresh(
-        txid in any::<UnminedTxId>()
+    fn eviction_list_repeated_insert_keeps_first_entry(
+        mut rejection_template in any::<UnminedTxId>()
     ) {
+        // Make unique IDs by converting the index to bytes, and writing it to each ID
+        let txids: Vec<_> = (0..3_u32).map(move |index| {
+            rejection_template.mined_id_mut().0[0..4].copy_from_slice(&index.to_le_bytes());
+            rejection_template.mined_id()
+        }).collect();
+        let (oldest, newer, newest) = (txids[0], txids[1], txids[2]);
+
         let mut e = EvictionList::new(2, EVICTION_MEMORY_TIME);
-        e.insert(txid.mined_id());
-        e.insert(txid.mined_id());
+        e.insert(oldest);
+        e.insert(oldest);
+        prop_assert_eq!(e.len(), 1);
+
+        e.insert(newer);
+        e.insert(newer);
+        // A repeat doesn't move `oldest` to the back of the order.
+        e.insert(oldest);
+        prop_assert_eq!(e.len(), 2);
+
+        // So `oldest` is still the one dropped at capacity.
+        e.insert(newest);
+        prop_assert_eq!(e.len(), 2);
+        prop_assert!(!e.contains_key(&oldest));
+        prop_assert!(e.contains_key(&newer));
+        prop_assert!(e.contains_key(&newest));
+
+        // A repeat doesn't refresh the entry's time either.
+        let mut e = EvictionList::new(2, Duration::from_millis(10));
+        e.insert(oldest);
+        thread::sleep(Duration::from_millis(6));
+        e.insert(oldest);
+        thread::sleep(Duration::from_millis(6));
+        prop_assert!(!e.contains_key(&oldest));
+        prop_assert_eq!(e.len(), 0);
+
+        // Once expired, the TXID can be remembered again.
+        e.insert(oldest);
+        prop_assert!(e.contains_key(&oldest));
+        prop_assert_eq!(e.len(), 1);
     }
 }

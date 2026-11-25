@@ -937,7 +937,9 @@ fn unwritten_want_ends_count_against_the_live_want_limit() {
     let config = PeerConfig::for_profile(Profile::TINY);
     let now = Instant::now();
     let unknown = block::Hash([0xAB; 32]);
-    let want = |want_id| recv_want(want_id, unknown, 0, &[0]);
+    // Each `Want` asks for its own stripe: a `Want` whose end is unwritten is
+    // still live, so a repeated set would overlap it.
+    let want = |want_id| recv_want(want_id, unknown, want_id, &[0]);
     let hard_limit = MAX_WANTS_INFLIGHT * 2;
 
     let mut peer = PeerState::new(config, node_id(1), node_id(2), 1);

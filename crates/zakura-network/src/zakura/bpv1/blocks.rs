@@ -59,7 +59,7 @@ pub fn stall_base(paths: &PeerPaths, coding: &Coding) -> Duration {
 pub const RECONSTRUCTION_DEADLINE: Duration = Duration::from_secs(15);
 
 /// Monotonic verification deadline from a block's first verifier submission
-/// (`bpv1-77`).
+/// (`bpv1-82`).
 ///
 /// The body claim lasts until this deadline while the block verifies
 /// (`bpv1-44`). Past it, the block falls back to block sync and frees its slot.
@@ -178,7 +178,7 @@ pub enum FallbackReason {
     RootMismatch,
     /// Local decoded-block pool capacity or retryable verifier backpressure.
     LocalCapacity,
-    /// The verification deadline elapsed before a verdict (`bpv1-77`).
+    /// The verification deadline elapsed before a verdict (`bpv1-82`).
     VerifyDeadline,
 }
 
@@ -795,7 +795,7 @@ pub enum BlockEvent {
         block_id: block::Hash,
     },
     /// A retryable verdict parked the assembled block until its parent commits
-    /// (`bpv1-79`).
+    /// (`bpv1-84`).
     Parked {
         /// Block hash.
         block_id: block::Hash,
@@ -1086,10 +1086,10 @@ struct ActiveBlock {
     done_peers: HashSet<NodeId>,
     /// Work id of the submission in flight. `None` while `Verifying` means a
     /// retryable verdict parked the assembled block until its parent commits
-    /// (`bpv1-79`).
+    /// (`bpv1-84`).
     verify_work_id: Option<WorkId>,
     /// Monotonic verification deadline, set at the first submission
-    /// (`bpv1-77`).
+    /// (`bpv1-82`).
     verify_deadline: Option<Instant>,
     /// Whether this block currently holds a body claim in `BlockFallback`.
     body_claimed: bool,
@@ -2039,7 +2039,7 @@ impl BlockTable {
         }
     }
 
-    /// Frees a slot for the block whose parent is the verified tip (`bpv1-78`).
+    /// Frees a slot for the block whose parent is the verified tip (`bpv1-83`).
     ///
     /// That block is the next one the chain can commit, and every block above it
     /// waits on it. When every slot is busy, it retires the highest block whose
@@ -2068,7 +2068,7 @@ impl BlockTable {
     }
 
     /// Resubmits each parked block whose parent the verified tip now includes
-    /// (`bpv1-79`).
+    /// (`bpv1-84`).
     fn resubmit_parked(&mut self, now: Instant, step: &mut BlockStep) {
         let ready: Vec<block::Hash> = self
             .blocks
@@ -2769,7 +2769,7 @@ impl BlockTable {
     /// it held every source part.
     ///
     /// `BlockTable` keeps every source part of an assembled block, so a parked
-    /// block resubmits without fetching anything (`bpv1-79`).
+    /// block resubmits without fetching anything (`bpv1-84`).
     fn submit_assembled(&mut self, block_id: block::Hash, step: &mut BlockStep) -> bool {
         let Some(block) = self.blocks.get_mut(&block_id) else {
             return false;
@@ -2850,7 +2850,7 @@ impl BlockTable {
             VerifierVerdict::RootMismatch => {
                 self.enter_fallback(block_id, FallbackReason::RootMismatch, step);
             }
-            // bpv1-79: a retryable verdict says nothing about the body. While the
+            // bpv1-84: a retryable verdict says nothing about the body. While the
             // parent is not committed, the block cannot commit through any path,
             // so it keeps its body and claim and resubmits once the parent
             // commits. With the parent committed, it falls back.
@@ -3002,7 +3002,7 @@ impl BlockTable {
         let mut verify_expired: Vec<block::Hash> = Vec::new();
 
         for (&block_id, block) in &mut self.blocks {
-            // bpv1-77: verification ends by its deadline, verdict or not.
+            // bpv1-82: verification ends by its deadline, verdict or not.
             if block.phase == BlockPhase::Verifying
                 && block
                     .verify_deadline

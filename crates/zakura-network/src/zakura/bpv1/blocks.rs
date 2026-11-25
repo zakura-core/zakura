@@ -246,7 +246,7 @@ pub enum ClaimRelease {
 }
 
 /// Decoded `HeaderMeta` envelope presented to [`BlockTable`].
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MetaEnvelope {
     /// Block consensus hash.
     pub block_id: block::Hash,
@@ -880,12 +880,17 @@ struct AdmittingEntry {
     arrived_at: Instant,
     from_peer: NodeId,
     session_gen: u64,
-    /// Other sessions that sent the same `HeaderMeta` while this entry waited.
-    /// Each session holds a received marker until the table rejects or admits
-    /// the block.
-    also_from: Vec<(NodeId, u64)>,
+    /// The copies other sessions sent while this entry waited.
+    later: LaterCopies,
     height: Option<u32>,
     stage: AdmittingStage,
+}
+
+impl AdmittingEntry {
+    /// Bytes this entry holds against the admitting budget.
+    fn charged_bytes(&self) -> usize {
+        self.envelope.estimated_bytes() + self.later.alternate_bytes()
+    }
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -901,10 +906,120 @@ struct PendingMetaEntry {
     arrived_at: Instant,
     from_peer: NodeId,
     session_gen: u64,
-    /// See [`AdmittingEntry::also_from`].
-    also_from: Vec<(NodeId, u64)>,
+    /// The copies other sessions sent while this entry waited.
+    later: LaterCopies,
     parent_hash: block::Hash,
     received_at: Instant,
+}
+
+impl PendingMetaEntry {
+    /// Bytes this entry holds against the pending budget.
+    fn charged_bytes(&self) -> usize {
+        self.envelope.estimated_bytes() + self.later.alternate_bytes()
+    }
+}
+
+/// The copies of one block's `HeaderMeta` that sessions other than the first
+/// sender sent while the table admitted it. Each session holds a received
+/// marker until the table rejects or admits the block.
+///
+/// The block id hashes only the header, so a later copy may carry another
+/// binding, coding, or part root. The table keeps one alternate envelope: the
+/// first later copy that differs from the entry's envelope. The alternate is
+/// charged to the budget of the stage that holds the entry, and it gives way
+/// before any first copy is refused. If the first copy fails its commitment
+/// check, the alternate gets its own check before the table answers its
+/// senders (bpv1-61).
+#[derive(Clone, Debug, Default)]
+struct LaterCopies {
+    /// Sessions whose copy equals the entry's envelope.
+    same: Vec<(NodeId, u64)>,
+    /// The alternate envelope, and the sessions whose copy equals it.
+    alternate: Option<(Box<MetaEnvelope>, Vec<(NodeId, u64)>)>,
+    /// Sessions whose copy matched neither kept envelope. The table did not
+    /// keep their copies, so it cannot check them.
+    unkept: Vec<(NodeId, u64)>,
+}
+
+impl LaterCopies {
+    /// Records `sender`'s `copy` beside the entry's `envelope`. A differing
+    /// copy becomes the alternate if none is kept and it fits in `room`
+    /// bytes. Returns the bytes the alternate now charges.
+    fn record(
+        &mut self,
+        envelope: &MetaEnvelope,
+        copy: Box<MetaEnvelope>,
+        sender: (NodeId, u64),
+        room: usize,
+    ) -> usize {
+        if *copy == *envelope {
+            self.same.push(sender);
+            return 0;
+        }
+        match &mut self.alternate {
+            Some((alternate, senders)) if **alternate == *copy => senders.push(sender),
+            None if copy.estimated_bytes() <= room => {
+                let bytes = copy.estimated_bytes();
+                self.alternate = Some((copy, vec![sender]));
+                return bytes;
+            }
+            _ => self.unkept.push(sender),
+        }
+        0
+    }
+
+    /// Bytes the alternate envelope charges.
+    fn alternate_bytes(&self) -> usize {
+        self.alternate
+            .as_ref()
+            .map_or(0, |(envelope, _)| envelope.estimated_bytes())
+    }
+
+    /// Drops the alternate envelope, so its senders become unkept. Returns
+    /// the bytes it freed.
+    fn drop_alternate(&mut self) -> usize {
+        let freed = self.alternate_bytes();
+        if let Some((_, senders)) = self.alternate.take() {
+            self.unkept.extend(senders);
+        }
+        freed
+    }
+
+    /// Every later session, whichever copy it sent.
+    fn sessions(&self) -> impl Iterator<Item = (NodeId, u64)> + '_ {
+        self.same
+            .iter()
+            .chain(self.alternate.iter().flat_map(|(_, senders)| senders))
+            .chain(&self.unkept)
+            .copied()
+    }
+}
+
+/// Drops alternate envelopes, largest first, until `needed` more bytes fit
+/// beside `used` under `cap` or none is left. Returns the bytes freed.
+/// Alternates use only room that no first copy needs.
+fn shed_alternates<'a>(
+    entries: impl Iterator<Item = (&'a block::Hash, &'a mut LaterCopies)>,
+    used: usize,
+    needed: usize,
+    cap: usize,
+) -> usize {
+    if used.saturating_add(needed) <= cap {
+        return 0;
+    }
+    let mut held: Vec<(usize, block::Hash, &mut LaterCopies)> = entries
+        .filter(|(_, later)| later.alternate.is_some())
+        .map(|(id, later)| (later.alternate_bytes(), *id, later))
+        .collect();
+    held.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1 .0.cmp(&b.1 .0)));
+    let mut freed = 0;
+    for (_, _, later) in held {
+        if used.saturating_sub(freed).saturating_add(needed) <= cap {
+            break;
+        }
+        freed += later.drop_alternate();
+    }
+    freed
 }
 
 /// Picks a block's `Have` initial group the way main's block gossip picks
@@ -1216,9 +1331,9 @@ fn reject_meta(step: &mut BlockStep, block_id: block::Hash, peer: NodeId, sessio
     });
 }
 
-/// Rejects the metadata for every session in `also_from`.
-fn reject_also(step: &mut BlockStep, block_id: block::Hash, also_from: &[(NodeId, u64)]) {
-    for &(peer, session_gen) in also_from {
+/// Rejects the metadata for every session in `later`.
+fn reject_later(step: &mut BlockStep, block_id: block::Hash, later: &LaterCopies) {
+    for (peer, session_gen) in later.sessions() {
         reject_meta(step, block_id, peer, session_gen);
     }
 }
@@ -1452,14 +1567,7 @@ impl BlockTable {
                 from_peer,
                 session_gen,
             } => {
-                self.handle_meta_received(
-                    now,
-                    envelope,
-                    from_peer,
-                    session_gen,
-                    Vec::new(),
-                    &mut step,
-                );
+                self.handle_meta_received(now, envelope, from_peer, session_gen, &mut step);
             }
             BlockInput::HeaderAdmitted { work_id, result } => {
                 self.handle_header_admitted(now, work_id, result, &mut step);
@@ -1627,30 +1735,16 @@ impl BlockTable {
         envelope: Box<MetaEnvelope>,
         from_peer: NodeId,
         session_gen: u64,
-        mut also_from: Vec<(NodeId, u64)>,
         step: &mut BlockStep,
     ) {
         let block_id = envelope.block_id;
         // An admitted or retired block's admission already cleared every
-        // session's received marker. A block still admitting or pending records
-        // this sender, so whatever ends the entry also answers this session.
+        // session's received marker, and the table never uses this copy.
         if self.blocks.contains_key(&block_id) {
             return;
         }
-        let waiting = match self.admitting.get_mut(&block_id) {
-            Some(entry) => Some(&mut entry.also_from),
-            None => self
-                .pending
-                .get_mut(&block_id)
-                .map(|entry| &mut entry.also_from),
-        };
-        if let Some(waiting) = waiting {
-            waiting.push((from_peer, session_gen));
-            waiting.append(&mut also_from);
-            return;
-        }
-        // bpv1-10: validate canonical coding tuple against the local
-        // profile BEFORE scheduling any headerchain admission work!
+        // bpv1-10: validate the canonical coding tuple of every copy against
+        // the local profile BEFORE scheduling any headerchain admission work.
         if self
             .config
             .profile
@@ -1666,21 +1760,80 @@ impl BlockTable {
                 session_gen,
                 row: Bpv1CloseRow::Row4BadMetaOrCommitment,
             });
-            reject_also(step, block_id, &also_from);
+            return;
+        }
+        // A block still admitting or pending records this sender, so
+        // whatever ends the entry also answers this session.
+        let sender = (from_peer, session_gen);
+        let admitting_room = MAX_ADMITTING_META_BYTES.saturating_sub(self.admitting_bytes());
+        if let Some(entry) = self.admitting.get_mut(&block_id) {
+            entry
+                .later
+                .record(&entry.envelope, envelope, sender, admitting_room);
+            return;
+        }
+        let pending_room = MAX_PENDING_META_BYTES.saturating_sub(self.pending_bytes);
+        if let Some(entry) = self.pending.get_mut(&block_id) {
+            let charged = entry
+                .later
+                .record(&entry.envelope, envelope, sender, pending_room);
+            self.pending_bytes += charged;
+            return;
+        }
+        self.start_admission(arrived_at, envelope, sender, LaterCopies::default(), step);
+    }
+
+    /// Queues headerchain admission for `envelope`, which `from` sent first,
+    /// with the copies `later` that other sessions sent.
+    fn start_admission(
+        &mut self,
+        arrived_at: Instant,
+        envelope: Box<MetaEnvelope>,
+        from: (NodeId, u64),
+        mut later: LaterCopies,
+        step: &mut BlockStep,
+    ) {
+        let block_id = envelope.block_id;
+        let (from_peer, session_gen) = from;
+        // A block admitted meanwhile already answered every sender.
+        if self.blocks.contains_key(&block_id) {
             return;
         }
         // Bound admitting count and bytes before queueing headerchain
         // admission. Pending metadata has its own budget, so headers with
         // unknown parents never take space from viable metadata (bpv1-75).
+        // Alternate envelopes give way to a first copy that fits without
+        // them.
+        let needed = envelope.estimated_bytes();
+        let mut used = self.admitting_bytes();
+        let alternates: usize = self
+            .admitting
+            .values()
+            .map(|e| e.later.alternate_bytes())
+            .sum();
+        if self.admitting.len() < MAX_ADMITTING_META_COUNT
+            && (used - alternates).saturating_add(needed) <= MAX_ADMITTING_META_BYTES
+        {
+            used -= shed_alternates(
+                self.admitting.iter_mut().map(|(id, e)| (id, &mut e.later)),
+                used,
+                needed,
+                MAX_ADMITTING_META_BYTES,
+            );
+        }
         if self.admitting.len() >= MAX_ADMITTING_META_COUNT
-            || self
-                .admitting_bytes()
-                .saturating_add(envelope.estimated_bytes())
-                > MAX_ADMITTING_META_BYTES
+            || used.saturating_add(needed) > MAX_ADMITTING_META_BYTES
         {
             reject_meta(step, block_id, from_peer, session_gen);
-            reject_also(step, block_id, &also_from);
+            reject_later(step, block_id, &later);
             return;
+        }
+        if used
+            .saturating_add(needed)
+            .saturating_add(later.alternate_bytes())
+            > MAX_ADMITTING_META_BYTES
+        {
+            later.drop_alternate();
         }
         let work_id = alloc_work_id(&mut self.next_work_id);
         let header_bytes = envelope.header_bytes.clone();
@@ -1692,7 +1845,7 @@ impl BlockTable {
                 arrived_at,
                 from_peer,
                 session_gen,
-                also_from,
+                later,
                 height: None,
                 stage: AdmittingStage::WaitingHeader,
             },
@@ -1732,7 +1885,7 @@ impl BlockTable {
                 if !self.admissible_height(height) {
                     if let Some(removed) = self.admitting.remove(&block_id) {
                         reject_meta(step, block_id, removed.from_peer, removed.session_gen);
-                        reject_also(step, block_id, &removed.also_from);
+                        reject_later(step, block_id, &removed.later);
                     }
                     return;
                 }
@@ -1767,7 +1920,7 @@ impl BlockTable {
                         arrived_at: entry.arrived_at,
                         from_peer: entry.from_peer,
                         session_gen: entry.session_gen,
-                        also_from: entry.also_from,
+                        later: entry.later,
                         parent_hash,
                         received_at: now,
                     },
@@ -1779,10 +1932,10 @@ impl BlockTable {
                     .admitting
                     .remove(&block_id)
                     .expect("admitting entry verified present");
-                // `block_id` is the hash of the header bytes, so every session
-                // in `also_from` sent this same invalid header.
-                for (peer, session_gen) in
-                    std::iter::once((entry.from_peer, entry.session_gen)).chain(entry.also_from)
+                // `block_id` is the hash of the header bytes, so every later
+                // session sent this same invalid header, whatever its binding.
+                for (peer, session_gen) in std::iter::once((entry.from_peer, entry.session_gen))
+                    .chain(entry.later.sessions())
                 {
                     step.outputs.push(BlockOutput::ClosePeer {
                         peer,
@@ -1794,7 +1947,7 @@ impl BlockTable {
             HeaderAdmissionResult::LocalError => {
                 if let Some(removed) = self.admitting.remove(&block_id) {
                     reject_meta(step, block_id, removed.from_peer, removed.session_gen);
-                    reject_also(step, block_id, &removed.also_from);
+                    reject_later(step, block_id, &removed.later);
                 }
             }
         }
@@ -1804,7 +1957,7 @@ impl BlockTable {
     fn admitting_bytes(&self) -> usize {
         self.admitting
             .values()
-            .map(|e| e.envelope.estimated_bytes())
+            .map(AdmittingEntry::charged_bytes)
             .sum()
     }
 
@@ -1829,12 +1982,22 @@ impl BlockTable {
     fn insert_pending(
         &mut self,
         block_id: block::Hash,
-        entry: PendingMetaEntry,
+        mut entry: PendingMetaEntry,
         step: &mut BlockStep,
     ) {
         let bytes = entry.envelope.estimated_bytes();
         let (held, _) = self.pending_held_by(entry.from_peer);
         let mut admit = held < MAX_PENDING_META_PER_PEER;
+        if admit {
+            // Alternate envelopes give way to a first copy, before any
+            // first copy is evicted.
+            self.pending_bytes -= shed_alternates(
+                self.pending.iter_mut().map(|(id, e)| (id, &mut e.later)),
+                self.pending_bytes,
+                bytes,
+                MAX_PENDING_META_BYTES,
+            );
+        }
         while admit
             && (self.pending.len() >= MAX_PENDING_META_COUNT
                 || self.pending_bytes.saturating_add(bytes) > MAX_PENDING_META_BYTES)
@@ -1866,10 +2029,13 @@ impl BlockTable {
             step.events
                 .push(BlockEvent::MetaPendingDropped { block_id });
             reject_meta(step, block_id, entry.from_peer, entry.session_gen);
-            reject_also(step, block_id, &entry.also_from);
+            reject_later(step, block_id, &entry.later);
             return;
         }
-        self.pending_bytes = self.pending_bytes.saturating_add(bytes);
+        if self.pending_bytes.saturating_add(entry.charged_bytes()) > MAX_PENDING_META_BYTES {
+            entry.later.drop_alternate();
+        }
+        self.pending_bytes = self.pending_bytes.saturating_add(entry.charged_bytes());
         self.pending.insert(block_id, entry);
     }
 
@@ -1877,13 +2043,11 @@ impl BlockTable {
     /// session that sent it.
     fn drop_pending(&mut self, block_id: block::Hash, step: &mut BlockStep) {
         if let Some(entry) = self.pending.remove(&block_id) {
-            self.pending_bytes = self
-                .pending_bytes
-                .saturating_sub(entry.envelope.estimated_bytes());
+            self.pending_bytes = self.pending_bytes.saturating_sub(entry.charged_bytes());
             step.events
                 .push(BlockEvent::MetaPendingDropped { block_id });
             reject_meta(step, block_id, entry.from_peer, entry.session_gen);
-            reject_also(step, block_id, &entry.also_from);
+            reject_later(step, block_id, &entry.later);
         }
     }
 
@@ -1896,15 +2060,12 @@ impl BlockTable {
             .collect();
         for block_id in ready {
             if let Some(pending) = self.pending.remove(&block_id) {
-                self.pending_bytes = self
-                    .pending_bytes
-                    .saturating_sub(pending.envelope.estimated_bytes());
-                self.handle_meta_received(
+                self.pending_bytes = self.pending_bytes.saturating_sub(pending.charged_bytes());
+                self.start_admission(
                     pending.arrived_at,
                     pending.envelope,
-                    pending.from_peer,
-                    pending.session_gen,
-                    pending.also_from,
+                    (pending.from_peer, pending.session_gen),
+                    pending.later,
                     step,
                 );
             }
@@ -1935,14 +2096,7 @@ impl BlockTable {
             .expect("admitting entry verified present");
 
         if !ok {
-            step.outputs.push(BlockOutput::ClosePeer {
-                peer: entry.from_peer,
-                session_gen: entry.session_gen,
-                row: Bpv1CloseRow::Row4BadMetaOrCommitment,
-            });
-            // Another sender's envelope may differ under the same hash, so it is
-            // not faulted for this one's commitment.
-            reject_also(step, block_id, &entry.also_from);
+            self.handle_commitment_failed(block_id, entry, step);
             return;
         }
 
@@ -1951,13 +2105,13 @@ impl BlockTable {
         // in case `top` advanced while commitment verification was running.
         if !self.admissible_height(height) {
             reject_meta(step, block_id, entry.from_peer, entry.session_gen);
-            reject_also(step, block_id, &entry.also_from);
+            reject_later(step, block_id, &entry.later);
             return;
         }
         // All concurrent slots actively collecting: drop cleanly without faulting the peer.
         if !self.evict_for_slot(false, step) && !self.displace_for_next_block(height, step) {
             reject_meta(step, block_id, entry.from_peer, entry.session_gen);
-            reject_also(step, block_id, &entry.also_from);
+            reject_later(step, block_id, &entry.later);
             return;
         }
 
@@ -2000,6 +2154,73 @@ impl BlockTable {
         // An empty body has no stripes, so the block assembles from
         // `HeaderMeta` alone and no part crosses the wire for it.
         self.maybe_assemble_and_verify(now, block_id, step);
+    }
+
+    /// Closes every session that sent `entry`'s failed envelope with row 4,
+    /// then checks the alternate envelope, if the entry kept one (bpv1-61).
+    ///
+    /// The commitment check is a pure function of the envelope and the
+    /// admitted height, so each session whose copy equals the failed envelope
+    /// sent the failed commitment. A session whose copy differs is not
+    /// faulted for it: the block id hashes only the header. An honest relay
+    /// forwards only admitted metadata, so its copy passes.
+    fn handle_commitment_failed(
+        &mut self,
+        block_id: block::Hash,
+        entry: AdmittingEntry,
+        step: &mut BlockStep,
+    ) {
+        let AdmittingEntry {
+            arrived_at,
+            from_peer,
+            session_gen,
+            later,
+            height,
+            ..
+        } = entry;
+        for (peer, session_gen) in std::iter::once((from_peer, session_gen)).chain(later.same) {
+            step.outputs.push(BlockOutput::ClosePeer {
+                peer,
+                session_gen,
+                row: Bpv1CloseRow::Row4BadMetaOrCommitment,
+            });
+        }
+        let Some((envelope, senders)) = later.alternate else {
+            for &(peer, session_gen) in &later.unkept {
+                reject_meta(step, block_id, peer, session_gen);
+            }
+            return;
+        };
+        let height = height.unwrap_or(self.top);
+        let mut senders = senders.into_iter();
+        let (from_peer, session_gen) = senders
+            .next()
+            .expect("the session that sent the alternate envelope is recorded with it");
+        let work_id = alloc_work_id(&mut self.next_work_id);
+        self.work_to_block.insert(work_id, block_id);
+        self.admitting.insert(
+            block_id,
+            AdmittingEntry {
+                work_id,
+                envelope: envelope.clone(),
+                arrived_at,
+                from_peer,
+                session_gen,
+                later: LaterCopies {
+                    same: senders.collect(),
+                    alternate: None,
+                    unkept: later.unkept,
+                },
+                height: Some(height),
+                stage: AdmittingStage::WaitingCommitment,
+            },
+        );
+        step.outputs.push(BlockOutput::VerifyCommitment {
+            work_id,
+            block_id,
+            height,
+            envelope,
+        });
     }
 
     /// Frees a concurrent-block slot if every slot is taken.
@@ -2926,13 +3147,11 @@ impl BlockTable {
             .collect();
         for id in aged {
             if let Some(entry) = self.pending.remove(&id) {
-                self.pending_bytes = self
-                    .pending_bytes
-                    .saturating_sub(entry.envelope.estimated_bytes());
+                self.pending_bytes = self.pending_bytes.saturating_sub(entry.charged_bytes());
                 step.events
                     .push(BlockEvent::MetaPendingAged { block_id: id });
                 reject_meta(step, id, entry.from_peer, entry.session_gen);
-                reject_also(step, id, &entry.also_from);
+                reject_later(step, id, &entry.later);
             }
         }
 

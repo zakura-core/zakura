@@ -25,7 +25,7 @@ impl BlockTable {
         let recomputed_pending: usize = self
             .pending
             .values()
-            .map(|e| e.envelope.estimated_bytes())
+            .map(PendingMetaEntry::charged_bytes)
             .sum();
         assert_eq!(
             self.pending_bytes, recomputed_pending,

@@ -517,6 +517,12 @@ proptest! {
             // fix-6: only the floor bytes peers use leave the shared part.
             let floor_usage: u64 = leased.iter().map(|&bytes| bytes.min(floor)).sum();
             prop_assert_eq!(sub.share_of_s(ceiling), (ceiling - floor_usage) / 4);
+            // Rule 3 holds while a waiting peer is below its part.
+            let waiting_below = peers
+                .iter()
+                .enumerate()
+                .any(|(i, peer)| waiting[i] > 0 && sub.is_below_share(peer, ceiling));
+            prop_assert_eq!(sub.any_below_share_waiting_except(None, ceiling), waiting_below);
         }
 
         // Releasing, unwaiting and unregistering every peer empties the sub-pool.
@@ -1452,4 +1458,66 @@ async fn request_above_the_peer_cap_is_refused_at_once() {
     let refused = pool.acquire_serving(&p1, Some(1), MIB, 5 * MIB).await;
     assert_eq!(refused.unwrap_err(), LeaseDenied::CapExceeded);
     assert_eq!(pool.serving_total_leased(), 0);
+}
+
+/// A cancelled waiter of a peer below its part ends serving's peer-level
+/// rule 3, so a peer it held back wakes, even when nothing changes at the
+/// node level.
+#[tokio::test]
+async fn a_cancelled_below_share_peer_waiter_wakes_the_peer_it_held_back() {
+    // Serving and BlockSync each have a 2 MiB floor and an 8 MiB share of
+    // the 16 MiB `S`.
+    let pool = serving_pool(16 * MIB, |config| {
+        config.with_consumer(
+            Consumer::BlockSync,
+            ConsumerSpec::bulk(2 * MIB, 20 * MIB, 1),
+        )
+    });
+    let (p1, p2) = (serving_peer(1), serving_peer(2));
+    let _reg1 = pool.register_serving_connection(&p1, 2 * MIB);
+    let _reg2 = pool.register_serving_connection(&p2, 2 * MIB);
+
+    // Serving holds its whole 10 MiB share, all on peer 1, and BlockSync
+    // leaves 2 MiB of `S` free. Serving's ceiling is 12 MiB, so each peer's
+    // part is 2 MiB + (12 - 2) / 2 = 7 MiB: peer 1 is above its part.
+    let _p1_lease = pool
+        .try_acquire_serving(&p1, Some(1), 2 * MIB, 10 * MIB)
+        .expect("peer 1 borrows while peer 2 is idle");
+    let _block_sync = pool
+        .try_acquire(Consumer::BlockSync, Some(10), 8 * MIB)
+        .expect("block sync takes 6 MiB of S");
+    let snapshot = pool.snapshot();
+    assert_eq!(snapshot.shared_capacity - snapshot.shared_used, 2 * MIB);
+
+    // Peer 2, below its part, waits for 4 MiB that `S` doesn't have. Serving
+    // is at its node share, so node-level rule 3 holds nobody back.
+    let below = {
+        let pool = pool.clone();
+        let p2 = p2.clone();
+        tokio::spawn(async move { pool.acquire_serving(&p2, Some(2), 2 * MIB, 4 * MIB).await })
+    };
+    wait_until_waiting(&pool, Consumer::Serving).await;
+
+    // Peer 1's 1 MiB fits in `S`, but peer 2 waits below its part.
+    assert_eq!(
+        pool.try_acquire_serving(&p1, Some(1), 2 * MIB, MIB)
+            .unwrap_err(),
+        LeaseDenied::BelowShareWaiting
+    );
+    let held_back = {
+        let pool = pool.clone();
+        let p1 = p1.clone();
+        tokio::spawn(async move { pool.acquire_serving(&p1, Some(1), 2 * MIB, MIB).await })
+    };
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    assert!(!held_back.is_finished(), "peer 1 waits behind peer 2");
+
+    // Peer 2's waiter is cancelled. Peer 1's 1 MiB now fits.
+    below.abort();
+    let lease = joined(held_back, "peer 2's cancelled wait wakes peer 1")
+        .await
+        .expect("peer 1 gets its lease");
+    assert_eq!(lease.bytes(), MIB);
 }

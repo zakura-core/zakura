@@ -301,6 +301,14 @@ impl Wake {
         self.waiters[class.index()].contains(consumer)
     }
 
+    /// Whether this wakes any of `consumer`'s waiters or pollers.
+    pub fn wakes(&self, consumer: Consumer) -> bool {
+        WakeClass::ALL
+            .into_iter()
+            .any(|class| self.wakes_waiter(consumer, class))
+            || self.wakes_pollers(consumer)
+    }
+
     /// Whether this wakes `consumer`'s pollers.
     pub fn wakes_pollers(&self, consumer: Consumer) -> bool {
         self.pollers.contains(consumer)
@@ -1083,6 +1091,15 @@ impl PoolState {
         }
     }
 
+    /// Whether serving's peer-level rule 3 holds peers back: a serving peer
+    /// waits on contention below its part.
+    fn serving_rule3(&self) -> bool {
+        self.serving.has_waiting_peers()
+            && self
+                .serving
+                .any_below_share_waiting_except(None, serving_ceiling(&self.machine))
+    }
+
     fn add_slot(&mut self, slot: &WaitSlot) {
         self.machine
             .add_waiter(slot.consumer, slot.class, slot.node_contended);
@@ -1751,19 +1768,29 @@ impl MemoryPool {
 
     /// Run one critical section. `change` updates the pool state and records
     /// what it changed in `effects`. Then, under the same lock, the machine
-    /// decides whose waiters the change wakes: rule 3's state before the
-    /// change is read first, so a change that stops rule 3 holding consumers
-    /// back wakes them. Metrics, the overrun warning and wakeups apply after
-    /// unlocking.
+    /// decides whose waiters the change wakes: rule 3's state at both levels
+    /// is read before the change, so a change that stops rule 3 holding
+    /// consumers or serving peers back wakes them. Metrics, the overrun
+    /// warning and wakeups apply after unlocking.
     fn with_state<R>(&self, change: impl FnOnce(&mut PoolState, &mut Effects) -> R) -> R {
         let mut effects = Effects::default();
         let out = {
             let mut state = self.lock();
             let rule3_before = state.machine.any_below_share_waiting_except(None);
+            let serving_rule3_before = state.serving_rule3();
             let out = change(&mut state, &mut effects);
-            let wake = state
+            // Peers that serving's rule 3 held back gained room.
+            let serving_freed = serving_rule3_before && !state.serving_rule3();
+            let released_by = match effects.released_by {
+                None if serving_freed => Some(Consumer::Serving),
+                released_by => released_by,
+            };
+            let mut wake = state
                 .machine
-                .wake(effects.released_by, effects.freed_shared, rule3_before);
+                .wake(released_by, effects.freed_shared, rule3_before);
+            if serving_freed && !wake.wakes(Consumer::Serving) {
+                wake.merge(state.machine.wake(Some(Consumer::Serving), false, false));
+            }
             effects.wake.merge(wake);
             out
         };

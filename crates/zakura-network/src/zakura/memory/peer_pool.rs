@@ -184,12 +184,28 @@ impl PeerSubPool {
             .is_some_and(|state| state.is_below_share(self.share_of_s(ceiling)))
     }
 
-    /// Whether a peer other than `peer` waits on contention below its share.
-    fn other_below_share_waiting(&self, peer: &ZakuraPeerId, share_of_s: u64) -> bool {
+    /// Whether any peer waits on contention.
+    #[inline]
+    pub(crate) fn has_waiting_peers(&self) -> bool {
+        self.waiting_peers > 0
+    }
+
+    /// Whether a peer other than `skip` waits on contention below its share
+    /// at `ceiling`. Such a waiter holds every other peer at or above its
+    /// share to it (rule 3).
+    pub(crate) fn any_below_share_waiting_except(
+        &self,
+        skip: Option<&ZakuraPeerId>,
+        ceiling: u64,
+    ) -> bool {
+        self.below_share_waiting_except(skip, self.share_of_s(ceiling))
+    }
+
+    fn below_share_waiting_except(&self, skip: Option<&ZakuraPeerId>, share_of_s: u64) -> bool {
         self.waiting_peers > 0
             && self.peers.iter().any(|(key, state)| {
                 state.waiters > 0
-                    && key.peer().as_bytes() != peer.as_bytes()
+                    && skip.is_none_or(|skip| key.peer().as_bytes() != skip.as_bytes())
                     && state.is_below_share(share_of_s)
             })
     }
@@ -221,7 +237,7 @@ impl PeerSubPool {
             reachable: state.cap,
             can_borrow: true,
             long_lived: false,
-            other_below_share_waiting: self.other_below_share_waiting(peer, share_of_s),
+            other_below_share_waiting: self.below_share_waiting_except(Some(peer), share_of_s),
         })
         .map(|_| ())
     }

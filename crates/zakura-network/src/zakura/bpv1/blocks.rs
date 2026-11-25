@@ -336,6 +336,9 @@ pub enum ReleaseReason {
 pub struct PullPeerState {
     /// Remote peer identity.
     pub peer: NodeId,
+    /// Generation of the session this snapshot describes. A grant planned
+    /// from it goes to that session only, and its claims belong to it.
+    pub session_gen: u64,
     /// Bytes this peer currently owes from live `Want`s (including late ones).
     pub ahead_bytes: u64,
     /// Whether this peer is open, unparked, and below `MAX_WANTS_INFLIGHT`.
@@ -448,6 +451,10 @@ pub enum BlockInput {
     SessionEnded {
         /// Disconnected peer.
         peer: NodeId,
+        /// Generation of the ended session. Claims of this session and of
+        /// the peer's earlier sessions are released; a later session's
+        /// claims stay.
+        session_gen: u64,
         /// Remaining live peers for immediate re-planning.
         peer_states: Vec<PullPeerState>,
     },
@@ -481,10 +488,13 @@ pub enum BlockInput {
         /// Snapshot of live peers' pull capacities.
         peer_states: Vec<PullPeerState>,
     },
-    /// Release node-wide pull claims held by `peer`.
+    /// Release pull claims held by one session of `peer`.
     ReleaseClaims {
         /// Peer whose claims are being released.
         peer: NodeId,
+        /// Generation of the session that holds the claims. A claim that a
+        /// later session of `peer` holds stays (bpv1-63).
+        session_gen: u64,
         /// Target block.
         block_id: block::Hash,
         /// Target stripe.
@@ -656,10 +666,13 @@ pub enum BlockOutput {
         /// The admitted block descriptor.
         admitted: AdmittedBlock,
     },
-    /// Grant an arrival-ordered pull to `peer`'s `PeerState`.
+    /// Grant an arrival-ordered pull to one `PeerState` session of `peer`.
     GrantPull {
         /// Chosen pull server.
         peer: NodeId,
+        /// Generation of the session that the plan read, which owns the
+        /// grant's claims. No other session of `peer` takes the grant.
+        session_gen: u64,
         /// Block hash.
         block_id: block::Hash,
         /// Target stripe.
@@ -912,6 +925,8 @@ pub enum BlockEvent {
 
 /// One peer's grant while [`BlockTable`] plans a stripe.
 struct PlannedPull {
+    /// The session of the peer that the grant goes to.
+    session_gen: u64,
     requested: WantBitmap,
     /// Arrival estimate of the last part granted to this peer.
     arrival: Arrival,
@@ -1180,8 +1195,9 @@ struct StripeState {
     held_count: u32,
     /// Number of held source parts (`0..=k`).
     source_held_count: u32,
-    /// Active pull claim owner per stripe-relative slot.
-    claims: HashMap<u32, NodeId>,
+    /// Active pull claim owner per stripe-relative slot: the peer and the
+    /// generation of the session that took the grant.
+    claims: HashMap<u32, (NodeId, u64)>,
     /// Slots a peer sends unasked and has not delivered yet, with the sender:
     /// the proposer's flagged seeds (decision-19) or a holder's flagged
     /// pushes (decision-24). The first sender keeps the slot. They count as
@@ -1785,8 +1801,12 @@ impl BlockTable {
             BlockInput::MetaSessionEnded { peer, session_gen } => {
                 self.forget_meta_session((peer, session_gen));
             }
-            BlockInput::SessionEnded { peer, peer_states } => {
-                self.handle_session_ended(now, peer, &peer_states, &mut step);
+            BlockInput::SessionEnded {
+                peer,
+                session_gen,
+                peer_states,
+            } => {
+                self.handle_session_ended(now, (peer, session_gen), &peer_states, &mut step);
             }
             BlockInput::PeerBlockDone {
                 peer,
@@ -1812,6 +1832,7 @@ impl BlockTable {
             }
             BlockInput::ReleaseClaims {
                 peer,
+                session_gen,
                 block_id,
                 stripe,
                 slots,
@@ -1820,7 +1841,7 @@ impl BlockTable {
             } => {
                 self.handle_release_claims(
                     now,
-                    peer,
+                    (peer, session_gen),
                     block_id,
                     stripe,
                     &slots,
@@ -2922,7 +2943,7 @@ impl BlockTable {
     fn handle_session_ended(
         &mut self,
         now: Instant,
-        peer: NodeId,
+        (peer, session_gen): (NodeId, u64),
         peer_states: &[PullPeerState],
         step: &mut BlockStep,
     ) {
@@ -2941,7 +2962,11 @@ impl BlockTable {
                     set.remove(&peer);
                 }
                 let before = stripe.pending_count();
-                stripe.claims.retain(|_, owner| *owner != peer);
+                // Session generations only grow, so a later session of
+                // `peer` keeps its claims.
+                stripe
+                    .claims
+                    .retain(|_, &mut (owner, gen)| owner != peer || gen > session_gen);
                 stripe.incoming.retain(|_, pending| pending.sender != peer);
                 if stripe.pending_count() < before {
                     replan.push((block_id, s_idx as u32));
@@ -2994,7 +3019,7 @@ impl BlockTable {
     fn handle_release_claims(
         &mut self,
         now: Instant,
-        peer: NodeId,
+        (peer, session_gen): (NodeId, u64),
         block_id: block::Hash,
         stripe: u32,
         slots: &[u32],
@@ -3014,7 +3039,8 @@ impl BlockTable {
                 return;
             };
             for &slot in slots {
-                if st.claims.get(&slot) != Some(&peer) {
+                // bpv1-63: only the session that holds the claim releases it.
+                if st.claims.get(&slot) != Some(&(peer, session_gen)) {
                     continue;
                 }
                 if reason == ReleaseReason::Late {
@@ -3085,10 +3111,15 @@ impl BlockTable {
         let mut needed = coding.k - already;
 
         // Working `ahead` bytes and window per eligible peer, updated as this plan grants.
-        let mut room: HashMap<NodeId, (u64, u32)> = peer_states
+        let mut room: HashMap<NodeId, (u64, u32, u64)> = peer_states
             .iter()
             .filter(|ps| ps.can_pull && ps.window_remaining > 0)
-            .map(|ps| (ps.peer, (ps.ahead_bytes, ps.window_remaining)))
+            .map(|ps| {
+                (
+                    ps.peer,
+                    (ps.ahead_bytes, ps.window_remaining, ps.session_gen),
+                )
+            })
             .collect();
         if room.is_empty() {
             return;
@@ -3117,7 +3148,7 @@ impl BlockTable {
                     if tried.contains(&peer) {
                         continue;
                     }
-                    let Some(&(ahead, window)) = room.get(&peer) else {
+                    let Some(&(ahead, window, _)) = room.get(&peer) else {
                         continue;
                     };
                     if window == 0 {
@@ -3142,12 +3173,15 @@ impl BlockTable {
                 break;
             };
 
-            st.claims.insert(slot, peer);
-            if let Some((ahead, window)) = room.get_mut(&peer) {
-                *ahead = ahead.saturating_add(part_bytes);
-                *window = window.saturating_sub(1);
-            }
+            let Some((ahead, window, session_gen)) = room.get_mut(&peer) else {
+                break;
+            };
+            *ahead = ahead.saturating_add(part_bytes);
+            *window = window.saturating_sub(1);
+            let session_gen = *session_gen;
+            st.claims.insert(slot, (peer, session_gen));
             let grant = grants.entry(peer).or_insert(PlannedPull {
+                session_gen,
                 requested: WantBitmap::EMPTY,
                 arrival,
             });
@@ -3165,6 +3199,7 @@ impl BlockTable {
         for (peer, grant) in grant_list {
             step.outputs.push(BlockOutput::GrantPull {
                 peer,
+                session_gen: grant.session_gen,
                 block_id,
                 stripe,
                 requested: grant.requested,

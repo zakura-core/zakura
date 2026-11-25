@@ -236,6 +236,7 @@ pub fn replay_bpv1_block_bytes(bytes: &[u8]) -> BlockReplaySummary {
             .iter()
             .map(|&p| PullPeerState {
                 peer: p,
+                session_gen: 1,
                 ahead_bytes: u64::from(b & 3) * 1_000,
                 can_pull: a & 0x80 == 0,
                 window_remaining: u32::from(b >> 6) + 1,
@@ -348,7 +349,11 @@ pub fn replay_bpv1_block_bytes(bytes: &[u8]) -> BlockReplaySummary {
                 peer,
                 session_gen: 1 + u64::from(b >> 1 & 1),
             },
-            10 => BlockInput::SessionEnded { peer, peer_states },
+            10 => BlockInput::SessionEnded {
+                peer,
+                session_gen: 2,
+                peer_states,
+            },
             11 => BlockInput::PeerBlockDone {
                 peer,
                 block_id: block.id,
@@ -365,8 +370,11 @@ pub fn replay_bpv1_block_bytes(bytes: &[u8]) -> BlockReplaySummary {
                 stripe: block.stripe(b),
                 peer_states,
             },
+            // `a` bit 7 names an earlier session than the one that holds the
+            // claims, which releases nothing (bpv1-63).
             14 => BlockInput::ReleaseClaims {
                 peer,
+                session_gen: 1 - u64::from(a >> 7),
                 block_id: block.id,
                 stripe: block.stripe(b >> 4),
                 slots: (0..4u32).filter(|i| b & (1 << i) != 0).collect(),

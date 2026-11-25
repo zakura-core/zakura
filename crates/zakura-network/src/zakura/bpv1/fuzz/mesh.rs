@@ -1101,7 +1101,14 @@ impl Mesh {
             let session_gen = session.state.session_gen();
             self.step_table(local, BlockInput::MetaSessionEnded { peer, session_gen });
             let peer_states = self.peer_states(local);
-            self.step_table(local, BlockInput::SessionEnded { peer, peer_states });
+            self.step_table(
+                local,
+                BlockInput::SessionEnded {
+                    peer,
+                    session_gen,
+                    peer_states,
+                },
+            );
         }
     }
 
@@ -1181,6 +1188,7 @@ impl Mesh {
         session.state.assert_invariants();
         self.summary.steps += 1;
         hit_peer_step(&mut self.summary.reached, &input, &step.outputs);
+        let session_gen = session.state.session_gen();
         let mut work: VecDeque<PeerOutput> = step.outputs.into();
         while let Some(output) = work.pop_front() {
             if let PeerOutput::ServeWant {
@@ -1209,7 +1217,7 @@ impl Mesh {
             }
             let remote = self.nodes[peer].id;
             let states = || self.peer_states(node);
-            match route_peer_output(remote, output, states) {
+            match route_peer_output(remote, session_gen, output, states) {
                 PeerRoute::Table(input) => self.step_table(node, input),
                 PeerRoute::Session(output) => self.session_output(node, peer, output),
             }
@@ -1431,7 +1439,7 @@ impl Mesh {
                         self.step_peer(node, to, input);
                     } else {
                         let states = || self.peer_states(node);
-                        if let Some(release) = refused_grant(peer, input, states) {
+                        if let Some(release) = refused_grant(peer, session_gen, input, states) {
                             self.step_table(node, release);
                         }
                     }

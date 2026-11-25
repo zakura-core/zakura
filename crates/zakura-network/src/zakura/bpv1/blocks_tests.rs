@@ -149,6 +149,7 @@ fn release(
         now,
         BlockInput::ReleaseClaims {
             peer,
+            session_gen: 1,
             block_id,
             stripe: 0,
             slots,
@@ -162,6 +163,7 @@ fn release(
 fn pull_state(peer: NodeId) -> PullPeerState {
     PullPeerState {
         peer,
+        session_gen: 1,
         ahead_bytes: 0,
         can_pull: true,
         window_remaining: 8,
@@ -1179,6 +1181,7 @@ fn scenario_peer_paths_under_connection_churn() {
                 now,
                 BlockInput::SessionEnded {
                     peer: drop_p,
+                    session_gen: 1,
                     peer_states: Vec::new(),
                 },
             );
@@ -1191,6 +1194,7 @@ fn scenario_peer_paths_under_connection_churn() {
             now,
             BlockInput::SessionEnded {
                 peer: p,
+                session_gen: 1,
                 peer_states: Vec::new(),
             },
         );
@@ -2397,6 +2401,85 @@ fn released_slot_moves_to_another_announcer_unless_refused() {
         }
         table.assert_invariants();
     }
+}
+
+/// bpv1-63, bpv1-89: a pull claim belongs to the session that took the
+/// grant. Session 2 of `p` replaces session 1 while session 1 still owes
+/// slot 0, and a repair round grants slot 0 to session 2. Session 1's
+/// `Refused` release and its `SessionEnded` then free nothing, so the table
+/// grants slot 0 to no one else while session 2's `Want` is live.
+#[test]
+fn a_replaced_sessions_release_keeps_the_replacements_claim() {
+    let coding = Profile::TINY.derive_coding(128, 2).unwrap();
+    let block_id = block::Hash([0xA4; 32]);
+    let (p, q) = (node_id(2), node_id(3));
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let t0 = Instant::now();
+    admit(&mut table, t0, block_id, coding, [0xA4; 32]);
+    observe(&mut table, t0, p, 5, 10_000_000);
+    observe(&mut table, t0, q, 40, 1_000_000);
+    announce(&mut table, t0, q, block_id, vec![0], &[]);
+    let s = announce(&mut table, t0, p, block_id, vec![0], &[pull_state(p)]);
+    assert_eq!(granted_slots(&s, p), vec![0], "session 1 claims slot 0");
+
+    let session_2 = PullPeerState {
+        session_gen: 2,
+        ..pull_state(p)
+    };
+    let live = [session_2, pull_state(q)];
+    let repair = t0 + stall_base(table.paths(), &coding);
+    let s = tick(&mut table, repair, &live);
+    assert!(s
+        .events
+        .contains(&BlockEvent::RepairRound { block_id, round: 1 }));
+    assert!(
+        s.outputs.iter().any(|o| matches!(
+            o,
+            BlockOutput::GrantPull { peer, session_gen: 2, .. } if *peer == p
+        )),
+        "the repair round grants slot 0 to session 2: {:?}",
+        s.outputs
+    );
+
+    let stale = table.step(
+        repair,
+        BlockInput::ReleaseClaims {
+            peer: p,
+            session_gen: 1,
+            block_id,
+            stripe: 0,
+            slots: vec![0],
+            reason: ReleaseReason::Refused,
+            peer_states: live.to_vec(),
+        },
+    );
+    assert!(stale.outputs.is_empty(), "{:?}", stale.outputs);
+    let ended = table.step(
+        repair,
+        BlockInput::SessionEnded {
+            peer: p,
+            session_gen: 1,
+            peer_states: live.to_vec(),
+        },
+    );
+    assert!(ended.outputs.is_empty(), "{:?}", ended.outputs);
+    table.assert_invariants();
+
+    // Session 2's own failure frees the slot for `q`.
+    let failed = table.step(
+        repair,
+        BlockInput::ReleaseClaims {
+            peer: p,
+            session_gen: 2,
+            block_id,
+            stripe: 0,
+            slots: vec![0],
+            reason: ReleaseReason::Failed,
+            peer_states: live.to_vec(),
+        },
+    );
+    assert_eq!(granted_slots(&failed, q), vec![0]);
+    table.assert_invariants();
 }
 
 /// Repair rounds repeat every `base × 2^r`,

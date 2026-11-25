@@ -30,10 +30,11 @@ pub(crate) enum PeerRoute {
     Session(PeerOutput),
 }
 
-/// Routes `output` of `peer`'s session. `peer_states` runs only for an
-/// output that the table plans pulls from.
+/// Routes `output` of `peer`'s session `session_gen`. `peer_states` runs
+/// only for an output that the table plans pulls from.
 pub(crate) fn route_peer_output(
     peer: NodeId,
+    session_gen: u64,
     output: PeerOutput,
     peer_states: impl FnOnce() -> Vec<PullPeerState>,
 ) -> PeerRoute {
@@ -80,6 +81,7 @@ pub(crate) fn route_peer_output(
             reason,
         } => BlockInput::ReleaseClaims {
             peer,
+            session_gen,
             block_id,
             stripe,
             slots,
@@ -105,6 +107,7 @@ pub(crate) fn route_peer_output(
             ..
         } => BlockInput::ReleaseClaims {
             peer,
+            session_gen,
             block_id,
             stripe,
             slots: unreceived_slots,
@@ -120,6 +123,7 @@ pub(crate) fn route_peer_output(
 pub(crate) fn pull_state(state: &PeerState, now: Instant) -> PullPeerState {
     PullPeerState {
         peer: state.remote_node(),
+        session_gen: state.session_gen(),
         ahead_bytes: state.outstanding_bytes(),
         can_pull: state.can_pull(now),
         window_remaining: state.window_remaining(),
@@ -234,13 +238,14 @@ pub(crate) fn route_block_output(output: BlockOutput) -> BlockRoute {
         }),
         BlockOutput::GrantPull {
             peer,
+            session_gen,
             block_id,
             stripe,
             requested,
             arrival,
         } => BlockRoute::Peer {
             peer,
-            session_gen: None,
+            session_gen: Some(session_gen),
             input: PeerInput::PullGranted(PullGranted {
                 block_id,
                 stripe,
@@ -288,19 +293,22 @@ pub(crate) fn route_block_output(output: BlockOutput) -> BlockRoute {
     }
 }
 
-/// The release that returns a grant's claims to `peer`'s table entry when
-/// no session took `input`, so slots never strand.
+/// The release that returns a grant's claims to the table when the
+/// session `session_gen` of `peer` that the grant names did not take
+/// `input`, so slots never strand.
 pub(crate) fn refused_grant(
     peer: NodeId,
+    session_gen: Option<u64>,
     input: PeerInput,
     peer_states: impl FnOnce() -> Vec<PullPeerState>,
 ) -> Option<BlockInput> {
-    let PeerInput::PullGranted(grant) = input else {
+    let (PeerInput::PullGranted(grant), Some(session_gen)) = (input, session_gen) else {
         return None;
     };
     let slots: Vec<u32> = grant.requested.iter().collect();
     (!slots.is_empty()).then(|| BlockInput::ReleaseClaims {
         peer,
+        session_gen,
         block_id: grant.block_id,
         stripe: grant.stripe,
         slots,

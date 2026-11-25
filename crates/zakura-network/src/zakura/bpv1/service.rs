@@ -362,8 +362,8 @@ impl SharedNode {
                 input,
             } => {
                 if let Err(input) = self.send_to(&peer, session_gen, input) {
-                    if let Some(release) = refused_grant(peer, input, || self.collect_peer_states())
-                    {
+                    let states = || self.collect_peer_states();
+                    if let Some(release) = refused_grant(peer, session_gen, input, states) {
                         self.drive(release);
                     }
                 }
@@ -1014,6 +1014,7 @@ impl Service for Bpv1Service {
 
         let snapshot = Arc::new(Mutex::new(PullPeerState {
             peer: peer_node,
+            session_gen,
             ahead_bytes: 0,
             can_pull: true,
             window_remaining: PULL_WINDOW,
@@ -1379,15 +1380,17 @@ impl Session {
     async fn run(&mut self, output: PeerOutput) -> bool {
         let node = &self.node;
         let peer = self.peer_node;
-        let output = match route_peer_output(peer, output, || node.collect_peer_states()) {
-            // The driver is the sole ordered executor of `BlockTable`
-            // transitions and their effects.
-            PeerRoute::Table(input) => {
-                node.drive(input);
-                return true;
-            }
-            PeerRoute::Session(output) => output,
-        };
+        let session_gen = self.state.session_gen();
+        let output =
+            match route_peer_output(peer, session_gen, output, || node.collect_peer_states()) {
+                // The driver is the sole ordered executor of `BlockTable`
+                // transitions and their effects.
+                PeerRoute::Table(input) => {
+                    node.drive(input);
+                    return true;
+                }
+                PeerRoute::Session(output) => output,
+            };
         match output {
             PeerOutput::SendControl(msg) => {
                 if let Some(block_id) = header_meta_trace_id(&msg) {
@@ -2089,7 +2092,9 @@ async fn run_peer_routine(
         // This session still releases its own pull claims.
         for output in end_step.outputs {
             if let PeerRoute::Table(input) =
-                route_peer_output(peer_node, output, || node.collect_peer_states())
+                route_peer_output(peer_node, session_gen, output, || {
+                    node.collect_peer_states()
+                })
             {
                 node.drive(input);
             }
@@ -2097,6 +2102,7 @@ async fn run_peer_routine(
     } else {
         node.drive(BlockInput::SessionEnded {
             peer: peer_node,
+            session_gen,
             peer_states: node.collect_peer_states(),
         });
     }
@@ -2637,6 +2643,7 @@ mod tests {
                 load: None,
                 snapshot: Arc::new(Mutex::new(PullPeerState {
                     peer,
+                    session_gen: 1,
                     ahead_bytes: 0,
                     can_pull: true,
                     window_remaining: PULL_WINDOW,

@@ -16,11 +16,12 @@ use super::{
     },
     blocks_tests::{commitment_ok, header_result},
     codec::encode_body,
-    peer::{PartAuth, PeerConfig, PeerInput, PeerOutput, PeerState},
+    peer::{PartAuth, PeerConfig, PeerInput, PeerOutput, PeerState, RecvWantEnd},
     peer_tests::{have_with, recv_meta, tiny},
     profile::Profile,
     route::{
-        pull_state, replay_admitted, route_block_output, route_peer_output, BlockRoute, PeerRoute,
+        pull_state, refused_grant, replay_admitted, route_block_output, route_peer_output,
+        BlockRoute, PeerRoute,
     },
     test_support::{make_envelope, node_id, TEST_TIP_HASH},
     wire::{Bpv1Message, HaveFlags},
@@ -102,7 +103,9 @@ impl Node {
         *self.session(peer) = session(peer, session_gen + 1);
         let states = self.peer_states();
         for output in end.outputs {
-            if let PeerRoute::Table(input) = route_peer_output(peer, output, || states.clone()) {
+            if let PeerRoute::Table(input) =
+                route_peer_output(peer, session_gen, output, || states.clone())
+            {
                 self.to_table.push_back(input);
             }
         }
@@ -110,8 +113,14 @@ impl Node {
             .step(now, BlockInput::MetaSessionEnded { peer, session_gen });
         if !replaced {
             let peer_states = self.peer_states();
-            self.table
-                .step(now, BlockInput::SessionEnded { peer, peer_states });
+            self.table.step(
+                now,
+                BlockInput::SessionEnded {
+                    peer,
+                    session_gen,
+                    peer_states,
+                },
+            );
         }
         for input in replay_admitted(&self.table) {
             self.to_session.push_back((peer, input));
@@ -146,6 +155,10 @@ impl Node {
                     });
                     if live {
                         self.to_session.push_back((peer, input));
+                    } else if let Some(release) =
+                        refused_grant(peer, session_gen, input, || self.peer_states())
+                    {
+                        self.to_table.push_back(release);
                     }
                 }
                 BlockRoute::Shell(_) => {}
@@ -163,13 +176,14 @@ impl Node {
                 if matches!(input, PeerInput::PullGranted(_)) {
                     self.grants.push(peer);
                 }
+                let session_gen = self.session_gen(peer);
                 let step = self.session(peer).step(now, input);
                 let states = self.peer_states();
                 for output in step.outputs {
                     if matches!(output, PeerOutput::ReleaseClaims { .. }) {
                         self.refusals += 1;
                     }
-                    match route_peer_output(peer, output, || states.clone()) {
+                    match route_peer_output(peer, session_gen, output, || states.clone()) {
                         PeerRoute::Table(input) => self.to_table.push_back(input),
                         PeerRoute::Session(output) => self.written.push((peer, output)),
                     }
@@ -340,6 +354,60 @@ fn later_sender_reconnecting_during_admission_gets_the_metadata() {
     );
     assert_eq!(node.wrote(q), (1, 1), "one HeaderMeta, then one Want");
     assert_eq!((node.grants_to(q), node.refusals), (1, 0));
+}
+
+/// bpv1-63, bpv1-89: a grant goes only to the session that the table
+/// planned it from. `p`'s `Have` reaches the table after session 2 replaced
+/// session 1, so the table plans from session 1's capacity. That grant comes
+/// back to the table, which grants session 2 from its own capacity. Session
+/// 2's `Want` then ends without the part, and its release frees the claim,
+/// so the slot moves to `q`.
+#[test]
+fn a_grant_planned_for_a_replaced_session_returns_to_the_table() {
+    let block_id = block::Hash([0x64; 32]);
+    let (p, q) = (node_id(2), node_id(3));
+    let mut node = Node::new(&[p, q]);
+    let received = node.receive_meta(q, block_id);
+    let header = admit_header(&mut node, &received);
+    admit(&mut node, &header, block_id);
+    node.pump();
+
+    // Session 1 announces part 0; the table reads it after session 2 opens.
+    let now = node.now;
+    let announced = node
+        .session(p)
+        .step(now, have_with(block_id, HaveFlags::Plain, vec![0]));
+    let states = node.peer_states();
+    for output in announced.outputs {
+        if let PeerRoute::Table(input) = route_peer_output(p, 1, output, || states.clone()) {
+            node.to_table.push_back(input);
+        }
+    }
+    node.reconnect(p, true);
+    node.pump();
+    let want_id = node
+        .written
+        .iter()
+        .find_map(|(to, o)| match o {
+            PeerOutput::SendControl(msg) if *to == p => match &**msg {
+                Bpv1Message::Want { want_id, .. } => Some(*want_id),
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("session 2 asks for part 0");
+
+    // `q` announces part 0 while session 2 holds the claim.
+    node.have(q, block_id);
+    assert_eq!(node.grants_to(q), 0, "session 2 holds part 0");
+
+    // Session 2's `Want` ends without the part.
+    node.to_session
+        .push_back((p, PeerInput::RecvWantEnd(RecvWantEnd { want_id, sent: 0 })));
+    node.pump();
+    assert_eq!(node.grants_to(q), 1, "part 0 moves to q");
+    assert_eq!(node.wrote(q), (0, 1));
+    node.table.assert_invariants();
 }
 
 /// bpv1-63, bpv1-89: a replaced session's stale proof result releases only its own

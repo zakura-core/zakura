@@ -3241,6 +3241,55 @@ async fn the_listeners_first_flight_fits_the_padded_allowance() {
     .unwrap();
 }
 
+/// DIAL-8: a hello whose first datagram meets a full send buffer is still
+/// padded. The driver parks that datagram before quinn-proto builds the
+/// second, waits for the socket, and only then adds the padding datagram,
+/// so the dial still completes in one round trip.
+#[tokio::test(start_paused = true)]
+async fn a_hello_that_meets_a_full_send_buffer_is_still_padded() {
+    tokio::time::timeout(SIM_TEST_TIMEOUT, async {
+        let net = sim_net();
+        let server =
+            serve_test_acceptor(sim_endpoint(&net, sim_addr(1)), &[ALPN], |_| Admit::Accept);
+        let client = sim_endpoint(&net, sim_addr(2));
+        assert!(net.fail_next_send(sim_addr(2), std::io::ErrorKind::WouldBlock));
+        let target = server.addr();
+        let dial = tokio::spawn(async move {
+            let result = client.connect(target, &[ALPN]).await;
+            (client, result)
+        });
+        let settle = || async {
+            for _ in 0..10_000 {
+                tokio::task::yield_now().await;
+            }
+        };
+        let deliver_from = |src: SocketAddr| {
+            for id in net.deliverable() {
+                if id.link.src == src {
+                    net.deliver(id).unwrap();
+                }
+            }
+        };
+
+        settle().await;
+        assert_eq!(sent_lengths(&net, sim_addr(2)), [1200, 1200, 1200]);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        deliver_from(sim_addr(2));
+        settle().await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        deliver_from(sim_addr(1));
+        settle().await;
+        assert!(
+            dial.is_finished(),
+            "the dialer completed on the listener's first flight"
+        );
+        let (_client, result) = dial.await.unwrap();
+        result.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
 /// A listener from before the hybrid group, with ring's groups only, shares
 /// no group with a production dialer (TLS-9), so the dial fails.
 #[tokio::test(start_paused = true)]

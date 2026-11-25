@@ -178,10 +178,15 @@ where
             }
             // block broadcasts inform other nodes about new blocks,
             // so our internal Grow or Reset state doesn't matter to them
-            let trusted_early = early.as_ref().is_some_and(|event| {
-                matches!(event.relay, zakura_rpc::EarlyBlockRelay::TrustedSubmission)
+            let complete_trusted_post = early.as_ref().is_some_and(|event| {
+                matches!(
+                    event.relay,
+                    zakura_rpc::EarlyBlockRelay::TrustedSubmission(
+                        zakura_rpc::TrustedBlockSource::CompletePost
+                    )
+                )
             });
-            let request = if is_block_submission && !trusted_early {
+            let request = if is_block_submission && !complete_trusted_post {
                 zn::Request::AdvertiseMinedBlock(block.clone())
             } else {
                 zn::Request::AdvertiseBlock(block.clone(), None)
@@ -210,7 +215,7 @@ where
         zakura_rpc::EarlyBlockRelay::StateAdmission(admission) => {
             broadcast_state_authorized(network, request, admission, event.pending).await
         }
-        zakura_rpc::EarlyBlockRelay::TrustedSubmission => {
+        zakura_rpc::EarlyBlockRelay::TrustedSubmission(_) => {
             broadcast_trusted_with_timeout(network, request, event.pending).await
         }
     };

@@ -2,6 +2,7 @@
 
 #![allow(clippy::unwrap_in_result)]
 
+mod jobs;
 mod native;
 mod pow;
 mod wire;
@@ -100,12 +101,15 @@ struct Node {
     native_startup: Option<zakura_network::zakura::ZakuraHeaderSyncDriverStartup>,
     native_violations: mpsc::UnboundedReceiver<zakura_network::zakura::BlockSyncMisbehavior>,
     advertisements: mpsc::UnboundedReceiver<zakura_chain::block::Hash>,
+    pushed_blocks: mpsc::UnboundedReceiver<Vec<u8>>,
     state: State,
     verifier: Verifier,
     tip: zakura_state::LatestChainTip,
     pending: PendingBlockRegistry,
     bans: zakura_network::MisbehaviorReporter,
     gate: ValidationGate,
+    hold_proposal: watch::Sender<bool>,
+    deny_peer_state_read: watch::Sender<bool>,
     hold_relay: watch::Sender<bool>,
     held_relays: mpsc::UnboundedReceiver<HeldRelay>,
     hold_body: watch::Sender<bool>,
@@ -128,10 +132,10 @@ impl Drop for Node {
 
 impl Node {
     async fn new(seed: Option<SocketAddr>) -> Self {
-        Self::with_stack(seed, P2pStack::Legacy).await
+        Self::with_stack(seed, P2pStack::Legacy, PeerServices::NODE_NETWORK).await
     }
 
-    async fn with_stack(seed: Option<SocketAddr>, stack: P2pStack) -> Self {
+    async fn with_stack(seed: Option<SocketAddr>, stack: P2pStack, services: PeerServices) -> Self {
         let network = Network::new_regtest(
             ConfiguredActivationHeights {
                 nu5: Some(1),
@@ -142,6 +146,7 @@ impl Node {
         Self::with_network(
             seed,
             stack,
+            services,
             network,
             zakura_chain::block::genesis::regtest_genesis_block(),
         )
@@ -151,6 +156,7 @@ impl Node {
     async fn with_network(
         seed: Option<SocketAddr>,
         stack: P2pStack,
+        services: PeerServices,
         network: Network,
         genesis: Arc<Block>,
     ) -> Self {
@@ -198,6 +204,7 @@ impl Node {
                     body_authority.clone(),
                     &network,
                     &coordinator,
+                    Default::default(),
                 )
                 .await
                 .unwrap(),
@@ -213,6 +220,7 @@ impl Node {
             ),
             16,
         );
+        let (pushed, pushed_blocks) = mpsc::unbounded_channel();
         let (advertisement_tx, advertisements) = mpsc::unbounded_channel();
         let (hold_body, body_held) = watch::channel(false);
         let (body_requested, body_requests) = mpsc::unbounded_channel();
@@ -222,6 +230,11 @@ impl Node {
                 // Fixture bootstrap can advertise genesis before the submitted block.
                 if block.hash != genesis_hash {
                     let _ = advertisement_tx.send(block.hash);
+                }
+            }
+            if let Request::PushBlock(block, _) = &request {
+                if block.hash() != genesis_hash {
+                    let _ = pushed.send(block.zcash_serialize_to_vec().unwrap());
                 }
             }
             let body = matches!(&request, Request::BlocksByHash(_));
@@ -256,6 +269,7 @@ impl Node {
                 bootstrap_peers: vec![],
                 ..Default::default()
             },
+            push_relayed_blocks: false,
             max_connections_per_ip: 8,
             ..Default::default()
         };
@@ -264,7 +278,7 @@ impl Node {
             inbound,
             tip.clone(),
             "trusted submission test".into(),
-            PeerServices::NODE_NETWORK,
+            services,
             vec![],
             native_startup.clone(),
         )
@@ -294,6 +308,7 @@ impl Node {
         let (failures, failures_rx) = mpsc::unbounded_channel();
         let gate_sender = held.clone();
         let real_verifier: Verifier = verifier.clone();
+        let (hold_proposal, proposal_gate) = watch::channel(false);
         let gated = tower::service_fn(move |request: VerifyRequest| {
             let verifier = real_verifier.clone();
             let mut held = gate_sender.subscribe();
@@ -304,9 +319,20 @@ impl Node {
                 request,
                 VerifyRequest::Commit(_) | VerifyRequest::CommitMined { .. }
             );
+            let mut proposal_gate = proposal_gate.clone();
+            let client_proposal = matches!(
+                request,
+                VerifyRequest::Prepare {
+                    source: zakura_consensus::PreparedCandidateSource::ClientProposal,
+                    ..
+                }
+            );
             let hash = request.block().hash();
             let verification = verifier.oneshot(request).boxed();
             async move {
+                if client_proposal {
+                    proposal_gate.wait_for(|held| !held).await.unwrap();
+                }
                 if commit {
                     entered.send(hash).unwrap();
                     while *held.borrow_and_update() {
@@ -371,13 +397,27 @@ impl Node {
             ));
             native_tasks.push(driver.abort_handle());
         }
+        let (deny_peer_state_read, deny_read) = watch::channel(false);
+        let peer_state: State = state.clone();
+        let peer_state = tower::service_fn(move |request: zakura_state::Request| {
+            let unavailable =
+                *deny_read.borrow() && matches!(request, zakura_state::Request::AnyChainBlock(_));
+            if unavailable {
+                futures::future::ready(Err::<zakura_state::Response, BoxError>(
+                    "peer block lookup unavailable".into(),
+                ))
+                .boxed()
+            } else {
+                peer_state.clone().oneshot(request).boxed()
+            }
+        });
         assert!(setup_tx
             .send(InboundSetupData {
                 address_book,
                 block_download_peer_set: peers.clone(),
                 block_verifier: gated.clone(),
                 mempool: pool.clone(),
-                state: state.clone(),
+                state: Buffer::new(peer_state, 16),
                 latest_chain_tip: tip.clone(),
                 network: network.clone(),
                 misbehavior: bans.clone(),
@@ -449,7 +489,8 @@ impl Node {
                 if let Request::AdvertiseMinedBlock(block) | Request::AdvertiseBlock(block, None) =
                     &request
                 {
-                    if held {
+                    // Startup gossip can announce genesis after the test enables the hold.
+                    if held && block.hash != genesis_hash {
                         let (release, released) = oneshot::channel();
                         let (finished, cancelled) = oneshot::channel();
                         relay_tx
@@ -492,11 +533,14 @@ impl Node {
             native_startup,
             native_violations,
             advertisements,
+            pushed_blocks,
             state,
             verifier: gated,
             tip,
             pending,
             bans,
+            hold_proposal,
+            deny_peer_state_read,
             gate: ValidationGate {
                 held,
                 entered: entered_rx,
@@ -565,7 +609,12 @@ fn faulty_body(block: &Block) -> Block {
 async fn trusted_rejection_cancels_held_relay_and_withdraws_body_before_peer_delivery() {
     let _init = zakura_test::init();
     let mut relay = Node::new(None).await;
-    let mut receiver = Node::new(Some(relay.p2p)).await;
+    let mut receiver = Node::with_stack(
+        Some(relay.p2p),
+        P2pStack::Legacy,
+        PeerServices::NODE_NETWORK | PeerServices::NODE_BLOCK_PUSH,
+    )
+    .await;
     relay.connected().await;
     receiver.connected().await;
     let valid = relay.template().await;
@@ -663,6 +712,7 @@ async fn trusted_rejection_cancels_held_relay_and_withdraws_body_before_peer_del
         panic!("the corrected body is fetched and committed by the receiver")
     };
     assert_eq!(fetched.zcash_serialize_to_vec().unwrap(), bytes);
+    assert!(receiver.pushed_blocks.try_recv().is_err());
     assert_eq!(relay.tip.best_tip_height(), Some(Height(0)));
     assert!(!retry.is_finished());
     relay.gate.release();
@@ -689,7 +739,12 @@ async fn faulty_trusted_block_bans_relay_and_closes_connections_then_valid_retry
     .await
     .unwrap();
     let observer = Buffer::new(observer, 4);
-    observer.clone().oneshot(Request::Peers).await.unwrap();
+    // A ping checks the socket even when the node has no addresses to advertise.
+    observer
+        .clone()
+        .oneshot(Request::Ping(Default::default()))
+        .await
+        .expect("the observer socket answers a ping before the ban");
     let valid = relay.template().await;
     let invalid = faulty_body(&valid);
     relay.gate.hold();
@@ -700,11 +755,14 @@ async fn faulty_trusted_block_bans_relay_and_closes_connections_then_valid_retry
         true,
     ));
     assert_eq!(relay.gate.entered().await, invalid.hash());
+    let genesis_request =
+        Request::BlocksByHash([receiver.network.genesis_hash()].into_iter().collect());
     timeout(Duration::from_secs(20), async {
         while !receiver.bans.is_banned(relay.p2p.ip()) {
-            // Poll the production inbound service while its download completes.
-            let _ = observer.clone().oneshot(Request::Peers).await;
-            tokio::task::yield_now().await;
+            // The inbound service reports completed downloads when it is polled.
+            // Genesis is already in the fixture's state, so this request gets a reply.
+            let _ = observer.clone().oneshot(genesis_request.clone()).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
@@ -714,10 +772,15 @@ async fn faulty_trusted_block_bans_relay_and_closes_connections_then_valid_retry
     assert!(!submission.is_finished());
     timeout(Duration::from_secs(10), async {
         loop {
-            if observer.clone().oneshot(Request::Peers).await.is_err() {
+            if observer
+                .clone()
+                .oneshot(Request::Ping(Default::default()))
+                .await
+                .is_err()
+            {
                 break;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
@@ -790,8 +853,10 @@ async fn faulty_trusted_block_bans_relay_and_closes_connections_then_valid_retry
     .unwrap();
     let progress_peer = Buffer::new(progress_peer, 4);
     timeout(Duration::from_secs(20), async {
+        // Wait on the tip, not a `Peers` round trip: a node with no gossipable
+        // addresses cached yet sends no reply, so one probe can outlast this timeout.
         while fresh_receiver.tip.best_tip_hash() != Some(valid.hash()) {
-            progress_peer.clone().oneshot(Request::Peers).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
@@ -829,7 +894,7 @@ async fn faulty_trusted_block_bans_relay_and_closes_connections_then_valid_retry
     .expect("the descendant is announced while its local validation is held");
     timeout(Duration::from_secs(20), async {
         while fresh_receiver.tip.best_tip_hash() != Some(child.hash()) {
-            progress_peer.clone().oneshot(Request::Peers).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
@@ -851,7 +916,11 @@ async fn faulty_trusted_block_bans_relay_and_closes_connections_then_valid_retry
     assert_eq!(relay.tip.best_tip_height(), Some(Height(2)));
     assert!(relay.pending.get(child.hash()).is_none());
     assert!(!fresh_receiver.bans.is_banned(relay.p2p.ip()));
-    progress_peer.clone().oneshot(Request::Peers).await.unwrap();
+    progress_peer
+        .clone()
+        .oneshot(Request::Ping(Default::default()))
+        .await
+        .expect("the recovery observer socket still answers a ping");
 }
 
 /// The documented pool workflow forwards the original byte buffer only on acceptance.
@@ -956,8 +1025,8 @@ async fn trusted_relay_after_gbt_validation() {
 #[tokio::test(flavor = "multi_thread")]
 async fn faulty_trusted_block_over_v2_compatibility_is_rejected_without_legacy_ip_ban() {
     let _init = zakura_test::init();
-    let mut relay = Node::with_stack(None, P2pStack::Dual).await;
-    let mut receiver = Node::with_stack(None, P2pStack::Dual).await;
+    let mut relay = Node::with_stack(None, P2pStack::Dual, PeerServices::NODE_NETWORK).await;
+    let mut receiver = Node::with_stack(None, P2pStack::Dual, PeerServices::NODE_NETWORK).await;
     let relay_endpoint = relay.endpoint.as_ref().unwrap();
     let receiver_endpoint = receiver.endpoint.as_ref().unwrap();
     let dial = relay_endpoint.spawn_native_dial(receiver_endpoint.node_addr().await);
@@ -1430,15 +1499,30 @@ async fn http(
     content_type: &str,
     bytes: Vec<u8>,
 ) -> (StatusCode, Vec<u8>) {
+    http_with_job(address, auth, path, content_type, bytes, None).await
+}
+
+async fn http_with_job(
+    address: SocketAddr,
+    auth: &str,
+    path: &str,
+    content_type: &str,
+    bytes: Vec<u8>,
+    job: Option<&str>,
+) -> (StatusCode, Vec<u8>) {
     timeout(Duration::from_secs(9 * 60), async {
         let stream = tokio::net::TcpStream::connect(address).await.unwrap();
         let (mut client, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
             .await
             .unwrap();
         let task = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(connection));
+        let mut builder = HttpRequest::post(path);
+        if let Some(id) = job {
+            builder = builder.header("X-Job-Id", id);
+        }
         let response = client
             .send_request(
-                HttpRequest::post(path)
+                builder
                     .header("Host", address.to_string())
                     .header("Authorization", auth)
                     .header("Content-Type", content_type)

@@ -64,7 +64,7 @@ use zakura_chain::{
             block_subsidy, founders_reward, funding_stream_values, is_zip234_active, miner_subsidy,
             parent_nsm_value_balance, FundingStreamReceiver,
         },
-        ConsensusBranchId, Network, NetworkUpgrade,
+        ConsensusBranchId, Network, NetworkUpgrade, GENESIS_PREVIOUS_BLOCK_HASH,
     },
     serialization::{BytesInDisplayOrder, Duration32, ZcashDeserialize, ZcashSerialize},
     subtree::NoteCommitmentSubtreeIndex,
@@ -121,6 +121,7 @@ use types::{
             ZCASHD_FUNDING_STREAM_ORDER,
         },
         proposal::proposal_block_from_template,
+        synced_to_tip,
         trace::{next_request_id, BuildTimes, MiningTemplateTrace, WaitReason},
         BlockTemplateResponse, BlockTemplateTimeSource, GetBlockTemplateHandler,
         GetBlockTemplateParameters, GetBlockTemplateResponse, TemplateBuildWork,
@@ -131,6 +132,7 @@ use types::{
     get_raw_mempool::{self, GetRawMempoolResponse},
     get_standard_fee::GetStandardFeeResponse,
     long_poll::LongPollInput,
+    miner_mesh_info::{GetMinerMeshInfoResponse, MeshNode, MinerMeshSources},
     network_info::{GetNetworkInfoResponse, NetworkInfo},
     peer_info::PeerInfo,
     submit_block::{
@@ -251,6 +253,7 @@ pub(crate) const RPC_METHOD_ACCESS: &[(&str, RpcAccess)] = &[
     ("invalidateblock", RpcAccess::Admin),
     ("reconsiderblock", RpcAccess::Admin),
     ("preciousblock", RpcAccess::Admin),
+    ("getminermeshinfo", RpcAccess::Admin),
     ("generate", RpcAccess::Test),
     ("addnode", RpcAccess::Test),
     ("rpc.discover", RpcAccess::Unauthenticated),
@@ -295,6 +298,8 @@ pub(super) const PARAM_VERBOSITY_DESC: &str = "Whether to include verbose output
 pub(super) const PARAM_N_DESC: &str = "The output index in the transaction.";
 pub(super) const PARAM_INCLUDE_MEMPOOL_DESC: &str =
     "Whether to include mempool transactions in the response.";
+pub(super) const RESULT_GETMINERMESHINFO_DESC: &str =
+    "The node's miner mesh window, ranked gateways, connection slots, and registered peers.";
 pub(super) const RESULT_PRECIOUSBLOCK_DESC: &str =
     "Always null. Errors are returned as JSON-RPC errors.";
 
@@ -829,6 +834,34 @@ pub trait RpcServer {
     #[method(name = "getpeerinfo")]
     async fn get_peer_info(&self) -> Result<Vec<PeerInfo>>;
 
+    /// Returns this node's view of the miner mesh.
+    ///
+    /// The response is a [`GetMinerMeshInfoResponse`] JSON struct: the
+    /// gateways recent blocks name, the connection places this node holds for
+    /// the best of them, and its v2 peers.
+    ///
+    /// Zakura-specific.
+    /// method: post
+    /// tags: network
+    ///
+    /// # Notes
+    ///
+    /// A mining node counts the gateways that recent best-chain coinbases
+    /// name, and while it is synced, v2 networking holds up to ten connection
+    /// places that ordinary peers cannot fill for the highest-ranked gateways
+    /// it can reach. Each gateway's `state` is `preferred` when it may fill a
+    /// held place, `standby` when it is reachable but ranked below those,
+    /// `backoff` when it is known but waiting out a failed dial or a lost
+    /// connection, and `unmatched` when v2 networking has no usable dial address for it.
+    ///
+    /// `synced` is evaluated at request time. The ranking and held places reflect
+    /// the last update applied by networking and can lag a change in tip freshness.
+    ///
+    /// `window` is null on a node that does not mine, and `slots` is null on
+    /// a node that runs no v2 networking.
+    #[method(name = "getminermeshinfo")]
+    async fn get_miner_mesh_info(&self) -> Result<GetMinerMeshInfoResponse>;
+
     /// Requests that a ping be sent to all other nodes, to measure ping time.
     ///
     /// Results provided in getpeerinfo, pingtime and pingwait fields are decimal seconds.
@@ -1061,6 +1094,9 @@ where
 
     /// The services this node sends in its legacy P2P handshake, reported by `getnetworkinfo`.
     local_services: PeerServices,
+
+    /// Where `getminermeshinfo` reads the miner mesh state.
+    miner_mesh: MinerMeshSources,
 
     // Services
     //
@@ -1434,6 +1470,7 @@ where
             rpc_surface: RpcSurface::Full,
             end_of_support_height: None,
             local_services: PeerServices::NODE_NETWORK,
+            miner_mesh: MinerMeshSources::default(),
             mempool: mempool.clone(),
             state: state.clone(),
             read_state: read_state.clone(),
@@ -2061,6 +2098,14 @@ where
         self
     }
 
+    /// Sets where `getminermeshinfo` reads the miner mesh state.
+    ///
+    /// When unset, it reports no counts and no v2 networking.
+    pub fn with_miner_mesh(mut self, miner_mesh: MinerMeshSources) -> Self {
+        self.miner_mesh = miner_mesh;
+        self
+    }
+
     /// Sets the end-of-support height reported by `getdeprecationinfo`.
     ///
     /// When unset, or set to `None`, the RPC omits `end_of_service`.
@@ -2342,6 +2387,9 @@ where
             estimated_height,
             chain_supply: GetBlockchainInfoBalance::chain_supply(value_balance),
             value_pools: GetBlockchainInfoBalance::value_pools(value_balance, None),
+            nsm_value_balance: nsm_value_balance_zat
+                .and_then(|balance| balance.constrain().ok())
+                .map(|balance| GetBlockchainInfoBalance::nsm(network, tip_height, balance, None)),
             nsm_value_balance_zat,
             upgrades,
             consensus,
@@ -2646,15 +2694,31 @@ where
                 unreachable!("unmatched response to a BlockInfo request");
             };
 
+            // The parent's balances can be missing if it left the non-finalized state between
+            // the two reads. Then the change is unknown, except before genesis, where it is zero.
             let delta = block_info.as_ref().and_then(|d| {
                 let value_pools = d.value_pools().constrain::<NegativeAllowed>().ok()?;
-                let prev_value_pools = prev_block_info
-                    .map(|d| d.value_pools().constrain::<NegativeAllowed>())
-                    .unwrap_or(Ok(ValueBalance::<NegativeAllowed>::zero()))
-                    .ok()?;
+                let prev_value_pools = match prev_block_info {
+                    Some(prev) => prev.value_pools().constrain::<NegativeAllowed>().ok()?,
+                    None if previous_block_hash == GENESIS_PREVIOUS_BLOCK_HASH => {
+                        ValueBalance::<NegativeAllowed>::zero()
+                    }
+                    None => return None,
+                };
                 (value_pools - prev_value_pools).ok()
             });
             let size = size.or(block_info.as_ref().map(|d| d.size() as usize));
+            let nsm_value_balance = block_info.as_ref().and_then(|d| {
+                let balance = d
+                    .value_pools()
+                    .nsm_value_balance_amount()
+                    .constrain()
+                    .ok()?;
+                let change = delta.map(|delta| delta.nsm_value_balance_amount());
+                Some(GetBlockchainInfoBalance::nsm(
+                    &network, height, balance, change,
+                ))
+            });
 
             Ok(GetBlockResponse::Object(Box::new(BlockObject {
                 hash,
@@ -2673,6 +2737,7 @@ where
                 chain_supply: block_info
                     .as_ref()
                     .map(|d| GetBlockchainInfoBalance::chain_supply(*d.value_pools())),
+                nsm_value_balance,
                 value_pools: block_info
                     .map(|d| GetBlockchainInfoBalance::value_pools(*d.value_pools(), delta)),
                 size: size.map(|size| size as i64),
@@ -4177,6 +4242,29 @@ where
             .collect())
     }
 
+    async fn get_miner_mesh_info(&self) -> Result<GetMinerMeshInfoResponse> {
+        let MinerMeshSources { coverage, endpoint } = &self.miner_mesh;
+        let miner_params = self.gbt.miner_params();
+        let node = MeshNode {
+            node_id: endpoint
+                .as_ref()
+                .map(|endpoint| *endpoint.local_node_id().as_bytes()),
+            announcing: miner_params.is_some_and(|params| params.mesh_commitment().is_some()),
+            mining: miner_params.is_some(),
+            synced: synced_to_tip(&self.network, &self.latest_chain_tip).is_ok(),
+        };
+        let places = endpoint
+            .as_ref()
+            .map(|endpoint| endpoint.connection_places());
+        let coverage = coverage.as_ref().map(|coverage| coverage.borrow().clone());
+
+        Ok(GetMinerMeshInfoResponse::new(
+            node,
+            coverage.as_ref(),
+            places.as_ref(),
+        ))
+    }
+
     async fn ping(&self) -> Result<()> {
         tracing::debug!("Receiving ping request via RPC");
 
@@ -4969,6 +5057,16 @@ pub struct GetBlockchainInfoResponse {
     #[getset(get = "pub")]
     value_pools: BlockchainValuePoolBalances,
 
+    /// The NSM value balance after the tip, in the same shape as a `valuePools` entry. Absent
+    /// when `nsm_value_balance_zat` is.
+    #[serde(
+        rename = "nsmValueBalance",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[getset(get = "pub")]
+    nsm_value_balance: Option<GetBlockchainInfoBalance>,
+
     /// The ZIP 234 NSM value balance, in zatoshis.
     ///
     /// This is an accounting counter rather than a pool of spendable value: it tracks
@@ -5157,6 +5255,7 @@ impl Default for GetBlockchainInfoResponse {
             estimated_height: Height(1),
             chain_supply: GetBlockchainInfoBalance::chain_supply(Default::default()),
             value_pools: GetBlockchainInfoBalance::zero_pools(),
+            nsm_value_balance: None,
             nsm_value_balance_zat: None,
             upgrades: IndexMap::new(),
             consensus: TipConsensusBranch {
@@ -5208,6 +5307,7 @@ impl GetBlockchainInfoResponse {
             value_pools,
             // Left unset so this constructor's signature stays stable; callers that
             // report the ZIP 234 counter set it with `with_nsm_value_balance_zat`.
+            nsm_value_balance: None,
             nsm_value_balance_zat: None,
             upgrades,
             consensus,
@@ -5544,6 +5644,7 @@ impl Default for GetBlockResponse {
             difficulty: None,
             chain_supply: None,
             value_pools: None,
+            nsm_value_balance: None,
             previous_block_hash: None,
             next_block_hash: None,
             solution: None,
@@ -5669,6 +5770,16 @@ pub struct BlockObject {
     )]
     #[getset(get = "pub")]
     value_pools: Option<BlockchainValuePoolBalances>,
+
+    /// The NSM value balance after this block and the block's change to it, in the same shape
+    /// as a `valuePools` entry.
+    #[serde(
+        rename = "nsmValueBalance",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[getset(get = "pub")]
+    nsm_value_balance: Option<GetBlockchainInfoBalance>,
 
     /// Information about the note commitment trees.
     #[getset(get_copy = "pub")]
@@ -6414,4 +6525,4 @@ pub enum AddNodeCommand {
 pub struct GetTxOutResponse(Option<types::transaction::OutputObject>);
 
 mod submission_lifecycle;
-mod trusted_block;
+pub(crate) mod trusted_block;

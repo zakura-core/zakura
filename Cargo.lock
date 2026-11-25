@@ -123,7 +123,7 @@ dependencies = [
  "regex",
  "rustc-hash",
  "shlex",
- "syn 2.0.118",
+ "syn 3.0.10",
 ]
 
 [[package]]
@@ -2994,7 +2994,7 @@ dependencies = [
 
 [[package]]
 name = "zakura"
-version = "1.9.0-rc1"
+version = "1.9.0-rc2"
 dependencies = [
  "base64",
  "bytes",
@@ -3065,9 +3065,9 @@ dependencies = [
 
 [[package]]
 name = "zakura-assets"
-version = "0.3591046.0"
+version = "0.3601446.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e922772f6f73b5ed73cab51668f0031cad5522fa967999ea231b2d4514b678c6"
+checksum = "dd3dcf05d3e9eb5486fcb640afdb013837e3b3e5eb91153cb33e452e0b4d1d1c"
 
 [[package]]
 name = "zakura-bellman"
@@ -3645,6 +3645,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "sha2",
  "subtle",
  "tempfile",
  "thiserror",

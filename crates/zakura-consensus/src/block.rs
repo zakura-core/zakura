@@ -40,6 +40,7 @@ mod receipt;
 pub mod request;
 pub mod subsidy;
 
+pub use receipt::{AnnouncementClaims, PendingClaims};
 pub use request::{PreparedCandidateSource, Request};
 
 #[cfg(test)]
@@ -63,6 +64,7 @@ pub struct SemanticBlockVerifier<S, V> {
     transaction_verifier: V,
     prepared_candidates: prepared::PreparedCandidateCache,
     receipt_orders: receipt::ReceiptRegistry,
+    committed_chains: Option<zs::WatchReceiver<zs::NonFinalizedState>>,
 }
 
 /// Block verification errors.
@@ -401,7 +403,10 @@ where
     V: Service<tx::Request, Response = tx::Response, Error = BoxError> + Send + Clone + 'static,
     V::Future: Send + 'static,
 {
-    /// Creates a new SemanticBlockVerifier
+    /// Creates a new SemanticBlockVerifier.
+    ///
+    /// It holds no announcement claims, so every block is ranked by the arrival of its body
+    /// until [`Self::with_announcement_claims`] supplies the table header sync writes to.
     pub fn new(network: &Network, state_service: S, transaction_verifier: V) -> Self {
         Self {
             network: network.clone(),
@@ -409,7 +414,20 @@ where
             transaction_verifier,
             prepared_candidates: Default::default(),
             receipt_orders: Default::default(),
+            committed_chains: None,
         }
+    }
+
+    /// Ranks blocks by the claims in `claims`, which header sync creates as it admits headers.
+    /// The published chains identify blocks already present when a miner submits a body.
+    pub fn with_announcement_claims(
+        mut self,
+        claims: AnnouncementClaims,
+        committed_chains: zs::WatchReceiver<zs::NonFinalizedState>,
+    ) -> Self {
+        self.committed_chains = Some(committed_chains);
+        self.receipt_orders = receipt::ReceiptRegistry::new(claims);
+        self
     }
 }
 
@@ -438,7 +456,20 @@ where
             Ok(hash) => hash,
             Err(error) => return async move { Err(BlockError::from(error).into()) }.boxed(),
         };
+        // Capture membership at submission. State can finish a peer's write before this
+        // request is first polled, even after the peer stopped waiting for it.
+        let new_mined_block = self.committed_chains.as_ref().filter(|chains| {
+            request.is_mined_commit()
+                && !chains.borrow_mapped(|state| state.any_chain_contains(&hash))
+        });
         let receipt = (!request.is_proposal()).then(|| self.receipt_orders.register(hash, &block));
+        let mined_record = match (new_mined_block, &receipt, block.coinbase_height()) {
+            (Some(chains), Some(receipt), Some(height)) => Some((
+                self.receipt_orders.mark_mined(hash, height, receipt.order),
+                chains.clone(),
+            )),
+            _ => None,
+        };
         let mut state_service = self.state_service.clone();
         let mut transaction_verifier = self.transaction_verifier.clone();
         let network = self.network.clone();
@@ -891,6 +922,25 @@ where
             }
             .await;
 
+            // A duplicate describes this request. A racing peer may have committed the mined body.
+            if let Some((mined, chains)) = mined_record {
+                let duplicate = result
+                    .as_ref()
+                    .is_err_and(|error| error.is_duplicate_request());
+                if result.is_ok()
+                    || (duplicate
+                        && committed_mined_body(
+                            state_service.clone(),
+                            &chains,
+                            hash,
+                            request.block(),
+                        )
+                        .await)
+                {
+                    mined.keep();
+                }
+            }
+
             match result {
                 // Proposals never become body evidence, so they keep the first failure.
                 Err(error) if !request.is_proposal() => Err(confirm_auth_data_binding(
@@ -1034,6 +1084,37 @@ where
         zs::Response::PreparedMinedRelayEligibility(eligibility) => Ok(eligibility),
         _ => unreachable!("wrong response for prepared mined-block relay eligibility"),
     }
+}
+
+/// Confirms that state committed the exact locally submitted body. A competing writer can
+/// outlive its caller or still be pending when state answers the local request as a duplicate.
+async fn committed_mined_body<S>(
+    state: S,
+    chains: &zs::WatchReceiver<zs::NonFinalizedState>,
+    hash: block::Hash,
+    submitted: BlockHandle,
+) -> bool
+where
+    S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
+    S::Future: Send + 'static,
+{
+    let confirm = async {
+        if !matches!(
+            state.oneshot(zs::Request::AwaitBlockInfo(hash)).await,
+            Ok(zs::Response::BlockInfo(Some(_)))
+        ) {
+            return false;
+        }
+        // Only a block on a retained fork can need equal-work protection. Compare the body
+        // outside the snapshot lock so the state writer can continue publishing.
+        chains
+            .borrow_mapped(|state| state.block_by_hash(hash))
+            .is_some_and(|body| body == submitted)
+    };
+    // Any rival claim older than this submission expires within one body deadline.
+    tokio::time::timeout(receipt::CLAIM_BODY_DEADLINE, confirm)
+        .await
+        .unwrap_or(false)
 }
 
 async fn commit_prepared_block<S>(

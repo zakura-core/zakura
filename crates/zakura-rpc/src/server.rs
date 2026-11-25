@@ -297,6 +297,15 @@ impl RpcServer {
                     Box::pin(async move { rpc.submit_trusted_block(&bytes).await })
                 }) as trusted_block::Submit
             });
+        let trusted_jobs = conf.enable_trusted_block_submission.then(|| {
+            let rpc = rpc.clone();
+            let jobs = crate::methods::trusted_block::jobs::Jobs::default();
+            Arc::new(move |id, op, bytes| -> trusted_block::JobFuture {
+                let rpc = rpc.clone();
+                let jobs = jobs.clone();
+                Box::pin(async move { rpc.trusted_job(jobs, id, op, bytes).await })
+            }) as trusted_block::SubmitJob
+        });
         let rpc_service = RpcLoggerMiddleware::new(
             FixRpcResponseMiddleware::new(RpcMetricsMiddleware::new(RpcTracingMiddleware::new(
                 RpcService::new(rpc, enabled_methods, max_response_body_size),
@@ -312,7 +321,8 @@ impl RpcServer {
             ));
 
         let service =
-            trusted_block::TrustedBlockHttpService::new(service, auth_cookie, trusted_submit);
+            trusted_block::TrustedBlockHttpService::new(service, auth_cookie, trusted_submit)
+                .with_jobs(trusted_jobs);
 
         if let Some(tls) = conf.tls.clone() {
             let tls_config = load_tls_config(&tls)?;

@@ -23,10 +23,13 @@ mod tests;
 
 pub use methods::types::{
     get_block_template::{
-        fetch_chain_info, proposal::proposal_block_from_template, MinerAddress, MinerParams,
+        fetch_chain_info, proposal::proposal_block_from_template, synced_to_tip, MinerAddress,
+        MinerParams, NotSyncedToTip,
     },
+    miner_mesh_info::MinerMeshSources,
     submit_block::{
         EarlyBlockRelay, EarlyMinedBlock, EarlyMinedBlockChannel, MinedBlockSubmission,
         PendingBlockRegistration, PendingBlockRegistry, PendingBlockResolution, PendingBlockSignal,
+        TrustedBlockSource,
     },
 };

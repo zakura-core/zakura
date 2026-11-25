@@ -460,6 +460,45 @@ fn config_zakura_network_tcp_warmup_env() {
 }
 
 #[test]
+fn config_tcp_warmup_keeps_legacy_defaults_for_a_single_ping_size() {
+    let _env = EnvGuard::new();
+    let temp_dir = TempDir::new().expect("create temp dir");
+    let path = temp_dir.path().join("warmup.toml");
+
+    for (settings, first, max) in [
+        ("max_chunk_bytes = 500000", 14_000, 500_000),
+        ("first_chunk_bytes = 1800000", 1_800_000, 2_097_144),
+        ("enabled = true", 800_000, 1_600_000),
+        (
+            "first_chunk_bytes = 1000\nmax_chunk_bytes = 3000",
+            1000,
+            3000,
+        ),
+    ] {
+        fs::write(&path, format!("[network.tcp_warmup]\n{settings}\n"))
+            .expect("write warm-up config");
+        let warmup = ZakuradConfig::load(Some(path.clone()))
+            .expect("load warm-up config")
+            .network
+            .tcp_warmup;
+        assert_eq!(
+            (warmup.first_chunk_bytes, warmup.max_chunk_bytes),
+            (first, max)
+        );
+    }
+
+    fs::write(
+        &path,
+        "[network.tcp_warmup]\nfirst_chunk_bytes = 2000\nmax_chunk_bytes = 1000\n",
+    )
+    .expect("write an invalid warm-up config");
+    let error = ZakuradConfig::load(Some(path)).expect_err("reject an invalid size range");
+    assert!(error
+        .to_string()
+        .contains("first_chunk_bytes must not exceed max_chunk_bytes"));
+}
+
+#[test]
 fn config_zakura_tracing_log_file_env() {
     let env = EnvGuard::new();
 

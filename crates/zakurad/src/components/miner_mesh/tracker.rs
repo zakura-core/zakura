@@ -2,11 +2,12 @@
 
 use std::time::Duration;
 
-use tokio::task::JoinHandle;
+use tokio::{task::JoinHandle, time::Instant};
 use tower::Service;
 use tracing::{info, warn, Instrument};
 use zakura_chain::{
     block::{self, Height},
+    chain_tip::ChainTip,
     miner_mesh::{MinerSetSnapshot, RecentMinerSet},
     parameters::Network,
 };
@@ -14,16 +15,31 @@ use zakura_state::{ChainTipChange, ReadRequest, ReadResponse, TipAction, MAX_BLO
 
 use crate::BoxError;
 
-use super::chain_reads::{best_chain_hash, read_block};
+use super::{
+    chain_reads::{best_chain_hash, read_block},
+    ranking::RankingPublisher,
+};
 
 /// How long the tracker waits after a failed state read before it reads again.
 const READ_RETRY_DELAY: Duration = Duration::from_secs(5);
 
-/// Starts the task that counts the gateways named in recent best-chain blocks
-/// and reports the counts as metrics.
+/// How often the tracker publishes the ranking again when nothing else made it
+/// publish, so a node whose tip grows too old stops preferring gateways.
+pub(super) const REPUBLISH_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Starts the task that counts the gateways named in recent best-chain blocks,
+/// reports the counts as metrics and hands the ranking to `publisher`.
+///
+/// `local_gateway` is the node ID this node's own coinbases name, if it announces one. The
+/// tracker reports how many counted blocks name it.
 ///
 /// The task runs until the state stops publishing tip changes.
-pub fn spawn<S>(state: S, tip_change: ChainTipChange) -> JoinHandle<()>
+pub fn spawn<S, Tip>(
+    state: S,
+    tip_change: ChainTipChange,
+    local_gateway: Option<[u8; 32]>,
+    publisher: RankingPublisher<Tip>,
+) -> JoinHandle<()>
 where
     S: Service<ReadRequest, Response = ReadResponse, Error = BoxError>
         + Clone
@@ -31,13 +47,14 @@ where
         + Sync
         + 'static,
     S::Future: Send,
+    Tip: ChainTip + Send + Sync + 'static,
 {
     info!("counting the gateways that recent blocks name");
     let network = tip_change.network().clone();
     tokio::spawn(
         async move {
-            let mut tracker = Tracker::new(network, state);
-            run(&mut tracker, tip_change).await;
+            let mut tracker = Tracker::new(network, state).with_local_gateway(local_gateway);
+            run(&mut tracker, tip_change, &publisher).await;
         }
         .in_current_span(),
     )
@@ -49,30 +66,41 @@ enum Step {
     FollowTip(TipMove),
     /// Read the newest unread block in the window; no tip change is pending.
     Read(Height),
+    /// Publish again: nothing is left to read and no tip change came in time.
+    Republish,
 }
 
 /// Follows tip changes first and reads older blocks between them, until the
 /// state stops publishing tip changes.
 ///
-/// Metrics are recorded after each tip change and whenever the tracker has
-/// read all it can.
-pub(super) async fn run<S>(tracker: &mut Tracker<S>, mut tip_change: ChainTipChange)
-where
+/// The counts are reported, as metrics and to `publisher`, after each tip
+/// change, whenever the tracker has read all it can, and at least every
+/// [`REPUBLISH_INTERVAL`].
+pub(super) async fn run<S, Tip>(
+    tracker: &mut Tracker<S>,
+    mut tip_change: ChainTipChange,
+    publisher: &RankingPublisher<Tip>,
+) where
     S: Service<ReadRequest, Response = ReadResponse, Error = BoxError> + Clone + Send + 'static,
     S::Future: Send,
+    Tip: ChainTip,
 {
+    let mut republish_at = Instant::now();
     loop {
         let step = match (tip_change.last_tip_change(), tracker.next_unread()) {
             (Some(action), _) => Step::FollowTip(action.into()),
             (None, Some(height)) => Step::Read(height),
-            (None, None) => match tip_change.wait_for_tip_change().await {
-                Ok(action) => Step::FollowTip(action.into()),
-                // The state has shut down.
-                Err(_) => return,
+            (None, None) => tokio::select! {
+                action = tip_change.wait_for_tip_change() => match action {
+                    Ok(action) => Step::FollowTip(action.into()),
+                    // The state has shut down.
+                    Err(_) => return,
+                },
+                () = tokio::time::sleep_until(republish_at) => Step::Republish,
             },
         };
 
-        match step {
+        let report = match step {
             Step::FollowTip(tip) => {
                 if let Err(error) = tracker.follow_tip(tip).await {
                     warn!(
@@ -83,7 +111,7 @@ where
                     );
                     tokio::time::sleep(READ_RETRY_DELAY).await;
                 }
-                record_metrics(&tracker.snapshot());
+                true
             }
             Step::Read(height) => {
                 if let Err(error) = tracker.read_next().await {
@@ -94,10 +122,19 @@ where
                     );
                     tokio::time::sleep(READ_RETRY_DELAY).await;
                 }
-                if tracker.next_unread().is_none() {
-                    record_metrics(&tracker.snapshot());
-                }
+                tracker.next_unread().is_none()
             }
+            Step::Republish => true,
+        };
+
+        // Whether the tip is fresh enough to mine on depends on the clock, so a
+        // long run of reads must not keep the ranking from being published again.
+        let republish_due = Instant::now() >= republish_at;
+        if report || republish_due {
+            let snapshot = tracker.snapshot();
+            record_metrics(&snapshot, tracker.local_gateway);
+            publisher.publish(&snapshot);
+            republish_at = Instant::now() + REPUBLISH_INTERVAL;
         }
     }
 }
@@ -140,6 +177,8 @@ pub(super) struct Tracker<S> {
     /// blocks below it are not read either until the tip moves, so a pruned
     /// block costs one failed read per tip change.
     unreadable_from: Option<Height>,
+    /// The gateway this node's own coinbases name, if it announces one.
+    local_gateway: Option<[u8; 32]>,
 }
 
 impl<S> Tracker<S>
@@ -152,7 +191,14 @@ where
             set: RecentMinerSet::new(network),
             state,
             unreadable_from: None,
+            local_gateway: None,
         }
+    }
+
+    /// Reports how many counted blocks name `local_gateway`, this node's own gateway.
+    pub(super) fn with_local_gateway(mut self, local_gateway: Option<[u8; 32]>) -> Self {
+        self.local_gateway = local_gateway;
+        self
     }
 
     pub(super) fn snapshot(&self) -> MinerSetSnapshot {
@@ -263,10 +309,48 @@ where
     }
 }
 
-/// Reports how many gateways are named and how much of the window is read.
-fn record_metrics(snapshot: &MinerSetSnapshot) {
+/// Reports how many gateways are named, how much of the window is read, how many blocks the
+/// busiest gateway has, and how many name this node's own gateway.
+fn record_metrics(snapshot: &MinerSetSnapshot, local_gateway: Option<[u8; 32]>) {
     // Each is at most the number of heights in a two-day window.
     metrics::gauge!("mining.mesh.gateways").set(snapshot.gateways.len() as f64);
     metrics::gauge!("mining.mesh.window.checked").set(snapshot.checked as f64);
-    metrics::gauge!("mining.mesh.window.total").set(snapshot.window_len as f64);
+    metrics::gauge!("mining.mesh.window.total").set(snapshot.window_len() as f64);
+
+    let counts = gateway_block_counts(snapshot, local_gateway);
+    metrics::gauge!("mining.mesh.gateway.top_blocks").set(f64::from(counts.top));
+    metrics::gauge!("mining.mesh.announcing").set(f64::from(u8::from(local_gateway.is_some())));
+    if local_gateway.is_some() {
+        metrics::gauge!("mining.mesh.gateway.local_blocks").set(f64::from(counts.local));
+    }
+}
+
+/// The block counts the gateway metrics report.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) struct GatewayBlockCounts {
+    /// How many counted blocks name the busiest gateway, or zero when none is named.
+    pub(super) top: u32,
+    /// How many counted blocks name `local_gateway`, or zero when it is not named or unset.
+    pub(super) local: u32,
+}
+
+/// Reads the busiest gateway's count and this node's own gateway's count from `snapshot`.
+pub(super) fn gateway_block_counts(
+    snapshot: &MinerSetSnapshot,
+    local_gateway: Option<[u8; 32]>,
+) -> GatewayBlockCounts {
+    // The snapshot lists the gateway named in the most blocks first.
+    let top = snapshot
+        .gateways
+        .first()
+        .map_or(0, |gateway| gateway.blocks);
+    let local = local_gateway
+        .and_then(|id| {
+            snapshot
+                .gateways
+                .iter()
+                .find(|gateway| gateway.gateway_id == id)
+        })
+        .map_or(0, |gateway| gateway.blocks);
+    GatewayBlockCounts { top, local }
 }

@@ -284,7 +284,9 @@ async fn resolved_trusted_announcement_is_cancelled_and_failure_does_not_disable
     for committed in [false, true] {
         let registration = registry.insert(local.clone()).unwrap();
         let event = EarlyMinedBlock {
-            relay: zakura_rpc::EarlyBlockRelay::TrustedSubmission,
+            relay: zakura_rpc::EarlyBlockRelay::TrustedSubmission(
+                zakura_rpc::TrustedBlockSource::CompletePost,
+            ),
             hash: local.hash(),
             height: local.coinbase_height().unwrap(),
             size: local.zcash_serialized_size(),
@@ -306,7 +308,9 @@ async fn resolved_trusted_announcement_is_cancelled_and_failure_does_not_disable
     gossip
         .early_sender
         .send(EarlyMinedBlock {
-            relay: zakura_rpc::EarlyBlockRelay::TrustedSubmission,
+            relay: zakura_rpc::EarlyBlockRelay::TrustedSubmission(
+                zakura_rpc::TrustedBlockSource::CompletePost,
+            ),
             hash: local.hash(),
             height: local.coinbase_height().unwrap(),
             size: local.zcash_serialized_size(),

@@ -14,7 +14,7 @@ use zakura_chain::{
             ConfiguredActivationHeights, ConfiguredFundingStreamRecipient,
             ConfiguredFundingStreams, ConfiguredLockboxDisbursement, RegtestParameters,
         },
-        Network,
+        Network, NetworkUpgrade,
     },
     primitives::byte_array::increment_big_endian,
 };
@@ -30,64 +30,42 @@ use super::{
     regtest::MiningRpcMethods,
 };
 
-/// Tests shielded coinbase construction through a live Regtest node.
+/// Tests that a node told to announce its gateway names its own v2 node ID in the coinbase,
+/// both beside a transparent reward and beside a shielded reward with NU7 active.
 ///
-/// A node configured with a Unified mining address must return a
-/// shielded coinbase through `getblocktemplate`. The resulting block must be
-/// accepted by the production `submitblock`, consensus, and state path.
-///
-/// Detailed address routing and upgrade-matrix behavior is tested by
-/// `shielded_coinbase_paths`.
-pub(crate) async fn regtest_coinbase() -> eyre::Result<()> {
-    async fn regtest_coinbase(addr_type: MinerAddressType) -> eyre::Result<()> {
-        let _init_guard = zakura_test::init();
+/// Each block must be accepted by the production `submitblock`, consensus, and state path,
+/// with exactly one commitment in its coinbase.
+pub(crate) async fn regtest_coinbase_names_the_gateway() -> eyre::Result<()> {
+    let _init_guard = zakura_test::init();
 
-        let net = Network::new_regtest(RegtestParameters {
-            activation_heights: ConfiguredActivationHeights {
-                // Coinbase construction pays unified miner addresses through
-                // the Ironwood pool, which activates at NU6.3.
-                nu6_3: Some(1),
-                ..Default::default()
-            },
-            funding_streams: Some(vec![ConfiguredFundingStreams {
-                height_range: Some(Height(1)..Height(100)),
-                recipients: Some(vec![ConfiguredFundingStreamRecipient {
-                    receiver: FundingStreamReceiver::Deferred,
-                    numerator: 1,
-                    addresses: None,
-                }]),
-            }]),
-            lockbox_disbursements: Some(vec![ConfiguredLockboxDisbursement {
-                address: "t2RnBRiqrN1nW4ecZs1Fj3WWjNdnSs4kiX8".to_string(),
-                amount: Amount::new(6_250_000),
-            }]),
-            ..Default::default()
-        });
+    announcing_block(
+        &Network::new_regtest(Default::default()),
+        MinerAddressType::Transparent,
+    )
+    .await?;
 
-        let config = os_assigned_rpc_port_config(false, &net)?.with(addr_type);
-        mine_template_block(&net, config).await?;
-
-        Ok(())
-    }
-
-    regtest_coinbase(MinerAddressType::Unified).await?;
+    let block = announcing_block(&nu7_regtest(), MinerAddressType::Unified).await?;
+    assert_eq!(
+        block.transactions[0].network_upgrade(),
+        Some(NetworkUpgrade::Nu7),
+        "the coinbase is built for NU7, which is active from height 1",
+    );
+    assert!(
+        block.transactions[0].ironwood_shielded_data().is_some(),
+        "a unified miner address pays the reward into the Ironwood pool",
+    );
 
     Ok(())
 }
 
-/// Tests that a node told to announce its gateway names its own v2 node ID in the coinbase.
-///
-/// The block must be accepted by the production `submitblock`, consensus, and state path,
-/// with exactly one commitment in its coinbase.
-pub(crate) async fn regtest_coinbase_names_the_gateway() -> eyre::Result<()> {
+/// Mines one block on `net` from a node that announces its gateway and pays `addr_type`,
+/// checks that the coinbase names the node's own ID, and returns the block.
+async fn announcing_block(net: &Network, addr_type: MinerAddressType) -> eyre::Result<Block> {
     // RFC 8032 section 7.1, test 1, as the node's secret key. The node ID is the hash of
     // the key list that seed derives: its Ed25519 public key and its ML-DSA-44 key.
     const NODE_SECRET_KEY: &str =
         "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60";
     const NODE_ID: &str = "78333d017dc319f798578d82bcdafb434f582cf38b98bc85e4b17bfde89a4c53";
-
-    let _init_guard = zakura_test::init();
-    let net = Network::new_regtest(Default::default());
 
     let identity_dir = tempfile::tempdir()?;
     std::fs::write(
@@ -95,20 +73,50 @@ pub(crate) async fn regtest_coinbase_names_the_gateway() -> eyre::Result<()> {
         NODE_SECRET_KEY,
     )?;
 
-    let mut config = os_assigned_rpc_port_config(false, &net)?.with(MinerAddressType::Transparent);
+    let mut config = os_assigned_rpc_port_config(false, net)?.with(addr_type);
     config.mining.miner_mesh = true;
     config.network.p2p_stack = zakura_network::P2pStack::Dual;
     config.network.identity_dir = identity_dir.path().to_path_buf();
     config.network.zakura.listen_addr = Some("127.0.0.1:0".parse()?);
     config.network.zakura.bootstrap_peers = Vec::new();
 
-    let block = mine_template_block(&net, config).await?;
+    let block = mine_template_block(net, config).await?;
 
     let gateway = MinerMeshCommitment::from_coinbase_outputs(block.transactions[0].outputs())
         .map(|commitment| hex::encode(commitment.gateway_id()));
     assert_eq!(gateway.as_deref(), Some(NODE_ID));
 
-    Ok(())
+    Ok(block)
+}
+
+/// A Regtest network with Ironwood and NU7 active from height 1.
+///
+/// Coinbase construction pays unified miner addresses through the Ironwood pool, which
+/// activates at NU6.3. Height 1 is also the NU6.1 activation block, whose coinbase pays the
+/// configured disbursement out of the lockbox, so the disbursement must fit in what that
+/// block's funding stream puts into the lockbox.
+fn nu7_regtest() -> Network {
+    Network::new_regtest(RegtestParameters {
+        activation_heights: ConfiguredActivationHeights {
+            nu6_3: Some(1),
+            nu7: Some(1),
+            ..Default::default()
+        },
+        funding_streams: Some(vec![ConfiguredFundingStreams {
+            height_range: Some(Height(1)..Height(100)),
+            recipients: Some(vec![ConfiguredFundingStreamRecipient {
+                receiver: FundingStreamReceiver::Deferred,
+                numerator: 1,
+                addresses: None,
+            }]),
+        }]),
+        // NU7's lower subsidy puts 2,083,333 zatoshis into the first block's lockbox.
+        lockbox_disbursements: Some(vec![ConfiguredLockboxDisbursement {
+            address: "t2RnBRiqrN1nW4ecZs1Fj3WWjNdnSs4kiX8".to_string(),
+            amount: Amount::new(2_000_000),
+        }]),
+        ..Default::default()
+    })
 }
 
 /// Starts a node with `config`, builds a block from its template, and submits it.

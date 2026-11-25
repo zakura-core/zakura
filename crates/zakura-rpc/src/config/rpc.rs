@@ -142,8 +142,9 @@ pub struct Config {
     /// Allow administrative methods on the unauthenticated primary listener.
     ///
     /// Defaults to `false`. Takes effect when [`Self::enable_cookie_auth`] is
-    /// `false`, allowing `invalidateblock`, `reconsiderblock`, and `preciousblock`
-    /// alongside the compatibility methods. Test-control methods remain
+    /// `false`, allowing administrative methods such as `invalidateblock`,
+    /// `reconsiderblock`, `preciousblock` and `getminermeshinfo` alongside the
+    /// compatibility methods. Test-control methods remain
     /// unavailable on Mainnet and Testnet. The separate
     /// [`Self::admin_listen_addr`] always requires cookie authentication.
     ///

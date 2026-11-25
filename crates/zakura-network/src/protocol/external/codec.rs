@@ -47,6 +47,9 @@ mod tests;
 /// The length of a Bitcoin message header.
 const HEADER_LEN: usize = 24usize;
 
+/// The command of a `block` message.
+const BLOCK_COMMAND: &[u8; 12] = b"block\0\0\0\0\0\0\0";
+
 /// Bloom filter commands accepted and discarded for peer compatibility.
 const BLOOM_FILTER_COMMANDS: [[u8; 12]; 3] =
     [*b"filterload\0\0", *b"filteradd\0\0\0", *b"filterclear\0"];
@@ -279,7 +282,14 @@ pub struct Builder {
     max_len: usize,
     /// The block checksums this codec reuses. A codec has its own unless it is given shared ones.
     block_checksums: BlockChecksums,
+    /// Called with the hash of the block header that starts each received `block` message.
+    /// Unset until the handshake is done.
+    block_header_hook: Option<BlockHeaderHook>,
 }
+
+/// Called with the hash of the block header that starts a received `block` message, as soon as
+/// that header has arrived.
+pub(crate) type BlockHeaderHook = Arc<dyn Fn(block::Hash) + Send + Sync>;
 
 impl Codec {
     /// Return a builder for constructing a [`Codec`].
@@ -289,6 +299,7 @@ impl Codec {
             version: constants::CURRENT_NETWORK_PROTOCOL_VERSION,
             max_len: MAX_HANDSHAKE_BODY_LEN,
             block_checksums: BlockChecksums::default(),
+            block_header_hook: None,
         }
     }
 
@@ -303,6 +314,19 @@ impl Codec {
     /// transactions) can use the full `MAX_PROTOCOL_MESSAGE_LEN`.
     pub fn reconfigure_full_body_len(&mut self) {
         self.builder.max_len = MAX_PROTOCOL_MESSAGE_LEN;
+    }
+
+    /// Start calling `block_header_hook` with the block hash once the block header of each
+    /// received `block` message has arrived, before the block's transactions. Does nothing if
+    /// it is `None`.
+    ///
+    /// Called after a successful handshake, so a peer that has not completed one reports
+    /// nothing, as its `inv`s would not be read either.
+    ///
+    /// The hash is of header bytes already received. The message header alone names no block:
+    /// its four-byte checksum can be matched by padding a block mined later.
+    pub(crate) fn report_block_headers_to(&mut self, block_header_hook: Option<BlockHeaderHook>) {
+        self.builder.block_header_hook = block_header_hook;
     }
 }
 
@@ -380,7 +404,7 @@ impl Encoder<Message> for Codec {
             P2pV2Upgrade(_) => crate::zakura::P2P_V2_UPGRADE_COMMAND_BYTES,
             Addr { .. } => b"addr\0\0\0\0\0\0\0\0",
             GetAddr => b"getaddr\0\0\0\0\0",
-            Block { .. } | UncachedBlock { .. } => b"block\0\0\0\0\0\0\0",
+            Block { .. } | UncachedBlock { .. } => BLOCK_COMMAND,
             GetBlocks { .. } => b"getblocks\0\0\0",
             Headers { .. } => b"headers\0\0\0\0\0",
             GetHeaders { .. } => b"getheaders\0\0",
@@ -619,9 +643,12 @@ impl Codec {
                 v1_addrs.zcash_serialize(writer)?
             }
             Message::GetAddr => { /* Empty payload -- no-op */ }
-            Message::Block(block) | Message::UncachedBlock(block, _) => {
-                block.zcash_serialize(writer)?
-            }
+            // A prepared attempt carries the block's exact serialization.
+            Message::UncachedBlock(block, attempt) => match attempt.prepared_bytes() {
+                Some(bytes) => writer.write_all(bytes)?,
+                None => block.zcash_serialize(writer)?,
+            },
+            Message::Block(block) => block.zcash_serialize(writer)?,
             Message::GetBlocks { known_blocks, stop } => {
                 writer.write_u32::<LittleEndian>(self.builder.version.0)?;
                 known_blocks.zcash_serialize(writer)?;
@@ -653,6 +680,9 @@ enum DecodeState {
         body_len: usize,
         command: [u8; 12],
         checksum: sha256d::Checksum,
+        /// Whether this is a `block` message whose block header has not yet been reported to
+        /// the block header hook.
+        block_header_pending: bool,
     },
 }
 
@@ -664,11 +694,13 @@ impl fmt::Debug for DecodeState {
                 body_len,
                 command,
                 checksum,
+                block_header_pending,
             } => f
                 .debug_struct("DecodeState::Body")
                 .field("body_len", &body_len)
                 .field("command", &String::from_utf8_lossy(command))
                 .field("checksum", &checksum)
+                .field("block_header_pending", &block_header_pending)
                 .finish(),
         }
     }
@@ -688,6 +720,7 @@ impl Decoder for Codec {
         // `max_len`, and one call only discards bytes already buffered, so the work
         // per call stays bounded without a separate count.
         'messages: loop {
+            self.report_block_header(src)?;
             match self.state {
                 DecodeState::Head => {
                     // First check that the src buffer contains an entire header.
@@ -737,6 +770,8 @@ impl Decoder for Codec {
                         body_len,
                         command,
                         checksum,
+                        block_header_pending: command == *BLOCK_COMMAND
+                            && self.builder.block_header_hook.is_some(),
                     };
 
                     // Now that the state is updated, attempt body decoding.
@@ -746,6 +781,7 @@ impl Decoder for Codec {
                     body_len,
                     command,
                     checksum,
+                    ..
                 } => {
                     if src.len() < body_len {
                         // Need to wait for the full body
@@ -798,7 +834,7 @@ impl Decoder for Codec {
                             b"addr\0\0\0\0\0\0\0\0" => self.read_addr(&mut body_reader),
                             b"addrv2\0\0\0\0\0\0" => self.read_addrv2(&mut body_reader),
                             b"getaddr\0\0\0\0\0" => self.read_getaddr(&mut body_reader),
-                            b"block\0\0\0\0\0\0\0" => self.read_block(&mut body_reader),
+                            BLOCK_COMMAND => self.read_block(&mut body_reader),
                             b"getblocks\0\0\0" => self.read_getblocks(&mut body_reader),
                             b"headers\0\0\0\0\0" => self.read_headers(&mut body_reader),
                             b"getheaders\0\0" => self.read_getheaders(&mut body_reader),
@@ -1048,6 +1084,53 @@ impl Codec {
 
     fn read_getaddr<R: Read>(&self, mut _reader: R) -> Result<Message, Error> {
         Ok(Message::GetAddr)
+    }
+
+    /// Reports the block header of the `block` message being received to the block header
+    /// hook, once the first bytes of the message body, which are that header, are in `src`.
+    /// Does nothing for other messages, and reports at most once per message however slowly
+    /// the bytes arrive.
+    ///
+    /// Only this message's body is parsed, never bytes of a following message, and a body that
+    /// does not start with a block header reports nothing: decoding the whole message reports
+    /// that error. Regtest headers are shorter than [`block::MAX_SERIALIZED_HEADER_BYTES`], so
+    /// a Regtest block smaller than that is reported when its whole body has arrived.
+    ///
+    /// Returns an error, which ends the connection, only if the header parser panics.
+    fn report_block_header(&mut self, src: &BytesMut) -> Result<(), Error> {
+        let DecodeState::Body {
+            body_len,
+            block_header_pending,
+            ..
+        } = &mut self.state
+        else {
+            return Ok(());
+        };
+        if !*block_header_pending || src.len() < (*body_len).min(block::MAX_SERIALIZED_HEADER_BYTES)
+        {
+            return Ok(());
+        }
+        *block_header_pending = false;
+
+        let body = &src[..(*body_len).min(src.len())];
+        // As for whole bodies in `decode`: these are peer bytes, and the parser only reads them.
+        let hash = panic::catch_unwind(|| {
+            block::Header::zcash_deserialize(body)
+                .ok()
+                .map(|header| header.hash())
+        })
+        .map_err(|_panic_payload| {
+            metrics::counter!("peer.message.parse.panics", "parser" => "legacy_block_header")
+                .increment(1);
+            tracing::error!(
+                "peer-controlled block header parser panicked; disconnecting legacy peer"
+            );
+            Error::Parse(PANICKED_MESSAGE_BODY_PARSE_ERROR)
+        })?;
+        if let (Some(hash), Some(hook)) = (hash, &self.builder.block_header_hook) {
+            hook(hash);
+        }
+        Ok(())
     }
 
     fn read_block(&self, reader: &mut &[u8]) -> Result<Message, Error> {

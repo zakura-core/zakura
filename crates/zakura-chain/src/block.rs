@@ -50,7 +50,9 @@ pub use commitment::{
     CHAIN_HISTORY_ACTIVATION_RESERVED,
 };
 pub use hash::Hash;
-pub use header::{BlockTimeError, CountedHeader, Header, ZCASH_BLOCK_VERSION};
+pub use header::{
+    BlockTimeError, CountedHeader, Header, MAX_SERIALIZED_HEADER_BYTES, ZCASH_BLOCK_VERSION,
+};
 pub use height::{Height, HeightDiff, TryIntoHeight};
 pub(crate) use serialize::check_max_block_bytes;
 pub use serialize::{SerializedBlock, MAX_BLOCK_BYTES};

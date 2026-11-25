@@ -11,6 +11,114 @@ independently.
 
 ## [Unreleased]
 
+## [1.9.0-rc2] - 2026-11-24
+
+### Added
+
+- `zakurad` now saves the Zakura P2P discovery book and reloads it at the next
+  start, so a restarted node can reconnect to the native peers it already
+  knew. The book follows `network.cache_dir`, including its disable setting.
+  Every loaded record is re-verified
+  ([#2395](https://github.com/zakura-core/zakura/pull/2395)).
+- `getblockchaininfo` and verbose `getblock` report the NSM value balance as an
+  `nsmValueBalance` object, in the same shape as a `valuePools` entry. It is
+  `monitored` from the block before NU7 activation
+  ([#2648](https://github.com/zakura-core/zakura/pull/2648)).
+- The v2 peer-to-peer handshake offers the hybrid post-quantum key exchange
+  X25519MLKEM768 ahead of X25519, so traffic between two upgraded nodes stays
+  secret from a later quantum computer. Nodes without it still connect on
+  X25519 in one round trip
+  ([#2674](https://github.com/zakura-core/zakura/pull/2674)).
+- Added `mining.miner_mesh`, off by default. When it is on, block templates name
+  the node's v2 gateway in the coinbase so other mining pools can find it, and
+  the node refuses to start unless v2 networking is on and its v2 node key is
+  stable across restarts
+  ([#2675](https://github.com/zakura-core/zakura/pull/2675)).
+- A node with `mining.miner_address` set now counts the mining gateways named
+  in the last two days of best-chain blocks and reports the count as
+  `mining.mesh.*` metrics
+  ([#2676](https://github.com/zakura-core/zakura/pull/2676)).
+- Each node exports two totals for v2 handshakes.
+  `zakura.quic.tls.key_exchange` counts completed key exchanges by `group`
+  (`X25519MLKEM768`), including exchanges whose handshake later fails.
+  `zakura.quic.tls.signature_verified` counts peer signatures by `scheme`
+  (`ed25519_mldsa44`) after both signature checks pass
+  ([#2682](https://github.com/zakura-core/zakura/pull/2682)).
+- The trusted block endpoint can retain a mining proposal and serve the exact
+  solved block to peers after local proposal verification or primary
+  confirmation. Released jobs push the solved block directly to capable peers
+  in the initial broadcast group by default. [#2702](https://github.com/zakura-core/zakura/pull/2702)
+
+### Changed
+
+- Ranked competing equal-work blocks by announcement order when their bodies
+  reach the verifier within 2 seconds, regardless of block size. A native
+  header or a legacy single-block inventory message (`inv`) can reserve a
+  place, including on nodes with native header sync disabled. On legacy paths
+  the reservation covers the final hop. A late or unclaimed body is ranked by
+  arrival, and the node preserves priority for its own mined block over an
+  earlier rival announcement. The `sync.block.announcement_claim` counter
+  and `sync.block.announcement_claim.age.seconds` histogram report by block
+  size and claim source. The `sync.block.announcement_claim.refused` counter
+  reports full-table refusals by source
+  ([#2605](https://github.com/zakura-core/zakura/pull/2605)).
+- Changed `zakura_consensus::router::init_with_read_state` to take the
+  shared `AnnouncementClaims` table and a subscription to the committed
+  non-finalized chains
+  ([#2605](https://github.com/zakura-core/zakura/pull/2605)).
+- Changed `zakura_network::init_with_zakura` to take a `BlockAnnouncementHook`
+  for legacy single-block announcements
+  ([#2605](https://github.com/zakura-core/zakura/pull/2605)).
+- When legacy TCP warm-up is enabled, the default schedule sends two padded
+  pings with 800,000 and 1,600,000 bytes of padding. This reduces the scheduled
+  padding from about 5.67 MB to 2.4 MB. Existing ping size overrides retain the
+  gradual ramp and the previous default for any omitted size. The concurrency
+  limit also covers writes that are still finishing after the warm-up times out
+  ([#2610](https://github.com/zakura-core/zakura/pull/2610)).
+- `BlockObject::new` takes a new `nsm_value_balance` argument after
+  `value_pools` ([#2648](https://github.com/zakura-core/zakura/pull/2648)).
+- On Regtest, v2 peer exchange now carries loopback, private and unique-local
+  addresses, so Regtest nodes on one host can find each other through peer
+  exchange. Other networks are unchanged
+  ([#2673](https://github.com/zakura-core/zakura/pull/2673)).
+- A v2 dial's first message now spans two packets. A dial the node refuses,
+  retries or ignores is counted once per packet in
+  `zakura.quic.incoming.refused`, `.retried` and `.ignored` and in the
+  `zakura.p2p.conn.retried.*` and `zakura.p2p.conn.rejected.*` counters
+  ([#2674](https://github.com/zakura-core/zakura/pull/2674)).
+- **Breaking for v2 P2P:** a node's ID is now the hash of the key list in
+  the credential it proves in the TLS handshake, instead of its Ed25519
+  public key, so every node's ID changes once. Key files don't change. The
+  v2 handshake now requires the post-quantum hybrid key exchange
+  X25519MLKEM768 and refuses a peer that offers only classical groups. The
+  v2 protocol moves to version 4 (ALPN `p2p-v2/4`) with no overlap with
+  version 3: nodes that run both stacks keep reaching older releases over
+  the legacy protocol, and nodes that run only the v2 stack lose peers on
+  older releases until those upgrade. Entries in `zakura.bootstrap_peers`
+  and pinned `network.unconditional_peers` name a peer by its node ID, which
+  a node prints for itself at startup, so existing entries need the peer's
+  new ID ([#2679](https://github.com/zakura-core/zakura/pull/2679)).
+- Raised `zakura-quic` to 2.0.0. `NodeId` is 32 opaque bytes, so
+  `NodeId::key()`, `NodeId::verify_strict()` and the conversion from a
+  `NodeKey` are removed; `NodeCredential` and `Conn::remote_key_list()` are
+  added ([#2679](https://github.com/zakura-core/zakura/pull/2679)).
+- **Breaking for v2 P2P:** v2 handshakes are now signed with a composite of
+  Ed25519 and the post-quantum ML-DSA-44, and a peer is accepted only when
+  both signatures verify. A node's ML-DSA-44 key derives from its existing
+  key file, so no file changes, but every node's ID changes once more; this
+  ships in the same release as the node ID change, so deployed IDs change
+  once ([#2680](https://github.com/zakura-core/zakura/pull/2680)).
+- `zakura-quic` 2.0.0 also removes `NodeKey::node_id()`, since a node ID now
+  covers the ML-DSA-44 key too, and adds `ML_DSA_44_KEY_TAG`,
+  `ML_DSA_44_KEY_BYTES`, `ML_DSA_44_SIGNATURE_BYTES` and
+  `COMPOSITE_SIGNATURE_BYTES` ([#2680](https://github.com/zakura-core/zakura/pull/2680)).
+
+### Fixed
+
+- Verbose `getblock` omits `valueDelta` when the parent block's balances are
+  missing, instead of reporting each whole balance as the block's change
+  ([#2648](https://github.com/zakura-core/zakura/pull/2648)).
+
 ## [1.9.0-rc1] - 2026-11-21
 
 ### Changed

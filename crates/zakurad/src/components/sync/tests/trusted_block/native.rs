@@ -86,7 +86,7 @@ async fn select_header(node: &Node, block: &Block, body_size: usize) {
 
 async fn native_invalid_body(tampered: bool) {
     let _init = zakura_test::init();
-    let mut receiver = Node::with_stack(None, P2pStack::Dual).await;
+    let mut receiver = Node::with_stack(None, P2pStack::Dual, PeerServices::NODE_NETWORK).await;
     let valid = receiver.template().await;
     let mut invalid = faulty_body(&valid);
     if !tampered {

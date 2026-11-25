@@ -1270,6 +1270,7 @@ async fn the_test_node_sizes_header_sync_from_its_connection_limit() {
     let anchor = (block::Height(0), network.genesis_hash());
     let mut limits = ZakuraLocalLimits::from_config(&crate::Config::default());
     limits.max_connections = 16;
+    limits.max_preferred_connections = 3;
     let node = ZakuraTestNode::builder(86500)
         .limits(limits)
         .supported_capabilities(ZAKURA_CAP_HEADER_SYNC)
@@ -1287,19 +1288,19 @@ async fn the_test_node_sizes_header_sync_from_its_connection_limit() {
         .await
         .expect("the test node starts");
     let handle = node.header_sync().expect("the node runs header sync");
-    let config = ZakuraHeaderSyncConfig::default().for_node_connections(16);
+    let config = ZakuraHeaderSyncConfig::default().for_node_connections(19);
 
     assert_eq!(
         handle.serving.limits(),
         v9::serving_limits(
             v9::SERVE_PEER_OUTPUT_BYTES,
-            16,
+            19,
             config.node_serve_output_bytes
         )
     );
     assert_eq!(
         handle.lifecycle.capacity(),
-        super::super::events::LIFECYCLE_SLOTS_PER_PEER * 16
+        super::super::events::LIFECYCLE_SLOTS_PER_PEER * 19
     );
 }
 

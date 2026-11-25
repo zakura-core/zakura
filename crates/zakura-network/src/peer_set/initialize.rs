@@ -175,6 +175,8 @@ where
         block_gossip_peer_ips,
         header_sync_driver_startup,
         Vec::new(),
+        peer::BlockAnnouncementHook::default(),
+        None,
     )
     .await
     .map(
@@ -186,6 +188,13 @@ where
 }
 
 /// Initialize a peer set with optional Zakura runtime components.
+///
+/// Legacy connections pass each block a peer announces in a single-block `inv` to
+/// `block_announcement_hook`.
+///
+/// `miner_gateways` ranks the mining gateways the v2 discovery dialer prefers
+/// to stay connected to. Without it, or once its sender is gone, the dialer
+/// prefers none.
 #[allow(clippy::too_many_arguments)]
 pub async fn init_with_zakura<S, C>(
     config: Config,
@@ -196,6 +205,8 @@ pub async fn init_with_zakura<S, C>(
     block_gossip_peer_ips: Vec<IpAddr>,
     header_sync_driver_startup: Option<ZakuraHeaderSyncDriverStartup>,
     custom_services: Vec<CustomService>,
+    block_announcement_hook: peer::BlockAnnouncementHook,
+    miner_gateways: Option<zakura_rt::sync::watch::Receiver<crate::zakura::MinerGatewayRanking>>,
 ) -> Result<
     (
         BoxCloneSyncService<Request, Response, BoxError>,
@@ -243,6 +254,7 @@ where
         header_sync_driver_startup,
         custom_services,
         peer_registry.clone(),
+        miner_gateways,
     )
     .boxed()
     .await?;
@@ -308,6 +320,7 @@ where
             .with_protected_peer_ips(protected_peer_ips)
             .with_misbehavior(misbehavior.clone())
             .with_block_checksums(block_checksums.clone())
+            .with_block_announcement_hook(block_announcement_hook)
             .with_tcp_warmup(peer::TcpWarmup::spawn(
                 config.tcp_warmup.clone(),
                 latest_chain_tip.clone(),
@@ -801,6 +814,32 @@ pub(crate) async fn open_listener(config: &Config) -> (TcpListener, SocketAddr) 
 
 const MAX_INBOUND_ACCEPT_BURST: u32 = 16;
 const MIN_INBOUND_ACCEPT_BURST_INTERVAL: Duration = Duration::from_millis(100);
+
+/// The most inbound connections [`accept_inbound_connections`] accepts within any `span` at
+/// its default pacing: bursts of [`MAX_INBOUND_ACCEPT_BURST`] connections
+/// [`MIN_INBOUND_ACCEPT_BURST_INTERVAL`] apart, with
+/// [`constants::MIN_INBOUND_PEER_CONNECTION_INTERVAL`] between bursts.
+///
+/// Counted from the first connection of a burst, which is where accepted connections are
+/// densest. Configured zcashd-compat peers are not paced and are not counted.
+#[cfg(any(test, feature = "proptest-impl"))]
+pub(crate) fn most_inbound_accepts_within(span: Duration) -> usize {
+    let mut accepted = 0;
+    let mut at = Duration::ZERO;
+    loop {
+        for place_in_burst in 1..=MAX_INBOUND_ACCEPT_BURST {
+            if at > span {
+                return accepted;
+            }
+            accepted += 1;
+            at += if place_in_burst < MAX_INBOUND_ACCEPT_BURST {
+                MIN_INBOUND_ACCEPT_BURST_INTERVAL
+            } else {
+                constants::MIN_INBOUND_PEER_CONNECTION_INTERVAL
+            };
+        }
+    }
+}
 
 /// Listens for peer connections on `addr`, then sets up each connection as a
 /// Zcash peer.

@@ -1470,15 +1470,19 @@ where
 
     /// Writes a warm-up ping and records it as awaiting its `pong`.
     ///
-    /// Does not change the state of any request that is awaiting its response, and does not
-    /// time out: the warm-up task stops waiting on its own.
+    /// Leaves any outstanding request in place. The connection keeps the warm-up permit until
+    /// the send finishes or failure cleanup completes, even if the warm-up task times out.
     async fn send_warmup_ping(&mut self, chunk: WarmupChunk) {
         let WarmupChunk {
             nonce,
             padding,
+            permit,
             written,
             pong,
         } = chunk;
+        let Some(_write_permit) = permit.upgrade() else {
+            return;
+        };
         if written.send(()).is_err() {
             // The warm-up stopped while the ping was queued.
             return;

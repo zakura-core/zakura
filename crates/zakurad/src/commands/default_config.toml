@@ -102,14 +102,13 @@ peerset_initial_target_size = 100
 push_relayed_blocks = false
 unconditional_peers = []
 
-# Warm each new legacy TCP connection with a few padded pings, so that its first
-# full block does not wait for TCP slow start. Needs
-# net.ipv4.tcp_slow_start_after_idle = 0.
+# Send padded pings on new legacy TCP connections to help grow their send window
+# before the first full block. Needs net.ipv4.tcp_slow_start_after_idle = 0.
 [network.tcp_warmup]
 chunk_timeout = "5s"
 enabled = false
-first_chunk_bytes = 14000
-max_chunk_bytes = 2097144
+first_chunk_bytes = 800000
+max_chunk_bytes = 1600000
 max_concurrent = 16
 peer_cooldown = "1day"
 tip_quiet = "2s"
@@ -139,7 +138,7 @@ max_connections_per_ip = 16
 max_pending_handshakes = 32
 message_rate_per_second = 2048
 nat_traversal = false
-peer_memory_budget_bytes = 16106127360
+peer_memory_budget_bytes = 17179869184
 stream_open_rate_per_second = 32
 # Optional IP-to-name labels for peers in gossip traces.
 trace_peer_names = {}

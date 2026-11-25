@@ -54,11 +54,42 @@ async fn first_padded_ping(link: &mut mpsc::Receiver<WarmupChunk>) -> WarmupChun
 }
 
 #[test]
-fn default_schedule_doubles_to_the_message_limit() {
-    let schedule = TcpWarmupConfig::default().schedule();
-
+fn default_schedule_sends_two_padded_pings() {
     assert_eq!(
-        schedule,
+        TcpWarmupConfig::default().schedule(),
+        [0, 800_000, 1_600_000]
+    );
+}
+
+#[test]
+fn schedule_with_equal_first_and_max_sends_one_padded_ping() {
+    let config = TcpWarmupConfig {
+        first_chunk_bytes: 1000,
+        max_chunk_bytes: 1000,
+        ..TcpWarmupConfig::default()
+    };
+    assert_eq!(config.schedule(), [0, 1000]);
+}
+
+#[test]
+fn schedule_steps_up_to_a_custom_maximum() {
+    let config = TcpWarmupConfig {
+        first_chunk_bytes: 1000,
+        max_chunk_bytes: 3000,
+        ..TcpWarmupConfig::default()
+    };
+    assert_eq!(config.schedule(), [0, 1000, 2000, 3000]);
+}
+
+#[test]
+fn schedule_keeps_the_gradual_ramp_for_the_previous_defaults() {
+    let config = TcpWarmupConfig {
+        first_chunk_bytes: 14_000,
+        max_chunk_bytes: crate::constants::MAX_PING_PADDING,
+        ..TcpWarmupConfig::default()
+    };
+    assert_eq!(
+        config.schedule(),
         [
             0,
             14_000,
@@ -72,23 +103,6 @@ fn default_schedule_doubles_to_the_message_limit() {
             crate::constants::MAX_PING_PADDING,
         ]
     );
-}
-
-#[test]
-fn schedule_with_equal_first_and_max_sends_one_padded_ping() {
-    let config = TcpWarmupConfig {
-        first_chunk_bytes: 1000,
-        max_chunk_bytes: 1000,
-        ..TcpWarmupConfig::default()
-    };
-    assert_eq!(config.schedule(), [0, 1000]);
-
-    let config = TcpWarmupConfig {
-        first_chunk_bytes: 1000,
-        max_chunk_bytes: 3000,
-        ..TcpWarmupConfig::default()
-    };
-    assert_eq!(config.schedule(), [0, 1000, 2000, 3000]);
 }
 
 #[test]
@@ -274,6 +288,11 @@ async fn queued_padding_that_is_never_written_keeps_no_claim() {
     let queued = first_padded_ping(&mut chunks).await;
 
     driver.await.unwrap();
+    assert_eq!(
+        warmup.inner.permits.available_permits(),
+        config.max_concurrent,
+        "an expired queued ping does not occupy a warm-up slot"
+    );
     assert!(
         queued.written.send(()).is_err(),
         "the connection skips a ping whose warm-up stopped"

@@ -226,12 +226,12 @@ fn coverage_is_complete_only_when_every_height_is_read() {
 
     // No tip: the set has not looked at the chain yet.
     assert!(!set.snapshot().is_complete());
-    assert_eq!(set.snapshot().window_len, 0);
+    assert_eq!(set.snapshot().window_len(), 0);
 
     // A tip below height 100 has nothing to read.
     set.set_tip(Height(99), hash(0));
     assert!(set.snapshot().is_complete());
-    assert_eq!(set.snapshot().window_len, 0);
+    assert_eq!(set.snapshot().window_len(), 0);
 
     // The window is the six heights from genesis to 5.
     set.set_tip(Height(105), hash(0));
@@ -239,7 +239,7 @@ fn coverage_is_complete_only_when_every_height_is_read() {
         set.record(Height(height), hash(1), None);
     }
     let partial = set.snapshot();
-    assert_eq!((partial.checked, partial.window_len), (5, 6));
+    assert_eq!((partial.checked, partial.window_len()), (5, 6));
     assert!(!partial.is_complete());
     assert_eq!(partial.gateways, []);
 

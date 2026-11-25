@@ -186,6 +186,20 @@
       }
     },
     {
+      "name": "getminermeshinfo",
+      "summary": "Returns this node's view of the miner mesh.",
+      "description": "Returns this node's view of the miner mesh.\n\nThe response is a [`GetMinerMeshInfoResponse`] JSON struct: the\ngateways recent blocks name, the connection places this node holds for\nthe best of them, and its v2 peers.\n\nZakura-specific.\nmethod: post\ntags: network\n\n# Notes\n\nA mining node counts the gateways that recent best-chain coinbases\nname, and while it is synced, v2 networking holds up to ten connection\nplaces that ordinary peers cannot fill for the highest-ranked gateways\nit can reach. Each gateway's `state` is `preferred` when it may fill a\nheld place, `standby` when it is reachable but ranked below those,\n`backoff` when it is known but waiting out a failed dial or a lost\nconnection, and `unmatched` when v2 networking has no usable dial address for it.\n\n`synced` is evaluated at request time. The ranking and held places reflect\nthe last update applied by networking and can lag a change in tip freshness.\n\n`window` is null on a node that does not mine, and `slots` is null on\na node that runs no v2 networking.",
+      "params": [],
+      "result": {
+        "name": "getminermeshinfo_result",
+        "summary": "The node's miner mesh window, ranked gateways, connection slots, and registered peers.",
+        "description": "The node's miner mesh window, ranked gateways, connection slots, and registered peers.",
+        "schema": {
+          "$ref": "#/components/schemas/GetMinerMeshInfoResponse"
+        }
+      }
+    },
+    {
       "name": "getblock",
       "summary": "Returns the requested block by hash or height, as a",
       "description": "Returns the requested block by hash or height, as a\n[`GetBlockResponse`] JSON string.\nIf the block is not in Zebra's state, returns\n[error code `-8`.](https://github.com/zcash/zcash/issues/5758) if a height was\npassed or -5 if a hash was passed.\n\nzcashd reference: [`getblock`](https://zcash.github.io/rpc/getblock.html)\nmethod: post\ntags: blockchain\n\n# Parameters\n\n- `hash_or_height`: (string, required, example=\"1\") The hash or height for the block to be returned.\n- `verbosity`: (number, optional, default=1, example=1) 0 for hex encoded data, 1 for a json object, and 2 for json object with transaction data.\n\n# Notes\n\nThe `size` field is only returned with verbosity=2.\n\nThe undocumented `chainwork` field is not returned.\n\nWith verbosity=2, transaction objects include `ironwood` only when the\ntransaction contains Ironwood shielded data. Block `trees` can include an\nIronwood tree entry when the state has one for the requested block.",
@@ -1190,6 +1204,74 @@
           }
         ]
       },
+      "GetMinerMeshInfoResponse": {
+        "properties": {
+          "announcing": {
+            "type": "boolean"
+          },
+          "gateways": {
+            "items": {
+              "$ref": "#/components/schemas/MeshGateway"
+            },
+            "type": "array"
+          },
+          "hold": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "mining": {
+            "type": "boolean"
+          },
+          "node_id": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "peers": {
+            "items": {
+              "$ref": "#/components/schemas/MeshPeer"
+            },
+            "type": "array"
+          },
+          "slots": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MeshSlots"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "synced": {
+            "type": "boolean"
+          },
+          "window": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MeshWindow"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "node_id",
+          "announcing",
+          "mining",
+          "synced",
+          "window",
+          "gateways",
+          "hold",
+          "slots",
+          "peers"
+        ],
+        "type": "object"
+      },
       "HexData": {
         "description": "Deserialize hex-encoded strings to bytes.",
         "type": "string"
@@ -1197,6 +1279,138 @@
       "LongPollId": {
         "description": "The encoded long poll ID, generated from the [`LongPollInput`].\n\n`zcashd` IDs are currently 69 hex/decimal digits long.\nIDs use 46 hex/decimal digits, or 62 after the first template withdrawal.",
         "type": "string"
+      },
+      "MeshGateway": {
+        "properties": {
+          "blocks": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "connected": {
+            "type": "boolean"
+          },
+          "node_id": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "state": {
+            "$ref": "#/components/schemas/MeshGatewayState"
+          }
+        },
+        "required": [
+          "node_id",
+          "blocks",
+          "state",
+          "connected"
+        ],
+        "type": "object"
+      },
+      "MeshGatewayState": {
+        "enum": [
+          "preferred",
+          "standby",
+          "backoff",
+          "unmatched"
+        ],
+        "type": "string"
+      },
+      "MeshPeer": {
+        "properties": {
+          "inbound": {
+            "type": "boolean"
+          },
+          "node_id": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "preferred": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "node_id",
+          "inbound",
+          "preferred"
+        ],
+        "type": "object"
+      },
+      "MeshSlots": {
+        "properties": {
+          "in_use": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "inbound": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "limit": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "ordinary": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "preferred": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "limit",
+          "in_use",
+          "preferred",
+          "ordinary",
+          "inbound"
+        ],
+        "type": "object"
+      },
+      "MeshWindow": {
+        "properties": {
+          "checked": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "coverage": {
+            "maximum": 1,
+            "minimum": 0,
+            "type": "number"
+          },
+          "newest": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "oldest": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "tip": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "tip",
+          "newest",
+          "oldest",
+          "checked",
+          "coverage"
+        ],
+        "type": "object"
       },
       "NoteCommitmentSubtreeIndex": {
         "description": "A note commitment subtree index, used to identify a subtree in a shielded pool.\nAlso used to count subtrees.",

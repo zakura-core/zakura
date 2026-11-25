@@ -634,6 +634,21 @@ pub trait Port: Send + Sync + 'static {
         hash: block::Hash,
     ) -> HeaderChainFuture<'_, Result<SelectedChainMembership, PortError>>;
 
+    /// Return the validation lease for a child of the retained header
+    /// `parent_hash`, or `None` when no header `parent_hash` is retained.
+    ///
+    /// The lease holds the up to [`zakura_header_chain::MAX_POW_ADJUSTMENT_BLOCK_SPAN`]
+    /// headers ending at `parent_hash`. BPv1 reads it at the best header to
+    /// bound the target of a header whose parent is unknown. The default
+    /// retains no headers.
+    fn header_validation_lease(
+        &self,
+        _parent_hash: block::Hash,
+    ) -> HeaderChainFuture<'_, Result<Option<zakura_header_chain::ValidationLease>, PortError>>
+    {
+        Box::pin(async { Ok(None) })
+    }
+
     /// Admit a single exact header into headerchain.
     ///
     /// Coalesces by hash with header sync: if `header` is already retained

@@ -60,14 +60,19 @@ impl BlockTable {
             self.config.part_buffer_bytes
         );
 
-        // bpv1-50: every indexed header or commitment job belongs to its
-        // admitting entry, so finished or abandoned work leaves no lease.
+        // bpv1-50: every indexed header, unknown-parent, or commitment job
+        // belongs to its admitting or pending entry, so finished or abandoned
+        // work leaves no lease.
         for (work_id, block_id) in &self.work_to_block {
             assert!(
                 self.admitting
                     .get(block_id)
-                    .is_some_and(|entry| entry.work_id == *work_id),
-                "{BLOCK_REPLAY}: bpv1-50 work index holds a job no admitting entry owns"
+                    .is_some_and(|entry| entry.work_id == *work_id)
+                    || self
+                        .pending
+                        .get(block_id)
+                        .is_some_and(|entry| entry.checking == Some(*work_id)),
+                "{BLOCK_REPLAY}: bpv1-50 work index holds a job no entry owns"
             );
         }
 

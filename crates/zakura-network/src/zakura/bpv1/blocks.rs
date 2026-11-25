@@ -29,6 +29,7 @@ use super::{
         Coding, Profile, W2_MAX_COINBASE_BYTES, W2_MAX_COMMITMENT_PATH_DEPTH, W2_MAX_HEADER_BYTES,
     },
     tree::{encoding_id, VerifiedPart},
+    unknown_parent::UnknownParentVerdict,
     wire::{Bpv1Message, WantBitmap, PROPAGATION_DEPTH},
 };
 
@@ -337,11 +338,13 @@ pub enum BlockInput {
         /// Height of the new verified tip.
         height: u32,
     },
-    /// A parent header was admitted into headerchain, waking pending metadata (`bpv1-11`).
+    /// Headerchain's best header moved to `hash`, waking pending metadata
+    /// (`bpv1-11`): the entries whose parent is `hash`, and the entry for
+    /// `hash` itself, which header sync admitted along with its skipped parent.
     ParentAdmitted {
-        /// Hash of the newly admitted parent header.
+        /// Hash of the new best header.
         hash: block::Hash,
-        /// Height of the admitted parent.
+        /// Height of the new best header.
         height: u32,
     },
     /// Validated-layout `HeaderMeta` received from a peer (`bpv1-1`, `bpv1-3`, `bpv1-7`).
@@ -359,6 +362,14 @@ pub enum BlockInput {
         work_id: WorkId,
         /// Admission outcome.
         result: HeaderAdmissionResult,
+    },
+    /// Completion of the checks on metadata whose parent header is unknown
+    /// ([`super::unknown_parent`]).
+    UnknownParentChecked {
+        /// Work identity returned by `CheckUnknownParent`.
+        work_id: WorkId,
+        /// The checks' outcome.
+        verdict: UnknownParentVerdict,
     },
     /// Completion of coinbase commitment verification (`bpv1-2`, `bpv1-6`, `bpv1-63`).
     CommitmentChecked {
@@ -563,6 +574,18 @@ pub enum BlockOutput {
         from_peer: NodeId,
         /// Session generation of `from_peer`.
         session_gen: u64,
+    },
+    /// Check the binding, height, target, and proof of work of metadata whose
+    /// parent header is unknown, off the driver ([`super::unknown_parent`]).
+    CheckUnknownParent {
+        /// Work identity.
+        work_id: WorkId,
+        /// Block hash.
+        block_id: block::Hash,
+        /// Metadata envelope to check.
+        envelope: Box<MetaEnvelope>,
+        /// `top` when the check starts. The block's height must lie above it.
+        top: u32,
     },
     /// Verify the coinbase commitment for an admitted header on a worker (`bpv1-2`).
     VerifyCommitment {
@@ -881,6 +904,12 @@ struct AdmittingEntry {
     later: LaterCopies,
     height: Option<u32>,
     stage: AdmittingStage,
+    /// When the entry first parked, if a wake retries it. A retried entry
+    /// already passed the unknown-parent checks, and it keeps its first
+    /// deadline if it parks again.
+    parked_at: Option<Instant>,
+    /// [`BlockTable::best_moves`] when the entry's header admission started.
+    best_moves: u64,
 }
 
 impl AdmittingEntry {
@@ -907,6 +936,12 @@ struct PendingMetaEntry {
     later: LaterCopies,
     parent_hash: block::Hash,
     received_at: Instant,
+    /// The unknown-parent checks' work while they run. The entry holds
+    /// pending budget during them, so metadata with an unknown parent never
+    /// takes admission budget from viable metadata (`bpv1-75`).
+    checking: Option<WorkId>,
+    /// [`BlockTable::best_moves`] when the entry's header admission started.
+    best_moves: u64,
 }
 
 impl PendingMetaEntry {
@@ -1375,6 +1410,20 @@ fn reject_later(step: &mut BlockStep, block_id: block::Hash, later: &LaterCopies
     }
 }
 
+/// Whether metadata that would wait for its parent retries header admission
+/// instead: the best header moved since its admission started, so header
+/// sync may have admitted the parent or the header itself, and no wake
+/// reached the entry. A retry starts only after a move and before the
+/// entry's deadline, so retries stay bounded.
+fn retries_admission(
+    started_at_moves: u64,
+    best_moves: u64,
+    parked_at: Instant,
+    now: Instant,
+) -> bool {
+    started_at_moves != best_moves && now.saturating_duration_since(parked_at) < PENDING_META_AGE
+}
+
 /// Returns the next work identity from `counter`, skipping zero.
 fn alloc_work_id(counter: &mut u64) -> WorkId {
     let id = WorkId(*counter);
@@ -1396,12 +1445,17 @@ pub struct BlockTable {
     admitting: HashMap<block::Hash, AdmittingEntry>,
     /// Index from `WorkId` to `block_id` for O(1) stale-work filtering.
     work_to_block: HashMap<WorkId, block::Hash>,
-    /// Pending metadata waiting on missing parents (`bpv1-11`).
+    /// Metadata whose parent header is missing, while its unknown-parent
+    /// checks run and then while it waits for the parent (`bpv1-11`).
     pending: HashMap<block::Hash, PendingMetaEntry>,
     /// Current byte charge of `pending`.
     pending_bytes: usize,
     /// Admitted (and retired-in-window) blocks.
     blocks: HashMap<block::Hash, ActiveBlock>,
+    /// Count of best-header moves (`ParentAdmitted`). A move during an
+    /// entry's admission or checks wakes nothing for it, so the entry retries
+    /// admission instead of parking.
+    best_moves: u64,
 }
 
 impl BlockTable {
@@ -1418,6 +1472,7 @@ impl BlockTable {
             pending: HashMap::new(),
             pending_bytes: 0,
             blocks: HashMap::new(),
+            best_moves: 0,
         }
     }
 
@@ -1590,8 +1645,9 @@ impl BlockTable {
                 self.raise_top(height, &mut step);
             }
             BlockInput::ParentAdmitted { hash, height } => {
+                self.best_moves = self.best_moves.wrapping_add(1);
                 self.raise_top(height, &mut step);
-                self.wake_pending_for_parent(hash, &mut step);
+                self.wake_pending(hash, &mut step);
             }
             BlockInput::MetaReceived {
                 envelope,
@@ -1602,6 +1658,9 @@ impl BlockTable {
             }
             BlockInput::HeaderAdmitted { work_id, result } => {
                 self.handle_header_admitted(now, work_id, result, &mut step);
+            }
+            BlockInput::UnknownParentChecked { work_id, verdict } => {
+                self.handle_unknown_parent_checked(now, work_id, verdict, &mut step);
             }
             BlockInput::CommitmentChecked {
                 work_id,
@@ -1817,7 +1876,14 @@ impl BlockTable {
             self.pending_bytes += charged;
             return;
         }
-        self.start_admission(arrived_at, envelope, sender, LaterCopies::default(), step);
+        self.start_admission(
+            arrived_at,
+            envelope,
+            sender,
+            LaterCopies::default(),
+            None,
+            step,
+        );
     }
 
     /// Forgets `session` in every later-copy record of metadata in admission
@@ -1833,13 +1899,15 @@ impl BlockTable {
     }
 
     /// Queues headerchain admission for `envelope`, which `from` sent first,
-    /// with the copies `later` that other sessions sent.
+    /// with the copies `later` that other sessions sent. `parked_at` is when
+    /// a woken pending entry first parked.
     fn start_admission(
         &mut self,
         arrived_at: Instant,
         envelope: Box<MetaEnvelope>,
         from: (NodeId, u64),
         mut later: LaterCopies,
+        parked_at: Option<Instant>,
         step: &mut BlockStep,
     ) {
         let block_id = envelope.block_id;
@@ -1889,6 +1957,8 @@ impl BlockTable {
                 later,
                 height: None,
                 stage: AdmittingStage::WaitingHeader,
+                parked_at,
+                best_moves: self.best_moves,
             },
         );
         self.work_to_block.insert(work_id, block_id);
@@ -1950,11 +2020,23 @@ impl BlockTable {
                 });
             }
             HeaderAdmissionResult::MissingParent { parent_hash } => {
+                if let Some(parked_at) = entry.parked_at {
+                    let entry = self
+                        .admitting
+                        .remove(&block_id)
+                        .expect("admitting entry verified present");
+                    self.park(now, block_id, entry, parent_hash, parked_at, step);
+                    return;
+                }
+                // Headerchain checked nothing but the parent's hash, so the
+                // header's own checks run before it waits. They run under the
+                // pending budget (`bpv1-75`).
                 let entry = self
                     .admitting
                     .remove(&block_id)
                     .expect("admitting entry verified present");
-                self.insert_pending(
+                let work_id = alloc_work_id(&mut self.next_work_id);
+                let held = self.insert_pending(
                     block_id,
                     PendingMetaEntry {
                         envelope: entry.envelope,
@@ -1964,9 +2046,20 @@ impl BlockTable {
                         later: entry.later,
                         parent_hash,
                         received_at: now,
+                        checking: Some(work_id),
+                        best_moves: entry.best_moves,
                     },
                     step,
                 );
+                if held {
+                    self.work_to_block.insert(work_id, block_id);
+                    step.outputs.push(BlockOutput::CheckUnknownParent {
+                        work_id,
+                        block_id,
+                        envelope: self.pending[&block_id].envelope.clone(),
+                        top: self.top,
+                    });
+                }
             }
             HeaderAdmissionResult::PeerInvalid => {
                 let entry = self
@@ -1994,7 +2087,120 @@ impl BlockTable {
         }
     }
 
-    /// Bytes held in metadata in header admission or the commitment check.
+    /// Parks, drops, or closes metadata whose parent header is unknown, as its
+    /// checks decided.
+    fn handle_unknown_parent_checked(
+        &mut self,
+        now: Instant,
+        work_id: WorkId,
+        verdict: UnknownParentVerdict,
+        step: &mut BlockStep,
+    ) {
+        let Some(block_id) = self.work_to_block.remove(&work_id) else {
+            return;
+        };
+        let Some(entry) = self
+            .pending
+            .get_mut(&block_id)
+            .filter(|entry| entry.checking == Some(work_id))
+        else {
+            return;
+        };
+        if verdict == UnknownParentVerdict::Park {
+            entry.checking = None;
+            if retries_admission(entry.best_moves, self.best_moves, entry.received_at, now) {
+                let entry = self
+                    .remove_pending(block_id)
+                    .expect("pending entry verified present");
+                self.start_admission(
+                    entry.arrived_at,
+                    entry.envelope,
+                    (entry.from_peer, entry.session_gen),
+                    entry.later,
+                    Some(entry.received_at),
+                    step,
+                );
+            }
+            return;
+        }
+        let entry = self
+            .remove_pending(block_id)
+            .expect("pending entry verified present");
+        match verdict {
+            UnknownParentVerdict::Park => {}
+            // Block sync owns the block, and no sender is at fault.
+            UnknownParentVerdict::Drop => {
+                reject_meta(step, block_id, entry.from_peer, entry.session_gen);
+                reject_later(step, block_id, &entry.later);
+            }
+            UnknownParentVerdict::Invalid(row) => {
+                step.outputs.push(BlockOutput::ClosePeer {
+                    peer: entry.from_peer,
+                    session_gen: entry.session_gen,
+                    row,
+                });
+                if row == Bpv1CloseRow::Row3InvalidHeader {
+                    // `block_id` is the hash of the header bytes, so every
+                    // later session sent this same invalid header.
+                    for (peer, session_gen) in entry.later.sessions() {
+                        step.outputs.push(BlockOutput::ClosePeer {
+                            peer,
+                            session_gen,
+                            row,
+                        });
+                    }
+                } else {
+                    // Another sender's binding may differ under the same hash,
+                    // so it is not faulted for this one's.
+                    reject_later(step, block_id, &entry.later);
+                }
+            }
+        }
+    }
+
+    /// Parks `entry`, a retried entry whose parent `parent_hash` headerchain
+    /// still lacks, until a new best header wakes it, or retries it again
+    /// ([`retries_admission`]). `parked_at` keeps its first deadline, and the
+    /// entry skips the checks it passed.
+    fn park(
+        &mut self,
+        now: Instant,
+        block_id: block::Hash,
+        entry: AdmittingEntry,
+        parent_hash: block::Hash,
+        parked_at: Instant,
+        step: &mut BlockStep,
+    ) {
+        if retries_admission(entry.best_moves, self.best_moves, parked_at, now) {
+            self.start_admission(
+                entry.arrived_at,
+                entry.envelope,
+                (entry.from_peer, entry.session_gen),
+                entry.later,
+                Some(parked_at),
+                step,
+            );
+            return;
+        }
+        self.insert_pending(
+            block_id,
+            PendingMetaEntry {
+                envelope: entry.envelope,
+                arrived_at: entry.arrived_at,
+                from_peer: entry.from_peer,
+                session_gen: entry.session_gen,
+                later: entry.later,
+                parent_hash,
+                received_at: parked_at,
+                checking: None,
+                best_moves: entry.best_moves,
+            },
+            step,
+        );
+    }
+
+    /// Bytes held in metadata in header admission, its unknown-parent checks,
+    /// or the commitment check.
     fn admitting_bytes(&self) -> usize {
         self.admitting
             .values()
@@ -2025,7 +2231,7 @@ impl BlockTable {
         block_id: block::Hash,
         mut entry: PendingMetaEntry,
         step: &mut BlockStep,
-    ) {
+    ) -> bool {
         let bytes = entry.envelope.estimated_bytes();
         let (held, _) = self.pending_held_by(entry.from_peer);
         let mut admit = held < MAX_PENDING_META_PER_PEER;
@@ -2071,7 +2277,7 @@ impl BlockTable {
                 .push(BlockEvent::MetaPendingDropped { block_id });
             reject_meta(step, block_id, entry.from_peer, entry.session_gen);
             reject_later(step, block_id, &entry.later);
-            return;
+            return false;
         }
         self.pending_bytes -= shed_alternates(
             &mut self.pending,
@@ -2085,13 +2291,23 @@ impl BlockTable {
         );
         self.pending_bytes = self.pending_bytes.saturating_add(entry.charged_bytes());
         self.pending.insert(block_id, entry);
+        true
+    }
+
+    /// Removes a pending entry, its byte charge, and its check's work index.
+    fn remove_pending(&mut self, block_id: block::Hash) -> Option<PendingMetaEntry> {
+        let entry = self.pending.remove(&block_id)?;
+        self.pending_bytes = self.pending_bytes.saturating_sub(entry.charged_bytes());
+        if let Some(work_id) = entry.checking {
+            self.work_to_block.remove(&work_id);
+        }
+        Some(entry)
     }
 
     /// Drops a pending entry for the pending budget and rejects it for each
     /// session that sent it.
     fn drop_pending(&mut self, block_id: block::Hash, step: &mut BlockStep) {
-        if let Some(entry) = self.pending.remove(&block_id) {
-            self.pending_bytes = self.pending_bytes.saturating_sub(entry.charged_bytes());
+        if let Some(entry) = self.remove_pending(block_id) {
             step.events
                 .push(BlockEvent::MetaPendingDropped { block_id });
             reject_meta(step, block_id, entry.from_peer, entry.session_gen);
@@ -2099,21 +2315,30 @@ impl BlockTable {
         }
     }
 
-    fn wake_pending_for_parent(&mut self, parent_hash: block::Hash, step: &mut BlockStep) {
+    /// Retries header admission for the pending entries that the new best
+    /// header `best` may resolve: those whose parent is `best`, and the entry
+    /// for `best` itself.
+    ///
+    /// Header sync usually fetches a missing parent together with the waiting
+    /// child, so the best header can move straight past the parent to the
+    /// child. The child's own entry then wakes, and its admission reports it
+    /// already known.
+    fn wake_pending(&mut self, best: block::Hash, step: &mut BlockStep) {
         let ready: Vec<block::Hash> = self
             .pending
             .iter()
-            .filter(|(_, e)| e.parent_hash == parent_hash)
+            // An entry whose checks still run retries when they pass.
+            .filter(|(id, e)| e.checking.is_none() && (e.parent_hash == best || **id == best))
             .map(|(id, _)| *id)
             .collect();
         for block_id in ready {
-            if let Some(pending) = self.pending.remove(&block_id) {
-                self.pending_bytes = self.pending_bytes.saturating_sub(pending.charged_bytes());
+            if let Some(pending) = self.remove_pending(block_id) {
                 self.start_admission(
                     pending.arrived_at,
                     pending.envelope,
                     (pending.from_peer, pending.session_gen),
                     pending.later,
+                    Some(pending.received_at),
                     step,
                 );
             }
@@ -2232,6 +2457,8 @@ impl BlockTable {
             session_gen,
             mut later,
             height,
+            parked_at,
+            best_moves,
             ..
         } = entry;
         for (peer, session_gen) in std::iter::once((from_peer, session_gen)).chain(later.same) {
@@ -2270,6 +2497,8 @@ impl BlockTable {
                 },
                 height: Some(height),
                 stage: AdmittingStage::WaitingCommitment,
+                parked_at,
+                best_moves,
             },
         );
         step.outputs.push(BlockOutput::VerifyCommitment {
@@ -3132,8 +3361,7 @@ impl BlockTable {
             .map(|(id, _)| *id)
             .collect();
         for id in aged {
-            if let Some(entry) = self.pending.remove(&id) {
-                self.pending_bytes = self.pending_bytes.saturating_sub(entry.charged_bytes());
+            if let Some(entry) = self.remove_pending(id) {
                 step.events
                     .push(BlockEvent::MetaPendingAged { block_id: id });
                 reject_meta(step, id, entry.from_peer, entry.session_gen);

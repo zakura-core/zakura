@@ -52,6 +52,7 @@ use super::{
     },
     service::{Bpv1Handle, Bpv1Ports, Bpv1Service},
     tree::VerifiedPart,
+    unknown_parent::UnknownParentVerdict,
     wire::{
         encode_part_frame, part_payload_len, Bpv1Message, HaveFlags, WantBitmap, WantEndReason,
         BPV1_CONTROL_KIND, BPV1_DATA_KIND, ZAKURA_CAP_BPV1,
@@ -1096,8 +1097,8 @@ impl MachineMesh {
         }
     }
 
-    /// The node's shell work, completed at once: header admission and
-    /// commitment checks pass, stripe jobs run inline, and the verifier
+    /// The node's shell work, completed at once: header admission, the
+    /// unknown-parent checks, and commitment checks pass, stripe jobs run inline, and the verifier
     /// accepts.
     fn shell(&mut self, node: usize, output: BlockOutput) {
         let input = match output {
@@ -1106,6 +1107,10 @@ impl MachineMesh {
                 result: HeaderAdmissionResult::Admitted {
                     height: MESH_HEIGHT,
                 },
+            },
+            BlockOutput::CheckUnknownParent { work_id, .. } => BlockInput::UnknownParentChecked {
+                work_id,
+                verdict: UnknownParentVerdict::Park,
             },
             BlockOutput::VerifyCommitment { work_id, .. } => {
                 let peers = self.nodes[node]

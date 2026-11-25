@@ -1568,6 +1568,40 @@ fn bpv1_12_part_under_another_part_root_is_not_stored() {
     );
 }
 
+/// A peer's copy whose commitment check finishes after this node admitted
+/// the same block from its own miner never replaces the solved block.
+#[test]
+fn local_admission_during_a_peer_copy_check_keeps_the_solved_block() {
+    let encoded = encode_body(&Profile::TINY, &[0x22; 128], 2).unwrap();
+    let block_id = block::Hash([42; 32]);
+    let envelope = || make_envelope(block_id, encoded.coding, encoded.part_root, node_id(1));
+    let now = Instant::now();
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let received = receive(&mut table, now, envelope());
+    let checking = header_result(
+        &mut table,
+        now,
+        &received,
+        HeaderAdmissionResult::Admitted { height: 1 },
+    );
+    let _ = table.step(
+        now,
+        BlockInput::BlockAdmittedLocal {
+            height: 1,
+            envelope: envelope(),
+            parts: encoded.parts.clone(),
+        },
+    );
+    let late = commitment_ok(&mut table, now, &checking);
+    table.assert_invariants();
+    assert!(
+        late.outputs.is_empty(),
+        "the late copy publishes, claims and retires nothing: {:?}",
+        late.outputs
+    );
+    assert_eq!(table.block_phase(&block_id), Some(BlockPhase::Done));
+}
+
 /// decision-20: the proposer announces nothing for its own block.
 #[test]
 fn decision20_proposer_admission_announces_nothing() {
@@ -1694,6 +1728,7 @@ fn bpv1_57_fallback_blocks_yield_to_a_new_block_at_the_cap() {
     let mut cfg = BlockConfig::for_profile(Profile::TINY);
     cfg.max_concurrent_blocks = 2;
     let mut table = BlockTable::new(cfg);
+    table.step(now, BlockInput::TipHeight { height: 99 });
     let late = now + RECONSTRUCTION_DEADLINE + Duration::from_secs(1);
     for i in 0..2u8 {
         admit_block(
@@ -2283,6 +2318,7 @@ fn fix2_raising_top_retires_out_of_window_blocks() {
     let t0 = Instant::now();
     let coding = Profile::TINY.derive_coding(128, 2).unwrap();
     let old = block::Hash([0xB1; 32]);
+    table.step(t0, BlockInput::TipHeight { height: 49 });
     admit_block(&mut table, t0, old, 50, coding, [0x21; 32]);
 
     // Headerchain admits a parent past the window.
@@ -2300,7 +2336,13 @@ fn fix2_raising_top_retires_out_of_window_blocks() {
     // An admitted header proves only that headerchain retained it: a fork
     // or a future-dated header admits too. It moves no window, so a block
     // at the selected height still admits after it.
-    let high_height = parent_height + PROPAGATION_DEPTH + 1;
+    table.step(
+        t0,
+        BlockInput::TipHeight {
+            height: parent_height,
+        },
+    );
+    let high_height = parent_height + PROPAGATION_DEPTH;
     let high = make_envelope(block::Hash([0xB4; 32]), coding, [0x21; 32], node_id(1));
     let received = receive(&mut table, t0, high);
     let step = header_result(
@@ -2328,6 +2370,144 @@ fn fix2_raising_top_retires_out_of_window_blocks() {
     );
     assert!(step.events.contains(&BlockEvent::Retired { block_id: mid }));
 
+    table.assert_invariants();
+}
+
+/// bpv1-76: while header sync runs far ahead of the verified tip, BPv1 refuses
+/// metadata more than `PROPAGATION_DEPTH` above the verified tip without
+/// faulting the sender, and admits it once the verified tip catches up.
+#[test]
+fn bpv1_76_metadata_far_above_the_verified_tip_belongs_to_block_sync() {
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let t0 = Instant::now();
+    let coding = Profile::TINY.derive_coding(128, 2).unwrap();
+    let verified = 100;
+    table.step(t0, BlockInput::TipHeight { height: verified });
+    // Header sync is near the network tip.
+    table.step(
+        t0,
+        BlockInput::ParentAdmitted {
+            hash: block::Hash([0xC0; 32]),
+            height: verified + 200,
+        },
+    );
+
+    let far = make_envelope(block::Hash([0xC1; 32]), coding, [0x21; 32], node_id(1));
+    let received = receive(&mut table, t0, far);
+    let step = header_result(
+        &mut table,
+        t0,
+        &received,
+        HeaderAdmissionResult::Admitted {
+            height: verified + 199,
+        },
+    );
+    assert!(!step
+        .outputs
+        .iter()
+        .any(|o| matches!(o, BlockOutput::VerifyCommitment { .. })));
+    assert!(
+        !step
+            .outputs
+            .iter()
+            .any(|o| matches!(o, BlockOutput::ClosePeer { .. })),
+        "a block above the gate is block sync's, not the sender's fault",
+    );
+    table.assert_invariants();
+
+    // The verified tip catches up to within `PROPAGATION_DEPTH`.
+    table.step(
+        t0,
+        BlockInput::TipHeight {
+            height: verified + 199 - PROPAGATION_DEPTH,
+        },
+    );
+    admit_block(
+        &mut table,
+        t0,
+        block::Hash([0xC2; 32]),
+        verified + 199,
+        coding,
+        [0x21; 32],
+    );
+    assert_eq!(
+        table.block_phase(&block::Hash([0xC2; 32])),
+        Some(BlockPhase::Collecting)
+    );
+    table.assert_invariants();
+}
+
+/// bpv1-76: the verified-tip bound gates admission only. A reorg that lowers
+/// the verified tip keeps a block admitted above the new bound, and refuses new
+/// metadata at that height.
+#[test]
+fn bpv1_76_a_verified_tip_rollback_keeps_admitted_blocks() {
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let t0 = Instant::now();
+    let coding = Profile::TINY.derive_coding(128, 2).unwrap();
+    let verified = 100;
+    let height = verified + PROPAGATION_DEPTH;
+    table.step(t0, BlockInput::TipHeight { height: verified });
+    let admitted = block::Hash([0xE1; 32]);
+    admit_block(&mut table, t0, admitted, height, coding, [0x21; 32]);
+
+    let step = table.step(
+        t0,
+        BlockInput::TipHeight {
+            height: verified - 2,
+        },
+    );
+    assert!(!step
+        .events
+        .contains(&BlockEvent::Retired { block_id: admitted }));
+    assert_eq!(table.block_phase(&admitted), Some(BlockPhase::Collecting));
+
+    let late = make_envelope(block::Hash([0xE2; 32]), coding, [0x21; 32], node_id(1));
+    let received = receive(&mut table, t0, late);
+    let step = header_result(
+        &mut table,
+        t0,
+        &received,
+        HeaderAdmissionResult::Admitted { height },
+    );
+    assert!(!step
+        .outputs
+        .iter()
+        .any(|o| matches!(o, BlockOutput::VerifyCommitment { .. })));
+    table.assert_invariants();
+}
+
+/// bpv1-7: retirement and admission use one propagation window, so a block
+/// the window refuses is never kept, and a block it accepts is never retired.
+#[test]
+fn bpv1_7_retirement_matches_the_admission_window() {
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let t0 = Instant::now();
+    let coding = Profile::TINY.derive_coding(128, 2).unwrap();
+    table.step(t0, BlockInput::TipHeight { height: 49 });
+    let edge = block::Hash([0xD1; 32]);
+    admit_block(&mut table, t0, edge, 50, coding, [0x21; 32]);
+
+    // `top = 50 + PROPAGATION_DEPTH - 1` keeps height 50 in the window.
+    let step = table.step(
+        t0,
+        BlockInput::TipHeight {
+            height: 50 + PROPAGATION_DEPTH - 1,
+        },
+    );
+    assert!(!step
+        .events
+        .contains(&BlockEvent::Retired { block_id: edge }));
+    // At `top = 50 + PROPAGATION_DEPTH`, admission refuses height 50, so it retires.
+    let step = table.step(
+        t0,
+        BlockInput::TipHeight {
+            height: 50 + PROPAGATION_DEPTH,
+        },
+    );
+    assert!(step
+        .events
+        .contains(&BlockEvent::Retired { block_id: edge }));
     table.assert_invariants();
 }
 

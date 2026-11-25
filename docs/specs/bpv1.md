@@ -48,6 +48,10 @@ the BPv1 implementation decisions:
 - **The proposer's silence (decision-20):** The proposer sends `HeaderMeta`
   and `BlockDone`, never `Have`. `BlockDone` means the sender holds every
   part. Repair rounds, but not normal pulls, may ask any `BlockDone` peer.
+- **`Have`s to the proposer (decision-32):** Every node announces to the
+  proposer each verified part that the proposer did not send it, at once and
+  unpaced. The proposer never pulls these parts. Its trace then records when
+  each neighbour obtained each part.
 - **Estimate-based repair (decision-22):** Repair starts after `SLOW_X` × one
   part's estimated arrival time without progress, doubling per round. The first
   repair round releases the body claim, so native block sync races.
@@ -244,8 +248,14 @@ block it proposed. `top` never decreases. A header that headerchain retains
 but has not selected, such as a fork or a future-dated header, does not raise
 `top`. A node MUST NOT admit
 metadata for a block at or below `top - PROPAGATION_DEPTH` (strictly
-`height + PROPAGATION_DEPTH > top`). Such a block uses the existing
-block-download path.
+`height + PROPAGATION_DEPTH > top`). A node also MUST NOT admit metadata for a
+block more than `PROPAGATION_DEPTH` above its verified tip. While a node catches
+up, header sync raises `top` far above the verified tip, and such a block cannot
+commit until its ancestors arrive. Such blocks use the existing block-download
+path. A node retires a block once it falls to or below `top - PROPAGATION_DEPTH`.
+The verified-tip bound applies at admission only. A reorg can lower the verified
+tip, and a block admitted above the new bound keeps its slot until it completes
+or reaches its deadline.
 
 The coinbase commitment binds `proposer_node` to the block. A node therefore
 accepts relay flags only from the connection authenticated as `proposer_node`,
@@ -947,6 +957,13 @@ only such parts. It SHOULD batch announcements for at most `HAVE_FLUSH_MS` or
 its own block (decision-20, bpv1-9). The receiver uses `Have`s to choose pulls,
 to skip sends, and to measure lag.
 
+A node SHOULD send the block's proposer an unflagged `Have` for each part it
+verifies, received or reconstructed, unless the proposer sent it that part
+(decision-32). It sends the `Have` at once, without pacing, and also after the
+proposer's `BlockDone`. It MUST NOT push or send the proposer a part. The
+proposer accepts these `Have`s under the usual cadence and retired-counter
+rules, records them for its trace, and never pulls for them.
+
 A `Have` with the push flag states that the sender will push the listed parts
 behind it on the data stream (section 3). A holder sets it for its own pushed
 seeds. The proposer sets it for its seeds and direct copies, and adds the relay
@@ -966,8 +983,8 @@ above `advert_window_full_size_bytes`, and linear between. The node announces
 verified parts to the initial group at once. Every other peer becomes eligible
 at admission plus `advert_delay`, and then receives one `Have` of the parts it
 still lacks. At both times the node skips a part that the peer announced or
-sent, and a stripe or block the peer finished. Flagged `Have`s, seeds, and
-repair are not paced.
+sent, and a stripe or block the peer finished. Flagged `Have`s, `Have`s to the
+proposer, seeds, and repair are not paced.
 
 An out-of-range index or a repeated index returns `Disconnect` while the
 receiver retains the block's peer view. A push flag past the connection's

@@ -127,7 +127,9 @@ finished its stripe. A holder never pushes any other part.
 
 Every node announces the parts it verifies with `Have`. It announces at once to
 an initial group of peers and to the rest after a delay. Main's block gossip
-uses the same pacing and settings.
+uses the same pacing and settings. A node also announces at once to the
+block's proposer every part the proposer did not send it. The proposer never
+pulls these parts. Its trace shows when each neighbour obtained each part.
 
 A node pulls an announced part it lacks with a `Want` that names exact indices.
 It asks the announcer whose copy would arrive first, by that peer's round-trip

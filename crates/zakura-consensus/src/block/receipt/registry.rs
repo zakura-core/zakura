@@ -38,6 +38,9 @@ type Active = Arc<Mutex<HashMap<block::Hash, Vec<Entry>>>>;
 /// arrived inside the claim's deadline and no block this node mined at that height outranks the
 /// claim. Otherwise it keeps its own arrival order. Every body under a claimed hash can take
 /// the same order, while still having a receipt of its own.
+///
+/// Deliveries that share a receipt also take turns verifying: see
+/// [`ReceiptGuard::verification_turn`].
 #[derive(Clone, Debug, Default)]
 pub(in crate::block) struct ReceiptRegistry {
     pub(super) active: Active,
@@ -51,7 +54,12 @@ pub(super) struct Entry {
     block: BlockHandle,
     order: u64,
     callers: usize,
+    /// Held by the one caller verifying this body. The others wait for it to finish.
+    turn: VerificationTurn,
 }
+
+/// The lock that lets one delivery of a body verify at a time.
+type VerificationTurn = Arc<tokio::sync::Mutex<()>>;
 
 /// Keeps a block's receipt active until its verification finishes or is cancelled.
 pub(in crate::block) struct ReceiptGuard {
@@ -59,6 +67,8 @@ pub(in crate::block) struct ReceiptGuard {
     /// The hash and body this receipt is registered under, or `None` for an untracked receipt.
     pub(super) registered: Option<(block::Hash, BlockHandle)>,
     pub(in crate::block) order: u64,
+    /// The turn shared by every delivery of the registered body.
+    turn: Option<VerificationTurn>,
 }
 
 impl ReceiptRegistry {
@@ -107,7 +117,7 @@ impl ReceiptRegistry {
     ) -> (ReceiptGuard, Option<ClaimOutcome>) {
         let claim = self.claims.resolve(hash, block.coinbase_height(), arrival);
         let new_order = claim.claimed_order().unwrap_or(arrival.order);
-        let (order, registered, counted) = {
+        let (order, registered, turn, counted) = {
             let mut active = self
                 .active
                 .lock()
@@ -119,22 +129,35 @@ impl ReceiptRegistry {
                     .callers
                     .checked_add(1)
                     .expect("each active caller owns memory, so its count fits in usize");
-                (entry.order, Some((hash, entry.block.clone())), None)
+                (
+                    entry.order,
+                    Some((hash, entry.block.clone())),
+                    Some(entry.turn.clone()),
+                    None,
+                )
             } else if bodies.len() < MAX_BODIES_PER_HASH {
+                let turn = VerificationTurn::default();
                 bodies.push(Entry {
                     block: block.clone(),
                     order: new_order,
                     callers: 1,
+                    turn: turn.clone(),
                 });
-                (new_order, Some((hash, block.clone())), Some(claim))
+                (
+                    new_order,
+                    Some((hash, block.clone())),
+                    Some(turn),
+                    Some(claim),
+                )
             } else {
-                (new_order, None, None)
+                (new_order, None, None, None)
             }
         };
         let receipt = ReceiptGuard {
             active: self.active.clone(),
             registered,
             order,
+            turn,
         };
         (receipt, counted)
     }
@@ -148,6 +171,42 @@ impl ReceiptRegistry {
         order: u64,
     ) -> MinedGuard {
         self.claims.mark_mined(hash, height, order)
+    }
+}
+
+impl ReceiptGuard {
+    /// Waits until no other delivery of this body is verifying, and returns the turn.
+    ///
+    /// Legacy gossip, native block sync and BPv1 can each deliver the same block. Without turns,
+    /// every delivery that arrives before the first one commits passes the duplicate check and
+    /// verifies the whole block again. With them, a later delivery waits, then finds the block in
+    /// state and reports a duplicate. If the earlier delivery fails or is cancelled, the waiting
+    /// one verifies the body itself.
+    ///
+    /// Only deliveries of an equal body share a turn, so a peer's invalid body under a real
+    /// header never delays the valid one. An untracked receipt verifies at once.
+    pub(in crate::block) async fn verification_turn(
+        &self,
+    ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        let turn = self.turn.clone()?;
+        match turn.clone().try_lock_owned() {
+            Ok(guard) => Some(guard),
+            Err(_) => {
+                metrics::counter!("state.semantic_commit.in_flight_waits").increment(1);
+                Some(turn.lock_owned().await)
+            }
+        }
+    }
+
+    /// Takes the turn only if no other delivery of this body is verifying, and never waits.
+    ///
+    /// A miner's own submission must not wait behind a network copy of its block: it would lose
+    /// its prepared fast path and return a duplicate that never publishes over BPv1. When it is
+    /// first, later deliveries still wait for it as [`Self::verification_turn`] describes.
+    pub(in crate::block) fn try_verification_turn(
+        &self,
+    ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        self.turn.clone()?.try_lock_owned().ok()
     }
 }
 

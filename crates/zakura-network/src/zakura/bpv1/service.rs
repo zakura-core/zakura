@@ -2276,6 +2276,16 @@ fn record_peer_event(event: &PeerEvent, peer: &NodeId) {
             metrics::counter!("zakura.p2p.bpv1.have.indices", "group" => group)
                 .increment(*count as u64);
         }
+        PeerEvent::HaveSentToProposer { block_id, count } => {
+            tracing::debug!(target: "bpv1_stage", %block_id, ?peer, count, "have_to_proposer");
+            // Widening usize to u64 is lossless on supported 64-bit targets.
+            metrics::counter!("zakura.p2p.bpv1.have.indices", "group" => "proposer")
+                .increment(*count as u64);
+        }
+        PeerEvent::ProposerHeardHave { block_id, indices } => {
+            tracing::debug!(target: "bpv1_stage", %block_id, ?peer, ?indices,
+                "proposer_heard_have");
+        }
         PeerEvent::CopiesQueued { bytes, .. } => {
             metrics::counter!("zakura.p2p.bpv1.seed.bytes", "deal" => "direct").increment(*bytes);
         }

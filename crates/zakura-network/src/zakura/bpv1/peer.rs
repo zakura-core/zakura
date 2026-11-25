@@ -613,6 +613,23 @@ pub enum PeerEvent {
         /// Whether the peer is outside the block's initial group.
         delayed: bool,
     },
+    /// This node announced `count` verified indices to the block's proposer
+    /// (decision-32).
+    HaveSentToProposer {
+        /// Block consensus hash.
+        block_id: block::Hash,
+        /// Announced indices.
+        count: usize,
+    },
+    /// This node proposed the block, and a neighbour announced `indices`
+    /// (decision-32). The proposer's trace records when each neighbour got
+    /// each part.
+    ProposerHeardHave {
+        /// Block consensus hash.
+        block_id: block::Hash,
+        /// Announced indices.
+        indices: Vec<u32>,
+    },
     /// The advertisement deadline dropped `count` held indices that the
     /// skip rules no longer allow (decision-26).
     HaveSkippedAtDeadline {
@@ -1215,7 +1232,12 @@ impl PeerState {
                 indices,
                 push,
             } => {
-                if push {
+                // decision-32: the proposer gets a plain `Have` for a pushed seed too.
+                let to_proposer = self
+                    .blocks
+                    .get(&block_id)
+                    .is_some_and(|block| self.remote_node == block.proposer_node);
+                if push && !to_proposer {
                     self.push_seeds(block_id, indices, &mut step);
                 } else {
                     self.handle_ready(now, block_id, indices, &mut step);
@@ -1606,7 +1628,40 @@ impl PeerState {
             return;
         }
         // bpv1-9 / decision-20: the proposer never announces its own block.
-        if block.peer_block_done || block.as_proposer {
+        if block.as_proposer {
+            return;
+        }
+        // decision-32: the proposer hears of every part this node verifies,
+        // except the parts it sent here, at once and outside decision-26's
+        // pacing. The proposer holds every part, so it never asks for one.
+        if self.remote_node == block.proposer_node {
+            let announced: Vec<u32> = indices
+                .into_iter()
+                .filter(|&index| {
+                    // Widening u32 to usize is lossless on supported targets.
+                    let i = index as usize;
+                    !block.recv_record.get(i) && !block.local_have_sent.get(i)
+                })
+                .collect();
+            for &index in &announced {
+                block.local_have_sent.set(index as usize);
+            }
+            for chunk in announced.chunks(W2_MAX_HAVE_INDICES) {
+                let mut indices = chunk.to_vec();
+                indices.sort_unstable();
+                step.events.push(PeerEvent::HaveSentToProposer {
+                    block_id,
+                    count: indices.len(),
+                });
+                step.outputs.push(PeerOutput::SendHave {
+                    block_id,
+                    flags: HaveFlags::Plain,
+                    indices,
+                });
+            }
+            return;
+        }
+        if block.peer_block_done {
             return;
         }
 
@@ -1830,6 +1885,9 @@ impl PeerState {
                 indices,
                 relay: flags.relay(),
             });
+        } else if block.as_proposer {
+            step.events
+                .push(PeerEvent::ProposerHeardHave { block_id, indices });
         } else {
             step.outputs.push(PeerOutput::PeerHas { block_id, indices });
         }

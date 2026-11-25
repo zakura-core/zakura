@@ -16,7 +16,7 @@ mod log_capture;
 use zakura_chain::{
     block::Height,
     chain_tip::mock::MockChainTip,
-    parameters::{Network, POST_NU7_POW_TARGET_SPACING},
+    parameters::{Network, NetworkUpgrade, POST_NU7_POW_TARGET_SPACING},
 };
 use zakurad::components::sync::end_of_support::{
     self, PastSupport, SupportWindow, CHECK_INTERVAL, EOS_KEEPS_RUNNING_MESSAGE_HEADER,

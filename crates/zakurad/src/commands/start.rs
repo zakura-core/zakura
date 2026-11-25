@@ -789,8 +789,11 @@ impl StartCmd {
         // The pool is chosen once, at startup. `tx-relay` needs the pool
         // core's port before the network starts, so it is built here and
         // handed to the core below.
-        let pool_implementation = config.mempool.implementation.resolve();
-        let tx_relay_port = if config.network.zakura.tx_relay.enabled {
+        let v2_p2p = config.network.v2_p2p();
+        let pool_implementation = config.mempool.implementation.resolve(v2_p2p);
+        // The service is registered on the v2 endpoint, which a legacy-only
+        // stack never starts, so a legacy-only core keeps the adapter path.
+        let tx_relay_port = if config.network.zakura.tx_relay.enabled && v2_p2p {
             if pool_implementation == mempool::config::Implementation::Core {
                 let port = mempool::core::TxRelayPort::new();
                 custom_services.push(zakura_network::zakura::tx_relay_service(
@@ -801,7 +804,8 @@ impl StartCmd {
                 ));
                 Some(port)
             } else {
-                warn!("tx-relay needs `[mempool] implementation = \"core\"`, so it stays off");
+                // `tx-relay` is on by default, so this is the `classic` rollback.
+                info!("tx-relay runs only with the pool core, so it stays off");
                 None
             }
         } else {
@@ -811,9 +815,7 @@ impl StartCmd {
         // The network counts `tx-relay`'s memory shares only when it is
         // registered, not merely enabled.
         network_config.zakura.tx_relay.enabled = tx_relay_port.is_some();
-        // The service is registered on the v2 endpoint, which a legacy-only
-        // stack never starts.
-        let tx_relay_registered = tx_relay_port.is_some() && config.network.v2_p2p();
+        let tx_relay_registered = tx_relay_port.is_some();
         info!(
             configured = config.network.zakura.tx_relay.enabled,
             registered = tx_relay_registered,

@@ -28,7 +28,8 @@ use crate::{
         INBOUND_PEER_LIMIT_MULTIPLIER, OUTBOUND_PEER_LIMIT_DIVISOR, OUTBOUND_PEER_LIMIT_MULTIPLIER,
     },
     zakura::{
-        ZakuraLocalLimits, DEFAULT_HS_RANGE, DEFAULT_TESTNET_ZAKURA_BOOTSTRAP_PEERS,
+        retired_seed_replacements, ZakuraConfig, ZakuraLocalLimits, DEFAULT_HS_RANGE,
+        DEFAULT_MAINNET_ZAKURA_BOOTSTRAP_PEERS, DEFAULT_TESTNET_ZAKURA_BOOTSTRAP_PEERS,
         DEFAULT_ZAKURA_BOOTSTRAP_PEERS, DEFAULT_ZAKURA_BUDGETED_CONNECTIONS,
         DEFAULT_ZAKURA_LISTEN_ADDR, DEFAULT_ZAKURA_MAX_CONNS_PER_IP,
     },
@@ -1333,6 +1334,32 @@ fn zakura_bootstrap_peers_parse_in_nested_config() {
     assert_eq!(config.zakura.message_rate_per_second, 5);
 }
 
+/// Config load checks the budget without `tx-relay`, which zakurad turns off
+/// with the classic pool, so a budget that funds the floor only without it
+/// still loads.
+#[test]
+fn zakura_peer_memory_budget_at_load_leaves_out_tx_relay() {
+    let _init_guard = zakura_test::init();
+
+    // One 256 MiB socket queue, 32 handshakes of 64 MiB, and Mainnet's floor
+    // of 17 connections of 141,945,123 bytes, which is 16 with `tx-relay`'s
+    // 4,259,840 bytes added to each.
+    let config: Config = toml::from_str(
+        r#"
+        p2p_stack = "dual"
+
+        [zakura]
+        peer_memory_budget_bytes = 4828986195
+        "#,
+    )
+    .expect("the budget funds the floor without tx-relay");
+    assert!(config.zakura.tx_relay.enabled);
+    assert!(config
+        .zakura
+        .budgeted_max_connections(&config.network)
+        .is_err());
+}
+
 #[test]
 fn zakura_peer_memory_budget_lowers_or_refuses_at_load() {
     let _init_guard = zakura_test::init();
@@ -1360,12 +1387,12 @@ fn zakura_peer_memory_budget_lowers_or_refuses_at_load() {
         r#"
         [zakura]
         max_connections = 256
-        peer_memory_budget_bytes = 38753870592
+        peer_memory_budget_bytes = 39844389632
         "#,
     )
     .unwrap();
     // One 256 MiB socket queue, 32 handshakes of 64 MiB, and 256 admitted
-    // connections of 141,945,123 bytes.
+    // connections of 146,204,963 bytes.
     assert_eq!(
         config.zakura.budgeted_max_connections(&config.network),
         Ok(256)
@@ -3021,5 +3048,155 @@ fn block_download_score_and_hedge_is_off_by_default_and_rejects_unknown_keys() {
     assert!(
         toml::from_str::<Config>("[block_download_score_and_hedge]\nenabeld = true").is_err(),
         "a misspelled key is rejected"
+    );
+}
+
+/// The Mainnet defaults before p2p-v2/4, as configs written then spell them out.
+const RETIRED_MAINNET_DEFAULTS: [&str; 9] = [
+    "1398f62c6d1a457c51ba6a4b5f3dbd2f69fca93216218dc8997e416bd17d93ca@165.22.54.66:8234",
+    "fd1724385aa0c75b64fb78cd602fa1d991fdebf76b13c58ed702eac835e9f618@104.131.184.123:8234",
+    "9ec67ad6834bc2ca0d659c240e042d3446c37cabcc092b527d459c87d938b4a4@159.65.183.89:8234",
+    "bd3dc5d2a3d44c6bf90e364bf446231dbf9737e38a562ccf9e91ea631ea59b22@143.244.184.176:8234",
+    "14ab98fa0c4b07d40119e1dbc9f3c36d20c8f226ae5ba4216218a2034f148e57@159.203.38.10:8234",
+    "681d21b18644cd82ec13256a97f92bec1fff815683ef6f65dc7c993f098a4fe5@64.227.44.93:8234",
+    "058b3f20dc9bef7bb447f94d7663d793cfbc036720f97e52d7f13661b21818e1@161.35.156.226:8234",
+    "291323d78eb7186c3fa225ef5e305e95363e0ef06d42dca91bd4ef0254aed1ae@139.59.64.115:8234",
+    "85e425233a68697d4be91dd5d542305a8a327cd06d992d53c0913cef2fa75084@168.144.173.250:8234",
+];
+
+/// The Testnet defaults before p2p-v2/4.
+const RETIRED_TESTNET_DEFAULTS: [&str; 3] = [
+    "57ad39fad4f0bca46cf1ea831772a99d5027b372fef2be5a0ea68e1b5bb4da49@167.99.103.111:8234",
+    "2bbb907b5d90598ef49f2e637066586b311a64587479be6ed43e8388587fcd2a@164.92.209.78:8234",
+    "50999835f48f4a048c0e9042e5332844c9673943d7fab1f7e993bae698c27ea3@206.189.148.0:8234",
+];
+
+/// Replaces `entry` as the only entry of a list.
+fn replace_one(entry: &str) -> Option<String> {
+    retired_seed_replacements(&[entry]).remove(0)
+}
+
+/// Each seed's old default entry becomes its current default entry, on both networks,
+/// and a current entry is left alone.
+#[test]
+fn retired_default_entries_map_onto_the_current_defaults() {
+    let old = RETIRED_MAINNET_DEFAULTS
+        .iter()
+        .chain(&RETIRED_TESTNET_DEFAULTS);
+    let current = DEFAULT_MAINNET_ZAKURA_BOOTSTRAP_PEERS
+        .iter()
+        .chain(DEFAULT_TESTNET_ZAKURA_BOOTSTRAP_PEERS);
+
+    for (old, current) in old.zip(current) {
+        assert_eq!(replace_one(old).as_deref(), Some(*current), "{old}");
+        assert_eq!(replace_one(current), None, "{current}");
+    }
+}
+
+#[test]
+fn replace_retired_seed_node_id_keeps_the_written_address() {
+    let (retired, _) = RETIRED_MAINNET_DEFAULTS[0].split_once('@').unwrap();
+    let (current, _) = DEFAULT_MAINNET_ZAKURA_BOOTSTRAP_PEERS[0]
+        .split_once('@')
+        .unwrap();
+
+    assert_eq!(
+        replace_one(&format!("{retired}@192.0.2.7:9000")),
+        Some(format!("{current}@192.0.2.7:9000")),
+    );
+    assert_eq!(
+        replace_one(&format!("{}@192.0.2.7:9000", retired.to_uppercase())),
+        Some(format!("{current}@192.0.2.7:9000")),
+        "node IDs compare as values, not as text",
+    );
+
+    for untouched in [
+        format!("{}@192.0.2.7:9000", "ab".repeat(32)),
+        retired.to_string(),
+        "not-a-node-id@192.0.2.7:9000".to_string(),
+    ] {
+        assert_eq!(replace_one(&untouched), None, "{untouched}");
+    }
+}
+
+#[test]
+fn replace_retired_seed_node_ids_reports_each_replacement() {
+    let other = format!("{}@192.0.2.9:8234", "cd".repeat(32));
+    let mut zakura = ZakuraConfig {
+        bootstrap_peers: vec![
+            RETIRED_MAINNET_DEFAULTS[2].to_string(),
+            other.clone(),
+            RETIRED_TESTNET_DEFAULTS[1].to_string(),
+        ],
+        ..ZakuraConfig::default()
+    };
+
+    let replaced = zakura.replace_retired_seed_node_ids();
+
+    let expected = vec![
+        DEFAULT_MAINNET_ZAKURA_BOOTSTRAP_PEERS[2].to_string(),
+        other,
+        DEFAULT_TESTNET_ZAKURA_BOOTSTRAP_PEERS[1].to_string(),
+    ];
+    assert_eq!(zakura.bootstrap_peers, expected);
+    assert_eq!(
+        replaced,
+        vec![
+            (RETIRED_MAINNET_DEFAULTS[2].to_string(), expected[0].clone()),
+            (RETIRED_TESTNET_DEFAULTS[1].to_string(), expected[2].clone()),
+        ]
+    );
+    assert!(
+        zakura.replace_retired_seed_node_ids().is_empty(),
+        "a second pass finds nothing"
+    );
+}
+
+/// A generated config spells out the Mainnet defaults, possibly by their retired IDs. On
+/// Testnet that list still counts as the implicit default, so the node gets the Testnet
+/// seeds. On Mainnet it is kept as written, so the startup replacement reports it.
+#[test]
+fn retired_mainnet_defaults_follow_the_network() {
+    let peers = RETIRED_MAINNET_DEFAULTS
+        .iter()
+        .map(|entry| format!("'{entry}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let parse = |network: &str| -> Config {
+        toml::from_str(&format!(
+            "network = '{network}'\n[zakura]\nbootstrap_peers = [{peers}]"
+        ))
+        .expect("config with retired default seeds parses")
+    };
+
+    assert_eq!(
+        parse("Testnet").zakura.bootstrap_peers,
+        default_testnet_zakura_bootstrap_peers()
+    );
+    assert_eq!(
+        parse("Mainnet").zakura.bootstrap_peers,
+        RETIRED_MAINNET_DEFAULTS.map(String::from)
+    );
+}
+
+/// A list that already names a seed by its current ID keeps the seed's retired entry, so
+/// the two never join into one wider bootstrap dial.
+#[test]
+fn retired_entry_is_kept_when_the_current_id_is_listed() {
+    let (retired, _) = RETIRED_MAINNET_DEFAULTS[0].split_once('@').unwrap();
+    let (current, _) = DEFAULT_MAINNET_ZAKURA_BOOTSTRAP_PEERS[0]
+        .split_once('@')
+        .unwrap();
+    let other_seed = RETIRED_MAINNET_DEFAULTS[1];
+    let retired_entry = format!("{retired}@192.0.2.1:8234");
+    let current_entry = format!("{current}@192.0.2.2:8234");
+
+    assert_eq!(
+        retired_seed_replacements(&[&retired_entry, &current_entry, other_seed]),
+        vec![
+            None,
+            None,
+            Some(DEFAULT_MAINNET_ZAKURA_BOOTSTRAP_PEERS[1].to_string())
+        ],
     );
 }

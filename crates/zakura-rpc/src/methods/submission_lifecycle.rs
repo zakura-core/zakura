@@ -153,6 +153,17 @@ impl RelayPolicy {
         let published = bpv1.publish_solved_block(block.clone(), height);
         tracing::debug!(?hash, ?height, published, stage, "bpv1 solved-block hook");
     }
+
+    fn retire_bpv1(&self, hash: block::Hash) {
+        if let Self::AfterStateAdmission {
+            bpv1_proposer: Some(bpv1),
+            ..
+        } = self
+        {
+            bpv1.retire_failed_block(hash);
+            tracing::debug!(?hash, "bpv1 retired a block whose commit failed");
+        }
+    }
 }
 
 /// A decoded submission whose entry point has already checked height and reserved capacity.
@@ -271,10 +282,7 @@ impl Submission {
                     if let Some(relay) = authorized {
                         // Only state admission publishes before commit: trusted early relay
                         // precedes verification.
-                        if matches!(relay, EarlyBlockRelay::StateAdmission(_)) {
-                            policy.publish_bpv1(&self.block, self.hash, self.height, "admitted");
-                            bpv1_attempted = true;
-                        }
+                        let publish_early = matches!(relay, EarlyBlockRelay::StateAdmission(_));
                         if policy.announces_early() {
                             let registration = match &policy {
                                 RelayPolicy::AfterStateAdmission { pending_blocks, .. } => {
@@ -304,12 +312,28 @@ impl Submission {
                                 admitted_registration.take();
                             }
                         }
+                        // BPv1 serializes and hashes the block before it publishes, so it
+                        // runs after the early announcement is queued.
+                        if publish_early {
+                            policy.publish_bpv1(&self.block, self.hash, self.height, "admitted");
+                            bpv1_attempted = true;
+                        }
                     }
                     verification.await
                 }
             };
             if !bpv1_attempted && matches!(result, VerificationOutcome::Completed(Ok(_))) {
                 policy.publish_bpv1(&self.block, self.hash, self.height, "committed");
+            }
+            // BPv1 published at admission, but the commit failed. A duplicate verdict means
+            // the block is already in state, so BPv1 keeps relaying it.
+            let commit_failed = matches!(
+                &result,
+                VerificationOutcome::Completed(verified)
+                    if verified.is_err() && !is_duplicate(verified)
+            );
+            if bpv1_attempted && commit_failed {
+                policy.retire_bpv1(self.hash);
             }
             let (registration, duplicate_body) = match policy {
                 RelayPolicy::AfterStateAdmission { .. } => (admitted_registration, None),

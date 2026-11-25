@@ -341,11 +341,11 @@ mod tests {
         let mut slots = ConnectionSlots::default();
         let member = node(1);
         let preferred = PreferredGateways::form(
-            [RankedGateway {
-                node: member,
-                blocks: 1,
-                standing: GatewayStanding::Connected,
-            }],
+            [RankedGateway::resolved(
+                member,
+                1,
+                GatewayStanding::Connected,
+            )],
             1,
         );
         assert_eq!(

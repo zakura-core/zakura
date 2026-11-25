@@ -8,7 +8,7 @@
 
 use std::{fmt, sync::Arc};
 
-use zakura_chain::block::{Block, Height};
+use zakura_chain::block::{self, Block, Height};
 
 /// Exact null-data push payload length for a BPv1 coinbase commitment
 /// (`ASCII("BPV1") || 0x01 || C`, 37 bytes -> 39-byte `OP_RETURN` script ->
@@ -59,4 +59,12 @@ pub trait Bpv1ProposerHook: Send + Sync + fmt::Debug {
     /// (e.g. pool-built coinbases or external submissions that missed the
     /// prepared encoding — left cleanly to existing relay).
     fn publish_solved_block(&self, block: Arc<Block>, height: Height) -> bool;
+
+    /// Stops BPv1 relay of a block that [`Self::publish_solved_block`]
+    /// published before its local commit, because that commit failed.
+    ///
+    /// Drops the parts still queued to peers, and peers that connect later
+    /// never hear of the block. Does nothing for a block this node did not
+    /// propose.
+    fn retire_failed_block(&self, hash: block::Hash);
 }

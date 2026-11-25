@@ -7,7 +7,9 @@
 //! target's node ID the same way, so an outbound claim stands for each.
 
 use super::*;
-use crate::zakura::{GatewayStanding, RankedGateway, SlotSplit};
+use zakura_chain::miner_mesh::GatewayId;
+
+use crate::zakura::{GatewayStanding, RankedGateway, SlotSplit, MAX_RANKED_GATEWAYS};
 
 fn handler_from_config(config: &Config) -> ZakuraProtocolHandler {
     let limits = ZakuraLocalLimits::from_config(config);
@@ -47,11 +49,7 @@ fn publish(handler: &ZakuraProtocolHandler, ranking: &[(NodeId, GatewayStanding)
     let ranked = ranking
         .iter()
         .zip((1..=count).rev())
-        .map(|(&(node, standing), blocks)| RankedGateway {
-            node,
-            blocks,
-            standing,
-        });
+        .map(|(&(node, standing), blocks)| RankedGateway::resolved(node, blocks, standing));
     handler.publish_gateway_ranking(ranked);
 }
 
@@ -311,7 +309,7 @@ fn a_caller_in_backoff_is_granted() {
 /// A full ordinary pool can immediately admit every funded gateway.
 #[test]
 fn default_and_explicit_memory_budgets_fund_gateways_after_ordinary_peers() {
-    for (budget, extra) in [(None, 10), (Some(15_u64 << 30), 4), (Some(14_u64 << 30), 0)] {
+    for (budget, extra) in [(None, 10), (Some(15_u64 << 30), 1), (Some(14_u64 << 30), 0)] {
         let mut config = Config::default();
         if let Some(bytes) = budget {
             config.zakura.peer_memory_budget_bytes = bytes;
@@ -477,11 +475,8 @@ fn simultaneous_claims_never_pass_the_ordinary_limit() {
 }
 
 fn publish_tied_gateways(handler: &ZakuraProtocolHandler, first: NodeId, second: NodeId) {
-    let ranking = [first, second].map(|node| RankedGateway {
-        node,
-        blocks: 1,
-        standing: GatewayStanding::Dialable,
-    });
+    let ranking =
+        [first, second].map(|node| RankedGateway::resolved(node, 1, GatewayStanding::Dialable));
     handler.publish_gateway_ranking(ranking);
 }
 
@@ -543,11 +538,8 @@ fn ranking_publication_reconciles_authenticated_slots() {
         let incumbent = new_node();
         let challenger = new_node();
         publish_tied_gateways(&handler, incumbent, challenger);
-        let stale = [challenger, incumbent].map(|node| RankedGateway {
-            node,
-            blocks: 1,
-            standing: GatewayStanding::Dialable,
-        });
+        let stale = [challenger, incumbent]
+            .map(|node| RankedGateway::resolved(node, 1, GatewayStanding::Dialable));
         let mut slot = handler.claim_connection(incumbent, inbound).unwrap();
         if !inbound {
             slot.outbound_connected();
@@ -564,7 +556,7 @@ fn ranking_publication_reconciles_authenticated_slots() {
         drop(slot);
         assert_eq!(preferred_set(&handler), [challenger]);
         let mut stale_connected = stale;
-        stale_connected[1].standing = GatewayStanding::Connected;
+        stale_connected[1] = stale_connected[1].with_standing(GatewayStanding::Connected);
         handler.publish_gateway_ranking(stale_connected);
         assert_eq!(preferred_set(&handler), [challenger]);
     }
@@ -603,10 +595,12 @@ fn publication_checks_live_owners_at_the_ranking_cutoff() {
     let lower = nodes[257];
     let _lower = handler.claim_connection(lower, true).unwrap();
     let _tied = handler.claim_connection(tied, true).unwrap();
-    handler.publish_gateway_ranking(nodes.into_iter().map(|node| RankedGateway {
-        node,
-        blocks: if node == lower { 1 } else { 2 },
-        standing: GatewayStanding::Dialable,
+    handler.publish_gateway_ranking(nodes.into_iter().map(|node| {
+        RankedGateway::resolved(
+            node,
+            if node == lower { 1 } else { 2 },
+            GatewayStanding::Dialable,
+        )
     }));
     assert_eq!(preferred_set(&handler), [tied]);
 }
@@ -764,4 +758,76 @@ fn a_dialing_or_dialable_member_leaves_the_set_with_its_last_slot() {
         assert_eq!(preferred_set(&handler), [next], "{standing:?}");
         assert_eq!(hold(&handler), 1);
     }
+}
+
+/// A node ID whose first 20 bytes are `prefix` and the rest `last`, so two
+/// such IDs can share a gateway ID.
+fn node_with_prefix(prefix: u8, last: u8) -> NodeId {
+    let mut bytes = [last; 32];
+    bytes[..20].fill(prefix);
+    NodeId::from_bytes(&bytes)
+}
+
+/// A node whose connection was proved after discovery's snapshot found no
+/// node with the gateway ID: publication resolves the gateway to it, and it
+/// takes the held place.
+#[test]
+fn publication_resolves_a_gateway_to_an_owner_proved_after_the_snapshot() {
+    let handler = handler(40, 1);
+    let gateway = node_with_prefix(1, 0x00);
+    let _inbound = handler
+        .claim_connection(gateway, true)
+        .expect("room for an ordinary inbound peer");
+
+    handler.publish_gateway_ranking([RankedGateway::unresolved(
+        GatewayId::from_node_id(gateway.as_bytes()),
+        1,
+    )]);
+
+    assert_eq!(preferred_set(&handler), [gateway]);
+    assert_eq!(hold(&handler), 1);
+}
+
+/// A gateway tied at the ranking cutoff that discovery's snapshot could not
+/// resolve joins at publication once a proved owner has its gateway ID, like
+/// a gateway above the cutoff.
+#[test]
+fn publication_resolves_a_tied_gateway_to_an_owner_proved_after_the_snapshot() {
+    let handler = handler(40, 1);
+    // The highest gateway ID sorts after the others, so it is the one tied
+    // entry left past the cutoff.
+    let gateway = node_with_prefix(0xff, 0x00);
+    let _inbound = handler
+        .claim_connection(gateway, true)
+        .expect("room for an ordinary inbound peer");
+
+    let others = (0..MAX_RANKED_GATEWAYS).map(|index| {
+        let mut id = [0; 20];
+        // The ranking holds at most 256 gateways, so the index fits in two bytes.
+        id[18..].copy_from_slice(&(index as u16).to_be_bytes());
+        RankedGateway::unresolved(GatewayId::from_bytes(id), 1)
+    });
+    let tied = RankedGateway::unresolved(GatewayId::from_node_id(gateway.as_bytes()), 1);
+    handler.publish_gateway_ranking(others.chain([tied]).collect::<Vec<_>>());
+
+    assert_eq!(preferred_set(&handler), [gateway]);
+    assert_eq!(hold(&handler), 1);
+}
+
+/// A proved owner that shares the gateway ID of the node discovery's
+/// snapshot named makes the gateway ambiguous: neither node is preferred and
+/// no place is held.
+#[test]
+fn publication_fails_closed_when_a_proved_owner_shares_a_resolved_gateway_id() {
+    let handler = handler(40, 1);
+    let named = node_with_prefix(1, 0x00);
+    let sharing = node_with_prefix(1, 0xff);
+    let _inbound = handler
+        .claim_connection(sharing, true)
+        .expect("room for an ordinary inbound peer");
+
+    handler.publish_gateway_ranking([RankedGateway::resolved(named, 1, GatewayStanding::Dialable)]);
+
+    assert!(preferred_set(&handler).is_empty());
+    assert_eq!(hold(&handler), 0);
 }

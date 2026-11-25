@@ -326,6 +326,49 @@ async fn fix2_committed_tip_retires_done_blocks_and_refuses_old_metadata() {
     shutdown.cancel();
 }
 
+/// bpv1-45: when the local commit of a published block fails, the proposer
+/// retires it, and a session that connects afterwards hears only of blocks
+/// still in flight.
+#[tokio::test]
+async fn bpv1_45_a_failed_local_commit_keeps_the_block_from_later_sessions() {
+    let shutdown = CancellationToken::new();
+    let (id_a, id_b, id_c) = (node_id(1), node_id(2), node_id(3));
+    let valid = || {
+        ports(
+            10,
+            ScriptedVerifier::new(VerifierVerdict::Valid),
+            SharedBodyClaims::new(),
+        )
+    };
+    let (svc_a, handle_a) = start(Profile::TINY, regtest_nu7(), id_a, valid(), &shutdown);
+    let (svc_b, _handle_b) = start(Profile::TINY, regtest_nu7(), id_b, valid(), &shutdown);
+    connect(&svc_a, id_a, &svc_b, id_b, &shutdown);
+
+    let failed = solved_block(&handle_a, Height(10), 11);
+    let kept = solved_block(&handle_a, Height(10), 12);
+    assert!(handle_a.publish_solved_block(&failed, 10));
+    assert!(handle_a.publish_solved_block(&kept, 10));
+    handle_a.retire_failed_block(failed.hash());
+    assert_eq!(
+        handle_a.block_phase(&failed.hash()),
+        Some(BlockPhase::Retired)
+    );
+
+    let (svc_c, handle_c) = start(Profile::TINY, regtest_nu7(), id_c, valid(), &shutdown);
+    connect(&svc_a, id_a, &svc_c, id_c, &shutdown);
+    wait_until("C commits the block still in flight", || {
+        handle_c.block_phase(&kept.hash()) == Some(BlockPhase::Done)
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        handle_c.block_phase(&failed.hash()),
+        None,
+        "the retired block is not replayed to a later session"
+    );
+    shutdown.cancel();
+}
+
 /// When native block sync commits a block that fell back,
 /// the committed snapshot ends its fallback and frees its parts without an
 /// eviction.

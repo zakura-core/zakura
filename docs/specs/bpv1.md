@@ -787,9 +787,13 @@ admission:
   that sent an equal copy, first or later. The check depends only on the copy
   and the admitted height, so an honest relay never forwards a copy that fails
   it.
-- When the first copy fails, the node checks one differing copy if its
-  metadata budget kept that copy. The kept copy gives way to any first copy
-  that needs the room.
+- The node keeps each differing copy while it fits the metadata budget.
+  Kept copies use only room that no first copy needs, and they give way to
+  any first copy that the node admits.
+- When the first copy fails, the node checks the kept copies one at a time,
+  in arrival order, until one passes.
+- A peer whose session ended gets no answer, so the node forgets it as a
+  sender of a copy.
 - Every other duplicate from another peer returns `Drop`, including each copy
   that arrives after the block is admitted.
 

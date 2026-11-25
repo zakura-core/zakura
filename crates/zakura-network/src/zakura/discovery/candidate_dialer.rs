@@ -359,12 +359,18 @@ impl CandidateDialerIO {
         if preferred {
             count_preferred_dial_result(outcome.result);
         }
-        let connected = self
-            .endpoint
-            .supervisor()
-            .moved_node_ids()
-            .borrow()
-            .current(attempt.node_id);
+        // Only a dial that registered its connection says which ID the node
+        // answered with. An earlier dial's move says nothing about a dial
+        // that failed.
+        let connected = match outcome.result {
+            DiscoveryDialResult::Registered | DiscoveryDialResult::ShortLivedRegistered => self
+                .endpoint
+                .supervisor()
+                .moved_node_ids()
+                .borrow()
+                .current(attempt.node_id),
+            _ => attempt.node_id,
+        };
         apply_discovery_dial_result(
             &self.discovery,
             DialedNode {
@@ -807,8 +813,8 @@ fn count_preferred_dial_result(result: DiscoveryDialResult) {
 }
 
 /// The node one attempt dialed, by the ID it dialed and the ID the node
-/// answers with now. They differ when the node has added keys since the
-/// book learned `dialed` (zakura-quic TLS-7).
+/// answered with. They differ when the dial registered a node that has
+/// added keys since the book learned `dialed` (zakura-quic TLS-7).
 #[derive(Clone, Copy, Debug)]
 struct DialedNode {
     dialed: NodeId,

@@ -6473,14 +6473,27 @@ pub(crate) async fn serve_reported_native_dial_connection(
     let peer_id = ZakuraPeerId::from_node_id(remote_node_id);
     if remote_node_id != dialed {
         // The node added keys since this node learned `dialed`, and answers
-        // under the ID it has now (zakura-quic TLS-7). If a connection to it
-        // is in its own handshake, the two meet in `register` like any
-        // simultaneous open.
+        // under the ID it has now (zakura-quic TLS-7, DIAL-9).
         endpoint.supervisor.learn_move(dialed, remote_node_id);
         if endpoint.supervisor.is_registered(&peer_id) {
-            close_redundant_dial(endpoint, &connection);
+            // The node already has a connection, which nothing could tell
+            // before TLS showed which node this dial reached. Close this one
+            // before the control handshake: the other end registers a
+            // connection as soon as it has acknowledged that handshake, and
+            // its duplicate rule would then cancel its side of the registered
+            // one, once that is older than
+            // `ZAKURA_SAME_IP_DUPLICATE_EVICT_MIN_AGE`. A dial to an earlier
+            // ID comes from a stale record or config entry, and must not
+            // replace a live connection.
+            #[cfg(any(test, zakura_sim))]
+            endpoint
+                .handler
+                .handshake_refused(&connection, "moved-peer-already-registered");
+            connection.close(VarInt::from_u32(ZAKURA_CLOSE_NEUTRAL), b"duplicate");
             return Ok(());
         }
+        // A connection to the node that is still in its own handshake meets
+        // this one in `register`, like any simultaneous open.
     }
     admission.outbound_connected(remote_node_id);
     let conn = ZakuraConnTrace::new(
@@ -6579,26 +6592,6 @@ pub(crate) async fn serve_reported_native_dial_connection(
             },
         )
         .await
-}
-
-/// Closes a dial's connection to a node that already has a registered one.
-/// The dial was to an earlier ID of the node, so nothing stopped it before
-/// TLS showed which node it reached.
-///
-/// The caller closes before the control handshake. The other end registers
-/// a connection as soon as it has acknowledged that handshake, and its
-/// duplicate rule would then cancel its side of the connection already
-/// registered, once that is older than
-/// [`ZAKURA_SAME_IP_DUPLICATE_EVICT_MIN_AGE`]. A dial to an earlier ID comes
-/// from a stale record or config entry, and must not replace a live connection.
-fn close_redundant_dial(endpoint: &ZakuraEndpoint, connection: &Connection) {
-    #[cfg(any(test, zakura_sim))]
-    endpoint
-        .handler
-        .handshake_refused(connection, "moved-peer-already-registered");
-    #[cfg(not(any(test, zakura_sim)))]
-    let _ = endpoint;
-    connection.close(VarInt::from_u32(ZAKURA_CLOSE_NEUTRAL), b"duplicate");
 }
 
 /// The protocol version the connection's ALPN selected (COMPAT-8). Both

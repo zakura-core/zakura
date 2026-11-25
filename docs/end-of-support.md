@@ -56,14 +56,19 @@ upgrades as they were when it was built, and later releases can change how
 they are handled. An upgrade that was scheduled after the release was built is
 invisible to it, and no warning or alert can report it.
 
-### Mining nodes
+### Mining nodes and RPCs
 
-Mining nodes always halt. A miner on outdated rules can build blocks that the
-network rejects, or extend a chain the network has left. A node counts as a
-mining node when `mining.miner_address` is set, because it can then build
-block templates, or when it runs the internal miner. On Mainnet such a node
-refuses to start with `--unsafe-ignore-end-of-support`. Other networks have no
-end of support, so the flag has no effect there and miners are not refused.
+A miner on outdated rules can build blocks that the network rejects, or
+extend a chain the network has left. On Mainnet, a node with
+`mining.miner_address` set or the internal miner enabled refuses to start with
+`--unsafe-ignore-end-of-support`.
+
+Once the Mainnet tip passes the last supported height, `getblocktemplate`
+(including requests waiting for new work), `submitblock`, and
+`submitsolution` reject requests. This also applies to nodes that accept full
+blocks from an external miner without a configured payout address, and takes
+effect before the next hourly support check. Other networks have no support
+cutoff.
 
 ### zcashd-compat mode
 

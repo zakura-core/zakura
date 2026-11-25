@@ -348,7 +348,8 @@ pub trait RpcServer {
     /// where releases reach an end of support. Zakura reports the estimated last
     /// height this release supports in `end_of_service.block_height`; the node
     /// halts when the tip goes past it, unless it was started with
-    /// `--unsafe-ignore-end-of-support`.
+    /// `--unsafe-ignore-end-of-support`. Mining RPCs reject requests once
+    /// the tip goes past this height, regardless of that flag.
     ///
     /// Some fields from the zcashd response are missing from Zakura's response:
     /// `version` and `subversion` are available from `getinfo`,
@@ -1737,6 +1738,7 @@ where
         let response = self
             .finish_mining_template(template, chain_info, miner_params)
             .await?;
+        self.check_mining_support()?;
         if let Some(GetBlockTemplateResponse::TemplateMode(template)) = &response {
             self.gbt
                 .trace
@@ -2112,12 +2114,33 @@ where
         self
     }
 
-    /// Sets the end-of-support height reported by `getdeprecationinfo`.
+    /// Sets the end-of-support height for mining RPCs and `getdeprecationinfo`.
     ///
-    /// When unset, or set to `None`, the RPC omits `end_of_service`.
+    /// With no height, mining RPCs have no support cutoff and
+    /// `getdeprecationinfo` omits `end_of_service`.
     pub fn with_end_of_support_height(mut self, end_of_support_height: Option<Height>) -> Self {
         self.end_of_support_height = end_of_support_height;
         self
+    }
+
+    /// Rejects mining requests when the best tip is past the last supported height.
+    fn check_mining_support(&self) -> Result<()> {
+        if let Some(last_supported_height) = self.end_of_support_height {
+            if self
+                .latest_chain_tip
+                .best_tip_height()
+                .is_some_and(|tip| tip > last_supported_height)
+            {
+                return Err(ErrorObject::new(
+                    0,
+                    format!(
+                        "Mining RPCs are disabled past the last supported height ({}). Upgrade to the latest Zakura release.",
+                        last_supported_height.0
+                    ),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Selects the method set and OpenRPC schema exposed by this instance.
@@ -3585,6 +3608,8 @@ where
             validate_block_proposal, zip317::select_mempool_transactions,
         };
 
+        self.check_mining_support()?;
+
         // Clone Services
         let mempool = self.mempool.clone();
         let mut latest_chain_tip = self.latest_chain_tip.clone();
@@ -3594,7 +3619,7 @@ where
             .as_ref()
             .and_then(GetBlockTemplateParameters::block_proposal_data)
         {
-            return validate_block_proposal(
+            let response = validate_block_proposal(
                 self.gbt.block_verifier_router(),
                 block_proposal_bytes,
                 &self.network,
@@ -3604,7 +3629,9 @@ where
                     .as_ref()
                     .and_then(|params| params.work_id.as_deref()),
             )
-            .await;
+            .await?;
+            self.check_mining_support()?;
+            return Ok(response);
         }
 
         // To implement long polling correctly, we split this RPC into multiple phases.
@@ -3643,6 +3670,8 @@ where
             // Set up the loop.
             // The loop returns the server long poll ID, which should be different to the client one.
             let (server_long_poll_id, chain_info, mempool_txs, mempool_tx_deps, submit_old) = loop {
+                self.check_mining_support()?;
+
                 // Check if we are synced to the tip.
                 // The result of this check can change during long polling.
                 //
@@ -3673,6 +3702,7 @@ where
                     cur_time,
                     ..
                 } = fetch_chain_info(read_state.clone()).await?;
+                self.check_mining_support()?;
                 // Tracking this iteration's parent marks the rejection state it snapshots as seen:
                 // this iteration's own parent update is not a reason to wake long polling again.
                 let Some(rejection_state) =
@@ -3870,6 +3900,8 @@ where
                 // But the coinbase value depends on the selected transactions, so this needs
                 // further analysis to check if it actually saves us any time.
 
+                // The tip may have advanced while the state or mempool request was in flight.
+                self.check_mining_support()?;
                 tokio::select! {
                     // Poll the futures in the listed order, for efficiency.
                     // We put the most frequent conditions first.
@@ -3894,6 +3926,7 @@ where
                     }
 
                     precomputed_coinbase = wait_for_new_tip => {
+                        self.check_mining_support()?;
                         self.gbt
                             .trace
                             .tip_woke(request_id, self.latest_chain_tip.best_tip_height_and_hash());
@@ -4006,6 +4039,7 @@ where
                 .finish_mining_template(template, &chain_info, miner_params)
                 .await?
             {
+                self.check_mining_support()?;
                 if let GetBlockTemplateResponse::TemplateMode(template) = &response {
                     self.gbt.trace.full_returned(
                         request_id,
@@ -4030,6 +4064,7 @@ where
         // looks a prepared candidate up by its content.
         _parameters: Option<SubmitBlockParameters>,
     ) -> Result<SubmitBlockResponse> {
+        self.check_mining_support()?;
         let submitted_at = std::time::Instant::now();
         let block = match self
             .gbt
@@ -4057,6 +4092,7 @@ where
         &self,
         SubmitSolutionParameters { work_id, header }: SubmitSolutionParameters,
     ) -> Result<SubmitSolutionResponse> {
+        self.check_mining_support()?;
         let submitted_at = std::time::Instant::now();
         let HexData(header_bytes) = header;
         let mut remaining_header_bytes = header_bytes.as_slice();

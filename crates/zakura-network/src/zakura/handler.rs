@@ -5791,33 +5791,32 @@ pub(crate) async fn spawn_zakura_endpoint_with_peer_registry(
     .await
 }
 
-/// Warns once at startup when the preferred places the peer memory budget funds,
-/// `funded_places`, are no more than the `always_preferred` IDs the operator configured
-/// the node to always prefer.
+/// The startup warning to log when the preferred places the peer memory budget funds,
+/// `funded_places`, are no more than the `always_preferred` IDs the operator configured the
+/// node to always prefer, or `None` when they leave room for ranked gateways.
 ///
 /// Those IDs take places first, so the gateways recent blocks name then get none, and with no
-/// funded place at all no always-preferred ID is held either. The ranking is checked here, where
-/// the funded count includes every custom stream kind the node serves.
-fn warn_on_unfunded_always_preferred(always_preferred: usize, funded_places: usize) {
-    if always_preferred == 0 {
-        return;
-    }
-    if funded_places == 0 {
-        warn!(
-            always_preferred,
+/// funded place at all no always-preferred ID is held either. The endpoint checks this at
+/// startup, where the funded count includes every custom stream kind the node serves.
+fn unfunded_always_preferred_warning(
+    always_preferred: usize,
+    funded_places: usize,
+) -> Option<&'static str> {
+    if always_preferred == 0 || funded_places > always_preferred {
+        None
+    } else if funded_places == 0 {
+        Some(
             "the peer memory budget funds no preferred connection places, so none is held for \
-             the IDs this node is configured to always prefer; raise \
-             [network.zakura] peer_memory_budget_bytes or lower max_connections"
-        );
-    } else if funded_places <= always_preferred {
-        warn!(
-            always_preferred,
-            funded_places,
-            "the peer memory budget funds no more preferred connection places than the IDs \
-             this node is configured to always prefer, so those IDs take every place and the \
-             gateways recent blocks name get none; raise [network.zakura] \
-             peer_memory_budget_bytes or lower max_connections"
-        );
+             the IDs this node is configured to always prefer; raise [network.zakura] \
+             peer_memory_budget_bytes or lower max_connections",
+        )
+    } else {
+        Some(
+            "the peer memory budget funds no more preferred connection places than the IDs this \
+             node is configured to always prefer, so those IDs take every place and the gateways \
+             recent blocks name get none; raise [network.zakura] peer_memory_budget_bytes or \
+             lower max_connections",
+        )
     }
 }
 
@@ -5887,10 +5886,11 @@ async fn spawn_zakura_endpoint_inner(
     }
     let limits = ZakuraLocalLimits::for_node(config, &custom_kinds);
     if let Some(ranking) = &miner_gateways {
-        warn_on_unfunded_always_preferred(
-            ranking.borrow().always_preferred.len(),
-            limits.max_preferred_connections,
-        );
+        let always_preferred = ranking.borrow().always_preferred.len();
+        let funded_places = limits.max_preferred_connections;
+        if let Some(warning) = unfunded_always_preferred_warning(always_preferred, funded_places) {
+            warn!(always_preferred, funded_places, "{warning}");
+        }
     }
     let node_envelope = crate::zakura::node_envelope::NodeEnvelope::for_node(
         config,

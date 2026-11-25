@@ -105,12 +105,7 @@ fn proposing(block_id: block::Hash, coding: Coding) -> PeerInput {
 
 /// A TINY session from node 1 to `remote` that stepped `admission`.
 fn session(remote: NodeId, now: Instant, admission: PeerInput) -> PeerState {
-    let mut peer = PeerState::new(
-        PeerConfig::for_profile(Profile::TINY),
-        node_id(1),
-        remote,
-        1,
-    );
+    let mut peer = PeerState::new(PeerConfig::for_profile(Profile::TINY), remote, 1);
     peer.step(now, admission);
     peer
 }
@@ -189,8 +184,8 @@ fn assert_closed(peer: &PeerState, row: Bpv1CloseRow) {
 fn scenario_both_peers_send_same_header_simultaneously() {
     let config = PeerConfig::for_profile(Profile::TINY);
     let now = Instant::now();
-    let mut a = PeerState::new(config, node_id(1), node_id(2), 1);
-    let mut b = PeerState::new(config, node_id(2), node_id(1), 1);
+    let mut a = PeerState::new(config, node_id(2), 1);
+    let mut b = PeerState::new(config, node_id(1), 1);
     let block_id = block::Hash([0xAA; 32]);
 
     // Both A and B admit the block independently and queue HeaderMeta before
@@ -339,7 +334,7 @@ fn scenario_early_record_full_pauses_data_only_and_replays_on_admission() {
     // The record holds exactly the seeds' flagged `Have` and two part frames.
     config.early_peer_bytes_cap =
         frame_bytes + part_frame(&coding, 0).len() + part_frame(&coding, 1).len();
-    let mut peer = PeerState::new(config, node_id(1), node_id(2), 1);
+    let mut peer = PeerState::new(config, node_id(2), 1);
     let t0 = Instant::now();
 
     // Proposer's HeaderMeta delayed on control so its flagged `Have` and
@@ -388,7 +383,7 @@ fn scenario_early_record_full_pauses_data_only_and_replays_on_admission() {
 #[test]
 fn scenario_retired_block_allows_stripes_times_n_then_closes_15() {
     let config = PeerConfig::for_profile(Profile::TINY);
-    let mut peer = PeerState::new(config, node_id(1), node_id(2), 1);
+    let mut peer = PeerState::new(config, node_id(2), 1);
     let now = Instant::now();
     let block_id = block::Hash([0x55; 32]);
     let coding = tiny();
@@ -421,7 +416,7 @@ fn scenario_retired_block_allows_stripes_times_n_then_closes_15() {
 #[test]
 fn scenario_stale_verify_token_is_noop() {
     let config = PeerConfig::for_profile(Profile::TINY);
-    let mut peer = PeerState::new(config, node_id(1), node_id(2), 2);
+    let mut peer = PeerState::new(config, node_id(2), 2);
     let now = Instant::now();
     let block_id = block::Hash([0x66; 32]);
     let encoded = encode_body(&Profile::TINY, &[0x11; 64], 2).unwrap();
@@ -518,8 +513,8 @@ proptest! {
 fn scenario_partial_want_server_ends_early_without_closing() {
     let config = PeerConfig::for_profile(Profile::TINY);
     let now = Instant::now();
-    let mut a = PeerState::new(config, node_id(1), node_id(2), 1);
-    let mut b = PeerState::new(config, node_id(2), node_id(1), 1);
+    let mut a = PeerState::new(config, node_id(2), 1);
+    let mut b = PeerState::new(config, node_id(1), 1);
     let block_id = block::Hash([0xAB; 32]);
     let encoded = encode_body(&Profile::TINY, &[0x21; 64], 2).unwrap();
     // A sends HeaderMeta; B admits on its own and receives A's.
@@ -647,12 +642,7 @@ fn empty_body_session_sends_block_done_and_closes_on_part_traffic() {
     assert_eq!(coding.total_parts(), Some(0));
     let admitted_peer = || session(node_id(2), now, admitted(block_id, coding, node_id(3)));
 
-    let mut p = PeerState::new(
-        PeerConfig::for_profile(Profile::TINY),
-        node_id(1),
-        node_id(2),
-        1,
-    );
+    let mut p = PeerState::new(PeerConfig::for_profile(Profile::TINY), node_id(2), 1);
     assert!(queues_meta(
         &p.step(now, admitted(block_id, coding, node_id(3)))
     ));
@@ -781,13 +771,52 @@ fn bpv1_38_block_done_cancels_the_pending_have_batch() {
     );
 }
 
+/// bpv1-9: a block whose miner named this node as `proposer_node`, but that
+/// this node admitted from a peer, is relayed like any other block: the node
+/// announces and pushes its parts. Only the node that proposed it stays quiet.
+#[test]
+fn bpv1_9_a_node_named_as_proposer_that_did_not_propose_still_relays() {
+    let now = Instant::now();
+    let named = block::Hash([0xB9; 32]);
+    let mut p = session(node_id(2), now, admitted(named, tiny(), node_id(1)));
+    let step = p.step(now, ready(named, vec![0], true));
+    assert!(
+        step.outputs.iter().any(|output| matches!(
+            output,
+            PeerOutput::SendHave {
+                flags: HaveFlags::Push,
+                ..
+            }
+        )),
+        "the named node pushes its pushed seeds"
+    );
+    p.step(now, ready(named, vec![1], false));
+    assert!(
+        p.next_deadline().is_some(),
+        "the named node announces the parts it verified"
+    );
+
+    let proposed = block::Hash([0xBA; 32]);
+    let mut p = session(node_id(2), now, proposing(proposed, tiny()));
+    let step = p.step(now, ready(proposed, vec![0], true));
+    assert!(
+        !step
+            .outputs
+            .iter()
+            .any(|output| matches!(output, PeerOutput::SendHave { .. })),
+        "the proposer pushes nothing back"
+    );
+    p.step(now, ready(proposed, vec![1], false));
+    assert_eq!(p.next_deadline(), None, "the proposer announces nothing");
+}
+
 /// bpv1-49: a grant the session refuses releases its slots at once.
 #[test]
 fn bpv1_49_refused_grant_releases_its_slots() {
     let config = PeerConfig::for_profile(Profile::TINY);
     let now = Instant::now();
     let block_id = block::Hash([0xB1; 32]);
-    let mut p = PeerState::new(config, node_id(1), node_id(2), 1);
+    let mut p = PeerState::new(config, node_id(2), 1);
     // Block not admitted on this peer -> PullGranted is refused and must release [0, 2].
     let step = p.step(now, pull(block_id, 0, &[0, 2], now));
     assert!(
@@ -881,12 +910,12 @@ fn scenario_early_record_refusals_emit_part_dropped() {
     };
 
     // A frame larger than the whole cap can never fit.
-    let mut peer = PeerState::new(config, node_id(1), node_id(2), 1);
+    let mut peer = PeerState::new(config, node_id(2), 1);
     let oversize = peer.step(now, prefix(0, 65));
     assert_eq!(dropped(&oversize, 0), Some(DropReason::EarlyOversize));
 
     // A frame that does not fit beside held entries is dropped as full.
-    let mut peer = PeerState::new(config, node_id(1), node_id(2), 1);
+    let mut peer = PeerState::new(config, node_id(2), 1);
     peer.step(now, prefix(0, 40));
     let full = peer.step(now, prefix(1, 40));
     assert!(peer.is_data_paused());
@@ -940,7 +969,7 @@ fn unwritten_want_ends_count_against_the_live_want_limit() {
     let want = |want_id| recv_want(want_id, unknown, 0, &[0]);
     let hard_limit = MAX_WANTS_INFLIGHT * 2;
 
-    let mut peer = PeerState::new(config, node_id(1), node_id(2), 1);
+    let mut peer = PeerState::new(config, node_id(2), 1);
     for want_id in 1..=hard_limit {
         let step = peer.step(now, want(want_id));
         assert!(step
@@ -1423,12 +1452,7 @@ fn decision24_flagged_have_is_chunked_at_the_have_limit() {
     };
     let block_id = block::Hash([0x69; 32]);
     let now = Instant::now();
-    let mut peer = PeerState::new(
-        PeerConfig::for_profile(Profile::W2),
-        node_id(1),
-        node_id(3),
-        1,
-    );
+    let mut peer = PeerState::new(PeerConfig::for_profile(Profile::W2), node_id(3), 1);
     peer.step(now, admitted(block_id, coding, node_id(2)));
     // `n − k` pushed seeds in every stripe: 4,400 in all.
     let pushed: Vec<u32> = (0..coding.stripes)
@@ -1482,12 +1506,7 @@ fn decision24_flagged_have_for_unadmitted_block_waits_and_counts_at_replay() {
     let block_id = block::Hash([0x64; 32]);
     let now = Instant::now();
     let bound = coding.n - coding.k;
-    let mut peer = PeerState::new(
-        PeerConfig::for_profile(Profile::TINY),
-        node_id(1),
-        node_id(3),
-        1,
-    );
+    let mut peer = PeerState::new(PeerConfig::for_profile(Profile::TINY), node_id(3), 1);
     let s = peer.step(now, have_with(block_id, HaveFlags::Push, vec![0]));
     assert!(s
         .events
@@ -1500,12 +1519,7 @@ fn decision24_flagged_have_for_unadmitted_block_waits_and_counts_at_replay() {
         relay: false,
     }));
 
-    let mut peer = PeerState::new(
-        PeerConfig::for_profile(Profile::TINY),
-        node_id(1),
-        node_id(3),
-        1,
-    );
+    let mut peer = PeerState::new(PeerConfig::for_profile(Profile::TINY), node_id(3), 1);
     peer.step(
         now,
         have_with(block_id, HaveFlags::Push, (0..bound).collect()),
@@ -1551,7 +1565,7 @@ fn bpv1_60_flagged_have_refused_by_a_full_early_record_never_closes() {
     // The record holds one flagged `Have` and its part, with no room for a
     // second `Have`.
     config.early_peer_bytes_cap = have_bytes + part_frame(&coding, 0).len() + have_bytes - 1;
-    let mut peer = PeerState::new(config, node_id(1), node_id(3), 1);
+    let mut peer = PeerState::new(config, node_id(3), 1);
     let now = Instant::now();
     let block_id = block::Hash([0x67; 32]);
 
@@ -1592,12 +1606,7 @@ fn bpv1_60_flagged_have_lost_to_age_or_rejected_meta_never_closes() {
     let t0 = Instant::now();
     for rejected in [false, true] {
         let block_id = block::Hash([0x68; 32]);
-        let mut peer = PeerState::new(
-            PeerConfig::for_profile(Profile::TINY),
-            node_id(1),
-            node_id(3),
-            1,
-        );
+        let mut peer = PeerState::new(PeerConfig::for_profile(Profile::TINY), node_id(3), 1);
         peer.step(t0, have_with(block_id, HaveFlags::Push, vec![0]));
         let mut now = t0;
         if rejected {
@@ -1660,8 +1669,7 @@ fn paced_sessions(
     let sessions = peers
         .into_iter()
         .map(|peer| {
-            let mut state =
-                PeerState::new(PeerConfig::for_profile(Profile::W2), node_id(251), peer, 1);
+            let mut state = PeerState::new(PeerConfig::for_profile(Profile::W2), peer, 1);
             state.step(now, broadcast.input_for(&peer));
             (peer, state)
         })
@@ -2027,12 +2035,7 @@ fn bpv1_60_lost_proposer_flags_admit_up_to_n_seeds() {
     let t0 = Instant::now();
     let block_id = block::Hash([0x69; 32]);
     // Node 2 proposed the block that `admit_tiny` admits.
-    let mut peer = PeerState::new(
-        PeerConfig::for_profile(Profile::TINY),
-        node_id(1),
-        node_id(2),
-        1,
-    );
+    let mut peer = PeerState::new(PeerConfig::for_profile(Profile::TINY), node_id(2), 1);
     peer.step(t0, have_with(block_id, HaveFlags::Relay, vec![0, 1]));
     let now = t0 + DEFAULT_EARLY_AGE;
     peer.step(now, PeerInput::Tick);

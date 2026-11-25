@@ -1858,7 +1858,7 @@ async fn run_peer_routine(
     let peer_cfg = node.config.peer_config(node.profile);
     let (verify_tx, mut verify_rx) = mpsc::unbounded_channel::<(PartToken, Option<VerifiedPart>)>();
     let mut session = Session {
-        state: PeerState::new(peer_cfg, node.local_node, peer_node, session_gen),
+        state: PeerState::new(peer_cfg, peer_node, session_gen),
         node: Arc::clone(&node),
         peer_node,
         ctrl: ControlWriter::new(ctrl_send),

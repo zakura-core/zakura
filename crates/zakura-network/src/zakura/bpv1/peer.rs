@@ -705,6 +705,10 @@ pub struct PeerStep {
 struct PeerBlockState {
     coding: Coding,
     proposer_node: NodeId,
+    /// This node proposed the block: it admitted the block from its own
+    /// solved template (bpv1-9). The miner picks `proposer_node`, so a block
+    /// can name a node that never proposed it; only this flag says a node did.
+    as_proposer: bool,
     /// Push slots the peer opened with flagged `Have`s (decision-24). A slot
     /// stays set after its part arrives, so it also counts toward the
     /// per-stripe bound (bpv1-69).
@@ -744,12 +748,13 @@ struct PeerBlockState {
 }
 
 impl PeerBlockState {
-    fn new(coding: Coding, proposer_node: NodeId) -> Self {
+    fn new(coding: Coding, proposer_node: NodeId, as_proposer: bool) -> Self {
         let total = coding.total_parts().unwrap_or(0) as usize;
         let stripes = coding.stripes as usize;
         Self {
             coding,
             proposer_node,
+            as_proposer,
             peer_flagged: BitSet::with_bits(total),
             peer_relayed: BitSet::with_bits(total),
             flags_lost: false,
@@ -946,7 +951,6 @@ struct InflightVerify {
 #[derive(Debug)]
 pub struct PeerState {
     config: PeerConfig,
-    local_node: NodeId,
     remote_node: NodeId,
     session_gen: u64,
     next_want_id: u32,
@@ -995,15 +999,9 @@ enum SessionClose {
 
 impl PeerState {
     /// Creates a clean session machine for one authenticated peer connection.
-    pub fn new(
-        config: PeerConfig,
-        local_node: NodeId,
-        remote_node: NodeId,
-        session_gen: u64,
-    ) -> Self {
+    pub fn new(config: PeerConfig, remote_node: NodeId, session_gen: u64) -> Self {
         Self {
             config,
-            local_node,
             remote_node,
             session_gen,
             next_want_id: 1,
@@ -1306,7 +1304,7 @@ impl PeerState {
         let state = self
             .blocks
             .entry(block_id)
-            .or_insert_with(|| PeerBlockState::new(coding, proposer_node));
+            .or_insert_with(|| PeerBlockState::new(coding, proposer_node, as_proposer));
         // decision-26: the first admission fixes the pacing; a repeat changes
         // nothing.
         if first {
@@ -1608,7 +1606,7 @@ impl PeerState {
             return;
         }
         // bpv1-9 / decision-20: the proposer never announces its own block.
-        if block.peer_block_done || self.local_node == block.proposer_node {
+        if block.peer_block_done || block.as_proposer {
             return;
         }
 
@@ -1674,7 +1672,7 @@ impl PeerState {
         if !block.meta_exchanged()
             || block.peer_block_done
             || self.remote_node == block.proposer_node
-            || self.local_node == block.proposer_node
+            || block.as_proposer
         {
             return;
         }
@@ -1966,10 +1964,7 @@ impl PeerState {
             return;
         };
         // bpv1-8 / bpv1-9: only the proposer seeds, after `HeaderMeta` crossed.
-        if !block.meta_exchanged()
-            || block.peer_block_done
-            || self.local_node != block.proposer_node
-        {
+        if !block.meta_exchanged() || block.peer_block_done || !block.as_proposer {
             return;
         }
         let mut relay: Vec<VerifiedPart> = Vec::new();

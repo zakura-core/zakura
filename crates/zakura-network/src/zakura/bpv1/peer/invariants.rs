@@ -79,6 +79,12 @@ impl PeerState {
         }
         for (block_id, block) in &self.blocks {
             let relay = block.relay_bound();
+            // The proposer flags up to `n` of its seeds; a holder up to `n − k`.
+            let local_bound = if block.as_proposer {
+                block.coding.n
+            } else {
+                relay
+            };
             for stripe in 0..block.coding.stripes {
                 // bpv1-69: per stripe, flags stay within each sender's push
                 // bound, and relay flags within `n − k`.
@@ -86,7 +92,7 @@ impl PeerState {
                     block.stripe_count(&block.peer_flagged, stripe)
                         <= block.push_bound(self.remote_node)
                         && block.stripe_count(&block.local_flagged, stripe)
-                            <= block.push_bound(self.local_node)
+                            <= local_bound
                         && block.stripe_count(&block.peer_relayed, stripe) <= relay,
                     "{PEER_REPLAY}: bpv1-69 push flags past the bound in stripe {stripe} of {block_id:?}"
                 );

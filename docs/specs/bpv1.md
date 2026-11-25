@@ -6,7 +6,7 @@ the BPv1 implementation decisions:
 
 - **Coinbase commitment (decision-1, decision-9, decision-25):** The proposer
   commits `C` in one zero-value post-NU7 v6 coinbase `OP_RETURN` output
-  (`6a 25 "BPV1" 01 C`), proven via both txid and ZIP 244 auth-data index-0
+  (`6a 23 "BP" 01 C`), proven via both txid and ZIP 244 auth-data index-0
   paths plus `hashBlockCommitments`. The byte after the tag is the format
   version. Readers ignore every output in another form. `block_id` is the
   consensus block hash; Ed25519 signatures, variant identifiers, and the
@@ -281,12 +281,12 @@ in a single zero-value transparent `OP_RETURN` output of the post-NU7 v6
 coinbase transaction before mining:
 
 ```text
-6a 25 || ASCII("BPV1") || 01 || C[32]
+6a 23 || ASCII("BP") || 01 || C[32]
 ```
 
-`6a` is `OP_RETURN`; `25` directly pushes the following 37 bytes (total script
-length 39 bytes, serialized transparent output 48 bytes). The byte after
-`"BPV1"` is the commitment format version (decision-25). BPv1 defines version
+`6a` is `OP_RETURN`; `23` directly pushes the following 35 bytes (total script
+length 37 bytes, serialized transparent output 46 bytes). The byte after
+`"BP"` is the commitment format version (decision-25). BPv1 defines version
 `01` only; the profile lives inside `C`, not in this byte.
 
 An output is a version-01 commitment only if its value is zero and its script
@@ -300,9 +300,11 @@ only the versions it supports.
 
 A miner mesh coinbase MAY also carry its own output
 ([#2666](https://github.com/zakura-core/zakura/pull/2666)), which names a
-gateway. BPv1 ignores that output, and it grants no BPv1 rights. When one node
-both builds the template and announces the gateway, `proposer_node` equals the
-gateway identity.
+gateway. That output has the same form with the tag `"MR"`
+([#2709](https://github.com/zakura-core/zakura/pull/2709)), so the two outputs
+never match each other's reader. BPv1 ignores that output, and it grants no BPv1
+rights. When one node both builds the template and announces the gateway,
+`proposer_node` equals the gateway identity.
 
 `CoinbaseBinding` carries the canonical v6 coinbase transaction, its index-0
 txid Merkle path, its index-0 ZIP 244 authorizing-data Merkle path, and
@@ -1468,7 +1470,7 @@ The profile MUST fix these before implementations claim interoperability:
 | Part payload and stripes | W2 fixes `S_MIN`, `S_MAX`, `ALIGN`, `STRIPE_K`, and `parity_parts` |
 | Codec construction | Candidate `reed-solomon-simd` 3.1 construction; vectors `TBD` |
 | Hashing | W2 fixes BLAKE3 key derivation with BPv1 contexts; vectors `TBD` |
-| Proposer authentication | W2 fixes the `BPV1 01` coinbase commitment; supported chain formats and admission adapter remain `TBD` |
+| Proposer authentication | W2 fixes the `BP 01` coinbase commitment; supported chain formats and admission adapter remain `TBD` |
 | Serialization | W2 fixes payload encoding; service identifier, capability, stream kinds, and negotiation remain `TBD` |
 | Resource bounds | W2 fixes syntax limits; accept limits, early-record, retention, and work bounds remain `TBD` |
 

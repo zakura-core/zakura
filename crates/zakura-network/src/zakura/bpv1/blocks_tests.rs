@@ -246,7 +246,7 @@ pub(super) fn header_result(
 /// then passes the unknown-parent checks, as for an honest child that
 /// arrives before its parent. Returns both steps' effects. A refused entry
 /// starts no checks.
-fn missing_parent(
+pub(super) fn missing_parent(
     table: &mut BlockTable,
     now: Instant,
     received: &BlockStep,

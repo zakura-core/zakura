@@ -15,7 +15,9 @@ use super::{
         BlockConfig, BlockEvent, BlockInput, BlockOutput, BlockStep, BlockTable,
         HeaderAdmissionResult,
     },
-    blocks_tests::{closed_sessions, commitment_ok, header_result, rejected_sessions},
+    blocks_tests::{
+        closed_sessions, commitment_ok, header_result, missing_parent, rejected_sessions,
+    },
     close::Bpv1CloseRow,
     codec::encode_body,
     peer::{PeerConfig, PeerInput, PeerOutput, PeerState, RecvWantEnd, Retire},
@@ -443,14 +445,7 @@ fn close_4_alternate_survives_a_wait_for_the_parent() {
         make_envelope(block_id, tiny(), [0xA1; 32], node_id(1)),
         a,
     );
-    header_result(
-        &mut table,
-        now,
-        &first,
-        HeaderAdmissionResult::MissingParent {
-            parent_hash: parent,
-        },
-    );
+    missing_parent(&mut table, now, &first, parent);
     copy_from(
         &mut table,
         now,
@@ -551,14 +546,7 @@ fn pending_alternates_give_way_before_a_first_copy_is_evicted() {
     let parent = block::Hash([0x3F; 32]);
     let park = |table: &mut BlockTable, copy, from| {
         let received = copy_from(table, now, copy, from);
-        header_result(
-            table,
-            now,
-            &received,
-            HeaderAdmissionResult::MissingParent {
-                parent_hash: parent,
-            },
-        )
+        missing_parent(table, now, &received, parent)
     };
     let [a, b, c, _] = sessions();
     let mut table = BlockTable::new(BlockConfig::for_profile(Profile::W2));
@@ -605,12 +593,7 @@ fn a_refused_pending_copy_keeps_every_alternate() {
     let alternate_parent = block::Hash([0x6F; 32]);
     let park = |table: &mut BlockTable, envelope, from: (NodeId, u64), parent_hash| {
         let received = copy_from(table, now, envelope, from);
-        header_result(
-            table,
-            now,
-            &received,
-            HeaderAdmissionResult::MissingParent { parent_hash },
-        )
+        missing_parent(table, now, &received, parent_hash)
     };
     let heavy = (node_id(10), 10);
     let relay = (node_id(11), 11);
@@ -699,14 +682,7 @@ fn an_ended_session_leaves_no_sender_record() {
         make_envelope(block_id, tiny(), [0xA1; 32], node_id(1)),
         a,
     );
-    header_result(
-        &mut table,
-        now,
-        &first,
-        HeaderAdmissionResult::MissingParent {
-            parent_hash: parent,
-        },
-    );
+    missing_parent(&mut table, now, &first, parent);
     copy_from(
         &mut table,
         now,

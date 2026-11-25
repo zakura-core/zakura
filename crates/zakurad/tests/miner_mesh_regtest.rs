@@ -143,8 +143,10 @@ async fn pools_form_a_mesh() -> Result<()> {
 /// A pool whose template node names its public relay: the blocks it mines
 /// name the relay, so every other mining node prefers the relay, and so does
 /// the template node itself, which holds a place for it. The relay mines
-/// nothing, yet counts the blocks and prefers the other pool's gateway. The
-/// template node is ranked nowhere, since no block names it.
+/// nothing, yet counts the blocks and prefers the other pool's gateway. No
+/// block names the template node, so only the relay, which lists it in
+/// `mining.miner_mesh_template_nodes`, keeps a place for it, ahead of the
+/// gateways it ranks.
 ///
 /// Only the template node, which builds coinbases, reports that it announces.
 /// Both report the blocks that name the relay, the gateway they stand for.
@@ -163,7 +165,9 @@ async fn a_pool_names_its_relay_as_its_gateway() -> Result<()> {
         NodeSpec::new(Role::Pool)
             .names_gateway(RELAY)
             .bootstrap_from([HUB]),
-        NodeSpec::new(Role::MeshRelay).bootstrap_from([HUB]),
+        NodeSpec::new(Role::MeshRelay)
+            .template_nodes([TEMPLATE])
+            .bootstrap_from([HUB]),
         NodeSpec::new(Role::Pool).bootstrap_from([HUB]),
         NodeSpec::new(Role::Miner).bootstrap_from([HUB]),
     ])
@@ -185,6 +189,7 @@ async fn a_pool_names_its_relay_as_its_gateway() -> Result<()> {
                 view.prefers_and_holds(&relay) && view.prefers_and_holds(&other_pool)
             }) && net.view(OTHER_POOL).prefers_and_holds(&relay)
                 && net.view(RELAY).prefers_and_holds(&other_pool)
+                && net.view(RELAY).prefers_and_holds(&template)
         },
     )
     .await?;
@@ -207,9 +212,20 @@ async fn a_pool_names_its_relay_as_its_gateway() -> Result<()> {
         relay_view.info.window.is_some(),
         "the relay counts the blocks"
     );
-    assert_eq!(relay_view.ranking(), vec![other_pool]);
+    assert_eq!(
+        relay_view.ranking(),
+        vec![template, other_pool],
+        "the relay keeps a place for its template node ahead of the gateways it ranks"
+    );
+    assert_eq!(relay_view.template_nodes(), vec![template]);
+    assert!(
+        relay_view
+            .peer(&template)
+            .is_some_and(|peer| peer.preferred),
+        "the template node is a preferred peer at the relay"
+    );
 
-    for node in [RELAY, OTHER_POOL, M] {
+    for node in [OTHER_POOL, M] {
         assert_eq!(
             net.view(node).state_of(&template),
             None,

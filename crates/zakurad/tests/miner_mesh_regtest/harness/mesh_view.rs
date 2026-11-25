@@ -70,6 +70,16 @@ impl MeshView {
         self.state_of(id) == Some(MeshGatewayState::Preferred) && self.is_connected_to(id)
     }
 
+    /// The template nodes the node keeps places for, in its order.
+    pub fn template_nodes(&self) -> Vec<GatewayId> {
+        self.info
+            .gateways
+            .iter()
+            .filter(|gateway| gateway.template_node)
+            .map(|gateway| decode_id(&gateway.gateway_id))
+            .collect()
+    }
+
     /// The block count of every ranked gateway.
     pub fn counts(&self) -> HashMap<GatewayId, u32> {
         self.info
@@ -87,8 +97,13 @@ impl MeshView {
             .iter()
             .map(|gateway| {
                 format!(
-                    "{} {} blocks {:?}{}",
+                    "{}{} {} blocks {:?}{}",
                     gateway.gateway_id,
+                    if gateway.template_node {
+                        " template node"
+                    } else {
+                        ""
+                    },
                     gateway.blocks,
                     gateway.state,
                     if gateway.connected { " connected" } else { "" }
@@ -120,7 +135,7 @@ impl MeshView {
 }
 
 /// What the harness configured on a node, which its report must agree with.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct NodeFacts {
     /// The node's whole v2 node ID.
     pub node_id: [u8; 32],
@@ -130,6 +145,8 @@ pub(super) struct NodeFacts {
     pub prefers_gateways: bool,
     /// The gateway the node's coinbases name, if it names one.
     pub announced: Option<GatewayId>,
+    /// The template nodes the node keeps places for, in config order.
+    pub template_nodes: Vec<GatewayId>,
     pub total_capacity: usize,
     pub gateway_capacity: usize,
 }
@@ -156,14 +173,20 @@ pub(super) fn check_view(view: &MeshView, facts: &NodeFacts) -> Vec<String> {
         .iter()
         .filter(|gateway| gateway.state == MeshGatewayState::Preferred)
         .count();
+    // A template node keeps its place unless it is ambiguous, so it counts
+    // toward the hold even while it is unmatched.
+    let keeps_its_place = |gateway: &MeshGateway| {
+        gateway.template_node && gateway.state != MeshGatewayState::Ambiguous
+    };
     let matched = info
         .gateways
         .iter()
         .filter(|gateway| {
-            !matches!(
-                gateway.state,
-                MeshGatewayState::Unmatched | MeshGatewayState::Ambiguous
-            )
+            keeps_its_place(gateway)
+                || !matches!(
+                    gateway.state,
+                    MeshGatewayState::Unmatched | MeshGatewayState::Ambiguous
+                )
         })
         .count();
 
@@ -199,11 +222,13 @@ pub(super) fn check_view(view: &MeshView, facts: &NodeFacts) -> Vec<String> {
         ));
     }
 
-    // 3. A matched gateway can hold one of the separately funded places.
+    // 3. A matched gateway, or a template node, can hold one of the
+    // separately funded places.
     let ceiling = facts.gateway_capacity;
     if info.hold != ceiling.min(matched) {
         broken.push(format!(
-            "3: the hold is {}, not the least of {ceiling} and {matched} matched gateways",
+            "3: the hold is {}, not the least of {ceiling} and {matched} matched gateways \
+             and template nodes",
             info.hold
         ));
     }
@@ -223,26 +248,43 @@ pub(super) fn check_view(view: &MeshView, facts: &NodeFacts) -> Vec<String> {
         broken.push("4: the node is connected to its own ID".into());
     }
 
-    // 5. The preferred set is the first available gateways in rank order, as
+    // 5. The template nodes come first, then the gateways by block count.
+    // The preferred set is the first available gateways in rank order, as
     // many as the hold, skipping only gateways in backoff, unmatched or
-    // ambiguous.
-    if info
-        .gateways
-        .windows(2)
-        .any(|pair| pair[0].blocks < pair[1].blocks)
-    {
+    // ambiguous, except that a template node keeps its place in that order
+    // even when it is not available.
+    if info.gateways.windows(2).any(|pair| {
+        (!pair[0].template_node && pair[1].template_node)
+            || (pair[0].template_node == pair[1].template_node && pair[0].blocks < pair[1].blocks)
+    }) {
         broken.push("5: the gateways are not in rank order".into());
     }
-    let leading_preferred = available
+    let mut places = 0;
+    let mut expected_preferred = Vec::new();
+    for gateway in &info.gateways {
+        if places == info.hold {
+            break;
+        }
+        let is_available = matches!(
+            gateway.state,
+            MeshGatewayState::Preferred | MeshGatewayState::Standby
+        );
+        if is_available || keeps_its_place(gateway) {
+            places += 1;
+        }
+        if is_available {
+            expected_preferred.push(gateway.gateway_id.as_str());
+        }
+    }
+    let actual_preferred: Vec<&str> = available
         .iter()
-        .take_while(|gateway| gateway.state == MeshGatewayState::Preferred)
-        .count();
-    if leading_preferred != preferred_gateways
-        || preferred_gateways != info.hold.min(available.len())
-    {
+        .filter(|gateway| gateway.state == MeshGatewayState::Preferred)
+        .map(|gateway| gateway.gateway_id.as_str())
+        .collect();
+    if actual_preferred != expected_preferred {
         broken.push(format!(
-            "5: the preferred gateways are not the first {} available ones: {:?}",
-            info.hold.min(available.len()),
+            "5: the preferred gateways are {actual_preferred:?}, not the first available ones \
+             within the hold, {expected_preferred:?}: {:?}",
             info.gateways
         ));
     }
@@ -272,6 +314,16 @@ pub(super) fn check_view(view: &MeshView, facts: &NodeFacts) -> Vec<String> {
         broken.push(format!(
             "8: the node announces {:?}, not {announced:?}",
             info.announced_gateways
+        ));
+    }
+
+    // 9. The node lists exactly the template nodes the harness configured,
+    // in order.
+    if view.template_nodes() != facts.template_nodes {
+        broken.push(format!(
+            "9: the node lists template nodes {:?}, not {:?}",
+            view.template_nodes(),
+            facts.template_nodes
         ));
     }
 

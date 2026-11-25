@@ -787,6 +787,14 @@ pub enum BlockEvent {
         /// Block hash.
         block_id: block::Hash,
     },
+    /// This node solved a block that a peer's `HeaderMeta` admitted first,
+    /// and became its proposer (bpv1-88).
+    ProposerTakeover {
+        /// Block hash.
+        block_id: block::Hash,
+        /// The phase of the peer's copy before the takeover.
+        from: BlockPhase,
+    },
     /// Verified part arrived at `BlockTable`.
     PartInserted {
         /// Block hash.
@@ -2684,15 +2692,14 @@ impl BlockTable {
         step: &mut BlockStep,
     ) {
         let block_id = envelope.block_id;
-        // Make local solved-block admission idempotent by hash. A stock peer's
-        // copy cannot come first: only this node's prepared template publishes
-        // metadata naming it as proposer, after this admission. A modified peer
-        // that gets the body early can build that metadata itself, and this
-        // return then leaves the block unseeded (#2753).
+        self.raise_top(height, step);
+        // bpv1-88: a peer's copy of this block may be admitted first. A peer
+        // that gets the solved body early, such as over legacy relay before
+        // this node commits, can rebuild metadata that names this node (#2753).
         if self.blocks.contains_key(&block_id) {
+            self.take_over_peer_copy(&envelope, parts, step);
             return;
         }
-        self.raise_top(height, step);
         // A solved block always takes a slot, evicting the lowest block if needed.
         self.evict_for_slot(true, step);
         let coding = envelope.coding;
@@ -2716,6 +2723,86 @@ impl BlockTable {
         });
         // decision-20: the proposer announces nothing. Its `BlockDone` tells
         // repair that it holds every part.
+    }
+
+    /// Makes this node the proposer of the block that a peer's `HeaderMeta`
+    /// admitted before this node's miner solved it (bpv1-88).
+    ///
+    /// The entry keeps its slot, its parts, and every session's view of the
+    /// block. It takes the solved block's parts and ends collection,
+    /// verification, stripe jobs, and its body claim, because this node holds
+    /// the body. It then republishes itself as the proposer's, so each
+    /// session sends `BlockDone` once and takes the seed plan.
+    ///
+    /// A retired entry stays retired: its sessions already dropped the block
+    /// for good (bpv1-46). An entry whose encoding or proposer differs from
+    /// the solved block's would not verify the solved parts. In both cases
+    /// this node does not propose the block over BPv1.
+    fn take_over_peer_copy(
+        &mut self,
+        envelope: &MetaEnvelope,
+        parts: Vec<VerifiedPart>,
+        step: &mut BlockStep,
+    ) {
+        let block_id = envelope.block_id;
+        let Some(block) = self.blocks.get_mut(&block_id) else {
+            return;
+        };
+        if block.as_proposer
+            || block.phase == BlockPhase::Retired
+            || block.meta.coding != envelope.coding
+            || block.meta.part_root != envelope.part_root
+            || block.meta.proposer_node != envelope.proposer_node
+        {
+            return;
+        }
+        let from = block.phase;
+        block.as_proposer = true;
+        block.phase = BlockPhase::Done;
+        block.repair_round = 0;
+        // bpv1-63: a verdict on the peer's copy is now stale.
+        block.verify_work_id = None;
+        block.verify_deadline = None;
+        // Each session sends `BlockDone` from its proposer role.
+        block.block_done_notified = true;
+        // decision-20: the proposer announces nothing.
+        block.have_group.clear();
+        block.have_deadline = None;
+        let coding = block.meta.coding;
+        for part in parts {
+            if let Some((s, slot)) = coding.split_index(part.index()) {
+                block.stripes[s as usize].store(slot, coding.k, part);
+            }
+        }
+        for st in &mut block.stripes {
+            st.claims.clear();
+            st.incoming.clear();
+            st.job = None;
+            st.assemblable = st.source_held_count == coding.k;
+        }
+        step.events
+            .push(BlockEvent::ProposerTakeover { block_id, from });
+        // This node holds the body and commits it itself, so block sync
+        // need not fetch it.
+        if std::mem::take(&mut block.body_claimed) {
+            step.outputs.push(BlockOutput::ReleaseBodyClaim {
+                block_id,
+                reason: ClaimRelease::Committed,
+            });
+        }
+        step.outputs.push(BlockOutput::PublishAdmitted {
+            admitted: block.admitted(),
+            from_peer: None,
+        });
+    }
+
+    /// Whether this node holds `block_id` as its proposer: it admitted the
+    /// block from its own solved template, and the block is not retired
+    /// (bpv1-9, bpv1-88).
+    pub fn is_proposer(&self, block_id: &block::Hash) -> bool {
+        self.blocks
+            .get(block_id)
+            .is_some_and(|block| block.as_proposer && block.phase != BlockPhase::Retired)
     }
 
     /// Records that `peer` holds every part of `block_id` (decision-20). A

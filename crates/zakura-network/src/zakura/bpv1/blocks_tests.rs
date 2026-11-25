@@ -1977,6 +1977,319 @@ fn local_admission_during_a_peer_copy_check_keeps_the_solved_block() {
         late.outputs
     );
     assert_eq!(table.block_phase(&block_id), Some(BlockPhase::Done));
+    // bpv1-88: a copy from another session after the solve changes nothing.
+    let later = table.step(
+        now,
+        BlockInput::MetaReceived {
+            envelope: envelope(),
+            from_peer: node_id(3),
+            session_gen: 1,
+        },
+    );
+    assert!(later.outputs.is_empty(), "{:?}", later.outputs);
+    assert!(table.is_proposer(&block_id));
+    table.assert_invariants();
+}
+
+/// How far a peer's copy of a block got before this node's miner solved the
+/// same block (bpv1-88).
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum PeerCopy {
+    /// One part stored, another charged and in flight.
+    Collecting,
+    /// Assembled and submitted; the verdict and the re-encode check are due.
+    Verifying,
+    /// Assembled, and a retryable verdict parked it until its parent
+    /// commits (bpv1-84), as the coordinator answers outside the native
+    /// phase in dual mode.
+    Parked,
+    /// Committed through BPv1; the re-encode check is due.
+    Done,
+    /// A retryable verdict with its parent committed handed it to block sync,
+    /// as in dual mode outside the native phase.
+    Fallback,
+    /// A consensus-invalid verdict retired it.
+    Retired,
+}
+
+/// The solved block's parts in [`peer_copy`].
+fn takeover_body() -> EncodedBody {
+    encode_body(&Profile::TINY, &[0x88; 128], 2).unwrap()
+}
+
+/// The height of [`peer_copy`]'s block: a parked block's parent is not
+/// committed yet, so it sits one above the next block.
+fn takeover_height(copy: PeerCopy) -> u32 {
+    if copy == PeerCopy::Parked {
+        2
+    } else {
+        1
+    }
+}
+
+/// Admits `block_id` from a peer's `HeaderMeta` that names node 1, this
+/// node, as its proposer, with live sessions to nodes 2 and 3, and brings
+/// the copy to `copy`. Returns the copy's pending verifier and re-encode
+/// check work.
+fn peer_copy(
+    table: &mut BlockTable,
+    now: Instant,
+    block_id: block::Hash,
+    copy: PeerCopy,
+) -> (Option<WorkId>, Option<WorkId>) {
+    let encoded = takeover_body();
+    let envelope = make_envelope(block_id, encoded.coding, encoded.part_root, node_id(1));
+    let received = receive(table, now, envelope);
+    let checking = header_result(
+        table,
+        now,
+        &received,
+        HeaderAdmissionResult::Admitted {
+            height: takeover_height(copy),
+            parent_hash: TEST_TIP_HASH,
+        },
+    );
+    table.step(
+        now,
+        BlockInput::CommitmentChecked {
+            work_id: commit_work(&checking),
+            ok: true,
+            peers: vec![node_id(2), node_id(3)],
+            rng_seed: 7,
+        },
+    );
+    assert_eq!(table.block_phase(&block_id), Some(BlockPhase::Collecting));
+    if copy == PeerCopy::Collecting {
+        insert(
+            table,
+            now,
+            block_id,
+            &encoded.parts[0],
+            node_id(2),
+            PartAuth::Want(1),
+        );
+        let part = &encoded.parts[1];
+        table
+            .charge_part(now, &block_id, 1, node_id(3), part.payload().len() as u64)
+            .expect("the collecting copy takes the part");
+        return (None, None);
+    }
+    let (verify, check) = assemble(table, now, block_id, &encoded);
+    let verdict = match copy {
+        PeerCopy::Verifying => return (Some(verify), Some(check)),
+        PeerCopy::Parked | PeerCopy::Fallback => VerifierVerdict::LocalCapacity,
+        PeerCopy::Done => VerifierVerdict::Valid,
+        PeerCopy::Retired => VerifierVerdict::Invalid,
+        PeerCopy::Collecting => unreachable!("the collecting copy returned above"),
+    };
+    table.step(
+        now,
+        BlockInput::VerifierVerdict {
+            work_id: verify,
+            block_id,
+            verdict,
+        },
+    );
+    let phase = match copy {
+        PeerCopy::Parked => BlockPhase::Verifying,
+        PeerCopy::Done => BlockPhase::Done,
+        PeerCopy::Fallback => BlockPhase::Fallback,
+        _ => BlockPhase::Retired,
+    };
+    assert_eq!(table.block_phase(&block_id), Some(phase), "{copy:?}");
+    (None, Some(check))
+}
+
+/// This node's admission of the solved block in [`peer_copy`].
+fn admit_solved(
+    table: &mut BlockTable,
+    now: Instant,
+    block_id: block::Hash,
+    copy: PeerCopy,
+) -> BlockStep {
+    let encoded = takeover_body();
+    table.step(
+        now,
+        BlockInput::BlockAdmittedLocal {
+            height: takeover_height(copy),
+            envelope: make_envelope(block_id, encoded.coding, encoded.part_root, node_id(1)),
+            parts: encoded.parts,
+        },
+    )
+}
+
+/// bpv1-88: a peer's copy admitted before this node solved the same block
+/// becomes this node's proposal, whatever phase it reached: it holds every
+/// part, is `Done`, holds no body claim, and republishes itself to every
+/// session as the proposer's, which no session hears from the peer copy.
+/// Work the copy left in flight goes stale, and a failed local commit now
+/// retires it (bpv1-45).
+#[test]
+fn bpv1_88_a_solved_block_takes_over_the_peer_copy_in_every_phase() {
+    use PeerCopy::*;
+    let block_id = block::Hash([0x88; 32]);
+    let encoded = takeover_body();
+    for copy in [Collecting, Verifying, Parked, Done, Fallback] {
+        let now = Instant::now();
+        let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+        let (verify, check) = peer_copy(&mut table, now, block_id, copy);
+        let from = table.block_phase(&block_id).unwrap();
+        let claimed = matches!(copy, Collecting | Verifying | Parked);
+
+        let took = admit_solved(&mut table, now, block_id, copy);
+        table.assert_invariants();
+        assert!(
+            took.events
+                .contains(&BlockEvent::ProposerTakeover { block_id, from }),
+            "{copy:?}: {:?}",
+            took.events
+        );
+        assert_eq!(
+            took.outputs
+                .iter()
+                .filter(|o| matches!(
+                    o,
+                    BlockOutput::ReleaseBodyClaim {
+                        reason: ClaimRelease::Committed,
+                        ..
+                    }
+                ))
+                .count(),
+            usize::from(claimed),
+            "{copy:?}: this node holds the body, so a live claim is released as committed"
+        );
+        let published: Vec<&AdmittedBlock> = took
+            .outputs
+            .iter()
+            .filter_map(|o| match o {
+                BlockOutput::PublishAdmitted {
+                    admitted,
+                    from_peer: None,
+                } => Some(admitted),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            matches!(published.as_slice(),
+                [admitted] if admitted.as_proposer
+                    && admitted.have_deadline.is_none()
+                    && admitted.have_group.is_empty()),
+            "{copy:?}: every session learns the proposer role: {:?}",
+            took.outputs
+        );
+        assert_eq!(table.block_phase(&block_id), Some(BlockPhase::Done));
+        assert!(table.is_proposer(&block_id), "{copy:?}");
+        assert!(
+            (0..encoded.coding.total_parts().unwrap())
+                .all(|index| table.get_part(&block_id, index).is_some()),
+            "{copy:?}: the proposer serves every part"
+        );
+        assert!(
+            table
+                .active_admitted_blocks()
+                .iter()
+                .any(|(admitted, _)| admitted.block_id == block_id && admitted.as_proposer),
+            "{copy:?}: a session that connects later learns the proposer role"
+        );
+
+        // Work the copy left in flight changes nothing.
+        let charged = table.part_buffer_bytes();
+        let mut late = Vec::new();
+        if copy == Collecting {
+            late.push(insert(
+                &mut table,
+                now,
+                block_id,
+                &encoded.parts[1],
+                node_id(3),
+                PartAuth::Want(2),
+            ));
+        }
+        if let Some(work_id) = verify {
+            late.push(table.step(
+                now,
+                BlockInput::VerifierVerdict {
+                    work_id,
+                    block_id,
+                    verdict: VerifierVerdict::Valid,
+                },
+            ));
+        }
+        if let Some(work_id) = check {
+            late.push(table.step(
+                now,
+                BlockInput::StripeJobDone {
+                    work_id,
+                    block_id,
+                    stripe: 0,
+                    result: Err(()),
+                },
+            ));
+        }
+        // The parent commits, and every deadline the copy had passes.
+        late.push(table.step(
+            now,
+            BlockInput::TipHeight {
+                height: 1,
+                hash: TEST_TIP_HASH,
+            },
+        ));
+        late.push(tick(
+            &mut table,
+            now + VERIFY_DEADLINE + Duration::from_secs(1),
+            &[pull_state(node_id(2)), pull_state(node_id(3))],
+        ));
+        for step in &late {
+            assert!(
+                step.outputs.is_empty(),
+                "{copy:?}: late work leaves the proposer's block alone: {:?}",
+                step.outputs
+            );
+        }
+        let in_flight = if copy == Collecting {
+            encoded.parts[1].payload().len() as u64
+        } else {
+            0
+        };
+        assert_eq!(
+            table.part_buffer_bytes(),
+            charged - in_flight,
+            "{copy:?}: the part in flight releases its charge"
+        );
+        assert_eq!(table.block_phase(&block_id), Some(BlockPhase::Done));
+        table.assert_invariants();
+
+        // bpv1-45: the proposer's failed commit retires the block.
+        table.step(now, BlockInput::ProposedCommitFailed { block_id });
+        assert_eq!(table.block_phase(&block_id), Some(BlockPhase::Retired));
+    }
+}
+
+/// bpv1-88: a retired peer copy stays retired, because its sessions dropped
+/// the block for good (bpv1-46), and a copy whose encoding differs from the
+/// solved block's never takes the solved parts. Neither becomes this node's
+/// proposal, so the shell reports that BPv1 did not publish it.
+#[test]
+fn bpv1_88_a_retired_or_different_peer_copy_is_not_taken_over() {
+    let now = Instant::now();
+    let block_id = block::Hash([0x89; 32]);
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    peer_copy(&mut table, now, block_id, PeerCopy::Retired);
+    let step = admit_solved(&mut table, now, block_id, PeerCopy::Retired);
+    assert!(step.outputs.is_empty(), "{:?}", step.outputs);
+    assert_eq!(table.block_phase(&block_id), Some(BlockPhase::Retired));
+    assert!(!table.is_proposer(&block_id));
+    table.assert_invariants();
+
+    let other = encode_body(&Profile::TINY, &[0x77; 128], 2).unwrap();
+    let block_id = block::Hash([0x8A; 32]);
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    admit(&mut table, now, block_id, other.coding, other.part_root);
+    let step = admit_solved(&mut table, now, block_id, PeerCopy::Collecting);
+    assert!(step.outputs.is_empty(), "{:?}", step.outputs);
+    assert_eq!(table.block_phase(&block_id), Some(BlockPhase::Collecting));
+    assert!(!table.is_proposer(&block_id));
+    table.assert_invariants();
 }
 
 /// decision-20: the proposer announces nothing for its own block.

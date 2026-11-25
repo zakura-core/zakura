@@ -116,6 +116,22 @@ impl BlockTable {
                 assert_eq!(block.repair_round, 0);
                 assert!(!block.body_claimed);
             }
+            // bpv1-88: a block this node proposed is done and holds every
+            // part, whichever admission came first.
+            if block.as_proposer {
+                assert!(
+                    block.phase == BlockPhase::Done
+                        && !block.body_claimed
+                        && block.have_deadline.is_none()
+                        && block.stripes.iter().all(|st| {
+                            st.held_count == block.meta.coding.n
+                                && st.claims.is_empty()
+                                && st.incoming.is_empty()
+                                && st.job.is_none()
+                        }),
+                    "{BLOCK_REPLAY}: bpv1-88 the proposer's block is not done with every part"
+                );
+            }
             // bpv1-63: only a verifying block has a submission in flight.
             assert!(
                 block.verify_work_id.is_none() || block.phase == BlockPhase::Verifying,

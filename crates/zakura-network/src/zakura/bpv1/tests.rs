@@ -480,6 +480,156 @@ fn commitment_and_miner_mesh_outputs_stay_distinct_in_one_coinbase() {
     assert_eq!(&mesh_script[2..4], b"MR");
 }
 
+/// decision-34 / bpv1-87: the coinbase decides how `HeaderMeta` names the proposer.
+/// With one miner mesh output, its gateway ID names the proposer, and
+/// `HeaderMeta` must leave `proposer_node` out. Without one, `HeaderMeta`
+/// must carry it. Two mesh outputs name no gateway, so `HeaderMeta` carries
+/// the node. A form that disagrees with the coinbase fails before `C`.
+#[test]
+fn decision34_the_coinbase_decides_the_proposer_form() {
+    let gateway = GatewayId::from_bytes([0x77; 20]);
+    let mesh = MinerMeshCommitment::new(gateway).to_output();
+    let verify = |committed: &Committed, proposer_node: Option<NodeId>| {
+        let fields = CommitmentFields {
+            proposer_node,
+            ..committed.fields.clone()
+        };
+        verify_commitment(
+            &committed.network,
+            committed.height,
+            &committed.block.header,
+            &committed.binding,
+            &fields,
+        )
+    };
+
+    let named = build_committed_nu7_block_with_outputs(&Profile::TINY, 2, vec![mesh.clone()]);
+    assert_eq!(named.fields.proposer_node, None);
+    assert_eq!(verify(&named, None), Ok(Proposer::Gateway(gateway)));
+    assert_eq!(
+        verify(&named, Some(node_id(1))),
+        Err(CommitmentError::ProposerNamedTwice),
+        "metadata that names a node beside a mesh output is refused"
+    );
+
+    let plain = build_committed_nu7_block(&Profile::TINY, 2);
+    assert_eq!(
+        verify(&plain, Some(node_id(1))),
+        Ok(Proposer::Node(node_id(1)))
+    );
+    assert_eq!(
+        verify(&plain, None),
+        Err(CommitmentError::MissingProposer),
+        "metadata that names no node without a mesh output is refused"
+    );
+
+    let ambiguous =
+        build_committed_nu7_block_with_outputs(&Profile::TINY, 2, vec![mesh.clone(), mesh]);
+    assert_eq!(
+        verify(&ambiguous, Some(node_id(1))),
+        Ok(Proposer::Node(node_id(1))),
+        "two mesh outputs name no gateway"
+    );
+    assert_eq!(
+        verify(&ambiguous, None),
+        Err(CommitmentError::MissingProposer)
+    );
+}
+
+/// decision-34 / bpv1-87: `C` covers `proposer_node` only in the node form, so the two
+/// forms of one body commit different hashes. A coinbase committed in one
+/// form never verifies metadata in the other.
+#[test]
+fn decision34_c_differs_per_form() {
+    let named = build_committed_nu7_block_with_outputs(
+        &Profile::TINY,
+        2,
+        vec![MinerMeshCommitment::new(GatewayId::from_bytes([0x77; 20])).to_output()],
+    );
+    let plain = build_committed_nu7_block(&Profile::TINY, 2);
+    assert_eq!(
+        (named.fields.coding, named.fields.part_root),
+        (plain.fields.coding, plain.fields.part_root),
+        "one body"
+    );
+    assert_ne!(commit_hash(&named.fields), commit_hash(&plain.fields));
+    let other_node = CommitmentFields {
+        proposer_node: Some(node_id(2)),
+        ..plain.fields.clone()
+    };
+    assert_ne!(commit_hash(&other_node), commit_hash(&plain.fields));
+}
+
+/// decision-34 / bpv1-86: a gateway ID names every node whose ID starts with it, and
+/// no other. A node that builds a template whose mesh output names another
+/// node's gateway gets no proposer, so it publishes no BPv1 commitment.
+#[test]
+fn decision34_a_gateway_names_only_nodes_with_its_prefix() {
+    let node = node_id(2);
+    let gateway = GatewayId::from_node_id(node.as_bytes());
+    let mut sibling_bytes = [2u8; 32];
+    sibling_bytes[31] = 9;
+    let sibling = NodeId::from_bytes(&sibling_bytes);
+    let mut outside_bytes = [2u8; 32];
+    outside_bytes[19] = 9;
+    let outside = NodeId::from_bytes(&outside_bytes);
+
+    let proposer = Proposer::Gateway(gateway);
+    assert!(proposer.is(&node));
+    assert!(proposer.is(&sibling), "the last 12 bytes do not count");
+    assert!(!proposer.is(&outside), "the first 20 bytes count");
+    assert!(!proposer.is(&node_id(3)));
+    assert!(Proposer::Node(node).is(&node));
+    assert!(!Proposer::Node(node).is(&sibling));
+
+    assert_eq!(Proposer::local(node, None), Some(Proposer::Node(node)));
+    assert_eq!(Proposer::local(node, Some(gateway)), Some(proposer));
+    assert_eq!(
+        Proposer::local(node_id(3), Some(gateway)),
+        None,
+        "a mesh output naming another node's gateway"
+    );
+    assert_eq!(proposer.proposer_node(), None);
+    assert_eq!(Proposer::Node(node).proposer_node(), Some(node));
+}
+
+/// decision-34: both `HeaderMeta` forms round trip. The gateway form ends in
+/// a zero flags byte; the node form sets bit 0 and appends the node ID, so it
+/// is 32 bytes longer.
+#[test]
+fn decision34_header_meta_round_trips_in_both_forms() {
+    let meta = |proposer_node| Bpv1Message::HeaderMeta {
+        header: vec![0x11; 80],
+        binding: CoinbaseBinding {
+            coinbase: vec![0x22; 64],
+            txid_siblings: vec![[0x33; 32]],
+            auth_siblings: vec![[0x44; 32]],
+            light_client_root: [0x55; 32],
+        },
+        coding: sample_coding(),
+        part_root: [0x66; 32],
+        proposer_node,
+    };
+    let gateway_form = meta(None);
+    let node_form = meta(Some(node_id(7)));
+    let gateway_frame = encode_frame(&gateway_form).unwrap();
+    let node_frame = encode_frame(&node_form).unwrap();
+    assert_eq!(
+        decode_frame::<Bpv1Message>(&gateway_frame).unwrap(),
+        gateway_form
+    );
+    assert_eq!(decode_frame::<Bpv1Message>(&node_frame).unwrap(), node_form);
+
+    let head = gateway_frame.payload.len() - 1;
+    assert_eq!(node_frame.payload.len(), head + 1 + 32);
+    assert_eq!(gateway_frame.payload[..head], node_frame.payload[..head]);
+    assert_eq!(&gateway_frame.payload[head..], [0x00]);
+    assert_eq!(
+        node_frame.payload[head..],
+        [&[0x01][..], node_id(7).as_bytes()].concat()
+    );
+}
+
 #[test]
 fn corrupted_parity_under_valid_proofs_fails_reencode_check() {
     // Named scenario (05 §3): proposer commits valid Merkle proofs over an

@@ -5,7 +5,7 @@
 use std::time::Duration;
 
 use proptest::prelude::*;
-use zakura_chain::block;
+use zakura_chain::{block, miner_mesh::GatewayId};
 use zakura_quic::NodeId;
 use zakura_rt::time::Instant;
 
@@ -1138,6 +1138,114 @@ fn decision19_proposer_push_bound_is_n_and_relay_bound_n_minus_k() {
         peer.step(now, have_with(block_id, HaveFlags::Relay, relay));
         assert_closed(&peer, Bpv1CloseRow::Row20BadPushFlags);
     }
+}
+
+/// The admission of `block_id`, whose coinbase's miner mesh output names
+/// the gateway of `named` (decision-34).
+fn gateway_admitted(block_id: block::Hash, named: NodeId) -> PeerInput {
+    PeerInput::BlockAdmitted(BlockAdmitted {
+        proposer: Proposer::Gateway(GatewayId::from_node_id(named.as_bytes())),
+        ..block_admitted(block_id, tiny(), named)
+    })
+}
+
+/// decision-34 / bpv1-86: when the miner mesh output names the proposer, the
+/// connection whose node ID starts with the gateway ID gets the proposer's
+/// rights: up to `n` flags per stripe, `n − k` of them relay, and its
+/// flagged parts arrive as seeds. Any node ID with that prefix qualifies.
+#[test]
+fn decision34_the_gateway_prefixed_connection_seeds_and_relays() {
+    let coding = tiny();
+    let block_id = block::Hash([0x5A; 32]);
+    let now = Instant::now();
+    let (n, bound) = (coding.n, coding.n - coding.k);
+    let mut sibling = [2u8; 32];
+    sibling[31] = 9;
+    for remote in [node_id(2), NodeId::from_bytes(&sibling)] {
+        let mut peer = session(remote, now, gateway_admitted(block_id, node_id(2)));
+        let relay: Vec<u32> = (0..bound).collect();
+        let s = peer.step(now, have_with(block_id, HaveFlags::Relay, relay.clone()));
+        assert!(s.outputs.contains(&PeerOutput::PushFlagged {
+            block_id,
+            indices: relay,
+            relay: true,
+        }));
+        peer.step(
+            now,
+            have_with(block_id, HaveFlags::Push, (bound..n).collect()),
+        );
+        assert!(peer.close_cause().is_none());
+        for index in 0..n {
+            // Widening u32 to usize is lossless on supported targets.
+            let (auth, _) = deliver(&mut peer, block_id, &session_part(index as usize), now);
+            assert_eq!(auth, Some(PartAuth::Seed), "seed {index} from {remote:?}");
+        }
+        assert!(peer.close_cause().is_none());
+        peer.assert_invariants();
+    }
+}
+
+/// decision-34 / bpv1-86: a connection whose node ID does not start with the
+/// gateway ID gets the non-proposer treatment. A relay flag, or a push flag
+/// past `n − k` in one stripe, closes 20, and flagged parts within the bound
+/// arrive as pushes, not seeds.
+#[test]
+fn decision34_a_connection_outside_the_gateway_is_an_ordinary_peer() {
+    let coding = tiny();
+    let block_id = block::Hash([0x5B; 32]);
+    let now = Instant::now();
+    let bound = coding.n - coding.k;
+    let mut outside = [2u8; 32];
+    outside[19] = 9;
+    for remote in [node_id(3), NodeId::from_bytes(&outside)] {
+        let gateway_of_2 = || gateway_admitted(block_id, node_id(2));
+        let mut peer = session(remote, now, gateway_of_2());
+        peer.step(now, have_with(block_id, HaveFlags::Relay, vec![0]));
+        assert_closed(&peer, Bpv1CloseRow::Row20BadPushFlags);
+
+        let mut peer = session(remote, now, gateway_of_2());
+        peer.step(
+            now,
+            have_with(block_id, HaveFlags::Push, (0..=bound).collect()),
+        );
+        assert_closed(&peer, Bpv1CloseRow::Row20BadPushFlags);
+
+        let mut peer = session(remote, now, gateway_of_2());
+        peer.step(
+            now,
+            have_with(block_id, HaveFlags::Push, (0..bound).collect()),
+        );
+        let (auth, _) = deliver(&mut peer, block_id, &session_part(0), now);
+        assert_eq!(auth, Some(PartAuth::Push));
+        assert!(peer.close_cause().is_none());
+        peer.assert_invariants();
+    }
+}
+
+/// decision-34 / bpv1-9: a node whose gateway the miner mesh output names,
+/// but that admitted the block from a peer, relays it like any other block.
+/// Naming a node never silences it (#2707 review, r4686585980).
+#[test]
+fn decision34_a_node_named_by_its_gateway_that_did_not_propose_still_relays() {
+    let now = Instant::now();
+    let named = block::Hash([0xBB; 32]);
+    let mut p = session(node_id(2), now, gateway_admitted(named, node_id(1)));
+    let step = p.step(now, ready(named, vec![0], true));
+    assert!(
+        step.outputs.iter().any(|output| matches!(
+            output,
+            PeerOutput::SendHave {
+                flags: HaveFlags::Push,
+                ..
+            }
+        )),
+        "the named node pushes its pushed seeds"
+    );
+    p.step(now, ready(named, vec![1], false));
+    assert!(
+        p.next_deadline().is_some(),
+        "the named node announces the parts it verified"
+    );
 }
 
 /// decision-19 / bpv1-25: the proposer flags each seed once, relay seeds

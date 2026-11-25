@@ -31,8 +31,8 @@ use super::{
     service::{Bpv1Handle, Bpv1Ports},
     test_support::{
         block_of, build_v6_coinbase, build_v6_tx, committed_coinbase, connect, connect_pair,
-        node_id, pair, ports, regtest_nu7, regtest_nu7_at, solved_block, start, wait_until,
-        ScriptedVerifier,
+        node_id, pair, ports, regtest_nu7, regtest_nu7_at, solved_block, solved_block_naming,
+        start, wait_until, ScriptedVerifier,
     },
     wire::{BPV1_CONTROL_KIND, BPV1_DATA_KIND, ZAKURA_CAP_BPV1},
 };
@@ -668,4 +668,108 @@ async fn data_writer_delays_but_never_drops_behind_a_slow_reader() {
         ],
         "every frame arrives, in order, with the Have and WantEnd behind the parts"
     );
+}
+
+/// decision-34 / bpv1-87: the proposer hook commits to the form its
+/// template's coinbase asks for. A mesh output that names this node's
+/// gateway gets a `C` without `proposer_node`; one that names another node
+/// gets no commitment. A solved block whose `C` has the other form than its
+/// coinbase stays on existing relay, so receivers never see a mismatch.
+#[tokio::test]
+async fn decision34_proposer_hook_commits_to_the_coinbase_form() {
+    use zakura_chain::miner_mesh::GatewayId;
+    use zakura_node_services::bpv1_proposer::Bpv1ProposerHook;
+
+    let shutdown = CancellationToken::new();
+    let (handle_a, _handle_b) = pair(
+        Profile::TINY,
+        ports(
+            10,
+            ScriptedVerifier::new(VerifierVerdict::Valid),
+            SharedBodyClaims::new(),
+        ),
+        ports(
+            10,
+            ScriptedVerifier::new(VerifierVerdict::Valid),
+            SharedBodyClaims::new(),
+        ),
+        &shutdown,
+    );
+    let own = GatewayId::from_node_id(node_id(1).as_bytes());
+    let other = GatewayId::from_node_id(node_id(2).as_bytes());
+    let lcr = [0x44; 32];
+    let tx = build_v6_tx(Height(10), 3);
+    let tx_bytes = tx.zcash_serialize_to_vec().unwrap();
+
+    let node_form = handle_a
+        .prepare_template_commitment(lcr, Height(10), 2, &tx_bytes, None)
+        .expect("a template without a mesh output");
+    let gateway_form = handle_a
+        .prepare_template_commitment(lcr, Height(10), 2, &tx_bytes, Some(own))
+        .expect("a template whose mesh output names this node");
+    assert_ne!(node_form, gateway_form, "C differs per form");
+    assert_eq!(
+        handle_a.prepare_template_commitment(lcr, Height(10), 2, &tx_bytes, Some(other)),
+        None,
+        "a mesh output that names another node"
+    );
+    assert_eq!(
+        handle_a.empty_template_commitment(Height(10), Some(other)),
+        None
+    );
+    assert_ne!(
+        handle_a.empty_template_commitment(Height(10), Some(own)),
+        handle_a.empty_template_commitment(Height(10), None)
+    );
+
+    // A coinbase with this node's mesh output but the node-form `C`, and one
+    // without a mesh output but the gateway-form `C`, stay on existing relay.
+    let mesh = zakura_chain::miner_mesh::MinerMeshCommitment::new(own).to_output();
+    for (payload, mesh_output) in [(node_form, Some(mesh)), (gateway_form, None)] {
+        let script = [&[0x6a, 0x23][..], &payload].concat();
+        let mut cb = committed_coinbase(Height(10), &script);
+        if let (Some(mesh_output), zakura_chain::transaction::Transaction::V6 { outputs, .. }) =
+            (mesh_output, &mut cb)
+        {
+            outputs.push(mesh_output);
+        }
+        let solved = Arc::new(block_of(lcr, vec![Arc::new(cb), Arc::new(tx.clone())]));
+        assert!(
+            !Bpv1ProposerHook::publish_solved_block(&handle_a, solved, Height(10)),
+            "a coinbase whose form disagrees with its C"
+        );
+    }
+    shutdown.cancel();
+}
+
+/// decision-34 / bpv1-86: a block whose coinbase names the proposer by its
+/// gateway ID reaches the follower over BPv1. The follower takes the
+/// proposer's seeds and relay flags on the gateway-prefixed connection,
+/// commits the block, and keeps the session.
+#[tokio::test]
+async fn decision34_a_gateway_named_block_propagates() {
+    use zakura_chain::miner_mesh::GatewayId;
+
+    let shutdown = CancellationToken::new();
+    let (handle_a, handle_b, _snapshots_b) =
+        proposer_and_follower(VerifierVerdict::Valid, &shutdown);
+    let gateway = GatewayId::from_node_id(node_id(1).as_bytes());
+    let block = solved_block_naming(
+        &handle_a,
+        Height(10),
+        vec![build_v6_tx(Height(10), 4)],
+        Some(gateway),
+    )
+    .expect("the mesh output names the proposer");
+    assert!(handle_a.publish_solved_block(&block, 10));
+    wait_until("B commits the block", || {
+        handle_b.block_phase(&block.hash()) == Some(BlockPhase::Done)
+    })
+    .await;
+    assert_eq!(
+        handle_b.live_sessions(),
+        1,
+        "B keeps the proposer's session"
+    );
+    shutdown.cancel();
 }

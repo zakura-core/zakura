@@ -583,8 +583,11 @@ For a fresh Ubuntu x86_64 host:
 
 ## Trace archives
 
-New controller deployments enable `policy.archive_traces`. Install the AWS CLI
-on each sync host. Set these values in `/etc/zakura-traces.env` (mode 0600):
+Controller deployments leave `policy.archive_traces` off, because no sync host
+has a trace Space configured. With it on, preflight halts every run until the
+Space below exists. To turn it on, set `archive_traces = true` in
+`templates/controller.toml`, install the AWS CLI on each sync host, and set
+these values in `/etc/zakura-traces.env` (mode 0600):
 
 ```sh
 ZAKURA_TRACE_SPACE=YOUR_SPACE
@@ -636,8 +639,8 @@ python3 deploy/continuous-sync/deploy.py summary-status
 
 This update preserves existing delivery cursors. For a new sender, follow the
 [initialization procedure](#daily-summary) before enabling its timer.
-Configure the AWS CLI, credentials, and lifecycle rule on every sync host before
-controller deployment. Preflight checks archive access and expiration before
-starting a sync. The next daily report includes a download link for each
+With archiving on, configure the AWS CLI, credentials, and lifecycle rule on
+every sync host before controller deployment. Preflight checks archive access
+and expiration before starting a sync. The next daily report includes a download link for each
 unreported completion that has an archive URL. Runs completed before archival
 was enabled have no download link.

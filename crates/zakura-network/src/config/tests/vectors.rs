@@ -1334,6 +1334,32 @@ fn zakura_bootstrap_peers_parse_in_nested_config() {
     assert_eq!(config.zakura.message_rate_per_second, 5);
 }
 
+/// Config load checks the budget without `tx-relay`, which zakurad turns off
+/// with the classic pool, so a budget that funds the floor only without it
+/// still loads.
+#[test]
+fn zakura_peer_memory_budget_at_load_leaves_out_tx_relay() {
+    let _init_guard = zakura_test::init();
+
+    // One 256 MiB socket queue, 32 handshakes of 64 MiB, and Mainnet's floor
+    // of 17 connections of 141,945,123 bytes, which is 16 with `tx-relay`'s
+    // 4,259,840 bytes added to each.
+    let config: Config = toml::from_str(
+        r#"
+        p2p_stack = "dual"
+
+        [zakura]
+        peer_memory_budget_bytes = 4828986195
+        "#,
+    )
+    .expect("the budget funds the floor without tx-relay");
+    assert!(config.zakura.tx_relay.enabled);
+    assert!(config
+        .zakura
+        .budgeted_max_connections(&config.network)
+        .is_err());
+}
+
 #[test]
 fn zakura_peer_memory_budget_lowers_or_refuses_at_load() {
     let _init_guard = zakura_test::init();
@@ -1361,12 +1387,12 @@ fn zakura_peer_memory_budget_lowers_or_refuses_at_load() {
         r#"
         [zakura]
         max_connections = 256
-        peer_memory_budget_bytes = 38753870592
+        peer_memory_budget_bytes = 39844389632
         "#,
     )
     .unwrap();
     // One 256 MiB socket queue, 32 handshakes of 64 MiB, and 256 admitted
-    // connections of 141,945,123 bytes.
+    // connections of 146,204,963 bytes.
     assert_eq!(
         config.zakura.budgeted_max_connections(&config.network),
         Ok(256)

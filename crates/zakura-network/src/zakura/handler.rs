@@ -356,13 +356,13 @@ pub struct ZakuraConfig {
     ///
     /// An admitted QUIC connection can hold its receive window, which is the
     /// `[network.zakura.quic]` receive window plus every reactor's receive
-    /// share, and its send window: 141,937,353 bytes at the Mainnet defaults.
+    /// share, and its send window: 146,204,963 bytes at the Mainnet defaults.
     /// A connection in its handshake holds only the two QUIC windows, 64 MiB.
     /// Each bound socket can also queue 256 MiB of datagrams, however many
     /// connections it serves (zakura-quic CTRL-26 lists what this leaves out).
     /// The node reserves one socket queue per bound socket and
     /// `max_pending_handshakes` handshakes, and funds the rest divided by the
-    /// admitted connection's cost: 104 connections at default Mainnet
+    /// admitted connection's cost: 108 connections at default Mainnet
     /// windows on one socket. A larger `max_connections` is lowered at startup.
     /// A closed connection releases its stream buffers and costs nothing more
     /// until it drains.
@@ -5783,6 +5783,20 @@ async fn spawn_zakura_endpoint_inner(
     if !config.v2_p2p() {
         return Ok(None);
     }
+    // `tx-relay`'s shares are charged exactly while its service is registered,
+    // whatever `[network.zakura.tx_relay] enabled` says.
+    let tx_relay_registered = custom_services
+        .iter()
+        .any(|custom| custom.tx_relay_sessions.is_some());
+    let registered_config;
+    let config = if config.zakura.tx_relay.enabled == tx_relay_registered {
+        config
+    } else {
+        let mut adjusted = config.clone();
+        adjusted.zakura.tx_relay.enabled = tx_relay_registered;
+        registered_config = adjusted;
+        &registered_config
+    };
 
     if config.zakura.nat_traversal {
         return Err(ZAKURA_NAT_TRAVERSAL_REMOVED.into());
@@ -10479,6 +10493,37 @@ mod tests {
         .await?;
 
         assert!(endpoint.is_none());
+        Ok(())
+    }
+
+    /// An endpoint started without the `tx-relay` service isn't charged for
+    /// its shares, though `[network.zakura.tx_relay] enabled` defaults to true.
+    #[tokio::test]
+    async fn an_endpoint_without_tx_relay_is_not_charged_for_it() -> Result<(), BoxError> {
+        let _guard = zakura_test::init();
+        let mut config = Config::for_test(P2pStack::Dual);
+        config.zakura.bootstrap_peers = Vec::new();
+        assert!(config.zakura.tx_relay.enabled);
+        // A budget for exactly the floor without `tx-relay`, so one fewer with it.
+        let mut without_tx_relay = config.zakura.clone();
+        without_tx_relay.tx_relay.enabled = false;
+        config.zakura.peer_memory_budget_bytes =
+            u64::try_from(without_tx_relay.quic_memory_bytes(
+                &config.network,
+                super::super::peer_memory::MIN_ZAKURA_BUDGETED_CONNECTIONS,
+                &[],
+            ))?;
+        assert!(config
+            .zakura
+            .budgeted_max_connections(&config.network)
+            .is_err());
+
+        let endpoint = spawn_zakura_endpoint(&config, |_supervisor, _trace| {
+            Arc::new(NoopService) as Arc<dyn Service>
+        })
+        .await?;
+
+        assert!(endpoint.is_some());
         Ok(())
     }
 

@@ -311,7 +311,7 @@ fn a_caller_in_backoff_is_granted() {
 /// A full ordinary pool can immediately admit every funded gateway.
 #[test]
 fn default_and_explicit_memory_budgets_fund_gateways_after_ordinary_peers() {
-    for (budget, extra) in [(None, 10), (Some(15_u64 << 30), 4), (Some(14_u64 << 30), 0)] {
+    for (budget, extra) in [(None, 10), (Some(15_u64 << 30), 1), (Some(14_u64 << 30), 0)] {
         let mut config = Config::default();
         if let Some(bytes) = budget {
             config.zakura.peer_memory_budget_bytes = bytes;

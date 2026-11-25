@@ -371,4 +371,3 @@ A requester gets 4 records per answer, not 32. One peer's 32-record window
 takes at least 8 answers, 105 seconds after the first: a requester excludes
 only the records it stored, so one it discards can be served again. A
 discovery-only connection, which makes one exchange, yields 4 records.
-

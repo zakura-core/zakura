@@ -12,11 +12,17 @@ use super::{
 };
 use crate::zakura::bpv1::peer::PartAuth;
 use crate::zakura::bpv1::{
+    close::Bpv1CloseRow,
     codec::encode_body,
     commitment::{CoinbaseBinding, Proposer},
     paths::PathEstimate,
     profile::Profile,
+    unknown_parent::UnknownParentVerdict,
 };
+
+/// The verified tip hash and every admitted header's parent, so a block one
+/// above the verified tip extends it.
+const FUZZ_TIP_HASH: block::Hash = block::Hash([0; 32]);
 
 /// Summary returned by [`replay_bpv1_block_bytes`] (`tool-2`).
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -74,6 +80,7 @@ pub fn replay_bpv1_block_bytes(bytes: &[u8]) -> BlockReplaySummary {
         let input = match op {
             0 => BlockInput::TipHeight {
                 height: u32::from(b),
+                hash: FUZZ_TIP_HASH,
             },
             1 => {
                 let env = MetaEnvelope {
@@ -100,6 +107,7 @@ pub fn replay_bpv1_block_bytes(bytes: &[u8]) -> BlockReplaySummary {
                 let result = match a % 4 {
                     0 => HeaderAdmissionResult::Admitted {
                         height: table.top().saturating_add(1),
+                        parent_hash: FUZZ_TIP_HASH,
                     },
                     1 => HeaderAdmissionResult::MissingParent {
                         parent_hash: block::Hash([0x01; 32]),
@@ -158,6 +166,10 @@ pub fn replay_bpv1_block_bytes(bytes: &[u8]) -> BlockReplaySummary {
                 ][usize::from(a % 3)],
                 peer_states,
             },
+            8 if a & 1 == 0 => BlockInput::MetaSessionEnded {
+                peer,
+                session_gen: 1,
+            },
             8 => BlockInput::SessionEnded { peer, peer_states },
             9 => {
                 // The IO shell charges a part before proof; a refused
@@ -189,6 +201,16 @@ pub fn replay_bpv1_block_bytes(bytes: &[u8]) -> BlockReplaySummary {
                 indices: (0..8u32).filter(|i| b & (1 << i) != 0).collect(),
                 relay: false,
             },
+            // Odd `a` answers the latest unknown-parent check.
+            _ if a & 1 == 1 => BlockInput::UnknownParentChecked {
+                work_id: pending_works.pop().unwrap_or(WorkId(u64::from(b))),
+                verdict: [
+                    UnknownParentVerdict::Park,
+                    UnknownParentVerdict::Drop,
+                    UnknownParentVerdict::Invalid(Bpv1CloseRow::Row3InvalidHeader),
+                    UnknownParentVerdict::Invalid(Bpv1CloseRow::Row4BadMetaOrCommitment),
+                ][usize::from(b % 4)],
+            },
             _ => BlockInput::Tick { peer_states },
         };
 
@@ -197,6 +219,7 @@ pub fn replay_bpv1_block_bytes(bytes: &[u8]) -> BlockReplaySummary {
         for o in out.outputs {
             match o {
                 BlockOutput::AdmitHeader { work_id, .. }
+                | BlockOutput::CheckUnknownParent { work_id, .. }
                 | BlockOutput::VerifyCommitment { work_id, .. } => {
                     pending_works.push(work_id);
                 }

@@ -25,7 +25,7 @@ impl BlockTable {
         let recomputed_pending: usize = self
             .pending
             .values()
-            .map(|e| e.envelope.estimated_bytes())
+            .map(PendingMetaEntry::charged_bytes)
             .sum();
         assert_eq!(
             self.pending_bytes, recomputed_pending,
@@ -60,14 +60,19 @@ impl BlockTable {
             self.config.part_buffer_bytes
         );
 
-        // bpv1-50: every indexed header or commitment job belongs to its
-        // admitting entry, so finished or abandoned work leaves no lease.
+        // bpv1-50: every indexed header, unknown-parent, or commitment job
+        // belongs to its admitting or pending entry, so finished or abandoned
+        // work leaves no lease.
         for (work_id, block_id) in &self.work_to_block {
             assert!(
                 self.admitting
                     .get(block_id)
-                    .is_some_and(|entry| entry.work_id == *work_id),
-                "{BLOCK_REPLAY}: bpv1-50 work index holds a job no admitting entry owns"
+                    .is_some_and(|entry| entry.work_id == *work_id)
+                    || self
+                        .pending
+                        .get(block_id)
+                        .is_some_and(|entry| entry.checking == Some(*work_id)),
+                "{BLOCK_REPLAY}: bpv1-50 work index holds a job no entry owns"
             );
         }
 
@@ -111,6 +116,17 @@ impl BlockTable {
                 assert_eq!(block.repair_round, 0);
                 assert!(!block.body_claimed);
             }
+            // bpv1-63: only a verifying block has a submission in flight.
+            assert!(
+                block.verify_work_id.is_none() || block.phase == BlockPhase::Verifying,
+                "{BLOCK_REPLAY}: bpv1-63 a {:?} block holds a verifier submission",
+                block.phase
+            );
+            // bpv1-82: every verifying block has a verification deadline.
+            assert!(
+                block.phase != BlockPhase::Verifying || block.verify_deadline.is_some(),
+                "{BLOCK_REPLAY}: bpv1-82 a verifying block has no deadline"
+            );
             for st in &block.stripes {
                 // bpv1-28 budgets pulls. A decode may end with more than `k`
                 // parts held, and a `Fallback` block keeps them to serve but

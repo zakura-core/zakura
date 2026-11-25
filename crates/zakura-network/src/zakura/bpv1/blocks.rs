@@ -8,7 +8,7 @@
 //! It holds values only: no locks, channels, tasks, or I/O handles. In
 //! production the IO layer wraps `BlockTable` in a short non-awaited `Mutex`.
 
-use std::{sync::Arc, time::Duration};
+use std::{collections::VecDeque, sync::Arc, time::Duration};
 
 use zakura_chain::block;
 use zakura_quic::NodeId;
@@ -29,6 +29,7 @@ use super::{
         Coding, Profile, W2_MAX_COINBASE_BYTES, W2_MAX_COMMITMENT_PATH_DEPTH, W2_MAX_HEADER_BYTES,
     },
     tree::{encoding_id, VerifiedPart},
+    unknown_parent::UnknownParentVerdict,
     wire::{Bpv1Message, WantBitmap, PROPAGATION_DEPTH},
 };
 
@@ -57,6 +58,16 @@ pub fn stall_base(paths: &PeerPaths, coding: &Coding) -> Duration {
 /// Monotonic reconstruction deadline from admission (`W2` baseline, `bpv1-57`).
 /// It is the only recovery bound (decision-17).
 pub const RECONSTRUCTION_DEADLINE: Duration = Duration::from_secs(15);
+
+/// Monotonic verification deadline from a block's first verifier submission
+/// (`bpv1-82`).
+///
+/// The body claim lasts until this deadline while the block verifies
+/// (`bpv1-44`). Past it, the block falls back to block sync and frees its slot.
+/// It matches the verifier's 2-minute wait for another delivery's pending
+/// commit, and the node's verifier adapter cancels its router call at the same
+/// bound.
+pub const VERIFY_DEADLINE: Duration = Duration::from_secs(120);
 
 /// Maximum metadata entries in header admission or the commitment check.
 /// Pending metadata never counts here (`bpv1-75`).
@@ -168,6 +179,8 @@ pub enum FallbackReason {
     RootMismatch,
     /// Local decoded-block pool capacity or retryable verifier backpressure.
     LocalCapacity,
+    /// The verification deadline elapsed before a verdict (`bpv1-82`).
+    VerifyDeadline,
 }
 
 /// How a received part was requested (`part.received{source}`).
@@ -193,6 +206,8 @@ pub enum HeaderAdmissionResult {
     Admitted {
         /// Consensus height of the admitted header.
         height: u32,
+        /// Hash of the header's parent.
+        parent_hash: block::Hash,
     },
     /// Parent header is not yet in headerchain.
     MissingParent {
@@ -234,7 +249,7 @@ pub enum ClaimRelease {
 }
 
 /// Decoded `HeaderMeta` envelope presented to [`BlockTable`].
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MetaEnvelope {
     /// Block consensus hash.
     pub block_id: block::Hash,
@@ -334,16 +349,20 @@ pub struct PullPeerState {
 /// Synchronous input to [`BlockTable::step`].
 #[derive(Clone, Debug)]
 pub enum BlockInput {
-    /// Headerchain / chain tip height updated (`bpv1-7`, `bpv1-46`).
+    /// The verified chain tip moved (`bpv1-7`, `bpv1-46`, `bpv1-76`).
     TipHeight {
-        /// New tip height.
+        /// Height of the new verified tip.
         height: u32,
-    },
-    /// A parent header was admitted into headerchain, waking pending metadata (`bpv1-11`).
-    ParentAdmitted {
-        /// Hash of the newly admitted parent header.
+        /// Hash of the new verified tip.
         hash: block::Hash,
-        /// Height of the admitted parent.
+    },
+    /// Headerchain's best header moved to `hash`, waking pending metadata
+    /// (`bpv1-11`): the entries whose parent is `hash`, and the entry for
+    /// `hash` itself, which header sync admitted along with its skipped parent.
+    ParentAdmitted {
+        /// Hash of the new best header.
+        hash: block::Hash,
+        /// Height of the new best header.
         height: u32,
     },
     /// Validated-layout `HeaderMeta` received from a peer (`bpv1-1`, `bpv1-3`, `bpv1-7`).
@@ -361,6 +380,14 @@ pub enum BlockInput {
         work_id: WorkId,
         /// Admission outcome.
         result: HeaderAdmissionResult,
+    },
+    /// Completion of the checks on metadata whose parent header is unknown
+    /// ([`super::unknown_parent`]).
+    UnknownParentChecked {
+        /// Work identity returned by `CheckUnknownParent`.
+        work_id: WorkId,
+        /// The checks' outcome.
+        verdict: UnknownParentVerdict,
     },
     /// Completion of coinbase commitment verification (`bpv1-2`, `bpv1-6`, `bpv1-63`).
     CommitmentChecked {
@@ -412,6 +439,15 @@ pub enum BlockInput {
         peer: NodeId,
         /// The sample's times and bytes.
         sample: RateSample,
+    },
+    /// One session ended, whether or not a newer session replaced it. The
+    /// table forgets it as a sender of metadata still in admission: no
+    /// answer can reach it.
+    MetaSessionEnded {
+        /// The peer of the session.
+        peer: NodeId,
+        /// The session's generation.
+        session_gen: u64,
     },
     /// Peer session ended: drop path entry and release its pull claims (`bpv1-62`, `bpv1-65`).
     SessionEnded {
@@ -560,6 +596,18 @@ pub enum BlockOutput {
         /// Session generation of `from_peer`.
         session_gen: u64,
     },
+    /// Check the binding, height, target, and proof of work of metadata whose
+    /// parent header is unknown, off the driver ([`super::unknown_parent`]).
+    CheckUnknownParent {
+        /// Work identity.
+        work_id: WorkId,
+        /// Block hash.
+        block_id: block::Hash,
+        /// Metadata envelope to check.
+        envelope: Box<MetaEnvelope>,
+        /// `top` when the check starts. The block's height must lie above it.
+        top: u32,
+    },
     /// Verify the coinbase commitment for an admitted header on a worker (`bpv1-2`).
     VerifyCommitment {
         /// Work identity.
@@ -582,6 +630,15 @@ pub enum BlockOutput {
     },
     /// Claim body ownership in `BlockFallback` so native block sync skips it.
     ClaimBody {
+        /// Claimed block hash.
+        block_id: block::Hash,
+        /// Monotonic expiry deadline.
+        deadline: Instant,
+    },
+    /// Move BPv1's live body claim to the later `deadline` (`bpv1-44`). An
+    /// expired or released claim stays gone, because block sync may already
+    /// own the body.
+    ExtendBodyClaim {
         /// Claimed block hash.
         block_id: block::Hash,
         /// Monotonic expiry deadline.
@@ -793,6 +850,12 @@ pub enum BlockEvent {
         /// Block hash.
         block_id: block::Hash,
     },
+    /// A retryable verdict parked the assembled block until its parent commits
+    /// (`bpv1-84`).
+    Parked {
+        /// Block hash.
+        block_id: block::Hash,
+    },
     /// Verdict received from `BlockVerifier`.
     Verdict {
         /// Block hash.
@@ -873,12 +936,25 @@ struct AdmittingEntry {
     arrived_at: Instant,
     from_peer: NodeId,
     session_gen: u64,
-    /// Other sessions that sent the same `HeaderMeta` while this entry waited.
-    /// Each session holds a received marker until the table rejects or admits
-    /// the block.
-    also_from: Vec<(NodeId, u64)>,
+    /// The copies other sessions sent while this entry waited.
+    later: LaterCopies,
     height: Option<u32>,
+    /// The header's parent, once headerchain admits the header.
+    parent_hash: Option<block::Hash>,
     stage: AdmittingStage,
+    /// When the entry first parked, if a wake retries it. A retried entry
+    /// already passed the unknown-parent checks, and it keeps its first
+    /// deadline if it parks again.
+    parked_at: Option<Instant>,
+    /// [`BlockTable::best_moves`] when the entry's header admission started.
+    best_moves: u64,
+}
+
+impl AdmittingEntry {
+    /// Bytes this entry holds against the admitting budget.
+    fn charged_bytes(&self) -> usize {
+        self.envelope.estimated_bytes() + self.later.alternate_bytes()
+    }
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -894,10 +970,172 @@ struct PendingMetaEntry {
     arrived_at: Instant,
     from_peer: NodeId,
     session_gen: u64,
-    /// See [`AdmittingEntry::also_from`].
-    also_from: Vec<(NodeId, u64)>,
+    /// The copies other sessions sent while this entry waited.
+    later: LaterCopies,
     parent_hash: block::Hash,
     received_at: Instant,
+    /// The unknown-parent checks' work while they run. The entry holds
+    /// pending budget during them, so metadata with an unknown parent never
+    /// takes admission budget from viable metadata (`bpv1-75`).
+    checking: Option<WorkId>,
+    /// [`BlockTable::best_moves`] when the entry's header admission started.
+    best_moves: u64,
+}
+
+impl PendingMetaEntry {
+    /// Bytes this entry holds against the pending budget.
+    fn charged_bytes(&self) -> usize {
+        self.envelope.estimated_bytes() + self.later.alternate_bytes()
+    }
+}
+
+/// The copies of one block's `HeaderMeta` that sessions other than the first
+/// sender sent while the table admitted it. Each session holds a received
+/// marker until the table rejects or admits the block.
+///
+/// The block id hashes only the header, so a later copy may carry another
+/// binding, coding, or part root. The table keeps each differing copy as an
+/// alternate envelope, in arrival order, while it fits the budget of the
+/// stage that holds the entry. Alternates use only room that no first copy
+/// needs. If the entry's envelope fails its commitment check, the oldest
+/// alternate gets its own check before the table answers its senders
+/// (bpv1-61). So invalid copies displace an honest relay's copy only by
+/// filling that room.
+#[derive(Clone, Debug, Default)]
+struct LaterCopies {
+    /// Sessions whose copy equals the entry's envelope.
+    same: Vec<(NodeId, u64)>,
+    /// The alternate envelopes, oldest first, each with the sessions whose
+    /// copy equals it.
+    alternates: VecDeque<(Box<MetaEnvelope>, Vec<(NodeId, u64)>)>,
+    /// Sessions whose copy matched no kept envelope. The table did not keep
+    /// their copies, so it cannot check them.
+    unkept: Vec<(NodeId, u64)>,
+}
+
+impl LaterCopies {
+    /// Records `sender`'s `copy` beside the entry's `envelope`. A new
+    /// differing copy becomes an alternate if it fits in `room` bytes.
+    /// Returns the bytes the new alternate charges.
+    fn record(
+        &mut self,
+        envelope: &MetaEnvelope,
+        copy: Box<MetaEnvelope>,
+        sender: (NodeId, u64),
+        room: usize,
+    ) -> usize {
+        if *copy == *envelope {
+            self.same.push(sender);
+            return 0;
+        }
+        if let Some((_, senders)) = self.alternates.iter_mut().find(|(alt, _)| **alt == *copy) {
+            senders.push(sender);
+            return 0;
+        }
+        let bytes = copy.estimated_bytes();
+        if bytes > room {
+            self.unkept.push(sender);
+            return 0;
+        }
+        self.alternates.push_back((copy, vec![sender]));
+        bytes
+    }
+
+    /// Bytes the alternate envelopes charge.
+    fn alternate_bytes(&self) -> usize {
+        self.alternates
+            .iter()
+            .map(|(envelope, _)| envelope.estimated_bytes())
+            .sum()
+    }
+
+    /// Drops the newest alternates until they charge at most `room` bytes.
+    /// Their senders become unkept. Returns the bytes freed.
+    fn keep_within(&mut self, room: usize) -> usize {
+        let mut freed = 0;
+        while self.alternate_bytes() > room {
+            let Some(dropped) = self.drop_alternate(self.alternates.len() - 1) else {
+                break;
+            };
+            freed += dropped;
+        }
+        freed
+    }
+
+    /// Drops the alternate at `position`, so its senders become unkept.
+    /// Returns the bytes it freed.
+    fn drop_alternate(&mut self, position: usize) -> Option<usize> {
+        let (envelope, senders) = self.alternates.remove(position)?;
+        self.unkept.extend(senders);
+        Some(envelope.estimated_bytes())
+    }
+
+    /// Forgets `session`, which ended: no answer can reach it. An alternate
+    /// that no live session sent goes too. Returns the bytes freed.
+    fn forget(&mut self, session: (NodeId, u64)) -> usize {
+        self.same.retain(|s| *s != session);
+        self.unkept.retain(|s| *s != session);
+        let mut freed = 0;
+        self.alternates.retain_mut(|(envelope, senders)| {
+            senders.retain(|s| *s != session);
+            if senders.is_empty() {
+                freed += envelope.estimated_bytes();
+            }
+            !senders.is_empty()
+        });
+        freed
+    }
+
+    /// Every later session, whichever copy it sent.
+    fn sessions(&self) -> impl Iterator<Item = (NodeId, u64)> + '_ {
+        self.same
+            .iter()
+            .chain(self.alternates.iter().flat_map(|(_, senders)| senders))
+            .chain(&self.unkept)
+            .copied()
+    }
+}
+
+/// Drops alternate envelopes from `entries`, largest first, until `needed`
+/// more bytes fit beside `used` under `cap` or none is left. Returns the
+/// bytes freed. Alternates use only room that no first copy needs.
+fn shed_alternates<E>(
+    entries: &mut HashMap<block::Hash, E>,
+    later: impl Fn(&mut E) -> &mut LaterCopies,
+    used: usize,
+    needed: usize,
+    cap: usize,
+) -> usize {
+    if used.saturating_add(needed) <= cap {
+        return 0;
+    }
+    let mut held: Vec<(usize, block::Hash, usize)> = Vec::new();
+    for (id, entry) in entries.iter_mut() {
+        for (position, (envelope, _)) in later(entry).alternates.iter().enumerate() {
+            held.push((envelope.estimated_bytes(), *id, position));
+        }
+    }
+    held.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| (a.1 .0, a.2).cmp(&(b.1 .0, b.2)))
+    });
+    let mut shed: Vec<(block::Hash, usize)> = Vec::new();
+    let mut freed = 0;
+    for (bytes, id, position) in held {
+        if used.saturating_sub(freed).saturating_add(needed) <= cap {
+            break;
+        }
+        freed += bytes;
+        shed.push((id, position));
+    }
+    // Later positions first, so each removal leaves the earlier ones valid.
+    shed.sort_by_key(|&(id, position)| std::cmp::Reverse((id.0, position)));
+    for (id, position) in shed {
+        if let Some(entry) = entries.get_mut(&id) {
+            later(entry).drop_alternate(position);
+        }
+    }
+    freed
 }
 
 /// Picks a block's `Have` initial group the way main's block gossip picks
@@ -1079,8 +1317,15 @@ struct ActiveBlock {
     last_part_at: Instant,
     /// Peers that sent `BlockDone`, which repair may ask for any part (decision-20).
     done_peers: HashSet<NodeId>,
-    /// Active verifier work id if `phase == Verifying`.
+    /// Work id of the submission in flight. `None` while `Verifying` means a
+    /// retryable verdict parked the assembled block until its parent commits
+    /// (`bpv1-84`).
     verify_work_id: Option<WorkId>,
+    /// Monotonic verification deadline, set at the first submission
+    /// (`bpv1-82`).
+    verify_deadline: Option<Instant>,
+    /// The header's parent. `None` for a local solved block.
+    parent_hash: Option<block::Hash>,
     /// Whether this block currently holds a body claim in `BlockFallback`.
     body_claimed: bool,
     /// True once `BlockDone` has been announced to routines.
@@ -1132,6 +1377,8 @@ impl ActiveBlock {
             last_part_at: now,
             done_peers: HashSet::new(),
             verify_work_id: None,
+            verify_deadline: None,
+            parent_hash: None,
             body_claimed: false,
             block_done_notified: false,
             part_charges: HashMap::new(),
@@ -1207,11 +1454,25 @@ fn reject_meta(step: &mut BlockStep, block_id: block::Hash, peer: NodeId, sessio
     });
 }
 
-/// Rejects the metadata for every session in `also_from`.
-fn reject_also(step: &mut BlockStep, block_id: block::Hash, also_from: &[(NodeId, u64)]) {
-    for &(peer, session_gen) in also_from {
+/// Rejects the metadata for every session in `later`.
+fn reject_later(step: &mut BlockStep, block_id: block::Hash, later: &LaterCopies) {
+    for (peer, session_gen) in later.sessions() {
         reject_meta(step, block_id, peer, session_gen);
     }
+}
+
+/// Whether metadata that would wait for its parent retries header admission
+/// instead: the best header moved since its admission started, so header
+/// sync may have admitted the parent or the header itself, and no wake
+/// reached the entry. A retry starts only after a move and before the
+/// entry's deadline, so retries stay bounded.
+fn retries_admission(
+    started_at_moves: u64,
+    best_moves: u64,
+    parked_at: Instant,
+    now: Instant,
+) -> bool {
+    started_at_moves != best_moves && now.saturating_duration_since(parked_at) < PENDING_META_AGE
 }
 
 /// Returns the next work identity from `counter`, skipping zero.
@@ -1227,17 +1488,28 @@ pub struct BlockTable {
     config: BlockConfig,
     next_work_id: u64,
     top: u32,
+    /// Height of the verified tip. Metadata more than `PROPAGATION_DEPTH` above it belongs to
+    /// block sync (`bpv1-76`).
+    verified: u32,
+    /// Hash of the verified tip. A block whose parent it is commits next
+    /// (`bpv1-83`, `bpv1-84`).
+    verified_hash: Option<block::Hash>,
     paths: PeerPaths,
     /// Metadata currently in `HeaderAdmission` or `VerifyCommitment`.
     admitting: HashMap<block::Hash, AdmittingEntry>,
     /// Index from `WorkId` to `block_id` for O(1) stale-work filtering.
     work_to_block: HashMap<WorkId, block::Hash>,
-    /// Pending metadata waiting on missing parents (`bpv1-11`).
+    /// Metadata whose parent header is missing, while its unknown-parent
+    /// checks run and then while it waits for the parent (`bpv1-11`).
     pending: HashMap<block::Hash, PendingMetaEntry>,
     /// Current byte charge of `pending`.
     pending_bytes: usize,
     /// Admitted (and retired-in-window) blocks.
     blocks: HashMap<block::Hash, ActiveBlock>,
+    /// Count of best-header moves (`ParentAdmitted`). A move during an
+    /// entry's admission or checks wakes nothing for it, so the entry retries
+    /// admission instead of parking.
+    best_moves: u64,
 }
 
 impl BlockTable {
@@ -1247,12 +1519,15 @@ impl BlockTable {
             config,
             next_work_id: 1,
             top: 0,
+            verified: 0,
+            verified_hash: None,
             paths: PeerPaths::new(),
             admitting: HashMap::new(),
             work_to_block: HashMap::new(),
             pending: HashMap::new(),
             pending_bytes: 0,
             blocks: HashMap::new(),
+            best_moves: 0,
         }
     }
 
@@ -1395,6 +1670,11 @@ impl BlockTable {
             .pending
             .values()
             .map(|entry| entry.received_at + PENDING_META_AGE);
+        let verifying = self
+            .blocks
+            .values()
+            .filter(|b| b.phase == BlockPhase::Verifying)
+            .filter_map(|b| b.verify_deadline);
         let blocks = self
             .blocks
             .values()
@@ -1413,34 +1693,36 @@ impl BlockTable {
                 .into_iter()
                 .flatten()
             });
-        pending.chain(blocks).min()
+        pending.chain(verifying).chain(blocks).min()
     }
 
     /// Executes one synchronous state transition.
     pub fn step(&mut self, now: Instant, input: BlockInput) -> BlockStep {
         let mut step = BlockStep::default();
         match input {
-            BlockInput::TipHeight { height } => self.raise_top(height, &mut step),
-            BlockInput::ParentAdmitted { hash, height } => {
+            BlockInput::TipHeight { height, hash } => {
+                self.verified = height;
+                self.verified_hash = Some(hash);
                 self.raise_top(height, &mut step);
-                self.wake_pending_for_parent(hash, &mut step);
+                self.resubmit_parked(now, &mut step);
+            }
+            BlockInput::ParentAdmitted { hash, height } => {
+                self.best_moves = self.best_moves.wrapping_add(1);
+                self.raise_top(height, &mut step);
+                self.wake_pending(hash, &mut step);
             }
             BlockInput::MetaReceived {
                 envelope,
                 from_peer,
                 session_gen,
             } => {
-                self.handle_meta_received(
-                    now,
-                    envelope,
-                    from_peer,
-                    session_gen,
-                    Vec::new(),
-                    &mut step,
-                );
+                self.handle_meta_received(now, envelope, from_peer, session_gen, &mut step);
             }
             BlockInput::HeaderAdmitted { work_id, result } => {
                 self.handle_header_admitted(now, work_id, result, &mut step);
+            }
+            BlockInput::UnknownParentChecked { work_id, verdict } => {
+                self.handle_unknown_parent_checked(now, work_id, verdict, &mut step);
             }
             BlockInput::CommitmentChecked {
                 work_id,
@@ -1467,6 +1749,9 @@ impl BlockTable {
             BlockInput::PathObserved { peer, estimate } => self.paths.observe(peer, estimate),
             BlockInput::RateSample { peer, sample } => {
                 self.paths.record_sample(peer, sample);
+            }
+            BlockInput::MetaSessionEnded { peer, session_gen } => {
+                self.forget_meta_session((peer, session_gen));
             }
             BlockInput::SessionEnded { peer, peer_states } => {
                 self.handle_session_ended(now, peer, &peer_states, &mut step);
@@ -1553,7 +1838,7 @@ impl BlockTable {
                 stripe,
                 result,
             } => {
-                self.handle_stripe_checked(work_id, block_id, stripe, result, &mut step);
+                self.handle_stripe_checked(now, work_id, block_id, stripe, result, &mut step);
             }
             BlockInput::BlockAssembled { work_id, block_id } => {
                 self.handle_block_assembled(now, work_id, block_id, &mut step);
@@ -1591,36 +1876,34 @@ impl BlockTable {
         height.saturating_add(PROPAGATION_DEPTH) > self.top
     }
 
+    /// Whether BPv1 may admit a block at `height`: inside the propagation window
+    /// (`bpv1-7`) and at most `PROPAGATION_DEPTH` above the verified tip (`bpv1-76`).
+    ///
+    /// While a node catches up, header sync runs near the network tip and raises
+    /// `top` far above the verified tip. A block that high cannot commit until block
+    /// sync delivers its ancestors, so block sync owns it, as legacy gossip's
+    /// verified-tip lookahead does.
+    fn admissible_height(&self, height: u32) -> bool {
+        self.in_propagation_window(height)
+            && height <= self.verified.saturating_add(PROPAGATION_DEPTH)
+    }
+
     fn handle_meta_received(
         &mut self,
         arrived_at: Instant,
         envelope: Box<MetaEnvelope>,
         from_peer: NodeId,
         session_gen: u64,
-        mut also_from: Vec<(NodeId, u64)>,
         step: &mut BlockStep,
     ) {
         let block_id = envelope.block_id;
         // An admitted or retired block's admission already cleared every
-        // session's received marker. A block still admitting or pending records
-        // this sender, so whatever ends the entry also answers this session.
+        // session's received marker, and the table never uses this copy.
         if self.blocks.contains_key(&block_id) {
             return;
         }
-        let waiting = match self.admitting.get_mut(&block_id) {
-            Some(entry) => Some(&mut entry.also_from),
-            None => self
-                .pending
-                .get_mut(&block_id)
-                .map(|entry| &mut entry.also_from),
-        };
-        if let Some(waiting) = waiting {
-            waiting.push((from_peer, session_gen));
-            waiting.append(&mut also_from);
-            return;
-        }
-        // bpv1-10: validate canonical coding tuple against the local
-        // profile BEFORE scheduling any headerchain admission work!
+        // bpv1-10: validate the canonical coding tuple of every copy against
+        // the local profile BEFORE scheduling any headerchain admission work.
         if self
             .config
             .profile
@@ -1636,22 +1919,94 @@ impl BlockTable {
                 session_gen,
                 row: Bpv1CloseRow::Row4BadMetaOrCommitment,
             });
-            reject_also(step, block_id, &also_from);
+            return;
+        }
+        // A block still admitting or pending records this sender, so
+        // whatever ends the entry also answers this session.
+        let sender = (from_peer, session_gen);
+        let admitting_room = MAX_ADMITTING_META_BYTES.saturating_sub(self.admitting_bytes());
+        if let Some(entry) = self.admitting.get_mut(&block_id) {
+            entry
+                .later
+                .record(&entry.envelope, envelope, sender, admitting_room);
+            return;
+        }
+        let pending_room = MAX_PENDING_META_BYTES.saturating_sub(self.pending_bytes);
+        if let Some(entry) = self.pending.get_mut(&block_id) {
+            let charged = entry
+                .later
+                .record(&entry.envelope, envelope, sender, pending_room);
+            self.pending_bytes += charged;
+            return;
+        }
+        self.start_admission(
+            arrived_at,
+            envelope,
+            sender,
+            LaterCopies::default(),
+            None,
+            step,
+        );
+    }
+
+    /// Forgets `session` in every later-copy record of metadata in admission
+    /// or pending. A first sender stays: its envelope can still admit the
+    /// block for every other session.
+    fn forget_meta_session(&mut self, session: (NodeId, u64)) {
+        for entry in self.admitting.values_mut() {
+            entry.later.forget(session);
+        }
+        for entry in self.pending.values_mut() {
+            self.pending_bytes -= entry.later.forget(session);
+        }
+    }
+
+    /// Queues headerchain admission for `envelope`, which `from` sent first,
+    /// with the copies `later` that other sessions sent. `parked_at` is when
+    /// a woken pending entry first parked.
+    fn start_admission(
+        &mut self,
+        arrived_at: Instant,
+        envelope: Box<MetaEnvelope>,
+        from: (NodeId, u64),
+        mut later: LaterCopies,
+        parked_at: Option<Instant>,
+        step: &mut BlockStep,
+    ) {
+        let block_id = envelope.block_id;
+        let (from_peer, session_gen) = from;
+        // A block admitted meanwhile already answered every sender.
+        if self.blocks.contains_key(&block_id) {
             return;
         }
         // Bound admitting count and bytes before queueing headerchain
         // admission. Pending metadata has its own budget, so headers with
         // unknown parents never take space from viable metadata (bpv1-75).
+        // First copies compete only with first copies: alternate envelopes
+        // give way once the table admits this one.
+        let needed = envelope.estimated_bytes();
+        let used = self.admitting_bytes();
+        let alternates: usize = self
+            .admitting
+            .values()
+            .map(|e| e.later.alternate_bytes())
+            .sum();
         if self.admitting.len() >= MAX_ADMITTING_META_COUNT
-            || self
-                .admitting_bytes()
-                .saturating_add(envelope.estimated_bytes())
-                > MAX_ADMITTING_META_BYTES
+            || (used - alternates).saturating_add(needed) > MAX_ADMITTING_META_BYTES
         {
             reject_meta(step, block_id, from_peer, session_gen);
-            reject_also(step, block_id, &also_from);
+            reject_later(step, block_id, &later);
             return;
         }
+        let used = used
+            - shed_alternates(
+                &mut self.admitting,
+                |e| &mut e.later,
+                used,
+                needed,
+                MAX_ADMITTING_META_BYTES,
+            );
+        later.keep_within(MAX_ADMITTING_META_BYTES.saturating_sub(used.saturating_add(needed)));
         let work_id = alloc_work_id(&mut self.next_work_id);
         let header_bytes = envelope.header_bytes.clone();
         self.admitting.insert(
@@ -1662,9 +2017,12 @@ impl BlockTable {
                 arrived_at,
                 from_peer,
                 session_gen,
-                also_from,
+                later,
                 height: None,
+                parent_hash: None,
                 stage: AdmittingStage::WaitingHeader,
+                parked_at,
+                best_moves: self.best_moves,
             },
         );
         self.work_to_block.insert(work_id, block_id);
@@ -1695,14 +2053,17 @@ impl BlockTable {
         }
 
         match result {
-            HeaderAdmissionResult::Admitted { height } => {
+            HeaderAdmissionResult::Admitted {
+                height,
+                parent_hash,
+            } => {
                 // An admitted header need not be selected: headerchain also
                 // retains forks and future-dated headers. Only the verified tip,
                 // the best header-valid height, and local solved blocks raise `top`.
-                if !self.in_propagation_window(height) {
+                if !self.admissible_height(height) {
                     if let Some(removed) = self.admitting.remove(&block_id) {
                         reject_meta(step, block_id, removed.from_peer, removed.session_gen);
-                        reject_also(step, block_id, &removed.also_from);
+                        reject_later(step, block_id, &removed.later);
                     }
                     return;
                 }
@@ -1712,6 +2073,7 @@ impl BlockTable {
                     .get_mut(&block_id)
                     .expect("admitting entry verified present");
                 entry.height = Some(height);
+                entry.parent_hash = Some(parent_hash);
                 entry.work_id = next_work;
                 entry.stage = AdmittingStage::WaitingCommitment;
                 let envelope = entry.envelope.clone();
@@ -1726,33 +2088,56 @@ impl BlockTable {
                 });
             }
             HeaderAdmissionResult::MissingParent { parent_hash } => {
+                if let Some(parked_at) = entry.parked_at {
+                    let entry = self
+                        .admitting
+                        .remove(&block_id)
+                        .expect("admitting entry verified present");
+                    self.park(now, block_id, entry, parent_hash, parked_at, step);
+                    return;
+                }
+                // Headerchain checked nothing but the parent's hash, so the
+                // header's own checks run before it waits. They run under the
+                // pending budget (`bpv1-75`).
                 let entry = self
                     .admitting
                     .remove(&block_id)
                     .expect("admitting entry verified present");
-                self.insert_pending(
+                let work_id = alloc_work_id(&mut self.next_work_id);
+                let held = self.insert_pending(
                     block_id,
                     PendingMetaEntry {
                         envelope: entry.envelope,
                         arrived_at: entry.arrived_at,
                         from_peer: entry.from_peer,
                         session_gen: entry.session_gen,
-                        also_from: entry.also_from,
+                        later: entry.later,
                         parent_hash,
                         received_at: now,
+                        checking: Some(work_id),
+                        best_moves: entry.best_moves,
                     },
                     step,
                 );
+                if held {
+                    self.work_to_block.insert(work_id, block_id);
+                    step.outputs.push(BlockOutput::CheckUnknownParent {
+                        work_id,
+                        block_id,
+                        envelope: self.pending[&block_id].envelope.clone(),
+                        top: self.top,
+                    });
+                }
             }
             HeaderAdmissionResult::PeerInvalid => {
                 let entry = self
                     .admitting
                     .remove(&block_id)
                     .expect("admitting entry verified present");
-                // `block_id` is the hash of the header bytes, so every session
-                // in `also_from` sent this same invalid header.
-                for (peer, session_gen) in
-                    std::iter::once((entry.from_peer, entry.session_gen)).chain(entry.also_from)
+                // `block_id` is the hash of the header bytes, so every later
+                // session sent this same invalid header, whatever its binding.
+                for (peer, session_gen) in std::iter::once((entry.from_peer, entry.session_gen))
+                    .chain(entry.later.sessions())
                 {
                     step.outputs.push(BlockOutput::ClosePeer {
                         peer,
@@ -1764,17 +2149,130 @@ impl BlockTable {
             HeaderAdmissionResult::LocalError => {
                 if let Some(removed) = self.admitting.remove(&block_id) {
                     reject_meta(step, block_id, removed.from_peer, removed.session_gen);
-                    reject_also(step, block_id, &removed.also_from);
+                    reject_later(step, block_id, &removed.later);
                 }
             }
         }
     }
 
-    /// Bytes held in metadata in header admission or the commitment check.
+    /// Parks, drops, or closes metadata whose parent header is unknown, as its
+    /// checks decided.
+    fn handle_unknown_parent_checked(
+        &mut self,
+        now: Instant,
+        work_id: WorkId,
+        verdict: UnknownParentVerdict,
+        step: &mut BlockStep,
+    ) {
+        let Some(block_id) = self.work_to_block.remove(&work_id) else {
+            return;
+        };
+        let Some(entry) = self
+            .pending
+            .get_mut(&block_id)
+            .filter(|entry| entry.checking == Some(work_id))
+        else {
+            return;
+        };
+        if verdict == UnknownParentVerdict::Park {
+            entry.checking = None;
+            if retries_admission(entry.best_moves, self.best_moves, entry.received_at, now) {
+                let entry = self
+                    .remove_pending(block_id)
+                    .expect("pending entry verified present");
+                self.start_admission(
+                    entry.arrived_at,
+                    entry.envelope,
+                    (entry.from_peer, entry.session_gen),
+                    entry.later,
+                    Some(entry.received_at),
+                    step,
+                );
+            }
+            return;
+        }
+        let entry = self
+            .remove_pending(block_id)
+            .expect("pending entry verified present");
+        match verdict {
+            UnknownParentVerdict::Park => {}
+            // Block sync owns the block, and no sender is at fault.
+            UnknownParentVerdict::Drop => {
+                reject_meta(step, block_id, entry.from_peer, entry.session_gen);
+                reject_later(step, block_id, &entry.later);
+            }
+            UnknownParentVerdict::Invalid(row) => {
+                step.outputs.push(BlockOutput::ClosePeer {
+                    peer: entry.from_peer,
+                    session_gen: entry.session_gen,
+                    row,
+                });
+                if row == Bpv1CloseRow::Row3InvalidHeader {
+                    // `block_id` is the hash of the header bytes, so every
+                    // later session sent this same invalid header.
+                    for (peer, session_gen) in entry.later.sessions() {
+                        step.outputs.push(BlockOutput::ClosePeer {
+                            peer,
+                            session_gen,
+                            row,
+                        });
+                    }
+                } else {
+                    // Another sender's binding may differ under the same hash,
+                    // so it is not faulted for this one's.
+                    reject_later(step, block_id, &entry.later);
+                }
+            }
+        }
+    }
+
+    /// Parks `entry`, a retried entry whose parent `parent_hash` headerchain
+    /// still lacks, until a new best header wakes it, or retries it again
+    /// ([`retries_admission`]). `parked_at` keeps its first deadline, and the
+    /// entry skips the checks it passed.
+    fn park(
+        &mut self,
+        now: Instant,
+        block_id: block::Hash,
+        entry: AdmittingEntry,
+        parent_hash: block::Hash,
+        parked_at: Instant,
+        step: &mut BlockStep,
+    ) {
+        if retries_admission(entry.best_moves, self.best_moves, parked_at, now) {
+            self.start_admission(
+                entry.arrived_at,
+                entry.envelope,
+                (entry.from_peer, entry.session_gen),
+                entry.later,
+                Some(parked_at),
+                step,
+            );
+            return;
+        }
+        self.insert_pending(
+            block_id,
+            PendingMetaEntry {
+                envelope: entry.envelope,
+                arrived_at: entry.arrived_at,
+                from_peer: entry.from_peer,
+                session_gen: entry.session_gen,
+                later: entry.later,
+                parent_hash,
+                received_at: parked_at,
+                checking: None,
+                best_moves: entry.best_moves,
+            },
+            step,
+        );
+    }
+
+    /// Bytes held in metadata in header admission, its unknown-parent checks,
+    /// or the commitment check.
     fn admitting_bytes(&self) -> usize {
         self.admitting
             .values()
-            .map(|e| e.envelope.estimated_bytes())
+            .map(AdmittingEntry::charged_bytes)
             .sum()
     }
 
@@ -1799,15 +2297,25 @@ impl BlockTable {
     fn insert_pending(
         &mut self,
         block_id: block::Hash,
-        entry: PendingMetaEntry,
+        mut entry: PendingMetaEntry,
         step: &mut BlockStep,
-    ) {
+    ) -> bool {
         let bytes = entry.envelope.estimated_bytes();
         let (held, _) = self.pending_held_by(entry.from_peer);
         let mut admit = held < MAX_PENDING_META_PER_PEER;
+        // First copies compete only with first copies: alternate envelopes
+        // give way once the table admits this one.
+        let first_copy_bytes = |table: &Self| {
+            let alternates: usize = table
+                .pending
+                .values()
+                .map(|e| e.later.alternate_bytes())
+                .sum();
+            table.pending_bytes - alternates
+        };
         while admit
             && (self.pending.len() >= MAX_PENDING_META_COUNT
-                || self.pending_bytes.saturating_add(bytes) > MAX_PENDING_META_BYTES)
+                || first_copy_bytes(self).saturating_add(bytes) > MAX_PENDING_META_BYTES)
         {
             let (own_count, own_bytes) = self.pending_held_by(entry.from_peer);
             let after_insert = (own_count + 1, own_bytes.saturating_add(bytes));
@@ -1836,45 +2344,69 @@ impl BlockTable {
             step.events
                 .push(BlockEvent::MetaPendingDropped { block_id });
             reject_meta(step, block_id, entry.from_peer, entry.session_gen);
-            reject_also(step, block_id, &entry.also_from);
-            return;
+            reject_later(step, block_id, &entry.later);
+            return false;
         }
-        self.pending_bytes = self.pending_bytes.saturating_add(bytes);
+        self.pending_bytes -= shed_alternates(
+            &mut self.pending,
+            |e| &mut e.later,
+            self.pending_bytes,
+            bytes,
+            MAX_PENDING_META_BYTES,
+        );
+        entry.later.keep_within(
+            MAX_PENDING_META_BYTES.saturating_sub(self.pending_bytes.saturating_add(bytes)),
+        );
+        self.pending_bytes = self.pending_bytes.saturating_add(entry.charged_bytes());
         self.pending.insert(block_id, entry);
+        true
+    }
+
+    /// Removes a pending entry, its byte charge, and its check's work index.
+    fn remove_pending(&mut self, block_id: block::Hash) -> Option<PendingMetaEntry> {
+        let entry = self.pending.remove(&block_id)?;
+        self.pending_bytes = self.pending_bytes.saturating_sub(entry.charged_bytes());
+        if let Some(work_id) = entry.checking {
+            self.work_to_block.remove(&work_id);
+        }
+        Some(entry)
     }
 
     /// Drops a pending entry for the pending budget and rejects it for each
     /// session that sent it.
     fn drop_pending(&mut self, block_id: block::Hash, step: &mut BlockStep) {
-        if let Some(entry) = self.pending.remove(&block_id) {
-            self.pending_bytes = self
-                .pending_bytes
-                .saturating_sub(entry.envelope.estimated_bytes());
+        if let Some(entry) = self.remove_pending(block_id) {
             step.events
                 .push(BlockEvent::MetaPendingDropped { block_id });
             reject_meta(step, block_id, entry.from_peer, entry.session_gen);
-            reject_also(step, block_id, &entry.also_from);
+            reject_later(step, block_id, &entry.later);
         }
     }
 
-    fn wake_pending_for_parent(&mut self, parent_hash: block::Hash, step: &mut BlockStep) {
+    /// Retries header admission for the pending entries that the new best
+    /// header `best` may resolve: those whose parent is `best`, and the entry
+    /// for `best` itself.
+    ///
+    /// Header sync usually fetches a missing parent together with the waiting
+    /// child, so the best header can move straight past the parent to the
+    /// child. The child's own entry then wakes, and its admission reports it
+    /// already known.
+    fn wake_pending(&mut self, best: block::Hash, step: &mut BlockStep) {
         let ready: Vec<block::Hash> = self
             .pending
             .iter()
-            .filter(|(_, e)| e.parent_hash == parent_hash)
+            // An entry whose checks still run retries when they pass.
+            .filter(|(id, e)| e.checking.is_none() && (e.parent_hash == best || **id == best))
             .map(|(id, _)| *id)
             .collect();
         for block_id in ready {
-            if let Some(pending) = self.pending.remove(&block_id) {
-                self.pending_bytes = self
-                    .pending_bytes
-                    .saturating_sub(pending.envelope.estimated_bytes());
-                self.handle_meta_received(
+            if let Some(pending) = self.remove_pending(block_id) {
+                self.start_admission(
                     pending.arrived_at,
                     pending.envelope,
-                    pending.from_peer,
-                    pending.session_gen,
-                    pending.also_from,
+                    (pending.from_peer, pending.session_gen),
+                    pending.later,
+                    Some(pending.received_at),
                     step,
                 );
             }
@@ -1905,29 +2437,32 @@ impl BlockTable {
             .expect("admitting entry verified present");
 
         let Some(proposer) = proposer else {
-            step.outputs.push(BlockOutput::ClosePeer {
-                peer: entry.from_peer,
-                session_gen: entry.session_gen,
-                row: Bpv1CloseRow::Row4BadMetaOrCommitment,
-            });
-            // Another sender's envelope may differ under the same hash, so it is
-            // not faulted for this one's commitment.
-            reject_also(step, block_id, &entry.also_from);
+            self.handle_commitment_failed(block_id, entry, step);
             return;
         };
+        // This node admitted the block itself while the check ran: its miner
+        // solved the block that a peer's copy also carries. That admission
+        // published the block to every session, so this copy ends here.
+        // Admitting it again would replace the solved block's entry.
+        if self.blocks.contains_key(&block_id) {
+            return;
+        }
 
         let height = entry.height.unwrap_or(self.top);
-        // Recheck propagation window after async commitment work
+        // Recheck the window after async commitment work
         // in case `top` advanced while commitment verification was running.
-        if !self.in_propagation_window(height) {
+        if !self.admissible_height(height) {
             reject_meta(step, block_id, entry.from_peer, entry.session_gen);
-            reject_also(step, block_id, &entry.also_from);
+            reject_later(step, block_id, &entry.later);
             return;
         }
         // All concurrent slots actively collecting: drop cleanly without faulting the peer.
-        if !self.evict_for_slot(false, step) {
+        let next = self.is_next_block(height, entry.parent_hash);
+        if !self.evict_for_slot(false, step)
+            && !(next && self.displace_for_next_block(height, step))
+        {
             reject_meta(step, block_id, entry.from_peer, entry.session_gen);
-            reject_also(step, block_id, &entry.also_from);
+            reject_later(step, block_id, &entry.later);
             return;
         }
 
@@ -1941,6 +2476,7 @@ impl BlockTable {
             false,
         );
         active.body_claimed = true;
+        active.parent_hash = entry.parent_hash;
         // decision-26: pick the `Have` initial group once, at admission.
         let pacing = self.config.have_pacing;
         let window = pacing.window(active.meta.coding.body_bytes);
@@ -1975,7 +2511,82 @@ impl BlockTable {
         });
         // An empty body has no stripes, so the block assembles from
         // `HeaderMeta` alone and no part crosses the wire for it.
-        self.maybe_assemble_and_verify(block_id, step);
+        self.maybe_assemble_and_verify(now, block_id, step);
+    }
+
+    /// Closes every session that sent `entry`'s failed envelope with row 4,
+    /// then checks the oldest alternate envelope, if the entry kept one
+    /// (bpv1-61). The other alternates wait behind it in arrival order.
+    ///
+    /// The commitment check is a pure function of the envelope and the
+    /// admitted height, so each session whose copy equals the failed envelope
+    /// sent the failed commitment. A session whose copy differs is not
+    /// faulted for it: the block id hashes only the header. An honest relay
+    /// forwards only admitted metadata, so its copy passes.
+    fn handle_commitment_failed(
+        &mut self,
+        block_id: block::Hash,
+        entry: AdmittingEntry,
+        step: &mut BlockStep,
+    ) {
+        let AdmittingEntry {
+            arrived_at,
+            from_peer,
+            session_gen,
+            mut later,
+            height,
+            parent_hash,
+            parked_at,
+            best_moves,
+            ..
+        } = entry;
+        for (peer, session_gen) in std::iter::once((from_peer, session_gen)).chain(later.same) {
+            step.outputs.push(BlockOutput::ClosePeer {
+                peer,
+                session_gen,
+                row: Bpv1CloseRow::Row4BadMetaOrCommitment,
+            });
+        }
+        let Some((envelope, senders)) = later.alternates.pop_front() else {
+            for &(peer, session_gen) in &later.unkept {
+                reject_meta(step, block_id, peer, session_gen);
+            }
+            return;
+        };
+        let height =
+            height.expect("an entry that waits for its commitment has its admitted height");
+        let mut senders = senders.into_iter();
+        let (from_peer, session_gen) = senders
+            .next()
+            .expect("an alternate envelope keeps at least one live sender");
+        let work_id = alloc_work_id(&mut self.next_work_id);
+        self.work_to_block.insert(work_id, block_id);
+        self.admitting.insert(
+            block_id,
+            AdmittingEntry {
+                work_id,
+                envelope: envelope.clone(),
+                arrived_at,
+                from_peer,
+                session_gen,
+                later: LaterCopies {
+                    same: senders.collect(),
+                    alternates: later.alternates,
+                    unkept: later.unkept,
+                },
+                height: Some(height),
+                parent_hash,
+                stage: AdmittingStage::WaitingCommitment,
+                parked_at,
+                best_moves,
+            },
+        );
+        step.outputs.push(BlockOutput::VerifyCommitment {
+            work_id,
+            block_id,
+            height,
+            envelope,
+        });
     }
 
     /// Frees a concurrent-block slot if every slot is taken.
@@ -2015,6 +2626,71 @@ impl BlockTable {
         }
     }
 
+    /// Whether a block at `height` with `parent_hash` extends the verified tip,
+    /// so it is the next block the chain can commit (`bpv1-83`, `bpv1-84`).
+    ///
+    /// Headerchain also admits retained forks, so the height alone does not
+    /// show that the parent is committed.
+    fn is_next_block(&self, height: u32, parent_hash: Option<block::Hash>) -> bool {
+        height == self.verified.saturating_add(1)
+            && parent_hash.is_some()
+            && parent_hash == self.verified_hash
+    }
+
+    /// Frees a slot for the next block, the one whose parent is the verified
+    /// tip (`bpv1-83`).
+    ///
+    /// Every block above that height waits on it. When every slot is busy, it
+    /// retires the highest block above it, and block sync fetches that one
+    /// instead. Returns whether a slot is free.
+    fn displace_for_next_block(&mut self, height: u32, step: &mut BlockStep) -> bool {
+        let victim = self
+            .blocks
+            .values()
+            .filter(|b| {
+                matches!(b.phase, BlockPhase::Collecting | BlockPhase::Verifying)
+                    && b.height > height
+            })
+            .max_by_key(|b| b.height)
+            .map(|b| b.meta.block_id);
+        match victim {
+            Some(id) => {
+                self.retire_block(id, step);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Resubmits each parked block whose parent is now the verified tip
+    /// (`bpv1-84`).
+    ///
+    /// A parked block whose height the verified tip reached on another branch
+    /// is no longer the next block, so it falls back to block sync.
+    fn resubmit_parked(&mut self, now: Instant, step: &mut BlockStep) {
+        let mut ready = Vec::new();
+        let mut passed = Vec::new();
+        for b in self.blocks.values() {
+            if b.phase != BlockPhase::Verifying
+                || b.verify_work_id.is_some()
+                || !b.verify_deadline.is_some_and(|deadline| now < deadline)
+            {
+                continue;
+            }
+            if self.is_next_block(b.height, b.parent_hash) {
+                ready.push(b.meta.block_id);
+            } else if b.height <= self.verified.saturating_add(1) {
+                passed.push(b.meta.block_id);
+            }
+        }
+        for block_id in ready {
+            self.submit_assembled(block_id, step);
+        }
+        for block_id in passed {
+            self.enter_fallback(block_id, FallbackReason::LocalCapacity, step);
+        }
+    }
+
     fn handle_block_admitted_local(
         &mut self,
         now: Instant,
@@ -2025,7 +2701,11 @@ impl BlockTable {
         step: &mut BlockStep,
     ) {
         let block_id = envelope.block_id;
-        // Make local solved-block admission idempotent by hash.
+        // Make local solved-block admission idempotent by hash. A stock peer's
+        // copy cannot come first: only this node's prepared template publishes
+        // metadata naming it as proposer, after this admission. A modified peer
+        // that gets the body early can build that metadata itself, and this
+        // return then leaves the block unseeded (#2753).
         if self.blocks.contains_key(&block_id) {
             return;
         }
@@ -2562,7 +3242,7 @@ impl BlockTable {
         }
 
         // Check if every stripe is now assemblable (e.g., all-systematic fast path).
-        self.maybe_assemble_and_verify(block_id, step);
+        self.maybe_assemble_and_verify(now, block_id, step);
 
         if let Some(stripe) = replan_stripe {
             self.plan_stripe(now, block_id, stripe, peer_states, step);
@@ -2571,6 +3251,7 @@ impl BlockTable {
 
     fn handle_stripe_checked(
         &mut self,
+        now: Instant,
         work_id: WorkId,
         block_id: block::Hash,
         stripe: u32,
@@ -2639,7 +3320,7 @@ impl BlockTable {
             self.enter_fallback(block_id, FallbackReason::ReencodeFailed, step);
             self.retire_block(block_id, step);
         } else {
-            self.maybe_assemble_and_verify(block_id, step);
+            self.maybe_assemble_and_verify(now, block_id, step);
         }
     }
 
@@ -2661,16 +3342,48 @@ impl BlockTable {
         block.notify_done(now, step);
     }
 
-    fn maybe_assemble_and_verify(&mut self, block_id: block::Hash, step: &mut BlockStep) {
+    fn maybe_assemble_and_verify(
+        &mut self,
+        now: Instant,
+        block_id: block::Hash,
+        step: &mut BlockStep,
+    ) {
         let Some(block) = self.blocks.get_mut(&block_id) else {
             return;
         };
-        // bpv1-44: one verifier submission per ownership episode; `Verifying`
-        // and every later phase are past collection.
-        if block.phase != BlockPhase::Collecting || !block.all_stripes_assemblable() {
+        // bpv1-44: `Verifying` and every later phase are past collection.
+        if block.phase != BlockPhase::Collecting
+            || !block.all_stripes_assemblable()
+            || !self.submit_assembled(block_id, step)
+        {
             return;
         }
+        let block = self
+            .blocks
+            .get_mut(&block_id)
+            .expect("the block exists because it was just submitted");
+        let deadline = now + VERIFY_DEADLINE;
+        block.phase = BlockPhase::Verifying;
+        block.verify_deadline = Some(deadline);
+        // bpv1-44: the body claim covers verification, so block sync fetches no
+        // second copy while the verifier holds this one. The verification
+        // deadline bounds it, as the reconstruction deadline bounds collection.
+        if block.body_claimed {
+            step.outputs
+                .push(BlockOutput::ExtendBodyClaim { block_id, deadline });
+        }
+        step.events.push(BlockEvent::Handoff { block_id });
+    }
 
+    /// Submits an assembled block's body to the verifier, and returns whether
+    /// it held every source part.
+    ///
+    /// `BlockTable` keeps every source part of an assembled block, so a parked
+    /// block resubmits without fetching anything (`bpv1-84`).
+    fn submit_assembled(&mut self, block_id: block::Hash, step: &mut BlockStep) -> bool {
+        let Some(block) = self.blocks.get_mut(&block_id) else {
+            return false;
+        };
         let coding = block.meta.coding;
         let mut stripe_sources = Vec::with_capacity(block.stripes.len());
         let mut zeros: Option<Arc<[u8]>> = None;
@@ -2682,7 +3395,7 @@ impl BlockTable {
                     None if st.is_padding(slot, coding.k) => zeros
                         .get_or_insert_with(|| vec![0u8; coding.part_bytes as usize].into())
                         .clone(),
-                    None => return,
+                    None => return false,
                 };
                 sources.push(payload);
             }
@@ -2691,10 +3404,8 @@ impl BlockTable {
 
         let work_id = alloc_work_id(&mut self.next_work_id);
         block.verify_work_id = Some(work_id);
-        block.phase = BlockPhase::Verifying;
 
         // `NotifyBlockDone` waits for `BlockAssembled` or a committed verdict.
-        step.events.push(BlockEvent::Handoff { block_id });
         step.outputs.push(BlockOutput::SubmitVerifier {
             work_id,
             block_id,
@@ -2703,6 +3414,7 @@ impl BlockTable {
             coding,
             stripe_sources,
         });
+        true
     }
 
     fn handle_verifier_verdict(
@@ -2748,7 +3460,13 @@ impl BlockTable {
             VerifierVerdict::RootMismatch => {
                 self.enter_fallback(block_id, FallbackReason::RootMismatch, step);
             }
-            // Local pool capacity is its own fallback reason.
+            // bpv1-84: a retryable verdict says nothing about the body. While the
+            // parent is not committed, the block cannot commit through any path,
+            // so it keeps its body and claim and resubmits once the parent
+            // commits. With the parent committed, it falls back.
+            VerifierVerdict::LocalCapacity if block.height > self.verified.saturating_add(1) => {
+                step.events.push(BlockEvent::Parked { block_id });
+            }
             VerifierVerdict::LocalCapacity => {
                 self.enter_fallback(block_id, FallbackReason::LocalCapacity, step);
             }
@@ -2772,6 +3490,8 @@ impl BlockTable {
         }
         block.repair_round = 0;
         block.phase = BlockPhase::Fallback;
+        // bpv1-63: fallback ends the submission, so a later verdict is stale.
+        block.verify_work_id = None;
         for st in &mut block.stripes {
             st.claims.clear();
             st.job = None;
@@ -2827,14 +3547,11 @@ impl BlockTable {
             .map(|(id, _)| *id)
             .collect();
         for id in aged {
-            if let Some(entry) = self.pending.remove(&id) {
-                self.pending_bytes = self
-                    .pending_bytes
-                    .saturating_sub(entry.envelope.estimated_bytes());
+            if let Some(entry) = self.remove_pending(id) {
                 step.events
                     .push(BlockEvent::MetaPendingAged { block_id: id });
                 reject_meta(step, id, entry.from_peer, entry.session_gen);
-                reject_also(step, id, &entry.also_from);
+                reject_later(step, id, &entry.later);
             }
         }
 
@@ -2901,7 +3618,18 @@ impl BlockTable {
         let mut to_fallback: Vec<block::Hash> = Vec::new();
         let mut to_repair: Vec<(block::Hash, u32)> = Vec::new();
 
+        let mut verify_expired: Vec<block::Hash> = Vec::new();
+
         for (&block_id, block) in &mut self.blocks {
+            // bpv1-82: verification ends by its deadline, verdict or not.
+            if block.phase == BlockPhase::Verifying
+                && block
+                    .verify_deadline
+                    .is_some_and(|deadline| now >= deadline)
+            {
+                verify_expired.push(block_id);
+                continue;
+            }
             if block.phase != BlockPhase::Collecting {
                 continue;
             }
@@ -2941,6 +3669,9 @@ impl BlockTable {
         for block_id in to_fallback {
             self.enter_fallback(block_id, FallbackReason::Deadline, step);
         }
+        for block_id in verify_expired {
+            self.enter_fallback(block_id, FallbackReason::VerifyDeadline, step);
+        }
         for (block_id, stripe) in to_repair {
             self.plan_stripe(now, block_id, stripe, peer_states, step);
         }
@@ -2950,11 +3681,12 @@ impl BlockTable {
     }
 
     fn retire_out_of_window(&mut self, step: &mut BlockStep) {
-        let min_keep = self.top.saturating_sub(PROPAGATION_DEPTH);
+        // bpv1-7: retire exactly the heights the propagation window refuses.
+        // The verified-tip bound (bpv1-76) gates admission only.
         let to_retire: Vec<block::Hash> = self
             .blocks
             .values()
-            .filter(|b| b.phase != BlockPhase::Retired && b.height < min_keep)
+            .filter(|b| b.phase != BlockPhase::Retired && !self.in_propagation_window(b.height))
             .map(|b| b.meta.block_id)
             .collect();
         for id in to_retire {

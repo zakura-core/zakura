@@ -59,25 +59,63 @@ groups:
           summary: "High error rate"
           description: "Zakura is experiencing elevated error rates (> 0.1/s for 5 minutes)."
 
-      # This release stops running when the tip passes its end of service height.
-      # 1152 blocks is one day at the 75 second target spacing.
+      # A release is only supported up to its end of service height. 3456 blocks is one
+      # day at the 25 second target spacing. The node refreshes these gauges once an
+      # hour, so they can lag the chain tip by that much.
       - alert: ZakuraEndOfServiceApproaching
-        expr: end_of_support_remaining_blocks < 3456
+        expr: end_of_support_remaining_blocks < 10368 and end_of_support_remaining_blocks >= 0
         for: 15m
         labels:
           severity: warning
         annotations:
           summary: "Release reaches end of service in under 3 days"
-          description: "This Zakura release halts in {{ $value }} blocks. Install the latest release before then."
+          description: "This Zakura release reaches its end of service in {{ $value }} blocks. Install the latest release before then."
 
+      # The node halts at its end of service height unless it was started with
+      # `--unsafe-ignore-end-of-support`, which reports `end_of_support_enforced` as 0.
       - alert: ZakuraEndOfServiceImminent
-        expr: end_of_support_remaining_blocks < 1152
+        expr: end_of_support_remaining_blocks < 3456 and end_of_support_enforced == 1
         for: 15m
         labels:
           severity: critical
         annotations:
           summary: "Release reaches end of service in under 1 day"
           description: "This Zakura release halts in {{ $value }} blocks. Install the latest release now."
+
+      # Started with `--unsafe-ignore-end-of-support`, the release keeps running past its
+      # end of service.
+      - alert: ZakuraRunningUnsupportedRelease
+        expr: end_of_support_remaining_blocks < 0 and end_of_support_enforced == 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Release is past its end of service and keeps running"
+          description: "The chain tip is past the last height this Zakura release supports (blocks remaining: {{ $value }}). Install the latest release."
+
+      # The gauge is only above zero while a release that keeps running is ahead of a
+      # network upgrade that activates after its end of service. It only covers upgrades
+      # the release was built with: one scheduled later is invisible to the node.
+      # 10368 blocks is three days.
+      - alert: ZakuraUnsupportedReleaseBeforeNetworkUpgrade
+        expr: end_of_support_blocks_until_next_upgrade > 0 and end_of_support_blocks_until_next_upgrade < 10368
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Release will be unsupported at a network upgrade within 3 days"
+          description: "A network upgrade activates in {{ $value }} blocks, after the last height this Zakura release supports. Later releases can change how the upgrade is handled. Install the latest release before then."
+
+      # The gauge is 1 once an unsupported release has kept running through a network
+      # upgrade that it was built with.
+      - alert: ZakuraUnsupportedReleasePastNetworkUpgrade
+        expr: end_of_support_upgrade_activated_unsupported == 1
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Unsupported release is running past a network upgrade"
+          description: "A network upgrade activated after the last height this Zakura release supports. Later releases can change how the upgrade is handled, so this node might not follow the network. Install the latest release."
 
   # Value Pool Alerts (Monitoring)
   - name: zakura-value-pools

@@ -335,3 +335,135 @@ async fn send_want(
     };
     raw.send(CONTROL, &encode_frame(&want)?).await
 }
+
+/// A W2 node serving BPv1 over real QUIC, and a raw peer that has opened
+/// both BPv1 streams to it.
+struct RawSession {
+    raw: RawLayoutPeer,
+    /// Keep the node serving.
+    _endpoint: zakura_quic::QuicEndpoint,
+    _handle: super::service::Bpv1Handle,
+}
+
+/// Starts a [`RawSession`].
+async fn raw_session(shutdown: &CancellationToken, seed: u64) -> Result<RawSession, BoxError> {
+    let limits = ZakuraLocalLimits::from_config(&Config::default());
+    let endpoint = LocalEndpointFactory::with_limits(&limits)
+        .endpoint(seed)
+        .await?;
+    let id = endpoint.local_id();
+    let ports = Bpv1Ports {
+        header_admission: Arc::new(AcceptingHeaderAdmission(20)),
+        body_store: Arc::new(MemoryBodyStore::new(DecodedBlockPool::for_block_count(
+            NonZeroU64::new(4).unwrap(),
+        ))),
+        ..Default::default()
+    };
+    let (svc, handle) = start(Profile::W2, regtest_nu7(), id, ports, shutdown);
+    let handler = ZakuraProtocolHandler::new_with_registry(
+        ZakuraSupervisorHandle::new(16),
+        Network::Mainnet,
+        ZakuraHandshakeConfig::for_network(&Network::Mainnet),
+        limits.clone(),
+        Arc::new(ServiceRegistry::new(vec![svc as Arc<dyn Service>])?),
+    )
+    .with_local_node_id(id);
+    endpoint.serve(handler)?;
+    let mut raw = RawLayoutPeer::connect(
+        LocalEndpointFactory::node_addr(&endpoint).await,
+        &limits,
+        seed + 1,
+        ZAKURA_CAP_BPV1,
+    )
+    .await?;
+    raw.open_layout(&BPV1_STREAMS).await?;
+    await_until("the raw session", TEST_NET_TIMEOUT, || {
+        handle.live_sessions() == 1
+    })
+    .await?;
+    Ok(RawSession {
+        raw,
+        _endpoint: endpoint,
+        _handle: handle,
+    })
+}
+
+/// Shows that the session still reads both streams: a `Want` for a block the
+/// node does not know comes back as an empty `WantEnd` on data.
+async fn assert_session_open(raw: &mut RawLayoutPeer, want_id: u32) -> Result<(), BoxError> {
+    send_want(raw, want_id, block::Hash([0x7E; 32]), 0..1).await?;
+    match decode_frame::<Bpv1Message>(&raw.recv(DATA).await?)? {
+        Bpv1Message::WantEnd {
+            want_id: id,
+            sent: 0,
+            reason: WantEndReason::UnknownBlock,
+        } if id == want_id => Ok(()),
+        other => Err(format!("expected an empty WantEnd, got {other:?}").into()),
+    }
+}
+
+/// `bpv1-close-1` over real QUIC: a `Have` with each defined flags byte
+/// keeps the session open, and a reserved flags byte closes the connection.
+#[tokio::test]
+async fn close_1_reserved_have_flags_close_the_connection() -> Result<(), BoxError> {
+    // `Have` payload: `block_id` (32 bytes), then the flags byte.
+    const FLAGS_AT: usize = 32;
+    let shutdown = CancellationToken::new();
+    let RawSession {
+        mut raw,
+        _endpoint,
+        _handle,
+    } = raw_session(&shutdown, 911).await?;
+    let have = |flags: u8| -> Result<_, BoxError> {
+        let mut frame = encode_frame(&Bpv1Message::Have {
+            block_id: block::Hash([0x7F; 32]),
+            flags: HaveFlags::Plain,
+            indices: vec![u32::from(flags)],
+        })?;
+        frame.payload[FLAGS_AT] = flags;
+        Ok(frame)
+    };
+    for flags in [HaveFlags::Plain, HaveFlags::Push, HaveFlags::Relay] {
+        raw.send(DATA, &have(flags.bits())?).await?;
+    }
+    assert_session_open(&mut raw, 1).await?;
+    assert!(!raw.is_closed());
+
+    raw.send(DATA, &have(0x80)?).await?;
+    raw.closed().await?;
+
+    raw.shutdown().await;
+    shutdown.cancel();
+    Ok(())
+}
+
+/// `bpv1-close-2` over real QUIC: a `Want` with a zero `want_id` closes the
+/// connection; the same `Want` with a nonzero id keeps it open.
+#[tokio::test]
+async fn close_2_zero_want_id_closes_the_connection() -> Result<(), BoxError> {
+    let shutdown = CancellationToken::new();
+    let RawSession {
+        mut raw,
+        _endpoint,
+        _handle,
+    } = raw_session(&shutdown, 913).await?;
+    assert_session_open(&mut raw, 1).await?;
+
+    let mut zero = encode_frame(&Bpv1Message::Want {
+        want_id: 2,
+        block_id: block::Hash([0x7E; 32]),
+        stripe: 0,
+        requested: {
+            let mut requested = WantBitmap::EMPTY;
+            requested.set(0);
+            requested
+        },
+    })?;
+    zero.payload[..4].fill(0);
+    raw.send(CONTROL, &zero).await?;
+    raw.closed().await?;
+
+    raw.shutdown().await;
+    shutdown.cancel();
+    Ok(())
+}

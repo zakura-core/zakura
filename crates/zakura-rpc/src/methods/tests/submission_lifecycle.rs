@@ -305,6 +305,7 @@ async fn trusted_rpc_publishes_to_bpv1_only_after_commit() {
             _height: Height,
             _tx_count: u32,
             _body_after_coinbase: &[u8],
+            _gateway: Option<zakura_chain::miner_mesh::GatewayId>,
         ) -> Option<[u8; BPV1_COMMITMENT_NULL_DATA_LEN]> {
             None
         }
@@ -312,6 +313,7 @@ async fn trusted_rpc_publishes_to_bpv1_only_after_commit() {
         fn empty_template_commitment(
             &self,
             _height: Height,
+            _gateway: Option<zakura_chain::miner_mesh::GatewayId>,
         ) -> Option<[u8; BPV1_COMMITMENT_NULL_DATA_LEN]> {
             None
         }

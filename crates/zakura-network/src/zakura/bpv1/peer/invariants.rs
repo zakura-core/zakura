@@ -14,10 +14,10 @@ impl PeerState {
     pub fn assert_invariants(&self) {
         let hard_wants_in = MAX_WANTS_INFLIGHT.saturating_mul(2) as usize;
         assert!(
-            self.wants_in.len() + self.unwritten_ends <= hard_wants_in,
+            self.wants_in.len() + self.unwritten_ends.len() <= hard_wants_in,
             "{PEER_REPLAY}: bpv1-49 live wants_in {} plus unwritten ends {} exceeded 2x limit {}",
             self.wants_in.len(),
-            self.unwritten_ends,
+            self.unwritten_ends.len(),
             hard_wants_in
         );
         assert!(
@@ -65,13 +65,19 @@ impl PeerState {
                 }
             }
         }
-        // Incoming live Want sets must be pairwise disjoint per (block_id, stripe) (bpv1-28).
-        let in_vec: Vec<&IncomingWant> = self.wants_in.values().collect();
+        // The peer's live Wants, including those whose end is unwritten, have
+        // distinct ids and pairwise disjoint sets per (block_id, stripe) (bpv1-28).
+        let in_vec: Vec<(u32, &IncomingWant)> = self.live_wants_in_iter().collect();
         for i in 0..in_vec.len() {
             for other in &in_vec[(i + 1)..] {
-                if in_vec[i].block_id == other.block_id && in_vec[i].stripe == other.stripe {
+                assert_ne!(
+                    in_vec[i].0, other.0,
+                    "{PEER_REPLAY}: bpv1-28 two live wants_in share an id"
+                );
+                if in_vec[i].1.block_id == other.1.block_id && in_vec[i].1.stripe == other.1.stripe
+                {
                     assert!(
-                        !in_vec[i].requested.intersects(&other.requested),
+                        !in_vec[i].1.requested.intersects(&other.1.requested),
                         "{PEER_REPLAY}: bpv1-28 overlapping live wants_in"
                     );
                 }
@@ -111,11 +117,12 @@ impl PeerState {
                     "{PEER_REPLAY}: bpv1-71 pushed to the proposer"
                 );
                 // bpv1-73: before the advertisement deadline, only flagged
-                // `Have`s go out.
+                // `Have`s go out, except to the proposer (decision-32).
                 assert!(
                     block.have_held_until.is_none()
                         || !block.local_have_sent.get(i)
-                        || block.local_flagged.get(i),
+                        || block.local_flagged.get(i)
+                        || block.proposer.is(&self.remote_node),
                     "{PEER_REPLAY}: bpv1-73 plain Have for index {i} of {block_id:?} before the deadline"
                 );
             }
@@ -160,7 +167,7 @@ impl PeerState {
                 && self.retired.is_empty()
                 && self.meta_received_pending.is_empty()
                 && self.inflight_verify.is_empty()
-                && self.unwritten_ends == 0,
+                && self.unwritten_ends.is_empty(),
             "{PEER_REPLAY}: bpv1-62 SessionEnd left per-peer state behind"
         );
     }

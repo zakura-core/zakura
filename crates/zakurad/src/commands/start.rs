@@ -187,6 +187,12 @@ pub struct StartCmd {
     /// Continue startup even when zcashd-compat preflight detects minimum hardware shortfalls.
     #[clap(long = "unsafe-low-specs")]
     unsafe_low_specs: bool,
+
+    /// Keep running, with warnings, after the chain tip passes the last height this release
+    /// supports. An unsupported release might not follow the network after a network upgrade.
+    /// Refused on a mining node.
+    #[clap(long = "unsafe-ignore-end-of-support")]
+    unsafe_ignore_end_of_support: bool,
 }
 
 /// Warns if Linux TCP slow-start-after-idle is enabled, which significantly
@@ -353,6 +359,42 @@ impl StartCmd {
             .consensus
             .validate()
             .map_err(|error| eyre!("invalid consensus configuration: {error}"))
+    }
+
+    /// Returns what this node does once the tip passes the last height its release supports.
+    fn past_support(&self) -> sync::end_of_support::PastSupport {
+        if self.unsafe_ignore_end_of_support {
+            sync::end_of_support::PastSupport::KeepRunning
+        } else {
+            sync::end_of_support::PastSupport::Halt
+        }
+    }
+
+    /// Refuses to keep a mining node running past the end of its release's support.
+    ///
+    /// A miner on an unsupported release can build blocks on outdated consensus rules, so
+    /// miners keep the halt. A node counts as a miner when it can build block templates
+    /// (`mining.miner_address`) or runs the internal miner. Networks where support does not
+    /// end have no halt to keep, so miners there are not refused.
+    fn validate_end_of_support(&self, config: &ZakuradConfig) -> Result<(), Report> {
+        use sync::end_of_support::{PastSupport, SupportWindow, KEEP_RUNNING_FLAG};
+
+        #[cfg(feature = "internal-miner")]
+        let runs_internal_miner = config.mining.is_internal_miner_enabled();
+        #[cfg(not(feature = "internal-miner"))]
+        let runs_internal_miner = false;
+        let is_miner = config.mining.miner_address.is_some() || runs_internal_miner;
+        let support_ends = SupportWindow::of_release(&config.network.network).is_some();
+
+        if self.past_support() == PastSupport::KeepRunning && is_miner && support_ends {
+            return Err(eyre!(
+                "{KEEP_RUNNING_FLAG} is not allowed on a mining node; remove \
+                 mining.miner_address and turn off mining.internal_miner, or start without \
+                 the flag"
+            ));
+        }
+
+        Ok(())
     }
 
     /// Refuses `mining.miner_mesh` on a node that cannot be a gateway, and warns when the
@@ -548,6 +590,7 @@ impl StartCmd {
         Self::validate_consensus_config(&config)?;
         Self::validate_debug_blocksync_throughput_config(&config)?;
         Self::validate_miner_mesh_config(&config)?;
+        self.validate_end_of_support(&config)?;
         let mut network_config = Self::network_config_for_start(&config)?;
         config.rpc.validate().map_err(|error| eyre!(error))?;
         let backend_verifications = config
@@ -853,6 +896,7 @@ impl StartCmd {
                     secret_key.public(),
                     Arc::new(zakura::bpv1_wiring::RouterBlockVerifierAdapter::new(
                         block_verifier_router.clone(),
+                        zakura_block_sync_handoff.clone(),
                     )),
                     driver_startup,
                     // Child token so disabling/shutting down BPv1 never shuts down the daemon.
@@ -1085,6 +1129,10 @@ impl StartCmd {
         // Create a channel to send mined blocks to the gossip task
         let submit_block_channel = EarlyMinedBlockChannel::new();
 
+        // The RPC server reports the end of this window, and a task checks the tip against it.
+        let support_window =
+            sync::end_of_support::SupportWindow::of_release(&config.network.network);
+
         // Launch RPC server
         let (rpc_impl, rpc_tx_queue_handle) = zakura_rpc::node::new_rpc_impl(
             config.network.network.clone(),
@@ -1110,7 +1158,9 @@ impl StartCmd {
             LAST_WARN_ERROR_LOG_SENDER.subscribe(),
             Some(submit_block_channel.sender()),
             pending_blocks,
-            sync::end_of_support::end_of_support_height(&config.network.network),
+            support_window
+                .as_ref()
+                .map(sync::end_of_support::SupportWindow::last_supported_height),
         );
         let rpc_impl = rpc_impl
             .with_template_trace(template_path_trace)
@@ -1319,8 +1369,12 @@ impl StartCmd {
         // Spawn never ending end of support task.
         info!("spawning end of support checking task");
         let end_of_support_task_handle = spawn_erased(
-            sync::end_of_support::start(config.network.network.clone(), latest_chain_tip.clone())
-                .in_current_span(),
+            sync::end_of_support::start(
+                self.past_support(),
+                support_window,
+                latest_chain_tip.clone(),
+            )
+            .in_current_span(),
         );
         node_tasks.supervise("end of support", end_of_support_task_handle, |result| {
             result
@@ -1784,6 +1838,8 @@ impl StartCmd {
         Self::validate_consensus_config(&config).map_err(config_error)?;
         Self::validate_debug_blocksync_throughput_config(&config).map_err(config_error)?;
         Self::validate_miner_mesh_config(&config).map_err(config_error)?;
+        self.validate_end_of_support(&config)
+            .map_err(config_error)?;
         config.rpc.validate().map_err(config_error)?;
 
         Ok(config)

@@ -59,6 +59,10 @@ use super::{
         route_peer_output, BlockRoute, PeerRoute,
     },
     tree::{verify_part_proof, VerifiedPart},
+    unknown_parent::{
+        check_binding_and_height, check_proof_of_work, check_target_bound, target_bound_applies,
+        UnknownParentVerdict,
+    },
     wire::{
         message_type, read_part_prefix, Bpv1FifoQueue, Bpv1Message, DataQueueItem, HaveFlags,
         WantEndReason, BPV1_CONTROL_KIND, BPV1_DATA_KIND, BPV1_STREAMS,
@@ -410,6 +414,20 @@ impl SharedNode {
                     node.drive(BlockInput::HeaderAdmitted { work_id, result });
                 }));
             }
+            BlockOutput::CheckUnknownParent {
+                work_id,
+                block_id,
+                envelope,
+                top,
+            } => {
+                let node = Arc::clone(self);
+                drop(task::spawn_named("bpv1-check-unknown-parent", async move {
+                    let verdict = check_unknown_parent(&node, envelope, top).await;
+                    tracing::debug!(target: "bpv1_stage", %block_id,
+                        work_id = work_id.0, ?verdict, "unknown_parent_checked");
+                    node.drive(BlockInput::UnknownParentChecked { work_id, verdict });
+                }));
+            }
             BlockOutput::VerifyCommitment {
                 work_id,
                 block_id,
@@ -452,6 +470,10 @@ impl SharedNode {
             BlockOutput::ClaimBody { block_id, deadline } => {
                 let installed = self.fallback.claim(block_id, deadline);
                 tracing::debug!(target: "bpv1_stage", %block_id, installed, "body_claim_installed");
+            }
+            BlockOutput::ExtendBodyClaim { block_id, deadline } => {
+                let extended = self.fallback.extend(block_id, deadline);
+                tracing::debug!(target: "bpv1_stage", %block_id, extended, "body_claim_extended");
             }
             BlockOutput::ReleaseBodyClaim { block_id, reason } => {
                 let released = self.fallback.release(block_id, reason);
@@ -566,6 +588,39 @@ fn verify_envelope_commitment(
         &fields,
     )
     .ok()
+}
+
+/// Runs the checks on `envelope`, whose parent header is unknown, in their
+/// order: the binding, height, and proof-of-work checks on a blocking thread,
+/// because they decode and hash an untrusted coinbase before any proof of
+/// work, then the target bound.
+async fn check_unknown_parent(
+    node: &SharedNode,
+    envelope: Box<MetaEnvelope>,
+    top: u32,
+) -> UnknownParentVerdict {
+    let network = node.network.clone();
+    let checked = task::spawn_blocking(move || {
+        let header = parse_header(&envelope.header_bytes).ok_or(UnknownParentVerdict::Invalid(
+            Bpv1CloseRow::Row3InvalidHeader,
+        ))?;
+        let height = check_binding_and_height(&header, &envelope, top)?;
+        let target = check_proof_of_work(&network, &header)?;
+        Ok::<_, UnknownParentVerdict>((height, target))
+    })
+    .await;
+    let (height, target) = match checked {
+        Ok(Ok(checked)) => checked,
+        Ok(Err(verdict)) => return verdict,
+        // A check that never finished faults no peer: block sync owns the block.
+        Err(_) => return UnknownParentVerdict::Drop,
+    };
+    let bound = if target_bound_applies(&node.network, height) {
+        node.header_admission.target_bound().await
+    } else {
+        None
+    };
+    check_target_bound(&node.network, target, height, bound)
 }
 
 /// Cloneable control & proposer handle for a running [`Bpv1Service`].
@@ -1062,14 +1117,16 @@ impl Service for Bpv1Service {
 /// inputs.
 ///
 /// A new verified tip moves the window and ends a fallback block that
-/// native block sync committed. A new best header wakes metadata
-/// pending on it. The watch coalesces, so a hash skipped between two
-/// snapshots leaves through the window or slot eviction instead.
+/// native block sync committed. A new best header wakes the metadata
+/// pending on it, and the metadata for the header itself when the snapshot
+/// skipped its parent. The watch coalesces, so other metadata whose
+/// parent a snapshot skipped ages out instead.
 pub(crate) fn frontier_inputs(last: Option<FrontierSet>, next: FrontierSet) -> Vec<BlockInput> {
     let mut inputs = Vec::new();
     if last.map(|last| last.verified_best) != Some(next.verified_best) {
         inputs.push(BlockInput::TipHeight {
             height: next.verified_best.height.0,
+            hash: next.verified_best.hash,
         });
         inputs.push(BlockInput::FallbackDone {
             block_id: next.verified_best.hash,
@@ -1810,7 +1867,7 @@ impl DataWriter {
 
 /// Decodes one control-stream frame into its machine input, or the close row
 /// it violates (`bpv1-61`).
-fn control_input(frame: &Frame) -> Result<PeerInput, Bpv1CloseRow> {
+pub(super) fn control_input(frame: &Frame) -> Result<PeerInput, Bpv1CloseRow> {
     let msg = decode_frame::<Bpv1Message>(frame).map_err(|_| Bpv1CloseRow::Row2Decode)?;
     Ok(match msg {
         Bpv1Message::HeaderMeta { ref header, .. } => {
@@ -1842,7 +1899,7 @@ fn control_input(frame: &Frame) -> Result<PeerInput, Bpv1CloseRow> {
 /// Decodes one data-stream frame into its machine input, or the close row it
 /// violates (`bpv1-61`). A `Part` keeps the received payload; only proof
 /// verification copies it into a verified part.
-fn data_input(frame: Frame) -> Result<PeerInput, Bpv1CloseRow> {
+pub(super) fn data_input(frame: Frame) -> Result<PeerInput, Bpv1CloseRow> {
     Ok(match frame.message_type {
         message_type::PART => {
             // bpv1-13: inspect only the 36-byte `(block_id, index)` prefix first.
@@ -2041,6 +2098,10 @@ async fn run_peer_routine(
     }
     // `remove_peer` may have taken this session's entry first, as the handler's
     // disconnect does. Its state in the table is still this session's to end.
+    node.drive(BlockInput::MetaSessionEnded {
+        peer: peer_node,
+        session_gen,
+    });
     let replaced = {
         let mut sessions = node.lock_sessions();
         match sessions.get(&peer_node) {
@@ -2299,6 +2360,16 @@ fn record_peer_event(event: &PeerEvent, peer: &NodeId) {
             metrics::counter!("zakura.p2p.bpv1.have.indices", "group" => group)
                 .increment(*count as u64);
         }
+        PeerEvent::HaveSentToProposer { block_id, count } => {
+            tracing::debug!(target: "bpv1_stage", %block_id, ?peer, count, "have_to_proposer");
+            // Widening usize to u64 is lossless on supported 64-bit targets.
+            metrics::counter!("zakura.p2p.bpv1.have.indices", "group" => "proposer")
+                .increment(*count as u64);
+        }
+        PeerEvent::ProposerHeardHave { block_id, indices } => {
+            tracing::debug!(target: "bpv1_stage", %block_id, ?peer, ?indices,
+                "proposer_heard_have");
+        }
         PeerEvent::CopiesQueued { bytes, .. } => {
             metrics::counter!("zakura.p2p.bpv1.seed.bytes", "deal" => "direct").increment(*bytes);
         }
@@ -2353,9 +2424,14 @@ fn record_block_event(event: &BlockEvent) {
                 FallbackReason::ReencodeFailed => "re_encode",
                 FallbackReason::RootMismatch => "root_mismatch",
                 FallbackReason::LocalCapacity => "local_capacity",
+                FallbackReason::VerifyDeadline => "verify_deadline",
             };
             tracing::debug!(target: "bpv1_stage", %block_id, reason = label, "fallback_started");
             metrics::counter!("zakura.p2p.bpv1.fallback.reason", "reason" => label).increment(1);
+        }
+        BlockEvent::Parked { block_id } => {
+            tracing::debug!(target: "bpv1_stage", %block_id, "verify_parked");
+            metrics::counter!("zakura.p2p.bpv1.verify.parked").increment(1);
         }
         BlockEvent::Assembled { since_meta, .. } => {
             metrics::histogram!("zakura.p2p.bpv1.assembly.seconds")

@@ -53,6 +53,7 @@ use super::{
     },
     service::{Bpv1Handle, Bpv1Ports, Bpv1Service},
     tree::VerifiedPart,
+    unknown_parent::UnknownParentVerdict,
     wire::{
         encode_part_frame, part_payload_len, Bpv1Message, HaveFlags, WantBitmap, WantEndReason,
         BPV1_CONTROL_KIND, BPV1_DATA_KIND, ZAKURA_CAP_BPV1,
@@ -249,13 +250,16 @@ pub(super) struct AcceptingHeaderAdmission(pub(super) u32);
 impl HeaderAdmissionPort for AcceptingHeaderAdmission {
     fn admit(
         &self,
-        _header: Arc<Header>,
+        header: Arc<Header>,
         _source_peer: NodeId,
         _session_gen: u64,
         _work_id: WorkId,
     ) -> PortFuture<'_, HeaderAdmissionResult> {
-        let height = self.0;
-        Box::pin(async move { HeaderAdmissionResult::Admitted { height } })
+        let result = HeaderAdmissionResult::Admitted {
+            height: self.0,
+            parent_hash: header.previous_block_hash,
+        };
+        Box::pin(async move { result })
     }
 }
 
@@ -295,8 +299,34 @@ impl BlockVerifierPort for ScriptedVerifier {
     }
 }
 
+/// A committed snapshot whose verified tip and best header are both at `height`.
+fn snapshot_at(height: u32) -> zakura_header_chain::EngineSnapshot {
+    let tip = zakura_header_chain::Frontier {
+        height: Height(height),
+        hash: block::Hash([0xEE; 32]),
+    };
+    zakura_header_chain::EngineSnapshot {
+        mode: zakura_header_chain::EngineMode::Integrated,
+        state_version: zakura_header_chain::StateVersion::new(1),
+        header_generation: zakura_header_chain::HeaderGeneration::new(1),
+        verified_generation: zakura_header_chain::VerifiedGeneration::new(1),
+        frontiers: zakura_header_chain::FrontierSet {
+            finalized: tip,
+            header_best: tip,
+            verified_best: tip,
+        },
+        header_best_score: zakura_header_chain::ChainScore::new(
+            zakura_header_chain::SuffixWork::zero(),
+            tip.hash,
+        ),
+        oldest_retained_height: tip.height,
+        alarms: zakura_header_chain::AlarmSet::default(),
+    }
+}
+
 /// Ports that admit every header at `height`, keep bodies in a four-block
-/// pool, verify with `verifier`, and claim bodies in `claims`.
+/// pool, verify with `verifier`, and claim bodies in `claims`. The committed
+/// snapshot puts the verified tip at the parent height.
 pub(super) fn ports(
     height: u32,
     verifier: impl BlockVerifierPort,
@@ -309,7 +339,7 @@ pub(super) fn ports(
         ))),
         verifier: Arc::new(verifier),
         fallback: Arc::new(claims),
-        committed_snapshots: watch::channel(None).1,
+        committed_snapshots: watch::channel(Some(snapshot_at(height.saturating_sub(1)))).1,
     }
 }
 
@@ -454,6 +484,10 @@ pub(super) fn connect_pair(
     svc_b.add_peer(peer_b);
 }
 
+/// The verified tip hash, and the parent hash headerchain reports, in table
+/// tests. A block one above the verified tip then extends it.
+pub(super) const TEST_TIP_HASH: block::Hash = block::Hash([0; 32]);
+
 /// A metadata envelope whose header bytes are the block hash.
 pub(super) fn make_envelope(
     block_id: block::Hash,
@@ -524,7 +558,10 @@ pub(super) fn admit_meta_from(
         now,
         BlockInput::HeaderAdmitted {
             work_id: admit_work(&s1),
-            result: HeaderAdmissionResult::Admitted { height },
+            result: HeaderAdmissionResult::Admitted {
+                height,
+                parent_hash: TEST_TIP_HASH,
+            },
         },
     );
     let s3 = table.step(
@@ -966,6 +1003,32 @@ impl MachineMesh {
         flagged
     }
 
+    /// Indices `from` announced to `to`, flagged or not.
+    pub(super) fn announced(&self, from: usize, to: usize, block_id: &block::Hash) -> Vec<u32> {
+        let mut announced: Vec<u32> = self
+            .wire
+            .announced
+            .iter()
+            .filter(|&&(f, t, b, _)| f == from && t == to && b == *block_id)
+            .map(|&(.., index)| index)
+            .collect();
+        announced.sort_unstable();
+        announced
+    }
+
+    /// Indices whose parts `from` sent to `to`.
+    pub(super) fn sent_parts(&self, from: usize, to: usize, block_id: &block::Hash) -> Vec<u32> {
+        let mut sent: Vec<u32> = self
+            .wire
+            .parts
+            .iter()
+            .filter(|&&(f, t, b, _)| f == from && t == to && b == *block_id)
+            .map(|&(.., index)| index)
+            .collect();
+        sent.sort_unstable();
+        sent
+    }
+
     pub(super) fn verified(&self, node: usize, block_id: &block::Hash) -> bool {
         self.nodes[node].verified.contains_key(block_id)
     }
@@ -1097,8 +1160,8 @@ impl MachineMesh {
         }
     }
 
-    /// The node's shell work, completed at once: header admission and
-    /// commitment checks pass, stripe jobs run inline, and the verifier
+    /// The node's shell work, completed at once: header admission, the
+    /// unknown-parent checks, and commitment checks pass, stripe jobs run inline, and the verifier
     /// accepts.
     fn shell(&mut self, node: usize, output: BlockOutput) {
         let input = match output {
@@ -1106,7 +1169,12 @@ impl MachineMesh {
                 work_id,
                 result: HeaderAdmissionResult::Admitted {
                     height: MESH_HEIGHT,
+                    parent_hash: TEST_TIP_HASH,
                 },
+            },
+            BlockOutput::CheckUnknownParent { work_id, .. } => BlockInput::UnknownParentChecked {
+                work_id,
+                verdict: UnknownParentVerdict::Park,
             },
             BlockOutput::VerifyCommitment {
                 work_id, block_id, ..
@@ -1152,7 +1220,9 @@ impl MachineMesh {
             BlockOutput::ClosePeer { peer, row, .. } => {
                 panic!("mesh metadata is valid, but the table closed {peer:?} with {row:?}")
             }
-            BlockOutput::ClaimBody { .. } | BlockOutput::ReleaseBodyClaim { .. } => return,
+            BlockOutput::ClaimBody { .. }
+            | BlockOutput::ExtendBodyClaim { .. }
+            | BlockOutput::ReleaseBodyClaim { .. } => return,
             routed => unreachable!("route_block_output keeps {routed:?} off the shell"),
         };
         self.step_table(node, input);
@@ -1209,7 +1279,10 @@ impl MachineMesh {
                 self.send(node, peer, MeshFrame::Part { block_id, part });
             }
             PeerOutput::SendWantEnd { want_id, sent, .. } => {
-                self.send(node, peer, MeshFrame::WantEnd { want_id, sent })
+                self.send(node, peer, MeshFrame::WantEnd { want_id, sent });
+                // The mesh hands each frame to its link at once, so it
+                // reports the end written, as the data writer does.
+                self.step_peer(node, peer, PeerInput::WantEndWritten);
             }
             PeerOutput::ServeWant {
                 want_id,

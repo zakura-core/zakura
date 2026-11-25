@@ -41,15 +41,22 @@ fn header_admission_maps_every_headerchain_reply() {
             already_known,
         })
     };
+    let header_parent = block::Hash([0x07; 32]);
     let cases = [
         (
             admitted(false),
-            HeaderAdmissionResult::Admitted { height: 42 },
+            HeaderAdmissionResult::Admitted {
+                height: 42,
+                parent_hash: header_parent,
+            },
         ),
         // A header headerchain already retains still admits (`decision-2`).
         (
             admitted(true),
-            HeaderAdmissionResult::Admitted { height: 42 },
+            HeaderAdmissionResult::Admitted {
+                height: 42,
+                parent_hash: header_parent,
+            },
         ),
         (
             Ok(ExactHeaderAdmission::MissingParent { parent_hash }),
@@ -66,7 +73,7 @@ fn header_admission_maps_every_headerchain_reply() {
         (Err(PortError::Timeout), HeaderAdmissionResult::LocalError),
     ];
     for (admission, expected) in cases {
-        assert_eq!(admission_result(admission), expected);
+        assert_eq!(admission_result(admission, header_parent), expected);
     }
 }
 
@@ -100,6 +107,33 @@ fn verifier_verdict_classification_preserves_root_mismatch_distinct_from_invalid
         )),
         VerifierVerdict::LocalCapacity
     );
+}
+
+/// bpv1-45: only a consensus-invalid class reports `Invalid`. Every
+/// retryable class, including a missing parent and a timeout, is local, so
+/// BPv1 never reports `Invalid` for a block that later commits.
+#[test]
+fn bpv1_45_only_a_consensus_invalid_class_reports_invalid() {
+    use TransientBodyFailureKind::*;
+    for kind in [
+        MissingContext,
+        Canceled,
+        Storage,
+        VerifierUnavailable,
+        Timeout,
+        ResourceExhausted,
+    ] {
+        // A new retryable kind fails this match, so the list stays complete.
+        match kind {
+            MissingContext | Canceled | Storage | VerifierUnavailable | Timeout
+            | ResourceExhausted => {}
+        }
+        assert_eq!(
+            classify_body_verification_class(BodyVerificationClass::Retryable(kind)),
+            VerifierVerdict::LocalCapacity,
+            "{kind:?} is retryable"
+        );
+    }
 }
 
 #[test]
@@ -221,6 +255,124 @@ async fn native_block_sync_skips_bpv1_claimed_hash_and_fetches_on_fallback_relea
             .missing_block_bodies
             .contains(&block::Height(11)),
         "08 §4: native block sync schedules h1 immediately after BPv1 releases fallback claim"
+    );
+
+    shutdown.cancel();
+    let _ = task.await;
+}
+
+/// bpv1-44: the port extends a live claim and never reinstalls an expired
+/// one, because block sync may already fetch that body.
+#[tokio::test]
+async fn body_claim_port_extends_only_a_live_claim() {
+    let claims = SharedBodyClaims::new();
+    let port: &dyn BlockFallbackPort = &claims;
+    let (live, expired) = (block::Hash([0x31; 32]), block::Hash([0x32; 32]));
+    let soon = Instant::now() + Duration::from_millis(20);
+    assert!(port.claim(live, Instant::now() + Duration::from_secs(10)));
+    assert!(port.claim(expired, soon));
+    zakura_rt::time::sleep_until(soon).await;
+
+    let later = Instant::now() + Duration::from_secs(120);
+    assert!(port.extend(live, later));
+    assert!(claims.is_claimed(live, later - Duration::from_secs(1)));
+    assert!(!port.extend(expired, later));
+    assert!(!claims.is_claimed(expired, Instant::now()));
+}
+
+/// bpv1-57: a claim that expires, not one BPv1 releases, wakes native block
+/// sync, which then selects the body.
+#[cfg(not(zakura_sim))]
+#[tokio::test]
+async fn native_block_sync_fetches_a_bpv1_claimed_hash_once_the_claim_expires() {
+    let claims = SharedBodyClaims::new();
+    let fallback_port: &dyn BlockFallbackPort = &claims;
+    let genesis_hash = regtest_genesis_block().hash();
+    let (h1, h2) = (block::Hash([0x11; 32]), block::Hash([0x22; 32]));
+    let expiry = Instant::now() + Duration::from_millis(500);
+    assert!(fallback_port.claim(h1, expiry));
+
+    let frontiers = BlockSyncFrontiers {
+        finalized_height: block::Height(10),
+        verified_block_tip: block::Height(10),
+        verified_block_hash: genesis_hash,
+    };
+    let (_tip_tx, tip_rx) = watch::channel((block::Height(12), h2));
+    let pool = DecodedBlockPool::for_block_count(NonZeroU64::new(8).unwrap());
+    let mut startup = BlockSyncStartup::new(
+        frontiers,
+        (block::Height(12), h2),
+        tip_rx,
+        pool,
+        ZakuraBlockSyncConfig::default(),
+    )
+    .with_body_claims(claims.clone());
+    startup.committed_views = Some(crate::zakura::testkit::startup_committed_view(
+        frontiers,
+        (block::Height(12), h2),
+    ));
+    let shutdown = startup.shutdown.clone();
+    let (handle, mut actions, task) =
+        spawn_block_sync_reactor(startup).expect("block sync reactor spawns");
+    let answer = |handle: &crate::zakura::block_sync::BlockSyncHandle| {
+        let meta = |height, hash| BlockSyncBlockMeta {
+            height: block::Height(height),
+            hash,
+            size: BlockSizeEstimate::Confirmed(1_000),
+        };
+        handle
+            .send_control(BlockSyncEvent::NeededBlocks(vec![
+                meta(11, h1),
+                meta(12, h2),
+            ]))
+            .expect("send NeededBlocks");
+    };
+
+    // Answer each query while the claim is live: selection skips the hash.
+    let mut next_query = async |until: Option<Instant>| loop {
+        let recv = actions.recv();
+        let action = match until {
+            Some(until) => match tokio::time::timeout_at(until, recv).await {
+                Ok(action) => action,
+                Err(_) => return false,
+            },
+            None => tokio::time::timeout(Duration::from_secs(2), recv)
+                .await
+                .expect("the claim expiry wakes the reactor"),
+        };
+        if matches!(
+            action.expect("action stream open"),
+            BlockSyncAction::QueryNeededBlocks { .. }
+        ) {
+            return true;
+        }
+    };
+    let mut live_queries = 0;
+    while next_query(Some(expiry)).await {
+        live_queries += 1;
+        answer(&handle);
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(
+            !handle
+                .candidate_state()
+                .missing_block_bodies
+                .contains(&block::Height(11)),
+            "native block sync skips the claimed hash"
+        );
+    }
+    assert!(live_queries >= 1, "the reactor queries at startup");
+
+    // The periodic retry waits `request_timeout`, far past the expiry, so the
+    // next query comes from the expiry wake.
+    assert!(next_query(None).await);
+    answer(&handle);
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert!(
+        handle
+            .candidate_state()
+            .missing_block_bodies
+            .contains(&block::Height(11)),
+        "native block sync selects the hash once the claim expires"
     );
 
     shutdown.cancel();

@@ -6,6 +6,7 @@
 //! - [`tree`]: BLAKE3 KDF part Merkle tree and proof-gated [`VerifiedPart`]
 //! - [`codec`]: systematic Reed–Solomon GF(2^16) stripe encoding, decoding, and re-encode check
 //! - [`commitment`]: post-NU7 v6 coinbase commitment construction and verification
+//! - [`unknown_parent`]: binding, height, target, and proof-of-work checks on metadata whose parent header is unknown
 //! - [`assemble`]: canonical block assembly with zero-padding and size checks
 //! - [`close`]: versioned `bpv1-close-N` close-cause enum
 //! - [`wire`]: seven-message wire grammar, message tables, `WireMessage`, and FIFO data writer
@@ -25,10 +26,13 @@ mod pull_trace;
 mod route;
 pub mod service;
 pub mod tree;
+pub mod unknown_parent;
 pub mod wire;
 
 #[cfg(test)]
 mod blocks_tests;
+#[cfg(test)]
+mod close_tests;
 #[cfg(all(test, not(zakura_sim)))]
 mod conformance_tests;
 #[cfg(all(test, not(zakura_sim)))]
@@ -43,6 +47,8 @@ mod service_tests;
 mod test_support;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod unknown_parent_tests;
 
 pub use assemble::{assemble_block, AssembleError};
 #[cfg(any(test, feature = "p2p-fuzz"))]
@@ -51,6 +57,7 @@ pub use blocks::{
     AdmittedBlock, BlockConfig, BlockEvent, BlockInput, BlockOutcome, BlockOutput, BlockPhase,
     BlockStep, BlockTable, ClaimRelease, FallbackReason, HeaderAdmissionResult, MetaEnvelope,
     PartRefusal, PartSource, PullPeerState, ReleaseReason, StripeJob, VerifierVerdict, WorkId,
+    VERIFY_DEADLINE,
 };
 pub use close::{Bpv1CloseCause, Bpv1CloseRow};
 pub use codec::{decode_and_check_stripe, encode_body, CodecError, EncodedBody};
@@ -83,6 +90,10 @@ pub use proposer::{
 pub use service::{bpv1_custom_service, bpv1_service_id, Bpv1Handle, Bpv1Ports, Bpv1Service};
 pub use tree::{
     build_part_tree, encoding_id, pad_hash, verify_part_proof, Bpv1Hash, ProofError, VerifiedPart,
+};
+pub use unknown_parent::{
+    check_binding_and_height, check_proof_of_work, check_target_bound, target_bound_applies,
+    TargetBound, UnknownParentVerdict,
 };
 pub use wire::{
     encode_part_frame, read_part_prefix, Bpv1FifoQueue, Bpv1Message, DataQueueItem, HaveFlags,

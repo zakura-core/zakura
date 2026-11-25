@@ -52,6 +52,10 @@ the BPv1 implementation decisions:
 - **The proposer's silence (decision-20):** The proposer sends `HeaderMeta`
   and `BlockDone`, never `Have`. `BlockDone` means the sender holds every
   part. Repair rounds, but not normal pulls, may ask any `BlockDone` peer.
+- **`Have`s to the proposer (decision-32):** Every node announces to the
+  proposer each verified part that the proposer did not send it, at once and
+  unpaced. The proposer never pulls these parts. Its trace then records when
+  each neighbour obtained each part.
 - **Estimate-based repair (decision-22):** Repair starts after `SLOW_X` × one
   part's estimated arrival time without progress, doubling per round. The first
   repair round releases the body claim, so native block sync races.
@@ -96,14 +100,39 @@ necessary exceptions. If parent context is missing, the node MAY retain a
 bounded metadata envelope while headerchain recovers that context. It MUST apply
 independent count, byte, work, and time limits to this pending state, both per
 peer and node-wide. Headerchain answers a missing parent before it checks proof
-of work, so a pending entry costs its sender only bytes. Pending metadata MUST
-NOT take space from metadata whose parent the node holds. When the node-wide
+of work. So before the node retains the envelope, it MUST check that the
+binding's coinbase txid reaches the header's Merkle root, that the coinbase's
+authorizing data reaches the header's block commitments (the txid leaves out
+the coinbase script, which holds the height), that the coinbase
+height lies above `top` (section 2) and at most
+`PROPAGATION_DEPTH` above it, and that the header meets its own target with a
+valid solution. Where no minimum-difficulty rule applies, it MUST then check
+that the target is at most `(1 + PoWMaxAdjustDown)^k` times the highest target
+in the widest averaging window ending at its best header, for a header `k`
+blocks above that header. A pending entry then costs its sender about as much
+work as a real block that far ahead. The target bound holds only for a chain
+that extends the best header, and an honest header on a fork with less hash
+rate can exceed it. So a target above the bound is not a violation. Pending metadata MUST
+NOT take space from metadata whose parent the node holds, including while these
+checks run. When the node-wide
 pending limit is full, the node SHOULD drop an entry of the peer holding the
 most pending metadata, not refuse a peer holding less. A dropped entry is not a
 violation, and the block arrives through header sync and block download.
 
 Header admission does not validate the block body. Reconstructed blocks MUST
 enter the existing consensus block-validation path.
+
+A node MUST keep at most one submission of a block in that path at a time. Its
+body claim keeps native block sync off the block from admission until the
+reconstruction deadline. Assembly extends a live claim until a verdict or the
+verification deadline, which starts at the first submission. It never renews an
+expired claim, because block sync may already fetch the body. When the
+verification deadline passes, the node MUST use the existing block-download
+path. A retryable verdict says nothing about the body. If the block is more than
+one block above the verified tip, its parent is not committed. The node then
+keeps the body and the claim, and submits the block again once its parent is the
+verified tip. In every other case, including a verified tip that reaches the
+block's height on another branch, the node uses the block-download path.
 
 The [design targets](../design/bpv1.md#performance-targets) define the
 planning workload and the latency goal. These estimates do not change consensus
@@ -249,8 +278,14 @@ block it proposed. `top` never decreases. A header that headerchain retains
 but has not selected, such as a fork or a future-dated header, does not raise
 `top`. A node MUST NOT admit
 metadata for a block at or below `top - PROPAGATION_DEPTH` (strictly
-`height + PROPAGATION_DEPTH > top`). Such a block uses the existing
-block-download path.
+`height + PROPAGATION_DEPTH > top`). A node also MUST NOT admit metadata for a
+block more than `PROPAGATION_DEPTH` above its verified tip. While a node catches
+up, header sync raises `top` far above the verified tip, and such a block cannot
+commit until its ancestors arrive. Such blocks use the existing block-download
+path. A node retires a block once it falls to or below `top - PROPAGATION_DEPTH`.
+The verified-tip bound applies at admission only. A reorg can lower the verified
+tip, and a block admitted above the new bound keeps its slot until it completes
+or reaches its deadline.
 
 The coinbase names the proposer (decision-34). With exactly one miner mesh
 output, the proposer is every node whose ID starts with that output's 20-byte
@@ -315,8 +350,8 @@ without a commitment use existing block propagation.
 The verifier MUST validate the coding layout first, then submit `header` to
 headerchain (checking proof of work and all contextual header rules), and only
 after header admission verify the coinbase commitment and allocate assembly
-state. Duplicate `HeaderMeta` for the same consensus hash from another peer
-returns `Drop`.
+state. Section 5 states how the verifier treats copies of one block's
+`HeaderMeta` from other peers.
 
 ### Authenticate parts and reconstruction
 
@@ -779,17 +814,39 @@ every peer before it writes any part.
 
 A header that headerchain rejects returns `Disconnect` when headerchain
 classifies the failure as peer-caused. A missing parent invokes bounded
-recovery and is not a violation. A layout mismatch, invalid binding, a
-`proposer_node` form that disagrees with the coinbase, or a failed commitment
-returns `Disconnect` (close-4): an honest relay forwards only admitted
-metadata. A repeat of a block's metadata from the same peer returns `Disconnect`
-while this node keeps the block admitted or retired. The sender keeps the block
-retired at least until the block leaves its own window, and it never admits a
-block outside that window, so it cannot send the metadata twice. The header
-commits the coinbase, and the coinbase commits `C`, so a block has one valid
-`HeaderMeta`. A duplicate from another peer returns `Drop`. Metadata
-for a retired block, or for a block outside the propagation window, returns
-`Drop`.
+recovery and is not a violation. With a missing parent, a height outside the
+range in section 1 or a target above the section 1 bound returns `Drop`, and a
+proof of work that fails the section 1 checks returns `Disconnect`. A layout
+mismatch, invalid binding, a `proposer_node` form that disagrees with the
+coinbase, or a failed commitment returns `Disconnect` (close-4): an honest relay
+forwards only admitted metadata. A repeat of a block's metadata from the same
+peer returns `Disconnect` while this node holds the block in admission,
+admitted, or retired. The sender keeps the block retired at least until the
+block leaves its own window, and it never admits a block outside that window,
+so it cannot send the metadata twice.
+
+The header commits the coinbase, and the coinbase commits `C`, so a block has
+one valid `HeaderMeta`. The consensus hash covers only the header, so other
+peers may send different copies under one hash while the first copy is in
+admission:
+
+- The node checks each copy's layout when the copy arrives.
+- A copy that fails its commitment check returns `Disconnect` for every peer
+  that sent an equal copy, first or later. The check covers the copy's
+  `proposer_node` form. It depends only on the copy and the admitted height,
+  so an honest relay never forwards a copy that fails it.
+- The node keeps each differing copy while it fits the metadata budget.
+  Kept copies use only room that no first copy needs, and they give way to
+  any first copy that the node admits.
+- When the first copy fails, the node checks the kept copies one at a time,
+  in arrival order, until one passes.
+- A peer whose session ended gets no answer, so the node forgets it as a
+  sender of a copy.
+- Every other duplicate from another peer returns `Drop`, including each copy
+  that arrives after the block is admitted.
+
+Metadata for a retired block, or for a block outside the propagation window,
+returns `Drop`.
 
 `HeaderMeta` authorizes no parts. The proposer's flagged `Have`s on the data
 stream authorize its seeds (section 3).
@@ -830,7 +887,10 @@ matching reason.
 
 An out-of-range stripe or requested bit returns `Disconnect`. A reused live
 `want_id`, an overlapping live requested set, or more than twice
-`MAX_WANTS_INFLIGHT` live `Want`s returns `Disconnect`.
+`MAX_WANTS_INFLIGHT` live `Want`s returns `Disconnect`. At the server, a `Want`
+stays live until the server writes its `WantEnd` to the transport. The
+requester keeps the `Want` live until it reads that `WantEnd`, so it cannot
+reuse an id or a set that the server still holds.
 
 A requester that no longer needs the parts keeps the reservation live until
 `WantEnd` or session retirement. A local pull timeout (`SLOW_X * estimated` or
@@ -965,6 +1025,13 @@ only such parts. It SHOULD batch announcements for at most `HAVE_FLUSH_MS` or
 its own block (decision-20, bpv1-9). The receiver uses `Have`s to choose pulls,
 to skip sends, and to measure lag.
 
+A node SHOULD send the block's proposer an unflagged `Have` for each part it
+verifies, received or reconstructed, unless the proposer sent it that part
+(decision-32). It sends the `Have` at once, without pacing, and also after the
+proposer's `BlockDone`. It MUST NOT push or send the proposer a part. The
+proposer accepts these `Have`s under the usual cadence and retired-counter
+rules, records them for its trace, and never pulls for them.
+
 A `Have` with the push flag states that the sender will push the listed parts
 behind it on the data stream (section 3). A holder sets it for its own pushed
 seeds. The proposer sets it for its seeds and direct copies, and adds the relay
@@ -984,8 +1051,8 @@ above `advert_window_full_size_bytes`, and linear between. The node announces
 verified parts to the initial group at once. Every other peer becomes eligible
 at admission plus `advert_delay`, and then receives one `Have` of the parts it
 still lacks. At both times the node skips a part that the peer announced or
-sent, and a stripe or block the peer finished. Flagged `Have`s, seeds, and
-repair are not paced.
+sent, and a stripe or block the peer finished. Flagged `Have`s, `Have`s to the
+proposer, seeds, and repair are not paced.
 
 An out-of-range index or a repeated index returns `Disconnect` while the
 receiver retains the block's peer view. A push flag past the connection's
@@ -1441,6 +1508,7 @@ registry.
 | --- | --- | --- |
 | Stall interval; `STALL_BACKOFF` | `SLOW_X` × one part's estimated arrival (decision-22); 2.0 | Recovery; the reconstruction deadline is the only bound (decision-17). |
 | Reconstruction deadline | 15 s | Monotonic from metadata admission. |
+| Verification deadline | 120 s | Monotonic from the first verifier submission. The verifier's wait for another delivery's pending commit. |
 | Retention after completion | 5 s, extended until every neighbour reports `BlockDone`, within a 60 s bound | Experimental. |
 | Verification and decode workers; CPU and memory caps | `TBD` | Required per-peer and node-wide work limits. |
 

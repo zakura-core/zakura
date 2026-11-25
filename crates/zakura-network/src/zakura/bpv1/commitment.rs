@@ -231,26 +231,7 @@ pub fn verify_commitment(
         return Err(CommitmentError::UnsupportedNetworkUpgrade);
     }
 
-    // The exact path depth is at most 32 for any `u32` count.
-    let expected_depth = expected_tx_path_depth(fields.coding.tx_count);
-    if binding.txid_siblings.len() != expected_depth
-        || binding.auth_siblings.len() != expected_depth
-    {
-        return Err(CommitmentError::WrongPathDepth {
-            expected: expected_depth,
-            txid: binding.txid_siblings.len(),
-            auth: binding.auth_siblings.len(),
-        });
-    }
-
-    let coinbase = decode_coinbase(&binding.coinbase)?;
-
-    // check-2: coinbase txid at index 0 reaches `header.merkle_root`.
-    let txid = coinbase.hash().0;
-    let computed_merkle_root = fold_index0(txid, &binding.txid_siblings, hash_txid_pair);
-    if computed_merkle_root != header.merkle_root.0 {
-        return Err(CommitmentError::TxidPathMismatch);
-    }
+    let coinbase = verify_txid_path(header, binding, fields.coding.tx_count)?;
 
     check_block_commitments(
         header,
@@ -271,6 +252,38 @@ pub fn verify_commitment(
     }
 
     Ok(proposer)
+}
+
+/// check-2: decodes the binding's coinbase and checks that its txid at index 0
+/// reaches `header.merkle_root` through `txid_siblings`.
+///
+/// Both sibling paths must have the depth that `tx_count` transactions give.
+/// The check needs no chain context.
+pub fn verify_txid_path(
+    header: &Header,
+    binding: &CoinbaseBinding,
+    tx_count: u32,
+) -> Result<Transaction, CommitmentError> {
+    // The exact path depth is at most 32 for any `u32` count.
+    let expected_depth = expected_tx_path_depth(tx_count);
+    if binding.txid_siblings.len() != expected_depth
+        || binding.auth_siblings.len() != expected_depth
+    {
+        return Err(CommitmentError::WrongPathDepth {
+            expected: expected_depth,
+            txid: binding.txid_siblings.len(),
+            auth: binding.auth_siblings.len(),
+        });
+    }
+
+    let coinbase = decode_coinbase(&binding.coinbase)?;
+
+    let txid = coinbase.hash().0;
+    let computed_merkle_root = fold_index0(txid, &binding.txid_siblings, hash_txid_pair);
+    if computed_merkle_root != header.merkle_root.0 {
+        return Err(CommitmentError::TxidPathMismatch);
+    }
+    Ok(coinbase)
 }
 
 /// Decodes the coinbase a `HeaderMeta` binds: a canonical v6 coinbase

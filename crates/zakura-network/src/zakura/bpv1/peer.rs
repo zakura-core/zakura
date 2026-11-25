@@ -614,6 +614,23 @@ pub enum PeerEvent {
         /// Whether the peer is outside the block's initial group.
         delayed: bool,
     },
+    /// This node announced `count` verified indices to the block's proposer
+    /// (decision-32).
+    HaveSentToProposer {
+        /// Block consensus hash.
+        block_id: block::Hash,
+        /// Announced indices.
+        count: usize,
+    },
+    /// This node proposed the block, and a neighbour announced `indices`
+    /// (decision-32). The proposer's trace records when each neighbour got
+    /// each part.
+    ProposerHeardHave {
+        /// Block consensus hash.
+        block_id: block::Hash,
+        /// Announced indices.
+        indices: Vec<u32>,
+    },
     /// The advertisement deadline dropped `count` held indices that the
     /// skip rules no longer allow (decision-26).
     HaveSkippedAtDeadline {
@@ -861,6 +878,9 @@ impl PeerBlockState {
 struct RetiredCounters {
     part_remaining: u32,
     have_remaining: u32,
+    /// Whether the peer sent the block's `HeaderMeta` on this connection, so
+    /// a repeat closes with row 5 while the block stays retired (bpv1-4).
+    meta_received: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -965,9 +985,10 @@ pub struct PeerState {
 
     wants_out: HashMap<u32, OutgoingWant>,
     wants_in: HashMap<u32, IncomingWant>,
-    /// `WantEnd`s emitted but not yet written to the data stream. Each still
-    /// counts as a live incoming `Want`: the peer cannot have received it.
-    unwritten_ends: usize,
+    /// `WantEnd`s emitted but not yet written to the data stream, oldest
+    /// first, with the `Want` each ends. Each `Want` is still live at the
+    /// peer, which cannot have received its end (bpv1-28, bpv1-49).
+    unwritten_ends: VecDeque<(u32, IncomingWant)>,
     inflight_verify: HashMap<u64, InflightVerify>,
 
     early_data: VecDeque<EarlyDataEntry>,
@@ -1012,7 +1033,7 @@ impl PeerState {
             retired: HashMap::new(),
             wants_out: HashMap::new(),
             wants_in: HashMap::new(),
-            unwritten_ends: 0,
+            unwritten_ends: VecDeque::new(),
             inflight_verify: HashMap::new(),
             early_data: VecDeque::new(),
             early_data_bytes: 0,
@@ -1216,7 +1237,12 @@ impl PeerState {
                 indices,
                 push,
             } => {
-                if push {
+                // decision-32: the proposer gets a plain `Have` for a pushed seed too.
+                let to_proposer = self
+                    .blocks
+                    .get(&block_id)
+                    .is_some_and(|block| block.proposer.is(&self.remote_node));
+                if push && !to_proposer {
                     self.push_seeds(block_id, indices, &mut step);
                 } else {
                     self.handle_ready(now, block_id, indices, &mut step);
@@ -1228,8 +1254,10 @@ impl PeerState {
             PeerInput::RecvWant(want) => self.handle_recv_want(want, &mut step),
             PeerInput::ServePartQueued(queued) => self.handle_serve_part_queued(queued),
             PeerInput::ServeDone(done) => self.handle_serve_done(done, &mut step),
+            // The data writer writes in FIFO order and never drops a `WantEnd`,
+            // so the oldest unwritten end is the one written.
             PeerInput::WantEndWritten => {
-                self.unwritten_ends = self.unwritten_ends.saturating_sub(1);
+                self.unwritten_ends.pop_front();
             }
             PeerInput::RecvWantEnd(end) => self.handle_recv_want_end(now, end, &mut step),
             PeerInput::LocalStripeDone { block_id, stripe } => {
@@ -1264,12 +1292,34 @@ impl PeerState {
             }
             PeerInput::SessionEnd => unreachable!("handled above"),
         }
-        self.unwritten_ends += step
-            .outputs
-            .iter()
-            .filter(|output| matches!(output, PeerOutput::SendWantEnd { .. }))
-            .count();
         step
+    }
+
+    /// Queues the `WantEnd` of the peer's `Want` `want_id`. The `Want` stays
+    /// live until the data writer writes its end.
+    fn end_want(
+        &mut self,
+        want_id: u32,
+        want: IncomingWant,
+        sent: u16,
+        reason: WantEndReason,
+        step: &mut PeerStep,
+    ) {
+        self.unwritten_ends.push_back((want_id, want));
+        step.outputs.push(PeerOutput::SendWantEnd {
+            want_id,
+            sent,
+            reason,
+        });
+    }
+
+    /// The peer's live `Want`s: those being served and those whose end is
+    /// not yet written.
+    fn live_wants_in_iter(&self) -> impl Iterator<Item = (u32, &IncomingWant)> {
+        self.wants_in
+            .iter()
+            .map(|(&id, want)| (id, want))
+            .chain(self.unwritten_ends.iter().map(|(id, want)| (*id, want)))
     }
 
     /// Closes for `row`, read on the stream of `stream_kind`.
@@ -1347,9 +1397,11 @@ impl PeerState {
         message: Box<Bpv1Message>,
         step: &mut PeerStep,
     ) {
-        // bpv1-4 / close-5: a second HeaderMeta for one block on one connection closes 5.
+        // bpv1-4 / close-5: a second HeaderMeta for one block on one connection
+        // closes 5 while this node keeps the block pending, admitted, or retired.
         let duplicate = self.meta_received_pending.contains(&block_id)
-            || self.blocks.get(&block_id).is_some_and(|b| b.meta_received);
+            || self.blocks.get(&block_id).is_some_and(|b| b.meta_received)
+            || self.retired.get(&block_id).is_some_and(|r| r.meta_received);
         if duplicate {
             self.close_protocol(
                 BPV1_CONTROL_KIND,
@@ -1362,7 +1414,9 @@ impl PeerState {
             block.meta_received = true;
             // Parts that waited for this `HeaderMeta` (bpv1-14) can now be accepted.
             self.replay_early_for_block(now, block_id, step);
-        } else if !self.retired.contains_key(&block_id) {
+        } else if let Some(retired) = self.retired.get_mut(&block_id) {
+            retired.meta_received = true;
+        } else {
             self.meta_received_pending.insert(block_id);
         }
         step.events.push(PeerEvent::MetaReceived(block_id));
@@ -1607,7 +1661,40 @@ impl PeerState {
             return;
         }
         // bpv1-9 / decision-20: the proposer never announces its own block.
-        if block.peer_block_done || block.as_proposer {
+        if block.as_proposer {
+            return;
+        }
+        // decision-32: the proposer hears of every part this node verifies,
+        // except the parts it sent here, at once and outside decision-26's
+        // pacing. The proposer holds every part, so it never asks for one.
+        if block.proposer.is(&self.remote_node) {
+            let announced: Vec<u32> = indices
+                .into_iter()
+                .filter(|&index| {
+                    // Widening u32 to usize is lossless on supported targets.
+                    let i = index as usize;
+                    !block.recv_record.get(i) && !block.local_have_sent.get(i)
+                })
+                .collect();
+            for &index in &announced {
+                block.local_have_sent.set(index as usize);
+            }
+            for chunk in announced.chunks(W2_MAX_HAVE_INDICES) {
+                let mut indices = chunk.to_vec();
+                indices.sort_unstable();
+                step.events.push(PeerEvent::HaveSentToProposer {
+                    block_id,
+                    count: indices.len(),
+                });
+                step.outputs.push(PeerOutput::SendHave {
+                    block_id,
+                    flags: HaveFlags::Plain,
+                    indices,
+                });
+            }
+            return;
+        }
+        if block.peer_block_done {
             return;
         }
 
@@ -1831,6 +1918,9 @@ impl PeerState {
                 indices,
                 relay: flags.relay(),
             });
+        } else if block.as_proposer {
+            step.events
+                .push(PeerEvent::ProposerHeardHave { block_id, indices });
         } else {
             step.outputs.push(PeerOutput::PeerHas { block_id, indices });
         }
@@ -2072,8 +2162,9 @@ impl PeerState {
             requested,
         } = want;
         // The decoder already rejected a zero `want_id` and an empty bitmap.
-        // bpv1-28 / close-9: reused live want_id.
-        if self.wants_in.contains_key(&want_id) {
+        // bpv1-28 / close-9: reused live want_id. A `Want` whose end this
+        // node has not yet written is still live at the peer.
+        if self.live_wants_in_iter().any(|(id, _)| id == want_id) {
             self.close_protocol(
                 BPV1_CONTROL_KIND,
                 Bpv1CloseRow::Row9WantReservationViolation,
@@ -2085,7 +2176,7 @@ impl PeerState {
         // unwritten `WantEnd` still holds its `Want`'s place, so a peer that
         // stops reading data cannot grow this node's data queue.
         let hard_limit = MAX_WANTS_INFLIGHT.saturating_mul(2) as usize;
-        if self.wants_in.len() + self.unwritten_ends >= hard_limit {
+        if self.wants_in.len() + self.unwritten_ends.len() >= hard_limit {
             self.close_protocol(
                 BPV1_CONTROL_KIND,
                 Bpv1CloseRow::Row9WantReservationViolation,
@@ -2094,7 +2185,7 @@ impl PeerState {
             return;
         }
         // bpv1-28 / close-9: overlapping live requested set for same (block, stripe).
-        let overlaps = self.wants_in.values().any(|w| {
+        let overlaps = self.live_wants_in_iter().any(|(_, w)| {
             w.block_id == block_id && w.stripe == stripe && w.requested.intersects(&requested)
         });
         if overlaps {
@@ -2106,22 +2197,19 @@ impl PeerState {
             return;
         }
 
+        let want = IncomingWant {
+            block_id,
+            stripe,
+            requested,
+        };
         // Reservation messages never enter early record: unknown or retired blocks
         // end immediately with sent = 0 (bpv1-29).
         if self.retired.contains_key(&block_id) {
-            step.outputs.push(PeerOutput::SendWantEnd {
-                want_id,
-                sent: 0,
-                reason: WantEndReason::Retired,
-            });
+            self.end_want(want_id, want, 0, WantEndReason::Retired, step);
             return;
         }
         let Some(block) = self.blocks.get(&block_id) else {
-            step.outputs.push(PeerOutput::SendWantEnd {
-                want_id,
-                sent: 0,
-                reason: WantEndReason::UnknownBlock,
-            });
+            self.end_want(want_id, want, 0, WantEndReason::UnknownBlock, step);
             return;
         };
 
@@ -2131,27 +2219,13 @@ impl PeerState {
             return;
         }
 
-        self.wants_in.insert(
-            want_id,
-            IncomingWant {
-                block_id,
-                stripe,
-                requested,
-            },
-        );
-
         // If HeaderMeta hasn't crossed or peer already sent BlockDone/StripeDone,
         // serve 0 parts and end cleanly.
         if !block.meta_exchanged()
             || block.peer_block_done
             || block.peer_stripe_done.get(stripe as usize)
         {
-            self.wants_in.remove(&want_id);
-            step.outputs.push(PeerOutput::SendWantEnd {
-                want_id,
-                sent: 0,
-                reason: WantEndReason::Served,
-            });
+            self.end_want(want_id, want, 0, WantEndReason::Served, step);
             return;
         }
 
@@ -2170,6 +2244,7 @@ impl PeerState {
             eligible_slots.push(slot);
         }
 
+        self.wants_in.insert(want_id, want);
         step.outputs.push(PeerOutput::ServeWant {
             want_id,
             block_id,
@@ -2207,11 +2282,7 @@ impl PeerState {
             return;
         };
         let capped_sent = sent.min(want.requested.count());
-        step.outputs.push(PeerOutput::SendWantEnd {
-            want_id,
-            sent: capped_sent,
-            reason,
-        });
+        self.end_want(want_id, want, capped_sent, reason, step);
     }
 
     fn handle_recv_want_end(&mut self, now: Instant, end: RecvWantEnd, step: &mut PeerStep) {
@@ -2359,7 +2430,7 @@ impl PeerState {
             stripes,
             n,
         } = retire;
-        self.meta_received_pending.remove(&block_id);
+        let meta_pending = self.meta_received_pending.remove(&block_id);
         self.inflight_verify.retain(|_, v| v.block_id != block_id);
         let total = stripes.saturating_mul(n);
 
@@ -2369,11 +2440,13 @@ impl PeerState {
             RetiredCounters {
                 part_remaining: total_parts.saturating_sub(block.recv_record.count_ones()),
                 have_remaining: total_parts.saturating_sub(block.peer_have.count_ones()),
+                meta_received: block.meta_received || meta_pending,
             }
         } else {
             RetiredCounters {
                 part_remaining: total,
                 have_remaining: total,
+                meta_received: meta_pending,
             }
         };
         self.retired.insert(block_id, counters);
@@ -2397,12 +2470,9 @@ impl PeerState {
             .map(|(&id, _)| id)
             .collect();
         for want_id in ending_wants {
-            self.wants_in.remove(&want_id);
-            step.outputs.push(PeerOutput::SendWantEnd {
-                want_id,
-                sent: 0,
-                reason: WantEndReason::Retired,
-            });
+            if let Some(want) = self.wants_in.remove(&want_id) {
+                self.end_want(want_id, want, 0, WantEndReason::Retired, step);
+            }
         }
     }
 
@@ -2548,7 +2618,7 @@ impl PeerState {
         self.retired.clear();
         self.wants_out.clear();
         self.wants_in.clear();
-        self.unwritten_ends = 0;
+        self.unwritten_ends.clear();
         self.inflight_verify.clear();
         self.early_data.clear();
         self.early_data_bytes = 0;

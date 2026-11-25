@@ -24,6 +24,7 @@ use crate::{
     config::{QuicBindConfig, QuicConfig},
     congestion::{CongestionProbe, InstrumentedFactory},
     conn::{Conn, ConnObserver, Hooks},
+    credential::NodeCredential,
     driver::{
         endpoint::{EndpointCmd, EndpointTask, SHUTDOWN_DRAIN},
         ConnRef, Connecting, Handshake,
@@ -165,6 +166,9 @@ type AdmissionObserver = Arc<dyn Fn(SocketAddr, bool) + Send + Sync>;
 /// sender, so it never keeps an endpoint task alive.
 pub(crate) struct Shared {
     pub(crate) id: NodeId,
+    /// The credential this node presents. A dial to any ID it proves would
+    /// reach this node (DIAL-1).
+    pub(crate) credential: NodeCredential,
     pub(crate) config: QuicConfig,
     pub(crate) max_bidi_streams: u32,
     pub(crate) tls: TlsConfig,
@@ -294,6 +298,7 @@ impl QuicEndpoint {
         }
         let shared = Arc::new(Shared {
             id: secret.public(),
+            credential: secret.credential().clone(),
             config: config.clone(),
             max_bidi_streams: bind.max_bidi_streams,
             tls: TlsConfig::with_inputs(&secret, &inputs)?,
@@ -555,8 +560,12 @@ impl QuicEndpoint {
         if alpns.is_empty() {
             return Err(ConnectError::AlpnMismatch);
         }
-        // DIAL-1.
-        if addr.id == shared.id {
+        // DIAL-1: this node answers to its own ID and to each ID its
+        // credential would prove to a dialer (TLS-7).
+        if shared
+            .credential
+            .proves_dialed_id(addr.id, &COMPOSITE_KEY_TAGS)
+        {
             return Err(ConnectError::SelfDial);
         }
         if *shared.shutdown.borrow() {

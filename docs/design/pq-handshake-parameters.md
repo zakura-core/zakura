@@ -37,7 +37,12 @@ margins first. The two halves of the handshake face that risk differently.
     the ID doesn't change a second time.
   - The rules had to ship with `p2p-v2/5`. The nodes of this release are
     the old nodes of the first upgrade, and a release without the rules
-    would refuse the longer credential.
+    would refuse the longer credential on a dial to the earlier ID, and a
+    fingerprint entry everywhere.
+  - The room is two more keys per node ID. A key list holds 4 entries, two
+    of them today's keys, and a retired key keeps its entry. A key over
+    2,592 bytes doesn't fit an entry. Past either limit an upgrade is a
+    hard break again.
 
   We still don't carry a pre-committed backup key: it would add a key to
   every credential today. The fingerprint entry leaves that open, since a

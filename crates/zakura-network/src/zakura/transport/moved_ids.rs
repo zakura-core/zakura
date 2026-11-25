@@ -68,6 +68,14 @@ impl MovedNodeIds {
         true
     }
 
+    /// Whether `holds` is true of the node known as `id`, under that ID or
+    /// the one it answers with now. This is the one way to ask whether a
+    /// node known by an ID is connected, in flight or otherwise accounted
+    /// for, since the accounts are kept under the ID a node answers with.
+    pub(crate) fn under_either_id(&self, id: NodeId, holds: impl Fn(&NodeId) -> bool) -> bool {
+        holds(&id) || self.current.get(&id).is_some_and(holds)
+    }
+
     /// Whether the node known as `peer` is among `registered`, under that ID
     /// or the one it moved to.
     pub(crate) fn names_registered(
@@ -75,20 +83,26 @@ impl MovedNodeIds {
         peer: &ZakuraPeerId,
         registered: &[ZakuraPeerId],
     ) -> bool {
-        if registered.contains(peer) {
-            return true;
-        }
-        peer.node_id()
-            .and_then(|id| self.current.get(&id))
-            .is_some_and(|current| registered.contains(&ZakuraPeerId::from_node_id(*current)))
+        // A legacy peer id is not a node ID and never moves.
+        let Some(id) = peer.node_id() else {
+            return registered.contains(peer);
+        };
+        self.under_either_id(id, |id| {
+            registered
+                .iter()
+                .any(|peer| peer.as_bytes() == id.as_bytes())
+        })
     }
 }
 
 /// The supervisor's registered peers, read together with the moves that say
 /// which of them a node's earlier ID names.
 ///
-/// A dial records a move before its connection registers, so a change in the
-/// registered peers is the only event a reader waits for.
+/// [`Self::changed`] waits for the registered peers alone. A dial records a
+/// move before its connection registers, so a reader woken by a registration
+/// sees the move behind it. A move learned for a node that is already
+/// registered wakes nobody: a reader that was waiting for the node sees it
+/// the next time it asks.
 #[derive(Clone, Debug)]
 pub(crate) struct RegisteredPeers {
     registered: watch::Receiver<Vec<ZakuraPeerId>>,

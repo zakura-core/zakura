@@ -501,12 +501,15 @@ async fn admit_dial_round(
                 if free_slots == 0 || free_permits == 0 {
                     return DialAdmission::Exhausted;
                 }
-                let answers_as = current(candidate.node_id);
-                if held_places.members.contains(&candidate.node_id)
-                    || held_places.members.contains(&answers_as)
-                {
+                let holds_a_place = moved
+                    .borrow()
+                    .under_either_id(candidate.node_id, |id| held_places.members.contains(id));
+                if holds_a_place {
                     return DialAdmission::Skipped;
                 }
+                // The book leaves out a node connected under the candidate's
+                // own ID. A moved node is registered under the other one.
+                let answers_as = current(candidate.node_id);
                 let moved_and_registered = answers_as != candidate.node_id
                     && supervisor.is_registered(&ZakuraPeerId::from_node_id(answers_as));
                 if moved_and_registered || dialing.contains(&answers_as) {

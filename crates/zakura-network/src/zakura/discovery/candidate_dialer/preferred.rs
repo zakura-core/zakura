@@ -207,10 +207,14 @@ pub(super) async fn classify_gateways(
             GatewayMatch::None => *gateway,
             GatewayMatch::Several => gateway.into_ambiguous(),
             GatewayMatch::One(node) => {
-                let answers_as = moved.borrow().current(node);
-                let standing = if registered.contains(&node) || registered.contains(&answers_as) {
+                let is_among = |nodes: &HashSet<NodeId>| {
+                    moved
+                        .borrow()
+                        .under_either_id(node, |id| nodes.contains(id))
+                };
+                let standing = if is_among(&registered) {
                     GatewayStanding::Connected
-                } else if in_flight.contains(&node) || in_flight.contains(&answers_as) {
+                } else if is_among(&in_flight) {
                     GatewayStanding::Dialing
                 } else {
                     let GatewayMatch::One((_, target)) = book_answer else {

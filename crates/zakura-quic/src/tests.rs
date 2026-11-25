@@ -651,6 +651,30 @@ async fn self_dial_is_refused_before_any_packet() {
     ));
 }
 
+/// DIAL-1, TLS-7: a node that added a key to its credential also answers to
+/// the ID it had before, so a dial to that ID is a self-dial too. A stale
+/// record or config entry naming this node can't make it connect to itself.
+#[tokio::test]
+async fn a_dial_to_this_nodes_earlier_id_is_a_self_dial() {
+    let secret = NodeSecretKey::generate();
+    let earlier = secret.public();
+    let own = [crate::ED25519_KEY_TAG, crate::ML_DSA_65_KEY_TAG]
+        .map(|tag| (tag, secret.credential().key(tag).unwrap().to_vec()));
+    let added = (0x0102, vec![0x5a; 64]);
+    let credential = crate::NodeCredential::from_entries(own.into_iter().chain([added])).unwrap();
+    let secret = secret.with_credential(credential).unwrap();
+    let endpoint = QuicEndpoint::bind(secret, &loopback(), &test_config()).unwrap();
+    assert_ne!(endpoint.local_id(), earlier);
+
+    for id in [earlier, endpoint.local_id()] {
+        let own = NodeAddr::with_addrs(id, endpoint.local_addrs());
+        assert!(matches!(
+            endpoint.connect(own, &[ALPN]).await,
+            Err(ConnectError::SelfDial)
+        ));
+    }
+}
+
 #[tokio::test]
 async fn dial_without_a_matching_family_fails_fast() {
     let server = server();

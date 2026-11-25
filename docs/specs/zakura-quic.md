@@ -78,8 +78,8 @@ it adds DIAL-8, changes ADM-1, API-3 and §16, and §17ab lists each change.
 Version 0.31 keeps a node reachable by its earlier node ID after it adds a
 key, and lets a credential carry a key as its fingerprint alone, so a later
 signature scheme doesn't change every node ID twice; it adds DIAL-9 and
-COMPAT-13, changes ID-9, ID-12, TLS-4, TLS-7, TLS-8, API-1, API-4, SEC-2
-and §16, and §17ac lists each change.
+COMPAT-13, changes DIAL-1, ID-9, ID-12, TLS-4, TLS-7, TLS-8, API-1, API-4,
+SEC-2 and §16, and §17ac lists each change.
 
 ## 0. Conventions
 
@@ -326,7 +326,10 @@ at fork tag `zakura-iroh-v1.1.0-rc.1`, and it keeps their MIT/Apache-2.0 notices
      passes;
   2. that list includes the entry of every key the handshake signature is
      checked with, and the credential holds each of those keys in full.
-     For the composite (TLS-4) they are the Ed25519 and ML-DSA-65 keys.
+     The keys are those of the scheme the server signed with, not of every
+     scheme the dialer offered. For the composite (TLS-4), the only scheme
+     this release offers, they are the Ed25519 and ML-DSA-65 keys, so the
+     verifier can apply the rule when it reads the credential.
 
   A node that adds a key to its credential therefore still answers a dial to
   the `NodeId` it had before, and a dialer that holds the earlier ID needs
@@ -840,8 +843,11 @@ is today's Zakura logic.
 
 ## 8. Dialing
 
-- **DIAL-1.** `connect(NodeAddr, alpns)` MUST refuse a `NodeId` equal to the
-  local one, before sending any packet.
+- **DIAL-1.** `connect(NodeAddr, alpns)` MUST refuse a `NodeId` that names
+  the local node, before sending any packet: the local `NodeId`, and every
+  ID the local credential would prove to a dialer (TLS-7). A node that has
+  added a key therefore can't connect to itself through a stale record or
+  config entry that names its earlier ID.
 - **DIAL-2.** `connect` MUST canonicalize, deduplicate and filter the addresses.
   It keeps only addresses whose family has a bound socket. If none remain, it
   fails with `ConnectFailed(NoUsableAddress)`.
@@ -868,9 +874,9 @@ is today's Zakura logic.
   `zakura-network` MUST:
   1. register the connection once, under the ID the node answers with, and
      hold the dial's connection slot under that ID;
-  2. record no failure and no backoff against the dialed ID, and count the
-     registration as a success for the discovery book's entries of both
-     IDs;
+  2. record no failure and no backoff against the dialed ID in the
+     discovery book, and count the registration as a success for the book's
+     entries of both IDs;
   3. treat the node as connected, under either ID, wherever it decides
      whether to dial: a maintained bootstrap peer, a discovery candidate
      and a preferred gateway named by the earlier ID are left alone while
@@ -880,7 +886,11 @@ is today's Zakura logic.
      registers a connection once it has acknowledged that handshake, and
      the duplicate rule would then replace the connection already
      registered. A dial to an earlier ID comes from a stale record or
-     config entry and MUST NOT replace a live connection.
+     config entry and MUST NOT replace a live connection. A discovery
+     attempt closed this way ends as connected elsewhere, with no failure.
+     A maintained dial treats it as it treats any closed duplicate: it
+     waits on the registered connection, and counts a failure only if that
+     connection ends before it is healthy.
 
   The dialer remembers moves in memory, at most 1,024, and learns one again
   with one dial after a restart. It keeps the book's entry of the earlier
@@ -888,8 +898,8 @@ is today's Zakura logic.
   still reaches the node. A `zakura.bootstrap_peers` entry that names a
   moved node logs one warning per start. Two cases are not covered: a
   pinned `network.unconditional_peers` entry matches its `NodeId` exactly,
-  so a pinned peer that moves isn't recognised until the pin names its new
-  ID; and a preferred gateway that blocks still name by its earlier ID is
+  so a pinned peer that moves is handled as any pin whose ID is stale,
+  unrecognised until the pin names its new ID; and a preferred gateway that blocks still name by its earlier ID is
   not dialed again but holds an ordinary connection slot, not a held place,
   until blocks name its new ID.
 - **DIAL-8.** When its hello spans two or more Initial datagrams, the dialer
@@ -1374,6 +1384,12 @@ this release tolerates, and keep each hard change explicit.
   These later steps are a plan, not rules this release implements. This
   release offers one scheme.
 
+  The room for this is what this release's readers accept. A list holds 4
+  entries (ID-8), two of them the Ed25519 and ML-DSA-65 keys, and a retired
+  key keeps its entry as a fingerprint, so a node ID's line can take two
+  more keys. A key longer than 2,592 bytes is refused (ID-12). An upgrade
+  that needs more than either is a hard break (COMPAT-8).
+
 ## 14. Security
 
 - **SEC-1.** The TLS and key code MUST pass these known-answer tests:
@@ -1456,7 +1472,7 @@ this release tolerates, and keep each hard change explicit.
 | A production listener refuses a handshake whose hybrid share is one byte short or carries an ML-KEM key that fails the modulus check | TLS-9, SEC-2 |
 | A peer that offers only classical groups is refused in either direction, and two production endpoints agree on the hybrid | TLS-9 |
 | A credential with an unknown long key derives the same ID on both ends; a bare Ed25519 SubjectPublicKeyInfo, a credential whose ID isn't the dialed one, and a client presenting a credential it can't sign for are refused | TLS-3, TLS-4, TLS-7, TLS-8, ID-12 |
-| A dial to the ID a node had before it added a key connects, and reports the dialed ID and the node's ID now; a dial to an ID whose list leaves out a signing key is refused; a node's public keys beside another party's key pass the ID check and fail the signature; a key list contains exactly the lists of its entries, in order, that keep the required tags | TLS-7, TLS-8, API-4 |
+| A dial to the ID a node had before it added a key connects, and reports the dialed ID and the node's ID now; a node's dial to its own earlier ID is refused as a self-dial; a dial to an ID whose list leaves out a signing key is refused; a node's public keys beside another party's key pass the ID check and fail the signature; a key list contains exactly the lists of its entries, in order, that keep the required tags | TLS-7, TLS-8, API-4, DIAL-1 |
 | A fingerprint-only entry gives the node ID of the full key, holds no key, and round-trips byte for byte under a known and an unknown tag; a marked Ed25519 entry and a marked entry that isn't 32 bytes are refused; both verifiers refuse a credential whose ML-DSA-65 key is a fingerprint | ID-12, TLS-4 |
 | The largest credential a node can authenticate with, its two signing keys and two 2,592-byte keys, completes a handshake in both directions, in two round trips where the listener's flight passes the padded allowance | ID-12, DIAL-8 |
 | A dial to a node's earlier ID registers the node once under its ID now, with the connection slot under that ID; a second such dial to a registered node ends before its control handshake and neither end's registered connection changes; an attempt follows the moved node's registration, a bootstrap supervisor and a dial round leave a registered moved node alone, and both of its book entries are credited | DIAL-9 |
@@ -2277,8 +2293,10 @@ earlier ID accepts its longer credential while the node signs with the keys
 that ID names, the dialer follows the node to its new ID, and a credential
 may carry a retired key as its fingerprint, which keeps the ID. These rules
 ship inside the `p2p-v2/5` break, because the nodes of this release are the
-old nodes of the first upgrade that needs them: a release without the rules
-would refuse the longer credential's ID and the marked entry. No release
+old nodes of the first upgrade that needs them. A release without the rules
+reads a longer credential on a dial to its new ID (ID-10), but refuses it
+on a dial to the earlier ID, and refuses a credential with a marked entry
+everywhere. No release
 has spoken `p2p-v2/5` without them, so the ALPN doesn't move. The key list
 still holds at most 4 entries, so discovery records don't change.
 
@@ -2290,6 +2308,7 @@ Added:
 
 Changed:
 
+- **DIAL-1.** A dial to an ID the local credential proves is a self-dial.
 - **ID-9.** A node that adds entries stays reachable by its earlier ID.
 - **ID-12.** Fingerprint-only entries, marked by the top bit of the length.
 - **TLS-4.** A signing key given as a fingerprint can't authenticate, and

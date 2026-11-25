@@ -1063,7 +1063,7 @@ impl PeerMachine {
         for pending in self.state.pending.iter() {
             shared.wanted.unhold(pending.id, pending.generation);
         }
-        self.state.pending.clear(&mut shared.pending);
+        self.state.pending.clear(&mut shared.excess);
         for (waiter, submitted) in self.submitted_at.drain() {
             shared.ended_submitted.insert(waiter, submitted);
         }
@@ -1180,8 +1180,8 @@ impl PeerMachine {
         let mut dropped: u64 = 0;
         for (id, size, first) in fresh {
             let share = self.state.pending.len() < PENDING_SHARE;
-            let records = shared.pending;
-            let node = records < PENDING_CAP || (first && records < 2 * PENDING_CAP);
+            let excess = shared.excess;
+            let node = excess < PENDING_CAP || (first && excess < 2 * PENDING_CAP);
             if self.state.room() == 0 || !(share || node) {
                 dropped = dropped.saturating_add(1);
                 continue;
@@ -1199,7 +1199,7 @@ impl PeerMachine {
                     generation,
                     size,
                 },
-                &mut shared.pending,
+                &mut shared.excess,
             );
             file(&mut self.state, &shared.wanted, id);
         }
@@ -1287,7 +1287,7 @@ impl PeerMachine {
     fn drop_tried_reference(&mut self, shared: &mut Shared, id: UnminedTxId, generation: EntryGen) {
         if self
             .state
-            .take_pending_of(id, generation, &mut shared.pending)
+            .take_pending_of(id, generation, &mut shared.excess)
             .is_some()
         {
             shared.wanted.unhold(id, generation);
@@ -1635,7 +1635,7 @@ impl PeerMachine {
     /// Drops this session's references to `id` in `generation`, which was
     /// decided, and gives back a fetch of it the session still had.
     fn drop_decided(&mut self, shared: &mut Shared, id: UnminedTxId, generation: EntryGen) {
-        self.state.drop_decided(id, generation, &mut shared.pending);
+        self.state.drop_decided(id, generation, &mut shared.excess);
         if let Some(reservation) = self
             .state
             .requests

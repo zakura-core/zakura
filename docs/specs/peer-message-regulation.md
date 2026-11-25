@@ -1070,8 +1070,8 @@ charge.
     bytes, five of the largest, so a deadline never stretches past what 5 requests allow. Then
     the node-wide 500 undecided transactions the pool core holds
   - requester's pending ids: at most 8,000 per session. Past 512 in a session, an id is taken
-    while sessions hold fewer than 64,000 pending records, or, if no session holds it yet, fewer
-    than 128,000, all provisional. A record counts until its session drops it. Ids a session
+    while sessions hold fewer than 64,000 pending records past their 512 each, or, if no session
+    holds it yet, fewer than 128,000, all provisional. A record counts until its session drops it. Ids a session
     keeps before its `Hello` or the go count only against its own 8,000. The rest is dropped,
     never a violation
   - receiver: at most the requests its `Hello` serves, and one more closes, as row 8 says. Each

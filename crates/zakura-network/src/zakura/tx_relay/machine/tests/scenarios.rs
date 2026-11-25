@@ -663,10 +663,12 @@ fn an_id_whose_holder_ended_mid_verdict_is_a_first_source() {
 }
 
 /// Fills twice the node-wide pending cap with made-up ids nobody serves:
-/// peers from `first_peer` on each join and announce a full pending set.
+/// peers from `first_peer` on each join and announce a full pending set,
+/// of which all but the share counts toward the cap.
 fn flood(bench: &mut Bench, first_peer: u64) {
     let per = u32::try_from(PENDING_PER_PEER).expect("fits");
-    let flooders = u32::try_from(2 * PENDING_CAP / PENDING_PER_PEER).expect("small");
+    let counted = PENDING_PER_PEER - PENDING_SHARE;
+    let flooders = u32::try_from((2 * PENDING_CAP).div_ceil(counted)).expect("small");
     for flooder in 0..flooders {
         let made_up: Vec<UnminedTxId> = (flooder * per..(flooder + 1) * per)
             .map(|n| {
@@ -678,8 +680,8 @@ fn flood(bench: &mut Bench, first_peer: u64) {
         let session = bench.join(first_peer + u64::from(flooder));
         bench.have(session, &made_up);
     }
-    let records = bench.machine.shared.pending;
-    assert!(records >= 2 * PENDING_CAP, "the flood filled the cap");
+    let excess = bench.machine.shared.excess;
+    assert!(excess >= 2 * PENDING_CAP, "the flood filled the cap");
 }
 
 /// Sessions that fill the node-wide cap with made-up ids they never serve

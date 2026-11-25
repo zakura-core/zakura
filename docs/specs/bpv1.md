@@ -314,8 +314,8 @@ without a commitment use existing block propagation.
 The verifier MUST validate the coding layout first, then submit `header` to
 headerchain (checking proof of work and all contextual header rules), and only
 after header admission verify the coinbase commitment and allocate assembly
-state. Duplicate `HeaderMeta` for the same consensus hash from another peer
-returns `Drop`.
+state. Section 5 states how the verifier treats copies of one block's
+`HeaderMeta` from other peers.
 
 ### Authenticate parts and reconstruction
 
@@ -779,13 +779,28 @@ classifies the failure as peer-caused. A missing parent invokes bounded
 recovery and is not a violation. A layout mismatch, invalid binding, or failed
 commitment returns `Disconnect`: an honest relay forwards only admitted
 metadata. A repeat of a block's metadata from the same peer returns `Disconnect`
-while this node keeps the block admitted or retired. The sender keeps the block
-retired at least until the block leaves its own window, and it never admits a
-block outside that window, so it cannot send the metadata twice. The header
-commits the coinbase, and the coinbase commits `C`, so a block has one valid
-`HeaderMeta`. A duplicate from another peer returns `Drop`. Metadata
-for a retired block, or for a block outside the propagation window, returns
-`Drop`.
+while this node holds the block in admission, admitted, or retired. The sender
+keeps the block retired at least until the block leaves its own window, and it
+never admits a block outside that window, so it cannot send the metadata twice.
+
+The header commits the coinbase, and the coinbase commits `C`, so a block has
+one valid `HeaderMeta`. The consensus hash covers only the header, so other
+peers may send different copies under one hash while the first copy is in
+admission:
+
+- The node checks each copy's layout when the copy arrives.
+- A copy that fails its commitment check returns `Disconnect` for every peer
+  that sent an equal copy, first or later. The check depends only on the copy
+  and the admitted height, so an honest relay never forwards a copy that fails
+  it.
+- When the first copy fails, the node checks one differing copy if its
+  metadata budget kept that copy. The kept copy gives way to any first copy
+  that needs the room.
+- Every other duplicate from another peer returns `Drop`, including each copy
+  that arrives after the block is admitted.
+
+Metadata for a retired block, or for a block outside the propagation window,
+returns `Drop`.
 
 `HeaderMeta` authorizes no parts. The proposer's flagged `Have`s on the data
 stream authorize its seeds (section 3).
@@ -826,7 +841,10 @@ matching reason.
 
 An out-of-range stripe or requested bit returns `Disconnect`. A reused live
 `want_id`, an overlapping live requested set, or more than twice
-`MAX_WANTS_INFLIGHT` live `Want`s returns `Disconnect`.
+`MAX_WANTS_INFLIGHT` live `Want`s returns `Disconnect`. At the server, a `Want`
+stays live until the server writes its `WantEnd` to the transport. The
+requester keeps the `Want` live until it reads that `WantEnd`, so it cannot
+reuse an id or a set that the server still holds.
 
 A requester that no longer needs the parts keeps the reservation live until
 `WantEnd` or session retirement. A local pull timeout (`SLOW_X * estimated` or

@@ -11,7 +11,10 @@ use zakura_quic::NodeId;
 use zakura_rt::time::Instant;
 
 use super::{
-    blocks::{BlockConfig, BlockInput, BlockOutput, BlockStep, BlockTable, HeaderAdmissionResult},
+    blocks::{
+        BlockConfig, BlockEvent, BlockInput, BlockOutput, BlockStep, BlockTable,
+        HeaderAdmissionResult,
+    },
     blocks_tests::{
         closed_sessions, commitment_ok, header_result, missing_parent, rejected_sessions,
         unknown_parent_checked,
@@ -139,7 +142,7 @@ fn close_2_decode_errors() {
         ("zero want_id", control_input(&zero_id)),
         ("empty Want bitmap", control_input(&empty_bitmap)),
         ("truncated Want", control_input(&short_want)),
-        ("unparseable header", control_input(&bad_header)),
+        ("unparsable header", control_input(&bad_header)),
     ] {
         assert_eq!(input.err(), Some(Bpv1CloseRow::Row2Decode), "{name}");
     }
@@ -567,6 +570,53 @@ fn alternates_never_take_admitting_room_from_a_first_copy() {
     table.assert_invariants();
 }
 
+/// An alternate envelope waiting for a parent also gives way to a first
+/// copy: the pending budget sheds it before it evicts any first copy.
+#[test]
+fn pending_alternates_give_way_before_a_first_copy_is_evicted() {
+    const COINBASE: usize = 1_900_000;
+    let now = Instant::now();
+    let coding = Profile::W2.derive_coding(64, 2).unwrap();
+    let big = |id: u8, root: u8| {
+        let mut envelope = make_envelope(block::Hash([id; 32]), coding, [root; 32], node_id(1));
+        envelope.binding.coinbase = vec![0x01; COINBASE];
+        envelope
+    };
+    let parent = block::Hash([0x3F; 32]);
+    let park = |table: &mut BlockTable, copy, from| {
+        let received = copy_from(table, now, copy, from);
+        header_result(
+            table,
+            now,
+            &received,
+            HeaderAdmissionResult::MissingParent {
+                parent_hash: parent,
+            },
+        )
+    };
+    let [a, b, c, _] = sessions();
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::W2));
+    for id in [0x40, 0x41, 0x42] {
+        park(&mut table, big(id, 0xA1), a);
+    }
+    // Three first copies and one alternate fill most of the pending budget.
+    copy_from(&mut table, now, big(0x40, 0xA2), b);
+    table.assert_invariants();
+
+    // A fourth first copy fits only without the alternate. Without the shed,
+    // the table would evict a first copy of `a`, the heaviest peer.
+    let parked = park(&mut table, big(0x43, 0xA1), c);
+    assert!(parked
+        .events
+        .iter()
+        .all(|e| !matches!(e, BlockEvent::MetaPendingDropped { .. })));
+    for id in [0x40, 0x41, 0x42, 0x43] {
+        assert!(rejected_sessions(&parked, block::Hash([id; 32])).is_empty());
+    }
+    assert_eq!(table.pending_meta_len(), 4);
+    table.assert_invariants();
+}
+
 // ============================================================================
 // Rows 5 to 20: the session machine
 // ============================================================================
@@ -940,6 +990,10 @@ fn close_20_push_and_relay_flag_bounds() {
 // ============================================================================
 
 proptest! {
+    // 48 cases keep this test under a second; the fuzz mesh explores interleavings
+    // at length.
+    #![proptest_config(ProptestConfig::with_cases(48))]
+
     /// Three conformant nodes never close each other however their streams
     /// interleave. Node 0 proposes to both relays, which also forward the
     /// block's metadata, parts, and `Have`s to each other, so each table

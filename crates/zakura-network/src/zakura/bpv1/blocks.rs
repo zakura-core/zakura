@@ -2355,7 +2355,8 @@ impl BlockTable {
                 BlockOutput::VerifyCommitment {
                     work_id,
                     block_id,
-                    height: height.unwrap_or(self.top),
+                    height: height
+                        .expect("an entry that waits for its commitment has its admitted height"),
                     envelope: envelope.clone(),
                 }
             }

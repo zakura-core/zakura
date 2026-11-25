@@ -10,15 +10,15 @@ use crate::{
     parameters::Network,
 };
 
-use super::{window::window, MinerMeshCommitment};
+use super::{window::window, GatewayId, MinerMeshCommitment};
 
 /// The gateways named by the best chain's recent blocks, with a count each.
 ///
 /// The set looks at a window of heights that follows the tip: two days' worth
-/// of blocks ending 100 blocks below it. Its owner tells it where the tip is
-/// with [`set_tip`](Self::set_tip) and reads blocks into it, in any order,
-/// with [`record`](Self::record). A height counts once, however often it is
-/// read.
+/// of blocks ending [`QUALIFYING_DEPTH`](super::QUALIFYING_DEPTH) blocks
+/// below it. Its owner tells it where the tip is with
+/// [`set_tip`](Self::set_tip) and reads blocks into it, in any order, with
+/// [`record`](Self::record). A height counts once, however often it is read.
 ///
 /// The set does not watch the chain itself. After a reorg its owner compares
 /// [`checked_blocks`](Self::checked_blocks) with the best chain and removes
@@ -40,14 +40,14 @@ pub struct RecentMinerSet {
 #[derive(Copy, Clone, Debug)]
 struct CheckedBlock {
     hash: block::Hash,
-    gateway_id: Option<[u8; 32]>,
+    gateway_id: Option<GatewayId>,
 }
 
 /// A gateway and the number of counted blocks that name it.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct GatewayBlocks {
     /// The gateway ID exactly as the blocks wrote it.
-    pub gateway_id: [u8; 32],
+    pub gateway_id: GatewayId,
     /// How many counted blocks name this gateway. Never zero.
     pub blocks: u32,
 }
@@ -63,7 +63,8 @@ pub struct MinerSetSnapshot {
     /// How many heights in the window have been read.
     pub checked: usize,
     /// The heights that count at the tip, oldest to newest, or `None` before
-    /// the first tip and while the tip is below height 100.
+    /// the first tip and while the tip is below
+    /// [`QUALIFYING_DEPTH`](super::QUALIFYING_DEPTH).
     pub window: Option<RangeInclusive<Height>>,
 }
 
@@ -126,7 +127,8 @@ impl RecentMinerSet {
     /// Moves the window to follow a best chain whose tip is `height`.
     ///
     /// Blocks that are now too old stop counting. So do blocks that are now
-    /// less than 100 below the tip, which happens when the tip moves back.
+    /// less than [`QUALIFYING_DEPTH`](super::QUALIFYING_DEPTH) below the tip,
+    /// which happens when the tip moves back.
     /// `hash` is only reported back in [`snapshot`](Self::snapshot).
     pub fn set_tip(&mut self, height: Height, hash: block::Hash) {
         self.tip = Some((height, hash));
@@ -188,7 +190,7 @@ impl RecentMinerSet {
     /// include displaced blocks until the owner has removed them, so the
     /// owner repairs the set before it takes a snapshot.
     pub fn snapshot(&self) -> MinerSetSnapshot {
-        let mut blocks_by_gateway: HashMap<[u8; 32], u32> = HashMap::new();
+        let mut blocks_by_gateway: HashMap<GatewayId, u32> = HashMap::new();
         for gateway_id in self.checked.values().filter_map(|block| block.gateway_id) {
             *blocks_by_gateway.entry(gateway_id).or_default() += 1;
         }

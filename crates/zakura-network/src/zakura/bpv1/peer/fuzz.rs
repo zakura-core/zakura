@@ -31,11 +31,10 @@ pub struct PeerReplaySummary {
 pub fn replay_bpv1_peer_bytes(bytes: &[u8]) -> PeerReplaySummary {
     use zakura_quic::NodeSecretKey;
 
-    let local = NodeSecretKey::from_bytes(&[1u8; 32]).public();
     let remote = NodeSecretKey::from_bytes(&[2u8; 32]).public();
     let third = NodeSecretKey::from_bytes(&[3u8; 32]).public();
     let config = PeerConfig::for_profile(Profile::TINY);
-    let mut peer = PeerState::new(config, local, remote, 1);
+    let mut peer = PeerState::new(config, remote, 1);
     let mut now = Instant::now();
     let coding = Profile::TINY.derive_coding(256, 2).expect("TINY coding");
     // An empty body has no parts, so every index and stripe is out of its range.

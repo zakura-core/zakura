@@ -20,7 +20,7 @@ use zakura_state::{state_database_format_version_in_code, state_database_format_
 use crate::{
     commands::EntryPoint,
     components::{metrics, tracing::Tracing},
-    config::ZakuradConfig,
+    config::{replace_retired_seed_ids, ZakuradConfig},
 };
 
 /// The last log event that occurred in the application.
@@ -266,7 +266,7 @@ fn start(command: &EntryPoint) -> Result<(Arc<ZakuradConfig>, Tracing), Report> 
         }
     };
 
-    let config = command.process_config(config)?;
+    let mut config = command.process_config(config)?;
 
     // collect the common metadata for the panic report,
     // skipping any env vars that aren't present
@@ -381,11 +381,13 @@ fn start(command: &EntryPoint) -> Result<(Arc<ZakuradConfig>, Tracing), Report> 
     if is_server {
         info!("{metadata_section}");
 
-        if command.config_path().is_some() {
-            info!("Using config file at: {:?}", command.config_path().unwrap());
+        let config_path = command.config_path();
+        if let Some(config_path) = &config_path {
+            info!("Using config file at: {:?}", config_path);
         } else {
             info!("No config file provided, using default configuration");
         }
+        replace_retired_seed_ids(config_path.as_deref(), &mut config.network.zakura);
 
         // Log only selected diagnostics. The full config can contain credentials.
         info!(

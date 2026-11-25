@@ -16,7 +16,9 @@ use tower::Service;
 use zakura_chain::{
     block::{self, Block, Height},
     chain_tip::mock::MockChainTip,
-    miner_mesh::MinerMeshCommitment,
+    miner_mesh::{
+        GatewayBlocks, GatewayId, MinerMeshCommitment, MinerSetSnapshot, QUALIFYING_DEPTH,
+    },
     parameters::Network,
     serialization::ZcashDeserializeInto,
     transaction::{self, Transaction},
@@ -28,14 +30,16 @@ use zakura_state::{
 use zakura_test::vectors::BLOCK_MAINNET_1_BYTES;
 
 use super::{
-    ranking::ranking_channel,
-    tracker::{run, TipMove, Tracker, REPUBLISH_INTERVAL},
+    ranking::{ranking_channel, MIN_GATEWAY_BLOCKS},
+    tracker::{
+        gateway_block_counts, run, GatewayBlockCounts, TipMove, Tracker, REPUBLISH_INTERVAL,
+    },
 };
 use crate::BoxError;
 
 /// The tip used by most tests. On Regtest, whose blocks are 75 seconds apart,
 /// its window is the 51 heights from genesis to 50.
-const TIP: u32 = 150;
+const TIP: u32 = 50 + QUALIFYING_DEPTH;
 
 /// One block of the fake best chain.
 #[derive(Copy, Clone)]
@@ -203,7 +207,7 @@ fn mined_coinbase(gateway: Option<u8>) -> MinedTx {
     if let Some(gateway) = gateway {
         coinbase
             .outputs_mut()
-            .push(MinerMeshCommitment::new([gateway; 32]).to_output());
+            .push(MinerMeshCommitment::new(GatewayId::from_bytes([gateway; 20])).to_output());
     }
     MinedTx::new(
         Arc::new(coinbase).into(),
@@ -272,7 +276,7 @@ where
         .snapshot()
         .gateways
         .iter()
-        .map(|gateway| (gateway.gateway_id[0], gateway.blocks))
+        .map(|gateway| (gateway.gateway_id.as_bytes()[0], gateway.blocks))
         .collect()
 }
 
@@ -282,7 +286,7 @@ fn ranked(ranking: &watch::Receiver<MinerGatewayRanking>) -> Vec<(u8, u32)> {
         .borrow()
         .gateways
         .iter()
-        .map(|gateway| (gateway.gateway_id[0], gateway.blocks))
+        .map(|gateway| (gateway.gateway_id.as_bytes()[0], gateway.blocks))
         .collect()
 }
 
@@ -321,7 +325,7 @@ async fn reads_the_window_newest_first_and_counts_each_gateway() {
 }
 
 #[tokio::test]
-async fn a_new_tip_reads_the_block_that_reached_depth_100() {
+async fn a_new_tip_reads_the_block_that_reached_the_qualifying_depth() {
     let chain = FakeChain::default();
     chain.set(0..=TIP, 1, None);
     let mut tracker = tracker(&chain);
@@ -345,7 +349,7 @@ async fn a_new_tip_reads_the_block_that_reached_depth_100() {
 }
 
 #[tokio::test]
-async fn a_reorg_deeper_than_100_blocks_replaces_the_displaced_counts() {
+async fn a_reorg_that_reaches_counted_blocks_replaces_the_displaced_counts() {
     let chain = FakeChain::default();
     chain.set(0..=TIP, 1, Some(7));
     let mut tracker = tracker(&chain);
@@ -482,7 +486,8 @@ async fn a_failed_repair_keeps_the_blocks_no_reorg_can_reach() {
         .await
         .expect("the fake chain answers");
     read_all(&mut tracker).await;
-    assert_eq!(counts(&tracker), [(7, 1_201)]);
+    // Every height from genesis to the qualifying depth below 1,300 counts.
+    assert_eq!(counts(&tracker), [(7, 1_301 - QUALIFYING_DEPTH)]);
 
     chain.set(1_301..=1_400, 1, Some(7));
     chain.fail_reads();
@@ -615,7 +620,8 @@ async fn a_comparison_that_fails_part_way_forgets_every_block_it_could_not_clear
 }
 
 /// A tip change that arrives while the task fills the window is handled before
-/// the next older block, so the block that just reached depth 100 is read next.
+/// the next older block, so the block that just reached the qualifying depth is
+/// read next.
 #[tokio::test]
 async fn the_task_follows_a_new_tip_before_reading_older_blocks() {
     let chain = FakeChain::default();
@@ -670,17 +676,18 @@ async fn a_new_tip_retries_the_block_that_could_not_be_read() {
     assert!(tracker.snapshot().is_complete());
 }
 
-/// A gateway a newly mined block names reaches the network once 100 more
-/// blocks are mined on top of it, and not before.
+/// A gateway newly mined blocks name reaches the network once the tenth of
+/// them is [`QUALIFYING_DEPTH`] deep, and not before.
 ///
 /// The clock is paused, so each sleep returns only once the task has handled
 /// everything it was sent.
 #[tokio::test(start_paused = true)]
-async fn a_mined_gateway_reaches_the_network_once_100_blocks_deep() {
+async fn a_mined_gateway_reaches_the_network_once_its_tenth_block_counts() {
     let chain = FakeChain::default();
-    chain.set(0..=TIP + 101, 1, None);
     let mined = TIP + 1;
-    chain.set([mined], 1, Some(7));
+    let tenth = mined + MIN_GATEWAY_BLOCKS - 1;
+    chain.set(0..=tenth + QUALIFYING_DEPTH, 1, None);
+    chain.set(mined..=tenth, 1, Some(7));
 
     let (mut tip_sender, latest_tip, tip_change) = ChainTipSender::new(None, &regtest());
     tip_sender.set_finalized_tip(Some(tip_block(1, TIP)));
@@ -691,24 +698,25 @@ async fn a_mined_gateway_reaches_the_network_once_100_blocks_deep() {
         run(&mut tracker, tip_change, &publisher).await;
     });
 
-    // Mine the block that names the gateway, then 99 more: it is 99 deep.
-    for height in mined..TIP + 101 {
+    // Mine the blocks that name the gateway, then enough more that nine of
+    // them count and the tenth is one block short of counting.
+    for height in mined..tenth + QUALIFYING_DEPTH {
         tip_sender.set_best_non_finalized_tip(Some(tip_block(1, height)));
         tokio::task::yield_now().await;
     }
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(ranked(&ranking).is_empty());
 
-    // One more block puts it 100 deep.
-    tip_sender.set_best_non_finalized_tip(Some(tip_block(1, TIP + 101)));
+    // One more block puts the tenth at the qualifying depth.
+    tip_sender.set_best_non_finalized_tip(Some(tip_block(1, tenth + QUALIFYING_DEPTH)));
     tokio::time::timeout(
         Duration::from_secs(10),
         ranking.wait_for(|ranking| !ranking.gateways.is_empty()),
     )
     .await
-    .expect("the gateway is published once its block is 100 deep")
+    .expect("the gateway is published once its tenth block counts")
     .expect("the tracker is still running");
-    assert_eq!(ranked(&ranking), [(7, 1)]);
+    assert_eq!(ranked(&ranking), [(7, MIN_GATEWAY_BLOCKS)]);
 
     drop(tip_sender);
     tokio::time::timeout(Duration::from_secs(10), task)
@@ -760,4 +768,57 @@ async fn the_task_publishes_an_empty_ranking_once_the_tip_is_too_old() {
         .await
         .expect("the task ends once the tip sender is gone")
         .expect("the task does not panic");
+}
+
+/// A snapshot that names the gateways `[(first ID byte, blocks)]`, most blocks first.
+fn snapshot_naming(gateways: &[(u8, u32)]) -> MinerSetSnapshot {
+    MinerSetSnapshot {
+        tip: None,
+        gateways: gateways
+            .iter()
+            .map(|&(id, blocks)| GatewayBlocks {
+                gateway_id: GatewayId::from_bytes([id; 20]),
+                blocks,
+            })
+            .collect(),
+        checked: 0,
+        window: None,
+    }
+}
+
+#[test]
+fn gateway_metrics_report_the_busiest_gateway_and_the_local_one() {
+    let snapshot = snapshot_naming(&[(7, 5), (3, 2), (9, 1)]);
+
+    assert_eq!(
+        gateway_block_counts(&snapshot, Some(GatewayId::from_bytes([3; 20]))),
+        GatewayBlockCounts { top: 5, local: 2 },
+        "the local gateway is counted by its own blocks, not the busiest gateway's"
+    );
+    assert_eq!(
+        gateway_block_counts(&snapshot, Some(GatewayId::from_bytes([7; 20]))),
+        GatewayBlockCounts { top: 5, local: 5 },
+    );
+}
+
+#[test]
+fn gateway_metrics_are_zero_when_nothing_matches() {
+    assert_eq!(
+        gateway_block_counts(&snapshot_naming(&[]), Some(GatewayId::from_bytes([3; 20]))),
+        GatewayBlockCounts { top: 0, local: 0 },
+        "an empty window names no gateway, including this node's"
+    );
+    assert_eq!(
+        gateway_block_counts(
+            &snapshot_naming(&[(7, 5)]),
+            Some(GatewayId::from_bytes([3; 20]))
+        ),
+        GatewayBlockCounts { top: 5, local: 0 },
+        "a local gateway that no block names has no blocks"
+    );
+    assert_eq!(
+        gateway_block_counts(&snapshot_naming(&[(7, 5)]), None),
+        GatewayBlockCounts { top: 5, local: 0 },
+        "a node that does not announce has no local gateway to count"
+    );
 }

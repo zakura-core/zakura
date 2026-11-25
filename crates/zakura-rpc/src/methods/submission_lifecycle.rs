@@ -145,6 +145,17 @@ impl RelayPolicy {
             tracing::debug!(?hash, ?height, published, stage, "bpv1 solved-block hook");
         }
     }
+
+    fn retire_bpv1(&self, hash: block::Hash) {
+        if let Self::AfterStateAdmission {
+            bpv1_proposer: Some(bpv1),
+            ..
+        } = self
+        {
+            bpv1.retire_failed_block(hash);
+            tracing::debug!(?hash, "bpv1 retired a block whose commit failed");
+        }
+    }
 }
 
 /// A decoded submission whose entry point has already checked height and reserved capacity.
@@ -261,8 +272,6 @@ impl Submission {
                 result = &mut verification => result,
                 authorized = policy.wait_for_relay(&admission, admission_start) => {
                     if let Some(relay) = authorized {
-                        policy.publish_bpv1(&self.block, self.hash, self.height, "admitted");
-                        bpv1_attempted = true;
                         if policy.announces_early() {
                             let registration = match &policy {
                                 RelayPolicy::AfterStateAdmission { pending_blocks, .. } => {
@@ -292,12 +301,26 @@ impl Submission {
                                 admitted_registration.take();
                             }
                         }
+                        // BPv1 serializes and hashes the block before it publishes, so it
+                        // runs after the early announcement is queued.
+                        policy.publish_bpv1(&self.block, self.hash, self.height, "admitted");
+                        bpv1_attempted = true;
                     }
                     verification.await
                 }
             };
             if !bpv1_attempted && matches!(result, VerificationOutcome::Completed(Ok(_))) {
                 policy.publish_bpv1(&self.block, self.hash, self.height, "committed");
+            }
+            // BPv1 published at admission, but the commit failed. A duplicate verdict means
+            // the block is already in state, so BPv1 keeps relaying it.
+            let commit_failed = matches!(
+                &result,
+                VerificationOutcome::Completed(verified)
+                    if verified.is_err() && !is_duplicate(verified)
+            );
+            if bpv1_attempted && commit_failed {
+                policy.retire_bpv1(self.hash);
             }
             let (registration, duplicate_body) = match policy {
                 RelayPolicy::AfterStateAdmission { .. } => (admitted_registration, None),

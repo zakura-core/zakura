@@ -70,9 +70,9 @@ pub struct Config {
 
     /// Name this node as the miner's gateway in the coinbase of every block Zakura builds.
     ///
-    /// The coinbase gets one extra zero-value output that carries this node's v2 node ID, so
-    /// other mining nodes can find the node and keep a direct connection to it. The output
-    /// takes 46 bytes of the block.
+    /// The coinbase gets one extra zero-value output that carries the first 20 bytes of this
+    /// node's v2 node ID, so other mining nodes can find the node and keep a direct connection
+    /// to it. The output takes 34 bytes of the block.
     ///
     /// Needs the v2 P2P stack and a node key that stays the same across restarts: `zakurad`
     /// refuses to start with this set unless it has both.

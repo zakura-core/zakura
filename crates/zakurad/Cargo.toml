@@ -244,6 +244,9 @@ zakura-mempool = { path = "../zakura-mempool", version = "0.1.0", features = ["p
 zakura-rpc = { path = "../zakura-rpc", version = "19.0.0", default-features = false, features = ["proptest-impl"] }
 
 zakura-test = { path = "../zakura-test", version = "4.0.0" }
+# Node keys and addresses for the regtest network harness, which dials its
+# `zakurad` children from in-process test nodes.
+zakura-quic = { path = "../zakura-quic", version = "2.0.0" }
 # The simulator's engine-backed header port, compared against
 # HeaderChainServicePort in its tests. Path-only, with no version, because
 # zakura-storage is never published, so packaging drops it.

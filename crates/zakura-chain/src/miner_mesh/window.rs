@@ -9,9 +9,12 @@ use crate::{
 
 /// How many blocks below the tip the newest counted block sits.
 ///
-/// A block this deep is very unlikely to leave the best chain, so the counts
-/// change little when the tip moves.
-const QUALIFYING_DEPTH: u32 = 100;
+/// Reorgs deeper than a few blocks are rare, so a block this deep almost
+/// always stays on the best chain. A reorg deeper than `QUALIFYING_DEPTH`
+/// displaces counted blocks, which the owner of the counts must repair. At
+/// 25-second blocks a block starts counting about four minutes after it is
+/// mined.
+pub const QUALIFYING_DEPTH: u32 = 10;
 
 /// How long a block keeps counting: two days at the target block spacing.
 const WINDOW_SECONDS: i64 = 2 * 24 * 60 * 60;
@@ -23,8 +26,8 @@ const WINDOW_SECONDS: i64 = 2 * 24 * 60 * 60;
 /// days, so the range holds two days' worth of blocks: 2,304 at a 75-second
 /// spacing and 6,912 at 25 seconds. Close to a spacing change it mixes both.
 ///
-/// Returns `None` while the tip is below height 100, when no block is that
-/// deep yet.
+/// Returns `None` while the tip is below [`QUALIFYING_DEPTH`], when no block
+/// is that deep yet.
 pub(super) fn window(network: &Network, tip: Height) -> Option<RangeInclusive<Height>> {
     let newest = tip.0.checked_sub(QUALIFYING_DEPTH)?;
     let mut oldest = newest;

@@ -1610,6 +1610,54 @@ fn bpv1_60_flagged_have_refused_by_a_full_early_record_never_closes() {
     assert_closed(&peer, Bpv1CloseRow::Row14UnwantedOrDuplicatePart);
 }
 
+/// bpv1-48 / decision-33: a bitmap byte decodes to up to eight `u32`
+/// indices, so the early record charges a held `Have` its decoded indices
+/// when they outweigh its frame. A peer that sends 4,096-index bitmaps for
+/// unknown blocks holds no more than the per-peer cap.
+#[test]
+fn bpv1_48_early_record_charges_a_have_its_decoded_indices() {
+    let config = PeerConfig::for_profile(Profile::TINY);
+    let cap = config.early_peer_bytes_cap;
+    let mut peer = PeerState::new(config, node_id(3), 1);
+    let now = Instant::now();
+    // 512 bytes of set bits name 4,096 indices.
+    let form = HaveForm::Bitmap { len: 512 };
+    let indices: Vec<u32> = (0..4_096).collect();
+    let frame_bytes = 33 + form.indices_len(indices.len());
+    let mut held_indices = 0;
+    for i in 0..=cap / frame_bytes {
+        let mut id = [0x6A; 32];
+        id[..8].copy_from_slice(&(i as u64).to_le_bytes());
+        let step = peer.step(
+            now,
+            PeerInput::RecvHave(RecvHave {
+                block_id: block::Hash(id),
+                flags: HaveFlags::Plain,
+                form,
+                frame_bytes,
+                indices: indices.clone(),
+            }),
+        );
+        if step
+            .events
+            .iter()
+            .any(|e| matches!(e, PeerEvent::EarlyHeld { .. }))
+        {
+            held_indices += indices.len();
+        }
+        peer.assert_invariants();
+        if peer.is_data_paused() {
+            break;
+        }
+    }
+    assert!(peer.is_data_paused(), "the record never filled");
+    let held_bytes = held_indices * std::mem::size_of::<u32>();
+    assert!(
+        held_bytes <= cap,
+        "the early record holds {held_bytes} index bytes past its {cap}-byte cap"
+    );
+}
+
 /// bpv1-60 / bpv1-14: the holder's flagged `Have` ages out of the early
 /// record, or leaves it with rejected metadata, before the block is
 /// admitted and before its part is read. The part still never closes, and

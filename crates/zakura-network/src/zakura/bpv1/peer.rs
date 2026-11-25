@@ -953,11 +953,18 @@ impl EarlyDataKind {
         }
     }
 
-    /// Encoded frame bytes charged to the early record.
-    fn frame_bytes(&self) -> usize {
+    /// Bytes charged to the early record: a part's payload, or a `Have`'s
+    /// frame or decoded indices, whichever is larger. A bitmap byte decodes
+    /// to up to eight `u32` indices (decision-33), so the frame alone
+    /// undercounts what the record holds.
+    fn held_bytes(&self) -> usize {
         match self {
             Self::Part(prefix) => prefix.payload.len(),
-            Self::Have(have) => have.frame_bytes,
+            Self::Have(have) => have.frame_bytes.max(
+                have.indices
+                    .len()
+                    .saturating_mul(std::mem::size_of::<u32>()),
+            ),
         }
     }
 }
@@ -2502,10 +2509,10 @@ impl PeerState {
             self.note_dropped_early(&entry.kind);
             step.events.push(PeerEvent::EarlyAged {
                 block_id: entry.kind.block_id(),
-                bytes: entry.kind.frame_bytes(),
+                bytes: entry.kind.held_bytes(),
             });
         }
-        self.release_early(aged.iter().map(|e| e.kind.frame_bytes()).sum(), step);
+        self.release_early(aged.iter().map(|e| e.kind.held_bytes()).sum(), step);
         self.early_control
             .retain(|e| now.saturating_duration_since(e.received_at) < early_age);
 
@@ -2664,7 +2671,7 @@ impl PeerState {
 
     fn buffer_early_data(&mut self, now: Instant, kind: EarlyDataKind, step: &mut PeerStep) {
         let block_id = kind.block_id();
-        let bytes = kind.frame_bytes();
+        let bytes = kind.held_bytes();
         // A single frame larger than the entire per-peer early cap can never fit:
         // drop it explicitly without pausing an empty queue.
         let refused = if bytes > self.config.early_peer_bytes_cap {
@@ -2726,7 +2733,7 @@ impl PeerState {
             .into_iter()
             .partition(|e| e.kind.block_id() == block_id);
         self.early_data = kept;
-        self.release_early(data.iter().map(|e| e.kind.frame_bytes()).sum(), step);
+        self.release_early(data.iter().map(|e| e.kind.held_bytes()).sum(), step);
         (control, data)
     }
 

@@ -3,6 +3,22 @@
 //! Every protocol-violation close in BPv1 cites exactly one active close row
 //! together with the `(stream_kind, stream_version)` pair it occurred on. Retired rows (6, 7, 12, 17, 19) are deliberately
 //! absent so they cannot be emitted.
+//!
+//! # Close properties
+//!
+//! Every row holds these properties. `close_tests` checks each row against
+//! the production machines.
+//!
+//! - **Sound**: a conformant peer never triggers the row. Each row's test
+//!   also runs the nearest conformant sequence and checks that it stays open.
+//! - **Complete**: every violation that the row names closes. A violation
+//!   that this node cannot prove from its own state does not close.
+//! - **Attributed**: the close names every session that sent the violating
+//!   message, and only those sessions.
+//! - **Local faults stay local**: a full local budget, a failed local port,
+//!   or a stale session drops or rejects without a close.
+//! - **Neutral closes stay neutral**: a repeat liveness stall or a stalled
+//!   control write closes without a row and records no fault.
 
 use super::wire::BPV1_STREAM_VERSION;
 
@@ -12,20 +28,31 @@ use super::wire::BPV1_STREAM_VERSION;
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 #[repr(u8)]
 pub enum Bpv1CloseRow {
-    /// `bpv1-close-1`: Frame over row cap, unknown discriminator, or nonzero flags.
+    /// `bpv1-close-1`: A `Have` flags byte with reserved bits (decision-24),
+    /// or a message type on the wrong BPv1 stream. Transport regulation
+    /// closes a frame over its row cap, an unknown type, or nonzero frame
+    /// flags before BPv1 reads it.
     Row1FrameHeader = 1,
-    /// `bpv1-close-2`: Field out of range, truncation, or trailing bytes.
+    /// `bpv1-close-2`: Field out of range, truncation, or trailing bytes,
+    /// including a zero `want_id`, an empty `Want` bitmap, and a `HeaderMeta`
+    /// header that does not parse.
     Row2Decode = 2,
     /// `bpv1-close-3`: `HeaderMeta` whose header headerchain classifies as peer-invalid,
     /// or whose proof of work fails while its parent is unknown.
     Row3InvalidHeader = 3,
-    /// `bpv1-close-4`: `HeaderMeta` layout mismatch or failed coinbase commitment.
+    /// `bpv1-close-4`: `HeaderMeta` layout mismatch or failed coinbase
+    /// commitment. It closes every session whose copy equals the failing
+    /// envelope, and no session whose copy differs.
     Row4BadMetaOrCommitment = 4,
-    /// `bpv1-close-5`: Second `HeaderMeta` for one block on one connection.
+    /// `bpv1-close-5`: Second `HeaderMeta` for one block on one connection
+    /// while this node keeps the block pending, admitted, or retired.
     Row5DuplicateHeaderMeta = 5,
-    /// `bpv1-close-8`: `Want` stripe or requested bit out of range, or empty bitmap.
+    /// `bpv1-close-8`: `Want` stripe or requested bit out of range for an
+    /// admitted block. An empty bitmap closes with row 2.
     Row8BadWantRange = 8,
-    /// `bpv1-close-9`: `Want` reused live id, overlapping live set, or > 2× `MAX_WANTS_INFLIGHT`.
+    /// `bpv1-close-9`: `Want` reused live id, overlapping live set, or > 2×
+    /// `MAX_WANTS_INFLIGHT`. A `Want` stays live until this node writes its
+    /// `WantEnd`.
     Row9WantReservationViolation = 9,
     /// `bpv1-close-10`: `StripeDone` stripe out of range or repeated.
     Row10BadStripeDone = 10,

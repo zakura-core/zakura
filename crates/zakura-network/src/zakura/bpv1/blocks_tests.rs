@@ -227,7 +227,7 @@ fn receive(table: &mut BlockTable, now: Instant, envelope: Box<MetaEnvelope>) ->
 }
 
 /// Completes the step's header admission with `result`.
-fn header_result(
+pub(super) fn header_result(
     table: &mut BlockTable,
     now: Instant,
     received: &BlockStep,
@@ -246,7 +246,7 @@ fn header_result(
 /// then passes the unknown-parent checks, as for an honest child that
 /// arrives before its parent. Returns both steps' effects. A refused entry
 /// starts no checks.
-fn missing_parent(
+pub(super) fn missing_parent(
     table: &mut BlockTable,
     now: Instant,
     received: &BlockStep,
@@ -311,7 +311,11 @@ fn flag_push(
 }
 
 /// Completes the step's commitment check as valid, with no live sessions.
-fn commitment_ok(table: &mut BlockTable, now: Instant, header_step: &BlockStep) -> BlockStep {
+pub(super) fn commitment_ok(
+    table: &mut BlockTable,
+    now: Instant,
+    header_step: &BlockStep,
+) -> BlockStep {
     table.step(
         now,
         BlockInput::CommitmentChecked {
@@ -693,7 +697,7 @@ fn bpv1_75_headers_with_unknown_parents_never_refuse_viable_metadata() {
 }
 
 /// Returns the sessions the step closed with `row`.
-fn closed_sessions(step: &BlockStep, row: Bpv1CloseRow) -> Vec<(NodeId, u64)> {
+pub(super) fn closed_sessions(step: &BlockStep, row: Bpv1CloseRow) -> Vec<(NodeId, u64)> {
     let mut closed: Vec<(NodeId, u64)> = step
         .outputs
         .iter()
@@ -855,7 +859,7 @@ fn unknown_parent_verdicts_park_drop_or_close() {
 }
 
 /// Returns the sessions the step rejected `block_id`'s metadata for.
-fn rejected_sessions(step: &BlockStep, block_id: block::Hash) -> Vec<(NodeId, u64)> {
+pub(super) fn rejected_sessions(step: &BlockStep, block_id: block::Hash) -> Vec<(NodeId, u64)> {
     let mut rejected: Vec<(NodeId, u64)> = step
         .outputs
         .iter()

@@ -1009,6 +1009,20 @@ fn the_exact_id_and_a_node_that_proved_it_share_one_place_at_most() {
 /// ordinary slot free for the first node, the call is granted.
 #[test]
 fn a_caller_that_makes_another_gateway_ambiguous_adds_no_slot_above_the_ordinary_limit() {
+    assert_disputed_gateway_limit(40, false, SlotRefusal::Hold);
+}
+
+/// Reclassifying an existing inbound gateway must also leave the outbound reserve free.
+#[test]
+fn a_gateway_proof_preserves_the_ordinary_inbound_share() {
+    assert_disputed_gateway_limit(
+        without_outbound_reserve(40),
+        true,
+        SlotRefusal::InboundShare,
+    );
+}
+
+fn assert_disputed_gateway_limit(peer_count: usize, inbound: bool, refusal: SlotRefusal) {
     let handler = handler(40, 2);
     let (exact, second, other) = (new_node(), new_node(), new_node());
     let proved = [exact];
@@ -1019,29 +1033,32 @@ fn a_caller_that_makes_another_gateway_ambiguous_adds_no_slot_above_the_ordinary
         (other, GatewayStanding::Dialable),
     ];
     publish(&handler, &ranking);
-    let mut peers = fill(&handler, 40, false);
+    let mut peers = fill(&handler, peer_count, inbound);
     let _exact = handler.claim_connection(exact, true).expect("held place");
     let one_held = SlotSplit {
         preferred: 1,
-        ordinary: 40,
-        ordinary_inbound: 0,
+        ordinary: peer_count,
+        ordinary_inbound: if inbound { peer_count } else { 0 },
     };
     assert_eq!(split(&handler), one_held);
     assert_eq!(preferred_set(&handler), [exact, second]);
 
-    assert_eq!(
-        handler.claim_slot(caller, true).map(drop),
-        Err(SlotRefusal::Hold)
-    );
+    assert_eq!(handler.claim_slot(caller, true).map(drop), Err(refusal));
     assert_eq!(split(&handler), one_held, "the refusal changed nothing");
     assert_eq!(preferred_set(&handler), [exact, second]);
     // A dial that reached the second node meets the same limit.
     let mut dial = handler
         .claim_connection(second, false)
         .expect("the second gateway's held place");
-    assert_eq!(dial.outbound_connected(caller), Err(SlotRefusal::Hold));
+    assert_eq!(dial.outbound_connected(caller), Err(refusal));
+    assert_eq!(preferred_set(&handler), [exact, second]);
     drop(dial);
     assert_eq!(split(&handler), one_held);
+    assert_eq!(
+        preferred_set(&handler),
+        [exact, other],
+        "the closed dial enters backoff"
+    );
 
     peers.pop();
     let _second = handler
@@ -1051,8 +1068,8 @@ fn a_caller_that_makes_another_gateway_ambiguous_adds_no_slot_above_the_ordinary
         split(&handler),
         SlotSplit {
             preferred: 1,
-            ordinary: 40,
-            ordinary_inbound: 1,
+            ordinary: peer_count,
+            ordinary_inbound: if inbound { peer_count } else { 1 },
         }
     );
     assert_eq!(preferred_set(&handler), [second, other]);

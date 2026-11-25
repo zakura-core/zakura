@@ -938,13 +938,15 @@ is today's Zakura logic.
      answers keeps under its own ID when its handshake proved the gateway's
      ID (DIAL-10). A dial charged to the last authenticated ID can be
      answered by a node that didn't, and a second connected node of one key
-     holder makes its gateway ambiguous. When the slot would then be an
-     ordinary one and no ordinary slot is free, the dial MUST close before
-     its control handshake and end as a local limit, with no failure
-     recorded. Otherwise one gateway could answer each dial under a new ID
-     and turn every held place into an ordinary slot of its own. A dial to
-     an ID known to have moved first claims under the last authenticated ID. For
-     discovery, both this claim and a move that adds an ordinary slot MUST
+     holder makes its gateway ambiguous. When counting a displaced slot
+     as ordinary would exceed the ordinary cap or its inbound share,
+     the dial MUST close before its control handshake. Discovery records a
+     local limit. A maintained dial counts the completed TLS attempt as a
+     failure for its retry policy. Otherwise one gateway could answer each
+     dial under a new ID and turn every held place into an ordinary slot of
+     its own. A dial to an ID known to have moved first claims under the last
+     authenticated ID. For discovery, both this claim and a move that adds an
+     ordinary slot MUST
      respect the ordinary discovery ceiling that leaves room for bootstrap.
      If ordinary capacity is full, a preferred gateway may retry under its
      original ID once per 30 seconds. The node that answers keeps the place
@@ -1007,10 +1009,10 @@ is today's Zakura logic.
      once towards the hold and the node fills one place. While a dial to
      the earlier ID is in flight, the gateway goes on naming that ID and
      the dial settles it. A proof that makes a gateway ambiguous leaves
-     its member's slot an ordinary one. When that would add an ordinary
-     slot above the ordinary limit, a caller is refused its slot and a
-     dial closes as DIAL-9 says, whichever place the new node itself would
-     fill.
+     its member's slot an ordinary one. If this increases the ordinary
+     total or the ordinary inbound count beyond its respective limit,
+     a caller is refused its slot and a dial closes as DIAL-9 says,
+     whichever place the new node itself would fill.
 
   The proven IDs are kept while the connection holds its slot or its
   registration, at most 3 for each. An inbound moved peer isn't linked to

@@ -6629,8 +6629,8 @@ pub(crate) async fn serve_reported_native_dial_connection(
     let proven = ProvenNode::new(remote_node_id, &earlier);
     if admission.outbound_connected(proven).is_err() {
         // The dial claimed a held place for a gateway the node doesn't
-        // answer for, or the node makes its gateway ambiguous, and no
-        // ordinary slot is free.
+        // answer for, or the node makes its gateway ambiguous. Counting
+        // the displaced slot as ordinary would exceed the cap or its inbound share.
         metrics::counter!("zakura.p2p.conn.dial.refused.hold").increment(1);
         #[cfg(any(test, zakura_sim))]
         endpoint

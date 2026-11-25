@@ -342,8 +342,8 @@ impl HandshakeCounts {
     ///
     /// A caller that makes a gateway ambiguous is not outranking anyone: a
     /// second node of one key holder answers for the gateway. It is refused
-    /// when the member's slot would then be an ordinary one above `cap`, as
-    /// a dial is in [`Self::outbound_connected`].
+    /// if counting the member as ordinary would exceed the ordinary cap
+    /// or its inbound share, as for a dial in [`Self::outbound_connected`].
     pub fn claim_inbound_connection(
         &mut self,
         caller: ProvenNode<'_>,
@@ -379,8 +379,8 @@ impl HandshakeCounts {
     /// under the ID it has now. A dial that claimed a held place for a
     /// gateway the node doesn't answer for loses it, and a node that makes
     /// a gateway ambiguous turns its member's slot into an ordinary one.
-    /// The dial is refused, and nothing is recorded, when that would add an
-    /// ordinary slot above `cap`.
+    /// The dial is refused, and nothing is recorded, when that would increase
+    /// the ordinary total or its inbound share beyond its limit.
     pub(crate) fn outbound_connected(
         &mut self,
         claimed: NodeId,

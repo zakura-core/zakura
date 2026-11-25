@@ -162,21 +162,28 @@ impl NodeKeyList {
         self.id
     }
 
-    /// Whether `id` names this list, or a prefix of it that keeps every
-    /// entry tagged in `required` (TLS-7).
+    /// The node IDs of this list and of each prefix of it that keeps every
+    /// entry tagged in `required` (TLS-7), the list's own ID first and then
+    /// its prefixes, shortest first. Empty when this list lacks a required
+    /// tag.
     ///
     /// A node only ever adds a key under a tag above those it holds, so each
     /// list it has had is a prefix of the one it has now, and it is still
     /// the node its earlier, shorter list named. `required` holds the tags
     /// of the keys that prove it: an ID whose list leaves one of them out is
-    /// not proven by them. False when this list lacks a required tag.
+    /// not proven by them. This is the one place that says which shorter
+    /// lists a list stands for, so a dial's check and a connection's report
+    /// can't disagree.
     ///
     /// Costs at most one hash per entry.
-    pub(crate) fn contains_list_named(&self, id: NodeId, required: &[u16]) -> bool {
-        let Some(shortest) = self.shortest_prefix_keeping(required) else {
-            return false;
-        };
-        id == self.id || self.earlier_ids(shortest).any(|earlier| earlier == id)
+    pub(crate) fn ids_of_lists_keeping<'a>(
+        &'a self,
+        required: &'a [u16],
+    ) -> impl Iterator<Item = NodeId> + 'a {
+        self.shortest_prefix_keeping(required)
+            .map(|shortest| std::iter::once(self.id).chain(self.earlier_ids(shortest)))
+            .into_iter()
+            .flatten()
     }
 
     /// The length of the shortest prefix that keeps every entry tagged in
@@ -237,6 +244,12 @@ mod tests {
 
     fn key() -> NodeKey {
         NodeKey::from_bytes(&KEY).expect("the RFC 8032 key is valid")
+    }
+
+    /// Whether `id` names `list`, or a list of some of its entries that
+    /// keeps every entry tagged in `required`.
+    fn contains_list_named(list: &NodeKeyList, id: NodeId, required: &[u16]) -> bool {
+        list.ids_of_lists_keeping(required).any(|named| named == id)
     }
 
     // The digests were computed with Python's `hashlib.blake2b`, so they
@@ -367,40 +380,41 @@ mod tests {
             node_id(&kept)
         };
 
-        assert!(list.contains_list_named(list.node_id(), &required));
+        assert!(contains_list_named(&list, list.node_id(), &required));
         for kept in [&[0, 1, 2][..], &[0, 1, 2, 3]] {
             assert!(
-                list.contains_list_named(named(kept), &required),
+                contains_list_named(&list, named(kept), &required),
                 "the prefix {kept:?} keeps both required tags"
             );
         }
         for kept in [&[0][..], &[0, 1]] {
             assert!(
-                !list.contains_list_named(named(kept), &required),
+                !contains_list_named(&list, named(kept), &required),
                 "the prefix {kept:?} leaves a required tag out"
             );
         }
         // Lists of the entries, in their order, that are not prefixes.
         for kept in [&[2][..], &[0, 3], &[1, 2, 3], &[0, 1, 3], &[1, 3]] {
             assert!(
-                !list.contains_list_named(named(kept), &required),
+                !contains_list_named(&list, named(kept), &required),
                 "{kept:?} is not a prefix"
             );
-            assert!(!list.contains_list_named(named(kept), &[]));
+            assert!(!contains_list_named(&list, named(kept), &[]));
         }
         // Not lists at all: no entries, entries out of order, one repeated.
         for kept in [&[][..], &[1, 0], &[0, 0, 1], &[0, 1, 1], &[3, 2, 1, 0]] {
             assert!(
-                !list.contains_list_named(named(kept), &required),
+                !contains_list_named(&list, named(kept), &required),
                 "{kept:?} is not a list of the entries in their order"
             );
-            assert!(!list.contains_list_named(named(kept), &[]));
+            assert!(!contains_list_named(&list, named(kept), &[]));
         }
         // With nothing required, every prefix is contained.
-        assert!(list.contains_list_named(named(&[0]), &[]));
-        assert!(list.contains_list_named(named(&[0, 1]), &[]));
-        assert!(!list.contains_list_named(named(&[]), &[]));
-        assert!(!list.contains_list_named(
+        assert!(contains_list_named(&list, named(&[0]), &[]));
+        assert!(contains_list_named(&list, named(&[0, 1]), &[]));
+        assert!(!contains_list_named(&list, named(&[]), &[]));
+        assert!(!contains_list_named(
+            &list,
             NodeKeyList::from_entries([UNKNOWN])
                 .expect("one entry is a list")
                 .node_id(),
@@ -424,7 +438,7 @@ mod tests {
             assert!(required
                 .iter()
                 .all(|tag| sublist.entries.iter().any(|(held, _)| held == tag)));
-            assert!(!list.contains_list_named(sublist.node_id(), &required));
+            assert!(!contains_list_named(&list, sublist.node_id(), &required));
         }
     }
 
@@ -468,17 +482,17 @@ mod tests {
                     let is_prefix = (kept_mask + 1).is_power_of_two();
                     let keeps_required = required_mask & !kept_mask == 0;
                     assert_eq!(
-                        list.contains_list_named(id, &required),
+                        contains_list_named(&list, id, &required),
                         is_prefix && keeps_required,
                         "{size} entries, required {required_mask:#08b}, kept {kept_mask:#08b}"
                     );
-                    assert!(!list.contains_list_named(id, &with_absent));
+                    assert!(!contains_list_named(&list, id, &with_absent));
                     // Every prefix holds the first entry, whose value
                     // differs in `other`, so this list contains none of
                     // that list's sublists.
                     if kept_mask & 1 != 0 {
                         let foreign = node_id(&picked(&other, kept_mask));
-                        assert!(!list.contains_list_named(foreign, &required));
+                        assert!(!contains_list_named(&list, foreign, &required));
                     }
                     checked += 1;
                     contained += usize::from(is_prefix && keeps_required);
@@ -504,10 +518,10 @@ mod tests {
         for length in 1..=entries.len() {
             let prefix = &entries[..length];
             let id = node_id(prefix);
-            assert!(list.contains_list_named(id, &[]));
+            assert!(contains_list_named(&list, id, &[]));
             for (index, (tag, _)) in entries.iter().enumerate() {
                 assert_eq!(
-                    list.contains_list_named(id, &[ED25519_KEY_TAG, *tag]),
+                    contains_list_named(&list, id, &[ED25519_KEY_TAG, *tag]),
                     index < length,
                     "a prefix of {length} entries and the required entry {index}"
                 );
@@ -517,14 +531,17 @@ mod tests {
                 dropped.remove(index);
                 // Dropping the last entry leaves a shorter prefix.
                 let is_prefix = index + 1 == length && length > 1;
-                assert_eq!(list.contains_list_named(node_id(&dropped), &[]), is_prefix);
+                assert_eq!(
+                    contains_list_named(&list, node_id(&dropped), &[]),
+                    is_prefix
+                );
                 let mut changed = prefix.to_vec();
                 changed[index].1[0] ^= 1;
-                assert!(!list.contains_list_named(node_id(&changed), &[]));
+                assert!(!contains_list_named(&list, node_id(&changed), &[]));
                 if index + 1 < length {
                     let mut swapped = prefix.to_vec();
                     swapped.swap(index, index + 1);
-                    assert!(!list.contains_list_named(node_id(&swapped), &[]));
+                    assert!(!contains_list_named(&list, node_id(&swapped), &[]));
                 }
             }
         }
@@ -553,8 +570,16 @@ mod tests {
     #[test]
     fn a_list_without_a_required_entry_contains_no_list() {
         let list = NodeKeyList::single(key());
-        assert!(list.contains_list_named(list.node_id(), &[ED25519_KEY_TAG]));
-        assert!(!list.contains_list_named(list.node_id(), &[ED25519_KEY_TAG, 3]));
+        assert!(contains_list_named(
+            &list,
+            list.node_id(),
+            &[ED25519_KEY_TAG]
+        ));
+        assert!(!contains_list_named(
+            &list,
+            list.node_id(),
+            &[ED25519_KEY_TAG, 3]
+        ));
     }
 
     #[test]

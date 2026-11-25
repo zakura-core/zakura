@@ -30,8 +30,8 @@ pub(super) const REPUBLISH_INTERVAL: Duration = Duration::from_secs(60);
 /// Starts the task that counts the gateways named in recent best-chain blocks,
 /// reports the counts as metrics and hands the ranking to `publisher`.
 ///
-/// `local_gateway` is the gateway ID this node's own coinbases name, if it announces one. The
-/// tracker reports how many counted blocks name it.
+/// `local_gateway` is the gateway ID this node's coinbases name when it runs the miner mesh:
+/// its own, or the relay node it names. The tracker reports how many counted blocks name it.
 ///
 /// The task runs until the state stops publishing tip changes.
 pub fn spawn<S, Tip>(

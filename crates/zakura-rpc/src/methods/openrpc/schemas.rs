@@ -455,6 +455,10 @@ impl RpcSchema for GetMinerMeshInfoResponse {
             "properties": {
                 "node_id": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$" },
                 "announcing": generator.subschema_for::<bool>(),
+                "announced_gateways": {
+                    "type": "array",
+                    "items": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+                },
                 "mining": generator.subschema_for::<bool>(),
                 "synced": generator.subschema_for::<bool>(),
                 "window": generator.subschema_for::<Option<MeshWindow>>(),
@@ -463,7 +467,7 @@ impl RpcSchema for GetMinerMeshInfoResponse {
                 "slots": generator.subschema_for::<Option<MeshSlots>>(),
                 "peers": generator.subschema_for::<Vec<MeshPeer>>(),
             },
-            "required": ["node_id", "announcing", "mining", "synced", "window", "gateways", "hold", "slots", "peers"],
+            "required": ["node_id", "announcing", "announced_gateways", "mining", "synced", "window", "gateways", "hold", "slots", "peers"],
         })
     }
 }

@@ -44,7 +44,7 @@ const fn node_id(hex: &[u8]) -> [u8; 32] {
 fn node() -> MeshNode {
     MeshNode {
         node_id: Some(LOCAL_NODE),
-        announcing: true,
+        announced_gateway: Some(GatewayId::from_node_id(&LOCAL_NODE)),
         mining: true,
         synced: true,
     }
@@ -155,11 +155,50 @@ fn gateways_report_their_20_byte_id_and_peers_their_whole_node_id() {
 }
 
 #[test]
+fn a_node_that_names_its_relay_reports_the_relay_as_its_announced_gateway() {
+    let relay = GatewayId::from_node_id(&PREFERRED_GATEWAY);
+    let response = GetMinerMeshInfoResponse::new(
+        MeshNode {
+            announced_gateway: Some(relay),
+            ..node()
+        },
+        Some(&coverage()),
+        Some(&places()),
+    );
+
+    assert!(response.announcing);
+    assert_eq!(response.announced_gateways, vec![relay.to_string()]);
+    assert_eq!(
+        response.node_id,
+        Some(hex::encode(LOCAL_NODE)),
+        "the node still reports its own node ID"
+    );
+}
+
+#[test]
+fn a_relay_that_prefers_gateways_reports_its_window_without_announcing() {
+    let response = GetMinerMeshInfoResponse::new(
+        MeshNode {
+            announced_gateway: None,
+            mining: false,
+            ..node()
+        },
+        Some(&coverage()),
+        Some(&places()),
+    );
+
+    assert!(!response.announcing);
+    assert!(response.announced_gateways.is_empty());
+    assert_eq!(response.window, Some(MeshWindow::from(&coverage())));
+    assert_eq!(response.hold, 1);
+}
+
+#[test]
 fn a_node_without_counts_or_v2_networking_reports_neither() {
     let response = GetMinerMeshInfoResponse::new(
         MeshNode {
             node_id: None,
-            announcing: false,
+            announced_gateway: None,
             mining: false,
             synced: false,
         },
@@ -168,6 +207,8 @@ fn a_node_without_counts_or_v2_networking_reports_neither() {
     );
 
     assert_eq!(response.node_id, None);
+    assert!(!response.announcing);
+    assert!(response.announced_gateways.is_empty());
     assert_eq!(response.window, None);
     assert!(response.gateways.is_empty());
     assert_eq!(response.hold, 0);

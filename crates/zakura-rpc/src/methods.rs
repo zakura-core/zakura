@@ -846,8 +846,9 @@ pub trait RpcServer {
     ///
     /// # Notes
     ///
-    /// A mining node counts the gateways that recent best-chain coinbases
-    /// name, and while it is synced, v2 networking holds up to ten connection
+    /// A node that prefers gateways, because it mines or sets
+    /// `mining.miner_mesh`, counts the gateways that recent best-chain
+    /// coinbases name, and while it is synced, v2 networking holds up to ten connection
     /// places that ordinary peers cannot fill for the highest-ranked gateways
     /// it can reach. Each gateway's `state` is `preferred` when it may fill a
     /// held place, `standby` when it is reachable but ranked below those,
@@ -862,8 +863,11 @@ pub trait RpcServer {
     /// `synced` is evaluated at request time. The ranking and held places reflect
     /// the last update applied by networking and can lag a change in tip freshness.
     ///
-    /// `window` is null on a node that does not mine, and `slots` is null on
-    /// a node that runs no v2 networking.
+    /// `announced_gateways` lists the gateway IDs this node's coinbases name:
+    /// its own, or the relay `mining.miner_mesh_gateways` names.
+    ///
+    /// `window` is null on a node that does not prefer gateways, and `slots`
+    /// is null on a node that runs no v2 networking.
     #[method(name = "getminermeshinfo")]
     async fn get_miner_mesh_info(&self) -> Result<GetMinerMeshInfoResponse>;
 
@@ -2146,7 +2150,8 @@ where
 
     /// Makes every coinbase this node builds name the gateway in `commitment`.
     ///
-    /// The node passes its own v2 node ID when `mining.miner_mesh` is set.
+    /// When `mining.miner_mesh` is set, the node passes the gateway
+    /// `mining.miner_mesh_gateways` names, or else its own v2 node ID.
     pub fn with_mesh_commitment(mut self, commitment: MinerMeshCommitment) -> Self {
         self.gbt.set_mesh_commitment(commitment);
         self
@@ -4338,7 +4343,9 @@ where
             node_id: endpoint
                 .as_ref()
                 .map(|endpoint| *endpoint.local_node_id().as_bytes()),
-            announcing: miner_params.is_some_and(|params| params.mesh_commitment().is_some()),
+            announced_gateway: miner_params
+                .and_then(|params| params.mesh_commitment())
+                .map(|commitment| commitment.gateway_id()),
             mining: miner_params.is_some(),
             synced: synced_to_tip(&self.network, &self.latest_chain_tip).is_ok(),
         };

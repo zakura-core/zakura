@@ -5,7 +5,10 @@
 //! v2 networking uses, and the v2 peers registered now.
 
 use tokio::sync::watch;
-use zakura_chain::{block::Height, miner_mesh::MinerSetCoverage};
+use zakura_chain::{
+    block::Height,
+    miner_mesh::{GatewayId, MinerSetCoverage},
+};
 use zakura_network::zakura::{
     ConnectedPeer, ConnectionPlaces, GatewayPlace, PlacedGateway, ZakuraEndpoint,
 };
@@ -20,7 +23,7 @@ mod tests;
 #[derive(Clone, Debug, Default)]
 pub struct MinerMeshSources {
     /// How much of its window the gateway counter has read, when this node
-    /// counts gateways, which it does when it mines.
+    /// counts gateways, which it does when it prefers them.
     pub coverage: Option<watch::Receiver<MinerSetCoverage>>,
     /// The v2 endpoint, when this node runs v2 networking.
     pub endpoint: Option<ZakuraEndpoint>,
@@ -31,8 +34,9 @@ pub struct MinerMeshSources {
 pub struct MeshNode {
     /// This node's v2 node ID, when it runs v2 networking.
     pub node_id: Option<[u8; 32]>,
-    /// Whether the coinbases this node builds name its gateway.
-    pub announcing: bool,
+    /// The gateway the coinbases this node builds name, if they name one:
+    /// this node itself, or the node `mining.miner_mesh_gateways` names.
+    pub announced_gateway: Option<GatewayId>,
     /// Whether this node builds blocks: it has a miner address.
     pub mining: bool,
     /// Whether the best tip is recent enough for the node to prefer
@@ -48,9 +52,14 @@ pub struct GetMinerMeshInfoResponse {
     /// This node's v2 node ID in hex, or null when it runs no v2 networking.
     pub node_id: Option<String>,
 
-    /// Whether the coinbases this node builds name its gateway
+    /// Whether the coinbases this node builds name a gateway
     /// (`mining.miner_mesh` with a miner address).
     pub announcing: bool,
+
+    /// The gateway IDs the coinbases this node builds name, in hex: this
+    /// node's own, or the one `mining.miner_mesh_gateways` names. Empty when
+    /// the node does not announce, and at most one entry for now.
+    pub announced_gateways: Vec<String>,
 
     /// Whether this node builds blocks: it has a miner address.
     pub mining: bool,
@@ -60,7 +69,7 @@ pub struct GetMinerMeshInfoResponse {
     pub synced: bool,
 
     /// The blocks counted, or null when this node does not count gateways
-    /// because it does not mine.
+    /// because it does not prefer them.
     pub window: Option<MeshWindow>,
 
     /// The last ranking applied by v2 networking, best first, at most 256.
@@ -186,13 +195,14 @@ impl GetMinerMeshInfoResponse {
     ) -> Self {
         let MeshNode {
             node_id,
-            announcing,
+            announced_gateway,
             mining,
             synced,
         } = node;
         Self {
             node_id: node_id.map(hex::encode),
-            announcing,
+            announcing: announced_gateway.is_some(),
+            announced_gateways: announced_gateway.iter().map(ToString::to_string).collect(),
             mining,
             synced,
             window: coverage.map(MeshWindow::from),

@@ -5,6 +5,7 @@ expression: get_miner_mesh_info
 {
   "node_id": null,
   "announcing": false,
+  "announced_gateways": [],
   "mining": true,
   "synced": true,
   "window": null,

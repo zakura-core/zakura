@@ -5,6 +5,9 @@ expression: response
 {
   "node_id": "2840d419ac18afd23ff4ffe3ba55fb67b620379394c054260ae223adf3d136c7",
   "announcing": true,
+  "announced_gateways": [
+    "2840d419ac18afd23ff4ffe3ba55fb67b6203793"
+  ],
   "mining": true,
   "synced": true,
   "window": {

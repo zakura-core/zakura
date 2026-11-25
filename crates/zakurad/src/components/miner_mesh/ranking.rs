@@ -22,11 +22,13 @@ mod tests;
 pub const MIN_GATEWAY_BLOCKS: u32 = 10;
 
 /// Returns the gateway ranking the network reads, and the publisher that
-/// fills it when the node mines (`is_mining`, set by `mining.miner_address`).
+/// fills it when the node prefers gateways (`prefers_gateways`: it mines, or
+/// it runs the miner mesh as a relay).
 ///
-/// A node that does not mine gets no publisher, so its ranking stays empty.
+/// A node that does not prefer gateways gets no publisher, so its ranking
+/// stays empty.
 pub fn ranking_channel<Tip: ChainTip>(
-    is_mining: bool,
+    prefers_gateways: bool,
     network: Network,
     latest_chain_tip: Tip,
 ) -> (
@@ -34,7 +36,7 @@ pub fn ranking_channel<Tip: ChainTip>(
     Option<RankingPublisher<Tip>>,
 ) {
     let (sender, receiver) = watch::channel(MinerGatewayRanking::default());
-    let publisher = is_mining.then(|| RankingPublisher {
+    let publisher = prefers_gateways.then(|| RankingPublisher {
         coverage: watch::channel(MinerSetCoverage::default()).0,
         network,
         latest_chain_tip,
@@ -43,7 +45,7 @@ pub fn ranking_channel<Tip: ChainTip>(
     (receiver, publisher)
 }
 
-/// Hands the network the gateways a synced mining node prefers to stay
+/// Hands the network the gateways a synced node prefers to stay
 /// connected to, and keeps how much of the window is read for
 /// `getminermeshinfo`.
 ///

@@ -421,10 +421,14 @@ from a peer's `HeaderMeta` (bpv1-88). A peer that gets the solved body early,
 such as over legacy relay before the proposer commits, can rebuild that
 metadata from the body alone. When the node's miner then publishes the block,
 the node keeps the admitted block and its state on each connection, takes
-every part, and ends the block's collection, verification, and body claim. It
-then sends `BlockDone` and its seeds as if it had admitted the block first. It
-never sends a second `HeaderMeta` on a connection (bpv1-4), and it announces
-nothing for the block from then on (decision-20). A block the node already
+every part, and ends the block's collection, verification, and body claim.
+Releasing the claim wakes block sync, which fetches the body only if the
+node's own commit fails. The node then sends `BlockDone` and its seeds as if
+it had admitted the block first, except for an index it already announced on
+a connection: a second `Have` for that index would close the connection
+(bpv1-25), so that neighbour pulls the part instead. It never sends a second
+`HeaderMeta` on a connection (bpv1-4), and it announces nothing for the block
+from then on (decision-20). A block the node already
 retired stays retired, and the node does not seed it.
 
 Two hops push. The proposer pushes seeds to its neighbours, and each holder

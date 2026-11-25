@@ -1298,6 +1298,66 @@ fn bpv1_88_a_peer_admitted_session_takes_the_proposer_role() {
     }
 }
 
+/// bpv1-88: after a takeover, a session seeds only the indices it never
+/// announced on its connection. An index it announced with a plain `Have`
+/// as a holder cannot carry a flagged `Have` too: the peer closes on a
+/// second `Have` for one index (bpv1-25, close-16), and on an unflagged part
+/// it never asked for (close-14). The peer already knows this node holds
+/// that part, so it pulls it. Every other seed goes out.
+#[test]
+fn bpv1_88_a_takeover_seeds_only_indices_the_session_never_announced() {
+    let encoded = encode_body(&Profile::TINY, &[0x5B; 64], 2).unwrap();
+    let block_id = block::Hash([0x5A; 32]);
+    let t0 = Instant::now();
+    let mut peer = session(
+        node_id(2),
+        t0,
+        PeerInput::BlockAdmitted(block_admitted(block_id, encoded.coding, node_id(1))),
+    );
+    // As a holder, the session announces a part it verified.
+    let mut steps = vec![peer.step(t0, ready(block_id, vec![0], false))];
+    steps.push(peer.step(t0 + Duration::from_secs(1), PeerInput::Tick));
+    assert!(
+        steps.iter().flat_map(|s| &s.outputs).any(|o| matches!(
+            o,
+            PeerOutput::SendHave { flags: HaveFlags::Plain, indices, .. } if indices == &[0]
+        )),
+        "the holder announces index 0: {steps:?}"
+    );
+
+    let t1 = t0 + Duration::from_secs(1);
+    peer.step(t1, proposing(block_id, encoded.coding));
+    let seeded = peer.step(
+        t1,
+        PeerInput::Seeds(Seeds {
+            block_id,
+            seeds: [0, 1]
+                .map(|i| Seed {
+                    part: encoded.parts[i].clone(),
+                    relay: true,
+                })
+                .to_vec(),
+            copies: Vec::new(),
+        }),
+    );
+    assert!(
+        matches!(
+            seeded.outputs.as_slice(),
+            [
+                PeerOutput::SendHave {
+                    flags: HaveFlags::Relay,
+                    indices,
+                    ..
+                },
+                PeerOutput::SendSeedPart { part, .. }
+            ] if indices == &[1] && part.index() == 1
+        ),
+        "only the unannounced seed goes out: {:?}",
+        seeded.outputs
+    );
+    peer.assert_invariants();
+}
+
 /// bpv1-88: a session takes the proposer role only for the proposer the
 /// block already names. An admission that names another node leaves the
 /// session a holder, so it never seeds or flags parts to the named proposer

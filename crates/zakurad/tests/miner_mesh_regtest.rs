@@ -145,6 +145,9 @@ async fn pools_form_a_mesh() -> Result<()> {
 /// the template node itself, which holds a place for it. The relay mines
 /// nothing, yet counts the blocks and prefers the other pool's gateway. The
 /// template node is ranked nowhere, since no block names it.
+///
+/// Only the template node, which builds coinbases, reports that it announces.
+/// Both report the blocks that name the relay, the gateway they stand for.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "starts zakurad children: run with the miner-mesh-regtest nextest profile"]
 async fn a_pool_names_its_relay_as_its_gateway() -> Result<()> {
@@ -217,6 +220,20 @@ async fn a_pool_names_its_relay_as_its_gateway() -> Result<()> {
         net.view(HUB).ranking().is_empty(),
         "a relay without the miner mesh ranks nothing"
     );
+
+    #[cfg(feature = "prometheus")]
+    for (node, announcing) in [(TEMPLATE, 1.0), (RELAY, 0.0)] {
+        assert_eq!(
+            net.gauge(node, "mining_mesh_announcing").await?,
+            Some(announcing),
+            "node {node}'s metric agrees with its getminermeshinfo report"
+        );
+        assert_eq!(
+            net.gauge(node, "mining_mesh_gateway_local_blocks").await?,
+            Some(f64::from(MIN_GATEWAY_BLOCKS)),
+            "node {node} counts the blocks that name the relay"
+        );
+    }
 
     Ok(())
 }

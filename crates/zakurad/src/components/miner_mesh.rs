@@ -17,4 +17,4 @@ mod tracker;
 mod tests;
 
 pub use ranking::ranking_channel;
-pub use tracker::spawn;
+pub use tracker::{spawn, LocalGateway};

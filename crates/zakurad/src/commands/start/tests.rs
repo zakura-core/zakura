@@ -3,7 +3,7 @@ use tokio_util::sync::CancellationToken;
 use zakura_chain::{block, miner_mesh::GatewayId};
 
 use super::{error_exit_status, supervise_block_sync_driver, NodeTasks, StartCmd};
-use crate::components::zcashd_compat;
+use crate::components::{miner_mesh::LocalGateway, zcashd_compat};
 use crate::config::ZakuradConfig;
 use zakura_network::types::PeerServices;
 use zakura_network::P2pStack;
@@ -306,49 +306,93 @@ fn a_relay_without_a_miner_address_needs_v2() {
     );
 }
 
-#[test]
-fn coinbases_name_the_configured_gateway_before_the_node_itself() {
-    let own_node_id = [0x07; 32];
+/// A node that runs the miner mesh and builds coinbases.
+fn announcing_config() -> ZakuradConfig {
     let mut config = ZakuradConfig::default();
-
-    assert_eq!(
-        StartCmd::announced_gateway(&config, Some(&own_node_id)).unwrap(),
-        None,
-        "a node without the miner mesh names no gateway"
-    );
-
     config.mining.miner_mesh = true;
+    config.mining.miner_address = Some(
+        "t1bmMa1wJDFdbc2TiURQP5BbBz6jHjUBuHq"
+            .parse()
+            .expect("a valid transparent address"),
+    );
+    config
+}
+
+const OWN_NODE_ID: [u8; 32] = [0x07; 32];
+
+#[test]
+fn a_node_without_the_miner_mesh_announces_and_stands_for_nothing() {
+    let mut config = announcing_config();
+    config.mining.miner_mesh = false;
+
     assert_eq!(
-        StartCmd::announced_gateway(&config, Some(&own_node_id)).unwrap(),
-        Some(GatewayId::from_node_id(&own_node_id)),
+        StartCmd::local_mesh_gateway(&config, Some(&OWN_NODE_ID)).unwrap(),
+        LocalGateway::default(),
+    );
+}
+
+#[test]
+fn a_miner_names_itself_unless_it_names_a_relay() {
+    let mut config = announcing_config();
+    let own = Some(GatewayId::from_node_id(&OWN_NODE_ID));
+    assert_eq!(
+        StartCmd::local_mesh_gateway(&config, Some(&OWN_NODE_ID)).unwrap(),
+        LocalGateway {
+            announced: own,
+            stands_for: own,
+        },
     );
     assert!(
-        StartCmd::announced_gateway(&config, None).is_err(),
+        StartCmd::local_mesh_gateway(&config, None).is_err(),
         "a node that names itself needs its v2 node ID"
     );
 
     config.mining.miner_mesh_gateways = vec![RELAY];
+    let relay = LocalGateway {
+        announced: Some(RELAY),
+        stands_for: Some(RELAY),
+    };
     assert_eq!(
-        StartCmd::announced_gateway(&config, Some(&own_node_id)).unwrap(),
-        Some(RELAY),
+        StartCmd::local_mesh_gateway(&config, Some(&OWN_NODE_ID)).unwrap(),
+        relay,
+        "the configured relay comes before the node itself"
     );
     assert_eq!(
-        StartCmd::announced_gateway(&config, None).unwrap(),
-        Some(RELAY),
+        StartCmd::local_mesh_gateway(&config, None).unwrap(),
+        relay,
         "a node naming its relay needs no v2 endpoint"
+    );
+}
+
+/// A node with no miner address builds no coinbase, so it announces nothing. A relay that
+/// names itself still stands for itself, so it counts the blocks that name it.
+#[test]
+fn a_node_without_a_miner_address_announces_nothing() {
+    let mut config = announcing_config();
+    config.mining.miner_address = None;
+    assert_eq!(
+        StartCmd::local_mesh_gateway(&config, Some(&OWN_NODE_ID)).unwrap(),
+        LocalGateway {
+            announced: None,
+            stands_for: Some(GatewayId::from_node_id(&OWN_NODE_ID)),
+        },
+    );
+
+    config.mining.miner_mesh_gateways = vec![RELAY];
+    assert_eq!(
+        StartCmd::local_mesh_gateway(&config, None).unwrap(),
+        LocalGateway::default(),
+        "a template node with no miner address names its relay in no coinbase"
     );
 }
 
 #[test]
 fn a_miner_or_a_node_running_the_miner_mesh_prefers_gateways() {
-    let miner_address = "t1bmMa1wJDFdbc2TiURQP5BbBz6jHjUBuHq"
-        .parse()
-        .expect("a valid transparent address");
     let mut config = ZakuradConfig::default();
     config.mining.miner_address = None;
     assert!(!StartCmd::prefers_gateways(&config));
 
-    config.mining.miner_address = Some(miner_address);
+    config.mining.miner_address = announcing_config().mining.miner_address;
     assert!(StartCmd::prefers_gateways(&config));
 
     config.mining.miner_address = None;

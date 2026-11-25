@@ -741,6 +741,27 @@ impl RegtestNet {
     /// Reads the total for a Prometheus counter across all labels.
     #[cfg(feature = "prometheus")]
     pub async fn counter(&self, node: usize, name: &str) -> Result<u64> {
+        let mut total = 0;
+        for value in self.metric_values(node, name).await? {
+            total += value.parse::<u64>()?;
+        }
+        Ok(total)
+    }
+
+    /// Reads a Prometheus gauge without labels, or `None` when the node has
+    /// not set it.
+    #[cfg(feature = "prometheus")]
+    pub async fn gauge(&self, node: usize, name: &str) -> Result<Option<f64>> {
+        match self.metric_values(node, name).await?.as_slice() {
+            [] => Ok(None),
+            [value] => Ok(Some(value.parse()?)),
+            values => Err(eyre!("node {node} reports {name} {} times", values.len())),
+        }
+    }
+
+    /// The value of every series of the Prometheus metric `name` on `node`.
+    #[cfg(feature = "prometheus")]
+    async fn metric_values(&self, node: usize, name: &str) -> Result<Vec<String>> {
         let response = self.nodes[node].metrics.get().await?;
         eyre::ensure!(
             response.status().is_success(),
@@ -748,15 +769,12 @@ impl RegtestNet {
             response.status()
         );
         let body = std::str::from_utf8(response.body())?;
-        let mut total = 0;
-        for line in body.lines() {
-            if let Some((series, value)) = line.split_once(' ') {
-                if series.split('{').next() == Some(name) {
-                    total += value.trim().parse::<u64>()?;
-                }
-            }
-        }
-        Ok(total)
+        Ok(body
+            .lines()
+            .filter_map(|line| line.split_once(' '))
+            .filter(|(series, _)| series.split('{').next() == Some(name))
+            .map(|(_, value)| value.trim().to_owned())
+            .collect())
     }
 
     /// Mines `count` blocks on `node`, a few per RPC request.

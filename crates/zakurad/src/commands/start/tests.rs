@@ -1,6 +1,6 @@
 use eyre::eyre;
 use tokio_util::sync::CancellationToken;
-use zakura_chain::block;
+use zakura_chain::{block, miner_mesh::GatewayId};
 
 use super::{error_exit_status, supervise_block_sync_driver, NodeTasks, StartCmd};
 use crate::components::zcashd_compat;
@@ -220,6 +220,140 @@ fn announcing_a_gateway_requires_a_key_that_survives_restarts() {
         !config.network.identity_dir.exists(),
         "startup must not generate a replacement key"
     );
+}
+
+/// A start command with no flags, for checking a config the way `zakurad start` does.
+fn plain_start() -> StartCmd {
+    StartCmd {
+        filters: Vec::new(),
+        zcashd_compat: false,
+        unsafe_low_specs: false,
+    }
+}
+
+/// The gateway ID of a pool's relay node.
+const RELAY: GatewayId = GatewayId::from_bytes([0x42; 20]);
+
+#[test]
+fn naming_more_than_one_gateway_is_refused_as_not_supported_yet() {
+    let mut config = ZakuradConfig::default();
+    config.mining.miner_mesh = true;
+    config.mining.miner_mesh_gateways = vec![RELAY, GatewayId::from_bytes([0x43; 20])];
+
+    let error = plain_start()
+        .override_config(config)
+        .expect_err("a node names one gateway for now");
+    assert!(
+        error
+            .to_string()
+            .contains("naming more than one gateway is not supported yet"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn a_named_gateway_without_miner_mesh_is_refused() {
+    let mut config = ZakuradConfig::default();
+    config.mining.miner_mesh_gateways = vec![RELAY];
+
+    let error = plain_start()
+        .override_config(config)
+        .expect_err("the gateway would never be named");
+    assert!(
+        error
+            .to_string()
+            .contains("mining.miner_mesh_gateways has no effect unless mining.miner_mesh is set"),
+        "unexpected error: {error}"
+    );
+}
+
+/// A template node that names its relay is not a gateway itself, so it may run only the
+/// legacy stack and keeps no node key.
+#[test]
+fn a_node_naming_its_relay_needs_neither_v2_nor_a_lasting_key() {
+    let dir = tempfile::tempdir().expect("failed to create temp dir");
+    // The identity directory's path is taken by a regular file, so it can hold no key file.
+    let blocked = dir.path().join("blocked");
+    std::fs::write(&blocked, "").expect("write the blocking file");
+
+    let mut config = ZakuradConfig::default();
+    config.network.p2p_stack = P2pStack::Legacy;
+    config.network.identity_dir = blocked;
+    config.mining.miner_mesh = true;
+    config.mining.miner_mesh_gateways = vec![RELAY];
+
+    plain_start()
+        .override_config(config.clone())
+        .expect("a legacy node may name its relay");
+    StartCmd::network_config_for_start(&config).expect("a node naming its relay pins no key");
+}
+
+#[test]
+fn a_relay_without_a_miner_address_needs_v2() {
+    let mut config = ZakuradConfig::default();
+    config.network.p2p_stack = P2pStack::Legacy;
+    config.mining.miner_mesh = true;
+    config.mining.miner_address = None;
+
+    let error = plain_start()
+        .override_config(config)
+        .expect_err("a relay is a gateway, so it needs v2");
+    assert!(
+        error
+            .to_string()
+            .contains("mining.miner_mesh requires the Zakura P2P v2 stack"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn coinbases_name_the_configured_gateway_before_the_node_itself() {
+    let own_node_id = [0x07; 32];
+    let mut config = ZakuradConfig::default();
+
+    assert_eq!(
+        StartCmd::announced_gateway(&config, Some(&own_node_id)).unwrap(),
+        None,
+        "a node without the miner mesh names no gateway"
+    );
+
+    config.mining.miner_mesh = true;
+    assert_eq!(
+        StartCmd::announced_gateway(&config, Some(&own_node_id)).unwrap(),
+        Some(GatewayId::from_node_id(&own_node_id)),
+    );
+    assert!(
+        StartCmd::announced_gateway(&config, None).is_err(),
+        "a node that names itself needs its v2 node ID"
+    );
+
+    config.mining.miner_mesh_gateways = vec![RELAY];
+    assert_eq!(
+        StartCmd::announced_gateway(&config, Some(&own_node_id)).unwrap(),
+        Some(RELAY),
+    );
+    assert_eq!(
+        StartCmd::announced_gateway(&config, None).unwrap(),
+        Some(RELAY),
+        "a node naming its relay needs no v2 endpoint"
+    );
+}
+
+#[test]
+fn a_miner_or_a_node_running_the_miner_mesh_prefers_gateways() {
+    let miner_address = "t1bmMa1wJDFdbc2TiURQP5BbBz6jHjUBuHq"
+        .parse()
+        .expect("a valid transparent address");
+    let mut config = ZakuradConfig::default();
+    config.mining.miner_address = None;
+    assert!(!StartCmd::prefers_gateways(&config));
+
+    config.mining.miner_address = Some(miner_address);
+    assert!(StartCmd::prefers_gateways(&config));
+
+    config.mining.miner_address = None;
+    config.mining.miner_mesh = true;
+    assert!(StartCmd::prefers_gateways(&config));
 }
 
 #[test]

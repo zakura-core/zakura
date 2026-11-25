@@ -4,7 +4,7 @@ use std::{collections::HashMap, ops::Deref, sync::LazyLock};
 
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
-use zakura_chain::parameters::NetworkKind;
+use zakura_chain::{miner_mesh::GatewayId, parameters::NetworkKind};
 use zcash_address::ZcashAddress;
 use zcash_transparent::coinbase::{MAX_COINBASE_HEIGHT_LEN, MAX_COINBASE_SCRIPT_LEN};
 
@@ -74,11 +74,28 @@ pub struct Config {
     /// node's v2 node ID, so other mining nodes can find the node and keep a direct connection
     /// to it. The output takes 34 bytes of the block.
     ///
+    /// A node with this set also prefers to stay connected to the gateways that recent blocks
+    /// name, with or without a miner address. A relay node that other pools should connect to
+    /// sets this without a miner address.
+    ///
     /// Needs the v2 P2P stack and a node key that stays the same across restarts: `zakurad`
-    /// refuses to start with this set unless it has both.
+    /// refuses to start with this set unless it has both. When [`Self::miner_mesh_gateways`]
+    /// names another node, this node needs neither.
     ///
     /// Off by default.
     pub miner_mesh: bool,
+
+    /// The gateway the coinbases this node builds name instead of this node, such as the
+    /// pool's public relay node.
+    ///
+    /// Each entry is the gateway's v2 node ID in hex, as its `getminermeshinfo` reports it, or
+    /// the first 40 hex digits of it. The coinbase names the gateway by its first 20 bytes.
+    ///
+    /// The list is empty by default, and then the coinbases name this node. For now it may hold
+    /// at most one entry: `zakurad` refuses to start with more. It needs
+    /// [`Self::miner_mesh`].
+    #[serde(with = "gateway_ids")]
+    pub miner_mesh_gateways: Vec<GatewayId>,
 }
 
 mod miner_address {
@@ -109,6 +126,34 @@ mod miner_address {
     }
 }
 
+/// Reads and writes gateway IDs as hex strings. This is where the config checks each entry's
+/// format.
+mod gateway_ids {
+    use serde::{de, Deserialize, Deserializer, Serializer};
+    use zakura_chain::miner_mesh::GatewayId;
+
+    pub(super) fn serialize<S>(gateways: &[GatewayId], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.collect_seq(gateways.iter().map(ToString::to_string))
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<Vec<GatewayId>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Vec::<String>::deserialize(deserializer)?
+            .iter()
+            .map(|entry| {
+                entry.parse().map_err(|error| {
+                    de::Error::custom(format!("miner_mesh_gateways entry {entry:?}: {error}"))
+                })
+            })
+            .collect()
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -118,6 +163,7 @@ impl Default for Config {
             internal_miner: false,
             optimistic_block_inventory: true,
             miner_mesh: false,
+            miner_mesh_gateways: Vec::new(),
         }
     }
 }
@@ -234,7 +280,57 @@ static MINER_ADDRESS: LazyLock<HashMap<NetworkKind, HashMap<MinerAddressType, &'
 
 #[cfg(test)]
 mod tests {
+    use zakura_chain::miner_mesh::GatewayId;
+
     use super::Config;
+
+    /// A v2 node ID, and the gateway ID it starts with.
+    const NODE_ID: &str = "4d70dccee88cea83ef71f9f870489b10f5c6c112d9c49725dc38d2979f6db690";
+    const GATEWAY_ID: &str = "4d70dccee88cea83ef71f9f870489b10f5c6c112";
+
+    #[test]
+    fn a_gateway_reads_from_a_node_id_or_a_gateway_id_and_writes_as_a_gateway_id() {
+        let expected: GatewayId = GATEWAY_ID.parse().unwrap();
+        for entry in [NODE_ID, GATEWAY_ID] {
+            let config: Config =
+                toml::from_str(&format!("miner_mesh_gateways = [{entry:?}]")).unwrap();
+            assert_eq!(config.miner_mesh_gateways, vec![expected]);
+
+            let serialized = toml::to_string(&config).unwrap();
+            assert!(serialized.contains(&format!("miner_mesh_gateways = [\"{GATEWAY_ID}\"]")));
+            assert_eq!(toml::from_str::<Config>(&serialized).unwrap(), config);
+        }
+    }
+
+    #[test]
+    fn a_gateway_entry_of_the_wrong_length_or_not_hex_fails_with_the_entry_named() {
+        for entry in [
+            &NODE_ID[..63],
+            &GATEWAY_ID[..38],
+            "",
+            &format!("{}zz", &NODE_ID[2..]),
+        ] {
+            let error = toml::from_str::<Config>(&format!("miner_mesh_gateways = [{entry:?}]"))
+                .expect_err("the entry names no gateway");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("miner_mesh_gateways entry {entry:?}")),
+                "unexpected error: {error}"
+            );
+        }
+        assert!(toml::from_str::<Config>(&format!(
+            "miner_mesh_gateways = [{GATEWAY_ID:?}, \"nothex\"]"
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn no_gateway_is_named_by_default() {
+        assert!(Config::default().miner_mesh_gateways.is_empty());
+        let config: Config = toml::from_str("").unwrap();
+        assert!(config.miner_mesh_gateways.is_empty());
+    }
 
     #[test]
     fn miner_address_preserves_string_encoding_and_optional_defaults() {

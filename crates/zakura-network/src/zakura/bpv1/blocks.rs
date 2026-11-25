@@ -2161,11 +2161,11 @@ impl BlockTable {
         step: &mut BlockStep,
     ) {
         let block_id = envelope.block_id;
-        // Make local solved-block admission idempotent by hash. A peer's copy
-        // cannot come first: the coinbase commitment names this node as
-        // proposer, and only this node's prepared template publishes it, after
-        // this admission. A copy relayed from before a restart has no prepared
-        // template behind it, so it never reaches here.
+        // Make local solved-block admission idempotent by hash. A stock peer's
+        // copy cannot come first: only this node's prepared template publishes
+        // metadata naming it as proposer, after this admission. A modified peer
+        // that gets the body early can build that metadata itself, and this
+        // return then leaves the block unseeded (#2753).
         if self.blocks.contains_key(&block_id) {
             return;
         }

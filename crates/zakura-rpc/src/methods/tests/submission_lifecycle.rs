@@ -64,6 +64,7 @@ async fn resolve_duplicate(reads_before_commit: Option<usize>) -> (Option<Duplic
             registration,
             early_relay: None,
             committed_block: committed_block_lookup(read_state),
+            bpv1_proposer: None,
         },
         |outcome| outcome.duplicate_body,
     )

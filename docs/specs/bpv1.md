@@ -97,7 +97,9 @@ bounded metadata envelope while headerchain recovers that context. It MUST apply
 independent count, byte, work, and time limits to this pending state, both per
 peer and node-wide. Headerchain answers a missing parent before it checks proof
 of work. So before the node retains the envelope, it MUST check that the
-binding's coinbase txid reaches the header's Merkle root, that the coinbase
+binding's coinbase txid reaches the header's Merkle root, that the coinbase's
+authorizing data reaches the header's block commitments (the txid leaves out
+the coinbase script, which holds the height), that the coinbase
 height lies above `top` (section 2) and at most
 `PROPAGATION_DEPTH` above it, and that the header meets its own target with a
 valid solution. Where no minimum-difficulty rule applies, it MUST then check
@@ -107,7 +109,8 @@ blocks above that header. A pending entry then costs its sender about as much
 work as a real block that far ahead. The target bound holds only for a chain
 that extends the best header, and an honest header on a fork with less hash
 rate can exceed it. So a target above the bound is not a violation. Pending metadata MUST
-NOT take space from metadata whose parent the node holds. When the node-wide
+NOT take space from metadata whose parent the node holds, including while these
+checks run. When the node-wide
 pending limit is full, the node SHOULD drop an entry of the peer holding the
 most pending metadata, not refuse a peer holding less. A dropped entry is not a
 violation, and the block arrives through header sync and block download.

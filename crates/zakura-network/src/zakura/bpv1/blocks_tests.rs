@@ -246,20 +246,32 @@ pub(super) fn header_result(
 
 /// Answers the received step's header admission with `parent_hash` missing,
 /// then passes the unknown-parent checks, as for an honest child that
-/// arrives before its parent. Returns the step that parks it.
+/// arrives before its parent. Returns both steps' effects. A refused entry
+/// starts no checks.
 pub(super) fn missing_parent(
     table: &mut BlockTable,
     now: Instant,
     received: &BlockStep,
     parent_hash: block::Hash,
 ) -> BlockStep {
-    let checking = header_result(
+    let mut step = header_result(
         table,
         now,
         received,
         HeaderAdmissionResult::MissingParent { parent_hash },
     );
-    unknown_parent_checked(table, now, &checking, UnknownParentVerdict::Park)
+    if step
+        .outputs
+        .iter()
+        .any(|o| matches!(o, BlockOutput::CheckUnknownParent { .. }))
+    {
+        let checked = unknown_parent_checked(table, now, &step, UnknownParentVerdict::Park);
+        step.outputs
+            .retain(|o| !matches!(o, BlockOutput::CheckUnknownParent { .. }));
+        step.outputs.extend(checked.outputs);
+        step.events.extend(checked.events);
+    }
+    step
 }
 
 /// Completes the step's unknown-parent check with `verdict`.
@@ -543,6 +555,70 @@ fn park_unknown_parent(
     parked
 }
 
+/// Unknown-parent checks run under the pending budget, so a peer whose fakes
+/// keep their checks running holds at most its pending share and never fills
+/// the admission budget that viable metadata needs (bpv1-75).
+#[test]
+fn bpv1_75_running_unknown_parent_checks_never_refuse_viable_metadata() {
+    let now = Instant::now();
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let coding = Profile::TINY.derive_coding(64, 2).unwrap();
+    let flooder = node_id(100);
+    let mut checks = 0;
+    for i in 0..=u8::try_from(MAX_ADMITTING_META_COUNT).unwrap() {
+        let fake = block::Hash([
+            0xF2, i, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0,
+        ]);
+        let received = table.step(
+            now,
+            BlockInput::MetaReceived {
+                envelope: make_envelope(fake, coding, [0xAA; 32], flooder),
+                from_peer: flooder,
+                session_gen: 1,
+            },
+        );
+        // The checks never finish.
+        let checking = header_result(
+            &mut table,
+            now,
+            &received,
+            HeaderAdmissionResult::MissingParent {
+                parent_hash: block::Hash([0xEE; 32]),
+            },
+        );
+        checks += checking
+            .outputs
+            .iter()
+            .filter(|o| matches!(o, BlockOutput::CheckUnknownParent { .. }))
+            .count();
+    }
+    assert_eq!(checks, MAX_PENDING_META_PER_PEER);
+    assert_eq!(table.admitting_meta_len(), 0);
+
+    let honest = node_id(7);
+    let viable = block::Hash([0x79; 32]);
+    let received = table.step(
+        now,
+        BlockInput::MetaReceived {
+            envelope: make_envelope(viable, coding, [0xAA; 32], honest),
+            from_peer: honest,
+            session_gen: 1,
+        },
+    );
+    let admitted = header_result(
+        &mut table,
+        now,
+        &received,
+        HeaderAdmissionResult::Admitted { height: 11 },
+    );
+    let committed = commitment_ok(&mut table, now, &admitted);
+    assert!(committed
+        .events
+        .contains(&BlockEvent::BlockAdmitted { block_id: viable }));
+    table.assert_invariants();
+}
+
 /// A made-up header with an unknown parent costs its sender only bytes, so
 /// waiting metadata is bounded per peer and per node (bpv1-11), and it never
 /// costs viable metadata its place (bpv1-75). Here sixteen peers fill the
@@ -738,9 +814,9 @@ fn unknown_parent_verdicts_park_drop_or_close() {
                 parent_hash: block::Hash([0x40; 32]),
             },
         );
-        // Nothing parks while the checks run.
-        assert_eq!(table.pending_meta_len(), 0);
-        assert_eq!(table.admitting_meta_len(), 1);
+        // The checks run under the pending budget, not the admission budget.
+        assert_eq!(table.pending_meta_len(), 1);
+        assert_eq!(table.admitting_meta_len(), 0);
         let checked = unknown_parent_checked(&mut table, now, &checking, verdict);
         table.assert_invariants();
         (table, checked)

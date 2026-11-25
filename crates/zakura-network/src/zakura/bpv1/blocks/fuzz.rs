@@ -12,7 +12,8 @@ use super::{
 };
 use crate::zakura::bpv1::peer::PartAuth;
 use crate::zakura::bpv1::{
-    codec::encode_body, commitment::CoinbaseBinding, paths::PathEstimate, profile::Profile,
+    close::Bpv1CloseRow, codec::encode_body, commitment::CoinbaseBinding, paths::PathEstimate,
+    profile::Profile, unknown_parent::UnknownParentVerdict,
 };
 
 /// The verified tip hash and every admitted header's parent, so a block one
@@ -185,6 +186,16 @@ pub fn replay_bpv1_block_bytes(bytes: &[u8]) -> BlockReplaySummary {
                 indices: (0..8u32).filter(|i| b & (1 << i) != 0).collect(),
                 relay: false,
             },
+            // Odd `a` answers the latest unknown-parent check.
+            _ if a & 1 == 1 => BlockInput::UnknownParentChecked {
+                work_id: pending_works.pop().unwrap_or(WorkId(u64::from(b))),
+                verdict: [
+                    UnknownParentVerdict::Park,
+                    UnknownParentVerdict::Drop,
+                    UnknownParentVerdict::Invalid(Bpv1CloseRow::Row3InvalidHeader),
+                    UnknownParentVerdict::Invalid(Bpv1CloseRow::Row4BadMetaOrCommitment),
+                ][usize::from(b % 4)],
+            },
             _ => BlockInput::Tick { peer_states },
         };
 
@@ -193,6 +204,7 @@ pub fn replay_bpv1_block_bytes(bytes: &[u8]) -> BlockReplaySummary {
         for o in out.outputs {
             match o {
                 BlockOutput::AdmitHeader { work_id, .. }
+                | BlockOutput::CheckUnknownParent { work_id, .. }
                 | BlockOutput::VerifyCommitment { work_id, .. } => {
                     pending_works.push(work_id);
                 }

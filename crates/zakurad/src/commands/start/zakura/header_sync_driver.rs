@@ -502,6 +502,22 @@ where
         Box::pin(async move { selected_chain_contains(read_state, hash).await })
     }
 
+    fn header_validation_lease(
+        &self,
+        parent_hash: block::Hash,
+    ) -> HeaderChainFuture<'_, Result<Option<zakura_header_chain::ValidationLease>, PortError>>
+    {
+        let read_state = self.read_state.clone();
+        Box::pin(async move {
+            read_validation_lease(read_state, parent_hash)
+                .await
+                .map_err(|failure| {
+                    tracing::debug!(%parent_hash, %failure, "header validation lease read failed");
+                    PortError::Unavailable { source: None }
+                })
+        })
+    }
+
     fn admit_exact_header(
         &self,
         header: Arc<block::Header>,

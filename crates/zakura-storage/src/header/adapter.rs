@@ -1248,6 +1248,17 @@ impl Port for EnginePort {
         self.run_on_poll(HeaderRequest::SelectedChainContains { hash })
     }
 
+    fn header_validation_lease(
+        &self,
+        parent_hash: block::Hash,
+    ) -> HeaderChainFuture<'_, Result<Option<ValidationLease>, PortError>> {
+        Box::pin(async move {
+            let engine = self.engine();
+            self.validation_lease(&engine, parent_hash)
+                .map_err(unavailable)
+        })
+    }
+
     fn admit_exact_header(
         &self,
         header: Arc<block::Header>,

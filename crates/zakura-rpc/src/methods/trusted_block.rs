@@ -110,8 +110,8 @@ where
         .await
     }
 
-    /// Checks mining support before registering `block` as a pending body. Relays it early if
-    /// `body` allows and returns the outcome of its normal verification and commit.
+    /// Registers `block` as a pending body, relays it early if `body` allows, and returns the
+    /// outcome of its normal verification and commit.
     async fn relay_trusted_block(
         &self,
         block: Arc<Block>,
@@ -120,8 +120,6 @@ where
         submitted_at: std::time::Instant,
         body: PeerBody,
     ) -> std::result::Result<SubmitBlockResponse, TrustedSubmissionError> {
-        self.check_mining_support()
-            .map_err(|_| TrustedSubmissionError::EndOfSupport)?;
         let hash = block.hash();
         let submission = match self.gbt.reserve_mined_submission(hash) {
             Ok(guard) => guard,

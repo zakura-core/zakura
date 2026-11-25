@@ -507,7 +507,7 @@ mod zip218_template_limits {
 }
 
 #[test]
-fn reserves_exact_48_bytes_for_bpv1_coinbase_null_data_at_block_limit() {
+fn reserves_exact_46_bytes_for_bpv1_coinbase_null_data_at_block_limit() {
     use zakura_node_services::bpv1_proposer::BPV1_COMMITMENT_NULL_DATA_LEN;
 
     let network = Network::Mainnet;
@@ -530,11 +530,11 @@ fn reserves_exact_48_bytes_for_bpv1_coinbase_null_data_at_block_limit() {
 
     assert_eq!(
         bpv1_resources.max_serialized_size - base_resources.max_serialized_size,
-        48,
-        "second audit #2: 37-byte OP_RETURN BPV1 01 C output adds exactly 48 serialized bytes"
+        46,
+        "second audit #2: 35-byte OP_RETURN BP 01 C output adds exactly 46 serialized bytes"
     );
 
-    // Compare actual serialized coinbase with 37-byte null data against the reservation!
+    // Compare actual serialized coinbase with 35-byte null data against the reservation!
     let dummy_payload = [0x42u8; BPV1_COMMITMENT_NULL_DATA_LEN];
     let coinbase_with_bpv1 = TransactionTemplate::new_coinbase(
         &network,
@@ -558,7 +558,7 @@ fn reserves_exact_48_bytes_for_bpv1_coinbase_null_data_at_block_limit() {
     );
 
     // Boundary check: a tx that fits WITHOUT BPv1 reservation (leaving 0 bytes spare)
-    // MUST be excluded when BPv1's 48-byte reservation is active!
+    // MUST be excluded when BPv1's 46-byte reservation is active!
     let max_block_bytes = usize::try_from(MAX_BLOCK_BYTES).expect("fits in memory");
     let max_tx_with_bpv1 = max_block_bytes
         - block_template_overhead_bytes(&network)
@@ -596,6 +596,6 @@ fn reserves_exact_48_bytes_for_bpv1_coinbase_null_data_at_block_limit() {
     .expect("selection succeeds");
     assert!(
         exceeds_by_one.is_empty(),
-        "second audit #2: tx exceeding MAX_BLOCK_BYTES once 48-byte BPv1 output is added must not be selected"
+        "second audit #2: tx exceeding MAX_BLOCK_BYTES once 46-byte BPv1 output is added must not be selected"
     );
 }

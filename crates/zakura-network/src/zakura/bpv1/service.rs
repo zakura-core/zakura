@@ -781,6 +781,19 @@ impl zakura_node_services::bpv1_proposer::Bpv1ProposerHook for Bpv1Handle {
             .map(|commitment| commitment_payload(commitment.commitment_hash))
     }
 
+    fn empty_template_commitment(&self, height: Height) -> Option<[u8; COMMITMENT_PAYLOAD_LEN]> {
+        if !self.should_prepare_template(height) {
+            return None;
+        }
+        // An empty body has one transaction, the coinbase, and no bytes after it.
+        let encoded = encode_body(&self.node.profile, &[], 1).ok()?;
+        let commitment_hash = self
+            .node
+            .lock_proposer()
+            .commitment_hash(encoded.coding, encoded.part_root);
+        Some(commitment_payload(commitment_hash))
+    }
+
     fn publish_solved_block(&self, block: Arc<Block>, height: Height) -> bool {
         Bpv1Handle::publish_solved_block(self, &block, height.0)
     }

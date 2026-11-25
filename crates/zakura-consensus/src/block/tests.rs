@@ -4480,6 +4480,36 @@ async fn a_different_body_under_the_same_hash_does_not_wait() {
     .expect("the turn test must finish");
 }
 
+/// A relay can push this node's solved block back while its own submission is in flight. The
+/// submission must not wait for that copy, or it would lose its prepared fast path and return a
+/// duplicate that never publishes the block over BPv1.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_mined_submission_does_not_wait_for_a_network_delivery() {
+    let _init_guard = zakura_test::init();
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let mut tips = EqualWorkTips::new().await;
+        let a = tips.a.clone();
+        let network_copy = tips
+            .verifier
+            .receipt_orders
+            .register(a.hash(), &a.clone().into());
+        let _verifying = network_copy.verification_turn().await;
+
+        let mined = tips.verifier.call(Request::CommitMined {
+            size: a.zcash_serialized_size(),
+            block: a.clone().into(),
+            admission: zs::BlockAdmission::pending(),
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), mined)
+            .await
+            .expect("the mined submission runs while a network copy holds the turn")
+            .unwrap();
+        assert_eq!(tips.tip_hash(), Some(a.hash()));
+    })
+    .await
+    .expect("the mined turn test must finish");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_block_whose_header_came_first_wins_the_tie_when_its_body_follows_in_time() {
     let _init_guard = zakura_test::init();

@@ -88,6 +88,23 @@ const fn peers_bytes(records: usize) -> usize {
     2 + records * MAX_NODE_RECORD_BYTES
 }
 
+/// The largest `Peers` payload this node sends: a full answer of records
+/// whose fields are as long as they can be and that carry no extension.
+///
+/// It is below [`PEERS_MAX_BYTES`], the largest `Peers` this node accepts.
+/// The room a record keeps for a second signature made the accepted size
+/// eleven times larger, and any node can fill that room in its own records.
+/// Without this cap a node whose book holds such records would send answers
+/// that a requester on a slow path can't finish reading before its exchange
+/// deadlines. An answer that reaches the cap carries fewer records than the
+/// request's limit, which is always allowed.
+///
+/// The stream's frame cap and the serving pools still follow
+/// [`PEERS_MAX_BYTES`]: one frame cap covers both directions, and each
+/// share has to hold a frame of that size.
+pub(crate) const SERVED_PEERS_MAX_BYTES: usize =
+    2 + MAX_DISCOVERY_RECORDS_PER_RESPONSE * (4 + MAX_NODE_RECORD_FIELDS_BYTES + SIGNATURE_BYTES);
+
 /// The most a `Peers` answer to a `GetPeers` with `limit` may carry: one frame
 /// with at most `limit` records.
 pub(crate) fn peers_cap(limit: u16) -> ResponseCap {
@@ -96,6 +113,36 @@ pub(crate) fn peers_cap(limit: u16) -> ResponseCap {
         // Widening usize to u64 is lossless on supported targets.
         bytes: peers_bytes(usize::from(limit)) as u64,
     }
+}
+
+/// The most this node sends in answer to a `GetPeers` with `limit`: what the
+/// requester accepts ([`peers_cap`]), and at most [`SERVED_PEERS_MAX_BYTES`].
+pub(crate) fn served_peers_cap(limit: u16) -> ResponseCap {
+    let accepted = peers_cap(limit);
+    ResponseCap {
+        // Widening usize to u64 is lossless on supported targets.
+        bytes: accepted.bytes.min(SERVED_PEERS_MAX_BYTES as u64),
+        ..accepted
+    }
+}
+
+/// The longest prefix of `records` whose `Peers` payload fits `cap` bytes.
+pub(crate) fn records_within(
+    mut records: Vec<ZakuraNodeRecord>,
+    cap: u64,
+) -> Vec<ZakuraNodeRecord> {
+    // The record count's two bytes come first.
+    let mut bytes = 2u64;
+    let fits = records
+        .iter()
+        .take_while(|record| {
+            // Widening usize to u64 is lossless on supported targets.
+            bytes = bytes.saturating_add(record_len(record) as u64);
+            bytes <= cap
+        })
+        .count();
+    records.truncate(fits);
+    records
 }
 
 const GET_SERVICES_MAX_BYTES: usize = 2 + MAX_GET_SERVICES_WANTED * SERVICE_ID_MAX_BYTES;

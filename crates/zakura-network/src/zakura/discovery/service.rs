@@ -1983,6 +1983,84 @@ mod tests {
         Ok(())
     }
 
+    /// A node sends no larger a `Peers` than it could before records kept
+    /// room for a second signature, however large the records in its book
+    /// are. Four confirmed records that fill their extension room would
+    /// make a 32 KB answer. The requester gets the two that fit.
+    #[tokio::test]
+    async fn a_peers_answer_stays_within_the_served_size() -> Result<(), crate::BoxError> {
+        use crate::zakura::discovery::{
+            protocol::RECORD_SIGNATURE_EXTENSION_BYTES, wire::SERVED_PEERS_MAX_BYTES,
+        };
+
+        let (_connected_tx, connected_rx) = watch::channel(Vec::new());
+        let handshake = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
+        let handle = ZakuraDiscoveryHandle::new(
+            ZakuraDiscoveryLocalConfig {
+                secret_key: NodeSecretKey::from_bytes(&[54u8; 32]),
+                direct_addrs: Vec::new(),
+                services: vec![ZakuraServiceId::discovery()],
+                zakura_protocol_min: handshake.zakura_protocol_min,
+                zakura_protocol_max: handshake.zakura_protocol_max,
+                network_id: handshake.network_id,
+                chain_id: handshake.chain_id,
+                last_authored_sequence: None,
+            },
+            ZakuraDiscoveryConfig::default(),
+            connected_rx,
+        )?;
+        let relay = NodeSecretKey::from_bytes(&[59u8; 32]).public();
+        let mut largest = 0;
+        for seed in 60..64u8 {
+            let author = NodeSecretKey::from_bytes(&[seed; 32]);
+            let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(45, 33, 30, seed)), 8233);
+            let mut body = signed_discovery_record(&author, &handshake)?.body;
+            body.direct_addrs = vec![addr];
+            body.extensions = vec![0; RECORD_SIGNATURE_EXTENSION_BYTES];
+            let record = ZakuraNodeRecord::sign(body, &author)?;
+            largest = encode_frame(&DiscoveryMessage::Hello {
+                record: record.clone(),
+            })?
+            .payload
+            .len();
+            let node_id = record.body.node_id();
+            handle.import_peer_records([record], Some(relay)).await?;
+            handle.mark_dial_success(&node_id, Some(addr)).await;
+        }
+        assert!(2 + 3 * largest > SERVED_PEERS_MAX_BYTES, "three don't fit");
+
+        let peer_node_id = NodeSecretKey::from_bytes(&[55u8; 32]).public();
+        let peer_id = ZakuraPeerId::new(peer_node_id.as_bytes().to_vec())?;
+        assert_eq!(
+            handle
+                .admit_peer_session(
+                    DiscoverySessionKey::new(peer_id.clone(), 0, 1),
+                    ServicePeerDirection::Inbound
+                )
+                .await,
+            ServiceAdmissionDecision::Admit
+        );
+        let (sink, mut recv) = discovery_sink_for_session(&handle, &peer_id, peer_node_id, 0, 1);
+        sink.handle_message(
+            DiscoveryMessage::GetPeers(GetPeers {
+                limit: 32,
+                wanted_services: Vec::new(),
+                exclude_node_ids: Vec::new(),
+            }),
+            None,
+        )
+        .await?;
+        let frame = tokio::time::timeout(Duration::from_secs(2), recv.recv())
+            .await?
+            .expect("the session stays open");
+        assert!(frame.payload.len() <= SERVED_PEERS_MAX_BYTES);
+        let DiscoveryMessage::Peers { records } = decode_frame::<DiscoveryMessage>(&frame)? else {
+            panic!("a GetPeers is answered with a Peers");
+        };
+        assert_eq!(records.len(), 2);
+        Ok(())
+    }
+
     /// Each `GetPeers` gets exactly one `Peers` from the row's `Serve`. While
     /// answers wait, a second open request is served and a third breaks the
     /// margin.

@@ -323,6 +323,20 @@ the two headers.
 Any node can fill the extension area of its own records, so every bound that scales with a record
 uses `NODE_RECORD_MAX` from this release on, whether or not a signature is present.
 
+What a node accepts and what it sends differ for `Peers`. A node MUST accept a `Peers` up to the
+row's cap, 276,770 bytes. It MUST NOT send one above `SERVED_PEERS_MAX`:
+
+```text
+SERVED_PEERS_MAX             = 24,098 bytes
+```
+
+That is a full answer of 32 records with the largest fields and no extension, the largest `Peers`
+before the record body cap grew. When the sampled records exceed it, the answer carries the first
+of them that fit, which is fewer than the request's limit and always allowed. The exchange
+deadlines of a discovery-only connection assume an answer of about this size, so a node whose book
+holds records with full extension areas still answers in time. A later release that signs records
+can send larger answers to the peers it knows will wait for them.
+
 #### `Hello` — Announcement, discriminator 1
 
 - **Frame**

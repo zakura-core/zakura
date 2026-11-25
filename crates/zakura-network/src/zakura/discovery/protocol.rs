@@ -2393,6 +2393,17 @@ impl ZakuraDiscoveryHandle {
         let state = self.inner.lock().await;
         state.book().persisted_entries()
     }
+
+    /// Returns the at most `max` entries the book file keeps at `now`; see
+    /// [`ZakuraDiscoveryBook::entries_to_persist`].
+    pub(super) async fn entries_to_persist(
+        &self,
+        now: u64,
+        max: usize,
+    ) -> Vec<ZakuraDiscoveryPersistedEntry> {
+        let state = self.inner.lock().await;
+        state.book().entries_to_persist(now, max)
+    }
 }
 impl Default for ZakuraDiscoveryBook {
     fn default() -> Self {
@@ -3107,23 +3118,37 @@ impl ZakuraDiscoveryBook {
 
     /// Returns entries suitable for a Zakura-specific persistent cache.
     pub fn persisted_entries(&self) -> Vec<ZakuraDiscoveryPersistedEntry> {
-        let mut entries: Vec<_> = self
-            .entries
-            .values()
-            .map(|entry| ZakuraDiscoveryPersistedEntry {
-                record: entry.record().clone(),
-                source: entry.source,
-                is_static: entry.is_static,
-                last_seen: entry.last_seen,
-                last_dial_attempt: entry.last_dial_attempt,
-                last_success: entry.last_success,
-                confirmed_addrs: entry.confirmed_addrs.clone(),
-                dialed_addrs: entry.dialed_addrs.clone(),
-                failure_count: entry.failure_count,
-            })
-            .collect();
+        let mut entries: Vec<_> = self.entries.values().map(persisted).collect();
         entries.sort_by_key(|entry| node_id_sort_key(&entry.record.body.node_id()));
         entries
+    }
+
+    /// Returns the at most `max` entries most worth keeping across a restart:
+    /// the ones [`persist_order`] puts first among those live at `now`.
+    ///
+    /// It ranks the book's entries where they are and copies only the ones it
+    /// keeps. A record may fill its extension area, so a copy of a full book
+    /// would be tens of megabytes made under the book's lock.
+    pub(super) fn entries_to_persist(
+        &self,
+        now: u64,
+        max: usize,
+    ) -> Vec<ZakuraDiscoveryPersistedEntry> {
+        let mut live: Vec<_> = self
+            .entries
+            .values()
+            .filter(|entry| entry.record.body.expires_at_unix_secs >= now)
+            .map(|entry| (node_id_sort_key(&entry.record.body.node_id()), entry))
+            .collect();
+        // Entries that rank alike keep node ID order, whatever order the map
+        // yields them in.
+        live.sort_by_key(|(node_id, entry)| {
+            (persist_order(entry.last_success, entry.last_seen), *node_id)
+        });
+        live.into_iter()
+            .take(max)
+            .map(|(_, entry)| persisted(entry))
+            .collect()
     }
 
     /// Re-validates and imports entries loaded from a persistent cache.
@@ -4163,6 +4188,27 @@ fn dial_backoff_secs(failure_count: u32, base_secs: u64, max_secs: u64) -> u64 {
 
 fn node_id_sort_key(node_id: &NodeId) -> [u8; NODE_ID_BYTES] {
     *node_id.as_bytes()
+}
+
+/// The order in which the book file keeps entries: the most recent
+/// successful dial first, then the most recent sighting.
+pub(super) fn persist_order(last_success: Option<u64>, last_seen: u64) -> impl Ord {
+    (Reverse(last_success), Reverse(last_seen))
+}
+
+/// The form of `entry` that the book file stores.
+fn persisted(entry: &ZakuraDiscoveryEntry) -> ZakuraDiscoveryPersistedEntry {
+    ZakuraDiscoveryPersistedEntry {
+        record: entry.record().clone(),
+        source: entry.source,
+        is_static: entry.is_static,
+        last_seen: entry.last_seen,
+        last_dial_attempt: entry.last_dial_attempt,
+        last_success: entry.last_success,
+        confirmed_addrs: entry.confirmed_addrs.clone(),
+        dialed_addrs: entry.dialed_addrs.clone(),
+        failure_count: entry.failure_count,
+    }
 }
 
 /// Check the record's network, chain, and protocol range against ours.
@@ -6208,10 +6254,50 @@ mod tests {
             test_requester(),
         );
         assert_eq!(sample.len(), MAX_DISCOVERY_RECORDS_PER_RESPONSE);
-        let encoded = DiscoveryMessage::Peers { records: sample }
-            .encode()
-            .expect("the sample fits one Peers message");
+        let encoded = DiscoveryMessage::Peers {
+            records: sample.clone(),
+        }
+        .encode()
+        .expect("the sample fits one Peers message");
         assert_eq!(encoded.len() - 1, super::super::wire::PEERS_MAX_BYTES);
+
+        // The node accepts that message and sends a smaller one: the answer
+        // it serves from the same sample stops at what a `Peers` could be
+        // before records kept room for a second signature.
+        use super::super::wire::{records_within, served_peers_cap, SERVED_PEERS_MAX_BYTES};
+        assert_eq!(SERVED_PEERS_MAX_BYTES, 24_098);
+        let cap = served_peers_cap(32);
+        assert_eq!(cap.bytes, 24_098);
+        let served = records_within(sample.clone(), cap.bytes);
+        assert_eq!(served, sample[..2], "two of the largest records fit");
+        let encoded = DiscoveryMessage::Peers { records: served }
+            .encode()
+            .expect("the served answer encodes");
+        assert_eq!(encoded.len() - 1, 2 + 2 * MAX_NODE_RECORD_BYTES);
+        // A request for one record is owed one, and no cap leaves room for
+        // a record that doesn't fit.
+        assert_eq!(served_peers_cap(1).bytes, 2 + MAX_NODE_RECORD_BYTES as u64);
+        assert_eq!(
+            records_within(sample.clone(), served_peers_cap(1).bytes).len(),
+            1
+        );
+        assert!(records_within(sample, 2 + MAX_NODE_RECORD_BYTES as u64 - 1).is_empty());
+    }
+
+    /// Records with no extension, as every node of this release signs them,
+    /// fit a full answer under the served cap, so the cap changes nothing
+    /// for them.
+    #[test]
+    fn a_full_answer_of_records_without_extensions_is_served_whole() {
+        use super::super::wire::{records_within, served_peers_cap};
+
+        let records: Vec<_> = (1..=32u8)
+            .map(|index| signed_record_with(1, service(1), test_addr(index)))
+            .collect();
+        assert_eq!(
+            records_within(records.clone(), served_peers_cap(32).bytes),
+            records
+        );
     }
 
     #[test]
@@ -7925,6 +8011,58 @@ mod tests {
         let mut reloaded = ZakuraDiscoveryBook::default();
         let outcome = reloaded.import_persisted_entries(file.load(), NOW, &context());
         assert_eq!((outcome.added, outcome.rejected), (0, 1));
+    }
+
+    /// The saver asks the book for only the entries the file keeps. That
+    /// selection is the one the file makes from a copy of the whole book:
+    /// live entries, the most recent successful dial first, then node ID
+    /// order, cut to the limit.
+    #[test]
+    fn the_book_selects_the_entries_its_file_keeps() {
+        use super::super::book_file::DiscoveryBookFile;
+
+        let mut book = ZakuraDiscoveryBook::default();
+        let mut ids = Vec::new();
+        for index in 1..=6u8 {
+            let record = signed_record_with(1, service(1), test_addr(index));
+            ids.push(record.body.node_id());
+            import_confirmed_record(&mut book, record).unwrap();
+        }
+        book.mark_dial_success(&ids[2], None, NOW - 10);
+        book.mark_dial_success(&ids[4], None, NOW - 5);
+        // An expired record is not kept, however recent its success.
+        let mut expiring = body(&secret_key());
+        expiring.direct_addrs = vec![test_addr(7)];
+        expiring.expires_at_unix_secs = NOW + 1;
+        let secret = secret_key();
+        expiring.keys = secret.key_list().clone();
+        let expiring = ZakuraNodeRecord::sign(expiring, &secret).unwrap();
+        let expired_id = expiring.body.node_id();
+        import_confirmed_record(&mut book, expiring).unwrap();
+        book.mark_dial_success(&expired_id, None, NOW);
+        let later = NOW + 2;
+
+        let node_ids = |entries: &[ZakuraDiscoveryPersistedEntry]| -> Vec<NodeId> {
+            entries
+                .iter()
+                .map(|entry| entry.record.body.node_id())
+                .collect()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let file = DiscoveryBookFile::new(dir.path().join("book"));
+        file.store(book.persisted_entries(), later).unwrap();
+        let from_file = node_ids(&file.load());
+        assert_eq!(from_file.len(), 6);
+        assert_eq!(from_file[..2], [ids[4], ids[2]]);
+        assert!(!from_file.contains(&expired_id));
+
+        assert_eq!(node_ids(&book.entries_to_persist(later, 6)), from_file);
+        assert_eq!(
+            node_ids(&book.entries_to_persist(later, 3)),
+            from_file[..3],
+            "a smaller limit keeps the first of the same order"
+        );
+        assert!(book.entries_to_persist(later, 0).is_empty());
     }
 
     /// The file keeps the most recently successful peers, stores static peers as

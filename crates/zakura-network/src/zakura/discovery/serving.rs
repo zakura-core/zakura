@@ -17,7 +17,10 @@ use super::{
         BlockSyncServiceSummary, DiscoveryMessage, DiscoveryWireError, GetPeers, GetServices,
         HeaderSyncServiceSummary, ServiceSummaryEnvelope, ZakuraDiscoveryHandle, ZakuraServiceId,
     },
-    wire::{peers_cap, services_cap, GET_PEERS, GET_SERVICES, LARGEST_PEERS, LARGEST_SERVICES},
+    wire::{
+        records_within, served_peers_cap, services_cap, GET_PEERS, GET_SERVICES, LARGEST_PEERS,
+        LARGEST_SERVICES,
+    },
 };
 use crate::zakura::{
     regulation::{
@@ -214,7 +217,7 @@ impl Produce for PeerSampler {
     type Message = DiscoveryMessage;
 
     fn response_cap(&self, query: &GetPeers) -> ResponseCap {
-        peers_cap(query.limit)
+        served_peers_cap(query.limit)
     }
 
     async fn produce(
@@ -235,6 +238,9 @@ impl Produce for PeerSampler {
                 &query.exclude_node_ids,
             )
             .await;
+        // Records that fill their extension area can make a sample larger
+        // than this node sends. The answer then carries the first of them.
+        let records = records_within(records, served_peers_cap(query.limit).bytes);
         sink.finish(&DiscoveryMessage::Peers { records })
             .map_err(|error| ServeEnd::LocalFault(error.to_string()))
     }

@@ -237,42 +237,42 @@ criteria = "safe-to-deploy"
 [[exemptions.libcrux-intrinsics]]
 version = "0.0.10"
 criteria = "safe-to-deploy"
-notes = "Introduced with the X25519MLKEM768 key-exchange group (zakura-quic TLS-9), which takes ML-KEM-768 from libcrux; exact-version exemption pending dedicated package review. This exemption is not an audit certification."
+notes = "Introduced with the hybrid key-exchange group (zakura-quic TLS-9), now X25519MLKEM1024, which takes ML-KEM-1024 from libcrux; exact-version exemption pending dedicated package review. This exemption is not an audit certification."
 
 [[exemptions.libcrux-macros]]
 version = "0.0.4"
 criteria = "safe-to-deploy"
-notes = "Introduced with the composite Ed25519 + ML-DSA-44 handshake signature (zakura-quic TLS-4), which takes ML-DSA-44 from libcrux; exact-version exemption pending dedicated package review. This exemption is not an audit certification."
+notes = "Introduced with the composite handshake signature (zakura-quic TLS-4), now Ed25519 + ML-DSA-65, which takes ML-DSA-65 from libcrux; exact-version exemption pending dedicated package review. This exemption is not an audit certification."
 
 [[exemptions.libcrux-ml-dsa]]
 version = "0.0.12"
 criteria = "safe-to-deploy"
-notes = "Introduced with the composite Ed25519 + ML-DSA-44 handshake signature (zakura-quic TLS-4), which takes ML-DSA-44 from libcrux; exact-version exemption pending dedicated package review. This exemption is not an audit certification."
+notes = "Introduced with the composite handshake signature (zakura-quic TLS-4), now Ed25519 + ML-DSA-65, which takes ML-DSA-65 from libcrux; exact-version exemption pending dedicated package review. This exemption is not an audit certification."
 
 [[exemptions.libcrux-ml-kem]]
 version = "0.0.12"
 criteria = "safe-to-deploy"
-notes = "Introduced with the X25519MLKEM768 key-exchange group (zakura-quic TLS-9), which takes ML-KEM-768 from libcrux; exact-version exemption pending dedicated package review. This exemption is not an audit certification."
+notes = "Introduced with the hybrid key-exchange group (zakura-quic TLS-9), now X25519MLKEM1024, which takes ML-KEM-1024 from libcrux; exact-version exemption pending dedicated package review. This exemption is not an audit certification."
 
 [[exemptions.libcrux-platform]]
 version = "0.0.4"
 criteria = "safe-to-deploy"
-notes = "Introduced with the X25519MLKEM768 key-exchange group (zakura-quic TLS-9), which takes ML-KEM-768 from libcrux; exact-version exemption pending dedicated package review. This exemption is not an audit certification."
+notes = "Introduced with the hybrid key-exchange group (zakura-quic TLS-9), now X25519MLKEM1024, which takes ML-KEM-1024 from libcrux; exact-version exemption pending dedicated package review. This exemption is not an audit certification."
 
 [[exemptions.libcrux-secrets]]
 version = "0.0.8"
 criteria = "safe-to-deploy"
-notes = "Introduced with the X25519MLKEM768 key-exchange group (zakura-quic TLS-9), which takes ML-KEM-768 from libcrux; exact-version exemption pending dedicated package review. This exemption is not an audit certification."
+notes = "Introduced with the hybrid key-exchange group (zakura-quic TLS-9), now X25519MLKEM1024, which takes ML-KEM-1024 from libcrux; exact-version exemption pending dedicated package review. This exemption is not an audit certification."
 
 [[exemptions.libcrux-sha3]]
 version = "0.0.12"
 criteria = "safe-to-deploy"
-notes = "Introduced with the X25519MLKEM768 key-exchange group (zakura-quic TLS-9), which takes ML-KEM-768 from libcrux; exact-version exemption pending dedicated package review. This exemption is not an audit certification."
+notes = "Introduced with the hybrid key-exchange group (zakura-quic TLS-9), now X25519MLKEM1024, which takes ML-KEM-1024 from libcrux; exact-version exemption pending dedicated package review. This exemption is not an audit certification."
 
 [[exemptions.libcrux-traits]]
 version = "0.0.10"
 criteria = "safe-to-deploy"
-notes = "Introduced with the X25519MLKEM768 key-exchange group (zakura-quic TLS-9), which takes ML-KEM-768 from libcrux; exact-version exemption pending dedicated package review. This exemption is not an audit certification."
+notes = "Introduced with the hybrid key-exchange group (zakura-quic TLS-9), now X25519MLKEM1024, which takes ML-KEM-1024 from libcrux; exact-version exemption pending dedicated package review. This exemption is not an audit certification."
 
 [[exemptions.libm]]
 version = "0.2.16"

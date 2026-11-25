@@ -4455,13 +4455,13 @@ fn retired_seed_ids_never_stop_startup() -> Result<()> {
     use zakura_test::command::{test_cmd, CommandExt as _};
 
     let _init_guard = zakura_test::init();
-    // asia-0's node ID before and since p2p-v2/4.
+    // asia-0's p2p-v2/3 and p2p-v2/5 node IDs.
     let retired = "1398f62c6d1a457c51ba6a4b5f3dbd2f69fca93216218dc8997e416bd17d93ca";
-    let current = "a5f148b592404c5fcdc27f06919681c1dceddb274336abf5c91e70780471bc12";
+    let current = "078a60720f0d474743a51674b152f49f575704a77905c16475683cff9d18f246";
     let retired_entry = format!("{retired}@127.0.0.1:1");
     let rewritten = regex::escape("rewrote default seeds' retired node IDs");
     let not_rewritten = regex::escape("could not rewrite the config file");
-    let warning = regex::escape("names a default seed by the node ID it had before");
+    let warning = regex::escape("names a default seed by its p2p-v2/3 node ID");
 
     // Runs `start` with `env` and waits for lines matching each of `expected` in order.
     // The replacement logs before "Starting zakurad", so its lines come first. Killing the

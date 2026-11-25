@@ -177,7 +177,9 @@ struct Binding {
     /// The last task that waited for a datagram and found none.
     waker: Option<Waker>,
     /// A receive error the scenario injected, returned before any datagram.
-    fail_next: Option<io::ErrorKind>,
+    fail_recv: Option<io::ErrorKind>,
+    /// A send error the scenario injected, returned by the next send.
+    fail_send: Option<io::ErrorKind>,
 }
 
 #[derive(Debug, Default)]
@@ -344,7 +346,8 @@ impl SimNet {
                 id,
                 queue: VecDeque::new(),
                 waker: None,
-                fail_next: None,
+                fail_recv: None,
+                fail_send: None,
             },
         );
         state.events.push(NetEvent::Bound { addr });
@@ -487,12 +490,24 @@ impl SimNet {
             let Some(binding) = state.sockets.get_mut(&addr) else {
                 return false;
             };
-            binding.fail_next = Some(kind);
+            binding.fail_recv = Some(kind);
             binding.waker.take()
         };
         if let Some(waker) = waker {
             waker.wake();
         }
+        true
+    }
+
+    /// Makes the next send on `addr` fail with `kind` and put nothing in
+    /// flight. `WouldBlock` stands for a full send buffer. Returns whether a
+    /// socket was bound there.
+    pub fn fail_next_send(&self, addr: SocketAddr, kind: io::ErrorKind) -> bool {
+        let mut state = self.lock();
+        let Some(binding) = state.sockets.get_mut(&addr) else {
+            return false;
+        };
+        binding.fail_send = Some(kind);
         true
     }
 
@@ -557,7 +572,7 @@ impl SimSocket {
     /// delivery can't slip between the check and the registration.
     fn poll_readable(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.with_binding(|binding| {
-            if !binding.queue.is_empty() || binding.fail_next.is_some() {
+            if !binding.queue.is_empty() || binding.fail_recv.is_some() {
                 return Poll::Ready(Ok(()));
             }
             match &mut binding.waker {
@@ -597,7 +612,8 @@ impl UdpIo for SimSocket {
         std::future::poll_fn(|cx| self.poll_readable(cx))
     }
 
-    /// Always ready: the network takes every send.
+    /// Always ready: an injected send failure lasts one send, so the next
+    /// try goes through.
     async fn writable(&self) -> io::Result<()> {
         Ok(())
     }
@@ -607,7 +623,7 @@ impl UdpIo for SimSocket {
     /// production socket drops a truncated one.
     fn try_recv(&self, buf: &mut [u8]) -> io::Result<Option<RecvMeta>> {
         self.with_binding(|binding| {
-            if let Some(kind) = binding.fail_next.take() {
+            if let Some(kind) = binding.fail_recv.take() {
                 return Err(io::Error::new(kind, "injected socket failure"));
             }
             let Some((remote, bytes)) = binding.queue.pop_front() else {
@@ -627,8 +643,11 @@ impl UdpIo for SimSocket {
     }
 
     /// Puts each datagram of the transmit in flight from this socket's
-    /// address. It never fails.
+    /// address. It fails only with an injected error, and then sends nothing.
     fn try_send(&self, transmit: &Transmit, contents: &[u8]) -> io::Result<()> {
+        if let Some(kind) = self.with_binding(|binding| binding.fail_send.take()) {
+            return Err(io::Error::new(kind, "injected socket failure"));
+        }
         let segment = transmit.segment_size.unwrap_or(contents.len()).max(1);
         let mut state = self.net.lock();
         // Read the clock under the lock that assigns sequence numbers, so

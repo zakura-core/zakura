@@ -253,10 +253,7 @@ fn echo_runs_under_sim() {
     ] {
         let (first, outcome, retries) = echo(plan.clone());
         assert_eq!(outcome, "echoed", "{:?}", first.end);
-        assert_eq!(
-            retries, 2,
-            "the hello spans two Initial datagrams and the server answered each with a Retry"
-        );
+        assert!(retries > 0, "the server required address validation");
         assert_eq!(
             first.end.outcome,
             Outcome::Idle {

@@ -609,7 +609,7 @@ fn close_4_alternate_survives_a_wait_for_the_parent() {
         &woke,
         HeaderAdmissionResult::Admitted {
             height: 2,
-            parent_hash: TEST_TIP_HASH,
+            parent_hash: parent,
         },
     );
     let failed = commitment(&mut table, now, &header, false);
@@ -804,7 +804,7 @@ fn a_refused_pending_copy_keeps_every_alternate() {
         &woke,
         HeaderAdmissionResult::Admitted {
             height: 2,
-            parent_hash: TEST_TIP_HASH,
+            parent_hash: alternate_parent,
         },
     );
     let failed = commitment(&mut table, now, &header, false);
@@ -869,7 +869,7 @@ fn an_ended_session_leaves_no_sender_record() {
         &woke,
         HeaderAdmissionResult::Admitted {
             height: 2,
-            parent_hash: TEST_TIP_HASH,
+            parent_hash: parent,
         },
     );
     let failed = commitment(&mut table, now, &header, false);
@@ -1280,7 +1280,10 @@ proptest! {
             mesh.run_until(start + Duration::from_millis(after));
             mesh.step_table(
                 node,
-                BlockInput::TipHeight { height: super::test_support::MESH_HEIGHT + PROPAGATION_DEPTH + 1, hash: TEST_TIP_HASH },
+                BlockInput::TipHeight {
+                    height: super::test_support::MESH_HEIGHT + PROPAGATION_DEPTH + 1,
+                    hash: TEST_TIP_HASH,
+                },
             );
         }
         mesh.run_until(start + Duration::from_secs(3));

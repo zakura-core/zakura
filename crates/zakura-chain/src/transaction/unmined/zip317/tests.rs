@@ -89,7 +89,10 @@ fn zip317_weight_ratio_is_uncapped() {
     );
 
     let miner_fee = Amount::try_from(200_000).expect("fee is a valid amount");
-    assert_eq!(conventional_fee_weight_ratio(&transaction, miner_fee), 250.0);
+    assert_eq!(
+        conventional_fee_weight_ratio(&transaction, miner_fee),
+        250.0
+    );
 }
 
 #[test]

@@ -272,7 +272,7 @@ counts, the places it holds, and its v2 peers. In this example the node has
 | `gateways` | The last ranking applied by v2 networking, best first, at most 256 gateways: the template nodes `mining.miner_mesh_template_nodes` lists, then the gateways named in at least 10 counted blocks. The gateway ID this node's own ID starts with is left out. |
 | `gateways[].gateway_id` | The gateway ID in hex: the 20 bytes the blocks name, the first 20 bytes of the gateway's v2 node ID. Peers report their full 32-byte node IDs as `node_id`. |
 | `gateways[].state` | See below. |
-| `gateways[].template_node` | The entry is a template node `mining.miner_mesh_template_nodes` lists. The node holds a place for it whatever its `state`, unless it is `ambiguous`. |
+| `gateways[].template_node` | The entry is a template node `mining.miner_mesh_template_nodes` lists. Within the funded places, the node holds a place for it whatever its `state`, unless it is `ambiguous`. |
 | `gateways[].connected` | The gateway is a v2 peer now. |
 | `hold` | The connection places held for preferred gateways and template nodes. |
 | `slots` | How connection slots are used, or null without v2 networking. `limit` includes all funded ordinary and gateway places. `in_use` is `preferred` plus `ordinary`; `preferred` counts one slot per preferred gateway connected; `inbound` counts slots of connections the remote node opened. |

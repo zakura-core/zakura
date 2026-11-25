@@ -134,11 +134,16 @@ impl RankedGateway {
     }
 
     /// Returns this gateway resolved to `node`, reachable as `standing` says.
-    /// A `node` whose ID does not start with this gateway ID changes nothing.
+    ///
+    /// `node`'s ID starts with this gateway ID: [`Self::resolved`] derives the
+    /// gateway ID from the node, and `classify_gateways` resolves a gateway
+    /// only to a node it matched by that prefix.
     pub(crate) fn resolved_as(mut self, node: NodeId, standing: GatewayStanding) -> Self {
-        if self.gateway.is_prefix_of(node.as_bytes()) {
-            self.resolution = GatewayMatch::One((node, standing));
-        }
+        debug_assert!(
+            self.gateway.is_prefix_of(node.as_bytes()),
+            "callers resolve a gateway only to a node whose ID starts with its gateway ID"
+        );
+        self.resolution = GatewayMatch::One((node, standing));
         self
     }
 

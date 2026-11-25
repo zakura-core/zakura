@@ -31,16 +31,16 @@ use crate::zakura::{
 /// prefers, then mining gateways ranked by how many recent best-chain blocks
 /// name them.
 ///
-/// The IDs the node always prefers rank ahead of every ranked gateway, and
-/// each keeps its place even while it is unreachable. Among themselves they
-/// are ordered like other gateways, connected ones first, not as given. The other gateways may be
-/// in any order: the dialer ranks them by block count, most first, and by
-/// lower gateway ID bytes among equal counts. It considers only the first
-/// 256 by rank, always-preferred IDs included. zakurad converts its config
-/// and the chain crate's gateway counts into this type in one place. It is
-/// the node's raw input; the dialer turns it into [`RankedGateway`]s, which
-/// carry the node each gateway ID names and each gateway's
-/// [`GatewayStanding`] for the connection-slot checks.
+/// The IDs the node always prefers rank ahead of every ranked gateway, in no
+/// promised order among themselves, and each keeps its place even while it
+/// is unreachable. The other gateways may be in any order: the dialer ranks
+/// them by block count, most first, and by lower gateway ID bytes among
+/// equal counts. It considers only the first 256 by rank, always-preferred
+/// IDs included. zakurad converts its config and the chain crate's gateway
+/// counts into this type in one place. It is the node's raw input; the
+/// dialer turns it into [`RankedGateway`]s, which carry the node each gateway
+/// ID names and each gateway's [`GatewayStanding`] for the connection-slot
+/// checks.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MinerGatewayRanking {
     /// The IDs the operator configures the node to always prefer, whatever

@@ -88,8 +88,8 @@ pub use tree::{
     build_part_tree, encoding_id, pad_hash, verify_part_proof, Bpv1Hash, ProofError, VerifiedPart,
 };
 pub use unknown_parent::{
-    check_binding_and_height, check_proof_of_work, target_bound_applies, TargetBound,
-    UnknownParentVerdict,
+    check_binding_and_height, check_proof_of_work, check_target_bound, target_bound_applies,
+    TargetBound, UnknownParentVerdict,
 };
 pub use wire::{
     encode_part_frame, read_part_prefix, Bpv1FifoQueue, Bpv1Message, DataQueueItem, HaveFlags,

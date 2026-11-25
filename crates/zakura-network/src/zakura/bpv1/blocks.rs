@@ -1849,8 +1849,8 @@ impl BlockTable {
             .expect("admitting entry verified present");
         match verdict {
             UnknownParentVerdict::Park => self.park(now, block_id, entry, parent_hash, now, step),
-            // Block sync owns the height.
-            UnknownParentVerdict::OutOfRange => {
+            // Block sync owns the block, and no sender is at fault.
+            UnknownParentVerdict::Drop => {
                 reject_meta(step, block_id, entry.from_peer, entry.session_gen);
                 reject_also(step, block_id, &entry.also_from);
             }

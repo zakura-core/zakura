@@ -20,8 +20,8 @@ use super::{
     profile::Profile,
     test_support::{block_of, build_v6_coinbase, build_v6_tx, node_id, regtest_nu7},
     unknown_parent::{
-        check_binding_and_height, check_proof_of_work, target_bound_applies, TargetBound,
-        UnknownParentVerdict,
+        check_binding_and_height, check_proof_of_work, check_target_bound, target_bound_applies,
+        TargetBound, UnknownParentVerdict,
     },
     wire::PROPAGATION_DEPTH,
 };
@@ -83,11 +83,15 @@ fn honest_child_with_a_late_parent_parks() {
         max_target: target_of(&header),
     };
     assert_eq!(
-        check_proof_of_work(&network, &header, 10, Some(bound)),
+        check_proof_of_work(&network, &header),
+        Ok(target_of(&header))
+    );
+    assert_eq!(
+        check_target_bound(&network, target_of(&header), 10, Some(bound)),
         UnknownParentVerdict::Park
     );
     assert_eq!(
-        check_proof_of_work(&network, &header, 10, None),
+        check_target_bound(&network, target_of(&header), 10, None),
         UnknownParentVerdict::Park
     );
 }
@@ -100,15 +104,15 @@ fn out_of_range_height_is_dropped_without_fault() {
     let (header, envelope) = honest_meta(40);
     assert_eq!(
         check_binding_and_height(&header, &envelope, 40),
-        Err(UnknownParentVerdict::OutOfRange)
+        Err(UnknownParentVerdict::Drop)
     );
     assert_eq!(
         check_binding_and_height(&header, &envelope, 41),
-        Err(UnknownParentVerdict::OutOfRange)
+        Err(UnknownParentVerdict::Drop)
     );
     assert_eq!(
         check_binding_and_height(&header, &envelope, 40 - PROPAGATION_DEPTH - 1),
-        Err(UnknownParentVerdict::OutOfRange)
+        Err(UnknownParentVerdict::Drop)
     );
     assert_eq!(
         check_binding_and_height(&header, &envelope, 40 - PROPAGATION_DEPTH),
@@ -118,7 +122,7 @@ fn out_of_range_height_is_dropped_without_fault() {
 
 /// Header sync can move the best header to the block's height or past it
 /// while the checks run. The bound then says nothing, so an honest block
-/// still parks, and proof of work still decides a fake.
+/// still parks.
 #[test]
 fn best_header_at_the_block_height_skips_the_bound() {
     let (header, _) = honest_meta(40);
@@ -129,7 +133,7 @@ fn best_header_at_the_block_height_skips_the_bound() {
             max_target: ExpandedDifficulty::from(target / U256::from(2u64)),
         };
         assert_eq!(
-            check_proof_of_work(&regtest_nu7(), &header, 40, Some(tight)),
+            check_target_bound(&regtest_nu7(), target_of(&header), 40, Some(tight)),
             UnknownParentVerdict::Park
         );
     }
@@ -154,10 +158,13 @@ fn binding_that_misses_the_merkle_root_closes_row_4() {
     );
 }
 
-/// A target above the bound closes its sender with row 3, except where the
-/// Testnet minimum-difficulty rule allows the proof-of-work limit.
+/// An honest header on a fork with less hash rate carries a target above
+/// the bound, because the bound assumes the header extends our best header.
+/// Its proof of work is valid, so it drops without fault instead of closing
+/// its sender. The bound does not apply where the Testnet minimum-difficulty
+/// rule allows the proof-of-work limit.
 #[test]
-fn target_above_the_bound_closes_row_3() {
+fn honest_fork_target_above_the_bound_drops_without_fault() {
     let network = regtest_nu7();
     let (header, _) = honest_meta(10);
     let target = U256::from(target_of(&header));
@@ -167,8 +174,12 @@ fn target_above_the_bound_closes_row_3() {
     };
     assert!(target_bound_applies(&network, 10));
     assert_eq!(
-        check_proof_of_work(&network, &header, 10, Some(tight)),
-        INVALID_HEADER
+        check_proof_of_work(&network, &header),
+        Ok(target_of(&header))
+    );
+    assert_eq!(
+        check_target_bound(&network, target_of(&header), 10, Some(tight)),
+        UnknownParentVerdict::Drop
     );
 
     // Regtest follows Testnet's minimum-difficulty rule above its start height.
@@ -179,7 +190,7 @@ fn target_above_the_bound_closes_row_3() {
         ..tight
     };
     assert_eq!(
-        check_proof_of_work(&network, &header, late, Some(tight_late)),
+        check_target_bound(&network, target_of(&header), late, Some(tight_late)),
         UnknownParentVerdict::Park
     );
 }
@@ -200,10 +211,11 @@ fn invalid_solution_closes_row_3() {
         nonce = nonce.checked_add(1).expect("a nonce meets the limit soon");
         header.nonce[..4].copy_from_slice(&nonce.to_le_bytes());
     }
-    assert_eq!(
-        check_proof_of_work(&network, &header, 10, None),
-        INVALID_HEADER
-    );
+    assert_eq!(check_proof_of_work(&network, &header), Err(INVALID_HEADER));
+
+    // A hash above its own target closes too.
+    header.difficulty_threshold = ExpandedDifficulty::from(U256::one()).to_compact();
+    assert_eq!(check_proof_of_work(&network, &header), Err(INVALID_HEADER));
 }
 
 /// The bound grows by `PoWMaxAdjustDown` per block above the best header and

@@ -185,7 +185,7 @@ pub fn replay_bpv1_block_bytes(bytes: &[u8]) -> BlockReplaySummary {
                 work_id: pending_works.pop().unwrap_or(WorkId(u64::from(b))),
                 verdict: [
                     UnknownParentVerdict::Park,
-                    UnknownParentVerdict::OutOfRange,
+                    UnknownParentVerdict::Drop,
                     UnknownParentVerdict::Invalid(Bpv1CloseRow::Row3InvalidHeader),
                     UnknownParentVerdict::Invalid(Bpv1CloseRow::Row4BadMetaOrCommitment),
                 ][usize::from(b % 4)],

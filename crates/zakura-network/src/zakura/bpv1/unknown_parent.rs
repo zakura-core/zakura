@@ -3,18 +3,29 @@
 //! Headerchain answers `MissingParent` after a hash lookup, before it checks
 //! proof of work. Without these checks, a made-up header with an unknown
 //! parent costs its sender only bytes. The checks need no parent, and they
-//! run cheapest first:
+//! run in this order:
 //!
 //! 1. The binding's coinbase txid reaches the header's Merkle root.
 //! 2. The coinbase height (BIP 34) lies above `top` and at most
 //!    [`PROPAGATION_DEPTH`] above it. Block sync owns every other height.
-//! 3. The target is at most the highest target that difficulty adjustment
+//! 3. The header hash meets the header's own target, and the Equihash
+//!    solution is valid.
+//! 4. The target is at most the highest target that difficulty adjustment
 //!    allows that far above the best header ([`TargetBound`]).
-//! 4. The header hash meets the target, and the Equihash solution is valid.
 //!
 //! A fake then costs about as much work as a real block that far ahead.
 //! The order departs from `bpv1-10` (headerchain before the commitment) only
 //! for metadata whose parent is missing.
+//!
+//! Only failures that no chain can contain close the sender. A binding that
+//! misses its header's Merkle root, a target above the proof-of-work limit, a
+//! hash above its own target, and an invalid solution are invalid on every
+//! chain of the network. Check 4 is not: it assumes the header extends the
+//! best header, and a header with an unknown parent may extend a fork. A fork
+//! with less hash rate legitimately carries targets several times ours, one
+//! block above our best header. So a target above the bound drops the
+//! metadata without fault. Check 3 runs first, so a drop costs its sender a
+//! valid solution.
 
 use zakura_chain::{
     block::{Header, Height},
@@ -40,10 +51,12 @@ const MAX_ADJUST_DOWN_PERCENT: u64 = 32;
 pub enum UnknownParentVerdict {
     /// Every check passed: the metadata waits for its parent.
     Park,
-    /// The block's height lies where block sync owns it. The sender is not at
-    /// fault.
-    OutOfRange,
-    /// A check failed, and the sender's session closes with this row.
+    /// This node cannot place the block, so block sync owns it: its height
+    /// lies outside the range, or its target exceeds the bound above the best
+    /// header. The sender is not at fault.
+    Drop,
+    /// A check failed that no chain can pass, and the sender's session closes
+    /// with this row.
     ///
     /// A binding that does not match its header closes with row 4. A target or
     /// proof of work that fails closes with row 3.
@@ -53,9 +66,9 @@ pub enum UnknownParentVerdict {
 /// The highest target that difficulty adjustment allows above the best header.
 ///
 /// A block's target is at most `1 + PoWMaxAdjustDown` times the mean target of
-/// its averaging window, so a header `k` blocks above the best header has a
-/// target at most `1.32^k` times the highest target in the best header's
-/// window. The bound reads the widest window that any upgrade uses, so it holds
+/// its averaging window, so a header `k` blocks above the best header, on a
+/// chain that extends it, has a target at most `1.32^k` times the highest
+/// target in the best header's window. A header on a fork need not meet it. The bound reads the widest window that any upgrade uses, so it holds
 /// across the NU7 change of `PoWAveragingWindow` (ZIP 218).
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct TargetBound {
@@ -121,7 +134,7 @@ impl TargetBound {
     }
 }
 
-/// Whether check 3 applies at `height`.
+/// Whether check 4 applies at `height`.
 ///
 /// The Testnet minimum-difficulty rule allows the proof-of-work limit after a
 /// long gap between blocks, so no bound holds where that rule is active.
@@ -146,44 +159,50 @@ pub fn check_binding_and_height(
         _ => return Err(invalid_binding),
     };
     if height <= top || height > top.saturating_add(PROPAGATION_DEPTH) {
-        return Err(UnknownParentVerdict::OutOfRange);
+        return Err(UnknownParentVerdict::Drop);
     }
     Ok(height)
 }
 
-/// Runs checks 3 and 4 on `header` at the coinbase `height`.
+/// Runs check 3 on `header`, and returns its target when it passes.
 ///
-/// `bound` is `None` when headerchain has no context for check 3; checks 1, 2
-/// and 4 still bound what a fake costs. Check 4 verifies an Equihash solution,
-/// so callers run this off the driver.
+/// Check 3 verifies an Equihash solution, so callers run this off the driver.
 pub fn check_proof_of_work(
     network: &Network,
     header: &Header,
-    height: u32,
-    bound: Option<TargetBound>,
-) -> UnknownParentVerdict {
+) -> Result<ExpandedDifficulty, UnknownParentVerdict> {
     let invalid_header = UnknownParentVerdict::Invalid(Bpv1CloseRow::Row3InvalidHeader);
-    let Ok(target) = validate_compact_target(header, network) else {
-        return invalid_header;
-    };
-    // A best header at or above `height` bounds nothing. Header sync moved it
-    // there during the checks, so check 4 decides, and the table retries the
-    // admission that may now find the header.
-    let limit = bound
-        .filter(|_| target_bound_applies(network, height))
-        .and_then(|bound| bound.limit_at(height, network.target_difficulty_limit()));
-    if limit.is_some_and(|limit| target > limit) {
-        return invalid_header;
-    }
+    let target = validate_compact_target(header, network).map_err(|_| invalid_header)?;
     // A network that cannot waive proof of work validates it, as headerchain does.
     let policy = PowPolicy::for_network(network).unwrap_or_else(|_| PowPolicy::validating(network));
     if !policy.is_authenticated_custom_waiver()
         && validate_hash_filter(header.hash(), target).is_err()
     {
-        return invalid_header;
+        return Err(invalid_header);
     }
-    if policy.validate_solution(header).is_err() {
-        return invalid_header;
+    policy
+        .validate_solution(header)
+        .map_err(|_| invalid_header)?;
+    Ok(target)
+}
+
+/// Runs check 4 on `target` at the coinbase `height`.
+///
+/// `bound` is `None` when headerchain has no context for check 4; checks 1 to
+/// 3 still bound what a fake costs. A best header at or above `height` bounds
+/// nothing: header sync moved it there during the checks, and the table
+/// retries the admission that may now find the header.
+pub fn check_target_bound(
+    network: &Network,
+    target: ExpandedDifficulty,
+    height: u32,
+    bound: Option<TargetBound>,
+) -> UnknownParentVerdict {
+    let limit = bound
+        .filter(|_| target_bound_applies(network, height))
+        .and_then(|bound| bound.limit_at(height, network.target_difficulty_limit()));
+    if limit.is_some_and(|limit| target > limit) {
+        return UnknownParentVerdict::Drop;
     }
     UnknownParentVerdict::Park
 }

@@ -17,7 +17,7 @@ pub enum Bpv1CloseRow {
     /// `bpv1-close-2`: Field out of range, truncation, or trailing bytes.
     Row2Decode = 2,
     /// `bpv1-close-3`: `HeaderMeta` whose header headerchain classifies as peer-invalid,
-    /// or whose target or proof of work fails while its parent is unknown.
+    /// or whose proof of work fails while its parent is unknown.
     Row3InvalidHeader = 3,
     /// `bpv1-close-4`: `HeaderMeta` layout mismatch or failed coinbase commitment.
     Row4BadMetaOrCommitment = 4,

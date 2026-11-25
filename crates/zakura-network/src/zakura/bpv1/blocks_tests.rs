@@ -697,9 +697,9 @@ fn invalid_header_closes_every_session_that_sent_it() {
 }
 
 /// Metadata whose parent header is unknown parks only after its checks pass
-/// (#2715). An out-of-range height drops it without fault. A failed target or
-/// proof of work closes every session that sent the header, and a failed
-/// binding closes only the sender whose binding failed.
+/// (#2715). An out-of-range height or a target above the bound drops it
+/// without fault. A failed proof of work closes every session that sent the
+/// header, and a failed binding closes only the sender whose binding failed.
 #[test]
 fn unknown_parent_verdicts_park_drop_or_close() {
     let now = Instant::now();
@@ -745,7 +745,7 @@ fn unknown_parent_verdicts_park_drop_or_close() {
     assert!(parked.outputs.is_empty());
 
     let dropped_id = block::Hash([0x42; 32]);
-    let (table, dropped) = check(UnknownParentVerdict::OutOfRange, dropped_id);
+    let (table, dropped) = check(UnknownParentVerdict::Drop, dropped_id);
     assert_eq!(table.pending_meta_len(), 0);
     assert_eq!(table.admitting_meta_len(), 0);
     assert_eq!(rejected_sessions(&dropped, dropped_id), both);

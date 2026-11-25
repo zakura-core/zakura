@@ -63,6 +63,13 @@ where
     fn opaque_types() -> &'static [u16] {
         &[]
     }
+
+    /// For a message of an opaque type, the payload bytes before its unparsed
+    /// tail, such as a list the family does parse. Only lengths that keep this
+    /// head whole must decode.
+    fn opaque_head_len(&self) -> usize {
+        0
+    }
 }
 
 /// Run every deterministic check for `M`.
@@ -75,7 +82,7 @@ where
     check_tight_bounds::<M>(&samples);
     for sample in &samples {
         let frame = check_round_trip(sample);
-        check_mutations::<M>(&frame);
+        check_mutations::<M>(&frame, sample.opaque_head_len());
     }
     check_undeclared_types::<M>(&samples[0]);
     for violation in M::violations() {
@@ -157,14 +164,17 @@ where
     frame
 }
 
-fn check_mutations<M: MessageSample>(frame: &Frame)
+fn check_mutations<M: MessageSample>(frame: &Frame, opaque_head_len: usize)
 where
     M::Error: Debug,
 {
     let len = frame.payload.len();
     let rule = MessageRule::find(M::RULES, frame.message_type).expect("samples use rows");
-    let admitted =
-        |len: usize| M::opaque_types().contains(&rule.message_type) && rule.payload.contains(len);
+    let admitted = |len: usize| {
+        M::opaque_types().contains(&rule.message_type)
+            && len >= opaque_head_len
+            && rule.payload.contains(len)
+    };
     // An admitted length decodes and re-encodes to the same bytes; any other
     // length fails.
     let check_changed = |changed: &Frame, what: &str| {

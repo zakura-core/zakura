@@ -20,7 +20,7 @@ use zakura_rt::{
 
 use super::{ConnCmd, ConnShared, Handshake, ReadReply, READ_BATCH_BYTES};
 use crate::{
-    congestion::CongestionProbe,
+    congestion::{CongestionProbe, RateMax},
     conn::{
         CongestionStats, ConnLimits, ConnLoad, ConnSample, ConnStats, DriverStats, Hooks,
         LOAD_INTERVAL, SAMPLE_INTERVAL,
@@ -98,6 +98,47 @@ struct SendState {
     writes: VecDeque<PendingWrite>,
     finish_after: bool,
     blocked_since: Option<Instant>,
+}
+
+/// The windowed-max inbound stream rate from one peer (06 §8), sampled at
+/// each load publish.
+///
+/// A sample is the smaller of two byte counts since the previous publish:
+/// stream bytes handed to readers, and UDP bytes the task handled. Reads alone
+/// overstate the link when a reader drains a backlog in a burst. Datagrams
+/// alone count padding and retransmissions. Neither raises the smaller count
+/// above what the link delivered as stream data.
+struct RateIn {
+    /// When the previous sample was taken, with both counters then.
+    last: Option<(Instant, u64, u64)>,
+    max: RateMax,
+}
+
+impl RateIn {
+    fn new(now: Instant) -> Self {
+        Self {
+            last: None,
+            max: RateMax::new(now),
+        }
+    }
+
+    /// Takes a sample from the read and UDP byte totals at `now`, and returns
+    /// the windowed max.
+    fn sample(&mut self, now: Instant, read: u64, udp: u64) -> Option<u64> {
+        if let Some((at, last_read, last_udp)) = self.last {
+            let bytes = read
+                .saturating_sub(last_read)
+                .min(udp.saturating_sub(last_udp));
+            let nanos = now.saturating_duration_since(at).as_nanos();
+            if bytes > 0 && nanos > 0 {
+                let bps = u128::from(bytes).saturating_mul(1_000_000_000) / nanos;
+                self.max
+                    .observe(now, u64::try_from(bps).unwrap_or(u64::MAX));
+            }
+        }
+        self.last = Some((now, read, udp));
+        self.max.get(now)
+    }
 }
 
 /// Counters the driver keeps beside quinn-proto's (OBS-12).
@@ -186,6 +227,7 @@ struct ConnTask<S: UdpIo> {
     more_to_send: bool,
     counters: Counters,
     exported: Exported,
+    rate_in: RateIn,
 }
 
 /// Runs one connection until quinn-proto drains it.
@@ -249,6 +291,7 @@ pub(crate) async fn run<S: UdpIo>(params: ConnTaskParams<S>) {
         more_to_send: false,
         counters: Counters::default(),
         exported: Exported::default(),
+        rate_in: RateIn::new(now()),
     };
 
     let mut cmds_open = true;
@@ -461,6 +504,11 @@ impl<S: UdpIo> ConnTask<S> {
         load.udp_rx = stats.udp_rx;
         load.frame_rx = stats.frame_rx;
         load.send_errors = self.counters.send_errors;
+        load.min_rtt = self.probe.min_rtt();
+        load.rate_in = self
+            .rate_in
+            .sample(now(), load.delivered_bytes, load.udp_rx.bytes);
+        load.rate_out = self.probe.rate_out();
         load.rtt = stats.path.rtt;
         load
     }
@@ -489,6 +537,7 @@ impl<S: UdpIo> ConnTask<S> {
         }
         if changed {
             tracing::debug!(target: "zakura_quic", %ip, admitted = %self.admitted, "peer migrated");
+            self.rate_in = RateIn::new(now());
         }
         if self.hooks.is_banned(ip) {
             metrics::counter!("zakura.quic.paths.closed_banned").increment(1);
@@ -1329,6 +1378,7 @@ mod tests {
             more_to_send: false,
             counters: Counters::default(),
             exported: Exported::default(),
+            rate_in: RateIn::new(now()),
         };
         (endpoint, task)
     }
@@ -1496,6 +1546,71 @@ mod tests {
             self.pump();
             read
         }
+    }
+
+    /// `rate_in` measures what the link delivered. A reader
+    /// that falls behind and then drains its backlog in a burst must not
+    /// raise it above the link rate.
+    #[tokio::test(start_paused = true)]
+    async fn a_delayed_reader_does_not_raise_rate_in_above_the_link_rate() {
+        const CHUNK: usize = 16 * 1024;
+        const STEP: Duration = Duration::from_millis(40);
+        // usize fits in u64, and STEP is 40 ms, on supported targets.
+        let link_bps = CHUNK as u64 * 1_000 / STEP.as_millis() as u64;
+        let mut pair = CreditPair::connected();
+        let stream = pair.stream;
+        let send_chunk = |pair: &mut CreditPair| {
+            let written = pair.peer().send_stream(stream).write(&[7; CHUNK]).unwrap();
+            assert_eq!(written, CHUNK);
+            pair.pump();
+            pair.task.process_events();
+        };
+        // The client learns of the stream from its first bytes.
+        send_chunk(&mut pair);
+        let (reply, accepted) = oneshot::channel();
+        pair.task.handle_cmd(ConnCmd::AcceptBi { reply });
+        assert_eq!(accepted.await.unwrap().unwrap(), stream);
+        let read = |task: &mut ConnTask<TokioUdpIo>, max: usize| {
+            let (reply, _result) = oneshot::channel();
+            task.handle_cmd(ConnCmd::Read {
+                id: stream,
+                max,
+                hold: 0,
+                reply,
+            });
+        };
+        let publish = |task: &mut ConnTask<TokioUdpIo>| {
+            task.load_stale = true;
+            let _ = task.publish_load();
+            task.shared.load.borrow().rate_in
+        };
+
+        // A reader that keeps up measures the link.
+        for _ in 0..16 {
+            read(&mut pair.task, CHUNK);
+            zakura_rt::time::sleep(STEP).await;
+            publish(&mut pair.task);
+            send_chunk(&mut pair);
+        }
+        zakura_rt::time::sleep(STEP * 4).await;
+        let measured = publish(&mut pair.task).expect("a busy link yields a rate");
+        assert!(measured <= link_bps, "{measured} > {link_bps}");
+
+        // The reader stops while the link fills the receive window, then
+        // drains the backlog in four reads 5 ms apart.
+        for _ in 1..4 {
+            send_chunk(&mut pair);
+            zakura_rt::time::sleep(STEP).await;
+            publish(&mut pair.task);
+        }
+        for _ in 0..4 {
+            read(&mut pair.task, CHUNK);
+            zakura_rt::time::sleep(Duration::from_millis(5)).await;
+            publish(&mut pair.task);
+        }
+        zakura_rt::time::sleep(STEP * 4).await;
+        let after = publish(&mut pair.task).expect("the estimate persists");
+        assert!(after <= link_bps, "{after} > {link_bps}");
     }
 
     /// API-10 relies on quinn-proto 0.11 counting a shrink below granted

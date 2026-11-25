@@ -1,6 +1,6 @@
 //! Typed boundary between header-sync policy and header-chain state.
 
-use std::{error::Error, fmt, future::Future, pin::Pin, sync::Arc};
+use std::{error::Error, fmt, future::Future, num::NonZeroU64, pin::Pin, sync::Arc};
 
 use zakura_chain::block;
 use zakura_header_chain::{
@@ -218,6 +218,54 @@ pub enum AcquirePathReply {
     CapacityBusy(ServingCapacitySignal),
 }
 
+/// Outcome of admitting a single exact header.
+///
+/// Coalesces by hash with header sync so a header already retained on either
+/// the selected chain or a retained fork returns [`Self::Admitted`] without
+/// re-validating.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ExactHeaderAdmission {
+    /// Exact header is retained/admitted at `height`.
+    Admitted {
+        /// Consensus height of the admitted header.
+        height: block::Height,
+        /// `true` when headerchain already retained this hash (e.g., via header sync),
+        /// allowing BPv1 to record `header.duplicate_bytes` (`decision-2`).
+        already_known: bool,
+    },
+    /// Parent header `parent_hash` is not yet retained in headerchain.
+    MissingParent {
+        /// Hash of the missing parent header.
+        parent_hash: block::Hash,
+    },
+    /// Header failed consensus/headerchain validation (`bpv1-close-3`).
+    PeerInvalid,
+    /// Local storage/service failure (never faults peer).
+    LocalError,
+}
+
+impl ExactHeaderAdmission {
+    /// Classifies a failed prepare or apply of an exact-header target.
+    pub fn target_failure(error: &HeaderChainError) -> Self {
+        if error.is_automatic_header_peer_fault() {
+            Self::PeerInvalid
+        } else {
+            Self::LocalError
+        }
+    }
+
+    /// Classifies a successful apply of an exact-header target at `height`.
+    pub fn applied(outcome: ApplyHeaderTargetOutcome, height: block::Height) -> Self {
+        match outcome {
+            ApplyHeaderTargetOutcome::Applied => Self::Admitted {
+                height,
+                already_known: false,
+            },
+            ApplyHeaderTargetOutcome::ResourceStalled(_) => Self::LocalError,
+        }
+    }
+}
+
 /// Where a header hash sits relative to the selected header chain.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum SelectedChainMembership {
@@ -364,6 +412,47 @@ pub struct PrepareHeaderTarget {
     pub entries: TargetEntries,
     /// Proof that the response satisfies its target purpose.
     pub completion: TargetCompletion,
+}
+
+impl PrepareHeaderTarget {
+    /// Builds the one-header target that [`Port::admit_exact_header`] prepares
+    /// on top of the retained `parent`. The request's `target` holds the
+    /// header's height. Header work uses the finalized frontier from `snapshot`.
+    ///
+    /// Returns [`ExactHeaderAdmission::PeerInvalid`] when the header's height
+    /// overflows.
+    pub fn exact_header(
+        header: Arc<block::Header>,
+        parent: Frontier,
+        snapshot: &EngineSnapshot,
+        source: SourceId,
+        session_id: u64,
+        request_id: NonZeroU64,
+    ) -> Result<Self, ExactHeaderAdmission> {
+        let Ok(height) = parent.height.next() else {
+            return Err(ExactHeaderAdmission::PeerInvalid);
+        };
+        let hash = header.hash();
+        let owner = HeaderSyncWorkOwner::Header(
+            HeaderWorkAuthority::for_target(snapshot, hash).bind(session_id, request_id),
+        );
+        let entries = TargetEntries::try_from(vec![TargetEntry {
+            header,
+            body_size: 0,
+            tree_aux: None,
+        }])
+        .map_err(|_| ExactHeaderAdmission::LocalError)?;
+        Ok(Self {
+            source,
+            owner,
+            common_ancestor: parent,
+            target: Frontier::new(height, hash),
+            entries,
+            completion: TargetCompletion::TargetComplete {
+                common_ancestor: parent,
+            },
+        })
+    }
 }
 
 /// A target sealed by the port's preparation operation.
@@ -544,6 +633,21 @@ pub trait Port: Send + Sync + 'static {
         &self,
         hash: block::Hash,
     ) -> HeaderChainFuture<'_, Result<SelectedChainMembership, PortError>>;
+
+    /// Admit a single exact header into headerchain.
+    ///
+    /// Coalesces by hash with header sync: if `header` is already retained
+    /// (selected chain or retained fork), returns [`ExactHeaderAdmission::Admitted`]
+    /// immediately without re-validating.
+    fn admit_exact_header(
+        &self,
+        _header: Arc<block::Header>,
+        _source: SourceId,
+        _session_id: u64,
+        _request_id: std::num::NonZeroU64,
+    ) -> HeaderChainFuture<'_, Result<ExactHeaderAdmission, PortError>> {
+        Box::pin(async { Ok(ExactHeaderAdmission::LocalError) })
+    }
 }
 
 impl std::fmt::Debug for dyn Port {
@@ -695,6 +799,53 @@ impl Port for InertHeaderChainPort {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_header_uses_finalized_authority_when_the_parent_is_unfinalized() {
+        use zakura_header_chain::{
+            BranchId, ChainScore, EngineMode, FrontierSet, HeaderGeneration, StateVersion,
+            SuffixWork, VerifiedGeneration,
+        };
+
+        let finalized = Frontier::new(block::Height(2), block::Hash([2; 32]));
+        let parent = Frontier::new(block::Height(3), block::Hash([3; 32]));
+        let snapshot = EngineSnapshot {
+            mode: EngineMode::Integrated,
+            state_version: StateVersion::new(1),
+            header_generation: HeaderGeneration::new(4),
+            verified_generation: VerifiedGeneration::new(1),
+            frontiers: FrontierSet {
+                finalized,
+                header_best: parent,
+                verified_best: parent,
+            },
+            header_best_score: ChainScore::new(SuffixWork::zero(), parent.hash),
+            oldest_retained_height: finalized.height,
+            alarms: Default::default(),
+        };
+        let mut header = *block::genesis::regtest_genesis_block().header;
+        header.previous_block_hash = parent.hash;
+        let hash = header.hash();
+        let target = PrepareHeaderTarget::exact_header(
+            Arc::new(header),
+            parent,
+            &snapshot,
+            SourceId::from_digest([0x5a; 32]),
+            7,
+            NonZeroU64::MIN,
+        )
+        .expect("the retained parent has a valid next height");
+
+        assert_eq!(target.common_ancestor, parent);
+        assert_eq!(target.target, Frontier::new(block::Height(4), hash));
+        assert_eq!(
+            target.owner.header_authority(),
+            HeaderWorkAuthority {
+                header_generation: snapshot.header_generation,
+                branch: BranchId::new(finalized.hash, hash),
+            }
+        );
+    }
 
     #[test]
     fn retained_path_identity_requires_the_issuing_adapter_key() {

@@ -3,9 +3,12 @@
 use std::{ops::Range, sync::Arc};
 
 use zakura_header_chain::BodyWorkOwner;
-use zakura_rt::sync::{
-    atomic::{AtomicU8, Ordering},
-    downgrade, CancellationToken, Weak,
+use zakura_rt::{
+    sync::{
+        atomic::{AtomicU8, Ordering},
+        downgrade, CancellationToken, Weak,
+    },
+    time::Instant,
 };
 
 use super::super::admission::{request_priority, RequestPriority};
@@ -445,10 +448,25 @@ impl FrameWriteClaim for RequestWrite {
             self.expire_unwritten();
             return false;
         }
-        let started = self
-            .state
-            .compare_exchange(QUEUED, STARTED, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok();
+        let start = || {
+            self.state
+                .compare_exchange(QUEUED, STARTED, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        };
+        let started = match &self.work.body_claims {
+            // The claims lock orders the start against a BPv1 claim. A request
+            // published before the claim skips the claimed body if its frame
+            // has not started. A started frame keeps its place on the stream.
+            Some(claims) => {
+                let hashes = self.items.iter().map(|(_, item)| &item.hash);
+                let Some(started) = claims.if_all_unclaimed(hashes, Instant::now(), start) else {
+                    self.expire_unwritten();
+                    return false;
+                };
+                started
+            }
+            None => start(),
+        };
         if started {
             report!(self.reporter, RequestStep::Started);
         }

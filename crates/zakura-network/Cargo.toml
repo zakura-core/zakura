@@ -60,6 +60,7 @@ internal-bench = []
 [dependencies]
 bitflags = { workspace = true }
 blake2b_simd = { workspace = true }
+blake3 = { workspace = true }
 byteorder = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
@@ -70,6 +71,7 @@ itertools = { workspace = true }
 pin-project = { workspace = true }
 rand_10 = { workspace = true }
 rayon = { workspace = true }
+reed-solomon-simd = { workspace = true }
 ring = { workspace = true }
 serde = { workspace = true, features = ["serde_derive"] }
 serde_json = { workspace = true }
@@ -166,3 +168,7 @@ required-features = ["internal-bench"]
 name = "block_checksum_threshold"
 harness = false
 required-features = ["internal-bench"]
+
+[[bench]]
+name = "bpv1_codec"
+harness = false

@@ -91,7 +91,9 @@ impl Write for NonBlocking {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         // A full or disconnected queue drops logs, matching the previous lossy
         // writer. Reporting success keeps output I/O off the caller's path.
-        let _ = self.sender.try_send(Message::Line(bytes.to_vec()));
+        if self.sender.try_send(Message::Line(bytes.to_vec())).is_err() {
+            metrics::counter!("tracing.log.dropped").increment(1);
+        }
         Ok(bytes.len())
     }
 

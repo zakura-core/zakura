@@ -84,7 +84,7 @@ impl<'a> BoundedReader<'a> {
 }
 
 /// Append the canonical CompactSize encoding of `count`.
-pub(super) fn write_compact_size(count: u64, out: &mut Vec<u8>) {
+pub(crate) fn write_compact_size(count: u64, out: &mut Vec<u8>) {
     // Each arm's range fits the width it casts to.
     match count {
         0..=0xfc => out.push(count as u8),
@@ -104,7 +104,7 @@ pub(super) fn write_compact_size(count: u64, out: &mut Vec<u8>) {
 }
 
 /// Length of the canonical CompactSize encoding of `count`.
-pub(super) const fn compact_size_len(count: usize) -> usize {
+pub(crate) const fn compact_size_len(count: usize) -> usize {
     match count {
         0..=0xfc => 1,
         0xfd..=0xffff => 3,

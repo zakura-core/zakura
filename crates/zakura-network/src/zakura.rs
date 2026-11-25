@@ -18,6 +18,7 @@ use crate::{
 };
 
 mod block_sync;
+pub mod bpv1;
 mod discovery;
 #[cfg(all(test, not(zakura_sim)))]
 mod example_reactor;
@@ -40,6 +41,10 @@ mod tx_relay;
 pub mod wire_codec;
 
 pub use block_sync::*;
+pub use bpv1::{
+    bpv1_custom_service, bpv1_service_id, Bpv1Handle, Bpv1Ports, Bpv1Service, ZakuraBpv1Config,
+    ZAKURA_CAP_BPV1,
+};
 pub use discovery::*;
 pub use handler::*;
 pub use handshake::*;

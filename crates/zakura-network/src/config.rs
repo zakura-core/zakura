@@ -83,6 +83,12 @@ impl ZakuraNodeSecretKey {
     }
 }
 
+impl From<&NodeSecretKey> for ZakuraNodeSecretKey {
+    fn from(key: &NodeSecretKey) -> Self {
+        Self(key.to_hex())
+    }
+}
+
 impl fmt::Debug for ZakuraNodeSecretKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("ZakuraNodeSecretKey([redacted])")

@@ -552,6 +552,7 @@ impl WorkQueueState {
     /// The estimate cap bounds the request's summed byte reservation. To
     /// guarantee progress, the first eligible item is always taken when
     /// `max_count > 0`, even if its estimate alone exceeds the cap.
+    /// A body that `is_body_claimed` stays pending and ends a contiguous run.
     ///
     /// Every taken item becomes a provisional, unpublished claim of `attempt`'s
     /// exact owner. A reset followed by a new take cannot be undone by this
@@ -564,6 +565,7 @@ impl WorkQueueState {
         max_count: usize,
         max_estimated_bytes: u64,
         attempt: (u64, std::num::NonZeroU64),
+        is_body_claimed: impl Fn(block::Hash) -> bool,
     ) -> Vec<(block::Height, WorkItem)> {
         // An empty count or inverted range is a caller bug, not a real "nothing to
         // take": every caller computes `low <= high` and a positive count before
@@ -582,6 +584,12 @@ impl WorkQueueState {
         let mut next_expected: Option<block::Height> = None;
         let mut scope = None;
         for (height, item) in self.pending.range(low..=high) {
+            if is_body_claimed(item.hash) {
+                if taken.is_empty() {
+                    continue;
+                }
+                break;
+            }
             if item.retry_after_tip.is_some_and(|tip| self.floor <= tip) {
                 break;
             }
@@ -1191,13 +1199,14 @@ impl WorkQueueState {
         &self,
         low: block::Height,
         high: block::Height,
+        is_body_claimed: impl Fn(block::Hash) -> bool,
     ) -> Option<block::Height> {
         if low > high {
             return None;
         }
         self.pending
             .range(low..=high)
-            .next()
+            .find(|(_, item)| !is_body_claimed(item.hash))
             .map(|(height, _)| *height)
     }
 

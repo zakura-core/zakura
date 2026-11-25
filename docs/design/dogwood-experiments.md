@@ -2,15 +2,15 @@
 
 > **Status: superseded draft.** This report covers the first draft's part masks,
 > grants, and byte-budgeted controller. The second revision of the
-> [spec](../specs/dogwood.md) replaced those mechanisms. The
-> [design](dogwood.md#current-evidence) summarizes the fleet results behind that
+> [spec](../specs/bpv1.md) replaced those mechanisms. The
+> [design](bpv1.md#current-evidence) summarizes the fleet results behind that
 > revision.
 
 The September 8–9, 2026 experiments test subscription allocation, proposer
 seeding, connected relay graphs, bounded fallback, and TCP delivery feedback.
 They do not establish production congestion control or sustained 50,000 TPS. The
-[design](dogwood.md) explains the tradeoffs; the
-[spec](../specs/dogwood.md#parameter-registry) owns parameter definitions.
+[design](bpv1.md) explains the tradeoffs; the
+[spec](../specs/bpv1.md#parameter-registry) owns parameter definitions.
 
 The experiment source and raw results remain on the local branch
 `local/dogwood-experiments-20260908`. PR #901 contains documentation only. The
@@ -263,7 +263,7 @@ At the planning rate, that holds about 33.55392 seconds of transaction bytes. A
 seconds requires at least 15.36 Gbps of source upload. The 1.344 Gbps average
 capacity example needs at least 57.14 seconds for that transfer. Stripes cannot
 remove this serialization time. We must select the block interval and body size
-before testing the [latency target](dogwood.md#performance-targets) under the
+before testing the [latency target](bpv1.md#performance-targets) under the
 resulting burst load.
 
 ## Reference codec scaling
@@ -920,7 +920,7 @@ relation reaches the source, so a parent can eventually serve a child's deficit
 after reconstructing. The checker has no clocks, failed parents, credit
 exhaustion, retention expiry, or repair-byte cap. This is a conditional liveness
 check, not a bounded-latency guarantee or a proof for sparse part subscriptions.
-The [design TODOs](dogwood.md#open-work) track those missing cases
+The [design TODOs](bpv1.md#open-work) track those missing cases
 and the proposed seeding-grant semantics.
 
 ## On-arrival Reed–Solomon

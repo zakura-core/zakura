@@ -2,6 +2,7 @@ use std::time::Duration;
 
 mod block_range_source;
 pub(crate) mod block_sync_driver;
+pub(crate) mod bpv1_wiring;
 mod coordinator;
 pub(crate) mod frontier;
 pub(crate) mod header_sync_driver;

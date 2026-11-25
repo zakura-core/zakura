@@ -419,6 +419,8 @@ pub struct ZakuraConfig {
     pub block_sync: ZakuraBlockSyncConfig,
     /// `tx-relay` settings (`[network.zakura.tx_relay]`).
     pub tx_relay: super::ZakuraTxRelayConfig,
+    /// BPv1 block propagation settings (`[network.zakura.bpv1]`, opt-in).
+    pub bpv1: super::ZakuraBpv1Config,
     /// Optional private dev-network cohort tag.
     ///
     /// When set, this node only forms Zakura (v2) connections with peers
@@ -455,6 +457,7 @@ impl Default for ZakuraConfig {
             header_sync: ZakuraHeaderSyncConfig::default(),
             block_sync: ZakuraBlockSyncConfig::default(),
             tx_relay: super::ZakuraTxRelayConfig::default(),
+            bpv1: super::ZakuraBpv1Config::default(),
             dev_network: None,
         }
     }
@@ -529,6 +532,15 @@ impl ZakuraConfig {
             };
             kinds.push((TX_RELAY_DATA_KIND, TX_RELAY_DATA_BUDGET));
             kinds.push((TX_RELAY_STATE_KIND, TX_RELAY_STATE_BUDGET));
+        }
+        // BPv1's kinds are listed only when enabled, so disabled nodes budget
+        // identically to before (`dual-6`).
+        if self.bpv1.enabled {
+            use super::bpv1::wire::{
+                BPV1_CONTROL_BUDGET, BPV1_CONTROL_KIND, BPV1_DATA_BUDGET, BPV1_DATA_KIND,
+            };
+            kinds.push((BPV1_CONTROL_KIND, BPV1_CONTROL_BUDGET));
+            kinds.push((BPV1_DATA_KIND, BPV1_DATA_BUDGET));
         }
         ReactorShares {
             kinds,
@@ -1068,6 +1080,8 @@ pub struct ZakuraHeaderSyncDriverStartup {
     pub vct_root_repairs: Option<watch::Receiver<zakura_header_chain::VctRootRepairStatus>>,
     /// Typed header-chain operations used directly by the reactor.
     pub header_chain_port: Arc<dyn zakura_node_services::header_chain::Port>,
+    /// Optional shared body claims coordinating native block sync with BPv1.
+    pub body_claims: Option<zakura_node_services::body_claims::SharedBodyClaims>,
 }
 
 impl ZakuraEndpoint {
@@ -4061,6 +4075,8 @@ impl ZakuraProtocolHandler {
         let limits_owner_bound = self.limits.owner_bound();
         let connection_resources = self.resources.connection(accepted_capabilities);
         self.resources.report_usage(limits_owner_bound);
+        // Services such as BPv1 read this connection's path load.
+        let load = connection.subscribe_load();
         #[cfg(zakura_sim)]
         if let Some(observer) = &self.transport_observer {
             observer.connection(
@@ -4195,8 +4211,8 @@ impl ZakuraProtocolHandler {
         };
 
         if negotiated_ordered_streams.is_empty() {
-            self.registry
-                .add_peer(Peer::new_with_conn_id_and_direction_and_close_cause(
+            self.registry.add_peer(
+                Peer::new_with_conn_id_and_direction_and_close_cause(
                     conn_id,
                     peer_id.clone(),
                     remote_ip,
@@ -4205,7 +4221,9 @@ impl ZakuraProtocolHandler {
                     HashMap::new(),
                     connection_token.clone(),
                     close_cause.clone(),
-                ));
+                )
+                .with_load(load.clone()),
+            );
             cleanup_guard.add_admitted_capabilities(accepted_capabilities);
         } else if !connection_token.is_cancelled() {
             let mut opened_capabilities = 0;
@@ -4270,6 +4288,7 @@ impl ZakuraProtocolHandler {
                         connection_token.clone(),
                         close_cause.clone(),
                     )
+                    .with_load(load.clone())
                     .with_rtt_reader(Some(connection.rtt_reader())),
                 );
                 cleanup_guard.add_admitted_capabilities(admitted_capabilities);
@@ -4392,6 +4411,7 @@ impl ZakuraProtocolHandler {
                                     connection_token.clone(),
                                     close_cause.clone(),
                                 )
+                                .with_load(load.clone())
                                 .with_rtt_reader(Some(connection.rtt_reader())),
                             );
                             cleanup_guard.add_admitted_capabilities(admitted_capabilities);
@@ -4520,6 +4540,7 @@ impl ZakuraProtocolHandler {
                                 connection_token.clone(),
                                 close_cause.clone(),
                             )
+                            .with_load(load.clone())
                             .with_rtt_reader(Some(connection.rtt_reader())),
                         );
                         cleanup_guard.add_admitted_capabilities(admitted_capabilities);
@@ -5970,6 +5991,9 @@ async fn spawn_zakura_endpoint_inner(
             .with_range_source(driver_startup.block_range_source.clone());
             startup.shutdown = header_sync_shutdown.clone();
             startup.trace = trace.clone();
+            if let Some(claims) = driver_startup.body_claims.clone() {
+                startup = startup.with_body_claims(claims);
+            }
             // With `checkpoint_sync = false` the verifier stops checkpointing
             // lower than this, so the cap only ever misses heights, never caps
             // a checkpoint range.
@@ -8703,6 +8727,8 @@ fn stream_kind_label(stream_kind: u16) -> &'static str {
         ZAKURA_STREAM_BLOCK_SYNC => "block_sync",
         super::tx_relay::wire::TX_RELAY_DATA_KIND => "tx_relay_data",
         super::tx_relay::wire::TX_RELAY_STATE_KIND => "tx_relay_state",
+        super::bpv1::wire::BPV1_CONTROL_KIND => "bpv1_control",
+        super::bpv1::wire::BPV1_DATA_KIND => "bpv1_data",
         _ => "unknown",
     }
 }

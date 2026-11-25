@@ -83,6 +83,7 @@ fn take(
             session,
             NonZeroU64::new(request).expect("tests use nonzero ids"),
         ),
+        |_| false,
     )
 }
 
@@ -401,7 +402,14 @@ fn adjacent_takes_by_two_peers_stay_disjoint() {
         authority(0),
         &[(1, 100), (2, 100), (3, 100), (4, 100)],
     );
-    let a = state.take_budgeted(height(1), height(4), 2, u64::MAX, (1, NonZeroU64::MIN));
+    let a = state.take_budgeted(
+        height(1),
+        height(4),
+        2,
+        u64::MAX,
+        (1, NonZeroU64::MIN),
+        |_| false,
+    );
     let b = take(&mut state, 1, 4, 2, 1);
     assert_eq!(heights_of(&a), BTreeSet::from([height(1), height(2)]));
     assert_eq!(heights_of(&b), BTreeSet::from([height(3), height(4)]));
@@ -423,9 +431,13 @@ fn adjacent_takes_by_two_peers_stay_disjoint() {
 fn a_take_stops_at_its_byte_cap_after_the_first_height() {
     let mut state = new_state();
     extend(&mut state, authority(0), &[(1, 300), (2, 100), (3, 100)]);
-    let first = state.take_budgeted(height(1), height(3), 3, 200, (1, NonZeroU64::MIN));
+    let first = state.take_budgeted(height(1), height(3), 3, 200, (1, NonZeroU64::MIN), |_| {
+        false
+    });
     assert_eq!(heights_of(&first), BTreeSet::from([height(1)]));
-    let rest = state.take_budgeted(height(1), height(3), 3, 200, (1, NonZeroU64::MAX));
+    let rest = state.take_budgeted(height(1), height(3), 3, 200, (1, NonZeroU64::MAX), |_| {
+        false
+    });
     assert_eq!(heights_of(&rest), BTreeSet::from([height(2), height(3)]));
 }
 
@@ -670,6 +682,7 @@ fn apply(state: &mut WorkQueueState, book: &mut Bookkeeping, op: Op) -> (u64, u6
                 max_count,
                 max_bytes,
                 (session, request),
+                |_| false,
             );
             let taken: Vec<u32> = items.iter().map(|(height, _)| height.0).collect();
             assert_eq!(

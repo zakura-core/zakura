@@ -42,6 +42,8 @@ mod peer_tests;
 #[cfg(test)]
 mod ports_tests;
 #[cfg(test)]
+mod reconnect_tests;
+#[cfg(test)]
 mod service_tests;
 #[cfg(test)]
 mod test_support;

@@ -180,11 +180,13 @@ pub(crate) enum BlockRoute {
 }
 
 /// An input for every live session.
+///
+/// A `BlockAdmitted` carries the block's `HeaderMeta` to every session. Each
+/// session records whether the metadata crossed its own connection, so it
+/// alone decides whether to send it (bpv1-4).
 #[derive(Debug)]
 pub(crate) struct Broadcast {
     input: PeerInput,
-    /// The peer that sent the block's `HeaderMeta`, which gets none back.
-    origin: Option<NodeId>,
     /// The block's `Have` initial group, whose sessions announce at once
     /// (decision-26).
     have_group: Vec<NodeId>,
@@ -195,9 +197,6 @@ impl Broadcast {
     pub(crate) fn input_for(&self, peer: &NodeId) -> PeerInput {
         let mut input = self.input.clone();
         if let PeerInput::BlockAdmitted(admitted) = &mut input {
-            if self.origin == Some(*peer) {
-                admitted.header_meta = None;
-            }
             if self.have_group.contains(peer) {
                 admitted.have_held_until = None;
             }
@@ -216,17 +215,12 @@ pub(crate) fn route_block_output(output: BlockOutput) -> BlockRoute {
     let broadcast = |input| {
         BlockRoute::Broadcast(Broadcast {
             input,
-            origin: None,
             have_group: Vec::new(),
         })
     };
     match output {
-        BlockOutput::PublishAdmitted {
-            mut admitted,
-            from_peer,
-        } => BlockRoute::Broadcast(Broadcast {
+        BlockOutput::PublishAdmitted { mut admitted } => BlockRoute::Broadcast(Broadcast {
             input: PeerInput::BlockAdmitted(admitted_input(&admitted)),
-            origin: from_peer,
             have_group: std::mem::take(&mut admitted.have_group),
         }),
         BlockOutput::GrantPull {

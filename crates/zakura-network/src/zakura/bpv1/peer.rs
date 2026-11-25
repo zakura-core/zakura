@@ -181,7 +181,7 @@ pub enum DropReason {
 }
 
 /// Block admitted locally in `BlockTable`; triggers `HeaderMeta` send (unless
-/// the peer already sent it) and replays held early entries.
+/// it already crossed this connection) and replays held early entries.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BlockAdmitted {
     /// Consensus block hash.
@@ -190,7 +190,9 @@ pub struct BlockAdmitted {
     pub coding: Coding,
     /// Committed proposer transport identity.
     pub proposer_node: NodeId,
-    /// Full `HeaderMeta` message to forward if this peer did not send it.
+    /// Full `HeaderMeta` message, which the session forwards unless the
+    /// metadata already crossed its connection. A new session of the peer
+    /// that sent it first still gets it.
     pub header_meta: Option<Box<Bpv1Message>>,
     /// Whether this local node is the block's proposer (queues `BlockDone` right after `HeaderMeta`, bpv1-9).
     pub as_proposer: bool,
@@ -1367,7 +1369,8 @@ impl PeerState {
         }
 
         // bpv1-4: send HeaderMeta at most once per connection, and never back
-        // to a peer that sent it first.
+        // on a connection that sent it. The session's own record decides,
+        // because a peer's later session never received this copy.
         if let Some(meta) = header_meta {
             if !state.meta_received && !state.meta_sent {
                 state.meta_sent = true;

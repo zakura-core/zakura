@@ -650,8 +650,6 @@ pub enum BlockOutput {
     PublishAdmitted {
         /// The admitted block descriptor.
         admitted: AdmittedBlock,
-        /// Peer that originally delivered `HeaderMeta` (`None` if local proposer).
-        from_peer: Option<NodeId>,
     },
     /// Grant an arrival-ordered pull to `peer`'s `PeerState`.
     GrantPull {
@@ -2489,10 +2487,7 @@ impl BlockTable {
         // selection and writer-start checks skip the claimed body.
         step.outputs
             .push(BlockOutput::ClaimBody { block_id, deadline });
-        step.outputs.push(BlockOutput::PublishAdmitted {
-            admitted,
-            from_peer: Some(entry.from_peer),
-        });
+        step.outputs.push(BlockOutput::PublishAdmitted { admitted });
         // An empty body has no stripes, so the block assembles from
         // `HeaderMeta` alone and no part crosses the wire for it.
         self.maybe_assemble_and_verify(now, block_id, step);
@@ -2710,10 +2705,7 @@ impl BlockTable {
         let admitted = active.admitted();
         self.blocks.insert(block_id, active);
         step.events.push(BlockEvent::BlockAdmitted { block_id });
-        step.outputs.push(BlockOutput::PublishAdmitted {
-            admitted,
-            from_peer: None,
-        });
+        step.outputs.push(BlockOutput::PublishAdmitted { admitted });
         // decision-20: the proposer announces nothing. Its `BlockDone` tells
         // repair that it holds every part.
     }

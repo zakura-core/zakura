@@ -1457,6 +1457,44 @@ fn reject_later(step: &mut BlockStep, block_id: block::Hash, later: &LaterCopies
     }
 }
 
+/// Closes with row 4 the first sender `from` of a failed envelope and every
+/// later session whose copy equals it, and takes the oldest alternate
+/// envelope with its senders out of `later`; the other alternates wait
+/// behind it in arrival order. Rejects the unkept senders when the entry
+/// kept no alternate.
+fn close_failed_copies(
+    block_id: block::Hash,
+    from: (NodeId, u64),
+    later: &mut LaterCopies,
+    step: &mut BlockStep,
+) -> Option<(Box<MetaEnvelope>, Vec<(NodeId, u64)>)> {
+    for (peer, session_gen) in std::iter::once(from).chain(later.same.drain(..)) {
+        step.outputs.push(BlockOutput::ClosePeer {
+            peer,
+            session_gen,
+            row: Bpv1CloseRow::Row4BadMetaOrCommitment,
+        });
+    }
+    let alternate = later.alternates.pop_front();
+    if alternate.is_none() {
+        for &(peer, session_gen) in &later.unkept {
+            reject_meta(step, block_id, peer, session_gen);
+        }
+    }
+    alternate
+}
+
+/// Splits an alternate's `senders` into the first sender, who now owns the
+/// entry, and the sessions whose copy equals it.
+fn promote_alternate(senders: Vec<(NodeId, u64)>, later: &mut LaterCopies) -> (NodeId, u64) {
+    let mut senders = senders.into_iter();
+    let first = senders
+        .next()
+        .expect("an alternate envelope keeps at least one live sender");
+    later.same = senders.collect();
+    first
+}
+
 /// Whether metadata that would wait for its parent retries header admission
 /// instead: the best header moved since its admission started, so header
 /// sync may have admitted the parent or the header itself, and no wake
@@ -2197,27 +2235,23 @@ impl BlockTable {
                 reject_meta(step, block_id, entry.from_peer, entry.session_gen);
                 reject_later(step, block_id, &entry.later);
             }
-            UnknownParentVerdict::Invalid(row) => {
-                step.outputs.push(BlockOutput::ClosePeer {
-                    peer: entry.from_peer,
-                    session_gen: entry.session_gen,
-                    row,
-                });
-                if row == Bpv1CloseRow::Row3InvalidHeader {
-                    // `block_id` is the hash of the header bytes, so every
-                    // later session sent this same invalid header.
-                    for (peer, session_gen) in entry.later.sessions() {
-                        step.outputs.push(BlockOutput::ClosePeer {
-                            peer,
-                            session_gen,
-                            row,
-                        });
-                    }
-                } else {
-                    // Another sender's binding may differ under the same hash,
-                    // so it is not faulted for this one's.
-                    reject_later(step, block_id, &entry.later);
+            // `block_id` is the hash of the header bytes, so every later
+            // session sent this same invalid header.
+            UnknownParentVerdict::Invalid(row @ Bpv1CloseRow::Row3InvalidHeader) => {
+                for (peer, session_gen) in std::iter::once((entry.from_peer, entry.session_gen))
+                    .chain(entry.later.sessions())
+                {
+                    step.outputs.push(BlockOutput::ClosePeer {
+                        peer,
+                        session_gen,
+                        row,
+                    });
                 }
+            }
+            // Another sender's binding may differ under the same hash, so
+            // the alternate gets its own check.
+            UnknownParentVerdict::Invalid(_) => {
+                self.handle_unknown_parent_binding_failed(block_id, entry, step)
             }
         }
     }
@@ -2516,64 +2550,107 @@ impl BlockTable {
         entry: AdmittingEntry,
         step: &mut BlockStep,
     ) {
-        let AdmittingEntry {
-            arrived_at,
-            from_peer,
-            session_gen,
-            mut later,
-            height,
-            parent_hash,
-            parked_at,
-            best_moves,
-            ..
-        } = entry;
-        for (peer, session_gen) in std::iter::once((from_peer, session_gen)).chain(later.same) {
-            step.outputs.push(BlockOutput::ClosePeer {
-                peer,
-                session_gen,
-                row: Bpv1CloseRow::Row4BadMetaOrCommitment,
-            });
-        }
-        let Some((envelope, senders)) = later.alternates.pop_front() else {
-            for &(peer, session_gen) in &later.unkept {
-                reject_meta(step, block_id, peer, session_gen);
-            }
+        let height = entry
+            .height
+            .expect("an entry that waits for its commitment has its admitted height");
+        let mut later = entry.later;
+        let Some((envelope, senders)) = close_failed_copies(
+            block_id,
+            (entry.from_peer, entry.session_gen),
+            &mut later,
+            step,
+        ) else {
             return;
         };
-        let height =
-            height.expect("an entry that waits for its commitment has its admitted height");
-        let mut senders = senders.into_iter();
-        let (from_peer, session_gen) = senders
-            .next()
-            .expect("an alternate envelope keeps at least one live sender");
+        let (from_peer, session_gen) = promote_alternate(senders, &mut later);
         let work_id = alloc_work_id(&mut self.next_work_id);
         self.work_to_block.insert(work_id, block_id);
-        self.admitting.insert(
-            block_id,
-            AdmittingEntry {
-                work_id,
-                envelope: envelope.clone(),
-                arrived_at,
-                from_peer,
-                session_gen,
-                later: LaterCopies {
-                    same: senders.collect(),
-                    alternates: later.alternates,
-                    unkept: later.unkept,
-                },
-                height: Some(height),
-                parent_hash,
-                stage: AdmittingStage::WaitingCommitment,
-                parked_at,
-                best_moves,
-            },
-        );
         step.outputs.push(BlockOutput::VerifyCommitment {
             work_id,
             block_id,
             height,
-            envelope,
+            envelope: envelope.clone(),
         });
+        self.admitting.insert(
+            block_id,
+            AdmittingEntry {
+                work_id,
+                envelope,
+                from_peer,
+                session_gen,
+                later,
+                ..entry
+            },
+        );
+    }
+
+    /// Closes every session that sent the pending `entry`'s failed binding
+    /// with row 4, then runs the unknown-parent checks on the oldest
+    /// alternate envelope, if the entry kept one (bpv1-61). The other
+    /// alternates wait behind it in arrival order.
+    ///
+    /// The binding check is a pure function of the envelope, so each session
+    /// whose copy equals the failed envelope sent the failed binding. The
+    /// alternate keeps the entry's place in the pending budget, its deadline
+    /// and its best-header count. Its new owner is the first of its senders
+    /// below [`MAX_PENDING_META_PER_PEER`] (`bpv1-11`). An alternate whose
+    /// senders are all at that cap is rejected without fault, and the next
+    /// one takes its place.
+    fn handle_unknown_parent_binding_failed(
+        &mut self,
+        block_id: block::Hash,
+        entry: PendingMetaEntry,
+        step: &mut BlockStep,
+    ) {
+        let mut later = entry.later;
+        let mut next = close_failed_copies(
+            block_id,
+            (entry.from_peer, entry.session_gen),
+            &mut later,
+            step,
+        );
+        let (envelope, from_peer, session_gen) = loop {
+            let Some((envelope, mut senders)) = next else {
+                return;
+            };
+            let below_cap = senders
+                .iter()
+                .position(|&(peer, _)| self.pending_held_by(peer).0 < MAX_PENDING_META_PER_PEER);
+            if let Some(index) = below_cap {
+                let owner = senders.remove(index);
+                senders.insert(0, owner);
+                let (from_peer, session_gen) = promote_alternate(senders, &mut later);
+                break (envelope, from_peer, session_gen);
+            }
+            for (peer, session_gen) in senders {
+                reject_meta(step, block_id, peer, session_gen);
+            }
+            next = later.alternates.pop_front();
+            if next.is_none() {
+                for &(peer, session_gen) in &later.unkept {
+                    reject_meta(step, block_id, peer, session_gen);
+                }
+            }
+        };
+        let work_id = alloc_work_id(&mut self.next_work_id);
+        self.work_to_block.insert(work_id, block_id);
+        step.outputs.push(BlockOutput::CheckUnknownParent {
+            work_id,
+            block_id,
+            envelope: envelope.clone(),
+            top: self.top,
+        });
+        let entry = PendingMetaEntry {
+            envelope,
+            from_peer,
+            session_gen,
+            later,
+            checking: Some(work_id),
+            ..entry
+        };
+        // The failed entry's charge covered the alternate, so it still fits.
+        self.pending_bytes = self.pending_bytes.saturating_add(entry.charged_bytes());
+        self.pending.insert(block_id, entry);
     }
 
     /// Frees a concurrent-block slot if every slot is taken.

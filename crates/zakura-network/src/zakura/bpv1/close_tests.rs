@@ -13,10 +13,11 @@ use zakura_rt::time::Instant;
 use super::{
     blocks::{
         BlockConfig, BlockEvent, BlockInput, BlockOutput, BlockStep, BlockTable,
-        HeaderAdmissionResult,
+        HeaderAdmissionResult, MAX_PENDING_META_PER_PEER,
     },
     blocks_tests::{
         closed_sessions, commitment_ok, header_result, missing_parent, rejected_sessions,
+        unknown_parent_checked,
     },
     close::Bpv1CloseRow,
     codec::encode_body,
@@ -28,6 +29,7 @@ use super::{
     profile::Profile,
     service::{control_input, data_input},
     test_support::{commit_work, make_envelope, node_id, LinkProfile, MachineMesh, TEST_TIP_HASH},
+    unknown_parent::UnknownParentVerdict,
     wire::{HaveFlags, PROPAGATION_DEPTH},
 };
 use crate::zakura::{handshake::Frame, wire_codec::encode_frame};
@@ -442,6 +444,199 @@ fn close_4_failed_commitment_closes_identical_copies_and_checks_the_alternate() 
         .all(|o| !matches!(o, BlockOutput::ClosePeer { .. })));
 }
 
+/// `bpv1-close-4`, unknown parent (bpv1-61): a binding that fails the
+/// unknown-parent checks closes the first sender and each session whose copy
+/// equals it. The kept alternates get their own checks in arrival order,
+/// and the first one that passes parks.
+#[test]
+fn close_4_failed_unknown_parent_binding_checks_the_alternate() {
+    let now = Instant::now();
+    let parent = block::Hash([0x38; 32]);
+    let block_id = block::Hash([0x39; 32]);
+    let [a, b, c, d] = sessions();
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let first = copy_from(
+        &mut table,
+        now,
+        make_envelope(block_id, tiny(), [0xA1; 32], node_id(1)),
+        a,
+    );
+    for (root, from) in [([0xA1; 32], b), ([0xA2; 32], c), ([0xA3; 32], d)] {
+        copy_from(
+            &mut table,
+            now,
+            make_envelope(block_id, tiny(), root, node_id(1)),
+            from,
+        );
+    }
+    let checking = header_result(
+        &mut table,
+        now,
+        &first,
+        HeaderAdmissionResult::MissingParent {
+            parent_hash: parent,
+        },
+    );
+    let failed = unknown_parent_checked(
+        &mut table,
+        now,
+        &checking,
+        UnknownParentVerdict::Invalid(Bpv1CloseRow::Row4BadMetaOrCommitment),
+    );
+    assert_eq!(
+        closed_sessions(&failed, Bpv1CloseRow::Row4BadMetaOrCommitment),
+        sorted(vec![a, b])
+    );
+    assert!(rejected_sessions(&failed, block_id).is_empty());
+    table.assert_invariants();
+
+    // `c`'s copy is the oldest alternate, so it is checked next; `d` waits.
+    let failed = unknown_parent_checked(
+        &mut table,
+        now,
+        &failed,
+        UnknownParentVerdict::Invalid(Bpv1CloseRow::Row4BadMetaOrCommitment),
+    );
+    assert_eq!(
+        closed_sessions(&failed, Bpv1CloseRow::Row4BadMetaOrCommitment),
+        vec![c]
+    );
+    assert!(rejected_sessions(&failed, block_id).is_empty());
+    table.assert_invariants();
+
+    let parked = unknown_parent_checked(&mut table, now, &failed, UnknownParentVerdict::Park);
+    assert!(parked
+        .outputs
+        .iter()
+        .all(|o| !matches!(o, BlockOutput::ClosePeer { .. })));
+    assert_eq!(table.pending_meta_len(), 1);
+    table.assert_invariants();
+}
+
+/// An alternate whose sender already holds [`MAX_PENDING_META_PER_PEER`]
+/// pending entries does not take over a failed unknown-parent binding
+/// (`bpv1-11`). Its copy is rejected without fault, and the next alternate
+/// takes the entry.
+#[test]
+fn close_4_failed_unknown_parent_binding_skips_an_alternate_at_the_pending_cap() {
+    let now = Instant::now();
+    let parent = block::Hash([0x3C; 32]);
+    let block_id = block::Hash([0x3D; 32]);
+    let [a, b, c, _] = sessions();
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    for i in (0u8..).take(MAX_PENDING_META_PER_PEER) {
+        let held = copy_from(
+            &mut table,
+            now,
+            make_envelope(
+                block::Hash([0x80 + i; 32]),
+                tiny(),
+                [0xB0 + i; 32],
+                node_id(1),
+            ),
+            b,
+        );
+        missing_parent(&mut table, now, &held, parent);
+    }
+    let first = copy_from(
+        &mut table,
+        now,
+        make_envelope(block_id, tiny(), [0xC1; 32], node_id(1)),
+        a,
+    );
+    for (root, from) in [([0xC2; 32], b), ([0xC3; 32], c)] {
+        copy_from(
+            &mut table,
+            now,
+            make_envelope(block_id, tiny(), root, node_id(1)),
+            from,
+        );
+    }
+    let checking = header_result(
+        &mut table,
+        now,
+        &first,
+        HeaderAdmissionResult::MissingParent {
+            parent_hash: parent,
+        },
+    );
+    let failed = unknown_parent_checked(
+        &mut table,
+        now,
+        &checking,
+        UnknownParentVerdict::Invalid(Bpv1CloseRow::Row4BadMetaOrCommitment),
+    );
+    assert_eq!(
+        closed_sessions(&failed, Bpv1CloseRow::Row4BadMetaOrCommitment),
+        vec![a]
+    );
+    assert_eq!(rejected_sessions(&failed, block_id), vec![b]);
+    table.assert_invariants();
+
+    // `c`'s copy took the entry, so its checks run and it parks.
+    unknown_parent_checked(&mut table, now, &failed, UnknownParentVerdict::Park);
+    assert_eq!(table.pending_meta_len(), MAX_PENDING_META_PER_PEER + 1);
+    table.assert_invariants();
+}
+
+/// An alternate that takes over a failed unknown-parent binding keeps the
+/// entry's best-header count. The best header moved during the first copy's
+/// checks, and no wake reached the entry, so the alternate retries header
+/// admission when its checks pass.
+#[test]
+fn close_4_unknown_parent_alternate_retries_after_the_best_header_moved() {
+    let now = Instant::now();
+    let parent = block::Hash([0x3A; 32]);
+    let block_id = block::Hash([0x3B; 32]);
+    let [a, b, ..] = sessions();
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let first = copy_from(
+        &mut table,
+        now,
+        make_envelope(block_id, tiny(), [0xA1; 32], node_id(1)),
+        a,
+    );
+    copy_from(
+        &mut table,
+        now,
+        make_envelope(block_id, tiny(), [0xA2; 32], node_id(1)),
+        b,
+    );
+    let checking = header_result(
+        &mut table,
+        now,
+        &first,
+        HeaderAdmissionResult::MissingParent {
+            parent_hash: parent,
+        },
+    );
+    table.step(
+        now,
+        BlockInput::ParentAdmitted {
+            hash: parent,
+            height: 1,
+        },
+    );
+    let failed = unknown_parent_checked(
+        &mut table,
+        now,
+        &checking,
+        UnknownParentVerdict::Invalid(Bpv1CloseRow::Row4BadMetaOrCommitment),
+    );
+    assert_eq!(
+        closed_sessions(&failed, Bpv1CloseRow::Row4BadMetaOrCommitment),
+        vec![a]
+    );
+
+    let retried = unknown_parent_checked(&mut table, now, &failed, UnknownParentVerdict::Park);
+    assert_eq!(table.pending_meta_len(), 0);
+    assert!(retried
+        .outputs
+        .iter()
+        .any(|o| matches!(o, BlockOutput::AdmitHeader { .. })));
+    table.assert_invariants();
+}
+
 /// The alternate envelope waits with its entry while the parent header is
 /// unknown, and gets its check once the parent arrives.
 #[test]
@@ -806,6 +1001,27 @@ fn close_5_repeated_header_meta_closes_while_the_block_is_known() {
     assert!(peer.close_cause().is_none());
     peer.step(now, recv_meta(block_id));
     assert_closed(&peer, Bpv1CloseRow::Row5DuplicateHeaderMeta);
+}
+
+/// `EvictRetired` drops the session's tombstone of a retired block. A
+/// `HeaderMeta` for the block then reaches the table, whose window refuses
+/// it, instead of closing 5 as a repeat.
+#[test]
+fn evicted_tombstone_forgets_the_retired_block() {
+    let now = Instant::now();
+    let block_id = block::Hash([0x56; 32]);
+    let mut peer = tiny_session(block_id, now);
+    peer.step(now, recv_meta(block_id));
+    peer.step(now, retire(block_id));
+    peer.step(now, PeerInput::EvictRetired { block_id });
+    peer.assert_invariants();
+
+    let step = peer.step(now, recv_meta(block_id));
+    assert!(peer.close_cause().is_none());
+    assert!(step.outputs.iter().any(
+        |o| matches!(o, PeerOutput::SubmitHeaderMeta { block_id: id, .. } if *id == block_id)
+    ));
+    peer.assert_invariants();
 }
 
 /// `bpv1-close-8`: a `Want` stripe or slot outside the admitted layout

@@ -35,6 +35,8 @@ mod blocks_tests;
 mod close_tests;
 #[cfg(all(test, not(zakura_sim)))]
 mod conformance_tests;
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub mod fuzz;
 #[cfg(all(test, not(zakura_sim)))]
 mod integration_tests;
 #[cfg(test)]

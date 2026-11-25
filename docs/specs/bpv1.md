@@ -817,12 +817,15 @@ admission:
 - A copy that fails its commitment check returns `Disconnect` for every peer
   that sent an equal copy, first or later. The check depends only on the copy
   and the admitted height, so an honest relay never forwards a copy that fails
-  it.
+  it. With a missing parent, a copy whose binding fails the section 1 checks
+  returns `Disconnect` the same way.
 - The node keeps each differing copy while it fits the metadata budget.
   Kept copies use only room that no first copy needs, and they give way to
   any first copy that the node admits.
 - When the first copy fails, the node checks the kept copies one at a time,
-  in arrival order, until one passes.
+  in arrival order, until one passes. With a missing parent, a kept copy
+  whose senders all hold the per-peer pending limit returns `Drop`, and the
+  next kept copy takes its place.
 - A peer whose session ended gets no answer, so the node forgets it as a
   sender of a copy.
 - Every other duplicate from another peer returns `Drop`, including each copy

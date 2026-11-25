@@ -1568,6 +1568,40 @@ fn bpv1_12_part_under_another_part_root_is_not_stored() {
     );
 }
 
+/// A peer's copy whose commitment check finishes after this node admitted
+/// the same block from its own miner never replaces the solved block.
+#[test]
+fn local_admission_during_a_peer_copy_check_keeps_the_solved_block() {
+    let encoded = encode_body(&Profile::TINY, &[0x22; 128], 2).unwrap();
+    let block_id = block::Hash([42; 32]);
+    let envelope = || make_envelope(block_id, encoded.coding, encoded.part_root, node_id(1));
+    let now = Instant::now();
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let received = receive(&mut table, now, envelope());
+    let checking = header_result(
+        &mut table,
+        now,
+        &received,
+        HeaderAdmissionResult::Admitted { height: 1 },
+    );
+    let _ = table.step(
+        now,
+        BlockInput::BlockAdmittedLocal {
+            height: 1,
+            envelope: envelope(),
+            parts: encoded.parts.clone(),
+        },
+    );
+    let late = commitment_ok(&mut table, now, &checking);
+    table.assert_invariants();
+    assert!(
+        late.outputs.is_empty(),
+        "the late copy publishes, claims and retires nothing: {:?}",
+        late.outputs
+    );
+    assert_eq!(table.block_phase(&block_id), Some(BlockPhase::Done));
+}
+
 /// decision-20: the proposer announces nothing for its own block.
 #[test]
 fn decision20_proposer_admission_announces_nothing() {

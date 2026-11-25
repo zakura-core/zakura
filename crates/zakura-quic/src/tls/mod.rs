@@ -626,7 +626,7 @@ mod tests {
         };
         let credential = NodeCredential::from_entries([
             own(crate::ED25519_KEY_TAG),
-            own(crate::ML_DSA_87_KEY_TAG),
+            own(crate::ML_DSA_65_KEY_TAG),
             (0x0102, vec![0x5A; 1_312]),
         ])
         .unwrap();

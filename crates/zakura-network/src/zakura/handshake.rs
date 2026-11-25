@@ -27,7 +27,7 @@ pub const P2P_V2_UPGRADE_COMMAND_BYTES: &[u8; 12] = b"p2pv2up\0\0\0\0\0";
 /// Its suffix is [`ZAKURA_PROTOCOL_VERSION_CURRENT`]. Version 3 replaced the
 /// Iroh 1.x wire profile of `p2p-v2/2`, version 4 changed what a node ID is
 /// and requires the hybrid key exchange, and version 5 moved the handshake to
-/// ML-KEM-1024 and ML-DSA-87, so nodes on different versions reach each other
+/// ML-KEM-1024 and ML-DSA-65, so nodes on different versions reach each other
 /// only over the legacy protocol.
 pub const P2P_V2_ALPN: &[u8] = b"p2p-v2/5";
 
@@ -67,7 +67,7 @@ pub const ZAKURA_PROTOCOL_VERSION_1: u16 = 1;
 ///
 /// Versions 4 and 5 are hard breaks. From version 4 on, a node's ID is the
 /// hash of the key list in its TLS credential, and its Ed25519 key before
-/// it. Version 5 replaces the list's ML-DSA-44 key with an ML-DSA-87 key, so
+/// it. Version 5 replaces the list's ML-DSA-44 key with an ML-DSA-65 key, so
 /// every ID changed again. A node that spoke both versions would be two
 /// different nodes to its peers.
 pub const ZAKURA_PROTOCOL_VERSION_MIN_NATIVE: u16 = 5;
@@ -105,7 +105,7 @@ pub fn zakura_protocol_for_alpn(alpn: &[u8]) -> Option<u16> {
 /// profile it can't speak. Version 2 was Iroh 1.x; version 3 is zakura-quic
 /// with Ed25519 node IDs; version 4 derives the node ID from a key list and
 /// requires the hybrid key exchange; version 5 moves the handshake to
-/// X25519MLKEM1024 and the Ed25519 + ML-DSA-87 composite.
+/// X25519MLKEM1024 and the Ed25519 + ML-DSA-65 composite.
 pub const ZAKURA_PROTOCOL_VERSION_CURRENT: u16 = 5;
 
 /// Hard cap for any legacy TCP upgrade prelude payload.

@@ -1,5 +1,5 @@
 //! Presents the local credential as an RFC 7250 raw public key and signs
-//! with its composite Ed25519 + ML-DSA-87 key (TLS-2 to TLS-4).
+//! with its composite Ed25519 + ML-DSA-65 key (TLS-2 to TLS-4).
 //!
 //! Adapted from `iroh/src/tls/resolver.rs` at fork tag `zakura-iroh-v1.1.0-rc.1`.
 //! Copyright 2025 N0, INC. Licensed under MIT OR Apache-2.0.
@@ -66,7 +66,7 @@ impl rustls::server::ResolvesServerCert for ResolveRawPublicKeyCert {
     }
 }
 
-/// Signs handshakes with the node's composite Ed25519 + ML-DSA-87 key
+/// Signs handshakes with the node's composite Ed25519 + ML-DSA-65 key
 /// (TLS-4), drawing ML-DSA's hedging randomness from the endpoint's TLS
 /// random source, which a simulation seeds.
 #[derive(Clone)]
@@ -99,7 +99,7 @@ impl rustls::sign::SigningKey for CompositeSigningKey {
 
     fn algorithm(&self) -> rustls::SignatureAlgorithm {
         // The low byte of the private-use scheme, as rustls reads one.
-        rustls::SignatureAlgorithm::Unknown(0x44)
+        rustls::SignatureAlgorithm::Unknown(0x65)
     }
 
     fn public_key(&self) -> Option<SubjectPublicKeyInfoDer<'_>> {
@@ -115,7 +115,7 @@ impl rustls::sign::Signer for CompositeSigningKey {
             .map_err(|_| rustls::Error::FailedToGetRandomBytes)?;
         self.secret
             .sign_composite(message, randomness)
-            .map_err(|_| rustls::Error::General("ML-DSA-87 signing failed".into()))
+            .map_err(|_| rustls::Error::General("ML-DSA-65 signing failed".into()))
     }
 
     fn scheme(&self) -> rustls::SignatureScheme {

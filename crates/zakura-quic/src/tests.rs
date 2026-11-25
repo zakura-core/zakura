@@ -3176,11 +3176,11 @@ async fn the_hybrid_hello_leaves_as_three_initial_datagrams() {
     .unwrap();
 }
 
-/// TLS-4, TLS-9, ADM-1: the listener's whole first flight, with its
-/// ML-KEM-1024 ciphertext, ML-DSA-87 credential and composite signature, is
-/// larger than three times the 2,400-byte hello, QUIC's allowance before the
-/// dialer's address is validated. The dialer's padding datagram raises the
-/// allowance to three times 3,600 bytes, the flight fits, and the dialer
+/// TLS-4, TLS-9, ADM-1: the listener's whole first flight, about 7.9 KB with
+/// its ML-KEM-1024 ciphertext, ML-DSA-65 credential and composite signature,
+/// is larger than three times the 2,400-byte hello, QUIC's allowance before
+/// the dialer's address is validated. The dialer's padding datagram raises
+/// the allowance to three times 3,600 bytes, the flight fits, and the dialer
 /// completes its handshake on it alone, in one round trip.
 #[tokio::test(start_paused = true)]
 async fn the_listeners_first_flight_fits_the_padded_allowance() {

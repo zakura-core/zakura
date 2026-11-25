@@ -791,9 +791,11 @@ Section 8 lists every field in transmission order.
 A node MUST send `HeaderMeta` for a block at most once per connection. It
 MUST forward only metadata it admitted, and only within the propagation window
 in section 2. It SHOULD forward admitted metadata promptly to every peer, including peers without subscriptions. Forwarding MUST NOT wait
-for parts or a per-hop request. It SHOULD NOT send metadata to a peer that
-already sent it the block's metadata. The proposer SHOULD write `HeaderMeta` to
-every peer before it writes any part.
+for parts or a per-hop request. It SHOULD NOT send metadata on a connection
+on which the peer already sent it the block's metadata. A peer's later
+connection never carried that copy, so it gets the metadata like any other
+connection, even when the peer sent the first copy on an earlier connection.
+The proposer SHOULD write `HeaderMeta` to every peer before it writes any part.
 
 A header that headerchain rejects returns `Disconnect` when headerchain
 classifies the failure as peer-caused. A missing parent invokes bounded

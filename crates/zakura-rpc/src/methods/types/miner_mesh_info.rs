@@ -124,9 +124,9 @@ pub struct MeshGateway {
     pub state: MeshGatewayState,
 
     /// Whether this is a template node `mining.miner_mesh_template_nodes`
-    /// lists. The node holds a place for a template node whatever the blocks
-    /// say and whatever its `state`, unless it is `ambiguous`, so the
-    /// template node can always connect in.
+    /// lists. Within the funded places, the node holds a place for a
+    /// template node whatever the blocks say and whatever its `state`, unless
+    /// it is `ambiguous`, so the template node can always connect in.
     pub template_node: bool,
 
     /// Whether the gateway is connected over v2 now.

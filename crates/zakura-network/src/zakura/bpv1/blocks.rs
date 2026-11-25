@@ -1721,6 +1721,18 @@ impl BlockTable {
         blocks.saturating_add(self.pending_bytes.saturating_add(admitting) as u64)
     }
 
+    /// The most blocks that hold an assembled block while their verdict is
+    /// owed: up to `max_concurrent_blocks` live blocks, plus each block above
+    /// the next height that a next block displaces (`bpv1-83`).
+    ///
+    /// A peer block takes a slot only while live and owed blocks together
+    /// stay below `max_concurrent_blocks`, so at most that many blocks sit
+    /// above the next height to be displaced, each at most once. A local
+    /// solve assembles nothing.
+    pub fn max_owed_verdicts(config: &BlockConfig) -> usize {
+        config.max_concurrent_blocks.saturating_mul(2)
+    }
+
     /// The most bytes [`Self::retained_bytes`] reaches under `config`: the part
     /// buffer budget, the metadata budget, and, for every concurrent block, a
     /// largest `HeaderMeta` and a largest local encoding.

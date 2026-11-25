@@ -99,8 +99,7 @@ impl BlockTable {
             self.config.max_concurrent_blocks
         );
 
-        // mem-5: the reserve funds one assembled block per concurrent block
-        // until its verdict.
+        // mem-5: the reserve funds every assembled block until its verdict.
         let verdicts = self
             .blocks
             .values()
@@ -108,10 +107,10 @@ impl BlockTable {
             .count()
             .saturating_add(self.owed_verdicts.len());
         assert!(
-            verdicts <= self.config.max_concurrent_blocks,
-            "{BLOCK_REPLAY}: owed verdicts {} > cap {}",
+            verdicts <= Self::max_owed_verdicts(&self.config),
+            "{BLOCK_REPLAY}: owed verdicts {} > bound {}",
             verdicts,
-            self.config.max_concurrent_blocks
+            Self::max_owed_verdicts(&self.config)
         );
 
         for block in self.blocks.values() {

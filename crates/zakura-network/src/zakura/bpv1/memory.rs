@@ -46,7 +46,11 @@ pub struct PropagationReserve {
     /// The proposer's prepared encodings plus as many encodes in flight,
     /// which [`ProposerState`] bounds.
     pub proposer: u64,
-    /// One assembled block per concurrent block, until its verdict.
+    /// Assembled blocks until their verdict: one per concurrent block, plus
+    /// one per block a next block displaces (`bpv1-83`). A displaced block
+    /// keeps its assembled block in the verifier until its verdict, and each
+    /// block above the next height is displaced at most once
+    /// ([`BlockTable::max_owed_verdicts`]).
     pub assembled: u64,
 }
 
@@ -59,7 +63,8 @@ impl PropagationReserve {
             table: BlockTable::retained_bound(&block_config),
             proposer: encodings.saturating_mul(profile.max_coding().encoded_bytes()),
             // Widening usize to u64 is lossless on supported targets.
-            assembled: (config.max_concurrent_blocks as u64).saturating_mul(ASSEMBLED_BLOCK_BYTES),
+            assembled: (BlockTable::max_owed_verdicts(&block_config) as u64)
+                .saturating_mul(ASSEMBLED_BLOCK_BYTES),
         }
     }
 

@@ -965,9 +965,11 @@ and the error names `[memory] budget`, which replaces it.
     reserve covers what BPv1 retains for its concurrent blocks, in place of
     the tip-block term. It holds the block table's part and metadata budgets,
     one largest `HeaderMeta` and local encoding per concurrent block, the
-    proposer's prepared encodings plus as many encodes in flight, and one
-    assembled block per concurrent block until its verdict. On Mainnet that
-    is 122,793,984 B, not 32,000,000 B. BPv1 holds these bytes as
+    proposer's prepared encodings plus as many encodes in flight, and
+    assembled blocks until their verdict: one per concurrent block, plus one
+    per block a next block displaces (`bpv1-83`), because a displaced block
+    stays in the verifier until its verdict. On Mainnet that is
+    162,793,984 B, not 32,000,000 B. BPv1 holds these bytes as
     `Propagation` leases, so they never wait behind bulk consumers. Each
     BPv1 session funds its base `b_bpv1` from `Sessions` when BPv1 admits the
     peer: its unsolicited receive credit, its output gates, its held frames

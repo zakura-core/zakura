@@ -548,7 +548,7 @@ impl StartCmd {
         Self::validate_consensus_config(&config)?;
         Self::validate_debug_blocksync_throughput_config(&config)?;
         Self::validate_miner_mesh_config(&config)?;
-        let mut network_config = Self::network_config_for_start(&config)?;
+        let network_config = Self::network_config_for_start(&config)?;
         config.rpc.validate().map_err(|error| eyre!(error))?;
         let backend_verifications = config
             .sync

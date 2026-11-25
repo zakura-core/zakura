@@ -309,6 +309,9 @@ fn block_seeds() -> Vec<Bpv1Seed> {
                     (BLOCK_HEADER, 1, 1),
                     (BLOCK_UNKNOWN_PARENT, 2, 1),
                     (BLOCK_META, 0x02, 0x02),
+                    // The second session's copy waits; that session ends.
+                    (BLOCK_META, 0x06, 0x01),
+                    (BLOCK_SESSION_END, 0x02, 0x03),
                     (BLOCK_META, 0x0A, 0),
                     (BLOCK_HEADER, 2, 2),
                     (BLOCK_META, 0x01, 0),

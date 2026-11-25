@@ -307,6 +307,13 @@ pub fn replay_bpv1_block_bytes(bytes: &[u8]) -> BlockReplaySummary {
                     last_at: now + Duration::from_millis(u64::from(a & 0x0F) + u64::from(b)),
                 },
             },
+            // `b` bit 0 ends one session's unanswered metadata (`b` bit 1
+            // picks its generation, as `MetaReceived` sends it); otherwise
+            // the peer's last session ends.
+            10 if b & 1 != 0 => BlockInput::MetaSessionEnded {
+                peer,
+                session_gen: 1 + u64::from(b >> 1 & 1),
+            },
             10 => BlockInput::SessionEnded { peer, peer_states },
             11 => BlockInput::PeerBlockDone {
                 peer,

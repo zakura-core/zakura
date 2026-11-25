@@ -1059,13 +1059,13 @@ impl Mesh {
                 &PeerInput::SessionEnd,
                 &end.outputs,
             );
+            // The shell forgets the session's metadata senders, then ends the
+            // peer in the table. A mesh link never has a newer session that
+            // replaced this one, so the shell drops the session's own outputs:
+            // `SessionEnded` releases everything the peer held.
             let peer = self.nodes[remote].id;
-            for output in end.outputs {
-                let states = || self.peer_states(local);
-                if let PeerRoute::Table(input) = route_peer_output(peer, output, states) {
-                    self.step_table(local, input);
-                }
-            }
+            let session_gen = session.state.session_gen();
+            self.step_table(local, BlockInput::MetaSessionEnded { peer, session_gen });
             let peer_states = self.peer_states(local);
             self.step_table(local, BlockInput::SessionEnded { peer, peer_states });
         }

@@ -3849,22 +3849,15 @@ where
                     // when the tip changes.
                     //
                     // An empty body's BPv1 commitment `C` does not depend on the parent, so the
-                    // coinbase carries it too. The new tip's light-client root is still unknown,
-                    // so the precompute registers the body under the current parent's root, and
-                    // the new-tip template registers it again under its own.
-                    let light_client_root = chain_info.chain_history_root;
+                    // coinbase carries it too. The precompute registers nothing with the
+                    // proposer: the new-tip template registers the body under the new parent's
+                    // light-client root, which is still unknown here.
                     let bpv1_proposer = self.gbt.template_bpv1_proposer(precomputed_height);
                     let precompute_coinbase = |network, height, params| {
                         let work = TemplateBuildWork::for_coinbase(&network, height, &params);
                         self.gbt.run_template_build(work, move || {
-                            let bpv1_commitment = bpv1_proposer.and_then(|proposer| {
-                                types::get_block_template::bpv1_template_commitment(
-                                    proposer.as_ref(),
-                                    light_client_root,
-                                    height,
-                                    std::iter::empty(),
-                                )
-                            });
+                            let bpv1_commitment = bpv1_proposer
+                                .and_then(|proposer| proposer.empty_template_commitment(height));
                             TransactionTemplate::new_coinbase(
                                 &network,
                                 height,

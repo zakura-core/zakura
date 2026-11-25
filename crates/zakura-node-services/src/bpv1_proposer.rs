@@ -50,6 +50,21 @@ pub trait Bpv1ProposerHook: Send + Sync + fmt::Debug {
         body_after_coinbase: &[u8],
     ) -> Option<[u8; BPV1_COMMITMENT_NULL_DATA_LEN]>;
 
+    /// Returns the payload [`Self::prepare_template_commitment`] would return
+    /// for an empty template at `height`, without registering the body.
+    ///
+    /// An empty body's `C` does not depend on the parent. A long poll uses
+    /// this payload to precompute the next empty block's coinbase before the
+    /// new tip, and so its light-client root, is known. The new-tip template
+    /// registers the body once it knows that root. Registering it earlier
+    /// would take a retained encoding or commitment from issued templates.
+    ///
+    /// Returns `None` in the cases [`Self::prepare_template_commitment`] does.
+    fn empty_template_commitment(
+        &self,
+        height: Height,
+    ) -> Option<[u8; BPV1_COMMITMENT_NULL_DATA_LEN]>;
+
     /// Publishes a solved block over BPv1 (`HeaderMeta` + `BlockDone` +
     /// interleaved seed parts) beside `CommitMined`, waiting on nothing in
     /// legacy broadcast.

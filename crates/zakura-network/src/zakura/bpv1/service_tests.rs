@@ -183,6 +183,72 @@ async fn bpv1_proposer_hook_handles_post_nu7_pre_nu7_reuse_and_pool_coinbase() {
     shutdown.cancel();
 }
 
+/// F-880: a long poll's precompute asks for the empty body's payload before
+/// the new tip is known. The answer matches the payload a registered empty
+/// template gets, and it retains nothing, so every issued template still
+/// publishes.
+#[tokio::test]
+async fn empty_template_commitment_matches_and_keeps_issued_templates() {
+    use super::proposer::MAX_PREPARED_ENCODINGS;
+    use zakura_node_services::bpv1_proposer::Bpv1ProposerHook;
+
+    let network = regtest_nu7_at(10);
+    let shutdown = CancellationToken::new();
+    let (id_a, id_b) = (node_id(53), node_id(54));
+    let tiny = |id| {
+        start(
+            Profile::TINY,
+            network.clone(),
+            id,
+            Bpv1Ports::default(),
+            &shutdown,
+        )
+    };
+    let ((svc_a, handle_a), (svc_b, _handle_b)) = (tiny(id_a), tiny(id_b));
+    connect(&svc_a, id_a, &svc_b, id_b, &shutdown);
+
+    assert_eq!(
+        handle_a.empty_template_commitment(Height(5)),
+        None,
+        "pre-NU7"
+    );
+
+    // Issue as many templates as the proposer retains encodings for.
+    let lcr = [0x44; 32];
+    let issued: Vec<_> = (1..=MAX_PREPARED_ENCODINGS)
+        .map(|tag| {
+            let tx = build_v6_tx(Height(12), u8::try_from(tag).unwrap());
+            let tx_bytes = tx.zcash_serialize_to_vec().unwrap();
+            let payload = handle_a
+                .prepare_template_commitment(lcr, Height(12), 2, &tx_bytes)
+                .expect("post-NU7 template with live peer gets commitment");
+            (tx, payload)
+        })
+        .collect();
+
+    let precomputed = handle_a
+        .empty_template_commitment(Height(12))
+        .expect("post-NU7 with a live peer");
+
+    // The oldest issued template still publishes.
+    let (tx, payload) = issued[0].clone();
+    let script = [&[0x6a, 0x23][..], &payload].concat();
+    let cb = committed_coinbase(Height(12), &script);
+    let solved = Arc::new(block_of(lcr, vec![Arc::new(cb), Arc::new(tx)]));
+    assert!(
+        Bpv1ProposerHook::publish_solved_block(&handle_a, solved, Height(12)),
+        "the precompute must not evict an issued template"
+    );
+
+    // A registered empty template on another parent gets the same payload.
+    assert_eq!(
+        handle_a.prepare_template_commitment([0x5a; 32], Height(12), 1, &[]),
+        Some(precomputed)
+    );
+
+    shutdown.cancel();
+}
+
 #[tokio::test]
 async fn bpv1_62_replaced_session_exit_keeps_the_replacement_and_shutdown_drains() {
     let (id_a, id_b) = (node_id(61), node_id(62));

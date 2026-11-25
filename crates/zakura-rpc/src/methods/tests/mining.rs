@@ -575,6 +575,13 @@ impl zakura_node_services::bpv1_proposer::Bpv1ProposerHook for RecordingBpv1Prop
         Some(BPV1_PAYLOAD)
     }
 
+    fn empty_template_commitment(
+        &self,
+        _height: Height,
+    ) -> Option<[u8; zakura_node_services::bpv1_proposer::BPV1_COMMITMENT_NULL_DATA_LEN]> {
+        Some(BPV1_PAYLOAD)
+    }
+
     fn publish_solved_block(
         &self,
         _block: Arc<zakura_chain::block::Block>,
@@ -719,13 +726,13 @@ fn long_poll_keeps_the_precomputed_bpv1_coinbase_on_a_new_parent() {
         assert_eq!(template.previous_block_hash, next.tip_hash);
         assert_eq!(template.height, 2);
         assert!(commits_bpv1_payload(&template));
-        // The precompute registers the empty body under the old parent's root, and the
-        // new-tip template registers it again under the new parent's root.
+        // The precompute registers nothing, so the initial template's registration
+        // under the old parent's root comes right before the new-tip template's
+        // registration under the new parent's root (F-880).
         let old_root: [u8; 32] = old.chain_history_root.unwrap().into();
-        let prepared = proposer.prepared();
         assert_eq!(
-            prepared[prepared.len() - 2..],
-            [(old_root, Height(2), 1, 0), ([0x5a; 32], Height(2), 1, 0)]
+            proposer.prepared(),
+            [(old_root, Height(1), 1, 0), ([0x5a; 32], Height(2), 1, 0)]
         );
     });
 }
@@ -1754,6 +1761,13 @@ fn bpv1_6_submit_block_publishes_only_after_consensus_admission_or_commit() {
             None
         }
 
+        fn empty_template_commitment(
+            &self,
+            _height: Height,
+        ) -> Option<[u8; BPV1_COMMITMENT_NULL_DATA_LEN]> {
+            None
+        }
+
         fn publish_solved_block(&self, _block: Arc<Block>, _height: Height) -> bool {
             self.published.fetch_add(1, Ordering::AcqRel);
             true
@@ -1860,6 +1874,13 @@ fn bpv1_commitment_follows_the_selection_decision() {
             _body_after_coinbase: &[u8],
         ) -> Option<[u8; BPV1_COMMITMENT_NULL_DATA_LEN]> {
             self.prepared.fetch_add(1, Ordering::SeqCst);
+            Some(PAYLOAD)
+        }
+
+        fn empty_template_commitment(
+            &self,
+            _height: Height,
+        ) -> Option<[u8; BPV1_COMMITMENT_NULL_DATA_LEN]> {
             Some(PAYLOAD)
         }
 

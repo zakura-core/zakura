@@ -207,32 +207,69 @@ fn standing() -> impl Strategy<Value = GatewayStanding> {
 }
 
 proptest! {
-    /// The set is the first `hold` available gateways in rank order, and
-    /// the hold never passes the ceiling, ten or the matched gateways.
+    /// The hold is the gateways that count toward it, up to the ceiling. The
+    /// set is the available nodes among the first `hold` places in rank
+    /// order, where an available gateway takes a place and an always-preferred
+    /// ID that is not ambiguous takes one whether or not it is available.
+    /// Without always-preferred IDs, that is the first `hold` available
+    /// gateways, and the hold is at most the matched ones.
     #[test]
     fn the_set_is_a_prefix_of_the_available_gateways(
-        entries in proptest::collection::vec((0u8..40, 0u32..4, standing()), 0..40),
+        entries in proptest::collection::vec(
+            (0u8..40, 0u32..4, standing(), proptest::bool::weighted(0.2)),
+            0..40,
+        ),
         hold_limit in 0usize..16,
     ) {
         let ranking: Vec<_> = entries
             .iter()
-            .map(|&(seed, blocks, standing)| gateway(seed, blocks, standing))
+            .map(|&(seed, blocks, standing, always)| {
+                let ranked = gateway(seed, blocks, standing);
+                if always {
+                    RankedGateway {
+                        always_preferred: true,
+                        ..ranked
+                    }
+                } else {
+                    ranked
+                }
+            })
             .collect();
+        let any_always_preferred = ranking.iter().any(RankedGateway::is_always_preferred);
         let formed = PreferredGateways::form(ranking, hold_limit);
-        let matched = formed.ranking.iter().filter(|g| g.is_matched()).count();
-        prop_assert!(formed.hold() <= hold_limit.min(MAX_PREFERRED_GATEWAYS));
-        prop_assert!(formed.hold() <= matched);
+
+        let counted = formed.ranking.iter().filter(|g| g.counts_toward_hold()).count();
+        prop_assert_eq!(formed.hold(), hold_limit.min(MAX_PREFERRED_GATEWAYS).min(counted));
         prop_assert!(formed.set().len() <= formed.hold());
-        let available: Vec<NodeId> = formed
-            .ranking
-            .iter()
-            .filter_map(RankedGateway::available_node)
-            .collect();
-        prop_assert_eq!(formed.set(), &available[..formed.hold().min(available.len())]);
+
+        let mut places = 0;
+        let mut expected = Vec::new();
+        for gateway in &formed.ranking {
+            if places == formed.hold() {
+                break;
+            }
+            let node = gateway.available_node();
+            if node.is_some() || gateway.keeps_its_place() {
+                places += 1;
+            }
+            expected.extend(node);
+        }
+        prop_assert_eq!(formed.set(), &expected[..]);
+
+        if !any_always_preferred {
+            let matched = formed.ranking.iter().filter(|g| g.is_matched()).count();
+            prop_assert!(formed.hold() <= matched);
+            let available: Vec<NodeId> = formed
+                .ranking
+                .iter()
+                .filter_map(RankedGateway::available_node)
+                .collect();
+            prop_assert_eq!(formed.set(), &available[..formed.hold().min(available.len())]);
+        }
         prop_assert!(formed
             .ranking
             .windows(2)
-            .all(|pair| pair[0].blocks >= pair[1].blocks));
+            .all(|pair| pair[0].rank() >= pair[1].rank()));
     }
 }
 

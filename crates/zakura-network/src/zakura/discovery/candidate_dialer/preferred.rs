@@ -31,8 +31,9 @@ use crate::zakura::{
 /// prefers, then mining gateways ranked by how many recent best-chain blocks
 /// name them.
 ///
-/// The IDs the node always prefers rank first, in the order given, and each
-/// keeps its place even while it is unreachable. The other gateways may be
+/// The IDs the node always prefers rank ahead of every ranked gateway, and
+/// each keeps its place even while it is unreachable. Among themselves they
+/// are ordered like other gateways, connected ones first, not as given. The other gateways may be
 /// in any order: the dialer ranks them by block count, most first, and by
 /// lower gateway ID bytes among equal counts. It considers only the first
 /// 256 by rank, always-preferred IDs included. zakurad converts its config
@@ -65,7 +66,7 @@ pub struct MinerGateway {
 /// most [`MAX_RANKED_GATEWAYS`] plus ties at the cutoff. Each one names no
 /// node until [`classify_gateways`] resolves it.
 ///
-/// The IDs the node always prefers come first, in their order, at most
+/// The IDs the node always prefers come first, at most
 /// [`MAX_PREFERRED_GATEWAYS`] of them; a repeat keeps its first entry. The
 /// other gateways follow, ranked by block count, leaving out the IDs already
 /// listed, entries with no blocks and repeats of an ID, keeping the repeat
@@ -680,8 +681,7 @@ mod tests {
         assert_eq!(ranked, vec![unresolved(a, 7)]);
     }
 
-    /// The IDs the node always prefers come first, in their order and with
-    /// any block count, and the ranked gateways fill the rest without
+    /// The IDs the node always prefers come first, with any block count, and the ranked gateways fill the rest without
     /// repeating them. The node's own ID is never included.
     #[test]
     fn always_preferred_ids_rank_first_and_gateways_fill_the_rest() {

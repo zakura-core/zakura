@@ -70,7 +70,8 @@ impl MeshView {
         self.state_of(id) == Some(MeshGatewayState::Preferred) && self.is_connected_to(id)
     }
 
-    /// The template nodes the node keeps places for, in its order.
+    /// The template nodes the node keeps places for. They rank ahead of every
+    /// ranked gateway, but not in config order.
     pub fn template_nodes(&self) -> Vec<GatewayId> {
         self.info
             .gateways
@@ -317,13 +318,16 @@ pub(super) fn check_view(view: &MeshView, facts: &NodeFacts) -> Vec<String> {
         ));
     }
 
-    // 9. The node lists exactly the template nodes the harness configured,
-    // in order.
-    if view.template_nodes() != facts.template_nodes {
+    // 9. The node lists exactly the template nodes the harness configured, in
+    // any order: networking orders them like other gateways, connected ones
+    // first.
+    let mut listed = view.template_nodes();
+    listed.sort_unstable();
+    let mut configured = facts.template_nodes.clone();
+    configured.sort_unstable();
+    if listed != configured {
         broken.push(format!(
-            "9: the node lists template nodes {:?}, not {:?}",
-            view.template_nodes(),
-            facts.template_nodes
+            "9: the node lists template nodes {listed:?}, not {configured:?}"
         ));
     }
 

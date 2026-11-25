@@ -1567,3 +1567,23 @@ fn an_always_preferred_caller_passes_a_full_inbound_share() {
         "no held place is free and the inbound share is full"
     );
 }
+
+/// Startup warns when the funded places are no more than the always-preferred
+/// IDs, with its own message when none is funded, and says nothing when a
+/// place is left for ranked gateways or no ID is always preferred.
+#[test]
+fn startup_warns_when_always_preferred_ids_fill_the_funded_places() {
+    let none_funded = unfunded_always_preferred_warning(2, 0).expect("no place is funded");
+    assert!(none_funded.contains("funds no preferred connection places"));
+
+    let filled = unfunded_always_preferred_warning(2, 2).expect("the IDs take every place");
+    assert!(filled.contains("those IDs take every place"));
+    assert_eq!(
+        unfunded_always_preferred_warning(3, 2),
+        Some(filled),
+        "fewer places than IDs warns the same way"
+    );
+
+    assert_eq!(unfunded_always_preferred_warning(2, 3), None);
+    assert_eq!(unfunded_always_preferred_warning(0, 0), None);
+}

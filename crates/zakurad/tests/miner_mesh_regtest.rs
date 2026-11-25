@@ -148,6 +148,11 @@ async fn pools_form_a_mesh() -> Result<()> {
 /// `mining.miner_mesh_template_nodes`, keeps a place for it, ahead of the
 /// gateways it ranks.
 ///
+/// This checks the ranking and what each node reports. It never fills the
+/// relay's inbound share: that a template node is still admitted then is
+/// covered by the handler unit test
+/// `an_always_preferred_caller_passes_a_full_inbound_share`.
+///
 /// Only the template node, which builds coinbases, reports that it announces.
 /// Both report the blocks that name the relay, the gateway they stand for.
 #[tokio::test(flavor = "multi_thread")]

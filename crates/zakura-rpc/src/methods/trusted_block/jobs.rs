@@ -59,6 +59,8 @@ pub(crate) enum JobError {
     Capacity,
     /// The job's parent is not the best tip, or its lifetime passed before release.
     Expired,
+    /// The best tip passed the release's last supported mining height.
+    EndOfSupport,
     /// The node could not establish an outcome.
     Unavailable,
 }
@@ -70,6 +72,7 @@ impl JobError {
             Self::Conflict => "conflict",
             Self::Capacity => "capacity",
             Self::Expired => "expired",
+            Self::EndOfSupport => "end_of_support",
             Self::Unavailable => "unavailable",
         }
     }
@@ -493,6 +496,7 @@ where
                 Err(JobError::Invalid)
             }
             Err(TrustedSubmissionError::Capacity) => Err(JobError::Capacity),
+            Err(TrustedSubmissionError::EndOfSupport) => Err(JobError::EndOfSupport),
             _ => Err(JobError::Unavailable),
         }
     }

@@ -155,6 +155,10 @@ pub fn replay_bpv1_block_bytes(bytes: &[u8]) -> BlockReplaySummary {
                 ][usize::from(a % 3)],
                 peer_states,
             },
+            8 if a & 1 == 0 => BlockInput::MetaSessionEnded {
+                peer,
+                session_gen: 1,
+            },
             8 => BlockInput::SessionEnded { peer, peer_states },
             9 => {
                 // The IO shell charges a part before proof; a refused

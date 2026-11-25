@@ -1844,7 +1844,7 @@ impl DataWriter {
 
 /// Decodes one control-stream frame into its machine input, or the close row
 /// it violates (`bpv1-61`).
-fn control_input(frame: &Frame) -> Result<PeerInput, Bpv1CloseRow> {
+pub(super) fn control_input(frame: &Frame) -> Result<PeerInput, Bpv1CloseRow> {
     let msg = decode_frame::<Bpv1Message>(frame).map_err(|_| Bpv1CloseRow::Row2Decode)?;
     Ok(match msg {
         Bpv1Message::HeaderMeta { ref header, .. } => {
@@ -1876,7 +1876,7 @@ fn control_input(frame: &Frame) -> Result<PeerInput, Bpv1CloseRow> {
 /// Decodes one data-stream frame into its machine input, or the close row it
 /// violates (`bpv1-61`). A `Part` keeps the received payload; only proof
 /// verification copies it into a verified part.
-fn data_input(frame: Frame) -> Result<PeerInput, Bpv1CloseRow> {
+pub(super) fn data_input(frame: Frame) -> Result<PeerInput, Bpv1CloseRow> {
     Ok(match frame.message_type {
         message_type::PART => {
             // bpv1-13: inspect only the 36-byte `(block_id, index)` prefix first.
@@ -2075,6 +2075,10 @@ async fn run_peer_routine(
     }
     // `remove_peer` may have taken this session's entry first, as the handler's
     // disconnect does. Its state in the table is still this session's to end.
+    node.drive(BlockInput::MetaSessionEnded {
+        peer: peer_node,
+        session_gen,
+    });
     let replaced = {
         let mut sessions = node.lock_sessions();
         match sessions.get(&peer_node) {

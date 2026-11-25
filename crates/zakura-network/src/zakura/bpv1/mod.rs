@@ -31,6 +31,8 @@ pub mod wire;
 
 #[cfg(test)]
 mod blocks_tests;
+#[cfg(test)]
+mod close_tests;
 #[cfg(all(test, not(zakura_sim)))]
 mod conformance_tests;
 #[cfg(all(test, not(zakura_sim)))]

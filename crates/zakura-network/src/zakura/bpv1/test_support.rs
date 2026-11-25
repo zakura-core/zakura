@@ -1224,7 +1224,10 @@ impl MachineMesh {
                 self.send(node, peer, MeshFrame::Part { block_id, part });
             }
             PeerOutput::SendWantEnd { want_id, sent, .. } => {
-                self.send(node, peer, MeshFrame::WantEnd { want_id, sent })
+                self.send(node, peer, MeshFrame::WantEnd { want_id, sent });
+                // The mesh hands each frame to its link at once, so it
+                // reports the end written, as the data writer does.
+                self.step_peer(node, peer, PeerInput::WantEndWritten);
             }
             PeerOutput::ServeWant {
                 want_id,

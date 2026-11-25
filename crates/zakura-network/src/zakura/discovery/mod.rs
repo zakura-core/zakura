@@ -8,6 +8,7 @@ mod dialer;
 mod peer;
 mod pipe;
 mod protocol;
+mod record_signature;
 mod redial;
 mod requester;
 mod runtime;
@@ -48,6 +49,12 @@ pub use peer::{replay_discovery_session_bytes, DiscoverySessionReplaySummary};
 #[cfg(test)]
 pub(crate) use protocol::discovery_dial_slot_limit;
 pub use protocol::*;
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use record_signature::fuzz::{replay_record_signature_bytes, RecordSignatureReplay};
+pub use record_signature::{
+    RecordSignatureError, RECORD_EXTENSION_ML_DSA_65_KEY, RECORD_EXTENSION_ML_DSA_65_SIGNATURE,
+    RECORD_ML_DSA_65_EXTENSION_BYTES,
+};
 pub(crate) use redial::{native_dial_supervised, RedialEnd, RedialPolicy};
 #[cfg(any(test, feature = "p2p-fuzz"))]
 pub use redial::{replay_redial_bytes, RedialReplaySummary};

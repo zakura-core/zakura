@@ -34,6 +34,7 @@ bpv1_codec = { decoder = 1, properties = ["bpv1/codec"] }
 credential_parse = { decoder = 3, properties = ["credential/canonical-encoding", "credential/node-id", "credential/bounded-parse"] }
 key_list_decode = { decoder = 2, properties = ["key-list/canonical-encoding", "key-list/stable-id"] }
 composite_verify = { decoder = 3, properties = ["composite/tamper-refused"] }
+record_signature = { decoder = 1, properties = ["record-signature/canonical-encoding", "record-signature/tamper-refused"] }
 
 [dependencies]
 libfuzzer-sys = "0.4"
@@ -199,6 +200,13 @@ bench = false
 [[bin]]
 name = "composite_verify"
 path = "fuzz_targets/composite_verify.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "record_signature"
+path = "fuzz_targets/record_signature.rs"
 test = false
 doc = false
 bench = false

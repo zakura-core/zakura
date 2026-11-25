@@ -17,8 +17,8 @@ use blake2b_simd::Params;
 use rustls_pki_types::{AlgorithmIdentifier, SubjectPublicKeyInfoDer};
 
 use crate::{
-    composite::{ML_DSA_65_KEY_BYTES, ML_DSA_65_KEY_TAG},
-    key::{NodeId, NodeKey, KEY_LENGTH},
+    composite::{self, ML_DSA_65_KEY_BYTES, ML_DSA_65_KEY_TAG},
+    key::{NodeId, NodeKey, SignatureError, KEY_LENGTH},
     key_list::{KeyListError, NodeKeyList, ED25519_KEY_TAG, MAX_NODE_KEYS},
 };
 
@@ -385,6 +385,35 @@ fn fingerprint(tag: u16, key: &[u8]) -> [u8; KEY_LENGTH] {
     value
 }
 
+/// Verifies the ML-DSA-65 signature of a discovery record (ID-7).
+///
+/// A record's key list holds the author's ML-DSA-65 key as a fingerprint, so
+/// the record carries the key in full beside the signature. This checks
+/// both links: `key` is the key `keys` names under [`ML_DSA_65_KEY_TAG`]
+/// (ID-12), and `signature` is that key's signature over `message` under the
+/// record context, as [`NodeSecretKey::sign_record_ml_dsa_65`] makes it.
+///
+/// Fails when the list has no ML-DSA-65 entry, when `key` or `signature`
+/// has another length than its scheme's, when the key's fingerprint is not
+/// the list's entry, and when the signature does not verify.
+///
+/// [`NodeSecretKey::sign_record_ml_dsa_65`]: crate::NodeSecretKey::sign_record_ml_dsa_65
+pub fn verify_record_ml_dsa_65(
+    keys: &NodeKeyList,
+    key: &[u8],
+    message: &[u8],
+    signature: &[u8],
+) -> Result<(), SignatureError> {
+    let key: &[u8; ML_DSA_65_KEY_BYTES] = key.try_into().map_err(|_| SignatureError)?;
+    // The fingerprint is checked before the signature: it is one hash, and
+    // it keeps a key the list doesn't name away from the far costlier
+    // signature check.
+    if keys.entry(ML_DSA_65_KEY_TAG) != Some(&fingerprint(ML_DSA_65_KEY_TAG, key)) {
+        return Err(SignatureError);
+    }
+    composite::verify_record(key, message, signature)
+}
+
 /// Returns the BIT STRING contents of a SubjectPublicKeyInfo whose algorithm
 /// is the credential's, or `None` for anything else. The caller checks the
 /// encoding is canonical.
@@ -484,6 +513,65 @@ mod tests {
             secret.public().to_string(),
             "bee4ed7d2e07dd73d681bdc52e8efb8aa4860cfbe832ef5b1479d7b313a9b72f"
         );
+    }
+
+    /// A record signature verifies only with the key the list names under
+    /// the ML-DSA-65 tag: the same check refuses a list without the entry,
+    /// another node's key with its own valid signature, and a key or
+    /// signature of another length.
+    #[test]
+    fn a_record_signature_needs_the_key_the_list_names() {
+        let node = NodeSecretKey::from_bytes(&[7; KEY_LENGTH]);
+        let other = NodeSecretKey::from_bytes(&[8; KEY_LENGTH]);
+        let key =
+            |secret: &NodeSecretKey| secret.credential().key(ML_DSA_65_KEY_TAG).unwrap().to_vec();
+        let message = b"record bytes";
+        let signature = node.sign_record_ml_dsa_65(message, [1; 32]).unwrap();
+        let verify = |keys: &NodeKeyList, key: &[u8], message: &[u8], signature: &[u8]| {
+            verify_record_ml_dsa_65(keys, key, message, signature)
+        };
+
+        assert_eq!(
+            verify(node.key_list(), &key(&node), message, &signature),
+            Ok(())
+        );
+        assert!(verify(node.key_list(), &key(&node), b"other bytes", &signature).is_err());
+
+        // The other node's key and signature are valid for the other node's
+        // list, and for no one else's.
+        let others = other.sign_record_ml_dsa_65(message, [1; 32]).unwrap();
+        assert_eq!(
+            verify(other.key_list(), &key(&other), message, &others),
+            Ok(())
+        );
+        assert!(verify(node.key_list(), &key(&other), message, &others).is_err());
+        assert!(verify(node.key_list(), &key(&node), message, &others).is_err());
+
+        // A list that names no ML-DSA-65 key verifies nothing, and neither
+        // does one that names the key under another tag.
+        let ed25519_only = NodeKeyList::single(node.public_key());
+        assert!(verify(&ed25519_only, &key(&node), message, &signature).is_err());
+        let fingerprint_value = fingerprint(ML_DSA_65_KEY_TAG, &key(&node));
+        let other_tag = NodeKeyList::from_entries([
+            (ED25519_KEY_TAG, *node.public_key().as_bytes()),
+            (ML_DSA_65_KEY_TAG + 1, fingerprint_value),
+        ])
+        .unwrap();
+        assert!(verify(&other_tag, &key(&node), message, &signature).is_err());
+
+        let full = key(&node);
+        for key in [
+            &full[..ML_DSA_65_KEY_BYTES - 1],
+            &[][..],
+            &[full.as_slice(), &[0]].concat(),
+        ] {
+            assert!(verify(node.key_list(), key, message, &signature).is_err());
+        }
+        for signature in [&signature[..signature.len() - 1], &[][..]] {
+            assert!(verify(node.key_list(), &full, message, signature).is_err());
+        }
+        assert!(node.key_list().contains_tag(ML_DSA_65_KEY_TAG));
+        assert!(!ed25519_only.contains_tag(ML_DSA_65_KEY_TAG));
     }
 
     #[test]

@@ -15,11 +15,11 @@ use super::protocol::{
     normalize_services, push_unique_service, AddressScope, BookChange, DialAdmission,
     DialCandidateExclusions, DialTarget, DisclosureKey, DiscoveryBookError, DiscoveryRecordError,
     DiscoveryRecordValidationContext, DiscoveryWireError, ImportBatchOutcome, ImportOutcome,
-    RecordVerdict, Services, ZakuraCachedLiveServiceSummary, ZakuraDiscoveryBook,
-    ZakuraDiscoveryConfig, ZakuraDiscoveryDialCandidate, ZakuraDiscoveryEntry,
-    ZakuraDiscoveryLocalConfig, ZakuraDiscoveryPersistedEntry, ZakuraNodeRecord,
-    ZakuraNodeRecordBody, ZakuraServiceId, DEFAULT_LIVE_SERVICE_SUMMARY_TTL,
-    MAX_DISCOVERY_EXCLUDED_NODE_IDS, MAX_SERVICE_SUMMARIES_PER_RESPONSE,
+    RecordVerdict, Services, VerifiedPersistedEntry, ZakuraCachedLiveServiceSummary,
+    ZakuraDiscoveryBook, ZakuraDiscoveryConfig, ZakuraDiscoveryDialCandidate, ZakuraDiscoveryEntry,
+    ZakuraDiscoveryLocalConfig, ZakuraNodeRecord, ZakuraNodeRecordBody, ZakuraServiceId,
+    DEFAULT_LIVE_SERVICE_SUMMARY_TTL, MAX_DISCOVERY_EXCLUDED_NODE_IDS,
+    MAX_SERVICE_SUMMARIES_PER_RESPONSE,
 };
 use super::verified::VerifiedRecord;
 use crate::zakura::{
@@ -719,16 +719,18 @@ impl DiscoveryState {
             .import_static_record_tracked(record, now, &context, changes)
     }
 
-    /// Re-validates and imports entries loaded from persistent storage.
-    pub(super) fn import_persisted_entries(
+    /// Stores book file entries whose records passed their author checks,
+    /// and counts each in `outcome`.
+    pub(super) fn install_persisted_entries(
         &mut self,
-        entries: impl IntoIterator<Item = ZakuraDiscoveryPersistedEntry>,
+        entries: Vec<VerifiedPersistedEntry>,
         now: u64,
+        outcome: &mut ImportBatchOutcome,
         changes: &mut Vec<BookChange>,
-    ) -> ImportBatchOutcome {
+    ) {
         let context = self.validation_context(now);
         self.book
-            .import_persisted_entries_tracked(entries, now, &context, changes)
+            .install_persisted_entries(entries, now, &context, outcome, changes);
     }
 
     /// Returns a bounded peer sample for `requester`, at most the configured

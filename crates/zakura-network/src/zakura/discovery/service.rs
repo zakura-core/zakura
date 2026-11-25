@@ -1991,6 +1991,7 @@ mod tests {
     async fn a_peers_answer_stays_within_the_served_size() -> Result<(), crate::BoxError> {
         use crate::zakura::discovery::{
             protocol::RECORD_SIGNATURE_EXTENSION_BYTES, wire::SERVED_PEERS_MAX_BYTES,
+            RECORD_ML_DSA_65_EXTENSION_BYTES,
         };
 
         let (_connected_tx, connected_rx) = watch::channel(Vec::new());
@@ -2016,7 +2017,13 @@ mod tests {
             let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(45, 33, 30, seed)), 8233);
             let mut body = signed_discovery_record(&author, &handshake)?.body;
             body.direct_addrs = vec![addr];
-            body.extensions = vec![0; RECORD_SIGNATURE_EXTENSION_BYTES];
+            // One unknown extension fills the room the record's own key
+            // and signature leave.
+            let unknown = RECORD_SIGNATURE_EXTENSION_BYTES - RECORD_ML_DSA_65_EXTENSION_BYTES;
+            body.extensions = 0x7001u16.to_le_bytes().to_vec();
+            body.extensions
+                .extend_from_slice(&u16::try_from(unknown - 4)?.to_le_bytes());
+            body.extensions.resize(unknown, 0);
             let record = ZakuraNodeRecord::sign(body, &author)?;
             largest = encode_frame(&DiscoveryMessage::Hello {
                 record: record.clone(),

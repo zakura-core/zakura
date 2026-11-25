@@ -277,6 +277,28 @@ cargo +nightly-2026-07-15 fuzz run --fuzz-dir . credential_parse
 `zakura-quic`'s unit tests replay every seed and check that a seed named
 `valid-` is accepted and one named `invalid-` is refused.
 
+## Discovery record target
+
+| Target | Property | Decoder |
+| --- | --- | --- |
+| `record_signature` | `record-signature/canonical-encoding`, `record-signature/tamper-refused` | 1 |
+
+`record_signature` feeds peer-chosen bytes to what discovery parses in a
+record's extension area before it trusts the record: the TLVs that hold the
+author's ML-DSA-65 key and signature (zakura-quic ID-7). The driver and its
+checks live in
+`crates/zakura-network/src/zakura/discovery/record_signature/fuzz.rs` behind
+the `p2p-fuzz` feature.
+
+An input whose first byte is even is an extension area. If the parser accepts
+it, the area is exactly its other TLVs, its key TLV and its signature TLV, and
+signing can rebuild it from the other TLVs. An odd first byte makes the rest
+four-byte edits of an honest record's area, signed once per process: a bit
+flip, a resize, an inserted byte, a removed byte or a repeated tail. The
+honest area verifies, and every edit of it is refused, with the pre-image an
+Ed25519 forger would sign for the edited record. ML-DSA verification makes
+this target slow per input, as it does `composite_verify`.
+
 ## BPv1 targets
 
 | Target | Property | Decoder |

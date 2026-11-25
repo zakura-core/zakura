@@ -119,9 +119,10 @@ authenticate (TLS-5). A handshake moves about 17.5 KB, in place of about
 12.5 KB on `p2p-v2/4` and 21.4 KB with ML-DSA-87. The keys don't make a
 discovery record grow: it carries each as a 32-byte fingerprint (ID-8). The
 largest record a node accepts does grow, from 753 to 9,601 bytes: 7,896
-bytes keep room for a later post-quantum record signature and its key
+bytes provide room for a post-quantum record signature and its key
 (COMPAT-13), and 952 hold the 28 more key list entries a node may come to
 have.
+§7 gives the cost of signing records with ML-DSA-65 in that room.
 
 The listener's figures vary by a few bytes between runs, with the size of
 its acknowledgements: its first flight measured 7,861 to 7,873 bytes.
@@ -277,6 +278,97 @@ runs once per node start. The ML-DSA-65 range spans three runs on 2026-11-25. In
 - Round trips and bytes: a simulator test over a link with a fixed delay,
   counting each side's datagrams until the dial completes and after the
   handshake settles. The committed test above checks the round trips.
+- Record signatures: `cargo bench -p zakura-network --bench
+  discovery_record`, whose `ed25519_only` rows are the work a record took
+  before.
 - Fleet: after the Testnet deploy, compare the
   `zakura.quic.handshake.duration_seconds` histogram on the three Testnet
   nodes before and after.
+
+## 7. Record signatures
+
+A prototype signs every discovery record with the node's ML-DSA-65 key as
+well as its Ed25519 key, and requires both (ID-7). The record carries the
+1,952-byte key and the 3,309-byte signature as two extensions, 5,269 bytes
+with their headers. This section records what that costs. "Before" is a
+record signed with Ed25519 alone.
+
+### 7.1 Sizes
+
+A default node's record lists its two keys, one IPv4 address and seven
+services. The figures come from the encoders, in the test
+`a_default_nodes_record_grows_by_the_key_and_signature`.
+
+| | Before | After |
+|---|---|---|
+| A default node's record, and its `Hello` payload | 361 B | 5,630 B |
+| A full sample of 32 such records | 11,554 B | 180,162 B |
+| The `Peers` answer a node sends for it | 11,554 B, 32 records | 22,522 B, 4 records |
+| The largest record | 9,601 B | 9,601 B |
+| The largest `Peers` a node accepts, and sends | 307,234 B, 24,098 B | 307,234 B, 24,098 B |
+| A full book file of 256 such records | 113,162 B | 1,462,026 B |
+| The largest book file | 2,585,610 B | 2,585,610 B |
+| The records of a full book of 10,000 | 3.6 MB | 56.3 MB |
+
+No limit moves. The served `Peers` cap of 24,098 bytes was sized as 32
+records without extensions, so it now holds 4 records.
+
+### 7.2 CPU
+
+`cargo bench -p zakura-network --bench discovery_record`, one core
+(`taskset -c 7`) of the same DigitalOcean premium Intel host, release
+build, mean time. Two other builds were running on the host, so the
+figures can be high by a few percent. The ranges span two runs on
+2026-11-25. The refused record has one flipped byte in its signature's
+commitment hash, so the verifier does all its work, and it was measured in
+the second run only.
+
+| Operation | Before | After |
+|---|---|---|
+| Sign one record | 69–70 µs | 354–363 µs |
+| Verify one record | 176–177 µs | 302–303 µs |
+| Verify the largest record | n/a | 324–329 µs |
+| Refuse a record with a valid Ed25519 and a wrong ML-DSA-65 signature | n/a | 298 µs |
+| Decode and verify a `Peers` of 32 records | 6.17–6.18 ms | 10.2–10.7 ms |
+| Decode a `Peers` of 32 records, no verification | n/a | 0.44 ms |
+
+Ed25519 verification is the strict one of ID-6, which checks the key and
+the signature's `R` for torsion, so it costs more than the 67 µs of §4.1,
+and more than the ML-DSA-65 check it now runs before: about 126 µs with the
+extension parse and the key fingerprint.
+A node signs its record at startup and when the record nears expiry, about
+once a day. The later signing runs on the async runtime under the
+discovery state lock, as the Ed25519 signing did. A record identical to the
+stored one skips verification. A record that verifies and is then
+discarded, for its protocol range, expiry, address or a storage limit, is
+not stored, so it is verified again each time it arrives: a peer that
+answers every `GetPeers` with the same 32 such records costs a node the
+`Peers` row above every 15 seconds on that connection, where it cost the
+"before" column. Verification runs in a blocking task under a node-wide
+slot, a quarter of the cores, for `Hello`, `Peers` and the book file.
+
+### 7.3 Bandwidth
+
+A connection that another service shares exchanges discovery messages
+every 15 seconds (`SEND_INTERVAL`): each side sends its `Hello`, whether
+its record changed or not, and a `GetPeers`, and answers the other's. A
+frame adds 8 bytes. Computed from those constants and the sizes above, per
+connection and direction:
+
+| | Before | After |
+|---|---|---|
+| `Hello`, steady state | 24.6 B/s | 375.9 B/s |
+| `Peers`, one 32-record window per 10-minute epoch | 19.3 B/s | 300.3 B/s |
+| `Peers`, a full answer every 15 seconds | 770.8 B/s | 1,502.0 B/s |
+
+A default node holds up to 92 connections (`DEFAULT_ZAKURA_MAX_CONNECTIONS`).
+Its `Hello`s then cost 34.6 kB/s in each direction, 3.0 GB a day, where
+they cost 2.3 kB/s. Its `Peers` answers cost 27.6 kB/s at one window per
+peer and epoch, 138 kB/s if every answer is full of default records, and
+at most 148 kB/s, the served cap on every answer.
+
+A requester gets 4 records per answer, not 32. One peer's 32-record window
+takes at least 8 answers, 105 seconds after the first: a requester excludes
+only the records it stored, so one it discards can be served again. A
+discovery-only connection, which makes one exchange, yields 4 records.
+

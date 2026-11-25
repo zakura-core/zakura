@@ -238,8 +238,9 @@ impl Produce for PeerSampler {
                 &query.exclude_node_ids,
             )
             .await;
-        // Records that fill their extension area can make a sample larger
-        // than this node sends. The answer then carries the first of them.
+        // A record's ML-DSA-65 key and signature make a full sample larger
+        // than this node sends. The answer carries the first records that
+        // fit: 4 of a default node's, 2 of the largest.
         let records = records_within(records, served_peers_cap(query.limit).bytes);
         sink.finish(&DiscoveryMessage::Peers { records })
             .map_err(|error| ServeEnd::LocalFault(error.to_string()))

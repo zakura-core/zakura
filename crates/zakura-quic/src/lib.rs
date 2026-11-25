@@ -29,7 +29,8 @@ pub use composite::{
     ML_DSA_65_SIGNATURE_BYTES,
 };
 pub use credential::{
-    CredentialError, CredentialKey, NodeCredential, MAX_CREDENTIAL_BYTES, MAX_CREDENTIAL_KEY_BYTES,
+    verify_record_ml_dsa_65, CredentialError, CredentialKey, NodeCredential, MAX_CREDENTIAL_BYTES,
+    MAX_CREDENTIAL_KEY_BYTES,
 };
 pub use key::{
     ForeignKeyList, KeyParsingError, NodeAddr, NodeId, NodeKey, NodeSecretKey, SignatureError,

@@ -100,32 +100,17 @@ const fn peers_bytes(records: usize) -> usize {
 /// its exchange deadlines. An answer that reaches the cap carries fewer
 /// records than the request's limit, which is always allowed.
 ///
-/// The value is fixed. It doesn't follow [`MAX_NODE_RECORD_FIELDS_BYTES`],
-/// which grew when a key list came to hold 32 entries, because the
-/// deadlines it protects did not change. A node of this release signs
-/// records with a two-entry key list, and a full answer of those still
-/// fits, as the assertion below checks. An answer of records with longer
-/// key lists carries fewer of them, 14 when every field is at its largest.
-/// The release that gives nodes such lists can raise the cap.
+/// Every record carries an ML-DSA-65 key and signature in its extension
+/// area, so every full sample reaches the cap: an answer holds 4 of a
+/// default node's 5,630-byte record, and 2 of the largest.
 ///
 /// The stream's frame cap and the serving pools still follow
 /// [`PEERS_MAX_BYTES`]: one frame cap covers both directions, and each
 /// share has to hold a frame of that size.
 pub(crate) const SERVED_PEERS_MAX_BYTES: usize = 24_098;
 
-// A full answer of the largest records a node of this release signs: the
-// Ed25519 and ML-DSA-65 entries, every other field at its largest, and no
-// extension.
-const _: () = assert!(
-    2 + MAX_DISCOVERY_RECORDS_PER_RESPONSE
-        * (4 + 1
-            + 2 * NODE_KEY_ENTRY_BYTES
-            + RECORD_BODY_FIELDS_BYTES
-            + MAX_DIRECT_ADDRS_PER_RECORD * SOCKET_ADDR_V6_BYTES
-            + MAX_SERVICES_PER_RECORD * SERVICE_ID_MAX_BYTES
-            + SIGNATURE_BYTES)
-        <= SERVED_PEERS_MAX_BYTES
-);
+// Two maximum-sized signed records fit in one served answer.
+const _: () = assert!(2 + 2 * MAX_NODE_RECORD_BYTES <= SERVED_PEERS_MAX_BYTES);
 
 /// The most a `Peers` answer to a `GetPeers` with `limit` may carry: one frame
 /// with at most `limit` records.

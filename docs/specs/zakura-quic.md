@@ -1,6 +1,6 @@
 # Spec: `zakura-quic` transport
 
-Status: draft for review, 2026-11-25. Version 0.34.
+Status: draft for review, 2026-11-25. Version 0.35.
 This document is authoritative for the `zakura-quic` crate, its configuration,
 its wire behavior and its `quinn-proto` dependency policy.
 [Decision 0003](../decisions/zakura/0003-zakura-quic-transport.md) records the
@@ -91,6 +91,10 @@ Version 0.34 lets a key list hold 32 entries, not 4, and accepts a dial to
 an earlier node ID only when that ID names a prefix of the node's key list,
 so the check costs one hash per entry; it changes ID-8, ID-9, ID-12, TLS-7,
 DIAL-1, CTRL-26, COMPAT-13, SEC-2 and §16, and §17af lists each change.
+Version 0.35 signs every discovery record with ML-DSA-65 as well as
+Ed25519, in that room, and requires both signatures of every record; it
+changes ID-7, ID-8, ID-11, ID-13, API-1, COMPAT-10, COMPAT-13 and §16, and
+§17ag lists each change.
 
 ## 0. Conventions
 
@@ -218,6 +222,45 @@ Terms:
   author's encoded key list (ID-8) instead, and the reader derives the ID
   from it. The control hello and the legacy upgrade prelude carry the
   32-byte ID: TLS proves it (TLS-8).
+
+  A record carries two signatures by its author, and a reader MUST accept
+  it only when both verify, so forging a record takes a break of both
+  schemes, as forging a handshake does (TLS-4):
+  - an Ed25519 signature, after the body, over the record's signing domain
+    `zakura-node-record-v1`, its format version and the whole body, checked
+    under ID-6 with the list's Ed25519 key;
+  - an ML-DSA-65 signature, in the body's extension area (COMPAT-10), with
+    the author's ML-DSA-65 public key in full beside it. The list holds
+    that key only as a fingerprint (ID-8), and the reader can ask the
+    author for nothing.
+
+  The key and the signature are the last two extensions of the area, in
+  that order: type 1 with the 1,952-byte key, then type 2 with the
+  3,309-byte signature. The ML-DSA-65 signature covers the signing domain,
+  the format version and every body byte before the type-2 extension: the
+  fields, every other extension and the key. It uses the FIPS 204 context
+  `Zakura node record ML-DSA-65 v1`, which differs from the handshake's
+  (TLS-4), so the node's one ML-DSA-65 key never makes a signature that
+  verifies in the other place. It is hedged with 32 fresh random bytes. The
+  Ed25519 signature covers the ML-DSA-65 signature too.
+
+  A reader MUST refuse a record whose list has an ML-DSA-65 entry unless:
+  - the extension area is whole extensions (`u16` type, `u16` length,
+    value), with nothing left over;
+  - types 1 and 2 each appear exactly once, as the last two, type 1 first,
+    with exactly 1,952 and 3,309 bytes;
+  - the fingerprint (ID-12) of the type-1 key equals the list's ML-DSA-65
+    entry;
+  - the signature verifies with that key.
+
+  It treats a failure of any of these as it treats a bad Ed25519 signature.
+  An extension of any other type is the author's to define: the reader
+  keeps it byte for byte, relays it, and checks both signatures over it,
+  wherever it sits before type 1 and however often its type repeats. The
+  peer message regulation spec gives the byte layout, and
+  `crates/zakura-network/src/zakura/discovery/record_signature/record_kat.json`
+  gives a seed, record fields and hedging randomness with the record they
+  produce.
 - **ID-8.** A key list holds 1 to 32 entries. An entry is a `u16` tag and 32
   bytes. The encoding is the entry count as a `u8`, then each entry as its
   tag (little-endian) and its 32 bytes, so a list is 35 to 1,089 bytes. Tag 1
@@ -225,7 +268,9 @@ Terms:
   bytes are the fingerprint of the full key in the node's credential
   (ID-12); tag 3 is ML-DSA-65 (ID-13), and the rest are opaque to this
   release. Tag 2 was ML-DSA-44 in `p2p-v2/4`, and this release reads it as
-  any other unknown tag. Decoding MUST reject, and only reject:
+  any other unknown tag. A discovery record carries the tag-3 key in full
+  beside the list, and its reader checks that key against the entry (ID-7).
+  Decoding MUST reject, and only reject:
   - a count of 0 or above 32;
   - a length other than 1 + 34 × count bytes;
   - a tag of 0, or a tag that doesn't exceed the one before it;
@@ -253,7 +298,7 @@ Terms:
   includes the entry in the ID-9 hash and re-encodes it byte for byte. A
   later release can therefore add a key to a node's list, and this release
   still connects to that node and agrees on its `NodeId`.
-- **ID-11.** A well-formed list with no entry the reader supports is
+- **ID-11.** A well-formed list that lacks an entry the reader needs is
   unverifiable, not malformed. The reader MUST drop a record it can't verify
   and MUST refuse a connection it can't authenticate, and it MUST NOT
   disconnect or penalise the peer that relayed the list, because a
@@ -261,7 +306,13 @@ Terms:
   MUST keep this rule, or a newer node would punish older relays. This
   release authenticates a peer only by the composite of its Ed25519 and
   ML-DSA-65 keys (TLS-4), so it connects only to nodes whose credential
-  holds both, and a record carries one Ed25519 signature.
+  holds both. It verifies a record by the same two keys (ID-7), so a
+  record whose list lacks the Ed25519 entry or the ML-DSA-65 entry is
+  unverifiable: the reader drops it before it checks any signature, and
+  doesn't penalise its relay. Such a list names a node this release could
+  not connect to either. A list that has both entries is this release's to
+  verify in full, and a record of it without a valid ML-DSA-65 key and
+  signature is forged, not unverifiable.
 - **ID-12.** A node's credential holds its public keys in full, in the key
   list's tag order and under its count and tag rules (ID-8). The encoding is
   the entry count as a `u8`, then each entry as its tag (`u16`
@@ -313,7 +364,8 @@ Terms:
   its Ed25519 key and its ML-DSA-65 key. Loading the identity derives the ML-DSA
   seed, generates the key pair once, and zeroizes the derived seed. Clones of
   the identity share the encoded signing key. Its bytes MUST be zeroized when
-  the last owner drops it. Each signature uses the cached key and fresh hedging
+  the last owner drops it. Each signature, of a handshake (TLS-4) or of a
+  discovery record (ID-7), uses the cached key and fresh hedging
   randomness. Library temporaries can remain unwiped. These include BLAKE2b
   state and output during derivation, and `libcrux-ml-dsa` state during key
   generation and signing.
@@ -1268,7 +1320,11 @@ The public surface of `zakura-quic`. Changing it is a semver change of the crate
   fingerprint. `MAX_EARLIER_NODE_IDS` is the most earlier IDs one handshake
   proves (TLS-8). A `NodeSecretKey` carries
   the node's credential: its Ed25519 and ML-DSA-65 keys (ID-13), or one set
-  with `with_credential`, which MUST hold both.
+  with `with_credential`, which MUST hold both. For a discovery record's
+  ML-DSA-65 signature (ID-7), `NodeSecretKey::sign_record_ml_dsa_65` signs,
+  `verify_record_ml_dsa_65` checks a full key against a key list's entry
+  and the signature with it, and `NodeKeyList::contains_tag` says whether
+  a list names a key of a scheme.
 - **API-2.** `QuicEndpoint`:
   - `bind(secret, &QuicBindConfig, &QuicConfig) -> Result<QuicEndpoint, BindError>`;
   - `bind_with(secret, &QuicBindConfig, &QuicConfig, impl SocketFactory, EndpointInputs)`,
@@ -1467,10 +1523,12 @@ this release tolerates, and keep each hard change explicit.
   types and trailing bytes; a new message type comes with a new stream version.
 - **COMPAT-10.** A node record (discovery `Hello` and `Peers`) is relayed
   third-party data that no hop can negotiate. The record body ends in an
-  opaque extension area, signed with the body and kept verbatim, so a node
+  extension area, signed with the body and kept verbatim, so a node
   verifies and relays a record whose extensions it doesn't understand. New
   record contents, new address kinds included, MUST go in that area as TLVs
-  (`u16` type, `u16` length, value). A reader MUST ignore an unknown TLV.
+  (`u16` type, `u16` length, value), before the two TLVs that end it: the
+  author's ML-DSA-65 key and record signature, types 1 and 2 (ID-7). A
+  reader MUST ignore an unknown TLV.
   Because new contents go only in that area, every record a conformant relay
   sends decodes. A record whose body doesn't decode therefore fails its
   message, as a framing error does. The record format version in the
@@ -1556,26 +1614,36 @@ this release tolerates, and keep each hard change explicit.
   such a loss costs a redial. This predates version 0.34: under version
   0.31 a node could already authenticate with a credential of 7,185 bytes.
 
-  A discovery record is a separate case. It carries one Ed25519 signature
-  (ID-11), and this release's readers refuse a record without an Ed25519
-  key or with a body above the cap, so the handshake's path doesn't reach
-  it. A record also holds every other key as a fingerprint (ID-8), and its
-  reader verifies it offline (ID-7), so a second signature is of use only
-  with its full key beside it. This release therefore keeps 7,896 bytes of
-  a record's extension area free: room for two extensions, a public key
-  and its signature, sized for SLH-DSA-128s. An ML-DSA key and signature
-  of any level fit in the same room. The peer message regulation spec sets
-  the cap and gives the reasons for the size. A later release that wants a
-  post-quantum record signature adds the key and the signature there, and
-  a node of this release still verifies the Ed25519 signature over the
-  whole body and relays the record byte for byte. That release has to:
-  - raise a record's sequence when it adds the signature, because a node
-    keeps the copy it has of a record with the same sequence;
-  - decide when a node refuses a record without the second signature,
-    because whoever can forge the Ed25519 signature can also leave the
-    extensions out;
-  - keep the Ed25519 signature for as long as nodes of this release are to
-    read the record.
+  A discovery record is a separate case, and a harder one. It carries an
+  Ed25519 signature and an ML-DSA-65 signature with the ML-DSA-65 key in
+  full (ID-7), and this release's readers refuse a record whose list has
+  both entries and whose ML-DSA-65 key or signature is missing or wrong.
+  The key and the signature take 5,269 bytes of the 7,896 that a record's
+  extension area has beside the largest fields. The peer message
+  regulation spec sets that cap and gives the reasons for its size. Three
+  things follow for a later release, and they hold for as long as nodes of
+  this release are to read its records:
+  - every record whose list has an ML-DSA-65 entry carries the ML-DSA-65
+    key and a valid signature by it, as its last two extensions. A node
+    that retires the key in its credential as a fingerprint (ID-12) keeps
+    its `NodeId` and can no longer sign such a record, so nodes of this
+    release refuse its records and disconnect the peer that relays one.
+    A node that drops the entry from its list has a new `NodeId`, and
+    nodes of this release drop its records without penalty (ID-11);
+  - a second post-quantum record signature does not fit beside the first.
+    New record contents go before the type-1 extension, where both
+    signatures cover them, and 2,627 bytes are left there beside the
+    largest fields. An ML-DSA-87 key and signature need 7,227 and an
+    SLH-DSA-128s pair 7,896, so carrying either with the ML-DSA-65 pair
+    needs 12,496 or 13,165 bytes of room. Replacing a broken ML-DSA-65 in
+    records is therefore a hard break (COMPAT-8): a larger body cap, which
+    nodes of this release refuse, or a list without the ML-DSA-65 entry,
+    which they drop;
+  - the record keeps its Ed25519 signature.
+
+  Version 0.32 kept the room free so that a later release could choose
+  the scheme and when to require it. This release spends that choice on
+  ML-DSA-65.
 
 ## 14. Security
 
@@ -1674,6 +1742,9 @@ this release tolerates, and keep each hard change explicit.
 | A composite signature verifies only whole: a tampered Ed25519 or ML-DSA half, a truncated signature, another node's key in either half, a credential without an ML-DSA-65 key, and one whose tag-3 entry isn't 1,952 bytes are refused; the ML-DSA seed derivation has a known answer | TLS-4, ID-11, ID-12, ID-13 |
 | ML-DSA-65 key generation, signing and verification give a subset of Project Wycheproof's and NIST ACVP's known answers, each under its own context: seeded keys and deterministic and hedged signatures match, and a 256-byte context, wrong-length keys and signatures, a flipped commitment hash, a bad hint encoding and an out-of-bound response are refused | TLS-4, ID-13 |
 | Signatures that RustCrypto `ml-dsa` 0.1.2 made under the TLS-4 context, recorded offline, are reproduced byte for byte and verify, and its public key for the same seed matches | TLS-4, ID-13 |
+| Signatures that RustCrypto `ml-dsa` 0.1.2 made under the record context, recorded offline, are reproduced byte for byte and verify as record signatures; a handshake's ML-DSA-65 half and a record signature over the same bytes each fail in the other's place; a record signature is refused with a list that has no ML-DSA-65 entry, with another node's key and its own valid signature, and with a key or signature of another length | ID-7, ID-12, ID-13 |
+| The published record known answer: a fixed seed, record fields and randomness give the recorded record byte for byte, which decodes and verifies. The known answer was made without the Zakura crates, with Python's `cryptography` and `hashlib` and RustCrypto `ml-dsa` | ID-7, ID-9, ID-12, ID-13 |
+| A record is refused, each as its own case, without its key, without its signature, with a key the list doesn't name, with another node's key and that node's valid signature over the record, with a signature from another record of its author, with one flipped byte in the key, in the signature and in each kind of signed byte, with a repeated key or signature extension, with the two out of order or not last, with a wrong length, and with an extension that runs past the area. Unknown extensions are kept, relayed byte for byte and covered by both signatures. `Hello`, `Peers`, the book file and a static record each refuse a record signed with Ed25519 alone, and a record whose list has no ML-DSA-65 entry is dropped without a disconnect | ID-7, ID-11, COMPAT-10 |
 | The published composite known answer: a fixed seed, message and randomness give the recorded Ed25519 key, ML-DSA-65 key, node ID and composite signature, which verifies. The known answer was made without this crate, with Python's `cryptography` and `hashlib` and RustCrypto `ml-dsa` | TLS-4, ID-9, ID-12, ID-13 |
 | In a simulated handshake the dialer's first flight is 3,600 bytes; the listener's first flight is larger than three times the 2,400-byte hello but within three times 3,600, and the dialer completes on it alone, in one round trip | TLS-4, TLS-9, ADM-1, DIAL-8 |
 | When only the two hello datagrams have arrived, the listener starts its reply and sends at most 7,200 bytes. Delivering the padding releases the rest of the reply. | ADM-1, DIAL-8 |
@@ -2613,3 +2684,43 @@ Changed:
 - **§16.** Tests for the prefix rule and the lists it no longer accepts,
   the 32-entry limits, the credential's byte limit, and the largest
   credential's handshake with and without loss.
+
+## 17ag. Changes in version 0.35
+
+A discovery record was signed with Ed25519 alone, which a quantum computer
+could forge. Version 0.32 kept room in a record for a post-quantum
+signature and left it to a later release to add one. That release would
+have had to run a transition: nodes of this release would accept a record
+with or without the new signature, and whoever could forge the Ed25519
+signature could strip it. No release has spoken `p2p-v2/5` yet, so this
+version signs every record with the node's ML-DSA-65 key from the first
+`p2p-v2/5` release and requires the signature, with no transition and
+nothing to strip. The ALPN doesn't move, and no limit changes: the key and
+the signature fit the room version 0.32 kept.
+
+This is a prototype under evaluation. COMPAT-13 states what it makes
+permanent: the room no longer holds a second post-quantum key and
+signature, so replacing ML-DSA-65 in records becomes a hard break.
+
+Builds of main since version 0.29 speak `p2p-v2/5` and sign records with
+Ed25519 alone. A node with this change completes a handshake with such a
+build and then refuses its `Hello`, and that build can't decode this
+change's larger record, so each disconnects the other. A fleet that runs
+main moves to this change in one pass.
+
+Changed:
+
+- **ID-7.** A record carries the author's ML-DSA-65 key and an ML-DSA-65
+  signature as its last two extensions, under a context of its own, and a
+  reader requires both signatures.
+- **ID-8.** A record carries the tag-3 key in full beside the list.
+- **ID-11.** A list without the Ed25519 or the ML-DSA-65 entry is
+  unverifiable, and its record is dropped before any signature is checked.
+- **ID-13.** The node's ML-DSA-65 key signs records as well as handshakes.
+- **API-1.** Adds `NodeSecretKey::sign_record_ml_dsa_65`,
+  `verify_record_ml_dsa_65` and `NodeKeyList::contains_tag`.
+- **COMPAT-10.** New record contents go before the key and the signature.
+- **COMPAT-13.** What a later release must do with a record now, and why
+  replacing ML-DSA-65 in records is a hard break.
+- **§16.** Tests for the record signature's known answers, its refusals,
+  unknown extensions and each import path.

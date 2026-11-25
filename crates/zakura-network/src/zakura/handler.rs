@@ -2211,6 +2211,9 @@ impl ZakuraSupervisorHandle {
     }
 
     /// Reserve the next connection ID, or `None` once IDs run out.
+    // Rust 1.99 deprecates std's `fetch_update` for `try_update`, which the
+    // 1.97 MSRV lacks. The simulator's atomic keeps its own `fetch_update`.
+    #[allow(deprecated)]
     fn reserve_conn_id(&self) -> Option<ZakuraConnId> {
         self.next_registration_id
             .fetch_update(

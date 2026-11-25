@@ -91,7 +91,13 @@ fn admitted_request(count: u32, bytes: u32) -> (Arc<WorkQueue>, ByteBudget, Unpu
         NonZeroU64::new(1).expect("request ID is nonzero"),
     );
     let admitted = taken
-        .admit(block::Height(0), CancellationToken::new())
+        .admit_for_connection(
+            block::Height(0),
+            block::Height(0),
+            0,
+            None,
+            CancellationToken::new(),
+        )
         .expect("the empty budget admits the whole request");
     assert_eq!(budget.reserved(), total);
     (work, budget, admitted)
@@ -214,9 +220,15 @@ impl BenchWorkChurn {
             attempt,
         );
         assert_eq!(taken.items().len(), usize::try_from(self.count).unwrap());
-        let admitted = match taken.admit(block::Height(0), CancellationToken::new()) {
+        let admitted = match taken.admit_for_connection(
+            block::Height(0),
+            block::Height(0),
+            0,
+            None,
+            CancellationToken::new(),
+        ) {
             Ok(admitted) => admitted,
-            Err(AdmitRefusal::Capacity) => return false,
+            Err(AdmitRefusal::Capacity(_)) => return false,
             Err(other) => panic!("churn admission failed unexpectedly: {other:?}"),
         };
         let claim = admitted

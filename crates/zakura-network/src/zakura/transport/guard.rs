@@ -263,6 +263,9 @@ impl ByteBudget {
     /// Own a charge of `bytes`. The budget is a settlement ledger: it refuses
     /// only after closing, or on overflow. An admission concurrent with closure
     /// can finish; the publisher must check closure before exposing its resource.
+    // Rust 1.99 deprecates std's `fetch_update` for `try_update`, which the
+    // 1.97 MSRV lacks. The simulator's atomic keeps its own `fetch_update`.
+    #[allow(deprecated)]
     pub(crate) fn charge_owned(&self, bytes: u64) -> Option<ByteReservation> {
         if self.is_closed() {
             return None;
@@ -368,6 +371,9 @@ impl ByteBudget {
 
     /// Invoke `released` after the settlement attempt and before waking capacity
     /// waiters. A zero-byte release does nothing.
+    // Rust 1.99 deprecates std's `fetch_update` for `try_update`, which the
+    // 1.97 MSRV lacks. The simulator's atomic keeps its own `fetch_update`.
+    #[allow(deprecated)]
     fn release_then(&self, bytes: u64, released: impl FnOnce()) {
         if bytes == 0 {
             return;

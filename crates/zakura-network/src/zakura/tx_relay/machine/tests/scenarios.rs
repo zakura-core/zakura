@@ -645,11 +645,13 @@ fn an_id_whose_holder_ended_mid_verdict_is_a_first_source() {
     // A session past its share, then sessions that fill the cap.
     let late = bench.join(1);
     bench.have(late, &pool[..PENDING_SHARE + 44]);
-    let fillers = u64::try_from(PENDING_CAP / PENDING_PER_PEER).expect("small");
+    let counted = PENDING_PER_PEER - PENDING_SHARE;
+    let fillers = u64::try_from(PENDING_CAP.div_ceil(counted)).expect("small");
     for peer in 2..=fillers + 1 {
         let session = bench.join(peer);
         bench.have(session, &pool);
     }
+    assert!(bench.machine.shared.excess >= PENDING_CAP, "the cap filled");
     let supplier = bench.join(fillers + 2);
     let waiter = bench.supply(supplier, 0);
     let id = bench.id(0);

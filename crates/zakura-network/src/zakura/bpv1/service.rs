@@ -419,7 +419,7 @@ impl SharedNode {
             } => {
                 let node = Arc::clone(self);
                 drop(task::spawn_named("bpv1-check-unknown-parent", async move {
-                    let verdict = check_unknown_parent(&node, &envelope, top).await;
+                    let verdict = check_unknown_parent(&node, envelope, top).await;
                     tracing::debug!(target: "bpv1_stage", %block_id,
                         work_id = work_id.0, ?verdict, "unknown_parent_checked");
                     node.drive(BlockInput::UnknownParentChecked { work_id, verdict });
@@ -583,23 +583,26 @@ fn verify_envelope_commitment(
 }
 
 /// Runs the checks on `envelope`, whose parent header is unknown, in their
-/// order: the cheap binding and height checks, then proof of work on a
-/// blocking thread, then the target bound.
+/// order: the binding, height, and proof-of-work checks on a blocking thread,
+/// because they decode and hash an untrusted coinbase before any proof of
+/// work, then the target bound.
 async fn check_unknown_parent(
     node: &SharedNode,
-    envelope: &MetaEnvelope,
+    envelope: Box<MetaEnvelope>,
     top: u32,
 ) -> UnknownParentVerdict {
-    let Some(header) = parse_header(&envelope.header_bytes) else {
-        return UnknownParentVerdict::Invalid(Bpv1CloseRow::Row3InvalidHeader);
-    };
-    let height = match check_binding_and_height(&header, envelope, top) {
-        Ok(height) => height,
-        Err(verdict) => return verdict,
-    };
     let network = node.network.clone();
-    let target = match task::spawn_blocking(move || check_proof_of_work(&network, &header)).await {
-        Ok(Ok(target)) => target,
+    let checked = task::spawn_blocking(move || {
+        let header = parse_header(&envelope.header_bytes).ok_or(UnknownParentVerdict::Invalid(
+            Bpv1CloseRow::Row3InvalidHeader,
+        ))?;
+        let height = check_binding_and_height(&header, &envelope, top)?;
+        let target = check_proof_of_work(&network, &header)?;
+        Ok::<_, UnknownParentVerdict>((height, target))
+    })
+    .await;
+    let (height, target) = match checked {
+        Ok(Ok(checked)) => checked,
         Ok(Err(verdict)) => return verdict,
         // A check that never finished faults no peer: block sync owns the block.
         Err(_) => return UnknownParentVerdict::Drop,

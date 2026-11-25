@@ -111,6 +111,17 @@ impl BlockTable {
                 assert_eq!(block.repair_round, 0);
                 assert!(!block.body_claimed);
             }
+            // bpv1-63: only a verifying block has a submission in flight.
+            assert!(
+                block.verify_work_id.is_none() || block.phase == BlockPhase::Verifying,
+                "{BLOCK_REPLAY}: bpv1-63 a {:?} block holds a verifier submission",
+                block.phase
+            );
+            // bpv1-77: every verifying block has a verification deadline.
+            assert!(
+                block.phase != BlockPhase::Verifying || block.verify_deadline.is_some(),
+                "{BLOCK_REPLAY}: bpv1-77 a verifying block has no deadline"
+            );
             for st in &block.stripes {
                 // bpv1-28 budgets pulls. A decode may end with more than `k`
                 // parts held, and a `Fallback` block keeps them to serve but

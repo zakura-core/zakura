@@ -4,8 +4,10 @@
 //! (`SharedBodyClaims`), so BPv1 and native `block_sync` share them without
 //! coupling `block_sync` to BPv1 or changing any legacy path (`dual-1`).
 //!
-//! Every claim carries a monotonic expiry deadline (`reconstruction_deadline`),
-//! so a dead claim can never pin a height (`bpv1-57`). Releasing a claim for any
+//! Every claim carries an expiry deadline, so a dead claim can never pin a
+//! height (`bpv1-57`). BPv1 claims a body until its reconstruction deadline and
+//! extends the claim to its verification deadline once the block assembles
+//! (`bpv1-44`, `bpv1-77`). Releasing a claim for any
 //! reason but [`BodyClaimRelease::Committed`], or installing a claim with an
 //! earlier expiry, bumps one watch generation, so native block sync wakes
 //! immediately to fetch the missing body or to re-arm its claim-expiry timer.

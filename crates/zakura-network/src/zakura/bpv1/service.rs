@@ -2313,6 +2313,7 @@ fn record_block_event(event: &BlockEvent) {
                 FallbackReason::ReencodeFailed => "re_encode",
                 FallbackReason::RootMismatch => "root_mismatch",
                 FallbackReason::LocalCapacity => "local_capacity",
+                FallbackReason::VerifyDeadline => "verify_deadline",
             };
             tracing::debug!(target: "bpv1_stage", %block_id, reason = label, "fallback_started");
             metrics::counter!("zakura.p2p.bpv1.fallback.reason", "reason" => label).increment(1);

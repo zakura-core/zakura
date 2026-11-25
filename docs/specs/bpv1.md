@@ -105,6 +105,12 @@ violation, and the block arrives through header sync and block download.
 Header admission does not validate the block body. Reconstructed blocks MUST
 enter the existing consensus block-validation path.
 
+A node MUST keep at most one submission of a block in that path at a time. Its
+body claim keeps native block sync off the block from admission until the
+reconstruction deadline, and from assembly until a verdict or the verification
+deadline, which starts at the first submission. When that deadline passes, the
+node MUST use the existing block-download path.
+
 The [design targets](../design/bpv1.md#performance-targets) define the
 planning workload and the latency goal. These estimates do not change consensus
 limits or establish measured guarantees. The block interval and body size remain
@@ -1432,6 +1438,7 @@ registry.
 | --- | --- | --- |
 | Stall interval; `STALL_BACKOFF` | `SLOW_X` × one part's estimated arrival (decision-22); 2.0 | Recovery; the reconstruction deadline is the only bound (decision-17). |
 | Reconstruction deadline | 15 s | Monotonic from metadata admission. |
+| Verification deadline | 120 s | Monotonic from the first verifier submission. The verifier's wait for another delivery's pending commit. |
 | Retention after completion | 5 s, extended until every neighbour reports `BlockDone`, within a 60 s bound | Experimental. |
 | Verification and decode workers; CPU and memory caps | `TBD` | Required per-peer and node-wide work limits. |
 

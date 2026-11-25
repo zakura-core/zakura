@@ -15,6 +15,7 @@ use zakura_chain::{
     serialization::ZcashSerialize,
     transaction::Transaction,
 };
+use zakura_node_services::body_claims::SharedBodyClaims;
 use zakura_quic::NodeId;
 use zakura_rt::{collections::HashSet, time::Instant};
 
@@ -24,6 +25,7 @@ use super::{
     commitment::commitment_script,
     paths::{PathDirection, PathEstimate, PeerPaths, DEFAULT_UNMEASURED_RATE_BPS},
     peer::{PartAuth, PeerConfig},
+    ports::{claim_body_at, BlockFallbackPort},
     profile::{Coding, Profile},
     proposer::*,
     test_support::{
@@ -3328,4 +3330,252 @@ fn decision19_push_crossing_a_direct_copy_drops_as_surplus() {
     assert!(retired
         .events
         .contains(&BlockEvent::PartDuplicates { block_id, count: 2 }));
+}
+
+// Catch-up handoff between block sync and BPv1 (#2718). Each test names the
+// property it checks:
+//
+// - bpv1-76: BPv1 never admits or submits a block more than `PROPAGATION_DEPTH`
+//   above the verified tip.
+// - bpv1-77: every `Verifying` block reaches a verdict or its verification
+//   deadline, then frees its slot.
+// - bpv1-44: for a block BPv1 admits, block sync fetches no body until BPv1
+//   releases the claim by fallback, repair, retirement, or commit.
+// - bpv1-57: when BPv1 fails a block, it releases the claim at the deadline of
+//   the block's phase, so block sync fetches it within one fetch.
+//
+// `service_tests` runs the handoff through the service, and `ports_tests` checks
+// that block sync wakes when a claim expires and that no retryable verdict
+// reports `Invalid`.
+
+/// Applies the step's body-claim outputs to `claims` at `now`, as the IO shell's
+/// `BlockFallbackPort` does, so a test reads block sync's view of each claim.
+fn apply_claims(claims: &SharedBodyClaims, now: Instant, step: &BlockStep) {
+    for output in &step.outputs {
+        match output {
+            BlockOutput::ClaimBody { block_id, deadline } => {
+                claim_body_at(claims, *block_id, *deadline, now);
+            }
+            BlockOutput::ReleaseBodyClaim { block_id, reason } => {
+                BlockFallbackPort::release(claims, *block_id, *reason);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The work ids of the step's verifier submissions.
+fn submissions(step: &BlockStep) -> Vec<WorkId> {
+    step.outputs
+        .iter()
+        .filter_map(|o| match o {
+            BlockOutput::SubmitVerifier { work_id, .. } => Some(*work_id),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Offers metadata for `block_id` at `height` from its proposer `node_id(1)`,
+/// as the shell would, and returns the last step. The block is admitted iff
+/// that step holds `BlockEvent::BlockAdmitted`.
+fn offer(
+    table: &mut BlockTable,
+    now: Instant,
+    block_id: block::Hash,
+    height: u32,
+    coding: Coding,
+    part_root: [u8; 32],
+) -> BlockStep {
+    let received = table.step(
+        now,
+        BlockInput::MetaReceived {
+            envelope: make_envelope(block_id, coding, part_root, node_id(1)),
+            from_peer: node_id(1),
+            session_gen: 1,
+        },
+    );
+    let admitted = header_result(
+        table,
+        now,
+        &received,
+        HeaderAdmissionResult::Admitted { height },
+    );
+    let Some(work_id) = admitted.outputs.iter().find_map(|o| match o {
+        BlockOutput::VerifyCommitment { work_id, .. } => Some(*work_id),
+        _ => None,
+    }) else {
+        return admitted;
+    };
+    table.step(
+        now,
+        BlockInput::CommitmentChecked {
+            work_id,
+            ok: true,
+            peers: Vec::new(),
+            rng_seed: 7,
+        },
+    )
+}
+
+fn was_admitted(step: &BlockStep, block_id: block::Hash) -> bool {
+    step.events
+        .contains(&BlockEvent::BlockAdmitted { block_id })
+}
+
+/// bpv1-44: assembly extends the body claim to the verification deadline, so a
+/// block that assembles just before its reconstruction deadline stays claimed
+/// while it verifies. The commit releases the claim.
+#[test]
+fn bpv1_44_the_body_claim_covers_verification() {
+    let t0 = Instant::now();
+    let claims = SharedBodyClaims::new();
+    let encoded = encode_body(&Profile::TINY, &[0x55; 128], 2).unwrap();
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let block_id = block::Hash([0xA1; 32]);
+    table.step(t0, BlockInput::TipHeight { height: 9 });
+    let admitted = admit_block(
+        &mut table,
+        t0,
+        block_id,
+        10,
+        encoded.coding,
+        encoded.part_root,
+    );
+    apply_claims(&claims, t0, &admitted);
+    assert_eq!(claims.next_expiry(), Some(t0 + RECONSTRUCTION_DEADLINE));
+
+    let assembled_at = t0 + RECONSTRUCTION_DEADLINE - Duration::from_secs(1);
+    let mut work = Vec::new();
+    for part in &encoded.parts[..encoded.coding.k as usize] {
+        let step = insert(
+            &mut table,
+            assembled_at,
+            block_id,
+            part,
+            node_id(2),
+            PartAuth::Want(1),
+        );
+        apply_claims(&claims, assembled_at, &step);
+        work.extend(submissions(&step));
+    }
+    let [work_id] = work[..] else {
+        panic!("one submission, got {work:?}");
+    };
+    assert_eq!(table.block_phase(&block_id), Some(BlockPhase::Verifying));
+    assert_eq!(claims.next_expiry(), Some(assembled_at + VERIFY_DEADLINE));
+
+    // Past the reconstruction deadline, the verifying block keeps its claim, so
+    // block sync still skips it.
+    let later = t0 + RECONSTRUCTION_DEADLINE + Duration::from_secs(30);
+    let ticked = tick(&mut table, later, &[]);
+    apply_claims(&claims, later, &ticked);
+    assert!(!ticked
+        .events
+        .iter()
+        .any(|e| matches!(e, BlockEvent::FallbackStarted { .. })));
+    assert!(claims.is_claimed(block_id, later));
+
+    let committed = table.step(
+        later,
+        BlockInput::VerifierVerdict {
+            work_id,
+            block_id,
+            verdict: VerifierVerdict::Valid,
+        },
+    );
+    apply_claims(&claims, later, &committed);
+    assert!(!claims.is_claimed(block_id, later));
+    assert_eq!(table.block_phase(&block_id), Some(BlockPhase::Done));
+    table.assert_invariants();
+}
+
+/// bpv1-76 and bpv1-77 during catch-up: the best header runs 20 blocks ahead of
+/// the verified tip. BPv1 refuses the tip block, and four blocks inside both
+/// windows wait on a verifier that never answers. At the verification deadline each
+/// falls back, releases its claim, and frees its slot, and a late verdict
+/// changes nothing.
+#[test]
+fn bpv1_77_verification_ends_by_its_deadline_and_frees_the_slot() {
+    let t0 = Instant::now();
+    let claims = SharedBodyClaims::new();
+    let empty = encode_body(&Profile::TINY, &[], 1).unwrap();
+    let (coding, root) = (empty.coding, empty.part_root);
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let verified = 100;
+    table.step(t0, BlockInput::TipHeight { height: verified });
+    table.step(
+        t0,
+        BlockInput::ParentAdmitted {
+            hash: block::Hash([0xB0; 32]),
+            height: verified + 20,
+        },
+    );
+
+    let tip = block::Hash([0xB1; 32]);
+    let refused = offer(&mut table, t0, tip, verified + 20, coding, root);
+    assert!(!was_admitted(&refused, tip), "bpv1-76: block sync owns it");
+
+    // Each empty body assembles and submits at admission.
+    let mut work = Vec::new();
+    for i in 0..4u8 {
+        let block_id = block::Hash([0xB2 + i; 32]);
+        let step = offer(
+            &mut table,
+            t0,
+            block_id,
+            verified + 5 + u32::from(i),
+            coding,
+            root,
+        );
+        assert!(was_admitted(&step, block_id));
+        apply_claims(&claims, t0, &step);
+        work.extend(submissions(&step).into_iter().map(|w| (w, block_id)));
+    }
+    assert_eq!(work.len(), 4, "one submission per block");
+    let blocked = block::Hash([0xBF; 32]);
+    let full = offer(&mut table, t0, blocked, verified + 9, coding, root);
+    assert!(!was_admitted(&full, blocked), "every slot is verifying");
+    assert_eq!(table.next_deadline(), Some(t0 + VERIFY_DEADLINE));
+
+    let before = tick(
+        &mut table,
+        t0 + VERIFY_DEADLINE - Duration::from_millis(1),
+        &[],
+    );
+    assert!(before.events.is_empty() && before.outputs.is_empty());
+
+    let at = t0 + VERIFY_DEADLINE;
+    let expired = tick(&mut table, at, &[]);
+    apply_claims(&claims, at, &expired);
+    for &(_, block_id) in &work {
+        assert!(expired.events.contains(&BlockEvent::FallbackStarted {
+            block_id,
+            reason: FallbackReason::VerifyDeadline,
+        }));
+        assert!(
+            !claims.is_claimed(block_id, at),
+            "bpv1-57: block sync fetches it"
+        );
+        assert_eq!(table.block_phase(&block_id), Some(BlockPhase::Fallback));
+    }
+
+    // bpv1-63: the verifier answering late changes nothing.
+    let (late_work, late_block) = work[0];
+    let late = table.step(
+        at,
+        BlockInput::VerifierVerdict {
+            work_id: late_work,
+            block_id: late_block,
+            verdict: VerifierVerdict::Valid,
+        },
+    );
+    assert!(late.events.is_empty() && late.outputs.is_empty());
+    assert_eq!(table.block_phase(&late_block), Some(BlockPhase::Fallback));
+
+    let freed = offer(&mut table, at, blocked, verified + 9, coding, root);
+    assert!(
+        was_admitted(&freed, blocked),
+        "a fallback block yields its slot"
+    );
+    table.assert_invariants();
 }

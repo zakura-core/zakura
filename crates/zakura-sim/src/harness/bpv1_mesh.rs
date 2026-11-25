@@ -20,7 +20,8 @@
 //! not committed waits in an orphan queue of at most
 //! [`MAX_BLOCK_REORG_HEIGHT`] blocks, which block sync and BPv1 share, as
 //! zakura-state's `MAX_QUEUED_BLOCKS` does. A submission that finds the
-//! queue full gets `QueueFull`. The model answers block sync's queries at
+//! queue full gets `QueueFull`. Once the parent commits, verification takes
+//! a fixed delay, so blocks commit one at a time. The model answers block sync's queries at
 //! once, and drops its body records and misbehavior reports, which it only
 //! counts.
 //!
@@ -132,8 +133,8 @@ pub struct MeshScenario {
     pub mirrors: u8,
     /// Each starting block's serialized size in bytes.
     pub body_bytes: u32,
-    /// How long the node's verifier takes for one block, before it waits
-    /// for the parent.
+    /// How long the node's verifier takes for one block once its parent
+    /// commits.
     pub verify_delay: Duration,
 }
 
@@ -281,13 +282,10 @@ impl NodeState {
         }
     }
 
-    /// Verifies `block`, waits in the orphan queue until its parent
-    /// commits, and commits it.
+    /// Waits in the orphan queue until `block`'s parent commits, then
+    /// verifies and commits it. Commits follow the chain one at a time, as
+    /// zakura-state's do.
     async fn verify(&self, block: BlockHandle, via: Via) -> Answer {
-        zakura_rt::select! {
-            () = self.shutdown.cancelled() => return Answer::Shutdown,
-            () = time::sleep(self.delay) => {},
-        }
         let hash = block.hash();
         let parent = block.header().previous_block_hash;
         // Subscribed before the first check, so no commit slips between.
@@ -326,6 +324,10 @@ impl NodeState {
         }
         if let Some(answer) = answer {
             return answer;
+        }
+        zakura_rt::select! {
+            () = self.shutdown.cancelled() => return Answer::Shutdown,
+            () = time::sleep(self.delay) => {},
         }
         match self.engine.preload_blocks([block]) {
             Ok(()) => {

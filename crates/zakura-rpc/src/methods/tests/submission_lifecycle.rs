@@ -64,6 +64,7 @@ async fn resolve_duplicate(reads_before_commit: Option<usize>) -> (Option<Duplic
             registration,
             early_relay: None,
             committed_block: committed_block_lookup(read_state),
+            bpv1_proposer: None,
         },
         |outcome| outcome.duplicate_body,
     )
@@ -280,6 +281,121 @@ async fn trusted_rpc_keeps_uncertain_hashes_private_and_reports_an_unconfirmed_d
         assert!(pending.resolution(hash).is_none());
         queue.abort();
     }
+}
+
+/// `submit_trusted_block` publishes to BPv1 once its block commits, and never for a block
+/// consensus rejects. Early relay does not publish it: a trusted submission skips state
+/// admission.
+#[tokio::test(start_paused = true)]
+async fn trusted_rpc_publishes_to_bpv1_only_after_commit() {
+    use crate::tests::test_rpc::TestRpcImpl;
+    use zakura_chain::{block::Height, chain_tip::NoChainTip, parameters::Network};
+    use zakura_node_services::bpv1_proposer::{Bpv1ProposerHook, BPV1_COMMITMENT_NULL_DATA_LEN};
+    use zakura_test::mock_service::MockService;
+
+    #[derive(Debug, Default)]
+    struct CountingBpv1Proposer {
+        published: AtomicUsize,
+    }
+
+    impl Bpv1ProposerHook for CountingBpv1Proposer {
+        fn prepare_template_commitment(
+            &self,
+            _light_client_root: [u8; 32],
+            _height: Height,
+            _tx_count: u32,
+            _body_after_coinbase: &[u8],
+        ) -> Option<[u8; BPV1_COMMITMENT_NULL_DATA_LEN]> {
+            None
+        }
+
+        fn empty_template_commitment(
+            &self,
+            _height: Height,
+        ) -> Option<[u8; BPV1_COMMITMENT_NULL_DATA_LEN]> {
+            None
+        }
+
+        fn publish_solved_block(&self, _block: Arc<Block>, _height: Height) -> bool {
+            self.published.fetch_add(1, Ordering::AcqRel);
+            true
+        }
+
+        fn retire_failed_block(&self, _hash: zakura_chain::block::Hash) {}
+    }
+
+    let hash = Network::Mainnet.genesis_hash();
+    let mut verifier: MockService<_, _, _, tower::BoxError> = MockService::build().for_unit_tests();
+    let mempool: MockService<_, _, _, tower::BoxError> = MockService::build().for_unit_tests();
+    let (events, mut early) = tokio::sync::mpsc::unbounded_channel();
+    let (rpc, queue) = TestRpcImpl::new_for_tests(
+        Network::Mainnet,
+        Default::default(),
+        false,
+        "test",
+        "test",
+        tower::buffer::Buffer::new(mempool, 1),
+        tower::service_fn(move |req| async move {
+            assert_eq!(req, zakura_state::Request::KnownBlock(hash));
+            Ok(zakura_state::Response::KnownBlock(None))
+        }),
+        tower::service_fn(|req| async move {
+            assert!(matches!(req, ReadRequest::BlockInfo(_)));
+            Ok(ReadResponse::BlockInfo(Some(Default::default())))
+        }),
+        verifier.clone(),
+        Default::default(),
+        NoChainTip,
+        Default::default(),
+        tokio::sync::watch::channel(None).1,
+        Some(events),
+    );
+    let proposer = Arc::new(CountingBpv1Proposer::default());
+    let rpc = rpc.with_bpv1_proposer(proposer.clone());
+
+    for (result, expected) in [
+        (
+            Err(tower::BoxError::from(zakura_consensus::RouterError::from(
+                zakura_consensus::VerifyBlockError::from(
+                    zakura_consensus::BlockError::DuplicateTransaction,
+                ),
+            ))),
+            0,
+        ),
+        (Ok(hash), 1),
+    ] {
+        let rpc = rpc.clone();
+        let response = tokio::spawn(async move {
+            rpc.submit_trusted_block(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES)
+                .await
+        });
+        let request = verifier
+            .expect_request_that(|req| matches!(req, zakura_consensus::Request::CommitMined { .. }))
+            .await;
+        tokio::time::timeout(Duration::from_secs(1), early.recv())
+            .await
+            .expect("early relay starts before verification completes")
+            .expect("relay channel is open");
+        assert_eq!(
+            proposer.published.load(Ordering::Acquire),
+            0,
+            "early relay does not publish to BPv1"
+        );
+        request.respond(result);
+        let Ok(response) = response.await.unwrap() else {
+            panic!("a complete request returns a verdict")
+        };
+        assert_eq!(
+            crate::server::trusted_block::outcome(&response),
+            if expected == 1 {
+                "accepted"
+            } else {
+                "rejected"
+            }
+        );
+        assert_eq!(proposer.published.load(Ordering::Acquire), expected);
+    }
+    queue.abort();
 }
 
 /// What a [`RecordingBpv1Proposer`] saw, in call order.

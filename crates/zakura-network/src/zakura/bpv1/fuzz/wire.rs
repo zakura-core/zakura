@@ -322,10 +322,12 @@ fn check_queue_item(message: &Bpv1Message, frame: &Frame, reached: &mut Reached)
         Bpv1Message::Have {
             block_id,
             flags,
+            form,
             indices,
         } => DataQueueItem::Have {
             block_id: *block_id,
             flags: *flags,
+            form: *form,
             indices: indices.clone(),
         },
         Bpv1Message::WantEnd {

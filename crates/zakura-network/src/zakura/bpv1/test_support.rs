@@ -49,8 +49,8 @@ use super::{
     tree::VerifiedPart,
     unknown_parent::UnknownParentVerdict,
     wire::{
-        encode_part_frame, part_payload_len, Bpv1Message, HaveFlags, WantBitmap, WantEndReason,
-        BPV1_CONTROL_KIND, BPV1_DATA_KIND, ZAKURA_CAP_BPV1,
+        encode_part_frame, part_payload_len, Bpv1Message, HaveFlags, HaveForm, WantBitmap,
+        WantEndReason, BPV1_CONTROL_KIND, BPV1_DATA_KIND, ZAKURA_CAP_BPV1,
     },
 };
 use crate::zakura::{
@@ -489,6 +489,7 @@ enum MeshFrame {
     Have {
         block_id: block::Hash,
         flags: HaveFlags,
+        form: HaveForm,
         indices: Vec<u32>,
     },
     WantEnd {
@@ -1075,6 +1076,7 @@ impl MachineMesh {
             PeerOutput::SendHave {
                 block_id,
                 flags,
+                form,
                 indices,
             } => {
                 self.send(
@@ -1083,6 +1085,7 @@ impl MachineMesh {
                     MeshFrame::Have {
                         block_id,
                         flags,
+                        form,
                         indices,
                     },
                 );
@@ -1260,6 +1263,7 @@ impl MachineMesh {
                 block_id,
                 flags,
                 indices,
+                ..
             } => {
                 assert!(
                     indices
@@ -1355,7 +1359,8 @@ impl MachineMesh {
         let bytes: u64 = match &frame {
             MeshFrame::Control(_) => 64,
             MeshFrame::Part { part, .. } => part.payload().len() as u64,
-            MeshFrame::Have { indices, .. } => 35 + 4 * indices.len() as u64,
+            // Widening usize to u64 is lossless on supported targets.
+            MeshFrame::Have { form, indices, .. } => 33 + form.indices_len(indices.len()) as u64,
             MeshFrame::WantEnd { .. } => 7,
         };
         let tx_ns = u128::from(bytes)
@@ -1425,11 +1430,13 @@ impl MachineMesh {
             MeshFrame::Have {
                 block_id,
                 flags,
+                form,
                 indices,
             } => PeerInput::RecvHave(RecvHave {
                 block_id,
                 flags,
-                frame_bytes: 35 + indices.len() * 4,
+                form,
+                frame_bytes: 33 + form.indices_len(indices.len()),
                 indices,
             }),
             MeshFrame::WantEnd { want_id, sent, .. } => {
@@ -1452,13 +1459,14 @@ impl MachineMesh {
             MeshFrame::Control(Bpv1Message::HeaderMeta { part_root, .. }) => {
                 let block_id = self.block_of_root(&part_root);
                 let total = self.envelopes[&block_id].coding.total_parts().unwrap_or(0);
-                let indices = (0..total).collect();
+                let indices: Vec<u32> = (0..total).collect();
                 self.enqueue(
                     adversary,
                     from,
                     MeshFrame::Have {
                         block_id,
                         flags: HaveFlags::Plain,
+                        form: HaveForm::smaller(total, indices.len()),
                         indices,
                     },
                 );

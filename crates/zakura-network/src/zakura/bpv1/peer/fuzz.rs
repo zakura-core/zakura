@@ -32,7 +32,7 @@ use crate::zakura::bpv1::{
     paths::Arrival,
     profile::Profile,
     tree::VerifiedPart,
-    wire::{encode_part_frame, Bpv1Message, HaveFlags, WantBitmap, WantEndReason},
+    wire::{encode_part_frame, Bpv1Message, HaveFlags, HaveForm, WantBitmap, WantEndReason},
 };
 
 /// Summary returned by [`replay_bpv1_peer_bytes`] (`tool-2`, `p2p-fuzz`).
@@ -343,7 +343,8 @@ fn decode(
             PeerInput::RecvHave(RecvHave {
                 block_id: block.id,
                 flags,
-                frame_bytes: 39 + 4 * indices.len(),
+                form: HaveForm::List,
+                frame_bytes: 33 + HaveForm::List.indices_len(indices.len()),
                 indices,
             })
         }

@@ -16,7 +16,7 @@ use crate::zakura::{
     bpv1::{
         commitment::CoinbaseBinding,
         profile::Profile,
-        wire::{Bpv1Message, HaveFlags, WantBitmap, WantEndReason},
+        wire::{Bpv1Message, HaveFlags, HaveForm, WantBitmap, WantEndReason},
     },
     wire_codec::encode_frame,
 };
@@ -583,6 +583,7 @@ fn wire_seeds() -> Vec<Bpv1Seed> {
             Bpv1Message::Have {
                 block_id,
                 flags: HaveFlags::Push,
+                form: HaveForm::List,
                 indices: vec![0, 2],
             },
         ),

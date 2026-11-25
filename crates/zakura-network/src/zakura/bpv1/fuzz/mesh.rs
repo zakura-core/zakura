@@ -98,7 +98,7 @@ use crate::zakura::{
         unknown_parent::UnknownParentVerdict,
         wire::{
             encode_part_frame, message_type, Bpv1FifoQueue, Bpv1Message, DataQueueItem, HaveFlags,
-            WantBitmap, WantEndReason, PROPAGATION_DEPTH,
+            HaveForm, WantBitmap, WantEndReason, PROPAGATION_DEPTH,
         },
     },
     wire_codec::encode_frame,
@@ -908,10 +908,13 @@ impl Mesh {
             1 => {
                 let flags =
                     [HaveFlags::Plain, HaveFlags::Push, HaveFlags::Relay][usize::from(a >> 5) % 3];
-                let indices = (0..8u32).filter(|i| mask & (1 << i) != 0).collect();
+                let indices: Vec<u32> = (0..8u32).filter(|i| mask & (1 << i) != 0).collect();
+                // The form an honest sender picks for the block's geometry.
+                let total = solved.map_or(0, |s| s.encoded.coding.total_parts().unwrap_or(0));
                 let message = Bpv1Message::Have {
                     block_id,
                     flags,
+                    form: HaveForm::smaller(total, indices.len()),
                     indices,
                 };
                 (false, encode_frame(&message).ok())
@@ -1280,6 +1283,7 @@ impl Mesh {
             PeerOutput::SendHave {
                 block_id,
                 flags,
+                form,
                 indices,
             } => self.push_data(
                 node,
@@ -1287,6 +1291,7 @@ impl Mesh {
                 DataQueueItem::Have {
                     block_id,
                     flags,
+                    form,
                     indices,
                 },
             ),

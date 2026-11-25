@@ -678,6 +678,7 @@ async fn data_writer_delays_but_never_drops_behind_a_slow_reader() {
     writer.push(DataQueueItem::Have {
         block_id,
         flags: super::wire::HaveFlags::Plain,
+        form: super::wire::HaveForm::List,
         indices: vec![0, 1, 2],
     });
     writer.push(DataQueueItem::WantEnd {

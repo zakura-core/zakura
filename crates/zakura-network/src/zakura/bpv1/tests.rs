@@ -19,6 +19,7 @@ use zakura_quic::{NodeId, NodeSecretKey};
 
 use super::{
     test_support::{build_v6_coinbase, build_v6_tx, node_id, regtest_nu7},
+    wire::{HAVE_BITMAP_MAX_BYTES, HAVE_FLAG_BITMAP},
     *,
 };
 use crate::zakura::{
@@ -28,6 +29,7 @@ use crate::zakura::{
         message_suite::{check_layout_carries_family, message_suite, MessageSample, Violation},
         WireError,
     },
+    Frame,
 };
 
 /// A complete post-NU7 block with a committed v6 coinbase.
@@ -680,6 +682,7 @@ fn fifo_queue_keeps_every_item_and_cancels_parts_but_never_ends() {
     queue.push_back(DataQueueItem::Have {
         block_id: block,
         flags: HaveFlags::Plain,
+        form: HaveForm::List,
         indices: vec![0],
     });
     queue.push_back(DataQueueItem::WantEnd {
@@ -852,14 +855,31 @@ impl MessageSample for Bpv1Message {
             siblings: vec![[0x66; 32]; profile::W2_MAX_PROOF_DEPTH],
             payload: vec![0x77; profile::W2_S_MAX as usize],
         };
+        // The shortest `Have` is a one-byte bitmap (decision-33).
         let min_have = Bpv1Message::Have {
             block_id: zakura_chain::block::Hash([5u8; 32]),
             flags: HaveFlags::Plain,
+            form: HaveForm::Bitmap { len: 1 },
             indices: vec![0],
         };
+        let list_have = Bpv1Message::Have {
+            block_id: zakura_chain::block::Hash([5u8; 32]),
+            flags: HaveFlags::Push,
+            form: HaveForm::List,
+            indices: vec![0, 43_000],
+        };
+        // A 2 MB block's 86 parts as an 11-byte bitmap.
+        let w2_bitmap_have = Bpv1Message::Have {
+            block_id: zakura_chain::block::Hash([5u8; 32]),
+            flags: HaveFlags::Relay,
+            form: HaveForm::Bitmap { len: 11 },
+            indices: (0..profile::W2_MAX_N).collect(),
+        };
+        // The longest `Have` is a `u16` list of `MAX_HAVE_INDICES`.
         let max_have = Bpv1Message::Have {
             block_id: zakura_chain::block::Hash([5u8; 32]),
             flags: HaveFlags::Relay,
+            form: HaveForm::List,
             indices: (0..profile::W2_MAX_HAVE_INDICES as u32).collect(),
         };
         let want_end = Bpv1Message::WantEnd {
@@ -877,6 +897,8 @@ impl MessageSample for Bpv1Message {
             min_part,
             max_part,
             min_have,
+            list_have,
+            w2_bitmap_have,
             max_have,
             want_end,
         ]
@@ -885,14 +907,31 @@ impl MessageSample for Bpv1Message {
     fn opaque_types() -> &'static [u16] {
         // A part payload is the rest of the frame, `wire_len(i)` bytes
         // (decision-18). The codec bounds it by `S_MAX`; `PeerState` checks the
-        // exact length against the admitted coding (bpv1-66).
-        &[super::wire::message_type::PART]
+        // exact length against the admitted coding (bpv1-66). A `Have`
+        // bitmap is also the rest of the frame (decision-33): the codec
+        // bounds it by `ceil(MAX_PARTS / 8)`, and `PeerState` checks the
+        // exact length against the admitted coding (close-16).
+        &[
+            super::wire::message_type::PART,
+            super::wire::message_type::HAVE,
+        ]
     }
 
     fn opaque_head_len(&self) -> usize {
         match self {
             // `block_id || index || depth || siblings`, then the payload.
             Bpv1Message::Part { siblings, .. } => 32 + 4 + 1 + 32 * siblings.len(),
+            // `block_id || flags`, then the bitmap. A bitmap sample's first
+            // byte is nonzero, so every longer prefix still names an index.
+            Bpv1Message::Have {
+                form: HaveForm::Bitmap { .. },
+                ..
+            } => 32 + 1 + 1,
+            // A list's count fixes its length.
+            Bpv1Message::Have {
+                form: HaveForm::List,
+                ..
+            } => usize::MAX,
             _ => 0,
         }
     }
@@ -949,12 +988,22 @@ impl MessageSample for Bpv1Message {
                     Just(HaveFlags::Plain),
                     Just(HaveFlags::Push),
                     Just(HaveFlags::Relay)
-                ]
+                ],
+                prop::option::of(0u16..4),
             )
-                .prop_map(|(hash, count, flags)| Bpv1Message::Have {
-                    block_id: zakura_chain::block::Hash(hash),
-                    flags,
-                    indices: (0..count as u32).map(|i| i * 3).collect(),
+                .prop_map(|(hash, count, flags, bitmap_slack)| {
+                    // `count <= 8`, so the cast keeps every value.
+                    let indices: Vec<u32> = (0..count as u32).map(|i| i * 3).collect();
+                    let covered = indices[count - 1] / 8 + 1;
+                    Bpv1Message::Have {
+                        block_id: zakura_chain::block::Hash(hash),
+                        flags,
+                        // `covered <= 3`, so the cast keeps every value.
+                        form: bitmap_slack.map_or(HaveForm::List, |slack| HaveForm::Bitmap {
+                            len: covered as u16 + slack,
+                        }),
+                        indices,
+                    }
                 }),
             (1u32..1000, 0u16..86, 0u8..=2).prop_map(|(want_id, sent, reason)| {
                 Bpv1Message::WantEnd {
@@ -981,6 +1030,7 @@ impl MessageSample for Bpv1Message {
             encode_frame(&Bpv1Message::Have {
                 block_id: zakura_chain::block::Hash([2u8; 32]),
                 flags: HaveFlags::Relay,
+                form: HaveForm::List,
                 indices: vec![1],
             })
             .unwrap()
@@ -998,15 +1048,38 @@ impl MessageSample for Bpv1Message {
         let mut unsorted_have = encode_frame(&Bpv1Message::Have {
             block_id: zakura_chain::block::Hash([2u8; 32]),
             flags: HaveFlags::Plain,
+            form: HaveForm::List,
             indices: vec![1, 2],
         })
         .unwrap();
-        // Set second index equal to first (not strictly increasing).
-        unsorted_have.payload[39..43].copy_from_slice(&1u32.to_le_bytes());
+        // Set the second `u16` index equal to the first (not strictly
+        // increasing).
+        unsorted_have.payload[37..39].copy_from_slice(&1u16.to_le_bytes());
 
-        // decision-24: bits 0 and 1 are the only defined `Have` flags.
+        // decision-24, decision-33: bits 0, 1 and 2 are the only defined
+        // `Have` flags.
         let mut reserved_have_flag = relay_have();
-        reserved_have_flag.payload[32] |= 0x04;
+        reserved_have_flag.payload[32] |= 0x08;
+
+        // `block_id || flags || body` as a raw `Have` frame.
+        let have_frame = |flags: u8, body: &[u8]| {
+            let mut payload = vec![2u8; 32];
+            payload.push(flags);
+            payload.extend_from_slice(body);
+            Frame {
+                message_type: super::wire::message_type::HAVE,
+                flags: 0,
+                payload,
+            }
+        };
+        let empty_list = have_frame(0, &0u16.to_le_bytes());
+        // The count check runs before the indices are read.
+        let long_list = have_frame(0, &4_097u16.to_le_bytes());
+        let short_list = have_frame(0, &[2, 0, 1, 0]);
+        let empty_have_bitmap = have_frame(HAVE_FLAG_BITMAP, &[0; 11]);
+        // 513 full bytes name 4,104 indices, past `MAX_HAVE_INDICES`.
+        let full_bitmap = have_frame(HAVE_FLAG_BITMAP, &[0xFF; 513]);
+        let long_bitmap = have_frame(HAVE_FLAG_BITMAP, &[0x01; HAVE_BITMAP_MAX_BYTES + 1]);
 
         // decision-24: relay is valid only beside push.
         let mut relay_without_push = relay_have();
@@ -1047,9 +1120,39 @@ impl MessageSample for Bpv1Message {
                 rejected_by: |e| matches!(e, WireError::OutOfRange(_)),
             },
             Violation {
-                name: "have flag bit other than push and relay",
+                name: "have flag bit other than push, relay, and bitmap",
                 frame: reserved_have_flag,
-                rejected_by: |e| matches!(e, WireError::ReservedFlags(0x07)),
+                rejected_by: |e| matches!(e, WireError::ReservedFlags(0x0B)),
+            },
+            Violation {
+                name: "have list with no index",
+                frame: empty_list,
+                rejected_by: |e| matches!(e, WireError::OutOfRange("have index count")),
+            },
+            Violation {
+                name: "have list past MAX_HAVE_INDICES",
+                frame: long_list,
+                rejected_by: |e| matches!(e, WireError::OutOfRange("have index count")),
+            },
+            Violation {
+                name: "have list shorter than its count",
+                frame: short_list,
+                rejected_by: |e| matches!(e, WireError::Truncated(_)),
+            },
+            Violation {
+                name: "have bitmap with no index",
+                frame: empty_have_bitmap,
+                rejected_by: |e| matches!(e, WireError::OutOfRange("have index count")),
+            },
+            Violation {
+                name: "have bitmap past MAX_HAVE_INDICES",
+                frame: full_bitmap,
+                rejected_by: |e| matches!(e, WireError::OutOfRange("have index count")),
+            },
+            Violation {
+                name: "have bitmap past ceil(MAX_PARTS / 8)",
+                frame: long_bitmap,
+                rejected_by: |e| matches!(e, WireError::OutOfRange("have bitmap length")),
             },
             Violation {
                 name: "have relay flag without push",
@@ -1144,4 +1247,152 @@ fn golden_external_hex_vectors_for_w2_discontinuities_and_wire() {
         hex::encode(&encoded_want.payload),
         "01000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa000000008100000000000000000000"
     );
+
+    // 4. Frozen `Have` frames in both forms (decision-33): a plain list of
+    // indices 1 and 300, then a push and relay bitmap of 0, 9 and 85 at 86
+    // parts.
+    let list_have = encode_frame(&Bpv1Message::Have {
+        block_id: zakura_chain::block::Hash([0xAA; 32]),
+        flags: HaveFlags::Plain,
+        form: HaveForm::List,
+        indices: vec![1, 300],
+    })
+    .expect("encode list Have");
+    assert_eq!(
+        hex::encode(&list_have.payload),
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa00020001002c01"
+    );
+    let bitmap_have = encode_frame(&Bpv1Message::Have {
+        block_id: zakura_chain::block::Hash([0xAA; 32]),
+        flags: HaveFlags::Relay,
+        form: HaveForm::Bitmap { len: 11 },
+        indices: vec![0, 9, 85],
+    })
+    .expect("encode bitmap Have");
+    assert_eq!(
+        hex::encode(&bitmap_have.payload),
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa070102000000000000000020"
+    );
+}
+
+/// decision-33: both `Have` forms round trip, through the message codec and
+/// through the data queue's borrowed encoder, to the same frame.
+#[test]
+fn decision33_have_round_trips_in_both_forms() {
+    let cases = [
+        (HaveForm::List, vec![0]),
+        (HaveForm::List, vec![3, 40_000, 44_031]),
+        (HaveForm::List, (0..4_096).collect()),
+        (HaveForm::Bitmap { len: 1 }, vec![7]),
+        (HaveForm::Bitmap { len: 11 }, (0..86).collect()),
+        (HaveForm::Bitmap { len: 11 }, vec![85]),
+        (
+            HaveForm::Bitmap {
+                len: HAVE_BITMAP_MAX_BYTES as u16,
+            },
+            vec![0, 44_031],
+        ),
+    ];
+    for (form, indices) in cases {
+        for flags in [HaveFlags::Plain, HaveFlags::Push, HaveFlags::Relay] {
+            let message = Bpv1Message::Have {
+                block_id: zakura_chain::block::Hash([0x3C; 32]),
+                flags,
+                form,
+                indices: indices.clone(),
+            };
+            let frame = encode_frame(&message).expect("a valid Have encodes");
+            assert_eq!(
+                decode_frame::<Bpv1Message>(&frame).expect("its frame decodes"),
+                message
+            );
+            let queued = DataQueueItem::Have {
+                block_id: zakura_chain::block::Hash([0x3C; 32]),
+                flags,
+                form,
+                indices: indices.clone(),
+            };
+            assert_eq!(queued.encode(), Some(frame), "{form:?} {flags:?}");
+        }
+    }
+    // The encoder refuses what the decoder would refuse.
+    for (form, indices) in [
+        (HaveForm::List, vec![]),
+        (HaveForm::List, vec![2, 2]),
+        (HaveForm::List, vec![65_536]),
+        (HaveForm::Bitmap { len: 1 }, vec![8]),
+        (HaveForm::Bitmap { len: 0 }, vec![0]),
+        (
+            HaveForm::Bitmap {
+                len: HAVE_BITMAP_MAX_BYTES as u16 + 1,
+            },
+            vec![0],
+        ),
+    ] {
+        assert!(
+            encode_have_frame(
+                zakura_chain::block::Hash([0; 32]),
+                HaveFlags::Plain,
+                form,
+                &indices
+            )
+            .is_err(),
+            "{form:?} {indices:?}"
+        );
+    }
+}
+
+/// decision-33: the encoder picks the smaller form, and a tie keeps the
+/// list. At 86 parts the bitmap takes 11 bytes, so four indices (10 bytes)
+/// stay a list and five (12 bytes) become a bitmap.
+#[test]
+fn decision33_encoder_picks_the_smaller_form_at_the_crossover() {
+    assert_eq!(HaveForm::smaller(86, 4), HaveForm::List);
+    assert_eq!(HaveForm::smaller(86, 5), HaveForm::Bitmap { len: 11 });
+    // At 80 parts four indices tie the 10-byte bitmap.
+    assert_eq!(HaveForm::smaller(80, 4), HaveForm::List);
+    assert_eq!(HaveForm::smaller(80, 5), HaveForm::Bitmap { len: 10 });
+    // An empty layout has no bitmap.
+    assert_eq!(HaveForm::smaller(0, 1), HaveForm::List);
+    let max_parts = profile::W2_MAX_STRIPES * profile::W2_MAX_N;
+    assert_eq!(
+        HaveForm::smaller(max_parts, 4_096),
+        HaveForm::Bitmap {
+            len: HAVE_BITMAP_MAX_BYTES as u16
+        }
+    );
+    for total in [1, 2, 8, 9, 86, 172, 1_000, max_parts] {
+        for count in 1..=profile::W2_MAX_HAVE_INDICES {
+            let form = HaveForm::smaller(total, count);
+            let list = HaveForm::List.indices_len(count);
+            let bitmap = total.div_ceil(8) as usize;
+            assert_eq!(form.indices_len(count), list.min(bitmap), "{total} {count}");
+            assert!(form.fits(total));
+        }
+    }
+}
+
+/// decision-33 against #2745's table: one index takes a 4-byte list, and a
+/// 2 MB block's 86 indices take an 11-byte bitmap, where the `u32` list took
+/// 6 and 346 bytes.
+#[test]
+fn decision33_have_sizes_match_the_issue_table() {
+    let have_len = |total: u32, indices: Vec<u32>| {
+        let form = HaveForm::smaller(total, indices.len());
+        encode_have_frame(
+            zakura_chain::block::Hash([0; 32]),
+            HaveFlags::Plain,
+            form,
+            &indices,
+        )
+        .expect("a valid Have encodes")
+        .payload
+        .len()
+    };
+    // `block_id` and the flags byte precede the indices.
+    let header = 32 + 1;
+    assert_eq!(have_len(86, vec![17]), header + 4);
+    assert_eq!(have_len(86, (0..86).collect()), header + 11);
+    // A full proposer seed list at 86 parts.
+    assert_eq!(have_len(86, (0..86).step_by(2).collect()), header + 11);
 }

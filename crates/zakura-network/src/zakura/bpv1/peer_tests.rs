@@ -21,8 +21,8 @@ use super::{
     },
     tree::VerifiedPart,
     wire::{
-        encode_part_frame, Bpv1Message, HaveFlags, WantBitmap, WantEndReason, MAX_WANTS_INFLIGHT,
-        PROPAGATION_DEPTH,
+        encode_part_frame, Bpv1Message, HaveFlags, HaveForm, WantBitmap, WantEndReason,
+        MAX_WANTS_INFLIGHT, PROPAGATION_DEPTH,
     },
 };
 
@@ -70,7 +70,8 @@ pub(super) fn have_with(block_id: block::Hash, flags: HaveFlags, indices: Vec<u3
     PeerInput::RecvHave(RecvHave {
         block_id,
         flags,
-        frame_bytes: 35 + 4 * indices.len(),
+        form: HaveForm::List,
+        frame_bytes: 33 + HaveForm::List.indices_len(indices.len()),
         indices,
     })
 }
@@ -1321,6 +1322,7 @@ fn decision24_holder_flags_then_pushes_its_seeds_but_not_to_the_proposer() {
             PeerOutput::SendHave {
                 block_id,
                 flags: HaveFlags::Push,
+                form: HaveForm::smaller(tiny().total_parts().unwrap(), 2),
                 indices: vec![0, 1],
             },
             PeerOutput::PushPart { block_id, index: 0 },
@@ -1477,6 +1479,7 @@ fn decision24_flagged_have_is_chunked_at_the_have_limit() {
         match output {
             PeerOutput::SendHave {
                 flags: HaveFlags::Push,
+                form,
                 indices,
                 ..
             } => {
@@ -1485,6 +1488,7 @@ fn decision24_flagged_have_is_chunked_at_the_have_limit() {
                     super::wire::DataQueueItem::Have {
                         block_id,
                         flags: HaveFlags::Push,
+                        form: *form,
                         indices: indices.clone(),
                     }
                     .encode()
@@ -1569,7 +1573,7 @@ fn bpv1_60_flagged_have_refused_by_a_full_early_record_never_closes() {
     let coding = tiny();
     let bound = coding.n - coding.k;
     assert!(bound >= 2 && coding.split_index(bound).unwrap().0 == 0);
-    let have_bytes = 39;
+    let have_bytes = 33 + HaveForm::List.indices_len(1);
     let mut config = PeerConfig::for_profile(Profile::TINY);
     // The record holds one flagged `Have` and its part, with no room for a
     // second `Have`.
@@ -2105,6 +2109,7 @@ fn a_pushed_seed_learned_after_its_plain_have_is_announced_once() {
         vec![PeerOutput::SendHave {
             block_id,
             flags: HaveFlags::Plain,
+            form: HaveForm::smaller(tiny().total_parts().unwrap(), 1),
             indices: vec![1],
         }],
         "an unpushed part gets a plain Have and no push"

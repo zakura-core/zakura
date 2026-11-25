@@ -44,7 +44,8 @@ const SUBMIT_TIMEOUT: Duration = VERIFY_DEADLINE;
 /// only while native sync owns block applies, and each submission is an apply the
 /// coordinator counts, so the legacy fallback drain waits for it. In `LegacyBootstrap`
 /// and during the legacy fallback the adapter submits nothing and returns
-/// [`VerifierVerdict::LocalCapacity`]: BPv1 releases the block, and legacy delivers it.
+/// [`VerifierVerdict::LocalCapacity`], and legacy delivers the block. BPv1 releases
+/// it, or parks it while its parent is not committed (`bpv1-84`).
 pub(crate) struct RouterBlockVerifierAdapter<V> {
     router: V,
     coordinator: Arc<SyncCoordinator>,

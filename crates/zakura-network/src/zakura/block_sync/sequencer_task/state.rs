@@ -868,9 +868,11 @@ impl SequencerState {
             return (false, released);
         }
         let Some((semantic_owner, semantic_state_version)) = semantic_completion else {
-            let _ = self.sequencer.remove_applying(height);
+            // Finish the submission first, so its body releases rather than
+            // detaches.
             self.sequencer
                 .finish_submission(owner, source, token, height, hash);
+            let _ = self.sequencer.remove_applying(height);
             // Removing this submitted body can leave the decoded-cap window with
             // nothing submitted, so wake its pending work (see
             // `Sequencer::submission_admitted`). With nothing pending, a stale
@@ -925,6 +927,10 @@ impl SequencerState {
                 .finish_attached_submission(owner, source, token, height, hash);
             return (false, true);
         }
+        // Finish the submission first, so its body releases rather than
+        // detaches.
+        self.sequencer
+            .finish_submission(owner, source, token, height, hash);
         let applying = self
             .sequencer
             .remove_applying(height)
@@ -935,8 +941,6 @@ impl SequencerState {
         if !cfg!(feature = "sync-metrics") && matches!(result, BlockApplyResult::Committed) {
             outputs.committed_bytes = Some(applying.bytes);
         }
-        self.sequencer
-            .finish_submission(owner, source, token, height, hash);
         match result {
             BlockApplyResult::Committed | BlockApplyResult::Duplicate => {}
             BlockApplyResult::Rejected

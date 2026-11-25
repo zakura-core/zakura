@@ -669,6 +669,7 @@ fn a_snapshot_that_differs_from_the_holder_events_is_a_gap() {
         payloads: Vec::new(),
         expected_payloads: Vec::new(),
         holders: holders.iter().map(|holder| (*holder, 5, 3)).collect(),
+        detached_decoded: 0,
     };
     let mut owners = model();
     owners.apply(held(BodyHolder::Queued(1)));

@@ -21,7 +21,8 @@
 //! - [`BUDGET_LEDGERS_AGREE`]: at rest, no handoff is open, the byte budget
 //!   equals the work queue's tally and the routines' unreceived estimates,
 //!   and the pool's `BlockSync` and `Consensus` leases equal those estimates
-//!   plus the retained bytes plus the receive credit that still drains.
+//!   plus the retained bytes, the decoded blocks of detached submissions and
+//!   the receive credit that still drains.
 //!
 //! The pool gauge ([`super::memory_pool`]) checks the pool's own bounds,
 //! teardown and `memory/consensus-once-per-height`.
@@ -323,6 +324,9 @@ pub enum OwnerInput {
         expected_payloads: Vec<BlockSyncPayload>,
         /// The listed holders, in the snapshot's order.
         holders: Vec<(BodyHolder, u32, u64)>,
+        /// The decoded attributed bytes of the submissions detached from
+        /// `applying`, which the driver still holds under their leases.
+        detached_decoded: u64,
     },
 }
 
@@ -475,6 +479,11 @@ impl OwnerInput {
                 let applying = applying
                     .iter()
                     .map(|body| retained(BodyHolder::Applying, body));
+                let detached_decoded = submissions
+                    .iter()
+                    .filter(|submission| submission.detached)
+                    .map(|submission| submission.decoded_attributed_memory_bytes)
+                    .fold(0, u64::saturating_add);
                 let submissions = submissions.iter().map(|submission| {
                     let holder = if submission.detached {
                         BodyHolder::Detached(submission.token)
@@ -487,6 +496,7 @@ impl OwnerInput {
                     payloads: payloads.clone(),
                     expected_payloads,
                     holders: reorder.chain(applying).chain(submissions).collect(),
+                    detached_decoded,
                 }
             }
             _ => return None,
@@ -571,6 +581,9 @@ pub struct OwnerModel {
     /// Decoded attributed bytes held by the sequencer's retained payloads in
     /// the latest snapshot.
     sequencer_decoded: u64,
+    /// Decoded attributed bytes of the latest snapshot's detached
+    /// submissions, each under the lease its body held.
+    detached_decoded: u64,
     /// The first budget input the model couldn't apply.
     budget_gap: Option<String>,
     /// The first holder or handoff input the model couldn't apply.
@@ -762,8 +775,10 @@ impl OwnerModel {
                 holders,
                 mut payloads,
                 mut expected_payloads,
+                detached_decoded,
             } => {
                 self.payloads_observed = true;
+                self.detached_decoded = detached_decoded;
                 self.sequencer_decoded = payloads
                     .iter()
                     .map(|p| p.decoded_attributed_memory_bytes)
@@ -1192,7 +1207,8 @@ where
 ///
 /// The pool's `BlockSync` and `Consensus` leases are then exact: each
 /// outstanding request leases its estimate, each retained body its wire
-/// bytes plus its decoded bytes, and each receive-credit drain its unspent
+/// bytes plus its decoded bytes, each detached submission the decoded block
+/// the driver still holds, and each receive-credit drain its unspent
 /// credit. A body above its estimate grows its lease or is dropped, so no
 /// tolerance applies.
 fn check_ledgers<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict
@@ -1202,7 +1218,7 @@ where
     if !crate::at_rest(cx.status) {
         return Verdict::NotApplicable;
     }
-    let (reserved, queued, unreceived, handoffs, pool_leased, draining, retained, gap) =
+    let (reserved, queued, unreceived, handoffs, pool_leased, draining, retained, detached, gap) =
         cx.view().read_owners(|owners| {
             (
                 owners.reserved(),
@@ -1212,6 +1228,7 @@ where
                 owners.pool_block_leases(),
                 owners.pool_draining_receive,
                 owners.retained().saturating_add(owners.retained_decoded()),
+                owners.detached_decoded,
                 owners.gap(),
             )
         });
@@ -1237,13 +1254,16 @@ where
             format!("the budget counts {reserved}"),
         );
     }
-    let expected = reserved.saturating_add(retained).saturating_add(draining);
+    let expected = reserved
+        .saturating_add(retained)
+        .saturating_add(detached)
+        .saturating_add(draining);
     if pool_leased != expected {
         return cx.violated(
             format!(
                 "the pool's block-sync and consensus leases equal in-flight estimates \
-                 ({reserved}) + retained bytes ({retained}) + draining receive credit \
-                 ({draining}) = {expected}"
+                 ({reserved}) + retained bytes ({retained}) + detached submissions \
+                 ({detached}) + draining receive credit ({draining}) = {expected}"
             ),
             format!("the pool counts {pool_leased}"),
         );

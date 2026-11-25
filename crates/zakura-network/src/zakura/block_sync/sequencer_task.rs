@@ -24,6 +24,8 @@
 //! operations that state emits at frontier, reset, and completion boundaries.
 //! A submitted body also lives in the driver's `SubmitBlock` action, and
 //! the `Sequencer` keeps its in-flight charge until the exact completion arrives.
+//! A body that leaves the sequencer first detaches: IO drops its payload and
+//! keeps its pool lease for the driver's decoded block until that completion.
 
 use zakura_node_services::block_memory::{
     Admission, AdmissionFailure, BlockHandle, DecodedBlockPool,
@@ -482,6 +484,9 @@ impl state::SequencerEvidence {
 pub(super) struct DeferredLeaseSettlement {
     released: Vec<crate::zakura::memory::PoolLease>,
     shrink_to_wire: Vec<super::reorder::BodyId>,
+    /// Detached submissions whose leases shrink to the driver's decoded
+    /// bytes and leave `Consumer::Consensus`.
+    detached: Vec<(BlockApplyToken, u64)>,
 }
 
 /// Runtime payload storage. Policy receives only identities and measured facts.
@@ -489,9 +494,20 @@ pub(super) struct DeferredLeaseSettlement {
 pub(super) struct SequencerPayloads {
     entries: std::collections::BTreeMap<super::reorder::BodyId, BufferedBlockBody>,
     /// Per-payload pool leases (`(wire_bytes, lease)`) following retained bodies
-    /// until `PayloadChange::Release` or teardown (`decision-4`).
+    /// until `PayloadChange::Release`, `PayloadChange::Detach` or teardown
+    /// (`decision-4`).
     leases:
         std::collections::BTreeMap<super::reorder::BodyId, (u64, crate::zakura::memory::PoolLease)>,
+    /// The leases of detached submissions, which cover the decoded blocks
+    /// the driver still holds until each exact completion arrives: the
+    /// lease, and the part a move off Consensus left there.
+    detached_leases: std::collections::BTreeMap<
+        BlockApplyToken,
+        (
+            crate::zakura::memory::PoolLease,
+            Option<crate::zakura::memory::PoolLease>,
+        ),
+    >,
     next_id: u64,
     /// The last raw payload the pool refused for capacity, with its admission
     /// and its decoded size. Decoding it again before the pool has room for
@@ -584,6 +600,25 @@ impl SequencerPayloads {
                         deferred.released.push(lease);
                     }
                 }
+                PayloadChange::Detach {
+                    id,
+                    token,
+                    decoded_bytes,
+                } => {
+                    self.entries
+                        .remove(&id)
+                        .expect("policy detaches a retained payload exactly once");
+                    if let Some((_, lease)) = self.leases.remove(&id) {
+                        self.detached_leases.insert(token, (lease, None));
+                        deferred.detached.push((token, decoded_bytes));
+                    }
+                }
+                PayloadChange::EndSubmission(token) => {
+                    if let Some((lease, left)) = self.detached_leases.remove(&token) {
+                        deferred.released.push(lease);
+                        deferred.released.extend(left);
+                    }
+                }
             }
         }
         deferred
@@ -597,6 +632,13 @@ impl SequencerPayloads {
                 if lease.bytes() > *wire_bytes {
                     lease.shrink_to(*wire_bytes);
                 }
+            }
+        }
+        for (token, decoded_bytes) in deferred.detached {
+            if let Some((lease, left)) = self.detached_leases.remove(&token) {
+                debug_assert!(left.is_none(), "a submission detaches once");
+                let leases = detached_submission_leases(lease, decoded_bytes);
+                self.detached_leases.insert(token, leases);
             }
         }
         drop(deferred.released);
@@ -705,6 +747,27 @@ fn lease_decoded_body(
     })
 }
 
+/// The leases that cover a detached submission's decoded block, from the
+/// lease its body held.
+///
+/// The driver holds only the decoded block, so the lease shrinks to
+/// `decoded_bytes`. The height no longer needs its Consensus charge, because
+/// it is committed or its body is requested again, so the lease moves to
+/// `Consumer::BlockSync` as a receive drain does (mem-15). Only a full pool
+/// leaves part of it on Consensus.
+fn detached_submission_leases(
+    mut lease: crate::zakura::memory::PoolLease,
+    decoded_bytes: u64,
+) -> (
+    crate::zakura::memory::PoolLease,
+    Option<crate::zakura::memory::PoolLease>,
+) {
+    if lease.bytes() > decoded_bytes {
+        lease.shrink_to(decoded_bytes);
+    }
+    super::work_queue::drain_on_block_sync(lease)
+}
+
 /// Count a Consensus refusal for a commit-window body, which mem-15 rules out.
 fn consensus_lease_refused(target: u64) {
     metrics::counter!("sync.block.consensus.lease_refused").increment(1);
@@ -779,6 +842,7 @@ impl Drop for SequencerIO {
         #[cfg(any(test, zakura_sim))]
         self.observe_teardown();
         self.payloads.leases.clear();
+        self.payloads.detached_leases.clear();
         drop(dropped_leases);
     }
 }

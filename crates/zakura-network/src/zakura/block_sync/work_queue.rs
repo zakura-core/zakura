@@ -129,8 +129,9 @@ pub(super) fn finish_receive_credit(
     }
 }
 
-/// Move a Consensus drain to `Consumer::BlockSync`, and return the drain and
-/// the bytes left on Consensus.
+/// Move a Consensus drain, or a detached submission's lease, to
+/// `Consumer::BlockSync`, and return the moved lease and the bytes left on
+/// Consensus.
 ///
 /// The height then holds no Consensus lease, so its re-issued request takes
 /// the only one (mem-15). Only a full pool leaves bytes on Consensus; block

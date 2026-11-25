@@ -874,3 +874,142 @@ fn decoded_byte_totals_follow_raw_to_decoded_changes() {
     assert_eq!(pool.reserved_bytes(), 0);
     assert!(!pool.is_closed());
 }
+
+/// A body that leaves `applying` while the driver still holds its submission
+/// keeps a lease for the decoded block the driver holds, off `Consensus`,
+/// until the submission's exact completion arrives (F-902). A later failure
+/// and a destructive reset both detach submissions this way.
+#[tokio::test]
+async fn detached_submissions_keep_their_leases_until_completion() {
+    use crate::zakura::memory::Consumer;
+
+    let frontiers = genesis_frontiers();
+    let input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let input_decoded_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let (_body_tx, body_rx) = mpsc::channel(1);
+    let (_control_tx, control_rx) = mpsc::unbounded_channel();
+    let (actions, mut actions_rx) = mpsc::channel(8);
+    let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+    let mut task = SequencerIO::new(
+        Sequencer::new(block::Height(0), 2),
+        Arc::new(WorkQueue::with_test_pool(
+            block::Height(0),
+            ByteBudget::new(1 << 30),
+        )),
+        Arc::new(PeerRegistry::new()),
+        actions,
+        ThroughputMeter::new(Instant::now()),
+        frontiers,
+        Some(super::super::test_work_scope()),
+        crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+        Arc::new(crate::zakura::block_sync::BlockSyncClock),
+        body_rx,
+        control_rx,
+        input_bytes.clone(),
+        input_decoded_bytes.clone(),
+        view_tx,
+        Duration::from_secs(60),
+        ZakuraTrace::noop(),
+        crate::zakura::block_sync::test_decoded_pool(),
+    );
+    let pool = task.work.memory_pool().clone();
+    let leased = |pool: &crate::zakura::memory::MemoryPool| {
+        pool.consumer_leased(Consumer::BlockSync) + pool.consumer_leased(Consumer::Consensus)
+    };
+    for (height, bytes) in [
+        (1, BLOCK_MAINNET_1_BYTES.as_slice()),
+        (2, BLOCK_MAINNET_2_BYTES.as_slice()),
+    ] {
+        let block: Arc<block::Block> = Arc::new(bytes.zcash_deserialize_into().unwrap());
+        let raw = DecodedBlockPayload::of_block(&block);
+        // usize always fits in u64 on supported targets.
+        let wire_bytes = raw.block_len() as u64;
+        let mut body = SequencedBody::new_queued(
+            super::super::test_work_owner(),
+            zakura_header_chain::SourceId::from_digest([1; 32]),
+            block::Height(height),
+            block.hash(),
+            block.header.previous_block_hash,
+            BufferedBlockBody::RawFramePayload(raw),
+            wire_bytes,
+            None,
+            ZakuraPeerId::new(vec![1; 32]).unwrap(),
+            Instant::now(),
+            input_bytes.clone(),
+            input_decoded_bytes.clone(),
+        );
+        body.body_lease = Some(
+            pool.try_acquire(Consumer::BlockSync, Some(1), wire_bytes)
+                .expect("the test pool has room for the body"),
+        );
+        body.leave_queue();
+        task.handle_accept_body(body);
+    }
+    task.submit_pending_blocks().await;
+    let submitted: Vec<_> = std::iter::from_fn(|| actions_rx.try_recv().ok())
+        .filter_map(|action| match action {
+            BlockSyncAction::SubmitBlock {
+                owner,
+                source,
+                token,
+                block,
+            } => Some((owner, source, token, block)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(submitted.len(), 2, "the two-body window submits both");
+    let decoded: Vec<u64> = submitted
+        .iter()
+        .map(|(_, _, _, block)| block.attributed_memory_size_bytes())
+        .collect();
+    assert!(
+        pool.consumer_leased(Consumer::Consensus) > 0,
+        "the commit-window bodies decode onto Consensus leases"
+    );
+
+    // Height 2's apply fails while its submission is still out, and then a
+    // reset clears height 1. Each body leaves the sequencer, but the driver
+    // still holds both decoded blocks.
+    task.state
+        .sequencer_mut()
+        .release_applying_blocks_from(block::Height(2));
+    let changes = task.state.sequencer_mut().take_payload_changes();
+    task.apply_payload_changes(changes);
+    let mut operations = Vec::new();
+    task.state
+        .destructive_reset_to(block::Height(0), false, &mut operations);
+    task.execute(operations).await;
+    let changes = task.state.sequencer_mut().take_payload_changes();
+    task.apply_payload_changes(changes);
+    assert!(task.payloads.entries.is_empty(), "IO holds no payload");
+    assert_eq!(
+        leased(&pool),
+        decoded.iter().sum::<u64>(),
+        "the leases cover exactly the decoded blocks the driver holds"
+    );
+    assert_eq!(
+        pool.consumer_leased(Consumer::Consensus),
+        0,
+        "a detached submission leaves Consensus to the heights' next bodies"
+    );
+
+    // Each exact completion returns its block's lease.
+    for (index, (owner, source, token, block)) in submitted.iter().enumerate() {
+        let height = block::Height(u32::try_from(index + 1).unwrap());
+        assert!(task.state.sequencer_mut().finish_submission(
+            *owner,
+            *source,
+            *token,
+            height,
+            block.hash()
+        ));
+        let changes = task.state.sequencer_mut().take_payload_changes();
+        task.apply_payload_changes(changes);
+        assert_eq!(
+            leased(&pool),
+            decoded[index + 1..].iter().sum::<u64>(),
+            "height {} returns its lease at completion",
+            height.0
+        );
+    }
+}

@@ -16,7 +16,7 @@ use tower::Service;
 use zakura_chain::{
     block::{self, Block, Height},
     chain_tip::mock::MockChainTip,
-    miner_mesh::MinerMeshCommitment,
+    miner_mesh::{GatewayBlocks, MinerMeshCommitment, MinerSetSnapshot},
     parameters::Network,
     serialization::ZcashDeserializeInto,
     transaction::{self, Transaction},
@@ -29,7 +29,9 @@ use zakura_test::vectors::BLOCK_MAINNET_1_BYTES;
 
 use super::{
     ranking::ranking_channel,
-    tracker::{run, TipMove, Tracker, REPUBLISH_INTERVAL},
+    tracker::{
+        gateway_block_counts, run, GatewayBlockCounts, TipMove, Tracker, REPUBLISH_INTERVAL,
+    },
 };
 use crate::BoxError;
 
@@ -760,4 +762,54 @@ async fn the_task_publishes_an_empty_ranking_once_the_tip_is_too_old() {
         .await
         .expect("the task ends once the tip sender is gone")
         .expect("the task does not panic");
+}
+
+/// A snapshot that names the gateways `[(first ID byte, blocks)]`, most blocks first.
+fn snapshot_naming(gateways: &[(u8, u32)]) -> MinerSetSnapshot {
+    MinerSetSnapshot {
+        tip: None,
+        gateways: gateways
+            .iter()
+            .map(|&(id, blocks)| GatewayBlocks {
+                gateway_id: [id; 32],
+                blocks,
+            })
+            .collect(),
+        checked: 0,
+        window: None,
+    }
+}
+
+#[test]
+fn gateway_metrics_report_the_busiest_gateway_and_the_local_one() {
+    let snapshot = snapshot_naming(&[(7, 5), (3, 2), (9, 1)]);
+
+    assert_eq!(
+        gateway_block_counts(&snapshot, Some([3; 32])),
+        GatewayBlockCounts { top: 5, local: 2 },
+        "the local gateway is counted by its own blocks, not the busiest gateway's"
+    );
+    assert_eq!(
+        gateway_block_counts(&snapshot, Some([7; 32])),
+        GatewayBlockCounts { top: 5, local: 5 },
+    );
+}
+
+#[test]
+fn gateway_metrics_are_zero_when_nothing_matches() {
+    assert_eq!(
+        gateway_block_counts(&snapshot_naming(&[]), Some([3; 32])),
+        GatewayBlockCounts { top: 0, local: 0 },
+        "an empty window names no gateway, including this node's"
+    );
+    assert_eq!(
+        gateway_block_counts(&snapshot_naming(&[(7, 5)]), Some([3; 32])),
+        GatewayBlockCounts { top: 5, local: 0 },
+        "a local gateway that no block names has no blocks"
+    );
+    assert_eq!(
+        gateway_block_counts(&snapshot_naming(&[(7, 5)]), None),
+        GatewayBlockCounts { top: 5, local: 0 },
+        "a node that does not announce has no local gateway to count"
+    );
 }

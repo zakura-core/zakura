@@ -3172,9 +3172,8 @@ async fn the_hybrid_hello_leaves_as_two_initial_datagrams() {
 /// TLS-4, TLS-9, ADM-1: the listener's whole first flight, about 7.9 KB with
 /// its ML-KEM-1024 ciphertext, ML-DSA-65 credential and composite signature,
 /// is larger than QUIC's allowance before the dialer's address is validated:
-/// three times the 2,400 bytes of the hybrid hello. quinn-proto stops at the
-/// allowance, finishing the datagram it started (quinn issue 1082), and sends
-/// the rest once the dialer's acknowledgements validate the address. A dial
+/// three times the 2,400 bytes of the hybrid hello. The listener holds the
+/// first datagram that would exceed the allowance until the dialer's reply. A dial
 /// therefore completes one round trip later than on the smaller `p2p-v2/4`
 /// handshake, and no later.
 #[tokio::test(start_paused = true)]
@@ -3218,8 +3217,8 @@ async fn the_listeners_first_flight_waits_one_round_trip_for_validation() {
         round(sim_addr(2)).await;
         let first = sent(sim_addr(1));
         assert!(
-            first > 3 * hello - mtu && first < 3 * hello + mtu,
-            "the listener sent {first} bytes before validation, which is not the allowance"
+            first > 3 * hello - mtu && first <= 3 * hello,
+            "the listener sent {first} bytes before validation, outside the expected allowance"
         );
 
         round(sim_addr(1)).await;

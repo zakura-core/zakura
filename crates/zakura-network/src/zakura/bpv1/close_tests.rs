@@ -918,6 +918,10 @@ fn close_20_push_and_relay_flag_bounds() {
 // ============================================================================
 
 proptest! {
+    // 48 cases keep this test under a second; the fuzz mesh explores interleavings
+    // at length.
+    #![proptest_config(ProptestConfig::with_cases(48))]
+
     /// Three conformant nodes never close each other however their streams
     /// interleave. Node 0 proposes to both relays, which also forward the
     /// block's metadata, parts, and `Have`s to each other, so each table

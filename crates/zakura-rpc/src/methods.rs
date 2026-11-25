@@ -1581,6 +1581,7 @@ where
                         chain_info.chain_history_root,
                         height,
                         std::iter::empty(),
+                        miner_params,
                     )
                 });
                 bpv1_commitment == precomputed.bpv1_commitment
@@ -3892,8 +3893,9 @@ where
                     let precompute_coinbase = |network, height, params| {
                         let work = TemplateBuildWork::for_coinbase(&network, height, &params);
                         self.gbt.run_template_build(work, move || {
-                            let bpv1_commitment = bpv1_proposer
-                                .and_then(|proposer| proposer.empty_template_commitment(height));
+                            let bpv1_commitment = bpv1_proposer.and_then(|proposer| {
+                                proposer.empty_template_commitment(height, params.mesh_gateway())
+                            });
                             TransactionTemplate::new_coinbase(
                                 &network,
                                 height,

@@ -68,7 +68,7 @@ impl StreamConformance for Bpv1Conformance {
                 },
                 coding: Profile::W2.derive_coding(64, 2).expect("valid W2 coding"),
                 part_root: [0x11; 32],
-                proposer_node: NodeSecretKey::from_bytes(&[7; 32]).public(),
+                proposer_node: Some(NodeSecretKey::from_bytes(&[7; 32]).public()),
             },
             message_type::WANT => {
                 let mut requested = WantBitmap::EMPTY;

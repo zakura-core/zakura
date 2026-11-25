@@ -60,7 +60,7 @@ fn honest_meta(height: u32) -> (Header, MetaEnvelope) {
             .derive_coding(64, 2)
             .expect("TINY codes 64 bytes"),
         part_root: [0xAA; 32],
-        proposer_node: node_id(1),
+        proposer_node: Some(node_id(1)),
     };
     (header, envelope)
 }

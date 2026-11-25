@@ -14,6 +14,7 @@ use zakura_chain::{
         self, genesis::regtest_genesis_block, merkle::AuthDataRoot, Block,
         ChainHistoryBlockTxAuthCommitmentHash, ChainHistoryMmrRootHash, Header, Height,
     },
+    miner_mesh::{GatewayId, MinerMeshCommitment},
     parameters::{testnet::ConfiguredActivationHeights, Network, NetworkUpgrade},
     serialization::ZcashSerialize,
     transaction::{LockTime, Transaction},
@@ -36,7 +37,7 @@ use super::{
         HeaderAdmissionResult, MetaEnvelope, PullPeerState, VerifierVerdict, WorkId,
     },
     codec::decode_and_check_stripe,
-    commitment::CoinbaseBinding,
+    commitment::{CoinbaseBinding, Proposer},
     config::{HavePacing, ZakuraBpv1Config},
     paths::PathEstimate,
     peer::{
@@ -195,6 +196,19 @@ pub(super) fn solved_block_of(
     height: Height,
     non_coinbase: Vec<Transaction>,
 ) -> Block {
+    solved_block_naming(proposer, height, non_coinbase, None)
+        .expect("a post-NU7 template gets a commitment")
+}
+
+/// [`solved_block_of`] whose coinbase also names `gateway` in a miner mesh
+/// output, after the commitment that `proposer` prepares for that coinbase
+/// (decision-34). `None` when `proposer` prepares no commitment.
+pub(super) fn solved_block_naming(
+    proposer: &Bpv1Handle,
+    height: Height,
+    non_coinbase: Vec<Transaction>,
+    gateway: Option<GatewayId>,
+) -> Option<Block> {
     let non_coinbase: Vec<Arc<Transaction>> = non_coinbase.into_iter().map(Arc::new).collect();
     let mut body = Vec::new();
     for tx in &non_coinbase {
@@ -204,12 +218,14 @@ pub(super) fn solved_block_of(
     // The coinbase is the one transaction outside the body.
     let tx_count = u32::try_from(non_coinbase.len() + 1).expect("a test block is small");
     let lcr = [0x99; 32];
-    let commitment = proposer
-        .prepare_commitment(lcr, height, tx_count, &body)
-        .expect("a post-NU7 template gets a commitment");
-    let mut txs = vec![Arc::new(committed_coinbase(height, &commitment.script))];
+    let commitment = proposer.prepare_commitment(lcr, height, tx_count, &body, gateway)?;
+    let mut coinbase = committed_coinbase(height, &commitment.script);
+    if let (Some(gateway), Transaction::V6 { outputs, .. }) = (gateway, &mut coinbase) {
+        outputs.push(MinerMeshCommitment::new(gateway).to_output());
+    }
+    let mut txs = vec![Arc::new(coinbase)];
     txs.extend(non_coinbase);
-    block_of(lcr, txs)
+    Some(block_of(lcr, txs))
 }
 
 /// A block holding `txs` under a genesis-derived header whose Merkle root and
@@ -490,7 +506,7 @@ pub(super) fn make_envelope(
         },
         coding,
         part_root,
-        proposer_node,
+        proposer_node: Some(proposer_node),
     })
 }
 
@@ -504,8 +520,32 @@ pub(super) fn admit_meta(
     height: u32,
     peers: &[NodeId],
 ) -> BlockStep {
+    let proposer = envelope
+        .proposer_node
+        .expect("admit_meta takes metadata that names its proposer node");
+    admit_meta_from(
+        table,
+        now,
+        envelope,
+        proposer,
+        Proposer::Node(proposer),
+        height,
+        peers,
+    )
+}
+
+/// [`admit_meta`] for metadata from `from_peer` whose commitment names
+/// `proposer` (decision-34).
+pub(super) fn admit_meta_from(
+    table: &mut BlockTable,
+    now: Instant,
+    envelope: Box<MetaEnvelope>,
+    from_peer: NodeId,
+    proposer: Proposer,
+    height: u32,
+    peers: &[NodeId],
+) -> BlockStep {
     let block_id = envelope.block_id;
-    let from_peer = envelope.proposer_node;
     let s1 = table.step(
         now,
         BlockInput::MetaReceived {
@@ -528,7 +568,7 @@ pub(super) fn admit_meta(
         now,
         BlockInput::CommitmentChecked {
             work_id: commit_work(&s2),
-            ok: true,
+            proposer: Some(proposer),
             peers: peers.to_vec(),
             rng_seed: 7,
         },
@@ -735,6 +775,8 @@ pub(super) struct MachineMesh {
     links: HashMap<(usize, usize), LinkProfile>,
     queue: BinaryHeap<Reverse<ScheduledDelivery>>,
     envelopes: HashMap<block::Hash, Box<MetaEnvelope>>,
+    /// The proposer each proposed block names (decision-34).
+    proposers: HashMap<block::Hash, Proposer>,
     wire: WireLedger,
 }
 
@@ -762,6 +804,7 @@ impl MachineMesh {
             links: HashMap::new(),
             queue: BinaryHeap::new(),
             envelopes: HashMap::new(),
+            proposers: HashMap::new(),
             wire: WireLedger::default(),
         }
     }
@@ -827,6 +870,15 @@ impl MachineMesh {
             self.nodes[node].table.paths(),
             self.direct_copies,
         );
+        // Metadata without `proposer_node` names the proposer by its
+        // gateway ID, as a coinbase with a miner mesh output does
+        // (decision-34).
+        let id = self.nodes[node].id;
+        let proposer = envelope.proposer_node.map_or_else(
+            || Proposer::Gateway(GatewayId::from_node_id(id.as_bytes())),
+            Proposer::Node,
+        );
+        self.proposers.insert(block_id, proposer);
         self.envelopes.insert(block_id, envelope.clone());
         self.nodes[node].verified.insert(block_id, self.now);
         self.step_table(
@@ -834,6 +886,7 @@ impl MachineMesh {
             BlockInput::BlockAdmittedLocal {
                 height: MESH_HEIGHT,
                 envelope,
+                proposer,
                 parts: parts.clone(),
             },
         );
@@ -1123,7 +1176,9 @@ impl MachineMesh {
                 work_id,
                 verdict: UnknownParentVerdict::Park,
             },
-            BlockOutput::VerifyCommitment { work_id, .. } => {
+            BlockOutput::VerifyCommitment {
+                work_id, block_id, ..
+            } => {
                 let peers = self.nodes[node]
                     .peers
                     .keys()
@@ -1132,7 +1187,7 @@ impl MachineMesh {
                 self.seq += 1;
                 BlockInput::CommitmentChecked {
                     work_id,
-                    ok: true,
+                    proposer: Some(self.proposers[&block_id]),
                     peers,
                     rng_seed: self.seq,
                 }
@@ -1201,8 +1256,8 @@ impl MachineMesh {
                     self.wire.flagged.contains(&(node, peer, block_id, index)),
                     "bpv1-72 pushed part {index} without its flag"
                 );
-                assert_ne!(
-                    self.envelopes[&block_id].proposer_node, self.nodes[peer].id,
+                assert!(
+                    !self.proposers[&block_id].is(&self.nodes[peer].id),
                     "bpv1-71 pushed a part to the proposer"
                 );
                 let part = self.nodes[node]
@@ -1411,8 +1466,8 @@ impl MachineMesh {
             }
             PartAuth::Push | PartAuth::Seed => {
                 if auth == PartAuth::Seed {
-                    assert_eq!(
-                        self.envelopes[&block_id].proposer_node, self.nodes[peer].id,
+                    assert!(
+                        self.proposers[&block_id].is(&self.nodes[peer].id),
                         "bpv1-47 seed part from a non-proposer"
                     );
                 }

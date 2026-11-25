@@ -12,6 +12,7 @@ use zakura_chain::{
     block_info::BlockInfo,
     chain_sync_status::MockSyncStatus,
     chain_tip::mock::MockChainTip,
+    miner_mesh::{GatewayId, MinerMeshCommitment},
     parameters::testnet::{ConfiguredActivationHeights, RegtestParameters},
     serialization::{DateTime32, Duration32, ZcashDeserializeInto},
 };
@@ -542,19 +543,25 @@ const BPV1_PAYLOAD: [u8; zakura_node_services::bpv1_proposer::BPV1_COMMITMENT_NU
     [0x42; zakura_node_services::bpv1_proposer::BPV1_COMMITMENT_NULL_DATA_LEN];
 
 /// One `prepare_template_commitment` call: the light-client root, the height, the transaction
-/// count and the length of the body after the coinbase.
-type PreparedTemplate = ([u8; 32], Height, u32, usize);
+/// count, the length of the body after the coinbase and the miner mesh gateway.
+type PreparedTemplate = ([u8; 32], Height, u32, usize, Option<GatewayId>);
 
 /// A BPv1 proposer that accepts every template, commits it to [`BPV1_PAYLOAD`] and records
 /// each preparation.
 #[derive(Debug, Default)]
 struct RecordingBpv1Proposer {
     prepared: std::sync::Mutex<Vec<PreparedTemplate>>,
+    /// The miner mesh gateway of each `empty_template_commitment` call.
+    empty: std::sync::Mutex<Vec<Option<GatewayId>>>,
 }
 
 impl RecordingBpv1Proposer {
     fn prepared(&self) -> Vec<PreparedTemplate> {
         self.prepared.lock().unwrap().clone()
+    }
+
+    fn empty(&self) -> Vec<Option<GatewayId>> {
+        self.empty.lock().unwrap().clone()
     }
 }
 
@@ -565,12 +572,14 @@ impl zakura_node_services::bpv1_proposer::Bpv1ProposerHook for RecordingBpv1Prop
         height: Height,
         tx_count: u32,
         body_after_coinbase: &[u8],
+        gateway: Option<GatewayId>,
     ) -> Option<[u8; zakura_node_services::bpv1_proposer::BPV1_COMMITMENT_NULL_DATA_LEN]> {
         self.prepared.lock().unwrap().push((
             light_client_root,
             height,
             tx_count,
             body_after_coinbase.len(),
+            gateway,
         ));
         Some(BPV1_PAYLOAD)
     }
@@ -578,7 +587,9 @@ impl zakura_node_services::bpv1_proposer::Bpv1ProposerHook for RecordingBpv1Prop
     fn empty_template_commitment(
         &self,
         _height: Height,
+        gateway: Option<GatewayId>,
     ) -> Option<[u8; zakura_node_services::bpv1_proposer::BPV1_COMMITMENT_NULL_DATA_LEN]> {
+        self.empty.lock().unwrap().push(gateway);
         Some(BPV1_PAYLOAD)
     }
 
@@ -647,7 +658,7 @@ fn precomputed_bpv1_template_does_not_wait_for_proof_capacity() {
         assert_eq!(template.coinbase_txn.data, expected_coinbase);
         assert_eq!(template.previous_block_hash, chain.tip_hash);
         let root: [u8; 32] = chain.chain_history_root.unwrap().into();
-        assert_eq!(proposer.prepared(), vec![(root, Height(2), 1, 0)]);
+        assert_eq!(proposer.prepared(), vec![(root, Height(2), 1, 0, None)]);
         gate.release().await;
         bounded(proof).await.unwrap();
     });
@@ -734,8 +745,59 @@ fn long_poll_keeps_the_precomputed_bpv1_coinbase_on_a_new_parent() {
         let old_root: [u8; 32] = old.chain_history_root.unwrap().into();
         assert_eq!(
             proposer.prepared(),
-            [(old_root, Height(1), 1, 0), ([0x5a; 32], Height(2), 1, 0)]
+            [
+                (old_root, Height(1), 1, 0, None),
+                ([0x5a; 32], Height(2), 1, 0, None)
+            ]
         );
+        assert_eq!(proposer.empty(), [None]);
+    });
+}
+
+/// decision-34: a node that names itself as the miner mesh gateway passes the gateway to the
+/// BPv1 proposer for every template and every precomputed coinbase, so `C` takes the form
+/// that the coinbase's miner mesh output asks for.
+#[test]
+fn bpv1_templates_pass_the_miner_mesh_gateway_to_the_proposer() {
+    mining_runtime(async {
+        let gateway = GatewayId::from_bytes([0x6d; 20]);
+        let old = chain_info(0, 1, 0);
+        let (info_tx, info) = watch::channel(old.clone());
+        let (rpc, tip, _) = mining_rpc(info);
+        let proposer = Arc::new(RecordingBpv1Proposer::default());
+        let rpc = rpc
+            .with_mesh_commitment(MinerMeshCommitment::new(gateway))
+            .with_bpv1_proposer(proposer.clone());
+        let initial = bounded(rpc.get_block_template(None))
+            .await
+            .unwrap()
+            .try_into_template()
+            .unwrap();
+        assert!(commits_bpv1_payload(&initial));
+        let request = rpc.get_block_template(Some(GetBlockTemplateParameters {
+            long_poll_id: Some(initial.long_poll_id),
+            ..Default::default()
+        }));
+        tokio::pin!(request);
+        assert!(futures::poll!(&mut request).is_pending());
+
+        let mut next = chain_info(1, 2, 0);
+        next.chain_history_root = Some([0x5a; 32].into());
+        info_tx.send_replace(next.clone());
+        tip.send_best_tip_height(next.tip_height);
+        tip.send_best_tip_hash(next.tip_hash);
+        let template = bounded(request).await.unwrap().try_into_template().unwrap();
+        assert!(commits_bpv1_payload(&template));
+
+        let old_root: [u8; 32] = old.chain_history_root.unwrap().into();
+        assert_eq!(
+            proposer.prepared(),
+            [
+                (old_root, Height(1), 1, 0, Some(gateway)),
+                ([0x5a; 32], Height(2), 1, 0, Some(gateway))
+            ]
+        );
+        assert_eq!(proposer.empty(), [Some(gateway)]);
     });
 }
 
@@ -1759,6 +1821,7 @@ fn bpv1_6_submit_block_publishes_only_after_consensus_admission_or_commit() {
             _height: Height,
             _tx_count: u32,
             _body_after_coinbase: &[u8],
+            _gateway: Option<GatewayId>,
         ) -> Option<[u8; BPV1_COMMITMENT_NULL_DATA_LEN]> {
             None
         }
@@ -1766,6 +1829,7 @@ fn bpv1_6_submit_block_publishes_only_after_consensus_admission_or_commit() {
         fn empty_template_commitment(
             &self,
             _height: Height,
+            _gateway: Option<GatewayId>,
         ) -> Option<[u8; BPV1_COMMITMENT_NULL_DATA_LEN]> {
             None
         }
@@ -1876,6 +1940,7 @@ fn bpv1_commitment_follows_the_selection_decision() {
             _height: Height,
             _tx_count: u32,
             _body_after_coinbase: &[u8],
+            _gateway: Option<GatewayId>,
         ) -> Option<[u8; BPV1_COMMITMENT_NULL_DATA_LEN]> {
             self.prepared.fetch_add(1, Ordering::SeqCst);
             Some(PAYLOAD)
@@ -1884,6 +1949,7 @@ fn bpv1_commitment_follows_the_selection_decision() {
         fn empty_template_commitment(
             &self,
             _height: Height,
+            _gateway: Option<GatewayId>,
         ) -> Option<[u8; BPV1_COMMITMENT_NULL_DATA_LEN]> {
             Some(PAYLOAD)
         }

@@ -113,7 +113,7 @@ impl PeerState {
                 );
                 // bpv1-71: the proposer is never pushed to.
                 assert!(
-                    !block.local_flagged.get(i) || self.remote_node != block.proposer_node,
+                    !block.local_flagged.get(i) || !block.proposer.is(&self.remote_node),
                     "{PEER_REPLAY}: bpv1-71 pushed to the proposer"
                 );
                 // bpv1-73: before the advertisement deadline, only flagged
@@ -122,7 +122,7 @@ impl PeerState {
                     block.have_held_until.is_none()
                         || !block.local_have_sent.get(i)
                         || block.local_flagged.get(i)
-                        || self.remote_node == block.proposer_node,
+                        || block.proposer.is(&self.remote_node),
                     "{PEER_REPLAY}: bpv1-73 plain Have for index {i} of {block_id:?} before the deadline"
                 );
             }

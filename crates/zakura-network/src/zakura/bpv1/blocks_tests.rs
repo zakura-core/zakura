@@ -11,6 +11,7 @@ use zakura_chain::{
         self, genesis::regtest_genesis_block, merkle::AuthDataRoot,
         ChainHistoryBlockTxAuthCommitmentHash, ChainHistoryMmrRootHash, Height,
     },
+    miner_mesh::GatewayId,
     parameters::NetworkUpgrade,
     serialization::ZcashSerialize,
     transaction::Transaction,
@@ -22,15 +23,15 @@ use zakura_rt::{collections::HashSet, time::Instant};
 use super::{
     blocks::*,
     codec::{encode_body, EncodedBody},
-    commitment::commitment_script,
+    commitment::{commitment_script, Proposer},
     paths::{PathDirection, PathEstimate, PeerPaths, DEFAULT_UNMEASURED_RATE_BPS},
     peer::{PartAuth, PeerConfig},
     ports::BlockFallbackPort,
     profile::{Coding, Profile},
     proposer::*,
     test_support::{
-        admit_meta, admit_work, build_v6_coinbase, commit_work, make_envelope, node_id, Adversary,
-        LinkProfile, MachineMesh, TEST_TIP_HASH,
+        admit_meta, admit_meta_from, admit_work, build_v6_coinbase, commit_work, make_envelope,
+        node_id, Adversary, LinkProfile, MachineMesh, TEST_TIP_HASH,
     },
     tree::VerifiedPart,
     unknown_parent::UnknownParentVerdict,
@@ -322,7 +323,7 @@ pub(super) fn commitment_ok(
         now,
         BlockInput::CommitmentChecked {
             work_id: commit_work(header_step),
-            ok: true,
+            proposer: Some(Proposer::Node(node_id(1))),
             peers: Vec::new(),
             rng_seed: 0,
         },
@@ -1269,6 +1270,7 @@ fn scenario_proposer_reuse_recompute_entry_filter_solve_and_disconnect() {
         template_id: TemplateId(2),
         body_identity: compute_body_identity(2, &[0xBB; 128]),
         light_client_root: [0; 32],
+        proposer: Proposer::Node(config.local_node),
     });
     assert!(changed.events.iter().any(|e| matches!(
         e,
@@ -1966,6 +1968,7 @@ fn local_admission_during_a_peer_copy_check_keeps_the_solved_block() {
         BlockInput::BlockAdmittedLocal {
             height: 1,
             envelope: envelope(),
+            proposer: Proposer::Node(node_id(1)),
             parts: encoded.parts.clone(),
         },
     );
@@ -1994,6 +1997,7 @@ fn decision20_proposer_admission_announces_nothing() {
                 encoded.part_root,
                 node_id(1),
             ),
+            proposer: Proposer::Node(node_id(1)),
             parts: encoded.parts.clone(),
         },
     );
@@ -2021,6 +2025,7 @@ fn bpv1_45_a_failed_local_commit_retires_only_the_proposed_block() {
         BlockInput::BlockAdmittedLocal {
             height: 2,
             envelope: make_envelope(proposed, encoded.coding, encoded.part_root, node_id(1)),
+            proposer: Proposer::Node(node_id(1)),
             parts: encoded.parts.clone(),
         },
     );
@@ -2198,6 +2203,7 @@ fn bpv1_2_reused_encoding_keeps_c_and_each_solve_finds_its_light_client_root() {
         template_id: TemplateId(2),
         body_identity,
         light_client_root: lcr_new,
+        proposer: Proposer::Node(config.local_node),
     });
     assert_eq!(set_commitment(&refreshed.outputs).commitment_hash, c);
 
@@ -2254,6 +2260,7 @@ fn encoded_proposer(
         template_id: TemplateId(1),
         body_identity: compute_body_identity(2, body),
         light_client_root,
+        proposer: Proposer::Node(config.local_node),
     });
     let work_id = built
         .outputs
@@ -2523,6 +2530,7 @@ fn fix14_templates_during_one_encode_share_it_and_each_get_a_commitment() {
             template_id: TemplateId(t),
             body_identity,
             light_client_root: [0u8; 32],
+            proposer: Proposer::Node(local),
         });
         encodes.extend(s.outputs.iter().filter_map(|o| match o {
             ProposerOutput::StartEncode { work_id, .. } => Some(*work_id),
@@ -3864,6 +3872,74 @@ fn decision19_push_crossing_a_direct_copy_drops_as_surplus() {
         .contains(&BlockEvent::PartDuplicates { block_id, count: 2 }));
 }
 
+/// decision-34 / bpv1-86: when the miner mesh output names the proposer, the
+/// block table takes relay flags only from a peer whose node ID starts with
+/// the gateway ID, and leaves that peer out of the `Have` initial group, as
+/// it does for a named proposer node. Another peer's relay flag grants
+/// nothing.
+#[test]
+fn decision34_relay_flags_count_only_from_the_gateway_prefixed_peer() {
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let t0 = Instant::now();
+    let block_id = block::Hash([0xE3; 32]);
+    let encoded = encode_body(&Profile::TINY, &[0x48; 128], 2).unwrap();
+    let gateway = node_id(1);
+    let mut envelope = make_envelope(block_id, encoded.coding, encoded.part_root, gateway);
+    envelope.proposer_node = None;
+    let peers = [gateway, node_id(5), node_id(6)];
+    let admitted = admit_meta_from(
+        &mut table,
+        t0,
+        envelope,
+        gateway,
+        Proposer::Gateway(GatewayId::from_node_id(gateway.as_bytes())),
+        1,
+        &peers,
+    );
+    let have_group = admitted
+        .outputs
+        .iter()
+        .find_map(|o| match o {
+            BlockOutput::PublishAdmitted { admitted, .. } => Some(admitted.have_group.clone()),
+            _ => None,
+        })
+        .expect("admission publishes the block");
+    assert!(!have_group.contains(&gateway), "the proposer hears no Have");
+    assert!(!have_group.is_empty());
+
+    for index in [0, 1] {
+        insert(
+            &mut table,
+            t0,
+            block_id,
+            &encoded.parts[index],
+            node_id(5),
+            PartAuth::Want(1),
+        );
+    }
+    let pushed = |s: &BlockStep| {
+        s.outputs
+            .iter()
+            .any(|o| matches!(o, BlockOutput::PartReady { push: true, .. }))
+    };
+    assert!(
+        !pushed(&flag_push(
+            &mut table,
+            t0,
+            node_id(6),
+            block_id,
+            vec![0],
+            true
+        )),
+        "a relay flag from another peer makes no pushed seed"
+    );
+    assert!(
+        pushed(&flag_push(&mut table, t0, gateway, block_id, vec![1], true)),
+        "the gateway's relay flag makes a pushed seed"
+    );
+    table.assert_invariants();
+}
+
 // Catch-up handoff between block sync and BPv1 (#2718). Each test names the
 // property it checks:
 //
@@ -3975,7 +4051,7 @@ fn offer_child(
         now,
         BlockInput::CommitmentChecked {
             work_id,
-            ok: true,
+            proposer: Some(Proposer::Node(node_id(1))),
             peers: Vec::new(),
             rng_seed: 7,
         },
@@ -4155,6 +4231,57 @@ fn bpv1_82_verification_ends_by_its_deadline_and_frees_the_slot() {
         "a fallback block yields its slot"
     );
     table.assert_invariants();
+}
+
+/// decision-34 / bpv1-86: a block whose miner mesh output names the
+/// proposer by its gateway ID reaches every node through seeds and holder
+/// push. Receivers accept the proposer's seeds and relay flags on its
+/// connection, every link stays open, and the harness checks that seeds come
+/// only from the gateway-prefixed node.
+#[test]
+fn decision34_a_gateway_named_block_converges_on_a_mesh() {
+    let peer_cfg = PeerConfig::for_profile(Profile::TINY);
+    let mut mesh = MachineMesh::new(5, BlockConfig::for_profile(Profile::TINY));
+    let link = LinkProfile::new(Duration::from_millis(20), 500_000);
+    let estimate = Some(PathEstimate {
+        min_rtt: Some(Duration::from_millis(20)),
+        rate_in: Some(500_000),
+        rate_out: Some(500_000),
+    });
+    for a in 0..5 {
+        for b in a + 1..5 {
+            mesh.connect(a, b, link, link, peer_cfg, estimate, estimate);
+        }
+    }
+    let block_id = block::Hash([0xE4; 32]);
+    let encoded = encode_body(&Profile::TINY, &[0x79; 256], 5).unwrap();
+    let mut envelope = make_envelope(
+        block_id,
+        encoded.coding,
+        encoded.part_root,
+        mesh.nodes[0].id,
+    );
+    // No `proposer_node`: the mesh names node 0 by its gateway ID.
+    envelope.proposer_node = None;
+    mesh.propose(0, envelope, encoded.parts);
+    let start = mesh.now;
+    mesh.run_until(start + Duration::from_secs(5));
+    mesh.assert_honest_links_open();
+    let proposer = mesh.nodes[0].id;
+    for idx in 1..5 {
+        assert!(mesh.verified(idx, &block_id), "node {idx} assembled");
+        assert!(
+            mesh.nodes[idx].block_events.iter().any(|(_, e)| matches!(
+                e,
+                BlockEvent::PartInserted {
+                    source: PartSource::Seed | PartSource::Direct,
+                    from_peer,
+                    ..
+                } if *from_peer == proposer
+            )),
+            "node {idx} took the proposer's seeds"
+        );
+    }
 }
 
 /// bpv1-83: with every slot verifying blocks that wait on their parents, the

@@ -12,6 +12,7 @@ use rand_10::RngExt;
 
 use zakura_chain::{
     block::{self, Block, Header, Height},
+    miner_mesh::GatewayId,
     parameters::Network,
     serialization::ZcashSerialize,
 };
@@ -37,7 +38,7 @@ use super::{
     codec::{decode_and_check_stripe, encode_body},
     commitment::{
         coinbase_paths, commitment_payload, extract_single_commitment, verify_commitment,
-        CommitmentFields, COMMITMENT_PAYLOAD_LEN,
+        CommitmentFields, Proposer, COMMITMENT_PAYLOAD_LEN,
     },
     config::{HavePacing, ZakuraBpv1Config, PATH_POLL_INTERVAL},
     paths::{Arrival, PathEstimate},
@@ -272,11 +273,13 @@ impl SharedNode {
                 ProposerOutput::AdmitSolvedLocal {
                     height,
                     envelope,
+                    proposer,
                     parts,
                 } => {
                     self.apply_block_input(BlockInput::BlockAdmittedLocal {
                         height,
                         envelope,
+                        proposer,
                         parts,
                     });
                 }
@@ -435,21 +438,22 @@ impl SharedNode {
                 drop(task::spawn_named("bpv1-verify-commit", async move {
                     tracing::debug!(target: "bpv1_stage", %block_id,
                         work_id = work_id.0, "commitment_check_started");
-                    let ok = verify_envelope_commitment(
+                    let proposer = verify_envelope_commitment(
                         &node.network,
                         Height(height),
                         node.chain_id,
                         &envelope,
                     );
                     tracing::debug!(target: "bpv1_stage", %block_id,
-                        work_id = work_id.0, ok, "commitment_check_finished");
+                        work_id = work_id.0, ok = proposer.is_some(), ?proposer,
+                        "commitment_check_finished");
                     // decision-26: admission picks the `Have` initial group
                     // among the live peers.
                     let peers: Vec<NodeId> = node.lock_sessions().keys().copied().collect();
                     let rng_seed = zakura_rt::rand::rng().random::<u64>();
                     node.drive(BlockInput::CommitmentChecked {
                         work_id,
-                        ok,
+                        proposer,
                         peers,
                         rng_seed,
                     });
@@ -560,15 +564,15 @@ impl SharedNode {
     }
 }
 
+/// Verifies `envelope`'s commitment and returns the proposer the block
+/// names, or `None` when the commitment fails (decision-34).
 fn verify_envelope_commitment(
     network: &Network,
     admitted_height: Height,
     chain_id: [u8; 32],
     envelope: &MetaEnvelope,
-) -> bool {
-    let Some(header) = parse_header(&envelope.header_bytes) else {
-        return false;
-    };
+) -> Option<Proposer> {
+    let header = parse_header(&envelope.header_bytes)?;
     let fields = CommitmentFields {
         chain_id,
         profile_id: W2_PROFILE_ID,
@@ -583,7 +587,7 @@ fn verify_envelope_commitment(
         &envelope.binding,
         &fields,
     )
-    .is_ok()
+    .ok()
 }
 
 /// Runs the checks on `envelope`, whose parent header is unknown, in their
@@ -722,12 +726,17 @@ impl Bpv1Handle {
     /// Prepares the commitment for a post-NU7 mining template (`decision-1`).
     /// A template whose body is already encoding
     /// waits for that encode instead of starting another.
+    ///
+    /// `gateway` is the gateway ID of the template's miner mesh output. The
+    /// commitment leaves `proposer_node` out when there is one, and the call
+    /// returns `None` when it names another node (decision-34).
     pub(crate) fn prepare_commitment(
         &self,
         light_client_root: [u8; 32],
         height: Height,
         tx_count: u32,
         body_after_coinbase: &[u8],
+        gateway: Option<GatewayId>,
     ) -> Option<PreparedCommitment> {
         use zakura_chain::parameters::NetworkUpgrade;
 
@@ -738,6 +747,7 @@ impl Bpv1Handle {
         if self.node.lock_sessions().is_empty() {
             return None;
         }
+        let proposer = Proposer::local(self.node.local_node, gateway)?;
 
         let template_id = TemplateId(self.node.next_template_id.fetch_add(1, Ordering::AcqRel));
         let body_identity = compute_body_identity(tx_count, body_after_coinbase);
@@ -747,11 +757,12 @@ impl Bpv1Handle {
         let results = EncodeResults::default();
         let mut own_results = lock(&results);
         let (step, joined) = {
-            let mut proposer = self.node.lock_proposer();
-            let step = proposer.step(ProposerInput::TemplateBuilt {
+            let mut proposer_state = self.node.lock_proposer();
+            let step = proposer_state.step(ProposerInput::TemplateBuilt {
                 template_id,
                 body_identity,
                 light_client_root,
+                proposer,
             });
             let mut encodes = lock(&self.node.encodes);
             if step
@@ -831,21 +842,33 @@ impl zakura_node_services::bpv1_proposer::Bpv1ProposerHook for Bpv1Handle {
         height: Height,
         tx_count: u32,
         body_after_coinbase: &[u8],
+        gateway: Option<GatewayId>,
     ) -> Option<[u8; COMMITMENT_PAYLOAD_LEN]> {
-        self.prepare_commitment(light_client_root, height, tx_count, body_after_coinbase)
-            .map(|commitment| commitment_payload(commitment.commitment_hash))
+        self.prepare_commitment(
+            light_client_root,
+            height,
+            tx_count,
+            body_after_coinbase,
+            gateway,
+        )
+        .map(|commitment| commitment_payload(commitment.commitment_hash))
     }
 
-    fn empty_template_commitment(&self, height: Height) -> Option<[u8; COMMITMENT_PAYLOAD_LEN]> {
+    fn empty_template_commitment(
+        &self,
+        height: Height,
+        gateway: Option<GatewayId>,
+    ) -> Option<[u8; COMMITMENT_PAYLOAD_LEN]> {
         if !self.should_prepare_template(height) {
             return None;
         }
+        let proposer = Proposer::local(self.node.local_node, gateway)?;
         // An empty body has one transaction, the coinbase, and no bytes after it.
         let encoded = encode_body(&self.node.profile, &[], 1).ok()?;
-        let commitment_hash = self
-            .node
-            .lock_proposer()
-            .commitment_hash(encoded.coding, encoded.part_root);
+        let commitment_hash =
+            self.node
+                .lock_proposer()
+                .commitment_hash(encoded.coding, encoded.part_root, proposer);
         Some(commitment_payload(commitment_hash))
     }
 
@@ -2652,7 +2675,7 @@ mod tests {
                     let handle = handle.clone();
                     let body = body.clone();
                     std::thread::spawn(move || {
-                        handle.prepare_commitment([i; 32], Height(5), 2, &body)
+                        handle.prepare_commitment([i; 32], Height(5), 2, &body, None)
                     })
                 })
                 .collect();

@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use zakura_chain::block;
+use zakura_chain::{block, miner_mesh::GatewayId};
 use zakura_rt::time::Instant;
 
 use super::{
@@ -10,7 +10,7 @@ use super::{
     RecvWant, RecvWantEnd, Retire,
 };
 use crate::zakura::bpv1::{
-    commitment::CoinbaseBinding,
+    commitment::{CoinbaseBinding, Proposer},
     paths::Arrival,
     profile::Profile,
     wire::{part_payload_len, Bpv1Message, HaveFlags, WantBitmap, HAVE_FLUSH_INTERVAL},
@@ -60,12 +60,20 @@ pub fn replay_bpv1_peer_bytes(bytes: &[u8]) -> PeerReplaySummary {
         };
         let input = match op & 0x0F {
             // Op bit 0x40 names a third node as the proposer, so pushes
-            // reach the remote (decision-24). Op bit 0x20 puts the remote
-            // outside the `Have` initial group (decision-26).
+            // reach the remote (decision-24). Op bit 0x10 names it by its
+            // gateway ID (decision-34). Op bit 0x20 puts the remote outside
+            // the `Have` initial group (decision-26).
             0 => PeerInput::BlockAdmitted(BlockAdmitted {
                 block_id,
                 coding: block_coding,
-                proposer_node: if op & 0x40 != 0 { third } else { remote },
+                proposer: {
+                    let named = if op & 0x40 != 0 { third } else { remote };
+                    if op & 0x10 != 0 {
+                        Proposer::Gateway(GatewayId::from_node_id(named.as_bytes()))
+                    } else {
+                        Proposer::Node(named)
+                    }
+                },
                 header_meta: Some(Box::new(Bpv1Message::BlockDone { block_id })),
                 as_proposer: false,
                 have_held_until: (op & 0x20 != 0).then(|| now + Duration::from_millis(500)),
@@ -83,7 +91,7 @@ pub fn replay_bpv1_peer_bytes(bytes: &[u8]) -> PeerReplaySummary {
                     },
                     coding: block_coding,
                     part_root: block_id.0,
-                    proposer_node: remote,
+                    proposer_node: Some(remote),
                 }),
             },
             2 => {

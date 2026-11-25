@@ -633,6 +633,7 @@ impl BlockTemplateResponse {
                         mempool_txs
                             .iter()
                             .map(|tx| tx.transaction.transaction().as_ref()),
+                        miner_params,
                     )
                 });
                 // ZIP 234 derives the subsidy from the money reserve after the parent, which
@@ -731,6 +732,9 @@ pub(crate) struct PrecomputedCoinbase {
 /// Prepares the BPv1 commitment payload for a template at `height` whose transactions after
 /// the coinbase are `body`, on a parent whose light-client root is `light_client_root`.
 ///
+/// The coinbase names the gateway of `miner_params`' miner mesh output, if it has one, and
+/// BPv1 then takes the proposer from that output.
+///
 /// Returns `None` when the parent has no light-client root, a transaction does not
 /// serialize, or `proposer` declines.
 pub(crate) fn bpv1_template_commitment<'a>(
@@ -738,6 +742,7 @@ pub(crate) fn bpv1_template_commitment<'a>(
     light_client_root: Option<block::ChainHistoryMmrRootHash>,
     height: block::Height,
     body: impl ExactSizeIterator<Item = &'a zakura_chain::transaction::Transaction>,
+    miner_params: &MinerParams,
 ) -> Option<[u8; zakura_node_services::bpv1_proposer::BPV1_COMMITMENT_NULL_DATA_LEN]> {
     use zakura_chain::serialization::ZcashSerialize;
 
@@ -747,7 +752,13 @@ pub(crate) fn bpv1_template_commitment<'a>(
     for tx in body {
         tx.zcash_serialize(&mut body_after_coinbase).ok()?;
     }
-    proposer.prepare_template_commitment(light_client_root, height, tx_count, &body_after_coinbase)
+    proposer.prepare_template_commitment(
+        light_client_root,
+        height,
+        tx_count,
+        &body_after_coinbase,
+        miner_params.mesh_gateway(),
+    )
 }
 
 fn new_work_id() -> String {
@@ -861,6 +872,12 @@ impl MinerParams {
     /// Returns the gateway every coinbase names, if the miner announces one.
     pub fn mesh_commitment(&self) -> Option<MinerMeshCommitment> {
         self.mesh_commitment
+    }
+
+    /// Returns the gateway ID the coinbase names, if it names one.
+    pub fn mesh_gateway(&self) -> Option<zakura_chain::miner_mesh::GatewayId> {
+        self.mesh_commitment
+            .map(|commitment| commitment.gateway_id())
     }
 
     /// Makes every coinbase name the gateway in `commitment`.

@@ -6,7 +6,7 @@
 use std::time::Duration;
 
 use proptest::prelude::*;
-use zakura_chain::block;
+use zakura_chain::{block, miner_mesh::GatewayId};
 use zakura_quic::NodeId;
 use zakura_rt::time::Instant;
 
@@ -20,6 +20,7 @@ use super::{
     },
     close::Bpv1CloseRow,
     codec::encode_body,
+    commitment::Proposer,
     peer::{PeerConfig, PeerInput, PeerOutput, PeerState, RecvWantEnd, Retire},
     peer_tests::{
         admitted, assert_closed, have_with, pull, recv_meta, recv_want, session, tiny,
@@ -127,7 +128,7 @@ fn close_2_decode_errors() {
         },
         coding: tiny(),
         part_root: [0x11; 32],
-        proposer_node: node_id(1),
+        proposer_node: Some(node_id(1)),
     });
 
     for (name, input) in [
@@ -198,7 +199,7 @@ fn commitment(table: &mut BlockTable, now: Instant, step: &BlockStep, ok: bool) 
         now,
         BlockInput::CommitmentChecked {
             work_id: commit_work(step),
-            ok,
+            proposer: ok.then_some(Proposer::Node(node_id(1))),
             peers: Vec::new(),
             rng_seed: 0,
         },
@@ -440,6 +441,79 @@ fn close_4_failed_commitment_closes_identical_copies_and_checks_the_alternate() 
         .outputs
         .iter()
         .all(|o| !matches!(o, BlockOutput::ClosePeer { .. })));
+}
+
+/// `bpv1-close-4`, proposer form (decision-34, bpv1-61): a copy whose
+/// `proposer_node` form disagrees with the coinbase fails its check like a
+/// failed commitment. Copies that differ only in `proposer_node` are
+/// different copies, so the other sender's copy gets its own check, and the
+/// block is admitted under the proposer that copy names.
+#[test]
+fn close_4_proposer_form_mismatch_checks_the_other_form() {
+    let now = Instant::now();
+    let block_id = block::Hash([0x36; 32]);
+    let [a, b, ..] = sessions();
+    let gateway = Proposer::Gateway(GatewayId::from_node_id(node_id(1).as_bytes()));
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    // The coinbase holds one miner mesh output, so `a`'s copy names the
+    // proposer twice and `b`'s copy, without `proposer_node`, is the valid
+    // form.
+    let first = copy_from(
+        &mut table,
+        now,
+        make_envelope(block_id, tiny(), [0xA1; 32], node_id(1)),
+        a,
+    );
+    let mut gateway_form = make_envelope(block_id, tiny(), [0xA1; 32], node_id(1));
+    gateway_form.proposer_node = None;
+    copy_from(&mut table, now, gateway_form, b);
+    let header = header_result(
+        &mut table,
+        now,
+        &first,
+        HeaderAdmissionResult::Admitted {
+            height: 1,
+            parent_hash: TEST_TIP_HASH,
+        },
+    );
+
+    let failed = table.step(
+        now,
+        BlockInput::CommitmentChecked {
+            work_id: commit_work(&header),
+            proposer: None,
+            peers: Vec::new(),
+            rng_seed: 0,
+        },
+    );
+    assert_eq!(
+        closed_sessions(&failed, Bpv1CloseRow::Row4BadMetaOrCommitment),
+        vec![a]
+    );
+    assert!(verifies(&failed), "the other form gets its own check");
+    let passed = table.step(
+        now,
+        BlockInput::CommitmentChecked {
+            work_id: commit_work(&failed),
+            proposer: Some(gateway),
+            peers: Vec::new(),
+            rng_seed: 0,
+        },
+    );
+    let admitted = passed
+        .outputs
+        .iter()
+        .find_map(|o| match o {
+            BlockOutput::PublishAdmitted { admitted, .. } => Some(admitted),
+            _ => None,
+        })
+        .expect("the gateway-form copy is admitted");
+    assert_eq!(admitted.proposer, gateway);
+    assert!(passed
+        .outputs
+        .iter()
+        .all(|o| !matches!(o, BlockOutput::ClosePeer { .. })));
+    table.assert_invariants();
 }
 
 /// The alternate envelope waits with its entry while the parent header is

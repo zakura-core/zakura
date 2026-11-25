@@ -12,6 +12,10 @@ the BPv1 implementation decisions:
   consensus block hash; Ed25519 signatures, variant identifiers, and the
   conflict rule are removed. Parts encode `B'` (transactions after the
   coinbase); `coding` carries `tx_count`.
+- **Proposer from the miner mesh output (decision-34):** When the coinbase
+  holds exactly one miner mesh output, its gateway ID names the proposer, and
+  `HeaderMeta` and `C` omit `proposer_node`. Without one, both carry it. A
+  `HeaderMeta` whose form disagrees with the coinbase fails admission.
 - **Headers (decision-2):** `HeaderMeta` always carries the full header, once
   per block per connection. Header sync runs unchanged and headerchain coalesces
   validation by hash.
@@ -249,7 +253,8 @@ HeaderMeta {
     binding: CoinbaseBinding,      // coinbase tx + txid & auth-data index-0 paths + light_client_root
     coding: Coding,                // codec, body_bytes, tx_count, part_bytes, stripes, k, n
     part_root: Hash,               // 32-byte BLAKE3 KDF Merkle root over all stripes*n parts
-    proposer_node: NodeId,         // transport identity that sends the seed parts
+    proposer_node: Option<NodeId>, // transport identity that sends the seed parts;
+                                   // absent when the miner mesh output names it
 }
 ```
 
@@ -282,13 +287,20 @@ The verified-tip bound applies at admission only. A reorg can lower the verified
 tip, and a block admitted above the new bound keeps its slot until it completes
 or reaches its deadline.
 
-The coinbase commitment binds `proposer_node` to the block. A node therefore
-accepts relay flags only from the connection authenticated as `proposer_node`,
-and only that connection may flag every index of a stripe for push.
+The coinbase names the proposer (decision-34). With exactly one miner mesh
+output, the proposer is every node whose ID starts with that output's 20-byte
+`gateway_id`, and `HeaderMeta` MUST omit `proposer_node`. Without one,
+`HeaderMeta` MUST carry `proposer_node`, and the coinbase commitment binds it
+to the block. A coinbase with two or more miner mesh outputs names no gateway,
+so it takes the `proposer_node` form. A node accepts relay flags only from a
+connection authenticated as the proposer, and only such a connection may flag
+every index of a stripe for push. Naming a node grants it these bounds on its
+own connections only: it never silences that node, which relays a block it
+admitted from a peer like any other.
 
 ### Bind the proposer to the proof of work
 
-The proposer commits `C = T("commit", chain_id || profile_id || coding || part_root || proposer_node)`
+The proposer commits `C = T("commit", chain_id || profile_id || coding || part_root [|| proposer_node])`
 in a single zero-value transparent `OP_RETURN` output of the post-NU7 v6
 coinbase transaction before mining:
 
@@ -314,9 +326,12 @@ A miner mesh coinbase MAY also carry its own output
 ([#2666](https://github.com/zakura-core/zakura/pull/2666)), which names a
 gateway. That output has the same form with the tag `"MR"`
 ([#2709](https://github.com/zakura-core/zakura/pull/2709)), so the two outputs
-never match each other's reader. BPv1 ignores that output, and it grants no BPv1
-rights. When one node both builds the template and announces the gateway,
-`proposer_node` equals the gateway identity.
+never match each other's reader. When the coinbase holds exactly one miner
+mesh output, its `gateway_id` names the proposer (decision-34): `C` and
+`HeaderMeta` leave `proposer_node` out, and a receiver grants the proposer's
+flag bounds to a connection whose node ID starts with `gateway_id`. A proposer
+whose template carries a mesh output that names another node's gateway
+commits no `C`, and its block uses existing relay.
 
 `CoinbaseBinding` carries the canonical v6 coinbase transaction, its index-0
 txid Merkle path, its index-0 ZIP 244 authorizing-data Merkle path, and
@@ -456,17 +471,17 @@ before its queued push is written, the holder skips the write.
 
 A receiver counts flags per stripe of an admitted block per connection when it
 reads the flagged `Have`. Its _push bound_ on a connection is `n` distinct
-indices per stripe from the connection authenticated as `proposer_node`, whose
-seeds carry its proof of work, and `n - k` from any other connection. Relay
-flags count separately, at most `n - k` per stripe, and only from
-`proposer_node`. Each of these returns `Disconnect` (close-20):
+indices per stripe from a connection authenticated as the proposer (section 2,
+decision-34), whose seeds carry its proof of work, and `n - k` from any other
+connection. Relay flags count separately, at most `n - k` per stripe, and only
+from the proposer. Each of these returns `Disconnect` (close-20):
 
 - a push flag past the connection's push bound;
-- a relay flag from a connection other than `proposer_node`;
+- a relay flag from a connection other than the proposer's;
 - a relay flag past `n - k` in one stripe.
 
-Any peer MAY push within its bound. Recognizing a miner mesh gateway grants
-nothing more. `n - k` is the most parts one holder can lose without stalling a
+Any peer MAY push within its bound. A miner mesh gateway that does not name
+the proposer grants nothing more. `n - k` is the most parts one holder can lose without stalling a
 stripe. At W2 with a 2 MB block, it is 22 parts, about 0.7 MB per stripe per
 connection. The receiver's relay-flagged indices become its pushed seeds.
 
@@ -615,7 +630,7 @@ still admits it runs far behind; the early record bounds its traffic.
 
 **The bound.** Any peer, honest or not, can send at most one copy of each part
 that this node subscribed to or asked for, plus the parts the peer flagged
-within its push bound: `n` per stripe from `proposer_node` and `n - k` from any
+within its push bound: `n` per stripe from the proposer and `n - k` from any
 other peer, for each admitted block. Data-stream messages about unknown blocks
 add at most the per-peer early-record bound per
 `EARLY_AGE`. Control-stream announcements about unknown or retired blocks are
@@ -699,7 +714,7 @@ describes. Payload caps below are W2 values (`01-wire.md` §1).
 
 | Discriminator | Message | Stream | Role | Answers or ends | Payload cap |
 | --- | --- | --- | --- | --- | --- |
-| 1 | `HeaderMeta` | control | Announcement | — | 2,006,278 |
+| 1 | `HeaderMeta` | control | Announcement | — | 2,006,279 |
 | 4 | `Want` | control | Request | — | 51 |
 | 5 | `StripeDone` | control | Announcement | — | 36 |
 | 6 | `BlockDone` | control | Announcement | — | 32 |
@@ -764,7 +779,7 @@ Section 8 lists every field in transmission order.
 #### `HeaderMeta` — Announcement, discriminator 1
 
 - **Frame**
-  - payload cap = 2,006,278 bytes
+  - payload cap = 2,006,279 bytes
 - **Decode**
   - header length = 1..=4,096 bytes
   - binding length = 1..=2,002,086 bytes
@@ -780,8 +795,10 @@ Section 8 lists every field in transmission order.
   - headerchain admits the header, including proof of work and contextual
     difficulty
   - the binding's txid and auth-data paths match the admitted header
-  - the coinbase holds exactly one version-01 commitment, and its `C` equals
-    the recomputed hash (section 2)
+  - the coinbase holds exactly one version-01 commitment
+  - `proposer_node` is present exactly when the coinbase holds no single miner
+    mesh output (decision-34)
+  - the commitment's `C` equals the recomputed hash (section 2)
 - **Cadence**
   - at most one `HeaderMeta` per block per connection
   - capacity = 64 messages; refill = 16 messages/s; on_empty = record and
@@ -799,12 +816,14 @@ A header that headerchain rejects returns `Disconnect` when headerchain
 classifies the failure as peer-caused. A missing parent invokes bounded
 recovery and is not a violation. With a missing parent, a height outside the
 range in section 1 or a target above the section 1 bound returns `Drop`, and a
-proof of work that fails the section 1 checks returns `Disconnect`. A layout mismatch, invalid binding, or failed
-commitment returns `Disconnect`: an honest relay forwards only admitted
-metadata. A repeat of a block's metadata from the same peer returns `Disconnect`
-while this node holds the block in admission, admitted, or retired. The sender
-keeps the block retired at least until the block leaves its own window, and it
-never admits a block outside that window, so it cannot send the metadata twice.
+proof of work that fails the section 1 checks returns `Disconnect`. A layout
+mismatch, invalid binding, a `proposer_node` form that disagrees with the
+coinbase, or a failed commitment returns `Disconnect` (close-4): an honest relay
+forwards only admitted metadata. A repeat of a block's metadata from the same
+peer returns `Disconnect` while this node holds the block in admission,
+admitted, or retired. The sender keeps the block retired at least until the
+block leaves its own window, and it never admits a block outside that window,
+so it cannot send the metadata twice.
 
 The header commits the coinbase, and the coinbase commits `C`, so a block has
 one valid `HeaderMeta`. The consensus hash covers only the header, so other
@@ -813,9 +832,9 @@ admission:
 
 - The node checks each copy's layout when the copy arrives.
 - A copy that fails its commitment check returns `Disconnect` for every peer
-  that sent an equal copy, first or later. The check depends only on the copy
-  and the admitted height, so an honest relay never forwards a copy that fails
-  it.
+  that sent an equal copy, first or later. The check covers the copy's
+  `proposer_node` form. It depends only on the copy and the admitted height,
+  so an honest relay never forwards a copy that fails it.
 - The node keeps each differing copy while it fits the metadata budget.
   Kept copies use only room that no first copy needs, and they give way to
   any first copy that the node admits.
@@ -993,7 +1012,7 @@ verification worker pauses reading and is not a violation.
   - every index < `stripes * n`
 - **Push flags**, when the receiver has admitted the block, counted across the
   block's flagged `Have`s on this connection
-  - from `proposer_node`: at most `n` flagged indices per stripe, of which at
+  - from the proposer: at most `n` flagged indices per stripe, of which at
     most `n - k` carry the relay flag
   - from any other connection: at most `n - k` flagged indices per stripe and
     no relay flag
@@ -1037,7 +1056,7 @@ proposer, seeds, and repair are not paced.
 
 An out-of-range index or a repeated index returns `Disconnect` while the
 receiver retains the block's peer view. A push flag past the connection's
-push bound, a relay flag from a connection other than `proposer_node`, or a
+push bound, a relay flag from a connection other than the proposer's, or a
 relay flag past `n - k` in one stripe returns `Disconnect` (close-20). A
 `Have` for an unknown block enters the data-stream early record, and a `Have`
 for a retired block spends the peer's retired index counter, under section 3. A false unflagged `Have` attracts `Want`s that the
@@ -1377,10 +1396,10 @@ fields, trailing bytes, and lengths above these bounds before allocation.
 | `MAX_STRIPES`; `MAX_PARTS`; maximum proof depth | 512; 44,032; 16 siblings |
 | Maximum body | 2 GiB (`MAX_STRIPES * STRIPE_K * S_MAX`), and never above `MAX_BLOCK_BYTES` |
 | `MAX_HAVE_INDICES`; `MAX_WANTS_INFLIGHT` | 4,096; 64 |
-| Pushed seeds per stripe per holder; flagged indices per stripe per connection | `min(n - k, ceil(real / eligible))`; `n` from `proposer_node`, of which `n - k` relay, and `n - k` from any other peer |
+| Pushed seeds per stripe per holder; flagged indices per stripe per connection | `min(n - k, ceil(real / eligible))`; `n` from the proposer, of which `n - k` relay, and `n - k` from any other peer |
 | Header bytes; key-binding bytes | 4,096; 2,002,086 |
 | Coinbase bytes; coinbase Merkle siblings | `MAX_BLOCK_BYTES` (the consensus bound); 32 |
-| Control-stream frame cap; data-stream frame cap | 2,006,286 bytes; 66,085 bytes |
+| Control-stream frame cap; data-stream frame cap | 2,006,287 bytes; 66,085 bytes |
 
 These are syntax limits, not assembly reservations or performance guarantees.
 The profile MUST impose lower admission bounds where consensus or node-wide work
@@ -1408,7 +1427,7 @@ The following table lists each payload's fields in transmission order.
 
 | Message | Fields |
 | --- | --- |
-| `HeaderMeta` | `u16(header_length)`, header, binding, coding tuple (30), part root (32), proposer node (32) |
+| `HeaderMeta` | `u16(header_length)`, header, binding, coding tuple (30), part root (32), `u8(proposer_flags)`, proposer node (32, when bit 0 is set) |
 | `Subscribe` | scope, `u16(count)`, lanes (32 each) |
 | `Unsubscribe` | scope, `u16(count)`, lanes (32 each) |
 | `Refuse` | scope, `u16(count)`, lanes (32 each), `u8(reason)` |
@@ -1425,6 +1444,9 @@ The requested bitmap encodes stripe-relative index `j` in bit `j mod 8` of byte
 `j / 8`. `Refuse` reasons are 0 `Capacity`, 1 `UnknownBlock`, 2 `Policy`, and
 3 `Shed`.
 `WantEnd` reasons are 0 `Served`, 1 `UnknownBlock`, and 2 `Retired`.
+`HeaderMeta` proposer flags are `0x00` (the miner mesh output names the
+proposer) or `0x01` (a proposer node follows). Any other value returns
+`Disconnect` (close-1).
 `Have` flags are `0x00`, `0x01` (push), or `0x03` (push and relay). Bit 1, the
 relay flag, is valid only with bit 0. Any other value returns `Disconnect`
 (close-1).

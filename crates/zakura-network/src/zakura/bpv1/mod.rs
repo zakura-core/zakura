@@ -64,7 +64,8 @@ pub use codec::{decode_and_check_stripe, encode_body, CodecError, EncodedBody};
 pub use commitment::{
     coinbase_paths, commit_hash, commitment_payload, commitment_script, expected_tx_path_depth,
     extract_single_commitment, verify_commitment, CoinbaseBinding, CommitmentError,
-    CommitmentFields, COMMITMENT_PAYLOAD_LEN, COMMITMENT_SCRIPT_LEN, COMMITMENT_SCRIPT_PREFIX,
+    CommitmentFields, Proposer, COMMITMENT_PAYLOAD_LEN, COMMITMENT_SCRIPT_LEN,
+    COMMITMENT_SCRIPT_PREFIX,
 };
 pub use config::{HavePacing, ZakuraBpv1Config, BPV1_SESSION_HELD_OUTPUT_BYTES};
 pub use paths::{

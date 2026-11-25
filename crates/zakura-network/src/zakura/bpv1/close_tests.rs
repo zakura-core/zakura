@@ -585,14 +585,7 @@ fn pending_alternates_give_way_before_a_first_copy_is_evicted() {
     let parent = block::Hash([0x3F; 32]);
     let park = |table: &mut BlockTable, copy, from| {
         let received = copy_from(table, now, copy, from);
-        header_result(
-            table,
-            now,
-            &received,
-            HeaderAdmissionResult::MissingParent {
-                parent_hash: parent,
-            },
-        )
+        missing_parent(table, now, &received, parent)
     };
     let [a, b, c, _] = sessions();
     let mut table = BlockTable::new(BlockConfig::for_profile(Profile::W2));

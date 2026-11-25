@@ -10,11 +10,13 @@
 //! synced, and an empty ranking otherwise.
 
 mod chain_reads;
+mod local_gateway;
 mod ranking;
 mod tracker;
 
 #[cfg(test)]
 mod tests;
 
+pub use local_gateway::LocalGateway;
 pub use ranking::ranking_channel;
-pub use tracker::{spawn, LocalGateway};
+pub use tracker::spawn;

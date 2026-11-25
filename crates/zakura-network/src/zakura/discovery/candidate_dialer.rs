@@ -781,6 +781,7 @@ fn dial_finish(
         // when this node refuses the authenticated peer before registration.
         Ok(Ok(())) => match own_registration {
             Some(DialRegistration::Registered) => DialFinish::Served,
+            Some(DialRegistration::AlreadyConnected) => DialFinish::AlreadyConnected,
             Some(DialRegistration::LocalLimit) => DialFinish::LocalLimit,
             None => DialFinish::Refused,
         },

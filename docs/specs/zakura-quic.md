@@ -899,7 +899,8 @@ is today's Zakura logic.
   4. if the dialer sees the authenticated ID registered at its check after
      TLS, close the new connection with application code 0 before sending
      the control handshake. A discovery
-     attempt closed this way ends as connected elsewhere, with no failure.
+     attempt closed this way ends as connected elsewhere, with no failure,
+     even if the registered connection ends before discovery processes the close.
      A maintained dial treats it as it treats any closed duplicate: it
      waits on the registered connection, and counts a failure only if that
      connection ends before it is healthy. Registrations visible only to

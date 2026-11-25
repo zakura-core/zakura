@@ -6406,6 +6406,8 @@ fn trace_conn_id(connection: &Connection) -> u64 {
 /// its discovery attempt or maintained redial.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum DialRegistration {
+    /// A dial to an earlier ID found the authenticated peer already registered.
+    AlreadyConnected,
     /// The supervisor registered the peer on this connection.
     Registered,
     /// This node's admission limits refused to register the peer, or a local
@@ -6427,9 +6429,8 @@ pub(crate) struct DialAuthenticated {
 pub(crate) struct DialReport {
     /// Receives what TLS authenticated, before the control handshake starts.
     pub(crate) authenticated: oneshot::Sender<DialAuthenticated>,
-    /// Receives how registration ended. The dial drops it unsent when it ends
-    /// before registration, or when this node refuses the peer for a reason
-    /// other than a local limit.
+    /// Receives the registration or the local reason for ending this dial
+    /// (duplicate or capacity). Other pre-registration failures drop the sender.
     pub(crate) registration: oneshot::Sender<DialRegistration>,
 }
 
@@ -6539,6 +6540,9 @@ pub(crate) async fn serve_reported_native_dial_connection(
             endpoint
                 .handler
                 .handshake_refused(&connection, "moved-peer-already-registered");
+            if let Some(report) = registration_report {
+                let _ = report.send(DialRegistration::AlreadyConnected);
+            }
             connection.close(VarInt::from_u32(ZAKURA_CLOSE_NEUTRAL), b"duplicate");
             return Ok(());
         }

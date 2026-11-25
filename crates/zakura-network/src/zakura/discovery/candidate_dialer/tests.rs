@@ -1065,14 +1065,19 @@ async fn an_attempt_follows_a_moved_node_to_its_registration() {
 /// registering it, so the attempt earns no success, no failure and no backoff.
 #[tokio::test(start_paused = true)]
 async fn a_redundant_dial_to_a_moved_node_is_connected_elsewhere() {
-    let (watch, _registered_tx, report) = dial_watch_with_moves(
+    let (watch, registered_tx, report) = dial_watch_with_moves(
         7,
         vec![peer_id(8)],
         moved_to(7, 8),
         std::future::ready(Ok(())),
     );
     report.authenticated.send(answered_as(8)).unwrap();
-    drop(report.registration);
+    report
+        .registration
+        .send(DialRegistration::AlreadyConnected)
+        .unwrap();
+    // The existing peer leaves before the worker consumes its own dial report.
+    registered_tx.send_replace(Vec::new());
 
     let outcome = watch.run().await;
     assert_eq!(outcome.result, DiscoveryDialResult::ConnectedElsewhere);
@@ -1083,8 +1088,24 @@ async fn a_redundant_dial_to_a_moved_node_is_connected_elsewhere() {
     let attempt = state
         .record_attempt(node_id(7), vec![DIAL_IP])
         .expect("a fresh dialer records the attempt");
-    assert!(state.complete(attempt, outcome.result, Some(DIAL_IP), now));
-    assert!(!state.is_backed_off(node_id(7), DIAL_IP, now));
+    let (node, mut io, _ranking) = preferred_round::dialer(9344).await;
+    io.discovery
+        .insert_static_candidate(NodeAddr::with_addrs(attempt.node_id, [DIAL_ADDR]))
+        .await
+        .unwrap();
+    io.settle(&mut state, attempt, outcome).await;
+    assert_eq!(state.in_flight_count(), 0);
+    assert_eq!(state.in_flight_dials_to(DIAL_IP), 0);
+    assert!(!state.is_backed_off(attempt.node_id, DIAL_IP, now));
+    assert!(
+        io.discovery
+            .dial_candidates(&[], &[])
+            .await
+            .iter()
+            .any(|candidate| candidate.node_id == attempt.node_id),
+        "the discovery book can immediately dial the earlier ID again"
+    );
+    node.shutdown().await;
 }
 
 #[tokio::test(start_paused = true)]

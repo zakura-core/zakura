@@ -158,9 +158,9 @@ async fn a_dial_to_an_earlier_id_leaves_the_registered_connection() {
     .await
     .expect("the redundant dial ends before the timeout")
     .expect("a redundant dial is not a failure");
-    assert!(
-        registered.await.is_err(),
-        "the redundant dial registered nothing"
+    assert_eq!(
+        registered.await.unwrap(),
+        DialRegistration::AlreadyConnected
     );
     assert_eq!(
         proved.try_recv().map(|proved| proved.node_id),

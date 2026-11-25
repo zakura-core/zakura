@@ -1,11 +1,9 @@
 //! What the post-quantum handshake costs a node (TLS-4, TLS-9, ID-13).
 //!
-//! - `handshake/loopback`: one dial over UDP loopback, from the first
-//!   datagram to an authenticated connection on both ends. Both endpoints run
-//!   in this process, so the time is the CPU work of both sides, the hybrid
-//!   key exchange and two composite signatures and verifications included,
-//!   plus loopback scheduling. Loopback has no round-trip time, so the
-//!   round trip a large first flight adds doesn't show here.
+//! - `handshake/loopback`: elapsed time from calling `connect` until the
+//!   dialer returns an authenticated connection over UDP loopback. The
+//!   listener runs in the same process and may still be verifying the dialer
+//!   when the timer stops. Loopback does not model a wide-area network delay.
 //! - `key/load`: loading a node key, which derives its ML-DSA key pair from
 //!   the seed once.
 //!

@@ -31,6 +31,7 @@ use crate::{
     key::{NodeId, NodeSecretKey},
 };
 
+pub(crate) mod address_validation;
 pub(crate) mod hybrid;
 mod mlkem;
 pub(crate) mod resolver;

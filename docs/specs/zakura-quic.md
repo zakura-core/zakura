@@ -336,7 +336,7 @@ at fork tag `zakura-iroh-v1.1.0-rc.1`, and it keeps their MIT/Apache-2.0 notices
 - **WIRE-2.** Production ALPNs are `p2p-v2/N`, one for each Zakura protocol
   version N this release speaks natively, from
   `ZAKURA_PROTOCOL_VERSION_MIN_NATIVE` to `ZAKURA_PROTOCOL_VERSION_CURRENT`
-  (both 4 in this release). A dialer MUST offer every supported ALPN, newest
+  (both 5 in this release). A dialer MUST offer every supported ALPN, newest
   first. The server MUST offer ALPNs in the order the acceptor lists them, not
   sorted, and rustls picks the server's first ALPN that the client also
   offered. The negotiated ALPN fixes the connection's Zakura protocol version.
@@ -544,6 +544,12 @@ is today's Zakura logic.
   the outcome changes to `Accept` between the two, the second datagram alone
   starts TLS: it keeps its admission charge (API-3) and holds a pending
   handshake until `handshake_timeout_secs`, as any unfinished hello does.
+  Until the client's address is validated, the listener MUST limit its UDP
+  payload bytes sent to three times the bytes received from that address
+  for the connection (RFC 9000 §8.1). The driver holds any complete datagram
+  that would exceed the remaining allowance. More bytes from the same
+  address add credit. A validated Retry token or a successfully decrypted
+  Handshake packet from the client establishes return reachability.
 - **ADM-2.** `admit` returns one of four outcomes, each mapped to a
   `quinn_proto::Endpoint` call:
   - `Accept` → `accept`;
@@ -1330,7 +1336,7 @@ this release tolerates, and keep each hard change explicit.
 | ML-DSA-65 key generation, signing and verification give a subset of Project Wycheproof's and NIST ACVP's known answers, each under its own context: seeded keys and deterministic and hedged signatures match, and a 256-byte context, wrong-length keys and signatures, a flipped commitment hash, a bad hint encoding and an out-of-bound response are refused | TLS-4, ID-13 |
 | Signatures that RustCrypto `ml-dsa` 0.1.2 made under the TLS-4 context, recorded offline, are reproduced byte for byte and verify, and its public key for the same seed matches | TLS-4, ID-13 |
 | The published composite known answer: a fixed seed, message and randomness give the recorded Ed25519 key, ML-DSA-65 key, node ID and composite signature, which verifies. The known answer was made without this crate, with Python's `cryptography` and `hashlib` and RustCrypto `ml-dsa` | TLS-4, ID-9, ID-12, ID-13 |
-| In a simulated handshake the listener's first flight stops at three times the 2,400-byte hybrid hello, finishing the datagram it started, and the dialer can't complete on it; once the dialer's reply validates its address, the listener sends the rest and the dialer completes, one round trip later and no more | TLS-4, TLS-9, ADM-1 |
+| In a simulated handshake the listener's first flight stays within three times the 2,400-byte hybrid hello, and the dialer can't complete on it; once the dialer's reply validates its address, the listener sends the rest and the dialer completes, one round trip later and no more | TLS-4, TLS-9, ADM-1 |
 | The seeded X25519MLKEM1024 completes against the production group in both roles and replays its shares for the same seed and node | TLS-9, API-2 |
 | A dialer that offers X25519MLKEM1024 sends its hello as two 1,200-byte Initial datagrams. A refused dial is decided and answered once per datagram, and a retried one decided once per datagram. A hello refused at its first datagram and accepted at its second keeps its charge and holds a pending handshake until the deadline. A one-datagram hello, which only a dialer with classical groups alone sends, is refused at its first datagram and cancelled; a hello with no ALPN in common, which spans two, fails as a handshake | ADM-1, ADM-3, ADM-7, API-3 |
 | On the deterministic scheduler, with no tokio runtime, two `bind_with` endpoints with the same seeded inputs, plan and UTC origin send byte-identical datagrams through a Retry handshake and an echoed stream, in one process and in fresh processes. Leaving out any seeded input, or changing the seed or the UTC origin, changes the bytes, and host time doesn't | API-2, TLS-9, ADM-10, DEP-2 |

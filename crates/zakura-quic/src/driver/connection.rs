@@ -15,7 +15,10 @@ use quinn_proto::{
 };
 use zakura_rt::{
     collections::{HashMap, HashSet},
-    sync::{atomic::Ordering, mpsc, oneshot, watch},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, oneshot, watch,
+    },
 };
 
 use super::{ConnCmd, ConnShared, Handshake, ReadReply, READ_BATCH_BYTES};
@@ -56,7 +59,8 @@ pub(crate) struct ConnTaskParams<S> {
     pub(crate) cmds: mpsc::UnboundedReceiver<ConnCmd>,
     /// Routed datagrams with their sizes, which count against the endpoint's
     /// per-connection byte budget until handled.
-    pub(crate) datagrams: mpsc::UnboundedReceiver<(ConnectionEvent, usize)>,
+    pub(crate) datagrams: mpsc::UnboundedReceiver<(ConnectionEvent, usize, SocketAddr)>,
+    pub(super) send_allowance: Option<HandshakeAllowance>,
     pub(crate) control: mpsc::UnboundedReceiver<ConnectionEvent>,
     pub(crate) to_endpoint: mpsc::UnboundedSender<(ConnectionHandle, EndpointEvent)>,
     pub(crate) socket: Arc<SocketCell<S>>,
@@ -69,6 +73,25 @@ pub(crate) struct ConnTaskParams<S> {
     /// The limits the transport config starts the connection with.
     pub(crate) limits: CurrentLimits,
     pub(crate) slot: Arc<ConnectionSlot>,
+}
+
+/// Bytes the listener may send to the original peer before validating its address.
+pub(super) struct HandshakeAllowance {
+    remaining: usize,
+    validated: Arc<AtomicBool>,
+}
+
+impl HandshakeAllowance {
+    pub(super) fn new(initial_bytes: usize, validated: Arc<AtomicBool>) -> Self {
+        Self {
+            remaining: initial_bytes.saturating_mul(3),
+            validated,
+        }
+    }
+
+    fn received(&mut self, bytes: usize) {
+        self.remaining = self.remaining.saturating_add(bytes.saturating_mul(3));
+    }
 }
 
 /// The connection's limits as last set (API-9).
@@ -224,6 +247,7 @@ struct ConnTask<S: UdpIo> {
 
     send_buf: Vec<u8>,
     blocked: Option<(Transmit, Vec<u8>)>,
+    send_allowance: Option<HandshakeAllowance>,
     more_to_send: bool,
     counters: Counters,
     exported: Exported,
@@ -238,6 +262,7 @@ pub(crate) async fn run<S: UdpIo>(params: ConnTaskParams<S>) {
         shared,
         mut cmds,
         mut datagrams,
+        send_allowance,
         mut control,
         to_endpoint,
         socket,
@@ -288,6 +313,7 @@ pub(crate) async fn run<S: UdpIo>(params: ConnTaskParams<S>) {
         slot,
         send_buf: Vec::new(),
         blocked: None,
+        send_allowance,
         more_to_send: false,
         counters: Counters::default(),
         exported: Exported::default(),
@@ -359,7 +385,11 @@ pub(crate) async fn run<S: UdpIo>(params: ConnTaskParams<S>) {
             Some(_) => {}
             None => timer_deadline = None,
         }
-        let blocked_io = task.blocked.as_ref().and_then(|_| task.socket.get());
+        let blocked_io = task
+            .blocked
+            .as_ref()
+            .filter(|(tx, _)| task.may_send(tx.size))
+            .and_then(|_| task.socket.get());
         let more_to_send = task.more_to_send;
 
         // Local inputs come before the datagram queue: they are bounded (one
@@ -438,11 +468,11 @@ pub(crate) async fn run<S: UdpIo>(params: ConnTaskParams<S>) {
 impl<S: UdpIo> ConnTask<S> {
     async fn drain_datagrams(
         &self,
-        datagrams: &mut mpsc::UnboundedReceiver<(ConnectionEvent, usize)>,
+        datagrams: &mut mpsc::UnboundedReceiver<(ConnectionEvent, usize, SocketAddr)>,
     ) {
         // Close first so concurrent endpoint sends fail and refund their own charge.
         datagrams.close();
-        while let Some((_, bytes)) = datagrams.recv().await {
+        while let Some((_, bytes, _)) = datagrams.recv().await {
             self.refund_datagram(bytes);
         }
     }
@@ -456,9 +486,23 @@ impl<S: UdpIo> ConnTask<S> {
             .fetch_sub(bytes, Ordering::Relaxed);
     }
 
-    fn on_datagram(&mut self, (event, bytes): (ConnectionEvent, usize)) {
+    fn on_datagram(&mut self, (event, bytes, remote): (ConnectionEvent, usize, SocketAddr)) {
         self.refund_datagram(bytes);
+        if let Some(allowance) = &mut self.send_allowance {
+            // Neither credit nor proof of return reachability transfers between addresses.
+            if remote != self.conn.remote_address() {
+                return;
+            }
+            allowance.received(bytes);
+        }
         self.conn.handle_event(event);
+        if self
+            .send_allowance
+            .as_ref()
+            .is_some_and(|allowance| allowance.validated.load(Ordering::Relaxed))
+        {
+            self.send_allowance = None;
+        }
         self.counters.datagrams_received += 1;
     }
 
@@ -585,6 +629,13 @@ impl<S: UdpIo> ConnTask<S> {
             }
             return;
         };
+        if self
+            .blocked
+            .as_ref()
+            .is_some_and(|(tx, _)| !self.may_send(tx.size))
+        {
+            return;
+        }
         if let Some((transmit, contents)) = self.blocked.take() {
             match io.try_send(&transmit, &contents[..transmit.size]) {
                 Ok(()) => self.count_sent(&transmit),
@@ -595,7 +646,12 @@ impl<S: UdpIo> ConnTask<S> {
                 Err(error) => self.send_failed(&error),
             }
         }
-        let max_segments = io.max_transmit_segments();
+        // A batch can exceed the remaining allowance even when its first datagram fits.
+        let max_segments = if self.send_allowance.is_some() {
+            1
+        } else {
+            io.max_transmit_segments()
+        };
         for _ in 0..MAX_TRANSMITS_PER_WAKEUP {
             self.send_buf.clear();
             let Some(transmit) = self
@@ -604,6 +660,12 @@ impl<S: UdpIo> ConnTask<S> {
             else {
                 return;
             };
+            // Quinn accounts a datagram as sent when polled and may round its
+            // three-times limit up. Keep that complete datagram until it fits.
+            if !self.may_send(transmit.size) {
+                self.blocked = Some((transmit, mem::take(&mut self.send_buf)));
+                return;
+            }
             match io.try_send(&transmit, &self.send_buf[..transmit.size]) {
                 Ok(()) => self.count_sent(&transmit),
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -616,7 +678,16 @@ impl<S: UdpIo> ConnTask<S> {
         self.more_to_send = true;
     }
 
+    fn may_send(&self, bytes: usize) -> bool {
+        self.send_allowance
+            .as_ref()
+            .is_none_or(|allowance| bytes <= allowance.remaining)
+    }
+
     fn count_sent(&mut self, transmit: &Transmit) {
+        if let Some(allowance) = &mut self.send_allowance {
+            allowance.remaining -= transmit.size;
+        }
         self.counters.transmits += 1;
         let datagrams = match transmit.segment_size {
             Some(segment) if segment > 0 => transmit.size.div_ceil(segment),
@@ -729,7 +800,7 @@ impl<S: UdpIo> ConnTask<S> {
     /// and the caller then drops the connection's state at once.
     fn enter_closing(
         &mut self,
-        datagrams: &mut mpsc::UnboundedReceiver<(ConnectionEvent, usize)>,
+        datagrams: &mut mpsc::UnboundedReceiver<(ConnectionEvent, usize, SocketAddr)>,
     ) -> bool {
         self.release_streams();
         let slot = self.slot.clone();
@@ -741,7 +812,7 @@ impl<S: UdpIo> ConnTask<S> {
         // handles them as usual.
         slot.begin_closing(|| {
             for _ in 0..datagrams.len() {
-                let Ok((_, bytes)) = datagrams.try_recv() else {
+                let Ok((_, bytes, _)) = datagrams.try_recv() else {
                     break;
                 };
                 self.refund_datagram(bytes);
@@ -1375,6 +1446,7 @@ mod tests {
                 .unwrap(),
             send_buf: Vec::new(),
             blocked: None,
+            send_allowance: None,
             more_to_send: false,
             counters: Counters::default(),
             exported: Exported::default(),
@@ -1828,7 +1900,7 @@ mod tests {
             task.shared
                 .socket_queued_bytes
                 .fetch_add(data.len(), Ordering::Relaxed);
-            tx.send((event, data.len())).unwrap();
+            tx.send((event, data.len(), remote)).unwrap();
         }
         task.drain_datagrams(&mut rx).await;
         assert!(tx.is_closed());
@@ -1876,7 +1948,7 @@ mod tests {
             task.shared
                 .socket_queued_bytes
                 .fetch_add(charged, Ordering::Relaxed);
-            tx.send((event, charged)).unwrap();
+            tx.send((event, charged, remote)).unwrap();
         }
 
         task.close(VarInt::from_u32(0), Bytes::from_static(b"test"));

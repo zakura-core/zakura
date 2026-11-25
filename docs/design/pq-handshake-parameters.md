@@ -81,10 +81,10 @@ the allowance is 7,200 bytes.
 
 - On `p2p-v2/4` the listener's whole first flight, about 5.8 KB, fit. A dial
   completed after one round trip.
-- On `p2p-v2/5` the flight is about 7.9 KB. quinn-proto stops at the
-  allowance, finishing the datagram it started (7,248 bytes in practice), and
-  sends the rest, about 620 bytes, once the dialer's acknowledgements
-  validate its address. A dial completes after two round trips.
+- On `p2p-v2/5` the flight is about 7.9 KB. The listener holds the first datagram
+  that would exceed the allowance. It sends the rest once the dialer's
+  Handshake acknowledgement validates its address. A dial completes after
+  two round trips.
 
 Measured in the simulator with a fixed one-way delay:
 
@@ -155,8 +155,8 @@ on `p2p-v2/5`, and would have been about 560 µs with ML-DSA-87: roughly
 3,600, 2,300 and 1,800 unauthenticated hellos per core-second. ADM-3's
 pending limits and Retry threshold bound how many a source can start.
 
-The committed bench `crates/zakura-quic/benches/handshake.rs` measures whole
-handshakes over UDP loopback, both endpoints in one process on four cores
+The committed bench `crates/zakura-quic/benches/handshake.rs` times the dialer's
+`connect` call over UDP loopback, with both endpoints in one process on four cores
 (`taskset -c 4-7`), through the public API only. The same file ran
 unchanged on main and on the ML-DSA-87 draft:
 
@@ -165,11 +165,10 @@ unchanged on main and on the ML-DSA-87 draft:
 | `handshake/loopback` | 3.92–3.97 ms | 4.45–4.59 ms | 4.79–4.90 ms |
 | `key/load` | 105 µs | 146–150 µs | 208 µs |
 
-A handshake takes about 0.58 ms (15%) longer than on main. The primitives
-predict 0.41 ms for both sides together, and the rest is the extra
-datagrams. Loopback has no RTT, so the added round trip doesn't appear here
-(§3). `key/load` runs once per node start. The ML-DSA-65 range spans three
-runs on 2026-11-25. In the same session the ML-DSA-87 draft measured
+The dialer returned about 0.58 ms (15%) later than on main in these runs.
+The timer can stop before the listener finishes authenticating the dialer.
+The simulated link in §3 measures the effect of network delay. `key/load`
+runs once per node start. The ML-DSA-65 range spans three runs on 2026-11-25. In the same session the ML-DSA-87 draft measured
 4.81–4.93 ms and 207 µs, which matches its earlier figures.
 
 ## 5. Rejected options

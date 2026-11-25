@@ -538,21 +538,18 @@ fn precomputed_template_does_not_wait_for_proof_capacity() {
     });
 }
 
-/// The gateway a pool names when it runs its own gateway node.
-const OWN_GATEWAY: GatewayId = GatewayId::from_bytes([0x5a; 20]);
-
-/// The gateway a pool names when `mining.miner_mesh_gateways` names a relay.
-const RELAY_GATEWAY: GatewayId = GatewayId::from_bytes([0xa5; 20]);
+/// The gateway the templates in these tests name.
+const GATEWAY: GatewayId = GatewayId::from_bytes([0x5a; 20]);
 
 /// Returns the outputs of `template`'s coinbase whose lock script is
-/// `minermeshoutput`.
-fn coinbase_outputs_matching_miner_mesh_output(
+/// `minermeshscriptpubkey`.
+fn coinbase_outputs_matching_miner_mesh_script_pubkey(
     template: &BlockTemplateResponse,
 ) -> Vec<zakura_chain::transparent::Output> {
     let script = template
-        .miner_mesh_output
+        .miner_mesh_script_pubkey
         .clone()
-        .expect("an announcing node's template has a miner mesh output");
+        .expect("an announcing node's template has a miner mesh scriptPubKey");
     let coinbase: zakura_chain::transaction::Transaction = template
         .coinbase_txn
         .data
@@ -567,41 +564,41 @@ fn coinbase_outputs_matching_miner_mesh_output(
         .collect()
 }
 
-/// An announcing node's template hands pools the lock script of the one
-/// zero-value output in `coinbasetxn` that names its gateway, whether the
-/// gateway is the node itself or a relay.
+/// An announcing node's template hands pools the scriptPubKey of the one
+/// zero-value output in `coinbasetxn` that names its gateway.
 #[test]
-fn template_returns_the_marker_output_its_coinbase_carries() {
+fn template_returns_the_marker_script_pubkey_its_coinbase_carries() {
     mining_runtime(async {
-        for gateway in [OWN_GATEWAY, RELAY_GATEWAY] {
-            let chain = chain_info(1, 1, 0);
-            let (_, info) = watch::channel(chain);
-            let (rpc, _, _) = mining_rpc(info);
-            let commitment = MinerMeshCommitment::new(gateway);
-            let rpc = rpc.with_mesh_commitment(commitment);
+        let chain = chain_info(1, 1, 0);
+        let (_, info) = watch::channel(chain);
+        let (rpc, _, _) = mining_rpc(info);
+        let commitment = MinerMeshCommitment::new(GATEWAY);
+        let rpc = rpc.with_mesh_commitment(commitment);
 
-            let template = bounded(rpc.get_block_template(None))
-                .await
-                .unwrap()
-                .try_into_template()
-                .unwrap();
+        let template = bounded(rpc.get_block_template(None))
+            .await
+            .unwrap()
+            .try_into_template()
+            .unwrap();
 
-            assert_eq!(template.miner_mesh_output, Some(commitment.lock_script()));
-            let marker_outputs = coinbase_outputs_matching_miner_mesh_output(&template);
-            assert_eq!(marker_outputs, [commitment.to_output()]);
+        assert_eq!(
+            template.miner_mesh_script_pubkey,
+            Some(commitment.lock_script())
+        );
+        let marker_outputs = coinbase_outputs_matching_miner_mesh_script_pubkey(&template);
+        assert_eq!(marker_outputs, [commitment.to_output()]);
 
-            let json = serde_json::to_value(&template).unwrap();
-            assert_eq!(
-                json["minermeshoutput"],
-                hex::encode(commitment.lock_script().as_raw_bytes()),
-            );
-        }
+        let json = serde_json::to_value(&template).unwrap();
+        assert_eq!(
+            json["minermeshscriptpubkey"],
+            hex::encode(commitment.lock_script().as_raw_bytes()),
+        );
     });
 }
 
-/// A node that names no gateway leaves `minermeshoutput` out of the template.
+/// A node that names no gateway leaves `minermeshscriptpubkey` out of the template.
 #[test]
-fn quiet_template_has_no_miner_mesh_output() {
+fn quiet_template_has_no_miner_mesh_script_pubkey() {
     mining_runtime(async {
         let chain = chain_info(1, 1, 0);
         let (_, info) = watch::channel(chain);
@@ -613,21 +610,21 @@ fn quiet_template_has_no_miner_mesh_output() {
             .try_into_template()
             .unwrap();
 
-        assert_eq!(template.miner_mesh_output, None);
+        assert_eq!(template.miner_mesh_script_pubkey, None);
         let json = serde_json::to_value(&template).unwrap();
-        assert!(json.get("minermeshoutput").is_none(), "{json}");
+        assert!(json.get("minermeshscriptpubkey").is_none(), "{json}");
     });
 }
 
 /// A template built on a precomputed coinbase returns the same miner mesh
-/// output as one that builds its coinbase, and its coinbase carries it.
+/// scriptPubKey as one that builds its coinbase, and its coinbase carries it.
 #[test]
-fn precomputed_template_returns_the_same_marker_output() {
+fn precomputed_template_returns_the_same_marker_script_pubkey() {
     mining_runtime(async {
         let chain = chain_info(1, 1, 0);
         let (_, info) = watch::channel(chain.clone());
         let (rpc, _, _) = mining_rpc(info);
-        let commitment = MinerMeshCommitment::new(RELAY_GATEWAY);
+        let commitment = MinerMeshCommitment::new(GATEWAY);
         let rpc = rpc.with_mesh_commitment(commitment);
         let params = rpc.gbt.miner_params().unwrap();
         let coinbase = TransactionTemplate::new_coinbase(
@@ -667,13 +664,16 @@ fn precomputed_template_returns_the_same_marker_output() {
         .unwrap();
 
         assert_eq!(precomputed.coinbase_txn.data, coinbase.data);
-        assert_eq!(precomputed.miner_mesh_output, built.miner_mesh_output);
         assert_eq!(
-            precomputed.miner_mesh_output,
+            precomputed.miner_mesh_script_pubkey,
+            built.miner_mesh_script_pubkey
+        );
+        assert_eq!(
+            precomputed.miner_mesh_script_pubkey,
             Some(commitment.lock_script())
         );
         assert_eq!(
-            coinbase_outputs_matching_miner_mesh_output(&precomputed),
+            coinbase_outputs_matching_miner_mesh_script_pubkey(&precomputed),
             [commitment.to_output()],
         );
     });

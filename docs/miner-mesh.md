@@ -153,15 +153,16 @@ has it, so it should not add the output again.
 
 A pool that builds its own coinbase outputs, for example to pay its own
 addresses, loses the output unless it copies it. For such pools
-`getblocktemplate` also returns `minermeshoutput`, the output's lock script in
-hex:
+`getblocktemplate` also returns `minermeshscriptpubkey`, the output's
+scriptPubKey in hex. It is the script alone, not a serialized output, so it
+has no value or length prefix:
 
 ```json
-"minermeshoutput": "6a174d5201<gateway_id>"
+"minermeshscriptpubkey": "6a174d5201<gateway_id>"
 ```
 
-Add exactly one zero-value transparent output to the coinbase with that lock
-script. The field names the same gateway `coinbasetxn` does, so it follows
+Add exactly one transparent output to the coinbase with value zero and that
+scriptPubKey. The field names the same gateway `coinbasetxn` does, so it follows
 `mining.miner_mesh_gateways`: it names the relay when one is set. A node that
 does not announce a gateway leaves the field out.
 

@@ -1372,7 +1372,7 @@ pub async fn test_mining_rpcs<State, ReadState>(
     );
 
     // Basic variant from a node that names a gateway, so the template has
-    // `minermeshoutput` and the coinbase has the output it names.
+    // `minermeshscriptpubkey` and the coinbase has the output it names.
 
     let (rpc_announcing, _) = TestRpcImpl::new_for_tests(
         network.clone(),

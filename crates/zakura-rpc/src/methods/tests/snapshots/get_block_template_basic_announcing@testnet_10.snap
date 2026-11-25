@@ -28,7 +28,7 @@ expression: block_template
     "sigops": 0,
     "required": true
   },
-  "minermeshoutput": "6a174d52015a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+  "minermeshscriptpubkey": "6a174d52015a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
   "longpollid": "00018424203eab7f731654008728000000000000000000",
   "target": "0555540000000000000000000000000000000000000000000000000000000000",
   "mintime": 1654008606,

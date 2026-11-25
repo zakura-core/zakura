@@ -399,20 +399,22 @@ pub struct BlockTemplateResponse {
     #[getset(get = "pub")]
     pub(crate) coinbase_txn: TransactionTemplate<amount::NegativeOrZero>,
 
-    /// The lock script of the miner mesh output, which names the gateway node
-    /// other miners can connect to. Present only when this node announces one.
+    /// The scriptPubKey of the zero-value miner mesh output, which names the
+    /// gateway node other miners can connect to. Present only when this node
+    /// announces one.
     ///
-    /// The output's value is always zero. `coinbasetxn` already has this
-    /// output, so a pool that submits `coinbasetxn`'s outputs adds nothing. A
-    /// pool that builds its own coinbase outputs adds exactly one zero-value
-    /// output with this lock script.
+    /// It is the script alone, not a serialized output: it has no value or
+    /// length prefix. `coinbasetxn` already has the output, so a pool that
+    /// submits `coinbasetxn`'s outputs adds nothing. Only a pool that builds
+    /// its own coinbase outputs adds exactly one output with value zero and
+    /// this scriptPubKey.
     ///
     /// This field is not in `zcashd` or the Zcash RPC reference.
-    #[serde(rename = "minermeshoutput")]
+    #[serde(rename = "minermeshscriptpubkey")]
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     #[getset(get = "pub")]
-    pub(crate) miner_mesh_output: Option<Script>,
+    pub(crate) miner_mesh_script_pubkey: Option<Script>,
 
     /// An ID that represents the chain tip and mempool contents for this template.
     #[serde(rename = "longpollid")]
@@ -530,7 +532,7 @@ impl fmt::Debug for BlockTemplateResponse {
             .field("transaction_count", &self.transactions.len())
             .field("transactions", &transactions_truncated)
             .field("coinbase_txn", &self.coinbase_txn)
-            .field("miner_mesh_output", &self.miner_mesh_output)
+            .field("miner_mesh_script_pubkey", &self.miner_mesh_script_pubkey)
             .field("long_poll_id", &self.long_poll_id)
             .field("target", &self.target)
             .field("min_time", &self.min_time)
@@ -708,7 +710,7 @@ impl BlockTemplateResponse {
 
             // The coinbase came from the same `miner_params`, whether it was
             // built here or precomputed, so it carries this output.
-            miner_mesh_output: miner_params
+            miner_mesh_script_pubkey: miner_params
                 .mesh_commitment()
                 .map(|commitment| commitment.lock_script()),
 

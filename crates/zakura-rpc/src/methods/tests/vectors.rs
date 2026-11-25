@@ -6579,6 +6579,7 @@ fn speculative_test_template(parent: Hash) -> BlockTemplateResponse {
         long_poll_id,
         vec![],
         None,
+        None,
     )
     .expect("the test template is valid")
 }

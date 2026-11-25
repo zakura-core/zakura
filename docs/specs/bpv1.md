@@ -1,13 +1,66 @@
-# Dogwood protocol specification
+# BPv1 protocol specification
 
-Status: protocol draft, second revision. This document defines the proposed
-behavior. The [design document](../design/dogwood.md) explains the choices. This
-revision replaces the first draft's part masks, immutable grants, and
-byte-budgeted route controller. It adopts the mechanisms that the `flow`
-prototype measured on an 80-node fleet: coded stripes, proposer entry peers, one
-lane per entry peer, pull-first routing, and receiver-chosen push. Section 8
-fixes candidate payload profile W2. Transport negotiation and the production
-chain adapter remain open.
+Status: protocol draft, third revision (BPv1). Earlier revisions called this
+protocol Dogwood. This document defines the proposed behavior, amended with
+the BPv1 implementation decisions:
+
+- **Coinbase commitment (decision-1, decision-9, decision-25):** The proposer
+  commits `C` in one zero-value post-NU7 v6 coinbase `OP_RETURN` output
+  (`6a 25 "BPV1" 01 C`), proven via both txid and ZIP 244 auth-data index-0
+  paths plus `hashBlockCommitments`. The byte after the tag is the format
+  version. Readers ignore every output in another form. `block_id` is the
+  consensus block hash; Ed25519 signatures, variant identifiers, and the
+  conflict rule are removed. Parts encode `B'` (transactions after the
+  coinbase); `coding` carries `tx_count`.
+- **Headers (decision-2):** `HeaderMeta` always carries the full header, once
+  per block per connection. Header sync runs unchanged and headerchain coalesces
+  validation by hash.
+- **Seeded pull, holder push, and exact-index `Want` (decision-13,
+  decision-14, decision-24):** BPv1 carries seven messages (`HeaderMeta`,
+  `Want`, `StripeDone`, `BlockDone`, `Part`, `Have`, `WantEnd`), omitting
+  `Subscribe`, `Unsubscribe`, `Refuse`, `SubscriptionEnd`, and `Advert`. The
+  proposer pushes seeds to its neighbours, behind `Have`s with the push flag.
+  Each neighbour pushes its relay-flagged seeds once to its own peers, behind
+  a `Have` with the push flag. Every later hop pulls. `Want` carries an exact
+  11-byte requested bitmap with no separate `count`.
+- **All-systematic fast path & root-mismatch fallback (decision-8, decision-10):**
+  A stripe holding all `k` source parts assembles without decoding; the re-encode
+  check gates only regenerated parity. A body whose transaction or auth-data root
+  does not match the header falls back to native block sync without marking the
+  header invalid.
+- **Seed plan and relay flags (decision-19):** `C` names no peer. The
+  proposer builds a focused seed plan when the block is solved. It flags each
+  neighbour's seeds with a `Have` on that neighbour's data stream, ahead of the
+  parts; the relay flag marks the seeds the neighbour pushes onward. Each
+  holder takes at most an even share of a stripe's pushed seeds. Direct copies
+  fill each neighbour's idle link until feedback stops them. BPv1 has no entry
+  peers and no lanes; the lane and subscription rules in sections 3, 6, and 7
+  apply only to the subscription extension, which must define lanes again
+  before it ships.
+- **Paced `Have`s (decision-26):** A node announces parts at once to an initial
+  group of peers, and to every other peer after `advert_delay`. Main's block
+  gossip uses the same pacing and settings.
+- **Rate samples and the 2 × BDP cap (decision-21):** When a `Want` ends with
+  parts, the receiver takes one delivery-rate sample,
+  `bytes / max(t_last − t_sent − min_rtt, t_last − t_first)`. A peer's `bw` is
+  the windowed max of its samples and the transport's `rate_in`. A node commits
+  at most `max(2 parts, 2 × bw × rtt)` of pulls to a peer.
+- **The proposer's silence (decision-20):** The proposer sends `HeaderMeta`
+  and `BlockDone`, never `Have`. `BlockDone` means the sender holds every
+  part. Repair rounds, but not normal pulls, may ask any `BlockDone` peer.
+- **Estimate-based repair (decision-22):** Repair starts after `SLOW_X` × one
+  part's estimated arrival time without progress, doubling per round. The first
+  repair round releases the body claim, so native block sync races.
+- **Arrival-ordered pull planning & liveness (decision-3, decision-12):** Pulls
+  and seed plans compare estimated arrival time `now + rtt + (ahead + bytes) / bw`
+  with `SLOW_X = 2` late release.
+  Unanswered `Want`s use deadline `8 s + outstanding_bytes / 100 KB/s`, parking
+  the session on first stall and closing neutrally on repeat stall. A control
+  frame that waits `4 × (8 s + frame_bytes / 100 KB/s)` for its stream also
+  closes the session neutrally.
+
+The [design document](../design/bpv1.md) explains the background choices.
+Section 8 fixes candidate payload profile W2.
 
 `MUST` defines a security or interoperability requirement. `SHOULD` defines the
 default policy. An alternative policy must preserve every `MUST`. `TBD`
@@ -17,7 +70,7 @@ Message admission follows the
 [peer message regulation specification](peer-message-regulation.md). That
 document defines the filter order, the admission results, reservations,
 subscriptions, cadence, and capacity admission. Section 5 states the
-Dogwood-specific rules for each message in the same format.
+BPv1-specific rules for each message in the same format.
 
 ## 1. Scope and integration
 
@@ -37,12 +90,18 @@ route measurements before full header admission and metadata authentication.
 Bounded parsing, verification, and the early record in section 3 are the
 necessary exceptions. If parent context is missing, the node MAY retain a
 bounded metadata envelope while headerchain recovers that context. It MUST apply
-independent count, byte, work, and time limits to this pending state.
+independent count, byte, work, and time limits to this pending state, both per
+peer and node-wide. Headerchain answers a missing parent before it checks proof
+of work, so a pending entry costs its sender only bytes. Pending metadata MUST
+NOT take space from metadata whose parent the node holds. When the node-wide
+pending limit is full, the node SHOULD drop an entry of the peer holding the
+most pending metadata, not refuse a peer holding less. A dropped entry is not a
+violation, and the block arrives through header sync and block download.
 
 Header admission does not validate the block body. Reconstructed blocks MUST
 enter the existing consensus block-validation path.
 
-The [design targets](../design/dogwood.md#performance-targets) define the
+The [design targets](../design/bpv1.md#performance-targets) define the
 planning workload and the latency goal. These estimates do not change consensus
 limits or establish measured guarantees. The block interval and body size remain
 required sizing inputs.
@@ -66,10 +125,11 @@ The existing block serializer concatenates the header and this vector.
 Reassembly MUST use the exact admitted header from `HeaderMeta`.
 
 ```text
-S        = part payload bytes                   // W2: 65,536
-K        = max(1, ceil(len(B) / S))             // source parts in the body
+S        = clamp(round_up(ceil(len(B) / STRIPE_K), ALIGN), S_MIN, S_MAX)
+                                                // W2: S_MIN = 4,096, S_MAX = 65,536, ALIGN = 64
+K        = ceil(len(B) / S)                     // source parts in the body
 stripes  = ceil(K / STRIPE_K)                   // W2: STRIPE_K = 64
-k        = ceil(K / stripes)                    // source parts per stripe
+k        = ceil(K / stripes), or 0 if stripes = 0  // source parts per stripe
 n        = k + parity_parts(k)                  // W2: parity_parts(k) = ceil(k / 3)
 data     = split(zero_pad(B, stripes * k * S), S)
 source(s) = data[s*k .. (s+1)*k]                // stripe s, 0 <= s < stripes
@@ -80,13 +140,40 @@ index(s, j) = s * n + j                         // wire index, 0 <= j < n
 Each stripe is an independent codeword. Any `k` distinct correctly encoded parts
 of a stripe reconstruct that stripe. Every stripe has the same `k` and `n`. The
 last stripes carry zero padding, and `body_bytes` gives the exact body length.
-Every part, including parity, MUST contain exactly `S` payload bytes.
 
-`0 < k < n`, `stripes <= MAX_STRIPES`, and
+Each block picks its part size `S`: the smallest multiple of `ALIGN` that fits
+the body in one stripe of `STRIPE_K` source parts, between `S_MIN` and `S_MAX`.
+A body above `STRIPE_K * S_MAX` uses `S_MAX` and more stripes. A small block
+therefore costs about its own size per node, not `STRIPE_K` parts of `S_MAX`.
+`coding.part_bytes` carries `S`, so the rule adds no field.
+
+On the wire a source part ends where the body ends, so padding never crosses:
+
+```text
+g            = s * k + j                        // global source index of slot j in stripe s
+wire_len(i)  = S                                if j >= k   (parity)
+             = clamp(len(B) - g * S, 0, S)      if j < k    (source)
+```
+
+Every part payload MUST contain exactly `wire_len(i)` bytes. The receiver
+appends zeros up to `S` before it hashes the leaf, decodes, or re-encodes, so
+the tree, the codec, and assembly see only padded parts. A source part with
+`wire_len(i) = 0` holds only padding. It exists only when `stripes * k > K >= 1`.
+The receiver holds a padding part from admission, and no node announces,
+requests, or sends it.
+
+An empty body (`len(B) = 0`) has no parts: `K = stripes = k = n = 0`. The block
+is the header and the coinbase, which `HeaderMeta` already carries. A node
+assembles it when it admits the metadata and then sends `BlockDone`. No `Have`,
+`Want`, `Part`, or `StripeDone` exists for it; one that names it names an index
+or stripe outside the layout and returns `Disconnect`.
+
+`0 < k < n` for a non-empty body, `stripes <= MAX_STRIPES`, and
 `len(canonical(header)) + len(B) <= MAX_BLOCK_BYTES` MUST hold. The profile
-fixes `S`, `STRIPE_K`, `parity_parts`, and `MAX_STRIPES`. A proposer cannot
-choose coding parameters. Receivers MUST recompute `stripes`, `k`, and `n` from
-`body_bytes` and the profile, and MUST reject a mismatch.
+fixes `S_MIN`, `S_MAX`, `ALIGN`, `STRIPE_K`, `parity_parts`, and `MAX_STRIPES`.
+A proposer cannot choose coding parameters. Receivers MUST recompute `S`,
+`stripes`, `k`, and `n` from `body_bytes` and the profile, and MUST reject a
+mismatch.
 
 ### Codec
 
@@ -115,7 +202,7 @@ The proposer MUST finish every stripe's codeword and the part root before it
 publishes `HeaderMeta`. It SHOULD precompute them for the candidate body while
 mining. A change to the body, including its coinbase, invalidates that cached
 encoding. A header-only change does not change the encoded body or the part
-root. The signature still binds the root to the final block identifier.
+root. `C` still binds the root to the final block through the coinbase.
 Bare-header propagation MAY proceed through headerchain while encoding runs. It
 MUST NOT authorize part processing.
 
@@ -124,112 +211,95 @@ send each stripe as soon as it is encoded. W2 does not.
 
 ### Metadata fields
 
-`HeaderMeta` MUST authenticate all of these values:
+`HeaderMeta` carries all of these values, authenticated via the post-NU7 v6
+coinbase commitment `C` (`decision-1`, `decision-9`, `01-wire.md` §3):
 
 ```text
 HeaderMeta {
-    header: ConsensusHeader,
-    proposer_key: PublicKey,
-    proposer_node: NodeId,    // transport identity that sends the seed parts
-    key_binding: BoundedProof,
-    coding: Coding,           // codec, body_bytes, part_bytes, stripes, k, n
-    part_root: Hash,
-    created_ms: u64,          // proposer's Unix time, in milliseconds
-    entry_peers: [NodeId],  // 1..=MAX_ENTRY_PEERS proposer peers, in lane order
-    signature: Signature,
+    header: ConsensusHeader,       // full canonical consensus header (decision-2)
+    binding: CoinbaseBinding,      // coinbase tx + txid & auth-data index-0 paths + light_client_root
+    coding: Coding,                // codec, body_bytes, tx_count, part_bytes, stripes, k, n
+    part_root: Hash,               // 32-byte BLAKE3 KDF Merkle root over all stripes*n parts
+    proposer_node: NodeId,         // transport identity that sends the seed parts
 }
 ```
 
-`body_bytes` MUST equal `len(B)`. Admission MUST check the combined header and
-body size with checked arithmetic before it allocates assembly state.
+`body_bytes` MUST equal `len(B')` (the serialized transactions after the
+coinbase, without the transaction-count prefix; `tx_count` is carried in
+`Coding`). Admission MUST validate the canonical coding tuple and check
+`len(canonical(header)) + len(coinbase) + compact_size(tx_count) + body_bytes <= MAX_BLOCK_BYTES`
+with checked arithmetic before headerchain work or assembly state allocation.
 
-`entry_peers` MUST be nonempty and MUST NOT repeat an identity. It MUST NOT
-contain `proposer_node`. Section 3 derives each part's lane from `entry_peers`.
+`HeaderMeta` names no seeds and is the same on every connection. The proposer
+authorizes its seeds on the data stream with flagged `Have`s (section 3).
 
-`created_ms` anchors the arrival delays in section 7. Nodes MUST NOT use it for
-admission, retention, or deadlines. A skewed proposer clock shifts every node's
-arrival delays by the same amount, so an arrival delay can be negative. Nodes
-saturate arrival delays at the bounds of `i32` microseconds.
+The block identifier (`block_id`) is the consensus hash of `header` across every
+BPv1 message. Because `C` is embedded in the mined coinbase inside the PoW
+header, Ed25519 proposer signatures, variant identifiers, and metadata conflict
+rules are unnecessary and removed in revision 3.
 
-The block identifier is the consensus hash of `header`. The profile MUST define
-one canonical serialization for the metadata fields and one hash `T`. The
-proposer signature MUST cover a domain separator, the chain identifier, the
-protocol profile, the block identifier, the proposer key, the proposer node, the
-coding tuple, the part root, the creation time, and the entry-peer list. The
-metadata variant identifier MUST hash these signed fields, excluding the
-signature and the key-binding proof. Alternate encodings of equivalent proof or
-signature evidence MUST NOT create apparent proposer equivocation.
+Coded propagation covers only recent blocks. Let `top` be the highest of this
+node's verified tip height, its best header-valid height, and the height of a
+block it proposed. `top` never decreases. A header that headerchain retains
+but has not selected, such as a fork or a future-dated header, does not raise
+`top`. A node MUST NOT admit
+metadata for a block at or below `top - PROPAGATION_DEPTH` (strictly
+`height + PROPAGATION_DEPTH > top`). Such a block uses the existing
+block-download path.
 
-Every Dogwood message other than `HeaderMeta` names a block by its variant
-identifier, not by its consensus hash. This document calls that identifier
-`block_id`. A proposer can sign two variants of one header. A peer that admitted
-the other variant then sees an unknown `block_id`, never an invalid proof or
-index. Headerchain still deduplicates headers by consensus hash.
-
-Coded propagation covers only recent blocks. Let `top` be the highest block
-height this node has admitted, which never decreases. A node MUST NOT admit
-metadata for a block at or below `top - PROPAGATION_DEPTH`. Such a block uses
-the existing block-download path.
-
-The signature binds `proposer_node` to the block. An entry peer therefore
-accepts seed parts only from the connection authenticated as `proposer_node`.
+The coinbase commitment binds `proposer_node` to the block. A node therefore
+accepts relay flags only from the connection authenticated as `proposer_node`,
+and only that connection may flag every index of a stripe for push.
 
 ### Bind the proposer to the proof of work
 
-`key_binding` MUST prove that the mined header commits to `proposer_key`. A
-transport identity, self-signed wrapper, or unauthenticated coinbase label does
-not satisfy this rule. The key is the proposer identity for this block. It does
-not establish a unique operator or a stable physical entry point.
-
-The proposed chain adapter commits the key before mining, then signs metadata
-after mining. Its candidate uses one zero-value transparent coinbase output with
-this exact script for a 32-byte proposer key:
+The proposer commits `C = T("commit", chain_id || profile_id || coding || part_root || proposer_node)`
+in a single zero-value transparent `OP_RETURN` output of the post-NU7 v6
+coinbase transaction before mining:
 
 ```text
-6a 28 || ASCII("DOGWOOD") || 01 || proposer_key[32]
+6a 25 || ASCII("BPV1") || 01 || C[32]
 ```
 
-`6a` is `OP_RETURN`; `28` directly pushes the following 40 bytes. The verifier
-MUST require exactly one matching commitment output. Alternate push encodings,
-extra bytes, and a nonzero output value MUST NOT satisfy this candidate. The
-candidate does not put the part root in the coinbase.
+`6a` is `OP_RETURN`; `25` directly pushes the following 37 bytes (total script
+length 39 bytes, serialized transparent output 48 bytes). The byte after
+`"BPV1"` is the commitment format version (decision-25). BPv1 defines version
+`01` only; the profile lives inside `C`, not in this byte.
 
-The proof carries the canonical coinbase transaction and its transaction-id
-Merkle path at index zero. The verifier MUST compute the txid with the existing
-chain implementation for the admitted height and transaction version. It MUST
-check the path against the admitted header's transaction Merkle root. Bounded
-parsing and an output key match do not replace that path check. The profile MUST
-bound the coinbase bytes, script bytes, output count, and path depth before
-allocation. Oversized or unsupported bindings use existing block propagation.
+An output is a version-01 commitment only if its value is zero and its script
+is exactly the form above. Readers MUST ignore every other output, including
+another version, length, push encoding, or value. A coinbase MUST hold exactly
+one version-01 commitment for a binding. With none or two, the block has no
+binding: it travels by block sync, and its `HeaderMeta` returns `Disconnect`
+(close-4). A later version is negotiated with the BPv1 service version. During
+a transition a proposer MAY write one output per version, and each reader reads
+only the versions it supports.
 
-Under [ZIP 244](https://zips.z.cash/zip-0244), the txid commits to transparent
-outputs. It excludes input scripts from that digest. A key in the coinbase input
-script MUST NOT be accepted with only a txid inclusion path. An adapter that
-uses authorizing data would need the separate header commitment proof for that
-data. It MUST NOT silently substitute one proof for the other.
+A miner mesh coinbase MAY also carry its own output
+([#2666](https://github.com/zakura-core/zakura/pull/2666)), which names a
+gateway. BPv1 ignores that output, and it grants no BPv1 rights. When one node
+both builds the template and announces the gateway, `proposer_node` equals the
+gateway identity.
 
-The local binding probe covers transparent-only V5 coinbases. The selected
-profile still MUST fix supported transaction versions and chain-verification
-work bounds. A post-Tachyon format requires its own commitment check; the V5
-result does not establish that future binding.
+`CoinbaseBinding` carries the canonical v6 coinbase transaction, its index-0
+txid Merkle path, its index-0 ZIP 244 authorizing-data Merkle path, and
+`hashLightClientRoot`. The verifier MUST recompute both the transaction Merkle
+root and `hashBlockCommitments = BLAKE2b("ZcashBlockCommit", hashLightClientRoot || hashAuthDataRoot)`
+using the chain implementation for the admitted height, and verify both against
+the admitted header. The profile bounds coinbase bytes and path depth before
+allocation. The coinbase byte bound is the consensus bound, `MAX_BLOCK_BYTES`:
+consensus has no separate coinbase limit, so a tighter bound would send valid
+blocks to slower relay. A large coinbase travels whole in `HeaderMeta`, so its
+miner pays for it on every connection's control stream. The coinbase byte bound
+also bounds the coinbase's outputs and
+script bytes. Pre-NU7 blocks and pool-built coinbases
+without a commitment use existing block propagation.
 
-Implementations MUST NOT assume that the current Zcash header already
-authenticates this wrapper. A block without a supported key binding MUST use
-existing block propagation.
-
-The verifier MUST check the header's proof of work and all contextual header
-rules before signature verification, part-root admission, or route-state
-allocation. It MUST bound even invalid-header verification with per-peer and
-global work limits.
-
-A valid header does not limit how many entry-peer lists its signer can sign.
-Nodes MUST retain at most one admitted metadata variant per block hash. Exact
-duplicates MUST NOT create additional assembly or forwarding work. On a second
-distinct, fully authenticated variant, a node MUST stop coded propagation for
-that block, retain bounded conflict evidence, and recover through the existing
-block-download path. A metadata conflict alone MUST NOT invalidate the consensus
-header or penalize an honest relay. Local variant selection is not a consensus
-rule.
+The verifier MUST validate the coding layout first, then submit `header` to
+headerchain (checking proof of work and all contextual header rules), and only
+after header admission verify the coinbase commitment and allocate assembly
+state. Duplicate `HeaderMeta` for the same consensus hash from another peer
+returns `Drop`.
 
 ### Authenticate parts and reconstruction
 
@@ -247,10 +317,14 @@ The construction MUST bind part position and coding parameters:
 
 ```text
 encoding_id = T("encoding", coding)
-leaf[i]     = T("leaf", encoding_id || u32(i) || payload[i])
+leaf[i]     = T("leaf", encoding_id || u32(i) || zero_pad(payload[i], S))
 pad[p]      = T("pad", encoding_id || u32(p))
 parent      = T("node", left || right)
 ```
+
+An empty body's tree has `next_pow2(0) * next_pow2(0) = 1` position, which
+holds a pad leaf, so its `part_root = pad[0]`. Every empty body has the same
+coding tuple, so every empty block has the same `part_root`.
 
 A proof contains exactly `depth` siblings in leaf-to-root order. Bit `j` of the
 position selects the orientation at level `j`: zero places the current hash on
@@ -282,19 +356,91 @@ whether the body's transaction commitments match the admitted header. Coding
 verification does not establish consensus validity and MUST NOT substitute for
 that validation.
 
-## 3. Lanes and route state
+## 3. Seeds, push, and route state
 
-### Entry peers and lanes
+### Seeds
 
-An entry peer is a peer of the proposer that `entry_peers` lists. With
-`R = len(entry_peers)`, wire index `i` belongs to the lane of entry peer
-`entry_peers[i mod R]`. A lane is identified by its entry peer's `NodeId`
-alone. Lanes are shared across proposers: two proposers that list the same
-entry peer feed the same lane.
+A seed is a part the proposer sends a neighbour unasked. The proposer builds
+its seed plan when the block is solved, from its live sessions and path
+estimates (decision-19, section 7). After it queues `HeaderMeta` and
+`BlockDone` to a neighbour, it writes a `Have` with the push flag on that
+neighbour's data stream, then the parts it flags. The relay flag marks the
+neighbour's _pushed seeds_: the deal-1 seeds the neighbour pushes onward. The
+neighbour that receives a part as a pushed seed is that part's _holder_.
+deal-2 cover copies and direct copies carry the push flag only. Relay-flagged
+seeds go first. A flagged `Have` lists at most `MAX_HAVE_INDICES` indices, so
+a longer batch goes out as several flagged `Have`s, each ahead of its own
+parts. The proposer skips an index that the neighbour announced or sent, or
+that the proposer already flagged or sent on the connection, and every index of
+a stripe or block the neighbour finished. It sends no unflagged `Have`.
 
-The proposer sends each part of its block exactly once, to the part's entry
-peer. The entry peer forwards it. Every other node obtains a lane's parts from a
-parent that pushes them, or by pulling parts that its neighbours announce.
+The flag travels on the same ordered stream as the parts, so it always
+reaches the neighbour before them, even when the proposer's `HeaderMeta` is
+still in flight on the control stream. A neighbour that admitted the block from
+another peer's `HeaderMeta` therefore accepts the proposer's seeds at once.
+
+Two hops push. The proposer pushes seeds to its neighbours, and each holder
+pushes its pushed seeds to its own peers. Every later hop pulls parts that its
+neighbours announce. On a full mesh the two pushed hops reach every node.
+Pulls fill what they miss, such as sparse topologies and lost holders.
+
+A neighbour holds flagged seeds as pending claims, like any flagged push
+below. Each late seed is released to the other announcers once. The proposer's
+session end releases its pending seeds.
+
+### Holder push
+
+A holder pushes each of its pushed seeds once it holds a verified copy of the
+part from any source, including a part it regenerated from a checked stripe
+(decision-24). It pushes the part once to each peer that meets all of these
+conditions:
+
+- the peer exchanged `HeaderMeta` for the block with the holder;
+- the peer is not the block's proposer;
+- the peer has not announced the part, sent it, or reported `StripeDone` for
+  its stripe or `BlockDone` for the block.
+
+The forwarding skip rules in section 6 also apply. The holder first writes a
+`Have` with the push flag that lists the indices it will push to the peer. It
+then writes those parts behind the flagged `Have` on the same data stream. The
+flag therefore arrives before its parts, and the receiver authorizes each
+pushed part from the `Part` prefix alone. The flagged `Have` also announces the
+parts, so the holder sends no second `Have` for them.
+
+A node other than the proposer MUST flag and push only its own pushed seeds,
+whichever source delivered them. It MUST NOT push any other part. It MUST NOT
+flag more than `n - k` indices of one stripe on one connection, and it MUST NOT
+set the relay flag. It MUST NOT flag an index that it already announced on the
+connection; a pushed seed learned after its unflagged `Have` went out is not
+pushed to that peer. A flagged `Have` lists at most
+`MAX_HAVE_INDICES` indices, so a longer push goes out as several flagged
+`Have`s, each ahead of its own parts. When the peer announces or sends a part
+before its queued push is written, the holder skips the write.
+
+A receiver counts flags per stripe of an admitted block per connection when it
+reads the flagged `Have`. Its _push bound_ on a connection is `n` distinct
+indices per stripe from the connection authenticated as `proposer_node`, whose
+seeds carry its proof of work, and `n - k` from any other connection. Relay
+flags count separately, at most `n - k` per stripe, and only from
+`proposer_node`. Each of these returns `Disconnect` (close-20):
+
+- a push flag past the connection's push bound;
+- a relay flag from a connection other than `proposer_node`;
+- a relay flag past `n - k` in one stripe.
+
+Any peer MAY push within its bound. Recognizing a miner mesh gateway grants
+nothing more. `n - k` is the most parts one holder can lose without stalling a
+stripe. At W2 with a 2 MB block, it is 22 parts, about 0.7 MB per stripe per
+connection. The receiver's relay-flagged indices become its pushed seeds.
+
+The receiver holds flagged indices as pending claims: it does not pull them
+until they turn late, and it releases a late push like a late pull (section
+7). Each flagged `Have` starts its own late time from its own estimated
+arrival, so a later flag never delays an earlier one. A pushed part that crosses another peer's copy of the same index returns
+`Drop` as surplus.
+
+BPv1 defines no lanes. The subscription rules below use lanes and
+apply only to the subscription extension.
 
 ### Subscriptions
 
@@ -364,8 +510,8 @@ admitted block `b` is wanted from peer `p` when at least one of these holds:
    `Live` or `Draining`. A proposer subscription contains every lane.
 2. A live `Want` sent to `p` for `b` has `i` in its allowed set and unspent
    count.
-3. `p` is `b`'s `proposer_node`, and this node is the entry peer of `i`'s lane.
-   This is the seed slot.
+3. `p` sent a `Have` for `b` with the push flag that lists `i`. The proposer's
+   seeds and direct copies arrive this way.
 
 Each wanted part is wanted once from each peer. The receive record holds, per
 peer and block, every index received from that peer. A second copy of
@@ -387,8 +533,7 @@ or retired block: `Refuse` with reason `UnknownBlock` for a block subscription,
 and `WantEnd` with `sent = 0` for a `Want`.
 
 **Unknown blocks.** Another message can name a `block_id` that this node has not
-admitted: its metadata is still in flight or under admission, the peer admitted
-another variant, the peer runs more than `PROPAGATION_DEPTH` blocks behind, or
+admitted: its metadata is still in flight or under admission, the peer runs more than `PROPAGATION_DEPTH` blocks behind, or
 the peer is lying. The receiver cannot yet check such a message.
 
 - On the data stream, the receiver holds `Part` and `Have` messages in a
@@ -404,8 +549,19 @@ the peer is lying. The receiver cannot yet check such a message.
 When the block is admitted, the receiver replays the held messages through the
 ordinary checks. A replayed part that is no longer wanted returns `Drop`,
 because the subscription state can change between arrival and replay. Entries
-that reach `EARLY_AGE` return `Drop`. When the node retires a block's variants
-after a conflict, it drops the entries held for every variant of that block.
+that reach `EARLY_AGE` return `Drop`.
+
+A flagged `Have` that leaves the early record without replay, because the
+record was full, the entry aged out, or the metadata was rejected, leaves its
+parts behind it on the stream. The receiver remembers that it lost this
+peer's flags for the block, in a per-peer set bounded like pending metadata.
+After admission, a part from that peer that no push slot or `Want` authorizes
+opens a push slot itself while its stripe has fewer push slots from the peer
+than the connection's push bound. Past that bound it returns `Disconnect` as
+an unwanted part. Until the stripe reaches the bound, the receiver sends the
+peer no `Want` for it, so a pushed part never answers a `Want`. The push bound
+therefore holds. A lost relay flag is not recovered, so its part does not
+become this node's pushed seed.
 
 **Retired blocks.** A node keeps a retired block's `block_id` while the block's
 height is above `top - PROPAGATION_DEPTH`. When it retires a block, it replaces
@@ -421,20 +577,26 @@ this node's propagation window, so this node never admits it again. A peer that
 still admits it runs far behind; the early record bounds its traffic.
 
 **The bound.** Any peer, honest or not, can send at most one copy of each part
-that this node subscribed to, asked for, or holds a seed slot for. Data-stream
-messages about unknown blocks add at most the per-peer early-record bound per
+that this node subscribed to or asked for, plus the parts the peer flagged
+within its push bound: `n` per stripe from `proposer_node` and `n - k` from any
+other peer, for each admitted block. Data-stream messages about unknown blocks
+add at most the per-peer early-record bound per
 `EARLY_AGE`. Control-stream announcements about unknown or retired blocks are
 small, and their cadence in section 5 records floods. Total receive bytes are
-therefore bounded by this node's own subscriptions and `Want`s over the retained
-blocks, plus the early allowance. A byte budget adds nothing to this bound. A
-per-peer byte budget per block MAY still serve as defence in depth.
+therefore bounded by this node's own subscriptions and `Want`s over the
+retained blocks, `(n - k) × S` pushed bytes per stripe per connection (`n × S`
+from the proposer), and the early allowance. A byte budget adds nothing to
+this bound. A per-peer byte budget per block MAY still serve as defence in
+depth.
 
 ### Node state
 
 Each node maintains these bounded structures:
 
 ```text
-meta[b]                          // admitted metadata, layout, entry peers
+meta[b]                          // admitted metadata and layout
+push_flags[peer][b]              // indices the peer flagged (relay flags apart), or this node flagged to it
+copies[peer][b]                  // as the proposer: direct copies waiting for an idle data writer
 store[b][i]                      // verified or regenerated parts
 receive_record[peer][b]          // indices received from the peer
 send_mark[peer][b]               // indices queued to the peer
@@ -460,14 +622,16 @@ records.
 
 ### Streams
 
-Dogwood is one zakura-network service. Its
+BPv1 is one `zakura-network` service. Its
 [service session](../design/service-sessions.md) has two persistent ordered
-streams:
+streams carrying seven messages (`decision-13`):
 
-- The **control stream** carries `HeaderMeta`, `Subscribe`, `Unsubscribe`,
-  `Want`, `StripeDone`, `BlockDone`, and `Advert`.
-- The **data stream** carries `Part`, `Have`, `Refuse`, `WantEnd`, and
-  `SubscriptionEnd`.
+- The **control stream** carries `HeaderMeta`, `Want`, `StripeDone`, and
+  `BlockDone`.
+- The **data stream** carries `Part`, `Have`, and `WantEnd`.
+
+`Subscribe`, `Unsubscribe`, `Refuse`, `SubscriptionEnd`, and `Advert` from
+revision 2 are omitted in BPv1 (`decision-13`).
 
 The control stream MUST have higher write priority than the data stream. Data
 queues MUST NOT block control traffic.
@@ -475,19 +639,17 @@ queues MUST NOT block control traffic.
 The two streams impose no order on each other. The protocol places each message
 by the ordering it needs:
 
-- **Ends travel behind parts.** `SubscriptionEnd` and `WantEnd` follow, on the
-  FIFO data stream, every part their exchange authorized. No part of an ended
-  subscription or `Want` can follow its end. The receiver can therefore close
-  the authorization exactly when it reads the end.
-- **Haves travel behind parts.** A `Have` queues behind the data already waiting
-  on the link. Its arrival time carries the sender's queue, which the learner in
-  section 7 measures.
+- **Ends travel behind parts.** `WantEnd` follows, on the FIFO data stream,
+  every part its `Want` exchange authorized. No part of an ended `Want` can
+  follow its `WantEnd`. The receiver closes the reservation exactly when it
+  reads `WantEnd`.
+- **Haves travel behind parts.** A `Have` queues behind data already waiting on
+  the link so announcements reflect sender queue drain.
+- **Push flags travel ahead of their parts.** A `Have` with the push flag
+  queues before every part it flags, so a pushed part never overtakes its
+  authorization.
 - **Stop signals overtake parts.** `StripeDone` and `BlockDone` travel on the
   control stream so they reach the sender before its queued parts drain.
-- **Refusals travel ahead of ends.** `Refuse` and `SubscriptionEnd` share the
-  data stream, so a subscriber always reads a subscription's `Refuse` before its
-  `SubscriptionEnd`. A refusal ends nothing: parts already queued stay wanted
-  until the `SubscriptionEnd` that answers the subscriber's `Unsubscribe`.
 
 A message can arrive before the metadata of the block it names. Section 3's
 early record handles that case.
@@ -496,22 +658,17 @@ early record handles that case.
 
 The service declares one message table per stream, as the
 [message regulation design](../design/peer-message-regulation.md#message-tables)
-describes. Payload caps below are W2 values.
+describes. Payload caps below are W2 values (`01-wire.md` §1).
 
 | Discriminator | Message | Stream | Role | Answers or ends | Payload cap |
 | --- | --- | --- | --- | --- | --- |
-| 1 | `HeaderMeta` | control | Announcement | — | 29,868 |
-| 2 | `Subscribe` | control | Subscription open | — | 8,195 |
-| 3 | `Unsubscribe` | control | Subscription close | — | 8,195 |
-| 4 | `Want` | control | Request | — | 53 |
+| 1 | `HeaderMeta` | control | Announcement | — | 2,006,278 |
+| 4 | `Want` | control | Request | — | 51 |
 | 5 | `StripeDone` | control | Announcement | — | 36 |
 | 6 | `BlockDone` | control | Announcement | — | 32 |
-| 7 | `Advert` | control | Announcement | — | 9,218 |
-| 8 | `Part` | data | Response | Answers `Subscribe`, `Want`, or the seed slot | 66,085 |
-| 9 | `Have` | data | Announcement | — | 16,418 |
-| 10 | `Refuse` | data | Subscription update | Refuses `Subscribe` | 8,196 |
+| 8 | `Part` | data | Item | Answers `Want` or a push flag | 66,085 |
+| 9 | `Have` | data | Announcement | — | 16,419 |
 | 11 | `WantEnd` | data | Response | Ends `Want` | 7 |
-| 12 | `SubscriptionEnd` | data | Response | Answers `Unsubscribe`; ends the subscription | 8,195 |
 
 ### Results and filter order
 
@@ -539,22 +696,21 @@ and produces a bounded diagnostic record.
 
 ## 5. Message rules
 
-The following limits apply to every Dogwood message:
+The following limits apply to every BPv1 message:
 
 ```text
-S                  = 65,536 bytes
+S_MIN; S_MAX       = 4,096; 65,536 bytes; S is per block (section 2)
 STRIPE_K           = 64
 MAX_N              = 86          // STRIPE_K + ceil(STRIPE_K / 3)
 MAX_STRIPES        = 512
 MAX_PARTS          = 44,032      // MAX_STRIPES * MAX_N
 MAX_PROOF_DEPTH    = 16          // log2(128) + log2(512)
-MAX_ENTRY_PEERS    = 255
 MAX_HAVE_INDICES   = 4,096
 MAX_WANTS_INFLIGHT = 64          // live Wants per connection direction
 MAX_OPEN_SUBS      = 1,024       // subscriptions outside Idle per connection direction
 PROPAGATION_DEPTH  = 16          // blocks below the highest admitted height
 MAX_HEADER_BYTES   = 4,096
-MAX_BINDING_BYTES  = 17,413
+MAX_BINDING_BYTES  = 2,002,086   // coinbase up to MAX_BLOCK_BYTES
 ```
 
 `StripeDone`, `BlockDone`, and `Advert` that name an unknown or retired block
@@ -563,7 +719,7 @@ charge one per-connection announcement bucket: capacity = 256 messages, refill
 are therefore visible without risking an honest peer.
 
 A scope encodes as `u8(0)` for `Standing`, `u8(1) || block_id[32]` for `Block`,
-or `u8(2)` for `Proposer`. A lane encodes as its entry peer's 32-byte `NodeId`.
+or `u8(2)` for `Proposer`. In the subscription extension a lane encodes as a 32-byte `NodeId`.
 Section 8 lists every field in transmission order.
 
 ### Control stream
@@ -571,13 +727,11 @@ Section 8 lists every field in transmission order.
 #### `HeaderMeta` — Announcement, discriminator 1
 
 - **Frame**
-  - payload cap = 29,868 bytes
+  - payload cap = 2,006,278 bytes
 - **Decode**
   - header length = 1..=4,096 bytes
-  - binding length = 1..=17,413 bytes
-  - codec = W2 codec identifier; `part_bytes = S`
-  - entry-peer count = 1..=255
-  - entry peers unique; none equals `proposer_node`
+  - binding length = 1..=2,002,086 bytes
+  - codec = W2 codec identifier; `part_bytes = S` for `body_bytes` (section 2)
   - exact consumption
 - **Verify**
   - `stripes`, `k`, and `n` equal the values recomputed from `body_bytes`
@@ -588,120 +742,52 @@ Section 8 lists every field in transmission order.
 - **Admission**, in this order
   - headerchain admits the header, including proof of work and contextual
     difficulty
-  - the key-binding path matches the admitted header's transaction root
-  - the strict Ed25519 signature verifies over the section 8 transcript
-  - at most one variant per block hash
+  - the binding's txid and auth-data paths match the admitted header
+  - the coinbase holds exactly one version-01 commitment, and its `C` equals
+    the recomputed hash (section 2)
 - **Cadence**
-  - at most one `HeaderMeta` per variant per connection
+  - at most one `HeaderMeta` per block per connection
   - capacity = 64 messages; refill = 16 messages/s; on_empty = record and
     forward
-  - headerchain's per-peer pending-header bounds
+  - the per-peer and node-wide pending-metadata bounds in section 1
 
-A node MUST send `HeaderMeta` for a variant at most once per connection. It
+A node MUST send `HeaderMeta` for a block at most once per connection. It
 MUST forward only metadata it admitted, and only within the propagation window
 in section 2. It SHOULD forward admitted metadata promptly to every peer, including peers without subscriptions. Forwarding MUST NOT wait
 for parts or a per-hop request. It SHOULD NOT send metadata to a peer that
-already sent it the same variant. The proposer SHOULD write `HeaderMeta` to
+already sent it the block's metadata. The proposer SHOULD write `HeaderMeta` to
 every peer before it writes any part.
 
 A header that headerchain rejects returns `Disconnect` when headerchain
 classifies the failure as peer-caused. A missing parent invokes bounded
-recovery and is not a violation. A layout mismatch, invalid binding, or invalid
-signature returns `Disconnect`: an honest relay forwards only admitted
-metadata. A repeat of a variant from the same peer returns `Disconnect` while
-this node keeps the variant admitted or retired. The sender keeps the variant
+recovery and is not a violation. A layout mismatch, invalid binding, or failed
+commitment returns `Disconnect`: an honest relay forwards only admitted
+metadata. A repeat of a block's metadata from the same peer returns `Disconnect`
+while this node keeps the block admitted or retired. The sender keeps the block
 retired at least until the block leaves its own window, and it never admits a
-block outside that window, so it cannot send the variant twice. An exact
-duplicate from another peer returns `Drop`. A second distinct authenticated
-variant returns `Drop` and triggers the conflict
-rule in section 2; the node then retires every variant of the block. Metadata
+block outside that window, so it cannot send the metadata twice. The header
+commits the coinbase, and the coinbase commits `C`, so a block has one valid
+`HeaderMeta`. A duplicate from another peer returns `Drop`. Metadata
 for a retired block, or for a block outside the propagation window, returns
 `Drop`.
 
-After admission, a node that appears in `entry_peers` wants its seed slot from
-`proposer_node` under section 3.
-
-#### `Subscribe` — Subscription open, discriminator 2
-
-- **Frame**
-  - payload cap = 8,195 bytes
-- **Decode**
-  - scope tag 0, 1, or 2
-  - lane count = 1..=255, or 0 exactly when the scope is `Proposer`
-  - lanes unique
-  - exact consumption
-- **Reservation**, at the publisher
-  - each `(scope, lane)` is not currently held
-  - held subscriptions per connection <= `MAX_OPEN_SUBS`; the publisher serves
-    and traces up to twice that limit and returns `Disconnect` beyond it
-- **Capacity**
-  - each held subscription reserves output for one `Refuse` and one
-    `SubscriptionEnd`
-  - the publisher's accept limit may be lower than `MAX_OPEN_SUBS`; above it,
-    the publisher refuses
-- **Cadence**
-  - capacity = 64 messages
-  - refill = 32 messages/s
-  - on_empty = record and forward, as the regulation design requires
-
-The publisher MUST accept or refuse each listed lane when it processes the
-message. It MAY refuse any lane for local policy, including its child budget
-in section 7. Refusal is never a violation. It MUST refuse a block subscription
-for a block it has not admitted or has retired. It answers every refused lane
-in one `Refuse`.
-
-An accepted subscription authorizes the publisher to push each part of the
-lane that it holds or later verifies, once, for every covered block. The
-publisher MAY skip any part. The protocol imposes no push deadline. A slow
-publisher is a routing problem for the subscriber's learner, not a violation.
-
-A `Subscribe` for a `(scope, lane)` that the publisher holds returns
-`Disconnect`. The subscriber sends `Subscribe` only in `Idle`, which it reaches
-only by reading `SubscriptionEnd`. The publisher forgets a subscription when it
-writes that `SubscriptionEnd`. The same ordering bounds the held count: a
-conformant subscriber never has more than `MAX_OPEN_SUBS` subscriptions that the
-publisher still holds.
-
-#### `Unsubscribe` — Subscription close, discriminator 3
-
-- **Frame**
-  - payload cap = 8,195 bytes
-- **Decode**
-  - same as `Subscribe`
-- **Reservation**, at the publisher
-  - each `(scope, lane)` is held, accepted or refused
-- **Capacity**
-  - processing MUST NOT wait for serving workers or data-output capacity; the
-    held subscription already reserved its `SubscriptionEnd` output
-
-For each accepted `(scope, lane)`, the publisher MUST stop queueing the lane's
-parts under that scope. It MUST cancel queued unsent parts that no other
-authorization covers. Cancellation keeps their send marks. For every listed
-`(scope, lane)`, accepted or refused, it MUST then write one `SubscriptionEnd`
-behind every part it already queued for the subscription. It MAY end several
-subscriptions in one `SubscriptionEnd` when it writes that message after all
-their parts.
-
-A `(scope, lane)` that the publisher does not hold returns `Disconnect`. The
-subscriber sends exactly one `Unsubscribe` per `Subscribe`, and the publisher
-holds every subscription until that `Unsubscribe` arrives.
+`HeaderMeta` authorizes no parts. The proposer's flagged `Have`s on the data
+stream authorize its seeds (section 3).
 
 #### `Want` — Request, discriminator 4
 
 - **Frame**
-  - payload cap = 53 bytes
+  - payload cap = 51 bytes (`want_id: u32 || block_id: [u8; 32] || stripe: u32 || requested: [u8; 11]`, `decision-14`)
 - **Decode**
   - `want_id != 0`
-  - `count >= 1`
-  - allowed bitmap = 11 bytes; bits at or above `MAX_N` are zero
-  - `count <= popcount(allowed)`
+  - `requested` bitmap = 11 bytes; bits at or above `MAX_N` are zero; popcount >= 1
   - exact consumption
 - **Verify**, when the server has admitted the block
   - `stripe < stripes`
-  - allowed bits at or above `n` are zero
+  - `requested` bits at or above `n` are zero
 - **Reservation**, at the server
   - `want_id` differs from every live `Want` on this connection
-  - the allowed set is disjoint from every live `Want` for the same block and
+  - the requested set is disjoint from every live `Want` for the same block and
     stripe on this connection
   - live `Want`s <= `MAX_WANTS_INFLIGHT`; the server serves and traces up to
     twice that limit and returns `Disconnect` beyond it
@@ -709,32 +795,27 @@ holds every subscription until that `Unsubscribe` arrives.
   - the serving task acquires output capacity before it produces parts
   - the reader admits the request as a commitment without waiting
 
-A `Want` asks for up to `count` parts of one stripe, chosen by the server from
-the allowed set. The requester MUST create the reservation before it sends the
-request. The requester MUST keep live `Want`s at one peer disjoint for each
-block and stripe. It SHOULD give disjoint allowed sets to different servers, so
-two servers do not send the same index.
+A `Want` asks for the exact set of parts marked in `requested` for one stripe
+(`decision-14`: no separate `count` field). The requester MUST create the
+reservation before it sends the request and keep live `Want`s at one peer
+disjoint for each block and stripe.
 
 The server MUST end every admitted `Want` exactly once with `WantEnd` on the
-data stream, behind the parts it sent for that `Want`. It MUST send at most
-`count` parts. Each part MUST come from the allowed set and MUST obey
-send-once. It serves the parts it holds when it processes the request,
-including regenerated parts of checked stripes. It does not wait for later
-parts; a block subscription serves that purpose. It SHOULD send data parts
-before parity parts. It SHOULD skip parts that the requester announced. It MAY
-send fewer than `count` parts, including none. A `Want` for a block the server
-has not admitted or has retired ends with `sent = 0` and the matching reason.
+data stream, behind the parts it sent for that `Want`. Each part MUST come from
+`requested` and MUST obey send-once. It serves the parts it holds when it
+processes the request, including regenerated parts of checked stripes, and MAY
+send fewer than `popcount(requested)` parts, including none. A `Want` for a
+block the server has not admitted or has retired ends with `sent = 0` and the
+matching reason.
 
-An out-of-range stripe or allowed bit returns `Disconnect`. The requester knows
-the layout because it admitted the metadata. A reused live `want_id`, an
-overlapping live allowed set, or more than twice `MAX_WANTS_INFLIGHT` live
-`Want`s returns `Disconnect`. A conformant requester sends a new `Want` only
-after it reads the previous one's end, and the server releases a `Want` when it
-writes that end.
+An out-of-range stripe or requested bit returns `Disconnect`. A reused live
+`want_id`, an overlapping live requested set, or more than twice
+`MAX_WANTS_INFLIGHT` live `Want`s returns `Disconnect`.
 
 A requester that no longer needs the parts keeps the reservation live until
-`WantEnd` or session retirement. A local pull timeout MAY send another `Want`
-to another server. It MUST NOT revoke the first reservation.
+`WantEnd` or session retirement. A local pull timeout (`SLOW_X * estimated` or
+hard deadline `8 s + outstanding_bytes / 100 KB/s`) MAY send another `Want` to
+another server; it MUST NOT revoke the first reservation.
 
 #### `StripeDone` — Announcement, discriminator 5
 
@@ -770,14 +851,16 @@ repair `Want`s, which the sender must still end.
   - at most once per block per connection
 
 `BlockDone` states that the sender assembled the block under section 2, or that
-the sender is the block's proposer. It is terminal and advisory for the block on
+the sender is the block's proposer, so it holds every part (decision-20). It is
+terminal and advisory for the block on
 the connection. The receiver MUST stop queueing parts of the block to the
 sender. It MUST still process control messages and future-block demand from the
 sender. `BlockDone` ends no subscription and no `Want`.
 
 A node SHOULD send `BlockDone` to every peer that knows the block. The proposer
 SHOULD send `BlockDone` right after `HeaderMeta`, so no neighbour forwards the
-block's parts back to it.
+block's parts back to it. A repair round MAY ask a `BlockDone` peer for any part;
+a normal pull asks only announcers.
 
 A repeat returns `Disconnect` while the receiver retains the block's peer view.
 A `BlockDone` for an unknown or retired block follows section 3: the receiver
@@ -787,28 +870,9 @@ A false `BlockDone` stops only the sender's own incoming parts. It can attract
 repair `Want`s, which the sender must still end. It cannot cancel another
 peer's traffic or establish block validity.
 
-#### `Advert` — Announcement, discriminator 7
-
-- **Frame**
-  - payload cap = 9,218 bytes
-- **Decode**
-  - item count = 0..=255
-  - item lanes unique
-  - exact consumption
-- **Verify**, when the receiver has admitted the block
-  - every item lane appears in the block's `entry_peers`
-- **Cadence**
-  - at most once per block per connection
-
-`Advert` carries the sender's forwarding wait and, per lane, its arrival delay
-for the block. Section 7 defines both values. The receiver keeps each
-peer's adverts for the last `ADV_KEEP` blocks. The values are hints. A
-receiver MUST NOT treat an advertised value as a violation.
-
-An item lane outside the block's entry peers returns `Disconnect`. A repeat
-returns `Disconnect` while the receiver retains the peer's adverts for the
-block. An `Advert` for an unknown or retired block follows section 3, like
-`BlockDone`.
+_(Discriminators 2 `Subscribe`, 3 `Unsubscribe`, 7 `Advert`, 10 `Refuse`, and
+12 `SubscriptionEnd` are reserved / omitted in revision-3 BPv1 seeded pull;
+`decision-13`.)_
 
 ### Data stream
 
@@ -818,13 +882,16 @@ block. An `Advert` for an unknown or retired block follows section 3, like
   - payload cap = 66,085 bytes
 - **Decode**
   - sibling count <= `MAX_PROOF_DEPTH`
-  - payload = exactly `S` bytes after the siblings
+  - payload = the bytes after the siblings, at most `S_MAX`
   - exact consumption
 - **Reservation precheck**, on the fixed prefix `(block_id, index)`
   - an unknown block goes to the data-stream early record
   - a retired block spends the peer's retired part counter and returns `Drop`;
     an exhausted counter returns `Disconnect`
   - `index < stripes * n`
+  - the frame's payload length equals the fixed prefix, `depth` siblings, and
+    `wire_len(index)` bytes; the frame header gives it before any payload byte
+    is read
   - `index` is absent from the peer's receive record; the node records it
   - `index` is wanted from the peer; the node spends a `Want`'s count when
     section 3 attributes the part to a `Want`
@@ -834,8 +901,8 @@ block. An `Advert` for an unknown or retired block follows section 3, like
 
 The sender MUST send a part only when the receiver wants it: a subscription it
 accepted and has not ended covers it, a live `Want` from the receiver allows it
-with count left, or the sender is the block's proposer and the receiver is the
-part's entry peer. The sender MUST mark a part as sent when it queues it, across
+with count left, or the sender flagged the part for push in a `Have` on this
+connection. The sender MUST mark a part as sent when it queues it, across
 every path. Cancelling a queued part MUST NOT clear the mark. The sender MUST
 NOT send a part to a peer from which it received a valid copy. Section 6 lists
 the other sends a sender skips.
@@ -854,55 +921,61 @@ verification worker pauses reading and is not a violation.
 #### `Have` — Announcement, discriminator 9
 
 - **Frame**
-  - payload cap = 16,418 bytes
+  - payload cap = 16,419 bytes
 - **Decode**
+  - `flags` = `0x00`, `0x01` (push), or `0x03` (push and relay); any other
+    value returns `Disconnect` (close-1)
   - index count = 1..=4,096
   - indices strictly increasing
   - exact consumption
 - **Verify**, when the receiver has admitted the block
   - every index < `stripes * n`
+- **Push flags**, when the receiver has admitted the block, counted across the
+  block's flagged `Have`s on this connection
+  - from `proposer_node`: at most `n` flagged indices per stripe, of which at
+    most `n - k` carry the relay flag
+  - from any other connection: at most `n - k` flagged indices per stripe and
+    no relay flag
 - **Cadence**
   - each `(block_id, index)` at most once per connection
 
 `Have` states that the sender holds verified parts. The sender MUST announce
 only such parts. It SHOULD batch announcements for at most `HAVE_FLUSH_MS` or
-`HAVE_FLUSH_COUNT` indices. It SHOULD announce each verified part to every peer
-that has not reported `StripeDone` for its stripe or `BlockDone` for its block.
-The receiver uses `Have`s to choose pulls, to skip sends, and to measure lag.
+`HAVE_FLUSH_COUNT` indices. The proposer MUST NOT send an unflagged `Have` for
+its own block (decision-20, bpv1-9). The receiver uses `Have`s to choose pulls,
+to skip sends, and to measure lag.
+
+A `Have` with the push flag states that the sender will push the listed parts
+behind it on the data stream (section 3). A holder sets it for its own pushed
+seeds. The proposer sets it for its seeds and direct copies, and adds the relay
+flag to the receiver's pushed seeds. Only the proposer sets the relay flag. The
+flagged `Have` is the only `Have` for those indices on the connection. A sender
+MAY skip a flagged part it has not yet written, when the receiver announced
+or sent it meanwhile; the receiver releases the unfilled flag when it turns
+late and never closes for it.
+
+**Pacing (decision-26).** A node SHOULD NOT announce every part to every peer
+at once. When it admits a block, it picks the block's _initial group_ the way
+main's block gossip does: peers in order of estimated arrival (section 7), with
+every fourth slot taken by a random remaining peer. The group's size is main's
+advertisement window for the block's body size: `advert_window_small_block`
+at or below `advert_window_small_size_bytes`, `advert_window_full_block` at or
+above `advert_window_full_size_bytes`, and linear between. The node announces
+verified parts to the initial group at once. Every other peer becomes eligible
+at admission plus `advert_delay`, and then receives one `Have` of the parts it
+still lacks. At both times the node skips a part that the peer announced or
+sent, and a stripe or block the peer finished. Flagged `Have`s, seeds, and
+repair are not paced.
 
 An out-of-range index or a repeated index returns `Disconnect` while the
-receiver retains the block's peer view. A `Have` for an unknown block enters the
-data-stream early record, and a `Have` for a retired block spends the peer's
-retired index counter, under section 3. A false `Have` attracts `Want`s that the sender must still end; it
-cannot force the receiver to accept parts.
-
-#### `Refuse` — Subscription update, discriminator 10
-
-- **Frame**
-  - payload cap = 8,196 bytes
-- **Decode**
-  - scope and lanes as in `Subscribe`
-  - reason = `Capacity`, `UnknownBlock`, `Policy`, or `Shed`
-  - exact consumption
-- **Reservation**, at the subscriber
-  - each `(scope, lane)` is `Live` or `Draining`
-  - at most one `Refuse` per subscription
-
-The publisher sends `Refuse` when it declines a new subscription or stops
-pushing an accepted one (`Shed`). After `Refuse`, it queues no new parts under
-the subscription. It still holds the subscription until `Unsubscribe` arrives.
-
-A subscriber that reads `Refuse` in `Live` MUST send `Unsubscribe`. Parts
-already queued stay wanted until the resulting `SubscriptionEnd`.
-
-A `(scope, lane)` in `Idle`, or a second `Refuse` for one subscription,
-returns `Disconnect`. The publisher refuses only a subscription it holds, at
-most once, and the subscriber stays outside `Idle` until the publisher writes
-the subscription's `SubscriptionEnd`.
-
-After a refusal, the subscriber SHOULD avoid that publisher for the lane for
-`BAN_STEPS` learning steps. A later `Subscribe` after `SubscriptionEnd` is
-legal.
+receiver retains the block's peer view. A push flag past the connection's
+push bound, a relay flag from a connection other than `proposer_node`, or a
+relay flag past `n - k` in one stripe returns `Disconnect` (close-20). A
+`Have` for an unknown block enters the data-stream early record, and a `Have`
+for a retired block spends the peer's retired index counter, under section 3. A false unflagged `Have` attracts `Want`s that the
+sender must still end; it cannot force the receiver to accept parts. A false
+flagged `Have` authorizes at most the connection's push bound per stripe, and
+each part must still be a distinct index that verifies against `part_root`.
 
 #### `WantEnd` — Response, discriminator 11
 
@@ -913,7 +986,7 @@ legal.
   - exact consumption
 - **Reservation**, at the requester
   - `want_id` names a live `Want`
-  - `sent <= count`
+  - `sent <= popcount(requested)`
   - `sent >=` the parts this node attributed to the `Want`
   - consumes the reservation
 
@@ -923,29 +996,16 @@ and section 3's attribution never counts more answers than the server sent.
 After `WantEnd`, the requester MAY ask another server for the parts it still
 lacks.
 
-#### `SubscriptionEnd` — Response, discriminator 12
-
-- **Frame**
-  - payload cap = 8,195 bytes
-- **Decode**
-  - scope and lanes as in `Subscribe`
-  - exact consumption
-- **Reservation**, at the subscriber
-  - each `(scope, lane)` is `Draining`
-  - consumes the subscription: the state becomes `Idle`
-
-A `(scope, lane)` outside `Draining` returns `Disconnect`. The publisher writes
-`SubscriptionEnd` only in answer to `Unsubscribe`, once per subscription. After
-`SubscriptionEnd`, a part of that lane under that scope is unwanted unless
-another authorization covers it.
-
 ## 6. Forwarding, completion, and recovery
 
 ### Forwarding
 
 When a node verifies a new part, it MUST store the part within assembly bounds.
-It SHOULD queue the part for every peer with an accepted subscription that
-covers the part, except peers that it MUST or SHOULD skip:
+If the part is one of its pushed seeds, from any source or regenerated from a
+checked stripe, it SHOULD queue the part for every peer that section 3's
+holder push rule names. In the subscription extension, it
+SHOULD queue the part for every peer with an accepted subscription that covers
+the part. In both cases it skips the peers that it MUST or SHOULD skip:
 
 - It MUST skip a peer from which it received a valid copy of the part.
 - It MUST skip a peer whose send mark already holds the part.
@@ -957,12 +1017,12 @@ covers the part, except peers that it MUST or SHOULD skip:
 
 The node checks these rules when it queues a part and again when it writes it.
 Forwarding MUST NOT wait for decoding or for other parts. The node MAY verify
-parts in bounded batches. It also queues a `Have` for the part to every peer
-under section 5.
+parts in bounded batches. It also announces the part to its other peers under
+the pacing in section 5.
 
-The proposer SHOULD send each part of its block exactly once, to the part's
-entry peer, in index order per entry peer. It sends parity parts as well. It
-SHOULD interleave its entry peers, so every lane starts at once. It SHOULD NOT
+The proposer sends each neighbour the seeds its plan gives it (section 7),
+parity parts as well, behind their flagged `Have`s. Its direct copies follow on
+each connection once that connection's data writer is idle. It SHOULD NOT
 push its own block's parts on standing subscriptions. It SHOULD push every part
 of its block on its accepted proposer subscriptions, interleaved with the seed
 parts, until each subscriber's `StripeDone` or `BlockDone` stops it.
@@ -1001,22 +1061,27 @@ window. Ends of `Want`s and subscriptions remain legal.
 
 Recovery follows a fixed ladder. A block's recovery state never moves backward.
 
-1. **Normal path.** Pushed parts and pulls on `Have` fill the stripes (section
-   7).
-2. **Repair.** After `STALL_MS` without a new verified part of the block, the
-   node enters repair. For each undecoded stripe it sends `Want`s for
+1. **Normal path.** Seeds, holder pushes, and pulls on `Have` fill the
+   stripes (section 7). A late seed or flagged push is released like a late
+   pull.
+2. **Repair.** After the stall interval without a new verified part of the
+   block, the node enters repair. The stall interval is `SLOW_X` times one
+   part's estimated arrival through the median path, at least 1 ms
+   (decision-22). The first repair round releases the body claim once, so
+   native block sync races the block; the first commit wins. For each undecoded stripe it sends `Want`s for
    `k - held - pending` parts, with the missing indices split disjointly across
-   peers. Peers that reported `StripeDone` or `BlockDone` and delivered parts of
-   the block come first. Other reporters follow, then peers that announced the
-   indices, then the proposer. Later rounds wait `STALL_MS * STALL_BACKOFF^round`
-   and never ask a peer again for the same index. The node MAY use a block
-   subscription to wait for parts a peer lacks now. Repair ends after
-   `REPAIR_ROUNDS` rounds.
+   peers. A repair round plans over the peers that announced the indices and
+   every peer that sent `BlockDone`, by earliest estimated arrival
+   (decision-20). The proposer is reached through its `BlockDone`. Later rounds wait the stall
+   interval times `STALL_BACKOFF^round`
+   and, within a round, never ask a peer again for the same index. The node MAY
+   use a block subscription to wait for parts a peer lacks now. Rounds repeat
+   until the reconstruction deadline, which is the only bound on repair.
 3. **Block download.** A monotonic reconstruction deadline starts at metadata
-   admission. Partial progress MUST NOT reset it. When the deadline passes, or
-   repair ends without decoding, the node MUST use the existing full-block
-   download path. It MUST verify the result against the admitted header. A
-   metadata conflict or a failed re-encode check goes to this step at once.
+   admission. Partial progress MUST NOT reset it. When the deadline passes, the
+   node MUST use the existing full-block download path. It MUST verify the
+   result against the admitted header. A failed re-encode check goes to this
+   step at once.
 
 The node MUST record the reason and time of each step, the repair bytes, and the
 terminal outcome. Reports MUST exclude block-download completion from
@@ -1033,6 +1098,10 @@ This section defines the baseline routing policy. Peers do not negotiate it.
 Implementations MAY change it within sections 3–6. The parameter registry in
 section 8 holds its values.
 
+BPv1 chooses pull servers, holders, and direct copies by one estimate: the
+arrival time of a part through each peer, from its RTT and bandwidth. Rules
+below that name lanes or parents apply only to the subscription extension.
+
 ### Pull first
 
 Every lane starts with no parent. A lane whose standing parent is the
@@ -1042,10 +1111,26 @@ on a `Have` when all of these hold:
 - the announcer is not the block's proposer;
 - the node neither holds the part nor has a pending pull for it;
 - the part's stripe has not decoded;
-- the node is not the entry peer of the part's lane;
+- the part is not a pending flagged push, the proposer's seeds included;
 - the lane has no parent;
 - the stripe's held and pending parts number fewer than `k`;
-- the announcer has room in its pull window, within the node-wide pull cap.
+- the announcer has room in its pull window, within the node-wide pull cap;
+- the parts committed to the announcer stay within
+  `max(2 parts, 2 × bw × rtt)` (decision-21).
+
+`bw` is the windowed max of the peer's delivery-rate samples and the
+transport's `rate_in`. When a `Want` ends with parts, the node takes one sample:
+
+```text
+transfer = max(t_last − t_sent − min_rtt, t_last − t_first)
+sample   = bytes / transfer
+```
+
+`t_sent` is when the node queued the `Want`; `t_first` and `t_last` are when the
+first and last attributed parts arrived. A sample counts until a later sample,
+one to two `RATE_WINDOW`s on, replaces it, or until the session ends.
+`RATE_WINDOW` is `PROPAGATION_DEPTH` times the target block spacing (20 minutes),
+so the estimate spans many blocks.
 
 A pull is a `Want` whose allowed set holds the announced indices the node still
 lacks. A pull is pending from when the node sends it until its `WantEnd`
@@ -1086,10 +1171,12 @@ the block. The step waits up to `ADV_WAIT_MS` for its candidates' `Advert`s.
 
 ### Arrival delays and cycle avoidance
 
-A node's arrival delay for a lane in a block is the median time from
-`created_ms` to the first arrival of each of the lane's sampled parts. Parts
-that the node regenerates count at decode time. The node advertises its arrival
-delays and its forwarding wait in `Advert`. The forwarding wait is its queued
+A node's arrival delay for a lane in a block is the median time from the
+block's creation to the first arrival of each of the lane's sampled parts.
+BPv1's `HeaderMeta` carries no creation time, so the subscription extension
+MUST define that reference again. Parts that the node regenerates count at
+decode time. The node advertises its arrival delays and its forwarding wait in
+`Advert`. The forwarding wait is its queued
 bytes over an EWMA of its egress rate.
 
 A candidate parent for a lane is a neighbour that is not the block's proposer,
@@ -1117,31 +1204,80 @@ raw lag plus that candidate's round-trip time plus `DEMOTE_MS`. After
 returns to pull.
 
 When the standing parent of a lane is the current block's proposer, the node
-subscribes for this block to the best-ranked other candidate. Without one, it
-subscribes to the entry peer itself when the entry peer is a neighbour.
+subscribes for this block to the best-ranked other candidate.
 
 ### Push where cheap
 
 A publisher bounds its accepted standing subscriptions with a child budget. The
-budget counts each accepted lane at its share of a block: `1/R`, where `R` is
-the entry-peer count of the most recent admitted block that listed the lane. It
-sums the shares across children. A publisher refuses a
+budget counts each accepted lane at its share of a block and sums the shares
+across children. The subscription extension defines the share when it defines lanes. A publisher refuses a
 subscription that would exceed `CHILD_BUDGET` blocks. Because lanes are shared
 across proposers, the budget binds per node, not per proposer. Proposer
 subscriptions do not count toward the child budget; a publisher accepts at most
 `MAX_PROPOSER_SUBS` of them and SHOULD prefer peers that its operator configured
 as miners.
 
-### Entry-peer selection
+### Seed plan
 
-The proposer SHOULD choose its entry peers from its neighbours by measured
-minimum round-trip time. It keeps the neighbours whose minimum is at most
-`ENTRY_RTT_X` times the median minimum of its neighbours with a sample. It drops
-neighbours without a sample when any sample exists. Among the kept neighbours,
-it SHOULD prefer outbound and operator-configured peers, take at most one per
-network group, and choose at random rather than by lowest round-trip time. It
-lists at most `MAX_ENTRY_PEERS` entry peers in any order. Lanes are keyed by
-entry peer, so the order does not disturb learned routes.
+The proposer builds the seed plan when the block is solved (decision-19). The
+plan builds a focused broadcast tree. Its objective is the median, the mean,
+and the `t90` of the time each node takes to receive the block. It does not
+weight nodes by hash power, and miner mesh status changes no deal.
+
+A neighbour is eligible when its estimated arrival of an even share of the
+body, `rtt + share / rate_out`, is within `SLOW_X` times the median. A
+neighbour's _seed arrival_ is the estimated arrival of its seeds so far through
+the proposer's queue, using `rate_out`. A holder's push is the second hop. It
+finishes when the holder's slowest path delivers its last pushed part:
+
+```text
+finish(H)          = seed_arrival(H) + rtt(H) + pushed_bytes(H) / push_rate(H)
+push_arrival(H, i) = seed_arrival(H) + rtt(H) + pushed_bytes_through(H, i) / push_rate(H)
+```
+
+`pushed_bytes(H)` counts the pushed seeds the plan has given `H`, including the
+next one. `pushed_bytes_through(H, i)` counts them up to part `i` in `H`'s push
+order. `push_rate(H)` is the rate at which `H` delivers one copy of each pushed
+part to its slowest peer. The proposer cannot see `H`'s paths, so its own
+`rate_in` from `H` stands in. Experiments decide whether holders later report
+their own estimate. Whatever the source, the even-share cap below bounds what
+a holder that overstates its rate can withhold.
+
+The plan runs three deals:
+
+1. deal-1 gives every non-padding part once, as a pushed seed, to the eligible
+   neighbour with the earliest `finish(H)`. A neighbour takes at most
+   `cap = min(n - k, ceil(real / eligible))` pushed seeds of a stripe, where
+   `real` counts the stripe's non-padding parts and `eligible` the eligible
+   neighbours. Under the cap, holders with fast paths take their share first.
+   The even share means that any `floor((n - k) / cap)` holders that withhold
+   their pushes take at most `n - k` parts of a stripe, so the other holders
+   still push `k`, counting padding. With fewer than `ceil(real / (n - k))`
+   eligible neighbours, a part left once every neighbour is at its cap goes to
+   the neighbour with the earliest seed arrival with the push flag only, so
+   nobody pushes it onward.
+2. deal-2 copies parts, with the push flag only, to the next-earliest neighbour while
+   losing any one neighbour would leave a stripe below `k` parts at the others
+   (bpv1-67). Padding counts as held.
+3. deal-3 lists direct copies. A neighbour may get a direct copy of any part
+   it lacks while it holds fewer than `k` of the stripe's parts. A neighbour's
+   copies go latest `push_arrival` first; a part nobody pushes counts as latest.
+   The neighbours go closest first, by their seed arrival.
+
+A direct copy carries the push flag only, so it never starts a second holder
+push. A direct copy can cross the holder push of the same part; the receiver
+drops the second copy as surplus.
+
+The proposer queues each neighbour's deal-1 and deal-2 seeds after its
+`HeaderMeta`. It releases that neighbour's direct copies once the
+connection's data writer has nothing queued or in flight, so they follow the
+neighbour's own seeds and wait for no other connection. Each release takes up
+to `COPY_BATCH` copies behind one push-flagged `Have`. Before each copy the
+proposer drops it when the neighbour announced, sent, or was sent the part,
+reported `StripeDone` for its stripe or `BlockDone` for the block, or can
+already decode the stripe (section 6). These checks, not a budget, stop the
+copies. The writer counts a frame as written once the transport queues it, so
+the transport's send buffer delays the feedback that stops copies.
 
 ### Evaluate block outcomes
 
@@ -1169,53 +1305,34 @@ fields, trailing bytes, and lengths above these bounds before allocation.
 
 | W2 limit | Value |
 | --- | --- |
-| `S`; `STRIPE_K`; `parity_parts(k)`; codec identifier | 65,536 bytes; 64; `ceil(k / 3)`; 2 |
+| `S_MIN`; `S_MAX`; `ALIGN`; `STRIPE_K`; `parity_parts(k)`; codec identifier | 4,096 bytes; 65,536 bytes; 64; 64; `ceil(k / 3)`; 2 |
 | `MAX_STRIPES`; `MAX_PARTS`; maximum proof depth | 512; 44,032; 16 siblings |
-| Maximum body | 2 GiB (`MAX_STRIPES * STRIPE_K * S`), and never above `MAX_BLOCK_BYTES` |
-| `MAX_ENTRY_PEERS`; `MAX_HAVE_INDICES`; `MAX_WANTS_INFLIGHT` | 255; 4,096; 64 |
-| Header bytes; key-binding bytes | 4,096; 17,413 |
-| Coinbase bytes; coinbase Merkle siblings | 16,384; 32 |
-| Control-stream frame cap; data-stream frame cap | 29,868 bytes; 66,085 bytes |
+| Maximum body | 2 GiB (`MAX_STRIPES * STRIPE_K * S_MAX`), and never above `MAX_BLOCK_BYTES` |
+| `MAX_HAVE_INDICES`; `MAX_WANTS_INFLIGHT` | 4,096; 64 |
+| Pushed seeds per stripe per holder; flagged indices per stripe per connection | `min(n - k, ceil(real / eligible))`; `n` from `proposer_node`, of which `n - k` relay, and `n - k` from any other peer |
+| Header bytes; key-binding bytes | 4,096; 2,002,086 |
+| Coinbase bytes; coinbase Merkle siblings | `MAX_BLOCK_BYTES` (the consensus bound); 32 |
+| Control-stream frame cap; data-stream frame cap | 2,006,286 bytes; 66,085 bytes |
 
 These are syntax limits, not assembly reservations or performance guarantees.
 The profile MUST impose lower admission bounds where consensus or node-wide work
 budgets require them.
 
-#### Hashes, commitments, and signatures
+#### Hashes and commitments
 
 Define `T(name, bytes)` as BLAKE3 in key-derivation mode with the context string
-`"Zakura Dogwood 2 " + name`. Define the 26-byte coding tuple:
+`"Zakura BPv1 " + name` (decision-25). Define the 30-byte coding tuple:
 
 ```text
-coding = u16(2) || u64(body_bytes) || u32(65536) || u32(stripes) || u32(k) || u32(n)
+coding = u16(2) || u64(body_bytes) || u32(tx_count) || u32(S) || u32(stripes) || u32(k) || u32(n)
 ```
 
-Section 2 defines the tree over this tuple. W2 MUST publish a Merkle-root vector
-together with the codec vectors.
+Section 2 defines the tree and the commitment `C` over this tuple. W2 MUST
+publish a Merkle-root vector together with the codec vectors.
 
-Use pure Ed25519 from [RFC 8032](https://www.rfc-editor.org/rfc/rfc8032.html),
-with these additional acceptance restrictions. The 32-byte public key and
-signature point `R` MUST use canonical compressed Edwards encodings and MUST be
-nonidentity points in the prime-order subgroup. Reject mixed-torsion and
-small-order points, noncanonical field encodings, and negative zero. The 64-byte
-signature consists of `R || S`; the little-endian scalar MUST satisfy
-`S < 2^252 + 27742317777372353535851937790883648493`. Verify the usual Ed25519
-equation after these checks. Implementations MUST test library behavior against
-these restrictions. Ed25519ph and Ed25519ctx do not implement W2.
-
-The chain identifier is the consensus genesis block's raw 32-byte hash. The
-signature covers this transcript of `216 + 32 * R` bytes:
-
-```text
-ASCII("Dogwood/metadata/2") || 00 || chain_id || u16(2) ||
-block_id || proposer_key || proposer_node || coding || part_root ||
-u64(created_ms) || u8(R) || entry_peers
-```
-
-Header admission MUST supply `block_id`; a sender-supplied identifier does not
-substitute for admission. The metadata variant identifier is
-`T("variant", transcript)`. It excludes the signature and key-binding proof. A
-signature does not replace proof of the coinbase commitment or body validation.
+The chain identifier is the consensus genesis block's raw 32-byte hash. Header
+admission MUST supply `block_id`; a sender-supplied identifier does not
+substitute for admission. The commitment does not replace body validation.
 
 #### Field grammar
 
@@ -1223,29 +1340,32 @@ The following table lists each payload's fields in transmission order.
 
 | Message | Fields |
 | --- | --- |
-| `HeaderMeta` | `u16(header_length)`, header, proposer key (32), proposer node (32), `u16(binding_length)`, binding, coding tuple (26), part root (32), `u64(created_ms)`, `u8(entry_peer_count)`, entry peers (32 each), signature (64) |
+| `HeaderMeta` | `u16(header_length)`, header, binding, coding tuple (30), part root (32), proposer node (32) |
 | `Subscribe` | scope, `u16(count)`, lanes (32 each) |
 | `Unsubscribe` | scope, `u16(count)`, lanes (32 each) |
 | `Refuse` | scope, `u16(count)`, lanes (32 each), `u8(reason)` |
-| `Want` | `u32(want_id)`, block identifier, `u32(stripe)`, `u16(count)`, allowed bitmap (11) |
+| `Want` | `u32(want_id)`, block identifier, `u32(stripe)`, requested bitmap (11) |
 | `StripeDone` | block identifier, `u32(stripe)` |
 | `BlockDone` | block identifier |
 | `Advert` | block identifier, `u32(wait_us)`, `u16(count)`, items of lane (32) and `i32(delay_us)` |
-| `Part` | block identifier, `u32(index)`, `u8(sibling_count)`, siblings (32 each), payload (`S`) |
-| `Have` | block identifier, `u16(count)`, `u32(index)` each |
+| `Part` | block identifier, `u32(index)`, `u8(sibling_count)`, siblings (32 each), payload (`wire_len(index)`) |
+| `Have` | block identifier, `u8(flags)`, `u16(count)`, `u32(index)` each |
 | `WantEnd` | `u32(want_id)`, `u16(sent)`, `u8(reason)` |
 | `SubscriptionEnd` | scope, `u16(count)`, lanes (32 each) |
 
-The allowed bitmap encodes stripe-relative index `j` in bit `j mod 8` of byte
+The requested bitmap encodes stripe-relative index `j` in bit `j mod 8` of byte
 `j / 8`. `Refuse` reasons are 0 `Capacity`, 1 `UnknownBlock`, 2 `Policy`, and
 3 `Shed`.
 `WantEnd` reasons are 0 `Served`, 1 `UnknownBlock`, and 2 `Retired`.
+`Have` flags are `0x00`, `0x01` (push), or `0x03` (push and relay). Bit 1, the
+relay flag, is valid only with bit 0. Any other value returns `Disconnect`
+(close-1).
 
 The binding contains
-`u32(coinbase_length) || canonical_coinbase || u8(sibling_count) || siblings`.
-The coinbase MUST be nonempty. The transaction path always starts at index zero.
-Its hashing and transaction-id rules come from the selected chain adapter, not
-the Dogwood part tree. Parsing this envelope does not establish that its
+`u32(coinbase_length) || canonical_coinbase || u8(txid_sibling_count) || txid_siblings || u8(auth_sibling_count) || auth_siblings || light_client_root`.
+The coinbase MUST be nonempty. Both paths always start at index zero.
+Their hashing and transaction-id rules come from the selected chain adapter,
+not the BPv1 part tree. Parsing this envelope does not establish that its
 transaction, header, or commitment is valid.
 
 ### Parameter registry
@@ -1255,15 +1375,15 @@ settings. A value marked experimental reproduces the fleet experiments. It is
 not a production recommendation or evidence of conformance. A value marked
 `TBD` MUST be fixed before an implementation claims conformance. Reports MUST
 record all overrides. The
-[design rationale](../design/dogwood.md#parameter-tuning) does not override this
+[design rationale](../design/bpv1.md#parameter-tuning) does not override this
 registry.
 
 #### Protocol and profile
 
 | Parameter | Reference value | Meaning and authority |
 | --- | --- | --- |
-| `S`; `STRIPE_K`; `parity_parts(k)` | 65,536 bytes; 64; `ceil(k / 3)` | W2 profile. Parity near one third let pulling nodes skip slow neighbours at 128 and 256 MiB. |
-| `MAX_STRIPES`; `MAX_ENTRY_PEERS`; `MAX_HAVE_INDICES` | 512; 255; 4,096 | W2 syntax limits. |
+| `S_MIN`; `S_MAX`; `STRIPE_K`; `parity_parts(k)` | 4,096 bytes; 65,536 bytes; 64; `ceil(k / 3)` | W2 profile. `S` is per block (section 2). `S_MIN` keeps a part's prefix, proof, and announcement under 4% of its payload. Parity near one third let pulling nodes skip slow neighbours at 128 and 256 MiB. |
+| `MAX_STRIPES`; `MAX_HAVE_INDICES` | 512; 4,096 | W2 syntax limits. |
 | `MAX_WANTS_INFLIGHT` | 64 per connection direction | W2 commitment limit. The server acts only above twice this value. |
 | `MAX_OPEN_SUBS` | 1,024 per connection direction | W2 limit on subscriptions outside `Idle`. The publisher acts only above twice this value. |
 | Publisher accept limit | `TBD`, at most `MAX_OPEN_SUBS` | Local capacity. The publisher refuses above it. |
@@ -1271,13 +1391,13 @@ registry.
 | Early record per peer; node-wide; `EARLY_AGE` | `TBD`; experiments used a 64 MiB node-wide buffer | Messages about unknown blocks. |
 | Peer-view and advert retention | `TBD`; `ADV_KEEP` = 64 blocks | Learning bounds. |
 | Concurrent blocks | `TBD`; experiments used 4 | Assembly bound. |
+| Metadata in admission; pending metadata | 64 entries and 8 MiB each; pending also 4 entries per peer and 15 s | Separate budgets, so headers with unknown parents never refuse viable metadata. |
 | Subscription cadence | capacity 64; refill 32/s | Candidate. Exhaustion is recorded, not enforced. |
 
 #### Routing policy
 
 | Parameter | Reference value | Meaning and authority |
 | --- | --- | --- |
-| `ENTRY_RTT_X` | 2.0 | Experimental proposer entry-peer rule. |
 | `PULL_WINDOW`; node-wide pull cap | 64 parts per neighbour; 4,096 parts | Experimental. |
 | `PULL_TICK_MS`; `PULL_TIMEOUT_MS` | 20 ms; 500 ms | Experimental. |
 | `HOLE_LOOKAHEAD`; `STARVE_MS`; hole-pull cap | 3; 300 ms; 256 parts | Experimental. |
@@ -1287,15 +1407,17 @@ registry.
 | `DEMOTE_AFTER`; `DEMOTE_MS` | 3 steps; 5 ms | Experimental. |
 | `BAN_STEPS` | 5 steps | Experimental. |
 | `MAX_PROPOSER_SUBS` | `TBD` | Required. Accepted proposer subscriptions per node. |
-| `CHILD_BUDGET` | `TBD` | Required before enabling push by default. The experiments capped accepted subscriptions at `1.0 * degree`, about 1.4 blocks at degree 28 and 20 entry peers. |
+| `CHILD_BUDGET` | `TBD` | Required before the subscription extension ships. The experiments capped accepted subscriptions at `1.0 * degree`, about 1.4 blocks at degree 28 and 20 entry peers. |
 | `HAVE_FLUSH_MS`; `HAVE_FLUSH_COUNT` | 2 ms; 32 indices | Experimental. |
+| `COPY_BATCH` | 8 direct copies | Experimental. Copies the proposer releases to an idle data writer behind one flagged `Have`. |
+| `Have` initial group; `advert_delay` | main's `advert_window_full_block` (32) to `advert_window_small_block` (64) by body size; 500 ms | Main's block gossip settings (decision-26). BPv1 adds no setting. |
 
 #### Recovery and retention
 
 | Parameter | Reference value | Meaning and authority |
 | --- | --- | --- |
-| `STALL_MS`; `STALL_BACKOFF`; `REPAIR_ROUNDS` | 2,000 ms; 2.0; 3 | Experimental. |
-| Reconstruction deadline | `TBD` | Required. Monotonic from metadata admission. |
+| Stall interval; `STALL_BACKOFF` | `SLOW_X` × one part's estimated arrival (decision-22); 2.0 | Recovery; the reconstruction deadline is the only bound (decision-17). |
+| Reconstruction deadline | 15 s | Monotonic from metadata admission. |
 | Retention after completion | 5 s, extended until every neighbour reports `BlockDone`, within a 60 s bound | Experimental. |
 | Verification and decode workers; CPU and memory caps | `TBD` | Required per-peer and node-wide work limits. |
 
@@ -1311,10 +1433,10 @@ The profile MUST fix these before implementations claim interoperability:
 
 | Item | Draft choice |
 | --- | --- |
-| Part payload and stripes | W2 fixes `S`, `STRIPE_K`, and `parity_parts` |
+| Part payload and stripes | W2 fixes `S_MIN`, `S_MAX`, `ALIGN`, `STRIPE_K`, and `parity_parts` |
 | Codec construction | Candidate `reed-solomon-simd` 3.1 construction; vectors `TBD` |
-| Hashing | W2 fixes BLAKE3 key derivation with Dogwood contexts; vectors `TBD` |
-| Proposer authentication | W2 fixes Ed25519 and the transcript; supported chain formats and admission adapter remain `TBD` |
+| Hashing | W2 fixes BLAKE3 key derivation with BPv1 contexts; vectors `TBD` |
+| Proposer authentication | W2 fixes the `BPV1 01` coinbase commitment; supported chain formats and admission adapter remain `TBD` |
 | Serialization | W2 fixes payload encoding; service identifier, capability, stream kinds, and negotiation remain `TBD` |
 | Resource bounds | W2 fixes syntax limits; accept limits, early-record, retention, and work bounds remain `TBD` |
 
@@ -1334,17 +1456,22 @@ infrastructure that the
    decoding, payload caps, and decoded-allocation checks. Deterministic cases
    MUST cover every message and rule; random generation MUST NOT provide the
    only coverage.
-2. Layout arithmetic, padding, the transaction-count prefix, trailing bytes, the
+2. Layout arithmetic, padding, the empty body, the transaction-count prefix,
+   trailing bytes, the
    total block-size bound, and proofs at every depth up to 16. Body changes
-   invalidate cached parity; header changes require a new signature but not a
-   new encoding.
-3. Header admission before any part work, missing parent context, forged key
-   binding, signed equivocation, a layout mismatch, a failed re-encode check
+   invalidate cached parity; header changes require no new encoding.
+3. Header admission before any part work, missing parent context, a forged
+   coinbase binding, a coinbase with no commitment or two, an unusual output
+   beside one valid commitment, a layout mismatch, a failed re-encode check
    going straight to block download, and consensus-invalid bodies.
 4. The wanted set. Unsolicited parts, repeats from one peer, parts after
    `SubscriptionEnd` or `WantEnd`, parts beyond a `Want`'s count, parts of
    retired blocks, retired-block counters, and early-record overflow, pausing,
-   and replay. The control stream never pauses for the early record.
+   and replay. The control stream never pauses for the early record. Push
+   flags past the connection's push bound, relay flags from a peer other than
+   the proposer or past `n - k`, proposer seeds that arrive before the
+   proposer's `HeaderMeta`, a flagged part that never arrives, and a holder
+   push that crosses another peer's copy of the same part.
 5. Subscription crossings. A reference model of both peers generates
    interleavings of the two streams: `Subscribe` against `Refuse`, `Unsubscribe`
    against `Refuse` with reason `Shed`, re-subscription after each end, and
@@ -1358,11 +1485,11 @@ infrastructure that the
    resources exactly once. Control progress continues while data output is
    blocked.
 8. Recovery. The stall resets on progress; the reconstruction deadline does not.
-   The ladder never moves backward. Block download follows repair failure, a
-   metadata conflict, or a failed re-encode check.
+   The ladder never moves backward. Block download follows the reconstruction
+   deadline, a metadata conflict, or a failed re-encode check.
 9. Routing. No cycles within a block, the cycle-break rule, a node that runs
    several blocks behind, two proposers at once, random proposer pairs,
-   proposer changes with shared entry peers, a parent that withholds one lane,
+   proposer changes with shared neighbours, a parent that withholds one lane,
    and proposer subscriptions.
 
 Fleet experiments MUST report the block outcomes in section 7. They MUST vary

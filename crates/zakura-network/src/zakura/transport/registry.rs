@@ -525,6 +525,7 @@ impl ServiceRegistry {
 
     /// Fan a newly connected peer out to every service enabled by its negotiated capabilities.
     pub fn add_peer(&self, peer: Peer) {
+        let load = peer.load().cloned();
         let (
             peer_id,
             conn_id,
@@ -552,7 +553,7 @@ impl ServiceRegistry {
                 .map(|stream| stream.cancel_token.clone())
                 .unwrap_or_else(|| cancel_token.child_token());
 
-            service.add_peer(Peer::new_with_service_cancel_token(
+            let mut service_peer = Peer::new_with_service_cancel_token(
                 conn_id,
                 peer_id.clone(),
                 remote_ip,
@@ -562,7 +563,11 @@ impl ServiceRegistry {
                 cancel_token.clone(),
                 service_cancel_token,
                 close_cause.clone(),
-            ));
+            );
+            if let Some(load) = &load {
+                service_peer = service_peer.with_load(load.clone());
+            }
+            service.add_peer(service_peer);
         }
     }
 
@@ -571,6 +576,7 @@ impl ServiceRegistry {
     /// Returns the capability mask for services that received a peer session, so
     /// disconnect fanout can be limited to reactors that were actually reached.
     pub fn add_escalated_peer(&self, peer: Peer) -> u64 {
+        let load = peer.load().cloned();
         let rtt = peer.rtt_reader();
         let (
             peer_id,
@@ -606,20 +612,22 @@ impl ServiceRegistry {
                 .map(|stream| stream.cancel_token.clone())
                 .unwrap_or_else(|| cancel_token.child_token());
 
-            service.add_peer(
-                Peer::new_with_service_cancel_token(
-                    conn_id,
-                    peer_id.clone(),
-                    remote_ip,
-                    negotiated,
-                    direction,
-                    service_streams,
-                    cancel_token.clone(),
-                    service_cancel_token,
-                    close_cause.clone(),
-                )
-                .with_rtt_reader(rtt.clone()),
-            );
+            let mut service_peer = Peer::new_with_service_cancel_token(
+                conn_id,
+                peer_id.clone(),
+                remote_ip,
+                negotiated,
+                direction,
+                service_streams,
+                cancel_token.clone(),
+                service_cancel_token,
+                close_cause.clone(),
+            )
+            .with_rtt_reader(rtt.clone());
+            if let Some(load) = &load {
+                service_peer = service_peer.with_load(load.clone());
+            }
+            service.add_peer(service_peer);
         }
 
         admitted_capabilities

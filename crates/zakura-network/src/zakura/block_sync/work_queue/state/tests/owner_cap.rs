@@ -109,6 +109,7 @@ fn apply_cap_op(state: &mut WorkQueueState, next_request: &mut u64, op: CapOp) {
                 count,
                 u64::MAX,
                 (session, request),
+                |_| false,
             );
             if items.is_empty() {
                 return;

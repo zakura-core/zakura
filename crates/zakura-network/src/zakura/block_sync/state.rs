@@ -73,6 +73,10 @@ pub struct BlockSyncStartup {
     /// above it is capped at `BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES` of
     /// decoded blocks. `None` keeps the count-only window.
     pub max_checkpoint_height: Option<block::Height>,
+    /// Optional shared body-claim set owned with BPv1.
+    /// Native block sync skips any hash with an unexpired claim and re-queries
+    /// when a claim releases with `Fallback` or expires.
+    pub body_claims: Option<zakura_node_services::body_claims::SharedBodyClaims>,
     /// Receives block sync's events in test and simulator builds.
     #[cfg(any(test, zakura_sim))]
     pub observer: super::block_sync_observe::ObserverSlot,
@@ -102,6 +106,7 @@ impl BlockSyncStartup {
             state_queries_enabled: true,
             trace: ZakuraTrace::noop(),
             max_checkpoint_height: None,
+            body_claims: None,
             #[cfg(any(test, zakura_sim))]
             observer: Default::default(),
         }
@@ -130,9 +135,20 @@ impl BlockSyncStartup {
             state_queries_enabled: true,
             trace: ZakuraTrace::noop(),
             max_checkpoint_height: None,
+            body_claims: None,
             #[cfg(any(test, zakura_sim))]
             observer: Default::default(),
         }
+    }
+
+    /// Attach a shared [`zakura_node_services::body_claims::SharedBodyClaims`] set
+    /// so native block sync skips BPv1-claimed bodies until fallback release or expiry.
+    pub fn with_body_claims(
+        mut self,
+        body_claims: zakura_node_services::body_claims::SharedBodyClaims,
+    ) -> Self {
+        self.body_claims = Some(body_claims);
+        self
     }
 
     /// Attach the storage-owned retained-body floor and the network's genesis hash.
@@ -180,6 +196,7 @@ impl BlockSyncStartup {
             state_queries_enabled: false,
             trace: ZakuraTrace::noop(),
             max_checkpoint_height: None,
+            body_claims: None,
             #[cfg(any(test, zakura_sim))]
             observer: Default::default(),
         })
@@ -492,7 +509,8 @@ impl BlockSyncState {
         #[cfg(any(test, zakura_sim))]
         let budget = budget.with_observer(startup.observer.budget_observer());
         let work_queue = WorkQueue::new(startup.frontiers.verified_block_tip, budget)
-            .with_owner_cap(startup.config.owner_reservation_cap());
+            .with_owner_cap(startup.config.owner_reservation_cap())
+            .with_body_claims(startup.body_claims.clone());
         #[cfg(any(test, zakura_sim))]
         let work_queue = work_queue.with_observer(startup.observer.clone());
         let work_queue = Arc::new(work_queue);

@@ -603,6 +603,20 @@ smoke-secs = 60
 args = ["-max_len=512"]
 timeout-secs = 1800
 
+[[target]]
+package = "p2p"
+name = "bpv1_peer"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
+package = "p2p"
+name = "bpv1_block"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800
+
 # `tx-relay/wire` runs production `tx-relay` behind its real transport on
 # simulated QUIC, with a test pool. Its 24-byte prefix composes the pool's
 # verdicts, the node's own bodies, the links, and each peer's answers and

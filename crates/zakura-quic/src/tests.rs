@@ -3865,3 +3865,111 @@ fn a_simulated_run_refuses_a_wildcard_socket() {
         })
     );
 }
+
+/// Pumps `net` while enforcing a per-link token bucket of `bytes_per_sec` on
+/// delivered datagrams. Every datagram waits at least `min_delay` in `net`,
+/// and delivery pace on each directed link is bounded by `bytes_per_sec`.
+async fn pump_shaped(net: SimNet, bytes_per_sec: u64) {
+    let mut tokens_by_link: std::collections::HashMap<crate::sim::Link, f64> =
+        std::collections::HashMap::new();
+    let max_burst: f64 = 4_800.0;
+    let tick = Duration::from_millis(1);
+    let refill_per_tick = bytes_per_sec as f64 / 1_000.0;
+    loop {
+        for tokens in tokens_by_link.values_mut() {
+            *tokens = (*tokens + refill_per_tick).min(max_burst);
+        }
+        for id in net.deliverable() {
+            let tokens = tokens_by_link.entry(id.link).or_insert(max_burst);
+            let cost = 1_200.0;
+            if *tokens < cost {
+                continue;
+            }
+            if net.deliver(id).is_ok() {
+                *tokens -= cost;
+            }
+        }
+        tokio::time::sleep(tick).await;
+    }
+}
+
+/// Measures `ConnLoad`'s `min_rtt`, `rate_out` and `rate_in` over a `SimNet`
+/// link with fixed propagation delay and rate shaping.
+async fn measure_shaped_link(
+    one_way_delay: Duration,
+    bytes_per_sec: u64,
+    payload_bytes: usize,
+) -> (crate::ConnLoad, crate::ConnLoad) {
+    let net = SimNet::new(LinkModel {
+        min_delay: one_way_delay,
+        max_delay: one_way_delay + Duration::from_secs(10),
+        reorder: false,
+        loss_budget: 0,
+    });
+    let pumper = tokio::spawn(pump_shaped(net.clone(), bytes_per_sec));
+
+    let server_addr = sim_addr(21);
+    let client_addr = sim_addr(22);
+    let server_ep = sim_endpoint(&net, server_addr);
+    let client_ep = sim_endpoint(&net, client_addr);
+
+    let mut server = serve_test_acceptor(server_ep, &[ALPN], |_| Admit::Accept);
+
+    let server_node = NodeAddr::with_addrs(server.endpoint.local_id(), vec![server_addr]);
+    let client_conn = client_ep.connect(server_node, &[ALPN]).await.unwrap();
+    let server_conn = server.handled.recv().await.unwrap();
+
+    // Send a bulk payload from client to server and receive the echo so both
+    // sides observe sustained outbound and inbound stream traffic.
+    let payload = vec![0xABu8; payload_bytes];
+    assert_eq!(echo(&client_conn, &payload).await, payload);
+
+    // Let the 50 ms load publisher publish the idle snapshot with finalized
+    // receive-rate windows.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let client_load = client_conn.load();
+    let server_load = server_conn.load();
+
+    drop(client_conn);
+    drop(server_conn);
+    pumper.abort();
+    client_ep.shutdown().await;
+    server.endpoint.shutdown().await;
+    (client_load, server_load)
+}
+
+#[tokio::test(start_paused = true)]
+async fn path_estimates_track_shaped_link_rtt_and_rates() {
+    tokio::time::timeout(SIM_TEST_TIMEOUT, async {
+        let (slow_client, slow_server) =
+            measure_shaped_link(Duration::from_millis(15), 300_000, 256 * 1024).await;
+        let (fast_client, fast_server) =
+            measure_shaped_link(Duration::from_millis(15), 2_400_000, 512 * 1024).await;
+
+        // Minimum RTT tracks the 30 ms round-trip propagation delay.
+        for load in [&slow_client, &slow_server, &fast_client, &fast_server] {
+            let min_rtt = load.min_rtt.expect("min_rtt observed after transfer");
+            assert!(
+                min_rtt >= Duration::from_millis(25) && min_rtt <= Duration::from_millis(80),
+                "unexpected min_rtt: {min_rtt:?}"
+            );
+        }
+
+        // Both rate_out and rate_in are populated and distinguish slow vs fast links.
+        let slow_out = slow_client.rate_out.expect("slow rate_out measured");
+        let fast_out = fast_client.rate_out.expect("fast rate_out measured");
+        let slow_in = slow_server.rate_in.expect("slow rate_in measured");
+        let fast_in = fast_server.rate_in.expect("fast rate_in measured");
+
+        assert!(
+            fast_out > slow_out * 3,
+            "fast rate_out ({fast_out}) should significantly exceed slow rate_out ({slow_out})"
+        );
+        assert!(
+            fast_in > slow_in * 3,
+            "fast rate_in ({fast_in}) should significantly exceed slow rate_in ({slow_in})"
+        );
+    })
+    .await
+    .expect("shaped-link path estimate test finished within timeout");
+}

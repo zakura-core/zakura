@@ -1,6 +1,6 @@
-use std::{collections::VecDeque, time::Duration};
+use std::time::Duration;
 
-use zakura_rt::time::Instant;
+use zakura_rt::{time::Instant, windowed::WindowedSamples};
 
 use super::{
     config::{CwndUnit, ZakuraBlockSyncConfig},
@@ -20,100 +20,6 @@ const BBR_DELAY_CAP_DOWN: f64 = 0.9;
 /// yield a body): a completion pulls it toward 1.0, a timeout toward 0.0. Averages over
 /// ~10–20 outcomes so a brief blip does not collapse a peer, sustained dropping does.
 const BBR_RELIABILITY_EWMA_ALPHA: f64 = 0.1;
-
-/// A time-windowed set of `f64` samples supporting `min` (RTprop) and `max` (BtlBw)
-/// filters — the BBR-lite estimators. Samples older than `horizon` are pruned on insert
-/// **and re-filtered at read time against the caller's `now`**, so a min/max never
-/// reflects a sample past the horizon even during a quiet (no-completion) period — a peer
-/// that went fast then stopped completing must not keep a stale-low RTprop / stale-high
-/// BtlBw.
-///
-/// Each filter keeps only the samples that can still become its extremum: a sample is
-/// dropped once a newer sample is at least as extreme, because the newer sample outlives
-/// it. Both candidate lists stay in time order with monotone values, so the oldest fresh
-/// candidate is the extremum. A peer delivers thousands of samples per horizon, and the
-/// routine reads the filters on every delivery, so neither insert nor read scans the
-/// window.
-#[derive(Clone, Debug)]
-struct WindowedSamples {
-    horizon: Duration,
-    /// Candidates for `min`, with values increasing from front to back.
-    minima: VecDeque<(Instant, f64)>,
-    /// Candidates for `max`, with values decreasing from front to back.
-    maxima: VecDeque<(Instant, f64)>,
-    newest_at: Option<Instant>,
-}
-
-impl WindowedSamples {
-    fn new(horizon: Duration) -> Self {
-        Self {
-            horizon,
-            minima: VecDeque::new(),
-            maxima: VecDeque::new(),
-            newest_at: None,
-        }
-    }
-
-    fn observe(&mut self, now: Instant, value: f64) {
-        // Callers pass a monotonic clock. Clamping keeps the candidate lists in time
-        // order if a caller ever passes an older `now`.
-        let at = self.newest_at.map_or(now, |newest| newest.max(now));
-        self.newest_at = Some(at);
-        if !value.is_nan() {
-            while self.minima.back().is_some_and(|(_, back)| *back >= value) {
-                self.minima.pop_back();
-            }
-            self.minima.push_back((at, value));
-            while self.maxima.back().is_some_and(|(_, back)| *back <= value) {
-                self.maxima.pop_back();
-            }
-            self.maxima.push_back((at, value));
-        }
-        self.prune(now);
-    }
-
-    /// Drop samples older than `horizon` relative to `now`. Called on insert; reads
-    /// filter again so a stale extremum is never returned during a quiet bad period.
-    fn prune(&mut self, now: Instant) {
-        if let Some(cutoff) = now.checked_sub(self.horizon) {
-            for candidates in [&mut self.minima, &mut self.maxima] {
-                while candidates.front().is_some_and(|(at, _)| *at < cutoff) {
-                    candidates.pop_front();
-                }
-            }
-        }
-    }
-
-    /// Windowed minimum over samples no older than `now - horizon`. Filters by `now`
-    /// rather than trusting the last prune, so a quiet-period read cannot return an
-    /// aged-out sample.
-    fn min(&self, now: Instant) -> Option<f64> {
-        self.oldest_fresh(&self.minima, now)
-    }
-
-    /// The windowed maximum over samples no older than `now - horizon`. See [`Self::min`].
-    fn max(&self, now: Instant) -> Option<f64> {
-        self.oldest_fresh(&self.maxima, now)
-    }
-
-    /// Whether this window has at least one sample no older than `now - horizon`.
-    ///
-    /// The cold-start gate only needs existence, so it reads the newest sample time.
-    fn has_fresh_sample(&self, now: Instant) -> bool {
-        let Some(newest_at) = self.newest_at else {
-            return false;
-        };
-        now.checked_sub(self.horizon)
-            .is_none_or(|cutoff| newest_at >= cutoff)
-    }
-
-    fn oldest_fresh(&self, candidates: &VecDeque<(Instant, f64)>, now: Instant) -> Option<f64> {
-        let first_fresh = now.checked_sub(self.horizon).map_or(0, |cutoff| {
-            candidates.partition_point(|(at, _)| *at < cutoff)
-        });
-        candidates.get(first_fresh).map(|(_, value)| *value)
-    }
-}
 
 /// Per-peer BBR-lite control parameters extracted from config (Copy, lock-free).
 #[derive(Copy, Clone, Debug)]
@@ -995,39 +901,6 @@ mod bbr_tests {
     }
 
     #[test]
-    fn windowed_samples_match_a_linear_scan() {
-        // The candidate lists must return the same extremum as scanning every sample
-        // in the horizon, for reads at the insert time and during quiet periods.
-        let horizon = Duration::from_millis(500);
-        let mut window = WindowedSamples::new(horizon);
-        let mut all: Vec<(Instant, f64)> = Vec::new();
-        let t0 = Instant::now();
-        let mut now = t0;
-        let mut seed = 0x2545_f491_4f6c_dd1du64;
-        let mut next = || {
-            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
-            seed >> 33
-        };
-        for _ in 0..5_000 {
-            now += Duration::from_millis(next() % 40);
-            let value = (next() % 1_000) as f64;
-            window.observe(now, value);
-            all.push((now, value));
-            let read_at = now + Duration::from_millis(next() % 700);
-            for at in [now, read_at] {
-                let cutoff = at.checked_sub(horizon);
-                let fresh = || {
-                    all.iter()
-                        .filter(move |(sampled, _)| cutoff.is_none_or(|c| *sampled >= c))
-                        .map(|(_, value)| *value)
-                };
-                assert_eq!(window.min(at), fresh().reduce(f64::min));
-                assert_eq!(window.max(at), fresh().reduce(f64::max));
-            }
-        }
-    }
-
-    #[test]
     fn windowed_estimators_drop_stale_samples_at_read_time() {
         // Finding #2: min/max filters are evaluated against the caller's `now`, so once
         // every sample has aged past the 10 s horizon the estimators read `None` even
@@ -1621,6 +1494,8 @@ mod bbr_tests {
 
 #[cfg(test)]
 mod cwnd_cap_tests {
+    use std::collections::VecDeque;
+
     use proptest::prelude::*;
 
     use zakura_chain::block;

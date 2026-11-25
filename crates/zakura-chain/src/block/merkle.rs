@@ -132,14 +132,16 @@ impl FromHex for Root {
     }
 }
 
-fn hash(h1: &[u8; 32], h2: &[u8; 32]) -> [u8; 32] {
+/// The parent of two nodes in the transaction Merkle tree: their SHA-256d hash.
+pub fn hash_txid_pair(h1: &[u8; 32], h2: &[u8; 32]) -> [u8; 32] {
     let mut w = sha256d::Writer::default();
     w.write_all(h1).unwrap();
     w.write_all(h2).unwrap();
     w.finish()
 }
 
-fn auth_data_hash(h1: &[u8; 32], h2: &[u8; 32]) -> [u8; 32] {
+/// The parent of two nodes in the ZIP 244 authorizing data Merkle tree.
+pub fn hash_auth_data_pair(h1: &[u8; 32], h2: &[u8; 32]) -> [u8; 32] {
     // > Non-leaf hashes in this tree are BLAKE2b-256 hashes personalized by
     // > the string "ZcashAuthDatHash".
     // https://zips.z.cash/zip-0244#block-header-changes
@@ -217,8 +219,8 @@ impl std::iter::FromIterator<transaction::Hash> for Root {
             hashes = hashes
                 .chunks(2)
                 .map(|chunk| match chunk {
-                    [h1, h2] => hash(h1, h2),
-                    [h1] => hash(h1, h1),
+                    [h1, h2] => hash_txid_pair(h1, h2),
+                    [h1] => hash_txid_pair(h1, h1),
                     _ => unreachable!("chunks(2)"),
                 })
                 .collect();
@@ -311,7 +313,7 @@ impl FromHex for AuthDataRoot {
 pub const AUTH_DIGEST_PLACEHOLDER: transaction::AuthDigest = transaction::AuthDigest([0xFF; 32]);
 
 /// Returns the transaction's auth digest, or the consensus placeholder for pre-v5 transactions.
-pub(crate) fn auth_digest_or_placeholder(tx: &Transaction) -> transaction::AuthDigest {
+pub fn auth_digest_or_placeholder(tx: &Transaction) -> transaction::AuthDigest {
     tx.auth_digest().unwrap_or(AUTH_DIGEST_PLACEHOLDER)
 }
 
@@ -390,7 +392,7 @@ impl std::iter::FromIterator<transaction::AuthDigest> for AuthDataRoot {
             hashes = hashes
                 .chunks(2)
                 .map(|chunk| match chunk {
-                    [h1, h2] => auth_data_hash(h1, h2),
+                    [h1, h2] => hash_auth_data_pair(h1, h2),
                     _ => unreachable!("number of nodes is always even since tree is full"),
                 })
                 .collect();

@@ -500,9 +500,15 @@ fn precomputed_template_does_not_wait_for_proof_capacity() {
         let (_, info) = watch::channel(chain.clone());
         let (rpc, _, _) = mining_rpc(info);
         let params = rpc.gbt.miner_params().unwrap();
-        let coinbase =
-            TransactionTemplate::new_coinbase(&network(), Height(2), params, Amount::zero(), None)
-                .unwrap();
+        let coinbase = TransactionTemplate::new_coinbase(
+            &network(),
+            Height(2),
+            params,
+            Amount::zero(),
+            None,
+            None,
+        )
+        .unwrap();
         let expected_coinbase = coinbase.data.clone();
         let gate = BlockingPoolGate::new().await;
         let handler = rpc.gbt.clone();
@@ -516,6 +522,7 @@ fn precomputed_template_does_not_wait_for_proof_capacity() {
             template_id(&chain),
             vec![],
             Some(false),
+            None,
         ));
         let Poll::Ready(Ok((template, _))) = futures::poll!(&mut template) else {
             panic!("a precomputed coinbase must not wait behind proof construction");
@@ -651,6 +658,7 @@ async fn template_worker_panic_is_an_rpc_error() {
         &invalid_parent,
         template_id(&invalid_parent),
         vec![],
+        None,
         None,
     ))
     .await
@@ -1329,6 +1337,7 @@ fn recovery_construction_yields_and_rebuilds_on_parent_change() {
                 template_id(&chain),
                 vec![],
                 None,
+                None,
             ))
             .await
             .unwrap();
@@ -1403,6 +1412,7 @@ fn failed_recovery_validation_rebuilds_when_committed_state_moved_on() {
             &chain,
             template_id(&chain),
             vec![],
+            None,
             None,
         ))
         .await
@@ -1497,7 +1507,7 @@ async fn shielded_template_rewards() {
         LongPollInput::new(chain.tip_height, chain.tip_hash, chain.max_time, vec![]).generate_id();
     let (template, _) = tokio::time::timeout(
         Duration::from_secs(300),
-        rpc.build_mining_template(None, &params, &chain, id, vec![], None),
+        rpc.build_mining_template(None, &params, &chain, id, vec![], None, None),
     )
     .await
     .unwrap()
@@ -1518,4 +1528,189 @@ async fn shielded_template_rewards() {
         i64::from(tx.ironwood_value_balance().ironwood_amount()),
     );
     assert_eq!((sapling, orchard, ironwood), (0, 0, -expected));
+}
+
+/// bpv1-6: `submitblock` publishes to BPv1 only after consensus admits the
+/// block, at most once, and never for a block consensus rejects.
+#[test]
+fn bpv1_6_submit_block_publishes_only_after_consensus_admission_or_commit() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use zakura_chain::block::Block;
+    use zakura_node_services::bpv1_proposer::{Bpv1ProposerHook, BPV1_COMMITMENT_NULL_DATA_LEN};
+
+    #[derive(Debug, Default)]
+    struct CountingBpv1Proposer {
+        published: AtomicUsize,
+    }
+
+    impl Bpv1ProposerHook for CountingBpv1Proposer {
+        fn should_prepare_template(&self, _height: Height) -> bool {
+            false
+        }
+
+        fn prepare_template_commitment(
+            &self,
+            _light_client_root: [u8; 32],
+            _height: Height,
+            _tx_count: u32,
+            _body_after_coinbase: &[u8],
+        ) -> Option<[u8; BPV1_COMMITMENT_NULL_DATA_LEN]> {
+            None
+        }
+
+        fn publish_solved_block(&self, _block: Arc<Block>, _height: Height) -> bool {
+            self.published.fetch_add(1, Ordering::AcqRel);
+            true
+        }
+
+        fn retire_failed_block(&self, _hash: zakura_chain::block::Hash) {}
+    }
+
+    mining_runtime(async {
+        let (_, info) = watch::channel(chain_info(2, 1, 0));
+        let (rpc, _, mut verifier) = mining_rpc(info);
+        let proposer = Arc::new(CountingBpv1Proposer::default());
+        let rpc = rpc.with_bpv1_proposer(proposer.clone());
+
+        let block_bytes = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES.to_vec();
+        let block_hash = zakura_chain::block::Block::zcash_deserialize(block_bytes.as_slice())
+            .unwrap()
+            .hash();
+
+        // 1. Consensus rejection -> ZERO BPv1 publication calls!
+        let reject_task = tokio::spawn({
+            let rpc = rpc.clone();
+            let bytes = block_bytes.clone();
+            async move { rpc.submit_block(HexData(bytes), None).await }
+        });
+        let req = verifier
+            .expect_request_that(|r| matches!(r, zakura_consensus::Request::CommitMined { .. }))
+            .await;
+        assert_eq!(
+            proposer.published.load(Ordering::Acquire),
+            0,
+            "no BPv1 publication while CommitMined is pending"
+        );
+        req.respond_error("invalid proof of work".into());
+        let _ = reject_task.await.unwrap();
+        assert_eq!(
+            proposer.published.load(Ordering::Acquire),
+            0,
+            "a rejected block is never published to BPv1"
+        );
+
+        // 2. Consensus admission authorizes optimistic relay -> publishes ONCE,
+        //    and subsequent CommitMined Ok does NOT double-publish!
+        let admit_task = tokio::spawn({
+            let rpc = rpc.clone();
+            let bytes = block_bytes.clone();
+            async move { rpc.submit_block(HexData(bytes), None).await }
+        });
+        let req = verifier
+            .expect_request_that(|r| matches!(r, zakura_consensus::Request::CommitMined { .. }))
+            .await;
+        let admission = match req.request() {
+            zakura_consensus::Request::CommitMined { admission, .. } => admission.clone(),
+            _ => unreachable!(),
+        };
+        assert_eq!(proposer.published.load(Ordering::Acquire), 0);
+        admission.authorize_optimistic_relay();
+        admission.admit_for_test();
+        let wait_deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < wait_deadline
+            && proposer.published.load(Ordering::Acquire) == 0
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            proposer.published.load(Ordering::Acquire),
+            1,
+            "admitted block publishes once immediately on admission"
+        );
+        req.respond(block_hash);
+        let _ = admit_task.await.unwrap();
+        assert_eq!(
+            proposer.published.load(Ordering::Acquire),
+            1,
+            "final commit must not publish a second time"
+        );
+    });
+}
+
+/// Selection decides whether a template carries a BPv1 commitment, and the build
+/// follows that decision, even when the proposer becomes eligible in between.
+#[test]
+fn bpv1_commitment_follows_the_selection_decision() {
+    use zakura_chain::block::Block;
+    use zakura_node_services::bpv1_proposer::{Bpv1ProposerHook, BPV1_COMMITMENT_NULL_DATA_LEN};
+
+    const PAYLOAD: [u8; BPV1_COMMITMENT_NULL_DATA_LEN] = [0x42; BPV1_COMMITMENT_NULL_DATA_LEN];
+
+    /// Declines the first eligibility question and accepts every later one.
+    #[derive(Debug, Default)]
+    struct LateBpv1Proposer {
+        asked: AtomicUsize,
+        prepared: AtomicUsize,
+    }
+
+    impl Bpv1ProposerHook for LateBpv1Proposer {
+        fn should_prepare_template(&self, _height: Height) -> bool {
+            self.asked.fetch_add(1, Ordering::SeqCst) > 0
+        }
+
+        fn prepare_template_commitment(
+            &self,
+            _light_client_root: [u8; 32],
+            _height: Height,
+            _tx_count: u32,
+            _body_after_coinbase: &[u8],
+        ) -> Option<[u8; BPV1_COMMITMENT_NULL_DATA_LEN]> {
+            self.prepared.fetch_add(1, Ordering::SeqCst);
+            Some(PAYLOAD)
+        }
+
+        fn publish_solved_block(&self, _block: Arc<Block>, _height: Height) -> bool {
+            false
+        }
+
+        fn retire_failed_block(&self, _hash: zakura_chain::block::Hash) {}
+    }
+
+    let commits = |template: &BlockTemplateResponse| {
+        template
+            .coinbase_txn
+            .data
+            .as_ref()
+            .windows(PAYLOAD.len())
+            .any(|window| window == PAYLOAD)
+    };
+
+    mining_runtime(async {
+        let (_, info) = watch::channel(chain_info(2, 1, 0));
+        let (rpc, _, _) = mining_rpc(info);
+        let proposer = Arc::new(LateBpv1Proposer::default());
+        let rpc = rpc.with_bpv1_proposer(proposer.clone());
+
+        let declined = bounded(rpc.get_block_template(None))
+            .await
+            .unwrap()
+            .try_into_template()
+            .unwrap();
+        assert!(
+            !commits(&declined),
+            "a selection without the reservation must not get a commitment"
+        );
+        assert_eq!(proposer.prepared.load(Ordering::SeqCst), 0);
+
+        let accepted = bounded(rpc.get_block_template(None))
+            .await
+            .unwrap()
+            .try_into_template()
+            .unwrap();
+        assert!(
+            commits(&accepted),
+            "a selection with the reservation gets the commitment"
+        );
+        assert_eq!(proposer.prepared.load(Ordering::SeqCst), 1);
+    });
 }

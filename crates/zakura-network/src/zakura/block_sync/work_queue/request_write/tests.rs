@@ -2,6 +2,9 @@ use super::*;
 use crate::zakura::block_sync::block_sync_observe::{
     BlockEvent, BlockSyncObserver, ObserverSlot, RequestStep,
 };
+use crate::zakura::block_sync::{
+    state::BlockSyncState, BlockSyncFrontiers, BlockSyncStartup, ZakuraBlockSyncConfig,
+};
 use crate::zakura::transport::{callback_waker, ByteBudget};
 use crate::zakura::{
     block_sync::{test_work_scope, BlockSizeEstimate},
@@ -9,6 +12,11 @@ use crate::zakura::{
     Frame, FramedSend,
 };
 use std::{num::NonZeroU64, time::Duration};
+use zakura_node_services::{
+    block_memory::DecodedBlockPool,
+    body_claims::{BodyClaimRelease, SharedBodyClaims},
+};
+use zakura_rt::{sync::watch, time::Instant};
 
 thread_local! {
     static BEFORE_RESET_HEIGHT_CHECK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
@@ -184,9 +192,13 @@ impl Fixture {
     }
 
     fn with_queue(work: WorkQueue) -> Self {
+        Self::with_shared_queue(Arc::new(work))
+    }
+
+    fn with_shared_queue(work: Arc<WorkQueue>) -> Self {
         let fixture = Self {
             budget: work.budget.clone(),
-            work: Arc::new(work),
+            work,
             cancel: CancellationToken::new(),
         };
         fixture.work.set_estimate_floor_for_tests(1);
@@ -236,6 +248,123 @@ impl Fixture {
     fn reset(&mut self) {
         self.work.reset_above(block::Height(0));
     }
+}
+
+/// A fixture whose queue comes from block-sync startup sharing body claims
+/// with BPv1.
+fn work_shared_with_bpv1() -> (Fixture, SharedBodyClaims) {
+    let frontiers = BlockSyncFrontiers {
+        finalized_height: block::Height(0),
+        verified_block_tip: block::Height(0),
+        verified_block_hash: block::Hash([0; 32]),
+    };
+    let best = (block::Height(2), block::Hash([2; 32]));
+    let (_tip_tx, tip_rx) = watch::channel(best);
+    let claims = SharedBodyClaims::new();
+    let startup = BlockSyncStartup::new(
+        frontiers,
+        best,
+        tip_rx,
+        DecodedBlockPool::for_block_count(NonZeroU64::new(8).unwrap()),
+        ZakuraBlockSyncConfig::default(),
+    )
+    .with_body_claims(claims.clone());
+    let work = BlockSyncState::new(&startup).work_queue;
+    (Fixture::with_shared_queue(work), claims)
+}
+
+/// 08 §4: selection leaves a claimed body pending and takes the work around
+/// it. Releasing the claim makes the body takeable.
+#[test]
+fn selection_skips_a_bpv1_claimed_body_until_release() {
+    let (fixture, claims) = work_shared_with_bpv1();
+    let now = Instant::now();
+    let claimed = block::Hash([1; 32]);
+    assert!(claims.claim_at(claimed, now + Duration::from_secs(15), now));
+
+    let taken = fixture.work.take_request(
+        block::Height(1),
+        block::Height(2),
+        2,
+        200,
+        7,
+        NonZeroU64::MIN,
+    );
+    assert_eq!(taken.items().len(), 1, "take only the unclaimed body");
+    assert_eq!(taken.items()[0].0, block::Height(2));
+    assert_eq!(
+        fixture
+            .work
+            .first_pending_in_range(block::Height(1), block::Height(2)),
+        None,
+        "the claimed body stays pending but is not selectable",
+    );
+
+    assert!(claims.release(claimed, BodyClaimRelease::Fallback));
+    assert_eq!(
+        fixture
+            .work
+            .first_pending_in_range(block::Height(1), block::Height(2)),
+        Some(block::Height(1)),
+    );
+}
+
+/// 06 §6: a request published before the claim but not yet written skips the
+/// claimed body at writer start. The skipped range returns its funding and
+/// work, and a release lets block sync fetch the body.
+#[test]
+fn writer_start_skips_a_body_claimed_after_publication() {
+    let (mut fixture, claims) = work_shared_with_bpv1();
+    let write = fixture.take(1).publish(|_| {}).unwrap();
+    assert_eq!(fixture.budget.reserved(), 200);
+
+    let now = Instant::now();
+    let claimed = block::Hash([2; 32]);
+    assert!(claims.claim_at(claimed, now + Duration::from_secs(15), now));
+    assert!(!write.try_start(), "the range holds a BPv1-claimed body");
+    drop(write);
+
+    assert_eq!(fixture.budget.reserved(), 0);
+    assert_eq!(fixture.work.reserved_bytes(), 0);
+    assert_eq!(fixture.work.in_flight_len(), 0);
+    assert!(!fixture.cancel.is_cancelled());
+    assert_eq!(
+        fixture
+            .work
+            .first_pending_in_range(block::Height(1), block::Height(1)),
+        Some(block::Height(1)),
+    );
+    assert_eq!(
+        fixture
+            .work
+            .first_pending_in_range(block::Height(2), block::Height(2)),
+        None,
+    );
+
+    assert!(claims.release(claimed, BodyClaimRelease::Fallback));
+    let retry = fixture.take(2).publish(|_| {}).unwrap();
+    assert!(retry.try_start());
+}
+
+/// A frame that started before the claim keeps its place on the ordered
+/// stream and finishes.
+#[test]
+fn writer_started_before_a_bpv1_claim_finishes() {
+    let (mut fixture, claims) = work_shared_with_bpv1();
+    let write = fixture.take(1).publish(|_| {}).unwrap();
+    let owner = write.owner();
+    assert!(write.try_start());
+
+    let now = Instant::now();
+    assert!(claims.claim_at(block::Hash([2; 32]), now + Duration::from_secs(15), now));
+    write.written();
+    drop(write);
+
+    assert_eq!(fixture.budget.reserved(), 200);
+    assert!(!fixture.cancel.is_cancelled());
+    fixture.expire(owner);
+    assert_eq!(fixture.budget.reserved(), 0);
+    assert_eq!(fixture.work.in_flight_len(), 0);
 }
 
 #[test]
@@ -1686,6 +1815,7 @@ impl WorkQueue {
             usize::MAX,
             u64::MAX,
             (u64::from(low), NonZeroU64::MIN),
+            |_| false,
         );
         assert_eq!(
             items.len(),

@@ -195,6 +195,12 @@ pub struct ConnLoad {
     pub frame_rx: quinn_proto::FrameStats,
     /// Sends that failed with an error other than `WouldBlock`.
     pub send_errors: u64,
+    /// Minimum RTT observed on the current path, if any ACK has arrived.
+    pub min_rtt: Option<Duration>,
+    /// Windowed-max stream receive rate in bytes/sec from this peer, if measured.
+    pub rate_in: Option<u64>,
+    /// Windowed-max outbound delivery rate in bytes/sec to this peer, if measured.
+    pub rate_out: Option<u64>,
     /// Smoothed round-trip time, which [`RttReader`] reads.
     pub(crate) rtt: Duration,
 }
@@ -218,7 +224,21 @@ impl ConnLoad {
             udp_rx: quinn_proto::UdpStats::default(),
             frame_rx: quinn_proto::FrameStats::default(),
             send_errors: 0,
+            min_rtt: None,
+            rate_in: None,
+            rate_out: None,
             rtt: Duration::ZERO,
+        }
+    }
+
+    /// A load that reports only a path estimate, for other crates' tests.
+    #[cfg(any(test, zakura_sim, feature = "test-support"))]
+    pub fn with_path(min_rtt: Duration, rate_in: u64, rate_out: u64) -> Self {
+        Self {
+            min_rtt: Some(min_rtt),
+            rate_in: Some(rate_in),
+            rate_out: Some(rate_out),
+            ..Self::new(SocketAddr::from(([127, 0, 0, 1], 0)))
         }
     }
 }
@@ -424,6 +444,13 @@ impl Conn {
     /// never waits on the connection task.
     pub fn load(&self) -> ConnLoad {
         *self.inner.shared.load.borrow()
+    }
+
+    /// Returns a cloneable watch receiver for [`ConnLoad`] snapshots
+    /// (`min_rtt`, `rate_in`, `rate_out`, updated every [`LOAD_INTERVAL`])
+    /// without keeping the connection open.
+    pub fn subscribe_load(&self) -> zakura_rt::sync::watch::Receiver<ConnLoad> {
+        self.inner.shared.load.subscribe()
     }
 
     /// A reader of this connection's smoothed round-trip time that does not

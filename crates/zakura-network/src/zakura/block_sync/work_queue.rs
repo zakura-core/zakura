@@ -27,12 +27,14 @@
 use std::{collections::BTreeSet, num::NonZeroU64, sync::Arc};
 
 use zakura_chain::block;
+use zakura_node_services::body_claims::SharedBodyClaims;
 use zakura_rt::{
     collections::HashMap,
     sync::{
         atomic::{AtomicU64, Ordering},
         Mutex as StdMutex, MutexGuard, Notify,
     },
+    time::Instant,
 };
 
 use super::request::BlockSizeEstimate;
@@ -127,6 +129,9 @@ pub(super) struct WorkQueue {
     budget: ByteBudget,
     /// Caps the reservations one session may publish. Admission checks it.
     owner_cap: OwnerReservationCap,
+    /// Bodies another v2 front is fetching. Selection skips them, and a
+    /// request's writer refuses to start while any of its bodies is claimed.
+    body_claims: Option<SharedBodyClaims>,
     available: Notify,
     /// Counts events that take an unreceived height from its owner without that
     /// owner's routine retiring the request. Routines rescan their requests for
@@ -148,6 +153,7 @@ impl WorkQueue {
             }),
             budget,
             owner_cap: OwnerReservationCap::UNLIMITED,
+            body_claims: None,
             available: Notify::new(),
             revocations: AtomicU64::new(0),
             #[cfg(any(test, zakura_sim))]
@@ -159,6 +165,18 @@ impl WorkQueue {
     pub(super) fn with_owner_cap(mut self, cap: OwnerReservationCap) -> Self {
         self.owner_cap = cap;
         self
+    }
+
+    /// This queue, skipping bodies claimed in `claims`.
+    pub(super) fn with_body_claims(mut self, claims: Option<SharedBodyClaims>) -> Self {
+        self.body_claims = claims;
+        self
+    }
+
+    fn is_body_claimed(&self, hash: block::Hash, now: Instant) -> bool {
+        self.body_claims
+            .as_ref()
+            .is_some_and(|claims| claims.is_claimed(hash, now))
     }
 
     /// This queue, reporting to `observer`.
@@ -320,12 +338,14 @@ impl WorkQueue {
         session_id: u64,
         request_id: NonZeroU64,
     ) -> TakenRequest {
+        let now = Instant::now();
         let items = self.lock().state.take_budgeted(
             low,
             high,
             max_count,
             max_estimated_bytes,
             (session_id, request_id),
+            |hash| self.is_body_claimed(hash, now),
         );
         TakenRequest::new(self.clone(), items)
     }
@@ -585,6 +605,12 @@ impl WorkQueue {
         &self.available
     }
 
+    /// Wakes routines after a body claim releases or expires, because a
+    /// skipped pending height may now be takeable.
+    pub(super) fn wake_after_body_claim_change(&self) {
+        self.available.notify_waiters();
+    }
+
     // ---- diagnostics (trace + late-response classification) ----
 
     pub(super) fn pending_len(&self) -> usize {
@@ -653,7 +679,10 @@ impl WorkQueue {
         if low > high {
             return None;
         }
-        self.lock().state.first_pending_in_range(low, high)
+        let now = Instant::now();
+        self.lock()
+            .state
+            .first_pending_in_range(low, high, |hash| self.is_body_claimed(hash, now))
     }
 
     pub(super) fn max_in_flight(&self) -> Option<block::Height> {

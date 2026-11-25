@@ -165,6 +165,9 @@ pub(crate) fn build_bpv1_service(
 }
 
 #[cfg(test)]
+mod router_tests;
+
+#[cfg(test)]
 mod tests {
     use std::{
         num::NonZeroU64,

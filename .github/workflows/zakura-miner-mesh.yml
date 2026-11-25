@@ -6,7 +6,7 @@ name: Zakura miner mesh regtest
 # gateways.
 #
 # The core scenarios run for pull requests that change the miner mesh code,
-# the v2 connection places, dialer and admission it drives, the block template
+# the preferred dialer and connection accounting it drives, the block template
 # and mining RPCs the scenarios mine with, node startup, the tests or this
 # workflow. The longer scenarios in miner_mesh_regtest/extended.rs run when
 # such a change reaches main. Both run on demand.
@@ -19,12 +19,13 @@ on:
       - ".config/nextest.toml"
       - "crates/zakura-chain/src/miner_mesh.rs"
       - "crates/zakura-chain/src/miner_mesh/**"
-      - "crates/zakura-network/src/zakura/discovery/**"
-      - "crates/zakura-network/src/zakura/regulation/**"
-      - "crates/zakura-network/src/zakura/transport/**"
-      - "crates/zakura-network/src/zakura/handler.rs"
-      - "crates/zakura-network/src/zakura/testkit/**"
-      - "crates/zakura-quic/**"
+      - "crates/zakura-network/src/zakura/discovery/candidate_dialer.rs"
+      - "crates/zakura-network/src/zakura/discovery/candidate_dialer/preferred.rs"
+      - "crates/zakura-network/src/zakura/discovery/candidate_dialer/replay.rs"
+      - "crates/zakura-network/src/zakura/transport/connection_places.rs"
+      - "crates/zakura-network/src/zakura/transport/handshake_counts.rs"
+      - "crates/zakura-network/src/zakura/transport/handshake_counts/slots.rs"
+      - "crates/zakura-network/src/zakura/transport/preferred_gateways.rs"
       - "crates/zakura-rpc/src/config/mining.rs"
       - "crates/zakura-rpc/src/methods.rs"
       - "crates/zakura-rpc/src/methods/types/get_block_template.rs"
@@ -41,8 +42,6 @@ on:
       - "crates/zakurad/tests/common/launch.rs"
       - "crates/zakurad/tests/common/mod.rs"
       - "crates/zakurad/tests/common/regtest.rs"
-      - "crates/zakurad/tests/common/regtest_net.rs"
-      - "crates/zakurad/tests/common/regtest_net/**"
   # The same paths as for pull requests.
   push:
     branches:
@@ -53,12 +52,13 @@ on:
       - ".config/nextest.toml"
       - "crates/zakura-chain/src/miner_mesh.rs"
       - "crates/zakura-chain/src/miner_mesh/**"
-      - "crates/zakura-network/src/zakura/discovery/**"
-      - "crates/zakura-network/src/zakura/regulation/**"
-      - "crates/zakura-network/src/zakura/transport/**"
-      - "crates/zakura-network/src/zakura/handler.rs"
-      - "crates/zakura-network/src/zakura/testkit/**"
-      - "crates/zakura-quic/**"
+      - "crates/zakura-network/src/zakura/discovery/candidate_dialer.rs"
+      - "crates/zakura-network/src/zakura/discovery/candidate_dialer/preferred.rs"
+      - "crates/zakura-network/src/zakura/discovery/candidate_dialer/replay.rs"
+      - "crates/zakura-network/src/zakura/transport/connection_places.rs"
+      - "crates/zakura-network/src/zakura/transport/handshake_counts.rs"
+      - "crates/zakura-network/src/zakura/transport/handshake_counts/slots.rs"
+      - "crates/zakura-network/src/zakura/transport/preferred_gateways.rs"
       - "crates/zakura-rpc/src/config/mining.rs"
       - "crates/zakura-rpc/src/methods.rs"
       - "crates/zakura-rpc/src/methods/types/get_block_template.rs"
@@ -75,8 +75,6 @@ on:
       - "crates/zakurad/tests/common/launch.rs"
       - "crates/zakurad/tests/common/mod.rs"
       - "crates/zakurad/tests/common/regtest.rs"
-      - "crates/zakurad/tests/common/regtest_net.rs"
-      - "crates/zakurad/tests/common/regtest_net/**"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}

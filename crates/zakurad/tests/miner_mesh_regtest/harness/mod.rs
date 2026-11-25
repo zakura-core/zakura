@@ -1,16 +1,15 @@
-//! A Regtest network of real `zakurad` processes on loopback.
+//! A miner mesh Regtest network of real `zakurad` processes on loopback.
 //!
 //! Each node is a `zakurad` child that runs only the v2 P2P stack, with a node
 //! key the harness chose, a fixed loopback v2 port, a fixed RPC port and the
 //! bootstrap peers its test names. A restarted node keeps its key, its ports
 //! and its state directory.
 //!
-//! Fillers are in-process v2 test nodes that dial a child and hold one of its
-//! connection places, so a test can fill a node's ordinary places without
-//! starting more children.
+//! In-process v2 peers probe whether a child refuses an ordinary connection
+//! at its capacity limit or when it is holding a place for a gateway.
 //!
 //! The harness counts the gateways named in blocks itself, from `getblock`
-//! and the bytes of each coinbase. Every step that changes the net ends with a
+//! and the chain crate's coinbase parser. Every step that changes the net ends with a
 //! check of the standing invariants on every running node, from its
 //! `getminermeshinfo` report and that count (see [`mesh_view`]).
 //!
@@ -19,7 +18,7 @@
 
 use std::{
     collections::HashMap,
-    fs, future,
+    fs,
     net::{Ipv4Addr, SocketAddr, TcpListener, UdpSocket},
     ops::RangeInclusive,
     path::{Path, PathBuf},
@@ -30,22 +29,18 @@ use std::{
 
 use eyre::{eyre, Result, WrapErr};
 use tempfile::TempDir;
-use tower::{service_fn, BoxError};
 
 use zakura_chain::{
     block::{self, Block, Height},
+    miner_mesh::MinerMeshCommitment,
     parameters::Network,
 };
 use zakura_network::{
-    self as zn,
-    zakura::{
-        self, testkit::ZakuraTestNode, zakura_trace_peer_label, LegacyGossipSink, ZakuraPeerId,
-        ZakuraSupervisorHandle, CONN_TABLE,
-    },
+    zakura::{zakura_trace_peer_label, ZakuraPeerId, CONN_TABLE},
     P2pStack,
 };
 use zakura_node_services::rpc_client::RpcRequestClient;
-use zakura_quic::{NodeAddr, NodeId, NodeSecretKey};
+use zakura_quic::{NodeId, NodeSecretKey};
 use zakura_test::{args, command::TestChild};
 use zakurad::config::ZakuradConfig;
 
@@ -92,6 +87,7 @@ const BLOCKS_PER_GENERATE: u32 = 10;
 const STOP_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// How long a filler waits for a child to accept its connection.
+#[cfg(feature = "prometheus")]
 const FILLER_DIAL_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Connections a child accepts from one IP address. Every node and filler
@@ -100,6 +96,7 @@ const MAX_CONNECTIONS_PER_IP: usize = 1_000;
 
 /// The first seed for filler node keys. The testkit derives filler keys from
 /// their seeds by hashing, so a filler's node ID never matches a child's.
+#[cfg(feature = "prometheus")]
 const FIRST_FILLER_SEED: u64 = 1_000;
 
 /// The lines of a node's log a startup failure report includes.
@@ -107,14 +104,6 @@ const LOG_TAIL_LINES: usize = 40;
 
 /// How long a peer's accepted connection record can take to reach the trace file.
 const CONNECTION_TRACE_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// The start of the lock script of a coinbase output that names a gateway:
-/// `OP_RETURN`, a push of the next 35 bytes, the tag `MR` and version 1. The
-/// 32-byte gateway ID follows.
-///
-/// The bytes are written out here, not taken from `zakura-chain`, so the
-/// harness's count checks the node's parser instead of repeating it.
-const GATEWAY_MARKER_PREFIX: [u8; 5] = [0x6a, 0x23, b'M', b'R', 0x01];
 
 /// The blocks above a marker before the gateway it names counts.
 pub const QUALIFYING_DEPTH: u32 = 100;
@@ -322,12 +311,6 @@ impl RegtestNode {
     }
 }
 
-/// A filler and the node it holds a place on.
-struct Filler {
-    target: usize,
-    node: ZakuraTestNode,
-}
-
 /// The receiving node's reason for refusing a filler.
 #[cfg(feature = "prometheus")]
 pub enum FillerRefusal {
@@ -335,11 +318,12 @@ pub enum FillerRefusal {
     HeldGatewayPlace,
 }
 
-/// A Regtest network of `zakurad` children and the fillers dialing them.
+/// A Regtest network of `zakurad` children.
 pub struct RegtestNet {
-    network: Network,
     nodes: Vec<RegtestNode>,
-    fillers: Vec<Filler>,
+    #[cfg(feature = "prometheus")]
+    network: Network,
+    #[cfg(feature = "prometheus")]
     next_filler_seed: u64,
 }
 
@@ -366,9 +350,10 @@ impl RegtestNet {
             .collect::<Result<Vec<_>>>()?;
 
         let mut net = Self {
+            #[cfg(feature = "prometheus")]
             network: network.clone(),
             nodes: Vec::with_capacity(specs.len()),
-            fillers: Vec::new(),
+            #[cfg(feature = "prometheus")]
             next_filler_seed: FIRST_FILLER_SEED,
         };
 
@@ -626,13 +611,6 @@ impl RegtestNet {
         self.nodes[node].stop().await;
     }
 
-    /// Starts `node` again, stopping it first if it is running, and waits
-    /// until it answers RPC requests.
-    pub async fn restart(&mut self, node: usize) -> Result<()> {
-        self.stop(node).await;
-        self.start_node(node).await
-    }
-
     /// `node`'s block at `height`.
     pub async fn block(&self, node: usize, height: u32) -> Result<Block> {
         let block = self
@@ -653,8 +631,7 @@ impl RegtestNet {
     /// Counts, from `node`'s blocks at `heights`, how many blocks name each
     /// gateway.
     ///
-    /// The count reads each block with `getblock` and the coinbase bytes
-    /// itself, independently of the node's own count.
+    /// Reads each block with `getblock` so the count is independent of the node's tracker.
     pub async fn recount(
         &self,
         node: usize,
@@ -669,19 +646,6 @@ impl RegtestNet {
         Ok(counts)
     }
 
-    /// Starts `count` fillers that each dial `node` and hold one of its
-    /// connection places.
-    ///
-    /// Fails at the first filler `node` does not accept within the dial
-    /// timeout; the fillers started before it keep their places.
-    pub async fn fill(&mut self, node: usize, count: usize) -> Result<()> {
-        for _ in 0..count {
-            let filler = self.spawn_filler().await?;
-            self.dial_filler(node, filler).await?;
-        }
-        Ok(())
-    }
-
     /// Starts one filler and requires the receiving node to record the expected refusal.
     #[cfg(feature = "prometheus")]
     pub async fn expect_filler_refused(
@@ -693,9 +657,25 @@ impl RegtestNet {
             FillerRefusal::AdmissionLimit => "zakura_p2p_conn_rejected_admission",
             FillerRefusal::HeldGatewayPlace => "zakura_p2p_conn_rejected_hold",
         };
-        let filler = self.spawn_filler().await?;
+        use zakura_network::zakura::testkit::ZakuraTestNode;
+        use zakura_quic::NodeAddr;
+
         let before = self.counter(node, counter).await?;
-        let Err(error) = self.dial_filler(node, filler).await else {
+        let seed = self.next_filler_seed;
+        self.next_filler_seed += 1;
+        let filler = ZakuraTestNode::builder(seed)
+            .handshake_network(self.network.clone())
+            .service_from_supervisor(serve_nothing)
+            .spawn()
+            .await
+            .map_err(|error| eyre!("filler {seed} could not start: {error}"))?;
+        let target = NodeAddr::with_addrs(self.nodes[node].node_id, [self.nodes[node].v2_addr]);
+        let result = filler
+            .connect_native_to_addr(target, FILLER_DIAL_TIMEOUT)
+            .await;
+        filler.shutdown().await;
+
+        let Err(error) = result else {
             return Err(eyre!("node {node} accepted an additional filler"));
         };
         eyre::ensure!(
@@ -724,51 +704,6 @@ impl RegtestNet {
             }
         }
         Ok(total)
-    }
-
-    async fn spawn_filler(&mut self) -> Result<ZakuraTestNode> {
-        let seed = self.next_filler_seed;
-        self.next_filler_seed += 1;
-        ZakuraTestNode::builder(seed)
-            .handshake_network(self.network.clone())
-            .service_from_supervisor(serve_nothing)
-            .spawn()
-            .await
-            .map_err(|error| eyre!("filler {seed} could not start: {error}"))
-    }
-
-    async fn dial_filler(&mut self, node: usize, filler: ZakuraTestNode) -> Result<()> {
-        let target = NodeAddr::with_addrs(self.nodes[node].node_id, [self.nodes[node].v2_addr]);
-        if let Err(error) = filler
-            .connect_native_to_addr(target, FILLER_DIAL_TIMEOUT)
-            .await
-        {
-            filler.shutdown().await;
-            return Err(eyre!("node {node} did not accept the filler: {error}"));
-        }
-        self.fillers.push(Filler {
-            target: node,
-            node: filler,
-        });
-        Ok(())
-    }
-
-    /// The fillers of `node` that are still connected to it.
-    pub fn connected_fillers(&self, node: usize) -> usize {
-        let node_id = self.nodes[node].node_id;
-        self.fillers
-            .iter()
-            .filter(|filler| filler.target == node)
-            .filter(|filler| {
-                filler
-                    .node
-                    .supervisor()
-                    .subscribe()
-                    .borrow()
-                    .iter()
-                    .any(|peer| peer.as_bytes() == node_id.as_bytes())
-            })
-            .count()
     }
 
     /// Mines `count` blocks on `node`, a few per RPC request.
@@ -966,23 +901,10 @@ impl RegtestNet {
     }
 }
 
-/// The gateway `block`'s coinbase names, if it names exactly one.
-///
-/// A naming output holds zero value and its lock script is the marker prefix
-/// followed by the 32-byte gateway ID, and nothing else. A coinbase with two or
-/// more naming outputs names no gateway.
+/// The gateway named by the block's coinbase, if it names one.
 fn named_gateway(block: &Block) -> Option<GatewayId> {
     let coinbase = block.transactions.first()?;
-    let mut named = coinbase.outputs().iter().filter_map(|output| {
-        if !output.value.is_zero() {
-            return None;
-        }
-        let script = output.lock_script.as_raw_bytes();
-        let gateway = script.strip_prefix(&GATEWAY_MARKER_PREFIX)?;
-        GatewayId::try_from(gateway).ok()
-    });
-    let gateway = named.next()?;
-    named.next().is_none().then_some(gateway)
+    MinerMeshCommitment::from_coinbase_outputs(coinbase.outputs()).map(|marker| marker.gateway_id())
 }
 
 /// A filler's answer to every request: nothing, as a node with no blocks or
@@ -990,7 +912,14 @@ fn named_gateway(block: &Block) -> Option<GatewayId> {
 ///
 /// Without a service that answers requests, the filler's own v2 stack closes
 /// the connection the first time the child sends it one.
-fn serve_nothing(supervisor: ZakuraSupervisorHandle) -> Arc<dyn zakura::Service> {
+#[cfg(feature = "prometheus")]
+fn serve_nothing(
+    supervisor: zakura_network::zakura::ZakuraSupervisorHandle,
+) -> Arc<dyn zakura_network::zakura::Service> {
+    use std::future;
+    use tower::{service_fn, BoxError};
+    use zakura_network::{self as zn, zakura::LegacyGossipSink};
+
     Arc::new(LegacyGossipSink::spawn(
         service_fn(|_request: zn::Request| future::ready(Ok::<_, BoxError>(zn::Response::Nil))),
         supervisor,
@@ -1082,5 +1011,40 @@ impl ReservedPorts {
             #[cfg(feature = "prometheus")]
             metrics: TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?,
         })
+    }
+}
+
+#[cfg(unix)]
+mod tests {
+    use super::*;
+
+    /// A node that exits outside the harness must fail convergence, even when
+    /// the remaining node has the expected best block.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "starts zakurad children: run with the miner-mesh-regtest nextest profile"]
+    async fn an_unexpected_exit_fails_convergence() -> Result<()> {
+        let _init_guard = zakura_test::init();
+        let mut net =
+            RegtestNet::start(vec![NodeSpec::new(Role::Relay), NodeSpec::new(Role::Relay)]).await?;
+        net.settle().await?;
+        net.rpc(1)
+            .json_result_from_call::<String>("stop", "[]")
+            .await
+            .map_err(|error| eyre::eyre!("stopping child by RPC: {error}"))?;
+        tokio::time::timeout(STOP_TIMEOUT, async {
+            while net.rpc(1).blockchain_info().await.is_ok() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await?;
+        let error = net
+            .settle()
+            .await
+            .expect_err("the harness still expects both children");
+        assert!(
+            error.to_string().contains("node 1 exited unexpectedly"),
+            "{error}"
+        );
+        Ok(())
     }
 }

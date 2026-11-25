@@ -16,9 +16,7 @@ use std::{
 
 use eyre::Result;
 
-use crate::common::regtest_net::{
-    GatewayId, NodeSpec, RegtestNet, Role, QUALIFYING_DEPTH, WINDOW_BLOCKS,
-};
+use super::harness::{GatewayId, NodeSpec, RegtestNet, Role, QUALIFYING_DEPTH, WINDOW_BLOCKS};
 
 use super::{DIAL_TIMEOUT, DISCOVERY_TIMEOUT, QUIET_PERIOD};
 

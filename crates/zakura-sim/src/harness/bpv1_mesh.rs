@@ -244,27 +244,31 @@ impl NodeState {
         if self.committed(hash) {
             return Answer::Duplicate;
         }
-        let (mut answer, joined) = {
+        // The spawn is a preemption point, so it waits until the verifying
+        // lock drops: a task the scheduler runs there may submit too.
+        let (mut answer, send) = {
             let mut verifying = lock(&self.verifying);
             match verifying.get(&hash) {
-                Some(answer) => (answer.clone(), true),
+                Some(answer) => (answer.clone(), None),
                 None => {
                     let (send, answer) = watch::channel(None);
                     verifying.insert(hash, answer.clone());
-                    self.count(|tally| *tally.verified.entry(hash).or_default() += 1);
-                    let state = self.clone();
-                    drop(zakura_rt::task::spawn_named(
-                        "bpv1-mesh-verify",
-                        async move {
-                            let answer = state.verify(block, via).await;
-                            lock(&state.verifying).remove(&hash);
-                            let _ = send.send(Some(answer));
-                        },
-                    ));
-                    (answer, false)
+                    (answer, Some(send))
                 }
             }
         };
+        let joined = send.is_none();
+        if let Some(send) = send {
+            let state = self.clone();
+            drop(zakura_rt::task::spawn_named(
+                "bpv1-mesh-verify",
+                async move {
+                    let answer = state.verify(block, via).await;
+                    lock(&state.verifying).remove(&hash);
+                    let _ = send.send(Some(answer));
+                },
+            ));
+        }
         let answer = loop {
             if let Some(answer) = *answer.borrow_and_update() {
                 break answer;
@@ -284,9 +288,15 @@ impl NodeState {
 
     /// Waits in the orphan queue until `block`'s parent commits, then
     /// verifies and commits it. Commits follow the chain one at a time, as
-    /// zakura-state's do.
+    /// zakura-state's do. A block committed since [`Self::answer`] checked
+    /// is a duplicate: an earlier verification committed it and left the
+    /// verifying map in between.
     async fn verify(&self, block: BlockHandle, via: Via) -> Answer {
         let hash = block.hash();
+        if self.committed(hash) {
+            return Answer::Duplicate;
+        }
+        self.count(|tally| *tally.verified.entry(hash).or_default() += 1);
         let parent = block.header().previous_block_hash;
         // Subscribed before the first check, so no commit slips between.
         let mut views = self.engine.subscribe_views();

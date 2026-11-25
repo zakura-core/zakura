@@ -412,7 +412,10 @@ fn best_header_jumping_past_the_parent_wakes_the_child() {
         &mut table,
         at,
         &woken,
-        HeaderAdmissionResult::Admitted { height: 11 },
+        HeaderAdmissionResult::Admitted {
+            height: 11,
+            parent_hash: parent,
+        },
     );
     let committed = commitment_ok(&mut table, at, &admitted);
     assert!(committed
@@ -466,7 +469,10 @@ fn best_header_moving_during_the_checks_retries_admission() {
         &mut table,
         now,
         &retried,
-        HeaderAdmissionResult::Admitted { height: 11 },
+        HeaderAdmissionResult::Admitted {
+            height: 11,
+            parent_hash: parent,
+        },
     );
     let committed = commitment_ok(&mut table, now, &admitted);
     assert!(committed
@@ -609,7 +615,10 @@ fn bpv1_75_running_unknown_parent_checks_never_refuse_viable_metadata() {
         &mut table,
         now,
         &received,
-        HeaderAdmissionResult::Admitted { height: 11 },
+        HeaderAdmissionResult::Admitted {
+            height: 11,
+            parent_hash: TEST_TIP_HASH,
+        },
     );
     let committed = commitment_ok(&mut table, now, &admitted);
     assert!(committed

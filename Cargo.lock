@@ -3073,6 +3073,7 @@ dependencies = [
  "zakura-network",
  "zakura-node-services",
  "zakura-orchard",
+ "zakura-quic",
  "zakura-rpc",
  "zakura-script",
  "zakura-state",

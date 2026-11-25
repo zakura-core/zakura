@@ -33,9 +33,6 @@ const P2PKH_STANDARD_INPUT_SIZE: usize = 150;
 /// The standard size of p2pkh outputs for the ZIP-317 fee calculation, in bytes.
 const P2PKH_STANDARD_OUTPUT_SIZE: usize = 34;
 
-/// Maximum fee weight ratio for Zakura's block template selection.
-const BLOCK_PRODUCTION_WEIGHT_RATIO_CAP: f32 = 13.0;
-
 /// The minimum fee for the block production weight ratio calculation, in zatoshis.
 /// If a transaction has a lower fee, this value is used instead.
 ///
@@ -98,7 +95,9 @@ pub fn unpaid_actions(transaction: &UnminedTx, miner_fee: Amount<NonNegative>) -
 
 /// Returns Zakura's block production fee weight ratio for `transaction`.
 ///
-/// This calculation will always return a positive, non-zero value.
+/// This calculation will always return a positive, non-zero value. Unlike
+/// ZIP-317, Zakura doesn't cap the ratio, so a transaction's weight grows with
+/// its whole fee.
 ///
 /// [ZIP-317]: https://zips.z.cash/zip-0317#block-production
 pub fn conventional_fee_weight_ratio(
@@ -119,9 +118,7 @@ pub fn conventional_fee_weight_ratio(
 
     let conventional_fee = i64::from(transaction.conventional_fee) as f32;
 
-    let uncapped_weight = miner_fee / conventional_fee;
-
-    uncapped_weight.min(BLOCK_PRODUCTION_WEIGHT_RATIO_CAP)
+    miner_fee / conventional_fee
 }
 
 /// Returns the conventional actions for `transaction`, `max(logical_actions, GRACE_ACTIONS)`,

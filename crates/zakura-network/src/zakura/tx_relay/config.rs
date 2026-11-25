@@ -9,13 +9,15 @@ use super::machine::{FanOut, ADVERT_DELAY, WINDOW_FULL, WINDOW_SMALL};
 /// `tx-relay` settings, nested under the Zakura P2P-v2 config.
 ///
 /// `tx-relay` runs only when it is enabled here, the v2 stack is on, and the
-/// mempool runs the pool core (`[mempool] implementation = "core"`).
+/// mempool runs the pool core, which `[mempool] implementation = "default"`
+/// picks on a v2 stack.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ZakuraTxRelayConfig {
-    /// Whether to move transactions over `tx-relay`. Off by default. At full
-    /// load, with 92 peers each announcing a full pool of its own, its
-    /// bookkeeping can use about 400 MiB of memory.
+    /// Whether to move transactions over `tx-relay`. On by default, so it
+    /// follows the pool: it runs with the pool core and stays off with
+    /// `classic`. At full load, with 92 peers each announcing a full pool of
+    /// its own, its bookkeeping can use about 400 MiB of memory.
     pub enabled: bool,
 
     /// How long a session outside a transaction's fan-out window waits before
@@ -46,7 +48,7 @@ pub struct ZakuraTxRelayConfig {
 impl Default for ZakuraTxRelayConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             advert_delay: ADVERT_DELAY,
             advert_window_full_tx: WINDOW_FULL,
             advert_window_small_tx: WINDOW_SMALL,

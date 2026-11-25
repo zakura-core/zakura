@@ -1633,6 +1633,47 @@ fn decision20_proposer_admission_announces_nothing() {
     );
 }
 
+/// bpv1-45: a proposed block whose local commit failed retires and stops
+/// serving. A peer's block is left to its own verdict.
+#[test]
+fn bpv1_45_a_failed_local_commit_retires_only_the_proposed_block() {
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let now = Instant::now();
+    let encoded = encode_body(&Profile::TINY, &[0x23; 128], 2).unwrap();
+    let relayed = block::Hash([43; 32]);
+    admit(&mut table, now, relayed, encoded.coding, encoded.part_root);
+    let proposed = block::Hash([42; 32]);
+    table.step(
+        now,
+        BlockInput::BlockAdmittedLocal {
+            height: 2,
+            envelope: make_envelope(proposed, encoded.coding, encoded.part_root, node_id(1)),
+            parts: encoded.parts.clone(),
+        },
+    );
+
+    let step = table.step(now, BlockInput::ProposedCommitFailed { block_id: relayed });
+    assert!(step.outputs.is_empty(), "a peer's block keeps collecting");
+    assert_eq!(table.block_phase(&relayed), Some(BlockPhase::Collecting));
+
+    let step = table.step(now, BlockInput::ProposedCommitFailed { block_id: proposed });
+    assert!(
+        step.outputs.iter().any(|output| matches!(
+            output,
+            BlockOutput::PublishRetire { block_id, .. } if *block_id == proposed
+        )),
+        "the retirement reaches every session"
+    );
+    assert_eq!(table.block_phase(&proposed), Some(BlockPhase::Retired));
+    assert!(
+        table
+            .active_admitted_blocks()
+            .iter()
+            .all(|(admitted, _)| admitted.block_id != proposed),
+        "sessions that connect later never hear of it"
+    );
+}
+
 /// decision-20: a `BlockDone` peer holds every part, so a repair round asks
 /// it even without a `Have`; normal pulls never do.
 #[test]

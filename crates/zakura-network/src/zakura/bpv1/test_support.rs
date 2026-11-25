@@ -771,11 +771,11 @@ impl MachineMesh {
         self.links.insert((a, b), a_to_b);
         self.links.insert((b, a), b_to_a);
         for (from, to, estimate) in [(a, b, a_sees_b), (b, a, b_sees_a)] {
-            let (local, remote) = (self.nodes[from].id, self.nodes[to].id);
+            let remote = self.nodes[to].id;
             if self.nodes[from].adversary.is_none() {
                 self.nodes[from]
                     .peers
-                    .insert(to, PeerState::new(peer_cfg, local, remote, 1));
+                    .insert(to, PeerState::new(peer_cfg, remote, 1));
             }
             if let Some(estimate) = estimate {
                 self.nodes[from].table.step(

@@ -2003,7 +2003,12 @@ impl<'de> Deserialize<'de> for Config {
         if p2p_stack.resolve(&network).runs_zakura() {
             // Legacy-only nodes create no QUIC endpoint. For v2, the endpoint
             // lowers a larger cap after tracing starts so its warning is logged.
-            zakura
+            // Whether `tx-relay` runs is decided at startup with the pool, so
+            // this checks the shares every connection has, and the endpoint
+            // charges `tx-relay`'s once it is registered.
+            let mut without_tx_relay = zakura.clone();
+            without_tx_relay.tx_relay.enabled = false;
+            without_tx_relay
                 .budgeted_max_connections(&network)
                 .map_err(de::Error::custom)?;
         }

@@ -298,15 +298,14 @@ fn ranking_from(nodes: &[NodeId; NODES], arg: u8) -> GatewayRanking {
     nodes
         .iter()
         .enumerate()
-        .map(|(index, &node)| RankedGateway {
-            node,
-            // The table holds four nodes, so the count fits.
-            blocks: (NODES - index) as u32,
-            standing: if arg & (1 << index) != 0 {
+        .map(|(index, &node)| {
+            let standing = if arg & (1 << index) != 0 {
                 GatewayStanding::Dialable
             } else {
                 GatewayStanding::Unmatched
-            },
+            };
+            // The table holds four nodes, so the count fits.
+            RankedGateway::resolved(node, (NODES - index) as u32, standing)
         })
         .collect()
 }

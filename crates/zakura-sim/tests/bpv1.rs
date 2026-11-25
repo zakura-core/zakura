@@ -37,12 +37,7 @@ fn session_with_want(peer: u8, block_id: block::Hash) -> (PeerState, u32, Vec<Ve
     let encoded = encode_body(&Profile::TINY, &[0x42; 64], 2).expect("TINY body encodes");
     let coding = encoded.coding;
     let now = Instant::now();
-    let mut state = PeerState::new(
-        PeerConfig::for_profile(Profile::TINY),
-        node_id(1),
-        node_id(peer),
-        1,
-    );
+    let mut state = PeerState::new(PeerConfig::for_profile(Profile::TINY), node_id(peer), 1);
     let meta = Box::new(Bpv1Message::HeaderMeta {
         header: block_id.0.to_vec(),
         binding: CoinbaseBinding {

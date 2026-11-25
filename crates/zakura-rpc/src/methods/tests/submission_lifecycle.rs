@@ -281,3 +281,131 @@ async fn trusted_rpc_keeps_uncertain_hashes_private_and_reports_an_unconfirmed_d
         queue.abort();
     }
 }
+
+/// What a [`RecordingBpv1Proposer`] saw, in call order.
+#[derive(Debug, PartialEq, Eq)]
+enum Bpv1Call {
+    /// `publish_solved_block`, and whether the early announcement was already queued.
+    Publish { announced_first: bool },
+    /// `retire_failed_block`.
+    Retire,
+}
+
+/// Records BPv1 hook calls and whether each publish came after the early announcement.
+#[derive(Debug)]
+struct RecordingBpv1Proposer {
+    early: std::sync::Mutex<
+        tokio::sync::mpsc::UnboundedReceiver<crate::methods::types::submit_block::EarlyMinedBlock>,
+    >,
+    calls: std::sync::Mutex<Vec<Bpv1Call>>,
+}
+
+impl zakura_node_services::bpv1_proposer::Bpv1ProposerHook for RecordingBpv1Proposer {
+    fn prepare_template_commitment(
+        &self,
+        _light_client_root: [u8; 32],
+        _height: zakura_chain::block::Height,
+        _tx_count: u32,
+        _body_after_coinbase: &[u8],
+    ) -> Option<[u8; zakura_node_services::bpv1_proposer::BPV1_COMMITMENT_NULL_DATA_LEN]> {
+        None
+    }
+
+    fn publish_solved_block(
+        &self,
+        _block: Arc<Block>,
+        _height: zakura_chain::block::Height,
+    ) -> bool {
+        let announced_first = self.early.lock().unwrap().try_recv().is_ok();
+        self.calls
+            .lock()
+            .unwrap()
+            .push(Bpv1Call::Publish { announced_first });
+        true
+    }
+
+    fn retire_failed_block(&self, _hash: zakura_chain::block::Hash) {
+        self.calls.lock().unwrap().push(Bpv1Call::Retire);
+    }
+}
+
+/// Submits a mined block whose state admission authorizes early relay, then
+/// answers its commit with `verdict`. Returns the BPv1 hook calls.
+async fn bpv1_calls_after_admission(
+    verdict: fn(zakura_chain::block::Hash) -> Result<zakura_chain::block::Hash, tower::BoxError>,
+) -> Vec<Bpv1Call> {
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .expect("the genesis block is valid");
+    let hash = block.hash();
+    let (sender, early) = tokio::sync::mpsc::unbounded_channel();
+    let bpv1 = Arc::new(RecordingBpv1Proposer {
+        early: std::sync::Mutex::new(early),
+        calls: Default::default(),
+    });
+    let verifier = tower::service_fn(move |request: zakura_consensus::Request| async move {
+        let zakura_consensus::Request::CommitMined { admission, .. } = request else {
+            unreachable!("a mined submission commits through CommitMined");
+        };
+        admission.authorize_optimistic_relay();
+        admission.admit_for_test();
+        // The writer commits after the submission observes admission.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        verdict(hash)
+    });
+    Submission {
+        block: block.clone(),
+        hash,
+        height: block.coinbase_height().unwrap(),
+        size: 0,
+        submitted_at: std::time::Instant::now(),
+        method: MinedBlockSubmission::FullBlock,
+        reservation: MinedSubmissions::default().reserve(hash).unwrap(),
+    }
+    .spawn(
+        verifier,
+        sender,
+        RelayPolicy::AfterStateAdmission {
+            pending_blocks: PendingBlockRegistry::default(),
+            optimistic_block_inventory: true,
+            bpv1_proposer: Some(bpv1.clone()),
+        },
+        |_| (),
+    )
+    .await
+    .unwrap();
+    let calls = std::mem::take(&mut *bpv1.calls.lock().unwrap());
+    calls
+}
+
+/// BPv1 publishes after the early announcement is queued, so its serialization
+/// never delays that announcement. A commit that fails after BPv1 published
+/// retires the block; a commit that succeeds, or a duplicate verdict for a
+/// block already in state, keeps it relaying.
+#[tokio::test(start_paused = true)]
+async fn bpv1_publishes_after_the_early_announcement_and_retires_a_failed_commit() {
+    let published = Bpv1Call::Publish {
+        announced_first: true,
+    };
+    assert_eq!(
+        bpv1_calls_after_admission(|_| Err("the write queue rejected the block".into())).await,
+        [
+            Bpv1Call::Publish {
+                announced_first: true
+            },
+            Bpv1Call::Retire
+        ],
+    );
+    assert_eq!(bpv1_calls_after_admission(Ok).await, [published]);
+    assert_eq!(
+        bpv1_calls_after_admission(|hash| Err(tower::BoxError::from(
+            zakura_consensus::RouterError::from(zakura_consensus::VerifyBlockError::from(
+                zakura_consensus::BlockError::AlreadyInChain(hash, KnownBlock::BestChain),
+            )),
+        )))
+        .await,
+        [Bpv1Call::Publish {
+            announced_first: true
+        }],
+    );
+}

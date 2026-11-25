@@ -2589,7 +2589,10 @@ impl BlockTable {
     /// The binding check is a pure function of the envelope, so each session
     /// whose copy equals the failed envelope sent the failed binding. The
     /// alternate keeps the entry's place in the pending budget, its deadline
-    /// and its best-header count.
+    /// and its best-header count. Its new owner is the first of its senders
+    /// below [`MAX_PENDING_META_PER_PEER`] (`bpv1-11`). An alternate whose
+    /// senders are all at that cap is rejected without fault, and the next
+    /// one takes its place.
     fn handle_unknown_parent_binding_failed(
         &mut self,
         block_id: block::Hash,
@@ -2597,15 +2600,35 @@ impl BlockTable {
         step: &mut BlockStep,
     ) {
         let mut later = entry.later;
-        let Some((envelope, senders)) = close_failed_copies(
+        let mut next = close_failed_copies(
             block_id,
             (entry.from_peer, entry.session_gen),
             &mut later,
             step,
-        ) else {
-            return;
+        );
+        let (envelope, from_peer, session_gen) = loop {
+            let Some((envelope, mut senders)) = next else {
+                return;
+            };
+            let below_cap = senders
+                .iter()
+                .position(|&(peer, _)| self.pending_held_by(peer).0 < MAX_PENDING_META_PER_PEER);
+            if let Some(index) = below_cap {
+                let owner = senders.remove(index);
+                senders.insert(0, owner);
+                let (from_peer, session_gen) = promote_alternate(senders, &mut later);
+                break (envelope, from_peer, session_gen);
+            }
+            for (peer, session_gen) in senders {
+                reject_meta(step, block_id, peer, session_gen);
+            }
+            next = later.alternates.pop_front();
+            if next.is_none() {
+                for &(peer, session_gen) in &later.unkept {
+                    reject_meta(step, block_id, peer, session_gen);
+                }
+            }
         };
-        let (from_peer, session_gen) = promote_alternate(senders, &mut later);
         let work_id = alloc_work_id(&mut self.next_work_id);
         self.work_to_block.insert(work_id, block_id);
         step.outputs.push(BlockOutput::CheckUnknownParent {

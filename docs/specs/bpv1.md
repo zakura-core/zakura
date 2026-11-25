@@ -821,7 +821,9 @@ admission:
   Kept copies use only room that no first copy needs, and they give way to
   any first copy that the node admits.
 - When the first copy fails, the node checks the kept copies one at a time,
-  in arrival order, until one passes.
+  in arrival order, until one passes. With a missing parent, a kept copy
+  whose senders all hold the per-peer pending limit returns `Drop`, and the
+  next kept copy takes its place.
 - A peer whose session ended gets no answer, so the node forgets it as a
   sender of a copy.
 - Every other duplicate from another peer returns `Drop`, including each copy

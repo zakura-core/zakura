@@ -13,7 +13,7 @@ use zakura_rt::time::Instant;
 use super::{
     blocks::{
         BlockConfig, BlockEvent, BlockInput, BlockOutput, BlockStep, BlockTable,
-        HeaderAdmissionResult,
+        HeaderAdmissionResult, MAX_PENDING_META_PER_PEER,
     },
     blocks_tests::{
         closed_sessions, commitment_ok, header_result, missing_parent, rejected_sessions,
@@ -510,6 +510,72 @@ fn close_4_failed_unknown_parent_binding_checks_the_alternate() {
         .iter()
         .all(|o| !matches!(o, BlockOutput::ClosePeer { .. })));
     assert_eq!(table.pending_meta_len(), 1);
+    table.assert_invariants();
+}
+
+/// An alternate whose sender already holds [`MAX_PENDING_META_PER_PEER`]
+/// pending entries does not take over a failed unknown-parent binding
+/// (`bpv1-11`). Its copy is rejected without fault, and the next alternate
+/// takes the entry.
+#[test]
+fn close_4_failed_unknown_parent_binding_skips_an_alternate_at_the_pending_cap() {
+    let now = Instant::now();
+    let parent = block::Hash([0x3C; 32]);
+    let block_id = block::Hash([0x3D; 32]);
+    let [a, b, c, _] = sessions();
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    for i in (0u8..).take(MAX_PENDING_META_PER_PEER) {
+        let held = copy_from(
+            &mut table,
+            now,
+            make_envelope(
+                block::Hash([0x80 + i; 32]),
+                tiny(),
+                [0xB0 + i; 32],
+                node_id(1),
+            ),
+            b,
+        );
+        missing_parent(&mut table, now, &held, parent);
+    }
+    let first = copy_from(
+        &mut table,
+        now,
+        make_envelope(block_id, tiny(), [0xC1; 32], node_id(1)),
+        a,
+    );
+    for (root, from) in [([0xC2; 32], b), ([0xC3; 32], c)] {
+        copy_from(
+            &mut table,
+            now,
+            make_envelope(block_id, tiny(), root, node_id(1)),
+            from,
+        );
+    }
+    let checking = header_result(
+        &mut table,
+        now,
+        &first,
+        HeaderAdmissionResult::MissingParent {
+            parent_hash: parent,
+        },
+    );
+    let failed = unknown_parent_checked(
+        &mut table,
+        now,
+        &checking,
+        UnknownParentVerdict::Invalid(Bpv1CloseRow::Row4BadMetaOrCommitment),
+    );
+    assert_eq!(
+        closed_sessions(&failed, Bpv1CloseRow::Row4BadMetaOrCommitment),
+        vec![a]
+    );
+    assert_eq!(rejected_sessions(&failed, block_id), vec![b]);
+    table.assert_invariants();
+
+    // `c`'s copy took the entry, so its checks run and it parks.
+    unknown_parent_checked(&mut table, now, &failed, UnknownParentVerdict::Park);
+    assert_eq!(table.pending_meta_len(), MAX_PENDING_META_PER_PEER + 1);
     table.assert_invariants();
 }
 

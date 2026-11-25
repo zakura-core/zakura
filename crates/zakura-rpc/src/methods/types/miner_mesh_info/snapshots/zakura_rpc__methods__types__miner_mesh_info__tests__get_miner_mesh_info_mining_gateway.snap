@@ -21,30 +21,35 @@ expression: response
       "gateway_id": "4d70dccee88cea83ef71f9f870489b10f5c6c112",
       "blocks": 40,
       "state": "preferred",
+      "template_node": false,
       "connected": true
     },
     {
       "gateway_id": "67bb6f072c1140d0d2198e9f937d24aeeb8d6446",
       "blocks": 12,
       "state": "backoff",
+      "template_node": false,
       "connected": false
     },
     {
       "gateway_id": "96ddfe87e3074e921304847fa147e7ee97ea3b7e",
       "blocks": 7,
       "state": "standby",
+      "template_node": false,
       "connected": true
     },
     {
       "gateway_id": "ccc7a088afe130bbb69492031e9fa86cce462885",
       "blocks": 3,
       "state": "unmatched",
+      "template_node": false,
       "connected": false
     },
     {
       "gateway_id": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4",
       "blocks": 2,
       "state": "ambiguous",
+      "template_node": false,
       "connected": false
     }
   ],

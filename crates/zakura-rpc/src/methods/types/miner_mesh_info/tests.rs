@@ -29,6 +29,9 @@ const UNMATCHED_GATEWAY: [u8; 32] =
     node_id(b"ccc7a088afe130bbb69492031e9fa86cce4628852cc966a62ad73423e20bd947");
 const ORDINARY_PEER: [u8; 32] =
     node_id(b"ce2480c5c1da2c6c9d28b1a6f119b1eafb5993be37b2ad01728f3d286d5d93ea");
+/// A relay's template node that is offline. It is not a peer.
+const OFFLINE_TEMPLATE_NODE: [u8; 32] =
+    node_id(b"5f1a3c9e0b7d42e8a6c1f04d9b3e7a2c8d5f6e1b0a9c3d7e2f4b8a6c0d1e9f3a");
 /// A gateway whose ID two known nodes share. It is not a peer.
 const AMBIGUOUS_GATEWAY: [u8; 32] =
     node_id(b"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
@@ -190,6 +193,50 @@ fn a_relay_that_prefers_gateways_reports_its_window_without_announcing() {
     assert!(response.announced_gateways.is_empty());
     assert_eq!(response.window, Some(MeshWindow::from(&coverage())));
     assert_eq!(response.hold, 1);
+}
+
+/// A relay's template node reads as one, whether it is connected in its held
+/// place or offline with its place waiting. Here the ordinary peer is a
+/// template node.
+#[test]
+fn a_relay_reports_its_template_nodes_first_and_whether_they_are_connected() {
+    let mut places = places();
+    places.hold = 2;
+    places.slots.preferred = 2;
+    places.slots.ordinary = 1;
+    places.slots.ordinary_inbound = 0;
+    places.peers[2].preferred = true;
+    places.gateways.insert(
+        0,
+        PlacedGateway {
+            always_preferred: true,
+            ..gateway(ORDINARY_PEER, 0, GatewayPlace::Preferred, true)
+        },
+    );
+    places.gateways.insert(
+        1,
+        PlacedGateway {
+            always_preferred: true,
+            ..gateway(OFFLINE_TEMPLATE_NODE, 0, GatewayPlace::Unmatched, false)
+        },
+    );
+
+    let response = GetMinerMeshInfoResponse::new(node(), Some(&coverage()), Some(&places));
+
+    let reported: Vec<_> = response
+        .gateways
+        .iter()
+        .map(|gateway| (gateway.template_node, gateway.state, gateway.connected))
+        .collect();
+    assert_eq!(
+        reported[..3],
+        [
+            (true, MeshGatewayState::Preferred, true),
+            (true, MeshGatewayState::Unmatched, false),
+            (false, MeshGatewayState::Preferred, true),
+        ]
+    );
+    assert_eq!(response.hold, 2);
 }
 
 #[test]

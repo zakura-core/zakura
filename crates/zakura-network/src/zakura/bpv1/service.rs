@@ -1024,6 +1024,7 @@ pub(crate) fn frontier_inputs(last: Option<FrontierSet>, next: FrontierSet) -> V
     if last.map(|last| last.verified_best) != Some(next.verified_best) {
         inputs.push(BlockInput::TipHeight {
             height: next.verified_best.height.0,
+            hash: next.verified_best.hash,
         });
         inputs.push(BlockInput::FallbackDone {
             block_id: next.verified_best.hash,

@@ -373,7 +373,10 @@ impl HeaderAdmissionPort for ParentGatedHeaderAdmission {
     ) -> PortFuture<'_, HeaderAdmissionResult> {
         self.calls.fetch_add(1, Ordering::AcqRel);
         let result = if self.parent_admitted.load(Ordering::Acquire) {
-            HeaderAdmissionResult::Admitted { height: 10 }
+            HeaderAdmissionResult::Admitted {
+                height: 10,
+                parent_hash: header.previous_block_hash,
+            }
         } else {
             HeaderAdmissionResult::MissingParent {
                 parent_hash: header.previous_block_hash,
@@ -575,7 +578,7 @@ fn frontier_inputs_follow_committed_frontier_changes() {
         inputs
             .into_iter()
             .map(|input| match input {
-                BlockInput::TipHeight { height } => format!("tip {height}"),
+                BlockInput::TipHeight { height, .. } => format!("tip {height}"),
                 BlockInput::FallbackDone { block_id } => format!("done {}", block_id.0[0]),
                 BlockInput::ParentAdmitted { hash, height } => {
                     format!("parent {} {height}", hash.0[0])

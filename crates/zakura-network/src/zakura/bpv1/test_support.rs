@@ -233,13 +233,16 @@ pub(super) struct AcceptingHeaderAdmission(pub(super) u32);
 impl HeaderAdmissionPort for AcceptingHeaderAdmission {
     fn admit(
         &self,
-        _header: Arc<Header>,
+        header: Arc<Header>,
         _source_peer: NodeId,
         _session_gen: u64,
         _work_id: WorkId,
     ) -> PortFuture<'_, HeaderAdmissionResult> {
-        let height = self.0;
-        Box::pin(async move { HeaderAdmissionResult::Admitted { height } })
+        let result = HeaderAdmissionResult::Admitted {
+            height: self.0,
+            parent_hash: header.previous_block_hash,
+        };
+        Box::pin(async move { result })
     }
 }
 
@@ -464,6 +467,10 @@ pub(super) fn connect_pair(
     svc_b.add_peer(peer_b);
 }
 
+/// The verified tip hash, and the parent hash headerchain reports, in table
+/// tests. A block one above the verified tip then extends it.
+pub(super) const TEST_TIP_HASH: block::Hash = block::Hash([0; 32]);
+
 /// A metadata envelope whose header bytes are the block hash.
 pub(super) fn make_envelope(
     block_id: block::Hash,
@@ -510,7 +517,10 @@ pub(super) fn admit_meta(
         now,
         BlockInput::HeaderAdmitted {
             work_id: admit_work(&s1),
-            result: HeaderAdmissionResult::Admitted { height },
+            result: HeaderAdmissionResult::Admitted {
+                height,
+                parent_hash: TEST_TIP_HASH,
+            },
         },
     );
     let s3 = table.step(
@@ -1105,6 +1115,7 @@ impl MachineMesh {
                 work_id,
                 result: HeaderAdmissionResult::Admitted {
                     height: MESH_HEIGHT,
+                    parent_hash: TEST_TIP_HASH,
                 },
             },
             BlockOutput::VerifyCommitment { work_id, .. } => {

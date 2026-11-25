@@ -41,15 +41,22 @@ fn header_admission_maps_every_headerchain_reply() {
             already_known,
         })
     };
+    let header_parent = block::Hash([0x07; 32]);
     let cases = [
         (
             admitted(false),
-            HeaderAdmissionResult::Admitted { height: 42 },
+            HeaderAdmissionResult::Admitted {
+                height: 42,
+                parent_hash: header_parent,
+            },
         ),
         // A header headerchain already retains still admits (`decision-2`).
         (
             admitted(true),
-            HeaderAdmissionResult::Admitted { height: 42 },
+            HeaderAdmissionResult::Admitted {
+                height: 42,
+                parent_hash: header_parent,
+            },
         ),
         (
             Ok(ExactHeaderAdmission::MissingParent { parent_hash }),
@@ -66,7 +73,7 @@ fn header_admission_maps_every_headerchain_reply() {
         (Err(PortError::Timeout), HeaderAdmissionResult::LocalError),
     ];
     for (admission, expected) in cases {
-        assert_eq!(admission_result(admission), expected);
+        assert_eq!(admission_result(admission, header_parent), expected);
     }
 }
 

@@ -1332,7 +1332,7 @@ fields, trailing bytes, and lengths above these bounds before allocation.
 | Pushed seeds per stripe per holder; flagged indices per stripe per connection | `min(n - k, ceil(real / eligible))`; `n` from the proposer, of which `n - k` relay, and `n - k` from any other peer |
 | Header bytes; key-binding bytes | 4,096; 2,002,086 |
 | Coinbase bytes; coinbase Merkle siblings | `MAX_BLOCK_BYTES` (the consensus bound); 32 |
-| Control-stream frame cap; data-stream frame cap | 2,006,286 bytes; 66,085 bytes |
+| Control-stream frame cap; data-stream frame cap | 2,006,287 bytes; 66,085 bytes |
 
 These are syntax limits, not assembly reservations or performance guarantees.
 The profile MUST impose lower admission bounds where consensus or node-wide work

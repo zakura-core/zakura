@@ -171,13 +171,23 @@ pub(super) async fn classify_gateways(
     discovery: &ZakuraDiscoveryHandle,
     now: Instant,
 ) -> ClassifiedGateways {
-    let registered: HashSet<NodeId> = registered.iter().copied().collect();
+    if ranked.is_empty() {
+        return ClassifiedGateways::default();
+    }
+    let exact: HashSet<NodeId> = registered.iter().copied().collect();
+    // A live connection still proves its earlier ID after the book evicts
+    // that record. Keep both full IDs for the usual prefix ambiguity check.
+    let connected: HashSet<NodeId> = exact
+        .iter()
+        .copied()
+        .chain(moved.borrow().earlier_ids_reaching(&exact))
+        .collect();
     let in_flight: HashSet<NodeId> = state.in_flight_node_ids().into_iter().collect();
 
     // The registered and in-flight nodes each ranked gateway ID names.
     let ranked_ids: HashSet<GatewayId> = ranked.iter().map(RankedGateway::gateway).collect();
     let mut local: HashMap<GatewayId, GatewayMatch<NodeId>> = HashMap::default();
-    for node in registered.iter().chain(&in_flight) {
+    for node in connected.iter().chain(&in_flight) {
         let gateway = GatewayId::from_node_id(node.as_bytes());
         if ranked_ids.contains(&gateway) {
             let known = local.entry(gateway).or_insert(GatewayMatch::None);
@@ -185,12 +195,8 @@ pub(super) async fn classify_gateways(
         }
     }
 
-    let book_answers = if ranked.is_empty() {
-        Vec::new()
-    } else {
-        let gateways: Vec<GatewayId> = ranked.iter().map(RankedGateway::gateway).collect();
-        discovery.gateway_targets(&gateways).await
-    };
+    let gateways: Vec<GatewayId> = ranked.iter().map(RankedGateway::gateway).collect();
+    let book_answers = discovery.gateway_targets(&gateways).await;
     assert_eq!(
         book_answers.len(),
         ranked.len(),
@@ -207,14 +213,12 @@ pub(super) async fn classify_gateways(
             GatewayMatch::None => *gateway,
             GatewayMatch::Several => gateway.into_ambiguous(),
             GatewayMatch::One(node) => {
-                let is_among = |nodes: &HashSet<NodeId>| {
-                    moved
-                        .borrow()
-                        .under_either_id(node, |id| nodes.contains(id))
-                };
-                let standing = if is_among(&registered) {
+                let standing = if connected.contains(&node) {
                     GatewayStanding::Connected
-                } else if is_among(&in_flight) {
+                } else if moved
+                    .borrow()
+                    .under_either_id(node, |id| in_flight.contains(id))
+                {
                     GatewayStanding::Dialing
                 } else {
                     let GatewayMatch::One((_, target)) = book_answer else {
@@ -867,6 +871,20 @@ mod tests {
             classified.ranking[0].resolution(),
             GatewayMatch::One((earlier, GatewayStanding::Dialable))
         );
+    }
+
+    #[tokio::test]
+    async fn a_live_earlier_id_and_another_book_id_with_its_prefix_are_ambiguous() {
+        let earlier = raw_node_id(1, 0);
+        let current = raw_node_id(2, 0);
+        let other = raw_node_id(1, 1);
+        let mut moves = MovedNodeIds::default();
+        moves.learn(earlier, current);
+        let moved = watch::channel(moves).1;
+        let classified =
+            classify_with_moves(&[unresolved(earlier, 1)], &[current], &[other], &moved).await;
+        assert_eq!(classified.ranking[0].resolution(), GatewayMatch::Several);
+        assert!(classified.dialable.is_empty());
     }
 
     #[tokio::test]

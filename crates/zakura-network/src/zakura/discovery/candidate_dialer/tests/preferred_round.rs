@@ -456,3 +456,84 @@ async fn moved_gateway_ranked_under_both_ids_gets_one_dial_per_round() {
     assert!(next.preferred.is_empty() && next.ordinary.is_empty());
     node.shutdown().await;
 }
+
+#[tokio::test]
+async fn moved_gateway_report_survives_eviction_of_the_earlier_record(
+) -> Result<(), crate::BoxError> {
+    use crate::zakura::{
+        testkit::{LocalEndpointFactory, TEST_NET_TIMEOUT},
+        GatewayPlace, ZakuraDiscoveryConfig, ZakuraDiscoveryLocalConfig, ZakuraHandshakeConfig,
+    };
+    let (node, mut io, ranks) = dialer(9340).await;
+    let peer = ZakuraTestNode::builder(9341)
+        .extended_credential()
+        .spawn()
+        .await?;
+    let earlier = peer.earlier_node_addr().await;
+    let current = peer.node_addr().await.id;
+    let handshake = ZakuraHandshakeConfig::for_network(&zakura_chain::parameters::Network::Mainnet);
+    let book = |seed| {
+        let local = ZakuraDiscoveryLocalConfig {
+            secret_key: LocalEndpointFactory::secret_key(seed),
+            direct_addrs: vec![SocketAddr::from(([93, 184, 216, 34], 8233))],
+            services: vec![ZakuraServiceId::discovery()],
+            zakura_protocol_min: handshake.zakura_protocol_min,
+            zakura_protocol_max: handshake.zakura_protocol_max,
+            network_id: handshake.network_id,
+            chain_id: handshake.chain_id,
+            last_authored_sequence: None,
+        };
+        let mut config = ZakuraDiscoveryConfig::default();
+        config.book_limits.max_records = 1;
+        ZakuraDiscoveryHandle::new(local, config, node.supervisor().subscribe())
+    };
+    io.discovery = book(9340)?;
+    let old_record = (*book(9341)?.current_self_record()).clone();
+    assert_eq!(old_record.body.node_id(), earlier.id);
+    io.discovery
+        .import_peer_records([old_record], Some(node_id(9)))
+        .await?;
+    assert!(io.discovery.record_for(earlier.id).await.is_some());
+    node.connect_native_to_addr(earlier.clone(), TEST_NET_TIMEOUT)
+        .await?;
+    let replacement = (*book(9342)?.current_self_record()).clone();
+    let replacement_id = replacement.body.node_id();
+    io.discovery
+        .import_connected_peer_record(
+            replacement,
+            replacement_id,
+            Some(IpAddr::from([93, 184, 216, 34])),
+        )
+        .await?;
+    assert!(
+        io.discovery.record_for(earlier.id).await.is_none(),
+        "the single-entry book evicts the relayed record"
+    );
+    ranks.send_replace(ranking(&[earlier.id]));
+    let state = CandidateDialerState::new(DIAL_BACKOFF);
+    io.publish_preferred_gateways(&state, &[current], Instant::now())
+        .await;
+    let report = node.endpoint().connection_places();
+    assert_eq!(
+        (report.gateways[0].place, report.gateways[0].connected),
+        (GatewayPlace::Standby, true)
+    );
+    assert_eq!(report.peers.len(), 1);
+    assert_eq!(report.peers[0].node_id, *current.as_bytes());
+    assert_eq!((report.slots.ordinary, report.slots.preferred), (1, 0));
+    peer.shutdown().await;
+    tokio::time::timeout(
+        TEST_NET_TIMEOUT,
+        node.supervisor().subscribe().wait_for(Vec::is_empty),
+    )
+    .await??;
+    io.publish_preferred_gateways(&state, &[], Instant::now())
+        .await;
+    let report = node.endpoint().connection_places();
+    assert_eq!(
+        (report.gateways[0].place, report.gateways[0].connected),
+        (GatewayPlace::Unmatched, false)
+    );
+    node.shutdown().await;
+    Ok(())
+}

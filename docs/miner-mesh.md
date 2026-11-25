@@ -177,6 +177,11 @@ counts, the places it holds, and its v2 peers. In this example the node has
 | `slots` | How connection slots are used, or null without v2 networking. `limit` includes all funded ordinary and gateway places. `in_use` is `preferred` plus `ordinary`; `preferred` counts one slot per preferred gateway connected; `inbound` counts slots of connections the remote node opened. |
 | `peers` | Every v2 peer connected now, ordered by node ID, at most the connection limit. A peer connected both ways counts as inbound. |
 
+If a node dials a gateway by an earlier ID and authenticates its newer ID,
+the earlier gateway remains connected in this report while the connection and
+the remembered move last, even after the earlier address record is evicted.
+Two distinct known IDs with the same gateway prefix still make it ambiguous.
+
 A gateway's `state` reads its standing in v2 networking together with the
 preferred set:
 

@@ -12,7 +12,11 @@
 use std::collections::VecDeque;
 
 use zakura_quic::NodeId;
-use zakura_rt::{collections::HashMap, sync::watch, time::Instant};
+use zakura_rt::{
+    collections::{HashMap, HashSet},
+    sync::watch,
+    time::Instant,
+};
 
 use crate::zakura::{ZakuraPeerId, DEFAULT_ZAKURA_REDIAL_MAX_BACKOFF};
 
@@ -105,6 +109,16 @@ impl MovedNodeIds {
         }
         self.learned.retain(|learned| learned != id);
         true
+    }
+
+    /// Earlier IDs whose directly authenticated destination is registered now.
+    pub(crate) fn earlier_ids_reaching<'a>(
+        &'a self,
+        registered: &'a HashSet<NodeId>,
+    ) -> impl Iterator<Item = NodeId> + 'a {
+        self.current.iter().filter_map(move |(earlier, entry)| {
+            registered.contains(&entry.connected).then_some(*earlier)
+        })
     }
 
     /// Whether `holds` is true of the node known as `id`, under that ID or

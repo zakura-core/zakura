@@ -910,7 +910,10 @@ is today's Zakura logic.
   The dialer remembers moves in memory, at most 1,024, and learns one again
   with one dial after a restart. It keeps the book's entry of the earlier
   ID, since relays carry that record until it expires, and a dial to it
-  still reaches the node. A `zakura.bootstrap_peers` entry that names a
+  still reaches the node. While the current ID is registered and the move is
+  remembered, the earlier ID still resolves its gateway prefix after its book
+  record is evicted. Distinct full IDs sharing a gateway prefix remain ambiguous.
+  A `zakura.bootstrap_peers` entry that names a
   moved node logs one warning per start. Two cases are not covered: a
   pinned `network.unconditional_peers` entry matches its `NodeId` exactly,
   so a pinned peer that moves is handled as any pin whose ID is stale,

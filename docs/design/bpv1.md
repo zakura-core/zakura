@@ -33,7 +33,7 @@ last stripe never travels.
 ## Authenticate before forwarding
 
 At template time, the proposer encodes the body and commits the part root in a
-zero-value coinbase output, `6a 25 "BPV1" 01 C`. `C` hashes the chain, the
+zero-value coinbase output, `6a 23 "BP" 01 C`. `C` hashes the chain, the
 profile, the coding, the part root, and the proposer's node id. The proof of
 work covers the header, the header commits the coinbase, and the coinbase
 commits `C`. A block therefore has one valid set of metadata, and BPv1 needs no

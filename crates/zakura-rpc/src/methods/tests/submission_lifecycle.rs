@@ -309,6 +309,13 @@ async fn trusted_rpc_publishes_to_bpv1_only_after_commit() {
             None
         }
 
+        fn empty_template_commitment(
+            &self,
+            _height: Height,
+        ) -> Option<[u8; BPV1_COMMITMENT_NULL_DATA_LEN]> {
+            None
+        }
+
         fn publish_solved_block(&self, _block: Arc<Block>, _height: Height) -> bool {
             self.published.fetch_add(1, Ordering::AcqRel);
             true
@@ -416,6 +423,13 @@ impl zakura_node_services::bpv1_proposer::Bpv1ProposerHook for RecordingBpv1Prop
         _height: zakura_chain::block::Height,
         _tx_count: u32,
         _body_after_coinbase: &[u8],
+    ) -> Option<[u8; zakura_node_services::bpv1_proposer::BPV1_COMMITMENT_NULL_DATA_LEN]> {
+        None
+    }
+
+    fn empty_template_commitment(
+        &self,
+        _height: zakura_chain::block::Height,
     ) -> Option<[u8; zakura_node_services::bpv1_proposer::BPV1_COMMITMENT_NULL_DATA_LEN]> {
         None
     }

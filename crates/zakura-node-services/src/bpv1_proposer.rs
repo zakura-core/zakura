@@ -11,9 +11,9 @@ use std::{fmt, sync::Arc};
 use zakura_chain::block::{self, Block, Height};
 
 /// Exact null-data push payload length for a BPv1 coinbase commitment
-/// (`ASCII("BPV1") || 0x01 || C`, 37 bytes -> 39-byte `OP_RETURN` script ->
-/// 48-byte serialized transparent output; decision-25).
-pub const BPV1_COMMITMENT_NULL_DATA_LEN: usize = 37;
+/// (`ASCII("BP") || 0x01 || C`, 35 bytes -> 37-byte `OP_RETURN` script ->
+/// 46-byte serialized transparent output; decision-25).
+pub const BPV1_COMMITMENT_NULL_DATA_LEN: usize = 35;
 
 /// Narrow proposer hook connecting `zakura-rpc` (`getblocktemplate`,
 /// `submitblock`, and trusted block submission) to BPv1's [`ProposerState`].
@@ -22,15 +22,15 @@ pub trait Bpv1ProposerHook: Send + Sync + fmt::Debug {
     /// for a BPv1 commitment (post-NU7 and at least one live BPv1 session).
     ///
     /// Used by `zakura-rpc` to avoid serializing mempool transactions or
-    /// reserving the 48-byte coinbase commitment output when BPv1 is inactive.
+    /// reserving the 46-byte coinbase commitment output when BPv1 is inactive.
     fn should_prepare_template(&self, height: Height) -> bool {
         let _ = height;
         true
     }
 
     /// Prepares (or reuses by body identity, `opt-8`) a BPv1 encoding for a
-    /// post-NU7 mining template and returns the 37-byte `OP_RETURN` null-data
-    /// push payload (`ASCII("BPV1") || 0x01 || C`) to embed in a zero-value
+    /// post-NU7 mining template and returns the 35-byte `OP_RETURN` null-data
+    /// push payload (`ASCII("BP") || 0x01 || C`) to embed in a zero-value
     /// transparent coinbase output.
     ///
     /// The commitment keeps `light_client_root`, which the block's
@@ -48,6 +48,21 @@ pub trait Bpv1ProposerHook: Send + Sync + fmt::Debug {
         height: Height,
         tx_count: u32,
         body_after_coinbase: &[u8],
+    ) -> Option<[u8; BPV1_COMMITMENT_NULL_DATA_LEN]>;
+
+    /// Returns the payload [`Self::prepare_template_commitment`] would return
+    /// for an empty template at `height`, without registering the body.
+    ///
+    /// An empty body's `C` does not depend on the parent. A long poll uses
+    /// this payload to precompute the next empty block's coinbase before the
+    /// new tip, and so its light-client root, is known. The new-tip template
+    /// registers the body once it knows that root. Registering it earlier
+    /// would take a retained encoding or commitment from issued templates.
+    ///
+    /// Returns `None` in the cases [`Self::prepare_template_commitment`] does.
+    fn empty_template_commitment(
+        &self,
+        height: Height,
     ) -> Option<[u8; BPV1_COMMITMENT_NULL_DATA_LEN]>;
 
     /// Publishes a solved block over BPv1 (`HeaderMeta` + `BlockDone` +

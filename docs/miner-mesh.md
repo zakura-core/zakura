@@ -145,6 +145,30 @@ gateway this node stands for: the one it announces, or itself on a relay. So
 on the relay it counts the template node's blocks, and on the template node it
 counts the same blocks.
 
+### Pools that build their own coinbase
+
+The node puts the output in the coinbase it returns as `getblocktemplate`'s
+`coinbasetxn`. A pool that submits `coinbasetxn`'s outputs unchanged already
+has it, so it should not add the output again.
+
+A pool that builds its own coinbase outputs, for example to pay its own
+addresses, loses the output unless it copies it. For such pools
+`getblocktemplate` also returns `minermeshoutput`, the output's lock script in
+hex:
+
+```json
+"minermeshoutput": "6a174d5201<gateway_id>"
+```
+
+Add exactly one zero-value transparent output to the coinbase with that lock
+script. The field names the same gateway `coinbasetxn` does, so it follows
+`mining.miner_mesh_gateways`: it names the relay when one is set. A node that
+does not announce a gateway leaves the field out.
+
+A coinbase that repeats the same output, as when a pool adds it to outputs
+that already have it, still names that gateway, and the block counts once. A
+coinbase whose outputs name two different gateway IDs names none.
+
 ### The gateway's ID
 
 The node ID a gateway ID is cut from is worked out from the secret in the

@@ -65,10 +65,11 @@ extend a chain the network has left. On Mainnet, a node with
 
 Once the Mainnet tip passes the last supported height, `getblocktemplate`
 (including requests waiting for new work), `submitblock`, and
-`submitsolution` reject requests. This also applies to nodes that accept full
-blocks from an external miner without a configured payout address, and takes
-effect before the next hourly support check. Other networks have no support
-cutoff.
+`submitsolution` reject requests. The trusted block endpoint also refuses to
+relay or commit new blocks, whether supplied whole or assembled from a prepared
+job. This applies to nodes serving external miners without a configured payout
+address and takes effect before the next hourly support check. Other networks
+have no support cutoff.
 
 ### zcashd-compat mode
 

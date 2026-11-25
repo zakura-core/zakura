@@ -202,7 +202,13 @@ each block one hop past the proposer's neighbours instead
 The gateway miner mesh
 ([#2666](https://github.com/zakura-core/zakura/pull/2666),
 [#2669](https://github.com/zakura-core/zakura/pull/2669)) is a separate
-coinbase output. It grants no BPv1 rights.
+coinbase output. When a coinbase holds exactly one, its gateway ID names the
+BPv1 proposer, and `HeaderMeta` and `C` leave out the 32-byte `proposer_node`
+([spec](../specs/bpv1.md#metadata-fields), decision-34). A receiver then
+accepts seeds and relay flags from a connection whose node ID starts with the
+gateway ID. Without a mesh output, `HeaderMeta` names the proposer node. The
+mesh output grants no other BPv1 rights, and naming a node never stops it
+relaying blocks it received from peers.
 
 | Delivery path | Required condition |
 | --- | --- |

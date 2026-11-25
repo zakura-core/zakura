@@ -2468,7 +2468,13 @@ fn bpv1_76_a_verified_tip_rollback_keeps_admitted_blocks() {
     let coding = Profile::TINY.derive_coding(128, 2).unwrap();
     let verified = 100;
     let height = verified + PROPAGATION_DEPTH;
-    table.step(t0, BlockInput::TipHeight { height: verified });
+    table.step(
+        t0,
+        BlockInput::TipHeight {
+            height: verified,
+            hash: TEST_TIP_HASH,
+        },
+    );
     let admitted = block::Hash([0xE1; 32]);
     admit_block(&mut table, t0, admitted, height, coding, [0x21; 32]);
 
@@ -2476,6 +2482,7 @@ fn bpv1_76_a_verified_tip_rollback_keeps_admitted_blocks() {
         t0,
         BlockInput::TipHeight {
             height: verified - 2,
+            hash: TEST_TIP_HASH,
         },
     );
     assert!(!step
@@ -2489,7 +2496,10 @@ fn bpv1_76_a_verified_tip_rollback_keeps_admitted_blocks() {
         &mut table,
         t0,
         &received,
-        HeaderAdmissionResult::Admitted { height },
+        HeaderAdmissionResult::Admitted {
+            height,
+            parent_hash: TEST_TIP_HASH,
+        },
     );
     assert!(!step
         .outputs

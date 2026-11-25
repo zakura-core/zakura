@@ -10,14 +10,14 @@
 //! stack already depends on. `curve25519-dalek` checks the public key and each
 //! signature's `R` point before the equation runs (ID-6).
 
-use std::{fmt, net::SocketAddr, str::FromStr};
+use std::{fmt, net::SocketAddr, str::FromStr, sync::Arc};
 
 use curve25519_dalek::edwards::{CompressedEdwardsY, EdwardsPoint};
 use ring::signature::{Ed25519KeyPair, KeyPair as _, UnparsedPublicKey, ED25519};
 use zeroize::Zeroize as _;
 
 use crate::{
-    composite::{self, ML_DSA_44_KEY_TAG},
+    composite::{self, MlDsaSigningKey, ML_DSA_65_KEY_TAG},
     NodeCredential, NodeKeyList, ED25519_KEY_TAG,
 };
 
@@ -232,19 +232,16 @@ pub struct SignatureError;
 
 /// A node's Ed25519 secret seed (ID-3).
 ///
-/// It holds the seed, the ML-DSA-44 seed derived from it, the public keys
-/// and the credential that names the node, and zeroizes both seeds on drop.
-/// The seed derives both the Ed25519 key (ID-4) and the ML-DSA-44 key
-/// (ID-13). [`sign`](Self::sign) expands the seed for each signature, and
-/// `ring` does not zeroize that expanded key when the call returns; the
-/// ML-DSA signing key is regenerated for each signature, and ID-13 lists the
-/// copies `libcrux-ml-dsa` leaves unwiped. `Debug` and `Display` never show
-/// the seed, and it has no `Serialize` impl.
+/// The seed derives the Ed25519 key (ID-4) and the cached ML-DSA-65 key
+/// (ID-13). Each clone wipes its seed on drop, and the last owner wipes the
+/// shared ML-DSA signing key. [`sign`](Self::sign) expands the Ed25519 seed
+/// for each signature, and `ring` leaves that expanded key unwiped. ID-13
+/// lists the copies `libcrux-ml-dsa` leaves unwiped. `Debug` and `Display`
+/// show only the public identity. There is no `Serialize` impl.
 #[derive(Clone)]
 pub struct NodeSecretKey {
     seed: [u8; KEY_LENGTH],
-    /// The ML-DSA-44 key generation seed derived from `seed` (ID-13).
-    ml_dsa_seed: [u8; KEY_LENGTH],
+    ml_dsa_signing_key: Arc<MlDsaSigningKey>,
     public: NodeKey,
     /// The keys the node proves in TLS. `public` is the Ed25519 key among
     /// them, and the node ID is the hash of their key list.
@@ -254,7 +251,6 @@ pub struct NodeSecretKey {
 impl Drop for NodeSecretKey {
     fn drop(&mut self) {
         self.seed.zeroize();
-        self.ml_dsa_seed.zeroize();
     }
 }
 
@@ -269,18 +265,15 @@ impl NodeSecretKey {
         // A key derived from a seed is a multiple of the base point, so it
         // passes every check `NodeKey::from_bytes` makes.
         let public = NodeKey(public);
-        let ml_dsa_seed = composite::ml_dsa_seed(seed);
+        let (ml_dsa_signing_key, ml_dsa_public_key) = MlDsaSigningKey::from_identity_seed(seed);
         let credential = NodeCredential::from_entries([
             (ED25519_KEY_TAG, public.as_bytes().to_vec()),
-            (
-                ML_DSA_44_KEY_TAG,
-                composite::ml_dsa_public_key(&ml_dsa_seed).to_vec(),
-            ),
+            (ML_DSA_65_KEY_TAG, ml_dsa_public_key.to_vec()),
         ])
-        .expect("a valid Ed25519 key and an ML-DSA-44 key form a credential");
+        .expect("a valid Ed25519 key and an ML-DSA-65 key form a credential");
         Self {
             seed: *seed,
-            ml_dsa_seed,
+            ml_dsa_signing_key: Arc::new(ml_dsa_signing_key),
             public,
             credential,
         }
@@ -322,20 +315,20 @@ impl NodeSecretKey {
 
     /// Returns the keys the node presents in TLS. Unless
     /// [`Self::with_credential`] replaced it, this holds the node's Ed25519
-    /// and ML-DSA-44 keys.
+    /// and ML-DSA-65 keys.
     pub fn credential(&self) -> &NodeCredential {
         &self.credential
     }
 
     /// Presents `credential` in TLS instead of the derived one, which
     /// changes the node ID. `credential` must hold this node's Ed25519 and
-    /// ML-DSA-44 keys, the two it signs with.
+    /// ML-DSA-65 keys, the two it signs with.
     ///
     /// The other entries are opaque here, and a peer accepts them by their
     /// fingerprints.
     pub fn with_credential(mut self, credential: NodeCredential) -> Result<Self, ForeignKeyList> {
         let own = |tag| self.credential.key(tag) == credential.key(tag);
-        if credential.ed25519() != Some(self.public) || !own(ML_DSA_44_KEY_TAG) {
+        if credential.ed25519() != Some(self.public) || !own(ML_DSA_65_KEY_TAG) {
             return Err(ForeignKeyList);
         }
         self.credential = credential;
@@ -357,7 +350,7 @@ impl NodeSecretKey {
     }
 
     /// Signs `message` with the composite of both keys (TLS-4): the Ed25519
-    /// signature, then the ML-DSA-44 signature hedged with `randomness`.
+    /// signature, then the ML-DSA-65 signature hedged with `randomness`.
     pub(crate) fn sign_composite(
         &self,
         message: &[u8],
@@ -365,16 +358,12 @@ impl NodeSecretKey {
     ) -> Result<Vec<u8>, SignatureError> {
         let mut signature = Vec::with_capacity(composite::COMPOSITE_SIGNATURE_BYTES);
         signature.extend_from_slice(&self.sign(message));
-        signature.extend_from_slice(&composite::ml_dsa_sign(
-            &self.ml_dsa_seed,
-            message,
-            randomness,
-        )?);
+        signature.extend_from_slice(&self.ml_dsa_signing_key.sign(message, randomness)?);
         Ok(signature)
     }
 }
 
-/// A credential that does not hold the secret key's Ed25519 and ML-DSA-44
+/// A credential that does not hold the secret key's Ed25519 and ML-DSA-65
 /// public keys, so the secret key cannot prove it is the node it names.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 #[error("the credential does not hold this secret key's public keys")]
@@ -538,6 +527,20 @@ mod tests {
 
         assert_eq!(secret.key_list().ed25519(), Some(key));
         assert_eq!(secret.public(), secret.key_list().node_id());
+    }
+
+    #[test]
+    fn cloned_node_keys_share_the_ml_dsa_signing_key() {
+        let key = NodeSecretKey::from_bytes(&[7; KEY_LENGTH]);
+        let clone = key.clone();
+        assert!(Arc::ptr_eq(
+            &key.ml_dsa_signing_key,
+            &clone.ml_dsa_signing_key
+        ));
+
+        let expected = key.sign_composite(b"transcript", [9; 32]).unwrap();
+        drop(key);
+        assert_eq!(clone.sign_composite(b"transcript", [9; 32]), Ok(expected));
     }
 
     #[test]

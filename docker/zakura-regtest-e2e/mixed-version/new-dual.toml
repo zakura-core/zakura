@@ -1,6 +1,6 @@
 # Zakura mixed-version e2e: NEW dual-stack node (the binary under test).
 #
-# Speaks p2p-v2/4. It dials old-dual over legacy TCP; both advertise the P2P-v2
+# Speaks p2p-v2/5. It dials old-dual over legacy TCP; both advertise the P2P-v2
 # service bit, so the upgrade prelude runs, finds no shared protocol version,
 # and must leave the legacy connection up. It is the native v2 bootstrap peer
 # for new-zakura, so it bridges the two cohorts.

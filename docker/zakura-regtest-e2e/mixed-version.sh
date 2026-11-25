@@ -4,7 +4,7 @@
 #
 # run.sh execs this script for ZAKURA_E2E_MODE=mixed-version; its header
 # describes the topology and the assertions. The released binary speaks
-# p2p-v2/3 and the binary under test speaks p2p-v2/4, so the two cohorts can
+# p2p-v2/3 and the binary under test speaks p2p-v2/5, so the two cohorts can
 # only meet over legacy TCP (docs/specs/zakura-quic.md, COMPAT-7 and COMPAT-8).
 #
 # Environment:
@@ -34,8 +34,10 @@ MIXED_SOAK_SECONDS="${MIXED_SOAK_SECONDS:-90}"
 RUN_LABEL="${ZAKURA_REGTEST_E2E_LABEL:-zakura-mixed-version}"
 EVIDENCE_DIR="${ZAKURA_E2E_TRACE_DIR:-/tmp/zakura-regtest-e2e-traces-${RUN_LABEL}}"
 
-# The latest release before p2p-v2/4. Pin the tarball digests here rather than
-# trusting the SHA256SUMS.txt fetched next to them.
+# The latest release before p2p-v2/4. v1.9.0-rc2 speaks p2p-v2/4, but it has the
+# same version string as this branch, and the harness tells the cohorts apart by
+# user agent. Pin the tarball digests here rather than trusting the
+# SHA256SUMS.txt fetched next to them.
 OLD_RELEASE="v1.8.9"
 declare -A OLD_RELEASE_SHA256=(
   [x86_64]=3661e01e474cb46ad453b93a2c00704a3634eeb169bec037fa15afb916a2ea03
@@ -447,7 +449,7 @@ log "starting the new dual-stack node (dials old-dual over legacy TCP)"
 start_node new-dual
 NEW_DUAL_ID=$(wait_node_id new-dual)
 printf '  old-dual node ID (p2p-v2/3 derivation) %s\n' "${OLD_DUAL_ID}"
-printf '  new-dual node ID (p2p-v2/4 derivation) %s\n' "${NEW_DUAL_ID}"
+printf '  new-dual node ID (p2p-v2/5 derivation) %s\n' "${NEW_DUAL_ID}"
 
 # Neither v2-only container exists yet, so replacing the config files is safe.
 write_bootstrap_peer() {

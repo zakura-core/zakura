@@ -4,8 +4,10 @@
 //! (`SharedBodyClaims`), so BPv1 and native `block_sync` share them without
 //! coupling `block_sync` to BPv1 or changing any legacy path (`dual-1`).
 //!
-//! Every claim carries a monotonic expiry deadline (`reconstruction_deadline`),
-//! so a dead claim can never pin a height (`bpv1-57`). Releasing a claim for any
+//! Every claim carries an expiry deadline, so a dead claim can never pin a
+//! height (`bpv1-57`). BPv1 claims a body until its reconstruction deadline and
+//! extends the claim to its verification deadline once the block assembles
+//! (`bpv1-44`, `bpv1-82`). Releasing a claim for any
 //! reason but [`BodyClaimRelease::Committed`], or installing a claim with an
 //! earlier expiry, bumps one watch generation, so native block sync wakes
 //! immediately to fetch the missing body or to re-arm its claim-expiry timer.
@@ -81,6 +83,23 @@ impl SharedBodyClaims {
             self.bump_generation();
         }
         true
+    }
+
+    /// Moves the live claim on `hash` to expire at `deadline`, judging expiry
+    /// at `now`.
+    ///
+    /// Returns `true` if a live claim existed and `deadline` is later than its
+    /// expiry. A later expiry needs no wake: block sync's timer fires at the
+    /// earlier one, finds the hash still claimed, and re-arms.
+    pub fn extend_at(&self, hash: block::Hash, deadline: Instant, now: Instant) -> bool {
+        let mut claims = self.lock();
+        match claims.get_mut(&hash) {
+            Some(expiry) if now < *expiry && *expiry < deadline => {
+                *expiry = deadline;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Releases `hash`. Unless the block committed, notifies subscribers so
@@ -186,6 +205,42 @@ mod tests {
         );
         assert!(claims.release(b, BodyClaimRelease::Retired));
         assert!(rx.has_changed().unwrap(), "a retired claim frees the body");
+    }
+
+    #[test]
+    fn extending_a_live_claim_moves_its_expiry_later_only() {
+        let claims = SharedBodyClaims::new();
+        let t0 = Instant::now();
+        let h = block::Hash([0xAA; 32]);
+        let (early, late) = (t0 + Duration::from_secs(10), t0 + Duration::from_secs(30));
+
+        assert!(!claims.extend_at(h, late, t0), "no claim to extend");
+        assert!(claims.claim_at(h, early, t0));
+        let mut rx = claims.subscribe();
+        rx.mark_unchanged();
+        assert!(
+            !claims.extend_at(h, early, t0),
+            "an equal expiry is no extension"
+        );
+        assert!(claims.extend_at(h, late, t0));
+        assert!(!rx.has_changed().unwrap(), "a later expiry wakes nobody");
+        assert!(claims.is_claimed(h, early));
+        assert_eq!(claims.next_expiry(), Some(late));
+        assert!(
+            !claims.extend_at(h, early, t0),
+            "an extension never shortens"
+        );
+
+        assert!(claims.release(h, BodyClaimRelease::Fallback));
+        assert!(
+            !claims.extend_at(h, late, t0),
+            "a released claim stays released"
+        );
+        assert!(claims.claim_at(h, early, t0));
+        assert!(
+            !claims.extend_at(h, late, early),
+            "an expired claim stays expired"
+        );
     }
 
     #[test]

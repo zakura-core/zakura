@@ -16,6 +16,10 @@ use crate::zakura::bpv1::{
     profile::Profile, unknown_parent::UnknownParentVerdict,
 };
 
+/// The verified tip hash and every admitted header's parent, so a block one
+/// above the verified tip extends it.
+const FUZZ_TIP_HASH: block::Hash = block::Hash([0; 32]);
+
 /// Summary returned by [`replay_bpv1_block_bytes`] (`tool-2`).
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct BlockReplaySummary {
@@ -72,6 +76,7 @@ pub fn replay_bpv1_block_bytes(bytes: &[u8]) -> BlockReplaySummary {
         let input = match op {
             0 => BlockInput::TipHeight {
                 height: u32::from(b),
+                hash: FUZZ_TIP_HASH,
             },
             1 => {
                 let env = MetaEnvelope {
@@ -98,6 +103,7 @@ pub fn replay_bpv1_block_bytes(bytes: &[u8]) -> BlockReplaySummary {
                 let result = match a % 4 {
                     0 => HeaderAdmissionResult::Admitted {
                         height: table.top().saturating_add(1),
+                        parent_hash: FUZZ_TIP_HASH,
                     },
                     1 => HeaderAdmissionResult::MissingParent {
                         parent_hash: block::Hash([0x01; 32]),

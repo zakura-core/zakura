@@ -77,6 +77,7 @@ impl HeaderAdmissionPort for HeaderChainAdmissionAdapter {
         Box::pin(async move {
             use zakura_chain::serialization::ZcashSerialize;
 
+            let parent_hash = header.previous_block_hash;
             // Widening header byte length (<= ~1.5 KiB) to u64 is lossless.
             let header_len = header.zcash_serialized_size() as u64;
             let source = SourceId::from_digest(*source_peer.as_bytes());
@@ -92,7 +93,7 @@ impl HeaderAdmissionPort for HeaderChainAdmissionAdapter {
             {
                 metrics::counter!("zakura.p2p.bpv1.header.duplicate_bytes").increment(header_len);
             }
-            admission_result(admission)
+            admission_result(admission, parent_hash)
         })
     }
 
@@ -113,14 +114,17 @@ impl HeaderAdmissionPort for HeaderChainAdmissionAdapter {
     }
 }
 
-/// Maps headerchain's exact-header admission onto [`HeaderAdmissionResult`].
+/// Maps headerchain's exact-header admission of a header whose parent is
+/// `parent_hash` onto [`HeaderAdmissionResult`].
 pub(super) fn admission_result(
     admission: Result<ExactHeaderAdmission, PortError>,
+    parent_hash: block::Hash,
 ) -> HeaderAdmissionResult {
     match admission {
-        Ok(ExactHeaderAdmission::Admitted { height, .. }) => {
-            HeaderAdmissionResult::Admitted { height: height.0 }
-        }
+        Ok(ExactHeaderAdmission::Admitted { height, .. }) => HeaderAdmissionResult::Admitted {
+            height: height.0,
+            parent_hash,
+        },
         Ok(ExactHeaderAdmission::MissingParent { parent_hash }) => {
             HeaderAdmissionResult::MissingParent { parent_hash }
         }
@@ -201,6 +205,10 @@ pub trait BlockFallbackPort: Send + Sync + 'static {
     /// Claims `hash` until `deadline` so native block sync skips fetching it.
     fn claim(&self, hash: block::Hash, deadline: Instant) -> bool;
 
+    /// Moves BPv1's live claim on `hash` to the later `deadline`. An expired
+    /// or released claim stays gone.
+    fn extend(&self, hash: block::Hash, deadline: Instant) -> bool;
+
     /// Releases `hash` with `reason`. `ClaimRelease::Fallback` and
     /// `ClaimRelease::Repair` wake native block sync.
     fn release(&self, hash: block::Hash, reason: ClaimRelease) -> bool;
@@ -210,6 +218,10 @@ pub trait BlockFallbackPort: Send + Sync + 'static {
 impl BlockFallbackPort for SharedBodyClaims {
     fn claim(&self, hash: block::Hash, deadline: Instant) -> bool {
         self.claim_at(hash, deadline, Instant::now())
+    }
+
+    fn extend(&self, hash: block::Hash, deadline: Instant) -> bool {
+        self.extend_at(hash, deadline, Instant::now())
     }
 
     fn release(&self, hash: block::Hash, reason: ClaimRelease) -> bool {

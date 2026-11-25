@@ -15,6 +15,7 @@ use zakura_chain::{
     serialization::ZcashSerialize,
     transaction::Transaction,
 };
+use zakura_node_services::body_claims::SharedBodyClaims;
 use zakura_quic::NodeId;
 use zakura_rt::{collections::HashSet, time::Instant};
 
@@ -24,11 +25,12 @@ use super::{
     commitment::commitment_script,
     paths::{PathDirection, PathEstimate, PeerPaths, DEFAULT_UNMEASURED_RATE_BPS},
     peer::{PartAuth, PeerConfig},
+    ports::BlockFallbackPort,
     profile::{Coding, Profile},
     proposer::*,
     test_support::{
         admit_meta, admit_work, build_v6_coinbase, commit_work, make_envelope, node_id, Adversary,
-        LinkProfile, MachineMesh,
+        LinkProfile, MachineMesh, TEST_TIP_HASH,
     },
     tree::VerifiedPart,
     unknown_parent::UnknownParentVerdict,
@@ -362,7 +364,10 @@ fn scenario_missing_parent_then_parent_arrives_defers_commitment() {
         &mut table,
         at,
         &s3,
-        HeaderAdmissionResult::Admitted { height: 11 },
+        HeaderAdmissionResult::Admitted {
+            height: 11,
+            parent_hash: TEST_TIP_HASH,
+        },
     );
     let s5 = commitment_ok(&mut table, at, &s4);
     assert!(s5
@@ -411,7 +416,10 @@ fn best_header_jumping_past_the_parent_wakes_the_child() {
         &mut table,
         at,
         &woken,
-        HeaderAdmissionResult::Admitted { height: 11 },
+        HeaderAdmissionResult::Admitted {
+            height: 11,
+            parent_hash: parent,
+        },
     );
     let committed = commitment_ok(&mut table, at, &admitted);
     assert!(committed
@@ -465,7 +473,10 @@ fn best_header_moving_during_the_checks_retries_admission() {
         &mut table,
         now,
         &retried,
-        HeaderAdmissionResult::Admitted { height: 11 },
+        HeaderAdmissionResult::Admitted {
+            height: 11,
+            parent_hash: parent,
+        },
     );
     let committed = commitment_ok(&mut table, now, &admitted);
     assert!(committed
@@ -608,7 +619,10 @@ fn bpv1_75_running_unknown_parent_checks_never_refuse_viable_metadata() {
         &mut table,
         now,
         &received,
-        HeaderAdmissionResult::Admitted { height: 11 },
+        HeaderAdmissionResult::Admitted {
+            height: 11,
+            parent_hash: TEST_TIP_HASH,
+        },
     );
     let committed = commitment_ok(&mut table, now, &admitted);
     assert!(committed
@@ -671,7 +685,10 @@ fn bpv1_75_headers_with_unknown_parents_never_refuse_viable_metadata() {
         &mut table,
         now,
         &received,
-        HeaderAdmissionResult::Admitted { height: 11 },
+        HeaderAdmissionResult::Admitted {
+            height: 11,
+            parent_hash: TEST_TIP_HASH,
+        },
     );
     let committed = commitment_ok(&mut table, now, &admitted);
     assert!(committed
@@ -915,14 +932,23 @@ fn duplicate_metadata_is_rejected_for_every_session_that_sent_it() {
 
     // Below the window: header admission ends the entry at once.
     let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
-    table.step(now, BlockInput::TipHeight { height: 100 });
+    table.step(
+        now,
+        BlockInput::TipHeight {
+            height: 100,
+            hash: TEST_TIP_HASH,
+        },
+    );
     let old = block::Hash([0x22; 32]);
     let s = send_twice(&mut table, old);
     let refused = header_result(
         &mut table,
         now,
         &s,
-        HeaderAdmissionResult::Admitted { height: 50 },
+        HeaderAdmissionResult::Admitted {
+            height: 50,
+            parent_hash: TEST_TIP_HASH,
+        },
     );
     assert_eq!(rejected_sessions(&refused, old), both);
     table.assert_invariants();
@@ -1828,7 +1854,13 @@ fn bpv1_7_window_excludes_its_edge_and_rechecks_after_the_commitment() {
     let coding = Profile::TINY.derive_coding(128, 2).unwrap();
     let now = Instant::now();
     let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
-    let _ = table.step(now, BlockInput::TipHeight { height: 116 });
+    let _ = table.step(
+        now,
+        BlockInput::TipHeight {
+            height: 116,
+            hash: TEST_TIP_HASH,
+        },
+    );
     let s1 = receive(
         &mut table,
         now,
@@ -1839,7 +1871,10 @@ fn bpv1_7_window_excludes_its_edge_and_rechecks_after_the_commitment() {
         &mut table,
         now,
         &s1,
-        HeaderAdmissionResult::Admitted { height: 100 },
+        HeaderAdmissionResult::Admitted {
+            height: 100,
+            parent_hash: TEST_TIP_HASH,
+        },
     );
     assert!(
         !s2.outputs
@@ -1862,10 +1897,19 @@ fn bpv1_7_window_excludes_its_edge_and_rechecks_after_the_commitment() {
         &mut table,
         now,
         &r1,
-        HeaderAdmissionResult::Admitted { height: 101 },
+        HeaderAdmissionResult::Admitted {
+            height: 101,
+            parent_hash: TEST_TIP_HASH,
+        },
     );
     // The tip advances so 101 + 16 == 117 <= top(120) before CommitmentChecked returns.
-    let _ = table.step(now, BlockInput::TipHeight { height: 120 });
+    let _ = table.step(
+        now,
+        BlockInput::TipHeight {
+            height: 120,
+            hash: TEST_TIP_HASH,
+        },
+    );
     let r3 = commitment_ok(&mut table, now, &r2);
     assert!(
         !r3.outputs
@@ -1912,7 +1956,10 @@ fn local_admission_during_a_peer_copy_check_keeps_the_solved_block() {
         &mut table,
         now,
         &received,
-        HeaderAdmissionResult::Admitted { height: 1 },
+        HeaderAdmissionResult::Admitted {
+            height: 1,
+            parent_hash: TEST_TIP_HASH,
+        },
     );
     let _ = table.step(
         now,
@@ -2058,7 +2105,13 @@ fn bpv1_57_fallback_blocks_yield_to_a_new_block_at_the_cap() {
     let mut cfg = BlockConfig::for_profile(Profile::TINY);
     cfg.max_concurrent_blocks = 2;
     let mut table = BlockTable::new(cfg);
-    table.step(now, BlockInput::TipHeight { height: 99 });
+    table.step(
+        now,
+        BlockInput::TipHeight {
+            height: 99,
+            hash: TEST_TIP_HASH,
+        },
+    );
     let late = now + RECONSTRUCTION_DEADLINE + Duration::from_secs(1);
     for i in 0..2u8 {
         admit_block(
@@ -2633,6 +2686,7 @@ fn fix8_part_charge_before_proof_bounds_the_part_buffer() {
         t0,
         BlockInput::TipHeight {
             height: 2 + super::wire::PROPAGATION_DEPTH,
+            hash: TEST_TIP_HASH,
         },
     );
     // The invariants check that a retired block holds no charge.
@@ -2648,7 +2702,13 @@ fn fix2_raising_top_retires_out_of_window_blocks() {
     let t0 = Instant::now();
     let coding = Profile::TINY.derive_coding(128, 2).unwrap();
     let old = block::Hash([0xB1; 32]);
-    table.step(t0, BlockInput::TipHeight { height: 49 });
+    table.step(
+        t0,
+        BlockInput::TipHeight {
+            height: 49,
+            hash: TEST_TIP_HASH,
+        },
+    );
     admit_block(&mut table, t0, old, 50, coding, [0x21; 32]);
 
     // Headerchain admits a parent past the window.
@@ -2670,6 +2730,7 @@ fn fix2_raising_top_retires_out_of_window_blocks() {
         t0,
         BlockInput::TipHeight {
             height: parent_height,
+            hash: TEST_TIP_HASH,
         },
     );
     let high_height = parent_height + PROPAGATION_DEPTH;
@@ -2681,6 +2742,7 @@ fn fix2_raising_top_retires_out_of_window_blocks() {
         &received,
         HeaderAdmissionResult::Admitted {
             height: high_height,
+            parent_hash: TEST_TIP_HASH,
         },
     );
     assert!(step
@@ -2696,6 +2758,7 @@ fn fix2_raising_top_retires_out_of_window_blocks() {
         t0,
         BlockInput::TipHeight {
             height: high_height,
+            hash: TEST_TIP_HASH,
         },
     );
     assert!(step.events.contains(&BlockEvent::Retired { block_id: mid }));
@@ -2712,7 +2775,13 @@ fn bpv1_76_metadata_far_above_the_verified_tip_belongs_to_block_sync() {
     let t0 = Instant::now();
     let coding = Profile::TINY.derive_coding(128, 2).unwrap();
     let verified = 100;
-    table.step(t0, BlockInput::TipHeight { height: verified });
+    table.step(
+        t0,
+        BlockInput::TipHeight {
+            height: verified,
+            hash: TEST_TIP_HASH,
+        },
+    );
     // Header sync is near the network tip.
     table.step(
         t0,
@@ -2730,6 +2799,7 @@ fn bpv1_76_metadata_far_above_the_verified_tip_belongs_to_block_sync() {
         &received,
         HeaderAdmissionResult::Admitted {
             height: verified + 199,
+            parent_hash: TEST_TIP_HASH,
         },
     );
     assert!(!step
@@ -2750,6 +2820,7 @@ fn bpv1_76_metadata_far_above_the_verified_tip_belongs_to_block_sync() {
         t0,
         BlockInput::TipHeight {
             height: verified + 199 - PROPAGATION_DEPTH,
+            hash: TEST_TIP_HASH,
         },
     );
     admit_block(
@@ -2777,7 +2848,13 @@ fn bpv1_76_a_verified_tip_rollback_keeps_admitted_blocks() {
     let coding = Profile::TINY.derive_coding(128, 2).unwrap();
     let verified = 100;
     let height = verified + PROPAGATION_DEPTH;
-    table.step(t0, BlockInput::TipHeight { height: verified });
+    table.step(
+        t0,
+        BlockInput::TipHeight {
+            height: verified,
+            hash: TEST_TIP_HASH,
+        },
+    );
     let admitted = block::Hash([0xE1; 32]);
     admit_block(&mut table, t0, admitted, height, coding, [0x21; 32]);
 
@@ -2785,6 +2862,7 @@ fn bpv1_76_a_verified_tip_rollback_keeps_admitted_blocks() {
         t0,
         BlockInput::TipHeight {
             height: verified - 2,
+            hash: TEST_TIP_HASH,
         },
     );
     assert!(!step
@@ -2798,7 +2876,10 @@ fn bpv1_76_a_verified_tip_rollback_keeps_admitted_blocks() {
         &mut table,
         t0,
         &received,
-        HeaderAdmissionResult::Admitted { height },
+        HeaderAdmissionResult::Admitted {
+            height,
+            parent_hash: TEST_TIP_HASH,
+        },
     );
     assert!(!step
         .outputs
@@ -2814,7 +2895,13 @@ fn bpv1_7_retirement_matches_the_admission_window() {
     let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
     let t0 = Instant::now();
     let coding = Profile::TINY.derive_coding(128, 2).unwrap();
-    table.step(t0, BlockInput::TipHeight { height: 49 });
+    table.step(
+        t0,
+        BlockInput::TipHeight {
+            height: 49,
+            hash: TEST_TIP_HASH,
+        },
+    );
     let edge = block::Hash([0xD1; 32]);
     admit_block(&mut table, t0, edge, 50, coding, [0x21; 32]);
 
@@ -2823,6 +2910,7 @@ fn bpv1_7_retirement_matches_the_admission_window() {
         t0,
         BlockInput::TipHeight {
             height: 50 + PROPAGATION_DEPTH - 1,
+            hash: TEST_TIP_HASH,
         },
     );
     assert!(!step
@@ -2833,6 +2921,7 @@ fn bpv1_7_retirement_matches_the_admission_window() {
         t0,
         BlockInput::TipHeight {
             height: 50 + PROPAGATION_DEPTH,
+            hash: TEST_TIP_HASH,
         },
     );
     assert!(step
@@ -3773,4 +3862,734 @@ fn decision19_push_crossing_a_direct_copy_drops_as_surplus() {
     assert!(retired
         .events
         .contains(&BlockEvent::PartDuplicates { block_id, count: 2 }));
+}
+
+// Catch-up handoff between block sync and BPv1 (#2718). Each test names the
+// property it checks:
+//
+// - bpv1-76: BPv1 never admits or submits a block more than `PROPAGATION_DEPTH`
+//   above the verified tip.
+// - bpv1-82: every `Verifying` block reaches a verdict or its verification
+//   deadline, then frees its slot.
+// - bpv1-44: for a block BPv1 admits, block sync fetches no body until BPv1
+//   releases the claim by fallback, repair, retirement, or commit.
+// - bpv1-57: when BPv1 fails a block, it releases the claim at the deadline of
+//   the block's phase, so block sync fetches it within one fetch.
+// - bpv1-83: in-window metadata whose parent is the verified tip is never
+//   refused because slots hold blocks waiting on parents.
+// - bpv1-84: a retryable verdict on a block whose parent is not committed keeps
+//   the body, and BPv1 resubmits it once the parent commits. A resubmission's
+//   parent is always committed, so only a block's first submission can wait in
+//   the state's orphan queue.
+//
+// `service_tests` runs the handoff through the service, and `ports_tests` checks
+// that block sync wakes when a claim expires and that no retryable verdict
+// reports `Invalid`.
+
+/// Applies the step's body-claim outputs to `claims` at `now`, as the IO shell's
+/// `BlockFallbackPort` does, so a test reads block sync's view of each claim.
+fn apply_claims(claims: &SharedBodyClaims, now: Instant, step: &BlockStep) {
+    for output in &step.outputs {
+        match output {
+            BlockOutput::ClaimBody { block_id, deadline } => {
+                claims.claim_at(*block_id, *deadline, now);
+            }
+            BlockOutput::ExtendBodyClaim { block_id, deadline } => {
+                claims.extend_at(*block_id, *deadline, now);
+            }
+            BlockOutput::ReleaseBodyClaim { block_id, reason } => {
+                BlockFallbackPort::release(claims, *block_id, *reason);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The work ids of the step's verifier submissions.
+fn submissions(step: &BlockStep) -> Vec<WorkId> {
+    step.outputs
+        .iter()
+        .filter_map(|o| match o {
+            BlockOutput::SubmitVerifier { work_id, .. } => Some(*work_id),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Offers metadata for `block_id` at `height` from its proposer `node_id(1)`,
+/// as the shell would, and returns the last step. The block is admitted iff
+/// that step holds `BlockEvent::BlockAdmitted`.
+fn offer(
+    table: &mut BlockTable,
+    now: Instant,
+    block_id: block::Hash,
+    height: u32,
+    coding: Coding,
+    part_root: [u8; 32],
+) -> BlockStep {
+    offer_child(
+        table,
+        now,
+        block_id,
+        height,
+        TEST_TIP_HASH,
+        coding,
+        part_root,
+    )
+}
+
+/// [`offer`] for a header whose parent is `parent_hash`.
+fn offer_child(
+    table: &mut BlockTable,
+    now: Instant,
+    block_id: block::Hash,
+    height: u32,
+    parent_hash: block::Hash,
+    coding: Coding,
+    part_root: [u8; 32],
+) -> BlockStep {
+    let received = table.step(
+        now,
+        BlockInput::MetaReceived {
+            envelope: make_envelope(block_id, coding, part_root, node_id(1)),
+            from_peer: node_id(1),
+            session_gen: 1,
+        },
+    );
+    let admitted = header_result(
+        table,
+        now,
+        &received,
+        HeaderAdmissionResult::Admitted {
+            height,
+            parent_hash,
+        },
+    );
+    let Some(work_id) = admitted.outputs.iter().find_map(|o| match o {
+        BlockOutput::VerifyCommitment { work_id, .. } => Some(*work_id),
+        _ => None,
+    }) else {
+        return admitted;
+    };
+    table.step(
+        now,
+        BlockInput::CommitmentChecked {
+            work_id,
+            ok: true,
+            peers: Vec::new(),
+            rng_seed: 7,
+        },
+    )
+}
+
+fn was_admitted(step: &BlockStep, block_id: block::Hash) -> bool {
+    step.events
+        .contains(&BlockEvent::BlockAdmitted { block_id })
+}
+
+/// bpv1-44: assembly extends the body claim to the verification deadline, so a
+/// block that assembles just before its reconstruction deadline stays claimed
+/// while it verifies. The commit releases the claim.
+#[test]
+fn bpv1_44_the_body_claim_covers_verification() {
+    let t0 = Instant::now();
+    let claims = SharedBodyClaims::new();
+    let encoded = encode_body(&Profile::TINY, &[0x55; 128], 2).unwrap();
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let block_id = block::Hash([0xA1; 32]);
+    table.step(
+        t0,
+        BlockInput::TipHeight {
+            height: 9,
+            hash: TEST_TIP_HASH,
+        },
+    );
+    let admitted = admit_block(
+        &mut table,
+        t0,
+        block_id,
+        10,
+        encoded.coding,
+        encoded.part_root,
+    );
+    apply_claims(&claims, t0, &admitted);
+    assert_eq!(claims.next_expiry(), Some(t0 + RECONSTRUCTION_DEADLINE));
+
+    let assembled_at = t0 + RECONSTRUCTION_DEADLINE - Duration::from_secs(1);
+    let mut work = Vec::new();
+    for part in &encoded.parts[..encoded.coding.k as usize] {
+        let step = insert(
+            &mut table,
+            assembled_at,
+            block_id,
+            part,
+            node_id(2),
+            PartAuth::Want(1),
+        );
+        apply_claims(&claims, assembled_at, &step);
+        work.extend(submissions(&step));
+    }
+    let [work_id] = work[..] else {
+        panic!("one submission, got {work:?}");
+    };
+    assert_eq!(table.block_phase(&block_id), Some(BlockPhase::Verifying));
+    assert_eq!(claims.next_expiry(), Some(assembled_at + VERIFY_DEADLINE));
+
+    // Past the reconstruction deadline, the verifying block keeps its claim, so
+    // block sync still skips it.
+    let later = t0 + RECONSTRUCTION_DEADLINE + Duration::from_secs(30);
+    let ticked = tick(&mut table, later, &[]);
+    apply_claims(&claims, later, &ticked);
+    assert!(!ticked
+        .events
+        .iter()
+        .any(|e| matches!(e, BlockEvent::FallbackStarted { .. })));
+    assert!(claims.is_claimed(block_id, later));
+
+    let committed = table.step(
+        later,
+        BlockInput::VerifierVerdict {
+            work_id,
+            block_id,
+            verdict: VerifierVerdict::Valid,
+        },
+    );
+    apply_claims(&claims, later, &committed);
+    assert!(!claims.is_claimed(block_id, later));
+    assert_eq!(table.block_phase(&block_id), Some(BlockPhase::Done));
+    table.assert_invariants();
+}
+
+/// bpv1-76 and bpv1-82 during catch-up: the best header runs 20 blocks ahead of
+/// the verified tip. BPv1 refuses the tip block, and four blocks inside both
+/// windows wait on a verifier that never answers. At the verification deadline each
+/// falls back, releases its claim, and frees its slot, and a late verdict
+/// changes nothing.
+#[test]
+fn bpv1_82_verification_ends_by_its_deadline_and_frees_the_slot() {
+    let t0 = Instant::now();
+    let claims = SharedBodyClaims::new();
+    let empty = encode_body(&Profile::TINY, &[], 1).unwrap();
+    let (coding, root) = (empty.coding, empty.part_root);
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let verified = 100;
+    table.step(
+        t0,
+        BlockInput::TipHeight {
+            height: verified,
+            hash: TEST_TIP_HASH,
+        },
+    );
+    table.step(
+        t0,
+        BlockInput::ParentAdmitted {
+            hash: block::Hash([0xB0; 32]),
+            height: verified + 20,
+        },
+    );
+
+    let tip = block::Hash([0xB1; 32]);
+    let refused = offer(&mut table, t0, tip, verified + 20, coding, root);
+    assert!(!was_admitted(&refused, tip), "bpv1-76: block sync owns it");
+
+    // Each empty body assembles and submits at admission.
+    let mut work = Vec::new();
+    for i in 0..4u8 {
+        let block_id = block::Hash([0xB2 + i; 32]);
+        let step = offer(
+            &mut table,
+            t0,
+            block_id,
+            verified + 5 + u32::from(i),
+            coding,
+            root,
+        );
+        assert!(was_admitted(&step, block_id));
+        apply_claims(&claims, t0, &step);
+        work.extend(submissions(&step).into_iter().map(|w| (w, block_id)));
+    }
+    assert_eq!(work.len(), 4, "one submission per block");
+    let blocked = block::Hash([0xBF; 32]);
+    let full = offer(&mut table, t0, blocked, verified + 9, coding, root);
+    assert!(!was_admitted(&full, blocked), "every slot is verifying");
+    assert_eq!(table.next_deadline(), Some(t0 + VERIFY_DEADLINE));
+
+    let before = tick(
+        &mut table,
+        t0 + VERIFY_DEADLINE - Duration::from_millis(1),
+        &[],
+    );
+    assert!(before.events.is_empty() && before.outputs.is_empty());
+
+    let at = t0 + VERIFY_DEADLINE;
+    let expired = tick(&mut table, at, &[]);
+    apply_claims(&claims, at, &expired);
+    for &(_, block_id) in &work {
+        assert!(expired.events.contains(&BlockEvent::FallbackStarted {
+            block_id,
+            reason: FallbackReason::VerifyDeadline,
+        }));
+        assert!(
+            !claims.is_claimed(block_id, at),
+            "bpv1-57: block sync fetches it"
+        );
+        assert_eq!(table.block_phase(&block_id), Some(BlockPhase::Fallback));
+    }
+
+    // bpv1-63: the verifier answering late changes nothing.
+    let (late_work, late_block) = work[0];
+    let late = table.step(
+        at,
+        BlockInput::VerifierVerdict {
+            work_id: late_work,
+            block_id: late_block,
+            verdict: VerifierVerdict::Valid,
+        },
+    );
+    assert!(late.events.is_empty() && late.outputs.is_empty());
+    assert_eq!(table.block_phase(&late_block), Some(BlockPhase::Fallback));
+
+    let freed = offer(&mut table, at, blocked, verified + 9, coding, root);
+    assert!(
+        was_admitted(&freed, blocked),
+        "a fallback block yields its slot"
+    );
+    table.assert_invariants();
+}
+
+/// bpv1-83: with every slot verifying blocks that wait on their parents, the
+/// block whose parent is the verified tip retires the highest of them. Other
+/// metadata displaces nothing.
+#[test]
+fn bpv1_83_the_next_block_displaces_a_block_waiting_on_its_parent() {
+    let t0 = Instant::now();
+    let empty = encode_body(&Profile::TINY, &[], 1).unwrap();
+    let (coding, root) = (empty.coding, empty.part_root);
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let verified = 100;
+    table.step(
+        t0,
+        BlockInput::TipHeight {
+            height: verified,
+            hash: TEST_TIP_HASH,
+        },
+    );
+    for i in 0..4u8 {
+        let block_id = block::Hash([0xC2 + i; 32]);
+        let step = offer(
+            &mut table,
+            t0,
+            block_id,
+            verified + 2 + u32::from(i),
+            coding,
+            root,
+        );
+        assert!(was_admitted(&step, block_id));
+    }
+    let highest = block::Hash([0xC5; 32]);
+
+    let other = block::Hash([0xCE; 32]);
+    let refused = offer(&mut table, t0, other, verified + 3, coding, root);
+    assert!(!was_admitted(&refused, other));
+
+    let next = block::Hash([0xC1; 32]);
+    let step = offer(&mut table, t0, next, verified + 1, coding, root);
+    assert!(was_admitted(&step, next));
+    assert!(step
+        .events
+        .contains(&BlockEvent::Retired { block_id: highest }));
+    assert!(step.outputs.iter().any(|o| matches!(
+        o,
+        BlockOutput::ReleaseBodyClaim { block_id, reason: ClaimRelease::Retired }
+            if *block_id == highest
+    )));
+    assert_eq!(
+        submissions(&step).len(),
+        1,
+        "the next block verifies at once"
+    );
+    table.assert_invariants();
+}
+
+/// bpv1-83 bounds what competing metadata at the next height can evict. Each
+/// sibling retires one block above that height, a retired block never takes a
+/// slot again, and siblings never displace each other.
+#[test]
+fn bpv1_83_siblings_of_the_next_block_evict_each_block_above_it_once() {
+    let t0 = Instant::now();
+    let empty = encode_body(&Profile::TINY, &[], 1).unwrap();
+    let (coding, root) = (empty.coding, empty.part_root);
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let verified = 100;
+    table.step(
+        t0,
+        BlockInput::TipHeight {
+            height: verified,
+            hash: TEST_TIP_HASH,
+        },
+    );
+    let above: Vec<block::Hash> = (0..4u8).map(|i| block::Hash([0xF2 + i; 32])).collect();
+    for (i, &block_id) in above.iter().enumerate() {
+        let height = verified + 2 + u32::try_from(i).unwrap();
+        assert!(was_admitted(
+            &offer(&mut table, t0, block_id, height, coding, root),
+            block_id
+        ));
+    }
+
+    let mut retired = Vec::new();
+    for i in 0..4u8 {
+        let sibling = block::Hash([0xE0 + i; 32]);
+        let step = offer(&mut table, t0, sibling, verified + 1, coding, root);
+        assert!(was_admitted(&step, sibling));
+        retired.extend(step.events.iter().filter_map(|e| match e {
+            BlockEvent::Retired { block_id } => Some(*block_id),
+            _ => None,
+        }));
+    }
+    let highest_first: Vec<block::Hash> = above.iter().rev().copied().collect();
+    assert_eq!(
+        retired, highest_first,
+        "each block above, highest first, once"
+    );
+
+    let fifth = block::Hash([0xE9; 32]);
+    let refused = offer(&mut table, t0, fifth, verified + 1, coding, root);
+    assert!(
+        !was_admitted(&refused, fifth),
+        "a sibling displaces no sibling"
+    );
+    assert!(!refused
+        .events
+        .iter()
+        .any(|e| matches!(e, BlockEvent::Retired { .. })));
+
+    // A retired block's metadata starts no admission, so it cannot thrash.
+    let again = table.step(
+        t0,
+        BlockInput::MetaReceived {
+            envelope: make_envelope(above[3], coding, root, node_id(1)),
+            from_peer: node_id(1),
+            session_gen: 1,
+        },
+    );
+    assert!(again.outputs.is_empty() && again.events.is_empty());
+    assert_eq!(table.block_phase(&above[3]), Some(BlockPhase::Retired));
+    table.assert_invariants();
+}
+
+/// bpv1-84: a retryable verdict on a block whose parent is not committed keeps
+/// the assembled body and the claim. BPv1 resubmits the same body once the
+/// verified tip reaches the parent, and not before. A retryable verdict with the
+/// parent committed falls back.
+#[test]
+fn bpv1_84_a_retryable_verdict_keeps_the_body_until_the_parent_commits() {
+    let t0 = Instant::now();
+    let claims = SharedBodyClaims::new();
+    let encoded = encode_body(&Profile::TINY, &[0x66; 128], 2).unwrap();
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let block_id = block::Hash([0xD7; 32]);
+    let verified = 100;
+    table.step(
+        t0,
+        BlockInput::TipHeight {
+            height: verified,
+            hash: TEST_TIP_HASH,
+        },
+    );
+    let admitted = admit_block(
+        &mut table,
+        t0,
+        block_id,
+        verified + 3,
+        encoded.coding,
+        encoded.part_root,
+    );
+    apply_claims(&claims, t0, &admitted);
+    let mut sources = Vec::new();
+    let mut first = None;
+    for part in &encoded.parts[..encoded.coding.k as usize] {
+        let step = insert(
+            &mut table,
+            t0,
+            block_id,
+            part,
+            node_id(2),
+            PartAuth::Want(1),
+        );
+        apply_claims(&claims, t0, &step);
+        for o in step.outputs {
+            if let BlockOutput::SubmitVerifier {
+                work_id,
+                stripe_sources,
+                ..
+            } = o
+            {
+                first = Some(work_id);
+                sources.push(stripe_sources);
+            }
+        }
+    }
+    let first = first.expect("k source parts assemble the block");
+
+    let parked = table.step(
+        t0,
+        BlockInput::VerifierVerdict {
+            work_id: first,
+            block_id,
+            verdict: VerifierVerdict::LocalCapacity,
+        },
+    );
+    apply_claims(&claims, t0, &parked);
+    assert!(parked.events.contains(&BlockEvent::Parked { block_id }));
+    assert!(parked.outputs.is_empty(), "no fallback and no release");
+    assert_eq!(table.block_phase(&block_id), Some(BlockPhase::Verifying));
+    assert!(claims.is_claimed(block_id, t0));
+    table.assert_invariants();
+
+    let grandparent = table.step(
+        t0,
+        BlockInput::TipHeight {
+            height: verified + 1,
+            hash: TEST_TIP_HASH,
+        },
+    );
+    assert!(
+        submissions(&grandparent).is_empty(),
+        "the parent is not committed"
+    );
+
+    let parent = table.step(
+        t0,
+        BlockInput::TipHeight {
+            height: verified + 2,
+            hash: TEST_TIP_HASH,
+        },
+    );
+    let mut resubmitted = None;
+    for o in parent.outputs {
+        if let BlockOutput::SubmitVerifier {
+            work_id,
+            stripe_sources,
+            ..
+        } = o
+        {
+            assert!(resubmitted.is_none(), "one resubmission");
+            resubmitted = Some(work_id);
+            sources.push(stripe_sources);
+        }
+    }
+    let resubmitted = resubmitted.expect("the committed parent resubmits the block");
+    assert_eq!(sources[0], sources[1], "BPv1 resubmits the body it kept");
+
+    // The parent is committed now, so another retryable verdict falls back.
+    let fallen = table.step(
+        t0,
+        BlockInput::VerifierVerdict {
+            work_id: resubmitted,
+            block_id,
+            verdict: VerifierVerdict::LocalCapacity,
+        },
+    );
+    apply_claims(&claims, t0, &fallen);
+    assert!(fallen.events.contains(&BlockEvent::FallbackStarted {
+        block_id,
+        reason: FallbackReason::LocalCapacity,
+    }));
+    assert!(!claims.is_claimed(block_id, t0));
+    table.assert_invariants();
+}
+
+/// bpv1-82: a parked block whose parent never commits falls back at its
+/// verification deadline.
+#[test]
+fn bpv1_82_a_parked_block_falls_back_at_its_verification_deadline() {
+    let t0 = Instant::now();
+    let empty = encode_body(&Profile::TINY, &[], 1).unwrap();
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    table.step(
+        t0,
+        BlockInput::TipHeight {
+            height: 100,
+            hash: TEST_TIP_HASH,
+        },
+    );
+    let block_id = block::Hash([0xE7; 32]);
+    let step = offer(&mut table, t0, block_id, 105, empty.coding, empty.part_root);
+    let [work_id] = submissions(&step)[..] else {
+        panic!("an empty body submits at admission");
+    };
+    table.step(
+        t0,
+        BlockInput::VerifierVerdict {
+            work_id,
+            block_id,
+            verdict: VerifierVerdict::LocalCapacity,
+        },
+    );
+    assert_eq!(table.next_deadline(), Some(t0 + VERIFY_DEADLINE));
+    let expired = tick(&mut table, t0 + VERIFY_DEADLINE, &[]);
+    assert!(expired.events.contains(&BlockEvent::FallbackStarted {
+        block_id,
+        reason: FallbackReason::VerifyDeadline,
+    }));
+    assert!(expired.outputs.iter().any(|o| matches!(
+        o,
+        BlockOutput::ReleaseBodyClaim {
+            reason: ClaimRelease::Fallback,
+            ..
+        }
+    )));
+    // A late tip move resubmits nothing.
+    let moved = table.step(
+        t0 + VERIFY_DEADLINE,
+        BlockInput::TipHeight {
+            height: 104,
+            hash: TEST_TIP_HASH,
+        },
+    );
+    assert!(submissions(&moved).is_empty());
+    table.assert_invariants();
+}
+
+/// bpv1-44: a block that assembles after its claim expired, before the tick
+/// that falls it back, claims nothing again. Block sync may already fetch the
+/// body, so the verification claim only extends a live claim.
+#[test]
+fn bpv1_44_a_late_assembly_does_not_reclaim_an_expired_body() {
+    let t0 = Instant::now();
+    let claims = SharedBodyClaims::new();
+    let encoded = encode_body(&Profile::TINY, &[0x57; 128], 2).unwrap();
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let block_id = block::Hash([0xA7; 32]);
+    table.step(
+        t0,
+        BlockInput::TipHeight {
+            height: 9,
+            hash: TEST_TIP_HASH,
+        },
+    );
+    let admitted = admit_block(
+        &mut table,
+        t0,
+        block_id,
+        10,
+        encoded.coding,
+        encoded.part_root,
+    );
+    apply_claims(&claims, t0, &admitted);
+
+    let late = t0 + RECONSTRUCTION_DEADLINE;
+    let mut work = Vec::new();
+    for part in &encoded.parts[..encoded.coding.k as usize] {
+        let step = insert(
+            &mut table,
+            late,
+            block_id,
+            part,
+            node_id(2),
+            PartAuth::Want(1),
+        );
+        apply_claims(&claims, late, &step);
+        work.extend(submissions(&step));
+    }
+    assert_eq!(work.len(), 1, "the late body still verifies");
+    assert!(
+        !claims.is_claimed(block_id, late),
+        "the expired claim stays expired"
+    );
+    table.assert_invariants();
+}
+
+/// bpv1-83: metadata one above the verified tip on another branch is not the
+/// next block, so it displaces nothing. Headerchain admits retained forks.
+#[test]
+fn bpv1_83_a_fork_block_at_the_next_height_displaces_nothing() {
+    let t0 = Instant::now();
+    let empty = encode_body(&Profile::TINY, &[], 1).unwrap();
+    let (coding, root) = (empty.coding, empty.part_root);
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let verified = 100;
+    table.step(
+        t0,
+        BlockInput::TipHeight {
+            height: verified,
+            hash: TEST_TIP_HASH,
+        },
+    );
+    for i in 0..4u8 {
+        let block_id = block::Hash([0x92 + i; 32]);
+        let height = verified + 2 + u32::from(i);
+        assert!(was_admitted(
+            &offer(&mut table, t0, block_id, height, coding, root),
+            block_id
+        ));
+    }
+
+    let fork = block::Hash([0x9E; 32]);
+    let other_parent = block::Hash([0x9F; 32]);
+    let step = offer_child(
+        &mut table,
+        t0,
+        fork,
+        verified + 1,
+        other_parent,
+        coding,
+        root,
+    );
+    assert!(!was_admitted(&step, fork));
+    assert!(!step
+        .events
+        .iter()
+        .any(|e| matches!(e, BlockEvent::Retired { .. })));
+
+    let next = block::Hash([0x91; 32]);
+    let step = offer(&mut table, t0, next, verified + 1, coding, root);
+    assert!(was_admitted(&step, next), "the tip's child still displaces");
+    table.assert_invariants();
+}
+
+/// bpv1-84: a parked block whose height the verified tip reaches on another
+/// branch is not resubmitted. Its parent is not the tip, so it falls back to
+/// block sync.
+#[test]
+fn bpv1_84_a_tip_on_another_branch_falls_back_a_parked_block() {
+    let t0 = Instant::now();
+    let empty = encode_body(&Profile::TINY, &[], 1).unwrap();
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    table.step(
+        t0,
+        BlockInput::TipHeight {
+            height: 100,
+            hash: TEST_TIP_HASH,
+        },
+    );
+    let block_id = block::Hash([0xE8; 32]);
+    let step = offer(&mut table, t0, block_id, 103, empty.coding, empty.part_root);
+    let [work_id] = submissions(&step)[..] else {
+        panic!("an empty body submits at admission");
+    };
+    let parked = table.step(
+        t0,
+        BlockInput::VerifierVerdict {
+            work_id,
+            block_id,
+            verdict: VerifierVerdict::LocalCapacity,
+        },
+    );
+    assert!(parked.events.contains(&BlockEvent::Parked { block_id }));
+
+    let fork_tip = table.step(
+        t0,
+        BlockInput::TipHeight {
+            height: 102,
+            hash: block::Hash([0xEF; 32]),
+        },
+    );
+    assert!(submissions(&fork_tip).is_empty());
+    assert!(fork_tip.events.contains(&BlockEvent::FallbackStarted {
+        block_id,
+        reason: FallbackReason::LocalCapacity,
+    }));
+    table.assert_invariants();
 }

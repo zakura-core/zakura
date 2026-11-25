@@ -195,6 +195,14 @@ Recovery proceeds in one direction:
    from metadata admission expires. Partial progress never resets the
    deadline. A failed re-encode check goes here at once.
 
+An assembled block keeps its body claim while it verifies, so native block sync
+downloads no second copy. A 120 s verification deadline bounds that wait. A
+retryable verdict on a block whose parent is not committed keeps the body until
+the parent is the verified tip, and BPv1 then submits it again. When every slot
+is busy, the block whose parent is the verified tip takes the slot of the
+highest block above it. The table compares parent hashes, not heights, because
+headerchain also admits retained forks.
+
 ### Miner mesh
 
 BPv1 does not have miners subscribe to each other's blocks. Holder push carries

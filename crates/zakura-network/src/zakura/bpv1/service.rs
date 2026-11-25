@@ -467,6 +467,10 @@ impl SharedNode {
                 let installed = self.fallback.claim(block_id, deadline);
                 tracing::debug!(target: "bpv1_stage", %block_id, installed, "body_claim_installed");
             }
+            BlockOutput::ExtendBodyClaim { block_id, deadline } => {
+                let extended = self.fallback.extend(block_id, deadline);
+                tracing::debug!(target: "bpv1_stage", %block_id, extended, "body_claim_extended");
+            }
             BlockOutput::ReleaseBodyClaim { block_id, reason } => {
                 let released = self.fallback.release(block_id, reason);
                 tracing::debug!(target: "bpv1_stage", %block_id, ?reason, released,
@@ -1099,6 +1103,7 @@ pub(crate) fn frontier_inputs(last: Option<FrontierSet>, next: FrontierSet) -> V
     if last.map(|last| last.verified_best) != Some(next.verified_best) {
         inputs.push(BlockInput::TipHeight {
             height: next.verified_best.height.0,
+            hash: next.verified_best.hash,
         });
         inputs.push(BlockInput::FallbackDone {
             block_id: next.verified_best.hash,
@@ -2396,9 +2401,14 @@ fn record_block_event(event: &BlockEvent) {
                 FallbackReason::ReencodeFailed => "re_encode",
                 FallbackReason::RootMismatch => "root_mismatch",
                 FallbackReason::LocalCapacity => "local_capacity",
+                FallbackReason::VerifyDeadline => "verify_deadline",
             };
             tracing::debug!(target: "bpv1_stage", %block_id, reason = label, "fallback_started");
             metrics::counter!("zakura.p2p.bpv1.fallback.reason", "reason" => label).increment(1);
+        }
+        BlockEvent::Parked { block_id } => {
+            tracing::debug!(target: "bpv1_stage", %block_id, "verify_parked");
+            metrics::counter!("zakura.p2p.bpv1.verify.parked").increment(1);
         }
         BlockEvent::Assembled { since_meta, .. } => {
             metrics::histogram!("zakura.p2p.bpv1.assembly.seconds")

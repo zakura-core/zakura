@@ -18,7 +18,7 @@ use zakura_network::zakura::{
     bpv1::{
         bpv1_custom_service, classify_body_verification_class, BlockVerifierPort, Bpv1Handle,
         Bpv1Ports, HavePacing, HeaderChainAdmissionAdapter, MemoryBodyStore, NodeId, PortFuture,
-        Profile, VerifierVerdict, WorkId, ZakuraBpv1Config,
+        Profile, VerifierVerdict, WorkId, ZakuraBpv1Config, VERIFY_DEADLINE,
     },
     CustomService, ZakuraHeaderSyncDriverStartup,
 };
@@ -28,11 +28,10 @@ use super::{block_verify_error_class, BlockApplyTerminal, SyncCoordinator};
 /// Bounds one BPv1 submission to the router.
 ///
 /// A block whose parent is missing can wait in the verifier for its parent's block
-/// info, its UTXOs, or a place in the state's orphan queue. This bound matches the
-/// verifier's 2-minute wait for another delivery's pending commit. A timeout returns
-/// [`VerifierVerdict::LocalCapacity`], so the block falls back to block sync and frees
-/// its BPv1 slot (#2718).
-const SUBMIT_TIMEOUT: Duration = Duration::from_secs(120);
+/// info, its UTXOs, or a place in the state's orphan queue. BPv1's block table
+/// falls back at its verification deadline, so the adapter cancels the router call
+/// at the same bound. A timeout returns [`VerifierVerdict::LocalCapacity`] (#2718).
+const SUBMIT_TIMEOUT: Duration = VERIFY_DEADLINE;
 
 /// Production [`BlockVerifierPort`] wrapping `zakurad`'s shared `block_verifier_router`
 /// (`dual-2`, `dual-4`, `decision-8`).
@@ -47,8 +46,9 @@ const SUBMIT_TIMEOUT: Duration = Duration::from_secs(120);
 /// starts, the adapter stops waiting and transfers the submission to legacy, as native
 /// block sync does: a block that waits for its parent would otherwise hold the drain
 /// until the submit timeout. In `LegacyBootstrap` and during the legacy fallback the
-/// adapter submits nothing. Both cases return [`VerifierVerdict::LocalCapacity`]: BPv1
-/// releases the block, and legacy delivers it.
+/// adapter submits nothing. Both cases return [`VerifierVerdict::LocalCapacity`], and
+/// legacy delivers the block. BPv1 releases it, or parks it while its parent is not
+/// committed (`bpv1-84`).
 pub(crate) struct RouterBlockVerifierAdapter<V> {
     router: V,
     coordinator: Arc<SyncCoordinator>,
@@ -163,6 +163,9 @@ pub(crate) fn build_bpv1_service(
         shutdown,
     )
 }
+
+#[cfg(test)]
+mod router_tests;
 
 #[cfg(test)]
 mod tests {

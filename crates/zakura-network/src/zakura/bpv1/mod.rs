@@ -57,6 +57,7 @@ pub use blocks::{
     AdmittedBlock, BlockConfig, BlockEvent, BlockInput, BlockOutcome, BlockOutput, BlockPhase,
     BlockStep, BlockTable, ClaimRelease, FallbackReason, HeaderAdmissionResult, MetaEnvelope,
     PartRefusal, PartSource, PullPeerState, ReleaseReason, StripeJob, VerifierVerdict, WorkId,
+    VERIFY_DEADLINE,
 };
 pub use close::{Bpv1CloseCause, Bpv1CloseRow};
 pub use codec::{decode_and_check_stripe, encode_body, CodecError, EncodedBody};

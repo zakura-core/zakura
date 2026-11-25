@@ -1008,8 +1008,10 @@ is today's Zakura logic.
      when the next ranking is applied. Gateways that name one node count
      once towards the hold and the node fills one place. While a dial to
      the earlier ID is in flight, the gateway goes on naming that ID and
-     the dial settles it. A proof that makes a gateway ambiguous leaves
-     its member's slot an ordinary one. If this increases the ordinary
+     the dial settles it. If the dial ends before settling and releases
+     the last slot under that ID, a connected node that uniquely proves
+     the gateway takes its place immediately. A proof that makes a gateway
+     ambiguous leaves its member's slot an ordinary one. If this increases the ordinary
      total or the ordinary inbound count beyond its respective limit,
      a caller is refused its slot and a dial closes as DIAL-9 says,
      whichever place the new node itself would fill.

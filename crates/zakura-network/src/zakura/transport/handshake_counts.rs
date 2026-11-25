@@ -532,9 +532,8 @@ impl HandshakeCounts {
 
     /// Releases the slot that `claim_connection` charged to `node`.
     ///
-    /// A gateway that loses its last connection slot counts as in backoff
-    /// until the next published ranking, so a dropped caller or member
-    /// doesn't stay preferred in the meantime.
+    /// A gateway that loses its last slot goes into backoff unless another
+    /// live connection proves it owns the gateway's place.
     pub fn release_connection(&mut self, node: NodeId, inbound: bool) {
         self.connections.release(node, inbound);
         self.slot_left(node);
@@ -545,7 +544,9 @@ impl HandshakeCounts {
     fn slot_left(&mut self, node: NodeId) {
         let slots = self.connections.of_node(&node);
         let updated = if slots.total() == 0 {
-            self.preferred.with_released(&node)
+            self.preferred.with_released(&node, self.owners(), |id| {
+                self.connections.of_node(id).total() > 0
+            })
         } else if !self.is_authenticated(&node) {
             self.preferred.with_dialing(&node)
         } else {

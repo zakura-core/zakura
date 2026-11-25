@@ -512,7 +512,9 @@ fn a_node_that_left_gives_its_gateway_to_the_next_node_that_proves_the_id() {
     let formed = PreferredGateways::form([unresolved(earlier, 5)], 1)
         .with_owners([ProvenNode::new(left, &proved)], no_slots)
         .expect("the first node fills the place");
-    let released = formed.with_released(&left).expect("the node left");
+    let released = formed
+        .with_released(&left, std::iter::empty(), no_slots)
+        .expect("the node left");
     assert_eq!(
         resolutions(&released),
         [GatewayMatch::One((left, GatewayStanding::Backoff))]
@@ -577,7 +579,9 @@ fn a_node_that_two_gateways_name_fills_one_place() {
     assert_eq!((one.hold(), one.set()), (1, &[current][..]));
 
     // Losing its connection puts both of its gateways in backoff.
-    let released = connected.with_released(&current).expect("the node left");
+    let released = connected
+        .with_released(&current, std::iter::empty(), no_slots)
+        .expect("the node left");
     assert_eq!(released.set(), [other]);
     assert_eq!(
         resolutions(&released)[..2],

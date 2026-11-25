@@ -51,8 +51,8 @@ pub enum GatewayStanding {
     Dialing,
     /// Connected to this node.
     ///
-    /// Whatever its standing, a gateway that loses its last connection slot
-    /// counts as in [`Self::Backoff`] until the next published ranking.
+    /// When the named node loses its last slot, another connected owner
+    /// can take its place. Without one, an available gateway enters [`Self::Backoff`].
     Connected,
 }
 
@@ -574,16 +574,31 @@ impl PreferredGateways {
         })
     }
 
-    /// The set re-formed with `node` in backoff, once it has lost its last
-    /// connection slot; `None` when no gateway names `node`, or it is
-    /// unmatched or already in backoff.
-    ///
-    /// A gateway that loses its last connection slot counts as in backoff
-    /// until the next published ranking. Like a gateway whose dial failed,
-    /// it still counts toward the hold and leaves the set so the next
-    /// available gateway may fill it, and may still call back in.
-    pub(super) fn with_released(&self, node: &NodeId) -> Option<Self> {
-        self.with_standing_of(node, GatewayStanding::Backoff, GatewayStanding::available)
+    /// Recounts a gateway after its named node releases its last slot. A
+    /// remaining owner can now take a place that was held by an in-flight
+    /// dial. An available gateway without an owner goes into backoff.
+    pub(super) fn with_released<'a>(
+        &self,
+        node: &NodeId,
+        owners: impl Iterator<Item = ProvenNode<'a>>,
+        holds_slot: impl Fn(&NodeId) -> bool,
+    ) -> Option<Self> {
+        if !self
+            .ranking
+            .iter()
+            .any(|gateway| gateway.node() == Some(*node))
+        {
+            return None;
+        }
+        let mut ranking = self.ranking.clone();
+        for gateway in &mut ranking {
+            if gateway.available_node() == Some(*node) {
+                *gateway = gateway.with_standing(GatewayStanding::Backoff);
+            }
+        }
+        GatewayRanking::connect_owners(&mut ranking, owners, holds_slot);
+        (ranking != self.ranking)
+            .then(|| Self::form_with_incumbents(ranking, self.hold_limit, &self.set))
     }
 
     /// The set re-formed with every gateway that already names `node` in

@@ -941,6 +941,35 @@ fn a_moved_gateway_that_calls_in_during_a_dial_to_it_takes_no_second_place() {
     );
 }
 
+/// Cancelling the old-ID dial gives its place to the already connected
+/// gateway before discovery publishes another ranking.
+#[test]
+fn cancelling_a_dial_gives_its_place_to_the_connected_moved_gateway() {
+    let handler = handler(40, 1);
+    let (earlier, current) = (new_node(), new_node());
+    publish(&handler, &[(earlier, GatewayStanding::Dialable)]);
+    let dial = handler
+        .claim_connection(earlier, false)
+        .expect("held place");
+    let _inbound = handler
+        .claim_slot(ProvenNode::new(current, &[earlier]), true)
+        .expect("the gateway fits in an ordinary slot while the dial holds its place");
+    assert_eq!(preferred_set(&handler), [earlier]);
+    assert_eq!(split(&handler).ordinary_inbound, 1);
+
+    drop(dial);
+
+    assert_eq!(preferred_set(&handler), [current]);
+    assert_eq!(
+        split(&handler),
+        SlotSplit {
+            preferred: 1,
+            ordinary: 0,
+            ordinary_inbound: 0,
+        }
+    );
+}
+
 /// The node with a gateway's exact ID and a node that proved that ID as an
 /// earlier one are both connected, in either order: one key holder runs two
 /// nodes. The second is refused while the ordinary slots are full, and the

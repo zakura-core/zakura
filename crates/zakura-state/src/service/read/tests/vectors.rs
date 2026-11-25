@@ -14,7 +14,7 @@ use zakura_chain::{
         NoteCommitmentSubtree, NoteCommitmentSubtreeData, NoteCommitmentSubtreeIndex,
         TRACKED_SUBTREE_HEIGHT,
     },
-    transaction,
+    transaction, transparent,
     value_balance::ValueBalance,
 };
 use zakura_header_chain::Frontier;
@@ -49,7 +49,7 @@ use crate::{
     },
     tests::FakeChainHelper,
     Config, HistoricalSubtreeUnavailable, HistoricalSubtreeUnavailableReason, ReadRequest,
-    ReadResponse,
+    ReadResponse, TransactionLocation,
 };
 
 /// Test that ReadStateService responds correctly when empty.
@@ -2336,4 +2336,95 @@ async fn block_sizes_by_hash_report_committed_sizes_and_none_for_unknown_hashes(
         "size queries above the header range cap are rejected"
     );
     Ok(())
+}
+
+/// A UTXO read from the finalized state gets its transaction ID from the finalized state, even
+/// when the query still holds a chain whose block at that height lost to the finalized block.
+#[test]
+fn address_utxo_transaction_ids_ignore_a_stale_chain_at_finalized_heights() {
+    use crate::{service::read::address_utxos, CheckpointVerifiedBlock};
+
+    let _init_guard = zakura_test::init();
+
+    let network = Mainnet;
+    let genesis: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .expect("the genesis block vector deserializes");
+    let finalized_block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .expect("the block 1 vector deserializes");
+
+    // The non-finalized chain only accepts transaction versions from after the mandatory
+    // checkpoint, so the competing block at height 1 takes its coinbase from a later block.
+    let mut stale_block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_434873_BYTES
+        .zcash_deserialize_into()
+        .expect("the historical block vector deserializes");
+    let stale_transactions = &mut Arc::make_mut(&mut stale_block).transactions;
+    stale_transactions.truncate(1);
+    match &mut Arc::make_mut(&mut stale_transactions[0]).inputs_mut()[0] {
+        transparent::Input::Coinbase { height, .. } => *height = Height(1),
+        transparent::Input::PrevOut { .. } => panic!("the first transaction is a coinbase"),
+    }
+
+    let mut finalized_state = FinalizedState::new(&Config::ephemeral(), &network)
+        .expect("opening an ephemeral database should succeed");
+    for block in [&genesis, &finalized_block] {
+        finalized_state
+            .commit_finalized_direct(
+                CheckpointVerifiedBlock::from(block.clone()).into(),
+                None,
+                None,
+                "stale chain test",
+            )
+            .expect("the block vectors are a valid chain");
+    }
+
+    // The chain the query cloned before a competing block was finalized at its only height.
+    let stale_chain = Chain::new(
+        &network,
+        Height(0),
+        Default::default(),
+        Default::default(),
+        Default::default(),
+        Default::default(),
+        Default::default(),
+        ValueBalance::fake_populated_pool(),
+    )
+    .push(stale_block.clone().prepare().test_with_zero_spent_utxos())
+    .expect("the fake block is a valid chain update");
+
+    let location = TransactionLocation::from_usize(Height(1), 0);
+    let finalized_hash = finalized_block.transactions[0].hash();
+    let stale_hash = stale_block.transactions[0].hash();
+    assert_ne!(finalized_hash, stale_hash);
+    assert_eq!(
+        stale_chain.transaction_hash_by_loc(location),
+        Some(stale_hash)
+    );
+
+    let addresses: HashSet<_> = finalized_block.transactions[0]
+        .outputs()
+        .iter()
+        .filter_map(|output| output.address(&network))
+        .collect();
+    assert!(!addresses.is_empty());
+
+    let utxos = address_utxos(
+        &network,
+        Some(Arc::new(stale_chain)),
+        &finalized_state.db,
+        addresses,
+    )
+    .expect("the transparent indexes are available");
+
+    let transaction_ids: Vec<_> = utxos
+        .utxos()
+        .map(|(_address, hash, output_location, _output)| {
+            (output_location.transaction_location(), *hash)
+        })
+        .collect();
+    assert!(!transaction_ids.is_empty());
+    assert!(transaction_ids
+        .iter()
+        .all(|transaction_id| *transaction_id == (location, finalized_hash)));
 }

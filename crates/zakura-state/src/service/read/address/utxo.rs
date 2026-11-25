@@ -156,9 +156,18 @@ where
                     "chain address UTXO response",
                 );
 
+                let chain_transaction_locations = created_chain_utxos
+                    .keys()
+                    .map(|output_location| output_location.transaction_location())
+                    .collect();
                 let utxos =
                     apply_utxo_changes(finalized_utxos, created_chain_utxos, spent_chain_utxos);
-                let tx_ids = lookup_tx_ids_for_utxos(chain.as_ref(), db, &utxos);
+                let tx_ids = lookup_tx_ids_for_utxos(
+                    chain.as_ref(),
+                    db,
+                    &chain_transaction_locations,
+                    &utxos,
+                );
 
                 debug!(
                     full_utxo_count = ?utxos.len(),
@@ -423,8 +432,12 @@ fn apply_utxo_changes(
         .collect()
 }
 
-/// Returns the [`transaction::Hash`]es containing the supplied UTXOs,
-/// from the non-finalized `chain` and finalized `db`.
+/// Returns the [`transaction::Hash`]es containing the supplied UTXOs.
+///
+/// A transaction in `chain_transaction_locations` is read from the non-finalized `chain`,
+/// and every other transaction from the finalized `db`. `chain_transaction_locations` must be
+/// the locations of the UTXOs that `chain` created, so a UTXO read from `db` never gets the
+/// hash of a `chain` block that a different finalized block has replaced at the same height.
 ///
 /// # Panics
 ///
@@ -432,6 +445,7 @@ fn apply_utxo_changes(
 fn lookup_tx_ids_for_utxos<C>(
     chain: Option<C>,
     db: &ZakuraDb,
+    chain_transaction_locations: &BTreeSet<TransactionLocation>,
     utxos: &BTreeMap<OutputLocation, transparent::Output>,
 ) -> BTreeMap<TransactionLocation, transaction::Hash>
 where
@@ -443,23 +457,22 @@ where
         .map(|output_location| output_location.transaction_location())
         .collect();
 
-    // First try the in-memory chain, then the disk database.
-    //
     // Each location is looked up on its own, so the work is bounded by the number of UTXOs,
     // not by the number of transactions the addresses have in the chain.
     transaction_locations
         .iter()
         .map(|tx_loc| {
-            (
-                *tx_loc,
+            let hash = if chain_transaction_locations.contains(tx_loc) {
                 chain
                     .as_ref()
                     .and_then(|chain| chain.as_ref().transaction_hash_by_loc(*tx_loc))
-                    .unwrap_or_else(|| {
-                        db.transaction_hash(*tx_loc)
-                            .expect("unexpected inconsistent UTXO indexes")
-                    }),
-            )
+                    .expect("the chain contains the transactions of the UTXOs it created")
+            } else {
+                db.transaction_hash(*tx_loc)
+                    .expect("unexpected inconsistent UTXO indexes")
+            };
+
+            (*tx_loc, hash)
         })
         .collect()
 }

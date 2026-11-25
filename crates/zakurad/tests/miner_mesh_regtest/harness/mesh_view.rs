@@ -108,7 +108,8 @@ impl MeshView {
             })
             .collect();
         format!(
-            "hold {}, slots {:?}, window {:?}, gateways [{}], peers [{}]",
+            "announces [{}], hold {}, slots {:?}, window {:?}, gateways [{}], peers [{}]",
+            info.announced_gateways.join(", "),
             info.hold,
             info.slots,
             info.window,
@@ -123,8 +124,12 @@ impl MeshView {
 pub(super) struct NodeFacts {
     /// The node's whole v2 node ID.
     pub node_id: [u8; 32],
-    /// The node has a miner address, so it counts gateways.
+    /// The node has a miner address.
     pub mining: bool,
+    /// The node mines or runs the miner mesh, so it counts gateways.
+    pub prefers_gateways: bool,
+    /// The gateway the node's coinbases name, if it names one.
+    pub announced: Option<GatewayId>,
     pub total_capacity: usize,
     pub gateway_capacity: usize,
 }
@@ -242,15 +247,31 @@ pub(super) fn check_view(view: &MeshView, facts: &NodeFacts) -> Vec<String> {
         ));
     }
 
-    // 7. A node that does not mine ranks nothing and holds nothing.
+    // 7. A node that does not prefer gateways ranks nothing and holds
+    // nothing. One that does reports the blocks it counts.
     if info.mining != facts.mining {
         broken.push(format!("7: the node reports mining = {}", info.mining));
     }
-    if !facts.mining && (!info.gateways.is_empty() || info.hold != 0 || info.window.is_some()) {
+    if !facts.prefers_gateways
+        && (!info.gateways.is_empty() || info.hold != 0 || info.window.is_some())
+    {
         broken.push(format!(
-            "7: a node that does not mine ranks {} gateways with a hold of {}",
+            "7: a node that does not prefer gateways ranks {} gateways with a hold of {}",
             info.gateways.len(),
             info.hold
+        ));
+    }
+    if facts.prefers_gateways && info.window.is_none() {
+        broken.push("7: a node that prefers gateways reports no window".into());
+    }
+
+    // 8. The node's coinbases name the gateway the harness configured: its
+    // own node, the relay it names, or none.
+    let announced: Vec<String> = facts.announced.iter().map(hex::encode).collect();
+    if info.announced_gateways != announced || info.announcing != facts.announced.is_some() {
+        broken.push(format!(
+            "8: the node announces {:?} (announcing = {}), not {announced:?}",
+            info.announced_gateways, info.announcing
         ));
     }
 

@@ -279,27 +279,19 @@ const fn layout_budget(layout: &[Stream], header_bytes: usize) -> ReactorBudget 
         Ok(bytes) => bytes,
         Err(error) => panic!("{}", error.rule()),
     };
-    let Some(unsolicited) = subscriber
-        .unsolicited
-        .checked_add(update_bytes(header_bytes))
-    else {
-        panic!("the header sync unsolicited receive share fits u64");
+    // The publisher pushes pages and updates against the subscription's
+    // credit, and nothing raises the connection's receive window per
+    // subscription, so the whole share is unsolicited. Funding it at
+    // negotiation keeps a header-only peer's window at full credit.
+    let Some(receive) = subscriber.total().checked_add(update_bytes(header_bytes)) else {
+        panic!("the header sync receive share fits u64");
     };
-    // Keep one maximal frame in `unsolicited` so header sync always passes
-    // `check_frame_cap` even with zero open subscription leases; move that
-    // largest page out of `per_request` so total credit stays unchanged.
+    let Some(receive) = receive.checked_add(FRAME_HEADER_BYTES as u64) else {
+        panic!("the header sync receive share fits u64");
+    };
     let frame = largest_page(header_bytes) as u64 + FRAME_HEADER_BYTES as u64;
-    let Some(unsolicited) = unsolicited.checked_add(frame) else {
-        panic!("the header sync unsolicited receive share fits u64");
-    };
-    let per_request = subscriber
-        .per_request
-        .saturating_sub(largest_page(header_bytes) as u64);
     ReactorBudget {
-        receive: ReceiveBudget {
-            unsolicited,
-            per_request,
-        },
+        receive: ReceiveBudget::unsolicited_only(receive),
         output: serve_output_bytes(header_bytes),
     }
     .assert_frame_cap(frame as u32)

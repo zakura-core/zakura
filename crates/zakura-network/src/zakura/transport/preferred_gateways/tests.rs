@@ -759,7 +759,7 @@ fn a_connected_template_keeps_its_place_when_blocks_name_an_offline_template() {
         let places = PreferredGateways::form(
             [
                 RankedGateway::always_preferred(offline, blocks),
-                always_preferred(connected).connected_as(connected),
+                always_preferred(connected).resolved_as(connected, GatewayStanding::Connected),
             ],
             1,
         );
@@ -794,7 +794,7 @@ fn an_always_preferred_id_that_disconnects_keeps_its_place() {
     assert_eq!(formed.set(), &[configured, node(2)]);
 
     let released = formed
-        .with_released(&configured)
+        .with_released(&configured, std::iter::empty(), no_slots)
         .expect("the connected ID loses its last slot");
 
     assert_eq!(released.set(), &[node(2)]);
@@ -827,4 +827,25 @@ fn always_preferred_ids_can_take_every_place() {
 
     assert_eq!(formed.hold(), 1);
     assert!(formed.set().is_empty());
+}
+
+/// A template's configured earlier ID and its block-ranked current ID share
+/// one funded place after the template proves its identity.
+#[test]
+fn a_template_that_changed_id_leaves_room_for_another_gateway() {
+    let (earlier, current, other) = (raw_node(1, 0), raw_node(2, 0), raw_node(3, 0));
+    let formed = PreferredGateways::form(
+        [
+            always_preferred(earlier),
+            RankedGateway::resolved(current, 12, GatewayStanding::Connected),
+            RankedGateway::resolved(other, 10, GatewayStanding::Dialable),
+        ],
+        MAX_PREFERRED_GATEWAYS,
+    );
+    let proved = [earlier];
+    let connected = formed
+        .with_owners([ProvenNode::new(current, &proved)], no_slots)
+        .expect("the template proved its configured earlier ID");
+    assert_eq!(connected.hold(), 2);
+    assert_eq!(connected.set(), [current, other]);
 }

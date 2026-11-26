@@ -24,7 +24,8 @@ use super::super::protocol::{DialTarget, ZakuraDiscoveryDialCandidate, ZakuraDis
 use super::discovery_node_addr_with_reserved_ip_capacity;
 use super::state::{CandidateDialerState, DialAttemptKey};
 use crate::zakura::{
-    transport::MovedNodeIds, GatewayMatch, GatewayStanding, RankedGateway, MAX_PREFERRED_GATEWAYS, MAX_RANKED_GATEWAYS,
+    transport::MovedNodeIds, GatewayMatch, GatewayStanding, RankedGateway, MAX_PREFERRED_GATEWAYS,
+    MAX_RANKED_GATEWAYS,
 };
 
 /// The gateways this node keeps connection places for: the IDs it always

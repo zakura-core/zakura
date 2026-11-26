@@ -497,7 +497,10 @@ impl PreferredGateways {
         let hold_limit = hold_limit.min(MAX_PREFERRED_GATEWAYS);
         let mut matched: HashSet<NodeId> = HashSet::default();
         let mut unresolved = 0;
-        for gateway in ranking.iter().filter(|gateway| gateway.counts_toward_hold()) {
+        for gateway in ranking
+            .iter()
+            .filter(|gateway| gateway.counts_toward_hold())
+        {
             if let Some(node) = gateway.node() {
                 matched.insert(node);
             } else {
@@ -604,7 +607,8 @@ impl PreferredGateways {
                     continue;
                 }
             }
-            if places == hold || (gateway.available_node().is_none() && !gateway.keeps_its_place()) {
+            if places == hold || (gateway.available_node().is_none() && !gateway.keeps_its_place())
+            {
                 continue;
             }
             places += 1;

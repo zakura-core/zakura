@@ -840,8 +840,9 @@ fn every_network_selects_the_layout_for_its_header_size() {
 /// Each budget holds its terms exactly, and each network selects the budget
 /// for its header size.
 ///
-/// The receive share is the peer's `Status` cadence (602 × 122 bytes), one
-/// subscription's byte credit plus its largest page, and the peer's
+/// The receive share, all unsolicited, is the peer's `Status` cadence
+/// (602 × 122 bytes), one subscription's byte credit plus its largest page,
+/// and the peer's
 /// unreleased updates: `credit.objects + credit.bytes / smallest page` grants
 /// and one `Close` at 107 bytes each, and one `Open` at 523 bytes. The output
 /// share covers `2 × max_live` overlapping subscriptions' byte credit plus
@@ -857,10 +858,7 @@ fn every_budget_holds_its_terms() {
     assert_eq!(
         CommonMessage::BUDGET,
         ReactorBudget {
-            receive: ReceiveBudget {
-                unsolicited: status + 999_154 + 2_096_713 + 8,
-                per_request: credit,
-            },
+            receive: ReceiveBudget::unsolicited_only(status + 999_154 + 2_096_713 + 8 + credit),
             output: 2 * (credit + 2_096_713),
         }
     );
@@ -869,10 +867,7 @@ fn every_budget_holds_its_terms() {
     assert_eq!(
         RegtestMessage::BUDGET,
         ReactorBudget {
-            receive: ReceiveBudget {
-                unsolicited: status + 3_841_395 + 1_348_082 + 8,
-                per_request: credit,
-            },
+            receive: ReceiveBudget::unsolicited_only(status + 3_841_395 + 1_348_082 + 8 + credit),
             output: 2 * (credit + 1_348_082),
         }
     );

@@ -879,7 +879,7 @@ mod receive_credit {
         )
         .await??;
         let base = 1024 * 1024;
-        let credit = ConnectionCredit::new_quic(connection().1, conn, base, base);
+        let credit = ConnectionCredit::new_quic(connection().1, conn, base, base, base);
 
         let memory_pool = crate::zakura::tx_relay::test_memory_pool();
         let tx_leased = || memory_pool.snapshot().consumers[Consumer::Tx.index()].leased;
@@ -969,7 +969,7 @@ mod receive_credit {
         )
         .await??;
         let base = 1024 * 1024;
-        let credit = ConnectionCredit::new_quic(connection().1, conn, base, base);
+        let credit = ConnectionCredit::new_quic(connection().1, conn, base, base, base);
 
         let cap = 4 * u64::from(MAX_TX_BYTES);
         let memory_pool = MemoryPool::new(

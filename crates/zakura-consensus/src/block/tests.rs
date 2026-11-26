@@ -3781,6 +3781,77 @@ mod zip218_shielded_action_limits {
         );
     }
 
+    /// ZIP 223 scales every ZIP 218 limit by 4/5 at NU7.1. A 300-action
+    /// transaction that fits a NU7 block no longer fits any NU7.1 block.
+    #[test]
+    fn limits_scale_by_four_fifths_at_the_nu7_1_height() {
+        const NU7: u32 = 1;
+        const NU7_1: u32 = 3;
+        let network = Parameters::build()
+            .with_slow_start_interval(Height(0))
+            .with_activation_heights(ConfiguredActivationHeights {
+                nu7: Some(NU7),
+                nu7_1: Some(NU7_1),
+                ..Default::default()
+            })
+            .expect("activation heights are valid")
+            .clear_funding_streams()
+            .to_network()
+            .expect("configured testnet is valid");
+
+        let check = |tx: Arc<Transaction>, height: u32| {
+            check::shielded_action_limits_are_valid([tx].iter(), Height(height), &network)
+        };
+
+        // The ZIP 218 limits still apply the block before NU7.1.
+        check(fake_v5_with_orchard_actions(330), NU7_1 - 1)
+            .expect("330 Orchard actions fit below NU7.1");
+        check(fake_v5_with_sapling_outputs(300), NU7_1 - 1)
+            .expect("300 Sapling outputs fit below NU7.1");
+
+        check(fake_v5_with_orchard_actions(264), NU7_1).expect("264 Orchard actions fit");
+        check(fake_v5_with_sapling_outputs(240), NU7_1).expect("240 Sapling outputs fit");
+        for (tx, expected) in [
+            (
+                fake_v5_with_orchard_actions(300),
+                TransactionError::OrchardActionsExceedBlockLimit {
+                    actions: 300,
+                    limit: 264,
+                },
+            ),
+            (
+                fake_v5_with_orchard_actions(265),
+                TransactionError::OrchardActionsExceedBlockLimit {
+                    actions: 265,
+                    limit: 264,
+                },
+            ),
+            (
+                fake_v6_with_orchard_and_ironwood_actions(NetworkUpgrade::Nu7_1, 0, 265),
+                TransactionError::IronwoodActionsExceedBlockLimit {
+                    actions: 265,
+                    limit: 264,
+                },
+            ),
+            (
+                fake_v5_with_sapling_outputs(241),
+                TransactionError::SaplingIOsExceedBlockLimit {
+                    ios: 241,
+                    limit: 240,
+                },
+            ),
+            (
+                fake_v6_with_orchard_and_ironwood_actions(NetworkUpgrade::Nu7_1, 132, 133),
+                TransactionError::ShieldedCostExceedsBlockBudget {
+                    cost: 265,
+                    limit: 264,
+                },
+            ),
+        ] {
+            assert_eq!(check(tx, NU7_1), Err(expected));
+        }
+    }
+
     #[test]
     fn counts_at_the_per_pool_limits_are_accepted() {
         let cases: [(&str, Arc<Transaction>); 3] = [

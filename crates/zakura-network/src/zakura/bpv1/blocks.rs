@@ -2250,9 +2250,17 @@ impl BlockTable {
         else {
             return;
         };
-        if verdict == UnknownParentVerdict::Park {
+        // A `Drop` for a height header sync reached during the checks may
+        // now find the header, so it retries like `Park` after a move.
+        let may_retry = matches!(
+            verdict,
+            UnknownParentVerdict::Park | UnknownParentVerdict::Drop
+        );
+        let retries = may_retry
+            && retries_admission(entry.best_moves, self.best_moves, entry.received_at, now);
+        if retries || verdict == UnknownParentVerdict::Park {
             entry.checking = None;
-            if retries_admission(entry.best_moves, self.best_moves, entry.received_at, now) {
+            if retries {
                 let entry = self
                     .remove_pending(block_id)
                     .expect("pending entry verified present");

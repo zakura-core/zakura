@@ -642,6 +642,81 @@ fn close_4_unknown_parent_alternate_retries_after_the_best_header_moved() {
     table.assert_invariants();
 }
 
+/// Header sync can reach a pending block's own height while its checks run.
+/// The promoted alternate is then checked against the new best header and
+/// gets `Drop`, but the header is now known, so it retries admission and
+/// BPv1 still delivers the block (#2760).
+#[test]
+fn unknown_parent_drop_after_header_sync_reached_the_block_retries_admission() {
+    let now = Instant::now();
+    let parent = block::Hash([0x3C; 32]);
+    let block_id = block::Hash([0x3D; 32]);
+    let [a, b, ..] = sessions();
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    table.step(
+        now,
+        BlockInput::ParentAdmitted {
+            hash: block::Hash([0x3E; 32]),
+            height: 9,
+        },
+    );
+    let first = copy_from(
+        &mut table,
+        now,
+        make_envelope(block_id, tiny(), [0xA1; 32], node_id(1)),
+        a,
+    );
+    copy_from(
+        &mut table,
+        now,
+        make_envelope(block_id, tiny(), [0xA2; 32], node_id(1)),
+        b,
+    );
+    let checking = header_result(
+        &mut table,
+        now,
+        &first,
+        HeaderAdmissionResult::MissingParent {
+            parent_hash: parent,
+        },
+    );
+    table.step(
+        now,
+        BlockInput::ParentAdmitted {
+            hash: block_id,
+            height: 11,
+        },
+    );
+    let failed = unknown_parent_checked(
+        &mut table,
+        now,
+        &checking,
+        UnknownParentVerdict::Invalid(Bpv1CloseRow::Row4BadMetaOrCommitment),
+    );
+    assert!(failed
+        .outputs
+        .iter()
+        .any(|o| matches!(o, BlockOutput::CheckUnknownParent { top: 11, .. })));
+
+    let retried = unknown_parent_checked(&mut table, now, &failed, UnknownParentVerdict::Drop);
+    assert!(rejected_sessions(&retried, block_id).is_empty());
+    assert_eq!(table.pending_meta_len(), 0);
+    let admitted = header_result(
+        &mut table,
+        now,
+        &retried,
+        HeaderAdmissionResult::Admitted {
+            height: 11,
+            parent_hash: parent,
+        },
+    );
+    let committed = commitment_ok(&mut table, now, &admitted);
+    assert!(committed
+        .events
+        .contains(&BlockEvent::BlockAdmitted { block_id }));
+    table.assert_invariants();
+}
+
 /// The alternate envelope waits with its entry while the parent header is
 /// unknown, and gets its check once the parent arrives.
 #[test]

@@ -52,7 +52,7 @@ use super::{
 use crate::{
     config::UnconditionalPeers,
     zakura::{
-        memory::{ConnectionCredit, Consumer, MemoryPool, PoolLease},
+        memory::{ConnectionCredit, Consumer, LeaseDenied, MemoryPool, PoolLease},
         regulation::{ByteBucket, MeteredReady, MeteredSender},
         resume_task_panic,
         transport::OrderedStreamFailure,
@@ -117,6 +117,19 @@ impl TxCreditLease {
             .filter(|_| unspent > 0)
             .and_then(|lease| lease.split(unspent.min(lease.bytes())));
         credit.finish_receive_credit(total, drain);
+    }
+
+    /// Grows the lease to cover `body` decoded, which can hold several
+    /// times its wire bytes (`docs/design/block-sync-resource-ledger.md`).
+    /// Returns the bytes the lease holds, `None` for a fetch with no lease,
+    /// or the refusal, which leaves the lease as it was.
+    fn cover_decoded(&mut self, body: &UnminedTx) -> Result<Option<u64>, LeaseDenied> {
+        let Some(lease) = &mut self.lease else {
+            return Ok(None);
+        };
+        let decoded = body.transaction().retained_memory_size_bytes();
+        lease.try_grow_to(decoded.max(lease.bytes()))?;
+        Ok(Some(lease.bytes()))
     }
 
     /// The core no longer counts the fetch's bytes. Credit no body spent
@@ -1513,9 +1526,30 @@ impl Routine {
                 reservation,
                 body,
             } => {
-                let Some(reservation) = self.take_reservation(reservation) else {
+                let Some(mut reservation) = self.take_reservation(reservation) else {
                     return;
                 };
+                // The decoded body's bytes are leased before the core holds
+                // it. A full `Consumer::Tx` is this node's doing: the body is
+                // dropped with a `NoRoom` verdict, which charges no one, and
+                // the id is fetched again later.
+                let leased = match self.tx_leases.get_mut(&reservation.id()) {
+                    Some(fetch) => fetch.cover_decoded(&body),
+                    None => Ok(None),
+                };
+                match leased {
+                    Ok(Some(bytes)) => reservation = reservation.with_tx_lease_bytes(bytes),
+                    Ok(None) => {}
+                    Err(_) => {
+                        self.calls.push(Box::pin(async move {
+                            PoolResult::Verdict {
+                                waiter,
+                                verdict: PortVerdict::NoRoom,
+                            }
+                        }));
+                        return;
+                    }
+                }
                 // The body goes into the core's queue now or is dropped
                 // with a `NoRoom` verdict, so the routine never holds a
                 // decoded body while it reads the next frame.

@@ -659,6 +659,81 @@ async fn a_fetch_holds_its_tx_lease_until_the_core_ends_it() {
     assert_eq!(memory_pool.snapshot().total_leased, 0);
 }
 
+/// `mem-7`: a decoded body can hold several times its wire bytes, so its
+/// fetch's lease grows to cover the decoded size before the core holds the
+/// body, and the core learns the lease's new size with the submission. A
+/// `Consumer::Tx` with no room for the growth drops the body with a
+/// `NoRoom` verdict, which charges no one.
+#[tokio::test]
+async fn a_decoded_body_is_leased_before_the_core_holds_it() {
+    use crate::zakura::memory::{ConsumerSpec, PoolConfig};
+
+    let tx = transactions(1).remove(0).transaction;
+    let (id, size) = (tx.id(), u32::try_from(tx.size()).expect("fits u32"));
+    let decoded = tx.transaction().retained_memory_size_bytes();
+    assert!(
+        decoded > u64::from(size),
+        "a decoded body outgrows its wire bytes"
+    );
+
+    for room in [true, false] {
+        let cap = if room { decoded } else { u64::from(size) };
+        let memory_pool = MemoryPool::new(
+            PoolConfig::new(cap, 0).with_consumer(Consumer::Tx, ConsumerSpec::bulk(cap, cap, 1)),
+        );
+        let tx_leased = || memory_pool.snapshot().consumers[Consumer::Tx.index()].leased;
+        let (handle, mut inbox) = pool_port();
+        publish(&inbox, Vec::new(), Vec::new());
+        let (wiring, _handed) = wiring_with(handle, memory_pool.clone());
+        let mut session = Session::open(&wiring);
+        session
+            .deliver(TxRelayMessage::Hello {
+                serves: 16,
+                max_tx_bytes: MAX_TX_BYTES,
+            })
+            .await;
+        session
+            .deliver(TxRelayMessage::Have(vec![(id, size)]))
+            .await;
+        let (reservation, _hold) =
+            inbox.grant_relayed(ReservationId(1), id, CancellationToken::new());
+        let leased = RelayedFetch {
+            announced_size: u64::from(size),
+            leased_bytes: u64::from(size),
+        };
+        answer_reserve(&mut session, &mut inbox, id, leased, Ok(reservation)).await;
+
+        let body = tx
+            .transaction()
+            .zcash_serialize_to_vec()
+            .expect("a valid transaction serializes");
+        session.deliver(TxRelayMessage::Tx { id, body }).await;
+        let command = tokio::time::timeout(Duration::from_secs(5), inbox.next())
+            .await
+            .expect("the core hears of the body promptly");
+        if room {
+            let Some(PoolCommand::Submit { reservation, .. }) = command else {
+                panic!("the leased body is submitted");
+            };
+            assert_eq!(reservation.tx_lease_bytes(), Some(decoded));
+            assert_eq!(tx_leased(), decoded);
+        } else {
+            assert!(
+                matches!(command, Some(PoolCommand::Released(ReservationId(1)))),
+                "the body is dropped with its reservation"
+            );
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                apply_calls(&mut session, |r| matches!(r, PoolResult::Verdict { .. })),
+            )
+            .await
+            .expect("the verdict reaches the routine promptly");
+            assert_eq!(session.cause.get(), None, "a full pool charges no one");
+            assert_eq!(tx_leased(), u64::from(size), "the lease stays as it was");
+        }
+    }
+}
+
 /// Receive credit on a real connection. The simulator has no local QUIC
 /// endpoint.
 #[cfg(not(zakura_sim))]

@@ -48,7 +48,7 @@ pub(super) fn probe_in(window: u32, pool: ReservationPool) -> Probe {
     let capacity = usize::try_from(window).unwrap() + 16;
     let (out_send, outbound) = crate::zakura::framed_channel(capacity);
     let budget = ByteBudget::new(config.inflight_block_bytes());
-    let work = Arc::new(WorkQueue::new(block::Height(0), budget.clone()));
+    let work = Arc::new(WorkQueue::with_test_pool(block::Height(0), budget.clone()));
     let (mut routine, ends) = super::tests::TestRoutine {
         config,
         work: Some(Arc::clone(&work)),

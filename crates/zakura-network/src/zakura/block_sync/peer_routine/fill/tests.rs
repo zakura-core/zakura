@@ -23,6 +23,7 @@ use crate::zakura::{
         events::RoutineToReactor, request::BlockSizeEstimate, test_work_scope,
         trace::request_owner, BlockSyncStatus,
     },
+    memory::Consumer,
     regulation::ReservationPool,
     testkit::{TraceCapture, TraceValue},
     trace::{block_sync_trace as bs_trace, ZakuraTrace},
@@ -193,16 +194,55 @@ async fn avoided_work_returns_quietly_with_its_retry_deadline() {
 async fn refused_above_floor_funding_returns_the_run_without_a_charge() {
     let mut fixture = fixture(1, &[3]);
     // Admission funds 500 bytes, but the take always admits its first body.
-    let budget = fixture.routine.io.work.budget_for_tests();
-    let reserved = budget.available() - 500;
-    let unrelated = budget.reserve_owned(reserved).unwrap();
+    let pool = fixture.routine.io.work.memory_pool().clone();
+    let reserved = pool.available_for(Consumer::Consensus) - 500;
+    let unrelated = pool
+        .try_acquire(Consumer::Consensus, None, reserved)
+        .unwrap();
     let before = fixture.next_request_id();
 
     let report = fixture.routine.try_fill();
 
     assert_eq!(report.stop, FillStop::Budget);
     assert_eq!(fixture.next_request_id(), before + 1);
-    fixture.assert_settled(reserved);
+    fixture.assert_settled(0);
+    assert_eq!(pool.consumer_leased(Consumer::Consensus), reserved);
+    drop(unrelated);
+}
+
+/// A memory refusal marks the routine waiting only until a later pass stops
+/// for another reason: a stale wait would hold other consumers back for a
+/// request this routine no longer has (rule 3, `02 §5`).
+#[tokio::test]
+async fn a_later_pass_that_stops_before_funding_ends_the_memory_wait() {
+    let mut fixture = fixture(1, &[3]);
+    let pool = fixture.routine.io.work.memory_pool().clone();
+    let reserved = pool.available_for(Consumer::Consensus) - 500;
+    let unrelated = pool
+        .try_acquire(Consumer::Consensus, None, reserved)
+        .unwrap();
+    let waiting = || pool.snapshot().consumers[Consumer::Consensus.index()].waiting;
+
+    let report = fixture.routine.try_fill();
+    assert_eq!(report.stop, FillStop::Budget);
+    assert_eq!(
+        fixture.routine.io.pool_wait_consumer(),
+        Some(Consumer::Consensus)
+    );
+    assert!(waiting(), "the refused routine waits on the pool");
+
+    // The run is now avoided, so the next pass stops before funding while
+    // the pool would still refuse it.
+    fixture
+        .routine
+        .state
+        .retry_avoid
+        .insert(block::Height(3), Instant::now() + Duration::from_secs(60));
+    let report = fixture.routine.try_fill();
+    assert_eq!(report.stop, FillStop::RetryAvoid);
+    assert_eq!(fixture.routine.io.pool_wait_consumer(), None);
+    assert!(!waiting(), "a routine with no refused request doesn't wait");
+    fixture.assert_settled(0);
     drop(unrelated);
 }
 
@@ -217,13 +257,14 @@ async fn session_cancellation_before_funding_returns_the_take_without_a_charge()
     let request_id = routine.state.allocate_request_id().unwrap();
     let TakenWork {
         download_floor,
+        verified_tip,
         request,
     } = routine.select_work(&limits, request_id, now).unwrap();
     // The session ends after the fence opened the exchange, so only funding
     // sees the cancellation.
     routine.io.session.cancel_token().cancel();
 
-    let refusal = routine.io.fund(request, download_floor).err();
+    let refusal = routine.io.fund(request, download_floor, verified_tip).err();
 
     assert_eq!(refusal, Some(FillStop::Cancelled));
     drop(capacity);
@@ -308,9 +349,13 @@ fn publish_after(
     let request_id = routine.state.allocate_request_id().unwrap();
     let TakenWork {
         download_floor,
+        verified_tip,
         request,
     } = routine.select_work(&limits, request_id, now).unwrap();
-    let unpublished = routine.io.fund(request, download_floor).unwrap();
+    let unpublished = routine
+        .io
+        .fund(request, download_floor, verified_tip)
+        .unwrap();
     assert!(routine.io.budget.reserved() > 0, "funding took its charge");
     let request = block_range_request(&unpublished).unwrap();
     let max_response_bytes = routine.state.max_response_bytes;
@@ -405,7 +450,9 @@ async fn a_reset_after_selection_refuses_funding() {
     let taken = routine.select_work(&limits, request_id, now).unwrap();
     routine.io.work.reset_above(block::Height(0));
 
-    let refusal = routine.io.fund(taken.request, taken.download_floor);
+    let refusal = routine
+        .io
+        .fund(taken.request, taken.download_floor, taken.verified_tip);
 
     assert_eq!(refusal.unwrap_err(), FillStop::StaleWork);
     assert_eq!(routine.io.budget.reserved(), 0);
@@ -427,7 +474,7 @@ async fn refused_authorization_rolls_back_funding() {
     let taken = routine.select_work(&limits, request_id, now).unwrap();
     let unpublished = routine
         .io
-        .fund(taken.request, taken.download_floor)
+        .fund(taken.request, taken.download_floor, taken.verified_tip)
         .unwrap();
     let request = block_range_request(&unpublished).unwrap();
     // An exchange that still owns this range refuses the overlapping reservation.

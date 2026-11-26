@@ -253,6 +253,7 @@ impl PeerRoutine {
         );
         let handoff_blocked = registry.handoff_blocked_flag(&peer, generation);
         registry.attach_outbound(&peer, generation, &session.request_sender());
+        let memory_pool = work.memory_pool().clone();
         PeerRoutine {
             io: PeerIO {
                 decoded_pool,
@@ -278,6 +279,9 @@ impl PeerRoutine {
                 sequencer_view,
                 cancel,
                 trace,
+                memory_pool,
+                conn_credit: None,
+                pool_wait: None,
                 #[cfg(any(test, zakura_sim))]
                 observer: Default::default(),
                 #[cfg(any(test, zakura_sim))]
@@ -286,6 +290,15 @@ impl PeerRoutine {
             config,
             state,
         }
+    }
+
+    /// Attach the connection's QUIC receive credit (`02 §3`, `02 §6`).
+    pub(super) fn with_conn_credit(
+        mut self,
+        conn_credit: Option<crate::zakura::memory::ConnectionCredit>,
+    ) -> Self {
+        self.io.conn_credit = conn_credit;
+        self
     }
 
     /// This routine, reporting to `observer`.
@@ -412,6 +425,7 @@ impl PeerRoutine {
         let work = self.io.work.clone();
         let registry = Arc::clone(&self.io.registry);
         let request_pool = self.io.requester.pool.clone();
+        let memory_pool = self.io.memory_pool.clone();
         // Per-peer BBR heartbeat cadence. `Skip` so a routine busy past a tick emits one
         // fresh sample rather than a catch-up burst. Observability only.
         let mut bbr_trace_ticks = time::interval(BBR_TRACE_INTERVAL);
@@ -420,11 +434,13 @@ impl PeerRoutine {
             if self.io.cancel.is_cancelled() {
                 return Ok(());
             }
-            // missed-wake safety: register all `Notify`s via
-            // `Notified::enable()` BEFORE the fill attempt. These
-            // `Notify`s use `notify_waiters` (no stored permit), so a
-            // release/extend that lands between the fill-check and the await
-            // would be lost if we registered after — the routine would stall.
+            // missed-wake safety: create every `Notified` BEFORE the fill
+            // attempt. These `Notify`s use `notify_waiters` (no stored
+            // permit), which wakes every `Notified` created before the call,
+            // polled or not. A release/extend that lands between the
+            // fill-check and the await therefore still wakes the routine; a
+            // `Notified` created after it would miss it and stall the routine.
+            let pool_version_before = memory_pool.capacity_version();
             let capacity = budget.subscribe_capacity().notified();
             let available = work.subscribe_available().notified();
             let floor_ranking = registry.subscribe_floor_ranking().notified();
@@ -452,6 +468,7 @@ impl PeerRoutine {
                 self.gc_skipped_outstanding();
                 None
             };
+            let waiting_on = self.io.pool_wait_consumer();
             let outbound_queue_has_capacity = self.io.session.outbound_capacity() > 0;
             self.follow_outbound_capacity(outbound_queue_has_capacity);
             // Track the start of the current continuous outbound-full stretch so the
@@ -505,6 +522,21 @@ impl PeerRoutine {
                 _ = &mut capacity => {
                     self.trace_wake("budget_capacity");
                 }
+                _ = async {
+                    // A refusal stopped the fill on the consumer it waits on;
+                    // otherwise bulk releases are what open new requests.
+                    let notified = memory_pool
+                        .notifier(waiting_on.unwrap_or(crate::zakura::memory::Consumer::BlockSync))
+                        .notified();
+                    zakura_rt::pin!(notified);
+                    Notified::enable(notified.as_mut());
+                    if memory_pool.capacity_version() != pool_version_before {
+                        return;
+                    }
+                    notified.await;
+                } => {
+                    self.trace_wake("pool_capacity");
+                }
                 _ = &mut available => {
                     self.trace_wake("work_added");
                 }
@@ -529,6 +561,9 @@ impl PeerRoutine {
         guard: &mut crate::zakura::SessionGuard,
         frame: crate::zakura::Frame,
     ) -> Result<(), SinkReject> {
+        if let Some(credit) = &self.io.conn_credit {
+            credit.poll_drain();
+        }
         #[cfg(any(test, zakura_sim))]
         {
             self.io.frames_judged += 1;
@@ -1199,7 +1234,17 @@ impl PeerRoutine {
             self.accept_already_settled_height(key, outstanding_owner, height, serialized_bytes);
             return;
         };
-        let Ok((body, decoded_attributed_memory_size_bytes)) = self.io.admit_decoded_body(body)
+        let mut body_lease = self.io.settle_received_body_lease(
+            receipt_settlement.charge,
+            serialized_bytes,
+            receipt_settlement.pool_lease,
+            receipt_settlement.conn_credit,
+        );
+        if let Some(lease) = body_lease.as_mut() {
+            lease.label_height(height.0);
+        }
+        let Ok((body, decoded_attributed_memory_size_bytes)) =
+            self.io.admit_decoded_body(body, &mut body_lease)
         else {
             return;
         };
@@ -1238,6 +1283,7 @@ impl PeerRoutine {
                 delivery_snapshot,
             );
         }
+        let fetch_elapsed = completed.is_some().then_some(request_elapsed);
         if let Some((outstanding, write)) = completed {
             self.finish_detached(outstanding, write, Disposition::Satisfied);
         } else {
@@ -1250,7 +1296,9 @@ impl PeerRoutine {
             body,
             outstanding_owner,
             receipt_settlement.funding,
+            body_lease,
             Some(estimated_bytes),
+            fetch_elapsed,
         );
         // This body opened only this peer's slots; the want-work loop runs at the
         // top of the next iteration.
@@ -1290,8 +1338,18 @@ impl PeerRoutine {
             .record_block_body_received(hash, BlockBodySource::Zakura);
         metrics::counter!("sync.block.response.unmatched_active_accepted").increment(1);
         let (funding, admitted_estimate_bytes) = (settlement.funding, Some(settlement.charge));
+        let mut body_lease = self.io.settle_received_body_lease(
+            settlement.charge,
+            serialized_bytes,
+            settlement.pool_lease,
+            settlement.conn_credit,
+        );
+        if let Some(lease) = body_lease.as_mut() {
+            lease.label_height(height.0);
+        }
 
-        let Ok((body, decoded_attributed_memory_size_bytes)) = self.io.admit_decoded_body(body)
+        let Ok((body, decoded_attributed_memory_size_bytes)) =
+            self.io.admit_decoded_body(body, &mut body_lease)
         else {
             return true;
         };
@@ -1330,8 +1388,14 @@ impl PeerRoutine {
         // the floor to this peer again.
         self.publish_slot_diagnostics();
 
-        self.io
-            .send_under_receipt(body, owner, funding, admitted_estimate_bytes);
+        self.io.send_under_receipt(
+            body,
+            owner,
+            funding,
+            body_lease,
+            admitted_estimate_bytes,
+            None,
+        );
         true
     }
 
@@ -1638,7 +1702,12 @@ mod tests {
             recv,
             session.request_sender(),
         );
-        let serving = Serving::new(Arc::new(EmptyBlockRangeSource), config).session(
+        let serving = Serving::new(
+            Arc::new(EmptyBlockRangeSource),
+            config,
+            crate::zakura::BlockSyncMemory::for_tests().pool,
+        )
+        .session(
             session.peer_id(),
             super::super::block_sync_observe::SessionKey::default(),
             session.request_sender(),
@@ -1734,7 +1803,7 @@ mod tests {
             });
             let work = self.work.unwrap_or_else(|| {
                 let budget = ByteBudget::new(self.config.inflight_block_bytes());
-                Arc::new(WorkQueue::new(block::Height(0), budget))
+                Arc::new(WorkQueue::with_test_pool(block::Height(0), budget))
             });
             let (sequencer_input, bodies) = mpsc::channel(self.channels);
             let (routine_to_reactor, events) = mpsc::channel(self.channels);
@@ -2463,7 +2532,7 @@ mod tests {
     async fn retry_filter_carries_the_checked_deadline_to_the_waiter() {
         let config = ZakuraBlockSyncConfig::default();
         let budget = ByteBudget::new(1_000_000);
-        let work = Arc::new(WorkQueue::new(block::Height(0), budget.clone()));
+        let work = Arc::new(WorkQueue::with_test_pool(block::Height(0), budget.clone()));
         let scope = super::super::test_work_scope();
         let hash = block::Hash([1; 32]);
         work.extend(
@@ -2541,12 +2610,12 @@ mod tests {
 
         // A byte budget reserved down to exactly zero free: the case that used to wedge.
         let budget = ByteBudget::new(8_192);
-        let _unrelated = budget.reserve_owned(8_192).unwrap();
+        let _unrelated = budget.charge_owned(8_192).unwrap();
         assert_eq!(budget.available(), 0, "the budget is exactly full");
 
         // The floor height (1) is pending and servable by this peer; the download floor
         // is 0 so height 1 is the floor.
-        let work = Arc::new(WorkQueue::new(block::Height(0), budget.clone()));
+        let work = Arc::new(WorkQueue::with_test_pool(block::Height(0), budget.clone()));
         assert_eq!(
             work.extend(
                 super::super::test_work_scope(),
@@ -2665,7 +2734,7 @@ mod tests {
     #[tokio::test]
     async fn request_owners_agree_across_routine_registry_and_queue() {
         let budget = ByteBudget::new(1_000_000);
-        let work = Arc::new(WorkQueue::new(block::Height(0), budget.clone()));
+        let work = Arc::new(WorkQueue::with_test_pool(block::Height(0), budget.clone()));
         work.extend(
             super::super::test_work_scope(),
             (1u8..=4).map(|height| {
@@ -2767,7 +2836,7 @@ mod tests {
         }
 
         let budget = ByteBudget::new(1_000_000);
-        let work = Arc::new(WorkQueue::new(block::Height(0), budget.clone()));
+        let work = Arc::new(WorkQueue::with_test_pool(block::Height(0), budget.clone()));
         work.extend(
             super::super::test_work_scope(),
             [(
@@ -2831,7 +2900,7 @@ mod tests {
         let liveness_timeout = config.effective_liveness_timeout();
         let mut expected_window = super::DownloadWindow::new(&config);
         let budget = ByteBudget::new(1_000_000);
-        let work = Arc::new(WorkQueue::new(block::Height(0), budget.clone()));
+        let work = Arc::new(WorkQueue::with_test_pool(block::Height(0), budget.clone()));
         work.set_estimate_floor_for_tests(1);
         let cancel = CancellationToken::new();
         let (out_send, mut out_recv) = crate::zakura::transport::worker_framed_channel(16);
@@ -3062,7 +3131,7 @@ mod tests {
         };
         let liveness_timeout = config.effective_liveness_timeout();
         let budget = ByteBudget::new(1_000_000);
-        let work = Arc::new(WorkQueue::new(block::Height(0), budget.clone()));
+        let work = Arc::new(WorkQueue::with_test_pool(block::Height(0), budget.clone()));
         work.set_estimate_floor_for_tests(1);
         let add_work = |height: u8| {
             work.extend(
@@ -3245,7 +3314,7 @@ mod tests {
         let budget_probe = budget.clone();
 
         // Height 1 is the floor (download floor is 0) and this peer's only work item.
-        let work = Arc::new(WorkQueue::new(block::Height(0), budget.clone()));
+        let work = Arc::new(WorkQueue::with_test_pool(block::Height(0), budget.clone()));
         work.set_estimate_floor_for_tests(1);
         assert_eq!(
             work.extend(
@@ -3514,7 +3583,7 @@ mod tests {
         );
         let config = ZakuraBlockSyncConfig::default();
         let budget = ByteBudget::new(1_000_000);
-        let work = Arc::new(WorkQueue::new(block::Height(0), budget.clone()));
+        let work = Arc::new(WorkQueue::with_test_pool(block::Height(0), budget.clone()));
         work.set_estimate_floor_for_tests(1);
         if unanswered {
             work.extend(
@@ -3812,7 +3881,7 @@ mod tests {
         let observer = ObserverSlot(Some(log.clone()));
         let config = ZakuraBlockSyncConfig::default();
         let budget = ByteBudget::new(1_000_000).with_observer(observer.budget_observer());
-        let work = Arc::new(WorkQueue::new(block::Height(0), budget.clone()));
+        let work = Arc::new(WorkQueue::with_test_pool(block::Height(0), budget.clone()));
         work.set_estimate_floor_for_tests(1);
         work.extend(
             super::super::test_work_scope(),
@@ -3963,7 +4032,7 @@ mod tests {
         );
         let config = ZakuraBlockSyncConfig::default();
         let budget = ByteBudget::new(1_000_000);
-        let work = Arc::new(WorkQueue::new(block::Height(0), budget.clone()));
+        let work = Arc::new(WorkQueue::with_test_pool(block::Height(0), budget.clone()));
         work.set_estimate_floor_for_tests(1);
         // 500 B advertised at the default 200 % tolerance means anything over 1 000 B
         // mismatches; the block header alone is 1 487 B.
@@ -4083,7 +4152,7 @@ mod tests {
         );
         let config = ZakuraBlockSyncConfig::default();
         let budget = ByteBudget::new(1_000_000);
-        let work = Arc::new(WorkQueue::new(block::Height(0), budget.clone()));
+        let work = Arc::new(WorkQueue::with_test_pool(block::Height(0), budget.clone()));
         work.extend(
             super::super::test_work_scope(),
             [(
@@ -4152,7 +4221,13 @@ mod tests {
                         9_001,
                         std::num::NonZeroU64::new(1).unwrap(),
                     )
-                    .admit(block::Height(0), CancellationToken::new())
+                    .admit_for_connection(
+                        block::Height(0),
+                        block::Height(0),
+                        0,
+                        None,
+                        CancellationToken::new(),
+                    )
                     .unwrap()
                     .publish(|_| {})
                     .unwrap(),
@@ -4473,7 +4548,7 @@ mod tests {
         let budget = ByteBudget::new(1_000_000);
         let task = SequencerIO::new(
             Sequencer::new(block::Height(0), 1),
-            Arc::new(WorkQueue::new(block::Height(0), budget)),
+            Arc::new(WorkQueue::with_test_pool(block::Height(0), budget)),
             Arc::new(PeerRegistry::new()),
             actions,
             ThroughputMeter::new(Instant::now()),

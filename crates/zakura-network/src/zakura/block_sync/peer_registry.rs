@@ -277,6 +277,9 @@ pub(super) struct SlotDiagnostics {
     pub(super) available_slots: usize,
     pub(super) outstanding_requests: usize,
     pub(super) bbr_rtprop_ms: Option<u64>,
+    /// Live BBR byte cwnd for this peer, summed across peers to derive
+    /// `Consumer::BlockSync`'s in-flight benefit cap (`02 §4`).
+    pub(super) bbr_cwnd_bytes: u64,
 }
 
 /// Published metadata for one unreceived outstanding height.
@@ -806,6 +809,11 @@ impl PeerRegistry {
             // table alone leaves its routine asleep until an unrelated wake.
             self.floor_ranking_changed.notify_waiters();
         }
+    }
+
+    /// Sum of the live BBR byte cwnds across every open peer session (`02 §4`).
+    pub(super) fn sum_bbr_cwnd_bytes(&self) -> u64 {
+        self.lock().state.sum_bbr_cwnd_bytes()
     }
 
     /// Register before checking floor preference so an update cannot be missed

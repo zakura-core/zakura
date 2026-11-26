@@ -68,7 +68,7 @@ async fn a_closed_sequencer_refuses_admission_without_settling() {
 #[tokio::test(flavor = "current_thread")]
 async fn a_stale_session_cleanup_leaves_the_replacement_request() {
     let budget = ByteBudget::new(1_000_000);
-    let work = Arc::new(WorkQueue::new(block::Height(0), budget.clone()));
+    let work = Arc::new(WorkQueue::with_test_pool(block::Height(0), budget.clone()));
     work.extend(
         super::super::test_work_scope(),
         [(
@@ -143,7 +143,7 @@ async fn a_reset_before_writer_start_skips_the_published_request() {
 #[tokio::test(flavor = "current_thread")]
 async fn a_reset_that_clears_the_probe_cap_republishes_free_slots() {
     let budget = ByteBudget::new(1_000_000);
-    let work = Arc::new(WorkQueue::new(block::Height(0), budget));
+    let work = Arc::new(WorkQueue::with_test_pool(block::Height(0), budget));
     work.extend(
         super::super::test_work_scope(),
         [(
@@ -254,7 +254,7 @@ async fn receipt_waits_for_admission_before_settlement() {
         let work = routine.io.work.clone();
         let charge = work.reserved_bytes();
         assert!(charge > 0);
-        let unrelated = budget.reserve_owned(17).unwrap();
+        let unrelated = budget.charge_owned(17).unwrap();
         let (sender, mut receiver) = mpsc::channel(1);
         let slot = sender.clone().reserve_owned().await.unwrap();
         routine.io.sequencer_input = sender;
@@ -397,7 +397,7 @@ async fn receipt_keeps_funding_until_the_production_send_completes() {
         }
         let charge = routine.io.work.reserved_bytes();
         assert!(charge > 0);
-        let unrelated = budget.reserve_owned(17).unwrap();
+        let unrelated = budget.charge_owned(17).unwrap();
         let (sender, mut receiver) = mpsc::channel(1);
         routine.io.sequencer_input = sender;
         let resident = routine.io.sequencer_input_bytes.clone();

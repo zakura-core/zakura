@@ -322,18 +322,15 @@ pub(crate) fn assert_core(
         outstanding_bound,
     );
 
-    // The request budget permits at most one floor-request overdraft.
+    // The pool bounds request bytes: the Consensus reserve plus block sync's cap.
     let overdraft_slack = scenario.config.floor_request_byte_reservation();
+    let (consensus, block_sync) = scenario.block_sync_memory_bytes();
+    let pool_bound = consensus.saturating_add(block_sync);
     assert!(
-        report.peak_budget_reserved
-            <= scenario
-                .config
-                .inflight_block_bytes()
-                .saturating_add(overdraft_slack),
-        "peak reserved bytes {} exceeded the in-flight request budget {} (+{} floor-overdraft slack)",
+        report.peak_budget_reserved <= pool_bound,
+        "peak reserved bytes {} exceeded the pool's block-sync bound {}",
         report.peak_budget_reserved,
-        scenario.config.inflight_block_bytes(),
-        overdraft_slack,
+        pool_bound,
     );
 
     // The final snapshot can race one receipt handoff.

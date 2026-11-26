@@ -20,7 +20,7 @@ use super::model::{expected_retry_run, fund_through_queue};
 use super::*;
 use crate::zakura::{
     block_sync::{
-        admission::request_priority,
+        admission::{request_priority, LOOKAHEAD_BLOCK_HARD_CAP},
         config::{BS_BLOCKS_PER_RESPONSE, MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES},
         request::BlockSizeEstimate,
         test_work_scope,
@@ -142,10 +142,15 @@ impl Scenario {
             applying_buffered_blocks: 0,
             sequencer_input_queued_bytes: 0,
             in_flight_submission_bytes: 0,
-            decoded_resident_bytes: if self.lookahead_full { u64::MAX } else { 0 },
+            decoded_resident_bytes: 0,
             reserved_above_floor_bytes: 0,
-            reserved_above_floor_blocks: 0,
+            reserved_above_floor_blocks: if self.lookahead_full {
+                LOOKAHEAD_BLOCK_HARD_CAP
+            } else {
+                0
+            },
             budget_available: self.budget_available,
+            consensus_available: self.budget_available,
         }
     }
 }
@@ -221,8 +226,6 @@ struct Attempt {
 struct Funded {
     priority: RequestPriority,
     reserved_bytes: u64,
-    /// Whether the run would be funded by an already exhausted budget.
-    overdrafts: bool,
 }
 
 /// Take `kept` from a real queue and admit it against `budget_bytes`.
@@ -231,7 +234,7 @@ fn admit_kept(
     kept: &[(block::Height, u64)],
     budget_bytes: u64,
 ) -> Option<Funded> {
-    let queue = Arc::new(WorkQueue::new(
+    let queue = Arc::new(WorkQueue::with_test_pool(
         block::Height(0),
         ByteBudget::new(budget_bytes),
     ));
@@ -249,18 +252,12 @@ fn admit_kept(
     Some(Funded {
         priority: funding.priority,
         reserved_bytes: funding.reserved_bytes,
-        overdrafts: false,
     })
 }
 
 /// Fund a retained run the way `PeerIO::fund` does.
 fn fund_retained(download_floor: block::Height, kept: &[(block::Height, u64)]) -> Funded {
-    let funded = admit_kept(download_floor, kept, u64::MAX / 2)
-        .expect("a run with an ample budget always funds");
-    Funded {
-        overdrafts: admit_kept(download_floor, kept, 0).is_some(),
-        ..funded
-    }
+    admit_kept(download_floor, kept, u64::MAX / 2).expect("a run with an ample budget always funds")
 }
 
 fn request_id(id: u64) -> NonZeroU64 {
@@ -269,10 +266,10 @@ fn request_id(id: u64) -> NonZeroU64 {
 
 /// Run one attempt the way `PeerRoutine::select_work`, `filter_retry`, and
 /// `try_issue_one` do, against a real work queue.
-fn attempt(config: &ZakuraBlockSyncConfig, scenario: &Scenario) -> Attempt {
+fn attempt(scenario: &Scenario) -> Attempt {
     let limits = scenario.limits();
     let snapshot = scenario.snapshot();
-    let work = Arc::new(WorkQueue::new(
+    let work = Arc::new(WorkQueue::with_test_pool(
         block::Height(0),
         ByteBudget::new(u64::MAX / 2),
     ));
@@ -304,7 +301,6 @@ fn attempt(config: &ZakuraBlockSyncConfig, scenario: &Scenario) -> Attempt {
     let mut taken = None;
     let mut above_floor_start = None;
     let lane = take_lanes(
-        config,
         &limits,
         snapshot,
         floor_start,
@@ -329,9 +325,8 @@ fn attempt(config: &ZakuraBlockSyncConfig, scenario: &Scenario) -> Attempt {
     );
     let mut attempt = Attempt {
         floor_start: floor_start.map(|height| scenario.raw(height)),
-        floor_plan: plan_floor(config, &limits, snapshot, floor_start),
-        above_floor_plan: above_floor_start
-            .map(|start| plan_above_floor(config, &limits, snapshot, start)),
+        floor_plan: plan_floor(&limits, snapshot, floor_start),
+        above_floor_plan: above_floor_start.map(|start| plan_above_floor(&limits, snapshot, start)),
         above_floor_start: above_floor_start
             .flatten()
             .map(|height| scenario.raw(height)),
@@ -481,7 +476,7 @@ fn check(scenario: &Scenario, attempt: &Attempt) {
     assert_eq!(retry.timed_rejection, expected.timed_rejection);
 
     // Funding follows the retained run's first height, never the lane or the
-    // probe, and only floor work may overdraft.
+    // probe.
     match (&expected_keep, attempt.funding) {
         (None, None) => {}
         (Some(keep), Some(funding)) => {
@@ -489,10 +484,6 @@ fn check(scenario: &Scenario, attempt: &Attempt) {
             assert_eq!(
                 funding.priority,
                 request_priority(scenario.height(scenario.floor), scenario.height(kept[0].0))
-            );
-            assert_eq!(
-                funding.overdrafts,
-                funding.priority == RequestPriority::Floor
             );
             assert_eq!(
                 funding.reserved_bytes,
@@ -513,7 +504,7 @@ proptest! {
         mut scenario in scenario(),
     ) {
         scenario.max_count = usize::try_from(BS_BLOCKS_PER_RESPONSE).unwrap();
-        let attempt = attempt(&ZakuraBlockSyncConfig::default(), &scenario);
+        let attempt = attempt(&scenario);
         check(&scenario, &attempt);
         if let Ok((_, items)) = &attempt.selected {
             prop_assert_eq!(items.len(), 1);
@@ -524,8 +515,7 @@ proptest! {
     /// including when another routine takes the probed floor height first.
     #[test]
     fn multi_item_fill_attempts_keep_their_limits(scenario in scenario()) {
-        let config = ZakuraBlockSyncConfig::default();
-        check(&scenario, &attempt(&config, &scenario));
+        check(&scenario, &attempt(&scenario));
     }
 
     /// The retry wake is the earliest timed avoidance, or now when a timed
@@ -578,10 +568,9 @@ fn worked_scenario(pending: &[u32]) -> Scenario {
 /// take. The floor lane's take gets 3..=5, which funds as above-floor work.
 #[test]
 fn multi_item_a_raced_floor_probe_funds_the_run_it_actually_took() {
-    let config = ZakuraBlockSyncConfig::default();
     let mut scenario = worked_scenario(&[1, 3, 4, 5]);
     scenario.floor_raced = true;
-    let attempt = attempt(&config, &scenario);
+    let attempt = attempt(&scenario);
     check(&scenario, &attempt);
     let Ok((lane, items)) = &attempt.selected else {
         panic!("the floor lane takes the remaining run");
@@ -590,17 +579,15 @@ fn multi_item_a_raced_floor_probe_funds_the_run_it_actually_took() {
     assert_eq!(items.first().map(|(raw, _)| *raw), Some(3));
     let funding = attempt.funding.unwrap();
     assert_eq!(funding.priority, RequestPriority::AboveFloor);
-    assert!(!funding.overdrafts);
 }
 
 /// The retry filter removes the floor item, so the retained run starts above
 /// the floor-rescue window and funds as above-floor work.
 #[test]
 fn multi_item_a_retry_filter_that_removes_the_floor_item_funds_above_floor() {
-    let config = ZakuraBlockSyncConfig::default();
     let mut scenario = worked_scenario(&[1, 2, 3, 4]);
     scenario.facts = [(1, RetryFact::Avoided), (2, RetryFact::ProtocolBlocked)].into();
-    let attempt = attempt(&config, &scenario);
+    let attempt = attempt(&scenario);
     check(&scenario, &attempt);
     let retry = attempt.retry.as_ref().unwrap();
     assert_eq!(retry.keep, Some(2..4));
@@ -611,13 +598,12 @@ fn multi_item_a_retry_filter_that_removes_the_floor_item_funds_above_floor() {
 }
 
 /// A floor take with no congestion headroom still asks for one byte, so it
-/// takes the floor body that the floor overdraft funds.
+/// takes the floor body and waits for the pool.
 #[test]
 fn a_floor_take_without_headroom_still_takes_one_body() {
-    let config = ZakuraBlockSyncConfig::default();
     let mut scenario = worked_scenario(&[1, 2, 3]);
     scenario.floor_cwnd_bytes = Some(0);
-    let attempt = attempt(&config, &scenario);
+    let attempt = attempt(&scenario);
     check(&scenario, &attempt);
     assert_eq!(
         attempt
@@ -630,19 +616,17 @@ fn a_floor_take_without_headroom_still_takes_one_body() {
     };
     assert_eq!(*lane, Lane::Floor);
     assert_eq!(items, &[(1, 1_000)]);
-    assert!(attempt.funding.unwrap().overdrafts);
+    assert_eq!(attempt.funding.unwrap().priority, RequestPriority::Floor);
 }
 
 /// A peer that serves nothing in the floor-rescue window plans no floor take,
 /// even from a start the caller probed outside that window.
 #[test]
 fn a_peer_above_the_rescue_window_plans_no_floor_take() {
-    let config = ZakuraBlockSyncConfig::default();
     let mut scenario = worked_scenario(&[3]);
     scenario.servable_low = 2;
     assert_eq!(
         plan_floor(
-            &config,
             &scenario.limits(),
             scenario.snapshot(),
             Some(scenario.height(3))
@@ -655,11 +639,10 @@ fn a_peer_above_the_rescue_window_plans_no_floor_take() {
 /// lane defers to a preferred carrier.
 #[test]
 fn a_floor_bypass_slot_never_takes_above_floor_work() {
-    let config = ZakuraBlockSyncConfig::default();
     let mut scenario = worked_scenario(&[1, 2, 3, 4]);
     scenario.floor_bypass_only = true;
     scenario.floor_deferred = true;
-    let attempt = attempt(&config, &scenario);
+    let attempt = attempt(&scenario);
     check(&scenario, &attempt);
     assert_eq!(attempt.selected, Err(FillStop::CwndSaturated));
     assert!(attempt.above_floor_plan.is_none());

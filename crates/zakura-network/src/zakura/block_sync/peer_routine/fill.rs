@@ -164,6 +164,8 @@ struct RequestCapacity<'a> {
 struct TakenWork {
     /// The download floor that both lanes planned against.
     download_floor: block::Height,
+    /// The verified tip that planned the commit-window boundary.
+    verified_tip: block::Height,
     request: TakenRequest,
 }
 
@@ -254,6 +256,7 @@ impl PeerRoutine {
         // Selection: the floor lane, then the above-floor lane.
         let TakenWork {
             download_floor,
+            verified_tip,
             mut request,
         } = self.select_work(&limits, request_id, now)?;
         // Retry filter: keep the first allowed contiguous run.
@@ -266,7 +269,7 @@ impl PeerRoutine {
 
         // Funding: the queue derives the charge and floor exception from the
         // retained run, never from the probe.
-        let unpublished = self.io.fund(request, download_floor)?;
+        let unpublished = self.io.fund(request, download_floor, verified_tip)?;
         self.trace_request_funded(&unpublished);
 
         // Preparation: the request, its response authorization, and its frame.
@@ -320,8 +323,17 @@ impl PeerRoutine {
         }
     }
 
-    /// Attribute the pass's stop and ask for more work if pending work runs low.
+    /// Attribute the pass's stop, end a stale memory wait, and ask for more
+    /// work if pending work runs low.
     fn finish_fill_pass(&mut self, report: FillReport) {
+        // The routine waits on the pool only while its latest pass stopped on
+        // a memory refusal. Any other stop leaves it no refused request, and
+        // its wait would hold other consumers back for nothing (rule 3,
+        // `02 §5`). The requester pool's refusal is the other `Budget` stop.
+        let memory_refused = report.stop == FillStop::Budget && !self.state.request_pool_waiting;
+        if !memory_refused {
+            self.io.release_pool_wait();
+        }
         // A pass that issued nothing is a candidate bubble; the reason + the live
         // slot/budget/work snapshot let a trace tell a legitimate stop (no_work with
         // empty queue, cwnd_saturated) from a recoverable one (slots + budget + work
@@ -380,7 +392,6 @@ impl PeerRoutine {
     ) -> Result<TakenWork, FillStop> {
         let mut taken = None;
         plan::take_lanes(
-            &self.config,
             limits,
             snapshot,
             floor_start,
@@ -403,6 +414,7 @@ impl PeerRoutine {
         )?;
         Ok(TakenWork {
             download_floor: snapshot.download_floor,
+            verified_tip: snapshot.verified_block_tip,
             request: taken.expect("`take_lanes` succeeds only after a take returned work"),
         })
     }
@@ -655,15 +667,28 @@ impl PeerIO {
     /// into a take/return spin, and any peer waiting on budget capacity wakes
     /// when capacity actually returns.
     fn fund(
-        &self,
+        &mut self,
         request: TakenRequest,
         download_floor: block::Height,
+        verified_tip: block::Height,
     ) -> Result<UnpublishedRequest, FillStop> {
-        request
-            .admit(download_floor, self.session.cancel_token())
+        let funded = request
+            .admit_for_connection(
+                download_floor,
+                verified_tip,
+                self.conn_id,
+                self.conn_credit.clone(),
+                self.session.cancel_token(),
+            )
             .map_err(|refusal| match refusal {
                 AdmitRefusal::AccountingClosed => FillStop::AccountingClosed,
-                AdmitRefusal::Capacity => FillStop::Budget,
+                AdmitRefusal::Capacity(consumer) => {
+                    // The routine retries when the pool changes, so it holds
+                    // a wait token for rule 3 until a request leases or a
+                    // later pass stops for another reason (`02 §5`).
+                    self.hold_pool_wait(consumer);
+                    FillStop::Budget
+                }
                 AdmitRefusal::Cancelled => FillStop::Cancelled,
                 AdmitRefusal::StaleClaim => FillStop::StaleWork,
                 // The owner cap is the byte cwnd's hard ceiling.
@@ -671,7 +696,9 @@ impl PeerIO {
                 AdmitRefusal::Empty | AdmitRefusal::MissingOwner | AdmitRefusal::AmountOverflow => {
                     FillStop::Internal
                 }
-            })
+            })?;
+        self.release_pool_wait();
+        Ok(funded)
     }
 
     /// Reserve response authorization for `request`, up to this peer's

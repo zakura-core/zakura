@@ -362,6 +362,7 @@ async fn divergent_status_advertises_a_block_the_range_reader_serves() {
             .decoded_block_pool(10_000)
             .expect("fixture decoded allowance fits"),
         config,
+        zakura_network::zakura::BlockSyncMemory::for_tests(),
     )
     .with_range_source(source.clone());
     let (handle, _actions, reactor) = spawn_block_sync_reactor(startup).unwrap();

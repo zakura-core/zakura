@@ -34,7 +34,7 @@ use super::*;
 use crate::zakura::{
     block_sync::work_queue::{
         request_write::{RequestWritePhase, UnpublishedRequest},
-        RequestWrite, TakenRequest, WorkQueue,
+        test_memory_pool, RequestWrite, TakenRequest, WorkQueue,
     },
     transport::{ByteBudget, ByteReservation, FrameWriteClaim},
 };
@@ -44,7 +44,7 @@ const PROPERTY: &str = "block/work-funding";
 
 /// The owner cap the driver's queue admits against: an above-floor request
 /// may bring its session's published reservations to [`LIMIT`], and a floor
-/// request, which may also overdraw the budget, to 1,500 bytes.
+/// request to 1,500 bytes.
 const OWNER_CAP: OwnerReservationCap = OwnerReservationCap {
     above_floor: LIMIT,
     floor: 1_500,
@@ -140,7 +140,8 @@ pub struct WorkFundingHistory {
 
 enum RetainedRequest {
     Taken(TakenRequest),
-    Admitted(UnpublishedRequest),
+    // Boxed: an unpublished request carries its pool lease and credit.
+    Admitted(Box<UnpublishedRequest>),
     Published(Arc<RequestWrite>),
 }
 
@@ -258,7 +259,12 @@ fn ensure(holds: bool, boundary: &str) -> Result<(), String> {
 impl Driver {
     fn new() -> Self {
         let budget = ByteBudget::new(LIMIT);
-        let work = Arc::new(WorkQueue::new(height(0), budget.clone()).with_owner_cap(OWNER_CAP));
+        // The pool holds every session's owner-cap floor total, so the owner
+        // cap, not the pool, decides admission.
+        let work = Arc::new(
+            WorkQueue::new(height(0), budget.clone(), test_memory_pool(OWNER_CAP.floor))
+                .with_owner_cap(OWNER_CAP),
+        );
         work.lock().state.set_estimate_floor(1);
         Self {
             work,
@@ -337,7 +343,7 @@ impl Driver {
         let held = owner.map_or(0, |owner| {
             self.state(|state| state.session_reserved(owner.session_id))
         });
-        match taken.admit(height(floor), cancel) {
+        match taken.admit_for_connection(height(floor), height(floor), 0, None, cancel) {
             Ok(admitted) => {
                 ensure(
                     !self.closed && !cancelled,
@@ -352,7 +358,7 @@ impl Driver {
                     held + estimates <= OWNER_CAP.floor,
                     "admission takes a session past the owner cap's floor total",
                 )?;
-                self.requests[index].retained = Some(RetainedRequest::Admitted(admitted));
+                self.requests[index].retained = Some(RetainedRequest::Admitted(Box::new(admitted)));
                 self.summary.admitted += 1;
             }
             Err(_) => {
@@ -378,7 +384,7 @@ impl Driver {
         };
         let owner = admitted.owner();
         let cancelled = request.cancel.is_cancelled();
-        let published = admitted.publish(|_| {});
+        let published = (*admitted).publish(|_| {});
         if published.is_some() {
             ensure(
                 !self.closed && !cancelled,
@@ -943,18 +949,6 @@ mod tests {
             assert_eq!(step.actual.reserved, 100);
             assert!(step.actual.receipts.is_empty());
         }
-    }
-
-    #[test]
-    fn admission_refusal_floor_exception_and_cancelled_publication_keep_exact_charge() {
-        let history = from_published(&[
-            0, 4, 3, 249, 1, 4, 27, 20, 2, 1, 0, 0, 1, 4, 27, 20, 2, 2, 4, 0, 7, 2, 0, 0, 3, 2, 0,
-            0,
-        ]);
-        assert_eq!(history.steps[6].actual.reserved, 400);
-        assert_eq!(history.steps[8].actual.reserved, 1400);
-        assert_eq!(history.steps[9].actual.reserved, 1400);
-        assert_eq!(history.steps[10].actual.reserved, 400);
     }
 
     /// Retains a receipt through a reset, then admits, publishes and returns

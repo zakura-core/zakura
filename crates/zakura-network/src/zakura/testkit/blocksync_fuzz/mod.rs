@@ -108,6 +108,7 @@ pub(crate) async fn run_scenario(
             .decoded_block_pool(10_000)
             .expect("fixture decoded allowance fits"),
         scenario.config.clone(),
+        scenario.block_sync_memory(),
     );
     startup.trace = trace.clone();
     startup.shutdown = shutdown.clone();

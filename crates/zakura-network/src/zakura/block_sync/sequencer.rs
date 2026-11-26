@@ -1017,6 +1017,8 @@ impl Sequencer {
             self.detached_submission_decoded_attributed_memory_bytes = self
                 .detached_submission_decoded_attributed_memory_bytes
                 .saturating_sub(decoded_attributed_memory_bytes);
+            self.payload_changes
+                .push(PayloadChange::EndSubmission(token));
         }
         self.decrement_submitted_apply(height, hash);
         true
@@ -1087,6 +1089,8 @@ impl Sequencer {
                 self.detached_submission_decoded_attributed_memory_bytes = self
                     .detached_submission_decoded_attributed_memory_bytes
                     .saturating_sub(submission.decoded_attributed_memory_bytes);
+                self.payload_changes
+                    .push(PayloadChange::EndSubmission(token));
             }
         }
     }
@@ -1138,8 +1142,8 @@ impl Sequencer {
 
     pub(super) fn remove_applying(&mut self, height: block::Height) -> Option<ApplyingBlock> {
         let removed = self.applying.remove(&height)?;
-        self.payload_changes
-            .push(PayloadChange::Release(removed.body.id));
+        let change = self.leave_applying(&removed);
+        self.payload_changes.push(change);
         let decoded_attributed_memory_bytes = removed.body.decoded_attributed_memory_size_bytes();
         self.set_applying_buffered_bytes(
             self.applying_buffered_bytes.saturating_sub(removed.bytes),
@@ -1149,16 +1153,41 @@ impl Sequencer {
             .saturating_sub(decoded_attributed_memory_bytes);
         if removed.submitted {
             self.attached_submission_count = self.attached_submission_count.saturating_sub(1);
-            if let Some(submission) = self.in_flight_submissions.get_mut(&removed.token) {
-                if !submission.detached {
-                    submission.detached = true;
-                    self.detached_submission_decoded_attributed_memory_bytes = self
-                        .detached_submission_decoded_attributed_memory_bytes
-                        .saturating_add(submission.decoded_attributed_memory_bytes);
-                }
-            }
         }
         Some(removed)
+    }
+
+    /// The payload change for `applying` leaving `applying`. While the
+    /// driver still holds its submission, the submission detaches and the
+    /// body's lease follows the driver's decoded block until the exact
+    /// completion arrives. Otherwise the payload releases.
+    fn leave_applying(&mut self, applying: &ApplyingBlock) -> PayloadChange {
+        let detached = applying
+            .submitted
+            .then(|| self.detach_submission(applying.token))
+            .flatten();
+        match detached {
+            Some(decoded_bytes) => PayloadChange::Detach {
+                id: applying.body.id,
+                token: applying.token,
+                decoded_bytes,
+            },
+            None => PayloadChange::Release(applying.body.id),
+        }
+    }
+
+    /// Mark submission `token` detached from `applying`. Returns the decoded
+    /// bytes the driver can still hold, or `None` when no submission with
+    /// that token is in flight.
+    fn detach_submission(&mut self, token: BlockApplyToken) -> Option<u64> {
+        let submission = self.in_flight_submissions.get_mut(&token)?;
+        if !submission.detached {
+            submission.detached = true;
+            self.detached_submission_decoded_attributed_memory_bytes = self
+                .detached_submission_decoded_attributed_memory_bytes
+                .saturating_add(submission.decoded_attributed_memory_bytes);
+        }
+        Some(submission.decoded_attributed_memory_bytes)
     }
 
     /// After a rejected/timed-out apply at `height`, roll the download floor back
@@ -1260,25 +1289,13 @@ impl Sequencer {
 
     fn release_all_applying_for_reset(&mut self, keep_submitted_applies: bool) -> u64 {
         let released = self.applying.values().map(|applying| applying.bytes).sum();
-        for applying in self.applying.values().filter(|applying| applying.submitted) {
-            if let Some(submission) = self.in_flight_submissions.get_mut(&applying.token) {
-                if !submission.detached {
-                    submission.detached = true;
-                    self.detached_submission_decoded_attributed_memory_bytes = self
-                        .detached_submission_decoded_attributed_memory_bytes
-                        .saturating_add(submission.decoded_attributed_memory_bytes);
-                }
-            }
-        }
         if !keep_submitted_applies {
             self.clear_submitted_applies_from(block::Height::MIN);
         }
-        self.payload_changes.extend(
-            self.applying
-                .values()
-                .map(|entry| PayloadChange::Release(entry.body.id)),
-        );
-        self.applying.clear();
+        for (_, applying) in std::mem::take(&mut self.applying) {
+            let change = self.leave_applying(&applying);
+            self.payload_changes.push(change);
+        }
         self.set_applying_buffered_bytes(0);
         self.applying_decoded_attributed_memory_bytes = 0;
         self.attached_submission_count = 0;

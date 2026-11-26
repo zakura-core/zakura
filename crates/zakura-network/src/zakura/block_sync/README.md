@@ -80,7 +80,7 @@ separate serving/read reservation contract.
 | Purpose | unblock the contiguous prefix so the committer keeps moving | fill the look-ahead buffer so the bursty committer never starves |
 | Candidate selection | first pending in `[servable_low, min(servable_high, floor_high)]`, only if this peer is the preferred floor carrier | first pending in the peer's servable range, only when the floor arm produced nothing |
 | cwnd slots | may borrow up to `floor_bypass_slots` (default 2) beyond a saturated cwnd — bypass slots fund the floor **only** | normal cwnd slots only |
-| Byte funding | `TakenRequest::admit` permits an owned overdraft for floor progress while accounting stays open; liveness rule 3 bounds the total | `TakenRequest::admit` refuses the request if the in-flight budget is spent |
+| Byte funding | Same as above-floor: the memory pool leases the request, and a refusal makes the routine wait | `admit_for_connection` leases from `Consumer::Consensus` inside the commit window and from `Consumer::BlockSync` above it; a refusal makes the routine wait |
 | Request deadline | short fixed leash (`floor_rescue_timeout`, default 2 s); on expiry the height is rescued to a faster carrier, the peer is retry-avoided but **not** disconnected | `request_timeout` (default 8 s) + expected transfer time (`estimated_bytes / measured BtlBw`, rate floored at 256 KiB/s) — patient, since it never gates the floor |
 
 **Floor carrier preference:** the floor rides the fastest servable peer. Before taking
@@ -158,108 +158,50 @@ while the input queue's and `applying`'s decoded bytes leave room for it under
 alone. The decoded copy appears in the next resident snapshot.
 
 **Takes never span the window boundary.** An exempt (in-window) grant is clamped at the
-window top, so a single multi-block request can never carry both exempt in-window blocks
-and gated above-window blocks — every above-window height must pass the resident check
-in the gated arm. A contiguous run straddling the boundary becomes two requests (the
+window top, so a single multi-block request can never carry both in-window blocks, which
+lease from Consensus, and above-window blocks, which lease from block sync. A contiguous run straddling the boundary becomes two requests (the
 above-window half is planned on the next fill iteration with headroom sizing). Requests
 carry one block, so this split never occurs in practice.
 
 ## The memory budget
 
-### Resident accounting
+The node-wide memory pool (`crate::zakura::memory`) bounds block sync. Block sync
+has no byte gate of its own.
 
-The look-ahead budget bounds **estimated resident memory**. Backlog bodies remain in
-their serialized wire form and are decoded only inside the bounded verifier submission
-window. Accounting therefore follows each pool's actual representation:
+- **Requests.** A request inside the commit window leases its estimated wire bytes
+  from `Consumer::Consensus`, a reserved consumer that never waits behind bulk work.
+  A request above the window leases from `Consumer::BlockSync`, a bulk consumer.
+  The QUIC receive credit for the request follows its lease.
+- **Bodies.** A received body keeps its request's lease, sized to its wire bytes. A
+  body above its estimate grows its lease. If the pool refuses, block sync drops the
+  body and returns the height at its measured size, so the next request leases the
+  body whole and waits.
+- **Decode.** At decode the lease grows to `wire + decoded`. A commit-window body on
+  a block-sync lease moves to Consensus there.
+- **Drains.** Credit a peer didn't deliver stays leased until the peer can no longer
+  spend it. A Consensus drain moves to block sync, so a re-issued request takes the
+  height's only Consensus lease (mem-15). Only a full pool leaves a drain on
+  Consensus; `sync.block.consensus.drain_unmoved_bytes` counts it.
+- **Benefit cap.** The sequencer sets block sync's cap once a second to the peers'
+  BBR windows plus `2 × commit rate × p99 range fetch time`. The commit rate is a
+  decaying peak, so a commit stall shrinks the cap gradually.
+  `[memory.cap] look_ahead` overrides the look-ahead term.
+- **Block cap.** `LOOKAHEAD_BLOCK_HARD_CAP` (262,144 blocks) bounds the retained
+  block count above the window, for tiny bodies whose bookkeeping dominates.
 
-| Pool (snapshot field) | Representation | Charge |
-| --- | --- | --- |
-| `reorder_buffered_bytes` | serialized | wire bytes |
-| unsubmitted `applying_buffered_bytes` | serialized | wire bytes |
-| `sequencer_input_queued_bytes` | serialized payload, plus the decoded block while the decoded cap had room at the handoff | wire bytes plus the decoded charge below |
-| `in_flight_submission_bytes` | submitted decoded block, including detached submissions awaiting completion | the decoded charge below, plus the applying wire charge while attached |
-| `decoded_resident_bytes` | measured heap of every decoded body in the input queue, reorder buffer and apply window | decoded charge = `max((input + submissions) × DESERIALIZED_MEM_FACTOR, decoded_resident_bytes)` |
-| `reserved_above_floor_bytes` | not received yet | estimated wire bytes |
-
-Two gates, checked together in `lookahead_over_budget`:
-
-- **Byte gate:** `estimated_resident ≥ effective_max_reorder_lookahead_bytes`
-  (= `max_reorder_lookahead_bytes`; the request budget no longer caps it, since
-  the request cap does not imply retention).
-- **Block gate (defense in depth):** reorder + applying + reserved block counts
-  `≥ LOOKAHEAD_BLOCK_HARD_CAP` (a fixed 262,144 — it binds before the byte gate
-  only for tiny bodies averaging under ~6.1 KB wire, where per-entry bookkeeping
-  overhead dominates; never needed operator tuning, so it is a constant, not a
-  config knob).
-
-This is separate from the **in-flight request budget** (`max_inflight_block_bytes`,
-derived as `x × C`, 2,944 MiB at the defaults, tracked by `ByteBudget`): that bounds outstanding request
-reservations — charged at issuance, released at receipt (or timeout/watchdog/
-reset/floor GC) — while the request look-ahead gate paces incoming work.
-
-The sequencer also checks actual serialized bytes before retaining **every** new body,
-including matched replies and late winners. Above the verified checkpoint window,
-reorder plus applying bytes plus the incoming body must fit the same look-ahead limit
-and block-count cap. This check uses the sequencer's current counters, so suppliers
-cannot concurrently spend a stale snapshot or accumulate bodies using understated
-hints. Transfers between reorder and applying retain their charge. Removal releases
-it. The bounded decoded submission window accounts for detached verifier work.
-
-At pressure, the body is released and its exact attempt returns to pending with the
-measured size as a minimum for retry. It waits for verified progress to avoid repeated
-downloads while full. The checkpoint window remains exempt so commit can advance.
-Request reservations and queued copies do not consume this final backlog allowance
-twice. Input, transport, and decoded submission windows remain separate bounded
-pools. The configured look-ahead limit is not a hard cap on total process RSS.
-
-### Config clamps
-
-At config load (`clamp_reorder_lookahead_to_floor`, serde path only), sub-range budgets
-are raised to one worst-case serialized checkpoint range —
-`BS_CHECKPOINT_RANGE_BYTE_FLOOR` (401 × 2 MB ≈ 802 MB) — with a warning. The clamp is
-defense-in-depth _sizing_ only: liveness is guaranteed by the commit-window exemption,
-not by budget size. Zero config values are rejected.
-
-### The bound
-
-Resident memory plateaus near **`effective budget + the bounded decode window`**, plus
-process overhead and bounded transients. At the default 401-block submission window and
-a chain that decodes at about four times its wire size, the decoded contribution is
-approximately 401 × `MAX_BLOCK_BYTES` × `DESERIALIZED_MEM_FACTOR` ≈ 3.2 GB. Above the
-last checkpoint the window is also capped at `BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES`
-(512 MiB) of decoded blocks: past the cap, bodies stay raw until earlier submissions finish,
-and the next body is always allowed when no submission is in flight, attached or detached. The peer
-routine rejects a body whose transactions do not match its header's Merkle root, so the
-decoded window holds the real chain's blocks; a chain that decodes larger is charged its
-measured size. The [resource ledger](../../../../../docs/design/block-sync-resource-ledger.md)
-derives the whole-node bound. The plateau can still exceed the budget by:
-
-- the floor's first-item progress margin (≤ one block per request — see liveness below);
-- a single in-window response can exceed the byte gate by up to its decoded resident
-  cost (in-window sizing is by the in-flight budget, for liveness);
-- concurrent peer routines admit against per-iteration snapshots, so a simultaneous
-  wake can transiently over-admit by roughly one response per racing runtime worker
-  before the reservations land in the next iteration's snapshot.
+`ByteBudget` remains an unlimited settlement ledger: it records each owner's
+charge, and the simulator compares it with the work queue. It never refuses.
 
 ## Liveness rules (why sync cannot wedge)
 
-1. **Commit-window heights are always fundable**, on both lanes, regardless of the
-   look-ahead gates — a pinned checkpoint range can always assemble.
-2. **Floor grants never size below one byte**, and `take_request` always
-   takes its first item regardless of the byte cap — so the floor block is taken even
-   when the in-flight budget is exactly full, reaching the floor reservation path…
-3. **…which overdrafts instead of waiting.** When `try_reserve` fails,
-   `TakenRequest::admit`'s Floor path charges the reservation past the max `M`,
-   repaid through the normal release discipline. The overshoot is bounded: only a
-   request starting at the floor or the next height is floor-priority, and the
-   WorkQueue gives each height one owner, so at most two overdrafts are live, each
-   at most one body `B`. A routine that hands a body to the sequencer still holds
-   its charge while the floor can advance, so each such open handoff `h` adds at
-   most one more `B`: the budget stays within `M + 2·B + h·B`
-   (`block-sync/reserved-byte-bound`). The floor is therefore never starved by
-   speculative work, with no cross-task funding round trip.
-4. **In-window floor liveness never depends on budget size** — the clamps only stop
-   sub-range configs from thrashing the speculative lane.
+1. **Commit-window heights lease from the Consensus reserve.** Consensus holds one
+   lease per height, and the reserve covers the window at admission's per-block
+   charge, so a pinned checkpoint range can always assemble. A Consensus refusal for
+   a commit-window body breaks that invariant: block sync counts it in
+   `sync.block.consensus.lease_refused`, and the simulator asserts it.
+2. **Floor grants never size below one byte**, and `take_request` always takes its
+   first item regardless of the byte cap, so the floor block reaches the pool and
+   waits for capacity.
 
 ## Observability
 
@@ -271,8 +213,8 @@ Every fill pass ends with a typed stop reason (`FillStop`), emitted as the
 | `no_status` | peer has not sent its servable status yet |
 | `cwnd_saturated` | no slots (not even a floor bypass slot), or bypass pass with no floor take |
 | `no_work` | nothing pending in the peer's servable range (or floor deferred to a preferred carrier) |
-| `lookahead_cap` | the resident look-ahead gate refused an above-window take (either lane) |
-| `inflight_budget` | gate has headroom but the in-flight byte budget funds zero bytes |
+| `lookahead_cap` | the block cap refused an above-window take (either lane) |
+| `inflight_budget` | the pool consumer for the take has no room |
 | `retry_avoid` | the whole take was heights this routine recently failed |
 | `budget` / `internal` / `outbound_full` / `send_error` | funding/bookkeeping/transport stops |
 
@@ -301,8 +243,7 @@ value:
 The above-floor gauge records an admission input, not a resource, so it keeps
 the value the latest admission read. It counts every reservation above the
 current download floor, including commit-window work, so it is a diagnostic.
-`lookahead-overshoot-bound` instead sums the estimates of outstanding
-above-window requests from the request records. The budget charges a request before the
+The budget charges a request before the
 work queue does and releases it after, so the budget gauge can exceed the work
 gauge while a request is in transition. The two gauges are written separately,
 so only a reader that sees no request in transition can compare them.
@@ -311,8 +252,8 @@ so only a reader that sees no request in transition can compare them.
 
 | Knob | Default | Notes |
 | --- | --- | --- |
-| `max_reorder_lookahead_bytes` | 1.5 GiB | resident-memory target; serialized pools are charged at wire size and decoded windows at the calibrated multiple; clamped up to ~802 MB |
-| `max_inflight_block_bytes` | unset: `x × C` (92 × 32 MiB = 2,944 MiB) | outstanding-request wire budget, released at receipt (separate from the resident gate) |
+| `max_reorder_lookahead_bytes` | 1.5 GiB | sizes the decoded pipeline bound; the pool, not this knob, bounds retained bodies |
+| `max_inflight_block_bytes` | unset: `x × C` (92 × 32 MiB = 2,944 MiB) | only validated; the pool, not this knob, bounds requests |
 | `max_blocks_per_response` | 1 (fixed) | deprecated and ignored; requests always carry one block, and serving answers a larger request with a one-block prefix |
 | `floor_bypass_slots` | 2 | extra slots past a saturated cwnd, floor lane only |
 | `request_timeout` / `floor_rescue_timeout` | 8 s / 2 s | above-floor base deadline / floor rescue leash |

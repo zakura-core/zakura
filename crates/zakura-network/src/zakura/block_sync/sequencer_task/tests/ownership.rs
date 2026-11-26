@@ -2,9 +2,28 @@ use super::*;
 use std::collections::BTreeMap;
 use zakura_node_services::block_memory::Admission;
 
-use crate::zakura::block_sync::{reorder::RetainedBody, wire::DecodedBlockPayload};
+use crate::zakura::block_sync::{
+    reorder::RetainedBody, wire::DecodedBlockPayload, work_queue::test_memory_pool,
+};
 
 use zakura_test::vectors::{BLOCK_MAINNET_2_BYTES, BLOCK_MAINNET_3_BYTES, BLOCK_MAINNET_5_BYTES};
+
+/// Applies `changes` to `payloads` and settles their leases at once.
+fn apply(payloads: &mut SequencerPayloads, changes: Vec<super::reorder::PayloadChange>) {
+    let deferred = payloads.apply_entries(changes);
+    payloads.settle_leases(deferred);
+}
+
+/// Materializes `id` under `admission`, with a memory pool that always has
+/// room.
+fn materialize(
+    payloads: &mut SequencerPayloads,
+    id: super::reorder::BodyId,
+    pool: &DecodedBlockPool,
+    admission: Admission,
+) -> Result<MaterializedBody, MaterializeError> {
+    payloads.materialize(id, pool, admission, &test_memory_pool(1 << 40))
+}
 
 /// The reorder, applying, and in-flight submission gauges, and the view
 /// admission reads, equal sums over the bodies the sequencer holds through
@@ -26,7 +45,7 @@ async fn byte_gauges_and_view_follow_sequencer_owners() {
     let budget = ByteBudget::new(1);
     let mut task = SequencerIO::new(
         Sequencer::new(block::Height(0), 2),
-        Arc::new(WorkQueue::new(block::Height(0), budget)),
+        Arc::new(WorkQueue::with_test_pool(block::Height(0), budget)),
         Arc::new(PeerRegistry::new()),
         actions,
         ThroughputMeter::new(Instant::now()),
@@ -45,7 +64,7 @@ async fn byte_gauges_and_view_follow_sequencer_owners() {
     );
     let check = |task: &mut SequencerIO, label: &str| {
         let changes = task.state.sequencer_mut().take_payload_changes();
-        task.payloads.apply(changes);
+        apply(&mut task.payloads, changes);
         let owners = task
             .state
             .sequencer()
@@ -274,7 +293,7 @@ async fn dropping_the_task_releases_its_queued_bodies_after_it_closes() {
     let budget = ByteBudget::new(1);
     let mut task = SequencerIO::new(
         Sequencer::new(block::Height(0), 2),
-        Arc::new(WorkQueue::new(block::Height(0), budget)),
+        Arc::new(WorkQueue::with_test_pool(block::Height(0), budget)),
         Arc::new(PeerRegistry::new()),
         actions,
         ThroughputMeter::new(Instant::now()),
@@ -310,6 +329,8 @@ async fn dropping_the_task_releases_its_queued_bodies_after_it_closes() {
     accepted.leave_queue();
     task.handle_accept_body(accepted);
     assert!(log.retained.upgrade().is_some());
+    // Clear setup observations so the assertion below checks only drop events.
+    log.events.lock().unwrap().clear();
 
     let block: Arc<block::Block> =
         Arc::new(BLOCK_MAINNET_2_BYTES.zcash_deserialize_into().unwrap());
@@ -376,7 +397,11 @@ fn runtime_payload(
     let previous = block.header.previous_block_hash;
     let bytes = u64::try_from(raw.block_len()).unwrap();
     let mut payloads = SequencerPayloads::default();
-    let facts = payloads.insert(BufferedBlockBody::from_decoded_block(block, Some(raw)));
+    let facts = payloads.insert(
+        BufferedBlockBody::from_decoded_block(block, Some(raw)),
+        0,
+        None,
+    );
     let mut policy = Sequencer::new(block::Height(0), 1);
     assert!(matches!(
         policy.accept_buffered_body(
@@ -396,7 +421,7 @@ fn runtime_payload(
         super::super::sequencer::AcceptOutcome::Buffered { .. }
     ));
     policy.drain_ready_into_applying();
-    payloads.apply(policy.take_payload_changes());
+    apply(&mut payloads, policy.take_payload_changes());
     (policy, payloads, weak)
 }
 
@@ -421,8 +446,11 @@ fn capacity_refused_payload_waits_for_room_for_its_size() {
         hold(BLOCK_MAINNET_5_BYTES.as_slice()),
     );
 
-    let refused = payloads.materialize(id, &pool, Admission::WithinLimit);
-    assert!(matches!(refused, Err(AdmissionFailure::Capacity)));
+    let refused = materialize(&mut payloads, id, &pool, Admission::WithinLimit);
+    assert!(matches!(
+        refused,
+        Err(MaterializeError::Admission(AdmissionFailure::Capacity))
+    ));
     assert_eq!(
         payloads.capacity_refused,
         Some((id, Admission::WithinLimit, size)),
@@ -434,12 +462,15 @@ fn capacity_refused_payload_waits_for_room_for_its_size() {
         !pool.has_room_for(size, Admission::WithinLimit),
         "the release leaves too little room"
     );
-    let skipped = payloads.materialize(id, &pool, Admission::WithinLimit);
-    assert!(matches!(skipped, Err(AdmissionFailure::Capacity)));
+    let skipped = materialize(&mut payloads, id, &pool, Admission::WithinLimit);
+    assert!(matches!(
+        skipped,
+        Err(MaterializeError::Admission(AdmissionFailure::Capacity))
+    ));
 
     second.leave_pipeline();
     assert!(pool.has_room_for(size, Admission::WithinLimit));
-    let admitted = payloads.materialize(id, &pool, Admission::WithinLimit);
+    let admitted = materialize(&mut payloads, id, &pool, Admission::WithinLimit);
     assert_eq!(admitted.unwrap().decoded_bytes, size);
 }
 
@@ -467,13 +498,13 @@ fn runtime_payload_reset_preserves_driver_copy_but_policy_clones_retain_no_paylo
         .upgrade()
         .expect("the runtime owner retains the input decode");
     let facts = policy.submission_body(block::Height(1)).unwrap();
-    let prepared = payloads
-        .materialize(
-            facts.id,
-            &DecodedBlockPool::for_pipeline(std::num::NonZeroU64::MAX, u64::MAX),
-            Admission::WithinLimit,
-        )
-        .unwrap();
+    let prepared = materialize(
+        &mut payloads,
+        facts.id,
+        &DecodedBlockPool::for_pipeline(std::num::NonZeroU64::MAX, u64::MAX),
+        Admission::WithinLimit,
+    )
+    .unwrap();
     policy
         .prepare_submit(block::Height(1), facts.id, prepared.decoded_bytes)
         .unwrap();
@@ -485,7 +516,7 @@ fn runtime_payload_reset_preserves_driver_copy_but_policy_clones_retain_no_paylo
     drop(original);
     let policy_snapshot = policy.clone();
     policy.reset_to(block::Height(0), false);
-    payloads.apply(policy.take_payload_changes());
+    apply(&mut payloads, policy.take_payload_changes());
     assert!(
         weak.upgrade().is_some(),
         "the driver still holds its submitted copy"
@@ -510,7 +541,7 @@ fn runtime_payload_inventory_tracks_reset_and_untracked_clone() {
         .ownership_snapshot(&payloads.entries)
         .payloads_match_policy());
     let retained = payloads.entries.values().next().unwrap().clone();
-    let untracked = payloads.insert(retained);
+    let untracked = payloads.insert(retained, 0, None);
     let snapshot = policy.ownership_snapshot(&payloads.entries);
     assert_eq!(snapshot.payloads.len(), 2);
     assert_eq!(snapshot.applying.len(), 1);
@@ -518,12 +549,15 @@ fn runtime_payload_inventory_tracks_reset_and_untracked_clone() {
         !snapshot.payloads_match_policy(),
         "capture must see an untracked shared allocation"
     );
-    payloads.release(untracked.id);
+    apply(
+        &mut payloads,
+        vec![super::reorder::PayloadChange::Release(untracked.id)],
+    );
     assert!(policy
         .ownership_snapshot(&payloads.entries)
         .payloads_match_policy());
     policy.reset_to(block::Height(0), false);
-    payloads.apply(policy.take_payload_changes());
+    apply(&mut payloads, policy.take_payload_changes());
     assert!(
         policy
             .ownership_snapshot(&payloads.entries)
@@ -564,7 +598,7 @@ async fn decoded_capacity_release_retries_pending_body_without_apply_completion(
             .unwrap();
         let retained = BlockHandle::Owned(blocker).transaction(0).unwrap();
         let expected_hash = retained.hash();
-        let mut task = retention_test_task(u64::MAX);
+        let mut task = retention_test_task();
         task.decoded_pool = pool.clone();
         let (actions, mut actions_rx) = mpsc::channel(1);
         task.actions = actions;
@@ -683,7 +717,7 @@ async fn commit_window_body_submits_at_a_full_decoded_byte_bound() {
         )
         .unwrap();
     let blocker_bytes = blocker.decoded_bytes();
-    let mut task = retention_test_task(u64::MAX);
+    let mut task = retention_test_task();
     task.decoded_pool = pool.clone();
     let (actions, mut actions_rx) = mpsc::channel(1);
     task.actions = actions;
@@ -743,7 +777,7 @@ async fn commit_window_body_submits_at_a_full_decoded_byte_bound() {
 #[tokio::test]
 async fn teardown_keeps_decoded_view_and_charge_while_the_driver_holds_a_submission() {
     let pool = DecodedBlockPool::for_block_count(std::num::NonZeroU64::new(8).unwrap());
-    let mut task = retention_test_task(u64::MAX);
+    let mut task = retention_test_task();
     task.decoded_pool = pool.clone();
     let (actions, mut actions_rx) = mpsc::channel(1);
     task.actions = actions;
@@ -839,4 +873,143 @@ fn decoded_byte_totals_follow_raw_to_decoded_changes() {
     drop(blocker);
     assert_eq!(pool.reserved_bytes(), 0);
     assert!(!pool.is_closed());
+}
+
+/// A body that leaves `applying` while the driver still holds its submission
+/// keeps a lease for the decoded block the driver holds, off `Consensus`,
+/// until the submission's exact completion arrives (F-902). A later failure
+/// and a destructive reset both detach submissions this way.
+#[tokio::test]
+async fn detached_submissions_keep_their_leases_until_completion() {
+    use crate::zakura::memory::Consumer;
+
+    let frontiers = genesis_frontiers();
+    let input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let input_decoded_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let (_body_tx, body_rx) = mpsc::channel(1);
+    let (_control_tx, control_rx) = mpsc::unbounded_channel();
+    let (actions, mut actions_rx) = mpsc::channel(8);
+    let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+    let mut task = SequencerIO::new(
+        Sequencer::new(block::Height(0), 2),
+        Arc::new(WorkQueue::with_test_pool(
+            block::Height(0),
+            ByteBudget::new(1 << 30),
+        )),
+        Arc::new(PeerRegistry::new()),
+        actions,
+        ThroughputMeter::new(Instant::now()),
+        frontiers,
+        Some(super::super::test_work_scope()),
+        crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+        Arc::new(crate::zakura::block_sync::BlockSyncClock),
+        body_rx,
+        control_rx,
+        input_bytes.clone(),
+        input_decoded_bytes.clone(),
+        view_tx,
+        Duration::from_secs(60),
+        ZakuraTrace::noop(),
+        crate::zakura::block_sync::test_decoded_pool(),
+    );
+    let pool = task.work.memory_pool().clone();
+    let leased = |pool: &crate::zakura::memory::MemoryPool| {
+        pool.consumer_leased(Consumer::BlockSync) + pool.consumer_leased(Consumer::Consensus)
+    };
+    for (height, bytes) in [
+        (1, BLOCK_MAINNET_1_BYTES.as_slice()),
+        (2, BLOCK_MAINNET_2_BYTES.as_slice()),
+    ] {
+        let block: Arc<block::Block> = Arc::new(bytes.zcash_deserialize_into().unwrap());
+        let raw = DecodedBlockPayload::of_block(&block);
+        // usize always fits in u64 on supported targets.
+        let wire_bytes = raw.block_len() as u64;
+        let mut body = SequencedBody::new_queued(
+            super::super::test_work_owner(),
+            zakura_header_chain::SourceId::from_digest([1; 32]),
+            block::Height(height),
+            block.hash(),
+            block.header.previous_block_hash,
+            BufferedBlockBody::RawFramePayload(raw),
+            wire_bytes,
+            None,
+            ZakuraPeerId::new(vec![1; 32]).unwrap(),
+            Instant::now(),
+            input_bytes.clone(),
+            input_decoded_bytes.clone(),
+        );
+        body.body_lease = Some(
+            pool.try_acquire(Consumer::BlockSync, Some(1), wire_bytes)
+                .expect("the test pool has room for the body"),
+        );
+        body.leave_queue();
+        task.handle_accept_body(body);
+    }
+    task.submit_pending_blocks().await;
+    let submitted: Vec<_> = std::iter::from_fn(|| actions_rx.try_recv().ok())
+        .filter_map(|action| match action {
+            BlockSyncAction::SubmitBlock {
+                owner,
+                source,
+                token,
+                block,
+            } => Some((owner, source, token, block)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(submitted.len(), 2, "the two-body window submits both");
+    let decoded: Vec<u64> = submitted
+        .iter()
+        .map(|(_, _, _, block)| block.attributed_memory_size_bytes())
+        .collect();
+    assert!(
+        pool.consumer_leased(Consumer::Consensus) > 0,
+        "the commit-window bodies decode onto Consensus leases"
+    );
+
+    // Height 2's apply fails while its submission is still out, and then a
+    // reset clears height 1. Each body leaves the sequencer, but the driver
+    // still holds both decoded blocks.
+    task.state
+        .sequencer_mut()
+        .release_applying_blocks_from(block::Height(2));
+    let changes = task.state.sequencer_mut().take_payload_changes();
+    task.apply_payload_changes(changes);
+    let mut operations = Vec::new();
+    task.state
+        .destructive_reset_to(block::Height(0), false, &mut operations);
+    task.execute(operations).await;
+    let changes = task.state.sequencer_mut().take_payload_changes();
+    task.apply_payload_changes(changes);
+    assert!(task.payloads.entries.is_empty(), "IO holds no payload");
+    assert_eq!(
+        leased(&pool),
+        decoded.iter().sum::<u64>(),
+        "the leases cover exactly the decoded blocks the driver holds"
+    );
+    assert_eq!(
+        pool.consumer_leased(Consumer::Consensus),
+        0,
+        "a detached submission leaves Consensus to the heights' next bodies"
+    );
+
+    // Each exact completion returns its block's lease.
+    for (index, (owner, source, token, block)) in submitted.iter().enumerate() {
+        let height = block::Height(u32::try_from(index + 1).unwrap());
+        assert!(task.state.sequencer_mut().finish_submission(
+            *owner,
+            *source,
+            *token,
+            height,
+            block.hash()
+        ));
+        let changes = task.state.sequencer_mut().take_payload_changes();
+        task.apply_payload_changes(changes);
+        assert_eq!(
+            leased(&pool),
+            decoded[index + 1..].iter().sum::<u64>(),
+            "height {} returns its lease at completion",
+            height.0
+        );
+    }
 }

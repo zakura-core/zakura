@@ -139,7 +139,7 @@ async fn mine_template_block(net: &Network, mut config: ZakuradConfig) -> eyre::
         &mut zakurad,
         OPENED_RPC_ENDPOINT_MSG,
     )?);
-    zakurad.expect_stdout_line_matches("activating mempool")?;
+    zakurad.expect_stdout_line_matches("mempool activated")?;
 
     let (mut block, height) = client.block_from_template(net).await?;
 

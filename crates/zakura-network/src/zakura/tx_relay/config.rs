@@ -17,7 +17,7 @@ pub struct ZakuraTxRelayConfig {
     /// Whether to move transactions over `tx-relay`. On by default, so it
     /// follows the pool: it runs with the pool core and stays off with
     /// `classic`. At full load, with 92 peers each announcing a full pool of
-    /// its own, its bookkeeping can use about 400 MiB of memory.
+    /// its own, its bookkeeping can use about 430 MiB of memory.
     pub enabled: bool,
 
     /// How long a session outside a transaction's fan-out window waits before

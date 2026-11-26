@@ -29,7 +29,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use zakura_network::zakura::{
     block_sync_serving_limit, block_sync_streams,
-    memory::{ByteSize, Consumer, MemoryPlan, MemoryPool},
+    memory::{Consumer, MemoryPlan, MemoryPool},
     BlockSyncMemory, ZakuraBlockSyncConfig,
 };
 use zakura_scheduler::{At, SchedulerConfig, TaskId};

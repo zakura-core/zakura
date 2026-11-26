@@ -409,18 +409,22 @@ impl HandshakeCounts {
         cap: usize,
         now: Instant,
     ) {
-        if self.free_ordinary_connections(cap) > 0 {
-            return;
+        while self.free_ordinary_connections(cap) == 0 {
+            let preferred = self.preferred.held_places();
+            self.preferred.defer_dials(|dialed| {
+                moves
+                    .cooling_destination(dialed, now)
+                    .is_some_and(|current| {
+                        !preferred.members.contains(&current)
+                            || self.connections.of_node(&current).total() > 0
+                    })
+            });
+            // A deferred destination can leave another gateway unable to dial.
+            // Each change puts at least one more ranked gateway into backoff.
+            if self.preferred.set() == preferred.members {
+                break;
+            }
         }
-        let preferred = self.preferred.held_places();
-        self.preferred.defer_dials(|dialed| {
-            moves
-                .cooling_destination(dialed, now)
-                .is_some_and(|current| {
-                    !preferred.members.contains(&current)
-                        || self.connections.of_node(&current).total() > 0
-                })
-        });
     }
 
     /// The preferred gateways the slot checks use now.

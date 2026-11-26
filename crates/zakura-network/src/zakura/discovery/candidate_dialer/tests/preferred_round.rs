@@ -442,6 +442,26 @@ async fn moved_gateway_yields_the_last_place_until_rollback_can_be_checked() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn chained_gateway_moves_yield_both_places_to_standbys() {
+    let (node, mut io, ranks) = dialer_with_places(9234, 2).await;
+    let gateways = known_gateways(&node, 4).await;
+    ranks.send_replace(ranking(&gateways));
+    node.supervisor().learn_move(gateways[0], gateways[1]);
+    node.supervisor().learn_move(gateways[1], node_id(0));
+    let slots = node
+        .endpoint()
+        .hold_connection_slots(MAX_CONNECTIONS, false);
+
+    let mut state = CandidateDialerState::new(DIAL_BACKOFF);
+    let round = io.admit_round(&mut state, &[], Instant::now()).await;
+    assert_eq!(held(&node.endpoint()).members, gateways[2..]);
+    assert_eq!(dialed(&round.preferred), gateways[2..]);
+
+    drop(slots);
+    node.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
 async fn moved_gateway_ranked_under_both_ids_gets_one_dial_per_round() {
     let (node, mut io, ranks) = dialer(9234).await;
     let gateways = known_gateways(&node, 2).await;

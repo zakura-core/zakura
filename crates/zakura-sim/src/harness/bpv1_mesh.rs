@@ -69,11 +69,11 @@ use zakura_network::{
     zakura::{
         bpv1::{
             BlockPhase, BlockVerifierPort, HavePacing, HeaderChainAdmissionAdapter,
-            MemoryBodyStore, PortFuture, Profile, PropagationReserve, VerifierVerdict, WorkId,
+            MemoryBodyStore, PortFuture, Profile, VerifierVerdict, WorkId,
             BPV1_CONTROL_KIND, BPV1_DATA_KIND,
         },
         framed_channel,
-        memory::{Consumer, ConsumerSpec, MemoryPool, PoolConfig},
+        memory::{MemoryPlan, MemoryPool},
         spawn_block_sync_reactor, BlockRangeRead, BlockRangeReadResult, BlockRangeSource,
         BlockSyncAction, BlockSyncFrontiers, BlockSyncMemory, BlockSyncService, BlockSyncStartup,
         Bpv1Handle, Bpv1Ports, Bpv1Service, Bpv1Startup, FramedRecv, FramedSend, Peer, Service,
@@ -109,6 +109,7 @@ use zakura_storage::{
 use super::{
     block_node::preload,
     header_node::{DispatchFlag, HeaderNode, LINK_DEPTH},
+    sync::DEFAULT_SIM_MEMORY_BUDGET_B,
 };
 use crate::Sim;
 
@@ -471,6 +472,19 @@ pub struct Mesh {
 
 /// Regtest with NU7 active from height 1, so every mined block is a BPv1
 /// block. It shares the fixture's genesis block, which is BPv1's chain ID.
+/// The memory pool of a BPv1 node on [`bpv1_network`], sized by the plan a
+/// node with BPv1 on builds at the simulator's default budget.
+fn bpv1_memory_pool() -> MemoryPool {
+    let mut config = zakura_network::Config {
+        network: bpv1_network(),
+        ..zakura_network::Config::default()
+    };
+    config.zakura.bpv1.enabled = true;
+    MemoryPlan::size(DEFAULT_SIM_MEMORY_BUDGET_B, &config, &config.network)
+        .expect("the simulator's budget sizes a BPv1 plan")
+        .build_pool()
+}
+
 fn bpv1_network() -> Network {
     Network::new_regtest(
         ConfiguredActivationHeights {
@@ -761,6 +775,8 @@ fn spawn_actor(
         None,
     );
     let claims = SharedBodyClaims::new();
+    // One pool funds block sync and BPv1, as `zakurad` builds it.
+    let memory_pool = bpv1_memory_pool();
     // Block sync, as `BlockNode::spawn` starts it, sharing BPv1's claims.
     let config = ZakuraBlockSyncConfig::default();
     let mut startup = BlockSyncStartup::new_with_committed_views(
@@ -775,7 +791,7 @@ fn spawn_actor(
             .decoded_block_pool(10_000)
             .expect("the fixture's decoded allowance fits"),
         config,
-        BlockSyncMemory::for_tests(),
+        BlockSyncMemory::new(memory_pool.clone(), None),
     )
     .with_body_claims(claims.clone());
     // Regtest's checkpoint list holds only genesis.
@@ -811,16 +827,9 @@ fn spawn_actor(
         fallback: Arc::new(claims.clone()),
         committed_snapshots: engine.selected_chain(),
     };
-    let bpv1_config = ZakuraBpv1Config::default();
-    // The `Propagation` reserve the node plan holds for this config.
-    let reserve = PropagationReserve::new(&bpv1_config, Profile::W2).total();
-    let pool = MemoryPool::new(
-        PoolConfig::new(reserve, 0)
-            .with_consumer(Consumer::Propagation, ConsumerSpec::reserved(reserve)),
-    );
     let (bpv1_service, bpv1) = Bpv1Service::start(
         Bpv1Startup {
-            config: bpv1_config,
+            config: ZakuraBpv1Config::default(),
             have_pacing: HavePacing::default(),
             profile: Profile::W2,
             network: bpv1_network(),
@@ -828,7 +837,7 @@ fn spawn_actor(
             ports,
             shutdown: bpv1_shutdown.clone(),
         },
-        pool,
+        memory_pool,
     );
     Actor {
         name,

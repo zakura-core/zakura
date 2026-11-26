@@ -110,6 +110,7 @@ impl SessionRecordError {
 /// their relay's node id as provenance, not a session.
 #[derive(Debug)]
 pub(super) struct DiscoveryState {
+    pub(super) peer_query_reserve: Option<super::protocol::PeerQueryReserve>,
     book: ZakuraDiscoveryBook,
     active_services: HashMap<NodeId, ZakuraActiveServiceEntry>,
     admitted_peers: HashMap<ZakuraPeerId, ZakuraDiscoveryAdmittedPeer>,
@@ -291,6 +292,7 @@ impl DiscoveryState {
                 disclosure_key,
             )
             .with_address_scope(AddressScope::for_network(local.network_id)),
+            peer_query_reserve: None,
             active_services: HashMap::new(),
             admitted_peers: HashMap::new(),
             local,

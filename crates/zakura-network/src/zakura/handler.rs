@@ -1399,6 +1399,11 @@ impl ZakuraEndpoint {
         self.quic.discovery_capacity()
     }
 
+    /// Transport room for an ordinary replacement after one established connection leaves.
+    pub(crate) fn discovery_replacement_address_capacity(&self) -> usize {
+        self.quic.discovery_replacement_capacity()
+    }
+
     /// Select preferred gateways within this endpoint's funded extra capacity.
     pub fn publish_gateway_ranking(&self, ranking: impl IntoIterator<Item = super::RankedGateway>) {
         self.handler.publish_gateway_ranking(ranking);

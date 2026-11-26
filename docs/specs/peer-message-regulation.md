@@ -433,7 +433,10 @@ The sender MAY send one initial `GetPeers`. It MUST send later requests at least
 and wait for the previous response before sending the next request. Configurable refresh intervals
 MUST obey this minimum. Zakura asks on each new stream. On shared streams it checks every 15 seconds:
 when the ordinary connection target is met and the book has at least two distinct, unconnected
-peers eligible to dial, it waits 60 seconds between peer queries. Otherwise it asks on this refresh.
+peers eligible for ordinary dials, it waits 60 seconds between peer queries. The candidate dialer
+checks both thresholds each round, accounting for preferred places, identity moves and route
+admission. A registration change or an assessment two seconds old clears the backoff.
+Otherwise it asks on this refresh.
 Live-service queries keep their 15-second interval.
 The handler MUST bound sampling work independently of discovery-book size.
 It MUST apply `wanted_services` when it samples the discovery book. It MUST sample

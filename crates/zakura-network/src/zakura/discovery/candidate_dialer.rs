@@ -58,6 +58,9 @@ use state::{
 
 /// How often the discovery dialer wakes to look for new candidates.
 const ZAKURA_DISCOVERY_DIAL_INTERVAL: Duration = Duration::from_secs(1);
+/// Allow one missed round before a stalled or stopped dialer forfeits its assessment.
+pub(super) const QUERY_RESERVE_VALIDITY: Duration =
+    ZAKURA_DISCOVERY_DIAL_INTERVAL.saturating_mul(2);
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(super) enum DiscoveryDialResult {
@@ -490,18 +493,28 @@ async fn admit_dial_round(
                 .preferred_dial_permits()
                 .saturating_sub(preferred.dials),
         );
-    if free_slots == 0 || free_permits == 0 {
-        return Vec::new();
-    }
     let supervisor = endpoint.supervisor();
     let in_flight_node_ids = state.in_flight_node_ids();
     let held_places = endpoint.held_places();
-    // The book lists a moved node under its earlier ID and, once it has the
-    // node's new record, under its ID now. One dial reaches the node either
-    // way, so the round compares candidates by the ID each answers with.
-    let moved = supervisor.moved_node_ids();
-    let current = |node: NodeId| moved.borrow().current(node);
-    let mut dialing: HashSet<NodeId> = in_flight_node_ids.iter().map(|id| current(*id)).collect();
+    let mut routes = OrdinaryDialRoutes::new(supervisor, &held_places, &in_flight_node_ids);
+    // One freed connection permits a replacement. The two spares are alternatives
+    // for that slot, so each is checked against the same remaining address capacity.
+    let replacement_slots = endpoint
+        .discovery_replacement_address_capacity()
+        .saturating_sub(preferred.address_attempts);
+    discovery
+        .update_peer_query_reserve(&held_places, |candidate| {
+            routes
+                .take(&candidate, state, replacement_slots, now)
+                .is_some()
+        })
+        .await;
+    if free_slots == 0 || free_permits == 0 {
+        return Vec::new();
+    }
+    // Reserve selection is observational; only real attempts exclude one another here.
+    let mut routes =
+        OrdinaryDialRoutes::new(endpoint.supervisor(), &held_places, &in_flight_node_ids);
     let mut admitted = Vec::new();
     discovery
         .admit_dial_candidates_preferring_any_service(
@@ -512,44 +525,88 @@ async fn admit_dial_round(
                 if free_slots == 0 || free_permits == 0 {
                     return DialAdmission::Exhausted;
                 }
-                let holds_a_place = moved
-                    .borrow()
-                    .under_either_id(candidate.node_id, |id| held_places.members.contains(id));
-                if holds_a_place {
-                    return DialAdmission::Skipped;
-                }
-                // The book leaves out a node connected under the candidate's
-                // own ID. A moved node is registered under the other one.
-                let answers_as = current(candidate.node_id);
-                let moved_and_registered = answers_as != candidate.node_id
-                    && supervisor.is_registered(&ZakuraPeerId::from_node_id(answers_as));
-                if moved_and_registered || dialing.contains(&answers_as) {
-                    return DialAdmission::Skipped;
-                }
-                let Some((node_addr, reserved_ips)) = discovery_node_addr_with_reserved_ip_capacity(
-                    state,
-                    &candidate,
-                    |ip, in_flight| supervisor.can_accept_remote_ip_with_in_flight(ip, in_flight),
-                    now,
-                ) else {
+                let Some((node_addr, reserved_ips)) =
+                    routes.take(&candidate, state, free_slots, now)
+                else {
                     return DialAdmission::Skipped;
                 };
-                if reserved_ips.len() > free_slots {
-                    return DialAdmission::Skipped;
-                }
                 let claimed_slots = reserved_ips.len();
                 let Some(attempt) = state.record_attempt(candidate.node_id, reserved_ips) else {
                     return DialAdmission::Skipped;
                 };
                 free_slots -= claimed_slots;
                 free_permits -= 1;
-                dialing.insert(answers_as);
                 admitted.push((attempt, node_addr));
                 DialAdmission::Admitted
             },
         )
         .await;
     admitted
+}
+
+/// An ordinary pass can use each current identity once, excluding preferred,
+/// registered and in-flight nodes, including their previously known identities.
+struct OrdinaryDialRoutes<'a> {
+    supervisor: crate::zakura::ZakuraSupervisorHandle,
+    held: &'a crate::zakura::HeldPlaces,
+    moved: watch::Receiver<crate::zakura::transport::MovedNodeIds>,
+    unavailable: HashSet<NodeId>,
+}
+
+impl<'a> OrdinaryDialRoutes<'a> {
+    fn new(
+        supervisor: crate::zakura::ZakuraSupervisorHandle,
+        held: &'a crate::zakura::HeldPlaces,
+        in_flight: &[NodeId],
+    ) -> Self {
+        let moved = supervisor.moved_node_ids();
+        let unavailable = in_flight
+            .iter()
+            .map(|id| moved.borrow().current(*id))
+            .collect();
+        Self {
+            supervisor,
+            held,
+            moved,
+            unavailable,
+        }
+    }
+
+    /// Takes a distinct destination if its eligible addresses fit this pass.
+    fn take(
+        &mut self,
+        candidate: &ZakuraDiscoveryDialCandidate,
+        state: &CandidateDialerState,
+        address_slots: usize,
+        now: Instant,
+    ) -> Option<(NodeAddr, Vec<IpAddr>)> {
+        let moved = self.moved.borrow();
+        let current = moved.current(candidate.node_id);
+        if self.unavailable.contains(&current)
+            || moved.under_either_id(candidate.node_id, |id| {
+                self.held.members.contains(id)
+                    || self
+                        .supervisor
+                        .is_registered(&ZakuraPeerId::from_node_id(*id))
+            })
+        {
+            return None;
+        }
+        let (addr, ips) = discovery_node_addr_with_reserved_ip_capacity(
+            state,
+            candidate,
+            |ip, in_flight| {
+                self.supervisor
+                    .can_accept_remote_ip_with_in_flight(ip, in_flight)
+            },
+            now,
+        )?;
+        if ips.len() > address_slots {
+            return None;
+        }
+        self.unavailable.insert(current);
+        Some((addr, ips))
+    }
 }
 
 /// Returns the addresses of `candidate` to dial and their canonical IPs, whose

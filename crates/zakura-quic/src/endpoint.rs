@@ -470,6 +470,12 @@ impl QuicEndpoint {
         self.inner.shared.connections.discovery_room()
     }
 
+    /// Discovery address attempts that would fit after one live connection leaves.
+    /// Conservatively keep room for an inbound attempt if an inbound connection leaves.
+    pub fn discovery_replacement_capacity(&self) -> usize {
+        self.inner.shared.connections.discovery_replacement_room()
+    }
+
     /// Network changes the endpoint has passed to its connections (SOCK-12).
     pub fn network_changes(&self) -> u64 {
         self.inner.shared.network_changes.load(Ordering::Relaxed)
@@ -1369,6 +1375,17 @@ impl ConnectionSlots {
             .saturating_sub(held.live)
     }
 
+    /// Room after losing one connection, preserving the inbound reserve.
+    fn discovery_replacement_room(&self) -> usize {
+        let held = self.held();
+        let after = Held {
+            live: held.live.saturating_sub(1),
+            inbound: held.inbound.saturating_sub(1),
+        };
+        self.limit(DialCeiling::Discovery, after)
+            .saturating_sub(after.live)
+    }
+
     /// Whether a dial attempt would get a slot right now.
     pub(crate) fn can_dial(&self) -> bool {
         self.live() < self.max
@@ -1700,6 +1717,18 @@ mod tests {
         assert_eq!(maintained_slots, 2);
         assert_eq!(full_count, 8);
         assert_eq!(slots.live(), 0);
+    }
+
+    #[test]
+    fn replacement_room_respects_the_discovery_and_inbound_reserves() {
+        let slots = ConnectionSlots::new(8, 2, Some(2), 0);
+        let _outbound = slots.claim_dial_slots(5, DialCeiling::Discovery).unwrap();
+        assert_eq!(slots.discovery_replacement_room(), 1);
+        let _inbound = slots.claim_inbound().unwrap();
+        assert_eq!(slots.discovery_replacement_room(), 0);
+        assert!(slots.claim_inbound().is_none());
+        let _maintained = slots.claim_dial().unwrap();
+        assert_eq!(slots.discovery_replacement_room(), 0);
     }
 
     /// Inbound attempts stop at their own cap, and each holds it until its

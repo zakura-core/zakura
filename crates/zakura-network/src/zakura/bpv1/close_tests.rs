@@ -643,11 +643,11 @@ fn close_4_unknown_parent_alternate_retries_after_the_best_header_moved() {
 }
 
 /// Header sync can reach a pending block's own height while its checks run.
-/// The promoted alternate is then checked against the new best header and
-/// gets `Drop`, but the header is now known, so it retries admission and
-/// BPv1 still delivers the block (#2760).
+/// A promoted alternate is checked against the same `top` as the first copy,
+/// not the new best header that would drop it, so it passes, retries
+/// admission, finds the header, and BPv1 still delivers the block (#2760).
 #[test]
-fn unknown_parent_drop_after_header_sync_reached_the_block_retries_admission() {
+fn unknown_parent_alternate_after_header_sync_reached_the_block_retries_admission() {
     let now = Instant::now();
     let parent = block::Hash([0x3C; 32]);
     let block_id = block::Hash([0x3D; 32]);
@@ -696,9 +696,9 @@ fn unknown_parent_drop_after_header_sync_reached_the_block_retries_admission() {
     assert!(failed
         .outputs
         .iter()
-        .any(|o| matches!(o, BlockOutput::CheckUnknownParent { top: 11, .. })));
+        .any(|o| matches!(o, BlockOutput::CheckUnknownParent { top: 9, .. })));
 
-    let retried = unknown_parent_checked(&mut table, now, &failed, UnknownParentVerdict::Drop);
+    let retried = unknown_parent_checked(&mut table, now, &failed, UnknownParentVerdict::Park);
     assert!(rejected_sessions(&retried, block_id).is_empty());
     assert_eq!(table.pending_meta_len(), 0);
     let admitted = header_result(
@@ -714,58 +714,6 @@ fn unknown_parent_drop_after_header_sync_reached_the_block_retries_admission() {
     assert!(committed
         .events
         .contains(&BlockEvent::BlockAdmitted { block_id }));
-    table.assert_invariants();
-}
-
-/// A dropped copy that retries after an unrelated best-header move, and whose
-/// parent is still unknown, is rejected. It failed its checks, so it never
-/// parks as if it had passed them.
-#[test]
-fn unknown_parent_drop_with_a_still_missing_parent_is_rejected_not_parked() {
-    let now = Instant::now();
-    let parent = block::Hash([0x3F; 32]);
-    let block_id = block::Hash([0x40; 32]);
-    let [a, ..] = sessions();
-    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
-    let first = copy_from(
-        &mut table,
-        now,
-        make_envelope(block_id, tiny(), [0xA1; 32], node_id(1)),
-        a,
-    );
-    let checking = header_result(
-        &mut table,
-        now,
-        &first,
-        HeaderAdmissionResult::MissingParent {
-            parent_hash: parent,
-        },
-    );
-    table.step(
-        now,
-        BlockInput::ParentAdmitted {
-            hash: block::Hash([0x41; 32]),
-            height: 5,
-        },
-    );
-
-    let retried = unknown_parent_checked(&mut table, now, &checking, UnknownParentVerdict::Drop);
-    assert!(rejected_sessions(&retried, block_id).is_empty());
-    let missing = header_result(
-        &mut table,
-        now,
-        &retried,
-        HeaderAdmissionResult::MissingParent {
-            parent_hash: parent,
-        },
-    );
-    assert_eq!(rejected_sessions(&missing, block_id), vec![a]);
-    assert!(!missing
-        .outputs
-        .iter()
-        .any(|o| matches!(o, BlockOutput::CheckUnknownParent { .. })));
-    assert_eq!(table.pending_meta_len(), 0);
-    assert_eq!(table.admitting_meta_len(), 0);
     table.assert_invariants();
 }
 

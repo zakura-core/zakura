@@ -95,6 +95,7 @@ NETWORK_UPGRADE = """
 const PRE_BLOSSOM_POW_TARGET_SPACING: i64 = 150;
 pub const POST_BLOSSOM_POW_TARGET_SPACING: u32 = 75;
 pub const POST_NU7_POW_TARGET_SPACING: u32 = 25;
+pub const POST_NU7_1_POW_TARGET_SPACING: u32 = 20;
 
     pub fn target_spacings(
         network: &Network,
@@ -106,6 +107,7 @@ pub const POST_NU7_POW_TARGET_SPACING: u32 = 25;
                 POST_BLOSSOM_POW_TARGET_SPACING.into(),
             ),
             (NetworkUpgrade::Nu7, POST_NU7_POW_TARGET_SPACING.into()),
+            (NetworkUpgrade::Nu7_1, POST_NU7_1_POW_TARGET_SPACING.into()),
         ]
         .into_iter()
 """
@@ -234,12 +236,21 @@ class SupportWindowTests(unittest.TestCase):
 
     def test_new_target_spacings_fail_instead_of_skewing_the_date(self):
         upgrades = NETWORK_UPGRADE.replace(
-            "(NetworkUpgrade::Nu7, POST_NU7_POW_TARGET_SPACING.into()),",
-            "(NetworkUpgrade::Nu7, POST_NU7_POW_TARGET_SPACING.into()),\n"
+            "(NetworkUpgrade::Nu7_1, POST_NU7_1_POW_TARGET_SPACING.into()),",
+            "(NetworkUpgrade::Nu7_1, POST_NU7_1_POW_TARGET_SPACING.into()),\n"
             "            (NetworkUpgrade::Nu8, POST_NU8_POW_TARGET_SPACING.into()),",
         )
         with self.assertRaisesRegex(NotesError, "target_spacings"):
             self.window(upgrades=upgrades)
+
+    def test_a_mainnet_nu7_1_height_fails_until_the_schedule_has_it(self):
+        heights = ACTIVATION_HEIGHTS.replace(
+            "pub(in crate::parameters) const NU7: Height = Height(3_543_405);",
+            "pub(in crate::parameters) const NU7: Height = Height(3_543_405);\n"
+            "        pub(in crate::parameters) const NU7_1: Height = Height(3_700_000);",
+        )
+        with self.assertRaisesRegex(NotesError, "NU7.1 has a Mainnet height"):
+            release_notes.spacing_schedule(NETWORK_UPGRADE, heights)
 
     def test_missing_constants_are_errors(self):
         with self.assertRaisesRegex(NotesError, "ESTIMATED_RELEASE_HEIGHT"):

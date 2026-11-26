@@ -736,6 +736,115 @@ fn averaging_window_changes_at_nu7_activation_height() -> Result<(), Report> {
     Ok(())
 }
 
+/// Tests ZIP 223's 20 second spacing and 128-block averaging window across the
+/// NU7.1 activation boundary.
+#[test]
+fn spacing_and_averaging_window_change_at_nu7_1_activation_height() -> Result<(), Report> {
+    use crate::parameters::{
+        testnet::{self, ConfiguredActivationHeights},
+        POST_NU7_1_POW_AVERAGING_WINDOW, POST_NU7_POW_AVERAGING_WINDOW,
+    };
+
+    let _init_guard = zakura_test::init();
+
+    let network = testnet::Parameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            blossom: Some(1),
+            nu7: Some(10),
+            nu7_1: Some(20),
+            ..Default::default()
+        })
+        .expect("activation heights are valid")
+        .clear_funding_streams()
+        .to_network()
+        .expect("configured testnet is valid");
+
+    for (height, spacing, window, timespan) in [
+        (19, 25, POST_NU7_POW_AVERAGING_WINDOW, 2_550),
+        (20, 20, POST_NU7_1_POW_AVERAGING_WINDOW, 2_560),
+        (21, 20, POST_NU7_1_POW_AVERAGING_WINDOW, 2_560),
+    ] {
+        let height = Height(height);
+        assert_eq!(
+            spacing,
+            NetworkUpgrade::target_spacing_for_height(&network, height).num_seconds()
+        );
+        assert_eq!(
+            window,
+            NetworkUpgrade::averaging_window_for_height(&network, height)
+        );
+        assert_eq!(
+            timespan,
+            NetworkUpgrade::averaging_window_timespan_for_height(&network, height).num_seconds()
+        );
+    }
+
+    Ok(())
+}
+
+/// Tests that the halving index and block subsidy follow ZIP 223 from NU7.1.
+///
+/// Both read the target spacing table, so the 20 second era gives ZIP 223's
+/// `Halving(h)` and `ScheduledBlockSubsidy(h)` without NU7.1-specific code.
+#[test]
+fn post_nu7_1_halving_and_subsidy() -> Result<(), Report> {
+    use crate::parameters::testnet::{self, ConfiguredActivationHeights};
+
+    let _init_guard = zakura_test::init();
+
+    // As in `post_nu7_spacing_halving_and_subsidy`, the third halving lands
+    // exactly at NU7. NU7.1 then activates halfway through the post-NU7 halving
+    // interval of 5,040,000 blocks.
+    let blossom = 1u32;
+    let canopy = blossom + u32::try_from(POST_BLOSSOM_HALVING_INTERVAL).unwrap();
+    let nu7 = canopy + u32::try_from(POST_BLOSSOM_HALVING_INTERVAL * 2).unwrap();
+    let nu7_1 = nu7 + 2_520_000;
+
+    let network = testnet::Parameters::build()
+        .with_slow_start_interval(Height(2))
+        .with_activation_heights(ConfiguredActivationHeights {
+            blossom: Some(blossom),
+            canopy: Some(canopy),
+            nu7: Some(nu7),
+            nu7_1: Some(nu7_1),
+            ..Default::default()
+        })
+        .expect("activation heights are valid")
+        .clear_funding_streams()
+        .to_network()
+        .expect("configured testnet is valid");
+
+    let nu7_1_height = Height(nu7_1);
+
+    // The block before NU7.1 keeps the 25 second subsidy at halving 3.
+    assert_eq!(3, halving((nu7_1_height - 1).unwrap(), &network));
+    assert_eq!(
+        Amount::<NonNegative>::try_from(26_041_666)?,
+        halving_block_subsidy((nu7_1_height - 1).unwrap(), &network)?,
+    );
+
+    // ZIP 223's example: floor(1_250_000_000 / (2 * 3 * 5/4 * 8)) = 20_833_333.
+    // Scaling the rounded 26_041_666 by 4/5 would give 20_833_332 instead.
+    assert_eq!(3, halving(nu7_1_height, &network));
+    assert_eq!(
+        Amount::<NonNegative>::try_from(20_833_333)?,
+        halving_block_subsidy(nu7_1_height, &network)?,
+    );
+
+    // Half of the halving interval remains at NU7.1, and it lasts half of the
+    // 6,300,000-block TwentySecondHalvingInterval. The interval doesn't restart.
+    let next_halving = (nu7_1_height + 3_150_000).unwrap();
+    assert_eq!(Some(next_halving), height_for_halving(4, &network));
+    assert_eq!(3, halving((next_halving - 1).unwrap(), &network));
+    assert_eq!(4, halving(next_halving, &network));
+    assert_eq!(
+        Amount::<NonNegative>::try_from(10_416_666)?,
+        halving_block_subsidy(next_halving, &network)?,
+    );
+
+    Ok(())
+}
+
 /// Returns the default Testnet parameters with NU7 at `nu7`.
 fn testnet_with_nu7(nu7: Option<u32>) -> testnet::ParametersBuilder {
     let mut activation_heights: ConfiguredActivationHeights = Network::new_default_testnet()

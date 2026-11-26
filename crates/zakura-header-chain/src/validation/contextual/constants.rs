@@ -32,8 +32,8 @@ pub const MAX_POW_PREDECESSOR_CONTEXT_SPAN: usize = MAX_POW_ADJUSTMENT_BLOCK_SPA
 /// `candidate_height` reads.
 ///
 /// The candidate block's upgrade selects the averaging window, so ZIP 218 widens
-/// this span from [`POW_ADJUSTMENT_BLOCK_SPAN`] to 113 blocks at NU7. It never
-/// exceeds the retained [`MAX_POW_ADJUSTMENT_BLOCK_SPAN`].
+/// this span from [`POW_ADJUSTMENT_BLOCK_SPAN`] to 113 blocks at NU7, and ZIP 223
+/// widens it to [`MAX_POW_ADJUSTMENT_BLOCK_SPAN`] at NU7.1.
 pub fn pow_adjustment_block_span_for_height(
     network: &Network,
     candidate_height: block::Height,

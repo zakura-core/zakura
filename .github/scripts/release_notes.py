@@ -242,11 +242,16 @@ def spacing_schedule(upgrades: str, heights: str) -> tuple[tuple[int, int], ...]
     """
     function = re.search(r"fn target_spacings\(.*?\.into_iter\(\)", upgrades, re.DOTALL)
     listed = re.findall(r"NetworkUpgrade::(\w+)", function[0]) if function else []
-    if listed != ["Genesis", "Blossom", "Nu7"]:
+    if listed != ["Genesis", "Blossom", "Nu7", "Nu7_1"]:
         raise NotesError(
             f"`target_spacings` in {NETWORK_UPGRADE} changed; update the schedule in release_notes.py"
         )
     mainnet = mainnet_heights(heights)
+    # NU7.1 has no Mainnet height yet, so its 20 second spacing isn't in the schedule.
+    if re.search(r"\bNU7_1\b", mainnet):
+        raise NotesError(
+            f"NU7.1 has a Mainnet height in {ACTIVATION_HEIGHTS}; add it to the schedule in release_notes.py"
+        )
     return (
         (0, rust_integer(upgrades, "PRE_BLOSSOM_POW_TARGET_SPACING", NETWORK_UPGRADE)),
         (rust_integer(mainnet, "BLOSSOM", ACTIVATION_HEIGHTS),

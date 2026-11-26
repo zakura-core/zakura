@@ -22,7 +22,10 @@ use std::{collections::HashMap, sync::OnceLock};
 use crate::{
     amount::{self, Amount, NegativeAllowed, NonNegative, MAX_MONEY},
     block::{Height, HeightDiff},
-    parameters::{Network, NetworkUpgrade, NU7_POW_TARGET_SPACING_RATIO},
+    parameters::{
+        Network, NetworkUpgrade, NU7_POW_TARGET_SPACING_RATIO, POST_BLOSSOM_POW_TARGET_SPACING,
+        POST_NU7_1_POW_TARGET_SPACING, POST_NU7_POW_TARGET_SPACING,
+    },
     transparent,
 };
 
@@ -580,15 +583,29 @@ pub const LN2_SCALED: u128 = 6_931_680_000;
 /// The NU7 subsidy fraction numerator on Mainnet and default Testnet.
 pub const BLOCK_SUBSIDY_FRACTION_NUMERATOR: u128 = 1_375;
 
-/// Returns `floor(LN2_SCALED / H)`, where `H` is the network's NU7 halving interval.
+/// Returns `floor(LN2_SCALED / HalvingInterval(height))` for `network`.
+///
+/// Below NU7.1 the interval is NU7's, even for pre-NU7 heights. From NU7.1 it's ZIP 223's,
+/// `5/4` of NU7's, which gives 1,100 instead of 1,375 on Mainnet and keeps daily
+/// reissuance the same at 20 second spacing. Computing `LN2_SCALED * spacing /
+/// (PostBlossomHalvingInterval * 75)` keeps the interval exact for any configured
+/// post-Blossom interval.
 ///
 /// Returns an error if the interval would round the numerator to zero.
-pub fn block_subsidy_fraction_numerator(network: &Network) -> Result<u128, SubsidyError> {
-    let interval = u128::try_from(network.post_blossom_halving_interval())
+pub fn block_subsidy_fraction_numerator(
+    network: &Network,
+    height: Height,
+) -> Result<u128, SubsidyError> {
+    let spacing = if NetworkUpgrade::current(network, height) >= NetworkUpgrade::Nu7_1 {
+        POST_NU7_1_POW_TARGET_SPACING
+    } else {
+        POST_NU7_POW_TARGET_SPACING
+    };
+    let interval_blocks_times_spacing = u128::try_from(network.post_blossom_halving_interval())
         .map_err(|_| SubsidyError::InvalidReissuanceFraction)?
-        * u128::from(NU7_POW_TARGET_SPACING_RATIO);
-    LN2_SCALED
-        .checked_div(interval)
+        * u128::from(POST_BLOSSOM_POW_TARGET_SPACING);
+    (LN2_SCALED * u128::from(spacing))
+        .checked_div(interval_blocks_times_spacing)
         .filter(|numerator| *numerator > 0)
         .ok_or(SubsidyError::InvalidReissuanceFraction)
 }
@@ -653,7 +670,9 @@ pub(crate) fn nsm_reissuance_crossing_height(
         supply_before_first,
         subsidy,
         max_money,
-        block_subsidy_fraction_numerator(network)?,
+        // ZIP 223 leaves the trigger open for a second spacing change, so it keeps
+        // NU7's fraction until that's specified.
+        block_subsidy_fraction_numerator(network, nu7)?,
     )?
     .map(Height))
 }
@@ -758,9 +777,10 @@ pub fn parent_nsm_value_balance(
 fn reissuance_amount(
     amount: Amount<NonNegative>,
     network: &Network,
+    height: Height,
 ) -> Result<Amount<NonNegative>, SubsidyError> {
     let subsidy = amount_to_u128(amount)
-        .checked_mul(block_subsidy_fraction_numerator(network)?)
+        .checked_mul(block_subsidy_fraction_numerator(network, height)?)
         .ok_or(SubsidyError::Overflow)?
         .div_ceil(BLOCK_SUBSIDY_FRACTION_DENOMINATOR);
 
@@ -776,7 +796,7 @@ fn reissuance_amount(
 /// The halving schedule keeps issuing new ZEC. The bonus reissues value removed from
 /// circulation. This helper does not check the reissuance activation height;
 /// callers must gate its use and supply the balance from the actual parent.
-/// It uses the network's NU7 halving interval, even for a pre-activation balance.
+/// It uses the reissuance fraction at `height`, see [`block_subsidy_fraction_numerator`].
 /// A zero balance pays zero; a positive balance pays at least one zatoshi and
 /// never more than that balance.
 ///
@@ -787,8 +807,9 @@ fn reissuance_amount(
 pub fn reissuance_bonus(
     nsm_value_balance: Amount<NonNegative>,
     network: &Network,
+    height: Height,
 ) -> Result<Amount<NonNegative>, SubsidyError> {
-    reissuance_amount(nsm_value_balance, network)
+    reissuance_amount(nsm_value_balance, network, height)
 }
 
 /// Returns `ExpectedIssuedSupply(height)` from zips#1354: the total block subsidy the
@@ -949,7 +970,7 @@ pub fn block_subsidy(
         let nsm_value_balance = nsm_value_balance.ok_or(SubsidyError::MissingNsmValueBalance)?;
 
         let halving_subsidy = halving_block_subsidy(height, net)?;
-        let bonus = reissuance_bonus(nsm_value_balance, net)?;
+        let bonus = reissuance_bonus(nsm_value_balance, net, height)?;
 
         return Ok((halving_subsidy + bonus)?);
     }

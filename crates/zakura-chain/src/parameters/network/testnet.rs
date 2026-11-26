@@ -1305,7 +1305,8 @@ impl ParametersBuilder {
     pub fn to_network(self) -> Result<Network, ParametersBuilderError> {
         let network = self.to_network_unchecked();
         if NetworkUpgrade::Nu7.activation_height(&network).is_some() {
-            super::subsidy::block_subsidy_fraction_numerator(&network)
+            // The last upgrade has the longest halving interval and the smallest fraction.
+            super::subsidy::block_subsidy_fraction_numerator(&network, Height::MAX)
                 .map_err(|_| ParametersBuilderError::InvalidReissuanceFraction)?;
         }
 

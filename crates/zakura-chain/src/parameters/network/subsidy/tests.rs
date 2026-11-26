@@ -9,7 +9,7 @@ proptest::proptest! {
         for balance in [0, 1, MAX_MONEY - 1, MAX_MONEY, balance] {
             let product = u128::try_from(balance).unwrap() * 1_375;
             let expected = product / 10_000_000_000 + u128::from(!product.is_multiple_of(10_000_000_000));
-            let actual = reissuance_bonus(Amount::try_from(balance).unwrap(), &Network::Mainnet).unwrap();
+            let actual = reissuance_bonus(Amount::try_from(balance).unwrap(), &Network::Mainnet, Height::MAX).unwrap();
             proptest::prop_assert_eq!(u128::try_from(i64::from(actual)).unwrap(), expected);
             proptest::prop_assert!(i64::from(actual) <= balance);
         }
@@ -44,8 +44,61 @@ fn reissuance_fraction_matches_zebra_nu7_intervals() {
         (custom_network(840_000), 1_375),
         (custom_network(1_155_280_000), 1),
     ] {
-        assert_eq!(block_subsidy_fraction_numerator(&network), Ok(expected));
+        assert_eq!(
+            block_subsidy_fraction_numerator(&network, Height::MAX),
+            Ok(expected)
+        );
     }
+}
+
+/// Returns a network with Mainnet's halving interval, NU7 at 1 and NU7.1 at `nu7_1`.
+fn nu7_1_network(
+    interval: i64,
+    nu7_1: u32,
+) -> Result<Network, crate::parameters::network::error::ParametersBuilderError> {
+    use crate::parameters::testnet::{ConfiguredActivationHeights, Parameters};
+
+    Parameters::build()
+        .with_halving_interval(interval)?
+        .with_slow_start_interval(Height(0))
+        .with_activation_heights(ConfiguredActivationHeights {
+            nu7: Some(1),
+            nu7_1: Some(nu7_1),
+            ..Default::default()
+        })?
+        .clear_funding_streams()
+        .to_network()
+}
+
+/// ZIP 223 lowers the reissuance fraction from 1,375 to 1,100 at NU7.1, so daily
+/// reissuance stays the same: 3,456 blocks of 1,375 equal 4,320 blocks of 1,100.
+#[test]
+fn reissuance_fraction_changes_at_nu7_1() {
+    const NU7_1: u32 = 100;
+    let network = nu7_1_network(840_000, NU7_1).unwrap();
+    let balance = Amount::try_from(1_000_000_000_000_i64).unwrap();
+
+    for (height, numerator, bonus) in [
+        (NU7_1 - 1, 1_375, 137_500),
+        (NU7_1, 1_100, 110_000),
+        (NU7_1 + 1, 1_100, 110_000),
+    ] {
+        let height = Height(height);
+        assert_eq!(
+            block_subsidy_fraction_numerator(&network, height),
+            Ok(numerator)
+        );
+        assert_eq!(
+            i64::from(reissuance_bonus(balance, &network, height).unwrap()),
+            bonus
+        );
+    }
+
+    // This interval leaves NU7 a fraction of 1, which NU7.1's longer interval rounds to 0.
+    assert!(matches!(
+        nu7_1_network(1_155_280_000, NU7_1),
+        Err(crate::parameters::network::error::ParametersBuilderError::InvalidReissuanceFraction)
+    ));
 }
 
 #[test]
@@ -61,14 +114,16 @@ fn custom_reissuance_rounds_up_and_preserves_the_halving_interval() {
     ] {
         let product = i128::from(balance) * 8_022_777;
         let expected = (product + 9_999_999_999) / 10_000_000_000;
-        let bonus = reissuance_bonus(Amount::try_from(balance).unwrap(), &network).unwrap();
+        let bonus =
+            reissuance_bonus(Amount::try_from(balance).unwrap(), &network, Height::MAX).unwrap();
         assert_eq!(i128::from(i64::from(bonus)), expected);
         assert!(i64::from(bonus) <= balance);
     }
     let initial = Amount::try_from(10_000_000_000i64).unwrap();
     let mut remaining = initial;
     for _ in 0..864 {
-        remaining = (remaining - reissuance_bonus(remaining, &network).unwrap()).unwrap();
+        remaining =
+            (remaining - reissuance_bonus(remaining, &network, Height::MAX).unwrap()).unwrap();
     }
     assert!(i64::from(remaining).abs_diff(5_000_000_000) < 2_000_000);
 }
@@ -112,7 +167,7 @@ fn nu7_rejects_an_interval_that_rounds_the_fraction_to_zero() {
     // The legacy schedule still supports this interval without NU7.
     let network = builder.clone().to_network().unwrap();
     assert_eq!(
-        block_subsidy_fraction_numerator(&network),
+        block_subsidy_fraction_numerator(&network, Height::MAX),
         Err(SubsidyError::InvalidReissuanceFraction)
     );
     assert!(builder
@@ -148,7 +203,7 @@ fn mixed_network_height_194_reward_matches_zebra() {
     // The October 20 mixed-network run shared this parent balance at height 193.
     let balance = Amount::try_from(1_000_001_818_000i64).unwrap();
     assert_eq!(
-        i64::from(reissuance_bonus(balance, &network).unwrap()),
+        i64::from(reissuance_bonus(balance, &network, Height::MAX).unwrap()),
         802_279_159
     );
     assert_eq!(
@@ -170,7 +225,7 @@ proptest::proptest! {
         let network = custom_network(interval);
         let numerator = 6_931_680_000i128 / (i128::from(interval) * 6);
         let expected = (i128::from(balance) * numerator + 9_999_999_999) / 10_000_000_000;
-        let actual = reissuance_bonus(Amount::try_from(balance).unwrap(), &network).unwrap();
+        let actual = reissuance_bonus(Amount::try_from(balance).unwrap(), &network, Height::MAX).unwrap();
         proptest::prop_assert_eq!(i128::from(i64::from(actual)), expected);
         proptest::prop_assert!(i64::from(actual) <= balance);
         proptest::prop_assert!(balance == 0 || i64::from(actual) > 0);

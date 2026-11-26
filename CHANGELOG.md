@@ -102,6 +102,16 @@ independently.
   the gateways that recent blocks name, the connection places held for the
   best of them, how connection slots are used, and the node's v2 peers
   ([#2687](https://github.com/zakura-core/zakura/pull/2687)).
+- A pool can use `mining.miner_mesh_gateways` on its template node so that its
+  blocks announce the pool's public relay as its miner mesh gateway. The
+  relay keeps connection places for other pools' gateways when `miner_mesh`
+  is enabled. It can list its own template nodes in
+  `mining.miner_mesh_template_nodes` to reserve places within its peer memory
+  budget. Listed nodes can use those places after the normal handshake even
+  when ordinary inbound slots are full. `getminermeshinfo` reports the gateway
+  named in this node's coinbases in `announced_gateways` and marks listed
+  template nodes with `template_node`
+  ([#2759](https://github.com/zakura-core/zakura/pull/2759)).
 - Added opt-in BPv1 block propagation on the `zakura` and `dual` P2P stacks.
   A miner commits an erasure-coded part root in its coinbase, and nodes relay
   each verified part as it arrives instead of waiting for the whole body.

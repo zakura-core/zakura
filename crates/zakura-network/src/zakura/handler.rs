@@ -428,14 +428,12 @@ pub struct ZakuraConfig {
     /// decision-2). Never serialized under `[network.zakura]`.
     #[serde(skip)]
     pub memory_budget: super::memory::ResolvedMemoryBudget,
-    /// Removed: the QUIC-only peer memory budget. `[memory] budget` replaces it.
-    #[serde(
-        rename = "peer_memory_budget_bytes",
-        skip_serializing,
-        deserialize_with = "reject_peer_memory_budget_bytes"
-    )]
+    /// Deprecated and ignored: the QUIC-only peer memory budget that
+    /// `[memory] budget` replaces. Kept so older configs still load, and
+    /// `zakurad start` warns when it is set.
+    #[serde(rename = "peer_memory_budget_bytes", skip_serializing)]
     #[doc(hidden)]
-    pub removed_peer_memory_budget_bytes: RemovedSetting,
+    pub deprecated_peer_memory_budget_bytes: Option<u64>,
     /// Maximum established Zakura connections admitted from one source IP.
     ///
     /// A global unicast IPv6 source counts by its /64, since one host can hold
@@ -501,24 +499,6 @@ pub struct ZakuraConfig {
     pub dev_network: Option<String>,
 }
 
-/// The place of a removed setting in a config struct. Every value fails to
-/// deserialize, so a config that still sets the key fails to load.
-#[doc(hidden)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct RemovedSetting;
-
-/// Refuse `[network.zakura] peer_memory_budget_bytes` and name its
-/// replacement, `[memory] budget` (`02 §2`).
-fn reject_peer_memory_budget_bytes<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<RemovedSetting, D::Error> {
-    <serde::de::IgnoredAny as serde::Deserialize>::deserialize(deserializer)?;
-    Err(serde::de::Error::custom(
-        "[network.zakura] peer_memory_budget_bytes has been removed; \
-         configure [memory] budget instead",
-    ))
-}
-
 impl Default for ZakuraConfig {
     fn default() -> Self {
         Self {
@@ -531,7 +511,7 @@ impl Default for ZakuraConfig {
             quic: QuicConfig::default(),
             max_connections: None,
             memory_budget: super::memory::ResolvedMemoryBudget::default(),
-            removed_peer_memory_budget_bytes: RemovedSetting,
+            deprecated_peer_memory_budget_bytes: None,
             max_connections_per_ip: DEFAULT_ZAKURA_MAX_CONNS_PER_IP,
             max_pending_handshakes: DEFAULT_ZAKURA_MAX_PENDING_HANDSHAKES,
             stream_open_rate_per_second: DEFAULT_ZAKURA_STREAM_OPEN_RATE_PER_SECOND,

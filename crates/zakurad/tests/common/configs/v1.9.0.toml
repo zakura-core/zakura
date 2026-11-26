@@ -51,17 +51,6 @@ min_connected_peers = 1
 ready_max_blocks_behind = 2
 ready_max_tip_age = "5m"
 
-[memory]
-# "auto" (default): the tightest host or cgroup limit. Or a byte size: "16 GiB".
-budget = "auto"
-
-# Optional. Shares of the bulk pool when consumers contend. Default: equal.
-[memory.weight]
-block_sync = 1
-serving = 1
-sessions = 1
-tx = 1
-
 [mempool]
 eviction_memory_time = "1h"
 implementation = "default"
@@ -146,12 +135,12 @@ bootstrap_peers = [
     "ba06d75332e3a430d4e838b5838a2356338124cf2930bb0f8e2962e01223ed95@168.144.173.250:8234",
 ]
 listen_addr = "0.0.0.0:8234"
-# Connection policy cap (defaults to 256 when unset; funded by [memory] budget).
-# max_connections = 256
+max_connections = 92
 max_connections_per_ip = 16
 max_pending_handshakes = 32
 message_rate_per_second = 2048
 nat_traversal = false
+peer_memory_budget_bytes = 18253611008
 stream_open_rate_per_second = 32
 # Optional IP-to-name labels for peers in gossip traces.
 trace_peer_names = {}
@@ -170,6 +159,7 @@ keep_alive_interval_secs = 10
 kernel_drop_poll_secs = 10
 max_incoming = 65536
 mtu_discovery = true
+receive_window_bytes = 33554432
 recv_buffer_bytes = 7340032
 retry_threshold = 8
 send_buffer_bytes = 7340032
@@ -223,4 +213,3 @@ shutdown_grace_period = "5m"
 startup_delay = "1s"
 zcashd_extra_args = []
 zcashd_source = "path"
-

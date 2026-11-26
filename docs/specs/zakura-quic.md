@@ -1146,8 +1146,10 @@ IPv6 /64, ADM-3), `max_pending_handshakes` (32), `stream_open_rate_per_second`,
 `message_rate_per_second` and the handshake's `max_open_streams`.
 `max_connections` becomes optional: it is a ceiling on admitted connections,
 256 when unset, and memory decides how many of them the node funds (CTRL-26).
-`peer_memory_budget_bytes` is removed. A config that sets it fails to load,
-and the error names `[memory] budget`, which replaces it.
+`peer_memory_budget_bytes` is deprecated and ignored. A config that sets it
+still loads, and `zakurad start` warns that `[memory] budget` replaces it.
+An old generated `[network.zakura.quic] receive_window_bytes = 33554432`
+reads as unset, so those nodes also get the small handshake windows.
 
 - **CTRL-26.** One node-wide memory budget funds every v2 P2P term, not only
   the QUIC windows. `[memory] budget` sets it, and its default `"auto"` reads

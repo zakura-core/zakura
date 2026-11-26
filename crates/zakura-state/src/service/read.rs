@@ -61,7 +61,7 @@ pub use tree::{
     sapling_tree,
 };
 
-#[cfg(any(test, feature = "proptest-impl"))]
+#[cfg(test)]
 #[allow(unused_imports)]
 pub use address::utxo::ADDRESS_HEIGHTS_FULL_RANGE;
 

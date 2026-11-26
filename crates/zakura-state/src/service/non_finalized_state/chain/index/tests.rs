@@ -433,6 +433,23 @@ fn block_index_records_each_address_transfers() {
         chain.partial_transparent_tx_ids(&HashSet::from([spender]), Height(0)..=Height::MAX),
         [(TransactionLocation::from_usize(height, 1), spending_hash)].into()
     );
+
+    // Hashes are found by location alone, without going through an address index.
+    assert_eq!(
+        chain.transaction_hash_by_loc(TransactionLocation::from_usize(height, 1)),
+        Some(spending_hash)
+    );
+    let transaction_count = block.transactions.len();
+    assert_eq!(
+        chain.transaction_hash_by_loc(TransactionLocation::from_usize(height, transaction_count)),
+        None
+    );
+    let missing_height =
+        (chain.non_finalized_tip_height() + 1).expect("the tip is below the maximum height");
+    assert_eq!(
+        chain.transaction_hash_by_loc(TransactionLocation::from_usize(missing_height, 0)),
+        None
+    );
 }
 
 #[test]

@@ -891,13 +891,13 @@ fn a_default_nodes_record_grows_by_the_key_and_signature() {
     assert_eq!(2 + 32 * 5_630, 180_162);
 
     // A node accepts that answer and does not send it: what it serves stops
-    // at 24,098 bytes, which is 4 of these records where it was all 32.
+    // at 67,562 bytes, which is 12 of these records where it was all 32.
     let served = |records: Vec<ZakuraNodeRecord>| {
         let served = records_within(records, served_peers_cap(32).bytes);
         (served.len(), peers(served))
     };
     assert_eq!(served(records(false)), (32, 11_554));
-    assert_eq!(served(records(true)), (4, 22_522));
+    assert_eq!(served(records(true)), (12, 67_562));
 
     // A full book file: 256 entries, each a record and the dial history of
     // a peer this node dialed once at the record's one address.

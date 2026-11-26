@@ -351,20 +351,14 @@ What a node accepts and what it sends differ for `Peers`. A node MUST accept a `
 row's cap, 307,234 bytes. It MUST NOT send one above `SERVED_PEERS_MAX`:
 
 ```text
-SERVED_PEERS_MAX             = 24,098 bytes
+SERVED_PEERS_MAX             = 67,562 bytes
 ```
 
-That is 2 bytes and 32 records of 753, a full answer of records with the largest fields and no
-extension while a key list held 4 entries. The value is fixed and does not follow
-`NODE_RECORD_FIELDS_MAX`, which grew with `MAX_NODE_KEYS`. When the sampled records exceed it,
-the answer carries the first of them that fit, which is fewer than the request's limit and always
-allowed. The exchange deadlines of a discovery-only connection assume an answer of about this
-size, so a node whose book holds records with full extension areas still answers in time.
-
-Every record now carries 5,269 bytes of key and signature, so the cap decides how many records an
-answer holds: 4 of a default node's 5,630-byte record, and 2 of the largest. A requester that
-asks for 32 gets the rest in later answers, 15 seconds apart, as it excludes the records it has.
-A discovery-only connection makes one exchange and gets one answer.
+The budget includes the two-byte count and twelve default signed records of 5,630 bytes each.
+Seven maximum-sized records fit. The responder sends the longest prefix of the sample that fits
+both the request and this byte budget. A discovery-only connection can return that sample in
+one exchange. On shared connections, a requester can ask again after 15 seconds and exclude
+records it has stored.
 
 #### `Hello` — Announcement, discriminator 1
 

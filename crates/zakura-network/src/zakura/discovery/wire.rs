@@ -88,29 +88,13 @@ const fn peers_bytes(records: usize) -> usize {
     2 + records * MAX_NODE_RECORD_BYTES
 }
 
-/// The largest `Peers` payload this node sends: 2 bytes and 32 records of
-/// 753, which was a full answer of records with the largest fields and no
-/// extension while a key list held 4 entries.
-///
-/// It is below [`PEERS_MAX_BYTES`], the largest `Peers` this node accepts.
-/// The room a record keeps for a second signature makes the accepted size
-/// more than ten times larger, and any node can fill that room in its own
-/// records. Without this cap a node whose book holds such records would
-/// send answers that a requester on a slow path can't finish reading before
-/// its exchange deadlines. An answer that reaches the cap carries fewer
-/// records than the request's limit, which is always allowed.
-///
-/// Every record carries an ML-DSA-65 key and signature in its extension
-/// area, so every full sample reaches the cap: an answer holds 4 of a
-/// default node's 5,630-byte record, and 2 of the largest.
-///
-/// The stream's frame cap and the serving pools still follow
-/// [`PEERS_MAX_BYTES`]: one frame cap covers both directions, and each
-/// share has to hold a frame of that size.
-pub(crate) const SERVED_PEERS_MAX_BYTES: usize = 24_098;
+/// Outgoing payload budget for the two-byte count and twelve default signed
+/// records (one IPv4 address and seven services). The byte budget also bounds
+/// replies containing larger records. Incoming frames and serving pools use
+/// [`PEERS_MAX_BYTES`], the protocol limit for 32 maximum-sized records.
+pub(crate) const SERVED_PEERS_MAX_BYTES: usize = 2 + 12 * 5_630;
 
-// Two maximum-sized signed records fit in one served answer.
-const _: () = assert!(2 + 2 * MAX_NODE_RECORD_BYTES <= SERVED_PEERS_MAX_BYTES);
+const _: () = assert!(peers_bytes(7) <= SERVED_PEERS_MAX_BYTES);
 
 /// The most a `Peers` answer to a `GetPeers` with `limit` may carry: one frame
 /// with at most `limit` records.

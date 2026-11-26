@@ -6449,19 +6449,17 @@ mod tests {
         .expect("the sample fits one Peers message");
         assert_eq!(encoded.len() - 1, super::super::wire::PEERS_MAX_BYTES);
 
-        // The node accepts that message and sends a smaller one: the answer
-        // it serves from the same sample stops at what a `Peers` could be
-        // before records kept room for a second signature.
+        // Seven maximum-sized records fit within the outgoing byte budget.
         use super::super::wire::{records_within, served_peers_cap, SERVED_PEERS_MAX_BYTES};
-        assert_eq!(SERVED_PEERS_MAX_BYTES, 24_098);
+        assert_eq!(SERVED_PEERS_MAX_BYTES, 67_562);
         let cap = served_peers_cap(32);
-        assert_eq!(cap.bytes, 24_098);
+        assert_eq!(cap.bytes, 67_562);
         let served = records_within(sample.clone(), cap.bytes);
-        assert_eq!(served, sample[..2], "two of the largest records fit");
+        assert_eq!(served, sample[..7], "seven of the largest records fit");
         let encoded = DiscoveryMessage::Peers { records: served }
             .encode()
             .expect("the served answer encodes");
-        assert_eq!(encoded.len() - 1, 2 + 2 * MAX_NODE_RECORD_BYTES);
+        assert_eq!(encoded.len() - 1, 2 + 7 * MAX_NODE_RECORD_BYTES);
         // A request for one record is owed one, and no cap leaves room for
         // a record that doesn't fit.
         assert_eq!(served_peers_cap(1).bytes, 2 + MAX_NODE_RECORD_BYTES as u64);
@@ -6474,19 +6472,19 @@ mod tests {
 
     /// Every record carries an ML-DSA-65 key and signature, so a full
     /// sample of records with no other extension is past the served cap,
-    /// and an answer carries the first four.
+    /// and an answer carries the first twelve.
     #[test]
-    fn a_full_sample_of_signed_records_is_served_four_at_a_time() {
+    fn a_full_sample_of_signed_records_is_served_twelve_at_a_time() {
         use super::super::wire::{records_within, served_peers_cap, SERVED_PEERS_MAX_BYTES};
 
         let records: Vec<_> = (1..=32u8)
             .map(|index| signed_record_with(1, service(1), test_addr(index)))
             .collect();
         let record_bytes = record_len(&records[0]);
-        assert_eq!((SERVED_PEERS_MAX_BYTES - 2) / record_bytes, 4);
+        assert_eq!((SERVED_PEERS_MAX_BYTES - 2) / record_bytes, 12);
         assert_eq!(
             records_within(records.clone(), served_peers_cap(32).bytes),
-            records[..4]
+            records[..12]
         );
         // Without the key and signature all 32 fit, as they did before
         // records were signed with ML-DSA-65.

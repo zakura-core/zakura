@@ -303,15 +303,15 @@ services. The figures come from the encoders, in the test
 |---|---|---|
 | A default node's record, and its `Hello` payload | 361 B | 5,630 B |
 | A full sample of 32 such records | 11,554 B | 180,162 B |
-| The `Peers` answer a node sends for it | 11,554 B, 32 records | 22,522 B, 4 records |
+| The `Peers` answer a node sends for it | 11,554 B, 32 records | 67,562 B, 12 records |
 | The largest record | 9,601 B | 9,601 B |
-| The largest `Peers` a node accepts, and sends | 307,234 B, 24,098 B | 307,234 B, 24,098 B |
+| The largest `Peers` a node accepts, and sends | 307,234 B, 24,098 B | 307,234 B, 67,562 B |
 | A full book file of 256 such records | 113,162 B | 1,462,026 B |
 | The largest book file | 2,585,610 B | 2,585,610 B |
 | The records of a full book of 10,000 | 3.6 MB | 56.3 MB |
 
-No limit moves. The served `Peers` cap of 24,098 bytes was sized as 32
-records without extensions, so it now holds 4 records.
+The outgoing byte budget now fits twelve default signed records or seven
+maximum-sized records. The receive limit remains 307,234 bytes.
 
 ### 7.2 CPU
 
@@ -361,15 +361,12 @@ connections would cost 2.99 GB per day in each direction. The older 361-byte
 record at that cadence cost 0.20 GB. These are application-frame estimates
 for continuously occupied connections and exclude transport overhead.
 
-With a 24,098-byte outgoing payload limit, a full reply of four default
-records costs 22,530 bytes with framing. At one such reply every 15 seconds
-on 92 connections, this is 138.2 kB/s in the sending direction. Sending one
-full 32-record sample to each peer every ten minutes costs about 27.6 kB/s.
-
-A requester gets four default records per answer. One peer's 32-record window
-takes at least 8 answers, 105 seconds after the first: a requester excludes
-only the records it stored, so one it discards can be served again. A
-discovery-only connection, which makes one exchange, yields 4 records.
+A full reply of twelve default records costs 67,570 bytes with framing. If
+all 92 peers receive a full reply every 15 seconds, the node sends 414.4 kB/s
+in peer-list replies. One 32-record window per peer every ten minutes costs
+about 27.6 kB/s. With twelve records per reply, that window takes at least
+three exchanges, or 30 seconds after the first reply, assuming each exchange
+returns new records. A discovery-only connection offers one exchange.
 
 ### 7.4 Cold discovery
 
@@ -407,15 +404,35 @@ All twelve reached four.
 | 96,000 B | 31.3 s | 238 kB |
 | 192,000 B | 32.3 s | 238 kB |
 
-The outgoing cap stays at 24,098 bytes. Larger replies delivered more
+In this initial comparison, larger replies delivered more
 addresses on the first exchange, but used more bytes without a consistent
 improvement in registration time. These small local samples cover one
 topology. They do not estimate bootstrap latency on Mainnet.
 
-Discovery-only seeds need separate qualification. At the existing cap, the
+A follow-up compared the original four-record budget with exactly twelve
+default records on the same paced seed path. Each cell is the median of five
+fresh requesters, all of which registered four non-seed peers within 75 seconds.
+Traffic includes sent and received discovery frames through the fourth registration.
+
+| Default records per reply | All reachable: time / traffic | Half stale: time / traffic | Reachable records in first reply, half stale |
+|---|---:|---:|---:|
+| 4 (24,098 B) | 1.21 s / 46.4 kB | 16.2 s / 96.2 kB | 1–4 |
+| 12 (67,562 B) | 1.21 s / 80.2 kB | 11.2 s / 116.1 kB | 4–8 |
+
+With half the addresses stale, individual times ranged from 1.2 to 56.3 s
+for four records and from 1.2 to 51.3 s for twelve. The reason to spend
+the extra bytes is the larger first sample: in these trials the requester
+always had at least four reachable candidates after one twelve-record reply.
+The overlapping times give limited evidence for a latency improvement.
+
+Discovery-only seeds need separate qualification. At the previous 24,098-byte cap, the
 seed offered four records per full answer. With all candidates reachable,
 both unrestricted controls decoded a four-record answer, while neither of
 the two bandwidth-limited controls decoded a nonempty answer. None registered
 a non-seed peer within 20 seconds. These observations do not establish where
 delivery or import stopped. The shared-connection results above apply to a
 seed that stays connected across exchanges.
+
+A separate paced discovery-only trial at the twelve-record
+cap also registered no non-seed peer within 75 seconds with all candidates
+reachable. The requester decoded no nonempty peer list in that trial.

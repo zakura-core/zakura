@@ -1985,10 +1985,7 @@ mod tests {
         Ok(())
     }
 
-    /// A node sends no larger a `Peers` than it could before records kept
-    /// room for a second signature, however large the records in its book
-    /// are. Four confirmed records that fill their extension room would
-    /// make a 32 KB answer. The requester gets the two that fit.
+    /// The service returns the longest prefix of the sample that fits its byte budget.
     #[tokio::test]
     async fn a_peers_answer_stays_within_the_served_size() -> Result<(), crate::BoxError> {
         use crate::zakura::discovery::{
@@ -2013,8 +2010,8 @@ mod tests {
             connected_rx,
         )?;
         let relay = NodeSecretKey::from_bytes(&[59u8; 32]).public();
-        let mut largest = 0;
-        for seed in 60..64u8 {
+        let mut record_bytes = 0;
+        for seed in 60..72u8 {
             let author = NodeSecretKey::from_bytes(&[seed; 32]);
             let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(45, 33, 30, seed)), 8233);
             let mut body = signed_discovery_record(&author, &handshake)?.body;
@@ -2027,7 +2024,7 @@ mod tests {
                 .extend_from_slice(&u16::try_from(unknown - 4)?.to_le_bytes());
             body.extensions.resize(unknown, 0);
             let record = ZakuraNodeRecord::sign(body, &author)?;
-            largest = encode_frame(&DiscoveryMessage::Hello {
+            record_bytes = encode_frame(&DiscoveryMessage::Hello {
                 record: record.clone(),
             })?
             .payload
@@ -2036,7 +2033,8 @@ mod tests {
             handle.import_peer_records([record], Some(relay)).await?;
             handle.mark_dial_success(&node_id, Some(addr)).await;
         }
-        assert!(2 + 3 * largest > SERVED_PEERS_MAX_BYTES, "three don't fit");
+        let expected = (SERVED_PEERS_MAX_BYTES - 2) / record_bytes;
+        assert!(expected < 12, "the full sample must exceed the byte budget");
 
         let peer_node_id = NodeSecretKey::from_bytes(&[55u8; 32]).public();
         let peer_id = ZakuraPeerId::new(peer_node_id.as_bytes().to_vec())?;
@@ -2066,7 +2064,7 @@ mod tests {
         let DiscoveryMessage::Peers { records } = decode_frame::<DiscoveryMessage>(&frame)? else {
             panic!("a GetPeers is answered with a Peers");
         };
-        assert_eq!(records.len(), 2);
+        assert_eq!(records.len(), expected);
         Ok(())
     }
 

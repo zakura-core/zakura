@@ -954,16 +954,17 @@ impl EarlyDataKind {
     }
 
     /// Bytes charged to the early record: a part's payload, or a `Have`'s
-    /// frame or decoded indices, whichever is larger. A bitmap byte decodes
-    /// to up to eight `u32` indices (decision-33), so the frame alone
-    /// undercounts what the record holds.
+    /// frame or its block id plus decoded indices, whichever is larger. A
+    /// bitmap byte decodes to up to eight `u32` indices (decision-33), so the
+    /// frame alone undercounts what the record holds.
     fn held_bytes(&self) -> usize {
         match self {
             Self::Part(prefix) => prefix.payload.len(),
             Self::Have(have) => have.frame_bytes.max(
                 have.indices
                     .len()
-                    .saturating_mul(std::mem::size_of::<u32>()),
+                    .saturating_mul(std::mem::size_of::<u32>())
+                    .saturating_add(std::mem::size_of::<block::Hash>()),
             ),
         }
     }

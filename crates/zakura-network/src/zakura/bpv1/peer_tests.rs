@@ -339,9 +339,11 @@ fn scenario_early_record_full_pauses_data_only_and_replays_on_admission() {
     let PeerInput::RecvHave(RecvHave { frame_bytes, .. }) = &flag else {
         unreachable!("have_with builds a Have");
     };
-    // The record holds exactly the seeds' flagged `Have` and two part frames.
+    // The record holds exactly the seeds' flagged `Have` (charged its id plus
+    // two `u32` indices) and two part frames.
+    let have_bytes = (*frame_bytes).max(32 + 2 * std::mem::size_of::<u32>());
     config.early_peer_bytes_cap =
-        frame_bytes + part_frame(&coding, 0).len() + part_frame(&coding, 1).len();
+        have_bytes + part_frame(&coding, 0).len() + part_frame(&coding, 1).len();
     let mut peer = PeerState::new(config, node_id(2), 1);
     let t0 = Instant::now();
 
@@ -1671,6 +1673,34 @@ fn bpv1_48_early_record_charges_a_have_its_decoded_indices() {
         held_bytes <= cap,
         "the early record holds {held_bytes} index bytes past its {cap}-byte cap"
     );
+}
+
+/// bpv1-48 / decision-33: a held `Have` also keeps its block id, so a
+/// one-byte bitmap naming eight parts costs the id plus eight `u32`s, not
+/// its 34-byte frame.
+#[test]
+fn bpv1_48_early_record_charges_a_have_its_block_id() {
+    let mut peer = PeerState::new(PeerConfig::for_profile(Profile::TINY), node_id(3), 1);
+    let step = peer.step(
+        Instant::now(),
+        PeerInput::RecvHave(RecvHave {
+            block_id: block::Hash([0x6B; 32]),
+            flags: HaveFlags::Plain,
+            form: HaveForm::Bitmap { len: 1 },
+            frame_bytes: 34,
+            indices: (0..8).collect(),
+        }),
+    );
+    let held: Vec<usize> = step
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            PeerEvent::EarlyHeld { bytes, .. } => Some(*bytes),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(held, [32 + 8 * std::mem::size_of::<u32>()]);
+    peer.assert_invariants();
 }
 
 /// bpv1-60 / bpv1-14: the holder's flagged `Have` ages out of the early

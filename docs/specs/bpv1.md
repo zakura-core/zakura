@@ -576,10 +576,10 @@ the peer is lying. The receiver cannot yet check such a message.
 - On the data stream, the receiver holds `Part` and `Have` messages in a
   per-peer early record, with a byte bound per peer, a node-wide byte bound, and
   an age bound `EARLY_AGE`. The byte bounds count what the receiver holds: a
-  held `Have` costs its frame or its decoded indices, whichever is larger,
-  because a bitmap byte names up to eight indices. When a peer's record is
-  full, the receiver pauses reading that peer's data stream until entries leave
-  the record. Pausing is not a violation.
+  held `Have` costs its frame, or its block id plus its decoded indices,
+  whichever is larger, because a bitmap byte names up to eight indices. When a
+  peer's record is full, the receiver pauses reading that peer's data stream
+  until entries leave the record. Pausing is not a violation.
 - On the control stream, the receiver MAY hold `StripeDone`, `BlockDone`, and
   `Advert` in a separate small per-peer record. It MUST NOT pause the control
   stream for this record, because the metadata that resolves the block can sit

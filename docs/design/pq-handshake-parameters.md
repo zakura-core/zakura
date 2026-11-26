@@ -435,9 +435,15 @@ seed’s reply while QUIC was delivering it or the requester was verifying it.
 At the twelve-record cap, a cold requester previously registered no other
 peers in 75 seconds on the paced link, even with all 32 candidates reachable.
 
-The dialer now closes after importing the reply. The listener allows up to
-two seconds for this after its own initial exchange. In five local Regtest
+The first close fix gave the listener a two-second grace period. In five local Regtest
 trials per link, the requester retained all twelve advertised records and
 registered four peers in 1.014–1.019 seconds on loopback and 1.203–1.207 seconds
 with a 1 Mbit/s downlink and 40 ms of added downlink latency. With the old
 close behavior, all four matching eight-second controls retained zero records.
+
+Both endpoints now allow eight seconds from the start of a discovery-only exchange.
+A 67,562-byte payload alone needs 4.22 seconds at 128 kbit/s. With that downlink
+and 40 ms of added delay, five fresh Regtest requesters each imported all twelve
+records from the seed before starting their candidate dialer, then connected to
+four non-seed peers. An empty peer list also completes the query. A silent peer
+uses at most one exchange budget before its session slot is released.

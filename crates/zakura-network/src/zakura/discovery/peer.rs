@@ -25,14 +25,16 @@ use std::{sync::Arc, time::Duration};
 
 use zakura_quic::NodeId;
 use zakura_rt::sync::{CancellationToken, Mutex, MutexGuard, Notify, PoisonError};
+use zakura_rt::time::Instant;
 
+#[cfg(test)]
+pub(super) use state::ExchangeProgress;
 #[cfg(any(test, zakura_sim))]
 pub use state::DISCOVERY_INITIAL_EXCHANGE_TIMEOUT;
+pub(super) use state::DISCOVERY_ONLY_EXCHANGE_BUDGET;
 use state::{
     Close, CloseReason, InitialWait, Ownership, PeerInput, PeerOutput, PeerState, SessionCharge,
 };
-#[cfg(test)]
-pub(super) use state::{ExchangeProgress, DISCOVERY_ANSWER_WRITE_DEADLINE};
 
 use super::{
     protocol::{DiscoveryMessage, GetServices, ZakuraDiscoveryHandle, ZakuraNodeRecord},
@@ -133,27 +135,44 @@ pub(super) struct PeerIO {
 impl PeerIO {
     /// Runs the session's steps until the state ends the session.
     pub(super) async fn run(mut self) {
+        let mut exchange_started = Instant::now();
         let mut step = self.state.lock().start();
         loop {
             if let Some(charge) = step.charge {
                 self.charge(charge);
             }
             let input = match step.next {
-                PeerOutput::Exchange => PeerInput::Exchanged {
-                    sent: self.exchange().await.is_ok(),
-                },
-                PeerOutput::WaitInitial { timeout } => {
-                    PeerInput::InitialWaitEnded(self.wait_initial(timeout).await)
+                PeerOutput::Exchange => {
+                    match zakura_rt::time::timeout(DISCOVERY_ONLY_EXCHANGE_BUDGET, self.exchange())
+                        .await
+                    {
+                        Ok(result) => PeerInput::Exchanged {
+                            sent: result.is_ok(),
+                        },
+                        Err(_) => {
+                            self.queries.retract_unsent();
+                            PeerInput::ExchangeDeadline
+                        }
+                    }
                 }
+                PeerOutput::WaitInitial { timeout } => PeerInput::InitialWaitEnded(
+                    self.wait_initial(timeout.min(
+                        DISCOVERY_ONLY_EXCHANGE_BUDGET.saturating_sub(exchange_started.elapsed()),
+                    ))
+                    .await,
+                ),
                 PeerOutput::CheckCurrentSession => PeerInput::CurrentSession {
                     current: self.handle.is_current_session(&self.slot.key).await,
                 },
                 PeerOutput::CheckSoleOwner => PeerInput::Owners(self.owners().await),
-                PeerOutput::Refresh { interval } => PeerInput::Refreshed {
-                    sent: self.refresh_after(interval).await,
-                },
+                PeerOutput::Refresh { interval } => {
+                    let sent = self.refresh_after(interval).await;
+                    exchange_started = Instant::now();
+                    PeerInput::Refreshed { sent }
+                }
                 PeerOutput::WaitForAnswers { deadline } => {
-                    self.wait_for_answers(deadline).await;
+                    self.wait_for_answers(deadline.saturating_sub(exchange_started.elapsed()))
+                        .await;
                     PeerInput::AnswersSettled
                 }
                 PeerOutput::MarkShortLived => {
@@ -238,7 +257,7 @@ impl PeerIO {
     async fn answers_settled(&self) {
         loop {
             self.answers.wait().await;
-            self.queries.answers_settled().await;
+            self.queries.answers_settled(true).await;
             if self.answers.is_written() {
                 return;
             }

@@ -547,7 +547,7 @@ async fn a_claimed_answer_holds_its_entry_and_kind_until_it_settles() {
 /// Spawns `answers_settled` and checks that something holds it.
 async fn held_settled_wait(queries: &Queries) -> zakura_rt::task::JoinHandle<()> {
     let waiting = queries.clone();
-    let settled = zakura_rt::task::spawn(async move { waiting.answers_settled().await });
+    let settled = zakura_rt::task::spawn(async move { waiting.answers_settled(false).await });
     zakura_rt::task::yield_now().await;
     assert!(!settled.is_finished(), "the hold keeps the wait open");
     settled
@@ -597,9 +597,12 @@ async fn answers_settled_waits_for_a_claimed_answer_only() {
         .send_get_services(get_services(Vec::new()))
         .await
         .unwrap();
-    zakura_rt::time::timeout(std::time::Duration::from_secs(5), queries.answers_settled())
-        .await
-        .expect("an unanswered query holds nothing");
+    zakura_rt::time::timeout(
+        std::time::Duration::from_secs(5),
+        queries.answers_settled(false),
+    )
+    .await
+    .expect("an unanswered query holds nothing");
 
     let answer = queries.claim(PEERS, peers_len(1)).unwrap().unwrap();
     let settled = held_settled_wait(&queries).await;
@@ -653,7 +656,7 @@ async fn answers_settled_sees_a_claim_that_takes_the_queued_frame() {
     let mut live = queries.lock();
     let waiting = queries.clone();
     let settled =
-        std::thread::spawn(move || futures::executor::block_on(waiting.answers_settled()));
+        std::thread::spawn(move || futures::executor::block_on(waiting.answers_settled(false)));
     // Let the wait reach the lock this test holds.
     std::thread::sleep(std::time::Duration::from_millis(100));
     let answer = queries

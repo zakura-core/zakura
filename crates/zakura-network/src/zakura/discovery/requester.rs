@@ -560,6 +560,17 @@ impl Queries {
         Err(QueryUnsent::Closed)
     }
 
+    /// Releases reservations for initial writes cancelled by the exchange deadline.
+    /// A sibling service may keep the stream alive for the next refresh.
+    pub(super) fn retract_unsent(&self) {
+        let mut live = self.lock();
+        for kind in QUERY_KINDS {
+            if live.state.release_unsent(kind) {
+                live.reservations.retract(&kind);
+            }
+        }
+    }
+
     /// Claims the live query that a `message_type` frame of `payload_len`
     /// bytes answers, before its payload is decoded. Returns the claimed
     /// answer, which keeps the query's resources until it drops, or `None` if
@@ -647,15 +658,18 @@ impl Queries {
     /// Resolves once this session holds nothing it read and has not processed:
     /// no claimed answer, no `Hello` in verification, no frame the reader
     /// received and has not judged, and no answer the transport reader queued.
-    /// An unanswered query does not hold it, so a silent peer costs no wait.
-    pub(super) async fn answers_settled(&self) {
+    /// A closing dialer also waits for its pending peer list, including one
+    /// whose first byte has yet to arrive. The connection deadline bounds that wait.
+    pub(super) async fn answers_settled(&self, wait_for_peers: bool) {
         let mut settling = self.settling.subscribe();
         loop {
             let settled = {
                 let live = self.lock();
                 // A claim takes the queued frame and counts its answer under
                 // this lock, so the two reads see one ledger.
-                settling.borrow_and_update().is_empty() && !live.reservations.has_queued()
+                settling.borrow_and_update().is_empty()
+                    && !live.reservations.has_queued()
+                    && !(wait_for_peers && live.state.live.contains_key(&QueryKind::Peers))
             };
             if settled {
                 return;

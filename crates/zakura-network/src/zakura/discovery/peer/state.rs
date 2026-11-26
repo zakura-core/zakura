@@ -19,10 +19,10 @@ const _: () = assert!(SEND_INTERVAL.as_secs() <= DEFAULT_LIVE_SERVICE_SUMMARY_TT
 
 /// Maximum time discovery waits for first-party exchange responses before releasing the session.
 pub const DISCOVERY_INITIAL_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(2);
-/// Bounds the final wait on a discovery-only connection. The dialer drains
-/// admitted work; the listener gives the dialer time to import its reply and close.
-pub(in crate::zakura::discovery) const DISCOVERY_ANSWER_WRITE_DEADLINE: Duration =
-    Duration::from_secs(2);
+/// Total time for a discovery-only exchange, including writing the initial queries,
+/// transferring the reply, and importing it before the connection closes.
+pub(in crate::zakura::discovery) const DISCOVERY_ONLY_EXCHANGE_BUDGET: Duration =
+    Duration::from_secs(8);
 
 /// The parts of the initial exchange that this session has processed.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -126,6 +126,8 @@ pub(super) enum PeerOutput {
 pub(super) enum PeerInput {
     /// [`PeerOutput::Exchange`] ran. `sent` is false once the session is gone.
     Exchanged { sent: bool },
+    /// The initial writes consumed the exchange budget.
+    ExchangeDeadline,
     /// [`PeerOutput::WaitInitial`] ended.
     InitialWaitEnded(InitialWait),
     /// [`PeerOutput::CheckCurrentSession`] found the session `current` or not.
@@ -233,6 +235,10 @@ impl PeerState {
                     timeout: DISCOVERY_INITIAL_EXCHANGE_TIMEOUT,
                 })
             }
+            (Phase::Exchanging, PeerInput::ExchangeDeadline) => {
+                self.phase = Phase::CheckingInitial { completed: false };
+                PeerStep::then(PeerOutput::CheckCurrentSession)
+            }
             (Phase::Exchanging, PeerInput::Exchanged { sent: false })
             | (Phase::WaitingInitial, PeerInput::InitialWaitEnded(InitialWait::Cancelled))
             | (Phase::CheckingInitial { .. }, PeerInput::CurrentSession { current: false }) => {
@@ -273,7 +279,7 @@ impl PeerState {
                 // exchange would end without it.
                 self.phase = Phase::AwaitingAnswers;
                 PeerStep::then(PeerOutput::WaitForAnswers {
-                    deadline: DISCOVERY_ANSWER_WRITE_DEADLINE,
+                    deadline: DISCOVERY_ONLY_EXCHANGE_BUDGET,
                 })
             }
             (Phase::Refreshing, PeerInput::Refreshed { sent: true }) => {

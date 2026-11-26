@@ -400,7 +400,7 @@ impl SettlementSession {
             || self.hello.is_some()
             || self.live.values().any(|query| query.delivered.is_some());
         assert_eq!(
-            self.queries.answers_settled().now_or_never().is_none(),
+            self.queries.answers_settled(false).now_or_never().is_none(),
             holds,
             "{SETTLEMENT}: the close wait disagrees with what the session holds"
         );

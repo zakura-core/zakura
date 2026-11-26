@@ -999,8 +999,8 @@ mod tests {
     use super::*;
     use crate::zakura::block_sync::BlockSyncService;
     use crate::zakura::discovery::peer::{
-        peer_has_other_service_owner, DISCOVERY_ANSWER_WRITE_DEADLINE,
-        DISCOVERY_INITIAL_EXCHANGE_TIMEOUT,
+        peer_has_other_service_owner, DISCOVERY_INITIAL_EXCHANGE_TIMEOUT,
+        DISCOVERY_ONLY_EXCHANGE_BUDGET,
     };
     use crate::zakura::discovery::protocol::{
         DiscoveryServiceSummary, GetPeers, GetServices, ServiceSummaryEnvelope,
@@ -1547,7 +1547,7 @@ mod tests {
             .await?;
         assert!(
             tokio::time::timeout(
-                DISCOVERY_ANSWER_WRITE_DEADLINE / 2,
+                DISCOVERY_ONLY_EXCHANGE_BUDGET / 2,
                 connection_cancel.cancelled()
             )
             .await
@@ -1555,7 +1555,7 @@ mod tests {
             "finishing the listener’s own exchange must leave the dialer time to import"
         );
         tokio::time::timeout(
-            DISCOVERY_ANSWER_WRITE_DEADLINE,
+            DISCOVERY_ONLY_EXCHANGE_BUDGET,
             connection_cancel.cancelled(),
         )
         .await
@@ -1577,6 +1577,7 @@ mod tests {
     async fn discovery_only_peer_awaiting_services(
         seed: u8,
         capacity: usize,
+        reply_delay: Duration,
     ) -> Result<(CancellationToken, FramedSend, FramedRecv), crate::BoxError> {
         let (connected_tx, connected_rx) = watch::channel(Vec::new());
         let handshake = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
@@ -1628,6 +1629,7 @@ mod tests {
                 },
             ))?)
             .await?;
+        tokio::time::sleep(reply_delay).await;
         answer_discovery_exchange(&peer_send, &peer_secret, &handshake).await?;
         Ok((connection_cancel, peer_send, peer_recv))
     }
@@ -1635,9 +1637,10 @@ mod tests {
     /// A completed exchange closes its discovery-only connection only after
     /// the peer's admitted `Services` answer is written.
     #[tokio::test]
-    async fn discovery_only_close_waits_for_an_unwritten_answer() -> Result<(), crate::BoxError> {
+    async fn a_late_empty_peer_list_closes_as_soon_as_the_local_answer_is_written(
+    ) -> Result<(), crate::BoxError> {
         let (connection_cancel, _peer_send, mut peer_recv) =
-            discovery_only_peer_awaiting_services(44, 3).await?;
+            discovery_only_peer_awaiting_services(44, 3, Duration::from_secs(4)).await?;
         assert!(
             tokio::time::timeout(Duration::from_millis(200), connection_cancel.cancelled())
                 .await
@@ -1667,15 +1670,15 @@ mod tests {
     async fn discovery_only_close_waits_at_most_the_answer_deadline() -> Result<(), crate::BoxError>
     {
         let (connection_cancel, _peer_send, _peer_recv) =
-            discovery_only_peer_awaiting_services(46, 3).await?;
+            discovery_only_peer_awaiting_services(46, 3, Duration::ZERO).await?;
         let waiting = tokio::time::Instant::now();
         tokio::time::timeout(
-            DISCOVERY_ANSWER_WRITE_DEADLINE + Duration::from_secs(1),
+            DISCOVERY_ONLY_EXCHANGE_BUDGET + Duration::from_secs(1),
             connection_cancel.cancelled(),
         )
         .await
         .expect("the deadline closes the connection");
-        assert!(waiting.elapsed() >= DISCOVERY_ANSWER_WRITE_DEADLINE - Duration::from_millis(100));
+        assert!(waiting.elapsed() >= DISCOVERY_ONLY_EXCHANGE_BUDGET - Duration::from_millis(100));
         Ok(())
     }
 
@@ -3620,9 +3623,14 @@ mod tests {
         );
 
         let (send, _recv) = framed_channel(4);
-        let (source, states) = test_peer_io(handle, peer_id.clone(), send);
+        let key = DiscoverySessionKey::new(peer_id.clone(), 2, 1);
+        let (source, states) = test_peer_io(handle.clone(), peer_id.clone(), send);
         let close_cause = source.close_cause.clone();
+        let started = tokio::time::Instant::now();
         source.run().await;
+        assert_eq!(started.elapsed(), DISCOVERY_ONLY_EXCHANGE_BUDGET);
+        assert!(!handle.is_current_session(&key).await);
+        assert_eq!(handle.peer_snapshot().inbound_peers, 0);
 
         assert_eq!(
             close_cause.get_or("none"),
@@ -3751,7 +3759,7 @@ mod tests {
         complete_peer_side_discovery_exchange(&peer_send, &mut peer_recv, &peer_secret, &handshake)
             .await?;
         tokio::time::timeout(
-            DISCOVERY_ANSWER_WRITE_DEADLINE + Duration::from_secs(1),
+            DISCOVERY_ONLY_EXCHANGE_BUDGET + Duration::from_secs(1),
             connection_cancel.cancelled(),
         )
         .await
@@ -3821,9 +3829,7 @@ mod tests {
         ));
 
         tokio::time::timeout(
-            DISCOVERY_INITIAL_EXCHANGE_TIMEOUT
-                + DISCOVERY_ANSWER_WRITE_DEADLINE
-                + Duration::from_secs(1),
+            DISCOVERY_ONLY_EXCHANGE_BUDGET + Duration::from_secs(1),
             connection_cancel.cancelled(),
         )
         .await
@@ -4207,18 +4213,60 @@ mod tests {
         let cancel = io.session.cancel_token();
         let mut session = tokio::spawn(io.run());
         assert!(
-            tokio::time::timeout(
-                DISCOVERY_INITIAL_EXCHANGE_TIMEOUT + DISCOVERY_ANSWER_WRITE_DEADLINE / 2,
-                &mut session
-            )
-            .await
-            .is_err(),
+            tokio::time::timeout(DISCOVERY_ONLY_EXCHANGE_BUDGET / 2, &mut session)
+                .await
+                .is_err(),
             "the listener stays open even when it has no pending local work"
         );
         cancel.cancel();
         tokio::time::timeout(Duration::from_millis(1), session)
             .await
             .expect("a disconnect releases the listener before its deadline")?;
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dialer_waits_for_an_empty_peer_list_then_closes_promptly(
+    ) -> Result<(), crate::BoxError> {
+        let (handle, peer_id, _) = handle_with_session(90, 2).await?;
+        let (send, _peer_recv) = framed_channel(16);
+        let (mut io, _) = test_peer_io(handle, peer_id, send);
+        io.session.direction = ServicePeerDirection::Outbound;
+        let queries = io.queries.clone();
+        let connection = io.connection_cancel.clone();
+        let session = tokio::spawn(io.run());
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        assert!(
+            !connection.is_cancelled(),
+            "a peer list still in transit keeps the dialer open"
+        );
+        let reply = queries
+            .claim(u16::from(MSG_DISCOVERY_PEERS), 2)
+            .expect("an empty peer list fits")
+            .expect("the peer query is pending");
+        reply.admitted().check(&DiscoveryMessage::Peers {
+            records: Vec::new(),
+        })?;
+        drop(reply);
+        tokio::time::timeout(Duration::from_millis(100), session).await??;
+        assert!(connection.is_cancelled());
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn blocked_initial_writes_release_the_discovery_slot_at_eight_seconds(
+    ) -> Result<(), crate::BoxError> {
+        let (handle, peer_id, _) = handle_with_session(91, 2).await?;
+        let key = DiscoverySessionKey::new(peer_id.clone(), 2, 1);
+        let (send, _peer_recv) = framed_channel(1);
+        let (mut io, _) = test_peer_io(handle.clone(), peer_id, send);
+        io.session.direction = ServicePeerDirection::Outbound;
+        let connection = io.connection_cancel.clone();
+        let started = tokio::time::Instant::now();
+        io.run().await;
+        assert_eq!(started.elapsed(), Duration::from_secs(8));
+        assert!(connection.is_cancelled());
+        assert!(!handle.is_current_session(&key).await);
         Ok(())
     }
 
@@ -4249,10 +4297,7 @@ mod tests {
         let started = tokio::time::Instant::now();
         let session = tokio::spawn(io.run());
 
-        tokio::time::sleep(
-            DISCOVERY_INITIAL_EXCHANGE_TIMEOUT + DISCOVERY_ANSWER_WRITE_DEADLINE / 2,
-        )
-        .await;
+        tokio::time::sleep(DISCOVERY_ONLY_EXCHANGE_BUDGET / 2).await;
         assert!(
             !connection.is_cancelled(),
             "the timeout does not revoke what the session holds"
@@ -4262,10 +4307,7 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(100), connection.cancelled())
             .await
             .expect("settlement lets the connection close");
-        assert!(
-            started.elapsed()
-                < DISCOVERY_INITIAL_EXCHANGE_TIMEOUT + DISCOVERY_ANSWER_WRITE_DEADLINE
-        );
+        assert!(started.elapsed() < DISCOVERY_ONLY_EXCHANGE_BUDGET);
         session.await?;
         Ok(())
     }
@@ -4277,9 +4319,7 @@ mod tests {
         let session = tokio::spawn(io.run());
 
         tokio::time::timeout(
-            DISCOVERY_INITIAL_EXCHANGE_TIMEOUT
-                + DISCOVERY_ANSWER_WRITE_DEADLINE
-                + Duration::from_secs(1),
+            DISCOVERY_ONLY_EXCHANGE_BUDGET + Duration::from_secs(1),
             connection.cancelled(),
         )
         .await
@@ -4303,6 +4343,12 @@ mod tests {
         let (mut io, _states) = test_peer_io(handle, peer_id, send);
         io.session.direction = ServicePeerDirection::Outbound;
         let hello = io.queries.verifying_hello();
+        // The late Hello is the only remaining work once the peer list is claimed.
+        let peers = claimed_peers_answer(&io.queries).await;
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            drop(peers);
+        });
         assert_close_held_until_settled(io, hello).await
     }
 
@@ -4347,7 +4393,7 @@ mod tests {
             .await?;
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
-            tokio::time::timeout(Duration::from_millis(50), queries.answers_settled())
+            tokio::time::timeout(Duration::from_millis(50), queries.answers_settled(false))
                 .await
                 .is_err(),
             "the Hello waits for a verification slot"
@@ -4355,7 +4401,7 @@ mod tests {
         assert!(!state.progress().hello);
 
         drop(held);
-        tokio::time::timeout(Duration::from_secs(5), queries.answers_settled())
+        tokio::time::timeout(Duration::from_secs(5), queries.answers_settled(false))
             .await
             .expect("the Hello settles after its verification");
         assert!(
@@ -4422,13 +4468,10 @@ mod tests {
         let answer = claimed_peers_answer(&io.queries).await;
         let session = tokio::spawn(io.run());
 
-        tokio::time::sleep(
-            DISCOVERY_INITIAL_EXCHANGE_TIMEOUT + DISCOVERY_ANSWER_WRITE_DEADLINE / 2,
-        )
-        .await;
+        tokio::time::sleep(DISCOVERY_ONLY_EXCHANGE_BUDGET / 2).await;
         owner.owns.store(true, Ordering::SeqCst);
         drop(answer);
-        tokio::time::sleep(DISCOVERY_ANSWER_WRITE_DEADLINE).await;
+        tokio::time::sleep(DISCOVERY_ONLY_EXCHANGE_BUDGET).await;
         assert!(!connection.is_cancelled(), "the new owner keeps it open");
         assert!(
             !session.is_finished(),
@@ -4470,10 +4513,7 @@ mod tests {
         let hello = io.queries.verifying_hello();
         let session = tokio::spawn(io.run());
 
-        tokio::time::sleep(
-            DISCOVERY_INITIAL_EXCHANGE_TIMEOUT + DISCOVERY_ANSWER_WRITE_DEADLINE / 2,
-        )
-        .await;
+        tokio::time::sleep(DISCOVERY_ONLY_EXCHANGE_BUDGET / 2).await;
         let state = handle.lock_for_test().await;
         drop(hello);
         // The session blocks on the discovery lock after its answer wait.
@@ -4527,7 +4567,7 @@ mod tests {
             .await?;
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
-            tokio::time::timeout(Duration::from_millis(50), queries.answers_settled())
+            tokio::time::timeout(Duration::from_millis(50), queries.answers_settled(false))
                 .await
                 .is_err(),
             "the answer waits for a verification slot"
@@ -4543,7 +4583,7 @@ mod tests {
             ServiceAdmissionDecision::Admit
         );
         drop(held);
-        tokio::time::timeout(Duration::from_secs(5), queries.answers_settled())
+        tokio::time::timeout(Duration::from_secs(5), queries.answers_settled(false))
             .await
             .expect("the answer settles after its verification");
         drop(to_sink);
@@ -4697,7 +4737,11 @@ mod tests {
             "the reader judges the bad frame: {read:?}"
         );
         assert!(!closed, "the graceful close waits for the reject");
-        tokio::time::timeout(Duration::from_secs(5), writer).await??;
+        tokio::time::timeout(
+            DISCOVERY_ONLY_EXCHANGE_BUDGET + Duration::from_secs(1),
+            writer,
+        )
+        .await??;
         Ok(())
     }
 
@@ -4715,7 +4759,11 @@ mod tests {
         let (read, closed) = tokio::time::timeout(Duration::from_secs(5), reader).await??;
         assert!(matches!(read, Err(SinkReject::Protocol(..))), "{read:?}");
         assert!(!closed, "the close waits while the caller holds the hold");
-        tokio::time::timeout(Duration::from_secs(5), writer).await??;
+        tokio::time::timeout(
+            DISCOVERY_ONLY_EXCHANGE_BUDGET + Duration::from_secs(1),
+            writer,
+        )
+        .await??;
         Ok(())
     }
 
@@ -4727,10 +4775,17 @@ mod tests {
         let (reader, writer, mut peer_recv, connection) =
             burst_at_exchange_end(80, true, get_peers_frame()?).await?;
 
-        tokio::time::timeout(Duration::from_secs(5), connection.cancelled())
-            .await
-            .expect("the exchange closes its discovery-only connection");
-        tokio::time::timeout(Duration::from_secs(5), writer).await??;
+        tokio::time::timeout(
+            DISCOVERY_ONLY_EXCHANGE_BUDGET + Duration::from_secs(1),
+            connection.cancelled(),
+        )
+        .await
+        .expect("the exchange closes its discovery-only connection");
+        tokio::time::timeout(
+            DISCOVERY_ONLY_EXCHANGE_BUDGET + Duration::from_secs(1),
+            writer,
+        )
+        .await??;
         let (read, _) = tokio::time::timeout(Duration::from_secs(5), reader).await??;
         assert!(read.is_ok(), "an honest peer rejects nothing: {read:?}");
         let mut answered = false;

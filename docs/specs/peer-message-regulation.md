@@ -395,7 +395,9 @@ apart. Zakura queues its current signed record once per discovery stream and aga
 changes. Peer and live-service queries continue at their normal cadence. Receivers still accept
 a repeated valid record. On a discovery-only connection the dialer normally closes after its
 first exchange, once it has processed the received records and written its admitted answers.
-The listener allows up to two seconds after its initial exchange for the dialer to close.
+Both ends use one eight-second budget from the start of the discovery-only exchange. The dialer
+waits for its requested peer list, including an empty reply, and closes once its admitted work
+has settled. The listener allows the dialer the remaining time to finish and close.
 Shared connections continue refreshing. The handler MUST apply sequence and
 expiry policy. It need not maintain a separate relevance snapshot. A repeated valid record MUST
 still satisfy initial-exchange progress when the receiver already knows that record.

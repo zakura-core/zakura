@@ -915,13 +915,14 @@ reads as unset, so those nodes also get the small handshake windows.
     `t` from the pool's `Sessions` consumer: the control receive share, one
     maximal block-sync frame of send window and discovery's unsolicited
     receive share. Admission adds each negotiated reactor's receive part:
-    its unsolicited receive bytes, including one maximal frame. It also adds
-    the session part, which holds serving output and bookkeeping, of each
-    reactor whose service admits the peer. A service that admits the peer
-    later funds that reactor's session part then, and answers `SessionFull`
-    if the pool refuses it. Inbound connections hold at most three quarters
-    of the `Sessions` share, so dials keep a quarter. An idle peer holds only
-    its bases.
+    its unsolicited receive bytes, including one maximal frame, and its
+    session part, which holds serving output and bookkeeping. Funding every
+    negotiated session at admission means a session that opens later never
+    waits on the pool. Inbound connections hold at most three quarters of
+    the `Sessions` share, so dials keep a quarter. The connection cap stops
+    at the required-chain connections the share funds, so the node doesn't
+    complete handshakes it would refuse. An idle peer holds only its
+    bases.
   - **Request credit.** A reactor that sends a request (block sync or
     `tx-relay`) first leases the expected response bytes and raises the
     connection's receive window by them (API-9). Reads move those bytes from

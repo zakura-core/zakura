@@ -35,6 +35,23 @@ fn two_bulk_config(block_sync_cap: u64) -> PoolConfig {
         .with_consumer(Consumer::Serving, ConsumerSpec::bulk(MIB, 10 * MIB, 1))
 }
 
+/// A consumer capped below its weighted share keeps only its room above
+/// its floor, and the rest of `S` goes to the others. Without that, a
+/// capped `Tx` strands its share where `Sessions`, which can't borrow, never
+/// reaches it.
+#[test]
+fn a_capped_consumer_leaves_its_unused_share_to_the_others() {
+    let config = PoolConfig::new(12 * MIB, 0)
+        .with_consumer(Consumer::Tx, ConsumerSpec::bulk(0, MIB, 1))
+        .with_consumer(Consumer::Sessions, ConsumerSpec::bulk(0, 12 * MIB, 1))
+        .with_consumer(Consumer::Serving, ConsumerSpec::bulk(0, 12 * MIB, 1));
+    let machine = MemoryPoolMachine::new(config);
+    assert_eq!(machine.share_of_s(Consumer::Tx), MIB);
+    assert_eq!(machine.share_of_s(Consumer::Sessions), 11 * MIB / 2);
+    assert_eq!(machine.share_of_s(Consumer::Serving), 11 * MIB / 2);
+    assert_eq!(machine.share_of_s(Consumer::Consensus), 0);
+}
+
 /// Yield until `pool` reports a waiter of `consumer`. Panics if no waiter
 /// registers within 100 yields.
 async fn wait_until_waiting(pool: &MemoryPool, consumer: Consumer) {

@@ -694,6 +694,10 @@ impl Drop for PublisherLife {
 type Work<'a> = Pin<Box<dyn Future<Output = Progress<'a>> + Send + 'a>>;
 
 /// The budgets a job holds while it runs.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "boxing would add an allocation per served page"
+)]
 enum Admission {
     /// A page's output and execution slots.
     Page(PushPermit),

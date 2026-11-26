@@ -65,7 +65,8 @@ pub(crate) use serve::ServeReports;
 pub(crate) use serve::{
     Completion, CompletionId, Completions, ExecutionSlots, OutputOrder, Produce, Push, PushPermit,
     PushSend, Responded, ResponseCap, ResponseSink, ResponsesWritten, Serve, ServeCapacity,
-    ServeConfigError, ServeEnd, ServeLimits, ServeViolation, SinkError, SinkProgress, WorkLease,
+    ServeConfigError, ServeEnd, ServeLimits, ServePoolBacking, ServeViolation, SinkError,
+    SinkProgress, WorkLease,
 };
 #[cfg(any(test, zakura_sim))]
 pub(crate) use serve::{ReleaseReport, ServeStep};

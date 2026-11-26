@@ -1081,19 +1081,16 @@ impl Service for Bpv1Service {
         let Some(peer_node) = peer.node_id() else {
             return;
         };
-        let removed = {
-            let mut sessions = self.node.lock_sessions();
-            if sessions
-                .get(&peer_node)
-                .is_some_and(|s| s.conn_id == conn_id)
-            {
-                sessions.remove(&peer_node)
-            } else {
-                None
+        // Cancel under the lock, as `add_peer` does for a replaced session,
+        // so an uncancelled session is always the registered one.
+        let mut sessions = self.node.lock_sessions();
+        if sessions
+            .get(&peer_node)
+            .is_some_and(|s| s.conn_id == conn_id)
+        {
+            if let Some(sess) = sessions.remove(&peer_node) {
+                sess.cancel.cancel();
             }
-        };
-        if let Some(sess) = removed {
-            sess.cancel.cancel();
         }
     }
 }
@@ -1271,6 +1268,8 @@ struct Session {
     verify_tx: mpsc::UnboundedSender<(PartToken, Option<VerifiedPart>)>,
     pulls: PullTelemetry,
     pushes: PushTelemetry,
+    /// Cancelled once the session is replaced, removed, or ending.
+    cancel: CancellationToken,
 }
 
 /// When this node wrote its pushed parts to the session's peer, per block
@@ -1418,7 +1417,13 @@ impl Session {
             match route_peer_output(peer, session_gen, output, || node.collect_peer_states()) {
                 // The driver is the sole ordered executor of `BlockTable`
                 // transitions and their effects.
-                PeerRoute::Table(input) => {
+                PeerRoute::Table(mut input) => {
+                    // `add_peer` and `remove_peer` cancel a session under the
+                    // sessions lock as it stops being registered, so a flag
+                    // it sends later is never live (bpv1-89).
+                    if let BlockInput::PushFlagged { live, .. } = &mut input {
+                        *live = !self.cancel.is_cancelled();
+                    }
                     node.drive(input);
                     return true;
                 }
@@ -1965,6 +1970,7 @@ async fn run_peer_routine(
         verify_tx,
         pulls: PullTelemetry::default(),
         pushes: PushTelemetry::default(),
+        cancel: session_cancel.clone(),
     };
 
     loop {

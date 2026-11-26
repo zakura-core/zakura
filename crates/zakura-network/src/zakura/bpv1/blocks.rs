@@ -426,6 +426,10 @@ pub enum BlockInput {
         /// Whether the proposer flagged them for relay: this node's pushed
         /// seeds, which it pushes onward once it holds them (decision-24).
         relay: bool,
+        /// Whether the flagging session was still the peer's registered
+        /// session when it sent the flag. A replaced or removed session can
+        /// no longer deliver, so its flag expects no part (bpv1-89).
+        live: bool,
     },
     /// Path estimate update from `PathSource` (`decision-12`, `bpv1-40`, `bpv1-65`).
     PathObserved {
@@ -1206,7 +1210,8 @@ struct StripeState {
     claims: HashMap<u32, (NodeId, u64)>,
     /// Slots a peer sends unasked and has not delivered yet, with the sender:
     /// the proposer's flagged seeds (decision-19) or a holder's flagged
-    /// pushes (decision-24). The first sender keeps the slot. They count as
+    /// pushes (decision-24). The first peer keeps the slot, and only a live
+    /// session of that peer takes it over (`expect_incoming`). They count as
     /// pending, apart from `claims`, so a neighbour seeded beyond `k` keeps
     /// `held + claims <= k` for pulls.
     incoming: HashMap<u32, Incoming>,
@@ -1311,8 +1316,8 @@ struct Incoming {
     /// The peer and the generation of the session that carries the part.
     sender: (NodeId, u64),
     /// When the slot turns late: `SLOW_X` × the estimated arrival of the
-    /// batch that listed or flagged it (bpv1-64). A later batch from the
-    /// same sender never moves it.
+    /// batch that listed or flagged it (bpv1-64). No later batch moves it
+    /// later, including one from another session of the same peer.
     late_at: Instant,
 }
 
@@ -1801,14 +1806,15 @@ impl BlockTable {
                 block_id,
                 indices,
                 relay,
-            } => self.handle_push_flagged(
-                now,
-                (peer, session_gen),
-                block_id,
-                &indices,
-                relay,
-                &mut step,
-            ),
+                live,
+            } => {
+                self.handle_push_flagged(peer, block_id, &indices, relay, &mut step);
+                // A session that is no longer live can't deliver, so its
+                // flag expects nothing and never takes a slot (bpv1-89).
+                if live {
+                    self.expect_incoming(now, (peer, session_gen), block_id, &indices);
+                }
+            }
             BlockInput::PathObserved { peer, estimate } => self.paths.observe(peer, estimate),
             BlockInput::RateSample { peer, sample } => {
                 self.paths.record_sample(peer, sample);
@@ -2856,8 +2862,9 @@ impl BlockTable {
         }
     }
 
-    /// Records `peer`'s flagged pushes as pending claims held by the flagging
-    /// session and arms their late timer (decision-24, bpv1-64). The planner
+    /// Handles `peer`'s push flags. `expect_incoming` records a live
+    /// session's flagged pushes as pending claims held by that session and
+    /// arms their late timer (decision-24, bpv1-64). The planner
     /// skips a slot while its push is pending, and the session refuses a
     /// grant for a part its peer is pushing (bpv1-69). Neither marks `peer`
     /// tried: only a late push or a failed pull does, because a push that
@@ -2867,8 +2874,7 @@ impl BlockTable {
     /// goes out now (bpv1-71).
     fn handle_push_flagged(
         &mut self,
-        now: Instant,
-        (peer, session_gen): (NodeId, u64),
+        peer: NodeId,
         block_id: block::Hash,
         indices: &[u32],
         relay: bool,
@@ -2900,7 +2906,6 @@ impl BlockTable {
                 push: true,
             });
         }
-        self.expect_incoming(now, (peer, session_gen), block_id, indices);
     }
 
     /// Marks each of `indices` that the block lacks and that no claim or
@@ -2908,9 +2913,9 @@ impl BlockTable {
     /// `peer`. They turn late at `SLOW_X` × the estimated arrival of this
     /// batch. A later batch from the same session keeps its own late time,
     /// so it never delays this one (bpv1-64). A slot pending from another
-    /// session of `peer` moves to this session: the peer flagged it again
-    /// on its live connection, and the other session's end must not drop
-    /// the live push (bpv1-89).
+    /// session of `peer` moves to this live session, so the other session's
+    /// end can't drop the live push (bpv1-89). It keeps the earlier of its
+    /// two late times, so a reconnect never delays it either.
     fn expect_incoming(
         &mut self,
         now: Instant,
@@ -2923,7 +2928,9 @@ impl BlockTable {
         };
         let coding = block.meta.coding;
         let mut bytes = 0u64;
-        let mut batch: Vec<(u32, u32)> = Vec::new();
+        // Each slot with the late time it already had, if it moves here
+        // from another session of `peer`.
+        let mut batch: Vec<(u32, u32, Option<Instant>)> = Vec::new();
         for &index in indices {
             let (Some((stripe, slot)), Some(wire_len)) =
                 (coding.split_index(index), coding.wire_len(index))
@@ -2931,9 +2938,8 @@ impl BlockTable {
                 continue;
             };
             let st = &block.stripes[stripe as usize];
-            let pending_elsewhere = st
-                .incoming
-                .get(&slot)
+            let pending = st.incoming.get(&slot);
+            let pending_elsewhere = pending
                 .is_some_and(|pending| pending.sender.0 != peer || pending.sender.1 == session_gen);
             if st.assemblable
                 || st.decoding()
@@ -2943,7 +2949,7 @@ impl BlockTable {
             {
                 continue;
             }
-            batch.push((stripe, slot));
+            batch.push((stripe, slot, pending.map(|pending| pending.late_at)));
             bytes = bytes.saturating_add(u64::from(wire_len));
         }
         if batch.is_empty() {
@@ -2955,12 +2961,12 @@ impl BlockTable {
             .saturating_duration_since(now)
             .max(Duration::from_millis(1));
         let late_at = now + estimate.saturating_mul(SLOW_X);
-        for (stripe, slot) in batch {
+        for (stripe, slot, earlier) in batch {
             block.stripes[stripe as usize].incoming.insert(
                 slot,
                 Incoming {
                     sender: (peer, session_gen),
-                    late_at,
+                    late_at: earlier.map_or(late_at, |earlier| earlier.min(late_at)),
                 },
             );
         }

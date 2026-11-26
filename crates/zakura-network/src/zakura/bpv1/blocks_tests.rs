@@ -313,6 +313,7 @@ fn flag_push(
             block_id,
             indices,
             relay,
+            live: true,
         },
     )
 }
@@ -2569,6 +2570,7 @@ fn an_old_sessions_end_releases_only_its_own_pending_pushes() {
                 block_id,
                 indices: vec![index(slot)],
                 relay: false,
+                live: true,
             },
         );
     }
@@ -2613,6 +2615,7 @@ fn a_replacement_sessions_push_flag_survives_the_old_sessions_end() {
                 block_id,
                 indices: vec![index],
                 relay: false,
+                live: true,
             },
         );
     }
@@ -2635,6 +2638,123 @@ fn a_replacement_sessions_push_flag_survives_the_old_sessions_end() {
         ended.outputs
     );
     table.assert_invariants();
+}
+
+/// bpv1-64, bpv1-89: a slot that moves to the peer's new session keeps the
+/// late time it already had. Session 1 of `p` flags slot 0 and session 2
+/// flags it again 15 ms later. Slot 0 still turns late at session 1's time.
+#[test]
+fn a_reflag_on_a_new_session_never_delays_the_push() {
+    let coding = Profile::TINY.derive_coding(2_048, 2).unwrap();
+    let block_id = block::Hash([0xAA; 32]);
+    let p = node_id(2);
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let t0 = Instant::now();
+    admit(&mut table, t0, block_id, coding, [0xAA; 32]);
+    // Slow peers keep the stall interval, and so repair, far off.
+    for (peer, rtt) in [(p, 10), (node_id(23), 500), (node_id(24), 500)] {
+        observe(&mut table, t0, peer, rtt, 10_000_000);
+    }
+    let index = coding.wire_index(0, 0).unwrap();
+    let flag = |table: &mut BlockTable, at: Instant, session_gen: u64| {
+        table.step(
+            at,
+            BlockInput::PushFlagged {
+                peer: p,
+                session_gen,
+                block_id,
+                indices: vec![index],
+                relay: false,
+                live: true,
+            },
+        )
+    };
+    flag(&mut table, t0, 1);
+    let late_at = table.next_deadline().expect("the push is pending");
+    let reflag_at = t0 + Duration::from_millis(15);
+    assert!(reflag_at < late_at, "the reflag comes before the late time");
+
+    flag(&mut table, reflag_at, 2);
+    assert_eq!(
+        table.next_deadline(),
+        Some(late_at),
+        "the new session's flag moved the late time"
+    );
+    let s = tick(&mut table, late_at, &[]);
+    assert!(
+        s.events.iter().any(|e| matches!(
+            e,
+            BlockEvent::PullLate { peer, stripe: 0, slot: 0, .. } if *peer == p
+        )),
+        "{:?}",
+        s.events
+    );
+    assert!(!s
+        .events
+        .iter()
+        .any(|e| matches!(e, BlockEvent::RepairRound { .. })));
+    table.assert_invariants();
+}
+
+/// bpv1-89: a flag from a session that is no longer live takes no slot. In
+/// either generation order, the live session of `p` flags slot 0 and then
+/// the replaced session flags it too. The replaced session's end keeps
+/// slot 0 pending, so `q` is asked for it only once the live session ends.
+#[test]
+fn a_replaced_sessions_late_flag_never_takes_the_live_push() {
+    for (live_gen, stale_gen) in [(2, 1), (1, 2)] {
+        let coding = Profile::TINY.derive_coding(128, 2).unwrap();
+        let block_id = block::Hash([0xAB; 32]);
+        let (p, q) = (node_id(2), node_id(3));
+        let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+        let t0 = Instant::now();
+        admit(&mut table, t0, block_id, coding, [0xAB; 32]);
+        observe(&mut table, t0, p, 5, 10_000_000);
+        observe(&mut table, t0, q, 40, 1_000_000);
+        let index = coding.wire_index(0, 0).unwrap();
+        announce(&mut table, t0, q, block_id, vec![index], &[]);
+        for (session_gen, live) in [(live_gen, true), (stale_gen, false)] {
+            table.step(
+                t0,
+                BlockInput::PushFlagged {
+                    peer: p,
+                    session_gen,
+                    block_id,
+                    indices: vec![index],
+                    relay: false,
+                    live,
+                },
+            );
+        }
+
+        let live_session = PullPeerState {
+            session_gen: live_gen,
+            ..pull_state(p)
+        };
+        let ended = table.step(
+            t0,
+            BlockInput::SessionEnded {
+                peer: p,
+                session_gen: stale_gen,
+                peer_states: vec![live_session, pull_state(q)],
+            },
+        );
+        assert!(
+            granted_slots(&ended, q).is_empty(),
+            "session {stale_gen}'s end dropped session {live_gen}'s push: {:?}",
+            ended.outputs
+        );
+        let ended = table.step(
+            t0,
+            BlockInput::SessionEnded {
+                peer: p,
+                session_gen: live_gen,
+                peer_states: vec![pull_state(q)],
+            },
+        );
+        assert_eq!(granted_slots(&ended, q), vec![0], "{:?}", ended.outputs);
+        table.assert_invariants();
+    }
 }
 
 /// decision-24, bpv1-89: a push flag says nothing about the node, so its

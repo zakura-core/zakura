@@ -74,6 +74,8 @@ pub(crate) fn route_peer_output(
             block_id,
             indices,
             relay,
+            // The IO shell clears it for a session it no longer runs.
+            live: true,
         },
         PeerOutput::ReleaseClaims {
             block_id,

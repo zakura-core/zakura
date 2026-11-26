@@ -325,6 +325,7 @@ pub fn replay_bpv1_block_bytes(bytes: &[u8]) -> BlockReplaySummary {
                 block_id: block.id,
                 indices: block.indices(b, a & 0x80 != 0),
                 relay: b & 1 != 0,
+                live: true,
             },
             8 => BlockInput::PathObserved {
                 peer,

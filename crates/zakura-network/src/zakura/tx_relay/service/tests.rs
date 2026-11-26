@@ -777,4 +777,87 @@ mod receive_credit {
         assert_eq!(credit.receive_window(), base);
         Ok(())
     }
+
+    /// `02 §6`: a body shorter than its request leaves the rest of the
+    /// request's credit spendable on the open connection. Here the peer
+    /// started cooling while the body was in flight, so the short body is
+    /// dropped unread instead of closing the peer. The unspent credit stays
+    /// leased as a drain after the core ends the fetch's lease.
+    #[tokio::test]
+    async fn a_short_body_from_a_cooling_peer_drains_its_unspent_credit(
+    ) -> Result<(), crate::BoxError> {
+        use crate::zakura::testkit::LocalEndpointFactory;
+
+        let tx = transactions(1).remove(0).transaction;
+        let (id, size) = (tx.id(), u32::try_from(tx.size()).expect("fits u32"));
+
+        let server = LocalEndpointFactory::new().endpoint(93403).await?;
+        let client = LocalEndpointFactory::new().endpoint(93404).await?;
+        server.serve(HoldConnections)?;
+        let conn = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.connect(
+                LocalEndpointFactory::node_addr(&server).await,
+                &[CREDIT_ALPN],
+            ),
+        )
+        .await??;
+        let base = 1024 * 1024;
+        let credit = ConnectionCredit::new_quic(connection().1, conn, base, base);
+
+        let memory_pool = crate::zakura::tx_relay::test_memory_pool();
+        let tx_leased = || memory_pool.snapshot().consumers[Consumer::Tx.index()].leased;
+        let (handle, mut inbox) = pool_port();
+        publish(&inbox, Vec::new(), Vec::new());
+        let (wiring, _handed) = wiring_with(handle, memory_pool.clone());
+        let mut session = Session::open_with_credit(&wiring, Some(credit.clone()));
+        session
+            .deliver(TxRelayMessage::Hello {
+                serves: 16,
+                max_tx_bytes: MAX_TX_BYTES,
+            })
+            .await;
+
+        // The fetch is leased and asks, which grows the window.
+        session
+            .deliver(TxRelayMessage::Have(vec![(id, size)]))
+            .await;
+        let (reservation, hold) =
+            inbox.grant_relayed(ReservationId(1), id, CancellationToken::new());
+        let leased = RelayedFetch {
+            announced_size: u64::from(size),
+            leased_bytes: u64::from(size),
+        };
+        answer_reserve(&mut session, &mut inbox, id, leased, Ok(reservation)).await;
+        assert_eq!(credit.receive_window(), base + u64::from(size));
+
+        // The peer starts cooling, then sends a 1-byte body.
+        {
+            let mut node = wiring.node.lock().expect("never poisoned");
+            let now = session.routine.now();
+            let _ = node.shared.reactor.record_invalid(PeerKey(1), now);
+        }
+        session
+            .deliver(TxRelayMessage::Tx { id, body: vec![0] })
+            .await;
+        assert!(
+            session.cause.get().is_none(),
+            "a cooling peer's body is dropped, not faulted"
+        );
+        assert_eq!(credit.receive_window(), base, "the request's credit ends");
+
+        // The core ends the fetch's lease. The credit the body didn't spend
+        // stays leased until the peer can no longer spend it.
+        drop(hold);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            apply_calls(&mut session, |r| {
+                matches!(r, PoolResult::TxLeaseEnded { .. })
+            }),
+        )
+        .await
+        .expect("the lease's end reaches the routine promptly");
+        assert_eq!(tx_leased(), u64::from(size) - 1);
+        Ok(())
+    }
 }

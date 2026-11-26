@@ -294,6 +294,9 @@ issues, at any later step. A completion may answer current work, repeat
 finished work or name work the machine never issued. A part may fail its
 proof or meet a refusal, and a stripe job may fail as a cancelled job does.
 Each replay asserts the machine's invariants after every input.
+`bpv1_peer`'s `Have` operation sends a `u16` list or a bitmap, and can add
+an index past the layout, a bitmap padding bit or a bitmap sized for another
+layout, which close with row 16.
 
 `bpv1_mesh` runs four nodes' production `PeerState`, `BlockTable` and
 `PeerPaths` machines and one `ProposerState` over in-memory links. The input
@@ -308,7 +311,9 @@ tables evict their tombstones while frames are still in flight.
 `bpv1_wire` decodes one arbitrary frame with every BPv1 decoder. A decoded
 frame re-encodes to the same bytes, the largest allocation stays within
 `Bpv1Message::max_heap_bytes`, and each stream decoder closes with the row
-the frame breaks. Only an honest part proves. The target installs
+the frame breaks. Only an honest part proves. A decoded `Have` re-encodes in
+the smaller form for the smallest layout that holds its indices. The
+target installs
 `MeteredAllocator`. `bpv1_codec` encodes an arbitrary body, decodes each
 stripe from a chosen `k`-subset, refuses `k - 1` parts, catches a lying
 proposer and checks canonical assembly.

@@ -628,7 +628,7 @@ timeout-secs = 1800
 package = "p2p"
 name = "bpv1_wire"
 smoke-secs = 60
-args = ["-max_len=2048"]
+args = ["-max_len=8229"]
 timeout-secs = 1800
 
 [[target]]

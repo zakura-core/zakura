@@ -16,7 +16,9 @@ use crate::zakura::{
     bpv1::{
         commitment::CoinbaseBinding,
         profile::Profile,
-        wire::{Bpv1Message, HaveFlags, WantBitmap, WantEndReason},
+        wire::{
+            Bpv1Message, HaveFlags, HaveForm, WantBitmap, WantEndReason, HAVE_BITMAP_MAX_BYTES,
+        },
     },
     wire_codec::encode_frame,
 };
@@ -204,6 +206,49 @@ fn peer_seeds() -> Vec<Bpv1Seed> {
             target,
             "bad-want-end",
             ops(PEER_EXACT, &[(PEER_ADMIT, 0, 1), (PEER_WANT_END, 0x40, 3)]),
+        ),
+        // `Have` bitmaps (decision-33). `PEER_HAVE`'s `a` bit 5 sends a
+        // bitmap, bit 7 an index past the layout, and bit 2 a bitmap one
+        // byte too long; `a % 3 == 0` keeps block 0. A bitmap that fits
+        // stays open; repeating one of its indices closes 16.
+        seed(
+            target,
+            "have-bitmap",
+            ops(
+                PEER_EXACT,
+                &[
+                    (PEER_ADMIT, 0, 1),
+                    (PEER_HAVE, 0x21, 0x05),
+                    (PEER_HAVE, 0x21, 0x02),
+                ],
+            ),
+        ),
+        seed(
+            target,
+            "have-bitmap-repeat",
+            ops(
+                PEER_EXACT,
+                &[
+                    (PEER_ADMIT, 0, 1),
+                    (PEER_HAVE, 0x21, 0x05),
+                    (PEER_HAVE, 0x21, 0x04),
+                ],
+            ),
+        ),
+        seed(
+            target,
+            "have-bitmap-padding",
+            ops(PEER_EXACT, &[(PEER_ADMIT, 0, 1), (PEER_HAVE, 0xA2, 0x01)]),
+        ),
+        seed(
+            target,
+            "have-bitmap-misfit",
+            ops(PEER_EXACT, &[(PEER_ADMIT, 0, 1), (PEER_HAVE, 0x24, 0x01)]),
+        ),
+        seed(
+            target,
+            "have-past-layout",
+            ops(PEER_EXACT, &[(PEER_ADMIT, 0, 1), (PEER_HAVE, 0x81, 0x01)]),
         ),
     ]
 }
@@ -583,7 +628,18 @@ fn wire_seeds() -> Vec<Bpv1Seed> {
             Bpv1Message::Have {
                 block_id,
                 flags: HaveFlags::Push,
+                form: HaveForm::List,
                 indices: vec![0, 2],
+            },
+        ),
+        (
+            5,
+            "have-bitmap",
+            Bpv1Message::Have {
+                block_id,
+                flags: HaveFlags::Plain,
+                form: HaveForm::Bitmap { len: 11 },
+                indices: (0..86).step_by(3).collect(),
             },
         ),
         (
@@ -612,6 +668,19 @@ fn wire_seeds() -> Vec<Bpv1Seed> {
     seeds.push(seed(target, "part-short", vec![0x34, 2, 3, 0]));
     // A `Have` with reserved frame flags, an unknown type, and garbage.
     seeds.push(seed(target, "flags", vec![0x0D, 0x02, 1, 2, 3]));
+    // `Have`s the decoder refuses (decision-33): an empty bitmap, a list
+    // that repeats an index, and a bitmap one byte past the longest layout.
+    let have = |body: &[u8]| {
+        let mut bytes = vec![5];
+        bytes.extend(block_id.0);
+        bytes.extend(body);
+        bytes
+    };
+    seeds.push(seed(target, "have-empty-bitmap", have(&[0x04, 0x00])));
+    seeds.push(seed(target, "have-repeat", have(&[0x00, 2, 0, 7, 0, 7, 0])));
+    let mut long_bitmap = vec![0x04];
+    long_bitmap.resize(2 + HAVE_BITMAP_MAX_BYTES, 0x01);
+    seeds.push(seed(target, "have-long-bitmap", have(&long_bitmap)));
     let [low, high] = 0x77u16.to_le_bytes();
     seeds.push(seed(target, "unknown", vec![7, low, high, 0]));
     seeds.push(seed(target, "garbage", vec![0, 1, 2, 3]));

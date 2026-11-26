@@ -21,8 +21,8 @@ use super::{
     },
     tree::VerifiedPart,
     wire::{
-        encode_part_frame, Bpv1Message, HaveFlags, WantBitmap, WantEndReason, MAX_WANTS_INFLIGHT,
-        PROPAGATION_DEPTH,
+        encode_part_frame, Bpv1Message, HaveFlags, HaveForm, WantBitmap, WantEndReason,
+        MAX_WANTS_INFLIGHT, PROPAGATION_DEPTH,
     },
 };
 
@@ -70,7 +70,8 @@ pub(super) fn have_with(block_id: block::Hash, flags: HaveFlags, indices: Vec<u3
     PeerInput::RecvHave(RecvHave {
         block_id,
         flags,
-        frame_bytes: 35 + 4 * indices.len(),
+        form: HaveForm::List,
+        frame_bytes: 33 + HaveForm::List.indices_len(indices.len()),
         indices,
     })
 }
@@ -336,9 +337,11 @@ fn scenario_early_record_full_pauses_data_only_and_replays_on_admission() {
     let PeerInput::RecvHave(RecvHave { frame_bytes, .. }) = &flag else {
         unreachable!("have_with builds a Have");
     };
-    // The record holds exactly the seeds' flagged `Have` and two part frames.
+    // The record holds exactly the seeds' flagged `Have` (charged its id plus
+    // two `u32` indices) and two part frames.
+    let have_bytes = (*frame_bytes).max(32 + 2 * std::mem::size_of::<u32>());
     config.early_peer_bytes_cap =
-        frame_bytes + part_frame(&coding, 0).len() + part_frame(&coding, 1).len();
+        have_bytes + part_frame(&coding, 0).len() + part_frame(&coding, 1).len();
     let mut peer = PeerState::new(config, node_id(2), 1);
     let t0 = Instant::now();
 
@@ -1312,6 +1315,7 @@ fn decision24_holder_flags_then_pushes_its_seeds_but_not_to_the_proposer() {
             PeerOutput::SendHave {
                 block_id,
                 flags: HaveFlags::Push,
+                form: HaveForm::smaller(tiny().total_parts().unwrap(), 2),
                 indices: vec![0, 1],
             },
             PeerOutput::PushPart { block_id, index: 0 },
@@ -1351,6 +1355,7 @@ fn decision32_a_pushed_seed_is_announced_to_the_proposer_not_pushed() {
         vec![PeerOutput::SendHave {
             block_id,
             flags: HaveFlags::Plain,
+            form: HaveForm::smaller(tiny().total_parts().unwrap(), 1),
             indices: vec![0],
         }]
     );
@@ -1482,6 +1487,7 @@ fn decision24_flagged_have_is_chunked_at_the_have_limit() {
         match output {
             PeerOutput::SendHave {
                 flags: HaveFlags::Push,
+                form,
                 indices,
                 ..
             } => {
@@ -1490,6 +1496,7 @@ fn decision24_flagged_have_is_chunked_at_the_have_limit() {
                     super::wire::DataQueueItem::Have {
                         block_id,
                         flags: HaveFlags::Push,
+                        form: *form,
                         indices: indices.clone(),
                     }
                     .encode()
@@ -1574,7 +1581,7 @@ fn bpv1_60_flagged_have_refused_by_a_full_early_record_never_closes() {
     let coding = tiny();
     let bound = coding.n - coding.k;
     assert!(bound >= 2 && coding.split_index(bound).unwrap().0 == 0);
-    let have_bytes = 39;
+    let have_bytes = 33 + HaveForm::List.indices_len(1);
     let mut config = PeerConfig::for_profile(Profile::TINY);
     // The record holds one flagged `Have` and its part, with no room for a
     // second `Have`.
@@ -1609,6 +1616,82 @@ fn bpv1_60_flagged_have_refused_by_a_full_early_record_never_closes() {
     assert!(sent_want(&peer.step(now, pull(block_id, 0, &[2], now))).is_some());
     peer.step(now, tiny_part_prefix(block_id, 3));
     assert_closed(&peer, Bpv1CloseRow::Row14UnwantedOrDuplicatePart);
+}
+
+/// bpv1-48 / decision-33: a bitmap byte decodes to up to eight `u32`
+/// indices, so the early record charges a held `Have` its decoded indices
+/// when they outweigh its frame. A peer that sends 4,096-index bitmaps for
+/// unknown blocks holds no more than the per-peer cap.
+#[test]
+fn bpv1_48_early_record_charges_a_have_its_decoded_indices() {
+    let config = PeerConfig::for_profile(Profile::TINY);
+    let cap = config.early_peer_bytes_cap;
+    let mut peer = PeerState::new(config, node_id(3), 1);
+    let now = Instant::now();
+    // 512 bytes of set bits name 4,096 indices.
+    let form = HaveForm::Bitmap { len: 512 };
+    let indices: Vec<u32> = (0..4_096).collect();
+    let frame_bytes = 33 + form.indices_len(indices.len());
+    let mut held_indices = 0;
+    for i in 0..=cap / frame_bytes {
+        let mut id = [0x6A; 32];
+        id[..8].copy_from_slice(&(i as u64).to_le_bytes());
+        let step = peer.step(
+            now,
+            PeerInput::RecvHave(RecvHave {
+                block_id: block::Hash(id),
+                flags: HaveFlags::Plain,
+                form,
+                frame_bytes,
+                indices: indices.clone(),
+            }),
+        );
+        if step
+            .events
+            .iter()
+            .any(|e| matches!(e, PeerEvent::EarlyHeld { .. }))
+        {
+            held_indices += indices.len();
+        }
+        peer.assert_invariants();
+        if peer.is_data_paused() {
+            break;
+        }
+    }
+    assert!(peer.is_data_paused(), "the record never filled");
+    let held_bytes = held_indices * std::mem::size_of::<u32>();
+    assert!(
+        held_bytes <= cap,
+        "the early record holds {held_bytes} index bytes past its {cap}-byte cap"
+    );
+}
+
+/// bpv1-48 / decision-33: a held `Have` also keeps its block id, so a
+/// one-byte bitmap naming eight parts costs the id plus eight `u32`s, not
+/// its 34-byte frame.
+#[test]
+fn bpv1_48_early_record_charges_a_have_its_block_id() {
+    let mut peer = PeerState::new(PeerConfig::for_profile(Profile::TINY), node_id(3), 1);
+    let step = peer.step(
+        Instant::now(),
+        PeerInput::RecvHave(RecvHave {
+            block_id: block::Hash([0x6B; 32]),
+            flags: HaveFlags::Plain,
+            form: HaveForm::Bitmap { len: 1 },
+            frame_bytes: 34,
+            indices: (0..8).collect(),
+        }),
+    );
+    let held: Vec<usize> = step
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            PeerEvent::EarlyHeld { bytes, .. } => Some(*bytes),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(held, [32 + 8 * std::mem::size_of::<u32>()]);
+    peer.assert_invariants();
 }
 
 /// bpv1-60 / bpv1-14: the holder's flagged `Have` ages out of the early
@@ -2110,6 +2193,7 @@ fn a_pushed_seed_learned_after_its_plain_have_is_announced_once() {
         vec![PeerOutput::SendHave {
             block_id,
             flags: HaveFlags::Plain,
+            form: HaveForm::smaller(tiny().total_parts().unwrap(), 1),
             indices: vec![1],
         }],
         "an unpushed part gets a plain Have and no push"

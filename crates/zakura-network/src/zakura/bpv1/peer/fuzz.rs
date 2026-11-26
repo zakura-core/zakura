@@ -32,7 +32,7 @@ use crate::zakura::bpv1::{
     paths::Arrival,
     profile::Profile,
     tree::VerifiedPart,
-    wire::{encode_part_frame, Bpv1Message, HaveFlags, WantBitmap, WantEndReason},
+    wire::{encode_part_frame, Bpv1Message, HaveFlags, HaveForm, WantBitmap, WantEndReason},
 };
 
 /// Summary returned by [`replay_bpv1_peer_bytes`] (`tool-2`, `p2p-fuzz`).
@@ -332,9 +332,35 @@ fn decode(
             push: a & 0x40 != 0,
         },
         // `a` bits 3–4 pick the flags. Bit 6 lists the indices out of order,
-        // which closes (bpv1-25).
+        // which closes (bpv1-25). Bit 5 sends a bitmap, sized for the
+        // layout. Bit 7 adds the first index past the layout, a padding bit
+        // when the bitmap has one. Bit 2 lengthens the bitmap by a byte.
+        // Each of these closes 16 (decision-33).
         8 => {
+            let total = block.geometry.encoded.coding.total_parts().unwrap_or(0);
             let mut indices = block.indices(b);
+            if a & 0x80 != 0 {
+                indices.push(total);
+                reached.hit("have:past-layout");
+            }
+            let form = if a & 0x20 != 0 {
+                let covered = indices.iter().max().map_or(0, |&last| last + 1);
+                let mut len = total.max(covered).div_ceil(8).max(1);
+                if a & 0x04 != 0 {
+                    len += 1;
+                    reached.hit("have:bitmap-misfit");
+                } else if a & 0x80 != 0 && !total.is_multiple_of(8) {
+                    reached.hit("have:bitmap-padding");
+                }
+                reached.hit("have:bitmap");
+                HaveForm::Bitmap {
+                    // A replay's layouts hold at most 2^16 bitmap bytes.
+                    len: u16::try_from(len).unwrap_or(u16::MAX),
+                }
+            } else {
+                reached.hit("have:list");
+                HaveForm::List
+            };
             if a & 0x40 != 0 {
                 indices.reverse();
             }
@@ -343,7 +369,8 @@ fn decode(
             PeerInput::RecvHave(RecvHave {
                 block_id: block.id,
                 flags,
-                frame_bytes: 39 + 4 * indices.len(),
+                form,
+                frame_bytes: 33 + form.indices_len(indices.len()),
                 indices,
             })
         }

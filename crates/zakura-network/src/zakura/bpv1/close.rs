@@ -64,7 +64,9 @@ pub enum Bpv1CloseRow {
     Row14UnwantedOrDuplicatePart = 14,
     /// `bpv1-close-15`: Retired block late `Part` or `Have` counter exhausted.
     Row15RetiredCounterExhausted = 15,
-    /// `bpv1-close-16`: `Have` index out of range or repeated index.
+    /// `bpv1-close-16`: `Have` index out of range, a repeated index, or a
+    /// bitmap whose length is not `ceil(stripes * n / 8)` (decision-33). A
+    /// set padding bit is an index out of range.
     Row16BadHaveIndex = 16,
     /// `bpv1-close-18`: `WantEnd` with no live `Want`, `sent` above popcount, or `sent` below attributed parts.
     Row18BadWantEnd = 18,

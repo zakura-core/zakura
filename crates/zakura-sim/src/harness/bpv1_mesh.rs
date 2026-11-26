@@ -786,7 +786,14 @@ fn spawn_actor(
     sim.scheduler().spawn_root("block-node", async move {
         let _ = reactor.await;
     });
-    spawn_actions(sim, engine.clone(), actions, handle.clone(), state);
+    spawn_actions(
+        sim,
+        engine.clone(),
+        actions,
+        handle.clone(),
+        state,
+        block_shutdown.clone(),
+    );
     let block = Arc::new(BlockSyncService::new_with_handle(handle));
     // BPv1, as `build_bpv1_service` starts it.
     let bpv1_shutdown = CancellationToken::new();
@@ -824,8 +831,10 @@ fn spawn_actor(
     }
 }
 
-/// Answers one actor's block-sync actions until the channel closes. Queries
-/// read full state at once. The node submits each body to `state` and
+/// Answers one actor's block-sync actions until the channel closes or
+/// `shutdown` fires. Its handle keeps the sequencer's body input open, and
+/// the sequencer keeps the action channel open, so only `shutdown` ends the
+/// wait at an idle tip. Queries read full state at once. The node submits each body to `state` and
 /// replies with its answer. A mirror holds every body, so it submits none.
 fn spawn_actions(
     sim: &mut Sim,
@@ -833,9 +842,17 @@ fn spawn_actions(
     mut actions: mpsc::Receiver<BlockSyncAction>,
     handle: zakura_network::zakura::BlockSyncHandle,
     state: Option<NodeState>,
+    shutdown: CancellationToken,
 ) {
     sim.scheduler().spawn_root("block-actions", async move {
-        while let Some(action) = actions.recv().await {
+        loop {
+            let action = zakura_rt::select! {
+                () = shutdown.cancelled() => return,
+                action = actions.recv() => match action {
+                    Some(action) => action,
+                    None => return,
+                },
+            };
             match action {
                 BlockSyncAction::QueryNeededBlocks {
                     query_id,

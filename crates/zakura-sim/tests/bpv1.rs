@@ -355,12 +355,38 @@ where
         },
         &mut NoChecks,
     );
+    // Quiescence counts a panicked task as finished, so check each exit.
+    let panicked: Vec<String> = report
+        .log
+        .entries()
+        .iter()
+        .filter_map(|entry| match &entry.obs {
+            Observation::TaskExited {
+                task,
+                exit: Exit::Panicked,
+            } => Some(task.clone()),
+            _ => None,
+        })
+        .collect();
     let seen = seen.borrow_mut().take();
-    let seen =
-        seen.unwrap_or_else(|| panic!("the director finished; the run ended {:?}", report.end));
+    let seen = seen.unwrap_or_else(|| {
+        panic!(
+            "the director finished; the run ended {:?}, panicked {panicked:?}",
+            report.end
+        )
+    });
     if let Some(failure) = &seen.failure {
         panic!("{failure}\n{}", summary(&seen));
     }
+    let summary = summary(&seen);
+    assert!(panicked.is_empty(), "{panicked:?} panicked\n{summary}");
+    assert_eq!(
+        report.end.outcome,
+        Outcome::Idle {
+            status: IdleStatus::Quiescent
+        },
+        "every task finished after shutdown\n{summary}"
+    );
     seen
 }
 

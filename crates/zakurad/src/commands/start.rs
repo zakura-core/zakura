@@ -394,9 +394,61 @@ impl StartCmd {
         Ok(())
     }
 
-    /// Prepares the endpoint config, pinning a persistent identity for an announcing gateway.
+    /// Resolves `[memory] budget` (probing host and cgroup limits for `"auto"`),
+    /// publishes `zakura.memory.budget_bytes{source}`, and derives `B` for `zakura-network`
+    /// (`02 §2`, `03 §5`, decision-2).
+    fn resolve_memory_budget(
+        config: &ZakuradConfig,
+    ) -> Result<zakura_network::zakura::memory::ResolvedMemoryBudget, Report> {
+        config.memory.validate().map_err(|error| eyre!(error))?;
+        let (host_budget_bytes, source) = match config.memory.budget {
+            zakura_network::zakura::memory::MemoryBudget::Auto => (
+                crate::components::memory_probe::detect_host_memory_bytes()?,
+                "auto",
+            ),
+            zakura_network::zakura::memory::MemoryBudget::Fixed(size) => (size.bytes(), "config"),
+        };
+        metrics::gauge!("zakura.memory.budget_bytes", "source" => source)
+            .set(host_budget_bytes as f64);
+        let managed_zcashd = config.zcashd_compat.enabled && config.zcashd_compat.manage_zcashd;
+        let mut resolved = config
+            .memory
+            .resolve(host_budget_bytes, source, managed_zcashd);
+        resolved.mempool_tx_cost_limit = config.mempool.tx_cost_limit;
+        // The plan counts state reads as one fixed term (`02 §4`).
+        let state_config = config.mirrored_state_config();
+        resolved.state_read_parser_bytes = state_config
+            .read_parser_bytes()
+            .map_err(|error| eyre!(error))?;
+        resolved.read_result_byte_limit = config
+            .state
+            .read_result_byte_limit
+            .map(std::num::NonZeroU64::get);
+        info!(
+            source,
+            host_budget_bytes = resolved.derivation.host_budget_bytes,
+            base_bytes = resolved.derivation.base_bytes,
+            sidecar_bytes = resolved.derivation.sidecar_bytes,
+            p2p_budget_b = resolved.p2p_budget_b(),
+            "resolved [memory] budget"
+        );
+        Ok(resolved)
+    }
+
+    /// Prepares the endpoint config, pinning a persistent identity for an announcing gateway
+    /// and passing the resolved pure P2P memory budget `B` into `zakura-network`.
     fn network_config_for_start(config: &ZakuradConfig) -> Result<zakura_network::Config, Report> {
         let mut network = config.network.clone();
+        // The budget governs the v2 stack only, so a legacy node neither probes the host
+        // nor fails on an unreadable cgroup (`02 §2`).
+        if config.network.v2_p2p() {
+            network.zakura.memory_budget = Self::resolve_memory_budget(config)?;
+        } else if config.memory != zakura_network::zakura::memory::MemoryConfig::default() {
+            warn!(
+                "[memory] settings have no effect on the legacy P2P stack; \
+                 set network.p2p_stack to \"zakura\" or \"dual\" to use them"
+            );
+        }
         if config.mining.miner_mesh {
             network.pin_stable_zakura_identity().map_err(|error| {
                 eyre!(
@@ -508,7 +560,7 @@ impl StartCmd {
     pub(crate) async fn start(
         &self,
         config: Arc<ZakuradConfig>,
-        mut custom_services: Vec<zakura_network::zakura::CustomService>,
+        custom_services: Vec<zakura_network::zakura::CustomService>,
         ready: Option<tokio::sync::oneshot::Sender<crate::node::NodeServices>>,
         shutdown: CancellationToken,
         shutdown_cleanup_required: CancellationToken,
@@ -753,6 +805,28 @@ impl StartCmd {
             .boxed()
             .await;
         node_tasks.track(&consensus_task_handles.state_checkpoint_verify_handle);
+        #[cfg(target_os = "linux")]
+        {
+            let rss_shutdown = shutdown.clone();
+            let rss_task = tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    select! {
+                        _ = rss_shutdown.cancelled() => break,
+                        _ = tick.tick() => {
+                            if let Some(rss) =
+                                crate::components::memory_probe::read_process_rss_bytes()
+                            {
+                                metrics::gauge!("zakura.memory.process_rss_bytes")
+                                    .set(rss as f64);
+                            }
+                        }
+                    }
+                }
+            });
+            node_tasks.track(&rss_task);
+        }
 
         info!("initializing network");
         // The service that our node uses to respond to requests by peers. The
@@ -805,20 +879,22 @@ impl StartCmd {
 
         // The pool is chosen once, at startup. `tx-relay` needs the pool
         // core's port before the network starts, so it is built here and
-        // handed to the core below.
+        // handed to the core below. The endpoint starts `tx-relay` once it
+        // has built the memory pool its fetches lease from.
         let v2_p2p = config.network.v2_p2p();
         let pool_implementation = config.mempool.implementation.resolve(v2_p2p);
+        let mut tx_relay = None;
         // The service is registered on the v2 endpoint, which a legacy-only
         // stack never starts, so a legacy-only core keeps the adapter path.
         let tx_relay_port = if config.network.zakura.tx_relay.enabled && v2_p2p {
             if pool_implementation == mempool::config::Implementation::Core {
                 let port = mempool::core::TxRelayPort::new();
-                custom_services.push(zakura_network::zakura::tx_relay_service(
-                    port.handle(),
-                    port.may_cool(),
-                    &config.network.zakura.tx_relay,
-                    config.network.unconditional_peers.clone(),
-                ));
+                tx_relay = Some(zakura_network::zakura::TxRelayStartup {
+                    pool: port.handle(),
+                    may_cool: port.may_cool(),
+                    config: config.network.zakura.tx_relay.clone(),
+                    unconditional: config.network.unconditional_peers.clone(),
+                });
                 Some(port)
             } else {
                 // `tx-relay` is on by default, so this is the `classic` rollback.
@@ -832,7 +908,7 @@ impl StartCmd {
         // BPv1 runs only when explicitly enabled AND headerchain is attached
         // (`Zakura` or `Dual` p2p_stack — strictly absent in `Legacy`, `dual-1`).
         let mut zakura_header_sync_driver_startup = zakura_header_sync_driver_startup;
-        let bpv1_handle = if config.network.zakura.bpv1.enabled {
+        let bpv1 = if config.network.zakura.bpv1.enabled {
             if let Some(driver_startup) = zakura_header_sync_driver_startup.as_mut() {
                 config
                     .network
@@ -845,7 +921,7 @@ impl StartCmd {
                     .zakura_secret_key()
                     .map_err(|error| eyre!(error))?;
                 network_config.zakura_node_secret_key = Some((&secret_key).into());
-                let (svc, handle) = zakura::bpv1_wiring::build_bpv1_service(
+                Some(zakura::bpv1_wiring::bpv1_startup(
                     &config.network.zakura.bpv1,
                     // decision-26: `Have`s follow block gossip's advertisement pacing.
                     zakura_network::zakura::bpv1::HavePacing::from_network_config(&config.network),
@@ -858,9 +934,7 @@ impl StartCmd {
                     driver_startup,
                     // Child token so disabling/shutting down BPv1 never shuts down the daemon.
                     shutdown.child_token(),
-                );
-                custom_services.push(svc);
-                Some(handle)
+                ))
             } else {
                 warn!(
                     "bpv1 requires `Zakura` or `Dual` p2p_stack (headerchain attached), so it stays off"
@@ -872,8 +946,8 @@ impl StartCmd {
         };
 
         // The network counts `bpv1` memory shares only when it is registered,
-        // not merely enabled.
-        network_config.zakura.bpv1.enabled = bpv1_handle.is_some();
+        // not merely enabled. The endpoint decides `tx-relay`'s the same way.
+        network_config.zakura.bpv1.enabled = bpv1.is_some();
         let tx_relay_registered = tx_relay_port.is_some();
         info!(
             configured = config.network.zakura.tx_relay.enabled,
@@ -908,10 +982,16 @@ impl StartCmd {
                     claims: announcement_claims.clone(),
                     latest_chain_tip: latest_chain_tip.clone(),
                 }),
+                tx_relay,
+                bpv1,
                 Some(miner_gateways),
             )
             .await
             .map_err(|error| eyre!(error))?;
+        // The endpoint starts BPv1 once it has built the memory pool BPv1 leases from.
+        let bpv1_handle = zakura_endpoint
+            .as_ref()
+            .and_then(zakura_network::zakura::ZakuraEndpoint::bpv1);
 
         let mut header_sync_fatal_events = match zakura_endpoint.as_ref() {
             Some(endpoint) => endpoint.take_header_sync_fatal_events().await,

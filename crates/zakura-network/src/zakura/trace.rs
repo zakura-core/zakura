@@ -144,6 +144,9 @@ pub const QUIC_CONN_TABLE: ZakuraTraceTable = ZakuraTraceTable::new("quic_conn",
 pub const QUEUE_SEND_TABLE: ZakuraTraceTable =
     ZakuraTraceTable::new("queue_send", "queue_send.jsonl");
 
+/// Startup memory sizing plan (`02 §8`, `03 §5`).
+pub const MEMORY_TABLE: ZakuraTraceTable = ZakuraTraceTable::new("memory", "memory.jsonl");
+
 /// Shared queue-send trace event names and field keys.
 #[allow(dead_code)] // Preserved as schema constants for compatible trace consumers.
 pub mod queue_send_trace {
@@ -518,6 +521,78 @@ impl ZakuraTrace {
             insert_optional_str(row, "peer", Some(&peer_label(peer_id)));
             insert_optional_str(row, "addr", Some(addr));
             insert_optional_str(row, "user_agent", Some(user_agent));
+        });
+    }
+
+    /// Record the startup `plan` row with every input, fixed term, reserve,
+    /// bulk floor/share/cap, `t`, each `b_r`, and resulting connection counts
+    /// (`02 §8`, `03 §5`).
+    pub(crate) fn emit_memory_plan(&self, plan: &super::memory::MemoryPlan) {
+        use super::memory::Consumer;
+        let count = |count: usize| u64::try_from(count).unwrap_or(u64::MAX);
+        let derivation = &plan.derivation;
+        let mut terms: Vec<(String, u64)> = [
+            ("host_budget_bytes", derivation.host_budget_bytes),
+            ("base_bytes", derivation.base_bytes),
+            ("sidecar_bytes", derivation.sidecar_bytes),
+            ("rho_numerator", derivation.rho_numerator),
+            ("rho_denominator", derivation.rho_denominator),
+            ("budget_b", plan.pool_config.budget_b),
+            (
+                "override_warnings_count",
+                count(plan.override_warnings.len()),
+            ),
+            ("fixed_total", plan.fixed.total()),
+        ]
+        .map(|(key, value)| (key.to_owned(), value))
+        .into();
+        terms.extend(
+            plan.fixed
+                .entries()
+                .map(|(name, bytes)| (format!("fixed_{name}"), bytes)),
+        );
+        terms.push(("transport_base".to_owned(), plan.bases.transport_base));
+        terms.extend(
+            plan.bases
+                .entries()
+                .map(|(name, _, base)| (format!("session_{name}"), base.total())),
+        );
+        terms.extend(
+            [
+                ("full_connection_base", plan.bases.full_connection_bytes()),
+                ("shared_s", plan.shared_capacity()),
+                ("min_connections", count(plan.min_connections)),
+                ("connection_cap", count(plan.connection_cap)),
+                (
+                    "planned_full_connections",
+                    count(plan.planned_full_connections),
+                ),
+                (
+                    "planned_required_connections",
+                    count(plan.planned_required_connections),
+                ),
+            ]
+            .map(|(key, value)| (key.to_owned(), value)),
+        );
+        for consumer in Consumer::ALL {
+            let label = consumer.label();
+            let spec = plan.consumer_spec(consumer);
+            for (field, value) in [
+                ("floor", spec.floor),
+                ("cap", spec.cap),
+                ("weight", spec.weight),
+                ("protected_share", plan.consumer_protected_share(consumer)),
+            ] {
+                terms.push((format!("{label}_{field}"), value));
+            }
+        }
+        self.emit_with(MEMORY_TABLE, |row| {
+            row.insert("event".to_string(), Value::String("plan".to_string()));
+            insert_optional_str(row, "source", Some(plan.source));
+            insert_optional_str(row, "network", Some(plan.network_name));
+            for (key, value) in terms {
+                row.insert(key, Value::Number(Number::from(value)));
+            }
         });
     }
 

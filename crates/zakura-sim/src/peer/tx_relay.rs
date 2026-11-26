@@ -616,7 +616,7 @@ impl RelayPeer {
             &bind_config(peer_addr(self.index, 0)),
             &QuicConfig {
                 stream_receive_window_bytes: RECEIVE_WINDOW,
-                receive_window_bytes: RECEIVE_WINDOW,
+                receive_window_bytes: Some(RECEIVE_WINDOW),
                 idle_timeout_secs: IDLE_TIMEOUT_SECS,
                 ..QuicConfig::default()
             },

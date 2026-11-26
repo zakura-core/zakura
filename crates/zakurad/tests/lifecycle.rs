@@ -1112,6 +1112,35 @@ fn stored_config_fixtures_load() {
     }
 }
 
+/// A config file setting the removed `[network.zakura] peer_memory_budget_bytes`
+/// fails to load and names `[memory] budget` (`02 §2`).
+#[test]
+fn removed_peer_memory_budget_bytes_fails_and_names_memory_budget() {
+    let scratch = Scratch::new();
+    let config_path = scratch.path().join("legacy-budget.toml");
+    fs::write(
+        &config_path,
+        "[network.zakura]\npeer_memory_budget_bytes = 16106127360\n",
+    )
+    .expect("write config");
+    let empty_state = scratch.path().join("empty-state");
+    let run = scratch.run(&mut scratch.command([
+        OsStr::new("-c"),
+        config_path.as_os_str(),
+        OsStr::new("tip-height"),
+        OsStr::new("--network"),
+        OsStr::new("Testnet"),
+        OsStr::new("--cache-dir"),
+        empty_state.as_os_str(),
+    ]));
+    assert_ne!(run.status.code(), Some(0));
+    let combined = format!("{}\n{}", run.stdout, run.stderr);
+    assert!(
+        combined.contains("[memory] budget"),
+        "expected error naming [memory] budget, got:\n{combined}"
+    );
+}
+
 /// `generate` panics with its usual report when it can't create the output file.
 #[test]
 fn generate_reports_file_creation_failure() {

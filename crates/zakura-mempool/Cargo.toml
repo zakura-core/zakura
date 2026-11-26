@@ -1,6 +1,6 @@
 [package]
 name = "zakura-mempool"
-version = "0.1.1"
+version = "0.1.0"
 authors.workspace = true
 description = "Zakura's transaction pool: its storage, its rules and the pool core. Internal crate, published to support cargo install zakura"
 license.workspace = true
@@ -22,7 +22,7 @@ proptest-impl = ["proptest", "proptest-derive"]
 zakura-chain = { path = "../zakura-chain", version = "17.0.0" }
 zakura-node-services = { path = "../zakura-node-services", version = "6.0.0" }
 zakura-rt = { path = "../zakura-rt", version = "0.4.0" }
-zakura-script = { path = "../zakura-script", version = "5.0.8" }
+zakura-script = { path = "../zakura-script", version = "5.0.9" }
 zcash_script = { workspace = true }
 
 chrono = { workspace = true }

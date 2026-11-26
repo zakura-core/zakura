@@ -3026,7 +3026,7 @@ dependencies = [
 
 [[package]]
 name = "zakura"
-version = "1.9.0-rc3"
+version = "1.9.0-rc2"
 dependencies = [
  "base64",
  "bytes",
@@ -3217,7 +3217,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-consensus"
-version = "18.0.1"
+version = "18.0.0"
 dependencies = [
  "blake2b_simd",
  "chrono",
@@ -3369,7 +3369,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-mempool"
-version = "0.1.1"
+version = "0.1.0"
 dependencies = [
  "chrono",
  "eyre",
@@ -3652,7 +3652,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-rpc"
-version = "19.0.1"
+version = "19.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3766,7 +3766,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-script"
-version = "5.0.8"
+version = "5.0.9"
 dependencies = [
  "hex",
  "ripemd",

@@ -473,7 +473,11 @@ connection. The receiver's relay-flagged indices become its pushed seeds.
 The receiver holds flagged indices as pending claims: it does not pull them
 until they turn late, and it releases a late push like a late pull (section
 7). Each flagged `Have` starts its own late time from its own estimated
-arrival, so a later flag never delays an earlier one. A pushed part that crosses another peer's copy of the same index returns
+arrival, so a later flag never delays an earlier one. A pending push belongs
+to the session that flagged it. When the peer reconnects and flags it again on
+its new session, the push moves to that session and keeps its earlier late time.
+A flag from a session the node has already replaced or removed expects nothing,
+so it never takes a push back. A pushed part that crosses another peer's copy of the same index returns
 `Drop` as surplus.
 
 BPv1 defines no lanes. The subscription rules below use lanes and
@@ -791,9 +795,11 @@ Section 8 lists every field in transmission order.
 A node MUST send `HeaderMeta` for a block at most once per connection. It
 MUST forward only metadata it admitted, and only within the propagation window
 in section 2. It SHOULD forward admitted metadata promptly to every peer, including peers without subscriptions. Forwarding MUST NOT wait
-for parts or a per-hop request. It SHOULD NOT send metadata to a peer that
-already sent it the block's metadata. The proposer SHOULD write `HeaderMeta` to
-every peer before it writes any part.
+for parts or a per-hop request. It SHOULD NOT send metadata on a connection
+on which the peer already sent it the block's metadata. A peer's later
+connection never carried that copy, so it gets the metadata like any other
+connection, even when the peer sent the first copy on an earlier connection.
+The proposer SHOULD write `HeaderMeta` to every peer before it writes any part.
 
 A header that headerchain rejects returns `Disconnect` when headerchain
 classifies the failure as peer-caused. A missing parent invokes bounded

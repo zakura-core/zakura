@@ -126,17 +126,12 @@ impl PeerState {
                     "{PEER_REPLAY}: bpv1-73 plain Have for index {i} of {block_id:?} before the deadline"
                 );
             }
-            // bpv1-8: no Have, Part, or Done goes out before HeaderMeta crossed.
-            if !block.meta_exchanged() {
-                assert!(
-                    block.send_mark.count_ones() == 0
-                        && block.local_have_sent.count_ones() == 0
-                        && block.local_stripe_done_sent.count_ones() == 0
-                        && !block.local_block_done_sent
-                        && block.pending_have.is_empty(),
-                    "{PEER_REPLAY}: bpv1-8 block traffic queued for {block_id:?} before HeaderMeta crossed"
-                );
-            }
+            // bpv1-8: HeaderMeta crossed from admission on, so no Have,
+            // Part, or Done goes out before it.
+            assert!(
+                block.meta_sent || block.meta_received,
+                "{PEER_REPLAY}: bpv1-8 admitted {block_id:?} before HeaderMeta crossed"
+            );
         }
         // bpv1-50: proof work runs only for an accepted part, once per part.
         let mut verifying = HashSet::new();

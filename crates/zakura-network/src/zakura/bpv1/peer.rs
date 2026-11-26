@@ -181,7 +181,7 @@ pub enum DropReason {
 }
 
 /// Block admitted locally in `BlockTable`; triggers `HeaderMeta` send (unless
-/// the peer already sent it) and replays held early entries.
+/// it already crossed this connection) and replays held early entries.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BlockAdmitted {
     /// Consensus block hash.
@@ -190,8 +190,12 @@ pub struct BlockAdmitted {
     pub coding: Coding,
     /// Committed proposer transport identity.
     pub proposer_node: NodeId,
-    /// Full `HeaderMeta` message to forward if this peer did not send it.
-    pub header_meta: Option<Box<Bpv1Message>>,
+    /// Full `HeaderMeta` message, which the session forwards unless the
+    /// metadata already crossed its connection. A new session of the peer
+    /// that sent it first still gets it. Every admitted block carries it,
+    /// so the metadata crosses each connection before any block traffic
+    /// (bpv1-8, bpv1-14).
+    pub header_meta: Box<Bpv1Message>,
     /// Whether this local node is the block's proposer (queues `BlockDone` right after `HeaderMeta`, bpv1-9).
     pub as_proposer: bool,
     /// Outside the block's `Have` initial group: when the peer may first
@@ -497,6 +501,9 @@ pub enum PeerOutput {
         block_id: block::Hash,
         /// Verified part.
         part: VerifiedPart,
+        /// Generation of the session that accepted the part, which owns its
+        /// charge.
+        session_gen: u64,
         /// How the part was authorized.
         auth: PartAuth,
     },
@@ -547,7 +554,7 @@ pub enum PeerOutput {
         /// Whether to also purge queued `Have`s (true on retirement).
         include_haves: bool,
     },
-    /// Release node-wide pull claims for undelivered indices (late pull or deadline).
+    /// Release this session's pull claims for undelivered indices (late pull, deadline, or refused grant).
     ReleaseClaims {
         /// Block consensus hash.
         block_id: block::Hash,
@@ -744,7 +751,12 @@ struct PeerBlockState {
     /// As the proposer: direct copies waiting for an idle data writer, in
     /// release order (decision-19).
     copies: VecDeque<VerifiedPart>,
+    /// This session wrote the block's `HeaderMeta`. A repeated
+    /// `BlockAdmitted` never writes it twice (bpv1-4).
     meta_sent: bool,
+    /// The peer sent the block's `HeaderMeta` on this connection. Admission
+    /// sets `meta_sent` or this, so the metadata crossed before any block
+    /// traffic (bpv1-8, bpv1-14).
     meta_received: bool,
     send_mark: BitSet,
     recv_record: BitSet,
@@ -792,10 +804,6 @@ impl PeerBlockState {
             have_held_until: None,
             have_delayed: false,
         }
-    }
-
-    fn meta_exchanged(&self) -> bool {
-        self.meta_sent || self.meta_received
     }
 
     /// Set bits of `set` in `stripe`.
@@ -1207,7 +1215,7 @@ impl PeerState {
     pub fn step(&mut self, now: Instant, input: PeerInput) -> PeerStep {
         let mut step = PeerStep::default();
         if matches!(input, PeerInput::SessionEnd) {
-            self.handle_session_end(&mut step);
+            self.handle_session_end();
             return step;
         }
         if self.is_closed() {
@@ -1367,17 +1375,16 @@ impl PeerState {
         }
 
         // bpv1-4: send HeaderMeta at most once per connection, and never back
-        // to a peer that sent it first.
-        if let Some(meta) = header_meta {
-            if !state.meta_received && !state.meta_sent {
-                state.meta_sent = true;
-                step.outputs.push(PeerOutput::SendControl(meta));
-            }
+        // on a connection that sent it. The session's own record decides,
+        // because a peer's later session never received this copy.
+        if !state.meta_received && !state.meta_sent {
+            state.meta_sent = true;
+            step.outputs.push(PeerOutput::SendControl(header_meta));
         }
 
         // bpv1-9: proposer queues BlockDone right after HeaderMeta so no peer
         // pushes or announces parts back.
-        if as_proposer && state.meta_exchanged() && !state.local_block_done_sent {
+        if as_proposer && !state.local_block_done_sent {
             state.local_block_done_sent = true;
             step.outputs
                 .push(PeerOutput::SendControl(Box::new(Bpv1Message::BlockDone {
@@ -1480,13 +1487,7 @@ impl PeerState {
             return;
         }
 
-        // 5. HeaderMeta must have crossed in either direction before accept (bpv1-14).
-        if !block.meta_exchanged() {
-            self.buffer_early_data(now, EarlyDataKind::Part(prefix), step);
-            return;
-        }
-
-        // 6. Attribution: a push slot first (bpv1-69), a seed when the
+        // 5. Attribution: a push slot first (bpv1-69), a seed when the
         //    proposer opened it (bpv1-16), then live Want (bpv1-13).
         // Widening u32 to usize is lossless on supported targets.
         let flagged = block.peer_flagged.get(index as usize);
@@ -1622,6 +1623,7 @@ impl PeerState {
         step.outputs.push(PeerOutput::InsertPart {
             block_id: token.block_id,
             part,
+            session_gen: token.session_gen,
             auth: inflight.auth,
         });
     }
@@ -1655,10 +1657,6 @@ impl PeerState {
         let Some(block) = self.blocks.get_mut(&block_id) else {
             return;
         };
-        // bpv1-8: never queue Have/Part/Done before HeaderMeta crossed.
-        if !block.meta_exchanged() {
-            return;
-        }
         // bpv1-9 / decision-20: the proposer never announces its own block.
         if block.as_proposer {
             return;
@@ -1755,12 +1753,7 @@ impl PeerState {
         let Some(block) = self.blocks.get_mut(&block_id) else {
             return;
         };
-        // bpv1-8: never queue Have/Part before HeaderMeta crossed.
-        if !block.meta_exchanged()
-            || block.peer_block_done
-            || self.remote_node == block.proposer_node
-            || block.as_proposer
-        {
+        if block.peer_block_done || self.remote_node == block.proposer_node || block.as_proposer {
             return;
         }
         let bound = block.coding.n.saturating_sub(block.coding.k);
@@ -1959,10 +1952,7 @@ impl PeerState {
             reject(step);
             return;
         };
-        if !block.meta_exchanged()
-            || stripe >= block.coding.stripes
-            || !requested.all_below(block.coding.n)
-        {
+        if stripe >= block.coding.stripes || !requested.all_below(block.coding.n) {
             reject(step);
             return;
         }
@@ -2053,8 +2043,8 @@ impl PeerState {
         let Some(block) = self.blocks.get_mut(&block_id) else {
             return;
         };
-        // bpv1-8 / bpv1-9: only the proposer seeds, after `HeaderMeta` crossed.
-        if !block.meta_exchanged() || block.peer_block_done || !block.as_proposer {
+        // bpv1-9: only the proposer seeds.
+        if block.peer_block_done || !block.as_proposer {
             return;
         }
         let mut relay: Vec<VerifiedPart> = Vec::new();
@@ -2218,12 +2208,9 @@ impl PeerState {
             return;
         }
 
-        // If HeaderMeta hasn't crossed or peer already sent BlockDone/StripeDone,
-        // serve 0 parts and end cleanly.
-        if !block.meta_exchanged()
-            || block.peer_block_done
-            || block.peer_stripe_done.get(stripe as usize)
-        {
+        // If the peer already sent BlockDone/StripeDone, serve 0 parts and
+        // end cleanly.
+        if block.peer_block_done || block.peer_stripe_done.get(stripe as usize) {
             self.end_want(want_id, want, 0, WantEndReason::Served, step);
             return;
         }
@@ -2338,7 +2325,7 @@ impl PeerState {
         let Some(block) = self.blocks.get_mut(&block_id) else {
             return;
         };
-        if !block.meta_exchanged() || stripe >= block.coding.stripes {
+        if stripe >= block.coding.stripes {
             return;
         }
         // bpv1-39: announce StripeDone at most once per (block, stripe) per connection.
@@ -2355,9 +2342,6 @@ impl PeerState {
         let Some(block) = self.blocks.get_mut(&block_id) else {
             return;
         };
-        if !block.meta_exchanged() {
-            return;
-        }
         // bpv1-39: announce BlockDone at most once per block per connection.
         if !block.local_block_done_sent {
             block.local_block_done_sent = true;
@@ -2599,19 +2583,10 @@ impl PeerState {
         }
     }
 
-    fn handle_session_end(&mut self, step: &mut PeerStep) {
-        // Release all outstanding node-wide pull claims before clearing state (bpv1-62).
-        for want in self.wants_out.values() {
-            let slots = want.unreceived_slots();
-            if !slots.is_empty() {
-                step.outputs.push(PeerOutput::ReleaseClaims {
-                    block_id: want.block_id,
-                    stripe: want.stripe,
-                    slots,
-                    reason: ReleaseReason::Refused,
-                });
-            }
-        }
+    /// Clears every per-session record. The table's `SessionEnded` releases
+    /// this session's pull claims and pending pushes (bpv1-62), including
+    /// grants that never reached the session, so the end emits nothing.
+    fn handle_session_end(&mut self) {
         self.blocks.clear();
         self.meta_received_pending.clear();
         self.retired.clear();

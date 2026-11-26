@@ -808,7 +808,8 @@ impl MachineMesh {
         };
         let step = state.step(self.now, input);
         state.assert_invariants();
-        self.apply_peer_step(node, peer, step);
+        let session_gen = state.session_gen();
+        self.apply_peer_step(node, (peer, session_gen), step);
     }
 
     /// Steps `node`'s table and runs its outputs.
@@ -937,7 +938,7 @@ impl MachineMesh {
             .collect()
     }
 
-    fn apply_peer_step(&mut self, node: usize, peer: usize, step: PeerStep) {
+    fn apply_peer_step(&mut self, node: usize, (peer, session_gen): (usize, u64), step: PeerStep) {
         for event in &step.events {
             match event {
                 PeerEvent::PartPrefix { block_id, auth, .. } => {
@@ -953,7 +954,7 @@ impl MachineMesh {
         let peer_id = self.nodes[peer].id;
         for output in step.outputs {
             let states = || self.peer_states_for(node);
-            match route_peer_output(peer_id, output, states) {
+            match route_peer_output(peer_id, session_gen, output, states) {
                 PeerRoute::Table(input) => self.step_table(node, input),
                 PeerRoute::Session(output) => self.session_output(node, peer, output),
             }
@@ -967,7 +968,11 @@ impl MachineMesh {
             .extend(step.events.into_iter().map(|event| (now, event)));
         for output in step.outputs {
             match route_block_output(output) {
-                BlockRoute::Peer { peer, input, .. } => {
+                BlockRoute::Peer {
+                    peer,
+                    session_gen,
+                    input,
+                } => {
                     if let PeerInput::PullGranted(grant) = &input {
                         self.nodes[node].grants.push((
                             now,
@@ -981,7 +986,7 @@ impl MachineMesh {
                         Some(idx) => self.step_peer(node, idx, input),
                         None => {
                             let states = || self.peer_states_for(node);
-                            if let Some(release) = refused_grant(peer, input, states) {
+                            if let Some(release) = refused_grant(peer, session_gen, input, states) {
                                 self.step_table(node, release);
                             }
                         }

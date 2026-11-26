@@ -208,7 +208,7 @@ fn peer_seeds() -> Vec<Bpv1Seed> {
     ]
 }
 
-// Decoder 3 of `bpv1_block`. Block `(a >> 2) % 3`, peer `a % 3`.
+// Decoder 4 of `bpv1_block`. Block `(a >> 2) % 3`, peer `a % 3`.
 const BLOCK_TIP: u8 = 0;
 const BLOCK_PARENT: u8 = 1;
 const BLOCK_META: u8 = 2;

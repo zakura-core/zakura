@@ -278,7 +278,7 @@ cargo +nightly-2026-07-15 fuzz run --fuzz-dir . credential_parse
 | Target | Property | Decoder |
 | --- | --- | --- |
 | `bpv1_peer` | `bpv1/peer-replay` | 2 |
-| `bpv1_block` | `bpv1/block-replay` | 3 |
+| `bpv1_block` | `bpv1/block-replay` | 4 |
 | `bpv1_mesh` | `bpv1/mesh` | 1 |
 | `bpv1_wire` | `bpv1/wire` | 1 |
 | `bpv1_codec` | `bpv1/codec` | 1 |

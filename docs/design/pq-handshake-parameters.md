@@ -349,25 +349,73 @@ slot, a quarter of the cores, for `Hello`, `Peers` and the book file.
 
 ### 7.3 Bandwidth
 
-A connection that another service shares exchanges discovery messages
-every 15 seconds (`SEND_INTERVAL`): each side sends its `Hello`, whether
-its record changed or not, and a `GetPeers`, and answers the other's. A
-frame adds 8 bytes. Computed from those constants and the sizes above, per
-connection and direction:
+On a shared connection, peer and live-service queries continue every 15
+seconds. The node sends its signed `Hello` on a new stream and when the
+record changes. Each transmission costs 5,638 bytes including framing.
+At 92 persistent connections, one publication costs 518,696 bytes in the
+sending direction. With a stable address and service list, the record is
+renewed roughly once a day. Reconnects cost one full `Hello` per stream.
 
-| | Before | After |
-|---|---|---|
-| `Hello`, steady state | 24.6 B/s | 375.9 B/s |
-| `Peers`, one 32-record window per 10-minute epoch | 19.3 B/s | 300.3 B/s |
-| `Peers`, a full answer every 15 seconds | 770.8 B/s | 1,502.0 B/s |
+For comparison, sending the unchanged record every 15 seconds on all 92
+connections would cost 2.99 GB per day in each direction. The older 361-byte
+record at that cadence cost 0.20 GB. These are application-frame estimates
+for continuously occupied connections and exclude transport overhead.
 
-A default node holds up to 92 connections (`DEFAULT_ZAKURA_MAX_CONNECTIONS`).
-Its `Hello`s then cost 34.6 kB/s in each direction, 3.0 GB a day, where
-they cost 2.3 kB/s. Its `Peers` answers cost 27.6 kB/s at one window per
-peer and epoch, 138 kB/s if every answer is full of default records, and
-at most 148 kB/s, the served cap on every answer.
+With a 24,098-byte outgoing payload limit, a full reply of four default
+records costs 22,530 bytes with framing. At one such reply every 15 seconds
+on 92 connections, this is 138.2 kB/s in the sending direction. Sending one
+full 32-record sample to each peer every ten minutes costs about 27.6 kB/s.
 
-A requester gets 4 records per answer, not 32. One peer's 32-record window
+A requester gets four default records per answer. One peer's 32-record window
 takes at least 8 answers, 105 seconds after the first: a requester excludes
 only the records it stored, so one it discards can be served again. A
 discovery-only connection, which makes one exchange, yields 4 records.
+
+### 7.4 Cold discovery
+
+The decision metric was time for an empty node to register four distinct peers
+beyond its seed. Four is the default number of concurrent discovery dials.
+The local Regtest comparison used native QUIC, one seed with 32 confirmed
+records, and the ordinary discovery service and candidate dialer. Each record
+had one IPv4 address and seven services. On the limited path the seed's UDP
+downlink carried 1 Mbit/s with 40 ms of added delay. Candidate dials used
+loopback directly. The per-IP allowance was raised to allow the nodes to
+share one host.
+
+| Outgoing payload cap | Default records in first reply | Median time to four, all reachable | Median discovery traffic to four, all reachable |
+|---|---:|---:|---:|
+| 24,098 B | 4 | 1.21 s | 46 kB |
+| 48,000 B | 8 | 1.21 s | 58 kB |
+| 96,000 B | 17 | 1.21 s | 108 kB |
+| 192,000 B | 32 | 2.21 s | 193 kB |
+
+Each row is five fresh requesters using a shared seed connection. Traffic
+counts discovery frames read at either end involving the requester, in both
+directions. It excludes handshake, packet, and other service traffic.
+
+With 16 of the 32 advertised addresses stale, the requester sometimes had
+enough reachable addresses in its book well before it registered four peers.
+The dialer allows four concurrent attempts, and a live registration can stay
+under observation for up to 60 seconds. For a second comparison, three fresh
+requesters per cap had up to 75 seconds to register four non-seed peers.
+All twelve reached four.
+
+| Outgoing payload cap | Median time to four, half stale | Median discovery traffic to four, half stale |
+|---|---:|---:|
+| 24,098 B | 26.2 s | 96 kB |
+| 48,000 B | 41.3 s | 193 kB |
+| 96,000 B | 31.3 s | 238 kB |
+| 192,000 B | 32.3 s | 238 kB |
+
+The outgoing cap stays at 24,098 bytes. Larger replies delivered more
+addresses on the first exchange, but used more bytes without a consistent
+improvement in registration time. These small local samples cover one
+topology. They do not estimate bootstrap latency on Mainnet.
+
+Discovery-only seeds need separate qualification. At the existing cap, the
+seed offered four records per full answer. With all candidates reachable,
+both unrestricted controls decoded a four-record answer, while neither of
+the two bandwidth-limited controls decoded a nonempty answer. None registered
+a non-seed peer within 20 seconds. These observations do not establish where
+delivery or import stopped. The shared-connection results above apply to a
+seed that stays connected across exchanges.

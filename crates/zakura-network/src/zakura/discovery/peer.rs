@@ -116,6 +116,8 @@ pub(super) struct PeerIO {
     pub(super) state: SharedPeerState,
     /// Paces `Hello` to its row's send interval.
     pub(super) hello: CadenceSender<DiscoveryMessage>,
+    /// Signature of the last self-record queued on this stream.
+    pub(super) last_hello_signature: Option<[u8; 64]>,
     /// This session's queries. A query waits until the previous query of its
     /// kind is answered.
     pub(super) queries: Queries,
@@ -288,7 +290,7 @@ impl PeerIO {
                     "failed to refresh Zakura discovery self-record"
                 );
             })?;
-        self.send_hello((*record).clone())?;
+        self.send_hello(&record)?;
 
         let limit = u16::try_from(
             self.handle
@@ -313,13 +315,23 @@ impl PeerIO {
     /// Sends `record` as `Hello` if the row's interval has passed and the
     /// previous `Hello` was written. Otherwise the next exchange offers a
     /// fresh record. Returns `Err(())` once the stream is gone.
-    fn send_hello(&mut self, record: ZakuraNodeRecord) -> Result<(), ()> {
+    fn send_hello(&mut self, record: &ZakuraNodeRecord) -> Result<(), ()> {
+        if self.last_hello_signature == Some(record.signature) {
+            return Ok(());
+        }
         let sent = self
             .hello
-            .update(DiscoveryMessage::Hello { record })
+            .update(DiscoveryMessage::Hello {
+                record: record.clone(),
+            })
             .and_then(|()| self.hello.send_due(&self.session.send));
         match sent {
-            Ok(_) => Ok(()),
+            Ok(queued) => {
+                if queued > 0 {
+                    self.last_hello_signature = Some(record.signature);
+                }
+                Ok(())
+            }
             Err(CadenceSendError::Closed) => Err(()),
             Err(error) => {
                 tracing::debug!(

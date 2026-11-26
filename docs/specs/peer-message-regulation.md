@@ -397,8 +397,9 @@ A discovery-only connection makes one exchange and gets one answer.
   - on_empty = record and forward (exhaustion is not a violation)
 
 The sender MAY send one initial `Hello`. It MUST send later `Hello` messages at least 15 seconds
-apart. A long-lived shared connection MAY carry periodic `Hello` messages, including an unchanged
-signed record. A discovery-only connection can finish after one exchange; this does not impose a
+apart. Zakura queues its current signed record once per discovery stream and again when it
+changes. Peer and live-service queries continue at their normal cadence. Receivers still accept
+a repeated valid record. A discovery-only connection can finish after one exchange; this does not impose a
 lifetime limit of one or two messages on shared connections. The handler MUST apply sequence and
 expiry policy. It need not maintain a separate relevance snapshot. A repeated valid record MUST
 still satisfy initial-exchange progress when the receiver already knows that record.

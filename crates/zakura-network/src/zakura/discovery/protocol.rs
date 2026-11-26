@@ -1797,7 +1797,7 @@ impl ZakuraDiscoveryHandle {
             .await
     }
 
-    async fn current_self_record_for_gossip_at(
+    pub(super) async fn current_self_record_for_gossip_at(
         &self,
         now_unix_secs: u64,
         wall_clock_sequence: u64,

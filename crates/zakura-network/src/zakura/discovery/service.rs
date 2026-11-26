@@ -670,6 +670,7 @@ fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
         slot,
         state,
         hello: CadenceSender::new(),
+        last_hello_signature: None,
         queries,
         answers,
         connection_owners,
@@ -1816,6 +1817,7 @@ mod tests {
             slot,
             state: SharedPeerState::default(),
             hello: CadenceSender::new(),
+            last_hello_signature: None,
             answers: serving.answers_written(),
             connection_owners: Vec::new(),
             peer_node_id,
@@ -3371,11 +3373,10 @@ mod tests {
         authors
     }
 
-    /// The source sends `Hello` once per send interval: an exchange inside the
-    /// interval sends none, and the first exchange after it sends the current
-    /// self-record.
+    /// Each stream sends the current record once and retries changed records after deferral.
     #[tokio::test(start_paused = true)]
-    async fn exchange_resends_hello_once_its_interval_passes() -> Result<(), crate::BoxError> {
+    async fn exchange_sends_only_changed_hello_after_its_interval_passes(
+    ) -> Result<(), crate::BoxError> {
         let (_connected_tx, connected_rx) = watch::channel(Vec::new());
         let handshake = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
         let local_secret = NodeSecretKey::from_bytes(&[52u8; 32]);
@@ -3418,6 +3419,29 @@ mod tests {
             "an exchange inside the interval sends no Hello"
         );
 
+        tokio::time::advance(SEND_INTERVAL).await;
+        source.exchange().await.expect("the session is current");
+        assert!(drain_hello_authors(&mut recv).is_empty());
+
+        let previous = handle.current_self_record();
+        let updated = handle
+            .current_self_record_for_gossip_at(
+                previous.body.expires_at_unix_secs,
+                previous.body.sequence + 1,
+            )
+            .await?;
+        assert_ne!(previous.signature, updated.signature);
+        source.exchange().await.expect("the session is current");
+        assert_eq!(drain_hello_authors(&mut recv), vec![local_node_id]);
+
+        handle
+            .current_self_record_for_gossip_at(
+                updated.body.expires_at_unix_secs,
+                updated.body.sequence + 1,
+            )
+            .await?;
+        source.exchange().await.expect("the session is current");
+        assert!(drain_hello_authors(&mut recv).is_empty());
         tokio::time::advance(SEND_INTERVAL).await;
         source.exchange().await.expect("the session is current");
         assert_eq!(drain_hello_authors(&mut recv), vec![local_node_id]);
@@ -3643,26 +3667,31 @@ mod tests {
         )
     }
 
-    /// Waits for the source's next refresh, a `GetPeers`, and checks that it
-    /// comes no sooner than the rows' send interval after `since`.
+    /// Both queries refresh after the send interval while the self-record stays unchanged.
     async fn wait_for_next_discovery_refresh(
         peer_recv: &mut FramedRecv,
         since: tokio::time::Instant,
     ) -> Result<(), crate::BoxError> {
         tokio::time::timeout(2 * SEND_INTERVAL, async {
-            loop {
+            let mut peers = false;
+            let mut services = false;
+            while !(peers && services) {
                 let frame = peer_recv
                     .recv()
                     .await
                     .expect("discovery refresh stream remains open");
-                if let DiscoveryMessage::GetPeers(_) = decode_frame::<DiscoveryMessage>(&frame)? {
-                    assert!(
-                        since.elapsed() >= SEND_INTERVAL,
-                        "a refresh waits for the send interval"
-                    );
-                    return Ok(());
+                match decode_frame::<DiscoveryMessage>(&frame)? {
+                    DiscoveryMessage::GetPeers(_) => peers = true,
+                    DiscoveryMessage::GetServices(_) => services = true,
+                    DiscoveryMessage::Hello { .. } => panic!("an unchanged record was resent"),
+                    _ => continue,
                 }
+                assert!(
+                    since.elapsed() >= SEND_INTERVAL,
+                    "a refresh waits for the send interval"
+                );
             }
+            Ok(())
         })
         .await?
     }

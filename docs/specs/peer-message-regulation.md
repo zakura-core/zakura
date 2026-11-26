@@ -1069,11 +1069,11 @@ charge.
     peer holds above 5 costs an admitted body. Its requests also stay within 10,000,000 announced
     bytes, five of the largest, so a deadline never stretches past what 5 requests allow. Then
     the node-wide 500 undecided transactions the pool core holds
-  - requester's pending ids: at most 8,000 per session. Past 256 in a session, an id is taken
-    while sessions hold fewer than 64,000 pending records, or, if no session holds it yet, fewer
-    than 128,000, all provisional. A record counts until its session drops it. Ids a session
-    keeps before its `Hello` or the go count only against its own 8,000. The rest is dropped,
-    never a violation
+  - requester's pending ids: at most 8,000 per session. Past 1,024 in a session, an id is taken
+    while sessions hold fewer than 64,000 pending records past their 1,024 each, or, if no
+    session holds it yet, fewer than 128,000, all provisional. A record counts until its session
+    drops it. Ids a session keeps before its `Hello` or the go count only against its own 8,000.
+    The rest is dropped, never a violation
   - receiver: at most the requests its `Hello` serves, and one more closes, as row 8 says. Each
     request waits on its data writer as an id, and the writer builds the body from the pool as it
     is when it reaches it, so the data stream's output share bounds the bytes queued to the peer,

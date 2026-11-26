@@ -133,24 +133,25 @@ fn a_full_load_keeps_its_budgets_and_its_state_bounded() {
         machine.have(session, &ids, now);
         sessions.push(session);
     }
-    // The first sessions fill the node-wide cap, and the rest hold their
-    // share, the ids past it counted as overflow, which closes nothing.
-    let full = PENDING_CAP / PENDING_PER_PEER;
-    let dropped = u64::try_from(PENDING_PER_PEER - PENDING_SHARE).expect("fits");
+    // Each session takes its share, then more while what sessions hold
+    // past their shares is under the cap. Once it is full the rest hold
+    // their share, the ids past it counted as overflow, which closes
+    // nothing.
+    let mut excess = 0;
     for (n, session) in sessions.iter().enumerate() {
         let state = machine.session(*session).expect("live");
-        let (held, overflow) = if n < full {
-            (PENDING_PER_PEER, 0)
-        } else {
-            (PENDING_SHARE, dropped)
-        };
+        let past = (PENDING_PER_PEER - PENDING_SHARE).min(PENDING_CAP - excess);
+        excess += past;
+        let held = PENDING_SHARE + past;
+        let overflow = u64::try_from(PENDING_PER_PEER - held).expect("fits");
         assert_eq!(state.pending.len(), held, "session {n}'s pending set");
         assert_eq!(state.overflow, overflow, "session {n}'s overflow");
     }
+    let full = PENDING_CAP / (PENDING_PER_PEER - PENDING_SHARE);
     // Sessions that have not sent their `Hello` keep what they were
     // announced while they wait, within their own pending bound, and that
     // leaves what fetchable sessions may take alone.
-    let records = machine.shared.pending;
+    let counted = machine.shared.excess;
     let silent: Vec<_> = (0..=full)
         .map(|n| {
             let peer = SESSIONS + u64::try_from(n).expect("small");
@@ -163,7 +164,7 @@ fn a_full_load_keeps_its_budgets_and_its_state_bounded() {
         let state = machine.session(*session).expect("live");
         assert_eq!(state.waiting.len(), PENDING_PER_PEER, "silent session {n}");
     }
-    assert_eq!(machine.shared.pending, records, "waiting holds no record");
+    assert_eq!(machine.shared.excess, counted, "waiting holds no record");
     // Once one may fetch, what it kept joins its pending set by the same
     // rule as any announcement. Every id already has a source, so past the
     // full cap it keeps its share and no id loses its source. Sessions that
@@ -181,7 +182,14 @@ fn a_full_load_keeps_its_budgets_and_its_state_bounded() {
     }
     let live = sessions.len() + silent.len() + late.len();
     let bound = 2 * PENDING_CAP + live * PENDING_SHARE;
-    assert!(machine.shared.pending <= bound, "records stay bounded");
+    let records: usize = sessions
+        .iter()
+        .chain(&silent)
+        .chain(&late)
+        .filter_map(|session| machine.session(*session))
+        .map(|state| state.pending.len())
+        .sum();
+    assert!(records <= bound, "records stay bounded");
     for session in silent.into_iter().chain(late) {
         machine.end(session, now);
     }
@@ -338,12 +346,58 @@ fn interleaved_full_pools_leave_every_id_a_source() {
             machine.have(*session, chunk, now);
         }
     }
-    assert!(machine.shared.pending >= PENDING_CAP, "the cap filled");
+    assert!(machine.shared.excess >= PENDING_CAP, "the cap filled");
     assert_eq!(
         machine.wanted().len(),
         PENDING_PER_PEER,
         "every id a source"
     );
+    machine.assert_invariants();
+}
+
+/// Ten sessions that announce ids they never serve leave honest peers that
+/// all announce the same full pool every id a source: honest shares don't
+/// count toward the cap, so they never use up the first sources' room.
+#[test]
+fn honest_shares_leave_first_sources_room_under_a_flood() {
+    let script = script_len();
+    let pool_size = u32::try_from(PENDING_PER_PEER).expect("small");
+    let pool: Vec<(UnminedTxId, u32)> = (0..pool_size)
+        .map(|n| (body(n, script).id(), SIZE))
+        .collect();
+    let config = RelayConfig {
+        fan_out: super::FanOut::default(),
+        short_id_key: 7,
+    };
+    let mut machine = RelayMachine::new(config, on(Vec::new()), Vec::new());
+    let now = Duration::ZERO;
+    let per = u64::try_from(PENDING_PER_PEER).expect("small");
+    let flooders = 10;
+    for peer in 0..flooders {
+        let made_up: Vec<(UnminedTxId, u32)> =
+            (0..per).map(|n| (plain_id(peer * per + n), SIZE)).collect();
+        let session = machine.connect(PeerKey(peer), false, now);
+        machine.hello(session, hello(), now);
+        machine.have(session, &made_up, now);
+    }
+    let honest: Vec<_> = (flooders..92)
+        .map(|peer| {
+            let session = machine.connect(PeerKey(peer), false, now);
+            machine.hello(session, hello(), now);
+            session
+        })
+        .collect();
+    for chunk in pool.chunks(MAX_HAVE_ENTRIES) {
+        for session in &honest {
+            machine.have(*session, chunk, now);
+        }
+    }
+    let wanted = machine.wanted();
+    let sourced = pool
+        .iter()
+        .filter(|(id, _)| wanted.entry(*id).is_some_and(|entry| entry.holders > 0))
+        .count();
+    assert_eq!(sourced, pool.len(), "every honest id a source");
     machine.assert_invariants();
 }
 
@@ -353,7 +407,10 @@ fn interleaved_full_pools_leave_every_id_a_source() {
 #[test]
 fn a_decided_reference_counts_until_its_session_drops_it() {
     let script = script_len();
-    let ids: Vec<(UnminedTxId, u32)> = (0..10).map(|n| (body(n, script).id(), SIZE)).collect();
+    // Ten past the session's share, since only those count.
+    let past = 10;
+    let len = u32::try_from(PENDING_SHARE + past).expect("small");
+    let ids: Vec<(UnminedTxId, u32)> = (0..len).map(|n| (body(n, script).id(), SIZE)).collect();
     let config = RelayConfig {
         fan_out: super::FanOut::default(),
         short_id_key: 7,
@@ -364,19 +421,15 @@ fn a_decided_reference_counts_until_its_session_drops_it() {
     let mut holder = PeerMachine::connect(&mut shared, &pool, PeerKey(1), now);
     holder.hello(&mut shared, &pool, hello(), now);
     holder.have(&mut shared, &pool, &ids, now);
-    assert_eq!(shared.pending, ids.len());
+    assert_eq!(shared.excess, past);
 
     for (id, _) in &ids {
         let generation = shared.wanted.entry(*id).expect("wanted").generation;
         shared.wanted.decide(*id, generation);
     }
-    assert_eq!(
-        shared.pending,
-        ids.len(),
-        "still held until it reads the ring"
-    );
+    assert_eq!(shared.excess, past, "still held until it reads the ring");
     holder.tick(&mut shared, &pool, now);
-    assert_eq!(shared.pending, 0, "dropped once it read the decisions");
+    assert_eq!(shared.excess, 0, "dropped once it read the decisions");
 }
 
 /// A cheap distinct id: the machine only keys on ids.
@@ -387,9 +440,9 @@ fn plain_id(n: u64) -> UnminedTxId {
 }
 
 /// Sessions that read decisions late still hold their references, so
-/// first sources stop at twice the cap's references however fast the table
-/// empties: holders of decided ids they have not read yet, and each next
-/// session taking fresh ids, stay within that plus their shares.
+/// first sources stop at twice the cap however fast the table empties:
+/// what holders of decided ids they have not read yet, and each next
+/// session taking fresh ids, hold past their shares stays within it.
 #[test]
 fn late_readers_keep_first_sources_within_twice_the_cap() {
     let config = RelayConfig {
@@ -417,12 +470,7 @@ fn late_readers_keep_first_sources_within_twice_the_cap() {
         }
         machines.push(holder);
     }
-    let shares = usize::try_from(holders).expect("small") * PENDING_SHARE;
-    assert!(
-        shared.pending <= 2 * PENDING_CAP + shares,
-        "{}",
-        shared.pending
-    );
+    assert!(shared.excess <= 2 * PENDING_CAP, "{}", shared.excess);
 }
 
 /// A session that gets the go takes its waiting ids in and counts them
@@ -431,7 +479,9 @@ fn late_readers_keep_first_sources_within_twice_the_cap() {
 #[test]
 fn the_go_counts_the_ids_it_takes_in() {
     let script = script_len();
-    let ids: Vec<(UnminedTxId, u32)> = (0..3).map(|n| (body(n, script).id(), SIZE)).collect();
+    let past = 3;
+    let len = u32::try_from(PENDING_SHARE + past).expect("small");
+    let ids: Vec<(UnminedTxId, u32)> = (0..len).map(|n| (body(n, script).id(), SIZE)).collect();
     let config = RelayConfig {
         fan_out: super::FanOut::default(),
         short_id_key: 7,
@@ -449,9 +499,5 @@ fn the_go_counts_the_ids_it_takes_in() {
     first.end_session(&mut shared);
     second.read_mail(&mut shared, &pool, Mail::Go);
     assert_eq!(second.state.pending.len(), ids.len());
-    assert_eq!(
-        shared.pending,
-        ids.len(),
-        "counted before anyone else reads"
-    );
+    assert_eq!(shared.excess, past, "counted before anyone else reads");
 }

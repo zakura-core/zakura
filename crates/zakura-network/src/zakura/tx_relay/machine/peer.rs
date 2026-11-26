@@ -16,7 +16,7 @@ use zakura_rt::collections::{HashMap, HashSet};
 use super::MAX_SERVES;
 use super::{
     CallId, EntryGen, PeerKey, Time, WaiterId, BASE_DEADLINE, INITIAL_WINDOW, KNOWN_CAP,
-    MAX_OUTSTANDING_BYTES, MIN_RATE, PENDING_PER_PEER, SENDER_ALLOWANCE,
+    MAX_OUTSTANDING_BYTES, MIN_RATE, PENDING_PER_PEER, PENDING_SHARE, SENDER_ALLOWANCE,
 };
 
 /// What the peer said in its `Hello`.
@@ -163,28 +163,29 @@ impl PeerState {
     }
 
     /// Takes `id` out of the pending set if it is pending in `generation`.
-    /// `records` is the node's count of pending records; see [`PendingSet`].
+    /// `excess` is the node's count of pending records past each session's
+    /// share; see [`PendingSet`].
     pub(crate) fn take_pending_of(
         &mut self,
         id: UnminedTxId,
         generation: EntryGen,
-        records: &mut usize,
+        excess: &mut usize,
     ) -> Option<Pending> {
         if !self.holds(id, generation) {
             return None;
         }
-        self.pending.take(id, records)
+        self.pending.take(id, excess)
     }
 
     /// Drops every pending reference to `id` in `generation`, because it was
-    /// decided. `records` is the node's count of pending records.
+    /// decided. `excess` is as for [`Self::take_pending_of`].
     pub(crate) fn drop_decided(
         &mut self,
         id: UnminedTxId,
         generation: EntryGen,
-        records: &mut usize,
+        excess: &mut usize,
     ) {
-        self.pending.drop_entry(id, generation, records);
+        self.pending.drop_entry(id, generation, excess);
     }
 
     /// Records that it announced or supplied `id`, whose short id is
@@ -447,10 +448,10 @@ pub(crate) type ReadyKey = (Time, u64);
 /// buckets it needs, and the ordered walk keeps every pass over the set
 /// deterministic.
 ///
-/// Every insert and removal takes the node's count of pending records, so
-/// that count is always the records every session holds, released only
-/// when one leaves its set. The node-wide cap reads it; see
-/// `PENDING_CAP`.
+/// Every insert and removal takes the node's count of pending records past
+/// each session's `PENDING_SHARE`, so that count is always what every
+/// session holds past its share, released only when a record leaves its
+/// set. The node-wide cap reads it; see `PENDING_CAP`.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct PendingSet {
     held: BTreeMap<OrdId, PendingSlot>,
@@ -506,9 +507,10 @@ impl PendingSet {
     }
 
     /// Adds `pending`, unfiled until the machine files it, and counts it in
-    /// `records`. The set must not already hold its id: a stale reference
-    /// goes first.
-    pub(crate) fn push(&mut self, pending: Pending, records: &mut usize) {
+    /// `excess` if the set already holds its share. The set must not already
+    /// hold its id: a stale reference goes first.
+    pub(crate) fn push(&mut self, pending: Pending, excess: &mut usize) {
+        let past_share = self.held.len() >= PENDING_SHARE;
         let old = self.held.insert(
             OrdId(pending.id),
             PendingSlot {
@@ -518,8 +520,8 @@ impl PendingSet {
             },
         );
         debug_assert!(old.is_none(), "one reference per id");
-        if old.is_none() {
-            *records = records.saturating_add(1);
+        if old.is_none() && past_share {
+            *excess = excess.saturating_add(1);
         }
     }
 
@@ -541,31 +543,29 @@ impl PendingSet {
     }
 
     /// Takes the pending reference to `id` out, unfiles it, and uncounts it
-    /// from `records`.
-    pub(crate) fn take(&mut self, id: UnminedTxId, records: &mut usize) -> Option<Pending> {
+    /// from `excess` if the set held more than its share.
+    pub(crate) fn take(&mut self, id: UnminedTxId, excess: &mut usize) -> Option<Pending> {
         let held = self.held.remove(&OrdId(id))?;
         if let Some(key) = held.filed {
             self.ready.remove(&key);
         }
-        *records = records.saturating_sub(1);
+        if self.held.len() >= PENDING_SHARE {
+            *excess = excess.saturating_sub(1);
+        }
         Some(held.pending(id))
     }
 
     /// Drops the pending reference to `id` if it is in `generation`.
-    pub(crate) fn drop_entry(
-        &mut self,
-        id: UnminedTxId,
-        generation: EntryGen,
-        records: &mut usize,
-    ) {
+    pub(crate) fn drop_entry(&mut self, id: UnminedTxId, generation: EntryGen, excess: &mut usize) {
         if self.holds(id, generation) {
-            self.take(id, records);
+            self.take(id, excess);
         }
     }
 
-    /// Drops every pending reference, uncounting them from `records`.
-    pub(crate) fn clear(&mut self, records: &mut usize) {
-        *records = records.saturating_sub(self.held.len());
+    /// Drops every pending reference, uncounting those past its share from
+    /// `excess`.
+    pub(crate) fn clear(&mut self, excess: &mut usize) {
+        *excess = excess.saturating_sub(self.held.len().saturating_sub(PENDING_SHARE));
         self.held.clear();
         self.ready.clear();
     }

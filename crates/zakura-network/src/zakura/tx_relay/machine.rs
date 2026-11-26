@@ -177,7 +177,8 @@
 //!   or the session ending. The pool answers it, which frees the slot.
 //! - **Overflow is counted and is never a violation.** An announcement
 //!   that finds its session's pending set full is dropped, and so is one
-//!   [`PENDING_CAP`] turns away. That cap stops copies of ids some session
+//!   [`PENDING_CAP`] turns away. That cap counts only what sessions hold
+//!   past their [`PENDING_SHARE`], and stops copies of ids some session
 //!   holds before it stops an id's first source, so when peers announce
 //!   the same pool, copies of its early ids never cost a later id its only
 //!   source. Ids a session keeps while it waits for the go or a `Hello` are
@@ -290,19 +291,27 @@ pub(crate) const MAX_OUTSTANDING_BYTES: u64 = INITIAL_WINDOW as u64 * MAX_TX_BYT
 /// Ids one session may hold pending: a whole pool at the default size.
 pub(crate) const PENDING_PER_PEER: usize = 8_000;
 
-/// The node-wide pending cap, eight full pending sets (*provisional*). A
-/// session with room takes an announced id while it holds fewer than
-/// [`PENDING_SHARE`], while every session holds fewer pending records than
-/// this, or, if no session holds the id yet, fewer than twice this. So an
-/// id's first source is crowded out only by twice the cap's records, and
-/// records stay within twice the cap plus every session's share. A record
-/// counts from when its set takes it until it leaves the set, however its
-/// entry ends.
+/// The node-wide pending cap, eight full pending sets (*provisional*). It
+/// counts only what sessions hold past their [`PENDING_SHARE`]: each set's
+/// records beyond its share, summed. A session with room takes an announced
+/// id while it holds fewer than its share, while that count is below this,
+/// or, if no session holds the id yet, while it is below twice this. So an
+/// id's first source is crowded out only by twice the cap's records past
+/// the shares, and records stay within twice the cap plus every session's
+/// share. The count changes whenever a set past its share takes or drops a
+/// record, however the record's entry ends.
 pub(crate) const PENDING_CAP: usize = 8 * PENDING_PER_PEER;
 
 /// Ids every session may hold pending however many the others hold
-/// (*provisional*).
-pub(crate) const PENDING_SHARE: usize = 256;
+/// (*provisional*). Peers that announce ids they never serve can keep
+/// [`PENDING_CAP`]'s count full for as long as they stay connected, since a
+/// reopened session refills faster than any age-out could drain it. This
+/// share is the room an honest session keeps anyway, for a new id's first
+/// announcement or a copy of one such a peer announced first. It is one full
+/// `Have` frame, so a fresh session takes all of its peer's first frame.
+/// Shares don't count toward the cap, so they never use up the room that
+/// copies and first sources past them need.
+pub(crate) const PENDING_SHARE: usize = 1_024;
 
 /// How many peers the reactor remembers as having tried one wanted entry
 /// before it forgets any. Past that it forgets the oldest peer with no
@@ -794,9 +803,9 @@ pub(crate) struct Shared {
     /// `tx-relay` was told the core stopped, so it claims nothing more and
     /// a slot given back is no room.
     pub(crate) stopped: bool,
-    /// The pending records every session holds, which each pending set
-    /// counts as it changes. See [`PENDING_CAP`].
-    pub(crate) pending: usize,
+    /// The pending records sessions hold past their [`PENDING_SHARE`],
+    /// which each pending set counts as it changes. See [`PENDING_CAP`].
+    pub(crate) excess: usize,
     /// How many sessions hear of an admission at once, and when the rest do.
     pub(crate) fan_out: FanOut,
     /// The parameters of the keyed short-id hash.
@@ -832,7 +841,7 @@ impl Shared {
             best_tip: Height(0),
             current: true,
             stopped: false,
-            pending: 0,
+            excess: 0,
             fan_out: config.fan_out,
             short_id,
             log_read: 0,
@@ -1908,12 +1917,12 @@ impl RelayMachine {
             assert!(count <= MAX_SERVES, "relay/limit-counted-once");
         }
 
-        let pending: usize = self
+        let excess: usize = self
             .machines
             .values()
-            .map(|machine| machine.state.pending.len())
+            .map(|machine| machine.state.pending.len().saturating_sub(PENDING_SHARE))
             .sum();
-        assert_eq!(self.shared.pending, pending, "relay/pending-count");
+        assert_eq!(self.shared.excess, excess, "relay/pending-count");
         // The table keeps nothing without a holder or a claim.
         for (id, entry) in wanted.entries() {
             let counted = references.get(&(*id, entry.generation)).copied();

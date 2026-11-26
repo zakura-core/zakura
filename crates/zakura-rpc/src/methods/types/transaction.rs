@@ -804,12 +804,14 @@ impl OutputObject {
         let addresses = output.address(network).map(|addr| vec![addr.to_string()]);
         let req_sigs = addresses.as_ref().map(|a| a.len() as u32);
 
+        // Copy the script bytes once for both `asm` and `type`.
+        let code = zcash_script::script::Code(lock_script.as_raw_bytes().to_vec());
+
         let script_pub_key = ScriptPubKey::new(
-            zcash_script::script::Code(lock_script.as_raw_bytes().to_vec()).to_asm(false),
+            code.to_asm(false),
             lock_script.clone(),
             req_sigs,
-            zcash_script::script::Code(lock_script.as_raw_bytes().to_vec())
-                .to_component()
+            code.to_component()
                 .ok()
                 .and_then(|c| c.refine().ok())
                 .and_then(|component| zcash_script::solver::standard(&component))
@@ -1352,6 +1354,8 @@ impl TransactionObject {
     ) -> Self {
         let tx = tx.as_ref();
         let block_time = block_time.map(|bt| bt.timestamp());
+        // `hex` already holds the serialized transaction, so its length is the size.
+        let size = hex.as_ref().len().try_into().ok();
         Self {
             hex,
             height: if in_active_chain.unwrap_or_default() {
@@ -1415,6 +1419,9 @@ impl TransactionObject {
                         .address(network)
                         .map(|address| (vec![address.to_string()], 1))
                         .unzip();
+                    // Copy the script bytes once for both `asm` and `type`.
+                    let code =
+                        zcash_script::script::Code(output.1.lock_script.as_raw_bytes().to_vec());
 
                     Output {
                         value: Zec::from(output.1.value).lossy_zec(),
@@ -1423,28 +1430,27 @@ impl TransactionObject {
                         script_pub_key: ScriptPubKey {
                             // https://github.com/zcash/zcash/blob/v6.11.0/src/rpc/rawtransaction.cpp#L271
                             // https://github.com/zcash/zcash/blob/v6.11.0/src/rpc/rawtransaction.cpp#L45
-                            asm: zcash_script::script::Code(
-                                output.1.lock_script.as_raw_bytes().to_vec(),
-                            )
-                            .to_asm(false),
+                            asm: code.to_asm(false),
                             hex: output.1.lock_script.clone(),
                             req_sigs,
-                            r#type: zcash_script::script::Code(
-                                output.1.lock_script.as_raw_bytes().to_vec(),
-                            )
-                            .to_component()
-                            .ok()
-                            .and_then(|c| c.refine().ok())
-                            .and_then(|component| zcash_script::solver::standard(&component))
-                            .map(|kind| match kind {
-                                zcash_script::solver::ScriptKind::PubKeyHash { .. } => "pubkeyhash",
-                                zcash_script::solver::ScriptKind::ScriptHash { .. } => "scripthash",
-                                zcash_script::solver::ScriptKind::MultiSig { .. } => "multisig",
-                                zcash_script::solver::ScriptKind::NullData { .. } => "nulldata",
-                                zcash_script::solver::ScriptKind::PubKey { .. } => "pubkey",
-                            })
-                            .unwrap_or("nonstandard")
-                            .to_string(),
+                            r#type: code
+                                .to_component()
+                                .ok()
+                                .and_then(|c| c.refine().ok())
+                                .and_then(|component| zcash_script::solver::standard(&component))
+                                .map(|kind| match kind {
+                                    zcash_script::solver::ScriptKind::PubKeyHash { .. } => {
+                                        "pubkeyhash"
+                                    }
+                                    zcash_script::solver::ScriptKind::ScriptHash { .. } => {
+                                        "scripthash"
+                                    }
+                                    zcash_script::solver::ScriptKind::MultiSig { .. } => "multisig",
+                                    zcash_script::solver::ScriptKind::NullData { .. } => "nulldata",
+                                    zcash_script::solver::ScriptKind::PubKey { .. } => "pubkey",
+                                })
+                                .unwrap_or("nonstandard")
+                                .to_string(),
                             addresses,
                         },
                     }
@@ -1552,7 +1558,7 @@ impl TransactionObject {
                 key
             }),
             joinsplit_sig: tx.joinsplit_sig().map(|raw_sig| raw_sig.into()),
-            size: tx.as_bytes().len().try_into().ok(),
+            size,
             time: block_time,
             txid,
             in_active_chain,
@@ -1728,5 +1734,40 @@ mod tests {
             transaction_json.get("ironwood").is_none(),
             "serialized verbose transaction output should not contain an empty Ironwood object"
         );
+    }
+
+    #[test]
+    fn transaction_object_size_is_the_serialized_length() {
+        use zakura_chain::serialization::{ZcashDeserializeInto, ZcashSerialize};
+
+        let _init_guard = zakura_test::init();
+
+        for (height, bytes) in zakura_test::vectors::MAINNET_BLOCKS.iter() {
+            let block: zakura_chain::block::Block = bytes
+                .zcash_deserialize_into()
+                .expect("block test vectors are structurally valid");
+            for tx in &block.transactions {
+                let transaction_object = TransactionObject::from_transaction(
+                    tx.clone(),
+                    None,
+                    None,
+                    &Network::Mainnet,
+                    None,
+                    None,
+                    None,
+                    tx.hash(),
+                );
+
+                assert_eq!(
+                    transaction_object.size,
+                    Some(
+                        tx.zcash_serialized_size()
+                            .try_into()
+                            .expect("a transaction is at most 2 MB, so its size fits in i64")
+                    ),
+                    "size of a transaction in block {height}"
+                );
+            }
+        }
     }
 }

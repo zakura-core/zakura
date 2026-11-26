@@ -52,7 +52,7 @@ use super::{
 use crate::{
     config::UnconditionalPeers,
     zakura::{
-        memory::{ConnectionCredit, Consumer, LeaseDenied, MemoryPool, PoolLease},
+        memory::{ConnectionCredit, Consumer, DrainHold, LeaseDenied, MemoryPool, PoolLease},
         regulation::{ByteBucket, MeteredReady, MeteredSender},
         resume_task_panic,
         transport::OrderedStreamFailure,
@@ -62,31 +62,129 @@ use crate::{
     },
 };
 
+/// The `Consumer::Tx` credit this node holds for each peer: the announced
+/// bytes of the peer's leased fetches, until the core ends each fetch's
+/// lease, or for credit the peer didn't spend, until its drain releases.
+/// Without a limit per peer, a few peers that never answer could hold the
+/// whole `Consumer::Tx` cap in drains. The machine names a peer by its
+/// identity, so the peer's connections share one limit.
+#[derive(Clone, Debug)]
+struct PeerTxBytes {
+    /// The most credit one peer holds.
+    limit: u64,
+    held: Arc<Mutex<HashMap<PeerKey, u64>>>,
+}
+
+impl PeerTxBytes {
+    /// A tally that lets each peer hold a quarter of `memory_pool`'s
+    /// `Consumer::Tx` cap, and at least one largest body.
+    fn new(memory_pool: &MemoryPool) -> Self {
+        let cap = memory_pool.snapshot().consumers[Consumer::Tx.index()].cap;
+        Self {
+            limit: (cap / 4).max(u64::from(MAX_TX_BYTES)),
+            held: Arc::default(),
+        }
+    }
+
+    /// Charges `bytes` to `peer`, or returns `None` if that would take the
+    /// peer past the limit.
+    fn try_charge(&self, peer: PeerKey, bytes: u64) -> Option<TxCharge> {
+        let mut held = self.lock();
+        let total = held
+            .get(&peer)
+            .map_or(bytes, |held| held.saturating_add(bytes));
+        if total > self.limit {
+            return None;
+        }
+        held.insert(peer, total);
+        Some(TxCharge {
+            tally: self.clone(),
+            peer,
+            bytes,
+        })
+    }
+
+    /// Locks the tally.
+    fn lock(&self) -> zakura_rt::sync::MutexGuard<'_, HashMap<PeerKey, u64>> {
+        self.held
+            .lock()
+            .expect("the tally is never poisoned: no code panics while holding it")
+    }
+}
+
+/// Bytes of one peer's `Consumer::Tx` credit in a [`PeerTxBytes`]. Dropping
+/// it gives them back.
+#[derive(Debug)]
+struct TxCharge {
+    tally: PeerTxBytes,
+    peer: PeerKey,
+    bytes: u64,
+}
+
+impl TxCharge {
+    /// Moves `bytes` of this charge, at most all of it, into a charge of
+    /// their own.
+    fn split(&mut self, bytes: u64) -> TxCharge {
+        let bytes = bytes.min(self.bytes);
+        self.bytes -= bytes;
+        TxCharge {
+            tally: self.tally.clone(),
+            peer: self.peer,
+            bytes,
+        }
+    }
+}
+
+impl Drop for TxCharge {
+    fn drop(&mut self) {
+        if self.bytes == 0 {
+            return;
+        }
+        let mut held = self.tally.lock();
+        if let Some(peer_held) = held.get_mut(&self.peer) {
+            *peer_held = peer_held.saturating_sub(self.bytes);
+            if *peer_held == 0 {
+                held.remove(&self.peer);
+            }
+        }
+    }
+}
+
 /// What a relayed fetch holds from its grant until the core ends its
-/// memory lease (`02 §6`, `02 §7` item 7): its `Consumer::Tx` lease, which
-/// the empty-pool exception goes without, and the receive credit its
-/// `GetTxs` added that no body has spent yet. The routine, and after the
-/// session the reactor, keeps one per reservation and ends it when the
-/// core's [`TxLeaseEnd`](zakura_node_services::mempool::port::TxLeaseEnd)
+/// memory lease (`02 §6`, `02 §7` item 7): its `Consumer::Tx` lease and its
+/// peer's charge for it, which the empty-pool exception goes without, and
+/// the receive credit its `GetTxs` added that no body has spent yet. The
+/// routine, and after the session the reactor, keeps one per reservation
+/// and ends it when the core's
+/// [`TxLeaseEnd`](zakura_node_services::mempool::port::TxLeaseEnd)
 /// resolves.
 #[derive(Debug)]
 struct TxCreditLease {
     lease: Option<PoolLease>,
+    /// The announced bytes of `lease`, which follow its unspent credit into
+    /// the drains.
+    charge: Option<TxCharge>,
     credit: Option<ConnectionCredit>,
     unspent_credit: u64,
 }
 
 impl TxCreditLease {
-    /// A granted fetch holding `lease`, on a connection with `credit`.
+    /// A granted fetch holding `lease` and its peer's `charge`, on a
+    /// connection with `credit`.
     ///
     /// Only a leased fetch adds receive credit: credit the peer doesn't
     /// spend stays charged to the lease until the peer can't spend it
     /// (`02 §6`). The empty-pool exception's fetch has no lease, so its body
     /// rides on the maximal `Tx` frame the data stream's static base holds.
-    fn new(lease: Option<PoolLease>, credit: Option<ConnectionCredit>) -> Self {
+    fn new(
+        lease: Option<PoolLease>,
+        charge: Option<TxCharge>,
+        credit: Option<ConnectionCredit>,
+    ) -> Self {
         Self {
             credit: credit.filter(|_| lease.is_some()),
             lease,
+            charge,
             unspent_credit: 0,
         }
     }
@@ -116,7 +214,11 @@ impl TxCreditLease {
             .as_mut()
             .filter(|_| unspent > 0)
             .and_then(|lease| lease.split(unspent.min(lease.bytes())));
-        credit.finish_receive_credit(total, drain);
+        let hold = drain.as_ref().and_then(|drain| {
+            let charge = self.charge.as_mut()?.split(drain.bytes());
+            Some(Box::new(charge) as DrainHold)
+        });
+        credit.finish_receive_credit_held(total, drain, hold);
     }
 
     /// Grows the lease to cover `body` decoded, which can hold several
@@ -138,7 +240,11 @@ impl TxCreditLease {
     fn end(mut self) {
         match self.credit.take() {
             Some(credit) if self.unspent_credit > 0 => {
-                credit.finish_receive_credit(self.unspent_credit, self.lease.take());
+                let hold = self
+                    .charge
+                    .take()
+                    .map(|charge| Box::new(charge) as DrainHold);
+                credit.finish_receive_credit_held(self.unspent_credit, self.lease.take(), hold);
             }
             _ => drop(self.lease.take()),
         }
@@ -333,6 +439,7 @@ impl TxRelayService {
         let wiring = Wiring {
             node: Arc::new(Mutex::new(node)),
             pool,
+            peer_tx: PeerTxBytes::new(&memory_pool),
             memory_pool,
             may_cool,
             handoff,
@@ -580,13 +687,21 @@ async fn serve_body(send: &FramedSend, bodies: &Bodies, id: UnminedTxId) -> bool
 
 /// What a pool call returns to its routine, or to the reactor task once its
 /// session ended.
+// A fetch's lease and charge trip clippy's size threshold in test builds.
+// Each result is moved once, so boxing them would only add an allocation
+// per fetch.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "boxing would add an allocation per fetch"
+)]
 enum PoolResult {
     /// The core's answer to a fetch's reservation, with the memory lease
-    /// taken for the fetch, if any.
+    /// taken for the fetch and its peer's charge for it, if any.
     Reserved {
         call: CallId,
-        answer: Result<Reservation, PortUnreserved>,
+        answer: Result<Reservation, Unreserved>,
         lease: Option<PoolLease>,
+        charge: Option<TxCharge>,
     },
     /// The core no longer counts the fetch's bytes under `reservation`.
     TxLeaseEnded {
@@ -758,6 +873,8 @@ struct Wiring {
     /// The node's memory pool, whose `Consumer::Tx` funds each fetch
     /// (`02 §7` item 7).
     memory_pool: MemoryPool,
+    /// Each peer's share of that funding.
+    peer_tx: PeerTxBytes,
     may_cool: MayCool,
     handoff: mpsc::UnboundedSender<Handoff>,
     owned: Owned,
@@ -1204,14 +1321,12 @@ impl Routine {
                 call,
                 answer,
                 lease,
+                charge,
             } => {
-                let answer = match answer {
-                    Ok(mut reservation) => {
-                        self.hold_tx_lease(&mut reservation, lease);
-                        Ok(self.hold(reservation))
-                    }
-                    Err(refused) => Err(unreserved(refused)),
-                };
+                let answer = answer.map(|mut reservation| {
+                    self.hold_tx_lease(&mut reservation, lease, charge);
+                    self.hold(reservation)
+                });
                 self.step(|machine, shared, pool, now| {
                     machine.reserve_answer(shared, pool, call, answer, now);
                 });
@@ -1240,13 +1355,18 @@ impl Routine {
         }
     }
 
-    /// Holds a granted fetch's memory lease, if one was taken, and the
-    /// connection's credit until the core ends the lease.
-    fn hold_tx_lease(&mut self, reservation: &mut Reservation, lease: Option<PoolLease>) {
+    /// Holds a granted fetch's memory lease and its peer's charge, if one
+    /// was taken, and the connection's credit until the core ends the lease.
+    fn hold_tx_lease(
+        &mut self,
+        reservation: &mut Reservation,
+        lease: Option<PoolLease>,
+        charge: Option<TxCharge>,
+    ) {
         let id = reservation.id();
         let ended = reservation.take_tx_lease_end();
-        self.tx_leases
-            .insert(id, TxCreditLease::new(lease, self.io.conn_credit.clone()));
+        let fetch = TxCreditLease::new(lease, charge, self.io.conn_credit.clone());
+        self.tx_leases.insert(id, fetch);
         self.calls.push(Box::pin(async move {
             ended.ended().await;
             PoolResult::TxLeaseEnded { reservation: id }
@@ -1494,14 +1614,29 @@ impl Routine {
                 id,
                 announced_size,
             } => {
+                // A peer that holds its limit of `Consumer::Tx` credit gets
+                // no new fetch until some of it frees. The core isn't asked.
+                let announced_size = u64::from(announced_size);
+                let peer = self.machine.state.peer;
+                let Some(charge) = self.wiring.peer_tx.try_charge(peer, announced_size) else {
+                    self.calls.push(Box::pin(async move {
+                        PoolResult::Reserved {
+                            call,
+                            answer: Err(Unreserved::PeerFull),
+                            lease: None,
+                            charge: None,
+                        }
+                    }));
+                    return;
+                };
                 // A full `Consumer::Tx` leases nothing, and the core decides
                 // whether the empty-pool exception takes the fetch anyway.
-                let announced_size = u64::from(announced_size);
                 let lease = self
                     .wiring
                     .memory_pool
                     .try_acquire(Consumer::Tx, Some(self.io.connection.1), announced_size)
                     .ok();
+                let charge = lease.is_some().then_some(charge);
                 let fetch = RelayedFetch {
                     announced_size,
                     leased_bytes: lease.as_ref().map_or(0, PoolLease::bytes),
@@ -1513,11 +1648,13 @@ impl Routine {
                     let answer = pool
                         .reserve_relayed(id, fetch, Instant::now() + POOL_ANSWER)
                         .await
-                        .unwrap_or(Err(PortUnreserved::NoRoom));
+                        .unwrap_or(Err(PortUnreserved::NoRoom))
+                        .map_err(unreserved);
                     PoolResult::Reserved {
                         call,
                         answer,
                         lease,
+                        charge,
                     }
                 }));
             }
@@ -1816,17 +1953,14 @@ fn ended_result(
         match result {
             // The grant and its memory lease go back when they drop below.
             PoolResult::Reserved { call, answer, .. } => {
-                let answer = match answer {
-                    Ok(reservation) => {
-                        let granted = Granted {
-                            reservation: reservation.id(),
-                            cancelled: reservation.cancellation().is_cancelled(),
-                        };
-                        grant = Some(reservation);
-                        Ok(granted)
-                    }
-                    Err(refused) => Err(unreserved(refused)),
-                };
+                let answer = answer.map(|reservation| {
+                    let granted = Granted {
+                        reservation: reservation.id(),
+                        cancelled: reservation.cancellation().is_cancelled(),
+                    };
+                    grant = Some(reservation);
+                    granted
+                });
                 if !node.shared.ended_call_answer(call, answer) {
                     node.shared.answer_unknown(answer);
                 }

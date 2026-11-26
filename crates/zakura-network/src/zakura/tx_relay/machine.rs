@@ -508,6 +508,9 @@ pub(crate) enum Unreserved {
     },
     /// The node's limit is reached.
     NoRoom,
+    /// The node holds as much of the peer's transaction credit as it lets
+    /// one peer hold. The IO answers this without asking the core.
+    PeerFull,
     /// The core has stopped.
     Stopped,
 }

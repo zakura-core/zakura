@@ -24,7 +24,7 @@
 //! could change a decision, or until another task adds a drain, so an idle
 //! connection doesn't wake.
 
-use std::{collections::VecDeque, future, sync::Arc};
+use std::{collections::VecDeque, fmt, future, sync::Arc};
 
 use zakura_quic::{Conn as QuicConn, ConnLimits, ConnLoad};
 use zakura_rt::sync::{watch, Mutex, Notify};
@@ -500,20 +500,29 @@ impl CreditMachine {
     }
 }
 
+/// A caller's own count of a drained lease's bytes, which the shell holds
+/// with the lease and drops when the lease releases.
+pub(crate) type DrainHold = Box<dyn fmt::Debug + Send>;
+
 /// An unspent receive-credit lease the shell holds while it drains.
 #[derive(Debug)]
 struct DrainingReceive {
     /// Held for its drop, which returns the bytes to the pool.
     _lease: PoolLease,
+    /// Held for its drop too. See [`DrainHold`].
+    _hold: Option<DrainHold>,
 }
 
 impl DrainingReceive {
-    fn new(lease: PoolLease) -> Self {
+    fn new(lease: PoolLease, hold: Option<DrainHold>) -> Self {
         #[cfg(any(test, zakura_sim))]
         lease
             .pool()
             .add_draining_receive_bytes(lease.consumer(), lease.bytes());
-        Self { _lease: lease }
+        Self {
+            _lease: lease,
+            _hold: hold,
+        }
     }
 }
 
@@ -704,13 +713,24 @@ impl ConnectionCredit {
         total_credit: u64,
         unspent_lease: Option<PoolLease>,
     ) {
+        self.finish_receive_credit_held(total_credit, unspent_lease, None);
+    }
+
+    /// [`Self::finish_receive_credit`], holding `hold` with the unspent lease
+    /// until the lease releases.
+    pub(crate) fn finish_receive_credit_held(
+        &self,
+        total_credit: u64,
+        unspent_lease: Option<PoolLease>,
+        hold: Option<DrainHold>,
+    ) {
         self.step(|shell, connection, released| {
             let wake = shell.machine.wake();
             let finish = shell
                 .machine
                 .finish_receive(total_credit, unspent_lease.as_ref().map(PoolLease::bytes));
             if let Some(lease) = unspent_lease {
-                let lease = DrainingReceive::new(lease);
+                let lease = DrainingReceive::new(lease, hold);
                 if finish.drains {
                     shell.receive.push_back(lease);
                 } else {

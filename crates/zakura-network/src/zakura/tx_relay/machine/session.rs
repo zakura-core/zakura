@@ -1536,6 +1536,13 @@ impl PeerMachine {
                 }
                 return_probe(wanted, probe);
             }
+            Err(Unreserved::PeerFull) => {
+                // This node's limit, not the peer's fault: the id waits a
+                // retry delay, and this peer or another brings it once the
+                // peer's held credit frees.
+                wanted.release(id, pending.generation, session, now, true);
+                return_probe(wanted, probe);
+            }
             Err(Unreserved::Inactive) => {
                 // The pool turned off, perhaps before a snapshot said so. The
                 // id waits a retry delay, so a missed turn-off and on again

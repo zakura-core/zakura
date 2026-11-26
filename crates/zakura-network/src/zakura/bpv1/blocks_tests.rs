@@ -2696,6 +2696,30 @@ fn a_reflag_on_a_new_session_never_delays_the_push() {
     table.assert_invariants();
 }
 
+/// A push flag that reaches a block after it stopped collecting expects
+/// nothing. A retired block's stripe buffers are gone, so the flag leaves
+/// the table as it was.
+#[test]
+fn a_push_flag_for_a_retired_block_is_ignored() {
+    let coding = Profile::TINY.derive_coding(128, 2).unwrap();
+    let block_id = block::Hash([0xAC; 32]);
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let t0 = Instant::now();
+    admit(&mut table, t0, block_id, coding, [0xAC; 32]);
+    table.step(
+        t0,
+        BlockInput::TipHeight {
+            height: 2 + super::wire::PROPAGATION_DEPTH,
+            hash: TEST_TIP_HASH,
+        },
+    );
+    assert_eq!(table.block_phase(&block_id), Some(BlockPhase::Retired));
+
+    let index = coding.wire_index(0, 0).unwrap();
+    flag_push(&mut table, t0, node_id(2), block_id, vec![index], false);
+    table.assert_invariants();
+}
+
 /// bpv1-89: a flag from a session that is no longer live takes no slot. In
 /// either generation order, the live session of `p` flags slot 0 and then
 /// the replaced session flags it too. The replaced session's end keeps

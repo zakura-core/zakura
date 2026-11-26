@@ -2923,14 +2923,16 @@ impl BlockTable {
         block_id: block::Hash,
         indices: &[u32],
     ) {
-        let Some(block) = self.blocks.get_mut(&block_id) else {
+        let Some(block) = self
+            .blocks
+            .get_mut(&block_id)
+            .filter(|b| b.phase == BlockPhase::Collecting)
+        else {
             return;
         };
         let coding = block.meta.coding;
         let mut bytes = 0u64;
-        // Each slot with the late time it already had, if it moves here
-        // from another session of `peer`.
-        let mut batch: Vec<(u32, u32, Option<Instant>)> = Vec::new();
+        let mut batch: Vec<(u32, u32)> = Vec::new();
         for &index in indices {
             let (Some((stripe, slot)), Some(wire_len)) =
                 (coding.split_index(index), coding.wire_len(index))
@@ -2949,7 +2951,7 @@ impl BlockTable {
             {
                 continue;
             }
-            batch.push((stripe, slot, pending.map(|pending| pending.late_at)));
+            batch.push((stripe, slot));
             bytes = bytes.saturating_add(u64::from(wire_len));
         }
         if batch.is_empty() {
@@ -2961,12 +2963,17 @@ impl BlockTable {
             .saturating_duration_since(now)
             .max(Duration::from_millis(1));
         let late_at = now + estimate.saturating_mul(SLOW_X);
-        for (stripe, slot, earlier) in batch {
-            block.stripes[stripe as usize].incoming.insert(
+        for (stripe, slot) in batch {
+            let incoming = &mut block.stripes[stripe as usize].incoming;
+            // Only another session of `peer` can hold a slot in the batch.
+            let late_at = incoming
+                .get(&slot)
+                .map_or(late_at, |moved| moved.late_at.min(late_at));
+            incoming.insert(
                 slot,
                 Incoming {
                     sender: (peer, session_gen),
-                    late_at: earlier.map_or(late_at, |earlier| earlier.min(late_at)),
+                    late_at,
                 },
             );
         }

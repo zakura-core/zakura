@@ -1275,9 +1275,11 @@ impl ParametersBuilder {
         };
 
         // ZIP 218 moves the third halving, and ZIP 214 Revision 3 moves the end of the
-        // Revision 2 streams there. Explicitly configured height ranges stay as configured.
-        let nu7_activation = NetworkUpgrade::Nu7
-            .activation_height(&Network::new_configured_testnet(parameters.clone()));
+        // Revision 2 streams there. ZIP 223 moves it again at NU7.1. Explicitly configured
+        // height ranges stay as configured.
+        let configured = Network::new_configured_testnet(parameters.clone());
+        let nu7_activation = NetworkUpgrade::Nu7.activation_height(&configured);
+        let nu7_1_activation = NetworkUpgrade::Nu7_1.activation_height(&configured);
         if let Some(funding_streams) = parameters
             .funding_streams
             .get_mut(REVISION_2_FUNDING_STREAMS_INDEX)
@@ -1289,7 +1291,8 @@ impl ParametersBuilder {
         {
             *funding_streams = funding_streams
                 .clone()
-                .with_nu7_adjusted_end_height(nu7_activation);
+                .with_nu7_adjusted_end_height(nu7_activation)
+                .with_nu7_1_adjusted_end_height(nu7_1_activation);
         }
 
         parameters

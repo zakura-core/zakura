@@ -284,7 +284,8 @@ pub(crate) static FUNDING_STREAMS: LazyLock<Vec<FundingStreams>> = LazyLock::new
             .into_iter()
             .collect(),
         }
-        .with_nu7_adjusted_end_height(NetworkUpgrade::Nu7.activation_height(&Network::Mainnet)),
+        .with_nu7_adjusted_end_height(NetworkUpgrade::Nu7.activation_height(&Network::Mainnet))
+        .with_nu7_1_adjusted_end_height(NetworkUpgrade::Nu7_1.activation_height(&Network::Mainnet)),
     ]
 });
 

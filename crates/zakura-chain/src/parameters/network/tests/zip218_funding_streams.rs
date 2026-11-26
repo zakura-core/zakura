@@ -18,10 +18,14 @@ use crate::{
         subsidy::{
             constants::{mainnet, testnet as testnet_constants},
             funding_stream_address_period, funding_stream_values, halving_block_subsidy,
-            height_for_halving, nu7_adjusted_funding_stream_height, scheduled_issuance_zatoshis,
-            FundingStreamReceiver, FundingStreams, ParameterSubsidy,
+            height_for_halving, nu7_1_adjusted_funding_stream_height,
+            nu7_adjusted_funding_stream_height, scheduled_issuance_zatoshis, FundingStreamReceiver,
+            FundingStreams, ParameterSubsidy,
         },
-        testnet::{self, ConfiguredFundingStreamRecipient, ConfiguredFundingStreams},
+        testnet::{
+            self, ConfiguredActivationHeights, ConfiguredFundingStreamRecipient,
+            ConfiguredFundingStreams,
+        },
         Network, NU7_POW_TARGET_SPACING_RATIO,
     },
 };
@@ -505,6 +509,86 @@ fn funding_stream_address_period_after_nu7() {
             required_addresses(built_in, &network) <= required_addresses(built_in, &without_nu7)
         );
         assert_eq!(required_addresses(built_in, &without_nu7), 27);
+    }
+}
+
+/// ZIP 223 doesn't say how to round a moved end height yet. Rounding up keeps a
+/// stream that ends at the third halving ending at `HeightForHalving(3)`.
+#[test]
+fn nu7_1_adjusted_funding_stream_height_cases() {
+    let nu7_1 = Some(Height(100));
+    for (height, moved) in [(99, 99), (100, 100), (103, 104), (104, 105), (108, 110)] {
+        assert_eq!(
+            nu7_1_adjusted_funding_stream_height(Height(height), nu7_1),
+            Some(Height(moved)),
+            "end height {height}"
+        );
+    }
+    assert_eq!(
+        nu7_1_adjusted_funding_stream_height(Height(103), None),
+        Some(Height(103))
+    );
+}
+
+/// Returns the Testnet network with NU7 at `nu7`, NU7.1 at `nu7_1`, and the
+/// built-in funding streams.
+fn testnet_network_with_nu7_1(nu7: u32, nu7_1: u32) -> Network {
+    let mut activation_heights: ConfiguredActivationHeights = Network::new_default_testnet()
+        .parameters()
+        .expect("Testnet has parameters")
+        .activation_heights()
+        .into();
+    activation_heights.nu7 = Some(nu7);
+    activation_heights.nu7_1 = Some(nu7_1);
+
+    testnet::Parameters::build()
+        .with_activation_heights(activation_heights)
+        .expect("activation heights are valid")
+        .to_network()
+        .expect("configured network is valid")
+}
+
+/// Heights that ZIP 223 moves keep the address period they had with NU7 alone, so
+/// the Revision 2 stream ends at the 20 second third halving with the same
+/// recipients.
+#[test]
+fn nu7_1_moved_heights_keep_their_address_period() {
+    let _init_guard = zakura_test::init();
+
+    // Neither NU7.1 height leaves a multiple of 4 blocks before the old end, so the
+    // moved end is rounded, and only rounding up lands on `HeightForHalving(3)`.
+    for (nu7, nu7_1) in [(TESTNET_NU7, 4_400_001), (4_406_000, 4_450_003)] {
+        let with_nu7 = testnet_network_with_nu7(Some(nu7));
+        let network = testnet_network_with_nu7_1(nu7, nu7_1);
+        let old_period = |height: u32| funding_stream_address_period(Height(height), &with_nu7);
+        let period = |height: u32| funding_stream_address_period(Height(height), &network);
+        let adjust = |height: u32| {
+            nu7_1_adjusted_funding_stream_height(Height(height), Some(Height(nu7_1)))
+                .expect("the height is valid")
+                .0
+        };
+
+        let old_end = height_for_halving(3, &with_nu7)
+            .expect("the halving has a height")
+            .0;
+        for height in (nu7_1..=old_end).step_by(997) {
+            assert_eq!(period(adjust(height)), old_period(height), "at {height}");
+        }
+
+        let new_end = adjust(old_end);
+        assert_eq!(Some(Height(new_end)), height_for_halving(3, &network));
+        assert_eq!(period(new_end - 1), old_period(old_end - 1));
+        assert_eq!(period(new_end), old_period(old_end));
+
+        let built_in = network.all_funding_streams()[REVISION_2].height_range();
+        assert_eq!(built_in.end, Height(new_end));
+        assert_eq!(
+            required_addresses(built_in, &network),
+            required_addresses(
+                with_nu7.all_funding_streams()[REVISION_2].height_range(),
+                &with_nu7
+            ),
+        );
     }
 }
 

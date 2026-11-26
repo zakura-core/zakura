@@ -439,6 +439,17 @@ impl StartCmd {
     /// and passing the resolved pure P2P memory budget `B` into `zakura-network`.
     fn network_config_for_start(config: &ZakuradConfig) -> Result<zakura_network::Config, Report> {
         let mut network = config.network.clone();
+        if config
+            .network
+            .zakura
+            .deprecated_peer_memory_budget_bytes
+            .is_some()
+        {
+            warn!(
+                "[network.zakura] peer_memory_budget_bytes is deprecated and ignored; \
+                 [memory] budget sizes the v2 P2P stack from host memory"
+            );
+        }
         // The budget governs the v2 stack only, so a legacy node neither probes the host
         // nor fails on an unreadable cgroup (`02 §2`).
         if config.network.v2_p2p() {

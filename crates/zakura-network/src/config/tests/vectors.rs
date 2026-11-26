@@ -1410,10 +1410,11 @@ fn a_raised_quic_window_loads_and_the_plan_sizes_it_against_the_budget() {
     }
 }
 
-/// `[network.zakura] peer_memory_budget_bytes` was removed with no back-compat:
-/// any config setting it fails to load and names `[memory] budget` (`02 §2`).
+/// Configs from older releases set `[network.zakura] peer_memory_budget_bytes`.
+/// They still load on every stack, the value is ignored, and it is never
+/// written back (`02 §2`).
 #[test]
-fn removed_peer_memory_budget_bytes_fails_and_names_memory_budget() {
+fn deprecated_peer_memory_budget_bytes_loads_and_is_not_written() {
     let _init_guard = zakura_test::init();
 
     for network in ["Mainnet", "Testnet"] {
@@ -1430,11 +1431,10 @@ fn removed_peer_memory_budget_bytes_fails_and_names_memory_budget() {
             let source = format!(
                 "network = \"{network}\"\n{stack_config}\n[zakura]\npeer_memory_budget_bytes = 1\n"
             );
-            let error = toml::from_str::<Config>(&source).unwrap_err().to_string();
-            assert!(
-                error.contains("peer_memory_budget_bytes") && error.contains("[memory] budget"),
-                "{source}: {error}"
-            );
+            let config = toml::from_str::<Config>(&source).expect("an old config still loads");
+            assert_eq!(config.zakura.deprecated_peer_memory_budget_bytes, Some(1));
+            let written = toml::to_string(&config).expect("config serializes");
+            assert!(!written.contains("peer_memory_budget_bytes"), "{written}");
         }
     }
 }

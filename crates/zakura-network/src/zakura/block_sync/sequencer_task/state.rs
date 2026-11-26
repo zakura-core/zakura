@@ -374,6 +374,7 @@ impl SequencerState {
         SequencerView {
             verified_tip: self.sequencer.verified_tip(),
             verified_hash: self.verified_block_hash,
+            commit_window_top: self.sequencer.commit_window_top(),
             download_floor: self.sequencer.floor(),
             finalized: self.finalized_height,
             reset_epoch: self.reset_epoch,
@@ -423,7 +424,7 @@ impl SequencerState {
             return BodyAcceptance::StaleScope;
         }
         if !super::super::admission::retain_received_body(
-            self.sequencer.verified_tip(),
+            self.sequencer.commit_window_top(),
             u64::try_from(
                 self.sequencer
                     .reorder_len()
@@ -1153,7 +1154,7 @@ impl SequencerState {
         Some(SubmissionBody {
             id: facts.id,
             admission: super::super::admission::submission_decode_admission(
-                self.sequencer.verified_tip(),
+                self.sequencer.commit_window_top(),
                 height,
             ),
         })

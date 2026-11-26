@@ -1,10 +1,14 @@
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
-use zakura_chain::block;
+use zakura_chain::{block, parameters::checkpoint::list::CheckpointList};
 use zakura_node_services::block_memory::Admission;
 use zakura_rt::time::Instant;
 
-use super::{config::MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES, state::next_height};
+use super::{
+    config::{BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES, MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES},
+    state::next_height,
+};
+use crate::zakura::memory::draft::ADMISSION_CHARGE_PER_MAX_BLOCK;
 
 /// Minimum rate used for deadline estimates. One maximum-size body adds about
 /// eight seconds; earlier unreceived bodies add their bounded transfer estimates.
@@ -40,10 +44,11 @@ pub const DESERIALIZED_MEM_FACTOR: u64 = 4;
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(super) struct AdmissionSnapshot {
     pub(super) download_floor: block::Height,
-    /// The verified (commit) tip. Heights within one checkpoint range above it (the
-    /// commit window) are always fundable (liveness), so a pinned checkpoint range can
-    /// assemble and commit can drain the pipeline; everything else is memory-gated.
-    pub(super) verified_block_tip: block::Height,
+    /// The top of the commit window ([`CommitWindow::top`] at the verified
+    /// tip). Heights up to it lease from `Consumer::Consensus`, so a checkpoint
+    /// range can assemble and commit can drain the pipeline; everything else is
+    /// memory-gated.
+    pub(super) commit_window_top: block::Height,
     pub(super) reorder_buffered_bytes: u64,
     pub(super) reorder_buffered_blocks: u64,
     pub(super) applying_buffered_bytes: u64,
@@ -149,17 +154,77 @@ pub(super) fn request_deadline(
     queued_at + base + transfer
 }
 
-/// Heights within one worst-case checkpoint range above the verified tip bypass
-/// look-ahead gates.
+/// Heights above the last checkpoint that the commit window covers: as many
+/// maximal blocks as [`BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES`] holds at
+/// admission's per-block charge, `536,870,912 / 10,000,000` = 53.
 ///
-/// During checkpoint sync, the verified tip remains at the previous checkpoint
-/// until the full range is submitted, so every block in that range must remain
-/// fundable even when normal look-ahead limits are full.
+/// Above the last checkpoint each block commits on its own, so the window
+/// only needs room to keep the verifier busy. The `Consensus` reserve is at
+/// least the decoded submission bound, so it funds every height here at once.
+pub(crate) const SEMANTIC_COMMIT_WINDOW_BLOCKS: u32 =
+    // The quotient is 53, which fits `u32`.
+    (BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES / ADMISSION_CHARGE_PER_MAX_BLOCK) as u32;
+
+/// The commit window's span without a checkpoint list: the widest checkpoint
+/// range any list can hold, `MAX_CHECKPOINT_HEIGHT_GAP + 1` heights.
+const UNLISTED_COMMIT_WINDOW_BLOCKS: u32 =
+    // `MAX_CHECKPOINT_HEIGHT_GAP + 1` is 401, which fits `u32`.
+    MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES as u32;
+
+/// The heights above the verified tip that block sync must fund for commits
+/// to move: the commit window.
 ///
-/// This is a fixed consensus-derived bound, not `config.submitted_apply_limit()`,
-/// because the configured submit window can be much larger and would weaken the
-/// memory gate.
-const COMMIT_WINDOW_EXEMPT_SPAN_BLOCKS: u32 = MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES as u32;
+/// Below the last checkpoint, the checkpoint verifier commits a range only
+/// once every block up to the next checkpoint is submitted, so the window
+/// ends at the next checkpoint above the verified tip. That also holds after a
+/// restart in the middle of a range. Above the last checkpoint, blocks verify
+/// one at a time, and the window covers [`SEMANTIC_COMMIT_WINDOW_BLOCKS`].
+///
+/// Commit-window requests lease from `Consumer::Consensus`, and commit-window
+/// bodies always decode and stay retained. Everything above the window is
+/// look-ahead that leases from `Consumer::BlockSync`.
+///
+/// The default, for a startup without a checkpoint list, covers the widest
+/// range a list can hold above every tip.
+#[derive(Clone, Default)]
+pub struct CommitWindow {
+    checkpoints: Option<Arc<CheckpointList>>,
+}
+
+impl CommitWindow {
+    /// The window of a node that verifies with `checkpoints`.
+    pub fn new(checkpoints: Arc<CheckpointList>) -> Self {
+        Self {
+            checkpoints: Some(checkpoints),
+        }
+    }
+
+    /// The highest height in the window above `verified_tip`.
+    pub fn top(&self, verified_tip: block::Height) -> block::Height {
+        let span = match &self.checkpoints {
+            Some(checkpoints) => match checkpoints.checkpoint_after(verified_tip) {
+                Some((checkpoint, _)) => return checkpoint,
+                None => SEMANTIC_COMMIT_WINDOW_BLOCKS,
+            },
+            None => UNLISTED_COMMIT_WINDOW_BLOCKS,
+        };
+        // Valid heights sit far below `u32::MAX`, so the saturation is
+        // unreachable; it just keeps the arithmetic total.
+        block::Height(verified_tip.0.saturating_add(span))
+    }
+}
+
+impl std::fmt::Debug for CommitWindow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The Mainnet list has about 15,000 entries, so print only its end.
+        f.debug_struct("CommitWindow")
+            .field(
+                "last_checkpoint",
+                &self.checkpoints.as_ref().map(|list| list.max_height()),
+            )
+            .finish()
+    }
+}
 
 /// Hard block-count cap on speculative look-ahead bookkeeping.
 ///
@@ -171,34 +236,17 @@ const COMMIT_WINDOW_EXEMPT_SPAN_BLOCKS: u32 = MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_
 /// per-entry bookkeeping overhead the flat resident factor does not model.
 pub(super) const LOOKAHEAD_BLOCK_HARD_CAP: u64 = 262_144;
 
-/// Highest height exempt from look-ahead backpressure: the top of the commit window
-/// ([`COMMIT_WINDOW_EXEMPT_SPAN_BLOCKS`] above the verified tip). Anchored to the
-/// verified tip — which advances only on commit — so the window cannot escalate with
-/// the download floor.
-fn commit_window_high(snapshot: &AdmissionSnapshot) -> block::Height {
-    commit_window_top(snapshot.verified_block_tip)
-}
-
-pub(super) fn commit_window_top(verified_tip: block::Height) -> block::Height {
-    // Valid heights sit far below `u32::MAX`, so the saturation is unreachable; it
-    // just keeps the arithmetic total.
-    block::Height(
-        verified_tip
-            .0
-            .saturating_add(COMMIT_WINDOW_EXEMPT_SPAN_BLOCKS),
-    )
-}
-
 /// Retained-decode admission for a raw body entering the submission window.
 ///
 /// Commit-window heights always decode, because a checkpoint range resolves only
 /// after every block in it is submitted. Refusing one could wedge the verified tip.
 /// Every refused height therefore enters the window as the tip advances.
+/// `window_top` is [`CommitWindow::top`] at the current verified tip.
 pub(super) fn submission_decode_admission(
-    verified_tip: block::Height,
+    window_top: block::Height,
     height: block::Height,
 ) -> Admission {
-    if height <= commit_window_top(verified_tip) {
+    if height <= window_top {
         Admission::PipelineExempt
     } else {
         Admission::WithinLimit
@@ -234,20 +282,21 @@ fn held_blocks(snapshot: &AdmissionSnapshot) -> u64 {
 
 /// Final backlog cap checked by the single sequencer owner. Each retained
 /// body carries its pool lease, so only the block count needs a cap here. The
-/// verified checkpoint window stays retainable even when look-ahead is full.
+/// commit window, which ends at `window_top`, stays retainable even when
+/// look-ahead is full.
 pub(super) fn retain_received_body(
-    verified_tip: block::Height,
+    window_top: block::Height,
     retained_blocks: u64,
     height: block::Height,
 ) -> bool {
-    height <= commit_window_top(verified_tip) || retained_blocks < LOOKAHEAD_BLOCK_HARD_CAP
+    height <= window_top || retained_blocks < LOOKAHEAD_BLOCK_HARD_CAP
 }
 
 /// Plans one contiguous take starting at `start_height`: the single authority for
 /// the commit-window exemption, the look-ahead block cap, and request sizing.
 ///
-/// Heights in the commit window (up to `MAX_CHECKPOINT_HEIGHT_GAP + 1` blocks
-/// above the *verified* tip) lease from the reserved `Consumer::Consensus`, so
+/// Heights in the commit window (up to `snapshot.commit_window_top`, see
+/// [`CommitWindow`]) lease from the reserved `Consumer::Consensus`, so
 /// bulk look-ahead never shrinks or blocks them (`02 §4`, decision-6). Exempt
 /// requests are capped at the top of the commit window, so one request cannot
 /// include both exempt in-window blocks and gated above-window blocks.
@@ -266,7 +315,7 @@ pub(super) fn admit(
     response_byte_cap: u64,
 ) -> AdmissionOutcome {
     let priority = request_priority(snapshot.download_floor, start_height);
-    let window_high = commit_window_high(&snapshot);
+    let window_high = snapshot.commit_window_top;
 
     let (take_high, max_request_bytes) = if start_height <= window_high {
         (
@@ -424,7 +473,7 @@ mod tests {
         let response_cap = 32 * 1024 * 1024;
         let snapshot = AdmissionSnapshot {
             download_floor: block::Height(10),
-            verified_block_tip: block::Height(0),
+            commit_window_top: CommitWindow::default().top(block::Height(0)),
             reorder_buffered_bytes: 0,
             reorder_buffered_blocks: 0,
             applying_buffered_bytes: 0,
@@ -437,7 +486,7 @@ mod tests {
             budget_available: 0,
             consensus_available: 3 * response_cap,
         };
-        let top = commit_window_top(snapshot.verified_block_tip);
+        let top = snapshot.commit_window_top;
         let AdmissionOutcome::Admit(grant) = admit(snapshot, block::Height(50), top, response_cap)
         else {
             panic!("a commit-window take must be admitted while bulk is full");
@@ -454,16 +503,45 @@ mod tests {
     #[test]
     fn every_commit_window_height_can_decode_past_the_pipeline_bound() {
         let tip = block::Height(1_000);
-        let top = block::Height(tip.0 + COMMIT_WINDOW_EXEMPT_SPAN_BLOCKS);
+        let top = CommitWindow::default().top(tip);
         for height in [block::Height(tip.0 + 1), top] {
             assert_eq!(
-                submission_decode_admission(tip, height),
+                submission_decode_admission(top, height),
                 Admission::PipelineExempt
             );
         }
         assert_eq!(
-            submission_decode_admission(tip, block::Height(top.0 + 1)),
+            submission_decode_admission(top, block::Height(top.0 + 1)),
             Admission::WithinLimit
+        );
+    }
+
+    /// Below the last checkpoint the window ends at the next checkpoint, even
+    /// from a tip in the middle of a range. At and above the last checkpoint
+    /// it covers the semantic span.
+    #[test]
+    fn the_commit_window_ends_at_the_next_checkpoint() {
+        let hash = |byte| block::Hash([byte; 32]);
+        let list = CheckpointList::from_list([
+            (block::Height(0), hash(1)),
+            (block::Height(400), hash(2)),
+            (block::Height(650), hash(3)),
+        ])
+        .expect("the test list is valid");
+        let window = CommitWindow::new(Arc::new(list));
+        for (tip, top) in [(0, 400), (150, 400), (399, 400), (400, 650), (649, 650)] {
+            assert_eq!(window.top(block::Height(tip)), block::Height(top), "{tip}");
+        }
+        assert_eq!(SEMANTIC_COMMIT_WINDOW_BLOCKS, 53);
+        for tip in [650, 10_000] {
+            assert_eq!(
+                window.top(block::Height(tip)),
+                block::Height(tip + SEMANTIC_COMMIT_WINDOW_BLOCKS)
+            );
+        }
+        assert_eq!(
+            CommitWindow::default().top(block::Height(150)),
+            block::Height(150 + 401)
         );
     }
 

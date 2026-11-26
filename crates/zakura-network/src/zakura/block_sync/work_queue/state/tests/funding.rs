@@ -343,7 +343,13 @@ impl Driver {
         let held = owner.map_or(0, |owner| {
             self.state(|state| state.session_reserved(owner.session_id))
         });
-        match taken.admit_for_connection(height(floor), height(floor), 0, None, cancel) {
+        match taken.admit_for_connection(
+            height(floor),
+            crate::zakura::CommitWindow::default().top(height(floor)),
+            0,
+            None,
+            cancel,
+        ) {
             Ok(admitted) => {
                 ensure(
                     !self.closed && !cancelled,

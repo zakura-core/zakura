@@ -69,6 +69,7 @@ mod work_queue;
 
 // The remaining consumers of these two internal constants are the same-crate
 // fuzz-testkit test modules; the re-exports only exist for test builds.
+pub use admission::CommitWindow;
 #[cfg(test)]
 pub(crate) use admission::DESERIALIZED_MEM_FACTOR;
 #[cfg(feature = "internal-bench")]

@@ -41,7 +41,7 @@ async fn byte_gauges_and_view_follow_sequencer_owners() {
     let (_body_tx, body_rx) = mpsc::channel(1);
     let (_control_tx, control_rx) = mpsc::unbounded_channel();
     let (actions, mut actions_rx) = mpsc::channel(8);
-    let (view_tx, view_rx) = watch::channel(initial_view(frontiers));
+    let (view_tx, view_rx) = watch::channel(initial_view(frontiers, &Default::default()));
     let budget = ByteBudget::new(1);
     let mut task = SequencerIO::new(
         Sequencer::new(block::Height(0), 2),
@@ -284,7 +284,7 @@ async fn dropping_the_task_releases_its_queued_bodies_after_it_closes() {
     let (body_tx, body_rx) = mpsc::channel(1);
     let (_control_tx, control_rx) = mpsc::unbounded_channel();
     let (actions, _actions_rx) = mpsc::channel(8);
-    let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+    let (view_tx, _view_rx) = watch::channel(initial_view(frontiers, &Default::default()));
     let retained = test_block();
     let log = Arc::new(Log {
         events: std::sync::Mutex::new(Vec::new()),
@@ -889,7 +889,7 @@ async fn detached_submissions_keep_their_leases_until_completion() {
     let (_body_tx, body_rx) = mpsc::channel(1);
     let (_control_tx, control_rx) = mpsc::unbounded_channel();
     let (actions, mut actions_rx) = mpsc::channel(8);
-    let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+    let (view_tx, _view_rx) = watch::channel(initial_view(frontiers, &Default::default()));
     let mut task = SequencerIO::new(
         Sequencer::new(block::Height(0), 2),
         Arc::new(WorkQueue::with_test_pool(

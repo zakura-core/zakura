@@ -257,14 +257,17 @@ async fn session_cancellation_before_funding_returns_the_take_without_a_charge()
     let request_id = routine.state.allocate_request_id().unwrap();
     let TakenWork {
         download_floor,
-        verified_tip,
+        commit_window_top,
         request,
     } = routine.select_work(&limits, request_id, now).unwrap();
     // The session ends after the fence opened the exchange, so only funding
     // sees the cancellation.
     routine.io.session.cancel_token().cancel();
 
-    let refusal = routine.io.fund(request, download_floor, verified_tip).err();
+    let refusal = routine
+        .io
+        .fund(request, download_floor, commit_window_top)
+        .err();
 
     assert_eq!(refusal, Some(FillStop::Cancelled));
     drop(capacity);
@@ -349,12 +352,12 @@ fn publish_after(
     let request_id = routine.state.allocate_request_id().unwrap();
     let TakenWork {
         download_floor,
-        verified_tip,
+        commit_window_top,
         request,
     } = routine.select_work(&limits, request_id, now).unwrap();
     let unpublished = routine
         .io
-        .fund(request, download_floor, verified_tip)
+        .fund(request, download_floor, commit_window_top)
         .unwrap();
     assert!(routine.io.budget.reserved() > 0, "funding took its charge");
     let request = block_range_request(&unpublished).unwrap();
@@ -452,7 +455,7 @@ async fn a_reset_after_selection_refuses_funding() {
 
     let refusal = routine
         .io
-        .fund(taken.request, taken.download_floor, taken.verified_tip);
+        .fund(taken.request, taken.download_floor, taken.commit_window_top);
 
     assert_eq!(refusal.unwrap_err(), FillStop::StaleWork);
     assert_eq!(routine.io.budget.reserved(), 0);
@@ -474,7 +477,7 @@ async fn refused_authorization_rolls_back_funding() {
     let taken = routine.select_work(&limits, request_id, now).unwrap();
     let unpublished = routine
         .io
-        .fund(taken.request, taken.download_floor, taken.verified_tip)
+        .fund(taken.request, taken.download_floor, taken.commit_window_top)
         .unwrap();
     let request = block_range_request(&unpublished).unwrap();
     // An exchange that still owns this range refuses the overlapping reservation.

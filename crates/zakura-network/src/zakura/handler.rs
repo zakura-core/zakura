@@ -6597,7 +6597,9 @@ async fn spawn_zakura_endpoint_inner(
             // With `checkpoint_sync = false` the verifier stops checkpointing
             // lower than this, so the cap only ever misses heights, never caps
             // a checkpoint range.
-            startup.max_checkpoint_height = Some(config.network.checkpoint_list().max_height());
+            let checkpoints = config.network.checkpoint_list();
+            startup.max_checkpoint_height = Some(checkpoints.max_height());
+            startup.commit_window = crate::zakura::CommitWindow::new(checkpoints);
             let (handle, actions, task) = spawn_block_sync_reactor(startup.with_retention(
                 driver_startup.retained_block_height.clone(),
                 config.network.genesis_hash(),

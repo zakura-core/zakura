@@ -72,8 +72,9 @@ pub const RETAINED_BYTE_BOUND: &str = "block-sync/retained-byte-bound";
 pub const BUDGET_LEDGERS_AGREE: &str = "block-sync/budget-ledgers-agree";
 
 /// Heights above the verified tip that skip block sync's look-ahead gates:
-/// one worst-case checkpoint range, `MAX_CHECKPOINT_HEIGHT_GAP + 1`
-/// (`admission.rs`'s `COMMIT_WINDOW_EXEMPT_SPAN_BLOCKS`).
+/// one worst-case checkpoint range, `MAX_CHECKPOINT_HEIGHT_GAP + 1`. The
+/// harness starts block sync without a checkpoint list, so the node's
+/// `CommitWindow` covers this span above every tip.
 pub const COMMIT_WINDOW_BLOCKS: u64 = constants::MAX_CHECKPOINT_HEIGHT_GAP as u64 + 1;
 
 /// The largest estimate one request height reserves: `B`, the most a body

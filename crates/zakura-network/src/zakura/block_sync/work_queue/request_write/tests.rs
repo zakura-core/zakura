@@ -436,7 +436,13 @@ fn admit(
     taken: TakenRequest,
     cancel: CancellationToken,
 ) -> Result<UnpublishedRequest, AdmitRefusal> {
-    taken.admit_for_connection(block::Height(0), block::Height(0), 0, None, cancel)
+    taken.admit_for_connection(
+        block::Height(0),
+        crate::zakura::CommitWindow::default().top(block::Height(0)),
+        0,
+        None,
+        cancel,
+    )
 }
 
 fn publish(claim: UnpublishedRequest, sender: &FramedSend) -> Arc<RequestWrite> {
@@ -1439,7 +1445,7 @@ fn funding_drift_closes_publication_and_survives_reset() {
                 )
                 .admit_for_connection(
                     block::Height(0),
-                    block::Height(0),
+                    crate::zakura::CommitWindow::default().top(block::Height(0)),
                     0,
                     None,
                     f.cancel.clone(),
@@ -1599,7 +1605,13 @@ fn funding_drift_refuses_normal_and_floor_admission() {
         assert!(!f.work.audit_funding());
         assert_eq!(
             taken
-                .admit_for_connection(floor, floor, 0, None, f.cancel.clone())
+                .admit_for_connection(
+                    floor,
+                    crate::zakura::CommitWindow::default().top(floor),
+                    0,
+                    None,
+                    f.cancel.clone()
+                )
                 .unwrap_err(),
             AdmitRefusal::AccountingClosed
         );

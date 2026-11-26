@@ -164,8 +164,8 @@ struct RequestCapacity<'a> {
 struct TakenWork {
     /// The download floor that both lanes planned against.
     download_floor: block::Height,
-    /// The verified tip that planned the commit-window boundary.
-    verified_tip: block::Height,
+    /// The commit-window top that planned the take.
+    commit_window_top: block::Height,
     request: TakenRequest,
 }
 
@@ -256,7 +256,7 @@ impl PeerRoutine {
         // Selection: the floor lane, then the above-floor lane.
         let TakenWork {
             download_floor,
-            verified_tip,
+            commit_window_top,
             mut request,
         } = self.select_work(&limits, request_id, now)?;
         // Retry filter: keep the first allowed contiguous run.
@@ -269,7 +269,7 @@ impl PeerRoutine {
 
         // Funding: the queue derives the charge and floor exception from the
         // retained run, never from the probe.
-        let unpublished = self.io.fund(request, download_floor, verified_tip)?;
+        let unpublished = self.io.fund(request, download_floor, commit_window_top)?;
         self.trace_request_funded(&unpublished);
 
         // Preparation: the request, its response authorization, and its frame.
@@ -414,7 +414,7 @@ impl PeerRoutine {
         )?;
         Ok(TakenWork {
             download_floor: snapshot.download_floor,
-            verified_tip: snapshot.verified_block_tip,
+            commit_window_top: snapshot.commit_window_top,
             request: taken.expect("`take_lanes` succeeds only after a take returned work"),
         })
     }
@@ -670,12 +670,12 @@ impl PeerIO {
         &mut self,
         request: TakenRequest,
         download_floor: block::Height,
-        verified_tip: block::Height,
+        commit_window_top: block::Height,
     ) -> Result<UnpublishedRequest, FillStop> {
         let funded = request
             .admit_for_connection(
                 download_floor,
-                verified_tip,
+                commit_window_top,
                 self.conn_id,
                 self.conn_credit.clone(),
                 self.session.cancel_token(),

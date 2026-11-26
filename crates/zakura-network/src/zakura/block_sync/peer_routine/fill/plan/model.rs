@@ -86,7 +86,7 @@ pub(super) fn fund_through_queue(
     let funded = take
         .admit_for_connection(
             download_floor,
-            download_floor,
+            crate::zakura::CommitWindow::default().top(download_floor),
             0,
             None,
             CancellationToken::new(),

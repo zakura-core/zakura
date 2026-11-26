@@ -102,7 +102,8 @@ async fn committed_payload_counts_once_across_frontier_and_completion_orderings(
                     let (_body_tx, body_rx) = mpsc::channel(1);
                     let (_control_tx, control_rx) = mpsc::unbounded_channel();
                     let (actions, mut actions_rx) = mpsc::channel(16);
-                    let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+                    let (view_tx, _view_rx) =
+                        watch::channel(initial_view(frontiers, &Default::default()));
                     let meter_start = Instant::now();
                     let budget = ByteBudget::new(123);
                     let mut task = SequencerIO::new(

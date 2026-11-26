@@ -1073,7 +1073,7 @@ mod memory_pool_tests {
             )
             .admit_for_connection(
                 block::Height(0),
-                block::Height(0),
+                crate::zakura::CommitWindow::default().top(block::Height(0)),
                 conn_id,
                 None,
                 cancel.clone(),

@@ -619,6 +619,73 @@ fn bpv1_57_withheld_parts_fall_back_to_block_sync() {
     assert_eq!(seen.tally.fetches(next.height), 0, "{summary}");
 }
 
+/// Mirror 0 withholds every part of a block past its reconstruction
+/// deadline. Block sync commits the block after the first repair round
+/// releases the claim, but BPv1 keeps it `Collecting` until the deadline
+/// moves it to `Fallback` (bpv1-57). When the hold lifts, BPv1 drops the late
+/// parts and never submits the block. The next block commits through BPv1.
+#[test]
+fn bpv1_57_a_collecting_block_falls_back_by_its_deadline() {
+    let seen = run_mesh(at_tip(), |director| async move {
+        let mesh = &director.mesh;
+        mesh.hold(0, true);
+        let held = director.mine().await;
+        until("BPv1 claims the body", Duration::from_secs(10), || {
+            mesh.node.claims.is_claimed(held.hash, Instant::now())
+        })
+        .await?;
+        // The admission claim and the reconstruction deadline both start at
+        // admission, and this is the node's only claim.
+        let deadline = mesh
+            .node
+            .claims
+            .next_expiry()
+            .expect("BPv1 claims the body");
+        director.committed(held).await?;
+        time::sleep_until(deadline - POLL).await;
+        let before = mesh.phase(held.hash);
+        if before != Some(BlockPhase::Collecting) {
+            return Err(format!(
+                "h{} is {before:?} before its deadline",
+                held.height.0
+            ));
+        }
+        time::sleep_until(deadline + POLL).await;
+        let after = mesh.phase(held.hash);
+        if after != Some(BlockPhase::Fallback) {
+            return Err(format!(
+                "h{} is {after:?} after its deadline",
+                held.height.0
+            ));
+        }
+        mesh.hold(0, false);
+        let next = director.mine().await;
+        director.committed(next).await
+    });
+    let summary = summary(&seen);
+    assert_clean(&seen);
+    let [held, next] = seen.mined[..] else {
+        panic!("the director mines two blocks\n{summary}");
+    };
+    assert_eq!(
+        answers(&seen, held.hash),
+        [(Via::BlockSync, Answer::Committed)],
+        "block sync commits the held block, and BPv1 never submits it\n{summary}"
+    );
+    assert_eq!(seen.tally.fetches(held.height), 1, "{summary}");
+    assert_eq!(
+        seen.phases[0],
+        Some(BlockPhase::Fallback),
+        "the held block stays in Fallback\n{summary}"
+    );
+    assert_eq!(
+        seen.tally.committed.get(&next.hash),
+        Some(&Via::Bpv1),
+        "BPv1 commits the next block\n{summary}"
+    );
+    assert_eq!(seen.tally.fetches(next.height), 0, "{summary}");
+}
+
 /// Mirror 0 withholds a block's parts until the first repair round
 /// releases the body claim and block sync fetches the body, then sends
 /// them. BPv1 and block sync both deliver the block, and the first

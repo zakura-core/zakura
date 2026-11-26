@@ -356,7 +356,9 @@ class SelfTests(unittest.TestCase):
 
         function = re.search(r"fn target_spacings\(.*?\.into_iter\(\)", upgrades, re.DOTALL)
         self.assertEqual(re.findall(r"NetworkUpgrade::(\w+)", function.group(0)),
-                         ["Genesis", "Blossom", "Nu7"])
+                         ["Genesis", "Blossom", "Nu7", "Nu7_1"])
+        # NU7.1 has no Mainnet height yet, so its spacing isn't in the Mainnet schedule.
+        self.assertNotRegex(mainnet, r"\bNU7_1\b")
         self.assertEqual(MAINNET_TARGET_SPACINGS, (
             (0, constant(upgrades, "PRE_BLOSSOM_POW_TARGET_SPACING")),
             (constant(mainnet, "BLOSSOM"), constant(upgrades, "POST_BLOSSOM_POW_TARGET_SPACING")),

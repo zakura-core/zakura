@@ -318,6 +318,100 @@ fn nu7_testnet_minimum_difficulty_gap_is_strictly_above_450_seconds() {
     }
 }
 
+fn configured_nu7_1_testnet(nu7_height: u32, nu7_1_height: u32) -> Network {
+    Parameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            blossom: Some(1),
+            nu7: Some(nu7_height),
+            nu7_1: Some(nu7_1_height),
+            ..Default::default()
+        })
+        .expect("activation heights are valid")
+        .clear_funding_streams()
+        .to_network()
+        .expect("configured testnet is valid")
+}
+
+/// Fixed expected `nBits` values independently calculated from the ZIP 223
+/// difficulty formulas using integer arithmetic.
+#[test]
+fn nu7_1_difficulty_vectors_match_expected_nbits() {
+    const NU7: u32 = 100;
+    const NU7_1: u32 = 200;
+
+    let network = configured_nu7_1_testnet(NU7, NU7_1);
+    let candidate_time =
+        DateTime::from_timestamp(2_000_000_000, 0).expect("test timestamp is in range");
+    let context = nu7_vector_context(candidate_time, MAX_POW_ADJUSTMENT_BLOCK_SPAN);
+
+    // At NU7.1 - 1, the 102-target window at 25 seconds produces 0x1e0cd7fd, as
+    // in `nu7_difficulty_vectors_match_expected_nbits`. At and after NU7.1, the
+    // 128-target mean has nBits 0x1e0ccebc. Its 3,226-second median gap is
+    // damped to 2,726 seconds against the 2,560-second timespan, producing
+    // 0x1e0da357. The window reaches below NU7.1, and nothing resets there.
+    for (height, expected_bits, wrong_window_bits) in [
+        (NU7_1 - 1, 0x1e0cd7fd, 0x1e0da357),
+        (NU7_1, 0x1e0da357, 0x1e0cd7fd),
+        (NU7_1 + 1, 0x1e0da357, 0x1e0cd7fd),
+    ] {
+        let adjustment = AdjustedDifficulty::new_from_header_time(
+            candidate_time,
+            block::Height(height - 1),
+            &network,
+            context.iter().copied(),
+        )
+        .expect("the vector supplies the complete height-dependent context");
+        assert_eq!(
+            adjustment.expected_difficulty_threshold(),
+            compact_vector_target(expected_bits),
+            "unexpected nBits at candidate height {height}"
+        );
+
+        let wrong_window_target = compact_vector_target(wrong_window_bits);
+        assert!(matches!(
+            validate_contextual_difficulty_and_time(wrong_window_target, adjustment),
+            Err(ContextualValidationError::InvalidDifficultyThreshold {
+                difficulty_threshold,
+                expected_difficulty,
+            }) if difficulty_threshold == wrong_window_target
+                && expected_difficulty == compact_vector_target(expected_bits)
+        ));
+    }
+}
+
+#[test]
+fn nu7_1_testnet_minimum_difficulty_gap_is_strictly_above_360_seconds() {
+    let network = configured_nu7_1_testnet(100, 200);
+    let candidate_height = block::Height(300_000);
+    let candidate_time =
+        DateTime::from_timestamp(2_000_000_000, 0).expect("test timestamp is in range");
+
+    for (gap, expected_bits) in [
+        (150, 0x1e0da357),
+        (151, 0x1e0da357),
+        (360, 0x1e0d9cf0),
+        (361, 0x2007ffff),
+    ] {
+        let mut context = nu7_vector_context(candidate_time, MAX_POW_ADJUSTMENT_BLOCK_SPAN);
+        context[0].1 = candidate_time - Duration::seconds(gap);
+        let actual = AdjustedDifficulty::new_from_header_time(
+            candidate_time,
+            candidate_height
+                .previous()
+                .expect("the test candidate is not genesis"),
+            &network,
+            context,
+        )
+        .expect("the vector supplies the complete post-NU7.1 context")
+        .expected_difficulty_threshold();
+        assert_eq!(
+            actual,
+            compact_vector_target(expected_bits),
+            "unexpected nBits for a {gap}-second parent gap"
+        );
+    }
+}
+
 #[test]
 fn difficulty_context_accepts_retained_inactive_tail() {
     let network = Network::Mainnet;

@@ -1040,6 +1040,9 @@ pub struct ZakuraEndpoint {
     /// that ended on a mismatch. No upgrade dial starts for a hint inside its
     /// floor (zakura-quic DIAL-5). See [`upgrade_hint`].
     upgrade_alpn_floors: Arc<StdMutex<HashMap<NodeAddr, Instant>>>,
+    /// The bootstrap peers the candidate dialer skips. See
+    /// [`Self::set_excluded_seed_ids`].
+    excluded_seed_ids: Arc<StdMutex<Arc<HashSet<NodeId>>>>,
 }
 
 #[derive(Debug)]
@@ -1316,6 +1319,24 @@ impl ZakuraEndpoint {
         ZakuraUpgradeDialStart::Started
     }
 
+    /// Sets the bootstrap peers the candidate dialer skips. The bootstrap
+    /// dialer names every seed while this node has enough outbound peers of
+    /// its own, so a seed it released isn't dialed again, and none otherwise.
+    pub(crate) fn set_excluded_seed_ids(&self, node_ids: HashSet<NodeId>) {
+        *self
+            .excluded_seed_ids
+            .lock()
+            .expect("Zakura excluded seed mutex is never poisoned") = Arc::new(node_ids);
+    }
+
+    /// Returns the bootstrap peers the candidate dialer skips now.
+    pub(crate) fn excluded_seed_ids(&self) -> Arc<HashSet<NodeId>> {
+        self.excluded_seed_ids
+            .lock()
+            .expect("Zakura excluded seed mutex is never poisoned")
+            .clone()
+    }
+
     /// Starts `hint`'s ALPN-mismatch floor, and drops the floors that ended.
     fn hold_upgrade_alpn_floor(&self, hint: NodeAddr) {
         let now = Instant::now();
@@ -1557,6 +1578,7 @@ impl ZakuraEndpoint {
             block_sync_actions: None,
             upgrade_dials: Arc::new(StdMutex::new(HashMap::new())),
             upgrade_alpn_floors: Arc::new(StdMutex::new(HashMap::new())),
+            excluded_seed_ids: Arc::default(),
         }
     }
 
@@ -1618,6 +1640,7 @@ impl ZakuraEndpoint {
                 .map(|actions| Arc::new(AsyncMutex::new(Some(actions)))),
             upgrade_dials: Arc::new(StdMutex::new(HashMap::new())),
             upgrade_alpn_floors: Arc::new(StdMutex::new(HashMap::new())),
+            excluded_seed_ids: Arc::default(),
         }
     }
 }
@@ -1902,7 +1925,19 @@ struct ZakuraPeerConnectionEntry {
     disconnect_token: CancellationToken,
     /// The connection's close outcome, which a tampered body records.
     close_cause: CloseCause,
+    /// Who opened the connection.
+    direction: ServicePeerDirection,
     registered_at: Instant,
+}
+
+/// A registered connection this node dialed. See
+/// [`ZakuraSupervisorHandle::outbound_peers`].
+#[derive(Debug)]
+pub(crate) struct OutboundPeer {
+    pub(crate) peer_id: ZakuraPeerId,
+    /// The [`admission_host`] the connection is charged to, if its IP is known.
+    pub(crate) host: Option<IpAddr>,
+    pub(crate) registered_at: Instant,
 }
 
 impl ZakuraSupervisorState {
@@ -2108,6 +2143,7 @@ impl ZakuraSupervisorHandle {
                 handle,
                 CancellationToken::new(),
                 CloseCause::new(),
+                ServicePeerDirection::Inbound,
                 super::ZAKURA_CAP_LEGACY_GOSSIP,
             )
             .await;
@@ -2338,6 +2374,41 @@ impl ZakuraSupervisorHandle {
         }
     }
 
+    /// Disconnects `peer_id` if its current connection is one this node
+    /// dialed, and returns whether it did. A connection the peer opened, such
+    /// as one that replaced this node's dial, stays up.
+    pub(crate) async fn disconnect_outbound_peer(&self, peer_id: &ZakuraPeerId) -> bool {
+        let state = self.inner.lock().await;
+        state
+            .active_by_peer
+            .get(peer_id)
+            .filter(|entry| {
+                entry.direction == ServicePeerDirection::Outbound
+                    && !entry.disconnect_token.is_cancelled()
+            })
+            .map(|entry| entry.disconnect_token.cancel())
+            .is_some()
+    }
+
+    /// Returns the registered connections this node dialed, leaving out
+    /// those whose disconnect has been requested.
+    pub(crate) async fn outbound_peers(&self) -> Vec<OutboundPeer> {
+        let state = self.inner.lock().await;
+        state
+            .active_by_peer
+            .iter()
+            .filter(|(_, entry)| {
+                entry.direction == ServicePeerDirection::Outbound
+                    && !entry.disconnect_token.is_cancelled()
+            })
+            .map(|(peer_id, entry)| OutboundPeer {
+                peer_id: peer_id.clone(),
+                host: state.host(entry.conn_id),
+                registered_at: entry.registered_at,
+            })
+            .collect()
+    }
+
     /// Registers the authenticated connection of `peer_id`, whose handshake
     /// also proved the node IDs `proven_earlier` that the peer had before it
     /// added keys (zakura-quic TLS-7).
@@ -2352,6 +2423,7 @@ impl ZakuraSupervisorHandle {
         outbound_handle: ZakuraPeerHandle,
         disconnect_token: CancellationToken,
         close_cause: CloseCause,
+        direction: ServicePeerDirection,
         _accepted_capabilities: u64,
     ) -> ZakuraRegistration {
         // Discovery matches the registered IP against advertised addresses,
@@ -2402,6 +2474,7 @@ impl ZakuraSupervisorHandle {
                     outbound_handle,
                     disconnect_token,
                     close_cause,
+                    direction,
                     registered_at: Instant::now(),
                 };
                 // The replaced registration keeps its per-IP charge until its
@@ -5374,6 +5447,7 @@ impl ZakuraProtocolHandler {
                 outbound_handle,
                 connection_token.clone(),
                 close_cause.clone(),
+                context.direction,
                 context.accepted_capabilities,
             )
             .await;
@@ -6322,6 +6396,7 @@ async fn spawn_zakura_endpoint_inner(
         block_sync_actions,
         upgrade_dials: Arc::new(StdMutex::new(HashMap::new())),
         upgrade_alpn_floors: Arc::new(StdMutex::new(HashMap::new())),
+        excluded_seed_ids: Arc::default(),
     };
     let startup_shutdown = endpoint.background_shutdown_token().drop_guard();
 
@@ -6420,16 +6495,30 @@ async fn spawn_zakura_endpoint_inner(
         &config.zakura.bootstrap_peers,
     )
     .await;
-    // Track the maintained bootstrap redial tasks and the discovery candidate
-    // dialer under the endpoint shutdown owner so `ZakuraEndpoint::shutdown`
-    // drains them. Previously their handles were dropped, leaving detached loops
-    // that kept retrying dials against a torn-down router while holding endpoint
-    // clones past teardown.
-    for task in spawn_native_bootstrap_dialer(
-        endpoint.clone(),
-        config.zakura.bootstrap_peers.clone(),
-        limits.clone(),
-    ) {
+    // A seed the operator also pins in `network.unconditional_peers` stays
+    // connected through the pin, so the bootstrap dialer leaves it alone
+    // instead of closing it once the node has other peers.
+    let pinned: HashSet<NodeId> = config
+        .unconditional_peers
+        .dial_names()
+        .filter_map(|name| name.node_id)
+        .collect();
+    let bootstrap_peers = config
+        .zakura
+        .bootstrap_peers
+        .iter()
+        .filter(|entry| {
+            super::discovery::parse_bootstrap_peer(entry)
+                .map_or(true, |node_addr| !pinned.contains(&node_addr.id))
+        })
+        .cloned()
+        .collect();
+    // Track the bootstrap dialer and the discovery candidate dialer under the
+    // endpoint shutdown owner so `ZakuraEndpoint::shutdown` drains them.
+    // Previously their handles were dropped, leaving detached loops that kept
+    // retrying dials against a torn-down router while holding endpoint clones
+    // past teardown.
+    for task in spawn_native_bootstrap_dialer(endpoint.clone(), bootstrap_peers, limits.clone()) {
         endpoint.push_header_sync_task(task).await;
     }
     let discovery_dialer = discovery::spawn_native_discovery_dialer(
@@ -9985,6 +10074,54 @@ mod tests {
         NEXT_TEST_CONN_ID.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// `outbound_peers` lists only the connections this node dialed, and
+    /// `disconnect_outbound_peer` closes those but leaves a connection the
+    /// peer opened, so a seed release can't close a seed's own connection.
+    #[tokio::test]
+    async fn only_dialed_connections_are_outbound_and_released() {
+        let supervisor = ZakuraSupervisorHandle::new(4);
+        let register = |byte: u8, direction: ServicePeerDirection| {
+            let supervisor = supervisor.clone();
+            async move {
+                let peer = test_peer(byte);
+                let (outbound_tx, _outbound_rx) = mpsc::channel(1);
+                let token = CancellationToken::new();
+                supervisor
+                    .register(
+                        test_conn_id(),
+                        peer.clone(),
+                        &[],
+                        Some(IpAddr::from([203, 0, 113, byte])),
+                        [byte; TRANSCRIPT_HASH_BYTES],
+                        ZakuraPeerHandle::new_for_tests(peer.clone(), outbound_tx),
+                        token.clone(),
+                        CloseCause::new(),
+                        direction,
+                        ZAKURA_CAP_DISCOVERY,
+                    )
+                    .await;
+                (peer, token)
+            }
+        };
+        let (dialed, dialed_token) = register(1, ServicePeerDirection::Outbound).await;
+        let (opened, opened_token) = register(2, ServicePeerDirection::Inbound).await;
+
+        let outbound = supervisor.outbound_peers().await;
+        assert_eq!(outbound.len(), 1);
+        assert_eq!(outbound[0].peer_id, dialed);
+        assert_eq!(outbound[0].host, Some(IpAddr::from([203, 0, 113, 1])));
+
+        assert!(!supervisor.disconnect_outbound_peer(&opened).await);
+        assert!(!opened_token.is_cancelled());
+        assert!(supervisor.disconnect_outbound_peer(&dialed).await);
+        assert!(dialed_token.is_cancelled());
+        assert!(
+            supervisor.outbound_peers().await.is_empty(),
+            "a connection whose disconnect was requested is no longer listed"
+        );
+        assert!(!supervisor.disconnect_outbound_peer(&dialed).await);
+    }
+
     fn registered_conn_id(registration: ZakuraRegistration) -> ZakuraConnId {
         match registration {
             ZakuraRegistration::Registered { conn_id, .. } => conn_id,
@@ -10023,6 +10160,7 @@ mod tests {
                 ZakuraPeerHandle::new_for_tests(peer_id.clone(), outbound_tx),
                 CancellationToken::new(),
                 CloseCause::new(),
+                ServicePeerDirection::Inbound,
                 ZAKURA_CAP_LEGACY_GOSSIP,
             )
             .await;
@@ -10112,6 +10250,7 @@ mod tests {
                     ZakuraPeerHandle::new_for_tests(peer.clone(), outbound_tx),
                     CancellationToken::new(),
                     CloseCause::new(),
+                    ServicePeerDirection::Inbound,
                     ZAKURA_CAP_LEGACY_GOSSIP,
                 )
                 .await,
@@ -10155,6 +10294,7 @@ mod tests {
                     outbound_handle,
                     token,
                     CloseCause::new(),
+                    ServicePeerDirection::Inbound,
                     ZAKURA_CAP_LEGACY_GOSSIP | ZAKURA_CAP_HEADER_SYNC,
                 )
                 .await
@@ -10655,6 +10795,7 @@ mod tests {
                 outbound_handle,
                 disconnect_token,
                 CloseCause::new(),
+                ServicePeerDirection::Inbound,
                 ZAKURA_CAP_LEGACY_GOSSIP | ZAKURA_CAP_HEADER_SYNC,
             )
             .await;
@@ -10682,6 +10823,7 @@ mod tests {
                 outbound_handle,
                 disconnect_token,
                 CloseCause::new(),
+                ServicePeerDirection::Inbound,
                 ZAKURA_CAP_LEGACY_GOSSIP | ZAKURA_CAP_HEADER_SYNC,
             )
             .await
@@ -11766,6 +11908,7 @@ mod tests {
                     outbound_handle,
                     token,
                     CloseCause::new(),
+                    ServicePeerDirection::Inbound,
                     ZAKURA_CAP_LEGACY_GOSSIP | ZAKURA_CAP_HEADER_SYNC,
                 )
                 .await
@@ -11838,6 +11981,7 @@ mod tests {
                     outbound_handle,
                     token,
                     CloseCause::new(),
+                    ServicePeerDirection::Inbound,
                     ZAKURA_CAP_LEGACY_GOSSIP | ZAKURA_CAP_HEADER_SYNC,
                 )
                 .await
@@ -11902,6 +12046,7 @@ mod tests {
                     outbound_handle,
                     CancellationToken::new(),
                     CloseCause::new(),
+                    ServicePeerDirection::Inbound,
                     ZAKURA_CAP_DISCOVERY,
                 )
                 .await
@@ -11971,6 +12116,7 @@ mod tests {
                     outbound_handle,
                     token,
                     CloseCause::new(),
+                    ServicePeerDirection::Inbound,
                     ZAKURA_CAP_LEGACY_GOSSIP | ZAKURA_CAP_HEADER_SYNC,
                 )
                 .await
@@ -12183,6 +12329,7 @@ mod tests {
                     ZakuraPeerHandle::new_for_tests(peer.clone(), outbound),
                     replacement_cancel.clone(),
                     replacement_cause.clone(),
+                    ServicePeerDirection::Inbound,
                     ZAKURA_CAP_BLOCK_SYNC_REGULATED,
                 )
                 .await,
@@ -15447,6 +15594,7 @@ mod tests {
                     outbound_handle,
                     CancellationToken::new(),
                     CloseCause::new(),
+                    ServicePeerDirection::Inbound,
                     ZAKURA_CAP_LEGACY_GOSSIP | ZAKURA_CAP_HEADER_SYNC,
                 )
                 .await
@@ -15629,6 +15777,7 @@ mod tests {
                 ZakuraPeerHandle::new_for_tests(peer, outbound_tx),
                 CancellationToken::new(),
                 CloseCause::new(),
+                ServicePeerDirection::Inbound,
                 ZAKURA_CAP_LEGACY_GOSSIP,
             )
             .await;
@@ -15790,6 +15939,7 @@ mod tests {
                 ZakuraPeerHandle::new_for_tests(peer.clone(), outbound_tx),
                 token,
                 CloseCause::new(),
+                ServicePeerDirection::Inbound,
                 ZAKURA_CAP_LEGACY_GOSSIP,
             )
             .await

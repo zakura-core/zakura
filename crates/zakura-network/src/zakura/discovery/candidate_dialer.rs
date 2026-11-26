@@ -136,8 +136,9 @@ pub(crate) fn spawn_native_discovery_dialer(
 }
 
 /// Seed the discovery book with the configured bootstrap peers as trusted static
-/// dial candidates, so the candidate dialer maintains them even before any peer
-/// gossips a signed record for them.
+/// dial candidates, so the candidate dialer can dial them before any peer
+/// gossips a signed record for them. The bootstrap dialer decides when it
+/// stops ([`super::bootstrap`]).
 pub(crate) async fn insert_static_bootstrap_candidates(
     discovery: &ZakuraDiscoveryHandle,
     bootstrap_peers: &[String],
@@ -470,7 +471,10 @@ impl Future for DiscoveryDialWorker {
 /// free ordinary connection slots, since each dial holds one.
 ///
 /// `preferred` is what this round's preferred pass already claimed, and the
-/// preferred set's members are left to that pass.
+/// preferred set's members are left to that pass. The round also skips the
+/// bootstrap peers the bootstrap dialer excludes once this node has enough
+/// outbound peers of its own ([`ZakuraEndpoint::set_excluded_seed_ids`]), so
+/// a released seed isn't dialed again.
 async fn admit_dial_round(
     endpoint: &ZakuraEndpoint,
     discovery: &ZakuraDiscoveryHandle,
@@ -496,7 +500,13 @@ async fn admit_dial_round(
     let supervisor = endpoint.supervisor();
     let in_flight_node_ids = state.in_flight_node_ids();
     let held_places = endpoint.held_places();
-    let mut routes = OrdinaryDialRoutes::new(supervisor, &held_places, &in_flight_node_ids);
+    let excluded_seeds = endpoint.excluded_seed_ids();
+    let mut routes = OrdinaryDialRoutes::new(
+        supervisor,
+        &held_places,
+        &excluded_seeds,
+        &in_flight_node_ids,
+    );
     // One freed connection permits a replacement. The two spares are alternatives
     // for that slot, so each is checked against the same remaining address capacity.
     let replacement_slots = endpoint
@@ -513,8 +523,12 @@ async fn admit_dial_round(
         return Vec::new();
     }
     // Reserve selection is observational; only real attempts exclude one another here.
-    let mut routes =
-        OrdinaryDialRoutes::new(endpoint.supervisor(), &held_places, &in_flight_node_ids);
+    let mut routes = OrdinaryDialRoutes::new(
+        endpoint.supervisor(),
+        &held_places,
+        &excluded_seeds,
+        &in_flight_node_ids,
+    );
     let mut admitted = Vec::new();
     discovery
         .admit_dial_candidates_preferring_any_service(
@@ -545,10 +559,12 @@ async fn admit_dial_round(
 }
 
 /// An ordinary pass can use each current identity once, excluding preferred,
-/// registered and in-flight nodes, including their previously known identities.
+/// excluded bootstrap, registered and in-flight nodes, including their
+/// previously known identities.
 struct OrdinaryDialRoutes<'a> {
     supervisor: crate::zakura::ZakuraSupervisorHandle,
     held: &'a crate::zakura::HeldPlaces,
+    excluded_seeds: &'a HashSet<NodeId>,
     moved: watch::Receiver<crate::zakura::transport::MovedNodeIds>,
     unavailable: HashSet<NodeId>,
 }
@@ -557,6 +573,7 @@ impl<'a> OrdinaryDialRoutes<'a> {
     fn new(
         supervisor: crate::zakura::ZakuraSupervisorHandle,
         held: &'a crate::zakura::HeldPlaces,
+        excluded_seeds: &'a HashSet<NodeId>,
         in_flight: &[NodeId],
     ) -> Self {
         let moved = supervisor.moved_node_ids();
@@ -567,6 +584,7 @@ impl<'a> OrdinaryDialRoutes<'a> {
         Self {
             supervisor,
             held,
+            excluded_seeds,
             moved,
             unavailable,
         }
@@ -585,6 +603,7 @@ impl<'a> OrdinaryDialRoutes<'a> {
         if self.unavailable.contains(&current)
             || moved.under_either_id(candidate.node_id, |id| {
                 self.held.members.contains(id)
+                    || self.excluded_seeds.contains(id)
                     || self
                         .supervisor
                         .is_registered(&ZakuraPeerId::from_node_id(*id))

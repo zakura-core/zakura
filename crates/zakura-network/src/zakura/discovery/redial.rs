@@ -128,7 +128,7 @@ pub(crate) enum RedialEnd {
 
 /// Outcome of one dial attempt, as seen by [`run_dial_supervisor`].
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum DialResult {
+pub(super) enum DialResult {
     /// Connected and served at least [`ZAKURA_REDIAL_HEALTHY_CONNECTION`].
     Healthy,
     /// Failed to establish, or served only briefly (e.g. a duplicate was closed).
@@ -202,7 +202,7 @@ pub(crate) async fn native_dial_supervised(
 ///
 /// Health counts from the `Registered` report, not from the dial's start, so
 /// transport and control-handshake setup earn no healthy-connection credit.
-async fn score_dial(
+pub(super) async fn score_dial(
     serve: impl Future<Output = Result<(), ZakuraHandlerError>>,
     registration: oneshot::Receiver<DialRegistration>,
 ) -> DialResult {

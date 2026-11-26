@@ -4346,6 +4346,7 @@ impl ZakuraProtocolHandler {
                 connection.clone(),
                 connection_resources.base_receive_window(),
                 BASE_SEND_WINDOW_BYTES.min(self.limits.admitted_send_window_bytes),
+                self.limits.admitted_send_window_bytes,
             )
         });
         let _close_credit = super::memory::CloseCreditOnDrop(conn_credit.clone());

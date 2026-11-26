@@ -21,7 +21,7 @@ struct Harness {
 impl Harness {
     fn new() -> Self {
         Self {
-            machine: CreditMachine::new(BASE_RECEIVE, BASE_SEND),
+            machine: CreditMachine::new(BASE_RECEIVE, BASE_SEND, PER_PEER_CAP),
             seq: 0,
         }
     }
@@ -204,6 +204,24 @@ fn send_window_grows_to_two_cwnd_and_drains_after_an_accepted_byte() {
             ..DrainRelease::default()
         }
     );
+}
+
+/// A configured send window below the serving per-peer cap bounds the
+/// window: with `2 × cwnd` = 10 MiB and a 16 MiB cap, a 3 MiB admitted window
+/// grows only 1 MiB above the 2 MiB base.
+#[test]
+fn send_window_never_grows_past_the_admitted_window() {
+    let mut harness = Harness::new();
+    harness.machine = CreditMachine::new(BASE_RECEIVE, BASE_SEND, 3 * MIB);
+    let waiting = CreditLoad {
+        cwnd: 5 * MIB,
+        queued_send_bytes: 64 * 1024,
+        ..CreditLoad::default()
+    };
+    assert_eq!(harness.tick(waiting).send, SendStep::Grow(MIB));
+    assert!(harness.grown(MIB).is_some());
+    assert_eq!(harness.machine.send_window(), 3 * MIB);
+    assert_eq!(harness.tick(waiting).send, SendStep::Keep);
 }
 
 /// fix-13: output that drains between ticks doesn't shrink the window, while

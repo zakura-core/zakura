@@ -5,7 +5,7 @@
 //! base send window. Live request leases raise the QUIC receive window via
 //! `set_limits` (API-9) before the request goes out, and lower it when the
 //! request ends. Output waiting on the send window grows that window toward
-//! `2 × cwnd` with a serving lease.
+//! `2 × cwnd`, up to the admitted send window, with a serving lease.
 //!
 //! Granted QUIC credit can't be revoked (`02 §6`). A lowered receive window
 //! keeps its unspent lease until `ConnLoad.receive_credit_excess` shows the
@@ -190,7 +190,7 @@ impl Drain {
 ///   until a snapshot that reflects the shrink shows the remaining excess
 ///   credit is covered by the drains after it.
 /// - With output waiting, the send window targets
-///   `min(2 × cwnd, per-peer cap)`. It shrinks to the base after
+///   `min(2 × cwnd, per-peer cap, max send window)`. It shrinks to the base after
 ///   [`SEND_IDLE_TICKS`] ticks with no waiting output and no accepted bytes.
 ///   A shrunk lease drains until the connection accepts a byte after a
 ///   snapshot reflected the shrink.
@@ -204,6 +204,9 @@ pub(crate) struct CreditMachine {
     active_receive_credit: u64,
     receive_drains: VecDeque<Drain>,
     base_send_window: u64,
+    /// The admitted send window (`[network.zakura.quic] send_window_bytes`),
+    /// which the window never grows past.
+    max_send_window: u64,
     active_send: u64,
     send_drains: VecDeque<Drain>,
     /// A [`SendStep::Grow`] awaits its answer.
@@ -219,12 +222,17 @@ pub(crate) struct CreditMachine {
 }
 
 impl CreditMachine {
-    pub(crate) fn new(base_receive_window: u64, base_send_window: u64) -> Self {
+    pub(crate) fn new(
+        base_receive_window: u64,
+        base_send_window: u64,
+        max_send_window: u64,
+    ) -> Self {
         Self {
             base_receive_window,
             active_receive_credit: 0,
             receive_drains: VecDeque::new(),
             base_send_window,
+            max_send_window,
             active_send: 0,
             send_drains: VecDeque::new(),
             growing: false,
@@ -430,7 +438,8 @@ impl CreditMachine {
         release
     }
 
-    /// Targets `min(2 × cwnd, per_peer_cap)` while output waits, keeps the
+    /// Targets `min(2 × cwnd, per_peer_cap, max send window)` while output
+    /// waits, keeps the
     /// window while bytes flow, and returns to the base after
     /// [`SEND_IDLE_TICKS`] idle ticks. Returns the peer's new serving cap, if
     /// it changed, and the window's change.
@@ -453,7 +462,11 @@ impl CreditMachine {
             self.idle_ticks.saturating_add(1)
         };
         let target = if waiting {
-            two_cwnd.min(per_peer_cap).max(base) - base
+            two_cwnd
+                .min(per_peer_cap)
+                .min(self.max_send_window)
+                .max(base)
+                - base
         } else if self.idle_ticks >= SEND_IDLE_TICKS {
             0
         } else {
@@ -629,14 +642,15 @@ pub(crate) struct ConnectionCredit {
 impl ConnectionCredit {
     /// Create the credit of one admitted QUIC connection at
     /// `base_receive_window` and `base_send_window`, and apply those limits
-    /// (API-9).
+    /// (API-9). The send window never grows past `max_send_window`.
     pub(crate) fn new_quic(
         conn_id: ZakuraConnId,
         connection: QuicConn,
         base_receive_window: u64,
         base_send_window: u64,
+        max_send_window: u64,
     ) -> Self {
-        let machine = CreditMachine::new(base_receive_window, base_send_window);
+        let machine = CreditMachine::new(base_receive_window, base_send_window, max_send_window);
         let _ = connection.set_limits(machine.limits());
         Self {
             inner: Arc::new(ConnectionCreditInner {

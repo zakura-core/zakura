@@ -725,7 +725,7 @@ mod receive_credit {
         )
         .await??;
         let base = 1024 * 1024;
-        let credit = ConnectionCredit::new_quic(connection().1, conn, base, base);
+        let credit = ConnectionCredit::new_quic(connection().1, conn, base, base, base);
 
         let (handle, mut inbox) = pool_port();
         publish(&inbox, Vec::new(), Vec::new());

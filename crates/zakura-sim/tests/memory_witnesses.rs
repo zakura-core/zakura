@@ -310,7 +310,7 @@ fn check_honest_never_punished_on_log(
 }
 
 /// Witness for `mem-9` (`pressure-never-faults`): at the exact smallest
-/// accepted budget `B` (where `B - 1` is refused by `MemoryPlan::size_for_node`),
+/// fitting budget `B` (where `B - 1` falls short in `MemoryPlan::size_for_node`),
 /// honest peers syncing headers, blocks, and discovery suffer zero fault
 /// closes and zero `Misbehavior` penalties (`session/honest-never-punished`
 /// holds). With `S` at zero, every lease above a floor waits or is refused,
@@ -325,11 +325,15 @@ fn smallest_accepted_budget_never_faults_honest_peers() {
     };
     let min_b = smallest_accepted_budget_b(&network);
     assert!(
-        MemoryPlan::size_for_node(min_b - 1, &config, &network, None, &[]).is_err(),
-        "min_b - 1 must be refused"
+        MemoryPlan::size_for_node(min_b - 1, &config, &network, None, &[])
+            .expect("a default config sizes")
+            .shortfall
+            .is_some(),
+        "min_b - 1 must fall short"
     );
     let min_plan = MemoryPlan::size_for_node(min_b, &config, &network, None, &[])
-        .expect("min_b must be accepted");
+        .expect("a default config sizes");
+    assert!(min_plan.shortfall.is_none(), "min_b must fit");
     assert_eq!(
         min_plan.build_pool().snapshot().shared_capacity,
         0,

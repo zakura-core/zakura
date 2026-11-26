@@ -46,6 +46,7 @@ use crate::{
             LEGACY_GOSSIP_BUDGET, LEGACY_INBOUND_RETAINED_BYTES, LEGACY_REQUESTS_BUDGET,
         },
         peer_memory::min_budgeted_connections,
+        transport::COMPAT_NODE_BYTES,
         tx_relay::wire::{
             MAX_TX_BYTES, SESSION_HELD_OUTPUT_BYTES, TX_RELAY_DATA_BUDGET, TX_RELAY_STATE_BUDGET,
             ZAKURA_CAP_TX_RELAY,
@@ -144,11 +145,15 @@ pub struct FixedTerms {
     /// Every v2 connection negotiates the compatibility streams, in `Zakura`
     /// and `Dual` mode alike.
     pub legacy_inbound: u64,
+    /// Compatibility output and outbound exchange frames, which every
+    /// connection's compatibility gates also take from one node-wide
+    /// allowance (`COMPAT_NODE_BYTES`).
+    pub legacy_frames: u64,
 }
 
 impl FixedTerms {
     /// Every fixed term by its metric and trace label (`03 §5`).
-    pub const fn entries(&self) -> [(&'static str, u64); 10] {
+    pub const fn entries(&self) -> [(&'static str, u64); 11] {
         [
             ("socket_queues", self.socket_queues),
             ("incoming_buffers", self.incoming_buffers),
@@ -160,6 +165,7 @@ impl FixedTerms {
             ("mempool_pool", self.mempool_pool),
             ("legacy_tcp_ingress", self.legacy_tcp_ingress),
             ("legacy_inbound", self.legacy_inbound),
+            ("legacy_frames", self.legacy_frames),
         ]
     }
 
@@ -880,6 +886,7 @@ impl PlanTerms {
             mempool_pool: memory.mempool_tx_cost_limit,
             legacy_tcp_ingress,
             legacy_inbound: LEGACY_INBOUND_RETAINED_BYTES,
+            legacy_frames: COMPAT_NODE_BYTES,
         };
 
         // Per-connection transport base `t` and per-reactor session bases `b_r` (`02 §8`).
@@ -1516,6 +1523,26 @@ mod tests {
                 .fixed
                 .entries()
                 .contains(&("legacy_inbound", LEGACY_INBOUND_RETAINED_BYTES)));
+        }
+    }
+
+    /// F-900: compatibility output and exchange frames take every grant from
+    /// one node-wide allowance, so the plan counts that allowance once, on every
+    /// v2 stack, instead of nothing.
+    #[test]
+    fn legacy_frames_count_the_compatibility_allowance() {
+        for stack in [P2pStack::Zakura, P2pStack::Dual] {
+            let config = Config {
+                network: Network::Mainnet,
+                p2p_stack: stack,
+                ..Config::default()
+            };
+            let plan = MemoryPlan::size(256 * GIB, &config, &Network::Mainnet).expect("fits");
+            assert_eq!(plan.fixed.legacy_frames, 128 * MIB);
+            assert!(plan
+                .fixed
+                .entries()
+                .contains(&("legacy_frames", COMPAT_NODE_BYTES)));
         }
     }
 

@@ -217,6 +217,7 @@ fn the_envelope_sums_the_shares_of_every_connection() {
             receive: ReceiveBudget::unsolicited_only(48 * MIB),
             output: 96 * MIB,
         },
+        compat_output: 0,
         compat_exchange_bytes: 20 * MIB,
         send_window: 16 * MIB,
         handshake_send_window: 16 * MIB,
@@ -318,8 +319,92 @@ fn compat_exchanges_use_their_connections_own_gate() {
     drop(clamped);
 }
 
-/// One connection's exchange gate holds one worst-case exchange, and the
-/// envelope counts it once per concurrent request of the compatibility client.
+/// F-900: compatibility output and exchanges take every grant from the node's
+/// allowances as well as their connection's gate, so many connections hold no
+/// more than the allowance. A full allowance makes the next grant wait, not
+/// fail, and never holds back other kinds or the other allowance.
+#[tokio::test]
+async fn compatibility_frames_share_the_node_allowances() {
+    const GOSSIP: Stream = Stream {
+        kind: 2,
+        capability: ZAKURA_CAP_LEGACY_GOSSIP,
+        frame_cap: 20,
+        ..Stream::PERSISTENT
+    };
+    let large = ReactorBudget {
+        receive: ReceiveBudget::unsolicited_only(20),
+        output: 1 << 30,
+    };
+    let node = NodeResources::new(
+        ReactorShares {
+            other: large,
+            ..shares()
+        },
+        [GOSSIP, BLOCKS],
+        4096,
+    );
+    let capabilities = GOSSIP.capability | BLOCKS.capability;
+    let output = |connection: &ConnectionResources, kind| {
+        connection
+            .stream(kind, connection.owner())
+            .expect("the connection negotiated the kind")
+            .output
+    };
+    let frame = 20 * MIB;
+    let held_frames = COMPAT_NODE_OUTPUT_BYTES / frame;
+
+    let connections: Vec<_> = (0..=held_frames)
+        .map(|_| node.connection(capabilities))
+        .collect();
+    assert_eq!(
+        output(&connections[0], GOSSIP.kind).capacity(),
+        COMPAT_NODE_OUTPUT_BYTES
+    );
+    let mut held: Vec<_> = connections[..connections.len() - 1]
+        .iter()
+        .map(|connection| output(connection, GOSSIP.kind).try_admit(frame).unwrap())
+        .collect();
+    let last = connections.last().unwrap();
+    assert!(
+        output(last, GOSSIP.kind).try_admit(frame).is_none(),
+        "a fresh connection finds the node's allowance full"
+    );
+    assert!(
+        output(last, BLOCKS.kind).try_admit(frame).is_some(),
+        "other kinds don't take from the allowance"
+    );
+    assert!(
+        last.admit_compat_response(frame).now_or_never().is_some(),
+        "exchanges have an allowance of their own"
+    );
+
+    let gossip = output(last, GOSSIP.kind);
+    let mut waiting = Box::pin(gossip.admit(frame));
+    assert!(futures::poll!(&mut waiting).is_pending());
+    held.pop();
+    drop(waiting.await);
+
+    let exchanges: Vec<_> = (0..COMPAT_NODE_EXCHANGE_BYTES / COMPAT_EXCHANGE_MAX_BYTES)
+        .map(|_| {
+            node.connection(capabilities)
+                .admit_compat_response(COMPAT_EXCHANGE_MAX_BYTES)
+                .now_or_never()
+                .unwrap()
+        })
+        .collect();
+    assert!(
+        node.connection(capabilities)
+            .admit_compat_response(COMPAT_EXCHANGE_MAX_BYTES)
+            .now_or_never()
+            .is_none(),
+        "a fresh connection's exchange waits for the node's allowance"
+    );
+    drop(exchanges);
+}
+
+/// One connection's exchange gate holds one worst-case exchange. The envelope
+/// counts one per concurrent request of the compatibility client, up to the
+/// node's exchange allowance.
 #[test]
 fn the_compat_exchange_budget_holds_one_worst_case_exchange() {
     assert_eq!(COMPAT_EXCHANGE_MAX_BYTES, 20 * MIB);
@@ -334,6 +419,7 @@ fn the_compat_exchange_budget_holds_one_worst_case_exchange() {
         max_open_streams: 1024,
         control_receive_bytes: MIB,
         connection_shares: ReactorBudget::ZERO,
+        compat_output: 0,
         compat_exchange_bytes,
         send_window: MIB,
         handshake_send_window: MIB,
@@ -343,7 +429,11 @@ fn the_compat_exchange_budget_holds_one_worst_case_exchange() {
     // Widening usize to u64 is lossless on supported targets.
     let client_requests = crate::zakura::legacy_gossip::LEGACY_CLIENT_REQUEST_SLOTS as u64;
     let envelope = ResourceEnvelope::new(limits(client_requests * COMPAT_EXCHANGE_MAX_BYTES));
-    assert_eq!(envelope.compat_response_bytes, 288 * 20 * MIB);
+    assert_eq!(envelope.compat_response_bytes, COMPAT_NODE_EXCHANGE_BYTES);
+    assert_eq!(
+        ResourceEnvelope::new(limits(COMPAT_EXCHANGE_MAX_BYTES)).compat_response_bytes,
+        20 * MIB
+    );
     assert_eq!(
         ResourceEnvelope::new(limits(0)).compat_response_bytes,
         0,

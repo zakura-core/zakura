@@ -63,13 +63,13 @@ pub(crate) use io::{
     GuardedFrameSlot, GuardedReserveError, OrderedStreamFailure, OrderedStreamFailureCause, Queued,
     QueuedFrame, ResponseFrameSlot,
 };
-#[cfg(test)]
-pub(crate) use lifetime::OwnerCounts;
 pub(crate) use lifetime::{
     check_reactor_shares, frame_wire_bytes, CompatResponseGrant, ConnectionResources, FrameGate,
     FrameGrant, NodeResources, OwnerBound, OwnerGuard, OwnerPhase, ResourceEnvelope,
-    StreamResources, TransportLimits, COMPAT_RESPONSE_MAX_AGGREGATE_BYTES,
+    StreamResources, TransportLimits, COMPAT_NODE_BYTES, COMPAT_RESPONSE_MAX_AGGREGATE_BYTES,
 };
+#[cfg(test)]
+pub(crate) use lifetime::{OwnerCounts, COMPAT_NODE_EXCHANGE_BYTES};
 pub use lifetime::{ReactorShares, COMPAT_EXCHANGE_BUDGET, DEFAULT_REACTOR_OUTPUT_BYTES};
 pub(crate) use message_rule::frame_filter::{FrameFilter, InboundReader};
 #[cfg(test)]

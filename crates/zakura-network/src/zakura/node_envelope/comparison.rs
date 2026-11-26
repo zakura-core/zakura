@@ -138,6 +138,7 @@ fn limits(shares: &ReactorShares, peers: usize) -> TransportLimits {
             receive: ReceiveBudget::unsolicited_only(2 * shares.other.receive_total()),
             output: 2 * shares.other.output,
         },
+        compat_output: 0,
         compat_exchange_bytes: 0,
         send_window: u64::from(DEFAULT_ZAKURA_RECEIVE_WINDOW),
         handshake_send_window: u64::from(DEFAULT_ZAKURA_RECEIVE_WINDOW),

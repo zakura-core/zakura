@@ -60,6 +60,7 @@ fn limits() -> TransportLimits {
             receive: ReceiveBudget::unsolicited_only(3 * WINDOW),
             output: 3 * WINDOW,
         },
+        compat_output: 0,
         compat_exchange_bytes: 0,
         send_window: WINDOW,
         handshake_send_window: WINDOW,
@@ -194,18 +195,21 @@ fn the_default_envelope_sums_the_reactor_shares() {
     );
     // Per connection: 79,750,859 B of receive shares with `tx-relay` on
     // (counted inside QUIC receive credit via CreditHold), and unguarded output
-    // shares: 128 MiB for legacy gossip and legacy requests plus `tx-relay`'s
+    // shares: 24 MiB for legacy gossip and legacy requests plus `tx-relay`'s
     // 4,259,840 B. Discovery, header sync and block sync use guarded
     // Serve/Push output counted in `serve_output_bytes`.
     assert_eq!(transport.connection_raw_bytes, 79_750_859);
-    assert_eq!(transport.connection_output_bytes, 128 * MIB + 4_259_840);
-    // The shared compatibility client holds at most 288 exchanges at once.
-    assert_eq!(transport.compat_response_bytes, 288 * 20 * MIB);
+    assert_eq!(transport.connection_output_bytes, 24 * MIB + 4_259_840);
+    // The node's exchange allowance caps the client's 288 exchanges.
+    assert_eq!(transport.compat_response_bytes, 64 * MIB);
     let conns = limits.total_connections() as u128;
+    // F-900: the compatibility output and exchanges stop at the node's 128 MiB
+    // allowance instead of growing by 128 MiB per connection.
     assert_eq!(
         envelope.transport_bytes,
-        conns * u128::from(128 * MIB + 4_259_840) + u128::from(288 * 20 * MIB)
+        conns * 4_259_840 + u128::from(crate::zakura::transport::COMPAT_NODE_BYTES)
     );
+    assert_eq!(crate::zakura::transport::COMPAT_NODE_BYTES, 128 * MIB);
     // `conns` × 113,370,827 + 32 × 128 KiB + 256 MiB.
     assert_eq!(
         envelope.quic_bytes,

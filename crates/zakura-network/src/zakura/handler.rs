@@ -909,6 +909,11 @@ impl ZakuraLocalLimits {
                 output: sum.output.saturating_add(unguarded_output),
             }
         });
+        let compat_output = [LEGACY_GOSSIP_STREAM_KIND, LEGACY_REQUEST_STREAM_KIND]
+            .into_iter()
+            .filter(|kind| kinds.contains(kind))
+            .map(|kind| shares.share(kind).output)
+            .fold(0, u64::saturating_add);
         let compat_exchange_bytes = if kinds.contains(&LEGACY_REQUEST_STREAM_KIND) {
             // Widening usize to u64 is lossless on supported targets.
             COMPAT_EXCHANGE_BUDGET
@@ -921,6 +926,7 @@ impl ZakuraLocalLimits {
             max_open_streams: self.max_open_streams,
             control_receive_bytes: shares.control_receive_bytes,
             connection_shares,
+            compat_output,
             compat_exchange_bytes,
             send_window: self.admitted_send_window_bytes,
             handshake_send_window: self.quic.send_window_bytes,

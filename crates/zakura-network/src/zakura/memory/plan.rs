@@ -990,7 +990,9 @@ impl PlanTerms {
             (admitted_cap as u64).saturating_mul(config.zakura.block_sync.bbr_max_cwnd_bytes);
         let cap_block_sync = block_sync_inflight_cap.saturating_add(look_ahead_cap);
 
-        let floor_serving = LARGEST_SERVED_BLOCK_RESPONSE_BYTES;
+        // Serving queues block responses and header pages, so its floor holds
+        // the larger of the two even when `S` is 0.
+        let floor_serving = LARGEST_SERVED_BLOCK_RESPONSE_BYTES.max(largest_header_page);
         let serving_per_peer_cap = DEFAULT_ZAKURA_SEND_WINDOW
             .saturating_add(SERVE_PEER_OUTPUT_BYTES)
             .max(floor_serving);
@@ -1497,6 +1499,22 @@ mod tests {
             lowered_plan.consumer_spec(Consumer::Sessions).floor,
             default_plan.consumer_spec(Consumer::Sessions).floor
         );
+    }
+
+    /// A node with no shared space still serves a full header page, which is
+    /// larger than the largest block response on Mainnet.
+    #[test]
+    fn serving_floor_holds_a_full_header_page_at_the_minimum() {
+        use crate::zakura::memory::MemoryPoolMachine;
+
+        let config = zakura_cfg(&Network::Mainnet);
+        let page = header_sync_v9::largest_header_page_bytes(&Network::Mainnet);
+        assert!(page > LARGEST_SERVED_BLOCK_RESPONSE_BYTES);
+        let plan = MemoryPlan::size(minimum(&config), &config, &Network::Mainnet).expect("sizes");
+        assert_eq!(plan.shared_capacity(), 0);
+        MemoryPoolMachine::new(plan.pool_config)
+            .try_lease(Consumer::Serving, page)
+            .expect("the serving floor holds one header page");
     }
 
     /// fix-63: state reads are one fixed term, the derived read limit plus the

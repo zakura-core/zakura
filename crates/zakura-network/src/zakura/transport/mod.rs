@@ -72,7 +72,7 @@ pub(crate) use message_rule::frame_filter::{FrameFilter, InboundReader};
 #[cfg(test)]
 pub(crate) use message_rule::frame_suite::check_frame_filter;
 pub use message_rule::{
-    budget::{BudgetError, LocalRole, ReactorBudget},
+    budget::{BudgetError, LocalRole, ReactorBudget, ReceiveBudget},
     frame_filter::FrameRejection,
     layout::LayoutError,
     ByteRate, Cadence, Credit, MessageRole, MessageRule, PayloadLen,

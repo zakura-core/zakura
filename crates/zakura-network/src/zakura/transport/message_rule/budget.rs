@@ -33,16 +33,95 @@ macro_rules! ok {
     };
 }
 
+/// Split of a reactor's per-connection receive bytes into static unsolicited
+/// bytes (charged in the connection's base) and request-answered bytes (funded
+/// by request leases at request time).
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub struct ReceiveBudget {
+    /// Bytes a peer may send without our request (announcements, metered
+    /// pushes, peer requests/updates we serve), plus one maximal frame of slack
+    /// on request-answering streams so every reactor always passes
+    /// [`ReactorBudget::check_frame_cap`].
+    pub unsolicited: u64,
+    /// Bytes a peer sends only in answer to our own requests or subscriptions.
+    pub per_request: u64,
+}
+
+impl ReceiveBudget {
+    /// A receive budget that holds nothing.
+    pub const ZERO: Self = Self {
+        unsolicited: 0,
+        per_request: 0,
+    };
+
+    /// A receive budget whose bytes are all unsolicited (static base).
+    pub const fn unsolicited_only(bytes: u64) -> Self {
+        Self {
+            unsolicited: bytes,
+            per_request: 0,
+        }
+    }
+
+    /// Total receive bytes: `unsolicited + per_request` (saturating).
+    pub const fn total(self) -> u64 {
+        self.unsolicited.saturating_add(self.per_request)
+    }
+
+    /// Total receive bytes, or `None` on overflow.
+    pub const fn checked_total(self) -> Option<u64> {
+        self.unsolicited.checked_add(self.per_request)
+    }
+
+    /// Component-wise checked addition.
+    pub const fn checked_add(self, other: Self) -> Option<Self> {
+        let Some(unsolicited) = self.unsolicited.checked_add(other.unsolicited) else {
+            return None;
+        };
+        let Some(per_request) = self.per_request.checked_add(other.per_request) else {
+            return None;
+        };
+        Some(Self {
+            unsolicited,
+            per_request,
+        })
+    }
+
+    /// Component-wise saturating addition.
+    pub const fn saturating_add(self, other: Self) -> Self {
+        Self {
+            unsolicited: self.unsolicited.saturating_add(other.unsolicited),
+            per_request: self.per_request.saturating_add(other.per_request),
+        }
+    }
+
+    /// Component-wise checked multiplication by `connections`.
+    pub const fn checked_mul(self, connections: usize) -> Option<Self> {
+        // Widening usize to u64 is lossless on supported targets.
+        let connections = connections as u64;
+        let Some(unsolicited) = self.unsolicited.checked_mul(connections) else {
+            return None;
+        };
+        let Some(per_request) = self.per_request.checked_mul(connections) else {
+            return None;
+        };
+        Some(Self {
+            unsolicited,
+            per_request,
+        })
+    }
+}
+
 /// One reactor's memory share on one connection, in bytes.
 ///
-/// `receive` bounds the payload bytes a conformant peer may have sent the
-/// reactor that the node has not released. `output` bounds the encoded bytes
-/// the reactor may queue for the peer. Node totals are checked sums and
-/// products of these values.
+/// `receive` splits the payload bytes a conformant peer may send the reactor
+/// into `unsolicited` (base) and `per_request` (answers to our requests).
+/// `output` bounds the encoded bytes the reactor may queue for the peer.
+/// Node totals are checked sums and products of these values.
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 pub struct ReactorBudget {
-    /// Received payload bytes held per connection.
-    pub receive: u64,
+    /// Received payload bytes held per connection, split into unsolicited and
+    /// per-request bytes.
+    pub receive: ReceiveBudget,
     /// Queued output bytes per connection.
     pub output: u64,
 }
@@ -50,9 +129,14 @@ pub struct ReactorBudget {
 impl ReactorBudget {
     /// A budget that holds nothing.
     pub const ZERO: Self = Self {
-        receive: 0,
+        receive: ReceiveBudget::ZERO,
         output: 0,
     };
+
+    /// Total received bytes (`unsolicited + per_request`).
+    pub const fn receive_total(self) -> u64 {
+        self.receive.total()
+    }
 
     /// This budget plus `other`, or `None` if either field overflows.
     pub const fn checked_add(self, other: Self) -> Option<Self> {
@@ -84,25 +168,25 @@ impl ReactorBudget {
     /// overflows.
     pub const fn checked_mul(self, connections: usize) -> Option<Self> {
         // Widening usize to u64 is lossless on every supported target.
-        let connections = connections as u64;
         let Some(receive) = self.receive.checked_mul(connections) else {
             return None;
         };
-        let Some(output) = self.output.checked_mul(connections) else {
+        let Some(output) = self.output.checked_mul(connections as u64) else {
             return None;
         };
         Some(Self { receive, output })
     }
 
-    /// This budget, if its receive share holds one frame of `frame_cap` bytes.
+    /// This budget, if its unsolicited receive base holds one frame of
+    /// `frame_cap` bytes.
     ///
-    /// A share below the frame cap could refuse a frame that the reactor
-    /// waits for, even with nothing else held.
+    /// A base below the frame cap could refuse a frame that the reactor waits
+    /// for, even when no request leases are held.
     pub const fn check_frame_cap(self, frame_cap: u32) -> Result<Self, BudgetError> {
         // Widening u32 to u64 is lossless.
-        if self.receive < frame_cap as u64 {
+        if self.receive.unsolicited < frame_cap as u64 {
             return Err(BudgetError::BelowFrameCap {
-                receive: self.receive,
+                receive: self.receive.unsolicited,
                 frame_cap,
             });
         }
@@ -113,9 +197,9 @@ impl ReactorBudget {
     /// a `const` item, the panic fails the build:
     ///
     /// ```compile_fail,E0080
-    /// # use zakura_network::zakura::ReactorBudget;
+    /// # use zakura_network::zakura::{ReactorBudget, ReceiveBudget};
     /// const _: ReactorBudget = ReactorBudget {
-    ///     receive: 1023,
+    ///     receive: ReceiveBudget::unsolicited_only(1023),
     ///     output: 0,
     /// }
     /// .assert_frame_cap(1024);
@@ -228,21 +312,51 @@ impl std::error::Error for BudgetError {}
 
 impl Stream {
     /// The most payload bytes a conformant peer may send this node over
-    /// `layout` on one connection, when this node takes the `local` side.
+    /// `layout` on one connection, split into `unsolicited` and `per_request`
+    /// bytes.
     ///
-    /// Only frames the peer sends count:
-    ///
-    /// - every announcement row, at its cadence: `capacity × max payload`;
-    /// - if this node serves, the peer's requests and subscription updates:
-    ///   `max_in_flight × max payload` per request row, and
-    ///   `capacity × max payload` of each subscription row's cadence;
-    /// - if this node requests, the answers: `max_in_flight × the largest
-    ///   response` per request row, and `max_live × (credit bytes + the
-    ///   largest response)` per subscription row: the credit plus one more
-    ///   page or the terminal outcome.
+    /// - `unsolicited`: every announcement row (`capacity × max payload`),
+    ///   every metered row (`opening_allowance + sender_allowance`), and when
+    ///   `local.serves()`, the peer's requests (`max_in_flight × max payload`)
+    ///   and paced subscription updates (`capacity × max payload`).
+    /// - `per_request`: when `local.requests()`, the answers to our requests
+    ///   (`max_in_flight × largest response`) and subscriptions
+    ///   (`max_live × (credit bytes + largest response)`).
     ///
     /// Response rows add nothing themselves: their request row counts them.
     /// The bound excludes frame headers, as [`PayloadLen`] does.
+    ///
+    /// [`PayloadLen`]: super::PayloadLen
+    pub const fn receive_bound_split(
+        layout: &[Stream],
+        local: LocalRole,
+    ) -> Result<ReceiveBudget, BudgetError> {
+        if let Err(error) = Self::check_layout(layout) {
+            return Err(BudgetError::Layout(error));
+        }
+        let mut rows = Rows::new(layout);
+        let mut total: Option<ReceiveBudget> = None;
+        while let Some(row) = rows.next() {
+            let share = ok!(row_receive_split(layout, row, local));
+            let sum = match total {
+                Some(total) => match total.checked_add(share) {
+                    Some(sum) => Ok(sum),
+                    None => Err(BudgetError::Overflow {
+                        message_type: row.message_type,
+                    }),
+                },
+                None => Ok(share),
+            };
+            total = Some(ok!(sum));
+        }
+        match total {
+            Some(total) => Ok(total),
+            None => Err(BudgetError::NoTables),
+        }
+    }
+
+    /// Total receive bound (`unsolicited + per_request`), derived from
+    /// [`Self::receive_bound_split`].
     ///
     /// A cadence term counts what a conformant sender queues across a
     /// connection-wide outage of up to [`Cadence::MAX_OUTAGE`]. A longer read
@@ -258,62 +372,64 @@ impl Stream {
     /// a count: a request this node sends whose responses need not end the
     /// exchange, or a subscription this node publishes without an update
     /// cadence. The reactor then computes that term itself.
-    ///
-    /// [`PayloadLen`]: super::PayloadLen
     pub const fn receive_bound(layout: &[Stream], local: LocalRole) -> Result<u64, BudgetError> {
-        if let Err(error) = Self::check_layout(layout) {
-            return Err(BudgetError::Layout(error));
-        }
-        let mut rows = Rows::new(layout);
-        let mut total = None;
-        while let Some(row) = rows.next() {
-            let share = ok!(row_receive(layout, row, local));
-            let sum = match total {
-                Some(total) => add(total, share, row.message_type),
-                None => Ok(share),
-            };
-            total = Some(ok!(sum));
-        }
-        match total {
+        let split = ok!(Self::receive_bound_split(layout, local));
+        match split.checked_total() {
             Some(total) => Ok(total),
-            None => Err(BudgetError::NoTables),
+            None => {
+                // Find the first row's message type for the overflow error.
+                let mut rows = Rows::new(layout);
+                let message_type = match rows.next() {
+                    Some(row) => row.message_type,
+                    None => 0,
+                };
+                Err(BudgetError::Overflow { message_type })
+            }
         }
     }
 }
 
-/// The bytes the peer may send this node under `row`.
-const fn row_receive(
+/// The bytes the peer may send this node under `row`, split into unsolicited
+/// and per-request bytes.
+const fn row_receive_split(
     layout: &[Stream],
     row: MessageRule,
     local: LocalRole,
-) -> Result<u64, BudgetError> {
+) -> Result<ReceiveBudget, BudgetError> {
     let message_type = row.message_type;
     let payload = row.payload.max();
     match row.role {
-        MessageRole::Announcement { cadence } => times(cadence.capacity, payload, message_type),
+        MessageRole::Announcement { cadence } => Ok(ReceiveBudget::unsolicited_only(ok!(times(
+            cadence.capacity,
+            payload,
+            message_type
+        )))),
         // A conformant sender has paid for at most its opening allowance and
         // holds at most its sender allowance unwritten. The stream receive
         // window, which flow control caps, is the connection's, not the row's.
-        MessageRole::Metered { rate } => add(
+        MessageRole::Metered { rate } => Ok(ReceiveBudget::unsolicited_only(ok!(add(
             // Widening u32 to u64 is lossless.
             rate.opening_allowance as u64,
             rate.sender_allowance as u64,
             message_type,
-        ),
+        )))),
         MessageRole::Request { max_in_flight, .. } => {
-            let mut share = 0;
+            let mut unsolicited = 0;
+            let mut per_request = 0;
             if local.serves() {
-                share = ok!(times(max_in_flight, payload, message_type));
+                unsolicited = ok!(times(max_in_flight, payload, message_type));
             }
             if local.requests() {
                 let (largest, open_ended) = responses(layout, message_type);
                 if open_ended {
                     return Err(BudgetError::UnboundedResponses { message_type });
                 }
-                let answers = ok!(times(max_in_flight, largest, message_type));
-                share = ok!(add(share, answers, message_type));
+                per_request = ok!(times(max_in_flight, largest, message_type));
             }
-            Ok(share)
+            Ok(ReceiveBudget {
+                unsolicited,
+                per_request,
+            })
         }
         MessageRole::Subscription {
             max_live,
@@ -321,12 +437,13 @@ const fn row_receive(
             cadence,
             ..
         } => {
-            let mut share = 0;
+            let mut unsolicited = 0;
+            let mut per_request = 0;
             if local.serves() {
                 let Some(cadence) = cadence else {
                     return Err(BudgetError::UnboundedUpdates { message_type });
                 };
-                share = ok!(times(cadence.capacity, payload, message_type));
+                unsolicited = ok!(times(cadence.capacity, payload, message_type));
             }
             if local.requests() {
                 let (largest, _) = responses(layout, message_type);
@@ -334,12 +451,14 @@ const fn row_receive(
                 let Some(per_live) = largest.checked_add(credit.bytes as usize) else {
                     return Err(BudgetError::Overflow { message_type });
                 };
-                let pages = ok!(times(max_live, per_live, message_type));
-                share = ok!(add(share, pages, message_type));
+                per_request = ok!(times(max_live, per_live, message_type));
             }
-            Ok(share)
+            Ok(ReceiveBudget {
+                unsolicited,
+                per_request,
+            })
         }
-        MessageRole::Response { .. } => Ok(0),
+        MessageRole::Response { .. } => Ok(ReceiveBudget::ZERO),
     }
 }
 

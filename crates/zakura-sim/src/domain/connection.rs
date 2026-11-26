@@ -480,7 +480,7 @@ impl ConnectionFold {
     /// trigger histories of it and [`CREDIT_ISOLATED`] read.
     fn shares(&mut self, bounds: &WireBounds, connection: u64, kinds: &[crate::observe::KindLoad]) {
         let shares = bounds.node.reactor_shares();
-        let handshake = u64::from(bounds.node.quic.receive_window_bytes);
+        let handshake = u64::from(bounds.node.quic.receive_window());
         self.holding.remove(&connection);
         self.findings.shares.judged = true;
         for load in kinds {
@@ -500,7 +500,7 @@ impl ConnectionFold {
                 self.grant_returned |= free.0 > last.0 || free.1 > last.1;
             }
             self.held_past_another_share |= kinds.iter().any(|other| {
-                other.kind != load.kind && load.raw_held > shares.share(other.kind).receive
+                other.kind != load.kind && load.raw_held > shares.share(other.kind).receive.total()
             });
             if load.raw_held > handshake {
                 self.holding.insert(connection, load.kind);
@@ -510,7 +510,7 @@ impl ConnectionFold {
                 (
                     "raw inbound gate",
                     load.raw_held,
-                    share.receive,
+                    share.receive.total(),
                     load.raw_excess,
                     load.raw_capacity,
                 ),
@@ -622,7 +622,12 @@ impl ConnectionFold {
         else {
             return;
         };
-        let share = bounds.node.reactor_shares().share(write.kind).receive;
+        let share = bounds
+            .node
+            .reactor_shares()
+            .share(write.kind)
+            .receive
+            .total();
         // The node's own gate held the frame back: its kind's held frames
         // left no room for one more frame.
         if write

@@ -535,7 +535,7 @@ fn the_largest_credit_fits_the_receive_budget() {
     // Widening u32 and usize to u64 is lossless on supported targets.
     let subscription = u64::from(credit.bytes) + largest_page(MAINNET) as u64;
     assert!(queued <= subscription);
-    assert!(queued + 602 * 122 + 999_154 <= CommonMessage::BUDGET.receive);
+    assert!(queued + 602 * 122 + 999_154 <= CommonMessage::BUDGET.receive_total());
 }
 
 /// Path pages start at the highest sent locator on the target's chain, carry

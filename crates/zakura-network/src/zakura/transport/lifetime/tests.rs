@@ -32,12 +32,12 @@ fn shares() -> ReactorShares {
         kinds: vec![(
             HEADERS.kind,
             ReactorBudget {
-                receive: 20,
+                receive: ReceiveBudget::unsolicited_only(20),
                 output: 1024,
             },
         )],
         other: ReactorBudget {
-            receive: 30,
+            receive: ReceiveBudget::unsolicited_only(30),
             output: 2048,
         },
     }
@@ -167,7 +167,7 @@ fn quic_shares_keep_the_configured_windows() {
     let shares = ReactorShares::from_quic(&quic);
     assert_eq!(
         shares.control_receive_bytes,
-        u64::from(quic.receive_window_bytes)
+        u64::from(quic.receive_window())
     );
     assert_eq!(
         shares.stream_receive_window(),
@@ -176,7 +176,7 @@ fn quic_shares_keep_the_configured_windows() {
     assert_eq!(shares.share(7).output, DEFAULT_REACTOR_OUTPUT_BYTES);
     assert_eq!(
         shares.receive_window([5, 6]),
-        u64::from(quic.receive_window_bytes) + 2 * u64::from(quic.stream_receive_window_bytes)
+        u64::from(quic.receive_window()) + 2 * u64::from(quic.stream_receive_window_bytes)
     );
 }
 
@@ -185,7 +185,7 @@ fn quic_shares_keep_the_configured_windows() {
 fn an_output_share_below_its_largest_frame_is_refused() {
     let small = ReactorShares {
         other: ReactorBudget {
-            receive: 20,
+            receive: ReceiveBudget::unsolicited_only(20),
             output: 19,
         },
         ..shares()
@@ -200,7 +200,7 @@ fn an_output_share_below_its_largest_frame_is_refused() {
 fn a_receive_share_below_its_largest_frame_is_refused() {
     let small = ReactorShares {
         other: ReactorBudget {
-            receive: 19,
+            receive: ReceiveBudget::unsolicited_only(19),
             output: 20,
         },
         ..shares()
@@ -214,17 +214,17 @@ fn the_envelope_sums_the_shares_of_every_connection() {
         max_open_streams: 1024,
         control_receive_bytes: 32 * MIB,
         connection_shares: ReactorBudget {
-            receive: 48 * MIB,
+            receive: ReceiveBudget::unsolicited_only(48 * MIB),
             output: 96 * MIB,
         },
         compat_exchange_bytes: 20 * MIB,
         send_window: 16 * MIB,
+        handshake_send_window: 16 * MIB,
         max_connections: 256,
         max_pending_handshakes: 32,
     });
     assert_eq!(envelope.connection_raw_bytes, 48 * MIB);
     assert_eq!(envelope.connection_output_bytes, 96 * MIB);
-    assert_eq!(envelope.node_raw_bytes, 256 * 48 * MIB);
     assert_eq!(envelope.node_output_bytes, 256 * 96 * MIB);
     assert_eq!(
         envelope.compat_response_bytes,
@@ -237,9 +237,12 @@ fn the_envelope_sums_the_shares_of_every_connection() {
         u128::from(256 * (32 + 48 + 16) * MIB + 32 * (32 + 16) * MIB)
     );
     assert_eq!(
+        envelope.retained_frame_bytes(),
+        u128::from(envelope.node_output_bytes) + u128::from(envelope.compat_response_bytes),
+    );
+    assert_eq!(
         envelope.transport_memory_bytes(),
-        u128::from(envelope.node_raw_bytes)
-            + u128::from(envelope.node_output_bytes)
+        u128::from(envelope.node_output_bytes)
             + u128::from(envelope.compat_response_bytes)
             + envelope.transport_credit_bytes,
     );
@@ -274,7 +277,7 @@ fn compat_exchanges_use_their_connections_own_gate() {
     let node = node();
     let connection = node.connection(HEADERS.capability | BLOCKS.capability);
     let headers = connection.stream(HEADERS.kind, connection.owner()).unwrap();
-    let capacity = COMPAT_EXCHANGE_BUDGET.receive;
+    let capacity = COMPAT_EXCHANGE_BUDGET.receive_total();
 
     // A kind share of twenty bytes does not limit a whole exchange.
     let held = connection
@@ -323,7 +326,7 @@ fn the_compat_exchange_budget_holds_one_worst_case_exchange() {
     assert_eq!(
         COMPAT_EXCHANGE_BUDGET,
         ReactorBudget {
-            receive: 20 * MIB,
+            receive: ReceiveBudget::unsolicited_only(20 * MIB),
             output: 0,
         }
     );
@@ -333,6 +336,7 @@ fn the_compat_exchange_budget_holds_one_worst_case_exchange() {
         connection_shares: ReactorBudget::ZERO,
         compat_exchange_bytes,
         send_window: MIB,
+        handshake_send_window: MIB,
         max_connections: 92,
         max_pending_handshakes: 32,
     };
@@ -347,11 +351,11 @@ fn the_compat_exchange_budget_holds_one_worst_case_exchange() {
     );
 }
 
-/// The peer memory budget funds every admitted connection's whole window at the
+/// The node's QUIC term counts every admitted connection's whole window at the
 /// default shares, its send window, every handshake, and the socket queue. The
-/// transport envelope's QUIC term is the budget's charge without the socket.
+/// transport envelope's QUIC term is that charge without the socket.
 #[test]
-fn the_peer_memory_budget_funds_the_whole_windows() {
+fn the_quic_term_counts_the_whole_windows() {
     let config = crate::Config::default();
     let limits = crate::zakura::ZakuraLocalLimits::from_config(&config);
     let shares = limits.reactor_shares();
@@ -365,8 +369,6 @@ fn the_peer_memory_budget_funds_the_whole_windows() {
         envelope.transport_credit_bytes + u128::from(zakura_quic::SOCKET_DATAGRAM_QUEUE_BYTES),
         quic
     );
-    let budget = u128::from(crate::zakura::DEFAULT_ZAKURA_PEER_MEMORY_BUDGET_BYTES);
-    assert!(quic <= budget, "{quic} of {budget}");
 }
 
 #[derive(Debug, Clone)]

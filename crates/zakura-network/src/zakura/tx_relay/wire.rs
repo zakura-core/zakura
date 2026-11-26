@@ -16,8 +16,8 @@ use zakura_chain::{
 
 use crate::zakura::{
     wire_codec::{BoundedReader, LeU16, LeU32, List, Wire, WireError, WireMessage},
-    ByteRate, Cadence, Frame, MessageRole, MessageRule, PayloadLen, ReactorBudget, Stream,
-    StreamQueueDepths,
+    ByteRate, Cadence, Frame, LocalRole, MessageRole, MessageRule, PayloadLen, ReactorBudget,
+    ReceiveBudget, Stream, StreamQueueDepths,
 };
 
 /// Capability bit for `tx-relay`.
@@ -242,19 +242,51 @@ pub(crate) const SESSION_HELD_OUTPUT_BYTES: u64 =
 /// The state stream's frame cap.
 const STATE_FRAME_CAP: u32 = 4 * 1024;
 
-/// The data stream's share of one connection: room for the largest body
-/// with space to spare, for both what the peer sends and what this node
-/// queues. *Provisional.*
+/// The unsolicited bytes a peer may send on `layout`'s rows, on a session
+/// where this node both asks and serves.
+const fn unsolicited_rows(layout: &[Stream]) -> u64 {
+    match Stream::receive_bound_split(layout, LocalRole::Both) {
+        Ok(bytes) => bytes.unsolicited,
+        Err(error) => panic!("{}", error.rule()),
+    }
+}
+
+/// The state stream's unsolicited rows: the `Hello` cadence and the peer's
+/// `GetTxs` in flight.
+const TX_RELAY_STATE_ROWS: u64 = unsolicited_rows(&[TX_RELAY_STREAMS[1]]);
+
+/// The data stream's unsolicited receive base: its rows, the `Have` metered
+/// allowances, plus one maximal `Tx` frame of slack so the stream always
+/// passes `check_frame_cap`. Its `Tx` answers the state stream's `GetTxs`,
+/// so its rows are the session's less the state stream's.
+// Widening `u32` to `u64` is lossless.
+const TX_RELAY_DATA_UNSOLICITED: u64 =
+    unsolicited_rows(&TX_RELAY_STREAMS) - TX_RELAY_STATE_ROWS + DATA_FRAME_CAP as u64;
+
+/// The data stream's share of one connection: unsolicited `Have` allowances
+/// plus one maximal `Tx` frame in the static base, and the remainder of the
+/// 4 MiB provisional window in `per_request`.
 pub(crate) const TX_RELAY_DATA_BUDGET: ReactorBudget = ReactorBudget {
-    receive: 4 * 1024 * 1024,
+    receive: ReceiveBudget {
+        unsolicited: TX_RELAY_DATA_UNSOLICITED,
+        per_request: (4 * 1024 * 1024) - TX_RELAY_DATA_UNSOLICITED,
+    },
     output: 4 * 1024 * 1024,
 }
 .assert_frame_cap(DATA_FRAME_CAP);
 
+/// The state stream's unsolicited receive base: its rows and one maximal
+/// state frame.
+// Widening `u32` to `u64` is lossless.
+const TX_RELAY_STATE_UNSOLICITED: u64 = TX_RELAY_STATE_ROWS + STATE_FRAME_CAP as u64;
+
 /// The state stream's share of one connection. Its frames are small and
-/// bounded in number by the per-peer request limits. *Provisional.*
+/// bounded in number by the per-peer request limits.
 pub(crate) const TX_RELAY_STATE_BUDGET: ReactorBudget = ReactorBudget {
-    receive: 64 * 1024,
+    receive: ReceiveBudget {
+        unsolicited: TX_RELAY_STATE_UNSOLICITED,
+        per_request: (64 * 1024) - TX_RELAY_STATE_UNSOLICITED,
+    },
     output: 64 * 1024,
 }
 .assert_frame_cap(STATE_FRAME_CAP);

@@ -196,11 +196,13 @@ fn difficulty_context_follows_the_candidate_height() {
         .into(),
     );
     let ancestors = 0..difficulty::MAX_POW_ADJUSTMENT_BLOCK_SPAN * 2;
+    let nu7_span =
+        zakura_chain::parameters::POST_NU7_POW_AVERAGING_WINDOW + difficulty::POW_MEDIAN_BLOCK_SPAN;
 
     for (candidate_height, expected) in [
         (NU7 - 1, difficulty::POW_ADJUSTMENT_BLOCK_SPAN),
-        (NU7, difficulty::MAX_POW_ADJUSTMENT_BLOCK_SPAN),
-        (NU7 + 1, difficulty::MAX_POW_ADJUSTMENT_BLOCK_SPAN),
+        (NU7, nu7_span),
+        (NU7 + 1, nu7_span),
     ] {
         assert_eq!(
             difficulty_context(&network, block::Height(candidate_height), ancestors.clone()).len(),

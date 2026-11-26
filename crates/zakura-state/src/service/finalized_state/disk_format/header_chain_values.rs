@@ -1741,6 +1741,16 @@ pub(crate) fn decode_v4_engine_metadata(
     decode_engine_metadata(bytes, HeaderChainDiskVersion(4), None)
 }
 
+/// Decode released version-five metadata.
+///
+/// Version five used the current layout. Version six only widened the retained validation
+/// context, so the format marker is the one difference.
+pub(crate) fn decode_v5_engine_metadata(
+    bytes: &[u8],
+) -> Result<EngineMetadata, HeaderChainValueError> {
+    decode_engine_metadata(bytes, HeaderChainDiskVersion(5), None)
+}
+
 /// Decode metadata, reading the network policy digest unless the caller supplies a legacy one.
 fn decode_engine_metadata(
     bytes: &[u8],
@@ -2195,22 +2205,27 @@ mod tests {
             )),
         };
         let bytes = metadata.encode().expect("metadata encodes");
-        assert_eq!(&bytes[..6], &[0, 0, 0, 5, 1, 2]);
+        assert_eq!(&bytes[..6], &[0, 0, 0, 6, 1, 2]);
         assert_eq!(EngineMetadata::decode(&bytes), Ok(metadata.clone()));
-        // Version four used the current layout with an older format marker.
-        let mut version_four_bytes = bytes.clone();
-        version_four_bytes[..4].copy_from_slice(&4_u32.to_be_bytes());
-        assert_eq!(
-            EngineMetadata::decode(&version_four_bytes),
-            Err(HeaderChainValueError::UnsupportedDiskFormat(4))
-        );
-        assert_eq!(
-            decode_v4_engine_metadata(&version_four_bytes),
-            Ok(EngineMetadata {
-                disk_format: HeaderChainDiskVersion(4),
-                ..metadata.clone()
-            })
-        );
+        // Versions four and five used the current layout with an older format marker.
+        for (version, decode_legacy) in [
+            (4, decode_v4_engine_metadata as fn(&[u8]) -> _),
+            (5, decode_v5_engine_metadata),
+        ] {
+            let mut legacy_bytes = bytes.clone();
+            legacy_bytes[..4].copy_from_slice(&u32::to_be_bytes(version));
+            assert_eq!(
+                EngineMetadata::decode(&legacy_bytes),
+                Err(HeaderChainValueError::UnsupportedDiskFormat(version))
+            );
+            assert_eq!(
+                decode_legacy(&legacy_bytes),
+                Ok(EngineMetadata {
+                    disk_format: HeaderChainDiskVersion(version),
+                    ..metadata.clone()
+                })
+            );
+        }
         // Version one wrote no network policy digest, so its row is the current row with the
         // marker rolled back and that field removed.
         let mut version_one_bytes = bytes.clone();
@@ -2256,7 +2271,8 @@ mod tests {
         // These digests pin the on-disk encodings. Regenerate a digest only together with a
         // deliberate encoding change; an unexplained change means a value's layout drifted.
         // The finality and metadata digests moved with the version-four migration provenance,
-        // and the metadata digest moved again with the version-five format marker.
+        // and the metadata digest moved again with the version-five and version-six format
+        // markers.
         assert_eq!(
             [
                 digest(&aux.encode().expect("aux encodes")),
@@ -2266,7 +2282,7 @@ mod tests {
             [
                 "c041fc819cc43fcd28dd3ba7fe296271ae0c7225c9bbcdf1dd38152dc313346a",
                 "37c583dc11b5fb0d06484330fe75a5b022249099fd00b3e4d06c267babcbff33",
-                "e12da354e079f8070f3f3b4cf75af93e41ec1f7f52cc31ed380e28a48c10b3e2",
+                "e2dfa202dee8af78eb092f79fccc9353c8d82508ae81a87653468d6b1bce73e7",
             ]
         );
     }
@@ -2343,13 +2359,13 @@ mod tests {
                 ..
             })
         ));
-        let mut metadata = vec![0, 0, 0, 6];
+        let mut metadata = vec![0, 0, 0, 7];
         metadata.resize(512, 0);
         assert_eq!(
             EngineMetadata::decode(&metadata),
-            Err(HeaderChainValueError::UnsupportedDiskFormat(6))
+            Err(HeaderChainValueError::UnsupportedDiskFormat(7))
         );
-        metadata[3] = 5;
+        metadata[3] = 6;
         metadata[4] = 9;
         assert!(matches!(
             EngineMetadata::decode(&metadata),

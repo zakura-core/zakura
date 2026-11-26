@@ -326,12 +326,19 @@ pub const PRE_NU7_POW_AVERAGING_WINDOW: usize = 17;
 /// spacing: `17 * (150 / 25) = 102` blocks.
 pub const POST_NU7_POW_AVERAGING_WINDOW: usize = 102;
 
+/// The averaging window for difficulty threshold arithmetic mean calculations
+/// from NU7.1 onwards.
+///
+/// `TwentySecondPoWAveragingWindow` in ZIP 223. 128 blocks at 20 seconds span
+/// 2,560 seconds, close to the 2,550 seconds ZIP 218's window spans at 25 seconds.
+pub const POST_NU7_1_POW_AVERAGING_WINDOW: usize = 128;
+
 /// The largest consensus averaging window, which bounds the number of relevant
 /// blocks a difficulty adjustment can read.
 ///
 /// Every build retains enough validation context for this window. The active
 /// window remains height-dependent; see [`NetworkUpgrade::averaging_window`].
-pub const MAX_POW_AVERAGING_WINDOW: usize = POST_NU7_POW_AVERAGING_WINDOW;
+pub const MAX_POW_AVERAGING_WINDOW: usize = POST_NU7_1_POW_AVERAGING_WINDOW;
 
 /// Per-block limit on the total number of actions in each Orchard-protocol
 /// pool, applied from NU7 activation onwards.

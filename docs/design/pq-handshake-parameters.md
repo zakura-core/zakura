@@ -29,7 +29,7 @@ margins first. The two halves of the handshake face that risk differently.
   signature needs to hold only until we can replace it.
 - **If a scheme breaks,** we add a key of a new scheme to each node's
   credential, under a new tag, and later retire the old key. Neither step
-  breaks node IDs (spec 0.31, TLS-7, ID-12, DIAL-9, COMPAT-13):
+  breaks node IDs (spec 0.31 and 0.34, TLS-7, ID-12, DIAL-9, COMPAT-13):
   - A dial to the ID a node had before it added the key still reaches it,
     as long as the node signs with the keys that ID names. The dialer then
     follows the node to its new ID.
@@ -39,10 +39,16 @@ margins first. The two halves of the handshake face that risk differently.
     the old nodes of the first upgrade, and a release without the rules
     would refuse the longer credential on a dial to the earlier ID, and a
     fingerprint entry everywhere.
-  - The room is two more keys per node ID. A key list holds 4 entries, two
+  - The room is 30 more keys per node ID. A key list holds 32 entries, two
     of them today's keys, and a retired key keeps its entry. A key over
-    2,592 bytes doesn't fit an entry. Past either limit an upgrade is a
-    hard break again.
+    2,592 bytes doesn't fit an entry, and a credential over 10,385 bytes
+    is refused, which leaves 8,392 bytes beside today's two keys: three
+    more keys of the longest length in full, or one in full and the rest
+    retired to 36-byte fingerprint entries. Past any of these limits an
+    upgrade is a hard break again.
+  - Each new key takes a tag above every tag in use, so a node's earlier
+    key lists are prefixes of its current one. Every later release has to
+    keep to that order.
 
   We still don't carry a pre-committed backup key: it would add a key to
   every credential today. The fingerprint entry leaves that open, since a
@@ -54,11 +60,27 @@ margins first. The two halves of the handshake face that risk differently.
   signature, so it can't help anyone answer as the node, and a verifier
   refuses a credential whose signing key is only a fingerprint.
 
-  **What the earlier-ID rule costs.** A verifier hashes at most 4 key
-  lists of at most 137 bytes on a dial whose ID doesn't match outright. The
-  dialed ID must name both signing keys, so adding a key to another node's
-  public keys gains nothing: the signature is still checked with that
-  node's keys.
+  **What the earlier-ID rule costs.** The dialed ID must name a prefix of
+  the node's key list, so a verifier hashes fewer than 32 key lists of at
+  most 1,089 bytes on a dial whose ID doesn't match outright, one per
+  entry. Spec 0.31 accepted any list of the entries in their order. That
+  was 4 hashes with 4 entries and would be 2^30 with 32, on a credential
+  the dialer has not authenticated yet. The dialed ID must name both
+  signing keys, so adding a key to another node's public keys gains
+  nothing: the signature is still checked with that node's keys.
+
+  **What a long credential costs.** A credential travels whole in each
+  handshake. The byte limit keeps the flight that carries it inside the
+  16 KiB of handshake data `quinn-proto` buffers: about 14 KB at the
+  limit, so the largest credential completes a handshake in any arrival
+  order. Loss is a different matter. With the largest credential on the
+  listener, losing the datagram that starts its ServerHello fails the dial
+  at the handshake deadline: in a `quinn-proto` trace the loss shrinks the
+  congestion window below the unacknowledged flight and the resend waits
+  behind it. Today's 1,993-byte credential recovers. In one simulator
+  measurement, which no test pins, 2,793 bytes still recovered and 3,193
+  did not. The release that adds a key in full has to fix that or accept
+  a redial on such a loss (COMPAT-13).
 
 The classical halves stay as they were. X25519 and Ed25519 don't protect
 against a quantum computer. They protect against a flaw in the young
@@ -96,8 +118,10 @@ Each side sends its credential and a signature, because both sides
 authenticate (TLS-5). A handshake moves about 17.5 KB, in place of about
 12.5 KB on `p2p-v2/4` and 21.4 KB with ML-DSA-87. The keys don't make a
 discovery record grow: it carries each as a 32-byte fingerprint (ID-8). The
-largest record a node accepts does grow, from 753 to 8,649 bytes, to keep
-room for a later post-quantum record signature and its key (COMPAT-13).
+largest record a node accepts does grow, from 753 to 9,601 bytes: 7,896
+bytes keep room for a later post-quantum record signature and its key
+(COMPAT-13), and 952 hold the 28 more key list entries a node may come to
+have.
 
 The listener's figures vary by a few bytes between runs, with the size of
 its acknowledgements: its first flight measured 7,861 to 7,873 bytes.

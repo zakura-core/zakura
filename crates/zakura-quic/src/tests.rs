@@ -1,7 +1,7 @@
 //! Endpoint conformance tests (SPEC §16).
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 
 use crate::{
     endpoint::watch_interfaces,
-    sim::{LinkModel, NetEvent, SeededInputs, SimNet, Source},
+    sim::{DatagramId, LinkModel, NetEvent, SeededInputs, SimNet, Source},
     Acceptor, Admit, Conn, ConnectError, ConnectionError, IncomingInfo, NodeAddr, NodeSecretKey,
     QuicBindConfig, QuicConfig, QuicEndpoint, SocketBuffers, SocketStats, VarInt,
 };
@@ -781,15 +781,50 @@ async fn a_quic_connection_authenticates_the_full_extended_credential() {
     .unwrap();
 }
 
-/// A new node presenting the largest credential it can authenticate with:
-/// its two signing keys and two more keys of the greatest length (ID-12).
-fn largest_credential_key() -> NodeSecretKey {
-    let secret = NodeSecretKey::generate();
-    let own = [crate::ED25519_KEY_TAG, crate::ML_DSA_65_KEY_TAG]
-        .map(|tag| (tag, secret.credential().key(tag).unwrap().to_vec()));
-    let more = [4u8, 5].map(|tag| (u16::from(tag), vec![tag; crate::MAX_CREDENTIAL_KEY_BYTES]));
-    let credential = crate::NodeCredential::from_entries(own.into_iter().chain(more)).unwrap();
+/// The key list entries a credential gives after its two signing keys when
+/// it is the largest a node can authenticate with: 27 retired keys as
+/// fingerprints, two keys of the greatest length and one of 2,224 bytes.
+/// With the signing keys that is 32 entries (ID-8) in exactly
+/// [`crate::MAX_CREDENTIAL_BYTES`] (ID-12).
+fn largest_credential_additions() -> Vec<(u16, crate::CredentialKey)> {
+    use crate::CredentialKey::{Fingerprint, Full};
+    let retired = (4u8..31).map(|tag| (u16::from(tag), Fingerprint([tag; 32])));
+    let longest = [31u8, 32].map(|tag| {
+        let key = vec![tag; crate::MAX_CREDENTIAL_KEY_BYTES];
+        (u16::from(tag), Full(key))
+    });
+    retired
+        .chain(longest)
+        .chain([(33, Full(vec![33; 2_224]))])
+        .collect()
+}
+
+/// `secret` presenting its two signing keys and then `additions`.
+fn with_additions(
+    secret: NodeSecretKey,
+    additions: impl IntoIterator<Item = (u16, crate::CredentialKey)>,
+) -> NodeSecretKey {
+    let own = [crate::ED25519_KEY_TAG, crate::ML_DSA_65_KEY_TAG].map(|tag| {
+        let key = secret.credential().key(tag).unwrap().to_vec();
+        (tag, crate::CredentialKey::Full(key))
+    });
+    let credential = crate::NodeCredential::from_entries(own.into_iter().chain(additions)).unwrap();
     secret.with_credential(credential).unwrap()
+}
+
+/// A new node presenting the largest credential it can authenticate with:
+/// the most entries in the most bytes (ID-8, ID-12).
+pub(crate) fn largest_credential_key() -> NodeSecretKey {
+    let secret = with_additions(NodeSecretKey::generate(), largest_credential_additions());
+    assert_eq!(
+        secret.key_list().encoded_len(),
+        crate::MAX_NODE_KEY_LIST_BYTES
+    );
+    assert_eq!(
+        secret.credential().encode().len(),
+        crate::MAX_CREDENTIAL_BYTES
+    );
+    secret
 }
 
 /// ID-12: the largest credential completes a handshake in both directions.
@@ -807,6 +842,59 @@ async fn the_largest_credential_completes_a_handshake() {
         assert_eq!(conn.remote_id(), server.addr().id);
         assert_eq!(inbound.remote_id(), client.local_id());
         assert_eq!(echo(&conn, b"hello").await, b"hello");
+    })
+    .await
+    .unwrap();
+}
+
+/// TLS-7 through whole QUIC handshakes with a 32-entry credential: the node
+/// answers a dial to each ID it has had since its two signing keys, which
+/// are the prefixes of its key list from those two entries on, and to no
+/// other list of its entries.
+#[tokio::test]
+async fn a_node_with_32_keys_answers_to_each_earlier_id_and_no_other_list() {
+    let original = NodeSecretKey::generate();
+    let additions = largest_credential_additions();
+    // The ID the node had after each key it added.
+    let earlier_ids: Vec<_> = (0..additions.len())
+        .map(|added| with_additions(original.clone(), additions[..added].to_vec()).public())
+        .collect();
+    assert_eq!(earlier_ids[0], original.public());
+    // Lists of the node's entries that keep both signing keys and are not
+    // prefixes: one skips the first key the node added, one keeps only the
+    // last. The rule before spec version 0.34 accepted both.
+    let skipping = with_additions(original.clone(), additions[1..].to_vec()).public();
+    let last_only = with_additions(original.clone(), additions[29..].to_vec()).public();
+    // A prefix that leaves a signing key out: the Ed25519 key alone.
+    let ed25519_only = crate::NodeCredential::single(original.public_key()).node_id();
+    let secret = with_additions(original, additions);
+    assert_eq!(
+        secret.key_list().encoded_len(),
+        crate::MAX_NODE_KEY_LIST_BYTES
+    );
+    let current = secret.public();
+
+    tokio::time::timeout(3 * TEST_TIMEOUT, async {
+        let endpoint = QuicEndpoint::bind(secret, &loopback(), &test_config()).unwrap();
+        let mut server = serve_test_acceptor(endpoint, &[ALPN], |_| Admit::Accept);
+        let client = client();
+        let addrs = server.endpoint.local_addrs();
+
+        for dialed in earlier_ids.into_iter().chain([current]) {
+            let addr = NodeAddr::with_addrs(dialed, addrs.clone());
+            let conn = client.connect(addr, &[ALPN]).await.unwrap();
+            server.handled.recv().await.unwrap();
+            assert_eq!(conn.dialed_id(), Some(dialed));
+            assert_eq!(conn.remote_id(), current);
+            conn.close(VarInt::from_u32(0), b"done");
+        }
+        for refused in [skipping, last_only, ed25519_only] {
+            let addr = NodeAddr::with_addrs(refused, addrs.clone());
+            assert!(matches!(
+                client.connect(addr, &[ALPN]).await,
+                Err(ConnectError::WrongIdentity)
+            ));
+        }
     })
     .await
     .unwrap();
@@ -3358,7 +3446,7 @@ async fn check_listener_first_flight(delay_padding: bool) {
 }
 
 /// ID-12, DIAL-8: a listener with the largest credential has a first flight
-/// of about 13 KB, beyond the padded allowance of 10,800 bytes. The dial
+/// of about 16 KB, beyond the padded allowance of 10,800 bytes. The dial
 /// takes a second round trip and completes. It doesn't fail.
 #[tokio::test(start_paused = true)]
 async fn the_largest_credential_takes_a_second_round_trip() {
@@ -3410,6 +3498,153 @@ async fn the_largest_credential_takes_a_second_round_trip() {
         );
         let (_client, result) = dial.await.unwrap();
         assert_eq!(result.unwrap().remote_id(), _server.addr().id);
+    })
+    .await
+    .unwrap();
+}
+
+/// The order [`pump_bursts`] delivers the datagrams of one burst in.
+#[derive(Clone, Copy)]
+enum BurstOrder {
+    /// As they were sent.
+    Sent,
+    /// The datagram sent last first.
+    Reversed,
+}
+
+/// Delivers what is eligible once per simulated millisecond, in `order`.
+/// `drops` is asked about each datagram, with its length, and the ones it
+/// claims are lost.
+async fn pump_bursts(
+    net: SimNet,
+    order: BurstOrder,
+    mut drops: impl FnMut(DatagramId, usize) -> bool,
+) {
+    let mut seen = 0;
+    let mut lengths = HashMap::new();
+    loop {
+        for event in net.events_since(seen) {
+            seen += 1;
+            if let NetEvent::Sent { id, len, .. } = event {
+                lengths.insert(id, len);
+            }
+        }
+        let mut eligible = net.deliverable();
+        eligible.sort_by_key(|id| id.seq);
+        if matches!(order, BurstOrder::Reversed) {
+            eligible.reverse();
+        }
+        for id in eligible {
+            if drops(id, lengths[&id]) {
+                net.drop_datagram(id).unwrap();
+            } else {
+                net.deliver(id).unwrap();
+            }
+        }
+        assert!(net.can_advance(), "a datagram passed its deadline");
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
+/// A simulated network whose links take 5 ms, so the datagrams of one burst
+/// become eligible together and [`pump_bursts`] can reorder them, and may
+/// lose `loss_budget` datagrams each.
+fn bursty_net(loss_budget: u64) -> SimNet {
+    SimNet::new(LinkModel {
+        min_delay: Duration::from_millis(5),
+        max_delay: Duration::from_millis(5),
+        reorder: true,
+        loss_budget,
+    })
+}
+
+/// ID-12: two nodes with the largest credential complete a handshake when
+/// every burst of datagrams arrives in reverse. The flight that carries the
+/// credential, about 14 KB, fits the 16 KiB of handshake data `quinn-proto`
+/// buffers, so no arrival order makes a peer refuse it.
+#[tokio::test(start_paused = true)]
+async fn the_largest_credential_completes_a_handshake_delivered_in_reverse() {
+    tokio::time::timeout(SIM_TEST_TIMEOUT, async {
+        let net = bursty_net(0);
+        let listener = sim_endpoint_keyed(&net, sim_addr(1), largest_credential_key());
+        let mut server = serve_test_acceptor(listener, &[ALPN], |_| Admit::Accept);
+        let client = sim_endpoint_keyed(&net, sim_addr(2), largest_credential_key());
+        let pump = tokio::spawn(pump_bursts(net.clone(), BurstOrder::Reversed, |_, _| false));
+
+        let conn = client.connect(server.addr(), &[ALPN]).await.unwrap();
+        let inbound = server.handled.recv().await.unwrap();
+        assert_eq!(conn.remote_id(), server.addr().id);
+        assert_eq!(inbound.remote_id(), client.local_id());
+        assert_eq!(echo(&conn, b"hello").await, b"hello");
+        pump.abort();
+    })
+    .await
+    .unwrap();
+}
+
+/// Dials a listener with the key `listener` on a network that loses the
+/// first full datagram the listener sends, which carries the start of its
+/// ServerHello, and delivers the others in the order sent. Returns the dial's result, how long it took, how many bytes
+/// the listener sent, and the connections each endpoint still counts.
+async fn dial_losing_the_server_hello(
+    listener: NodeSecretKey,
+) -> (Result<(), ConnectError>, Duration, usize, [usize; 2]) {
+    let net = bursty_net(1);
+    let listener = sim_endpoint_keyed(&net, sim_addr(1), listener);
+    let server = serve_test_acceptor(listener, &[ALPN], |_| Admit::Accept);
+    let client = sim_endpoint(&net, sim_addr(2));
+    let mut lost = false;
+    let drops = move |id: DatagramId, len| {
+        let first_full = !lost && id.link.src == sim_addr(1) && len == 1200;
+        lost |= first_full;
+        first_full
+    };
+    let pump = tokio::spawn(pump_bursts(net.clone(), BurstOrder::Sent, drops));
+
+    let started = tokio::time::Instant::now();
+    let result = client.connect(server.addr(), &[ALPN]).await;
+    let elapsed = started.elapsed();
+    let sent = sent_lengths(&net, sim_addr(1)).iter().sum();
+    let result = result.map(|conn| conn.close(VarInt::from_u32(0), b"done"));
+    // Leaves time for both ends to release a failed or closed connection.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let counts = [
+        server.endpoint.connection_count(),
+        client.connection_count(),
+    ];
+    pump.abort();
+    (result, elapsed, sent, counts)
+}
+
+/// ID-12: what a long credential costs under loss, today. When the datagram
+/// with the start of a listener's ServerHello is lost, the dialer can't
+/// read the rest of the flight, and the listener has to resend that
+/// datagram. A listener with this release's own credential does, and the
+/// dial completes. A listener with the largest credential doesn't: the loss
+/// shrinks its congestion window below the flight it still has unacked, so
+/// `quinn-proto` holds the resend back, and its probes carry handshake data
+/// the dialer can't read yet. The dial fails at the handshake deadline
+/// (ADM-6), no sooner or later, and both ends release the connection. It
+/// doesn't hang, and the listener sends a bounded number of bytes.
+#[tokio::test(start_paused = true)]
+async fn a_lost_server_hello_fails_the_largest_credentials_dial_at_the_deadline() {
+    tokio::time::timeout(SIM_TEST_TIMEOUT, async {
+        let (result, elapsed, _, counts) =
+            dial_losing_the_server_hello(NodeSecretKey::generate()).await;
+        assert!(result.is_ok(), "{result:?}");
+        assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+        assert_eq!(counts, [0, 0]);
+
+        let deadline = test_config().handshake_timeout().unwrap();
+        let (result, elapsed, sent, counts) =
+            dial_losing_the_server_hello(largest_credential_key()).await;
+        assert!(
+            matches!(result, Err(ConnectError::HandshakeTimeout)),
+            "{result:?}"
+        );
+        assert_eq!(elapsed, deadline);
+        assert!(sent < 64 * 1024, "the listener sent {sent} bytes");
+        assert_eq!(counts, [0, 0]);
     })
     .await
     .unwrap();

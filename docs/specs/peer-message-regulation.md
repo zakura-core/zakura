@@ -275,11 +275,11 @@ MAX_DISCOVERY_RECORDS        = 32
 MAX_EXCLUDED_NODE_IDS        = 256
 MAX_SERVICE_SUMMARIES        = 8
 MAX_SERVICE_SUMMARY_BYTES    = 256
-MAX_NODE_KEYS                = 4
-NODE_RECORD_FIELDS_MAX       = 685 bytes
+MAX_NODE_KEYS                = 32
+NODE_RECORD_FIELDS_MAX       = 1,637 bytes
 RECORD_SIGNATURE_ROOM        = 7,896 bytes
-NODE_RECORD_BODY_MAX         = 8,581 bytes
-NODE_RECORD_MAX              = 8,649 bytes
+NODE_RECORD_BODY_MAX         = 9,533 bytes
+NODE_RECORD_MAX              = 9,601 bytes
 SERVICE_ENVELOPE_MAX         = 294 bytes
 ```
 
@@ -287,6 +287,12 @@ A record body is its fields and then an extension area that this release keeps b
 does not parse. `NODE_RECORD_FIELDS_MAX` is the longest key list with the most and largest
 addresses and services. `NODE_RECORD_BODY_MAX` adds `RECORD_SIGNATURE_ROOM` to it, and
 `NODE_RECORD_MAX` adds the 4-byte body length and the 64-byte Ed25519 signature.
+
+A record carries its author's whole key list, so `MAX_NODE_KEYS` sizes the fields. A key list is a
+count byte and 34 bytes per entry (zakura-quic ID-8): 1,089 bytes for 32 entries, where 4 entries
+took 137. The other 548 bytes of `NODE_RECORD_FIELDS_MAX` are unchanged: the protocol range,
+network, chain, sequence, expiry and counts, 8 IPv6 addresses and 8 service ids of 32 bytes. A
+record of a node with the two keys of this release is no longer than before.
 
 `RECORD_SIGNATURE_ROOM` is kept free for a second record signature. It is two extensions, each a
 `u16` type, a `u16` length and a value: a public key and its signature. This release signs a
@@ -324,31 +330,36 @@ Any node can fill the extension area of its own records, so every bound that sca
 uses `NODE_RECORD_MAX` from this release on, whether or not a signature is present.
 
 What a node accepts and what it sends differ for `Peers`. A node MUST accept a `Peers` up to the
-row's cap, 276,770 bytes. It MUST NOT send one above `SERVED_PEERS_MAX`:
+row's cap, 307,234 bytes. It MUST NOT send one above `SERVED_PEERS_MAX`:
 
 ```text
 SERVED_PEERS_MAX             = 24,098 bytes
 ```
 
-That is a full answer of 32 records with the largest fields and no extension, the largest `Peers`
-before the record body cap grew. When the sampled records exceed it, the answer carries the first
-of them that fit, which is fewer than the request's limit and always allowed. The exchange
-deadlines of a discovery-only connection assume an answer of about this size, so a node whose book
-holds records with full extension areas still answers in time. A later release that signs records
-can send larger answers to the peers it knows will wait for them.
+That is 2 bytes and 32 records of 753, a full answer of records with the largest fields and no
+extension while a key list held 4 entries. The value is fixed and does not follow
+`NODE_RECORD_FIELDS_MAX`, which grew with `MAX_NODE_KEYS`. When the sampled records exceed it,
+the answer carries the first of them that fit, which is fewer than the request's limit and always
+allowed. The exchange deadlines of a discovery-only connection assume an answer of about this
+size, so a node whose book holds records with full extension areas still answers in time. Every
+node of this release signs records with a two-entry key list, and a full answer of those is at
+most 21,922 bytes, so the cap changes nothing for them. A full answer of records with 32-entry key
+lists and every other field at its largest would be 54,562 bytes, and is cut to 14 records. A
+later release that gives nodes longer key lists, or that signs records, can send larger answers
+to the peers it knows will wait for them.
 
 #### `Hello` — Announcement, discriminator 1
 
 - **Frame**
-  - payload cap = 8,649 bytes
+  - payload cap = 9,601 bytes
 - **Decode** — [`validate_record_body_bounds`][record-bounds], [`validate_service_id`][service-id]
   - addresses <= 8
   - services <= 8
   - service ID length = 1..=32 ASCII bytes
   - `protocol_min <= protocol_max`
-  - key list = 1..=4 entries of a `u16` tag and 32 bytes, tags nonzero and strictly increasing
+  - key list = 1..=32 entries of a `u16` tag and 32 bytes, tags nonzero and strictly increasing
   - an Ed25519 entry (tag 1) holds a valid key; an entry with any other tag is kept as it is
-  - record body <= 8,581 bytes, extension area included
+  - record body <= 9,533 bytes, extension area included
   - exact consumption
 - **Verify** — [`ZakuraNodeRecord::verify`][record-verify], with time-varying import policy split
   from [`validate_record_body_for_import`][record-import]
@@ -404,8 +415,8 @@ MUST send exactly one `Peers` response for every admitted request.
 #### `Peers` — Response, discriminator 3
 
 - **Frame**
-  - absolute payload cap = 276,770 bytes
-  - reservation payload cap = 2 + reserved_limit * 8,649 bytes
+  - absolute payload cap = 307,234 bytes
+  - reservation payload cap = 2 + reserved_limit * 9,601 bytes
 - **Decode** — [`validate_record_body_bounds`][record-bounds]
   - count = 0..=reserved_limit
   - records <= 32

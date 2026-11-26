@@ -672,11 +672,21 @@ mod tests {
         credential: &NodeCredential,
         signer: &NodeSecretKey,
     ) -> Option<rustls::Error> {
+        dial_presenting_cert(dialed, credential.to_spki().to_vec(), signer)
+    }
+
+    /// [`dial_presenting`] with the listener's raw public key given as
+    /// bytes, which need not be a credential.
+    fn dial_presenting_cert(
+        dialed: NodeId,
+        cert: Vec<u8>,
+        signer: &NodeSecretKey,
+    ) -> Option<rustls::Error> {
         let client = TlsConfig::new(&NodeSecretKey::generate())
             .rustls_client(dialed, &[b"a"])
             .unwrap();
         let listener = TlsConfig::new(signer);
-        let cert = rustls_pki_types::CertificateDer::from(credential.to_spki().to_vec());
+        let cert = rustls_pki_types::CertificateDer::from(cert);
         let key = rustls::sign::CertifiedKey::new(vec![cert], Arc::new(SignsAs(signer.clone())));
         let mut server =
             rustls::ServerConfig::builder_with_details(listener.provider, Arc::new(RuntimeUtc))
@@ -779,7 +789,8 @@ mod tests {
         // A node this release can't authenticate: its ID names only a key
         // under a later scheme's tag. Its record is public, so the attacker
         // copies that entry beside its own keys and signs validly. The
-        // dialed ID names none of the keys that signed, so it proves nothing.
+        // copied entry follows the attacker's keys, so no prefix of the
+        // list is the node's.
         let later_key = (5, CredentialKey::Full(vec![0x77; 1_952]));
         let later_node = NodeCredential::from_entries([later_key.clone()]).unwrap();
         let copying = NodeCredential::from_entries([
@@ -791,7 +802,7 @@ mod tests {
             later_key,
         ])
         .unwrap();
-        assert!(copying
+        assert!(!copying
             .key_list()
             .contains_list_named(later_node.node_id(), &[]));
         assert_eq!(
@@ -800,6 +811,19 @@ mod tests {
         );
         assert_eq!(
             dial_presenting(later_node.node_id(), &copying, &attacker),
+            refused(CertificateError::UnknownIssuer)
+        );
+        // An ID that names only the node's Ed25519 key is the hash of a
+        // prefix of its credential's list. The prefix leaves out the
+        // ML-DSA-65 key the handshake is also signed with, so the node's own
+        // valid signature doesn't prove that ID.
+        let ed25519_only = NodeCredential::single(node.public_key());
+        assert!(node
+            .credential()
+            .key_list()
+            .contains_list_named(ed25519_only.node_id(), &[ED25519_KEY_TAG]));
+        assert_eq!(
+            dial_presenting(ed25519_only.node_id(), node.credential(), &node),
             refused(CertificateError::UnknownIssuer)
         );
         // The node's Ed25519 key and the fingerprint of its ML-DSA-65 key,
@@ -826,6 +850,183 @@ mod tests {
             dial_presenting(earlier, &shaped, &attacker),
             refused(CertificateError::ApplicationVerificationFailure)
         );
+    }
+
+    /// TLS-7 through whole handshakes: a node that added two keys answers a
+    /// dial to each ID it has had, which are the prefixes of its key list
+    /// that keep both signing keys. The other lists of its entries that keep
+    /// both signing keys are refused, though the node signs validly. Spec
+    /// versions before 0.34 accepted them.
+    #[test]
+    fn a_dial_to_a_list_that_skips_an_entry_is_refused() {
+        use rustls::CertificateError;
+
+        use crate::{CredentialKey, ED25519_KEY_TAG, ML_DSA_65_KEY_TAG};
+
+        let node = NodeSecretKey::generate();
+        let own = [ED25519_KEY_TAG, ML_DSA_65_KEY_TAG].map(|tag| {
+            let key = node.credential().key(tag).unwrap().to_vec();
+            (tag, CredentialKey::Full(key))
+        });
+        let first = (4, CredentialKey::Full(vec![0x5a; 1_312]));
+        let second = (5, CredentialKey::Fingerprint([0x6b; 32]));
+        let with = |added: &[(u16, CredentialKey)]| {
+            NodeCredential::from_entries(own.iter().chain(added).cloned()).unwrap()
+        };
+        let current = with(&[first.clone(), second.clone()]);
+
+        for earlier in [with(&[]), with(&[first]), current.clone()] {
+            assert_eq!(dial_presenting(earlier.node_id(), &current, &node), None);
+        }
+        let skipping = with(&[second]);
+        assert_eq!(
+            dial_presenting(skipping.node_id(), &current, &node),
+            Some(rustls::Error::InvalidCertificate(
+                CertificateError::UnknownIssuer
+            ))
+        );
+    }
+
+    /// TLS-7, ID-8 through a whole handshake: a credential with 32 entries
+    /// authenticates on a dial to its own ID and to each earlier one, and
+    /// the same entries presented by someone without the node's keys fail
+    /// the signature.
+    #[test]
+    fn a_32_entry_credential_authenticates_only_its_holder() {
+        use rustls::CertificateError;
+
+        let node = crate::tests::largest_credential_key();
+        let attacker = NodeSecretKey::generate();
+        let credential = node.credential();
+        assert_eq!(
+            credential.key_list().encoded_len(),
+            crate::MAX_NODE_KEY_LIST_BYTES
+        );
+        let current = credential.node_id();
+        // The ID of the node's two signing keys alone.
+        let original = NodeSecretKey::from_bytes(&node.to_bytes()).public();
+        assert_ne!(original, current);
+
+        for dialed in [original, current] {
+            assert_eq!(dial_presenting(dialed, credential, &node), None);
+            assert_eq!(
+                dial_presenting(dialed, credential, &attacker),
+                Some(rustls::Error::InvalidCertificate(
+                    CertificateError::BadSignature
+                ))
+            );
+        }
+    }
+
+    /// ID-12: a credential one byte above the limit is refused as a bad
+    /// encoding when the dialer reads it, before any signature check, and
+    /// the handshake fails with that error.
+    #[test]
+    fn a_credential_above_the_byte_limit_fails_the_handshake() {
+        use rustls::CertificateError;
+
+        let node = crate::tests::largest_credential_key();
+        let credential = node.credential();
+        // The last entry is a key of 2,224 bytes. One byte more keeps every
+        // rule but the byte limit.
+        let mut encoded = credential.encode();
+        let length_at = encoded.len() - 2_224 - 2;
+        assert_eq!(encoded[length_at..length_at + 2], 2_224u16.to_le_bytes());
+        encoded[length_at..length_at + 2].copy_from_slice(&2_225u16.to_le_bytes());
+        encoded.push(0);
+        assert_eq!(encoded.len(), crate::MAX_CREDENTIAL_BYTES + 1);
+        let spki = crate::credential::spki_of(&encoded).to_vec();
+        assert_eq!(
+            NodeCredential::from_spki(&spki),
+            Err(crate::CredentialError::TooLong)
+        );
+        assert_eq!(
+            dial_presenting_cert(credential.node_id(), spki, &node),
+            Some(rustls::Error::InvalidCertificate(
+                CertificateError::BadEncoding
+            ))
+        );
+    }
+
+    /// Runs one handshake between two production endpoints through rustls'
+    /// QUIC interface, which hands over the handshake messages as QUIC
+    /// carries them, without TLS records. Returns the bytes each side sends
+    /// under the handshake keys: the listener's flight from its extensions
+    /// to its Finished, and the dialer's credential, signature and Finished.
+    fn handshake_flights(dialer: &NodeSecretKey, listener: &NodeSecretKey) -> (usize, usize) {
+        use rustls::quic::{ClientConnection, KeyChange, ServerConnection, Version};
+
+        // Stands in for the QUIC transport parameters. An endpoint's real
+        // ones, and its ALPN, move the listener's flight by a few bytes.
+        let parameters = vec![0; 128];
+        let client = TlsConfig::new(dialer)
+            .rustls_client(listener.public(), &[b"a"])
+            .unwrap();
+        let server = TlsConfig::new(listener)
+            .rustls_server(vec![b"a".to_vec()])
+            .unwrap();
+        let name = rustls_pki_types::ServerName::try_from(UNSENT_SERVER_NAME).unwrap();
+        let mut client =
+            ClientConnection::new(Arc::new(client), Version::V1, name, parameters.clone()).unwrap();
+        let mut server = ServerConnection::new(Arc::new(server), Version::V1, parameters).unwrap();
+
+        let mut hello = Vec::new();
+        assert!(client.write_hs(&mut hello).is_none());
+        server.read_hs(&hello).unwrap();
+        let mut server_hello = Vec::new();
+        let keys = server.write_hs(&mut server_hello);
+        assert!(matches!(keys, Some(KeyChange::Handshake { .. })));
+        let mut listener_flight = Vec::new();
+        let keys = server.write_hs(&mut listener_flight);
+        assert!(matches!(keys, Some(KeyChange::OneRtt { .. })));
+
+        client.read_hs(&server_hello).unwrap();
+        let mut none = Vec::new();
+        let keys = client.write_hs(&mut none);
+        assert!(matches!(keys, Some(KeyChange::Handshake { .. })) && none.is_empty());
+        client.read_hs(&listener_flight).unwrap();
+        let mut dialer_flight = Vec::new();
+        let keys = client.write_hs(&mut dialer_flight);
+        assert!(matches!(keys, Some(KeyChange::OneRtt { .. })));
+        server.read_hs(&dialer_flight).unwrap();
+        assert!(!client.is_handshaking() && !server.is_handshaking());
+        (listener_flight.len(), dialer_flight.len())
+    }
+
+    /// ID-12: the flight that carries the largest credential fits the
+    /// handshake data `quinn-proto` buffers, in either direction, with more
+    /// than 2 KiB to spare. Even if the end of this flight arrives first,
+    /// it fits within the receiver's limit for out-of-order handshake data.
+    #[test]
+    fn the_largest_credentials_flight_fits_the_handshake_buffer() {
+        /// `quinn-proto`'s default `crypto_buffer_size`, which this crate
+        /// keeps (`transport_profile_snapshot` pins it).
+        const HANDSHAKE_BUFFER_BYTES: usize = 16 * 1024;
+
+        let plain = NodeSecretKey::generate();
+        let largest = crate::tests::largest_credential_key();
+        assert_eq!(
+            largest.credential().encode().len(),
+            crate::MAX_CREDENTIAL_BYTES
+        );
+        // What a flight holds beside the credential: the composite
+        // signature, the Finished and the message headers, and for the
+        // listener its extensions and its request for the dialer's key.
+        let (listener_flight, dialer_flight) = handshake_flights(&plain, &plain);
+        let credential = plain.credential().encode().len();
+        let beside = (listener_flight - credential, dialer_flight - credential);
+        assert_eq!(beside, (3_650, 3_479));
+
+        let (listener_flight, dialer_flight) = handshake_flights(&largest, &largest);
+        assert_eq!(
+            (listener_flight, dialer_flight),
+            (
+                crate::MAX_CREDENTIAL_BYTES + beside.0,
+                crate::MAX_CREDENTIAL_BYTES + beside.1
+            )
+        );
+        assert_eq!((listener_flight, dialer_flight), (14_035, 13_864));
+        assert!(listener_flight + 2 * 1024 < HANDSHAKE_BUFFER_BYTES);
     }
 
     /// TLS-3, TLS-8: the ID a peer's verifier derives from a node's

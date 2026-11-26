@@ -1,6 +1,6 @@
 # Spec: `zakura-quic` transport
 
-Status: draft for review, 2026-11-25. Version 0.32.
+Status: draft for review, 2026-11-25. Version 0.34.
 This document is authoritative for the `zakura-quic` crate, its configuration,
 its wire behavior and its `quinn-proto` dependency policy.
 [Decision 0003](../decisions/zakura/0003-zakura-quic-transport.md) records the
@@ -83,6 +83,11 @@ SEC-2 and §16, and §17ac lists each change.
 Version 0.32 keeps room in a discovery record for a second, post-quantum
 signature, so a later release can add one without a break; it changes
 CTRL-26 and COMPAT-13, and §17ad lists each change.
+Version 0.34 lets a key list hold 32 entries, not 4, and accepts a dial to
+an earlier node ID only when that ID names a prefix of the node's key list,
+so the check costs one hash per entry; it changes ID-8, ID-9, ID-12, TLS-7,
+DIAL-1, CTRL-26, COMPAT-13, SEC-2 and §16, and §17af lists each change.
+Version 0.33 is the draft in #2766. This version doesn't include it.
 
 ## 0. Conventions
 
@@ -210,26 +215,37 @@ Terms:
   author's encoded key list (ID-8) instead, and the reader derives the ID
   from it. The control hello and the legacy upgrade prelude carry the
   32-byte ID: TLS proves it (TLS-8).
-- **ID-8.** A key list holds 1 to 4 entries. An entry is a `u16` tag and 32
+- **ID-8.** A key list holds 1 to 32 entries. An entry is a `u16` tag and 32
   bytes. The encoding is the entry count as a `u8`, then each entry as its
-  tag (little-endian) and its 32 bytes, so a list is 35 to 137 bytes. Tag 1
+  tag (little-endian) and its 32 bytes, so a list is 35 to 1,089 bytes. Tag 1
   is Ed25519 and its 32 bytes are a `NodeKey`. Any other nonzero tag's 32
   bytes are the fingerprint of the full key in the node's credential
   (ID-12); tag 3 is ML-DSA-65 (ID-13), and the rest are opaque to this
   release. Tag 2 was ML-DSA-44 in `p2p-v2/4`, and this release reads it as
   any other unknown tag. Decoding MUST reject, and only reject:
-  - a count of 0 or above 4;
+  - a count of 0 or above 32;
   - a length other than 1 + 34 × count bytes;
   - a tag of 0, or a tag that doesn't exceed the one before it;
   - an Ed25519 entry that fails an ID-1 check.
 
   Tags strictly increase, so one set of keys has exactly one encoding.
+
+  A node keeps the entry of every key it has ever added, a retired key as
+  its fingerprint (ID-12), so 32 is the number of keys one node's line of
+  IDs can hold over its lifetime. A node MUST add a key only under a tag
+  above every tag its list already holds. The new entry is then the last
+  one, and each list the node has had is a prefix of the list it has now,
+  which is what TLS-7 accepts. A release that defines a tag for a new key
+  therefore numbers it above every tag an earlier release defined, 1 to 3
+  so far, and a node that passed a tag over can't add it later without
+  becoming unreachable by its earlier IDs.
 - **ID-9.** A node's `NodeId` is the BLAKE2b-256 hash of its encoded key
   list, personalised `Zakura_NodeId_v1`. The hash covers every entry,
   including those the reader can't interpret. A node that changes its list
-  has a new `NodeId`. A node that only adds entries stays reachable by the
-  ID it had: a dial to that ID accepts the longer list while the node signs
-  with the keys the earlier ID names (TLS-7).
+  has a new `NodeId`. A node that only adds entries after its last one
+  (ID-8) stays reachable by each ID it had: a dial to that ID accepts the
+  longer list while the node signs with the keys the earlier ID names
+  (TLS-7).
 - **ID-10.** A reader MUST keep an entry whose tag it doesn't know: it
   includes the entry in the ID-9 hash and re-encodes it byte for byte. A
   later release can therefore add a key to a node's list, and this release
@@ -257,6 +273,24 @@ Terms:
   `Zakura_KeyFpr_v1`. A node's `NodeId` is the ID-9 hash of that list. So
   a discovery record stays small, the node ID still commits to every key,
   and a reader keeps an unknown key (ID-10) by its fingerprint.
+
+  An encoded credential is at most 10,385 bytes, whatever its entry count,
+  and a reader MUST refuse a longer one. The limit is the count byte and
+  four entries of 2,592 bytes, which is what a credential could reach when
+  a list held 4 entries. Version 0.34 raised the entry count and kept this
+  limit, so a credential may hold 32 entries but only a few long keys in
+  full: beside the Ed25519 and ML-DSA-65 keys, three keys of 2,592 bytes
+  and one of 600, or 27 fingerprints and three keys of 7,408 bytes
+  together. The limit stays because a credential travels whole in one
+  handshake flight. A flight is the credential and about 3,650 bytes more
+  (the composite signature, the Finished and the listener's extensions,
+  whose size varies by a few bytes with the transport parameters), so
+  about 14 KB at the limit. `quinn-proto` refuses handshake data that ends
+  more than 16 KiB past what it has read in order. A flight inside 16 KiB
+  therefore completes whatever the network reorders, and a larger one is
+  refused when an early datagram is lost and a late one arrives. A
+  credential of 10,385 bytes is the largest that authenticates, and it
+  completes a handshake in both directions.
 
   An entry may carry its key's fingerprint in place of the key. The top bit
   of the entry's length marks it, the other 15 bits MUST be 32, and its 32
@@ -323,11 +357,11 @@ at fork tag `zakura-iroh-v1.1.0-rc.1`, and it keeps their MIT/Apache-2.0 notices
   its verifier in memory.
 - **TLS-7.** The client verifier MUST abort unless the server proves it is
   the dialed node. It does when both hold:
-  1. the dialed `NodeId` is the ID-9 hash of a key list made of entries of
-     the server's credential's key list (ID-12), in their order. The whole
-     list is one such list, so a credential that derives the dialed ID
-     passes;
-  2. that list includes the entry of every key the handshake signature is
+  1. the dialed `NodeId` is the ID-9 hash of a prefix of the server's
+     credential's key list (ID-12): its first k entries, in their order,
+     for some k from 1 to the entry count. The whole list is the longest
+     prefix, so a credential that derives the dialed ID passes;
+  2. that prefix includes the entry of every key the handshake signature is
      checked with, and the credential holds each of those keys in full.
      The keys are those of the scheme the server signed with, not of every
      scheme the dialer offered. For the composite (TLS-4), the only scheme
@@ -341,8 +375,17 @@ at fork tag `zakura-iroh-v1.1.0-rc.1`, and it keeps their MIT/Apache-2.0 notices
   credential passes rule 1 for that node's ID. The signature is then
   checked with the node's keys, which the presenter can't sign with. Without
   rule 2, a later scheme that signed with the added key would let its holder
-  answer as the node. A list has at most 4 entries, so a verifier hashes at
-  most 4 lists.
+  answer as the node.
+
+  Only a prefix passes, not any list of the credential's entries, because
+  a node adds each key after its last entry (ID-8), so the prefixes are
+  the lists it has had. A list that skips an entry never named the node.
+  The check hashes at most one list per entry, fewer than 32 on the
+  longest credential and none when the dialed ID is the credential's own.
+  Version 0.31 accepted any list of the entries in their order, which is
+  one hash per subset of the entries that aren't signing keys: 4 at most
+  on a 4-entry list, and 2^30 on a 32-entry one that an unauthenticated
+  peer chooses.
 - **TLS-8.** Each endpoint MUST derive the peer's `NodeId` from the
   credential the peer proved in the TLS handshake, through one derivation
   that the client verifier also uses: the ID-9 hash of the credential's key
@@ -848,7 +891,8 @@ is today's Zakura logic.
 
 - **DIAL-1.** `connect(NodeAddr, alpns)` MUST refuse a `NodeId` that names
   the local node, before sending any packet: the local `NodeId`, and every
-  ID the local credential would prove to a dialer (TLS-7). A node that has
+  ID the local credential would prove to a dialer (TLS-7), which are the
+  prefixes of its key list that keep its signing keys. A node that has
   added a key therefore can't connect to itself through a stale record or
   config entry that names its earlier ID.
 - **DIAL-2.** `connect` MUST canonicalize, deduplicate and filter the addresses.
@@ -996,8 +1040,8 @@ IPv4 address or global IPv6 /64, ADM-3),
   negotiates its streams, the application raises its receive window once
   (API-9) by the receive share of each stream kind it negotiated, so an
   admitted connection holds that window plus `send_window_bytes`:
-  146,789,267 B at the defaults on Mainnet and Testnet with `tx-relay`
-  registered, and 142,529,427 B without it. Per-stream receive
+  146,859,715 B at the defaults on Mainnet and Testnet with `tx-relay`
+  registered, and 142,599,875 B without it. Per-stream receive
   windows sit inside the connection window and add nothing.
   `zakura_quic::connection_memory_bytes` is the only implementation of the
   handshake cost, and `ConnectionMemory` in `zakura-network` of the admitted
@@ -1417,11 +1461,41 @@ this release tolerates, and keep each hard change explicit.
   self-dial error for as long as it is configured, and its addresses leave
   the node's advertised record.
 
-  The room for this is what this release's readers accept. A list holds 4
-  entries (ID-8), two of them the Ed25519 and ML-DSA-65 keys, and a retired
-  key keeps its entry as a fingerprint, so a node ID's line can take two
-  more keys. A key longer than 2,592 bytes is refused (ID-12). An upgrade
-  that needs more than either is a hard break (COMPAT-8).
+  The room for this is what this release's readers accept:
+  - A list holds 32 entries (ID-8), two of them the Ed25519 and ML-DSA-65
+    keys, and a retired key keeps its entry as a fingerprint, so a node
+    ID's line can take 30 more keys.
+  - Each new key takes a tag above every tag defined before it (ID-8).
+    This binds every later release: tags are handed out in increasing
+    order, 4 next, and a node adds keys in that order. A dial to an
+    earlier ID is accepted only for a prefix of the list (TLS-7), so a
+    node that added a key under a lower tag would lose the IDs it had.
+  - A key longer than 2,592 bytes is refused, and so is a credential
+    longer than 10,385 bytes (ID-12). The second limit is the one a
+    release reaches first: beside the two keys of this release it leaves
+    8,392 bytes, which is three ML-DSA-87 keys in full, or one key in full
+    and many retired ones. A release that adds a key SHOULD retire an
+    earlier one to its 36-byte fingerprint entry before the credential
+    nears the limit.
+
+  An upgrade that needs more than any of these is a hard break (COMPAT-8).
+
+  One cost of a longer credential is known and not fixed here. With this
+  release's credential, 1,993 bytes, the listener's first flight is about
+  7.9 KB, and a dial recovers when the datagram that starts the listener's
+  ServerHello is lost. With the largest credential it doesn't: the dial
+  fails at the handshake deadline (ADM-6), bounded and clean, and a redial
+  starts over. §16 has a test for both. In a `quinn-proto` trace of the
+  failure the listener declares the datagram lost, is then blocked by
+  congestion control, since the loss shrank its window below the flight
+  still unacknowledged, and sends probes that carry handshake data the
+  dialer can't read without the ServerHello. Where the change comes was
+  measured once in the simulator and is not pinned by a test: a listener
+  credential of 2,793 bytes recovered and one of 3,193 bytes did not. One
+  more key in full passes that size, so the release that adds one has to
+  resend lost Initial data ahead of the congestion window, or accept that
+  such a loss costs a redial. This predates version 0.34: under version
+  0.31 a node could already authenticate with a credential of 7,185 bytes.
 
   A discovery record is a separate case. It carries one Ed25519 signature
   (ID-11), and this release's readers refuse a record without an Ed25519
@@ -1458,9 +1532,12 @@ this release tolerates, and keep each hard change explicit.
     keys that fail the modulus check (TLS-9).
 - **SEC-2.** These handshakes MUST fail:
   - a dial that names a `NodeId` and reaches a server that doesn't prove it
-    is that node (TLS-7): its credential has no list of entries that
-    hashes to the ID, or that list leaves out a key the handshake is signed
-    with;
+    is that node (TLS-7): no prefix of its credential's key list hashes
+    to the ID, or that prefix leaves out a key the handshake is signed
+    with. A list of the credential's entries that skips one is not a
+    prefix;
+  - a credential with more than 32 entries or longer than 10,385 bytes
+    (ID-8, ID-12), in either direction;
   - a credential that gives a signing key as its fingerprint (ID-12), in
     either direction;
   - a client without a key;
@@ -1526,9 +1603,12 @@ this release tolerates, and keep each hard change explicit.
 | A production listener refuses a handshake whose hybrid share is one byte short or carries an ML-KEM key that fails the modulus check | TLS-9, SEC-2 |
 | A peer that offers only classical groups is refused in either direction, and two production endpoints agree on the hybrid | TLS-9 |
 | A credential with an unknown long key derives the same ID on both ends; a bare Ed25519 SubjectPublicKeyInfo, a credential whose ID isn't the dialed one, and a client presenting a credential it can't sign for are refused | TLS-3, TLS-4, TLS-7, TLS-8, ID-12 |
-| A dial to the ID a node had before it added a key connects, and reports the dialed ID and the node's ID now; a node's dial to its own earlier ID is refused as a self-dial; a dial to an ID whose list leaves out a signing key is refused; a node's public keys beside another party's key pass the ID check and fail the signature; a key list contains exactly the lists of its entries, in order, that keep the required tags | TLS-7, TLS-8, API-4, DIAL-1 |
+| A dial to the ID a node had before it added a key connects, and reports the dialed ID and the node's ID now; a node's dial to its own earlier ID is refused as a self-dial; a dial to an ID whose list leaves out a signing key is refused; a node's public keys beside another party's key pass the ID check and fail the signature; a key list contains exactly its prefixes that keep the required tags, checked against every list of the entries of each list of 1 to 6 entries and every set of required tags, and on a 32-entry list against each prefix with one entry dropped, swapped or changed | TLS-7, TLS-8, API-4, DIAL-1 |
+| A list of a credential's entries that keeps both signing keys and skips an entry, which version 0.31 accepted, is refused: by the key list, by the verifier in a whole TLS handshake, and on a QUIC dial to a node with 32 entries, which answers each of its 31 prefix IDs from its two signing keys on. The check hashes fewer lists than the list has entries | TLS-7, SEC-2 |
+| A key list and a credential hold 32 entries and refuse 33; a credential of exactly 10,385 bytes decodes, with 5 entries and with 32, and one byte more is refused when built, when decoded and in a whole TLS handshake; the dialer's verifier and the listener's each read a credential of 32 entries and one of 10,385 bytes, and refuse 33 entries and 10,386 bytes as a bad encoding | ID-8, ID-12, SEC-2 |
 | A fingerprint-only entry gives the node ID of the full key, holds no key, and round-trips byte for byte under a known and an unknown tag; a marked Ed25519 entry and a marked entry that isn't 32 bytes are refused; both verifiers refuse a credential whose ML-DSA-65 key is a fingerprint | ID-12, TLS-4 |
-| The largest credential a node can authenticate with, its two signing keys and two 2,592-byte keys, completes a handshake in both directions, in two round trips where the listener's flight passes the padded allowance | ID-12, DIAL-8 |
+| The largest credential a node can authenticate with, 32 entries in 10,385 bytes, completes a handshake in both directions on loopback, and in the simulator when every burst of datagrams arrives in reverse, in two round trips where the listener's flight passes the padded allowance. With 128 bytes standing in for the transport parameters, its flights are 14,035 bytes from the listener and 13,864 from the dialer, inside the 16 KiB `quinn-proto` buffers | ID-12, DIAL-8 |
+| When the datagram that starts the listener's ServerHello is lost, a dial to a listener with this release's credential completes, and a dial to a listener with the largest credential fails at the handshake deadline, with both connections released and a bounded number of bytes sent | ID-12, ADM-6, COMPAT-13 |
 | A dial to a node's earlier ID registers the node once under its ID now, with the connection slot under that ID; a second such dial to a registered node ends before its control handshake and neither end's registered connection changes; an attempt follows the moved node's registration, a bootstrap supervisor and a dial round leave a registered moved node alone, and both of its book entries are credited | DIAL-9 |
 | A composite signature verifies only whole: a tampered Ed25519 or ML-DSA half, a truncated signature, another node's key in either half, a credential without an ML-DSA-65 key, and one whose tag-3 entry isn't 1,952 bytes are refused; the ML-DSA seed derivation has a known answer | TLS-4, ID-11, ID-12, ID-13 |
 | ML-DSA-65 key generation, signing and verification give a subset of Project Wycheproof's and NIST ACVP's known answers, each under its own context: seeded keys and deterministic and hedged signatures match, and a 256-byte context, wrong-length keys and signatures, a flipped commitment hash, a bad hint encoding and an out-of-bound response are refused | TLS-4, ID-13 |
@@ -2400,3 +2480,42 @@ Changed:
   defaults, not 108, and still funds the default connection count of 102.
 - **COMPAT-13.** States what the room is for and what the release that
   uses it has to do.
+
+## 17af. Changes in version 0.34
+
+Every key a node ever adds keeps an entry in its key list, a retired key as
+its fingerprint, so the cap of 4 entries let a node ID's line take two keys
+beyond the two of this release before a hard break. This version raises
+the cap to 32. Two things were sized by the cap and are settled here.
+Version 0.31's rule for a dial to an earlier ID tried every list of the
+credential's entries, which doubles with each entry, so the rule now names
+only prefixes. And a credential of 32 long keys would not fit a handshake
+flight, so the credential keeps the byte limit it had and is no longer
+bounded by its entry count alone. No release has spoken `p2p-v2/5` with
+the earlier rules, and a node with this release's two-entry list has the
+same encodings and node ID, so the ALPN doesn't move. Version 0.33 is the
+draft in #2766, which this version doesn't include.
+
+Changed:
+
+- **ID-8.** A list holds up to 32 entries and 1,089 bytes. A node adds a
+  key only under a tag above those it holds.
+- **ID-9.** The earlier IDs a node stays reachable by are those of its
+  list's prefixes.
+- **ID-12.** A credential is at most 10,385 bytes, stated as its own limit.
+- **TLS-7.** The dialed ID names a prefix of the credential's key list, not
+  any list of its entries. The check costs one hash per entry.
+- **DIAL-1.** The IDs that name the local node are those prefixes.
+- **CTRL-26.** A record carries the whole key list, so the largest record
+  grows by 952 bytes, to 9,601, which raises discovery's receive share and
+  so an admitted connection's memory by 70,448 B, to 146,859,715 B at the
+  defaults. The default `peer_memory_budget_bytes` of 17 GiB still funds
+  107 connections at Mainnet defaults.
+- **COMPAT-13.** The room is 30 more keys, the tag order every later
+  release keeps, and the credential's byte limit. Notes the cost of a long
+  credential when the listener's first datagram is lost.
+- **SEC-2.** The identity refusal names prefixes, and a credential past
+  either limit is refused.
+- **§16.** Tests for the prefix rule and the lists it no longer accepts,
+  the 32-entry limits, the credential's byte limit, and the largest
+  credential's handshake with and without loss.

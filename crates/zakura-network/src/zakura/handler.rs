@@ -357,7 +357,7 @@ pub struct ZakuraConfig {
     ///
     /// An admitted QUIC connection can hold its receive window, which is the
     /// `[network.zakura.quic]` receive window plus every reactor's receive
-    /// share, and its send window: 146,789,267 bytes at the Mainnet defaults.
+    /// share, and its send window: 146,859,715 bytes at the Mainnet defaults.
     /// A connection in its handshake holds only the two QUIC windows, 64 MiB.
     /// Each bound socket can also queue 256 MiB of datagrams, however many
     /// connections it serves (zakura-quic CTRL-26 lists what this leaves out).

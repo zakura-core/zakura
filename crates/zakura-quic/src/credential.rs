@@ -36,9 +36,33 @@ const FINGERPRINT_ONLY_FLAG: u16 = 0x8000;
 // No key length may reach the flag bit. The cast widens a `u16`.
 const _: () = assert!(MAX_CREDENTIAL_KEY_BYTES < FINGERPRINT_ONLY_FLAG as usize);
 
-/// The longest encoded credential: the count byte, then [`MAX_NODE_KEYS`]
-/// entries of a tag, a length and [`MAX_CREDENTIAL_KEY_BYTES`].
-pub const MAX_CREDENTIAL_BYTES: usize = 1 + MAX_NODE_KEYS * (4 + MAX_CREDENTIAL_KEY_BYTES);
+/// Length of an entry's header: its tag and its length, a `u16` each.
+const ENTRY_HEADER_BYTES: usize = 2 + 2;
+
+/// The longest encoded credential, in bytes (ID-12).
+///
+/// The limit is on the whole encoding, not on each entry: a credential may
+/// hold [`MAX_NODE_KEYS`] entries, and far fewer of them at
+/// [`MAX_CREDENTIAL_KEY_BYTES`]. The value is the count byte and four
+/// entries of the longest key, what a credential could reach while it held
+/// no more than four entries. The entry count rose and this did not,
+/// because a credential travels whole in one handshake flight.
+///
+/// A flight is the credential and about 3,650 bytes more, so about 14 KB at
+/// this limit. `quinn-proto` refuses handshake data that ends more than
+/// 16 KiB past what it has read in order, so a flight inside 16 KiB
+/// completes whatever the network reorders, and this limit leaves over
+/// 2 KiB of that for later handshake messages to grow into.
+pub const MAX_CREDENTIAL_BYTES: usize = 10_385;
+
+// The limit leaves room for the two keys this release signs with and a key
+// of the longest length beside them.
+const _: () = assert!(
+    1 + (ENTRY_HEADER_BYTES + KEY_LENGTH)
+        + (ENTRY_HEADER_BYTES + ML_DSA_65_KEY_BYTES)
+        + (ENTRY_HEADER_BYTES + MAX_CREDENTIAL_KEY_BYTES)
+        <= MAX_CREDENTIAL_BYTES
+);
 
 /// The BLAKE2b personalisation of a key's fingerprint (ID-12).
 const FINGERPRINT_PERSONALISATION: &[u8; 16] = b"Zakura_KeyFpr_v1";
@@ -70,6 +94,9 @@ pub enum CredentialError {
     /// Ed25519 key, which is its own fingerprint and is always sent in full.
     #[error("a fingerprint-only credential entry is 32 bytes and not Ed25519")]
     FingerprintOnly,
+    /// The encoded credential is longer than [`MAX_CREDENTIAL_BYTES`].
+    #[error("a credential is at most 10,385 bytes")]
+    TooLong,
 }
 
 /// What a credential holds for one of the node's keys (ID-12).
@@ -92,7 +119,8 @@ impl From<Vec<u8>> for CredentialKey {
 /// A node's public keys, in tag order (ID-12).
 ///
 /// Encoded as a count byte, then each entry as its tag (little-endian `u16`),
-/// its length (little-endian `u16`) and its bytes. The rules on count and tags
+/// its length (little-endian `u16`) and its bytes, in at most
+/// [`MAX_CREDENTIAL_BYTES`]. The rules on count and tags
 /// are the key list's (ID-8). An Ed25519 entry is a checked 32-byte
 /// [`NodeKey`]. An entry with an unknown tag is kept byte for byte, so a
 /// release reaches the same node ID for a node holding a key it doesn't know.
@@ -154,6 +182,9 @@ impl NodeCredential {
             };
             (*tag, value)
         }))?;
+        if encoded_len(&entries) > MAX_CREDENTIAL_BYTES {
+            return Err(CredentialError::TooLong);
+        }
         Ok(Self { entries, key_list })
     }
 
@@ -178,6 +209,11 @@ impl NodeCredential {
 
     /// Decodes a credential from exactly `bytes`.
     pub fn decode(bytes: &[u8]) -> Result<Self, CredentialError> {
+        // Refused before any key is copied. A decoded credential re-encodes
+        // to exactly `bytes`, so this is the bound `from_entries` checks.
+        if bytes.len() > MAX_CREDENTIAL_BYTES {
+            return Err(CredentialError::TooLong);
+        }
         let (&count, mut rest) = bytes.split_first().ok_or(CredentialError::Encoding)?;
         let count = usize::from(count);
         if count == 0 || count > MAX_NODE_KEYS {
@@ -186,7 +222,7 @@ impl NodeCredential {
         let mut entries = Vec::with_capacity(count);
         for _ in 0..count {
             let (header, body) = rest
-                .split_first_chunk::<4>()
+                .split_first_chunk::<ENTRY_HEADER_BYTES>()
                 .ok_or(CredentialError::Encoding)?;
             let tag = u16::from_le_bytes([header[0], header[1]]);
             let length = u16::from_le_bytes([header[2], header[3]]);
@@ -219,16 +255,7 @@ impl NodeCredential {
 
     /// The credential's canonical bytes, which [`Self::decode`] reads back.
     pub fn encode(&self) -> Vec<u8> {
-        let entry_bytes = |key: &CredentialKey| match key {
-            CredentialKey::Full(key) => key.len(),
-            CredentialKey::Fingerprint(_) => KEY_LENGTH,
-        };
-        let length = 1 + self
-            .entries
-            .iter()
-            .map(|(_, key)| 4 + entry_bytes(key))
-            .sum::<usize>();
-        let mut bytes = Vec::with_capacity(length);
+        let mut bytes = Vec::with_capacity(encoded_len(&self.entries));
         // A credential holds at most `MAX_NODE_KEYS` entries.
         bytes.push(self.entries.len() as u8);
         for (tag, key) in &self.entries {
@@ -260,11 +287,11 @@ impl NodeCredential {
     /// (TLS-7).
     ///
     /// It does when the credential holds each signing key in full and
-    /// `dialed` names a list of this credential's entries that includes them
-    /// all. That is the credential's own ID, or the ID the node had before
-    /// it added its other entries. An ID whose list leaves a signing key out
-    /// is refused: whoever added that key to another node's entries could
-    /// otherwise sign as that node.
+    /// `dialed` names a prefix of this credential's key list that includes
+    /// them all. That is the credential's own ID, or an ID the node had
+    /// before it added its later entries. An ID whose list leaves a signing
+    /// key out is refused: whoever added that key after another node's
+    /// entries could otherwise sign as that node.
     pub(crate) fn proves_dialed_id(&self, dialed: NodeId, signing_tags: &[u16]) -> bool {
         signing_tags.iter().all(|tag| self.key(*tag).is_some())
             && self.key_list.contains_list_named(dialed, signing_tags)
@@ -287,10 +314,7 @@ impl NodeCredential {
     /// The SubjectPublicKeyInfo a node presents as its TLS raw public key
     /// (TLS-3).
     pub(crate) fn to_spki(&self) -> SubjectPublicKeyInfoDer<'static> {
-        rustls::sign::public_key_to_spki(
-            &AlgorithmIdentifier::from_slice(CREDENTIAL_ALGORITHM),
-            self.encode(),
-        )
+        spki_of(&self.encode())
     }
 
     /// Reads a credential back from exactly the SubjectPublicKeyInfo
@@ -304,6 +328,28 @@ impl NodeCredential {
         }
         Ok(credential)
     }
+}
+
+/// The SubjectPublicKeyInfo that carries the credential encoding `encoded`
+/// (TLS-3).
+pub(crate) fn spki_of(encoded: &[u8]) -> SubjectPublicKeyInfoDer<'static> {
+    rustls::sign::public_key_to_spki(
+        &AlgorithmIdentifier::from_slice(CREDENTIAL_ALGORITHM),
+        encoded,
+    )
+}
+
+/// The length of the encoding of `entries`: the count byte, then each
+/// entry's header and bytes.
+fn encoded_len(entries: &[(u16, CredentialKey)]) -> usize {
+    let key_bytes = |key: &CredentialKey| match key {
+        CredentialKey::Full(key) => key.len(),
+        CredentialKey::Fingerprint(_) => KEY_LENGTH,
+    };
+    1 + entries
+        .iter()
+        .map(|(_, key)| ENTRY_HEADER_BYTES + key_bytes(key))
+        .sum::<usize>()
 }
 
 /// A key's 32-byte entry in the key list (ID-12): an Ed25519 key is its own
@@ -669,22 +715,121 @@ mod tests {
         );
     }
 
+    /// The Ed25519 key, then `more` further entries with the tags from 4 up.
+    fn with_more(more: impl IntoIterator<Item = CredentialKey>) -> Vec<(u16, CredentialKey)> {
+        let ed25519 = CredentialKey::Full(ed25519().as_bytes().to_vec());
+        // Tag 3 is ML-DSA-65, whose length is fixed.
+        [(ED25519_KEY_TAG, ed25519)]
+            .into_iter()
+            .chain((4..).zip(more))
+            .collect()
+    }
+
+    /// ID-12: the byte limit bounds a credential, whatever its entry count.
+    /// The Ed25519 key, three keys of the longest length and one of 2,556
+    /// bytes fill it exactly, and one byte more is refused however it
+    /// arrives.
     #[test]
-    fn the_longest_credential_fits_its_bound() {
-        // Tag 3 is ML-DSA-65, whose length is fixed below the bound.
-        let entries = [ED25519_KEY_TAG, 4, 5, 6].map(|tag| {
-            let key = if tag == ED25519_KEY_TAG {
-                ed25519().as_bytes().to_vec()
-            } else {
-                vec![tag as u8; MAX_CREDENTIAL_KEY_BYTES]
-            };
-            (tag, key)
-        });
-        let credential = NodeCredential::from_entries(entries).expect("four entries fit");
+    fn the_longest_credential_fills_its_bound() {
+        assert_eq!(MAX_CREDENTIAL_BYTES, 10_385);
+        let keys = |last: usize| {
+            let longest = CredentialKey::Full(vec![0xEE; MAX_CREDENTIAL_KEY_BYTES]);
+            with_more([
+                longest.clone(),
+                longest.clone(),
+                longest,
+                CredentialKey::Full(vec![0xDD; last]),
+            ])
+        };
+        let credential = NodeCredential::from_entries(keys(2_556)).expect("the entries fit");
+        let encoded = credential.encode();
+        assert_eq!(encoded.len(), MAX_CREDENTIAL_BYTES);
+        assert_eq!(NodeCredential::decode(&encoded), Ok(credential.clone()));
         assert_eq!(
-            credential.encode().len(),
-            MAX_CREDENTIAL_BYTES - (MAX_CREDENTIAL_KEY_BYTES - KEY_LENGTH)
+            NodeCredential::from_spki(credential.to_spki().as_ref()),
+            Ok(credential)
         );
-        assert!(NodeCredential::from_spki(credential.to_spki().as_ref()).is_ok());
+
+        assert_eq!(
+            NodeCredential::from_entries(keys(2_557)),
+            Err(CredentialError::TooLong)
+        );
+        // The same credential on the wire: its last entry is one byte
+        // longer, and every other rule holds.
+        let mut too_long = encoded;
+        let length_at = too_long.len() - 2_556 - 2;
+        assert_eq!(too_long[length_at..length_at + 2], 2_556u16.to_le_bytes());
+        too_long[length_at..length_at + 2].copy_from_slice(&2_557u16.to_le_bytes());
+        too_long.push(0xDD);
+        assert_eq!(
+            NodeCredential::decode(&too_long),
+            Err(CredentialError::TooLong)
+        );
+        // The length is checked before an entry is read or a key copied, so
+        // an input above the limit is refused for its length whatever else
+        // is wrong with it: here a count of 255 and no well-formed entry.
+        assert_eq!(
+            NodeCredential::decode(&[0xFF; MAX_CREDENTIAL_BYTES + 1]),
+            Err(CredentialError::TooLong)
+        );
+        assert_eq!(
+            NodeCredential::decode(&[0xFF; MAX_CREDENTIAL_BYTES]),
+            Err(KeyListError::EntryCount.into())
+        );
+        assert_eq!(
+            NodeCredential::from_spki(spki_of(&too_long).as_ref()),
+            Err(CredentialError::TooLong)
+        );
+    }
+
+    /// ID-8, ID-12: a credential holds up to 32 entries. The entry count
+    /// alone never refuses 32, and 33 are refused at any size.
+    #[test]
+    fn a_credential_holds_32_entries_within_the_byte_limit() {
+        let fingerprints =
+            |count: u8| (0..count).map(|index| CredentialKey::Fingerprint([index; 32]));
+        let most = NodeCredential::from_entries(with_more(fingerprints(31)))
+            .expect("32 entries form a credential");
+        assert_eq!(most.key_list().encoded_len(), 1 + MAX_NODE_KEYS * 34);
+        assert_eq!(most.encode().len(), 1 + MAX_NODE_KEYS * (4 + 32));
+        assert_eq!(NodeCredential::decode(&most.encode()), Ok(most.clone()));
+        assert_eq!(
+            NodeCredential::from_spki(most.to_spki().as_ref()),
+            Ok(most.clone())
+        );
+
+        assert_eq!(
+            NodeCredential::from_entries(with_more(fingerprints(32))),
+            Err(KeyListError::EntryCount.into())
+        );
+        let mut one_more = most.encode();
+        one_more[0] += 1;
+        one_more.extend(entry(0x0102, FINGERPRINT_ONLY_FLAG, &[0xAB; 32]));
+        assert_eq!(
+            NodeCredential::decode(&one_more),
+            Err(KeyListError::EntryCount.into())
+        );
+
+        // 32 entries of keys in full: each of the 31 after the Ed25519 key
+        // may average 329 bytes, and one byte more passes the limit.
+        let keys = |last: usize| {
+            let mut keys = vec![CredentialKey::Full(vec![0x11; 329]); 30];
+            keys.push(CredentialKey::Full(vec![0x22; last]));
+            with_more(keys)
+        };
+        let full = NodeCredential::from_entries(keys(354)).expect("the keys fit");
+        assert_eq!(full.encode().len(), MAX_CREDENTIAL_BYTES);
+        assert_eq!(NodeCredential::decode(&full.encode()), Ok(full));
+        assert_eq!(
+            NodeCredential::from_entries(keys(355)),
+            Err(CredentialError::TooLong)
+        );
+        // Four entries of the longest key were the limit's worth before:
+        // with the Ed25519 key beside them they no longer fit.
+        let longest = CredentialKey::Full(vec![0xEE; MAX_CREDENTIAL_KEY_BYTES]);
+        assert_eq!(
+            NodeCredential::from_entries(with_more(vec![longest; 4])),
+            Err(CredentialError::TooLong)
+        );
     }
 }

@@ -7320,14 +7320,23 @@ async fn persistent_stream_worker_with_policy(
     }));
 
     let mut outbound_rx = Some(outbound_rx);
-    let mut drained = false;
+    // Whether the stream ends between frames, so a FIN keeps the frames
+    // already written.
+    let mut at_frame_boundary = false;
     loop {
         zakura_rt::select! {
             biased;
-            _ = context.connection_token.cancelled() => break,
+            // No write is in flight here, so a FIN ahead of the connection
+            // close lets a peer that reads its stream get the frames written
+            // before the close, which a reset would discard. A fault this
+            // stream's reader forwarded before cancelling still resets.
+            _ = context.connection_token.cancelled() => {
+                at_frame_boundary = close_rx.try_recv().is_err();
+                break;
+            }
             _ = context.stream_token.cancelled() => break,
             _ = inbound_closed.closed(), if outbound_rx.is_none() => {
-                drained = true;
+                at_frame_boundary = true;
                 // An idle member must not cancel another member's queued writes
                 // or retained application handles. Faults still interrupt draining.
                 if let Some(barrier) = &application_drain {
@@ -7434,7 +7443,7 @@ async fn persistent_stream_worker_with_policy(
 
     context.resources.owner.advance(OwnerPhase::Retiring);
     // Never leave a partial frame followed by a graceful FIN.
-    if drained {
+    if at_frame_boundary {
         // A FIN preserves completed writes in QUIC's send buffer.
         let _ = send.finish();
     } else {

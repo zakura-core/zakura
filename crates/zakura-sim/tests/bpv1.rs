@@ -62,7 +62,7 @@ fn session_with_want(peer: u8, block_id: block::Hash) -> (PeerState, u32, Vec<Ve
             block_id,
             coding,
             proposer_node: node_id(9),
-            header_meta: Some(meta),
+            header_meta: meta,
             as_proposer: false,
             have_held_until: None,
         }),

@@ -9,6 +9,12 @@ use std::{collections::hash_map::RandomState, collections::HashSet, fmt::Debug};
 use eyre::Result;
 
 #[test]
+#[should_panic(expected = "zatoshis <= MAX_MONEY && zatoshis >= 0")]
+fn div_exact_rejects_negative_quotient() {
+    let _ = Amount::<NonNegative>::new(1).div_exact(-1);
+}
+
+#[test]
 fn test_add_bare() -> Result<()> {
     let _init_guard = zakura_test::init();
 

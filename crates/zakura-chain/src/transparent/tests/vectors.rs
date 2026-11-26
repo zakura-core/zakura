@@ -341,3 +341,45 @@ proptest! {
         }
     }
 }
+
+#[test]
+fn tex_addresses_require_bech32m() {
+    use crate::{parameters::NetworkKind, transparent::Address};
+
+    let _init_guard = zakura_test::init();
+
+    // The ZIP 320 test vector, followed by the same address with a Bech32 checksum.
+    assert!("tex1s2rt77ggv6q989lr49rkgzmh5slsksa9khdgte"
+        .parse::<Address>()
+        .is_ok());
+    assert!("tex1s2rt77ggv6q989lr49rkgzmh5slsksa9rtaywm"
+        .parse::<Address>()
+        .is_err());
+
+    for (network_kind, hrp) in [
+        (
+            NetworkKind::Mainnet,
+            zcash_protocol::constants::mainnet::HRP_TEX_ADDRESS,
+        ),
+        (
+            NetworkKind::Testnet,
+            zcash_protocol::constants::testnet::HRP_TEX_ADDRESS,
+        ),
+    ] {
+        let hrp = bech32::Hrp::parse(hrp).expect("TEX HRP constants are valid");
+        let bech32 = bech32::encode::<bech32::Bech32>(hrp, &[0; 20])
+            .expect("a 20-byte payload fits in a Bech32 string");
+        let bech32m = bech32::encode::<bech32::Bech32m>(hrp, &[0; 20])
+            .expect("a 20-byte payload fits in a Bech32m string");
+        assert!(bech32.parse::<Address>().is_err(), "accepted {bech32}");
+        assert_eq!(
+            bech32m
+                .parse::<Address>()
+                .expect("Bech32m TEX addresses parse"),
+            Address::Tex {
+                network_kind,
+                validating_key_hash: [0; 20],
+            },
+        );
+    }
+}

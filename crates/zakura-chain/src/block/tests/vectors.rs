@@ -964,3 +964,29 @@ fn unmined_ids_reject_hashes_from_a_different_block() {
 
     let _ = auth.unmined_ids(fewer_hashes).count();
 }
+
+#[test]
+fn height_i64_conversion_checks_bounds() {
+    let _init_guard = zakura_test::init();
+
+    for height in [Height::MIN, Height(1), Height::MAX] {
+        assert_eq!(Height::try_from(i64::from(height)), Ok(height));
+    }
+    for value in [
+        i64::MIN,
+        -1,
+        i64::from(Height::MAX.0) + 1,
+        i64::from(u32::MAX),
+        i64::MAX,
+    ] {
+        assert!(Height::try_from(value).is_err(), "accepted height {value}");
+    }
+}
+
+#[test]
+fn height_diff_arithmetic_checks_i64_overflow() {
+    let _init_guard = zakura_test::init();
+
+    assert_eq!(Height(1) + i64::MAX, None);
+    assert_eq!(Height(0) - i64::MIN, None);
+}

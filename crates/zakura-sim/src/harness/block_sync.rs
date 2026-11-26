@@ -751,9 +751,6 @@ impl Subsystem for Storage {
             ..zakura_network::Config::default()
         };
         net_config.zakura.block_sync = config.clone();
-        if let Some(look_ahead) = scenario.max_reorder_lookahead_bytes {
-            net_config.zakura.memory_budget.caps.look_ahead = Some(ByteSize(look_ahead));
-        }
         let budget_b = scenario
             .memory_budget_bytes
             .unwrap_or(super::sync::DEFAULT_SIM_MEMORY_BUDGET_B);
@@ -762,7 +759,7 @@ impl Subsystem for Storage {
                 .expect("block-sync/storage memory plan fits");
         *view.borrow().pool.borrow_mut() = PoolGaugeModel::new(
             memory_plan.pool_config.consumers[Consumer::Sessions.index()].floor,
-            memory_plan.override_warnings.is_empty(),
+            memory_plan.shortfall.is_none(),
         );
         let (pool_observer, pool_tap) =
             PoolTap::new(sim, "node", view.borrow().pool.clone(), Some(view.clone()));

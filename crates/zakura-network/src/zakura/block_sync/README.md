@@ -185,7 +185,6 @@ has no byte gate of its own.
 - **Benefit cap.** The sequencer sets block sync's cap once a second to the peers'
   BBR windows plus `2 × commit rate × p99 range fetch time`. The commit rate is a
   decaying peak, so a commit stall shrinks the cap gradually.
-  `[memory.cap] look_ahead` overrides the look-ahead term.
 - **Block cap.** `LOOKAHEAD_BLOCK_HARD_CAP` (262,144 blocks) bounds the retained
   block count above the window, for tiny bodies whose bookkeeping dominates.
 

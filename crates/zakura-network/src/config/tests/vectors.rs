@@ -1366,10 +1366,10 @@ fn zakura_connection_cap_sets_the_transport_slots() {
 
 /// mem-14: config load never sizes memory, because `zakurad` resolves
 /// `[memory] budget` after it. A raised QUIC window loads on every stack, and
-/// the memory plan then warns or refuses against the resolved `B`.
+/// the memory plan names it when the plan doesn't fit the resolved `B`.
 #[test]
 fn a_raised_quic_window_loads_and_the_plan_sizes_it_against_the_budget() {
-    use crate::zakura::memory::{MemoryPlan, MemoryPlanError};
+    use crate::zakura::memory::MemoryPlan;
 
     let _init_guard = zakura_test::init();
 
@@ -1386,27 +1386,22 @@ fn a_raised_quic_window_loads_and_the_plan_sizes_it_against_the_budget() {
         .unwrap_or_else(|error| panic!("{stack}: {error}"));
         let network = config.network.clone();
 
-        let warned = MemoryPlan::size(16 * GIB, &config, &network)
-            .expect("the unraised settings fit 16 GiB");
+        let short = MemoryPlan::size(16 * GIB, &config, &network)
+            .expect("sizes")
+            .shortfall
+            .unwrap_or_else(|| panic!("{stack}: 256 MiB handshake windows don't fit 16 GiB"));
         assert!(
-            warned
-                .override_warnings
+            short
+                .raised_settings
                 .iter()
-                .any(|warning| warning.setting == "[network.zakura.quic] receive_window_bytes"),
-            "{stack}: {:?}",
-            warned.override_warnings
+                .any(|raised| raised.setting == "[network.zakura.quic] receive_window_bytes"),
+            "{stack}: {short}"
         );
-        let funded =
-            MemoryPlan::size(64 * GIB, &config, &network).expect("64 GiB funds the raised window");
+        let funded = MemoryPlan::size(64 * GIB, &config, &network).expect("sizes");
         assert!(
-            funded.override_warnings.is_empty(),
-            "{stack}: {:?}",
-            funded.override_warnings
+            funded.shortfall.is_none(),
+            "{stack}: 64 GiB funds the raised window"
         );
-        match MemoryPlan::size(GIB, &config, &network) {
-            Err(MemoryPlanError::BudgetTooSmall(error)) => assert_eq!(error.budget_b, GIB),
-            other => panic!("{stack}: 1 GiB must refuse: {other:?}"),
-        }
     }
 }
 

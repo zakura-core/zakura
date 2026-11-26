@@ -144,8 +144,8 @@ still delivering the earlier response.
   retained by, or reserved to enter, the reorder, applying, and sequencer-input pools.
   The pool caps `BlockSync` at its benefit: the sum of the peers' BBR congestion windows plus
   `2 × commit_rate × p99_range_fetch_time` of look-ahead. The cap is at least one minimum-cwnd
-  request. It is at most the planned cap: the in-flight cap plus `max_reorder_lookahead_bytes`, or
-  `[memory.cap] look_ahead` when set. A large host therefore prefetches only what commits can
+  request. It is at most the planned cap: the in-flight cap plus `max_reorder_lookahead_bytes`.
+  A large host therefore prefetches only what commits can
   drain.
   Serialized pools MUST be charged at wire size, while bounded decoded pools MUST also
   pay the calibrated decoded-memory charge. Commit-window work remains exempt so a

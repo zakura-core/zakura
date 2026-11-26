@@ -1315,7 +1315,7 @@ pub(crate) fn spawn_actors_with_memory(
     .expect("sync harness memory plan fits");
     *view.borrow().pool.borrow_mut() = PoolGaugeModel::new(
         memory_plan.pool_config.consumers[Consumer::Sessions.index()].floor,
-        memory_plan.override_warnings.is_empty(),
+        memory_plan.shortfall.is_none(),
     );
     let (pool_observer, pool_tap) =
         PoolTap::new(sim, "node", view.borrow().pool.clone(), Some(view.clone()));
@@ -1352,13 +1352,7 @@ pub(crate) fn spawn_actors_with_memory(
         .borrow_mut()
         .authority
         .startup(BodyWorkAuthority::for_view(&ports.engine.view()).into());
-    let look_ahead_override = node_net_config
-        .zakura
-        .memory_budget
-        .caps
-        .look_ahead
-        .map(zakura_network::zakura::memory::ByteSize::bytes);
-    let block_memory = BlockSyncMemory::new(memory_pool.clone(), look_ahead_override);
+    let block_memory = BlockSyncMemory::new(memory_pool.clone(), None);
     let node = SyncNode {
         name: "node".to_owned(),
         header: HeaderNode::spawn(

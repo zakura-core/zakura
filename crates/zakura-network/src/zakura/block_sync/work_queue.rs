@@ -1220,7 +1220,7 @@ mod memory_pool_tests {
         cap.tick(rate, 0);
         assert_eq!(cap.look_ahead_bytes(), 400 * 1024 * 1024);
 
-        // [memory.cap] look_ahead lowers the derived cap.
+        // A ceiling lowers the derived cap.
         let mut capped = LookAheadCap::new(Some(256 * 1024 * 1024));
         capped.record_fetch(Duration::from_secs(2));
         capped.tick(rate, 0);

@@ -29,15 +29,12 @@ mod tests;
 
 use std::time::Duration;
 
-pub use config::{
-    ByteSize, ByteSizeParseError, MemoryBudget, MemoryCaps, MemoryConfig, MemoryWeights,
-    ResolvedMemoryBudget,
-};
+pub use config::{ByteSize, ByteSizeParseError, MemoryBudget, MemoryConfig, ResolvedMemoryBudget};
 pub(crate) use credit::{CloseCreditOnDrop, ConnectionCredit};
 pub use draft::{derive_p2p_budget, BudgetDerivation};
 pub use plan::{
     derived_read_result_byte_limit, inbound_sessions_share, BudgetTooSmall, ConnectionSessionCost,
-    FixedTerms, MemoryPlan, MemoryPlanError, OverrideWarning, ReactorBase, SessionBases,
+    FixedTerms, MemoryPlan, MemoryPlanError, RaisedSetting, ReactorBase, SessionBases,
     SessionDirections, SessionSide, DEFAULT_MEMPOOL_TX_COST_LIMIT_BYTES,
     DEFAULT_STATE_READ_PARSER_BYTES, DISCOVERY_TABLES_FIXED_BYTES, PROPAGATION_RESERVE_BYTES,
     TX_RELAY_MAPS_FIXED_BYTES,
@@ -197,8 +194,7 @@ pub struct PoolConfig {
     pub fixed_bytes: u64,
     /// Per-consumer specifications, indexed by [`Consumer::index`].
     pub consumers: [ConsumerSpec; Consumer::COUNT],
-    /// The cap on one serving peer's part (`[memory.cap] serving_per_peer`),
-    /// at least 1 byte. It bounds every per-peer cap the pool sets.
+    /// The cap on one serving peer's part, at least 1 byte. It bounds every per-peer cap the pool sets.
     pub serving_per_peer_cap: u64,
 }
 

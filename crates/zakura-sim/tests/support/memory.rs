@@ -1,10 +1,7 @@
 //! Memory-plan, run and report helpers for the memory-budget witnesses.
 
 use zakura_chain::parameters::Network;
-use zakura_network::{
-    zakura::memory::{MemoryPlan, MemoryPlanError},
-    Config,
-};
+use zakura_network::{zakura::memory::MemoryPlan, Config};
 use zakura_sim::{
     harness::{
         header_sync::Dialer,
@@ -17,18 +14,18 @@ use zakura_sim::{
     MemorySink, Plan, PropertyOutcome, RunReport,
 };
 
-/// The smallest P2P budget `B` that `MemoryPlan::size_for_node` accepts on
-/// `network` with the default config: the required bytes its refusal of
-/// `B = 0` reports.
+/// The smallest P2P budget `B` whose plan fits on `network` with the default
+/// config: the required bytes the shortfall of `B = 0` reports.
 pub fn smallest_accepted_budget_b(network: &Network) -> u64 {
     let config = Config {
         network: network.clone(),
         ..Config::default()
     };
-    match MemoryPlan::size_for_node(0, &config, network, None, &[]) {
-        Err(MemoryPlanError::BudgetTooSmall(refusal)) => refusal.required_bytes,
-        other => panic!("a zero budget is refused for its size on {network:?}: {other:?}"),
-    }
+    MemoryPlan::size_for_node(0, &config, network, None, &[])
+        .expect("a default config sizes")
+        .shortfall
+        .unwrap_or_else(|| panic!("a zero budget falls short on {network:?}"))
+        .required_bytes
 }
 
 /// `id`'s outcome in `report`.

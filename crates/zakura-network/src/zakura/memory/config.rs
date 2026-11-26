@@ -262,94 +262,6 @@ impl<'de> Deserialize<'de> for MemoryBudget {
     }
 }
 
-/// Optional bulk-consumer weights under `[memory.weight]` (`03 §3`, D1).
-///
-/// Defaults to equal weights (`1` for every bulk consumer).
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct MemoryWeights {
-    /// Weight for block-sync request leases above the commit window.
-    pub block_sync: u64,
-    /// Weight for serving output and send-window leases.
-    pub serving: u64,
-    /// Weight for tx-relay / mempool pending leases.
-    pub tx: u64,
-    /// Weight for connection transport and reactor-session bases (no borrowing).
-    pub sessions: u64,
-}
-
-impl Default for MemoryWeights {
-    fn default() -> Self {
-        Self {
-            block_sync: 1,
-            serving: 1,
-            tx: 1,
-            sessions: 1,
-        }
-    }
-}
-
-impl MemoryWeights {
-    /// Validate that every configured weight is strictly positive.
-    pub fn validate(&self) -> Result<(), String> {
-        for (name, value) in [
-            ("block_sync", self.block_sync),
-            ("serving", self.serving),
-            ("tx", self.tx),
-            ("sessions", self.sessions),
-        ] {
-            if value == 0 {
-                return Err(format!(
-                    "invalid [memory.weight] {name}: weight must be at least 1"
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    /// The weight of `consumer` in `S`, or 0 for a reserved consumer.
-    pub const fn of(&self, consumer: super::Consumer) -> u64 {
-        match consumer {
-            super::Consumer::BlockSync => self.block_sync,
-            super::Consumer::Serving => self.serving,
-            super::Consumer::Sessions => self.sessions,
-            super::Consumer::Tx => self.tx,
-            super::Consumer::Control
-            | super::Consumer::Propagation
-            | super::Consumer::Consensus => 0,
-        }
-    }
-
-    /// True if all weights match the default equal-weight policy (D1).
-    pub fn is_default(&self) -> bool {
-        *self == Self::default()
-    }
-}
-
-/// Optional derived-cap overrides under `[memory.cap]` (`03 §3`).
-///
-/// Each configured cap lowers the consumer's derived cap, never below its floor.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct MemoryCaps {
-    /// Cap for block-sync look-ahead bytes (overrides `2 × commit_rate × p99_fetch_time`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub look_ahead: Option<ByteSize>,
-    /// Per-peer cap for serving queued output plus send-window growth.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub serving_per_peer: Option<ByteSize>,
-    /// Cap for tx-relay / mempool pending bytes.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tx: Option<ByteSize>,
-}
-
-impl MemoryCaps {
-    /// True when no optional cap override is configured.
-    pub fn is_empty(&self) -> bool {
-        *self == Self::default()
-    }
-}
-
 /// Top-level `[memory]` section of `zakura.toml` (`02 §2`, `03 §3`).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -357,11 +269,6 @@ pub struct MemoryConfig {
     /// `"auto"` (detect tightest host or cgroup limit) or an explicit byte size
     /// such as `"16 GiB"`.
     pub budget: MemoryBudget,
-    /// Shares of the bulk pool when consumers contend. Default: equal (`1`).
-    pub weight: MemoryWeights,
-    /// Optional derived-cap overrides, never lowering below a consumer's floor.
-    #[serde(default, skip_serializing_if = "MemoryCaps::is_empty")]
-    pub cap: MemoryCaps,
 }
 
 impl MemoryConfig {
@@ -374,7 +281,6 @@ impl MemoryConfig {
                 );
             }
         }
-        self.weight.validate()?;
         Ok(())
     }
 
@@ -389,8 +295,6 @@ impl MemoryConfig {
         ResolvedMemoryBudget::with_derivation(
             derive_p2p_budget(host_budget_bytes, managed_zcashd),
             source,
-            self.weight,
-            self.cap,
         )
     }
 }
@@ -403,10 +307,6 @@ pub struct ResolvedMemoryBudget {
     pub derivation: BudgetDerivation,
     /// Source label for `zakura.memory.budget_bytes{source}` (`"auto"` or `"config"`).
     pub source: &'static str,
-    /// Bulk consumer weights.
-    pub weights: MemoryWeights,
-    /// Optional cap overrides.
-    pub caps: MemoryCaps,
     /// Mempool pool capacity (`[mempool] tx_cost_limit`), counted as a fixed
     /// term and as the default cap for the `Tx` consumer (`02 §4`).
     pub mempool_tx_cost_limit: u64,
@@ -421,17 +321,10 @@ pub struct ResolvedMemoryBudget {
 impl ResolvedMemoryBudget {
     /// A resolved budget from `derivation`, with the default mempool, state
     /// read and read limit terms, which `zakurad` sets from its own config.
-    const fn with_derivation(
-        derivation: BudgetDerivation,
-        source: &'static str,
-        weights: MemoryWeights,
-        caps: MemoryCaps,
-    ) -> Self {
+    const fn with_derivation(derivation: BudgetDerivation, source: &'static str) -> Self {
         Self {
             derivation,
             source,
-            weights,
-            caps,
             mempool_tx_cost_limit: super::plan::DEFAULT_MEMPOOL_TX_COST_LIMIT_BYTES,
             state_read_parser_bytes: super::plan::DEFAULT_STATE_READ_PARSER_BYTES,
             read_result_byte_limit: None,
@@ -451,17 +344,6 @@ impl ResolvedMemoryBudget {
                 p2p_budget_b,
             },
             "config",
-            MemoryWeights {
-                block_sync: 1,
-                serving: 1,
-                tx: 1,
-                sessions: 1,
-            },
-            MemoryCaps {
-                look_ahead: None,
-                serving_per_peer: None,
-                tx: None,
-            },
         )
     }
 
@@ -494,8 +376,6 @@ impl Default for ResolvedMemoryBudget {
                 p2p_budget_b,
             },
             "auto",
-            MemoryWeights::default(),
-            MemoryCaps::default(),
         )
     }
 }
@@ -553,38 +433,19 @@ mod tests {
         let cfg: MemoryConfig = toml::from_str(
             r#"
             budget = "16 GiB"
-
-            [weight]
-            block_sync = 2
-            serving = 1
-            tx = 1
-            sessions = 3
-
-            [cap]
-            look_ahead = "4 GiB"
-            serving_per_peer = "64 MiB"
-            tx = "256 MiB"
             "#,
         )
         .expect("valid [memory] section");
 
         assert_eq!(cfg.budget, MemoryBudget::Fixed(ByteSize(16 * GIB)));
-        assert_eq!(cfg.weight.block_sync, 2);
-        assert_eq!(cfg.weight.sessions, 3);
-        assert_eq!(cfg.cap.look_ahead, Some(ByteSize(4 * GIB)));
-        assert_eq!(cfg.cap.serving_per_peer, Some(ByteSize(64 * MIB)));
-        assert_eq!(cfg.cap.tx, Some(ByteSize(256 * MIB)));
         assert!(cfg.validate().is_ok());
 
         let auto: MemoryConfig = toml::from_str(r#"budget = "auto""#).unwrap();
         assert_eq!(auto.budget, MemoryBudget::Auto);
-        assert!(auto.weight.is_default());
-        assert!(auto.cap.is_empty());
 
         let int_budget: MemoryConfig = toml::from_str("budget = 17179869184").unwrap();
         assert_eq!(int_budget.budget, MemoryBudget::Fixed(ByteSize(16 * GIB)));
 
-        let zero_weight: MemoryConfig = toml::from_str("[weight]\ntx = 0\n").unwrap();
-        assert!(zero_weight.validate().is_err());
+        assert!(toml::from_str::<MemoryConfig>("[weight]\ntx = 1\n").is_err());
     }
 }

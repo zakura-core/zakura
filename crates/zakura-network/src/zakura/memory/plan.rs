@@ -219,31 +219,6 @@ pub struct SessionBases {
 /// It has no capability bit, and no metric (`03 §5`).
 const CUSTOM_KINDS: &str = "custom_kinds";
 
-/// The reactors whose session bases [`SessionBases`] names, by capability bit.
-const SESSION_REACTOR_CAPABILITIES: u64 = {
-    let zero = ReactorBase {
-        receive: 0,
-        session: 0,
-    };
-    let entries = SessionBases {
-        transport_base: 0,
-        header_sync: zero,
-        block_sync: zero,
-        tx_relay: zero,
-        legacy_compat: zero,
-        bpv1: zero,
-        custom_kinds: zero,
-    }
-    .entries();
-    let mut capabilities = 0;
-    let mut index = 0;
-    while index < entries.len() {
-        capabilities |= entries[index].1;
-        index += 1;
-    }
-    capabilities
-};
-
 impl SessionBases {
     /// Every base besides `t`, with its label and its reactor's capability
     /// bit (0 for [`CUSTOM_KINDS`]). Sizing, admission, metrics, traces and
@@ -287,26 +262,23 @@ impl SessionBases {
     }
 
     /// The bases that `Consumer::Sessions` funds when it admits a connection
-    /// (`02 §8` rule 3).
-    ///
-    /// - `negotiated`: the capabilities both sides accepted. The connection's
-    ///   receive credit covers each negotiated reactor's unsolicited bytes, so
-    ///   each one adds its `receive` part.
-    /// - `admitted`: the capabilities whose services take a session from this
-    ///   peer now. Each one adds its `session` part. A service that admits a
-    ///   session later funds it then, through [`Self::session_top_up`].
-    /// - `custom_kinds_negotiated`: whether the connection negotiated any
-    ///   embedder custom kind.
+    /// (`02 §8` rule 3): every reactor in `negotiated` adds its `receive` and
+    /// `session` parts, and `custom_kinds_negotiated` adds the custom kinds'
+    /// part. Funding every negotiated session at admission means a session
+    /// that opens later never needs a lease that could be refused.
     pub fn connection_cost(
         &self,
         negotiated: u64,
-        admitted: u64,
         custom_kinds_negotiated: bool,
     ) -> ConnectionSessionCost {
-        let admitted = admitted & negotiated;
-        let [header_sync, block_sync, tx_relay, legacy_compat, bpv1, _] = self
-            .entries()
-            .map(|(_, capability, base)| reactor_cost(base, negotiated, admitted, capability));
+        let [header_sync, block_sync, tx_relay, legacy_compat, bpv1, _] =
+            self.entries().map(|(_, capability, base)| {
+                if negotiated & capability != 0 {
+                    base.total()
+                } else {
+                    0
+                }
+            });
         ConnectionSessionCost {
             transport_base: self.transport_base,
             header_sync,
@@ -321,42 +293,6 @@ impl SessionBases {
             },
         }
     }
-
-    /// The reactor capabilities whose `session` parts
-    /// [`Self::connection_cost`] funds for the same `negotiated` and
-    /// `admitted` capabilities.
-    pub const fn funded_sessions(negotiated: u64, admitted: u64) -> u64 {
-        admitted & negotiated & SESSION_REACTOR_CAPABILITIES
-    }
-
-    /// The `session` part a connection still owes when a service admits a
-    /// session for `capability`, given the reactor sessions it has funded so
-    /// far. Returns the reactor's capability bit and the bytes, or `None` when
-    /// nothing is owed: the reactor is funded, has no session part, or isn't
-    /// one of the reactors these bases name.
-    pub fn session_top_up(&self, funded_sessions: u64, capability: u64) -> Option<(u64, u64)> {
-        let (_, bit, base) = self
-            .entries()
-            .into_iter()
-            .find(|(_, bit, _)| capability & bit != 0)?;
-        (funded_sessions & bit == 0 && base.session != 0).then_some((bit, base.session))
-    }
-}
-
-/// One reactor's admission charge: its receive part when negotiated, plus its
-/// session part when its service admits the peer.
-const fn reactor_cost(base: ReactorBase, negotiated: u64, admitted: u64, capability: u64) -> u64 {
-    let receive = if negotiated & capability != 0 {
-        base.receive
-    } else {
-        0
-    };
-    let session = if admitted & capability != 0 {
-        base.session
-    } else {
-        0
-    };
-    receive.saturating_add(session)
 }
 
 /// Exact transport base `t` and reactor session bases `b_r` required to admit
@@ -771,11 +707,18 @@ impl MemoryPlan {
     }
 
     /// The endpoint's local limits under this plan: the configured limits with
-    /// the connection cap `N_cap` (`02 §8`). `Consumer::Sessions` decides how
+    /// the connection cap `N_cap`, lowered to the required-chain connections
+    /// the sessions share funds (`02 §8`). `Consumer::Sessions` decides how
     /// many connections memory funds below that cap.
     pub fn local_limits(&self, config: &Config) -> ZakuraLocalLimits {
         let mut limits = ZakuraLocalLimits::from_config(config);
-        limits.max_connections = self.connection_cap.max(1);
+        // No connection costs less than the required chain reactors, so
+        // slots past what the share funds for them would only take
+        // handshakes that admission then refuses.
+        limits.max_connections = self
+            .connection_cap
+            .min(self.planned_required_connections)
+            .max(1);
         limits
     }
 
@@ -1302,56 +1245,50 @@ mod tests {
             .required_minimum_bytes()
     }
 
-    /// fix-37: a negotiated reactor adds its receive part, because receive
-    /// credit covers it, and its session part only when its service admits
-    /// the peer. Custom kinds count only when negotiated.
+    /// On a host that funds fewer connections than `N_cap`, the slot cap
+    /// stops at what the sessions share funds, so the node doesn't complete
+    /// handshakes only to refuse them at admission.
     #[test]
-    fn connection_cost_charges_sessions_only_for_admitted_reactors() {
-        let bases = bases();
-        let all = SESSION_REACTOR_CAPABILITIES;
-
-        let minimal = bases.connection_cost(0, all, false);
-        assert_eq!(minimal.total(), bases.transport_base);
-
-        let negotiated_only = bases.connection_cost(all, 0, false);
+    fn local_limits_stop_at_the_funded_connections() {
+        let config = zakura_cfg(&Network::Mainnet);
+        let plan = MemoryPlan::size(host_b(16 * GIB), &config, &Network::Mainnet).expect("sizes");
+        assert!(plan.planned_required_connections < plan.connection_cap);
         assert_eq!(
-            negotiated_only.total(),
-            320 * KIB + 256 * KIB + MIB + 64 * KIB + 128 * KIB + 512 * KIB
+            plan.local_limits(&config).max_connections,
+            plan.planned_required_connections
         );
-        assert_eq!(SessionBases::funded_sessions(all, 0), 0);
-
-        let admitted = ZAKURA_CAP_HEADER_SYNC | ZAKURA_CAP_BLOCK_SYNC_REGULATED;
-        let cost = bases.connection_cost(all, admitted, false);
-        assert_eq!(cost.header_sync, bases.header_sync.total());
-        assert_eq!(cost.block_sync, bases.block_sync.total());
-        assert_eq!(cost.tx_relay, bases.tx_relay.receive);
-        assert_eq!(cost.bpv1, bases.bpv1.receive);
-        assert_eq!(cost.custom_kinds, 0);
-        assert_eq!(SessionBases::funded_sessions(all, admitted), admitted);
-
-        let everything = bases.connection_cost(all, all, true);
-        assert_eq!(everything.total(), bases.full_connection_bytes());
+        let large = MemoryPlan::size(256 * GIB, &config, &Network::Mainnet).expect("sizes");
+        assert_eq!(
+            large.local_limits(&config).max_connections,
+            large.connection_cap
+        );
     }
 
-    /// fix-37: a service that admits a session after admission funds its
-    /// session part once.
+    /// fix-37: a negotiated reactor adds its receive and session parts at
+    /// admission, an unnegotiated one adds nothing, and custom kinds count
+    /// only when negotiated.
     #[test]
-    fn session_top_up_funds_each_reactor_once() {
+    fn connection_cost_charges_every_negotiated_reactor() {
         let bases = bases();
-        let funded = ZAKURA_CAP_HEADER_SYNC;
-        assert_eq!(bases.session_top_up(funded, ZAKURA_CAP_HEADER_SYNC), None);
+        // Every capability bit, so every reactor counts as negotiated.
+        let all = u64::MAX;
+
         assert_eq!(
-            bases.session_top_up(funded, ZAKURA_CAP_TX_RELAY),
-            Some((ZAKURA_CAP_TX_RELAY, 32 * KIB))
+            bases.connection_cost(0, false).total(),
+            bases.transport_base
         );
-        // BPv1's session base follows each admitted session (`b_bpv1`).
-        assert_eq!(
-            bases.session_top_up(funded, ZAKURA_CAP_BPV1),
-            Some((ZAKURA_CAP_BPV1, 96 * KIB))
-        );
-        // No session part, or no reactor these bases name.
-        assert_eq!(bases.session_top_up(0, ZAKURA_CAP_LEGACY_GOSSIP), None);
-        assert_eq!(bases.session_top_up(0, 0), None);
+
+        let chain = ZAKURA_CAP_HEADER_SYNC | ZAKURA_CAP_BLOCK_SYNC_REGULATED;
+        let cost = bases.connection_cost(chain, false);
+        assert_eq!(cost.header_sync, bases.header_sync.total());
+        assert_eq!(cost.block_sync, bases.block_sync.total());
+        assert_eq!(cost.tx_relay, 0);
+        assert_eq!(cost.bpv1, 0);
+        assert_eq!(cost.custom_kinds, 0);
+        assert_eq!(cost.total(), bases.required_chain_connection_bytes());
+
+        let everything = bases.connection_cost(all, true);
+        assert_eq!(everything.total(), bases.full_connection_bytes());
     }
 
     /// fix-32: inbound connections stop at three quarters of the sessions

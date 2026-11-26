@@ -1750,7 +1750,6 @@ async fn incomplete_pairs_expire_and_mismatched_roles_release_stream_permits(
         connection_token: cancel.clone(),
         close_cause: CloseCause::new(),
         freshness_tx: freshness,
-        session_funding: None,
     };
     let mut offers = Vec::new();
     // The request role may arrive first. It must not reach the service alone.
@@ -1862,7 +1861,6 @@ async fn ineligible_pair_opener_is_rejected_before_service_reservation() -> Resu
         connection_token: context.connection_token.clone(),
         close_cause: context.close_cause,
         freshness_tx: context.freshness_tx,
-        session_funding: None,
     };
     let (mut send, _recv) = connection.open_bi().await?;
     // Withhold the pair ID: even the first role cannot reserve service capacity.
@@ -1946,7 +1944,6 @@ async fn prelude_frame_cap_must_fit_a_header_and_a_payload_byte() -> Result<(), 
             connection_token: context.connection_token.clone(),
             close_cause: context.close_cause,
             freshness_tx: context.freshness_tx,
-            session_funding: None,
         };
         let (mut send, mut recv) = connection.open_bi().await?;
         let prelude = StreamPrelude {

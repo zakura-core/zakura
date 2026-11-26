@@ -2772,40 +2772,31 @@ enum SessionFundingRefusal {
     /// The pool refused the lease.
     #[error("the memory pool refused the lease: {0:?}")]
     Pool(super::memory::LeaseDenied),
-    /// The connection released its funding before the session arrived.
-    #[error("the connection released its session leases")]
-    Released,
 }
 
-/// One connection's `Consumer::Sessions` lease (`02 §8`): the bases its
-/// admission funded, plus each reactor's session part that a service
-/// admitted later. Releasing it, or dropping the last handle, returns the
-/// lease and the connection's charge in the direction ledger.
+/// One connection's `Consumer::Sessions` lease (`02 §8`): every base of the
+/// reactors it negotiated, funded at admission. Releasing it, or dropping
+/// the last handle, returns the lease and the connection's charge in the
+/// direction ledger.
 #[derive(Debug)]
 struct SessionFunding {
     directions: Arc<zakura_rt::sync::Mutex<super::memory::SessionDirections>>,
-    bases: super::memory::SessionBases,
-    sessions_share: u64,
     side: super::memory::SessionSide,
     held: zakura_rt::sync::Mutex<HeldSessionLeases>,
 }
 
 #[derive(Debug)]
 struct HeldSessionLeases {
-    /// The connection's one lease. Each later session part grows it.
+    /// The connection's one lease.
     lease: super::memory::PoolLease,
-    /// The reactor capabilities whose session parts the lease holds.
-    funded_sessions: u64,
     /// Bytes this connection charged to the direction ledger.
     charged: u64,
-    released: bool,
 }
 
 impl SessionFunding {
-    /// Fund `cost` bytes, which hold the session parts of `funded_sessions`,
-    /// for connection `conn_id` on `side`: charge the direction ledger,
-    /// then lease every base together from the pool, waiting up to
-    /// `wait_timeout` for borrowed bytes to return.
+    /// Fund `cost` bytes for connection `conn_id` on `side`: charge the
+    /// direction ledger, then lease every base together from the pool,
+    /// waiting up to `wait_timeout` for borrowed bytes to return.
     #[allow(clippy::too_many_arguments)]
     async fn acquire(
         pool: &super::memory::MemoryPool,
@@ -2814,7 +2805,6 @@ impl SessionFunding {
         conn_id: ZakuraConnId,
         side: super::memory::SessionSide,
         cost: u64,
-        funded_sessions: u64,
         shutdown: &CancellationToken,
         wait_timeout: Duration,
     ) -> Result<Self, SessionFundingRefusal> {
@@ -2824,14 +2814,10 @@ impl SessionFunding {
         // From here, dropping `funding` returns the charge.
         let funding = Self {
             directions: directions.clone(),
-            bases: plan.bases,
-            sessions_share: plan.sessions_share,
             side,
             held: zakura_rt::sync::Mutex::new(HeldSessionLeases {
                 lease: pool.empty_lease(super::memory::Consumer::Sessions, Some(conn_id)),
-                funded_sessions,
                 charged: cost,
-                released: false,
             }),
         };
         let lease = pool
@@ -2842,43 +2828,9 @@ impl SessionFunding {
         Ok(funding)
     }
 
-    /// Fund the session part of the reactor that `capability` names, after
-    /// its service admitted a session that admission didn't fund. A
-    /// connection funds each reactor once and keeps it until it closes.
-    fn fund_session(&self, capability: u64) -> Result<(), SessionFundingRefusal> {
-        let mut held = self.lock_held();
-        if held.released {
-            return Err(SessionFundingRefusal::Released);
-        }
-        let Some((reactor, bytes)) = self.bases.session_top_up(held.funded_sessions, capability)
-        else {
-            return Ok(());
-        };
-        if !lock_session_directions(&self.directions).try_charge(
-            self.side,
-            bytes,
-            self.sessions_share,
-        ) {
-            return Err(SessionFundingRefusal::DirectionFull);
-        }
-        let grown = held.lease.bytes().saturating_add(bytes);
-        match held.lease.try_grow_to(grown) {
-            Ok(()) => {
-                held.funded_sessions |= reactor;
-                held.charged = held.charged.saturating_add(bytes);
-                Ok(())
-            }
-            Err(denied) => {
-                lock_session_directions(&self.directions).release(self.side, bytes);
-                Err(SessionFundingRefusal::Pool(denied))
-            }
-        }
-    }
-
     /// Return the lease and the direction charge. Later calls do nothing.
     fn release(&self) {
         let mut held = self.lock_held();
-        held.released = true;
         held.lease.shrink_to(0);
         let charged = std::mem::take(&mut held.charged);
         drop(held);
@@ -2933,8 +2885,6 @@ struct StreamAdmission<'a> {
     connection_token: CancellationToken,
     close_cause: CloseCause,
     freshness_tx: watch::Sender<Instant>,
-    /// The connection's session leases, when a memory pool funds them.
-    session_funding: Option<&'a SessionFunding>,
 }
 
 struct ConnectionServeContext {
@@ -3394,8 +3344,6 @@ struct SessionOpenContext<'a> {
     peer_id: ZakuraPeerId,
     direction: ServicePeerDirection,
     session_exit_tx: mpsc::UnboundedSender<SessionExit>,
-    /// The connection's session leases, when a memory pool funds them.
-    session_funding: Option<&'a SessionFunding>,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -4542,7 +4490,6 @@ impl ZakuraProtocolHandler {
         let connection_token = context.connection_token;
         let close_cause = context.close_cause;
         let accepted_capabilities = context.accepted_capabilities;
-        let session_funding = cleanup_guard.session_funding.clone();
         let stream_sem = Arc::new(Semaphore::new(usize::from(limits.max_open_streams)));
         let limits_owner_bound = self.limits.owner_bound();
         let connection_resources = self.resources.connection(accepted_capabilities);
@@ -4707,7 +4654,6 @@ impl ZakuraProtocolHandler {
             peer_id: peer_id.clone(),
             direction: context.direction,
             session_exit_tx: session_exit_tx.clone(),
-            session_funding: session_funding.as_deref(),
         };
 
         if negotiated_ordered_streams.is_empty() {
@@ -4977,7 +4923,6 @@ impl ZakuraProtocolHandler {
                         connection_token: connection_token.clone(),
                         close_cause: close_cause.clone(),
                         freshness_tx: freshness_tx.clone(),
-                        session_funding: session_funding.as_deref(),
                     };
                     if let Some(admitted) = self.finish_bi_stream_setup(
                         setup, &mut admission, per_stream_queue_depth,
@@ -5085,7 +5030,6 @@ impl ZakuraProtocolHandler {
                                 connection_token: connection_token.clone(),
                                 close_cause: close_cause.clone(),
                                 freshness_tx: freshness_tx.clone(),
-                                session_funding: session_funding.as_deref(),
                             };
                             incoming_setup = self.begin_bi_stream_setup(send, recv, &mut admission);
                         }
@@ -5269,12 +5213,6 @@ impl ZakuraProtocolHandler {
             .expect("a selected stream has an owning service")
             .reserve_session(open.direction)
             .map_err(|_| ZakuraHandlerError::SessionFull)?;
-        // The service admitted the session, so its base is held now.
-        if let Some(funding) = open.session_funding {
-            funding
-                .fund_session(stream.capability)
-                .map_err(|_| ZakuraHandlerError::SessionFull)?;
-        }
         let prepared = members.into_iter().map(|member| {
             let mut member = self.prepare_opened_stream(
                 member,
@@ -5579,18 +5517,8 @@ impl ZakuraProtocolHandler {
             return None;
         };
         let resources = if let Some((layout, _)) = &session {
-            let reserved = pending_sessions
-                .reserve_or_share(layout, &self.registry, admission.direction)
-                .and_then(|resources| {
-                    // The service admitted the session, so its base is held now.
-                    match admission.session_funding {
-                        Some(funding) => funding
-                            .fund_session(layout.primary().capability)
-                            .map(|()| resources)
-                            .map_err(|_| crate::zakura::SessionFull),
-                        None => Ok(resources),
-                    }
-                });
+            let reserved =
+                pending_sessions.reserve_or_share(layout, &self.registry, admission.direction);
             match reserved {
                 Ok(resources) => resources,
                 Err(_) => {
@@ -5735,9 +5663,6 @@ impl ZakuraProtocolHandler {
         let session_funding = if let (Some(pool), Some(plan), Some(conn_id)) =
             (&self.memory_pool, &self.memory_plan, reserved_conn_id)
         {
-            let admitted_sessions = escalation_streams
-                .iter()
-                .fold(0, |capabilities, stream| capabilities | stream.capability);
             let custom_kinds_negotiated = self
                 .registry
                 .services_for_negotiated(context.accepted_capabilities)
@@ -5747,15 +5672,9 @@ impl ZakuraProtocolHandler {
                     stream.capability & context.accepted_capabilities != 0
                         && plan.custom_kinds.contains(&stream.kind)
                 });
-            let cost = plan.bases.connection_cost(
-                context.accepted_capabilities,
-                admitted_sessions,
-                custom_kinds_negotiated,
-            );
-            let funded_sessions = super::memory::SessionBases::funded_sessions(
-                context.accepted_capabilities,
-                admitted_sessions,
-            );
+            let cost = plan
+                .bases
+                .connection_cost(context.accepted_capabilities, custom_kinds_negotiated);
             // A preferred gateway leases from the places held for it, as it
             // claims a held connection slot.
             let gateway = peer_id.node_id().is_some_and(|node| {
@@ -5772,7 +5691,6 @@ impl ZakuraProtocolHandler {
                 conn_id,
                 super::memory::SessionSide::new(context.direction, gateway),
                 cost.total(),
-                funded_sessions,
                 &self.shutdown,
                 self.limits.control_timeout,
             )
@@ -14708,7 +14626,6 @@ mod tests {
             connection_token: connection_token.clone(),
             close_cause: CloseCause::new(),
             freshness_tx,
-            session_funding: None,
         };
         let (session_exit_tx, _session_exit_rx) = mpsc::unbounded_channel();
         let admitted = handler
@@ -16457,9 +16374,7 @@ mod tests {
         let directions = Arc::new(zakura_rt::sync::Mutex::new(SessionDirections::default()));
         let shutdown = CancellationToken::new();
         let negotiated = ZAKURA_CAP_HEADER_SYNC | ZAKURA_CAP_BLOCK_SYNC_REGULATED;
-        let cost = plan
-            .bases
-            .connection_cost(negotiated, ZAKURA_CAP_HEADER_SYNC, false);
+        let cost = plan.bases.connection_cost(negotiated, false);
         let fund = |conn_id, direction| {
             SessionFunding::acquire(
                 &pool,
@@ -16468,7 +16383,6 @@ mod tests {
                 conn_id,
                 direction,
                 cost.total(),
-                ZAKURA_CAP_HEADER_SYNC,
                 &shutdown,
                 Duration::from_millis(10),
             )
@@ -16495,15 +16409,6 @@ mod tests {
         let dial = fund(u64::MAX, crate::zakura::memory::SessionSide::Outbound)
             .await
             .expect("the dial reserve funds a dial");
-        let leased = pool.snapshot().total_leased;
-        dial.fund_session(ZAKURA_CAP_BLOCK_SYNC_REGULATED)
-            .expect("the share funds the block-sync session");
-        dial.fund_session(ZAKURA_CAP_BLOCK_SYNC_REGULATED)
-            .expect("a funded session owes nothing");
-        assert_eq!(
-            pool.snapshot().total_leased,
-            leased + plan.bases.block_sync.session
-        );
 
         dial.release();
         drop(dial);
@@ -16520,7 +16425,7 @@ mod tests {
     #[tokio::test]
     async fn session_funding_admits_a_bpv1_connection() {
         use crate::zakura::{
-            memory::{Consumer, MemoryPlan, SessionBases, SessionDirections},
+            memory::{Consumer, MemoryPlan, SessionDirections},
             ZAKURA_CAP_BPV1,
         };
 
@@ -16532,7 +16437,8 @@ mod tests {
         let pool = plan.build_pool();
         let directions = Arc::new(zakura_rt::sync::Mutex::new(SessionDirections::default()));
         let negotiated = ZAKURA_CAP_HEADER_SYNC | ZAKURA_CAP_BPV1;
-        let cost = plan.bases.connection_cost(negotiated, negotiated, false);
+        let cost = plan.bases.connection_cost(negotiated, false);
+        assert!(cost.bpv1 >= plan.bases.bpv1.total());
 
         let funding = SessionFunding::acquire(
             &pool,
@@ -16541,16 +16447,11 @@ mod tests {
             1,
             crate::zakura::memory::SessionSide::Outbound,
             cost.total(),
-            SessionBases::funded_sessions(negotiated, negotiated),
             &CancellationToken::new(),
             Duration::from_millis(10),
         )
         .await
         .expect("the plan funds a BPv1 connection");
-        assert_eq!(pool.consumer_leased(Consumer::Sessions), cost.total());
-        funding
-            .fund_session(ZAKURA_CAP_BPV1)
-            .expect("admission funded BPv1's session");
         assert_eq!(pool.consumer_leased(Consumer::Sessions), cost.total());
 
         drop(funding);

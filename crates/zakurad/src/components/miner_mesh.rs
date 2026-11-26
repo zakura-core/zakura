@@ -1,7 +1,9 @@
 //! Counts the gateways that recent best-chain blocks name in their coinbase,
 //! and tells the network which mining gateways to prefer.
 //!
-//! A mining node keeps connections to the gateways named most often. The
+//! A mining node, or a relay that runs the miner mesh, keeps connections to
+//! the gateways named most often, and a relay also keeps places for the
+//! template nodes its config lists. The
 //! tracker follows the best chain's tip, reads each block once it is
 //! [`QUALIFYING_DEPTH`](zakura_chain::miner_mesh::QUALIFYING_DEPTH) deep, reads
 //! older blocks in the window when it has nothing newer to do, and repairs its
@@ -9,11 +11,13 @@
 //! synced, and an empty ranking otherwise.
 
 mod chain_reads;
+mod local_gateway;
 mod ranking;
 mod tracker;
 
 #[cfg(test)]
 mod tests;
 
+pub use local_gateway::LocalGateway;
 pub use ranking::ranking_channel;
 pub use tracker::spawn;

@@ -44,6 +44,7 @@ fn snapshot_with<const N: usize>(gateways: [(GatewayId, u32); N]) -> MinerSetSna
 /// in at least the minimum of blocks.
 fn expected_ranking() -> MinerGatewayRanking {
     MinerGatewayRanking {
+        always_preferred: Vec::new(),
         gateways: vec![
             MinerGateway {
                 gateway_id: id(7),
@@ -68,7 +69,7 @@ fn tip_aged(age: Duration) -> (MockChainTip, MockChainTipSender) {
 #[test]
 fn a_node_that_does_not_mine_gets_no_publisher_and_an_empty_ranking() {
     let (tip, _sender) = tip_aged(Duration::zero());
-    let (ranking, publisher) = ranking_channel(false, Network::Mainnet, tip);
+    let (ranking, publisher) = ranking_channel(false, Vec::new(), Network::Mainnet, tip);
 
     assert!(publisher.is_none());
     assert_eq!(*ranking.borrow(), MinerGatewayRanking::default());
@@ -77,7 +78,7 @@ fn a_node_that_does_not_mine_gets_no_publisher_and_an_empty_ranking() {
 #[test]
 fn a_synced_mining_node_publishes_the_gateways_named_in_enough_blocks() {
     let (tip, _sender) = tip_aged(Duration::minutes(5));
-    let (ranking, publisher) = ranking_channel(true, Network::Mainnet, tip);
+    let (ranking, publisher) = ranking_channel(true, Vec::new(), Network::Mainnet, tip);
     let publisher = publisher.expect("a mining node gets a publisher");
 
     publisher.publish(&snapshot());
@@ -88,7 +89,7 @@ fn a_synced_mining_node_publishes_the_gateways_named_in_enough_blocks() {
 #[test]
 fn a_gateway_whose_count_falls_below_the_minimum_leaves_the_ranking() {
     let (tip, _sender) = tip_aged(Duration::minutes(5));
-    let (mut ranking, publisher) = ranking_channel(true, Network::Mainnet, tip);
+    let (mut ranking, publisher) = ranking_channel(true, Vec::new(), Network::Mainnet, tip);
     let publisher = publisher.expect("a mining node gets a publisher");
     publisher.publish(&snapshot_with([(id(9), MIN_GATEWAY_BLOCKS)]));
     ranking.mark_unchanged();
@@ -102,7 +103,7 @@ fn a_gateway_whose_count_falls_below_the_minimum_leaves_the_ranking() {
 #[test]
 fn a_mining_node_whose_tip_is_too_old_publishes_an_empty_ranking() {
     let (tip, sender) = tip_aged(Duration::minutes(5));
-    let (mut ranking, publisher) = ranking_channel(true, Network::Mainnet, tip);
+    let (mut ranking, publisher) = ranking_channel(true, Vec::new(), Network::Mainnet, tip);
     let publisher = publisher.expect("a mining node gets a publisher");
     publisher.publish(&snapshot());
     ranking.mark_unchanged();
@@ -118,7 +119,7 @@ fn a_mining_node_whose_tip_is_too_old_publishes_an_empty_ranking() {
 #[test]
 fn a_mining_node_with_no_tip_yet_publishes_an_empty_ranking() {
     let (tip, _sender) = MockChainTip::new();
-    let (ranking, publisher) = ranking_channel(true, Network::Mainnet, tip);
+    let (ranking, publisher) = ranking_channel(true, Vec::new(), Network::Mainnet, tip);
     let publisher = publisher.expect("a mining node gets a publisher");
 
     publisher.publish(&snapshot());
@@ -130,7 +131,7 @@ fn a_mining_node_with_no_tip_yet_publishes_an_empty_ranking() {
 fn a_mining_node_on_a_test_network_publishes_whatever_its_tip_age() {
     let (tip, _sender) = tip_aged(Duration::days(30));
     let network = Network::new_regtest(Default::default());
-    let (ranking, publisher) = ranking_channel(true, network, tip);
+    let (ranking, publisher) = ranking_channel(true, Vec::new(), network, tip);
     let publisher = publisher.expect("a mining node gets a publisher");
 
     publisher.publish(&snapshot());
@@ -141,7 +142,7 @@ fn a_mining_node_on_a_test_network_publishes_whatever_its_tip_age() {
 #[test]
 fn publishing_the_same_ranking_again_does_not_wake_the_network() {
     let (tip, _sender) = tip_aged(Duration::minutes(5));
-    let (mut ranking, publisher) = ranking_channel(true, Network::Mainnet, tip);
+    let (mut ranking, publisher) = ranking_channel(true, Vec::new(), Network::Mainnet, tip);
     let publisher = publisher.expect("a mining node gets a publisher");
     publisher.publish(&snapshot());
     ranking.mark_unchanged();
@@ -154,7 +155,7 @@ fn publishing_the_same_ranking_again_does_not_wake_the_network() {
 #[test]
 fn the_coverage_reaches_its_receivers_whether_or_not_the_node_is_synced() {
     let (tip, _sender) = MockChainTip::new();
-    let (ranking, publisher) = ranking_channel(true, Network::Mainnet, tip);
+    let (ranking, publisher) = ranking_channel(true, Vec::new(), Network::Mainnet, tip);
     let publisher = publisher.expect("a mining node gets a publisher");
     let coverage = publisher.coverage();
     assert_eq!(*coverage.borrow(), MinerSetCoverage::default());
@@ -164,4 +165,78 @@ fn the_coverage_reaches_its_receivers_whether_or_not_the_node_is_synced() {
     assert_eq!(*ranking.borrow(), MinerGatewayRanking::default());
     assert_eq!(*coverage.borrow(), snapshot().coverage());
     assert_eq!(coverage.borrow().window_len(), 30);
+}
+
+/// The template nodes listed in a relay's config, as the network gets them
+/// before any block is counted.
+fn template_nodes(ids: &[GatewayId]) -> Vec<MinerGateway> {
+    ids.iter()
+        .map(|&gateway_id| MinerGateway {
+            gateway_id,
+            blocks: 0,
+        })
+        .collect()
+}
+
+#[test]
+fn a_relay_publishes_its_template_nodes_before_anything_is_counted() {
+    let (tip, _sender) = MockChainTip::new();
+    let (ranking, _publisher) = ranking_channel(true, vec![id(2), id(1)], Network::Mainnet, tip);
+
+    assert_eq!(
+        *ranking.borrow(),
+        MinerGatewayRanking {
+            always_preferred: template_nodes(&[id(2), id(1)]),
+            gateways: Vec::new(),
+        },
+        "the template nodes are listed in config order, with no block naming them"
+    );
+}
+
+/// The template nodes come first, each with the blocks that name it, and the
+/// gateways the blocks rank follow them, including a template node that is
+/// also a ranked gateway.
+#[test]
+fn a_synced_relay_publishes_its_template_nodes_ahead_of_the_ranked_gateways() {
+    let (tip, _sender) = tip_aged(Duration::minutes(5));
+    let (ranking, publisher) = ranking_channel(true, vec![id(1), id(9)], Network::Mainnet, tip);
+    let publisher = publisher.expect("a relay gets a publisher");
+
+    publisher.publish(&snapshot());
+
+    assert_eq!(
+        *ranking.borrow(),
+        MinerGatewayRanking {
+            always_preferred: vec![
+                MinerGateway {
+                    gateway_id: id(1),
+                    blocks: 0,
+                },
+                MinerGateway {
+                    gateway_id: id(9),
+                    blocks: MIN_GATEWAY_BLOCKS,
+                },
+            ],
+            ..expected_ranking()
+        }
+    );
+}
+
+/// A relay whose tip is too old ranks no gateway, but keeps its template
+/// nodes: no block names them, so the tip's age says nothing about them.
+#[test]
+fn a_relay_that_is_not_synced_keeps_only_its_template_nodes() {
+    let (tip, _sender) = MockChainTip::new();
+    let (ranking, publisher) = ranking_channel(true, vec![id(3)], Network::Mainnet, tip);
+    let publisher = publisher.expect("a relay gets a publisher");
+
+    publisher.publish(&snapshot());
+
+    assert_eq!(
+        *ranking.borrow(),
+        MinerGatewayRanking {
+            always_preferred: template_nodes(&[id(3)]),
+            gateways: Vec::new(),
+        }
+    );
 }

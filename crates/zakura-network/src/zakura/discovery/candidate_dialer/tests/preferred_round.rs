@@ -111,6 +111,7 @@ fn gateway_ip(gateway: NodeId) -> IpAddr {
 fn ranking(gateways: &[NodeId]) -> MinerGatewayRanking {
     let count = u32::try_from(gateways.len()).expect("a test ranks few gateways");
     MinerGatewayRanking {
+        always_preferred: Vec::new(),
         gateways: gateways
             .iter()
             .zip((1..=count).rev())
@@ -251,6 +252,24 @@ async fn unknown_gateways_and_the_node_itself_are_neither_held_nor_dialed() {
     assert_eq!(held.members, known);
     assert_eq!(dialed(&round.preferred), known);
     assert_eq!(state.in_flight_node_ids(), known);
+    node.shutdown().await;
+}
+
+/// A template node whose coinbases name its pool's relay ranks the relay like any other
+/// gateway: only the node's own ID is left out.
+#[tokio::test(start_paused = true)]
+async fn the_relay_a_node_names_is_held_and_dialed_but_its_own_id_is_not() {
+    let (node, mut io, ranking_tx) = dialer(9240).await;
+    let relay = known_gateways(&node, 1).await;
+    let own = node.endpoint().local_node_id();
+    // The node's own blocks name the relay, so the relay ranks first.
+    ranking_tx.send_replace(ranking(&[relay[0], own]));
+    let mut state = CandidateDialerState::new(DIAL_BACKOFF);
+
+    let round = io.admit_round(&mut state, &[], Instant::now()).await;
+
+    assert_eq!(held(&node.endpoint()).members, relay);
+    assert_eq!(dialed(&round.preferred), relay);
     node.shutdown().await;
 }
 

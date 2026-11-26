@@ -1522,3 +1522,68 @@ fn publication_fails_closed_when_a_proved_owner_shares_a_resolved_gateway_id() {
     assert!(preferred_set(&handler).is_empty());
     assert_eq!(hold(&handler), 0);
 }
+
+/// An ID the operator configures the node to always prefer keeps
+/// its place while v2 networking knows nothing of it. With the ordinary
+/// inbound share full, it is admitted before its ID is read and granted the
+/// held place once it is, while an ordinary caller is still refused.
+#[test]
+fn an_always_preferred_caller_passes_a_full_inbound_share() {
+    let handler = handler(40, 2);
+    let configured = new_node();
+    let gateway = new_node();
+    handler.publish_gateway_ranking([
+        RankedGateway::resolved(gateway, 10, GatewayStanding::Dialable),
+        RankedGateway::always_preferred(GatewayId::from_node_id(configured.as_bytes()), 0),
+    ]);
+    assert_eq!(hold(&handler), 2);
+    assert_eq!(
+        preferred_set(&handler),
+        [gateway],
+        "the configured ID's place waits for it"
+    );
+    let _gateway = handler.claim_connection(gateway, false).expect("held");
+    let _inbound = fill(&handler, 30, true);
+    assert_eq!(ordinary(&handler, true), Err(SlotRefusal::InboundShare));
+
+    assert!(
+        admits_a_caller(&handler, 1),
+        "its place is free before the caller's ID is known"
+    );
+    let _configured = handler
+        .claim_connection(configured, true)
+        .expect("the configured ID calls into its held place");
+    assert_eq!(preferred_set(&handler), [configured, gateway]);
+    assert_eq!(
+        split(&handler),
+        SlotSplit {
+            preferred: 2,
+            ordinary: 30,
+            ordinary_inbound: 30,
+        }
+    );
+    assert!(
+        !admits_a_caller(&handler, 2),
+        "no held place is free and the inbound share is full"
+    );
+}
+
+/// Startup warns when the funded places are no more than the always-preferred
+/// IDs, with its own message when none is funded, and says nothing when a
+/// place is left for ranked gateways or no ID is always preferred.
+#[test]
+fn startup_warns_when_always_preferred_ids_fill_the_funded_places() {
+    let none_funded = unfunded_always_preferred_warning(2, 0).expect("no place is funded");
+    assert!(none_funded.contains("funds no preferred connection places"));
+
+    let filled = unfunded_always_preferred_warning(2, 2).expect("the IDs take every place");
+    assert!(filled.contains("those IDs take every place"));
+    assert_eq!(
+        unfunded_always_preferred_warning(3, 2),
+        Some(filled),
+        "fewer places than IDs warns the same way"
+    );
+
+    assert_eq!(unfunded_always_preferred_warning(2, 3), None);
+    assert_eq!(unfunded_always_preferred_warning(0, 0), None);
+}

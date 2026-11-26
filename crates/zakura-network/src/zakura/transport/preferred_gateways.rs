@@ -381,6 +381,8 @@ pub struct PreferredGateways {
     hold: usize,
     /// The available gateways that fill the held places, in rank order.
     set: Vec<NodeId>,
+    /// Rank-order choices to retry when an ordinary inbound place frees.
+    deferred: Option<Vec<NodeId>>,
 }
 
 impl PreferredGateways {
@@ -443,12 +445,13 @@ impl PreferredGateways {
             hold_limit,
             hold,
             set,
+            deferred: None,
         }
     }
 
     /// Lets the next ranked gateway take a place while a dialable member waits
     /// for its rollback probe. A waiting gateway still contributes to the hold.
-    pub(super) fn defer_dials(&mut self, waiting: impl Fn(NodeId) -> bool) {
+    pub(super) fn defer_dials(&mut self, waiting: impl Fn(NodeId) -> bool) -> bool {
         let mut changed = false;
         for gateway in &mut self.ranking {
             if let GatewayMatch::One((node, GatewayStanding::Dialable)) = gateway.resolution() {
@@ -462,7 +465,62 @@ impl PreferredGateways {
             // Only dialable entries moved to backoff. The ordering, including
             // connected tie breakers, and the number of matched gateways stay.
             self.set = Self::members(&self.ranking, self.hold);
+            self.deferred = None;
         }
+        changed
+    }
+
+    /// Retains eligible inbound incumbents when moving them to ordinary slots
+    /// would exceed the inbound share. The ranking and TLS ownership stay current.
+    pub(super) fn preserve_inbound_places(
+        &mut self,
+        incumbents: &[NodeId],
+        required: usize,
+        inbound: impl Fn(&NodeId) -> bool,
+    ) {
+        if required == 0 {
+            return;
+        }
+        let reserved = self.set.iter().filter(|node| inbound(node)).count();
+        let mut needed = required.saturating_sub(reserved);
+        if needed == 0 {
+            return;
+        }
+        let desired = self.set.clone();
+        // Prefer the highest-ranked eligible incumbent and displace the
+        // lowest-ranked member whose place protects no inbound connection.
+        for node in self
+            .ranking
+            .iter()
+            .filter_map(RankedGateway::available_node)
+        {
+            if !incumbents.contains(&node) || self.set.contains(&node) || !inbound(&node) {
+                continue;
+            }
+            let Some(index) = self.set.iter().rposition(|member| !inbound(member)) else {
+                break;
+            };
+            self.set[index] = node;
+            needed -= 1;
+            if needed == 0 {
+                break;
+            }
+        }
+        if self.set != desired {
+            self.set.sort_by_key(|node| {
+                self.ranking
+                    .iter()
+                    .position(|g| g.available_node() == Some(*node))
+            });
+            self.deferred = Some(desired);
+        }
+    }
+
+    /// Restores the desired members and returns the incumbents to check
+    /// again after a release. An ordinary release usually has nothing to do.
+    pub(super) fn retry_deferred(&mut self) -> Option<Vec<NodeId>> {
+        let desired = self.deferred.take()?;
+        Some(std::mem::replace(&mut self.set, desired))
     }
 
     /// The nodes of the available gateways in `ranking`, in its order and

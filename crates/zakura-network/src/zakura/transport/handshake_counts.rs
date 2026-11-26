@@ -114,6 +114,8 @@ pub struct HandshakeCounts {
     /// lock as the slots, so a check never sees a set and slot counts from
     /// different moments.
     preferred: PreferredGateways,
+    /// Ordinary inbound share of the node that published this ranking.
+    inbound_limit: usize,
     /// Charges of attempts whose source address was validated, by a Retry
     /// token, before TLS.
     validated_cadence: CadenceLedger,
@@ -350,7 +352,9 @@ impl HandshakeCounts {
         cap: usize,
     ) -> Result<SlotClass, SlotRefusal> {
         let formed = self.connected_ranking(caller, None);
-        let class = if let Some(formed) = formed {
+        let class = if let Some(mut formed) = formed {
+            self.connections
+                .protect_inbound(&mut formed, self.preferred.set(), inbound_share(cap));
             let class = self.connections.claim_under_new_ranking(
                 caller.id(),
                 cap,
@@ -387,7 +391,11 @@ impl HandshakeCounts {
         cap: usize,
     ) -> Result<(), SlotRefusal> {
         let node = connected.id();
-        let formed = self.connected_ranking(connected, Some(claimed));
+        let mut formed = self.connected_ranking(connected, Some(claimed));
+        if let Some(next) = &mut formed {
+            self.connections
+                .protect_inbound(next, self.preferred.set(), inbound_share(cap));
+        }
         self.connections.settle_outbound(
             claimed,
             node,
@@ -455,7 +463,12 @@ impl HandshakeCounts {
     /// Replaces the preferred gateways the slot checks use. Slots already
     /// held stay held; only how they count changes.
     /// TLS ownership is sampled here, since discovery prepared its snapshot before this lock.
-    pub fn publish_gateway_ranking(&mut self, ranking: &GatewayRanking, hold_limit: usize) {
+    pub fn publish_gateway_ranking(
+        &mut self,
+        ranking: &GatewayRanking,
+        hold_limit: usize,
+        connection_cap: usize,
+    ) {
         let mut live = ranking.candidates(self.owners());
         // A node discovery found connected may have lost its proof since.
         for gateway in &mut live {
@@ -475,8 +488,12 @@ impl HandshakeCounts {
         GatewayRanking::connect_owners(&mut live, self.owners(), |id| {
             self.connections.of_node(id).total() > 0
         });
-        self.preferred =
+        self.inbound_limit = inbound_share(connection_cap);
+        let mut next =
             PreferredGateways::form_with_incumbents(live, hold_limit, self.preferred.set());
+        self.connections
+            .protect_inbound(&mut next, self.preferred.set(), self.inbound_limit);
+        self.preferred = next;
     }
 
     /// Yields places that moved gateways cannot use in this ranking. The
@@ -489,7 +506,7 @@ impl HandshakeCounts {
     ) {
         while self.free_ordinary_connections(cap) == 0 {
             let preferred = self.preferred.held_places();
-            self.preferred.defer_dials(|dialed| {
+            let changed = self.preferred.defer_dials(|dialed| {
                 moves
                     .cooling_destination(dialed, now)
                     .is_some_and(|current| {
@@ -497,6 +514,13 @@ impl HandshakeCounts {
                             || self.connections.of_node(&current).total() > 0
                     })
             });
+            if changed {
+                self.connections.protect_inbound(
+                    &mut self.preferred,
+                    &preferred.members,
+                    self.inbound_limit,
+                );
+            }
             // A deferred destination can leave another gateway unable to dial.
             // Each change puts at least one more ranked gateway into backoff.
             if self.preferred.set() == preferred.members {
@@ -554,8 +578,13 @@ impl HandshakeCounts {
         if !self.is_authenticated(&node) {
             self.proven_earlier.remove(&node);
         }
-        if let Some(formed) = updated {
+        if let Some(mut formed) = updated {
+            self.connections
+                .protect_inbound(&mut formed, self.preferred.set(), self.inbound_limit);
             self.preferred = formed;
+        } else if let Some(incumbents) = self.preferred.retry_deferred() {
+            self.connections
+                .protect_inbound(&mut self.preferred, &incumbents, self.inbound_limit);
         }
     }
 

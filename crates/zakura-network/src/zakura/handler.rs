@@ -3921,7 +3921,11 @@ impl ZakuraProtocolHandler {
         let ranking = ranking.into_iter().collect();
         let moved = self.supervisor.moved_tx.borrow();
         let mut counts = self.supervisor.ip_slots.counts();
-        counts.publish_gateway_ranking(&ranking, self.limits.max_preferred_connections);
+        counts.publish_gateway_ranking(
+            &ranking,
+            self.limits.max_preferred_connections,
+            self.limits.max_connections,
+        );
         counts.defer_gateway_rollbacks(&moved, ordinary_cap, Instant::now());
         let hold = counts.preferred_gateways().hold();
         let split = counts.slot_split();

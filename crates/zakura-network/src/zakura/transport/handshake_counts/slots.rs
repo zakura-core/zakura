@@ -94,6 +94,21 @@ impl ConnectionSlots {
         self.inbound
     }
 
+    /// Each inbound connection above the ordinary share needs a preferred
+    /// place. Keep eligible incumbents in those places across a ranking change.
+    pub(super) fn protect_inbound(
+        &self,
+        next: &mut PreferredGateways,
+        incumbents: &[NodeId],
+        inbound_limit: usize,
+    ) {
+        next.preserve_inbound_places(
+            incumbents,
+            self.inbound.saturating_sub(inbound_limit),
+            |node| self.of_node(node).inbound > 0,
+        );
+    }
+
     /// Splits the slots in use by `preferred`'s set, with one lookup per
     /// member.
     pub(super) fn split(&self, preferred: &PreferredGateways) -> SlotSplit {

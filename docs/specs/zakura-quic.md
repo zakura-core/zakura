@@ -938,7 +938,11 @@ is today's Zakura logic.
      answers keeps under its own ID when its handshake proved the gateway's
      ID (DIAL-10). A dial charged to the last authenticated ID can be
      answered by a node that didn't, and a second connected node of one key
-     holder makes its gateway ambiguous. When counting a displaced slot
+     holder makes its gateway ambiguous. A higher-ranked gateway that fits
+     in an ordinary outbound slot MUST stay connected there if promoting it
+     would move an eligible incumbent above the ordinary inbound share.
+     Ranking updates and slot releases defer the same swap until it fits.
+     When counting a displaced slot
      as ordinary would exceed the ordinary cap or its inbound share,
      the dial MUST close before its control handshake. Discovery records a
      local limit. A maintained dial counts the completed TLS attempt as a

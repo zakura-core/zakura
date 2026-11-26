@@ -1289,6 +1289,50 @@ fn gateway_promotion_preserves_the_ordinary_inbound_share() {
     }
 }
 
+/// The higher-ranked gateway can authenticate and stay connected outbound
+/// while an inbound incumbent needs the held place. A ranking publication
+/// and a ranked dial's cancellation must respect the same inbound share.
+#[test]
+fn a_connected_gateway_waits_for_room_to_promote_its_outbound_slot() {
+    let handler = handler(8, 1);
+    let (higher, incumbent, pending) = (new_node(), new_node(), new_node());
+    let ranking = [
+        (higher, GatewayStanding::Backoff),
+        (incumbent, GatewayStanding::Dialable),
+        (pending, GatewayStanding::Dialable),
+    ];
+    publish(&handler, &ranking);
+    let _incumbent = handler.claim_connection(incumbent, true).unwrap();
+    let mut peers = fill(&handler, 6, true);
+    let pending_dial = handler.claim_connection(pending, false).unwrap();
+    let current = new_node();
+    let mut dial = handler.claim_connection(higher, false).unwrap();
+    dial.outbound_connected(ProvenNode::new(current, &[higher]))
+        .expect("the gateway can keep its ordinary outbound slot");
+    let check = || {
+        assert_eq!(preferred_set(&handler), [incumbent]);
+        assert_eq!(split(&handler).ordinary_inbound, 6);
+        assert_eq!(
+            handler
+                .supervisor
+                .ip_slots
+                .counts()
+                .node_connections(&current)
+                .outbound,
+            1
+        );
+    };
+    check();
+    publish(&handler, &ranking);
+    check();
+    drop(pending_dial);
+    check();
+
+    peers.pop();
+    assert_eq!(preferred_set(&handler), [current]);
+    assert_eq!(split(&handler).ordinary_inbound, 6);
+}
+
 /// A ranked caller that already holds a slot re-forms the set, but its
 /// second slot is ordinary; when the ordinary slots are full the claim is
 /// refused for the hold and the set is restored.

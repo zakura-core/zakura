@@ -255,8 +255,8 @@ pub(super) fn check_view(view: &MeshView, facts: &NodeFacts) -> Vec<String> {
     // ambiguous, except that a template node keeps its place in that order
     // even when it is not available.
     if info.gateways.windows(2).any(|pair| {
-        (!pair[0].template_node && pair[1].template_node)
-            || (pair[0].template_node == pair[1].template_node && pair[0].blocks < pair[1].blocks)
+        let (higher, lower) = (&pair[0], &pair[1]);
+        !higher.template_node && (lower.template_node || higher.blocks < lower.blocks)
     }) {
         broken.push("5: the gateways are not in rank order".into());
     }

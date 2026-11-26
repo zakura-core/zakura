@@ -282,7 +282,8 @@ proptest! {
             prop_assert_eq!(formed.set(), &available[..formed.hold().min(available.len())]);
         }
         let ranked_in_order = formed.ranking.windows(2).all(|pair| {
-            (pair[0].always_preferred, pair[0].blocks) >= (pair[1].always_preferred, pair[1].blocks)
+            let (higher, lower) = (&pair[0], &pair[1]);
+            higher.always_preferred || (!lower.always_preferred && higher.blocks >= lower.blocks)
         });
         prop_assert!(ranked_in_order);
     }
@@ -746,6 +747,32 @@ fn an_ambiguous_always_preferred_id_holds_nothing() {
 
     assert!(formed.set().is_empty());
     assert_eq!(formed.hold(), 0);
+}
+
+/// Blocks naming an offline template do not displace a connected template
+/// when the relay can fund only one of their places.
+#[test]
+fn a_connected_template_keeps_its_place_when_blocks_name_an_offline_template() {
+    let connected = raw_node(1, 0x00);
+    let offline = GatewayId::from_node_id(raw_node(2, 0x00).as_bytes());
+    for blocks in [0, 1] {
+        let places = PreferredGateways::form(
+            [
+                RankedGateway::always_preferred(offline, blocks),
+                always_preferred(connected).connected_as(connected),
+            ],
+            1,
+        );
+        assert_eq!(places.hold(), 1);
+        assert_eq!(places.set(), &[connected]);
+        assert_eq!(
+            places
+                .places()
+                .find(|(entry, _)| entry.gateway() == offline)
+                .map(|(entry, _)| entry.blocks()),
+            Some(blocks),
+        );
+    }
 }
 
 /// An always-preferred ID that disconnects goes into backoff but keeps its

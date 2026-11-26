@@ -9,8 +9,8 @@
 //!
 //! The operator can also configure the node to always prefer a few IDs,
 //! whatever the blocks say. Those rank ahead of every gateway the blocks name,
-//! and each keeps its place even while it is unreachable, so it can always
-//! call in.
+//! and a funded place stays reserved even while its peer is unreachable.
+//! Inbound callers still share the normal handshake limits.
 //!
 //! A ranked gateway ID names whichever node v2 networking knows with an ID
 //! that starts with it. When it knows two or more, it cannot tell which one
@@ -172,10 +172,14 @@ impl RankedGateway {
         self.always_preferred
     }
 
-    /// The order gateways rank in, highest first: the ones the node always
-    /// prefers, then by block count.
+    /// Configured IDs share the highest rank. Block counts rank only the
+    /// other gateways, so blocks cannot shift a configured reservation.
     fn rank(&self) -> (bool, u32) {
-        (self.always_preferred, self.blocks)
+        if self.always_preferred {
+            (true, 0)
+        } else {
+            (false, self.blocks)
+        }
     }
 
     /// The node the gateway ID names, and how v2 networking can reach it.
@@ -219,8 +223,7 @@ impl RankedGateway {
     }
 
     /// Whether the gateway keeps a held place even while it is unreachable:
-    /// the node always prefers it, and it is not ambiguous. Its place waits
-    /// for it, so it can call in whenever it connects.
+    /// the node always prefers it, and it is not ambiguous.
     fn keeps_its_place(&self) -> bool {
         self.always_preferred && self.resolution != GatewayMatch::Several
     }
@@ -457,9 +460,9 @@ impl PreferredGateways {
     /// up to the ceiling, so a gateway in backoff still counts toward the
     /// shared hold. The set is the available gateways, in rank order, up to
     /// the hold. A gateway the node always prefers keeps its place in that
-    /// order even while it is unreachable, so no lower gateway fills it, and
-    /// it can call in whenever it connects. An unreachable one costs at most
-    /// that one place. They take places first, so when `hold_limit` is no
+    /// order even while it is unreachable, so no lower gateway fills it.
+    /// An unreachable one costs at most that one place. They take places
+    /// first, so when `hold_limit` is no
     /// more than their number, as when a small budget funds fewer than the
     /// ten places the default budget funds, no ranked gateway gets one.
     /// Multiple IDs proved by the same node share one place.

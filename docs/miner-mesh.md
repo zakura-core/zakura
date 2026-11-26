@@ -106,9 +106,8 @@ with the node's own ID. An empty list, the default, names the node itself.
 
 `mining.miner_mesh_template_nodes` on the relay lists the template node the
 same way, by the `node_id` its `getminermeshinfo` reports or the first 40 hex
-digits of it. No block names a template node, so without this line the relay
-holds no place for it and refuses its connection once the relay's ordinary
-inbound share is full.
+digits of it. This reserves room for the template node independently of
+which gateways the pool's blocks name.
 
 The two nodes need different things:
 
@@ -133,8 +132,9 @@ address. More highly ranked gateways can take all those places.
 On the relay, each listed template node gets priority over block-ranked
 gateways. Within the funded places, an unambiguous template ID keeps its place
 even while offline, so the template node can call in when ordinary inbound
-places are full. The relay can also dial the template node if it knows a
-reachable address.
+places are full. The caller must first complete a handshake, which shares
+the relay's normal per-IP and global limits. The relay can also dial the
+template node if it knows a reachable address.
 
 `zakurad` refuses to start with `miner_mesh_template_nodes` set unless
 `miner_mesh` is set and the node is its own gateway (`miner_mesh_gateways` is
@@ -145,8 +145,10 @@ funds to the gateways recent blocks name. A smaller peer memory budget, or a
 larger `network.zakura.max_connections`, funds fewer places, and the template
 nodes may then take all of them: `zakurad` warns at startup when the funded
 places are no more than the template nodes, and when none are funded at all,
-so no template node gets a place. A gateway with a miner address may list
-template nodes too.
+so no template node gets a place. When only some listed templates fit,
+connected templates take priority. Blocks naming a template still appear
+in its reported count and have no effect on its reservation. A gateway
+with a miner address may list template nodes too.
 
 `getminermeshinfo` on the template node lists the relay's gateway ID in
 `announced_gateways`, which is how an operator confirms the setting. On the

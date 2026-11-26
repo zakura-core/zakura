@@ -126,7 +126,7 @@ pub struct MeshGateway {
     /// Whether this is a template node `mining.miner_mesh_template_nodes`
     /// lists. Within the funded places, the node holds a place for a
     /// template node whatever the blocks say and whatever its `state`, unless
-    /// it is `ambiguous`, so the template node can always connect in.
+    /// it is `ambiguous`. Normal inbound handshake limits apply.
     pub template_node: bool,
 
     /// Whether the gateway is connected over v2 now.

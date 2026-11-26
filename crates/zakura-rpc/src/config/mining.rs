@@ -104,11 +104,9 @@ pub struct Config {
     /// The template nodes this relay node keeps connection places for: the pool's internal
     /// nodes whose coinbases name this node through their own [`Self::miner_mesh_gateways`].
     ///
-    /// No block names a template node, so without this the relay holds no place for it, and
-    /// refuses its connection once the ordinary inbound share is full. Each node listed here
-    /// ranks ahead of the gateways recent blocks name and keeps one held place whether or not
-    /// it is connected, so it can always call in. One that is offline costs only its own
-    /// place; the ranked gateways fill the rest.
+    /// Listed nodes rank ahead of gateways chosen by block count. Within the funded places,
+    /// an unambiguous template ID keeps its place even while offline. Once authenticated, it
+    /// can use that place when ordinary inbound slots are full. Normal handshake limits apply.
     ///
     /// Each entry is a template node's v2 node ID in hex, as its `getminermeshinfo` reports
     /// it, or the first 40 hex digits of it.

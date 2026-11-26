@@ -11,7 +11,7 @@ use zakura_rt::{
     time::Instant,
 };
 
-use super::super::admission::{commit_window_top, request_priority, RequestPriority};
+use super::super::admission::{request_priority, RequestPriority};
 use super::{block, OwnerLease, WorkItem, WorkQueue};
 #[cfg(any(test, zakura_sim))]
 use crate::zakura::block_sync::block_sync_observe::{BlockEvent, RequestStep};
@@ -226,14 +226,15 @@ impl TakenRequest {
     }
 
     /// Admit the retained take for `conn_id`. A take that starts in the
-    /// commit window (`height <= verified_tip + 401`) leases from the reserved
-    /// `Consumer::Consensus`; one above it leases from bulk `Consumer::BlockSync`
-    /// (`02 §4`). The pool call runs after the queue lock is released; publication
-    /// rechecks the claim under the lock.
+    /// commit window (`height <= commit_window_top`, see
+    /// [`CommitWindow`](super::super::admission::CommitWindow)) leases from the
+    /// reserved `Consumer::Consensus`; one above it leases from bulk
+    /// `Consumer::BlockSync` (`02 §4`). The pool call runs after the queue lock
+    /// is released; publication rechecks the claim under the lock.
     pub(in crate::zakura::block_sync) fn admit_for_connection(
         mut self,
         download_floor: block::Height,
-        verified_tip: block::Height,
+        commit_window_top: block::Height,
         conn_id: ZakuraConnId,
         conn_credit: Option<ConnectionCredit>,
         cancel: CancellationToken,
@@ -241,7 +242,7 @@ impl TakenRequest {
         let (first_height, first_item) = self.items.first().ok_or(AdmitRefusal::Empty)?;
         let owner = first_item.owner.ok_or(AdmitRefusal::MissingOwner)?;
         let priority = request_priority(download_floor, *first_height);
-        let consumer = if *first_height <= commit_window_top(verified_tip) {
+        let consumer = if *first_height <= commit_window_top {
             Consumer::Consensus
         } else {
             Consumer::BlockSync

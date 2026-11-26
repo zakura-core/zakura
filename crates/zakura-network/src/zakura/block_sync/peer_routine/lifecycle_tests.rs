@@ -78,7 +78,8 @@ async fn a_stale_session_cleanup_leaves_the_replacement_request() {
         )],
     );
     let registry = Arc::new(PeerRegistry::new());
-    let (_view_tx, view_rx) = watch::channel(initial_view(genesis_frontiers()));
+    let (_view_tx, view_rx) =
+        watch::channel(initial_view(genesis_frontiers(), &Default::default()));
     let (mut old, _old_outbound) = shared_floor_routine(7, &work, &registry, view_rx.clone());
     old.try_fill();
     let old_owner = work.owner_for_height(block::Height(1)).unwrap();
@@ -153,7 +154,7 @@ async fn a_reset_that_clears_the_probe_cap_republishes_free_slots() {
         )],
     );
     let registry = Arc::new(PeerRegistry::new());
-    let (view_tx, view_rx) = watch::channel(initial_view(genesis_frontiers()));
+    let (view_tx, view_rx) = watch::channel(initial_view(genesis_frontiers(), &Default::default()));
     let (mut routine, _outbound) = shared_floor_routine(7, &work, &registry, view_rx);
     assert_eq!(routine.try_fill().sent, 1);
     assert!(

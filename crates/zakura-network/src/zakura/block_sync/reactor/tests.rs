@@ -148,7 +148,7 @@ proptest! {
                     );
                     prop_assert_eq!(taken.items().len(), 1);
                     let request = taken
-                        .admit_for_connection(block::Height(0), block::Height(0), 0, None, CancellationToken::new())
+                        .admit_for_connection(block::Height(0), crate::zakura::CommitWindow::default().top(block::Height(0)), 0, None, CancellationToken::new())
                         .expect("the test budget covers every height");
                     let owner = request.owner();
                     let deadline = start + Duration::from_millis(deadline_ms);

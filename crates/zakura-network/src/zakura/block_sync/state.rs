@@ -127,6 +127,9 @@ pub struct BlockSyncStartup {
     /// above it is capped at `BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES` of
     /// decoded blocks. `None` keeps the count-only window.
     pub max_checkpoint_height: Option<block::Height>,
+    /// Where the commit window ends above the verified tip. Production builds
+    /// it from the same checkpoint list as `max_checkpoint_height`.
+    pub commit_window: super::admission::CommitWindow,
     /// Optional shared body-claim set owned with BPv1.
     /// Native block sync skips any hash with an unexpired claim and re-queries
     /// when a claim releases with `Fallback` or expires.
@@ -163,6 +166,7 @@ impl BlockSyncStartup {
             state_queries_enabled: true,
             trace: ZakuraTrace::noop(),
             max_checkpoint_height: None,
+            commit_window: Default::default(),
             body_claims: None,
             memory,
             #[cfg(any(test, zakura_sim))]
@@ -194,6 +198,7 @@ impl BlockSyncStartup {
             state_queries_enabled: true,
             trace: ZakuraTrace::noop(),
             max_checkpoint_height: None,
+            commit_window: Default::default(),
             body_claims: None,
             memory,
             #[cfg(any(test, zakura_sim))]
@@ -259,6 +264,7 @@ impl BlockSyncStartup {
             state_queries_enabled: false,
             trace: ZakuraTrace::noop(),
             max_checkpoint_height: None,
+            commit_window: Default::default(),
             body_claims: None,
             memory,
             #[cfg(any(test, zakura_sim))]

@@ -2996,7 +2996,7 @@ fn exempt_take_never_spans_the_commit_window_boundary() {
     // Consensus.
     let snapshot = super::admission::AdmissionSnapshot {
         download_floor: block::Height(10),
-        verified_block_tip: block::Height(10),
+        commit_window_top: crate::zakura::CommitWindow::default().top(block::Height(10)),
         reorder_buffered_bytes: 0,
         reorder_buffered_blocks: 0,
         applying_buffered_bytes: 0,
@@ -3267,7 +3267,7 @@ async fn floor_watchdog_only_avoids_requests_that_started_writing() {
         let write = taken
             .admit_for_connection(
                 block::Height(0),
-                block::Height(0),
+                crate::zakura::CommitWindow::default().top(block::Height(0)),
                 0,
                 None,
                 CancellationToken::new(),
@@ -4723,7 +4723,7 @@ impl TestSequencer {
             .materialize(
                 facts.id,
                 &test_decoded_pool(),
-                admission::submission_decode_admission(self.policy.verified_tip(), height),
+                admission::submission_decode_admission(self.policy.commit_window_top(), height),
                 &super::work_queue::test_memory_pool(1 << 40),
             )
             .unwrap();
@@ -5191,7 +5191,7 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
     let (body_tx, body_rx) = mpsc::channel(body_channel_capacity);
     let (control_tx, control_rx) = mpsc::unbounded_channel();
     let (actions_tx, mut actions_rx) = mpsc::channel(submission_limit + 128);
-    let (view_tx, mut view_rx) = watch::channel(initial_view(frontiers));
+    let (view_tx, mut view_rx) = watch::channel(initial_view(frontiers, &Default::default()));
     let budget = ByteBudget::new(1);
     let task = SequencerIO::new(
         Sequencer::new(block::Height(0), submission_limit)
@@ -5442,7 +5442,7 @@ impl CappedSequencerTask {
         let (body_tx, body_rx) = mpsc::channel(8);
         let (control_tx, control_rx) = mpsc::unbounded_channel();
         let (actions_tx, actions_rx) = mpsc::channel(8);
-        let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+        let (view_tx, _view_rx) = watch::channel(initial_view(frontiers, &Default::default()));
         let budget = ByteBudget::new(1);
         let task = SequencerIO::new(
             Sequencer::new(block::Height(0), MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES)
@@ -5905,7 +5905,7 @@ async fn detached_checkpoint_duplicates_refill_current_submission_window() {
     let (body_tx, body_rx) = mpsc::channel(body_channel_capacity);
     let (control_tx, control_rx) = mpsc::unbounded_channel();
     let (actions_tx, mut actions_rx) = mpsc::channel(submission_limit + DETACHED_PREFIX);
-    let (view_tx, mut view_rx) = watch::channel(initial_view(frontiers));
+    let (view_tx, mut view_rx) = watch::channel(initial_view(frontiers, &Default::default()));
     let budget = ByteBudget::new(1);
     let task = SequencerIO::new(
         Sequencer::new(block::Height(0), submission_limit),
@@ -6126,7 +6126,7 @@ impl DetachedWindow {
         let (body_tx, body_rx) = mpsc::channel(submission_limit);
         let (control_tx, control_rx) = mpsc::unbounded_channel();
         let (actions_tx, actions_rx) = mpsc::channel(2 * submission_limit);
-        let (view_tx, view_rx) = watch::channel(initial_view(frontiers));
+        let (view_tx, view_rx) = watch::channel(initial_view(frontiers, &Default::default()));
         let body_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let body_input_decoded_attributed_memory_bytes =
             Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -7138,7 +7138,7 @@ async fn reactor_handle_observes_its_actual_request_budget_closing() {
         )
         .admit_for_connection(
             block::Height(0),
-            block::Height(0),
+            crate::zakura::CommitWindow::default().top(block::Height(0)),
             0,
             None,
             CancellationToken::new(),
@@ -7182,7 +7182,7 @@ proptest::proptest! {
         // The download floor sits above the commit window (verified_tip 10 + 401 = 411).
         let snapshot = super::admission::AdmissionSnapshot {
             download_floor: block::Height(600),
-            verified_block_tip: block::Height(10),
+            commit_window_top: crate::zakura::CommitWindow::default().top(block::Height(10)),
             reorder_buffered_bytes: 0,
             reorder_buffered_blocks: reorder_blocks,
             applying_buffered_bytes: 0,

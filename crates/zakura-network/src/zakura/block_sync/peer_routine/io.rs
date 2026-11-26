@@ -197,7 +197,7 @@ impl PeerIO {
             self.work.reserved_above(view.download_floor);
         let snapshot = AdmissionSnapshot {
             download_floor: view.download_floor,
-            verified_block_tip: view.verified_tip,
+            commit_window_top: view.commit_window_top,
             reorder_buffered_bytes: view.reorder_buffered_bytes,
             reorder_buffered_blocks: view.reorder_len,
             applying_buffered_bytes: view.applying_buffered_bytes,

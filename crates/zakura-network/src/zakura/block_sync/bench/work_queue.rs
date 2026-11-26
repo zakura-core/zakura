@@ -93,7 +93,7 @@ fn admitted_request(count: u32, bytes: u32) -> (Arc<WorkQueue>, ByteBudget, Unpu
     let admitted = taken
         .admit_for_connection(
             block::Height(0),
-            block::Height(0),
+            crate::zakura::CommitWindow::default().top(block::Height(0)),
             0,
             None,
             CancellationToken::new(),
@@ -222,7 +222,7 @@ impl BenchWorkChurn {
         assert_eq!(taken.items().len(), usize::try_from(self.count).unwrap());
         let admitted = match taken.admit_for_connection(
             block::Height(0),
-            block::Height(0),
+            crate::zakura::CommitWindow::default().top(block::Height(0)),
             0,
             None,
             CancellationToken::new(),

@@ -128,14 +128,19 @@ sizing.
 
 ### The commit window
 
-Heights in `(verified_tip, verified_tip + 401]` are the **commit window**
-(`COMMIT_WINDOW_EXEMPT_SPAN_BLOCKS` = `MAX_CHECKPOINT_HEIGHT_GAP + 1`). The checkpoint
-verifier resolves a range only once the _whole_ range (up to 401 blocks) is submitted,
-while the verified tip stays pinned to the previous checkpoint. So every block of the
-active range must stay fundable even when the look-ahead budget is full — otherwise the
-range can never assemble and sync wedges. The span is deliberately a constant, not
-`config.submitted_apply_limit()`: that knob has no ceiling, and a huge configured
-submit window would widen the exemption until the memory gate is disabled.
+Heights in `(verified_tip, window_top]` are the **commit window** (`CommitWindow`).
+Below the last checkpoint, `window_top` is the next checkpoint above the verified tip.
+The checkpoint verifier resolves a range only once the _whole_ range is submitted,
+while the verified tip stays pinned to the previous checkpoint, so every block of the
+active range must stay fundable even when the look-ahead budget is full. Otherwise the
+range can never assemble and sync wedges. A restart in the middle of a range resumes
+with the same `window_top`. At and above the last checkpoint, blocks verify one at a
+time, and the window covers `SEMANTIC_COMMIT_WINDOW_BLOCKS` (53) heights: as many
+maximum-size blocks as `BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES` holds at admission's
+charge. A startup without a checkpoint list uses `MAX_CHECKPOINT_HEIGHT_GAP + 1`
+heights above every tip. The window never follows `config.submitted_apply_limit()`:
+that knob has no ceiling, and a huge configured submit window would widen the window
+until the memory gate is disabled.
 
 Because the window is anchored to the **verified tip**, it advances only on commit. The
 download floor moves on every download and can run far ahead of commit, but any such
@@ -145,7 +150,7 @@ height is just another gated height.
 
 | Condition | Outcome | `take_high` | `max_request_bytes` |
 | --- | --- | --- | --- |
-| `start ≤ verified_tip + 401` (in-window) | always `Admit` | `min(servable_high, window_top)` | `min(budget_available, response_byte_cap)`; Floor priority floors it at 1 |
+| `start ≤ window_top` (in-window) | always `Admit` | `min(servable_high, window_top)` | `min(budget_available, response_byte_cap)`; Floor priority floors it at 1 |
 | `start > window` and gate full (bytes **or** blocks), or wire headroom rounds to 0 | `LookaheadAtCap` | — | — |
 | `start > window`, gate open | `Admit` | `servable_high` | `min(budget_available, remaining_wire, response_byte_cap)` |
 | any admitted sizing that still comes to 0 bytes (in-flight budget spent, non-floor) | `InflightBudgetEmpty` | — | — |

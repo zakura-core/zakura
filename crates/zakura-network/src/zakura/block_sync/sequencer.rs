@@ -18,7 +18,13 @@
 
 use super::events::BlockSupplier;
 
-use super::{admission::DESERIALIZED_MEM_FACTOR, events::BlockApplyToken, reorder::*, state::*, *};
+use super::{
+    admission::{CommitWindow, DESERIALIZED_MEM_FACTOR},
+    events::BlockApplyToken,
+    reorder::*,
+    state::*,
+    *,
+};
 
 /// A received body draining contiguously toward the verified tip, awaiting (or
 /// undergoing) verifier submission.
@@ -199,6 +205,8 @@ pub(super) struct Sequencer {
     submitted_apply_limit: usize,
     /// Decoded-byte cap above the last checkpoint, or `None` for a count-only window.
     decoded_window_cap: Option<DecodedWindowCap>,
+    /// Where the commit window ends above `verified_block_tip`.
+    commit_window: CommitWindow,
 }
 
 /// Decoded-byte cap on the submission window; see
@@ -248,7 +256,14 @@ impl Sequencer {
             verified_block_tip,
             submitted_apply_limit,
             decoded_window_cap: None,
+            commit_window: CommitWindow::default(),
         }
+    }
+
+    /// End the commit window where `commit_window` says.
+    pub(super) fn with_commit_window(mut self, commit_window: CommitWindow) -> Self {
+        self.commit_window = commit_window;
+        self
     }
 
     /// Cap the decoded heap of the submission window at `max_decoded_bytes` for
@@ -291,6 +306,11 @@ impl Sequencer {
 
     pub(super) fn verified_tip(&self) -> block::Height {
         self.verified_block_tip
+    }
+
+    /// The top of the commit window above the verified tip.
+    pub(super) fn commit_window_top(&self) -> block::Height {
+        self.commit_window.top(self.verified_block_tip)
     }
 
     #[cfg(any(test, feature = "p2p-fuzz"))]

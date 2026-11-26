@@ -231,7 +231,7 @@ fn far_ahead_headers_hold_an_empty_node() {
         ReactorProgress::new(
             frontiers(0),
             (block::Height(0), header_hash(0)),
-            initial_view(frontiers(0)),
+            initial_view(frontiers(0), &Default::default()),
         ),
         BootstrapGate::new(false, None),
         None,

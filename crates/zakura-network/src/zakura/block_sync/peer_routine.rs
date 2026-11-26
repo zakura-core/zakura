@@ -1772,7 +1772,7 @@ mod tests {
                 out_send,
                 failure_cause: None,
                 channels: 16,
-                view: initial_view(genesis_frontiers()),
+                view: initial_view(genesis_frontiers(), &Default::default()),
                 view_rx: None,
                 input_decoded_bytes: Arc::new(AtomicU64::new(0)),
                 decoded_pool: super::super::test_decoded_pool(),
@@ -2746,7 +2746,8 @@ mod tests {
             }),
         );
         let registry = Arc::new(PeerRegistry::new());
-        let (_view_tx, view_rx) = watch::channel(initial_view(genesis_frontiers()));
+        let (_view_tx, view_rx) =
+            watch::channel(initial_view(genesis_frontiers(), &Default::default()));
         let (mut routine, mut out_recv) = shared_floor_routine(7, &work, &registry, view_rx);
         let _ = routine.try_fill();
 
@@ -2846,7 +2847,8 @@ mod tests {
             )],
         );
         let registry = Arc::new(PeerRegistry::new());
-        let (_view_tx, view_rx) = watch::channel(initial_view(genesis_frontiers()));
+        let (_view_tx, view_rx) =
+            watch::channel(initial_view(genesis_frontiers(), &Default::default()));
         let (routine, _out_recv) = shared_floor_routine(7, &work, &registry, view_rx);
         let log = Arc::new(Log::default());
         let mut routine = routine.with_observer(ObserverSlot(Some(log.clone())));
@@ -3903,7 +3905,8 @@ mod tests {
         let session = BlockSyncPeerSession::for_test(peer.clone(), out_send, cancel.clone());
         let (sequencer_input, mut sequencer_recv) = mpsc::channel(4);
         let (reactor_input, _reactor_recv) = mpsc::channel(4);
-        let (_view_tx, view_rx) = watch::channel(initial_view(genesis_frontiers()));
+        let (_view_tx, view_rx) =
+            watch::channel(initial_view(genesis_frontiers(), &Default::default()));
         let (requester, serving) = test_authorization(
             &session,
             &in_recv,
@@ -4167,7 +4170,7 @@ mod tests {
         let registry = Arc::new(PeerRegistry::new());
         let cancel = CancellationToken::new();
         let (out_send, mut out_recv) = crate::zakura::transport::worker_framed_channel(4);
-        let mut view = initial_view(genesis_frontiers());
+        let mut view = initial_view(genesis_frontiers(), &Default::default());
         view.applying_decoded_attributed_memory_bytes = applying_decoded_bytes;
         let input_decoded_bytes = Arc::new(AtomicU64::new(queued_decoded_bytes));
         let (mut routine, mut ends) = TestRoutine {
@@ -4223,7 +4226,7 @@ mod tests {
                     )
                     .admit_for_connection(
                         block::Height(0),
-                        block::Height(0),
+                        crate::zakura::CommitWindow::default().top(block::Height(0)),
                         0,
                         None,
                         CancellationToken::new(),
@@ -4544,7 +4547,7 @@ mod tests {
         let (body_tx, body_rx) = mpsc::channel(1);
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
         let (actions, mut actions_rx) = mpsc::channel(1);
-        let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+        let (view_tx, _view_rx) = watch::channel(initial_view(frontiers, &Default::default()));
         let budget = ByteBudget::new(1_000_000);
         let task = SequencerIO::new(
             Sequencer::new(block::Height(0), 1),

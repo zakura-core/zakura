@@ -196,7 +196,7 @@ pub fn spawn_bench_sequencer(
     let (control_tx, control_rx) = mpsc::unbounded_channel();
     let body_input_bytes = Arc::new(AtomicU64::new(0));
     let body_input_decoded_attributed_memory_bytes = Arc::new(AtomicU64::new(0));
-    let (view_tx, view_rx) = watch::channel(initial_view(frontiers));
+    let (view_tx, view_rx) = watch::channel(initial_view(frontiers, &Default::default()));
 
     let decoded_pool = ZakuraBlockSyncConfig {
         max_submitted_block_applies: limit,

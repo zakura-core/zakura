@@ -379,6 +379,9 @@ pub(super) struct SequencerView {
     pub(super) accounting_closed: bool,
     pub(super) verified_tip: block::Height,
     pub(super) verified_hash: block::Hash,
+    /// The top of the commit window above `verified_tip`
+    /// ([`CommitWindow::top`](super::admission::CommitWindow::top)).
+    pub(super) commit_window_top: block::Height,
     pub(super) download_floor: block::Height,
     pub(super) finalized: block::Height,
     /// Increments only when the task performs a destructive `reset_to`, so the
@@ -408,12 +411,17 @@ pub(super) struct SequencerView {
     pub(super) committed_blocks_per_sec: u64,
 }
 
-/// Build the initial view from the startup frontiers, before the task runs.
-pub(super) fn initial_view(frontiers: BlockSyncFrontiers) -> SequencerView {
+/// Build the initial view from the startup frontiers and the node's commit
+/// window, before the task runs.
+pub(super) fn initial_view(
+    frontiers: BlockSyncFrontiers,
+    commit_window: &super::admission::CommitWindow,
+) -> SequencerView {
     SequencerView {
         accounting_closed: false,
         verified_tip: frontiers.verified_block_tip,
         verified_hash: frontiers.verified_block_hash,
+        commit_window_top: commit_window.top(frontiers.verified_block_tip),
         download_floor: frontiers.verified_block_tip,
         finalized: frontiers.finalized_height,
         reset_epoch: 0,
@@ -1698,6 +1706,7 @@ mod tests {
             accounting_closed: false,
             verified_tip: block::Height(1),
             verified_hash: block::Hash([1; 32]),
+            commit_window_top: crate::zakura::CommitWindow::default().top(block::Height(1)),
             download_floor: block::Height(1),
             finalized: block::Height(1),
             reset_epoch: 0,
@@ -1902,7 +1911,7 @@ mod tests {
         let (_body_tx, body_rx) = mpsc::channel(1);
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
         let (actions, _actions_rx) = mpsc::channel(1);
-        let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+        let (view_tx, _view_rx) = watch::channel(initial_view(frontiers, &Default::default()));
         let budget = ByteBudget::new(1_000_000);
         SequencerIO::new(
             Sequencer::new(block::Height(0), 1),
@@ -1932,7 +1941,7 @@ mod tests {
         let (_body_tx, body_rx) = mpsc::channel(1);
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
         let (actions, _actions_rx) = mpsc::channel(1);
-        let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+        let (view_tx, _view_rx) = watch::channel(initial_view(frontiers, &Default::default()));
         let budget = ByteBudget::new(123);
         let mut task = SequencerIO::new(
             Sequencer::new(block::Height(0), 1),
@@ -1978,7 +1987,7 @@ mod tests {
         let (_body_tx, body_rx) = mpsc::channel(1);
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
         let (actions, _actions_rx) = mpsc::channel(1);
-        let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+        let (view_tx, _view_rx) = watch::channel(initial_view(frontiers, &Default::default()));
         let budget = ByteBudget::new(123);
         let mut task = SequencerIO::new(
             Sequencer::new(block::Height(0), 1),
@@ -2044,7 +2053,7 @@ mod tests {
         let (_body_tx, body_rx) = mpsc::channel(1);
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
         let (actions, _actions_rx) = mpsc::channel(1);
-        let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+        let (view_tx, _view_rx) = watch::channel(initial_view(frontiers, &Default::default()));
         let mut task = SequencerIO::new(
             Sequencer::new(block::Height(0), 1),
             work.clone(),
@@ -2097,7 +2106,7 @@ mod tests {
         let (_body_tx, body_rx) = mpsc::channel(1);
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
         let (actions, mut actions_rx) = mpsc::channel(4);
-        let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+        let (view_tx, _view_rx) = watch::channel(initial_view(frontiers, &Default::default()));
         let budget = ByteBudget::new(123);
         let mut task = SequencerIO::new(
             Sequencer::new(block::Height(0), 1),
@@ -2210,7 +2219,7 @@ mod tests {
         let (_body_tx, body_rx) = mpsc::channel(1);
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
         let (actions, _actions_rx) = mpsc::channel(4);
-        let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+        let (view_tx, _view_rx) = watch::channel(initial_view(frontiers, &Default::default()));
         let refusals = Arc::new(Refusals::default());
         let mut task = SequencerIO::new(
             Sequencer::new(block::Height(0), 1),
@@ -2275,7 +2284,7 @@ mod tests {
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
         let (actions, mut actions_rx) = mpsc::channel(1 + BS_ACTION_CONTROL_RESERVE);
         let action_sender = actions.clone();
-        let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+        let (view_tx, _view_rx) = watch::channel(initial_view(frontiers, &Default::default()));
         let budget = ByteBudget::new(123);
         let mut task = SequencerIO::new(
             Sequencer::new(block::Height(0), 1),
@@ -2396,7 +2405,7 @@ mod tests {
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
         let (actions, mut actions_rx) = mpsc::channel(1);
         let action_sender = actions.clone();
-        let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+        let (view_tx, _view_rx) = watch::channel(initial_view(frontiers, &Default::default()));
         let budget = ByteBudget::new(123);
         let mut task = SequencerIO::new(
             Sequencer::new(block::Height(0), 1),
@@ -2519,7 +2528,7 @@ mod tests {
         let (_body_tx, body_rx) = mpsc::channel(1);
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
         let (actions, mut actions_rx) = mpsc::channel(4);
-        let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+        let (view_tx, _view_rx) = watch::channel(initial_view(frontiers, &Default::default()));
         let registry = Arc::new(PeerRegistry::new());
         // A day ahead, so an episode or failure dated by the host clock lands a
         // day early: the deadline collapses to now, or the episode alarms.
@@ -2604,7 +2613,7 @@ mod tests {
         let (_body_tx, body_rx) = mpsc::channel(1);
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
         let (actions, mut actions_rx) = mpsc::channel(1);
-        let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+        let (view_tx, _view_rx) = watch::channel(initial_view(frontiers, &Default::default()));
         let budget = ByteBudget::new(123);
         let mut task = SequencerIO::new(
             Sequencer::new(block::Height(0), 1),
@@ -2706,7 +2715,8 @@ mod tests {
                 let (_body_tx, body_rx) = mpsc::channel(1);
                 let (_control_tx, control_rx) = mpsc::unbounded_channel();
                 let (actions, mut actions_rx) = mpsc::channel(4);
-                let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+                let (view_tx, _view_rx) =
+                    watch::channel(initial_view(frontiers, &Default::default()));
                 let budget = ByteBudget::new(123);
                 let mut task = SequencerIO::new(
                     Sequencer::new(block::Height(0), 1),
@@ -2816,7 +2826,7 @@ mod tests {
         let (_body_tx, body_rx) = mpsc::channel(1);
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
         let (actions, mut actions_rx) = mpsc::channel(4);
-        let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+        let (view_tx, _view_rx) = watch::channel(initial_view(frontiers, &Default::default()));
         let mut task = SequencerIO::new(
             Sequencer::new(block::Height(0), 1),
             Arc::new(WorkQueue::with_test_pool(
@@ -2924,7 +2934,7 @@ mod tests {
             let (_body_tx, body_rx) = mpsc::channel(1);
             let (_control_tx, control_rx) = mpsc::unbounded_channel();
             let (actions, mut actions_rx) = mpsc::channel(2 + BS_ACTION_CONTROL_RESERVE);
-            let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+            let (view_tx, _view_rx) = watch::channel(initial_view(frontiers, &Default::default()));
             let budget = ByteBudget::new(123);
             let mut task = SequencerIO::new(
                 Sequencer::new(block::Height(0), 1),
@@ -3063,7 +3073,7 @@ mod tests {
             let (_body_tx, body_rx) = mpsc::channel(1);
             let (_control_tx, control_rx) = mpsc::unbounded_channel();
             let (actions, mut actions_rx) = mpsc::channel(4);
-            let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+            let (view_tx, _view_rx) = watch::channel(initial_view(frontiers, &Default::default()));
             let budget = ByteBudget::new(123);
             let mut task = SequencerIO::new(
                 Sequencer::new(block::Height(0), 1),
@@ -3190,7 +3200,7 @@ mod tests {
                 scope: super::test_work_scope(),
             })
             .expect("test fills the action channel");
-        let (view_tx, mut view_rx) = watch::channel(initial_view(frontiers));
+        let (view_tx, mut view_rx) = watch::channel(initial_view(frontiers, &Default::default()));
         let budget = ByteBudget::new(123);
         let task = SequencerIO::new(
             Sequencer::new(block::Height(0), 1),
@@ -3257,7 +3267,7 @@ mod tests {
     fn simultaneous_handoffs_cannot_share_one_body_of_room() {
         const BODY: u64 = 1_000;
         let input_decoded = Arc::new(AtomicU64::new(0));
-        let mut view = initial_view(genesis_frontiers());
+        let mut view = initial_view(genesis_frontiers(), &Default::default());
         view.applying_decoded_attributed_memory_bytes =
             BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES - BODY;
         let (_view_tx, view_rx) = watch::channel(view);
@@ -3283,7 +3293,7 @@ mod tests {
         let (_body_tx, body_rx) = mpsc::channel(1);
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
         let (actions, _actions_rx) = mpsc::channel(1);
-        let (view_tx, view_rx) = watch::channel(initial_view(frontiers));
+        let (view_tx, view_rx) = watch::channel(initial_view(frontiers, &Default::default()));
         let budget = ByteBudget::new(123);
         let mut task = SequencerIO::new(
             Sequencer::new(block::Height(0), 1),
@@ -3334,7 +3344,7 @@ mod tests {
             .expect("body channel has capacity");
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
         let (actions, _actions_rx) = mpsc::channel(1);
-        let mut initial = initial_view(frontiers);
+        let mut initial = initial_view(frontiers, &Default::default());
         initial.reorder_decoded_attributed_memory_bytes = 10;
         initial.applying_decoded_attributed_memory_bytes = 20;
         initial.active_pipeline_decoded_attributed_memory_bytes =
@@ -3437,7 +3447,7 @@ mod tests {
             )
             .admit_for_connection(
                 block::Height(0),
-                block::Height(0),
+                crate::zakura::CommitWindow::default().top(block::Height(0)),
                 0,
                 None,
                 zakura_rt::sync::CancellationToken::new(),

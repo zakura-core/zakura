@@ -170,7 +170,7 @@ fn replay(
         };
         let snapshot = AdmissionSnapshot {
             download_floor: block::Height(floor),
-            verified_block_tip: block::Height(floor),
+            commit_window_top: crate::zakura::CommitWindow::default().top(block::Height(floor)),
             reorder_buffered_bytes: 0,
             reorder_buffered_blocks: 0,
             applying_buffered_bytes: 0,

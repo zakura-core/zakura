@@ -135,7 +135,7 @@ impl Scenario {
     fn snapshot(&self) -> AdmissionSnapshot {
         AdmissionSnapshot {
             download_floor: self.height(self.floor),
-            verified_block_tip: block::Height(0),
+            commit_window_top: crate::zakura::CommitWindow::default().top(block::Height(0)),
             reorder_buffered_bytes: 0,
             reorder_buffered_blocks: 0,
             applying_buffered_bytes: 0,

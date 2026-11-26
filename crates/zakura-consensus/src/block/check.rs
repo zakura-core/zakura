@@ -14,8 +14,7 @@ use zakura_chain::{
             founders_reward, founders_reward_address, funding_stream_values, miner_fee_share,
             FundingStreamReceiver, ParameterSubsidy, SubsidyError,
         },
-        Network, NetworkUpgrade, GLOBAL_SHIELDED_BUDGET, ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT,
-        SAPLING_BLOCK_IO_LIMIT, SPROUT_BLOCK_JOINSPLIT_LIMIT,
+        Network, NetworkUpgrade,
     },
     transaction::{self, ShieldedActionCounts, Transaction},
     transparent::{Address, Output},
@@ -502,19 +501,21 @@ pub fn time_is_valid_at(
 /// <https://zips.z.cash/zip-0218#shielded-pool-action-limits>
 ///
 /// Orchard and Ironwood each get their own per-pool limit, and both draw on the
-/// single global shielded budget.
+/// single global shielded budget. ZIP 223 scales the limits by 4/5 at NU7.1, see
+/// [`NetworkUpgrade::shielded_block_limits`].
 ///
 /// ZIP 218 sets `SproutBlockJoinSplitLimit` to zero. Zakura rejects any
 /// JoinSplit at or after NU7, because ZIP 2003 disallows the only transaction
-/// versions that can carry one. See [`SPROUT_BLOCK_JOINSPLIT_LIMIT`].
+/// versions that can carry one. See
+/// [`zakura_chain::parameters::SPROUT_BLOCK_JOINSPLIT_LIMIT`].
 pub fn shielded_action_limits_are_valid<T: AsRef<Transaction>>(
     transactions: impl IntoIterator<Item = T>,
     height: Height,
     network: &Network,
 ) -> Result<(), TransactionError> {
-    if !NetworkUpgrade::is_nu7_active(network, height) {
+    let Some(limits) = NetworkUpgrade::shielded_block_limits(network, height) else {
         return Ok(());
-    }
+    };
 
     let totals = transactions
         .into_iter()
@@ -524,39 +525,39 @@ pub fn shielded_action_limits_are_valid<T: AsRef<Transaction>>(
             ShieldedActionCounts::saturating_add,
         );
 
-    if totals.orchard_actions > ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT {
+    if totals.orchard_actions > limits.orchard_protocol_actions {
         return Err(TransactionError::OrchardActionsExceedBlockLimit {
             actions: totals.orchard_actions,
-            limit: ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT,
+            limit: limits.orchard_protocol_actions,
         });
     }
 
-    if totals.ironwood_actions > ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT {
+    if totals.ironwood_actions > limits.orchard_protocol_actions {
         return Err(TransactionError::IronwoodActionsExceedBlockLimit {
             actions: totals.ironwood_actions,
-            limit: ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT,
+            limit: limits.orchard_protocol_actions,
         });
     }
 
-    if totals.sapling_ios > SAPLING_BLOCK_IO_LIMIT {
+    if totals.sapling_ios > limits.sapling_ios {
         return Err(TransactionError::SaplingIOsExceedBlockLimit {
             ios: totals.sapling_ios,
-            limit: SAPLING_BLOCK_IO_LIMIT,
+            limit: limits.sapling_ios,
         });
     }
 
-    if totals.sprout_joinsplits > SPROUT_BLOCK_JOINSPLIT_LIMIT {
+    if totals.sprout_joinsplits > limits.sprout_joinsplits {
         return Err(TransactionError::SproutJoinSplitsExceedBlockLimit {
             joinsplits: totals.sprout_joinsplits,
-            limit: SPROUT_BLOCK_JOINSPLIT_LIMIT,
+            limit: limits.sprout_joinsplits,
         });
     }
 
     let cost = totals.cost();
-    if cost > GLOBAL_SHIELDED_BUDGET {
+    if cost > limits.global_shielded_budget {
         return Err(TransactionError::ShieldedCostExceedsBlockBudget {
             cost,
-            limit: GLOBAL_SHIELDED_BUDGET,
+            limit: limits.global_shielded_budget,
         });
     }
 

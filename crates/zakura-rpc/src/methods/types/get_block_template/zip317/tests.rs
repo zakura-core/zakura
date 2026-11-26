@@ -408,6 +408,38 @@ mod zip218_template_limits {
         );
     }
 
+    /// Templates use ZIP 223's limits from NU7.1, so the space left after a
+    /// one-output Sapling coinbase shrinks by 4/5.
+    #[test]
+    fn the_shielded_limits_scale_at_nu7_1() {
+        let network = Parameters::build()
+            .with_slow_start_interval(Height(0))
+            .with_activation_heights(ConfiguredActivationHeights {
+                nu5: Some(1),
+                nu7: Some(2),
+                nu7_1: Some(3),
+                ..Default::default()
+            })
+            .expect("activation heights are valid")
+            .clear_funding_streams()
+            .to_network()
+            .expect("configured testnet is valid");
+        let coinbase = ShieldedActionCounts {
+            sapling_ios: 1,
+            ..Default::default()
+        };
+
+        for (height, actions, sapling_ios, cost) in [(2, 330, 299, 329), (3, 264, 239, 263)] {
+            let limits =
+                BlockTemplateLimits::remaining_shielded_limits(&network, Height(height), coinbase);
+            assert_eq!(limits.orchard_actions, actions, "height {height}");
+            assert_eq!(limits.ironwood_actions, actions, "height {height}");
+            assert_eq!(limits.sapling_ios, sapling_ios, "height {height}");
+            assert_eq!(limits.sprout_joinsplits, 0, "height {height}");
+            assert_eq!(limits.cost, cost, "height {height}");
+        }
+    }
+
     /// A shielded coinbase output consumes the same block capacity as a
     /// shielded output in any other transaction.
     #[test]

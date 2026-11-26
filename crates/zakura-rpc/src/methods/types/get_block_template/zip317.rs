@@ -10,10 +10,7 @@
 use zakura_chain::{
     amount::{self, Amount},
     block::{Height, MAX_BLOCK_BYTES},
-    parameters::{
-        Network, NetworkUpgrade, GLOBAL_SHIELDED_BUDGET, ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT,
-        SAPLING_BLOCK_IO_LIMIT, SPROUT_BLOCK_JOINSPLIT_LIMIT,
-    },
+    parameters::{Network, NetworkUpgrade},
     serialization::{CompactSizeMessage, TrustedPreallocate, ZcashSerialize},
     transaction::{
         self, zip317::BLOCK_UNPAID_ACTION_LIMIT, ShieldedActionCounts, VerifiedUnminedTx,
@@ -169,7 +166,7 @@ impl BlockTemplateLimits {
         height: Height,
         coinbase: ShieldedActionCounts,
     ) -> RemainingShieldedLimits {
-        if !NetworkUpgrade::is_nu7_active(network, height) {
+        let Some(limits) = NetworkUpgrade::shielded_block_limits(network, height) else {
             return RemainingShieldedLimits {
                 orchard_actions: u32::MAX,
                 ironwood_actions: u32::MAX,
@@ -177,22 +174,27 @@ impl BlockTemplateLimits {
                 sprout_joinsplits: u32::MAX,
                 cost: u32::MAX,
             };
-        }
+        };
 
         RemainingShieldedLimits {
-            orchard_actions: ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT
+            orchard_actions: limits
+                .orchard_protocol_actions
                 .checked_sub(coinbase.orchard_actions)
                 .expect("a generated coinbase satisfies the Orchard action limit"),
-            ironwood_actions: ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT
+            ironwood_actions: limits
+                .orchard_protocol_actions
                 .checked_sub(coinbase.ironwood_actions)
                 .expect("a generated coinbase satisfies the Ironwood action limit"),
-            sapling_ios: SAPLING_BLOCK_IO_LIMIT
+            sapling_ios: limits
+                .sapling_ios
                 .checked_sub(coinbase.sapling_ios)
                 .expect("a generated coinbase satisfies the Sapling I/O limit"),
-            sprout_joinsplits: SPROUT_BLOCK_JOINSPLIT_LIMIT
+            sprout_joinsplits: limits
+                .sprout_joinsplits
                 .checked_sub(coinbase.sprout_joinsplits)
                 .expect("a generated coinbase satisfies the Sprout JoinSplit limit"),
-            cost: GLOBAL_SHIELDED_BUDGET
+            cost: limits
+                .global_shielded_budget
                 .checked_sub(coinbase.cost())
                 .expect("a generated coinbase satisfies the global shielded budget"),
         }

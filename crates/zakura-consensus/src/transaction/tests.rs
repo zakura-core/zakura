@@ -4841,6 +4841,60 @@ async fn mempool_applies_the_zip218_limits_to_ironwood_actions() {
     }
 }
 
+/// Checks that the mempool applies ZIP 223's limits from NU7.1. The mempool
+/// re-verifies its transactions when the tip reaches an activation block, so
+/// this also evicts a transaction that no NU7.1 block can include.
+#[tokio::test]
+async fn mempool_applies_the_zip223_limits_from_nu7_1() {
+    let _init_guard = zakura_test::init();
+
+    let height = Height(2);
+    let network = Parameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            nu7: Some(1),
+            nu7_1: Some(height.0),
+            ..Default::default()
+        })
+        .expect("activation heights are valid")
+        .clear_funding_streams()
+        .to_network()
+        .expect("configured testnet is valid");
+
+    // The fake proofs fail the proof size check, which the verifier runs after
+    // the shielded limits. That error shows a transaction passed the limits.
+    let cases = [
+        (
+            265,
+            Some(TransactionError::IronwoodActionsExceedBlockLimit {
+                actions: 265,
+                limit: 264,
+            }),
+        ),
+        (264, None),
+    ];
+
+    for (ironwood_actions, limit_error) in cases {
+        let tx =
+            fake_v6_with_orchard_and_ironwood_actions(NetworkUpgrade::Nu7_1, 0, ironwood_actions);
+
+        let response = Verifier::new_for_tests(
+            &network,
+            service_fn(|_| async { unreachable!("state service should not be called") }),
+        )
+        .oneshot(Request::Mempool {
+            transaction: Arc::unwrap_or_clone(tx).into(),
+            height,
+        })
+        .await;
+
+        assert_eq!(
+            response,
+            Err(limit_error.unwrap_or(TransactionError::IronwoodProofSize)),
+            "{ironwood_actions} Ironwood actions",
+        );
+    }
+}
+
 /// Checks that ZIP 2003 accepts V4 transactions below NU7 and rejects them
 /// from NU7.
 #[test]

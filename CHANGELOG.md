@@ -11,10 +11,57 @@ independently.
 
 ## [Unreleased]
 
-## [1.9.0-rc2] - 2026-11-24
+## [1.9.0] - 2026-11-26
 
 ### Added
 
+- Mining nodes push newly mined blocks to peers in the initial announcement
+  group that advertise `NODE_BLOCK_PUSH`, saving one request round trip.
+  The opt-in `network.push_relayed_blocks` setting also pushes blocks this
+  node relays after it commits them, which can send an extra copy to a
+  peer that already has the block
+  ([#2537](https://github.com/zakura-core/zakura/pull/2537)).
+- Added the binary `/submittrustedblock` endpoint, enabled through
+  `rpc.enable_trusted_block_submission`. It can start relaying a new block
+  before local validation and follows the RPC listener's cookie-authentication
+  setting. Submit only final block bytes verified by a trusted full node,
+  because peers can ban a relay that sends an invalid block. Zakura withdraws
+  pending announcements and responses when a submission is rejected or
+  times out. The endpoint returns `inconclusive` when it cannot establish
+  the result, so the caller can retry
+  ([#2534](https://github.com/zakura-core/zakura/pull/2534)).
+- Added the opt-in `[network.block_download_score_and_hedge]` setting.
+  With `enabled = true`, Zakura picks a legacy peer using recent response
+  times and can send one backup request when a later announcer is likely
+  to deliver sooner or the first request stalls. Peer and request events
+  can trigger the backup. If you tried the feature in a development build,
+  replace `[network.block_source_score]` and remove its `second_request`
+  key
+  ([#2572](https://github.com/zakura-core/zakura/pull/2572),
+  [#2595](https://github.com/zakura-core/zakura/pull/2595),
+  [#2596](https://github.com/zakura-core/zakura/pull/2596)).
+- Added the `[mempool] implementation` setting. `default` and `classic` keep
+  the pool nodes run today. `core` runs the new pool core, which is
+  experimental
+  ([#2502](https://github.com/zakura-core/zakura/pull/2502)).
+- Added `tx-relay`, an experimental v2 P2P service that moves transactions
+  between Zakura peers and hands them to the pool core. It is off by
+  default. It runs only with `[network.zakura.tx_relay] enabled = true`, the
+  v2 stack on, and `[mempool] implementation = "core"`. While a peer has a
+  live `tx-relay` session, the legacy adapter leaves that peer's
+  transactions to it. New `zakura.p2p.tx_relay.*` metrics count what it
+  moves, and the existing `zakura.p2p.legacy.inbound.refused` counter gains
+  a `type` label. The experimental `advert_delay` (2 s),
+  `advert_window_full_tx` (4) and `advert_window_small_tx` (16) keys tune
+  its fan-out
+  ([#2503](https://github.com/zakura-core/zakura/pull/2503)).
+- Added mempool metrics for canaries: the pool core exports how many
+  transactions it pools and how many a reset took out that are not back
+  yet, and `mempool.implementation` shows which pool the node resolved to
+  ([#2506](https://github.com/zakura-core/zakura/pull/2506)).
+- Added `zakura.p2p.tx_relay.registered`, which says whether the node
+  registered `tx-relay`
+  ([#2506](https://github.com/zakura-core/zakura/pull/2506)).
 - `zakurad` now saves the Zakura P2P discovery book and reloads it at the next
   start, so a restarted node can reconnect to the native peers it already
   knew. The book follows `network.cache_dir`, including its disable setting.
@@ -48,9 +95,109 @@ independently.
   solved block to peers after local proposal verification or primary
   confirmation. Released jobs push the solved block directly to capable peers
   in the initial broadcast group by default. [#2702](https://github.com/zakura-core/zakura/pull/2702)
+- Mining nodes now keep connections to the mining gateways that recent blocks
+  name most often, while the node is synced to the chain tip
+  ([#2686](https://github.com/zakura-core/zakura/pull/2686)).
+- Added the `getminermeshinfo` admin RPC, which shows a node's miner mesh state:
+  the gateways that recent blocks name, the connection places held for the
+  best of them, how connection slots are used, and the node's v2 peers
+  ([#2687](https://github.com/zakura-core/zakura/pull/2687)).
+- Added opt-in BPv1 block propagation on the `zakura` and `dual` P2P stacks.
+  A miner commits an erasure-coded part root in its coinbase, and nodes relay
+  each verified part as it arrives instead of waiting for the whole body.
+  Enable it with `[network.zakura.bpv1] enabled = true`
+  ([#2707](https://github.com/zakura-core/zakura/pull/2707)).
+- A node with `mining.miner_address` set now also reports the blocks that name
+  the busiest mining gateway, whether it announces itself, and the blocks that
+  name it, as `mining.mesh.gateway.top_blocks`, `mining.mesh.announcing` and
+  `mining.mesh.gateway.local_blocks`
+  ([#2708](https://github.com/zakura-core/zakura/pull/2708)).
+- The node now logs `mempool activated` once its mempool answers requests.
+  With the pool core this comes shortly after `activating mempool`, which
+  marks the decision to turn the mempool on, so a script that waits for a
+  log line before calling an RPC such as `getblocktemplate` should wait for
+  the new one ([#2752](https://github.com/zakura-core/zakura/pull/2752)).
 
 ### Changed
 
+- With `trace_dir` set, the legacy request rows in `legacy_peer_request.jsonl` now follow
+  `network.expose_peer_addresses`: they hold the peer's address when it is set and stay
+  redacted when it is not. Each row also carries the peer's user agent, and a peer upgraded
+  to Zakura gets one `peer_upgraded` row in `handshake.jsonl` with its trace label, its
+  address under the same setting, and its user agent. The rows' `peer_id` column is now
+  `connection_id`, the same number the connection's `legacy_gossip.jsonl` rows carry
+  ([#2455](https://github.com/zakura-core/zakura/pull/2455)).
+- Serving a block to several legacy peers uses less CPU by reusing its
+  serialized bytes and sharing its checksum across requests
+  ([#2556](https://github.com/zakura-core/zakura/pull/2556),
+  [#2557](https://github.com/zakura-core/zakura/pull/2557)).
+- When Zakura is still verifying a locally submitted block, it waits to
+  download a peer's copy until local verification fails or five seconds
+  pass. The wait leaves the peer-download slot available. Its duration
+  and outcome are recorded in metrics and, when enabled, in
+  `commit_state.jsonl`
+  ([#2562](https://github.com/zakura-core/zakura/pull/2562)).
+- The experimental core mempool builds each snapshot from the previous one,
+  reducing CPU use as the pool fills
+  ([#2591](https://github.com/zakura-core/zakura/pull/2591)).
+- The `pool.route_inv.hedge.not_yet.count` and
+  `pool.route_inv.hedge.no_candidate.count` metrics count decisions to send
+  a backup block request. `pool.route_inv.hedge.held` shows how many
+  downloads are waiting for one
+  ([#2596](https://github.com/zakura-core/zakura/pull/2596)).
+- A stalled v2 frame read now resets its session or one-shot request. Sibling
+  services can keep using the connection. Header sync counts an unanswered
+  subscription `Close` from the completion of its write. A second header-sync or
+  block-sync stall on the same connection can close it without a peer fault
+  ([#2604](https://github.com/zakura-core/zakura/pull/2604)).
+- Inbound v2 handshakes now share a node-wide rate of 24 starts a second for
+  each source validation state. The last 8 tokens go only to an address within
+  its share of 3 starts a second, so a few busy addresses can't refuse the rest.
+  The 10-second handshake deadline now starts when the connection is accepted.
+  Every TLS start keeps its node and address charges
+  ([#2604](https://github.com/zakura-core/zakura/pull/2604)).
+- Discovery dispatch uses a wall-clock budget even when its receive queue fills.
+  Header sync meters peer `Status` messages and locator walks for new
+  subscriptions per connection, so reopening a session gets no fresh burst
+  ([#2604](https://github.com/zakura-core/zakura/pull/2604)).
+- The experimental `tx-relay` service uses less memory with many connected
+  peers. It sizes each peer's request window based on recent deliveries
+  and announces new transactions to the lowest-latency peers first
+  ([#2623](https://github.com/zakura-core/zakura/pull/2623)).
+- Finalized transaction bodies now move out of RocksDB into append-only
+  static files in the state directory, in the background and at least 50
+  blocks at a time. On first start the node upgrades its database in place
+  to state format v32. Older releases can't open the upgraded database, so
+  going back means a fresh sync or restoring a backup from before the
+  upgrade ([#2146](https://github.com/zakura-core/zakura/pull/2146)).
+- A Mainnet archive node grows by about 11 GB at the peak of the move,
+  because the new static files sit next to the old RocksDB data until
+  RocksDB frees it. Leave that much free disk. If a static file write
+  fails, for example on a full disk, moves stop until zakurad restarts, so
+  free space and restart it
+  ([#2146](https://github.com/zakura-core/zakura/pull/2146)).
+- Back up the `static_files` directory along with RocksDB, because a
+  RocksDB checkpoint no longer holds finalized transaction bodies. Copy the
+  whole state directory with zakurad stopped or take a filesystem snapshot,
+  and don't hard link static files into a restore
+  ([#2146](https://github.com/zakura-core/zakura/pull/2146)).
+- Upgrade read-only RPC secondaries together with their primary, and stop
+  them around `zakurad rollback-state`. A v31 secondary can't follow a v32
+  primary, and rollback shortens static files in place
+  ([#2146](https://github.com/zakura-core/zakura/pull/2146)).
+- A pruned node that started as an archive used to keep serving old
+  transaction bodies below its pruning marker. After the first static file
+  move it treats them as pruned
+  ([#2146](https://github.com/zakura-core/zakura/pull/2146)).
+- With the experimental core mempool, a new block no longer scans the whole
+  pool for conflicting and expired transactions, so its cost follows the
+  block's size instead of the pool's
+  ([#2636](https://github.com/zakura-core/zakura/pull/2636)).
+- With the experimental `tx-relay` enabled, the
+  `zakura.p2p.tx_relay.inv_ids` counter is now
+  `zakura.p2p.tx_relay.have_ids`, because the announcement message is now
+  called `Have`. Update dashboards that read the old name. The wire format
+  is unchanged ([#2665](https://github.com/zakura-core/zakura/pull/2665)).
 - Ranked competing equal-work blocks by announcement order when their bodies
   reach the verifier within 2 seconds, regardless of block size. A native
   header or a legacy single-block inventory message (`inv`) can reserve a
@@ -112,169 +259,165 @@ independently.
   covers the ML-DSA-44 key too, and adds `ML_DSA_44_KEY_TAG`,
   `ML_DSA_44_KEY_BYTES`, `ML_DSA_44_SIGNATURE_BYTES` and
   `COMPOSITE_SIGNATURE_BYTES` ([#2680](https://github.com/zakura-core/zakura/pull/2680)).
+- Raised the default v2 peer memory budget from 15 to 16 GiB to fund up to
+  ten preferred mining gateways in addition to 92 ordinary peers. Explicit
+  budgets fund ordinary peers first ([#2681](https://github.com/zakura-core/zakura/pull/2681)).
 
-### Fixed
+- Nodes hold zero gateway places until a gateway ranking is published. At an
+  equal-score cutoff, a ranking update preserves the preferred gateway while
+  its authenticated connection is open. Rust callers
+  tracking the development branch must update their use of `HandshakeCounts`:
+  `connections_full(inbound, cap)` was removed. Use `inbound_place_free(cap)`
+  for pre-TLS inbound capacity and `free_ordinary_connections(cap)` for ordinary
+  outbound capacity. The result of `claim_connection(node, inbound, cap)` changed
+  from `bool` to `Result<SlotClass, SlotRefusal>`.
+  Direct constructors of `ZakuraLocalLimits` also supply `max_preferred_connections`.
+- At startup, `zakurad` replaces a default seed's pre-p2p-v2/4 node ID in
+  `zakura.bootstrap_peers` with the seed's current ID, keeping the address
+  as written. It also overwrites those IDs in the config file in place, so
+  the change persists. Nothing else in the file changes, and the file keeps
+  its owner, permissions and access control lists. Each replacement is
+  logged with the old and new entry. A read-only file, or one zakurad can't
+  write, is left alone with a warning, and the node uses the new IDs for
+  that run. An old entry is left as it is when the list already names that
+  seed by its current ID
+  ([#2698](https://github.com/zakura-core/zakura/pull/2698)).
+- A mining node prefers a mining gateway only once at least ten blocks of the
+  last two days name it
+  ([#2706](https://github.com/zakura-core/zakura/pull/2706)).
+- The miner mesh coinbase marker names a mining gateway by the first 20 bytes
+  of its v2 node ID, so the marker output takes 34 bytes instead of 46. In
+  `getminermeshinfo`, `gateways[].node_id` is renamed `gateway_id`, and a
+  gateway that two known nodes both match is reported as `ambiguous` and is not
+  preferred
+  ([#2720](https://github.com/zakura-core/zakura/pull/2720)).
+- A block counts toward a mining gateway once it is 10 blocks below the tip
+  instead of 100, so a newly announced gateway is preferred about four minutes
+  after its tenth block
+  ([#2722](https://github.com/zakura-core/zakura/pull/2722)).
+- The miner mesh marker in coinbase outputs now starts with the tag `MR` instead of `MESH`, so the marker output takes 46 bytes ([#2709](https://github.com/zakura-core/zakura/pull/2709)).
+- **Breaking for v2 P2P:** the v2 handshake's key exchange moves to NIST
+  security category 5, X25519MLKEM1024, and handshakes are signed with a
+  composite of Ed25519 and ML-DSA-65 (category 3). Every node's ID changes
+  again and the v2 protocol moves to version 5 (ALPN `p2p-v2/5`) with no
+  overlap with version 4, so nodes on v1.9.0-rc2 reach this release only
+  over the legacy protocol. Key files don't change, but entries in
+  `zakura.bootstrap_peers` and pinned `network.unconditional_peers` name a
+  peer by its node ID, which a node prints for itself at startup. Zakura
+  updates built-in seed entries in `zakura.bootstrap_peers` directly from
+  their version 3 IDs to version 5. Update other pins to the peer's new ID.
+  The dialer sends an additional 1,200-byte
+  datagram with its hello so a normal dial still completes in one round
+  trip. Each handshake moves about 17.5 KB in place of 12.5 KB ([#2723](https://github.com/zakura-core/zakura/pull/2723)).
+- `zakura-quic` replaces `ML_DSA_44_KEY_TAG`, `ML_DSA_44_KEY_BYTES` and
+  `ML_DSA_44_SIGNATURE_BYTES` with `ML_DSA_65_KEY_TAG`, `ML_DSA_65_KEY_BYTES`
+  and `ML_DSA_65_SIGNATURE_BYTES`, and `COMPOSITE_SIGNATURE_BYTES` grows to
+  3,373 ([#2723](https://github.com/zakura-core/zakura/pull/2723)).
+- Zakura generates the ML-DSA signing key when it loads the node identity and
+  reuses it across handshakes ([#2723](https://github.com/zakura-core/zakura/pull/2723)).
+- With BPv1 enabled, nodes announce their verified parts to the block's proposer, so the proposer's trace records when each neighbour obtained each part ([#2726](https://github.com/zakura-core/zakura/pull/2726)).
+- The BPv1 coinbase commitment output now starts with the tag `BP` instead of `BPV1`, so the output takes 46 bytes, and a long poll returns a BPv1 template on a new tip without building its coinbase again ([#2727](https://github.com/zakura-core/zakura/pull/2727)).
+- With BPv1 enabled, a block submitted through the trusted block submission endpoint is now published over BPv1 once it commits. Before, only `submitblock` published solved blocks over BPv1 ([#2729](https://github.com/zakura-core/zakura/pull/2729)).
+- Nodes whose P2P stack runs v2 (`dual` or `zakura`) now run the pool core
+  and `tx-relay` by default. Testnet and Regtest default to `dual`, so they
+  move to the core. Mainnet defaults to `legacy` and keeps today's pool
+  unless its operator turned on v2. `[mempool] implementation = "default"`
+  now resolves from the stack, and `[network.zakura.tx_relay] enabled` now
+  defaults to true, so `tx-relay` follows the pool. Set
+  `[mempool] implementation = "classic"` to go back to today's pool and turn
+  `tx-relay` off, or `[network.zakura.tx_relay] enabled = false` to keep the
+  core without `tx-relay`. A value written in a node's own config still wins
+  ([#2732](https://github.com/zakura-core/zakura/pull/2732)).
 
-- Verbose `getblock` omits `valueDelta` when the parent block's balances are
-  missing, instead of reporting each whole balance as the block's change
-  ([#2648](https://github.com/zakura-core/zakura/pull/2648)).
+- Raised the default v2 peer memory budget from 16 to 17 GiB, so a node
+  running `tx-relay` still funds 92 ordinary peers and ten preferred mining
+  gateways. Config load now checks an explicit budget without `tx-relay`'s
+  shares, so a v2 node set to `classic` loads with the same budget as before
+  ([#2732](https://github.com/zakura-core/zakura/pull/2732)).
+- A transaction's block production fee weight ratio is no longer capped at 13,
+  so mempool fee metrics report how much each transaction pays above the
+  conventional fee ([#2739](https://github.com/zakura-core/zakura/pull/2739)).
+- Extended Mainnet support through block 3,660,343, with end of support
+  expected around December 10, 2026
+  ([#2742](https://github.com/zakura-core/zakura/pull/2742)).
+- A later release can add or retire a v2 signature key without changing how
+  peers reach a node. A dial to the node ID a peer had before it added a key
+  still connects, the node is then tracked under its new ID, and a retired
+  key stays in the credential as a 32-byte fingerprint, which keeps the node
+  ID. These rules ship with protocol version 5 (ALPN `p2p-v2/5`), so they
+  need no further break. A `zakura.bootstrap_peers` entry that names a peer
+  by an earlier node ID keeps working and logs one warning per start that
+  asks for the new ID. A preferred gateway that returns to its original ID
+  can reclaim its reserved place even when ordinary slots are full. The
+  next reachable gateway can use the place while the rollback probe waits.
+  Discovery preserves room for configured bootstrap peers when a preferred
+  gateway answers under an ordinary node ID.
+  The miner mesh report recognizes a connected gateway under its earlier ID
+  even after discovery evicts its earlier address record.
+  A pinned `network.unconditional_peers` entry still
+  matches its node ID exactly and needs the new ID
+  ([#2744](https://github.com/zakura-core/zakura/pull/2744)).
+- `zakura-quic` adds `Conn::dialed_id()`, `CredentialKey`,
+  `NodeCredential::with_fingerprint_only()` and
+  `CredentialError::FingerprintOnly`. `NodeCredential::from_entries` takes
+  either full keys or `CredentialKey` values. `Conn::remote_id()` can differ
+  from the dialed node ID when the peer has added a key
+  ([#2744](https://github.com/zakura-core/zakura/pull/2744)).
+- A pinned `network.unconditional_peers` entry and a preferred mining
+  gateway's held connection place now follow a peer that adds a v2 signature
+  key. A pin that names the node ID the peer had before keeps working: the
+  peer counts as connected and its address stays exempt while its connection
+  proves the pinned ID, and the node logs one warning per start that asks
+  for the new ID. A gateway that blocks still name by its earlier node ID
+  keeps its held place under its new node ID, whether the node dials it or
+  it calls in, and `getminermeshinfo` reports it as `preferred` and
+  connected. Two connected nodes that prove one gateway's ID make it
+  `ambiguous`. A returning gateway can displace a lower-ranked gateway only
+  while preserving the node's outbound reserve. A dialed gateway stays
+  connected in its ordinary slot while it waits for promotion. No node ID, record or
+  protocol version changes
+  ([#2766](https://github.com/zakura-core/zakura/pull/2766)).
+- `zakura-quic` adds `Conn::remote_earlier_ids()`, the earlier node IDs a
+  connection's peer proved in its handshake, in both directions, and
+  `MAX_EARLIER_NODE_IDS`
+  ([#2766](https://github.com/zakura-core/zakura/pull/2766)).
+- A v2 discovery record may now be up to 8,649 bytes, where the limit was
+  753. The extra room is reserved for a post-quantum record signature and
+  its public key, which a later release can add without a break. This
+  release signs records with Ed25519 alone and does not use the room. The
+  discovery requester checks the reply length against its query before reading
+  the payload. Each admitted v2 connection budgets 584,304 more bytes. The default
+  `network.zakura.peer_memory_budget_bytes` still funds the default
+  connection count. A custom budget can now fund several fewer connections.
+  If it funds fewer than the minimum, the node refuses to start. Raise the
+  budget or reduce the configured QUIC windows or handshake headroom
+  ([#2768](https://github.com/zakura-core/zakura/pull/2768)).
+- A v2 node key list may now hold 32 entries, where the limit was 4, so a
+  node ID can take 30 more signature keys over its lifetime before a
+  protocol break. A dial to a node ID that a peer had before it added keys
+  is now accepted only when that ID names the first entries of the peer's
+  current key list, in order. A later release therefore adds each key
+  after the ones a node already has. Nodes with today's two keys keep
+  their node IDs, and nothing changes for them on the wire. A v2 discovery
+  record may now be up to 9,601 bytes, where the limit was 8,649, because
+  it carries the whole key list. Each admitted v2 connection budgets
+  70,448 more bytes. The default
+  `network.zakura.peer_memory_budget_bytes` still funds the default
+  connection count. A custom budget may fund fewer connections after the
+  upgrade. If it can no longer fund the minimum number of connections, the
+  node refuses to start. To keep the same capacity, increase the budget
+  by 70,448 bytes per admitted connection before upgrading
+  ([#2770](https://github.com/zakura-core/zakura/pull/2770)).
+- `zakura-quic` raises `MAX_NODE_KEYS` to 32 and `MAX_NODE_KEY_LIST_BYTES`
+  to 1,089, keeps `MAX_CREDENTIAL_BYTES` at 10,385 as a limit on the whole
+  credential, and adds `CredentialError::TooLong` for a credential above
+  it ([#2770](https://github.com/zakura-core/zakura/pull/2770)).
 
-## [1.9.0-rc1] - 2026-11-21
+### Removed
 
-### Changed
-
-- Finalized transaction bodies now move out of RocksDB into append-only
-  static files in the state directory, in the background and at least 50
-  blocks at a time. On first start the node upgrades its database in place
-  to state format v32. Older releases can't open the upgraded database, so
-  going back means a fresh sync or restoring a backup from before the
-  upgrade ([#2146](https://github.com/zakura-core/zakura/pull/2146)).
-- A Mainnet archive node grows by about 11 GB at the peak of the move,
-  because the new static files sit next to the old RocksDB data until
-  RocksDB frees it. Leave that much free disk. If a static file write
-  fails, for example on a full disk, moves stop until zakurad restarts, so
-  free space and restart it
-  ([#2146](https://github.com/zakura-core/zakura/pull/2146)).
-- Back up the `static_files` directory along with RocksDB, because a
-  RocksDB checkpoint no longer holds finalized transaction bodies. Copy the
-  whole state directory with zakurad stopped or take a filesystem snapshot,
-  and don't hard link static files into a restore
-  ([#2146](https://github.com/zakura-core/zakura/pull/2146)).
-- Upgrade read-only RPC secondaries together with their primary, and stop
-  them around `zakurad rollback-state`. A v31 secondary can't follow a v32
-  primary, and rollback shortens static files in place
-  ([#2146](https://github.com/zakura-core/zakura/pull/2146)).
-- A pruned node that started as an archive used to keep serving old
-  transaction bodies below its pruning marker. After the first static file
-  move it treats them as pruned
-  ([#2146](https://github.com/zakura-core/zakura/pull/2146)).
-- With the experimental core mempool, a new block no longer scans the whole
-  pool for conflicting and expired transactions, so its cost follows the
-  block's size instead of the pool's
-  ([#2636](https://github.com/zakura-core/zakura/pull/2636)).
-- With the experimental `tx-relay` enabled, the
-  `zakura.p2p.tx_relay.inv_ids` counter is now
-  `zakura.p2p.tx_relay.have_ids`, because the announcement message is now
-  called `Have`. Update dashboards that read the old name. The wire format
-  is unchanged ([#2665](https://github.com/zakura-core/zakura/pull/2665)).
-
-### Fixed
-
-- Header sync now takes equal peer offers in arrival order, so peers that
-  reconnect under fresh keys or overstate their chain work can't keep an
-  honest peer's headers from being requested
-  ([#2638](https://github.com/zakura-core/zakura/pull/2638)).
-- With the experimental `tx-relay` enabled, a new connection accepts at
-  most its peer's 544 KB `Have` opening allowance plus what 256 KB/s earns
-  since the handshake, instead of about 44 MB
-  ([#2637](https://github.com/zakura-core/zakura/pull/2637)).
-
-### Security
-
-- With the experimental `tx-relay` enabled, orphan transactions and late
-  `notfound` answers now shrink a peer's request window, and tx-relay
-  fetches can hold at most 250 of the pool core's 500 slots, so peers can't
-  crowd out local submissions, legacy peers or re-admissions after a reset
-  ([#2634](https://github.com/zakura-core/zakura/pull/2634)).
-
-## [1.9.0-rc0] - 2026-11-20
-
-### Added
-
-- Mining nodes push newly mined blocks to peers in the initial announcement
-  group that advertise `NODE_BLOCK_PUSH`, saving one request round trip.
-  The opt-in `network.push_relayed_blocks` setting also pushes blocks this
-  node relays after it commits them, which can send an extra copy to a
-  peer that already has the block
-  ([#2537](https://github.com/zakura-core/zakura/pull/2537)).
-- Added the binary `/submittrustedblock` endpoint, enabled through
-  `rpc.enable_trusted_block_submission`. It can start relaying a new block
-  before local validation and follows the RPC listener's cookie-authentication
-  setting. Submit only final block bytes verified by a trusted full node,
-  because peers can ban a relay that sends an invalid block. Zakura withdraws
-  pending announcements and responses when a submission is rejected or
-  times out. The endpoint returns `inconclusive` when it cannot establish
-  the result, so the caller can retry
-  ([#2534](https://github.com/zakura-core/zakura/pull/2534)).
-- Added the opt-in `[network.block_download_score_and_hedge]` setting.
-  With `enabled = true`, Zakura picks a legacy peer using recent response
-  times and can send one backup request when a later announcer is likely
-  to deliver sooner or the first request stalls. Peer and request events
-  can trigger the backup. If you tried the feature in a development build,
-  replace `[network.block_source_score]` and remove its `second_request`
-  key
-  ([#2572](https://github.com/zakura-core/zakura/pull/2572),
-  [#2595](https://github.com/zakura-core/zakura/pull/2595),
-  [#2596](https://github.com/zakura-core/zakura/pull/2596)).
-- Added the `[mempool] implementation` setting. `default` and `classic` keep
-  the pool nodes run today. `core` runs the new pool core, which is
-  experimental
-  ([#2502](https://github.com/zakura-core/zakura/pull/2502)).
-- Added `tx-relay`, an experimental v2 P2P service that moves transactions
-  between Zakura peers and hands them to the pool core. It is off by
-  default. It runs only with `[network.zakura.tx_relay] enabled = true`, the
-  v2 stack on, and `[mempool] implementation = "core"`. While a peer has a
-  live `tx-relay` session, the legacy adapter leaves that peer's
-  transactions to it. New `zakura.p2p.tx_relay.*` metrics count what it
-  moves, and the existing `zakura.p2p.legacy.inbound.refused` counter gains
-  a `type` label. The experimental `advert_delay` (2 s),
-  `advert_window_full_tx` (4) and `advert_window_small_tx` (16) keys tune
-  its fan-out
-  ([#2503](https://github.com/zakura-core/zakura/pull/2503)).
-- Added mempool metrics for canaries: the pool core exports how many
-  transactions it pools and how many a reset took out that are not back
-  yet, and `mempool.implementation` shows which pool the node resolved to
-  ([#2506](https://github.com/zakura-core/zakura/pull/2506)).
-- Added `zakura.p2p.tx_relay.registered`, which says whether the node
-  registered `tx-relay`
-  ([#2506](https://github.com/zakura-core/zakura/pull/2506)).
-
-### Changed
-
-- With `trace_dir` set, the legacy request rows in `legacy_peer_request.jsonl` now follow
-  `network.expose_peer_addresses`: they hold the peer's address when it is set and stay
-  redacted when it is not. Each row also carries the peer's user agent, and a peer upgraded
-  to Zakura gets one `peer_upgraded` row in `handshake.jsonl` with its trace label, its
-  address under the same setting, and its user agent. The rows' `peer_id` column is now
-  `connection_id`, the same number the connection's `legacy_gossip.jsonl` rows carry
-  ([#2455](https://github.com/zakura-core/zakura/pull/2455)).
-- Serving a block to several legacy peers uses less CPU by reusing its
-  serialized bytes and sharing its checksum across requests
-  ([#2556](https://github.com/zakura-core/zakura/pull/2556),
-  [#2557](https://github.com/zakura-core/zakura/pull/2557)).
-- When Zakura is still verifying a locally submitted block, it waits to
-  download a peer's copy until local verification fails or five seconds
-  pass. The wait leaves the peer-download slot available. Its duration
-  and outcome are recorded in metrics and, when enabled, in
-  `commit_state.jsonl`
-  ([#2562](https://github.com/zakura-core/zakura/pull/2562)).
-- The experimental core mempool builds each snapshot from the previous one,
-  reducing CPU use as the pool fills
-  ([#2591](https://github.com/zakura-core/zakura/pull/2591)).
-- The `pool.route_inv.hedge.not_yet.count` and
-  `pool.route_inv.hedge.no_candidate.count` metrics count decisions to send
-  a backup block request. `pool.route_inv.hedge.held` shows how many
-  downloads are waiting for one
-  ([#2596](https://github.com/zakura-core/zakura/pull/2596)).
-- A stalled v2 frame read now resets its session or one-shot request. Sibling
-  services can keep using the connection. Header sync counts an unanswered
-  subscription `Close` from the completion of its write. A second header-sync or
-  block-sync stall on the same connection can close it without a peer fault
-  ([#2604](https://github.com/zakura-core/zakura/pull/2604)).
-- Inbound v2 handshakes now share a node-wide rate of 24 starts a second for
-  each source validation state. The last 8 tokens go only to an address within
-  its share of 3 starts a second, so a few busy addresses can't refuse the rest.
-  The 10-second handshake deadline now starts when the connection is accepted.
-  Every TLS start keeps its node and address charges
-  ([#2604](https://github.com/zakura-core/zakura/pull/2604)).
-- Discovery dispatch uses a wall-clock budget even when its receive queue fills.
-  Header sync meters peer `Status` messages and locator walks for new
-  subscriptions per connection, so reopening a session gets no fresh burst
-  ([#2604](https://github.com/zakura-core/zakura/pull/2604)).
-- The experimental `tx-relay` service uses less memory with many connected
-  peers. It sizes each peer's request window based on recent deliveries
-  and announces new transactions to the lowest-latency peers first
-  ([#2623](https://github.com/zakura-core/zakura/pull/2623)).
+- Removed the end-of-support opt-out and restored the mandatory Mainnet halt
+  after block 3,660,343, the cutoff projected for December 10, 2026
+  ([#2757](https://github.com/zakura-core/zakura/pull/2757)).
 
 ### Fixed
 
@@ -361,6 +504,37 @@ independently.
   parents is checked again at once for the first two parents to arrive per
   block, then at most every 10 s, instead of once per arriving parent
   ([#2619](https://github.com/zakura-core/zakura/pull/2619)).
+- Header sync now takes equal peer offers in arrival order, so peers that
+  reconnect under fresh keys or overstate their chain work can't keep an
+  honest peer's headers from being requested
+  ([#2638](https://github.com/zakura-core/zakura/pull/2638)).
+- With the experimental `tx-relay` enabled, a new connection accepts at
+  most its peer's 544 KB `Have` opening allowance plus what 256 KB/s earns
+  since the handshake, instead of about 44 MB
+  ([#2637](https://github.com/zakura-core/zakura/pull/2637)).
+- Verbose `getblock` omits `valueDelta` when the parent block's balances are
+  missing, instead of reporting each whole balance as the block's change
+  ([#2648](https://github.com/zakura-core/zakura/pull/2648)).
+- The built-in Mainnet and Testnet v2 bootstrap peers, and the default
+  config's `zakura.bootstrap_peers`, now name the seeds by their
+  post-quantum node IDs, so a v2-only node can bootstrap again
+  ([#2698](https://github.com/zakura-core/zakura/pull/2698)).
+- Overlapping deliveries of one block from legacy gossip, block sync, and BPv1 now verify the block's transactions once; the later deliveries return a duplicate ([#2726](https://github.com/zakura-core/zakura/pull/2726)).
+- With BPv1 enabled, BPv1 leaves blocks more than 16 above the verified tip to block sync, applies blocks only while native sync owns applies, and times out a stuck submission after two minutes ([#2726](https://github.com/zakura-core/zakura/pull/2726)).
+- With BPv1 enabled, a node checks the coinbase binding, height, target, and proof of work of block metadata whose parent header is unknown before it holds the metadata, and it closes peers that send invalid ones ([#2728](https://github.com/zakura-core/zakura/pull/2728)).
+- With BPv1 enabled, block metadata that waits for its parent resumes when header sync moves the best header past the parent to the block itself, so the block still arrives through BPv1 ([#2728](https://github.com/zakura-core/zakura/pull/2728)).
+- With BPv1 enabled, a node now closes every peer that sent the same failed block metadata, and it checks a relay's differing copy before it falls back to block sync ([#2730](https://github.com/zakura-core/zakura/pull/2730)).
+- With BPv1 enabled, a node now closes a peer that repeats a retired block's metadata, or that reuses or overlaps a part request before the node writes that request's end ([#2730](https://github.com/zakura-core/zakura/pull/2730)).
+- With BPv1 enabled, a block keeps BPv1's body claim while it verifies, so block sync no longer downloads a second copy, and verification falls back to block sync after two minutes ([#2731](https://github.com/zakura-core/zakura/pull/2731)).
+- With BPv1 enabled, a retryable verdict on a block whose parent is not committed keeps the assembled body and resubmits it once the parent commits, instead of downloading the block again ([#2731](https://github.com/zakura-core/zakura/pull/2731)).
+- With BPv1 enabled, the block whose parent is the verified tip always gets a BPv1 slot, even when every slot holds a block waiting on its parent ([#2731](https://github.com/zakura-core/zakura/pull/2731)).
+- Recover stalled dual nodes near the chain tip sooner when legacy peers have blocks ahead
+  ([#2748](https://github.com/zakura-core/zakura/pull/2748)).
+- With BPv1 enabled, a peer that reconnects while one of its blocks is in admission now gets the block's metadata on its new connection, so the node pulls the block's parts from it instead of offering it the same pull request repeatedly until the block falls back to block sync ([#2761](https://github.com/zakura-core/zakura/pull/2761)).
+- With BPv1 enabled, a peer's replaced connection no longer cancels the part buffer charge of a part that its new connection delivered, so the node stores that part ([#2761](https://github.com/zakura-core/zakura/pull/2761)).
+- With BPv1 enabled, a peer's replaced connection no longer releases a pull request that its new connection holds, so the node no longer requests the same part twice after a reconnect ([#2761](https://github.com/zakura-core/zakura/pull/2761)).
+- With BPv1 enabled, a peer's replaced connection now releases its pending pull requests and pushes when it ends, and an ended connection no longer clears what the peer's new connection already announced, so the node keeps pulling from a peer that reconnects ([#2761](https://github.com/zakura-core/zakura/pull/2761)).
+- With BPv1 enabled, a part that a reconnected peer pushes again on its new connection stays expected when the old connection ends, keeps the time by which the node expected it, and can't be taken back by a late message from the old connection. The node can also pull a part from the new connection that the old connection had been pushing ([#2761](https://github.com/zakura-core/zakura/pull/2761)).
 
 ### Security
 
@@ -374,6 +548,11 @@ independently.
   and checks a page's credit before hashing it, and discovery checks a `Hello`'s
   network and chain before its signature
   ([#2604](https://github.com/zakura-core/zakura/pull/2604)).
+- With the experimental `tx-relay` enabled, orphan transactions and late
+  `notfound` answers now shrink a peer's request window, and tx-relay
+  fetches can hold at most 250 of the pool core's 500 slots, so peers can't
+  crowd out local submissions, legacy peers or re-admissions after a reset
+  ([#2634](https://github.com/zakura-core/zakura/pull/2634)).
 
 ## [1.8.9] - 2026-11-16
 

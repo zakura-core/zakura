@@ -851,6 +851,23 @@ pub enum BackendExecutionError {
 }
 
 impl Config {
+    /// Returns how many blocks below `max_checkpoint_height` the state keeps queued
+    /// outputs available to full verification.
+    ///
+    /// The syncer can have its whole scaled checkpoint pipeline queued when full
+    /// verification starts, so this uses the same [`LookaheadScale`] as the syncer,
+    /// at the final checkpoint. [`Self::backend_verification_total`] bounds it at
+    /// startup.
+    pub fn checkpoint_output_lookahead(
+        &self,
+        network: &Network,
+        max_checkpoint_height: Height,
+    ) -> usize {
+        LookaheadScale::at(network, max_checkpoint_height)
+            .scale(self.checkpoint_verify_concurrency_limit)
+            * (VERIFICATION_PIPELINE_SCALING_MULTIPLIER + 1)
+    }
+
     /// Check that the sync and gossip paths fit one verifier allowance, then return
     /// the block verifications they can hold together on `network`.
     ///

@@ -4796,6 +4796,53 @@ fn lookahead_scale_follows_zip_218_and_zip_223() {
     );
 }
 
+/// The state keeps queued outputs for the syncer's whole scaled checkpoint
+/// pipeline, so a block just past the final checkpoint finds outputs from
+/// checkpoint blocks still in the write queue.
+#[test]
+fn checkpoint_output_lookahead_covers_the_scaled_pipeline() {
+    let config = sync::Config::default();
+    let max_checkpoint_height = Height(10_000);
+    let twenty_second = zakura_chain::parameters::testnet::Parameters::build()
+        .with_activation_heights(
+            zakura_chain::parameters::testnet::ConfiguredActivationHeights {
+                blossom: Some(1),
+                nu7: Some(10),
+                nu7_1: Some(20),
+                ..Default::default()
+            },
+        )
+        .expect("activation heights are valid")
+        .clear_funding_streams()
+        .to_network()
+        .expect("configured testnet is valid");
+
+    let tip = max_checkpoint_height
+        .previous()
+        .expect("the test checkpoint is above genesis");
+    let (_, pause_height, _) = lookahead_heights(
+        Some(tip),
+        config.checkpoint_verify_concurrency_limit,
+        LookaheadScale::at(&twenty_second, tip),
+    );
+    let lookahead = config.checkpoint_output_lookahead(&twenty_second, max_checkpoint_height);
+    // 1,000 configured blocks, 3.75 times at 20 seconds, for the pipeline's 3 stages.
+    assert_eq!(lookahead, 11_250);
+    assert!(
+        pause_height - tip
+            <= block::HeightDiff::try_from(lookahead).expect("the test lookahead fits")
+    );
+
+    // At 75 seconds the window keeps its unscaled size.
+    assert_eq!(
+        config.checkpoint_output_lookahead(
+            &Network::new_regtest(Default::default()),
+            max_checkpoint_height
+        ),
+        3_000
+    );
+}
+
 /// The downloader must not drop blocks inside the syncer's scaled request window.
 #[test]
 fn scaled_lookahead_stays_below_the_drop_height() {

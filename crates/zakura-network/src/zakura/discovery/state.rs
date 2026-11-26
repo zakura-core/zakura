@@ -371,10 +371,7 @@ impl DiscoveryState {
         // replacement that changes direction, needs a free slot in the
         // destination pool. A rejected replacement leaves the current session.
         if current_direction != Some(direction) {
-            let cap = match direction {
-                ServicePeerDirection::Inbound => self.config.peer_limits.max_inbound_peers,
-                ServicePeerDirection::Outbound => self.config.peer_limits.max_outbound_peers,
-            };
+            let cap = self.config.peer_limits.max_for(direction);
             if self.admitted_in(direction) >= cap {
                 return ServiceAdmissionDecision::RejectFull;
             }
@@ -429,7 +426,7 @@ impl DiscoveryState {
             self.admitted_in(ServicePeerDirection::Outbound),
         );
         assert!(
-            inbound <= limits.max_inbound_peers && outbound <= limits.max_outbound_peers,
+            inbound <= limits.max_inbound() && outbound <= limits.max_outbound(),
             "{PROPERTY}: {inbound} inbound and {outbound} outbound sessions exceed a direction cap"
         );
         assert!(

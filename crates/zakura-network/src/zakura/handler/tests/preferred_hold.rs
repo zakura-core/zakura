@@ -23,14 +23,15 @@ fn handler_from_config(config: &Config) -> ZakuraProtocolHandler {
 
 fn handler(ordinary: usize, extra: usize) -> ZakuraProtocolHandler {
     let mut config = Config::default();
-    config.zakura.max_connections = ordinary;
-    config.zakura.peer_memory_budget_bytes = u64::try_from(config.zakura.quic_memory_bytes(
-        &config.network,
-        ordinary + extra,
-        &[],
-    ))
-    .expect("test capacities fit in u64");
-    handler_from_config(&config)
+    config.zakura.max_connections = Some(ordinary);
+    let mut limits = ZakuraLocalLimits::from_config(&config);
+    limits.max_preferred_connections = extra;
+    ZakuraProtocolHandler::new(
+        ZakuraSupervisorHandle::new(DEFAULT_ZAKURA_MAX_CONNS_PER_IP),
+        Network::Mainnet,
+        ZakuraHandshakeConfig::for_network(&Network::Mainnet),
+        limits,
+    )
 }
 
 /// A fresh node ID. Slots and rankings key on its 32 bytes alone, so no key
@@ -306,60 +307,48 @@ fn a_caller_in_backoff_is_granted() {
     assert_eq!(split(&handler).preferred, 1);
 }
 
-/// A full ordinary pool can immediately admit every funded gateway.
+/// A full ordinary pool admits every held gateway at once. The default
+/// limits hold ten places above the ordinary cap, and the transport binds
+/// them. `Consumer::Sessions` funds them (`SessionDirections`).
 #[test]
-fn default_and_explicit_memory_budgets_fund_gateways_after_ordinary_peers() {
-    for (budget, extra) in [(None, 10), (Some(15_u64 << 30), 1), (Some(14_u64 << 30), 0)] {
-        let mut config = Config::default();
-        if let Some(bytes) = budget {
-            config.zakura.peer_memory_budget_bytes = bytes;
-        }
-        let handler = handler_from_config(&config);
-        let limits = &handler.limits;
-        assert_eq!(limits.max_preferred_connections, extra);
-        let ordinary_cap = limits.max_connections;
-        if extra > 0 {
-            assert_eq!(ordinary_cap, 92);
-        }
-        let bind = limits.quic_bind_config(Vec::new());
-        assert_eq!(
-            bind.max_connections,
-            ordinary_cap + extra + limits.max_pending_handshakes
-        );
-        assert!(
-            config
-                .zakura
-                .quic_memory_bytes(&config.network, ordinary_cap + extra, &[])
-                <= u128::from(config.zakura.peer_memory_budget_bytes)
-        );
-        let inbound = limits.max_inbound_connections();
-        let _inbound = fill(&handler, inbound, true);
-        let _dials = fill(&handler, ordinary_cap - inbound, false);
-        let ranked = gateways(11, GatewayStanding::Dialable);
-        publish(&handler, &ranked);
-        assert_eq!(hold(&handler), extra);
-        assert_eq!(handler.free_connection_slots(), 0);
-        assert!(ordinary(&handler, false).is_err());
-        let mut guards = Vec::new();
-        for &(node, _) in &ranked[..extra] {
-            assert!(admits_a_caller(
-                &handler,
-                u8::try_from(guards.len() + 1).unwrap()
-            ));
-            guards.push(
-                handler
-                    .claim_connection(node, true)
-                    .expect("funded gateway place"),
-            );
-        }
-        assert_eq!(split(&handler).ordinary, ordinary_cap);
-        assert_eq!(split(&handler).preferred, extra);
-        assert!(!admits_a_caller(&handler, 2));
-        assert_eq!(
-            handler.claim_connection(ranked[extra].0, false).map(drop),
-            Err(SlotRefusal::Full)
+fn a_full_ordinary_pool_admits_every_held_gateway() {
+    let handler = handler_from_config(&Config::default());
+    let limits = &handler.limits;
+    let extra = crate::zakura::MAX_PREFERRED_GATEWAYS;
+    assert_eq!(limits.max_preferred_connections, extra);
+    let ordinary_cap = limits.max_connections;
+    let bind = limits.quic_bind_config(Vec::new());
+    assert_eq!(
+        bind.max_connections,
+        ordinary_cap + extra + limits.max_pending_handshakes
+    );
+    let inbound = limits.max_inbound_connections();
+    let _inbound = fill(&handler, inbound, true);
+    let _dials = fill(&handler, ordinary_cap - inbound, false);
+    let ranked = gateways(extra + 1, GatewayStanding::Dialable);
+    publish(&handler, &ranked);
+    assert_eq!(hold(&handler), extra);
+    assert_eq!(handler.free_connection_slots(), 0);
+    assert!(ordinary(&handler, false).is_err());
+    let mut guards = Vec::new();
+    for &(node, _) in &ranked[..extra] {
+        assert!(admits_a_caller(
+            &handler,
+            u8::try_from(guards.len() + 1).unwrap()
+        ));
+        guards.push(
+            handler
+                .claim_connection(node, true)
+                .expect("held gateway place"),
         );
     }
+    assert_eq!(split(&handler).ordinary, ordinary_cap);
+    assert_eq!(split(&handler).preferred, extra);
+    assert!(!admits_a_caller(&handler, 2));
+    assert_eq!(
+        handler.claim_connection(ranked[extra].0, false).map(drop),
+        Err(SlotRefusal::Full)
+    );
 }
 
 /// A set change recounts the slots already held, with no claim or release:
@@ -758,6 +747,28 @@ fn a_dialing_or_dialable_member_leaves_the_set_with_its_last_slot() {
         assert_eq!(preferred_set(&handler), [next], "{standing:?}");
         assert_eq!(hold(&handler), 1);
     }
+}
+
+/// A published ranking sets the bytes that ordinary connections leave in
+/// `Consumer::Sessions` for the held places, and an empty ranking frees them.
+#[test]
+fn the_hold_sets_the_gateway_reserve_in_the_session_ledger() {
+    let config = Config::default();
+    let plan = crate::zakura::memory::MemoryPlan::size(64 << 30, &config, &Network::Mainnet)
+        .expect("64 GiB fits the default plan");
+    let pool = plan.build_pool();
+    let handler = handler_from_config(&config).with_memory_pool(plan.clone(), pool);
+    let reserve = || lock_session_directions(&handler.session_directions).gateway_reserve;
+    assert_eq!(reserve(), 0);
+
+    publish(&handler, &gateways(3, GatewayStanding::Dialable));
+    assert_eq!(hold(&handler), 3);
+    assert_eq!(reserve(), plan.gateway_reserve(3));
+    assert!(reserve() > 0);
+
+    publish(&handler, &[]);
+    assert_eq!(hold(&handler), 0);
+    assert_eq!(reserve(), 0);
 }
 
 /// A node ID whose first 20 bytes are `prefix` and the rest `last`, so two

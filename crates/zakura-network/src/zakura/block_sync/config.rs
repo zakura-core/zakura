@@ -482,8 +482,8 @@ impl ZakuraBlockSyncConfig {
             .and_then(|count| count.checked_mul(4));
         let peers = self
             .peer_limits
-            .max_inbound_peers
-            .checked_add(self.peer_limits.max_outbound_peers)
+            .max_inbound()
+            .checked_add(self.peer_limits.max_outbound())
             .and_then(|count| u64::try_from(count).ok());
         windows
             .zip(peers)
@@ -581,8 +581,11 @@ impl ZakuraBlockSyncConfig {
     /// outbound peer limit, clamped to `max_connections`.
     pub fn block_sync_connections(&self, max_connections: usize) -> usize {
         self.peer_limits
-            .max_inbound_peers
-            .saturating_add(self.peer_limits.max_outbound_peers)
+            .effective_max_inbound_peers(max_connections)
+            .saturating_add(
+                self.peer_limits
+                    .effective_max_outbound_peers(max_connections),
+            )
             .min(max_connections)
     }
 
@@ -608,6 +611,7 @@ impl ZakuraBlockSyncConfig {
     /// unset serving output budget becomes one session's budget on each of
     /// those `x` connections. A configured value stays.
     pub fn for_node_connections(mut self, max_connections: usize) -> Self {
+        self.peer_limits = self.peer_limits.resolved_for_connections(max_connections);
         if self.max_inflight_block_bytes.is_none() {
             self.max_inflight_block_bytes =
                 Some(self.derived_inflight_block_bytes(max_connections));
@@ -654,7 +658,8 @@ impl ZakuraBlockSyncConfig {
         // The block-sync share sets the QUIC stream receive window, which
         // can't exceed QUIC's ceiling.
         match block_sync_reactor_budget(self.bbr_max_cwnd_bytes, self.floor_bypass_slots) {
-            Ok(budget) if budget.receive <= zakura_quic::MAX_STREAM_RECEIVE_WINDOW_BYTES => {}
+            Ok(budget)
+                if budget.receive_total() <= zakura_quic::MAX_STREAM_RECEIVE_WINDOW_BYTES => {}
             _ => {
                 return Err(
                     "bbr_max_cwnd_bytes and floor_bypass_slots must keep the block-sync \
@@ -832,8 +837,8 @@ mod owner_cap_tests {
         // A node without block-sync peers still covers one floor request.
         let no_peers = ZakuraBlockSyncConfig {
             peer_limits: crate::zakura::ServicePeerLimits {
-                max_inbound_peers: 0,
-                max_outbound_peers: 0,
+                max_inbound_peers: Some(0),
+                max_outbound_peers: Some(0),
                 ..config.peer_limits
             },
             ..config.clone()
@@ -845,8 +850,17 @@ mod owner_cap_tests {
                 .inflight_block_bytes(),
             no_peers.floor_request_byte_reservation() + 1
         );
-        // The peer limits bind when the node admits more connections.
-        assert_eq!(config.block_sync_connections(10_000), 512);
+        // Unset peer limits follow the node connection cap; explicit limits bind when smaller.
+        assert_eq!(config.block_sync_connections(10_000), 10_000);
+        let explicit = ZakuraBlockSyncConfig {
+            peer_limits: crate::zakura::ServicePeerLimits {
+                max_inbound_peers: Some(256),
+                max_outbound_peers: Some(256),
+                ..config.peer_limits
+            },
+            ..config.clone()
+        };
+        assert_eq!(explicit.block_sync_connections(10_000), 512);
         assert_eq!(config.block_sync_connections(0), 0);
     }
 
@@ -866,7 +880,7 @@ mod owner_cap_tests {
 
     #[test]
     fn validation_keeps_the_block_sync_share_within_the_quic_stream_window() {
-        let fixed = BLOCK_SYNC_REACTOR_BUDGET.receive - DEFAULT_BS_BBR_MAX_CWND_BYTES;
+        let fixed = BLOCK_SYNC_REACTOR_BUDGET.receive_total() - DEFAULT_BS_BBR_MAX_CWND_BYTES;
         let largest_cwnd = zakura_quic::MAX_STREAM_RECEIVE_WINDOW_BYTES - fixed;
         let mut config = ZakuraBlockSyncConfig {
             bbr_max_cwnd_bytes: largest_cwnd,

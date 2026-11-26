@@ -95,8 +95,11 @@ impl ZakuraHeaderSyncConfig {
     /// `max_connections`.
     pub(crate) fn serving_sessions(&self, max_connections: usize) -> usize {
         self.peer_limits
-            .max_inbound_peers
-            .saturating_add(self.peer_limits.max_outbound_peers)
+            .effective_max_inbound_peers(max_connections)
+            .saturating_add(
+                self.peer_limits
+                    .effective_max_outbound_peers(max_connections),
+            )
             .min(max_connections)
     }
 
@@ -104,6 +107,7 @@ impl ZakuraHeaderSyncConfig {
     /// output budget becomes one session's budget on each of
     /// [`Self::serving_sessions`]. A configured value stays.
     pub fn for_node_connections(mut self, max_connections: usize) -> Self {
+        self.peer_limits = self.peer_limits.resolved_for_connections(max_connections);
         if self.node_serve_output_bytes.is_none() {
             self.node_serve_output_bytes = Some(
                 super::v9::serving_limits(

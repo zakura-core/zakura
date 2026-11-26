@@ -431,8 +431,8 @@ impl HarnessConfig {
             request_timeout: Duration::from_secs(60),
             status_refresh_interval: Duration::from_millis(200),
             peer_limits: ServicePeerLimits {
-                max_inbound_peers: self.seeds.saturating_add(1),
-                max_outbound_peers: self.seeds.saturating_add(1),
+                max_inbound_peers: Some(self.seeds.saturating_add(1)),
+                max_outbound_peers: Some(self.seeds.saturating_add(1)),
                 inbound_queue_depth: usize::from(self.max_inflight).saturating_mul(2).max(128),
                 outbound_queue_depth: usize::from(self.max_inflight).saturating_mul(2).max(128),
                 ..ServicePeerLimits::default()

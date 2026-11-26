@@ -586,10 +586,9 @@ pub const BLOCK_SUBSIDY_FRACTION_NUMERATOR: u128 = 1_375;
 /// Returns `floor(LN2_SCALED / HalvingInterval(height))` for `network`.
 ///
 /// Below NU7.1 the interval is NU7's, even for pre-NU7 heights. From NU7.1 it's ZIP 223's,
-/// `5/4` of NU7's, which gives 1,100 instead of 1,375 on Mainnet and keeps daily
-/// reissuance the same at 20 second spacing. Computing `LN2_SCALED * spacing /
-/// (PostBlossomHalvingInterval * 75)` keeps the interval exact for any configured
-/// post-Blossom interval.
+/// `5/4` of NU7's, which gives 1,100 instead of 1,375 on Mainnet. That keeps the
+/// fraction reissued per day the same at 20 second spacing, apart from per-block
+/// rounding.
 ///
 /// Returns an error if the interval would round the numerator to zero.
 pub fn block_subsidy_fraction_numerator(
@@ -601,6 +600,17 @@ pub fn block_subsidy_fraction_numerator(
     } else {
         POST_NU7_POW_TARGET_SPACING
     };
+    reissuance_fraction_numerator_for_spacing(network, spacing)
+}
+
+/// Returns `floor(LN2_SCALED / H)`, where `H` is the halving interval at `spacing` seconds.
+///
+/// Computing `LN2_SCALED * spacing / (PostBlossomHalvingInterval * 75)` keeps the interval
+/// exact for any configured post-Blossom interval.
+fn reissuance_fraction_numerator_for_spacing(
+    network: &Network,
+    spacing: u32,
+) -> Result<u128, SubsidyError> {
     let interval_blocks_times_spacing = u128::try_from(network.post_blossom_halving_interval())
         .map_err(|_| SubsidyError::InvalidReissuanceFraction)?
         * u128::from(POST_BLOSSOM_POW_TARGET_SPACING);
@@ -671,8 +681,8 @@ pub(crate) fn nsm_reissuance_crossing_height(
         subsidy,
         max_money,
         // ZIP 223 leaves the trigger open for a second spacing change, so it keeps
-        // NU7's fraction until that's specified.
-        block_subsidy_fraction_numerator(network, nu7)?,
+        // NU7's fraction until that's specified, even where NU7.1 shares NU7's height.
+        reissuance_fraction_numerator_for_spacing(network, POST_NU7_POW_TARGET_SPACING)?,
     )?
     .map(Height))
 }

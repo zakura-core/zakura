@@ -2,6 +2,10 @@
 
 use super::*;
 
+/// Mainnet's NU7 height, where these NU7 reissuance vectors apply.
+const MAINNET_NU7: crate::block::Height =
+    crate::parameters::constants::activation_heights::mainnet::NU7;
+
 proptest::proptest! {
     #[test]
     fn max_money_reissuance_matches_wide_integer_oracle(balance in 0i64..=MAX_MONEY) {
@@ -9,7 +13,7 @@ proptest::proptest! {
         for balance in [0, 1, MAX_MONEY - 1, MAX_MONEY, balance] {
             let product = u128::try_from(balance).unwrap() * 1_375;
             let expected = product / 10_000_000_000 + u128::from(!product.is_multiple_of(10_000_000_000));
-            let actual = reissuance_bonus(Amount::try_from(balance).unwrap(), &Network::Mainnet, Height::MAX).unwrap();
+            let actual = reissuance_bonus(Amount::try_from(balance).unwrap(), &Network::Mainnet, MAINNET_NU7).unwrap();
             proptest::prop_assert_eq!(u128::try_from(i64::from(actual)).unwrap(), expected);
             proptest::prop_assert!(i64::from(actual) <= balance);
         }
@@ -70,8 +74,9 @@ fn nu7_1_network(
         .to_network()
 }
 
-/// ZIP 223 lowers the reissuance fraction from 1,375 to 1,100 at NU7.1, so daily
-/// reissuance stays the same: 3,456 blocks of 1,375 equal 4,320 blocks of 1,100.
+/// ZIP 223 lowers the reissuance fraction from 1,375 to 1,100 at NU7.1, so the
+/// fraction reissued per day stays the same: 3,456 blocks of 1,375 equal 4,320
+/// blocks of 1,100.
 #[test]
 fn reissuance_fraction_changes_at_nu7_1() {
     const NU7_1: u32 = 100;
@@ -99,6 +104,21 @@ fn reissuance_fraction_changes_at_nu7_1() {
         nu7_1_network(1_155_280_000, NU7_1),
         Err(crate::parameters::network::error::ParametersBuilderError::InvalidReissuanceFraction)
     ));
+}
+
+/// The reissuance trigger keeps NU7's fraction even where NU7.1 shares NU7's height.
+#[test]
+fn reissuance_trigger_keeps_the_nu7_fraction_at_a_shared_nu7_1_height() {
+    let network = nu7_1_network(840_000, 1).unwrap();
+    assert_eq!(
+        block_subsidy_fraction_numerator(&network, Height(1)),
+        Ok(1_100)
+    );
+    // NU7's 1,375 gives this crossing. NU7.1's 1,100 would give 22,409,143.
+    assert_eq!(
+        nsm_reissuance_crossing_height(&network),
+        Ok(Some(Height(24_227_324)))
+    );
 }
 
 #[test]

@@ -68,7 +68,7 @@ pub enum ParametersBuilderError {
     #[non_exhaustive]
     InvalidHalvingInterval,
 
-    #[error("NU7 halving interval must produce a positive reissuance fraction")]
+    #[error("NU7 and NU7.1 halving intervals must produce positive reissuance fractions")]
     #[non_exhaustive]
     InvalidReissuanceFraction,
 

@@ -92,8 +92,9 @@ monetary pool totals.
 
 At the reissuance start height, the bonus becomes
 `ceil(D(parent) * floor(6_931_680_000 / H) / 10_000_000_000)`, where `H` is the
-network's post-NU7 halving interval (ZIP 237). The numerator is 1375 on Mainnet and
-the default Testnet. Each fork uses its own parent balance.
+network's halving interval at that height (ZIP 237): the post-NU7 interval, then 5/4 of
+it from NU7.1 (ZIP 223). The numerator is 1375 on Mainnet and the default Testnet, and
+1100 from NU7.1. Each fork uses its own parent balance.
 Contextual validation rejects negative balances from NU7 onward. The stored type remains
 signed because a chain can run ahead of its schedule before NU7.
 

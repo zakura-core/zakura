@@ -25,8 +25,8 @@
 
 use thiserror::Error;
 use zakura_quic::{
-    verify_record_ml_dsa_65, NodeKeyList, NodeSecretKey, SignatureError, ML_DSA_65_KEY_BYTES,
-    ML_DSA_65_KEY_TAG, ML_DSA_65_SIGNATURE_BYTES,
+    verify_record_ml_dsa_65, NodeKeyList, NodeSecretKey, ML_DSA_65_KEY_BYTES, ML_DSA_65_KEY_TAG,
+    ML_DSA_65_SIGNATURE_BYTES,
 };
 
 /// The header of one extension in a record's extension area: a `u16` type
@@ -43,7 +43,8 @@ pub const RECORD_EXTENSION_ML_DSA_65_SIGNATURE: u16 = 2;
 const KEY_TLV_BYTES: usize = RECORD_EXTENSION_HEADER_BYTES + ML_DSA_65_KEY_BYTES;
 
 /// Bytes of the signature TLV, which the ML-DSA-65 signature does not cover.
-const SIGNATURE_TLV_BYTES: usize = RECORD_EXTENSION_HEADER_BYTES + ML_DSA_65_SIGNATURE_BYTES;
+pub(super) const SIGNATURE_TLV_BYTES: usize =
+    RECORD_EXTENSION_HEADER_BYTES + ML_DSA_65_SIGNATURE_BYTES;
 
 /// Bytes of a record's extension area that its ML-DSA-65 key and signature
 /// take: 5,269.
@@ -141,11 +142,16 @@ fn scan(area: &[u8]) -> Result<Scan, RecordSignatureError> {
 /// Splits `area` under the module's canonical encoding, or says which rule
 /// it breaks. `area` is untrusted: it comes from a peer or the book file.
 pub(super) fn parse(area: &[u8]) -> Result<SignatureExtensions<'_>, RecordSignatureError> {
+    split_signed(area, scan(area)?)
+}
+
+/// Checks the reserved fields from a complete scan of `area` and returns their values.
+fn split_signed(area: &[u8], scan: Scan) -> Result<SignatureExtensions<'_>, RecordSignatureError> {
     let Scan {
         keys,
         signatures,
         last_two,
-    } = scan(area)?;
+    } = scan;
     if keys == 0 {
         return Err(RecordSignatureError::MissingKey);
     }
@@ -176,15 +182,6 @@ pub(super) fn parse(area: &[u8]) -> Result<SignatureExtensions<'_>, RecordSignat
     })
 }
 
-/// The part of a record's Ed25519 pre-image that its ML-DSA-65 signature
-/// covers: everything before the signature TLV, which ends the body.
-///
-/// `pre_image` is the pre-image of a body whose extension area [`parse`]
-/// accepted or [`write_unsigned`] built, so it ends in a whole signature TLV.
-fn signed_bytes(pre_image: &[u8]) -> &[u8] {
-    &pre_image[..pre_image.len() - SIGNATURE_TLV_BYTES]
-}
-
 /// Verifies the ML-DSA-65 signature of the record whose key list is `keys`,
 /// whose extension area is `area`, and whose Ed25519 pre-image is
 /// `pre_image`, which therefore ends in `area`.
@@ -198,69 +195,41 @@ pub(super) fn verify(
     verify_record_ml_dsa_65(
         keys,
         extensions.key,
-        signed_bytes(pre_image),
+        &pre_image[..pre_image.len() - SIGNATURE_TLV_BYTES],
         extensions.signature,
     )
     .map_err(|_| RecordSignatureError::Invalid)
 }
 
-/// Makes `area` the extension area of a record `signer` is about to sign:
-/// the author's other TLVs, the key TLV, and a signature TLV whose value is
-/// still zero.
-///
-/// `area` holds the author's other TLVs on entry. It may also be the area of
-/// an earlier record by `signer`, whose key and signature TLVs are then
-/// replaced. Fails when the other TLVs are not whole, or hold a key or
-/// signature TLV, because no reader would accept the record.
-pub(super) fn write_unsigned(
+/// Keeps the author's other TLVs and appends the key that the ML-DSA signature covers.
+/// When renewing a signed record, replaces its previous key and signature.
+pub(super) fn write_key(
     area: &mut Vec<u8>,
     signer: &NodeSecretKey,
 ) -> Result<(), RecordSignatureError> {
-    if let Ok(SignatureExtensions { other, .. }) = parse(area) {
-        area.truncate(other.len());
+    let scanned = scan(area)?;
+    if scanned.keys != 0 || scanned.signatures != 0 {
+        let signed = split_signed(area, scanned).map_err(|_| RecordSignatureError::Duplicate)?;
+        area.truncate(signed.other.len());
     }
-    let others = scan(area)?;
-    if others.keys != 0 || others.signatures != 0 {
-        return Err(RecordSignatureError::Duplicate);
-    }
-
     let key = signer
         .credential()
         .key(ML_DSA_65_KEY_TAG)
         .expect("a secret key's credential always holds its ML-DSA-65 key in full");
-    let header = |kind: u16, len: usize| {
-        let len = u16::try_from(len).expect("an ML-DSA-65 key or signature is under 64 KiB");
-        [kind.to_le_bytes(), len.to_le_bytes()].concat()
-    };
-    area.reserve(RECORD_ML_DSA_65_EXTENSION_BYTES);
-    area.extend_from_slice(&header(RECORD_EXTENSION_ML_DSA_65_KEY, key.len()));
-    area.extend_from_slice(key);
-    area.extend_from_slice(&header(
-        RECORD_EXTENSION_ML_DSA_65_SIGNATURE,
-        ML_DSA_65_SIGNATURE_BYTES,
-    ));
-    area.resize(area.len() + ML_DSA_65_SIGNATURE_BYTES, 0);
+    append_tlv(area, RECORD_EXTENSION_ML_DSA_65_KEY, key);
     Ok(())
 }
 
-/// Signs the record whose extension area is `area`, as [`write_unsigned`]
-/// built it, and whose Ed25519 pre-image is `pre_image`, which therefore
-/// ends in `area`: writes the ML-DSA-65 signature, hedged with `randomness`,
-/// into the signature TLV of each. Fails only if ML-DSA gives up signing,
-/// which no honest input causes in practice.
-pub(super) fn sign(
-    area: &mut [u8],
-    pre_image: &mut [u8],
-    signer: &NodeSecretKey,
-    randomness: [u8; 32],
-) -> Result<(), SignatureError> {
-    debug_assert!(pre_image.ends_with(area));
-    let signature = signer.sign_record_ml_dsa_65(signed_bytes(pre_image), randomness)?;
-    for bytes in [area, pre_image] {
-        let value_at = bytes.len() - ML_DSA_65_SIGNATURE_BYTES;
-        bytes[value_at..].copy_from_slice(&signature);
-    }
-    Ok(())
+/// Completes the record body for the outer Ed25519 signature.
+pub(super) fn write_signature(area: &mut Vec<u8>, signature: &[u8; ML_DSA_65_SIGNATURE_BYTES]) {
+    append_tlv(area, RECORD_EXTENSION_ML_DSA_65_SIGNATURE, signature);
+}
+
+fn append_tlv(area: &mut Vec<u8>, kind: u16, value: &[u8]) {
+    let len = u16::try_from(value.len()).expect("an ML-DSA-65 key or signature is under 64 KiB");
+    area.extend_from_slice(&kind.to_le_bytes());
+    area.extend_from_slice(&len.to_le_bytes());
+    area.extend_from_slice(value);
 }
 
 #[cfg(any(test, feature = "p2p-fuzz"))]

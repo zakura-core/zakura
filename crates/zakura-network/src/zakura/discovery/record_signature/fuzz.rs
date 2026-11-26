@@ -13,7 +13,7 @@ use zakura_quic::NodeSecretKey;
 
 use super::{
     super::protocol::{ZakuraNodeRecord, ZakuraNodeRecordBody, ZakuraServiceId},
-    parse, verify, write_unsigned, SignatureExtensions, RECORD_EXTENSION_ML_DSA_65_KEY,
+    parse, verify, write_key, write_signature, SignatureExtensions, RECORD_EXTENSION_ML_DSA_65_KEY,
     RECORD_EXTENSION_ML_DSA_65_SIGNATURE,
 };
 use crate::zakura::ZakuraNetworkId;
@@ -140,9 +140,16 @@ fn check_canonical(area: &[u8]) -> Option<SignatureExtensions<'_>> {
     // and gives an area that splits at the same place.
     let mut resigned = extensions.other.to_vec();
     assert_eq!(
-        write_unsigned(&mut resigned, &witness().secret),
+        write_key(&mut resigned, &witness().secret),
         Ok(()),
         "{CANONICAL}: the other TLVs of an accepted area can't be signed again"
+    );
+    write_signature(
+        &mut resigned,
+        extensions
+            .signature
+            .try_into()
+            .expect("parse checked the signature length"),
     );
     assert_eq!(
         parse(&resigned).map(|resigned| resigned.other),

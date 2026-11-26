@@ -369,6 +369,14 @@ impl ZakuraNodeRecordBody {
 
     /// Encodes this body into canonical bytes for signing and verification.
     pub fn encode_for_signature(&self) -> Result<Vec<u8>, DiscoveryWireError> {
+        self.encode_for_signature_with_room(0)
+    }
+
+    /// Encodes only the current body, counting any trailing signature TLV against the final cap.
+    fn encode_for_signature_with_room(
+        &self,
+        trailing_bytes: usize,
+    ) -> Result<Vec<u8>, DiscoveryWireError> {
         validate_record_body_bounds(self)?;
 
         let mut bytes = Vec::new();
@@ -377,7 +385,7 @@ impl ZakuraNodeRecordBody {
         let body_start = bytes.len();
         write_record_body(self, &mut bytes);
         // Bound the body, not the pre-image, so every body that decodes also verifies.
-        let body_len = bytes.len() - body_start;
+        let body_len = (bytes.len() - body_start).saturating_add(trailing_bytes);
         if body_len > MAX_NODE_RECORD_BODY_BYTES {
             return Err(DiscoveryWireError::OversizedPayload {
                 actual: body_len,
@@ -435,11 +443,13 @@ impl ZakuraNodeRecord {
         if &body.keys != secret_key.key_list() {
             return Err(DiscoveryWireError::SigningKeyMismatch);
         }
-        record_signature::write_unsigned(&mut body.extensions, secret_key)?;
-        let mut pre_image = body.encode_for_signature()?;
-        record_signature::sign(&mut body.extensions, &mut pre_image, secret_key, randomness)
+        record_signature::write_key(&mut body.extensions, secret_key)?;
+        let prefix = body.encode_for_signature_with_room(record_signature::SIGNATURE_TLV_BYTES)?;
+        let ml_dsa_signature = secret_key
+            .sign_record_ml_dsa_65(&prefix, randomness)
             .map_err(|_| DiscoveryWireError::RecordSigning)?;
-        let signature = secret_key.sign(&pre_image);
+        record_signature::write_signature(&mut body.extensions, &ml_dsa_signature);
+        let signature = secret_key.sign(&body.encode_for_signature()?);
         Ok(Self { body, signature })
     }
 

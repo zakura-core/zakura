@@ -73,6 +73,27 @@ That mode emits no checkpoints and refuses the other artifact outputs, which onl
 newly selected checkpoint. The height must be one of the embedded checkpoints, and the database
 must agree with the embedded list at it.
 
+#### Checking checkpoint range sizes
+
+Block sync's `Consensus` memory reserve funds one checkpoint range, so it relies on every
+shipped range following the selection rule: at most `MAX_CHECKPOINT_HEIGHT_GAP` (400) heights,
+and under `MAX_CHECKPOINT_BYTE_COUNT` (32 MiB) before its last block. The repository has no
+block sizes, so its tests only check the height gap (`checkpoint_list_hard_coded_max_gap_*` in
+`zakura-chain`). To check the bytes too, run offline mode against a state database of that
+network synced past its last embedded checkpoint. It needs every block's `BlockInfo` size.
+Pruning drops raw transactions but keeps `BlockInfo`, so a pruned database that synced every
+block works. A fast-synced database lacks the heights it skipped, and the run fails at the
+first one:
+
+```sh
+zakura-checkpoints \
+  --state-cache-dir /path/to/zakura-cache \
+  --check-checkpoint-ranges mainnet   # or testnet, for test-checkpoints.txt
+```
+
+The run reads one size per height, checks every range and every embedded hash, and reports the
+largest range. It fails on the first range that breaks the rule.
+
 Do not hand-append RPC-mode output to the Mainnet list: pipeline
 updates must stay on the deterministic selection grid (see
 `docs/design/verified-commitment-trees.md`, "Mainnet release-state pipeline").

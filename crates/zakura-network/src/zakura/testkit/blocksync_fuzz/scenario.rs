@@ -338,8 +338,9 @@ pub(crate) struct Scenario {
 
 impl Scenario {
     /// Block sync's memory for this scenario. The Consensus reserve holds the
-    /// commit window at the draft's per-block charge, as production sizes it,
-    /// and block sync's cap is the scenario's in-flight and look-ahead bound.
+    /// default 401-height commit window at admission's per-block charge, since
+    /// the scenario has no checkpoint list, and block sync's cap is the
+    /// scenario's in-flight and look-ahead bound.
     pub(crate) fn block_sync_memory(&self) -> crate::zakura::BlockSyncMemory {
         let (consensus, block_sync) = self.block_sync_memory_bytes();
         crate::zakura::BlockSyncMemory::with_block_bytes(consensus, block_sync)

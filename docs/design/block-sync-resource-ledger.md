@@ -43,7 +43,7 @@ decides which stream gets the room that acknowledgments free.
 | Requester bookkeeping | Fixed | `MAX_BS_INFLIGHT_REQUESTS`: 32,768 ranges and at most 128 MiB of expected hashes. |
 | Raw stream-6 frames awaiting the routine | The request's lease (`CreditHold`) | `BLOCK_SYNC_INBOUND_QUEUE_DEPTH` (8 frames). `Reservations::admit` disconnects a peer that sends more than it owes. |
 | Look-ahead above the commit window | `BlockSync` | The benefit cap: the peers' BBR windows plus `2 × commit_rate × p99_range_fetch_time`, at most the in-flight cap plus `max_reorder_lookahead_bytes`. |
-| Commit-window bodies (`≤ verified_tip + 401`) | `Consensus` (reserved) | Reserved in full for the worst checkpoint window at admission's charge, `wire + max(4 × wire, decoded)` per block. The draft value is `401 × 5 × MAX_BLOCK_BYTES` (3.73 GiB) until a scan of the chain measures it. Each height holds at most one `Consensus` lease. It never waits on bulk. |
+| Commit-window bodies (up to the next checkpoint, or 53 heights above the last one) | `Consensus` (reserved) | Reserved in full for the larger of one checkpoint range and the semantic window at admission's charge, `wire + max(4 × wire, decoded)` per block. A range holds under `MAX_CHECKPOINT_BYTE_COUNT + MAX_BLOCK_BYTES` (about 170 MiB charged), so the semantic window's `BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES` (512 MiB) sets the reserve. Each height holds at most one `Consensus` lease, and above-floor requests leave one maximum block free for the floor. It never waits on bulk. |
 | Control state | Fixed | 8,192 supplier cooldowns. `Status` keeps the latest value. |
 
 Startup checks every term against `B`, and the pool enforces the leases while the node runs.

@@ -20,8 +20,8 @@ use super::{
 };
 use crate::zakura::{
     block_sync::{
-        events::RoutineToReactor, request::BlockSizeEstimate, test_work_scope,
-        trace::request_owner, BlockSyncStatus,
+        admission::FLOOR_CONSENSUS_HEADROOM_BYTES, events::RoutineToReactor,
+        request::BlockSizeEstimate, test_work_scope, trace::request_owner, BlockSyncStatus,
     },
     memory::Consumer,
     regulation::ReservationPool,
@@ -193,9 +193,10 @@ async fn avoided_work_returns_quietly_with_its_retry_deadline() {
 #[tokio::test]
 async fn refused_above_floor_funding_returns_the_run_without_a_charge() {
     let mut fixture = fixture(1, &[3]);
-    // Admission funds 500 bytes, but the take always admits its first body.
+    // Admission funds 500 bytes past the floor's headroom, but the take
+    // always admits its first body.
     let pool = fixture.routine.io.work.memory_pool().clone();
-    let reserved = pool.available_for(Consumer::Consensus) - 500;
+    let reserved = pool.available_for(Consumer::Consensus) - 500 - FLOOR_CONSENSUS_HEADROOM_BYTES;
     let unrelated = pool
         .try_acquire(Consumer::Consensus, None, reserved)
         .unwrap();
@@ -217,7 +218,7 @@ async fn refused_above_floor_funding_returns_the_run_without_a_charge() {
 async fn a_later_pass_that_stops_before_funding_ends_the_memory_wait() {
     let mut fixture = fixture(1, &[3]);
     let pool = fixture.routine.io.work.memory_pool().clone();
-    let reserved = pool.available_for(Consumer::Consensus) - 500;
+    let reserved = pool.available_for(Consumer::Consensus) - 500 - FLOOR_CONSENSUS_HEADROOM_BYTES;
     let unrelated = pool
         .try_acquire(Consumer::Consensus, None, reserved)
         .unwrap();

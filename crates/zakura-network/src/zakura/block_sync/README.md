@@ -150,7 +150,7 @@ height is just another gated height.
 
 | Condition | Outcome | `take_high` | `max_request_bytes` |
 | --- | --- | --- | --- |
-| `start ≤ window_top` (in-window) | always `Admit` | `min(servable_high, window_top)` | `min(budget_available, response_byte_cap)`; Floor priority floors it at 1 |
+| `start ≤ window_top` (in-window) | always `Admit` | `min(servable_high, window_top)` | `min(consensus_available, response_byte_cap)`, less `FLOOR_CONSENSUS_HEADROOM_BYTES` for above-floor starts; Floor priority floors it at 1 |
 | `start > window` and gate full (bytes **or** blocks), or wire headroom rounds to 0 | `LookaheadAtCap` | — | — |
 | `start > window`, gate open | `Admit` | `servable_high` | `min(budget_available, remaining_wire, response_byte_cap)` |
 | any admitted sizing that still comes to 0 bytes (in-flight budget spent, non-floor) | `InflightBudgetEmpty` | — | — |
@@ -200,10 +200,20 @@ charge, and the simulator compares it with the work queue. It never refuses.
 
 1. **Commit-window heights lease from the Consensus reserve.** Consensus holds one
    lease per height, and the reserve covers the window at admission's per-block
-   charge, so a pinned checkpoint range can always assemble. A Consensus refusal for
-   a commit-window body breaks that invariant: block sync counts it in
-   `sync.block.consensus.lease_refused`, and the simulator asserts it.
-2. **Floor grants never size below one byte**, and `take_request` always takes its
+   charge: one checkpoint range (`WORST_CHECKPOINT_RANGE_CHARGE_BYTES`, about
+   170 MiB) or the semantic window, whichever is larger, which is
+   `BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES` (512 MiB). So a pinned checkpoint range
+   can always assemble. A Consensus refusal for a commit-window body breaks that
+   invariant: block sync counts it in `sync.block.consensus.lease_refused`, and the
+   simulator asserts it.
+2. **The floor always fits in Consensus.** A request without a size hint reserves
+   `MAX_BLOCK_BYTES`, so a range's requests can ask for more than the reserve holds.
+   An above-floor commit-window request leases only while
+   `FLOOR_CONSENSUS_HEADROOM_BYTES` (one maximum block) stays free after it, checked
+   in the same pool call. The lowest missing height can then always lease once
+   earlier requests end: a received body shrinks its lease to its wire bytes, and an
+   expired request releases its lease.
+3. **Floor grants never size below one byte**, and `take_request` always takes its
    first item regardless of the byte cap, so the floor block reaches the pool and
    waits for capacity.
 

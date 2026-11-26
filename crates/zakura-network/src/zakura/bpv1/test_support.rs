@@ -1019,7 +1019,9 @@ impl MachineMesh {
             },
             BlockOutput::CheckUnknownParent { work_id, .. } => BlockInput::UnknownParentChecked {
                 work_id,
-                verdict: UnknownParentVerdict::Park,
+                verdict: UnknownParentVerdict::Park {
+                    height: MESH_HEIGHT,
+                },
             },
             BlockOutput::VerifyCommitment { work_id, .. } => {
                 let peers = self.nodes[node]

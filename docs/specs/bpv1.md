@@ -108,7 +108,10 @@ in the widest averaging window ending at its best header, for a header `k`
 blocks above that header. A pending entry then costs its sender about as much
 work as a real block that far ahead. The target bound holds only for a chain
 that extends the best header, and an honest header on a fork with less hash
-rate can exceed it. So a target above the bound is not a violation. Pending metadata MUST
+rate can exceed it. So a target above the bound is not a violation. A retained
+envelope that retries header admission and still lacks its parent keeps its
+first deadline, and the node MUST again check that its coinbase height lies
+above `top`. Pending metadata MUST
 NOT take space from metadata whose parent the node holds, including while these
 checks run. When the node-wide
 pending limit is full, the node SHOULD drop an entry of the peer holding the

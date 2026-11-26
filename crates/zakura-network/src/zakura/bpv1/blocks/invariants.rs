@@ -71,7 +71,7 @@ impl BlockTable {
                     || self
                         .pending
                         .get(block_id)
-                        .is_some_and(|entry| entry.checking == Some(*work_id)),
+                        .is_some_and(|entry| entry.checks == PendingChecks::Running(*work_id)),
                 "{BLOCK_REPLAY}: bpv1-50 work index holds a job no entry owns"
             );
         }

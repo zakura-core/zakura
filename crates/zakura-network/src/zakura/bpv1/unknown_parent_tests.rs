@@ -89,11 +89,11 @@ fn honest_child_with_a_late_parent_parks() {
     );
     assert_eq!(
         check_target_bound(&network, target_of(&header), 10, Some(bound)),
-        UnknownParentVerdict::Park
+        UnknownParentVerdict::Park { height: 10 }
     );
     assert_eq!(
         check_target_bound(&network, target_of(&header), 10, None),
-        UnknownParentVerdict::Park
+        UnknownParentVerdict::Park { height: 10 }
     );
 }
 
@@ -135,7 +135,7 @@ fn best_header_at_the_block_height_skips_the_bound() {
         };
         assert_eq!(
             check_target_bound(&regtest_nu7(), target_of(&header), 40, Some(tight)),
-            UnknownParentVerdict::Park
+            UnknownParentVerdict::Park { height: 40 }
         );
     }
 }
@@ -225,7 +225,7 @@ fn honest_fork_target_above_the_bound_drops_without_fault() {
     };
     assert_eq!(
         check_target_bound(&network, target_of(&header), late, Some(tight_late)),
-        UnknownParentVerdict::Park
+        UnknownParentVerdict::Park { height: late }
     );
 }
 

@@ -298,7 +298,9 @@ pub fn replay_bpv1_block_bytes(bytes: &[u8]) -> BlockReplaySummary {
                     .answer(1, b, reached)
                     .map_or_else(|| unknown_work(reached, b), |(id, _)| id),
                 verdict: [
-                    UnknownParentVerdict::Park,
+                    UnknownParentVerdict::Park {
+                        height: u32::from(a >> 2),
+                    },
                     UnknownParentVerdict::Drop,
                     UnknownParentVerdict::Invalid(Bpv1CloseRow::Row3InvalidHeader),
                     UnknownParentVerdict::Invalid(Bpv1CloseRow::Row4BadMetaOrCommitment),

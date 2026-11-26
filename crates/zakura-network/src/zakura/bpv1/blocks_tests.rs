@@ -269,7 +269,7 @@ pub(super) fn missing_parent(
         .iter()
         .any(|o| matches!(o, BlockOutput::CheckUnknownParent { .. }))
     {
-        let checked = unknown_parent_checked(table, now, &step, UnknownParentVerdict::Park);
+        let checked = unknown_parent_checked(table, now, &step, passed(&step));
         step.outputs
             .retain(|o| !matches!(o, BlockOutput::CheckUnknownParent { .. }));
         step.outputs.extend(checked.outputs);
@@ -294,6 +294,20 @@ pub(super) fn unknown_parent_checked(
         })
         .expect("the step checks metadata with an unknown parent");
     table.step(now, BlockInput::UnknownParentChecked { work_id, verdict })
+}
+
+/// The verdict of checks that pass for the step's unknown-parent check, for
+/// a block one above the `top` it checks against.
+pub(super) fn passed(checking: &BlockStep) -> UnknownParentVerdict {
+    let top = checking
+        .outputs
+        .iter()
+        .find_map(|o| match o {
+            BlockOutput::CheckUnknownParent { top, .. } => Some(*top),
+            _ => None,
+        })
+        .expect("the step checks metadata with an unknown parent");
+    UnknownParentVerdict::Park { height: top + 1 }
 }
 
 /// Records that `peer` flagged `indices` of `block_id` as pushes.
@@ -473,7 +487,7 @@ fn best_header_moving_during_the_checks_retries_admission() {
     );
     assert!(moved.outputs.is_empty(), "nothing is pending yet");
 
-    let retried = unknown_parent_checked(&mut table, now, &checking, UnknownParentVerdict::Park);
+    let retried = unknown_parent_checked(&mut table, now, &checking, passed(&checking));
     assert_eq!(table.pending_meta_len(), 0);
     let admitted = header_result(
         &mut table,
@@ -491,6 +505,134 @@ fn best_header_moving_during_the_checks_retries_admission() {
     table.assert_invariants();
 }
 
+/// Header sync can admit a block between its header lookup, which found the
+/// parent missing, and the table handling that answer. The new `top` would
+/// drop the block in the checks, so they run against the `top` from when the
+/// lookup started, pass, and retry admission, which finds the header (#2788).
+#[test]
+fn best_header_moving_during_the_lookup_checks_against_the_older_top() {
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let now = Instant::now();
+    let parent = block::Hash([0x57; 32]);
+    let child = block::Hash([0x58; 32]);
+    let coding = Profile::TINY.derive_coding(64, 2).unwrap();
+    table.step(
+        now,
+        BlockInput::ParentAdmitted {
+            hash: block::Hash([0x59; 32]),
+            height: 9,
+        },
+    );
+    let received = receive(
+        &mut table,
+        now,
+        make_envelope(child, coding, [0xAA; 32], node_id(1)),
+    );
+    // Header sync admits `parent` and `child` before the lookup's answer.
+    let moved = table.step(
+        now,
+        BlockInput::ParentAdmitted {
+            hash: child,
+            height: 11,
+        },
+    );
+    assert!(moved.outputs.is_empty(), "nothing is pending yet");
+
+    let checking = header_result(
+        &mut table,
+        now,
+        &received,
+        HeaderAdmissionResult::MissingParent {
+            parent_hash: parent,
+        },
+    );
+    assert!(checking
+        .outputs
+        .iter()
+        .any(|o| matches!(o, BlockOutput::CheckUnknownParent { top: 9, .. })));
+    let retried = unknown_parent_checked(
+        &mut table,
+        now,
+        &checking,
+        UnknownParentVerdict::Park { height: 11 },
+    );
+    assert_eq!(table.pending_meta_len(), 0);
+    let admitted = header_result(
+        &mut table,
+        now,
+        &retried,
+        HeaderAdmissionResult::Admitted {
+            height: 11,
+            parent_hash: parent,
+        },
+    );
+    let committed = commitment_ok(&mut table, now, &admitted);
+    assert!(committed
+        .events
+        .contains(&BlockEvent::BlockAdmitted { block_id: child }));
+    table.assert_invariants();
+}
+
+/// A retry that still finds the parent missing parks the entry only while
+/// its verified height lies above `top`. Here another branch reached the
+/// fork block's height during its checks, so block sync owns it (#2788).
+#[test]
+fn retried_entry_at_or_below_top_drops_instead_of_parking() {
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let now = Instant::now();
+    let parent = block::Hash([0x5A; 32]);
+    let fork = block::Hash([0x5B; 32]);
+    let coding = Profile::TINY.derive_coding(64, 2).unwrap();
+    table.step(
+        now,
+        BlockInput::ParentAdmitted {
+            hash: block::Hash([0x5C; 32]),
+            height: 9,
+        },
+    );
+    let received = receive(
+        &mut table,
+        now,
+        make_envelope(fork, coding, [0xAA; 32], node_id(1)),
+    );
+    let checking = header_result(
+        &mut table,
+        now,
+        &received,
+        HeaderAdmissionResult::MissingParent {
+            parent_hash: parent,
+        },
+    );
+    // Another branch reaches height 10 while the checks run.
+    table.step(
+        now,
+        BlockInput::ParentAdmitted {
+            hash: block::Hash([0x5D; 32]),
+            height: 10,
+        },
+    );
+    let retried = unknown_parent_checked(
+        &mut table,
+        now,
+        &checking,
+        UnknownParentVerdict::Park { height: 10 },
+    );
+    let dropped = header_result(
+        &mut table,
+        now,
+        &retried,
+        HeaderAdmissionResult::MissingParent {
+            parent_hash: parent,
+        },
+    );
+    assert_eq!(table.pending_meta_len(), 0);
+    assert!(dropped.outputs.iter().any(|o| matches!(
+        o,
+        BlockOutput::MetaRejected { block_id, .. } if *block_id == fork
+    )));
+    table.assert_invariants();
+}
+
 /// An entry that a wake retries and that parks again keeps its first
 /// deadline, so retries never extend its life, and it skips the checks it
 /// already passed.
@@ -501,6 +643,14 @@ fn retried_pending_entry_ages_out_at_its_first_deadline() {
     let parent = block::Hash([0x61; 32]);
     let child = block::Hash([0x62; 32]);
     let coding = Profile::TINY.derive_coding(64, 2).unwrap();
+    // `child` sits at height 11, one above `top`.
+    table.step(
+        now,
+        BlockInput::ParentAdmitted {
+            hash: block::Hash([0x63; 32]),
+            height: 10,
+        },
+    );
     let received = receive(
         &mut table,
         now,
@@ -844,7 +994,7 @@ fn unknown_parent_verdicts_park_drop_or_close() {
     };
 
     let parked_id = block::Hash([0x41; 32]);
-    let (table, parked) = check(UnknownParentVerdict::Park, parked_id);
+    let (table, parked) = check(UnknownParentVerdict::Park { height: 1 }, parked_id);
     assert_eq!(table.pending_meta_len(), 1);
     assert!(parked.outputs.is_empty());
 

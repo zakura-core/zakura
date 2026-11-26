@@ -54,8 +54,12 @@ const MAX_ADJUST_DOWN_PERCENT: u64 = 32;
 /// The outcome of checking metadata whose parent header is unknown.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum UnknownParentVerdict {
-    /// Every check passed: the metadata waits for its parent.
-    Park,
+    /// Every check passed: the metadata waits for its parent. `height` is
+    /// the coinbase height that check 2 verified.
+    Park {
+        /// The verified coinbase height.
+        height: u32,
+    },
     /// This node cannot place the block, so block sync owns it: its height
     /// lies outside the range, or its target exceeds the bound above the best
     /// header. The sender is not at fault.
@@ -217,5 +221,5 @@ pub fn check_target_bound(
     if limit.is_some_and(|limit| target > limit) {
         return UnknownParentVerdict::Drop;
     }
-    UnknownParentVerdict::Park
+    UnknownParentVerdict::Park { height }
 }

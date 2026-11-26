@@ -549,7 +549,7 @@ impl Mesh {
                         crate::zakura::bpv1::close::Bpv1CloseRow::Row3InvalidHeader,
                     ),
                     Some(s) if self.commitment_holds(s.height, &envelope) => {
-                        UnknownParentVerdict::Park
+                        UnknownParentVerdict::Park { height: s.height }
                     }
                     Some(_) => UnknownParentVerdict::Invalid(
                         crate::zakura::bpv1::close::Bpv1CloseRow::Row4BadMetaOrCommitment,

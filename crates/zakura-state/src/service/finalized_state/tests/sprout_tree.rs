@@ -68,6 +68,7 @@ fn early_nu7_network() -> Network {
             nu6_2: Some(10),
             nu6_3: Some(11),
             nu7: Some(12),
+            nu7_1: None,
         })
         .expect("the activation heights are in order")
         .extend_funding_streams()

@@ -365,7 +365,7 @@ fn sanitize_transaction_version(
             Sapling | Blossom | Heartwood | Canopy => (4, 4),
             Nu5 | Nu6 | Nu6_1 | Nu6_2 => (4, 5),
             Nu6_3 => (4, 6),
-            Nu7 => (5, 5),
+            Nu7 | Nu7_1 => (5, 5),
 
             #[cfg(zcash_unstable = "zfuture")]
             NetworkUpgrade::ZFuture => (5, u8::MAX),

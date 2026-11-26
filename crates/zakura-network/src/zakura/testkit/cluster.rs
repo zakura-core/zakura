@@ -1278,6 +1278,7 @@ mod tests {
                 nu6_2: None,
                 nu6_3: None,
                 nu7: None,
+                nu7_1: None,
                 #[cfg(zcash_unstable = "zfuture")]
                 zfuture: None,
             })

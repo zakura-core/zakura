@@ -982,6 +982,13 @@ impl OwnerModel {
         self.pool_block_leases
     }
 
+    /// The bodies block sync still holds: in the sequencer's input queue,
+    /// reorder buffer or `applying`, or in a submission, attached or
+    /// detached, whose completion hasn't arrived.
+    pub fn held_bodies(&self) -> usize {
+        self.holders.len()
+    }
+
     /// The wire bytes in the sequencer's input queue.
     pub fn queued(&self) -> u64 {
         self.queued
@@ -1473,6 +1480,40 @@ mod tests {
             teardown(owners, PoolGaugeModel::default()),
             (Verdict::Holds, None)
         );
+    }
+
+    /// A detached submission keeps its lease until its completion arrives,
+    /// so teardown waits for the submission even after every peer left.
+    #[test]
+    fn teardown_waits_for_a_detached_submission() {
+        let mut owners = settled(2);
+        let detached = BodyHolder::Detached(5);
+        owners.apply(OwnerInput::Held {
+            holder: detached,
+            request: (1, 1),
+            height: 1,
+            bytes: 0,
+            decoded_bytes: 0,
+        });
+        let mut pool = PoolGaugeModel::default();
+        pool.observe(&PoolFact::Granted {
+            lease_id: 1,
+            consumer: zakura_network::zakura::memory::Consumer::BlockSync,
+            peer: Some(1),
+            bytes: 3_639,
+            consumer_leased: 3_639,
+            consumer_cap: 10_000,
+            consumer_share: 5_000,
+            total_leased: 3_639,
+            pool_limit: 20_000,
+        });
+        assert_eq!(
+            teardown(owners.clone(), pool.clone()),
+            (Verdict::NotApplicable, None)
+        );
+        owners.apply(OwnerInput::Released { holder: detached });
+        let (verdict, _) = teardown(owners, pool);
+        assert!(violation(&verdict).1.contains("3639 B"), "{verdict:?}");
     }
 
     #[test]

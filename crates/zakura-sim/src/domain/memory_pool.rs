@@ -654,16 +654,17 @@ where
 
 /// [`TEARDOWN_RETURNS_ZERO`] (`mem-11`, catalogue G4): replaces
 /// `block-sync/teardown-returns-baseline`. Once every peer has left, every
-/// routine has ended, the input queue is empty and every serving lease is
+/// routine has ended, block sync holds no body and every serving lease is
 /// released, at rest, every live pool lease and every block-sync charge is
-/// back at zero.
+/// back at zero. A body still in a submission keeps its lease until its
+/// completion arrives, however long storage takes, so teardown waits for it.
 pub fn teardown_returns_zero<S: HasView>() -> Property<S>
 where
     S::View: PoolView + OwnerView,
 {
     Property {
         id: PropertyId::new(TEARDOWN_RETURNS_ZERO),
-        claim: "once every peer has left, every routine has ended, the input queue is empty and \
+        claim: "once every peer has left, every routine has ended, block sync holds no body and \
                 every serving lease is released, at rest, every live pool lease and every \
                 block-sync charge returns to zero",
         kind: Kind::Safety,
@@ -860,11 +861,12 @@ where
     S::View: PoolView + OwnerView,
 {
     let status = cx.status;
-    let (left, unended, queued, serving, charges, gap) = cx.view().read_owners(|owners| {
+    let (left, unended, queued, held, serving, charges, gap) = cx.view().read_owners(|owners| {
         (
             owners.peers_left(),
             owners.unended(),
             owners.queued(),
+            owners.held_bodies(),
             owners.serving_leases(),
             [
                 ("the byte budget", owners.reserved()),
@@ -891,7 +893,7 @@ where
         cx.missing_evidence(gap);
         return Verdict::NotApplicable;
     }
-    if unended > 0 || queued > 0 || serving > 0 || !crate::at_rest(status) {
+    if unended > 0 || queued > 0 || held > 0 || serving > 0 || !crate::at_rest(status) {
         cx.pending(Pending::BlockTeardownOpen);
         return Verdict::NotApplicable;
     }

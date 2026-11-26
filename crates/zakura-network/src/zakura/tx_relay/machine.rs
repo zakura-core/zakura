@@ -307,10 +307,11 @@ pub(crate) const PENDING_CAP: usize = 8 * PENDING_PER_PEER;
 /// [`PENDING_CAP`]'s count full for as long as they stay connected, since a
 /// reopened session refills faster than any age-out could drain it. This
 /// share is the room an honest session keeps anyway, for a new id's first
-/// announcement or a copy of one such a peer announced first. Shares don't
-/// count toward the cap, so they never use up the room that copies and
-/// first sources past them need.
-pub(crate) const PENDING_SHARE: usize = 512;
+/// announcement or a copy of one such a peer announced first. It is one full
+/// `Have` frame, so a fresh session takes all of its peer's first frame.
+/// Shares don't count toward the cap, so they never use up the room that
+/// copies and first sources past them need.
+pub(crate) const PENDING_SHARE: usize = 1_024;
 
 /// How many peers the reactor remembers as having tried one wanted entry
 /// before it forgets any. Past that it forgets the oldest peer with no

@@ -14,12 +14,19 @@ use libcrux_ml_dsa::{
 };
 use zeroize::{Zeroize as _, Zeroizing};
 
-use crate::key::{NodeKey, SignatureError, KEY_LENGTH};
+use crate::{
+    key::{NodeKey, SignatureError, KEY_LENGTH},
+    key_list::ED25519_KEY_TAG,
+};
 
 /// The credential tag of an ML-DSA-65 public key (ID-13). Tag 2 was the
 /// ML-DSA-44 key of `p2p-v2/4`; this release reads it as an unknown tag
 /// (ID-10).
 pub const ML_DSA_65_KEY_TAG: u16 = 3;
+
+/// The credential tags of the two keys a composite signature is made with
+/// (TLS-4). A handshake signed with the composite proves exactly these keys.
+pub(crate) const COMPOSITE_KEY_TAGS: [u16; 2] = [ED25519_KEY_TAG, ML_DSA_65_KEY_TAG];
 
 /// Length of an ML-DSA-65 public key, in bytes.
 pub const ML_DSA_65_KEY_BYTES: usize = 1_952;

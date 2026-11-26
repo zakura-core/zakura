@@ -614,6 +614,220 @@ mod tests {
             .expect_err("the listener shares no group with the dialer")
     }
 
+    /// A listener's key that signs the composite with `self.0`'s two keys,
+    /// whatever credential the listener presents.
+    #[derive(Clone, Debug)]
+    struct SignsAs(NodeSecretKey);
+
+    impl rustls::sign::SigningKey for SignsAs {
+        fn choose_scheme(
+            &self,
+            offered: &[rustls::SignatureScheme],
+        ) -> Option<Box<dyn rustls::sign::Signer>> {
+            offered
+                .contains(&crate::composite::COMPOSITE_SCHEME)
+                .then(|| Box::new(self.clone()) as Box<dyn rustls::sign::Signer>)
+        }
+
+        fn algorithm(&self) -> rustls::SignatureAlgorithm {
+            rustls::SignatureAlgorithm::Unknown(0x65)
+        }
+    }
+
+    impl rustls::sign::Signer for SignsAs {
+        fn sign(&self, message: &[u8]) -> Result<Vec<u8>, rustls::Error> {
+            self.0
+                .sign_composite(message, [9; 32])
+                .map_err(|_| rustls::Error::General("the composite signature failed".into()))
+        }
+
+        fn scheme(&self) -> rustls::SignatureScheme {
+            crate::composite::COMPOSITE_SCHEME
+        }
+    }
+
+    /// Presents one fixed raw public key to every dialer.
+    #[derive(Debug)]
+    struct Presents(Arc<rustls::sign::CertifiedKey>);
+
+    impl rustls::server::ResolvesServerCert for Presents {
+        fn resolve(
+            &self,
+            _hello: rustls::server::ClientHello<'_>,
+        ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+            Some(self.0.clone())
+        }
+
+        fn only_raw_public_keys(&self) -> bool {
+            true
+        }
+    }
+
+    /// Runs one TLS handshake in memory. A production dialer dials the node
+    /// `dialed` and reaches a listener that presents `credential` and signs
+    /// with `signer`'s keys. Returns the error the dialer fails the handshake
+    /// with, or `None` when the handshake completes.
+    fn dial_presenting(
+        dialed: NodeId,
+        credential: &NodeCredential,
+        signer: &NodeSecretKey,
+    ) -> Option<rustls::Error> {
+        let client = TlsConfig::new(&NodeSecretKey::generate())
+            .rustls_client(dialed, &[b"a"])
+            .unwrap();
+        let listener = TlsConfig::new(signer);
+        let cert = rustls_pki_types::CertificateDer::from(credential.to_spki().to_vec());
+        let key = rustls::sign::CertifiedKey::new(vec![cert], Arc::new(SignsAs(signer.clone())));
+        let mut server =
+            rustls::ServerConfig::builder_with_details(listener.provider, Arc::new(RuntimeUtc))
+                .with_protocol_versions(verifier::PROTOCOL_VERSIONS)
+                .unwrap()
+                .with_client_cert_verifier(listener.client_verifier)
+                .with_cert_resolver(Arc::new(Presents(Arc::new(key))));
+        server.alpn_protocols = vec![b"a".to_vec()];
+
+        let name = rustls_pki_types::ServerName::try_from(UNSENT_SERVER_NAME).unwrap();
+        let mut client = rustls::ClientConnection::new(Arc::new(client), name).unwrap();
+        let mut server = rustls::ServerConnection::new(Arc::new(server)).unwrap();
+        for _ in 0..4 {
+            if !client.is_handshaking() && !server.is_handshaking() {
+                return None;
+            }
+            let mut flight = Vec::new();
+            while client.wants_write() {
+                client.write_tls(&mut flight).unwrap();
+            }
+            let mut unread = flight.as_slice();
+            while !unread.is_empty() {
+                server.read_tls(&mut unread).unwrap();
+                server
+                    .process_new_packets()
+                    .expect("the listener accepts the dialer's own credential");
+            }
+            let mut flight = Vec::new();
+            while server.wants_write() {
+                server.write_tls(&mut flight).unwrap();
+            }
+            let mut unread = flight.as_slice();
+            while !unread.is_empty() {
+                client.read_tls(&mut unread).unwrap();
+                if let Err(error) = client.process_new_packets() {
+                    return Some(error);
+                }
+            }
+        }
+        panic!("the handshake stalled");
+    }
+
+    /// TLS-7 and TLS-4 through a whole handshake, as rustls runs the two
+    /// checks: a dial to a node's earlier ID completes only against a
+    /// listener that signs with the keys that ID names.
+    #[test]
+    fn a_dial_completes_only_with_a_listener_that_holds_the_dialed_ids_keys() {
+        use rustls::CertificateError;
+
+        use crate::{CredentialKey, ED25519_KEY_TAG, ML_DSA_65_KEY_TAG};
+
+        let node = NodeSecretKey::generate();
+        let attacker = NodeSecretKey::generate();
+        let earlier = node.public();
+        let ml_dsa = |secret: &NodeSecretKey| {
+            let key = secret.credential().key(ML_DSA_65_KEY_TAG).unwrap();
+            CredentialKey::Full(key.to_vec())
+        };
+        // `secret`'s two keys, then `added` under a tag of its own.
+        let with = |secret: &NodeSecretKey, added: CredentialKey| {
+            let ed25519 = CredentialKey::Full(secret.public_key().as_bytes().to_vec());
+            NodeCredential::from_entries([
+                (ED25519_KEY_TAG, ed25519),
+                (ML_DSA_65_KEY_TAG, ml_dsa(secret)),
+                (4, added),
+            ])
+            .unwrap()
+        };
+        let refused = |error| Some(rustls::Error::InvalidCertificate(error));
+
+        // The node itself, before and after it added a key.
+        assert_eq!(dial_presenting(earlier, node.credential(), &node), None);
+        let extended = with(&node, CredentialKey::Full(vec![0x5a; 1_312]));
+        assert_ne!(extended.node_id(), earlier);
+        assert_eq!(dial_presenting(earlier, &extended, &node), None);
+
+        // The node's public credential, signed by someone else.
+        assert_eq!(
+            dial_presenting(earlier, node.credential(), &attacker),
+            refused(CertificateError::BadSignature)
+        );
+        // The node's public keys beside the attacker's key: the ID check
+        // passes, and the signature is checked with the node's keys alone.
+        let beside = with(&node, ml_dsa(&attacker));
+        assert_eq!(
+            dial_presenting(earlier, &beside, &attacker),
+            refused(CertificateError::BadSignature)
+        );
+        // The attacker's keys beside the node's key: a valid signature for
+        // a credential that never names the node.
+        let claiming = with(&attacker, ml_dsa(&node));
+        assert_eq!(
+            dial_presenting(claiming.node_id(), &claiming, &attacker),
+            None
+        );
+        assert_eq!(
+            dial_presenting(earlier, &claiming, &attacker),
+            refused(CertificateError::UnknownIssuer)
+        );
+        // A node this release can't authenticate: its ID names only a key
+        // under a later scheme's tag. Its record is public, so the attacker
+        // copies that entry beside its own keys and signs validly. The
+        // dialed ID names none of the keys that signed, so it proves nothing.
+        let later_key = (5, CredentialKey::Full(vec![0x77; 1_952]));
+        let later_node = NodeCredential::from_entries([later_key.clone()]).unwrap();
+        let copying = NodeCredential::from_entries([
+            (
+                ED25519_KEY_TAG,
+                CredentialKey::Full(attacker.public_key().as_bytes().to_vec()),
+            ),
+            (ML_DSA_65_KEY_TAG, ml_dsa(&attacker)),
+            later_key,
+        ])
+        .unwrap();
+        assert!(copying
+            .key_list()
+            .contains_list_named(later_node.node_id(), &[]));
+        assert_eq!(
+            dial_presenting(copying.node_id(), &copying, &attacker),
+            None
+        );
+        assert_eq!(
+            dial_presenting(later_node.node_id(), &copying, &attacker),
+            refused(CertificateError::UnknownIssuer)
+        );
+        // The node's Ed25519 key and the fingerprint of its ML-DSA-65 key,
+        // which hash to the node's ID, beside the attacker's key in full.
+        // The ID is committed to, but no key under the signing tag can
+        // check a signature, so there is nothing for the attacker's to pass.
+        let committed = node
+            .credential()
+            .clone()
+            .with_fingerprint_only(ML_DSA_65_KEY_TAG)
+            .unwrap();
+        assert_eq!(committed.node_id(), earlier);
+        let attacker_key = attacker.credential().key(ML_DSA_65_KEY_TAG).unwrap();
+        let mut bytes = committed.encode();
+        bytes[0] += 1;
+        bytes.extend_from_slice(&4u16.to_le_bytes());
+        bytes.extend_from_slice(&(attacker_key.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(attacker_key);
+        let shaped = NodeCredential::decode(&bytes).unwrap();
+        assert!(shaped
+            .key_list()
+            .contains_list_named(earlier, &[ED25519_KEY_TAG, ML_DSA_65_KEY_TAG]));
+        assert_eq!(
+            dial_presenting(earlier, &shaped, &attacker),
+            refused(CertificateError::ApplicationVerificationFailure)
+        );
+    }
+
     /// TLS-3, TLS-8: the ID a peer's verifier derives from a node's
     /// credential is the ID the node gives itself, including for a credential
     /// with an entry this release doesn't know.

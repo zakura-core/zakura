@@ -14,6 +14,7 @@ use super::{InboundRecorder, LocalEndpointFactory, WaitError};
 use crate::{
     zakura::{
         discovery::build_discovery_handle, service_registry, spawn_block_sync_reactor,
+        transport::RegisteredPeers,
         spawn_header_sync_reactor, BlockSyncAction, BlockSyncFrontiers, BlockSyncHandle,
         BlockSyncStartup, DiscoveryService, FullStateFrontiers, HeaderSyncAction, HeaderSyncHandle,
         HeaderSyncStartup, Service, ZakuraBlockSyncConfig, ZakuraDiscoveryHandle, ZakuraEndpoint,
@@ -51,6 +52,17 @@ impl ZakuraTestNode {
     /// Current node address.
     pub async fn node_addr(&self) -> NodeAddr {
         self.endpoint.node_addr().await
+    }
+
+    /// The node's addresses under the node ID it had before
+    /// [`ZakuraTestNodeBuilder::extended_credential`] added a key to its
+    /// credential. A dial to it reaches the node, which answers under
+    /// [`Self::node_addr`]'s ID.
+    pub async fn earlier_node_addr(&self) -> NodeAddr {
+        NodeAddr::with_addrs(
+            LocalEndpointFactory::secret_key(self.seed).public(),
+            self.node_addr().await.direct,
+        )
     }
 
     /// Active supervisor handle.
@@ -149,20 +161,21 @@ impl ZakuraTestNode {
     }
 
     /// Start a native dial to an explicit [`NodeAddr`] and wait until this node
-    /// registers it. Lets tests advertise a specific direct-address list (for
-    /// example a decoy address ahead of the reachable one).
+    /// registers it, under that ID or the one the node has moved to. Lets
+    /// tests advertise a specific direct-address list (for example a decoy
+    /// address ahead of the reachable one).
     pub async fn connect_native_to_addr(
         &self,
         peer_addr: NodeAddr,
         timeout: Duration,
     ) -> Result<(), BoxError> {
         let mut handle = self.endpoint.spawn_native_dial(peer_addr.clone());
-        let peer_id = peer_addr.id.as_bytes().to_vec();
-        let mut peer_set_rx = self.supervisor().subscribe();
+        let peer_id = ZakuraPeerId::from_node_id(peer_addr.id);
+        let mut registered = self.supervisor().registered_peers();
 
         let result = tokio::time::timeout(timeout, async {
             tokio::select! {
-                registered = wait_for_peer_registration(&mut peer_set_rx, peer_id.as_slice()) => {
+                registered = wait_for_peer_registration(&mut registered, &peer_id) => {
                     registered
                 }
                 joined = &mut handle => {
@@ -204,19 +217,15 @@ impl ZakuraTestNode {
 }
 
 async fn wait_for_peer_registration(
-    peer_set_rx: &mut tokio::sync::watch::Receiver<Vec<ZakuraPeerId>>,
-    peer_id: &[u8],
+    registered: &mut RegisteredPeers,
+    peer_id: &ZakuraPeerId,
 ) -> Result<(), BoxError> {
     loop {
-        if peer_set_rx
-            .borrow()
-            .iter()
-            .any(|id| id.as_bytes() == peer_id)
-        {
+        if registered.names_and_mark_seen(peer_id) {
             return Ok(());
         }
 
-        peer_set_rx.changed().await.map_err(|_| -> BoxError {
+        registered.changed().await.map_err(|_| -> BoxError {
             "Zakura peer-set watcher closed before registration".into()
         })?;
     }
@@ -237,6 +246,8 @@ pub struct ZakuraTestNodeBuilder {
     /// application registers its own.
     custom_services: Vec<crate::zakura::CustomService>,
     discovery_direct_addrs: Vec<SocketAddr>,
+    /// Whether the node presents a credential with a key added to it.
+    extended_credential: bool,
     extra_advertised_services: Vec<ZakuraServiceId>,
     header_sync: Option<TestHeaderSyncStartup>,
     header_sync_config: ZakuraHeaderSyncConfig,
@@ -303,6 +314,7 @@ impl ZakuraTestNodeBuilder {
             service_factory: None,
             custom_services: Vec::new(),
             discovery_direct_addrs: Vec::new(),
+            extended_credential: false,
             extra_advertised_services: Vec::new(),
             header_sync: None,
             header_sync_config: ZakuraHeaderSyncConfig::default(),
@@ -316,6 +328,15 @@ impl ZakuraTestNodeBuilder {
             #[cfg(test)]
             transport_observer: None,
         }
+    }
+
+    /// Give the node a credential with one more key than its seed derives,
+    /// as a node has after a release adds a key (see
+    /// [`LocalEndpointFactory::extended_secret_key`]). Its node ID changes,
+    /// and [`ZakuraTestNode::earlier_node_addr`] names it by the ID it had.
+    pub fn extended_credential(mut self) -> Self {
+        self.extended_credential = true;
+        self
     }
 
     /// Advertise these direct addresses in this node's discovery self-record.
@@ -489,7 +510,14 @@ impl ZakuraTestNodeBuilder {
         if let Some(quic) = self.quic_config.clone() {
             factory = factory.quic_config(quic);
         }
-        let endpoint = factory.endpoint(self.seed).await?;
+        let secret_key = || {
+            if self.extended_credential {
+                LocalEndpointFactory::extended_secret_key(self.seed)
+            } else {
+                LocalEndpointFactory::secret_key(self.seed)
+            }
+        };
+        let endpoint = factory.endpoint_with_key(secret_key()).await?;
         let supervisor = ZakuraSupervisorHandle::new(self.max_connections_per_ip)
             .with_tx_relay_sessions(
                 self.custom_services
@@ -507,7 +535,7 @@ impl ZakuraTestNodeBuilder {
         let mut advertised_services = crate::zakura::discovery::default_advertised_services();
         advertised_services.extend(self.extra_advertised_services.clone());
         let discovery = build_discovery_handle(
-            LocalEndpointFactory::secret_key(self.seed),
+            secret_key(),
             None,
             self.discovery_direct_addrs.clone(),
             advertised_services,
@@ -912,7 +940,7 @@ mod tests {
             .await
             .expect("peer spawns");
         let peer_loopback = ipv4_loopback_addr(&peer.node_addr().await);
-        let peer_id = peer_loopback.id.as_bytes().to_vec();
+        let peer_id = ZakuraPeerId::from_node_id(peer_loopback.id);
         // RFC 6598 shared address space is not routable.
         let decoy = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)), 1);
         let decoy_first = NodeAddr::with_addrs(
@@ -934,11 +962,11 @@ mod tests {
                 .spawn()
                 .await
                 .expect("dialer spawns");
-            let mut peer_set_rx = node.supervisor().subscribe();
-            let (admitted_addr_tx, mut admitted_addr_rx) = tokio::sync::oneshot::channel();
+            let mut registered = node.supervisor().registered_peers();
+            let (authenticated_tx, mut authenticated_rx) = tokio::sync::oneshot::channel();
             let (registration_tx, registration_rx) = tokio::sync::oneshot::channel();
             let report = DialReport {
-                admitted_addr: admitted_addr_tx,
+                authenticated: authenticated_tx,
                 registration: registration_tx,
             };
             let endpoint = node.endpoint();
@@ -956,15 +984,16 @@ mod tests {
 
             tokio::time::timeout(
                 TEST_NET_TIMEOUT,
-                wait_for_peer_registration(&mut peer_set_rx, peer_id.as_slice()),
+                wait_for_peer_registration(&mut registered, &peer_id),
             )
             .await
             .expect("peer registers before the timeout")
             .expect("peer-set watcher stays open");
-            let admitted_addr = admitted_addr_rx.try_recv().ok();
+            let authenticated = authenticated_rx.try_recv().ok();
             assert!(
-                admitted_addr.is_some_and(|addr| peer_loopback.direct.contains(&addr)),
-                "dialer {seed} reports the loopback path its handshake won, before registration: {admitted_addr:?}",
+                authenticated.is_some_and(|proved| peer_loopback.direct.contains(&proved.addr)
+                    && proved.node_id == peer_loopback.id),
+                "dialer {seed} reports the node and the loopback path its handshake won, before registration: {authenticated:?}",
             );
             assert_eq!(
                 tokio::time::timeout(TEST_NET_TIMEOUT, registration_rx)

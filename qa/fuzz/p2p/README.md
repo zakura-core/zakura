@@ -224,9 +224,9 @@ connection ownership across scheduled IO.
 
 | Target | Property | Decoder |
 | --- | --- | --- |
-| `credential_parse` | `credential/canonical-encoding`, `credential/node-id`, `credential/bounded-parse` | 1 |
+| `credential_parse` | `credential/canonical-encoding`, `credential/node-id`, `credential/bounded-parse` | 2 |
 | `key_list_decode` | `key-list/canonical-encoding`, `key-list/stable-id` | 1 |
-| `composite_verify` | `composite/tamper-refused` | 1 |
+| `composite_verify` | `composite/tamper-refused` | 3 |
 
 These targets feed peer-chosen bytes to what `zakura-quic` parses before a v2
 TLS handshake authenticates the peer, not machine histories. The drivers and

@@ -101,7 +101,12 @@ async fn a_node_at_its_ordinary_limit_connects_to_a_known_gateway() {
     ranking_tx.send_replace(ranking(gateway_id));
 
     await_registered(&dialer_node, gateway_id, "the gateway registers").await;
-    assert_eq!(dialer_node.endpoint().discovery_dial_permits(), 0);
+    assert_eq!(
+        dialer_node
+            .endpoint()
+            .discovery_dial_permits(dialer_node.discovery().ordinary_connection_cap),
+        0
+    );
 
     dialer.abort();
     dialer_node.shutdown().await;

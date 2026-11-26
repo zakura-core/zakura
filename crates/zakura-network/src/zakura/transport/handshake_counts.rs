@@ -10,7 +10,7 @@ mod slots;
 use slots::ConnectionSlots;
 pub use slots::{SlotClass, SlotCount, SlotRefusal, SlotSplit};
 
-use super::{GatewayMatch, GatewayRanking, GatewayStanding, PreferredGateways};
+use super::{GatewayMatch, GatewayRanking, GatewayStanding, MovedNodeIds, PreferredGateways};
 use crate::zakura::regulation::Bucket;
 use crate::zakura::{admission_host, Cadence, DEFAULT_ZAKURA_REDIAL_INITIAL_BACKOFF};
 
@@ -329,12 +329,30 @@ impl HandshakeCounts {
         claim
     }
 
-    /// Records a dial target as connected once the outbound transport proves its ID.
-    pub(crate) fn outbound_connected(&mut self, node: NodeId) {
-        *self.authenticated_dials.entry(node).or_default() += 1;
-        if let Some(formed) = self.preferred.with_connected(&node) {
+    /// Records a dial as connected once the outbound transport proves the
+    /// node's ID. `connected` is that ID. When the node has moved on from the
+    /// `dialed` ID, the dial's slot moves to `connected` with it, so the slot
+    /// and the proof sit under the ID the connection registers with.
+    ///
+    /// A dial to a preferred gateway's earlier ID claimed a held place that
+    /// `connected` doesn't keep. The move is refused, and nothing is
+    /// recorded, when the slot would then be an ordinary one above `cap`.
+    pub(crate) fn outbound_connected(
+        &mut self,
+        dialed: NodeId,
+        connected: NodeId,
+        cap: usize,
+    ) -> Result<(), SlotRefusal> {
+        if dialed != connected {
+            self.connections
+                .move_outbound(dialed, connected, cap, &self.preferred)?;
+            self.slot_left(dialed);
+        }
+        *self.authenticated_dials.entry(connected).or_default() += 1;
+        if let Some(formed) = self.preferred.with_connected(&connected) {
             self.preferred = formed;
         }
+        Ok(())
     }
 
     /// Replaces the preferred gateways the slot checks use. Slots already
@@ -383,6 +401,32 @@ impl HandshakeCounts {
             PreferredGateways::form_with_incumbents(live, hold_limit, self.preferred.set());
     }
 
+    /// Yields places that moved gateways cannot use in this ranking. The
+    /// handler still checks the actual slot and consumes the probe at dial time.
+    pub(crate) fn defer_gateway_rollbacks(
+        &mut self,
+        moves: &MovedNodeIds,
+        cap: usize,
+        now: Instant,
+    ) {
+        while self.free_ordinary_connections(cap) == 0 {
+            let preferred = self.preferred.held_places();
+            self.preferred.defer_dials(|dialed| {
+                moves
+                    .cooling_destination(dialed, now)
+                    .is_some_and(|current| {
+                        !preferred.members.contains(&current)
+                            || self.connections.of_node(&current).total() > 0
+                    })
+            });
+            // A deferred destination can leave another gateway unable to dial.
+            // Each change puts at least one more ranked gateway into backoff.
+            if self.preferred.set() == preferred.members {
+                break;
+            }
+        }
+    }
+
     /// The preferred gateways the slot checks use now.
     pub fn preferred_gateways(&self) -> &PreferredGateways {
         &self.preferred
@@ -414,6 +458,11 @@ impl HandshakeCounts {
     /// doesn't stay preferred in the meantime.
     pub fn release_connection(&mut self, node: NodeId, inbound: bool) {
         self.connections.release(node, inbound);
+        self.slot_left(node);
+    }
+
+    /// Updates `node`'s gateway standing after one of its slots left it.
+    fn slot_left(&mut self, node: NodeId) {
         let slots = self.connections.of_node(&node);
         let updated = if slots.total() == 0 {
             self.preferred.with_released(&node)

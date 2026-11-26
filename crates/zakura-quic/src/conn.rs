@@ -303,6 +303,8 @@ pub struct Conn {
     /// The credential the peer proved in TLS. The verifier accepted it only
     /// with an Ed25519 key (TLS-4).
     remote: Arc<NodeCredential>,
+    /// The node ID this endpoint dialed. `None` on an accepted connection.
+    dialed_id: Option<NodeId>,
     admitted_addr: SocketAddr,
     admitted_at: Instant,
     source_validated: bool,
@@ -313,6 +315,7 @@ impl fmt::Debug for Conn {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Conn")
             .field("remote_id", &self.remote_id())
+            .field("dialed_id", &self.dialed_id)
             .field("admitted_addr", &self.admitted_addr)
             .field("admitted_at", &self.admitted_at)
             .field("source_validated", &self.source_validated)
@@ -325,6 +328,7 @@ impl Conn {
     pub(crate) fn new(
         inner: ConnRef,
         remote: Arc<NodeCredential>,
+        dialed_id: Option<NodeId>,
         admitted_addr: SocketAddr,
         admitted_at: Instant,
         source_validated: bool,
@@ -333,6 +337,7 @@ impl Conn {
         Self {
             inner,
             remote,
+            dialed_id,
             admitted_addr,
             admitted_at,
             source_validated,
@@ -342,8 +347,18 @@ impl Conn {
 
     /// The peer's node ID, derived from the credential it proved in the TLS
     /// handshake (TLS-8).
+    ///
+    /// On a dial this can differ from [`Self::dialed_id`]: the peer has
+    /// added keys since the dialer learned its ID, and this is its ID now.
     pub fn remote_id(&self) -> NodeId {
         self.remote.node_id()
+    }
+
+    /// The node ID this endpoint dialed to open the connection, which the
+    /// peer proved it also answers to (TLS-7). `None` on a connection this
+    /// endpoint accepted.
+    pub fn dialed_id(&self) -> Option<NodeId> {
+        self.dialed_id
     }
 
     /// The key list the peer proved in the TLS handshake: the list its node

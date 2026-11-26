@@ -107,7 +107,9 @@ A held place is a connection slot that only a preferred gateway may use:
   gateway's first connection takes a held place even when the ordinary slots
   and the inbound share are full;
 - a gateway in backoff still counts toward the number of places held. The
-  next available gateway can fill a place while the first waits to retry;
+  next available gateway can fill a place while the first waits to retry.
+  This also applies while a moved gateway waits for its 30-second rollback
+  probe and its current ID cannot take a slot;
 - a ranked gateway that connects in takes a place when its rank brings it into
   the preferred set.
 
@@ -175,13 +177,18 @@ counts, the places it holds, and its v2 peers. In this example the node has
 | `slots` | How connection slots are used, or null without v2 networking. `limit` includes all funded ordinary and gateway places. `in_use` is `preferred` plus `ordinary`; `preferred` counts one slot per preferred gateway connected; `inbound` counts slots of connections the remote node opened. |
 | `peers` | Every v2 peer connected now, ordered by node ID, at most the connection limit. A peer connected both ways counts as inbound. |
 
+If a node dials a gateway by an earlier ID and authenticates its newer ID,
+the earlier gateway remains connected in this report while the connection and
+the remembered move last, even after the earlier address record is evicted.
+Two distinct known IDs with the same gateway prefix still make it ambiguous.
+
 A gateway's `state` reads its standing in v2 networking together with the
 preferred set:
 
 | State | Meaning |
 | --- | --- |
 | `preferred` | Reachable and among the highest-ranked: it may fill a held place. |
-| `standby` | Known and reachable (it can be dialed, is being dialed, or is connected), but ranked below the gateways that fill the held places. |
+| `standby` | Known and reachable (it can be dialed, is being dialed, or is connected), but ranked below the gateways that fill the held places, or connected under a newer node ID than the one blocks name. |
 | `backoff` | Known, but waiting out a failed dial or a lost connection. It still counts toward the shared hold and may connect inbound during backoff. |
 | `unmatched` | Networking found no connection or usable dial address for this gateway when it ranked it. A missing or expired address record can produce this state. Gateways are usually learned through v2 peer exchange. |
 | `ambiguous` | Networking knows two or more nodes whose node IDs start with this gateway ID, so it prefers none of them and holds no place for the gateway. |

@@ -396,7 +396,8 @@ impl FromStr for NodeSecretKey {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct NodeAddr {
     /// The node's identity. A dial fails in the TLS handshake unless the
-    /// peer's credential derives this ID (TLS-7).
+    /// peer proves it is this node: its credential derives this ID, or
+    /// derived it before the node added keys (TLS-7).
     pub id: NodeId,
     /// Direct UDP addresses, in the order to try them.
     pub direct: Vec<SocketAddr>,

@@ -27,11 +27,38 @@ margins first. The two halves of the handshake face that risk differently.
   handshake runs. A later break of ML-DSA can't forge a handshake that has
   already completed, and it reveals nothing about the session keys. The
   signature needs to hold only until we can replace it.
-- **If a scheme breaks,** we ship a new node-ID stack: a new signature, a new
-  credential tag and a new ALPN, the way `p2p-v2/5` replaced `p2p-v2/4`.
-  We don't carry a pre-committed backup key or other agility machinery,
-  which would add a key to every credential and code paths that only run
-  in an emergency.
+- **If a scheme breaks,** we add a key of a new scheme to each node's
+  credential, under a new tag, and later retire the old key. Neither step
+  breaks node IDs (spec 0.31, TLS-7, ID-12, DIAL-9, COMPAT-13):
+  - A dial to the ID a node had before it added the key still reaches it,
+    as long as the node signs with the keys that ID names. The dialer then
+    follows the node to its new ID.
+  - A retired key stays in the credential as its 32-byte fingerprint, so
+    the ID doesn't change a second time.
+  - The rules had to ship with `p2p-v2/5`. The nodes of this release are
+    the old nodes of the first upgrade, and a release without the rules
+    would refuse the longer credential on a dial to the earlier ID, and a
+    fingerprint entry everywhere.
+  - The room is two more keys per node ID. A key list holds 4 entries, two
+    of them today's keys, and a retired key keeps its entry. A key over
+    2,592 bytes doesn't fit an entry. Past either limit an upgrade is a
+    hard break again.
+
+  We still don't carry a pre-committed backup key: it would add a key to
+  every credential today. The fingerprint entry leaves that open, since a
+  node could commit to a backup key by its fingerprint for 36 bytes per
+  handshake and nothing in a discovery record beyond one 34-byte entry.
+
+  **Why a fingerprint entry is safe.** It commits to a key without showing
+  it, as an entry under an unknown tag already does. It can't check a
+  signature, so it can't help anyone answer as the node, and a verifier
+  refuses a credential whose signing key is only a fingerprint.
+
+  **What the earlier-ID rule costs.** A verifier hashes at most 4 key
+  lists of at most 137 bytes on a dial whose ID doesn't match outright. The
+  dialed ID must name both signing keys, so adding a key to another node's
+  public keys gains nothing: the signature is still checked with that
+  node's keys.
 
 The classical halves stay as they were. X25519 and Ed25519 don't protect
 against a quantum computer. They protect against a flaw in the young

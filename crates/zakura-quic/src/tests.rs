@@ -651,6 +651,30 @@ async fn self_dial_is_refused_before_any_packet() {
     ));
 }
 
+/// DIAL-1, TLS-7: a node that added a key to its credential also answers to
+/// the ID it had before, so a dial to that ID is a self-dial too. A stale
+/// record or config entry naming this node can't make it connect to itself.
+#[tokio::test]
+async fn a_dial_to_this_nodes_earlier_id_is_a_self_dial() {
+    let secret = NodeSecretKey::generate();
+    let earlier = secret.public();
+    let own = [crate::ED25519_KEY_TAG, crate::ML_DSA_65_KEY_TAG]
+        .map(|tag| (tag, secret.credential().key(tag).unwrap().to_vec()));
+    let added = (0x0102, vec![0x5a; 64]);
+    let credential = crate::NodeCredential::from_entries(own.into_iter().chain([added])).unwrap();
+    let secret = secret.with_credential(credential).unwrap();
+    let endpoint = QuicEndpoint::bind(secret, &loopback(), &test_config()).unwrap();
+    assert_ne!(endpoint.local_id(), earlier);
+
+    for id in [earlier, endpoint.local_id()] {
+        let own = NodeAddr::with_addrs(id, endpoint.local_addrs());
+        assert!(matches!(
+            endpoint.connect(own, &[ALPN]).await,
+            Err(ConnectError::SelfDial)
+        ));
+    }
+}
+
 #[tokio::test]
 async fn dial_without_a_matching_family_fails_fast() {
     let server = server();
@@ -709,6 +733,16 @@ async fn a_quic_connection_authenticates_the_full_extended_credential() {
     bytes.extend_from_slice(&[0x5a; 1312]);
     let credential = crate::NodeCredential::decode(&bytes).unwrap();
     let listener_keys = credential.key_list().clone();
+    // The ID of the listener's Ed25519 key and the added key alone.
+    let unsigned_id = crate::NodeCredential::from_entries([
+        (
+            crate::ED25519_KEY_TAG,
+            secret.public_key().as_bytes().to_vec(),
+        ),
+        (0x0102, vec![0x5a; 1312]),
+    ])
+    .unwrap()
+    .node_id();
     let secret = secret.with_credential(credential).unwrap();
 
     tokio::time::timeout(TEST_TIMEOUT, async {
@@ -716,15 +750,61 @@ async fn a_quic_connection_authenticates_the_full_extended_credential() {
         let mut server = serve_test_acceptor(endpoint, &[ALPN], |_| Admit::Accept);
         let client = client();
 
-        let old_pin = NodeAddr::with_addrs(original_id, server.endpoint.local_addrs());
-        assert!(matches!(
-            client.connect(old_pin, &[ALPN]).await,
-            Err(ConnectError::WrongIdentity)
-        ));
+        // TLS-7: the ID the listener had before it added the key still
+        // reaches it, and the connection reports the ID it has now.
+        let earlier = NodeAddr::with_addrs(original_id, server.endpoint.local_addrs());
+        let moved = client.connect(earlier, &[ALPN]).await.unwrap();
+        let inbound = server.handled.recv().await.unwrap();
+        assert_eq!(moved.dialed_id(), Some(original_id));
+        assert_eq!(moved.remote_id(), listener_keys.node_id());
+        assert_eq!(moved.remote_key_list(), &listener_keys);
+        assert_eq!(inbound.dialed_id(), None);
+        assert_eq!(echo(&moved, b"hello").await, b"hello");
+
         let conn = client.connect(server.addr(), &[ALPN]).await.unwrap();
         let inbound = server.handled.recv().await.unwrap();
+        assert_eq!(conn.dialed_id(), Some(listener_keys.node_id()));
         assert_eq!(conn.remote_key_list(), &listener_keys);
         assert_eq!(conn.remote_id(), listener_keys.node_id());
+        assert_eq!(inbound.remote_id(), client.local_id());
+        assert_eq!(echo(&conn, b"hello").await, b"hello");
+
+        // An ID that names the added key but not the ML-DSA-65 key the
+        // listener signs with is not proven by the handshake.
+        let unsigned = NodeAddr::with_addrs(unsigned_id, server.endpoint.local_addrs());
+        assert!(matches!(
+            client.connect(unsigned, &[ALPN]).await,
+            Err(ConnectError::WrongIdentity)
+        ));
+    })
+    .await
+    .unwrap();
+}
+
+/// A new node presenting the largest credential it can authenticate with:
+/// its two signing keys and two more keys of the greatest length (ID-12).
+fn largest_credential_key() -> NodeSecretKey {
+    let secret = NodeSecretKey::generate();
+    let own = [crate::ED25519_KEY_TAG, crate::ML_DSA_65_KEY_TAG]
+        .map(|tag| (tag, secret.credential().key(tag).unwrap().to_vec()));
+    let more = [4u8, 5].map(|tag| (u16::from(tag), vec![tag; crate::MAX_CREDENTIAL_KEY_BYTES]));
+    let credential = crate::NodeCredential::from_entries(own.into_iter().chain(more)).unwrap();
+    secret.with_credential(credential).unwrap()
+}
+
+/// ID-12: the largest credential completes a handshake in both directions.
+#[tokio::test]
+async fn the_largest_credential_completes_a_handshake() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let endpoint =
+            QuicEndpoint::bind(largest_credential_key(), &loopback(), &test_config()).unwrap();
+        let mut server = serve_test_acceptor(endpoint, &[ALPN], |_| Admit::Accept);
+        let client =
+            QuicEndpoint::bind(largest_credential_key(), &loopback(), &test_config()).unwrap();
+
+        let conn = client.connect(server.addr(), &[ALPN]).await.unwrap();
+        let inbound = server.handled.recv().await.unwrap();
+        assert_eq!(conn.remote_id(), server.addr().id);
         assert_eq!(inbound.remote_id(), client.local_id());
         assert_eq!(echo(&conn, b"hello").await, b"hello");
     })
@@ -3104,14 +3184,19 @@ async fn cancelled_discovery_dials_restore_every_slot() {
     .unwrap();
 }
 
-/// An endpoint on one simulated socket at `addr`.
+/// An endpoint with a new key on one simulated socket at `addr`.
 fn sim_endpoint(net: &SimNet, addr: SocketAddr) -> QuicEndpoint {
+    sim_endpoint_keyed(net, addr, NodeSecretKey::generate())
+}
+
+/// An endpoint with the key `secret` on one simulated socket at `addr`.
+fn sim_endpoint_keyed(net: &SimNet, addr: SocketAddr, secret: NodeSecretKey) -> QuicEndpoint {
     let bind = QuicBindConfig {
         addrs: vec![addr],
         ..loopback()
     };
     QuicEndpoint::bind_with(
-        NodeSecretKey::generate(),
+        secret,
         &bind,
         &test_config(),
         net.clone(),
@@ -3267,6 +3352,64 @@ async fn check_listener_first_flight(delay_padding: bool) {
         );
         let (_client, result) = dial.await.unwrap();
         result.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+/// ID-12, DIAL-8: a listener with the largest credential has a first flight
+/// of about 13 KB, beyond the padded allowance of 10,800 bytes. The dial
+/// takes a second round trip and completes. It doesn't fail.
+#[tokio::test(start_paused = true)]
+async fn the_largest_credential_takes_a_second_round_trip() {
+    tokio::time::timeout(SIM_TEST_TIMEOUT, async {
+        let net = sim_net();
+        let listener = sim_endpoint_keyed(&net, sim_addr(1), largest_credential_key());
+        let _server = serve_test_acceptor(listener, &[ALPN], |_| Admit::Accept);
+        let client = sim_endpoint(&net, sim_addr(2));
+        let target = _server.addr();
+        let dial = tokio::spawn(async move {
+            let result = client.connect(target, &[ALPN]).await;
+            (client, result)
+        });
+        // Waits out the longest link delay, then delivers what `src` sent.
+        let deliver_from = |src: SocketAddr| {
+            let net = net.clone();
+            async move {
+                for _ in 0..10_000 {
+                    tokio::task::yield_now().await;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                for id in net.deliverable() {
+                    if id.link.src == src {
+                        net.deliver(id).unwrap();
+                    }
+                }
+                for _ in 0..10_000 {
+                    tokio::task::yield_now().await;
+                }
+            }
+        };
+
+        deliver_from(sim_addr(2)).await;
+        let flight: usize = sent_lengths(&net, sim_addr(1)).iter().sum();
+        assert!(
+            flight <= 3 * 3_600,
+            "the listener sent {flight} bytes before validation"
+        );
+        deliver_from(sim_addr(1)).await;
+        assert!(
+            !dial.is_finished(),
+            "the allowance can't carry the largest credential in one flight"
+        );
+        deliver_from(sim_addr(2)).await;
+        deliver_from(sim_addr(1)).await;
+        assert!(
+            dial.is_finished(),
+            "the dial completes on the second flight"
+        );
+        let (_client, result) = dial.await.unwrap();
+        assert_eq!(result.unwrap().remote_id(), _server.addr().id);
     })
     .await
     .unwrap();

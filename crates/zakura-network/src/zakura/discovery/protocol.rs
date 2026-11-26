@@ -1425,6 +1425,8 @@ impl fmt::Debug for ZakuraDiscoveryLocalConfig {
 /// publishes.
 #[derive(Clone)]
 pub struct ZakuraDiscoveryHandle {
+    /// Ordinary slot budget shared by discovery scheduling and connection admission.
+    pub(crate) ordinary_connection_cap: usize,
     inner: Arc<AsyncMutex<DiscoveryState>>,
     connected: watch::Receiver<Vec<ZakuraPeerId>>,
     self_record: watch::Receiver<Arc<ZakuraNodeRecord>>,
@@ -1550,9 +1552,14 @@ impl ZakuraDiscoveryHandle {
         let (self_record_tx, self_record_rx) = watch::channel(self_record);
         let (peer_snapshot_tx, peer_snapshot_rx) =
             watch::channel(ServicePeerSnapshot::new(0, 0, config.peer_limits));
+        let ordinary_connection_cap = discovery_ordinary_cap(
+            config.max_zakura_connections,
+            config.discovery_connection_headroom,
+        );
         let state = DiscoveryState::new(local, config, DisclosureKey::random());
         let verification_context = state.validation_context(now_unix_secs);
         Ok(Self {
+            ordinary_connection_cap,
             inner: Arc::new(AsyncMutex::new(state)),
             connected,
             self_record: self_record_rx,
@@ -3786,6 +3793,10 @@ fn connected_peer_node_ids(connected: &[ZakuraPeerId]) -> Vec<NodeId> {
     connected.iter().filter_map(ZakuraPeerId::node_id).collect()
 }
 
+fn discovery_ordinary_cap(max_connections: usize, connection_headroom: usize) -> usize {
+    max_connections.saturating_sub(connection_headroom)
+}
+
 /// Returns how many ordinary discovery dials may start.
 ///
 /// Registered peers and in-flight dials outside the preferred set,
@@ -3800,7 +3811,7 @@ pub(crate) fn discovery_dial_slot_limit(
     connection_headroom: usize,
     max_concurrent_dials: usize,
 ) -> usize {
-    let soft_cap = max_connections.saturating_sub(connection_headroom);
+    let soft_cap = discovery_ordinary_cap(max_connections, connection_headroom);
     let available_connection_slots = soft_cap.saturating_sub(ordinary_occupied);
     let available_dial_slots = max_concurrent_dials.saturating_sub(in_flight_count);
     available_connection_slots.min(available_dial_slots)

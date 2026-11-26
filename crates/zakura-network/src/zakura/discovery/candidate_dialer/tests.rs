@@ -15,8 +15,10 @@ use super::state::{classify_dial, DialFinish, DialObservation, PeerRegistration}
 use super::state::{CandidateAddress, CandidateDialerState, MAX_DIAL_BACKOFF_ENTRIES};
 use super::*;
 use crate::zakura::{
-    canonical_ip, discovery::DEFAULT_MAX_CONCURRENT_DISCOVERY_DIALS,
+    canonical_ip,
+    discovery::DEFAULT_MAX_CONCURRENT_DISCOVERY_DIALS,
     machine_test::machine_target_tests,
+    transport::{no_moves, MovedNodeIds},
 };
 
 mod preferred_loopback;
@@ -601,7 +603,10 @@ async fn connected_elsewhere_leaves_the_record_unconfirmed() -> Result<(), crate
 
     apply_discovery_dial_result(
         &handle,
-        &node,
+        DialedNode {
+            dialed: node,
+            connected: node,
+        },
         DiscoveryDialResult::ConnectedElsewhere,
         dialed,
         &trace,
@@ -611,7 +616,10 @@ async fn connected_elsewhere_leaves_the_record_unconfirmed() -> Result<(), crate
 
     apply_discovery_dial_result(
         &handle,
-        &node,
+        DialedNode {
+            dialed: node,
+            connected: node,
+        },
         DiscoveryDialResult::Registered,
         dialed,
         &trace,
@@ -621,6 +629,36 @@ async fn connected_elsewhere_leaves_the_record_unconfirmed() -> Result<(), crate
         sampled().await.len(),
         1,
         "the attempt's own registration confirms it"
+    );
+
+    // The node answered a dial to its earlier ID under the ID it has now.
+    // The registration confirms the book's records of both.
+    let moved = ZakuraDiscoveryHandle::new(
+        local(84, vec![SocketAddr::from(([93, 184, 216, 34], 8233))]),
+        ZakuraDiscoveryConfig::default(),
+        watch::channel(Vec::new()).1,
+    )?;
+    let moved_record = (*moved.current_self_record()).clone();
+    let moved_node = moved_record.body.node_id();
+    handle
+        .import_peer_records([moved_record], Some(node_id(82)))
+        .await?;
+    assert_eq!(sampled().await.len(), 1, "the new record is unconfirmed");
+    apply_discovery_dial_result(
+        &handle,
+        DialedNode {
+            dialed: node,
+            connected: moved_node,
+        },
+        DiscoveryDialResult::Registered,
+        dialed,
+        &trace,
+    )
+    .await;
+    assert_eq!(
+        sampled().await.len(),
+        2,
+        "a registration confirms both records of a moved node"
     );
     Ok(())
 }
@@ -665,7 +703,7 @@ async fn cancelled_unpolled_worker_settles_only_its_attempt() {
     assert!(state.complete(
         attempt,
         outcome.result,
-        outcome.admitted_addr.map(|addr| addr.ip()),
+        outcome.admitted_ip(),
         Instant::now()
     ));
     assert_eq!(state.in_flight_dials_to(ip), 1);
@@ -674,7 +712,7 @@ async fn cancelled_unpolled_worker_settles_only_its_attempt() {
     assert!(!state.complete(
         attempt,
         outcome.result,
-        outcome.admitted_addr.map(|addr| addr.ip()),
+        outcome.admitted_ip(),
         Instant::now()
     ));
     assert_eq!(state.in_flight_dials_to(ip), 2);
@@ -779,6 +817,7 @@ async fn preferred_dials_leave_the_maintained_dial_reserve() {
                 endpoint.clone(),
                 NodeAddr::with_addrs(target, [silent.local_addr().unwrap()]),
                 limits.clone(),
+                limits.max_connections,
                 attempt,
             ),
         );
@@ -838,6 +877,7 @@ async fn cancelled_worker_releases_its_real_quic_dial_capacity() {
                     endpoint.clone(),
                     NodeAddr::with_addrs(target, [silent.local_addr().unwrap()]),
                     limits.clone(),
+                    limits.max_connections,
                     attempt,
                 ),
             );
@@ -854,7 +894,7 @@ async fn cancelled_worker_releases_its_real_quic_dial_capacity() {
             assert!(state.complete(
                 completed,
                 outcome.result,
-                outcome.admitted_addr.map(|addr| addr.ip()),
+                outcome.admitted_ip(),
                 Instant::now()
             ));
             zakura_rt::time::timeout(Duration::from_secs(2), async {
@@ -887,11 +927,40 @@ async fn panicked_worker_returns_metadata_needed_to_release_reservations() {
     assert!(state.complete(
         completed,
         outcome.result,
-        outcome.admitted_addr.map(|addr| addr.ip()),
+        outcome.admitted_ip(),
         Instant::now()
     ));
     assert!(state.in_flight_node_ids().is_empty());
     assert_eq!(state.in_flight_dials_to(ip), 0);
+}
+
+/// An attempt's node is the one its own handshake authenticated, so two
+/// dials to one earlier ID that reach different nodes each credit their own.
+/// An attempt that authenticated nothing speaks for the dialed ID alone.
+#[test]
+fn an_attempt_speaks_for_the_node_its_own_handshake_authenticated() {
+    let mut state =
+        CandidateDialerState::new((Duration::from_secs(60), Duration::from_secs(3_600)));
+    let attempt = state.record_attempt(node_id(7), vec![DIAL_IP]).unwrap();
+    let outcome = |authenticated| DiscoveryDialOutcome {
+        authenticated,
+        result: DiscoveryDialResult::Registered,
+        phase: DialPhase::WorkerFinished,
+    };
+    for answered in [8, 9] {
+        let node = DialedNode::of(attempt, &outcome(Some(answered_as(answered))));
+        assert_eq!(
+            node.entries().copied().collect::<Vec<_>>(),
+            [node_id(7), answered_as(answered).node_id]
+        );
+    }
+    assert_eq!(
+        DialedNode::of(attempt, &outcome(None)),
+        DialedNode {
+            dialed: node_id(7),
+            connected: node_id(7),
+        }
+    );
 }
 
 const DIAL_IP: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(93, 184, 216, 34));
@@ -905,8 +974,18 @@ fn dial_watch(
     registered: Vec<ZakuraPeerId>,
     dial: impl Future<Output = Result<(), ZakuraHandlerError>> + Send + 'static,
 ) -> (DialWatch, watch::Sender<Vec<ZakuraPeerId>>, DialReport) {
+    dial_watch_with_moves(byte, registered, no_moves(), dial)
+}
+
+/// [`dial_watch`] for a dialer whose earlier dials learned `moved`.
+fn dial_watch_with_moves(
+    byte: u8,
+    registered: Vec<ZakuraPeerId>,
+    moved: watch::Receiver<MovedNodeIds>,
+    dial: impl Future<Output = Result<(), ZakuraHandlerError>> + Send + 'static,
+) -> (DialWatch, watch::Sender<Vec<ZakuraPeerId>>, DialReport) {
     let (registered_tx, registered_rx) = watch::channel(registered);
-    let (admitted_tx, admitted_addr_rx) = oneshot::channel();
+    let (authenticated_tx, authenticated_rx) = oneshot::channel();
     let (registration_tx, registration_rx) = oneshot::channel();
     let mut state =
         CandidateDialerState::new((Duration::from_secs(60), Duration::from_secs(3_600)));
@@ -915,27 +994,127 @@ fn dial_watch(
             .record_attempt(node_id(byte), vec![DIAL_IP])
             .expect("a fresh dialer records the attempt"),
         peer_id: peer_id(byte),
-        registered: registered_rx,
+        registered: RegisteredPeers::new(registered_rx, moved),
         dial: AbortOnDropHandle::new(zakura_rt::task::spawn(dial)),
-        admitted_addr_rx,
-        admitted_addr: None,
+        authenticated_rx,
+        authenticated: None,
         registration_rx,
         own_registration: None,
         registration: PeerRegistration::Absent,
         trace: ZakuraTrace::default(),
     };
     let report = DialReport {
-        admitted_addr: admitted_tx,
+        authenticated: authenticated_tx,
         registration: registration_tx,
     };
     (watch, registered_tx, report)
+}
+
+/// What a dial reports when TLS authenticated the node of
+/// [`peer_id`]`(byte)` at [`DIAL_ADDR`].
+fn answered_as(byte: u8) -> DialAuthenticated {
+    DialAuthenticated {
+        addr: DIAL_ADDR,
+        node_id: NodeId::from_bytes(&[byte; 32]),
+    }
+}
+
+/// A moves watch whose dialer found the node of [`peer_id`]`(dialed)` under
+/// the ID of `peer_id(connected)`.
+fn moved_to(dialed: u8, connected: u8) -> watch::Receiver<MovedNodeIds> {
+    let id = |byte| NodeId::from_bytes(&[byte; 32]);
+    let mut moves = MovedNodeIds::default();
+    moves.learn(id(dialed), id(connected));
+    watch::channel(moves).1
+}
+
+/// The node dialed as 7 answers as 8. The attempt's own dial registered it,
+/// under 8, so the attempt follows that registration and ends as registered
+/// once it is healthy, even if another dial changes the remembered ID.
+#[tokio::test(start_paused = true)]
+async fn an_attempt_follows_a_moved_node_to_its_registration() {
+    let (moves, moved) = watch::channel(MovedNodeIds::default());
+    moves.send_modify(|moves| {
+        moves.learn(answered_as(7).node_id, answered_as(8).node_id);
+    });
+    let (watch, registered_tx, report) =
+        dial_watch_with_moves(7, Vec::new(), moved, std::future::pending());
+    report.authenticated.send(answered_as(8)).unwrap();
+    report
+        .registration
+        .send(DialRegistration::Registered)
+        .unwrap();
+
+    let settled = tokio::spawn(watch.run());
+    registered_tx.send_replace(vec![peer_id(8)]);
+    tokio::time::sleep(ZAKURA_REDIAL_HEALTHY_CONNECTION - Duration::from_secs(1)).await;
+    assert!(
+        !settled.is_finished(),
+        "the registration is not yet healthy"
+    );
+
+    moves.send_modify(|moves| {
+        moves.learn(answered_as(7).node_id, answered_as(9).node_id);
+    });
+    registered_tx.send_replace(vec![peer_id(8), peer_id(10)]);
+    let outcome = settled.await.unwrap();
+    assert_eq!(outcome.result, DiscoveryDialResult::Registered);
+    assert_eq!(outcome.authenticated, Some(answered_as(8)));
+}
+
+/// The node dialed as 7 answers as 8, which is already registered from
+/// another connection. The handler closed this dial's connection without
+/// registering it, so the attempt earns no success, no failure and no backoff.
+#[tokio::test(start_paused = true)]
+async fn a_redundant_dial_to_a_moved_node_is_connected_elsewhere() {
+    let (watch, registered_tx, report) = dial_watch_with_moves(
+        7,
+        vec![peer_id(8)],
+        moved_to(7, 8),
+        std::future::ready(Ok(())),
+    );
+    report.authenticated.send(answered_as(8)).unwrap();
+    report
+        .registration
+        .send(DialRegistration::AlreadyConnected)
+        .unwrap();
+    // The existing peer leaves before the worker consumes its own dial report.
+    registered_tx.send_replace(Vec::new());
+
+    let outcome = watch.run().await;
+    assert_eq!(outcome.result, DiscoveryDialResult::ConnectedElsewhere);
+
+    let mut state =
+        CandidateDialerState::new((Duration::from_secs(60), Duration::from_secs(3_600)));
+    let now = Instant::now();
+    let attempt = state
+        .record_attempt(node_id(7), vec![DIAL_IP])
+        .expect("a fresh dialer records the attempt");
+    let (node, mut io, _ranking) = preferred_round::dialer(9344).await;
+    io.discovery
+        .insert_static_candidate(NodeAddr::with_addrs(attempt.node_id, [DIAL_ADDR]))
+        .await
+        .unwrap();
+    io.settle(&mut state, attempt, outcome).await;
+    assert_eq!(state.in_flight_count(), 0);
+    assert_eq!(state.in_flight_dials_to(DIAL_IP), 0);
+    assert!(!state.is_backed_off(attempt.node_id, DIAL_IP, now));
+    assert!(
+        io.discovery
+            .dial_candidates(&[], &[])
+            .await
+            .iter()
+            .any(|candidate| candidate.node_id == attempt.node_id),
+        "the discovery book can immediately dial the earlier ID again"
+    );
+    node.shutdown().await;
 }
 
 #[tokio::test(start_paused = true)]
 async fn registration_drop_before_healthy_threshold_is_short_lived() {
     let peer = peer_id(7);
     let (watch, registered_tx, report) = dial_watch(7, vec![peer], std::future::pending());
-    report.admitted_addr.send(DIAL_ADDR).unwrap();
+    report.authenticated.send(answered_as(7)).unwrap();
     report
         .registration
         .send(DialRegistration::Registered)
@@ -948,7 +1127,7 @@ async fn registration_drop_before_healthy_threshold_is_short_lived() {
     registered_tx.send_replace(Vec::new());
     let outcome = settled.await.unwrap();
     assert_eq!(outcome.result, DiscoveryDialResult::ShortLivedRegistered);
-    assert_eq!(outcome.admitted_addr, Some(DIAL_ADDR));
+    assert_eq!(outcome.admitted_addr(), Some(DIAL_ADDR));
 }
 
 #[tokio::test(start_paused = true)]
@@ -972,7 +1151,7 @@ async fn another_connections_registration_end_does_not_credit_an_unregistered_di
         let _ = refuse_rx.await;
         Ok(())
     });
-    report.admitted_addr.send(DIAL_ADDR).unwrap();
+    report.authenticated.send(answered_as(11)).unwrap();
 
     let settled = tokio::spawn(watch.run());
     tokio::task::yield_now().await;
@@ -994,14 +1173,14 @@ async fn another_connections_registration_end_does_not_credit_an_unregistered_di
 #[tokio::test(start_paused = true)]
 async fn a_served_dial_with_a_delayed_registration_is_short_lived() {
     let (watch, _registered_tx, report) = dial_watch(10, Vec::new(), std::future::ready(Ok(())));
-    report.admitted_addr.send(DIAL_ADDR).unwrap();
+    report.authenticated.send(answered_as(10)).unwrap();
     report
         .registration
         .send(DialRegistration::Registered)
         .unwrap();
     let outcome = watch.run().await;
     assert_eq!(outcome.result, DiscoveryDialResult::ShortLivedRegistered);
-    assert_eq!(outcome.admitted_addr, Some(DIAL_ADDR));
+    assert_eq!(outcome.admitted_addr(), Some(DIAL_ADDR));
 }
 
 /// A dial that authenticated its peer and was refused before registration
@@ -1010,14 +1189,14 @@ async fn a_served_dial_with_a_delayed_registration_is_short_lived() {
 #[tokio::test(start_paused = true)]
 async fn a_dial_refused_before_registration_fails_the_attempt() {
     let (watch, _registered_tx, report) = dial_watch(14, Vec::new(), std::future::ready(Ok(())));
-    report.admitted_addr.send(DIAL_ADDR).unwrap();
+    report.authenticated.send(answered_as(14)).unwrap();
     drop(report.registration);
     let outcome = watch.run().await;
     assert_eq!(outcome.result, DiscoveryDialResult::Failed);
-    assert_eq!(outcome.admitted_addr, Some(DIAL_ADDR));
+    assert_eq!(outcome.admitted_addr(), Some(DIAL_ADDR));
 
     let (watch, _registered_tx, report) = dial_watch(15, Vec::new(), std::future::ready(Ok(())));
-    report.admitted_addr.send(DIAL_ADDR).unwrap();
+    report.authenticated.send(answered_as(15)).unwrap();
     report
         .registration
         .send(DialRegistration::LocalLimit)
@@ -1049,7 +1228,7 @@ async fn another_connections_registration_ending_keeps_the_attempt_waiting() {
     fail_tx.send(()).unwrap();
     let outcome = settled.await.unwrap();
     assert_eq!(outcome.result, DiscoveryDialResult::LocalResourceLimit);
-    assert_eq!(outcome.admitted_addr, None);
+    assert_eq!(outcome.admitted_addr(), None);
 }
 
 /// A registration that lasts on another connection does not credit this
@@ -1064,7 +1243,7 @@ async fn another_connections_healthy_registration_ends_the_unfinished_dial() {
     });
     let outcome = watch.run().await;
     assert_eq!(outcome.result, DiscoveryDialResult::ConnectedElsewhere);
-    assert_eq!(outcome.admitted_addr, None);
+    assert_eq!(outcome.admitted_addr(), None);
     for _ in 0..8 {
         tokio::task::yield_now().await;
     }
@@ -1080,18 +1259,89 @@ async fn an_authenticated_healthy_registration_hands_the_dial_to_its_connection(
         let _retained = retained;
         std::future::pending().await
     });
-    report.admitted_addr.send(DIAL_ADDR).unwrap();
+    report.authenticated.send(answered_as(13)).unwrap();
     report
         .registration
         .send(DialRegistration::Registered)
         .unwrap();
     let outcome = watch.run().await;
     assert_eq!(outcome.result, DiscoveryDialResult::Registered);
-    assert_eq!(outcome.admitted_addr, Some(DIAL_ADDR));
+    assert_eq!(outcome.admitted_addr(), Some(DIAL_ADDR));
     for _ in 0..8 {
         tokio::task::yield_now().await;
     }
     assert!(observed.upgrade().is_some(), "the dial keeps serving");
+}
+
+/// The book lists a node that added a key under both of its IDs: relays
+/// still carry the record of its earlier ID, and its own record names the ID
+/// it has now. A dial to the earlier ID found the node under the current one.
+///
+/// While the node is registered, a round dials neither ID. Once it is gone, a
+/// round dials it once, not once per ID.
+#[tokio::test]
+async fn a_round_dials_a_moved_node_once() {
+    use crate::zakura::testkit::{ZakuraTestNode, TEST_NET_TIMEOUT};
+
+    let listener = ZakuraTestNode::builder(9305)
+        .extended_credential()
+        .spawn()
+        .await
+        .expect("listener spawns");
+    let dialer = ZakuraTestNode::builder(9306)
+        .max_connections_per_ip(4)
+        .spawn()
+        .await
+        .expect("dialer spawns");
+    let earlier = listener.earlier_node_addr().await;
+    let current = listener.node_addr().await;
+    for node_addr in [earlier.clone(), current.clone()] {
+        dialer
+            .discovery()
+            .insert_static_candidate(node_addr)
+            .await
+            .expect("the static candidate is valid");
+    }
+    dialer
+        .connect_native_to_addr(earlier.clone(), TEST_NET_TIMEOUT)
+        .await
+        .expect("a dial to the earlier ID connects");
+    let round = || async {
+        let mut state = CandidateDialerState::new(DIAL_BACKOFF);
+        admit_dial_round(
+            &dialer.endpoint(),
+            &dialer.discovery(),
+            &[],
+            &mut state,
+            RoundClaims::default(),
+            Instant::now(),
+        )
+        .await
+    };
+
+    let admitted: Vec<_> = round().await;
+    assert!(
+        admitted
+            .iter()
+            .all(|(attempt, _)| { attempt.node_id != earlier.id && attempt.node_id != current.id }),
+        "the node is registered under the ID it has now"
+    );
+
+    listener.shutdown().await;
+    let mut registered = dialer.supervisor().subscribe();
+    zakura_rt::time::timeout(TEST_NET_TIMEOUT, registered.wait_for(Vec::is_empty))
+        .await
+        .expect("the connection ends before the timeout")
+        .expect("the supervisor outlives the test");
+    let dialed: Vec<_> = round()
+        .await
+        .into_iter()
+        .map(|(attempt, _)| attempt.node_id)
+        .filter(|node| *node == earlier.id || *node == current.id)
+        .collect();
+    assert_eq!(dialed.len(), 1, "one dial reaches the node under either ID");
+
+    dialer.shutdown().await;
 }
 
 /// A cancelled worker reports its identity and its end.
@@ -1503,9 +1753,12 @@ async fn a_round_admits_no_more_dials_than_free_admission_permits() {
         .await
         .expect("dialer spawns");
     let endpoint = node.endpoint();
-    let permits = endpoint.discovery_dial_permits();
+    let permits = endpoint.discovery_dial_permits(node.discovery().ordinary_connection_cap);
     let held = endpoint.hold_connection_slots(permits - 1, false);
-    assert_eq!(endpoint.discovery_dial_permits(), 1);
+    assert_eq!(
+        endpoint.discovery_dial_permits(node.discovery().ordinary_connection_cap),
+        1
+    );
     assert!(
         endpoint.discovery_admission_capacity() >= 3,
         "the transport has a slot for each candidate"
@@ -1575,7 +1828,7 @@ async fn finished_workers_settle_before_the_round_starts() {
         finished.push(attempt.node_id);
         io.workers.push(DiscoveryDialWorker::spawn(attempt, async {
             DiscoveryDialOutcome {
-                admitted_addr: None,
+                authenticated: None,
                 result: DiscoveryDialResult::Failed,
                 phase: DialPhase::WorkerFinished,
             }
@@ -1764,7 +2017,7 @@ async fn every_dial_reservation_returns_to_baseline_after_each_exit() {
     // leaves before the registration turns healthy.
     let attempt = state.record_attempt(node_id(21), vec![DIAL_IP]).unwrap();
     let (registered_tx, registered_rx) = watch::channel(vec![peer_id(21)]);
-    let (_admitted_tx, admitted_addr_rx) = oneshot::channel();
+    let (_authenticated_tx, authenticated_rx) = oneshot::channel();
     let (registration_tx, registration_rx) = oneshot::channel();
     registration_tx.send(DialRegistration::Registered).unwrap();
     let dial = AbortOnDropHandle::new(zakura_rt::task::spawn(std::future::pending()));
@@ -1773,10 +2026,10 @@ async fn every_dial_reservation_returns_to_baseline_after_each_exit() {
         DialWatch {
             attempt,
             peer_id: peer_id(21),
-            registered: registered_rx,
+            registered: RegisteredPeers::new(registered_rx, no_moves()),
             dial,
-            admitted_addr_rx,
-            admitted_addr: None,
+            authenticated_rx,
+            authenticated: None,
             registration_rx,
             own_registration: None,
             registration: PeerRegistration::Absent,

@@ -612,7 +612,7 @@ async fn raw_connection() -> Result<(QuicEndpoint, QuicEndpoint, Connection, Con
     let factory = || {
         LocalEndpointFactory::with_limits(&local).quic_config(QuicConfig {
             stream_receive_window_bytes: 64 * 1024,
-            receive_window_bytes: 128 * 1024,
+            receive_window_bytes: Some(128 * 1024),
             send_window_bytes: 64 * 1024,
             ..local.quic.clone()
         })
@@ -639,7 +639,7 @@ async fn raw_connection() -> Result<(QuicEndpoint, QuicEndpoint, Connection, Con
 async fn serving_sets_the_window_to_the_negotiated_shares() -> Result<(), BoxError> {
     const KIB: u64 = 1024;
     let budget = |receive| ReactorBudget {
-        receive,
+        receive: ReceiveBudget::unsolicited_only(receive),
         output: 4 << 20,
     };
     let shares = ReactorShares {
@@ -649,7 +649,7 @@ async fn serving_sets_the_window_to_the_negotiated_shares() -> Result<(), BoxErr
         other: budget(2 * 1024 * KIB),
     };
     let local = ZakuraLocalLimits::from_config(&Config::default()).with_reactor_shares(shares);
-    assert_eq!(u64::from(local.quic.receive_window_bytes), 256 * KIB);
+    assert_eq!(u64::from(local.quic.receive_window()), 256 * KIB);
     assert_eq!(
         u64::from(local.quic.stream_receive_window_bytes),
         3 * 1024 * KIB
@@ -670,12 +670,17 @@ async fn serving_sets_the_window_to_the_negotiated_shares() -> Result<(), BoxErr
     let remote = timeout(TEST_TIMEOUT, connections.recv())
         .await?
         .ok_or("missing connection")?;
-    // The handshake is over, and nothing raised the window yet.
+    // The handshake is over, and nothing raised the windows yet.
     tokio::time::sleep(zakura_quic::LOAD_INTERVAL * 2).await;
     assert_eq!(
         remote.load().receive_window,
         256 * KIB,
-        "the handshake share"
+        "the handshake receive share"
+    );
+    assert_eq!(
+        remote.load().send_window,
+        HANDSHAKE_SEND_WINDOW_BYTES,
+        "the small handshake send window"
     );
 
     let (sessions, _sessions) = mpsc::channel(1);
@@ -709,6 +714,7 @@ async fn serving_sets_the_window_to_the_negotiated_shares() -> Result<(), BoxErr
     );
     let remote_ip = Some(remote.admitted_ip());
     let served = remote.clone();
+    let admitted_send_window = local.admitted_send_window_bytes;
     let serving = AbortOnDropHandle::new(tokio::spawn(async move {
         handler
             .register_and_serve(
@@ -733,7 +739,9 @@ async fn serving_sets_the_window_to_the_negotiated_shares() -> Result<(), BoxErr
             .await
     }));
     timeout(TEST_TIMEOUT, async {
-        while remote.load().receive_window != (256 + 3 * 1024) * KIB {
+        while remote.load().receive_window != (256 + 3 * 1024) * KIB
+            || remote.load().send_window != admitted_send_window
+        {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
@@ -1617,7 +1625,7 @@ async fn a_compat_response_stays_funded_until_its_frames_drop() -> Result<(), Bo
     let resources = node.connection(stream.capability);
 
     // A full exchange gate holds the exchange back before its stream opens.
-    let capacity = COMPAT_EXCHANGE_BUDGET.receive;
+    let capacity = COMPAT_EXCHANGE_BUDGET.receive_total();
     let saturated = resources.admit_compat_response(capacity).await;
     let blocked = write_outbound_request_frame(
         &connection,
@@ -1742,6 +1750,7 @@ async fn incomplete_pairs_expire_and_mismatched_roles_release_stream_permits(
         connection_token: cancel.clone(),
         close_cause: CloseCause::new(),
         freshness_tx: freshness,
+        session_funding: None,
     };
     let mut offers = Vec::new();
     // The request role may arrive first. It must not reach the service alone.
@@ -1853,6 +1862,7 @@ async fn ineligible_pair_opener_is_rejected_before_service_reservation() -> Resu
         connection_token: context.connection_token.clone(),
         close_cause: context.close_cause,
         freshness_tx: context.freshness_tx,
+        session_funding: None,
     };
     let (mut send, _recv) = connection.open_bi().await?;
     // Withhold the pair ID: even the first role cannot reserve service capacity.
@@ -1936,6 +1946,7 @@ async fn prelude_frame_cap_must_fit_a_header_and_a_payload_byte() -> Result<(), 
             connection_token: context.connection_token.clone(),
             close_cause: context.close_cause,
             freshness_tx: context.freshness_tx,
+            session_funding: None,
         };
         let (mut send, mut recv) = connection.open_bi().await?;
         let prelude = StreamPrelude {

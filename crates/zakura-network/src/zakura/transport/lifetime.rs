@@ -56,7 +56,7 @@ use zakura_rt::{
 
 use crate::zakura::{
     regulation::{OutputByteBudget, OutputGrant, WeakOutputByteBudget},
-    ReactorBudget, Stream, FRAME_HEADER_BYTES,
+    ReactorBudget, ReceiveBudget, Stream, FRAME_HEADER_BYTES,
 };
 use zakura_chain::serialization::MAX_PROTOCOL_MESSAGE_LEN;
 
@@ -93,7 +93,7 @@ pub(crate) const COMPAT_EXCHANGE_MAX_BYTES: u64 =
 /// from the compatibility client's concurrent requests, which each hold at most
 /// one grant, not from the connection count.
 pub const COMPAT_EXCHANGE_BUDGET: ReactorBudget = ReactorBudget {
-    receive: COMPAT_EXCHANGE_MAX_BYTES,
+    receive: ReceiveBudget::unsolicited_only(COMPAT_EXCHANGE_MAX_BYTES),
     output: 0,
 };
 
@@ -124,10 +124,12 @@ impl ReactorShares {
     /// of received frames and [`DEFAULT_REACTOR_OUTPUT_BYTES`] of output.
     pub fn from_quic(quic: &QuicConfig) -> Self {
         Self {
-            control_receive_bytes: u64::from(quic.receive_window_bytes),
+            control_receive_bytes: u64::from(quic.receive_window()),
             kinds: Vec::new(),
             other: ReactorBudget {
-                receive: u64::from(quic.stream_receive_window_bytes),
+                receive: ReceiveBudget::unsolicited_only(u64::from(
+                    quic.stream_receive_window_bytes,
+                )),
                 output: DEFAULT_REACTOR_OUTPUT_BYTES,
             },
         }
@@ -142,22 +144,32 @@ impl ReactorShares {
     }
 
     /// The QUIC receive window of a connection that negotiated `kinds`: the
-    /// handshake window plus each kind's receive share.
+    /// control share plus each kind's total receive share.
     pub fn receive_window(&self, kinds: impl IntoIterator<Item = u16>) -> u64 {
         kinds
             .into_iter()
             .fold(self.control_receive_bytes, |window, kind| {
-                window.saturating_add(self.share(kind).receive)
+                window.saturating_add(self.share(kind).receive_total())
             })
     }
 
-    /// The QUIC stream receive window: the largest receive share, so one
+    /// The static base receive window of a connection that negotiated `kinds`:
+    /// the control share plus each kind's unsolicited receive bytes.
+    pub fn base_receive_window(&self, kinds: impl IntoIterator<Item = u16>) -> u64 {
+        kinds
+            .into_iter()
+            .fold(self.control_receive_bytes, |window, kind| {
+                window.saturating_add(self.share(kind).receive.unsolicited)
+            })
+    }
+
+    /// The QUIC stream receive window: the largest total receive share, so one
     /// stream can carry its whole kind's share.
     pub fn stream_receive_window(&self) -> u64 {
         self.kinds
             .iter()
-            .map(|(_, share)| share.receive)
-            .fold(self.other.receive, u64::max)
+            .map(|(_, share)| share.receive_total())
+            .fold(self.other.receive_total(), u64::max)
     }
 }
 
@@ -175,8 +187,10 @@ pub(crate) struct TransportLimits {
     /// compatibility client on a node that registers the legacy request kind, and
     /// zero otherwise.
     pub(crate) compat_exchange_bytes: u64,
-    /// The QUIC send window of one connection.
+    /// The QUIC send window of one admitted connection.
     pub(crate) send_window: u64,
+    /// The QUIC send window of one pending handshake connection.
+    pub(crate) handshake_send_window: u64,
     /// Connections the node admits.
     pub(crate) max_connections: usize,
     /// QUIC connections the node holds beyond the admitted ones.
@@ -186,13 +200,18 @@ pub(crate) struct TransportLimits {
 /// The node's transport byte bounds, derived from its transport limits.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ResourceEnvelope {
-    /// Raw inbound frame bytes that one connection may retain.
+    /// Raw inbound frame bytes that one connection's raw gates may retain.
+    ///
+    /// Every held raw frame carries a QUIC `CreditHold` (API-10), so its bytes
+    /// sit inside [`Self::transport_credit_bytes`] and are not counted again in
+    /// [`Self::retained_frame_bytes`].
     pub(crate) connection_raw_bytes: u64,
-    /// Raw inbound frame bytes that all connections may retain together.
-    pub(crate) node_raw_bytes: u64,
-    /// Queued frame bytes without another owner that one connection may retain.
+    /// Queued unguarded frame bytes that one connection may retain.
+    ///
+    /// Guarded `Serve` and `Push` frames skip `FrameGate.output` and are counted
+    /// once in the serving envelope instead.
     pub(crate) connection_output_bytes: u64,
-    /// Queued frame bytes without another owner that the node may retain.
+    /// Queued unguarded frame bytes that the node may retain.
     pub(crate) node_output_bytes: u64,
     /// Outbound compatibility exchange bytes that the node may retain.
     pub(crate) compat_response_bytes: u64,
@@ -215,34 +234,36 @@ impl ResourceEnvelope {
         let node_bytes =
             |connection_bytes: u64| connection_bytes.saturating_mul(connections as u64);
         let shares = limits.connection_shares;
-        let window = |receive: u64| u128::from(receive) + u128::from(limits.send_window);
+        let receive_total = shares.receive_total();
+        let admitted_window =
+            u128::from(limits.control_receive_bytes.saturating_add(receive_total))
+                + u128::from(limits.send_window);
+        let handshake_window =
+            u128::from(limits.control_receive_bytes) + u128::from(limits.handshake_send_window);
         Self {
-            connection_raw_bytes: shares.receive,
-            node_raw_bytes: node_bytes(shares.receive),
+            connection_raw_bytes: receive_total,
             connection_output_bytes: shares.output,
             node_output_bytes: node_bytes(shares.output),
             compat_response_bytes: limits.compat_exchange_bytes,
             request_executions: connections.saturating_mul(usize::from(limits.max_open_streams)),
-            transport_credit_bytes: connections as u128
-                * window(limits.control_receive_bytes.saturating_add(shares.receive))
-                + limits.max_pending_handshakes as u128 * window(limits.control_receive_bytes),
+            transport_credit_bytes: connections as u128 * admitted_window
+                + limits.max_pending_handshakes as u128 * handshake_window,
         }
     }
 
-    /// The most frame bytes these bounds allow this module's owners to retain:
-    /// the kinds' gates and the compatibility exchange gates.
+    /// The most frame bytes these bounds allow this module's owners to retain
+    /// outside QUIC receive credit: unguarded output gates and compatibility
+    /// exchange gates.
+    ///
+    /// Held raw frames sit inside [`Self::transport_credit_bytes`] via API-10
+    /// `CreditHold`, so they are counted once there.
     pub(crate) fn retained_frame_bytes(&self) -> u128 {
-        u128::from(self.node_raw_bytes)
-            + u128::from(self.node_output_bytes)
-            + u128::from(self.compat_response_bytes)
+        u128::from(self.node_output_bytes) + u128::from(self.compat_response_bytes)
     }
 
-    /// The most transport memory these bounds allow: retained frames, plus the
-    /// bytes QUIC buffers under the windows.
-    ///
-    /// A held raw frame's bytes also sit inside its connection's receive
-    /// window, so the sum counts them twice. The second count funds a payload
-    /// buffer that the reader allocates before its bytes arrive.
+    /// The most transport memory these bounds allow: unguarded retained output
+    /// and compatibility exchange frames, plus the QUIC credit windows that also
+    /// cover held raw frames.
     pub(crate) fn transport_memory_bytes(&self) -> u128 {
         self.retained_frame_bytes() + self.transport_credit_bytes
     }
@@ -300,7 +321,7 @@ fn check_kind_shares(
 ) -> Result<(), ShareBelowFrame> {
     for &(kind, _, frame) in kinds {
         let ReactorBudget { receive, output } = shares.share(kind);
-        for (direction, share) in [("receive", receive), ("output", output)] {
+        for (direction, share) in [("receive", receive.unsolicited), ("output", output)] {
             if share < frame {
                 return Err(ShareBelowFrame {
                     kind,
@@ -404,18 +425,22 @@ impl NodeResources {
         }
     }
 
-    /// Count a breach of `bound` in [`Self::usage`], so reconnect churn that
-    /// outlives its admission slot stays visible.
+    /// Count a breach of `bound` in [`Self::usage`] (conn-17), so reconnect
+    /// churn that outlives its admission slot stays visible.
     ///
-    /// This only observes. It never refuses an owner, because a stuck worker that
-    /// outlived its drain timeout already holds what it holds. Connections call it
-    /// when they start and end. The endpoint's usage timer sets the byte gauges
-    /// with [`NodeUsage::record`].
+    /// Outside the simulator this only observes. It never refuses an owner,
+    /// because a stuck worker that outlived its drain timeout already holds
+    /// what it holds. The simulator's drain timeout can't be outlived, so
+    /// there a breach is a bug and panics. Connections call it when they
+    /// start and end. The endpoint's usage timer sets the byte gauges with
+    /// [`NodeUsage::record`].
     pub(crate) fn report_usage(&self, bound: OwnerBound) -> NodeUsage {
         let usage = self.usage();
         if !bound.admits(&usage.owners) {
             metrics::counter!("zakura.p2p.owners.over_bound").increment(1);
             debug!(?usage, ?bound, "Zakura owners exceed their admission bound");
+            #[cfg(zakura_sim)]
+            panic!("Zakura owners exceed their admission bound: usage={usage:?}, bound={bound:?}");
         }
         usage
     }
@@ -429,7 +454,7 @@ impl NodeResources {
             .filter(|(_, kind_capabilities, _)| capabilities & kind_capabilities != 0)
             .map(|(kind, ..)| (*kind, KindGates::new(self.shares.share(*kind))))
             .collect();
-        let compat_exchanges = FrameGate::new(COMPAT_EXCHANGE_BUDGET.receive);
+        let compat_exchanges = FrameGate::new(COMPAT_EXCHANGE_BUDGET.receive_total());
         self.live
             .lock()
             .expect("no usage report panics")
@@ -453,6 +478,9 @@ impl NodeResources {
             receive_window: self
                 .shares
                 .receive_window(gates.iter().map(|(kind, _)| *kind)),
+            base_receive_window: self
+                .shares
+                .base_receive_window(gates.iter().map(|(kind, _)| *kind)),
             gates: gates.into(),
             compat_exchanges,
         }
@@ -478,7 +506,7 @@ struct KindGates {
 impl KindGates {
     fn new(share: ReactorBudget) -> Self {
         Self {
-            raw: FrameGate::new(share.receive),
+            raw: FrameGate::new(share.receive_total()),
             output: FrameGate::new(share.output),
         }
     }
@@ -499,6 +527,7 @@ pub(crate) struct ConnectionResources {
     stream_owners: Arc<[AtomicUsize; OWNER_PHASES]>,
     gates: Arc<[(u16, KindGates)]>,
     receive_window: u64,
+    base_receive_window: u64,
     /// Funds this connection's outbound compatibility exchanges.
     compat_exchanges: FrameGate,
 }
@@ -510,18 +539,26 @@ impl ConnectionResources {
         self.receive_window
     }
 
+    /// The static base QUIC receive window for pool-backed connections (`02 §3`):
+    /// the control share plus each negotiated kind's unsolicited receive bytes.
+    pub(crate) fn base_receive_window(&self) -> u64 {
+        self.base_receive_window
+    }
+
     /// A probe of this connection's gates and of `quic`, the connection's
     /// QUIC load.
     #[cfg(zakura_sim)]
     pub(crate) fn probe(
         &self,
         quic: zakura_quic::LoadProbe,
+        live_receive_window: Option<Arc<zakura_rt::sync::counter::AtomicU64>>,
         streams: &Arc<zakura_rt::sync::Semaphore>,
         limits: super::super::ZakuraConnectionLimits,
     ) -> super::ConnectionProbe {
         super::ConnectionProbe::new(
             quic,
             self.receive_window,
+            live_receive_window,
             streams,
             &self.stream_owners,
             limits,
@@ -608,7 +645,7 @@ impl ConnectionResources {
     /// behavior.
     pub(crate) fn unconstrained(kinds: &[u16]) -> Self {
         let share = ReactorBudget {
-            receive: 1 << 30,
+            receive: ReceiveBudget::unsolicited_only(1 << 30),
             output: 1 << 30,
         };
         Self {
@@ -620,7 +657,8 @@ impl ConnectionResources {
                 .map(|kind| (*kind, KindGates::new(share)))
                 .collect(),
             receive_window: u64::MAX,
-            compat_exchanges: FrameGate::new(COMPAT_EXCHANGE_BUDGET.receive),
+            base_receive_window: u64::MAX,
+            compat_exchanges: FrameGate::new(COMPAT_EXCHANGE_BUDGET.receive_total()),
         }
     }
 }
@@ -946,11 +984,12 @@ pub(crate) struct OwnerGuard {
 }
 
 impl OwnerGuard {
-    /// Move this owner to `phase`.
+    /// Move this owner to `phase`. It leaves its old phase first, so a
+    /// concurrent [`NodeResources::report_usage`] never counts it twice.
     pub(crate) fn advance(&self, phase: OwnerPhase) {
         let previous = self.phase.swap(phase as usize, Ordering::Relaxed);
-        self.ledger.add(phase);
         self.ledger.remove(owner_phase(previous));
+        self.ledger.add(phase);
         #[cfg(zakura_sim)]
         if let Some(owners) = &self.stream_owners {
             owners[previous].fetch_sub(1, Ordering::Relaxed);

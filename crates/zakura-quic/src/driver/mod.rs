@@ -112,6 +112,9 @@ pub(crate) enum ConnCmd {
     },
     SetLimits {
         limits: crate::conn::ConnLimits,
+        /// This call's place in the order of [`crate::Conn::set_limits`]
+        /// calls, which [`crate::ConnLoad::limits_applied`] reports.
+        seq: u64,
     },
     SetPriority {
         id: StreamId,
@@ -159,6 +162,9 @@ pub(crate) struct ConnShared {
     released_credit: AtomicU64,
     /// Wakes the task when `released_credit` leaves zero.
     credit_released: Notify,
+    /// The sequence number of the last `SetLimits` command sent. The lock
+    /// spans the send, so sequence numbers follow the command order.
+    limits_sent: Mutex<u64>,
     /// The ID both ends derive from the TLS handshake, set when the
     /// handshake completes ([`crate::Conn::shared_id`]).
     #[cfg(any(test, zakura_sim, feature = "test-support"))]
@@ -182,6 +188,7 @@ impl ConnShared {
             socket_queued_bytes,
             released_credit: AtomicU64::new(0),
             credit_released: Notify::new(),
+            limits_sent: Mutex::new(0),
             #[cfg(any(test, zakura_sim, feature = "test-support"))]
             shared_id: std::sync::OnceLock::new(),
         })
@@ -273,6 +280,23 @@ impl ConnRef {
     /// Sends a command, or returns the close reason if the task has ended.
     pub(crate) fn send(&self, cmd: ConnCmd) -> Result<(), ConnectionError> {
         self.cmds.send(cmd).map_err(|_| self.shared.close_reason())
+    }
+
+    /// Sends `limits` to the task with the next sequence number, and returns
+    /// that number.
+    pub(crate) fn send_limits(
+        &self,
+        limits: crate::conn::ConnLimits,
+    ) -> Result<u64, ConnectionError> {
+        let mut sent = self
+            .shared
+            .limits_sent
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let seq = *sent + 1;
+        self.send(ConnCmd::SetLimits { limits, seq })?;
+        *sent = seq;
+        Ok(seq)
     }
 }
 

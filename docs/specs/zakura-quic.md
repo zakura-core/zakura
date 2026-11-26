@@ -1192,8 +1192,10 @@ reads as unset, so those nodes also get the small handshake windows.
     50 ms (one `LOAD_INTERVAL`) only while its send window is above its base
     or its latest load snapshot showed output waiting. On each tick, a
     connection with output waiting leases growth from the `Serving` consumer
-    toward `min(2 × cwnd, serving_per_peer)`. `serving_per_peer` defaults to
-    96 MiB, and `PeerSubPool` shares `Serving` fairly across peers. After
+    toward `min(2 × cwnd, serving_per_peer)`, and never past
+    `[network.zakura.quic] send_window_bytes` (32 MiB by default).
+    `serving_per_peer` defaults to 96 MiB, and `PeerSubPool` shares `Serving`
+    fairly across peers. After
     four ticks with no output waiting and no accepted bytes, the window
     shrinks back to its base. The shrunk bytes stay leased until the
     connection accepts a byte after a snapshot reflected the shrink, or until

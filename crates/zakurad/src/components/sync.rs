@@ -193,10 +193,10 @@ const REGISTRY_MISS_RETRY_BACKOFF: Duration = Duration::from_secs(2);
 /// So we want to keep the lookahead limit reasonably small.
 ///
 /// The configured limits count blocks, so the syncer multiplies them by
-/// [`lookahead_limit_multiplier`] to keep the same time window at shorter target
-/// spacings. After NU7, the in-flight bound and its RAM bound are three times the
-/// configured value. ZIP 218 scales `BLOCK_DOWNLOAD_WINDOW` and
-/// `MAX_BLOCKS_IN_TRANSIT_PER_PEER` by the same factor:
+/// [`LookaheadScale`] to keep the same time window at shorter target spacings.
+/// After NU7, the in-flight bound and its RAM bound are three times the
+/// configured value, and 3.75 times after NU7.1. ZIP 218 and ZIP 223 scale
+/// `BLOCK_DOWNLOAD_WINDOW` and `MAX_BLOCKS_IN_TRANSIT_PER_PEER` by the same factors:
 /// <https://zips.z.cash/zip-0218#block-count-based-constants>
 ///
 /// Once these malicious blocks start failing validation, the syncer will cancel all
@@ -225,14 +225,61 @@ pub const DEFAULT_ZAKURA_BLOCK_APPLY_CONCURRENCY_LIMIT: usize = 32;
 /// If the concurrency limit is 0, Zebra can't download or verify any blocks.
 pub const MIN_CONCURRENCY_LIMIT: usize = 1;
 
-/// Returns the lookahead multiplier needed to preserve the post-Blossom time window.
+/// How much the block-count lookahead limits grow at a target spacing, so they
+/// cover the same time window as at the post-Blossom 75 second spacing.
 ///
-/// Existing 150- and 75-second eras retain the configured limits. Shorter future
-/// target spacings increase the number of blocks in the same time window.
-pub(crate) fn lookahead_limit_multiplier(network: &Network, height: Height) -> usize {
-    let spacing = NetworkUpgrade::target_spacing_for_height(network, height).num_seconds();
-    usize::try_from((i64::from(POST_BLOSSOM_POW_TARGET_SPACING) / spacing).max(1))
-        .expect("the spacing ratio fits in usize")
+/// Existing 150 and 75 second eras keep the configured limits. 25 seconds
+/// triples them, and 20 seconds multiplies them by 3.75, rounding up.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LookaheadScale {
+    /// The target spacing, at most the post-Blossom spacing.
+    spacing_seconds: usize,
+}
+
+impl LookaheadScale {
+    /// The scale that keeps the configured limits.
+    pub(crate) const UNSCALED: Self = Self {
+        // The post-Blossom spacing is 75, so the cast can't truncate.
+        spacing_seconds: POST_BLOSSOM_POW_TARGET_SPACING as usize,
+    };
+
+    /// Returns the scale at the target spacing for `height` on `network`.
+    pub(crate) fn at(network: &Network, height: Height) -> Self {
+        let spacing = NetworkUpgrade::target_spacing_for_height(network, height).num_seconds();
+        let spacing_seconds = usize::try_from(spacing).expect("target spacings are positive");
+        Self {
+            spacing_seconds: spacing_seconds.min(Self::UNSCALED.spacing_seconds),
+        }
+    }
+
+    /// Returns the largest scale any upgrade on `network` uses.
+    pub(crate) fn widest(network: &Network) -> Self {
+        network
+            .activation_list()
+            .into_keys()
+            .map(|height| Self::at(network, height))
+            .min_by_key(|scale| scale.spacing_seconds)
+            .unwrap_or(Self::UNSCALED)
+    }
+
+    /// Returns `blocks` scaled to the same time window, rounded up, or `None`
+    /// if it overflows.
+    pub(crate) fn checked_scale(self, blocks: usize) -> Option<usize> {
+        Some(
+            blocks
+                .checked_mul(Self::UNSCALED.spacing_seconds)?
+                .div_ceil(self.spacing_seconds),
+        )
+    }
+
+    /// Returns `blocks` scaled to the same time window, rounded up.
+    ///
+    /// [`Config::backend_verification_total`] bounds every configured limit at
+    /// startup, so the product fits.
+    pub(crate) fn scale(self, blocks: usize) -> usize {
+        self.checked_scale(blocks)
+            .expect("startup bounds the scaled lookahead limits")
+    }
 }
 
 /// The expected maximum number of hashes in an ObtainTips or ExtendTips response.
@@ -815,23 +862,19 @@ impl Config {
         &self,
         network: &Network,
     ) -> Result<usize, BackendExecutionError> {
-        let multiplier = network
-            .activation_list()
-            .into_keys()
-            .map(|height| lookahead_limit_multiplier(network, height))
-            .max()
-            .unwrap_or(1);
+        let scale = LookaheadScale::widest(network);
         let checkpoint = self
             .checkpoint_verify_concurrency_limit
             .max(MIN_CHECKPOINT_CONCURRENCY_LIMIT);
-        let legacy_checkpoint = checkpoint
-            .checked_mul(multiplier)
+        let legacy_checkpoint = scale
+            .checked_scale(checkpoint)
             .and_then(|limit| limit.checked_mul(VERIFICATION_PIPELINE_SCALING_MULTIPLIER + 1))
             .ok_or(BackendExecutionError::Overflow)?;
-        let legacy_full = self
-            .full_verify_concurrency_limit
-            .max(MIN_CONCURRENCY_LIMIT)
-            .checked_mul(multiplier)
+        let legacy_full = scale
+            .checked_scale(
+                self.full_verify_concurrency_limit
+                    .max(MIN_CONCURRENCY_LIMIT),
+            )
             .ok_or(BackendExecutionError::Overflow)?;
         // The native driver keeps room for two complete checkpoint ranges.
         let native_applies = self
@@ -2643,7 +2686,7 @@ where
     /// The configured lookahead limit, based on the currently verified height,
     /// and the number of hashes we haven't queued yet.
     ///
-    /// The configured limits scale with [`lookahead_limit_multiplier`] at the verified height.
+    /// The configured limits scale with [`LookaheadScale`] at the verified height.
     fn lookahead_limit(&self, new_hashes: usize) -> usize {
         let max_checkpoint_height: usize = self
             .max_checkpoint_height
@@ -2653,19 +2696,19 @@ where
 
         // When the state is empty, we want to verify using checkpoints
         let verified_height = self.latest_chain_tip.best_tip_height().unwrap_or(Height(0));
-        let multiplier = lookahead_limit_multiplier(&self.network, verified_height);
+        let scale = LookaheadScale::at(&self.network, verified_height);
         let verified_height: usize = verified_height.0.try_into().expect("fits in usize");
 
         if verified_height >= max_checkpoint_height {
-            self.full_verify_concurrency_limit * multiplier
+            scale.scale(self.full_verify_concurrency_limit)
         } else if (verified_height + new_hashes) >= max_checkpoint_height {
             // If we're just about to start full verification, allow enough for the remaining checkpoint,
             // and also enough for a separate full verification lookahead.
             let checkpoint_hashes = verified_height + new_hashes - max_checkpoint_height;
 
-            self.full_verify_concurrency_limit * multiplier + checkpoint_hashes
+            scale.scale(self.full_verify_concurrency_limit) + checkpoint_hashes
         } else {
-            self.checkpoint_verify_concurrency_limit * multiplier
+            scale.scale(self.checkpoint_verify_concurrency_limit)
         }
     }
 

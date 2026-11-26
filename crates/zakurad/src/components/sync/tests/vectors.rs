@@ -45,7 +45,7 @@ use crate::{
                 VERIFICATION_PIPELINE_DROP_LIMIT,
             },
             legacy_trace::LegacySyncTrace,
-            SyncStatus,
+            LookaheadScale, SyncStatus,
         },
         test_misbehavior::{self, reported_score},
         ChainSync,
@@ -4252,7 +4252,7 @@ async fn mainnet_work_floor_rejects_downloads_before_verification() {
             let (_, pause_height, _) = lookahead_heights(
                 Some(tip_height),
                 sync::MIN_CONCURRENCY_LIMIT,
-                sync::lookahead_limit_multiplier(&Network::Mainnet, tip_height),
+                sync::LookaheadScale::at(&Network::Mainnet, tip_height),
             );
             let canonical: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
                 .zcash_deserialize_into()
@@ -4764,6 +4764,38 @@ async fn lookahead_limit_scales_with_target_spacing() {
     }
 }
 
+/// The lookahead scale gives ZIP 218's and ZIP 223's scaled block-count
+/// defaults: 16 blocks in transit and a 1,024-block window become 48 and 3,072
+/// at NU7's 25 seconds, and 60 and 3,840 at NU7.1's 20 seconds.
+#[test]
+fn lookahead_scale_follows_zip_218_and_zip_223() {
+    let network = zakura_chain::parameters::testnet::Parameters::build()
+        .with_activation_heights(
+            zakura_chain::parameters::testnet::ConfiguredActivationHeights {
+                blossom: Some(1),
+                nu7: Some(10),
+                nu7_1: Some(20),
+                ..Default::default()
+            },
+        )
+        .expect("activation heights are valid")
+        .clear_funding_streams()
+        .to_network()
+        .expect("configured testnet is valid");
+
+    for (height, in_transit, window) in [(9, 16, 1_024), (10, 48, 3_072), (20, 60, 3_840)] {
+        let scale = LookaheadScale::at(&network, Height(height));
+        assert_eq!(scale.scale(16), in_transit, "height {height}");
+        assert_eq!(scale.scale(1_024), window, "height {height}");
+    }
+    // A single block covers 3.75 blocks at 20 seconds, which rounds up.
+    assert_eq!(LookaheadScale::at(&network, Height(20)).scale(1), 4);
+    assert_eq!(
+        LookaheadScale::widest(&network),
+        LookaheadScale::at(&network, Height(20))
+    );
+}
+
 /// The downloader must not drop blocks inside the syncer's scaled request window.
 #[test]
 fn scaled_lookahead_stays_below_the_drop_height() {
@@ -4773,28 +4805,37 @@ fn scaled_lookahead_stays_below_the_drop_height() {
     const LOOKAHEAD_LIMIT: usize = 20_000;
     let tip = Height(1_000_000);
 
-    let (drop_height, _, _) = lookahead_heights(Some(tip), LOOKAHEAD_LIMIT, 1);
+    let (drop_height, _, _) =
+        lookahead_heights(Some(tip), LOOKAHEAD_LIMIT, LookaheadScale::UNSCALED);
     assert_eq!(
         drop_height,
         (tip + VERIFICATION_PIPELINE_DROP_LIMIT).expect("the test height is valid"),
         "the drop limit is unchanged at 75 second spacing",
     );
 
-    for multiplier in [1, 3] {
+    for scale in [
+        LookaheadScale::UNSCALED,
+        LookaheadScale {
+            spacing_seconds: 25,
+        },
+        LookaheadScale {
+            spacing_seconds: 20,
+        },
+    ] {
+        let scaled_limit = scale.scale(LOOKAHEAD_LIMIT);
         let request_height = (tip
-            + block::HeightDiff::try_from(LOOKAHEAD_LIMIT * multiplier)
-                .expect("the test lookahead fits"))
+            + block::HeightDiff::try_from(scaled_limit).expect("the test lookahead fits"))
         .expect("the test height is valid");
 
         let (drop_height, pause_height, reset_height) =
-            lookahead_heights(Some(tip), LOOKAHEAD_LIMIT, multiplier);
-        assert!(request_height <= drop_height, "multiplier {multiplier}");
-        assert!(reset_height <= pause_height, "multiplier {multiplier}");
+            lookahead_heights(Some(tip), LOOKAHEAD_LIMIT, scale);
+        assert!(request_height <= drop_height, "{scale:?}");
+        assert!(reset_height <= pause_height, "{scale:?}");
 
-        let (genesis_drop, _, _) = lookahead_heights(None, LOOKAHEAD_LIMIT, multiplier);
+        let (genesis_drop, _, _) = lookahead_heights(None, LOOKAHEAD_LIMIT, scale);
         assert!(
-            Height(u32::try_from(LOOKAHEAD_LIMIT * multiplier).expect("fits")) <= genesis_drop,
-            "multiplier {multiplier}"
+            Height(u32::try_from(scaled_limit).expect("fits")) <= genesis_drop,
+            "{scale:?}"
         );
     }
 }
@@ -4803,9 +4844,8 @@ fn scaled_lookahead_stays_below_the_drop_height() {
 fn backend_verification_total_sums_effective_limits_and_rejects_excess() {
     use crate::components::inbound::downloads::MAX_INBOUND_CONCURRENCY;
     use crate::components::sync::{
-        lookahead_limit_multiplier, BackendExecutionError, Config,
-        DEFAULT_ZAKURA_BLOCK_APPLY_CONCURRENCY_LIMIT, MAX_BACKEND_BLOCK_VERIFICATIONS,
-        MIN_CHECKPOINT_CONCURRENCY_LIMIT, MIN_CONCURRENCY_LIMIT,
+        BackendExecutionError, Config, DEFAULT_ZAKURA_BLOCK_APPLY_CONCURRENCY_LIMIT,
+        MAX_BACKEND_BLOCK_VERIFICATIONS, MIN_CHECKPOINT_CONCURRENCY_LIMIT, MIN_CONCURRENCY_LIMIT,
         VERIFICATION_PIPELINE_SCALING_MULTIPLIER,
     };
 
@@ -4817,18 +4857,12 @@ fn backend_verification_total_sums_effective_limits_and_rejects_excess() {
         ..Config::default()
     };
     for network in Network::iter() {
-        let multiplier = network
-            .activation_list()
-            .into_keys()
-            .map(|height| lookahead_limit_multiplier(&network, height))
-            .max()
-            .unwrap();
+        let scale = LookaheadScale::widest(&network);
         assert_eq!(
             low.backend_verification_total(&network).unwrap(),
-            MIN_CHECKPOINT_CONCURRENCY_LIMIT
-                * multiplier
+            scale.scale(MIN_CHECKPOINT_CONCURRENCY_LIMIT)
                 * (VERIFICATION_PIPELINE_SCALING_MULTIPLIER + 1)
-                + MIN_CONCURRENCY_LIMIT * multiplier
+                + scale.scale(MIN_CONCURRENCY_LIMIT)
                 + 2 * MIN_CHECKPOINT_CONCURRENCY_LIMIT
                 + MAX_INBOUND_CONCURRENCY,
             "{network}"
@@ -4836,7 +4870,7 @@ fn backend_verification_total_sums_effective_limits_and_rejects_excess() {
 
         let default = Config::default();
         let total = default.backend_verification_total(&network).unwrap();
-        assert!(total > default.full_verify_concurrency_limit * multiplier);
+        assert!(total > scale.scale(default.full_verify_concurrency_limit));
         assert!(total > DEFAULT_ZAKURA_BLOCK_APPLY_CONCURRENCY_LIMIT);
         assert!(total <= MAX_BACKEND_BLOCK_VERIFICATIONS);
 

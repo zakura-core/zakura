@@ -35,7 +35,7 @@ use zakura_state as zs;
 use crate::components::{
     auth_download_height::tip_child_mismatch,
     download_work::has_sufficient_work,
-    sync::{lookahead_limit_multiplier, MIN_CONCURRENCY_LIMIT},
+    sync::{LookaheadScale, MIN_CONCURRENCY_LIMIT},
 };
 
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -293,7 +293,7 @@ pub(crate) fn max_lookahead_height(
 ) -> block::Height {
     if let Some(tip_height) = tip_height {
         let lookahead = HeightDiff::try_from(
-            full_verify_concurrency_limit * lookahead_limit_multiplier(network, tip_height),
+            LookaheadScale::at(network, tip_height).scale(full_verify_concurrency_limit),
         )
         .expect("fits in HeightDiff");
         (tip_height + lookahead).expect("tip is much lower than Height::MAX")

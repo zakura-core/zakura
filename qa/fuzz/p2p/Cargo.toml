@@ -27,7 +27,7 @@ discovery_redial = { decoder = 2, properties = ["discovery/redial-policy"] }
 discovery_query = { decoder = 1, properties = ["discovery/query-ownership", "discovery/answer-settlement"] }
 discovery_candidate = { decoder = 2, properties = ["discovery/dial-attempts", "discovery/preferred-dials"] }
 bpv1_peer = { decoder = 2, properties = ["bpv1/peer-replay"] }
-bpv1_block = { decoder = 3, properties = ["bpv1/block-replay"] }
+bpv1_block = { decoder = 4, properties = ["bpv1/block-replay"] }
 bpv1_mesh = { decoder = 1, properties = ["bpv1/mesh"] }
 bpv1_wire = { decoder = 1, properties = ["bpv1/wire"] }
 bpv1_codec = { decoder = 1, properties = ["bpv1/codec"] }

@@ -1,4 +1,4 @@
-//! Decoder 3 of the `bpv1_block` fuzz target (`tool-2`).
+//! Decoder 4 of the `bpv1_block` fuzz target (`tool-2`).
 //!
 //! The first byte picks the profile (bit 0 set: `W2`, else `TINY`), the
 //! layout of each of the three blocks (bits 1–2, 3–4 and 5–6, indexing
@@ -72,7 +72,7 @@ pub struct BlockReplaySummary {
     pub reached: Reached,
 }
 
-/// Operations decoder 3 reads.
+/// Operations decoder 4 reads.
 const OPS: u8 = 25;
 
 /// The fuzz property the replay's own ledger checks name.
@@ -345,16 +345,25 @@ pub fn replay_bpv1_block_bytes(bytes: &[u8]) -> BlockReplaySummary {
                 },
             },
             // `b` bit 0 ends one session's unanswered metadata (`b` bit 1
-            // picks its generation, as `MetaReceived` sends it); otherwise
-            // the peer's last session ends.
+            // picks its generation, as `MetaReceived` sends it). Otherwise
+            // the peer's session 1, which holds its claims and pushes, ends:
+            // its last session, or with `b` bit 2 one that session 2
+            // replaced. Bit 2 is clear of bits 0-1, which set `ahead_bytes`.
             10 if b & 1 != 0 => BlockInput::MetaSessionEnded {
                 peer,
                 session_gen: 1 + u64::from(b >> 1 & 1),
             },
             10 => BlockInput::SessionEnded {
                 peer,
-                session_gen: 2,
-                peer_states,
+                session_gen: 1,
+                peer_states: peer_states
+                    .into_iter()
+                    .filter(|ps| b & 4 != 0 || ps.peer != peer)
+                    .map(|ps| PullPeerState {
+                        session_gen: if ps.peer == peer { 2 } else { ps.session_gen },
+                        ..ps
+                    })
+                    .collect(),
             },
             11 => BlockInput::PeerBlockDone {
                 peer,

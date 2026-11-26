@@ -100,13 +100,23 @@ impl TxCreditLease {
         }
     }
 
-    /// The body arrived and spent its credit. The lease stays: it covers the
-    /// body until the core decides it.
-    fn body_arrived(&mut self) {
-        let spent = std::mem::take(&mut self.unspent_credit);
-        if let Some(credit) = self.credit.as_ref().filter(|_| spent > 0) {
-            credit.finish_receive_credit(spent, None);
-        }
+    /// A body of `received` bytes arrived, and the request's credit ends.
+    /// Credit the body didn't spend, as when a peer that started cooling
+    /// sends a short body, splits off the lease and drains (`02 §6`). The
+    /// rest of the lease stays: it covers the body until the core decides
+    /// it.
+    fn body_arrived(&mut self, received: u64) {
+        let total = std::mem::take(&mut self.unspent_credit);
+        let Some(credit) = self.credit.as_ref().filter(|_| total > 0) else {
+            return;
+        };
+        let unspent = total.saturating_sub(received);
+        let drain = self
+            .lease
+            .as_mut()
+            .filter(|_| unspent > 0)
+            .and_then(|lease| lease.split(unspent.min(lease.bytes())));
+        credit.finish_receive_credit(total, drain);
     }
 
     /// The core no longer counts the fetch's bytes. Credit no body spent
@@ -1121,16 +1131,16 @@ impl Routine {
                 self.step(|machine, shared, pool, now| machine.not_found(shared, pool, id, now));
             }
             TxRelayMessage::Tx { id, body } => {
-                // The body spent its receive credit. Its memory lease stays
-                // until the core decides it (`02 §6`, `mem-7`).
+                // A frame's body is at most the data stream's cap.
+                let size = u32::try_from(body.len()).unwrap_or(u32::MAX);
+                // The body spent its bytes of receive credit. Its memory
+                // lease stays until the core decides it (`02 §6`, `mem-7`).
                 if let Some(fetch) = self
                     .reserved_for(id)
                     .and_then(|reservation| self.tx_leases.get_mut(&reservation))
                 {
-                    fetch.body_arrived();
+                    fetch.body_arrived(u64::from(size));
                 }
-                // A frame's body is at most the data stream's cap.
-                let size = u32::try_from(body.len()).unwrap_or(u32::MAX);
                 // The body is judged as of when it arrived, before and after
                 // it decodes. A body on time when it came is not late because
                 // its decode took time, and its supplier keeps the exemption

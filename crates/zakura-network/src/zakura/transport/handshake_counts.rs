@@ -326,9 +326,9 @@ impl HandshakeCounts {
 
     /// Charges a connection slot to `caller`, the node an inbound connection
     /// proved, while keeping the dial reserve
-    /// and the held places: the total stays within `cap` plus the hold, ordinary slots
-    /// within `cap`, and ordinary inbound slots within the
-    /// inbound share. A preferred gateway's first slot takes a held place.
+    /// and the held places: the total stays within `cap` plus the hold, and
+    /// admission cannot increase ordinary inbound slots past the inbound share.
+    /// A preferred gateway's first slot takes a held place.
     /// The check and the charge are one step.
     ///
     /// The caller answers for the gateway its node ID names and for the
@@ -350,22 +350,21 @@ impl HandshakeCounts {
         cap: usize,
     ) -> Result<SlotClass, SlotRefusal> {
         let formed = self.connected_ranking(caller, None);
-        let counted_under = formed.as_ref().unwrap_or(&self.preferred);
-        let disputes = counted_under.ambiguous() > self.preferred.ambiguous();
-        let claim = if disputes {
-            self.connections
-                .claim_disputing(caller.id(), cap, &self.preferred, counted_under)
+        let class = if let Some(formed) = formed {
+            let class = self.connections.claim_under_new_ranking(
+                caller.id(),
+                cap,
+                &self.preferred,
+                &formed,
+            )?;
+            self.preferred = formed;
+            class
         } else {
             self.connections
-                .claim(caller.id(), true, cap, counted_under)
+                .claim(caller.id(), true, cap, &self.preferred)?
         };
-        if claim.is_ok() {
-            if let Some(formed) = formed {
-                self.preferred = formed;
-            }
-            self.record_proof(caller);
-        }
-        claim
+        self.record_proof(caller);
+        Ok(class)
     }
 
     /// Records a dial as connected once the outbound transport proves the

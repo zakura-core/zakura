@@ -173,15 +173,12 @@ impl ConnectionSlots {
         Ok(class)
     }
 
-    /// Claims an inbound slot for `node`, whose proof re-forms the preferred
-    /// set from `held_under` to `counted_under` and makes a gateway
-    /// ambiguous on the way.
+    /// Claims an inbound slot for a caller whose proof changes the gateway ranking.
     ///
-    /// A gateway that turns ambiguous leaves its member's slot an ordinary
-    /// one. [`Self::claim`] doesn't see that when `node` fills a held place
-    /// of its own through another gateway. Check the displaced slot against
-    /// both ordinary limits, as for a dial in [`Self::settle_outbound`].
-    pub(super) fn claim_disputing(
+    /// A displaced member stays connected as ordinary. Outranking it can exceed
+    /// the ordinary total temporarily. Making a gateway ambiguous also requires
+    /// room under the ordinary cap. Both changes must preserve the dial reserve.
+    pub(super) fn claim_under_new_ranking(
         &mut self,
         node: NodeId,
         cap: usize,
@@ -190,7 +187,8 @@ impl ConnectionSlots {
     ) -> Result<SlotClass, SlotRefusal> {
         let before = self.split(held_under);
         let class = self.claim(node, true, cap, counted_under)?;
-        if let Err(refusal) = self.check_reclassification(before, cap, counted_under) {
+        let disputes = counted_under.ambiguous() > held_under.ambiguous();
+        if let Err(refusal) = self.check_reclassification(before, cap, counted_under, disputes) {
             self.release(node, true);
             return Err(refusal);
         }
@@ -198,15 +196,17 @@ impl ConnectionSlots {
     }
 
     /// A proof may leave an existing excess from a ranking change in place.
-    /// It cannot increase either the ordinary total or its inbound share past its limit.
+    /// It cannot increase ordinary inbound use past its share. Dials and inbound
+    /// proofs that make a gateway ambiguous must also respect the ordinary total.
     fn check_reclassification(
         &self,
         before: SlotSplit,
         cap: usize,
         counted_under: &PreferredGateways,
+        enforce_ordinary_cap: bool,
     ) -> Result<(), SlotRefusal> {
         let after = self.split(counted_under);
-        if after.ordinary > before.ordinary && after.ordinary > cap {
+        if enforce_ordinary_cap && after.ordinary > before.ordinary && after.ordinary > cap {
             return Err(SlotRefusal::Hold);
         }
         if after.ordinary_inbound > before.ordinary_inbound
@@ -242,7 +242,7 @@ impl ConnectionSlots {
         if from != to {
             self.rekey_outbound(from, to);
         }
-        if let Err(refusal) = self.check_reclassification(before, cap, counted_under) {
+        if let Err(refusal) = self.check_reclassification(before, cap, counted_under, true) {
             if from != to {
                 self.rekey_outbound(to, from);
             }
@@ -530,7 +530,7 @@ mod tests {
         );
         slots.release(caller, true);
         assert_eq!(
-            slots.claim_disputing(caller, 1, &held, &disputed),
+            slots.claim_under_new_ranking(caller, 1, &held, &disputed),
             Err(SlotRefusal::Hold),
             "the member's slot would be a second ordinary one"
         );
@@ -539,7 +539,7 @@ mod tests {
 
         slots.release(peer, false);
         assert_eq!(
-            slots.claim_disputing(caller, 1, &held, &disputed),
+            slots.claim_under_new_ranking(caller, 1, &held, &disputed),
             Ok(SlotClass::Preferred)
         );
         assert_eq!(

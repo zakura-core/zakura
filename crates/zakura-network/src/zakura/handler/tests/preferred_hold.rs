@@ -1250,6 +1250,45 @@ fn a_ranked_caller_displaces_a_connected_member() {
     assert_eq!(handler.supervisor.ip_slots.counts().connections(), 46);
 }
 
+/// A promotion can displace a connected inbound gateway only when its
+/// connection fits in the ordinary inbound share.
+#[test]
+fn gateway_promotion_preserves_the_ordinary_inbound_share() {
+    let ranked_id = new_node();
+    let moved_id = new_node();
+    let earlier = [ranked_id];
+    for caller in [ranked_id.into(), ProvenNode::new(moved_id, &earlier)] {
+        let handler = handler(4, 1);
+        let incumbent = new_node();
+        publish(
+            &handler,
+            &[
+                (ranked_id, GatewayStanding::Backoff),
+                (incumbent, GatewayStanding::Dialable),
+            ],
+        );
+        let _incumbent = handler
+            .claim_connection(incumbent, true)
+            .expect("held place");
+        let mut peers = fill(&handler, 3, true);
+        let before = split(&handler);
+
+        assert_eq!(
+            handler.claim_slot(caller, true).map(drop),
+            Err(SlotRefusal::InboundShare)
+        );
+        assert_eq!(split(&handler), before);
+        assert_eq!(preferred_set(&handler), [incumbent]);
+
+        peers.pop();
+        let _caller = handler
+            .claim_slot(caller, true)
+            .expect("the incumbent fits in the inbound share");
+        assert_eq!(preferred_set(&handler), [caller.id()]);
+        assert_eq!(split(&handler), before);
+    }
+}
+
 /// A ranked caller that already holds a slot re-forms the set, but its
 /// second slot is ordinary; when the ordinary slots are full the claim is
 /// refused for the hold and the set is restored.

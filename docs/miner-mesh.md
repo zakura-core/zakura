@@ -121,8 +121,10 @@ A held place is a connection slot that only a preferred gateway may use:
   next available gateway can fill a place while the first waits to retry.
   This also applies while a moved gateway waits for its 30-second rollback
   probe and its current ID cannot take a slot;
-- a ranked gateway that connects in takes a place when its rank brings it into
-  the preferred set.
+- a ranked gateway that connects in can take a place from a lower-ranked
+  gateway. The lower-ranked gateway stays connected as an ordinary peer.
+  If that would use a slot reserved for the node's own dials, the
+  node refuses the new connection and the lower-ranked gateway keeps its place.
 
 A held place grants nothing else: once connected, a preferred gateway is
 treated like any other peer.

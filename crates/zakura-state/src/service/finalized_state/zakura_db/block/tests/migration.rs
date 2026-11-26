@@ -8,9 +8,9 @@ use zakura_chain::{
     work::difficulty::U256,
 };
 use zakura_header_chain::{
-    prepare_headers, CheckpointSet, EngineConfig, EngineMode, Frontier, HeaderBatchInput,
-    HeaderChainDiskVersion, HeaderRules, RowLimit, StoreAuditRead, StoreAuditSnapshot, SystemClock,
-    TrustedAnchor, MAX_NON_FINALIZED_NODES_V1,
+    prepare_headers, CheckpointSet, EngineConfig, EngineMetadata, EngineMode, Frontier,
+    HeaderBatchInput, HeaderChainDiskVersion, HeaderRules, RowLimit, StoreAuditRead,
+    StoreAuditSnapshot, SystemClock, TrustedAnchor, MAX_NON_FINALIZED_NODES_V1,
 };
 
 use super::{
@@ -24,7 +24,9 @@ use crate::{
     service::finalized_state::{
         disk_db::{DiskWriteBatch, WriteDisk},
         disk_format::{
-            header_chain_values::{decode_v4_engine_metadata, HeaderChainValueError},
+            header_chain_values::{
+                decode_v4_engine_metadata, decode_v5_engine_metadata, HeaderChainValueError,
+            },
             RawBytes,
         },
         header_chain::{
@@ -258,8 +260,29 @@ fn predecessor_overlay_is_atomically_replaced_from_finalized_state() {
     );
 }
 
+/// A build without ZIP 218 retained 17 averaging-window headers plus 10
+/// additional median-time headers below the finalized anchor, and recorded
+/// header-chain disk format 4.
 #[test]
-fn existing_narrow_validation_context_is_backfilled_before_startup() {
+fn version_four_validation_context_is_backfilled_before_startup() {
+    narrow_validation_context_is_backfilled_before_startup(4, 27, decode_v4_engine_metadata);
+}
+
+/// A build without ZIP 223 retained ZIP 218's 102 averaging-window headers plus
+/// 10 additional median-time headers, and recorded header-chain disk format 5.
+#[test]
+fn version_five_validation_context_is_backfilled_before_startup() {
+    narrow_validation_context_is_backfilled_before_startup(5, 112, decode_v5_engine_metadata);
+}
+
+/// Rewrites a current store as the `old_format` release left it, with only
+/// `old_predecessor_span` validation-context rows, then checks that migration
+/// marks the current format and startup backfills the wider context.
+fn narrow_validation_context_is_backfilled_before_startup(
+    old_format: u32,
+    old_predecessor_span: usize,
+    decode_old_metadata: fn(&[u8]) -> Result<EngineMetadata, HeaderChainValueError>,
+) {
     let _init_guard = zakura_test::init();
     let network = Network::Mainnet;
     let genesis = mainnet_block(0);
@@ -287,9 +310,6 @@ fn existing_narrow_validation_context_is_backfilled_before_startup() {
         .expect("the validation context rows decode");
     contexts.sort_unstable_by_key(|record| record.height);
 
-    // A build without ZIP 218 retained 17 averaging-window headers plus 10
-    // additional median-time headers below the finalized anchor.
-    let old_predecessor_span = 27;
     let mut downgrade = DiskWriteBatch::new();
     let context_cf = state
         .db
@@ -301,7 +321,6 @@ fn existing_narrow_validation_context_is_backfilled_before_startup() {
     {
         downgrade.zs_delete(&context_cf, context.header.hash());
     }
-    // That build also recorded header-chain disk format 4.
     let metadata_cf = state
         .db
         .cf_handle(HEADER_ENGINE_META)
@@ -311,7 +330,7 @@ fn existing_narrow_validation_context_is_backfilled_before_startup() {
         .raw_get_cf(&metadata_cf, b"")
         .expect("the metadata row reads")
         .expect("the initialized store has metadata");
-    metadata[..4].copy_from_slice(&4_u32.to_be_bytes());
+    metadata[..4].copy_from_slice(&old_format.to_be_bytes());
     downgrade.zs_insert(
         &metadata_cf,
         RawBytes::new_raw_bytes(Vec::new()),
@@ -320,12 +339,12 @@ fn existing_narrow_validation_context_is_backfilled_before_startup() {
     state
         .db
         .write(downgrade)
-        .expect("the pre-ZIP 218 context fixture writes");
+        .expect("the narrow context fixture writes");
 
     // A different network kind must still be rejected without changing its bytes,
     // even though Mainnet permits a network policy change.
     let mut incompatible =
-        decode_v4_engine_metadata(&metadata).expect("the version-four metadata fixture decodes");
+        decode_old_metadata(&metadata).expect("the old metadata fixture decodes");
     incompatible.network_id = NetworkKind::Testnet;
     let incompatible = incompatible
         .encode()
@@ -363,11 +382,11 @@ fn existing_narrow_validation_context_is_backfilled_before_startup() {
     state
         .db
         .write(restore)
-        .expect("the valid version-four metadata fixture is restored");
+        .expect("the valid old metadata fixture is restored");
 
     assert!(store
         .migrate_to_current(&config)
-        .expect("version four migrates to the current format"));
+        .expect("the old format migrates to the current format"));
     let metadata = state
         .db
         .raw_get_cf(&metadata_cf, b"")
@@ -377,10 +396,10 @@ fn existing_narrow_validation_context_is_backfilled_before_startup() {
         metadata[..4],
         HeaderChainDiskVersion::CURRENT.0.to_be_bytes()
     );
-    // The previous release accepts only format 4, so it reports the newer format
+    // The old release accepts only its own format, so it reports the newer format
     // instead of reading a validation context wider than its row limit.
     assert_eq!(
-        decode_v4_engine_metadata(&metadata),
+        decode_old_metadata(&metadata),
         Err(HeaderChainValueError::UnsupportedDiskFormat(
             HeaderChainDiskVersion::CURRENT.0
         ))

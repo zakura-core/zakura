@@ -425,14 +425,15 @@ the extra bytes is the larger first sample: in these trials the requester
 always had at least four reachable candidates after one twelve-record reply.
 The overlapping times give limited evidence for a latency improvement.
 
-Discovery-only seeds need separate qualification. At the previous 24,098-byte cap, the
-seed offered four records per full answer. With all candidates reachable,
-both unrestricted controls decoded a four-record answer, while neither of
-the two bandwidth-limited controls decoded a nonempty answer. None registered
-a non-seed peer within 20 seconds. These observations do not establish where
-delivery or import stopped. The shared-connection results above apply to a
-seed that stays connected across exchanges.
+On a discovery-only connection, the seed can finish its own exchange as soon
+as the requester returns an empty list. Closing then used to discard the
+seed’s reply while QUIC was delivering it or the requester was verifying it.
+At the twelve-record cap, a cold requester previously registered no other
+peers in 75 seconds on the paced link, even with all 32 candidates reachable.
 
-A separate paced discovery-only trial at the twelve-record
-cap also registered no non-seed peer within 75 seconds with all candidates
-reachable. The requester decoded no nonempty peer list in that trial.
+The dialer now closes after importing the reply. The listener allows up to
+two seconds for this after its own initial exchange. In five local Regtest
+trials per link, the requester retained all twelve advertised records and
+registered four peers in 1.014–1.019 seconds on loopback and 1.203–1.207 seconds
+with a 1 Mbit/s downlink and 40 ms of added downlink latency. With the old
+close behavior, all four matching eight-second controls retained zero records.

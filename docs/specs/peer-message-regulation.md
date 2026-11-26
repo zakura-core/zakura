@@ -393,8 +393,10 @@ records it has stored.
 The sender MAY send one initial `Hello`. It MUST send later `Hello` messages at least 15 seconds
 apart. Zakura queues its current signed record once per discovery stream and again when it
 changes. Peer and live-service queries continue at their normal cadence. Receivers still accept
-a repeated valid record. A discovery-only connection can finish after one exchange; this does not impose a
-lifetime limit of one or two messages on shared connections. The handler MUST apply sequence and
+a repeated valid record. On a discovery-only connection the dialer normally closes after its
+first exchange, once it has processed the received records and written its admitted answers.
+The listener allows up to two seconds after its initial exchange for the dialer to close.
+Shared connections continue refreshing. The handler MUST apply sequence and
 expiry policy. It need not maintain a separate relevance snapshot. A repeated valid record MUST
 still satisfy initial-exchange progress when the receiver already knows that record.
 A failed extension, key or ML-DSA-65 check MUST disconnect the sender, as a failed Ed25519

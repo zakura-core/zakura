@@ -1502,8 +1502,8 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn discovery_only_short_lived_exchange_closes_connection_and_backs_off(
+    #[tokio::test(start_paused = true)]
+    async fn discovery_listener_gives_the_dialer_time_to_import_then_backs_off(
     ) -> Result<(), crate::BoxError> {
         let (connected_tx, connected_rx) = watch::channel(Vec::new());
         let handshake = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
@@ -1544,9 +1544,21 @@ mod tests {
         wait_for_discovery_inbound_peers(&handle, 1).await;
         complete_peer_side_discovery_exchange(&peer_send, &mut peer_recv, &peer_secret, &handshake)
             .await?;
-        tokio::time::timeout(Duration::from_secs(2), connection_cancel.cancelled())
+        assert!(
+            tokio::time::timeout(
+                DISCOVERY_ANSWER_WRITE_DEADLINE / 2,
+                connection_cancel.cancelled()
+            )
             .await
-            .expect("discovery-only exchange closes the shared connection");
+            .is_err(),
+            "finishing the listener’s own exchange must leave the dialer time to import"
+        );
+        tokio::time::timeout(
+            DISCOVERY_ANSWER_WRITE_DEADLINE,
+            connection_cancel.cancelled(),
+        )
+        .await
+        .expect("the listener closes when the dialer stays connected");
         wait_for_discovery_inbound_peers(&handle, 0).await;
 
         connected_tx.send_replace(Vec::new());
@@ -1591,14 +1603,14 @@ mod tests {
         let (service_send, peer_recv) = framed_channel(capacity);
         let local_output = service_send.clone();
         let streams = HashMap::from([(ZAKURA_STREAM_DISCOVERY, (service_recv, service_send))]);
-        service.add_peer(Peer::new(
+        service.add_peer(Peer::new_with_direction(
             peer_id,
             None,
             ZAKURA_CAP_DISCOVERY,
+            ServicePeerDirection::Outbound,
             streams,
             connection_cancel.clone(),
         ));
-        wait_for_discovery_inbound_peers(&handle, 1).await;
         // The local Hello, GetPeers and GetServices fill the stream, so the
         // answer below cannot be written until the peer reads.
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -3736,9 +3748,12 @@ mod tests {
         wait_for_discovery_inbound_peers(&handle, 1).await;
         complete_peer_side_discovery_exchange(&peer_send, &mut peer_recv, &peer_secret, &handshake)
             .await?;
-        tokio::time::timeout(Duration::from_secs(2), connection_cancel.cancelled())
-            .await
-            .expect("unadmitted block sync does not keep the shared connection alive");
+        tokio::time::timeout(
+            DISCOVERY_ANSWER_WRITE_DEADLINE + Duration::from_secs(1),
+            connection_cancel.cancelled(),
+        )
+        .await
+        .expect("unadmitted block sync does not keep the shared connection alive");
         // A finished discovery-only exchange retires the session so the handler
         // cannot reopen the stream while the connection tears down.
         assert!(matches!(
@@ -3804,7 +3819,9 @@ mod tests {
         ));
 
         tokio::time::timeout(
-            2 * DISCOVERY_INITIAL_EXCHANGE_TIMEOUT,
+            DISCOVERY_INITIAL_EXCHANGE_TIMEOUT
+                + DISCOVERY_ANSWER_WRITE_DEADLINE
+                + Duration::from_secs(1),
             connection_cancel.cancelled(),
         )
         .await
@@ -4180,6 +4197,29 @@ mod tests {
         Ok((handle, peer_id, peer_secret))
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn listener_wait_ends_when_the_dialer_disconnects() -> Result<(), crate::BoxError> {
+        let (handle, peer_id, _) = handle_with_session(61, 2).await?;
+        let (send, _peer_recv) = framed_channel(16);
+        let (io, _states) = test_peer_io(handle, peer_id, send);
+        let cancel = io.session.cancel_token();
+        let mut session = tokio::spawn(io.run());
+        assert!(
+            tokio::time::timeout(
+                DISCOVERY_INITIAL_EXCHANGE_TIMEOUT + DISCOVERY_ANSWER_WRITE_DEADLINE / 2,
+                &mut session
+            )
+            .await
+            .is_err(),
+            "the listener stays open even when it has no pending local work"
+        );
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_millis(1), session)
+            .await
+            .expect("a disconnect releases the listener before its deadline")?;
+        Ok(())
+    }
+
     /// Claims the answer to a `GetPeers` that `queries` sends.
     async fn claimed_peers_answer(queries: &Queries) -> ClaimedAnswer {
         let query = GetPeers {
@@ -4251,13 +4291,15 @@ mod tests {
     {
         let (handle, peer_id, _) = handle_with_session(60, 2).await?;
         let (send, _peer_recv) = framed_channel(16);
-        let (io, _states) = test_peer_io(handle, peer_id, send);
+        let (mut io, _states) = test_peer_io(handle, peer_id, send);
+        io.session.direction = ServicePeerDirection::Outbound;
         let answer = claimed_peers_answer(&io.queries).await;
         assert_close_held_until_settled(io, answer).await?;
 
         let (handle, peer_id, _) = handle_with_session(72, 2).await?;
         let (send, _peer_recv) = framed_channel(16);
-        let (io, _states) = test_peer_io(handle, peer_id, send);
+        let (mut io, _states) = test_peer_io(handle, peer_id, send);
+        io.session.direction = ServicePeerDirection::Outbound;
         let hello = io.queries.verifying_hello();
         assert_close_held_until_settled(io, hello).await
     }
@@ -4574,6 +4616,7 @@ mod tests {
         let handshake = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
         let (send, mut peer_recv) = framed_channel(64);
         let (mut io, _states) = test_peer_io(handle.clone(), peer_id.clone(), send);
+        io.session.direction = ServicePeerDirection::Outbound;
         let sink = test_sink(&mut io);
         let progress = io.state.clone();
         let connection = io.connection_cancel.clone();

@@ -45,7 +45,8 @@ use super::{
 };
 use crate::zakura::{
     regulation::{CadenceSendError, CadenceSender},
-    CloseCause, CloseOutcome, NeutralCause, Service, ZakuraConnId, ZakuraPeerId,
+    CloseCause, CloseOutcome, NeutralCause, Service, ServicePeerDirection, ZakuraConnId,
+    ZakuraPeerId,
 };
 
 /// One session's [`PeerState`], shared by its reader and its writer.
@@ -225,7 +226,9 @@ impl PeerIO {
         zakura_rt::select! {
             biased;
             _ = cancel.cancelled() => {}
-            () = self.answers_settled() => {}
+            // A local write can finish while QUIC still has the reply buffered.
+            // The dialer knows when it has imported the seed's records and can close.
+            () = self.answers_settled(), if self.session.direction() == ServicePeerDirection::Outbound => {}
             () = zakura_rt::time::sleep(deadline) => {}
         }
     }

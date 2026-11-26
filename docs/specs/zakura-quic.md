@@ -878,7 +878,8 @@ is today's Zakura logic.
      preferred gateway's earlier ID claims a held place, which the ID the
      node answers with keeps only if it is a preferred gateway's too. When
      it isn't, and no ordinary slot is free, the dial MUST close before its
-     control handshake and end as a local limit, with no failure recorded.
+     control handshake. Discovery records a local limit. A maintained dial
+     counts the completed TLS attempt as a failure for its retry policy.
      Otherwise one gateway could answer each dial under a new ID and turn
      every held place into an ordinary slot of its own. A dial to an ID
      known to have moved first claims under the last authenticated ID.

@@ -6561,7 +6561,7 @@ pub(crate) async fn serve_reported_native_dial_connection(
             VarInt::from_u32(ZAKURA_CLOSE_RESOURCE),
             ADMISSION_LIMIT.as_bytes(),
         );
-        return Err(ZakuraHandlerError::ResourceLimit(ADMISSION_LIMIT));
+        return Err(ZakuraHandlerError::ResourceLimit(AUTHENTICATED_SLOT_LIMIT));
     }
     let conn = ZakuraConnTrace::new(
         &endpoint.handler.trace,
@@ -9187,6 +9187,8 @@ pub enum ZakuraHandlerError {
 /// The [`ZakuraHandlerError::ResourceLimit`] a dial returns when the admission
 /// semaphore is full, before it sends any packet.
 const ADMISSION_LIMIT: &str = "admission";
+/// TLS proved the dial reached a node that cannot keep the claimed slot.
+pub(super) const AUTHENTICATED_SLOT_LIMIT: &str = "authenticated connection slot";
 const PENDING_HANDSHAKE_LIMIT: &str = "pending handshake";
 /// The [`ZakuraHandlerError::ResourceLimit`] a dial returns when the transport
 /// cannot fit the dial under its connection ceiling, before any packet

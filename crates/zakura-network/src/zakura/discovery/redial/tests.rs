@@ -50,6 +50,33 @@ fn repeated_local_limits_keep_the_remote_failure_budget() {
     assert_eq!(state.record(DialResult::Failed), RedialNext::Stop);
 }
 
+/// A completed TLS handshake costs one attempt even when the authenticated
+/// peer cannot keep the slot.
+#[tokio::test]
+async fn authenticated_slot_refusals_count_toward_redial_backoff() {
+    use crate::zakura::handler::AUTHENTICATED_SLOT_LIMIT;
+
+    let initial = Duration::from_secs(1);
+    let mut state = RedialState::new(RedialPolicy::maintain_bounded(initial, 8 * initial, 3));
+    for (limit, expected) in [
+        (AUTHENTICATED_SLOT_LIMIT, RedialNext::RetryAfter(initial)),
+        (
+            AUTHENTICATED_SLOT_LIMIT,
+            RedialNext::RetryAfter(2 * initial),
+        ),
+        (AUTHENTICATED_SLOT_LIMIT, RedialNext::Stop),
+    ] {
+        let (registration, registered) = oneshot::channel();
+        drop(registration);
+        let result = score_dial(
+            async { Err(ZakuraHandlerError::ResourceLimit(limit)) },
+            registered,
+        )
+        .await;
+        assert_eq!(state.record(result), expected);
+    }
+}
+
 // A healthy connection keeps its outcome while its deregistration lags, and a
 // lasting registration upgrades a failed dial.
 #[test]

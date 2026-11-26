@@ -254,10 +254,16 @@ async fn a_dial_to_a_moved_gateway_waits_for_an_ordinary_slot() {
             .expect("the dial ends before the timeout")
         }
     };
-    let is_local_limit = |result: &Result<(), ZakuraHandlerError>| matches!(result, Err(ZakuraHandlerError::ResourceLimit(limit)) if *limit == ADMISSION_LIMIT);
+    let is_pre_dial_limit = |result: &Result<(), ZakuraHandlerError>| matches!(result, Err(ZakuraHandlerError::ResourceLimit(limit)) if *limit == ADMISSION_LIMIT);
 
     let refused = dial(earlier.clone()).await;
-    assert!(is_local_limit(&refused), "{refused:?}");
+    assert!(
+        matches!(
+            refused,
+            Err(ZakuraHandlerError::ResourceLimit(AUTHENTICATED_SLOT_LIMIT))
+        ),
+        "{refused:?}"
+    );
     let moved = dialer.supervisor().moved_node_ids();
     assert_eq!(moved.borrow().current(earlier.id), current);
     assert_eq!(
@@ -272,7 +278,7 @@ async fn a_dial_to_a_moved_gateway_waits_for_an_ordinary_slot() {
     let nowhere = NodeAddr::with_addrs(earlier.id, [SocketAddr::from(([127, 0, 0, 1], 9))]);
     endpoint.handler.publish_gateway_ranking(ranking());
     let refused = dial(nowhere).await;
-    assert!(is_local_limit(&refused), "{refused:?}");
+    assert!(is_pre_dial_limit(&refused), "{refused:?}");
 
     ordinary.pop();
     endpoint.handler.publish_gateway_ranking(ranking());
@@ -312,7 +318,7 @@ async fn a_dial_to_a_moved_gateway_waits_for_an_ordinary_slot() {
             .expect("the last ordinary place is free"),
     );
     endpoint.handler.publish_gateway_ranking(ranking());
-    assert!(is_local_limit(&dial(restored.clone()).await));
+    assert!(is_pre_dial_limit(&dial(restored.clone()).await));
 
     tokio::time::pause();
     tokio::time::advance(DEFAULT_ZAKURA_REDIAL_MAX_BACKOFF).await;

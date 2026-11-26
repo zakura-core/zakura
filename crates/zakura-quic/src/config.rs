@@ -83,6 +83,10 @@ pub struct QuicConfig {
     /// Connection receive window in bytes; unset uses
     /// [`DEFAULT_RECEIVE_WINDOW_BYTES`], and lets an application choose a
     /// smaller window before it admits a peer (CTRL-6).
+    ///
+    /// A value equal to [`DEFAULT_RECEIVE_WINDOW_BYTES`] reads as unset, see
+    /// [`deserialize_receive_window`].
+    #[serde(deserialize_with = "deserialize_receive_window")]
     pub receive_window_bytes: Option<u32>,
     /// Connection send window in bytes (CTRL-7).
     pub send_window_bytes: u64,
@@ -116,6 +120,20 @@ pub struct QuicConfig {
     pub dial_stagger_ms: u32,
     /// Kernel drop counter poll interval in seconds, Linux only (CTRL-24).
     pub kernel_drop_poll_secs: u32,
+}
+
+/// Reads `receive_window_bytes`, treating [`DEFAULT_RECEIVE_WINDOW_BYTES`]
+/// as unset.
+///
+/// Generated configs up to v1.9.0-rc2 wrote `receive_window_bytes =
+/// 33554432`. Read as set, that value keeps a 32 MiB window on every pending
+/// handshake. An operator who chose exactly 32 MiB on purpose looks the same
+/// in an old file and also gets the unset behavior.
+fn deserialize_receive_window<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u32>, D::Error> {
+    let window = Option::<u32>::deserialize(deserializer)?;
+    Ok(window.filter(|&bytes| bytes != DEFAULT_RECEIVE_WINDOW_BYTES))
 }
 
 impl Default for QuicConfig {
@@ -533,5 +551,14 @@ mod tests {
         assert!(toml::from_str::<QuicConfig>("path_idle_timeout_secs = 15\n").is_err());
         // qlog output was removed in SPEC version 0.7 (§17e).
         assert!(toml::from_str::<QuicConfig>("qlog_dir = \"/tmp\"\n").is_err());
+    }
+
+    #[test]
+    fn generated_default_receive_window_reads_as_unset() {
+        let old: QuicConfig = toml::from_str("receive_window_bytes = 33554432\n").unwrap();
+        assert_eq!(old.receive_window_bytes, None);
+
+        let set: QuicConfig = toml::from_str("receive_window_bytes = 1048576\n").unwrap();
+        assert_eq!(set.receive_window_bytes, Some(1_048_576));
     }
 }

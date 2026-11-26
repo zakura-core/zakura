@@ -173,6 +173,7 @@ fn wiring_with(
     let wiring = Wiring {
         node: Arc::new(Mutex::new(node)),
         pool,
+        peer_tx: PeerTxBytes::new(&memory_pool),
         memory_pool,
         may_cool: Arc::new(|_| true),
         handoff,
@@ -933,6 +934,97 @@ mod receive_credit {
         .await
         .expect("the lease's end reaches the routine promptly");
         assert_eq!(tx_leased(), u64::from(size) - 1);
+        Ok(())
+    }
+
+    /// F-901: a peer holds at most a quarter of the `Consumer::Tx` cap in
+    /// fetches and in the drains of credit it didn't spend. A fetch past
+    /// that waits for a retry without asking the core, and the peer is not
+    /// faulted.
+    #[tokio::test]
+    async fn a_peer_holds_at_most_its_part_of_tx_credit() -> Result<(), crate::BoxError> {
+        use crate::zakura::{
+            memory::{ConsumerSpec, PoolConfig},
+            testkit::LocalEndpointFactory,
+        };
+
+        let mut txs = transactions(2);
+        let (id_a, id_b) = (
+            txs.remove(0).transaction.id(),
+            txs.remove(0).transaction.id(),
+        );
+        // Announced sizes the peer never delivers: together they pass the
+        // peer's part, one largest body.
+        let (size_a, size_b) = (MAX_TX_BYTES * 3 / 4, MAX_TX_BYTES / 2);
+
+        let server = LocalEndpointFactory::new().endpoint(93405).await?;
+        let client = LocalEndpointFactory::new().endpoint(93406).await?;
+        server.serve(HoldConnections)?;
+        let conn = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.connect(
+                LocalEndpointFactory::node_addr(&server).await,
+                &[CREDIT_ALPN],
+            ),
+        )
+        .await??;
+        let base = 1024 * 1024;
+        let credit = ConnectionCredit::new_quic(connection().1, conn, base, base);
+
+        let cap = 4 * u64::from(MAX_TX_BYTES);
+        let memory_pool = MemoryPool::new(
+            PoolConfig::new(cap, 0).with_consumer(Consumer::Tx, ConsumerSpec::bulk(cap, cap, 1)),
+        );
+        let tx_leased = || memory_pool.snapshot().consumers[Consumer::Tx.index()].leased;
+        let (handle, mut inbox) = pool_port();
+        publish(&inbox, Vec::new(), Vec::new());
+        let (wiring, _handed) = wiring_with(handle, memory_pool.clone());
+        let mut session = Session::open_with_credit(&wiring, Some(credit.clone()));
+        session
+            .deliver(TxRelayMessage::Hello {
+                serves: 16,
+                max_tx_bytes: MAX_TX_BYTES,
+            })
+            .await;
+
+        // The first fetch asks, the peer has no body, and the fetch's
+        // credit drains once the core ends its lease.
+        session
+            .deliver(TxRelayMessage::Have(vec![(id_a, size_a)]))
+            .await;
+        let (reservation, hold) =
+            inbox.grant_relayed(ReservationId(1), id_a, CancellationToken::new());
+        let leased = RelayedFetch {
+            announced_size: u64::from(size_a),
+            leased_bytes: u64::from(size_a),
+        };
+        answer_reserve(&mut session, &mut inbox, id_a, leased, Ok(reservation)).await;
+        session.deliver(TxRelayMessage::NotFound(id_a)).await;
+        drop(hold);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            apply_calls(&mut session, |r| {
+                matches!(r, PoolResult::TxLeaseEnded { .. })
+            }),
+        )
+        .await
+        .expect("the lease's end reaches the routine promptly");
+        assert_eq!(tx_leased(), u64::from(size_a), "the unspent credit drains");
+
+        // The draining credit counts against the peer, so the next fetch is
+        // refused here, as retryable, without a call to the core.
+        session
+            .deliver(TxRelayMessage::Have(vec![(id_b, size_b)]))
+            .await;
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            apply_calls(&mut session, |r| matches!(r, PoolResult::Reserved { .. })),
+        )
+        .await
+        .expect("the refusal needs no answer from the core");
+        assert_eq!(tx_leased(), u64::from(size_a));
+        assert!(!session.routine.machine.state.requests.contains_key(&id_b));
+        assert_eq!(session.cause.get(), None, "the peer is not faulted");
         Ok(())
     }
 }

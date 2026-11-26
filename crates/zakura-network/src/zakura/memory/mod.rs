@@ -30,7 +30,7 @@ mod tests;
 use std::time::Duration;
 
 pub use config::{ByteSize, ByteSizeParseError, MemoryBudget, MemoryConfig, ResolvedMemoryBudget};
-pub(crate) use credit::{CloseCreditOnDrop, ConnectionCredit};
+pub(crate) use credit::{CloseCreditOnDrop, ConnectionCredit, DrainHold};
 pub use draft::{derive_p2p_budget, BudgetDerivation};
 pub use plan::{
     derived_read_result_byte_limit, inbound_sessions_share, BudgetTooSmall, ConnectionSessionCost,

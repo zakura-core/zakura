@@ -1,7 +1,6 @@
 //! Pure admission decisions and charges shared by QUIC and control handshakes.
 
 use std::{net::IpAddr, time::Duration};
-use zakura_chain::miner_mesh::GatewayId;
 use zakura_quic::NodeId;
 use zakura_rt::{collections::HashMap, time::Instant};
 
@@ -10,7 +9,9 @@ mod slots;
 use slots::ConnectionSlots;
 pub use slots::{SlotClass, SlotCount, SlotRefusal, SlotSplit};
 
-use super::{GatewayMatch, GatewayRanking, GatewayStanding, MovedNodeIds, PreferredGateways};
+use super::{
+    GatewayMatch, GatewayRanking, GatewayStanding, MovedNodeIds, PreferredGateways, ProvenNode,
+};
 use crate::zakura::regulation::Bucket;
 use crate::zakura::{admission_host, Cadence, DEFAULT_ZAKURA_REDIAL_INITIAL_BACKOFF};
 
@@ -102,10 +103,19 @@ pub struct HandshakeCounts {
     connections: ConnectionSlots,
     /// Outbound slots whose TLS handshake has proved the target identity.
     authenticated_dials: HashMap<NodeId, usize>,
+    /// The earlier IDs each node proved in the handshake of its latest
+    /// authenticated slot, kept while it holds one. Only nodes that proved
+    /// any have an entry, of at most
+    /// [`zakura_quic::MAX_EARLIER_NODE_IDS`] IDs. Every handshake of this
+    /// release is signed with the same two keys, so all connections of one
+    /// node prove the same earlier IDs.
+    proven_earlier: HashMap<NodeId, Vec<NodeId>>,
     /// The gateways connection places are held for. It sits under the same
     /// lock as the slots, so a check never sees a set and slot counts from
     /// different moments.
     preferred: PreferredGateways,
+    /// Ordinary inbound share of the node that published this ranking.
+    inbound_limit: usize,
     /// Charges of attempts whose source address was validated, by a Retry
     /// token, before TLS.
     validated_cadence: CadenceLedger,
@@ -300,80 +310,170 @@ impl HandshakeCounts {
         self.connections.free_ordinary(cap, &self.preferred)
     }
 
-    /// Charges a connection slot to `node` while keeping the dial reserve
-    /// and the held places: the total stays within `cap` plus the hold, ordinary slots
-    /// within `cap`, and ordinary inbound slots within the
-    /// inbound share. A preferred gateway's first slot takes a held place.
-    /// The check and the charge are one step.
-    ///
-    /// A granted inbound claim records the authenticated gateway as connected
-    /// for later cutoff ties. A refusal restores the previous ranking. Each member
-    /// counts one preferred slot, so preferred slots never pass the hold. A member the
-    /// caller displaces keeps its slot, now ordinary, which can leave the
-    /// ordinary slots one over `cap` until a slot frees. That
-    /// is bounded by the hold and passes, as after a published set change.
+    /// Charges a connection slot to `node`, a dial's target or an inbound
+    /// caller that proved no earlier ID, as [`Self::claim_inbound_connection`]
+    /// does for a caller.
     pub fn claim_connection(
         &mut self,
         node: NodeId,
         inbound: bool,
         cap: usize,
     ) -> Result<SlotClass, SlotRefusal> {
-        let before = inbound
-            .then(|| self.preferred.with_connected(&node))
-            .flatten()
-            .map(|formed| std::mem::replace(&mut self.preferred, formed));
-        let claim = self.connections.claim(node, inbound, cap, &self.preferred);
-        if let (Err(_), Some(before)) = (claim, before) {
-            self.preferred = before;
+        if inbound {
+            self.claim_inbound_connection(node.into(), cap)
+        } else {
+            self.connections.claim(node, false, cap, &self.preferred)
         }
-        claim
+    }
+
+    /// Charges a connection slot to `caller`, the node an inbound connection
+    /// proved, while keeping the dial reserve
+    /// and the held places: the total stays within `cap` plus the hold, and
+    /// admission cannot increase ordinary inbound slots past the inbound share.
+    /// A preferred gateway's first slot takes a held place.
+    /// The check and the charge are one step.
+    ///
+    /// The caller answers for the gateway its node ID names and for the
+    /// gateways its earlier IDs name. A granted claim records it as their
+    /// connected node for the place and for later cutoff ties. A refusal
+    /// leaves the ranking as it was. Each member
+    /// counts one preferred slot, so preferred slots never pass the hold. A member the
+    /// caller outranks keeps its slot, now ordinary, which can leave the
+    /// ordinary slots one over `cap` until a slot frees. That
+    /// is bounded by the hold and passes, as after a published set change.
+    ///
+    /// A caller that makes a gateway ambiguous is not outranking anyone: a
+    /// second node of one key holder answers for the gateway. It is refused
+    /// if counting the member as ordinary would exceed the ordinary cap
+    /// or its inbound share, as for a dial in [`Self::outbound_connected`].
+    pub fn claim_inbound_connection(
+        &mut self,
+        caller: ProvenNode<'_>,
+        cap: usize,
+    ) -> Result<SlotClass, SlotRefusal> {
+        let formed = self.connected_ranking(caller, None);
+        let class = if let Some(mut formed) = formed {
+            self.connections
+                .protect_inbound(&mut formed, self.preferred.set(), inbound_share(cap));
+            let class = self.connections.claim_under_new_ranking(
+                caller.id(),
+                cap,
+                &self.preferred,
+                &formed,
+            )?;
+            self.preferred = formed;
+            class
+        } else {
+            self.connections
+                .claim(caller.id(), true, cap, &self.preferred)?
+        };
+        self.record_proof(caller);
+        Ok(class)
     }
 
     /// Records a dial as connected once the outbound transport proves the
-    /// node's ID. `connected` is that ID. When the node has moved on from the
-    /// `dialed` ID, the dial's slot moves to `connected` with it, so the slot
-    /// and the proof sit under the ID the connection registers with.
+    /// node it reached, `connected`. The dial's slot was claimed for
+    /// `claimed`. When the node answers under another ID, the slot moves to
+    /// that ID, so the slot and the proof sit under the ID the connection
+    /// registers with.
     ///
-    /// A dial to a preferred gateway's earlier ID claimed a held place that
-    /// `connected` doesn't keep. The move is refused, and nothing is
-    /// recorded, when the slot would then be an ordinary one above `cap`.
+    /// The node becomes the connected node of each gateway it answers for,
+    /// so a gateway that blocks name by an earlier ID keeps its held place
+    /// under the ID it has now. A dial that claimed a held place for a
+    /// gateway the node doesn't answer for loses it, and a node that makes
+    /// a gateway ambiguous turns its member's slot into an ordinary one.
+    /// The dial is refused, and nothing is recorded, when that would increase
+    /// the ordinary total or its inbound share beyond its limit.
     pub(crate) fn outbound_connected(
         &mut self,
-        dialed: NodeId,
-        connected: NodeId,
+        claimed: NodeId,
+        connected: ProvenNode<'_>,
         cap: usize,
     ) -> Result<(), SlotRefusal> {
-        if dialed != connected {
+        let node = connected.id();
+        let mut formed = self.connected_ranking(connected, Some(claimed));
+        if let Some(next) = &mut formed {
             self.connections
-                .move_outbound(dialed, connected, cap, &self.preferred)?;
-            self.slot_left(dialed);
+                .protect_inbound(next, self.preferred.set(), inbound_share(cap));
         }
-        *self.authenticated_dials.entry(connected).or_default() += 1;
-        if let Some(formed) = self.preferred.with_connected(&connected) {
+        self.connections.settle_outbound(
+            claimed,
+            node,
+            cap,
+            &self.preferred,
+            formed.as_ref().unwrap_or(&self.preferred),
+        )?;
+        if let Some(formed) = formed {
             self.preferred = formed;
         }
+        *self.authenticated_dials.entry(node).or_default() += 1;
+        self.record_proof(connected);
+        if claimed != node {
+            self.slot_left(claimed);
+        }
         Ok(())
+    }
+
+    /// Whether `node` holds a slot whose TLS handshake has proved it.
+    fn is_authenticated(&self, node: &NodeId) -> bool {
+        self.connections.of_node(node).inbound > 0 || self.authenticated_dials.contains_key(node)
+    }
+
+    /// The connected nodes TLS has proved, each with the earlier IDs it
+    /// proved.
+    fn owners(&self) -> impl Iterator<Item = ProvenNode<'_>> {
+        self.connections
+            .nodes()
+            .filter(|node| self.is_authenticated(node))
+            .map(|node| {
+                let earlier = self.proven_earlier.get(node).map_or(&[][..], Vec::as_slice);
+                ProvenNode::new(*node, earlier)
+            })
+    }
+
+    /// The preferred gateways once a handshake has proved `node`, or `None`
+    /// when that changes nothing. `settling` is the ID a dial claimed the
+    /// slot for that is about to become `node`'s, which no longer counts as
+    /// a slot of that ID.
+    fn connected_ranking(
+        &self,
+        node: ProvenNode<'_>,
+        settling: Option<NodeId>,
+    ) -> Option<PreferredGateways> {
+        let owners = self
+            .owners()
+            .filter(|owner| owner.id() != node.id())
+            .chain([node]);
+        self.preferred.with_owners(owners, |id| {
+            let settled = usize::from(settling == Some(*id));
+            self.connections.of_node(id).total() > settled
+        })
+    }
+
+    /// Keeps what an authenticated slot's handshake proved about `node`.
+    fn record_proof(&mut self, node: ProvenNode<'_>) {
+        if node.earlier().is_empty() {
+            self.proven_earlier.remove(&node.id());
+        } else {
+            self.proven_earlier
+                .insert(node.id(), node.earlier().to_vec());
+        }
     }
 
     /// Replaces the preferred gateways the slot checks use. Slots already
     /// held stay held; only how they count changes.
     /// TLS ownership is sampled here, since discovery prepared its snapshot before this lock.
-    pub fn publish_gateway_ranking(&mut self, ranking: &GatewayRanking, hold_limit: usize) {
-        let authenticated = |node: &NodeId| {
-            self.connections.of_node(node).inbound > 0
-                || self.authenticated_dials.contains_key(node)
-        };
-        let owners: Vec<NodeId> = self
-            .connections
-            .nodes()
-            .filter(|node| authenticated(node))
-            .copied()
-            .collect();
-        let mut live = ranking.candidates(owners.iter());
+    pub fn publish_gateway_ranking(
+        &mut self,
+        ranking: &GatewayRanking,
+        hold_limit: usize,
+        connection_cap: usize,
+    ) {
+        let mut live = ranking.candidates(self.owners());
         // A node discovery found connected may have lost its proof since.
         for gateway in &mut live {
             if let GatewayMatch::One((node, GatewayStanding::Connected)) = gateway.resolution() {
-                if !authenticated(&node) {
+                if !self.is_authenticated(&node) {
                     let standing = if self.connections.of_node(&node).outbound > 0 {
                         GatewayStanding::Dialing
                     } else {
@@ -383,22 +483,17 @@ impl HandshakeCounts {
                 }
             }
         }
-        // Every proved owner connects the gateway its ID names, tied at the
-        // cutoff or not. An owner that connected after discovery's snapshot
-        // resolves that gateway, or makes it ambiguous when the snapshot
-        // named another node.
-        let by_gateway: HashMap<GatewayId, usize> = live
-            .iter()
-            .enumerate()
-            .map(|(index, gateway)| (gateway.gateway(), index))
-            .collect();
-        for owner in &owners {
-            if let Some(&index) = by_gateway.get(&GatewayId::from_node_id(owner.as_bytes())) {
-                live[index] = live[index].connected_as(*owner);
-            }
-        }
-        self.preferred =
+        // Every proved owner connects the gateways it answers for, under
+        // the ID it has now or an earlier one, tied at the cutoff or not.
+        GatewayRanking::connect_owners(&mut live, self.owners(), |id| {
+            self.connections.of_node(id).total() > 0
+        });
+        self.inbound_limit = inbound_share(connection_cap);
+        let mut next =
             PreferredGateways::form_with_incumbents(live, hold_limit, self.preferred.set());
+        self.connections
+            .protect_inbound(&mut next, self.preferred.set(), self.inbound_limit);
+        self.preferred = next;
     }
 
     /// Yields places that moved gateways cannot use in this ranking. The
@@ -411,7 +506,7 @@ impl HandshakeCounts {
     ) {
         while self.free_ordinary_connections(cap) == 0 {
             let preferred = self.preferred.held_places();
-            self.preferred.defer_dials(|dialed| {
+            let changed = self.preferred.defer_dials(|dialed| {
                 moves
                     .cooling_destination(dialed, now)
                     .is_some_and(|current| {
@@ -419,6 +514,13 @@ impl HandshakeCounts {
                             || self.connections.of_node(&current).total() > 0
                     })
             });
+            if changed {
+                self.connections.protect_inbound(
+                    &mut self.preferred,
+                    &preferred.members,
+                    self.inbound_limit,
+                );
+            }
             // A deferred destination can leave another gateway unable to dial.
             // Each change puts at least one more ranked gateway into backoff.
             if self.preferred.set() == preferred.members {
@@ -453,26 +555,36 @@ impl HandshakeCounts {
 
     /// Releases the slot that `claim_connection` charged to `node`.
     ///
-    /// A gateway that loses its last connection slot counts as in backoff
-    /// until the next published ranking, so a dropped caller or member
-    /// doesn't stay preferred in the meantime.
+    /// A gateway that loses its last slot goes into backoff unless another
+    /// live connection proves it owns the gateway's place.
     pub fn release_connection(&mut self, node: NodeId, inbound: bool) {
         self.connections.release(node, inbound);
         self.slot_left(node);
     }
 
-    /// Updates `node`'s gateway standing after one of its slots left it.
+    /// Updates `node`'s gateway standing after one of its slots left it,
+    /// and forgets what its handshakes proved with its last proved slot.
     fn slot_left(&mut self, node: NodeId) {
         let slots = self.connections.of_node(&node);
         let updated = if slots.total() == 0 {
-            self.preferred.with_released(&node)
-        } else if slots.inbound == 0 && !self.authenticated_dials.contains_key(&node) {
+            self.preferred.with_released(&node, self.owners(), |id| {
+                self.connections.of_node(id).total() > 0
+            })
+        } else if !self.is_authenticated(&node) {
             self.preferred.with_dialing(&node)
         } else {
             None
         };
-        if let Some(formed) = updated {
+        if !self.is_authenticated(&node) {
+            self.proven_earlier.remove(&node);
+        }
+        if let Some(mut formed) = updated {
+            self.connections
+                .protect_inbound(&mut formed, self.preferred.set(), self.inbound_limit);
             self.preferred = formed;
+        } else if let Some(incumbents) = self.preferred.retry_deferred() {
+            self.connections
+                .protect_inbound(&mut self.preferred, &incumbents, self.inbound_limit);
         }
     }
 
@@ -673,6 +785,56 @@ pub fn inbound_share(cap: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn node(byte: u8) -> NodeId {
+        NodeId::from_bytes(&[byte; 32])
+    }
+
+    /// What a node's handshakes proved is kept while the node holds a proved
+    /// slot and no longer, never more than a handshake proves, and only for
+    /// claims that were granted and dials that TLS has proved.
+    #[test]
+    fn a_nodes_proof_is_bounded_and_leaves_with_its_last_proved_slot() {
+        use zakura_quic::MAX_EARLIER_NODE_IDS;
+
+        let mut counts = HandshakeCounts::default();
+        let caller = node(0xF0);
+        let many: Vec<NodeId> = (1..).take(MAX_EARLIER_NODE_IDS + 2).map(node).collect();
+        let proved = ProvenNode::new(caller, &many);
+
+        counts
+            .claim_inbound_connection(proved, 2)
+            .expect("a free slot");
+        assert_eq!(counts.proven_earlier[&caller], many[..MAX_EARLIER_NODE_IDS]);
+
+        // A dial to the node proves nothing until TLS has.
+        counts.claim_connection(caller, false, 2).expect("a slot");
+        counts.release_connection(caller, true);
+        assert!(!counts.is_authenticated(&caller));
+        assert!(counts.proven_earlier.is_empty());
+        counts
+            .outbound_connected(caller, proved, 2)
+            .expect("the same node");
+        assert_eq!(counts.owners().collect::<Vec<_>>(), [proved]);
+        counts.release_authenticated_dial(caller);
+        assert!(counts.proven_earlier.is_empty());
+        assert_eq!(counts.owners().count(), 0);
+
+        // A refused claim records nothing.
+        counts
+            .claim_connection(node(0xF1), false, 1)
+            .expect("a slot");
+        assert_eq!(
+            counts.claim_inbound_connection(proved, 1),
+            Err(SlotRefusal::Full)
+        );
+        assert!(counts.proven_earlier.is_empty());
+        // A node that proved no earlier ID has no entry at all.
+        counts
+            .claim_inbound_connection(node(0xF2).into(), 2)
+            .expect("a free slot");
+        assert!(counts.proven_earlier.is_empty());
+    }
 
     #[test]
     fn transport_and_control_share_one_pending_budget() {

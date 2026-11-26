@@ -283,6 +283,7 @@ pub(crate) fn negotiated_alpn(session: &dyn quinn_proto::crypto::Session) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::composite::COMPOSITE_KEY_TAGS;
 
     /// A random source that always fills with 7s.
     #[derive(Debug)]
@@ -804,7 +805,14 @@ mod tests {
         .unwrap();
         assert!(!copying
             .key_list()
-            .contains_list_named(later_node.node_id(), &[]));
+            .ids_of_lists_keeping(&[])
+            .any(|id| id == later_node.node_id()));
+        assert!(
+            !copying
+                .proven_ids(&COMPOSITE_KEY_TAGS)
+                .any(|id| id == later_node.node_id()),
+            "the attacker's keys don't prove the node's ID"
+        );
         assert_eq!(
             dial_presenting(copying.node_id(), &copying, &attacker),
             None
@@ -821,7 +829,8 @@ mod tests {
         assert!(node
             .credential()
             .key_list()
-            .contains_list_named(ed25519_only.node_id(), &[ED25519_KEY_TAG]));
+            .ids_of_lists_keeping(&[ED25519_KEY_TAG])
+            .any(|id| id == ed25519_only.node_id()));
         assert_eq!(
             dial_presenting(ed25519_only.node_id(), node.credential(), &node),
             refused(CertificateError::UnknownIssuer)
@@ -845,7 +854,13 @@ mod tests {
         let shaped = NodeCredential::decode(&bytes).unwrap();
         assert!(shaped
             .key_list()
-            .contains_list_named(earlier, &[ED25519_KEY_TAG, ML_DSA_65_KEY_TAG]));
+            .ids_of_lists_keeping(&COMPOSITE_KEY_TAGS)
+            .any(|id| id == earlier));
+        assert_eq!(
+            shaped.proven_ids(&COMPOSITE_KEY_TAGS).next(),
+            None,
+            "a signing key given as its fingerprint proves no ID"
+        );
         assert_eq!(
             dial_presenting(earlier, &shaped, &attacker),
             refused(CertificateError::ApplicationVerificationFailure)

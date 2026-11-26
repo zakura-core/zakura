@@ -159,10 +159,11 @@ pub(super) struct ClassifiedGateways {
 ///
 /// A node that `moved` says answers under a new ID is connected or being
 /// dialed when that ID is, so the round never dials a gateway it already
-/// reaches. The gateway keeps resolving to the node's earlier ID, the one
-/// its gateway ID is made from. That ID holds no connection slot, so the
-/// slot checks hold no place for it: the node's connection counts as an
-/// ordinary one until blocks name the gateway by its new ID.
+/// reaches. Here the gateway keeps resolving to the node's earlier ID, the
+/// one its gateway ID is made from. The slot checks know which earlier IDs
+/// each connected node proved, and resolve the gateway to that node when
+/// they apply the ranking, so the node fills the gateway's held place under
+/// the ID it has now.
 pub(super) async fn classify_gateways(
     ranked: &[RankedGateway],
     registered: &[NodeId],

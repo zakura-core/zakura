@@ -83,11 +83,14 @@ SEC-2 and §16, and §17ac lists each change.
 Version 0.32 keeps room in a discovery record for a second, post-quantum
 signature, so a later release can add one without a break; it changes
 CTRL-26 and COMPAT-13, and §17ad lists each change.
+Version 0.33 has a connection report the earlier node IDs its peer
+proved, in both directions, so a pinned peer entry and a mining gateway's
+held place follow a node that adds a key; it adds DIAL-10, changes TLS-8,
+DIAL-9, COMPAT-13, API-1, API-4 and §16, and §17ae lists each change.
 Version 0.34 lets a key list hold 32 entries, not 4, and accepts a dial to
 an earlier node ID only when that ID names a prefix of the node's key list,
 so the check costs one hash per entry; it changes ID-8, ID-9, ID-12, TLS-7,
 DIAL-1, CTRL-26, COMPAT-13, SEC-2 and §16, and §17af lists each change.
-Version 0.33 is the draft in #2766. This version doesn't include it.
 
 ## 0. Conventions
 
@@ -393,7 +396,16 @@ at fork tag `zakura-iroh-v1.1.0-rc.1`, and it keeps their MIT/Apache-2.0 notices
   the key list and `Conn::remote_key()` the Ed25519 key that signed. On a
   dial, `remote_id()` is the node's ID now, which differs from the dialed ID
   when the node has added keys (TLS-7); `Conn::dialed_id()` returns the
-  dialed one.
+  dialed one. `Conn::remote_earlier_ids()` returns the other IDs the
+  handshake proved, on a dial and on an accepted connection: each ID that
+  TLS-7 would accept for this credential and the keys the peer signed with,
+  apart from `remote_id()`. That is the ID of every shorter prefix of the
+  credential's key list that keeps the signing keys, shortest first. A node
+  adds keys only at the end of its list (ID-8), so these are the IDs it had,
+  and only the holder of those keys can prove any of them. One enumeration
+  of the credential's prefixes answers both the dial's check and this
+  report, so they can't disagree. A credential holds 32 entries and the
+  composite signs with two, so a handshake proves at most 30 earlier IDs.
 - **TLS-9.** The crypto provider is rustls' `ring` provider with its default
   TLS 1.3 cipher suites, and its only key-exchange group is X25519MLKEM1024,
   private-use code point 0xFE24. No standard pairs X25519 with ML-KEM-1024
@@ -922,18 +934,28 @@ is today's Zakura logic.
   1. register the connection once, under the ID the node answers with, and
      hold the dial's connection slot under that ID. The connection limits
      apply to that ID as they applied to the dialed one. A dial to a
-     preferred gateway's earlier ID claims a held place, which the ID the
-     node answers with keeps only if it is a preferred gateway's too. When
-     it isn't, and no ordinary slot is free, the dial MUST close before its
-     control handshake. Discovery records a local limit. A maintained dial
-     counts the completed TLS attempt as a failure for its retry policy.
-     Otherwise one gateway could answer each dial under a new ID and turn
-     every held place into an ordinary slot of its own. A dial to an ID
-     known to have moved first claims under the last authenticated ID. For
-     discovery, both this claim and a move that adds an ordinary slot MUST
+     preferred gateway's ID claims a held place, which the node that
+     answers keeps under its own ID when its handshake proved the gateway's
+     ID (DIAL-10). A dial charged to the last authenticated ID can be
+     answered by a node that didn't, and a second connected node of one key
+     holder makes its gateway ambiguous. A higher-ranked gateway that fits
+     in an ordinary outbound slot MUST stay connected there if promoting it
+     would move an eligible incumbent above the ordinary inbound share.
+     Ranking updates and slot releases defer the same swap until it fits.
+     When counting a displaced slot
+     as ordinary would exceed the ordinary cap or its inbound share,
+     the dial MUST close before its control handshake. Discovery records a
+     local limit. A maintained dial counts the completed TLS attempt as a
+     failure for its retry policy. Otherwise one gateway could answer each
+     dial under a new ID and turn every held place into an ordinary slot of
+     its own. A dial to an ID known to have moved first claims under the last
+     authenticated ID. For discovery, both this claim and a move that adds an
+     ordinary slot MUST
      respect the ordinary discovery ceiling that leaves room for bootstrap.
      If ordinary capacity is full, a preferred gateway may retry under its
-     original ID once per 30 seconds to detect a rollback. The same limits
+     original ID once per 30 seconds. The node that answers keeps the place
+     under either ID, so the retry serves a gateway that went back to its
+     original ID and one that reconnects under its new ID. The same limits
      apply after TLS on every retry. While a moved gateway waits for that
      probe and its current ID cannot take a slot, the next reachable gateway
      may use the held place. Discovery admits at most one attempt per known
@@ -964,12 +986,44 @@ is today's Zakura logic.
   remembered, the earlier ID still resolves its gateway prefix after its book
   record is evicted. Distinct full IDs sharing a gateway prefix remain ambiguous.
   A `zakura.bootstrap_peers` entry that names a
-  moved node logs one warning per start. Two cases are not covered: a
-  pinned `network.unconditional_peers` entry matches its `NodeId` exactly,
-  so a pinned peer that moves is handled as any pin whose ID is stale,
-  unrecognised until the pin names its new ID; and a preferred gateway that blocks still name by its earlier ID is
-  not dialed again but holds an ordinary connection slot, not a held place,
-  until blocks name its new ID.
+  moved node logs one warning per start. A pinned
+  `network.unconditional_peers` entry and a preferred gateway's held place
+  follow a moved node through what its connection proved (DIAL-10), not
+  through this table.
+- **DIAL-10.** A connection's peer is still the node of each earlier
+  `NodeId` its handshake proved (TLS-8), whichever end opened the
+  connection. `zakura-network` MUST take a peer for the node an ID names
+  only on that proof or on the ID the connection registered under, where it
+  knows a node by an ID the node may have moved on from:
+  1. a pinned `network.unconditional_peers` entry is proven by the
+     connection registered under its `NodeId`, or without one by a
+     connection whose handshake proved that ID as an earlier one. The peer
+     then counts as connected and its address is exempt, as for a pin that
+     names its current ID, and the node logs one warning per start that
+     asks for the new ID. A pin still means that the peer holds the keys
+     the pinned ID names;
+  2. a connected node answers for the mining gateway its `NodeId` names
+     and for the gateway each proven earlier ID names. A gateway that
+     blocks name by an earlier ID therefore fills its held place under the
+     ID it has now, on a dial and on a call in. A gateway that two or more
+     connected nodes answer for is ambiguous and holds no place, as when
+     two nodes share its ID, so one key holder's nodes never fill more
+     than the gateway's one place. An ambiguous gateway is resolved again
+     when the next ranking is applied. Gateways that name one node count
+     once towards the hold and the node fills one place. While a dial to
+     the earlier ID is in flight, the gateway goes on naming that ID and
+     the dial settles it. If the dial ends before settling and releases
+     the last slot under that ID, a connected node that uniquely proves
+     the gateway takes its place immediately. A proof that makes a gateway
+     ambiguous leaves its member's slot an ordinary one. If this increases the ordinary
+     total or the ordinary inbound count beyond its respective limit,
+     a caller is refused its slot and a dial closes as DIAL-9 says,
+     whichever place the new node itself would fill.
+
+  The proven IDs are kept while the connection holds its slot or its
+  registration, at most 30 for each. An inbound moved peer isn't linked to
+  its earlier ID in the discovery book, so discovery may still dial that
+  ID once and close the dial as a duplicate (DIAL-9).
 - **DIAL-8.** When its hello spans two or more Initial datagrams, the dialer
   MUST send one more Initial datagram right after it: a PING, which
   `quinn-proto` pads to 1,200 bytes like every datagram that carries a
@@ -1211,7 +1265,8 @@ The public surface of `zakura-quic`. Changing it is a semver change of the crate
   `NodeCredential` entries are `CredentialKey::Full` or
   `CredentialKey::Fingerprint` (ID-12), and
   `NodeCredential::with_fingerprint_only(tag)` gives a full key as its
-  fingerprint. A `NodeSecretKey` carries
+  fingerprint. `MAX_EARLIER_NODE_IDS` is the most earlier IDs one handshake
+  proves (TLS-8). A `NodeSecretKey` carries
   the node's credential: its Ed25519 and ML-DSA-65 keys (ID-13), or one set
   with `with_credential`, which MUST hold both.
 - **API-2.** `QuicEndpoint`:
@@ -1268,6 +1323,9 @@ The public surface of `zakura-quic`. Changing it is a semver change of the crate
     credential the peer proved in TLS (TLS-8).
   - `dialed_id()`, the `NodeId` a dial named, or `None` on an accepted
     connection (TLS-7).
+  - `remote_earlier_ids()`, the IDs the peer had before it added keys, as
+    far as the handshake proved them, on a dial and on an accepted
+    connection (TLS-8).
   - `admitted_ip()`, `admitted_addr()`, `admitted_at()`,
     `source_validated()`, `alpn()` and `stable_id()`.
     `source_validated()` is
@@ -1431,8 +1489,9 @@ this release tolerates, and keep each hard change explicit.
 - **COMPAT-13.** A release that adds a signature scheme SHOULD NOT strand
   the nodes that hold earlier IDs. This release already does its part: it
   reads a longer credential (ID-10), accepts it on a dial to the earlier ID
-  (TLS-7), follows the node to its new ID (DIAL-9) and reads a
-  fingerprint-only entry (ID-12). The release that adds the scheme does the
+  (TLS-7), follows the node to its new ID (DIAL-9), keeps its pins and
+  gateway places with it (DIAL-10) and reads a fingerprint-only entry
+  (ID-12). The release that adds the scheme does the
   rest:
   - a listener keeps the earlier scheme's keys in full in its credential
     while it still accepts that scheme, and signs with the scheme the
@@ -1606,10 +1665,12 @@ this release tolerates, and keep each hard change explicit.
 | A dial to the ID a node had before it added a key connects, and reports the dialed ID and the node's ID now; a node's dial to its own earlier ID is refused as a self-dial; a dial to an ID whose list leaves out a signing key is refused; a node's public keys beside another party's key pass the ID check and fail the signature; a key list contains exactly its prefixes that keep the required tags, checked against every list of the entries of each list of 1 to 6 entries and every set of required tags, and on a 32-entry list against each prefix with one entry dropped, swapped or changed | TLS-7, TLS-8, API-4, DIAL-1 |
 | A list of a credential's entries that keeps both signing keys and skips an entry, which version 0.31 accepted, is refused: by the key list, by the verifier in a whole TLS handshake, and on a QUIC dial to a node with 32 entries, which answers each of its 31 prefix IDs from its two signing keys on. The check hashes fewer lists than the list has entries | TLS-7, SEC-2 |
 | A key list and a credential hold 32 entries and refuse 33; a credential of exactly 10,385 bytes decodes, with 5 entries and with 32, and one byte more is refused when built, when decoded and in a whole TLS handshake; the dialer's verifier and the listener's each read a credential of 32 entries and one of 10,385 bytes, and refuse 33 entries and 10,386 bytes as a bad encoding | ID-8, ID-12, SEC-2 |
+| A connection reports, in both directions, the earlier IDs its peer proved: for the largest credential, its 30 shorter prefixes from the two signing keys on, shortest first, each of which a dial also reaches, and neither a list that leaves a signing key out nor one that skips an entry; a credential proves to a dialer exactly the IDs it reports, and none when a signing key is a fingerprint | TLS-7, TLS-8, API-4 |
 | A fingerprint-only entry gives the node ID of the full key, holds no key, and round-trips byte for byte under a known and an unknown tag; a marked Ed25519 entry and a marked entry that isn't 32 bytes are refused; both verifiers refuse a credential whose ML-DSA-65 key is a fingerprint | ID-12, TLS-4 |
 | The largest credential a node can authenticate with, 32 entries in 10,385 bytes, completes a handshake in both directions on loopback, and in the simulator when every burst of datagrams arrives in reverse, in two round trips where the listener's flight passes the padded allowance. With 128 bytes standing in for the transport parameters, its flights are 14,035 bytes from the listener and 13,864 from the dialer, inside the 16 KiB `quinn-proto` buffers | ID-12, DIAL-8 |
 | When the datagram that starts the listener's ServerHello is lost, a dial to a listener with this release's credential completes, and a dial to a listener with the largest credential fails at the handshake deadline, with both connections released and a bounded number of bytes sent | ID-12, ADM-6, COMPAT-13 |
 | A dial to a node's earlier ID registers the node once under its ID now, with the connection slot under that ID; a second such dial to a registered node ends before its control handshake and neither end's registered connection changes; an attempt follows the moved node's registration, a bootstrap supervisor and a dial round leave a registered moved node alone, and both of its book entries are credited | DIAL-9 |
+| A gateway named by its earlier ID fills its held place under its new ID with the ordinary slots full, on a dial and on a call in, and takes it again after a restart under either ID; a node that didn't prove the gateway's ID gets no place and no slot above the ordinary limit; two connected nodes that answer for one gateway hold no place, in either order, and the second is refused while that would pass the ordinary limit, on a call in and on a dial, also when it fills a place of its own; a node two gateways name fills one place; a registration carries its proven earlier IDs to the peer registry in both directions, and a pin by an earlier ID counts as connected with its address exempt | DIAL-9, DIAL-10 |
 | A composite signature verifies only whole: a tampered Ed25519 or ML-DSA half, a truncated signature, another node's key in either half, a credential without an ML-DSA-65 key, and one whose tag-3 entry isn't 1,952 bytes are refused; the ML-DSA seed derivation has a known answer | TLS-4, ID-11, ID-12, ID-13 |
 | ML-DSA-65 key generation, signing and verification give a subset of Project Wycheproof's and NIST ACVP's known answers, each under its own context: seeded keys and deterministic and hedged signatures match, and a 256-byte context, wrong-length keys and signatures, a flipped commitment hash, a bad hint encoding and an out-of-bound response are refused | TLS-4, ID-13 |
 | Signatures that RustCrypto `ml-dsa` 0.1.2 made under the TLS-4 context, recorded offline, are reproduced byte for byte and verify, and its public key for the same seed matches | TLS-4, ID-13 |
@@ -2481,6 +2542,40 @@ Changed:
 - **COMPAT-13.** States what the room is for and what the release that
   uses it has to do.
 
+## 17ae. Changes in version 0.33
+
+Version 0.31 let a dial follow a node from its earlier ID to its new one,
+and left two places that still matched a node ID exactly: a pinned
+`network.unconditional_peers` entry and a mining gateway's held place. Both
+stopped working for a node that added a key. A connection reported one ID,
+the hash of the peer's whole credential, and the earlier-ID check ran only
+on a dial, against the one dialed ID.
+
+A connection now reports every earlier ID its peer proved, in both
+directions, and those two places use the report. Nothing on the wire
+changes: no node ID, no record and no ALPN. A release can take this at any
+time before the one that adds a signature scheme.
+
+Added:
+
+- **DIAL-10.** A pin and a gateway's held place follow a node to its new ID
+  on the proof its connection gave. Two connected nodes that answer for one
+  gateway hold no place.
+
+Changed:
+
+- **TLS-8, API-4.** Adds `Conn::remote_earlier_ids()`, from the enumeration
+  the TLS-7 check uses.
+- **API-1.** Adds `MAX_EARLIER_NODE_IDS`.
+- **DIAL-9.** A dial to a gateway's earlier ID keeps the held place under
+  the ID the node answers with. The limit that closes a dial before its
+  control handshake now covers a node that didn't prove the gateway's ID
+  and a proof that makes a gateway ambiguous. The two cases it listed as
+  not covered are DIAL-10.
+- **COMPAT-13.** Names DIAL-10 among what this release already does.
+- **§16.** Tests for the report in both directions, and for pins and
+  gateway places that follow a moved node.
+
 ## 17af. Changes in version 0.34
 
 Every key a node ever adds keeps an entry in its key list, a retired key as
@@ -2493,8 +2588,7 @@ only prefixes. And a credential of 32 long keys would not fit a handshake
 flight, so the credential keeps the byte limit it had and is no longer
 bounded by its entry count alone. No release has spoken `p2p-v2/5` with
 the earlier rules, and a node with this release's two-entry list has the
-same encodings and node ID, so the ALPN doesn't move. Version 0.33 is the
-draft in #2766, which this version doesn't include.
+same encodings and node ID, so the ALPN doesn't move.
 
 Changed:
 

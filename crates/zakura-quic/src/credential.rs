@@ -282,19 +282,32 @@ impl NodeCredential {
         self.key_list.node_id()
     }
 
+    /// The node IDs that a handshake signed with the keys under
+    /// `signing_tags` proves this credential's holder answers to (TLS-7):
+    /// the credential's own ID first, then the ID of each shorter prefix of
+    /// its key list that includes every signing key, shortest first. Those
+    /// are the IDs the node had before it added its later entries.
+    ///
+    /// An ID whose list leaves a signing key out is not among
+    /// them: whoever added that key to another node's entries could
+    /// otherwise sign as that node. Empty unless the credential holds each
+    /// signing key in full, since a fingerprint verifies no signature.
+    pub(crate) fn proven_ids<'a>(
+        &'a self,
+        signing_tags: &'a [u16],
+    ) -> impl Iterator<Item = NodeId> + 'a {
+        let holds_keys = signing_tags.iter().all(|tag| self.key(*tag).is_some());
+        holds_keys
+            .then(|| self.key_list.ids_of_lists_keeping(signing_tags))
+            .into_iter()
+            .flatten()
+    }
+
     /// Whether a handshake signed with the keys under `signing_tags` proves
     /// this credential's holder is the node a dialer knows as `dialed`
-    /// (TLS-7).
-    ///
-    /// It does when the credential holds each signing key in full and
-    /// `dialed` names a prefix of this credential's key list that includes
-    /// them all. That is the credential's own ID, or an ID the node had
-    /// before it added its later entries. An ID whose list leaves a signing
-    /// key out is refused: whoever added that key after another node's
-    /// entries could otherwise sign as that node.
+    /// (TLS-7): `dialed` is one of [`Self::proven_ids`].
     pub(crate) fn proves_dialed_id(&self, dialed: NodeId, signing_tags: &[u16]) -> bool {
-        signing_tags.iter().all(|tag| self.key(*tag).is_some())
-            && self.key_list.contains_list_named(dialed, signing_tags)
+        self.proven_ids(signing_tags).any(|id| id == dialed)
     }
 
     /// The node's Ed25519 key, if the credential has one.
@@ -723,6 +736,77 @@ mod tests {
             .into_iter()
             .chain((4..).zip(more))
             .collect()
+    }
+
+    /// TLS-7: a credential proves the ID of each prefix of its key list that
+    /// keeps every signing key, when it holds those keys in full, and what
+    /// it proves to a dialer is exactly what it reports. An entry outside
+    /// the signing keys may be a fingerprint. A signing key given as its
+    /// fingerprint proves nothing, not even the credential's own ID.
+    #[test]
+    fn a_credential_proves_the_ids_of_the_prefixes_that_keep_its_signing_keys() {
+        const SIGNING: [u16; 2] = [ED25519_KEY_TAG, ML_DSA_65_KEY_TAG];
+        let secret = NodeSecretKey::from_bytes(&[7; KEY_LENGTH]);
+        let own = |tag: u16| {
+            let key = secret.credential().key(tag).expect("a node holds its keys");
+            (tag, CredentialKey::Full(key.to_vec()))
+        };
+        // Tag 2 sorts between the signing keys and tag 4 after them.
+        let entries = [
+            own(ED25519_KEY_TAG),
+            (2, CredentialKey::Full(vec![2; 40])),
+            own(ML_DSA_65_KEY_TAG),
+            (4, CredentialKey::Fingerprint([4; KEY_LENGTH])),
+        ];
+        let credential = NodeCredential::from_entries(entries.clone()).expect("four entries fit");
+        let id_of = |mask: u32| {
+            let kept = (0..entries.len())
+                .filter(|index| mask & (1 << index) != 0)
+                .map(|index| entries[index].clone());
+            NodeCredential::from_entries(kept).map(|kept| kept.node_id())
+        };
+
+        // The whole list, then the one shorter prefix that keeps both
+        // signing keys: the first three entries.
+        let proven: Vec<NodeId> = credential.proven_ids(&SIGNING).collect();
+        assert_eq!(
+            proven,
+            [
+                credential.node_id(),
+                id_of(0b0111).expect("a prefix is a list")
+            ]
+        );
+        for mask in 1u32..1 << entries.len() {
+            // A prefix's mask is one below a power of two. Bits 0 and 2 are
+            // the signing keys.
+            let proves = (mask + 1).is_power_of_two() && mask & 0b0101 == 0b0101;
+            let id = id_of(mask).expect("entries in tag order form a credential");
+            assert_eq!(proven.contains(&id), proves, "{mask:#06b}");
+            assert_eq!(
+                credential.proves_dialed_id(id, &SIGNING),
+                proves,
+                "{mask:#06b}"
+            );
+        }
+
+        let retired = credential
+            .clone()
+            .with_fingerprint_only(ML_DSA_65_KEY_TAG)
+            .expect("an ML-DSA-65 key can be given as its fingerprint");
+        assert_eq!(retired.node_id(), credential.node_id());
+        assert_eq!(retired.proven_ids(&SIGNING).next(), None);
+        assert!(!retired.proves_dialed_id(retired.node_id(), &SIGNING));
+        // The same credential still proves its four prefixes to a scheme
+        // that signs with the Ed25519 key alone.
+        assert_eq!(retired.proven_ids(&[ED25519_KEY_TAG]).count(), 4);
+
+        // A credential without a signing key proves nothing either.
+        let single = NodeCredential::single(ed25519());
+        assert_eq!(single.proven_ids(&SIGNING).next(), None);
+        assert_eq!(
+            single.proven_ids(&[ED25519_KEY_TAG]).collect::<Vec<_>>(),
+            [single.node_id()]
+        );
     }
 
     /// ID-12: the byte limit bounds a credential, whatever its entry count.

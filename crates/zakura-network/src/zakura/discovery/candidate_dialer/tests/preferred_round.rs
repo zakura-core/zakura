@@ -534,13 +534,16 @@ async fn moved_gateway_report_survives_eviction_of_the_earlier_record(
     io.publish_preferred_gateways(&state, &[current], Instant::now())
         .await;
     let report = node.endpoint().connection_places();
+    // The peer's handshake proved the earlier ID the blocks name, so the
+    // peer fills that gateway's held place under the ID it has now.
     assert_eq!(
         (report.gateways[0].place, report.gateways[0].connected),
-        (GatewayPlace::Standby, true)
+        (GatewayPlace::Preferred, true)
     );
     assert_eq!(report.peers.len(), 1);
     assert_eq!(report.peers[0].node_id, *current.as_bytes());
-    assert_eq!((report.slots.ordinary, report.slots.preferred), (1, 0));
+    assert!(report.peers[0].preferred);
+    assert_eq!((report.slots.ordinary, report.slots.preferred), (0, 1));
     peer.shutdown().await;
     tokio::time::timeout(
         TEST_NET_TIMEOUT,

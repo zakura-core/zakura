@@ -263,6 +263,9 @@ pub struct ZakuraTestNodeBuilder {
     /// The observer the node's handler reports transport events to.
     #[cfg(test)]
     transport_observer: Option<Arc<dyn crate::zakura::TransportObserver>>,
+    /// The legacy stack's registry the node's native registrations reach.
+    #[cfg(test)]
+    peer_registry: Option<crate::peer_registry::PeerRegistry>,
 }
 
 #[derive(Clone, Debug)]
@@ -327,6 +330,8 @@ impl ZakuraTestNodeBuilder {
             block_range_source: None,
             #[cfg(test)]
             transport_observer: None,
+            #[cfg(test)]
+            peer_registry: None,
         }
     }
 
@@ -479,6 +484,17 @@ impl ZakuraTestNodeBuilder {
         self
     }
 
+    /// Record the node's native registrations in `peer_registry`, as a node
+    /// that runs both stacks does.
+    #[cfg(test)]
+    pub(crate) fn peer_registry(
+        mut self,
+        peer_registry: crate::peer_registry::PeerRegistry,
+    ) -> Self {
+        self.peer_registry = Some(peer_registry);
+        self
+    }
+
     /// Restrict the capability mask advertised by this test node.
     pub fn supported_capabilities(mut self, supported_capabilities: u64) -> Self {
         self.supported_capabilities = Some(supported_capabilities);
@@ -518,7 +534,16 @@ impl ZakuraTestNodeBuilder {
             }
         };
         let endpoint = factory.endpoint_with_key(secret_key()).await?;
-        let supervisor = ZakuraSupervisorHandle::new(self.max_connections_per_ip)
+        let supervisor = ZakuraSupervisorHandle::new(self.max_connections_per_ip);
+        #[cfg(test)]
+        let supervisor = match self.peer_registry.clone() {
+            Some(peer_registry) => ZakuraSupervisorHandle::new_with_peer_registry(
+                self.max_connections_per_ip,
+                peer_registry,
+            ),
+            None => supervisor,
+        };
+        let supervisor = supervisor
             .with_tx_relay_sessions(
                 self.custom_services
                     .iter()

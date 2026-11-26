@@ -16,7 +16,7 @@ use zeroize::{Zeroize as _, Zeroizing};
 
 use crate::{
     key::{NodeKey, SignatureError, KEY_LENGTH},
-    key_list::ED25519_KEY_TAG,
+    key_list::{ED25519_KEY_TAG, MAX_NODE_KEYS},
 };
 
 /// The credential tag of an ML-DSA-65 public key (ID-13). Tag 2 was the
@@ -27,6 +27,12 @@ pub const ML_DSA_65_KEY_TAG: u16 = 3;
 /// The credential tags of the two keys a composite signature is made with
 /// (TLS-4). A handshake signed with the composite proves exactly these keys.
 pub(crate) const COMPOSITE_KEY_TAGS: [u16; 2] = [ED25519_KEY_TAG, ML_DSA_65_KEY_TAG];
+
+/// The most earlier node IDs a handshake signed with the composite proves
+/// (TLS-7): one for each proper prefix of the credential's key list that
+/// keeps both signing keys. Such a prefix holds at least those two entries
+/// and a credential at most [`MAX_NODE_KEYS`], which makes 30.
+pub const MAX_EARLIER_NODE_IDS: usize = MAX_NODE_KEYS - COMPOSITE_KEY_TAGS.len();
 
 /// Length of an ML-DSA-65 public key, in bytes.
 pub const ML_DSA_65_KEY_BYTES: usize = 1_952;

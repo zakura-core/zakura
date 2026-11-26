@@ -758,7 +758,11 @@ async fn a_quic_connection_authenticates_the_full_extended_credential() {
         assert_eq!(moved.dialed_id(), Some(original_id));
         assert_eq!(moved.remote_id(), listener_keys.node_id());
         assert_eq!(moved.remote_key_list(), &listener_keys);
+        // The one earlier ID the listener's signing keys prove. The ID of
+        // its Ed25519 key and the added key alone is not one of them.
+        assert_eq!(moved.remote_earlier_ids(), [original_id]);
         assert_eq!(inbound.dialed_id(), None);
+        assert_eq!(inbound.remote_earlier_ids(), []);
         assert_eq!(echo(&moved, b"hello").await, b"hello");
 
         let conn = client.connect(server.addr(), &[ALPN]).await.unwrap();
@@ -766,6 +770,7 @@ async fn a_quic_connection_authenticates_the_full_extended_credential() {
         assert_eq!(conn.dialed_id(), Some(listener_keys.node_id()));
         assert_eq!(conn.remote_key_list(), &listener_keys);
         assert_eq!(conn.remote_id(), listener_keys.node_id());
+        assert_eq!(conn.remote_earlier_ids(), [original_id]);
         assert_eq!(inbound.remote_id(), client.local_id());
         assert_eq!(echo(&conn, b"hello").await, b"hello");
 
@@ -895,6 +900,88 @@ async fn a_node_with_32_keys_answers_to_each_earlier_id_and_no_other_list() {
                 Err(ConnectError::WrongIdentity)
             ));
         }
+    })
+    .await
+    .unwrap();
+}
+
+/// TLS-7, API-4: a connection reports the earlier IDs its peer proves in
+/// both directions. The largest credential proves the most: the ID of each
+/// prefix of its key list from its two signing keys on, short of the whole,
+/// shortest first. An accepted connection reports them for the dialer as a
+/// dial reports them for the listener, and a dial to any of them reaches
+/// the node.
+#[tokio::test]
+async fn a_connection_reports_the_earlier_ids_its_peer_proves() {
+    // A node with the largest credential, and the IDs its handshake proves
+    // and doesn't.
+    let largest = || {
+        let original = NodeSecretKey::generate();
+        let additions = largest_credential_additions();
+        let earlier: Vec<_> = (0..additions.len())
+            .map(|added| with_additions(original.clone(), additions[..added].to_vec()).public())
+            .collect();
+        assert_eq!(earlier.len(), crate::MAX_EARLIER_NODE_IDS);
+        // Lists of the node's entries the handshake can't prove: one that
+        // leaves out the ML-DSA-65 key, and one that skips the first key the
+        // node added.
+        let ed25519 = original.credential().key(crate::ED25519_KEY_TAG).unwrap();
+        let without_ml_dsa = crate::NodeCredential::from_entries(
+            [(
+                crate::ED25519_KEY_TAG,
+                crate::CredentialKey::Full(ed25519.to_vec()),
+            )]
+            .into_iter()
+            .chain(additions.iter().cloned()),
+        )
+        .unwrap()
+        .node_id();
+        let skipping = with_additions(original.clone(), additions[1..].to_vec()).public();
+        let secret = with_additions(original, additions);
+        (secret, earlier, [without_ml_dsa, skipping])
+    };
+
+    tokio::time::timeout(3 * TEST_TIMEOUT, async {
+        let (listener_key, listener_earlier, listener_unproven) = largest();
+        let (dialer_key, dialer_earlier, dialer_unproven) = largest();
+        let endpoint = QuicEndpoint::bind(listener_key, &loopback(), &test_config()).unwrap();
+        let mut server = serve_test_acceptor(endpoint, &[ALPN], |_| Admit::Accept);
+        let client = QuicEndpoint::bind(dialer_key, &loopback(), &test_config()).unwrap();
+
+        let conn = client.connect(server.addr(), &[ALPN]).await.unwrap();
+        let inbound = server.handled.recv().await.unwrap();
+        assert_eq!(conn.remote_earlier_ids(), listener_earlier);
+        assert_eq!(inbound.remote_earlier_ids(), dialer_earlier);
+        assert!(!conn.remote_earlier_ids().contains(&conn.remote_id()));
+        for (connection, unproven) in [(&conn, listener_unproven), (&inbound, dialer_unproven)] {
+            for id in unproven {
+                assert!(!connection.remote_earlier_ids().contains(&id));
+            }
+        }
+
+        // What a connection reports is what a dial accepts.
+        for earlier in &listener_earlier {
+            let addr = NodeAddr::with_addrs(*earlier, server.endpoint.local_addrs());
+            let moved = client.connect(addr, &[ALPN]).await.unwrap();
+            server.handled.recv().await.unwrap();
+            assert_eq!(moved.dialed_id(), Some(*earlier));
+            assert_eq!(moved.remote_id(), server.addr().id);
+            assert!(moved.remote_earlier_ids().contains(earlier));
+        }
+        for unproven in listener_unproven {
+            let addr = NodeAddr::with_addrs(unproven, server.endpoint.local_addrs());
+            assert!(matches!(
+                client.connect(addr, &[ALPN]).await,
+                Err(ConnectError::WrongIdentity)
+            ));
+        }
+
+        // A node with only its two signing keys has no earlier ID.
+        let plain = self::client();
+        let conn = plain.connect(server.addr(), &[ALPN]).await.unwrap();
+        let inbound = server.handled.recv().await.unwrap();
+        assert_eq!(conn.remote_earlier_ids(), listener_earlier);
+        assert_eq!(inbound.remote_earlier_ids(), []);
     })
     .await
     .unwrap();

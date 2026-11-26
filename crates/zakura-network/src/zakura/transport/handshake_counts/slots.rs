@@ -94,6 +94,21 @@ impl ConnectionSlots {
         self.inbound
     }
 
+    /// Each inbound connection above the ordinary share needs a preferred
+    /// place. Keep eligible incumbents in those places across a ranking change.
+    pub(super) fn protect_inbound(
+        &self,
+        next: &mut PreferredGateways,
+        incumbents: &[NodeId],
+        inbound_limit: usize,
+    ) {
+        next.preserve_inbound_places(
+            incumbents,
+            self.inbound.saturating_sub(inbound_limit),
+            |node| self.of_node(node).inbound > 0,
+        );
+    }
+
     /// Splits the slots in use by `preferred`'s set, with one lookup per
     /// member.
     pub(super) fn split(&self, preferred: &PreferredGateways) -> SlotSplit {
@@ -173,28 +188,80 @@ impl ConnectionSlots {
         Ok(class)
     }
 
-    /// Moves one outbound slot from `from` to `to`: a dial to `from` reached
-    /// the node whose ID is `to`. The totals don't change.
+    /// Claims an inbound slot for a caller whose proof changes the gateway ranking.
     ///
-    /// The slot passed [`Self::claim`] for `from` and has to pass for `to`
-    /// as well. A dial to a preferred gateway's ID takes a held place, which
-    /// `to` loses unless it is a preferred gateway itself. The move is
-    /// refused, and nothing changes, when it would add an ordinary slot
-    /// above `cap`. Otherwise a gateway could turn every held place into an
-    /// ordinary slot of its own by answering under new IDs.
-    pub(super) fn move_outbound(
+    /// A displaced member stays connected as ordinary. Outranking it can exceed
+    /// the ordinary total temporarily. Making a gateway ambiguous also requires
+    /// room under the ordinary cap. Both changes must preserve the dial reserve.
+    pub(super) fn claim_under_new_ranking(
+        &mut self,
+        node: NodeId,
+        cap: usize,
+        held_under: &PreferredGateways,
+        counted_under: &PreferredGateways,
+    ) -> Result<SlotClass, SlotRefusal> {
+        let before = self.split(held_under);
+        let class = self.claim(node, true, cap, counted_under)?;
+        let disputes = counted_under.ambiguous() > held_under.ambiguous();
+        if let Err(refusal) = self.check_reclassification(before, cap, counted_under, disputes) {
+            self.release(node, true);
+            return Err(refusal);
+        }
+        Ok(class)
+    }
+
+    /// A proof may leave an existing excess from a ranking change in place.
+    /// It cannot increase ordinary inbound use past its share. Dials and inbound
+    /// proofs that make a gateway ambiguous must also respect the ordinary total.
+    fn check_reclassification(
+        &self,
+        before: SlotSplit,
+        cap: usize,
+        counted_under: &PreferredGateways,
+        enforce_ordinary_cap: bool,
+    ) -> Result<(), SlotRefusal> {
+        let after = self.split(counted_under);
+        if enforce_ordinary_cap && after.ordinary > before.ordinary && after.ordinary > cap {
+            return Err(SlotRefusal::Hold);
+        }
+        if after.ordinary_inbound > before.ordinary_inbound
+            && after.ordinary_inbound > inbound_share(cap)
+        {
+            return Err(SlotRefusal::InboundShare);
+        }
+        Ok(())
+    }
+
+    /// Settles one outbound slot once its dial has proved which node it
+    /// reached: the slot was claimed for `from` and belongs to `to` from
+    /// here on. The totals don't change. When `from` is `to` the slot stays
+    /// where it is and only the limit is checked.
+    ///
+    /// `held_under` is the preferred set the slot was held under, and
+    /// `counted_under` the set as the proof re-forms it. The slot passed
+    /// [`Self::claim`] for `from` and has to pass for `to` as well. A dial
+    /// to a preferred gateway's ID takes a held place, which `to` keeps only
+    /// if it is that gateway's node too, and a proof that makes a gateway
+    /// ambiguous turns its member's slot into an ordinary one. The slot is
+    /// refused if reclassification would increase the ordinary total or
+    /// its inbound share past its limit. The dial then keeps its original charge.
+    pub(super) fn settle_outbound(
         &mut self,
         from: NodeId,
         to: NodeId,
         cap: usize,
-        preferred: &PreferredGateways,
+        held_under: &PreferredGateways,
+        counted_under: &PreferredGateways,
     ) -> Result<(), SlotRefusal> {
-        let before = self.split(preferred).ordinary;
-        self.rekey_outbound(from, to);
-        let ordinary = self.split(preferred).ordinary;
-        if ordinary > before && ordinary > cap {
-            self.rekey_outbound(to, from);
-            return Err(SlotRefusal::Hold);
+        let before = self.split(held_under);
+        if from != to {
+            self.rekey_outbound(from, to);
+        }
+        if let Err(refusal) = self.check_reclassification(before, cap, counted_under, true) {
+            if from != to {
+                self.rekey_outbound(to, from);
+            }
+            return Err(refusal);
         }
         Ok(())
     }
@@ -274,8 +341,9 @@ mod tests {
 
     /// Moves a slot with no preferred set, so no move is refused.
     fn move_outbound(slots: &mut ConnectionSlots, from: NodeId, to: NodeId) {
+        let none = PreferredGateways::default();
         slots
-            .move_outbound(from, to, 8, &PreferredGateways::default())
+            .settle_outbound(from, to, 8, &none, &none)
             .expect("no held place to lose");
     }
 
@@ -371,7 +439,7 @@ mod tests {
         );
 
         assert_eq!(
-            slots.move_outbound(member, moved, 1, &preferred),
+            slots.settle_outbound(member, moved, 1, &preferred, &preferred),
             Err(SlotRefusal::Hold)
         );
         assert_eq!(slots.of_node(&member).outbound, 1, "nothing changed");
@@ -379,14 +447,14 @@ mod tests {
 
         // A move to another member keeps a held place.
         assert_eq!(
-            slots.move_outbound(member, other_member, 1, &preferred),
+            slots.settle_outbound(member, other_member, 1, &preferred, &preferred),
             Ok(())
         );
         assert_eq!(slots.split(&preferred).preferred, 1);
         // With the ordinary slot free, the slot may become ordinary.
         slots.release(peer, true);
         assert_eq!(
-            slots.move_outbound(other_member, moved, 1, &preferred),
+            slots.settle_outbound(other_member, moved, 1, &preferred, &preferred),
             Ok(())
         );
         assert_eq!(
@@ -395,6 +463,106 @@ mod tests {
                 preferred: 0,
                 ordinary: 1,
                 ordinary_inbound: 0,
+            }
+        );
+    }
+
+    /// A slot that stays with its node is refused all the same when the
+    /// proof re-forms the set so that a member's slot becomes ordinary above
+    /// the limit, and passes when the set it is counted under keeps the
+    /// ordinary slots where they were.
+    #[test]
+    fn a_proof_that_makes_a_members_slot_ordinary_needs_a_free_ordinary_slot() {
+        use crate::zakura::transport::{GatewayStanding, RankedGateway};
+        let (member, dialed) = (node(1), node(2));
+        let held = PreferredGateways::form(
+            [RankedGateway::resolved(
+                member,
+                1,
+                GatewayStanding::Connected,
+            )],
+            1,
+        );
+        let ambiguous = PreferredGateways::form(
+            [RankedGateway::resolved(member, 1, GatewayStanding::Connected).into_ambiguous()],
+            1,
+        );
+        let mut slots = ConnectionSlots::default();
+        assert_eq!(
+            slots.claim(member, true, 1, &held),
+            Ok(SlotClass::Preferred)
+        );
+        assert_eq!(
+            slots.claim(dialed, false, 1, &held),
+            Ok(SlotClass::Ordinary)
+        );
+
+        assert_eq!(
+            slots.settle_outbound(dialed, dialed, 1, &held, &ambiguous),
+            Err(SlotRefusal::Hold),
+            "the member's slot would be a second ordinary one"
+        );
+        assert_eq!(
+            slots.settle_outbound(dialed, dialed, 1, &held, &held),
+            Ok(())
+        );
+        assert_eq!(
+            slots.settle_outbound(dialed, dialed, 2, &held, &ambiguous),
+            Ok(())
+        );
+        assert_eq!(slots.of_node(&dialed).outbound, 1);
+    }
+
+    /// A caller fills a held place of its own while its proof makes another
+    /// gateway ambiguous. That gateway's member keeps its slot as an
+    /// ordinary one, which the ordinary limit has to allow, or the caller
+    /// is refused and no slot changes.
+    #[test]
+    fn a_caller_whose_proof_makes_a_members_slot_ordinary_needs_a_free_ordinary_slot() {
+        use crate::zakura::transport::{GatewayStanding, RankedGateway};
+        let (member, caller, peer, other) = (node(1), node(2), node(3), node(4));
+        // A third gateway keeps two places held when the member's gateway
+        // turns ambiguous, so the total limit doesn't refuse the caller.
+        let ranked = |member_gateway: RankedGateway| {
+            let caller_gateway = RankedGateway::resolved(caller, 2, GatewayStanding::Connected);
+            let other_gateway = RankedGateway::resolved(other, 1, GatewayStanding::Dialable);
+            PreferredGateways::form([member_gateway, caller_gateway, other_gateway], 2)
+        };
+        let member_gateway = RankedGateway::resolved(member, 3, GatewayStanding::Connected);
+        let held = ranked(member_gateway);
+        let disputed = ranked(member_gateway.into_ambiguous());
+        let mut slots = ConnectionSlots::default();
+        assert_eq!(slots.claim(peer, false, 1, &held), Ok(SlotClass::Ordinary));
+        assert_eq!(
+            slots.claim(member, true, 1, &held),
+            Ok(SlotClass::Preferred)
+        );
+
+        assert_eq!(
+            slots.claim(caller, true, 1, &disputed),
+            Ok(SlotClass::Preferred),
+            "the plain claim sees only the caller's own held place"
+        );
+        slots.release(caller, true);
+        assert_eq!(
+            slots.claim_under_new_ranking(caller, 1, &held, &disputed),
+            Err(SlotRefusal::Hold),
+            "the member's slot would be a second ordinary one"
+        );
+        assert_eq!(slots.of_node(&caller), SlotCount::default());
+        assert_eq!((slots.total(), slots.inbound()), (2, 1));
+
+        slots.release(peer, false);
+        assert_eq!(
+            slots.claim_under_new_ranking(caller, 1, &held, &disputed),
+            Ok(SlotClass::Preferred)
+        );
+        assert_eq!(
+            slots.split(&disputed),
+            SlotSplit {
+                preferred: 1,
+                ordinary: 1,
+                ordinary_inbound: 1,
             }
         );
     }

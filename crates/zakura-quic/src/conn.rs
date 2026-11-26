@@ -16,6 +16,7 @@ use zakura_rt::{
 };
 
 use crate::{
+    composite::COMPOSITE_KEY_TAGS,
     credential::NodeCredential,
     driver::{ConnCmd, ConnRef, ConnShared},
     key::{NodeId, NodeKey},
@@ -359,6 +360,29 @@ impl Conn {
     /// endpoint accepted.
     pub fn dialed_id(&self) -> Option<NodeId> {
         self.dialed_id
+    }
+
+    /// The earlier node IDs this handshake proves for the peer (TLS-7):
+    /// each ID, other than [`Self::remote_id`], that names a prefix of the
+    /// peer's key list which includes the keys the handshake was signed
+    /// with, held in full. At most [`crate::MAX_EARLIER_NODE_IDS`], shortest
+    /// list first.
+    ///
+    /// Every ID the peer had before it added keys is among them, as long as
+    /// it still signs with the keys that ID names. A peer adds keys only at
+    /// the end of its list (ID-8), so these are exactly those IDs, and only
+    /// the holder of the signing keys can prove any of them. The peer is the
+    /// node each of these IDs names, on a connection it opened as much as on
+    /// one it accepted. On a dial, the dialed ID is [`Self::remote_id`] or
+    /// one of these. An ID that the peer's key list only hashes to proves
+    /// nothing: it is listed only when the peer signed with the keys it
+    /// names.
+    pub fn remote_earlier_ids(&self) -> Vec<NodeId> {
+        let current = self.remote_id();
+        self.remote
+            .proven_ids(&COMPOSITE_KEY_TAGS)
+            .filter(|id| *id != current)
+            .collect()
     }
 
     /// The key list the peer proved in the TLS handshake: the list its node

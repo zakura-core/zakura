@@ -9,7 +9,9 @@
 use super::*;
 use zakura_chain::miner_mesh::GatewayId;
 
-use crate::zakura::{GatewayStanding, RankedGateway, SlotSplit, MAX_RANKED_GATEWAYS};
+use crate::zakura::{
+    GatewayPlace, GatewayStanding, ProvenNode, RankedGateway, SlotSplit, MAX_RANKED_GATEWAYS,
+};
 
 fn handler_from_config(config: &Config) -> ZakuraProtocolHandler {
     let limits = ZakuraLocalLimits::from_config(config);
@@ -79,6 +81,13 @@ fn ordinary(handler: &ZakuraProtocolHandler, inbound: bool) -> Result<(), SlotRe
 
 fn split(handler: &ZakuraProtocolHandler) -> SlotSplit {
     handler.supervisor.ip_slots.counts().slot_split()
+}
+
+/// Each ranked gateway's place, in rank order.
+fn places(handler: &ZakuraProtocolHandler) -> Vec<GatewayPlace> {
+    let counts = handler.supervisor.ip_slots.counts();
+    let places = counts.preferred_gateways().places();
+    places.map(|(_, place)| place).collect()
 }
 
 fn preferred_set(handler: &ZakuraProtocolHandler) -> Vec<NodeId> {
@@ -584,11 +593,60 @@ fn a_stale_connected_snapshot_cannot_restore_a_closed_dial() {
     assert_eq!(preferred_set(&handler), [other]);
 }
 
-/// A dial to a gateway's earlier node ID reaches the node under the ID it
-/// has now. The slot the dial took in the gateway's held place moves to that
-/// ID, where it is an ordinary one, and releases from there.
+/// Blocks name a gateway by the node ID it had before it added a key. A dial
+/// to that ID reaches the node under the ID it has now, which proved the
+/// earlier one. The slot the dial took in the gateway's held place moves to
+/// that ID and stays a preferred one, with the ordinary slots full, and
+/// releases from there.
 #[test]
-fn a_dial_that_reached_a_moved_gateway_gives_its_place_back() {
+fn a_dial_that_reached_a_moved_gateway_keeps_its_held_place() {
+    let handler = handler(40, 1);
+    let earlier = new_node();
+    let current = new_node();
+    let slots = |node: &NodeId| {
+        let counts = handler.supervisor.ip_slots.counts();
+        counts.node_connections(node).total()
+    };
+    publish(&handler, &[(earlier, GatewayStanding::Dialable)]);
+    let _peers = fill(&handler, 40, false);
+    let held = SlotSplit {
+        preferred: 1,
+        ordinary: 40,
+        ordinary_inbound: 0,
+    };
+    let mut dial = handler
+        .claim_connection(earlier, false)
+        .expect("held place");
+    assert_eq!(split(&handler), held);
+
+    dial.outbound_connected(ProvenNode::new(current, &[earlier]))
+        .expect("the node keeps the gateway's place");
+    assert_eq!((slots(&earlier), slots(&current)), (0, 1));
+    assert_eq!(split(&handler), held);
+    assert_eq!(preferred_set(&handler), [current]);
+    assert_eq!(places(&handler), [GatewayPlace::Preferred]);
+    // The next ranking still names the earlier ID. The proof outlives it.
+    publish(&handler, &[(earlier, GatewayStanding::Connected)]);
+    assert_eq!(preferred_set(&handler), [current]);
+    assert_eq!(split(&handler), held);
+
+    drop(dial);
+    assert_eq!((slots(&earlier), slots(&current)), (0, 0));
+    assert_eq!(split(&handler).preferred, 0);
+    assert!(preferred_set(&handler).is_empty());
+    // Nothing proves the earlier ID any more, so a ranking that still calls
+    // it connected holds the place for nobody.
+    publish(&handler, &[(earlier, GatewayStanding::Connected)]);
+    assert!(preferred_set(&handler).is_empty());
+    assert_eq!(places(&handler), [GatewayPlace::Backoff]);
+}
+
+/// A dial's slot is charged to the ID its node last answered with. When
+/// another node answers, one that doesn't prove that ID, the slot the dial
+/// took in the gateway's held place moves to the node's own ID, where it is
+/// an ordinary one, and releases from there.
+#[test]
+fn a_dial_answered_by_another_node_gives_its_place_back() {
     let handler = handler(40, 1);
     let earlier = new_node();
     let current = new_node();
@@ -619,13 +677,15 @@ fn a_dial_that_reached_a_moved_gateway_gives_its_place_back() {
     assert_eq!(split(&handler), SlotSplit::default());
 }
 
-/// A gateway that answers under another ID loses the held place its dial
-/// claimed, and with the ordinary slots full its slot has nowhere to go. The
-/// move is refused and the slot leaves with the dial. Were it allowed, one
-/// gateway could answer each dial under a new ID and turn every held place
-/// into an ordinary slot of its own, above the ordinary limit.
+/// A node that answers a dial without proving the ID the dial's slot was
+/// claimed for loses the held place the dial claimed, and with the ordinary
+/// slots full its slot has nowhere to go. The move is refused and the slot
+/// leaves with the dial. Were it allowed, one gateway could answer each dial
+/// under a new ID and turn every held place into an ordinary slot of its
+/// own, above the ordinary limit. Proving some other earlier ID changes
+/// nothing: only the gateway's own ID keeps its place.
 #[test]
-fn a_moved_gateway_takes_no_slot_above_the_ordinary_limit() {
+fn a_node_that_does_not_prove_the_gateways_id_takes_no_slot_above_the_ordinary_limit() {
     let handler = handler(40, 2);
     let earlier = new_node();
     let other = new_node();
@@ -640,15 +700,15 @@ fn a_moved_gateway_takes_no_slot_above_the_ordinary_limit() {
         ordinary_inbound: 0,
     };
 
-    for _ in 0..3 {
+    for unrelated in [&[][..], &[new_node()]] {
         publish(&handler, &ranking);
         let mut dial = handler
             .claim_connection(earlier, false)
             .expect("held place");
         assert_eq!(
-            dial.outbound_connected(new_node()),
+            dial.outbound_connected(ProvenNode::new(new_node(), unrelated)),
             Err(SlotRefusal::Hold),
-            "no ordinary slot is free for the ID the gateway answers with"
+            "no ordinary slot is free for the ID the node answers with"
         );
         assert_eq!(
             split(&handler),
@@ -658,11 +718,12 @@ fn a_moved_gateway_takes_no_slot_above_the_ordinary_limit() {
             },
             "a refused move leaves the slot where the dial claimed it"
         );
+        assert_eq!(preferred_set(&handler), [earlier, other]);
         drop(dial);
         assert_eq!(split(&handler), full);
     }
 
-    // With an ordinary slot free the node connects under its ID now, and
+    // With an ordinary slot free the node connects under its own ID, and
     // the other gateway still finds its held place.
     peers.pop();
     publish(&handler, &ranking);
@@ -680,6 +741,455 @@ fn a_moved_gateway_takes_no_slot_above_the_ordinary_limit() {
             ..full
         }
     );
+}
+
+/// One key holder answers dials to its gateway's earlier ID under a new ID
+/// each time, and every one of them proves the earlier ID. The first fills
+/// the gateway's one place. A second connected node makes the gateway
+/// ambiguous, so it fills no place and needs an ordinary slot, and it is
+/// refused while that would put the ordinary slots above their limit. The
+/// key holder never fills more than the one place, and the other gateway
+/// keeps its own.
+#[test]
+fn a_gateway_that_answers_under_successive_ids_holds_one_place_at_most() {
+    let handler = handler(40, 2);
+    let (earlier, other) = (new_node(), new_node());
+    let (first, second) = (new_node(), new_node());
+    let ranking = [
+        (earlier, GatewayStanding::Dialable),
+        (other, GatewayStanding::Dialable),
+    ];
+    publish(&handler, &ranking);
+    let mut peers = fill(&handler, 40, false);
+    let one_held = SlotSplit {
+        preferred: 1,
+        ordinary: 40,
+        ordinary_inbound: 0,
+    };
+
+    let mut dial = handler
+        .claim_connection(earlier, false)
+        .expect("held place");
+    dial.outbound_connected(ProvenNode::new(first, &[earlier]))
+        .expect("the first node keeps the gateway's place");
+    assert_eq!(split(&handler), one_held);
+    assert_eq!(preferred_set(&handler), [first, other]);
+
+    // The next dial is charged to the earlier ID or to the ID the node
+    // last answered with. Neither is a free held place any more.
+    for charged in [earlier, first] {
+        assert_eq!(
+            handler.claim_connection(charged, false).map(drop),
+            Err(SlotRefusal::Hold)
+        );
+    }
+
+    // With one ordinary slot free the dial starts, and the node answers
+    // under a second ID. That makes the gateway ambiguous, which would turn
+    // the first node's slot into a 41st ordinary one.
+    peers.pop();
+    let mut again = handler
+        .claim_connection(first, false)
+        .expect("an ordinary slot is free");
+    assert_eq!(
+        again.outbound_connected(ProvenNode::new(second, &[earlier])),
+        Err(SlotRefusal::Hold)
+    );
+    assert_eq!(split(&handler), one_held, "the refusal changed nothing");
+    assert_eq!(preferred_set(&handler), [first, other]);
+    drop(again);
+
+    // With two free, both nodes hold ordinary slots and the gateway holds
+    // no place. The slots never pass the ordinary limit.
+    peers.pop();
+    let mut again = handler
+        .claim_connection(first, false)
+        .expect("an ordinary slot is free");
+    again
+        .outbound_connected(ProvenNode::new(second, &[earlier]))
+        .expect("both nodes fit in the ordinary slots");
+    let both_ordinary = SlotSplit {
+        preferred: 0,
+        ordinary: 40,
+        ordinary_inbound: 0,
+    };
+    assert_eq!(split(&handler), both_ordinary);
+    assert_eq!(preferred_set(&handler), [other]);
+    assert_eq!(
+        places(&handler),
+        [GatewayPlace::Ambiguous, GatewayPlace::Preferred]
+    );
+    // A new ranking reads the same two connections the same way.
+    publish(&handler, &ranking);
+    assert_eq!(split(&handler), both_ordinary);
+    assert_eq!(preferred_set(&handler), [other]);
+    let _other = handler.claim_connection(other, false).expect("held place");
+    assert_eq!(
+        split(&handler),
+        SlotSplit {
+            preferred: 1,
+            ..both_ordinary
+        }
+    );
+
+    // Once the first node leaves, the second is the gateway's one node.
+    drop(dial);
+    publish(&handler, &ranking);
+    assert_eq!(preferred_set(&handler), [second, other]);
+    assert_eq!(
+        split(&handler),
+        SlotSplit {
+            preferred: 2,
+            ordinary: 38,
+            ordinary_inbound: 0,
+        }
+    );
+}
+
+/// A gateway that added a key calls in under its new ID, which proves the
+/// ID blocks still name it by. It takes the gateway's held place past a full
+/// inbound share and ordinary limit, as a caller with the exact ID does. A
+/// caller that proves another ID, or none, is an ordinary one.
+#[test]
+fn a_moved_gateway_calls_in_to_its_held_place() {
+    let rankings: [fn(NodeId) -> RankedGateway; 2] = [
+        |earlier| RankedGateway::resolved(earlier, 1, GatewayStanding::Dialable),
+        |earlier| RankedGateway::unresolved(GatewayId::from_node_id(earlier.as_bytes()), 1),
+    ];
+    for ranked in rankings {
+        let handler = handler(40, 1);
+        let (earlier, current) = (new_node(), new_node());
+        handler.publish_gateway_ranking([ranked(earlier)]);
+        let _inbound = fill(&handler, 30, true);
+        let _dials = fill(&handler, 10, false);
+        assert!(ordinary(&handler, true).is_err());
+
+        for unproven in [
+            ProvenNode::from(current),
+            ProvenNode::new(current, &[new_node()]),
+        ] {
+            assert!(handler.claim_slot(unproven, true).is_err());
+            assert!(preferred_set(&handler).iter().all(|node| *node == earlier));
+        }
+        let caller = handler
+            .claim_slot(ProvenNode::new(current, &[earlier]), true)
+            .expect("the gateway's held place");
+        assert_eq!(
+            split(&handler),
+            SlotSplit {
+                preferred: 1,
+                ordinary: 40,
+                ordinary_inbound: 30,
+            }
+        );
+        assert_eq!(preferred_set(&handler), [current]);
+
+        drop(caller);
+        assert_eq!(split(&handler).preferred, 0);
+        assert!(preferred_set(&handler).is_empty());
+    }
+}
+
+/// A dial to a gateway's earlier ID is in flight and holds the gateway's
+/// place when the gateway calls in under its new ID. The call is a second
+/// slot for the one gateway, so it needs an ordinary slot, as a call from
+/// the exact ID would. When the dial lands, the node holds the place with
+/// one slot and an ordinary slot with the other.
+#[test]
+fn a_moved_gateway_that_calls_in_during_a_dial_to_it_takes_no_second_place() {
+    let handler = handler(40, 1);
+    let (earlier, current) = (new_node(), new_node());
+    let proved = [earlier];
+    let caller = ProvenNode::new(current, &proved);
+    publish(&handler, &[(earlier, GatewayStanding::Dialable)]);
+    let mut peers = fill(&handler, 40, false);
+    let mut dial = handler
+        .claim_connection(earlier, false)
+        .expect("held place");
+
+    assert!(
+        handler.claim_slot(caller, true).is_err(),
+        "the dial holds the gateway's one place"
+    );
+    assert_eq!(preferred_set(&handler), [earlier]);
+    peers.pop();
+    let _call = handler
+        .claim_slot(caller, true)
+        .expect("an ordinary slot is free");
+    let one_held = SlotSplit {
+        preferred: 1,
+        ordinary: 40,
+        ordinary_inbound: 1,
+    };
+    assert_eq!(split(&handler), one_held);
+    assert_eq!(preferred_set(&handler), [earlier]);
+    // A new ranking leaves the place with the dial too.
+    publish(&handler, &[(earlier, GatewayStanding::Dialing)]);
+    assert_eq!(preferred_set(&handler), [earlier]);
+    assert_eq!(split(&handler), one_held);
+
+    dial.outbound_connected(caller)
+        .expect("the node keeps the place its dial held");
+    assert_eq!(preferred_set(&handler), [current]);
+    assert_eq!(
+        split(&handler),
+        SlotSplit {
+            preferred: 1,
+            ordinary: 40,
+            ordinary_inbound: 0,
+        }
+    );
+}
+
+/// Cancelling the old-ID dial gives its place to the already connected
+/// gateway before discovery publishes another ranking.
+#[test]
+fn cancelling_a_dial_gives_its_place_to_the_connected_moved_gateway() {
+    let handler = handler(40, 1);
+    let (earlier, current) = (new_node(), new_node());
+    publish(&handler, &[(earlier, GatewayStanding::Dialable)]);
+    let dial = handler
+        .claim_connection(earlier, false)
+        .expect("held place");
+    let _inbound = handler
+        .claim_slot(ProvenNode::new(current, &[earlier]), true)
+        .expect("the gateway fits in an ordinary slot while the dial holds its place");
+    assert_eq!(preferred_set(&handler), [earlier]);
+    assert_eq!(split(&handler).ordinary_inbound, 1);
+
+    drop(dial);
+
+    assert_eq!(preferred_set(&handler), [current]);
+    assert_eq!(
+        split(&handler),
+        SlotSplit {
+            preferred: 1,
+            ordinary: 0,
+            ordinary_inbound: 0,
+        }
+    );
+}
+
+/// The node with a gateway's exact ID and a node that proved that ID as an
+/// earlier one are both connected, in either order: one key holder runs two
+/// nodes. The second is refused while the ordinary slots are full, and the
+/// first keeps the place. With room for it the gateway is ambiguous and
+/// holds no place, so the key holder never fills more than one.
+#[test]
+fn the_exact_id_and_a_node_that_proved_it_share_one_place_at_most() {
+    for exact_first in [true, false] {
+        let handler = handler(40, 1);
+        let (earlier, current) = (new_node(), new_node());
+        let exact = ProvenNode::from(earlier);
+        let proved = [earlier];
+        let moved = ProvenNode::new(current, &proved);
+        let (first, second) = if exact_first {
+            (exact, moved)
+        } else {
+            (moved, exact)
+        };
+        publish(&handler, &[(earlier, GatewayStanding::Dialable)]);
+        let mut peers = fill(&handler, 40, false);
+
+        let _first = handler.claim_slot(first, true).expect("held place");
+        assert_eq!(preferred_set(&handler), [first.id()]);
+        assert!(
+            handler.claim_slot(second, true).is_err(),
+            "the second node needs an ordinary slot"
+        );
+        assert_eq!(
+            preferred_set(&handler),
+            [first.id()],
+            "the refusal restored the set"
+        );
+        assert_eq!(split(&handler).preferred, 1);
+
+        // One free slot is not enough: the first node's slot becomes an
+        // ordinary one too.
+        peers.pop();
+        assert!(handler.claim_slot(second, true).is_err());
+        assert_eq!(preferred_set(&handler), [first.id()]);
+        peers.pop();
+        let _second = handler
+            .claim_slot(second, true)
+            .expect("both fit in the ordinary slots");
+        assert!(preferred_set(&handler).is_empty());
+        assert_eq!(places(&handler), [GatewayPlace::Ambiguous]);
+        assert_eq!(
+            split(&handler),
+            SlotSplit {
+                preferred: 0,
+                ordinary: 40,
+                ordinary_inbound: 2,
+            }
+        );
+        publish(&handler, &[(earlier, GatewayStanding::Connected)]);
+        assert!(preferred_set(&handler).is_empty());
+        assert_eq!(split(&handler).preferred, 0);
+    }
+}
+
+/// One key holder runs the node with a gateway's exact ID and a second node
+/// that proved that ID, and blocks name the second node's own gateway ID as
+/// well. The second node calls in: it fills its own gateway's place, and its
+/// proof makes the first gateway ambiguous, which would leave the first
+/// node's slot an ordinary one above the limit. The call is refused and
+/// nothing changes, as a dial that reached that node would be. With an
+/// ordinary slot free for the first node, the call is granted.
+#[test]
+fn a_caller_that_makes_another_gateway_ambiguous_adds_no_slot_above_the_ordinary_limit() {
+    assert_disputed_gateway_limit(40, false, SlotRefusal::Hold);
+}
+
+/// Reclassifying an existing inbound gateway must also leave the outbound reserve free.
+#[test]
+fn a_gateway_proof_preserves_the_ordinary_inbound_share() {
+    assert_disputed_gateway_limit(
+        without_outbound_reserve(40),
+        true,
+        SlotRefusal::InboundShare,
+    );
+}
+
+fn assert_disputed_gateway_limit(peer_count: usize, inbound: bool, refusal: SlotRefusal) {
+    let handler = handler(40, 2);
+    let (exact, second, other) = (new_node(), new_node(), new_node());
+    let proved = [exact];
+    let caller = ProvenNode::new(second, &proved);
+    let ranking = [
+        (exact, GatewayStanding::Dialable),
+        (second, GatewayStanding::Dialable),
+        (other, GatewayStanding::Dialable),
+    ];
+    publish(&handler, &ranking);
+    let mut peers = fill(&handler, peer_count, inbound);
+    let _exact = handler.claim_connection(exact, true).expect("held place");
+    let one_held = SlotSplit {
+        preferred: 1,
+        ordinary: peer_count,
+        ordinary_inbound: if inbound { peer_count } else { 0 },
+    };
+    assert_eq!(split(&handler), one_held);
+    assert_eq!(preferred_set(&handler), [exact, second]);
+
+    assert_eq!(handler.claim_slot(caller, true).map(drop), Err(refusal));
+    assert_eq!(split(&handler), one_held, "the refusal changed nothing");
+    assert_eq!(preferred_set(&handler), [exact, second]);
+    // A dial that reached the second node meets the same limit.
+    let mut dial = handler
+        .claim_connection(second, false)
+        .expect("the second gateway's held place");
+    assert_eq!(dial.outbound_connected(caller), Err(refusal));
+    assert_eq!(preferred_set(&handler), [exact, second]);
+    drop(dial);
+    assert_eq!(split(&handler), one_held);
+    assert_eq!(
+        preferred_set(&handler),
+        [exact, other],
+        "the closed dial enters backoff"
+    );
+
+    peers.pop();
+    let _second = handler
+        .claim_slot(caller, true)
+        .expect("the first node's slot fits in the ordinary slots");
+    assert_eq!(
+        split(&handler),
+        SlotSplit {
+            preferred: 1,
+            ordinary: peer_count,
+            ordinary_inbound: if inbound { peer_count } else { 1 },
+        }
+    );
+    assert_eq!(preferred_set(&handler), [second, other]);
+    assert_eq!(
+        places(&handler),
+        [
+            GatewayPlace::Ambiguous,
+            GatewayPlace::Preferred,
+            GatewayPlace::Preferred
+        ]
+    );
+}
+
+/// While blocks name a node by its earlier ID and by the ID it has now, two
+/// ranked gateways name the one connected node. It fills one place with its
+/// one slot, and the slot counts never disagree with the slots held.
+#[test]
+fn a_node_that_two_ranked_gateways_name_fills_one_place() {
+    let handler = handler(40, 3);
+    let (earlier, current, other) = (new_node(), new_node(), new_node());
+    let ranking = [
+        (earlier, GatewayStanding::Dialable),
+        (current, GatewayStanding::Dialable),
+        (other, GatewayStanding::Dialable),
+    ];
+    publish(&handler, &ranking);
+    assert_eq!(hold(&handler), 3);
+    let _peers = fill(&handler, 40, false);
+
+    let _caller = handler
+        .claim_slot(ProvenNode::new(current, &[earlier]), true)
+        .expect("held place");
+    assert_eq!(
+        hold(&handler),
+        2,
+        "one place for the node, one for the other"
+    );
+    assert_eq!(preferred_set(&handler), [current, other]);
+    assert_eq!(
+        split(&handler),
+        SlotSplit {
+            preferred: 1,
+            ordinary: 40,
+            ordinary_inbound: 0,
+        }
+    );
+    publish(&handler, &ranking);
+    assert_eq!(preferred_set(&handler), [current, other]);
+    assert_eq!(split(&handler).preferred, 1);
+    assert_eq!(ordinary(&handler, false), Err(SlotRefusal::Hold));
+    let _other = handler.claim_connection(other, false).expect("held place");
+    assert_eq!(ordinary(&handler, false), Err(SlotRefusal::Full));
+}
+
+/// A ranking is formed from discovery's snapshot, which knows a moved
+/// gateway by its earlier ID. Publication resolves the gateway to the
+/// connected node that proved that ID, whatever standing the snapshot gave
+/// it, and to nobody once that node's proved slot is gone.
+#[test]
+fn publication_resolves_a_gateway_to_the_owner_that_proved_its_earlier_id() {
+    for inbound in [true, false] {
+        for standing in [
+            GatewayStanding::Connected,
+            GatewayStanding::Dialable,
+            GatewayStanding::Backoff,
+        ] {
+            let handler = handler(40, 1);
+            let (earlier, current) = (new_node(), new_node());
+            let proved = [earlier];
+            let node = ProvenNode::new(current, &proved);
+            let slot = if inbound {
+                handler.claim_slot(node, true).expect("an ordinary slot")
+            } else {
+                let mut dial = handler.claim_connection(current, false).expect("a slot");
+                dial.outbound_connected(node).expect("the same node");
+                dial
+            };
+            assert!(preferred_set(&handler).is_empty(), "no gateway is ranked");
+
+            publish(&handler, &[(earlier, standing)]);
+            assert_eq!(preferred_set(&handler), [current]);
+            assert_eq!(split(&handler).preferred, 1);
+
+            // An unproved dial to the node holds no proof of its own.
+            let _pending = handler.claim_connection(current, false).expect("a slot");
+            drop(slot);
+            publish(&handler, &[(earlier, standing)]);
+            assert!(!preferred_set(&handler).contains(&current));
+            assert_eq!(split(&handler).preferred, 0);
+        }
+    }
 }
 
 /// An authenticated owner at the truncation boundary beats its equally scored peers,
@@ -738,6 +1248,89 @@ fn a_ranked_caller_displaces_a_connected_member() {
         }
     );
     assert_eq!(handler.supervisor.ip_slots.counts().connections(), 46);
+}
+
+/// A promotion can displace a connected inbound gateway only when its
+/// connection fits in the ordinary inbound share.
+#[test]
+fn gateway_promotion_preserves_the_ordinary_inbound_share() {
+    let ranked_id = new_node();
+    let moved_id = new_node();
+    let earlier = [ranked_id];
+    for caller in [ranked_id.into(), ProvenNode::new(moved_id, &earlier)] {
+        let handler = handler(4, 1);
+        let incumbent = new_node();
+        publish(
+            &handler,
+            &[
+                (ranked_id, GatewayStanding::Backoff),
+                (incumbent, GatewayStanding::Dialable),
+            ],
+        );
+        let _incumbent = handler
+            .claim_connection(incumbent, true)
+            .expect("held place");
+        let mut peers = fill(&handler, 3, true);
+        let before = split(&handler);
+
+        assert_eq!(
+            handler.claim_slot(caller, true).map(drop),
+            Err(SlotRefusal::InboundShare)
+        );
+        assert_eq!(split(&handler), before);
+        assert_eq!(preferred_set(&handler), [incumbent]);
+
+        peers.pop();
+        let _caller = handler
+            .claim_slot(caller, true)
+            .expect("the incumbent fits in the inbound share");
+        assert_eq!(preferred_set(&handler), [caller.id()]);
+        assert_eq!(split(&handler), before);
+    }
+}
+
+/// The higher-ranked gateway can authenticate and stay connected outbound
+/// while an inbound incumbent needs the held place. A ranking publication
+/// and a ranked dial's cancellation must respect the same inbound share.
+#[test]
+fn a_connected_gateway_waits_for_room_to_promote_its_outbound_slot() {
+    let handler = handler(8, 1);
+    let (higher, incumbent, pending) = (new_node(), new_node(), new_node());
+    let ranking = [
+        (higher, GatewayStanding::Backoff),
+        (incumbent, GatewayStanding::Dialable),
+        (pending, GatewayStanding::Dialable),
+    ];
+    publish(&handler, &ranking);
+    let _incumbent = handler.claim_connection(incumbent, true).unwrap();
+    let mut peers = fill(&handler, 6, true);
+    let pending_dial = handler.claim_connection(pending, false).unwrap();
+    let current = new_node();
+    let mut dial = handler.claim_connection(higher, false).unwrap();
+    dial.outbound_connected(ProvenNode::new(current, &[higher]))
+        .expect("the gateway can keep its ordinary outbound slot");
+    let check = || {
+        assert_eq!(preferred_set(&handler), [incumbent]);
+        assert_eq!(split(&handler).ordinary_inbound, 6);
+        assert_eq!(
+            handler
+                .supervisor
+                .ip_slots
+                .counts()
+                .node_connections(&current)
+                .outbound,
+            1
+        );
+    };
+    check();
+    publish(&handler, &ranking);
+    check();
+    drop(pending_dial);
+    check();
+
+    peers.pop();
+    assert_eq!(preferred_set(&handler), [current]);
+    assert_eq!(split(&handler).ordinary_inbound, 6);
 }
 
 /// A ranked caller that already holds a slot re-forms the set, but its

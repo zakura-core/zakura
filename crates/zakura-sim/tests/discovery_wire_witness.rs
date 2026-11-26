@@ -248,39 +248,43 @@ fn over_owed_at_its_cap(scenario: &WireScenario, report: &RunReport) {
     let cap = peers.payload.min() + LIMIT * MAX_NODE_RECORD_BYTES;
     assert!(cap < peers.payload.max(), "{cap}");
     let entries = report.log.entries();
-    let (connection, seq) = entries
+    let (connection, stream, seq) = entries
         .iter()
         .find_map(|entry| match &entry.obs {
             Observation::PeerFrame {
                 connection,
-                quic_stream: Some(_),
+                quic_stream: Some(stream),
                 seq,
                 row: Some(row),
                 label: Label::OverOwed,
                 ..
-            } if row == DiscoveryRow::Peers.name() => Some((*connection, *seq)),
+            } if row == DiscoveryRow::Peers.name() => Some((*connection, *stream, *seq)),
             _ => None,
         })
         .expect("the act's Peers is over-owed");
-    let read = entries.iter().find_map(|entry| match &entry.obs {
+    let mut events = entries.iter();
+    let read = events.find_map(|entry| match &entry.obs {
         Observation::Transport {
             connection: Some(on),
             event:
                 TransportFact::HeaderRead {
+                    quic_stream,
                     seq: read,
                     message_type,
                     payload_len,
                     ..
                 },
             ..
-        } if (*on, *read, *message_type) == (connection, seq, u16::from(MSG_DISCOVERY_PEERS)) => {
+        } if (*on, *quic_stream, *read, *message_type)
+            == (connection, stream, seq, u16::from(MSG_DISCOVERY_PEERS)) =>
+        {
             Some(*payload_len)
         }
         _ => None,
     });
     // A u32 fits usize on every supported target.
     assert_eq!(read.map(|len| len as usize), Some(cap + 1));
-    let close = entries.iter().find_map(|entry| match &entry.obs {
+    let close = events.find_map(|entry| match &entry.obs {
         Observation::ConnectionClosed {
             connection: on,
             cause,

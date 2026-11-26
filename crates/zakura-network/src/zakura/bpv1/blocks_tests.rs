@@ -2145,6 +2145,88 @@ fn bpv1_57_fallback_blocks_yield_to_a_new_block_at_the_cap() {
     assert_eq!(table.block_phase(&h(60)), Some(BlockPhase::Retired));
 }
 
+/// mem-5: the `Propagation` reserve funds one assembled block per concurrent
+/// block until its verdict. A block retired while its verdict is owed still
+/// holds its assembled lease, so it keeps its slot from peer blocks until
+/// the verdict arrives. A local solve assembles nothing and still admits.
+#[test]
+fn mem5_a_retired_block_keeps_its_slot_until_its_verdict() {
+    let now = Instant::now();
+    let encoded = encode_body(&Profile::TINY, &[0x56; 128], 2).unwrap();
+    let mut cfg = BlockConfig::for_profile(Profile::TINY);
+    cfg.max_concurrent_blocks = 1;
+    let mut table = BlockTable::new(cfg);
+    let verifying = block::Hash([0x71; 32]);
+    admit(
+        &mut table,
+        now,
+        verifying,
+        encoded.coding,
+        encoded.part_root,
+    );
+    let (verify, _) = assemble(&mut table, now, verifying, &encoded);
+
+    // A local solve takes the only slot and retires the verifying block.
+    let solved = block::Hash([0x72; 32]);
+    table.step(
+        now,
+        BlockInput::BlockAdmittedLocal {
+            height: 2,
+            envelope: make_envelope(solved, encoded.coding, encoded.part_root, node_id(1)),
+            parts: encoded.parts.clone(),
+        },
+    );
+    assert_eq!(table.block_phase(&verifying), Some(BlockPhase::Retired));
+    assert_eq!(table.block_phase(&solved), Some(BlockPhase::Done));
+
+    // The retired block's verdict is owed, so a peer block finds no slot.
+    let peer_block = || {
+        make_envelope(
+            block::Hash([0x73; 32]),
+            encoded.coding,
+            encoded.part_root,
+            node_id(1),
+        )
+    };
+    let try_admit = |table: &mut BlockTable| {
+        let received = receive(table, now, peer_block());
+        let admitted = header_result(
+            table,
+            now,
+            &received,
+            HeaderAdmissionResult::Admitted {
+                height: 3,
+                parent_hash: TEST_TIP_HASH,
+            },
+        );
+        commitment_ok(table, now, &admitted)
+    };
+    let refused = try_admit(&mut table);
+    assert!(
+        !refused
+            .events
+            .iter()
+            .any(|e| matches!(e, BlockEvent::BlockAdmitted { .. })),
+        "an owed verdict holds the slot"
+    );
+    table.assert_invariants();
+
+    // The verdict frees the slot.
+    table.step(
+        now,
+        BlockInput::VerifierVerdict {
+            work_id: verify,
+            block_id: verifying,
+            verdict: VerifierVerdict::Valid,
+        },
+    );
+    let admitted = try_admit(&mut table);
+    assert!(admitted.events.contains(&BlockEvent::BlockAdmitted {
+        block_id: block::Hash([0x73; 32])
+    }));
+    table.assert_invariants();
+}
+
 /// A Valid verdict is terminal over a late failed stripe check: the block
 /// starts no fallback and no second verification (bpv1-44). The failed check
 /// still stops coded propagation (bpv1-41), so the encoding retires and its
@@ -2248,6 +2330,102 @@ fn bpv1_2_reused_encoding_keeps_c_and_each_solve_finds_its_light_client_root() {
         &paths,
     );
     assert!(unknown.outputs.is_empty());
+}
+
+/// A failed encode ends the body's pending entry. Its templates get no
+/// commitment, a late completion for it is stale, and the next template for
+/// the body starts a fresh encode instead of joining the dead one.
+#[test]
+fn failed_encode_lets_the_next_template_for_its_body_encode() {
+    let body = vec![0x66; 128];
+    let body_identity = compute_body_identity(2, &body);
+    let mut proposer = ProposerState::new(ProposerConfig::new([0x33; 32], node_id(1)));
+    let build = |proposer: &mut ProposerState, id: u64| {
+        proposer.step(ProposerInput::TemplateBuilt {
+            template_id: TemplateId(id),
+            body_identity,
+            light_client_root: [0; 32],
+        })
+    };
+
+    let first = start_encode(&build(&mut proposer, 1).outputs).expect("a new body encodes");
+    assert!(
+        build(&mut proposer, 2).outputs.is_empty(),
+        "a template for the same body joins the encode"
+    );
+    let failed = proposer.step(ProposerInput::EncodeFailed { work_id: first });
+    assert!(
+        failed.outputs.is_empty(),
+        "the failed encode commits nothing"
+    );
+    let late = proposer.step(ProposerInput::EncodeDone {
+        work_id: first,
+        encoded: encode_body(&Profile::TINY, &body, 2).unwrap(),
+    });
+    assert!(
+        late.outputs.is_empty(),
+        "a completion after the failure is stale"
+    );
+    assert_eq!(proposer.prepared_bytes(), 0);
+
+    let retry = start_encode(&build(&mut proposer, 3).outputs)
+        .expect("the next template starts a fresh encode");
+    let done = proposer.step(ProposerInput::EncodeDone {
+        work_id: retry,
+        encoded: encode_body(&Profile::TINY, &body, 2).unwrap(),
+    });
+    let committed: Vec<TemplateId> = done
+        .outputs
+        .iter()
+        .filter_map(|o| match o {
+            ProposerOutput::SetCommitment { template_id, .. } => Some(*template_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        committed,
+        [TemplateId(3)],
+        "only the retry's template commits"
+    );
+}
+
+/// mem-5: the `Propagation` reserve funds `MAX_PREPARED_ENCODINGS` encodes
+/// in flight. A template for another body gets no encode until one of them
+/// ends, so the shell never holds more encode leases than the reserve covers.
+#[test]
+fn mem5_encodes_in_flight_stay_within_the_reserve() {
+    let mut proposer = ProposerState::new(ProposerConfig::new([0x44; 32], node_id(1)));
+    let build = |proposer: &mut ProposerState, body: u8| {
+        proposer.step(ProposerInput::TemplateBuilt {
+            template_id: TemplateId(u64::from(body)),
+            body_identity: compute_body_identity(2, &[body; 128]),
+            light_client_root: [0; 32],
+        })
+    };
+    let max = u8::try_from(MAX_PREPARED_ENCODINGS).unwrap();
+    let in_flight: Vec<WorkId> = (0..max)
+        .map(|body| start_encode(&build(&mut proposer, body).outputs).expect("room to encode"))
+        .collect();
+    assert!(
+        build(&mut proposer, max).outputs.is_empty(),
+        "a body past the bound gets no encode"
+    );
+
+    proposer.step(ProposerInput::EncodeFailed {
+        work_id: in_flight[0],
+    });
+    assert!(
+        start_encode(&build(&mut proposer, max).outputs).is_some(),
+        "an ended encode frees its place"
+    );
+}
+
+/// The work id of the `StartEncode` in `outputs`, if any.
+fn start_encode(outputs: &[ProposerOutput]) -> Option<WorkId> {
+    outputs.iter().find_map(|o| match o {
+        ProposerOutput::StartEncode { work_id } => Some(*work_id),
+        _ => None,
+    })
 }
 
 /// A proposer that built template 1 for `body` under `light_client_root`

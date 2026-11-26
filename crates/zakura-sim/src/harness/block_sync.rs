@@ -27,7 +27,11 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-use zakura_network::zakura::{block_sync_serving_limit, block_sync_streams, ZakuraBlockSyncConfig};
+use zakura_network::zakura::{
+    block_sync_serving_limit, block_sync_streams,
+    memory::{ByteSize, Consumer, MemoryPlan, MemoryPool},
+    BlockSyncMemory, ZakuraBlockSyncConfig,
+};
 use zakura_scheduler::{At, SchedulerConfig, TaskId};
 use zakura_storage::{
     block::{
@@ -49,12 +53,14 @@ use super::{
         NodeStorage, Policy, PolicySource, Topology, PROBE,
     },
     header_sync::{check_service_operation_ids, Dialer},
+    pool_tap::PoolTap,
     ScenarioFamily, Subsystem,
 };
 use crate::{
     domain::{
         block_sync::{resource_properties, Limits, OwnerModel, OwnerView},
         block_sync_semantic::{semantic_properties, SemanticModel, SemanticView},
+        memory_pool::{self, PoolGaugeModel, PoolView},
     },
     property::{
         Capture, CheckCtx, HasView, Kind, Property, PropertyId, Source, Sources, Status, Verdict,
@@ -176,6 +182,11 @@ pub struct BlockScenario {
     /// unset, so earlier scenarios keep their digests.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drain_steps: Option<u64>,
+    /// Optional logical P2P memory budget `B` in bytes for the node's memory
+    /// pool (`None` uses the simulator default of 16 GiB). Left out of JSON
+    /// when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_budget_bytes: Option<u64>,
 }
 
 /// Pauses each routine that hands a body to the sequencer, after the send
@@ -233,6 +244,7 @@ impl Default for BlockScenario {
             sequencer_pause: None,
             sessions: false,
             drain_steps: None,
+            memory_budget_bytes: None,
         }
     }
 }
@@ -575,6 +587,8 @@ pub struct Storage {
     /// The nodes and links. They live until the run ends, so no reactor sees
     /// its inputs close unless a `Teardown` step drops the node's.
     _topology: Rc<Topology>,
+    /// Keeps the node's memory pool (and its observer) alive across teardown.
+    _memory_pool: MemoryPool,
 }
 
 impl HasView for Storage {
@@ -711,7 +725,6 @@ impl Subsystem for Storage {
             .chain([scenario.body_bytes])
             .max()
             .map_or(0, u64::from);
-        let workers = storage_config(scenario).scheduler.workers;
         // The node holds its first `node_bodies` bodies committed, so its
         // verified tip starts at the last of them.
         let verified_tip = scenario
@@ -719,7 +732,7 @@ impl Subsystem for Storage {
             .checked_sub(1)
             .and_then(|last| ports.chain.get(usize::try_from(last).ok()?))
             .map_or(0, |block| block.height.0);
-        let limits = Limits::of(&config, workers, largest_body);
+        let limits = Limits::of(&config, largest_body);
         // With one body per request, a revocation takes a request's only
         // height, so the routine retires the whole request. With more, a
         // request can lose some heights and keep the rest
@@ -733,6 +746,29 @@ impl Subsystem for Storage {
         ports.view.borrow_mut().owners = OwnerModel::new(limits, verified_tip);
         let view = ports.view.clone();
         view.borrow().semantic.borrow_mut().set_limit(&config);
+        let mut net_config = zakura_network::Config {
+            network: ports.fixture.headers().network().clone(),
+            ..zakura_network::Config::default()
+        };
+        net_config.zakura.block_sync = config.clone();
+        if let Some(look_ahead) = scenario.max_reorder_lookahead_bytes {
+            net_config.zakura.memory_budget.caps.look_ahead = Some(ByteSize(look_ahead));
+        }
+        let budget_b = scenario
+            .memory_budget_bytes
+            .unwrap_or(super::sync::DEFAULT_SIM_MEMORY_BUDGET_B);
+        let memory_plan =
+            MemoryPlan::size_for_node(budget_b, &net_config, &net_config.network, None, &[])
+                .expect("block-sync/storage memory plan fits");
+        *view.borrow().pool.borrow_mut() = PoolGaugeModel::new(
+            memory_plan.pool_config.consumers[Consumer::Sessions.index()].floor,
+            memory_plan.override_warnings.is_empty(),
+        );
+        let (pool_observer, pool_tap) =
+            PoolTap::new(sim, "node", view.borrow().pool.clone(), Some(view.clone()));
+        let memory_pool = memory_plan.build_pool().with_observer(Some(pool_observer));
+        let pool_tap = pool_tap
+            .with_draining_block_receive_bytes(memory_pool.draining_block_receive_bytes_atomic());
         let (observer, mut tap) = BlockTap::new(sim, &ports.service, "node", view.clone());
         let wire = Wire::new(block_sync_serving_limit(&config));
         tap.label_with(wire.clone());
@@ -761,11 +797,14 @@ impl Subsystem for Storage {
         let storage = storage.with_tap(tap);
         let predicates = storage.predicates();
         sim.add_source(Box::new(storage));
+        sim.add_source(Box::new(pool_tap));
         sim.add_source(Box::new(MirrorReadSource::new(
             ports.reads.clone(),
             predicates.clone(),
         )));
-        let mut nodes = vec![BlockNode::spawn(
+        let block_memory =
+            BlockSyncMemory::new(memory_pool.clone(), scenario.max_reorder_lookahead_bytes);
+        let mut nodes = vec![BlockNode::spawn_with_memory(
             sim,
             "node",
             1,
@@ -776,6 +815,7 @@ impl Subsystem for Storage {
             },
             config,
             Some(observer),
+            Some(block_memory),
         )];
         sessions.watch(
             nodes[0]
@@ -819,15 +859,21 @@ impl Subsystem for Storage {
             view,
             replies,
             _topology: topology,
+            _memory_pool: memory_pool,
         }
     }
 
     /// [`storage_properties`], [`table_wiring_properties`], the resource
-    /// properties, then the [semantic properties](semantic_properties).
+    /// properties, the pool gauge properties, then the
+    /// [semantic properties](semantic_properties).
     fn properties() -> Vec<Property<Self>> {
         let mut properties = storage_properties();
         properties.extend(table_wiring_properties());
         properties.extend(resource_properties());
+        properties.push(memory_pool::pool_bounded());
+        properties.push(memory_pool::tip_never_waits());
+        properties.push(memory_pool::consensus_once_per_height());
+        properties.push(memory_pool::teardown_returns_zero());
         properties.extend(semantic_properties());
         properties
     }
@@ -926,7 +972,7 @@ impl TaskHold for PausedHandoffs {
         }
         let view = self.view.borrow();
         let step = view.step.unwrap_or(0);
-        let past = view.owners.reserved() > view.owners.limits.reserved_bound(0);
+        let past = view.owners.reserved() > view.owners.limits.pause_bound();
         let expired = self
             .first
             .get()
@@ -993,6 +1039,13 @@ impl SemanticView for Rc<RefCell<BlockSyncView>> {
 impl OwnerView for Rc<RefCell<BlockSyncView>> {
     fn read_owners<T>(&self, read: impl FnOnce(&OwnerModel) -> T) -> T {
         read(&self.borrow().owners)
+    }
+}
+
+/// The pool gauge properties read the pool model in the node's view.
+impl PoolView for Rc<RefCell<BlockSyncView>> {
+    fn read_pool<T>(&self, read: impl FnOnce(&PoolGaugeModel) -> T) -> T {
+        read(&self.borrow().pool.borrow())
     }
 }
 

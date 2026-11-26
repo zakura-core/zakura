@@ -40,9 +40,6 @@ pub const DEFAULT_VERIFY_CONCURRENCY: usize = 8;
 /// Default Reed–Solomon decode/re-encode worker concurrency.
 pub const DEFAULT_DECODE_CONCURRENCY: usize = 2;
 
-/// Default maximum simultaneous BPv1 peer sessions.
-pub const DEFAULT_MAX_BPV1_SESSIONS: usize = 64;
-
 /// `zakura-quic` `ConnLoad` poll interval.
 pub const PATH_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -124,8 +121,11 @@ pub struct ZakuraBpv1Config {
     /// The session writer can enqueue a full stripe per peer before feedback
     /// arrives. Leave copies off unless measuring that policy explicitly.
     pub proposer_direct_copies: bool,
-    /// Maximum simultaneous BPv1 peer sessions.
-    pub max_sessions: usize,
+    /// Most simultaneous BPv1 peer sessions, a reactor cap. Unset by default:
+    /// the connection cap and the `[memory]` budget's sessions share bound
+    /// the sessions, and each session funds its own base. A set value warns
+    /// at startup if its worst case can exceed the budget.
+    pub max_sessions: Option<usize>,
     /// Maximum concurrently active (non-retired) blocks admitted for collection.
     pub max_concurrent_blocks: usize,
     /// Per-peer data early-record byte cap (default: two maximum W2 `Part` frames).
@@ -145,7 +145,7 @@ impl Default for ZakuraBpv1Config {
         Self {
             enabled: false,
             proposer_direct_copies: false,
-            max_sessions: DEFAULT_MAX_BPV1_SESSIONS,
+            max_sessions: None,
             max_concurrent_blocks: DEFAULT_MAX_CONCURRENT_BLOCKS,
             early_peer_bytes_cap: DEFAULT_EARLY_PEER_BYTES_CAP,
             early_age_ms: DEFAULT_EARLY_AGE.as_millis() as u64,
@@ -159,7 +159,7 @@ impl Default for ZakuraBpv1Config {
 impl ZakuraBpv1Config {
     /// Validates that configured bounds are non-zero and self-consistent.
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.max_sessions == 0 {
+        if self.max_sessions == Some(0) {
             return Err("bpv1.max_sessions must be > 0");
         }
         if self.max_concurrent_blocks == 0 {
@@ -175,6 +175,19 @@ impl ZakuraBpv1Config {
             return Err("bpv1.part_retention_budget_bytes must be > 0");
         }
         Ok(())
+    }
+
+    /// Whether a node already running `live` sessions may admit another.
+    pub fn admits_session(&self, live: usize) -> bool {
+        self.max_sessions.is_none_or(|max| live < max)
+    }
+
+    /// The most early-record bytes `sessions` sessions hold together: each
+    /// session's data records stay within `early_peer_bytes_cap`, so the node
+    /// cap is `sessions × early_peer_bytes_cap` (`02 §7` item 6).
+    pub fn early_node_bytes_cap(&self, sessions: usize) -> u64 {
+        // Widening usize to u64 is lossless on supported targets.
+        (sessions as u64).saturating_mul(self.early_peer_bytes_cap as u64)
     }
 
     /// Derives [`PeerConfig`] for `profile` from this operator config.

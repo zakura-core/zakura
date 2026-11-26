@@ -98,6 +98,17 @@ pub enum ProposerInput {
         /// Encoded body (`coding`, `part_root`, `parts`).
         encoded: EncodedBody,
     },
+    /// The encode for `work_id` ended without an encoding: the reserve
+    /// refused its lease or the body failed to encode. Its templates get no
+    /// commitment, and the next template for the body starts a fresh encode.
+    ///
+    /// Every encode ends in `EncodeDone` or `EncodeFailed`, so the encodes
+    /// the machine counts in flight are the ones the IO shell holds leases
+    /// for.
+    EncodeFailed {
+        /// Work identity from `StartEncode`.
+        work_id: WorkId,
+    },
     /// A block was solved (locally mined or externally submitted).
     Solved {
         /// Consensus hash of the solved block.
@@ -278,7 +289,10 @@ fn push_bounded<T>(items: &mut Vec<T>, item: T, max: usize) {
 pub struct ProposerState {
     config: ProposerConfig,
     next_work_id: u64,
-    /// In-flight encodes keyed by body, oldest first, at most [`MAX_PREPARED_ENCODINGS`].
+    /// In-flight encodes keyed by body, oldest first, at most
+    /// [`MAX_PREPARED_ENCODINGS`]. A template for another body gets no
+    /// encode while that many are in flight, so the encode leases stay
+    /// within the `Propagation` reserve (mem-5).
     pending: Vec<PendingEncode>,
     /// Prepared encodings keyed by body, oldest first, at most [`MAX_PREPARED_ENCODINGS`].
     prepared: Vec<PreparedEntry>,
@@ -293,6 +307,16 @@ impl ProposerState {
             pending: Vec::new(),
             prepared: Vec::new(),
         }
+    }
+
+    /// The bytes the prepared encodings hold: each encoding's parts at
+    /// [`Coding::encoded_bytes`]. An encode in flight holds its bytes outside
+    /// the machine until [`ProposerInput::EncodeDone`].
+    pub fn prepared_bytes(&self) -> u64 {
+        self.prepared
+            .iter()
+            .map(|entry| entry.encoded.coding.encoded_bytes())
+            .fold(0, u64::saturating_add)
     }
 
     /// Executes one synchronous proposer transition.
@@ -326,18 +350,14 @@ impl ProposerState {
                 {
                     // Join the body's in-flight encode instead of restarting it.
                     push_bounded(&mut pending.waiters, waiter, MAX_COMMITMENTS_PER_BODY);
-                } else {
+                } else if self.pending.len() < MAX_PREPARED_ENCODINGS {
                     let work_id = WorkId(self.next_work_id);
                     self.next_work_id = self.next_work_id.wrapping_add(1).max(1);
-                    push_bounded(
-                        &mut self.pending,
-                        PendingEncode {
-                            work_id,
-                            body_identity,
-                            waiters: vec![waiter],
-                        },
-                        MAX_PREPARED_ENCODINGS,
-                    );
+                    self.pending.push(PendingEncode {
+                        work_id,
+                        body_identity,
+                        waiters: vec![waiter],
+                    });
                     step.events.push(ProposerEvent::EncodeStarted {
                         template_id,
                         work_id,
@@ -364,6 +384,9 @@ impl ProposerState {
                 for waiter in &pending.waiters {
                     self.commit(at, waiter, &mut step);
                 }
+            }
+            ProposerInput::EncodeFailed { work_id } => {
+                self.pending.retain(|p| p.work_id != work_id);
             }
             ProposerInput::Solved {
                 block_id,

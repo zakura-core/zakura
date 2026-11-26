@@ -33,6 +33,7 @@ use super::{
     codec::decode_and_check_stripe,
     commitment::CoinbaseBinding,
     config::{HavePacing, ZakuraBpv1Config},
+    memory::PropagationReserve,
     paths::PathEstimate,
     peer::{
         PartAuth, PeerConfig, PeerEvent, PeerInput, PeerOutput, PeerState, PeerStep, RecvHave,
@@ -45,7 +46,7 @@ use super::{
         charge_part, held_parts, pull_state, refused_grant, route_block_output, route_peer_output,
         BlockRoute, PeerRoute,
     },
-    service::{Bpv1Handle, Bpv1Ports, Bpv1Service},
+    service::{Bpv1Handle, Bpv1Ports, Bpv1Service, Bpv1Startup},
     tree::VerifiedPart,
     unknown_parent::UnknownParentVerdict,
     wire::{
@@ -54,6 +55,7 @@ use super::{
     },
 };
 use crate::zakura::{
+    memory::{Consumer, ConsumerSpec, MemoryPool, PoolConfig},
     transport::{framed_channel, Peer, Service},
     ServicePeerDirection, ZakuraPeerId,
 };
@@ -250,7 +252,37 @@ impl Default for Bpv1Ports {
     }
 }
 
-/// Starts a service with the default config and `Have` pacing.
+/// A memory pool that holds only the `Propagation` reserve that `config`
+/// needs under `profile`, as the node plan sizes it.
+pub(super) fn propagation_pool(config: &ZakuraBpv1Config, profile: Profile) -> MemoryPool {
+    let reserve = PropagationReserve::new(config, profile).total();
+    MemoryPool::new(
+        PoolConfig::new(reserve, 0)
+            .with_consumer(Consumer::Propagation, ConsumerSpec::reserved(reserve)),
+    )
+}
+
+/// What a service with the default config and `Have` pacing needs to start.
+pub(super) fn startup(
+    profile: Profile,
+    network: Network,
+    id: NodeId,
+    ports: Bpv1Ports,
+    shutdown: &CancellationToken,
+) -> Bpv1Startup {
+    Bpv1Startup {
+        config: ZakuraBpv1Config::default(),
+        have_pacing: HavePacing::default(),
+        profile,
+        network,
+        local_node: id,
+        ports,
+        shutdown: shutdown.clone(),
+    }
+}
+
+/// Starts a service with the default config and `Have` pacing, funded by
+/// its own [`propagation_pool`].
 pub(super) fn start(
     profile: Profile,
     network: Network,
@@ -258,15 +290,8 @@ pub(super) fn start(
     ports: Bpv1Ports,
     shutdown: &CancellationToken,
 ) -> (Arc<Bpv1Service>, Bpv1Handle) {
-    Bpv1Service::start(
-        ZakuraBpv1Config::default(),
-        HavePacing::default(),
-        profile,
-        network,
-        id,
-        ports,
-        shutdown.clone(),
-    )
+    let pool = propagation_pool(&ZakuraBpv1Config::default(), profile);
+    Bpv1Service::start(startup(profile, network, id, ports, shutdown), pool)
 }
 
 /// Connects two services with sessions that end when `shutdown` ends.

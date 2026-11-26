@@ -509,6 +509,19 @@ pub enum Observation {
         /// peer's main task records it.
         order: u64,
     },
+    /// One lease event a node's memory pool reported through its tap, in the
+    /// order the pool reported it (`03 §4`).
+    Pool {
+        /// The tap's registration index among the run's pool taps, an index
+        /// space of its own.
+        instance: u64,
+        /// The event's number, from 1 per tap.
+        seq: u64,
+        /// The node's name, a display label only.
+        node: String,
+        /// What happened in the memory pool.
+        event: PoolFact,
+    },
     /// An event from a test-only fake action source.
     Fake {
         /// The source's name.
@@ -1846,6 +1859,27 @@ pub struct BlockSyncSubmission {
     /// Whether it left `applying` while the driver can still retain it.
     pub detached: bool,
 }
+
+/// The events that memory-pool tap `instance` logged in `observations`, in
+/// order.
+pub(crate) fn pool_entries<'o>(
+    observations: impl IntoIterator<Item = &'o Observation>,
+    instance: u64,
+) -> Vec<&'o Observation> {
+    observations
+        .into_iter()
+        .filter(|obs| {
+            matches!(
+                obs,
+                Observation::Pool { instance: index, .. } if *index == instance
+            )
+        })
+        .collect()
+}
+
+/// One lease transition reported by a node's memory pool (`03 §4`), recorded
+/// as the pool reports it.
+pub type PoolFact = zakura_network::zakura::memory::PoolEvent;
 
 /// The events that block-sync tap `instance` logged in `observations`, in
 /// order.

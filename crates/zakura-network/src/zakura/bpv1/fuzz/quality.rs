@@ -234,6 +234,7 @@ pub fn proposer_input_name(input: &ProposerInput) -> &'static str {
     match input {
         ProposerInput::TemplateBuilt { .. } => "proposer-in:TemplateBuilt",
         ProposerInput::EncodeDone { .. } => "proposer-in:EncodeDone",
+        ProposerInput::EncodeFailed { .. } => "proposer-in:EncodeFailed",
         ProposerInput::Solved { .. } => "proposer-in:Solved",
     }
 }

@@ -39,25 +39,30 @@ only above the largest count a conformant peer can reach on this node's tally, u
 congestion, reordering between streams, or release timing. Counts between the advertised limit and
 that margin are served and traced.
 
-Limits never cost throughput. Every capacity default derives from one target, 10 Gbps per
-connection at 500 ms round-trip time, and a test checks each default against its derivation. A
-local capacity limit makes the node wait; it never faults a peer. QUIC flow control binds first
-today: a 32 MiB connection send window carries about 540 Mbps at 500 ms.
+Limits never cost throughput while the node's `[memory]` budget covers the work's demand. Each
+consumer's cap derives from its own benefit signal: BBR congestion windows and the commit rate times
+the p99 fetch time for block sync, `2 × cwnd` for serving send windows, and the mempool's capacity
+for `tx-relay`. Raising `[memory] budget` above demand therefore doesn't grow memory use. When the
+budget is smaller than demand, the pool delays bulk requests, serving output or send-window growth
+to stay within it. A local limit makes the node wait. That can cost a peer throughput, and it never
+faults or penalizes a peer.
 
-Paused reads leave a peer's data in QUIC's receive window, so the windows are also memory every
-peer can fill. The node bounds that credit by holding fewer connections, not by shrinking windows:
-`peer_memory_budget_bytes` (17 GiB) funds one 256 MiB datagram queue per bound socket,
-`max_pending_handshakes` (32) connections in their handshakes at 64 MiB of windows each, and
-admitted connections at their raised windows: the handshake window, each negotiated reactor's
-receive share and the send window, 146,204,963 B at the defaults with `tx-relay` on. That funds 92 ordinary peers and
-up to ten additional preferred gateways, plus 32 handshakes for 134 live QUIC connections. A closed connection
-releases its stream buffers and waits out its drain in a separate, cheap allowance, so a peer that
-gets rejected and reconnects can't pile up buffers, and its closed connections take no slot from
-inbound peers. CTRL-26, ADM-12 and ADM-13 in the zakura-quic spec give the rules
-and the overheads the budget leaves out.
+Paused reads leave a peer's data in QUIC's receive window, so the windows are memory every peer
+can fill. The node used to reserve worst-case windows for every peer and bound the total by holding
+fewer connections. Now receive credit follows the node's own requests, and send windows follow the
+node's own congestion window. One `[memory] budget` funds every v2 P2P term. A pending handshake
+holds only QUIC's minimum windows. Admission leases each connection's bases from `Sessions`, a
+request leases its receive credit before it goes out (API-9), and `Serving` leases send-window
+growth while output waits. With BPv1 on, the `Propagation` reserve funds what BPv1 retains. Proof
+of work bounds those bytes, so their leases never wait behind bulk. Each BPv1 session funds its base
+from `Sessions`. Its receive credit stays unsolicited, because pushed and pulled parts share the
+data stream's `Part` row and BPv1 raises no credit per `Want`. A mining node holds up to ten
+connection places above `max_connections` for its preferred gateways, and ordinary connections
+leave those places' bases free in `Sessions`. CTRL-26, ADM-12 and ADM-13 in the
+[`zakura-quic` spec](../specs/zakura-quic.md) state the rules and their numbers.
 
-Configuration loading checks this budget only when the resolved P2P stack runs v2. Legacy-only
-nodes retain the configured value without enforcing it because they create no QUIC endpoint.
+Configuration loading checks the startup memory plan only when the resolved P2P stack runs v2.
+Legacy-only nodes create no QUIC endpoint.
 
 ## Message checks and handler policy
 

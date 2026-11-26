@@ -12,73 +12,42 @@
 //! workers and the fixture, and checks the budget's own reported maximum
 //! against them.
 //!
-//! Six properties read it:
-//! - [`PAYLOAD_INVENTORY_AGREES`]: every captured runtime payload has a policy entry;
-//! - [`RETAINED_BYTE_BOUND`]: retained wire bytes stay within
-//!   `L + 401·b + Q·b`, after every step, where `b` is the fixture's
-//!   largest body;
-//! - [`RESERVED_BYTE_BOUND`]: the byte budget stays within
-//!   `M + 2·k·B + h·B`, after every step, where `h` counts the charged
-//!   handoffs open then, at most one per live routine and none at rest (D2
-//!   in the lane 3 plan);
-//! - [`BUDGET_LEDGERS_AGREE`]: at rest, no handoff is open, and the byte
-//!   budget equals both the work queue's reserved tally and the routines'
-//!   unreceived estimates;
-//! - [`LOOKAHEAD_OVERSHOOT_BOUND`]: at rest, above-window retained bytes
-//!   plus outstanding above-window estimates stay within
-//!   `L + H + (W + 1)·k·B`;
-//! - [`TEARDOWN_RETURNS_BASELINE`]: once every peer has left, every
-//!   routine has ended, the sequencer's input queue is empty and every
-//!   serving lease is released, at rest, every charge is back to zero,
-//!   session slots included.
+//! Three properties read it:
+//! - [`PAYLOAD_INVENTORY_AGREES`]: every captured runtime payload has a
+//!   policy entry.
+//! - [`RETAINED_BYTE_BOUND`]: after every step, the wire and decoded bytes
+//!   the sequencer retains stay within the pool's live `BlockSync` and
+//!   `Consensus` leases (`mem-2`).
+//! - [`BUDGET_LEDGERS_AGREE`]: at rest, no handoff is open, the byte budget
+//!   equals the work queue's tally and the routines' unreceived estimates,
+//!   and the pool's `BlockSync` and `Consensus` leases equal those estimates
+//!   plus the retained bytes, the decoded blocks of detached submissions and
+//!   the receive credit that still drains.
+//!
+//! The pool gauge ([`super::memory_pool`]) checks the pool's own bounds,
+//! teardown and `memory/consensus-once-per-height`.
 //!
 //! `B` is [`ESTIMATE_CEILING`], and `k` is
 //! `advertised_max_blocks_per_response()`, the most bodies one request asks
-//! for. D2's `2·B` assumes each request asks for one body
-//! (`BS_BLOCKS_PER_RESPONSE = 1`). [`Limits::reserved_bound`] and
-//! [`Limits::lookahead_bound`] allow one request's estimate, `k·B`, per
-//! term, so the bounds stay sound if that constant grows.
+//! for. The harnesses run at `k = 1`.
 //!
 //! Each check records its quantities' peaks in the run's report, since
-//! properties.md asks the report for each allowance's largest value.
-//!
-//! The retained, reserved and look-ahead bounds are instances of the
-//! shared resource bound ([`super::shared::bounds`]). Each instance gives
-//! its reading, and the shared check judges it.
-//!
-//! # The look-ahead bound's coefficients
-//!
-//! A height is above the window when it exceeds the verified tip plus 401.
-//! Admission plans each above-window request from one snapshot
-//! (`admission.rs`, `admit`). It refuses once retained bytes plus the work
-//! queue's estimates above the download floor reach `L`, and otherwise
-//! sizes the take to the room left. Both totals cover their above-window
-//! parts: every retained body counts, and every outstanding above-window
-//! height is above the floor. So one routine's admission keeps `R + E`
-//! within `L`, except that a take always keeps its first item, up to one
-//! request's estimate: the floor's first-item margin, one `B`. Each routine
-//! admits against its own snapshot, so up to `W` routines can each add one
-//! request's estimate past the room that the others' snapshots missed: the
-//! race term, `W·B`. A body's retained bytes replace its request's estimate
-//! when it arrives, so a body larger than its estimate adds its excess,
-//! which the hint-error term `H` counts. The model reads the highest
-//! verified tip any view published. A higher tip moves heights into the
-//! window, which lowers `R + E` by at least as much as `H`, so a lagging or
-//! reset tip can't fail the check.
+//! properties.md asks the report for each allowance's largest value. The
+//! retained bound is an instance of the shared resource bound
+//! ([`super::shared::bounds`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use zakura_chain::{block::MAX_BLOCK_BYTES, parameters::checkpoint::constants};
 use zakura_network::zakura::{FreeSlots, ZakuraBlockSyncConfig};
-use zakura_scheduler::Status as SchedulerStatus;
 
 use crate::{
     observe::{
         BlockSyncFact, BlockSyncHolder, BlockSyncPayload, BlockSyncRetained, StorageFact, WorkOwner,
     },
     property::{
-        CheckCtx, HasView, Kind, Pending, Property, PropertyId, Source, Status, TriggerHistory,
-        Unit, Verdict,
+        CheckCtx, HasView, Kind, Property, PropertyId, Source, Status, TriggerHistory, Unit,
+        Verdict,
     },
     Observation, ObservationLog,
 };
@@ -93,21 +62,14 @@ use super::shared::bounds::{bound, Bound, Measured, Reading};
 /// driver and backend retention require separate evidence.
 pub const PAYLOAD_INVENTORY_AGREES: &str = "block-sync/payload-inventory-agrees";
 
-/// Retained wire bytes stay within the derived bound.
+/// The wire and decoded bytes the sequencer retains stay within the pool's
+/// live `BlockSync` and `Consensus` leases (`03 §4`, `mem-2`).
 pub const RETAINED_BYTE_BOUND: &str = "block-sync/retained-byte-bound";
 
-/// Reserved request bytes stay within the derived bound.
-pub const RESERVED_BYTE_BOUND: &str = "block-sync/reserved-byte-bound";
-
-/// The two reserved-byte ledgers agree.
+/// At rest, the byte budget, the work queue, the routines' unreceived
+/// estimates and the pool's `BlockSync` and `Consensus` leases agree
+/// (`03 §4`).
 pub const BUDGET_LEDGERS_AGREE: &str = "block-sync/budget-ledgers-agree";
-
-/// Above-window bytes exceed the look-ahead limit only by size-hint error
-/// and the admission race.
-pub const LOOKAHEAD_OVERSHOOT_BOUND: &str = "block-sync/lookahead-overshoot-bound";
-
-/// Teardown returns every block-sync charge.
-pub const TEARDOWN_RETURNS_BASELINE: &str = "block-sync/teardown-returns-baseline";
 
 /// Heights above the verified tip that skip block sync's look-ahead gates:
 /// one worst-case checkpoint range, `MAX_CHECKPOINT_HEIGHT_GAP + 1`
@@ -124,18 +86,14 @@ pub const ESTIMATE_CEILING: u64 = MAX_BLOCK_BYTES;
 /// (`work_queue.rs`), which the crate doesn't export.
 pub const ESTIMATE_FLOOR: u64 = 1_024;
 
-/// The limits the bounds add up, from the node's configuration and the
-/// fixture.
+/// The limits the model checks inputs against, from the node's
+/// configuration and the fixture.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Limits {
-    /// `M`, the byte budget's limit: `max_inflight_block_bytes`.
+    /// `M`, block sync's configured in-flight bytes:
+    /// `max_inflight_block_bytes`. The byte budget records charges without
+    /// refusing, so `M` only paces the harness's handoff pauses.
     pub budget: u64,
-    /// `L`, the look-ahead limit the sequencer's final gate reads:
-    /// `effective_max_reorder_lookahead_bytes()`.
-    pub lookahead: u64,
-    /// `Q`, the sequencer input queue's depth in bodies:
-    /// `submitted_apply_limit()`.
-    pub queue: u64,
     /// The most bodies one request asks for:
     /// `advertised_max_blocks_per_response()`.
     pub per_request: u64,
@@ -144,91 +102,25 @@ pub struct Limits {
     /// the node holds comes from the fixture, so the fixture's largest body
     /// bounds every retained one.
     pub largest_body: u64,
-    /// `W`, the runtime's workers, which run the peer routines.
-    pub workers: u64,
 }
 
 impl Limits {
-    /// The limits of a node that runs `config` on `workers` workers, on a
-    /// fixture whose largest body is `largest_body` wire bytes.
-    pub fn of(config: &ZakuraBlockSyncConfig, workers: u16, largest_body: u64) -> Limits {
+    /// The limits of a node that runs `config` on a fixture whose largest
+    /// body is `largest_body` wire bytes.
+    pub fn of(config: &ZakuraBlockSyncConfig, largest_body: u64) -> Limits {
         Limits {
             budget: config.inflight_block_bytes(),
-            lookahead: config.effective_max_reorder_lookahead_bytes(),
-            queue: u64::try_from(config.submitted_apply_limit()).unwrap_or(u64::MAX),
             per_request: u64::from(config.advertised_max_blocks_per_response()),
             largest_body,
-            workers: u64::from(workers),
         }
     }
 
-    /// `M + 2·k·B + h·B`, the most the byte budget may count while
-    /// `handoffs` charged handoffs are open, with `k` the most bodies one
-    /// request asks for (properties.md, Reserved bytes).
-    ///
-    /// Only a floor request may charge past `M`, and only one that starts at
-    /// the download floor or the next height. Each height has one owner, so
-    /// at most two such charges are live, each at most one request's
-    /// estimate, `k·B`. D2 writes `2·B` because `k` is 1
-    /// (`BS_BLOCKS_PER_RESPONSE`). While a routine hands a body to the
-    /// sequencer, both the sequencer and the budget count it, and the
-    /// sequencer can advance the floor, so another routine can overdraft for
-    /// the new floor's next height. Each open handoff adds one more `B`.
-    pub fn reserved_bound(&self, handoffs: u64) -> u64 {
-        let overdraft = self.per_request.saturating_mul(ESTIMATE_CEILING);
-        self.budget
-            .saturating_add(overdraft.saturating_mul(2))
-            .saturating_add(handoffs.saturating_mul(ESTIMATE_CEILING))
-    }
-
-    /// `L + H + (W + 1)·k·B`, the most above-window retained bytes and
-    /// outstanding above-window estimates may add up to when the retained
-    /// bodies exceed their estimates by `hint_error` in all (properties.md,
-    /// Over-admission). The module doc derives the coefficients.
-    pub fn lookahead_bound(&self, hint_error: u64) -> u64 {
+    /// `M + 2·k·B`: the byte budget's count past which the harness ends its
+    /// handoff pauses.
+    pub fn pause_bound(&self) -> u64 {
         let request = self.per_request.saturating_mul(ESTIMATE_CEILING);
-        self.lookahead
-            .saturating_add(hint_error)
-            .saturating_add(self.workers.saturating_add(1).saturating_mul(request))
+        self.budget.saturating_add(request.saturating_mul(2))
     }
-
-    /// `L + 401·b + Q·b`, the most the sequencer may retain (properties.md,
-    /// Retained bytes), with `b` the fixture's largest body.
-    ///
-    /// The sequencer's final gate admits a body above the commit window only
-    /// while the reorder buffer and `applying` stay within `L`. At most 401
-    /// commit-window heights skip the gate, one body each, and the input
-    /// queue holds at most `Q` bodies.
-    pub fn retained_bound(&self) -> u64 {
-        let bodies = COMMIT_WINDOW_BLOCKS.saturating_add(self.queue);
-        self.lookahead
-            .saturating_add(bodies.saturating_mul(self.largest_body))
-    }
-}
-
-/// [`Limits::retained_bound`]'s formula, as a literal for `concat!`. The
-/// claim and the violation text of [`RETAINED_BYTE_BOUND`] both state it.
-macro_rules! retained_formula {
-    () => {
-        "L + 401·b + Q·b"
-    };
-}
-
-/// [`Limits::reserved_bound`]'s formula, as a literal for `concat!`. The
-/// claim and the violation text of [`RESERVED_BYTE_BOUND`] both state it.
-macro_rules! reserved_formula {
-    () => {
-        "M + 2·k·B + h·B"
-    };
-}
-
-/// [`Limits::lookahead_bound`]'s formula, as a literal for `concat!`. The
-/// claim and the violation text of [`LOOKAHEAD_OVERSHOOT_BOUND`] both state
-/// it.
-macro_rules! lookahead_formula {
-    () => {
-        "L + H + (W + 1)·k·B"
-    };
 }
 
 /// A holder of one retained body, by the tap's allocation number or the
@@ -364,11 +256,23 @@ pub enum OwnerInput {
         height: u32,
         /// Its wire bytes.
         bytes: u64,
+        /// Decoded attributed bytes when the holder is `Queued` and carries a
+        /// pre-decoded block (0 otherwise).
+        decoded_bytes: u64,
     },
     /// `holder` let its body go.
     Released {
         /// The holder.
         holder: BodyHolder,
+    },
+    /// Live combined `Consumer::BlockSync + Consumer::Consensus` bytes leased
+    /// in the node's memory pool, reported by [`PoolTap`].
+    PoolBlockLeases {
+        /// Live leased bytes across `BlockSync` and `Consensus`.
+        leased: u64,
+        /// Subset of `leased` currently parked in `ConnectionCredit` QUIC
+        /// receive-credit drain queues (`02 §6`).
+        draining: u64,
     },
     /// The work queue's items charge `reserved` bytes in all.
     WorkQueue {
@@ -420,6 +324,9 @@ pub enum OwnerInput {
         expected_payloads: Vec<BlockSyncPayload>,
         /// The listed holders, in the snapshot's order.
         holders: Vec<(BodyHolder, u32, u64)>,
+        /// The decoded attributed bytes of the submissions detached from
+        /// `applying`, which the driver still holds under their leases.
+        detached_decoded: u64,
     },
 }
 
@@ -503,12 +410,22 @@ impl OwnerInput {
                 holder,
                 change,
             } => {
-                let holder = match holder {
-                    BlockSyncHolder::Queued { allocation, .. } => BodyHolder::Queued(*allocation),
-                    BlockSyncHolder::Reorder { allocation } => BodyHolder::Reorder(*allocation),
-                    BlockSyncHolder::Applying { allocation } => BodyHolder::Applying(*allocation),
-                    BlockSyncHolder::Submitted { token } => BodyHolder::Submitted(*token),
-                    BlockSyncHolder::Detached { token } => BodyHolder::Detached(*token),
+                let (holder, decoded_bytes) = match holder {
+                    BlockSyncHolder::Queued {
+                        allocation,
+                        decoded_attributed_memory_bytes,
+                    } => (
+                        BodyHolder::Queued(*allocation),
+                        *decoded_attributed_memory_bytes,
+                    ),
+                    BlockSyncHolder::Reorder { allocation } => {
+                        (BodyHolder::Reorder(*allocation), 0)
+                    }
+                    BlockSyncHolder::Applying { allocation } => {
+                        (BodyHolder::Applying(*allocation), 0)
+                    }
+                    BlockSyncHolder::Submitted { token } => (BodyHolder::Submitted(*token), 0),
+                    BlockSyncHolder::Detached { token } => (BodyHolder::Detached(*token), 0),
                 };
                 if change == "retained" {
                     OwnerInput::Held {
@@ -516,6 +433,7 @@ impl OwnerInput {
                         request: request_key(&body.owner),
                         height: body.height,
                         bytes: body.bytes,
+                        decoded_bytes,
                     }
                 } else {
                     OwnerInput::Released { holder }
@@ -561,6 +479,11 @@ impl OwnerInput {
                 let applying = applying
                     .iter()
                     .map(|body| retained(BodyHolder::Applying, body));
+                let detached_decoded = submissions
+                    .iter()
+                    .filter(|submission| submission.detached)
+                    .map(|submission| submission.decoded_attributed_memory_bytes)
+                    .fold(0, u64::saturating_add);
                 let submissions = submissions.iter().map(|submission| {
                     let holder = if submission.detached {
                         BodyHolder::Detached(submission.token)
@@ -573,6 +496,7 @@ impl OwnerInput {
                     payloads: payloads.clone(),
                     expected_payloads,
                     holders: reorder.chain(applying).chain(submissions).collect(),
+                    detached_decoded,
                 }
             }
             _ => return None,
@@ -581,7 +505,7 @@ impl OwnerInput {
 }
 
 /// A body a routine is handing to the sequencer while its request still
-/// charges the budget: one unit of D2's `h`.
+/// charges the budget.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OpenHandoff {
     /// The request the body answered.
@@ -592,14 +516,11 @@ pub struct OpenHandoff {
     pub charge: u64,
 }
 
-/// One retained allocation: its holders, and its body's height, wire bytes,
-/// and wire bytes past its request's estimate.
+/// One retained allocation: its holders and its body's wire bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Allocation {
     holders: u32,
-    height: u32,
     bytes: u64,
-    excess: u64,
 }
 
 /// Block sync's owners and quantities, folded from [`OwnerInput`]s. See the
@@ -649,6 +570,20 @@ pub struct OwnerModel {
     session_slots: Option<(FreeSlots, FreeSlots)>,
     /// The largest value of each quantity, for the run's report.
     peaks: Peaks,
+    /// The latest live `BlockSync` and `Consensus` lease total `PoolTap`
+    /// reported.
+    pool_block_leases: u64,
+    /// Subset of `pool_block_leases` held in `ConnectionCredit` QUIC
+    /// receive-credit drain queues (`02 §6`).
+    pool_draining_receive: u64,
+    /// Decoded attributed bytes held by each `Queued` body allocation.
+    queued_decoded: BTreeMap<u64, u64>,
+    /// Decoded attributed bytes held by the sequencer's retained payloads in
+    /// the latest snapshot.
+    sequencer_decoded: u64,
+    /// Decoded attributed bytes of the latest snapshot's detached
+    /// submissions, each under the lease its body held.
+    detached_decoded: u64,
     /// The first budget input the model couldn't apply.
     budget_gap: Option<String>,
     /// The first holder or handoff input the model couldn't apply.
@@ -670,25 +605,14 @@ pub struct Peaks {
     pub handoffs: u64,
     /// The most retained wire bytes.
     pub retained: u64,
-    /// The most wire bytes in the sequencer's input queue, the `Q·b`
-    /// allowance's quantity.
+    /// The most retained wire and decoded bytes.
+    pub retained_with_decoded: u64,
+    /// The most wire bytes in the sequencer's input queue.
     pub queued: u64,
     /// The most session slots held at once.
     pub session_slots: u64,
-}
-
-/// The look-ahead bound's quantities at one boundary (properties.md,
-/// Over-admission).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Lookahead {
-    /// `R`: wire bytes of retained above-window bodies, once per
-    /// allocation.
-    pub retained: u64,
-    /// `E`: estimates of outstanding above-window request heights.
-    pub estimated: u64,
-    /// `H`: the wire bytes by which each retained above-window body exceeds
-    /// its request's estimate, summed.
-    pub hint_error: u64,
+    /// The largest combined `BlockSync + Consensus` memory-pool lease total.
+    pub pool_block_leases: u64,
 }
 
 impl OwnerModel {
@@ -721,6 +645,13 @@ impl OwnerModel {
 
     /// Folds `input`.
     pub fn apply(&mut self, input: OwnerInput) {
+        self.fold(input);
+        let held = self.retained.saturating_add(self.retained_decoded());
+        self.peaks.retained_with_decoded = self.peaks.retained_with_decoded.max(held);
+    }
+
+    /// Folds `input` without updating the retained peak.
+    fn fold(&mut self, input: OwnerInput) {
         match input {
             OwnerInput::SessionAdmitted {
                 connection,
@@ -768,11 +699,11 @@ impl OwnerModel {
                         self.reserved
                     ));
                 }
-                if limit != self.limits.budget {
+                // The pool is block sync's only admission bound, so the
+                // byte budget records charges with no maximum.
+                if limit != u64::MAX {
                     self.note_budget_gap(format!(
-                        "the byte budget reports a maximum of {limit}, but the node's config \
-                         sets {}",
-                        self.limits.budget
+                        "the byte budget reports a maximum of {limit}, but it has none"
                     ));
                 }
                 self.reserved = after;
@@ -815,8 +746,14 @@ impl OwnerModel {
                 request,
                 height,
                 bytes,
-            } => self.hold(holder, request, height, bytes),
+                decoded_bytes,
+            } => self.hold(holder, request, height, bytes, decoded_bytes),
             OwnerInput::Released { holder } => self.release(holder),
+            OwnerInput::PoolBlockLeases { leased, draining } => {
+                self.pool_block_leases = leased;
+                self.pool_draining_receive = draining;
+                self.peaks.pool_block_leases = self.peaks.pool_block_leases.max(leased);
+            }
             OwnerInput::WorkQueue { reserved } => self.queue_reserved = reserved,
             OwnerInput::VerifiedTip { height } => {
                 self.verified_tip = self.verified_tip.max(height);
@@ -838,8 +775,14 @@ impl OwnerModel {
                 holders,
                 mut payloads,
                 mut expected_payloads,
+                detached_decoded,
             } => {
                 self.payloads_observed = true;
+                self.detached_decoded = detached_decoded;
+                self.sequencer_decoded = payloads
+                    .iter()
+                    .map(|p| p.decoded_attributed_memory_bytes)
+                    .fold(0, u64::saturating_add);
                 payloads.sort_unstable();
                 expected_payloads.sort_unstable();
                 if payloads != expected_payloads && self.payload_gap.is_none() {
@@ -861,7 +804,14 @@ impl OwnerModel {
 
     /// Folds `holder` taking the body at `height`, `bytes` wire bytes, which
     /// answered `request`.
-    fn hold(&mut self, holder: BodyHolder, request: RequestKey, height: u32, bytes: u64) {
+    fn hold(
+        &mut self,
+        holder: BodyHolder,
+        request: RequestKey,
+        height: u32,
+        bytes: u64,
+        decoded_bytes: u64,
+    ) {
         if bytes > self.limits.largest_body {
             self.note_holder_gap(format!(
                 "{holder:?} holds {bytes} bytes at height {height}, more than the fixture's \
@@ -873,29 +823,29 @@ impl OwnerModel {
             self.note_holder_gap(format!("{holder:?} took a second body"));
         }
         if let Some(allocation) = holder.retained_allocation() {
-            let estimate = self.estimates.get(&(request, height)).copied();
-            let Some(estimate) = estimate else {
+            if !self.estimates.contains_key(&(request, height)) {
                 self.note_holder_gap(format!(
                     "{holder:?} holds the body at height {height}, but no snapshot or write \
                      reported its request's estimate"
                 ));
                 return;
-            };
-            let entry = self.allocations.entry(allocation).or_insert(Allocation {
-                holders: 0,
-                height,
-                bytes,
-                excess: bytes.saturating_sub(estimate),
-            });
+            }
+            let entry = self
+                .allocations
+                .entry(allocation)
+                .or_insert(Allocation { holders: 0, bytes });
             if entry.holders == 0 {
                 self.retained = self.retained.saturating_add(bytes);
             }
             entry.holders += 1;
             self.peaks.retained = self.peaks.retained.max(self.retained);
         }
-        if let BodyHolder::Queued(_) = holder {
+        if let BodyHolder::Queued(allocation) = holder {
             self.queued = self.queued.saturating_add(bytes);
             self.peaks.queued = self.peaks.queued.max(self.queued);
+            if decoded_bytes > 0 {
+                self.queued_decoded.insert(allocation, decoded_bytes);
+            }
         }
     }
 
@@ -905,8 +855,9 @@ impl OwnerModel {
             self.note_holder_gap(format!("{holder:?} released a body it never took"));
             return;
         };
-        if let BodyHolder::Queued(_) = holder {
+        if let BodyHolder::Queued(allocation) = holder {
             self.queued = self.queued.saturating_sub(bytes);
+            self.queued_decoded.remove(&allocation);
         }
         if let Some(allocation) = holder.retained_allocation() {
             if let Some(entry) = self.allocations.get_mut(&allocation) {
@@ -996,18 +947,6 @@ impl OwnerModel {
         u64::try_from(self.live.len()).unwrap_or(u64::MAX)
     }
 
-    /// D2's `h` after a step that left the scheduler at `status`: the open
-    /// handoffs, at most one per live routine, since a routine hands one
-    /// body at a time; none at rest, since a handoff never parks.
-    pub fn counted_handoffs(&self, status: SchedulerStatus) -> u64 {
-        if crate::at_rest(status) {
-            return 0;
-        }
-        u64::try_from(self.handoffs.len())
-            .unwrap_or(u64::MAX)
-            .min(self.live_routines())
-    }
-
     /// The estimates of every routine's unreceived request heights, by each
     /// routine's latest snapshot. A routine reports one before it parks, so
     /// at rest they're current.
@@ -1026,6 +965,22 @@ impl OwnerModel {
         self.retained
     }
 
+    /// The decoded attributed bytes held across `Queued` bodies and the
+    /// sequencer's retained payloads.
+    pub fn retained_decoded(&self) -> u64 {
+        self.queued_decoded
+            .values()
+            .copied()
+            .fold(0, u64::saturating_add)
+            .saturating_add(self.sequencer_decoded)
+    }
+
+    /// The latest live `BlockSync` and `Consensus` lease total `PoolTap`
+    /// reported.
+    pub fn pool_block_leases(&self) -> u64 {
+        self.pool_block_leases
+    }
+
     /// The wire bytes in the sequencer's input queue.
     pub fn queued(&self) -> u64 {
         self.queued
@@ -1041,28 +996,6 @@ impl OwnerModel {
     /// reading the highest one can't add to `R + E`.
     pub fn verified_tip(&self) -> u32 {
         self.verified_tip
-    }
-
-    /// The look-ahead bound's quantities: heights above the verified tip
-    /// plus 401 count.
-    pub fn lookahead(&self) -> Lookahead {
-        let window_high = u64::from(self.verified_tip).saturating_add(COMMIT_WINDOW_BLOCKS);
-        let above = |height: u32| u64::from(height) > window_high;
-        let mut quantities = Lookahead::default();
-        for allocation in self.allocations.values() {
-            if above(allocation.height) {
-                quantities.retained = quantities.retained.saturating_add(allocation.bytes);
-                quantities.hint_error = quantities.hint_error.saturating_add(allocation.excess);
-            }
-        }
-        quantities.estimated = self
-            .requests
-            .values()
-            .flatten()
-            .filter(|height| !height.received && above(height.height))
-            .map(|height| height.estimate)
-            .sum();
-        quantities
     }
 
     /// True once the harness has made links and closed every one: all peers
@@ -1126,7 +1059,7 @@ impl OwnerModel {
     }
 
     /// The first input the model couldn't apply, budget inputs first.
-    fn gap(&self) -> Option<String> {
+    pub(crate) fn gap(&self) -> Option<String> {
         self.budget_gap()
             .or_else(|| self.holder_gap())
             .map(str::to_owned)
@@ -1139,8 +1072,10 @@ pub trait OwnerView {
     fn read_owners<T>(&self, read: impl FnOnce(&OwnerModel) -> T) -> T;
 }
 
-/// The six resource properties, all active. A harness registers them on a
-/// view that holds the node's [`OwnerModel`].
+/// The three block-sync resource properties, all active (`03 §4`). The pool
+/// gauge's [`crate::domain::memory_pool::POOL_BOUNDED`] bounds the leases,
+/// and [`crate::domain::memory_pool::TEARDOWN_RETURNS_ZERO`] checks
+/// teardown.
 pub fn resource_properties<S: HasView>() -> Vec<Property<S>>
 where
     S::View: OwnerView,
@@ -1157,30 +1092,18 @@ where
             witness: Some(TriggerHistory::Log(payload_retained)),
         },
         bound::<S, RetainedBound>(),
-        bound::<S, ReservedBound>(),
         Property {
             id: PropertyId::new(BUDGET_LEDGERS_AGREE),
-            claim: "at rest, no handoff is open, and the byte budget equals the work queue's \
-                    reserved tally and the routines' unreceived estimates",
+            claim: "at rest, no handoff is open, the byte budget equals the work queue's \
+                    reserved tally and the routines' unreceived estimates, and the pool's \
+                    block-sync and consensus leases equal those estimates plus the retained \
+                    bytes plus the receive credit that still drains",
             kind: Kind::Safety,
             assumes: &[],
             needs: &[Source::View, Source::Schedule],
             status: Status::Active,
             check: check_ledgers::<S>,
             witness: Some(TriggerHistory::Log(body_handed_off)),
-        },
-        bound::<S, LookaheadBound>(),
-        Property {
-            id: PropertyId::new(TEARDOWN_RETURNS_BASELINE),
-            claim: "once every peer has left, every routine has ended, the input queue \
-                    is empty and every serving lease is released, at rest, no block-sync \
-                    charge remains",
-            kind: Kind::Safety,
-            assumes: &[],
-            needs: &[Source::View, Source::Schedule],
-            status: Status::Active,
-            check: check_teardown::<S>,
-            witness: Some(TriggerHistory::Log(routine_ended_owing)),
         },
     ]
 }
@@ -1208,9 +1131,12 @@ fn payload_retained(log: &ObservationLog) -> bool {
     )
 }
 
-/// [`RETAINED_BYTE_BOUND`], checked after every step. A holder gap, such
-/// as a sequencer snapshot that disagrees with the holder events, leaves
-/// the retained bytes unknown, so the reading is missing evidence.
+/// [`RETAINED_BYTE_BOUND`] (`mem-2`), checked after every step.
+///
+/// Each retained body holds a lease of its wire bytes, grown to wire plus
+/// decoded bytes when it decodes. A body above its request's estimate grows
+/// its lease or is dropped, so the sequencer's wire and decoded bytes stay
+/// within the live `BlockSync` and `Consensus` leases.
 struct RetainedBound;
 
 impl<S: HasView> Bound<S> for RetainedBound
@@ -1218,18 +1144,20 @@ where
     S::View: OwnerView,
 {
     const ID: &'static str = RETAINED_BYTE_BOUND;
-    const CLAIM: &'static str = concat!("retained wire bytes stay within ", retained_formula!());
-    const UNIT: Unit = Unit::WireBytes;
+    const CLAIM: &'static str =
+        "retained wire and decoded bytes stay within live block-sync and consensus leases (mem-2)";
+    const UNIT: Unit = Unit::ResidentBytes;
     const NEEDS: &'static [Source] = &[Source::View];
     const WITNESS: fn(&ObservationLog) -> bool = commit_window_filled;
-    type Terms = ();
-    type Peaks = [(&'static str, u64); 2];
+    type Terms = u64;
+    type Peaks = [(&'static str, u64); 4];
 
-    fn read(cx: &CheckCtx<'_, S>) -> Reading<(), Self::Peaks> {
-        let (retained, limit, peaks, gap) = cx.view().read_owners(|owners| {
+    fn read(cx: &CheckCtx<'_, S>) -> Reading<u64, Self::Peaks> {
+        let (wire, decoded, leases, peaks, gap) = cx.view().read_owners(|owners| {
             (
                 owners.retained(),
-                owners.limits.retained_bound(),
+                owners.retained_decoded(),
+                owners.pool_block_leases(),
                 owners.peaks(),
                 owners.holder_gap().map(str::to_owned),
             )
@@ -1238,107 +1166,32 @@ where
             return Reading::MissingEvidence(gap);
         }
         Reading::Measured(Measured {
-            quantity: retained,
-            limit,
+            quantity: wire.saturating_add(decoded),
+            limit: leases,
             peaks: [
                 ("retained-wire-bytes", peaks.retained),
+                (
+                    "retained-wire-and-decoded-bytes",
+                    peaks.retained_with_decoded,
+                ),
                 ("input-queue-wire-bytes", peaks.queued),
+                ("pool-block-sync-leases", peaks.pool_block_leases),
             ],
-            terms: (),
+            terms: decoded,
         })
     }
 
-    fn violation(measured: &Measured<(), Self::Peaks>) -> (String, String) {
+    fn violation(measured: &Measured<u64, Self::Peaks>) -> (String, String) {
         (
             format!(
-                concat!(
-                    "the sequencer retains at most ",
-                    retained_formula!(),
-                    " = {} wire bytes"
-                ),
+                "retained wire and decoded bytes stay within the pool's block-sync and \
+                 consensus leases, {} bytes",
                 measured.limit
             ),
-            format!("it retains {}", measured.quantity),
-        )
-    }
-}
-
-/// [`RESERVED_BYTE_BOUND`], checked after every step, with `h` from
-/// [`OwnerModel::counted_handoffs`]. A handoff that never ends, such as a
-/// leaked charge, counts only while its routine could still be in it.
-struct ReservedBound;
-
-/// What [`ReservedBound`]'s violation text names.
-struct ReservedTerms {
-    limits: Limits,
-    /// `h`, the handoffs the limit counts.
-    handoffs: u64,
-    /// The handoffs open.
-    open: usize,
-}
-
-impl<S: HasView> Bound<S> for ReservedBound
-where
-    S::View: OwnerView,
-{
-    const ID: &'static str = RESERVED_BYTE_BOUND;
-    const CLAIM: &'static str = concat!("reserved request bytes stay within ", reserved_formula!());
-    const UNIT: Unit = Unit::EstimateBytes;
-    const NEEDS: &'static [Source] = &[Source::View];
-    const WITNESS: fn(&ObservationLog) -> bool = budget_charged;
-    type Terms = ReservedTerms;
-    type Peaks = [(&'static str, u64); 3];
-
-    fn read(cx: &CheckCtx<'_, S>) -> Reading<ReservedTerms, Self::Peaks> {
-        let status = cx.status;
-        let (reserved, handoffs, open, peaks, limits, gap) = cx.view().read_owners(|owners| {
-            (
-                owners.reserved(),
-                owners.counted_handoffs(status),
-                owners.handoffs().len(),
-                owners.peaks(),
-                owners.limits,
-                owners.gap(),
-            )
-        });
-        if let Some(gap) = gap {
-            return Reading::MissingEvidence(gap);
-        }
-        Reading::Measured(Measured {
-            quantity: reserved,
-            limit: limits.reserved_bound(handoffs),
-            peaks: [
-                ("reserved-estimate-bytes", peaks.reserved),
-                (
-                    "past-budget-estimate-bytes",
-                    peaks.reserved.saturating_sub(limits.budget),
-                ),
-                ("open-handoffs", peaks.handoffs),
-            ],
-            terms: ReservedTerms {
-                limits,
-                handoffs,
-                open,
-            },
-        })
-    }
-
-    fn violation(measured: &Measured<ReservedTerms, Self::Peaks>) -> (String, String) {
-        let ReservedTerms {
-            limits,
-            handoffs,
-            open,
-        } = &measured.terms;
-        (
             format!(
-                concat!(
-                    "the byte budget counts at most ",
-                    reserved_formula!(),
-                    " = {} bytes, with M = {}, k = {} and h = {}"
-                ),
-                measured.limit, limits.budget, limits.per_request, handoffs
+                "it retains {} bytes, {} of them decoded",
+                measured.quantity, measured.terms
             ),
-            format!("it counts {}, with {open} handoffs open", measured.quantity),
         )
     }
 }
@@ -1350,9 +1203,14 @@ where
 /// sequencer through a send permit it reserved, so no routine parks
 /// between a handoff's start and its release either. A routine reports a
 /// snapshot before it parks, so at rest each routine's latest snapshot
-/// lists what its requests still charge. So at rest no handoff is open,
-/// and the budget equals the work queue's tally and the routines'
-/// unreceived estimates.
+/// lists what its requests still charge.
+///
+/// The pool's `BlockSync` and `Consensus` leases are then exact: each
+/// outstanding request leases its estimate, each retained body its wire
+/// bytes plus its decoded bytes, each detached submission the decoded block
+/// the driver still holds, and each receive-credit drain its unspent
+/// credit. A body above its estimate grows its lease or is dropped, so no
+/// tolerance applies.
 fn check_ledgers<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict
 where
     S::View: OwnerView,
@@ -1360,15 +1218,20 @@ where
     if !crate::at_rest(cx.status) {
         return Verdict::NotApplicable;
     }
-    let (reserved, queued, unreceived, handoffs, gap) = cx.view().read_owners(|owners| {
-        (
-            owners.reserved(),
-            owners.queue_reserved(),
-            owners.unreceived_estimates(),
-            owners.handoffs().len(),
-            owners.gap(),
-        )
-    });
+    let (reserved, queued, unreceived, handoffs, pool_leased, draining, retained, detached, gap) =
+        cx.view().read_owners(|owners| {
+            (
+                owners.reserved(),
+                owners.queue_reserved(),
+                owners.unreceived_estimates(),
+                owners.handoffs().len(),
+                owners.pool_block_leases(),
+                owners.pool_draining_receive,
+                owners.retained().saturating_add(owners.retained_decoded()),
+                owners.detached_decoded,
+                owners.gap(),
+            )
+        });
     if let Some(gap) = gap {
         cx.missing_evidence(gap);
         return Verdict::NotApplicable;
@@ -1391,157 +1254,21 @@ where
             format!("the budget counts {reserved}"),
         );
     }
+    let expected = reserved
+        .saturating_add(retained)
+        .saturating_add(detached)
+        .saturating_add(draining);
+    if pool_leased != expected {
+        return cx.violated(
+            format!(
+                "the pool's block-sync and consensus leases equal in-flight estimates \
+                 ({reserved}) + retained bytes ({retained}) + detached submissions \
+                 ({detached}) + draining receive credit ({draining}) = {expected}"
+            ),
+            format!("the pool counts {pool_leased}"),
+        );
+    }
     Verdict::Holds
-}
-
-/// [`LOOKAHEAD_OVERSHOOT_BOUND`], checked after each step that left the
-/// run at rest, the boundary at which every routine's snapshot is current.
-struct LookaheadBound;
-
-/// What [`LookaheadBound`]'s violation text names.
-struct LookaheadTerms {
-    limits: Limits,
-    quantities: Lookahead,
-}
-
-impl<S: HasView> Bound<S> for LookaheadBound
-where
-    S::View: OwnerView,
-{
-    const ID: &'static str = LOOKAHEAD_OVERSHOOT_BOUND;
-    const CLAIM: &'static str = concat!(
-        "at rest, above-window retained bytes plus outstanding above-window estimates \
-         stay within ",
-        lookahead_formula!()
-    );
-    const UNIT: Unit = Unit::WireBytes;
-    const NEEDS: &'static [Source] = &[Source::View, Source::Schedule];
-    const WITNESS: fn(&ObservationLog) -> bool = above_window_requested;
-    type Terms = LookaheadTerms;
-    type Peaks = [(&'static str, u64); 4];
-
-    fn read(cx: &CheckCtx<'_, S>) -> Reading<LookaheadTerms, Self::Peaks> {
-        if !crate::at_rest(cx.status) {
-            return Reading::Unjudged;
-        }
-        let (quantities, limits, gap) = cx
-            .view()
-            .read_owners(|owners| (owners.lookahead(), owners.limits, owners.gap()));
-        if let Some(gap) = gap {
-            return Reading::MissingEvidence(gap);
-        }
-        let Lookahead {
-            retained,
-            estimated,
-            hint_error,
-        } = quantities;
-        let total = retained.saturating_add(estimated);
-        Reading::Measured(Measured {
-            quantity: total,
-            limit: limits.lookahead_bound(hint_error),
-            peaks: [
-                ("above-window-wire-bytes", retained),
-                ("above-window-estimate-bytes", estimated),
-                ("hint-error-bytes", hint_error),
-                (
-                    "past-lookahead-bytes",
-                    total.saturating_sub(limits.lookahead),
-                ),
-            ],
-            terms: LookaheadTerms { limits, quantities },
-        })
-    }
-
-    fn violation(measured: &Measured<LookaheadTerms, Self::Peaks>) -> (String, String) {
-        let LookaheadTerms { limits, quantities } = &measured.terms;
-        (
-            format!(
-                concat!(
-                    "above-window bytes R + E stay within ",
-                    lookahead_formula!(),
-                    " = {}, with L = {}, H = {}, W = {} and k = {}"
-                ),
-                measured.limit,
-                limits.lookahead,
-                quantities.hint_error,
-                limits.workers,
-                limits.per_request
-            ),
-            format!(
-                "R = {} and E = {}",
-                quantities.retained, quantities.estimated
-            ),
-        )
-    }
-}
-
-/// Checks [`TEARDOWN_RETURNS_BASELINE`] after a step.
-///
-/// The trigger is every link the harness made having closed. Settlement is
-/// established apart from the charges: every admitted session's routine,
-/// and every routine that reported a snapshot, has reported its last one,
-/// the sequencer's input queue is empty, every serving lease is released,
-/// and the run is at rest. The input queue is part of settlement because
-/// the sequencer can rest in a submit, waiting for storage, with bodies
-/// still queued: those bodies are the sequencer's work, which no peer's
-/// leaving ends. Serving leases are part of it for the same reason: a
-/// serving range read outlives its link's close, and it holds a clone of
-/// the session's sender, and so the session's slot, until storage answers.
-/// Then the budget, the work queue's tally and the routines' unreceived
-/// estimates must all be zero, no handoff may be open, and the service's
-/// session slots must all be free again. Before settlement the property is
-/// pending ([`Pending::BlockTeardownOpen`]), so a run that ends there,
-/// including one with a leaked routine, queued body or serving lease, is
-/// unsettled, not a violation. `receiver-serving-bounded` catches a leaked serving
-/// lease. A serving lease gap leaves settlement unknown, so it is missing
-/// evidence.
-pub(crate) fn check_teardown<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict
-where
-    S::View: OwnerView,
-{
-    let status = cx.status;
-    let (left, unended, queued, serving, charges, gap) = cx.view().read_owners(|owners| {
-        (
-            owners.peers_left(),
-            owners.unended(),
-            owners.queued(),
-            owners.serving_leases(),
-            [
-                ("the byte budget", owners.reserved()),
-                ("the work queue's tally", owners.queue_reserved()),
-                (
-                    "the routines' unreceived estimates",
-                    owners.unreceived_estimates(),
-                ),
-                (
-                    "open handoffs",
-                    u64::try_from(owners.handoffs().len()).unwrap_or(u64::MAX),
-                ),
-                ("held session slots", owners.session_slots()),
-            ],
-            owners
-                .gap()
-                .or_else(|| owners.serving_gap().map(str::to_owned)),
-        )
-    });
-    if !left {
-        return Verdict::NotApplicable;
-    }
-    if let Some(gap) = gap {
-        cx.missing_evidence(gap);
-        return Verdict::NotApplicable;
-    }
-    if unended > 0 || queued > 0 || serving > 0 || !crate::at_rest(status) {
-        cx.pending(Pending::BlockTeardownOpen);
-        return Verdict::NotApplicable;
-    }
-    match charges.iter().find(|(_, value)| *value > 0) {
-        None => Verdict::Holds,
-        Some((owner, value)) => cx.violated(
-            format!("{owner} is zero once teardown settles"),
-            format!("it counts {value}"),
-        ),
-    }
 }
 
 /// The block-sync events in `log`.
@@ -1570,115 +1297,55 @@ fn commit_window_filled(log: &ObservationLog) -> bool {
     })
 }
 
-/// [`RESERVED_BYTE_BOUND`]'s trigger history: a floor request charged the
-/// budget past what it could reserve, the only change that can take the
-/// budget past `M`.
-fn budget_charged(log: &ObservationLog) -> bool {
-    block_sync_facts(log)
-        .any(|fact| matches!(fact, BlockSyncFact::Budget { change, .. } if change == "charged"))
-}
-
 /// [`BUDGET_LEDGERS_AGREE`]'s trigger history: a routine handed a charged
 /// body to the sequencer, the release that moves the two ledgers apart.
 fn body_handed_off(log: &ObservationLog) -> bool {
     block_sync_facts(log).any(|fact| matches!(fact, BlockSyncFact::HandoffStarted { .. }))
 }
 
-/// [`LOOKAHEAD_OVERSHOOT_BOUND`]'s trigger history: a routine published a
-/// request for a height above the window of the highest verified tip that
-/// any view had published by then.
-fn above_window_requested(log: &ObservationLog) -> bool {
-    let mut tip = 0;
-    log.entries().iter().any(|entry| match &entry.obs {
-        Observation::Storage {
-            fact: StorageFact::ViewPublished { verified_best, .. },
-            ..
-        } => {
-            tip = tip.max(u64::from(verified_best.height));
-            false
-        }
-        Observation::BlockSync {
-            event: BlockSyncFact::Request { heights, step, .. },
-            ..
-        } => {
-            step == "published"
-                && heights
-                    .iter()
-                    .any(|height| u64::from(*height) > tip.saturating_add(COMMIT_WINDOW_BLOCKS))
-        }
-        _ => false,
-    })
-}
-
-/// [`TEARDOWN_RETURNS_BASELINE`]'s trigger history: a routine's
-/// second-to-last snapshot listed an unreceived request height before its
-/// last one, so the routine ended owing work it had to return.
-fn routine_ended_owing(log: &ObservationLog) -> bool {
-    let mut owing = BTreeSet::new();
-    block_sync_facts(log).any(|fact| match fact {
-        BlockSyncFact::Routine {
-            connection,
-            generation,
-            requests,
-            ended,
-            ..
-        } => {
-            let routine = (*connection, *generation);
-            if *ended {
-                return owing.contains(&routine);
-            }
-            let unreceived = requests
-                .iter()
-                .any(|request| request.heights.iter().any(|height| !height.received));
-            if unreceived {
-                owing.insert(routine);
-            } else {
-                owing.remove(&routine);
-            }
-            false
-        }
-        _ => false,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use std::rc::Rc;
 
-    use zakura_scheduler::SimInstant;
+    use zakura_scheduler::{SimInstant, Status as SchedulerStatus};
 
     use super::*;
     use crate::{
         check::{Phase, StepCtx},
+        domain::memory_pool::{teardown_returns_zero, PoolGaugeModel, PoolView},
+        observe::PoolFact,
         Identity,
     };
 
-    /// A harness whose view is a fixed owner model.
-    struct Scripted(Rc<OwnerModel>);
+    /// A harness whose view pairs an owner model with a pool gauge model.
+    struct Scripted(Rc<(OwnerModel, PoolGaugeModel)>);
 
     impl HasView for Scripted {
-        type View = Rc<OwnerModel>;
+        type View = Rc<(OwnerModel, PoolGaugeModel)>;
 
-        fn view(&self) -> Rc<OwnerModel> {
+        fn view(&self) -> Self::View {
             self.0.clone()
         }
     }
 
-    impl OwnerView for Rc<OwnerModel> {
+    impl OwnerView for Rc<(OwnerModel, PoolGaugeModel)> {
         fn read_owners<T>(&self, read: impl FnOnce(&OwnerModel) -> T) -> T {
-            read(self)
+            read(&self.0)
         }
     }
 
-    /// [`TEARDOWN_RETURNS_BASELINE`]'s verdict on `owners` after a step that
-    /// left the run quiescent, and the missing evidence it reported.
-    fn teardown(owners: OwnerModel) -> (Verdict, Option<String>) {
-        let harness = Scripted(Rc::new(owners));
-        let registered = resource_properties::<Scripted>();
-        let property = registered
-            .iter()
-            .find(|property| property.id == PropertyId::new(TEARDOWN_RETURNS_BASELINE))
-            .expect("the resource properties register teardown");
+    impl PoolView for Rc<(OwnerModel, PoolGaugeModel)> {
+        fn read_pool<T>(&self, read: impl FnOnce(&PoolGaugeModel) -> T) -> T {
+            read(&self.1)
+        }
+    }
+
+    /// [`TEARDOWN_RETURNS_ZERO`]'s verdict on `(owners, pool)` after a step
+    /// that left the run quiescent, and any missing evidence it reported.
+    fn teardown(owners: OwnerModel, pool: PoolGaugeModel) -> (Verdict, Option<String>) {
+        let harness = Scripted(Rc::new((owners, pool)));
+        let registered = vec![teardown_returns_zero::<Scripted>()];
+        let property = &registered[0];
         let log = ObservationLog::default();
         let pick = Identity::advance_time(SimInstant::ZERO);
         let step = StepCtx {
@@ -1734,7 +1401,10 @@ mod tests {
         let mut owners = settled(2);
         owners.apply(slots(1));
         owners.apply(slots(2));
-        assert_eq!(teardown(owners), (Verdict::Holds, None));
+        assert_eq!(
+            teardown(owners, PoolGaugeModel::default()),
+            (Verdict::Holds, None)
+        );
     }
 
     /// The scripted bypass: one session slot held once teardown settles.
@@ -1742,7 +1412,7 @@ mod tests {
     fn a_held_session_slot_violates_once_teardown_settles() {
         let mut owners = settled(2);
         owners.apply(slots(1));
-        let (verdict, _) = teardown(owners);
+        let (verdict, _) = teardown(owners, PoolGaugeModel::default());
         assert_eq!(
             violation(&verdict),
             (
@@ -1750,6 +1420,28 @@ mod tests {
                 "it counts 1"
             )
         );
+    }
+
+    /// The pool-gauge bypass: one pool lease still live once teardown settles.
+    #[test]
+    fn a_leaked_pool_lease_violates_once_teardown_settles() {
+        let owners = settled(2);
+        let mut pool = PoolGaugeModel::default();
+        pool.observe(&PoolFact::Granted {
+            lease_id: 1,
+            consumer: zakura_network::zakura::memory::Consumer::BlockSync,
+            peer: Some(1),
+            bytes: 2_000,
+            consumer_leased: 2_000,
+            consumer_cap: 10_000,
+            consumer_share: 5_000,
+            total_leased: 2_000,
+            pool_limit: 20_000,
+        });
+        let (verdict, _) = teardown(owners, pool);
+        let (expected, actual) = violation(&verdict);
+        assert!(expected.contains("returns to zero"), "{expected}");
+        assert!(actual.contains("2000 B"), "{actual}");
     }
 
     /// A serving lease on height 1 of connection 3, taken if `acquired`.
@@ -1770,17 +1462,23 @@ mod tests {
         let mut owners = settled(2);
         owners.apply(lease(true));
         owners.apply(slots(1));
-        assert_eq!(teardown(owners.clone()), (Verdict::NotApplicable, None));
+        assert_eq!(
+            teardown(owners.clone(), PoolGaugeModel::default()),
+            (Verdict::NotApplicable, None)
+        );
         owners.apply(lease(false));
         owners.apply(slots(2));
-        assert_eq!(teardown(owners), (Verdict::Holds, None));
+        assert_eq!(
+            teardown(owners, PoolGaugeModel::default()),
+            (Verdict::Holds, None)
+        );
     }
 
     #[test]
     fn a_lease_released_without_its_acquisition_is_missing_evidence() {
         let mut owners = settled(1);
         owners.apply(lease(false));
-        let (verdict, missing) = teardown(owners);
+        let (verdict, missing) = teardown(owners, PoolGaugeModel::default());
         assert_eq!(verdict, Verdict::NotApplicable);
         assert!(missing.is_some_and(|gap| gap.contains("never took")));
     }

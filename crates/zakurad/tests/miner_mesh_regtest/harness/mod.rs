@@ -142,7 +142,6 @@ pub struct NodeSpec {
     role: Role,
     bootstrap_from: Vec<usize>,
     max_connections: Option<usize>,
-    gateway_capacity: Option<usize>,
     start_later: bool,
     trace_connections: bool,
 }
@@ -154,7 +153,6 @@ impl NodeSpec {
             role,
             bootstrap_from: Vec::new(),
             max_connections: None,
-            gateway_capacity: None,
             start_later: false,
             trace_connections: false,
         }
@@ -169,12 +167,6 @@ impl NodeSpec {
     /// Sets the node's `network.zakura.max_connections`.
     pub fn max_connections(mut self, limit: usize) -> Self {
         self.max_connections = Some(limit);
-        self
-    }
-
-    /// Funds this many gateway places beyond the configured ordinary connection limit.
-    pub fn gateway_capacity(mut self, slots: usize) -> Self {
-        self.gateway_capacity = Some(slots);
         self
     }
 
@@ -960,18 +952,7 @@ fn configure_node(
     config.network.zakura.bootstrap_peers = bootstrap_peers;
     config.network.zakura.max_connections_per_ip = MAX_CONNECTIONS_PER_IP;
     if let Some(limit) = spec.max_connections {
-        config.network.zakura.max_connections = limit;
-    }
-
-    if let Some(extra) = spec.gateway_capacity {
-        let network = &config.network;
-        let total = network.zakura.max_connections + extra;
-        config.network.zakura.peer_memory_budget_bytes = u64::try_from(
-            network
-                .zakura
-                .quic_memory_bytes(&network.network, total, &[]),
-        )
-        .expect("the regtest peer budget fits in u64");
+        config.network.zakura.max_connections = Some(limit);
     }
 
     // The test config names a miner address, which every mining role keeps.

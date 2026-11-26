@@ -138,9 +138,15 @@ where
     }
 }
 
-/// A released round returns its reservation and leases once its calls are
-/// handled, and a stopped node's teardown returns every chunk-budget charge
-/// and every locator permit no pending storage read still holds.
+/// A released round returns its chunk-budget reservation and leases once its
+/// calls are handled, and a stopped node's teardown returns every
+/// chunk-budget charge and every locator permit no pending storage read
+/// still holds.
+///
+/// The chunk budget and the locator permits are header sync's fixed terms,
+/// not memory-pool leases, so this property checks only them.
+/// [`memory/teardown-returns-zero`](crate::domain::memory_pool::TEARDOWN_RETURNS_ZERO)
+/// checks that every memory-pool lease returns.
 pub const TEARDOWN_RETURNS_BASELINE: &str = "header-sync/teardown-returns-baseline";
 
 /// The claim rules [`TEARDOWN_RETURNS_BASELINE`] reports: round settlement's,
@@ -174,9 +180,9 @@ where
 {
     Property {
         id: PropertyId::new(TEARDOWN_RETURNS_BASELINE),
-        claim: "a released header round returns its reservation and leases once its calls are \
-                handled, and a stopped node's teardown returns every chunk-budget charge and \
-                every locator permit no pending storage read still holds",
+        claim: "a released header round returns its chunk-budget reservation and leases once \
+                its calls are handled, and a stopped node's teardown returns every chunk-budget \
+                charge and every locator permit no pending storage read still holds",
         kind: Kind::Safety,
         assumes: &[],
         needs: &[Source::View],

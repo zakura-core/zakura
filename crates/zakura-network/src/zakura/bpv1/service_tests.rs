@@ -71,25 +71,29 @@ fn config_default_is_opt_in_and_disabled_adds_zero_envelope_bytes() {
     assert!(cfg.zakura.bpv1.validate().is_ok());
     // Hold max_connections fixed under a generous peer memory budget so both
     // envelopes compare the exact same connection count.
-    cfg.zakura.max_connections = 8;
+    cfg.zakura.max_connections = Some(8);
 
     let limits = ZakuraLocalLimits::from_config(&cfg);
-    let env_disabled = NodeEnvelope::for_node(&cfg, &limits, &[], 0).expect("disabled envelope");
+    let env_disabled =
+        NodeEnvelope::for_memory_plan(&cfg, &limits, &[], 0).expect("disabled envelope");
     assert!(env_disabled.quic_bytes > 0);
 
     let mut cfg_enabled = cfg.clone();
     cfg_enabled.zakura.bpv1.enabled = true;
     let limits_enabled = ZakuraLocalLimits::from_config(&cfg_enabled);
-    assert_eq!(limits.max_connections, limits_enabled.max_connections);
-    let env_enabled =
-        NodeEnvelope::for_node(&cfg_enabled, &limits_enabled, &[], 0).expect("enabled envelope");
+    assert_eq!(
+        limits.total_connections(),
+        limits_enabled.total_connections()
+    );
+    let env_enabled = NodeEnvelope::for_memory_plan(&cfg_enabled, &limits_enabled, &[], 0)
+        .expect("enabled envelope");
 
     // Each stream's writer holds one encoded frame outside its output gate.
     assert_eq!(
         super::config::BPV1_SESSION_HELD_OUTPUT_BYTES,
         u64::from(super::wire::CONTROL_FRAME_CAP) + u64::from(super::wire::DATA_FRAME_CAP),
     );
-    let expected_delta = u128::from(limits_enabled.max_connections as u64)
+    let expected_delta = u128::from(limits_enabled.total_connections() as u64)
         * u128::from(super::config::BPV1_SESSION_HELD_OUTPUT_BYTES);
     assert_eq!(
         env_enabled.serve_output_bytes - env_disabled.serve_output_bytes,
@@ -99,6 +103,37 @@ fn config_default_is_opt_in_and_disabled_adds_zero_envelope_bytes() {
     assert!(
         env_enabled.quic_bytes > env_disabled.quic_bytes,
         "enabled BPv1 registers its two persistent stream kinds in reactor_shares"
+    );
+
+    // The memory plan's session base `b_bpv1` covers the held output the
+    // envelope registers per session and both output gates.
+    let base = super::memory::SessionBase::new(&cfg_enabled.zakura.bpv1);
+    let held_per_session = (env_enabled.serve_output_bytes - env_disabled.serve_output_bytes)
+        / u128::from(limits_enabled.total_connections() as u64);
+    let gates = super::wire::BPV1_CONTROL_BUDGET.output + super::wire::BPV1_DATA_BUDGET.output;
+    assert!(
+        u128::from(base.session) >= held_per_session + u128::from(gates),
+        "a session's base funds its held output and both output gates"
+    );
+}
+
+#[test]
+fn config_max_sessions_is_an_optional_cap_and_early_records_scale_by_session() {
+    let config = super::config::ZakuraBpv1Config::default();
+    // `max_sessions` is unset by default, so memory decides the session
+    // count. A set value is a reactor cap, and zero is invalid.
+    assert_eq!(config.max_sessions, None);
+    assert!(config.admits_session(10_000));
+    let mut capped = config.clone();
+    capped.max_sessions = Some(2);
+    assert!(capped.admits_session(1) && !capped.admits_session(2));
+    capped.max_sessions = Some(0);
+    assert!(capped.validate().is_err());
+
+    assert_eq!(
+        config.early_node_bytes_cap(3),
+        3 * u64::try_from(config.early_peer_bytes_cap).expect("the default cap fits in u64"),
+        "the node's early-record cap is sessions × early_peer_bytes_cap"
     );
 }
 

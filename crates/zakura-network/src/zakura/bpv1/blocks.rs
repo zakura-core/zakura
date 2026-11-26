@@ -1568,6 +1568,10 @@ pub struct BlockTable {
     pending_bytes: usize,
     /// Admitted (and retired-in-window) blocks.
     blocks: HashMap<block::Hash, ActiveBlock>,
+    /// Verifier work of retired blocks whose verdict has not arrived. Each
+    /// still holds an assembled block's lease, so it keeps a slot from peer
+    /// blocks until its verdict (mem-5).
+    owed_verdicts: HashSet<WorkId>,
     /// Count of best-header moves (`ParentAdmitted`). A move during an
     /// entry's admission or checks wakes nothing for it, so the entry retries
     /// admission instead of parking.
@@ -1589,6 +1593,7 @@ impl BlockTable {
             pending: HashMap::new(),
             pending_bytes: 0,
             blocks: HashMap::new(),
+            owed_verdicts: HashSet::new(),
             best_moves: 0,
         }
     }
@@ -1715,6 +1720,74 @@ impl BlockTable {
     /// Peer part bytes charged against the part buffer budget, in flight or stored.
     pub fn part_buffer_bytes(&self) -> u64 {
         self.blocks.values().map(ActiveBlock::charged_bytes).sum()
+    }
+
+    /// Bytes the table retains: part charges, pending and admitting metadata,
+    /// each admitted block's `HeaderMeta`, and the parts of blocks this node
+    /// proposed, which it stores without a charge.
+    pub fn retained_bytes(&self) -> u64 {
+        let blocks = self
+            .blocks
+            .values()
+            .filter(|block| block.phase != BlockPhase::Retired)
+            .map(|block| {
+                // Widening usize to u64 is lossless on supported targets.
+                let meta = block.meta.estimated_bytes() as u64;
+                let local = if block.as_proposer {
+                    block.meta.coding.encoded_bytes()
+                } else {
+                    0
+                };
+                block
+                    .charged_bytes()
+                    .saturating_add(meta)
+                    .saturating_add(local)
+            })
+            .fold(0, u64::saturating_add);
+        let admitting: usize = self
+            .admitting
+            .values()
+            .map(|entry| entry.envelope.estimated_bytes())
+            .sum();
+        // Widening usize to u64 is lossless on supported targets.
+        blocks.saturating_add(self.pending_bytes.saturating_add(admitting) as u64)
+    }
+
+    /// The most blocks that hold an assembled block while their verdict is
+    /// owed: up to `max_concurrent_blocks` live blocks, plus each block above
+    /// the next height that a next block displaces (`bpv1-83`).
+    ///
+    /// A peer block takes a slot only while live and owed blocks together
+    /// stay below `max_concurrent_blocks`, so at most that many blocks sit
+    /// above the next height to be displaced, each at most once. A local
+    /// solve assembles nothing.
+    pub fn max_owed_verdicts(config: &BlockConfig) -> usize {
+        config.max_concurrent_blocks.saturating_mul(2)
+    }
+
+    /// The most bytes [`Self::retained_bytes`] reaches under `config`: the part
+    /// buffer budget, the metadata budget, and, for every concurrent block, a
+    /// largest `HeaderMeta` and a largest local encoding.
+    pub fn retained_bound(config: &BlockConfig) -> u64 {
+        // Widening usize to u64 is lossless on supported targets.
+        let per_block = (MetaEnvelope::MAX_ESTIMATED_BYTES as u64)
+            .saturating_add(config.profile.max_coding().encoded_bytes());
+        config
+            .part_buffer_bytes
+            .saturating_add(MAX_PENDING_META_BYTES as u64)
+            .saturating_add((config.max_concurrent_blocks as u64).saturating_mul(per_block))
+    }
+
+    /// The `Propagation` lease that covers [`Self::retained_bytes`]: the
+    /// retained bytes rounded up to a whole largest block's parts, so the IO
+    /// shell resizes its lease a few times per block, not once per part, and
+    /// never past [`Self::retained_bound`].
+    pub fn lease_bytes(&self) -> u64 {
+        let step = self.config.profile.max_coding().encoded_bytes().max(1);
+        self.retained_bytes()
+            .div_ceil(step)
+            .saturating_mul(step)
+            .min(Self::retained_bound(&self.config))
     }
 
     /// Returns the number of retained parts across all non-retired blocks.
@@ -2700,35 +2773,41 @@ impl BlockTable {
     /// Retires the lowest `Done` block, else the lowest `Fallback` block so a
     /// stalled fallback never wedges admission. With `force`, retires the lowest
     /// non-retired block as a last resort. Returns whether a slot is free.
+    ///
+    /// A peer block may assemble, so its slots also count each owed verdict,
+    /// which holds an assembled block's lease (mem-5). A `force` admission is
+    /// a local solve, which assembles nothing, so it counts only live blocks.
     fn evict_for_slot(&mut self, force: bool, step: &mut BlockStep) -> bool {
-        let lowest = |phases: &[BlockPhase]| {
-            self.blocks
+        loop {
+            let lowest = |phases: &[BlockPhase]| {
+                self.blocks
+                    .values()
+                    .filter(|b| phases.contains(&b.phase))
+                    .min_by_key(|b| b.height)
+                    .map(|b| b.meta.block_id)
+            };
+            let active = self
+                .blocks
                 .values()
-                .filter(|b| phases.contains(&b.phase))
-                .min_by_key(|b| b.height)
-                .map(|b| b.meta.block_id)
-        };
-        let active = self
-            .blocks
-            .values()
-            .filter(|b| b.phase != BlockPhase::Retired)
-            .count();
-        if active < self.config.max_concurrent_blocks {
-            return true;
-        }
-        let victim = lowest(&[BlockPhase::Done])
-            .or_else(|| lowest(&[BlockPhase::Fallback]))
-            .or_else(|| {
-                force
-                    .then(|| lowest(&[BlockPhase::Collecting, BlockPhase::Verifying]))
-                    .flatten()
-            });
-        match victim {
-            Some(id) => {
-                self.retire_block(id, step);
-                true
+                .filter(|b| b.phase != BlockPhase::Retired)
+                .count();
+            let owed = if force { 0 } else { self.owed_verdicts.len() };
+            if active.saturating_add(owed) < self.config.max_concurrent_blocks {
+                return true;
             }
-            None => false,
+            let victim = lowest(&[BlockPhase::Done])
+                .or_else(|| lowest(&[BlockPhase::Fallback]))
+                .or_else(|| {
+                    force
+                        .then(|| lowest(&[BlockPhase::Collecting, BlockPhase::Verifying]))
+                        .flatten()
+                });
+            // Retiring a block whose verdict is owed frees no slot for a peer
+            // block, so the loop retires the next one.
+            match victim {
+                Some(id) => self.retire_block(id, step),
+                None => return false,
+            }
         }
     }
 
@@ -3570,6 +3649,10 @@ impl BlockTable {
         verdict: VerifierVerdict,
         step: &mut BlockStep,
     ) {
+        // The block retired before its verdict, which now frees its slot.
+        if self.owed_verdicts.remove(&work_id) {
+            return;
+        }
         let Some(block) = self.blocks.get_mut(&block_id) else {
             return;
         };
@@ -3862,7 +3945,9 @@ impl BlockTable {
         let stripes = block.meta.coding.stripes;
         let n = block.meta.coding.n;
         let release_claim = std::mem::take(&mut block.body_claimed);
-        block.verify_work_id = None;
+        if let Some(work_id) = block.verify_work_id.take() {
+            self.owed_verdicts.insert(work_id);
+        }
         for st in &mut block.stripes {
             st.clear_buffers();
         }

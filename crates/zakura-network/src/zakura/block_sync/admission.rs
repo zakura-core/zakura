@@ -226,6 +226,16 @@ impl std::fmt::Debug for CommitWindow {
     }
 }
 
+/// `Consumer::Consensus` bytes an above-floor commit-window request must leave
+/// free: the most one height's request can reserve.
+///
+/// A request reserves `MAX_BLOCK_BYTES` for a body without a size hint, so the
+/// heights of one window can ask for more than the reserve holds. Leaving
+/// this much free keeps the lowest missing height fundable. The rest of the
+/// reserve only holds bodies of the window, at most one range's charge, and
+/// requests in flight, which shrink to their body or release when they end.
+pub(super) const FLOOR_CONSENSUS_HEADROOM_BYTES: u64 = block::MAX_BLOCK_BYTES;
+
 /// Hard block-count cap on speculative look-ahead bookkeeping.
 ///
 /// Defense-in-depth on the map/bookkeeping size only; the resident-memory
@@ -297,7 +307,9 @@ pub(super) fn retain_received_body(
 ///
 /// Heights in the commit window (up to `snapshot.commit_window_top`, see
 /// [`CommitWindow`]) lease from the reserved `Consumer::Consensus`, so
-/// bulk look-ahead never shrinks or blocks them (`02 §4`, decision-6). Exempt
+/// bulk look-ahead never shrinks or blocks them (`02 §4`, decision-6). An
+/// above-floor take there leaves [`FLOOR_CONSENSUS_HEADROOM_BYTES`] of the
+/// reserve for the floor. Exempt
 /// requests are capped at the top of the commit window, so one request cannot
 /// include both exempt in-window blocks and gated above-window blocks.
 ///
@@ -318,9 +330,15 @@ pub(super) fn admit(
     let window_high = snapshot.commit_window_top;
 
     let (take_high, max_request_bytes) = if start_height <= window_high {
+        let consensus_available = match priority {
+            RequestPriority::Floor => snapshot.consensus_available,
+            RequestPriority::AboveFloor => snapshot
+                .consensus_available
+                .saturating_sub(FLOOR_CONSENSUS_HEADROOM_BYTES),
+        };
         (
             servable_high.min(window_high),
-            snapshot.consensus_available.min(response_byte_cap),
+            consensus_available.min(response_byte_cap),
         )
     } else {
         if held_blocks(&snapshot) >= LOOKAHEAD_BLOCK_HARD_CAP {

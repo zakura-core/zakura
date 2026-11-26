@@ -1211,16 +1211,17 @@ reads as unset, so those nodes also get the small handshake windows.
     legacy TCP ingress. State reads are
     the state's read limit, which the node derives from its read
     concurrency, plus the state's parser allowance. The reserves fund `Control`, `Propagation` and
-    `Consensus`. The `Consensus` reserve holds the network's worst 401-block
-    checkpoint window at admission's charge per block, so the chain sets the
-    smallest host that can run. The `Sessions` floor funds 19 full
-    connections on Mainnet. With the draft values and
-    `p2p_stack = "zakura"`, Mainnet and Testnet need a host of about
-    13.3 GiB, and Regtest about 9.5 GiB. In `Dual` mode, legacy TCP ingress
-    and one legacy read add 1.2 GiB of fixed terms, and Mainnet needs about
-    14.8 GiB. Below its minimum, the node starts with no shared space and
-    logs one warning that lists every term and each raised setting that adds
-    to them. It refuses only once the draft constants are measured.
+    `Consensus`. The `Consensus` reserve holds block sync's commit window at
+    admission's charge per block: one checkpoint range, which the checkpoint
+    byte rule bounds at about 170 MiB, or the 512 MiB semantic window above
+    the last checkpoint, whichever is larger. The `Sessions` floor funds 19
+    full connections on Mainnet. With the draft values and
+    `p2p_stack = "zakura"`, Mainnet, Testnet and Regtest each need a host of
+    about 9.3 GiB. In `Dual` mode, legacy TCP ingress and one legacy read add
+    1.2 GiB of fixed terms, and Mainnet needs about 10.8 GiB. Below its
+    minimum, the node starts with no shared space and logs one warning that
+    lists every term and each raised setting that adds to them. It refuses
+    only once the draft constants are measured.
   - **BPv1.** With `[network.zakura.bpv1] enabled = true`, the `Propagation`
     reserve covers what BPv1 retains for its concurrent blocks, in place of
     the tip-block term. It holds the block table's part and metadata budgets,
@@ -1235,8 +1236,8 @@ reads as unset, so those nodes also get the small handshake windows.
     BPv1 session funds its base `b_bpv1` from `Sessions` when BPv1 admits the
     peer: its unsolicited receive credit, its output gates, its held frames
     and its early records. BPv1 adds 22.9 MiB to a full connection, so a
-    16 GiB Mainnet host funds 28 full connections, not 46, and the smallest
-    Mainnet host grows from about 13.3 GiB to about 14.1 GiB.
+    16 GiB Mainnet host funds 48 full connections, not 89, and the smallest
+    Mainnet host grows from about 9.3 GiB to about 10.0 GiB.
   - **Preferred gateways.** A mining node holds up to ten connection places
     above `max_connections` for the mining gateways it ranks highest. While
     places are held, ordinary connections leave one full connection's bases
@@ -2840,8 +2841,8 @@ Changed:
 - **§9.1, CTRL-26.** `max_connections` becomes an optional ceiling. A
   pending handshake holds 128 KiB of windows. Admission leases each
   connection's bases, requests lease their receive credit, and send windows
-  grow toward `2 × cwnd`. The chain's worst checkpoint window sets the
-  smallest host that can run. With BPv1 on, the `Propagation` reserve covers
+  grow toward `2 × cwnd`. Block sync's commit window sets the `Consensus`
+  reserve, 512 MiB. With BPv1 on, the `Propagation` reserve covers
   what BPv1 retains, and each BPv1 session funds its own base. A raised
   setting that can exceed the budget warns at startup. A budget below demand
   can cost a peer throughput, and never faults or penalizes it.

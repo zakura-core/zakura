@@ -242,16 +242,18 @@ impl Drop for WorkQueueGuard<'_> {
     }
 }
 
-/// A pool whose reserved Consensus and bulk BlockSync consumers each lease
-/// up to `bytes`, the shape block sync leases from, for tests and fuzzers.
+/// A pool whose reserved Consensus and bulk BlockSync consumers each fund
+/// `bytes` of requests at any height, the shape block sync leases from, for
+/// tests and fuzzers. Consensus also reserves the floor's headroom.
 #[cfg(any(test, feature = "p2p-fuzz", feature = "internal-bench"))]
 pub(super) fn test_memory_pool(bytes: u64) -> MemoryPool {
     use crate::zakura::memory::{Consumer, ConsumerSpec, PoolConfig};
     // Keep the pool's sums far from overflow for "unlimited" test budgets.
     let bytes = bytes.min(1 << 50);
+    let consensus = bytes + super::admission::FLOOR_CONSENSUS_HEADROOM_BYTES;
     MemoryPool::new(
-        PoolConfig::new(bytes.saturating_mul(2), 0)
-            .with_consumer(Consumer::Consensus, ConsumerSpec::reserved(bytes))
+        PoolConfig::new(consensus + bytes, 0)
+            .with_consumer(Consumer::Consensus, ConsumerSpec::reserved(consensus))
             .with_consumer(Consumer::BlockSync, ConsumerSpec::bulk(0, bytes, 1)),
     )
 }
@@ -1087,9 +1089,10 @@ mod memory_pool_tests {
     #[test]
     fn withheld_consensus_drain_moves_to_block_sync_before_reissue() {
         for pool_full in [false, true] {
-            // Consensus reserves exactly one 2 MB height. S = 4 MB.
-            let config = PoolConfig::new(7 * MB, 0)
-                .with_consumer(Consumer::Consensus, ConsumerSpec::reserved(2 * MB))
+            // Consensus reserves exactly one 2 MB above-floor height and the
+            // floor's 2 MB headroom. S = 4 MB.
+            let config = PoolConfig::new(9 * MB, 0)
+                .with_consumer(Consumer::Consensus, ConsumerSpec::reserved(4 * MB))
                 .with_consumer(Consumer::BlockSync, ConsumerSpec::bulk(MB, MB, 1))
                 .with_consumer(Consumer::Serving, ConsumerSpec::bulk(0, 4 * MB, 1));
             let pool = MemoryPool::new(config);
@@ -1127,6 +1130,29 @@ mod memory_pool_tests {
             }
             assert!(pool.snapshot().total_leased <= pool.snapshot().lease_limit);
         }
+    }
+
+    /// Above-floor commit-window requests leave one maximum block of
+    /// Consensus free, so the floor height still leases once they fill the
+    /// rest of the reserve.
+    #[test]
+    fn above_floor_requests_leave_consensus_room_for_the_floor() {
+        let config = PoolConfig::new(6 * MB, 0)
+            .with_consumer(Consumer::Consensus, ConsumerSpec::reserved(6 * MB));
+        let pool = MemoryPool::new(config);
+        let queue = queue_with(&pool, &[1, 100, 101, 102]);
+        let cancel = CancellationToken::new();
+
+        let _first = admit(&queue, 100, 1, 42, &cancel).expect("4 MB stays free");
+        let _second = admit(&queue, 101, 2, 42, &cancel).expect("2 MB stays free");
+        assert_eq!(
+            admit(&queue, 102, 3, 42, &cancel).map(|_| ()).unwrap_err(),
+            AdmitRefusal::Capacity(Consumer::Consensus),
+            "a third above-floor request would spend the floor's headroom"
+        );
+        assert_eq!(pool.consumer_leased(Consumer::Consensus), 4 * MB);
+        let _floor = admit(&queue, 1, 4, 42, &cancel).expect("the floor takes the headroom");
+        assert_eq!(pool.consumer_leased(Consumer::Consensus), 6 * MB);
     }
 
     #[test]

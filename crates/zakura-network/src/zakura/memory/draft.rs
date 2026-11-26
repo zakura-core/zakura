@@ -5,8 +5,7 @@
 //! the measured values replace these constants before the PR leaves draft.
 
 use zakura_chain::{
-    block::{Height, MAX_BLOCK_BYTES},
-    parameters::{Network, NetworkKind},
+    block::MAX_BLOCK_BYTES, parameters::checkpoint::constants::MAX_CHECKPOINT_BYTE_COUNT,
 };
 
 const MIB: u64 = 1024 * 1024;
@@ -48,50 +47,17 @@ pub const DRAFT_MANAGED_ZCASHD_SIDECAR_BYTES: u64 = 4 * GIB;
 /// `5 × 2,000,000 B`.
 pub const ADMISSION_CHARGE_PER_MAX_BLOCK: u64 = 5 * MAX_BLOCK_BYTES;
 
-/// Draft worst 401-block checkpoint window charge on Mainnet (`decision-12`).
+/// Most bytes block-sync admission charges one checkpoint range before it
+/// decodes (`decision-12`).
 ///
-/// Admission's charge summed over 401 maximal blocks:
-/// `401 × 5 × 2,000,000 = 4,010,000,000 B` (~3.73 GiB), the most any 401
-/// blocks can charge before they decode.
-///
-/// Source: conservative bound; replaced by Stage 0 (`03 §1`: offline scan of
-/// the Mainnet chain, summing admission's per-block charge).
-pub const DRAFT_WORST_CHECKPOINT_WINDOW_BYTES_MAINNET: u64 = 401 * ADMISSION_CHARGE_PER_MAX_BLOCK;
-
-/// Draft worst 401-block checkpoint window charge on Testnet (`decision-12`).
-///
-/// Testnet has the same block size limit as Mainnet, and its checkpoints
-/// cover blocks up to that limit, so the unmeasured bound equals Mainnet's.
-///
-/// Source: conservative bound; replaced by Stage 0 (`03 §1`: offline scan of
-/// the Testnet chain, summing admission's per-block charge).
-pub const DRAFT_WORST_CHECKPOINT_WINDOW_BYTES_TESTNET: u64 = 401 * ADMISSION_CHARGE_PER_MAX_BLOCK;
-
-/// Draft worst 401-block checkpoint window charge on Regtest (`decision-12`).
-///
-/// Regtest has no checkpoint beyond genesis, so it never verifies a
-/// checkpoint window. The consensus reserve then covers the semantic commit
-/// window alone.
-///
-/// Source: Regtest's checkpoint list (`03 §1` measures only the networks with
-/// checkpoints).
-pub const DRAFT_WORST_CHECKPOINT_WINDOW_BYTES_REGTEST: u64 = 0;
-
-/// Draft worst 401-block checkpoint window charge on `network` (`decision-12`,
-/// `03 §1`).
-///
-/// A network whose checkpoint list ends at genesis, such as a configured
-/// test network without checkpoints, has no checkpoint window.
-pub fn draft_worst_checkpoint_window_bytes(network: &Network) -> u64 {
-    if network.checkpoint_list().max_height() == Height(0) {
-        return DRAFT_WORST_CHECKPOINT_WINDOW_BYTES_REGTEST;
-    }
-    match network.kind() {
-        NetworkKind::Mainnet => DRAFT_WORST_CHECKPOINT_WINDOW_BYTES_MAINNET,
-        NetworkKind::Testnet => DRAFT_WORST_CHECKPOINT_WINDOW_BYTES_TESTNET,
-        NetworkKind::Regtest => DRAFT_WORST_CHECKPOINT_WINDOW_BYTES_REGTEST,
-    }
-}
+/// The checkpoint generator closes a range once its serialized bytes reach
+/// `MAX_CHECKPOINT_BYTE_COUNT`, counting the block that crosses it, so a
+/// range holds under `MAX_CHECKPOINT_BYTE_COUNT + MAX_BLOCK_BYTES`. At
+/// admission's five bytes per wire byte that is
+/// `(33,554,432 + 2,000,000) × 5 = 177,772,160 B` (~170 MiB). Block sync's
+/// commit window covers one range (`block_sync::CommitWindow`).
+pub const WORST_CHECKPOINT_RANGE_CHARGE_BYTES: u64 = (MAX_CHECKPOINT_BYTE_COUNT + MAX_BLOCK_BYTES)
+    * (ADMISSION_CHARGE_PER_MAX_BLOCK / MAX_BLOCK_BYTES);
 
 /// Breakdown of how the pure P2P budget `B` was derived from the host/configured
 /// memory budget (`02 §2`).
@@ -143,15 +109,15 @@ pub const fn derive_p2p_budget(host_budget_bytes: u64, managed_zcashd: bool) -> 
 mod tests {
     use super::*;
 
-    /// The draft window follows admission's per-block charge (fix-62).
+    /// The range charge follows admission's per-block charge (fix-62).
     #[test]
-    fn the_draft_window_sums_admissions_charge() {
+    fn the_range_charge_sums_admissions_charge() {
         use crate::zakura::block_sync::DESERIALIZED_MEM_FACTOR;
 
         assert_eq!(
             ADMISSION_CHARGE_PER_MAX_BLOCK,
             (1 + DESERIALIZED_MEM_FACTOR) * MAX_BLOCK_BYTES
         );
-        assert_eq!(DRAFT_WORST_CHECKPOINT_WINDOW_BYTES_MAINNET, 4_010_000_000);
+        assert_eq!(WORST_CHECKPOINT_RANGE_CHARGE_BYTES, 177_772_160);
     }
 }

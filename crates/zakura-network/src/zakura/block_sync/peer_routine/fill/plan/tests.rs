@@ -20,7 +20,7 @@ use super::model::{expected_retry_run, fund_through_queue};
 use super::*;
 use crate::zakura::{
     block_sync::{
-        admission::{request_priority, LOOKAHEAD_BLOCK_HARD_CAP},
+        admission::{request_priority, FLOOR_CONSENSUS_HEADROOM_BYTES, LOOKAHEAD_BLOCK_HARD_CAP},
         config::{BS_BLOCKS_PER_RESPONSE, MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES},
         request::BlockSizeEstimate,
         test_work_scope,
@@ -150,7 +150,11 @@ impl Scenario {
                 0
             },
             budget_available: self.budget_available,
-            consensus_available: self.budget_available,
+            // An above-floor commit-window take leaves the floor's headroom,
+            // so it can spend `budget_available`, as an above-window take can.
+            consensus_available: self
+                .budget_available
+                .saturating_add(FLOOR_CONSENSUS_HEADROOM_BYTES),
         }
     }
 }
@@ -374,11 +378,17 @@ fn check(scenario: &Scenario, attempt: &Attempt) {
     let floor_rescue_high = scenario.raw(floor_rescue_high(scenario.height(scenario.floor)));
     // Lookahead refusal needs a start above the commit window and a full gate.
     let gated = scenario.above_window && scenario.lookahead_full;
-    let min_cap = |cwnd: Option<u64>| {
+    let min_cap = |budget: u64, cwnd: Option<u64>| {
         scenario
             .response_byte_cap
-            .min(scenario.budget_available)
+            .min(budget)
             .min(cwnd.unwrap_or(u64::MAX))
+    };
+    // A floor take in the commit window may also spend the floor's headroom.
+    let floor_budget = if scenario.above_window {
+        scenario.budget_available
+    } else {
+        scenario.snapshot().consensus_available
     };
 
     // The floor lane plans exactly when the probe found an undeferred floor
@@ -393,7 +403,7 @@ fn check(scenario: &Scenario, attempt: &Attempt) {
             assert!(plan.high <= scenario.height(scenario.servable_high));
             assert_eq!(plan.max_count, scenario.max_count);
             assert!(plan.max_bytes >= 1, "a floor take always funds one body");
-            assert!(plan.max_bytes <= min_cap(scenario.floor_cwnd_bytes).max(1));
+            assert!(plan.max_bytes <= min_cap(floor_budget, scenario.floor_cwnd_bytes).max(1));
         }
         (Err(stop), Some(_)) => {
             assert_eq!(*stop, FillStop::LookaheadCap);
@@ -417,7 +427,10 @@ fn check(scenario: &Scenario, attempt: &Attempt) {
                 assert_eq!(plan.low, scenario.height(scenario.servable_low));
                 assert!(scenario.height(start) <= plan.high);
                 assert!(plan.high <= scenario.height(scenario.servable_high));
-                assert!(plan.max_bytes <= min_cap(scenario.above_floor_cwnd_bytes));
+                assert!(
+                    plan.max_bytes
+                        <= min_cap(scenario.budget_available, scenario.above_floor_cwnd_bytes)
+                );
             }
             Err(FillStop::NoWork) => {
                 assert!(start.is_none_or(|start| start <= floor_rescue_high));

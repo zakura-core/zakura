@@ -11,7 +11,7 @@ use zakura_rt::{
     time::Instant,
 };
 
-use super::super::admission::{request_priority, RequestPriority};
+use super::super::admission::{request_priority, RequestPriority, FLOOR_CONSENSUS_HEADROOM_BYTES};
 use super::{block, OwnerLease, WorkItem, WorkQueue};
 #[cfg(any(test, zakura_sim))]
 use crate::zakura::block_sync::block_sync_observe::{BlockEvent, RequestStep};
@@ -229,8 +229,10 @@ impl TakenRequest {
     /// commit window (`height <= commit_window_top`, see
     /// [`CommitWindow`](super::super::admission::CommitWindow)) leases from the
     /// reserved `Consumer::Consensus`; one above it leases from bulk
-    /// `Consumer::BlockSync` (`02 §4`). The pool call runs after the queue lock
-    /// is released; publication rechecks the claim under the lock.
+    /// `Consumer::BlockSync` (`02 §4`). An above-floor commit-window request
+    /// leaves [`FLOOR_CONSENSUS_HEADROOM_BYTES`] of Consensus free, so the
+    /// lowest missing height can always lease. The pool call runs after the
+    /// queue lock is released; publication rechecks the claim under the lock.
     pub(in crate::zakura::block_sync) fn admit_for_connection(
         mut self,
         download_floor: block::Height,
@@ -270,11 +272,27 @@ impl TakenRequest {
                 return Err(AdmitRefusal::OwnerCap);
             }
         }
+        // An above-floor commit-window request leases only while the floor's
+        // headroom stays free after it. One pool call checks both, so
+        // concurrent requests can't spend that headroom between them.
+        let headroom = if consumer == Consumer::Consensus && priority == RequestPriority::AboveFloor
+        {
+            FLOOR_CONSENSUS_HEADROOM_BYTES
+        } else {
+            0
+        };
         let mut lease = self
             .work
             .memory_pool
-            .try_acquire(consumer, Some(conn_id), bytes)
+            .try_acquire(
+                consumer,
+                Some(conn_id),
+                bytes
+                    .checked_add(headroom)
+                    .ok_or(AdmitRefusal::AmountOverflow)?,
+            )
             .map_err(|_| AdmitRefusal::Capacity(consumer))?;
+        lease.shrink_to(bytes);
         lease.label_height(first_height.0);
         let funding = self
             .work

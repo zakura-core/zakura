@@ -18,7 +18,7 @@ use zakura_quic::{NodeId, SOCKET_DATAGRAM_QUEUE_BYTES};
 
 use super::{
     config::ByteSize,
-    draft::{draft_worst_checkpoint_window_bytes, BudgetDerivation},
+    draft::{BudgetDerivation, WORST_CHECKPOINT_RANGE_CHARGE_BYTES},
     Consumer, ConsumerSpec, MemoryPool, PoolConfig, Priority,
 };
 use crate::{
@@ -994,8 +994,11 @@ impl PlanTerms {
         } else {
             PROPAGATION_RESERVE_BYTES
         };
-        let reserve_consensus = draft_worst_checkpoint_window_bytes(network)
-            .max(BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES);
+        // The commit window holds one checkpoint range below the last
+        // checkpoint and the semantic window above it, which the decoded
+        // submission bound sizes (`block_sync::CommitWindow`).
+        let reserve_consensus =
+            WORST_CHECKPOINT_RANGE_CHARGE_BYTES.max(BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES);
         let mut consumers = [ConsumerSpec::default(); Consumer::COUNT];
         for (consumer, floor, cap) in [
             (
@@ -1594,18 +1597,14 @@ mod tests {
             Network::new_regtest(Default::default()),
         ];
 
-        let mut mainnet_minimums = Vec::new();
         for network in networks {
-            for (row, (stack, tx_relay, bpv1)) in [
+            for (stack, tx_relay, bpv1) in [
                 (P2pStack::Zakura, false, false),
                 (P2pStack::Zakura, true, false),
                 (P2pStack::Zakura, false, true),
                 (P2pStack::Zakura, true, true),
                 (P2pStack::Dual, false, false),
-            ]
-            .into_iter()
-            .enumerate()
-            {
+            ] {
                 let mut config = Config {
                     network: network.clone(),
                     p2p_stack: stack,
@@ -1683,22 +1682,15 @@ mod tests {
                 assert_eq!(
                     plan.consumer_spec(Consumer::Sessions).floor,
                     plan.min_connections as u64 * plan.bases.full_connection_bytes(),
-                    "{network:?} row {row}"
+                    "{network:?} {stack:?} tx_relay={tx_relay} bpv1={bpv1}"
                 );
-                // fix-40: Regtest has no checkpoints, so its consensus reserve
-                // is the submission window, and it starts on a far smaller
-                // budget than Mainnet.
-                match network.kind() {
-                    NetworkKind::Mainnet => mainnet_minimums.push(exact_min),
-                    NetworkKind::Regtest => {
-                        assert_eq!(
-                            plan.consumer_spec(Consumer::Consensus).floor,
-                            BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES
-                        );
-                        assert!(exact_min < mainnet_minimums[row], "row {row}");
-                    }
-                    NetworkKind::Testnet => {}
-                }
+                // fix-40: one checkpoint range charges less than the semantic
+                // window, so every network reserves the decoded submission
+                // bound for consensus.
+                assert_eq!(
+                    plan.consumer_spec(Consumer::Consensus).floor,
+                    BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES
+                );
                 let err = MemoryPlan::size(exact_min - 1, &config, &network)
                     .expect("sizes")
                     .shortfall
@@ -1738,8 +1730,8 @@ mod tests {
     fn host_budget_progression(config: &Config) {
         let config = config.clone();
 
-        // 4 GiB and 8 GiB fall short under the draft base (~4.6 GiB) and the
-        // worst checkpoint window (~3.7 GiB).
+        // 4 GiB and 8 GiB fall short under the draft base (~4.6 GiB), the
+        // connection floor and the consensus reserve (512 MiB).
         for small_gib in [4u64, 8] {
             let b = host_b(small_gib * GIB);
             let plan = MemoryPlan::size(b, &config, &Network::Mainnet).expect("sizes");

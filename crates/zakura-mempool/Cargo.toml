@@ -1,6 +1,6 @@
 [package]
 name = "zakura-mempool"
-version = "0.1.0"
+version = "0.1.1"
 authors.workspace = true
 description = "Zakura's transaction pool: its storage, its rules and the pool core. Internal crate, published to support cargo install zakura"
 license.workspace = true

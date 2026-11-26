@@ -315,9 +315,13 @@ impl Bench {
         give_up: Option<Duration>,
     ) -> (WaiterId, Step) {
         let give_up = give_up.map(|at| self.base + at);
-        let (waiter, step) =
-            self.machine
-                .submit(reservation, tx.real.transaction.clone(), give_up, self.at());
+        let (waiter, step) = self.machine.submit(
+            reservation,
+            tx.real.transaction.clone(),
+            give_up,
+            None,
+            self.at(),
+        );
         self.tracker.waits(waiter, tx.id());
         (waiter, self.took(step))
     }

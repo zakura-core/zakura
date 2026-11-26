@@ -524,12 +524,16 @@ impl<E: VerifyError> MempoolState<E> {
 
     /// A body under `reservation`. Returns the waiter the verdict will name,
     /// which can be in the returned step. An admission still undecided at
-    /// `give_up` ends then as a timeout.
+    /// `give_up` ends then as a timeout. `tx_lease_bytes`, when set, is what
+    /// a relayed fetch's memory lease holds now that its caller grew it to
+    /// cover the decoded body, and the machine counts that many for the
+    /// fetch from here on.
     pub fn submit(
         &mut self,
         reservation: ReservationId,
         tx: UnminedTx,
         give_up: Option<Instant>,
+        tx_lease_bytes: Option<u64>,
         now: Instant,
     ) -> (WaiterId, Step) {
         self.enter(now);
@@ -561,6 +565,9 @@ impl<E: VerifyError> MempoolState<E> {
         };
         let now = self.now;
         let admission = self.admission_at(key);
+        if let (Some(fetch), Some(bytes)) = (admission.relayed.as_mut(), tx_lease_bytes) {
+            fetch.leased_bytes = bytes;
+        }
         // `mem-7`: a leased body larger than its lease is not the body the
         // peer announced, which `relay-1` already closes the peer for.
         let unfunded = admission

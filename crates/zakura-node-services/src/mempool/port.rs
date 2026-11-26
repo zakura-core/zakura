@@ -160,6 +160,9 @@ pub struct Reservation {
     /// When the core stops counting a relayed fetch's bytes. See
     /// [`Self::take_tx_lease_end`].
     tx_lease_end: TxLeaseEnd,
+    /// What a relayed fetch's memory lease holds once its body decoded. See
+    /// [`Self::with_tx_lease_bytes`].
+    tx_lease_bytes: Option<u64>,
 }
 
 impl Reservation {
@@ -178,6 +181,7 @@ impl Reservation {
             cancel,
             give_up: None,
             tx_lease_end: TxLeaseEnd::default(),
+            tx_lease_bytes: None,
         }
     }
 
@@ -196,6 +200,20 @@ impl Reservation {
     /// time. See [`Self::give_up_at`].
     pub fn give_up(&self) -> Option<Instant> {
         self.give_up
+    }
+
+    /// Tells the core that the relayed fetch's memory lease now holds
+    /// `bytes`, grown to cover the decoded body, so the core counts that
+    /// many for the fetch from the submission on.
+    pub fn with_tx_lease_bytes(mut self, bytes: u64) -> Self {
+        self.tx_lease_bytes = Some(bytes);
+        self
+    }
+
+    /// What the relayed fetch's memory lease holds, if its caller grew it.
+    /// See [`Self::with_tx_lease_bytes`].
+    pub fn tx_lease_bytes(&self) -> Option<u64> {
+        self.tx_lease_bytes
     }
 
     /// Cancelled when the core no longer needs the body this reservation

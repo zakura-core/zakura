@@ -35,10 +35,7 @@ use state::{
 pub(super) use state::{ExchangeProgress, DISCOVERY_ANSWER_WRITE_DEADLINE};
 
 use super::{
-    protocol::{
-        DiscoveryMessage, GetPeers, GetServices, ZakuraDiscoveryHandle, ZakuraNodeRecord,
-        MAX_DISCOVERY_RECORDS_PER_RESPONSE,
-    },
+    protocol::{DiscoveryMessage, GetServices, ZakuraDiscoveryHandle, ZakuraNodeRecord},
     requester::{AdmittedAnswer, Queries, QueryUnsent},
     service::{DiscoveryPeerSession, SessionSlot},
     serving::AnswersWritten,
@@ -119,6 +116,8 @@ pub(super) struct PeerIO {
     pub(super) hello: CadenceSender<DiscoveryMessage>,
     /// Signature of the last self-record queued on this stream.
     pub(super) last_hello_signature: Option<[u8; 64]>,
+    /// When this stream last queued a peer query successfully.
+    pub(super) last_peer_query: Option<zakura_rt::time::Instant>,
     /// This session's queries. A query waits until the previous query of its
     /// kind is answered.
     pub(super) queries: Queries,
@@ -295,20 +294,13 @@ impl PeerIO {
             })?;
         self.send_hello(&record)?;
 
-        let limit = u16::try_from(
-            self.handle
-                .peer_sample_limit()
-                .await
-                .clamp(1, MAX_DISCOVERY_RECORDS_PER_RESPONSE),
-        )
-        .expect("the largest wire limit fits u16");
-        let exclude_node_ids = self.handle.peer_sample_exclusions().await;
-        let get_peers = GetPeers {
-            limit,
-            wanted_services: Vec::new(),
-            exclude_node_ids,
-        };
-        continues(self.queries.send_get_peers(get_peers).await)?;
+        if let Some(query) = self.handle.next_peer_query(self.last_peer_query).await {
+            match self.queries.send_get_peers(query).await {
+                Ok(()) => self.last_peer_query = Some(zakura_rt::time::Instant::now()),
+                Err(QueryUnsent::NotDue) => {}
+                Err(QueryUnsent::Closed) => return Err(()),
+            }
+        }
         let get_services = GetServices {
             wanted_services: Vec::new(),
         };

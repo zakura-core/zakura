@@ -259,7 +259,7 @@ resume eligible processing. Local capacity exhaustion is not a peer violation.
 
 Discovery MUST carry discriminators `1..=5` in the frame header. It MUST remove the payload
 discriminator used by version 1. The remaining field order and integer encodings stay unchanged.
-`Hello`, `GetPeers`, and `GetServices` share one cadence. A capacity of 42 covers the 15-second
+`Hello`, `GetPeers`, and `GetServices` share a minimum send interval. A capacity of 42 covers the 15-second
 sender interval across a 600-second connection-wide outage, plus the initial message and one more.
 The buffered arrivals after such an outage cannot prove a sender violation, so exhaustion is
 recorded and the message proceeds. The outstanding-request limit, verification slots, and the
@@ -431,7 +431,11 @@ expiry.
 
 The sender MAY send one initial `GetPeers`. It MUST send later requests at least 15 seconds apart
 and wait for the previous response before sending the next request. Configurable refresh intervals
-MUST obey this minimum. The handler MUST bound sampling work independently of discovery-book size.
+MUST obey this minimum. Zakura asks on each new stream. On shared streams it checks every 15 seconds:
+when the ordinary connection target is met and the book has at least two distinct, unconnected
+peers eligible to dial, it waits 60 seconds between peer queries. Otherwise it asks on this refresh.
+Live-service queries keep their 15-second interval.
+The handler MUST bound sampling work independently of discovery-book size.
 It MUST apply `wanted_services` when it samples the discovery book. It MUST sample
 qualifying records at random. It MAY apply the excluded node IDs on a best-effort basis: exclusion
 improves sampling efficiency and does not entitle the sender to enumerate the book. The handler

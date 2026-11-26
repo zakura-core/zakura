@@ -349,8 +349,12 @@ slot, a quarter of the cores, for `Hello`, `Peers` and the book file.
 
 ### 7.3 Bandwidth
 
-On a shared connection, peer and live-service queries continue every 15
-seconds. The node sends its signed `Hello` on a new stream and when the
+On a shared connection, live-service queries continue every 15 seconds. Peer
+queries use the same interval until the node meets its ordinary connection
+target and has two unconnected candidates eligible to dial. It then asks
+every 60 seconds and rechecks both conditions every 15 seconds. See the
+[parameter rationale](../changelog/params.md#parameters) for the measured
+bandwidth and recovery times. The node sends its signed `Hello` on a new stream and when the
 record changes. Each transmission costs 5,638 bytes including framing.
 At 92 persistent connections, one publication costs 518,696 bytes in the
 sending direction. With a stable address and service list, the record is

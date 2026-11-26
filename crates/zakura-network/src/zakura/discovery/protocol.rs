@@ -169,6 +169,11 @@ pub const DEFAULT_DISCOVERY_RECORD_TTL: Duration = Duration::from_secs(24 * 60 *
 pub const DEFAULT_DISCOVERY_REFRESH_INTERVAL: Duration = Duration::from_secs(10 * 60);
 /// Default peer sample size requested by active discovery.
 pub const DEFAULT_DISCOVERY_PEER_SAMPLE_LIMIT: usize = 32;
+/// Peer query interval while the ordinary connection target and spare reserve are met.
+pub(super) const HEALTHY_PEER_QUERY_INTERVAL: Duration = Duration::from_secs(60);
+/// Minimum distinct unconnected, dial-ready peers needed to slow peer queries.
+const MIN_SPARE_DIAL_CANDIDATES: usize = 2;
+
 /// Default maximum accepted future TTL on imported records.
 pub const DEFAULT_DISCOVERY_MAX_RECORD_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// Default expiry clock-skew tolerance for imported records.
@@ -1915,6 +1920,43 @@ impl ZakuraDiscoveryHandle {
         let _ = self.peer_snapshot_tx.send(state.peer_snapshot());
     }
 
+    /// Builds the next peer query unless this stream queried recently and the
+    /// node has both a full connection set and a reserve of dialable peers.
+    pub(super) async fn next_peer_query(
+        &self,
+        last_sent: Option<zakura_rt::time::Instant>,
+    ) -> Option<GetPeers> {
+        let connected = connected_peer_node_ids(&self.connected.borrow());
+        let state = self.inner.lock().await;
+        let config = state.config();
+        if last_sent.is_some_and(|sent| sent.elapsed() < HEALTHY_PEER_QUERY_INTERVAL)
+            && connected.len() >= self.ordinary_connection_cap
+        {
+            let connected_ids: HashSet<_> = connected.iter().copied().collect();
+            let book = state.book();
+            let now = current_unix_secs();
+            let backoff = (config.dial_backoff_base, config.dial_backoff_max);
+            let mut spares = book.dial_candidate_refs().filter(|candidate| {
+                !connected_ids.contains(&candidate.node_id())
+                    && book.dial_readiness(candidate, now, backoff) == DialReadiness::Ready
+            });
+            if spares.nth(MIN_SPARE_DIAL_CANDIDATES - 1).is_some() {
+                return None;
+            }
+        }
+
+        Some(GetPeers {
+            limit: u16::try_from(
+                config
+                    .peer_sample_limit
+                    .clamp(1, MAX_DISCOVERY_RECORDS_PER_RESPONSE),
+            )
+            .expect("the largest wire limit fits u16"),
+            wanted_services: Vec::new(),
+            exclude_node_ids: state.peer_sample_exclusions(&connected),
+        })
+    }
+
     /// Returns bounded node ids to exclude from a peer-sample request.
     ///
     /// Exclusions include the local node, currently connected peers, and recent known records.
@@ -3063,16 +3105,7 @@ impl ZakuraDiscoveryBook {
         let in_flight_node_ids: HashSet<_> =
             exclusions.in_flight_node_ids.iter().copied().collect();
         let candidates: Vec<_> = self
-            .entries
-            .values()
-            .map(DialCandidateRef::SignedRecord)
-            // A node with a signed record is offered through that record only.
-            .chain(
-                self.static_candidates
-                    .values()
-                    .filter(|candidate| !self.entries.contains_key(&candidate.node_id))
-                    .map(DialCandidateRef::StaticConfigured),
-            )
+            .dial_candidate_refs()
             .filter(|candidate| {
                 let node_id = candidate.node_id();
                 !connected_node_ids.contains(&node_id)
@@ -3125,6 +3158,19 @@ impl ZakuraDiscoveryBook {
                 DialAdmission::Exhausted => return,
             }
         }
+    }
+
+    /// Offers each identity once, preferring its signed record over a static address.
+    fn dial_candidate_refs(&self) -> impl Iterator<Item = DialCandidateRef<'_>> {
+        self.entries
+            .values()
+            .map(DialCandidateRef::SignedRecord)
+            .chain(
+                self.static_candidates
+                    .values()
+                    .filter(|candidate| !self.entries.contains_key(&candidate.node_id))
+                    .map(DialCandidateRef::StaticConfigured),
+            )
     }
 
     /// Whether the book could dial `candidate` at `now`, before the caller's
@@ -10781,6 +10827,60 @@ mod tests {
         assert_eq!(
             handle.current_self_record().body.direct_addrs,
             vec![test_addr(46)]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn peer_query_backoff_requires_full_connections_and_two_dialable_spares() {
+        use zakura_rt::time::Instant;
+        let (connected_tx, connected_rx) = watch::channel(Vec::new());
+        let handle = discovery_handle_at(
+            local_config_with(secret_key(), vec![test_addr(47)], vec![service(1)]),
+            ZakuraDiscoveryConfig {
+                max_zakura_connections: 2,
+                discovery_connection_headroom: 1,
+                ..ZakuraDiscoveryConfig::default()
+            },
+            connected_rx,
+            NOW,
+        );
+        let mut ids = Vec::new();
+        for i in 1..=3 {
+            let record = runtime_record_with(i.into(), service(1), test_addr(i));
+            ids.push(record.body.node_id());
+            import_hello_record(&handle, record).await;
+        }
+        connected_tx.send_replace(vec![peer_id_for(ids[0])]);
+        assert!(
+            handle.next_peer_query(None).await.is_some(),
+            "initial query"
+        );
+        let sent = Some(Instant::now());
+        tokio::time::advance(Duration::from_secs(15)).await;
+        assert!(handle.next_peer_query(sent).await.is_none());
+        connected_tx.send_replace(Vec::new());
+        assert!(
+            handle.next_peer_query(sent).await.is_some(),
+            "connection lost"
+        );
+        connected_tx.send_replace(vec![peer_id_for(ids[0]), peer_id_for(ids[1])]);
+        assert!(
+            handle.next_peer_query(sent).await.is_some(),
+            "only one spare"
+        );
+        connected_tx.send_replace(vec![peer_id_for(ids[0])]);
+        tokio::time::advance(Duration::from_secs(44)).await;
+        assert!(handle.next_peer_query(sent).await.is_none());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(
+            handle.next_peer_query(sent).await.is_some(),
+            "healthy refresh due"
+        );
+        handle.mark_dial_attempt(&ids[1]).await;
+        handle.mark_dial_failure(&ids[1]).await;
+        assert!(
+            handle.next_peer_query(Some(Instant::now())).await.is_some(),
+            "a peer in backoff is not a spare"
         );
     }
 

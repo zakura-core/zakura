@@ -4,7 +4,7 @@
 //! fixed non-leased terms, per-connection transport base `t`, per-reactor
 //! session bases `b_r`, proof-of-work-bounded reserves (`Control`,
 //! `Propagation`, `Consensus`), bulk consumer floors, and the remaining shared
-//! space `S` divided by `[memory.weight]`.
+//! space `S`, shared equally by the bulk consumers.
 
 use std::fmt;
 
@@ -17,7 +17,7 @@ use zakura_node_services::block_memory::{MAX_DECODED_BLOCK_BYTES, READ_RESULT_BL
 use zakura_quic::{NodeId, SOCKET_DATAGRAM_QUEUE_BYTES};
 
 use super::{
-    config::{ByteSize, MemoryWeights},
+    config::ByteSize,
     draft::{draft_worst_checkpoint_window_bytes, BudgetDerivation},
     Consumer, ConsumerSpec, MemoryPool, PoolConfig, Priority,
 };
@@ -25,7 +25,7 @@ use crate::{
     config::{Config, P2pStack},
     zakura::{
         block_sync::{
-            ZakuraBlockSyncConfig, BLOCK_SYNC_REACTOR_BUDGET, BLOCK_SYNC_SERVE_NODE_EXECUTION,
+            BLOCK_SYNC_REACTOR_BUDGET, BLOCK_SYNC_SERVE_NODE_EXECUTION,
             BLOCK_SYNC_SESSION_BOOKKEEPING_BYTES, BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES,
             DEFAULT_BS_BBR_MIN_CWND_BYTES, LARGEST_SERVED_BLOCK_RESPONSE_BYTES,
         },
@@ -50,9 +50,8 @@ use crate::{
             MAX_TX_BYTES, SESSION_HELD_OUTPUT_BYTES, TX_RELAY_DATA_BUDGET, TX_RELAY_STATE_BUDGET,
             ZAKURA_CAP_TX_RELAY,
         },
-        ServicePeerDirection, ServicePeerLimits, ZakuraLocalLimits, DEFAULT_SERVICE_MAX_PEERS,
-        MAX_BS_FRAME_BYTES, ZAKURA_CAP_BLOCK_SYNC_REGULATED, ZAKURA_CAP_HEADER_SYNC,
-        ZAKURA_CAP_LEGACY_GOSSIP,
+        ServicePeerDirection, ZakuraLocalLimits, MAX_BS_FRAME_BYTES,
+        ZAKURA_CAP_BLOCK_SYNC_REGULATED, ZAKURA_CAP_HEADER_SYNC, ZAKURA_CAP_LEGACY_GOSSIP,
     },
 };
 
@@ -497,7 +496,9 @@ impl SessionDirections {
     }
 }
 
-/// Breakdown returned in [`MemoryPlanError::BudgetTooSmall`] (`02 §8`).
+/// Why a plan needs more than `B`: its terms, and the raised settings that add
+/// to them (`02 §8`). [`MemoryPlan::shortfall`] carries it, and startup logs
+/// it as one warning.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BudgetTooSmall {
     /// Host-to-P2P derivation breakdown (`budget`, `base`, `sidecar`, `ρ`, `B`).
@@ -514,10 +515,9 @@ pub struct BudgetTooSmall {
     pub floors: [u64; Consumer::COUNT],
     /// Minimum budgeted connections required for discovery + chain following.
     pub min_connections: usize,
-    /// Operator settings raised above their defaults that raise a reserve.
-    /// A reserve is held in full, so it never starts with a warning: the
-    /// refusal names these settings instead (BP-pt-2).
-    pub raised_reserve_settings: Vec<RaisedSetting>,
+    /// Operator settings raised above their defaults that add to a fixed
+    /// term or a reserve.
+    pub raised_settings: Vec<RaisedSetting>,
 }
 
 /// One operator setting above its default that a [`BudgetTooSmall`] names.
@@ -542,7 +542,7 @@ impl fmt::Display for BudgetTooSmall {
         write!(
             f,
             "insufficient [memory] budget: host budget={} B, base={} B, sidecar={} B, rho={}/{}, \
-             resolved P2P budget B={} B, but required minimum is {} B (fixed={} B [",
+             resolved P2P budget B={} B, but the minimum plan needs {} B (fixed={} B [",
             derivation.host_budget_bytes,
             derivation.base_bytes,
             derivation.sidecar_bytes,
@@ -581,15 +581,20 @@ impl fmt::Display for BudgetTooSmall {
             write!(f, ", {name}={} B", base.total())?;
         }
         f.write_str("]); ")?;
-        for raised in &self.raised_reserve_settings {
+        for raised in &self.raised_settings {
             write!(
                 f,
-                "{} = {} raises a reserve (default {}); ",
+                "{} = {} adds to it (default {}); ",
                 raised.setting, raised.configured_value, raised.default_value
             )?;
         }
-        f.write_str("raise [memory] budget or add host RAM")?;
-        if !self.raised_reserve_settings.is_empty() {
+        write!(
+            f,
+            "the node runs with no shared space and can hold {} B more than B; \
+             raise [memory] budget or add host RAM",
+            self.required_bytes.saturating_sub(self.budget_b),
+        )?;
+        if !self.raised_settings.is_empty() {
             f.write_str(", or lower the raised settings")?;
         }
         Ok(())
@@ -619,36 +624,6 @@ pub enum MemoryPlanError {
         /// Validation failure description.
         reason: String,
     },
-    /// Invalid `[memory.weight]` configuration.
-    #[error("{0}")]
-    InvalidWeights(String),
-    /// `fixed + reserves + Σ floors > B` under default settings (`02 §8`).
-    #[error("{0}")]
-    BudgetTooSmall(Box<BudgetTooSmall>),
-}
-
-/// One operator setting whose worst-case memory pushes the startup plan past
-/// the resolved P2P budget `B` (`02 §8`, `mem-14`).
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct OverrideWarning {
-    /// TOML setting path that pushes the worst case past `B`.
-    pub setting: String,
-    /// Operator-configured value for this setting.
-    pub configured_value: String,
-    /// Bytes by which the worst case with this setting exceeds `B`.
-    pub excess_bytes: u64,
-    /// Value the plan would have chosen under default settings.
-    pub plan_value: String,
-}
-
-impl fmt::Display for OverrideWarning {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{} = {} exceeds [memory] budget by {} B (plan would choose {})",
-            self.setting, self.configured_value, self.excess_bytes, self.plan_value
-        )
-    }
 }
 
 /// Complete, pure startup memory sizing plan (`02 §8`).
@@ -681,15 +656,18 @@ pub struct MemoryPlan {
     /// Required-chain-reactor connections funded by the sessions consumer's
     /// protected share (`min(N_cap, sessions_share / (t + b_hsync + b_bsync))`).
     pub planned_required_connections: usize,
-    /// Effective look-ahead cap (default or overridden by `[memory.cap] look_ahead`).
+    /// Look-ahead cap: `[network.zakura.block_sync] max_reorder_lookahead_bytes`.
     pub look_ahead_cap: u64,
-    /// Effective per-peer serving cap (default or overridden by `[memory.cap] serving_per_peer`).
+    /// Per-peer serving cap: one default send window plus queued serve output.
     pub serving_per_peer_cap: u64,
-    /// Effective tx pending-bytes cap (mempool cost limit or overridden by `[memory.cap] tx`).
+    /// Tx pending-bytes cap: the mempool cost limit.
     pub tx_cap: u64,
-    /// Warnings for operator overrides whose worst case can exceed `B` (`02 §8`, `mem-14`).
-    /// Always empty under default settings.
-    pub override_warnings: Vec<OverrideWarning>,
+    /// Set when the minimum plan needs more than `B`. The node then runs with
+    /// no shared space `S` while every floor and reserve stays funded, so it
+    /// can hold more than `B` and the pool reports the live overrun. Startup
+    /// warns rather than refuses while the base constants in `draft.rs` are
+    /// unmeasured.
+    pub shortfall: Option<Box<BudgetTooSmall>>,
 }
 
 impl MemoryPlan {
@@ -713,45 +691,19 @@ impl MemoryPlan {
         custom_kinds: &[u16],
     ) -> Result<Self, MemoryPlanError> {
         let memory = &config.zakura.memory_budget;
-        memory
-            .weights
-            .validate()
-            .map_err(MemoryPlanError::InvalidWeights)?;
-
         let shares = config.zakura.reactor_shares(network);
         validate_reactor_unsolicited_frame_caps(config, network, &shares)?;
 
         let terms = PlanTerms::compute(config, network, local_node_id, custom_kinds);
-        let override_warnings = override_warnings(config, network, &terms, budget_b);
 
         let mut derivation = memory.derivation;
         derivation.p2p_budget_b = budget_b;
 
-        // Startup refuses when fixed + reserves + floors exceed `B` even with
-        // every raised setting back at its default (`02 §8`). Otherwise it
-        // starts, and `override_warnings` names each raised setting whose
-        // excess pushes the plan past `B`. Lowering a setting never raises a
-        // term, so the unraised plan matters only when this one doesn't fit.
-        if terms.required_bytes() > budget_b {
-            let unraised = PlanTerms::compute(
-                &without_raised_settings(config, network),
-                network,
-                local_node_id,
-                custom_kinds,
-            );
-            let smallest = if unraised.required_bytes() < terms.required_bytes() {
-                &unraised
-            } else {
-                &terms
-            };
-            if smallest.required_bytes() > budget_b {
-                return Err(MemoryPlanError::BudgetTooSmall(Box::new(
-                    smallest.budget_too_small(config, derivation, budget_b),
-                )));
-            }
-        }
+        let required = terms.required_bytes();
+        let shortfall = (required > budget_b)
+            .then(|| Box::new(terms.budget_too_small(config, network, derivation, budget_b)));
 
-        let pool_config = terms.pool_config(budget_b, memory.weights);
+        let pool_config = terms.pool_config(budget_b);
         let sessions_protected =
             super::MemoryPoolMachine::new(pool_config).protected_share(Consumer::Sessions);
         let connections = |cost: u64| {
@@ -784,7 +736,7 @@ impl MemoryPlan {
             look_ahead_cap: terms.look_ahead_cap,
             serving_per_peer_cap: terms.serving_per_peer_cap,
             tx_cap: terms.cap(Consumer::Tx),
-            override_warnings,
+            shortfall,
         })
     }
 
@@ -924,18 +876,12 @@ impl fmt::Display for MemoryPlan {
 struct PlanTerms {
     connection_cap: usize,
     min_connections: usize,
-    bound_sockets: u64,
-    handshake_cost: u64,
     fixed: FixedTerms,
     bases: SessionBases,
-    /// Each consumer's floor and cap, by [`Consumer::index`]. Weights come
-    /// from `[memory.weight]` when [`Self::pool_config`] builds the pool.
+    /// Each consumer's floor and cap, by [`Consumer::index`].
     consumers: [ConsumerSpec; Consumer::COUNT],
-    default_look_ahead: u64,
     look_ahead_cap: u64,
-    default_serving_per_peer: u64,
     serving_per_peer_cap: u64,
-    default_tx_cap: u64,
 }
 
 impl PlanTerms {
@@ -1056,23 +1002,18 @@ impl PlanTerms {
 
         // Bulk consumers (`Priority::Bulk`, `02 §4` & `02 §8`).
         let floor_block_sync = DEFAULT_BS_BBR_MIN_CWND_BYTES;
-        let default_look_ahead = config.zakura.block_sync.max_reorder_lookahead_bytes;
-        let look_ahead_cap = memory
-            .caps
-            .look_ahead
-            .map_or(default_look_ahead, ByteSize::bytes)
+        let look_ahead_cap = config
+            .zakura
+            .block_sync
+            .max_reorder_lookahead_bytes
             .max(floor_block_sync);
         let block_sync_inflight_cap =
             (admitted_cap as u64).saturating_mul(config.zakura.block_sync.bbr_max_cwnd_bytes);
         let cap_block_sync = block_sync_inflight_cap.saturating_add(look_ahead_cap);
 
         let floor_serving = LARGEST_SERVED_BLOCK_RESPONSE_BYTES;
-        let default_serving_per_peer =
-            DEFAULT_ZAKURA_SEND_WINDOW.saturating_add(SERVE_PEER_OUTPUT_BYTES);
-        let serving_per_peer_cap = memory
-            .caps
-            .serving_per_peer
-            .map_or(default_serving_per_peer, ByteSize::bytes)
+        let serving_per_peer_cap = DEFAULT_ZAKURA_SEND_WINDOW
+            .saturating_add(SERVE_PEER_OUTPUT_BYTES)
             .max(floor_serving);
         let cap_serving = (admitted_cap as u64).saturating_mul(serving_per_peer_cap);
 
@@ -1093,8 +1034,7 @@ impl PlanTerms {
         );
 
         let floor_tx = u64::from(MAX_TX_BYTES);
-        let default_tx_cap = memory.mempool_tx_cost_limit.max(floor_tx);
-        let tx_cap = memory.caps.tx.map_or(default_tx_cap, ByteSize::bytes);
+        let tx_cap = memory.mempool_tx_cost_limit.max(floor_tx);
 
         // Reserved consumers (`Priority::Reserved`, `floor == cap`, `02 §4`).
         let reserve_propagation = if config.zakura.bpv1.enabled {
@@ -1127,21 +1067,12 @@ impl PlanTerms {
         Self {
             connection_cap,
             min_connections,
-            bound_sockets,
-            handshake_cost,
             fixed,
             bases,
             consumers,
-            default_look_ahead,
             look_ahead_cap,
-            default_serving_per_peer,
             serving_per_peer_cap,
-            default_tx_cap,
         }
-    }
-
-    const fn floor(&self, consumer: Consumer) -> u64 {
-        self.consumers[consumer.index()].floor
     }
 
     const fn cap(&self, consumer: Consumer) -> u64 {
@@ -1157,26 +1088,27 @@ impl PlanTerms {
             })
     }
 
-    /// The pool these terms size under `budget_b`, sharing `S` by `weights`.
-    fn pool_config(&self, budget_b: u64, weights: MemoryWeights) -> PoolConfig {
+    /// The pool these terms size under `budget_b`. The bulk consumers share
+    /// `S` equally, and the reserved ones take no share.
+    fn pool_config(&self, budget_b: u64) -> PoolConfig {
         Consumer::ALL
             .into_iter()
             .fold(
                 PoolConfig::new(budget_b, self.fixed.total()),
                 |pool, consumer| {
                     let ConsumerSpec { floor, cap, .. } = self.consumers[consumer.index()];
-                    pool.with_consumer(
-                        consumer,
-                        ConsumerSpec::bulk(floor, cap, weights.of(consumer)),
-                    )
+                    let weight = u64::from(consumer.priority() == Priority::Bulk);
+                    pool.with_consumer(consumer, ConsumerSpec::bulk(floor, cap, weight))
                 },
             )
             .with_serving_per_peer_cap(self.serving_per_peer_cap)
     }
 
+    /// Why these terms need more than `budget_b`.
     fn budget_too_small(
         &self,
         config: &Config,
+        network: &Network,
         derivation: BudgetDerivation,
         budget_b: u64,
     ) -> BudgetTooSmall {
@@ -1188,34 +1120,88 @@ impl PlanTerms {
             bases: self.bases,
             floors: self.consumers.map(|spec| spec.floor),
             min_connections: self.min_connections,
-            raised_reserve_settings: raised_reserve_settings(config),
+            raised_settings: raised_settings(config, network),
         }
     }
 }
 
-/// The settings in `config` above their defaults that raise a reserve. With
-/// BPv1 on, its part buffer and its concurrent blocks size the `Propagation`
-/// reserve ([`PropagationReserve`]).
-fn raised_reserve_settings(config: &Config) -> Vec<RaisedSetting> {
-    let bpv1 = &config.zakura.bpv1;
-    if !bpv1.enabled {
-        return Vec::new();
-    }
-    let default = ZakuraBpv1Config::default();
+/// The settings in `config` above their defaults that add to a fixed term or
+/// a reserve. With BPv1 on, its part buffer and its concurrent blocks size the
+/// `Propagation` reserve ([`PropagationReserve`]).
+fn raised_settings(config: &Config, network: &Network) -> Vec<RaisedSetting> {
+    let zakura = &config.zakura;
+    let memory = &zakura.memory_budget;
+    let default_quic = zakura_quic::QuicConfig::default();
+    let default_bpv1 = ZakuraBpv1Config::default();
+    let bytes = |bytes: u64| ByteSize(bytes).to_string();
+    let derived_reads = derived_read_result_byte_limit(config, network);
     let mut raised = Vec::new();
-    if bpv1.part_retention_budget_bytes > default.part_retention_budget_bytes {
+    let mut push = |setting, configured_value, default_value| {
         raised.push(RaisedSetting {
-            setting: "[network.zakura.bpv1] part_retention_budget_bytes",
-            configured_value: ByteSize(bpv1.part_retention_budget_bytes).to_string(),
-            default_value: ByteSize(default.part_retention_budget_bytes).to_string(),
+            setting,
+            configured_value,
+            default_value,
         });
+    };
+    if zakura.max_pending_handshakes > DEFAULT_ZAKURA_MAX_PENDING_HANDSHAKES {
+        push(
+            "[network.zakura] max_pending_handshakes",
+            zakura.max_pending_handshakes.to_string(),
+            DEFAULT_ZAKURA_MAX_PENDING_HANDSHAKES.to_string(),
+        );
     }
-    if bpv1.max_concurrent_blocks > default.max_concurrent_blocks {
-        raised.push(RaisedSetting {
-            setting: "[network.zakura.bpv1] max_concurrent_blocks",
-            configured_value: bpv1.max_concurrent_blocks.to_string(),
-            default_value: default.max_concurrent_blocks.to_string(),
-        });
+    if zakura.quic.incoming_buffer_total_bytes > default_quic.incoming_buffer_total_bytes {
+        push(
+            "[network.zakura.quic] incoming_buffer_total_bytes",
+            bytes(zakura.quic.incoming_buffer_total_bytes),
+            bytes(default_quic.incoming_buffer_total_bytes),
+        );
+    }
+    if zakura.quic.receive_window() > DEFAULT_ZAKURA_RECEIVE_WINDOW {
+        push(
+            "[network.zakura.quic] receive_window_bytes",
+            bytes(u64::from(zakura.quic.receive_window())),
+            bytes(u64::from(DEFAULT_ZAKURA_RECEIVE_WINDOW)),
+        );
+    }
+    if zakura.quic.send_window_bytes > DEFAULT_ZAKURA_SEND_WINDOW {
+        push(
+            "[network.zakura.quic] send_window_bytes",
+            bytes(zakura.quic.send_window_bytes),
+            bytes(DEFAULT_ZAKURA_SEND_WINDOW),
+        );
+    }
+    if memory.mempool_tx_cost_limit > DEFAULT_MEMPOOL_TX_COST_LIMIT_BYTES {
+        push(
+            "[mempool] tx_cost_limit",
+            bytes(memory.mempool_tx_cost_limit),
+            bytes(DEFAULT_MEMPOOL_TX_COST_LIMIT_BYTES),
+        );
+    }
+    if let Some(limit) = memory
+        .read_result_byte_limit
+        .filter(|&limit| limit > derived_reads)
+    {
+        push(
+            "[state] read_result_byte_limit",
+            bytes(limit),
+            bytes(derived_reads),
+        );
+    }
+    let bpv1 = &zakura.bpv1;
+    if bpv1.enabled && bpv1.part_retention_budget_bytes > default_bpv1.part_retention_budget_bytes {
+        push(
+            "[network.zakura.bpv1] part_retention_budget_bytes",
+            bytes(bpv1.part_retention_budget_bytes),
+            bytes(default_bpv1.part_retention_budget_bytes),
+        );
+    }
+    if bpv1.enabled && bpv1.max_concurrent_blocks > default_bpv1.max_concurrent_blocks {
+        push(
+            "[network.zakura.bpv1] max_concurrent_blocks",
+            bpv1.max_concurrent_blocks.to_string(),
+            default_bpv1.max_concurrent_blocks.to_string(),
+        );
     }
     raised
 }
@@ -1233,295 +1219,6 @@ fn reactor_session_cap(config: &Config, capability: u64, connection_cap: usize) 
             .map_or(connection_cap, |max| max.min(connection_cap)),
         _ => connection_cap,
     }
-}
-
-/// One warning for each raised operator setting whose worst case pushes the
-/// plan `terms` past `budget_b` (`02 §8`, `mem-14`). Only a setting raised past
-/// its default warns: a lowered one can't add to the default worst case
-/// (fix-35).
-fn override_warnings(
-    config: &Config,
-    network: &Network,
-    terms: &PlanTerms,
-    budget_b: u64,
-) -> Vec<OverrideWarning> {
-    let zakura = &config.zakura;
-    let memory = &zakura.memory_budget;
-    let default_quic = zakura_quic::QuicConfig::default();
-    let default_bs = ZakuraBlockSyncConfig::default();
-    let bytes = |bytes: u64| ByteSize(bytes).to_string();
-    let required_bytes = terms.required_bytes();
-    // The plan's worst case without `consumer`'s floor.
-    let without = |consumer: Consumer| required_bytes.saturating_sub(terms.floor(consumer));
-    let mut warnings = Vec::new();
-
-    // What the plan would fund under default settings, so warnings can cite
-    // the plan's baseline values.
-    let baseline = terms.pool_config(budget_b, MemoryWeights::default());
-    let plan_full_connections = usize::try_from(
-        super::MemoryPoolMachine::new(baseline).protected_share(Consumer::Sessions)
-            / terms.bases.full_connection_bytes().max(1),
-    )
-    .unwrap_or(usize::MAX)
-    .min(DEFAULT_SERVICE_MAX_PEERS);
-    let plan_funds = format!("unset (plan funds {plan_full_connections})");
-
-    // Session caps: what a raised cap lets the sessions consumer hold.
-    let sessions_worst = without(Consumer::Sessions).saturating_add(terms.cap(Consumer::Sessions));
-    if let Some(configured) = zakura
-        .max_connections
-        .filter(|&conns| conns > DEFAULT_SERVICE_MAX_PEERS)
-    {
-        if sessions_worst > budget_b {
-            warnings.push(warning(
-                "[network.zakura] max_connections",
-                configured.to_string(),
-                sessions_worst - budget_b,
-                format!("{plan_full_connections} connections"),
-            ));
-        }
-    }
-    let peer_limits_sessions = |limits: &ServicePeerLimits| {
-        limits.has_explicit_peer_caps().then(|| {
-            limits
-                .max_inbound()
-                .saturating_add(limits.max_outbound())
-                .min(terms.connection_cap)
-        })
-    };
-    for (setting, sessions) in [
-        (
-            "[network.zakura.header_sync.peer_limits]",
-            peer_limits_sessions(&zakura.header_sync.peer_limits),
-        ),
-        (
-            "[network.zakura.block_sync.peer_limits]",
-            peer_limits_sessions(&zakura.block_sync.peer_limits),
-        ),
-        (
-            "[network.zakura.bpv1] max_sessions",
-            zakura
-                .bpv1
-                .max_sessions
-                .map(|max| max.min(terms.connection_cap)),
-        ),
-    ] {
-        if let Some(sessions) = sessions.filter(|&sessions| sessions > plan_full_connections) {
-            if sessions_worst > budget_b {
-                warnings.push(warning(
-                    setting,
-                    format!("{sessions} sessions"),
-                    sessions_worst - budget_b,
-                    plan_funds.clone(),
-                ));
-            }
-        }
-    }
-
-    // Consumer caps: each raised cap against the plan without that floor.
-    let without_bs = without(Consumer::BlockSync);
-    if let Some(cap) = memory.caps.look_ahead {
-        let worst_case = without_bs.saturating_add(terms.look_ahead_cap);
-        if terms.look_ahead_cap > terms.default_look_ahead && worst_case > budget_b {
-            let plan_choice = terms
-                .default_look_ahead
-                .min(budget_b.saturating_sub(without_bs));
-            warnings.push(warning(
-                "[memory.cap] look_ahead",
-                cap.to_string(),
-                worst_case - budget_b,
-                bytes(plan_choice),
-            ));
-        }
-    }
-    if let Some(cap) = memory.caps.serving_per_peer {
-        let without_serving = without(Consumer::Serving);
-        let single_worst = without_serving.saturating_add(terms.serving_per_peer_cap);
-        let multi_worst = without_serving.saturating_add(
-            terms
-                .serving_per_peer_cap
-                .saturating_mul(plan_full_connections.max(1) as u64),
-        );
-        if cap.bytes() > terms.default_serving_per_peer
-            && (single_worst > budget_b || multi_worst > budget_b)
-        {
-            let excess_bytes = if single_worst > budget_b {
-                single_worst - budget_b
-            } else {
-                multi_worst - budget_b
-            };
-            warnings.push(warning(
-                "[memory.cap] serving_per_peer",
-                cap.to_string(),
-                excess_bytes,
-                bytes(terms.default_serving_per_peer),
-            ));
-        }
-    }
-    if let Some(cap) = memory.caps.tx {
-        let without_tx = without(Consumer::Tx);
-        let tx_cap = terms.cap(Consumer::Tx);
-        let worst_case = without_tx.saturating_add(tx_cap);
-        if tx_cap > terms.default_tx_cap && worst_case > budget_b {
-            let plan_choice = terms
-                .default_tx_cap
-                .min(budget_b.saturating_sub(without_tx));
-            warnings.push(warning(
-                "[memory.cap] tx",
-                cap.to_string(),
-                worst_case - budget_b,
-                bytes(plan_choice),
-            ));
-        }
-    }
-    let lookahead = zakura.block_sync.max_reorder_lookahead_bytes;
-    if lookahead > default_bs.max_reorder_lookahead_bytes && memory.caps.look_ahead.is_none() {
-        let worst_case = without_bs.saturating_add(terms.look_ahead_cap);
-        if worst_case > budget_b {
-            warnings.push(warning(
-                "[network.zakura.block_sync] max_reorder_lookahead_bytes",
-                bytes(lookahead),
-                worst_case - budget_b,
-                bytes(default_bs.max_reorder_lookahead_bytes),
-            ));
-        }
-    }
-    let bbr_max = zakura.block_sync.bbr_max_cwnd_bytes;
-    if bbr_max > default_bs.bbr_max_cwnd_bytes {
-        let worst_case = without_bs.saturating_add(bbr_max);
-        if worst_case > budget_b {
-            warnings.push(warning(
-                "[network.zakura.block_sync] bbr_max_cwnd_bytes",
-                bytes(bbr_max),
-                worst_case - budget_b,
-                bytes(default_bs.bbr_max_cwnd_bytes),
-            ));
-        }
-    }
-
-    // Fixed terms: each raised setting warns once the whole plan passes `B`,
-    // by at most what it adds.
-    if required_bytes > budget_b {
-        let over = required_bytes - budget_b;
-        if zakura.max_pending_handshakes > DEFAULT_ZAKURA_MAX_PENDING_HANDSHAKES {
-            let default_handshakes =
-                (DEFAULT_ZAKURA_MAX_PENDING_HANDSHAKES as u64).saturating_mul(terms.handshake_cost);
-            warnings.push(warning(
-                "[network.zakura] max_pending_handshakes",
-                zakura.max_pending_handshakes.to_string(),
-                terms
-                    .fixed
-                    .handshakes
-                    .saturating_sub(default_handshakes)
-                    .min(over),
-                DEFAULT_ZAKURA_MAX_PENDING_HANDSHAKES.to_string(),
-            ));
-        }
-        let incoming = zakura.quic.incoming_buffer_total_bytes;
-        if incoming > default_quic.incoming_buffer_total_bytes {
-            let default_incoming = terms
-                .bound_sockets
-                .saturating_mul(default_quic.incoming_buffer_total_bytes);
-            warnings.push(warning(
-                "[network.zakura.quic] incoming_buffer_total_bytes",
-                bytes(incoming),
-                terms
-                    .fixed
-                    .incoming_buffers
-                    .saturating_sub(default_incoming)
-                    .min(over),
-                bytes(default_quic.incoming_buffer_total_bytes),
-            ));
-        }
-        let receive_window = zakura.quic.receive_window();
-        if receive_window > DEFAULT_ZAKURA_RECEIVE_WINDOW {
-            warnings.push(warning(
-                "[network.zakura.quic] receive_window_bytes",
-                bytes(u64::from(receive_window)),
-                over,
-                bytes(u64::from(DEFAULT_ZAKURA_RECEIVE_WINDOW)),
-            ));
-        }
-        if zakura.quic.send_window_bytes > DEFAULT_ZAKURA_SEND_WINDOW {
-            warnings.push(warning(
-                "[network.zakura.quic] send_window_bytes",
-                bytes(zakura.quic.send_window_bytes),
-                over,
-                bytes(DEFAULT_ZAKURA_SEND_WINDOW),
-            ));
-        }
-        if memory.mempool_tx_cost_limit > DEFAULT_MEMPOOL_TX_COST_LIMIT_BYTES {
-            warnings.push(warning(
-                "[mempool] tx_cost_limit",
-                bytes(memory.mempool_tx_cost_limit),
-                (memory.mempool_tx_cost_limit - DEFAULT_MEMPOOL_TX_COST_LIMIT_BYTES).min(over),
-                bytes(DEFAULT_MEMPOOL_TX_COST_LIMIT_BYTES),
-            ));
-        }
-        let derived_reads = derived_read_result_byte_limit(config, network);
-        if let Some(limit) = memory
-            .read_result_byte_limit
-            .filter(|&limit| limit > derived_reads)
-        {
-            warnings.push(warning(
-                "[state] read_result_byte_limit",
-                bytes(limit),
-                (limit - derived_reads).min(over),
-                bytes(derived_reads),
-            ));
-        }
-    }
-    warnings
-}
-
-/// One [`OverrideWarning`].
-fn warning(
-    setting: &str,
-    configured_value: String,
-    excess_bytes: u64,
-    plan_value: String,
-) -> OverrideWarning {
-    OverrideWarning {
-        setting: setting.to_owned(),
-        configured_value,
-        excess_bytes,
-        plan_value,
-    }
-}
-
-/// `config` with every setting that raises a fixed term or a reserve above
-/// its default lowered back to the default. Lowered settings stay.
-fn without_raised_settings(config: &Config, network: &Network) -> Config {
-    let mut config = config.clone();
-    let derived_reads = derived_read_result_byte_limit(&config, network);
-    let zakura = &mut config.zakura;
-    let default_quic = zakura_quic::QuicConfig::default();
-    zakura.max_pending_handshakes = zakura
-        .max_pending_handshakes
-        .min(DEFAULT_ZAKURA_MAX_PENDING_HANDSHAKES);
-    zakura.quic.incoming_buffer_total_bytes = zakura
-        .quic
-        .incoming_buffer_total_bytes
-        .min(default_quic.incoming_buffer_total_bytes);
-    zakura.quic.receive_window_bytes = zakura
-        .quic
-        .receive_window_bytes
-        .map(|window| window.min(DEFAULT_ZAKURA_RECEIVE_WINDOW));
-    zakura.quic.send_window_bytes = zakura
-        .quic
-        .send_window_bytes
-        .min(DEFAULT_ZAKURA_SEND_WINDOW);
-    zakura.max_connections = zakura
-        .max_connections
-        .map(|cap| cap.min(DEFAULT_SERVICE_MAX_PEERS));
-    let memory = &mut zakura.memory_budget;
-    memory.mempool_tx_cost_limit = memory
-        .mempool_tx_cost_limit
-        .min(DEFAULT_MEMPOOL_TX_COST_LIMIT_BYTES);
-    memory.read_result_byte_limit = memory
-        .read_result_byte_limit
-        .map(|limit| limit.min(derived_reads));
-    config
 }
 
 /// Verify that every native reactor passes `check_frame_cap` using its
@@ -1782,40 +1479,45 @@ mod tests {
         assert_eq!(min_connections(repeated, outsider), 33);
     }
 
-    /// fix-35 and fix-36: an override never lets startup pass a budget the
-    /// unraised settings need, and an explicit connection cap keeps the base
-    /// sessions floor.
+    /// fix-35 and fix-36: a plan below its minimum runs with no shared space
+    /// and names the raised settings, and an explicit connection cap keeps the
+    /// base sessions floor.
     #[test]
-    fn overrides_refuse_below_the_unraised_minimum_and_keep_the_floor() {
+    fn a_short_plan_names_raised_settings_and_keeps_the_floor() {
         let config = zakura_cfg(&Network::Mainnet);
         let default_minimum = minimum(&config);
 
         let mut raised = config.clone();
         raised.zakura.max_connections = Some(2_000);
         raised.zakura.max_pending_handshakes = 50_000;
-        assert!(matches!(
-            MemoryPlan::size(default_minimum - 1, &raised, &Network::Mainnet),
-            Err(MemoryPlanError::BudgetTooSmall(_))
-        ));
+        let plan = MemoryPlan::size(default_minimum, &raised, &Network::Mainnet).expect("sizes");
+        let shortfall = plan
+            .shortfall
+            .as_ref()
+            .expect("the raised handshakes don't fit");
+        assert_eq!(plan.shared_capacity(), 0);
+        assert!(shortfall
+            .raised_settings
+            .iter()
+            .any(|raised| raised.setting == "[network.zakura] max_pending_handshakes"));
 
         // A lower connection cap lowers the reserves that scale with it, but
         // the sessions floor still funds `min_connections` full connections.
         let mut lowered = config.clone();
         lowered.zakura.max_connections = Some(64);
         let lowered_minimum = minimum(&lowered);
-        assert!(matches!(
-            MemoryPlan::size(lowered_minimum - 1, &lowered, &Network::Mainnet),
-            Err(MemoryPlanError::BudgetTooSmall(_))
-        ));
-        let lowered_plan = MemoryPlan::size(lowered_minimum, &lowered, &Network::Mainnet)
-            .expect("the minimum fits");
-        let default_plan = MemoryPlan::size(default_minimum, &config, &Network::Mainnet)
-            .expect("the minimum fits");
+        let short =
+            MemoryPlan::size(lowered_minimum - 1, &lowered, &Network::Mainnet).expect("sizes");
+        assert!(short.shortfall.is_some());
+        let lowered_plan =
+            MemoryPlan::size(lowered_minimum, &lowered, &Network::Mainnet).expect("sizes");
+        let default_plan =
+            MemoryPlan::size(default_minimum, &config, &Network::Mainnet).expect("sizes");
+        assert!(lowered_plan.shortfall.is_none() && default_plan.shortfall.is_none());
         assert_eq!(
             lowered_plan.consumer_spec(Consumer::Sessions).floor,
             default_plan.consumer_spec(Consumer::Sessions).floor
         );
-        assert!(lowered_plan.override_warnings.is_empty());
     }
 
     /// fix-63: state reads are one fixed term, the derived read limit plus the
@@ -1862,26 +1564,27 @@ mod tests {
         }
     }
 
-    /// fix-63: an operator-set read limit above the derived one warns once the
-    /// plan passes `B`; a lower one lowers the requirement without a warning.
+    /// fix-63: an operator-set read limit above the derived one is named once
+    /// the plan passes `B`; a lower one lowers the requirement.
     #[test]
-    fn an_operator_read_limit_is_an_override() {
+    fn an_operator_read_limit_is_named_when_it_does_not_fit() {
         let config = zakura_cfg(&Network::Mainnet);
         let default_minimum = minimum(&config);
 
         let mut raised = config.clone();
         raised.zakura.memory_budget.read_result_byte_limit = Some(64 * GIB);
-        let plan = MemoryPlan::size(default_minimum, &raised, &Network::Mainnet)
-            .expect("a raised setting starts with a warning");
+        let plan = MemoryPlan::size(default_minimum, &raised, &Network::Mainnet).expect("sizes");
         assert!(plan
-            .override_warnings
+            .shortfall
+            .expect("the raised limit doesn't fit")
+            .raised_settings
             .iter()
-            .any(|warning| warning.setting == "[state] read_result_byte_limit"));
+            .any(|raised| raised.setting == "[state] read_result_byte_limit"));
 
         let mut lowered = config.clone();
         lowered.zakura.memory_budget.read_result_byte_limit = Some(MAX_DECODED_BLOCK_BYTES);
-        let plan = MemoryPlan::size(default_minimum, &lowered, &Network::Mainnet).expect("fits");
-        assert!(plan.override_warnings.is_empty());
+        let plan = MemoryPlan::size(default_minimum, &lowered, &Network::Mainnet).expect("sizes");
+        assert!(plan.shortfall.is_none());
         assert!(plan.required_minimum_bytes() < default_minimum);
     }
 
@@ -1891,8 +1594,8 @@ mod tests {
     /// - For every accepted `B`, `fixed + reserves + floors <= B`.
     /// - `N` (both full and required connection counts) never decreases as `B` grows.
     /// - Every reactor passes `check_frame_cap`.
-    /// - Below the smallest accepted `B`, the plan refuses and names `budget`,
-    ///   `base`, `ρ`, `B`, and every term.
+    /// - Below the smallest fitting `B`, the plan has no shared space and its
+    ///   shortfall names `budget`, `base`, `ρ`, `B`, and every term.
     #[test]
     fn mem1_plan_fits_sweep_all_networks() {
         // 64 MiB steps up to 8 GiB, 512 MiB steps up to 32 GiB, then 4 GiB
@@ -1935,8 +1638,10 @@ mod tests {
                 let mut prev_req_n = 0usize;
 
                 for &budget_b in &sweep_points {
-                    match MemoryPlan::size(budget_b, &config, &network) {
-                        Ok(plan) => {
+                    let plan = MemoryPlan::size(budget_b, &config, &network)
+                        .unwrap_or_else(|err| panic!("plan error on {network:?}: {err}"));
+                    match &plan.shortfall {
+                        None => {
                             assert!(
                                 plan.fixed.total() + plan.pool_config.total_floors() <= budget_b,
                                 "fixed + reserves + floors exceeded B for {network:?}"
@@ -1973,24 +1678,24 @@ mod tests {
                                 first_accepted = Some(plan);
                             }
                         }
-                        Err(MemoryPlanError::BudgetTooSmall(err)) => {
+                        Some(shortfall) => {
                             assert!(
                                 first_accepted.is_none(),
-                                "plan refused after an earlier smaller B succeeded on {network:?}"
+                                "plan fell short after an earlier smaller B fit on {network:?}"
                             );
-                            assert!(err.required_bytes > err.budget_b);
-                        }
-                        Err(other) => {
-                            panic!("unexpected plan error on {network:?}: {other}");
+                            assert!(shortfall.required_bytes > shortfall.budget_b);
+                            assert_eq!(plan.shared_capacity(), 0);
                         }
                     }
                 }
 
-                let first = first_accepted.expect("plan must accept 256 GiB");
+                let first = first_accepted.expect("plan must fit 256 GiB");
                 let exact_min = first.required_minimum_bytes();
-                let plan = MemoryPlan::size(exact_min, &config, &network).unwrap_or_else(|err| {
-                    panic!("exact minimum {exact_min} must be accepted on {network:?}: {err}")
-                });
+                let plan = MemoryPlan::size(exact_min, &config, &network).expect("sizes");
+                assert!(
+                    plan.shortfall.is_none(),
+                    "exact minimum {exact_min} must fit on {network:?}"
+                );
                 // fix-33: the smallest accepted budget funds `min_connections`
                 // connections carrying every reactor.
                 assert_eq!(
@@ -2013,7 +1718,9 @@ mod tests {
                     NetworkKind::Testnet => {}
                 }
                 let err = MemoryPlan::size(exact_min - 1, &config, &network)
-                    .expect_err("one byte below minimum must refuse")
+                    .expect("sizes")
+                    .shortfall
+                    .expect("one byte below minimum falls short")
                     .to_string();
                 for needle in [
                     "host budget=",
@@ -2027,7 +1734,7 @@ mod tests {
                 ] {
                     assert!(
                         err.contains(needle),
-                        "refusal message missing {needle:?}: {err}"
+                        "shortfall message missing {needle:?}: {err}"
                     );
                 }
             }
@@ -2049,15 +1756,14 @@ mod tests {
     fn host_budget_progression(config: &Config) {
         let config = config.clone();
 
-        // 4 GiB and 8 GiB refuse under draft Stage 0 base (~4.6 GiB) + worst checkpoint window (~3.7 GiB).
+        // 4 GiB and 8 GiB fall short under the draft base (~4.6 GiB) and the
+        // worst checkpoint window (~3.7 GiB).
         for small_gib in [4u64, 8] {
             let b = host_b(small_gib * GIB);
+            let plan = MemoryPlan::size(b, &config, &Network::Mainnet).expect("sizes");
             assert!(
-                matches!(
-                    MemoryPlan::size(b, &config, &Network::Mainnet),
-                    Err(MemoryPlanError::BudgetTooSmall(_))
-                ),
-                "{small_gib} GiB should refuse under draft values (D2)"
+                plan.shortfall.is_some(),
+                "{small_gib} GiB should fall short under draft values (D2)"
             );
         }
 
@@ -2066,9 +1772,8 @@ mod tests {
         let mut prev_n = 0usize;
         for host_gib in [16u64, 32, 64] {
             let b = host_b(host_gib * GIB);
-            let plan = MemoryPlan::size(b, &config, &Network::Mainnet)
-                .unwrap_or_else(|err| panic!("{host_gib} GiB must fit: {err}"));
-            assert!(plan.override_warnings.is_empty());
+            let plan = MemoryPlan::size(b, &config, &Network::Mainnet).expect("sizes");
+            assert!(plan.shortfall.is_none(), "{host_gib} GiB must fit");
             assert!(plan.shared_capacity() >= prev_s);
             assert!(plan.planned_full_connections >= prev_n);
             prev_s = plan.shared_capacity();
@@ -2110,42 +1815,25 @@ mod tests {
         );
         assert!(BASE_SEND_WINDOW_BYTES >= block_push_bytes(NODE_PROFILE));
         assert_eq!(on_plan.bases.transport_base, off_plan.bases.transport_base);
-
-        // `max_sessions` is unset by default, so it never warns. Set above
-        // what the plan funds, it warns when its worst case passes `B`; set
-        // below, it never does.
-        assert!(on_plan.override_warnings.is_empty());
-        for (max_sessions, warns) in [(256, true), (8, false)] {
-            let mut capped = on.clone();
-            capped.zakura.bpv1.max_sessions = Some(max_sessions);
-            let plan = MemoryPlan::size(budget_b, &capped, &Network::Mainnet).expect("fits");
-            assert_eq!(
-                plan.override_warnings
-                    .iter()
-                    .any(|warning| warning.setting == "[network.zakura.bpv1] max_sessions"),
-                warns,
-                "max_sessions = {max_sessions}: {:?}",
-                plan.override_warnings
-            );
-        }
+        assert!(on_plan.shortfall.is_none() && off_plan.shortfall.is_none());
     }
 
     /// BP-pt-2: a raised BPv1 setting that grows the `Propagation` reserve past
-    /// `B` still refuses, because a reserve is held in full, but the refusal
-    /// names the setting and its value. A default BPv1 refusal names none.
+    /// `B` makes the plan fall short, and the shortfall names the setting and
+    /// its value. A default BPv1 shortfall names none.
     #[test]
-    fn a_raised_bpv1_reserve_refuses_and_names_its_setting() {
+    fn a_raised_bpv1_reserve_falls_short_and_names_its_setting() {
         let mut on = zakura_cfg(&Network::Mainnet);
         on.zakura.bpv1.enabled = true;
         let budget_b = host_b(16 * GIB);
         MemoryPlan::size(budget_b, &on, &Network::Mainnet).expect("the default reserve fits");
 
-        let refusal =
-            |config: &Config, budget_b| match MemoryPlan::size(budget_b, config, &Network::Mainnet)
-            {
-                Err(MemoryPlanError::BudgetTooSmall(refusal)) => refusal,
-                other => panic!("expected a refusal: {other:?}"),
-            };
+        let refusal = |config: &Config, budget_b| {
+            MemoryPlan::size(budget_b, config, &Network::Mainnet)
+                .expect("sizes")
+                .shortfall
+                .expect("the plan falls short")
+        };
         let mut part_buffer = on.clone();
         part_buffer.zakura.bpv1.part_retention_budget_bytes = 12 * GIB;
         let mut blocks = on.clone();
@@ -2165,7 +1853,7 @@ mod tests {
             let refusal = refusal(config, budget_b);
             assert_eq!(
                 refusal
-                    .raised_reserve_settings
+                    .raised_settings
                     .iter()
                     .map(|raised| (raised.setting, raised.configured_value.as_str()))
                     .collect::<Vec<_>>(),
@@ -2173,37 +1861,33 @@ mod tests {
             );
             let message = refusal.to_string();
             assert!(
-                message.contains(&format!("{setting} = {value} raises a reserve")),
+                message.contains(&format!("{setting} = {value} adds to it")),
                 "{message}"
             );
         }
-        assert!(refusal(&on, GIB).raised_reserve_settings.is_empty());
+        assert!(refusal(&on, GIB).raised_settings.is_empty());
     }
 
     /// mem-14 (`overrides-warn`):
-    /// - Default settings never warn and refuse below minimum `B`.
-    /// - Operator overrides whose worst case exceeds `B` start anyway and emit
-    ///   one warning per offending setting naming the setting, excess bytes,
-    ///   and the plan's baseline value.
-    /// - Lowering caps or setting `max_connections` within `B` produces zero
-    ///   warnings.
-    /// - Static/session overrides that push live memory past `B` saturate `S`
-    ///   at 0, and the pool this plan sizes reports a live overrun; default
-    ///   settings never do. `memory::tests` checks the overrun warning's rate
-    ///   limit.
+    /// - Default settings fit with no shortfall and never overrun live.
+    /// - A lower connection cap fits with no shortfall.
+    /// - Raised settings that push the minimum past `B` start anyway with one
+    ///   shortfall naming them, `S` saturates at 0, and the pool this plan
+    ///   sizes reports a live overrun. `memory::tests` checks the overrun
+    ///   warning's rate limit.
     #[test]
-    fn mem14_operator_overrides_warn_at_startup_and_overrun_live() {
+    fn mem14_a_short_plan_starts_names_its_settings_and_overruns_live() {
         use zakura_rt::time::Instant;
 
         use crate::zakura::memory::MemoryPoolMachine;
 
         let budget_16g = host_b(16 * GIB);
 
-        // 1. Default settings fit with zero warnings and never overrun live.
+        // 1. Default settings fit with no shortfall and never overrun live.
         let default_cfg = zakura_cfg(&Network::Mainnet);
         let default_plan =
-            MemoryPlan::size(budget_16g, &default_cfg, &Network::Mainnet).expect("16 GiB fits");
-        assert!(default_plan.override_warnings.is_empty());
+            MemoryPlan::size(budget_16g, &default_cfg, &Network::Mainnet).expect("sizes");
+        assert!(default_plan.shortfall.is_none());
         let mut default_machine = MemoryPoolMachine::new(default_plan.pool_config);
         let now = Instant::now();
         default_machine
@@ -2217,58 +1901,37 @@ mod tests {
             "default settings must never produce a live overrun"
         );
 
-        // 2. Operator overrides that stay within B produce zero warnings.
+        // 2. A lower connection cap fits.
         let mut modest_cfg = default_cfg.clone();
         modest_cfg.zakura.max_connections = Some(64);
-        modest_cfg.zakura.memory_budget.caps.look_ahead = Some(ByteSize(512 * MIB));
-        modest_cfg.zakura.memory_budget.caps.serving_per_peer = Some(ByteSize(64 * MIB));
-        modest_cfg.zakura.memory_budget.caps.tx = Some(ByteSize(32 * MIB));
         let modest_plan =
-            MemoryPlan::size(budget_16g, &modest_cfg, &Network::Mainnet).expect("modest fits");
-        assert!(
-            modest_plan.override_warnings.is_empty(),
-            "overrides within B must not warn: {:?}",
-            modest_plan.override_warnings
-        );
+            MemoryPlan::size(budget_16g, &modest_cfg, &Network::Mainnet).expect("sizes");
+        assert!(modest_plan.shortfall.is_none());
 
-        // 3. Operator overrides whose worst case exceeds B start anyway and
-        //    report each offending setting, its excess bytes, and plan value.
+        // 3. Raised settings past B start anyway and name themselves.
         let mut overrun_cfg = default_cfg.clone();
         overrun_cfg.zakura.max_connections = Some(2_000);
-        overrun_cfg.zakura.memory_budget.caps.look_ahead = Some(ByteSize(32 * GIB));
-        overrun_cfg.zakura.memory_budget.caps.tx = Some(ByteSize(32 * GIB));
         overrun_cfg.zakura.max_pending_handshakes = 50_000;
-        let overrun_plan = MemoryPlan::size(budget_16g, &overrun_cfg, &Network::Mainnet)
-            .expect("operator overrides start anyway with warnings");
+        let overrun_plan =
+            MemoryPlan::size(budget_16g, &overrun_cfg, &Network::Mainnet).expect("sizes");
         assert_eq!(
             overrun_plan.shared_capacity(),
             0,
             "S saturates at 0 so short-lived leases stay bounded by remaining B"
         );
-        for expected_setting in [
-            "[network.zakura] max_connections",
-            "[memory.cap] look_ahead",
-            "[memory.cap] tx",
-            "[network.zakura] max_pending_handshakes",
-        ] {
-            let warning = overrun_plan
-                .override_warnings
-                .iter()
-                .find(|w| w.setting == expected_setting)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "missing warning for {expected_setting}: {:?}",
-                        overrun_plan.override_warnings
-                    )
-                });
-            assert!(warning.excess_bytes > 0, "{warning}");
-            assert!(!warning.plan_value.is_empty(), "{warning}");
-        }
+        let shortfall = overrun_plan
+            .shortfall
+            .as_ref()
+            .expect("raised handshakes push the minimum past B");
+        assert!(shortfall
+            .raised_settings
+            .iter()
+            .any(|raised| raised.setting == "[network.zakura] max_pending_handshakes"));
 
-        // 4. The overridden plan hands the pool a live overrun.
+        // 4. The short plan hands the pool a live overrun.
         assert!(
             overrun_plan.fixed.total() + overrun_plan.pool_config.total_floors() > budget_16g,
-            "the overridden fixed terms and floors exceed B"
+            "the raised fixed terms and floors exceed B"
         );
         let mut live_machine = MemoryPoolMachine::new(overrun_plan.pool_config);
         for consumer in Consumer::ALL {

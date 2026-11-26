@@ -1454,8 +1454,7 @@ impl MemoryPool {
         }
     }
 
-    /// The plan's cap on one serving peer's part (`[memory.cap]
-    /// serving_per_peer`).
+    /// The plan's cap on one serving peer's part.
     pub(crate) fn serving_per_peer_cap(&self) -> u64 {
         self.lock().machine.serving_per_peer_cap()
     }

@@ -539,8 +539,10 @@ impl ZakuraTrace {
             ("rho_denominator", derivation.rho_denominator),
             ("budget_b", plan.pool_config.budget_b),
             (
-                "override_warnings_count",
-                count(plan.override_warnings.len()),
+                "shortfall_bytes",
+                plan.shortfall.as_ref().map_or(0, |shortfall| {
+                    shortfall.required_bytes.saturating_sub(shortfall.budget_b)
+                }),
             ),
             ("fixed_total", plan.fixed.total()),
         ]

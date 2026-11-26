@@ -6511,24 +6511,13 @@ async fn spawn_zakura_endpoint_inner(
         custom_services.push(service);
         handle
     });
-    let block_sync_memory = super::BlockSyncMemory::new(
-        memory_pool.clone(),
-        config
-            .zakura
-            .memory_budget
-            .caps
-            .look_ahead
-            .map(super::memory::ByteSize::bytes),
-    );
+    let block_sync_memory = super::BlockSyncMemory::new(memory_pool.clone(), None);
     info!(plan = %memory_plan, "sized and enforced Zakura startup memory plan");
-    for warning in &memory_plan.override_warnings {
+    if let Some(shortfall) = &memory_plan.shortfall {
         warn!(
-            setting = %warning.setting,
-            configured = %warning.configured_value,
-            excess_bytes = warning.excess_bytes,
-            plan_value = %warning.plan_value,
-            budget_b = memory_plan.pool_config.budget_b,
-            "operator setting can exceed [memory] budget: {warning}"
+            budget_b = shortfall.budget_b,
+            required_bytes = shortfall.required_bytes,
+            "the memory plan needs more than [memory] budget: {shortfall}"
         );
     }
     let limits = memory_plan.local_limits(config);

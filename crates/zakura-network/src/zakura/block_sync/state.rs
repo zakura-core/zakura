@@ -55,7 +55,7 @@ pub(super) struct NeededBlocksQueryFailure {
 #[derive(Clone, Debug)]
 pub struct BlockSyncMemory {
     pub(super) pool: MemoryPool,
-    /// `[memory.cap] look_ahead`, which lowers the derived look-ahead cap.
+    /// An optional ceiling that lowers the derived look-ahead cap.
     pub(super) look_ahead_cap: Option<u64>,
 }
 
@@ -1436,7 +1436,7 @@ pub(super) struct LookAheadCap {
     fetch_samples: usize,
     fetch_cursor: usize,
     commit_rate_peak: u64,
-    /// `[memory.cap] look_ahead`, which lowers the derived look-ahead.
+    /// An optional ceiling that lowers the derived look-ahead.
     cap_override: Option<u64>,
 }
 
@@ -1485,8 +1485,8 @@ impl LookAheadCap {
     }
 
     /// The look-ahead from the commit-rate peak and the p99 range-fetch time
-    /// (`02 §4`): `2 × commit_rate × p99_range_fetch_time`, optionally lowered
-    /// by `[memory.cap] look_ahead`. Zero before any range fetch completed.
+    /// (`02 §4`): `2 × commit_rate × p99_range_fetch_time`, lowered by the
+    /// optional ceiling. Zero before any range fetch completed.
     pub(super) fn look_ahead_bytes(&self) -> u64 {
         let Some(p99) = self.p99_fetch_time() else {
             return 0;

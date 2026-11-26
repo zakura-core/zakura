@@ -55,13 +55,6 @@ ready_max_tip_age = "5m"
 # "auto" (default): the tightest host or cgroup limit. Or a byte size: "16 GiB".
 budget = "auto"
 
-# Optional. Shares of the bulk pool when consumers contend. Default: equal.
-[memory.weight]
-block_sync = 1
-serving = 1
-sessions = 1
-tx = 1
-
 [mempool]
 eviction_memory_time = "1h"
 implementation = "default"

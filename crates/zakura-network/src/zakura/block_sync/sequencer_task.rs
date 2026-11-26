@@ -999,7 +999,7 @@ impl SequencerIO {
         );
     }
 
-    /// This task, lowering the derived look-ahead to `[memory.cap] look_ahead`.
+    /// This task, lowering the derived look-ahead to `cap_override` when set.
     pub(super) fn with_look_ahead_cap(mut self, cap_override: Option<u64>) -> Self {
         self.look_ahead = LookAheadCap::new(cap_override);
         self

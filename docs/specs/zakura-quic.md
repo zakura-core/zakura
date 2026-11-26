@@ -1213,8 +1213,9 @@ reads as unset, so those nodes also get the small handshake windows.
     `p2p_stack = "zakura"`, Mainnet needs a host of about 13.5 GiB, Testnet
     about 13.4 GiB and Regtest about 9.5 GiB. In `Dual` mode, legacy TCP
     ingress and one legacy read add 1.2 GiB of fixed terms, and Mainnet needs
-    about 15.0 GiB. Below its minimum, the node refuses to start and lists
-    every term.
+    about 15.0 GiB. Below its minimum, the node starts with no shared space and
+    logs one warning that lists every term and each raised setting that adds
+    to them. It refuses only once the draft constants are measured.
   - **BPv1.** With `[network.zakura.bpv1] enabled = true`, the `Propagation`
     reserve covers what BPv1 retains for its concurrent blocks, in place of
     the tip-block term. It holds the block table's part and metadata budgets,
@@ -1236,14 +1237,13 @@ reads as unset, so those nodes also get the small handshake windows.
     of the `Sessions` share free for each, but never so much that the share
     funds fewer connections than its floor. A gateway may lease anything left
     in the share. The caps that scale with connections count the held places.
-  - **Operator settings.** The node refuses to start when the plan exceeds
-    `B` with every raised setting at its default. A lowered setting stays
-    lowered in that check. A raised setting (`max_connections`, a reactor's
-    `peer_limits`, BPv1's `max_sessions`, `[memory.cap]`, `[memory.weight]`,
-    larger static windows or more handshakes) whose worst case exceeds `B`
-    starts the node with one warning per setting. While the node runs, it warns about an overrun at
-    most once every 10 minutes, and short-lived leases stay within what
-    remains of `B`.
+  - **Operator settings.** The bulk consumers share `S` equally, and no
+    setting changes their weights or caps. A raised setting that adds to a
+    fixed term or a reserve (larger static windows, more handshakes, a larger
+    mempool or state read limit, or BPv1's part buffer and concurrent blocks)
+    is named in the startup warning when the plan exceeds `B`. While the node
+    runs, it warns about an overrun at most once every 10 minutes, and
+    short-lived leases stay within what remains of `B`.
   - **Throughput.** A budget below the workload's demand can delay a peer's
     requests, serving output or send-window growth. That costs throughput
     and keeps RSS bounded. A local memory limit never faults or penalizes a
@@ -2823,8 +2823,8 @@ congestion window.
 
 Removed:
 
-- **§9.1.** `peer_memory_budget_bytes`. A config that sets it fails to load
-  and names `[memory] budget`.
+- **§9.1.** `peer_memory_budget_bytes`. A config that sets it still loads,
+  the value is ignored, and startup warns that `[memory] budget` replaces it.
 
 Changed:
 

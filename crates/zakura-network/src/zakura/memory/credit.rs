@@ -327,9 +327,8 @@ impl CreditMachine {
     }
 
     /// Reads a periodic load snapshot to release drained leases and to size
-    /// the send window. `per_peer_cap` is the serving per-peer cap
-    /// (`[memory.cap] serving_per_peer`), and `peer_floor` the peer's serving
-    /// floor: one largest response.
+    /// the send window. `per_peer_cap` is the serving per-peer cap and
+    /// `peer_floor` the peer's serving floor: one largest response.
     pub(crate) fn tick(
         &mut self,
         load: CreditLoad,

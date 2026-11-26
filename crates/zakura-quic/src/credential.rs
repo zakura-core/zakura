@@ -284,9 +284,9 @@ impl NodeCredential {
 
     /// The node IDs that a handshake signed with the keys under
     /// `signing_tags` proves this credential's holder answers to (TLS-7):
-    /// the credential's own ID first, then the ID of each shorter list of
-    /// its entries that includes every signing key. Those are the IDs the
-    /// node had, or could have had, before it added its other entries.
+    /// the credential's own ID first, then the ID of each shorter prefix of
+    /// its key list that includes every signing key, shortest first. Those
+    /// are the IDs the node had before it added its later entries.
     ///
     /// An ID whose list leaves a signing key out is not among
     /// them: whoever added that key to another node's entries could
@@ -738,13 +738,13 @@ mod tests {
             .collect()
     }
 
-    /// TLS-7: a credential proves the ID of each list of its entries that
+    /// TLS-7: a credential proves the ID of each prefix of its key list that
     /// keeps every signing key, when it holds those keys in full, and what
     /// it proves to a dialer is exactly what it reports. An entry outside
     /// the signing keys may be a fingerprint. A signing key given as its
     /// fingerprint proves nothing, not even the credential's own ID.
     #[test]
-    fn a_credential_proves_the_ids_of_the_lists_that_keep_its_signing_keys() {
+    fn a_credential_proves_the_ids_of_the_prefixes_that_keep_its_signing_keys() {
         const SIGNING: [u16; 2] = [ED25519_KEY_TAG, ML_DSA_65_KEY_TAG];
         let secret = NodeSecretKey::from_bytes(&[7; KEY_LENGTH]);
         let own = |tag: u16| {
@@ -766,17 +766,25 @@ mod tests {
             NodeCredential::from_entries(kept).map(|kept| kept.node_id())
         };
 
+        // The whole list, then the one shorter prefix that keeps both
+        // signing keys: the first three entries.
         let proven: Vec<NodeId> = credential.proven_ids(&SIGNING).collect();
-        assert_eq!(proven.first(), Some(&credential.node_id()));
-        assert_eq!(proven.len(), crate::MAX_EARLIER_NODE_IDS + 1);
+        assert_eq!(
+            proven,
+            [
+                credential.node_id(),
+                id_of(0b0111).expect("a prefix is a list")
+            ]
+        );
         for mask in 1u32..1 << entries.len() {
-            // Bits 0 and 2 are the signing keys.
-            let keeps_signing_keys = mask & 0b0101 == 0b0101;
+            // A prefix's mask is one below a power of two. Bits 0 and 2 are
+            // the signing keys.
+            let proves = (mask + 1).is_power_of_two() && mask & 0b0101 == 0b0101;
             let id = id_of(mask).expect("entries in tag order form a credential");
-            assert_eq!(proven.contains(&id), keeps_signing_keys, "{mask:#06b}");
+            assert_eq!(proven.contains(&id), proves, "{mask:#06b}");
             assert_eq!(
                 credential.proves_dialed_id(id, &SIGNING),
-                keeps_signing_keys,
+                proves,
                 "{mask:#06b}"
             );
         }
@@ -788,9 +796,9 @@ mod tests {
         assert_eq!(retired.node_id(), credential.node_id());
         assert_eq!(retired.proven_ids(&SIGNING).next(), None);
         assert!(!retired.proves_dialed_id(retired.node_id(), &SIGNING));
-        // The same credential still proves its Ed25519 lists to a scheme
-        // that signs with that key alone.
-        assert_eq!(retired.proven_ids(&[ED25519_KEY_TAG]).count(), 8);
+        // The same credential still proves its four prefixes to a scheme
+        // that signs with the Ed25519 key alone.
+        assert_eq!(retired.proven_ids(&[ED25519_KEY_TAG]).count(), 4);
 
         // A credential without a signing key proves nothing either.
         let single = NodeCredential::single(ed25519());

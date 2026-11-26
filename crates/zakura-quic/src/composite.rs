@@ -29,10 +29,10 @@ pub const ML_DSA_65_KEY_TAG: u16 = 3;
 pub(crate) const COMPOSITE_KEY_TAGS: [u16; 2] = [ED25519_KEY_TAG, ML_DSA_65_KEY_TAG];
 
 /// The most earlier node IDs a handshake signed with the composite proves
-/// (TLS-7): one for each list of the credential's entries, short of the
-/// whole, that keeps both signing keys. A credential holds at most
-/// [`MAX_NODE_KEYS`] entries, so two may be left out, which makes 3.
-pub const MAX_EARLIER_NODE_IDS: usize = (1 << (MAX_NODE_KEYS - COMPOSITE_KEY_TAGS.len())) - 1;
+/// (TLS-7): one for each proper prefix of the credential's key list that
+/// keeps both signing keys. Such a prefix holds at least those two entries
+/// and a credential at most [`MAX_NODE_KEYS`], which makes 30.
+pub const MAX_EARLIER_NODE_IDS: usize = MAX_NODE_KEYS - COMPOSITE_KEY_TAGS.len();
 
 /// Length of an ML-DSA-65 public key, in bytes.
 pub const ML_DSA_65_KEY_BYTES: usize = 1_952;

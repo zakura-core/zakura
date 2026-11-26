@@ -770,7 +770,7 @@ mod tests {
 
         let mut counts = HandshakeCounts::default();
         let caller = node(0xF0);
-        let many: Vec<NodeId> = (1..=10).map(node).collect();
+        let many: Vec<NodeId> = (1..).take(MAX_EARLIER_NODE_IDS + 2).map(node).collect();
         let proved = ProvenNode::new(caller, &many);
 
         counts

@@ -399,13 +399,13 @@ at fork tag `zakura-iroh-v1.1.0-rc.1`, and it keeps their MIT/Apache-2.0 notices
   dialed one. `Conn::remote_earlier_ids()` returns the other IDs the
   handshake proved, on a dial and on an accepted connection: each ID that
   TLS-7 would accept for this credential and the keys the peer signed with,
-  apart from `remote_id()`. That is the ID of every shorter list of the
-  credential's entries that keeps the signing keys, whether or not the node
-  ever used it, and only the holder of those keys can prove any of them.
-  One enumeration of the credential's lists
-  answers both the dial's check and this report, so they can't disagree. A
-  credential holds 4 entries and the composite signs with two, so a
-  handshake proves at most 3 earlier IDs.
+  apart from `remote_id()`. That is the ID of every shorter prefix of the
+  credential's key list that keeps the signing keys, shortest first. A node
+  adds keys only at the end of its list (ID-8), so these are the IDs it had,
+  and only the holder of those keys can prove any of them. One enumeration
+  of the credential's prefixes answers both the dial's check and this
+  report, so they can't disagree. A credential holds 32 entries and the
+  composite signs with two, so a handshake proves at most 30 earlier IDs.
 - **TLS-9.** The crypto provider is rustls' `ring` provider with its default
   TLS 1.3 cipher suites, and its only key-exchange group is X25519MLKEM1024,
   private-use code point 0xFE24. No standard pairs X25519 with ML-KEM-1024
@@ -1017,7 +1017,7 @@ is today's Zakura logic.
      whichever place the new node itself would fill.
 
   The proven IDs are kept while the connection holds its slot or its
-  registration, at most 3 for each. An inbound moved peer isn't linked to
+  registration, at most 30 for each. An inbound moved peer isn't linked to
   its earlier ID in the discovery book, so discovery may still dial that
   ID once and close the dial as a duplicate (DIAL-9).
 - **DIAL-8.** When its hello spans two or more Initial datagrams, the dialer
@@ -1661,7 +1661,7 @@ this release tolerates, and keep each hard change explicit.
 | A dial to the ID a node had before it added a key connects, and reports the dialed ID and the node's ID now; a node's dial to its own earlier ID is refused as a self-dial; a dial to an ID whose list leaves out a signing key is refused; a node's public keys beside another party's key pass the ID check and fail the signature; a key list contains exactly its prefixes that keep the required tags, checked against every list of the entries of each list of 1 to 6 entries and every set of required tags, and on a 32-entry list against each prefix with one entry dropped, swapped or changed | TLS-7, TLS-8, API-4, DIAL-1 |
 | A list of a credential's entries that keeps both signing keys and skips an entry, which version 0.31 accepted, is refused: by the key list, by the verifier in a whole TLS handshake, and on a QUIC dial to a node with 32 entries, which answers each of its 31 prefix IDs from its two signing keys on. The check hashes fewer lists than the list has entries | TLS-7, SEC-2 |
 | A key list and a credential hold 32 entries and refuse 33; a credential of exactly 10,385 bytes decodes, with 5 entries and with 32, and one byte more is refused when built, when decoded and in a whole TLS handshake; the dialer's verifier and the listener's each read a credential of 32 entries and one of 10,385 bytes, and refuse 33 entries and 10,386 bytes as a bad encoding | ID-8, ID-12, SEC-2 |
-| A connection reports, in both directions, the earlier IDs its peer proved: for the largest credential, the three lists that keep both signing keys, each of which a dial also reaches, and none that leaves a signing key out; a credential proves to a dialer exactly the IDs it reports, and none when a signing key is a fingerprint | TLS-7, TLS-8, API-4 |
+| A connection reports, in both directions, the earlier IDs its peer proved: for the largest credential, its 30 shorter prefixes from the two signing keys on, shortest first, each of which a dial also reaches, and neither a list that leaves a signing key out nor one that skips an entry; a credential proves to a dialer exactly the IDs it reports, and none when a signing key is a fingerprint | TLS-7, TLS-8, API-4 |
 | A fingerprint-only entry gives the node ID of the full key, holds no key, and round-trips byte for byte under a known and an unknown tag; a marked Ed25519 entry and a marked entry that isn't 32 bytes are refused; both verifiers refuse a credential whose ML-DSA-65 key is a fingerprint | ID-12, TLS-4 |
 | The largest credential a node can authenticate with, 32 entries in 10,385 bytes, completes a handshake in both directions on loopback, and in the simulator when every burst of datagrams arrives in reverse, in two round trips where the listener's flight passes the padded allowance. With 128 bytes standing in for the transport parameters, its flights are 14,035 bytes from the listener and 13,864 from the dialer, inside the 16 KiB `quinn-proto` buffers | ID-12, DIAL-8 |
 | When the datagram that starts the listener's ServerHello is lost, a dial to a listener with this release's credential completes, and a dial to a listener with the largest credential fails at the handshake deadline, with both connections released and a bounded number of bytes sent | ID-12, ADM-6, COMPAT-13 |

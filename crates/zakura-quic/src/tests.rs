@@ -17,8 +17,8 @@ use tokio::sync::mpsc;
 use crate::{
     endpoint::watch_interfaces,
     sim::{DatagramId, LinkModel, NetEvent, SeededInputs, SimNet, Source},
-    Acceptor, Admit, Conn, ConnectError, ConnectionError, IncomingInfo, NodeAddr, NodeId,
-    NodeSecretKey, QuicBindConfig, QuicConfig, QuicEndpoint, SocketBuffers, SocketStats, VarInt,
+    Acceptor, Admit, Conn, ConnectError, ConnectionError, IncomingInfo, NodeAddr, NodeSecretKey,
+    QuicBindConfig, QuicConfig, QuicEndpoint, SocketBuffers, SocketStats, VarInt,
 };
 
 const ALPN: &[u8] = b"p2p-v2/3";
@@ -906,61 +906,52 @@ async fn a_node_with_32_keys_answers_to_each_earlier_id_and_no_other_list() {
 }
 
 /// TLS-7, API-4: a connection reports the earlier IDs its peer proves in
-/// both directions. The largest credential proves the most: the ID of its
-/// two signing keys alone, and that list with either added key. An accepted
-/// connection reports them for the dialer as a dial reports them for the
-/// listener, and a dial to any of them reaches the node.
+/// both directions. The largest credential proves the most: the ID of each
+/// prefix of its key list from its two signing keys on, short of the whole,
+/// shortest first. An accepted connection reports them for the dialer as a
+/// dial reports them for the listener, and a dial to any of them reaches
+/// the node.
 #[tokio::test]
 async fn a_connection_reports_the_earlier_ids_its_peer_proves() {
-    let ids_of = |secret: &NodeSecretKey| {
-        let entry = |tag: u16| (tag, secret.credential().key(tag).unwrap().to_vec());
-        let signing = [crate::ED25519_KEY_TAG, crate::ML_DSA_65_KEY_TAG].map(entry);
-        let id = |added: &[u16]| {
-            let entries = signing
-                .iter()
-                .cloned()
-                .chain(added.iter().map(|tag| entry(*tag)));
-            crate::NodeCredential::from_entries(entries)
-                .unwrap()
-                .node_id()
-        };
-        let mut earlier = vec![id(&[]), id(&[4]), id(&[5])];
-        earlier.sort_unstable_by_key(|id| *id.as_bytes());
+    // A node with the largest credential, and the IDs its handshake proves
+    // and doesn't.
+    let largest = || {
+        let original = NodeSecretKey::generate();
+        let additions = largest_credential_additions();
+        let earlier: Vec<_> = (0..additions.len())
+            .map(|added| with_additions(original.clone(), additions[..added].to_vec()).public())
+            .collect();
         assert_eq!(earlier.len(), crate::MAX_EARLIER_NODE_IDS);
-        // Lists that leave out a signing key, which the handshake can't
-        // prove: the Ed25519 key with the added keys, and the added keys
-        // alone.
-        let unproven = [
-            crate::NodeCredential::from_entries([
-                entry(crate::ED25519_KEY_TAG),
-                entry(4),
-                entry(5),
-            ])
-            .unwrap()
-            .node_id(),
-            crate::NodeCredential::from_entries([entry(4), entry(5)])
-                .unwrap()
-                .node_id(),
-        ];
-        (earlier, unproven)
-    };
-    let sorted = |mut ids: Vec<NodeId>| {
-        ids.sort_unstable_by_key(|id| *id.as_bytes());
-        ids
+        // Lists of the node's entries the handshake can't prove: one that
+        // leaves out the ML-DSA-65 key, and one that skips the first key the
+        // node added.
+        let ed25519 = original.credential().key(crate::ED25519_KEY_TAG).unwrap();
+        let without_ml_dsa = crate::NodeCredential::from_entries(
+            [(
+                crate::ED25519_KEY_TAG,
+                crate::CredentialKey::Full(ed25519.to_vec()),
+            )]
+            .into_iter()
+            .chain(additions.iter().cloned()),
+        )
+        .unwrap()
+        .node_id();
+        let skipping = with_additions(original.clone(), additions[1..].to_vec()).public();
+        let secret = with_additions(original, additions);
+        (secret, earlier, [without_ml_dsa, skipping])
     };
 
-    tokio::time::timeout(TEST_TIMEOUT, async {
-        let (listener_key, dialer_key) = (largest_credential_key(), largest_credential_key());
-        let (listener_earlier, listener_unproven) = ids_of(&listener_key);
-        let (dialer_earlier, dialer_unproven) = ids_of(&dialer_key);
+    tokio::time::timeout(3 * TEST_TIMEOUT, async {
+        let (listener_key, listener_earlier, listener_unproven) = largest();
+        let (dialer_key, dialer_earlier, dialer_unproven) = largest();
         let endpoint = QuicEndpoint::bind(listener_key, &loopback(), &test_config()).unwrap();
         let mut server = serve_test_acceptor(endpoint, &[ALPN], |_| Admit::Accept);
         let client = QuicEndpoint::bind(dialer_key, &loopback(), &test_config()).unwrap();
 
         let conn = client.connect(server.addr(), &[ALPN]).await.unwrap();
         let inbound = server.handled.recv().await.unwrap();
-        assert_eq!(sorted(conn.remote_earlier_ids()), listener_earlier);
-        assert_eq!(sorted(inbound.remote_earlier_ids()), dialer_earlier);
+        assert_eq!(conn.remote_earlier_ids(), listener_earlier);
+        assert_eq!(inbound.remote_earlier_ids(), dialer_earlier);
         assert!(!conn.remote_earlier_ids().contains(&conn.remote_id()));
         for (connection, unproven) in [(&conn, listener_unproven), (&inbound, dialer_unproven)] {
             for id in unproven {
@@ -989,7 +980,7 @@ async fn a_connection_reports_the_earlier_ids_its_peer_proves() {
         let plain = self::client();
         let conn = plain.connect(server.addr(), &[ALPN]).await.unwrap();
         let inbound = server.handled.recv().await.unwrap();
-        assert_eq!(sorted(conn.remote_earlier_ids()), listener_earlier);
+        assert_eq!(conn.remote_earlier_ids(), listener_earlier);
         assert_eq!(inbound.remote_earlier_ids(), []);
     })
     .await

@@ -671,7 +671,7 @@ mod tests {
     fn a_native_connection_keeps_a_bounded_number_of_earlier_ids() {
         let node = |byte: u8| NodeId::from_bytes(&[byte; 32]);
         let registry = PeerRegistry::default();
-        let many: Vec<NodeId> = (1..=10).map(node).collect();
+        let many: Vec<NodeId> = (1..).take(MAX_EARLIER_NODE_IDS + 2).map(node).collect();
         registry.register_native_connection(peer_id(0xFF), 1, None, &many);
 
         let state = registry.inner.lock().expect("the mutex is not poisoned");

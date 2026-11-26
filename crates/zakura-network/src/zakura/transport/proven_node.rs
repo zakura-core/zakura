@@ -87,7 +87,7 @@ mod tests {
 
     #[test]
     fn a_node_keeps_no_more_earlier_ids_than_a_handshake_proves() {
-        let many: Vec<NodeId> = (0..10).map(id).collect();
+        let many: Vec<NodeId> = (0..).take(MAX_EARLIER_NODE_IDS + 2).map(id).collect();
         let node = ProvenNode::new(id(0xFF), &many);
         assert_eq!(node.earlier(), &many[..MAX_EARLIER_NODE_IDS]);
     }

@@ -1568,6 +1568,54 @@ fn an_always_preferred_caller_passes_a_full_inbound_share() {
     );
 }
 
+/// Unknown callers can try concurrently for different offline template nodes.
+#[test]
+fn pending_handshakes_share_the_empty_template_places() {
+    let handler = handler(40, 2);
+    let templates = [new_node(), new_node()];
+    handler.publish_gateway_ranking(
+        templates.map(|node| {
+            RankedGateway::always_preferred(GatewayId::from_node_id(node.as_bytes()), 0)
+        }),
+    );
+    let mut peers = fill(&handler, 30, true);
+    let incoming = IncomingInfo {
+        remote: SocketAddr::new(IpAddr::from([203, 0, 113, 7]), 8234),
+        validated: true,
+        pending_total: 0,
+        pending_from_ip: 0,
+    };
+    assert_eq!(handler.admit(&incoming), Admit::Accept);
+    assert_eq!(handler.admit(&incoming), Admit::Accept);
+    assert!(!admits_a_caller(&handler, 2));
+
+    drop(peers.pop());
+    assert!(admits_a_caller(&handler, 2), "an ordinary place is free");
+    peers.push(
+        handler
+            .claim_connection(new_node(), true)
+            .expect("ordinary place"),
+    );
+    handler.cancel_admission(&incoming);
+    assert!(admits_a_caller(&handler, 2), "one attempt was cancelled");
+
+    let _template = handler
+        .claim_connection(templates[0], true)
+        .expect("held place");
+    handler.finish_admission(false);
+    assert_eq!(handler.admit(&incoming), Admit::Accept);
+    assert!(
+        !admits_a_caller(&handler, 2),
+        "only one template is offline"
+    );
+    assert_eq!(ordinary(&handler, true), Err(SlotRefusal::InboundShare));
+    handler.finish_admission(false);
+    assert!(
+        admits_a_caller(&handler, 2),
+        "the ordinary caller was refused"
+    );
+}
+
 /// Startup warns when the funded places are no more than the always-preferred
 /// IDs, with its own message when none is funded, and says nothing when a
 /// place is left for ranked gateways or no ID is always preferred.

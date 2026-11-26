@@ -298,10 +298,11 @@ impl HandshakeCounts {
 
     /// Whether a slot within `cap` may be free for an inbound caller whose
     /// node ID is not known yet: an ordinary inbound slot, or a held place
-    /// that no preferred gateway fills. With no hold this is the ordinary
-    /// inbound check alone.
+    /// for a gateway or configured template node. When only held places are
+    /// free, allow one pending transport handshake per empty place.
     pub fn inbound_place_free(&self, cap: usize) -> bool {
-        self.connections.inbound_place_free(cap, &self.preferred)
+        self.connections
+            .inbound_place_free(cap, &self.preferred, self.transport_pending())
     }
 
     /// Connection slots within `cap` that a dial to a node outside the

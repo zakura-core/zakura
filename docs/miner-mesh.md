@@ -136,6 +136,13 @@ places are full. The caller must first complete a handshake, which shares
 the relay's normal per-IP and global limits. The relay can also dial the
 template node if it knows a reachable address.
 
+When ordinary inbound places are full, the relay allows one concurrent inbound
+transport handshake per empty reserved place. It learns who called during the
+handshake, so an ordinary caller can temporarily use an attempt and the template
+node may need to retry. Remove stale IDs and IDs of legacy-only template nodes
+from the relay’s list. They leave a place open for repeated handshake attempts
+without a v2 template node to fill it.
+
 `zakurad` refuses to start with `miner_mesh_template_nodes` set unless
 `miner_mesh` is set and the node is its own gateway (`miner_mesh_gateways` is
 empty), since template nodes connect to the gateway their coinbases name. It

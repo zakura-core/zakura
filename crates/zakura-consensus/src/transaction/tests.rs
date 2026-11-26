@@ -4841,9 +4841,10 @@ async fn mempool_applies_the_zip218_limits_to_ironwood_actions() {
     }
 }
 
-/// Checks that the mempool applies ZIP 223's limits from NU7.1. The mempool
-/// re-verifies its transactions when the tip reaches an activation block, so
-/// this also evicts a transaction that no NU7.1 block can include.
+/// Checks that the mempool refuses a transaction over ZIP 223's limits when the
+/// next block is at or above NU7.1. Both mempools re-verify their transactions
+/// when the block before NU7.1 becomes the tip, so this check also drops one
+/// admitted earlier.
 #[tokio::test]
 async fn mempool_applies_the_zip223_limits_from_nu7_1() {
     let _init_guard = zakura_test::init();

@@ -1,3 +1,4 @@
+mod checkpoint_reserve;
 pub(super) mod gauge_recorder;
 mod progress;
 mod query_lifecycle;

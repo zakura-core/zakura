@@ -951,6 +951,19 @@ pub struct BlockStep {
     pub events: Vec<BlockEvent>,
 }
 
+/// Why metadata retries header admission after it waited or was dropped.
+#[derive(Clone, Copy, Debug)]
+enum AdmissionRetry {
+    /// A wake or a best-header move retried an entry that passed the
+    /// unknown-parent checks and parked at this time. It keeps that first
+    /// deadline if it parks again.
+    Parked(Instant),
+    /// The checks dropped the entry after the best header moved. The retry
+    /// only looks for a header that header sync admitted meanwhile, so a
+    /// missing parent rejects the copy as the drop did.
+    Dropped,
+}
+
 #[derive(Clone, Debug)]
 struct AdmittingEntry {
     work_id: WorkId,
@@ -965,10 +978,8 @@ struct AdmittingEntry {
     /// The header's parent, once headerchain admits the header.
     parent_hash: Option<block::Hash>,
     stage: AdmittingStage,
-    /// When the entry first parked, if a wake retries it. A retried entry
-    /// already passed the unknown-parent checks, and it keeps its first
-    /// deadline if it parks again.
-    parked_at: Option<Instant>,
+    /// Why the entry retries header admission, if it does.
+    retry: Option<AdmissionRetry>,
     /// [`BlockTable::best_moves`] when the entry's header admission started.
     best_moves: u64,
 }
@@ -2038,15 +2049,15 @@ impl BlockTable {
     }
 
     /// Queues headerchain admission for `envelope`, which `from` sent first,
-    /// with the copies `later` that other sessions sent. `parked_at` is when
-    /// a woken pending entry first parked.
+    /// with the copies `later` that other sessions sent. `retry` says why
+    /// a pending entry retries, if it does.
     fn start_admission(
         &mut self,
         arrived_at: Instant,
         envelope: Box<MetaEnvelope>,
         from: (NodeId, u64),
         mut later: LaterCopies,
-        parked_at: Option<Instant>,
+        retry: Option<AdmissionRetry>,
         step: &mut BlockStep,
     ) {
         let block_id = envelope.block_id;
@@ -2097,7 +2108,7 @@ impl BlockTable {
                 height: None,
                 parent_hash: None,
                 stage: AdmittingStage::WaitingHeader,
-                parked_at,
+                retry,
                 best_moves: self.best_moves,
             },
         );
@@ -2164,13 +2175,26 @@ impl BlockTable {
                 });
             }
             HeaderAdmissionResult::MissingParent { parent_hash } => {
-                if let Some(parked_at) = entry.parked_at {
-                    let entry = self
-                        .admitting
-                        .remove(&block_id)
-                        .expect("admitting entry verified present");
-                    self.park(now, block_id, entry, parent_hash, parked_at, step);
-                    return;
+                match entry.retry {
+                    Some(AdmissionRetry::Parked(parked_at)) => {
+                        let entry = self
+                            .admitting
+                            .remove(&block_id)
+                            .expect("admitting entry verified present");
+                        self.park(now, block_id, entry, parent_hash, parked_at, step);
+                        return;
+                    }
+                    // The entry failed its checks, so it never parks.
+                    Some(AdmissionRetry::Dropped) => {
+                        let entry = self
+                            .admitting
+                            .remove(&block_id)
+                            .expect("admitting entry verified present");
+                        reject_meta(step, block_id, entry.from_peer, entry.session_gen);
+                        reject_later(step, block_id, &entry.later);
+                        return;
+                    }
+                    None => {}
                 }
                 // Headerchain checked nothing but the parent's hash, so the
                 // header's own checks run before it waits. They run under the
@@ -2250,13 +2274,14 @@ impl BlockTable {
         else {
             return;
         };
-        // A `Drop` for a height header sync reached during the checks may
-        // now find the header, so it retries like `Park` after a move.
-        let may_retry = matches!(
-            verdict,
-            UnknownParentVerdict::Park | UnknownParentVerdict::Drop
-        );
-        let retries = may_retry
+        // Header sync may have admitted the header during the checks, so a
+        // `Drop` retries after a move too (see `AdmissionRetry::Dropped`).
+        let retry = match verdict {
+            UnknownParentVerdict::Park => Some(AdmissionRetry::Parked(entry.received_at)),
+            UnknownParentVerdict::Drop => Some(AdmissionRetry::Dropped),
+            UnknownParentVerdict::Invalid(_) => None,
+        };
+        let retries = retry.is_some()
             && retries_admission(entry.best_moves, self.best_moves, entry.received_at, now);
         if retries || verdict == UnknownParentVerdict::Park {
             entry.checking = None;
@@ -2269,7 +2294,7 @@ impl BlockTable {
                     entry.envelope,
                     (entry.from_peer, entry.session_gen),
                     entry.later,
-                    Some(entry.received_at),
+                    retry,
                     step,
                 );
             }
@@ -2325,7 +2350,7 @@ impl BlockTable {
                 entry.envelope,
                 (entry.from_peer, entry.session_gen),
                 entry.later,
-                Some(parked_at),
+                Some(AdmissionRetry::Parked(parked_at)),
                 step,
             );
             return;
@@ -2486,7 +2511,7 @@ impl BlockTable {
                     pending.envelope,
                     (pending.from_peer, pending.session_gen),
                     pending.later,
-                    Some(pending.received_at),
+                    Some(AdmissionRetry::Parked(pending.received_at)),
                     step,
                 );
             }

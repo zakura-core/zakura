@@ -296,6 +296,10 @@ async fn the_transport_reader_queues_at_most_the_owed_peers() {
     written.recv().await.expect("GetServices was queued");
     written.recv().await.expect("the query was queued");
 
+    assert!(matches!(
+        precheck.check(PEERS, peers_len(1) + 1),
+        Err(FrameRejection::AboveReservation { .. })
+    ));
     precheck
         .check(PEERS, peers_len(1))
         .expect("the owed answer queues");
@@ -673,7 +677,7 @@ async fn answers_settled_sees_a_claim_that_takes_the_queued_frame() {
 /// Exercises each hold: a live query and an unsettled answer each refuse
 /// the next query of their kind, an answer outlives its retired session, a
 /// retirement with a written unanswered query closes its connection, and the
-/// transport and the claim each refuse an answer.
+/// transport refuses oversized and duplicate answers.
 const SETTLEMENT_WITNESS: [u8; 21] = [
     16, 2, 4, 16, 6, 16, 10, 14, 12, 16, 2, 14, 24, 17, 21, 7, 16, 4, 4, 10, 12,
 ];
@@ -690,13 +694,12 @@ mod settlement_target {
             sent: 4,
             not_due: 2,
             written: 2,
-            delivered: 3,
-            refused: 1,
+            delivered: 2,
+            refused: 2,
             claimed: 1,
-            oversized: 1,
             settled: 1,
             hellos: 2,
-            stale: 1,
+            stale: 2,
             retired: 2,
             closed: 1,
         },

@@ -97,13 +97,22 @@ impl Asked {
         }
     }
 
-    /// The largest answer to this query. A reservation admits its row's
-    /// largest ending, so the claim checks this tighter cap too.
+    /// The largest answer to this query, checked at header admission and claim.
     fn cap(&self) -> ResponseCap {
         match self {
             Self::Peers { limit } => peers_cap(*limit),
             Self::Services(query) => services_cap(query.wanted_services.len()),
         }
+    }
+
+    /// Refuses a payload larger than the answer this query requested.
+    fn check_len(&self, payload_len: usize) -> Result<(), ClaimRefused> {
+        let bytes = self.cap().bytes;
+        // Widening usize to u64 is lossless on supported targets.
+        if payload_len as u64 > bytes {
+            return Err(ClaimRefused::OverBytes { bytes });
+        }
+        Ok(())
     }
 
     /// Checks a decoded answer against what the query asked. The decoder
@@ -255,12 +264,11 @@ impl QueryState {
         payload_len: usize,
     ) -> Option<Result<AdmittedAnswer, ClaimRefused>> {
         let LiveQuery { asked, .. } = self.live.remove(&kind)?;
-        let cap = asked.cap().bytes;
-        // Widening usize to u64 is lossless on supported targets.
-        if payload_len as u64 > cap {
-            return Some(Err(ClaimRefused::OverBytes { bytes: cap }));
-        }
-        Some(Ok(AdmittedAnswer { asked }))
+        Some(
+            asked
+                .check_len(payload_len)
+                .map(|()| AdmittedAnswer { asked }),
+        )
     }
 
     /// Checks the state's invariant: each live query sits under its own
@@ -687,8 +695,18 @@ struct QueriesPrecheck(Arc<Mutex<LiveQueries>>);
 
 impl ResponsePrecheck for QueriesPrecheck {
     fn check(&self, message_type: u16, payload_len: usize) -> Result<(), FrameRejection> {
-        lock(&self.0)
-            .reservations
+        let mut live = lock(&self.0);
+        // The shared ledger leaves room for the row's largest ending. Each
+        // discovery answer ends its query and must also fit that query's limit.
+        if let Some(query) =
+            QueryKind::answered_by(message_type).and_then(|kind| live.state.live.get(&kind))
+        {
+            query
+                .asked
+                .check_len(payload_len)
+                .map_err(ClaimRefused::frame_rejection)?;
+        }
+        live.reservations
             .admit(message_type, payload_len)
             .map_err(ClaimRefused::frame_rejection)
     }

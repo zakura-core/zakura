@@ -128,6 +128,21 @@ fn longest_ipv6(index: u8) -> SocketAddr {
 
 /// The `index`th test node's record body with the longest key list and the
 /// most and longest addresses and services.
+/// Two TLVs this release does not know, types 0x7002 and 0x7003, whose
+/// values are as long as an SLH-DSA-128s key and signature. They fill the
+/// room the body cap keeps for a second record signature.
+fn key_and_signature_sized_extensions() -> Vec<u8> {
+    let mut tlvs = 0x7002u16.to_le_bytes().to_vec();
+    tlvs.extend_from_slice(&32u16.to_le_bytes());
+    tlvs.extend_from_slice(&[0xbc; 32]);
+    tlvs.extend_from_slice(&0x7003u16.to_le_bytes());
+    tlvs.extend_from_slice(&7_856u16.to_le_bytes());
+    tlvs.extend_from_slice(&[0xcd; 7_856]);
+    tlvs
+}
+
+/// The longest record body: the longest key list, the most and largest
+/// addresses and services, and a full extension area.
 fn longest_body(index: usize) -> ZakuraNodeRecordBody {
     ZakuraNodeRecordBody {
         direct_addrs: (0..MAX_DIRECT_ADDRS_PER_RECORD)
@@ -138,6 +153,7 @@ fn longest_body(index: usize) -> ZakuraNodeRecordBody {
         zakura_protocol_max: u16::MAX,
         sequence: u64::MAX,
         expires_at_unix_secs: u64::MAX,
+        extensions: key_and_signature_sized_extensions(),
         ..shortest_body(longest_keys(index))
     }
 }
@@ -1087,17 +1103,27 @@ fn fixture_record(index: usize) -> Vec<u8> {
     body.extend_from_slice(&[7; 32]);
     body.extend_from_slice(&u64::MAX.to_le_bytes());
     body.extend_from_slice(&u64::MAX.to_le_bytes());
+    // The longest fields, then the extension area: two unknown TLVs as long
+    // as an SLH-DSA-128s key and signature, in the room kept for a second
+    // signature.
     assert_eq!(body.len(), 685);
+    body.extend_from_slice(&[0x02, 0x70]);
+    body.extend_from_slice(&32u16.to_le_bytes());
+    body.extend_from_slice(&[0xbc; 32]);
+    body.extend_from_slice(&[0x03, 0x70]);
+    body.extend_from_slice(&7_856u16.to_le_bytes());
+    body.extend_from_slice(&[0xcd; 7_856]);
+    assert_eq!(body.len(), 8_581);
 
-    let mut out = 685u32.to_le_bytes().to_vec();
+    let mut out = 8_581u32.to_le_bytes().to_vec();
     out.extend_from_slice(&body);
     out.extend_from_slice(&[0xab; 64]);
     out
 }
 
 #[test]
-fn hello_fixture_is_753_bytes() {
-    check_fixture(MSG_DISCOVERY_HELLO, fixture_record(0), 753);
+fn hello_fixture_is_8649_bytes() {
+    check_fixture(MSG_DISCOVERY_HELLO, fixture_record(0), 8_649);
 }
 
 #[test]
@@ -1125,12 +1151,12 @@ fn get_peers_fixture_is_8470_bytes() {
 }
 
 #[test]
-fn peers_fixture_is_24098_bytes() {
+fn peers_fixture_is_276770_bytes() {
     let mut bytes = 32u16.to_le_bytes().to_vec();
     for index in 0..32 {
         bytes.extend_from_slice(&fixture_record(index));
     }
-    check_fixture(MSG_DISCOVERY_PEERS, bytes, 24_098);
+    check_fixture(MSG_DISCOVERY_PEERS, bytes, 276_770);
 }
 
 #[test]

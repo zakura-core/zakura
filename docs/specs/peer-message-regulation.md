@@ -276,14 +276,71 @@ MAX_EXCLUDED_NODE_IDS        = 256
 MAX_SERVICE_SUMMARIES        = 8
 MAX_SERVICE_SUMMARY_BYTES    = 256
 MAX_NODE_KEYS                = 4
-NODE_RECORD_MAX              = 753 bytes
+NODE_RECORD_FIELDS_MAX       = 685 bytes
+RECORD_SIGNATURE_ROOM        = 7,896 bytes
+NODE_RECORD_BODY_MAX         = 8,581 bytes
+NODE_RECORD_MAX              = 8,649 bytes
 SERVICE_ENVELOPE_MAX         = 294 bytes
 ```
+
+A record body is its fields and then an extension area that this release keeps byte for byte and
+does not parse. `NODE_RECORD_FIELDS_MAX` is the longest key list with the most and largest
+addresses and services. `NODE_RECORD_BODY_MAX` adds `RECORD_SIGNATURE_ROOM` to it, and
+`NODE_RECORD_MAX` adds the 4-byte body length and the 64-byte Ed25519 signature.
+
+`RECORD_SIGNATURE_ROOM` is kept free for a second record signature. It is two extensions, each a
+`u16` type, a `u16` length and a value: a public key and its signature. This release signs a
+record with Ed25519 alone and neither reads nor writes a second signature. The room is reserved
+now because it can't be added later:
+
+- A receiver MUST refuse a record body above `NODE_RECORD_BODY_MAX`. A release that needed a larger
+  body for a post-quantum signature would have every node of this release drop its records.
+- With the room in place, a later release adds the key and the signature as extensions. A node of
+  this release verifies the Ed25519 signature, which covers the extension area, and relays the
+  record unchanged.
+
+The room holds the key as well as the signature. A record's key list carries every key but the
+Ed25519 one as a 32-byte fingerprint, and a reader verifies a relayed record without asking its
+author for anything, so a signature without its full key could not be checked.
+
+The size is that of an SLH-DSA-128s key and signature (FIPS 205): 32 and 7,856 bytes, 7,896 with
+the two headers.
+
+| Scheme | Key | Signature | With headers | Fits |
+| --- | --- | --- | --- | --- |
+| ML-DSA-65 (FIPS 204), the handshake's level | 1,952 | 3,309 | 5,269 | yes |
+| ML-DSA-87 | 2,592 | 4,627 | 7,227 | yes |
+| SLH-DSA-128s | 32 | 7,856 | 7,896 | yes, sets the size |
+| SLH-DSA-192s, the next smallest SLH-DSA signature | 48 | 16,224 | 16,280 | no |
+
+- Every ML-DSA level fits, so a later release can sign records at the handshake's level or raise
+  it without changing this limit again.
+- SLH-DSA-128s fits. It rests on hash functions alone, and the likeliest reason to replace a record
+  signature is a break of the lattice schemes, which room for ML-DSA alone would not cover. It
+  costs 669 bytes more than ML-DSA-87.
+- The larger SLH-DSA parameter sets do not fit. Room for the next one would double the size.
+
+Any node can fill the extension area of its own records, so every bound that scales with a record
+uses `NODE_RECORD_MAX` from this release on, whether or not a signature is present.
+
+What a node accepts and what it sends differ for `Peers`. A node MUST accept a `Peers` up to the
+row's cap, 276,770 bytes. It MUST NOT send one above `SERVED_PEERS_MAX`:
+
+```text
+SERVED_PEERS_MAX             = 24,098 bytes
+```
+
+That is a full answer of 32 records with the largest fields and no extension, the largest `Peers`
+before the record body cap grew. When the sampled records exceed it, the answer carries the first
+of them that fit, which is fewer than the request's limit and always allowed. The exchange
+deadlines of a discovery-only connection assume an answer of about this size, so a node whose book
+holds records with full extension areas still answers in time. A later release that signs records
+can send larger answers to the peers it knows will wait for them.
 
 #### `Hello` — Announcement, discriminator 1
 
 - **Frame**
-  - payload cap = 753 bytes
+  - payload cap = 8,649 bytes
 - **Decode** — [`validate_record_body_bounds`][record-bounds], [`validate_service_id`][service-id]
   - addresses <= 8
   - services <= 8
@@ -291,7 +348,7 @@ SERVICE_ENVELOPE_MAX         = 294 bytes
   - `protocol_min <= protocol_max`
   - key list = 1..=4 entries of a `u16` tag and 32 bytes, tags nonzero and strictly increasing
   - an Ed25519 entry (tag 1) holds a valid key; an entry with any other tag is kept as it is
-  - record body <= 685 bytes
+  - record body <= 8,581 bytes, extension area included
   - exact consumption
 - **Verify** — [`ZakuraNodeRecord::verify`][record-verify], with time-varying import policy split
   from [`validate_record_body_for_import`][record-import]
@@ -347,8 +404,8 @@ MUST send exactly one `Peers` response for every admitted request.
 #### `Peers` — Response, discriminator 3
 
 - **Frame**
-  - absolute payload cap = 24,098 bytes
-  - reservation payload cap = 2 + reserved_limit * 753 bytes
+  - absolute payload cap = 276,770 bytes
+  - reservation payload cap = 2 + reserved_limit * 8,649 bytes
 - **Decode** — [`validate_record_body_bounds`][record-bounds]
   - count = 0..=reserved_limit
   - records <= 32

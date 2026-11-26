@@ -24,6 +24,10 @@
 //!   opens the stream until its decoder finishes, so a response's frames and
 //!   reassembly copies never wait on the gates of the connection's stream kinds.
 //!   The grant can outlive its connection, but not its requester's client slot.
+//! - Compatibility frames (legacy gossip and legacy request output, and
+//!   outbound compatibility exchanges) also take each grant from a node-wide
+//!   allowance ([`COMPAT_NODE_BYTES`]), so their total doesn't grow with the
+//!   connection count. A full allowance delays or drops compatibility traffic.
 //!
 //! One connection's QUIC receive window is the handshake share plus the
 //! receive share of every kind it negotiated. Unread QUIC bytes and held raw
@@ -56,7 +60,7 @@ use zakura_rt::{
 
 use crate::zakura::{
     regulation::{OutputByteBudget, OutputGrant, WeakOutputByteBudget},
-    ReactorBudget, ReceiveBudget, Stream, FRAME_HEADER_BYTES,
+    ReactorBudget, ReceiveBudget, Stream, FRAME_HEADER_BYTES, ZAKURA_CAP_LEGACY_GOSSIP,
 };
 use zakura_chain::serialization::MAX_PROTOCOL_MESSAGE_LEN;
 
@@ -96,6 +100,24 @@ pub const COMPAT_EXCHANGE_BUDGET: ReactorBudget = ReactorBudget {
     receive: ReceiveBudget::unsolicited_only(COMPAT_EXCHANGE_MAX_BYTES),
     output: 0,
 };
+
+/// The queued legacy gossip and legacy request output that the whole node may
+/// hold, over every connection: about three maximal responses.
+pub(crate) const COMPAT_NODE_OUTPUT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The outbound compatibility exchange bytes that the whole node may hold, over
+/// every connection: three exchanges at [`COMPAT_EXCHANGE_MAX_BYTES`], or ten
+/// single-object fetches.
+///
+/// It is separate from [`COMPAT_NODE_OUTPUT_BYTES`] so this node's exchanges,
+/// which wait on peers' answers, never hold the output its own answers need.
+/// Two nodes fetching from each other therefore can't stall each other until a
+/// timeout.
+pub(crate) const COMPAT_NODE_EXCHANGE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The compatibility frame bytes the whole node may hold, which the memory
+/// plan counts as one fixed term.
+pub(crate) const COMPAT_NODE_BYTES: u64 = COMPAT_NODE_OUTPUT_BYTES + COMPAT_NODE_EXCHANGE_BYTES;
 
 #[cfg(test)]
 mod tests;
@@ -182,10 +204,13 @@ pub(crate) struct TransportLimits {
     pub(crate) control_receive_bytes: u64,
     /// The shares of one connection that negotiated every registered kind.
     pub(crate) connection_shares: ReactorBudget,
-    /// The outbound compatibility exchange bytes the node may hold:
+    /// The part of `connection_shares.output` that the compatibility kinds
+    /// hold, which [`COMPAT_NODE_OUTPUT_BYTES`] also bounds across the node.
+    pub(crate) compat_output: u64,
+    /// The outbound compatibility exchange bytes the node's client could hold:
     /// [`COMPAT_EXCHANGE_BUDGET`]'s receive share per concurrent request of its
     /// compatibility client on a node that registers the legacy request kind, and
-    /// zero otherwise.
+    /// zero otherwise. [`COMPAT_NODE_EXCHANGE_BYTES`] also bounds it.
     pub(crate) compat_exchange_bytes: u64,
     /// The QUIC send window of one admitted connection.
     pub(crate) send_window: u64,
@@ -225,9 +250,10 @@ impl ResourceEnvelope {
     /// Bounds for a node with these transport limits.
     ///
     /// A connection's budgets are the sums of its kinds' shares, and the node's
-    /// are the connections' sums, except the compatibility exchange bytes, which
-    /// the limits give for the whole node. Admitted connections hold the full
-    /// window, and pending handshakes hold the handshake window.
+    /// are the connections' sums, except compatibility frames: the node-wide
+    /// allowances cap their output, and the limits give the exchange bytes for
+    /// the whole node. Admitted connections hold the full window, and pending
+    /// handshakes hold the handshake window.
     pub(crate) fn new(limits: TransportLimits) -> Self {
         let connections = limits.max_connections.max(1);
         // Widening usize to u64 or u128 is lossless on supported targets.
@@ -240,11 +266,13 @@ impl ResourceEnvelope {
                 + u128::from(limits.send_window);
         let handshake_window =
             u128::from(limits.control_receive_bytes) + u128::from(limits.handshake_send_window);
+        let compat_output = node_bytes(limits.compat_output).min(COMPAT_NODE_OUTPUT_BYTES);
         Self {
             connection_raw_bytes: receive_total,
             connection_output_bytes: shares.output,
-            node_output_bytes: node_bytes(shares.output),
-            compat_response_bytes: limits.compat_exchange_bytes,
+            node_output_bytes: node_bytes(shares.output.saturating_sub(limits.compat_output))
+                .saturating_add(compat_output),
+            compat_response_bytes: limits.compat_exchange_bytes.min(COMPAT_NODE_EXCHANGE_BYTES),
             request_executions: connections.saturating_mul(usize::from(limits.max_open_streams)),
             transport_credit_bytes: connections as u128 * admitted_window
                 + limits.max_pending_handshakes as u128 * handshake_window,
@@ -345,6 +373,10 @@ pub(crate) struct NodeResources {
     owners: OwnerLedger,
     /// Every connection's gates since the last usage report, for the report.
     live: Arc<Mutex<Vec<LiveConnection>>>,
+    /// The node-wide allowance of the compatibility kinds' output gates.
+    compat_output: OutputByteBudget,
+    /// The node-wide allowance of the compatibility exchange gates.
+    compat_exchanges: OutputByteBudget,
 }
 
 impl NodeResources {
@@ -370,6 +402,8 @@ impl NodeResources {
             kinds: kinds.into(),
             owners: OwnerLedger::default(),
             live: Arc::default(),
+            compat_output: byte_budget(COMPAT_NODE_OUTPUT_BYTES),
+            compat_exchanges: byte_budget(COMPAT_NODE_EXCHANGE_BYTES),
         }
     }
 
@@ -446,15 +480,23 @@ impl NodeResources {
     }
 
     /// Fresh gates for a connection that negotiated `capabilities`, one pair
-    /// per kind it may carry.
+    /// per kind it may carry. The compatibility kinds' output gates and the
+    /// exchange gate also take from the node's compatibility allowances.
     pub(crate) fn connection(&self, capabilities: u64) -> ConnectionResources {
         let gates: Vec<_> = self
             .kinds
             .iter()
             .filter(|(_, kind_capabilities, _)| capabilities & kind_capabilities != 0)
-            .map(|(kind, ..)| (*kind, KindGates::new(self.shares.share(*kind))))
+            .map(|(kind, kind_capabilities, _)| {
+                let mut gates = KindGates::new(self.shares.share(*kind));
+                if kind_capabilities & ZAKURA_CAP_LEGACY_GOSSIP != 0 {
+                    gates.output.node = Some(self.compat_output.clone());
+                }
+                (*kind, gates)
+            })
             .collect();
-        let compat_exchanges = FrameGate::new(COMPAT_EXCHANGE_BUDGET.receive_total());
+        let mut compat_exchanges = FrameGate::new(COMPAT_EXCHANGE_BUDGET.receive_total());
+        compat_exchanges.node = Some(self.compat_exchanges.clone());
         self.live
             .lock()
             .expect("no usage report panics")
@@ -594,7 +636,8 @@ impl ConnectionResources {
     }
 
     /// Fund one outbound compatibility exchange of at most `bytes` from this
-    /// connection's exchange gate. Cancelling the wait takes nothing.
+    /// connection's exchange gate and the node's exchange allowance. Cancelling
+    /// the wait takes nothing.
     ///
     /// The exchange counts as an installed stream until its grant drops. A response
     /// cannot wait for bytes that it already holds, because this single grant covers
@@ -667,7 +710,7 @@ impl ConnectionResources {
 impl FrameGate {
     /// A gate over `budget`, for tests that read the budget.
     pub(crate) fn over(budget: OutputByteBudget) -> Self {
-        Self { budget }
+        Self { budget, node: None }
     }
 }
 
@@ -686,6 +729,8 @@ impl StreamResources {
 #[derive(Clone, Debug)]
 pub(crate) struct FrameGate {
     budget: OutputByteBudget,
+    /// A node-wide allowance that each grant also takes its charge from.
+    node: Option<OutputByteBudget>,
 }
 
 impl FrameGate {
@@ -693,34 +738,53 @@ impl FrameGate {
     fn new(bytes: u64) -> Self {
         Self {
             budget: byte_budget(bytes),
+            node: None,
         }
     }
 
     /// The bytes this gate can grant at once.
     pub(crate) fn capacity(&self) -> u64 {
-        self.budget.capacity()
+        self.node
+            .as_ref()
+            .map_or(u64::MAX, OutputByteBudget::capacity)
+            .min(self.budget.capacity())
+    }
+
+    /// The charge of a frame of `bytes`: the frame, or the whole gate if the
+    /// frame is larger.
+    fn charge(&self, bytes: u64) -> u32 {
+        self.budget.clamp(bytes.min(self.capacity()))
     }
 
     /// Admit a frame of `bytes` without waiting, if the gate has room.
     pub(crate) fn try_admit(&self, bytes: u64) -> Option<FrameGrant> {
-        let charge = self.budget.clamp(bytes);
-        self.budget
-            .try_grant(charge)
-            .map(|grant| FrameGrant::new(grant, charge, Duration::ZERO))
+        let charge = self.charge(bytes);
+        let granted = self.budget.try_grant(charge)?;
+        let node = match &self.node {
+            Some(node) => Some(node.try_grant(charge)?),
+            None => None,
+        };
+        Some(FrameGrant::new(granted, node, charge, Duration::ZERO))
     }
 
     /// Wait for room for a frame of `bytes`. Cancelling the wait takes nothing.
     ///
     /// A frame above the gate takes the whole gate, so it waits for every
-    /// other frame of its kind instead of waiting forever.
+    /// other frame of its kind instead of waiting forever. A gate with a node
+    /// allowance takes its own share first, so one connection waits on the
+    /// node with at most one grant.
     pub(crate) async fn admit(&self, bytes: u64) -> FrameGrant {
         if let Some(grant) = self.try_admit(bytes) {
             return grant;
         }
         let started = Instant::now();
-        let charge = self.budget.clamp(bytes);
-        let grant = self.budget.grant(charge).await;
-        FrameGrant::new(grant, charge, started.elapsed())
+        let charge = self.charge(bytes);
+        let granted = self.budget.grant(charge).await;
+        let node = match &self.node {
+            Some(node) => Some(node.grant(charge).await),
+            None => None,
+        };
+        FrameGrant::new(granted, node, charge, started.elapsed())
     }
 }
 
@@ -738,15 +802,18 @@ pub(crate) struct FrameGrant {
     /// Field order is drop order: the credit returns first.
     credit: Option<CreditHold>,
     granted: OutputGrant,
+    /// The same charge, from the gate's node-wide allowance.
+    node: Option<OutputGrant>,
     charge: u32,
     waited: Duration,
 }
 
 impl FrameGrant {
-    fn new(charge: OutputGrant, bytes: u32, waited: Duration) -> Self {
+    fn new(granted: OutputGrant, node: Option<OutputGrant>, bytes: u32, waited: Duration) -> Self {
         Self {
             credit: None,
-            granted: charge,
+            granted,
+            node,
             charge: bytes,
             waited,
         }
@@ -761,6 +828,9 @@ impl FrameGrant {
     /// A smaller grant stays as it is.
     pub(crate) fn shrink_to(&mut self, bytes: u64) {
         self.granted.shrink_to(bytes);
+        if let Some(node) = &mut self.node {
+            node.shrink_to(bytes);
+        }
         self.charge = self.charge.min(u32::try_from(bytes).unwrap_or(u32::MAX));
     }
 

@@ -192,6 +192,7 @@ pub(crate) async fn native_discovery_dial(
     endpoint: &ZakuraEndpoint,
     node_addr: NodeAddr,
     limits: &ZakuraLocalLimits,
+    ordinary_cap: usize,
     report: DialReport,
 ) -> Result<(), ZakuraHandlerError> {
     crate::zakura::handler::serve_reported_native_dial_connection(
@@ -199,7 +200,7 @@ pub(crate) async fn native_discovery_dial(
         node_addr,
         limits,
         Some(report),
-        crate::zakura::handler::NativeDialKind::Discovery,
+        crate::zakura::handler::NativeDialKind::Discovery { ordinary_cap },
     )
     .await
 }
@@ -319,7 +320,7 @@ mod tests {
             };
             let result = tokio::time::timeout(
                 Duration::from_millis(200),
-                native_discovery_dial(&endpoint, target, &limits, report),
+                native_discovery_dial(&endpoint, target, &limits, limits.max_connections, report),
             )
             .await?;
             assert!(matches!(result, Err(ref error) if error.is_pre_dial_limit()));

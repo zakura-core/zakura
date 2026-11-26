@@ -1393,7 +1393,7 @@ impl ZakuraEndpoint {
     /// slot, otherwise the transport's free discovery slots. A dial claims
     /// a slot for every address it tries, or fails with none claimed.
     pub(crate) fn discovery_admission_capacity(&self) -> usize {
-        if self.discovery_dial_permits() == 0 {
+        if self.handler.free_connection_slots() == 0 {
             return 0;
         }
         self.quic.discovery_capacity()
@@ -1402,6 +1402,16 @@ impl ZakuraEndpoint {
     /// Select preferred gateways within this endpoint's funded extra capacity.
     pub fn publish_gateway_ranking(&self, ranking: impl IntoIterator<Item = super::RankedGateway>) {
         self.handler.publish_gateway_ranking(ranking);
+    }
+
+    /// Applies discovery's ordinary slot budget when yielding a moved gateway's place.
+    pub(super) fn publish_discovery_gateway_ranking(
+        &self,
+        ranking: impl IntoIterator<Item = super::RankedGateway>,
+        ordinary_cap: usize,
+    ) {
+        self.handler
+            .publish_discovery_gateway_ranking(ranking, ordinary_cap);
     }
 
     /// The places the connection-slot checks hold for preferred gateways
@@ -1441,8 +1451,11 @@ impl ZakuraEndpoint {
     /// connection slots, which leave the places held for preferred gateways.
     /// Each dial holds one slot from its start, or fails as a local limit
     /// without one.
-    pub(crate) fn discovery_dial_permits(&self) -> usize {
-        self.handler.free_connection_slots()
+    pub(crate) fn discovery_dial_permits(&self, ordinary_cap: usize) -> usize {
+        self.supervisor
+            .ip_slots
+            .counts()
+            .free_ordinary_connections(ordinary_cap.min(self.handler.limits.max_connections))
     }
 
     /// How many dials to preferred gateways can start now: every free
@@ -1747,8 +1760,8 @@ pub(crate) struct ConnectionAdmissionGuard {
     slots: IpSlots,
     node: NodeId,
     inbound: bool,
-    /// The connection limit the slot was claimed under.
-    max_connections: usize,
+    /// Ordinary slot limit for this caller, also enforced if TLS changes the slot class.
+    ordinary_cap: usize,
     #[cfg(any(test, zakura_sim))]
     observation: Option<HandshakeObservation>,
 }
@@ -1765,7 +1778,7 @@ impl ConnectionAdmissionGuard {
         assert!(!self.inbound && !self.authenticated_dial);
         self.slots
             .counts()
-            .outbound_connected(self.node, connected, self.max_connections)?;
+            .outbound_connected(self.node, connected, self.ordinary_cap)?;
         self.node = connected;
         self.authenticated_dial = true;
         Ok(())
@@ -3884,11 +3897,19 @@ impl ZakuraProtocolHandler {
     }
 
     fn publish_gateway_ranking(&self, ranking: impl IntoIterator<Item = super::RankedGateway>) {
+        self.publish_discovery_gateway_ranking(ranking, self.limits.max_connections);
+    }
+
+    fn publish_discovery_gateway_ranking(
+        &self,
+        ranking: impl IntoIterator<Item = super::RankedGateway>,
+        ordinary_cap: usize,
+    ) {
         let ranking = ranking.into_iter().collect();
         let moved = self.supervisor.moved_tx.borrow();
         let mut counts = self.supervisor.ip_slots.counts();
         counts.publish_gateway_ranking(&ranking, self.limits.max_preferred_connections);
-        counts.defer_gateway_rollbacks(&moved, self.limits.max_connections, Instant::now());
+        counts.defer_gateway_rollbacks(&moved, ordinary_cap, Instant::now());
         let hold = counts.preferred_gateways().hold();
         let split = counts.slot_split();
         drop(counts);
@@ -3904,10 +3925,11 @@ impl ZakuraProtocolHandler {
     fn claim_dial_connection(
         &self,
         dialed: NodeId,
+        ordinary_cap: usize,
     ) -> Result<ConnectionAdmissionGuard, SlotRefusal> {
         let moves = &self.supervisor.moved_tx;
         let expected = moves.borrow().current(dialed);
-        let claim = self.claim_connection(expected, false);
+        let claim = self.claim_connection_with_ordinary_cap(expected, false, ordinary_cap);
         if expected == dialed || !matches!(claim, Err(SlotRefusal::Hold)) {
             return claim;
         }
@@ -3920,7 +3942,7 @@ impl ZakuraProtocolHandler {
         if preferred
             && moves.send_if_modified(|moves| moves.take_recheck(dialed, expected, Instant::now()))
         {
-            return self.claim_connection(dialed, false);
+            return self.claim_connection_with_ordinary_cap(dialed, false, ordinary_cap);
         }
         claim
     }
@@ -3932,10 +3954,25 @@ impl ZakuraProtocolHandler {
         node: NodeId,
         inbound: bool,
     ) -> Result<ConnectionAdmissionGuard, SlotRefusal> {
+        self.claim_connection_with_ordinary_cap(node, inbound, self.limits.max_connections)
+    }
+
+    fn claim_connection_with_ordinary_cap(
+        &self,
+        node: NodeId,
+        inbound: bool,
+        ordinary_cap: usize,
+    ) -> Result<ConnectionAdmissionGuard, SlotRefusal> {
         let mut counts = self.supervisor.ip_slots.counts();
         let preferred_dial = !inbound
             && counts.preferred_gateways().contains(&node)
             && counts.node_connections(&node).total() == 0;
+        if !preferred_dial
+            && ordinary_cap < self.limits.max_connections
+            && counts.free_ordinary_connections(ordinary_cap) == 0
+        {
+            return Err(SlotRefusal::Hold);
+        }
         let claim = counts.claim_connection(node, inbound, self.limits.max_connections);
         drop(counts);
         if inbound && matches!(claim, Ok(SlotClass::Preferred)) {
@@ -3952,7 +3989,7 @@ impl ZakuraProtocolHandler {
             slots: self.supervisor.ip_slots.clone(),
             node,
             inbound,
-            max_connections: self.limits.max_connections,
+            ordinary_cap,
         })
     }
 
@@ -6439,7 +6476,7 @@ pub(crate) enum NativeDialKind {
     /// Bootstrap and maintained dials may use every live slot.
     Maintained,
     /// Discovery leaves room for an inbound connection and maintained dials.
-    Discovery,
+    Discovery { ordinary_cap: usize },
 }
 
 /// Dials and serves a maintained native connection using the full transport cap.
@@ -6471,9 +6508,15 @@ pub(crate) async fn serve_reported_native_dial_connection(
     kind: NativeDialKind,
 ) -> Result<(), ZakuraHandlerError> {
     let dialed = node_addr.id;
+    let ordinary_cap = match kind {
+        NativeDialKind::Maintained => endpoint.handler.limits.max_connections,
+        NativeDialKind::Discovery { ordinary_cap } => {
+            ordinary_cap.min(endpoint.handler.limits.max_connections)
+        }
+    };
     let mut admission = endpoint
         .handler
-        .claim_dial_connection(dialed)
+        .claim_dial_connection(dialed, ordinary_cap)
         .map_err(|refusal| {
             if refusal == SlotRefusal::Hold {
                 metrics::counter!("zakura.p2p.conn.dial.refused.hold").increment(1);
@@ -6490,7 +6533,9 @@ pub(crate) async fn serve_reported_native_dial_connection(
     let dial = async {
         match kind {
             NativeDialKind::Maintained => endpoint.quic.connect(node_addr, &offered).await,
-            NativeDialKind::Discovery => endpoint.quic.connect_discovery(node_addr, &offered).await,
+            NativeDialKind::Discovery { .. } => {
+                endpoint.quic.connect_discovery(node_addr, &offered).await
+            }
         }
     };
     let connection = match timeout(dial_timeout, dial)
@@ -10880,7 +10925,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
-        assert!(endpoint.discovery_dial_permits() > 0);
+        assert!(endpoint.handler.free_connection_slots() > 0);
         assert_eq!(endpoint.discovery_admission_capacity(), 0);
         for dial in dials {
             dial.abort();

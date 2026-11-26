@@ -89,7 +89,9 @@ async fn a_dial_the_listener_cannot_prove_learns_no_move() {
             claimed,
             dialer.limits(),
             None,
-            NativeDialKind::Discovery,
+            NativeDialKind::Discovery {
+                ordinary_cap: dialer.discovery().ordinary_connection_cap,
+            },
         ),
     )
     .await
@@ -152,7 +154,9 @@ async fn a_dial_to_an_earlier_id_leaves_the_registered_connection() {
                 authenticated,
                 registration,
             }),
-            NativeDialKind::Discovery,
+            NativeDialKind::Discovery {
+                ordinary_cap: dialer.discovery().ordinary_connection_cap,
+            },
         ),
     )
     .await
@@ -191,12 +195,12 @@ async fn a_dial_to_an_earlier_id_leaves_the_registered_connection() {
 
 /// Blocks still name a gateway by its earlier ID, so the dial to it claims a
 /// held place. The node answers under the ID it has now, which no gateway
-/// names, and the ordinary slots are full. The dial ends as a local limit
+/// names, and ordinary discovery is at its soft cap. The dial ends as a local limit
 /// before the control handshake: neither end registers a peer and no slot
 /// stays charged, but the move is learned. The next dial is charged to the
 /// ID the node has now, and is refused before it reaches the network.
 #[tokio::test]
-async fn a_dial_to_a_moved_gateway_waits_for_an_ordinary_slot() {
+async fn moved_gateway_discovery_dials_leave_headroom_for_a_bootstrap_peer() {
     let listener = ZakuraTestNode::builder(9310)
         .extended_credential()
         .spawn()
@@ -217,24 +221,18 @@ async fn a_dial_to_a_moved_gateway_waits_for_an_ordinary_slot() {
         )]
     };
     endpoint.handler.publish_gateway_ranking(ranking());
+    let ordinary_cap = dialer.discovery().ordinary_connection_cap;
+    assert!(ordinary_cap < dialer.limits().max_connections);
     let mut ordinary = Vec::new();
-    for index in 0u32.. {
+    for index in 0..ordinary_cap {
         let mut id = [0xA5; 32];
-        id[..4].copy_from_slice(&index.to_be_bytes());
-        match endpoint
-            .handler
-            .claim_connection(NodeId::from_bytes(&id), false)
-        {
-            Ok(slot) => ordinary.push(slot),
-            Err(refusal) => {
-                assert_eq!(
-                    refusal,
-                    SlotRefusal::Hold,
-                    "a place is held for the gateway"
-                );
-                break;
-            }
-        }
+        id[..size_of::<usize>()].copy_from_slice(&index.to_be_bytes());
+        ordinary.push(
+            endpoint
+                .handler
+                .claim_connection(NodeId::from_bytes(&id), false)
+                .expect("an ordinary slot fits under the discovery cap"),
+        );
     }
     let limits = dialer.limits().clone();
     let dial = |addr: NodeAddr| {
@@ -247,7 +245,7 @@ async fn a_dial_to_a_moved_gateway_waits_for_an_ordinary_slot() {
                     addr,
                     &limits,
                     None,
-                    NativeDialKind::Discovery,
+                    NativeDialKind::Discovery { ordinary_cap },
                 ),
             )
             .await
@@ -279,6 +277,25 @@ async fn a_dial_to_a_moved_gateway_waits_for_an_ordinary_slot() {
     endpoint.handler.publish_gateway_ranking(ranking());
     let refused = dial(nowhere).await;
     assert!(is_pre_dial_limit(&refused), "{refused:?}");
+
+    let bootstrap = ZakuraTestNode::builder(9312)
+        .spawn()
+        .await
+        .expect("bootstrap peer spawns");
+    let seed = bootstrap.node_addr().await;
+    let [bootstrap_task]: [_; 1] = discovery::spawn_native_bootstrap_dialer(
+        endpoint.clone(),
+        vec![format!("{}@{}", seed.id, seed.direct[0])],
+        limits.clone(),
+    )
+    .try_into()
+    .expect("one configured bootstrap peer starts one dial");
+    registers(&dialer, &[seed.id]).await;
+    assert_eq!(slots(&dialer, &seed.id), 1);
+    bootstrap_task.abort();
+    let _ = bootstrap_task.await;
+    bootstrap.shutdown().await;
+    registers(&dialer, &[]).await;
 
     ordinary.pop();
     endpoint.handler.publish_gateway_ranking(ranking());

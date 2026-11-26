@@ -400,7 +400,7 @@ async fn moved_gateway_yields_the_last_place_until_rollback_can_be_checked() {
     let (earlier, standby) = (gateways[0], gateways[1]);
     let current = node_id(0);
     let endpoint = node.endpoint();
-    let mut slots = endpoint.hold_connection_slots(MAX_CONNECTIONS, false);
+    let mut slots = endpoint.hold_connection_slots(io.discovery.ordinary_connection_cap, false);
     ranks.send_replace(ranking(&gateways));
     node.supervisor().learn_move(earlier, current);
     let now = Instant::now();

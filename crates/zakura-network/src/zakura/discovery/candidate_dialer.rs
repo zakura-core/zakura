@@ -325,7 +325,10 @@ impl CandidateDialerIO {
             now,
         )
         .await;
-        self.endpoint.publish_gateway_ranking(classified.ranking);
+        self.endpoint.publish_discovery_gateway_ranking(
+            classified.ranking,
+            self.discovery.ordinary_connection_cap,
+        );
         PreferredRound {
             set: self.endpoint.held_places().members,
             dialable: classified.dialable,
@@ -349,6 +352,7 @@ impl CandidateDialerIO {
                 self.endpoint.clone(),
                 node_addr,
                 self.limits.clone(),
+                self.discovery.ordinary_connection_cap,
                 attempt,
             ),
         ));
@@ -479,11 +483,13 @@ async fn admit_dial_round(
     let mut free_slots = endpoint
         .discovery_admission_capacity()
         .saturating_sub(preferred.address_attempts);
-    let mut free_permits = endpoint.discovery_dial_permits().min(
-        endpoint
-            .preferred_dial_permits()
-            .saturating_sub(preferred.dials),
-    );
+    let mut free_permits = endpoint
+        .discovery_dial_permits(discovery.ordinary_connection_cap)
+        .min(
+            endpoint
+                .preferred_dial_permits()
+                .saturating_sub(preferred.dials),
+        );
     if free_slots == 0 || free_permits == 0 {
         return Vec::new();
     }
@@ -577,6 +583,7 @@ async fn run_discovery_dial_once(
     endpoint: ZakuraEndpoint,
     node_addr: NodeAddr,
     limits: ZakuraLocalLimits,
+    ordinary_cap: usize,
     attempt: DialAttemptKey,
 ) -> DiscoveryDialOutcome {
     let finished = |result| DiscoveryDialOutcome {
@@ -601,7 +608,7 @@ async fn run_discovery_dial_once(
     };
     let dial = AbortOnDropHandle::new(spawn_erased_named("discovery_dial", {
         let endpoint = endpoint.clone();
-        async move { native_discovery_dial(&endpoint, node_addr, &limits, report).await }
+        async move { native_discovery_dial(&endpoint, node_addr, &limits, ordinary_cap, report).await }
     }));
     DialWatch {
         attempt,

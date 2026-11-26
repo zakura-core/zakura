@@ -882,7 +882,9 @@ is today's Zakura logic.
      counts the completed TLS attempt as a failure for its retry policy.
      Otherwise one gateway could answer each dial under a new ID and turn
      every held place into an ordinary slot of its own. A dial to an ID
-     known to have moved first claims under the last authenticated ID.
+     known to have moved first claims under the last authenticated ID. For
+     discovery, both this claim and a move that adds an ordinary slot MUST
+     respect the ordinary discovery ceiling that leaves room for bootstrap.
      If ordinary capacity is full, a preferred gateway may retry under its
      original ID once per 30 seconds to detect a rollback. The same limits
      apply after TLS on every retry. While a moved gateway waits for that

@@ -817,6 +817,7 @@ async fn preferred_dials_leave_the_maintained_dial_reserve() {
                 endpoint.clone(),
                 NodeAddr::with_addrs(target, [silent.local_addr().unwrap()]),
                 limits.clone(),
+                limits.max_connections,
                 attempt,
             ),
         );
@@ -876,6 +877,7 @@ async fn cancelled_worker_releases_its_real_quic_dial_capacity() {
                     endpoint.clone(),
                     NodeAddr::with_addrs(target, [silent.local_addr().unwrap()]),
                     limits.clone(),
+                    limits.max_connections,
                     attempt,
                 ),
             );
@@ -1751,9 +1753,12 @@ async fn a_round_admits_no_more_dials_than_free_admission_permits() {
         .await
         .expect("dialer spawns");
     let endpoint = node.endpoint();
-    let permits = endpoint.discovery_dial_permits();
+    let permits = endpoint.discovery_dial_permits(node.discovery().ordinary_connection_cap);
     let held = endpoint.hold_connection_slots(permits - 1, false);
-    assert_eq!(endpoint.discovery_dial_permits(), 1);
+    assert_eq!(
+        endpoint.discovery_dial_permits(node.discovery().ordinary_connection_cap),
+        1
+    );
     assert!(
         endpoint.discovery_admission_capacity() >= 3,
         "the transport has a slot for each candidate"

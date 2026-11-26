@@ -18,7 +18,7 @@ use std::{
 
 use support::script::{run_under, OBSERVED};
 use zakura_network::zakura::{
-    wire_codec::WireMessage, CloseOutcome, DiscoveryMessage, MAX_NODE_RECORD_BYTES,
+    wire_codec::WireMessage, CloseOutcome, CloseRow, DiscoveryMessage, MAX_NODE_RECORD_BYTES,
     MSG_DISCOVERY_PEERS,
 };
 use zakura_sim::NaReason;
@@ -233,9 +233,8 @@ fn apply_on_row(row: DiscoveryRow) {
 /// #2114's audit: the node checks a `Peers` against its own request's cap,
 /// `peers_cap(limit)`, which is under the row's maximum when its limit is
 /// under 32. In the over-owed witness, a node asking for [`LIMIT`] record
-/// gets a `Peers` one byte over that cap and under the row's maximum, two
-/// validly signed records that decode. The
-/// peer's models label it `over-owed`, not `Conformant` and not
+/// gets a `Peers` one byte over that cap and under the row's maximum. The
+/// extra record carries only an Ed25519 signature. The peer's models label it `over-owed`, not `Conformant` and not
 /// `long-payload`. The node reads it, its claim of the answer refuses it,
 /// and the node closes the connection with a fault cause.
 ///
@@ -281,11 +280,18 @@ fn over_owed_at_its_cap(scenario: &WireScenario, report: &RunReport) {
     });
     // A u32 fits usize on every supported target.
     assert_eq!(read.map(|len| len as usize), Some(cap + 1));
-    let fault = entries.iter().any(|entry| {
-        matches!(&entry.obs, Observation::ConnectionClosed { connection: on, cause }
-            if *on == connection && cause.is_fault())
+    let close = entries.iter().find_map(|entry| match &entry.obs {
+        Observation::ConnectionClosed {
+            connection: on,
+            cause,
+        } if *on == connection => Some(cause),
+        _ => None,
     });
-    assert!(fault, "the node admitted a Peers over its cap");
+    assert_eq!(
+        close.and_then(|cause| cause.row()),
+        Some(CloseRow::REG_CLOSE_7),
+        "the reply must close the connection for exceeding its reservation: {close:?}"
+    );
 }
 
 /// The node's fault closes in `report`, by cause.

@@ -14,6 +14,9 @@
 
 use std::ops::Deref;
 
+use zakura_chain::block::MAX_BLOCK_BYTES;
+use zakura_node_services::block_memory::MAX_DECODED_BLOCK_BYTES;
+
 use super::{
     blocks::BlockTable,
     config::{ZakuraBpv1Config, BPV1_SESSION_HELD_OUTPUT_BYTES},
@@ -23,7 +26,7 @@ use super::{
     wire::{BPV1_CONTROL_BUDGET, BPV1_DATA_BUDGET},
 };
 use crate::zakura::{
-    memory::{draft::ADMISSION_CHARGE_PER_MAX_BLOCK, Consumer, MemoryPool, PoolLease},
+    memory::{Consumer, MemoryPool, PoolLease},
     FRAME_HEADER_BYTES,
 };
 
@@ -31,10 +34,10 @@ use crate::zakura::{
 /// block hash, the index and the sibling count.
 const PART_PREFIX_BYTES: u64 = 32 + 4 + 1;
 
-/// Bytes one assembled block holds from assembly until its verdict:
-/// block-sync admission's per-block charge for the largest block,
-/// `wire + 4 × wire`.
-pub const ASSEMBLED_BLOCK_BYTES: u64 = ADMISSION_CHARGE_PER_MAX_BLOCK;
+/// Bytes one assembled block holds from assembly until its verdict: the
+/// largest block's raw bytes, which assembly parses and keeps until the
+/// verdict, plus its worst-case decoded block.
+pub const ASSEMBLED_BLOCK_BYTES: u64 = MAX_BLOCK_BYTES + MAX_DECODED_BLOCK_BYTES;
 
 /// The `Propagation` reserve's terms with BPv1 on.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -223,5 +226,22 @@ impl<M> Deref for Leased<M> {
 
     fn deref(&self) -> &M {
         &self.machine
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::zakura::bpv1::NODE_PROFILE;
+
+    /// The Mainnet reserve at the default config, which the specs quote. Each
+    /// of its eight owed verdicts holds a 2 MB raw block and its 24 MB
+    /// decoded worst case.
+    #[test]
+    fn the_mainnet_reserve_funds_each_assembled_block_at_its_parse_peak() {
+        let reserve = PropagationReserve::new(&ZakuraBpv1Config::default(), NODE_PROFILE);
+        assert_eq!(ASSEMBLED_BLOCK_BYTES, 26_000_000);
+        assert_eq!(reserve.assembled, 8 * ASSEMBLED_BLOCK_BYTES);
+        assert_eq!(reserve.total(), 290_793_984);
     }
 }

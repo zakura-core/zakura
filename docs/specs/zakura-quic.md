@@ -1228,14 +1228,15 @@ reads as unset, so those nodes also get the small handshake windows.
     proposer's prepared encodings plus as many encodes in flight, and
     assembled blocks until their verdict: one per concurrent block, plus one
     per block a next block displaces (`bpv1-83`), because a displaced block
-    stays in the verifier until its verdict. On Mainnet that is
-    162,793,984 B, not 32,000,000 B. BPv1 holds these bytes as
+    stays in the verifier until its verdict. Each assembled block counts its
+    raw bytes and its worst-case decoded block, which assembly holds together
+    while it parses. On Mainnet that is 290,793,984 B, not 32,000,000 B. BPv1 holds these bytes as
     `Propagation` leases, so they never wait behind bulk consumers. Each
     BPv1 session funds its base `b_bpv1` from `Sessions` when BPv1 admits the
     peer: its unsolicited receive credit, its output gates, its held frames
     and its early records. BPv1 adds 22.9 MiB to a full connection, so a
     16 GiB Mainnet host funds 28 full connections, not 46, and the smallest
-    Mainnet host grows from about 13.3 GiB to about 14.0 GiB.
+    Mainnet host grows from about 13.3 GiB to about 14.1 GiB.
   - **Preferred gateways.** A mining node holds up to ten connection places
     above `max_connections` for the mining gateways it ranks highest. While
     places are held, ordinary connections leave one full connection's bases

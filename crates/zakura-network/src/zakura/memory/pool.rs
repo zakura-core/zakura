@@ -346,9 +346,54 @@ pub struct MemoryPoolMachine {
     shared_used: u64,
     total_leased: u64,
     total_floors: u64,
-    total_weight: u128,
+    /// Each consumer's share of `S`, from [`shares_of_s`].
+    shares: [u64; Consumer::COUNT],
     consumers: [ConsumerState; Consumer::COUNT],
     last_overrun_warn: Option<Instant>,
+}
+
+/// Each consumer's share of `config`'s shared space `S`: `S` split by weight,
+/// except that a consumer whose planned cap leaves less room above its floor
+/// than its weighted share gets only that room, and the rest is split among
+/// the others by weight. A consumer with weight 0 gets none.
+fn shares_of_s(config: &PoolConfig) -> [u64; Consumer::COUNT] {
+    let room = |c: Consumer| {
+        let spec = config.consumers[c.index()];
+        u128::from(spec.cap.saturating_sub(spec.floor))
+    };
+    let weight = |c: Consumer| u128::from(config.consumers[c.index()].weight);
+    let mut shares = [0u64; Consumer::COUNT];
+    let mut open = Consumer::ALL.map(|c| weight(c) > 0);
+    let mut remaining = u128::from(config.shared_capacity());
+    // Each round fixes at least one capped consumer or ends, so it runs at
+    // most `Consumer::COUNT` times.
+    loop {
+        let open_weight: u128 = Consumer::ALL
+            .into_iter()
+            .filter(|c| open[c.index()])
+            .map(weight)
+            .sum();
+        if open_weight == 0 {
+            return shares;
+        }
+        let fair = |c: Consumer| remaining.saturating_mul(weight(c)) / open_weight;
+        let capped = Consumer::ALL.map(|c| open[c.index()] && room(c) <= fair(c));
+        if !capped.contains(&true) {
+            for c in Consumer::ALL.into_iter().filter(|c| open[c.index()]) {
+                // `fair(c) <= remaining <= S <= u64::MAX`.
+                shares[c.index()] = u64::try_from(fair(c)).unwrap_or(u64::MAX);
+            }
+            return shares;
+        }
+        let mut fixed = 0u128;
+        for c in Consumer::ALL.into_iter().filter(|c| capped[c.index()]) {
+            // `room(c)` is a difference of two `u64`s.
+            shares[c.index()] = u64::try_from(room(c)).unwrap_or(u64::MAX);
+            fixed = fixed.saturating_add(room(c));
+            open[c.index()] = false;
+        }
+        remaining = remaining.saturating_sub(fixed);
+    }
 }
 
 impl MemoryPoolMachine {
@@ -357,17 +402,13 @@ impl MemoryPoolMachine {
         let config = Consumer::ALL.into_iter().fold(config, |config, consumer| {
             config.with_consumer(consumer, config.consumers[consumer.index()])
         });
-        let total_weight = config
-            .consumers
-            .iter()
-            .map(|spec| u128::from(spec.weight))
-            .sum();
+        let shares = shares_of_s(&config);
         Self {
             shared_capacity: config.shared_capacity(),
             shared_used: 0,
             total_leased: 0,
             total_floors: config.total_floors(),
-            total_weight,
+            shares,
             consumers: Consumer::ALL.map(|consumer| ConsumerState {
                 cap: config.consumers[consumer.index()].cap,
                 ..ConsumerState::default()
@@ -456,16 +497,10 @@ impl MemoryPoolMachine {
         self.leased(consumer).saturating_sub(self.floor(consumer))
     }
 
-    /// Consumer's weighted share of `S` (bytes above its floor).
+    /// Consumer's share of `S` (bytes above its floor), see [`shares_of_s`].
     #[inline]
     pub fn share_of_s(&self, consumer: Consumer) -> u64 {
-        if self.total_weight == 0 {
-            return 0;
-        }
-        let weight = u128::from(self.config.consumers[consumer.index()].weight);
-        let share = u128::from(self.shared_capacity).saturating_mul(weight) / self.total_weight;
-        // `share <= self.shared_capacity <= u64::MAX` always holds.
-        u64::try_from(share).unwrap_or(u64::MAX)
+        self.shares[consumer.index()]
     }
 
     /// Consumer's protected total (`floor + share_of_S`).

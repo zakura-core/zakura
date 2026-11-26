@@ -1431,6 +1431,7 @@ impl PeerMachine {
             shared.effects.push(RelayEffect::Reserve {
                 call,
                 id: pending.id,
+                announced_size: pending.size,
             });
         }
     }

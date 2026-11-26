@@ -28,7 +28,10 @@ use zakura_chain::{
 };
 use zakura_node_services::{
     block_memory::TransactionHandle,
-    mempool::port::{ChainTip, Charge, ConnectedBlock, ReservationId, Unreserved, Verdict},
+    mempool::port::{
+        ChainTip, Charge, ConnectedBlock, LocalFault, RelayedFetch, ReservationId, Unreserved,
+        Verdict,
+    },
 };
 use zakura_rt::collections::HashSet;
 
@@ -270,11 +273,23 @@ impl Bench {
         (answer, self.took(step))
     }
 
-    /// Reserves `tx` for a `tx-relay` fetch. Returns the answer, and what else
-    /// the input caused.
-    fn reserve_relayed(&mut self, tx: &Tx) -> (Result<ReservationId, Unreserved>, Step) {
-        let (answer, step) = self.machine.reserve_relayed(tx.id(), self.at());
+    /// Reserves `tx` for a `tx-relay` fetch whose peer announced
+    /// `announced_size` and whose caller leased `leased_bytes` for it.
+    fn reserve_relayed(
+        &mut self,
+        tx: &Tx,
+        announced_size: u64,
+        leased_bytes: u64,
+    ) -> (Result<ReservationId, Unreserved>, Step) {
+        let fetch = RelayedFetch {
+            announced_size,
+            leased_bytes,
+        };
+        let (answer, step) = self.machine.reserve_relayed(tx.id(), fetch, self.at());
         self.tracker.reserve_answered(tx.id(), &answer);
+        if let Ok(reservation) = answer {
+            self.tracker.tx_leased(reservation);
+        }
         (answer, self.took(step))
     }
 
@@ -473,4 +488,83 @@ impl Bench {
         );
         rejected
     }
+}
+
+/// The size of `tx`'s body.
+fn size(tx: &Tx) -> u64 {
+    u64::try_from(tx.real.transaction.size()).expect("a test body's size fits in u64")
+}
+
+/// Whether `step` ends the memory lease of the relayed fetch under
+/// `reservation`.
+fn ends_tx_lease(step: &Step, reservation: ReservationId) -> bool {
+    step.effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::EndTxLease(ended) if *ended == reservation))
+}
+
+/// mem-7 (`mempool-pending-bytes`), `02 §7` item 7:
+/// - A relayed fetch without a covering memory lease is reserved only into a
+///   pool that holds nothing. A second one, or one into a pool that holds a
+///   transaction, gets `NoRoom`.
+/// - A leased fetch's lease stays counted through verification, and ends
+///   when the transaction is decided or the reservation is dropped.
+/// - A body larger than the memory lease its fetch announced is not the body
+///   announced. It never reaches a verifier, and its lease ends.
+#[test]
+fn mem7_relayed_lease_lifecycle_and_oversized_body() {
+    let mut bench = Bench::new();
+    let mut runner = TestRunner::deterministic();
+    let txs: Vec<Tx> = (0..4).map(|_| build(&mut runner, &[], 0, None)).collect();
+
+    let (unleased, step) = bench.reserve_relayed(&txs[0], size(&txs[0]), 0);
+    let unleased = unleased.expect("a pool that holds nothing takes one unleased fetch");
+    assert!(!ends_tx_lease(&step, unleased));
+    assert!(
+        matches!(
+            bench.reserve_relayed(&txs[1], size(&txs[1]), 0).0,
+            Err(Unreserved::NoRoom)
+        ),
+        "a second unleased fetch waits for the first"
+    );
+
+    // A leased fetch comes in beside it, and its lease stays counted until
+    // the verdict.
+    let leased = bench
+        .reserve_relayed(&txs[1], size(&txs[1]), size(&txs[1]))
+        .0
+        .expect("a leased fetch is reserved");
+    let (_, step) = bench.submit(leased, &txs[1]);
+    assert!(
+        !ends_tx_lease(&step, leased),
+        "verification holds the lease"
+    );
+    let job = started(&step)[0];
+    assert!(ends_tx_lease(&bench.pass(job, &txs[1]), leased));
+
+    // Dropping the unleased fetch ends it. The pool holds a transaction now,
+    // so the next unleased fetch waits.
+    assert!(ends_tx_lease(&bench.release(unleased), unleased));
+    assert!(matches!(
+        bench.reserve_relayed(&txs[2], size(&txs[2]), 0).0,
+        Err(Unreserved::NoRoom)
+    ));
+    let leased = bench
+        .reserve_relayed(&txs[2], size(&txs[2]), size(&txs[2]))
+        .0
+        .expect("a leased fetch is reserved");
+    assert!(ends_tx_lease(&bench.release(leased), leased));
+
+    let announced = size(&txs[3]) - 1;
+    let reservation = bench
+        .reserve_relayed(&txs[3], announced, announced)
+        .0
+        .expect("a leased fetch is reserved");
+    let (waiter, step) = bench.submit(reservation, &txs[3]);
+    assert!(started(&step).is_empty());
+    assert!(matches!(
+        step.verdict(waiter),
+        Some(Verdict::LocalFault(LocalFault::WrongTransaction))
+    ));
+    assert!(ends_tx_lease(&step, reservation));
 }

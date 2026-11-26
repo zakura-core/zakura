@@ -31,7 +31,7 @@ use zakura_node_services::mempool::{
 };
 use zakura_rt::sync::{oneshot, CancellationToken, Mutex};
 
-use super::{tx_relay_service, MayCool, TxRelaySessions};
+use super::{test_memory_pool as memory_pool, tx_relay_service, MayCool, TxRelaySessions};
 use crate::{
     zakura::{
         testkit::{ZakuraTestNode, ZakuraTestNodeBuilder},
@@ -348,6 +348,7 @@ impl RelayNode {
         if let Some(pool) = &pool {
             let relay = tx_relay_service(
                 pool.handle.clone(),
+                memory_pool(),
                 may_cool,
                 &Default::default(),
                 Default::default(),
@@ -390,6 +391,7 @@ impl RelayNode {
         if let Some(pool) = pool {
             let relay = tx_relay_service(
                 pool,
+                memory_pool(),
                 Arc::new(|_| true),
                 &Default::default(),
                 Default::default(),

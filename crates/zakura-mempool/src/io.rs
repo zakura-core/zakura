@@ -15,7 +15,8 @@
 //! 2. It sends the answers to the commands it took, so no caller hears of a
 //!    change before readers can see it.
 //! 3. It does each step's effects in order: starts and cancels
-//!    verifications, and sends verdicts.
+//!    verifications, sends verdicts, and lets go of relayed fetches' memory
+//!    leases.
 //!
 //! A verifier the core owns reads the pool through a `PoolReader`, so it
 //! does not keep the core running once every handle is gone.
@@ -36,7 +37,7 @@ use chrono::{DateTime, Utc};
 use zakura_chain::transaction::UnminedTx;
 use zakura_node_services::mempool::port::{
     ChainEvent, ChainTip, ChangeSeq, LocalFault, PoolCommand, PoolInbox, PoolSnapshot,
-    ReservationId, Verdict,
+    ReservationId, TxLeaseHold, Verdict,
 };
 use zakura_rt::{
     collections::HashMap,
@@ -121,6 +122,9 @@ pub struct MempoolIO<E, V> {
     /// The cancellation of each reservation the core granted for a fetch,
     /// until its caller submits, fails or drops it. One per slot at most.
     fetches: HashMap<ReservationId, CancellationToken>,
+    /// The hold on each relayed fetch's memory lease, until the machine ends
+    /// it. Dropping one lets the caller release its lease.
+    tx_leases: HashMap<ReservationId, TxLeaseHold>,
     /// Callers waiting for a verdict.
     verdicts: HashMap<WaiterId, oneshot::Sender<Verdict>>,
     published: Option<Published>,
@@ -196,6 +200,7 @@ impl<E: VerifyError, V: Verifier<E>> MempoolIO<E, V> {
             reports,
             jobs: HashMap::default(),
             fetches: HashMap::default(),
+            tx_leases: HashMap::default(),
             verdicts: HashMap::default(),
             published: None,
             steps: Vec::new(),
@@ -266,15 +271,19 @@ impl<E: VerifyError, V: Verifier<E>> MempoolIO<E, V> {
                 relayed,
                 reply,
             } => {
-                let (answer, step) = if relayed {
-                    self.machine.reserve_relayed(tx_id, now)
-                } else {
-                    self.machine.reserve(tx_id, now)
+                let (answer, step) = match relayed {
+                    Some(fetch) => self.machine.reserve_relayed(tx_id, fetch, now),
+                    None => self.machine.reserve(tx_id, now),
                 };
                 let answer = answer.map(|id| {
                     let cancel = CancellationToken::new();
                     self.fetches.insert(id, cancel.clone());
-                    self.inbox.grant(id, tx_id, cancel)
+                    if relayed.is_none() {
+                        return self.inbox.grant(id, tx_id, cancel);
+                    }
+                    let (reservation, hold) = self.inbox.grant_relayed(id, tx_id, cancel);
+                    self.tx_leases.insert(id, hold);
+                    reservation
                 });
                 // A caller that left drops the reservation with the reply,
                 // which frees the slot.
@@ -427,6 +436,9 @@ impl<E: VerifyError, V: Verifier<E>> MempoolIO<E, V> {
                     if let Some(cancel) = self.fetches.remove(&reservation) {
                         cancel.cancel();
                     }
+                }
+                Effect::EndTxLease(reservation) => {
+                    self.tx_leases.remove(&reservation);
                 }
                 Effect::Verdict { waiter, verdict } => {
                     if let Some(reply) = self.verdicts.remove(&waiter) {

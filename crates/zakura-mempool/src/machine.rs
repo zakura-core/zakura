@@ -37,8 +37,8 @@ use zakura_chain::{
 };
 use zakura_node_services::mempool::port::{
     ChainReason, ChainTip, Change, ChangeSeq, Charge, ConnectedBlock, LocalFault, PoolSnapshot,
-    Rejection, RejectionDetail, RejectionScope, RemovalReason, ReservationId, Unreserved, Verdict,
-    MAX_PENDING, MAX_READMITTING, MAX_RELAYED, T_PARK, T_VERIFY,
+    Rejection, RejectionDetail, RejectionScope, RelayedFetch, RemovalReason, ReservationId,
+    Unreserved, Verdict, MAX_PENDING, MAX_READMITTING, MAX_RELAYED, T_PARK, T_VERIFY,
 };
 use zakura_rt::collections::{HashMap, HashSet};
 
@@ -145,6 +145,11 @@ pub enum Effect {
     /// longer needed, because a block mined the transaction. See
     /// `Reservation::cancellation`.
     CancelFetch(ReservationId),
+    /// The core no longer counts the bytes of the relayed fetch under this
+    /// reservation: its transaction was decided, or the reservation ended
+    /// without a body. Its caller releases the memory lease it holds for
+    /// the fetch (`02 §7` item 7, `mem-7`).
+    EndTxLease(ReservationId),
     /// Answer a submission.
     Verdict {
         /// The submission.
@@ -225,15 +230,16 @@ enum Stage {
 }
 
 /// An undecided transaction and the submission waiting on it.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct Admission<E> {
     tx_id: UnminedTxId,
     /// The reservation it was granted under, whose caller is fetching the
     /// body until `body` is set. `None` for a pooled transaction that a
     /// reset sent back through admission: nobody waits for its verdict.
     owner: Option<ReservationId>,
-    /// Whether a `tx-relay` fetch reserved it. See [`Limits::relayed`].
-    relayed: bool,
+    /// What the `tx-relay` fetch that reserved it said of its body. See
+    /// [`Limits::relayed`].
+    relayed: Option<RelayedFetch>,
     body: Option<UnminedTx>,
     /// The submission that brought the body, which gets the verdict.
     waiter: Option<WaiterId>,
@@ -297,13 +303,14 @@ struct Queued {
 }
 
 /// A slot kept for a fetch that is still out after its id was decided.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct Lease {
     tx_id: UnminedTxId,
     /// The verdict its admission got, which its caller gets too.
     verdict: Verdict,
-    /// Whether a `tx-relay` fetch holds it. See [`Limits::relayed`].
-    relayed: bool,
+    /// What the `tx-relay` fetch that holds it said of its body. See
+    /// [`Limits::relayed`].
+    relayed: Option<RelayedFetch>,
 }
 
 /// The tip before the chain names one. The pool is off until then.
@@ -406,24 +413,31 @@ impl<E: VerifyError> MempoolState<E> {
         now: Instant,
     ) -> (Result<ReservationId, Unreserved>, Step) {
         self.enter(now);
-        let answer = self.grant(tx_id, false);
+        let answer = self.grant(tx_id, None);
         (answer, self.take_step())
     }
 
     /// [`Self::reserve`] for a `tx-relay` fetch, which also needs room under
-    /// [`Limits::relayed`].
+    /// [`Limits::relayed`]. The machine counts the fetch's bytes against
+    /// `fetch`'s memory lease until [`Effect::EndTxLease`] names the
+    /// reservation.
     pub fn reserve_relayed(
         &mut self,
         tx_id: UnminedTxId,
+        fetch: RelayedFetch,
         now: Instant,
     ) -> (Result<ReservationId, Unreserved>, Step) {
         self.enter(now);
-        let answer = self.grant(tx_id, true);
+        let answer = self.grant(tx_id, Some(fetch));
         (answer, self.take_step())
     }
 
     /// Grants a reservation for `tx_id`, or says why not.
-    fn grant(&mut self, tx_id: UnminedTxId, relayed: bool) -> Result<ReservationId, Unreserved> {
+    fn grant(
+        &mut self,
+        tx_id: UnminedTxId,
+        relayed: Option<RelayedFetch>,
+    ) -> Result<ReservationId, Unreserved> {
         if !self.active {
             return Err(Unreserved::Inactive);
         }
@@ -448,8 +462,15 @@ impl<E: VerifyError> MempoolState<E> {
             return Err(Unreserved::Pending);
         }
         if self.slots_in_use() >= self.limits.pending
-            || (relayed && self.relaying >= self.limits.relayed)
+            || (relayed.is_some() && self.relaying >= self.limits.relayed)
         {
+            return Err(Unreserved::NoRoom);
+        }
+        // `02 §7` item 7 (`mem-7`): a relayed fetch needs a memory lease that
+        // covers its announced body, except one transaction into a pool that
+        // holds nothing, so a node whose `Consumer::Tx` is at its floor still
+        // takes transactions in. This is the one place that decides it.
+        if relayed.is_some_and(unleased) && !self.holds_nothing() {
             return Err(Unreserved::NoRoom);
         }
         let owner = ReservationId(self.fresh());
@@ -475,7 +496,7 @@ impl<E: VerifyError> MempoolState<E> {
         );
         self.admission_of.insert(tx_id, key);
         self.owners.insert(owner, key);
-        if relayed {
+        if relayed.is_some() {
             self.relaying = self.relaying.saturating_add(1);
         }
         Ok(owner)
@@ -540,11 +561,18 @@ impl<E: VerifyError> MempoolState<E> {
         };
         let now = self.now;
         let admission = self.admission_at(key);
+        // `mem-7`: a leased body larger than its lease is not the body the
+        // peer announced, which `relay-1` already closes the peer for.
+        let unfunded = admission
+            .relayed
+            .is_some_and(|fetch| !unleased(fetch) && body_bytes(&tx) > fetch.leased_bytes);
         admission.waiter = Some(waiter);
         admission.body = Some(tx);
         admission.give_up = give_up;
-        // The command waited past its submitter's deadline.
-        if give_up.is_some_and(|at| at <= now) {
+        if unfunded {
+            self.fail_locally(key, LocalFault::WrongTransaction);
+        } else if give_up.is_some_and(|at| at <= now) {
+            // The command waited past its submitter's deadline.
             self.fail_locally(key, LocalFault::VerifyTimeout);
         } else {
             self.start_admission(key);
@@ -828,6 +856,23 @@ impl<E: VerifyError> MempoolState<E> {
         self.owners.len().saturating_add(self.leases.len())
     }
 
+    /// The reservations of relayed fetches whose bytes the machine counts:
+    /// those [`Effect::EndTxLease`] has not named yet.
+    #[cfg(test)]
+    pub(crate) fn tx_leased(&self) -> HashSet<ReservationId> {
+        let admissions = self
+            .admissions
+            .values()
+            .filter(|admission| admission.relayed.is_some())
+            .filter_map(|admission| admission.owner);
+        let leases = self
+            .leases
+            .iter()
+            .filter(|(_, lease)| lease.relayed.is_some())
+            .map(|(reservation, _)| *reservation);
+        admissions.chain(leases).collect()
+    }
+
     /// The pool, oldest first.
     #[cfg(test)]
     pub(crate) fn pooled_ids(&self) -> Vec<UnminedTxId> {
@@ -964,9 +1009,13 @@ impl<E: VerifyError> MempoolState<E> {
         let relaying = self
             .admissions
             .values()
-            .filter(|admission| admission.relayed)
+            .filter(|admission| admission.relayed.is_some())
             .count()
-            + self.leases.values().filter(|lease| lease.relayed).count();
+            + self
+                .leases
+                .values()
+                .filter(|lease| lease.relayed.is_some())
+                .count();
         assert_eq!(
             relaying, self.relaying,
             "the tx-relay count matches the admissions and leases"
@@ -975,6 +1024,26 @@ impl<E: VerifyError> MempoolState<E> {
             self.relaying <= self.limits.relayed,
             "pool/relayed-within-limit: the tx-relay share"
         );
+        // mem-7 (`mempool-pending-bytes`): each undecided relayed body stays
+        // within its fetch's memory lease, except one transaction that came
+        // into a pool that held nothing.
+        let fetches = self
+            .admissions
+            .values()
+            .filter_map(|admission| admission.relayed)
+            .chain(self.leases.values().filter_map(|lease| lease.relayed));
+        assert!(
+            fetches.filter(|fetch| unleased(*fetch)).count() <= 1,
+            "mem-7: at most one unleased relayed transaction, into an empty pool"
+        );
+        for admission in self.admissions.values() {
+            if let (Some(fetch), Some(body)) = (admission.relayed, &admission.body) {
+                assert!(
+                    unleased(fetch) || body_bytes(body) <= fetch.leased_bytes,
+                    "mem-7: an undecided relayed body stays within its memory lease"
+                );
+            }
+        }
         assert!(
             self.storage.total_cost().saturating_add(self.queued_cost) <= self.storage.cost_limit(),
             "pool/cost-within-limit: the pool and the queue together stay within the cost limit"
@@ -1136,7 +1205,8 @@ impl<E: VerifyError> MempoolState<E> {
     /// on it.
     fn drop_reservation(&mut self, reservation: ReservationId) {
         if let Some(key) = self.owners.remove(&reservation) {
-            self.end(key);
+            let admission = self.end(key);
+            self.end_tx_lease(reservation, admission.relayed);
         }
         self.take_lease(reservation);
     }
@@ -1144,10 +1214,31 @@ impl<E: VerifyError> MempoolState<E> {
     /// Frees `reservation`'s lease, if it has one.
     fn take_lease(&mut self, reservation: ReservationId) -> Option<Lease> {
         let lease = self.leases.remove(&reservation)?;
-        if lease.relayed {
+        if lease.relayed.is_some() {
             self.relaying = self.relaying.saturating_sub(1);
         }
+        self.end_tx_lease(reservation, lease.relayed);
         Some(lease)
+    }
+
+    /// Tells the caller of a relayed fetch under `reservation` that the
+    /// machine no longer counts the fetch's bytes. This is the only place
+    /// that emits [`Effect::EndTxLease`].
+    fn end_tx_lease(&mut self, reservation: ReservationId, relayed: Option<RelayedFetch>) {
+        if relayed.is_some() {
+            self.step.effects.push(Effect::EndTxLease(reservation));
+        }
+    }
+
+    /// Whether the machine holds no transaction at all: none pooled,
+    /// undecided, kept for a fetch that is still out, or waiting to be
+    /// verified again. Only then may a relayed fetch come in without a
+    /// covering memory lease (`02 §7` item 7).
+    fn holds_nothing(&self) -> bool {
+        self.storage.transaction_count() == 0
+            && self.admissions.is_empty()
+            && self.leases.is_empty()
+            && self.queue.is_empty()
     }
 
     /// Applies a fresh outcome to an undecided transaction.
@@ -1348,7 +1439,8 @@ impl<E: VerifyError> MempoolState<E> {
             self.owners.remove(&owner);
             if admission.body.is_none() {
                 // The reserving caller's fetch is still out. Its body will
-                // arrive decoded, so its slot is not free yet.
+                // arrive decoded, so its slot is not free yet, and neither
+                // are its bytes.
                 self.leases.insert(
                     owner,
                     Lease {
@@ -1357,9 +1449,11 @@ impl<E: VerifyError> MempoolState<E> {
                         relayed: admission.relayed,
                     },
                 );
-                if admission.relayed {
+                if admission.relayed.is_some() {
                     self.relaying = self.relaying.saturating_add(1);
                 }
+            } else {
+                self.end_tx_lease(owner, admission.relayed);
             }
         }
         if let Some(waiter) = admission.waiter {
@@ -1377,7 +1471,7 @@ impl<E: VerifyError> MempoolState<E> {
         if admission.owner.is_none() {
             self.readmitting = self.readmitting.saturating_sub(1);
         }
-        if admission.relayed {
+        if admission.relayed.is_some() {
             self.relaying = self.relaying.saturating_sub(1);
         }
         admission
@@ -1400,7 +1494,7 @@ impl<E: VerifyError> MempoolState<E> {
                 Admission {
                     tx_id,
                     owner: None,
-                    relayed: false,
+                    relayed: None,
                     body: Some(tx),
                     waiter: None,
                     stage: Stage::Reserved,
@@ -1670,6 +1764,17 @@ impl<E: VerifyError> MempoolState<E> {
         self.next_id = self.next_id.saturating_add(1);
         self.next_id
     }
+}
+
+/// Whether `fetch` comes without a memory lease that covers its announced
+/// body, which only the empty-pool exception admits (`02 §7` item 7).
+fn unleased(fetch: RelayedFetch) -> bool {
+    fetch.leased_bytes < fetch.announced_size
+}
+
+/// The bytes `tx`'s body holds.
+fn body_bytes(tx: &UnminedTx) -> u64 {
+    u64::try_from(tx.size()).unwrap_or(u64::MAX)
 }
 
 /// A rejection as callers see it.

@@ -286,7 +286,7 @@ impl Tracker {
         let (mut submitted, mut answers) = (false, 0);
         for effect in effects {
             match effect {
-                RelayEffect::Reserve { call, id } => {
+                RelayEffect::Reserve { call, id, .. } => {
                     assert!(self.active && !self.stopped, "reserved from an off pool");
                     self.calls.insert(*call, *id);
                     self.saw("reserve");

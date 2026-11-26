@@ -995,10 +995,8 @@ mod tests {
 
     /// ID-12: the flight that carries the largest credential fits the
     /// handshake data `quinn-proto` buffers, in either direction, with more
-    /// than 2 KiB to spare. A peer refuses a handshake frame that ends more
-    /// than that buffer past the data it has read in order, so a larger
-    /// flight completes only if the network delivers it nearly in order.
-    /// This one completes whatever is lost or reordered.
+    /// than 2 KiB to spare. Even if the end of this flight arrives first,
+    /// it fits within the receiver's limit for out-of-order handshake data.
     #[test]
     fn the_largest_credentials_flight_fits_the_handshake_buffer() {
         /// `quinn-proto`'s default `crypto_buffer_size`, which this crate

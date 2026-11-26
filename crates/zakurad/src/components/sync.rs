@@ -854,18 +854,21 @@ impl Config {
     /// Returns how many blocks below `max_checkpoint_height` the state keeps queued
     /// outputs available to full verification.
     ///
-    /// The syncer can have its whole scaled checkpoint pipeline queued when full
-    /// verification starts, so this uses the same [`LookaheadScale`] as the syncer,
-    /// at the final checkpoint. [`Self::backend_verification_total`] bounds it at
-    /// startup.
+    /// A checkpoint block stays in flight until the state writes it, so every
+    /// unwritten block is within the syncer's lookahead of the newest request.
+    /// The window must cover that scaled checkpoint lookahead, which only exceeds
+    /// the unscaled `3 * checkpoint_verify_concurrency_limit` at 20 second spacing.
+    /// [`Self::backend_verification_total`] bounds it at startup.
     pub fn checkpoint_output_lookahead(
         &self,
         network: &Network,
         max_checkpoint_height: Height,
     ) -> usize {
-        LookaheadScale::at(network, max_checkpoint_height)
-            .scale(self.checkpoint_verify_concurrency_limit)
-            * (VERIFICATION_PIPELINE_SCALING_MULTIPLIER + 1)
+        let unscaled = self.checkpoint_verify_concurrency_limit
+            * (VERIFICATION_PIPELINE_SCALING_MULTIPLIER + 1);
+        let lookahead = LookaheadScale::at(network, max_checkpoint_height)
+            .scale(self.checkpoint_verify_concurrency_limit);
+        unscaled.max(lookahead)
     }
 
     /// Check that the sync and gossip paths fit one verifier allowance, then return

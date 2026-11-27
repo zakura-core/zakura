@@ -25,7 +25,7 @@ zcash_script = { workspace = true }
 zcash_primitives = { workspace = true }
 zcash_transparent = { workspace = true, optional = true }
 zcash_protocol = { workspace = true, optional = true }
-zakura-chain = { path = "../zakura-chain", version = "16.0.0" }
+zakura-chain = { path = "../zakura-chain", version = "17.0.0" }
 
 thiserror = { workspace = true }
 

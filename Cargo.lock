@@ -3272,7 +3272,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-chain"
-version = "16.1.0"
+version = "17.0.0"
 dependencies = [
  "bech32",
  "bitflags",

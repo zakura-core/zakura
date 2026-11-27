@@ -1983,7 +1983,12 @@ impl ZakuraDiscoveryHandle {
     }
 
     /// Records two replacement candidates that pass the ordinary dialer's live
-    /// route and identity checks. No outbound connection is started or reserved.
+    /// route and identity checks once the registered ordinary peers reach
+    /// [`Self::ordinary_outbound_target`]. No outbound connection is started
+    /// or reserved.
+    ///
+    /// Peers count in either direction. A node with a lower target seldom has
+    /// inbound peers, and the two spares bound any early slowdown.
     pub(super) async fn update_peer_query_reserve(
         &self,
         held: &HeldPlaces,
@@ -1997,7 +2002,7 @@ impl ZakuraDiscoveryHandle {
             .count();
         let mut state = self.inner.lock().await;
         let previous = state.peer_query_reserve.take();
-        if ordinary < self.ordinary_connection_cap {
+        if ordinary < self.ordinary_outbound_target {
             return;
         }
 
@@ -11027,6 +11032,54 @@ mod tests {
         assert!(
             handle.next_peer_query(Some(Instant::now())).await.is_some(),
             "a peer in backoff is not a spare"
+        );
+    }
+
+    /// Issue 2805: a node whose record has no address stops dialing at its
+    /// outbound target, so reaching that target with two spares slows its
+    /// peer queries, as a full connection set does.
+    #[tokio::test]
+    async fn peer_query_backoff_follows_the_outbound_target_without_an_address() {
+        use zakura_rt::time::Instant;
+        let (connected_tx, connected_rx) = watch::channel(Vec::new());
+        let handle = discovery_handle_at(
+            local_config_with(secret_key(), Vec::new(), vec![service(1)]),
+            ZakuraDiscoveryConfig {
+                max_zakura_connections: 92,
+                discovery_connection_headroom: 9,
+                ..ZakuraDiscoveryConfig::default()
+            },
+            connected_rx,
+            NOW,
+        );
+        assert_eq!(handle.ordinary_outbound_target, 23);
+        for i in 1..=2 {
+            import_hello_record(
+                &handle,
+                runtime_record_with(i.into(), service(1), test_addr(i)),
+            )
+            .await;
+        }
+        let peers: Vec<_> = (0..23)
+            .map(|_| peer_id_for(secret_key().public()))
+            .collect();
+        let sent = Some(Instant::now());
+
+        connected_tx.send_replace(peers[..22].to_vec());
+        handle
+            .update_peer_query_reserve(&HeldPlaces::default(), |_| true)
+            .await;
+        assert!(
+            handle.next_peer_query(sent).await.is_some(),
+            "below the target"
+        );
+        connected_tx.send_replace(peers);
+        handle
+            .update_peer_query_reserve(&HeldPlaces::default(), |_| true)
+            .await;
+        assert!(
+            handle.next_peer_query(sent).await.is_none(),
+            "at the target with two spares"
         );
     }
 

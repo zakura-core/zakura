@@ -1874,8 +1874,9 @@ async fn a_round_admits_no_more_dials_than_free_admission_permits() {
         .await
         .expect("dialer spawns");
     let endpoint = node.endpoint();
-    let permits = dial_permits(&node);
-    let held = endpoint.hold_connection_slots(permits - 1, false);
+    // Inbound slots leave the outbound target alone, so only the ordinary cap
+    // limits this round.
+    let held = endpoint.hold_connection_slots(node.discovery().ordinary_connection_cap - 1, true);
     assert_eq!(dial_permits(&node), 1);
     assert!(
         endpoint.discovery_admission_capacity() >= 3,

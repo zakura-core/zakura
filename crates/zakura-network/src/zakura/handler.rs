@@ -1462,11 +1462,11 @@ impl ZakuraEndpoint {
         ordinary_cap: usize,
         outbound_target: usize,
     ) -> usize {
-        let counts = self.supervisor.ip_slots.counts();
-        let split = counts.slot_split();
+        let split = self.supervisor.ip_slots.counts().slot_split();
         let ordinary_outbound = split.ordinary.saturating_sub(split.ordinary_inbound);
-        counts
-            .free_ordinary_connections(ordinary_cap.min(self.handler.limits.max_connections))
+        ordinary_cap
+            .min(self.handler.limits.max_connections)
+            .saturating_sub(split.ordinary)
             .min(outbound_target.saturating_sub(ordinary_outbound))
     }
 

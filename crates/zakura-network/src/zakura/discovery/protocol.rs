@@ -1953,7 +1953,8 @@ impl ZakuraDiscoveryHandle {
     }
 
     /// Builds the next peer query unless this stream queried recently and the
-    /// node has both a full connection set and a reserve of dialable peers.
+    /// node holds its outbound target in registered peers with a reserve of
+    /// dialable peers (see [`Self::update_peer_query_reserve`]).
     pub(super) async fn next_peer_query(
         &self,
         last_sent: Option<zakura_rt::time::Instant>,
@@ -4180,7 +4181,8 @@ fn discovery_ordinary_cap(max_connections: usize, connection_headroom: usize) ->
 ///
 /// Each dial takes an inbound slot on the peer it reaches. Without the
 /// target, reachable nodes fill each other's slots up to the soft cap and
-/// leave none for nodes whose records carry no address, which can only dial.
+/// leave only the few above it for nodes whose records carry no address,
+/// which can only dial.
 /// The target stays above the headroom, so discovery keeps a dial with every
 /// bootstrap peer connected (see `min_budgeted_connections`).
 fn discovery_outbound_target(max_connections: usize, connection_headroom: usize) -> usize {

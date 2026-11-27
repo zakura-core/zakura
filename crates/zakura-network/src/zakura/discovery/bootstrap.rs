@@ -36,6 +36,7 @@ use zakura_rt::{
     time::Instant,
 };
 
+use super::protocol::ZakuraDiscoveryHandle;
 use super::redial::{score_dial, DialResult, ZAKURA_REDIAL_HEALTHY_CONNECTION};
 use crate::zakura::{
     handler::OutboundPeer, ZakuraEndpoint, ZakuraLocalLimits, ZakuraPeerId,
@@ -296,6 +297,7 @@ impl BootstrapPlan {
 /// [`super::dialer::warn_when_moved`].
 pub(super) async fn run_bootstrap_dialer(
     endpoint: ZakuraEndpoint,
+    discovery: ZakuraDiscoveryHandle,
     seeds: Vec<NodeAddr>,
     limits: ZakuraLocalLimits,
 ) {
@@ -345,9 +347,12 @@ pub(super) async fn run_bootstrap_dialer(
             plan.dials(coverage, registered, now, || endpoint.connection_token())
         {
             metrics::counter!("zakura.p2p.bootstrap.dial.started").increment(1);
+            let current = moved.borrow().current(node_addr.id);
             dials.push(seed_dial(
                 endpoint.clone(),
+                discovery.clone(),
                 node_addr,
+                current,
                 limits.clone(),
                 connection,
                 index,
@@ -383,16 +388,36 @@ pub(super) async fn run_bootstrap_dialer(
     }
 }
 
-/// Dials and serves seed `index` at `node_addr` under `connection` in a task
-/// of its own, and returns how the dial ended.
+/// Dials and serves seed `index` under `connection` in a task of its own, and
+/// returns how the dial ended.
+///
+/// It dials the configured `node_addr`, then the addresses the seed's signed
+/// records advertise under its configured and `current` IDs, so a seed that
+/// moved to a new address stays reachable. Only this dialer dials seeds. The
+/// record's addresses fill only the dial reserve that startup checked the
+/// configured ones against, because a dial claims a slot for every attempt
+/// at once (zakura-quic ADM-12).
 async fn seed_dial(
     endpoint: ZakuraEndpoint,
-    node_addr: NodeAddr,
+    discovery: ZakuraDiscoveryHandle,
+    mut node_addr: NodeAddr,
+    current: NodeId,
     limits: ZakuraLocalLimits,
     connection: CancellationToken,
     index: usize,
 ) -> (usize, DialResult) {
     let task = AbortOnDropHandle::new(spawn_erased_named("bootstrap_dial", async move {
+        let reserve = limits.quic_bind_config(Vec::new()).dial_reserve;
+        for addr in discovery.record_addrs(&[node_addr.id, current]).await {
+            if node_addr.direct.contains(&addr) {
+                continue;
+            }
+            node_addr.direct.push(addr);
+            if endpoint.dial_attempt_count(&node_addr) > reserve {
+                node_addr.direct.pop();
+                break;
+            }
+        }
         let (registration, registered) = oneshot::channel();
         score_dial(
             super::dialer::native_bootstrap_dial(

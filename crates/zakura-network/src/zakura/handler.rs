@@ -1345,6 +1345,12 @@ impl ZakuraEndpoint {
         self.handler.shutdown.child_token()
     }
 
+    /// The address attempts a dial to `node_addr` would claim transport slots
+    /// for at once, as [`QuicEndpoint::dial_attempt_count`] counts them.
+    pub(crate) fn dial_attempt_count(&self, node_addr: &NodeAddr) -> usize {
+        self.quic.dial_attempt_count(node_addr)
+    }
+
     /// Starts `hint`'s ALPN-mismatch floor, and drops the floors that ended.
     fn hold_upgrade_alpn_floor(&self, hint: NodeAddr) {
         let now = Instant::now();
@@ -6502,6 +6508,7 @@ async fn spawn_zakura_endpoint_inner(
     // past teardown.
     for task in spawn_native_bootstrap_dialer(
         endpoint.clone(),
+        discovery.clone(),
         config.zakura.bootstrap_peers.clone(),
         limits.clone(),
     ) {

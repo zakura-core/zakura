@@ -11,6 +11,7 @@ use zakura_rt::{
     task::JoinHandle,
 };
 
+use super::protocol::ZakuraDiscoveryHandle;
 use crate::zakura::{
     handler::{DialRegistration, DialReport},
     transport::MovedNodeIds,
@@ -27,6 +28,7 @@ use crate::zakura::{
 /// this returns, so the candidate dialer never dials a seed.
 pub(crate) fn spawn_native_bootstrap_dialer(
     endpoint: ZakuraEndpoint,
+    discovery: ZakuraDiscoveryHandle,
     bootstrap_peers: Vec<String>,
     limits: ZakuraLocalLimits,
 ) -> Vec<JoinHandle<()>> {
@@ -41,7 +43,7 @@ pub(crate) fn spawn_native_bootstrap_dialer(
     seeds.shuffle(&mut zakura_rt::rand::rng());
     vec![spawn_erased_named(
         "bootstrap_dialer",
-        super::bootstrap::run_bootstrap_dialer(endpoint, seeds, limits),
+        super::bootstrap::run_bootstrap_dialer(endpoint, discovery, seeds, limits),
     )]
 }
 

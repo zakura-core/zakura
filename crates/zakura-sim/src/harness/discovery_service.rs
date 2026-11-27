@@ -198,8 +198,12 @@ pub fn spawn_node(
         |endpoint, limits, handle| async move {
             insert_static_bootstrap_candidates(&handle, &bootstrap_peers).await;
             insert_static_bootstrap_candidates(&handle, &book_entries).await;
-            let mut tasks =
-                spawn_native_bootstrap_dialer(endpoint.clone(), bootstrap_peers, limits.clone());
+            let mut tasks = spawn_native_bootstrap_dialer(
+                endpoint.clone(),
+                handle.clone(),
+                bootstrap_peers,
+                limits.clone(),
+            );
             // A node with no custom services seeks none.
             tasks.push(spawn_native_discovery_dialer(
                 endpoint,

@@ -88,44 +88,13 @@ const fn peers_bytes(records: usize) -> usize {
     2 + records * MAX_NODE_RECORD_BYTES
 }
 
-/// The largest `Peers` payload this node sends: 2 bytes and 32 records of
-/// 753, which was a full answer of records with the largest fields and no
-/// extension while a key list held 4 entries.
-///
-/// It is below [`PEERS_MAX_BYTES`], the largest `Peers` this node accepts.
-/// The room a record keeps for a second signature makes the accepted size
-/// more than ten times larger, and any node can fill that room in its own
-/// records. Without this cap a node whose book holds such records would
-/// send answers that a requester on a slow path can't finish reading before
-/// its exchange deadlines. An answer that reaches the cap carries fewer
-/// records than the request's limit, which is always allowed.
-///
-/// The value is fixed. It doesn't follow [`MAX_NODE_RECORD_FIELDS_BYTES`],
-/// which grew when a key list came to hold 32 entries, because the
-/// deadlines it protects did not change. A node of this release signs
-/// records with a two-entry key list, and a full answer of those still
-/// fits, as the assertion below checks. An answer of records with longer
-/// key lists carries fewer of them, 14 when every field is at its largest.
-/// The release that gives nodes such lists can raise the cap.
-///
-/// The stream's frame cap and the serving pools still follow
-/// [`PEERS_MAX_BYTES`]: one frame cap covers both directions, and each
-/// share has to hold a frame of that size.
-pub(crate) const SERVED_PEERS_MAX_BYTES: usize = 24_098;
+/// Outgoing payload budget for the two-byte count and twelve default signed
+/// records (one IPv4 address and seven services). The byte budget also bounds
+/// replies containing larger records. Incoming frames and serving pools use
+/// [`PEERS_MAX_BYTES`], the protocol limit for 32 maximum-sized records.
+pub(crate) const SERVED_PEERS_MAX_BYTES: usize = 2 + 12 * 5_630;
 
-// A full answer of the largest records a node of this release signs: the
-// Ed25519 and ML-DSA-65 entries, every other field at its largest, and no
-// extension.
-const _: () = assert!(
-    2 + MAX_DISCOVERY_RECORDS_PER_RESPONSE
-        * (4 + 1
-            + 2 * NODE_KEY_ENTRY_BYTES
-            + RECORD_BODY_FIELDS_BYTES
-            + MAX_DIRECT_ADDRS_PER_RECORD * SOCKET_ADDR_V6_BYTES
-            + MAX_SERVICES_PER_RECORD * SERVICE_ID_MAX_BYTES
-            + SIGNATURE_BYTES)
-        <= SERVED_PEERS_MAX_BYTES
-);
+const _: () = assert!(peers_bytes(7) <= SERVED_PEERS_MAX_BYTES);
 
 /// The most a `Peers` answer to a `GetPeers` with `limit` may carry: one frame
 /// with at most `limit` records.

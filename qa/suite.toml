@@ -521,6 +521,15 @@ smoke-secs = 60
 args = ["-max_len=4096"]
 timeout-secs = 1800
 
+# A record's extension area is at most 8,486 bytes: the body cap less the
+# shortest fields.
+[[target]]
+package = "p2p"
+name = "record_signature"
+smoke-secs = 60
+args = ["-max_len=9001"]
+timeout-secs = 1800
+
 [[target]]
 package = "sim"
 name = "block_work_ownership"

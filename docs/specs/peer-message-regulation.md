@@ -259,7 +259,7 @@ resume eligible processing. Local capacity exhaustion is not a peer violation.
 
 Discovery MUST carry discriminators `1..=5` in the frame header. It MUST remove the payload
 discriminator used by version 1. The remaining field order and integer encodings stay unchanged.
-`Hello`, `GetPeers`, and `GetServices` share one cadence. A capacity of 42 covers the 15-second
+`Hello`, `GetPeers`, and `GetServices` share a minimum send interval. A capacity of 42 covers the 15-second
 sender interval across a 600-second connection-wide outage, plus the initial message and one more.
 The buffered arrivals after such an outage cannot prove a sender violation, so exhaustion is
 recorded and the message proceeds. The outstanding-request limit, verification slots, and the
@@ -283,9 +283,9 @@ NODE_RECORD_MAX              = 9,601 bytes
 SERVICE_ENVELOPE_MAX         = 294 bytes
 ```
 
-A record body is its fields and then an extension area that this release keeps byte for byte and
-does not parse. `NODE_RECORD_FIELDS_MAX` is the longest key list with the most and largest
-addresses and services. `NODE_RECORD_BODY_MAX` adds `RECORD_SIGNATURE_ROOM` to it, and
+A record body is its fields and then an extension area of TLVs: a `u16` type, a `u16` length and
+a value, all little-endian. `NODE_RECORD_FIELDS_MAX` is the longest key list with the most and
+largest addresses and services. `NODE_RECORD_BODY_MAX` adds `RECORD_SIGNATURE_ROOM` to it, and
 `NODE_RECORD_MAX` adds the 4-byte body length and the 64-byte Ed25519 signature.
 
 A record carries its author's whole key list, so `MAX_NODE_KEYS` sizes the fields. A key list is a
@@ -299,54 +299,66 @@ record of a node with the two keys of this release is no longer than before.
 record with Ed25519 alone and neither reads nor writes a second signature. The room is reserved
 now because it can't be added later:
 
-- A receiver MUST refuse a record body above `NODE_RECORD_BODY_MAX`. A release that needed a larger
-  body for a post-quantum signature would have every node of this release drop its records.
-- With the room in place, a later release adds the key and the signature as extensions. A node of
-  this release verifies the Ed25519 signature, which covers the extension area, and relays the
-  record unchanged.
+A record is signed twice, with Ed25519 and with ML-DSA-65 (zakura-quic ID-7). The ML-DSA-65
+signature and the author's ML-DSA-65 public key are the last two TLVs of the extension area, and
+use 5,269 bytes of `RECORD_SIGNATURE_ROOM`:
 
-The room holds the key as well as the signature. A record's key list carries every key but the
-Ed25519 one as a 32-byte fingerprint, and a reader verifies a relayed record without asking its
-author for anything, so a signature without its full key could not be checked.
+```text
+record          = body length (u32) | body | Ed25519 signature (64 bytes)
+body            = fields | extension area
+extension area  = other TLVs | key TLV | signature TLV
+key TLV         = type 0x0001 | length 1,952 | ML-DSA-65 public key
+signature TLV   = type 0x0002 | length 3,309 | ML-DSA-65 signature
 
-The size is that of an SLH-DSA-128s key and signature (FIPS 205): 32 and 7,856 bytes, 7,896 with
-the two headers.
+Ed25519 signs   "zakura-node-record-v1" | format version (u16) | body
+ML-DSA-65 signs "zakura-node-record-v1" | format version (u16) | fields | other TLVs | key TLV
+                under the FIPS 204 context "Zakura node record ML-DSA-65 v1"
+```
 
-| Scheme | Key | Signature | With headers | Fits |
-| --- | --- | --- | --- | --- |
-| ML-DSA-65 (FIPS 204), the handshake's level | 1,952 | 3,309 | 5,269 | yes |
-| ML-DSA-87 | 2,592 | 4,627 | 7,227 | yes |
-| SLH-DSA-128s | 32 | 7,856 | 7,896 | yes, sets the size |
-| SLH-DSA-192s, the next smallest SLH-DSA signature | 48 | 16,224 | 16,280 | no |
+- The key travels in full because a record's key list carries every key but the Ed25519 one as a
+  32-byte fingerprint, and a reader verifies a relayed record without asking its author for
+  anything. The reader checks the key against the list's fingerprint before it uses it.
+- The ML-DSA-65 signature covers everything in the body but itself. The Ed25519 signature covers
+  the whole body, so it also fixes which ML-DSA-65 signature the record carries.
+- The encoding is canonical: the area is whole TLVs, types 1 and 2 each appear exactly once, as
+  the last two and in that order, with exactly these lengths. Nothing follows the signature TLV.
+- A TLV of any other type is the author's to define. A receiver keeps it byte for byte, relays the
+  record unchanged, and checks both signatures over it. Such TLVs may sit in any order before the
+  key TLV and may repeat.
 
-- Every ML-DSA level fits, so a later release can sign records at the handshake's level or raise
-  it without changing this limit again.
-- SLH-DSA-128s fits. It rests on hash functions alone, and the likeliest reason to replace a record
-  signature is a break of the lattice schemes, which room for ML-DSA alone would not cover. It
-  costs 669 bytes more than ML-DSA-87.
-- The larger SLH-DSA parameter sets do not fit. Room for the next one would double the size.
+`RECORD_SIGNATURE_ROOM` was sized before a record carried a signature in it, and it can't grow
+later: a receiver MUST refuse a record body above `NODE_RECORD_BODY_MAX`, so a release that needed
+a larger body would have every node of this release drop its records. The size is that of an
+SLH-DSA-128s key and signature (FIPS 205): 32 and 7,856 bytes, 7,896 with the two headers.
+
+| Scheme | Key | Signature | With headers | Fits alone | Fits beside ML-DSA-65 |
+| --- | --- | --- | --- | --- | --- |
+| ML-DSA-65 (FIPS 204), the handshake's level and this release's record signature | 1,952 | 3,309 | 5,269 | yes | - |
+| ML-DSA-87 | 2,592 | 4,627 | 7,227 | yes | no, 12,496 together |
+| SLH-DSA-128s | 32 | 7,856 | 7,896 | yes, sets the size | no, 13,165 together |
+| SLH-DSA-192s, the next smallest SLH-DSA signature | 48 | 16,224 | 16,280 | no | no |
+
+- A record with the largest fields has 2,627 bytes left for other TLVs. A record with shorter
+  fields may use the difference too, because the bound is on the whole body.
+- A second post-quantum key and signature do not fit beside the ML-DSA-65 pair. A release that
+  replaces ML-DSA-65 while nodes of this release still require it needs a larger body, which is a
+  hard break (zakura-quic COMPAT-13).
 
 Any node can fill the extension area of its own records, so every bound that scales with a record
-uses `NODE_RECORD_MAX` from this release on, whether or not a signature is present.
+uses `NODE_RECORD_MAX`, whatever a typical record holds.
 
 What a node accepts and what it sends differ for `Peers`. A node MUST accept a `Peers` up to the
 row's cap, 307,234 bytes. It MUST NOT send one above `SERVED_PEERS_MAX`:
 
 ```text
-SERVED_PEERS_MAX             = 24,098 bytes
+SERVED_PEERS_MAX             = 67,562 bytes
 ```
 
-That is 2 bytes and 32 records of 753, a full answer of records with the largest fields and no
-extension while a key list held 4 entries. The value is fixed and does not follow
-`NODE_RECORD_FIELDS_MAX`, which grew with `MAX_NODE_KEYS`. When the sampled records exceed it,
-the answer carries the first of them that fit, which is fewer than the request's limit and always
-allowed. The exchange deadlines of a discovery-only connection assume an answer of about this
-size, so a node whose book holds records with full extension areas still answers in time. Every
-node of this release signs records with a two-entry key list, and a full answer of those is at
-most 21,922 bytes, so the cap changes nothing for them. A full answer of records with 32-entry key
-lists and every other field at its largest would be 54,562 bytes, and is cut to 14 records. A
-later release that gives nodes longer key lists, or that signs records, can send larger answers
-to the peers it knows will wait for them.
+The budget includes the two-byte count and twelve default signed records of 5,630 bytes each.
+Seven maximum-sized records fit. The responder sends the longest prefix of the sample that fits
+both the request and this byte budget. A discovery-only connection can return that sample in
+one exchange. On shared connections, a requester can ask again after 15 seconds and exclude
+records it has stored.
 
 #### `Hello` — Announcement, discriminator 1
 
@@ -361,9 +373,15 @@ to the peers it knows will wait for them.
   - an Ed25519 entry (tag 1) holds a valid key; an entry with any other tag is kept as it is
   - record body <= 9,533 bytes, extension area included
   - exact consumption
+  - the extension area is not parsed at decode: it is kept as bytes
 - **Verify** — [`ZakuraNodeRecord::verify`][record-verify], with time-varying import policy split
   from [`validate_record_body_for_import`][record-import]
-  - record signature, by the Ed25519 key in the record's key list
+  - the key list has an Ed25519 entry and an ML-DSA-65 entry
+  - Ed25519 signature, by the Ed25519 key in the record's key list
+  - extension area is whole TLVs that end in one key TLV and one signature TLV, in that order,
+    with exact lengths and no other TLV of either type
+  - the key TLV's key has the fingerprint in the key list's ML-DSA-65 entry
+  - ML-DSA-65 signature, by that key
   - network and chain IDs
   - protocol overlap
   - record author (the hash of its key list) == authenticated peer
@@ -373,12 +391,21 @@ to the peers it knows will wait for them.
   - on_empty = record and forward (exhaustion is not a violation)
 
 The sender MAY send one initial `Hello`. It MUST send later `Hello` messages at least 15 seconds
-apart. A long-lived shared connection MAY carry periodic `Hello` messages, including an unchanged
-signed record. A discovery-only connection can finish after one exchange; this does not impose a
-lifetime limit of one or two messages on shared connections. The handler MUST apply sequence and
+apart. Zakura queues its current signed record once per discovery stream and again when it
+changes. Peer and live-service queries continue at their normal cadence. Receivers still accept
+a repeated valid record. On a discovery-only connection the dialer normally closes after its
+first exchange, once it has processed the received records and written its admitted answers.
+Both ends use one eight-second budget from the start of the discovery-only exchange. The dialer
+waits for its requested peer list, including an empty reply, and closes once its admitted work
+has settled. The listener allows the dialer the remaining time to finish and close.
+Shared connections continue refreshing. The handler MUST apply sequence and
 expiry policy. It need not maintain a separate relevance snapshot. A repeated valid record MUST
 still satisfy initial-exchange progress when the receiver already knows that record.
-Verify MUST run before the discovery book lock. Expiry and sequence checks MUST return `Drop`
+A failed extension, key or ML-DSA-65 check MUST disconnect the sender, as a failed Ed25519
+signature does. The Ed25519 check runs first, as it did when it was the only one. The order
+changes no verdict.
+Verify MUST run before the discovery book lock and off the async runtime, in a blocking task that
+holds one of the node's verification slots. A record identical to the stored one skips it. Expiry and sequence checks MUST return `Drop`
 for obsolete records because clock passage and local record
 state can make an otherwise valid record obsolete. The handler MUST NOT store an address that is
 not globally routable unless local policy allows that address class. A stored record's sequence
@@ -406,7 +433,14 @@ expiry.
 
 The sender MAY send one initial `GetPeers`. It MUST send later requests at least 15 seconds apart
 and wait for the previous response before sending the next request. Configurable refresh intervals
-MUST obey this minimum. The handler MUST bound sampling work independently of discovery-book size.
+MUST obey this minimum. Zakura asks on each new stream. On shared streams it checks every 15 seconds:
+when the ordinary connection target is met and the book has at least two distinct, unconnected
+peers eligible for ordinary dials, it waits 60 seconds between peer queries. The candidate dialer
+checks both thresholds each round, accounting for preferred places, identity moves and route
+admission. A registration change or an assessment two seconds old clears the backoff.
+Otherwise it asks on this refresh.
+Live-service queries keep their 15-second interval.
+The handler MUST bound sampling work independently of discovery-book size.
 It MUST apply `wanted_services` when it samples the discovery book. It MUST sample
 qualifying records at random. It MAY apply the excluded node IDs on a best-effort basis: exclusion
 improves sampling efficiency and does not entitle the sender to enumerate the book. The handler
@@ -428,17 +462,25 @@ MUST send exactly one `Peers` response for every admitted request.
   - consumed by this message
 - **Verify** — the signature and immutable import checks from
   [`ZakuraNodeRecord::verify`][record-verify] for each record, before the discovery book lock
-  - record signature
+  - the key list has an Ed25519 entry and an ML-DSA-65 entry
+  - Ed25519 signature
+  - extension area, key fingerprint and ML-DSA-65 signature, as for `Hello`
   - record body bounds
   - network ID and chain ID
   - structurally valid protocol range
 
-A malformed record, invalid signature, wrong network, or wrong chain MUST disconnect the relaying
-peer. The handler MUST discard an otherwise valid record whose protocol range does not overlap
+A malformed record, an invalid Ed25519 signature, a missing, misplaced or invalid ML-DSA-65 key or
+signature, wrong network, or wrong chain MUST disconnect the relaying peer. A conformant relay
+verified both signatures before it stored the record, so it never sends one that fails either.
+The handler MUST discard an otherwise valid record whose protocol range does not overlap
 local support. A relaying peer can legitimately know nodes with different protocol compatibility.
 The handler MUST likewise discard, and MUST NOT disconnect the relaying peer for, a record whose
-key list is well formed but holds no key the handler can verify a signature with. A relay passes
+key list is well formed but lacks the Ed25519 entry or the ML-DSA-65 entry (zakura-quic ID-11).
+The handler decides this from the key list alone, before it checks a signature. A relay passes
 on key lists it cannot read, byte for byte, so such a record is never the relay's fault.
+One blocking task verifies a whole `Peers` under one verification slot: at most 32 records of two
+signatures each. Records identical to stored ones skip it. A record that verifies and is then
+discarded is not stored, so it is verified again each time it arrives.
 Expiry MUST remain a handler policy check because a record can expire in transit.
 The handler MUST discard an otherwise valid record when local staleness, expiry,
 address, or storage policy rejects it. The handler MUST NOT store an address that is not globally

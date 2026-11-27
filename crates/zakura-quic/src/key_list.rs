@@ -155,6 +155,20 @@ impl NodeKeyList {
             })
     }
 
+    /// Whether the list has an entry under `tag`.
+    pub fn contains_tag(&self, tag: u16) -> bool {
+        self.entry(tag).is_some()
+    }
+
+    /// The 32 bytes the list holds under `tag`: the key itself for Ed25519,
+    /// and the key's fingerprint for any other tag (ID-8).
+    pub(crate) fn entry(&self, tag: u16) -> Option<&[u8; KEY_LENGTH]> {
+        self.entries
+            .iter()
+            .find(|(held, _)| *held == tag)
+            .map(|(_, value)| value)
+    }
+
     /// The node ID of the node these keys belong to: BLAKE2b-256 of the
     /// encoded list (ID-9). Entries this release doesn't understand are
     /// hashed too, so every release derives the same ID from the same list.

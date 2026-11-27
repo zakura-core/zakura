@@ -1409,6 +1409,81 @@ async fn insert_ranked_static_candidates(
     node_ids
 }
 
+/// A full node needs two usable ordinary replacements to slow peer queries.
+#[tokio::test]
+async fn peer_queries_follow_ordinary_occupancy_and_admissible_replacements() {
+    use crate::zakura::{
+        testkit::{ZakuraTestNode, TEST_NET_TIMEOUT},
+        GatewayStanding, RankedGateway,
+    };
+    let mut limits = ZakuraLocalLimits::from_config(&crate::Config::default());
+    limits.max_connections = 5; // Four slots are reserved for maintained dials.
+    limits.max_preferred_connections = 1;
+    let node = ZakuraTestNode::builder(9370)
+        .limits(limits)
+        .max_connections_per_ip(1)
+        .spawn()
+        .await
+        .expect("node spawns");
+    let live = ZakuraTestNode::builder(9371)
+        .spawn()
+        .await
+        .expect("peer spawns");
+    node.connect_native(&live, TEST_NET_TIMEOUT)
+        .await
+        .expect("ordinary peer registers");
+    let endpoint = node.endpoint();
+    let discovery = node.discovery();
+    assert_eq!(discovery.ordinary_connection_cap, 1);
+    let open = SocketAddr::from(([198, 51, 100, 12], 8233));
+    let full = SocketAddr::from(([127, 0, 0, 1], 8233));
+    let ids =
+        insert_ranked_static_candidates(&discovery, 10, vec![vec![open], vec![open], vec![full]])
+            .await;
+    endpoint.supervisor().learn_move(ids[0], ids[1]);
+    let check = || async {
+        let mut state = CandidateDialerState::new(DIAL_BACKOFF);
+        admit_dial_round(
+            &endpoint,
+            &discovery,
+            &[],
+            &mut state,
+            RoundClaims::default(),
+            Instant::now(),
+        )
+        .await;
+        discovery
+            .next_peer_query(Some(Instant::now()))
+            .await
+            .is_some()
+    };
+    assert!(
+        check().await,
+        "the two aliases are one spare and the loopback IP is full"
+    );
+    insert_ranked_static_candidates(&discovery, 20, vec![vec![open]]).await;
+    assert!(
+        !check().await,
+        "two distinct destinations can each fill the ordinary slot"
+    );
+    let gateway = live.endpoint().local_node_id();
+    endpoint.publish_discovery_gateway_ranking(
+        vec![RankedGateway::resolved(
+            gateway,
+            1,
+            GatewayStanding::Connected,
+        )],
+        1,
+    );
+    assert!(endpoint.held_places().members.contains(&gateway));
+    assert!(
+        check().await,
+        "a preferred registration cannot fill the ordinary target"
+    );
+    live.shutdown().await;
+    node.shutdown().await;
+}
+
 // V12 F-521: the book used to return only its best candidates, and the round
 // skipped those whose IP was full without asking for more. Candidates on one
 // full IP then took every slot of every round. The round now refills each

@@ -172,3 +172,7 @@ required-features = ["internal-bench"]
 [[bench]]
 name = "bpv1_codec"
 harness = false
+
+[[bench]]
+name = "discovery_record"
+harness = false

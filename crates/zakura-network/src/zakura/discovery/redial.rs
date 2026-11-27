@@ -178,7 +178,7 @@ pub(crate) async fn native_dial_supervised(
         Box::pin(async move {
             let (registration, registered) = oneshot::channel();
             score_dial(
-                super::dialer::native_bootstrap_dial(&endpoint, node_addr, &limits, registration),
+                super::dialer::native_maintained_dial(&endpoint, node_addr, &limits, registration),
                 registered,
             )
             .await

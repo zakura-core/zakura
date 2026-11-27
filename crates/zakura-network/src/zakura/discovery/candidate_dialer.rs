@@ -28,6 +28,7 @@ use zakura_rt::{
     time::Instant,
 };
 
+use super::bootstrap::SeedDialPolicy;
 use super::dialer::native_discovery_dial;
 use super::protocol::{DialAdmission, ZakuraDiscoveryDialCandidate, ZakuraDiscoveryHandle};
 use super::redial::ZAKURA_REDIAL_HEALTHY_CONNECTION;
@@ -471,10 +472,9 @@ impl Future for DiscoveryDialWorker {
 /// free ordinary connection slots, since each dial holds one.
 ///
 /// `preferred` is what this round's preferred pass already claimed, and the
-/// preferred set's members are left to that pass. The round also skips the
-/// bootstrap peers the bootstrap dialer excludes once this node has enough
-/// outbound peers of its own ([`ZakuraEndpoint::set_excluded_seed_ids`]), so
-/// a released seed isn't dialed again.
+/// preferred set's members are left to that pass. Seeds are dialed only as
+/// far as the bootstrap dialer's [`SeedDialPolicy`] allows, so a released
+/// seed isn't dialed again.
 async fn admit_dial_round(
     endpoint: &ZakuraEndpoint,
     discovery: &ZakuraDiscoveryHandle,
@@ -500,11 +500,12 @@ async fn admit_dial_round(
     let supervisor = endpoint.supervisor();
     let in_flight_node_ids = state.in_flight_node_ids();
     let held_places = endpoint.held_places();
-    let excluded_seeds = endpoint.excluded_seed_ids();
+    let seeds = endpoint.seed_dial_policy();
     let mut routes = OrdinaryDialRoutes::new(
         supervisor,
         &held_places,
-        &excluded_seeds,
+        &seeds,
+        discovery.ordinary_connection_cap,
         &in_flight_node_ids,
     );
     // One freed connection permits a replacement. The two spares are alternatives
@@ -526,7 +527,8 @@ async fn admit_dial_round(
     let mut routes = OrdinaryDialRoutes::new(
         endpoint.supervisor(),
         &held_places,
-        &excluded_seeds,
+        &seeds,
+        discovery.ordinary_connection_cap,
         &in_flight_node_ids,
     );
     let mut admitted = Vec::new();
@@ -559,12 +561,14 @@ async fn admit_dial_round(
 }
 
 /// An ordinary pass can use each current identity once, excluding preferred,
-/// excluded bootstrap, registered and in-flight nodes, including their
-/// previously known identities.
+/// registered and in-flight nodes, including their previously known
+/// identities, and seeds beyond what the [`SeedDialPolicy`] allows.
 struct OrdinaryDialRoutes<'a> {
     supervisor: crate::zakura::ZakuraSupervisorHandle,
     held: &'a crate::zakura::HeldPlaces,
-    excluded_seeds: &'a HashSet<NodeId>,
+    seeds: &'a SeedDialPolicy,
+    /// How many more seeds this pass may take.
+    seed_room: usize,
     moved: watch::Receiver<crate::zakura::transport::MovedNodeIds>,
     unavailable: HashSet<NodeId>,
 }
@@ -573,18 +577,30 @@ impl<'a> OrdinaryDialRoutes<'a> {
     fn new(
         supervisor: crate::zakura::ZakuraSupervisorHandle,
         held: &'a crate::zakura::HeldPlaces,
-        excluded_seeds: &'a HashSet<NodeId>,
+        seeds: &'a SeedDialPolicy,
+        ordinary_cap: usize,
         in_flight: &[NodeId],
     ) -> Self {
         let moved = supervisor.moved_node_ids();
-        let unavailable = in_flight
+        let unavailable: HashSet<NodeId> = in_flight
             .iter()
             .map(|id| moved.borrow().current(*id))
             .collect();
+        let seed_connections = seeds
+            .ids
+            .iter()
+            .filter(|id| {
+                unavailable.contains(*id)
+                    || supervisor.is_registered(&ZakuraPeerId::from_node_id(**id))
+            })
+            .count();
         Self {
+            seed_room: seeds
+                .seed_connection_cap(ordinary_cap)
+                .saturating_sub(seed_connections),
             supervisor,
             held,
-            excluded_seeds,
+            seeds,
             moved,
             unavailable,
         }
@@ -600,10 +616,11 @@ impl<'a> OrdinaryDialRoutes<'a> {
     ) -> Option<(NodeAddr, Vec<IpAddr>)> {
         let moved = self.moved.borrow();
         let current = moved.current(candidate.node_id);
+        let seed = moved.under_either_id(candidate.node_id, |id| self.seeds.ids.contains(id));
         if self.unavailable.contains(&current)
+            || (seed && self.seed_room == 0)
             || moved.under_either_id(candidate.node_id, |id| {
                 self.held.members.contains(id)
-                    || self.excluded_seeds.contains(id)
                     || self
                         .supervisor
                         .is_registered(&ZakuraPeerId::from_node_id(*id))
@@ -624,6 +641,9 @@ impl<'a> OrdinaryDialRoutes<'a> {
             return None;
         }
         self.unavailable.insert(current);
+        if seed {
+            self.seed_room -= 1;
+        }
         Some((addr, ips))
     }
 }

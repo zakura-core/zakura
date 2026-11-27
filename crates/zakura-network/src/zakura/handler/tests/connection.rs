@@ -76,6 +76,7 @@ pub(in crate::zakura::handler) async fn connect_holding_credits_and_serve(
                     metered_epoch: negotiated.metered_epoch,
                     role: "initiator",
                     direction: ServicePeerDirection::Outbound,
+                    opener: ConnectionOpener::Other,
                     transcript_hash: native_connection_transcript_hash(
                         ServicePeerDirection::Outbound,
                         &local_id,

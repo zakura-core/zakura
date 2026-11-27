@@ -137,13 +137,51 @@ fn grouped_remote_bootstrap_peers(
         .collect()
 }
 
-/// Dials and serves a bootstrap or maintained connection, and reports on
-/// `registration` how its registration ended.
+/// Dials and serves a seed for the bootstrap dialer, and reports on
+/// `registration` how its registration ended. The bootstrap dialer may close
+/// the connection, see [`ConnectionOpener`](crate::zakura::handler::ConnectionOpener).
 pub(crate) async fn native_bootstrap_dial(
     endpoint: &ZakuraEndpoint,
     node_addr: NodeAddr,
     limits: &ZakuraLocalLimits,
     registration: oneshot::Sender<DialRegistration>,
+) -> Result<(), ZakuraHandlerError> {
+    native_reported_dial(
+        endpoint,
+        node_addr,
+        limits,
+        registration,
+        crate::zakura::handler::NativeDialKind::Bootstrap,
+    )
+    .await
+}
+
+/// Dials and serves a maintained connection, such as an upgrade hand-off,
+/// and reports on `registration` how its registration ended.
+pub(crate) async fn native_maintained_dial(
+    endpoint: &ZakuraEndpoint,
+    node_addr: NodeAddr,
+    limits: &ZakuraLocalLimits,
+    registration: oneshot::Sender<DialRegistration>,
+) -> Result<(), ZakuraHandlerError> {
+    native_reported_dial(
+        endpoint,
+        node_addr,
+        limits,
+        registration,
+        crate::zakura::handler::NativeDialKind::Maintained,
+    )
+    .await
+}
+
+/// Dials `node_addr` as `kind` and reports on `registration` how its
+/// registration ended.
+async fn native_reported_dial(
+    endpoint: &ZakuraEndpoint,
+    node_addr: NodeAddr,
+    limits: &ZakuraLocalLimits,
+    registration: oneshot::Sender<DialRegistration>,
+    kind: crate::zakura::handler::NativeDialKind,
 ) -> Result<(), ZakuraHandlerError> {
     // Only discovery uses the admitted address, to settle per-IP reservations
     // and confirm the record address the dial reached.
@@ -157,7 +195,7 @@ pub(crate) async fn native_bootstrap_dial(
         node_addr,
         limits,
         Some(report),
-        crate::zakura::handler::NativeDialKind::Maintained,
+        kind,
     )
     .await
 }

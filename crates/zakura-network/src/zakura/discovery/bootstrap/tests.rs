@@ -20,12 +20,14 @@ fn peer_id(byte: u8) -> ZakuraPeerId {
     ZakuraPeerId::from_node_id(NodeSecretKey::from_bytes(&[byte; 32]).public())
 }
 
-/// An outbound peer on `ip`, registered at `registered_at`.
+/// An outbound peer discovery opened on `ip`, registered at `registered_at`.
 fn outbound(byte: u8, ip: Option<[u8; 4]>, registered_at: Instant) -> OutboundPeer {
     OutboundPeer {
         peer_id: peer_id(byte),
+        earlier: Vec::new(),
         host: ip.map(IpAddr::from),
         registered_at,
+        opener: ConnectionOpener::Discovery,
     }
 }
 
@@ -44,12 +46,10 @@ fn dialed(started: &[(usize, NodeAddr)]) -> Vec<usize> {
 /// peer without a known IP, and settled only after the healthy-connection
 /// time. The floor excludes seeds and the settled hosts release them.
 #[test]
-fn coverage_counts_distinct_non_seed_hosts() {
+fn coverage_counts_distinct_hosts() {
     let now = Instant::now();
     let old = now - ZAKURA_REDIAL_HEALTHY_CONNECTION;
     let young = now - (ZAKURA_REDIAL_HEALTHY_CONNECTION - Duration::from_secs(1));
-    let seed = peer_id(9);
-    let seeds = HashSet::from_iter([seed.clone()]);
     let peers = [
         // Two peers on one IP are one host.
         outbound(1, Some([203, 0, 113, 1]), old),
@@ -57,21 +57,73 @@ fn coverage_counts_distinct_non_seed_hosts() {
         outbound(3, Some([203, 0, 113, 2]), young),
         // A peer with no known IP is a host of its own.
         outbound(4, None, old),
-        // A seed never counts.
-        OutboundPeer {
-            peer_id: seed,
-            host: Some(IpAddr::from([203, 0, 113, 3])),
-            registered_at: old,
-        },
     ];
 
-    assert_eq!(PeerCoverage::of(&peers, &seeds, now), coverage(3, 2));
-    assert_eq!(PeerCoverage::of(&[], &seeds, now), coverage(0, 0));
+    assert_eq!(PeerCoverage::of(&peers, now), coverage(3, 2));
+    assert_eq!(PeerCoverage::of(&[], now), coverage(0, 0));
 
     assert!(!coverage(BOOTSTRAP_DIAL_FLOOR - 1, 0).excludes_seeds());
     assert!(coverage(BOOTSTRAP_DIAL_FLOOR, 0).excludes_seeds());
     assert!(!coverage(9, BOOTSTRAP_RELEASE_HOSTS - 1).releases_seeds());
     assert!(coverage(9, BOOTSTRAP_RELEASE_HOSTS).releases_seeds());
+}
+
+/// A peer is a seed when it registered under a seed's configured ID or the
+/// ID a dial to it answered with, or when its handshake proved the
+/// configured ID. The plan then knows the seed by the ID it registered
+/// under, even on a connection that proves nothing earlier.
+#[test]
+fn seeds_are_matched_by_the_ids_their_handshakes_prove() {
+    let now = Instant::now();
+    let mut plan = BootstrapPlan::new(seeds(3), now);
+    let configured: Vec<NodeId> = plan.configured_ids().collect();
+    let dialed_and_moved = peer_id(20).node_id().expect("test peers have node IDs");
+    let current = |id: NodeId| {
+        if id == configured[1] {
+            dialed_and_moved
+        } else {
+            id
+        }
+    };
+    let mut moved = outbound(21, None, now);
+    moved.earlier = vec![configured[2]];
+    let peers = [
+        OutboundPeer {
+            peer_id: ZakuraPeerId::from_node_id(configured[0]),
+            ..outbound(0, None, now)
+        },
+        outbound(20, None, now),
+        moved,
+        outbound(30, None, now),
+    ];
+
+    assert_eq!(
+        plan.match_peers(&peers, current),
+        [Some(0), Some(1), Some(2), None]
+    );
+    let moved_id = peer_id(21).node_id().expect("test peers have node IDs");
+    assert_eq!(
+        plan.ids_of(2, current).collect::<Vec<_>>(),
+        [configured[2], moved_id]
+    );
+    assert_eq!(
+        plan.match_peers(&[outbound(21, None, now)], current),
+        [Some(2)],
+        "the seed is known by its new ID"
+    );
+}
+
+/// The candidate dialer may hold seeds in half its ordinary slots while the
+/// node is below the floor, and in none once seeds are excluded.
+#[test]
+fn seeds_take_at_most_half_the_ordinary_slots() {
+    let policy = |excluded| SeedDialPolicy {
+        ids: HashSet::new(),
+        excluded,
+    };
+    assert_eq!(policy(false).seed_connection_cap(10), 5);
+    assert_eq!(policy(false).seed_connection_cap(1), 0);
+    assert_eq!(policy(true).seed_connection_cap(10), 0);
 }
 
 /// A node below the floor dials at most two seeds at once, in order, and

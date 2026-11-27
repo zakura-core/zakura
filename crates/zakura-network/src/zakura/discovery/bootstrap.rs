@@ -9,15 +9,18 @@
 //! - Below [`BOOTSTRAP_DIAL_FLOOR`] outbound non-seed hosts, this dialer dials
 //!   up to [`MAX_BOOTSTRAP_CONNECTIONS`] seeds with a short backoff, so a
 //!   node whose seeds were down recovers quickly, and the candidate dialer may
-//!   dial seeds like any other candidate.
+//!   dial seeds like any other candidate, up to half its ordinary slots.
 //! - At the floor, the candidate dialer stops dialing seeds
-//!   ([`ZakuraEndpoint::set_excluded_seed_ids`]).
+//!   ([`SeedDialPolicy`]).
 //! - Once [`BOOTSTRAP_RELEASE_HOSTS`] hosts have settled, this dialer closes
-//!   every connection this node opened to a seed, whichever dialer opened it,
-//!   and stops a legacy-to-Zakura upgrade dial to it so it doesn't reconnect.
+//!   the seed connections that discovery opened. A pin, an upgrade hand-off
+//!   or a seed's own connection keeps the lifetime its owner gives it
+//!   ([`ConnectionOpener`]).
 //!
-//! A small network whose nodes are all seeds never reaches the floor, so its
-//! seeds stay connected as before.
+//! A seed is recognized by what its connection's handshake proved: its
+//! configured node ID, or an ID it has now that keeps the configured one
+//! (zakura-quic TLS-7). A small network whose nodes are all seeds never
+//! reaches the floor, so its seeds stay connected as before.
 //!
 //! [`BootstrapPlan`] owns the policy. [`run_bootstrap_dialer`] does the IO.
 
@@ -30,9 +33,9 @@ use zakura_rt::{collections::HashSet, sync::oneshot, task::AbortOnDropHandle, ti
 
 use super::redial::{score_dial, DialResult, ZAKURA_REDIAL_HEALTHY_CONNECTION};
 use crate::zakura::{
-    handler::OutboundPeer, ZakuraEndpoint, ZakuraLocalLimits, ZakuraPeerId,
-    DEFAULT_ZAKURA_REDIAL_INITIAL_BACKOFF, DEFAULT_ZAKURA_REDIAL_MAX_BACKOFF,
-    ZAKURA_ALPN_MISMATCH_BACKOFF,
+    handler::{ConnectionOpener, OutboundPeer},
+    ZakuraEndpoint, ZakuraLocalLimits, ZakuraPeerId, DEFAULT_ZAKURA_REDIAL_INITIAL_BACKOFF,
+    DEFAULT_ZAKURA_REDIAL_MAX_BACKOFF, ZAKURA_ALPN_MISMATCH_BACKOFF,
 };
 
 #[cfg(all(test, not(zakura_sim)))]
@@ -57,6 +60,32 @@ pub(super) const MAX_BOOTSTRAP_CONNECTIONS: usize = 2;
 /// How often the bootstrap dialer rechecks this node's peers.
 const BOOTSTRAP_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
+/// What the candidate dialer may do with seeds. The bootstrap dialer sets it
+/// on the endpoint every check.
+#[derive(Debug, Default)]
+pub(crate) struct SeedDialPolicy {
+    /// Every node ID a seed is known by: the configured one, the one a dial
+    /// to it answered with, and the one a connection that proved it has.
+    pub(crate) ids: HashSet<NodeId>,
+    /// The node has [`BOOTSTRAP_DIAL_FLOOR`] hosts of its own, so it dials
+    /// no seed.
+    pub(crate) excluded: bool,
+}
+
+impl SeedDialPolicy {
+    /// The most seed connections the candidate dialer lets this node have,
+    /// given its `ordinary_cap` slots: none once seeds are excluded, and
+    /// otherwise half, so seeds can't fill the slots the node's own peers
+    /// need to reach the floor.
+    pub(crate) fn seed_connection_cap(&self, ordinary_cap: usize) -> usize {
+        if self.excluded {
+            0
+        } else {
+            ordinary_cap / 2
+        }
+    }
+}
+
 /// How many hosts back this node's outbound non-seed peers.
 ///
 /// Hosts are [`admission_host`](crate::zakura::handler)s, so peers on one IPv4
@@ -71,13 +100,9 @@ pub(super) struct PeerCoverage {
 }
 
 impl PeerCoverage {
-    /// Counts the hosts of the `outbound` peers outside `seeds` at `now`. A
-    /// peer whose IP isn't known counts as a host of its own.
-    pub(super) fn of(
-        outbound: &[OutboundPeer],
-        seeds: &HashSet<ZakuraPeerId>,
-        now: Instant,
-    ) -> Self {
+    /// Counts the hosts of the outbound non-seed `peers` at `now`. A peer
+    /// whose IP isn't known counts as a host of its own.
+    pub(super) fn of<'a>(peers: impl IntoIterator<Item = &'a OutboundPeer>, now: Instant) -> Self {
         #[derive(Clone, Copy, Eq, Hash, PartialEq)]
         enum Host<'a> {
             Ip(IpAddr),
@@ -85,10 +110,7 @@ impl PeerCoverage {
         }
         let mut hosts = HashSet::new();
         let mut settled = HashSet::new();
-        for peer in outbound
-            .iter()
-            .filter(|peer| !seeds.contains(&peer.peer_id))
-        {
+        for peer in peers {
             let host = peer.host.map_or(Host::Peer(&peer.peer_id), Host::Ip);
             if now.saturating_duration_since(peer.registered_at) >= ZAKURA_REDIAL_HEALTHY_CONNECTION
             {
@@ -119,6 +141,9 @@ impl PeerCoverage {
 #[derive(Debug)]
 struct Seed {
     node_addr: NodeAddr,
+    /// The ID a connection that proved the configured one registered under,
+    /// once the seed has added keys.
+    known_as: Option<NodeId>,
     /// The wait after this seed's next failed dial.
     backoff: Duration,
     /// No dial to this seed starts before this.
@@ -146,6 +171,7 @@ impl BootstrapPlan {
             .into_iter()
             .map(|node_addr| Seed {
                 node_addr,
+                known_as: None,
                 backoff: DEFAULT_ZAKURA_REDIAL_INITIAL_BACKOFF,
                 retry_at: now,
                 dialing: false,
@@ -158,6 +184,47 @@ impl BootstrapPlan {
     /// The seeds' configured node IDs, in plan order.
     pub(super) fn configured_ids(&self) -> impl Iterator<Item = NodeId> + '_ {
         self.seeds.iter().map(|seed| seed.node_addr.id)
+    }
+
+    /// Every ID seed `index` is known by, given `current(id)`, the ID a dial
+    /// to `id` answered with.
+    pub(super) fn ids_of(
+        &self,
+        index: usize,
+        current: impl Fn(NodeId) -> NodeId,
+    ) -> impl Iterator<Item = NodeId> {
+        let seed = &self.seeds[index];
+        let configured = seed.node_addr.id;
+        let answered = Some(current(configured)).filter(|id| *id != configured);
+        [Some(configured), answered, seed.known_as]
+            .into_iter()
+            .flatten()
+    }
+
+    /// Returns which seed each of the `outbound` peers is, if any. A peer is
+    /// seed `index` when it is registered under an ID that seed is known by,
+    /// or its handshake proved the seed's configured ID. In that last case
+    /// the plan remembers the ID it registered under.
+    pub(super) fn match_peers(
+        &mut self,
+        outbound: &[OutboundPeer],
+        current: impl Fn(NodeId) -> NodeId,
+    ) -> Vec<Option<usize>> {
+        outbound
+            .iter()
+            .map(|peer| {
+                let node_id = peer.peer_id.node_id()?;
+                let index = (0..self.seeds.len()).find(|&index| {
+                    peer.earlier.contains(&self.seeds[index].node_addr.id)
+                        || self.ids_of(index, &current).any(|id| id == node_id)
+                })?;
+                let seed = &mut self.seeds[index];
+                if node_id != seed.node_addr.id {
+                    seed.known_as = Some(node_id);
+                }
+                Some(index)
+            })
+            .collect()
     }
 
     /// Returns the seeds to dial at `now`, given this node's `coverage` and
@@ -241,12 +308,10 @@ impl BootstrapPlan {
 /// Runs the bootstrap dialer for `seeds` until the endpoint shuts down.
 ///
 /// Every [`BOOTSTRAP_CHECK_INTERVAL`], and whenever a seed dial ends, it
-/// reads this node's outbound peers, sets which seeds the candidate dialer
-/// skips, closes the seed connections once enough hosts have settled, and
-/// starts the dials [`BootstrapPlan::dials`] picks. Seeds are matched under
-/// the ID each answers with now as well as the configured one (zakura-quic
-/// TLS-7), and a seed found under a new ID gets the operator warning of
-/// [`super::dialer::warn_when_moved`].
+/// reads this node's outbound peers, sets the [`SeedDialPolicy`], closes the
+/// seed connections discovery opened once enough hosts have settled, and
+/// starts the dials [`BootstrapPlan::dials`] picks. A seed found under a new
+/// ID gets the operator warning of [`super::dialer::warn_when_moved`].
 pub(super) async fn run_bootstrap_dialer(
     endpoint: ZakuraEndpoint,
     seeds: Vec<NodeAddr>,
@@ -263,48 +328,51 @@ pub(super) async fn run_bootstrap_dialer(
     let mut dials = FuturesUnordered::new();
     loop {
         let now = Instant::now();
-        let current: Vec<NodeId> = plan
-            .configured_ids()
-            .map(|id| moved.borrow().current(id))
-            .collect();
-        let current_peers: Vec<ZakuraPeerId> = current
-            .iter()
-            .map(|id| ZakuraPeerId::from_node_id(*id))
-            .collect();
-        let seed_ids: HashSet<NodeId> = plan
-            .configured_ids()
-            .chain(current.iter().copied())
-            .collect();
-        let seed_peers: HashSet<ZakuraPeerId> = seed_ids
-            .iter()
-            .map(|id| ZakuraPeerId::from_node_id(*id))
-            .collect();
+        let current = |id: NodeId| moved.borrow().current(id);
         let outbound = supervisor.outbound_peers().await;
-        let coverage = PeerCoverage::of(&outbound, &seed_peers, now);
-
-        endpoint.set_excluded_seed_ids(if coverage.excludes_seeds() {
-            seed_ids
-        } else {
-            HashSet::new()
+        let matched = plan.match_peers(&outbound, current);
+        let coverage = PeerCoverage::of(
+            outbound
+                .iter()
+                .zip(&matched)
+                .filter(|(_, seed)| seed.is_none())
+                .map(|(peer, _)| peer),
+            now,
+        );
+        let seed_count = plan.configured_ids().count();
+        endpoint.set_seed_dial_policy(SeedDialPolicy {
+            ids: (0..seed_count)
+                .flat_map(|index| plan.ids_of(index, current))
+                .collect(),
+            excluded: coverage.excludes_seeds(),
         });
+
         if coverage.releases_seeds() {
             let held = endpoint.held_places();
-            for (index, peer_id) in current_peers.iter().enumerate() {
+            for (peer, index) in outbound.iter().zip(&matched) {
+                let Some(index) = *index else {
+                    continue;
+                };
                 // A seed the node prefers as a mining gateway keeps its place.
-                if !outbound.iter().any(|peer| &peer.peer_id == peer_id)
-                    || held.contains_bytes(peer_id.as_bytes())
-                {
+                let preferred = std::iter::once(peer.peer_id.as_bytes())
+                    .chain(peer.earlier.iter().map(|id| id.as_bytes().as_slice()))
+                    .any(|id| held.contains_bytes(id));
+                if peer.opener != ConnectionOpener::Discovery || preferred {
                     continue;
                 }
-                endpoint.cancel_upgrade_native_dial(peer_id);
-                if supervisor.disconnect_outbound_peer(peer_id).await {
+                if supervisor.disconnect_discovery_peer(&peer.peer_id).await {
                     plan.released(index);
                     metrics::counter!("zakura.p2p.bootstrap.released").increment(1);
                 }
             }
         }
-        let registered = |index: usize| supervisor.is_registered(&current_peers[index]);
-        for (index, node_addr) in plan.dials(coverage, registered, now) {
+        let registered: Vec<bool> = (0..seed_count)
+            .map(|index| {
+                plan.ids_of(index, current)
+                    .any(|id| supervisor.is_registered(&ZakuraPeerId::from_node_id(id)))
+            })
+            .collect();
+        for (index, node_addr) in plan.dials(coverage, |index| registered[index], now) {
             metrics::counter!("zakura.p2p.bootstrap.dial.started").increment(1);
             dials.push(seed_dial(
                 endpoint.clone(),

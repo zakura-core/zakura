@@ -577,8 +577,8 @@ fn bpv1_44_a_slow_verification_keeps_block_sync_off_the_body() {
     );
 }
 
-/// Mirror 0 withholds every part of a block it mines. BPv1 admits the block
-/// and claims its body. Its first repair round releases the claim
+/// The mirrors withhold every part of a block mirror 0 mines. BPv1 admits
+/// the block and claims its body. Its first repair round releases the claim
 /// (decision-22), and block sync fetches the body once and commits it. BPv1
 /// then rebuilds every part from the committed body while the parts are
 /// still withheld (bpv1-90): it holds the proposer's parts without receiving
@@ -587,7 +587,7 @@ fn bpv1_44_a_slow_verification_keeps_block_sync_off_the_body() {
 fn bpv1_57_90_withheld_parts_fall_back_to_block_sync_and_rebuild() {
     let seen = run_mesh(at_tip(), |director| async move {
         let mesh = &director.mesh;
-        mesh.hold(0, true);
+        mesh.hold_all(true);
         let withheld = director.mine().await;
         director.committed(withheld).await?;
         until(
@@ -613,7 +613,7 @@ fn bpv1_57_90_withheld_parts_fall_back_to_block_sync_and_rebuild() {
         if index == 0 {
             return Err("the proposer holds no part".to_owned());
         }
-        mesh.hold(0, false);
+        mesh.hold_all(false);
         let next = director.mine().await;
         director.committed(next).await
     });
@@ -641,7 +641,7 @@ fn bpv1_57_90_withheld_parts_fall_back_to_block_sync_and_rebuild() {
     assert_eq!(seen.tally.fetches(next.height), 0, "{summary}");
 }
 
-/// Mirror 0 withholds every part of a block past its reconstruction
+/// The mirrors withhold every part of a block past its reconstruction
 /// deadline. Block sync fetches the block after the first repair round
 /// releases the claim, but the node's verifier takes 20 s, so the block
 /// commits only after the deadline. BPv1 keeps it `Collecting` until the
@@ -657,7 +657,7 @@ fn bpv1_57_a_collecting_block_falls_back_by_its_deadline() {
     };
     let seen = run_mesh(scenario, |director| async move {
         let mesh = &director.mesh;
-        mesh.hold(0, true);
+        mesh.hold_all(true);
         let held = director.mine().await;
         until("BPv1 claims the body", Duration::from_secs(10), || {
             mesh.node.claims.is_claimed(held.hash, Instant::now())
@@ -687,7 +687,7 @@ fn bpv1_57_a_collecting_block_falls_back_by_its_deadline() {
             ));
         }
         director.committed(held).await?;
-        mesh.hold(0, false);
+        mesh.hold_all(false);
         let next = director.mine().await;
         director.committed(next).await
     });
@@ -715,7 +715,7 @@ fn bpv1_57_a_collecting_block_falls_back_by_its_deadline() {
     assert_eq!(seen.tally.fetches(next.height), 0, "{summary}");
 }
 
-/// Mirror 0 withholds a block's parts until the first repair round
+/// The mirrors withhold a block's parts until the first repair round
 /// releases the body claim and block sync fetches the body, then sends
 /// them. BPv1 and block sync both deliver the block, and the first
 /// submission wins: the node verifies the block once, commits it once, and
@@ -724,7 +724,7 @@ fn bpv1_57_a_collecting_block_falls_back_by_its_deadline() {
 fn bpv1_57_a_repair_round_race_commits_once() {
     let seen = run_mesh(at_tip(), |director| async move {
         let mesh = &director.mesh;
-        mesh.hold(0, true);
+        mesh.hold_all(true);
         let raced = director.mine().await;
         until("BPv1 claims the body", Duration::from_secs(10), || {
             mesh.node.claims.is_claimed(raced.hash, Instant::now())
@@ -742,7 +742,7 @@ fn bpv1_57_a_repair_round_race_commits_once() {
             || mesh.state.tally().fetches(raced.height) > 0,
         )
         .await?;
-        mesh.hold(0, false);
+        mesh.hold_all(false);
         director.committed(raced).await
     });
     let summary = summary(&seen);

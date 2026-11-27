@@ -597,6 +597,15 @@ impl Mesh {
         self.holds[index].send_replace(held);
     }
 
+    /// Holds, or releases, every BPv1 data frame from every mirror to the
+    /// node. A mirror that commits a block rebuilds and serves its parts
+    /// (bpv1-90), so withholding a block's parts takes every mirror.
+    pub fn hold_all(&self, held: bool) {
+        for hold in &self.holds {
+            hold.send_replace(held);
+        }
+    }
+
     /// Mines the next tip block on mirror 0: a v6 coinbase that commits to
     /// the block's BPv1 encoding, and one transaction tagged by its height.
     /// Mirror 0 publishes it over BPv1, then every mirror commits it.

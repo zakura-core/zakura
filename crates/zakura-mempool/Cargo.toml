@@ -22,7 +22,7 @@ proptest-impl = ["proptest", "proptest-derive"]
 zakura-chain = { path = "../zakura-chain", version = "17.0.0" }
 zakura-node-services = { path = "../zakura-node-services", version = "6.0.0" }
 zakura-rt = { path = "../zakura-rt", version = "0.4.0" }
-zakura-script = { path = "../zakura-script", version = "5.0.9" }
+zakura-script = { path = "../zakura-script", version = "6.0.0" }
 zcash_script = { workspace = true }
 
 chrono = { workspace = true }

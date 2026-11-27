@@ -169,9 +169,9 @@ pub(crate) fn frame_payload_bounds(
 
 const LEGACY_GOSSIP_INBOUND_QUEUE: usize = 256;
 const LEGACY_GOSSIP_DECODED_SLOTS: usize = 8;
-/// The share of [`LEGACY_GOSSIP_DECODED_SLOTS`] one gossip session may hold, so a
-/// single peer cannot keep every other peer's gossip out.
-const LEGACY_GOSSIP_SESSION_DECODED_SLOTS: usize = 2;
+/// The share of [`LEGACY_GOSSIP_DECODED_SLOTS`] one peer may hold across all of its
+/// gossip sessions, so a single peer cannot keep every other peer's gossip out.
+const LEGACY_GOSSIP_PEER_DECODED_SLOTS: usize = 2;
 const LEGACY_REQUEST_IN_FLIGHT_LIMIT: usize = 64;
 /// Decoded compatibility work that the inbound queue and its handlers may retain,
 /// until each handler hands its payload to the inbound service.
@@ -3089,6 +3089,8 @@ impl LegacyGossipForwarder {
 pub struct LegacyGossipSink {
     inbound_tx: mpsc::Sender<LegacyInboundWork>,
     gossip_slots: Arc<Semaphore>,
+    /// Each peer's decoded-gossip slot pool, by peer. See `peer_gossip_slots`.
+    peer_gossip_slots: StdMutex<HashMap<ZakuraPeerId, std::sync::Weak<Semaphore>>>,
     inbound_budget: InboundBudget,
     outbound: LegacyGossipOutbound,
     switch: TxRelaySwitch,
@@ -3131,6 +3133,7 @@ impl LegacyGossipSink {
         Self {
             inbound_tx,
             gossip_slots: Arc::new(Semaphore::new(LEGACY_GOSSIP_DECODED_SLOTS)),
+            peer_gossip_slots: StdMutex::default(),
             inbound_budget: InboundBudget::new(LEGACY_INBOUND_RETAINED_BYTES),
             outbound,
             switch: TxRelaySwitch::for_supervisor(&supervisor),
@@ -3140,21 +3143,38 @@ impl LegacyGossipSink {
 }
 
 impl LegacyGossipSink {
+    /// `peer`'s share of the node's decoded-gossip slots. All of the peer's
+    /// sessions draw on one pool while any session or queued item holds it,
+    /// so reopening the gossip stream can't add slots.
+    fn peer_gossip_slots(&self, peer: &ZakuraPeerId) -> Arc<Semaphore> {
+        let mut pools = self
+            .peer_gossip_slots
+            .lock()
+            .expect("the peer gossip slot mutex is never held across a panic");
+        pools.retain(|_, pool| pool.strong_count() > 0);
+        if let Some(pool) = pools.get(peer).and_then(std::sync::Weak::upgrade) {
+            return pool;
+        }
+        let pool = Arc::new(Semaphore::new(LEGACY_GOSSIP_PEER_DECODED_SLOTS));
+        pools.insert(peer.clone(), Arc::downgrade(&pool));
+        pool
+    }
+
     /// Decodes a gossip frame from `peer_id` and queues it for the worker.
-    /// A frame is dropped before decoding when its session's `session_slots`
-    /// or the node's `gossip_slots` are all held. A frame over the
-    /// retained-byte budget or the queue is dropped, and a transaction advert
-    /// from a peer `switch` leaves to `tx-relay` is dropped with no penalty.
+    /// A frame is dropped before decoding when the peer's `peer_slots` or the
+    /// node's `gossip_slots` are all held. A frame over the retained-byte
+    /// budget or the queue is dropped, and a transaction advert from a peer
+    /// `switch` leaves to `tx-relay` is dropped with no penalty.
     fn enqueue_gossip_frame(
         inbound_tx: &mpsc::Sender<LegacyInboundWork>,
         gossip_slots: &Arc<Semaphore>,
-        session_slots: &Arc<Semaphore>,
+        peer_slots: &Arc<Semaphore>,
         inbound_budget: &InboundBudget,
         switch: &TxRelaySwitch,
         peer_id: ZakuraPeerId,
         frame: Frame,
     ) -> Result<(), SinkReject> {
-        let Ok(session_admission) = session_slots.clone().try_acquire_owned() else {
+        let Ok(peer_admission) = peer_slots.clone().try_acquire_owned() else {
             return Ok(());
         };
         let Ok(admission) = gossip_slots.clone().try_acquire_owned() else {
@@ -3182,7 +3202,7 @@ impl LegacyGossipSink {
         match inbound_tx.try_send(LegacyInboundWork::Gossip(LegacyGossipInbound {
             peer_id,
             frame,
-            _admission: (session_admission, admission),
+            _admission: (peer_admission, admission),
             _charge: charge,
         })) {
             Ok(()) => Ok(()),
@@ -3207,11 +3227,10 @@ impl LegacyGossipSink {
             return Ok(());
         }
 
-        // A delivered frame has no session of its own, so it meets only the node limit.
         Self::enqueue_gossip_frame(
             &self.inbound_tx,
             &self.gossip_slots,
-            &Arc::new(Semaphore::new(1)),
+            &self.peer_gossip_slots(&peer_id),
             &self.inbound_budget,
             &self.switch,
             peer_id,
@@ -3364,6 +3383,7 @@ impl ZakuraService for LegacyGossipSink {
         let inbound_budget = self.inbound_budget.clone();
         let switch = self.switch.clone();
         let peer_id = peer.id.clone();
+        let peer_slots = self.peer_gossip_slots(&peer_id);
         let conn_id = peer.conn_id;
         let cancel_token = peer.cancel_token();
         let session = LegacyGossipPeerSession::new(peer_id.clone(), conn_id, session_id, send);
@@ -3419,7 +3439,6 @@ impl ZakuraService for LegacyGossipSink {
             },
             async move {
                 let mut received_frame = false;
-                let session_slots = Arc::new(Semaphore::new(LEGACY_GOSSIP_SESSION_DECODED_SLOTS));
                 loop {
                     let frame = tokio::select! {
                         _ = cancel_token.cancelled() => {
@@ -3451,7 +3470,7 @@ impl ZakuraService for LegacyGossipSink {
                     match Self::enqueue_gossip_frame(
                         &inbound_tx,
                         &gossip_slots,
-                        &session_slots,
+                        &peer_slots,
                         &inbound_budget,
                         &switch,
                         peer_id.clone(),
@@ -3529,7 +3548,7 @@ enum LegacyInboundWork {
 
 #[derive(Debug)]
 struct LegacyGossipInbound {
-    /// The sending session's and the node's decoded-gossip slots, held until
+    /// The sending peer's and the node's decoded-gossip slots, held until
     /// this item's handler ends.
     _admission: (OwnedSemaphorePermit, OwnedSemaphorePermit),
     peer_id: ZakuraPeerId,
@@ -4349,6 +4368,7 @@ mod tests {
         LegacyGossipSink {
             inbound_tx,
             gossip_slots: Arc::new(Semaphore::new(LEGACY_GOSSIP_DECODED_SLOTS)),
+            peer_gossip_slots: StdMutex::default(),
             inbound_budget: InboundBudget::new(LEGACY_INBOUND_RETAINED_BYTES),
             outbound,
             switch: TxRelaySwitch::default(),
@@ -8746,7 +8766,9 @@ mod tests {
         );
         let responder = hostile.respond_to_next_request_with(|request_id| {
             let mut frames = Vec::new();
-            for _ in 0..=LEGACY_RESPONSE_MAX_FRAMES {
+            // More frames than a one-block request allows at default caps: eight
+            // chunks for the largest item, plus one.
+            for _ in 0..16 {
                 let mut payload = Vec::new();
                 payload.extend_from_slice(&request_id.to_le_bytes());
                 payload.extend_from_slice(&encoded_count(0));
@@ -9321,14 +9343,15 @@ mod tests {
             .iter()
             .all(|frame| frame.payload.capacity() == RESPONSE_CHUNK_HEADER_BYTES + 1));
     }
-    /// Decoded gossip holds at most its session's share of the node's slots and
-    /// the node's eight, each until its item's handler ends, so neither one peer
-    /// nor all gossip together can fill the queue it shares with requests.
+    /// Decoded gossip holds at most its peer's share of the node's slots, over
+    /// every session of that peer, and the node's eight, each until its item's
+    /// handler ends. So neither one peer nor all gossip together can fill the
+    /// queue it shares with requests.
     #[test]
     fn decoded_gossip_keeps_request_queue_capacity() -> Result<(), BoxError> {
         let (tx, mut rx) = mpsc::channel(LEGACY_GOSSIP_INBOUND_QUEUE);
-        let slots = Arc::new(Semaphore::new(LEGACY_GOSSIP_DECODED_SLOTS));
-        let peer = ZakuraPeerId::new(vec![1; 32])?;
+        let sink = test_sink(tx.clone(), LegacyGossipOutbound::default());
+        let peer = |byte: u8| ZakuraPeerId::new(vec![byte; 32]);
         let frame = LegacyGossipFrame::AdvertiseTransactionIds(vec![
             legacy_tx_id(1);
             usize::try_from(
@@ -9336,49 +9359,37 @@ mod tests {
             )?
         ])
         .encode_frame()?;
-        let budget = InboundBudget::new(LEGACY_INBOUND_RETAINED_BYTES);
-        // Each session floods the queue with as many adverts as it holds.
-        let flood_from = |session: &Arc<Semaphore>| -> Result<(), BoxError> {
+        // Each peer floods the queue with as many adverts as get in.
+        let flood_from = |byte: u8| -> Result<(), BoxError> {
             for _ in 0..LEGACY_GOSSIP_INBOUND_QUEUE {
-                LegacyGossipSink::enqueue_gossip_frame(
-                    &tx,
-                    &slots,
-                    session,
-                    &budget,
-                    &TxRelaySwitch::default(),
-                    peer.clone(),
-                    frame.clone(),
-                )?;
+                sink.deliver(peer(byte)?, ZAKURA_STREAM_GOSSIP, frame.clone())?;
             }
             Ok(())
         };
-        // One session more than the node's slots fit at each session's share.
-        let sessions: Vec<_> = (0..=LEGACY_GOSSIP_DECODED_SLOTS
-            / LEGACY_GOSSIP_SESSION_DECODED_SLOTS)
-            .map(|_| Arc::new(Semaphore::new(LEGACY_GOSSIP_SESSION_DECODED_SLOTS)))
-            .collect();
-        flood_from(&sessions[0])?;
+        flood_from(1)?;
         assert_eq!(
             rx.len(),
-            LEGACY_GOSSIP_SESSION_DECODED_SLOTS,
-            "one session takes only its share of the node's slots"
+            LEGACY_GOSSIP_PEER_DECODED_SLOTS,
+            "one peer takes only its share of the node's slots"
         );
-        for session in &sessions[1..] {
-            flood_from(session)?;
+        assert_eq!(
+            sink.peer_gossip_slots(&peer(1)?).available_permits(),
+            0,
+            "a reopened session draws on its peer's held pool"
+        );
+        // One peer more than the node's slots fit at each peer's share.
+        let peers = u8::try_from(LEGACY_GOSSIP_DECODED_SLOTS / LEGACY_GOSSIP_PEER_DECODED_SLOTS)?;
+        for byte in 2..=peers + 1 {
+            flood_from(byte)?;
         }
         assert_eq!(rx.len(), LEGACY_GOSSIP_DECODED_SLOTS);
+        let slots = &sink.gossip_slots;
         assert_eq!(slots.available_permits(), 0);
-        let refused = sessions.last().expect("the test makes sessions");
-        assert_eq!(
-            refused.available_permits(),
-            LEGACY_GOSSIP_SESSION_DECODED_SLOTS,
-            "a frame the node refuses gives its session slot back"
-        );
         let running = rx.try_recv()?;
         assert_eq!(slots.available_permits(), 0);
         let (response_tx, _) = oneshot::channel();
         tx.try_send(LegacyInboundWork::Request(LegacyRequestInbound {
-            peer_id: peer,
+            peer_id: peer(1)?,
             request_id: 1,
             frame: LegacyRequestFrame::Ping,
             response_tx,

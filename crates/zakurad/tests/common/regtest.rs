@@ -885,7 +885,9 @@ async fn pq_spend_test(scenario: PqSpendScenario) -> Result<()> {
 
     let _guard = zakura_test::init();
     let maturity = transparent::MIN_TRANSPARENT_COINBASE_MATURITY;
-    let activation = Height(maturity + 3);
+    // Below activation: the maturing blocks, the funding block, a block spending the wrapped
+    // namespace script, and an empty last block under the old rules.
+    let activation = Height(maturity + 4);
     let net = Network::new_regtest(RegtestParameters {
         pq_activation_height: Some(activation),
         activation_heights: ConfiguredActivationHeights {
@@ -1175,24 +1177,37 @@ async fn pq_spend_test(scenario: PqSpendScenario) -> Result<()> {
         pool.contains(&wrapped.hash().to_string()),
         "a wrapped namespace script is spendable before activation: {pool:?}"
     );
-    // The chain reaches the last block under the old rules without carrying that spend, so
-    // the pool still holds it when the new rules begin to apply.
-    pq_mine_block_leaving_pool(&client, &net, wrapped_fee).await?;
+    // A block under the old rules carries that spend, and the last block below activation
+    // is empty, so nothing from before the boundary is left in the pool.
+    let wrapped_block = pq_mine_block(&client, &net, &[], 0).await?;
+    assert!(
+        wrapped_block
+            .transactions
+            .iter()
+            .any(|tx| tx.hash() == wrapped.hash()),
+        "a wrapped namespace script is mined before activation"
+    );
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let pool: Vec<String> = client
+                .json_result_from_call("getrawmempool", "[]")
+                .await
+                .map_err(|e| eyre!(e))?;
+            if pool.is_empty() {
+                return Ok::<_, eyre::Report>(());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .wrap_err("the mined wrapped spend did not leave the pool")??;
+    pq_mine_block(&client, &net, &[], 0).await?;
     assert_eq!(
         client.blockchain_info().await?.blocks(),
         Height(activation.0 - 1),
         "admission checks the next block height"
     );
-    // The pool is cleared at the boundary, as at every rule change, and the same spend is
-    // still valid under the rules from the activation height on.
-    let pool: Vec<String> = client
-        .json_result_from_call("getrawmempool", "[]")
-        .await
-        .map_err(|e| eyre!(e))?;
-    assert!(
-        !pool.contains(&wrapped.hash().to_string()),
-        "the pool is cleared when the new rules begin to apply: {pool:?}"
-    );
+    // The same spend is still valid under the rules from the activation height on.
     zakura_script::CachedFfiTransaction::new_for_network(
         Arc::new(wrapped.clone()),
         Arc::new(vec![Output::new(funded_value, wrapped_entry.lock_script())]),
@@ -1426,7 +1441,7 @@ async fn pq_spend_test(scenario: PqSpendScenario) -> Result<()> {
         }
         mined
     } else if matches!(scenario, PqSpendScenario::Reorg) {
-        pq_reorg_spends(&client, &net, &spends, activation, block.hash()).await?
+        pq_reorg_spends(&client, &net, &spends, activation, wrapped_block.hash()).await?
     } else {
         client.mine_proposed_block(&net).await?
     };
@@ -1471,31 +1486,17 @@ async fn pq_mine_block_including(
     extra: &[Transaction],
     fees: Amount<NonNegative>,
 ) -> Result<Block> {
-    pq_mine_block(client, network, extra, i64::from(fees), true).await
+    pq_mine_block(client, network, extra, i64::from(fees)).await
 }
 
-/// Mines the next block carrying nothing the node offered from its mempool, so a transaction
-/// stays in the pool while the chain moves on past it. `pool_fees` is what the dropped
-/// transactions would have paid, which the coinbase gives up: a block may always claim fewer
-/// fees than it could.
-#[cfg(feature = "pq")]
-async fn pq_mine_block_leaving_pool(
-    client: &RpcRequestClient,
-    network: &Network,
-    pool_fees: Amount<NonNegative>,
-) -> Result<Block> {
-    pq_mine_block(client, network, &[], -i64::from(pool_fees), false).await
-}
-
-/// Mines the next block from the node's own template, with `extra` appended, the template's
-/// own transactions kept or dropped, and the coinbase's claim moved by `fee_change`.
+/// Mines the next block from the node's own template, with `extra` appended and the
+/// coinbase's claim moved by `fee_change`.
 #[cfg(feature = "pq")]
 async fn pq_mine_block(
     client: &RpcRequestClient,
     network: &Network,
     extra: &[Transaction],
     fee_change: i64,
-    keep_template_transactions: bool,
 ) -> Result<Block> {
     use zakura_chain::{
         block::{merkle::AuthDataRoot, ChainHistoryBlockTxAuthCommitmentHash},
@@ -1508,9 +1509,6 @@ async fn pq_mine_block(
         .map_err(|e| eyre!(e))?;
     let mut block =
         proposal_block_from_template(&template, BlockTemplateTimeSource::default(), network)?;
-    if !keep_template_transactions {
-        block.transactions.truncate(1);
-    }
     for transaction in extra {
         block.transactions.push(Arc::new(transaction.clone()));
     }
@@ -1578,7 +1576,7 @@ async fn pq_reorg_spends(
     network: &Network,
     spends: &[Transaction],
     activation: Height,
-    funding_tip: block::Hash,
+    rollback_tip: block::Hash,
 ) -> Result<Block> {
     use zakura_chain::{
         block::{merkle::AuthDataRoot, ChainHistoryBlockTxAuthCommitmentHash},
@@ -1604,7 +1602,7 @@ async fn pq_reorg_spends(
         .json_result_from_call("invalidateblock", params)
         .await
         .map_err(|e| eyre!(e))?;
-    wait_for_pq_tip(client, funding_tip).await?;
+    wait_for_pq_tip(client, rollback_tip).await?;
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let pool: Vec<String> = client

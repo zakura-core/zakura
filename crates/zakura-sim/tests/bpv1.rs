@@ -579,9 +579,10 @@ fn bpv1_44_a_slow_verification_keeps_block_sync_off_the_body() {
 
 /// Mirror 0 withholds every part of a block it mines. BPv1 admits the block
 /// and claims its body. Its first repair round releases the claim
-/// (decision-22), and block sync fetches the body once and commits it. When
-/// the parts arrive later, BPv1's copy is a duplicate the node doesn't
-/// verify again. The next block commits through BPv1.
+/// (decision-22), and block sync fetches the body once and commits it. BPv1
+/// then retires the block it was still collecting (bpv1-57), so it never
+/// submits it, even once the parts arrive. The next block commits through
+/// BPv1.
 #[test]
 fn bpv1_57_withheld_parts_fall_back_to_block_sync() {
     let seen = run_mesh(at_tip(), |director| async move {
@@ -604,11 +605,13 @@ fn bpv1_57_withheld_parts_fall_back_to_block_sync() {
     );
     assert_eq!(
         answers(&seen, withheld.hash),
-        [
-            (Via::BlockSync, Answer::Committed),
-            (Via::Bpv1, Answer::Duplicate)
-        ],
-        "block sync commits the withheld block, and BPv1's late copy is a duplicate\n{summary}"
+        [(Via::BlockSync, Answer::Committed)],
+        "block sync commits the withheld block, and BPv1 never submits it\n{summary}"
+    );
+    assert_eq!(
+        seen.phases[0],
+        Some(BlockPhase::Retired),
+        "BPv1 retires the committed block\n{summary}"
     );
     assert_eq!(seen.tally.fetches(withheld.height), 1, "{summary}");
     assert_eq!(
@@ -620,13 +623,19 @@ fn bpv1_57_withheld_parts_fall_back_to_block_sync() {
 }
 
 /// Mirror 0 withholds every part of a block past its reconstruction
-/// deadline. Block sync commits the block after the first repair round
-/// releases the claim, but BPv1 keeps it `Collecting` until the deadline
-/// moves it to `Fallback` (bpv1-57). When the hold lifts, BPv1 drops the late
-/// parts and never submits the block. The next block commits through BPv1.
+/// deadline. Block sync fetches the block after the first repair round
+/// releases the claim, but the node's verifier takes 20 s, so the block
+/// commits only after the deadline. BPv1 keeps it `Collecting` until the
+/// deadline moves it to `Fallback` (bpv1-57), then retires it once block sync
+/// commits it. When the hold lifts, BPv1 drops the late parts and never
+/// submits the block. The next block commits through BPv1.
 #[test]
 fn bpv1_57_a_collecting_block_falls_back_by_its_deadline() {
-    let seen = run_mesh(at_tip(), |director| async move {
+    let scenario = MeshScenario {
+        verify_delay: Duration::from_secs(20),
+        ..at_tip()
+    };
+    let seen = run_mesh(scenario, |director| async move {
         let mesh = &director.mesh;
         mesh.hold(0, true);
         let held = director.mine().await;
@@ -641,7 +650,6 @@ fn bpv1_57_a_collecting_block_falls_back_by_its_deadline() {
             .claims
             .next_expiry()
             .expect("BPv1 claims the body");
-        director.committed(held).await?;
         time::sleep_until(deadline - POLL).await;
         let before = mesh.phase(held.hash);
         if before != Some(BlockPhase::Collecting) {
@@ -658,6 +666,7 @@ fn bpv1_57_a_collecting_block_falls_back_by_its_deadline() {
                 held.height.0
             ));
         }
+        director.committed(held).await?;
         mesh.hold(0, false);
         let next = director.mine().await;
         director.committed(next).await
@@ -675,8 +684,8 @@ fn bpv1_57_a_collecting_block_falls_back_by_its_deadline() {
     assert_eq!(seen.tally.fetches(held.height), 1, "{summary}");
     assert_eq!(
         seen.phases[0],
-        Some(BlockPhase::Fallback),
-        "the held block stays in Fallback\n{summary}"
+        Some(BlockPhase::Retired),
+        "BPv1 retires the held block once block sync commits it\n{summary}"
     );
     assert_eq!(
         seen.tally.committed.get(&next.hash),

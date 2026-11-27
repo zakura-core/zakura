@@ -391,13 +391,10 @@ independently.
   connection's peer proved in its handshake, in both directions, and
   `MAX_EARLIER_NODE_IDS`
   ([#2766](https://github.com/zakura-core/zakura/pull/2766)).
-- A v2 discovery record may now be up to 8,649 bytes, where the limit was
-  753. The extra room is reserved for a post-quantum record signature and
-  its public key, which a later release can add without a break. This
-  release signs records with Ed25519 alone and does not use the room. The
-  discovery requester checks the reply length against its query before reading
-  the payload. Each admitted v2 connection budgets 584,304 more bytes. The default
-  `network.zakura.peer_memory_budget_bytes` still funds the default
+- V2 discovery records allow room for a post-quantum signature and its public
+  key. The discovery requester checks the reply length against its query before
+  reading the payload. Each admitted v2 connection budgets 584,304 more bytes.
+  The default `network.zakura.peer_memory_budget_bytes` still funds the default
   connection count. A custom budget can now fund several fewer connections.
   If it funds fewer than the minimum, the node refuses to start. Raise the
   budget or reduce the configured QUIC windows or handshake headroom
@@ -422,6 +419,21 @@ independently.
   to 1,089, keeps `MAX_CREDENTIAL_BYTES` at 10,385 as a limit on the whole
   credential, and adds `CredentialError::TooLong` for a credential above
   it ([#2770](https://github.com/zakura-core/zakura/pull/2770)).
+- A v2 discovery record is now signed with the node's ML-DSA-65 key as well
+  as its Ed25519 key, and a node refuses a record without both signatures.
+  The record carries the ML-DSA-65 public key and signature in its
+  extension area, so a default node's record grows from 361 to 5,630 bytes
+  and the outgoing `Peers` budget rises to 67,562 bytes, enough for 12
+  signed records of that size. A native discovery stream sends the full
+  `Hello` on connection and when the signed record changes. Peer queries slow
+  from 15 to 60 seconds while the node meets its ordinary connection target
+  and has at least two dialable spares. Live-service queries continue every
+  15 seconds. Discovery-only connections allow up to eight seconds for the
+  dialer to import the reply, and close early when the exchange finishes.
+  A node running this release rejects an Ed25519-only discovery record
+  from an earlier `p2p-v2/5` build and disconnects, so upgrade a fleet
+  in one pass
+  ([#2772](https://github.com/zakura-core/zakura/pull/2772)).
 
 ### Removed
 
@@ -431,6 +443,9 @@ independently.
 
 ### Fixed
 
+- Restoring the discovery peer book at startup preserves a newer live
+  sighting of the same peer record
+  ([#2772](https://github.com/zakura-core/zakura/pull/2772)).
 - Count inbound TLS attempts and control handshakes against one pending budget,
   so outbound dials cannot exceed the limit while inbound TLS attempts remain
   pending ([#2337](https://github.com/zakura-core/zakura/pull/2337)).

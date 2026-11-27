@@ -51,22 +51,22 @@ notes = "These dependencies are behind `cfg(hax)` or `cfg(valgrind_ct_test)`, wh
 [policy.zakura]
 audit-as-crates-io = false
 
-[policy."zakura-address:5.3.0@git:be9570590963dfc331bc08a5c9ecfdf9f7fcdcbe"]
+[policy."zakura-address:5.4.0@git:0add9e8147cf80c1cce9caa37ff04b20b1680a03"]
 audit-as-crates-io = false
 
-[policy."zakura-bellman:5.3.0@git:be9570590963dfc331bc08a5c9ecfdf9f7fcdcbe"]
+[policy."zakura-bellman:5.4.0@git:0add9e8147cf80c1cce9caa37ff04b20b1680a03"]
 audit-as-crates-io = false
 
-[policy."zakura-bento-core:0.1.0@git:be9570590963dfc331bc08a5c9ecfdf9f7fcdcbe"]
+[policy."zakura-bento-core:0.1.0@git:0add9e8147cf80c1cce9caa37ff04b20b1680a03"]
 audit-as-crates-io = false
 
-[policy."zakura-bento-macros:0.1.0@git:be9570590963dfc331bc08a5c9ecfdf9f7fcdcbe"]
+[policy."zakura-bento-macros:0.1.0@git:0add9e8147cf80c1cce9caa37ff04b20b1680a03"]
 audit-as-crates-io = false
 
-[policy."zakura-bento:0.1.0@git:be9570590963dfc331bc08a5c9ecfdf9f7fcdcbe"]
+[policy."zakura-bento:0.1.0@git:0add9e8147cf80c1cce9caa37ff04b20b1680a03"]
 audit-as-crates-io = false
 
-[policy."zakura-bls12-381:5.3.0@git:be9570590963dfc331bc08a5c9ecfdf9f7fcdcbe"]
+[policy."zakura-bls12-381:5.4.0@git:0add9e8147cf80c1cce9caa37ff04b20b1680a03"]
 audit-as-crates-io = false
 
 [policy.zakura-chain]
@@ -75,16 +75,16 @@ audit-as-crates-io = false
 [policy.zakura-consensus]
 audit-as-crates-io = false
 
-[policy."zakura-equihash:5.3.0@git:be9570590963dfc331bc08a5c9ecfdf9f7fcdcbe"]
+[policy."zakura-equihash:5.4.0@git:0add9e8147cf80c1cce9caa37ff04b20b1680a03"]
 audit-as-crates-io = false
 
-[policy."zakura-halo2-gadgets:5.3.0@git:be9570590963dfc331bc08a5c9ecfdf9f7fcdcbe"]
+[policy."zakura-halo2-gadgets:5.4.0@git:0add9e8147cf80c1cce9caa37ff04b20b1680a03"]
 audit-as-crates-io = false
 
-[policy."zakura-halo2-poseidon:5.3.0@git:be9570590963dfc331bc08a5c9ecfdf9f7fcdcbe"]
+[policy."zakura-halo2-poseidon:5.4.0@git:0add9e8147cf80c1cce9caa37ff04b20b1680a03"]
 audit-as-crates-io = false
 
-[policy."zakura-halo2-proofs:5.3.0@git:be9570590963dfc331bc08a5c9ecfdf9f7fcdcbe"]
+[policy."zakura-halo2-proofs:5.4.0@git:0add9e8147cf80c1cce9caa37ff04b20b1680a03"]
 audit-as-crates-io = false
 
 [policy.zakura-header-chain]
@@ -93,7 +93,7 @@ audit-as-crates-io = false
 [policy.zakura-jsonl-trace]
 audit-as-crates-io = false
 
-[policy."zakura-jubjub:5.3.0@git:be9570590963dfc331bc08a5c9ecfdf9f7fcdcbe"]
+[policy."zakura-jubjub:5.4.0@git:0add9e8147cf80c1cce9caa37ff04b20b1680a03"]
 audit-as-crates-io = false
 
 [policy.zakura-mempool]
@@ -108,34 +108,34 @@ audit-as-crates-io = false
 [policy.zakura-node-services]
 audit-as-crates-io = false
 
-[policy."zakura-note-encryption:5.3.0@git:be9570590963dfc331bc08a5c9ecfdf9f7fcdcbe"]
+[policy."zakura-note-encryption:5.4.0@git:0add9e8147cf80c1cce9caa37ff04b20b1680a03"]
 audit-as-crates-io = false
 
-[policy."zakura-orchard-legacy:5.3.0@git:be9570590963dfc331bc08a5c9ecfdf9f7fcdcbe"]
+[policy."zakura-orchard-legacy:5.4.0@git:0add9e8147cf80c1cce9caa37ff04b20b1680a03"]
 audit-as-crates-io = false
 
-[policy."zakura-orchard:5.3.0@git:be9570590963dfc331bc08a5c9ecfdf9f7fcdcbe"]
+[policy."zakura-orchard:5.4.0@git:0add9e8147cf80c1cce9caa37ff04b20b1680a03"]
 audit-as-crates-io = false
 
-[policy."zakura-pairing:5.3.0@git:be9570590963dfc331bc08a5c9ecfdf9f7fcdcbe"]
+[policy."zakura-pairing:5.4.0@git:0add9e8147cf80c1cce9caa37ff04b20b1680a03"]
 audit-as-crates-io = false
 
-[policy."zakura-pasta-curves:5.3.0@git:be9570590963dfc331bc08a5c9ecfdf9f7fcdcbe"]
+[policy."zakura-pasta-curves:5.4.0@git:0add9e8147cf80c1cce9caa37ff04b20b1680a03"]
 audit-as-crates-io = false
 
-[policy."zakura-primitives:5.3.0@git:be9570590963dfc331bc08a5c9ecfdf9f7fcdcbe"]
+[policy."zakura-primitives:5.4.0@git:0add9e8147cf80c1cce9caa37ff04b20b1680a03"]
 audit-as-crates-io = false
 
-[policy."zakura-protocol:5.3.0@git:be9570590963dfc331bc08a5c9ecfdf9f7fcdcbe"]
+[policy."zakura-protocol:5.4.0@git:0add9e8147cf80c1cce9caa37ff04b20b1680a03"]
 audit-as-crates-io = false
 
 [policy.zakura-quic]
 audit-as-crates-io = false
 
-[policy."zakura-reddsa:5.3.0@git:be9570590963dfc331bc08a5c9ecfdf9f7fcdcbe"]
+[policy."zakura-reddsa:5.4.0@git:0add9e8147cf80c1cce9caa37ff04b20b1680a03"]
 audit-as-crates-io = false
 
-[policy."zakura-redjubjub:5.3.0@git:be9570590963dfc331bc08a5c9ecfdf9f7fcdcbe"]
+[policy."zakura-redjubjub:5.4.0@git:0add9e8147cf80c1cce9caa37ff04b20b1680a03"]
 audit-as-crates-io = false
 
 [policy.zakura-rpc]
@@ -144,7 +144,7 @@ audit-as-crates-io = false
 [policy.zakura-rt]
 audit-as-crates-io = false
 
-[policy."zakura-sapling-crypto:5.3.0@git:be9570590963dfc331bc08a5c9ecfdf9f7fcdcbe"]
+[policy."zakura-sapling-crypto:5.4.0@git:0add9e8147cf80c1cce9caa37ff04b20b1680a03"]
 audit-as-crates-io = false
 
 [policy.zakura-scheduler]
@@ -153,22 +153,22 @@ criteria = "safe-to-run"
 [policy.zakura-script]
 audit-as-crates-io = false
 
-[policy."zakura-sensei-artifacts:0.1.0@git:be9570590963dfc331bc08a5c9ecfdf9f7fcdcbe"]
+[policy."zakura-sensei-artifacts:0.2.0@git:0add9e8147cf80c1cce9caa37ff04b20b1680a03"]
 audit-as-crates-io = false
 
-[policy."zakura-sensei-macros:0.1.0@git:be9570590963dfc331bc08a5c9ecfdf9f7fcdcbe"]
+[policy."zakura-sensei-macros:0.1.1@git:0add9e8147cf80c1cce9caa37ff04b20b1680a03"]
 audit-as-crates-io = false
 
-[policy."zakura-sensei-shared:0.1.0@git:be9570590963dfc331bc08a5c9ecfdf9f7fcdcbe"]
+[policy."zakura-sensei-shared:0.2.0@git:0add9e8147cf80c1cce9caa37ff04b20b1680a03"]
 audit-as-crates-io = false
 
-[policy."zakura-sensei:0.1.1@git:be9570590963dfc331bc08a5c9ecfdf9f7fcdcbe"]
+[policy."zakura-sensei:0.1.3@git:0add9e8147cf80c1cce9caa37ff04b20b1680a03"]
 audit-as-crates-io = false
 
 [policy.zakura-sim]
 criteria = "safe-to-run"
 
-[policy."zakura-sinsemilla:5.3.0@git:be9570590963dfc331bc08a5c9ecfdf9f7fcdcbe"]
+[policy."zakura-sinsemilla:5.4.0@git:0add9e8147cf80c1cce9caa37ff04b20b1680a03"]
 audit-as-crates-io = false
 
 [policy.zakura-state]
@@ -177,16 +177,16 @@ audit-as-crates-io = false
 [policy.zakura-test]
 audit-as-crates-io = false
 
-[policy."zakura-transparent:5.3.0@git:be9570590963dfc331bc08a5c9ecfdf9f7fcdcbe"]
+[policy."zakura-transparent:5.4.0@git:0add9e8147cf80c1cce9caa37ff04b20b1680a03"]
 audit-as-crates-io = false
 
-[policy."zakura-udon:0.2.0@git:be9570590963dfc331bc08a5c9ecfdf9f7fcdcbe"]
+[policy."zakura-udon:0.3.0@git:0add9e8147cf80c1cce9caa37ff04b20b1680a03"]
 audit-as-crates-io = false
 
 [policy.zakura-utils]
 audit-as-crates-io = false
 
-[policy."zakura-zcash-script:0.0.1@git:be9570590963dfc331bc08a5c9ecfdf9f7fcdcbe"]
+[policy."zakura-zcash-script:0.0.2@git:0add9e8147cf80c1cce9caa37ff04b20b1680a03"]
 audit-as-crates-io = false
 
 [[exemptions.addr2line]]
@@ -331,6 +331,11 @@ notes = "Audit held: the generated data package embeds 249 unsafe unchecked zero
 version = "0.17.11"
 criteria = "safe-to-deploy"
 
+[[exemptions.keccak]]
+version = "0.2.2"
+criteria = "safe-to-deploy"
+notes = "Reached through the post-quantum signature dependency; exact-version audit backlog entry pending dedicated package review. This exemption is not an audit certification."
+
 [[exemptions.libcrux-intrinsics]]
 version = "0.0.10"
 criteria = "safe-to-deploy"
@@ -370,11 +375,6 @@ notes = "Introduced with the hybrid key-exchange group (zakura-quic TLS-9), now 
 version = "0.0.10"
 criteria = "safe-to-deploy"
 notes = "Introduced with the hybrid key-exchange group (zakura-quic TLS-9), now X25519MLKEM1024, which takes ML-KEM-1024 from libcrux; exact-version exemption pending dedicated package review. This exemption is not an audit certification."
-
-[[exemptions.keccak]]
-version = "0.2.2"
-criteria = "safe-to-deploy"
-notes = "Reached through the post-quantum signature dependency; exact-version audit backlog entry pending dedicated package review. This exemption is not an audit certification."
 
 [[exemptions.libm]]
 version = "0.2.16"
@@ -506,11 +506,6 @@ for 32-bit x86 SHA-512, so this admission must be reconsidered if the target
 condition, sha2 version, or direct callers change.
 """
 
-[[exemptions.syn]]
-version = "3.0.10"
-criteria = "safe-to-deploy"
-notes = "Build-time only: libcrux-macros, the proc macro of libcrux-ml-dsa (zakura-quic TLS-4), is built on syn 3. Exact-version exemption pending review. This exemption is not an audit certification."
-
 [[exemptions.sha3]]
 version = "0.11.0"
 criteria = "safe-to-deploy"
@@ -530,6 +525,11 @@ notes = "Reached through the post-quantum signature dependency; exact-version au
 version = "0.8.1"
 criteria = "safe-to-deploy"
 notes = "Reached through the post-quantum signature dependency; exact-version audit backlog entry pending dedicated package review. This exemption is not an audit certification."
+
+[[exemptions.syn]]
+version = "3.0.10"
+criteria = "safe-to-deploy"
+notes = "Build-time only: libcrux-macros, the proc macro of libcrux-ml-dsa (zakura-quic TLS-4), is built on syn 3. Exact-version exemption pending review. This exemption is not an audit certification."
 
 [[exemptions.tar]]
 version = "0.4.45"

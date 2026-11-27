@@ -4496,7 +4496,7 @@ async fn regtest_pq_mempool_and_template() -> Result<()> {
     Ok(())
 }
 
-/// PQ single-signer and multisig spends propagate between nodes and survive block/RPC transport.
+/// PQ single-signer and threshold (`OP_CHECKSIGADD`) spends propagate between nodes and survive block/RPC transport.
 #[cfg(feature = "pq")]
 #[tokio::test(flavor = "multi_thread")]
 async fn regtest_pq_p2p_relay_and_block_acceptance() -> Result<()> {

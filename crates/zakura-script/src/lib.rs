@@ -358,11 +358,13 @@ impl<T: Deref<Target = zakura_chain::transaction::Transaction>> CachedFfiTransac
     }
 }
 
-/// Counts the signature operations in the script a post-quantum output commits to, rather
-/// than in the input that reveals it.
+/// Counts the most signature checks a post-quantum spend can run, from the script its output
+/// commits to and the input's size, rather than legacy-counting the input that reveals it.
 ///
 /// The input's signature pushes are far larger than the legacy counter's push bound, where
-/// that counter stops and would report almost none of the checks the script performs. This
+/// that counter stops and would report almost none of the checks the script performs, and
+/// the legacy counter reads `OP_CHECKSIGADD` as worth nothing. The count is the checking
+/// opcodes in the script or what the input's byte budget pays for, whichever is fewer. This
 /// is accounting only: the input is still authenticated and executed independently.
 #[cfg(feature = "pq")]
 fn pq_input_sigop_count(input: &transparent::Input, output: &transparent::Output) -> u32 {
@@ -374,7 +376,7 @@ fn pq_input_sigop_count(input: &transparent::Input, output: &transparent::Output
     match zcash_transparent::pq::output::parse_output(&lock_code) {
         Ok(Some(pq_output)) => pq_output
             .authenticate_spend(unlock_script.as_raw_bytes())
-            .map_or(legacy_count, |spend| spend.sig_op_count(true)),
+            .map_or(legacy_count, |spend| spend.sig_op_count()),
         // Either a legacy output, or one no spend can satisfy; verification rejects the
         // latter, and counting it as the legacy rules do charges nothing extra for it.
         _ => legacy_count,

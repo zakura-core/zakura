@@ -724,10 +724,10 @@ enum PqFundedKind {
 #[cfg(feature = "pq")]
 struct PqFunded {
     kind: PqFundedKind,
-    /// Which of this scheme's keys sign, in the order the revealed script expects. More
-    /// than one signer means a multisig script, whose input also carries the dummy
-    /// element legacy `OP_CHECKMULTISIG` consumes.
-    signers: Vec<usize>,
+    /// Each key slot of the revealed script, first key first: which of this scheme's keys
+    /// signs it, or `None` for a key that declines with an empty item. A threshold script
+    /// gives every key a slot, so one with several keys may have declining slots.
+    slots: Vec<Option<usize>>,
 }
 
 #[cfg(feature = "pq")]
@@ -783,18 +783,29 @@ impl PqFunded {
             Some(parameters) => parameters.signature_bytes() + 1,
             None => 73,
         };
-        vec![vec![0; bytes]; self.signers.len()]
+        vec![vec![0; bytes]; self.signers().count()]
     }
 
-    /// The complete argument list an input carries, ahead of the revealed script.
+    /// The keys that sign, in slot order.
+    fn signers(&self) -> impl Iterator<Item = usize> + '_ {
+        self.slots.iter().flatten().copied()
+    }
+
+    /// The complete argument list an input carries, ahead of the revealed script: one item
+    /// per slot, these signatures in the signing slots and empty items in the rest.
     fn arguments(&self, signatures: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
-        if self.signers.len() > 1 {
-            let mut arguments = vec![Vec::new()];
-            arguments.extend(signatures);
-            arguments
-        } else {
-            signatures
-        }
+        let mut signatures = signatures.into_iter();
+        let mut arguments: Vec<Vec<u8>> = self
+            .slots
+            .iter()
+            .map(|slot| {
+                slot.map(|_| signatures.next().expect("one signature per signer"))
+                    .unwrap_or_default()
+            })
+            .collect();
+        // The first key's slot is checked first, so its item is pushed last, on top.
+        arguments.reverse();
+        arguments
     }
 }
 
@@ -841,18 +852,20 @@ async fn pq_spend_test(scenario: PqSpendScenario) -> Result<()> {
         encoded.extend(bytes);
         encoded
     }
-    /// A script requiring `required` of these public keys, in the legacy multisig shape.
-    fn multisig_body(keys: &[Vec<u8>], required: u8) -> Code {
-        let number = |value: u8| {
-            assert!(value <= 16, "the fixtures stay within the small opcodes");
-            vec![0x50 + value]
-        };
-        let mut bytes = number(required);
-        for key in keys {
+    /// A script requiring `required` of these public keys, in the post-quantum threshold
+    /// shape: `<K1> CHECKSIG <K2> CHECKSIGADD ... <required> NUMEQUAL`.
+    fn threshold_body(keys: &[Vec<u8>], required: u8) -> Code {
+        assert!(required <= 16, "the fixtures stay within the small opcodes");
+        let mut bytes = Vec::new();
+        for (index, key) in keys.iter().enumerate() {
             bytes.extend(push(key));
+            bytes.push(if index == 0 {
+                0xac
+            } else {
+                zcash_script::pq::OP_CHECKSIGADD
+            });
         }
-        bytes.extend(number(u8::try_from(keys.len()).unwrap()));
-        bytes.push(0xae);
+        bytes.extend([0x50 + required, 0x9c]);
         Code(bytes)
     }
     fn transaction(outpoint: OutPoint, value: Amount<NonNegative>, output: Script) -> Transaction {
@@ -914,7 +927,7 @@ async fn pq_spend_test(scenario: PqSpendScenario) -> Result<()> {
                 parameters: set,
                 body: single_key::body(set, &keys[index][0].public_key())?,
             },
-            signers: vec![0],
+            slots: vec![Some(0)],
         })
     };
     let two_of_three = |set: ParameterSet| -> PqFunded {
@@ -923,10 +936,10 @@ async fn pq_spend_test(scenario: PqSpendScenario) -> Result<()> {
         PqFunded {
             kind: PqFundedKind::Pq {
                 parameters: set,
-                body: multisig_body(&public, 2),
+                body: threshold_body(&public, 2),
             },
-            // The second signature comes from the last key, so matching also has to skip one.
-            signers: vec![0, 2],
+            // The middle key declines, so the input carries an empty item in its slot.
+            slots: vec![Some(0), None, Some(2)],
         }
     };
     let secret = secp256k1::SecretKey::from_secret_bytes([4; 32])?;
@@ -941,9 +954,9 @@ async fn pq_spend_test(scenario: PqSpendScenario) -> Result<()> {
     let large = PqFunded {
         kind: PqFundedKind::Pq {
             parameters: schemes[0],
-            body: multisig_body(&fifteen, 15),
+            body: threshold_body(&fifteen, 15),
         },
-        signers: vec![0; 15],
+        slots: vec![Some(0); 15],
     };
     let fixture = vec![
         single(schemes[0])?,
@@ -953,13 +966,13 @@ async fn pq_spend_test(scenario: PqSpendScenario) -> Result<()> {
                 script: restricted,
                 revealed: single_key::body(schemes[0], &keys[0][0].public_key())?,
             },
-            signers: vec![0],
+            slots: vec![Some(0)],
         },
         PqFunded {
             kind: PqFundedKind::Legacy {
                 redeem: Code(legacy),
             },
-            signers: vec![0],
+            slots: vec![Some(0)],
         },
         single(schemes[1])?,
         two_of_three(schemes[1]),
@@ -978,7 +991,7 @@ async fn pq_spend_test(scenario: PqSpendScenario) -> Result<()> {
                         .collect::<Vec<u8>>(),
                 ),
             },
-            signers: Vec::new(),
+            slots: Vec::new(),
         },
     ];
     let mut config = os_assigned_rpc_port_config(false, &net)?;
@@ -1112,9 +1125,8 @@ async fn pq_spend_test(scenario: PqSpendScenario) -> Result<()> {
                 Some(parameters) => {
                     let scheme = pq_scheme_index(parameters);
                     entry
-                        .signers
-                        .iter()
-                        .map(|&signer| {
+                        .signers()
+                        .map(|signer| {
                             let mut signature =
                                 keys[scheme][signer].sign(&digest.0, &context[scheme]);
                             signature.push(1);

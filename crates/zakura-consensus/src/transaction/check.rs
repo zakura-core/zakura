@@ -839,11 +839,10 @@ fn mempool_standard_input_scripts_with_pq(
 
         #[cfg(feature = "pq")]
         if pq_active
-            && zakura_script::standard::authenticated_pq_body(
+            && zakura_script::standard::is_authenticated_pq_input(
                 unlock_script,
                 &spent_outputs[input_index].lock_script,
             )
-            .is_some()
         {
             continue;
         }

@@ -53,6 +53,7 @@ fn insert(
         &block_id,
         part.index(),
         from_peer,
+        1,
         part.payload().len() as u64,
     );
     table.step(
@@ -61,6 +62,7 @@ fn insert(
             block_id,
             part: part.clone(),
             from_peer,
+            session_gen: 1,
             auth,
             peer_states: Vec::new(),
         },
@@ -147,6 +149,7 @@ fn release(
         now,
         BlockInput::ReleaseClaims {
             peer,
+            session_gen: 1,
             block_id,
             stripe: 0,
             slots,
@@ -160,6 +163,7 @@ fn release(
 fn pull_state(peer: NodeId) -> PullPeerState {
     PullPeerState {
         peer,
+        session_gen: 1,
         ahead_bytes: 0,
         can_pull: true,
         window_remaining: 8,
@@ -305,9 +309,11 @@ fn flag_push(
         now,
         BlockInput::PushFlagged {
             peer,
+            session_gen: 1,
             block_id,
             indices,
             relay,
+            live: true,
         },
     )
 }
@@ -1177,6 +1183,7 @@ fn scenario_peer_paths_under_connection_churn() {
                 now,
                 BlockInput::SessionEnded {
                     peer: drop_p,
+                    session_gen: 1,
                     peer_states: Vec::new(),
                 },
             );
@@ -1189,6 +1196,7 @@ fn scenario_peer_paths_under_connection_churn() {
             now,
             BlockInput::SessionEnded {
                 peer: p,
+                session_gen: 1,
                 peer_states: Vec::new(),
             },
         );
@@ -2397,6 +2405,468 @@ fn released_slot_moves_to_another_announcer_unless_refused() {
     }
 }
 
+/// bpv1-63, bpv1-89: a pull claim belongs to the session that took the
+/// grant. Session 2 of `p` replaces session 1 while session 1 still owes
+/// slot 0, and a repair round grants slot 0 to session 2. Session 1's
+/// `Refused` release and its `SessionEnded` then free nothing, so the table
+/// grants slot 0 to no one else while session 2's `Want` is live.
+#[test]
+fn a_replaced_sessions_release_keeps_the_replacements_claim() {
+    let coding = Profile::TINY.derive_coding(128, 2).unwrap();
+    let block_id = block::Hash([0xA4; 32]);
+    let (p, q) = (node_id(2), node_id(3));
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let t0 = Instant::now();
+    admit(&mut table, t0, block_id, coding, [0xA4; 32]);
+    observe(&mut table, t0, p, 5, 10_000_000);
+    observe(&mut table, t0, q, 40, 1_000_000);
+    announce(&mut table, t0, q, block_id, vec![0], &[]);
+    let s = announce(&mut table, t0, p, block_id, vec![0], &[pull_state(p)]);
+    assert_eq!(granted_slots(&s, p), vec![0], "session 1 claims slot 0");
+
+    let session_2 = PullPeerState {
+        session_gen: 2,
+        ..pull_state(p)
+    };
+    let live = [session_2, pull_state(q)];
+    let repair = t0 + stall_base(table.paths(), &coding);
+    let s = tick(&mut table, repair, &live);
+    assert!(s
+        .events
+        .contains(&BlockEvent::RepairRound { block_id, round: 1 }));
+    assert!(
+        s.outputs.iter().any(|o| matches!(
+            o,
+            BlockOutput::GrantPull { peer, session_gen: 2, .. } if *peer == p
+        )),
+        "the repair round grants slot 0 to session 2: {:?}",
+        s.outputs
+    );
+
+    let stale = table.step(
+        repair,
+        BlockInput::ReleaseClaims {
+            peer: p,
+            session_gen: 1,
+            block_id,
+            stripe: 0,
+            slots: vec![0],
+            reason: ReleaseReason::Refused,
+            peer_states: live.to_vec(),
+        },
+    );
+    assert!(stale.outputs.is_empty(), "{:?}", stale.outputs);
+    let ended = table.step(
+        repair,
+        BlockInput::SessionEnded {
+            peer: p,
+            session_gen: 1,
+            peer_states: live.to_vec(),
+        },
+    );
+    assert!(ended.outputs.is_empty(), "{:?}", ended.outputs);
+    table.assert_invariants();
+
+    // Session 2's own failure frees the slot for `q`.
+    let failed = table.step(
+        repair,
+        BlockInput::ReleaseClaims {
+            peer: p,
+            session_gen: 2,
+            block_id,
+            stripe: 0,
+            slots: vec![0],
+            reason: ReleaseReason::Failed,
+            peer_states: live.to_vec(),
+        },
+    );
+    assert_eq!(granted_slots(&failed, q), vec![0]);
+    table.assert_invariants();
+}
+
+/// bpv1-65, bpv1-89: the end of a peer's old session releases that
+/// session's claims but keeps the node's path and announcements when a
+/// later session of the peer is live, so the table grants the slot to the
+/// later session at once. The end of the peer's last session drops them.
+#[test]
+fn an_old_sessions_end_keeps_a_reconnected_peers_node_facts() {
+    let coding = Profile::TINY.derive_coding(128, 2).unwrap();
+    let block_id = block::Hash([0xA5; 32]);
+    let p = node_id(2);
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let t0 = Instant::now();
+    admit(&mut table, t0, block_id, coding, [0xA5; 32]);
+    observe(&mut table, t0, p, 5, 10_000_000);
+    let s = announce(&mut table, t0, p, block_id, vec![0], &[pull_state(p)]);
+    assert_eq!(granted_slots(&s, p), vec![0], "session 1 claims slot 0");
+
+    // Session 2 is live when session 1's end reaches the table. Session 1's
+    // grant never reached it, so its end releases the claim.
+    let session_2 = PullPeerState {
+        session_gen: 2,
+        ..pull_state(p)
+    };
+    let ended = table.step(
+        t0,
+        BlockInput::SessionEnded {
+            peer: p,
+            session_gen: 1,
+            peer_states: vec![session_2],
+        },
+    );
+    assert_eq!(
+        table.paths().len(),
+        1,
+        "the reconnected peer keeps its path"
+    );
+    assert!(
+        ended.outputs.iter().any(|o| matches!(
+            o,
+            BlockOutput::GrantPull { peer, session_gen: 2, .. } if *peer == p
+        )),
+        "session 2 takes slot 0 from the kept announcement: {:?}",
+        ended.outputs
+    );
+
+    let last = table.step(
+        t0,
+        BlockInput::SessionEnded {
+            peer: p,
+            session_gen: 2,
+            peer_states: Vec::new(),
+        },
+    );
+    assert!(last.outputs.is_empty(), "{:?}", last.outputs);
+    assert_eq!(
+        table.paths().len(),
+        0,
+        "the last session's end drops the path"
+    );
+    table.assert_invariants();
+}
+
+/// decision-24, bpv1-89: pending pushes belong to the session that flagged
+/// them. Session 1 of `p` flagged slot 0 and session 2 flagged slot 1.
+/// Session 1's end releases slot 0 to `q` and keeps slot 1 pending.
+#[test]
+fn an_old_sessions_end_releases_only_its_own_pending_pushes() {
+    let coding = Profile::TINY.derive_coding(128, 2).unwrap();
+    assert!(coding.k >= 2);
+    let block_id = block::Hash([0xA6; 32]);
+    let (p, q) = (node_id(2), node_id(3));
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let t0 = Instant::now();
+    admit(&mut table, t0, block_id, coding, [0xA6; 32]);
+    observe(&mut table, t0, p, 5, 10_000_000);
+    observe(&mut table, t0, q, 40, 1_000_000);
+    let index = |slot| coding.wire_index(0, slot).unwrap();
+    announce(&mut table, t0, q, block_id, vec![index(0), index(1)], &[]);
+    for (session_gen, slot) in [(1, 0), (2, 1)] {
+        table.step(
+            t0,
+            BlockInput::PushFlagged {
+                peer: p,
+                session_gen,
+                block_id,
+                indices: vec![index(slot)],
+                relay: false,
+                live: true,
+            },
+        );
+    }
+
+    let session_2 = PullPeerState {
+        session_gen: 2,
+        ..pull_state(p)
+    };
+    let ended = table.step(
+        t0,
+        BlockInput::SessionEnded {
+            peer: p,
+            session_gen: 1,
+            peer_states: vec![session_2, pull_state(q)],
+        },
+    );
+    assert_eq!(granted_slots(&ended, q), vec![0], "{:?}", ended.outputs);
+    table.assert_invariants();
+}
+
+/// decision-24, bpv1-89: a slot that a peer flags again on its live session
+/// moves to that session. Session 1 and session 2 of `p` both flag slot 0.
+/// Session 1's end keeps slot 0 pending, so `q` is not asked for it.
+#[test]
+fn a_replacement_sessions_push_flag_survives_the_old_sessions_end() {
+    let coding = Profile::TINY.derive_coding(128, 2).unwrap();
+    let block_id = block::Hash([0xA7; 32]);
+    let (p, q) = (node_id(2), node_id(3));
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let t0 = Instant::now();
+    admit(&mut table, t0, block_id, coding, [0xA7; 32]);
+    observe(&mut table, t0, p, 5, 10_000_000);
+    observe(&mut table, t0, q, 40, 1_000_000);
+    let index = coding.wire_index(0, 0).unwrap();
+    announce(&mut table, t0, q, block_id, vec![index], &[]);
+    for session_gen in [1, 2] {
+        table.step(
+            t0,
+            BlockInput::PushFlagged {
+                peer: p,
+                session_gen,
+                block_id,
+                indices: vec![index],
+                relay: false,
+                live: true,
+            },
+        );
+    }
+
+    let session_2 = PullPeerState {
+        session_gen: 2,
+        ..pull_state(p)
+    };
+    let ended = table.step(
+        t0,
+        BlockInput::SessionEnded {
+            peer: p,
+            session_gen: 1,
+            peer_states: vec![session_2, pull_state(q)],
+        },
+    );
+    assert!(
+        granted_slots(&ended, q).is_empty(),
+        "the old session's end dropped the live push: {:?}",
+        ended.outputs
+    );
+    table.assert_invariants();
+}
+
+/// bpv1-64, bpv1-89: a slot that moves to the peer's new session keeps the
+/// late time it already had. Session 1 of `p` flags slot 0 and session 2
+/// flags it again 15 ms later. Slot 0 still turns late at session 1's time.
+#[test]
+fn a_reflag_on_a_new_session_never_delays_the_push() {
+    let coding = Profile::TINY.derive_coding(2_048, 2).unwrap();
+    let block_id = block::Hash([0xAA; 32]);
+    let p = node_id(2);
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let t0 = Instant::now();
+    admit(&mut table, t0, block_id, coding, [0xAA; 32]);
+    // Slow peers keep the stall interval, and so repair, far off.
+    for (peer, rtt) in [(p, 10), (node_id(23), 500), (node_id(24), 500)] {
+        observe(&mut table, t0, peer, rtt, 10_000_000);
+    }
+    let index = coding.wire_index(0, 0).unwrap();
+    let flag = |table: &mut BlockTable, at: Instant, session_gen: u64| {
+        table.step(
+            at,
+            BlockInput::PushFlagged {
+                peer: p,
+                session_gen,
+                block_id,
+                indices: vec![index],
+                relay: false,
+                live: true,
+            },
+        )
+    };
+    flag(&mut table, t0, 1);
+    let late_at = table.next_deadline().expect("the push is pending");
+    let reflag_at = t0 + Duration::from_millis(15);
+    assert!(reflag_at < late_at, "the reflag comes before the late time");
+
+    flag(&mut table, reflag_at, 2);
+    assert_eq!(
+        table.next_deadline(),
+        Some(late_at),
+        "the new session's flag moved the late time"
+    );
+    let s = tick(&mut table, late_at, &[]);
+    assert!(
+        s.events.iter().any(|e| matches!(
+            e,
+            BlockEvent::PullLate { peer, stripe: 0, slot: 0, .. } if *peer == p
+        )),
+        "{:?}",
+        s.events
+    );
+    assert!(!s
+        .events
+        .iter()
+        .any(|e| matches!(e, BlockEvent::RepairRound { .. })));
+    table.assert_invariants();
+}
+
+/// A push flag that reaches a block after it stopped collecting expects
+/// nothing. A retired block's stripe buffers are gone, so the flag leaves
+/// the table as it was.
+#[test]
+fn a_push_flag_for_a_retired_block_is_ignored() {
+    let coding = Profile::TINY.derive_coding(128, 2).unwrap();
+    let block_id = block::Hash([0xAC; 32]);
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let t0 = Instant::now();
+    admit(&mut table, t0, block_id, coding, [0xAC; 32]);
+    table.step(
+        t0,
+        BlockInput::TipHeight {
+            height: 2 + super::wire::PROPAGATION_DEPTH,
+            hash: TEST_TIP_HASH,
+        },
+    );
+    assert_eq!(table.block_phase(&block_id), Some(BlockPhase::Retired));
+
+    let index = coding.wire_index(0, 0).unwrap();
+    flag_push(&mut table, t0, node_id(2), block_id, vec![index], false);
+    table.assert_invariants();
+}
+
+/// bpv1-89: a flag from a session that is no longer live takes no slot. In
+/// either generation order, the live session of `p` flags slot 0 and then
+/// the replaced session flags it too. The replaced session's end keeps
+/// slot 0 pending, so `q` is asked for it only once the live session ends.
+#[test]
+fn a_replaced_sessions_late_flag_never_takes_the_live_push() {
+    for (live_gen, stale_gen) in [(2, 1), (1, 2)] {
+        let coding = Profile::TINY.derive_coding(128, 2).unwrap();
+        let block_id = block::Hash([0xAB; 32]);
+        let (p, q) = (node_id(2), node_id(3));
+        let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+        let t0 = Instant::now();
+        admit(&mut table, t0, block_id, coding, [0xAB; 32]);
+        observe(&mut table, t0, p, 5, 10_000_000);
+        observe(&mut table, t0, q, 40, 1_000_000);
+        let index = coding.wire_index(0, 0).unwrap();
+        announce(&mut table, t0, q, block_id, vec![index], &[]);
+        for (session_gen, live) in [(live_gen, true), (stale_gen, false)] {
+            table.step(
+                t0,
+                BlockInput::PushFlagged {
+                    peer: p,
+                    session_gen,
+                    block_id,
+                    indices: vec![index],
+                    relay: false,
+                    live,
+                },
+            );
+        }
+
+        let live_session = PullPeerState {
+            session_gen: live_gen,
+            ..pull_state(p)
+        };
+        let ended = table.step(
+            t0,
+            BlockInput::SessionEnded {
+                peer: p,
+                session_gen: stale_gen,
+                peer_states: vec![live_session, pull_state(q)],
+            },
+        );
+        assert!(
+            granted_slots(&ended, q).is_empty(),
+            "session {stale_gen}'s end dropped session {live_gen}'s push: {:?}",
+            ended.outputs
+        );
+        let ended = table.step(
+            t0,
+            BlockInput::SessionEnded {
+                peer: p,
+                session_gen: live_gen,
+                peer_states: vec![pull_state(q)],
+            },
+        );
+        assert_eq!(granted_slots(&ended, q), vec![0], "{:?}", ended.outputs);
+        table.assert_invariants();
+    }
+}
+
+/// decision-24, bpv1-89: a push flag says nothing about the node, so its
+/// session's end leaves the reconnected peer eligible. Session 1 of `p`
+/// flagged slot 0, which `p` announced. Session 1's end grants slot 0 to
+/// session 2.
+#[test]
+fn an_ended_push_leaves_the_replacement_session_eligible() {
+    let coding = Profile::TINY.derive_coding(128, 2).unwrap();
+    let block_id = block::Hash([0xA8; 32]);
+    let p = node_id(2);
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let t0 = Instant::now();
+    admit(&mut table, t0, block_id, coding, [0xA8; 32]);
+    observe(&mut table, t0, p, 5, 10_000_000);
+    let index = coding.wire_index(0, 0).unwrap();
+    announce(&mut table, t0, p, block_id, vec![index], &[]);
+    flag_push(&mut table, t0, p, block_id, vec![index], false);
+
+    let session_2 = PullPeerState {
+        session_gen: 2,
+        ..pull_state(p)
+    };
+    let ended = table.step(
+        t0,
+        BlockInput::SessionEnded {
+            peer: p,
+            session_gen: 1,
+            peer_states: vec![session_2],
+        },
+    );
+    let grants: Vec<(u64, Vec<u32>)> = ended
+        .outputs
+        .iter()
+        .filter_map(|o| match o {
+            BlockOutput::GrantPull {
+                peer,
+                session_gen,
+                requested,
+                ..
+            } if *peer == p => Some((*session_gen, requested.iter().collect())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(grants, vec![(2, vec![0])], "{:?}", ended.outputs);
+    table.assert_invariants();
+}
+
+/// bpv1-89: the table never infers liveness from generation order. Session 1
+/// of `p` is live and holds the claim on slot 0; session 2 registered first
+/// and ended. Session 2's end keeps session 1's claim and `p`'s node facts.
+#[test]
+fn an_ended_later_generation_keeps_a_live_earlier_sessions_claim() {
+    let coding = Profile::TINY.derive_coding(128, 2).unwrap();
+    let block_id = block::Hash([0xA9; 32]);
+    let (p, q) = (node_id(2), node_id(3));
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let t0 = Instant::now();
+    admit(&mut table, t0, block_id, coding, [0xA9; 32]);
+    observe(&mut table, t0, p, 5, 10_000_000);
+    observe(&mut table, t0, q, 40, 1_000_000);
+    let index = coding.wire_index(0, 0).unwrap();
+    let s = announce(&mut table, t0, p, block_id, vec![index], &[pull_state(p)]);
+    assert_eq!(granted_slots(&s, p), vec![0]);
+    let states = vec![pull_state(p), pull_state(q)];
+    let s = announce(&mut table, t0, q, block_id, vec![index], &states);
+    assert!(granted_slots(&s, q).is_empty());
+
+    let ended = table.step(
+        t0,
+        BlockInput::SessionEnded {
+            peer: p,
+            session_gen: 2,
+            peer_states: states,
+        },
+    );
+    assert!(
+        granted_slots(&ended, q).is_empty(),
+        "the ended session released the live session's claim: {:?}",
+        ended.outputs
+    );
+    assert!(
+        table.paths().get(&p).is_some(),
+        "the ended session dropped the live peer's path"
+    );
+    table.assert_invariants();
+}
+
 /// Repair rounds repeat every `base × 2^r`,
 /// with `base = SLOW_X ×` one part's estimated arrival, until the monotonic
 /// deadline, which is the only bound and the only way into fallback. Only the
@@ -2595,6 +3065,7 @@ fn fix6_rejected_metadata_leaves_no_state_and_arrival_lives_in_the_entry() {
             &block_id,
             part.index(),
             sender,
+            1,
             part.payload().len() as u64,
         )
         .unwrap();
@@ -2604,6 +3075,7 @@ fn fix6_rejected_metadata_leaves_no_state_and_arrival_lives_in_the_entry() {
             block_id,
             part,
             from_peer: sender,
+            session_gen: 1,
             auth: PartAuth::Want(1),
             peer_states: Vec::new(),
         },
@@ -2637,6 +3109,7 @@ fn fix8_part_charge_before_proof_bounds_the_part_buffer() {
                 block_id,
                 part: encoded.parts[i].clone(),
                 from_peer,
+                session_gen: 1,
                 auth: PartAuth::Want(1),
                 peer_states: Vec::new(),
             },
@@ -2645,13 +3118,13 @@ fn fix8_part_charge_before_proof_bounds_the_part_buffer() {
     };
 
     assert_eq!(
-        table.charge_part(t0, &block::Hash([0xEE; 32]), 0, a, part_len),
+        table.charge_part(t0, &block::Hash([0xEE; 32]), 0, a, 1, part_len),
         Err(PartRefusal::NotAdmitted)
     );
-    assert!(table.charge_part(t0, &block_id, 0, a, part_len).is_ok());
-    assert!(table.charge_part(t0, &block_id, 1, a, part_len).is_ok());
+    assert!(table.charge_part(t0, &block_id, 0, a, 1, part_len).is_ok());
+    assert!(table.charge_part(t0, &block_id, 1, a, 1, part_len).is_ok());
     assert_eq!(
-        table.charge_part(t0, &block_id, 2, a, part_len),
+        table.charge_part(t0, &block_id, 2, a, 1, part_len),
         Err(PartRefusal::LocalCapacity)
     );
     store(&mut table, 2, a);
@@ -2666,6 +3139,7 @@ fn fix8_part_charge_before_proof_bounds_the_part_buffer() {
             block_id,
             index: 1,
             from_peer: a,
+            session_gen: 1,
         },
     );
     assert_eq!(table.part_buffer_bytes(), part_len, "failed proof releases");
@@ -2678,11 +3152,11 @@ fn fix8_part_charge_before_proof_bounds_the_part_buffer() {
         "a stored part keeps its charge"
     );
 
-    assert!(table.charge_part(t0, &block_id, 0, b, part_len).is_ok());
+    assert!(table.charge_part(t0, &block_id, 0, b, 1, part_len).is_ok());
     store(&mut table, 0, b);
     assert_eq!(table.part_buffer_bytes(), part_len, "a duplicate releases");
 
-    assert!(table.charge_part(t0, &block_id, 1, b, part_len).is_ok());
+    assert!(table.charge_part(t0, &block_id, 1, b, 1, part_len).is_ok());
     table.step(
         t0,
         BlockInput::TipHeight {

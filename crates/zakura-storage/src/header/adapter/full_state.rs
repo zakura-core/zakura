@@ -1,8 +1,6 @@
 //! [`EnginePort`]'s full state: committed blocks, body evidence and the
 //! committed views, as zakura-state's writer and readers provide them.
 
-use std::sync::Arc;
-
 #[cfg(test)]
 mod tests;
 
@@ -54,7 +52,8 @@ impl EnginePort {
     pub fn subscribe_views(&self) -> watch::Receiver<Option<CommittedHeaderChainView>> {
         let sender = {
             let _engine = self.engine();
-            self.views().sender()
+            let views = self.views();
+            views.sender()
         };
         match sender {
             Some(sender) => sender.subscribe(),
@@ -65,13 +64,15 @@ impl EnginePort {
     /// The latest committed view.
     pub fn view(&self) -> CommittedHeaderChainView {
         let _engine = self.engine();
-        self.views().view()
+        let views = self.views();
+        views.view()
     }
 
     /// Runs `read` on full state, read together with the engine.
     pub fn with_full_state<R>(&self, read: impl FnOnce(&VerifiedChain) -> R) -> R {
         let _engine = self.engine();
-        read(&self.full_state())
+        let chain = self.full_state();
+        read(&chain)
     }
 
     /// Commits `block`, which the verifier received `receipt`th, to full
@@ -134,7 +135,8 @@ impl EnginePort {
     /// Commits `blocks`, each after its parent, to a port no block service
     /// commits through: before a run, so full state holds them when a node
     /// starts, as the header side's preload commits headers, or to a peer
-    /// whose storage the run doesn't control. Each counts as received at
+    /// whose storage the run doesn't control, such as a node whose verifier
+    /// the harness models itself. Each counts as received at
     /// receipt 0, as genesis does, so it ranks before any body a service
     /// admits, and equal-work tips among preloaded bodies fall to the
     /// greater hash. A node under test commits only through its block
@@ -150,7 +152,7 @@ impl EnginePort {
     /// facts the preload would skip.
     pub fn preload_blocks(
         &self,
-        blocks: impl IntoIterator<Item = Arc<block::Block>>,
+        blocks: impl IntoIterator<Item = impl Into<BlockHandle>>,
     ) -> Result<(), StateError> {
         assert!(
             !self.has_block_service(),
@@ -313,7 +315,8 @@ impl EnginePort {
     pub(crate) fn close_views(&self) {
         let sender = {
             let _engine = self.engine();
-            self.views().close()
+            let mut views = self.views();
+            views.close()
         };
         // Dropped after the locks, since the last sender's drop is a
         // scheduling point.

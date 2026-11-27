@@ -131,6 +131,12 @@ uses the same pacing and settings. A node also announces at once to the
 block's proposer every part the proposer did not send it. The proposer never
 pulls these parts. Its trace shows when each neighbour obtained each part.
 
+A `Have` lists its indices in the smaller of two forms: `u16` indices, or a
+bitmap over the block's parts. A one-index `Have` from a 2 ms flush takes 4
+bytes as a list. The one delayed `Have` to a peer outside the initial group
+takes 11 bytes as a bitmap of a 2 MB block's 86 parts, where a `u32` list took
+346. The receiver checks a bitmap's length once it knows the block's layout.
+
 A node pulls an announced part it lacks with a `Want` that names exact indices.
 It asks the announcer whose copy would arrive first, by that peer's round-trip
 time and delivery rate. It stops at `k` parts per stripe. Parity therefore lets

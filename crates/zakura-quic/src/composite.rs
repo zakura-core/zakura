@@ -14,12 +14,25 @@ use libcrux_ml_dsa::{
 };
 use zeroize::{Zeroize as _, Zeroizing};
 
-use crate::key::{NodeKey, SignatureError, KEY_LENGTH};
+use crate::{
+    key::{NodeKey, SignatureError, KEY_LENGTH},
+    key_list::{ED25519_KEY_TAG, MAX_NODE_KEYS},
+};
 
 /// The credential tag of an ML-DSA-65 public key (ID-13). Tag 2 was the
 /// ML-DSA-44 key of `p2p-v2/4`; this release reads it as an unknown tag
 /// (ID-10).
 pub const ML_DSA_65_KEY_TAG: u16 = 3;
+
+/// The credential tags of the two keys a composite signature is made with
+/// (TLS-4). A handshake signed with the composite proves exactly these keys.
+pub(crate) const COMPOSITE_KEY_TAGS: [u16; 2] = [ED25519_KEY_TAG, ML_DSA_65_KEY_TAG];
+
+/// The most earlier node IDs a handshake signed with the composite proves
+/// (TLS-7): one for each proper prefix of the credential's key list that
+/// keeps both signing keys. Such a prefix holds at least those two entries
+/// and a credential at most [`MAX_NODE_KEYS`], which makes 30.
+pub const MAX_EARLIER_NODE_IDS: usize = MAX_NODE_KEYS - COMPOSITE_KEY_TAGS.len();
 
 /// Length of an ML-DSA-65 public key, in bytes.
 pub const ML_DSA_65_KEY_BYTES: usize = 1_952;
@@ -46,9 +59,16 @@ pub(crate) const COMPOSITE_SCHEME: rustls::SignatureScheme =
 /// a private-use scheme.
 pub(crate) const COMPOSITE_SCHEME_LABEL: &str = "ed25519_mldsa65";
 
-/// The FIPS 204 context string of every ML-DSA signature a node makes, so a
-/// handshake signature can't be passed off as one made for anything else.
+/// The FIPS 204 context string of the ML-DSA signature in a handshake's
+/// composite, so a handshake signature can't be passed off as one made for
+/// anything else.
 const ML_DSA_CONTEXT: &[u8] = b"Zakura TLS 1.3 Ed25519+ML-DSA-65 v1";
+
+/// The FIPS 204 context string of the ML-DSA signature in a discovery record
+/// (ID-7). A node signs handshakes and records with one ML-DSA key, and
+/// FIPS 204 binds the context into what is signed, so neither signature
+/// verifies as the other.
+const ML_DSA_RECORD_CONTEXT: &[u8] = b"Zakura node record ML-DSA-65 v1";
 
 /// The BLAKE2b personalisation that derives a node's ML-DSA-65 key
 /// generation seed from its Ed25519 seed (ID-13).
@@ -105,6 +125,16 @@ impl MlDsaSigningKey {
         self.sign_in_context(message, ML_DSA_CONTEXT, randomness)
     }
 
+    /// Signs the bytes a discovery record's ML-DSA signature covers (ID-7),
+    /// hedged with fresh `randomness`.
+    pub(crate) fn sign_record(
+        &self,
+        message: &[u8],
+        randomness: [u8; SIGNING_RANDOMNESS_SIZE],
+    ) -> Result<[u8; ML_DSA_65_SIGNATURE_BYTES], SignatureError> {
+        self.sign_in_context(message, ML_DSA_RECORD_CONTEXT, randomness)
+    }
+
     /// Signs under `context`, with all-zero `randomness` selecting the
     /// deterministic variant. Fails for contexts over 255 bytes or if
     /// libcrux exhausts its rejection-sampling attempts.
@@ -135,6 +165,17 @@ pub(crate) fn verify(
     let (classical, post_quantum) = signature.split_at(ED25519_SIGNATURE_BYTES);
     ed25519.verify_strict(message, classical)?;
     ml_dsa_verify_in_context(ml_dsa, message, ML_DSA_CONTEXT, post_quantum)
+}
+
+/// Verifies a discovery record's ML-DSA-65 `signature` over `message`, under
+/// the record context, with the encoded public key `ml_dsa` (ID-7). The
+/// caller has checked that the key is the one the record's key list names.
+pub(crate) fn verify_record(
+    ml_dsa: &[u8; ML_DSA_65_KEY_BYTES],
+    message: &[u8],
+    signature: &[u8],
+) -> Result<(), SignatureError> {
+    ml_dsa_verify_in_context(ml_dsa, message, ML_DSA_RECORD_CONTEXT, signature)
 }
 
 /// FIPS 204 ML-DSA.Verify of `signature` over `message` under `context`,
@@ -236,6 +277,33 @@ mod tests {
             hex::encode(ml_dsa_seed(&SEED)),
             "bff8a2ef4140474cd7814ae25071788c5a2edb3e1dbc0c1769a8a38c19b3c77c"
         );
+    }
+
+    /// A node signs handshakes and records with one ML-DSA-65 key. The two
+    /// contexts keep each signature out of the other's place.
+    #[test]
+    fn a_handshake_signature_and_a_record_signature_do_not_swap() {
+        assert_ne!(ML_DSA_CONTEXT, ML_DSA_RECORD_CONTEXT);
+        // FIPS 204 allows a context of at most 255 bytes.
+        assert!(ML_DSA_CONTEXT.len() <= 255 && ML_DSA_RECORD_CONTEXT.len() <= 255);
+
+        let secret = NodeSecretKey::from_bytes(&SEED);
+        let ml_dsa = secret.credential().key(ML_DSA_65_KEY_TAG).unwrap();
+        let message = b"the same bytes under both contexts";
+
+        let handshake = secret.sign_composite(message, [9; 32]).unwrap();
+        assert_eq!(
+            verify(&secret.public_key(), ml_dsa, message, &handshake),
+            Ok(())
+        );
+        let record_key: &[u8; ML_DSA_65_KEY_BYTES] = ml_dsa.try_into().unwrap();
+        assert!(verify_record(record_key, message, &handshake[ED25519_SIGNATURE_BYTES..]).is_err());
+
+        let record = secret.sign_record_ml_dsa_65(message, [9; 32]).unwrap();
+        assert_eq!(verify_record(record_key, message, &record), Ok(()));
+        let mut swapped = handshake[..ED25519_SIGNATURE_BYTES].to_vec();
+        swapped.extend_from_slice(&record);
+        assert!(verify(&secret.public_key(), ml_dsa, message, &swapped).is_err());
     }
 
     #[test]

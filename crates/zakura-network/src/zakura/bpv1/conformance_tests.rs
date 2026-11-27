@@ -20,7 +20,7 @@ use super::{
         AcceptingHeaderAdmission,
     },
     wire::{
-        message_type, Bpv1Message, HaveFlags, WantBitmap, WantEndReason, BPV1_STREAMS,
+        message_type, Bpv1Message, HaveFlags, HaveForm, WantBitmap, WantEndReason, BPV1_STREAMS,
         ZAKURA_CAP_BPV1,
     },
 };
@@ -96,6 +96,7 @@ impl StreamConformance for Bpv1Conformance {
             message_type::HAVE => Bpv1Message::Have {
                 block_id: block_for_exchange(exchange),
                 flags: HaveFlags::Plain,
+                form: HaveForm::List,
                 indices: vec![0],
             },
             message_type::WANT_END => Bpv1Message::WantEnd {
@@ -264,6 +265,7 @@ async fn bpv1_54_55_control_progresses_and_ends_follow_parts_while_data_is_pause
                 block_id,
                 flags,
                 indices,
+                ..
             } => {
                 assert!(
                     flags.push(),
@@ -418,6 +420,7 @@ async fn close_1_reserved_have_flags_close_the_connection() -> Result<(), BoxErr
         let mut frame = encode_frame(&Bpv1Message::Have {
             block_id: block::Hash([0x7F; 32]),
             flags: HaveFlags::Plain,
+            form: HaveForm::List,
             indices: vec![u32::from(flags)],
         })?;
         frame.payload[FLAGS_AT] = flags;

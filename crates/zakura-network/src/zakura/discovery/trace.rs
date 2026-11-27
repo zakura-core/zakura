@@ -73,17 +73,30 @@ pub(super) struct DiscoveryDialResultEvent {
     event: &'static str,
     result: &'static str,
     peer: Option<String>,
+    /// The ID the node answered the dial with, when it has moved on from the
+    /// dialed one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    connected_as: Option<String>,
 }
 
 impl DiscoveryDialResultEvent {
-    pub(super) fn new(node_id: &[u8], result: DiscoveryDialResult) -> Self {
-        let peer = ZakuraPeerId::new(node_id.to_vec())
-            .map(|peer| peer_label(&peer))
-            .ok();
+    /// The result of a dial to `node_id`. `connected_as` is the ID the node
+    /// answered with when that isn't `node_id`.
+    pub(super) fn new(
+        node_id: &[u8],
+        connected_as: Option<&[u8]>,
+        result: DiscoveryDialResult,
+    ) -> Self {
+        let label = |id: &[u8]| {
+            ZakuraPeerId::new(id.to_vec())
+                .map(|peer| peer_label(&peer))
+                .ok()
+        };
         Self {
             event: d_trace::DISCOVERY_DIAL_RESULT,
             result: result.label(),
-            peer,
+            peer: label(node_id),
+            connected_as: connected_as.and_then(label),
         }
     }
 }
@@ -195,13 +208,33 @@ mod tests {
 
     #[test]
     fn discovery_result_schema_preserves_null_invalid_peer() {
-        let event = DiscoveryDialResultEvent::new(&[0; 1_025], DiscoveryDialResult::Failed);
+        let event = DiscoveryDialResultEvent::new(&[0; 1_025], None, DiscoveryDialResult::Failed);
         assert_eq!(
             serde_json::to_value(event).expect("event serializes"),
             json!({
                 "event": "discovery_dial_result",
                 "result": "failed",
                 "peer": null,
+            })
+        );
+    }
+
+    #[test]
+    fn discovery_result_names_the_id_a_moved_node_answered_with() {
+        let dialed = ZakuraPeerId::new(vec![7; 32]).expect("a 32-byte id is a valid peer id");
+        let connected = ZakuraPeerId::new(vec![8; 32]).expect("a 32-byte id is a valid peer id");
+        let event = DiscoveryDialResultEvent::new(
+            &[7; 32],
+            Some(&[8; 32]),
+            DiscoveryDialResult::Registered,
+        );
+        assert_eq!(
+            serde_json::to_value(event).expect("event serializes"),
+            json!({
+                "event": "discovery_dial_result",
+                "result": "registered",
+                "peer": peer_label(&dialed),
+                "connected_as": peer_label(&connected),
             })
         );
     }

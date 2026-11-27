@@ -27,11 +27,60 @@ margins first. The two halves of the handshake face that risk differently.
   handshake runs. A later break of ML-DSA can't forge a handshake that has
   already completed, and it reveals nothing about the session keys. The
   signature needs to hold only until we can replace it.
-- **If a scheme breaks,** we ship a new node-ID stack: a new signature, a new
-  credential tag and a new ALPN, the way `p2p-v2/5` replaced `p2p-v2/4`.
-  We don't carry a pre-committed backup key or other agility machinery,
-  which would add a key to every credential and code paths that only run
-  in an emergency.
+- **If a scheme breaks,** we add a key of a new scheme to each node's
+  credential, under a new tag, and later retire the old key. Neither step
+  breaks node IDs (spec 0.31 and 0.34, TLS-7, ID-12, DIAL-9, COMPAT-13):
+  - A dial to the ID a node had before it added the key still reaches it,
+    as long as the node signs with the keys that ID names. The dialer then
+    follows the node to its new ID.
+  - A retired key stays in the credential as its 32-byte fingerprint, so
+    the ID doesn't change a second time.
+  - The rules had to ship with `p2p-v2/5`. The nodes of this release are
+    the old nodes of the first upgrade, and a release without the rules
+    would refuse the longer credential on a dial to the earlier ID, and a
+    fingerprint entry everywhere.
+  - The room is 30 more keys per node ID. A key list holds 32 entries, two
+    of them today's keys, and a retired key keeps its entry. A key over
+    2,592 bytes doesn't fit an entry, and a credential over 10,385 bytes
+    is refused, which leaves 8,392 bytes beside today's two keys: three
+    more keys of the longest length in full, or one in full and the rest
+    retired to 36-byte fingerprint entries. Past any of these limits an
+    upgrade is a hard break again.
+  - Each new key takes a tag above every tag in use, so a node's earlier
+    key lists are prefixes of its current one. Every later release has to
+    keep to that order.
+
+  We still don't carry a pre-committed backup key: it would add a key to
+  every credential today. The fingerprint entry leaves that open, since a
+  node could commit to a backup key by its fingerprint for 36 bytes per
+  handshake and nothing in a discovery record beyond one 34-byte entry.
+
+  **Why a fingerprint entry is safe.** It commits to a key without showing
+  it, as an entry under an unknown tag already does. It can't check a
+  signature, so it can't help anyone answer as the node, and a verifier
+  refuses a credential whose signing key is only a fingerprint.
+
+  **What the earlier-ID rule costs.** The dialed ID must name a prefix of
+  the node's key list, so a verifier hashes fewer than 32 key lists of at
+  most 1,089 bytes on a dial whose ID doesn't match outright, one per
+  entry. Spec 0.31 accepted any list of the entries in their order. That
+  was 4 hashes with 4 entries and would be 2^30 with 32, on a credential
+  the dialer has not authenticated yet. The dialed ID must name both
+  signing keys, so adding a key to another node's public keys gains
+  nothing: the signature is still checked with that node's keys.
+
+  **What a long credential costs.** A credential travels whole in each
+  handshake. The byte limit keeps the flight that carries it inside the
+  16 KiB of handshake data `quinn-proto` buffers: about 14 KB at the
+  limit, so the largest credential completes a handshake in any arrival
+  order. Loss is a different matter. With the largest credential on the
+  listener, losing the datagram that starts its ServerHello fails the dial
+  at the handshake deadline: in a `quinn-proto` trace the loss shrinks the
+  congestion window below the unacknowledged flight and the resend waits
+  behind it. Today's 1,993-byte credential recovers. In one simulator
+  measurement, which no test pins, 2,793 bytes still recovered and 3,193
+  did not. The release that adds a key in full has to fix that or accept
+  a redial on such a loss (COMPAT-13).
 
 The classical halves stay as they were. X25519 and Ed25519 don't protect
 against a quantum computer. They protect against a flaw in the young
@@ -67,8 +116,13 @@ The last column is the ML-DSA-87 draft, for comparison (§5).
 
 Each side sends its credential and a signature, because both sides
 authenticate (TLS-5). A handshake moves about 17.5 KB, in place of about
-12.5 KB on `p2p-v2/4` and 21.4 KB with ML-DSA-87. Discovery records don't
-grow: they carry each key as a 32-byte fingerprint (ID-8).
+12.5 KB on `p2p-v2/4` and 21.4 KB with ML-DSA-87. The keys don't make a
+discovery record grow: it carries each as a 32-byte fingerprint (ID-8). The
+largest record a node accepts does grow, from 753 to 9,601 bytes: 7,896
+bytes provide room for a post-quantum record signature and its key
+(COMPAT-13), and 952 hold the 28 more key list entries a node may come to
+have.
+§7 gives the cost of signing records with ML-DSA-65 in that room.
 
 The listener's figures vary by a few bytes between runs, with the size of
 its acknowledgements: its first flight measured 7,861 to 7,873 bytes.
@@ -224,6 +278,172 @@ runs once per node start. The ML-DSA-65 range spans three runs on 2026-11-25. In
 - Round trips and bytes: a simulator test over a link with a fixed delay,
   counting each side's datagrams until the dial completes and after the
   handshake settles. The committed test above checks the round trips.
+- Record signatures: `cargo bench -p zakura-network --bench
+  discovery_record`, whose `ed25519_only` rows are the work a record took
+  before.
 - Fleet: after the Testnet deploy, compare the
   `zakura.quic.handshake.duration_seconds` histogram on the three Testnet
   nodes before and after.
+
+## 7. Record signatures
+
+A prototype signs every discovery record with the node's ML-DSA-65 key as
+well as its Ed25519 key, and requires both (ID-7). The record carries the
+1,952-byte key and the 3,309-byte signature as two extensions, 5,269 bytes
+with their headers. This section records what that costs. "Before" is a
+record signed with Ed25519 alone.
+
+### 7.1 Sizes
+
+A default node's record lists its two keys, one IPv4 address and seven
+services. The figures come from the encoders, in the test
+`a_default_nodes_record_grows_by_the_key_and_signature`.
+
+| | Before | After |
+|---|---|---|
+| A default node's record, and its `Hello` payload | 361 B | 5,630 B |
+| A full sample of 32 such records | 11,554 B | 180,162 B |
+| The `Peers` answer a node sends for it | 11,554 B, 32 records | 67,562 B, 12 records |
+| The largest record | 9,601 B | 9,601 B |
+| The largest `Peers` a node accepts, and sends | 307,234 B, 24,098 B | 307,234 B, 67,562 B |
+| A full book file of 256 such records | 113,162 B | 1,462,026 B |
+| The largest book file | 2,585,610 B | 2,585,610 B |
+| The records of a full book of 10,000 | 3.6 MB | 56.3 MB |
+
+The outgoing byte budget now fits twelve default signed records or seven
+maximum-sized records. The receive limit remains 307,234 bytes.
+
+### 7.2 CPU
+
+`cargo bench -p zakura-network --bench discovery_record`, one core
+(`taskset -c 7`) of the same DigitalOcean premium Intel host, release
+build, mean time. Two other builds were running on the host, so the
+figures can be high by a few percent. The ranges span two runs on
+2026-11-25. The refused record has one flipped byte in its signature's
+commitment hash, so the verifier does all its work, and it was measured in
+the second run only.
+
+| Operation | Before | After |
+|---|---|---|
+| Sign one record | 69–70 µs | 354–363 µs |
+| Verify one record | 176–177 µs | 302–303 µs |
+| Verify the largest record | n/a | 324–329 µs |
+| Refuse a record with a valid Ed25519 and a wrong ML-DSA-65 signature | n/a | 298 µs |
+| Decode and verify a `Peers` of 32 records | 6.17–6.18 ms | 10.2–10.7 ms |
+| Decode a `Peers` of 32 records, no verification | n/a | 0.44 ms |
+
+Ed25519 verification is the strict one of ID-6, which checks the key and
+the signature's `R` for torsion, so it costs more than the 67 µs of §4.1,
+and more than the ML-DSA-65 check it now runs before: about 126 µs with the
+extension parse and the key fingerprint.
+A node signs its record at startup and when the record nears expiry, about
+once a day. The later signing runs on the async runtime under the
+discovery state lock, as the Ed25519 signing did. A record identical to the
+stored one skips verification. A record that verifies and is then
+discarded, for its protocol range, expiry, address or a storage limit, is
+not stored, so it is verified again each time it arrives: a peer that
+answers every `GetPeers` with the same 32 such records costs a node the
+`Peers` row above every 15 seconds on that connection, where it cost the
+"before" column. Verification runs in a blocking task under a node-wide
+slot, a quarter of the cores, for `Hello`, `Peers` and the book file.
+
+### 7.3 Bandwidth
+
+On a shared connection, live-service queries continue every 15 seconds. Peer
+queries use the same interval until the node meets its ordinary connection
+target and has two unconnected candidates eligible to dial. It then asks
+every 60 seconds and rechecks both conditions every 15 seconds. See the
+[parameter rationale](../changelog/params.md#parameters) for the measured
+bandwidth and recovery times. The node sends its signed `Hello` on a new stream and when the
+record changes. Each transmission costs 5,638 bytes including framing.
+At 92 persistent connections, one publication costs 518,696 bytes in the
+sending direction. With a stable address and service list, the record is
+renewed roughly once a day. Reconnects cost one full `Hello` per stream.
+
+For comparison, sending the unchanged record every 15 seconds on all 92
+connections would cost 2.99 GB per day in each direction. The older 361-byte
+record at that cadence cost 0.20 GB. These are application-frame estimates
+for continuously occupied connections and exclude transport overhead.
+
+A full reply of twelve default records costs 67,570 bytes with framing. If
+all 92 peers receive a full reply every 15 seconds, the node sends 414.4 kB/s
+in peer-list replies. One 32-record window per peer every ten minutes costs
+about 27.6 kB/s. With twelve records per reply, that window takes at least
+three exchanges, or 30 seconds after the first reply, assuming each exchange
+returns new records. A discovery-only connection offers one exchange.
+
+### 7.4 Cold discovery
+
+The decision metric was time for an empty node to register four distinct peers
+beyond its seed. Four is the default number of concurrent discovery dials.
+The local Regtest comparison used native QUIC, one seed with 32 confirmed
+records, and the ordinary discovery service and candidate dialer. Each record
+had one IPv4 address and seven services. On the limited path the seed's UDP
+downlink carried 1 Mbit/s with 40 ms of added delay. Candidate dials used
+loopback directly. The per-IP allowance was raised to allow the nodes to
+share one host.
+
+| Outgoing payload cap | Default records in first reply | Median time to four, all reachable | Median discovery traffic to four, all reachable |
+|---|---:|---:|---:|
+| 24,098 B | 4 | 1.21 s | 46 kB |
+| 48,000 B | 8 | 1.21 s | 58 kB |
+| 96,000 B | 17 | 1.21 s | 108 kB |
+| 192,000 B | 32 | 2.21 s | 193 kB |
+
+Each row is five fresh requesters using a shared seed connection. Traffic
+counts discovery frames read at either end involving the requester, in both
+directions. It excludes handshake, packet, and other service traffic.
+
+With 16 of the 32 advertised addresses stale, the requester sometimes had
+enough reachable addresses in its book well before it registered four peers.
+The dialer allows four concurrent attempts, and a live registration can stay
+under observation for up to 60 seconds. For a second comparison, three fresh
+requesters per cap had up to 75 seconds to register four non-seed peers.
+All twelve reached four.
+
+| Outgoing payload cap | Median time to four, half stale | Median discovery traffic to four, half stale |
+|---|---:|---:|
+| 24,098 B | 26.2 s | 96 kB |
+| 48,000 B | 41.3 s | 193 kB |
+| 96,000 B | 31.3 s | 238 kB |
+| 192,000 B | 32.3 s | 238 kB |
+
+In this initial comparison, larger replies delivered more
+addresses on the first exchange, but used more bytes without a consistent
+improvement in registration time. These small local samples cover one
+topology. They do not estimate bootstrap latency on Mainnet.
+
+A follow-up compared the original four-record budget with exactly twelve
+default records on the same paced seed path. Each cell is the median of five
+fresh requesters, all of which registered four non-seed peers within 75 seconds.
+Traffic includes sent and received discovery frames through the fourth registration.
+
+| Default records per reply | All reachable: time / traffic | Half stale: time / traffic | Reachable records in first reply, half stale |
+|---|---:|---:|---:|
+| 4 (24,098 B) | 1.21 s / 46.4 kB | 16.2 s / 96.2 kB | 1–4 |
+| 12 (67,562 B) | 1.21 s / 80.2 kB | 11.2 s / 116.1 kB | 4–8 |
+
+With half the addresses stale, individual times ranged from 1.2 to 56.3 s
+for four records and from 1.2 to 51.3 s for twelve. The reason to spend
+the extra bytes is the larger first sample: in these trials the requester
+always had at least four reachable candidates after one twelve-record reply.
+The overlapping times give limited evidence for a latency improvement.
+
+On a discovery-only connection, the seed can finish its own exchange as soon
+as the requester returns an empty list. Closing then used to discard the
+seed’s reply while QUIC was delivering it or the requester was verifying it.
+At the twelve-record cap, a cold requester previously registered no other
+peers in 75 seconds on the paced link, even with all 32 candidates reachable.
+
+The first close fix gave the listener a two-second grace period. In five local Regtest
+trials per link, the requester retained all twelve advertised records and
+registered four peers in 1.014–1.019 seconds on loopback and 1.203–1.207 seconds
+with a 1 Mbit/s downlink and 40 ms of added downlink latency. With the old
+close behavior, all four matching eight-second controls retained zero records.
+
+Both endpoints now allow eight seconds from the start of a discovery-only exchange.
+A 67,562-byte payload alone needs 4.22 seconds at 128 kbit/s. With that downlink
+and 40 ms of added delay, five fresh Regtest requesters each imported all twelve
+records from the seed before starting their candidate dialer, then connected to
+four non-seed peers. An empty peer list also completes the query. A silent peer
+uses at most one exchange budget before its session slot is released.

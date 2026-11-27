@@ -20,7 +20,9 @@ use rustls::{
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 
 use crate::{
-    composite::{self, COMPOSITE_SCHEME, COMPOSITE_SCHEME_LABEL, ML_DSA_65_KEY_TAG},
+    composite::{
+        self, COMPOSITE_KEY_TAGS, COMPOSITE_SCHEME, COMPOSITE_SCHEME_LABEL, ML_DSA_65_KEY_TAG,
+    },
     credential::NodeCredential,
     key::NodeId,
 };
@@ -31,7 +33,9 @@ pub(crate) const PROTOCOL_VERSIONS: &[&SupportedProtocolVersion] = &[&rustls::ve
 /// The signature schemes a peer may sign its handshake with (TLS-4).
 const SIGNATURE_SCHEMES: &[SignatureScheme] = &[COMPOSITE_SCHEME];
 
-/// Accepts the server only if its credential derives the dialed node ID (TLS-7).
+/// Accepts the server only if the keys it signs with prove it is the dialed
+/// node (TLS-7): its credential derives the dialed node ID, or extends the
+/// credential that did.
 #[derive(Debug)]
 pub(crate) struct ServerCertificateVerifier {
     expected: NodeId,
@@ -53,7 +57,9 @@ impl ServerCertVerifier for ServerCertificateVerifier {
         _now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
         let credential = verifiable_credential(end_entity, intermediates)?;
-        if credential.node_id() != self.expected {
+        // The composite is the only scheme offered, so its keys are the
+        // ones the signature check below will use.
+        if !credential.proves_dialed_id(self.expected, &COMPOSITE_KEY_TAGS) {
             return Err(rustls::Error::InvalidCertificate(
                 CertificateError::UnknownIssuer,
             ));
@@ -189,22 +195,34 @@ fn verify_signature(
     // rustls calls this only after a verifier accepted `cert`, so the
     // credential parses and holds both keys.
     let bad_encoding = rustls::Error::InvalidCertificate(CertificateError::BadEncoding);
-    let credential = super::credential_from_cert(cert.as_ref()).ok_or(bad_encoding.clone())?;
-    let (Some(ed25519), Some(ml_dsa)) = (credential.ed25519(), credential.key(ML_DSA_65_KEY_TAG))
-    else {
-        return Err(bad_encoding);
-    };
-    composite::verify(&ed25519, ml_dsa, message, dss.signature())
-        .map_err(|_| rustls::Error::InvalidCertificate(CertificateError::BadSignature))?;
+    let credential = super::credential_from_cert(cert.as_ref()).ok_or(bad_encoding)?;
+    verify_composite(&credential, message, dss.signature())?;
     metrics::counter!("zakura.quic.tls.signature_verified", "scheme" => COMPOSITE_SCHEME_LABEL)
         .increment(1);
     Ok(HandshakeSignatureValid::assertion())
 }
 
+/// Checks a composite `signature` over `message` with the two keys
+/// `credential` holds under [`COMPOSITE_KEY_TAGS`], and with no other entry.
+fn verify_composite(
+    credential: &NodeCredential,
+    message: &[u8],
+    signature: &[u8],
+) -> Result<(), rustls::Error> {
+    let (Some(ed25519), Some(ml_dsa)) = (credential.ed25519(), credential.key(ML_DSA_65_KEY_TAG))
+    else {
+        return Err(rustls::Error::InvalidCertificate(
+            CertificateError::BadEncoding,
+        ));
+    };
+    composite::verify(&ed25519, ml_dsa, message, signature)
+        .map_err(|_| rustls::Error::InvalidCertificate(CertificateError::BadSignature))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{NodeSecretKey, ED25519_KEY_TAG};
+    use crate::{CredentialKey, NodeSecretKey, ED25519_KEY_TAG};
 
     fn cert(credential: &NodeCredential) -> CertificateDer<'static> {
         CertificateDer::from(credential.to_spki().to_vec())
@@ -280,6 +298,208 @@ mod tests {
                 CertificateError::BadEncoding
             ))
         );
+    }
+
+    /// ID-8, ID-12, SEC-2: a credential past either limit is a bad encoding
+    /// to both verifiers, so a dialer refuses it from a listener and a
+    /// listener from a dialer. Each is one step past a credential both
+    /// verifiers read.
+    #[test]
+    fn a_credential_past_a_limit_is_refused_in_both_directions() {
+        let secret = NodeSecretKey::generate();
+        // The node's two keys, then `added` entries of a tag, a length and
+        // bytes. A length with its top bit set marks a fingerprint.
+        let with = |added: &[(u16, u16, usize)]| {
+            let mut bytes = secret.credential().encode();
+            bytes[0] += u8::try_from(added.len()).unwrap();
+            for (tag, length, value) in added {
+                bytes.extend_from_slice(&tag.to_le_bytes());
+                bytes.extend_from_slice(&length.to_le_bytes());
+                bytes.extend(vec![0x5a; *value]);
+            }
+            crate::credential::spki_of(&bytes)
+        };
+        let fingerprints =
+            |count: u16| -> Vec<_> { (4..4 + count).map(|tag| (tag, 0x8020, 32)).collect() };
+        let keys = |last: u16| {
+            let longest = |tag| (tag, 2_592, 2_592);
+            [
+                longest(4),
+                longest(5),
+                longest(6),
+                (7, last, usize::from(last)),
+            ]
+        };
+        // 32 entries and 10,385 bytes are within the limits.
+        let within = [with(&fingerprints(30)), with(&keys(600))];
+        assert_eq!(
+            NodeCredential::from_spki(within[1].as_ref())
+                .map(|credential| credential.encode().len()),
+            Ok(crate::MAX_CREDENTIAL_BYTES)
+        );
+        let past = [with(&fingerprints(31)), with(&keys(601))];
+
+        let name = ServerName::try_from(super::super::UNSENT_SERVER_NAME).unwrap();
+        let dialer_reads = |spki: &[u8], dialed: NodeId| {
+            ServerCertificateVerifier::new(dialed)
+                .verify_server_cert(
+                    &CertificateDer::from(spki),
+                    &[],
+                    &name,
+                    &[],
+                    UnixTime::now(),
+                )
+                .map(|_| ())
+        };
+        let listener_reads = |spki: &[u8]| {
+            ClientCertificateVerifier
+                .verify_client_cert(&CertificateDer::from(spki), &[], UnixTime::now())
+                .map(|_| ())
+        };
+        let bad_encoding = Err(rustls::Error::InvalidCertificate(
+            CertificateError::BadEncoding,
+        ));
+
+        // The ID of the node's two keys names a prefix of each credential.
+        for spki in &within {
+            assert_eq!(dialer_reads(spki.as_ref(), secret.public()), Ok(()));
+            assert_eq!(listener_reads(spki.as_ref()), Ok(()));
+        }
+        for spki in &past {
+            assert_eq!(dialer_reads(spki.as_ref(), secret.public()), bad_encoding);
+            assert_eq!(listener_reads(spki.as_ref()), bad_encoding);
+        }
+    }
+
+    fn accepts(dialed: NodeId, presented: &NodeCredential) -> bool {
+        let name = ServerName::try_from(super::super::UNSENT_SERVER_NAME).unwrap();
+        ServerCertificateVerifier::new(dialed)
+            .verify_server_cert(&cert(presented), &[], &name, &[], UnixTime::now())
+            .is_ok()
+    }
+
+    /// `secret`'s credential with `extra` entries after its own two.
+    fn extended(
+        secret: &NodeSecretKey,
+        extra: impl IntoIterator<Item = (u16, CredentialKey)>,
+    ) -> NodeCredential {
+        let own = [ED25519_KEY_TAG, ML_DSA_65_KEY_TAG].map(|tag| {
+            let key = secret.credential().key(tag).unwrap().to_vec();
+            (tag, CredentialKey::Full(key))
+        });
+        NodeCredential::from_entries(own.into_iter().chain(extra)).unwrap()
+    }
+
+    /// TLS-7: a node that added keys still answers a dial to the ID its two
+    /// signing keys had on their own, and to its current ID.
+    #[test]
+    fn a_dial_to_an_earlier_id_accepts_the_extended_credential() {
+        let secret = NodeSecretKey::generate();
+        let earlier = secret.public();
+        let with_key = extended(&secret, [(4, CredentialKey::Full(vec![0x5a; 1_312]))]);
+        let with_fingerprint = extended(&secret, [(4, CredentialKey::Fingerprint([0x5a; 32]))]);
+        let with_two = extended(
+            &secret,
+            [
+                (4, CredentialKey::Full(vec![0x5a; 1_312])),
+                (5, CredentialKey::Fingerprint([0x6b; 32])),
+            ],
+        );
+
+        assert!(accepts(earlier, secret.credential()));
+        for credential in [&with_key, &with_fingerprint, &with_two] {
+            assert_ne!(credential.node_id(), earlier);
+            assert!(accepts(earlier, credential));
+            assert!(accepts(credential.node_id(), credential));
+        }
+        // The ID the node had between the two additions.
+        assert!(accepts(with_key.node_id(), &with_two));
+        assert!(!accepts(with_two.node_id(), &with_key));
+        assert!(!accepts(NodeSecretKey::generate().public(), &with_two));
+    }
+
+    /// TLS-7: the dialed ID must commit to both signing keys. An ID whose
+    /// list leaves one out is refused, though the credential holds every
+    /// entry of that list.
+    #[test]
+    fn a_dialed_id_that_leaves_a_signing_key_out_is_refused() {
+        let secret = NodeSecretKey::generate();
+        let ed25519 = secret.public_key().as_bytes().to_vec();
+        let ml_dsa = secret.credential().key(ML_DSA_65_KEY_TAG).unwrap().to_vec();
+        let other = vec![0x5a; 1_312];
+        let presented = extended(&secret, [(4, CredentialKey::Full(other.clone()))]);
+        let id_of =
+            |entries: Vec<(u16, Vec<u8>)>| NodeCredential::from_entries(entries).unwrap().node_id();
+
+        assert!(!accepts(
+            id_of(vec![(ED25519_KEY_TAG, ed25519.clone())]),
+            &presented
+        ));
+        assert!(!accepts(
+            id_of(vec![(ED25519_KEY_TAG, ed25519), (4, other.clone())]),
+            &presented
+        ));
+        assert!(!accepts(
+            id_of(vec![(ML_DSA_65_KEY_TAG, ml_dsa), (4, other)]),
+            &presented
+        ));
+    }
+
+    /// TLS-4, ID-12: a fingerprint-only ML-DSA-65 entry keeps the node ID
+    /// but can't check a signature, so both verifiers refuse the credential
+    /// even on a dial to exactly its ID.
+    #[test]
+    fn a_signing_key_given_as_a_fingerprint_is_refused() {
+        let secret = NodeSecretKey::generate();
+        let retired = secret
+            .credential()
+            .clone()
+            .with_fingerprint_only(ML_DSA_65_KEY_TAG)
+            .unwrap();
+        assert_eq!(retired.node_id(), secret.public());
+
+        assert!(!retired.proves_dialed_id(secret.public(), &COMPOSITE_KEY_TAGS));
+        assert!(!accepts(secret.public(), &retired));
+        assert_eq!(
+            verifiable_credential(&cert(&retired), &[]),
+            Err(rustls::Error::InvalidCertificate(
+                CertificateError::ApplicationVerificationFailure
+            ))
+        );
+        assert!(verify_composite(&retired, b"transcript", &[0; 3_373]).is_err());
+        // Nor can the node itself be set to present it.
+        assert!(secret.with_credential(retired).is_err());
+    }
+
+    /// TLS-7: anyone can present a node's public keys beside a key of their
+    /// own. The credential passes for a dial to that node, and the handshake
+    /// then fails, because the signature is checked with the node's two keys
+    /// and never with the added one.
+    #[test]
+    fn a_nodes_keys_beside_an_attackers_key_fail_the_signature() {
+        let node = NodeSecretKey::generate();
+        let attacker = NodeSecretKey::generate();
+        let attacker_key = attacker.credential().key(ML_DSA_65_KEY_TAG).unwrap();
+        let forged = extended(&node, [(4, CredentialKey::Full(attacker_key.to_vec()))]);
+        let message = b"transcript";
+
+        assert!(accepts(node.public(), &forged));
+        let attackers = attacker.sign_composite(message, [3; 32]).unwrap();
+        assert_eq!(
+            verify_composite(&forged, message, &attackers),
+            Err(rustls::Error::InvalidCertificate(
+                CertificateError::BadSignature
+            ))
+        );
+        let nodes = node.sign_composite(message, [3; 32]).unwrap();
+        assert_eq!(verify_composite(&forged, message, &nodes), Ok(()));
+
+        // The attacker's own credential, extended with the node's keys as
+        // extra entries, signs validly but never names the node.
+        let node_key = node.credential().key(ML_DSA_65_KEY_TAG).unwrap();
+        let claiming = extended(&attacker, [(4, CredentialKey::Full(node_key.to_vec()))]);
+        assert_eq!(verify_composite(&claiming, message, &attackers), Ok(()));
+        assert!(!accepts(node.public(), &claiming));
     }
 
     /// TLS-4: a credential that pairs this node's Ed25519 key with another

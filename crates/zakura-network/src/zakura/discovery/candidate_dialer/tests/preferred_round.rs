@@ -28,9 +28,20 @@ pub(super) async fn dialer(
     CandidateDialerIO,
     watch::Sender<MinerGatewayRanking>,
 ) {
+    dialer_with_places(seed, 10).await
+}
+
+async fn dialer_with_places(
+    seed: u64,
+    places: usize,
+) -> (
+    ZakuraTestNode,
+    CandidateDialerIO,
+    watch::Sender<MinerGatewayRanking>,
+) {
     let mut limits = ZakuraLocalLimits::from_config(&crate::Config::default());
     limits.max_connections = MAX_CONNECTIONS;
-    limits.max_preferred_connections = 10;
+    limits.max_preferred_connections = places;
     let node = ZakuraTestNode::builder(seed)
         .limits(limits)
         .spawn()
@@ -100,6 +111,7 @@ fn gateway_ip(gateway: NodeId) -> IpAddr {
 fn ranking(gateways: &[NodeId]) -> MinerGatewayRanking {
     let count = u32::try_from(gateways.len()).expect("a test ranks few gateways");
     MinerGatewayRanking {
+        always_preferred: Vec::new(),
         gateways: gateways
             .iter()
             .zip((1..=count).rev())
@@ -243,6 +255,24 @@ async fn unknown_gateways_and_the_node_itself_are_neither_held_nor_dialed() {
     node.shutdown().await;
 }
 
+/// A template node whose coinbases name its pool's relay ranks the relay like any other
+/// gateway: only the node's own ID is left out.
+#[tokio::test(start_paused = true)]
+async fn the_relay_a_node_names_is_held_and_dialed_but_its_own_id_is_not() {
+    let (node, mut io, ranking_tx) = dialer(9240).await;
+    let relay = known_gateways(&node, 1).await;
+    let own = node.endpoint().local_node_id();
+    // The node's own blocks name the relay, so the relay ranks first.
+    ranking_tx.send_replace(ranking(&[relay[0], own]));
+    let mut state = CandidateDialerState::new(DIAL_BACKOFF);
+
+    let round = io.admit_round(&mut state, &[], Instant::now()).await;
+
+    assert_eq!(held(&node.endpoint()).members, relay);
+    assert_eq!(dialed(&round.preferred), relay);
+    node.shutdown().await;
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_node_at_ordinary_capacity_can_dial_a_funded_gateway() {
     let (node, mut io, ranking_tx) = dialer(9234).await;
@@ -380,4 +410,172 @@ async fn a_waiting_member_that_calls_in_gets_no_dial() {
         .await;
     assert_eq!(dialed(&fourth.preferred), below);
     node.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn moved_gateway_yields_the_last_place_until_rollback_can_be_checked() {
+    let (node, mut io, ranks) = dialer_with_places(9234, 1).await;
+    let gateways = known_gateways(&node, 2).await;
+    let (earlier, standby) = (gateways[0], gateways[1]);
+    let current = node_id(0);
+    let endpoint = node.endpoint();
+    let mut slots = endpoint.hold_connection_slots(io.discovery.ordinary_connection_cap, false);
+    ranks.send_replace(ranking(&gateways));
+    node.supervisor().learn_move(earlier, current);
+    let now = Instant::now();
+    let due = now + crate::zakura::DEFAULT_ZAKURA_REDIAL_MAX_BACKOFF;
+
+    for (at, expected) in [(now, standby), (due - Duration::from_nanos(1), standby)] {
+        tokio::time::advance(at - Instant::now()).await;
+        let mut state = CandidateDialerState::new(DIAL_BACKOFF);
+        let round = io.admit_round(&mut state, &[], at).await;
+        assert_eq!(dialed(&round.preferred), [expected]);
+        assert_eq!(state.in_flight_node_ids(), [expected]);
+        assert!(!state.is_backed_off(earlier, gateway_ip(earlier), at));
+    }
+    slots.pop();
+    let round = io
+        .admit_round(
+            &mut CandidateDialerState::new(DIAL_BACKOFF),
+            &[],
+            Instant::now(),
+        )
+        .await;
+    assert_eq!(
+        dialed(&round.preferred),
+        [earlier],
+        "a free ordinary slot needs no rollback probe"
+    );
+    slots.extend(endpoint.hold_connection_slots(1, false));
+    tokio::time::advance(due - Instant::now()).await;
+    let round = io
+        .admit_round(&mut CandidateDialerState::new(DIAL_BACKOFF), &[], due)
+        .await;
+    assert_eq!(
+        dialed(&round.preferred),
+        [earlier],
+        "the due gateway can use the held place"
+    );
+    drop(slots);
+    node.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn chained_gateway_moves_yield_both_places_to_standbys() {
+    let (node, mut io, ranks) = dialer_with_places(9234, 2).await;
+    let gateways = known_gateways(&node, 4).await;
+    ranks.send_replace(ranking(&gateways));
+    node.supervisor().learn_move(gateways[0], gateways[1]);
+    node.supervisor().learn_move(gateways[1], node_id(0));
+    let slots = node
+        .endpoint()
+        .hold_connection_slots(MAX_CONNECTIONS, false);
+
+    let mut state = CandidateDialerState::new(DIAL_BACKOFF);
+    let round = io.admit_round(&mut state, &[], Instant::now()).await;
+    assert_eq!(held(&node.endpoint()).members, gateways[2..]);
+    assert_eq!(dialed(&round.preferred), gateways[2..]);
+
+    drop(slots);
+    node.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn moved_gateway_ranked_under_both_ids_gets_one_dial_per_round() {
+    let (node, mut io, ranks) = dialer(9234).await;
+    let gateways = known_gateways(&node, 2).await;
+    let (earlier, current) = (gateways[0], gateways[1]);
+    ranks.send_replace(ranking(&gateways));
+    node.supervisor().learn_move(earlier, current);
+    let mut state = CandidateDialerState::new(DIAL_BACKOFF);
+    let round = io.admit_round(&mut state, &[], Instant::now()).await;
+    assert_eq!(dialed(&round.preferred), [earlier]);
+    assert!(round.ordinary.is_empty());
+    let next = io.admit_round(&mut state, &[], Instant::now()).await;
+    assert!(next.preferred.is_empty() && next.ordinary.is_empty());
+    node.shutdown().await;
+}
+
+#[tokio::test]
+async fn moved_gateway_report_survives_eviction_of_the_earlier_record(
+) -> Result<(), crate::BoxError> {
+    use crate::zakura::{
+        testkit::{LocalEndpointFactory, TEST_NET_TIMEOUT},
+        GatewayPlace, ZakuraDiscoveryConfig, ZakuraDiscoveryLocalConfig, ZakuraHandshakeConfig,
+    };
+    let (node, mut io, ranks) = dialer(9340).await;
+    let peer = ZakuraTestNode::builder(9341)
+        .extended_credential()
+        .spawn()
+        .await?;
+    let earlier = peer.earlier_node_addr().await;
+    let current = peer.node_addr().await.id;
+    let handshake = ZakuraHandshakeConfig::for_network(&zakura_chain::parameters::Network::Mainnet);
+    let book = |seed| {
+        let local = ZakuraDiscoveryLocalConfig {
+            secret_key: LocalEndpointFactory::secret_key(seed),
+            direct_addrs: vec![SocketAddr::from(([93, 184, 216, 34], 8233))],
+            services: vec![ZakuraServiceId::discovery()],
+            zakura_protocol_min: handshake.zakura_protocol_min,
+            zakura_protocol_max: handshake.zakura_protocol_max,
+            network_id: handshake.network_id,
+            chain_id: handshake.chain_id,
+            last_authored_sequence: None,
+        };
+        let mut config = ZakuraDiscoveryConfig::default();
+        config.book_limits.max_records = 1;
+        ZakuraDiscoveryHandle::new(local, config, node.supervisor().subscribe())
+    };
+    io.discovery = book(9340)?;
+    let old_record = (*book(9341)?.current_self_record()).clone();
+    assert_eq!(old_record.body.node_id(), earlier.id);
+    io.discovery
+        .import_peer_records([old_record], Some(node_id(9)))
+        .await?;
+    assert!(io.discovery.record_for(earlier.id).await.is_some());
+    node.connect_native_to_addr(earlier.clone(), TEST_NET_TIMEOUT)
+        .await?;
+    let replacement = (*book(9342)?.current_self_record()).clone();
+    let replacement_id = replacement.body.node_id();
+    io.discovery
+        .import_connected_peer_record(
+            replacement,
+            replacement_id,
+            Some(IpAddr::from([93, 184, 216, 34])),
+        )
+        .await?;
+    assert!(
+        io.discovery.record_for(earlier.id).await.is_none(),
+        "the single-entry book evicts the relayed record"
+    );
+    ranks.send_replace(ranking(&[earlier.id]));
+    let state = CandidateDialerState::new(DIAL_BACKOFF);
+    io.publish_preferred_gateways(&state, &[current], Instant::now())
+        .await;
+    let report = node.endpoint().connection_places();
+    // The peer's handshake proved the earlier ID the blocks name, so the
+    // peer fills that gateway's held place under the ID it has now.
+    assert_eq!(
+        (report.gateways[0].place, report.gateways[0].connected),
+        (GatewayPlace::Preferred, true)
+    );
+    assert_eq!(report.peers.len(), 1);
+    assert_eq!(report.peers[0].node_id, *current.as_bytes());
+    assert!(report.peers[0].preferred);
+    assert_eq!((report.slots.ordinary, report.slots.preferred), (0, 1));
+    peer.shutdown().await;
+    tokio::time::timeout(
+        TEST_NET_TIMEOUT,
+        node.supervisor().subscribe().wait_for(Vec::is_empty),
+    )
+    .await??;
+    io.publish_preferred_gateways(&state, &[], Instant::now())
+        .await;
+    let report = node.endpoint().connection_places();
+    assert_eq!(
+        (report.gateways[0].place, report.gateways[0].connected),
+        (GatewayPlace::Unmatched, false)
+    );
+    node.shutdown().await;
+    Ok(())
 }

@@ -405,9 +405,10 @@ impl RpcSchema for MeshGateway {
                 "gateway_id": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
                 "blocks": generator.subschema_for::<u32>(),
                 "state": generator.subschema_for::<MeshGatewayState>(),
+                "template_node": generator.subschema_for::<bool>(),
                 "connected": generator.subschema_for::<bool>(),
             },
-            "required": ["gateway_id", "blocks", "state", "connected"],
+            "required": ["gateway_id", "blocks", "state", "template_node", "connected"],
         })
     }
 }
@@ -454,7 +455,10 @@ impl RpcSchema for GetMinerMeshInfoResponse {
             "type": "object",
             "properties": {
                 "node_id": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$" },
-                "announcing": generator.subschema_for::<bool>(),
+                "announced_gateways": {
+                    "type": "array",
+                    "items": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+                },
                 "mining": generator.subschema_for::<bool>(),
                 "synced": generator.subschema_for::<bool>(),
                 "window": generator.subschema_for::<Option<MeshWindow>>(),
@@ -463,7 +467,7 @@ impl RpcSchema for GetMinerMeshInfoResponse {
                 "slots": generator.subschema_for::<Option<MeshSlots>>(),
                 "peers": generator.subschema_for::<Vec<MeshPeer>>(),
             },
-            "required": ["node_id", "announcing", "mining", "synced", "window", "gateways", "hold", "slots", "peers"],
+            "required": ["node_id", "announced_gateways", "mining", "synced", "window", "gateways", "hold", "slots", "peers"],
         })
     }
 }

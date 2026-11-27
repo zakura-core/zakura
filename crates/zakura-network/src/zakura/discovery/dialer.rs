@@ -11,6 +11,7 @@ use zakura_rt::{
     task::JoinHandle,
 };
 
+use super::bootstrap::SeedDialPolicy;
 use crate::zakura::{
     handler::{DialRegistration, DialReport},
     transport::MovedNodeIds,
@@ -23,23 +24,31 @@ use crate::zakura::{
 ///
 /// Returns the dialer's task, if there are remote peers, so the caller can
 /// track it under the endpoint shutdown owner. The task also observes the
-/// shutdown token directly.
+/// shutdown token directly. The seeds' [`SeedDialPolicy`] is set before this
+/// returns, so the candidate dialer never runs without it. `pins` are the
+/// operator's `network.unconditional_peers`, whose seed connections the
+/// dialer leaves alone.
 pub(crate) fn spawn_native_bootstrap_dialer(
     endpoint: ZakuraEndpoint,
     bootstrap_peers: Vec<String>,
+    pins: crate::UnconditionalPeers,
     limits: ZakuraLocalLimits,
 ) -> Vec<JoinHandle<()>> {
     let mut seeds = grouped_remote_bootstrap_peers(bootstrap_peers, endpoint.local_node_id());
     if seeds.is_empty() {
         return Vec::new();
     }
+    endpoint.set_seed_dial_policy(SeedDialPolicy {
+        ids: seeds.iter().map(|seed| seed.id).collect(),
+        excluded: false,
+    });
     // Shuffled so nodes spread their first dials over the seeds. Sorted first,
     // so the shuffle is the order's only source of randomness.
     seeds.sort_unstable_by(|a, b| a.id.as_bytes().cmp(b.id.as_bytes()));
     seeds.shuffle(&mut zakura_rt::rand::rng());
     vec![spawn_erased_named(
         "bootstrap_dialer",
-        super::bootstrap::run_bootstrap_dialer(endpoint, seeds, limits),
+        super::bootstrap::run_bootstrap_dialer(endpoint, seeds, pins, limits),
     )]
 }
 

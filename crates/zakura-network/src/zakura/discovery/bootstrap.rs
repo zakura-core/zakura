@@ -6,7 +6,7 @@
 //! outgrew their inbound cap. Like Bitcoin Core's address-fetch connections, a
 //! seed connection now lasts only until discovery has found other peers:
 //!
-//! - Below [`BOOTSTRAP_DIAL_FLOOR`] outbound non-seed hosts, this dialer dials
+//! - Below [`BOOTSTRAP_DIAL_FLOOR`] non-seed hosts, this dialer dials
 //!   up to [`MAX_BOOTSTRAP_CONNECTIONS`] seeds with a short backoff, so a
 //!   node whose seeds were down recovers quickly, and the candidate dialer may
 //!   dial seeds like any other candidate, up to half its ordinary slots.
@@ -15,7 +15,10 @@
 //! - Once [`BOOTSTRAP_RELEASE_HOSTS`] hosts have settled, this dialer closes
 //!   the seed connections that discovery opened. A pin, an upgrade hand-off
 //!   or a seed's own connection keeps the lifetime its owner gives it
-//!   ([`ConnectionOpener`]).
+//!   ([`ConnectionOpener`]), and so does a connection that satisfies a pin.
+//!
+//! Hosts count peers in either direction, so a node whose slots fill with
+//! inbound peers still lets its seeds go.
 //!
 //! A seed is recognized by what its connection's handshake proved: its
 //! configured node ID, or an ID it has now that keeps the configured one
@@ -33,7 +36,8 @@ use zakura_rt::{collections::HashSet, sync::oneshot, task::AbortOnDropHandle, ti
 
 use super::redial::{score_dial, DialResult, ZAKURA_REDIAL_HEALTHY_CONNECTION};
 use crate::zakura::{
-    handler::{ConnectionOpener, OutboundPeer},
+    handler::{ConnectionOpener, PeerConnection},
+    transport::HeldPlaces,
     ZakuraEndpoint, ZakuraLocalLimits, ZakuraPeerId, DEFAULT_ZAKURA_REDIAL_INITIAL_BACKOFF,
     DEFAULT_ZAKURA_REDIAL_MAX_BACKOFF, ZAKURA_ALPN_MISMATCH_BACKOFF,
 };
@@ -41,12 +45,12 @@ use crate::zakura::{
 #[cfg(all(test, not(zakura_sim)))]
 mod tests;
 
-/// Below this many outbound non-seed hosts, the node dials seeds. Bitcoin Core
-/// skips its DNS seeds at the same count of outbound peers
-/// (`SEED_OUTBOUND_CONNECTION_THRESHOLD`).
+/// Below this many non-seed hosts, the node dials seeds. Bitcoin Core skips
+/// its DNS seeds at the same count (`SEED_OUTBOUND_CONNECTION_THRESHOLD`) of
+/// outbound peers.
 pub(super) const BOOTSTRAP_DIAL_FLOOR: usize = 2;
 
-/// Once this many outbound non-seed hosts have each kept a peer registered for
+/// Once this many non-seed hosts have each kept a peer registered for
 /// [`ZAKURA_REDIAL_HEALTHY_CONNECTION`], the node closes the connections it
 /// opened to seeds. The gap above [`BOOTSTRAP_DIAL_FLOOR`] keeps brief churn
 /// from dialing a seed again.
@@ -86,23 +90,26 @@ impl SeedDialPolicy {
     }
 }
 
-/// How many hosts back this node's outbound non-seed peers.
+/// How many hosts back this node's non-seed peers, in either direction.
 ///
 /// Hosts are [`admission_host`](crate::zakura::handler)s, so peers on one IPv4
 /// address or IPv6 /64 count once.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(super) struct PeerCoverage {
-    /// Hosts with a registered outbound peer.
+    /// Hosts with a registered peer.
     hosts: usize,
-    /// Hosts with an outbound peer registered for at least
+    /// Hosts with a peer registered for at least
     /// [`ZAKURA_REDIAL_HEALTHY_CONNECTION`].
     settled_hosts: usize,
 }
 
 impl PeerCoverage {
-    /// Counts the hosts of the outbound non-seed `peers` at `now`. A peer
-    /// whose IP isn't known counts as a host of its own.
-    pub(super) fn of<'a>(peers: impl IntoIterator<Item = &'a OutboundPeer>, now: Instant) -> Self {
+    /// Counts the hosts of the non-seed `peers` at `now`. A peer whose IP
+    /// isn't known counts as a host of its own.
+    pub(super) fn of<'a>(
+        peers: impl IntoIterator<Item = &'a PeerConnection>,
+        now: Instant,
+    ) -> Self {
         #[derive(Clone, Copy, Eq, Hash, PartialEq)]
         enum Host<'a> {
             Ip(IpAddr),
@@ -201,16 +208,16 @@ impl BootstrapPlan {
             .flatten()
     }
 
-    /// Returns which seed each of the `outbound` peers is, if any. A peer is
+    /// Returns which seed each of the `connections` is, if any. A peer is
     /// seed `index` when it is registered under an ID that seed is known by,
     /// or its handshake proved the seed's configured ID. In that last case
     /// the plan remembers the ID it registered under.
     pub(super) fn match_peers(
         &mut self,
-        outbound: &[OutboundPeer],
+        connections: &[PeerConnection],
         current: impl Fn(NodeId) -> NodeId,
     ) -> Vec<Option<usize>> {
-        outbound
+        connections
             .iter()
             .map(|peer| {
                 let node_id = peer.peer_id.node_id()?;
@@ -308,15 +315,17 @@ impl BootstrapPlan {
 /// Runs the bootstrap dialer for `seeds` until the endpoint shuts down.
 ///
 /// Every [`BOOTSTRAP_CHECK_INTERVAL`], and whenever a seed dial ends, it
-/// reads this node's outbound peers, sets the [`SeedDialPolicy`], closes the
+/// reads this node's connections, sets the [`SeedDialPolicy`], closes the
 /// seed connections discovery opened once enough hosts have settled, and
 /// starts the dials [`BootstrapPlan::dials`] picks. A seed found under a new
 /// ID gets the operator warning of [`super::dialer::warn_when_moved`].
 pub(super) async fn run_bootstrap_dialer(
     endpoint: ZakuraEndpoint,
     seeds: Vec<NodeAddr>,
+    pins: crate::UnconditionalPeers,
     limits: ZakuraLocalLimits,
 ) {
+    let pinned_ids: HashSet<NodeId> = pins.dial_names().filter_map(|name| name.node_id).collect();
     let shutdown = endpoint.background_shutdown_token();
     let supervisor = endpoint.supervisor();
     let moved = supervisor.moved_node_ids();
@@ -329,10 +338,10 @@ pub(super) async fn run_bootstrap_dialer(
     loop {
         let now = Instant::now();
         let current = |id: NodeId| moved.borrow().current(id);
-        let outbound = supervisor.outbound_peers().await;
-        let matched = plan.match_peers(&outbound, current);
+        let connections = supervisor.peer_connections().await;
+        let matched = plan.match_peers(&connections, current);
         let coverage = PeerCoverage::of(
-            outbound
+            connections
                 .iter()
                 .zip(&matched)
                 .filter(|(_, seed)| seed.is_none())
@@ -349,15 +358,11 @@ pub(super) async fn run_bootstrap_dialer(
 
         if coverage.releases_seeds() {
             let held = endpoint.held_places();
-            for (peer, index) in outbound.iter().zip(&matched) {
+            for (peer, index) in connections.iter().zip(&matched) {
                 let Some(index) = *index else {
                     continue;
                 };
-                // A seed the node prefers as a mining gateway keeps its place.
-                let preferred = std::iter::once(peer.peer_id.as_bytes())
-                    .chain(peer.earlier.iter().map(|id| id.as_bytes().as_slice()))
-                    .any(|id| held.contains_bytes(id));
-                if peer.opener != ConnectionOpener::Discovery || preferred {
+                if keeps_seed_connection(peer, &held, &pinned_ids, &pins) {
                     continue;
                 }
                 if supervisor.disconnect_discovery_peer(&peer.peer_id).await {
@@ -396,6 +401,27 @@ pub(super) async fn run_bootstrap_dialer(
             _ = zakura_rt::time::sleep(BOOTSTRAP_CHECK_INTERVAL) => {}
         }
     }
+}
+
+/// Whether a seed release leaves the seed connection `peer` up: discovery
+/// didn't open it, the node holds it as a preferred mining gateway, or it
+/// satisfies an unconditional peer entry in `pins`, which names it by an ID
+/// in `pinned_ids` that its handshake proved or by its address.
+fn keeps_seed_connection(
+    peer: &PeerConnection,
+    held: &HeldPlaces,
+    pinned_ids: &HashSet<NodeId>,
+    pins: &crate::UnconditionalPeers,
+) -> bool {
+    let proven = || {
+        peer.peer_id
+            .node_id()
+            .into_iter()
+            .chain(peer.earlier.iter().copied())
+    };
+    peer.opener != ConnectionOpener::Discovery
+        || proven().any(|id| held.contains_bytes(id.as_bytes()) || pinned_ids.contains(&id))
+        || peer.remote_ip.is_some_and(|ip| pins.is_dial_address(ip))
 }
 
 /// Dials and serves seed `index` at `node_addr` in a task of its own, and

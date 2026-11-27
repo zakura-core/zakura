@@ -20,11 +20,12 @@ fn peer_id(byte: u8) -> ZakuraPeerId {
     ZakuraPeerId::from_node_id(NodeSecretKey::from_bytes(&[byte; 32]).public())
 }
 
-/// An outbound peer discovery opened on `ip`, registered at `registered_at`.
-fn outbound(byte: u8, ip: Option<[u8; 4]>, registered_at: Instant) -> OutboundPeer {
-    OutboundPeer {
+/// A peer discovery opened on `ip`, registered at `registered_at`.
+fn outbound(byte: u8, ip: Option<[u8; 4]>, registered_at: Instant) -> PeerConnection {
+    PeerConnection {
         peer_id: peer_id(byte),
         earlier: Vec::new(),
+        remote_ip: ip.map(IpAddr::from),
         host: ip.map(IpAddr::from),
         registered_at,
         opener: ConnectionOpener::Discovery,
@@ -42,7 +43,7 @@ fn dialed(started: &[(usize, NodeAddr)]) -> Vec<usize> {
     started.iter().map(|(index, _)| *index).collect()
 }
 
-/// Coverage counts the hosts of outbound non-seed peers: one per IP, one per
+/// Coverage counts the hosts of non-seed peers: one per IP, one per
 /// peer without a known IP, and settled only after the healthy-connection
 /// time. The floor excludes seeds and the settled hosts release them.
 #[test]
@@ -57,9 +58,14 @@ fn coverage_counts_distinct_hosts() {
         outbound(3, Some([203, 0, 113, 2]), young),
         // A peer with no known IP is a host of its own.
         outbound(4, None, old),
+        // A peer that dialed this node counts too.
+        PeerConnection {
+            opener: ConnectionOpener::Remote,
+            ..outbound(5, Some([203, 0, 113, 3]), old)
+        },
     ];
 
-    assert_eq!(PeerCoverage::of(&peers, now), coverage(3, 2));
+    assert_eq!(PeerCoverage::of(&peers, now), coverage(4, 3));
     assert_eq!(PeerCoverage::of(&[], now), coverage(0, 0));
 
     assert!(!coverage(BOOTSTRAP_DIAL_FLOOR - 1, 0).excludes_seeds());
@@ -88,7 +94,7 @@ fn seeds_are_matched_by_the_ids_their_handshakes_prove() {
     let mut moved = outbound(21, None, now);
     moved.earlier = vec![configured[2]];
     let peers = [
-        OutboundPeer {
+        PeerConnection {
             peer_id: ZakuraPeerId::from_node_id(configured[0]),
             ..outbound(0, None, now)
         },
@@ -211,4 +217,40 @@ fn failed_seeds_back_off_and_rotate() {
     plan.finished(0, DialResult::Healthy, later);
     assert_eq!(plan.seeds[0].retry_at, later);
     assert_eq!(plan.seeds[0].backoff, DEFAULT_ZAKURA_REDIAL_INITIAL_BACKOFF);
+}
+
+/// A seed release closes a seed connection discovery opened, and leaves one
+/// another dialer opened, one held as a preferred gateway, and one that
+/// satisfies an unconditional peer entry by node ID, by an earlier node ID
+/// its handshake proved, or by address.
+#[test]
+fn a_release_keeps_pinned_and_foreign_seed_connections() {
+    let now = Instant::now();
+    let node = |byte| peer_id(byte).node_id().expect("test peers have node IDs");
+    let (by_id, by_earlier, gateway) = (node(1), node(2), node(3));
+    let pins: crate::UnconditionalPeers = toml::from_str::<crate::Config>(&format!(
+        "p2p_stack = 'dual'\n\
+         unconditional_peers = ['192.0.2.7', '{by_id}@one.example.com:8233', \
+         '{by_earlier}@two.example.com:8233']"
+    ))
+    .expect("the pins parse")
+    .unconditional_peers;
+    let pinned_ids: HashSet<NodeId> = pins.dial_names().filter_map(|name| name.node_id).collect();
+    let held = HeldPlaces {
+        members: vec![gateway],
+    };
+    let keeps = |peer: PeerConnection| keeps_seed_connection(&peer, &held, &pinned_ids, &pins);
+
+    assert!(!keeps(outbound(10, Some([198, 51, 100, 10]), now)));
+    assert!(keeps(PeerConnection {
+        opener: ConnectionOpener::Other,
+        ..outbound(10, Some([198, 51, 100, 10]), now)
+    }));
+    assert!(keeps(outbound(3, Some([198, 51, 100, 3]), now)));
+    assert!(keeps(outbound(1, Some([198, 51, 100, 1]), now)));
+    assert!(keeps(PeerConnection {
+        earlier: vec![by_earlier],
+        ..outbound(11, Some([198, 51, 100, 11]), now)
+    }));
+    assert!(keeps(outbound(12, Some([192, 0, 2, 7]), now)));
 }

@@ -1927,6 +1927,8 @@ struct ZakuraPeerConnectionEntry {
     close_cause: CloseCause,
     /// What opened the connection.
     opener: ConnectionOpener,
+    /// The canonical address the connection came from, if known.
+    remote_ip: Option<IpAddr>,
     /// The node IDs the peer had before it added keys, which its handshake
     /// proved (zakura-quic TLS-7).
     earlier: Vec<NodeId>,
@@ -1946,13 +1948,15 @@ pub(crate) enum ConnectionOpener {
     Other,
 }
 
-/// A registered connection this node dialed. See
-/// [`ZakuraSupervisorHandle::outbound_peers`].
+/// A registered connection, as [`ZakuraSupervisorHandle::peer_connections`]
+/// lists it.
 #[derive(Debug)]
-pub(crate) struct OutboundPeer {
+pub(crate) struct PeerConnection {
     pub(crate) peer_id: ZakuraPeerId,
     /// See [`ZakuraPeerConnectionEntry::earlier`].
     pub(crate) earlier: Vec<NodeId>,
+    /// See [`ZakuraPeerConnectionEntry::remote_ip`].
+    pub(crate) remote_ip: Option<IpAddr>,
     /// The [`admission_host`] the connection is charged to, if its IP is known.
     pub(crate) host: Option<IpAddr>,
     pub(crate) registered_at: Instant,
@@ -2409,19 +2413,18 @@ impl ZakuraSupervisorHandle {
             .is_some()
     }
 
-    /// Returns the registered connections this node dialed, leaving out
-    /// those whose disconnect has been requested.
-    pub(crate) async fn outbound_peers(&self) -> Vec<OutboundPeer> {
+    /// Returns the registered connections, leaving out those whose
+    /// disconnect has been requested.
+    pub(crate) async fn peer_connections(&self) -> Vec<PeerConnection> {
         let state = self.inner.lock().await;
         state
             .active_by_peer
             .iter()
-            .filter(|(_, entry)| {
-                entry.opener != ConnectionOpener::Remote && !entry.disconnect_token.is_cancelled()
-            })
-            .map(|(peer_id, entry)| OutboundPeer {
+            .filter(|(_, entry)| !entry.disconnect_token.is_cancelled())
+            .map(|(peer_id, entry)| PeerConnection {
                 peer_id: peer_id.clone(),
                 earlier: entry.earlier.clone(),
+                remote_ip: entry.remote_ip,
                 host: state.host(entry.conn_id),
                 registered_at: entry.registered_at,
                 opener: entry.opener,
@@ -2495,6 +2498,7 @@ impl ZakuraSupervisorHandle {
                     disconnect_token,
                     close_cause,
                     opener,
+                    remote_ip,
                     earlier: proven_earlier.to_vec(),
                     registered_at: Instant::now(),
                 };
@@ -6526,6 +6530,7 @@ async fn spawn_zakura_endpoint_inner(
     for task in spawn_native_bootstrap_dialer(
         endpoint.clone(),
         config.zakura.bootstrap_peers.clone(),
+        config.unconditional_peers.clone(),
         limits.clone(),
     ) {
         endpoint.push_header_sync_task(task).await;
@@ -10095,10 +10100,10 @@ mod tests {
         NEXT_TEST_CONN_ID.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// `outbound_peers` lists the connections this node opened, with the IDs
-    /// their handshakes proved, and `disconnect_discovery_peer` closes only
-    /// one that discovery opened. A seed release then leaves pins, upgrade
-    /// hand-offs and a seed's own connection alone.
+    /// `peer_connections` lists the connections with what opened them and
+    /// the IDs their handshakes proved, and `disconnect_discovery_peer`
+    /// closes only one that discovery opened. A seed release then leaves
+    /// upgrade hand-offs and a seed's own connection alone.
     #[tokio::test]
     async fn only_discovery_connections_are_released() {
         let supervisor = ZakuraSupervisorHandle::new(4);
@@ -10130,17 +10135,31 @@ mod tests {
         let (upgraded, upgraded_token) = register(2, ConnectionOpener::Other).await;
         let (remote, remote_token) = register(3, ConnectionOpener::Remote).await;
 
-        let mut outbound = supervisor.outbound_peers().await;
-        outbound.sort_by_key(|peer| peer.host);
-        let listed: Vec<_> = outbound
+        let mut connections = supervisor.peer_connections().await;
+        connections.sort_by_key(|peer| peer.host);
+        let listed: Vec<_> = connections
             .iter()
-            .map(|peer| (&peer.peer_id, peer.opener, peer.earlier.as_slice()))
+            .map(|peer| {
+                (
+                    &peer.peer_id,
+                    peer.opener,
+                    peer.earlier.as_slice(),
+                    peer.remote_ip,
+                )
+            })
             .collect();
+        let ip = |byte| Some(IpAddr::from([203, 0, 113, byte]));
         assert_eq!(
             listed,
             [
-                (&discovered, ConnectionOpener::Discovery, &[earlier][..]),
-                (&upgraded, ConnectionOpener::Other, &[earlier][..]),
+                (
+                    &discovered,
+                    ConnectionOpener::Discovery,
+                    &[earlier][..],
+                    ip(1)
+                ),
+                (&upgraded, ConnectionOpener::Other, &[earlier][..], ip(2)),
+                (&remote, ConnectionOpener::Remote, &[earlier][..], ip(3)),
             ]
         );
 
@@ -10151,8 +10170,8 @@ mod tests {
         assert!(supervisor.disconnect_discovery_peer(&discovered).await);
         assert!(discovered_token.is_cancelled());
         assert_eq!(
-            supervisor.outbound_peers().await.len(),
-            1,
+            supervisor.peer_connections().await.len(),
+            2,
             "a connection whose disconnect was requested is no longer listed"
         );
         assert!(!supervisor.disconnect_discovery_peer(&discovered).await);

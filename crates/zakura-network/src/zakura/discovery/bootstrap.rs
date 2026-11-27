@@ -17,8 +17,14 @@
 //!   closes those and nothing else: a seed's own connection, a pin's or an
 //!   upgrade hand-off's stays.
 //!
-//! A node that finds no other peers, such as one in a small network whose
-//! nodes are all seeds, keeps two seeds connected.
+//! A node that finds its own ID among its seeds is a seed itself, as on the
+//! default seeds and a fleet that lists all its nodes. It keeps every other
+//! seed connected and never closes them, as before, so the seeds stay a full
+//! mesh that reconnects after an outage. That costs each seed one inbound
+//! slot per other seed.
+//!
+//! An ordinary node that finds no other peers, such as one in a small network
+//! whose nodes list only each other, keeps two seeds connected.
 //!
 //! [`BootstrapPlan`] owns the policy. [`run_bootstrap_dialer`] does the IO.
 //!
@@ -156,11 +162,15 @@ pub(super) struct BootstrapPlan {
     /// Where the next search for a seed to dial starts, so failed seeds
     /// rotate.
     next: usize,
+    /// This node is a seed itself, so it keeps every other seed connected.
+    mesh: bool,
 }
 
 impl BootstrapPlan {
-    /// Plans dials to `seeds`, in this order, the first allowed at `now`.
-    pub(super) fn new(seeds: Vec<NodeAddr>, now: Instant) -> Self {
+    /// Plans dials to `seeds`, in this order, the first allowed at `now`. A
+    /// `mesh` plan, for a node that is a seed itself, keeps every seed
+    /// connected and never closes them.
+    pub(super) fn new(seeds: Vec<NodeAddr>, mesh: bool, now: Instant) -> Self {
         let seeds = seeds
             .into_iter()
             .map(|node_addr| Seed {
@@ -171,7 +181,16 @@ impl BootstrapPlan {
                 released: false,
             })
             .collect();
-        Self { seeds, next: 0 }
+        Self {
+            seeds,
+            next: 0,
+            mesh,
+        }
+    }
+
+    /// Whether this plan keeps every seed connected, see [`Self::new`].
+    pub(super) fn is_mesh(&self) -> bool {
+        self.mesh
     }
 
     /// The seeds' configured node IDs, in plan order.
@@ -185,7 +204,8 @@ impl BootstrapPlan {
     ///
     /// Below [`BOOTSTRAP_DIAL_FLOOR`] hosts, it tops the seeds that are
     /// connected or being dialed up to [`MAX_BOOTSTRAP_CONNECTIONS`], taking
-    /// the next ones in order that are out of backoff.
+    /// the next ones in order that are out of backoff. A mesh plan dials
+    /// every seed out of backoff that isn't connected, whatever the coverage.
     pub(super) fn dials(
         &mut self,
         coverage: PeerCoverage,
@@ -193,15 +213,20 @@ impl BootstrapPlan {
         now: Instant,
         mut token: impl FnMut() -> CancellationToken,
     ) -> Vec<(usize, NodeAddr, CancellationToken)> {
-        if coverage.excludes_seeds() || self.seeds.is_empty() {
+        if self.seeds.is_empty() || (!self.mesh && coverage.excludes_seeds()) {
             return Vec::new();
         }
+        let wanted = if self.mesh {
+            self.seeds.len()
+        } else {
+            MAX_BOOTSTRAP_CONNECTIONS
+        };
         let mut busy = (0..self.seeds.len())
             .filter(|&index| self.seeds[index].connection.is_some() || registered(index))
             .count();
         let mut started = Vec::new();
         for offset in 0..self.seeds.len() {
-            if busy >= MAX_BOOTSTRAP_CONNECTIONS {
+            if busy >= wanted {
                 break;
             }
             let index = (self.next + offset) % self.seeds.len();
@@ -299,6 +324,7 @@ pub(super) async fn run_bootstrap_dialer(
     endpoint: ZakuraEndpoint,
     discovery: ZakuraDiscoveryHandle,
     seeds: Vec<NodeAddr>,
+    mesh: bool,
     limits: ZakuraLocalLimits,
 ) {
     let shutdown = endpoint.background_shutdown_token();
@@ -314,7 +340,7 @@ pub(super) async fn run_bootstrap_dialer(
         .iter()
         .map(|seed| super::dialer::warn_when_moved(supervisor.moved_node_ids(), seed.id))
         .collect();
-    let mut plan = BootstrapPlan::new(seeds, Instant::now());
+    let mut plan = BootstrapPlan::new(seeds, mesh, Instant::now());
     let mut dials = FuturesUnordered::new();
     loop {
         let now = Instant::now();
@@ -331,7 +357,7 @@ pub(super) async fn run_bootstrap_dialer(
             now,
         );
 
-        if coverage.releases_seeds(needed) {
+        if !plan.is_mesh() && coverage.releases_seeds(needed) {
             let held = endpoint.held_places();
             // A seed the node prefers as a mining gateway keeps its place.
             let closed = plan.release(|index| {
@@ -359,13 +385,15 @@ pub(super) async fn run_bootstrap_dialer(
             ));
         }
 
-        // Below the floor a seed's backoff can end, and while this dialer
-        // holds seeds a peer can settle. Nothing else changes without a
-        // registration or a dial ending.
-        let retry = (!coverage.excludes_seeds())
+        // Below the floor or in a mesh a seed's backoff can end, and while
+        // this dialer holds seeds it may release a peer can settle. Nothing
+        // else changes without a registration or a dial ending.
+        let retry = (plan.is_mesh() || !coverage.excludes_seeds())
             .then(|| plan.next_retry(now))
             .flatten();
-        let settle = coverage.next_settled.filter(|_| plan.has_running_dials());
+        let settle = coverage
+            .next_settled
+            .filter(|_| !plan.is_mesh() && plan.has_running_dials());
         let wake = retry.into_iter().chain(settle).min();
         zakura_rt::select! {
             biased;

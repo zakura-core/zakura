@@ -99,7 +99,7 @@ fn small_dial_reserves_release_with_fewer_hosts() {
 #[test]
 fn below_the_floor_the_node_dials_two_seeds() {
     let now = Instant::now();
-    let mut plan = BootstrapPlan::new(seeds(3), now);
+    let mut plan = BootstrapPlan::new(seeds(3), false, now);
 
     assert_eq!(
         indexes(&dial(&mut plan, coverage(0, 0), |_| false, now)),
@@ -110,7 +110,7 @@ fn below_the_floor_the_node_dials_two_seeds() {
         "two seed dials are already running"
     );
 
-    let mut plan = BootstrapPlan::new(seeds(3), now);
+    let mut plan = BootstrapPlan::new(seeds(3), false, now);
     assert!(
         dial(&mut plan, coverage(BOOTSTRAP_DIAL_FLOOR, 0), |_| false, now).is_empty(),
         "a node at the floor dials no seed"
@@ -118,7 +118,7 @@ fn below_the_floor_the_node_dials_two_seeds() {
 
     // A seed that is already registered, say because the seed itself
     // connected, takes one of the two places.
-    let mut plan = BootstrapPlan::new(seeds(3), now);
+    let mut plan = BootstrapPlan::new(seeds(3), false, now);
     assert_eq!(
         indexes(&dial(&mut plan, coverage(0, 0), |index| index == 0, now)),
         [1]
@@ -130,7 +130,7 @@ fn below_the_floor_the_node_dials_two_seeds() {
 #[test]
 fn a_release_closes_only_its_own_dials() {
     let now = Instant::now();
-    let mut plan = BootstrapPlan::new(seeds(3), now);
+    let mut plan = BootstrapPlan::new(seeds(3), false, now);
     let started = dial(&mut plan, coverage(0, 0), |_| false, now);
     assert!(plan.has_running_dials());
 
@@ -154,7 +154,7 @@ fn a_release_closes_only_its_own_dials() {
 #[test]
 fn failed_seeds_back_off_and_rotate() {
     let start = Instant::now();
-    let mut plan = BootstrapPlan::new(seeds(3), start);
+    let mut plan = BootstrapPlan::new(seeds(3), false, start);
     assert_eq!(
         indexes(&dial(&mut plan, coverage(0, 0), |_| false, start)),
         [0, 1]
@@ -190,4 +190,25 @@ fn failed_seeds_back_off_and_rotate() {
     plan.finished(0, DialResult::Healthy, later);
     assert_eq!(plan.seeds[0].retry_at, later);
     assert_eq!(plan.seeds[0].backoff, DEFAULT_ZAKURA_REDIAL_INITIAL_BACKOFF);
+}
+
+/// A seed node's plan dials every other seed, however many peers of its own
+/// the node has, and a seed that connected to it takes no dial.
+#[test]
+fn a_seed_node_keeps_every_other_seed() {
+    let now = Instant::now();
+    let mut plan = BootstrapPlan::new(seeds(3), true, now);
+    assert_eq!(
+        indexes(&dial(&mut plan, coverage(9, 9), |index| index == 1, now)),
+        [0, 2]
+    );
+
+    // A failed seed is dialed again once its backoff ends.
+    plan.finished(2, DialResult::Failed, now);
+    let later = now + DEFAULT_ZAKURA_REDIAL_INITIAL_BACKOFF;
+    assert_eq!(plan.next_retry(now), Some(later));
+    assert_eq!(
+        indexes(&dial(&mut plan, coverage(9, 9), |index| index == 1, later)),
+        [2]
+    );
 }

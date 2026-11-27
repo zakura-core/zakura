@@ -20,7 +20,8 @@ use crate::zakura::{
 
 /// Spawns the bootstrap dialer ([`super::bootstrap`]) for the configured
 /// native bootstrap peers, after merging each remote identity's addresses and
-/// removing the local identity.
+/// removing the local identity. A node listed among its own bootstrap peers
+/// is a seed and keeps the others connected ([`super::bootstrap`]).
 ///
 /// Returns the dialer's task, if there are remote peers, so the caller can
 /// track it under the endpoint shutdown owner. The task also observes the
@@ -32,7 +33,11 @@ pub(crate) fn spawn_native_bootstrap_dialer(
     bootstrap_peers: Vec<String>,
     limits: ZakuraLocalLimits,
 ) -> Vec<JoinHandle<()>> {
-    let mut seeds = grouped_remote_bootstrap_peers(bootstrap_peers, endpoint.local_node_id());
+    let local_node_id = endpoint.local_node_id();
+    let mesh = bootstrap_peers
+        .iter()
+        .any(|entry| parse_bootstrap_peer(entry).is_ok_and(|seed| seed.id == local_node_id));
+    let mut seeds = grouped_remote_bootstrap_peers(bootstrap_peers, local_node_id);
     if seeds.is_empty() {
         return Vec::new();
     }
@@ -43,7 +48,7 @@ pub(crate) fn spawn_native_bootstrap_dialer(
     seeds.shuffle(&mut zakura_rt::rand::rng());
     vec![spawn_erased_named(
         "bootstrap_dialer",
-        super::bootstrap::run_bootstrap_dialer(endpoint, discovery, seeds, limits),
+        super::bootstrap::run_bootstrap_dialer(endpoint, discovery, seeds, mesh, limits),
     )]
 }
 

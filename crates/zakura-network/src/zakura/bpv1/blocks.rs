@@ -582,7 +582,8 @@ pub enum BlockInput {
         /// Consensus verdict.
         verdict: VerifierVerdict,
     },
-    /// Native block sync committed this block; ends it if it is in fallback (`bpv1-57`).
+    /// Native block sync committed this block; ends it if it is collecting or
+    /// in fallback (`bpv1-57`).
     FallbackDone {
         /// Committed block.
         block_id: block::Hash,
@@ -2519,6 +2520,13 @@ impl BlockTable {
         if self.blocks.contains_key(&block_id) {
             return;
         }
+        // Block sync committed the block while its metadata was in admission,
+        // so no `FallbackDone` reaches it (bpv1-57).
+        if self.verified_hash == Some(block_id) {
+            reject_meta(step, block_id, entry.from_peer, entry.session_gen);
+            reject_later(step, block_id, &entry.later);
+            return;
+        }
 
         let height = entry.height.unwrap_or(self.top);
         // Recheck the window after async commitment work
@@ -3662,12 +3670,31 @@ impl BlockTable {
         }
     }
 
-    /// Native block sync committed `block_id`. A `Fallback` block holds no
-    /// complete body to relay, so it retires at once and frees its slot.
+    /// Native block sync committed `block_id` (`bpv1-57`). A `Fallback` or
+    /// `Collecting` block holds no complete body to relay, so it retires at
+    /// once: its pulls stop and its slot frees. Block sync delivered a
+    /// collecting block, so its outcome is `Fallback`.
     fn handle_fallback_done(&mut self, block_id: block::Hash, step: &mut BlockStep) {
-        if self.block_phase(&block_id) == Some(BlockPhase::Fallback) {
-            self.retire_block(block_id, step);
+        let Some(block) = self.blocks.get_mut(&block_id) else {
+            return;
+        };
+        match block.phase {
+            BlockPhase::Fallback => {}
+            BlockPhase::Collecting => {
+                step.events.push(BlockEvent::Outcome {
+                    block_id,
+                    outcome: BlockOutcome::Fallback,
+                });
+                if std::mem::take(&mut block.body_claimed) {
+                    step.outputs.push(BlockOutput::ReleaseBodyClaim {
+                        block_id,
+                        reason: ClaimRelease::Committed,
+                    });
+                }
+            }
+            _ => return,
         }
+        self.retire_block(block_id, step);
     }
 
     fn handle_proposed_commit_failed(&mut self, block_id: block::Hash, step: &mut BlockStep) {

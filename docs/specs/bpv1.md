@@ -1133,6 +1133,11 @@ section 2, the node MUST stop issuing pulls for the block and SHOULD send
 `BlockDone` to every peer that knows the block. Its outstanding `Want`s stay
 live until their `WantEnd`s arrive.
 
+When native block sync commits a block the node still collects, or before its
+metadata finishes admission, the node MUST stop collecting it. It retires the
+block, so it stops issuing pulls, frees the block's slot, and never submits a
+second copy to the validator.
+
 After a stripe passes its re-encode check, the node MAY send the stripe's parts
 it never received to accepted subscribers of their lanes. These parts obey
 the ordinary skip, send-once, and wanted rules. The node SHOULD NOT send them to

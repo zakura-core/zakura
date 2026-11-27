@@ -593,10 +593,14 @@ fn rank(
             )
         })
         .collect();
+    let round = super::preferred::PreferredRound {
+        set: formed.set().to_vec(),
+        dialable,
+    };
     let (admitted, claims) = admit_preferred_dials(
         state,
-        formed.set(),
-        &dialable,
+        &round,
+        &crate::zakura::transport::MovedNodeIds::default(),
         deferred,
         room,
         |_, in_flight| in_flight < PER_IP_CAP,
@@ -647,7 +651,7 @@ fn rank(
     sent.preferred_dialable_since = formed
         .set()
         .iter()
-        .filter(|member| dialable.contains_key(*member) && !dialed.contains(member))
+        .filter(|member| round.dialable.contains_key(*member) && !dialed.contains(member))
         .map(|member| {
             let since = sent.preferred_dialable_since.get(member);
             (*member, since.copied().unwrap_or(sent.now))

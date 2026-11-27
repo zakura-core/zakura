@@ -5,7 +5,10 @@
 //! v2 networking uses, and the v2 peers registered now.
 
 use tokio::sync::watch;
-use zakura_chain::{block::Height, miner_mesh::MinerSetCoverage};
+use zakura_chain::{
+    block::Height,
+    miner_mesh::{GatewayId, MinerSetCoverage},
+};
 use zakura_network::zakura::{
     ConnectedPeer, ConnectionPlaces, GatewayPlace, PlacedGateway, ZakuraEndpoint,
 };
@@ -15,12 +18,12 @@ mod tests;
 
 /// Where `getminermeshinfo` reads the miner mesh state.
 ///
-/// The default has no source, as on a node that does not mine and runs no
-/// v2 networking.
+/// The default has no source, as on a node that neither prefers gateways
+/// (it does not mine or set `mining.miner_mesh`) nor runs v2 networking.
 #[derive(Clone, Debug, Default)]
 pub struct MinerMeshSources {
     /// How much of its window the gateway counter has read, when this node
-    /// counts gateways, which it does when it mines.
+    /// counts gateways, which it does when it prefers them.
     pub coverage: Option<watch::Receiver<MinerSetCoverage>>,
     /// The v2 endpoint, when this node runs v2 networking.
     pub endpoint: Option<ZakuraEndpoint>,
@@ -31,8 +34,9 @@ pub struct MinerMeshSources {
 pub struct MeshNode {
     /// This node's v2 node ID, when it runs v2 networking.
     pub node_id: Option<[u8; 32]>,
-    /// Whether the coinbases this node builds name its gateway.
-    pub announcing: bool,
+    /// The gateway the coinbases this node builds name, if they name one:
+    /// this node itself, or the node `mining.miner_mesh_gateways` names.
+    pub announced_gateway: Option<GatewayId>,
     /// Whether this node builds blocks: it has a miner address.
     pub mining: bool,
     /// Whether the best tip is recent enough for the node to prefer
@@ -48,9 +52,10 @@ pub struct GetMinerMeshInfoResponse {
     /// This node's v2 node ID in hex, or null when it runs no v2 networking.
     pub node_id: Option<String>,
 
-    /// Whether the coinbases this node builds name its gateway
-    /// (`mining.miner_mesh` with a miner address).
-    pub announcing: bool,
+    /// The gateway IDs the coinbases this node builds name, in hex: this
+    /// node's own, or the one `mining.miner_mesh_gateways` names. Empty when
+    /// the node does not announce, and at most one entry for now.
+    pub announced_gateways: Vec<String>,
 
     /// Whether this node builds blocks: it has a miner address.
     pub mining: bool,
@@ -60,15 +65,16 @@ pub struct GetMinerMeshInfoResponse {
     pub synced: bool,
 
     /// The blocks counted, or null when this node does not count gateways
-    /// because it does not mine.
+    /// because it does not prefer them.
     pub window: Option<MeshWindow>,
 
-    /// The last ranking applied by v2 networking, best first, at most 256.
-    /// Only gateways named in at least 10 counted blocks are ranked. It can
-    /// briefly reflect an earlier tip freshness decision than `synced`.
+    /// The last ranking applied by v2 networking, best first, at most 256:
+    /// the template nodes `mining.miner_mesh_template_nodes` lists, then the
+    /// gateways named in at least 10 counted blocks. It can briefly reflect
+    /// an earlier tip freshness decision than `synced`.
     pub gateways: Vec<MeshGateway>,
 
-    /// The connection places held for preferred gateways.
+    /// The connection places held for preferred gateways and template nodes.
     pub hold: usize,
 
     /// How the connection slots are used, or null when the node runs no v2
@@ -103,7 +109,7 @@ pub struct MeshWindow {
     pub coverage: f64,
 }
 
-/// One ranked gateway.
+/// One ranked gateway, or one of this relay's template nodes.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MeshGateway {
     /// The ID the blocks name the gateway by, in hex: the first 20 bytes of
@@ -116,6 +122,12 @@ pub struct MeshGateway {
 
     /// Where the gateway stands against the held places.
     pub state: MeshGatewayState,
+
+    /// Whether this is a template node `mining.miner_mesh_template_nodes`
+    /// lists. Within the funded places, the node holds a place for a
+    /// template node whatever the blocks say and whatever its `state`, unless
+    /// it is `ambiguous`. Normal inbound handshake limits apply.
+    pub template_node: bool,
 
     /// Whether the gateway is connected over v2 now.
     pub connected: bool,
@@ -135,10 +147,12 @@ pub enum MeshGatewayState {
     /// Known, but waiting out a failed dial or a lost connection. It still
     /// counts toward the shared hold and may connect inbound during backoff.
     Backoff,
-    /// v2 networking has no usable dial address for it, so no place is held for it.
+    /// v2 networking has no usable dial address for it, so no place is held
+    /// for it, unless it is a template node.
     Unmatched,
     /// v2 networking knows two or more nodes whose node IDs start with the
-    /// gateway ID, so it prefers none of them and holds no place for it.
+    /// gateway ID, so it prefers none of them and holds no place for it,
+    /// even for a template node.
     Ambiguous,
 }
 
@@ -186,13 +200,13 @@ impl GetMinerMeshInfoResponse {
     ) -> Self {
         let MeshNode {
             node_id,
-            announcing,
+            announced_gateway,
             mining,
             synced,
         } = node;
         Self {
             node_id: node_id.map(hex::encode),
-            announcing,
+            announced_gateways: announced_gateway.iter().map(ToString::to_string).collect(),
             mining,
             synced,
             window: coverage.map(MeshWindow::from),
@@ -234,6 +248,8 @@ impl From<&PlacedGateway> for MeshGateway {
             gateway_id: gateway.gateway_id.to_string(),
             blocks: gateway.blocks,
             state: gateway.place.into(),
+            // zakurad always prefers only the template nodes its config lists.
+            template_node: gateway.always_preferred,
             connected: gateway.connected,
         }
     }

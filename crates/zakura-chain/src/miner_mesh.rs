@@ -21,6 +21,6 @@ mod window;
 mod tests;
 
 pub use commitment::MinerMeshCommitment;
-pub use gateway_id::GatewayId;
+pub use gateway_id::{GatewayId, ParseGatewayIdError};
 pub use recent_set::{GatewayBlocks, MinerSetCoverage, MinerSetSnapshot, RecentMinerSet};
 pub use window::QUALIFYING_DEPTH;

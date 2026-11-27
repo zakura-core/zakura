@@ -20,9 +20,11 @@ use zakura_rt::{
 };
 
 use crate::{
+    composite::COMPOSITE_KEY_TAGS,
     config::{QuicBindConfig, QuicConfig},
     congestion::{CongestionProbe, InstrumentedFactory},
     conn::{Conn, ConnObserver, Hooks},
+    credential::NodeCredential,
     driver::{
         endpoint::{EndpointCmd, EndpointTask, SHUTDOWN_DRAIN},
         ConnRef, Connecting, Handshake,
@@ -164,6 +166,9 @@ type AdmissionObserver = Arc<dyn Fn(SocketAddr, bool) + Send + Sync>;
 /// sender, so it never keeps an endpoint task alive.
 pub(crate) struct Shared {
     pub(crate) id: NodeId,
+    /// The credential this node presents. A dial to any ID it proves would
+    /// reach this node (DIAL-1).
+    pub(crate) credential: NodeCredential,
     pub(crate) config: QuicConfig,
     pub(crate) max_bidi_streams: u32,
     pub(crate) tls: TlsConfig,
@@ -293,6 +298,7 @@ impl QuicEndpoint {
         }
         let shared = Arc::new(Shared {
             id: secret.public(),
+            credential: secret.credential().clone(),
             config: config.clone(),
             max_bidi_streams: bind.max_bidi_streams,
             tls: TlsConfig::with_inputs(&secret, &inputs)?,
@@ -464,6 +470,12 @@ impl QuicEndpoint {
         self.inner.shared.connections.discovery_room()
     }
 
+    /// Discovery address attempts that would fit after one live connection leaves.
+    /// Conservatively keep room for an inbound attempt if an inbound connection leaves.
+    pub fn discovery_replacement_capacity(&self) -> usize {
+        self.inner.shared.connections.discovery_replacement_room()
+    }
+
     /// Network changes the endpoint has passed to its connections (SOCK-12).
     pub fn network_changes(&self) -> u64 {
         self.inner.shared.network_changes.load(Ordering::Relaxed)
@@ -554,8 +566,13 @@ impl QuicEndpoint {
         if alpns.is_empty() {
             return Err(ConnectError::AlpnMismatch);
         }
-        // DIAL-1.
-        if addr.id == shared.id {
+        // DIAL-1: this node answers to its own ID and to each ID its
+        // credential would prove to a dialer (TLS-7).
+        if addr.id == shared.id
+            || shared
+                .credential
+                .proves_dialed_id(addr.id, &COMPOSITE_KEY_TAGS)
+        {
             return Err(ConnectError::SelfDial);
         }
         if *shared.shutdown.borrow() {
@@ -788,7 +805,7 @@ fn finish_dial(
     // The verifier already enforced TLS-7; this guards against a verifier bug.
     let Some(remote) = handshake
         .remote
-        .filter(|remote| remote.node_id() == expected)
+        .filter(|remote| remote.proves_dialed_id(expected, &COMPOSITE_KEY_TAGS))
     else {
         close(b"identity");
         return Err(ConnectError::WrongIdentity);
@@ -797,7 +814,15 @@ fn finish_dial(
         close(b"alpn");
         return Err(ConnectError::AlpnMismatch);
     };
-    Ok(Conn::new(conn, remote, target, started, true, alpn))
+    Ok(Conn::new(
+        conn,
+        remote,
+        Some(expected),
+        target,
+        started,
+        true,
+        alpn,
+    ))
 }
 
 /// Waits for a handshake, closing the connection at the deadline (ADM-6,
@@ -858,6 +883,7 @@ pub(crate) async fn inbound_handshake(
     let handled = acceptor.handle(Conn::new(
         conn,
         remote_credential,
+        None,
         remote,
         admitted_at,
         source_validated,
@@ -1349,6 +1375,17 @@ impl ConnectionSlots {
             .saturating_sub(held.live)
     }
 
+    /// Room after losing one connection, preserving the inbound reserve.
+    fn discovery_replacement_room(&self) -> usize {
+        let held = self.held();
+        let after = Held {
+            live: held.live.saturating_sub(1),
+            inbound: held.inbound.saturating_sub(1),
+        };
+        self.limit(DialCeiling::Discovery, after)
+            .saturating_sub(after.live)
+    }
+
     /// Whether a dial attempt would get a slot right now.
     pub(crate) fn can_dial(&self) -> bool {
         self.live() < self.max
@@ -1680,6 +1717,18 @@ mod tests {
         assert_eq!(maintained_slots, 2);
         assert_eq!(full_count, 8);
         assert_eq!(slots.live(), 0);
+    }
+
+    #[test]
+    fn replacement_room_respects_the_discovery_and_inbound_reserves() {
+        let slots = ConnectionSlots::new(8, 2, Some(2), 0);
+        let _outbound = slots.claim_dial_slots(5, DialCeiling::Discovery).unwrap();
+        assert_eq!(slots.discovery_replacement_room(), 1);
+        let _inbound = slots.claim_inbound().unwrap();
+        assert_eq!(slots.discovery_replacement_room(), 0);
+        assert!(slots.claim_inbound().is_none());
+        let _maintained = slots.claim_dial().unwrap();
+        assert_eq!(slots.discovery_replacement_room(), 0);
     }
 
     /// Inbound attempts stop at their own cap, and each holds it until its

@@ -54,6 +54,8 @@ impl DialAttemptKey {
 /// How one attempt's own dial ended.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(super) enum DialFinish {
+    /// The handler closed a moved duplicate before the control handshake.
+    AlreadyConnected,
     /// The dial registered its peer and finished serving the connection.
     Served,
     /// The dial authenticated its peer, and this node refused to register it
@@ -117,6 +119,7 @@ pub(super) fn classify_dial(
         }
         DialObservation::DialEnded(_, PeerRegistration::Live) => Result::ConnectedElsewhere,
         DialObservation::DialEnded(finish, _) => match finish {
+            DialFinish::AlreadyConnected => Result::ConnectedElsewhere,
             DialFinish::LocalLimit => Result::LocalResourceLimit,
             DialFinish::AlpnMismatch => Result::AlpnMismatch,
             DialFinish::Served | DialFinish::Refused | DialFinish::Failed => Result::Failed,

@@ -32,7 +32,7 @@ use tempfile::TempDir;
 
 use zakura_chain::{
     block::{self, Block, Height},
-    miner_mesh::MinerMeshCommitment,
+    miner_mesh::{self, MinerMeshCommitment},
     parameters::Network,
 };
 use zakura_network::{
@@ -128,12 +128,28 @@ pub struct Tip {
 /// What a node does on the network.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum Role {
-    /// Mines, and names its own node as the gateway in every coinbase.
+    /// Mines, and names a gateway in every coinbase: its own node, or the
+    /// node [`NodeSpec::names_gateway`] picks.
     Pool,
     /// Mines without naming a gateway.
     Miner,
     /// Relays blocks and does not mine.
     Relay,
+    /// Relays blocks without mining and runs the miner mesh, as a pool's
+    /// public relay node does: it prefers gateways, and a pool may name it.
+    MeshRelay,
+}
+
+impl Role {
+    /// Whether the node has a miner address.
+    fn mines(self) -> bool {
+        matches!(self, Self::Pool | Self::Miner)
+    }
+
+    /// Whether the node sets `mining.miner_mesh`.
+    fn runs_miner_mesh(self) -> bool {
+        matches!(self, Self::Pool | Self::MeshRelay)
+    }
 }
 
 /// How to start one node of a [`RegtestNet`].
@@ -141,6 +157,8 @@ pub enum Role {
 pub struct NodeSpec {
     role: Role,
     bootstrap_from: Vec<usize>,
+    names_gateway: Option<usize>,
+    template_nodes: Vec<usize>,
     max_connections: Option<usize>,
     start_later: bool,
     trace_connections: bool,
@@ -152,6 +170,8 @@ impl NodeSpec {
         Self {
             role,
             bootstrap_from: Vec::new(),
+            names_gateway: None,
+            template_nodes: Vec::new(),
             max_connections: None,
             start_later: false,
             trace_connections: false,
@@ -161,6 +181,19 @@ impl NodeSpec {
     /// Makes the node dial these nodes, by index, at startup.
     pub fn bootstrap_from(mut self, nodes: impl IntoIterator<Item = usize>) -> Self {
         self.bootstrap_from = nodes.into_iter().collect();
+        self
+    }
+
+    /// Makes this pool's coinbases name `node`, by index, instead of itself.
+    pub fn names_gateway(mut self, node: usize) -> Self {
+        self.names_gateway = Some(node);
+        self
+    }
+
+    /// Makes this gateway keep places for these template nodes, by index:
+    /// `mining.miner_mesh_template_nodes`.
+    pub fn template_nodes(mut self, nodes: impl IntoIterator<Item = usize>) -> Self {
+        self.template_nodes = nodes.into_iter().collect();
         self
     }
 
@@ -364,6 +397,30 @@ impl RegtestNet {
                     Ok(format!("{}@{}", id.public(), v2_addrs[peer]))
                 })
                 .collect::<Result<Vec<_>>>()?;
+            let gateway_id_of = |node: usize| {
+                let key = keys.get(node).ok_or_else(|| {
+                    eyre!("node {index} names node {node}, which is not in the net")
+                })?;
+                Ok::<_, eyre::Report>(miner_mesh::GatewayId::from_node_id(key.public().as_bytes()))
+            };
+            let named_gateway = spec
+                .names_gateway
+                .map(|gateway| {
+                    eyre::ensure!(
+                        spec.role == Role::Pool,
+                        "node {index} names a gateway but is not a pool"
+                    );
+                    gateway_id_of(gateway)
+                })
+                .transpose()?;
+            let mesh = MeshSettings {
+                gateways: named_gateway.into_iter().collect(),
+                template_nodes: spec
+                    .template_nodes
+                    .iter()
+                    .map(|&node| gateway_id_of(node))
+                    .collect::<Result<_>>()?,
+            };
 
             let dir = testdir()?;
             let identity_dir = dir.path().join("identity");
@@ -387,6 +444,7 @@ impl RegtestNet {
                 identity_dir,
                 log_file(dir.path()),
                 bootstrap_peers,
+                &mesh,
             );
             if spec.trace_connections {
                 config.network.zakura.trace_dir = Some(dir.path().join("trace"));
@@ -398,6 +456,13 @@ impl RegtestNet {
                 .listen_addr
                 .expect("rpc_port_config always sets the RPC address");
             let node_id = keys[index].public();
+            let announced = match spec.role {
+                Role::Pool => Some(
+                    named_gateway
+                        .unwrap_or_else(|| miner_mesh::GatewayId::from_node_id(node_id.as_bytes())),
+                ),
+                Role::Miner | Role::Relay | Role::MeshRelay => None,
+            };
             let limits = zakura_network::zakura::ZakuraLocalLimits::from_config(&config.network);
             net.nodes.push(RegtestNode {
                 process: None,
@@ -411,7 +476,14 @@ impl RegtestNet {
                 metrics: RpcRequestClient::new_with_timeout(metrics_addr, RPC_TIMEOUT),
                 facts: NodeFacts {
                     node_id: *node_id.as_bytes(),
-                    mining: spec.role != Role::Relay,
+                    mining: spec.role.mines(),
+                    prefers_gateways: spec.role.mines() || spec.role.runs_miner_mesh(),
+                    announced: announced.map(|gateway| *gateway.as_bytes()),
+                    template_nodes: mesh
+                        .template_nodes
+                        .iter()
+                        .map(|node| *node.as_bytes())
+                        .collect(),
                     total_capacity: limits.total_connections(),
                     gateway_capacity: limits.max_preferred_connections,
                 },
@@ -438,7 +510,7 @@ impl RegtestNet {
         self.nodes[node].node_id
     }
 
-    /// The gateway ID a coinbase names when `node` is a pool: the first 20
+    /// The gateway ID a coinbase names when it names `node`: the first 20
     /// bytes of its node ID.
     pub fn gateway_id(&self, node: usize) -> GatewayId {
         self.nodes[node].node_id.as_bytes()[..20]
@@ -686,6 +758,27 @@ impl RegtestNet {
     /// Reads the total for a Prometheus counter across all labels.
     #[cfg(feature = "prometheus")]
     pub async fn counter(&self, node: usize, name: &str) -> Result<u64> {
+        let mut total = 0;
+        for value in self.metric_values(node, name).await? {
+            total += value.parse::<u64>()?;
+        }
+        Ok(total)
+    }
+
+    /// Reads a Prometheus gauge without labels, or `None` when the node has
+    /// not set it.
+    #[cfg(feature = "prometheus")]
+    pub async fn gauge(&self, node: usize, name: &str) -> Result<Option<f64>> {
+        match self.metric_values(node, name).await?.as_slice() {
+            [] => Ok(None),
+            [value] => Ok(Some(value.parse()?)),
+            values => Err(eyre!("node {node} reports {name} {} times", values.len())),
+        }
+    }
+
+    /// The value of every series of the Prometheus metric `name` on `node`.
+    #[cfg(feature = "prometheus")]
+    async fn metric_values(&self, node: usize, name: &str) -> Result<Vec<String>> {
         let response = self.nodes[node].metrics.get().await?;
         eyre::ensure!(
             response.status().is_success(),
@@ -693,20 +786,17 @@ impl RegtestNet {
             response.status()
         );
         let body = std::str::from_utf8(response.body())?;
-        let mut total = 0;
-        for line in body.lines() {
-            if let Some((series, value)) = line.split_once(' ') {
-                if series.split('{').next() == Some(name) {
-                    total += value.trim().parse::<u64>()?;
-                }
-            }
-        }
-        Ok(total)
+        Ok(body
+            .lines()
+            .filter_map(|line| line.split_once(' '))
+            .filter(|(series, _)| series.split('{').next() == Some(name))
+            .map(|(_, value)| value.trim().to_owned())
+            .collect())
     }
 
     /// Mines `count` blocks on `node`, a few per RPC request.
     async fn generate(&self, node: usize, count: u32) -> Result<()> {
-        if self.nodes[node].role == Role::Relay {
+        if !self.nodes[node].role.mines() {
             return Err(eyre!("node {node} is a relay, so it has no miner address"));
         }
 
@@ -750,10 +840,11 @@ impl RegtestNet {
         }
     }
 
-    /// Waits until every running mining node of `island` has read its whole
+    /// Waits until every running node of `island` that prefers gateways has read its whole
     /// window at `tip`, and ranks each gateway the harness finds named in at
     /// least [`MIN_GATEWAY_BLOCKS`] of the same blocks, with that count, and
-    /// no other: standing invariant 6. A node never ranks its own ID.
+    /// its template nodes, and no other: standing invariant 6. A node never
+    /// ranks its own ID.
     async fn wait_for_matching_counts(&mut self, tip: Tip, island: &[usize]) -> Result<()> {
         let newest = tip.height.0.checked_sub(QUALIFYING_DEPTH);
         let oldest = newest.map(|height| height.saturating_sub(WINDOW_BLOCKS - 1));
@@ -765,7 +856,9 @@ impl RegtestNet {
         loop {
             let mut behind = Vec::new();
             for &index in island {
-                if !self.nodes[index].is_running(index)? || !self.nodes[index].facts.mining {
+                if !self.nodes[index].is_running(index)?
+                    || !self.nodes[index].facts.prefers_gateways
+                {
                     continue;
                 }
                 let view = self.nodes[index].mesh_view().await?;
@@ -791,6 +884,13 @@ impl RegtestNet {
                 };
                 let mut expected = counts.clone();
                 expected.retain(|_, blocks| *blocks >= MIN_GATEWAY_BLOCKS);
+                // A template node is listed with the blocks that name it, if any.
+                for template_node in &self.nodes[index].facts.template_nodes {
+                    expected.insert(
+                        *template_node,
+                        counts.get(template_node).copied().unwrap_or(0),
+                    );
+                }
                 expected.remove(&self.gateway_id(index));
                 if view.counts() != expected {
                     behind.push(format!(
@@ -941,6 +1041,7 @@ fn configure_node(
     identity_dir: PathBuf,
     log_file: PathBuf,
     bootstrap_peers: Vec<String>,
+    mesh: &MeshSettings,
 ) {
     // A restarted node keeps its chain.
     config.state.ephemeral = false;
@@ -956,10 +1057,21 @@ fn configure_node(
     }
 
     // The test config names a miner address, which every mining role keeps.
-    if spec.role == Role::Relay {
+    if !spec.role.mines() {
         config.mining.miner_address = None;
     }
-    config.mining.miner_mesh = spec.role == Role::Pool;
+    config.mining.miner_mesh = spec.role.runs_miner_mesh();
+    config.mining.miner_mesh_gateways = mesh.gateways.clone();
+    config.mining.miner_mesh_template_nodes = mesh.template_nodes.clone();
+}
+
+/// The gateway IDs a node's miner mesh settings list, resolved from the node
+/// indexes its [`NodeSpec`] gives.
+struct MeshSettings {
+    /// `mining.miner_mesh_gateways`.
+    gateways: Vec<miner_mesh::GatewayId>,
+    /// `mining.miner_mesh_template_nodes`.
+    template_nodes: Vec<miner_mesh::GatewayId>,
 }
 
 /// A fixed node key for node `index`, so its node ID is known before it starts.

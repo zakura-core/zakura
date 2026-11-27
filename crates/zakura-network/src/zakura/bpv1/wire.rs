@@ -15,7 +15,8 @@ use super::{
     commitment::CoinbaseBinding,
     profile::{
         Coding, CODING_BYTES, W2_MAX_COINBASE_BYTES, W2_MAX_COMMITMENT_PATH_DEPTH,
-        W2_MAX_HAVE_INDICES, W2_MAX_HEADER_BYTES, W2_MAX_N, W2_MAX_PROOF_DEPTH, W2_S_MAX,
+        W2_MAX_HAVE_INDICES, W2_MAX_HEADER_BYTES, W2_MAX_N, W2_MAX_PROOF_DEPTH, W2_MAX_STRIPES,
+        W2_S_MAX,
     },
     tree::VerifiedPart,
 };
@@ -417,14 +418,6 @@ pub fn part_payload_len(coding: &Coding, index: u32) -> Option<usize> {
     Some(32 + 4 + 1 + 32 * coding.tree_depth() + wire_len)
 }
 
-/// Wire item for a `u16`-counted strictly increasing list of `MIN..=MAX`
-/// part indices.
-#[derive(Debug)]
-pub struct IndexListItem<const MIN: usize, const MAX: usize>;
-
-/// `Have` indices (`1..=4,096`).
-type HaveIndices = IndexListItem<1, W2_MAX_HAVE_INDICES>;
-
 /// `Have` flag bit 0: the sender pushes the listed parts behind this `Have`
 /// on the same data stream (decision-24).
 pub const HAVE_FLAG_PUSH: u8 = 0b0000_0001;
@@ -433,6 +426,14 @@ pub const HAVE_FLAG_PUSH: u8 = 0b0000_0001;
 /// holder (decision-24). Valid only beside [`HAVE_FLAG_PUSH`], and only from
 /// the block's proposer.
 pub const HAVE_FLAG_RELAY: u8 = 0b0000_0010;
+
+/// `Have` flag bit 2: the indices follow as a bitmap, not as a `u16` list
+/// (decision-33).
+pub const HAVE_FLAG_BITMAP: u8 = 0b0000_0100;
+
+/// Longest `Have` bitmap: `ceil(MAX_PARTS / 8)` = 5,504 bytes.
+// `MAX_PARTS` (44,032) fits `usize` on every supported target.
+pub const HAVE_BITMAP_MAX_BYTES: usize = (W2_MAX_STRIPES * W2_MAX_N).div_ceil(8) as usize;
 
 /// The flags of one `Have` (decision-19, decision-24).
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash)]
@@ -458,7 +459,7 @@ impl HaveFlags {
         matches!(self, Self::Relay)
     }
 
-    /// The wire byte.
+    /// The push and relay bits of the wire byte.
     pub const fn bits(self) -> u8 {
         match self {
             Self::Plain => 0,
@@ -466,80 +467,223 @@ impl HaveFlags {
             Self::Relay => HAVE_FLAG_PUSH | HAVE_FLAG_RELAY,
         }
     }
-}
 
-/// Wire item for the `Have` flags byte: `0`, push, or push and relay. Any
-/// other value, relay without push included, is a reserved flag, which
-/// closes with row 1.
-#[derive(Debug)]
-pub struct HaveFlagsItem;
-
-impl Wire for HaveFlagsItem {
-    type Value = HaveFlags;
-    const MIN_LEN: usize = 1;
-    const MAX_LEN: usize = 1;
-
-    fn max_heap_bytes(_input_len: usize) -> usize {
-        0
-    }
-
-    fn encode(value: &HaveFlags, out: &mut Vec<u8>) -> Result<(), WireError> {
-        out.push(value.bits());
-        Ok(())
-    }
-
-    fn decode(reader: &mut BoundedReader<'_>) -> Result<HaveFlags, WireError> {
-        let flags = reader.read::<U8>()?;
-        [HaveFlags::Plain, HaveFlags::Push, HaveFlags::Relay]
-            .into_iter()
-            .find(|f| f.bits() == flags)
-            .ok_or(WireError::ReservedFlags(u16::from(flags)))
+    /// The flags whose wire bits are `bits`: `0`, push, or push and relay.
+    /// Relay without push is not a flag set.
+    pub const fn from_bits(bits: u8) -> Option<Self> {
+        match bits {
+            0 => Some(Self::Plain),
+            HAVE_FLAG_PUSH => Some(Self::Push),
+            0b0000_0011 => Some(Self::Relay),
+            _ => None,
+        }
     }
 }
 
-impl<const MIN: usize, const MAX: usize> Wire for IndexListItem<MIN, MAX> {
-    type Value = Vec<u32>;
-    const MIN_LEN: usize = 2 + MIN * 4;
-    const MAX_LEN: usize = 2 + MAX * 4;
+/// How a `Have` encodes its indices (decision-33).
+///
+/// The sender picks [`HaveForm::smaller`] for the block's geometry. The
+/// decoder learns the form from [`HAVE_FLAG_BITMAP`] and a bitmap's length
+/// from the frame, so it decodes a `Have` before the receiver knows the
+/// block. `PeerState` checks the bitmap's length against the admitted
+/// geometry with [`HaveForm::fits`].
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash)]
+pub enum HaveForm {
+    /// `u16(count)`, then one `u16` per index, strictly increasing.
+    #[default]
+    List,
+    /// The rest of the payload, `len` bytes: bit `i mod 8` of byte `i / 8`
+    /// announces wire index `i`. A conformant sender sizes it
+    /// `ceil(total_parts / 8)`.
+    Bitmap {
+        /// Bitmap length in bytes (`1..=HAVE_BITMAP_MAX_BYTES`).
+        len: u16,
+    },
+}
 
-    fn max_heap_bytes(input_len: usize) -> usize {
-        input_len.saturating_sub(2).min(MAX * 4)
+impl HaveForm {
+    /// The smaller form for `count` indices of a block with `total_parts`
+    /// parts. A tie keeps the list.
+    pub fn smaller(total_parts: u32, count: usize) -> Self {
+        let bitmap_len = total_parts.div_ceil(8);
+        match u16::try_from(bitmap_len) {
+            Ok(len)
+                if (1..=HAVE_BITMAP_MAX_BYTES).contains(&usize::from(len))
+                    && usize::from(len) < Self::List.indices_len(count) =>
+            {
+                Self::Bitmap { len }
+            }
+            _ => Self::List,
+        }
     }
 
-    fn encode(value: &Vec<u32>, out: &mut Vec<u8>) -> Result<(), WireError> {
-        if !(MIN..=MAX).contains(&value.len()) {
-            return Err(WireError::OutOfRange("index count"));
+    /// Payload bytes that `count` indices take in this form, the flags byte
+    /// excluded.
+    pub fn indices_len(self, count: usize) -> usize {
+        match self {
+            Self::List => count.saturating_mul(2).saturating_add(2),
+            Self::Bitmap { len } => usize::from(len),
         }
-        if value.windows(2).any(|pair| pair[1] <= pair[0]) {
-            return Err(WireError::OutOfRange("indices not strictly increasing"));
-        }
-        // `MAX` fits `u16` for every list this file declares.
-        LeU16::encode(&(value.len() as u16), out)?;
-        for &idx in value {
-            LeU32::encode(&idx, out)?;
-        }
-        Ok(())
     }
 
-    fn decode(reader: &mut BoundedReader<'_>) -> Result<Vec<u32>, WireError> {
+    /// Whether this form fits a block of `total_parts` parts: a list always
+    /// does, and a bitmap must be exactly `ceil(total_parts / 8)` bytes
+    /// (close-16).
+    pub fn fits(self, total_parts: u32) -> bool {
+        match self {
+            Self::List => true,
+            Self::Bitmap { len } => u32::from(len) == total_parts.div_ceil(8),
+        }
+    }
+}
+
+/// Appends a `Have`'s flags byte and indices in `form` (decision-33).
+///
+/// `indices` must hold `1..=MAX_HAVE_INDICES` strictly increasing indices,
+/// each below `2^16` for a list or below `8 * len` for a bitmap. The encoder
+/// reserves the exact length before it writes.
+pub fn encode_have_indices(
+    flags: HaveFlags,
+    form: HaveForm,
+    indices: &[u32],
+    out: &mut Vec<u8>,
+) -> Result<(), WireError> {
+    if !(1..=W2_MAX_HAVE_INDICES).contains(&indices.len()) {
+        return Err(WireError::OutOfRange("have index count"));
+    }
+    if indices.windows(2).any(|pair| pair[1] <= pair[0]) {
+        return Err(WireError::OutOfRange(
+            "have indices not strictly increasing",
+        ));
+    }
+    // The indices increase strictly, so the last is the largest.
+    let last = *indices
+        .last()
+        .expect("the count check admits no empty list");
+    out.reserve(1 + form.indices_len(indices.len()));
+    match form {
+        HaveForm::List => {
+            if last > u32::from(u16::MAX) {
+                return Err(WireError::OutOfRange("have list index above u16"));
+            }
+            out.push(flags.bits());
+            // The count check bounds the count by 4,096, which fits u16.
+            out.extend_from_slice(&(indices.len() as u16).to_le_bytes());
+            for &index in indices {
+                // The last index bounds every index by `u16::MAX`.
+                out.extend_from_slice(&(index as u16).to_le_bytes());
+            }
+        }
+        HaveForm::Bitmap { len } => {
+            let len = usize::from(len);
+            // Widening u32 to usize is lossless on supported targets.
+            if !(1..=HAVE_BITMAP_MAX_BYTES).contains(&len) || last as usize >= len * 8 {
+                return Err(WireError::OutOfRange("have bitmap length"));
+            }
+            out.push(flags.bits() | HAVE_FLAG_BITMAP);
+            let start = out.len();
+            out.resize(start + len, 0);
+            for &index in indices {
+                // Widening u32 to usize is lossless; `index / 8 < len`.
+                out[start + (index / 8) as usize] |= 1 << (index % 8);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reads a `Have`'s flags byte and indices (decision-33). A flags byte with
+/// a reserved bit, or with relay but not push, is a reserved flag, which
+/// closes with row 1. Any other refusal closes with row 2.
+pub fn decode_have_indices(
+    reader: &mut BoundedReader<'_>,
+) -> Result<(HaveFlags, HaveForm, Vec<u32>), WireError> {
+    let byte = reader.read::<U8>()?;
+    let flags = HaveFlags::from_bits(byte & !HAVE_FLAG_BITMAP)
+        .ok_or(WireError::ReservedFlags(u16::from(byte)))?;
+    if byte & HAVE_FLAG_BITMAP == 0 {
         let count = usize::from(reader.read::<LeU16>()?);
-        if !(MIN..=MAX).contains(&count) {
-            return Err(WireError::OutOfRange("index count"));
+        if !(1..=W2_MAX_HAVE_INDICES).contains(&count) {
+            return Err(WireError::OutOfRange("have index count"));
         }
-        if count.saturating_mul(4) > reader.remaining() {
-            return Err(WireError::Truncated("indices"));
+        if count * 2 > reader.remaining() {
+            return Err(WireError::Truncated("have indices"));
         }
         let mut indices = Vec::with_capacity(count);
         for _ in 0..count {
-            let idx = reader.read::<LeU32>()?;
-            if indices.last().is_some_and(|&prev| idx <= prev) {
-                return Err(WireError::OutOfRange("indices not strictly increasing"));
+            let index = u32::from(reader.read::<LeU16>()?);
+            if indices.last().is_some_and(|&prev| index <= prev) {
+                return Err(WireError::OutOfRange(
+                    "have indices not strictly increasing",
+                ));
             }
-            indices.push(idx);
+            indices.push(index);
         }
-        Ok(indices)
+        return Ok((flags, HaveForm::List, indices));
+    }
+    // A bitmap is the rest of the payload.
+    let len = reader.remaining();
+    if !(1..=HAVE_BITMAP_MAX_BYTES).contains(&len) {
+        return Err(WireError::OutOfRange("have bitmap length"));
+    }
+    let bitmap = reader.bytes(len, "have bitmap")?;
+    // A byte has at most 8 set bits, so each count fits usize.
+    let count: usize = bitmap.iter().map(|byte| byte.count_ones() as usize).sum();
+    if !(1..=W2_MAX_HAVE_INDICES).contains(&count) {
+        return Err(WireError::OutOfRange("have index count"));
+    }
+    let mut indices = Vec::with_capacity(count);
+    for (at, &byte) in bitmap.iter().enumerate() {
+        let mut bits = byte;
+        while bits != 0 {
+            // `at < 5,504`, so `8 * at + 7` fits u32.
+            indices.push(at as u32 * 8 + bits.trailing_zeros());
+            bits &= bits - 1;
+        }
+    }
+    Ok((
+        flags,
+        HaveForm::Bitmap {
+            // The length check bounds `len` by 5,504, which fits u16.
+            len: len as u16,
+        },
+        indices,
+    ))
+}
+
+/// Wire item for a `Have`'s flags byte and indices in either form
+/// (decision-33).
+#[derive(Debug)]
+pub struct HaveIndicesItem;
+
+impl Wire for HaveIndicesItem {
+    type Value = (HaveFlags, HaveForm, Vec<u32>);
+    /// The flags byte and a one-byte bitmap.
+    const MIN_LEN: usize = 1 + 1;
+    /// The flags byte and a list of `MAX_HAVE_INDICES`, which is longer than
+    /// the longest bitmap.
+    const MAX_LEN: usize = 1 + 2 + 2 * W2_MAX_HAVE_INDICES;
+
+    fn max_heap_bytes(input_len: usize) -> usize {
+        // A list allocates 4 bytes per 2 bytes read, a bitmap 4 bytes per
+        // bit, and either at most `MAX_HAVE_INDICES` indices.
+        input_len
+            .saturating_mul(32)
+            .min(W2_MAX_HAVE_INDICES * std::mem::size_of::<u32>())
+    }
+
+    fn encode(value: &Self::Value, out: &mut Vec<u8>) -> Result<(), WireError> {
+        let (flags, form, indices) = value;
+        encode_have_indices(*flags, *form, indices, out)
+    }
+
+    fn decode(reader: &mut BoundedReader<'_>) -> Result<Self::Value, WireError> {
+        decode_have_indices(reader)
     }
 }
+
+// The flags byte and the longest bitmap fit the item.
+const _: () = assert!(HaveIndicesItem::MAX_LEN > HAVE_BITMAP_MAX_BYTES);
 
 /// Payload type aliases tying each row's [`PayloadLen`] directly to its codec items.
 type HeaderMetaPayload = (
@@ -554,7 +698,7 @@ type WantPayload = (NonZeroLeU32, BlockHash, LeU32, WantBitmapItem);
 type StripeDonePayload = (BlockHash, LeU32);
 type BlockDonePayload = BlockHash;
 type PartPayload = (BlockHash, LeU32, PartSiblings, PartPayloadItem);
-type HavePayload = (BlockHash, HaveFlagsItem, HaveIndices);
+type HavePayload = (BlockHash, HaveIndicesItem);
 type WantEndPayload = (NonZeroLeU32, LeU16, U8);
 
 /// Longest time a buffered `Have` index waits before `PeerState` flushes it
@@ -742,7 +886,7 @@ const _: () = {
     assert!(STRIPE_DONE_RULE.payload.min() == 36 && STRIPE_DONE_RULE.payload.max() == 36);
     assert!(BLOCK_DONE_RULE.payload.min() == 32 && BLOCK_DONE_RULE.payload.max() == 32);
     assert!(WANT_END_RULE.payload.min() == 7 && WANT_END_RULE.payload.max() == 7);
-    assert!(HAVE_RULE.payload.min() == 39 && HAVE_RULE.payload.max() == 16_419);
+    assert!(HAVE_RULE.payload.min() == 34 && HAVE_RULE.payload.max() == 8_227);
     assert!(PART_RULE.payload.min() == 32 + 4 + 1);
     assert!(PART_RULE.payload.max() == 32 + 4 + 1 + 16 * 32 + 65_536);
 };
@@ -820,6 +964,8 @@ pub enum Bpv1Message {
         block_id: block::Hash,
         /// Push and relay flags (decision-24).
         flags: HaveFlags,
+        /// How the indices travel: a `u16` list or a bitmap (decision-33).
+        form: HaveForm,
         /// Strictly increasing wire part indices (`1..=4,096`).
         indices: Vec<u32>,
     },
@@ -900,11 +1046,11 @@ impl WireMessage for Bpv1Message {
             Self::Have {
                 block_id,
                 flags,
+                form,
                 indices,
             } => {
                 BlockHash::encode(block_id, out)?;
-                HaveFlagsItem::encode(flags, out)?;
-                HaveIndices::encode(indices, out)
+                encode_have_indices(*flags, *form, indices, out)
             }
             // A fieldless `repr(u8)` enum's discriminant is its declared value.
             Self::WantEnd {
@@ -957,10 +1103,11 @@ impl WireMessage for Bpv1Message {
                 }
             }
             message_type::HAVE => {
-                let (block_id, flags, indices) = reader.read::<HavePayload>()?;
+                let (block_id, (flags, form, indices)) = reader.read::<HavePayload>()?;
                 Self::Have {
                     block_id,
                     flags,
+                    form,
                     indices,
                 }
             }
@@ -1011,6 +1158,8 @@ pub enum DataQueueItem {
         block_id: block::Hash,
         /// Push and relay flags (decision-24).
         flags: HaveFlags,
+        /// The smaller index form for the block's geometry (decision-33).
+        form: HaveForm,
         /// Strictly increasing wire indices.
         indices: Vec<u32>,
     },
@@ -1033,13 +1182,9 @@ impl DataQueueItem {
             Self::Have {
                 block_id,
                 flags,
+                form,
                 indices,
-            } => encode_frame(&Bpv1Message::Have {
-                block_id: *block_id,
-                flags: *flags,
-                indices: indices.clone(),
-            })
-            .ok(),
+            } => encode_have_frame(*block_id, *flags, *form, indices).ok(),
             Self::WantEnd {
                 want_id,
                 sent,
@@ -1053,6 +1198,25 @@ impl DataQueueItem {
             .ok(),
         }
     }
+}
+
+/// Encodes a `Have` frame from borrowed indices:
+/// `block_id(32) || flags(1) || indices in form` (decision-33). It writes
+/// into one buffer of the exact length and does not clone the indices.
+pub fn encode_have_frame(
+    block_id: block::Hash,
+    flags: HaveFlags,
+    form: HaveForm,
+    indices: &[u32],
+) -> Result<Frame, WireError> {
+    let mut payload = Vec::with_capacity(32 + 1 + form.indices_len(indices.len()));
+    payload.extend_from_slice(&block_id.0);
+    encode_have_indices(flags, form, indices, &mut payload)?;
+    Ok(Frame {
+        message_type: message_type::HAVE,
+        flags: 0,
+        payload,
+    })
 }
 
 /// Encodes `part` of `block_id` as a W2 `Part` frame:

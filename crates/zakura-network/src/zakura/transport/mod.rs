@@ -13,12 +13,14 @@ mod handshake_counts;
 mod io;
 mod lifetime;
 mod message_rule;
+mod moved_ids;
 #[cfg(any(test, zakura_sim))]
 mod observe;
 mod pipe;
 mod preferred_gateways;
 #[cfg(zakura_sim)]
 mod probe;
+mod proven_node;
 mod registry;
 mod service;
 mod session;
@@ -39,6 +41,7 @@ pub use preferred_gateways::{
     RankedGateway, MAX_PREFERRED_GATEWAYS,
 };
 pub(crate) use preferred_gateways::{HeldPlaces, MAX_RANKED_GATEWAYS};
+pub use proven_node::ProvenNode;
 // `SessionGuard` and `ByteBudget` are imported through this re-export; `Admit`
 // and `PeerMeters` are reached directly via the `guard` module path, so they are
 // unused *here* until a later service imports them through `crate::zakura`.
@@ -77,6 +80,9 @@ pub use message_rule::{
     layout::LayoutError,
     ByteRate, Cadence, Credit, MessageRole, MessageRule, PayloadLen,
 };
+#[cfg(test)]
+pub(crate) use moved_ids::tests::no_moves;
+pub(crate) use moved_ids::{MovedNodeIds, RegisteredPeers};
 #[cfg(any(test, zakura_sim))]
 pub(crate) use observe::{ConnTap, RegulationTap, StreamTap};
 #[cfg(zakura_sim)]

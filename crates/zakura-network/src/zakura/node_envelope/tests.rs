@@ -173,7 +173,7 @@ fn the_default_envelope_sums_the_reactor_shares() {
     // The connection window and the stream window that carry the shares.
     assert_eq!(
         shares.receive_window(shares.kinds.iter().map(|(kind, _)| *kind)),
-        crate::zakura::CONTROL_RECEIVE_BYTES + 79_096_107
+        crate::zakura::CONTROL_RECEIVE_BYTES + 79_750_859
     );
     assert_eq!(
         u64::from(limits.quic.stream_receive_window_bytes),
@@ -193,12 +193,12 @@ fn the_default_envelope_sums_the_reactor_shares() {
     let transport = ResourceEnvelope::new(
         limits.transport_limits_for_kinds(shares.kinds.iter().map(|(kind, _)| *kind)),
     );
-    // Per connection: 79,096,107 B of receive shares with `tx-relay` on
+    // Per connection: 79,750,859 B of receive shares with `tx-relay` on
     // (counted inside QUIC receive credit via CreditHold), and unguarded output
     // shares: 24 MiB for legacy gossip and legacy requests plus `tx-relay`'s
     // 4,259,840 B. Discovery, header sync and block sync use guarded
     // Serve/Push output counted in `serve_output_bytes`.
-    assert_eq!(transport.connection_raw_bytes, 79_096_107);
+    assert_eq!(transport.connection_raw_bytes, 79_750_859);
     assert_eq!(transport.connection_output_bytes, 24 * MIB + 4_259_840);
     // The node's exchange allowance caps the client's 288 exchanges.
     assert_eq!(transport.compat_response_bytes, 64 * MIB);
@@ -210,10 +210,10 @@ fn the_default_envelope_sums_the_reactor_shares() {
         conns * 4_259_840 + u128::from(crate::zakura::transport::COMPAT_NODE_BYTES)
     );
     assert_eq!(crate::zakura::transport::COMPAT_NODE_BYTES, 128 * MIB);
-    // `conns` × 112,716,075 + 32 × 128 KiB + 256 MiB.
+    // `conns` × 113,370,827 + 32 × 128 KiB + 256 MiB.
     assert_eq!(
         envelope.quic_bytes,
-        conns * 112_716_075 + 32 * u128::from(128u64 << 10) + u128::from(256 * MIB)
+        conns * 113_370_827 + 32 * u128::from(128u64 << 10) + u128::from(256 * MIB)
     );
 }
 

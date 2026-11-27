@@ -456,7 +456,10 @@ pub struct Config {
     /// the name has no such address. So a changed DNS answer, or someone else at the
     /// peer's old address, gets nothing. Only a peer that upgrades to P2P v2 can prove its
     /// node ID, so Zakura closes a connection to the name's address that stays on the
-    /// legacy protocol, warns, and dials the next address later. A pin needs
+    /// legacy protocol, warns, and dials the next address later. A peer that has added a
+    /// key since it was pinned has a new node ID. It still proves the pinned one while it
+    /// signs with the keys that ID was made from, so the pin keeps working, and Zakura
+    /// warns once and asks for the new ID. A pin needs
     /// `p2p_stack = "dual"`, and Zakura refuses to start with one otherwise. Zakura warns
     /// about each DNS name without a pin when it runs both stacks.
     ///

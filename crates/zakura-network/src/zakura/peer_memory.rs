@@ -124,7 +124,7 @@ mod tests {
     const MIB: u64 = 1024 * 1024;
     const KIB: u64 = 1024;
     /// One admitted Mainnet connection at the derived control share and default shares.
-    const CONNECTION: u64 = 108_456_235;
+    const CONNECTION: u64 = 109_110_987;
     /// One pending handshake: 64 KiB control receive + 64 KiB handshake send.
     const HANDSHAKE: u64 = 128 * KIB;
 
@@ -145,7 +145,7 @@ mod tests {
         let regtest = Network::new_regtest(Default::default());
         assert_eq!(
             config.connection_memory(&regtest, &[]).admitted_bytes,
-            110_549_845
+            111_204_597
         );
         assert_eq!(QuicConfig::default().connection_memory_bytes(), 64 * MIB);
 

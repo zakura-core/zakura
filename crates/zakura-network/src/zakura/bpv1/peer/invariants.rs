@@ -32,7 +32,7 @@ impl PeerState {
             self.early_data_bytes,
             self.config.early_peer_bytes_cap
         );
-        let recomputed_early: usize = self.early_data.iter().map(|e| e.kind.frame_bytes()).sum();
+        let recomputed_early: usize = self.early_data.iter().map(|e| e.kind.held_bytes()).sum();
         assert_eq!(
             self.early_data_bytes, recomputed_early,
             "{PEER_REPLAY}: early_data_bytes accounting mismatch"

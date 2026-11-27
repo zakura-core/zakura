@@ -1532,11 +1532,13 @@ impl Session {
             PeerOutput::SendHave {
                 block_id,
                 flags,
+                form,
                 indices,
             } => {
                 self.data.push(DataQueueItem::Have {
                     block_id,
                     flags,
+                    form,
                     indices,
                 });
             }
@@ -1762,6 +1764,7 @@ impl Written {
                 block_id,
                 flags,
                 indices,
+                ..
             } => Written::Have {
                 block_id,
                 flags,
@@ -2017,18 +2020,21 @@ pub(super) fn data_input(frame: Frame) -> Result<PeerInput, Bpv1CloseRow> {
             Ok(Bpv1Message::Have {
                 block_id,
                 flags,
+                form,
                 indices,
             }) => PeerInput::RecvHave(RecvHave {
                 block_id,
                 flags,
+                form,
                 indices,
                 frame_bytes: frame.payload.len(),
             }),
             Ok(Bpv1Message::WantEnd { want_id, sent, .. }) => {
                 PeerInput::RecvWantEnd(RecvWantEnd { want_id, sent })
             }
-            // A `Have` flags byte other than none, push, or push and relay is
-            // a reserved flag (decision-24).
+            // A `Have` flags byte other than none, push, or push and relay,
+            // each with or without the bitmap bit, is a reserved flag
+            // (decision-24, decision-33).
             Err(WireError::ReservedFlags(_)) => return Err(Bpv1CloseRow::Row1FrameHeader),
             _ => return Err(Bpv1CloseRow::Row2Decode),
         },

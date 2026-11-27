@@ -21,8 +21,8 @@ use super::{
     profile::{Coding, Profile, W2_MAX_HAVE_INDICES},
     tree::VerifiedPart,
     wire::{
-        part_payload_len, Bpv1Message, HaveFlags, WantBitmap, WantEndReason, BPV1_CONTROL_KIND,
-        BPV1_DATA_KIND, HAVE_FLUSH_INTERVAL, MAX_WANTS_INFLIGHT, PART_RULE,
+        part_payload_len, Bpv1Message, HaveFlags, HaveForm, WantBitmap, WantEndReason,
+        BPV1_CONTROL_KIND, BPV1_DATA_KIND, HAVE_FLUSH_INTERVAL, MAX_WANTS_INFLIGHT, PART_RULE,
     },
 };
 
@@ -228,6 +228,9 @@ pub struct RecvHave {
     pub block_id: block::Hash,
     /// Push and relay flags (decision-24).
     pub flags: HaveFlags,
+    /// The form the indices arrived in. A bitmap's length must fit the
+    /// admitted geometry (decision-33, close-16).
+    pub form: HaveForm,
     /// Strictly increasing wire indices.
     pub indices: Vec<u32>,
     /// Encoded frame bytes (for early-record accounting).
@@ -447,6 +450,8 @@ pub enum PeerOutput {
         block_id: block::Hash,
         /// Push and relay flags (decision-24).
         flags: HaveFlags,
+        /// The smaller index form for the block's geometry (decision-33).
+        form: HaveForm,
         /// Strictly increasing wire indices.
         indices: Vec<u32>,
     },
@@ -592,6 +597,22 @@ pub enum PeerOutput {
     CloseProtocol(Bpv1CloseCause),
     /// Close the connection neutrally after a repeat liveness stall (bpv1-58).
     CloseNeutralStall,
+}
+
+/// A [`PeerOutput::SendHave`] of `indices` in the smaller form for `coding`
+/// (decision-33).
+fn send_have(
+    block_id: block::Hash,
+    coding: &Coding,
+    flags: HaveFlags,
+    indices: Vec<u32>,
+) -> PeerOutput {
+    PeerOutput::SendHave {
+        block_id,
+        flags,
+        form: HaveForm::smaller(coding.total_parts().unwrap_or(0), indices.len()),
+        indices,
+    }
 }
 
 /// How long a transfer of `bytes` may make no progress before the session
@@ -945,11 +966,19 @@ impl EarlyDataKind {
         }
     }
 
-    /// Encoded frame bytes charged to the early record.
-    fn frame_bytes(&self) -> usize {
+    /// Bytes charged to the early record: a part's payload, or a `Have`'s
+    /// frame or its block id plus decoded indices, whichever is larger. A
+    /// bitmap byte decodes to up to eight `u32` indices (decision-33), so the
+    /// frame alone undercounts what the record holds.
+    fn held_bytes(&self) -> usize {
         match self {
             Self::Part(prefix) => prefix.payload.len(),
-            Self::Have(have) => have.frame_bytes,
+            Self::Have(have) => have.frame_bytes.max(
+                have.indices
+                    .len()
+                    .saturating_mul(std::mem::size_of::<u32>())
+                    .saturating_add(std::mem::size_of::<block::Hash>()),
+            ),
         }
     }
 }
@@ -1688,11 +1717,12 @@ impl PeerState {
                     block_id,
                     count: indices.len(),
                 });
-                step.outputs.push(PeerOutput::SendHave {
+                step.outputs.push(send_have(
                     block_id,
-                    flags: HaveFlags::Plain,
+                    &block.coding,
+                    HaveFlags::Plain,
                     indices,
-                });
+                ));
             }
             return;
         }
@@ -1785,11 +1815,12 @@ impl PeerState {
         // A `Have` lists at most `W2_MAX_HAVE_INDICES`, so each chunk goes
         // out as its own flagged `Have` ahead of its parts.
         for chunk in flagged.chunks(W2_MAX_HAVE_INDICES) {
-            step.outputs.push(PeerOutput::SendHave {
+            step.outputs.push(send_have(
                 block_id,
-                flags: HaveFlags::Push,
-                indices: chunk.to_vec(),
-            });
+                &block.coding,
+                HaveFlags::Push,
+                chunk.to_vec(),
+            ));
             for &index in chunk {
                 step.outputs.push(PeerOutput::PushPart { block_id, index });
             }
@@ -1821,11 +1852,12 @@ impl PeerState {
                     count: chunk.len(),
                     delayed,
                 });
-                step.outputs.push(PeerOutput::SendHave {
+                step.outputs.push(send_have(
                     block_id,
-                    flags: HaveFlags::Plain,
-                    indices: chunk.to_vec(),
-                });
+                    &block.coding,
+                    HaveFlags::Plain,
+                    chunk.to_vec(),
+                ));
             }
         }
     }
@@ -1853,11 +1885,14 @@ impl PeerState {
         let indices = have.indices;
 
         let total = block.coding.total_parts().unwrap_or(0);
-        // Validate every index before mutating peer_have (bpv1-25, close-16). The
+        // Validate the form and every index before mutating peer_have
+        // (bpv1-25, close-16). A bitmap sized for another geometry, or a
+        // padding bit, which names an index at or past `total`, closes. The
         // decoder already rejected indices that are not strictly increasing.
-        if indices
-            .iter()
-            .any(|&idx| idx >= total || block.peer_have.get(idx as usize))
+        if !have.form.fits(total)
+            || indices
+                .iter()
+                .any(|&idx| idx >= total || block.peer_have.get(idx as usize))
         {
             self.close_protocol(BPV1_DATA_KIND, Bpv1CloseRow::Row16BadHaveIndex, step);
             return;
@@ -2072,11 +2107,8 @@ impl PeerState {
             for chunk in parts.chunks(W2_MAX_HAVE_INDICES) {
                 let mut indices: Vec<u32> = chunk.iter().map(VerifiedPart::index).collect();
                 indices.sort_unstable();
-                step.outputs.push(PeerOutput::SendHave {
-                    block_id,
-                    flags,
-                    indices,
-                });
+                step.outputs
+                    .push(send_have(block_id, &block.coding, flags, indices));
                 for part in chunk {
                     step.outputs.push(PeerOutput::SendSeedPart {
                         block_id,
@@ -2137,11 +2169,8 @@ impl PeerState {
                 .map(|part| part.wire_payload().len() as u64)
                 .sum(),
         });
-        step.outputs.push(PeerOutput::SendHave {
-            block_id,
-            flags: HaveFlags::Push,
-            indices,
-        });
+        step.outputs
+            .push(send_have(block_id, &block.coding, HaveFlags::Push, indices));
         for part in batch {
             step.outputs
                 .push(PeerOutput::SendSeedPart { block_id, part });
@@ -2475,10 +2504,10 @@ impl PeerState {
             self.note_dropped_early(&entry.kind);
             step.events.push(PeerEvent::EarlyAged {
                 block_id: entry.kind.block_id(),
-                bytes: entry.kind.frame_bytes(),
+                bytes: entry.kind.held_bytes(),
             });
         }
-        self.release_early(aged.iter().map(|e| e.kind.frame_bytes()).sum(), step);
+        self.release_early(aged.iter().map(|e| e.kind.held_bytes()).sum(), step);
         self.early_control
             .retain(|e| now.saturating_duration_since(e.received_at) < early_age);
 
@@ -2628,7 +2657,7 @@ impl PeerState {
 
     fn buffer_early_data(&mut self, now: Instant, kind: EarlyDataKind, step: &mut PeerStep) {
         let block_id = kind.block_id();
-        let bytes = kind.frame_bytes();
+        let bytes = kind.held_bytes();
         // A single frame larger than the entire per-peer early cap can never fit:
         // drop it explicitly without pausing an empty queue.
         let refused = if bytes > self.config.early_peer_bytes_cap {
@@ -2690,7 +2719,7 @@ impl PeerState {
             .into_iter()
             .partition(|e| e.kind.block_id() == block_id);
         self.early_data = kept;
-        self.release_early(data.iter().map(|e| e.kind.frame_bytes()).sum(), step);
+        self.release_early(data.iter().map(|e| e.kind.held_bytes()).sum(), step);
         (control, data)
     }
 

@@ -262,6 +262,17 @@ pub fn phase_name(phase: BlockPhase) -> &'static str {
 /// it never started. The replays record each under these names.
 pub const COMPLETIONS: [&str; 3] = ["work:current", "work:stale", "work:unknown"];
 
+/// The `Have` forms and malformed indices the `bpv1_peer` replay sends
+/// (decision-33): a list, a bitmap, an index past the layout, a bitmap
+/// padding bit, and a bitmap sized for another layout.
+pub const HAVE_FORMS: [&str; 5] = [
+    "have:list",
+    "have:bitmap",
+    "have:past-layout",
+    "have:bitmap-padding",
+    "have:bitmap-misfit",
+];
+
 /// One target's measurement.
 #[derive(Clone, Debug)]
 pub struct TargetQuality {
@@ -298,7 +309,14 @@ const TARGETS: [Target; 5] = [
     Target {
         name: "bpv1_peer",
         replay: |bytes| replay_bpv1_peer_bytes(bytes).reached,
-        expected: || PEER_INPUTS.iter().copied().chain(COMPLETIONS).collect(),
+        expected: || {
+            PEER_INPUTS
+                .iter()
+                .copied()
+                .chain(COMPLETIONS)
+                .chain(HAVE_FORMS)
+                .collect()
+        },
         max_len: 512,
     },
     Target {

@@ -135,6 +135,14 @@ and never reserves a block that it saw claimed, so BPv1 delays a body by at
 most one grace before its claim, and never after a release. A request that
 native block sync started before any claim or reservation runs to completion.
 
+A peer with a live BPv1 session sends `HeaderMeta`, which carries the header,
+for each block it admits. So header sync MUST NOT fetch a header in BPv1's
+window from that peer while a claim or reservation on the header's hash is
+live. Header sync's first wait takes the same once-per-hash reservation as
+native block sync, so the header and its body share one grace. Header sync
+fetches the header when the claim is released or the reservation expires. It
+fetches a header from a peer without BPv1 at once.
+
 Assembly extends a live claim until a verdict or the
 verification deadline, which starts at the first submission. It never renews an
 expired claim, because block sync may already fetch the body. When the

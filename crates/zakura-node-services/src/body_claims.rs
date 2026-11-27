@@ -28,7 +28,11 @@ use std::{
 };
 
 use zakura_chain::block;
-use zakura_rt::{collections::HashMap, sync::watch, time::Instant};
+use zakura_rt::{
+    collections::{HashMap, HashSet},
+    sync::watch,
+    time::Instant,
+};
 
 /// Reason a body claim is released.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -81,8 +85,9 @@ struct Table {
     /// moves above its height.
     seen: HashMap<block::Hash, u32>,
     window: Option<Bpv1Window>,
-    /// Whether BPv1 has a live session to receive `HeaderMeta` from.
-    bpv1_live: bool,
+    /// The node ids of the peers with a live BPv1 session. Only they send
+    /// this node `HeaderMeta`.
+    bpv1_peers: HashSet<[u8; 32]>,
 }
 
 impl Table {
@@ -211,14 +216,27 @@ impl SharedBodyClaims {
         table.window = window;
     }
 
-    /// Records whether BPv1 has a live session. Without one, no `HeaderMeta`
-    /// can arrive, so native block sync reserves nothing.
-    pub fn set_bpv1_live(&self, live: bool) {
-        self.lock().bpv1_live = live;
+    /// Records whether the peer with node id `peer` has a live BPv1 session.
+    /// Without any, no `HeaderMeta` can arrive, so nothing is reserved.
+    pub fn set_bpv1_peer(&self, peer: [u8; 32], live: bool) {
+        let mut table = self.lock();
+        if live {
+            table.bpv1_peers.insert(peer);
+        } else {
+            table.bpv1_peers.remove(&peer);
+        }
+    }
+
+    /// Whether the peer with node id `peer` has a live BPv1 session, so it
+    /// sends this node `HeaderMeta` for the blocks it admits.
+    pub fn is_bpv1_peer(&self, peer: &[u8; 32]) -> bool {
+        self.lock().bpv1_peers.contains(peer)
     }
 
     /// Native block sync asks whether to skip the needed body `hash` at
-    /// `height` for now, judging expiry at `now`.
+    /// `height` for now, judging expiry at `now`. Header sync asks the same
+    /// before it fetches the header `hash` from a BPv1 peer, so the header
+    /// and the body share one reservation.
     ///
     /// Returns `true` while a live claim or reservation covers `hash`. If no
     /// entry covers it, and native block sync never saw it covered before,
@@ -226,15 +244,15 @@ impl SharedBodyClaims {
     /// the window's grace and returns `true`. Otherwise returns `false`, and
     /// native block sync fetches the body.
     ///
-    /// A new reservation does not bump the generation. Native block sync is
-    /// the only caller, and re-arms its timer from [`Self::next_expiry`].
+    /// A new reservation does not bump the generation. Each caller re-arms
+    /// its own timer from [`Self::next_expiry`].
     pub fn defer_to_bpv1(&self, hash: block::Hash, height: u32, now: Instant) -> bool {
         let mut table = self.lock();
         if table.is_live(&hash, now) {
             table.seen.entry(hash).or_insert(height);
             return true;
         }
-        if table.seen.contains_key(&hash) || !table.bpv1_live {
+        if table.seen.contains_key(&hash) || table.bpv1_peers.is_empty() {
             return false;
         }
         let Some(window) = table.window.filter(|window| window.contains(height)) else {
@@ -414,7 +432,8 @@ mod tests {
             !claims.defer_to_bpv1(h, 101, t0),
             "no live BPv1 session, no reservation"
         );
-        claims.set_bpv1_live(true);
+        assert!(!claims.is_bpv1_peer(&[7; 32]));
+        claims.set_bpv1_peer([7; 32], true);
         assert!(
             !claims.defer_to_bpv1(h, 84, t0),
             "the window excludes its low"
@@ -443,7 +462,7 @@ mod tests {
         let t0 = Instant::now();
         let h = block::Hash([0xAA; 32]);
         claims.set_bpv1_window(window(84, 116));
-        claims.set_bpv1_live(true);
+        claims.set_bpv1_peer([7; 32], true);
         assert!(claims.defer_to_bpv1(h, 101, t0));
         let late = t0 + Duration::from_secs(15);
         assert!(
@@ -469,7 +488,7 @@ mod tests {
         let t0 = Instant::now();
         let h = block::Hash([0xAA; 32]);
         claims.set_bpv1_window(window(84, 116));
-        claims.set_bpv1_live(true);
+        claims.set_bpv1_peer([7; 32], true);
         assert!(claims.claim_at(h, t0 + Duration::from_secs(15), t0));
         assert!(claims.defer_to_bpv1(h, 101, t0), "the claim is live");
 
@@ -486,7 +505,7 @@ mod tests {
         let t0 = Instant::now();
         let (a, b) = (block::Hash([0xAA; 32]), block::Hash([0xBB; 32]));
         claims.set_bpv1_window(window(84, 116));
-        claims.set_bpv1_live(true);
+        claims.set_bpv1_peer([7; 32], true);
         assert!(claims.defer_to_bpv1(a, 90, t0));
         assert!(claims.defer_to_bpv1(b, 100, t0));
         let t1 = t0 + Duration::from_secs(1);

@@ -3074,3 +3074,76 @@ async fn an_earlier_lower_work_offer_waits_behind_a_later_offer_the_pass_serves_
     reactor.schedule_cached_statuses();
     expect_locator_query(&mut actions, &honest, target);
 }
+
+/// Header sync fetches no header in BPv1's window from a BPv1 peer while it
+/// waits for that peer's `HeaderMeta`. A peer without BPv1 is served at
+/// once, and the held offer is staged when its reservation expires.
+#[tokio::test(start_paused = true)]
+async fn a_bpv1_peers_status_waits_for_its_header_meta() {
+    use zakura_node_services::body_claims::{Bpv1Window, SharedBodyClaims};
+
+    let (mut reactor, mut actions, snapshot) = offers_reactor();
+    let claims = SharedBodyClaims::new();
+    let grace = std::time::Duration::from_millis(300);
+    claims.set_bpv1_window(Some(Bpv1Window {
+        low_exclusive: 0,
+        high_inclusive: 16,
+        grace,
+    }));
+    reactor.startup.body_claims = Some(claims.clone());
+    let (bpv1_peer, _bpv1_outbound) = connect(&mut reactor, 0x31);
+    let (plain_peer, _plain_outbound) = connect(&mut reactor, 0x32);
+    claims.set_bpv1_peer([0x31; 32], true);
+    let held = block::Hash([0x41; 32]);
+    let served = block::Hash([0x42; 32]);
+
+    reactor.handle_status(bpv1_peer.clone(), 0, status_for(&snapshot, held));
+    reactor.schedule_cached_statuses();
+    assert!(
+        actions.try_recv().is_err(),
+        "the BPv1 peer's header waits for its HeaderMeta"
+    );
+    assert!(
+        claims.is_claimed(held, Instant::now()),
+        "the wait reserves the body too"
+    );
+    let deadline = reactor
+        .bpv1_hold_until()
+        .expect("a held offer wakes at the reservation's expiry");
+
+    reactor.handle_status(plain_peer.clone(), 0, status_for(&snapshot, served));
+    expect_locator_query(&mut actions, &plain_peer, served);
+
+    time::advance(deadline - Instant::now()).await;
+    reactor.end_bpv1_hold();
+    reactor.schedule_cached_statuses();
+    expect_locator_query(&mut actions, &bpv1_peer, held);
+    assert_eq!(
+        reactor.bpv1_hold_until(),
+        None,
+        "a hash is reserved once, so nothing is held after the grace"
+    );
+}
+
+/// A peer without BPv1, or a target outside BPv1's window, is never held.
+#[test]
+fn header_sync_holds_only_a_bpv1_peer_inside_the_window() {
+    use zakura_node_services::body_claims::{Bpv1Window, SharedBodyClaims};
+
+    let (mut reactor, mut actions, snapshot) = offers_reactor();
+    let claims = SharedBodyClaims::new();
+    claims.set_bpv1_window(Some(Bpv1Window {
+        low_exclusive: 5,
+        high_inclusive: 16,
+        grace: std::time::Duration::from_secs(1),
+    }));
+    reactor.startup.body_claims = Some(claims.clone());
+    let (bpv1_peer, _bpv1_outbound) = connect(&mut reactor, 0x33);
+    claims.set_bpv1_peer([0x33; 32], true);
+    let below = block::Hash([0x43; 32]);
+
+    // `status_for` advertises height 2, below the window.
+    reactor.handle_status(bpv1_peer.clone(), 0, status_for(&snapshot, below));
+    expect_locator_query(&mut actions, &bpv1_peer, below);
+    assert!(!claims.is_claimed(below, Instant::now()));
+}

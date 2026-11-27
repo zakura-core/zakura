@@ -6158,6 +6158,7 @@ async fn spawn_zakura_endpoint_inner(
         .and_then(|driver| driver.vct_root_repairs.clone());
     if let Some(driver) = header_sync_driver_startup.as_ref() {
         startup.header_chain_port = driver.header_chain_port.clone();
+        startup.body_claims = driver.body_claims.clone();
     }
     let header_sync_shutdown = CancellationToken::new();
     startup.shutdown = header_sync_shutdown.clone();

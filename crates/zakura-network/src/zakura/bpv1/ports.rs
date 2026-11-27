@@ -218,9 +218,10 @@ pub trait BlockFallbackPort: Send + Sync + 'static {
     /// header first.
     fn publish_window(&self, window: Bpv1Window);
 
-    /// Records whether BPv1 has a live session. Native block sync reserves
-    /// no body while it has none.
-    fn set_live(&self, live: bool);
+    /// Records whether `peer` has a live BPv1 session. Header sync holds a
+    /// header for BPv1 only from such a peer, and nothing is reserved while
+    /// no peer has one.
+    fn set_peer_live(&self, peer: NodeId, live: bool);
 }
 
 /// The body claims BPv1 shares with native `block_sync`.
@@ -248,7 +249,7 @@ impl BlockFallbackPort for SharedBodyClaims {
         self.set_bpv1_window(Some(window));
     }
 
-    fn set_live(&self, live: bool) {
-        self.set_bpv1_live(live);
+    fn set_peer_live(&self, peer: NodeId, live: bool) {
+        self.set_bpv1_peer(*peer.as_bytes(), live);
     }
 }

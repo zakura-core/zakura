@@ -309,6 +309,7 @@ fn build_header_sync_reactor(
             zakura_header_chain::MAX_STAGED_TARGETS_V1,
         )),
         locator_capacity_waiting: false,
+        bpv1_hold: false,
         tip: tip_tx,
         peers: peers_tx,
         candidates: candidates_tx,
@@ -366,6 +367,9 @@ struct HeaderSyncReactor {
     // Unlike queue ownership, this capacity survives eviction and caller timeouts.
     locator_capacity: std::sync::Arc<Semaphore>,
     locator_capacity_waiting: bool,
+    /// Whether an ordinary offer waits for a BPv1 peer's `HeaderMeta`. A
+    /// body-claim release or expiry then reruns the cached pass.
+    bpv1_hold: bool,
     tip: watch::Sender<(block::Height, block::Hash)>,
     peers: watch::Sender<ServicePeerSnapshot>,
     candidates: watch::Sender<ZakuraHeaderSyncCandidateState>,
@@ -522,6 +526,11 @@ impl HeaderSyncReactor {
         let mut committed_snapshots = self.startup.committed_snapshots.clone();
         let mut vct_root_repairs = self.startup.vct_root_repairs.clone();
         let mut capacity_releases = self.peer_work_queue.capacity_releases();
+        let mut body_claim_generation = self
+            .startup
+            .body_claims
+            .as_ref()
+            .map(|claims| claims.subscribe());
         let mut maintenance = self.next_maintenance_deadline();
         let terminal_outcome = loop {
             if self
@@ -569,6 +578,7 @@ impl HeaderSyncReactor {
             maintenance = self.next_maintenance_deadline();
             metrics::counter!("sync.header.reactor.iterations").increment(1);
             let locator_capacity = self.locator_capacity.clone();
+            let bpv1_hold_until = self.bpv1_hold_until();
             zakura_rt::select! {
                 biased;
                 _ = self.startup.shutdown.cancelled() => break HeaderRequestTerminal::Shutdown,
@@ -590,6 +600,25 @@ impl HeaderSyncReactor {
                     });
                 },
                 _ = capacity_releases.changed() => {},
+                // A held offer's reservation or claim expired, or BPv1
+                // released a claim: the cached pass decides again.
+                () = async {
+                    match bpv1_hold_until {
+                        Some(deadline) => time::sleep_until(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                } => self.end_bpv1_hold(),
+                changed = async {
+                    match body_claim_generation.as_mut() {
+                        Some(generation) => generation.changed().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if changed.is_err() {
+                        body_claim_generation = None;
+                    }
+                    self.end_bpv1_hold();
+                }
                 // Wakes the loop. The next turn runs the due maintenance.
                 _ = time::sleep_until(maintenance) => {},
                 event = self.lifecycle.recv() => match event {
@@ -1419,7 +1448,57 @@ impl HeaderSyncReactor {
                 self.peer_work_queue.remove_unstarted(&peer)
             }
             OfferDecision::AwaitSubscription => self.close_subscription(&peer),
-            OfferDecision::Stage => self.stage_offer(peer, target, priority),
+            OfferDecision::Stage => {
+                if self.holds_for_bpv1(&peer, &target.status) {
+                    return;
+                }
+                self.stage_offer(peer, target, priority)
+            }
+        }
+    }
+
+    /// Whether `peer`'s offer waits for BPv1, leaving its status unspent.
+    ///
+    /// A BPv1 peer sends `HeaderMeta`, which carries the header, for each
+    /// block it admits. So within BPv1's window, header sync fetches no
+    /// header from such a peer while a BPv1 claim or reservation on the
+    /// target is live. The first wait reserves the target for BPv1's
+    /// metadata grace, the same reservation that native block sync takes for
+    /// the body, and each hash is reserved once. A header the grace passes
+    /// over is fetched at once, and its body is too.
+    fn holds_for_bpv1(&mut self, peer: &ZakuraPeerId, status: &Status) -> bool {
+        let Some(claims) = self.startup.body_claims.as_ref() else {
+            return false;
+        };
+        let held = peer
+            .node_id()
+            .is_some_and(|node| claims.is_bpv1_peer(node.as_bytes()))
+            && claims.defer_to_bpv1(
+                status.selected_tip_hash,
+                status.selected_tip_height.0,
+                Instant::now(),
+            );
+        if held {
+            metrics::counter!("sync.header.target.bpv1_held").increment(1);
+            self.bpv1_hold = true;
+        }
+        held
+    }
+
+    /// When a held offer's claim or reservation can next expire.
+    fn bpv1_hold_until(&self) -> Option<Instant> {
+        if !self.bpv1_hold {
+            return None;
+        }
+        let claims = self.startup.body_claims.as_ref()?;
+        claims.prune_expired(Instant::now());
+        claims.next_expiry()
+    }
+
+    /// Lets the cached pass reconsider the offers held for BPv1.
+    fn end_bpv1_hold(&mut self) {
+        if std::mem::take(&mut self.bpv1_hold) {
+            self.state.bump_scheduling_revision();
         }
     }
 

@@ -396,7 +396,10 @@ async fn native_block_sync_reserves_a_header_in_the_bpv1_window_for_the_grace() 
         high_inclusive: 11,
         grace,
     });
-    fallback_port.set_live(true);
+    fallback_port.set_peer_live(
+        zakura_quic::NodeSecretKey::from_bytes(&[2; 32]).public(),
+        true,
+    );
 
     let frontiers = BlockSyncFrontiers {
         finalized_height: block::Height(10),

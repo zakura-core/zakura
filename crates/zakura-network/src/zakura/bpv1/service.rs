@@ -1053,7 +1053,7 @@ impl Service for Bpv1Service {
             if let Some(prev) = sessions.insert(peer_node, live) {
                 prev.cancel.cancel();
             }
-            self.node.fallback.set_live(true);
+            self.node.fallback.set_peer_live(peer_node, true);
             (session_gen, snapshot)
         };
 
@@ -1097,7 +1097,7 @@ impl Service for Bpv1Service {
             if let Some(sess) = sessions.remove(&peer_node) {
                 sess.cancel.cancel();
             }
-            self.node.fallback.set_live(!sessions.is_empty());
+            self.node.fallback.set_peer_live(peer_node, false);
         }
     }
 }
@@ -2135,7 +2135,7 @@ async fn run_peer_routine(
             .is_some_and(|s| s.conn_id == conn_id && s.session_gen == session_gen)
         {
             sessions.remove(&peer_node);
-            node.fallback.set_live(!sessions.is_empty());
+            node.fallback.set_peer_live(peer_node, false);
         }
     }
     // `SessionEnded` releases every claim and pending push of this session,

@@ -1502,8 +1502,9 @@ const PONG: MessageRule = MessageRule {
 async fn request_response_tables_reject_the_other_role_before_payloads() -> Result<(), BoxError> {
     let _guard = zakura_test::init();
     let (server, client, connection, remote) = raw_connection().await?;
+    // A native kind: on a legacy kind, the legacy codec's bounds would reject
+    // these frames before the table could.
     let stream = Stream {
-        kind: LEGACY_REQUEST_STREAM_KIND,
         mode: StreamMode::RequestResponse,
         messages: Some(&[PING, PONG]),
         ..DATA
@@ -2339,6 +2340,110 @@ async fn abandoned_application_drains_queued_writes_before_retirement() -> Resul
         assert!(fixture.connection.close_reason().is_none());
         fixture.close().await?;
     }
+    Ok(())
+}
+
+/// A partial legacy request closes its connection at the local read deadline, well
+/// before the idle timeout, whether it stalls in its header or in its payload.
+#[tokio::test]
+async fn legacy_partial_requests_close_at_local_deadline() -> Result<(), BoxError> {
+    let (_server, client, connection, remote) = raw_connection().await?;
+    let registry = Arc::new(ServiceRegistry::new(vec![])?);
+    let local = ZakuraLocalLimits::from_config(&Config::default());
+    let limits = local.clamp(&local.initial_limits());
+    assert!(limits.idle_timeout > 2 * LEGACY_REQUEST_READ_TIMEOUT);
+    let mut workers = Vec::new();
+    let mut streams = Vec::new();
+    let mut cancellations = Vec::new();
+    for complete_header in [false, true] {
+        let (mut peer_send, peer_recv) = connection.open_bi().await?;
+        let mut header = LEGACY_REQUEST_PUSH_TRANSACTION.to_le_bytes().to_vec();
+        header.extend_from_slice(&0u16.to_le_bytes());
+        header.extend_from_slice(&64u32.to_le_bytes());
+        peer_send
+            .write_all(
+                &header[..if complete_header {
+                    FRAME_HEADER_BYTES
+                } else {
+                    1
+                }],
+            )
+            .await?;
+        let (send, recv) = timeout(TEST_TIMEOUT, remote.accept_bi()).await??;
+        let mut context = raw_worker_context(&client, Arc::new(Semaphore::new(1)));
+        context.limits = limits;
+        cancellations.push(context.connection_token.clone());
+        workers.push(tokio::spawn(request_stream_worker(
+            send,
+            recv,
+            StreamPrelude {
+                magic: STREAM_PRELUDE_MAGIC,
+                stream_kind: LEGACY_REQUEST_STREAM_KIND,
+                stream_version: 1,
+                request_id: Some(1),
+                max_frame_bytes: crate::zakura::LOCAL_MAX_CONTROL_FRAME_BYTES,
+            },
+            context,
+            registry.clone(),
+        )));
+        streams.push((peer_send, peer_recv));
+    }
+    // With the clock paused, it jumps to whichever timer ends each read. The
+    // deadline must win well before the idle timeout, which the timer wheel's
+    // millisecond rounding can't blur.
+    tokio::time::pause();
+    let paused = tokio::time::Instant::now();
+    for worker in workers {
+        worker.await?;
+    }
+    assert!(paused.elapsed() < 2 * LEGACY_REQUEST_READ_TIMEOUT);
+    assert!(cancellations.iter().all(CancellationToken::is_cancelled));
+    drop(streams);
+    Ok(())
+}
+
+/// A complete legacy request that waits for room in its connection's raw-frame
+/// gate keeps the connection past the read deadline, because that wait is local.
+#[tokio::test]
+async fn legacy_request_admission_wait_outlasts_the_read_deadline() -> Result<(), BoxError> {
+    let (_server, client, connection, remote) = raw_connection().await?;
+    let (mut peer_send, _peer_recv) = connection.open_bi().await?;
+    let mut frame = LEGACY_REQUEST_PUSH_TRANSACTION.to_le_bytes().to_vec();
+    frame.extend_from_slice(&0u16.to_le_bytes());
+    frame.extend_from_slice(&64u32.to_le_bytes());
+    frame.extend_from_slice(&[0; 64]);
+    peer_send.write_all(&frame).await?;
+    let (send, recv) = timeout(TEST_TIMEOUT, remote.accept_bi()).await??;
+    let mut context = raw_worker_context(&client, Arc::new(Semaphore::new(1)));
+    // A short idle timeout shortens the read deadline, so the test runs in real time.
+    context.limits.idle_timeout = Duration::from_millis(200);
+    let cancel = context.connection_token.clone();
+    let raw = context.resources.raw.clone();
+    // Earlier requests hold the whole gate, so this frame waits after its header.
+    let held = raw
+        .try_admit(raw.capacity())
+        .expect("nothing holds the gate yet");
+    let worker = tokio::spawn(request_stream_worker(
+        send,
+        recv,
+        StreamPrelude {
+            magic: STREAM_PRELUDE_MAGIC,
+            stream_kind: LEGACY_REQUEST_STREAM_KIND,
+            stream_version: 1,
+            request_id: Some(1),
+            max_frame_bytes: crate::zakura::LOCAL_MAX_CONTROL_FRAME_BYTES,
+        },
+        context,
+        Arc::new(ServiceRegistry::new(vec![])?),
+    ));
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(
+        !cancel.is_cancelled(),
+        "a wait for local capacity is not a peer stall"
+    );
+    assert!(!worker.is_finished());
+    worker.abort();
+    drop(held);
     Ok(())
 }
 

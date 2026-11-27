@@ -230,6 +230,11 @@ const STREAM_WORKER_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const TRANSPORT_USAGE_REPORT_INTERVAL: Duration = Duration::from_secs(10);
 const OUTBOUND_STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const OUTBOUND_REQUEST_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+/// The bound on each phase of a legacy request's read, regardless of peer idle limits:
+/// its first header byte, the rest of its header and its payload. A wait for local
+/// raw-frame capacity between header and payload doesn't count. Missing it closes the
+/// connection, where another request stream's read timeout resets only that stream.
+const LEGACY_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(10);
 // Mirrors the legacy gossip compatibility protocol. Compile-time assertions
 // below keep this transport-side budget validator pinned to the codec constants.
 const LEGACY_GOSSIP_STREAM_KIND: u16 = 2;
@@ -256,10 +261,8 @@ const LEGACY_RESPONSE_REQUEST_ID_BYTES: usize = 8;
 const LEGACY_RESPONSE_CHUNK_HEADER_BYTES: usize = LEGACY_RESPONSE_REQUEST_ID_BYTES + 1;
 const LEGACY_COMPACT_SIZE_PREFIX_BYTES: usize = 9;
 const LEGACY_BLOCK_HASH_BYTES: usize = 32;
-const LEGACY_INVENTORY_HASH_BYTES: usize = 36;
 /// A witnessed transaction's inventory entry: a type code and two 32-byte hashes.
 const LEGACY_WTX_INVENTORY_BYTES: usize = 68;
-const LEGACY_RESPONSE_MAX_FRAMES_PER_ITEM: usize = 8;
 const _: () = assert!(LEGACY_GOSSIP_STREAM_KIND == super::legacy_gossip::ZAKURA_STREAM_GOSSIP);
 const _: () =
     assert!(LEGACY_REQUEST_STREAM_KIND == super::legacy_gossip::ZAKURA_STREAM_LEGACY_REQUESTS);
@@ -7037,6 +7040,7 @@ async fn persistent_stream_worker_with_policy(
                     &mut recv,
                     reader_context.inbound_frame_cap,
                     sim_chain!(FrameFilter::new(reader_context.messages, InboundReader::Persistent)
+                        .with_legacy_stream(stream_kind)
                         .with_precheck(reader_context.precheck.get())
                         => with_tap(reader_context.precheck.tap())),
                     reader_context.limits.idle_timeout,
@@ -7343,7 +7347,7 @@ fn read_close_outcome(
 
     let fault = |row| CloseOutcome::fault(kind, version, row);
     match (path, error) {
-        (_, RejectedFrame { rejection, .. }) => fault(rejection.close_row()),
+        (_, RejectedFrame { rejection, .. }) => rejection.close_outcome(kind, version),
         (_, OversizeFrame { .. }) => fault(CloseRow::REG_CLOSE_1),
         (_, QuicRead(FinishedEarly(_)))
         | (ReadPath::Ordered, Oversize)
@@ -7392,6 +7396,7 @@ async fn request_stream_worker(
     context: StreamWorkerContext,
     registry: Arc<ServiceRegistry>,
 ) {
+    let legacy = prelude.stream_kind == super::legacy_gossip::ZAKURA_STREAM_LEGACY_REQUESTS;
     let Some(request_id) = prelude.request_id else {
         let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
         context.close_cause.record(CloseOutcome::fault(
@@ -7403,18 +7408,24 @@ async fn request_stream_worker(
         return;
     };
 
+    let read_timeout = if legacy {
+        LEGACY_REQUEST_READ_TIMEOUT.min(context.limits.idle_timeout)
+    } else {
+        context.limits.idle_timeout
+    };
     let frame = zakura_rt::select! {
         biased;
         _ = context.connection_token.cancelled() => return,
         frame = read_admitted_frame(
             &mut recv,
             context.inbound_frame_cap,
-            FrameFilter::new(context.messages, InboundReader::Responder),
-            context.limits.idle_timeout,
+            FrameFilter::new(context.messages, InboundReader::Responder)
+                .with_legacy_stream(prelude.stream_kind),
+            read_timeout,
             // A request stream carries its request frame immediately after the
             // prelude, so a peer that opens one and then goes silent is treated
-            // as a stalled one-shot stream and bounded by the idle timeout.
-            Some(context.limits.idle_timeout),
+            // as a stalled one-shot stream and bounded by the read timeout.
+            Some(read_timeout),
             &context.resources.raw,
         ) => frame,
     };
@@ -7422,6 +7433,16 @@ async fn request_stream_worker(
     // The raw frame stays funded until its service's call ends.
     let (frame, raw_grant) = match frame {
         Ok(AdmittedFrame { frame, grant, .. }) => (frame, grant),
+        // See `LEGACY_REQUEST_READ_TIMEOUT`.
+        Err(ZakuraHandlerError::Timeout(_)) if legacy => {
+            let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_NEUTRAL));
+            context.close_cause.record(CloseOutcome::neutral(
+                NeutralCause::Timeout,
+                "legacy_request_deadline",
+            ));
+            context.connection_token.cancel();
+            return;
+        }
         Err(ZakuraHandlerError::Timeout(_)) => {
             let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_NEUTRAL));
             let _ = recv.stop(VarInt::from_u32(ZAKURA_CLOSE_NEUTRAL));
@@ -8137,6 +8158,7 @@ async fn write_outbound_request_frame_inner(
             &mut recv,
             inbound_frame_cap,
             FrameFilter::new(stream.messages, InboundReader::Requester)
+                .with_legacy_stream(stream.kind)
                 .with_precheck(Some(&legacy_state)),
             limits.idle_timeout,
             // This is the requester side of a one-shot legacy request/response:
@@ -8167,6 +8189,14 @@ async fn write_outbound_request_frame_inner(
                 return Err(OutboundRequestError::Local(Box::new(
                     ZakuraHandlerError::Timeout("outbound response"),
                 )));
+            }
+            Err(
+                error @ ZakuraHandlerError::RejectedFrame {
+                    rejection: FrameRejection::LocalCapacity,
+                    ..
+                },
+            ) => {
+                return Err(OutboundRequestError::Local(Box::new(error)));
             }
             Err(error @ ZakuraHandlerError::OversizeFrame { .. })
             | Err(error @ ZakuraHandlerError::Oversize) => {
@@ -8230,19 +8260,21 @@ impl LegacyResponseBudget {
         let (max_items, max_frames, max_bytes) = match kind {
             LegacyResponseKind::Blocks | LegacyResponseKind::Transactions => {
                 let item_count = legacy_inventory_count(payload, kind)?;
-                let max_frames = item_count
-                    .saturating_mul(LEGACY_RESPONSE_MAX_FRAMES_PER_ITEM)
-                    .saturating_add(1);
+                let max_frames = super::legacy_gossip::LEGACY_RESPONSE_MAX_FRAMES;
                 let item_bytes = match kind {
                     LegacyResponseKind::Blocks => LEGACY_BLOCK_HASH_BYTES,
-                    LegacyResponseKind::Transactions => LEGACY_INVENTORY_HASH_BYTES,
+                    LegacyResponseKind::Transactions => LEGACY_WTX_INVENTORY_BYTES,
                     _ => unreachable!("matched inventory response kind"),
                 };
                 let missing_bytes = LEGACY_RESPONSE_REQUEST_ID_BYTES
                     .saturating_add(LEGACY_COMPACT_SIZE_PREFIX_BYTES)
                     .saturating_add(item_count.saturating_mul(item_bytes));
+                // Chunks retain their own headers in addition to each assembled item.
+                // Allow any chunking within the local frame ceiling, not just full frames.
+                let chunk_headers = max_frames.saturating_mul(LEGACY_RESPONSE_CHUNK_HEADER_BYTES);
                 let max_bytes = item_count
                     .saturating_mul(max_message_bytes)
+                    .saturating_add(chunk_headers)
                     .saturating_add(missing_bytes)
                     .max(LEGACY_RESPONSE_CHUNK_HEADER_BYTES);
                 (item_count, max_frames, max_bytes)
@@ -8263,9 +8295,7 @@ impl LegacyResponseBudget {
             LegacyResponseKind::TransactionIds => {
                 let max_bytes = LEGACY_RESPONSE_REQUEST_ID_BYTES
                     .saturating_add(LEGACY_COMPACT_SIZE_PREFIX_BYTES)
-                    .saturating_add(
-                        max_inventory_items.saturating_mul(LEGACY_INVENTORY_HASH_BYTES),
-                    );
+                    .saturating_add(max_inventory_items.saturating_mul(LEGACY_WTX_INVENTORY_BYTES));
                 (max_inventory_items, 1, max_bytes)
             }
             LegacyResponseKind::Pong | LegacyResponseKind::Nil => {
@@ -8456,7 +8486,12 @@ struct LegacyResponseReadState {
 impl super::regulation::ResponsePrecheck for LegacyResponseReadState {
     fn check(&self, _message_type: u16, payload_len: usize) -> Result<(), FrameRejection> {
         if self.frames >= self.budget.max_frames {
-            return Err(FrameRejection::Unsolicited);
+            return Err(match self.budget.kind {
+                LegacyResponseKind::Blocks | LegacyResponseKind::Transactions => {
+                    FrameRejection::LocalCapacity
+                }
+                _ => FrameRejection::Unsolicited,
+            });
         }
         let remaining = self.budget.max_bytes.saturating_sub(self.bytes);
         if payload_len > remaining {
@@ -8487,6 +8522,19 @@ impl LegacyResponseReadState {
         request_id: u64,
         frame: Frame,
     ) -> Result<Option<LegacyResponseItem>, OutboundRequestError> {
+        <Self as super::regulation::ResponsePrecheck>::check(
+            self,
+            frame.message_type,
+            frame.payload.len(),
+        )
+        .map_err(|error| match error {
+            FrameRejection::LocalCapacity => OutboundRequestError::Local(
+                "legacy response reached the local frame ceiling".into(),
+            ),
+            _ => OutboundRequestError::Fatal(
+                format!("legacy response receive budget: {error:?}").into(),
+            ),
+        })?;
         if frame.flags != 0 {
             return Err(OutboundRequestError::Fatal(
                 format!("unsupported legacy response flags: {}", frame.flags).into(),
@@ -12649,7 +12697,7 @@ mod tests {
         let frame = Frame {
             message_type: 1,
             flags: 0,
-            payload: Vec::new(),
+            payload: vec![0; 32],
         }
         .encode(LOCAL_MAX_CONTROL_FRAME_BYTES)?;
 
@@ -16379,6 +16427,92 @@ mod tests {
         .await?;
 
         server_ep.shutdown().await;
+        Ok(())
+    }
+    /// Legacy request and response declarations are checked before payload allocation.
+    #[test]
+    fn legacy_header_bounds_reject_impossible_declarations() {
+        let request = FrameFilter::new(None, InboundReader::Responder)
+            .with_legacy_stream(LEGACY_REQUEST_STREAM_KIND);
+        assert_eq!(
+            request.check_header(LEGACY_REQUEST_PING, 0, 0, 1024 * 1024),
+            Ok(8)
+        );
+        assert_eq!(
+            request.check_header(65535, 0, 0, 1024),
+            Err(FrameRejection::UnknownMessageType)
+        );
+        assert_eq!(
+            request.check_header(LEGACY_REQUEST_PING, 1, 0, 1024),
+            Err(FrameRejection::ReservedFlags)
+        );
+        assert!(matches!(
+            request.check_header(LEGACY_REQUEST_FIND_BLOCKS, 0, 32, 1024),
+            Err(FrameRejection::PayloadTooShort { min: 33 })
+        ));
+        let response = FrameFilter::new(None, InboundReader::Requester)
+            .with_legacy_stream(LEGACY_REQUEST_STREAM_KIND);
+        assert_eq!(
+            response.check_header(LEGACY_RESPONSE_PONG, 0, 1024, 1024),
+            Ok(16)
+        );
+        assert_eq!(
+            response.check_header(LEGACY_REQUEST_PING, 0, 0, 1024),
+            Err(FrameRejection::UnknownMessageType)
+        );
+        // An impossible length stays a fatal oversize even when local capacity is gone.
+        let saturated = response.with_precheck(Some(&SaturatedPrecheck));
+        for declared in [9, usize::MAX] {
+            assert_eq!(
+                saturated.check_header(LEGACY_RESPONSE_PONG, 0, declared, 1024),
+                Ok(16)
+            );
+        }
+    }
+
+    /// A precheck that refuses every header, as an exhausted local limit does.
+    #[derive(Debug)]
+    struct SaturatedPrecheck;
+
+    impl super::super::regulation::ResponsePrecheck for SaturatedPrecheck {
+        /// Refuses the header as local capacity exhaustion.
+        fn check(&self, _message_type: u16, _payload_len: usize) -> Result<(), FrameRejection> {
+            Err(FrameRejection::LocalCapacity)
+        }
+    }
+
+    /// A peer with a small negotiated frame cap can return a full-size block.
+    #[test]
+    fn small_frame_caps_accept_full_block_responses() -> Result<(), BoxError> {
+        use zakura_chain::serialization::ZcashSerialize;
+        let mut block = Block::zcash_deserialize(BLOCK_TESTNET_141042_BYTES.as_slice())?;
+        let size = block.zcash_serialize_to_vec()?.len();
+        let output = &mut Arc::make_mut(&mut block.transactions[0]).outputs_mut()[0];
+        let script_size = output.lock_script.as_raw_bytes().len() + 2_000_000 - size - 4;
+        output.lock_script = zakura_chain::transparent::Script::new(&vec![0; script_size]);
+        let block = Arc::new(block);
+        let request = LegacyRequestFrame::BlocksByHash(vec![block.hash()]).encode_frame()?;
+        let mut limits = test_connection_limits();
+        limits.max_frame_bytes = 64 * 1024;
+        limits.max_message_bytes = u32::try_from(block.zcash_serialize_to_vec()?.len())?;
+        assert_eq!(limits.max_message_bytes, 2_000_000);
+        let budget =
+            LegacyResponseBudget::from_request(request.message_type, &request.payload, limits)
+                .map_err(|error| format!("{error:?}"))?;
+        let mut state = LegacyResponseReadState::new(budget);
+        let frames = LegacyResponseCodec::encode_response(
+            1,
+            Response::Blocks(vec![InventoryResponse::Available((block.into(), None))]),
+            limits.max_frame_bytes,
+            limits.max_message_bytes,
+        )?;
+        assert!(frames.len() > 9);
+        for frame in frames {
+            state
+                .validate_frame(1, frame)
+                .map_err(|error| format!("{error:?}"))?;
+        }
+        state.finish().map_err(|error| format!("{error:?}"))?;
         Ok(())
     }
 }

@@ -2,19 +2,22 @@
 
 use thiserror::Error;
 
-use crate::zakura::CloseRow;
+use crate::zakura::{CloseOutcome, CloseRow, NeutralCause};
 
 use super::{MessageRole, MessageRule};
 use crate::zakura::{regulation::ResponsePrecheck, FRAME_HEADER_BYTES};
 
 /// Why a reader rejected a frame from its header.
 ///
-/// Every rejection is a framing violation that disconnects the peer. A payload
+/// Except for local capacity exhaustion, rejections are framing violations. A payload
 /// above its row's maximum is reported as an oversize frame instead, so the
 /// existing oversize diagnostics keep one path.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Error)]
 #[non_exhaustive]
 pub enum FrameRejection {
+    /// A local receive limit is exhausted, without proving peer misconduct.
+    #[error("local receive capacity exhausted")]
+    LocalCapacity,
     /// No row on this reader declares the frame's message type.
     #[error("no row on this reader declares the message type")]
     UnknownMessageType,
@@ -47,21 +50,34 @@ pub enum FrameRejection {
 }
 
 impl FrameRejection {
-    /// The regulation close-spec row this rejection breaks.
-    pub fn close_row(self) -> CloseRow {
+    /// The regulation close-spec row this rejection breaks, or `None` for
+    /// [`Self::LocalCapacity`], which breaks no row.
+    pub fn close_row(self) -> Option<CloseRow> {
         match self {
-            Self::UnknownMessageType => CloseRow::REG_CLOSE_2,
-            Self::ReservedFlags => CloseRow::REG_CLOSE_3,
-            Self::PayloadTooShort { .. } => CloseRow::REG_CLOSE_4,
-            Self::Unsolicited => CloseRow::REG_CLOSE_6,
-            Self::AboveReservation { .. } => CloseRow::REG_CLOSE_7,
-            Self::AboveOwed { .. } => CloseRow::REG_CLOSE_8,
+            Self::LocalCapacity => None,
+            Self::UnknownMessageType => Some(CloseRow::REG_CLOSE_2),
+            Self::ReservedFlags => Some(CloseRow::REG_CLOSE_3),
+            Self::PayloadTooShort { .. } => Some(CloseRow::REG_CLOSE_4),
+            Self::Unsolicited => Some(CloseRow::REG_CLOSE_6),
+            Self::AboveReservation { .. } => Some(CloseRow::REG_CLOSE_7),
+            Self::AboveOwed { .. } => Some(CloseRow::REG_CLOSE_8),
+        }
+    }
+
+    /// The outcome a reader closes with for this rejection on a stream of
+    /// `kind` at `version`: a fault on [`Self::close_row`], or a neutral
+    /// resource refusal for [`Self::LocalCapacity`].
+    pub(crate) fn close_outcome(self, kind: u16, version: u16) -> CloseOutcome {
+        match self.close_row() {
+            Some(row) => CloseOutcome::fault(kind, version, row),
+            None => CloseOutcome::neutral(NeutralCause::ResourceRefusal, self.label()),
         }
     }
 
     /// Stable metric and trace label.
     pub fn label(self) -> &'static str {
         match self {
+            Self::LocalCapacity => "local_capacity",
             Self::UnknownMessageType => "unknown_message_type",
             Self::ReservedFlags => "reserved_flags",
             Self::PayloadTooShort { .. } => "payload_too_short",
@@ -103,6 +119,7 @@ impl InboundReader {
 pub(crate) struct FrameFilter<'a> {
     rules: Option<&'static [MessageRule]>,
     reader: InboundReader,
+    legacy_stream: Option<u16>,
     precheck: Option<&'a dyn ResponsePrecheck>,
     /// The reader's transport observer.
     #[cfg(any(test, zakura_sim))]
@@ -114,10 +131,20 @@ impl<'a> FrameFilter<'a> {
         Self {
             rules,
             reader,
+            legacy_stream: None,
             precheck: None,
             #[cfg(any(test, zakura_sim))]
             tap: None,
         }
+    }
+
+    /// Apply the legacy codec's bounds without changing its existing cadence policy.
+    pub(crate) fn with_legacy_stream(mut self, kind: u16) -> Self {
+        use crate::zakura::legacy_gossip::{ZAKURA_STREAM_GOSSIP, ZAKURA_STREAM_LEGACY_REQUESTS};
+        if matches!(kind, ZAKURA_STREAM_GOSSIP | ZAKURA_STREAM_LEGACY_REQUESTS) {
+            self.legacy_stream = Some(kind);
+        }
+        self
     }
 
     /// Also check each response header against `precheck`, which bounds it by
@@ -132,6 +159,7 @@ impl<'a> FrameFilter<'a> {
         FrameFilter {
             rules: self.rules,
             reader: self.reader,
+            legacy_stream: self.legacy_stream,
             precheck,
             #[cfg(any(test, zakura_sim))]
             tap: None,
@@ -182,6 +210,28 @@ impl<'a> FrameFilter<'a> {
         payload_len: usize,
         frame_cap: usize,
     ) -> Result<usize, FrameRejection> {
+        let frame_cap = if let Some(kind) = self.legacy_stream {
+            let payload = crate::zakura::legacy_gossip::frame_payload_bounds(
+                kind,
+                message_type,
+                matches!(self.reader, InboundReader::Requester),
+            )
+            .ok_or(FrameRejection::UnknownMessageType)?;
+            if flags != 0 {
+                return Err(FrameRejection::ReservedFlags);
+            }
+            if payload_len < payload.min() {
+                return Err(FrameRejection::PayloadTooShort { min: payload.min() });
+            }
+            let cap = frame_cap.min(payload.max().saturating_add(FRAME_HEADER_BYTES));
+            // Let the reader report oversize before local capacity can mask bad framing.
+            if payload_len.saturating_add(FRAME_HEADER_BYTES) > cap {
+                return Ok(cap);
+            }
+            cap
+        } else {
+            frame_cap
+        };
         let Some(rules) = self.rules else {
             if let Some(precheck) = self.precheck {
                 precheck.check(message_type, payload_len)?;

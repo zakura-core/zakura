@@ -1337,7 +1337,14 @@ fn the_bound_covers_an_encoded_response_under_small_caps() -> Result<(), BoxErro
                 u64::MAX,
             )
             .ok_or("an unlimited gate fits every bound")?;
-            let frames = LegacyResponseCodec::encode_response(7, response, frame_cap, message_cap)?;
+            // The encoder's frame ceiling refuses a large object under tiny caps, so
+            // that response never reaches its reservation.
+            let frames =
+                match LegacyResponseCodec::encode_response(7, response, frame_cap, message_cap) {
+                    Ok(frames) => frames,
+                    Err(crate::zakura::LegacyGossipError::ResponseFrameBudget) => continue,
+                    Err(error) => return Err(error.into()),
+                };
             let bytes: u64 = frames
                 .iter()
                 .map(|frame| response_frame_bytes(frame.payload.len()))

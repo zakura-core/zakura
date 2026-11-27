@@ -3535,6 +3535,68 @@ async fn mempool_reject_non_standard_scriptpubkey() -> Result<(), Report> {
     Ok(())
 }
 
+/// Check that a payment into the post-quantum namespace is non-standard where those rules do
+/// not apply, since the legacy rules let anyone spend it with an empty scriptSig.
+#[tokio::test(flavor = "multi_thread")]
+async fn mempool_reject_pq_namespace_output_before_the_rules_apply() -> Result<(), Report> {
+    let network = Network::Mainnet;
+
+    let mut last_transaction = network
+        .unmined_transactions_in_blocks(1..=10)
+        .next()
+        .expect("missing transaction");
+    last_transaction.height = Some(Height(100_000));
+
+    // The output format the rules define, then an undefined scheme and an undefined format.
+    let transactions: Vec<_> = [[0x00, 0x51, 0x20], [0x00, 0x53, 0x20], [0x51, 0x51, 0x20]]
+        .into_iter()
+        .map(|header| {
+            let mut transaction = last_transaction.clone();
+            let mut tx = transaction.transaction.transaction().clone();
+            *Arc::make_mut(&mut tx).outputs_mut() = vec![transparent::Output {
+                value: Amount::new(100_000),
+                lock_script: transparent::Script::new(&[&header[..], &[0x11; 32]].concat()),
+            }];
+            transaction.transaction = tx.into();
+            transaction
+        })
+        .collect();
+
+    let cost_limit = transactions
+        .iter()
+        .map(|tx| tx.cost())
+        .max()
+        .unwrap_or_default();
+
+    let (
+        mut service,
+        _peer_set,
+        _state_service,
+        _chain_tip_change,
+        _tx_verifier,
+        mut recent_syncs,
+        _mempool_transaction_receiver,
+    ) = setup(&network, cost_limit, true).await;
+
+    service.enable(&mut recent_syncs).await;
+
+    for transaction in transactions {
+        let insert_err = service
+            .storage()
+            .insert(transaction, Vec::new(), None)
+            .expect_err("a payment into the post-quantum namespace is non-standard");
+
+        assert_eq!(
+            insert_err,
+            MempoolError::NonStandardTransaction(
+                storage::NonStandardTransactionError::ScriptPubKeyNonStandard
+            )
+        );
+    }
+
+    Ok(())
+}
+
 /// Check that bare multisig outputs are rejected.
 #[tokio::test(flavor = "multi_thread")]
 async fn mempool_reject_bare_multisig() -> Result<(), Report> {

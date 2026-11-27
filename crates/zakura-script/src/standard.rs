@@ -132,6 +132,14 @@ pub fn are_inputs_standard_with_pq(
         #[cfg(not(feature = "pq"))]
         let _ = pq_active;
 
+        // Until the post-quantum rules apply, the legacy rules satisfy a script in their
+        // namespace with an empty scriptSig, so a spend of one may be taking a payment that
+        // was never the spender's. It is non-standard by name, not only because no template
+        // happens to match it. Once the rules apply, a valid spend was accepted above.
+        if script::is_pq_namespace(spent_output.lock_script.as_raw_bytes()) {
+            return false;
+        }
+
         // Step 1: Classify the spent output's scriptPubKey via the zcash_script solver.
         let script_kind = match standard_script_kind(&spent_output.lock_script) {
             Some(kind) => kind,

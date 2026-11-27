@@ -928,3 +928,36 @@ fn relay_policy_uses_the_authenticated_body_and_the_chain_activation() {
     *oversized.input_mut() = Script::new(&vec![0; script_pq::MAX_INPUT_BYTES + 1]);
     assert!(policy(&oversized, &active, ACTIVATION).is_err());
 }
+
+#[test]
+fn relay_policy_refuses_a_namespace_spend_the_rules_do_not_accept() {
+    // Under the legacy rules an empty input satisfies any script in the namespace, so before
+    // the post-quantum rules apply such a spend may be taking a payment that was never the
+    // spender's. After they apply it is simply not a valid spend.
+    let mut defined = SPEND.clone();
+    *defined.input_mut() = Script::new(&[]);
+    let mut undefined_format = defined.clone();
+    undefined_format.previous_outputs[PQ_INPUT] = output_with(&namespace_script(0x51, 0x51, 32));
+    let mut undefined_scheme = defined.clone();
+    undefined_scheme.previous_outputs[PQ_INPUT] = output_with(&namespace_script(0x00, 0x53, 32));
+
+    let active = network(Some(ACTIVATION));
+    for spend in [&defined, &undefined_format, &undefined_scheme] {
+        for (net, height) in [
+            (Network::Mainnet, ACTIVATION),
+            (network(None), ACTIVATION),
+            (active.clone(), Height(9)),
+            (active.clone(), ACTIVATION),
+        ] {
+            assert_eq!(
+                check::mempool_standard_input_scripts_for_network(
+                    &spend.transaction,
+                    &spend.previous_outputs,
+                    &net,
+                    height,
+                ),
+                Err(TransactionError::NonStandardInputs),
+            );
+        }
+    }
+}

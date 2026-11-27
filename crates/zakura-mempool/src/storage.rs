@@ -1035,6 +1035,14 @@ pub fn standardness_with_pq(
             }
         }
 
+        // Rule: until the post-quantum rules apply, the legacy rules satisfy a script in
+        // their namespace with an empty scriptSig, so anyone could take a payment to one.
+        // It is non-standard by name, not only because no template happens to match it.
+        // Once the rules apply, every namespace script was settled above.
+        if script::is_pq_namespace(lock_script.as_raw_bytes()) {
+            return Err(NonStandardTransactionError::ScriptPubKeyNonStandard);
+        }
+
         let script_kind = policy::standard_script_kind(lock_script);
 
         match script_kind {

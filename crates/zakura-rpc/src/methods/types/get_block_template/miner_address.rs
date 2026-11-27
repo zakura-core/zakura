@@ -101,6 +101,13 @@ impl TryFromAddress for MinerAddress {
                 unified::Receiver::P2sh(data) => {
                     transparent = Some(TransparentAddress::ScriptHash(*data));
                 }
+                // A post-quantum receiver is never the miner-reward destination. The node
+                // cannot build the coinbase output that pays one, and before the rules
+                // activate such an output is spendable by anyone, so mining to it would
+                // hand the reward away. A unified miner address offering nothing else
+                // payable fails the check below, as one with no payable receiver already
+                // does.
+                unified::Receiver::PqTransparent { .. } => {}
                 unified::Receiver::Unknown { .. } => {}
             }
         }

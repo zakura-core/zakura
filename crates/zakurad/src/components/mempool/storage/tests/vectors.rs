@@ -98,10 +98,13 @@ fn sprout_joinsplits_are_rejected_before_eviction_and_cached() {
     let incumbent = factory.tx(10_000);
     let incumbent_id = incumbent.transaction.id();
     let incumbent_cost = incumbent.cost();
-    let mut storage = Storage::new(&config::Config {
-        tx_cost_limit: incumbent_cost,
-        ..Default::default()
-    });
+    let mut storage = Storage::new(
+        &config::Config {
+            tx_cost_limit: incumbent_cost,
+            ..Default::default()
+        },
+        &zakura_chain::parameters::Network::Mainnet,
+    );
     storage.insert(incumbent, Vec::new(), None).unwrap();
     let sprout = Network::Mainnet
         .unmined_transactions_in_blocks(..)
@@ -138,7 +141,10 @@ fn sprout_joinsplits_are_rejected_before_eviction_and_cached() {
 
 #[test]
 fn oversized_policy_rejection_is_cached_by_exact_id() {
-    let mut storage = Storage::new(&config::Config::default());
+    let mut storage = Storage::new(
+        &config::Config::default(),
+        &zakura_chain::parameters::Network::Mainnet,
+    );
     let transaction = Network::Mainnet
         .unmined_transactions_in_blocks(..)
         .find(|transaction| transaction.transaction.id().auth_digest().is_some())
@@ -177,11 +183,14 @@ fn mempool_storage_crud_exact_mainnet() {
     let network = Network::Mainnet;
 
     // Create an empty storage instance
-    let mut storage: Storage = Storage::new(&config::Config {
-        tx_cost_limit: u64::MAX,
-        eviction_memory_time: EVICTION_MEMORY_TIME,
-        ..Default::default()
-    });
+    let mut storage: Storage = Storage::new(
+        &config::Config {
+            tx_cost_limit: u64::MAX,
+            eviction_memory_time: EVICTION_MEMORY_TIME,
+            ..Default::default()
+        },
+        &zakura_chain::parameters::Network::Mainnet,
+    );
 
     // Get one (1) unmined transaction
     let unmined_tx = network
@@ -209,11 +218,14 @@ fn mempool_storage_crud_exact_mainnet() {
 fn transactions_exact_ignores_different_authorizing_data() {
     let _init_guard = zakura_test::init();
 
-    let mut storage: Storage = Storage::new(&config::Config {
-        tx_cost_limit: u64::MAX,
-        eviction_memory_time: EVICTION_MEMORY_TIME,
-        ..Default::default()
-    });
+    let mut storage: Storage = Storage::new(
+        &config::Config {
+            tx_cost_limit: u64::MAX,
+            eviction_memory_time: EVICTION_MEMORY_TIME,
+            ..Default::default()
+        },
+        &zakura_chain::parameters::Network::Mainnet,
+    );
     let unmined_tx = Network::Mainnet
         .unmined_transactions_in_blocks(..)
         .find(|transaction| transaction.transaction.id().auth_digest().is_some())
@@ -272,10 +284,13 @@ fn mempool_storage_basic_for_network(network: Network) -> Result<()> {
         .sum();
 
     // Create an empty storage
-    let mut storage: Storage = Storage::new(&config::Config {
-        tx_cost_limit,
-        ..Default::default()
-    });
+    let mut storage: Storage = Storage::new(
+        &config::Config {
+            tx_cost_limit,
+            ..Default::default()
+        },
+        &zakura_chain::parameters::Network::Mainnet,
+    );
 
     // Insert them all to the storage
     let mut maybe_inserted_transactions = Vec::new();
@@ -338,11 +353,14 @@ fn mempool_storage_crud_same_effects_mainnet() {
     let network = Network::Mainnet;
 
     // Create an empty storage instance
-    let mut storage: Storage = Storage::new(&config::Config {
-        tx_cost_limit: 160_000_000,
-        eviction_memory_time: EVICTION_MEMORY_TIME,
-        ..Default::default()
-    });
+    let mut storage: Storage = Storage::new(
+        &config::Config {
+            tx_cost_limit: 160_000_000,
+            eviction_memory_time: EVICTION_MEMORY_TIME,
+            ..Default::default()
+        },
+        &zakura_chain::parameters::Network::Mainnet,
+    );
 
     // Get one (1) unmined transaction
     let unmined_tx_1 = network
@@ -424,11 +442,14 @@ fn mempool_storage_crud_same_effects_mainnet() {
 fn mempool_removes_ironwood_duplicate_spends() {
     let _init_guard = zakura_test::init();
 
-    let mut storage: Storage = Storage::new(&config::Config {
-        tx_cost_limit: 160_000_000,
-        eviction_memory_time: EVICTION_MEMORY_TIME,
-        ..Default::default()
-    });
+    let mut storage: Storage = Storage::new(
+        &config::Config {
+            tx_cost_limit: 160_000_000,
+            eviction_memory_time: EVICTION_MEMORY_TIME,
+            ..Default::default()
+        },
+        &zakura_chain::parameters::Network::Mainnet,
+    );
 
     let action = ironwood_action();
     let mempool_tx = verified_ironwood_v6_tx(Height(1), action.clone());
@@ -460,11 +481,14 @@ fn mempool_removes_ironwood_duplicate_spends() {
 fn mempool_rejects_ironwood_conflict_on_insert() {
     let _init_guard = zakura_test::init();
 
-    let mut storage: Storage = Storage::new(&config::Config {
-        tx_cost_limit: 160_000_000,
-        eviction_memory_time: EVICTION_MEMORY_TIME,
-        ..Default::default()
-    });
+    let mut storage: Storage = Storage::new(
+        &config::Config {
+            tx_cost_limit: 160_000_000,
+            eviction_memory_time: EVICTION_MEMORY_TIME,
+            ..Default::default()
+        },
+        &zakura_chain::parameters::Network::Mainnet,
+    );
 
     let action = ironwood_action();
     let first_mempool_tx = verified_ironwood_v6_tx(Height(1), action.clone());
@@ -502,11 +526,14 @@ fn mempool_expired_basic() -> Result<()> {
 
 fn mempool_expired_basic_for_network(network: Network) -> Result<()> {
     // Create an empty storage
-    let mut storage: Storage = Storage::new(&config::Config {
-        tx_cost_limit: 160_000_000,
-        eviction_memory_time: EVICTION_MEMORY_TIME,
-        ..Default::default()
-    });
+    let mut storage: Storage = Storage::new(
+        &config::Config {
+            tx_cost_limit: 160_000_000,
+            eviction_memory_time: EVICTION_MEMORY_TIME,
+            ..Default::default()
+        },
+        &zakura_chain::parameters::Network::Mainnet,
+    );
 
     let block: Block = network.test_block(982681, 925483).unwrap();
 
@@ -552,11 +579,14 @@ fn mempool_expired_basic_for_network(network: Network) -> Result<()> {
 #[test]
 fn mempool_expiration_reports_removed_dependent_transactions() -> Result<()> {
     let _init_guard = zakura_test::init();
-    let mut storage = Storage::new(&config::Config {
-        tx_cost_limit: 160_000_000,
-        eviction_memory_time: EVICTION_MEMORY_TIME,
-        ..Default::default()
-    });
+    let mut storage = Storage::new(
+        &config::Config {
+            tx_cost_limit: 160_000_000,
+            eviction_memory_time: EVICTION_MEMORY_TIME,
+            ..Default::default()
+        },
+        &zakura_chain::parameters::Network::Mainnet,
+    );
     let block: Block = Network::Mainnet.test_block(982681, 925483).unwrap();
 
     let mut parent = block.transactions[1].as_ref().clone();
@@ -606,11 +636,14 @@ fn mempool_removes_dependent_transactions() -> Result<()> {
     let network = Network::Mainnet;
 
     // Create an empty storage
-    let mut storage: Storage = Storage::new(&config::Config {
-        tx_cost_limit: 160_000_000,
-        eviction_memory_time: EVICTION_MEMORY_TIME,
-        ..Default::default()
-    });
+    let mut storage: Storage = Storage::new(
+        &config::Config {
+            tx_cost_limit: 160_000_000,
+            eviction_memory_time: EVICTION_MEMORY_TIME,
+            ..Default::default()
+        },
+        &zakura_chain::parameters::Network::Mainnet,
+    );
 
     // Each transaction spends the previous one, so the chain stops at the ancestor limit.
     let unmined_txs_with_transparent_outputs = || {
@@ -706,7 +739,10 @@ fn mempool_removes_dependent_transactions() -> Result<()> {
 #[test]
 fn same_effects_lookup_returns_only_requested_stored_transactions() {
     let mut factory = TxFactory::new();
-    let mut storage = Storage::new(&Config::default());
+    let mut storage = Storage::new(
+        &Config::default(),
+        &zakura_chain::parameters::Network::Mainnet,
+    );
     let transactions = [factory.tx(10_000), factory.tx(10_000), factory.tx(10_000)];
     let ids = transactions.each_ref().map(|tx| tx.transaction.id());
     for tx in transactions {
@@ -740,7 +776,7 @@ fn benchmark_mempool_txid_lookup() {
     let default_count = config.tx_cost_limit / MEMPOOL_TRANSACTION_COST_THRESHOLD;
     let mut factory = TxFactory::new();
     for count in [0, default_count / 8, default_count] {
-        let mut storage = Storage::new(&config);
+        let mut storage = Storage::new(&config, &zakura_chain::parameters::Network::Mainnet);
         let mut stored = Vec::new();
         for _ in 0..count {
             let tx = factory.tx(10_000);

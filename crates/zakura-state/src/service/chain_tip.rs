@@ -710,6 +710,11 @@ impl ChainTipChange {
         // upgrade, but it has the same memory-pool requirement: once the chain tip
         // reaches its activation height, the mempool must drop any transactions
         // that are no longer valid under the new rule. So we also reset there.
+        //
+        // The post-quantum transparent output rules are the same kind of boundary: from that
+        // height a payment to the namespace is validated differently, so the pool is checked
+        // again under the new rules rather than carried across. Relay policy already keeps the
+        // namespace out of the pool before the height, so this is a second line of defence.
         // The next height is what the mempool verifies against; it always exists because the
         // chain tip height is far below `Height::MAX`.
         // TODO: confirm whether resetting at `activation_height - 1` (the `.next()` semantics
@@ -724,6 +729,7 @@ impl ChainTipChange {
             || self
                 .network
                 .is_temporary_orchard_disabling_soft_fork_activation_height(next_height)
+            || self.network.is_pq_activation_height(next_height)
         {
             TipAction::reset_with(block)
         } else {

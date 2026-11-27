@@ -592,6 +592,10 @@ where
             // [NU6.3 onward]: `vbalanceOrchard` MUST be non-negative.
             check::disabled_add_to_orchard_pool(&tx, req.height(), &network)?;
 
+            // Reject a payment to a post-quantum output that nothing can spend, in the
+            // transaction that creates it rather than when someone tries to spend it.
+            check::pq_outputs_are_defined(&tx, req.height(), &network)?;
+
             check::spend_conflicts(&tx)?;
 
             tracing::trace!(?tx_id, "passed quick checks");
@@ -638,7 +642,12 @@ where
                 // scriptSigs, and high-sigop P2SH redeem scripts) *before*
                 // doing expensive script verification, to avoid DoS attacks on
                 // the script interpreter.
-                check::mempool_standard_input_scripts(tx.as_ref(), &spent_outputs)?;
+                check::mempool_standard_input_scripts_for_network(
+                    tx.as_ref(),
+                    &spent_outputs,
+                    &network,
+                    req.height(),
+                )?;
             }
 
             let mempool_transaction = req.mempool_transaction();
@@ -669,7 +678,7 @@ where
 
             let nu = req.upgrade(&network);
             let cached_ffi_transaction =
-                Arc::new(CachedFfiTransaction::new(tx.clone(), Arc::new(spent_outputs), nu).map_err(|_| TransactionError::UnsupportedByNetworkUpgrade(tx.version(), nu))?);
+                Arc::new(CachedFfiTransaction::new_for_network(tx.clone(), Arc::new(spent_outputs), &network, req.height()).map_err(|_| TransactionError::UnsupportedByNetworkUpgrade(tx.version(), nu))?);
 
             tracing::trace!(?tx_id, "got state UTXOs");
 

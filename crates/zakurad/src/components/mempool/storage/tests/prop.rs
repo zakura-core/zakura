@@ -73,8 +73,8 @@ fn reject_lists_enforce_production_capacity() {
         eviction_memory_time: EVICTION_MEMORY_TIME,
         ..Default::default()
     };
-    let mut tip_rejected = Storage::new(&config);
-    let mut chain_rejected = Storage::new(&config);
+    let mut tip_rejected = Storage::new(&config, &zakura_chain::parameters::Network::Mainnet);
+    let mut chain_rejected = Storage::new(&config, &zakura_chain::parameters::Network::Mainnet);
     let production_capacity: u32 = MAX_EVICTION_MEMORY_ENTRIES
         .try_into()
         .expect("production rejection-list capacity fits in u32");
@@ -128,6 +128,7 @@ proptest! {
                 ..Default::default()
             },
             TEST_REJECTION_LIST_CAPACITY,
+            &zakura_chain::parameters::Network::Mainnet,
         );
 
         let (first_transaction, second_transaction) = input.conflicting_transactions();
@@ -190,6 +191,7 @@ proptest! {
                 ..Default::default()
             },
             TEST_REJECTION_LIST_CAPACITY,
+            &zakura_chain::parameters::Network::Mainnet,
         );
 
         let test_capacity: u32 = TEST_REJECTION_LIST_CAPACITY
@@ -257,6 +259,7 @@ proptest! {
                 ..Default::default()
             },
             TEST_REJECTION_LIST_CAPACITY,
+            &zakura_chain::parameters::Network::Mainnet,
         );
 
         let test_capacity: u32 = TEST_REJECTION_LIST_CAPACITY
@@ -307,7 +310,7 @@ proptest! {
             tx_cost_limit: 160_000_000,
             eviction_memory_time: Duration::from_millis(10),
             ..Default::default()
-        });
+        }, &zakura_chain::parameters::Network::Mainnet);
 
         // Make unique IDs by converting the index to bytes, and writing it to each ID
         let unique_ids: Vec<UnminedTxId> = (0..2_u32).map(move |index| {
@@ -339,7 +342,7 @@ proptest! {
         let mut storage = Storage::new(&Config {
             tx_cost_limit: 160_000_000,
             ..Default::default()
-        });
+        }, &zakura_chain::parameters::Network::Mainnet);
 
         storage.insert(first.clone(), Vec::new(), None).unwrap();
         prop_assert_eq!(storage.remove_exact(&HashSet::from([first_id])), 1);
@@ -373,7 +376,7 @@ proptest! {
             tx_cost_limit: 160_000_000,
             eviction_memory_time: EVICTION_MEMORY_TIME,
             ..Default::default()
-        });
+        }, &zakura_chain::parameters::Network::Mainnet);
 
         let (first_transaction, second_transaction) = input.conflicting_transactions();
         let input_permutations = vec![
@@ -409,7 +412,7 @@ proptest! {
             tx_cost_limit: 160_000_000,
             eviction_memory_time: EVICTION_MEMORY_TIME,
             ..Default::default()
-        });
+        }, &zakura_chain::parameters::Network::Mainnet);
 
         let (first_unconflicting_transaction, second_unconflicting_transaction) =
             input.clone().unconflicting_transactions();
@@ -466,7 +469,7 @@ proptest! {
             tx_cost_limit: 160_000_000,
             eviction_memory_time: EVICTION_MEMORY_TIME,
             ..Default::default()
-        });
+        }, &zakura_chain::parameters::Network::Mainnet);
 
         // Insert all input transactions, and keep track of the IDs of the one that were actually
         // inserted.

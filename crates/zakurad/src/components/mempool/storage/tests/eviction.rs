@@ -24,10 +24,13 @@ const COST: u64 = MEMPOOL_TRANSACTION_COST_THRESHOLD;
 
 /// Returns a storage whose cost limit fits `count` transactions of cost [`COST`].
 fn storage_for(count: u64) -> Storage {
-    Storage::new(&config::Config {
-        tx_cost_limit: count * COST,
-        ..Default::default()
-    })
+    Storage::new(
+        &config::Config {
+            tx_cost_limit: count * COST,
+            ..Default::default()
+        },
+        &zakura_chain::parameters::Network::Mainnet,
+    )
 }
 
 /// Inserts `tx` into `storage` and returns its id, panicking if the insert fails.

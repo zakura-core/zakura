@@ -11,8 +11,10 @@ use zakura_chain::transparent;
 // The transparent-input standardness checks (`AreInputsStandard()` and the spent-output
 // classifier) are shared with the transaction verifier, which applies them to mempool
 // transactions *before* script verification, so the two paths can't drift apart.
+#[cfg(feature = "pq")]
+pub(super) use zakura_script::standard::authenticated_pq_body;
 pub(super) use zakura_script::standard::{
-    are_inputs_standard, standard_script_kind, MAX_STANDARD_SCRIPTSIG_SIZE,
+    are_inputs_standard_with_pq, standard_script_kind, MAX_STANDARD_SCRIPTSIG_SIZE,
 };
 
 /// Maximum number of signature operations allowed per standard transaction (zcashd `MAX_STANDARD_TX_SIGOPS`).

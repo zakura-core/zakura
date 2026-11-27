@@ -45,10 +45,13 @@ impl Fixture {
     fn new(factory: &mut TxFactory, count: usize, shape: Shape) -> Self {
         let count_cost = u64::try_from(count).expect("benchmark count fits in u64");
         let mut fixture = Self {
-            storage: Storage::new(&config::Config {
-                tx_cost_limit: count_cost * MEMPOOL_TRANSACTION_COST_THRESHOLD,
-                ..Default::default()
-            }),
+            storage: Storage::new(
+                &config::Config {
+                    tx_cost_limit: count_cost * MEMPOOL_TRANSACTION_COST_THRESHOLD,
+                    ..Default::default()
+                },
+                &zakura_chain::parameters::Network::Mainnet,
+            ),
             spent: HashMap::new(),
         };
         for start in (0..count).step_by(MAX_MEMPOOL_PACKAGE_TRANSACTIONS) {

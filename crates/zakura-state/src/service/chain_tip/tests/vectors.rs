@@ -6,10 +6,10 @@ use futures::FutureExt;
 use zakura_chain::{
     block,
     chain_tip::{ChainTip, NoChainTip},
-    parameters::Network::*,
+    parameters::{testnet::RegtestParameters, Network, Network::*},
 };
 
-use super::super::{ChainTipBlock, ChainTipSender};
+use super::super::{ChainTipBlock, ChainTipSender, TipAction};
 
 fn tip(height: u32, hash_byte: u8, parent_byte: u8) -> ChainTipBlock {
     ChainTipBlock {
@@ -124,5 +124,73 @@ fn late_broadcast_completion_does_not_rewind_the_tip_cursor() {
             .unwrap()
             .best_tip_hash_and_height(),
         (block::Hash([3; 32]), block::Height(3))
+    );
+}
+
+/// The mempool must revalidate what it holds when the post-quantum rules begin to apply.
+///
+/// From that height a payment to the namespace is validated differently, so the pool is
+/// checked again under the new rules rather than carried across, as at every rule change.
+/// Growing the pool would carry it across.
+#[test]
+fn post_quantum_activation_resets_the_chain_tip() {
+    // The chain reaches the activation height by growing onto the block below it, so the tip
+    // that triggers the reset is the one before: the mempool verifies against the next height.
+    let activation = 12;
+    #[allow(
+        clippy::needless_update,
+        reason = "test-only fields depend on feature unification"
+    )]
+    let network = Network::new_regtest(RegtestParameters {
+        pq_activation_height: Some(block::Height(activation)),
+        ..Default::default()
+    });
+
+    let (mut sender, _, mut changes) = ChainTipSender::new(None, &network);
+
+    // An ordinary step well below the height grows the chain, so the pool keeps its contents.
+    sender.set_best_non_finalized_tip(Some(tip(activation - 3, 9, 8)));
+    assert!(matches!(
+        changes.last_tip_change(),
+        Some(TipAction::Reset { .. })
+    ));
+    sender.set_best_non_finalized_tip(Some(tip(activation - 2, 10, 9)));
+    assert!(
+        matches!(changes.last_tip_change(), Some(TipAction::Grow { .. })),
+        "a step below the activation height grows the chain"
+    );
+
+    // The step whose next block is the first under the new rules resets it.
+    sender.set_best_non_finalized_tip(Some(tip(activation - 1, 11, 10)));
+    assert!(
+        matches!(
+            changes.last_tip_change(),
+            Some(TipAction::Reset {
+                height: block::Height(h),
+                ..
+            }) if h == activation - 1
+        ),
+        "the block before the activation height resets the chain"
+    );
+
+    // Once the rules apply, every later step is ordinary growth again.
+    sender.set_best_non_finalized_tip(Some(tip(activation, 12, 11)));
+    assert!(
+        matches!(changes.last_tip_change(), Some(TipAction::Grow { .. })),
+        "a step above the activation height grows the chain"
+    );
+
+    // A chain that never applies the rules never resets for them.
+    let (mut sender, _, mut changes) =
+        ChainTipSender::new(None, &Network::new_regtest(<_>::default()));
+    sender.set_best_non_finalized_tip(Some(tip(activation - 2, 10, 9)));
+    assert!(matches!(
+        changes.last_tip_change(),
+        Some(TipAction::Reset { .. })
+    ));
+    sender.set_best_non_finalized_tip(Some(tip(activation - 1, 11, 10)));
+    assert!(
+        matches!(changes.last_tip_change(), Some(TipAction::Grow { .. })),
+        "without a configured height there is nothing to reset for"
     );
 }

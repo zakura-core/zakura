@@ -100,6 +100,10 @@ skip = [
     # libcrux-ml-dsa's proc macro, libcrux-macros, builds on syn 3 while the
     # rest of the tree is on syn 2. It runs only at build time.
     { name = "syn", version = "=3.0.10" },
+
+    # The post-quantum signature crate uses the signature 3.0 traits, while the
+    # ECDSA and Ed25519 crates still resolve 2.2. Remove when the ecosystem converges.
+    { name = "signature", version = "=2.2.0" },
 ]
 
 # Similarly to `skip` allows you to skip certain crates during duplicate
@@ -185,7 +189,10 @@ unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 
 # List of URLs for allowed Git repositories
-allow-git = []
+#
+# The post-quantum transparent output work is unreleased in Common, so there is no
+# published version to depend on yet. Drop this entry once the pin moves to one.
+allow-git = ["https://github.com/zakura-core/common"]
 
 [sources.allow-org]
 github = [

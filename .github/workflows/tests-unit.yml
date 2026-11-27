@@ -285,11 +285,11 @@ jobs:
           # binaries hold no tests here. sim-build runs them, and lint.yml still
           # checks that the crate compiles without the flag.
           if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
-            cargo nextest archive --locked --workspace --exclude zakura-sim --release --features default-release-binaries,sync-metrics --archive-file "${RUNNER_TEMP}/nextest-archive.tar.zst"
+            cargo nextest archive --locked --workspace --exclude zakura-sim --release --features default-release-binaries,sync-metrics,zakura/pq --archive-file "${RUNNER_TEMP}/nextest-archive.tar.zst"
           elif [[ "${FULL_COVERAGE}" == "true" ]]; then
-            cargo nextest archive --locked --workspace --exclude zakura-sim --cargo-profile ci-tests --features default-release-binaries,sync-metrics --archive-file "${RUNNER_TEMP}/nextest-archive.tar.zst"
+            cargo nextest archive --locked --workspace --exclude zakura-sim --cargo-profile ci-tests --features default-release-binaries,sync-metrics,zakura/pq --archive-file "${RUNNER_TEMP}/nextest-archive.tar.zst"
           else
-            cargo nextest archive --locked --workspace --exclude zakura-sim --features default-release-binaries,sync-metrics --archive-file "${RUNNER_TEMP}/nextest-archive.tar.zst"
+            cargo nextest archive --locked --workspace --exclude zakura-sim --features default-release-binaries,sync-metrics,zakura/pq --archive-file "${RUNNER_TEMP}/nextest-archive.tar.zst"
           fi
         env:
           FULL_COVERAGE: ${{ github.event_name != 'pull_request' }}

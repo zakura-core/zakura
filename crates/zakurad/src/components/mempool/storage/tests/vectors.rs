@@ -491,6 +491,134 @@ fn mempool_rejects_ironwood_conflict_on_insert() {
     );
 }
 
+/// A v7 transaction with one Ironwood action, and one transparent input spending
+/// `spent` when it is set, stating a 1_000_000 zatoshi fee.
+fn verified_v7_tx(
+    action: zakura_chain::ironwood::Action,
+    spent: Option<OutPoint>,
+) -> zakura_chain::transaction::VerifiedUnminedTx {
+    use zakura_chain::{
+        at_least_one, ironwood,
+        orchard::{self, tree},
+        parameters::NetworkUpgrade,
+        primitives::Halo2Proof,
+        transaction::{
+            v7::{V7Fields, ValueDeltas},
+            LockTime, Transaction,
+        },
+    };
+
+    let fee = Amount::try_from(1_000_000).expect("valid test fee");
+    let inputs: Vec<_> = spent
+        .into_iter()
+        .map(|outpoint| transparent::Input::PrevOut {
+            outpoint,
+            // A signature and a public key, as a standard P2PKH spend pushes.
+            unlock_script: transparent::Script::new(&[0x01, 0x00, 0x01, 0x00]),
+            sequence: u32::MAX,
+        })
+        .collect();
+    let spent_outputs = inputs
+        .iter()
+        .map(|_| transparent::Output {
+            value: fee,
+            lock_script: super::super::policy::p2pkh_lock_script(&[0; 20]),
+        })
+        .collect();
+    let transparent_delta = if inputs.is_empty() {
+        Amount::zero()
+    } else {
+        fee.constrain().unwrap()
+    };
+    let ironwood_delta = if inputs.is_empty() {
+        fee.constrain().unwrap()
+    } else {
+        Amount::zero()
+    };
+    let tx = Transaction::V7 {
+        network_upgrade: NetworkUpgrade::Nu7_1,
+        lock_time: LockTime::unlocked(),
+        expiry_height: Height(1_000),
+        inputs,
+        outputs: Vec::new(),
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+        ironwood_shielded_data: Some(Box::new(ironwood::ShieldedData {
+            flags: orchard::Flags::ENABLE_SPENDS,
+            value_balance: ironwood_delta,
+            shared_anchor: tree::Root::default(),
+            proof: Halo2Proof(vec![0; 4992]),
+            actions: at_least_one![ironwood::AuthorizedAction {
+                action,
+                spend_auth_sig: [0u8; 64].into(),
+            }],
+            binding_sig: [0u8; 64].into(),
+        })),
+        v7_fields: Box::new(V7Fields {
+            value_deltas: ValueDeltas {
+                transparent: transparent_delta,
+                fee: -fee
+                    .constrain::<zakura_chain::amount::NegativeAllowed>()
+                    .unwrap(),
+                ..ValueDeltas::default()
+            },
+            coinbase: None,
+        }),
+    };
+
+    zakura_chain::transaction::VerifiedUnminedTx::new(
+        std::sync::Arc::new(tx).into(),
+        fee,
+        0,
+        0,
+        std::sync::Arc::new(spent_outputs),
+    )
+    .expect("test transaction has a valid mempool fee")
+}
+
+/// The mempool tracks the nullifiers and transparent spends of v7 transactions like
+/// those of earlier versions, so conflicts across versions are rejected.
+#[test]
+fn mempool_rejects_v7_spend_conflicts() {
+    let _init_guard = zakura_test::init();
+    let mut storage: Storage = Storage::new(&config::Config {
+        tx_cost_limit: 160_000_000,
+        eviction_memory_time: EVICTION_MEMORY_TIME,
+        ..Default::default()
+    });
+    let outpoint = OutPoint {
+        hash: zakura_chain::transaction::Hash([3; 32]),
+        index: 0,
+    };
+
+    let action = ironwood_action();
+    let v6 = verified_ironwood_v6_tx(Height(1), action.clone());
+    let v6_id = v6.transaction.id();
+    assert_eq!(storage.insert(v6, Vec::new(), None), Ok(v6_id));
+
+    let same_nullifier = verified_v7_tx(action, None);
+    let same_nullifier_id = same_nullifier.transaction.id();
+    assert_eq!(
+        storage.insert(same_nullifier, Vec::new(), None),
+        Err(SameEffectsTipRejectionError::SpendConflict.into())
+    );
+    assert_eq!(
+        storage.rejection_error(&same_nullifier_id),
+        Some(SameEffectsTipRejectionError::SpendConflict.into())
+    );
+
+    let spender = verified_v7_tx(ironwood_action(), Some(outpoint));
+    let spender_id = spender.transaction.id();
+    assert_eq!(storage.insert(spender, Vec::new(), None), Ok(spender_id));
+    assert!(storage.contains_transaction_exact(&spender_id.mined_id()));
+
+    let double_spender = verified_v7_tx(ironwood_action(), Some(outpoint));
+    assert_eq!(
+        storage.insert(double_spender, Vec::new(), None),
+        Err(SameEffectsTipRejectionError::SpendConflict.into())
+    );
+}
+
 #[test]
 fn mempool_expired_basic() -> Result<()> {
     let _init_guard = zakura_test::init();

@@ -1,6 +1,7 @@
 //! Tests for types and functions for the `getblocktemplate` RPC.
 
 mod nsm_fees;
+mod v7_coinbase;
 
 use anyhow::anyhow;
 use std::iter;

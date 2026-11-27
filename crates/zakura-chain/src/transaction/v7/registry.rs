@@ -44,6 +44,37 @@ pub enum BundleKind {
     Nsm,
 }
 
+impl BundleKind {
+    /// Every registered bundle, in bundle type order.
+    pub(super) const ALL: [BundleKind; 7] = [
+        BundleKind::Transparent,
+        BundleKind::Coinbase,
+        BundleKind::Sapling,
+        BundleKind::Orchard,
+        BundleKind::Ironwood,
+        BundleKind::Fee,
+        BundleKind::Nsm,
+    ];
+
+    /// Returns the `(bundleType, bundleVariant)` pair that identifies this bundle.
+    pub fn id(self) -> (u32, u32) {
+        match self {
+            BundleKind::Transparent => TRANSPARENT,
+            BundleKind::Coinbase => COINBASE,
+            BundleKind::Sapling => SAPLING,
+            BundleKind::Orchard => ORCHARD,
+            BundleKind::Ironwood => IRONWOOD,
+            BundleKind::Fee => FEE,
+            BundleKind::Nsm => NSM,
+        }
+    }
+
+    /// Returns the registered bundle that `id` identifies.
+    pub(super) fn of(id: BundleId) -> Option<BundleKind> {
+        BundleKind::ALL.into_iter().find(|kind| kind.id() == id)
+    }
+}
+
 /// Which maps of a v7 transaction may contain an entry for a registered pair.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Registration {

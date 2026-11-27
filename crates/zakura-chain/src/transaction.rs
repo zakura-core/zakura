@@ -898,6 +898,12 @@ impl Transaction {
         v7::V7Ref::of(self).map_or_else(Vec::new, |v7| v7.bundles())
     }
 
+    /// Returns the `mValuePoolDeltas` of a v7 transaction in encoding order, including
+    /// the Sapling, Orchard, and Ironwood balancing values, or `None` before v7.
+    pub fn value_pool_deltas(&self) -> Option<Vec<(v7::BundleKind, Amount<NegativeAllowed>)>> {
+        v7::V7Ref::of(self).map(|v7| v7.value_pool_deltas())
+    }
+
     /// Returns the v7-only value pool deltas and coinbase bundle, or `None` before v7.
     pub fn v7_fields(&self) -> Option<&v7::V7Fields> {
         match self {

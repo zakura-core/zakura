@@ -1,0 +1,82 @@
+---
+source: crates/zakura-rpc/src/methods/types/transaction/v7_tests.rs
+expression: json
+---
+{
+  "in_active_chain": true,
+  "hex": "07000080f7fffffffeffffff00000000e8030000030000e09a37dfffffffff0100103ec82000000000050010270000000000000200000c00012065c820000000000151010034e803000040be402500000000c0687804000000000af09f8cb83a20706f6f6c0201020300abababababababababababababababab00",
+  "height": 1000,
+  "confirmations": 1,
+  "vin": [],
+  "vout": [
+    {
+      "value": 5.50004,
+      "valueZat": 550004000,
+      "n": 0,
+      "scriptPubKey": {
+        "asm": "1",
+        "hex": "51",
+        "type": "nonstandard"
+      }
+    }
+  ],
+  "vShieldedSpend": [],
+  "vShieldedOutput": [],
+  "vjoinsplit": [],
+  "orchard": {
+    "actions": [],
+    "valueBalance": 0.0,
+    "valueBalanceZat": 0
+  },
+  "valuePoolDeltas": [
+    {
+      "bundleType": 0,
+      "bundleVariant": 0,
+      "value": -5.50004,
+      "valueZat": -550004000
+    },
+    {
+      "bundleType": 1,
+      "bundleVariant": 0,
+      "value": 5.49994,
+      "valueZat": 549994000
+    },
+    {
+      "bundleType": 5,
+      "bundleVariant": 0,
+      "value": 0.0001,
+      "valueZat": 10000
+    }
+  ],
+  "coinbase": {
+    "blockHeight": 1000,
+    "blockSubsidy": 6.25,
+    "blockSubsidyZat": 625000000,
+    "lockboxValue": 0.75,
+    "lockboxValueZat": 75000000,
+    "coinbaseData": "f09f8cb83a20706f6f6c",
+    "minerPoll": {
+      "pollDigest": "abababababababababababababababab",
+      "signals": [
+        {
+          "signalCode": 1,
+          "levelOfSupport": 2
+        },
+        {
+          "signalCode": 3,
+          "levelOfSupport": 0
+        }
+      ]
+    }
+  },
+  "valueBalance": 0.0,
+  "valueBalanceZat": 0,
+  "size": 123,
+  "txid": "8f77316cd3565da83216a66ac0a44b06df4a9d7bf095aa8b16780a2aea6d556d",
+  "authdigest": "1bff15c452f7600bc8ffa0f57292c4a6fbde4db1e5f5cafacde0ac92e9507d5e",
+  "overwintered": true,
+  "version": 7,
+  "versiongroupid": "fffffff7",
+  "locktime": 0,
+  "expiryheight": 1000
+}

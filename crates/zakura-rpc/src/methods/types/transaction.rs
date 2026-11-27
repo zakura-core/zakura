@@ -16,13 +16,17 @@ use zakura_chain::{
     miner_mesh::MinerMeshCommitment,
     orchard,
     parameters::{
-        subsidy::{block_subsidy, funding_stream_values, miner_fee_share, miner_subsidy},
+        subsidy::{
+            block_subsidy, funding_stream_values, miner_fee_share, miner_subsidy,
+            V7CoinbaseIssuance,
+        },
         Network, NetworkUpgrade,
     },
     sapling::ValueCommitment,
     serialization::{CompactSizeMessage, ZcashSerialize},
     transaction::{
-        self, SerializedTransaction, ShieldedActionCounts, Transaction, VerifiedUnminedTx,
+        self, v7::MAX_COINBASE_DATA_LEN, SerializedTransaction, ShieldedActionCounts, Transaction,
+        VerifiedUnminedTx,
     },
     transparent::Script,
 };
@@ -30,8 +34,9 @@ use zakura_consensus::{error::TransactionError, funding_stream_address};
 use zakura_script::Sigops;
 use zakura_state::IntoDisk;
 use zcash_primitives::transaction::{
-    builder::{cached_orchard_proving_key, BuildConfig, Builder},
+    builder::{cached_orchard_proving_key, BuildConfig, Builder, V7CoinbaseConfig},
     components::orchard::{bundle_version_for_branch, ACTION_SIZE},
+    v7::MinerPoll as V7MinerPoll,
     TxVersion,
 };
 use zcash_protocol::{
@@ -220,12 +225,51 @@ pub(crate) fn coinbase_needs_proof(
     )
 }
 
+/// Returns the transaction version of the coinbase Zakura builds at `height`.
+fn coinbase_version_at(net: &Network, height: Height) -> TxVersion {
+    coinbase_version(
+        BranchId::for_height(net, BlockHeight::from(height)),
+        !net.lockbox_disbursements(height).is_empty(),
+    )
+}
+
+/// Returns the transaction version of a coinbase under `branch`.
+///
+/// From NU7.1 the coinbase is a [ZIP 248] v7 transaction, whose coinbase bundle states the
+/// block height and issuance. Wallets keep the oldest valid format for their own
+/// transactions, but a coinbase is read by consensus rather than by other wallets.
+///
+/// A coinbase that pays a lockbox disbursement keeps the earlier format: ZIP 248
+/// registers no bundle that pays out of the lockbox, so a v7 coinbase could not balance
+/// the disbursement outputs. Today's only disbursement is at NU6.1 activation, which
+/// precedes NU7.1.
+///
+/// [ZIP 248]: https://zips.z.cash/zip-0248
+fn coinbase_version(branch: BranchId, pays_lockbox_disbursement: bool) -> TxVersion {
+    if TxVersion::V7.valid_in_branch(branch) && !pays_lockbox_disbursement {
+        TxVersion::V7
+    } else {
+        TxVersion::suggested_for_branch(branch)
+    }
+}
+
+// The miner data a v7 coinbase carries is the data a pre-v7 coinbase pushes after the
+// block height: the marker, separator, and user data, which always fit.
+const _: () = assert!(
+    crate::config::mining::ZAKURA_COINBASE_MARKER.len()
+        + crate::config::mining::ZAKURA_COINBASE_SEPARATOR.len()
+        + crate::config::mining::MAX_USER_COINBASE_DATA_LEN
+        <= MAX_COINBASE_DATA_LEN
+);
+
 /// Fee-independent outputs that determine a coinbase transaction's shape.
 struct CoinbasePlan {
     miner_reward_address: MinerRewardAddress,
     funding_stream_outputs: Vec<(Zatoshis, TransparentAddress)>,
     /// The gateway the coinbase names in its last transparent output, if any.
     mesh_commitment: Option<MinerMeshCommitment>,
+    /// The miner's poll response that a v7 coinbase carries in its coinbase bundle.
+    miner_poll: Option<V7MinerPoll>,
 }
 
 impl CoinbasePlan {
@@ -254,6 +298,8 @@ impl CoinbasePlan {
             miner_reward_address,
             funding_stream_outputs,
             mesh_commitment: miner_params.mesh_commitment(),
+            // Zakura does not answer miner polls yet.
+            miner_poll: None,
         })
     }
 
@@ -318,11 +364,12 @@ impl CoinbasePlan {
             .map(|commitment| commitment.to_output().zcash_serialized_size());
         transparent_output_count += usize::from(mesh_commitment_bytes.is_some());
 
+        let transparent_output_bytes =
+            transparent_output_bytes + mesh_commitment_bytes.unwrap_or(0);
         let transparent_bytes = compact_size_bytes(1)
             + max_coinbase_input_bytes
             + compact_size_bytes(transparent_output_count)
-            + transparent_output_bytes
-            + mesh_commitment_bytes.unwrap_or(0);
+            + transparent_output_bytes;
 
         let orchard_proof_bytes = ::orchard::Proof::expected_proof_size(1);
         let orchard_bundle_bytes = compact_size_bytes(1)
@@ -334,7 +381,55 @@ impl CoinbasePlan {
             + orchard_proof_bytes
             + SIGNATURE_BYTES
             + SIGNATURE_BYTES;
-        let (fixed_fields_bytes, shielded_bytes) = match version {
+        let (fixed_fields_bytes, transparent_bytes, shielded_bytes) = match version {
+            TxVersion::V7 => {
+                // A v7 coinbase has no coinbase input; its coinbase bundle carries the
+                // height and miner data, and each bundle is a type-length-value entry.
+                const BUNDLE_ID_BYTES: usize = 2;
+                const VALUE_POOL_DELTA_BYTES: usize = BUNDLE_ID_BYTES + VALUE_BALANCE_BYTES;
+                const SIGHASH_INFO_BYTES: usize = 2;
+                let entry =
+                    |payload: usize| BUNDLE_ID_BYTES + compact_size_bytes(payload) + payload;
+
+                let transparent_effects = compact_size_bytes(0)
+                    + compact_size_bytes(transparent_output_count)
+                    + transparent_output_bytes;
+                const SIGNAL_BYTES: usize = 2;
+                const POLL_DIGEST_BYTES: usize = 16;
+                let signal_count = self
+                    .miner_poll
+                    .as_ref()
+                    .map_or(0, |poll| poll.signals().len());
+                let miner_poll_bytes = compact_size_bytes(signal_count)
+                    + SIGNAL_BYTES * signal_count
+                    + if signal_count > 0 {
+                        POLL_DIGEST_BYTES
+                    } else {
+                        0
+                    };
+                let coinbase_effects = 4
+                    + VALUE_BALANCE_BYTES
+                    + VALUE_BALANCE_BYTES
+                    + compact_size_bytes(MAX_COINBASE_DATA_LEN)
+                    + MAX_COINBASE_DATA_LEN
+                    + miner_poll_bytes;
+                let ironwood = matches!(self.miner_reward_address, MinerRewardAddress::Ironwood(_));
+                let ironwood_effects = compact_size_bytes(1) + ACTION_SIZE + 1;
+                let ironwood_auth = ANCHOR_BYTES
+                    + compact_size_bytes(orchard_proof_bytes)
+                    + orchard_proof_bytes
+                    + 2 * (SIGHASH_INFO_BYTES + SIGNATURE_BYTES);
+
+                // Transparent, coinbase, Ironwood and fee deltas.
+                let deltas = compact_size_bytes(4) + 4 * VALUE_POOL_DELTA_BYTES;
+                let effects = compact_size_bytes(3)
+                    + entry(transparent_effects)
+                    + entry(coinbase_effects)
+                    + if ironwood { entry(ironwood_effects) } else { 0 };
+                let auths = compact_size_bytes(1) + if ironwood { entry(ironwood_auth) } else { 0 };
+
+                (V5_AND_V6_FIXED_FIELDS_BYTES, 0, deltas + effects + auths)
+            }
             TxVersion::V6 => {
                 let sapling = compact_size_bytes(0) + compact_size_bytes(0);
                 let orchard = compact_size_bytes(0);
@@ -343,19 +438,31 @@ impl CoinbasePlan {
                     _ => compact_size_bytes(0),
                 };
 
-                (V5_AND_V6_FIXED_FIELDS_BYTES, sapling + orchard + ironwood)
+                (
+                    V5_AND_V6_FIXED_FIELDS_BYTES,
+                    transparent_bytes,
+                    sapling + orchard + ironwood,
+                )
             }
             TxVersion::V5 => {
                 let sapling = compact_size_bytes(0) + compact_size_bytes(0);
                 let orchard = compact_size_bytes(0);
 
-                (V5_AND_V6_FIXED_FIELDS_BYTES, sapling + orchard)
+                (
+                    V5_AND_V6_FIXED_FIELDS_BYTES,
+                    transparent_bytes,
+                    sapling + orchard,
+                )
             }
             TxVersion::V4 => {
                 let sapling = VALUE_BALANCE_BYTES + compact_size_bytes(0) + compact_size_bytes(0);
                 let joinsplit_count = compact_size_bytes(0);
 
-                (V4_FIXED_FIELDS_BYTES, sapling + joinsplit_count)
+                (
+                    V4_FIXED_FIELDS_BYTES,
+                    transparent_bytes,
+                    sapling + joinsplit_count,
+                )
             }
             _ => {
                 return Err(TransactionError::CoinbaseConstruction(format!(
@@ -401,10 +508,7 @@ impl TransactionTemplate<NegativeOrZero> {
     ) -> Result<CoinbaseResourceUsage, TransactionError> {
         let block_subsidy = block_subsidy(height, net, issuance_deficit)?;
         let plan = CoinbasePlan::new(net, height, miner_params, block_subsidy)?;
-        let branch = BranchId::for_height(net, BlockHeight::from(height));
-        let version = TxVersion::suggested_for_branch(branch);
-
-        plan.resource_usage(version, extra_null_data_len)
+        plan.resource_usage(coinbase_version_at(net, height), extra_null_data_len)
     }
 
     /// Constructs a transaction template for a coinbase transaction.
@@ -426,13 +530,27 @@ impl TransactionTemplate<NegativeOrZero> {
         let miner_reward = miner_subsidy(height, net, block_subsidy)? + miner_fees;
         let miner_reward = Zatoshis::try_from(miner_reward?)?;
 
-        let mut builder = Builder::new(
-            net,
-            BlockHeight::from(height),
+        let build_config = if coinbase_version_at(net, height) == TxVersion::V7 {
+            let issuance = V7CoinbaseIssuance::new(height, net, block_subsidy, txs_fee)?;
+            let mut config = V7CoinbaseConfig::new(
+                Zatoshis::try_from(issuance.block_subsidy)?,
+                Zatoshis::try_from(issuance.lockbox_value)?,
+                Zatoshis::try_from(issuance.fees)?,
+                Zatoshis::try_from(issuance.nsm_fee_contribution)?,
+            );
+            config.coinbase_data = miner_params
+                .data()
+                .as_ref()
+                .map(|data| data.value())
+                .unwrap_or_default();
+            config.miner_poll = plan.miner_poll.clone();
+            BuildConfig::V7Coinbase(config)
+        } else {
             BuildConfig::Coinbase {
                 miner_data: miner_params.data().clone(),
-            },
-        );
+            }
+        };
+        let mut builder = Builder::new(net, BlockHeight::from(height), build_config);
 
         let default_memo = MemoBytes::empty();
         let memo = miner_params.memo().unwrap_or(&default_memo);
@@ -626,6 +744,26 @@ pub struct TransactionObject {
     #[new(default)]
     #[getset(get = "pub")]
     pub(crate) ironwood: Option<Orchard>,
+
+    /// The value pool deltas of a v7 transaction ([ZIP 248]), in encoding order, omitted
+    /// for earlier versions.
+    ///
+    /// [ZIP 248]: https://zips.z.cash/zip-0248
+    #[serde(rename = "valuePoolDeltas", skip_serializing_if = "Option::is_none")]
+    #[new(default)]
+    #[getset(get = "pub")]
+    pub(crate) value_pool_deltas: Option<Vec<ValuePoolDelta>>,
+
+    /// The coinbase bundle of a v7 coinbase transaction ([ZIP 248]), omitted otherwise.
+    ///
+    /// A v7 coinbase transaction has no coinbase input, so its `vin` holds no
+    /// `coinbase` entry: the block height and miner data are stated here instead.
+    ///
+    /// [ZIP 248]: https://zips.z.cash/zip-0248
+    #[serde(rename = "coinbase", skip_serializing_if = "Option::is_none")]
+    #[new(default)]
+    #[getset(get = "pub")]
+    pub(crate) coinbase_bundle: Option<CoinbaseBundleObject>,
 
     /// The net value of Sapling Spends minus Outputs in ZEC
     #[serde(rename = "valueBalance", skip_serializing_if = "Option::is_none")]
@@ -1046,6 +1184,129 @@ pub struct ShieldedOutput {
     proof: [u8; 192],
 }
 
+/// An entry of a v7 transaction's `mValuePoolDeltas`: one bundle's net change to the
+/// transparent transaction value pool.
+#[derive(
+    Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, CopyGetters, new,
+)]
+pub struct ValuePoolDelta {
+    /// The bundle type.
+    #[serde(rename = "bundleType")]
+    #[getset(get_copy = "pub")]
+    bundle_type: u32,
+    /// The bundle variant.
+    #[serde(rename = "bundleVariant")]
+    #[getset(get_copy = "pub")]
+    bundle_variant: u32,
+    /// The delta in ZEC.
+    #[getset(get_copy = "pub")]
+    value: f64,
+    /// The delta in zatoshis.
+    #[serde(rename = "valueZat")]
+    #[getset(get_copy = "pub")]
+    value_zat: i64,
+}
+
+impl ValuePoolDelta {
+    fn from_delta(bundle: transaction::v7::BundleKind, value: Amount<NegativeAllowed>) -> Self {
+        let (bundle_type, bundle_variant) = bundle.id();
+        Self {
+            bundle_type,
+            bundle_variant,
+            value: Zec::from(value).lossy_zec(),
+            value_zat: value.zatoshis(),
+        }
+    }
+}
+
+/// The coinbase bundle of a v7 coinbase transaction.
+#[derive(
+    Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, CopyGetters, new,
+)]
+pub struct CoinbaseBundleObject {
+    /// The height of the block the transaction is mined in.
+    #[serde(rename = "blockHeight")]
+    #[getset(get_copy = "pub")]
+    block_height: Height,
+    /// The block subsidy in ZEC.
+    #[serde(rename = "blockSubsidy")]
+    #[getset(get_copy = "pub")]
+    block_subsidy: f64,
+    /// The block subsidy in zatoshis.
+    #[serde(rename = "blockSubsidyZat")]
+    #[getset(get_copy = "pub")]
+    block_subsidy_zat: i64,
+    /// The part of the block subsidy deposited into the lockbox, in ZEC.
+    #[serde(rename = "lockboxValue")]
+    #[getset(get_copy = "pub")]
+    lockbox_value: f64,
+    /// The part of the block subsidy deposited into the lockbox, in zatoshis.
+    #[serde(rename = "lockboxValueZat")]
+    #[getset(get_copy = "pub")]
+    lockbox_value_zat: i64,
+    /// The data chosen by the miner, as hex.
+    #[serde(rename = "coinbaseData", with = "crate::methods::hex_data")]
+    #[getset(get = "pub")]
+    coinbase_data: Vec<u8>,
+    /// The miner's poll response, if any.
+    #[serde(rename = "minerPoll", skip_serializing_if = "Option::is_none")]
+    #[getset(get = "pub")]
+    miner_poll: Option<MinerPoll>,
+}
+
+/// A miner's response to a poll, in a v7 coinbase bundle.
+#[derive(
+    Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, CopyGetters, new,
+)]
+pub struct MinerPoll {
+    /// The digest identifying the poll, as hex.
+    #[serde(rename = "pollDigest", with = "hex")]
+    #[getset(get_copy = "pub")]
+    poll_digest: [u8; 16],
+    /// The signals, in ascending order of signal code.
+    #[getset(get = "pub")]
+    signals: Vec<MinerSignal>,
+}
+
+/// One signal of a miner's poll response.
+#[derive(
+    Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, CopyGetters, new,
+)]
+pub struct MinerSignal {
+    /// The subject of the signal.
+    #[serde(rename = "signalCode")]
+    #[getset(get_copy = "pub")]
+    signal_code: u8,
+    /// The miner's level of support for the subject.
+    #[serde(rename = "levelOfSupport")]
+    #[getset(get_copy = "pub")]
+    level_of_support: u8,
+}
+
+impl CoinbaseBundleObject {
+    fn from_bundle(bundle: &transaction::v7::CoinbaseBundle) -> Self {
+        Self {
+            block_height: bundle.height(),
+            block_subsidy: Zec::from(bundle.block_subsidy()).lossy_zec(),
+            block_subsidy_zat: bundle.block_subsidy().zatoshis(),
+            lockbox_value: Zec::from(bundle.lockbox_value()).lossy_zec(),
+            lockbox_value_zat: bundle.lockbox_value().zatoshis(),
+            coinbase_data: bundle.coinbase_data().to_vec(),
+            miner_poll: bundle.miner_poll().map(|poll| MinerPoll {
+                poll_digest: *poll.poll_digest(),
+                signals: poll
+                    .signals()
+                    .iter()
+                    .map(|signal| MinerSignal {
+                        signal_code: signal.signal_code,
+                        level_of_support: signal.level_of_support,
+                    })
+                    .collect(),
+            }),
+        }
+    }
+}
+
 /// Object with Orchard or Ironwood action information.
 #[derive(
     Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, CopyGetters, new,
@@ -1284,6 +1545,8 @@ impl Default for TransactionObject {
             joinsplits: Vec::new(),
             orchard: None,
             ironwood: None,
+            value_pool_deltas: None,
+            coinbase_bundle: None,
             binding_sig: None,
             joinsplit_pub_key: None,
             joinsplit_sig: None,
@@ -1544,6 +1807,16 @@ impl TransactionObject {
                     tx.ironwood_value_balance().ironwood_amount(),
                 )
             }),
+            value_pool_deltas: tx.value_pool_deltas().map(|deltas| {
+                deltas
+                    .into_iter()
+                    .map(|(bundle, value)| ValuePoolDelta::from_delta(bundle, value))
+                    .collect()
+            }),
+            coinbase_bundle: tx
+                .v7_fields()
+                .and_then(|fields| fields.coinbase.as_ref())
+                .map(CoinbaseBundleObject::from_bundle),
             binding_sig: tx.sapling_binding_sig().map(|raw_sig| raw_sig.into()),
             joinsplit_pub_key: tx.joinsplit_pub_key().map(|raw_key| {
                 // Display order is reversed in the RPC output.
@@ -1573,6 +1846,9 @@ impl TransactionObject {
         }
     }
 }
+
+#[cfg(test)]
+mod v7_tests;
 
 #[cfg(test)]
 mod tests {

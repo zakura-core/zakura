@@ -14,8 +14,10 @@
 
 pub(crate) mod constants;
 mod fees;
+mod v7_coinbase;
 
 pub use fees::miner_fee_share;
+pub use v7_coinbase::V7CoinbaseIssuance;
 
 use std::{collections::HashMap, sync::OnceLock};
 
@@ -464,6 +466,30 @@ pub fn funding_stream_values(
     }
 
     Ok(results)
+}
+
+/// Returns the lockbox deposit of the block at `height`, `totalDeferredOutput(height)`:
+/// the value of its funding streams to the deferred development fund pool ([ZIP 1015]).
+///
+/// [ZIP 1015]: https://zips.z.cash/zip-1015
+pub fn lockbox_deposit(
+    height: Height,
+    network: &Network,
+    expected_block_subsidy: Amount<NonNegative>,
+) -> Result<Amount<NonNegative>, amount::Error> {
+    let mut funding_streams = funding_stream_values(height, network, expected_block_subsidy)?;
+    Ok(take_lockbox_deposit(&mut funding_streams))
+}
+
+/// Removes the deferred development fund stream from `funding_streams`, the
+/// [`funding_stream_values`] of a block, and returns it as that block's
+/// [`lockbox_deposit`]. The remaining streams are the ones paid by coinbase outputs.
+pub fn take_lockbox_deposit(
+    funding_streams: &mut HashMap<FundingStreamReceiver, Amount<NonNegative>>,
+) -> Amount<NonNegative> {
+    funding_streams
+        .remove(&FundingStreamReceiver::Deferred)
+        .unwrap_or_default()
 }
 
 /// Block subsidy errors.

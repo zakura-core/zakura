@@ -193,11 +193,17 @@ pub fn verify_txid_path(
     Ok(coinbase)
 }
 
-/// Decodes the coinbase a `HeaderMeta` binds: a canonical v6 coinbase
-/// transaction of at most `W2_MAX_COINBASE_BYTES` (decision-9).
+/// Decodes the coinbase a `HeaderMeta` binds: a canonical v6 or v7 ([ZIP 248])
+/// coinbase of at most `W2_MAX_COINBASE_BYTES` (decision-9).
+///
+/// The check needs no chain context, so it accepts either version at any height
+/// [`verify_commitment`] admits. A v7 coinbase decodes only with the NU7.1 branch ID,
+/// and full block validation rejects one in a block before NU7.1.
 ///
 /// The proposer runs this check before it announces a block, so a coinbase
 /// that receivers refuse never leaves through BPv1.
+///
+/// [ZIP 248]: https://zips.z.cash/zip-0248
 pub fn decode_coinbase(bytes: &[u8]) -> Result<Transaction, CommitmentError> {
     // The byte bound also bounds the parsed coinbase's outputs and script bytes.
     if bytes.is_empty() || bytes.len() > W2_MAX_COINBASE_BYTES {
@@ -209,7 +215,9 @@ pub fn decode_coinbase(bytes: &[u8]) -> Result<Transaction, CommitmentError> {
     if !cursor.is_empty() {
         return Err(CommitmentError::TrailingCoinbaseBytes);
     }
-    if !matches!(coinbase, Transaction::V6 { .. }) {
+    // Both formats commit to the coinbase through a non-malleable txid and an auth
+    // digest, which check-2 and check-3 need.
+    if !matches!(coinbase, Transaction::V6 { .. } | Transaction::V7 { .. }) {
         return Err(CommitmentError::UnsupportedCoinbaseVersion);
     }
     if !coinbase.is_coinbase() {
@@ -366,8 +374,8 @@ pub enum CommitmentError {
     /// Trailing bytes remained after parsing the coinbase transaction.
     #[error("trailing bytes after coinbase transaction")]
     TrailingCoinbaseBytes,
-    /// Coinbase is not a v6 transaction (decision-9).
-    #[error("coinbase must be a v6 transaction")]
+    /// Coinbase is not a v6 or v7 transaction (decision-9).
+    #[error("coinbase must be a v6 or v7 transaction")]
     UnsupportedCoinbaseVersion,
     /// Supplied transaction is not a coinbase transaction.
     #[error("transaction is not a coinbase")]

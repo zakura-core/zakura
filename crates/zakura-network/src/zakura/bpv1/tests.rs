@@ -477,6 +477,85 @@ fn commitment_and_miner_mesh_outputs_stay_distinct_in_one_coinbase() {
     assert_eq!(&mesh_script[2..4], b"MR");
 }
 
+/// From NU7.1 a block's coinbase can be a ZIP 248 v7 transaction, which has no coinbase
+/// input. Its txid and auth digest bind it to the header like a v6 coinbase, and its
+/// transparent outputs carry the commitment.
+#[test]
+fn commitment_binds_a_v7_coinbase() {
+    use zakura_chain::{
+        parameters::{testnet::ConfiguredActivationHeights, NetworkUpgrade},
+        transaction::{
+            v7::{CoinbaseBundle, V7Fields, ValueDeltas},
+            LockTime, Transaction,
+        },
+    };
+
+    let network = Network::new_regtest(
+        ConfiguredActivationHeights {
+            nu7: Some(1),
+            nu7_1: Some(2),
+            ..Default::default()
+        }
+        .into(),
+    );
+    let height = Height(10);
+    let fields = build_committed_nu7_block(&Profile::TINY, 0).fields;
+    let paid = Amount::try_from(1_000_000).unwrap();
+    let v7_coinbase = |coinbase: Option<CoinbaseBundle>| Transaction::V7 {
+        network_upgrade: NetworkUpgrade::Nu7_1,
+        lock_time: LockTime::unlocked(),
+        expiry_height: height,
+        inputs: Vec::new(),
+        outputs: vec![
+            Output::new(paid.constrain().unwrap(), Script::new(&[0x51])),
+            Output::new(
+                Amount::zero(),
+                Script::new(&commitment_script(commit_hash(&fields))),
+            ),
+        ],
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+        ironwood_shielded_data: None,
+        v7_fields: Box::new(V7Fields {
+            value_deltas: ValueDeltas {
+                transparent: -paid,
+                coinbase: paid,
+                ..ValueDeltas::default()
+            },
+            coinbase,
+        }),
+    };
+    let bundle = CoinbaseBundle::new(
+        height,
+        paid.constrain().unwrap(),
+        Amount::zero(),
+        b"miner".to_vec(),
+        None,
+    )
+    .unwrap();
+    let coinbase = v7_coinbase(Some(bundle));
+
+    let block = super::fuzz::chain::block_of([0x42; 32], vec![Arc::new(coinbase.clone())]);
+    let paths = coinbase_paths(&block).expect("the block has a coinbase");
+    let binding = CoinbaseBinding {
+        coinbase: paths.coinbase,
+        txid_siblings: paths.txid_siblings,
+        auth_siblings: paths.auth_siblings,
+        light_client_root: [0x42; 32],
+    };
+    assert_eq!(
+        verify_commitment(&network, height, &block.header, &binding, &fields),
+        Ok(coinbase)
+    );
+
+    // A v7 transaction without a coinbase bundle is not a coinbase.
+    let not_coinbase = v7_coinbase(None).zcash_serialize_to_vec().unwrap();
+    assert_eq!(
+        commitment::decode_coinbase(&not_coinbase),
+        Err(CommitmentError::NotCoinbase)
+    );
+}
+
 #[test]
 fn corrupted_parity_under_valid_proofs_fails_reencode_check() {
     // Named scenario (05 §3): proposer commits valid Merkle proofs over an

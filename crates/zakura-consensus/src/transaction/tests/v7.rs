@@ -953,3 +953,52 @@ fn sapling_signatures_verify_only_against_their_per_signature_digests() {
         )
         .is_ok());
 }
+
+/// The mempool admits a signed v7 transaction that `zcash_primitives` builds, paying the
+/// ZIP 317 fee it states.
+#[tokio::test]
+async fn mempool_admits_a_signed_v7_shielding_transaction() {
+    use zakura_test::mock_service::MockService;
+
+    let _init_guard = zakura_test::init();
+    let Signed { tx, spent_outputs } = &*SHIELDING_TO_IRONWOOD;
+    let transparent::Input::PrevOut { outpoint, .. } = tx.inputs()[0] else {
+        unreachable!("the fixture spends a transparent output");
+    };
+    let mut state: MockService<_, _, _, _> = MockService::build().for_prop_tests();
+    let verifier = Verifier::new_for_tests(&network(), state.clone());
+
+    let utxo = transparent::Utxo::new(spent_outputs[0].clone(), Height(1), false);
+    tokio::spawn(async move {
+        state
+            .expect_request(zakura_state::Request::UnspentBestChainUtxo(outpoint))
+            .await
+            .expect("the verifier looks up the spent output")
+            .respond(zakura_state::Response::UnspentBestChainUtxo(Some(utxo)));
+        state
+            .expect_request_that(|request| {
+                matches!(
+                    request,
+                    zakura_state::Request::CheckBestChainTipNullifiersAndAnchors(_)
+                )
+            })
+            .await
+            .expect("the verifier checks the shielded anchors")
+            .respond(zakura_state::Response::ValidBestChainTipNullifiersAndAnchors);
+    });
+
+    let response = verifier
+        .oneshot(Request::Mempool {
+            transaction: tx.clone().into(),
+            height: NU7_1_HEIGHT,
+        })
+        .await
+        .expect("the mempool admits the transaction");
+
+    let crate::transaction::Response::Mempool { transaction, .. } = response else {
+        unreachable!("a mempool request has a mempool response");
+    };
+    assert_eq!(i64::from(transaction.miner_fee), 15_000);
+    assert_eq!(transaction.unpaid_actions, 0);
+    assert_eq!(transaction.transaction.id(), tx.unmined_id());
+}

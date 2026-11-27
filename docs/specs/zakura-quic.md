@@ -1208,11 +1208,11 @@ and the error names `[memory] budget`, which replaces it.
     checkpoint window at admission's charge per block, so the chain sets the
     smallest host that can run. The `Sessions` floor funds 19 full
     connections on Mainnet. With the draft values and
-    `p2p_stack = "zakura"`, Mainnet and Testnet need a host of about
-    13.2 GiB, and Regtest about 9.3 GiB. In `Dual` mode, legacy TCP ingress
-    and one legacy read add 1.2 GiB of fixed terms, and Mainnet needs about
-    14.7 GiB. Below its minimum, the node refuses to start and lists every
-    term.
+    `p2p_stack = "zakura"`, Mainnet needs a host of about 13.5 GiB, Testnet
+    about 13.4 GiB and Regtest about 9.5 GiB. In `Dual` mode, legacy TCP
+    ingress and one legacy read add 1.2 GiB of fixed terms, and Mainnet needs
+    about 15.0 GiB. Below its minimum, the node refuses to start and lists
+    every term.
   - **BPv1.** With `[network.zakura.bpv1] enabled = true`, the `Propagation`
     reserve covers what BPv1 retains for its concurrent blocks, in place of
     the tip-block term. It holds the block table's part and metadata budgets,
@@ -1226,8 +1226,8 @@ and the error names `[memory] budget`, which replaces it.
     BPv1 session funds its base `b_bpv1` from `Sessions` when BPv1 admits the
     peer: its unsolicited receive credit, its output gates, its held frames
     and its early records. BPv1 adds 22.9 MiB to a full connection, so a
-    16 GiB Mainnet host funds 29 full connections, not 48, and the smallest
-    Mainnet host grows from about 13.2 GiB to about 13.9 GiB.
+    16 GiB Mainnet host funds 28 full connections, not 44, and the smallest
+    Mainnet host grows from about 13.5 GiB to about 14.1 GiB.
   - **Preferred gateways.** A mining node holds up to ten connection places
     above `max_connections` for the mining gateways it ranks highest. While
     places are held, ordinary connections leave one full connection's bases

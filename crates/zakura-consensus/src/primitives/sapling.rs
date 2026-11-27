@@ -141,7 +141,7 @@ fn validate_batch(items: Vec<Item>) -> BatchResult {
     // Successful batch validation must not turn that item's failure into Ok.
     let checks = items
         .into_iter()
-        .map(|item| batch.check_bundle(item.bundle, item.sighash.into()))
+        .map(|item| batch.check_bundle(item.bundle, <[u8; 32]>::from(item.sighash)))
         .collect();
     let (spend_vk, output_vk) = verifying_keys();
     let valid = batch.validate(spend_vk, output_vk, thread_rng());
@@ -254,7 +254,7 @@ pub fn verify_single(
     async move {
         let is_valid = spawn_fallback(move || {
             let mut batch = BatchValidator::default();
-            if !batch.check_bundle(item.bundle, item.sighash.into()) {
+            if !batch.check_bundle(item.bundle, <[u8; 32]>::from(item.sighash)) {
                 return false;
             }
             let (spend_vk, output_vk) = verifying_keys();

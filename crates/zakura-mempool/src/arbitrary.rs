@@ -31,7 +31,10 @@ pub fn standardize_transaction(transaction: &mut Transaction) {
             *joinsplit_data = None;
         }
         Transaction::V4 { joinsplit_data, .. } => *joinsplit_data = None,
-        Transaction::V1 { .. } | Transaction::V5 { .. } | Transaction::V6 { .. } => {}
+        Transaction::V1 { .. }
+        | Transaction::V5 { .. }
+        | Transaction::V6 { .. }
+        | Transaction::V7 { .. } => {}
     }
 
     let lock_script = standard_lock_script();

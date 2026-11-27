@@ -24,12 +24,13 @@ use zcash_script::script::{self, Evaluable as _};
 
 use crate::error::TransactionError;
 
-/// Rejects v1 to v3 transactions, which have no verifier in this node.
+/// Rejects v1 to v3 transactions, and v7 transactions until ZIP 248 validation is
+/// implemented, since this node has no verifier for them.
 ///
 /// This runs first among the quick checks so that the mempool's unconditional ban
 /// for the wrong version is never replaced by a tip-dependent chain error.
 pub fn version_has_a_verifier(tx: &Transaction) -> Result<(), TransactionError> {
-    if tx.version() < 4 {
+    if !(4..=6).contains(&tx.version()) {
         return Err(TransactionError::WrongVersion);
     }
     Ok(())

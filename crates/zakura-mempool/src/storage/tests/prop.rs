@@ -711,6 +711,10 @@ impl SpendConflictTestInput {
                 Transaction::V6 {
                     sapling_shielded_data,
                     ..
+                }
+                | Transaction::V7 {
+                    sapling_shielded_data,
+                    ..
                 } => {
                     Self::remove_sapling_transfers_with_conflicts(sapling_shielded_data, &conflicts)
                 }
@@ -787,6 +791,10 @@ impl SpendConflictTestInput {
                 } => Self::remove_orchard_actions_with_conflicts(orchard_shielded_data, &conflicts),
 
                 Transaction::V6 {
+                    orchard_shielded_data,
+                    ..
+                }
+                | Transaction::V7 {
                     orchard_shielded_data,
                     ..
                 } => Self::remove_orchard_actions_with_conflicts(orchard_shielded_data, &conflicts),

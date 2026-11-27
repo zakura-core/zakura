@@ -707,6 +707,9 @@ where
                     cached_ffi_transaction.clone(),
                     wtx_id.expect("a v6 transaction has a witnessed transaction ID"),
                 ),
+                Transaction::V7 { .. } => {
+                    unreachable!("the version quick check rejects v7 transactions before any lookup")
+                }
             };
             let async_checks = match queueing.as_ref() {
                 Some(queueing) => queueing.scope(build_checks),

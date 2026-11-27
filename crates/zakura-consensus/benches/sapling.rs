@@ -107,7 +107,7 @@ fn bench_sapling_verify(c: &mut Criterion) {
         let item = source_items[0].clone();
         b.iter(|| {
             let mut batch = BatchValidator::default();
-            assert!(batch.check_bundle(item.bundle.clone(), item.sighash.into()));
+            assert!(batch.check_bundle(item.bundle.clone(), <[u8; 32]>::from(item.sighash)));
             assert!(batch.validate(spend_vk, output_vk, thread_rng()));
         })
     });
@@ -123,7 +123,9 @@ fn bench_sapling_verify(c: &mut Criterion) {
                 b.iter(|| {
                     for item in items {
                         let mut batch = BatchValidator::default();
-                        assert!(batch.check_bundle(item.bundle.clone(), item.sighash.into()));
+                        assert!(
+                            batch.check_bundle(item.bundle.clone(), <[u8; 32]>::from(item.sighash))
+                        );
                         assert!(batch.validate(spend_vk, output_vk, thread_rng()));
                     }
                 })
@@ -144,7 +146,9 @@ fn bench_sapling_verify(c: &mut Criterion) {
                 b.iter(|| {
                     let mut batch = BatchValidator::default();
                     for item in items {
-                        assert!(batch.check_bundle(item.bundle.clone(), item.sighash.into()));
+                        assert!(
+                            batch.check_bundle(item.bundle.clone(), <[u8; 32]>::from(item.sighash))
+                        );
                     }
                     assert!(batch.validate(spend_vk, output_vk, thread_rng()));
                 })

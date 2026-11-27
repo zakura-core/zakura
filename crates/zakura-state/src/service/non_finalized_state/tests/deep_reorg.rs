@@ -36,9 +36,9 @@ use crate::{
 
 const REORG_DEPTH: u32 = 100;
 const FINALIZED_BEFORE_FORK: u32 = 64;
-const TRANSFER_VALUE: i64 = 1_000;
-const TRANSPARENT_TX_INDEX: usize = 1;
-const SHIELDED_TX_INDEX: usize = 2;
+pub(super) const TRANSFER_VALUE: i64 = 1_000;
+pub(super) const TRANSPARENT_TX_INDEX: usize = 1;
+pub(super) const SHIELDED_TX_INDEX: usize = 2;
 
 #[test]
 fn deep_reorg_with_transparent_and_shielded_transactions() {
@@ -271,7 +271,7 @@ fn assert_live_double_spends_rejected(
 }
 
 /// Checks membership in every index affected by the transactions in `record`.
-fn assert_membership(chain: &Chain, record: &ContextuallyVerifiedBlock, present: bool) {
+pub(super) fn assert_membership(chain: &Chain, record: &ContextuallyVerifiedBlock, present: bool) {
     assert_eq!(chain.block(record.hash.into()).is_some(), present);
     for hash in record.transaction_hashes.iter() {
         assert_eq!(chain.contains_transaction(hash), present);
@@ -309,7 +309,7 @@ fn assert_membership(chain: &Chain, record: &ContextuallyVerifiedBlock, present:
 }
 
 /// Returns an empty NU5 chain, its finalized tip, and a mixed shielded template.
-fn fixtures(skip_address_index: bool) -> (Chain, Arc<Block>, Transaction) {
+pub(super) fn fixtures(skip_address_index: bool) -> (Chain, Arc<Block>, Transaction) {
     let mut template: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1687118_BYTES
         .zcash_deserialize_into()
         .unwrap();
@@ -347,7 +347,7 @@ fn fixtures(skip_address_index: bool) -> (Chain, Arc<Block>, Transaction) {
 }
 
 /// Builds one transparent spend and one Sapling/Orchard transaction per block.
-fn mixed_child(
+pub(super) fn mixed_child(
     parent: &Arc<Block>,
     shielded: &Transaction,
     seed: u32,
@@ -430,20 +430,20 @@ fn mixed_child(
     (block, contextual)
 }
 
-fn set_merkle_root(block: &mut Block) {
+pub(super) fn set_merkle_root(block: &mut Block) {
     let merkle_root = block.transactions.iter().collect();
     Arc::make_mut(&mut block.header).merkle_root = merkle_root;
 }
 
 /// Different seeds identify different blocks; indexes distinguish their spends.
-fn nullifier_bytes(seed: u32, index: usize) -> [u8; 32] {
+pub(super) fn nullifier_bytes(seed: u32, index: usize) -> [u8; 32] {
     let mut bytes = [0; 32];
     bytes[..4].copy_from_slice(&seed.to_le_bytes());
     bytes[4..12].copy_from_slice(&u64::try_from(index).unwrap().to_le_bytes());
     bytes
 }
 
-fn address_script(seed: u32, branch: u32) -> transparent::Script {
+pub(super) fn address_script(seed: u32, branch: u32) -> transparent::Script {
     let mut script = vec![0x76, 0xa9, 0x14];
     let mut hash = [0; 20];
     hash[..4].copy_from_slice(&seed.to_le_bytes());

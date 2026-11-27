@@ -185,7 +185,9 @@ unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 
 # List of URLs for allowed Git repositories
-allow-git = []
+# TEMPORARY: the unreleased ZIP 248 Common crates, patched in the root
+# Cargo.toml until Common 6.0.0 is published.
+allow-git = ["https://github.com/zakura-core/common"]
 
 [sources.allow-org]
 github = [

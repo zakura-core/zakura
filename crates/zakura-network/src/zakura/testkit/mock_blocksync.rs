@@ -776,6 +776,7 @@ fn synthetic_block_at_height(
         | Transaction::V4 { inputs, .. }
         | Transaction::V5 { inputs, .. } => &mut inputs[0],
         Transaction::V6 { inputs, .. } => &mut inputs[0],
+        Transaction::V7 { .. } => unreachable!("template blocks are pre-v7"),
     };
     match input {
         transparent::Input::Coinbase {
@@ -796,7 +797,8 @@ fn synthetic_block_at_height(
             | Transaction::V3 { lock_time, .. }
             | Transaction::V4 { lock_time, .. }
             | Transaction::V5 { lock_time, .. }
-            | Transaction::V6 { lock_time, .. } => lock_time,
+            | Transaction::V6 { lock_time, .. }
+            | Transaction::V7 { lock_time, .. } => lock_time,
         };
         *lock_time = LockTime::Height(block::Height(
             u32::try_from(index)

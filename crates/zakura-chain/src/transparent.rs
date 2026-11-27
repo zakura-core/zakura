@@ -81,6 +81,16 @@ pub struct OutPoint {
 }
 
 impl OutPoint {
+    /// The null previous output: an all-zero hash and the maximum index.
+    ///
+    /// Before v7, a transparent input with this previous output is a coinbase input. A
+    /// v7 transaction has no coinbase input, so its inputs can name it as a spend, which
+    /// consensus rejects.
+    pub const NULL: OutPoint = OutPoint {
+        hash: transaction::Hash([0; 32]),
+        index: u32::MAX,
+    };
+
     /// Returns a new [`OutPoint`] from an in-memory output `index`.
     ///
     /// # Panics

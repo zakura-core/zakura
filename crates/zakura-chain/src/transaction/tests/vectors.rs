@@ -1838,6 +1838,7 @@ fn binding_signatures() {
                                 .expect("verification passes");
                         }
                     }
+                    Transaction::V7 { .. } => unreachable!("the test vectors have no v7 blocks"),
                 }
             }
         }

@@ -149,9 +149,7 @@ impl ZcashSerialize for Input {
                 writer.write_u32::<LittleEndian>(*sequence)?;
             }
             Input::Coinbase { sequence, .. } => {
-                // Write the null prevout.
-                writer.write_all(&[0; 32][..])?;
-                writer.write_u32::<LittleEndian>(0xffff_ffff)?;
+                OutPoint::NULL.zcash_serialize(writer)?;
 
                 // Write the script sig containing the height and data.
                 self.coinbase_script()
@@ -174,10 +172,9 @@ impl ZcashDeserialize for Input {
         // have a coinbase input.
         let hash = reader.read_32_bytes()?;
 
-        // Coinbase inputs have a null prevout hash.
-        if hash == [0; 32] {
-            // Coinbase txs have the prevout index set to `u32::MAX`.
-            if reader.read_u32::<LittleEndian>()? != 0xffff_ffff {
+        // Coinbase inputs have a null prevout.
+        if hash == OutPoint::NULL.hash.0 {
+            if reader.read_u32::<LittleEndian>()? != OutPoint::NULL.index {
                 return Err(SerializationError::Parse("Wrong index in coinbase"));
             }
 

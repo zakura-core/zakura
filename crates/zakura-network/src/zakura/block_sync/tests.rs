@@ -118,6 +118,7 @@ pub(super) fn fake_block_at_height(
         | Transaction::V4 { inputs, .. }
         | Transaction::V5 { inputs, .. } => &mut inputs[0],
         Transaction::V6 { inputs, .. } => &mut inputs[0],
+        Transaction::V7 { .. } => unreachable!("template blocks are pre-v7"),
     };
     match input {
         transparent::Input::Coinbase {

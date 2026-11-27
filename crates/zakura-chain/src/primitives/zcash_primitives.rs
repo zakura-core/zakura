@@ -334,6 +334,9 @@ enum SighashError {
     /// Reaching this branch means the caller passed an output whose amount
     /// was not validated by the consensus rules before sighash computation.
     InvalidPreviousOutputAmount,
+    /// `zcash_primitives` refused to compute the signature hash, as it does for a v7
+    /// signature that does not use `SIGHASH_ALL`.
+    Refused(zp_tx::sighash::SighashError),
 }
 
 impl std::fmt::Display for SighashError {
@@ -367,6 +370,7 @@ impl std::fmt::Display for SighashError {
                  the amount should have been validated before sighash \
                  computation",
             ),
+            Self::Refused(e) => write!(f, "zcash_primitives refused the signature hash: {e}"),
         }
     }
 }
@@ -433,6 +437,40 @@ pub(crate) fn sighash_v4_raw(
          input_index when computing a transparent sighash, and the transaction \
          must contain the transparent input being signed",
     )
+}
+
+/// Computes the digest of a v7 Sapling, Orchard, or Ironwood signature with
+/// `librustzcash`, so tests can compare it with the native digest.
+///
+/// `bundle_type` is the bundle's ZIP 248 type, and `spend_index` is the position of a
+/// spend authorization signature, or `None` for the binding signature. Returns `None` if
+/// `librustzcash` refuses to compute the digest.
+#[cfg(test)]
+pub(crate) fn v7_shielded_sighash_via_librustzcash(
+    precomputed_tx_data: &PrecomputedTxData,
+    bundle_type: u32,
+    spend_index: Option<usize>,
+) -> Option<SigHash> {
+    use zp_tx::v7::{ShieldedBundleType, ShieldedSignature};
+
+    let bundle_type = match bundle_type {
+        2 => ShieldedBundleType::Sapling,
+        3 => ShieldedBundleType::Orchard,
+        4 => ShieldedBundleType::Ironwood,
+        _ => panic!("bundle type {bundle_type} has no shielded signatures"),
+    };
+    let signature = match spend_index {
+        Some(index) => ShieldedSignature::SpendAuth { index },
+        None => ShieldedSignature::Binding,
+    };
+    let tx_data = &precomputed_tx_data.tx_data;
+    let txid_parts = tx_data.digest(zp_tx::txid::TxIdDigester);
+    let signable_input = zp_tx::sighash::SignableInput::V7Shielded {
+        bundle_type,
+        signature,
+    };
+    let sighash = zp_tx::sighash::signature_hash(tx_data, &signable_input, &txid_parts).ok()?;
+    Some(SigHash(*sighash.as_ref()))
 }
 
 /// Internal sighash computation that surfaces precondition violations through
@@ -503,9 +541,11 @@ fn sighash_inner(
         // `SigHasher` answers v5 and later signature hashes from its native ZIP-244 cache, so
         // only the tests that compare against librustzcash reach this arm. It hashes the
         // transaction's effecting data on every call rather than caching it.
-        zp_tx::TxVersion::V5 | zp_tx::TxVersion::V6 => {
+        zp_tx::TxVersion::V5 | zp_tx::TxVersion::V6 | zp_tx::TxVersion::V7 => {
             let txid_parts = tx_data.digest(zp_tx::txid::TxIdDigester);
-            *zp_tx::sighash::signature_hash(tx_data, &signable_input, &txid_parts).as_ref()
+            *zp_tx::sighash::signature_hash(tx_data, &signable_input, &txid_parts)
+                .map_err(SighashError::Refused)?
+                .as_ref()
         }
         // `signature_hash` sends these versions to the same function, without the digests.
         zp_tx::TxVersion::Sprout(_) | zp_tx::TxVersion::V3 | zp_tx::TxVersion::V4 => {
@@ -534,6 +574,11 @@ fn v4_signature_hash(
 ///
 /// [ZIP-244]: https://zips.z.cash/zip-0244
 pub(crate) fn auth_digest(tx: &Transaction) -> AuthDigest {
+    // ZIP 248 v7 digests are always native.
+    if let Some(v7) = crate::transaction::v7::V7Ref::of(tx) {
+        return v7.authorizing_digest();
+    }
+
     // Compute the v5/v6 ZIP-244 authorizing-data digest natively, avoiding the
     // `librustzcash` reparse (see `crate::transaction::zip244`). Unsupported
     // versions fall back to `librustzcash`.
@@ -561,6 +606,11 @@ pub(crate) fn auth_digest(tx: &Transaction) -> AuthDigest {
 ///
 /// If passed a pre-v5 transaction.
 pub(crate) fn txid_and_auth_digest(tx: &Transaction) -> (Hash, AuthDigest) {
+    // ZIP 248 v7 digests are always native.
+    if let Some(v7) = crate::transaction::v7::V7Ref::of(tx) {
+        return (v7.txid(), v7.authorizing_digest());
+    }
+
     // Compute the v5/v6 ZIP-244 txid and authorizing-data digest natively,
     // avoiding the `librustzcash` reparse (see `crate::transaction::zip244`).
     // Unsupported versions fall back to `librustzcash`.

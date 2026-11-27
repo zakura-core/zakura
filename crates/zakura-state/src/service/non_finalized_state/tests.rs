@@ -3,6 +3,7 @@
 mod deep_reorg;
 mod prop;
 mod shared_outputs;
+mod v7_rollback;
 mod vectors;
 
 use std::sync::Mutex;

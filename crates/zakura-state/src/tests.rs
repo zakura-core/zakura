@@ -41,6 +41,7 @@ impl FakeChainHelper for Arc<Block> {
             Transaction::V4 { inputs, .. } => &mut inputs[0],
             Transaction::V5 { inputs, .. } => &mut inputs[0],
             Transaction::V6 { inputs, .. } => &mut inputs[0],
+            Transaction::V7 { .. } => unreachable!("test blocks are pre-v7"),
         };
 
         match input {

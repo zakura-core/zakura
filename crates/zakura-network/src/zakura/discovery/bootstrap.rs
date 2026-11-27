@@ -64,8 +64,10 @@ pub(super) const BOOTSTRAP_DIAL_FLOOR: usize = 2;
 pub(super) const BOOTSTRAP_RELEASE_HOSTS: usize = 4;
 
 /// The most seeds this node has connected or is dialing at once. A second
-/// seed's sample keeps one dishonest seed from choosing all of a new node's
-/// first peers.
+/// seed's sample makes it less likely that one seed picks all of a new node's
+/// first peers, but doesn't rule it out: once one seed's peers bring the node
+/// to [`BOOTSTRAP_DIAL_FLOOR`], it dials no other seed. Bitcoin Core likewise
+/// stops DNS seeding at two outbound peers.
 pub(super) const MAX_BOOTSTRAP_CONNECTIONS: usize = 2;
 
 /// How many outbound non-seed hosts must each keep a peer registered for

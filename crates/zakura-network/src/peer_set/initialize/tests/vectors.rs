@@ -1140,7 +1140,7 @@ async fn pinned_unconditional_peer_name_is_exempt_only_while_its_node_id_is_prov
 
     // The connection upgrades to P2P v2, which proves the node ID, and the legacy
     // connection closes.
-    peer_registry.register_native_connection(peer_id.clone(), 1, Some(ip("192.0.2.1")));
+    peer_registry.register_native_connection(peer_id.clone(), 1, Some(ip("192.0.2.1")), &[]);
     assert!(peer_registry.attach_native_metadata(
         peer_id.clone(),
         1,
@@ -1166,6 +1166,78 @@ async fn pinned_unconditional_peer_name_is_exempt_only_while_its_node_id_is_prov
     assert!(
         !unconditional_peers.contains(ip("192.0.2.1")),
         "the address loses its exemption with the connection that proved it",
+    );
+}
+
+/// A pinned peer that added a key registers under a new node ID, and its connection
+/// still proves the pinned one. The pin goes on working: the peer counts as connected,
+/// so it is neither dialed nor looked up, and the address that connection comes from is
+/// exempt. A connection that proves some other earlier ID gets nothing.
+#[tokio::test(start_paused = true)]
+async fn pinned_unconditional_peer_that_added_a_key_still_proves_its_pin() {
+    let _init_guard = zakura_test::init();
+    let ip = |ip: &str| ip.parse::<IpAddr>().unwrap();
+
+    let (node_id, pinned) = test_node_id();
+    let pinned = pinned.node_id().expect("a pin is a node ID");
+    let node = |byte: u8| zakura_quic::NodeId::from_bytes(&[byte; 32]);
+    let current = ZakuraPeerId::from_node_id(node(0xC1));
+    let unrelated = ZakuraPeerId::from_node_id(node(0xC2));
+    let config: Config = toml::from_str(&format!(
+        "p2p_stack = 'dual'\nunconditional_peers = ['{node_id}@peer.example.com:18233']"
+    ))
+    .unwrap();
+    let unconditional_peers = config.unconditional_peers.clone();
+    let peer_registry = PeerRegistry::default();
+    // Another peer added a key too. Its earlier ID is not the pinned one.
+    peer_registry.register_native_connection(
+        unrelated.clone(),
+        1,
+        Some(ip("203.0.113.9")),
+        &[node(0xC3)],
+    );
+    let dialer = spawn_unconditional_peer_dialer(
+        config,
+        peer_registry.clone(),
+        UnconditionalPeerDial::ConnectAndStayOpen,
+    );
+
+    dialer.set_lookup(Some(&["192.0.2.1:18233"]));
+    dialer.wait_for_dial_after(0).await;
+    tokio::time::sleep(constants::UNCONDITIONAL_PEER_CHECK_INTERVAL * 2).await;
+    assert!(
+        !unconditional_peers.contains(ip("203.0.113.9")),
+        "a peer that proves another earlier ID is not the pinned peer",
+    );
+    assert!(!unconditional_peers.contains(ip("192.0.2.1")));
+
+    // The pinned peer's connection upgrades to P2P v2 and registers under its new ID.
+    peer_registry.register_native_connection(current.clone(), 2, Some(ip("192.0.2.1")), &[pinned]);
+    assert!(peer_registry.attach_native_metadata(
+        current.clone(),
+        2,
+        connected_peer(peer_addr("192.0.2.1:18233"), false),
+        true,
+    ));
+    dialer.close_connections();
+    tokio::time::sleep(constants::UNCONDITIONAL_PEER_CHECK_INTERVAL * 2).await;
+    assert!(unconditional_peers.contains(ip("192.0.2.1")));
+    assert!(!unconditional_peers.contains(ip("203.0.113.9")));
+
+    let (dials, lookups) = (dialer.dial_addrs(), dialer.lookups());
+    tokio::time::sleep(constants::MAX_UNCONDITIONAL_PEER_REDIAL_DELAY * 2).await;
+    assert_eq!(
+        dialer.dial_addrs(),
+        dials,
+        "a peer that proves its pin is not dialed again",
+    );
+    assert_eq!(dialer.lookups(), lookups, "nor looked up");
+
+    peer_registry.deregister_native_connection(&current, 2);
+    tokio::time::sleep(constants::UNCONDITIONAL_PEER_CHECK_INTERVAL * 2).await;
+    assert!(
+        !unconditional_peers.contains(ip("192.0.2.1")),
+        "the address loses its exemption with the connection that proved the pin",
     );
 }
 
@@ -1218,7 +1290,7 @@ async fn pinned_unconditional_peer_is_followed_to_the_address_that_proves_it() {
     .unwrap();
     let unconditional_peers = config.unconditional_peers.clone();
     let peer_registry = PeerRegistry::default();
-    peer_registry.register_native_connection(peer_id.clone(), 1, Some(ip("198.51.100.7")));
+    peer_registry.register_native_connection(peer_id.clone(), 1, Some(ip("198.51.100.7")), &[]);
     assert!(peer_registry.attach_native_metadata(
         peer_id,
         1,
@@ -1266,7 +1338,7 @@ async fn pinned_unconditional_peer_exempts_the_address_of_the_connection_that_pr
 
     // The legacy upgrade came from the relay at 192.0.2.1, but the P2P v2 connection
     // reached the real peer at 203.0.113.9.
-    peer_registry.register_native_connection(peer_id.clone(), 1, Some(ip("203.0.113.9")));
+    peer_registry.register_native_connection(peer_id.clone(), 1, Some(ip("203.0.113.9")), &[]);
     assert!(peer_registry.attach_native_metadata(
         peer_id,
         1,

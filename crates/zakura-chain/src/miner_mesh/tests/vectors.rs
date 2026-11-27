@@ -2,7 +2,7 @@
 
 use crate::{
     amount::{Amount, NonNegative},
-    miner_mesh::{GatewayId, MinerMeshCommitment},
+    miner_mesh::{GatewayId, MinerMeshCommitment, ParseGatewayIdError},
     serialization::ZcashSerialize,
     transparent::{Output, Script},
 };
@@ -219,4 +219,56 @@ fn a_gateway_id_is_the_first_20_bytes_of_the_node_id() {
     other_prefix[19] ^= 0x01;
     assert!(!gateway_id.is_prefix_of(&other_prefix));
     assert_ne!(GatewayId::from_node_id(&other_prefix), gateway_id);
+}
+
+#[test]
+fn a_gateway_id_reads_from_a_whole_node_id_or_its_first_20_bytes_in_hex() {
+    let expected = GatewayId::from_node_id(&NODE_ID);
+
+    let from_node_id: GatewayId = hex::encode(NODE_ID).parse().expect("a 64-digit node ID");
+    let from_gateway_id: GatewayId = hex::encode(&NODE_ID[..20])
+        .parse()
+        .expect("a 40-digit gateway ID");
+    let upper_case: GatewayId = hex::encode_upper(NODE_ID)
+        .parse()
+        .expect("hex digits in either case");
+
+    assert_eq!(from_node_id, expected);
+    assert_eq!(from_gateway_id, expected);
+    assert_eq!(upper_case, expected);
+    assert_eq!(expected.to_string().parse::<GatewayId>(), Ok(expected));
+}
+
+#[test]
+fn text_of_another_length_or_not_hex_names_no_gateway_id() {
+    for text in [
+        "",
+        "00",
+        &hex::encode(&NODE_ID[..19]),
+        &hex::encode([0; 33]),
+    ] {
+        assert!(
+            matches!(
+                text.parse::<GatewayId>(),
+                Err(ParseGatewayIdError::Length(len)) if len == text.len()
+            ),
+            "{text:?} has the length of neither ID"
+        );
+    }
+
+    // The length is counted in bytes, as the parser chooses by it.
+    let error = "é".parse::<GatewayId>().expect_err("two bytes name no ID");
+    assert_eq!(error, ParseGatewayIdError::Length(2));
+    assert!(error.to_string().ends_with("found 2 bytes"), "{error}");
+
+    let not_hex = format!("{}zz", &hex::encode(NODE_ID)[2..]);
+    assert!(matches!(
+        not_hex.parse::<GatewayId>(),
+        Err(ParseGatewayIdError::NotHex(_))
+    ));
+    let not_hex = format!("{}zz", &hex::encode(&NODE_ID[..20])[2..]);
+    assert!(matches!(
+        not_hex.parse::<GatewayId>(),
+        Err(ParseGatewayIdError::NotHex(_))
+    ));
 }

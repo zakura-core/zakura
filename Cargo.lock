@@ -2374,7 +2374,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -3026,7 +3026,7 @@ dependencies = [
 
 [[package]]
 name = "zakura"
-version = "1.9.0-rc2"
+version = "1.9.0"
 dependencies = [
  "base64",
  "bytes",
@@ -3098,9 +3098,9 @@ dependencies = [
 
 [[package]]
 name = "zakura-assets"
-version = "0.3601446.0"
+version = "0.3611446.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dd3dcf05d3e9eb5486fcb640afdb013837e3b3e5eb91153cb33e452e0b4d1d1c"
+checksum = "2c687474d83940cdfdf13bb9054f0b4545d7a0502bd350c18f42737e44ee3ff3"
 
 [[package]]
 name = "zakura-bellman"
@@ -3716,7 +3716,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-rt"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "pin-project-lite",
  "rand 0.10.2",

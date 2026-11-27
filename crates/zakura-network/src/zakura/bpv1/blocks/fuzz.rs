@@ -1,4 +1,4 @@
-//! Decoder 3 of the `bpv1_block` fuzz target (`tool-2`).
+//! Decoder 4 of the `bpv1_block` fuzz target (`tool-2`).
 //!
 //! The first byte picks the profile (bit 0 set: `W2`, else `TINY`), the
 //! layout of each of the three blocks (bits 1–2, 3–4 and 5–6, indexing
@@ -72,7 +72,7 @@ pub struct BlockReplaySummary {
     pub reached: Reached,
 }
 
-/// Operations decoder 3 reads.
+/// Operations decoder 4 reads.
 const OPS: u8 = 25;
 
 /// The fuzz property the replay's own ledger checks name.
@@ -236,6 +236,7 @@ pub fn replay_bpv1_block_bytes(bytes: &[u8]) -> BlockReplaySummary {
             .iter()
             .map(|&p| PullPeerState {
                 peer: p,
+                session_gen: 1,
                 ahead_bytes: u64::from(b & 3) * 1_000,
                 can_pull: a & 0x80 == 0,
                 window_remaining: u32::from(b >> 6) + 1,
@@ -320,9 +321,11 @@ pub fn replay_bpv1_block_bytes(bytes: &[u8]) -> BlockReplaySummary {
             // `b` bit 0 sets the relay flag; the proposer sends relay flags.
             7 => BlockInput::PushFlagged {
                 peer: if b & 1 != 0 { peers[0] } else { peer },
+                session_gen: 1,
                 block_id: block.id,
                 indices: block.indices(b, a & 0x80 != 0),
                 relay: b & 1 != 0,
+                live: true,
             },
             8 => BlockInput::PathObserved {
                 peer,
@@ -342,13 +345,26 @@ pub fn replay_bpv1_block_bytes(bytes: &[u8]) -> BlockReplaySummary {
                 },
             },
             // `b` bit 0 ends one session's unanswered metadata (`b` bit 1
-            // picks its generation, as `MetaReceived` sends it); otherwise
-            // the peer's last session ends.
+            // picks its generation, as `MetaReceived` sends it). Otherwise
+            // the peer's session 1, which holds its claims and pushes, ends:
+            // its last session, or with `b` bit 2 one that session 2
+            // replaced. Bit 2 is clear of bits 0-1, which set `ahead_bytes`.
             10 if b & 1 != 0 => BlockInput::MetaSessionEnded {
                 peer,
                 session_gen: 1 + u64::from(b >> 1 & 1),
             },
-            10 => BlockInput::SessionEnded { peer, peer_states },
+            10 => BlockInput::SessionEnded {
+                peer,
+                session_gen: 1,
+                peer_states: peer_states
+                    .into_iter()
+                    .filter(|ps| b & 4 != 0 || ps.peer != peer)
+                    .map(|ps| PullPeerState {
+                        session_gen: if ps.peer == peer { 2 } else { ps.session_gen },
+                        ..ps
+                    })
+                    .collect(),
+            },
             11 => BlockInput::PeerBlockDone {
                 peer,
                 block_id: block.id,
@@ -365,8 +381,11 @@ pub fn replay_bpv1_block_bytes(bytes: &[u8]) -> BlockReplaySummary {
                 stripe: block.stripe(b),
                 peer_states,
             },
+            // `a` bit 7 names an earlier session than the one that holds the
+            // claims, which releases nothing (bpv1-63).
             14 => BlockInput::ReleaseClaims {
                 peer,
+                session_gen: 1 - u64::from(a >> 7),
                 block_id: block.id,
                 stripe: block.stripe(b >> 4),
                 slots: (0..4u32).filter(|i| b & (1 << i) != 0).collect(),
@@ -386,7 +405,7 @@ pub fn replay_bpv1_block_bytes(bytes: &[u8]) -> BlockReplaySummary {
                 };
                 // usize -> u64 widens on every supported target.
                 let len = part.payload().len() as u64;
-                let charge = table.charge_part(now, &block.id, part.index(), peer, len);
+                let charge = table.charge_part(now, &block.id, part.index(), peer, 1, len);
                 reached.hit(if charge.is_ok() {
                     "charge:accepted"
                 } else {
@@ -396,6 +415,7 @@ pub fn replay_bpv1_block_bytes(bytes: &[u8]) -> BlockReplaySummary {
                     block_id: block.id,
                     part,
                     from_peer: peer,
+                    session_gen: 1,
                     auth: [PartAuth::Seed, PartAuth::Push, PartAuth::Want(1)]
                         [usize::from(a >> 5 & 3) % 3],
                     peer_states,
@@ -409,11 +429,12 @@ pub fn replay_bpv1_block_bytes(bytes: &[u8]) -> BlockReplaySummary {
                     .map_or(u32::from(b), |p| p.index());
                 // `s_max` bounds a part's charge.
                 let len = u64::from(profile.s_max);
-                let _ = table.charge_part(now, &block.id, index, peer, len);
+                let _ = table.charge_part(now, &block.id, index, peer, 1, len);
                 BlockInput::ReleasePartCharge {
                     block_id: block.id,
                     index,
                     from_peer: peer,
+                    session_gen: 1,
                 }
             }
             17 => BlockInput::PartUploaded {
@@ -557,10 +578,7 @@ fn step(
             // after its tombstone is purged: `top` only rises, so a purged
             // height stays below the window. This node's own solved block
             // skips the window check (`BlockAdmittedLocal`), so it may.
-            BlockOutput::PublishAdmitted {
-                admitted,
-                from_peer: Some(_),
-            } => {
+            BlockOutput::PublishAdmitted { admitted } if !admitted.as_proposer => {
                 assert!(
                     !ledger.retired.contains(&admitted.block_id),
                     "{BLOCK_REPLAY}: bpv1-46 retired block {:?} was admitted again",

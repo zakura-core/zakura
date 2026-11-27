@@ -3281,7 +3281,9 @@ fn fix2_raising_top_retires_out_of_window_blocks() {
         .any(|o| matches!(o, BlockOutput::VerifyCommitment { .. })));
     let mid = block::Hash([0xB3; 32]);
     admit_block(&mut table, t0, mid, parent_height, coding, [0x21; 32]);
-    assert_eq!(table.block_phase(&mid), Some(BlockPhase::Collecting));
+    // It sits at the verified tip's height, so it asks state for a committed
+    // body at once (bpv1-90).
+    assert_eq!(table.block_phase(&mid), Some(BlockPhase::Rebuilding));
 
     // The verified tip moving past the window retires the blocks below it.
     let step = table.step(
@@ -3528,8 +3530,9 @@ fn tip_rebuild(
 }
 
 /// bpv1-90: block sync commits a block BPv1 still collects. BPv1 pulls
-/// nothing while it rebuilds the parts from the committed body, drops a part
-/// that arrives meanwhile, then holds every part as `Done`. It serves a part
+/// nothing while it rebuilds the parts from the committed body, still stores
+/// a part an outstanding `Want` delivers meanwhile, then holds every part as
+/// `Done`. It serves a part
 /// it never received, sends `BlockDone`, and never submits the block.
 #[test]
 fn bpv1_90_a_committed_collecting_block_rebuilds_and_serves_every_part() {
@@ -3564,7 +3567,7 @@ fn bpv1_90_a_committed_collecting_block_rebuilds_and_serves_every_part() {
         &[pull_state(node_id(3))],
     );
     assert!(late.outputs.is_empty() && late.events.is_empty());
-    let dropped = insert(
+    let stored = insert(
         &mut table,
         t0,
         block_id,
@@ -3572,11 +3575,14 @@ fn bpv1_90_a_committed_collecting_block_rebuilds_and_serves_every_part() {
         node_id(2),
         PartAuth::Want(1),
     );
-    assert!(dropped.outputs.is_empty());
-    assert_eq!(
-        table.part_buffer_bytes(),
-        u64::from(encoded.coding.part_bytes)
-    );
+    assert!(stored.outputs.iter().any(|o| matches!(
+        o,
+        BlockOutput::PartReady { indices, .. } if *indices == [encoded.parts[1].index()]
+    )));
+    assert!(!stored
+        .outputs
+        .iter()
+        .any(|o| matches!(o, BlockOutput::GrantPull { .. })));
 
     let done = table.step(
         t0,
@@ -3603,8 +3609,8 @@ fn bpv1_90_a_committed_collecting_block_rebuilds_and_serves_every_part() {
         .collect();
     assert_eq!(
         ready,
-        (1..encoded.parts.len() as u32).collect::<Vec<_>>(),
-        "every part but the one received becomes servable"
+        (2..encoded.parts.len() as u32).collect::<Vec<_>>(),
+        "every part but the two received becomes servable"
     );
     assert!(done
         .outputs
@@ -3685,6 +3691,101 @@ fn bpv1_90_a_block_state_lacks_keeps_collecting_and_rebuilds_once() {
     assert_eq!(again, None);
     tick(&mut table, t0 + RECONSTRUCTION_DEADLINE, &[]);
     assert_eq!(table.block_phase(&block_id), Some(BlockPhase::Fallback));
+    table.assert_invariants();
+}
+
+/// bpv1-90, bpv1-41: a stripe decode that fails while the block rebuilds
+/// shows a bad encoding. The block falls back with its outcome recorded and
+/// retires, and the rebuild's late result changes nothing.
+#[test]
+fn bpv1_90_a_failed_stripe_decode_while_rebuilding_records_its_outcome() {
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let t0 = Instant::now();
+    let block_id = block::Hash([0x95; 32]);
+    let encoded = encode_body(&Profile::TINY, &[0x5E; 128], 2).unwrap();
+    let coding = encoded.coding;
+    admit(&mut table, t0, block_id, coding, encoded.part_root);
+    // `k` parts of stripe 0 without its first source part start a decode.
+    let mut decode = None;
+    for slot in 1..=coding.k {
+        let index = coding.wire_index(0, slot).unwrap();
+        let part = encoded.parts.iter().find(|p| p.index() == index).unwrap();
+        for o in insert(
+            &mut table,
+            t0,
+            block_id,
+            part,
+            node_id(2),
+            PartAuth::Want(1),
+        )
+        .outputs
+        {
+            if let BlockOutput::StartStripeJob {
+                work_id,
+                kind: StripeJob::Decode,
+                ..
+            } = o
+            {
+                decode = Some(work_id);
+            }
+        }
+    }
+    let decode = decode.expect("k parts with parity start a decode");
+    let (_, work) = tip_rebuild(&mut table, t0, 1, block_id, block_id);
+
+    let failed = table.step(
+        t0,
+        BlockInput::StripeJobDone {
+            work_id: decode,
+            block_id,
+            stripe: 0,
+            result: Err(()),
+        },
+    );
+    assert!(failed.events.contains(&BlockEvent::FallbackStarted {
+        block_id,
+        reason: FallbackReason::ReencodeFailed,
+    }));
+    assert!(failed.events.contains(&BlockEvent::Outcome {
+        block_id,
+        outcome: BlockOutcome::Fallback,
+    }));
+    assert_eq!(table.block_phase(&block_id), Some(BlockPhase::Retired));
+    let late = table.step(
+        t0,
+        BlockInput::Rebuilt {
+            work_id: work.unwrap(),
+            block_id,
+            result: RebuildResult::Parts(encoded.parts.clone()),
+        },
+    );
+    assert!(late.outputs.is_empty() && late.events.is_empty());
+    table.assert_invariants();
+}
+
+/// bpv1-90: block sync committed the height while the metadata was in
+/// admission, so no later tip move reaches the block. It starts its rebuild
+/// as it is admitted.
+#[test]
+fn bpv1_90_a_block_admitted_at_the_verified_tip_rebuilds_at_once() {
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let t0 = Instant::now();
+    let block_id = block::Hash([0x96; 32]);
+    let encoded = encode_body(&Profile::TINY, &[0x5F; 128], 2).unwrap();
+    table.step(
+        t0,
+        BlockInput::TipHeight {
+            height: 1,
+            hash: block_id,
+        },
+    );
+
+    let step = admit(&mut table, t0, block_id, encoded.coding, encoded.part_root);
+    assert!(step.outputs.iter().any(|o| matches!(
+        o,
+        BlockOutput::RebuildFromCommitted { block_id: id, .. } if *id == block_id
+    )));
+    assert_eq!(table.block_phase(&block_id), Some(BlockPhase::Rebuilding));
     table.assert_invariants();
 }
 

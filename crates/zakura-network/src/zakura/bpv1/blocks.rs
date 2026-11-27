@@ -161,7 +161,8 @@ pub enum BlockPhase {
     /// Assembled block handed to the consensus verifier.
     Verifying,
     /// Native block sync committed the block while it collected. IO rebuilds
-    /// its parts from the committed body; the block pulls nothing meanwhile
+    /// its parts from the committed body. The block pulls nothing meanwhile,
+    /// but still stores the parts its outstanding `Want`s deliver
     /// (`bpv1-90`).
     Rebuilding,
     /// Committed / completed.
@@ -2642,6 +2643,11 @@ impl BlockTable {
         // An empty body has no stripes, so the block assembles from
         // `HeaderMeta` alone and no part crosses the wire for it.
         self.maybe_assemble_and_verify(now, block_id, step);
+        // Block sync may have committed the height while the metadata was in
+        // admission, so no later tip move would start the rebuild (bpv1-90).
+        if self.rebuilds(&block_id) {
+            self.start_rebuild(block_id, step);
+        }
     }
 
     /// Closes every session that sent `entry`'s failed envelope with row 4,
@@ -3349,10 +3355,7 @@ impl BlockTable {
             let Some(charge) = block.part_charges.remove(&(index, from_peer, session_gen)) else {
                 return;
             };
-            if matches!(
-                block.phase,
-                BlockPhase::Retired | BlockPhase::Fallback | BlockPhase::Rebuilding
-            ) {
+            if matches!(block.phase, BlockPhase::Retired | BlockPhase::Fallback) {
                 return;
             }
             // Defense-in-depth check that the part was verified
@@ -3700,8 +3703,13 @@ impl BlockTable {
         let Some(block) = self.blocks.get_mut(&block_id) else {
             return;
         };
-        // bpv1-57: fallback starts at most once per block, and never after commit.
-        if !matches!(block.phase, BlockPhase::Collecting | BlockPhase::Verifying) {
+        // bpv1-57: fallback starts at most once per block, and never after a
+        // BPv1 commit. A rebuilding block falls back only when a stripe check
+        // fails, which retires it (bpv1-90).
+        if !matches!(
+            block.phase,
+            BlockPhase::Collecting | BlockPhase::Verifying | BlockPhase::Rebuilding
+        ) {
             return;
         }
         block.repair_round = 0;
@@ -3743,39 +3751,51 @@ impl BlockTable {
     fn rebuild_committed(&mut self, step: &mut BlockStep) {
         let committed: Vec<block::Hash> = self
             .blocks
-            .values()
-            .filter(|b| {
-                b.phase == BlockPhase::Collecting && !b.rebuild_tried && b.height <= self.verified
-            })
-            .map(|b| b.meta.block_id)
+            .keys()
+            .copied()
+            .filter(|block_id| self.rebuilds(block_id))
             .collect();
         for block_id in committed {
-            let work_id = alloc_work_id(&mut self.next_work_id);
-            let block = self
-                .blocks
-                .get_mut(&block_id)
-                .expect("the block exists because the scan just found it");
-            block.phase = BlockPhase::Rebuilding;
-            block.rebuild_work_id = Some(work_id);
-            block.rebuild_tried = true;
-            // Outstanding `Want`s stay live; the parts they deliver are dropped.
-            for st in &mut block.stripes {
-                st.claims.clear();
-                st.incoming.clear();
-            }
-            if std::mem::take(&mut block.body_claimed) {
-                step.outputs.push(BlockOutput::ReleaseBodyClaim {
-                    block_id,
-                    reason: ClaimRelease::Committed,
-                });
-            }
-            step.outputs.push(BlockOutput::RebuildFromCommitted {
-                work_id,
+            self.start_rebuild(block_id, step);
+        }
+    }
+
+    /// Whether `block_id` is a collecting block at or below the verified tip
+    /// that has not tried a rebuild yet (`bpv1-90`).
+    fn rebuilds(&self, block_id: &block::Hash) -> bool {
+        self.blocks.get(block_id).is_some_and(|b| {
+            b.phase == BlockPhase::Collecting && !b.rebuild_tried && b.height <= self.verified
+        })
+    }
+
+    /// Moves `block_id` to `Rebuilding` and asks IO for its committed body
+    /// (`bpv1-90`). The caller checks [`Self::rebuilds`].
+    fn start_rebuild(&mut self, block_id: block::Hash, step: &mut BlockStep) {
+        let work_id = alloc_work_id(&mut self.next_work_id);
+        let Some(block) = self.blocks.get_mut(&block_id) else {
+            return;
+        };
+        block.phase = BlockPhase::Rebuilding;
+        block.rebuild_work_id = Some(work_id);
+        block.rebuild_tried = true;
+        // Outstanding `Want`s stay live, and the parts they deliver are
+        // still stored, so a missing body loses none of them.
+        for st in &mut block.stripes {
+            st.claims.clear();
+            st.incoming.clear();
+        }
+        if std::mem::take(&mut block.body_claimed) {
+            step.outputs.push(BlockOutput::ReleaseBodyClaim {
                 block_id,
-                coding: block.meta.coding,
-                part_root: block.meta.part_root,
+                reason: ClaimRelease::Committed,
             });
         }
+        step.outputs.push(BlockOutput::RebuildFromCommitted {
+            work_id,
+            block_id,
+            coding: block.meta.coding,
+            part_root: block.meta.part_root,
+        });
     }
 
     /// Applies a rebuild's result (`bpv1-90`).

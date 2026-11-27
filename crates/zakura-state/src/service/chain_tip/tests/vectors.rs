@@ -129,10 +129,9 @@ fn late_broadcast_completion_does_not_rewind_the_tip_cursor() {
 
 /// The mempool must revalidate what it holds when the post-quantum rules begin to apply.
 ///
-/// A script in their namespace can hide inside a pay-to-script-hash redeem script, which the
-/// legacy rules accept and these rules refuse, so a spend the mempool took before the height
-/// is invalid from it on with nothing about the transaction changed. Only a reset drops it;
-/// growing the pool keeps it and still offers it to mining.
+/// From that height a payment to the namespace is validated differently, so the pool is
+/// checked again under the new rules rather than carried across, as at every rule change.
+/// Growing the pool would carry it across.
 #[test]
 fn post_quantum_activation_resets_the_chain_tip() {
     // The chain reaches the activation height by growing onto the block below it, so the tip

@@ -1796,10 +1796,10 @@ impl Network {
     /// Returns whether `height` is the first height at which the post-quantum transparent
     /// output rules apply.
     ///
-    /// This is a boundary at which the mempool must revalidate what it holds. A script in the
-    /// post-quantum namespace can be hidden inside a pay-to-script-hash redeem script, which
-    /// the rules refuse once they apply, so a spend that was valid when it was accepted is
-    /// invalid from this height on, without anything about the transaction changing.
+    /// The mempool clears what it holds at this height, as it does at every rule change, so
+    /// nothing admitted under the earlier rules reaches a block template without being checked
+    /// again under the new ones. Relay policy already keeps the namespace out of the pool before
+    /// this height, so the reset is a second line of defence rather than the only one.
     pub fn is_pq_activation_height(&self, height: Height) -> bool {
         self.pq_activation_height() == Some(height)
     }

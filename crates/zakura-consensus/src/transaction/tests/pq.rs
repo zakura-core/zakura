@@ -369,8 +369,7 @@ async fn a_pq_output_is_claimable_before_activation_and_refused_after() {
     // The output is three pushes, so the legacy rules leave its commitment on the stack as a
     // non-zero value: before activation an empty input claims it, which is why a node that
     // has activated these rules must refuse to run one under the legacy interpreter. This is
-    // the whole argument for the dedicated output, and it was not testable while the format
-    // hid inside a pay-to-script-hash redeem script.
+    // what the namespace refusal exists to close.
     let mut spend = SPEND.clone();
     *spend.input_mut() = Script::new(&[]);
 

@@ -1142,10 +1142,10 @@ async fn pq_spend_test(scenario: PqSpendScenario) -> Result<()> {
         );
     }
     // A namespace script can also hide inside a pay-to-script-hash redeem script, where
-    // neither the output nor relay policy can see it, and where the legacy rules run it and
-    // accept the spend that reveals it. Admitted here, it is invalid from the activation
-    // height on with nothing about it changed, so the pool has to let it go when the chain
-    // reaches that boundary, and mining must not be offered it.
+    // neither the output nor relay policy can see it. The post-quantum rules refuse a
+    // namespace script only as the output itself, so the legacy rules keep running it there,
+    // before activation and after: turning the rules on must not freeze a pay-to-script-hash
+    // output whose hidden script happens to have this shape.
     let wrapped_entry = &fixture[9];
     let mut wrapped = transaction(
         OutPoint {
@@ -1183,30 +1183,24 @@ async fn pq_spend_test(scenario: PqSpendScenario) -> Result<()> {
         Height(activation.0 - 1),
         "admission checks the next block height"
     );
+    // The pool is cleared at the boundary, as at every rule change, and the same spend is
+    // still valid under the rules from the activation height on.
     let pool: Vec<String> = client
         .json_result_from_call("getrawmempool", "[]")
         .await
         .map_err(|e| eyre!(e))?;
     assert!(
         !pool.contains(&wrapped.hash().to_string()),
-        "the pool lets go of a spend the new rules refuse: {pool:?}"
+        "the pool is cleared when the new rules begin to apply: {pool:?}"
     );
-    let offered: BlockTemplateResponse = client
-        .json_result_from_call("getblocktemplate", "[]")
-        .await
-        .map_err(|e| eyre!(e))?;
-    let offered = proposal_block_from_template(&offered, BlockTemplateTimeSource::default(), &net)?;
-    assert!(
-        !offered
-            .transactions
-            .iter()
-            .any(|tx| tx.hash() == wrapped.hash()),
-        "and mining is not offered it either"
-    );
-    assert!(
-        client.send_raw_transaction(&wrapped).await.is_err(),
-        "nor can it be accepted again"
-    );
+    zakura_script::CachedFfiTransaction::new_for_network(
+        Arc::new(wrapped.clone()),
+        Arc::new(vec![Output::new(funded_value, wrapped_entry.lock_script())]),
+        &net,
+        activation,
+    )?
+    .is_valid(0)
+    .wrap_err("a wrapped namespace script stays spendable after activation")?;
     // A valid fifteen-signature spend is accepted by consensus and refused by relay, which
     // caps how large a transaction it will forward.
     let oversized_entry = &fixture[8];

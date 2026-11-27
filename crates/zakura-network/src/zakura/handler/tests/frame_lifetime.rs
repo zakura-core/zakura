@@ -686,6 +686,62 @@ async fn cancelling_the_connection_ends_a_stalled_response_write() -> Result<(),
     Ok(())
 }
 
+/// A response whose tail fits the stream's write-ahead keeps its output grant
+/// until QUIC takes the tail. A peer that stops reading then can't pin uncharged
+/// response bytes in the connection task on each of its streams.
+#[tokio::test]
+async fn a_response_tail_waiting_on_credit_keeps_its_output_grant() -> Result<(), BoxError> {
+    const SLOW: Stream = test_stream(912, StreamMode::RequestResponse);
+    const OTHER: Stream = test_stream(913, StreamMode::RequestResponse);
+    // 70 frames of 1,008 bytes pass the peer's 64 KiB stream window by about
+    // 5 KiB, less than the stream's write-ahead, so no write waits.
+    const RESPONSE_FRAMES: usize = 70;
+    let peer = LocalEndpointFactory::new().quic_config(QuicConfig {
+        stream_receive_window_bytes: 64 * 1024,
+        receive_window_bytes: Some(128 * 1024),
+        ..QuicConfig::default()
+    });
+    let mut link = Link::connect_with(peer).await?;
+    let connection = connection_gates(&[SLOW, OTHER], 1 << 20, 1 << 20);
+    let registry = Arc::new(ServiceRegistry::new(vec![Arc::new(AnsweringRequests {
+        streams: [SLOW, OTHER],
+        frames: RESPONSE_FRAMES,
+    })])?);
+    let response_bytes = u64::try_from(RESPONSE_FRAMES)? * response_frame_bytes(1000);
+    let output = OutputByteBudget::new(1 << 20)?;
+    let (_peer_send, mut peer_recv, worker) = spawn_request(
+        &mut link,
+        &connection,
+        &registry,
+        prelude_of(SLOW.kind, Some(1)),
+        Some(FrameGate::over(output.clone())),
+    )
+    .await?;
+    timeout(TEST_TIMEOUT, async {
+        while output.granted() != response_bytes && !worker.is_finished() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await?;
+    tokio::time::sleep(HELD).await;
+    assert!(
+        !worker.is_finished(),
+        "the worker waits for QUIC to take the tail before it returns the grant"
+    );
+    assert_eq!(
+        output.granted(),
+        response_bytes,
+        "the waiting tail stays charged"
+    );
+
+    let answer = timeout(TEST_TIMEOUT, peer_recv.read_to_end(usize::MAX)).await??;
+    assert_eq!(answer.len(), RESPONSE_FRAMES * 1008);
+    timeout(TEST_TIMEOUT, worker).await??;
+    assert_eq!(output.granted(), 0);
+    link.close().await;
+    Ok(())
+}
+
 /// A legacy request service that counts its calls, waits for the test's release, and
 /// answers with `answer`. It rejects a frame that fails legacy request decoding as a
 /// protocol fault on the call's first poll, as `LegacyGossipSink` does.

@@ -7776,6 +7776,18 @@ async fn request_stream_worker(
         }
     }
 
+    // The last writes can return while their bytes still wait for the peer's
+    // credit, so `output` keeps funding them until QUIC takes them.
+    let flushed = zakura_rt::select! {
+        biased;
+        _ = context.connection_token.cancelled() => return,
+        flushed = timeout(OUTBOUND_STREAM_WRITE_TIMEOUT, send.flush()) => flushed,
+    };
+    if !matches!(flushed, Ok(Ok(()))) {
+        debug!(?flushed, "failed to flush Zakura request response");
+        let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
+        return;
+    }
     let _ = send.finish();
 }
 

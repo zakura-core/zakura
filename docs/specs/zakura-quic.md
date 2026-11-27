@@ -481,7 +481,9 @@ The driver follows the P2P stack's routine and reactor pattern. No lock guards a
     over: a blocked call's whole chunk waits at the task until the peer's
     flow control takes it. A peer that stops reading therefore pins each
     blocked writer's chunk plus 64 KiB per stream, so the application bounds
-    chunk size and concurrent writers (V12 F-70).
+    chunk size and concurrent writers (V12 F-70). `flush` waits until
+    `quinn-proto` holds every write, so an application that funds written
+    bytes keeps the funding until then.
     Without write-ahead, each write cost a round trip to the
     connection task and its own packet.
 - **DRV-5.** Cancelling a read or write future MUST NOT lose or reorder stream
@@ -1211,8 +1213,8 @@ The public surface of `zakura-quic`. Changing it is a semver change of the crate
 - **API-5.** Streams are `zakura-quic`'s own `SendStream` and `RecvStream`
   (DRV-4, DRV-5). A `SendStream` write may return before `quinn-proto` accepts
   its data, so a write error can belong to an earlier write (DRV-4):
-  - `SendStream`: `write_all`, `write_chunk` (no copy), `set_priority`,
-    `finish`, `reset` and `stopped`. `set_priority` maps to `quinn-proto`'s
+  - `SendStream`: `write_all`, `write_chunk` (no copy), `flush`,
+    `set_priority`, `finish`, `reset` and `stopped`. `set_priority` maps to `quinn-proto`'s
     stream priority (higher first) and is ordered with the stream's writes.
     `stopped` returns a future that doesn't borrow the handle. It resolves
     with the peer's STOP_SENDING code (DRV-9), or with the close reason once

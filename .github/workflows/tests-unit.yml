@@ -578,7 +578,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      CARGO_TARGET_DIR: target/sim-check
+      CARGO_TARGET_DIR: target/sim
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
@@ -586,9 +586,9 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 #v2.0.1
         with:
           toolchain: stable
-          cache-shared-key: zakura-sim-check
-          cache-on-failure: true
-          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+          # Read the nightly sim-build cache, which only sim-build writes.
+          cache-shared-key: zakura-sim
+          cache-save-if: false
       - name: Check the simulator build
         run: |
           cargo check --locked -p zakura-rt -p zakura-scheduler -p zakura-sim -p zakura-storage -p zakura-quic --all-targets

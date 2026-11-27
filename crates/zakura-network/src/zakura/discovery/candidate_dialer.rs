@@ -557,7 +557,9 @@ async fn admit_dial_round(
 struct OrdinaryDialRoutes<'a> {
     supervisor: crate::zakura::ZakuraSupervisorHandle,
     held: &'a crate::zakura::HeldPlaces,
-    seeds: &'a HashSet<NodeId>,
+    /// The seeds' configured IDs and the IDs dials to them answered with.
+    /// A moved seed's own record names it by the second.
+    seeds: HashSet<NodeId>,
     moved: watch::Receiver<crate::zakura::transport::MovedNodeIds>,
     unavailable: HashSet<NodeId>,
 }
@@ -566,13 +568,17 @@ impl<'a> OrdinaryDialRoutes<'a> {
     fn new(
         supervisor: crate::zakura::ZakuraSupervisorHandle,
         held: &'a crate::zakura::HeldPlaces,
-        seeds: &'a HashSet<NodeId>,
+        seeds: &HashSet<NodeId>,
         in_flight: &[NodeId],
     ) -> Self {
         let moved = supervisor.moved_node_ids();
         let unavailable = in_flight
             .iter()
             .map(|id| moved.borrow().current(*id))
+            .collect();
+        let seeds = seeds
+            .iter()
+            .flat_map(|id| [*id, moved.borrow().current(*id)])
             .collect();
         Self {
             supervisor,

@@ -1539,7 +1539,8 @@ async fn honest_candidates_fill_the_round_when_the_best_share_a_full_ip() {
 }
 
 /// The round leaves seeds to the bootstrap dialer, even when the book ranks
-/// them first.
+/// them first, and also skips a seed under the ID a dial to its configured
+/// one answered with, as its own record names it.
 #[tokio::test]
 async fn the_round_never_dials_seeds() {
     let node = crate::zakura::testkit::ZakuraTestNode::builder(9216)
@@ -1554,8 +1555,12 @@ async fn the_round_never_dials_seeds() {
             .collect(),
     )
     .await;
+    // The second seed is configured under an ID it had before it added keys,
+    // and a dial to that ID found it under the ID its book entry has.
+    let configured = node_id(9);
+    node.supervisor().learn_move(configured, ranked[1]);
     node.endpoint()
-        .set_seed_ids(ranked[..2].iter().copied().collect());
+        .set_seed_ids([ranked[0], configured].into_iter().collect());
 
     let mut state = CandidateDialerState::new(DIAL_BACKOFF);
     let admitted = admit_dial_round(

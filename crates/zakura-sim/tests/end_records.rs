@@ -63,7 +63,9 @@ fn the_hook_writes_one_record_per_run_and_nothing_when_unset() {
             .iter()
             .find(|report| report["property"] == WAIT_COMPLETE_WAKES)
             .unwrap();
-        assert_eq!(report["outcome"]["held"]["applicable"], 1);
+        // The listening node rests on its exchange budget after the wake,
+        // then again once it closes, and the property judges each rest.
+        assert_eq!(report["outcome"]["held"]["applicable"], 2);
         assert!(record["source"].is_string());
     }
 

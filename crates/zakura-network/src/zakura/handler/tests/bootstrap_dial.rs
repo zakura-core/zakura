@@ -62,8 +62,8 @@ async fn a_bootstrap_dial_closes_when_its_token_is_cancelled() {
 }
 
 /// A seed that moved to a new address is still reached when its configured
-/// address is stale: the bootstrap dialer also dials the address the seed's
-/// signed record advertises. Only that dialer dials seeds, so without it the
+/// address is stale: after the dial there fails, the bootstrap dialer dials
+/// the address the seed's signed record advertises. Only that dialer dials seeds, so without it the
 /// node could never reach the seed again.
 #[tokio::test]
 async fn a_seed_is_dialed_at_its_record_address_too() {

@@ -153,6 +153,10 @@ struct Seed {
     /// This node closed the seed's connection, so the dial's result says
     /// nothing about the seed.
     released: bool,
+    /// The next dial uses the addresses the seed's signed records advertise
+    /// instead of the configured ones. Each failed dial switches sets, so
+    /// neither set can crowd the other out.
+    records_next: bool,
 }
 
 /// Which seeds this dialer dials, and how their dials ended.
@@ -179,6 +183,7 @@ impl BootstrapPlan {
                 retry_at: now,
                 connection: None,
                 released: false,
+                records_next: false,
             })
             .collect();
         Self {
@@ -199,7 +204,8 @@ impl BootstrapPlan {
     }
 
     /// Returns the seeds to dial at `now`, given this node's `coverage` and
-    /// whether each seed is `registered` now, each with a new connection
+    /// whether each seed is `registered` now, each with whether to dial the
+    /// seed's record addresses ([`Seed::records_next`]) and a new connection
     /// token from `token`, and marks them dialing.
     ///
     /// Below [`BOOTSTRAP_DIAL_FLOOR`] hosts, it tops the seeds that are
@@ -212,7 +218,7 @@ impl BootstrapPlan {
         registered: impl Fn(usize) -> bool,
         now: Instant,
         mut token: impl FnMut() -> CancellationToken,
-    ) -> Vec<(usize, NodeAddr, CancellationToken)> {
+    ) -> Vec<(usize, NodeAddr, bool, CancellationToken)> {
         if self.seeds.is_empty() || (!self.mesh && coverage.excludes_seeds()) {
             return Vec::new();
         }
@@ -237,7 +243,7 @@ impl BootstrapPlan {
             let connection = token();
             seed.connection = Some(connection.clone());
             busy += 1;
-            started.push((index, seed.node_addr.clone(), connection));
+            started.push((index, seed.node_addr.clone(), seed.records_next, connection));
         }
         if let Some((last, ..)) = started.last() {
             self.next = (last + 1) % self.seeds.len();
@@ -283,7 +289,8 @@ impl BootstrapPlan {
     /// A connection this node closed, or one that stayed up for
     /// [`ZAKURA_REDIAL_HEALTHY_CONNECTION`], leaves the seed dialable at
     /// once. A failure waits out a backoff that doubles up to
-    /// [`DEFAULT_ZAKURA_REDIAL_MAX_BACKOFF`].
+    /// [`DEFAULT_ZAKURA_REDIAL_MAX_BACKOFF`], and the next dial tries the
+    /// other address set.
     pub(super) fn finished(&mut self, index: usize, result: DialResult, now: Instant) {
         let seed = &mut self.seeds[index];
         seed.connection = None;
@@ -302,6 +309,7 @@ impl BootstrapPlan {
             DialResult::AlpnMismatch => seed.backoff.max(ZAKURA_ALPN_MISMATCH_BACKOFF),
         };
         if matches!(result, DialResult::Failed | DialResult::AlpnMismatch) {
+            seed.records_next = !seed.records_next;
             seed.backoff = seed
                 .backoff
                 .saturating_mul(2)
@@ -369,16 +377,15 @@ pub(super) async fn run_bootstrap_dialer(
             metrics::counter!("zakura.p2p.bootstrap.released").increment(closed as u64);
         }
         let registered = |index: usize| ids[index].iter().any(|id| supervisor.is_registered(id));
-        for (index, node_addr, connection) in
+        for (index, node_addr, records, connection) in
             plan.dials(coverage, registered, now, || endpoint.connection_token())
         {
             metrics::counter!("zakura.p2p.bootstrap.dial.started").increment(1);
             let current = moved.borrow().current(node_addr.id);
             dials.push(seed_dial(
                 endpoint.clone(),
-                discovery.clone(),
+                records.then(|| (discovery.clone(), current)),
                 node_addr,
-                current,
                 limits.clone(),
                 connection,
                 index,
@@ -419,31 +426,34 @@ pub(super) async fn run_bootstrap_dialer(
 /// Dials and serves seed `index` under `connection` in a task of its own, and
 /// returns how the dial ended.
 ///
-/// It dials the configured `node_addr`, then the addresses the seed's signed
-/// records advertise under its configured and `current` IDs, so a seed that
-/// moved to a new address stays reachable. Only this dialer dials seeds. The
-/// record's addresses fill only the dial reserve that startup checked the
-/// configured ones against, because a dial claims a slot for every attempt
-/// at once (zakura-quic ADM-12).
+/// It dials the configured `node_addr`, or with `records` (the discovery
+/// handle and the seed's current ID), the addresses the seed's signed records
+/// in the book advertise under its current and configured IDs, so a seed
+/// that moved to a new address stays reachable.
+/// Only this dialer dials seeds. Record addresses fill only the dial reserve
+/// that startup checked the configured ones against, because a dial claims a
+/// slot for every attempt at once (zakura-quic ADM-12), and a seed with no
+/// usable record is dialed at its configured addresses.
 async fn seed_dial(
     endpoint: ZakuraEndpoint,
-    discovery: ZakuraDiscoveryHandle,
+    records: Option<(ZakuraDiscoveryHandle, NodeId)>,
     mut node_addr: NodeAddr,
-    current: NodeId,
     limits: ZakuraLocalLimits,
     connection: CancellationToken,
     index: usize,
 ) -> (usize, DialResult) {
     let task = AbortOnDropHandle::new(spawn_erased_named("bootstrap_dial", async move {
-        let reserve = limits.quic_bind_config(Vec::new()).dial_reserve;
-        for addr in discovery.record_addrs(&[node_addr.id, current]).await {
-            if node_addr.direct.contains(&addr) {
-                continue;
+        if let Some((discovery, current)) = records {
+            let mut record = NodeAddr {
+                id: node_addr.id,
+                direct: discovery.record_addrs(&[current, node_addr.id]).await,
+            };
+            let reserve = limits.quic_bind_config(Vec::new()).dial_reserve;
+            while endpoint.dial_attempt_count(&record) > reserve {
+                record.direct.pop();
             }
-            node_addr.direct.push(addr);
-            if endpoint.dial_attempt_count(&node_addr) > reserve {
-                node_addr.direct.pop();
-                break;
+            if !record.direct.is_empty() {
+                node_addr = record;
             }
         }
         let (registration, registered) = oneshot::channel();

@@ -42,7 +42,7 @@ fn dial(
 ) -> Vec<(usize, CancellationToken)> {
     plan.dials(coverage, registered, now, CancellationToken::new)
         .into_iter()
-        .map(|(index, _, token)| (index, token))
+        .map(|(index, _, _, token)| (index, token))
         .collect()
 }
 
@@ -211,4 +211,35 @@ fn a_seed_node_keeps_every_other_seed() {
         indexes(&dial(&mut plan, coverage(9, 9), |index| index == 1, later)),
         [2]
     );
+}
+
+/// A failed dial switches the seed between its configured addresses and its
+/// record's, so a stale set can't keep the other out. A connection keeps the
+/// set that reached the seed.
+#[test]
+fn a_failed_dial_switches_address_sets() {
+    let now = Instant::now();
+    let mut plan = BootstrapPlan::new(seeds(1), false, now);
+    let records_next = |plan: &mut BootstrapPlan, now| {
+        let [(_, _, records, _)]: [_; 1] = plan
+            .dials(coverage(0, 0), |_| false, now, CancellationToken::new)
+            .try_into()
+            .expect("the one seed is dialed");
+        records
+    };
+
+    assert!(
+        !records_next(&mut plan, now),
+        "the first dial is configured"
+    );
+    plan.finished(0, DialResult::Failed, now);
+    let later = now + DEFAULT_ZAKURA_REDIAL_MAX_BACKOFF;
+    assert!(records_next(&mut plan, later), "then the record's");
+    plan.finished(0, DialResult::Healthy, later);
+    assert!(records_next(&mut plan, later), "a healthy set stays");
+    plan.finished(0, DialResult::Failed, later);
+    assert!(!records_next(
+        &mut plan,
+        later + DEFAULT_ZAKURA_REDIAL_MAX_BACKOFF
+    ));
 }

@@ -98,10 +98,13 @@ fn sprout_joinsplits_are_rejected_before_eviction_and_cached() {
     let incumbent = factory.tx(10_000);
     let incumbent_id = incumbent.transaction.id();
     let incumbent_cost = incumbent.cost();
-    let mut storage = Storage::new(&config::Config {
-        tx_cost_limit: incumbent_cost,
-        ..Default::default()
-    });
+    let mut storage = Storage::new(
+        &config::Config {
+            tx_cost_limit: incumbent_cost,
+            ..Default::default()
+        },
+        &zakura_chain::parameters::Network::Mainnet,
+    );
     storage.insert(incumbent, Vec::new(), None).unwrap();
     let sprout = Network::Mainnet
         .unmined_transactions_in_blocks(..)

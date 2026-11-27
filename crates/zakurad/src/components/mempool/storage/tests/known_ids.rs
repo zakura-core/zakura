@@ -20,7 +20,10 @@ fn with_expiry(mut tx: VerifiedUnminedTx, height: Height) -> VerifiedUnminedTx {
 #[test]
 fn expiry_tracks_boundaries_removal_and_clear() {
     let mut factory = TxFactory::new();
-    let mut storage = Storage::new(&Config::default());
+    let mut storage = Storage::new(
+        &Config::default(),
+        &zakura_chain::parameters::Network::Mainnet,
+    );
     let removed_early = with_expiry(factory.tx(10_000), Height(10));
     let due = with_expiry(factory.tx(10_000), Height(10));
     let future = with_expiry(factory.tx(10_000), Height(11));
@@ -54,7 +57,10 @@ fn expiry_tracks_boundaries_removal_and_clear() {
 #[test]
 fn expiry_removes_later_expiring_descendants_from_the_index() {
     let mut factory = TxFactory::new();
-    let mut storage = Storage::new(&Config::default());
+    let mut storage = Storage::new(
+        &Config::default(),
+        &zakura_chain::parameters::Network::Mainnet,
+    );
     let parent = with_expiry(factory.tx_with(10_000, 1, 0), Height(10));
     let child = with_expiry(factory.tx(10_000), Height(20));
     let parent_id = parent.transaction.id();
@@ -149,7 +155,10 @@ fn mined_parent_keeps_unmined_child_and_ignores_unknown_mined_ids() {
 #[test]
 fn mining_parent_and_child_preserves_the_unmined_grandchild() {
     let mut factory = TxFactory::new();
-    let mut storage = Storage::new(&Config::default());
+    let mut storage = Storage::new(
+        &Config::default(),
+        &zakura_chain::parameters::Network::Mainnet,
+    );
     let parent = factory.tx_with(10_000, 1, 0);
     let child = factory.tx_with(10_000, 1, 0);
     let grandchild = factory.tx(10_000);
@@ -190,7 +199,10 @@ fn mining_parent_and_child_preserves_the_unmined_grandchild() {
 #[test]
 fn batch_removal_deduplicates_overlapping_roots_and_keeps_unrelated_transactions() {
     let mut factory = TxFactory::new();
-    let mut storage = Storage::new(&Config::default());
+    let mut storage = Storage::new(
+        &Config::default(),
+        &zakura_chain::parameters::Network::Mainnet,
+    );
     let parent = factory.tx_with(10_000, 1, 0);
     let child = factory.tx_with(10_000, 1, 0);
     let grandchild = factory.tx(10_000);

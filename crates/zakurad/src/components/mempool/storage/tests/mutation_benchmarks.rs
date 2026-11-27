@@ -25,10 +25,14 @@ struct Fixture {
 
 impl Fixture {
     fn new(factory: &mut TxFactory, count: usize, ancestors: usize) -> Self {
-        let mut storage = Storage::new(&Config {
-            tx_cost_limit: (u64::try_from(count).unwrap() + 1) * MEMPOOL_TRANSACTION_COST_THRESHOLD,
-            ..Default::default()
-        });
+        let mut storage = Storage::new(
+            &Config {
+                tx_cost_limit: (u64::try_from(count).unwrap() + 1)
+                    * MEMPOOL_TRANSACTION_COST_THRESHOLD,
+                ..Default::default()
+            },
+            &zakura_chain::parameters::Network::Mainnet,
+        );
         for index in 0..count - ancestors - 1 {
             let fee = [10_000, 20_000, 50_000][index % 3];
             storage.insert(factory.tx(fee), Vec::new(), None).unwrap();
@@ -217,12 +221,15 @@ fn benchmark_mempool_full_block_deletion() {
         assert!(members.len() <= count);
         let block_cost: u64 = members.iter().map(VerifiedUnminedTx::cost).sum();
         let background_count = count - members.len();
-        let mut storage = Storage::new(&Config {
-            tx_cost_limit: u64::try_from(background_count).unwrap()
-                * MEMPOOL_TRANSACTION_COST_THRESHOLD
-                + block_cost,
-            ..Default::default()
-        });
+        let mut storage = Storage::new(
+            &Config {
+                tx_cost_limit: u64::try_from(background_count).unwrap()
+                    * MEMPOOL_TRANSACTION_COST_THRESHOLD
+                    + block_cost,
+                ..Default::default()
+            },
+            &zakura_chain::parameters::Network::Mainnet,
+        );
         for _ in 0..background_count {
             storage
                 .insert(factory.tx(10_000), Vec::new(), None)

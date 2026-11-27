@@ -342,7 +342,7 @@ proptest! {
         let mut storage = Storage::new(&Config {
             tx_cost_limit: 160_000_000,
             ..Default::default()
-        });
+        }, &zakura_chain::parameters::Network::Mainnet);
 
         storage.insert(first.clone(), Vec::new(), None).unwrap();
         prop_assert_eq!(storage.remove_exact(&HashSet::from([first_id])), 1);

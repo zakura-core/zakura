@@ -122,8 +122,10 @@ pub fn are_inputs_standard_with_pq(
 
         #[cfg(feature = "pq")]
         if pq_active {
-            if let Some(body) = authenticated_pq_body(unlock_script, &spent_output.lock_script) {
-                if body.sig_op_count(true) > MAX_P2SH_SIGOPS {
+            if let Some(sig_ops) =
+                authenticated_pq_sig_ops(unlock_script, &spent_output.lock_script)
+            {
+                if sig_ops > MAX_P2SH_SIGOPS {
                     return false;
                 }
                 continue;
@@ -205,17 +207,20 @@ pub fn are_inputs_standard_with_pq(
     true
 }
 
-/// The script a post-quantum output commits to, when this input reveals exactly that script.
+/// The most signature checks a post-quantum spend can run, when this input reveals exactly
+/// the script its output commits to: the checking opcodes in that script, or what the
+/// input's size pays for, whichever is fewer.
 ///
-/// Authentication happens before the body is used, so an input that names the wrong script
-/// gets no policy exemption from it.
+/// Authentication happens before the script is used, so an input that names the wrong
+/// script gets no policy exemption from it. The legacy counter must not be used on that
+/// script instead: it reads `OP_CHECKSIGADD` as an unknown opcode worth nothing.
 #[cfg(feature = "pq")]
-pub fn authenticated_pq_body(
+pub fn authenticated_pq_sig_ops(
     unlock: &transparent::Script,
     lock: &transparent::Script,
-) -> Option<script::Code> {
+) -> Option<u32> {
     let lock = script::Code(lock.as_raw_bytes().to_vec());
     let output = zcash_transparent::pq::output::parse_output(&lock).ok()??;
     let spend = output.authenticate_spend(unlock.as_raw_bytes()).ok()?;
-    Some(script::Code(spend.body().to_vec()))
+    Some(spend.sig_op_count())
 }

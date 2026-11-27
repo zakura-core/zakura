@@ -88,25 +88,47 @@ fn single_signer() -> Code {
     single_key::body(PARAMETERS, &KEY.public_key()).unwrap()
 }
 
-fn multisig(required: u8, keys: &[[u8; crypto::PUBLIC_KEY_BYTES]], verify: bool) -> Code {
-    let number = |value: u8| {
-        if value <= 16 {
-            vec![0x50 + value]
-        } else {
-            push(&[value])
-        }
-    };
-    let mut bytes = number(required);
-    for key in keys {
-        bytes.push(u8::try_from(crypto::PUBLIC_KEY_BYTES).unwrap());
-        bytes.extend(key);
+/// `<K1> CHECKSIG <K2> CHECKSIGADD ... <Kn> CHECKSIGADD <required> NUMEQUAL[VERIFY 1]`, the
+/// post-quantum shape of a k-of-n: every key has its own slot.
+fn threshold(required: u8, keys: &[[u8; crypto::PUBLIC_KEY_BYTES]], verify: bool) -> Code {
+    assert!((1..=16).contains(&required));
+    let mut bytes = Vec::new();
+    for (index, key) in keys.iter().enumerate() {
+        bytes.extend(push(key));
+        bytes.push(if index == 0 { 0xac } else { script_pq::OP_CHECKSIGADD });
     }
-    bytes.extend(number(u8::try_from(keys.len()).unwrap()));
-    bytes.push(if verify { 0xaf } else { 0xae });
+    bytes.push(0x50 + required);
     if verify {
-        bytes.push(0x51);
+        bytes.extend([0x9d, 0x51]); // NUMEQUALVERIFY 1
+    } else {
+        bytes.push(0x9c); // NUMEQUAL
     }
     Code(bytes)
+}
+
+/// The arguments [`threshold`] takes: a signature or an empty item for each key, the first
+/// key's on top of the stack.
+fn slots(signatures: &[Option<&Vec<u8>>]) -> Vec<Vec<u8>> {
+    signatures
+        .iter()
+        .rev()
+        .map(|signature| signature.cloned().unwrap_or_default())
+        .collect()
+}
+
+/// The script error a post-quantum spend fails with.
+fn script_error(error: &ScriptError) -> Option<&zcash_script::interpreter::Error> {
+    match error {
+        ScriptError::Pq(output::Error::Pq(script_pq::Error::Script(
+            zcash_script::script::Error::Interpreter(_, error),
+        ))) => Some(error),
+        _ => None,
+    }
+}
+
+/// Whether a spend failed because a non-empty signature did not verify, which ends it.
+fn is_null_fail(error: &ScriptError) -> bool {
+    script_error(error) == Some(&zcash_script::interpreter::Error::PqNullFail)
 }
 
 fn output_with(bytes: &[u8]) -> Output {
@@ -470,78 +492,101 @@ async fn an_output_no_rules_define_cannot_be_spent_either() {
 }
 
 #[tokio::test]
-async fn distinct_multisig_pairs_and_failed_matches_reach_transaction_validation() {
+async fn threshold_spends_reach_transaction_validation_with_one_check_per_signer() {
     let _guard = zakura_test::init();
     let bob = SigningKey::from_seed(&[8; crypto::SEED_BYTES]);
     let carol = SigningKey::from_seed(&[9; crypto::SEED_BYTES]);
     let keys = [&*KEY, &bob, &carol];
     for verify in [false, true] {
-        let body = multisig(2, &keys.map(SigningKey::public_key), verify);
+        let body = threshold(2, &keys.map(SigningKey::public_key), verify);
         let mut spend = Spend::unsigned(body, LockTime::unlocked());
         let signatures: Vec<_> = keys
             .iter()
             .map(|key| spend.signature(key, HashType::ALL, context()))
             .collect();
-        // Pair [0, 1] must first skip the non-signing key at the top of the stack.
         for pair in [[0, 1], [0, 2], [1, 2]] {
-            spend.install_arguments(&[
-                vec![],
-                signatures[pair[0]].clone(),
-                signatures[pair[1]].clone(),
-            ]);
+            let chosen: Vec<_> = (0..3)
+                .map(|index| pair.contains(&index).then(|| &signatures[index]))
+                .collect();
+            spend.install_arguments(&slots(&chosen));
             let response = verify_block(&spend, &network(Some(ACTIVATION)), Height(11))
                 .await
                 .unwrap();
             assert_eq!(response.tx_id(), spend.transaction.unmined_id());
             assert_eq!(
                 response.sigops(),
-                3,
-                "multisig accounting charges the keys, including missed matches"
+                2,
+                "a 2-of-3 is charged the two checks its input pays for, not its three keys"
             );
         }
         let mut forged = signatures[0].clone();
         forged[0] ^= 1;
-        for arguments in [
-            vec![vec![], signatures[2].clone(), signatures[0].clone()],
-            vec![vec![], forged, signatures[2].clone()],
+        for chosen in [
+            // Two signatures in each other's slots.
+            [Some(&signatures[2]), None, Some(&signatures[0])],
+            [Some(&forged), None, Some(&signatures[2])],
         ] {
-            spend.install_arguments(&arguments);
+            spend.install_arguments(&slots(&chosen));
             let error = verify_block(&spend, &network(Some(ACTIVATION)), Height(11))
                 .await
                 .unwrap_err();
-            if verify {
-                assert!(matches!(
-                    error,
-                    TransactionError::Script(ScriptError::Pq(output::Error::Pq(
-                        script_pq::Error::Script(zcash_script::script::Error::Interpreter(
-                            _,
-                            zcash_script::interpreter::Error::Verify
-                        ))
-                    )))
-                ));
-            } else {
-                assert!(matches!(
-                    error,
-                    TransactionError::Script(ScriptError::ScriptInvalid)
-                ));
-            }
+            assert!(
+                matches!(&error, TransactionError::Script(error) if is_null_fail(error)),
+                "{error:?}"
+            );
         }
     }
 }
 
 #[tokio::test]
-async fn twenty_signature_capacity_survives_node_parsing_and_sigop_accounting() {
+async fn copied_signatures_and_multisig_are_refused_by_transaction_validation() {
     let _guard = zakura_test::init();
-    // Duplicate keys are legal in legacy Script. This is a transport and capacity fixture;
-    // the separate distinct-key test establishes signer matching.
+    // DUP, then CHECKSIGVERIFY and CHECKSIG: one signature checked twice.
+    let mut copied = vec![0x76];
+    let mut twice = single_signer();
+    *twice.0.last_mut().unwrap() = 0xad; // CHECKSIGVERIFY
+    copied.extend(twice.0);
+    copied.extend(single_signer().0);
+    let spend = Spend::signed(Code(copied), HashType::ALL, context(), 1);
+    let error = verify_block(&spend, &network(Some(ACTIVATION)), Height(11))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, TransactionError::Script(error)
+            if script_error(error) == Some(&zcash_script::interpreter::Error::PqCheckBudget)),
+        "{error:?}"
+    );
+    // A single signer with a multisig in a branch that never runs: 0 IF CHECKMULTISIG ENDIF.
+    let mut body = single_signer();
+    body.0.extend([0x00, 0x63, 0xae, 0x68]);
+    let spend = Spend::signed(body, HashType::ALL, context(), 1);
+    let error = verify_block(&spend, &network(Some(ACTIVATION)), Height(11))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, TransactionError::Script(error)
+            if script_error(error) == Some(&zcash_script::interpreter::Error::PqMultisig)),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn more_signers_than_multisig_allowed_survive_node_parsing_and_sigop_accounting() {
+    let _guard = zakura_test::init();
+    // Past CHECKMULTISIG's twenty keys. Duplicate keys are legal in Script; this is a
+    // transport and capacity fixture, and the distinct-key test establishes signer matching.
+    let signers = 25;
     let mut spend = Spend::unsigned(
-        multisig(20, &[KEY.public_key(); 20], false),
+        threshold(16, &vec![KEY.public_key(); signers], false),
         LockTime::unlocked(),
     );
     let signature = spend.signature(&KEY, HashType::ALL, context());
-    let mut arguments = vec![vec![]];
-    arguments.extend(vec![signature; 20]);
-    spend.install_arguments(&arguments);
+    // Sixteen of the twenty-five sign; the rest decline with an empty item.
+    let chosen: Vec<_> = (0..signers)
+        .map(|index| (index % 3 != 2 && index < 24).then_some(&signature))
+        .collect();
+    assert_eq!(chosen.iter().flatten().count(), 16);
+    spend.install_arguments(&slots(&chosen));
     let input_bytes = spend.input_mut().as_raw_bytes().len();
     assert!(input_bytes > 32 * 1024);
     assert!(input_bytes <= script_pq::MAX_INPUT_BYTES);
@@ -549,7 +594,7 @@ async fn twenty_signature_capacity_survives_node_parsing_and_sigop_accounting() 
         .await
         .unwrap();
     assert_eq!(response.tx_id(), spend.transaction.unmined_id());
-    assert_eq!(response.sigops(), 20);
+    assert_eq!(response.sigops(), 16);
     assert!(matches!(
         check::mempool_standard_input_scripts(&spend.transaction, &spend.previous_outputs),
         Err(TransactionError::NonStandardScriptSigSize {
@@ -729,7 +774,7 @@ async fn real_previous_outputs_and_transaction_fields_are_bound() {
     });
     assert!(matches!(
         verify_block(&changed, &upgraded_network, Height(11)).await,
-        Err(TransactionError::Script(ScriptError::ScriptInvalid))
+        Err(TransactionError::Script(error)) if is_null_fail(&error)
     ));
 }
 
@@ -756,7 +801,9 @@ async fn existing_signing_modes_use_the_node_digest() {
             if let Transaction::V5 { outputs, .. } = &mut changed.transaction {
                 outputs.pop();
             }
-            assert_eq!(changed.check(), Err(ScriptError::ScriptInvalid));
+            // No digest exists for a SINGLE signature without its output, which a
+            // non-empty signature turns into a failed spend rather than a false result.
+            assert!(is_null_fail(&changed.check().unwrap_err()));
         }
     }
 }
@@ -775,7 +822,7 @@ fn the_commitment_and_the_input_bounds_are_enforced() {
     // Moving the commitment to match it makes the input authentic again, and then the
     // signature, which was made over the original body, is what fails.
     changed.previous_outputs[PQ_INPUT] = pq_output(&body);
-    assert_eq!(changed.check(), Err(ScriptError::ScriptInvalid));
+    assert!(is_null_fail(&changed.check().unwrap_err()));
 
     let mut changed = SPEND.clone();
     *changed.input_mut() = Script::new(&vec![0; script_pq::MAX_INPUT_BYTES + 1]);
@@ -802,7 +849,7 @@ fn the_signing_context_binds_the_network_the_scheme_and_the_protocol() {
         output::signing_context(NetworkType::Test, PARAMETERS),
     ] {
         let spend = Spend::signed(single_signer(), HashType::ALL, wrong, 1);
-        assert_eq!(spend.check(), Err(ScriptError::ScriptInvalid));
+        assert!(is_null_fail(&spend.check().unwrap_err()));
     }
     assert_eq!(
         Spend::signed(single_signer(), HashType::ALL, context(), 1).check(),
@@ -906,23 +953,43 @@ fn relay_policy_uses_the_authenticated_body_and_the_chain_activation() {
     assert!(policy(&changed, &active, ACTIVATION).is_err());
 
     let mut multiple = Spend::unsigned(
-        multisig(2, &[KEY.public_key(); 3], false),
+        threshold(2, &[KEY.public_key(); 3], false),
         LockTime::unlocked(),
     );
     let signature = multiple.signature(&KEY, HashType::ALL, context());
-    multiple.install_arguments(&[vec![], signature.clone(), signature]);
+    multiple.install_arguments(&slots(&[Some(&signature), None, Some(&signature)]));
     assert_eq!(policy(&multiple, &active, ACTIVATION), Ok(()));
 
-    // Policy still caps how much checking one input may ask a relay to do.
-    let mut too_many = Spend::unsigned(
-        multisig(16, &[KEY.public_key(); 16], false),
+    // A 2-of-20 relays: it can run two checks, however many keys it lists.
+    let mut wide = Spend::unsigned(
+        threshold(2, &[KEY.public_key(); 20], false),
         LockTime::unlocked(),
     );
-    too_many.install_arguments(&[vec![], vec![0; crypto::SIGNATURE_BYTES + 1]]);
+    let signature = wide.signature(&KEY, HashType::ALL, context());
+    let mut chosen = vec![None; 20];
+    chosen[3] = Some(&signature);
+    chosen[17] = Some(&signature);
+    wide.install_arguments(&slots(&chosen));
+    assert_eq!(policy(&wide, &active, ACTIVATION), Ok(()));
+
+    // Policy still caps how much checking one input may ask a relay to do: sixteen
+    // signature-sized arguments pay for sixteen checks, one more than relay allows. Relay
+    // does not run the script, so these need not be real signatures.
+    let mut too_many = Spend::unsigned(
+        threshold(16, &[KEY.public_key(); 16], false),
+        LockTime::unlocked(),
+    );
+    let junk = vec![0; crypto::SIGNATURE_BYTES + 1];
+    too_many.install_arguments(&slots(&vec![Some(&junk); 16]));
     assert_eq!(
         policy(&too_many, &active, ACTIVATION),
         Err(TransactionError::NonStandardInputs)
     );
+    // The same sixteen keys with fifteen arguments' worth of bytes relay.
+    let mut fifteen = vec![Some(&junk); 15];
+    fifteen.push(None);
+    too_many.install_arguments(&slots(&fifteen));
+    assert_eq!(policy(&too_many, &active, ACTIVATION), Ok(()));
 
     let mut oversized = SPEND.clone();
     *oversized.input_mut() = Script::new(&vec![0; script_pq::MAX_INPUT_BYTES + 1]);

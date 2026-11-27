@@ -2297,6 +2297,14 @@ impl BlockTable {
                     }),
                     step,
                 );
+            } else if height <= self.top {
+                // The checks ran against an older `top`, and a local proposal
+                // or the verified tip raises it without moving the best header.
+                let entry = self
+                    .remove_pending(block_id)
+                    .expect("pending entry verified present");
+                reject_meta(step, block_id, entry.from_peer, entry.session_gen);
+                reject_later(step, block_id, &entry.later);
             }
             return;
         }

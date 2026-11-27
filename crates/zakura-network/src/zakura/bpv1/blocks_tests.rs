@@ -633,6 +633,56 @@ fn retried_entry_at_or_below_top_drops_instead_of_parking() {
     table.assert_invariants();
 }
 
+/// A first copy's checks run against an older `top`, so one that passes is
+/// still dropped when the verified tip reached its height meanwhile without
+/// moving the best header.
+#[test]
+fn checked_entry_at_or_below_top_drops_instead_of_waiting() {
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let now = Instant::now();
+    let fork = block::Hash([0x5E; 32]);
+    let coding = Profile::TINY.derive_coding(64, 2).unwrap();
+    table.step(
+        now,
+        BlockInput::ParentAdmitted {
+            hash: block::Hash([0x5F; 32]),
+            height: 9,
+        },
+    );
+    let received = receive(
+        &mut table,
+        now,
+        make_envelope(fork, coding, [0xAA; 32], node_id(1)),
+    );
+    let checking = header_result(
+        &mut table,
+        now,
+        &received,
+        HeaderAdmissionResult::MissingParent {
+            parent_hash: block::Hash([0x60; 32]),
+        },
+    );
+    table.step(
+        now,
+        BlockInput::TipHeight {
+            height: 10,
+            hash: TEST_TIP_HASH,
+        },
+    );
+    let dropped = unknown_parent_checked(
+        &mut table,
+        now,
+        &checking,
+        UnknownParentVerdict::Park { height: 10 },
+    );
+    assert_eq!(table.pending_meta_len(), 0);
+    assert!(dropped.outputs.iter().any(|o| matches!(
+        o,
+        BlockOutput::MetaRejected { block_id, .. } if *block_id == fork
+    )));
+    table.assert_invariants();
+}
+
 /// An entry that a wake retries and that parks again keeps its first
 /// deadline, so retries never extend its life, and it skips the checks it
 /// already passed.

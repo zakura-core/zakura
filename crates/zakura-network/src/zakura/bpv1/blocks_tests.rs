@@ -3572,15 +3572,17 @@ fn bpv1_57_a_committed_collecting_block_retires_and_frees_its_slot() {
 
 /// bpv1-57: block sync commits a block while its metadata is in admission.
 /// No `FallbackDone` can reach a block the table does not hold yet, so the
-/// admission rejects the metadata without fault instead of collecting it.
+/// admission records it as retired, without fault and without collecting it.
+/// Every session then drops the block's later parts, and a later copy starts
+/// no new admission.
 #[test]
-fn bpv1_57_metadata_for_the_committed_tip_is_not_admitted() {
+fn bpv1_57_metadata_for_the_committed_tip_is_retired_at_admission() {
     let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
     let t0 = Instant::now();
     let block_id = block::Hash([0xC5; 32]);
     let encoded = encode_body(&Profile::TINY, &[0xC5; 128], 2).unwrap();
     let envelope = make_envelope(block_id, encoded.coding, encoded.part_root, node_id(1));
-    let received = receive(&mut table, t0, envelope);
+    let received = receive(&mut table, t0, envelope.clone());
     let admitted = header_result(
         &mut table,
         t0,
@@ -3599,11 +3601,19 @@ fn bpv1_57_metadata_for_the_committed_tip_is_not_admitted() {
     );
 
     let step = commitment_ok(&mut table, t0, &admitted);
-    assert_eq!(table.block_phase(&block_id), None);
-    assert_eq!(rejected_sessions(&step, block_id), [(node_id(2), 1)]);
-    assert!(!step
-        .events
-        .contains(&BlockEvent::BlockAdmitted { block_id }));
+    assert_eq!(table.block_phase(&block_id), Some(BlockPhase::Retired));
+    assert!(step.outputs.iter().any(|o| matches!(
+        o,
+        BlockOutput::PublishRetire { block_id: id, .. } if *id == block_id
+    )));
+    assert!(!step.outputs.iter().any(|o| matches!(
+        o,
+        BlockOutput::PublishAdmitted { .. }
+            | BlockOutput::ClaimBody { .. }
+            | BlockOutput::ClosePeer { .. }
+    )));
+    let again = receive(&mut table, t0, envelope);
+    assert!(again.outputs.is_empty(), "a later copy starts no admission");
     table.assert_invariants();
 }
 

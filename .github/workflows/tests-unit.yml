@@ -568,7 +568,7 @@ jobs:
           RUSTFLAGS: --cfg zakura_sim
 
   # The compile half of sim-build, so a `--cfg zakura_sim` break fails the PR
-  # instead of the next nightly. The main push run catches PRs that only break together.
+  # instead of the next nightly. Main push runs catch PRs that only break together.
   sim-check:
     name: zakura_sim check
     needs: changes
@@ -576,9 +576,7 @@ jobs:
     permissions:
       contents: read
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    env:
-      CARGO_TARGET_DIR: target/sim
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
@@ -586,9 +584,8 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 #v2.0.1
         with:
           toolchain: stable
-          # Read the nightly sim-build cache, which only sim-build writes.
-          cache-shared-key: zakura-sim
-          cache-save-if: false
+          # Checking the workspace crates is most of the time, so a cache saves nothing.
+          cache: false
       - name: Check the simulator build
         run: |
           cargo check --locked -p zakura-rt -p zakura-scheduler -p zakura-sim -p zakura-storage -p zakura-quic --all-targets
@@ -789,6 +786,7 @@ jobs:
       - check-no-git-dependencies
       - publish-graph
       - sim-build
+      - sim-check
       - sim-sanitizers
       - sim-feedback
       - zakura-testkit
@@ -815,9 +813,10 @@ jobs:
           # skips on PRs that do not touch Cargo manifests or this check, and
           # sim-build, sim-sanitizers and sim-feedback run only on the nightly
           # schedule and manual dispatch, so a nightly failure still fails
-          # this status and reaches report-nightly-result.
+          # this status and reaches report-nightly-result. sim-check skips
+          # there, and on pull requests that touch no test-relevant paths.
           # Failed, non-skipped jobs still fail this aggregate status.
-          allowed-skips: temporary-unit-tests, check-no-git-dependencies, pruned-storage, zakura-config, build-tests, unit-tests, extended-reissuance-properties, sprout-enabled, network-dependent, publish-graph, sim-build, sim-sanitizers, sim-feedback, zakura-testkit
+          allowed-skips: temporary-unit-tests, check-no-git-dependencies, pruned-storage, zakura-config, build-tests, unit-tests, extended-reissuance-properties, sprout-enabled, network-dependent, publish-graph, sim-build, sim-check, sim-sanitizers, sim-feedback, zakura-testkit
 
   report-nightly-result:
     name: report nightly release test result

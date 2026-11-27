@@ -170,7 +170,21 @@ impl<T: Deref<Target = zakura_chain::transaction::Transaction>> CachedFfiTransac
         } = previous_output;
         let script_pub_key: &[u8] = lock_script.as_raw_bytes();
 
-        let flags = Flags::P2SH | Flags::CHECKLOCKTIMEVERIFY;
+        let mut flags = Flags::P2SH | Flags::CHECKLOCKTIMEVERIFY;
+        // # Consensus
+        //
+        // > For each TransparentInputAuth whose sighashInfo specifies sighash variant 0,
+        // > the hash_type byte of every nonempty signature supplied to OP_CHECKSIG,
+        // > OP_CHECKSIGVERIFY, OP_CHECKMULTISIG, or OP_CHECKMULTISIGVERIFY when
+        // > validating that input MUST be SIGHASH_ALL (0x01).
+        //
+        // <https://zips.z.cash/zip-0248#bundle-local-rules>
+        //
+        // The interpreter enforces this on every supplied signature, including those it
+        // never checks, and fails the input with `SigHashNotAll`.
+        if self.transaction.version() >= 7 {
+            flags |= Flags::SigHashAllOnly;
+        }
 
         let lock_time = self.transaction.raw_lock_time();
         let is_final = self.transaction.inputs()[input_index].sequence() == u32::MAX;
@@ -190,6 +204,16 @@ impl<T: Deref<Target = zakura_chain::transaction::Transaction>> CachedFfiTransac
         // interpreter pushes false, which later opcodes such as `OP_NOT` may consume.
         let calculate_sighash =
             |script_code: &script::Code, hash_type: &zcash_script::signature::HashType| {
+                // The interpreter rejects other hash types under `SigHashAllOnly`, and
+                // the v7 sighasher has no digest for them either.
+                if self.transaction.version() >= 7 {
+                    let hash_type = parse_zip244_hash_type(hash_type.raw_bits())?;
+                    return self
+                        .sighasher()
+                        .v7_transparent_sighash(hash_type, input_index)
+                        .map(|sighash| sighash.0);
+                }
+
                 let script_code_vec = script_code.0.clone();
 
                 // For pre-v5 (v4) transactions: zcashd serializes the raw

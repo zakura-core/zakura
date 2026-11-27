@@ -57,6 +57,7 @@ use super::{check, Request, Verifier};
 
 #[cfg(test)]
 mod prop;
+mod v7;
 
 #[tokio::test]
 async fn cancelled_owned_transaction_verification_keeps_queued_script_charge() {

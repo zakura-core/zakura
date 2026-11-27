@@ -17,7 +17,9 @@ use tokio::sync::watch;
 use tower::{util::ServiceFn, Service};
 
 use sapling_crypto::{bundle::Authorized, BatchValidator, Bundle};
-use zakura_chain::transaction::{SigHash, UnminedTxId};
+use zakura_chain::transaction::UnminedTxId;
+
+use super::BundleSighashes;
 use zcash_protocol::value::ZatBalance;
 
 use crate::{error::TransactionError, BoxError};
@@ -43,14 +45,15 @@ use sapling_crypto::circuit::pinned_verifying_keys as verifying_keys;
 pub struct Item {
     /// The bundle containing the Sapling shielded data to verify.
     bundle: Bundle<Authorized, ZatBalance>,
-    /// The sighash of the transaction that contains the Sapling shielded data.
-    sighash: SigHash,
+    /// The digests that the bundle's signatures sign.
+    sighashes: BundleSighashes,
     /// The key this item's successful verification is remembered under.
     cache_key: CacheKey,
 }
 
 impl Item {
-    /// Creates a new [`Item`] from a Sapling bundle, its sighash, and its transaction's ID.
+    /// Creates a new [`Item`] from a Sapling bundle, the digests its signatures sign, and
+    /// its transaction's ID.
     ///
     /// `tx_id` must identify the transaction containing `bundle`, because the cache treats it as
     /// determining the bundle — see this type's [`CachedItem`] implementation. The transaction
@@ -58,13 +61,14 @@ impl Item {
     /// whose caller must preserve this invariant.
     pub(crate) fn new(
         bundle: Bundle<Authorized, ZatBalance>,
-        sighash: SigHash,
+        sighashes: impl Into<BundleSighashes>,
         tx_id: UnminedTxId,
     ) -> Self {
+        let sighashes = sighashes.into();
         Self {
+            cache_key: CacheKey::new(tx_id, sighashes.commitment(), ShieldedPool::Sapling),
             bundle,
-            sighash,
-            cache_key: CacheKey::new(tx_id, sighash.0, ShieldedPool::Sapling),
+            sighashes,
         }
     }
 }
@@ -141,7 +145,7 @@ fn validate_batch(items: Vec<Item>) -> BatchResult {
     // Successful batch validation must not turn that item's failure into Ok.
     let checks = items
         .into_iter()
-        .map(|item| batch.check_bundle(item.bundle, <[u8; 32]>::from(item.sighash)))
+        .map(|item| batch.check_bundle(item.bundle, &item.sighashes))
         .collect();
     let (spend_vk, output_vk) = verifying_keys();
     let valid = batch.validate(spend_vk, output_vk, thread_rng());
@@ -254,7 +258,7 @@ pub fn verify_single(
     async move {
         let is_valid = spawn_fallback(move || {
             let mut batch = BatchValidator::default();
-            if !batch.check_bundle(item.bundle, <[u8; 32]>::from(item.sighash)) {
+            if !batch.check_bundle(item.bundle, &item.sighashes) {
                 return false;
             }
             let (spend_vk, output_vk) = verifying_keys();

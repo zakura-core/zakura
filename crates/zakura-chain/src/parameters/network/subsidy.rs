@@ -485,6 +485,26 @@ pub enum SubsidyError {
     #[error("miner fees are invalid")]
     InvalidMinerFees,
 
+    #[error("v7 coinbase blockHeight does not match the block height")]
+    V7CoinbaseHeightMismatch,
+
+    #[error("v7 coinbase blockSubsidy does not match the block subsidy")]
+    V7CoinbaseSubsidyMismatch,
+
+    #[error("v7 coinbase lockboxValue does not match the lockbox deposit of the block")]
+    V7CoinbaseLockboxMismatch,
+
+    #[error(
+        "v7 coinbase value pool delta does not match the block subsidy less the lockbox deposit \
+         and the ZIP 235 fee contribution"
+    )]
+    V7CoinbaseDeltaMismatch,
+
+    #[error(
+        "v7 coinbase fee bundle does not collect exactly the fees of the block's transactions"
+    )]
+    V7CoinbaseFeesMismatch,
+
     #[error("ZIP 234 block subsidy needs the NSM value balance after the parent block")]
     MissingNsmValueBalance,
 

@@ -23,6 +23,7 @@ pub use fields::{
     CoinbaseBundle, CoinbaseError, MinerPoll, MinerSignal, V7Fields, ValueDeltas,
     MAX_COINBASE_DATA_LEN,
 };
+pub use registry::BundleKind;
 pub use sighash::{ShieldedBundle, ShieldedSighashes};
 
 pub(crate) use codec::{read, V7_VERSION_GROUP_ID};
@@ -98,5 +99,31 @@ impl<'a> V7Ref<'a> {
     /// Returns the authorizing data commitment.
     pub(crate) fn authorizing_digest(&self) -> AuthDigest {
         AuthDigest(self.auth_digest())
+    }
+
+    /// Returns the bundles that have an entry in any of the transaction's maps, in bundle
+    /// type order.
+    pub(crate) fn bundles(&self) -> Vec<BundleKind> {
+        let deltas = &self.fields.value_deltas;
+        [
+            (
+                BundleKind::Transparent,
+                !self.inputs.is_empty()
+                    || !self.outputs.is_empty()
+                    || !deltas.transparent.is_zero(),
+            ),
+            (
+                BundleKind::Coinbase,
+                self.fields.coinbase.is_some() || !deltas.coinbase.is_zero(),
+            ),
+            (BundleKind::Sapling, self.sapling.is_some()),
+            (BundleKind::Orchard, self.orchard.is_some()),
+            (BundleKind::Ironwood, self.ironwood.is_some()),
+            (BundleKind::Fee, !deltas.fee.is_zero()),
+            (BundleKind::Nsm, !deltas.nsm.is_zero()),
+        ]
+        .into_iter()
+        .filter_map(|(bundle, present)| present.then_some(bundle))
+        .collect()
     }
 }

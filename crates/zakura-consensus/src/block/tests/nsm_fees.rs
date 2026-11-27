@@ -40,7 +40,7 @@ fn nsm_fee_claims_at_activation_and_reissuance() {
                     height,
                     Amount::try_from(fees).unwrap(),
                     subsidy,
-                    DeferredPoolBalanceChange::new(Amount::zero()),
+                    check::LockboxFlows::default(),
                     &network,
                 );
                 assert_eq!(

@@ -18,6 +18,32 @@ pub(super) const FEE: BundleId = (5, 0);
 /// The NSM field of ZIP 233.
 pub(super) const NSM: BundleId = (6, 0);
 
+/// A bundle that ZIP 248 registers for v7 transactions, in bundle type order.
+///
+/// Registration alone does not activate a bundle: full validators check that each bundle
+/// a transaction contains is active in the consensus epoch of its block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(
+    any(test, feature = "proptest-impl"),
+    derive(proptest_derive::Arbitrary)
+)]
+pub enum BundleKind {
+    /// The transparent bundle.
+    Transparent,
+    /// The coinbase bundle.
+    Coinbase,
+    /// The Sapling bundle.
+    Sapling,
+    /// The Orchard bundle.
+    Orchard,
+    /// The Ironwood bundle.
+    Ironwood,
+    /// The transaction fee bundle of ZIP 2002.
+    Fee,
+    /// The NSM field of ZIP 233.
+    Nsm,
+}
+
 /// Which maps of a v7 transaction may contain an entry for a registered pair.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Registration {

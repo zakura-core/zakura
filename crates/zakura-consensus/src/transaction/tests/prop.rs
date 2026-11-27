@@ -534,14 +534,11 @@ fn validate(
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(16))]
 
-    /// v7 transactions have no verifier until ZIP 248 validation is implemented.
+    /// v7 transactions have a verifier.
     #[test]
-    fn v7_transactions_have_no_verifier(tx in Transaction::v7_strategy()) {
+    fn v7_transactions_have_a_verifier(tx in Transaction::v7_strategy()) {
         let _init_guard = zakura_test::init();
 
-        prop_assert!(matches!(
-            transaction::check::version_has_a_verifier(&tx),
-            Err(TransactionError::WrongVersion)
-        ));
+        prop_assert_eq!(transaction::check::version_has_a_verifier(&tx), Ok(()));
     }
 }

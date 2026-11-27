@@ -56,6 +56,39 @@ pub enum TransactionError {
     #[error("coinbase transaction MUST NOT have an Orchard shielded bundle")]
     CoinbaseHasOrchardShieldedData,
 
+    #[error("a v7 coinbase transaction MUST NOT spend any transparent output")]
+    CoinbaseHasTransparentInput,
+
+    #[error("v7 bundle {0:?} is not active in the network upgrade of the block")]
+    V7BundleNotActive(zakura_chain::transaction::v7::BundleKind),
+
+    #[error("v7 value pool delta of bundle {0:?} has no effecting bundle")]
+    V7DeltaWithoutBundle(zakura_chain::transaction::v7::BundleKind),
+
+    #[error("the value pool deltas of a v7 transaction MUST sum to zero")]
+    V7UnbalancedValuePoolDeltas,
+
+    #[error("the fee bundle of a non-coinbase v7 transaction MUST NOT add value")]
+    V7FeeAddsValue,
+
+    #[error("the fee bundle of a v7 coinbase transaction MUST NOT remove value")]
+    V7CoinbaseFeeRemovesValue,
+
+    #[error("the NSM value pool delta of a v7 transaction MUST NOT add value")]
+    V7NsmAddsValue,
+
+    #[error(
+        "the transparent value pool delta of a v7 transaction MUST equal the value of its \
+         spent outputs minus the value of its transparent outputs"
+    )]
+    V7TransparentDeltaMismatch,
+
+    #[error(
+        "the per-signature digests of a v7 shielded bundle are unavailable because the \
+         spent outputs do not match the transparent inputs"
+    )]
+    V7ShieldedSighashesUnavailable,
+
     #[error("coinbase transaction Sapling or Orchard outputs MUST be decryptable with an all-zero outgoing viewing key")]
     CoinbaseOutputsNotDecryptable,
 
@@ -64,6 +97,9 @@ pub enum TransactionError {
 
     #[error("non-coinbase transactions MUST NOT have coinbase inputs")]
     NonCoinbaseHasCoinbaseInput,
+
+    #[error("a transparent input in a non-coinbase transaction MUST NOT have a null prevout")]
+    NonCoinbaseHasNullPrevout,
 
     #[error("the tx is not coinbase, but it should be")]
     NotCoinbase,
@@ -434,6 +470,22 @@ impl TransactionError {
             Self::CoinbaseHasOrchardShieldedData => {
                 consensus("transaction.coinbase_has_orchard_shielded_data")
             }
+            Self::CoinbaseHasTransparentInput => {
+                consensus("transaction.coinbase_has_transparent_input")
+            }
+            Self::V7BundleNotActive(_) => consensus("transaction.v7_bundle_not_active"),
+            Self::V7DeltaWithoutBundle(_) => consensus("transaction.v7_delta_without_bundle"),
+            Self::V7UnbalancedValuePoolDeltas => {
+                consensus("transaction.v7_unbalanced_value_pool_deltas")
+            }
+            Self::V7FeeAddsValue => consensus("transaction.v7_fee_adds_value"),
+            Self::V7CoinbaseFeeRemovesValue => {
+                consensus("transaction.v7_coinbase_fee_removes_value")
+            }
+            Self::V7NsmAddsValue => consensus("transaction.v7_nsm_adds_value"),
+            Self::V7TransparentDeltaMismatch => {
+                consensus("transaction.v7_transparent_delta_mismatch")
+            }
             Self::CoinbaseOutputsNotDecryptable => {
                 consensus("transaction.coinbase_outputs_not_decryptable")
             }
@@ -442,6 +494,9 @@ impl TransactionError {
             }
             Self::NonCoinbaseHasCoinbaseInput => {
                 consensus("transaction.non_coinbase_has_coinbase_input")
+            }
+            Self::NonCoinbaseHasNullPrevout => {
+                consensus("transaction.non_coinbase_has_null_prevout")
             }
             Self::NotCoinbase => consensus("transaction.not_coinbase"),
             Self::LockedUntilAfterBlockHeight(_) => {
@@ -480,7 +535,11 @@ impl TransactionError {
             Self::Ed25519(_) => consensus("transaction.ed25519"),
             Self::RedJubjub(_) => consensus("transaction.redjubjub"),
             Self::RedPallas(_) => consensus("transaction.redpallas"),
-            Self::InternalDowncastError(_) | Self::StateUnavailable(_) => {
+            // Missing v7 shielded digests mean this node broke an invariant, not that the
+            // block is invalid, so they must not mark the block invalid permanently.
+            Self::InternalDowncastError(_)
+            | Self::StateUnavailable(_)
+            | Self::V7ShieldedSighashesUnavailable => {
                 BodyVerificationClass::Retryable(TransientBodyFailureKind::VerifierUnavailable)
             }
             Self::BothVPubsNonZero => consensus("transaction.both_vpubs_nonzero"),
@@ -569,9 +628,18 @@ impl TransactionError {
             | CoinbaseHasEnableSpendsOrchard
             | CoinbaseHasEnableSpendsIronwood
             | CoinbaseHasOrchardShieldedData
+            | CoinbaseHasTransparentInput
+            | V7BundleNotActive(_)
+            | V7DeltaWithoutBundle(_)
+            | V7UnbalancedValuePoolDeltas
+            | V7FeeAddsValue
+            | V7CoinbaseFeeRemovesValue
+            | V7NsmAddsValue
+            | V7TransparentDeltaMismatch
             | CoinbaseOutputsNotDecryptable
             | CoinbaseInMempool
             | NonCoinbaseHasCoinbaseInput
+            | NonCoinbaseHasNullPrevout
             | CoinbaseExpiryBlockHeight { .. }
             | IncorrectFee
             | Subsidy(_)

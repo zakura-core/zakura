@@ -125,6 +125,17 @@ impl From<orchard::ValuePool> for ShieldedPool {
 /// commit to the block's consensus branch id, which a v4 transaction ID does not carry, and which
 /// selects the verification a bundle is checked against.
 ///
+/// A v7 bundle's signatures each sign their own [ZIP 248] digest, and the key holds the
+/// binding signature's digest. Every digest of a bundle hashes one shared prefix (the txid,
+/// which commits to the branch ID, and the spent outputs' amounts and `scriptPubKey`s)
+/// followed by the bundle's type and the signature's position. Barring a hash collision, the
+/// binding digest fixes that prefix, the
+/// pool fixes the bundle type, and the [`WtxId`](zakura_chain::transaction::WtxId) fixes the
+/// bundle and its signature count, so the binding digest determines every spend
+/// authorization digest.
+///
+/// [ZIP 248]: https://zips.z.cash/zip-0248
+///
 /// The verifying key is absent on purpose. Each Orchard circuit era has its own cache, so an
 /// entry is only ever read back under the key it was written against, and Sapling has one key
 /// pair for all of history.
@@ -133,7 +144,8 @@ pub(super) struct CacheKey {
     /// The ID of the transaction the bundle was parsed from.
     tx_id: UnminedTxId,
 
-    /// The signature digest used to verify the bundle's signatures.
+    /// The signature digest used to verify the bundle's signatures, or for a v7 bundle, the
+    /// binding signature's digest, which determines the others.
     sighash: [u8; 32],
 
     /// The bundle slot verified for this transaction.

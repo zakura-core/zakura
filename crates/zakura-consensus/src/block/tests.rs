@@ -8,7 +8,7 @@ use tower::{buffer::Buffer, service_fn, util::BoxService, Service, ServiceExt};
 
 use zakura_chain::{amount::NegativeAllowed, ironwood};
 use zakura_chain::{
-    amount::{DeferredPoolBalanceChange, MAX_MONEY},
+    amount::MAX_MONEY,
     block::{
         tests::generate::{
             large_multi_transaction_block, large_single_transaction_block_many_inputs,
@@ -38,6 +38,7 @@ use super::*;
 
 mod mined_duplicates;
 mod nsm_fees;
+mod v7_coinbase;
 
 fn prepared_test_verifier(
     network: &Network,
@@ -2182,7 +2183,7 @@ fn local_genesis_nu6_3_activation_has_satisfiable_lockbox_rule() -> Result<(), R
     assert!(!expected_block_subsidy.is_zero());
     assert_eq!(
         subsidy_is_valid(&block, &network, expected_block_subsidy)?,
-        DeferredPoolBalanceChange::zero()
+        check::LockboxFlows::default()
     );
 
     Ok(())
@@ -2398,7 +2399,7 @@ fn miner_fees_validation_for_network(network: Network) -> Result<(), Report> {
                     Some(activation_height) if height >= activation_height => {
                         subsidy_is_valid(&block, &network, expected_block_subsidy)?
                     }
-                    _other => DeferredPoolBalanceChange::zero(),
+                    _other => check::LockboxFlows::default(),
                 };
 
             assert!(check::miner_fees_are_valid(
@@ -2430,7 +2431,7 @@ fn miner_fees_validation_failure() -> Result<(), Report> {
         Some(activation_height) if height >= activation_height => {
             subsidy_is_valid(&block, &network, expected_block_subsidy)?
         }
-        _other => DeferredPoolBalanceChange::zero(),
+        _other => check::LockboxFlows::default(),
     };
 
     assert_eq!(
@@ -2695,7 +2696,7 @@ fn miner_fees_validation_includes_ironwood_balance() {
             height,
             Amount::zero(),
             output_value,
-            DeferredPoolBalanceChange::zero(),
+            check::LockboxFlows::default(),
             &network,
         ),
         Err(BlockError::Transaction(TransactionError::Subsidy(
@@ -2709,7 +2710,7 @@ fn miner_fees_validation_includes_ironwood_balance() {
             height,
             Amount::zero(),
             Amount::try_from(9).expect("valid test amount"),
-            DeferredPoolBalanceChange::zero(),
+            check::LockboxFlows::default(),
             &network,
         ),
         Ok(())

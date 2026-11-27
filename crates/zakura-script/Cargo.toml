@@ -27,6 +27,8 @@ ripemd = { workspace = true }
 secp256k1 = { workspace = true }
 sha2 = { workspace = true }
 zakura-test = { path = "../zakura-test", version = "4.0.0" }
+# The NU7.1 branch ID that v7 test transactions commit to exists only in test builds.
+zakura-chain = { path = "../zakura-chain", version = "17.0.0", features = ["zakura-test"] }
 
 [lints]
 workspace = true

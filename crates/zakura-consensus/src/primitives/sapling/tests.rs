@@ -35,7 +35,10 @@ use zakura_chain::{
 
 use crate::BoxError;
 
-use super::{verifying_keys, Authorized, Bundle, CacheKey, Cached, CachedItem, Item, ZatBalance};
+use super::{
+    verifying_keys, Authorized, Bundle, BundleSighashes, CacheKey, Cached, CachedItem, Item,
+    ZatBalance,
+};
 
 /// Enough time for real verification, without depending on the batch timer.
 const VERIFICATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -134,7 +137,10 @@ async fn invalid_sapling_signature_retries_batch_and_rejects_only_bad_item() {
     let (nu, tx) = mined_v4_sapling_transaction_with_spends();
     let valid = item(&tx, nu).expect("the fixture has a Sapling bundle");
     let mut bad = valid.clone();
-    bad.sighash.0[0] ^= 1;
+    let BundleSighashes::Shared(sighash) = &mut bad.sighashes else {
+        unreachable!("a v4 bundle's signatures share one digest");
+    };
+    sighash.0[0] ^= 1;
     let (results, fallbacks) = explicitly_flushed_batch(vec![valid.clone(), bad, valid]).await;
     assert_eq!(fallbacks, results.len());
     for (index, result) in results.into_iter().enumerate() {
@@ -543,7 +549,9 @@ fn cache_key_commits_to_the_sighash() {
     let tx = sapling_transaction();
     let original = item(&tx, NetworkUpgrade::Nu5).expect("the transaction has a bundle");
 
-    let mut tweaked_sighash = original.sighash;
+    let BundleSighashes::Shared(mut tweaked_sighash) = original.sighashes.clone() else {
+        unreachable!("a v5 bundle's signatures share one digest");
+    };
     tweaked_sighash.0[0] ^= 1;
     let tweaked = Item::new(original.bundle.clone(), tweaked_sighash, tx.unmined_id());
 
@@ -1130,8 +1138,7 @@ fn library_verifier_rejects_invalid_value_commitments_that_now_convert() {
         let item = item(tx, nu).expect(
             "librustzcash conversion keeps a Sapling cv as bytes, so even an invalid cv converts",
         );
-        sapling_crypto::BatchValidator::new()
-            .check_bundle(item.bundle, <[u8; 32]>::from(item.sighash))
+        sapling_crypto::BatchValidator::new().check_bundle(item.bundle, &item.sighashes)
     };
 
     assert!(

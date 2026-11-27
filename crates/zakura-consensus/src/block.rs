@@ -695,8 +695,7 @@ where
                 )?;
 
                 // See [ZIP-1015](https://zips.z.cash/zip-1015).
-                let deferred_pool_balance_change =
-                    check::subsidy_is_valid(&block, &network, expected_block_subsidy)?;
+                let lockbox = check::subsidy_is_valid(&block, &network, expected_block_subsidy)?;
 
                 // Now do the slower checks
 
@@ -895,7 +894,7 @@ where
                     height,
                     block_transaction_fees,
                     expected_block_subsidy,
-                    deferred_pool_balance_change,
+                    lockbox,
                     &network,
                 )?;
 
@@ -907,7 +906,7 @@ where
                     height,
                     new_outputs: known_utxos,
                     transaction_hashes,
-                    deferred_pool_balance_change: Some(deferred_pool_balance_change),
+                    deferred_pool_balance_change: Some(lockbox.balance_change()),
                     auth_data_root: Some(auth_data_digests.root),
                     receipt_order,
                 };

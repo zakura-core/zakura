@@ -140,6 +140,125 @@ async fn pools_form_a_mesh() -> Result<()> {
     Ok(())
 }
 
+/// A pool whose template node names its public relay: the blocks it mines
+/// name the relay, so every other mining node prefers the relay, and so does
+/// the template node itself, which holds a place for it. The relay mines
+/// nothing, yet counts the blocks and prefers the other pool's gateway. No
+/// block names the template node, so only the relay, which lists it in
+/// `mining.miner_mesh_template_nodes`, keeps a place for it, ahead of the
+/// gateways it ranks.
+///
+/// This checks the ranking and what each node reports. It never fills the
+/// relay's inbound share: that a template node is still admitted then is
+/// covered by the handler unit test
+/// `an_always_preferred_caller_passes_a_full_inbound_share`.
+///
+/// Only the template node, which builds coinbases, reports that it announces.
+/// Both report the blocks that name the relay, the gateway they stand for.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "starts zakurad children: run with the miner-mesh-regtest nextest profile"]
+async fn a_pool_names_its_relay_as_its_gateway() -> Result<()> {
+    const HUB: usize = 0;
+    const TEMPLATE: usize = 1;
+    const RELAY: usize = 2;
+    const OTHER_POOL: usize = 3;
+    const M: usize = 4;
+    let _init_guard = zakura_test::init();
+
+    let mut net = RegtestNet::start(vec![
+        NodeSpec::new(Role::Relay),
+        NodeSpec::new(Role::Pool)
+            .names_gateway(RELAY)
+            .bootstrap_from([HUB]),
+        NodeSpec::new(Role::MeshRelay)
+            .template_nodes([TEMPLATE])
+            .bootstrap_from([HUB]),
+        NodeSpec::new(Role::Pool).bootstrap_from([HUB]),
+        NodeSpec::new(Role::Miner).bootstrap_from([HUB]),
+    ])
+    .await?;
+    let template = net.gateway_id(TEMPLATE);
+    let relay = net.gateway_id(RELAY);
+    let other_pool = net.gateway_id(OTHER_POOL);
+
+    net.mine(TEMPLATE, MIN_GATEWAY_BLOCKS).await?;
+    net.mine(OTHER_POOL, MIN_GATEWAY_BLOCKS).await?;
+    net.mine(M, QUALIFYING_DEPTH).await?;
+
+    net.wait_for(
+        "every node that prefers gateways holding the relay and the other pool",
+        DISCOVERY_TIMEOUT,
+        |net| {
+            [TEMPLATE, M].into_iter().all(|node| {
+                let view = net.view(node);
+                view.prefers_and_holds(&relay) && view.prefers_and_holds(&other_pool)
+            }) && net.view(OTHER_POOL).prefers_and_holds(&relay)
+                && net.view(RELAY).prefers_and_holds(&other_pool)
+                && net.view(RELAY).prefers_and_holds(&template)
+        },
+    )
+    .await?;
+
+    let template_view = net.view(TEMPLATE);
+    assert_eq!(
+        template_view.info.announced_gateways,
+        vec![hex::encode(relay)],
+        "the template node's coinbases name the relay"
+    );
+    assert_eq!(
+        template_view.info.node_id,
+        Some(hex::encode(net.node_id(TEMPLATE).as_bytes())),
+        "the template node still reports its own node ID"
+    );
+
+    let relay_view = net.view(RELAY);
+    assert!(!relay_view.info.mining && relay_view.info.announced_gateways.is_empty());
+    assert!(
+        relay_view.info.window.is_some(),
+        "the relay counts the blocks"
+    );
+    assert_eq!(
+        relay_view.ranking(),
+        vec![template, other_pool],
+        "the relay keeps a place for its template node ahead of the gateways it ranks"
+    );
+    assert_eq!(relay_view.template_nodes(), vec![template]);
+    assert!(
+        relay_view
+            .peer(&template)
+            .is_some_and(|peer| peer.preferred),
+        "the template node is a preferred peer at the relay"
+    );
+
+    for node in [OTHER_POOL, M] {
+        assert_eq!(
+            net.view(node).state_of(&template),
+            None,
+            "node {node} ranks the template node, which no block names"
+        );
+    }
+    assert!(
+        net.view(HUB).ranking().is_empty(),
+        "a relay without the miner mesh ranks nothing"
+    );
+
+    #[cfg(feature = "prometheus")]
+    for (node, announcing) in [(TEMPLATE, 1.0), (RELAY, 0.0)] {
+        assert_eq!(
+            net.gauge(node, "mining_mesh_announcing").await?,
+            Some(announcing),
+            "node {node}'s metric agrees with its getminermeshinfo report"
+        );
+        assert_eq!(
+            net.gauge(node, "mining_mesh_gateway_local_blocks").await?,
+            Some(f64::from(MIN_GATEWAY_BLOCKS)),
+            "node {node} counts the blocks that name the relay"
+        );
+    }
+
+    Ok(())
+}
+
 /// With all ordinary slots occupied, a qualifying gateway connects in its
 /// separately funded place and ordinary peers keep their connections.
 #[tokio::test(flavor = "multi_thread")]

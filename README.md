@@ -108,7 +108,7 @@ cargo install --locked zakura
 Alternatively, you can install it from GitHub:
 
 ```sh
-cargo install --git https://github.com/zakura-core/zakura --tag v1.8.9 zakura
+cargo install --git https://github.com/zakura-core/zakura --tag v1.9.0 zakura
 ```
 
 Sprout JoinSplit proof and signature verification is disabled by default. When
@@ -171,8 +171,8 @@ The Zakura maintainers provide the following resources:
   authenticated early relay and the recommended upstream-validation workflow.
 
 - The [miner mesh guide](docs/miner-mesh.md) for announcing a mining gateway,
-  the connections a mining node keeps to announced gateways, and the
-  `getminermeshinfo` RPC.
+  the connections a node that mines or runs the miner mesh keeps to announced
+  gateways, and the `getminermeshinfo` RPC.
 
 - The [documentation of the public
   APIs](https://docs.rs/zakura/latest/zakurad/#zakura-crates) for the latest

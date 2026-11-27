@@ -80,3 +80,41 @@ fn seeds_replay_and_reach_every_expected_name() {
         );
     }
 }
+
+/// The `Have` seeds double as close-16 tests (decision-33): a bitmap that
+/// fits the layout stays open, and a repeated bitmap index, a padding bit,
+/// a bitmap sized for another layout, and a list index past the layout
+/// each close 16.
+#[test]
+fn have_form_seeds_close_16_only_when_malformed() {
+    let seeds = seed_inputs();
+    let closed_row = |name: &str| {
+        let seed = seeds
+            .iter()
+            .find(|seed| seed.target == "bpv1_peer" && seed.name == name)
+            .unwrap_or_else(|| panic!("no bpv1_peer seed {name}"));
+        crate::zakura::bpv1::peer::replay_bpv1_peer_bytes(&seed.bytes).closed_row
+    };
+    assert_eq!(closed_row("have-bitmap"), None);
+    assert_eq!(closed_row("have-bitmap-repeat"), Some(16));
+    assert_eq!(closed_row("have-bitmap-padding"), Some(16));
+    assert_eq!(closed_row("have-bitmap-misfit"), Some(16));
+    assert_eq!(closed_row("have-past-layout"), Some(16));
+}
+
+/// decision-33: no layout holds an index at or past `MAX_PARTS`, so a
+/// decoded list that names one keeps the list form. The wire target's
+/// smaller-form check must not expect a bitmap past `MAX_HAVE_BITMAP` for it.
+#[test]
+fn wire_replay_accepts_a_full_list_past_every_layout() {
+    // Selector 5 sends the rest of the input as a `Have` payload.
+    let mut bytes = vec![5];
+    bytes.extend([0x5A; 32]);
+    bytes.push(0);
+    bytes.extend(4_096u16.to_le_bytes());
+    for index in (u16::MAX - 4_095)..=u16::MAX {
+        bytes.extend(index.to_le_bytes());
+    }
+    let summary = replay_bpv1_wire_bytes(&bytes, &mut no_meter);
+    assert!(summary.reached.contains("have:smaller-form"));
+}

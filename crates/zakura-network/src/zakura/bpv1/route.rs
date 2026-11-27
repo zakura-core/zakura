@@ -30,10 +30,11 @@ pub(crate) enum PeerRoute {
     Session(PeerOutput),
 }
 
-/// Routes `output` of `peer`'s session. `peer_states` runs only for an
-/// output that the table plans pulls from.
+/// Routes `output` of `peer`'s session `session_gen`. `peer_states` runs
+/// only for an output that the table plans pulls from.
 pub(crate) fn route_peer_output(
     peer: NodeId,
+    session_gen: u64,
     output: PeerOutput,
     peer_states: impl FnOnce() -> Vec<PullPeerState>,
 ) -> PeerRoute {
@@ -53,11 +54,13 @@ pub(crate) fn route_peer_output(
         PeerOutput::InsertPart {
             block_id,
             part,
+            session_gen,
             auth,
         } => BlockInput::InsertPart {
             block_id,
             part,
             from_peer: peer,
+            session_gen,
             auth,
             peer_states: peer_states(),
         },
@@ -67,9 +70,12 @@ pub(crate) fn route_peer_output(
             relay,
         } => BlockInput::PushFlagged {
             peer,
+            session_gen,
             block_id,
             indices,
             relay,
+            // The IO shell clears it for a session it no longer runs.
+            live: true,
         },
         PeerOutput::ReleaseClaims {
             block_id,
@@ -78,6 +84,7 @@ pub(crate) fn route_peer_output(
             reason,
         } => BlockInput::ReleaseClaims {
             peer,
+            session_gen,
             block_id,
             stripe,
             slots,
@@ -103,6 +110,7 @@ pub(crate) fn route_peer_output(
             ..
         } => BlockInput::ReleaseClaims {
             peer,
+            session_gen,
             block_id,
             stripe,
             slots: unreceived_slots,
@@ -118,6 +126,7 @@ pub(crate) fn route_peer_output(
 pub(crate) fn pull_state(state: &PeerState, now: Instant) -> PullPeerState {
     PullPeerState {
         peer: state.remote_node(),
+        session_gen: state.session_gen(),
         ahead_bytes: state.outstanding_bytes(),
         can_pull: state.can_pull(now),
         window_remaining: state.window_remaining(),
@@ -153,7 +162,14 @@ pub(crate) fn charge_part(
     bytes: u64,
 ) -> Result<(Coding, [u8; 32]), PeerInput> {
     table
-        .charge_part(now, &token.block_id, token.index, peer, bytes)
+        .charge_part(
+            now,
+            &token.block_id,
+            token.index,
+            peer,
+            token.session_gen,
+            bytes,
+        )
         .map_err(|refusal| PeerInput::PartRefused {
             token,
             reason: match refusal {
@@ -180,11 +196,13 @@ pub(crate) enum BlockRoute {
 }
 
 /// An input for every live session.
+///
+/// A `BlockAdmitted` carries the block's `HeaderMeta` to every session. Each
+/// session records whether the metadata crossed its own connection, so it
+/// alone decides whether to send it (bpv1-4).
 #[derive(Debug)]
 pub(crate) struct Broadcast {
     input: PeerInput,
-    /// The peer that sent the block's `HeaderMeta`, which gets none back.
-    origin: Option<NodeId>,
     /// The block's `Have` initial group, whose sessions announce at once
     /// (decision-26).
     have_group: Vec<NodeId>,
@@ -195,9 +213,6 @@ impl Broadcast {
     pub(crate) fn input_for(&self, peer: &NodeId) -> PeerInput {
         let mut input = self.input.clone();
         if let PeerInput::BlockAdmitted(admitted) = &mut input {
-            if self.origin == Some(*peer) {
-                admitted.header_meta = None;
-            }
             if self.have_group.contains(peer) {
                 admitted.have_held_until = None;
             }
@@ -216,28 +231,24 @@ pub(crate) fn route_block_output(output: BlockOutput) -> BlockRoute {
     let broadcast = |input| {
         BlockRoute::Broadcast(Broadcast {
             input,
-            origin: None,
             have_group: Vec::new(),
         })
     };
     match output {
-        BlockOutput::PublishAdmitted {
-            mut admitted,
-            from_peer,
-        } => BlockRoute::Broadcast(Broadcast {
+        BlockOutput::PublishAdmitted { mut admitted } => BlockRoute::Broadcast(Broadcast {
             input: PeerInput::BlockAdmitted(admitted_input(&admitted)),
-            origin: from_peer,
             have_group: std::mem::take(&mut admitted.have_group),
         }),
         BlockOutput::GrantPull {
             peer,
+            session_gen,
             block_id,
             stripe,
             requested,
             arrival,
         } => BlockRoute::Peer {
             peer,
-            session_gen: None,
+            session_gen: Some(session_gen),
             input: PeerInput::PullGranted(PullGranted {
                 block_id,
                 stripe,
@@ -285,19 +296,22 @@ pub(crate) fn route_block_output(output: BlockOutput) -> BlockRoute {
     }
 }
 
-/// The release that returns a grant's claims to `peer`'s table entry when
-/// no session took `input`, so slots never strand.
+/// The release that returns a grant's claims to the table when the
+/// session `session_gen` of `peer` that the grant names did not take
+/// `input`, so slots never strand.
 pub(crate) fn refused_grant(
     peer: NodeId,
+    session_gen: Option<u64>,
     input: PeerInput,
     peer_states: impl FnOnce() -> Vec<PullPeerState>,
 ) -> Option<BlockInput> {
-    let PeerInput::PullGranted(grant) = input else {
+    let (PeerInput::PullGranted(grant), Some(session_gen)) = (input, session_gen) else {
         return None;
     };
     let slots: Vec<u32> = grant.requested.iter().collect();
     (!slots.is_empty()).then(|| BlockInput::ReleaseClaims {
         peer,
+        session_gen,
         block_id: grant.block_id,
         stripe: grant.stripe,
         slots,
@@ -306,13 +320,31 @@ pub(crate) fn refused_grant(
     })
 }
 
+/// The inputs that tell a new session of every admitted block still active,
+/// with the parts this node already holds of each.
+pub(crate) fn replay_admitted(table: &BlockTable) -> Vec<PeerInput> {
+    let mut inputs = Vec::new();
+    for (admitted, indices) in table.active_admitted_blocks() {
+        let block_id = admitted.block_id;
+        inputs.push(PeerInput::BlockAdmitted(admitted_input(&admitted)));
+        if !indices.is_empty() {
+            inputs.push(PeerInput::Ready {
+                block_id,
+                indices,
+                push: false,
+            });
+        }
+    }
+    inputs
+}
+
 /// The [`PeerInput::BlockAdmitted`] payload that publishes `admitted`.
 pub(crate) fn admitted_input(admitted: &AdmittedBlock) -> BlockAdmitted {
     BlockAdmitted {
         block_id: admitted.block_id,
         coding: admitted.coding,
         proposer_node: admitted.proposer_node,
-        header_meta: Some(admitted.header_meta.clone()),
+        header_meta: admitted.header_meta.clone(),
         as_proposer: admitted.as_proposer,
         have_held_until: admitted.have_deadline,
     }

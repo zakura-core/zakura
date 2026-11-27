@@ -71,10 +71,10 @@ zcash_transparent = { workspace = true }
 zcash_script = { workspace = true }
 zcash_primitives = { workspace = true }
 
-zakura-script = { path = "../zakura-script", version = "5.0.9" }
+zakura-script = { path = "../zakura-script", version = "6.0.0" }
 zakura-state = { path = "../zakura-state", version = "19.0.0" }
 zakura-node-services = { path = "../zakura-node-services", version = "6.0.0" }
-zakura-rt = { path = "../zakura-rt", version = "0.4.0" }
+zakura-rt = { path = "../zakura-rt", version = "0.5.0" }
 zakura-chain = { path = "../zakura-chain", version = "17.0.0" }
 zakura-header-chain = { path = "../zakura-header-chain", version = "6.0.0" }
 

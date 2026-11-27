@@ -53,19 +53,23 @@ fn keys(index: usize) -> NodeKeyList {
     NodeKeyList::single(NodeSecretKey::from_bytes(&seed).public_key())
 }
 
-/// The `index`th test node's Ed25519 key with three entries of unassigned
-/// tags after it: the longest a key list can be.
-fn longest_keys(index: usize) -> NodeKeyList {
+/// The entries of the longest key list a record can carry, 32 of them: the
+/// `index`th test node's Ed25519 key, then 31 entries of unassigned tags, the
+/// last the highest tag there is.
+fn longest_key_entries(index: usize) -> Vec<(u16, [u8; 32])> {
     let key = keys(index)
         .ed25519()
         .expect("a test node's list holds its Ed25519 key");
-    NodeKeyList::from_entries([
-        (ED25519_KEY_TAG, *key.as_bytes()),
-        (UNKNOWN_KEY_TAG, [0x11; 32]),
-        (UNKNOWN_KEY_TAG + 1, [0x22; 32]),
-        (u16::MAX, [0x33; 32]),
-    ])
-    .expect("the tags are nonzero and increasing")
+    let mut entries = vec![(ED25519_KEY_TAG, *key.as_bytes())];
+    entries.extend((0..30u8).map(|unknown| (UNKNOWN_KEY_TAG + u16::from(unknown), [unknown; 32])));
+    entries.push((u16::MAX, [0x33; 32]));
+    entries
+}
+
+/// The longest key list of the `index`th test node.
+fn longest_keys(index: usize) -> NodeKeyList {
+    NodeKeyList::from_entries(longest_key_entries(index))
+        .expect("the tags are nonzero and increasing")
 }
 
 /// Node ids in byte order: enough to fill an exclusion list.
@@ -128,6 +132,21 @@ fn longest_ipv6(index: u8) -> SocketAddr {
 
 /// The `index`th test node's record body with the longest key list and the
 /// most and longest addresses and services.
+/// Two TLVs this release does not know, types 0x7002 and 0x7003, whose
+/// values are as long as an SLH-DSA-128s key and signature. They fill the
+/// room the body cap keeps for a second record signature.
+fn key_and_signature_sized_extensions() -> Vec<u8> {
+    let mut tlvs = 0x7002u16.to_le_bytes().to_vec();
+    tlvs.extend_from_slice(&32u16.to_le_bytes());
+    tlvs.extend_from_slice(&[0xbc; 32]);
+    tlvs.extend_from_slice(&0x7003u16.to_le_bytes());
+    tlvs.extend_from_slice(&7_856u16.to_le_bytes());
+    tlvs.extend_from_slice(&[0xcd; 7_856]);
+    tlvs
+}
+
+/// The longest record body: the longest key list, the most and largest
+/// addresses and services, and a full extension area.
 fn longest_body(index: usize) -> ZakuraNodeRecordBody {
     ZakuraNodeRecordBody {
         direct_addrs: (0..MAX_DIRECT_ADDRS_PER_RECORD)
@@ -138,6 +157,7 @@ fn longest_body(index: usize) -> ZakuraNodeRecordBody {
         zakura_protocol_max: u16::MAX,
         sequence: u64::MAX,
         expires_at_unix_secs: u64::MAX,
+        extensions: key_and_signature_sized_extensions(),
         ..shortest_body(longest_keys(index))
     }
 }
@@ -668,15 +688,13 @@ impl MessageSample for DiscoveryMessage {
                 rejected_by: |error| *error == WireError::OutOfRange("record key list"),
             },
             Violation {
-                name: "record key list holds five entries",
+                name: "record key list holds 33 entries",
                 frame: hello_with_body(&raw_body(
-                    &raw_keys(&[
-                        (ED25519_KEY_TAG, valid_key()),
-                        (2, [2; 32]),
-                        (3, [3; 32]),
-                        (4, [4; 32]),
-                        (5, [5; 32]),
-                    ]),
+                    &raw_keys(
+                        &std::iter::once((ED25519_KEY_TAG, valid_key()))
+                            .chain((2..34u8).map(|tag| (u16::from(tag), [tag; 32])))
+                            .collect::<Vec<_>>(),
+                    ),
                     &NO_LISTS,
                     (1, 1),
                     1,
@@ -1057,15 +1075,9 @@ fn fixture_service(index: usize) -> Vec<u8> {
 }
 
 fn fixture_record(index: usize) -> Vec<u8> {
-    let key = keys(index)
-        .ed25519()
-        .expect("a test node's list holds its Ed25519 key");
-    let mut body = raw_keys(&[
-        (ED25519_KEY_TAG, *key.as_bytes()),
-        (UNKNOWN_KEY_TAG, [0x11; 32]),
-        (UNKNOWN_KEY_TAG + 1, [0x22; 32]),
-        (u16::MAX, [0x33; 32]),
-    ]);
+    // The count byte and 32 entries of a 2-byte tag and 32 bytes.
+    let mut body = raw_keys(&longest_key_entries(index));
+    assert_eq!(body.len(), 1 + 32 * 34);
     body.extend_from_slice(&8u16.to_le_bytes());
     for index in 0..8u8 {
         let SocketAddr::V6(addr) = longest_ipv6(index) else {
@@ -1087,17 +1099,27 @@ fn fixture_record(index: usize) -> Vec<u8> {
     body.extend_from_slice(&[7; 32]);
     body.extend_from_slice(&u64::MAX.to_le_bytes());
     body.extend_from_slice(&u64::MAX.to_le_bytes());
-    assert_eq!(body.len(), 685);
+    // The longest fields, then the extension area: two unknown TLVs as long
+    // as an SLH-DSA-128s key and signature, in the room kept for a second
+    // signature.
+    assert_eq!(body.len(), 1_637);
+    body.extend_from_slice(&[0x02, 0x70]);
+    body.extend_from_slice(&32u16.to_le_bytes());
+    body.extend_from_slice(&[0xbc; 32]);
+    body.extend_from_slice(&[0x03, 0x70]);
+    body.extend_from_slice(&7_856u16.to_le_bytes());
+    body.extend_from_slice(&[0xcd; 7_856]);
+    assert_eq!(body.len(), 9_533);
 
-    let mut out = 685u32.to_le_bytes().to_vec();
+    let mut out = 9_533u32.to_le_bytes().to_vec();
     out.extend_from_slice(&body);
     out.extend_from_slice(&[0xab; 64]);
     out
 }
 
 #[test]
-fn hello_fixture_is_753_bytes() {
-    check_fixture(MSG_DISCOVERY_HELLO, fixture_record(0), 753);
+fn hello_fixture_is_9601_bytes() {
+    check_fixture(MSG_DISCOVERY_HELLO, fixture_record(0), 9_601);
 }
 
 #[test]
@@ -1125,12 +1147,12 @@ fn get_peers_fixture_is_8470_bytes() {
 }
 
 #[test]
-fn peers_fixture_is_24098_bytes() {
+fn peers_fixture_is_307234_bytes() {
     let mut bytes = 32u16.to_le_bytes().to_vec();
     for index in 0..32 {
         bytes.extend_from_slice(&fixture_record(index));
     }
-    check_fixture(MSG_DISCOVERY_PEERS, bytes, 24_098);
+    check_fixture(MSG_DISCOVERY_PEERS, bytes, 307_234);
 }
 
 #[test]

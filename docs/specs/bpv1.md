@@ -473,7 +473,11 @@ connection. The receiver's relay-flagged indices become its pushed seeds.
 The receiver holds flagged indices as pending claims: it does not pull them
 until they turn late, and it releases a late push like a late pull (section
 7). Each flagged `Have` starts its own late time from its own estimated
-arrival, so a later flag never delays an earlier one. A pushed part that crosses another peer's copy of the same index returns
+arrival, so a later flag never delays an earlier one. A pending push belongs
+to the session that flagged it. When the peer reconnects and flags it again on
+its new session, the push moves to that session and keeps its earlier late time.
+A flag from a session the node has already replaced or removed expects nothing,
+so it never takes a push back. A pushed part that crosses another peer's copy of the same index returns
 `Drop` as surplus.
 
 BPv1 defines no lanes. The subscription rules below use lanes and
@@ -575,9 +579,11 @@ the peer is lying. The receiver cannot yet check such a message.
 
 - On the data stream, the receiver holds `Part` and `Have` messages in a
   per-peer early record, with a byte bound per peer, a node-wide byte bound, and
-  an age bound `EARLY_AGE`. When a peer's record is full, the receiver pauses
-  reading that peer's data stream until entries leave the record. Pausing is not
-  a violation.
+  an age bound `EARLY_AGE`. The byte bounds count what the receiver holds: a
+  held `Have` costs its frame, or its block id plus its decoded indices,
+  whichever is larger, because a bitmap byte names up to eight indices. When a
+  peer's record is full, the receiver pauses reading that peer's data stream
+  until entries leave the record. Pausing is not a violation.
 - On the control stream, the receiver MAY hold `StripeDone`, `BlockDone`, and
   `Advert` in a separate small per-peer record. It MUST NOT pause the control
   stream for this record, because the metadata that resolves the block can sit
@@ -704,7 +710,7 @@ describes. Payload caps below are W2 values (`01-wire.md` §1).
 | 5 | `StripeDone` | control | Announcement | — | 36 |
 | 6 | `BlockDone` | control | Announcement | — | 32 |
 | 8 | `Part` | data | Item | Answers `Want` or a push flag | 66,085 |
-| 9 | `Have` | data | Announcement | — | 16,419 |
+| 9 | `Have` | data | Announcement | — | 8,227 |
 | 11 | `WantEnd` | data | Response | Ends `Want` | 7 |
 
 ### Results and filter order
@@ -743,6 +749,7 @@ MAX_STRIPES        = 512
 MAX_PARTS          = 44,032      // MAX_STRIPES * MAX_N
 MAX_PROOF_DEPTH    = 16          // log2(128) + log2(512)
 MAX_HAVE_INDICES   = 4,096
+MAX_HAVE_BITMAP    = 5,504       // ceil(MAX_PARTS / 8) bytes
 MAX_WANTS_INFLIGHT = 64          // live Wants per connection direction
 MAX_OPEN_SUBS      = 1,024       // subscriptions outside Idle per connection direction
 PROPAGATION_DEPTH  = 16          // blocks below the highest admitted height
@@ -791,9 +798,11 @@ Section 8 lists every field in transmission order.
 A node MUST send `HeaderMeta` for a block at most once per connection. It
 MUST forward only metadata it admitted, and only within the propagation window
 in section 2. It SHOULD forward admitted metadata promptly to every peer, including peers without subscriptions. Forwarding MUST NOT wait
-for parts or a per-hop request. It SHOULD NOT send metadata to a peer that
-already sent it the block's metadata. The proposer SHOULD write `HeaderMeta` to
-every peer before it writes any part.
+for parts or a per-hop request. It SHOULD NOT send metadata on a connection
+on which the peer already sent it the block's metadata. A peer's later
+connection never carried that copy, so it gets the metadata like any other
+connection, even when the peer sent the first copy on an earlier connection.
+The proposer SHOULD write `HeaderMeta` to every peer before it writes any part.
 
 A header that headerchain rejects returns `Disconnect` when headerchain
 classifies the failure as peer-caused. A missing parent invokes bounded
@@ -985,15 +994,17 @@ verification worker pauses reading and is not a violation.
 #### `Have` — Announcement, discriminator 9
 
 - **Frame**
-  - payload cap = 16,419 bytes
+  - payload cap = 8,227 bytes
 - **Decode**
-  - `flags` = `0x00`, `0x01` (push), or `0x03` (push and relay); any other
-    value returns `Disconnect` (close-1)
-  - index count = 1..=4,096
-  - indices strictly increasing
-  - exact consumption
+  - `flags` = `0x00`, `0x01` (push), or `0x03` (push and relay), each with or
+    without `0x04` (bitmap); any other value returns `Disconnect` (close-1)
+  - without the bitmap bit: a `u16` count of 1..=4,096, then that many
+    `u16` indices, strictly increasing, and exact consumption
+  - with the bitmap bit: the rest of the payload, 1..=5,504 bytes, with
+    1..=4,096 bits set
 - **Verify**, when the receiver has admitted the block
   - every index < `stripes * n`
+  - a bitmap is exactly `ceil(stripes * n / 8)` bytes
 - **Push flags**, when the receiver has admitted the block, counted across the
   block's flagged `Have`s on this connection
   - from `proposer_node`: at most `n` flagged indices per stripe, of which at
@@ -1004,7 +1015,12 @@ verification worker pauses reading and is not a violation.
   - each `(block_id, index)` at most once per connection
 
 `Have` states that the sender holds verified parts. The sender MUST announce
-only such parts. It SHOULD batch announcements for at most `HAVE_FLUSH_MS` or
+only such parts. It SHOULD encode the indices in the smaller form for the
+block's `stripes * n` parts: a `u16` list takes `2 + 2 * count` bytes, a bitmap
+`ceil(stripes * n / 8)` bytes, and a tie keeps the list (decision-33). Bit
+`i mod 8` of bitmap byte `i / 8` announces index `i`. The receiver reads a
+bitmap's length from the frame, so it decodes a `Have` before it admits the
+block, and checks the length once it admits the block. It SHOULD batch announcements for at most `HAVE_FLUSH_MS` or
 `HAVE_FLUSH_COUNT` indices. The proposer MUST NOT send an unflagged `Have` for
 its own block (decision-20, bpv1-9). The receiver uses `Have`s to choose pulls,
 to skip sends, and to measure lag.
@@ -1038,8 +1054,12 @@ still lacks. At both times the node skips a part that the peer announced or
 sent, and a stripe or block the peer finished. Flagged `Have`s, `Have`s to the
 proposer, seeds, and repair are not paced.
 
-An out-of-range index or a repeated index returns `Disconnect` while the
-receiver retains the block's peer view. A push flag past the connection's
+An out-of-range index, a repeated index, or a bitmap whose length is not
+`ceil(stripes * n / 8)` returns `Disconnect` (close-16) while the receiver
+retains the block's peer view. A set bitmap bit at or past `stripes * n` is an
+out-of-range index. A `Have` from the early record meets these checks at
+replay. A `Have` for a retired block spends the retired index counter by its
+index count, whatever its form. A push flag past the connection's
 push bound, a relay flag from a connection other than `proposer_node`, or a
 relay flag past `n - k` in one stripe returns `Disconnect` (close-20). A
 `Have` for an unknown block enters the data-stream early record, and a `Have`
@@ -1420,7 +1440,7 @@ The following table lists each payload's fields in transmission order.
 | `BlockDone` | block identifier |
 | `Advert` | block identifier, `u32(wait_us)`, `u16(count)`, items of lane (32) and `i32(delay_us)` |
 | `Part` | block identifier, `u32(index)`, `u8(sibling_count)`, siblings (32 each), payload (`wire_len(index)`) |
-| `Have` | block identifier, `u8(flags)`, `u16(count)`, `u32(index)` each |
+| `Have` | block identifier, `u8(flags)`, then `u16(count)` and `u16(index)` each, or with flag `0x04` a bitmap (the rest of the payload) |
 | `WantEnd` | `u32(want_id)`, `u16(sent)`, `u8(reason)` |
 | `SubscriptionEnd` | scope, `u16(count)`, lanes (32 each) |
 
@@ -1428,9 +1448,10 @@ The requested bitmap encodes stripe-relative index `j` in bit `j mod 8` of byte
 `j / 8`. `Refuse` reasons are 0 `Capacity`, 1 `UnknownBlock`, 2 `Policy`, and
 3 `Shed`.
 `WantEnd` reasons are 0 `Served`, 1 `UnknownBlock`, and 2 `Retired`.
-`Have` flags are `0x00`, `0x01` (push), or `0x03` (push and relay). Bit 1, the
-relay flag, is valid only with bit 0. Any other value returns `Disconnect`
-(close-1).
+`Have` flags are `0x00`, `0x01` (push), or `0x03` (push and relay), each with
+or without `0x04` (bitmap). Bit 1, the relay flag, is valid only with bit 0.
+Any other value returns `Disconnect` (close-1). A `Have` bitmap encodes wire
+index `i` in bit `i mod 8` of byte `i / 8`.
 
 The binding contains
 `u32(coinbase_length) || canonical_coinbase || u8(txid_sibling_count) || txid_siblings || u8(auth_sibling_count) || auth_siblings || light_client_root`.
@@ -1454,7 +1475,7 @@ registry.
 | Parameter | Reference value | Meaning and authority |
 | --- | --- | --- |
 | `S_MIN`; `S_MAX`; `STRIPE_K`; `parity_parts(k)` | 4,096 bytes; 65,536 bytes; 64; `ceil(k / 3)` | W2 profile. `S` is per block (section 2). `S_MIN` keeps a part's prefix, proof, and announcement under 4% of its payload. Parity near one third let pulling nodes skip slow neighbours at 128 and 256 MiB. |
-| `MAX_STRIPES`; `MAX_HAVE_INDICES` | 512; 4,096 | W2 syntax limits. |
+| `MAX_STRIPES`; `MAX_HAVE_INDICES`; `MAX_HAVE_BITMAP` | 512; 4,096; 5,504 bytes | W2 syntax limits. |
 | `MAX_WANTS_INFLIGHT` | 64 per connection direction | W2 commitment limit. The server acts only above twice this value. |
 | `MAX_OPEN_SUBS` | 1,024 per connection direction | W2 limit on subscriptions outside `Idle`. The publisher acts only above twice this value. |
 | Publisher accept limit | `TBD`, at most `MAX_OPEN_SUBS` | Local capacity. The publisher refuses above it. |

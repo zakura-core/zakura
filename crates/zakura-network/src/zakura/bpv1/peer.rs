@@ -21,8 +21,8 @@ use super::{
     profile::{Coding, Profile, W2_MAX_HAVE_INDICES},
     tree::VerifiedPart,
     wire::{
-        part_payload_len, Bpv1Message, HaveFlags, WantBitmap, WantEndReason, BPV1_CONTROL_KIND,
-        BPV1_DATA_KIND, HAVE_FLUSH_INTERVAL, MAX_WANTS_INFLIGHT, PART_RULE,
+        part_payload_len, Bpv1Message, HaveFlags, HaveForm, WantBitmap, WantEndReason,
+        BPV1_CONTROL_KIND, BPV1_DATA_KIND, HAVE_FLUSH_INTERVAL, MAX_WANTS_INFLIGHT, PART_RULE,
     },
 };
 
@@ -181,7 +181,7 @@ pub enum DropReason {
 }
 
 /// Block admitted locally in `BlockTable`; triggers `HeaderMeta` send (unless
-/// the peer already sent it) and replays held early entries.
+/// it already crossed this connection) and replays held early entries.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BlockAdmitted {
     /// Consensus block hash.
@@ -190,8 +190,12 @@ pub struct BlockAdmitted {
     pub coding: Coding,
     /// Committed proposer transport identity.
     pub proposer_node: NodeId,
-    /// Full `HeaderMeta` message to forward if this peer did not send it.
-    pub header_meta: Option<Box<Bpv1Message>>,
+    /// Full `HeaderMeta` message, which the session forwards unless the
+    /// metadata already crossed its connection. A new session of the peer
+    /// that sent it first still gets it. Every admitted block carries it,
+    /// so the metadata crosses each connection before any block traffic
+    /// (bpv1-8, bpv1-14).
+    pub header_meta: Box<Bpv1Message>,
     /// Whether this local node is the block's proposer (queues `BlockDone` right after `HeaderMeta`, bpv1-9).
     pub as_proposer: bool,
     /// Outside the block's `Have` initial group: when the peer may first
@@ -219,6 +223,9 @@ pub struct RecvHave {
     pub block_id: block::Hash,
     /// Push and relay flags (decision-24).
     pub flags: HaveFlags,
+    /// The form the indices arrived in. A bitmap's length must fit the
+    /// admitted geometry (decision-33, close-16).
+    pub form: HaveForm,
     /// Strictly increasing wire indices.
     pub indices: Vec<u32>,
     /// Encoded frame bytes (for early-record accounting).
@@ -438,6 +445,8 @@ pub enum PeerOutput {
         block_id: block::Hash,
         /// Push and relay flags (decision-24).
         flags: HaveFlags,
+        /// The smaller index form for the block's geometry (decision-33).
+        form: HaveForm,
         /// Strictly increasing wire indices.
         indices: Vec<u32>,
     },
@@ -497,6 +506,9 @@ pub enum PeerOutput {
         block_id: block::Hash,
         /// Verified part.
         part: VerifiedPart,
+        /// Generation of the session that accepted the part, which owns its
+        /// charge.
+        session_gen: u64,
         /// How the part was authorized.
         auth: PartAuth,
     },
@@ -547,7 +559,7 @@ pub enum PeerOutput {
         /// Whether to also purge queued `Have`s (true on retirement).
         include_haves: bool,
     },
-    /// Release node-wide pull claims for undelivered indices (late pull or deadline).
+    /// Release this session's pull claims for undelivered indices (late pull, deadline, or refused grant).
     ReleaseClaims {
         /// Block consensus hash.
         block_id: block::Hash,
@@ -580,6 +592,22 @@ pub enum PeerOutput {
     CloseProtocol(Bpv1CloseCause),
     /// Close the connection neutrally after a repeat liveness stall (bpv1-58).
     CloseNeutralStall,
+}
+
+/// A [`PeerOutput::SendHave`] of `indices` in the smaller form for `coding`
+/// (decision-33).
+fn send_have(
+    block_id: block::Hash,
+    coding: &Coding,
+    flags: HaveFlags,
+    indices: Vec<u32>,
+) -> PeerOutput {
+    PeerOutput::SendHave {
+        block_id,
+        flags,
+        form: HaveForm::smaller(coding.total_parts().unwrap_or(0), indices.len()),
+        indices,
+    }
 }
 
 /// How long a transfer of `bytes` may make no progress before the session
@@ -744,7 +772,12 @@ struct PeerBlockState {
     /// As the proposer: direct copies waiting for an idle data writer, in
     /// release order (decision-19).
     copies: VecDeque<VerifiedPart>,
+    /// This session wrote the block's `HeaderMeta`. A repeated
+    /// `BlockAdmitted` never writes it twice (bpv1-4).
     meta_sent: bool,
+    /// The peer sent the block's `HeaderMeta` on this connection. Admission
+    /// sets `meta_sent` or this, so the metadata crossed before any block
+    /// traffic (bpv1-8, bpv1-14).
     meta_received: bool,
     send_mark: BitSet,
     recv_record: BitSet,
@@ -792,10 +825,6 @@ impl PeerBlockState {
             have_held_until: None,
             have_delayed: false,
         }
-    }
-
-    fn meta_exchanged(&self) -> bool {
-        self.meta_sent || self.meta_received
     }
 
     /// Set bits of `set` in `stripe`.
@@ -932,11 +961,19 @@ impl EarlyDataKind {
         }
     }
 
-    /// Encoded frame bytes charged to the early record.
-    fn frame_bytes(&self) -> usize {
+    /// Bytes charged to the early record: a part's payload, or a `Have`'s
+    /// frame or its block id plus decoded indices, whichever is larger. A
+    /// bitmap byte decodes to up to eight `u32` indices (decision-33), so the
+    /// frame alone undercounts what the record holds.
+    fn held_bytes(&self) -> usize {
         match self {
             Self::Part(prefix) => prefix.payload.len(),
-            Self::Have(have) => have.frame_bytes,
+            Self::Have(have) => have.frame_bytes.max(
+                have.indices
+                    .len()
+                    .saturating_mul(std::mem::size_of::<u32>())
+                    .saturating_add(std::mem::size_of::<block::Hash>()),
+            ),
         }
     }
 }
@@ -1207,7 +1244,7 @@ impl PeerState {
     pub fn step(&mut self, now: Instant, input: PeerInput) -> PeerStep {
         let mut step = PeerStep::default();
         if matches!(input, PeerInput::SessionEnd) {
-            self.handle_session_end(&mut step);
+            self.handle_session_end();
             return step;
         }
         if self.is_closed() {
@@ -1367,17 +1404,16 @@ impl PeerState {
         }
 
         // bpv1-4: send HeaderMeta at most once per connection, and never back
-        // to a peer that sent it first.
-        if let Some(meta) = header_meta {
-            if !state.meta_received && !state.meta_sent {
-                state.meta_sent = true;
-                step.outputs.push(PeerOutput::SendControl(meta));
-            }
+        // on a connection that sent it. The session's own record decides,
+        // because a peer's later session never received this copy.
+        if !state.meta_received && !state.meta_sent {
+            state.meta_sent = true;
+            step.outputs.push(PeerOutput::SendControl(header_meta));
         }
 
         // bpv1-9: proposer queues BlockDone right after HeaderMeta so no peer
         // pushes or announces parts back.
-        if as_proposer && state.meta_exchanged() && !state.local_block_done_sent {
+        if as_proposer && !state.local_block_done_sent {
             state.local_block_done_sent = true;
             step.outputs
                 .push(PeerOutput::SendControl(Box::new(Bpv1Message::BlockDone {
@@ -1480,13 +1516,7 @@ impl PeerState {
             return;
         }
 
-        // 5. HeaderMeta must have crossed in either direction before accept (bpv1-14).
-        if !block.meta_exchanged() {
-            self.buffer_early_data(now, EarlyDataKind::Part(prefix), step);
-            return;
-        }
-
-        // 6. Attribution: a push slot first (bpv1-69), a seed when the
+        // 5. Attribution: a push slot first (bpv1-69), a seed when the
         //    proposer opened it (bpv1-16), then live Want (bpv1-13).
         // Widening u32 to usize is lossless on supported targets.
         let flagged = block.peer_flagged.get(index as usize);
@@ -1622,6 +1652,7 @@ impl PeerState {
         step.outputs.push(PeerOutput::InsertPart {
             block_id: token.block_id,
             part,
+            session_gen: token.session_gen,
             auth: inflight.auth,
         });
     }
@@ -1655,10 +1686,6 @@ impl PeerState {
         let Some(block) = self.blocks.get_mut(&block_id) else {
             return;
         };
-        // bpv1-8: never queue Have/Part/Done before HeaderMeta crossed.
-        if !block.meta_exchanged() {
-            return;
-        }
         // bpv1-9 / decision-20: the proposer never announces its own block.
         if block.as_proposer {
             return;
@@ -1685,11 +1712,12 @@ impl PeerState {
                     block_id,
                     count: indices.len(),
                 });
-                step.outputs.push(PeerOutput::SendHave {
+                step.outputs.push(send_have(
                     block_id,
-                    flags: HaveFlags::Plain,
+                    &block.coding,
+                    HaveFlags::Plain,
                     indices,
-                });
+                ));
             }
             return;
         }
@@ -1755,12 +1783,7 @@ impl PeerState {
         let Some(block) = self.blocks.get_mut(&block_id) else {
             return;
         };
-        // bpv1-8: never queue Have/Part before HeaderMeta crossed.
-        if !block.meta_exchanged()
-            || block.peer_block_done
-            || self.remote_node == block.proposer_node
-            || block.as_proposer
-        {
+        if block.peer_block_done || self.remote_node == block.proposer_node || block.as_proposer {
             return;
         }
         let bound = block.coding.n.saturating_sub(block.coding.k);
@@ -1787,11 +1810,12 @@ impl PeerState {
         // A `Have` lists at most `W2_MAX_HAVE_INDICES`, so each chunk goes
         // out as its own flagged `Have` ahead of its parts.
         for chunk in flagged.chunks(W2_MAX_HAVE_INDICES) {
-            step.outputs.push(PeerOutput::SendHave {
+            step.outputs.push(send_have(
                 block_id,
-                flags: HaveFlags::Push,
-                indices: chunk.to_vec(),
-            });
+                &block.coding,
+                HaveFlags::Push,
+                chunk.to_vec(),
+            ));
             for &index in chunk {
                 step.outputs.push(PeerOutput::PushPart { block_id, index });
             }
@@ -1823,11 +1847,12 @@ impl PeerState {
                     count: chunk.len(),
                     delayed,
                 });
-                step.outputs.push(PeerOutput::SendHave {
+                step.outputs.push(send_have(
                     block_id,
-                    flags: HaveFlags::Plain,
-                    indices: chunk.to_vec(),
-                });
+                    &block.coding,
+                    HaveFlags::Plain,
+                    chunk.to_vec(),
+                ));
             }
         }
     }
@@ -1855,11 +1880,14 @@ impl PeerState {
         let indices = have.indices;
 
         let total = block.coding.total_parts().unwrap_or(0);
-        // Validate every index before mutating peer_have (bpv1-25, close-16). The
+        // Validate the form and every index before mutating peer_have
+        // (bpv1-25, close-16). A bitmap sized for another geometry, or a
+        // padding bit, which names an index at or past `total`, closes. The
         // decoder already rejected indices that are not strictly increasing.
-        if indices
-            .iter()
-            .any(|&idx| idx >= total || block.peer_have.get(idx as usize))
+        if !have.form.fits(total)
+            || indices
+                .iter()
+                .any(|&idx| idx >= total || block.peer_have.get(idx as usize))
         {
             self.close_protocol(BPV1_DATA_KIND, Bpv1CloseRow::Row16BadHaveIndex, step);
             return;
@@ -1959,10 +1987,7 @@ impl PeerState {
             reject(step);
             return;
         };
-        if !block.meta_exchanged()
-            || stripe >= block.coding.stripes
-            || !requested.all_below(block.coding.n)
-        {
+        if stripe >= block.coding.stripes || !requested.all_below(block.coding.n) {
             reject(step);
             return;
         }
@@ -2053,8 +2078,8 @@ impl PeerState {
         let Some(block) = self.blocks.get_mut(&block_id) else {
             return;
         };
-        // bpv1-8 / bpv1-9: only the proposer seeds, after `HeaderMeta` crossed.
-        if !block.meta_exchanged() || block.peer_block_done || !block.as_proposer {
+        // bpv1-9: only the proposer seeds.
+        if block.peer_block_done || !block.as_proposer {
             return;
         }
         let mut relay: Vec<VerifiedPart> = Vec::new();
@@ -2077,11 +2102,8 @@ impl PeerState {
             for chunk in parts.chunks(W2_MAX_HAVE_INDICES) {
                 let mut indices: Vec<u32> = chunk.iter().map(VerifiedPart::index).collect();
                 indices.sort_unstable();
-                step.outputs.push(PeerOutput::SendHave {
-                    block_id,
-                    flags,
-                    indices,
-                });
+                step.outputs
+                    .push(send_have(block_id, &block.coding, flags, indices));
                 for part in chunk {
                     step.outputs.push(PeerOutput::SendSeedPart {
                         block_id,
@@ -2142,11 +2164,8 @@ impl PeerState {
                 .map(|part| part.wire_payload().len() as u64)
                 .sum(),
         });
-        step.outputs.push(PeerOutput::SendHave {
-            block_id,
-            flags: HaveFlags::Push,
-            indices,
-        });
+        step.outputs
+            .push(send_have(block_id, &block.coding, HaveFlags::Push, indices));
         for part in batch {
             step.outputs
                 .push(PeerOutput::SendSeedPart { block_id, part });
@@ -2218,12 +2237,9 @@ impl PeerState {
             return;
         }
 
-        // If HeaderMeta hasn't crossed or peer already sent BlockDone/StripeDone,
-        // serve 0 parts and end cleanly.
-        if !block.meta_exchanged()
-            || block.peer_block_done
-            || block.peer_stripe_done.get(stripe as usize)
-        {
+        // If the peer already sent BlockDone/StripeDone, serve 0 parts and
+        // end cleanly.
+        if block.peer_block_done || block.peer_stripe_done.get(stripe as usize) {
             self.end_want(want_id, want, 0, WantEndReason::Served, step);
             return;
         }
@@ -2338,7 +2354,7 @@ impl PeerState {
         let Some(block) = self.blocks.get_mut(&block_id) else {
             return;
         };
-        if !block.meta_exchanged() || stripe >= block.coding.stripes {
+        if stripe >= block.coding.stripes {
             return;
         }
         // bpv1-39: announce StripeDone at most once per (block, stripe) per connection.
@@ -2355,9 +2371,6 @@ impl PeerState {
         let Some(block) = self.blocks.get_mut(&block_id) else {
             return;
         };
-        if !block.meta_exchanged() {
-            return;
-        }
         // bpv1-39: announce BlockDone at most once per block per connection.
         if !block.local_block_done_sent {
             block.local_block_done_sent = true;
@@ -2486,10 +2499,10 @@ impl PeerState {
             self.note_dropped_early(&entry.kind);
             step.events.push(PeerEvent::EarlyAged {
                 block_id: entry.kind.block_id(),
-                bytes: entry.kind.frame_bytes(),
+                bytes: entry.kind.held_bytes(),
             });
         }
-        self.release_early(aged.iter().map(|e| e.kind.frame_bytes()).sum(), step);
+        self.release_early(aged.iter().map(|e| e.kind.held_bytes()).sum(), step);
         self.early_control
             .retain(|e| now.saturating_duration_since(e.received_at) < early_age);
 
@@ -2599,19 +2612,10 @@ impl PeerState {
         }
     }
 
-    fn handle_session_end(&mut self, step: &mut PeerStep) {
-        // Release all outstanding node-wide pull claims before clearing state (bpv1-62).
-        for want in self.wants_out.values() {
-            let slots = want.unreceived_slots();
-            if !slots.is_empty() {
-                step.outputs.push(PeerOutput::ReleaseClaims {
-                    block_id: want.block_id,
-                    stripe: want.stripe,
-                    slots,
-                    reason: ReleaseReason::Refused,
-                });
-            }
-        }
+    /// Clears every per-session record. The table's `SessionEnded` releases
+    /// this session's pull claims and pending pushes (bpv1-62), including
+    /// grants that never reached the session, so the end emits nothing.
+    fn handle_session_end(&mut self) {
         self.blocks.clear();
         self.meta_received_pending.clear();
         self.retired.clear();
@@ -2648,7 +2652,7 @@ impl PeerState {
 
     fn buffer_early_data(&mut self, now: Instant, kind: EarlyDataKind, step: &mut PeerStep) {
         let block_id = kind.block_id();
-        let bytes = kind.frame_bytes();
+        let bytes = kind.held_bytes();
         // A single frame larger than the entire per-peer early cap can never fit:
         // drop it explicitly without pausing an empty queue.
         let refused = if bytes > self.config.early_peer_bytes_cap {
@@ -2710,7 +2714,7 @@ impl PeerState {
             .into_iter()
             .partition(|e| e.kind.block_id() == block_id);
         self.early_data = kept;
-        self.release_early(data.iter().map(|e| e.kind.frame_bytes()).sum(), step);
+        self.release_early(data.iter().map(|e| e.kind.held_bytes()).sum(), step);
         (control, data)
     }
 

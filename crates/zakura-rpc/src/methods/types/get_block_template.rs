@@ -838,7 +838,8 @@ impl MinerParams {
             addr,
             data,
             memo,
-            // The gateway is this node's ID, which only its network stack knows.
+            // The gateway is set at startup: this node's ID or the relay
+            // `mining.miner_mesh_gateways` names.
             mesh_commitment: None,
         })
     }

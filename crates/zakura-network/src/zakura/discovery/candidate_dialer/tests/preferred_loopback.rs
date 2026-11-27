@@ -55,6 +55,7 @@ fn spawn_dialer(
 
 fn ranking(gateway: NodeId) -> MinerGatewayRanking {
     MinerGatewayRanking {
+        always_preferred: Vec::new(),
         gateways: vec![MinerGateway {
             gateway_id: GatewayId::from_node_id(gateway.as_bytes()),
             blocks: 1,
@@ -101,7 +102,12 @@ async fn a_node_at_its_ordinary_limit_connects_to_a_known_gateway() {
     ranking_tx.send_replace(ranking(gateway_id));
 
     await_registered(&dialer_node, gateway_id, "the gateway registers").await;
-    assert_eq!(dialer_node.endpoint().discovery_dial_permits(), 0);
+    assert_eq!(
+        dialer_node
+            .endpoint()
+            .discovery_dial_permits(dialer_node.discovery().ordinary_connection_cap),
+        0
+    );
 
     dialer.abort();
     dialer_node.shutdown().await;
@@ -240,6 +246,7 @@ async fn connection_places_report_the_ranking_and_the_peers() {
     let unknown = NodeSecretKey::generate().public();
     let (dialer, ranking_tx) = spawn_dialer(&dialer_node);
     ranking_tx.send_replace(MinerGatewayRanking {
+        always_preferred: Vec::new(),
         gateways: vec![
             MinerGateway {
                 gateway_id: GatewayId::from_node_id(gateway_id.as_bytes()),
@@ -258,12 +265,14 @@ async fn connection_places_report_the_ranking_and_the_peers() {
                 gateway_id: GatewayId::from_node_id(gateway_id.as_bytes()),
                 blocks: 2,
                 place: GatewayPlace::Preferred,
+                always_preferred: false,
                 connected: true,
             },
             PlacedGateway {
                 gateway_id: GatewayId::from_node_id(unknown.as_bytes()),
                 blocks: 1,
                 place: GatewayPlace::Unmatched,
+                always_preferred: false,
                 connected: false,
             },
         ],

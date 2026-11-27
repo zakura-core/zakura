@@ -98,7 +98,7 @@ use crate::zakura::{
         unknown_parent::UnknownParentVerdict,
         wire::{
             encode_part_frame, message_type, Bpv1FifoQueue, Bpv1Message, DataQueueItem, HaveFlags,
-            WantBitmap, WantEndReason, PROPAGATION_DEPTH,
+            HaveForm, WantBitmap, WantEndReason, PROPAGATION_DEPTH,
         },
     },
     wire_codec::encode_frame,
@@ -649,6 +649,7 @@ impl Mesh {
                             block_id: token.block_id,
                             index: token.index,
                             from_peer,
+                            session_gen,
                         },
                     );
                 }
@@ -908,10 +909,13 @@ impl Mesh {
             1 => {
                 let flags =
                     [HaveFlags::Plain, HaveFlags::Push, HaveFlags::Relay][usize::from(a >> 5) % 3];
-                let indices = (0..8u32).filter(|i| mask & (1 << i) != 0).collect();
+                let indices: Vec<u32> = (0..8u32).filter(|i| mask & (1 << i) != 0).collect();
+                // The form an honest sender picks for the block's geometry.
+                let total = solved.map_or(0, |s| s.encoded.coding.total_parts().unwrap_or(0));
                 let message = Bpv1Message::Have {
                     block_id,
                     flags,
+                    form: HaveForm::smaller(total, indices.len()),
                     indices,
                 };
                 (false, encode_frame(&message).ok())
@@ -1093,14 +1097,21 @@ impl Mesh {
                 &end.outputs,
             );
             // The shell forgets the session's metadata senders, then ends the
-            // peer in the table. A mesh link never has a newer session that
-            // replaced this one, so the shell drops the session's own outputs:
-            // `SessionEnded` releases everything the peer held.
+            // session in the table. A mesh link never has a newer session
+            // that replaced this one, so `SessionEnded` also drops the
+            // peer's node facts.
             let peer = self.nodes[remote].id;
             let session_gen = session.state.session_gen();
             self.step_table(local, BlockInput::MetaSessionEnded { peer, session_gen });
             let peer_states = self.peer_states(local);
-            self.step_table(local, BlockInput::SessionEnded { peer, peer_states });
+            self.step_table(
+                local,
+                BlockInput::SessionEnded {
+                    peer,
+                    session_gen,
+                    peer_states,
+                },
+            );
         }
     }
 
@@ -1180,6 +1191,7 @@ impl Mesh {
         session.state.assert_invariants();
         self.summary.steps += 1;
         hit_peer_step(&mut self.summary.reached, &input, &step.outputs);
+        let session_gen = session.state.session_gen();
         let mut work: VecDeque<PeerOutput> = step.outputs.into();
         while let Some(output) = work.pop_front() {
             if let PeerOutput::ServeWant {
@@ -1208,7 +1220,7 @@ impl Mesh {
             }
             let remote = self.nodes[peer].id;
             let states = || self.peer_states(node);
-            match route_peer_output(remote, output, states) {
+            match route_peer_output(remote, session_gen, output, states) {
                 PeerRoute::Table(input) => self.step_table(node, input),
                 PeerRoute::Session(output) => self.session_output(node, peer, output),
             }
@@ -1280,6 +1292,7 @@ impl Mesh {
             PeerOutput::SendHave {
                 block_id,
                 flags,
+                form,
                 indices,
             } => self.push_data(
                 node,
@@ -1287,6 +1300,7 @@ impl Mesh {
                 DataQueueItem::Have {
                     block_id,
                     flags,
+                    form,
                     indices,
                 },
             ),
@@ -1430,7 +1444,7 @@ impl Mesh {
                         self.step_peer(node, to, input);
                     } else {
                         let states = || self.peer_states(node);
-                        if let Some(release) = refused_grant(peer, input, states) {
+                        if let Some(release) = refused_grant(peer, session_gen, input, states) {
                             self.step_table(node, release);
                         }
                     }
@@ -1456,10 +1470,7 @@ impl Mesh {
     fn check_table_output(&mut self, node: usize, output: &BlockOutput) {
         let n = &mut self.nodes[node];
         match output {
-            BlockOutput::PublishAdmitted {
-                admitted,
-                from_peer: Some(_),
-            } => assert!(
+            BlockOutput::PublishAdmitted { admitted } if !admitted.as_proposer => assert!(
                 !n.retired.contains(&admitted.block_id),
                 "{MESH}: bpv1-46 node {node} readmitted retired block {:?}",
                 admitted.block_id

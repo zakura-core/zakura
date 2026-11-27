@@ -326,7 +326,7 @@ pub enum ReleaseReason {
     /// deadline passed, or the peer already owes it on a live `Want`. The peer
     /// counts as tried.
     Failed,
-    /// A local refusal (parked, window full, mailbox closed) or session end.
+    /// A local refusal (parked, window full, no session took the grant).
     /// The peer never failed the slot, so it stays eligible.
     Refused,
 }
@@ -336,6 +336,9 @@ pub enum ReleaseReason {
 pub struct PullPeerState {
     /// Remote peer identity.
     pub peer: NodeId,
+    /// Generation of the session this snapshot describes. A grant planned
+    /// from it goes to that session only, and its claims belong to it.
+    pub session_gen: u64,
     /// Bytes this peer currently owes from live `Want`s (including late ones).
     pub ahead_bytes: u64,
     /// Whether this peer is open, unparked, and below `MAX_WANTS_INFLIGHT`.
@@ -409,10 +412,13 @@ pub enum BlockInput {
         parts: Vec<VerifiedPart>,
     },
     /// `peer` flagged `indices` for push (decision-24). They count as pending
-    /// claims held by `peer` until they arrive or turn late (bpv1-64).
+    /// claims held by the flagging session until they arrive, turn late
+    /// (bpv1-64), or that session ends.
     PushFlagged {
-        /// The pushing connection.
+        /// The pushing peer.
         peer: NodeId,
+        /// Generation of the session that carries the pushes.
+        session_gen: u64,
         /// Target block.
         block_id: block::Hash,
         /// Flagged wire indices.
@@ -420,6 +426,10 @@ pub enum BlockInput {
         /// Whether the proposer flagged them for relay: this node's pushed
         /// seeds, which it pushes onward once it holds them (decision-24).
         relay: bool,
+        /// Whether the flagging session was still the peer's registered
+        /// session when it sent the flag. A replaced or removed session can
+        /// no longer deliver, so its flag expects no part (bpv1-89).
+        live: bool,
     },
     /// Path estimate update from `PathSource` (`decision-12`, `bpv1-40`, `bpv1-65`).
     PathObserved {
@@ -444,11 +454,18 @@ pub enum BlockInput {
         /// The session's generation.
         session_gen: u64,
     },
-    /// Peer session ended: drop path entry and release its pull claims (`bpv1-62`, `bpv1-65`).
+    /// Peer session ended: release its pull claims and pending pushes
+    /// (`bpv1-62`). Without a later live session of `peer`, also drop the
+    /// peer's path entry (`bpv1-65`), announcements, and `BlockDone`.
     SessionEnded {
         /// Disconnected peer.
         peer: NodeId,
-        /// Remaining live peers for immediate re-planning.
+        /// Generation of the ended session. Only its claims and pending
+        /// pushes are released; another session's stay.
+        session_gen: u64,
+        /// Every live session's pull capacity, read when the table takes
+        /// this input. An entry for another session of `peer` means the
+        /// peer reconnected, so its node facts stay (bpv1-89).
         peer_states: Vec<PullPeerState>,
     },
     /// `peer` sent `BlockDone` for `block_id`, so it holds every part. Only
@@ -481,10 +498,13 @@ pub enum BlockInput {
         /// Snapshot of live peers' pull capacities.
         peer_states: Vec<PullPeerState>,
     },
-    /// Release node-wide pull claims held by `peer`.
+    /// Release pull claims held by one session of `peer`.
     ReleaseClaims {
         /// Peer whose claims are being released.
         peer: NodeId,
+        /// Generation of the session that holds the claims. A claim that
+        /// another session of `peer` holds stays (bpv1-63).
+        session_gen: u64,
         /// Target block.
         block_id: block::Hash,
         /// Target stripe.
@@ -499,8 +519,9 @@ pub enum BlockInput {
     /// Verified part delivered by a peer (`bpv1-22`, `bpv1-23`, `decision-10`).
     ///
     /// The part's bytes must already be charged by [`BlockTable::charge_part`]
-    /// for `(index, from_peer)`; an uncharged part is not stored. Storing the
-    /// part keeps the charge; a duplicate or stale part releases it.
+    /// for `(index, from_peer, session_gen)`; an uncharged part is not stored.
+    /// Storing the part keeps the charge; a duplicate or stale part releases
+    /// it.
     InsertPart {
         /// Target block.
         block_id: block::Hash,
@@ -508,13 +529,15 @@ pub enum BlockInput {
         part: VerifiedPart,
         /// Peer that supplied the part.
         from_peer: NodeId,
+        /// Generation of the session that accepted the part.
+        session_gen: u64,
         /// How the session authorized the part.
         auth: PartAuth,
         /// Snapshot of live peers' pull capacities (used if a stripe still needs parts).
         peer_states: Vec<PullPeerState>,
     },
-    /// Proof verification failed for a part charged by [`BlockTable::charge_part`]:
-    /// release its charge.
+    /// A part charged by [`BlockTable::charge_part`] will not be inserted: its
+    /// proof failed, or its session ended first. Release its charge.
     ReleasePartCharge {
         /// Target block.
         block_id: block::Hash,
@@ -522,6 +545,8 @@ pub enum BlockInput {
         index: u32,
         /// Peer that sent the part.
         from_peer: NodeId,
+        /// Generation of the session that accepted the part.
+        session_gen: u64,
     },
     /// This node uploaded `bytes` of `block_id` part payloads to a peer (`upload.bytes_over_body`).
     PartUploaded {
@@ -650,13 +675,14 @@ pub enum BlockOutput {
     PublishAdmitted {
         /// The admitted block descriptor.
         admitted: AdmittedBlock,
-        /// Peer that originally delivered `HeaderMeta` (`None` if local proposer).
-        from_peer: Option<NodeId>,
     },
-    /// Grant an arrival-ordered pull to `peer`'s `PeerState`.
+    /// Grant an arrival-ordered pull to one `PeerState` session of `peer`.
     GrantPull {
         /// Chosen pull server.
         peer: NodeId,
+        /// Generation of the session that the plan read, which owns the
+        /// grant's claims. No other session of `peer` takes the grant.
+        session_gen: u64,
         /// Block hash.
         block_id: block::Hash,
         /// Target stripe.
@@ -909,6 +935,8 @@ pub enum BlockEvent {
 
 /// One peer's grant while [`BlockTable`] plans a stripe.
 struct PlannedPull {
+    /// The session of the peer that the grant goes to.
+    session_gen: u64,
     requested: WantBitmap,
     /// Arrival estimate of the last part granted to this peer.
     arrival: Arrival,
@@ -1177,11 +1205,13 @@ struct StripeState {
     held_count: u32,
     /// Number of held source parts (`0..=k`).
     source_held_count: u32,
-    /// Active pull claim owner per stripe-relative slot.
-    claims: HashMap<u32, NodeId>,
+    /// Active pull claim owner per stripe-relative slot: the peer and the
+    /// generation of the session that took the grant.
+    claims: HashMap<u32, (NodeId, u64)>,
     /// Slots a peer sends unasked and has not delivered yet, with the sender:
     /// the proposer's flagged seeds (decision-19) or a holder's flagged
-    /// pushes (decision-24). The first sender keeps the slot. They count as
+    /// pushes (decision-24). The first peer keeps the slot, and only a live
+    /// session of that peer takes it over (`expect_incoming`). They count as
     /// pending, apart from `claims`, so a neighbour seeded beyond `k` keeps
     /// `held + claims <= k` for pulls.
     incoming: HashMap<u32, Incoming>,
@@ -1283,10 +1313,11 @@ impl StripeState {
 /// A slot a peer sends unasked (decision-19, decision-24).
 #[derive(Copy, Clone, Debug)]
 struct Incoming {
-    sender: NodeId,
+    /// The peer and the generation of the session that carries the part.
+    sender: (NodeId, u64),
     /// When the slot turns late: `SLOW_X` × the estimated arrival of the
-    /// batch that listed or flagged it (bpv1-64). A later batch from the
-    /// same sender never moves it.
+    /// batch that listed or flagged it (bpv1-64). No later batch moves it
+    /// later, including one from another session of the same peer.
     late_at: Instant,
 }
 
@@ -1324,8 +1355,10 @@ struct ActiveBlock {
     /// True once `BlockDone` has been announced to routines.
     block_done_notified: bool,
     /// Peer part bytes charged before proof and not yet stored or released,
-    /// keyed by `(index, peer)`.
-    part_charges: HashMap<(u32, NodeId), u64>,
+    /// keyed by `(index, peer, session generation)`. Each charge belongs to
+    /// the session that accepted the part, so a replaced session's stale
+    /// completion never releases its replacement's charge (bpv1-63).
+    part_charges: HashMap<(u32, NodeId, u64), u64>,
     /// Charged bytes of stored peer parts, held until retirement.
     stored_charge: u64,
     /// When `HeaderMeta` arrived, or when the proposer admitted the block.
@@ -1649,13 +1682,15 @@ impl BlockTable {
     /// the answer before it starts proof work. A later `InsertPart` stores the
     /// part under the charge or releases it; `ReleasePartCharge` releases it
     /// after a failed proof; retirement releases every charge of the block. A
-    /// repeated charge for the same `(index, peer)` replaces the earlier one.
+    /// repeated charge for the same `(index, from_peer, session_gen)` replaces
+    /// the earlier one.
     pub fn charge_part(
         &mut self,
         now: Instant,
         block_id: &block::Hash,
         index: u32,
         from_peer: NodeId,
+        session_gen: u64,
         bytes: u64,
     ) -> Result<(Coding, [u8; 32]), PartRefusal> {
         let charged = self.part_buffer_bytes();
@@ -1672,15 +1707,12 @@ impl BlockTable {
             .wire_len(index)
             .map_or(0, |len| block.meta.coding.part_bytes.saturating_sub(len));
         let bytes = bytes.saturating_add(u64::from(padding));
-        let replaced = block
-            .part_charges
-            .get(&(index, from_peer))
-            .copied()
-            .unwrap_or(0);
+        let charge = (index, from_peer, session_gen);
+        let replaced = block.part_charges.get(&charge).copied().unwrap_or(0);
         if charged - replaced + bytes > budget {
             return Err(PartRefusal::LocalCapacity);
         }
-        block.part_charges.insert((index, from_peer), bytes);
+        block.part_charges.insert(charge, bytes);
         block.first_part_at.get_or_insert(now);
         Ok((block.meta.coding, block.meta.part_root))
     }
@@ -1843,10 +1875,19 @@ impl BlockTable {
             }
             BlockInput::PushFlagged {
                 peer,
+                session_gen,
                 block_id,
                 indices,
                 relay,
-            } => self.handle_push_flagged(now, peer, block_id, &indices, relay, &mut step),
+                live,
+            } => {
+                self.handle_push_flagged(peer, block_id, &indices, relay, &mut step);
+                // A session that is no longer live can't deliver, so its
+                // flag expects nothing and never takes a slot (bpv1-89).
+                if live {
+                    self.expect_incoming(now, (peer, session_gen), block_id, &indices);
+                }
+            }
             BlockInput::PathObserved { peer, estimate } => self.paths.observe(peer, estimate),
             BlockInput::RateSample { peer, sample } => {
                 self.paths.record_sample(peer, sample);
@@ -1854,8 +1895,12 @@ impl BlockTable {
             BlockInput::MetaSessionEnded { peer, session_gen } => {
                 self.forget_meta_session((peer, session_gen));
             }
-            BlockInput::SessionEnded { peer, peer_states } => {
-                self.handle_session_ended(now, peer, &peer_states, &mut step);
+            BlockInput::SessionEnded {
+                peer,
+                session_gen,
+                peer_states,
+            } => {
+                self.handle_session_ended(now, (peer, session_gen), &peer_states, &mut step);
             }
             BlockInput::PeerBlockDone {
                 peer,
@@ -1881,6 +1926,7 @@ impl BlockTable {
             }
             BlockInput::ReleaseClaims {
                 peer,
+                session_gen,
                 block_id,
                 stripe,
                 slots,
@@ -1889,7 +1935,7 @@ impl BlockTable {
             } => {
                 self.handle_release_claims(
                     now,
-                    peer,
+                    (peer, session_gen),
                     block_id,
                     stripe,
                     &slots,
@@ -1902,6 +1948,7 @@ impl BlockTable {
                 block_id,
                 part,
                 from_peer,
+                session_gen,
                 auth,
                 peer_states,
             } => {
@@ -1909,7 +1956,7 @@ impl BlockTable {
                     now,
                     block_id,
                     part,
-                    from_peer,
+                    (from_peer, session_gen),
                     auth,
                     &peer_states,
                     &mut step,
@@ -1919,9 +1966,10 @@ impl BlockTable {
                 block_id,
                 index,
                 from_peer,
+                session_gen,
             } => {
                 if let Some(block) = self.blocks.get_mut(&block_id) {
-                    block.part_charges.remove(&(index, from_peer));
+                    block.part_charges.remove(&(index, from_peer, session_gen));
                 }
             }
             BlockInput::PartUploaded { block_id, bytes } => {
@@ -2596,10 +2644,7 @@ impl BlockTable {
         // selection and writer-start checks skip the claimed body.
         step.outputs
             .push(BlockOutput::ClaimBody { block_id, deadline });
-        step.outputs.push(BlockOutput::PublishAdmitted {
-            admitted,
-            from_peer: Some(entry.from_peer),
-        });
+        step.outputs.push(BlockOutput::PublishAdmitted { admitted });
         // An empty body has no stripes, so the block assembles from
         // `HeaderMeta` alone and no part crosses the wire for it.
         self.maybe_assemble_and_verify(now, block_id, step);
@@ -2866,10 +2911,7 @@ impl BlockTable {
         let admitted = active.admitted();
         self.blocks.insert(block_id, active);
         step.events.push(BlockEvent::BlockAdmitted { block_id });
-        step.outputs.push(BlockOutput::PublishAdmitted {
-            admitted,
-            from_peer: None,
-        });
+        step.outputs.push(BlockOutput::PublishAdmitted { admitted });
         // decision-20: the proposer announces nothing. Its `BlockDone` tells
         // repair that it holds every part.
     }
@@ -2899,14 +2941,18 @@ impl BlockTable {
         }
     }
 
-    /// Records `peer`'s flagged pushes as pending claims held by `peer` and
-    /// arms their late timer (decision-24, bpv1-64). The planner never asks
-    /// `peer` for a part it is pushing. Relay-flagged indices, which only the
-    /// proposer sends, become this node's pushed seeds: it pushes each onward
-    /// once it holds it, and one already held goes out now (bpv1-71).
+    /// Handles `peer`'s push flags. `expect_incoming` records a live
+    /// session's flagged pushes as pending claims held by that session and
+    /// arms their late timer (decision-24, bpv1-64). The planner
+    /// skips a slot while its push is pending, and the session refuses a
+    /// grant for a part its peer is pushing (bpv1-69). Neither marks `peer`
+    /// tried: only a late push or a failed pull does, because a push that
+    /// ends with its session says nothing about the node. Relay-flagged
+    /// indices, which only the proposer sends, become this node's pushed
+    /// seeds: it pushes each onward once it holds it, and one already held
+    /// goes out now (bpv1-71).
     fn handle_push_flagged(
         &mut self,
-        now: Instant,
         peer: NodeId,
         block_id: block::Hash,
         indices: &[u32],
@@ -2924,7 +2970,6 @@ impl BlockTable {
         for &index in indices {
             if let Some((stripe, slot)) = block.meta.coding.split_index(index) {
                 let st = &mut block.stripes[stripe as usize];
-                st.tried[slot as usize].insert(peer);
                 if relay && peer == block.meta.proposer_node {
                     st.pushed.insert(slot);
                     if st.held[slot as usize].is_some() {
@@ -2940,21 +2985,28 @@ impl BlockTable {
                 push: true,
             });
         }
-        self.expect_incoming(now, peer, block_id, indices);
     }
 
     /// Marks each of `indices` that the block lacks and that no claim or
-    /// earlier sender covers as pending from `peer`. They turn late at
-    /// `SLOW_X` × the estimated arrival of this batch. A later batch from
-    /// `peer` keeps its own late time, so it never delays this one (bpv1-64).
+    /// other peer's push covers as pending from session `session_gen` of
+    /// `peer`. They turn late at `SLOW_X` × the estimated arrival of this
+    /// batch. A later batch from the same session keeps its own late time,
+    /// so it never delays this one (bpv1-64). A slot pending from another
+    /// session of `peer` moves to this live session, so the other session's
+    /// end can't drop the live push (bpv1-89). It keeps the earlier of its
+    /// two late times, so a reconnect never delays it either.
     fn expect_incoming(
         &mut self,
         now: Instant,
-        peer: NodeId,
+        (peer, session_gen): (NodeId, u64),
         block_id: block::Hash,
         indices: &[u32],
     ) {
-        let Some(block) = self.blocks.get_mut(&block_id) else {
+        let Some(block) = self
+            .blocks
+            .get_mut(&block_id)
+            .filter(|b| b.phase == BlockPhase::Collecting)
+        else {
             return;
         };
         let coding = block.meta.coding;
@@ -2967,11 +3019,14 @@ impl BlockTable {
                 continue;
             };
             let st = &block.stripes[stripe as usize];
+            let pending = st.incoming.get(&slot);
+            let pending_elsewhere = pending
+                .is_some_and(|pending| pending.sender.0 != peer || pending.sender.1 == session_gen);
             if st.assemblable
                 || st.decoding()
                 || st.has(slot, coding.k)
                 || st.claims.contains_key(&slot)
-                || st.incoming.contains_key(&slot)
+                || pending_elsewhere
             {
                 continue;
             }
@@ -2988,10 +3043,15 @@ impl BlockTable {
             .max(Duration::from_millis(1));
         let late_at = now + estimate.saturating_mul(SLOW_X);
         for (stripe, slot) in batch {
-            block.stripes[stripe as usize].incoming.insert(
+            let incoming = &mut block.stripes[stripe as usize].incoming;
+            // Only another session of `peer` can hold a slot in the batch.
+            let late_at = incoming
+                .get(&slot)
+                .map_or(late_at, |moved| moved.late_at.min(late_at));
+            incoming.insert(
                 slot,
                 Incoming {
-                    sender: peer,
+                    sender: (peer, session_gen),
                     late_at,
                 },
             );
@@ -3001,27 +3061,42 @@ impl BlockTable {
     fn handle_session_ended(
         &mut self,
         now: Instant,
-        peer: NodeId,
+        (peer, session_gen): (NodeId, u64),
         peer_states: &[PullPeerState],
         step: &mut BlockStep,
     ) {
+        // bpv1-89: another live session of `peer` keeps the node's path,
+        // announcements, and `BlockDone`. The table never relies on
+        // generation order, so only identity counts.
+        let reconnected = peer_states
+            .iter()
+            .any(|ps| ps.peer == peer && ps.session_gen != session_gen);
         // bpv1-65: drop path entry with connection.
-        self.paths.remove(&peer);
+        if !reconnected {
+            self.paths.remove(&peer);
+        }
+        // Every session's end reaches the table, so each end releases only
+        // its own session's claims and pending pushes.
+        let ended = |owner: (NodeId, u64)| owner == (peer, session_gen);
 
         let mut replan: Vec<(block::Hash, u32)> = Vec::new();
         for (&block_id, block) in &mut self.blocks {
             if block.phase != BlockPhase::Collecting {
                 continue;
             }
-            block.done_peers.remove(&peer);
-            // A sender's pending seeds and pushes end with its connection.
+            if !reconnected {
+                block.done_peers.remove(&peer);
+            }
+            // A session's claims and pending seeds and pushes end with it.
             for (s_idx, stripe) in block.stripes.iter_mut().enumerate() {
-                for set in &mut stripe.announcers {
-                    set.remove(&peer);
+                if !reconnected {
+                    for set in &mut stripe.announcers {
+                        set.remove(&peer);
+                    }
                 }
                 let before = stripe.pending_count();
-                stripe.claims.retain(|_, owner| *owner != peer);
-                stripe.incoming.retain(|_, pending| pending.sender != peer);
+                stripe.claims.retain(|_, &mut owner| !ended(owner));
+                stripe.incoming.retain(|_, pending| !ended(pending.sender));
                 if stripe.pending_count() < before {
                     replan.push((block_id, s_idx as u32));
                 }
@@ -3073,7 +3148,7 @@ impl BlockTable {
     fn handle_release_claims(
         &mut self,
         now: Instant,
-        peer: NodeId,
+        (peer, session_gen): (NodeId, u64),
         block_id: block::Hash,
         stripe: u32,
         slots: &[u32],
@@ -3093,7 +3168,8 @@ impl BlockTable {
                 return;
             };
             for &slot in slots {
-                if st.claims.get(&slot) != Some(&peer) {
+                // bpv1-63: only the session that holds the claim releases it.
+                if st.claims.get(&slot) != Some(&(peer, session_gen)) {
                     continue;
                 }
                 if reason == ReleaseReason::Late {
@@ -3164,10 +3240,15 @@ impl BlockTable {
         let mut needed = coding.k - already;
 
         // Working `ahead` bytes and window per eligible peer, updated as this plan grants.
-        let mut room: HashMap<NodeId, (u64, u32)> = peer_states
+        let mut room: HashMap<NodeId, (u64, u32, u64)> = peer_states
             .iter()
             .filter(|ps| ps.can_pull && ps.window_remaining > 0)
-            .map(|ps| (ps.peer, (ps.ahead_bytes, ps.window_remaining)))
+            .map(|ps| {
+                (
+                    ps.peer,
+                    (ps.ahead_bytes, ps.window_remaining, ps.session_gen),
+                )
+            })
             .collect();
         if room.is_empty() {
             return;
@@ -3196,7 +3277,7 @@ impl BlockTable {
                     if tried.contains(&peer) {
                         continue;
                     }
-                    let Some(&(ahead, window)) = room.get(&peer) else {
+                    let Some(&(ahead, window, _)) = room.get(&peer) else {
                         continue;
                     };
                     if window == 0 {
@@ -3221,12 +3302,15 @@ impl BlockTable {
                 break;
             };
 
-            st.claims.insert(slot, peer);
-            if let Some((ahead, window)) = room.get_mut(&peer) {
-                *ahead = ahead.saturating_add(part_bytes);
-                *window = window.saturating_sub(1);
-            }
+            let Some((ahead, window, session_gen)) = room.get_mut(&peer) else {
+                break;
+            };
+            *ahead = ahead.saturating_add(part_bytes);
+            *window = window.saturating_sub(1);
+            let session_gen = *session_gen;
+            st.claims.insert(slot, (peer, session_gen));
             let grant = grants.entry(peer).or_insert(PlannedPull {
+                session_gen,
                 requested: WantBitmap::EMPTY,
                 arrival,
             });
@@ -3244,6 +3328,7 @@ impl BlockTable {
         for (peer, grant) in grant_list {
             step.outputs.push(BlockOutput::GrantPull {
                 peer,
+                session_gen: grant.session_gen,
                 block_id,
                 stripe,
                 requested: grant.requested,
@@ -3258,7 +3343,7 @@ impl BlockTable {
         now: Instant,
         block_id: block::Hash,
         part: VerifiedPart,
-        from_peer: NodeId,
+        (from_peer, session_gen): (NodeId, u64),
         auth: PartAuth,
         peer_states: &[PullPeerState],
         step: &mut BlockStep,
@@ -3272,7 +3357,7 @@ impl BlockTable {
             };
             // 03 §4: every peer part is charged before proof. Removing the charge
             // here releases it on every early return; storing the part keeps it.
-            let Some(charge) = block.part_charges.remove(&(index, from_peer)) else {
+            let Some(charge) = block.part_charges.remove(&(index, from_peer, session_gen)) else {
                 return;
             };
             if matches!(block.phase, BlockPhase::Retired | BlockPhase::Fallback) {
@@ -3706,16 +3791,17 @@ impl BlockTable {
                 continue;
             }
             // Each slot turns late at its own time (bpv1-64).
-            let mut late: Vec<NodeId> = block
+            let mut late: Vec<(NodeId, u64)> = block
                 .stripes
                 .iter()
                 .flat_map(|st| st.incoming.values())
                 .filter(|pending| now >= pending.late_at)
                 .map(|pending| pending.sender)
                 .collect();
-            late.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+            late.sort_by(|a, b| (a.0.as_bytes(), a.1).cmp(&(b.0.as_bytes(), b.1)));
             late.dedup();
             for sender in late {
+                let peer = sender.0;
                 let mut released = false;
                 for (s_idx, st) in block.stripes.iter_mut().enumerate() {
                     let mut slots: Vec<u32> = st
@@ -3734,22 +3820,19 @@ impl BlockTable {
                         st.incoming.remove(&slot);
                         if st.late_released.insert(slot) {
                             step.events.push(BlockEvent::PullLate {
-                                peer: sender,
+                                peer,
                                 block_id,
                                 stripe,
                                 slot,
                             });
                         }
-                        st.tried[slot as usize].insert(sender);
+                        st.tried[slot as usize].insert(peer);
                     }
                     released = true;
                     late_seeds.push((block_id, stripe));
                 }
-                if released && sender != block.meta.proposer_node {
-                    step.events.push(BlockEvent::PushLate {
-                        peer: sender,
-                        block_id,
-                    });
+                if released && peer != block.meta.proposer_node {
+                    step.events.push(BlockEvent::PushLate { peer, block_id });
                 }
             }
         }

@@ -64,10 +64,11 @@ use super::transport::{
     check_reactor_shares, frame_wire_bytes, sim_arg, sim_chain, transport_observe,
     worker_framed_channel, AdmittedFrame, CloseOutcome, CloseRow, CompatResponseGrant,
     ConnectionPlaces, ConnectionResources, FrameGate, FrameGrant, FramedWorkerRecv,
-    HandshakeCounts, HeldPlaces, IpAdmission, NeutralCause, NodeResources, OrderedStreamFailure,
-    OrderedStreamFailureCause, OwnerBound, OwnerGuard, OwnerPhase, ReactorBudget, ReactorShares,
-    ReceiveBudget, ResourceEnvelope, SessionLayout, SlotClass, SlotRefusal, StreamResources,
-    TransportLimits, COMPAT_EXCHANGE_BUDGET, COMPAT_RESPONSE_MAX_AGGREGATE_BYTES,
+    HandshakeCounts, HeldPlaces, IpAdmission, MovedNodeIds, NeutralCause, NodeResources,
+    OrderedStreamFailure, OrderedStreamFailureCause, OwnerBound, OwnerGuard, OwnerPhase,
+    ProvenNode, ReactorBudget, ReactorShares, ReceiveBudget, RegisteredPeers, ResourceEnvelope,
+    SessionLayout, SlotClass, SlotRefusal, StreamResources, TransportLimits,
+    COMPAT_EXCHANGE_BUDGET, COMPAT_RESPONSE_MAX_AGGREGATE_BYTES,
 };
 #[cfg(any(test, feature = "zakura-testkit"))]
 use crate::zakura::drive_header_sync_actions;
@@ -1482,15 +1483,30 @@ impl ZakuraEndpoint {
     /// slot, otherwise the transport's free discovery slots. A dial claims
     /// a slot for every address it tries, or fails with none claimed.
     pub(crate) fn discovery_admission_capacity(&self) -> usize {
-        if self.discovery_dial_permits() == 0 {
+        if self.handler.free_connection_slots() == 0 {
             return 0;
         }
         self.quic.discovery_capacity()
     }
 
+    /// Transport room for an ordinary replacement after one established connection leaves.
+    pub(crate) fn discovery_replacement_address_capacity(&self) -> usize {
+        self.quic.discovery_replacement_capacity()
+    }
+
     /// Select preferred gateways within this endpoint's funded extra capacity.
     pub fn publish_gateway_ranking(&self, ranking: impl IntoIterator<Item = super::RankedGateway>) {
         self.handler.publish_gateway_ranking(ranking);
+    }
+
+    /// Applies discovery's ordinary slot budget when yielding a moved gateway's place.
+    pub(super) fn publish_discovery_gateway_ranking(
+        &self,
+        ranking: impl IntoIterator<Item = super::RankedGateway>,
+        ordinary_cap: usize,
+    ) {
+        self.handler
+            .publish_discovery_gateway_ranking(ranking, ordinary_cap);
     }
 
     /// The places the connection-slot checks hold for preferred gateways
@@ -1529,8 +1545,11 @@ impl ZakuraEndpoint {
     /// connection slots, which leave the places held for preferred gateways.
     /// Each dial holds one slot from its start, or fails as a local limit
     /// without one.
-    pub(crate) fn discovery_dial_permits(&self) -> usize {
-        self.handler.free_connection_slots()
+    pub(crate) fn discovery_dial_permits(&self, ordinary_cap: usize) -> usize {
+        self.supervisor
+            .ip_slots
+            .counts()
+            .free_ordinary_connections(ordinary_cap.min(self.handler.limits.max_connections))
     }
 
     /// How many dials to preferred gateways can start now: every free
@@ -1702,6 +1721,10 @@ pub struct ZakuraSupervisorHandle {
     inner: Arc<AsyncMutex<ZakuraSupervisorState>>,
     shutdown: CancellationToken,
     peer_set_tx: watch::Sender<Vec<ZakuraPeerId>>,
+    /// The earlier IDs of nodes that this node's dials found under a new ID.
+    /// A dial writes it before its connection registers, so a reader woken by
+    /// `peer_set_tx` already sees the move behind a new registration.
+    moved_tx: watch::Sender<MovedNodeIds>,
     registration_tx: broadcast::Sender<ZakuraConnectionRegistration>,
     pending_handoffs: Arc<StdMutex<HashMap<ZakuraPeerId, ZakuraHandoffId>>>,
     peer_registry: Option<PeerRegistry>,
@@ -1836,16 +1859,31 @@ pub(crate) struct ConnectionAdmissionGuard {
     slots: IpSlots,
     node: NodeId,
     inbound: bool,
+    /// Ordinary slot limit for this caller, also enforced if TLS changes the slot class.
+    ordinary_cap: usize,
     #[cfg(any(test, zakura_sim))]
     observation: Option<HandshakeObservation>,
 }
 
 impl ConnectionAdmissionGuard {
-    /// The outbound QUIC connection has authenticated this guard's dial target.
-    fn outbound_connected(&mut self) {
+    /// The outbound QUIC connection has authenticated the node this guard's
+    /// dial reached, `connected`. When its ID isn't the one the slot was
+    /// claimed for, the guard holds its slot under that ID from here on.
+    ///
+    /// The limits apply to `connected` as they did to the claim. A refusal
+    /// leaves the guard as it was, and the caller closes the connection.
+    fn outbound_connected<'a>(
+        &mut self,
+        connected: impl Into<ProvenNode<'a>>,
+    ) -> Result<(), SlotRefusal> {
         assert!(!self.inbound && !self.authenticated_dial);
-        self.slots.counts().outbound_connected(self.node);
+        let connected = connected.into();
+        self.slots
+            .counts()
+            .outbound_connected(self.node, connected, self.ordinary_cap)?;
+        self.node = connected.id();
         self.authenticated_dial = true;
+        Ok(())
     }
 }
 
@@ -2158,6 +2196,7 @@ impl ZakuraSupervisorHandle {
             .register(
                 1,
                 handle.peer_id().clone(),
+                &[],
                 Some("192.0.2.6".parse().expect("test IP parses")),
                 [6; TRANSCRIPT_HASH_BYTES],
                 handle,
@@ -2200,6 +2239,7 @@ impl ZakuraSupervisorHandle {
             })),
             shutdown: CancellationToken::new(),
             peer_set_tx: watch::channel(Vec::new()).0,
+            moved_tx: watch::channel(MovedNodeIds::default()).0,
             registration_tx,
             pending_handoffs: Arc::new(StdMutex::new(HashMap::new())),
             peer_registry,
@@ -2275,6 +2315,40 @@ impl ZakuraSupervisorHandle {
     /// Subscribe to peer-set changes for event-driven tests and diagnostics.
     pub fn subscribe(&self) -> watch::Receiver<Vec<ZakuraPeerId>> {
         self.peer_set_tx.subscribe()
+    }
+
+    /// The node IDs that this node's dials found their nodes have moved on
+    /// from.
+    pub(crate) fn moved_node_ids(&self) -> watch::Receiver<MovedNodeIds> {
+        self.moved_tx.subscribe()
+    }
+
+    /// The registered peers, for a caller that asks whether a node it knows
+    /// by ID is registered. Unlike [`Self::subscribe`]'s peer set, it finds a
+    /// node that has moved on from that ID.
+    pub(crate) fn registered_peers(&self) -> RegisteredPeers {
+        RegisteredPeers::new(self.peer_set_tx.subscribe(), self.moved_tx.subscribe())
+    }
+
+    /// Records that a dial to `dialed` reached the node whose ID is now
+    /// `connected`.
+    pub(super) fn learn_move(&self, dialed: NodeId, connected: NodeId) {
+        metrics::counter!("zakura.p2p.conn.dial.moved").increment(1);
+        let news = self
+            .moved_tx
+            .send_if_modified(|moved| moved.learn(dialed, connected));
+        if news {
+            info!(
+                %dialed,
+                connected_as = %connected,
+                "A Zakura peer answered a dial to its earlier node ID under a new one"
+            );
+        }
+    }
+
+    /// Whether a connection of `peer_id` is registered now.
+    pub(crate) fn is_registered(&self, peer_id: &ZakuraPeerId) -> bool {
+        self.peer_set_tx.borrow().contains(peer_id)
     }
 
     /// Start an atomic wait for the next connection generation of `peer_id`.
@@ -2372,12 +2446,15 @@ impl ZakuraSupervisorHandle {
         }
     }
 
+    /// Registers the authenticated connection of `peer_id` under a fresh
+    /// connection ID. See [`Self::register_with_reserved_conn_id`].
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     async fn register(
         &self,
         _trace_conn_id: ZakuraConnId,
         peer_id: ZakuraPeerId,
+        proven_earlier: &[NodeId],
         remote_ip: Option<IpAddr>,
         transcript_hash: [u8; TRANSCRIPT_HASH_BYTES],
         outbound_handle: ZakuraPeerHandle,
@@ -2388,6 +2465,7 @@ impl ZakuraSupervisorHandle {
         self.register_with_reserved_conn_id(
             self.reserve_conn_id(),
             peer_id,
+            proven_earlier,
             remote_ip,
             transcript_hash,
             outbound_handle,
@@ -2398,13 +2476,16 @@ impl ZakuraSupervisorHandle {
         .await
     }
 
-    /// Register an authenticated connection under `conn_id`, which
-    /// [`Self::reserve_conn_id`] reserved. `None` means IDs ran out.
+    /// Registers the authenticated connection of `peer_id` under `conn_id`,
+    /// which [`Self::reserve_conn_id`] reserved. `None` means IDs ran out. The
+    /// handshake also proved the node IDs `proven_earlier` that the peer had
+    /// before it added keys (zakura-quic TLS-7).
     #[allow(clippy::too_many_arguments)]
     async fn register_with_reserved_conn_id(
         &self,
         conn_id: Option<ZakuraConnId>,
         peer_id: ZakuraPeerId,
+        proven_earlier: &[NodeId],
         remote_ip: Option<IpAddr>,
         transcript_hash: [u8; TRANSCRIPT_HASH_BYTES],
         outbound_handle: ZakuraPeerHandle,
@@ -2469,11 +2550,22 @@ impl ZakuraSupervisorHandle {
                 }
                 state.charge_ip(conn_id, host);
                 state.debug_assert_accounting();
+                // A node registered under an ID has not moved on from it,
+                // whatever an earlier dial found.
+                if let Some(node_id) = peer_id.node_id() {
+                    self.moved_tx
+                        .send_if_modified(|moved| moved.forget(&node_id));
+                }
                 let registered_ids: Vec<_> = state.active_by_peer.keys().cloned().collect();
                 set_active_connection_gauge(registered_ids.len());
                 self.peer_set_tx.send_replace(registered_ids);
                 if let Some(peer_registry) = &self.peer_registry {
-                    peer_registry.register_native_connection(peer_id.clone(), conn_id, remote_ip);
+                    peer_registry.register_native_connection(
+                        peer_id.clone(),
+                        conn_id,
+                        remote_ip,
+                        proven_earlier,
+                    );
                 }
                 let _ = self.registration_tx.send(ZakuraConnectionRegistration {
                     peer_id: peer_id.clone(),
@@ -3991,8 +4083,9 @@ impl ZakuraProtocolHandler {
                 elapsed: None,
             }
         );
+        let earlier = connection.remote_earlier_ids();
         let admission = self
-            .claim_connection(connection.remote_id(), true)
+            .claim_slot(ProvenNode::new(connection.remote_id(), &earlier), true)
             .map_err(|refusal| match refusal {
                 SlotRefusal::Hold => InboundRefusal::Hold,
                 SlotRefusal::Full | SlotRefusal::InboundShare => InboundRefusal::Admission,
@@ -4150,9 +4243,23 @@ impl ZakuraProtocolHandler {
     }
 
     fn publish_gateway_ranking(&self, ranking: impl IntoIterator<Item = super::RankedGateway>) {
+        self.publish_discovery_gateway_ranking(ranking, self.limits.max_connections);
+    }
+
+    fn publish_discovery_gateway_ranking(
+        &self,
+        ranking: impl IntoIterator<Item = super::RankedGateway>,
+        ordinary_cap: usize,
+    ) {
         let ranking = ranking.into_iter().collect();
+        let moved = self.supervisor.moved_tx.borrow();
         let mut counts = self.supervisor.ip_slots.counts();
-        counts.publish_gateway_ranking(&ranking, self.limits.max_preferred_connections);
+        counts.publish_gateway_ranking(
+            &ranking,
+            self.limits.max_preferred_connections,
+            self.limits.max_connections,
+        );
+        counts.defer_gateway_rollbacks(&moved, ordinary_cap, Instant::now());
         let hold = counts.preferred_gateways().hold();
         let split = counts.slot_split();
         drop(counts);
@@ -4166,27 +4273,81 @@ impl ZakuraProtocolHandler {
         metrics::gauge!("zakura.p2p.conn.slots.ordinary").set(split.ordinary as f64);
     }
 
-    /// Claims a connection slot for `node`, the dial target or the proven
-    /// remote of an inbound connection, as one locked check and charge.
+    /// Charges a dial to the last authenticated ID. When its ordinary slot is
+    /// unavailable, periodically let the original preferred ID try its held place.
+    /// TLS must still prove which ID can keep the slot.
+    fn claim_dial_connection(
+        &self,
+        dialed: NodeId,
+        ordinary_cap: usize,
+    ) -> Result<ConnectionAdmissionGuard, SlotRefusal> {
+        let moves = &self.supervisor.moved_tx;
+        let expected = moves.borrow().current(dialed);
+        let claim = self.claim_slot_with_ordinary_cap(expected.into(), false, ordinary_cap);
+        if expected == dialed || !matches!(claim, Err(SlotRefusal::Hold)) {
+            return claim;
+        }
+        let preferred = self
+            .supervisor
+            .ip_slots
+            .counts()
+            .preferred_gateways()
+            .contains(&dialed);
+        if preferred
+            && moves.send_if_modified(|moves| moves.take_recheck(dialed, expected, Instant::now()))
+        {
+            return self.claim_slot_with_ordinary_cap(dialed.into(), false, ordinary_cap);
+        }
+        claim
+    }
+
+    /// Claims a connection slot for `node`, a dial's target or an inbound
+    /// caller that proved no earlier ID, as one locked check and charge.
+    #[cfg(test)]
     fn claim_connection(
         &self,
         node: NodeId,
         inbound: bool,
     ) -> Result<ConnectionAdmissionGuard, SlotRefusal> {
+        self.claim_slot(node.into(), inbound)
+    }
+
+    /// Claims a connection slot for `node`, as one locked check and charge.
+    /// `node` is a dial's target, which has proved nothing yet, or the
+    /// remote an inbound connection proved, with its earlier IDs.
+    fn claim_slot(
+        &self,
+        node: ProvenNode<'_>,
+        inbound: bool,
+    ) -> Result<ConnectionAdmissionGuard, SlotRefusal> {
+        self.claim_slot_with_ordinary_cap(node, inbound, self.limits.max_connections)
+    }
+
+    /// Keeps discovery's ordinary dials below the ceiling that leaves bootstrap room.
+    fn claim_slot_with_ordinary_cap(
+        &self,
+        node: ProvenNode<'_>,
+        inbound: bool,
+        ordinary_cap: usize,
+    ) -> Result<ConnectionAdmissionGuard, SlotRefusal> {
         let mut counts = self.supervisor.ip_slots.counts();
         let preferred_dial = !inbound
-            && counts.preferred_gateways().contains(&node)
-            && counts.node_connections(&node).total() == 0;
-        let claim = counts.claim_connection(node, inbound, self.limits.max_connections);
+            && counts.preferred_gateways().contains(&node.id())
+            && counts.node_connections(&node.id()).total() == 0;
+        if !preferred_dial
+            && ordinary_cap < self.limits.max_connections
+            && counts.free_ordinary_connections(ordinary_cap) == 0
+        {
+            return Err(SlotRefusal::Hold);
+        }
+        let claim = if inbound {
+            counts.claim_inbound_connection(node, self.limits.max_connections)
+        } else {
+            counts.claim_connection(node.id(), false, self.limits.max_connections)
+        };
         drop(counts);
-        match claim {
-            Ok(SlotClass::Preferred) if inbound => {
-                metrics::counter!("zakura.p2p.conn.accepted.preferred").increment(1);
-            }
-            Err(SlotRefusal::Hold) if !inbound => {
-                metrics::counter!("zakura.p2p.conn.dial.refused.hold").increment(1);
-            }
-            _ => {}
+        if inbound && matches!(claim, Ok(SlotClass::Preferred)) {
+            metrics::counter!("zakura.p2p.conn.accepted.preferred").increment(1);
         }
         if preferred_dial && claim.is_err() {
             metrics::counter!("zakura.p2p.conn.dial.refused.preferred").increment(1);
@@ -4197,8 +4358,9 @@ impl ZakuraProtocolHandler {
             #[cfg(any(test, zakura_sim))]
             observation: None,
             slots: self.supervisor.ip_slots.clone(),
-            node,
+            node: node.id(),
             inbound,
+            ordinary_cap,
         })
     }
 
@@ -5678,6 +5840,7 @@ impl ZakuraProtocolHandler {
             .register_with_reserved_conn_id(
                 reserved_conn_id,
                 peer_id,
+                &connection.remote_earlier_ids(),
                 remote_ip,
                 context.transcript_hash,
                 outbound_handle,
@@ -6268,6 +6431,33 @@ pub(crate) async fn spawn_zakura_endpoint_with_peer_registry(
     .await
 }
 
+/// The startup warning to log when the preferred places the sessions share funds,
+/// `funded_places`, are no more than the `always_preferred` IDs the operator configured the
+/// node to always prefer, or `None` when they leave room for ranked gateways.
+///
+/// Those IDs take places first, so the gateways recent blocks name then get none, and with no
+/// funded place at all no always-preferred ID is held either. The endpoint checks this at
+/// startup against [`MemoryPlan::funded_gateway_places`](super::memory::MemoryPlan::funded_gateway_places).
+fn unfunded_always_preferred_warning(
+    always_preferred: usize,
+    funded_places: usize,
+) -> Option<&'static str> {
+    if always_preferred == 0 || funded_places > always_preferred {
+        None
+    } else if funded_places == 0 {
+        Some(
+            "the peer memory budget funds no preferred connection places, so none is held for \
+             the IDs this node is configured to always prefer; raise [memory] budget",
+        )
+    } else {
+        Some(
+            "the peer memory budget funds no more preferred connection places than the IDs this \
+             node is configured to always prefer, so those IDs take every place and the gateways \
+             recent blocks name get none; raise [memory] budget",
+        )
+    }
+}
+
 /// Starts the endpoint. `sink_factory` is boxed so this large function is compiled once for
 /// every caller's factory type. `tx_relay` and `bpv1` start once the memory pool they lease
 /// from exists.
@@ -6362,6 +6552,13 @@ async fn spawn_zakura_endpoint_inner(
         );
     }
     let limits = memory_plan.local_limits(config);
+    if let Some(ranking) = &miner_gateways {
+        let always_preferred = ranking.borrow().always_preferred.len();
+        let funded_places = memory_plan.funded_gateway_places();
+        if let Some(warning) = unfunded_always_preferred_warning(always_preferred, funded_places) {
+            warn!(always_preferred, funded_places, "{warning}");
+        }
+    }
     let node_envelope = crate::zakura::node_envelope::NodeEnvelope::for_memory_plan(
         config,
         &limits,
@@ -6838,6 +7035,8 @@ fn trace_conn_id(connection: &Connection) -> u64 {
 /// its discovery attempt or maintained redial.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum DialRegistration {
+    /// A dial to an earlier ID found the authenticated peer already registered.
+    AlreadyConnected,
     /// The supervisor registered the peer on this connection.
     Registered,
     /// This node's admission limits refused to register the peer, or a local
@@ -6845,14 +7044,22 @@ pub(crate) enum DialRegistration {
     LocalLimit,
 }
 
+/// What TLS proved about the remote end of one dial.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DialAuthenticated {
+    /// The address whose handshake TLS authenticated.
+    pub(crate) addr: SocketAddr,
+    /// The ID the node answered with. It isn't the dialed ID when the node
+    /// has added keys since the dialer learned that one (zakura-quic TLS-7).
+    pub(crate) node_id: NodeId,
+}
+
 /// The channels on which a discovery or maintained dial reports its progress.
 pub(crate) struct DialReport {
-    /// Receives the address whose handshake TLS authenticated, before the
-    /// control handshake starts.
-    pub(crate) admitted_addr: oneshot::Sender<SocketAddr>,
-    /// Receives how registration ended. The dial drops it unsent when it ends
-    /// before registration, or when this node refuses the peer for a reason
-    /// other than a local limit.
+    /// Receives what TLS authenticated, before the control handshake starts.
+    pub(crate) authenticated: oneshot::Sender<DialAuthenticated>,
+    /// Receives the registration or the local reason for ending this dial
+    /// (duplicate or capacity). Other pre-registration failures drop the sender.
     pub(crate) registration: oneshot::Sender<DialRegistration>,
 }
 
@@ -6861,7 +7068,7 @@ pub(crate) enum NativeDialKind {
     /// Bootstrap and maintained dials may use every live slot.
     Maintained,
     /// Discovery leaves room for an inbound connection and maintained dials.
-    Discovery,
+    Discovery { ordinary_cap: usize },
 }
 
 /// Dials and serves a maintained native connection using the full transport cap.
@@ -6892,10 +7099,22 @@ pub(crate) async fn serve_reported_native_dial_connection(
     report: Option<DialReport>,
     kind: NativeDialKind,
 ) -> Result<(), ZakuraHandlerError> {
+    let dialed = node_addr.id;
+    let ordinary_cap = match kind {
+        NativeDialKind::Maintained => endpoint.handler.limits.max_connections,
+        NativeDialKind::Discovery { ordinary_cap } => {
+            ordinary_cap.min(endpoint.handler.limits.max_connections)
+        }
+    };
     let mut admission = endpoint
         .handler
-        .claim_connection(node_addr.id, false)
-        .map_err(|_| ZakuraHandlerError::ResourceLimit(ADMISSION_LIMIT))?;
+        .claim_dial_connection(dialed, ordinary_cap)
+        .map_err(|refusal| {
+            if refusal == SlotRefusal::Hold {
+                metrics::counter!("zakura.p2p.conn.dial.refused.hold").increment(1);
+            }
+            ZakuraHandlerError::ResourceLimit(ADMISSION_LIMIT)
+        })?;
     let dial_timeout = native_dial_timeout(
         endpoint.quic.config(),
         node_addr.direct.len(),
@@ -6906,7 +7125,9 @@ pub(crate) async fn serve_reported_native_dial_connection(
     let dial = async {
         match kind {
             NativeDialKind::Maintained => endpoint.quic.connect(node_addr, &offered).await,
-            NativeDialKind::Discovery => endpoint.quic.connect_discovery(node_addr, &offered).await,
+            NativeDialKind::Discovery { .. } => {
+                endpoint.quic.connect_discovery(node_addr, &offered).await
+            }
         }
     };
     let connection = match timeout(dial_timeout, dial)
@@ -6929,14 +7150,59 @@ pub(crate) async fn serve_reported_native_dial_connection(
     {
         admission.observation = endpoint.handler.handshake_observation(&connection);
     }
+    let remote_node_id = connection.remote_id();
     let registration_report = report.map(|report| {
         // The receiver is gone when the caller stopped waiting for the result.
-        let _ = report.admitted_addr.send(connection.admitted_addr());
+        let _ = report.authenticated.send(DialAuthenticated {
+            addr: connection.admitted_addr(),
+            node_id: remote_node_id,
+        });
         report.registration
     });
-    let remote_node_id = connection.remote_id();
-    admission.outbound_connected();
     let peer_id = ZakuraPeerId::from_node_id(remote_node_id);
+    if remote_node_id != dialed {
+        // The node added keys since this node learned `dialed`, and answers
+        // under the ID it has now (zakura-quic TLS-7, DIAL-9).
+        endpoint.supervisor.learn_move(dialed, remote_node_id);
+        if endpoint.supervisor.is_registered(&peer_id) {
+            // The node already has a connection, which nothing could tell
+            // before TLS showed which node this dial reached. Close this one
+            // before the control handshake: the other end registers a
+            // connection as soon as it has acknowledged that handshake, and
+            // its duplicate rule would then cancel its side of the registered
+            // one, once that is older than
+            // `ZAKURA_SAME_IP_DUPLICATE_EVICT_MIN_AGE`. A dial to an earlier
+            // ID must leave this locally visible registration alone.
+            #[cfg(any(test, zakura_sim))]
+            endpoint
+                .handler
+                .handshake_refused(&connection, "moved-peer-already-registered");
+            if let Some(report) = registration_report {
+                let _ = report.send(DialRegistration::AlreadyConnected);
+            }
+            connection.close(VarInt::from_u32(ZAKURA_CLOSE_NEUTRAL), b"duplicate");
+            return Ok(());
+        }
+        // A connection to the node that is still in its own handshake meets
+        // this one in `register`, like any simultaneous open.
+    }
+    let earlier = connection.remote_earlier_ids();
+    let proven = ProvenNode::new(remote_node_id, &earlier);
+    if admission.outbound_connected(proven).is_err() {
+        // The dial claimed a held place for a gateway the node doesn't
+        // answer for, or the node makes its gateway ambiguous. Counting
+        // the displaced slot as ordinary would exceed the cap or its inbound share.
+        metrics::counter!("zakura.p2p.conn.dial.refused.hold").increment(1);
+        #[cfg(any(test, zakura_sim))]
+        endpoint
+            .handler
+            .handshake_refused(&connection, "moved-peer-hold");
+        connection.close(
+            VarInt::from_u32(ZAKURA_CLOSE_RESOURCE),
+            ADMISSION_LIMIT.as_bytes(),
+        );
+        return Err(ZakuraHandlerError::ResourceLimit(AUTHENTICATED_SLOT_LIMIT));
+    }
     let conn = ZakuraConnTrace::new(
         &endpoint.handler.trace,
         trace_conn_id(&connection),
@@ -9580,6 +9846,8 @@ pub enum ZakuraHandlerError {
 /// The [`ZakuraHandlerError::ResourceLimit`] a dial returns when the admission
 /// semaphore is full, before it sends any packet.
 const ADMISSION_LIMIT: &str = "admission";
+/// TLS proved the dial reached a node that cannot keep the claimed slot.
+pub(super) const AUTHENTICATED_SLOT_LIMIT: &str = "authenticated connection slot";
 const PENDING_HANDSHAKE_LIMIT: &str = "pending handshake";
 /// The [`ZakuraHandlerError::ResourceLimit`] a dial returns when the transport
 /// cannot fit the dial under its connection ceiling, before any packet
@@ -9633,6 +9901,7 @@ mod tests {
     mod frame_lifetime;
     #[cfg(not(zakura_sim))]
     mod handshake_cost;
+    mod moved_identity;
     mod preferred_hold;
     mod quic_progress;
     mod read_close_cause;
@@ -10283,6 +10552,7 @@ mod tests {
             .register(
                 test_conn_id(),
                 peer_id.clone(),
+                &[],
                 Some("192.0.2.6".parse().expect("test IP parses")),
                 [6; TRANSCRIPT_HASH_BYTES],
                 ZakuraPeerHandle::new_for_tests(peer_id.clone(), outbound_tx),
@@ -10371,6 +10641,7 @@ mod tests {
                 .register(
                     test_conn_id(),
                     peer.clone(),
+                    &[],
                     Some("203.0.113.12".parse().expect("test ip parses")),
                     [0; TRANSCRIPT_HASH_BYTES],
                     ZakuraPeerHandle::new_for_tests(peer.clone(), outbound_tx),
@@ -10413,6 +10684,7 @@ mod tests {
                 .register(
                     conn_id,
                     peer.clone(),
+                    &[],
                     Some(remote_ip),
                     transcript_hash,
                     outbound_handle,
@@ -10928,6 +11200,7 @@ mod tests {
             .register(
                 test_conn_id(),
                 peer.clone(),
+                &[],
                 None,
                 [peer.as_bytes()[0]; TRANSCRIPT_HASH_BYTES],
                 outbound_handle,
@@ -10954,6 +11227,7 @@ mod tests {
             .register(
                 conn_id,
                 peer.clone(),
+                &[],
                 remote_ip,
                 transcript_hash,
                 outbound_handle,
@@ -11279,7 +11553,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
-        assert!(endpoint.discovery_dial_permits() > 0);
+        assert!(endpoint.handler.free_connection_slots() > 0);
         assert_eq!(endpoint.discovery_admission_capacity(), 0);
         for dial in dials {
             dial.abort();
@@ -12030,6 +12304,7 @@ mod tests {
                 .register(
                     test_conn_id(),
                     peer.clone(),
+                    &[],
                     None,
                     [peer.as_bytes()[0]; TRANSCRIPT_HASH_BYTES],
                     outbound_handle,
@@ -12101,6 +12376,7 @@ mod tests {
                 .register(
                     test_conn_id(),
                     peer.clone(),
+                    &[],
                     Some(ip),
                     [peer.as_bytes()[0]; TRANSCRIPT_HASH_BYTES],
                     outbound_handle,
@@ -12164,6 +12440,7 @@ mod tests {
                 .register(
                     test_conn_id(),
                     peer.clone(),
+                    &[],
                     Some(ip),
                     [peer.as_bytes()[0]; TRANSCRIPT_HASH_BYTES],
                     outbound_handle,
@@ -12232,6 +12509,7 @@ mod tests {
                 .register(
                     test_conn_id(),
                     peer.clone(),
+                    &[],
                     ip,
                     [peer.as_bytes()[0]; TRANSCRIPT_HASH_BYTES],
                     outbound_handle,
@@ -12443,6 +12721,7 @@ mod tests {
                 .register(
                     test_conn_id(),
                     peer.clone(),
+                    &[],
                     None,
                     [0; TRANSCRIPT_HASH_BYTES],
                     ZakuraPeerHandle::new_for_tests(peer.clone(), outbound),
@@ -15709,6 +15988,7 @@ mod tests {
                 .register(
                     test_conn_id(),
                     peer.clone(),
+                    &[],
                     remote_ip,
                     [peer.as_bytes()[0]; TRANSCRIPT_HASH_BYTES],
                     outbound_handle,
@@ -15890,6 +16170,7 @@ mod tests {
             .register(
                 test_conn_id(),
                 peer.clone(),
+                &[],
                 Some(ip),
                 [1; TRANSCRIPT_HASH_BYTES],
                 ZakuraPeerHandle::new_for_tests(peer, outbound_tx),
@@ -16050,6 +16331,7 @@ mod tests {
             .register(
                 test_conn_id(),
                 peer.clone(),
+                &[],
                 Some(ip.parse().expect("test ip parses")),
                 [peer.as_bytes()[0]; TRANSCRIPT_HASH_BYTES],
                 ZakuraPeerHandle::new_for_tests(peer.clone(), outbound_tx),

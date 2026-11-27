@@ -1065,6 +1065,8 @@ pub async fn test_mining_rpcs<State, ReadState>(
         internal_miner: true,
         optimistic_block_inventory: true,
         miner_mesh: false,
+        miner_mesh_gateways: Vec::new(),
+        miner_mesh_template_nodes: Vec::new(),
     };
 
     // nu5 block height

@@ -15,6 +15,7 @@ pub mod block_node;
 pub mod block_semantic;
 pub mod block_sync;
 pub mod block_work;
+pub mod bpv1_mesh;
 pub mod coverage;
 pub mod discovery;
 pub mod discovery_machine;

@@ -55,7 +55,7 @@ use super::{
     },
     pull_trace::{is_sampled_part, PullOutcome, PullTraceRecord},
     route::{
-        admitted_input, charge_part, held_parts, pull_state, refused_grant, route_block_output,
+        charge_part, held_parts, pull_state, refused_grant, replay_admitted, route_block_output,
         route_peer_output, BlockRoute, PeerRoute,
     },
     tree::{verify_part_proof, VerifiedPart},
@@ -123,7 +123,15 @@ struct LiveSession {
 /// Async completion returned to the BPv1 driver task.
 enum DriverMsg {
     BlockInput(BlockInput),
-    ReplayActiveToPeer { peer_node: NodeId, session_gen: u64 },
+    ReplayActiveToPeer {
+        peer_node: NodeId,
+        session_gen: u64,
+    },
+    /// A session left `sessions`; the driver ends it in the table.
+    SessionEnded {
+        peer_node: NodeId,
+        session_gen: u64,
+    },
     WakeTick,
 }
 
@@ -392,8 +400,8 @@ impl SharedNode {
                 input,
             } => {
                 if let Err(input) = self.send_to(&peer, session_gen, input) {
-                    if let Some(release) = refused_grant(peer, input, || self.collect_peer_states())
-                    {
+                    let states = || self.collect_peer_states();
+                    if let Some(release) = refused_grant(peer, session_gen, input, states) {
                         self.drive(release);
                     }
                 }
@@ -1095,29 +1103,13 @@ impl Service for Bpv1Service {
         };
 
         let conn_id = peer.conn_id;
-        let session_gen = self.node.next_session_gen.fetch_add(1, Ordering::AcqRel);
         let peer_cancel = peer.cancel_token();
         let session_cancel = peer_cancel.child_token();
         let (inputs, inputs_rx) = mpsc::unbounded_channel();
 
-        let snapshot = Arc::new(Mutex::new(PullPeerState {
-            peer: peer_node,
-            ahead_bytes: 0,
-            can_pull: true,
-            window_remaining: PULL_WINDOW,
-        }));
-
-        let live = LiveSession {
-            conn_id,
-            session_gen,
-            inputs,
-            cancel: session_cancel.clone(),
-            connection: peer_cancel.clone(),
-            load: peer.load().cloned(),
-            snapshot: snapshot.clone(),
-        };
-
-        {
+        // The generation is taken under the sessions lock, so a peer's
+        // sessions enter the map in generation order.
+        let (session_gen, snapshot) = {
             let mut sessions = self.node.lock_sessions();
             if !self.node.config.admits_session(sessions.len())
                 && !sessions.contains_key(&peer_node)
@@ -1125,10 +1117,28 @@ impl Service for Bpv1Service {
                 session_cancel.cancel();
                 return;
             }
+            let session_gen = self.node.next_session_gen.fetch_add(1, Ordering::AcqRel);
+            let snapshot = Arc::new(Mutex::new(PullPeerState {
+                peer: peer_node,
+                session_gen,
+                ahead_bytes: 0,
+                can_pull: true,
+                window_remaining: PULL_WINDOW,
+            }));
+            let live = LiveSession {
+                conn_id,
+                session_gen,
+                inputs,
+                cancel: session_cancel.clone(),
+                connection: peer_cancel.clone(),
+                load: peer.load().cloned(),
+                snapshot: snapshot.clone(),
+            };
             if let Some(prev) = sessions.insert(peer_node, live) {
                 prev.cancel.cancel();
             }
-        }
+            (session_gen, snapshot)
+        };
 
         let node = Arc::clone(&self.node);
         // Audit crossing #5: replay currently active admitted blocks so a newly joined
@@ -1160,19 +1170,16 @@ impl Service for Bpv1Service {
         let Some(peer_node) = peer.node_id() else {
             return;
         };
-        let removed = {
-            let mut sessions = self.node.lock_sessions();
-            if sessions
-                .get(&peer_node)
-                .is_some_and(|s| s.conn_id == conn_id)
-            {
-                sessions.remove(&peer_node)
-            } else {
-                None
+        // Cancel under the lock, as `add_peer` does for a replaced session,
+        // so an uncancelled session is always the registered one.
+        let mut sessions = self.node.lock_sessions();
+        if sessions
+            .get(&peer_node)
+            .is_some_and(|s| s.conn_id == conn_id)
+        {
+            if let Some(sess) = sessions.remove(&peer_node) {
+                sess.cancel.cancel();
             }
-        };
-        if let Some(sess) = removed {
-            sess.cancel.cancel();
         }
     }
 }
@@ -1263,20 +1270,36 @@ async fn run_bpv1_driver(
                         peer_node,
                         session_gen,
                     } => {
-                        let active = node.lock_table().active_admitted_blocks();
-                        for (admitted, indices) in active {
-                            let block_id = admitted.block_id;
-                            let input = PeerInput::BlockAdmitted(admitted_input(&admitted));
+                        let inputs = replay_admitted(&node.lock_table());
+                        for input in inputs {
                             let _ = node.send_to(&peer_node, Some(session_gen), input);
-                            if !indices.is_empty() {
-                                let input = PeerInput::Ready {
-                                    block_id,
-                                    indices,
-                                    push: false,
-                                };
-                                let _ = node.send_to(&peer_node, Some(session_gen), input);
-                            }
                         }
+                    }
+                    DriverMsg::SessionEnded {
+                        peer_node,
+                        session_gen,
+                    } => {
+                        // Hold `sessions` while the table ends the session.
+                        // Another session of the peer that is already live
+                        // shows in `peer_states` and keeps the node's facts
+                        // (bpv1-89). One that opens later registers after
+                        // this end, so the end never clears what it rebuilt.
+                        let step = {
+                            let sessions = node.lock_sessions();
+                            let peer_states =
+                                sessions.values().map(|s| *lock(&s.snapshot)).collect();
+                            node.change_table(|table| {
+                                table.step(
+                                    Instant::now(),
+                                    BlockInput::SessionEnded {
+                                        peer: peer_node,
+                                        session_gen,
+                                        peer_states,
+                                    },
+                                )
+                            })
+                        };
+                        node.dispatch_block_step(step);
                     }
                     DriverMsg::WakeTick => {}
                 }
@@ -1337,6 +1360,8 @@ struct Session {
     verify_tx: mpsc::UnboundedSender<(PartToken, Option<VerifiedPart>)>,
     pulls: PullTelemetry,
     pushes: PushTelemetry,
+    /// Cancelled once the session is replaced, removed, or ending.
+    cancel: CancellationToken,
 }
 
 /// When this node wrote its pushed parts to the session's peer, per block
@@ -1479,15 +1504,23 @@ impl Session {
     async fn run(&mut self, output: PeerOutput) -> bool {
         let node = &self.node;
         let peer = self.peer_node;
-        let output = match route_peer_output(peer, output, || node.collect_peer_states()) {
-            // The driver is the sole ordered executor of `BlockTable`
-            // transitions and their effects.
-            PeerRoute::Table(input) => {
-                node.drive(input);
-                return true;
-            }
-            PeerRoute::Session(output) => output,
-        };
+        let session_gen = self.state.session_gen();
+        let output =
+            match route_peer_output(peer, session_gen, output, || node.collect_peer_states()) {
+                // The driver is the sole ordered executor of `BlockTable`
+                // transitions and their effects.
+                PeerRoute::Table(mut input) => {
+                    // `add_peer` and `remove_peer` cancel a session under the
+                    // sessions lock as it stops being registered, so a flag
+                    // it sends later is never live (bpv1-89).
+                    if let BlockInput::PushFlagged { live, .. } = &mut input {
+                        *live = !self.cancel.is_cancelled();
+                    }
+                    node.drive(input);
+                    return true;
+                }
+                PeerRoute::Session(output) => output,
+            };
         match output {
             PeerOutput::SendControl(msg) => {
                 if let Some(block_id) = header_meta_trace_id(&msg) {
@@ -1499,11 +1532,13 @@ impl Session {
             PeerOutput::SendHave {
                 block_id,
                 flags,
+                form,
                 indices,
             } => {
                 self.data.push(DataQueueItem::Have {
                     block_id,
                     flags,
+                    form,
                     indices,
                 });
             }
@@ -1729,6 +1764,7 @@ impl Written {
                 block_id,
                 flags,
                 indices,
+                ..
             } => Written::Have {
                 block_id,
                 flags,
@@ -1834,6 +1870,7 @@ fn finish_part_proof(
             block_id: token.block_id,
             index: token.index,
             from_peer: peer,
+            session_gen: token.session_gen,
         }));
     }
 }
@@ -1983,18 +2020,21 @@ pub(super) fn data_input(frame: Frame) -> Result<PeerInput, Bpv1CloseRow> {
             Ok(Bpv1Message::Have {
                 block_id,
                 flags,
+                form,
                 indices,
             }) => PeerInput::RecvHave(RecvHave {
                 block_id,
                 flags,
+                form,
                 indices,
                 frame_bytes: frame.payload.len(),
             }),
             Ok(Bpv1Message::WantEnd { want_id, sent, .. }) => {
                 PeerInput::RecvWantEnd(RecvWantEnd { want_id, sent })
             }
-            // A `Have` flags byte other than none, push, or push and relay is
-            // a reserved flag (decision-24).
+            // A `Have` flags byte other than none, push, or push and relay,
+            // each with or without the bitmap bit, is a reserved flag
+            // (decision-24, decision-33).
             Err(WireError::ReservedFlags(_)) => return Err(Bpv1CloseRow::Row1FrameHeader),
             _ => return Err(Bpv1CloseRow::Row2Decode),
         },
@@ -2028,6 +2068,7 @@ async fn run_peer_routine(
         verify_tx,
         pulls: PullTelemetry::default(),
         pushes: PushTelemetry::default(),
+        cancel: session_cancel.clone(),
     };
 
     loop {
@@ -2141,7 +2182,7 @@ async fn run_peer_routine(
 
     // Unified close & teardown (`bpv1-62`):
     // cancel peer on protocol close or repeat neutral stall, stop & join data writer,
-    // and emit `SessionEnded` unless a newer session already owns `peer_node`.
+    // and emit `SessionEnded`.
     if session.state.close_cause().is_some() || session.state.is_closed_neutral() {
         peer_cancel.cancel();
     }
@@ -2157,6 +2198,7 @@ async fn run_peer_routine(
                 block_id: token.block_id,
                 index: token.index,
                 from_peer: peer_node,
+                session_gen: token.session_gen,
             });
         }
     }
@@ -2171,33 +2213,21 @@ async fn run_peer_routine(
         peer: peer_node,
         session_gen,
     });
-    let replaced = {
+    {
         let mut sessions = node.lock_sessions();
-        match sessions.get(&peer_node) {
-            Some(s) if s.conn_id == conn_id && s.session_gen == session_gen => {
-                sessions.remove(&peer_node);
-                false
-            }
-            Some(_) => true,
-            None => false,
+        if sessions
+            .get(&peer_node)
+            .is_some_and(|s| s.conn_id == conn_id && s.session_gen == session_gen)
+        {
+            sessions.remove(&peer_node);
         }
-    };
-    if replaced {
-        // The newer session keeps the paths and samples keyed by `peer_node`.
-        // This session still releases its own pull claims.
-        for output in end_step.outputs {
-            if let PeerRoute::Table(input) =
-                route_peer_output(peer_node, output, || node.collect_peer_states())
-            {
-                node.drive(input);
-            }
-        }
-    } else {
-        node.drive(BlockInput::SessionEnded {
-            peer: peer_node,
-            peer_states: node.collect_peer_states(),
-        });
     }
+    // `SessionEnded` releases every claim and pending push of this session,
+    // including the claims of grants still queued in its inbox.
+    let _ = node.driver_tx.send(DriverMsg::SessionEnded {
+        peer_node,
+        session_gen,
+    });
 }
 
 /// Parses a `Part` frame payload and verifies its proof for `expected_index`
@@ -2735,6 +2765,7 @@ mod tests {
                 load: None,
                 snapshot: Arc::new(Mutex::new(PullPeerState {
                     peer,
+                    session_gen: 1,
                     ahead_bytes: 0,
                     can_pull: true,
                     window_remaining: PULL_WINDOW,

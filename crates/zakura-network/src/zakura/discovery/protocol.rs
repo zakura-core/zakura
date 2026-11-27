@@ -13,13 +13,16 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use rand_10::seq::SliceRandom;
 use thiserror::Error;
 use zakura_chain::{block, miner_mesh::GatewayId};
-use zakura_quic::{NodeAddr, NodeId, NodeKeyList, NodeSecretKey};
+use zakura_quic::{NodeAddr, NodeId, NodeKeyList, NodeSecretKey, ML_DSA_65_KEY_TAG};
 use zakura_rt::{
     collections::{hash_map, HashMap, HashSet},
     sync::{watch, AsyncMutex},
     time::utc_now,
 };
 
+use super::record_signature::{
+    self, RecordSignatureError, RECORD_EXTENSION_HEADER_BYTES, RECORD_ML_DSA_65_EXTENSION_BYTES,
+};
 use super::sequence_file::AuthoredSequenceFile;
 use super::state::{DiscoverySessionKey, DiscoveryState, LocalRecordState, SessionRecordError};
 use super::verified::VerifiedRecord;
@@ -57,11 +60,89 @@ pub const MSG_DISCOVERY_GET_SERVICES: u8 = 4;
 /// First-party live service summary response.
 pub const MSG_DISCOVERY_SERVICES: u8 = 5;
 
-/// Maximum bytes in an encoded node record body, its extension area included.
+/// The largest fields of a node record body: the longest key list, the
+/// protocol range, network, chain, sequence and expiry, and
+/// [`MAX_DIRECT_ADDRS_PER_RECORD`] IPv6 addresses and
+/// [`MAX_SERVICES_PER_RECORD`] maximal service ids.
 ///
-/// The fixed fields with [`MAX_DIRECT_ADDRS_PER_RECORD`] IPv6 addresses and
-/// [`MAX_SERVICES_PER_RECORD`] maximal service ids fill it exactly.
-pub const MAX_NODE_RECORD_BODY_BYTES: usize = 685;
+/// The key list is 1,089 of these bytes: a record carries all 32 entries a
+/// node's list may hold (zakura-quic ID-8), so a reader can derive the
+/// author's node ID. The wire module asserts the sum.
+pub const MAX_NODE_RECORD_FIELDS_BYTES: usize = 1_637;
+
+/// An ML-DSA-87 public key and signature (FIPS 204, table 2), the largest
+/// of the three ML-DSA parameter sets.
+const ML_DSA_87_KEY_BYTES: usize = 2_592;
+const ML_DSA_87_SIGNATURE_BYTES: usize = 4_627;
+
+/// An SLH-DSA-128s public key and signature (FIPS 205, table 2), the
+/// parameter sets with the smallest SLH-DSA signature.
+const SLH_DSA_128S_KEY_BYTES: usize = 32;
+const SLH_DSA_128S_SIGNATURE_BYTES: usize = 7_856;
+
+/// Room in a record's extension area for record signatures: two extensions,
+/// one whose value is a public key and one whose value is its signature,
+/// sized for SLH-DSA-128s. An ML-DSA-87 key and signature fit in the same
+/// room.
+///
+/// This release uses 5,269 bytes of the room: every record carries its
+/// author's ML-DSA-65 key and signature there
+/// ([`RECORD_ML_DSA_65_EXTENSION_BYTES`]), beside the Ed25519 signature, and
+/// a reader refuses a record without them. The rest, 2,627 bytes beside the
+/// largest fields, stays free for extensions a later release defines. A node
+/// of this release keeps those byte for byte, checks both signatures over
+/// them, and relays the record unchanged.
+///
+/// The room was sized before records carried a signature in it, and can't
+/// grow later: a node refuses a record body above
+/// [`MAX_NODE_RECORD_BODY_BYTES`], so a release that needed a larger body
+/// would have every node of this release drop its records.
+///
+/// Why the key as well: a record's key list holds every key but the Ed25519
+/// one as a 32-byte fingerprint, and a reader has to verify a relayed record
+/// without asking its author for anything. A signature it can't check
+/// against a full key would protect nothing, so the room holds both.
+///
+/// Why this size:
+/// - It fits ML-DSA at every level. An ML-DSA-87 key and signature take
+///   7,227 bytes with their headers, and the ML-DSA-65 pair that matches the
+///   handshake's key takes 5,269.
+/// - It fits SLH-DSA-128s, which takes 7,896 bytes and sets the size.
+///   SLH-DSA rests on hash functions alone. The likeliest reason to replace
+///   a record signature is a break of the lattice schemes, and room that fit
+///   only ML-DSA would not cover it. This costs 669 bytes over ML-DSA-87.
+/// - It does not fit the larger SLH-DSA parameter sets. Their smallest
+///   signature after 128s is 16,224 bytes, which would double the room.
+///
+/// What the room does not fit is a second key and signature beside the
+/// ML-DSA-65 pair. A release that replaces ML-DSA-65 has to carry both pairs
+/// while nodes of this release still require the old one: 12,496 bytes with
+/// ML-DSA-87 and 13,165 with SLH-DSA-128s. Neither fits in 7,896, so that
+/// replacement is a hard break (zakura-quic COMPAT-13).
+///
+/// What it costs: any node may fill the area in its own records, so every
+/// bound that scales with a record uses the largest record: 9,601 bytes, and
+/// 307,234 for a full `Peers` answer. The row for this limit in
+/// `docs/changelog/params.md` lists the memory bounds that follow.
+pub const RECORD_SIGNATURE_EXTENSION_BYTES: usize =
+    2 * RECORD_EXTENSION_HEADER_BYTES + SLH_DSA_128S_KEY_BYTES + SLH_DSA_128S_SIGNATURE_BYTES;
+
+const _: () = assert!(
+    2 * RECORD_EXTENSION_HEADER_BYTES + ML_DSA_87_KEY_BYTES + ML_DSA_87_SIGNATURE_BYTES
+        <= RECORD_SIGNATURE_EXTENSION_BYTES
+);
+
+// A record with the largest fields has room for the ML-DSA-65 key and
+// signature every record carries.
+const _: () = assert!(RECORD_ML_DSA_65_EXTENSION_BYTES <= RECORD_SIGNATURE_EXTENSION_BYTES);
+
+/// Maximum bytes in an encoded node record body, its extension area included:
+/// the largest fields and the room of [`RECORD_SIGNATURE_EXTENSION_BYTES`].
+///
+/// The bound is on the whole body. A record with shorter fields may use the
+/// difference for other extensions.
+pub const MAX_NODE_RECORD_BODY_BYTES: usize =
+    MAX_NODE_RECORD_FIELDS_BYTES + RECORD_SIGNATURE_EXTENSION_BYTES;
 /// Maximum bytes in an encoded node record: its length, body, and signature.
 pub const MAX_NODE_RECORD_BYTES: usize = 4 + MAX_NODE_RECORD_BODY_BYTES + SIGNATURE_BYTES;
 /// Maximum direct addresses in a node record.
@@ -88,6 +169,11 @@ pub const DEFAULT_DISCOVERY_RECORD_TTL: Duration = Duration::from_secs(24 * 60 *
 pub const DEFAULT_DISCOVERY_REFRESH_INTERVAL: Duration = Duration::from_secs(10 * 60);
 /// Default peer sample size requested by active discovery.
 pub const DEFAULT_DISCOVERY_PEER_SAMPLE_LIMIT: usize = 32;
+/// Peer query interval while the ordinary connection target and spare reserve are met.
+pub(super) const HEALTHY_PEER_QUERY_INTERVAL: Duration = Duration::from_secs(60);
+/// Minimum distinct unconnected, dial-ready peers needed to slow peer queries.
+const MIN_SPARE_DIAL_CANDIDATES: usize = 2;
+
 /// Default maximum accepted future TTL on imported records.
 pub const DEFAULT_DISCOVERY_MAX_RECORD_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// Default expiry clock-skew tolerance for imported records.
@@ -261,14 +347,19 @@ pub struct ZakuraNodeRecordBody {
     pub sequence: u64,
     /// Unix timestamp when this record expires.
     pub expires_at_unix_secs: u64,
-    /// Opaque signed extension area: every body byte after the fixed fields.
+    /// Signed extension area: every body byte after the fixed fields.
     ///
-    /// Future record fields go here as TLVs (`u16` type, `u16` length, value bytes), so a
-    /// release can add record contents, such as a new address kind, without a hard break.
-    /// A reader ignores TLVs it does not know. This release does not parse the area: it
-    /// keeps the bytes verbatim, so the signature still verifies and a relayed record
-    /// reaches the next hop unchanged. [`MAX_NODE_RECORD_BODY_BYTES`] bounds the whole
-    /// body, extension area included.
+    /// The area is TLVs (`u16` type, `u16` length, value bytes). Its last two hold the
+    /// author's ML-DSA-65 public key and record signature, which
+    /// [`ZakuraNodeRecord::sign`] writes and [`ZakuraNodeRecord::verify`] requires; the
+    /// `record_signature` module gives their encoding.
+    ///
+    /// Future record fields go before them as TLVs of other types, so a release can add
+    /// record contents, such as a new address kind, without a hard break. A reader ignores
+    /// TLVs it does not know. This release reads only the two it defines and keeps every
+    /// byte verbatim, so both signatures still verify and a relayed record reaches the next
+    /// hop unchanged. [`MAX_NODE_RECORD_BODY_BYTES`] bounds the whole body, extension area
+    /// included.
     ///
     /// A new address kind MUST NOT appear as a new family byte in `direct_addrs`: a release
     /// that does not know the family skips the whole record.
@@ -283,6 +374,14 @@ impl ZakuraNodeRecordBody {
 
     /// Encodes this body into canonical bytes for signing and verification.
     pub fn encode_for_signature(&self) -> Result<Vec<u8>, DiscoveryWireError> {
+        self.encode_for_signature_with_room(0)
+    }
+
+    /// Encodes only the current body, counting any trailing signature TLV against the final cap.
+    fn encode_for_signature_with_room(
+        &self,
+        trailing_bytes: usize,
+    ) -> Result<Vec<u8>, DiscoveryWireError> {
         validate_record_body_bounds(self)?;
 
         let mut bytes = Vec::new();
@@ -291,7 +390,7 @@ impl ZakuraNodeRecordBody {
         let body_start = bytes.len();
         write_record_body(self, &mut bytes);
         // Bound the body, not the pre-image, so every body that decodes also verifies.
-        let body_len = bytes.len() - body_start;
+        let body_len = (bytes.len() - body_start).saturating_add(trailing_bytes);
         if body_len > MAX_NODE_RECORD_BODY_BYTES {
             return Err(DiscoveryWireError::OversizedPayload {
                 actual: body_len,
@@ -305,7 +404,8 @@ impl ZakuraNodeRecordBody {
 /// A self-signed Zakura node record.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ZakuraNodeRecord {
-    /// Signed record body.
+    /// Signed record body. Its extension area ends in the author's ML-DSA-65 key and
+    /// signature.
     pub body: ZakuraNodeRecordBody,
     /// Ed25519 signature over [`ZakuraNodeRecordBody::encode_for_signature`], by the key
     /// behind [`ZakuraNodeRecordBody::node_id`].
@@ -313,19 +413,52 @@ pub struct ZakuraNodeRecord {
 }
 
 impl ZakuraNodeRecord {
-    /// Signs `body` when its full author key list matches the signer's credential.
+    /// Signs `body` with both of the signer's keys, when its full author key
+    /// list matches the signer's credential.
+    ///
+    /// `body.extensions` holds the author's other extensions. The returned
+    /// record's area is those, then the signer's ML-DSA-65 key and its
+    /// ML-DSA-65 signature over the body up to there, and the Ed25519
+    /// signature covers the whole body. A body taken from an earlier record
+    /// of the signer still ends in that record's key and signature, and they
+    /// are replaced.
+    ///
+    /// The ML-DSA-65 signature is hedged with fresh randomness, so signing
+    /// one body twice gives two records that differ in their signatures.
     pub fn sign(
         body: ZakuraNodeRecordBody,
         secret_key: &NodeSecretKey,
     ) -> Result<Self, DiscoveryWireError> {
+        use rand_10::Rng;
+
+        let mut randomness = [0; 32];
+        zakura_rt::rand::rng().fill_bytes(&mut randomness);
+        Self::sign_with_randomness(body, secret_key, randomness)
+    }
+
+    /// Signs `body` as [`Self::sign`] does, hedging the ML-DSA-65 signature
+    /// with `randomness`. The same inputs give the same record, which a
+    /// known-answer test needs. A caller that publishes the record draws
+    /// `randomness` fresh for each signature.
+    pub fn sign_with_randomness(
+        mut body: ZakuraNodeRecordBody,
+        secret_key: &NodeSecretKey,
+        randomness: [u8; 32],
+    ) -> Result<Self, DiscoveryWireError> {
         if &body.keys != secret_key.key_list() {
             return Err(DiscoveryWireError::SigningKeyMismatch);
         }
+        record_signature::write_key(&mut body.extensions, secret_key)?;
+        let prefix = body.encode_for_signature_with_room(record_signature::SIGNATURE_TLV_BYTES)?;
+        let ml_dsa_signature = secret_key
+            .sign_record_ml_dsa_65(&prefix, randomness)
+            .map_err(|_| DiscoveryWireError::RecordSigning)?;
+        record_signature::write_signature(&mut body.extensions, &ml_dsa_signature);
         let signature = secret_key.sign(&body.encode_for_signature()?);
         Ok(Self { body, signature })
     }
 
-    /// Verifies this record signature and advisory import context.
+    /// Verifies this record's signatures and advisory import context.
     ///
     /// The author's checks run first, so an expired record with a bad
     /// signature fails as [`DiscoveryRecordError::InvalidSignature`].
@@ -337,27 +470,41 @@ impl ZakuraNodeRecord {
         validate_record_expiry(&self.body, context)
     }
 
-    /// Verifies what only the record's author controls: bounds, signature,
-    /// network, chain, and protocol overlap. Expiry depends on the local clock,
-    /// so [`validate_record_expiry`] checks it separately.
+    /// Verifies what only the record's author controls: bounds, both
+    /// signatures, network, chain, and protocol overlap. Expiry depends on
+    /// the local clock, so [`validate_record_expiry`] checks it separately.
+    ///
+    /// A record is authentic only if its Ed25519 signature and its ML-DSA-65
+    /// signature both verify, so forging one takes a break of both schemes.
+    /// A key list that lacks the Ed25519 entry or the ML-DSA-65 entry is
+    /// unverifiable, not forged (zakura-quic ID-11).
     pub(super) fn verify_authentic(
         &self,
         context: &DiscoveryRecordValidationContext,
     ) -> Result<(), DiscoveryRecordError> {
         validate_record_body_bounds(&self.body)?;
-        let body_bytes = self
+        let keys = &self.body.keys;
+        // Decided from the key list alone, before any signature, so a record
+        // this release can't verify is never held against its relay.
+        let ed25519 = keys
+            .ed25519()
+            .filter(|_| keys.contains_tag(ML_DSA_65_KEY_TAG))
+            .ok_or(DiscoveryRecordError::NoSupportedKey)?;
+        let pre_image = self
             .body
             .encode_for_signature()
             .map_err(DiscoveryRecordError::Wire)?;
         // The TLS handshake verifies with the same strict policy. A key with a
         // torsion component passes the cofactored equation alone, but it can
         // never authenticate a dial, so its record is useless to the book.
-        self.body
-            .keys
-            .ed25519()
-            .ok_or(DiscoveryRecordError::NoSupportedKey)?
-            .verify_strict(&body_bytes, &self.signature)
+        //
+        // Ed25519 goes first, as it did when it was the only check, so a
+        // record it refuses fails as it always has. The order changes no
+        // verdict: either failure refuses the record with the same severity.
+        ed25519
+            .verify_strict(&pre_image, &self.signature)
             .map_err(|_| DiscoveryRecordError::InvalidSignature)?;
+        record_signature::verify(keys, &self.body.extensions, &pre_image)?;
         validate_record_context(&self.body, context)
     }
 }
@@ -688,6 +835,15 @@ pub enum DiscoveryWireError {
     #[error("Zakura discovery record author differs from the signer's node ID")]
     SigningKeyMismatch,
 
+    /// The body's extension area can't take the record's ML-DSA-65 key and
+    /// signature: its other extensions are not whole, or already hold one.
+    #[error("Zakura discovery record can't take its ML-DSA-65 signature: {0}")]
+    RecordSignature(#[from] RecordSignatureError),
+
+    /// ML-DSA-65 signing gave up, which no honest input causes in practice.
+    #[error("ML-DSA-65 could not sign the Zakura discovery record")]
+    RecordSigning,
+
     /// The record has an invalid protocol range.
     #[error("invalid Zakura discovery protocol range")]
     InvalidProtocolRange,
@@ -713,12 +869,18 @@ pub enum DiscoveryRecordError {
     #[error("malformed Zakura discovery node id")]
     MalformedNodeId,
 
-    /// The record signature does not verify.
+    /// The record's Ed25519 signature does not verify.
     #[error("invalid Zakura discovery record signature")]
     InvalidSignature,
 
-    /// The author's key list is well formed but holds no key this release
-    /// can check a signature with, so the record can't be verified.
+    /// The record's key list names an ML-DSA-65 key, and the record does not
+    /// carry that key and a valid signature by it.
+    #[error("invalid Zakura discovery record ML-DSA-65 signature: {0}")]
+    InvalidMlDsaSignature(#[from] RecordSignatureError),
+
+    /// The author's key list is well formed but lacks a key this release
+    /// verifies a record with, the Ed25519 or the ML-DSA-65 one, so the
+    /// record can't be verified.
     ///
     /// This is not the sender's fault: a node relays key lists it can't read
     /// byte for byte. It MUST only drop the record, in this and every later
@@ -1133,6 +1295,7 @@ pub(super) fn hello_verdict(error: &DiscoveryBookError) -> RecordVerdict {
             DiscoveryRecordError::Wire(_)
             | DiscoveryRecordError::MalformedNodeId
             | DiscoveryRecordError::InvalidSignature
+            | DiscoveryRecordError::InvalidMlDsaSignature(_)
             | DiscoveryRecordError::WrongNetwork
             | DiscoveryRecordError::WrongChain
             | DiscoveryRecordError::IncompatibleProtocol => RecordVerdict::Disconnect,
@@ -1164,6 +1327,7 @@ fn relay_verdict(error: &DiscoveryRecordError) -> RecordVerdict {
         DiscoveryRecordError::Wire(_)
         | DiscoveryRecordError::MalformedNodeId
         | DiscoveryRecordError::InvalidSignature
+        | DiscoveryRecordError::InvalidMlDsaSignature(_)
         | DiscoveryRecordError::WrongNetwork
         | DiscoveryRecordError::WrongChain => RecordVerdict::Disconnect,
     }
@@ -1187,6 +1351,42 @@ fn verify_relayed(
         }
     }
     Ok((authentic, dropped))
+}
+
+/// A book file entry whose record passed its author checks, with the dial
+/// history the file kept for it.
+#[derive(Debug)]
+pub(super) struct VerifiedPersistedEntry {
+    record: VerifiedRecord,
+    metadata: DiscoveryEntryMetadata,
+}
+
+/// Runs the author checks of book file entries. Returns the authentic
+/// entries and the number refused. The file is local, so a refused record
+/// costs nobody a connection.
+fn verify_persisted(
+    entries: impl IntoIterator<Item = ZakuraDiscoveryPersistedEntry>,
+    context: &DiscoveryRecordValidationContext,
+) -> (Vec<VerifiedPersistedEntry>, usize) {
+    let mut authentic = Vec::new();
+    let mut refused = 0;
+    for entry in entries {
+        let metadata = DiscoveryEntryMetadata {
+            source: entry.source,
+            is_static: entry.is_static,
+            last_seen: entry.last_seen,
+            last_dial_attempt: entry.last_dial_attempt,
+            last_success: entry.last_success,
+            confirmed_addrs: entry.confirmed_addrs,
+            dialed_addrs: entry.dialed_addrs,
+            failure_count: entry.failure_count,
+        };
+        match VerifiedRecord::verify(entry.record, context) {
+            Ok(record) => authentic.push(VerifiedPersistedEntry { record, metadata }),
+            Err(_) => refused += 1,
+        }
+    }
+    (authentic, refused)
 }
 
 /// The secret key for a requester's disclosure window.
@@ -1417,6 +1617,30 @@ impl fmt::Debug for ZakuraDiscoveryLocalConfig {
     }
 }
 
+/// Evidence from the last ordinary dial round that peer queries may slow down.
+#[derive(Debug)]
+pub(super) struct PeerQueryReserve {
+    registrations: watch::Receiver<Vec<ZakuraPeerId>>,
+    candidates: [NodeId; MIN_SPARE_DIAL_CANDIDATES],
+    checked: zakura_rt::time::Instant,
+}
+
+impl PeerQueryReserve {
+    fn still_usable(&self, state: &DiscoveryState) -> bool {
+        let config = state.config();
+        let backoff = (config.dial_backoff_base, config.dial_backoff_max);
+        let now = current_unix_secs();
+        matches!(self.registrations.has_changed(), Ok(false))
+            && self.checked.elapsed() < super::candidate_dialer::QUERY_RESERVE_VALIDITY
+            && self.candidates.iter().all(|id| {
+                matches!(
+                    state.book().dial_target(id, now, backoff),
+                    DialTarget::Dialable(_)
+                )
+            })
+    }
+}
+
 /// Cloneable passive runtime handle for native Zakura discovery state.
 ///
 /// The handle is discovery's IO. It holds the logical [`DiscoveryState`] under
@@ -1425,6 +1649,8 @@ impl fmt::Debug for ZakuraDiscoveryLocalConfig {
 /// publishes.
 #[derive(Clone)]
 pub struct ZakuraDiscoveryHandle {
+    /// Ordinary slot budget shared by discovery scheduling and connection admission.
+    pub(crate) ordinary_connection_cap: usize,
     inner: Arc<AsyncMutex<DiscoveryState>>,
     connected: watch::Receiver<Vec<ZakuraPeerId>>,
     self_record: watch::Receiver<Arc<ZakuraNodeRecord>>,
@@ -1550,9 +1776,14 @@ impl ZakuraDiscoveryHandle {
         let (self_record_tx, self_record_rx) = watch::channel(self_record);
         let (peer_snapshot_tx, peer_snapshot_rx) =
             watch::channel(ServicePeerSnapshot::new(0, 0, config.peer_limits));
+        let ordinary_connection_cap = discovery_ordinary_cap(
+            config.max_zakura_connections,
+            config.discovery_connection_headroom,
+        );
         let state = DiscoveryState::new(local, config, DisclosureKey::random());
         let verification_context = state.validation_context(now_unix_secs);
         Ok(Self {
+            ordinary_connection_cap,
             inner: Arc::new(AsyncMutex::new(state)),
             connected,
             self_record: self_record_rx,
@@ -1595,7 +1826,7 @@ impl ZakuraDiscoveryHandle {
             .await
     }
 
-    async fn current_self_record_for_gossip_at(
+    pub(super) async fn current_self_record_for_gossip_at(
         &self,
         now_unix_secs: u64,
         wall_clock_sequence: u64,
@@ -1711,6 +1942,93 @@ impl ZakuraDiscoveryHandle {
 
     fn publish_peer_snapshot_locked(&self, state: &DiscoveryState) {
         let _ = self.peer_snapshot_tx.send(state.peer_snapshot());
+    }
+
+    /// Builds the next peer query unless this stream queried recently and the
+    /// node has both a full connection set and a reserve of dialable peers.
+    pub(super) async fn next_peer_query(
+        &self,
+        last_sent: Option<zakura_rt::time::Instant>,
+    ) -> Option<GetPeers> {
+        let state = self.inner.lock().await;
+        if last_sent.is_some_and(|sent| sent.elapsed() < HEALTHY_PEER_QUERY_INTERVAL)
+            && state
+                .peer_query_reserve
+                .as_ref()
+                .is_some_and(|reserve| reserve.still_usable(&state))
+        {
+            return None;
+        }
+        let connected = connected_peer_node_ids(&self.connected.borrow());
+        let config = state.config();
+        Some(GetPeers {
+            limit: u16::try_from(
+                config
+                    .peer_sample_limit
+                    .clamp(1, MAX_DISCOVERY_RECORDS_PER_RESPONSE),
+            )
+            .expect("the largest wire limit fits u16"),
+            wanted_services: Vec::new(),
+            exclude_node_ids: state.peer_sample_exclusions(&connected),
+        })
+    }
+
+    /// Records two replacement candidates that pass the ordinary dialer's live
+    /// route and identity checks. No outbound connection is started or reserved.
+    pub(super) async fn update_peer_query_reserve(
+        &self,
+        held: &HeldPlaces,
+        mut usable: impl FnMut(ZakuraDiscoveryDialCandidate) -> bool,
+    ) {
+        let mut registrations = self.connected.clone();
+        let ordinary = registrations
+            .borrow_and_update()
+            .iter()
+            .filter(|peer| !held.contains_bytes(peer.as_bytes()))
+            .count();
+        let mut state = self.inner.lock().await;
+        let previous = state.peer_query_reserve.take();
+        if ordinary < self.ordinary_connection_cap {
+            return;
+        }
+
+        let now = current_unix_secs();
+        let backoff = (
+            state.config().dial_backoff_base,
+            state.config().dial_backoff_max,
+        );
+        let book = state.book();
+        let mut candidates = Vec::with_capacity(MIN_SPARE_DIAL_CANDIDATES);
+        // Recheck the previous witnesses first so a stable, full node normally
+        // checks only two book entries per round.
+        if let Some(previous) = previous {
+            for id in previous.candidates {
+                if let DialTarget::Dialable(candidate) = book.dial_target(&id, now, backoff) {
+                    if usable(candidate) {
+                        candidates.push(id);
+                    }
+                }
+            }
+        }
+        if candidates.len() < MIN_SPARE_DIAL_CANDIDATES {
+            for candidate in book.dial_candidate_refs() {
+                if book.dial_readiness(&candidate, now, backoff) == DialReadiness::Ready
+                    && usable(candidate.into_candidate())
+                {
+                    candidates.push(candidate.node_id());
+                    if candidates.len() == MIN_SPARE_DIAL_CANDIDATES {
+                        break;
+                    }
+                }
+            }
+        }
+        if let Ok(candidates) = candidates.try_into() {
+            state.peer_query_reserve = Some(PeerQueryReserve {
+                registrations,
+                candidates,
+                checked: zakura_rt::time::Instant::now(),
+            });
+        }
     }
 
     /// Returns bounded node ids to exclude from a peer-sample request.
@@ -2013,17 +2331,45 @@ impl ZakuraDiscoveryHandle {
     }
 
     /// Imports records loaded from persistent storage through the validation path.
+    ///
+    /// The whole file verifies in one blocking task, under one node-wide
+    /// verification slot, before a short lock hold installs the authentic
+    /// entries. A full file is 256 records with two signatures each, which
+    /// is too much work for the async runtime or the book lock.
     pub async fn import_persisted_entries(
         &self,
         entries: impl IntoIterator<Item = ZakuraDiscoveryPersistedEntry>,
     ) -> ImportBatchOutcome {
+        let entries: Vec<_> = entries.into_iter().collect();
+        let mut outcome = ImportBatchOutcome::default();
+        if entries.is_empty() {
+            return outcome;
+        }
+        let entries_len = entries.len();
+        let Some(VerifiedHold {
+            result: (verified, refused),
+            slot,
+        }) = self
+            .verify_off_lock(move |context| verify_persisted(entries, context))
+            .await
+        else {
+            // Shutdown cancelled the task.
+            outcome.attempted = entries_len;
+            outcome.rejected = entries_len;
+            return outcome;
+        };
+        outcome.attempted = refused;
+        outcome.rejected = refused;
+
         let now = current_unix_secs();
         let mut changes = Vec::new();
-        let outcome = self
-            .inner
-            .lock()
-            .await
-            .import_persisted_entries(entries, now, &mut changes);
+        self.inner.lock().await.install_persisted_entries(
+            verified,
+            now,
+            &mut outcome,
+            &mut changes,
+        );
+        drop(slot);
         log_book_changes(&changes);
         outcome
     }
@@ -2318,6 +2664,17 @@ impl ZakuraDiscoveryHandle {
     pub async fn persisted_entries(&self) -> Vec<ZakuraDiscoveryPersistedEntry> {
         let state = self.inner.lock().await;
         state.book().persisted_entries()
+    }
+
+    /// Returns the at most `max` entries the book file keeps at `now`; see
+    /// [`ZakuraDiscoveryBook::entries_to_persist`].
+    pub(super) async fn entries_to_persist(
+        &self,
+        now: u64,
+        max: usize,
+    ) -> Vec<ZakuraDiscoveryPersistedEntry> {
+        let state = self.inner.lock().await;
+        state.book().entries_to_persist(now, max)
     }
 }
 impl Default for ZakuraDiscoveryBook {
@@ -2822,16 +3179,7 @@ impl ZakuraDiscoveryBook {
         let in_flight_node_ids: HashSet<_> =
             exclusions.in_flight_node_ids.iter().copied().collect();
         let candidates: Vec<_> = self
-            .entries
-            .values()
-            .map(DialCandidateRef::SignedRecord)
-            // A node with a signed record is offered through that record only.
-            .chain(
-                self.static_candidates
-                    .values()
-                    .filter(|candidate| !self.entries.contains_key(&candidate.node_id))
-                    .map(DialCandidateRef::StaticConfigured),
-            )
+            .dial_candidate_refs()
             .filter(|candidate| {
                 let node_id = candidate.node_id();
                 !connected_node_ids.contains(&node_id)
@@ -2884,6 +3232,19 @@ impl ZakuraDiscoveryBook {
                 DialAdmission::Exhausted => return,
             }
         }
+    }
+
+    /// Offers each identity once, preferring its signed record over a static address.
+    fn dial_candidate_refs(&self) -> impl Iterator<Item = DialCandidateRef<'_>> {
+        self.entries
+            .values()
+            .map(DialCandidateRef::SignedRecord)
+            .chain(
+                self.static_candidates
+                    .values()
+                    .filter(|candidate| !self.entries.contains_key(&candidate.node_id))
+                    .map(DialCandidateRef::StaticConfigured),
+            )
     }
 
     /// Whether the book could dial `candidate` at `now`, before the caller's
@@ -3033,74 +3394,79 @@ impl ZakuraDiscoveryBook {
 
     /// Returns entries suitable for a Zakura-specific persistent cache.
     pub fn persisted_entries(&self) -> Vec<ZakuraDiscoveryPersistedEntry> {
-        let mut entries: Vec<_> = self
-            .entries
-            .values()
-            .map(|entry| ZakuraDiscoveryPersistedEntry {
-                record: entry.record().clone(),
-                source: entry.source,
-                is_static: entry.is_static,
-                last_seen: entry.last_seen,
-                last_dial_attempt: entry.last_dial_attempt,
-                last_success: entry.last_success,
-                confirmed_addrs: entry.confirmed_addrs.clone(),
-                dialed_addrs: entry.dialed_addrs.clone(),
-                failure_count: entry.failure_count,
-            })
-            .collect();
+        let mut entries: Vec<_> = self.entries.values().map(persisted).collect();
         entries.sort_by_key(|entry| node_id_sort_key(&entry.record.body.node_id()));
         entries
     }
 
+    /// Returns the at most `max` entries most worth keeping across a restart:
+    /// the ones [`persist_order`] puts first among those live at `now`.
+    ///
+    /// It ranks the book's entries where they are and copies only the ones it
+    /// keeps. A record may fill its extension area, so a copy of a full book
+    /// would be tens of megabytes made under the book's lock.
+    pub(super) fn entries_to_persist(
+        &self,
+        now: u64,
+        max: usize,
+    ) -> Vec<ZakuraDiscoveryPersistedEntry> {
+        let mut live: Vec<_> = self
+            .entries
+            .values()
+            .filter(|entry| entry.record.body.expires_at_unix_secs >= now)
+            .map(|entry| (node_id_sort_key(&entry.record.body.node_id()), entry))
+            .collect();
+        // Entries that rank alike keep node ID order, whatever order the map
+        // yields them in.
+        live.sort_by_key(|(node_id, entry)| {
+            (persist_order(entry.last_success, entry.last_seen), *node_id)
+        });
+        live.into_iter()
+            .take(max)
+            .map(|(_, entry)| persisted(entry))
+            .collect()
+    }
+
     /// Re-validates and imports entries loaded from a persistent cache.
+    ///
+    /// Each record's signatures are verified here, on the caller's thread.
+    /// The node's own reload verifies off the async runtime instead:
+    /// [`ZakuraDiscoveryHandle::import_persisted_entries`].
     pub fn import_persisted_entries(
         &mut self,
         entries: impl IntoIterator<Item = ZakuraDiscoveryPersistedEntry>,
         now: u64,
         context: &DiscoveryRecordValidationContext,
     ) -> ImportBatchOutcome {
-        self.import_persisted_entries_tracked(entries, now, context, &mut Vec::new())
+        let (verified, refused) = verify_persisted(entries, context);
+        let mut outcome = ImportBatchOutcome {
+            attempted: refused,
+            rejected: refused,
+            ..ImportBatchOutcome::default()
+        };
+        self.install_persisted_entries(verified, now, context, &mut outcome, &mut Vec::new());
+        outcome
     }
 
-    /// Imports entries as [`Self::import_persisted_entries`] does, and appends each
-    /// resulting change to `changes`.
-    pub(super) fn import_persisted_entries_tracked(
+    /// Stores book file entries whose records passed their author checks,
+    /// counts each in `outcome`, and appends each resulting change to
+    /// `changes`. Expiry, address and storage policy still run here, and
+    /// each only rejects its entry.
+    pub(super) fn install_persisted_entries(
         &mut self,
-        entries: impl IntoIterator<Item = ZakuraDiscoveryPersistedEntry>,
+        entries: Vec<VerifiedPersistedEntry>,
         now: u64,
         context: &DiscoveryRecordValidationContext,
+        outcome: &mut ImportBatchOutcome,
         changes: &mut Vec<BookChange>,
-    ) -> ImportBatchOutcome {
-        let mut outcome = ImportBatchOutcome::default();
-        for entry in entries {
+    ) {
+        for VerifiedPersistedEntry { record, metadata } in entries {
             outcome.attempted += 1;
-            match self.import_persisted_entry(entry, now, context, changes) {
+            match self.install_record(record, metadata, now, context, changes) {
                 Ok(import_outcome) => outcome.record_success(import_outcome),
                 Err(_) => outcome.rejected += 1,
             }
         }
-        outcome
-    }
-
-    fn import_persisted_entry(
-        &mut self,
-        entry: ZakuraDiscoveryPersistedEntry,
-        now: u64,
-        context: &DiscoveryRecordValidationContext,
-        changes: &mut Vec<BookChange>,
-    ) -> Result<ImportOutcome, DiscoveryBookError> {
-        let metadata = DiscoveryEntryMetadata {
-            source: entry.source,
-            is_static: entry.is_static,
-            last_seen: entry.last_seen,
-            last_dial_attempt: entry.last_dial_attempt,
-            last_success: entry.last_success,
-            confirmed_addrs: entry.confirmed_addrs,
-            dialed_addrs: entry.dialed_addrs,
-            failure_count: entry.failure_count,
-        };
-        let record = self.verify_foreign(entry.record, context)?;
-        self.install_record(record, metadata, now, context, changes)
     }
 
     fn import_record_inner(
@@ -3688,7 +4054,11 @@ fn update_existing_entry(
         entry.source = metadata.source;
     }
     entry.is_static |= metadata.is_static;
-    entry.last_seen = metadata.last_seen;
+    entry.last_seen = if same_sequence {
+        entry.last_seen.max(metadata.last_seen)
+    } else {
+        metadata.last_seen
+    };
 
     // Confirmation attaches to addresses, not to the node identity: a later
     // record keeps the confirmed addresses it still lists, and an import adds
@@ -3786,6 +4156,10 @@ fn connected_peer_node_ids(connected: &[ZakuraPeerId]) -> Vec<NodeId> {
     connected.iter().filter_map(ZakuraPeerId::node_id).collect()
 }
 
+fn discovery_ordinary_cap(max_connections: usize, connection_headroom: usize) -> usize {
+    max_connections.saturating_sub(connection_headroom)
+}
+
 /// Returns how many ordinary discovery dials may start.
 ///
 /// Registered peers and in-flight dials outside the preferred set,
@@ -3800,7 +4174,7 @@ pub(crate) fn discovery_dial_slot_limit(
     connection_headroom: usize,
     max_concurrent_dials: usize,
 ) -> usize {
-    let soft_cap = max_connections.saturating_sub(connection_headroom);
+    let soft_cap = discovery_ordinary_cap(max_connections, connection_headroom);
     let available_connection_slots = soft_cap.saturating_sub(ordinary_occupied);
     let available_dial_slots = max_concurrent_dials.saturating_sub(in_flight_count);
     available_connection_slots.min(available_dial_slots)
@@ -4085,6 +4459,27 @@ fn dial_backoff_secs(failure_count: u32, base_secs: u64, max_secs: u64) -> u64 {
 
 fn node_id_sort_key(node_id: &NodeId) -> [u8; NODE_ID_BYTES] {
     *node_id.as_bytes()
+}
+
+/// The order in which the book file keeps entries: the most recent
+/// successful dial first, then the most recent sighting.
+pub(super) fn persist_order(last_success: Option<u64>, last_seen: u64) -> impl Ord {
+    (Reverse(last_success), Reverse(last_seen))
+}
+
+/// The form of `entry` that the book file stores.
+fn persisted(entry: &ZakuraDiscoveryEntry) -> ZakuraDiscoveryPersistedEntry {
+    ZakuraDiscoveryPersistedEntry {
+        record: entry.record().clone(),
+        source: entry.source,
+        is_static: entry.is_static,
+        last_seen: entry.last_seen,
+        last_dial_attempt: entry.last_dial_attempt,
+        last_success: entry.last_success,
+        confirmed_addrs: entry.confirmed_addrs.clone(),
+        dialed_addrs: entry.dialed_addrs.clone(),
+        failure_count: entry.failure_count,
+    }
 }
 
 /// Check the record's network, chain, and protocol range against ours.
@@ -4416,7 +4811,9 @@ mod tests {
     use std::{net::IpAddr, time::Duration};
 
     use rand_10::{rngs::StdRng, SeedableRng};
-    use zakura_quic::{NodeCredential, NodeSecretKey, ED25519_KEY_TAG, ML_DSA_65_KEY_TAG};
+    use zakura_quic::{
+        CredentialKey, NodeCredential, NodeSecretKey, ED25519_KEY_TAG, ML_DSA_65_KEY_TAG,
+    };
 
     use super::*;
     use crate::zakura::{
@@ -5249,7 +5646,14 @@ mod tests {
         let honest =
             ZakuraNodeRecord::sign(body(&secret_key), &secret_key).expect("test record signs");
         let mut body = body(&secret_key);
-        body.keys = NodeKeyList::single(mixed);
+        // The list also needs an ML-DSA-65 entry, or the record is
+        // unverifiable before any signature is checked. The Ed25519 check
+        // fails first, so the entry's value does not matter here.
+        body.keys = NodeKeyList::from_entries([
+            (ED25519_KEY_TAG, *mixed.as_bytes()),
+            (ML_DSA_65_KEY_TAG, [0x33; 32]),
+        ])
+        .expect("two entries in increasing tag order form a list");
         let message = body
             .encode_for_signature()
             .expect("test record body encodes");
@@ -5922,6 +6326,146 @@ mod tests {
         ));
     }
 
+    /// The body cap holds the largest fields, the ML-DSA-65 key and
+    /// signature every record carries, and 2,627 bytes of extensions this
+    /// release does not know. A record that uses all of it is exactly as
+    /// long as a record may be. The node verifies both signatures over the
+    /// unknown extensions, relays the record byte for byte, serves it from
+    /// the book and restores it from the book file. One byte more is
+    /// refused.
+    #[test]
+    fn a_key_and_signature_fit_beside_the_largest_fields() {
+        use super::super::book_file::DiscoveryBookFile;
+
+        // The longest key list: the signer's two keys and 30 entries this
+        // release cannot read, each a key given as its fingerprint.
+        let signer = secret_key();
+        let own = |tag| {
+            let key = signer.credential().key(tag).unwrap().to_vec();
+            (tag, CredentialKey::Full(key))
+        };
+        let unreadable = (0..30u8).map(|index| {
+            let fingerprint = CredentialKey::Fingerprint([index; 32]);
+            (UNREADABLE_KEY_TAG + u16::from(index), fingerprint)
+        });
+        let credential = NodeCredential::from_entries(
+            [own(ED25519_KEY_TAG), own(ML_DSA_65_KEY_TAG)]
+                .into_iter()
+                .chain(unreadable),
+        )
+        .expect("32 entries in increasing tag order are a valid credential");
+        assert_eq!(
+            credential.key_list().encoded_len(),
+            zakura_quic::MAX_NODE_KEY_LIST_BYTES
+        );
+        let signer = signer
+            .with_credential(credential)
+            .expect("the credential holds the signer's own keys");
+
+        let mut body = body(&signer);
+        body.direct_addrs = (1..=MAX_DIRECT_ADDRS_PER_RECORD)
+            .map(|index| {
+                let host = u16::try_from(index).expect("a record holds a few addresses");
+                SocketAddr::new(
+                    IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, host)),
+                    8233,
+                )
+            })
+            .collect();
+        body.services = (0..MAX_SERVICES_PER_RECORD)
+            .map(|index| {
+                ZakuraServiceId::new(format!("zakura.test.{index:017}.v1"))
+                    .expect("a 32-byte service id is valid")
+            })
+            .collect();
+        let mut fields = Vec::new();
+        write_record_body(&body, &mut fields);
+        assert_eq!(fields.len(), MAX_NODE_RECORD_FIELDS_BYTES);
+
+        // The room is sized for an SLH-DSA-128s key and signature, and an
+        // ML-DSA-87 pair needs less. FIPS 204 and 205 give the lengths,
+        // restated here so the test does not take them from the constants
+        // it checks.
+        const { assert!(4 + 32 + 4 + 7_856 == RECORD_SIGNATURE_EXTENSION_BYTES) };
+        const { assert!(4 + 2_592 + 4 + 4_627 <= RECORD_SIGNATURE_EXTENSION_BYTES) };
+        // The ML-DSA-65 key and signature take 5,269 bytes of it, so two
+        // extensions this release does not know, types 0x7002 and 0x7003,
+        // fill the other 2,627.
+        let unknown_extension = |value_len: usize| {
+            let mut extension = 0x7002u16.to_le_bytes().to_vec();
+            extension.extend_from_slice(&32u16.to_le_bytes());
+            extension.extend_from_slice(&[0xbc; 32]);
+            extension.extend_from_slice(&0x7003u16.to_le_bytes());
+            extension.extend_from_slice(&u16::try_from(value_len).unwrap().to_le_bytes());
+            extension.resize(extension.len() + value_len, 0xcd);
+            extension
+        };
+        let unknown = unknown_extension(2_587);
+        assert_eq!(
+            unknown.len() + 4 + 1_952 + 4 + 3_309,
+            RECORD_SIGNATURE_EXTENSION_BYTES
+        );
+
+        let mut too_long = body.clone();
+        too_long.extensions = unknown_extension(2_588);
+        assert!(matches!(
+            ZakuraNodeRecord::sign(too_long, &signer),
+            Err(DiscoveryWireError::OversizedPayload { .. })
+        ));
+
+        body.extensions = unknown.clone();
+        let record = ZakuraNodeRecord::sign(body, &signer).expect("the largest record signs");
+        assert_eq!(record_len(&record), MAX_NODE_RECORD_BYTES);
+        record
+            .verify(&context())
+            .expect("both signatures cover the unknown extensions");
+        let extension = record.body.extensions.clone();
+        assert!(extension.starts_with(&unknown));
+        assert_eq!(extension.len(), RECORD_SIGNATURE_EXTENSION_BYTES);
+
+        let encoded = DiscoveryMessage::Hello {
+            record: record.clone(),
+        }
+        .encode()
+        .expect("the largest record encodes");
+        let DiscoveryMessage::Hello { record: relayed } =
+            DiscoveryMessage::decode(&encoded).expect("the largest record decodes")
+        else {
+            panic!("expected a hello message");
+        };
+        assert_eq!(relayed.body.extensions, extension);
+        assert_eq!(
+            DiscoveryMessage::Hello { record: relayed }
+                .encode()
+                .expect("the relayed record encodes"),
+            encoded,
+            "a relayed record is byte-identical"
+        );
+
+        let node_id = record.body.node_id();
+        let mut book = ZakuraDiscoveryBook::default();
+        import_confirmed_record(&mut book, record.clone()).expect("the largest record imports");
+        assert_eq!(
+            book.sample_peers(1, &[], &[], NOW, test_requester()),
+            std::slice::from_ref(&record),
+            "a `Peers` answer serves the stored record unchanged"
+        );
+        book.mark_dial_success(&node_id, None, NOW);
+        let dir = tempfile::tempdir().unwrap();
+        let file = DiscoveryBookFile::new(dir.path().join("book"));
+        file.store(book.persisted_entries(), NOW).unwrap();
+        let mut reloaded = ZakuraDiscoveryBook::default();
+        let outcome = reloaded.import_persisted_entries(file.load(), NOW, &context());
+        assert_eq!((outcome.added, outcome.rejected), (1, 0));
+        assert_eq!(
+            reloaded
+                .get(&node_id)
+                .expect("the saved record reloads")
+                .record(),
+            &record
+        );
+    }
+
     /// A record body this release cannot decode fails the whole `Peers`
     /// message. New record contents go only in the extension area, so a
     /// conformant relay never sends such a body.
@@ -5999,7 +6543,16 @@ mod tests {
             body.direct_addrs = vec![test_addr(index)];
             let mut body_bytes = Vec::new();
             write_record_body(&body, &mut body_bytes);
-            body.extensions = vec![index; MAX_NODE_RECORD_BODY_BYTES - body_bytes.len()];
+            // One unknown TLV fills what the key and signature leave.
+            let room = MAX_NODE_RECORD_BODY_BYTES
+                - body_bytes.len()
+                - RECORD_ML_DSA_65_EXTENSION_BYTES
+                - RECORD_EXTENSION_HEADER_BYTES;
+            body.extensions = 0x7001u16.to_le_bytes().to_vec();
+            body.extensions
+                .extend_from_slice(&u16::try_from(room).unwrap().to_le_bytes());
+            body.extensions
+                .resize(RECORD_EXTENSION_HEADER_BYTES + room, index);
             let record = ZakuraNodeRecord::sign(body, &secret_key).expect("record signs");
             assert_eq!(record_len(&record), MAX_NODE_RECORD_BYTES);
             import_confirmed_record(&mut book, record).expect("first-party record imports");
@@ -6013,10 +6566,55 @@ mod tests {
             test_requester(),
         );
         assert_eq!(sample.len(), MAX_DISCOVERY_RECORDS_PER_RESPONSE);
-        let encoded = DiscoveryMessage::Peers { records: sample }
-            .encode()
-            .expect("the sample fits one Peers message");
+        let encoded = DiscoveryMessage::Peers {
+            records: sample.clone(),
+        }
+        .encode()
+        .expect("the sample fits one Peers message");
         assert_eq!(encoded.len() - 1, super::super::wire::PEERS_MAX_BYTES);
+
+        // Seven maximum-sized records fit within the outgoing byte budget.
+        use super::super::wire::{records_within, served_peers_cap, SERVED_PEERS_MAX_BYTES};
+        assert_eq!(SERVED_PEERS_MAX_BYTES, 67_562);
+        let cap = served_peers_cap(32);
+        assert_eq!(cap.bytes, 67_562);
+        let served = records_within(sample.clone(), cap.bytes);
+        assert_eq!(served, sample[..7], "seven of the largest records fit");
+        let encoded = DiscoveryMessage::Peers { records: served }
+            .encode()
+            .expect("the served answer encodes");
+        assert_eq!(encoded.len() - 1, 2 + 7 * MAX_NODE_RECORD_BYTES);
+        // A request for one record is owed one, and no cap leaves room for
+        // a record that doesn't fit.
+        assert_eq!(served_peers_cap(1).bytes, 2 + MAX_NODE_RECORD_BYTES as u64);
+        assert_eq!(
+            records_within(sample.clone(), served_peers_cap(1).bytes).len(),
+            1
+        );
+        assert!(records_within(sample, 2 + MAX_NODE_RECORD_BYTES as u64 - 1).is_empty());
+    }
+
+    /// Every record carries an ML-DSA-65 key and signature, so a full
+    /// sample of records with no other extension is past the served cap,
+    /// and an answer carries the first twelve.
+    #[test]
+    fn a_full_sample_of_signed_records_is_served_twelve_at_a_time() {
+        use super::super::wire::{records_within, served_peers_cap, SERVED_PEERS_MAX_BYTES};
+
+        let records: Vec<_> = (1..=32u8)
+            .map(|index| signed_record_with(1, service(1), test_addr(index)))
+            .collect();
+        let record_bytes = record_len(&records[0]);
+        assert_eq!((SERVED_PEERS_MAX_BYTES - 2) / record_bytes, 12);
+        assert_eq!(
+            records_within(records.clone(), served_peers_cap(32).bytes),
+            records[..12]
+        );
+        // Without the key and signature all 32 fit, as they did before
+        // records were signed with ML-DSA-65.
+        assert!(
+            2 + 32 * (record_bytes - RECORD_ML_DSA_65_EXTENSION_BYTES) <= SERVED_PEERS_MAX_BYTES
+        );
     }
 
     #[test]
@@ -7730,6 +8328,75 @@ mod tests {
         let mut reloaded = ZakuraDiscoveryBook::default();
         let outcome = reloaded.import_persisted_entries(file.load(), NOW, &context());
         assert_eq!((outcome.added, outcome.rejected), (0, 1));
+    }
+
+    #[test]
+    fn restoring_a_saved_peer_preserves_a_newer_live_sighting() {
+        let mut book = ZakuraDiscoveryBook::default();
+        let record = signed_record_with(1, service(9), test_addr(9));
+        let node_id = record.body.node_id();
+        import_hello(&mut book, record.clone(), NOW).unwrap();
+        let saved = book.persisted_entries();
+
+        let later = NOW + 1;
+        let mut reloaded = ZakuraDiscoveryBook::default();
+        import_hello(&mut reloaded, record, later).unwrap();
+        let outcome = reloaded.import_persisted_entries(saved, later, &context());
+
+        assert_eq!(outcome.metadata_updated, 1);
+        assert_eq!(reloaded.get(&node_id).unwrap().last_seen(), later);
+    }
+
+    /// The saver asks the book for only the entries the file keeps. That
+    /// selection is the one the file makes from a copy of the whole book:
+    /// live entries, the most recent successful dial first, then node ID
+    /// order, cut to the limit.
+    #[test]
+    fn the_book_selects_the_entries_its_file_keeps() {
+        use super::super::book_file::DiscoveryBookFile;
+
+        let mut book = ZakuraDiscoveryBook::default();
+        let mut ids = Vec::new();
+        for index in 1..=6u8 {
+            let record = signed_record_with(1, service(1), test_addr(index));
+            ids.push(record.body.node_id());
+            import_confirmed_record(&mut book, record).unwrap();
+        }
+        book.mark_dial_success(&ids[2], None, NOW - 10);
+        book.mark_dial_success(&ids[4], None, NOW - 5);
+        // An expired record is not kept, however recent its success.
+        let mut expiring = body(&secret_key());
+        expiring.direct_addrs = vec![test_addr(7)];
+        expiring.expires_at_unix_secs = NOW + 1;
+        let secret = secret_key();
+        expiring.keys = secret.key_list().clone();
+        let expiring = ZakuraNodeRecord::sign(expiring, &secret).unwrap();
+        let expired_id = expiring.body.node_id();
+        import_confirmed_record(&mut book, expiring).unwrap();
+        book.mark_dial_success(&expired_id, None, NOW);
+        let later = NOW + 2;
+
+        let node_ids = |entries: &[ZakuraDiscoveryPersistedEntry]| -> Vec<NodeId> {
+            entries
+                .iter()
+                .map(|entry| entry.record.body.node_id())
+                .collect()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let file = DiscoveryBookFile::new(dir.path().join("book"));
+        file.store(book.persisted_entries(), later).unwrap();
+        let from_file = node_ids(&file.load());
+        assert_eq!(from_file.len(), 6);
+        assert_eq!(from_file[..2], [ids[4], ids[2]]);
+        assert!(!from_file.contains(&expired_id));
+
+        assert_eq!(node_ids(&book.entries_to_persist(later, 6)), from_file);
+        assert_eq!(
+            node_ids(&book.entries_to_persist(later, 3)),
+            from_file[..3],
+            "a smaller limit keeps the first of the same order"
+        );
+        assert!(book.entries_to_persist(later, 0).is_empty());
     }
 
     /// The file keeps the most recently successful peers, stores static peers as
@@ -10255,6 +10922,79 @@ mod tests {
         assert_eq!(
             handle.current_self_record().body.direct_addrs,
             vec![test_addr(46)]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn peer_query_backoff_requires_full_connections_and_two_dialable_spares() {
+        use zakura_rt::time::Instant;
+        let (connected_tx, connected_rx) = watch::channel(Vec::new());
+        let handle = discovery_handle_at(
+            local_config_with(secret_key(), vec![test_addr(47)], vec![service(1)]),
+            ZakuraDiscoveryConfig {
+                max_zakura_connections: 2,
+                discovery_connection_headroom: 1,
+                ..ZakuraDiscoveryConfig::default()
+            },
+            connected_rx,
+            NOW,
+        );
+        let mut ids = Vec::new();
+        for i in 1..=3 {
+            let record = runtime_record_with(i.into(), service(1), test_addr(i));
+            ids.push(record.body.node_id());
+            import_hello_record(&handle, record).await;
+        }
+        let assess = || async {
+            let mut unavailable: HashSet<_> = connected_peer_node_ids(&connected_tx.borrow())
+                .into_iter()
+                .collect();
+            handle
+                .update_peer_query_reserve(&HeldPlaces::default(), |c| {
+                    unavailable.insert(c.node_id)
+                })
+                .await;
+        };
+        connected_tx.send_replace(vec![peer_id_for(ids[0])]);
+        assert!(
+            handle.next_peer_query(None).await.is_some(),
+            "initial query"
+        );
+        let sent = Some(Instant::now());
+        tokio::time::advance(Duration::from_secs(15)).await;
+        assess().await;
+        assert!(handle.next_peer_query(sent).await.is_none());
+        tokio::time::advance(super::super::candidate_dialer::QUERY_RESERVE_VALIDITY).await;
+        assert!(
+            handle.next_peer_query(sent).await.is_some(),
+            "a stopped dialer cannot keep delaying queries"
+        );
+        assess().await;
+        connected_tx.send_replace(Vec::new());
+        assert!(
+            handle.next_peer_query(sent).await.is_some(),
+            "connection lost"
+        );
+        connected_tx.send_replace(vec![peer_id_for(ids[0]), peer_id_for(ids[1])]);
+        assess().await;
+        assert!(
+            handle.next_peer_query(sent).await.is_some(),
+            "only one spare"
+        );
+        connected_tx.send_replace(vec![peer_id_for(ids[0])]);
+        tokio::time::advance(Duration::from_secs(42)).await;
+        assess().await;
+        assert!(handle.next_peer_query(sent).await.is_none());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(
+            handle.next_peer_query(sent).await.is_some(),
+            "healthy refresh due"
+        );
+        handle.mark_dial_attempt(&ids[1]).await;
+        handle.mark_dial_failure(&ids[1]).await;
+        assert!(
+            handle.next_peer_query(Some(Instant::now())).await.is_some(),
+            "a peer in backoff is not a spare"
         );
     }
 

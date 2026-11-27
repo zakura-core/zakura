@@ -25,10 +25,12 @@ mod key_list;
 mod tls;
 
 pub use composite::{
-    COMPOSITE_SIGNATURE_BYTES, ML_DSA_65_KEY_BYTES, ML_DSA_65_KEY_TAG, ML_DSA_65_SIGNATURE_BYTES,
+    COMPOSITE_SIGNATURE_BYTES, MAX_EARLIER_NODE_IDS, ML_DSA_65_KEY_BYTES, ML_DSA_65_KEY_TAG,
+    ML_DSA_65_SIGNATURE_BYTES,
 };
 pub use credential::{
-    CredentialError, NodeCredential, MAX_CREDENTIAL_BYTES, MAX_CREDENTIAL_KEY_BYTES,
+    verify_record_ml_dsa_65, CredentialError, CredentialKey, NodeCredential, MAX_CREDENTIAL_BYTES,
+    MAX_CREDENTIAL_KEY_BYTES,
 };
 pub use key::{
     ForeignKeyList, KeyParsingError, NodeAddr, NodeId, NodeKey, NodeSecretKey, SignatureError,

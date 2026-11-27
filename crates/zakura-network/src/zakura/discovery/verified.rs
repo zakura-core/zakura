@@ -4,8 +4,8 @@ use std::ops::Deref;
 
 use super::protocol::{DiscoveryRecordError, DiscoveryRecordValidationContext, ZakuraNodeRecord};
 
-/// A node record whose author checks passed: bounds, signature, network,
-/// chain, and protocol overlap.
+/// A node record whose author checks passed: bounds, both signatures,
+/// network, chain, and protocol overlap.
 ///
 /// Only [`VerifiedRecord::verify`] creates one, so holding one proves the
 /// checks ran. Discovery stores records in this form. A record identical to a

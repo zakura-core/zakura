@@ -556,6 +556,11 @@ impl DiscoveryPeer {
 
     /// The held `Peers` `frame` with one more record, by an author no
     /// script relays, whose extension bytes take the payload to `len`.
+    ///
+    /// The node refuses the frame for its size, before it verifies a record,
+    /// so the extra record is signed with Ed25519 alone. With an ML-DSA-65
+    /// key and signature it would be too long to land one byte past the cap
+    /// of a small `GetPeers` limit.
     fn over_owed(&self, frame: DiscoveryFrame, len: usize) -> Result<DiscoveryFrame, String> {
         let DiscoveryMessage::Peers { records } = frame.message else {
             return Err("over-owed needs a held Peers".to_owned());
@@ -564,8 +569,13 @@ impl DiscoveryPeer {
         let with = |extensions: Vec<u8>| -> Result<DiscoveryFrame, String> {
             let mut extra = body(&author, &self.handshake, unix_now(), vec![FIXTURE_ADDR]);
             extra.extensions = extensions;
-            let extra = ZakuraNodeRecord::sign(extra, &author)
-                .map_err(|error| format!("the over-owed record doesn't sign: {error:?}"))?;
+            let pre_image = extra
+                .encode_for_signature()
+                .map_err(|error| format!("the over-owed record doesn't encode: {error:?}"))?;
+            let extra = ZakuraNodeRecord {
+                signature: author.sign(&pre_image),
+                body: extra,
+            };
             let mut records = records.clone();
             records.push(extra);
             Ok(DiscoveryFrame::of(DiscoveryMessage::Peers { records }))

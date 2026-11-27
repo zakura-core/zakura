@@ -94,9 +94,17 @@ pub fn derived_read_result_byte_limit(config: &Config, network: &Network) -> u64
         .saturating_add(MAX_DECODED_BLOCK_BYTES)
 }
 
-/// Fixed non-leased memory for discovery's peer book and dial-backoff tables
-/// (`01 §1`: ~25 MiB for 10k records + 32k backoff entries).
-pub const DISCOVERY_TABLES_FIXED_BYTES: u64 = 25 * MIB;
+/// Fixed non-leased memory for discovery's peer book and dial-backoff tables:
+/// a full book's encoded records at the largest record size
+/// (`DEFAULT_MAX_DISCOVERY_BOOK_RECORDS` × `MAX_NODE_RECORD_BYTES`,
+/// 96,010,000 B), plus `01 §1`'s 25 MiB estimate for the entries' dial
+/// metadata and the 32k dial-backoff entries. That estimate dates from
+/// records of at most 753 B, so it also counts those bytes again.
+// Widening usize to u64 is lossless on supported targets.
+pub const DISCOVERY_TABLES_FIXED_BYTES: u64 = (crate::zakura::DEFAULT_MAX_DISCOVERY_BOOK_RECORDS
+    as u64)
+    * (crate::zakura::MAX_NODE_RECORD_BYTES as u64)
+    + 25 * MIB;
 
 /// Fixed non-leased memory for `tx-relay`'s `WantedIds` and `PendingSet` maps
 /// (`01 §1`, `#2623`: ~150 MiB when `tx-relay` is enabled).
@@ -828,6 +836,19 @@ impl MemoryPlan {
         (hold as u64)
             .saturating_mul(self.bases.full_connection_bytes())
             .min(self.sessions_share.saturating_sub(floor))
+    }
+
+    /// Preferred gateway places the sessions share can fund at once: whole
+    /// connections in [`Self::gateway_reserve`], at most
+    /// [`MAX_PREFERRED_GATEWAYS`](crate::zakura::MAX_PREFERRED_GATEWAYS).
+    pub fn funded_gateway_places(&self) -> usize {
+        let max = crate::zakura::MAX_PREFERRED_GATEWAYS;
+        let funded = self
+            .gateway_reserve(max)
+            .checked_div(self.bases.full_connection_bytes())
+            .unwrap_or(u64::MAX);
+        // The minimum is at most `max`, a usize, so the narrowing is lossless.
+        funded.min(max as u64) as usize
     }
 
     /// Construct a live [`MemoryPool`] sized from this plan.

@@ -118,7 +118,7 @@ where
 /// pool BPv1 leases from.
 ///
 /// The service follows `committed_snapshots`: the verified tip moves its
-/// propagation window and ends committed fallback blocks, and the best header
+/// propagation window and ends committed collecting and fallback blocks, and the best header
 /// wakes metadata pending on its parent.
 ///
 /// Sizes `DecodedBlockPool` to cover `decoded_backend_blocks` (non-finalized

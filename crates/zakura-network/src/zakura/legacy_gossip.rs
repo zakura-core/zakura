@@ -102,71 +102,6 @@ pub const MSG_RESPONSE_PONG: u16 = 17;
 /// Nil response for fire-and-forget legacy requests.
 pub const MSG_RESPONSE_NIL: u16 = 18;
 
-/// Header-visible bounds for legacy transport readers.
-/// Request IDs are in the stream prelude for requests and in the payload for responses.
-pub(crate) fn frame_payload_bounds(
-    kind: u16,
-    message: u16,
-    response: bool,
-) -> Option<super::PayloadLen> {
-    use super::PayloadLen;
-    let inventory =
-        usize::try_from(MAX_TX_INV_IN_SENT_MESSAGE).expect("inventory limit fits usize");
-    let hashes = 9 + inventory * 32;
-    // Witnessed inventory identifiers contain a type tag and two 32-byte hashes.
-    let ids = 9 + inventory * 68;
-    match (kind, response, message) {
-        (ZAKURA_STREAM_GOSSIP, _, MSG_ADVERTISE_BLOCK) => Some(PayloadLen::exact(32)),
-        (ZAKURA_STREAM_GOSSIP, _, MSG_ADVERTISE_TX_IDS) => Some(PayloadLen::between(1, ids)),
-        (ZAKURA_STREAM_LEGACY_REQUESTS, false, MSG_REQUEST_BLOCKS_BY_HASH) => {
-            Some(PayloadLen::between(1, hashes))
-        }
-        (ZAKURA_STREAM_LEGACY_REQUESTS, false, MSG_REQUEST_TRANSACTIONS_BY_ID) => {
-            Some(PayloadLen::between(1, ids))
-        }
-        (
-            ZAKURA_STREAM_LEGACY_REQUESTS,
-            false,
-            MSG_REQUEST_FIND_BLOCKS | MSG_REQUEST_FIND_HEADERS,
-        ) => Some(PayloadLen::between(
-            33,
-            usize::try_from(9 + MAX_BLOCK_LOCATOR_LENGTH * 32 + 32)
-                .expect("locator limit fits usize"),
-        )),
-        (
-            ZAKURA_STREAM_LEGACY_REQUESTS,
-            false,
-            MSG_REQUEST_MEMPOOL_TRANSACTION_IDS | MSG_REQUEST_PING,
-        ) => Some(PayloadLen::exact(0)),
-        (ZAKURA_STREAM_LEGACY_REQUESTS, false, MSG_REQUEST_PUSH_TRANSACTION) => {
-            Some(PayloadLen::between(1, MAX_PROTOCOL_MESSAGE_LEN))
-        }
-        (ZAKURA_STREAM_LEGACY_REQUESTS, true, MSG_RESPONSE_BLOCK | MSG_RESPONSE_TRANSACTION) => {
-            Some(PayloadLen::between(
-                RESPONSE_CHUNK_HEADER_BYTES,
-                RESPONSE_CHUNK_HEADER_BYTES + MAX_PROTOCOL_MESSAGE_LEN,
-            ))
-        }
-        (
-            ZAKURA_STREAM_LEGACY_REQUESTS,
-            true,
-            MSG_RESPONSE_MISSING_BLOCKS | MSG_RESPONSE_BLOCK_HASHES,
-        ) => Some(PayloadLen::between(9, REQUEST_ID_BYTES + hashes)),
-        (
-            ZAKURA_STREAM_LEGACY_REQUESTS,
-            true,
-            MSG_RESPONSE_MISSING_TRANSACTIONS | MSG_RESPONSE_TRANSACTION_IDS,
-        ) => Some(PayloadLen::between(9, REQUEST_ID_BYTES + ids)),
-        (ZAKURA_STREAM_LEGACY_REQUESTS, true, MSG_RESPONSE_BLOCK_HEADERS) => Some(
-            PayloadLen::between(9, REQUEST_ID_BYTES + MAX_PROTOCOL_MESSAGE_LEN),
-        ),
-        (ZAKURA_STREAM_LEGACY_REQUESTS, true, MSG_RESPONSE_PONG | MSG_RESPONSE_NIL) => {
-            Some(PayloadLen::exact(REQUEST_ID_BYTES))
-        }
-        _ => None,
-    }
-}
-
 const LEGACY_GOSSIP_INBOUND_QUEUE: usize = 256;
 const LEGACY_GOSSIP_DECODED_SLOTS: usize = 8;
 /// The share of [`LEGACY_GOSSIP_DECODED_SLOTS`] one peer may hold across all of its
@@ -8750,9 +8685,8 @@ mod tests {
         Ok(())
     }
 
-    /// Exhausting the local framing allowance ends only the response exchange.
     #[tokio::test]
-    async fn excessive_outbound_response_frames_preserves_peer() -> Result<(), BoxError> {
+    async fn excessive_outbound_response_frames_disconnects_peer() -> Result<(), BoxError> {
         let _guard = zakura_test::init();
         let node = ZakuraTestNode::builder(75).spawn().await?;
         let hostile = HostilePeer::connect_native(&node, 76).await?;
@@ -8766,9 +8700,7 @@ mod tests {
         );
         let responder = hostile.respond_to_next_request_with(|request_id| {
             let mut frames = Vec::new();
-            // More frames than a one-block request allows at default caps: eight
-            // chunks for the largest item, plus one.
-            for _ in 0..16 {
+            for _ in 0..10 {
                 let mut payload = Vec::new();
                 payload.extend_from_slice(&request_id.to_le_bytes());
                 payload.extend_from_slice(&encoded_count(0));
@@ -8788,13 +8720,13 @@ mod tests {
             matches!(
                 error.downcast_ref::<crate::zakura::handler::ZakuraHandlerError>(),
                 Some(crate::zakura::handler::ZakuraHandlerError::RejectedFrame {
-                    rejection: crate::zakura::FrameRejection::LocalCapacity,
+                    rejection: crate::zakura::FrameRejection::Unsolicited,
                     ..
                 })
             ),
             "unexpected error: {error}"
         );
-        wait_registered_count(&node, 1).await?;
+        wait_registered_count(&node, 0).await?;
 
         hostile.shutdown().await;
         node.shutdown().await;

@@ -63,10 +63,9 @@ impl StreamReader {
         self.refusal(frame).is_none()
     }
 
-    /// The outcome a QUIC stream reader closes with for `frame`'s header, or
-    /// `None` if it admits the header.
-    fn refusal(&self, frame: &Frame) -> Option<CloseOutcome> {
-        let (kind, version) = (self.stream.kind, self.stream.version);
+    /// The row a QUIC stream reader refuses `frame`'s header for, or `None`
+    /// if it admits the header.
+    fn refusal(&self, frame: &Frame) -> Option<CloseRow> {
         let frame_cap =
             usize::try_from(self.stream.frame_cap).expect("a u32 frame cap fits in usize");
         match FrameFilter::new(self.stream.messages, InboundReader::Persistent)
@@ -77,9 +76,9 @@ impl StreamReader {
                 frame.payload.len(),
                 frame_cap,
             ) {
-            Err(rejection) => Some(rejection.close_outcome(kind, version)),
+            Err(rejection) => Some(rejection.close_row()),
             Ok(cap) if FRAME_HEADER_BYTES.saturating_add(frame.payload.len()) > cap => {
-                Some(CloseOutcome::fault(kind, version, CloseRow::REG_CLOSE_1))
+                Some(CloseRow::REG_CLOSE_1)
             }
             Ok(_) => None,
         }
@@ -93,10 +92,14 @@ impl StreamReader {
     /// If no [`Peer::read_through`](super::Peer::read_through) bound this
     /// reader to its connection, or the reader admits the header.
     pub fn refuse(&self, frame: &Frame) {
-        let outcome = self
+        let row = self
             .refusal(frame)
             .expect("a relay refuses only a header the reader refuses");
-        self.close(outcome);
+        self.close(CloseOutcome::fault(
+            self.stream.kind,
+            self.stream.version,
+            row,
+        ));
     }
 
     /// Closes the connection with `cause`.

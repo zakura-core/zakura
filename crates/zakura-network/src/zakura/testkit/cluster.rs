@@ -2338,7 +2338,7 @@ mod tests {
             HostilePeer::connect_native_with_capabilities(victim, 2, ZAKURA_CAP_LEGACY_GOSSIP)
                 .await?;
 
-        let known_payload = vec![1; 32];
+        let known_payload = b"known-kind-frame".to_vec();
         let unknown_payload = b"unknown-kind-frame".to_vec();
         // Reset and drop unknown kind 9.
         hostile.send_frame(9, unknown_payload.clone()).await?;
@@ -2462,7 +2462,7 @@ mod tests {
                 .await?;
 
         let bad_version = b"kind-2-version-99".to_vec();
-        let good = vec![2; 32];
+        let good = b"kind-2-version-1".to_vec();
         hostile
             .send_frame_with_version(2, 99, bad_version.clone())
             .await?;
@@ -2548,7 +2548,7 @@ mod tests {
         let recorder = victim.recorder();
         let hostile = HostilePeer::connect_native(victim, 6).await?;
 
-        let before = vec![3; 32];
+        let before = b"before-header-sync-error".to_vec();
         let bad_header_sync_payload = vec![99];
         hostile
             .send_frame(ZAKURA_STREAM_HEADER_SYNC, bad_header_sync_payload.clone())
@@ -2559,7 +2559,7 @@ mod tests {
         })
         .await?;
 
-        let after = vec![4; 32];
+        let after = b"after-header-sync-error".to_vec();
         hostile.send_frame(2, after.clone()).await?;
         await_until(
             "post-header-sync gossip delivered",
@@ -2653,7 +2653,7 @@ mod tests {
         v8_peer
             .send_frame_with_version(ZAKURA_STREAM_HEADER_SYNC, 8, header_sync.clone())
             .await?;
-        let gossip = vec![5; 32];
+        let gossip = b"gossip-after-header-sync-version-8".to_vec();
         v8_peer
             .send_frame(ZAKURA_STREAM_GOSSIP, gossip.clone())
             .await?;
@@ -2953,7 +2953,7 @@ mod tests {
             // The victim disconnects after the sender exceeds the budget.
             // Later sends can race the teardown and return an error.
             if hostile
-                .send_frame(2, vec![u8::try_from(index).unwrap(); 32])
+                .send_frame(2, format!("a-{index}").into_bytes())
                 .await
                 .is_err()
             {
@@ -3008,7 +3008,9 @@ mod tests {
         let hostile =
             HostilePeer::connect_native_with_capabilities(&victim, 17, ZAKURA_CAP_LEGACY_GOSSIP)
                 .await?;
-        let payloads: Vec<Vec<u8>> = (0..4).map(|index| vec![index; 32]).collect();
+        let payloads: Vec<Vec<u8>> = (0..4)
+            .map(|index| format!("ordered-{index}").into_bytes())
+            .collect();
 
         for payload in &payloads {
             hostile
@@ -3050,7 +3052,7 @@ mod tests {
         let peer_id = hostile.id()?;
 
         hostile
-            .send_frame(ZAKURA_STREAM_GOSSIP, vec![6; 32])
+            .send_frame(ZAKURA_STREAM_GOSSIP, b"open-source-stream".to_vec())
             .await?;
         tokio::time::timeout(Duration::from_secs(5), async {
             while !service.contains_peer(&peer_id).await {
@@ -3098,7 +3100,7 @@ mod tests {
         let peer_id = hostile.id()?;
 
         hostile
-            .send_frame(ZAKURA_STREAM_GOSSIP, vec![7; 32])
+            .send_frame(ZAKURA_STREAM_GOSSIP, b"start-probe".to_vec())
             .await?;
         wait_for_probe_event(
             &mut events_rx,

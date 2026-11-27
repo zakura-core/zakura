@@ -283,6 +283,21 @@ pub(crate) const CONSENSUS_BRANCH_IDS: &[(NetworkUpgrade, ConsensusBranchId)] = 
     (ZFuture, ConsensusBranchId(0xfffffffd)),
 ];
 
+/// Whether this build knows a consensus branch ID for NU7.1, and so can validate NU7.1
+/// blocks.
+///
+/// Only test builds do, through the placeholder in [`CONSENSUS_BRANCH_IDS`]. This reads that
+/// table, so it always agrees with the branch IDs the build accepts.
+pub const NU7_1_HAS_BRANCH_ID: bool = {
+    let mut index = 0;
+    let mut found = false;
+    while index < CONSENSUS_BRANCH_IDS.len() {
+        found |= matches!(CONSENSUS_BRANCH_IDS[index].0, Nu7_1);
+        index += 1;
+    }
+    found
+};
+
 /// Mainnet activation heights as a map, built once instead of on every lookup.
 static MAINNET_ACTIVATION_MAP: LazyLock<BTreeMap<block::Height, NetworkUpgrade>> =
     LazyLock::new(|| MAINNET_ACTIVATION_HEIGHTS.iter().cloned().collect());

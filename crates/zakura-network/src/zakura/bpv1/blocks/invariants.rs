@@ -107,6 +107,7 @@ impl BlockTable {
                 // bpv1-50: retirement returns every worker lease.
                 assert!(
                     block.verify_work_id.is_none()
+                        && block.rebuild_work_id.is_none()
                         && block.stripes.iter().all(|st| st.job.is_none()),
                     "{BLOCK_REPLAY}: bpv1-50 retired block still holds worker leases"
                 );
@@ -120,6 +121,13 @@ impl BlockTable {
             assert!(
                 block.verify_work_id.is_none() || block.phase == BlockPhase::Verifying,
                 "{BLOCK_REPLAY}: bpv1-63 a {:?} block holds a verifier submission",
+                block.phase
+            );
+            // bpv1-90: a rebuild is in flight exactly while the block rebuilds.
+            assert_eq!(
+                block.rebuild_work_id.is_some(),
+                block.phase == BlockPhase::Rebuilding,
+                "{BLOCK_REPLAY}: bpv1-90 a {:?} block's rebuild lease",
                 block.phase
             );
             // bpv1-82: every verifying block has a verification deadline.

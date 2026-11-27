@@ -74,7 +74,7 @@ use crate::zakura::{
         assemble::assemble_block,
         blocks::{
             BlockConfig, BlockInput, BlockOutput, BlockPhase, BlockTable, HeaderAdmissionResult,
-            MetaEnvelope, PullPeerState, VerifierVerdict, WorkId,
+            MetaEnvelope, PullPeerState, RebuildResult, VerifierVerdict, WorkId,
         },
         codec::{decode_and_check_stripe, encode_body, EncodedBody},
         commitment::coinbase_paths,
@@ -93,7 +93,8 @@ use crate::zakura::{
             route_peer_output, BlockRoute, PeerRoute,
         },
         service::{
-            control_input, data_input, parse_and_verify_part_frame, verify_envelope_commitment,
+            control_input, data_input, parse_and_verify_part_frame, rebuild_parts,
+            verify_envelope_commitment,
         },
         unknown_parent::UnknownParentVerdict,
         wire::{
@@ -205,6 +206,12 @@ enum Job {
     Encode {
         work_id: WorkId,
         block: usize,
+    },
+    Rebuild {
+        work_id: WorkId,
+        block_id: block::Hash,
+        coding: Coding,
+        part_root: [u8; 32],
     },
 }
 
@@ -406,7 +413,7 @@ impl Mesh {
             20 => self.reconnect(a),
             21 => match b % 3 {
                 0 => self.control_stalled(a),
-                1 => self.fallback_done(a),
+                1 => self.fallback_done(a, b & 4 != 0),
                 _ => self.sync_past(b),
             },
             22 => self.adversary_crafted(a, b),
@@ -653,6 +660,39 @@ impl Mesh {
                         },
                     );
                 }
+            }
+            Job::Rebuild {
+                work_id,
+                block_id,
+                coding,
+                part_root,
+            } => {
+                // Full state holds every solved block the node committed.
+                let committed = self
+                    .solved
+                    .iter()
+                    .find(|s| s.id == block_id && s.height <= self.nodes[node].tip)
+                    .filter(|_| !local_failure)
+                    .map(|s| {
+                        block::Block::zcash_deserialize_bounded(&mut s.raw.as_slice())
+                            .expect("a solved block's bytes decode")
+                    });
+                let result = match committed {
+                    Some(block) => rebuild_parts(&self.profile, &block, &coding, &part_root),
+                    None => RebuildResult::Missing,
+                };
+                assert!(
+                    !matches!(result, RebuildResult::Mismatch),
+                    "{MESH}: bpv1-90 node {node}'s committed {block_id:?} encodes to another root"
+                );
+                self.step_table(
+                    node,
+                    BlockInput::Rebuilt {
+                        work_id,
+                        block_id,
+                        result,
+                    },
+                );
             }
             Job::Encode { work_id, block } => {
                 let planned = &self.planned[block];
@@ -1566,6 +1606,17 @@ impl Mesh {
                 }
                 return;
             }
+            BlockOutput::RebuildFromCommitted {
+                work_id,
+                block_id,
+                coding,
+                part_root,
+            } => Job::Rebuild {
+                work_id,
+                block_id,
+                coding,
+                part_root,
+            },
             // `check_table_output` keeps the claim ledger.
             BlockOutput::ClaimBody { .. }
             | BlockOutput::ExtendBodyClaim { .. }
@@ -1609,14 +1660,21 @@ impl Mesh {
     }
 
     /// Block sync fetches and commits one block that fell back on the node
-    /// `a` picks.
-    fn fallback_done(&mut self, a: u8) {
+    /// `a` picks. With `collecting`, it may instead commit a block BPv1 still
+    /// collects once a repair round released its claim, so BPv1 rebuilds it
+    /// (bpv1-90).
+    fn fallback_done(&mut self, a: u8, collecting: bool) {
         let node = usize::from(a) % ADVERSARY;
+        let n = &self.nodes[node];
         let fallen: Vec<block::Hash> = self
             .solved
             .iter()
             .map(|s| s.id)
-            .filter(|id| self.nodes[node].table.block_phase(id) == Some(BlockPhase::Fallback))
+            .filter(|id| match n.table.block_phase(id) {
+                Some(BlockPhase::Fallback) => true,
+                Some(BlockPhase::Collecting) => collecting && !n.claimed.contains(id),
+                _ => false,
+            })
             .collect();
         if let Some(&block_id) = fallen.get(usize::from(a >> 2) % fallen.len().max(1)) {
             self.commit(node, block_id);
@@ -1653,7 +1711,7 @@ impl Mesh {
             // `node` is below `NODES`, so the cast keeps it; each call
             // finishes one fallback, and a node holds at most `BLOCKS`.
             for _ in 0..BLOCKS {
-                self.fallback_done(node as u8);
+                self.fallback_done(node as u8, false);
             }
         }
         for (i, j) in self.connections(true) {

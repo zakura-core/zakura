@@ -171,6 +171,7 @@ pub fn block_input_name(input: &BlockInput) -> &'static str {
         BlockInput::StripeJobDone { .. } => "block-in:StripeJobDone",
         BlockInput::BlockAssembled { .. } => "block-in:BlockAssembled",
         BlockInput::VerifierVerdict { .. } => "block-in:VerifierVerdict",
+        BlockInput::Rebuilt { .. } => "block-in:Rebuilt",
         BlockInput::FallbackDone { .. } => "block-in:FallbackDone",
         BlockInput::ProposedCommitFailed { .. } => "block-in:ProposedCommitFailed",
         BlockInput::Tick { .. } => "block-in:Tick",
@@ -178,7 +179,7 @@ pub fn block_input_name(input: &BlockInput) -> &'static str {
 }
 
 /// Every name [`block_input_name`] returns.
-pub const BLOCK_INPUTS: [&str; 25] = [
+pub const BLOCK_INPUTS: [&str; 26] = [
     "block-in:TipHeight",
     "block-in:ParentAdmitted",
     "block-in:MetaReceived",
@@ -201,6 +202,7 @@ pub const BLOCK_INPUTS: [&str; 25] = [
     "block-in:StripeJobDone",
     "block-in:BlockAssembled",
     "block-in:VerifierVerdict",
+    "block-in:Rebuilt",
     "block-in:FallbackDone",
     "block-in:ProposedCommitFailed",
     "block-in:Tick",
@@ -223,6 +225,7 @@ pub fn block_output_name(output: &BlockOutput) -> &'static str {
         BlockOutput::NotifyBlockDone { .. } => "block-out:NotifyBlockDone",
         BlockOutput::StartStripeJob { .. } => "block-out:StartStripeJob",
         BlockOutput::SubmitVerifier { .. } => "block-out:SubmitVerifier",
+        BlockOutput::RebuildFromCommitted { .. } => "block-out:RebuildFromCommitted",
         BlockOutput::PublishRetire { .. } => "block-out:PublishRetire",
         BlockOutput::MetaRejected { .. } => "block-out:MetaRejected",
         BlockOutput::PublishEvictRetired { .. } => "block-out:PublishEvictRetired",
@@ -250,6 +253,7 @@ pub fn phase_name(phase: BlockPhase) -> &'static str {
     match phase {
         BlockPhase::Collecting => "phase:Collecting",
         BlockPhase::Verifying => "phase:Verifying",
+        BlockPhase::Rebuilding => "phase:Rebuilding",
         BlockPhase::Done => "phase:Done",
         BlockPhase::Fallback => "phase:Fallback",
         BlockPhase::Retired => "phase:Retired",

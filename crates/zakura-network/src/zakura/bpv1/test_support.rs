@@ -15,7 +15,7 @@ use zakura_chain::{
     transaction::Transaction,
 };
 use zakura_node_services::{
-    block_memory::{DecodedBlockPool, OwnedBlock},
+    block_memory::{BlockHandle, DecodedBlockPool, OwnedBlock},
     body_claims::SharedBodyClaims,
 };
 use zakura_quic::{ConnLoad, NodeId};
@@ -38,7 +38,9 @@ use super::{
         PartAuth, PeerConfig, PeerEvent, PeerInput, PeerOutput, PeerState, PeerStep, RecvHave,
         RecvPartPrefix, RecvWant, RecvWantEnd, Seed, Seeds, ServeDone, ServePartQueued,
     },
-    ports::{BlockVerifierPort, HeaderAdmissionPort, MemoryBodyStore, PortFuture},
+    ports::{
+        BlockVerifierPort, CommittedBlockPort, HeaderAdmissionPort, MemoryBodyStore, PortFuture,
+    },
     profile::{Coding, Profile},
     proposer::{queue_seeds, seed_plan, ProposerOutput},
     route::{
@@ -200,9 +202,19 @@ fn snapshot_at(height: u32) -> zakura_header_chain::EngineSnapshot {
     }
 }
 
+/// A committed-block port over a state that holds no block.
+struct NoCommittedBlocks;
+
+impl CommittedBlockPort for NoCommittedBlocks {
+    fn committed_block(&self, _hash: block::Hash) -> PortFuture<'_, Option<BlockHandle>> {
+        Box::pin(async { None })
+    }
+}
+
 /// Ports that admit every header at `height`, keep bodies in a four-block
-/// pool, verify with `verifier`, and claim bodies in `claims`. The committed
-/// snapshot puts the verified tip at the parent height.
+/// pool, verify with `verifier`, and claim bodies in `claims`. State holds
+/// no committed block, and the committed snapshot puts the verified tip at
+/// the parent height.
 pub(super) fn ports(
     height: u32,
     verifier: impl BlockVerifierPort,
@@ -215,6 +227,7 @@ pub(super) fn ports(
         ))),
         verifier: Arc::new(verifier),
         fallback: Arc::new(claims),
+        committed_blocks: Arc::new(NoCommittedBlocks),
         committed_snapshots: watch::channel(Some(snapshot_at(height.saturating_sub(1)))).1,
     }
 }

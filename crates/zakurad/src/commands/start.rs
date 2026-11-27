@@ -999,6 +999,9 @@ impl StartCmd {
                         block_verifier_router.clone(),
                         zakura_block_sync_handoff.clone(),
                     )),
+                    Arc::new(zakura::bpv1_wiring::StateCommittedBlocks::new(
+                        read_only_state_service.clone(),
+                    )),
                     driver_startup,
                     // Child token so disabling/shutting down BPv1 never shuts down the daemon.
                     shutdown.child_token(),

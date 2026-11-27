@@ -388,7 +388,8 @@ total block-size bound and reject trailing or noncanonical body bytes.
 
 A node MAY serve regenerated parts of a stripe only after that stripe passes its
 re-encode check. A node other than the proposer MUST send `BlockDone` only after
-assembly succeeds. The existing validator independently decides whether the block is valid, including
+assembly succeeds, or after it rebuilds every part from the block's committed
+body (section 6). The existing validator independently decides whether the block is valid, including
 whether the body's transaction commitments match the admitted header. Coding
 verification does not establish consensus validity and MUST NOT substitute for
 that validation.
@@ -923,8 +924,9 @@ repair `Want`s, which the sender must still end.
 - **Cadence**
   - at most once per block per connection
 
-`BlockDone` states that the sender assembled the block under section 2, or that
-the sender is the block's proposer, so it holds every part (decision-20). It is
+`BlockDone` states that the sender assembled the block under section 2, rebuilt
+every part from the block's committed body under section 6, or is the block's
+proposer, so it holds every part (decision-20). It is
 terminal and advisory for the block on
 the connection. The receiver MUST stop queueing parts of the block to the
 sender. It MUST still process control messages and future-block demand from the
@@ -1132,6 +1134,18 @@ When a stripe reaches `k` distinct verified parts, the node SHOULD send
 section 2, the node MUST stop issuing pulls for the block and SHOULD send
 `BlockDone` to every peer that knows the block. Its outstanding `Want`s stay
 live until their `WantEnd`s arrive.
+
+When native block sync commits a block the node still collects, the node SHOULD
+rebuild the block's parts from the committed body. It MUST stop issuing pulls
+for the block once the commit is known. It encodes the body under section 2,
+and the result MUST match the admitted coding and `part_root`, which commit to
+every stripe and to the padding above the last one. On a match the node holds
+every part: it SHOULD send `BlockDone` and serves the parts as it serves an
+assembled block's. On a mismatch the admitted metadata was wrong, because the
+committed body is valid, so the node retires the block without faulting any
+peer. If the node finds no committed body, the block keeps collecting under its
+reconstruction deadline. A block that already passed that deadline retires
+when native block sync commits it.
 
 After a stripe passes its re-encode check, the node MAY send the stripe's parts
 it never received to accepted subscribers of their lanes. These parts obey

@@ -160,6 +160,10 @@ pub enum BlockPhase {
     Collecting,
     /// Assembled block handed to the consensus verifier.
     Verifying,
+    /// Native block sync committed the block while it collected. IO rebuilds
+    /// its parts from the committed body; the block pulls nothing meanwhile
+    /// (`bpv1-90`).
+    Rebuilding,
     /// Committed / completed.
     Done,
     /// Handed off to native block sync fallback (`bpv1-41`, `bpv1-43`, `bpv1-57`).
@@ -233,6 +237,20 @@ pub enum VerifierVerdict {
     Invalid,
     /// Another path already delivered the block.
     Duplicate,
+}
+
+/// What IO found when it rebuilt a block's parts from its committed body
+/// (`bpv1-90`).
+#[derive(Clone, Debug)]
+pub enum RebuildResult {
+    /// Every `stripes * n` part, encoded from the committed body with a
+    /// coding and part root equal to the admitted metadata's.
+    Parts(Vec<VerifiedPart>),
+    /// State held no committed block for the hash, or the read failed.
+    Missing,
+    /// The committed body encodes to another coding or part root, so the
+    /// admitted metadata was wrong.
+    Mismatch,
 }
 
 /// Reason a body claim is released to `BlockFallback`.
@@ -350,7 +368,8 @@ pub struct PullPeerState {
 /// Synchronous input to [`BlockTable::step`].
 #[derive(Clone, Debug)]
 pub enum BlockInput {
-    /// The verified chain tip moved (`bpv1-7`, `bpv1-46`, `bpv1-76`).
+    /// The verified chain tip moved (`bpv1-7`, `bpv1-46`, `bpv1-76`). A
+    /// collecting block at or below it rebuilds its parts (`bpv1-90`).
     TipHeight {
         /// Height of the new verified tip.
         height: u32,
@@ -582,6 +601,15 @@ pub enum BlockInput {
         /// Consensus verdict.
         verdict: VerifierVerdict,
     },
+    /// Completion of `RebuildFromCommitted` (`bpv1-63`, `bpv1-90`).
+    Rebuilt {
+        /// Work identity from `RebuildFromCommitted`.
+        work_id: WorkId,
+        /// Target block.
+        block_id: block::Hash,
+        /// What the rebuild found.
+        result: RebuildResult,
+    },
     /// Native block sync committed this block; ends it if it is in fallback (`bpv1-57`).
     FallbackDone {
         /// Committed block.
@@ -752,6 +780,18 @@ pub enum BlockOutput {
         /// has no stripes.
         stripe_sources: Vec<Vec<Arc<[u8]>>>,
     },
+    /// Read `block_id`'s committed body from state, encode it, and report
+    /// its parts if its coding and part root equal these (`bpv1-90`).
+    RebuildFromCommitted {
+        /// Work identity.
+        work_id: WorkId,
+        /// Committed block hash.
+        block_id: block::Hash,
+        /// Admitted coding tuple.
+        coding: Coding,
+        /// Admitted part root.
+        part_root: [u8; 32],
+    },
     /// Publish block retirement to every live `PeerState`.
     PublishRetire {
         /// Retired block hash.
@@ -890,6 +930,18 @@ pub enum BlockEvent {
         block_id: block::Hash,
         /// 1-based repair round number.
         round: u8,
+    },
+    /// Native block sync committed a collecting block, and BPv1 rebuilt
+    /// every part from the committed body (`bpv1-90`).
+    Rebuilt {
+        /// Block hash.
+        block_id: block::Hash,
+    },
+    /// A committed body encoded to another coding or part root than the
+    /// admitted metadata, so the block retired (`bpv1-90`).
+    RebuildMismatch {
+        /// Block hash.
+        block_id: block::Hash,
     },
     /// Block transitioned to fallback (`bpv1-57`).
     FallbackStarted {
@@ -1348,6 +1400,11 @@ struct ActiveBlock {
     /// Monotonic verification deadline, set at the first submission
     /// (`bpv1-82`).
     verify_deadline: Option<Instant>,
+    /// Work id of the rebuild in flight, exactly while `Rebuilding`.
+    rebuild_work_id: Option<WorkId>,
+    /// True once a rebuild started, so a block whose committed body state
+    /// lacked tries once (`bpv1-90`).
+    rebuild_tried: bool,
     /// The header's parent. `None` for a local solved block.
     parent_hash: Option<block::Hash>,
     /// Whether this block currently holds a body claim in `BlockFallback`.
@@ -1402,6 +1459,8 @@ impl ActiveBlock {
             done_peers: HashSet::new(),
             verify_work_id: None,
             verify_deadline: None,
+            rebuild_work_id: None,
+            rebuild_tried: false,
             parent_hash: None,
             body_claimed: false,
             block_done_notified: false,
@@ -1766,6 +1825,7 @@ impl BlockTable {
                 self.verified_hash = Some(hash);
                 self.raise_top(height, &mut step);
                 self.resubmit_parked(now, &mut step);
+                self.rebuild_committed(&mut step);
             }
             BlockInput::ParentAdmitted { hash, height } => {
                 self.best_moves = self.best_moves.wrapping_add(1);
@@ -1925,6 +1985,13 @@ impl BlockTable {
                 verdict,
             } => {
                 self.handle_verifier_verdict(now, work_id, block_id, verdict, &mut step);
+            }
+            BlockInput::Rebuilt {
+                work_id,
+                block_id,
+                result,
+            } => {
+                self.handle_rebuilt(now, work_id, block_id, result, &mut step);
             }
             BlockInput::FallbackDone { block_id } => {
                 self.handle_fallback_done(block_id, &mut step);
@@ -2697,9 +2764,10 @@ impl BlockTable {
 
     /// Frees a concurrent-block slot if every slot is taken.
     ///
-    /// Retires the lowest `Done` block, else the lowest `Fallback` block so a
-    /// stalled fallback never wedges admission. With `force`, retires the lowest
-    /// non-retired block as a last resort. Returns whether a slot is free.
+    /// Retires the lowest `Done` or `Rebuilding` block, both committed, else
+    /// the lowest `Fallback` block so a stalled fallback never wedges
+    /// admission. With `force`, retires the lowest non-retired block as a
+    /// last resort. Returns whether a slot is free.
     fn evict_for_slot(&mut self, force: bool, step: &mut BlockStep) -> bool {
         let lowest = |phases: &[BlockPhase]| {
             self.blocks
@@ -2716,7 +2784,7 @@ impl BlockTable {
         if active < self.config.max_concurrent_blocks {
             return true;
         }
-        let victim = lowest(&[BlockPhase::Done])
+        let victim = lowest(&[BlockPhase::Done, BlockPhase::Rebuilding])
             .or_else(|| lowest(&[BlockPhase::Fallback]))
             .or_else(|| {
                 force
@@ -3281,7 +3349,10 @@ impl BlockTable {
             let Some(charge) = block.part_charges.remove(&(index, from_peer, session_gen)) else {
                 return;
             };
-            if matches!(block.phase, BlockPhase::Retired | BlockPhase::Fallback) {
+            if matches!(
+                block.phase,
+                BlockPhase::Retired | BlockPhase::Fallback | BlockPhase::Rebuilding
+            ) {
                 return;
             }
             // Defense-in-depth check that the part was verified
@@ -3662,6 +3733,141 @@ impl BlockTable {
         }
     }
 
+    /// Starts one rebuild for each collecting block at or below the verified
+    /// tip (`bpv1-90`).
+    ///
+    /// Such a block can no longer commit through BPv1: block sync committed
+    /// it, or another block took its height. The snapshot watch coalesces, so
+    /// the height, not the tip hash, finds every block a snapshot committed.
+    /// State answers `Missing` for a block on a losing branch.
+    fn rebuild_committed(&mut self, step: &mut BlockStep) {
+        let committed: Vec<block::Hash> = self
+            .blocks
+            .values()
+            .filter(|b| {
+                b.phase == BlockPhase::Collecting && !b.rebuild_tried && b.height <= self.verified
+            })
+            .map(|b| b.meta.block_id)
+            .collect();
+        for block_id in committed {
+            let work_id = alloc_work_id(&mut self.next_work_id);
+            let block = self
+                .blocks
+                .get_mut(&block_id)
+                .expect("the block exists because the scan just found it");
+            block.phase = BlockPhase::Rebuilding;
+            block.rebuild_work_id = Some(work_id);
+            block.rebuild_tried = true;
+            // Outstanding `Want`s stay live; the parts they deliver are dropped.
+            for st in &mut block.stripes {
+                st.claims.clear();
+                st.incoming.clear();
+            }
+            if std::mem::take(&mut block.body_claimed) {
+                step.outputs.push(BlockOutput::ReleaseBodyClaim {
+                    block_id,
+                    reason: ClaimRelease::Committed,
+                });
+            }
+            step.outputs.push(BlockOutput::RebuildFromCommitted {
+                work_id,
+                block_id,
+                coding: block.meta.coding,
+                part_root: block.meta.part_root,
+            });
+        }
+    }
+
+    /// Applies a rebuild's result (`bpv1-90`).
+    ///
+    /// Rebuilt parts make the block `Done`: it holds and serves every part
+    /// and sends `BlockDone`. Block sync delivered it, so its outcome is
+    /// `Fallback` and it records no assembly. A mismatch retires the block
+    /// without faulting a peer, because the committed body is valid by
+    /// consensus. A missing body returns the block to `Collecting` under its
+    /// unmoved deadline.
+    fn handle_rebuilt(
+        &mut self,
+        now: Instant,
+        work_id: WorkId,
+        block_id: block::Hash,
+        result: RebuildResult,
+        step: &mut BlockStep,
+    ) {
+        let Some(block) = self
+            .blocks
+            .get_mut(&block_id)
+            .filter(|b| b.rebuild_work_id == Some(work_id))
+        else {
+            // bpv1-63: the block retired or was evicted since.
+            return;
+        };
+        block.rebuild_work_id = None;
+        let parts = match result {
+            RebuildResult::Missing => {
+                block.phase = BlockPhase::Collecting;
+                // A stripe job that finished meanwhile may have made the
+                // block assemblable.
+                self.maybe_assemble_and_verify(now, block_id, step);
+                return;
+            }
+            RebuildResult::Mismatch => {
+                step.events.push(BlockEvent::RebuildMismatch { block_id });
+                step.events.push(BlockEvent::Outcome {
+                    block_id,
+                    outcome: BlockOutcome::Fallback,
+                });
+                self.retire_block(block_id, step);
+                return;
+            }
+            RebuildResult::Parts(parts) => parts,
+        };
+        let coding = block.meta.coding;
+        let mut ready = Vec::new();
+        let mut pushed = Vec::new();
+        for part in parts {
+            let index = part.index();
+            if part.part_root() != block.meta.part_root {
+                continue;
+            }
+            let Some((stripe, slot)) = coding.split_index(index) else {
+                continue;
+            };
+            // `split_index` keeps `stripe` below `coding.stripes`, the length
+            // of `stripes`, so the u32 index fits.
+            let st = &mut block.stripes[stripe as usize];
+            if st.store(slot, coding.k, part) {
+                // bpv1-71: a pushed seed goes on, as after a stripe check.
+                if st.pushed.contains(&slot) {
+                    pushed.push(index);
+                } else {
+                    ready.push(index);
+                }
+            }
+        }
+        for st in &mut block.stripes {
+            st.assemblable = st.source_held_count == coding.k;
+        }
+        block.phase = BlockPhase::Done;
+        for (indices, push) in [(ready, false), (pushed, true)] {
+            if !indices.is_empty() {
+                step.outputs.push(BlockOutput::PartReady {
+                    block_id,
+                    indices,
+                    push,
+                });
+            }
+        }
+        if !std::mem::replace(&mut block.block_done_notified, true) {
+            step.outputs.push(BlockOutput::NotifyBlockDone { block_id });
+        }
+        step.events.push(BlockEvent::Rebuilt { block_id });
+        step.events.push(BlockEvent::Outcome {
+            block_id,
+            outcome: BlockOutcome::Fallback,
+        });
+    }
+
     /// Native block sync committed `block_id`. A `Fallback` block holds no
     /// complete body to relay, so it retires at once and frees its slot.
     fn handle_fallback_done(&mut self, block_id: block::Hash, step: &mut BlockStep) {
@@ -3863,6 +4069,7 @@ impl BlockTable {
         let n = block.meta.coding.n;
         let release_claim = std::mem::take(&mut block.body_claimed);
         block.verify_work_id = None;
+        block.rebuild_work_id = None;
         for st in &mut block.stripes {
             st.clear_buffers();
         }

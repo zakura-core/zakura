@@ -68,9 +68,9 @@ use zakura_header_chain::Frontier;
 use zakura_network::{
     zakura::{
         bpv1::{
-            BlockPhase, BlockVerifierPort, HavePacing, HeaderChainAdmissionAdapter,
-            MemoryBodyStore, PortFuture, Profile, VerifierVerdict, WorkId, BPV1_CONTROL_KIND,
-            BPV1_DATA_KIND,
+            BlockPhase, BlockVerifierPort, CommittedBlockPort, HavePacing,
+            HeaderChainAdmissionAdapter, MemoryBodyStore, PortFuture, Profile, VerifierVerdict,
+            WorkId, BPV1_CONTROL_KIND, BPV1_DATA_KIND,
         },
         framed_channel, spawn_block_sync_reactor, BlockRangeRead, BlockRangeReadResult,
         BlockRangeSource, BlockSyncAction, BlockSyncFrontiers, BlockSyncService, BlockSyncStartup,
@@ -384,6 +384,17 @@ impl BlockVerifierPort for MirrorVerifier {
                 Err(_) => VerifierVerdict::LocalCapacity,
             }
         })
+    }
+}
+
+/// BPv1's committed-block reads from an actor's full state, as zakurad's
+/// `StateCommittedBlocks` reads the read-only state service.
+struct FullStateBlocks(Arc<EnginePort>);
+
+impl CommittedBlockPort for FullStateBlocks {
+    fn committed_block(&self, hash: block::Hash) -> PortFuture<'_, Option<BlockHandle>> {
+        let block = self.0.with_full_state(|chain| chain.block(hash).cloned());
+        Box::pin(async move { block })
     }
 }
 
@@ -806,6 +817,7 @@ fn spawn_actor(
         ))),
         verifier,
         fallback: Arc::new(claims.clone()),
+        committed_blocks: Arc::new(FullStateBlocks(engine.clone())),
         committed_snapshots: engine.selected_chain(),
     };
     let (bpv1_service, bpv1) = Bpv1Service::start(

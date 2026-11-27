@@ -3506,6 +3506,218 @@ fn fix4_committed_fallback_block_frees_its_slot_without_eviction() {
     );
 }
 
+/// Moves the verified tip to `height` at `hash` and returns the rebuild work
+/// the step starts for `block_id`, if any.
+fn tip_rebuild(
+    table: &mut BlockTable,
+    now: Instant,
+    height: u32,
+    hash: block::Hash,
+    block_id: block::Hash,
+) -> (BlockStep, Option<WorkId>) {
+    let step = table.step(now, BlockInput::TipHeight { height, hash });
+    let work = step.outputs.iter().find_map(|o| match o {
+        BlockOutput::RebuildFromCommitted {
+            work_id,
+            block_id: id,
+            ..
+        } if *id == block_id => Some(*work_id),
+        _ => None,
+    });
+    (step, work)
+}
+
+/// bpv1-90: block sync commits a block BPv1 still collects. BPv1 pulls
+/// nothing while it rebuilds the parts from the committed body, drops a part
+/// that arrives meanwhile, then holds every part as `Done`. It serves a part
+/// it never received, sends `BlockDone`, and never submits the block.
+#[test]
+fn bpv1_90_a_committed_collecting_block_rebuilds_and_serves_every_part() {
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let t0 = Instant::now();
+    let block_id = block::Hash([0x90; 32]);
+    let encoded = encode_body(&Profile::TINY, &[0x5A; 128], 2).unwrap();
+    admit(&mut table, t0, block_id, encoded.coding, encoded.part_root);
+    insert(
+        &mut table,
+        t0,
+        block_id,
+        &encoded.parts[0],
+        node_id(2),
+        PartAuth::Want(1),
+    );
+
+    let (step, work) = tip_rebuild(&mut table, t0, 1, block_id, block_id);
+    let work_id = work.expect("a committed collecting block starts a rebuild");
+    assert!(step.outputs.iter().any(|o| matches!(
+        o,
+        BlockOutput::ReleaseBodyClaim {
+            reason: ClaimRelease::Committed,
+            ..
+        }
+    )));
+    assert_eq!(table.block_phase(&block_id), Some(BlockPhase::Rebuilding));
+    assert_eq!(table.next_deadline(), None, "a rebuild arms no timer");
+    let late = tick(
+        &mut table,
+        t0 + RECONSTRUCTION_DEADLINE,
+        &[pull_state(node_id(3))],
+    );
+    assert!(late.outputs.is_empty() && late.events.is_empty());
+    let dropped = insert(
+        &mut table,
+        t0,
+        block_id,
+        &encoded.parts[1],
+        node_id(2),
+        PartAuth::Want(1),
+    );
+    assert!(dropped.outputs.is_empty());
+    assert_eq!(
+        table.part_buffer_bytes(),
+        u64::from(encoded.coding.part_bytes)
+    );
+
+    let done = table.step(
+        t0,
+        BlockInput::Rebuilt {
+            work_id,
+            block_id,
+            result: RebuildResult::Parts(encoded.parts.clone()),
+        },
+    );
+    assert_eq!(table.block_phase(&block_id), Some(BlockPhase::Done));
+    let never_received = encoded.parts.last().unwrap();
+    assert_eq!(
+        table.get_part(&block_id, never_received.index()),
+        Some(never_received)
+    );
+    let ready: Vec<u32> = done
+        .outputs
+        .iter()
+        .filter_map(|o| match o {
+            BlockOutput::PartReady { indices, .. } => Some(indices.clone()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    assert_eq!(
+        ready,
+        (1..encoded.parts.len() as u32).collect::<Vec<_>>(),
+        "every part but the one received becomes servable"
+    );
+    assert!(done
+        .outputs
+        .iter()
+        .any(|o| matches!(o, BlockOutput::NotifyBlockDone { .. })));
+    assert!(!done
+        .outputs
+        .iter()
+        .any(|o| matches!(o, BlockOutput::SubmitVerifier { .. })));
+    assert!(done.events.contains(&BlockEvent::Rebuilt { block_id }));
+    assert!(done.events.contains(&BlockEvent::Outcome {
+        block_id,
+        outcome: BlockOutcome::Fallback,
+    }));
+    assert!(
+        !done
+            .events
+            .iter()
+            .any(|e| matches!(e, BlockEvent::Assembled { .. })),
+        "BPv1 assembled nothing"
+    );
+    table.assert_invariants();
+}
+
+/// bpv1-90: a committed body that encodes to another part root shows the
+/// admitted metadata was wrong. The block retires, and no peer is closed.
+#[test]
+fn bpv1_90_a_committed_body_that_mismatches_retires_without_faulting_a_peer() {
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let t0 = Instant::now();
+    let block_id = block::Hash([0x91; 32]);
+    let encoded = encode_body(&Profile::TINY, &[0x5B; 128], 2).unwrap();
+    admit(&mut table, t0, block_id, encoded.coding, encoded.part_root);
+    let (_, work) = tip_rebuild(&mut table, t0, 1, block_id, block_id);
+
+    let step = table.step(
+        t0,
+        BlockInput::Rebuilt {
+            work_id: work.unwrap(),
+            block_id,
+            result: RebuildResult::Mismatch,
+        },
+    );
+    assert_eq!(table.block_phase(&block_id), Some(BlockPhase::Retired));
+    assert!(step
+        .events
+        .contains(&BlockEvent::RebuildMismatch { block_id }));
+    assert!(!step
+        .outputs
+        .iter()
+        .any(|o| matches!(o, BlockOutput::ClosePeer { .. })));
+    table.assert_invariants();
+}
+
+/// bpv1-90: another block took the height, so state holds no body for this
+/// one. It keeps collecting under its unmoved deadline, and a later tip
+/// starts no second rebuild.
+#[test]
+fn bpv1_90_a_block_state_lacks_keeps_collecting_and_rebuilds_once() {
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let t0 = Instant::now();
+    let block_id = block::Hash([0x92; 32]);
+    let fork = block::Hash([0x9F; 32]);
+    let encoded = encode_body(&Profile::TINY, &[0x5C; 128], 2).unwrap();
+    admit(&mut table, t0, block_id, encoded.coding, encoded.part_root);
+    let (_, work) = tip_rebuild(&mut table, t0, 1, fork, block_id);
+
+    table.step(
+        t0,
+        BlockInput::Rebuilt {
+            work_id: work.expect("a block at the tip's height starts a rebuild"),
+            block_id,
+            result: RebuildResult::Missing,
+        },
+    );
+    assert_eq!(table.block_phase(&block_id), Some(BlockPhase::Collecting));
+    let (_, again) = tip_rebuild(&mut table, t0, 2, block::Hash([0x9E; 32]), block_id);
+    assert_eq!(again, None);
+    tick(&mut table, t0 + RECONSTRUCTION_DEADLINE, &[]);
+    assert_eq!(table.block_phase(&block_id), Some(BlockPhase::Fallback));
+    table.assert_invariants();
+}
+
+/// bpv1-90, bpv1-63: a rebuilding block is committed, so the next admission
+/// may evict it, and its rebuild's late result changes nothing.
+#[test]
+fn bpv1_90_an_evicted_rebuild_ignores_its_late_result() {
+    let mut cfg = BlockConfig::for_profile(Profile::TINY);
+    cfg.max_concurrent_blocks = 1;
+    let mut table = BlockTable::new(cfg);
+    let t0 = Instant::now();
+    let block_id = block::Hash([0x93; 32]);
+    let encoded = encode_body(&Profile::TINY, &[0x5D; 128], 2).unwrap();
+    admit(&mut table, t0, block_id, encoded.coding, encoded.part_root);
+    let (_, work) = tip_rebuild(&mut table, t0, 1, block_id, block_id);
+
+    let next = block::Hash([0x94; 32]);
+    admit_block(&mut table, t0, next, 2, encoded.coding, encoded.part_root);
+    assert_eq!(table.block_phase(&block_id), Some(BlockPhase::Retired));
+
+    let late = table.step(
+        t0,
+        BlockInput::Rebuilt {
+            work_id: work.unwrap(),
+            block_id,
+            result: RebuildResult::Parts(encoded.parts.clone()),
+        },
+    );
+    assert!(late.outputs.is_empty() && late.events.is_empty());
+    assert_eq!(table.block_phase(&block_id), Some(BlockPhase::Retired));
+    table.assert_invariants();
+}
+
 /// decision-18: a padding source part (`wire_len = 0`) is held from
 /// admission. The planner never requests it, and the stripe decodes and
 /// assembles once its real parts reach `k`.

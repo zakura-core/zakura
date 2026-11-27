@@ -24,7 +24,7 @@ use zakura_rt::time::Instant;
 
 use super::{
     BlockConfig, BlockInput, BlockOutput, BlockTable, HeaderAdmissionResult, MetaEnvelope,
-    PullPeerState, ReleaseReason, VerifierVerdict, WorkId,
+    PullPeerState, RebuildResult, ReleaseReason, VerifierVerdict, WorkId,
 };
 use crate::zakura::bpv1::{
     close::Bpv1CloseRow,
@@ -73,7 +73,7 @@ pub struct BlockReplaySummary {
 }
 
 /// Operations decoder 4 reads.
-const OPS: u8 = 25;
+const OPS: u8 = 26;
 
 /// The fuzz property the replay's own ledger checks name.
 const BLOCK_REPLAY: &str = "bpv1/block-replay";
@@ -141,6 +141,9 @@ enum Work {
     Verify {
         block_id: block::Hash,
     },
+    Rebuild {
+        block_id: block::Hash,
+    },
 }
 
 impl Work {
@@ -151,6 +154,7 @@ impl Work {
             Work::Commitment => 2,
             Work::Stripe { .. } => 3,
             Work::Verify { .. } => 4,
+            Work::Rebuild { .. } => 5,
         }
     }
 }
@@ -514,7 +518,30 @@ pub fn replay_bpv1_block_bytes(bytes: &[u8]) -> BlockReplaySummary {
                 BlockInput::Tick { peer_states }
             }
             // This node's commit of a block fails; only a proposed block retires.
-            _ => BlockInput::ProposedCommitFailed { block_id: block.id },
+            24 => BlockInput::ProposedCommitFailed { block_id: block.id },
+            // State's answer to a rebuild: the block's parts, no body, or a
+            // body that encodes to another root, by `a` bits 5-6 (bpv1-90).
+            _ => {
+                let answer = ledger.answer(5, b, reached);
+                let (work_id, block_id) = match answer {
+                    Some((work_id, Work::Rebuild { block_id })) => (work_id, block_id),
+                    _ => (unknown_work(reached, b), block.id),
+                };
+                let parts = blocks
+                    .iter()
+                    .find(|blk| blk.id == block_id)
+                    .map(|blk| blk.geometry.encoded.parts.clone())
+                    .unwrap_or_default();
+                BlockInput::Rebuilt {
+                    work_id,
+                    block_id,
+                    result: match a >> 5 & 3 {
+                        0 | 3 => RebuildResult::Parts(parts),
+                        1 => RebuildResult::Missing,
+                        _ => RebuildResult::Mismatch,
+                    },
+                }
+            }
         };
         step(&mut table, now, input, &blocks, &mut ledger, &mut summary);
     }
@@ -574,6 +601,9 @@ fn step(
             BlockOutput::SubmitVerifier {
                 work_id, block_id, ..
             } => Some((work_id, Work::Verify { block_id })),
+            BlockOutput::RebuildFromCommitted {
+                work_id, block_id, ..
+            } => Some((work_id, Work::Rebuild { block_id })),
             // A peer's `HeaderMeta` never brings a retired block back, even
             // after its tombstone is purged: `top` only rises, so a purged
             // height stays below the window. This node's own solved block

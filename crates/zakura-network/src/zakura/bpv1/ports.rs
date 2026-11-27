@@ -1,18 +1,19 @@
 //! BPv1 node-service ports and production/test/inert adapters.
 //!
 //! Isolates the pure BPv1 machines from concrete node services behind five
-//! narrow traits:
+//! narrow traits and the committed-snapshot watch:
 //! - [`HeaderAdmissionPort`]: exact-header admission into headerchain.
 //! - [`BodyStorePort`]: assembled [`OwnedBlock`]s (`DecodedBlockPool`).
 //! - [`BlockVerifierPort`]: shared consensus verifier router mapping `PayloadMismatch` -> `RootMismatch` (`decision-8`).
 //! - [`BlockFallbackPort`]: shared v2 [`SharedBodyClaims`] set with native block sync.
+//! - [`CommittedBlockPort`]: committed block bodies read from state.
 
 use std::{future::Future, num::NonZeroU64, pin::Pin, sync::Arc};
 
 use zakura_chain::block::{self, Block, Header};
 use zakura_header_chain::{BodyVerificationClass, SourceId};
 use zakura_node_services::{
-    block_memory::{Admission, AdmissionFailure, DecodedBlockPool, OwnedBlock},
+    block_memory::{Admission, AdmissionFailure, BlockHandle, DecodedBlockPool, OwnedBlock},
     body_claims::{BodyClaimRelease, SharedBodyClaims},
     header_chain::{ExactHeaderAdmission, Port as HeaderChainPort, PortError},
 };
@@ -234,4 +235,17 @@ impl BlockFallbackPort for SharedBodyClaims {
         };
         SharedBodyClaims::release(self, hash, mapped)
     }
+}
+
+// ============================================================================
+// 5. CommittedBlockPort
+// ============================================================================
+
+/// Reads committed blocks from state, so BPv1 can rebuild the parts of a
+/// block that native block sync committed while BPv1 collected it
+/// (`bpv1-90`).
+pub trait CommittedBlockPort: Send + Sync + 'static {
+    /// Returns the committed block `hash` from any chain state holds, or
+    /// `None` when state holds no such block or the read fails.
+    fn committed_block(&self, hash: block::Hash) -> PortFuture<'_, Option<BlockHandle>>;
 }

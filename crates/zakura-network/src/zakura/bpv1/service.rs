@@ -5,13 +5,13 @@
 //! [`BlockTable`], [`PeerPaths`], and [`ProposerState`]. Shared state sits
 //! behind short, non-awaited [`Mutex`] locks.
 
-use std::{collections::VecDeque, fmt, sync::Arc};
+use std::{collections::VecDeque, fmt, sync::Arc, time::Duration};
 
 use futures::future::BoxFuture;
 use rand_10::RngExt;
 
 use zakura_chain::{
-    block::{self, Block, Header, Height},
+    block::{self, Block, BlockRef, Header, Height},
     parameters::Network,
     serialization::ZcashSerialize,
 };
@@ -31,7 +31,7 @@ use super::{
     assemble::assemble_block,
     blocks::{
         BlockEvent, BlockInput, BlockOutcome, BlockOutput, BlockStep, BlockTable, FallbackReason,
-        MetaEnvelope, PartSource, PullPeerState, StripeJob, VerifierVerdict,
+        MetaEnvelope, PartSource, PullPeerState, RebuildResult, StripeJob, VerifierVerdict,
     },
     close::{Bpv1CloseCause, Bpv1CloseRow},
     codec::{decode_and_check_stripe, encode_body},
@@ -46,7 +46,10 @@ use super::{
         PeerState, PeerStep, RecvHave, RecvPartPrefix, RecvWant, RecvWantEnd, Seed, Seeds,
         ServeDone, ServePartQueued, PULL_WINDOW,
     },
-    ports::{BlockFallbackPort, BlockVerifierPort, BodyStorePort, HeaderAdmissionPort},
+    ports::{
+        BlockFallbackPort, BlockVerifierPort, BodyStorePort, CommittedBlockPort,
+        HeaderAdmissionPort,
+    },
     profile::{Coding, Profile, W2_PROFILE_ID},
     proposer::{
         compute_body_identity, PreparedCommitment, ProposerConfig, ProposerEvent, ProposerInput,
@@ -92,6 +95,9 @@ pub struct Bpv1Ports {
     pub verifier: Arc<dyn BlockVerifierPort>,
     /// Shared body-claim port coordinating with native block sync.
     pub fallback: Arc<dyn BlockFallbackPort>,
+    /// Committed block reads, for rebuilding a block's parts after native
+    /// block sync commits it (`bpv1-90`).
+    pub committed_blocks: Arc<dyn CommittedBlockPort>,
     /// Durable header-chain snapshots. The driver feeds their frontiers to
     /// `BlockTable`.
     pub committed_snapshots: watch::Receiver<Option<EngineSnapshot>>,
@@ -163,6 +169,7 @@ struct SharedNode {
     body_store: Arc<dyn BodyStorePort>,
     verifier: Arc<dyn BlockVerifierPort>,
     fallback: Arc<dyn BlockFallbackPort>,
+    committed_blocks: Arc<dyn CommittedBlockPort>,
     verify_sem: Arc<Semaphore>,
     decode_sem: Arc<Semaphore>,
     driver_tx: mpsc::UnboundedSender<DriverMsg>,
@@ -563,9 +570,107 @@ impl SharedNode {
                     });
                 }));
             }
+            BlockOutput::RebuildFromCommitted {
+                work_id,
+                block_id,
+                coding,
+                part_root,
+            } => {
+                let node = Arc::clone(self);
+                drop(task::spawn_named("bpv1-rebuild", async move {
+                    let result = rebuild_committed(&node, block_id, coding, part_root).await;
+                    let label = match &result {
+                        RebuildResult::Parts(_) => "rebuilt",
+                        RebuildResult::Missing => "missing",
+                        RebuildResult::Mismatch => "mismatch",
+                    };
+                    tracing::debug!(target: "bpv1_stage", %block_id, work_id = work_id.0,
+                        result = label, "rebuild_finished");
+                    node.drive(BlockInput::Rebuilt {
+                        work_id,
+                        block_id,
+                        result,
+                    });
+                }));
+            }
             routed => unreachable!("route_block_output keeps {routed:?} off the shell"),
         }
     }
+}
+
+/// Bounds the state read of a committed block that BPv1 rebuilds. A read
+/// that times out counts as `Missing`, and the block keeps collecting under
+/// its reconstruction deadline.
+const COMMITTED_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Reads committed block `block_id` from state and rebuilds its parts on a
+/// decode worker (`bpv1-90`).
+async fn rebuild_committed(
+    node: &SharedNode,
+    block_id: block::Hash,
+    coding: Coding,
+    part_root: [u8; 32],
+) -> RebuildResult {
+    let read = time::timeout(
+        COMMITTED_READ_TIMEOUT,
+        node.committed_blocks.committed_block(block_id),
+    )
+    .await;
+    let Ok(Some(block)) = read else {
+        return RebuildResult::Missing;
+    };
+    let Ok(_permit) = node.decode_sem.clone().acquire_owned().await else {
+        return RebuildResult::Missing;
+    };
+    let profile = node.profile;
+    metrics::gauge!("zakura.p2p.bpv1.work.leases", "kind" => "rebuild").increment(1.0);
+    let result =
+        task::spawn_blocking(move || rebuild_parts(&profile, block.view(), &coding, &part_root))
+            .await
+            .unwrap_or(RebuildResult::Missing);
+    metrics::gauge!("zakura.p2p.bpv1.work.leases", "kind" => "rebuild").decrement(1.0);
+    result
+}
+
+/// Encodes committed `block`'s body and returns every part if its coding and
+/// part root equal the admitted ones (`bpv1-90`).
+///
+/// Comparing the whole `part_root` checks every stripe root and the padding
+/// above the last stripe, even for a stripe that holds no part yet. The
+/// transaction count and body length are checked first, so most mismatches
+/// cost no encode.
+pub(super) fn rebuild_parts(
+    profile: &Profile,
+    block: &BlockRef,
+    coding: &Coding,
+    part_root: &[u8; 32],
+) -> RebuildResult {
+    if u32::try_from(block.transactions().len()) != Ok(coding.tx_count) {
+        return RebuildResult::Mismatch;
+    }
+    let Some(body) = body_after_coinbase(block) else {
+        return RebuildResult::Missing;
+    };
+    // Widening usize to u64 is lossless on supported targets.
+    if body.len() as u64 != coding.body_bytes {
+        return RebuildResult::Mismatch;
+    }
+    match encode_body(profile, &body, coding.tx_count) {
+        Ok(encoded) if encoded.coding == *coding && encoded.part_root == *part_root => {
+            RebuildResult::Parts(encoded.parts)
+        }
+        _ => RebuildResult::Mismatch,
+    }
+}
+
+/// Serializes `block`'s transactions after the coinbase: the body `B'` that
+/// BPv1 encodes. `None` if a transaction fails to serialize.
+fn body_after_coinbase(block: &BlockRef) -> Option<Vec<u8>> {
+    let mut body = Vec::new();
+    for tx in block.transactions().skip(1) {
+        tx.zcash_serialize(&mut body).ok()?;
+    }
+    Some(body)
 }
 
 /// Whether `envelope`'s coinbase commits its layout under `chain_id` at
@@ -657,12 +762,9 @@ impl Bpv1Handle {
         let Ok(header_bytes) = block.header.zcash_serialize_to_vec() else {
             return false;
         };
-        let mut body_bytes = Vec::new();
-        for tx in block.transactions.iter().skip(1) {
-            if tx.zcash_serialize(&mut body_bytes).is_err() {
-                return false;
-            }
-        }
+        let Some(body_bytes) = body_after_coinbase(block) else {
+            return false;
+        };
         let Ok(tx_count) = u32::try_from(block.transactions.len()) else {
             return false;
         };
@@ -715,6 +817,12 @@ impl Bpv1Handle {
     #[cfg(any(test, zakura_sim))]
     pub fn block_phase(&self, block_id: &block::Hash) -> Option<super::blocks::BlockPhase> {
         self.node.lock_table().block_phase(block_id)
+    }
+
+    /// The verified part `index` of `block_id` that `BlockTable` holds to serve.
+    #[cfg(any(test, zakura_sim))]
+    pub fn held_part(&self, block_id: &block::Hash, index: u32) -> Option<VerifiedPart> {
+        self.node.lock_table().get_part(block_id, index).cloned()
     }
 
     /// Current number of path entries tracked in `PeerPaths` (`bpv1-65`).
@@ -906,6 +1014,7 @@ impl Bpv1Service {
             body_store: ports.body_store,
             verifier: ports.verifier,
             fallback: ports.fallback,
+            committed_blocks: ports.committed_blocks,
             verify_sem: Arc::new(Semaphore::new(config.verify_concurrency.max(1))),
             decode_sem: Arc::new(Semaphore::new(config.decode_concurrency.max(1))),
             config,
@@ -1102,8 +1211,8 @@ impl Service for Bpv1Service {
 /// Converts a change of committed header-chain frontiers into `BlockTable`
 /// inputs.
 ///
-/// A new verified tip moves the window and ends a fallback block that
-/// native block sync committed. A new best header wakes the metadata
+/// A new verified tip moves the window, rebuilds the collecting blocks at or
+/// below it, and ends a fallback block that native block sync committed. A new best header wakes the metadata
 /// pending on it, and the metadata for the header itself when the snapshot
 /// skipped its parent. The watch coalesces, so other metadata whose
 /// parent a snapshot skipped ages out instead.
@@ -2443,6 +2552,14 @@ fn record_block_event(event: &BlockEvent) {
             };
             tracing::debug!(target: "bpv1_stage", %block_id, reason = label, "fallback_started");
             metrics::counter!("zakura.p2p.bpv1.fallback.reason", "reason" => label).increment(1);
+        }
+        BlockEvent::Rebuilt { block_id } => {
+            tracing::debug!(target: "bpv1_stage", %block_id, "rebuilt_from_committed");
+            metrics::counter!("zakura.p2p.bpv1.rebuild", "result" => "rebuilt").increment(1);
+        }
+        BlockEvent::RebuildMismatch { block_id } => {
+            tracing::info!(target: "bpv1_stage", %block_id, "rebuild_mismatch");
+            metrics::counter!("zakura.p2p.bpv1.rebuild", "result" => "mismatch").increment(1);
         }
         BlockEvent::Parked { block_id } => {
             tracing::debug!(target: "bpv1_stage", %block_id, "verify_parked");

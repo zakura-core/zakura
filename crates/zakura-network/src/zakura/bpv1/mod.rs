@@ -60,8 +60,8 @@ pub use blocks::{replay_bpv1_block_bytes, BlockReplaySummary};
 pub use blocks::{
     AdmittedBlock, BlockConfig, BlockEvent, BlockInput, BlockOutcome, BlockOutput, BlockPhase,
     BlockStep, BlockTable, ClaimRelease, FallbackReason, HeaderAdmissionResult, MetaEnvelope,
-    PartRefusal, PartSource, PullPeerState, ReleaseReason, StripeJob, VerifierVerdict, WorkId,
-    VERIFY_DEADLINE,
+    PartRefusal, PartSource, PullPeerState, RebuildResult, ReleaseReason, StripeJob,
+    VerifierVerdict, WorkId, VERIFY_DEADLINE,
 };
 pub use close::{Bpv1CloseCause, Bpv1CloseRow};
 pub use codec::{decode_and_check_stripe, encode_body, CodecError, EncodedBody};
@@ -83,7 +83,8 @@ pub use peer::{
 };
 pub use ports::{
     classify_body_verification_class, BlockFallbackPort, BlockVerifierPort, BodyStorePort,
-    HeaderAdmissionPort, HeaderChainAdmissionAdapter, MemoryBodyStore, PortFuture,
+    CommittedBlockPort, HeaderAdmissionPort, HeaderChainAdmissionAdapter, MemoryBodyStore,
+    PortFuture,
 };
 pub use profile::{Coding, LayoutError, Profile, W2_PROFILE_ID};
 pub use proposer::{

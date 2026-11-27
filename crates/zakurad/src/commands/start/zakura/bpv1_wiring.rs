@@ -17,8 +17,8 @@ use zakura_node_services::{
 use zakura_network::zakura::{
     bpv1::{
         bpv1_custom_service, classify_body_verification_class, BlockVerifierPort, Bpv1Handle,
-        Bpv1Ports, HavePacing, HeaderChainAdmissionAdapter, MemoryBodyStore, NodeId, PortFuture,
-        Profile, VerifierVerdict, WorkId, ZakuraBpv1Config, VERIFY_DEADLINE,
+        Bpv1Ports, CommittedBlockPort, HavePacing, HeaderChainAdmissionAdapter, MemoryBodyStore,
+        NodeId, PortFuture, Profile, VerifierVerdict, WorkId, ZakuraBpv1Config, VERIFY_DEADLINE,
     },
     CustomService, ZakuraHeaderSyncDriverStartup,
 };
@@ -113,6 +113,49 @@ where
     }
 }
 
+/// Production [`CommittedBlockPort`] over `zakurad`'s read-only state service.
+///
+/// `ReadRequest::AnyChainBlock` checks the non-finalized chains in memory before the
+/// finalized database, so a block that just committed costs no disk read. A failed read
+/// answers `None`, as a missing block does.
+pub(crate) struct StateCommittedBlocks<S> {
+    state: S,
+}
+
+impl<S> StateCommittedBlocks<S> {
+    pub(crate) fn new(state: S) -> Self {
+        Self { state }
+    }
+}
+
+impl<S> CommittedBlockPort for StateCommittedBlocks<S>
+where
+    S: Service<zakura_state::ReadRequest, Response = zakura_state::ReadResponse>
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+    S::Error: std::fmt::Debug,
+    S::Future: Send + 'static,
+{
+    fn committed_block(&self, hash: block::Hash) -> PortFuture<'_, Option<BlockHandle>> {
+        let state = self.state.clone();
+        Box::pin(async move {
+            match state
+                .oneshot(zakura_state::ReadRequest::AnyChainBlock(hash.into()))
+                .await
+            {
+                Ok(zakura_state::ReadResponse::Block(block)) => block,
+                Ok(_) => None,
+                Err(error) => {
+                    tracing::debug!(%hash, ?error, "bpv1 committed block read failed");
+                    None
+                }
+            }
+        })
+    }
+}
+
 /// Builds the opt-in BPv1 [`CustomService`] and [`Bpv1Handle`] for `Zakura` / `Dual` startup,
 /// sharing `body_claims` with native `block_sync`.
 ///
@@ -122,13 +165,16 @@ where
 ///
 /// Sizes `DecodedBlockPool` to cover `decoded_backend_blocks` (non-finalized
 /// state retention) plus active BPv1 collection headroom.
-/// The service runs as `local_node` and submits assembled blocks to `verifier`.
+/// The service runs as `local_node`, submits assembled blocks to `verifier`, and reads
+/// the bodies native block sync committed from `committed_blocks`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_bpv1_service(
     config: &ZakuraBpv1Config,
     have_pacing: HavePacing,
     network: Network,
     local_node: NodeId,
     verifier: Arc<dyn BlockVerifierPort>,
+    committed_blocks: Arc<dyn CommittedBlockPort>,
     driver_startup: &mut ZakuraHeaderSyncDriverStartup,
     shutdown: CancellationToken,
 ) -> (CustomService, Bpv1Handle) {
@@ -151,6 +197,7 @@ pub(crate) fn build_bpv1_service(
         body_store: Arc::new(MemoryBodyStore::new(decoded_pool)),
         verifier,
         fallback: Arc::new(body_claims),
+        committed_blocks,
         committed_snapshots: driver_startup.committed_snapshots.clone(),
     };
     bpv1_custom_service(

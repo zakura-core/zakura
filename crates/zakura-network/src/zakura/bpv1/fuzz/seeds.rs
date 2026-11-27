@@ -279,6 +279,7 @@ const BLOCK_FALLBACK_DONE: u8 = 21;
 const BLOCK_TICK: u8 = 22;
 const BLOCK_TICK_LONG: u8 = 23;
 const BLOCK_COMMIT_FAILED: u8 = 24;
+const BLOCK_REBUILT: u8 = 25;
 
 /// The `TINY` exact layout for block 0, empty for the others.
 const BLOCK_EXACT: u8 = 2 << 1;
@@ -366,6 +367,22 @@ fn block_seeds() -> Vec<Bpv1Seed> {
                     (BLOCK_TICK, 0, 200),
                 ],
             ),
+        ),
+        // Block sync commits a block BPv1 still collects, and BPv1 rebuilds
+        // its parts from the committed body (bpv1-90).
+        seed(
+            target,
+            "rebuild",
+            ops(BLOCK_EXACT, &{
+                let mut rebuild = admit_block(1).to_vec();
+                rebuild.extend([
+                    (BLOCK_INSERT, 0x41, 0),
+                    (BLOCK_TIP, 0, 1),
+                    (BLOCK_INSERT, 0x41, 1),
+                    (BLOCK_REBUILT, 0, 0),
+                ]);
+                rebuild
+            }),
         ),
         // This node proposes, then the window moves past every block.
         seed(
@@ -483,6 +500,18 @@ fn mesh_seeds() -> Vec<Bpv1Seed> {
         (MESH_STALL_OR_FALLBACK, 2, 1),
         (MESH_TICK_LONG, 0, 200),
     ]);
+    // Node 2 hears of the block only from the adversary. Its first repair
+    // round releases the claim, block sync commits the block, and BPv1
+    // rebuilds its parts (bpv1-90).
+    let mut rebuild = vec![(MESH_DISCONNECT, 1, 0), (MESH_DISCONNECT, 2, 0)];
+    rebuild.extend(propose(0));
+    rebuild.extend(pump(2));
+    for b in 0..6 {
+        rebuild.push((MESH_ADVERSARY, 0x11, b));
+    }
+    rebuild.extend(pump(3));
+    rebuild.extend([(MESH_TICK, 0, 40), (MESH_STALL_OR_FALLBACK, 2, 4)]);
+    rebuild.extend(pump(2));
     // The receivers' header admission fails locally, then a stalled link.
     let mut local_failures = propose(0);
     local_failures.extend([
@@ -547,6 +576,7 @@ fn mesh_seeds() -> Vec<Bpv1Seed> {
         seed(target, "orphan", ops(MESH_ONE_TX, &orphan)),
         seed(target, "pull", ops(MESH_ONE_TX, &pull)),
         seed(target, "fallback", ops(MESH_ONE_TX, &fallback)),
+        seed(target, "rebuild", ops(MESH_ONE_TX, &rebuild)),
         seed(target, "local-failures", ops(MESH_ONE_TX, &local_failures)),
         seed(target, "adversary", ops(MESH_ONE_TX, &adversary)),
         seed(target, "stress", ops(MESH_STRESS | MESH_ONE_TX, &stress)),

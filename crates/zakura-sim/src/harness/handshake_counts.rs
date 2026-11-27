@@ -627,8 +627,11 @@ fn history(input: &[u8]) -> Vec<(usize, MachineStep)> {
             }
             (10, _) => {
                 // The ranking changes. Slots already held stay held.
-                counts
-                    .publish_gateway_ranking(&ranking_from(&nodes, arg), usize::from(arg >> 4) % 4);
+                counts.publish_gateway_ranking(
+                    &ranking_from(&nodes, arg),
+                    usize::from(arg >> 4) % 4,
+                    CONNECTION_CAP,
+                );
                 published = true;
             }
             _ => {}

@@ -21,7 +21,7 @@ use super::{
     },
     close::Bpv1CloseRow,
     codec::encode_body,
-    peer::{PeerConfig, PeerInput, PeerOutput, PeerState, RecvWantEnd, Retire},
+    peer::{PeerConfig, PeerInput, PeerOutput, PeerState, RecvHave, RecvWantEnd, Retire},
     peer_tests::{
         admitted, assert_closed, have_with, pull, recv_meta, recv_want, session, tiny,
         tiny_part_prefix, tiny_session, verify_token,
@@ -30,7 +30,7 @@ use super::{
     service::{control_input, data_input},
     test_support::{commit_work, make_envelope, node_id, LinkProfile, MachineMesh, TEST_TIP_HASH},
     unknown_parent::UnknownParentVerdict,
-    wire::{HaveFlags, PROPAGATION_DEPTH},
+    wire::{HaveFlags, HaveForm, HAVE_FLAG_BITMAP, PROPAGATION_DEPTH},
 };
 use crate::zakura::{handshake::Frame, wire_codec::encode_frame};
 
@@ -46,6 +46,7 @@ fn plain_have() -> super::wire::Bpv1Message {
     super::wire::Bpv1Message::Have {
         block_id: block::Hash([0x51; 32]),
         flags: HaveFlags::Plain,
+        form: HaveForm::List,
         indices: vec![0, 1],
     }
 }
@@ -62,21 +63,25 @@ fn want(want_id: u32) -> super::wire::Bpv1Message {
 }
 
 /// `bpv1-close-1`: a `Have` flags byte with reserved bits closes 1, and a
-/// message type on the wrong BPv1 stream closes 1. Every defined flags byte
-/// decodes.
+/// message type on the wrong BPv1 stream closes 1. Every defined flags byte,
+/// with or without the bitmap bit (decision-33), decodes.
 #[test]
 fn close_1_reserved_have_flags_and_wrong_stream_types() {
     // `Have` payload: `block_id` (32 bytes), then the flags byte.
     const FLAGS_AT: usize = 32;
-    for flags in [HaveFlags::Plain, HaveFlags::Push, HaveFlags::Relay] {
+    let defined: Vec<u8> = [HaveFlags::Plain, HaveFlags::Push, HaveFlags::Relay]
+        .into_iter()
+        .flat_map(|flags| [flags.bits(), flags.bits() | HAVE_FLAG_BITMAP])
+        .collect();
+    for &flags in &defined {
+        // The list `[0, 1]` read as a bitmap still names two indices.
         let mut have = frame(&plain_have());
-        have.payload[FLAGS_AT] = flags.bits();
+        have.payload[FLAGS_AT] = flags;
         assert!(
             data_input(have).is_ok(),
-            "{flags:?} is a defined flags byte"
+            "{flags:#04x} is a defined flags byte"
         );
     }
-    let defined = [HaveFlags::Plain, HaveFlags::Push, HaveFlags::Relay].map(HaveFlags::bits);
     for reserved in (0..=u8::MAX).filter(|b| !defined.contains(b)) {
         let mut have = frame(&plain_have());
         have.payload[FLAGS_AT] = reserved;
@@ -1228,6 +1233,67 @@ fn close_16_have_index_out_of_range_or_repeated() {
     let mut peer = tiny_session(block_id, now);
     peer.step(now, have_with(block_id, HaveFlags::Plain, vec![total]));
     assert_closed(&peer, Bpv1CloseRow::Row16BadHaveIndex);
+}
+
+/// An inbound `Have` of `indices` in `form`.
+fn have_in(block_id: block::Hash, form: HaveForm, indices: Vec<u32>) -> PeerInput {
+    PeerInput::RecvHave(RecvHave {
+        block_id,
+        flags: HaveFlags::Plain,
+        form,
+        frame_bytes: 33 + form.indices_len(indices.len()),
+        indices,
+    })
+}
+
+/// `bpv1-close-16` (decision-33): a `Have` bitmap must be exactly
+/// `ceil(stripes * n / 8)` bytes, and a set padding bit names an index past
+/// the layout. Each closes 16, also after the `Have` waited in the early
+/// record for the block's admission. A bitmap that fits stays open, and an
+/// index it repeats closes 16.
+#[test]
+fn close_16_have_bitmap_length_padding_or_repeat() {
+    let now = Instant::now();
+    let block_id = block::Hash([0x63; 32]);
+    let total = tiny().total_parts().unwrap();
+    assert!(!total.is_multiple_of(8), "the TINY layout has padding bits");
+    // The TINY layout's bitmap is a single byte.
+    let len = u16::try_from(total.div_ceil(8)).unwrap();
+    let fits = HaveForm::Bitmap { len };
+
+    let mut peer = tiny_session(block_id, now);
+    peer.step(now, have_in(block_id, fits, vec![0, 2]));
+    peer.step(now, have_in(block_id, fits, vec![1, total - 1]));
+    assert!(peer.close_cause().is_none());
+    peer.step(now, have_in(block_id, fits, vec![2]));
+    assert_closed(&peer, Bpv1CloseRow::Row16BadHaveIndex);
+
+    let mut peer = tiny_session(block_id, now);
+    peer.step(now, have_in(block_id, fits, vec![total]));
+    assert_closed(&peer, Bpv1CloseRow::Row16BadHaveIndex);
+
+    let mut peer = tiny_session(block_id, now);
+    peer.step(
+        now,
+        have_in(block_id, HaveForm::Bitmap { len: len + 1 }, vec![0]),
+    );
+    assert_closed(&peer, Bpv1CloseRow::Row16BadHaveIndex);
+
+    // A `Have` before admission waits in the early record, then closes
+    // when its replay meets the layout.
+    let mut peer = PeerState::new(PeerConfig::for_profile(Profile::TINY), node_id(2), 1);
+    peer.step(
+        now,
+        have_in(block_id, HaveForm::Bitmap { len: len + 1 }, vec![0]),
+    );
+    assert!(peer.close_cause().is_none());
+    peer.step(now, admitted(block_id, tiny(), node_id(3)));
+    assert_closed(&peer, Bpv1CloseRow::Row16BadHaveIndex);
+
+    let mut peer = PeerState::new(PeerConfig::for_profile(Profile::TINY), node_id(2), 1);
+    peer.step(now, have_in(block_id, fits, vec![0, total - 1]));
+    peer.step(now, admitted(block_id, tiny(), node_id(3)));
+    assert!(peer.close_cause().is_none());
 }
 
 /// `bpv1-close-18` (bpv1-29, bpv1-30): a `WantEnd` for no live `Want`, with

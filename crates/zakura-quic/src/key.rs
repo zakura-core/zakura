@@ -225,9 +225,9 @@ impl<'de> serde::Deserialize<'de> for NodeId {
     }
 }
 
-/// A signature failed [`NodeKey::verify_strict`].
+/// A signature did not verify, or an ML-DSA signature could not be made.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
-#[error("invalid Ed25519 signature")]
+#[error("invalid signature")]
 pub struct SignatureError;
 
 /// A node's Ed25519 secret seed (ID-3).
@@ -361,6 +361,24 @@ impl NodeSecretKey {
         signature.extend_from_slice(&self.ml_dsa_signing_key.sign(message, randomness)?);
         Ok(signature)
     }
+
+    /// Signs `message`, the bytes a discovery record's ML-DSA-65 signature
+    /// covers, with the node's ML-DSA-65 key (ID-7). The signature is hedged
+    /// with `randomness`, which the caller draws fresh for each signature,
+    /// and made under a context of its own, so it never verifies as a
+    /// handshake signature. [`verify_record_ml_dsa_65`] checks it.
+    ///
+    /// Fails only if ML-DSA exhausts its signing attempts, which no honest
+    /// input does in practice.
+    ///
+    /// [`verify_record_ml_dsa_65`]: crate::verify_record_ml_dsa_65
+    pub fn sign_record_ml_dsa_65(
+        &self,
+        message: &[u8],
+        randomness: [u8; 32],
+    ) -> Result<[u8; composite::ML_DSA_65_SIGNATURE_BYTES], SignatureError> {
+        self.ml_dsa_signing_key.sign_record(message, randomness)
+    }
 }
 
 /// A credential that does not hold the secret key's Ed25519 and ML-DSA-65
@@ -396,7 +414,8 @@ impl FromStr for NodeSecretKey {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct NodeAddr {
     /// The node's identity. A dial fails in the TLS handshake unless the
-    /// peer's credential derives this ID (TLS-7).
+    /// peer proves it is this node: its credential derives this ID, or
+    /// derived it before the node added keys (TLS-7).
     pub id: NodeId,
     /// Direct UDP addresses, in the order to try them.
     pub direct: Vec<SocketAddr>,

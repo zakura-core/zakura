@@ -23,7 +23,9 @@ use zakura_rt::{
     time::sleep,
 };
 
-use super::protocol::{current_unix_secs, ZakuraDiscoveryHandle, ZakuraDiscoveryPersistedEntry};
+use super::protocol::{
+    current_unix_secs, persist_order, ZakuraDiscoveryHandle, ZakuraDiscoveryPersistedEntry,
+};
 use super::wire::{
     decode_persisted_entries, encode_persisted_entries, MAX_BOOK_FILE_BYTES,
     MAX_PERSISTED_DISCOVERY_ENTRIES,
@@ -103,11 +105,7 @@ fn entries_to_persist(
     now: u64,
 ) -> Vec<ZakuraDiscoveryPersistedEntry> {
     entries.retain(|entry| entry.record.body.expires_at_unix_secs >= now);
-    entries.sort_by(|a, b| {
-        b.last_success
-            .cmp(&a.last_success)
-            .then(b.last_seen.cmp(&a.last_seen))
-    });
+    entries.sort_by_key(|entry| persist_order(entry.last_success, entry.last_seen));
     entries.truncate(MAX_PERSISTED_DISCOVERY_ENTRIES);
     entries
 }
@@ -176,10 +174,13 @@ fn spawn_discovery_book_saver(
 }
 
 async fn save_discovery_book(discovery: &ZakuraDiscoveryHandle, file: &DiscoveryBookFile) {
-    let entries = discovery.persisted_entries().await;
+    let now = current_unix_secs();
+    // The book copies only the entries the file keeps, not all it holds.
+    let entries = discovery
+        .entries_to_persist(now, MAX_PERSISTED_DISCOVERY_ENTRIES)
+        .await;
     let file = file.clone();
     let path = file.path.clone();
-    let now = current_unix_secs();
     match spawn_blocking_named("discovery_book_save", move || file.store(entries, now)).await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => warn!(?error, ?path, "could not save the Zakura discovery book"),

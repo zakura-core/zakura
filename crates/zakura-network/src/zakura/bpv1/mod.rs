@@ -44,6 +44,8 @@ mod peer_tests;
 #[cfg(test)]
 mod ports_tests;
 #[cfg(test)]
+mod reconnect_tests;
+#[cfg(test)]
 mod service_tests;
 #[cfg(test)]
 mod test_support;
@@ -97,9 +99,9 @@ pub use unknown_parent::{
     TargetBound, UnknownParentVerdict,
 };
 pub use wire::{
-    encode_part_frame, read_part_prefix, Bpv1FifoQueue, Bpv1Message, DataQueueItem, HaveFlags,
-    PartPrefix, WantBitmap, WantEndReason, BPV1_CONTROL_BUDGET, BPV1_CONTROL_KIND,
-    BPV1_DATA_BUDGET, BPV1_DATA_KIND, BPV1_STREAMS, BPV1_STREAM_VERSION, MAX_WANTS_INFLIGHT,
-    PROPAGATION_DEPTH, ZAKURA_CAP_BPV1,
+    encode_have_frame, encode_part_frame, read_part_prefix, Bpv1FifoQueue, Bpv1Message,
+    DataQueueItem, HaveFlags, HaveForm, PartPrefix, WantBitmap, WantEndReason, BPV1_CONTROL_BUDGET,
+    BPV1_CONTROL_KIND, BPV1_DATA_BUDGET, BPV1_DATA_KIND, BPV1_STREAMS, BPV1_STREAM_VERSION,
+    MAX_WANTS_INFLIGHT, PROPAGATION_DEPTH, ZAKURA_CAP_BPV1,
 };
 pub use zakura_quic::NodeId;

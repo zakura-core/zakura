@@ -4,7 +4,9 @@ expression: response
 ---
 {
   "node_id": "2840d419ac18afd23ff4ffe3ba55fb67b620379394c054260ae223adf3d136c7",
-  "announcing": true,
+  "announced_gateways": [
+    "2840d419ac18afd23ff4ffe3ba55fb67b6203793"
+  ],
   "mining": true,
   "synced": true,
   "window": {
@@ -19,30 +21,35 @@ expression: response
       "gateway_id": "4d70dccee88cea83ef71f9f870489b10f5c6c112",
       "blocks": 40,
       "state": "preferred",
+      "template_node": false,
       "connected": true
     },
     {
       "gateway_id": "67bb6f072c1140d0d2198e9f937d24aeeb8d6446",
       "blocks": 12,
       "state": "backoff",
+      "template_node": false,
       "connected": false
     },
     {
       "gateway_id": "96ddfe87e3074e921304847fa147e7ee97ea3b7e",
       "blocks": 7,
       "state": "standby",
+      "template_node": false,
       "connected": true
     },
     {
       "gateway_id": "ccc7a088afe130bbb69492031e9fa86cce462885",
       "blocks": 3,
       "state": "unmatched",
+      "template_node": false,
       "connected": false
     },
     {
       "gateway_id": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4",
       "blocks": 2,
       "state": "ambiguous",
+      "template_node": false,
       "connected": false
     }
   ],

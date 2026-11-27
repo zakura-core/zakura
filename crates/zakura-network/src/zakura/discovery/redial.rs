@@ -8,14 +8,14 @@ use std::{future::Future, pin::Pin, time::Duration};
 
 use zakura_quic::NodeAddr;
 use zakura_rt::{
-    sync::{oneshot, watch, CancellationToken},
+    sync::{oneshot, CancellationToken},
     time::Instant,
 };
 
 use super::trace::{DialOwner, DialPhase, DiscoveryDialPhaseEvent};
 use crate::zakura::{
-    handler::DialRegistration, ZakuraEndpoint, ZakuraHandlerError, ZakuraLocalLimits, ZakuraPeerId,
-    ZakuraTrace,
+    handler::DialRegistration, transport::RegisteredPeers, ZakuraEndpoint, ZakuraHandlerError,
+    ZakuraLocalLimits, ZakuraPeerId, ZakuraTrace,
 };
 
 #[cfg(any(test, feature = "p2p-fuzz"))]
@@ -169,7 +169,7 @@ pub(crate) async fn native_dial_supervised(
     };
 
     let shutdown = endpoint.background_shutdown_token();
-    let registered = endpoint.supervisor().subscribe();
+    let registered = endpoint.supervisor().registered_peers();
     let trace = endpoint.trace();
     let supervised = run_dial_supervisor(peer_id, registered, trace, policy, stop, move || {
         let endpoint = endpoint.clone();
@@ -246,7 +246,7 @@ async fn score_dial(
 /// so the loop is unit-testable without real network I/O.
 async fn run_dial_supervisor<F>(
     peer_id: ZakuraPeerId,
-    registered: watch::Receiver<Vec<ZakuraPeerId>>,
+    registered: RegisteredPeers,
     trace: ZakuraTrace,
     policy: RedialPolicy,
     stop: CancellationToken,
@@ -271,7 +271,7 @@ where
 /// supervisor's registration watch. [`RedialState`] decides what they do.
 struct RedialIO<F> {
     peer_id: ZakuraPeerId,
-    registered: watch::Receiver<Vec<ZakuraPeerId>>,
+    registered: RegisteredPeers,
     dial: F,
     trace: ZakuraTrace,
     /// Once cancelled, no attempt starts.
@@ -421,18 +421,18 @@ where
                 changed = registrations.changed(), if watching => {
                     watching = changed.is_ok();
                     if watching {
-                        attempt.observe_registration(registrations.borrow().contains(&self.peer_id));
+                        attempt.observe_registration(registrations.names(&self.peer_id));
                     }
                 }
             }
         };
-        attempt.observe_registration(self.registered.borrow().contains(&self.peer_id));
+        attempt.observe_registration(self.registered.names(&self.peer_id));
         result
     }
 
     /// Whether the peer is registered now, marking the watch seen.
     fn peer_is_registered(&mut self) -> bool {
-        self.registered.borrow_and_update().contains(&self.peer_id)
+        self.registered.names_and_mark_seen(&self.peer_id)
     }
 }
 
@@ -498,7 +498,7 @@ impl Drop for TracedAttempt {
 /// unrelated peer-set changes always. Returns `false` when the registration
 /// watch closes (node shutdown).
 async fn sleep_unless_registered(
-    registered: &mut watch::Receiver<Vec<ZakuraPeerId>>,
+    registered: &mut RegisteredPeers,
     wake_for: Option<&ZakuraPeerId>,
     wait: Duration,
 ) -> bool {
@@ -510,7 +510,7 @@ async fn sleep_unless_registered(
                 if changed.is_err() {
                     return false;
                 }
-                if wake_for.is_some_and(|peer_id| registered.borrow().contains(peer_id)) {
+                if wake_for.is_some_and(|peer_id| registered.names(peer_id)) {
                     return true;
                 }
             }
@@ -524,13 +524,13 @@ async fn sleep_unless_registered(
 /// Returns how long the peer remained registered after this observer first saw
 /// it, or `None` when the sender closes while the peer remains registered.
 async fn wait_for_peer_deregistration(
-    registered: &mut watch::Receiver<Vec<ZakuraPeerId>>,
+    registered: &mut RegisteredPeers,
     peer_id: &ZakuraPeerId,
 ) -> Option<Duration> {
     let registered_at = Instant::now();
     loop {
         registered.changed().await.ok()?;
-        if !registered.borrow_and_update().contains(peer_id) {
+        if !registered.names_and_mark_seen(peer_id) {
             return Some(registered_at.elapsed());
         }
     }

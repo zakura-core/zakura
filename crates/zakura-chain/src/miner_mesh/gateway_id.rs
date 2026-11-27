@@ -1,6 +1,6 @@
 //! The ID a coinbase commitment names a gateway by.
 
-use std::fmt;
+use std::{fmt, str::FromStr};
 
 /// The bytes in a [`GatewayId`].
 pub(super) const GATEWAY_ID_LEN: usize = 20;
@@ -19,7 +19,7 @@ pub struct GatewayId([u8; GATEWAY_ID_LEN]);
 
 impl GatewayId {
     /// Returns the gateway ID made of exactly these bytes.
-    pub fn from_bytes(bytes: [u8; GATEWAY_ID_LEN]) -> Self {
+    pub const fn from_bytes(bytes: [u8; GATEWAY_ID_LEN]) -> Self {
         Self(bytes)
     }
 
@@ -54,6 +54,41 @@ impl GatewayId {
     /// Returns the gateway ID's bytes.
     pub fn as_bytes(&self) -> &[u8; GATEWAY_ID_LEN] {
         &self.0
+    }
+}
+
+/// The error returned when text names no gateway ID.
+#[derive(Clone, Debug, PartialEq, thiserror::Error)]
+pub enum ParseGatewayIdError {
+    /// The text is the length of neither a v2 node ID nor a gateway ID.
+    #[error(
+        "expected 64 hex digits (a v2 node ID) or 40 hex digits (a gateway ID), \
+         found {0} bytes"
+    )]
+    Length(usize),
+    /// The text has the length of an ID but is not hex.
+    #[error("not hex: {0}")]
+    NotHex(#[from] hex::FromHexError),
+}
+
+impl FromStr for GatewayId {
+    type Err = ParseGatewayIdError;
+
+    /// Reads a gateway ID from hex: either a whole 32-byte v2 node ID, which
+    /// names the gateway whose node ID it is, or the 20-byte gateway ID
+    /// itself.
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        if text.len() == NODE_ID_LEN * 2 {
+            let mut node_id = [0; NODE_ID_LEN];
+            hex::decode_to_slice(text, &mut node_id)?;
+            Ok(Self::from_node_id(&node_id))
+        } else if text.len() == GATEWAY_ID_LEN * 2 {
+            let mut gateway_id = [0; GATEWAY_ID_LEN];
+            hex::decode_to_slice(text, &mut gateway_id)?;
+            Ok(Self(gateway_id))
+        } else {
+            Err(ParseGatewayIdError::Length(text.len()))
+        }
     }
 }
 

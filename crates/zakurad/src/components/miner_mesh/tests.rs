@@ -31,9 +31,8 @@ use zakura_test::vectors::BLOCK_MAINNET_1_BYTES;
 
 use super::{
     ranking::{ranking_channel, MIN_GATEWAY_BLOCKS},
-    tracker::{
-        gateway_block_counts, run, GatewayBlockCounts, TipMove, Tracker, REPUBLISH_INTERVAL,
-    },
+    tracker::{gateway_metrics, run, GatewayMetrics, TipMove, Tracker, REPUBLISH_INTERVAL},
+    LocalGateway,
 };
 use crate::BoxError;
 
@@ -528,7 +527,7 @@ async fn the_task_reads_the_window_and_ends_when_the_state_stops() {
     let (mut tip_sender, latest_tip, tip_change) = ChainTipSender::new(None, &regtest());
     tip_sender.set_finalized_tip(Some(tip_block(1, TIP)));
     drop(tip_sender);
-    let (ranking, publisher) = ranking_channel(true, regtest(), latest_tip);
+    let (ranking, publisher) = ranking_channel(true, Vec::new(), regtest(), latest_tip);
     let publisher = publisher.expect("a mining node gets a publisher");
 
     let mut tracker = tracker(&chain);
@@ -631,7 +630,7 @@ async fn the_task_follows_a_new_tip_before_reading_older_blocks() {
     chain.on_hash_read(40, move || {
         tip_sender.set_best_non_finalized_tip(Some(tip_block(1, TIP + 1)));
     });
-    let (_ranking, publisher) = ranking_channel(true, regtest(), latest_tip);
+    let (_ranking, publisher) = ranking_channel(true, Vec::new(), regtest(), latest_tip);
     let publisher = publisher.expect("a mining node gets a publisher");
 
     let mut tracker = tracker(&chain);
@@ -691,7 +690,7 @@ async fn a_mined_gateway_reaches_the_network_once_its_tenth_block_counts() {
 
     let (mut tip_sender, latest_tip, tip_change) = ChainTipSender::new(None, &regtest());
     tip_sender.set_finalized_tip(Some(tip_block(1, TIP)));
-    let (mut ranking, publisher) = ranking_channel(true, regtest(), latest_tip);
+    let (mut ranking, publisher) = ranking_channel(true, Vec::new(), regtest(), latest_tip);
     let publisher = publisher.expect("a mining node gets a publisher");
     let task = tokio::spawn(async move {
         let mut tracker = tracker(&chain);
@@ -737,7 +736,7 @@ async fn the_task_publishes_an_empty_ranking_once_the_tip_is_too_old() {
     let (sync_tip, sync_tip_sender) = MockChainTip::new();
     sync_tip_sender.send_best_tip_height(Height(TIP));
     sync_tip_sender.send_best_tip_block_time(Utc::now());
-    let (mut ranking, publisher) = ranking_channel(true, Network::Mainnet, sync_tip);
+    let (mut ranking, publisher) = ranking_channel(true, Vec::new(), Network::Mainnet, sync_tip);
     let publisher = publisher.expect("a mining node gets a publisher");
     let task = tokio::spawn(async move {
         let mut tracker = Tracker::new(Network::Mainnet, chain.service());
@@ -786,39 +785,74 @@ fn snapshot_naming(gateways: &[(u8, u32)]) -> MinerSetSnapshot {
     }
 }
 
+/// A node that announces the gateway with ID bytes `id`.
+fn announcing(id: u8) -> LocalGateway {
+    let gateway = Some(GatewayId::from_bytes([id; 20]));
+    LocalGateway {
+        announced: gateway,
+        stands_for: gateway,
+    }
+}
+
 #[test]
 fn gateway_metrics_report_the_busiest_gateway_and_the_local_one() {
     let snapshot = snapshot_naming(&[(7, 5), (3, 2), (9, 1)]);
 
     assert_eq!(
-        gateway_block_counts(&snapshot, Some(GatewayId::from_bytes([3; 20]))),
-        GatewayBlockCounts { top: 5, local: 2 },
+        gateway_metrics(&snapshot, announcing(3)),
+        GatewayMetrics {
+            top: 5,
+            announcing: true,
+            stood_for_blocks: Some(2)
+        },
         "the local gateway is counted by its own blocks, not the busiest gateway's"
     );
     assert_eq!(
-        gateway_block_counts(&snapshot, Some(GatewayId::from_bytes([7; 20]))),
-        GatewayBlockCounts { top: 5, local: 5 },
+        gateway_metrics(&snapshot, announcing(7)).stood_for_blocks,
+        Some(5),
+    );
+}
+
+#[test]
+fn a_relay_announces_nothing_but_counts_the_blocks_that_name_it() {
+    let relay = LocalGateway {
+        announced: None,
+        stands_for: Some(GatewayId::from_bytes([3; 20])),
+    };
+
+    assert_eq!(
+        gateway_metrics(&snapshot_naming(&[(7, 5), (3, 2)]), relay),
+        GatewayMetrics {
+            top: 5,
+            announcing: false,
+            stood_for_blocks: Some(2)
+        },
     );
 }
 
 #[test]
 fn gateway_metrics_are_zero_when_nothing_matches() {
     assert_eq!(
-        gateway_block_counts(&snapshot_naming(&[]), Some(GatewayId::from_bytes([3; 20]))),
-        GatewayBlockCounts { top: 0, local: 0 },
+        gateway_metrics(&snapshot_naming(&[]), announcing(3)),
+        GatewayMetrics {
+            top: 0,
+            announcing: true,
+            stood_for_blocks: Some(0)
+        },
         "an empty window names no gateway, including this node's"
     );
     assert_eq!(
-        gateway_block_counts(
-            &snapshot_naming(&[(7, 5)]),
-            Some(GatewayId::from_bytes([3; 20]))
-        ),
-        GatewayBlockCounts { top: 5, local: 0 },
+        gateway_metrics(&snapshot_naming(&[(7, 5)]), announcing(3)).stood_for_blocks,
+        Some(0),
         "a local gateway that no block names has no blocks"
     );
     assert_eq!(
-        gateway_block_counts(&snapshot_naming(&[(7, 5)]), None),
-        GatewayBlockCounts { top: 5, local: 0 },
-        "a node that does not announce has no local gateway to count"
+        gateway_metrics(&snapshot_naming(&[(7, 5)]), LocalGateway::default()),
+        GatewayMetrics {
+            top: 5,
+            announcing: false,
+            stood_for_blocks: None
+        },
+        "a node that stands for no gateway has no local gateway to count"
     );
 }

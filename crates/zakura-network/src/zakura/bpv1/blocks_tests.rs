@@ -3508,6 +3508,21 @@ fn fix4_committed_fallback_block_frees_its_slot_without_eviction() {
     );
 }
 
+/// A fresh table holding a `TINY` block `[seed; 32]` admitted at height 1.
+fn rebuild_fixture(cfg: BlockConfig, seed: u8) -> (BlockTable, block::Hash, EncodedBody) {
+    let mut table = BlockTable::new(cfg);
+    let block_id = block::Hash([seed; 32]);
+    let encoded = encode_body(&Profile::TINY, &[seed; 128], 2).unwrap();
+    admit(
+        &mut table,
+        Instant::now(),
+        block_id,
+        encoded.coding,
+        encoded.part_root,
+    );
+    (table, block_id, encoded)
+}
+
 /// Moves the verified tip to `height` at `hash` and returns the rebuild work
 /// the step starts for `block_id`, if any.
 fn tip_rebuild(
@@ -3529,30 +3544,53 @@ fn tip_rebuild(
     (step, work)
 }
 
+/// Answers rebuild `work_id` of `block_id` with `result`.
+fn rebuilt(
+    table: &mut BlockTable,
+    now: Instant,
+    work_id: Option<WorkId>,
+    block_id: block::Hash,
+    result: RebuildResult,
+) -> BlockStep {
+    let work_id = work_id.expect("the block started a rebuild");
+    table.step(
+        now,
+        BlockInput::Rebuilt {
+            work_id,
+            block_id,
+            result,
+        },
+    )
+}
+
+/// Whether `step` emits an output that `wanted` matches.
+fn emits(step: &BlockStep, wanted: impl Fn(&BlockOutput) -> bool) -> bool {
+    step.outputs.iter().any(wanted)
+}
+
+/// Inserts `part` as `node_id(2)`'s answer to a pull.
+fn pulled(
+    table: &mut BlockTable,
+    now: Instant,
+    block_id: block::Hash,
+    part: &VerifiedPart,
+) -> BlockStep {
+    insert(table, now, block_id, part, node_id(2), PartAuth::Want(1))
+}
+
 /// bpv1-90: block sync commits a block BPv1 still collects. BPv1 pulls
-/// nothing while it rebuilds the parts from the committed body, still stores
-/// a part an outstanding `Want` delivers meanwhile, then holds every part as
-/// `Done`. It serves a part
-/// it never received, sends `BlockDone`, and never submits the block.
+/// nothing while it rebuilds the parts from the committed body, but stores
+/// a part an outstanding `Want` delivers. Then it holds every part as `Done`,
+/// serves one it never received, sends `BlockDone`, and never submits.
 #[test]
 fn bpv1_90_a_committed_collecting_block_rebuilds_and_serves_every_part() {
-    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let (mut table, block_id, encoded) =
+        rebuild_fixture(BlockConfig::for_profile(Profile::TINY), 0x90);
     let t0 = Instant::now();
-    let block_id = block::Hash([0x90; 32]);
-    let encoded = encode_body(&Profile::TINY, &[0x5A; 128], 2).unwrap();
-    admit(&mut table, t0, block_id, encoded.coding, encoded.part_root);
-    insert(
-        &mut table,
-        t0,
-        block_id,
-        &encoded.parts[0],
-        node_id(2),
-        PartAuth::Want(1),
-    );
+    pulled(&mut table, t0, block_id, &encoded.parts[0]);
 
     let (step, work) = tip_rebuild(&mut table, t0, 1, block_id, block_id);
-    let work_id = work.expect("a committed collecting block starts a rebuild");
-    assert!(step.outputs.iter().any(|o| matches!(
+    assert!(emits(&step, |o| matches!(
         o,
         BlockOutput::ReleaseBodyClaim {
             reason: ClaimRelease::Committed,
@@ -3567,30 +3605,22 @@ fn bpv1_90_a_committed_collecting_block_rebuilds_and_serves_every_part() {
         &[pull_state(node_id(3))],
     );
     assert!(late.outputs.is_empty() && late.events.is_empty());
-    let stored = insert(
-        &mut table,
-        t0,
-        block_id,
-        &encoded.parts[1],
-        node_id(2),
-        PartAuth::Want(1),
-    );
-    assert!(stored.outputs.iter().any(|o| matches!(
+    let stored = pulled(&mut table, t0, block_id, &encoded.parts[1]);
+    assert!(emits(&stored, |o| matches!(
         o,
         BlockOutput::PartReady { indices, .. } if *indices == [encoded.parts[1].index()]
     )));
-    assert!(!stored
-        .outputs
-        .iter()
-        .any(|o| matches!(o, BlockOutput::GrantPull { .. })));
+    assert!(!emits(&stored, |o| matches!(
+        o,
+        BlockOutput::GrantPull { .. }
+    )));
 
-    let done = table.step(
+    let done = rebuilt(
+        &mut table,
         t0,
-        BlockInput::Rebuilt {
-            work_id,
-            block_id,
-            result: RebuildResult::Parts(encoded.parts.clone()),
-        },
+        work,
+        block_id,
+        RebuildResult::Parts(encoded.parts.clone()),
     );
     assert_eq!(table.block_phase(&block_id), Some(BlockPhase::Done));
     let never_received = encoded.parts.last().unwrap();
@@ -3612,14 +3642,14 @@ fn bpv1_90_a_committed_collecting_block_rebuilds_and_serves_every_part() {
         (2..encoded.parts.len() as u32).collect::<Vec<_>>(),
         "every part but the two received becomes servable"
     );
-    assert!(done
-        .outputs
-        .iter()
-        .any(|o| matches!(o, BlockOutput::NotifyBlockDone { .. })));
-    assert!(!done
-        .outputs
-        .iter()
-        .any(|o| matches!(o, BlockOutput::SubmitVerifier { .. })));
+    assert!(emits(&done, |o| matches!(
+        o,
+        BlockOutput::NotifyBlockDone { .. }
+    )));
+    assert!(!emits(&done, |o| matches!(
+        o,
+        BlockOutput::SubmitVerifier { .. }
+    )));
     assert!(done.events.contains(&BlockEvent::Rebuilt { block_id }));
     assert!(done.events.contains(&BlockEvent::Outcome {
         block_id,
@@ -3639,29 +3669,19 @@ fn bpv1_90_a_committed_collecting_block_rebuilds_and_serves_every_part() {
 /// admitted metadata was wrong. The block retires, and no peer is closed.
 #[test]
 fn bpv1_90_a_committed_body_that_mismatches_retires_without_faulting_a_peer() {
-    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let (mut table, block_id, _) = rebuild_fixture(BlockConfig::for_profile(Profile::TINY), 0x91);
     let t0 = Instant::now();
-    let block_id = block::Hash([0x91; 32]);
-    let encoded = encode_body(&Profile::TINY, &[0x5B; 128], 2).unwrap();
-    admit(&mut table, t0, block_id, encoded.coding, encoded.part_root);
     let (_, work) = tip_rebuild(&mut table, t0, 1, block_id, block_id);
 
-    let step = table.step(
-        t0,
-        BlockInput::Rebuilt {
-            work_id: work.unwrap(),
-            block_id,
-            result: RebuildResult::Mismatch,
-        },
-    );
+    let step = rebuilt(&mut table, t0, work, block_id, RebuildResult::Mismatch);
     assert_eq!(table.block_phase(&block_id), Some(BlockPhase::Retired));
     assert!(step
         .events
         .contains(&BlockEvent::RebuildMismatch { block_id }));
-    assert!(!step
-        .outputs
-        .iter()
-        .any(|o| matches!(o, BlockOutput::ClosePeer { .. })));
+    assert!(!emits(&step, |o| matches!(
+        o,
+        BlockOutput::ClosePeer { .. }
+    )));
     table.assert_invariants();
 }
 
@@ -3670,22 +3690,11 @@ fn bpv1_90_a_committed_body_that_mismatches_retires_without_faulting_a_peer() {
 /// starts no second rebuild.
 #[test]
 fn bpv1_90_a_block_state_lacks_keeps_collecting_and_rebuilds_once() {
-    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let (mut table, block_id, _) = rebuild_fixture(BlockConfig::for_profile(Profile::TINY), 0x92);
     let t0 = Instant::now();
-    let block_id = block::Hash([0x92; 32]);
-    let fork = block::Hash([0x9F; 32]);
-    let encoded = encode_body(&Profile::TINY, &[0x5C; 128], 2).unwrap();
-    admit(&mut table, t0, block_id, encoded.coding, encoded.part_root);
-    let (_, work) = tip_rebuild(&mut table, t0, 1, fork, block_id);
+    let (_, work) = tip_rebuild(&mut table, t0, 1, block::Hash([0x9F; 32]), block_id);
 
-    table.step(
-        t0,
-        BlockInput::Rebuilt {
-            work_id: work.expect("a block at the tip's height starts a rebuild"),
-            block_id,
-            result: RebuildResult::Missing,
-        },
-    );
+    rebuilt(&mut table, t0, work, block_id, RebuildResult::Missing);
     assert_eq!(table.block_phase(&block_id), Some(BlockPhase::Collecting));
     let (_, again) = tip_rebuild(&mut table, t0, 2, block::Hash([0x9E; 32]), block_id);
     assert_eq!(again, None);
@@ -3699,38 +3708,26 @@ fn bpv1_90_a_block_state_lacks_keeps_collecting_and_rebuilds_once() {
 /// retires, and the rebuild's late result changes nothing.
 #[test]
 fn bpv1_90_a_failed_stripe_decode_while_rebuilding_records_its_outcome() {
-    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let (mut table, block_id, encoded) =
+        rebuild_fixture(BlockConfig::for_profile(Profile::TINY), 0x95);
     let t0 = Instant::now();
-    let block_id = block::Hash([0x95; 32]);
-    let encoded = encode_body(&Profile::TINY, &[0x5E; 128], 2).unwrap();
     let coding = encoded.coding;
-    admit(&mut table, t0, block_id, coding, encoded.part_root);
     // `k` parts of stripe 0 without its first source part start a decode.
-    let mut decode = None;
-    for slot in 1..=coding.k {
-        let index = coding.wire_index(0, slot).unwrap();
-        let part = encoded.parts.iter().find(|p| p.index() == index).unwrap();
-        for o in insert(
-            &mut table,
-            t0,
-            block_id,
-            part,
-            node_id(2),
-            PartAuth::Want(1),
-        )
-        .outputs
-        {
-            if let BlockOutput::StartStripeJob {
+    let decode = (1..=coding.k)
+        .flat_map(|slot| {
+            let index = coding.wire_index(0, slot).unwrap();
+            let part = encoded.parts.iter().find(|p| p.index() == index).unwrap();
+            pulled(&mut table, t0, block_id, part).outputs
+        })
+        .find_map(|o| match o {
+            BlockOutput::StartStripeJob {
                 work_id,
                 kind: StripeJob::Decode,
                 ..
-            } = o
-            {
-                decode = Some(work_id);
-            }
-        }
-    }
-    let decode = decode.expect("k parts with parity start a decode");
+            } => Some(work_id),
+            _ => None,
+        })
+        .expect("k parts with parity start a decode");
     let (_, work) = tip_rebuild(&mut table, t0, 1, block_id, block_id);
 
     let failed = table.step(
@@ -3751,13 +3748,12 @@ fn bpv1_90_a_failed_stripe_decode_while_rebuilding_records_its_outcome() {
         outcome: BlockOutcome::Fallback,
     }));
     assert_eq!(table.block_phase(&block_id), Some(BlockPhase::Retired));
-    let late = table.step(
+    let late = rebuilt(
+        &mut table,
         t0,
-        BlockInput::Rebuilt {
-            work_id: work.unwrap(),
-            block_id,
-            result: RebuildResult::Parts(encoded.parts.clone()),
-        },
+        work,
+        block_id,
+        RebuildResult::Parts(encoded.parts.clone()),
     );
     assert!(late.outputs.is_empty() && late.events.is_empty());
     table.assert_invariants();
@@ -3771,7 +3767,7 @@ fn bpv1_90_a_block_admitted_at_the_verified_tip_rebuilds_at_once() {
     let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
     let t0 = Instant::now();
     let block_id = block::Hash([0x96; 32]);
-    let encoded = encode_body(&Profile::TINY, &[0x5F; 128], 2).unwrap();
+    let encoded = encode_body(&Profile::TINY, &[0x96; 128], 2).unwrap();
     table.step(
         t0,
         BlockInput::TipHeight {
@@ -3781,7 +3777,7 @@ fn bpv1_90_a_block_admitted_at_the_verified_tip_rebuilds_at_once() {
     );
 
     let step = admit(&mut table, t0, block_id, encoded.coding, encoded.part_root);
-    assert!(step.outputs.iter().any(|o| matches!(
+    assert!(emits(&step, |o| matches!(
         o,
         BlockOutput::RebuildFromCommitted { block_id: id, .. } if *id == block_id
     )));
@@ -3795,27 +3791,22 @@ fn bpv1_90_a_block_admitted_at_the_verified_tip_rebuilds_at_once() {
 fn bpv1_90_an_evicted_rebuild_ignores_its_late_result() {
     let mut cfg = BlockConfig::for_profile(Profile::TINY);
     cfg.max_concurrent_blocks = 1;
-    let mut table = BlockTable::new(cfg);
+    let (mut table, block_id, encoded) = rebuild_fixture(cfg, 0x93);
     let t0 = Instant::now();
-    let block_id = block::Hash([0x93; 32]);
-    let encoded = encode_body(&Profile::TINY, &[0x5D; 128], 2).unwrap();
-    admit(&mut table, t0, block_id, encoded.coding, encoded.part_root);
     let (_, work) = tip_rebuild(&mut table, t0, 1, block_id, block_id);
 
     let next = block::Hash([0x94; 32]);
     admit_block(&mut table, t0, next, 2, encoded.coding, encoded.part_root);
     assert_eq!(table.block_phase(&block_id), Some(BlockPhase::Retired));
 
-    let late = table.step(
+    let late = rebuilt(
+        &mut table,
         t0,
-        BlockInput::Rebuilt {
-            work_id: work.unwrap(),
-            block_id,
-            result: RebuildResult::Parts(encoded.parts.clone()),
-        },
+        work,
+        block_id,
+        RebuildResult::Parts(encoded.parts.clone()),
     );
     assert!(late.outputs.is_empty() && late.events.is_empty());
-    assert_eq!(table.block_phase(&block_id), Some(BlockPhase::Retired));
     table.assert_invariants();
 }
 

@@ -598,9 +598,7 @@ impl SharedNode {
     }
 }
 
-/// Bounds the state read of a committed block that BPv1 rebuilds. A read
-/// that times out counts as `Missing`, and the block keeps collecting under
-/// its reconstruction deadline.
+/// Bounds a rebuild's state read. A timeout counts as `Missing`.
 const COMMITTED_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Reads committed block `block_id` from state and rebuilds its parts on a
@@ -633,12 +631,9 @@ async fn rebuild_committed(
 }
 
 /// Encodes committed `block`'s body and returns every part if its coding and
-/// part root equal the admitted ones (`bpv1-90`).
-///
-/// Comparing the whole `part_root` checks every stripe root and the padding
-/// above the last stripe, even for a stripe that holds no part yet. The
-/// transaction count and body length are checked first, so most mismatches
-/// cost no encode.
+/// part root equal the admitted ones (`bpv1-90`). The whole `part_root`
+/// covers every stripe and the padding above the last, even a stripe that
+/// holds no part yet.
 pub(super) fn rebuild_parts(
     profile: &Profile,
     block: &BlockRef,
@@ -663,8 +658,8 @@ pub(super) fn rebuild_parts(
     }
 }
 
-/// Serializes `block`'s transactions after the coinbase: the body `B'` that
-/// BPv1 encodes. `None` if a transaction fails to serialize.
+/// Serializes `block`'s transactions after the coinbase, the body `B'` that
+/// BPv1 encodes.
 fn body_after_coinbase(block: &BlockRef) -> Option<Vec<u8>> {
     let mut body = Vec::new();
     for tx in block.transactions().skip(1) {

@@ -484,15 +484,16 @@ fn mesh_seeds() -> Vec<Bpv1Seed> {
     pull.extend(pump(4));
     pull.extend([(MESH_RECONNECT, 0, 0), (MESH_TICK_LONG, 0, 30)]);
     pull.extend(pump(2));
-    // Node 2 hears of the block only from the adversary, so it falls back
-    // and block sync fetches it.
-    let mut fallback = vec![(MESH_DISCONNECT, 1, 0), (MESH_DISCONNECT, 2, 0)];
-    fallback.extend(propose(0));
-    fallback.extend(pump(2));
+    // Node 2 hears of block 0 only from the adversary.
+    let mut isolated = vec![(MESH_DISCONNECT, 1, 0), (MESH_DISCONNECT, 2, 0)];
+    isolated.extend(propose(0));
+    isolated.extend(pump(2));
     for b in 0..6 {
-        fallback.push((MESH_ADVERSARY, 0x11, b));
+        isolated.push((MESH_ADVERSARY, 0x11, b));
     }
-    fallback.extend(pump(3));
+    isolated.extend(pump(3));
+    // So it falls back, and block sync fetches the block.
+    let mut fallback = isolated.clone();
     fallback.extend([
         (MESH_TICK_LONG, 0, 20),
         (MESH_RECONNECT, 0, 0),
@@ -500,16 +501,9 @@ fn mesh_seeds() -> Vec<Bpv1Seed> {
         (MESH_STALL_OR_FALLBACK, 2, 1),
         (MESH_TICK_LONG, 0, 200),
     ]);
-    // Node 2 hears of the block only from the adversary. Its first repair
-    // round releases the claim, block sync commits the block, and BPv1
-    // rebuilds its parts (bpv1-90).
-    let mut rebuild = vec![(MESH_DISCONNECT, 1, 0), (MESH_DISCONNECT, 2, 0)];
-    rebuild.extend(propose(0));
-    rebuild.extend(pump(2));
-    for b in 0..6 {
-        rebuild.push((MESH_ADVERSARY, 0x11, b));
-    }
-    rebuild.extend(pump(3));
+    // Or its first repair round releases the claim, block sync commits the
+    // block, and BPv1 rebuilds its parts (bpv1-90).
+    let mut rebuild = isolated;
     rebuild.extend([(MESH_TICK, 0, 40), (MESH_STALL_OR_FALLBACK, 2, 4)]);
     rebuild.extend(pump(2));
     // The receivers' header admission fails locally, then a stalled link.

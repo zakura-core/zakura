@@ -113,9 +113,7 @@ where
     }
 }
 
-/// How long [`StateCommittedBlocks`] waits for the next non-finalized publication after
-/// a miss. The state writer publishes the verified tip before the non-finalized state
-/// that holds the committed block, so the wait spans that gap.
+/// How long a [`StateCommittedBlocks`] miss waits for the next non-finalized publication.
 const NON_FINALIZED_PUBLISH_WAIT: Duration = Duration::from_secs(2);
 
 /// Production [`CommittedBlockPort`] over `zakurad`'s read-only state service.
@@ -143,25 +141,6 @@ impl<S> StateCommittedBlocks<S> {
     }
 }
 
-/// Reads `hash` from `state` on any chain. A failed read answers `None`.
-async fn any_chain_block<S>(state: S, hash: block::Hash) -> Option<BlockHandle>
-where
-    S: Service<zakura_state::ReadRequest, Response = zakura_state::ReadResponse>,
-    S::Error: std::fmt::Debug,
-{
-    match state
-        .oneshot(zakura_state::ReadRequest::AnyChainBlock(hash.into()))
-        .await
-    {
-        Ok(zakura_state::ReadResponse::Block(block)) => block,
-        Ok(_) => None,
-        Err(error) => {
-            tracing::debug!(%hash, ?error, "bpv1 committed block read failed");
-            None
-        }
-    }
-}
-
 impl<S> CommittedBlockPort for StateCommittedBlocks<S>
 where
     S: Service<zakura_state::ReadRequest, Response = zakura_state::ReadResponse>
@@ -173,16 +152,29 @@ where
     S::Future: Send + 'static,
 {
     fn committed_block(&self, hash: block::Hash) -> PortFuture<'_, Option<BlockHandle>> {
+        let read = move |state: S| async move {
+            match state
+                .oneshot(zakura_state::ReadRequest::AnyChainBlock(hash.into()))
+                .await
+            {
+                Ok(zakura_state::ReadResponse::Block(block)) => block,
+                Ok(_) => None,
+                Err(error) => {
+                    tracing::debug!(%hash, ?error, "bpv1 committed block read failed");
+                    None
+                }
+            }
+        };
         let state = self.state.clone();
         // Marked seen before the first read, so a publication after it wakes the wait.
         let mut published = self.non_finalized.clone();
         published.mark_as_seen();
         Box::pin(async move {
-            if let Some(block) = any_chain_block(state.clone(), hash).await {
+            if let Some(block) = read(state.clone()).await {
                 return Some(block);
             }
             match tokio::time::timeout(NON_FINALIZED_PUBLISH_WAIT, published.changed()).await {
-                Ok(Ok(())) => any_chain_block(state, hash).await,
+                Ok(Ok(())) => read(state).await,
                 _ => None,
             }
         })
@@ -271,12 +263,15 @@ mod tests {
         RouterBlockVerifierAdapter, StateCommittedBlocks, SyncCoordinator, SUBMIT_TIMEOUT,
     };
 
-    fn owned_genesis() -> OwnedBlock {
-        let block: Block = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+    fn genesis() -> Block {
+        zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
             .zcash_deserialize_into()
-            .expect("the genesis vector deserializes");
+            .expect("the genesis vector deserializes")
+    }
+
+    fn owned_genesis() -> OwnedBlock {
         DecodedBlockPool::for_block_count(NonZeroU64::new(4).expect("4 is non-zero"))
-            .try_admit(block, Admission::WithinLimit)
+            .try_admit(genesis(), Admission::WithinLimit)
             .expect("an empty pool admits one block")
     }
 
@@ -397,17 +392,11 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
-    /// The state writer publishes the verified tip before the non-finalized state that
-    /// holds the block, so BPv1's first read can miss. The port waits for the next
-    /// non-finalized publication and reads again (bpv1-90).
+    /// A read that misses waits for the next non-finalized publication and reads again.
     #[tokio::test]
     async fn a_committed_block_read_waits_for_the_non_finalized_publication() {
         let _init_guard = zakura_test::init();
-        let genesis: Arc<Block> = Arc::new(
-            zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
-                .zcash_deserialize_into()
-                .expect("the genesis vector deserializes"),
-        );
+        let genesis = Arc::new(genesis());
         let reads = Arc::new(AtomicUsize::new(0));
         let state = service_fn({
             let (reads, genesis) = (reads.clone(), genesis.clone());

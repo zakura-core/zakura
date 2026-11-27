@@ -2643,11 +2643,9 @@ impl BlockTable {
         // An empty body has no stripes, so the block assembles from
         // `HeaderMeta` alone and no part crosses the wire for it.
         self.maybe_assemble_and_verify(now, block_id, step);
-        // Block sync may have committed the height while the metadata was in
-        // admission, so no later tip move would start the rebuild (bpv1-90).
-        if self.rebuilds(&block_id) {
-            self.start_rebuild(block_id, step);
-        }
+        // Block sync may have committed the height during admission, and no
+        // later tip move would reach the block (bpv1-90).
+        self.maybe_start_rebuild(block_id, step);
     }
 
     /// Closes every session that sent `entry`'s failed envelope with row 4,
@@ -3741,40 +3739,28 @@ impl BlockTable {
         }
     }
 
-    /// Starts one rebuild for each collecting block at or below the verified
-    /// tip (`bpv1-90`).
-    ///
-    /// Such a block can no longer commit through BPv1: block sync committed
-    /// it, or another block took its height. The snapshot watch coalesces, so
-    /// the height, not the tip hash, finds every block a snapshot committed.
-    /// State answers `Missing` for a block on a losing branch.
+    /// Starts a rebuild for each block [`Self::maybe_start_rebuild`] takes.
+    /// The snapshot watch coalesces, so the height, not the tip hash, finds
+    /// every block a snapshot committed.
     fn rebuild_committed(&mut self, step: &mut BlockStep) {
-        let committed: Vec<block::Hash> = self
-            .blocks
-            .keys()
-            .copied()
-            .filter(|block_id| self.rebuilds(block_id))
-            .collect();
-        for block_id in committed {
-            self.start_rebuild(block_id, step);
+        let block_ids: Vec<block::Hash> = self.blocks.keys().copied().collect();
+        for block_id in block_ids {
+            self.maybe_start_rebuild(block_id, step);
         }
     }
 
-    /// Whether `block_id` is a collecting block at or below the verified tip
-    /// that has not tried a rebuild yet (`bpv1-90`).
-    fn rebuilds(&self, block_id: &block::Hash) -> bool {
-        self.blocks.get(block_id).is_some_and(|b| {
-            b.phase == BlockPhase::Collecting && !b.rebuild_tried && b.height <= self.verified
-        })
-    }
-
-    /// Moves `block_id` to `Rebuilding` and asks IO for its committed body
-    /// (`bpv1-90`). The caller checks [`Self::rebuilds`].
-    fn start_rebuild(&mut self, block_id: block::Hash, step: &mut BlockStep) {
-        let work_id = alloc_work_id(&mut self.next_work_id);
-        let Some(block) = self.blocks.get_mut(&block_id) else {
+    /// Moves a collecting block at or below the verified tip, which can no
+    /// longer commit through BPv1, to `Rebuilding` and asks IO for its
+    /// committed body, once per block (`bpv1-90`). State answers `Missing`
+    /// for a block on a losing branch.
+    fn maybe_start_rebuild(&mut self, block_id: block::Hash, step: &mut BlockStep) {
+        let verified = self.verified;
+        let Some(block) = self.blocks.get_mut(&block_id).filter(|b| {
+            b.phase == BlockPhase::Collecting && !b.rebuild_tried && b.height <= verified
+        }) else {
             return;
         };
+        let work_id = alloc_work_id(&mut self.next_work_id);
         block.phase = BlockPhase::Rebuilding;
         block.rebuild_work_id = Some(work_id);
         block.rebuild_tried = true;
@@ -3798,14 +3784,9 @@ impl BlockTable {
         });
     }
 
-    /// Applies a rebuild's result (`bpv1-90`).
-    ///
-    /// Rebuilt parts make the block `Done`: it holds and serves every part
-    /// and sends `BlockDone`. Block sync delivered it, so its outcome is
-    /// `Fallback` and it records no assembly. A mismatch retires the block
-    /// without faulting a peer, because the committed body is valid by
-    /// consensus. A missing body returns the block to `Collecting` under its
-    /// unmoved deadline.
+    /// Applies a rebuild's [`RebuildResult`] (`bpv1-90`). Block sync delivered
+    /// the block, so a rebuilt or mismatched block's outcome is `Fallback`, and
+    /// a rebuilt one records no assembly.
     fn handle_rebuilt(
         &mut self,
         now: Instant,

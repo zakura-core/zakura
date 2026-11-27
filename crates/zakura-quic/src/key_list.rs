@@ -10,7 +10,14 @@ use blake2b_simd::Params;
 use crate::key::{NodeId, NodeKey, KEY_LENGTH};
 
 /// The most entries a key list holds (ID-8).
-pub const MAX_NODE_KEYS: usize = 4;
+///
+/// A node keeps the entry of every key it has ever added, a retired key as
+/// its fingerprint, so this is the number of keys one node ID's line can
+/// hold over its lifetime. The count travels as one byte.
+pub const MAX_NODE_KEYS: usize = 32;
+
+// The count byte holds the largest count. The cast widens a `u8`.
+const _: () = assert!(MAX_NODE_KEYS <= u8::MAX as usize);
 
 /// The tag of an Ed25519 entry. Its value is the [`NodeKey`] (ID-8).
 pub const ED25519_KEY_TAG: u16 = 1;
@@ -38,7 +45,7 @@ const NODE_ID_PERSONALISATION: &[u8; 16] = b"Zakura_NodeId_v1";
 #[non_exhaustive]
 pub enum KeyListError {
     /// The list holds no entry or more than [`MAX_NODE_KEYS`].
-    #[error("a key list holds 1 to 4 entries")]
+    #[error("a key list holds 1 to 32 entries")]
     EntryCount,
     /// The bytes are not the count byte followed by exactly that many
     /// entries.
@@ -79,16 +86,8 @@ impl NodeKeyList {
     /// Wraps entries that already satisfy every rule of
     /// [`Self::from_entries`], and derives their node ID.
     fn from_checked(entries: Vec<(u16, [u8; KEY_LENGTH])>) -> Self {
-        let hash = Params::new()
-            .hash_length(KEY_LENGTH)
-            .personal(NODE_ID_PERSONALISATION)
-            .hash(&encode(&entries));
-        let mut digest = [0; KEY_LENGTH];
-        digest.copy_from_slice(hash.as_bytes());
-        Self {
-            entries,
-            id: NodeId::from_bytes(&digest),
-        }
+        let id = node_id(&entries);
+        Self { entries, id }
     }
 
     /// Builds a list from `(tag, value)` entries, which must already be in
@@ -156,12 +155,78 @@ impl NodeKeyList {
             })
     }
 
+    /// Whether the list has an entry under `tag`.
+    pub fn contains_tag(&self, tag: u16) -> bool {
+        self.entry(tag).is_some()
+    }
+
+    /// The 32 bytes the list holds under `tag`: the key itself for Ed25519,
+    /// and the key's fingerprint for any other tag (ID-8).
+    pub(crate) fn entry(&self, tag: u16) -> Option<&[u8; KEY_LENGTH]> {
+        self.entries
+            .iter()
+            .find(|(held, _)| *held == tag)
+            .map(|(_, value)| value)
+    }
+
     /// The node ID of the node these keys belong to: BLAKE2b-256 of the
     /// encoded list (ID-9). Entries this release doesn't understand are
     /// hashed too, so every release derives the same ID from the same list.
     pub fn node_id(&self) -> NodeId {
         self.id
     }
+
+    /// The node IDs of this list and of each prefix of it that keeps every
+    /// entry tagged in `required` (TLS-7), the list's own ID first and then
+    /// its prefixes, shortest first. Empty when this list lacks a required
+    /// tag.
+    ///
+    /// A node only ever adds a key under a tag above those it holds, so each
+    /// list it has had is a prefix of the one it has now, and it is still
+    /// the node its earlier, shorter list named. `required` holds the tags
+    /// of the keys that prove it: an ID whose list leaves one of them out is
+    /// not proven by them. This is the one place that says which shorter
+    /// lists a list stands for, so a dial's check and a connection's report
+    /// can't disagree.
+    ///
+    /// Costs at most one hash per entry.
+    pub(crate) fn ids_of_lists_keeping<'a>(
+        &'a self,
+        required: &'a [u16],
+    ) -> impl Iterator<Item = NodeId> + 'a {
+        self.shortest_prefix_keeping(required)
+            .map(|shortest| std::iter::once(self.id).chain(self.earlier_ids(shortest)))
+            .into_iter()
+            .flatten()
+    }
+
+    /// The length of the shortest prefix that keeps every entry tagged in
+    /// `required`, at least one entry. `None` when the list lacks one of the
+    /// tags.
+    fn shortest_prefix_keeping(&self, required: &[u16]) -> Option<usize> {
+        required.iter().try_fold(1, |shortest: usize, tag| {
+            let index = self.entries.iter().position(|(held, _)| held == tag)?;
+            Some(shortest.max(index + 1))
+        })
+    }
+
+    /// The node IDs of this list's proper prefixes of `shortest` entries or
+    /// more, shortest first: one hash each, and fewer of them than the list
+    /// has entries. The whole list's ID is [`Self::node_id`].
+    fn earlier_ids(&self, shortest: usize) -> impl Iterator<Item = NodeId> + '_ {
+        (shortest..self.entries.len()).map(|length| node_id(&self.entries[..length]))
+    }
+}
+
+/// The node ID of `entries`: the BLAKE2b-256 hash of their encoding (ID-9).
+fn node_id(entries: &[(u16, [u8; KEY_LENGTH])]) -> NodeId {
+    let hash = Params::new()
+        .hash_length(KEY_LENGTH)
+        .personal(NODE_ID_PERSONALISATION)
+        .hash(&encode(entries));
+    let mut digest = [0; KEY_LENGTH];
+    digest.copy_from_slice(hash.as_bytes());
+    NodeId::from_bytes(&digest)
 }
 
 /// Encodes entries as a count byte, then each tag and value.
@@ -193,6 +258,12 @@ mod tests {
 
     fn key() -> NodeKey {
         NodeKey::from_bytes(&KEY).expect("the RFC 8032 key is valid")
+    }
+
+    /// Whether `id` names `list`, or a list of some of its entries that
+    /// keeps every entry tagged in `required`.
+    fn contains_list_named(list: &NodeKeyList, id: NodeId, required: &[u16]) -> bool {
+        list.ids_of_lists_keeping(required).any(|named| named == id)
     }
 
     // The digests were computed with Python's `hashlib.blake2b`, so they
@@ -256,9 +327,15 @@ mod tests {
 
         assert_eq!(NodeKeyList::decode(&[]), Err(KeyListError::Length));
         assert_eq!(NodeKeyList::decode(&[0]), Err(KeyListError::EntryCount));
-        let five: Vec<_> = (2..7).map(|tag| entry(tag, value)).collect();
+        let too_many: Vec<_> = (2..35).map(|tag| entry(tag, value)).collect();
+        assert_eq!(too_many.len(), MAX_NODE_KEYS + 1);
         assert_eq!(
-            NodeKeyList::decode(&list(5, &five)),
+            NodeKeyList::decode(&list(33, &too_many)),
+            Err(KeyListError::EntryCount)
+        );
+        assert!(NodeKeyList::decode(&list(32, &too_many[..32])).is_ok());
+        assert_eq!(
+            NodeKeyList::from_entries((2..35).map(|tag| (tag, value))),
             Err(KeyListError::EntryCount)
         );
         // A count that disagrees with the bytes, either way.
@@ -292,18 +369,240 @@ mod tests {
         );
     }
 
+    /// `count` entries with tags 1 to `count`: the Ed25519 key, then values
+    /// that differ by tag.
+    fn tagged_entries(count: u16) -> Vec<(u16, [u8; KEY_LENGTH])> {
+        (1..=count)
+            .map(|tag| match tag {
+                ED25519_KEY_TAG => (tag, KEY),
+                // A tag is at most 32 here, so it fits a byte.
+                _ => (tag, [tag as u8; KEY_LENGTH]),
+            })
+            .collect()
+    }
+
+    /// TLS-7: a list answers to the ID of each prefix that keeps the
+    /// required entries, and to no other.
+    #[test]
+    fn a_list_contains_the_prefixes_that_keep_the_required_entries() {
+        let entries = tagged_entries(4);
+        let list = NodeKeyList::from_entries(entries.iter().copied())
+            .expect("four increasing tags form a list");
+        let required = [ED25519_KEY_TAG, 3];
+        let named = |kept: &[usize]| {
+            let kept: Vec<_> = kept.iter().map(|index| entries[*index]).collect();
+            node_id(&kept)
+        };
+
+        assert!(contains_list_named(&list, list.node_id(), &required));
+        for kept in [&[0, 1, 2][..], &[0, 1, 2, 3]] {
+            assert!(
+                contains_list_named(&list, named(kept), &required),
+                "the prefix {kept:?} keeps both required tags"
+            );
+        }
+        for kept in [&[0][..], &[0, 1]] {
+            assert!(
+                !contains_list_named(&list, named(kept), &required),
+                "the prefix {kept:?} leaves a required tag out"
+            );
+        }
+        // Lists of the entries, in their order, that are not prefixes.
+        for kept in [&[2][..], &[0, 3], &[1, 2, 3], &[0, 1, 3], &[1, 3]] {
+            assert!(
+                !contains_list_named(&list, named(kept), &required),
+                "{kept:?} is not a prefix"
+            );
+            assert!(!contains_list_named(&list, named(kept), &[]));
+        }
+        // Not lists at all: no entries, entries out of order, one repeated.
+        for kept in [&[][..], &[1, 0], &[0, 0, 1], &[0, 1, 1], &[3, 2, 1, 0]] {
+            assert!(
+                !contains_list_named(&list, named(kept), &required),
+                "{kept:?} is not a list of the entries in their order"
+            );
+            assert!(!contains_list_named(&list, named(kept), &[]));
+        }
+        // With nothing required, every prefix is contained.
+        assert!(contains_list_named(&list, named(&[0]), &[]));
+        assert!(contains_list_named(&list, named(&[0, 1]), &[]));
+        assert!(!contains_list_named(&list, named(&[]), &[]));
+        assert!(!contains_list_named(
+            &list,
+            NodeKeyList::from_entries([UNKNOWN])
+                .expect("one entry is a list")
+                .node_id(),
+            &[]
+        ));
+    }
+
+    /// TLS-7 named a list of any of the credential's entries before spec
+    /// version 0.34. The lists that rule accepted and a prefix rule doesn't
+    /// are refused: each keeps both required entries, in order, and skips
+    /// an entry before the last one it keeps.
+    #[test]
+    fn a_sublist_that_skips_an_entry_is_refused() {
+        let entries = tagged_entries(4);
+        let list = NodeKeyList::from_entries(entries.iter().copied())
+            .expect("four increasing tags form a list");
+        let required = [ED25519_KEY_TAG, 3];
+        for kept in [&[0, 2][..], &[0, 2, 3]] {
+            let kept: Vec<_> = kept.iter().map(|index| entries[*index]).collect();
+            let sublist = NodeKeyList::from_entries(kept).expect("a sublist is a list");
+            assert!(required
+                .iter()
+                .all(|tag| sublist.entries.iter().any(|(held, _)| held == tag)));
+            assert!(!contains_list_named(&list, sublist.node_id(), &required));
+        }
+    }
+
+    /// TLS-7, exhaustively: for every list of 1 to 6 entries, every set of
+    /// required tags and every sublist, the list contains the sublist's ID
+    /// exactly when the sublist is the first entries of the list, with none
+    /// skipped, and keeps every required entry. No sublist passes when a
+    /// required tag is missing from the list, and no sublist of a list that
+    /// differs in one value passes.
+    #[test]
+    fn a_list_contains_exactly_the_prefixes_that_keep_every_required_entry() {
+        /// A tag none of the lists holds.
+        const ABSENT_TAG: u16 = 99;
+        let all = tagged_entries(6);
+        let picked = |entries: &[(u16, [u8; KEY_LENGTH])], mask: u32| -> Vec<_> {
+            let kept = |index: &usize| mask & (1 << index) != 0;
+            (0..entries.len())
+                .filter(kept)
+                .map(|index| entries[index])
+                .collect()
+        };
+        let mut checked = 0;
+        let mut contained = 0;
+        for size in 1..=all.len() {
+            let entries = &all[..size];
+            let list = NodeKeyList::from_entries(entries.iter().copied())
+                .expect("increasing tags form a list");
+            let mut other = entries.to_vec();
+            other[0].1 = [0xEE; KEY_LENGTH];
+            for required_mask in 0u32..1 << size {
+                let required: Vec<u16> = picked(entries, required_mask)
+                    .iter()
+                    .map(|(tag, _)| *tag)
+                    .collect();
+                let mut with_absent = required.clone();
+                with_absent.push(ABSENT_TAG);
+                for kept_mask in 1u32..1 << size {
+                    let id = node_id(&picked(entries, kept_mask));
+                    // A prefix keeps entries 0 to k - 1 and no other, so its
+                    // mask is 2^k - 1: one below a power of two.
+                    let is_prefix = (kept_mask + 1).is_power_of_two();
+                    let keeps_required = required_mask & !kept_mask == 0;
+                    assert_eq!(
+                        contains_list_named(&list, id, &required),
+                        is_prefix && keeps_required,
+                        "{size} entries, required {required_mask:#08b}, kept {kept_mask:#08b}"
+                    );
+                    assert!(!contains_list_named(&list, id, &with_absent));
+                    // Every prefix holds the first entry, whose value
+                    // differs in `other`, so this list contains none of
+                    // that list's sublists.
+                    if kept_mask & 1 != 0 {
+                        let foreign = node_id(&picked(&other, kept_mask));
+                        assert!(!contains_list_named(&list, foreign, &required));
+                    }
+                    checked += 1;
+                    contained += usize::from(is_prefix && keeps_required);
+                }
+            }
+        }
+        // 2^n sets of required tags times 2^n - 1 sublists, for n of 1 to 6.
+        assert_eq!(checked, 2 + 12 + 56 + 240 + 992 + 4_032);
+        // A prefix of k entries keeps the required tags of 2^k of the sets:
+        // 2^(n+1) - 2 pairs for each n.
+        assert_eq!(contained, 2 + 6 + 14 + 30 + 62 + 126);
+    }
+
+    /// TLS-7 on the longest list: it contains each of its 32 prefixes that
+    /// keeps the required entries, wherever those sit, and no list that
+    /// drops, swaps or changes one entry of a prefix.
+    #[test]
+    fn the_longest_list_contains_its_prefixes_and_nothing_near_them() {
+        let entries = tagged_entries(32);
+        assert_eq!(entries.len(), MAX_NODE_KEYS);
+        let list = NodeKeyList::from_entries(entries.iter().copied())
+            .expect("32 increasing tags form a list");
+        for length in 1..=entries.len() {
+            let prefix = &entries[..length];
+            let id = node_id(prefix);
+            assert!(contains_list_named(&list, id, &[]));
+            for (index, (tag, _)) in entries.iter().enumerate() {
+                assert_eq!(
+                    contains_list_named(&list, id, &[ED25519_KEY_TAG, *tag]),
+                    index < length,
+                    "a prefix of {length} entries and the required entry {index}"
+                );
+            }
+            for index in 0..length {
+                let mut dropped = prefix.to_vec();
+                dropped.remove(index);
+                // Dropping the last entry leaves a shorter prefix.
+                let is_prefix = index + 1 == length && length > 1;
+                assert_eq!(
+                    contains_list_named(&list, node_id(&dropped), &[]),
+                    is_prefix
+                );
+                let mut changed = prefix.to_vec();
+                changed[index].1[0] ^= 1;
+                assert!(!contains_list_named(&list, node_id(&changed), &[]));
+                if index + 1 < length {
+                    let mut swapped = prefix.to_vec();
+                    swapped.swap(index, index + 1);
+                    assert!(!contains_list_named(&list, node_id(&swapped), &[]));
+                }
+            }
+        }
+    }
+
+    /// The check hashes fewer lists than the list has entries, on the
+    /// longest list too: one per proper prefix that could match.
+    #[test]
+    fn the_check_hashes_at_most_one_list_per_entry() {
+        for count in [1, 2, 4, 32] {
+            let entries = tagged_entries(count);
+            let list = NodeKeyList::from_entries(entries.iter().copied())
+                .expect("increasing tags form a list");
+            let entries = usize::from(count);
+            assert_eq!(list.shortest_prefix_keeping(&[]), Some(1));
+            assert_eq!(list.earlier_ids(1).count(), entries - 1);
+            // Requiring the last entry leaves only the whole list, whose ID
+            // is already known.
+            assert_eq!(list.shortest_prefix_keeping(&[count]), Some(entries));
+            assert_eq!(list.earlier_ids(entries).count(), 0);
+            assert_eq!(list.shortest_prefix_keeping(&[count + 1]), None);
+        }
+    }
+
+    /// A list that lacks a required tag contains nothing, not even itself.
+    #[test]
+    fn a_list_without_a_required_entry_contains_no_list() {
+        let list = NodeKeyList::single(key());
+        assert!(contains_list_named(
+            &list,
+            list.node_id(),
+            &[ED25519_KEY_TAG]
+        ));
+        assert!(!contains_list_named(
+            &list,
+            list.node_id(),
+            &[ED25519_KEY_TAG, 3]
+        ));
+    }
+
     #[test]
     fn the_longest_list_fills_the_length_bound() {
-        let list = NodeKeyList::from_entries([
-            (
-                ED25519_KEY_TAG,
-                *NodeSecretKey::generate().public_key().as_bytes(),
-            ),
-            (2, [2; KEY_LENGTH]),
-            (3, [3; KEY_LENGTH]),
-            (4, [4; KEY_LENGTH]),
-        ])
-        .expect("four increasing tags form a list");
+        let mut entries = tagged_entries(32);
+        entries[0].1 = *NodeSecretKey::generate().public_key().as_bytes();
+        let list = NodeKeyList::from_entries(entries).expect("32 increasing tags form a list");
         assert_eq!(list.encode().len(), MAX_NODE_KEY_LIST_BYTES);
+        assert_eq!(MAX_NODE_KEY_LIST_BYTES, 1_089);
+        assert_eq!(NodeKeyList::decode(&list.encode()), Ok(list));
     }
 }

@@ -24,6 +24,7 @@ pub mod regtest;
 pub mod sync;
 pub mod test_type;
 pub mod zcashd_compat;
+pub mod zip248;
 
 /// Returns the path to the compiled `zakurad` binary under test.
 ///

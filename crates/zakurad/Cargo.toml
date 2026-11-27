@@ -247,6 +247,22 @@ zakura-test = { path = "../zakura-test", version = "4.0.0" }
 # Node keys and addresses for the regtest network harness, which dials its
 # `zakurad` children from in-process test nodes.
 zakura-quic = { path = "../zakura-quic", version = "2.0.0" }
+
+# Builds, signs, and proves the ZIP 248 v7 transactions that the regtest acceptance tests
+# submit, with the same wallet builder that block templates use for coinbases.
+# Their features (transparent-inputs, wallet) unify into the zakurad under test; its
+# template path does not depend on them.
+zcash_primitives = { workspace = true, features = ["transparent-inputs", "wallet"] }
+zcash_transparent = { workspace = true, features = ["transparent-inputs"] }
+zcash_protocol = { workspace = true }
+orchard = { workspace = true }
+sapling-crypto = { workspace = true }
+incrementalmerkletree = { workspace = true }
+secp256k1 = { workspace = true }
+ripemd = { workspace = true }
+# The Sapling prover trait signatures name these types.
+bls12_381 = { workspace = true }
+jubjub = { workspace = true }
 # The simulator's engine-backed header port, compared against
 # HeaderChainServicePort in its tests. Path-only, with no version, because
 # zakura-storage is never published, so packaging drops it.

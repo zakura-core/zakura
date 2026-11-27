@@ -497,8 +497,9 @@ args = ["-max_len=512"]
 timeout-secs = 1800
 
 # The handshake parsers' targets read peer-chosen bytes, not machine
-# histories. The longest credential's SPKI is 10,418 bytes, and a raw
-# composite input with an honest signature is about 3,900.
+# histories. The longest credential's SPKI is 10,418 bytes, the longest key
+# list is 1,089, and a raw composite input with an honest signature is about
+# 3,900.
 [[target]]
 package = "p2p"
 name = "credential_parse"
@@ -510,7 +511,7 @@ timeout-secs = 1800
 package = "p2p"
 name = "key_list_decode"
 smoke-secs = 60
-args = ["-max_len=512"]
+args = ["-max_len=2048"]
 timeout-secs = 1800
 
 [[target]]
@@ -518,6 +519,15 @@ package = "p2p"
 name = "composite_verify"
 smoke-secs = 60
 args = ["-max_len=4096"]
+timeout-secs = 1800
+
+# A record's extension area is at most 8,486 bytes: the body cap less the
+# shortest fields.
+[[target]]
+package = "p2p"
+name = "record_signature"
+smoke-secs = 60
+args = ["-max_len=9001"]
 timeout-secs = 1800
 
 [[target]]
@@ -628,7 +638,7 @@ timeout-secs = 1800
 package = "p2p"
 name = "bpv1_wire"
 smoke-secs = 60
-args = ["-max_len=2048"]
+args = ["-max_len=8229"]
 timeout-secs = 1800
 
 [[target]]

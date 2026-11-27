@@ -12,7 +12,10 @@ fn main() {
         .nth(1)
         .map_or(200, |n| n.parse().expect("the argument is an input count"));
     for target in measure_bpv1_targets(generated, 0x5EED) {
-        let reached = target.reached.iter().filter(|n| target.expected.contains(n));
+        let reached = target
+            .reached
+            .iter()
+            .filter(|n| target.expected.contains(n));
         let rows: Vec<&str> = target
             .reached
             .iter()

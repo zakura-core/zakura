@@ -89,6 +89,10 @@ struct RedialState {
     /// Whether Zakura has warned that a connection at this pinned peer's address does not
     /// prove its node ID, since the peer last proved it.
     warned_unproven: bool,
+
+    /// Whether Zakura has warned that this peer's pin names it by a node ID it had before
+    /// it added keys.
+    warned_moved: bool,
 }
 
 /// A finished step of an attempt to connect to the peer at `index`.
@@ -264,8 +268,9 @@ fn is_connected(
 /// Returns whether `peer` is connected.
 ///
 /// A peer pinned to a node ID is connected while a native connection in `peer_registry`
-/// proves that ID, from any address. Any other peer is connected when [`is_connected`]
-/// says its address is.
+/// proves that ID, from any address: the connection is registered under the ID, or its
+/// handshake proved it as an ID the peer had before it added keys. Any other peer is
+/// connected when [`is_connected`] says its address is.
 fn is_peer_connected(
     peer: &RedialState,
     peer_registry: &PeerRegistry,
@@ -276,7 +281,7 @@ fn is_peer_connected(
         Some(NamedPeer {
             node_id: Some(node_id),
             ..
-        }) => peer_registry.native_connection_ip(node_id).is_some(),
+        }) => peer_registry.native_connection_proving(node_id).is_some(),
         _ => peer
             .addr
             .is_some_and(|addr| is_connected(addr, connections, max_connections_per_ip)),
@@ -298,7 +303,9 @@ fn exempt_proven_address(peer: &RedialState, peer_registry: &PeerRegistry, confi
         ..
     }) = &peer.name
     {
-        let proven_ip = peer_registry.native_connection_ip(node_id).flatten();
+        let proven_ip = peer_registry
+            .native_connection_proving(node_id)
+            .and_then(|proof| proof.remote_ip);
         let changed = config
             .unconditional_peers
             .set_resolved_ip(*index, proven_ip);
@@ -316,6 +323,41 @@ fn exempt_proven_address(peer: &RedialState, peer_registry: &PeerRegistry, confi
             }
         }
     }
+}
+
+/// Warns, once per start, when the connection that proves `peer`'s pinned node ID is
+/// registered under another one: the peer added keys, so its node ID changed.
+///
+/// The peer still proves the pinned ID, so the pin keeps working. It stops working if the
+/// peer later drops a key the pinned ID was made from, which is why the entry should be
+/// updated. Does nothing for a peer without a pin.
+fn warn_when_pinned_by_an_earlier_id(peer: &mut RedialState, peer_registry: &PeerRegistry) {
+    let Some(NamedPeer {
+        node_id: Some(pinned),
+        ..
+    }) = &peer.name
+    else {
+        return;
+    };
+    if peer.warned_moved {
+        return;
+    }
+    let current = peer_registry
+        .native_connection_proving(pinned)
+        .and_then(|proof| proof.moved_to);
+    let (Some(pinned), Some(current)) = (
+        pinned.node_id(),
+        current.as_ref().and_then(ZakuraPeerId::node_id),
+    ) else {
+        return;
+    };
+    peer.warned_moved = true;
+    warn!(
+        %pinned,
+        %current,
+        "a network.unconditional_peers entry pins a peer by an earlier node ID; \
+         replace it with the peer's current node ID"
+    );
 }
 
 /// Returns the delay before the attempt that follows `attempts` attempts without a
@@ -425,7 +467,9 @@ fn warn_about_unpinned_names(names: &[UnconditionalPeerName], config: &Config) {
 /// A name pinned to a node ID is dialed the same way, but its address is only exempt
 /// while a native connection proves the ID, see [`exempt_proven_address`], and its peer
 /// only counts as connected then, see [`is_peer_connected`]. A dial to it that ends in a
-/// legacy connection cannot prove the ID, so Zakura closes it instead of keeping it.
+/// legacy connection cannot prove the ID, so Zakura closes it instead of keeping it. A
+/// peer that added keys since it was pinned still proves the pinned ID, and Zakura asks
+/// once for the entry to be updated, see [`warn_when_pinned_by_an_earlier_id`].
 ///
 /// An attempt that does not lead to a lasting connection doubles the peer's redial
 /// delay, from [`constants::MIN_UNCONDITIONAL_PEER_REDIAL_DELAY`] up to
@@ -512,6 +556,7 @@ where
             connected_since: None,
             dialing: None,
             warned_unproven: false,
+            warned_moved: false,
         })
         .collect();
 
@@ -744,6 +789,7 @@ where
 
                 for (index, peer) in peers.iter_mut().enumerate() {
                     exempt_proven_address(peer, &peer_registry, &config);
+                    warn_when_pinned_by_an_earlier_id(peer, &peer_registry);
 
                     if peer.is_attempting {
                         continue;
@@ -804,5 +850,60 @@ where
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pinned_peer(pin: &ZakuraPeerId) -> RedialState {
+        RedialState {
+            name: Some(NamedPeer {
+                index: 0,
+                name: "peer.example.com".into(),
+                port: 18233,
+                node_id: Some(pin.clone()),
+            }),
+            addr: None,
+            next_attempt: Instant::now(),
+            attempts: 0,
+            is_attempting: false,
+            has_attempted: false,
+            connected_since: None,
+            dialing: None,
+            warned_unproven: false,
+            warned_moved: false,
+        }
+    }
+
+    /// The warning that asks for a pin's new node ID is due only while a connection
+    /// registered under another ID proves the pin, and only once.
+    #[test]
+    fn a_pin_by_an_earlier_node_id_is_reported_once() {
+        let node = |byte: u8| zakura_quic::NodeId::from_bytes(&[byte; 32]);
+        let id = |byte: u8| ZakuraPeerId::from_node_id(node(byte));
+        let registry = PeerRegistry::default();
+        let mut peer = pinned_peer(&id(1));
+
+        warn_when_pinned_by_an_earlier_id(&mut peer, &registry);
+        assert!(!peer.warned_moved, "no connection proves the pin");
+
+        // A peer that proved another earlier ID, and the pinned peer under its own ID.
+        registry.register_native_connection(id(3), 1, None, &[node(4)]);
+        registry.register_native_connection(id(1), 2, None, &[]);
+        warn_when_pinned_by_an_earlier_id(&mut peer, &registry);
+        assert!(!peer.warned_moved, "the pin names the peer's current ID");
+        registry.deregister_native_connection(&id(1), 2);
+
+        registry.register_native_connection(id(2), 3, None, &[node(1)]);
+        warn_when_pinned_by_an_earlier_id(&mut peer, &registry);
+        assert!(peer.warned_moved);
+
+        // An entry without a pin has nothing to report.
+        let mut unpinned = pinned_peer(&id(1));
+        unpinned.name.as_mut().expect("a named peer").node_id = None;
+        warn_when_pinned_by_an_earlier_id(&mut unpinned, &registry);
+        assert!(!unpinned.warned_moved);
     }
 }

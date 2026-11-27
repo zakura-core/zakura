@@ -4018,6 +4018,8 @@ async fn zip234_mining_rpcs_include_the_reissuance_bonus() {
                     internal_miner: true,
                     optimistic_block_inventory: true,
                     miner_mesh: false,
+                    miner_mesh_gateways: Vec::new(),
+                    miner_mesh_template_nodes: Vec::new(),
                 },
                 Default::default(),
                 "0.0.1",
@@ -4607,6 +4609,8 @@ async fn gbt_with(net: Network, addr: ZcashAddress) {
         internal_miner: true,
         optimistic_block_inventory: true,
         miner_mesh: false,
+        miner_mesh_gateways: Vec::new(),
+        miner_mesh_template_nodes: Vec::new(),
     };
 
     // nu5 block height
@@ -5845,6 +5849,8 @@ async fn rpc_getdifficulty() {
         internal_miner: true,
         optimistic_block_inventory: true,
         miner_mesh: false,
+        miner_mesh_gateways: Vec::new(),
+        miner_mesh_template_nodes: Vec::new(),
     };
 
     // nu5 block height

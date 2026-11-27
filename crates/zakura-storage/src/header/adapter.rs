@@ -244,6 +244,12 @@ impl EnginePort {
     }
 
     /// Locks full state. Only a holder of the engine lock may take it.
+    ///
+    /// Bind the guard to a local declared after the engine guard, so it
+    /// drops first. Left as a block's tail temporary, it outlives the engine
+    /// guard, whose drop is a preemption point. A task the scheduler runs
+    /// there takes the engine lock and blocks the run's only thread on this
+    /// std lock. [`Self::views`] has the same rule.
     fn full_state(&self) -> StdMutexGuard<'_, VerifiedChain> {
         self.full_state
             .lock()

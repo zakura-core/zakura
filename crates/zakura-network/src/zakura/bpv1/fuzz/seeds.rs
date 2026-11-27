@@ -349,7 +349,7 @@ fn block_seeds() -> Vec<Bpv1Seed> {
                 &[
                     (BLOCK_META, 0x05, 0),
                     (BLOCK_HEADER, 1, 0),
-                    (BLOCK_UNKNOWN_PARENT, 0, 0),
+                    (BLOCK_UNKNOWN_PARENT, 0x08, 0),
                     (BLOCK_PARENT, 0, 0),
                     (BLOCK_META, 0x09, 0),
                     (BLOCK_HEADER, 1, 1),

@@ -4054,7 +4054,11 @@ fn update_existing_entry(
         entry.source = metadata.source;
     }
     entry.is_static |= metadata.is_static;
-    entry.last_seen = metadata.last_seen;
+    entry.last_seen = if same_sequence {
+        entry.last_seen.max(metadata.last_seen)
+    } else {
+        metadata.last_seen
+    };
 
     // Confirmation attaches to addresses, not to the node identity: a later
     // record keeps the confirmed addresses it still lists, and an import adds
@@ -8324,6 +8328,23 @@ mod tests {
         let mut reloaded = ZakuraDiscoveryBook::default();
         let outcome = reloaded.import_persisted_entries(file.load(), NOW, &context());
         assert_eq!((outcome.added, outcome.rejected), (0, 1));
+    }
+
+    #[test]
+    fn restoring_a_saved_peer_preserves_a_newer_live_sighting() {
+        let mut book = ZakuraDiscoveryBook::default();
+        let record = signed_record_with(1, service(9), test_addr(9));
+        let node_id = record.body.node_id();
+        import_hello(&mut book, record.clone(), NOW).unwrap();
+        let saved = book.persisted_entries();
+
+        let later = NOW + 1;
+        let mut reloaded = ZakuraDiscoveryBook::default();
+        import_hello(&mut reloaded, record, later).unwrap();
+        let outcome = reloaded.import_persisted_entries(saved, later, &context());
+
+        assert_eq!(outcome.metadata_updated, 1);
+        assert_eq!(reloaded.get(&node_id).unwrap().last_seen(), later);
     }
 
     /// The saver asks the book for only the entries the file keeps. That

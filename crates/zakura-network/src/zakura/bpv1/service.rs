@@ -332,6 +332,11 @@ impl SharedNode {
         let step = {
             let mut table = self.lock_table();
             let step = table.step(Instant::now(), input);
+            // Native block sync reads the window when it reacts to a header,
+            // so the window moves before the step's outputs run.
+            if let Some(window) = table.take_window_change() {
+                self.fallback.publish_window(window);
+            }
             metrics::gauge!("zakura.p2p.bpv1.pending_meta.count")
                 .set(table.pending_meta_len() as f64);
             metrics::gauge!("zakura.p2p.bpv1.path.entries").set(table.paths().len() as f64);
@@ -1048,6 +1053,7 @@ impl Service for Bpv1Service {
             if let Some(prev) = sessions.insert(peer_node, live) {
                 prev.cancel.cancel();
             }
+            self.node.fallback.set_live(true);
             (session_gen, snapshot)
         };
 
@@ -1091,6 +1097,7 @@ impl Service for Bpv1Service {
             if let Some(sess) = sessions.remove(&peer_node) {
                 sess.cancel.cancel();
             }
+            self.node.fallback.set_live(!sessions.is_empty());
         }
     }
 }
@@ -2128,6 +2135,7 @@ async fn run_peer_routine(
             .is_some_and(|s| s.conn_id == conn_id && s.session_gen == session_gen)
         {
             sessions.remove(&peer_node);
+            node.fallback.set_live(!sessions.is_empty());
         }
     }
     // `SessionEnded` releases every claim and pending push of this session,

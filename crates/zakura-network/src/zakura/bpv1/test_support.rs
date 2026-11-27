@@ -425,8 +425,9 @@ pub(super) fn admit_meta(
             rng_seed: 7,
         },
     );
+    assert_claim_precedes_admission(&s1, block_id);
     assert!(s3.events.contains(&BlockEvent::BlockAdmitted { block_id }));
-    assert_claim_precedes_publication(&s3, block_id);
+    assert_claim_extends_before_publication(&s3, block_id);
     table.assert_invariants();
     s3
 }
@@ -453,20 +454,36 @@ pub(super) fn commit_work(step: &BlockStep) -> WorkId {
         .expect("the step verifies a commitment")
 }
 
-/// 06 §6: BPv1 claims the body before it publishes `BlockAdmitted`, so native
-/// block sync never sees an admitted body unclaimed.
-fn assert_claim_precedes_publication(step: &BlockStep, block_id: block::Hash) {
+/// 06 §6: BPv1 claims the body before headerchain sees the header, so native
+/// block sync never sees an eligible header with its body unclaimed.
+pub(super) fn assert_claim_precedes_admission(step: &BlockStep, block_id: block::Hash) {
     let position = |want: fn(&BlockOutput, block::Hash) -> bool| {
         step.outputs.iter().position(|o| want(o, block_id))
     };
     let claim =
         position(|o, id| matches!(o, BlockOutput::ClaimBody { block_id, .. } if *block_id == id))
             .expect("admission claims the body");
+    let admit =
+        position(|o, id| matches!(o, BlockOutput::AdmitHeader { block_id, .. } if *block_id == id))
+            .expect("admission submits the header");
+    assert!(claim < admit, "the claim precedes header admission");
+}
+
+/// 06 §6: BPv1 extends its claim to the reconstruction deadline before it
+/// publishes `BlockAdmitted`.
+fn assert_claim_extends_before_publication(step: &BlockStep, block_id: block::Hash) {
+    let position = |want: fn(&BlockOutput, block::Hash) -> bool| {
+        step.outputs.iter().position(|o| want(o, block_id))
+    };
+    let extend = position(
+        |o, id| matches!(o, BlockOutput::ExtendBodyClaim { block_id, .. } if *block_id == id),
+    )
+    .expect("admission extends the body claim");
     let publish = position(|o, id| {
         matches!(o, BlockOutput::PublishAdmitted { admitted, .. } if admitted.block_id == id)
     })
     .expect("admission publishes BlockAdmitted");
-    assert!(claim < publish, "the claim precedes BlockAdmitted");
+    assert!(extend < publish, "the extension precedes BlockAdmitted");
 }
 
 // ============================================================================

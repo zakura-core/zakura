@@ -1189,11 +1189,12 @@ impl ReactorIO {
                     && !self
                         .registry
                         .has_outstanding_request(block.height, block.hash)
-                    && !self
-                        .startup
-                        .body_claims
-                        .as_ref()
-                        .is_some_and(|claims| claims.is_claimed(block.hash, now))
+                    // A BPv1 claim, or a reservation for BPv1's metadata,
+                    // holds the body. The claims' expiry timer and release
+                    // wake re-run this query.
+                    && !self.startup.body_claims.as_ref().is_some_and(|claims| {
+                        claims.defer_to_bpv1(block.hash, block.height.0, now)
+                    })
             })
             .collect();
 

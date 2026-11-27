@@ -567,6 +567,35 @@ jobs:
         env:
           RUSTFLAGS: --cfg zakura_sim
 
+  # The compile half of sim-build, so a `--cfg zakura_sim` break fails the PR
+  # instead of the next nightly. The main push run catches PRs that only break together.
+  sim-check:
+    name: zakura_sim check
+    needs: changes
+    if: vars.TEMPORARY_PR_CI != 'true' && (github.event_name == 'push' || github.event_name == 'merge_group' || (github.event_name == 'pull_request' && needs.changes.outputs.rust == 'true'))
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_TARGET_DIR: target/sim-check
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 #v2.0.1
+        with:
+          toolchain: stable
+          cache-shared-key: zakura-sim-check
+          cache-on-failure: true
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Check the simulator build
+        run: |
+          cargo check --locked -p zakura-rt -p zakura-scheduler -p zakura-sim -p zakura-storage -p zakura-quic --all-targets
+          cargo check --locked -p zakura-network --lib --tests
+        env:
+          RUSTFLAGS: --cfg zakura_sim
+
   # The scheduler switches coroutine stacks in unsafe code, so its tests also
   # run in release mode and under AddressSanitizer on Linux x86_64. Each mode
   # has its own target directory and cache key. The ASan build turns on

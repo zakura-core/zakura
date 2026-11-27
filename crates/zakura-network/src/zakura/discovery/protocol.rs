@@ -4174,9 +4174,9 @@ fn discovery_ordinary_cap(max_connections: usize, connection_headroom: usize) ->
 /// carries no address, the transport's outbound reserve (23 of the default
 /// 92) within that cap.
 ///
-/// No peer can dial such a node, so without the target it would fill its
-/// inbound share with dials too, each taking an inbound slot on a reachable
-/// peer. The target stays above the headroom, so discovery keeps a dial with
+/// Peers can't learn a dial address from such a record, so without the
+/// target the node would fill its inbound share with dials too, each taking
+/// an inbound slot on a reachable peer. The target stays above the headroom, so discovery keeps a dial with
 /// every bootstrap peer connected (see `min_budgeted_connections`).
 fn discovery_outbound_target(
     max_connections: usize,

@@ -78,9 +78,14 @@ pub struct NodeSpec {
     /// The verification slots its handle has, in place of the host's count.
     pub verification_slots: usize,
     /// The scripted peers, by distinct index, that it holds as static
-    /// bootstrap candidates and keeps dialing. An index no peer takes names
-    /// an address nobody listens on.
+    /// bootstrap candidates, which only its bootstrap dialer dials. An index
+    /// no peer takes names an address nobody listens on.
     pub static_candidates: Vec<usize>,
+    /// The scripted peers, by distinct index, that its book holds as static
+    /// entries without being bootstrap peers, so its candidate dialer dials
+    /// them. Left out of a serialized scenario when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub book_candidates: Vec<usize>,
     /// The peer limit of its `GetPeers`, in place of production's 32. Left
     /// out of a serialized scenario when unset, so saved ones keep their
     /// form.
@@ -128,6 +133,7 @@ pub fn spawn_node(
     dials: DialReporter,
     node: NodeHandle,
 ) {
+    let book_entries = bootstrap_peers(seed, &spec.book_candidates, peers);
     let bootstrap_peers = bootstrap_peers(seed, &spec.static_candidates, peers);
     let slots = spec.verification_slots;
     let peer_sample_limit = spec.peer_sample_limit;
@@ -191,6 +197,7 @@ pub fn spawn_node(
         },
         |endpoint, limits, handle| async move {
             insert_static_bootstrap_candidates(&handle, &bootstrap_peers).await;
+            insert_static_bootstrap_candidates(&handle, &book_entries).await;
             let mut tasks =
                 spawn_native_bootstrap_dialer(endpoint.clone(), bootstrap_peers, limits.clone());
             // A node with no custom services seeks none.
@@ -330,6 +337,7 @@ impl Default for WireScenario {
             node: NodeSpec {
                 verification_slots: 1,
                 static_candidates: Vec::new(),
+                book_candidates: Vec::new(),
                 peer_sample_limit: None,
             },
             peers: vec![discovering(PeerSpec::dialing(), DiscoveryScript::default())],
@@ -438,6 +446,7 @@ impl SavedPlan {
                 WireScenario {
                     node: NodeSpec {
                         static_candidates: vec![0],
+                        book_candidates: Vec::new(),
                         ..base.node
                     },
                     peers: vec![discovering(
@@ -1234,6 +1243,7 @@ pub fn composed_scenario(prefix: &[u8]) -> WireScenario {
         node: NodeSpec {
             verification_slots: 1 + usize::from(node & 3),
             static_candidates: if dials { vec![0] } else { Vec::new() },
+            book_candidates: Vec::new(),
             peer_sample_limit,
         },
         peers: vec![PeerSpec {

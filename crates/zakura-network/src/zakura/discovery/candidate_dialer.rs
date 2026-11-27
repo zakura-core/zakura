@@ -28,7 +28,6 @@ use zakura_rt::{
     time::Instant,
 };
 
-use super::bootstrap::SeedDialPolicy;
 use super::dialer::native_discovery_dial;
 use super::protocol::{DialAdmission, ZakuraDiscoveryDialCandidate, ZakuraDiscoveryHandle};
 use super::redial::ZAKURA_REDIAL_HEALTHY_CONNECTION;
@@ -137,9 +136,8 @@ pub(crate) fn spawn_native_discovery_dialer(
 }
 
 /// Seed the discovery book with the configured bootstrap peers as trusted static
-/// dial candidates, so the candidate dialer can dial them before any peer
-/// gossips a signed record for them. The bootstrap dialer decides when it
-/// stops ([`super::bootstrap`]).
+/// entries, before any peer gossips a signed record for them. Only the
+/// bootstrap dialer dials them ([`super::bootstrap`]).
 pub(crate) async fn insert_static_bootstrap_candidates(
     discovery: &ZakuraDiscoveryHandle,
     bootstrap_peers: &[String],
@@ -472,9 +470,9 @@ impl Future for DiscoveryDialWorker {
 /// free ordinary connection slots, since each dial holds one.
 ///
 /// `preferred` is what this round's preferred pass already claimed, and the
-/// preferred set's members are left to that pass. Seeds are dialed only as
-/// far as the bootstrap dialer's [`SeedDialPolicy`] allows, so a released
-/// seed isn't dialed again.
+/// preferred set's members are left to that pass. Seeds are left to the
+/// bootstrap dialer ([`ZakuraEndpoint::seed_ids`]), so only it decides how
+/// many seed connections this node holds.
 async fn admit_dial_round(
     endpoint: &ZakuraEndpoint,
     discovery: &ZakuraDiscoveryHandle,
@@ -500,14 +498,8 @@ async fn admit_dial_round(
     let supervisor = endpoint.supervisor();
     let in_flight_node_ids = state.in_flight_node_ids();
     let held_places = endpoint.held_places();
-    let seeds = endpoint.seed_dial_policy();
-    let mut routes = OrdinaryDialRoutes::new(
-        supervisor,
-        &held_places,
-        &seeds,
-        discovery.ordinary_connection_cap,
-        &in_flight_node_ids,
-    );
+    let seeds = endpoint.seed_ids();
+    let mut routes = OrdinaryDialRoutes::new(supervisor, &held_places, &seeds, &in_flight_node_ids);
     // One freed connection permits a replacement. The two spares are alternatives
     // for that slot, so each is checked against the same remaining address capacity.
     let replacement_slots = endpoint
@@ -528,7 +520,6 @@ async fn admit_dial_round(
         endpoint.supervisor(),
         &held_places,
         &seeds,
-        discovery.ordinary_connection_cap,
         &in_flight_node_ids,
     );
     let mut admitted = Vec::new();
@@ -561,14 +552,12 @@ async fn admit_dial_round(
 }
 
 /// An ordinary pass can use each current identity once, excluding preferred,
-/// registered and in-flight nodes, including their previously known
-/// identities, and seeds beyond what the [`SeedDialPolicy`] allows.
+/// seed, registered and in-flight nodes, including their previously known
+/// identities.
 struct OrdinaryDialRoutes<'a> {
     supervisor: crate::zakura::ZakuraSupervisorHandle,
     held: &'a crate::zakura::HeldPlaces,
-    seeds: &'a SeedDialPolicy,
-    /// How many more seeds this pass may take.
-    seed_room: usize,
+    seeds: &'a HashSet<NodeId>,
     moved: watch::Receiver<crate::zakura::transport::MovedNodeIds>,
     unavailable: HashSet<NodeId>,
 }
@@ -577,27 +566,15 @@ impl<'a> OrdinaryDialRoutes<'a> {
     fn new(
         supervisor: crate::zakura::ZakuraSupervisorHandle,
         held: &'a crate::zakura::HeldPlaces,
-        seeds: &'a SeedDialPolicy,
-        ordinary_cap: usize,
+        seeds: &'a HashSet<NodeId>,
         in_flight: &[NodeId],
     ) -> Self {
         let moved = supervisor.moved_node_ids();
-        let unavailable: HashSet<NodeId> = in_flight
+        let unavailable = in_flight
             .iter()
             .map(|id| moved.borrow().current(*id))
             .collect();
-        let seed_connections = seeds
-            .ids
-            .iter()
-            .filter(|id| {
-                unavailable.contains(*id)
-                    || supervisor.is_registered(&ZakuraPeerId::from_node_id(**id))
-            })
-            .count();
         Self {
-            seed_room: seeds
-                .seed_connection_cap(ordinary_cap)
-                .saturating_sub(seed_connections),
             supervisor,
             held,
             seeds,
@@ -616,11 +593,10 @@ impl<'a> OrdinaryDialRoutes<'a> {
     ) -> Option<(NodeAddr, Vec<IpAddr>)> {
         let moved = self.moved.borrow();
         let current = moved.current(candidate.node_id);
-        let seed = moved.under_either_id(candidate.node_id, |id| self.seeds.ids.contains(id));
         if self.unavailable.contains(&current)
-            || (seed && self.seed_room == 0)
             || moved.under_either_id(candidate.node_id, |id| {
                 self.held.members.contains(id)
+                    || self.seeds.contains(id)
                     || self
                         .supervisor
                         .is_registered(&ZakuraPeerId::from_node_id(*id))
@@ -641,9 +617,6 @@ impl<'a> OrdinaryDialRoutes<'a> {
             return None;
         }
         self.unavailable.insert(current);
-        if seed {
-            self.seed_room -= 1;
-        }
         Some((addr, ips))
     }
 }

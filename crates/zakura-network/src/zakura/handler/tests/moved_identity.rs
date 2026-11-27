@@ -526,7 +526,6 @@ async fn a_dial_answered_by_another_node_than_its_gateway_waits_for_an_ordinary_
     let [bootstrap_task]: [_; 1] = discovery::spawn_native_bootstrap_dialer(
         endpoint.clone(),
         vec![format!("{}@{}", seed.id, seed.direct[0])],
-        crate::UnconditionalPeers::default(),
         limits.clone(),
     )
     .try_into()

@@ -50,19 +50,14 @@ pub async fn insert_static_bootstrap_candidates(
     discovery::insert_static_bootstrap_candidates(discovery, bootstrap_peers).await;
 }
 
-/// Spawns the bootstrap dialer for `bootstrap_peers` on `endpoint`, with no
-/// pinned peers.
+/// Spawns one maintained `bootstrap_dial` task per bootstrap peer on
+/// `endpoint`.
 pub fn spawn_native_bootstrap_dialer(
     endpoint: ZakuraEndpoint,
     bootstrap_peers: Vec<String>,
     limits: ZakuraLocalLimits,
 ) -> Vec<JoinHandle<()>> {
-    discovery::spawn_native_bootstrap_dialer(
-        endpoint,
-        bootstrap_peers,
-        crate::UnconditionalPeers::default(),
-        limits,
-    )
+    discovery::spawn_native_bootstrap_dialer(endpoint, bootstrap_peers, limits)
 }
 
 /// Spawns the `discovery_dialer` task, which dials `discovery`'s

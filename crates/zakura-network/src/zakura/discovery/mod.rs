@@ -36,7 +36,6 @@ pub(crate) mod wire;
 mod wire_tests;
 
 pub(crate) use book_file::start_discovery_book_cache;
-pub(crate) use bootstrap::SeedDialPolicy;
 #[cfg(any(test, feature = "zakura-testkit"))]
 pub(crate) use candidate_dialer::run_native_discovery_dialer;
 pub(crate) use candidate_dialer::{

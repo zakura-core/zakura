@@ -723,12 +723,12 @@ async fn serving_sets_the_window_to_the_negotiated_shares() -> Result<(), BoxErr
                     accepted_capabilities: SIBLING.capability,
                     role: "responder",
                     direction: ServicePeerDirection::Inbound,
-                    opener: ConnectionOpener::Remote,
                     transcript_hash,
                     i_open_collision_winner: false,
                     conn: ZakuraConnTrace::without_peer(1),
                     control_handshake: None,
                     registration_report: None,
+                    connection_token: None,
                 },
             )
             .await
@@ -885,12 +885,12 @@ impl RawFixture {
                         accepted_capabilities: DATA.capability | SIBLING.capability,
                         role: "responder",
                         direction: ServicePeerDirection::Inbound,
-                        opener: ConnectionOpener::Remote,
                         transcript_hash,
                         i_open_collision_winner: false,
                         conn: ZakuraConnTrace::without_peer(1),
                         control_handshake: None,
                         registration_report: None,
+                        connection_token: None,
                     },
                 )
                 .await

@@ -1538,54 +1538,43 @@ async fn honest_candidates_fill_the_round_when_the_best_share_a_full_ip() {
     node.shutdown().await;
 }
 
-/// The round dials seeds up to half the ordinary slots while the bootstrap
-/// dialer allows them, and none once it excludes them, so a released seed
-/// isn't dialed again.
+/// The round leaves seeds to the bootstrap dialer, even when the book ranks
+/// them first.
 #[tokio::test]
-async fn the_round_dials_seeds_only_as_the_policy_allows() {
-    let mut limits = ZakuraLocalLimits::from_config(&crate::Config::default());
-    limits.max_connections = 8; // Four ordinary slots, so room for two seeds.
+async fn the_round_never_dials_seeds() {
     let node = crate::zakura::testkit::ZakuraTestNode::builder(9216)
-        .limits(limits)
         .spawn()
         .await
         .expect("dialer spawns");
-    assert_eq!(node.discovery().ordinary_connection_cap, 4);
     let ranked = insert_ranked_static_candidates(
         &node.discovery(),
         1,
-        (1..=4)
+        (1..=3)
             .map(|host| vec![SocketAddr::new(IpAddr::from([198, 51, 100, host]), 8233)])
             .collect(),
     )
     .await;
-    let other = *ranked.last().expect("four candidates");
-    let round = |excluded: bool| {
-        let node = &node;
-        let ranked = &ranked;
-        async move {
-            node.endpoint().set_seed_dial_policy(SeedDialPolicy {
-                ids: ranked[..3].iter().copied().collect(),
-                excluded,
-            });
-            let mut state = CandidateDialerState::new(DIAL_BACKOFF);
-            admit_dial_round(
-                &node.endpoint(),
-                &node.discovery(),
-                &[],
-                &mut state,
-                RoundClaims::default(),
-                Instant::now(),
-            )
-            .await
-            .into_iter()
-            .map(|(attempt, _)| attempt.node_id)
-            .collect::<Vec<_>>()
-        }
-    };
+    node.endpoint()
+        .set_seed_ids(ranked[..2].iter().copied().collect());
 
-    assert_eq!(round(false).await, [ranked[0], ranked[1], other]);
-    assert_eq!(round(true).await, [other]);
+    let mut state = CandidateDialerState::new(DIAL_BACKOFF);
+    let admitted = admit_dial_round(
+        &node.endpoint(),
+        &node.discovery(),
+        &[],
+        &mut state,
+        RoundClaims::default(),
+        Instant::now(),
+    )
+    .await;
+
+    assert_eq!(
+        admitted
+            .iter()
+            .map(|(attempt, _)| attempt.node_id)
+            .collect::<Vec<_>>(),
+        ranked[2..],
+    );
     node.shutdown().await;
 }
 

@@ -1651,6 +1651,9 @@ impl PeerQueryReserve {
 pub struct ZakuraDiscoveryHandle {
     /// Ordinary slot budget shared by discovery scheduling and connection admission.
     pub(crate) ordinary_connection_cap: usize,
+    /// Ordinary outbound connections discovery dials up to. See
+    /// [`discovery_outbound_target`].
+    pub(crate) ordinary_outbound_target: usize,
     inner: Arc<AsyncMutex<DiscoveryState>>,
     connected: watch::Receiver<Vec<ZakuraPeerId>>,
     self_record: watch::Receiver<Arc<ZakuraNodeRecord>>,
@@ -1773,6 +1776,11 @@ impl ZakuraDiscoveryHandle {
             local.next_body(now_unix_secs, wall_clock_sequence, config.record_ttl),
             &signing_key,
         )?);
+        let ordinary_outbound_target = discovery_outbound_target(
+            config.max_zakura_connections,
+            config.discovery_connection_headroom,
+            self_record.body.direct_addrs.is_empty(),
+        );
         let (self_record_tx, self_record_rx) = watch::channel(self_record);
         let (peer_snapshot_tx, peer_snapshot_rx) =
             watch::channel(ServicePeerSnapshot::new(0, 0, config.peer_limits));
@@ -1784,6 +1792,7 @@ impl ZakuraDiscoveryHandle {
         let verification_context = state.validation_context(now_unix_secs);
         Ok(Self {
             ordinary_connection_cap,
+            ordinary_outbound_target,
             inner: Arc::new(AsyncMutex::new(state)),
             connected,
             self_record: self_record_rx,
@@ -4158,6 +4167,29 @@ fn connected_peer_node_ids(connected: &[ZakuraPeerId]) -> Vec<NodeId> {
 
 fn discovery_ordinary_cap(max_connections: usize, connection_headroom: usize) -> usize {
     max_connections.saturating_sub(connection_headroom)
+}
+
+/// Returns the ordinary outbound connections discovery dials up to: the soft
+/// cap of [`discovery_dial_slot_limit`], or for a node whose signed record
+/// carries no address, the transport's outbound reserve (23 of the default
+/// 92) within that cap.
+///
+/// No peer can dial such a node, so without the target it would fill its
+/// inbound share with dials too, each taking an inbound slot on a reachable
+/// peer. The target stays above the headroom, so discovery keeps a dial with
+/// every bootstrap peer connected (see `min_budgeted_connections`).
+fn discovery_outbound_target(
+    max_connections: usize,
+    connection_headroom: usize,
+    advertises_no_address: bool,
+) -> usize {
+    let soft_cap = discovery_ordinary_cap(max_connections, connection_headroom);
+    if !advertises_no_address {
+        return soft_cap;
+    }
+    let outbound_reserve =
+        max_connections - crate::zakura::transport::inbound_share(max_connections);
+    soft_cap.min(outbound_reserve.max(connection_headroom.saturating_add(1)))
 }
 
 /// Returns how many ordinary discovery dials may start.
@@ -11138,6 +11170,29 @@ mod tests {
         assert_eq!(discovery_dial_slot_limit(5, 1, 8, 2, 4), 1);
         assert_eq!(discovery_dial_slot_limit(6, 4, 8, 2, 4), 0);
         assert_eq!(discovery_dial_slot_limit(2, 0, 2, 4, 4), 0);
+    }
+
+    /// A node that advertises no address dials up to the outbound reserve,
+    /// and at the connection budget floor it keeps a dial with every
+    /// bootstrap peer connected. A node that advertises one keeps the soft cap.
+    #[test]
+    fn the_outbound_target_is_the_reserve_above_the_bootstrap_headroom() {
+        use crate::zakura::{
+            discovery::effective_discovery_connection_headroom, min_budgeted_connections,
+        };
+
+        assert_eq!(discovery_outbound_target(92, 9, false), 83);
+        assert_eq!(discovery_outbound_target(92, 9, true), 23);
+        assert_eq!(discovery_outbound_target(16, 4, true), 5);
+        assert_eq!(discovery_outbound_target(6, 4, true), 2);
+        for bootstrap_peers in [0, 3, 9, 20, 100] {
+            let floor = min_budgeted_connections(bootstrap_peers);
+            let headroom = effective_discovery_connection_headroom(bootstrap_peers);
+            assert!(
+                discovery_outbound_target(floor, headroom, true) > bootstrap_peers,
+                "{bootstrap_peers} bootstrap peers"
+            );
+        }
     }
 
     proptest::proptest! {

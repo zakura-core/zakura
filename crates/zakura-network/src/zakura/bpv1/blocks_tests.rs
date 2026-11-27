@@ -3589,14 +3589,7 @@ fn bpv1_90_a_committed_collecting_block_rebuilds_and_serves_every_part() {
     let t0 = Instant::now();
     pulled(&mut table, t0, block_id, &encoded.parts[0]);
 
-    let (step, work) = tip_rebuild(&mut table, t0, 1, block_id, block_id);
-    assert!(emits(&step, |o| matches!(
-        o,
-        BlockOutput::ReleaseBodyClaim {
-            reason: ClaimRelease::Committed,
-            ..
-        }
-    )));
+    let (_, work) = tip_rebuild(&mut table, t0, 1, block_id, block_id);
     assert_eq!(table.block_phase(&block_id), Some(BlockPhase::Rebuilding));
     assert_eq!(table.next_deadline(), None, "a rebuild arms no timer");
     let late = tick(
@@ -3623,6 +3616,13 @@ fn bpv1_90_a_committed_collecting_block_rebuilds_and_serves_every_part() {
         RebuildResult::Parts(encoded.parts.clone()),
     );
     assert_eq!(table.block_phase(&block_id), Some(BlockPhase::Done));
+    assert!(emits(&done, |o| matches!(
+        o,
+        BlockOutput::ReleaseBodyClaim {
+            reason: ClaimRelease::Committed,
+            ..
+        }
+    )));
     let never_received = encoded.parts.last().unwrap();
     assert_eq!(
         table.get_part(&block_id, never_received.index()),
@@ -3686,19 +3686,29 @@ fn bpv1_90_a_committed_body_that_mismatches_retires_without_faulting_a_peer() {
 }
 
 /// bpv1-90: another block took the height, so state holds no body for this
-/// one. It keeps collecting under its unmoved deadline, and a later tip
-/// starts no second rebuild.
+/// one. It keeps its body claim and collects under its unmoved deadline, so
+/// the claim's later release wakes block sync. A later tip starts no second
+/// rebuild.
 #[test]
 fn bpv1_90_a_block_state_lacks_keeps_collecting_and_rebuilds_once() {
     let (mut table, block_id, _) = rebuild_fixture(BlockConfig::for_profile(Profile::TINY), 0x92);
     let t0 = Instant::now();
-    let (_, work) = tip_rebuild(&mut table, t0, 1, block::Hash([0x9F; 32]), block_id);
+    let (step, work) = tip_rebuild(&mut table, t0, 1, block::Hash([0x9F; 32]), block_id);
+    let released = |o: &BlockOutput| matches!(o, BlockOutput::ReleaseBodyClaim { .. });
+    assert!(
+        !emits(&step, released),
+        "an unproven commit keeps the claim"
+    );
 
     rebuilt(&mut table, t0, work, block_id, RebuildResult::Missing);
     assert_eq!(table.block_phase(&block_id), Some(BlockPhase::Collecting));
     let (_, again) = tip_rebuild(&mut table, t0, 2, block::Hash([0x9E; 32]), block_id);
     assert_eq!(again, None);
-    tick(&mut table, t0 + RECONSTRUCTION_DEADLINE, &[]);
+    let late = tick(&mut table, t0 + RECONSTRUCTION_DEADLINE, &[]);
+    assert!(emits(&late, |o| matches!(
+        o,
+        BlockOutput::ReleaseBodyClaim { reason, .. } if *reason != ClaimRelease::Committed
+    )));
     assert_eq!(table.block_phase(&block_id), Some(BlockPhase::Fallback));
     table.assert_invariants();
 }

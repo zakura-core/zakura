@@ -3766,15 +3766,12 @@ impl BlockTable {
         block.rebuild_tried = true;
         // Outstanding `Want`s stay live, and the parts they deliver are
         // still stored, so a missing body loses none of them.
+        // The body claim stays until a rebuild proves the block committed: a
+        // fork at this height comes back `Missing`, and its later repair or
+        // fallback release then wakes block sync.
         for st in &mut block.stripes {
             st.claims.clear();
             st.incoming.clear();
-        }
-        if std::mem::take(&mut block.body_claimed) {
-            step.outputs.push(BlockOutput::ReleaseBodyClaim {
-                block_id,
-                reason: ClaimRelease::Committed,
-            });
         }
         step.outputs.push(BlockOutput::RebuildFromCommitted {
             work_id,
@@ -3850,6 +3847,12 @@ impl BlockTable {
             st.assemblable = st.source_held_count == coding.k;
         }
         block.phase = BlockPhase::Done;
+        if std::mem::take(&mut block.body_claimed) {
+            step.outputs.push(BlockOutput::ReleaseBodyClaim {
+                block_id,
+                reason: ClaimRelease::Committed,
+            });
+        }
         for (indices, push) in [(ready, false), (pushed, true)] {
             if !indices.is_empty() {
                 step.outputs.push(BlockOutput::PartReady {

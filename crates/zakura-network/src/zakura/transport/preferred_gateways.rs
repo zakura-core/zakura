@@ -1,14 +1,29 @@
 //! The mining gateways this node holds connection places for.
 //!
 //! Mining pools name their gateway in their coinbases by a [`GatewayId`], the
-//! first 20 bytes of its v2 node ID, and a mining node ranks those IDs by how
-//! many recent blocks name them. The node keeps up to
+//! first 20 bytes of its v2 node ID, and a node that prefers gateways (it
+//! mines or sets `mining.miner_mesh`) ranks those IDs by how many recent
+//! blocks name them. The node keeps up to
 //! [`MAX_PREFERRED_GATEWAYS`] connection places that ordinary peers cannot
 //! fill, for the highest-ranked gateways it can reach.
+//!
+//! The operator can also configure the node to always prefer a few IDs,
+//! whatever the blocks say. Those rank ahead of every gateway the blocks name,
+//! and a funded place stays reserved even while its peer is unreachable.
+//! Inbound callers still share the normal handshake limits.
 //!
 //! A ranked gateway ID names whichever node v2 networking knows with an ID
 //! that starts with it. When it knows two or more, it cannot tell which one
 //! the miners named, so it prefers none of them: the gateway is ambiguous.
+//!
+//! A node that adds a key has a new node ID, which starts with other bytes,
+//! while blocks go on naming the gateway by the earlier one. A connected node
+//! therefore also answers for the gateway ID of each earlier ID its
+//! handshake proved ([`ProvenNode`]), and keeps the gateway's place under the
+//! ID it has now. Two connected nodes that answer for one gateway make it
+//! ambiguous like two nodes that share its ID, so one key holder never fills
+//! more than the one place. A gateway stays ambiguous until the next ranking
+//! is applied, which resolves it again from the nodes connected then.
 //!
 //! This module only decides how many places are held and which gateways may
 //! fill them. The connection-slot checks in `handshake_counts` apply that
@@ -18,7 +33,7 @@ use zakura_chain::miner_mesh::GatewayId;
 use zakura_quic::NodeId;
 use zakura_rt::collections::{HashMap, HashSet};
 
-use super::GatewayMatch;
+use super::{GatewayMatch, ProvenNode};
 
 /// The most connection places a node holds for preferred gateways.
 pub const MAX_PREFERRED_GATEWAYS: usize = 10;
@@ -42,8 +57,8 @@ pub enum GatewayStanding {
     Dialing,
     /// Connected to this node.
     ///
-    /// Whatever its standing, a gateway that loses its last connection slot
-    /// counts as in [`Self::Backoff`] until the next published ranking.
+    /// When the named node loses its last slot, another connected owner
+    /// can take its place. Without one, an available gateway enters [`Self::Backoff`].
     Connected,
 }
 
@@ -86,13 +101,17 @@ pub enum GatewayPlace {
 
 /// One gateway of the ranking.
 ///
-/// A gateway that names a node always names one whose node ID starts with
-/// its gateway ID: the constructors derive the gateway ID from that node,
-/// and the updates change only the standing or check the prefix.
+/// A gateway that names a node names one whose node ID starts with its
+/// gateway ID, or a connected node whose handshake proved an earlier ID
+/// that does. The constructors derive the gateway ID from the node, and the
+/// updates change only the standing or check what the node answers for.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RankedGateway {
     gateway: GatewayId,
     blocks: u32,
+    /// The node prefers this ID whatever the blocks say, so it ranks ahead of
+    /// every other gateway and keeps a place while it is unreachable.
+    always_preferred: bool,
     resolution: GatewayResolution,
 }
 
@@ -103,18 +122,39 @@ impl RankedGateway {
         Self {
             gateway,
             blocks,
+            always_preferred: false,
             resolution: GatewayMatch::None,
+        }
+    }
+
+    /// A gateway ID the node always prefers, named in `blocks` recent blocks,
+    /// before any node with it is known.
+    pub fn always_preferred(gateway: GatewayId, blocks: u32) -> Self {
+        Self {
+            always_preferred: true,
+            ..Self::unresolved(gateway, blocks)
         }
     }
 
     /// The gateway that `node`'s gateway ID names, named in `blocks` recent
     /// blocks, resolved to `node` and reachable as `standing` says.
     pub fn resolved(node: NodeId, blocks: u32, standing: GatewayStanding) -> Self {
-        Self {
-            gateway: GatewayId::from_node_id(node.as_bytes()),
-            blocks,
-            resolution: GatewayMatch::One((node, standing)),
-        }
+        Self::unresolved(GatewayId::from_node_id(node.as_bytes()), blocks)
+            .resolved_as(node, standing)
+    }
+
+    /// Returns this gateway resolved to `node`, reachable as `standing` says.
+    ///
+    /// `node`'s ID starts with this gateway ID: [`Self::resolved`] derives the
+    /// gateway ID from the node, and `classify_gateways` resolves a gateway
+    /// only to a node it matched by that prefix.
+    pub(crate) fn resolved_as(mut self, node: NodeId, standing: GatewayStanding) -> Self {
+        debug_assert!(
+            self.gateway.is_prefix_of(node.as_bytes()),
+            "callers resolve a gateway only to a node whose ID starts with its gateway ID"
+        );
+        self.resolution = GatewayMatch::One((node, standing));
+        self
     }
 
     /// The ID the blocks name the gateway by.
@@ -125,6 +165,21 @@ impl RankedGateway {
     /// Recent blocks that name the gateway.
     pub fn blocks(&self) -> u32 {
         self.blocks
+    }
+
+    /// Whether the node prefers this ID whatever the blocks say.
+    pub fn is_always_preferred(&self) -> bool {
+        self.always_preferred
+    }
+
+    /// Configured IDs share the highest rank. Block counts rank only the
+    /// other gateways, so blocks cannot shift a configured reservation.
+    fn rank(&self) -> (bool, u32) {
+        if self.always_preferred {
+            (true, 0)
+        } else {
+            (false, self.blocks)
+        }
     }
 
     /// The node the gateway ID names, and how v2 networking can reach it.
@@ -167,6 +222,17 @@ impl RankedGateway {
         matches!(self.resolution, GatewayMatch::One((_, standing)) if standing.matched())
     }
 
+    /// Whether the gateway keeps a held place even while it is unreachable:
+    /// the node always prefers it, and it is not ambiguous.
+    fn keeps_its_place(&self) -> bool {
+        self.always_preferred && self.resolution != GatewayMatch::Several
+    }
+
+    /// Whether the gateway counts toward the hold.
+    fn counts_toward_hold(&self) -> bool {
+        self.keeps_its_place() || self.is_matched()
+    }
+
     /// The node the gateway names, when it is reachable now and so may fill
     /// a held place.
     fn available_node(&self) -> Option<NodeId> {
@@ -184,23 +250,88 @@ impl RankedGateway {
         }
     }
 
-    /// Returns this gateway once a connection has proved that it reaches
-    /// `node`.
+    /// Returns this gateway resolved against `owners`: the connected nodes
+    /// that TLS has proved and that answer for its gateway ID, under the ID
+    /// they have now or an earlier one.
     ///
-    /// When `node`'s ID starts with this gateway ID, a gateway that named no
-    /// node, or `node`, names `node` as connected, and one that named
-    /// another node becomes ambiguous. A node with another gateway ID changes
-    /// nothing.
-    pub(crate) fn connected_as(mut self, node: NodeId) -> Self {
-        if !self.gateway.is_prefix_of(node.as_bytes()) {
-            return self;
+    /// With no owner the gateway is unchanged, and with two or more it is
+    /// ambiguous. One owner connects it:
+    /// - a gateway that named no node, or the owner, names the owner as
+    ///   connected;
+    /// - so does a gateway that named the same node by another ID, which is
+    ///   an ID the owner had before or a node that an earlier connection
+    ///   resolved it to. While that ID still `holds_slot`, for a dial that
+    ///   no handshake has proved, the gateway is unchanged and the dial
+    ///   settles it;
+    /// - a gateway that named another node whose ID starts with the gateway
+    ///   ID becomes ambiguous.
+    fn owned_by(
+        mut self,
+        owners: GatewayMatch<ProvenNode<'_>>,
+        holds_slot: impl Fn(&NodeId) -> bool,
+    ) -> Self {
+        let owner = match owners {
+            GatewayMatch::None => return self,
+            GatewayMatch::Several => return self.into_ambiguous(),
+            GatewayMatch::One(owner) => owner,
+        };
+        let named = match self.nodes() {
+            GatewayMatch::None => None,
+            GatewayMatch::One(named) => Some(named),
+            GatewayMatch::Several => return self,
+        };
+        if let Some(named) = named.filter(|named| *named != owner.id()) {
+            // A named node with another prefix got here through a proof,
+            // so only the gateway's key holder could have put it there.
+            let same_key_holder = owner.had(&named) || !self.gateway.is_prefix_of(named.as_bytes());
+            if !same_key_holder {
+                return self.into_ambiguous();
+            }
+            if holds_slot(&named) {
+                return self;
+            }
         }
-        self.resolution = self
-            .nodes()
-            .with(node)
-            .map(|node| (node, GatewayStanding::Connected));
+        self.resolution = GatewayMatch::One((owner.id(), GatewayStanding::Connected));
         self
     }
+}
+
+/// Each gateway of `ranking` that `owners` change, by its index, resolved as
+/// [`RankedGateway::owned_by`] says.
+///
+/// `owners` are all the connected nodes TLS has proved. An owner answers for
+/// the gateway that its node ID names and for the gateway that each of its
+/// earlier IDs names. `holds_slot` says whether a node ID holds a connection
+/// slot.
+fn owner_updates<'a>(
+    ranking: &[RankedGateway],
+    owners: impl IntoIterator<Item = ProvenNode<'a>>,
+    holds_slot: impl Fn(&NodeId) -> bool,
+) -> Vec<(usize, RankedGateway)> {
+    // A node that does not mine ranks no gateway, and every authenticated
+    // claim comes through here.
+    if ranking.is_empty() {
+        return Vec::new();
+    }
+    let by_gateway: HashMap<GatewayId, usize> = ranking
+        .iter()
+        .enumerate()
+        .map(|(index, gateway)| (gateway.gateway, index))
+        .collect();
+    let mut owned: HashMap<usize, GatewayMatch<ProvenNode<'a>>> = HashMap::default();
+    for owner in owners {
+        for id in owner.ids() {
+            if let Some(&index) = by_gateway.get(&GatewayId::from_node_id(id.as_bytes())) {
+                let known = owned.entry(index).or_insert(GatewayMatch::None);
+                *known = known.with(owner);
+            }
+        }
+    }
+    owned
+        .into_iter()
+        .map(|(index, owners)| (index, ranking[index].owned_by(owners, &holds_slot)))
+        .filter(|(index, resolved)| ranking[*index] != *resolved)
+        .collect()
 }
 
 /// A discovery snapshot prepared before taking the connection admission lock.
@@ -227,15 +358,15 @@ impl FromIterator<RankedGateway> for GatewayRanking {
             // Ignore the snapshot's connection status. Only the admission lock can
             // tell which of the tied identities still owns an authenticated slot.
             candidates.sort_unstable_by(|a, b| {
-                b.blocks
-                    .cmp(&a.blocks)
+                b.rank()
+                    .cmp(&a.rank())
                     .then_with(|| a.gateway.cmp(&b.gateway))
             });
-            let cutoff = candidates[MAX_RANKED_GATEWAYS - 1].blocks;
+            let cutoff = candidates[MAX_RANKED_GATEWAYS - 1].rank();
             tied_at_cutoff.extend(
                 candidates
                     .drain(MAX_RANKED_GATEWAYS..)
-                    .take_while(|gateway| gateway.blocks == cutoff)
+                    .take_while(|gateway| gateway.rank() == cutoff)
                     .map(|gateway| (gateway.gateway, gateway)),
             );
         }
@@ -248,26 +379,47 @@ impl FromIterator<RankedGateway> for GatewayRanking {
 
 impl GatewayRanking {
     /// At publication, look up only live owners among the tied overflow entries:
-    /// a tied entry joins, once, when an authenticated owner has its gateway ID
-    /// and the entry names no node or that owner. Publication then resolves it
+    /// a tied entry joins, once, when an authenticated owner answers for its
+    /// gateway ID and the entry names no node, that owner, or an ID the owner
+    /// had before. Publication then resolves it
     /// with the owners like every other gateway. Entries below the cutoff score
     /// cannot advance even if they authenticated.
     pub(super) fn candidates<'a>(
         &self,
-        authenticated: impl Iterator<Item = &'a NodeId>,
+        owners: impl Iterator<Item = ProvenNode<'a>>,
     ) -> Vec<RankedGateway> {
         let mut candidates = self.candidates.clone();
         if !self.tied_at_cutoff.is_empty() {
             let mut joined: HashSet<GatewayId> = HashSet::default();
-            candidates.extend(authenticated.filter_map(|node| {
+            let answered = owners.flat_map(|owner| owner.ids().map(move |id| (owner, id)));
+            candidates.extend(answered.filter_map(|(owner, id)| {
                 self.tied_at_cutoff
-                    .get(&GatewayId::from_node_id(node.as_bytes()))
-                    .filter(|gateway| gateway.nodes().with(*node) == GatewayMatch::One(*node))
+                    .get(&GatewayId::from_node_id(id.as_bytes()))
+                    .filter(|gateway| match gateway.nodes() {
+                        GatewayMatch::None => true,
+                        GatewayMatch::One(named) => named == owner.id() || owner.had(&named),
+                        GatewayMatch::Several => false,
+                    })
                     .filter(|gateway| joined.insert(gateway.gateway))
                     .copied()
             }));
         }
         candidates
+    }
+
+    /// Resolves `candidates` against `owners`, all the connected nodes TLS
+    /// has proved, as [`RankedGateway::owned_by`] says. An owner that
+    /// connected after discovery's snapshot resolves the gateways it answers
+    /// for, tied at the cutoff or not. `holds_slot` says whether a node ID
+    /// holds a connection slot.
+    pub(super) fn connect_owners<'a>(
+        candidates: &mut [RankedGateway],
+        owners: impl Iterator<Item = ProvenNode<'a>>,
+        holds_slot: impl Fn(&NodeId) -> bool,
+    ) {
+        for (index, resolved) in owner_updates(candidates, owners, holds_slot) {
+            candidates[index] = resolved;
+        }
     }
 }
 
@@ -281,28 +433,39 @@ pub struct PreferredGateways {
     ranking: Vec<RankedGateway>,
     /// The hold's ceiling, at most [`MAX_PREFERRED_GATEWAYS`].
     hold_limit: usize,
-    /// The places held: the ceiling, or the matched gateways when fewer.
+    /// The places held: the ceiling, or the matched gateways and the ones the
+    /// node always prefers when fewer.
     hold: usize,
     /// The available gateways that fill the held places, in rank order.
     set: Vec<NodeId>,
+    /// Rank-order choices to retry when an ordinary inbound place frees.
+    deferred: Option<Vec<NodeId>>,
 }
 
 impl PreferredGateways {
     /// Forms the preferred set from `ranking`, with at most `hold_limit`
     /// additional places funded for gateways.
     ///
-    /// Gateways are ranked by block count, highest first. Within one count a
-    /// connected gateway comes first, so a tie at the cutoff keeps the
-    /// gateway already connected from round to round; other ties keep the
-    /// order of `ranking`. A gateway listed twice keeps its first entry.
+    /// The gateways the node always prefers rank first, then the others by
+    /// block count, highest first. Within one rank a connected gateway comes
+    /// first, so a tie at the cutoff keeps the gateway already connected from
+    /// round to round; other ties keep the order of `ranking`. A gateway
+    /// listed twice keeps its first entry.
     ///
     /// Of a ranking longer than [`MAX_RANKED_GATEWAYS`], only that many are
-    /// kept: the highest block counts, then connected gateways, then the
-    /// lowest gateway ID bytes.
+    /// kept: the highest ranks, then connected gateways, then the lowest
+    /// gateway ID bytes.
     ///
-    /// The hold is the matched gateways, up to the ceiling, so a gateway in
-    /// backoff still counts toward the shared hold. The set is the available
-    /// gateways, in rank order, up to the hold.
+    /// The hold is the matched gateways and the ones the node always prefers,
+    /// up to the ceiling, so a gateway in backoff still counts toward the
+    /// shared hold. The set is the available gateways, in rank order, up to
+    /// the hold. A gateway the node always prefers keeps its place in that
+    /// order even while it is unreachable, so no lower gateway fills it.
+    /// An unreachable one costs at most that one place. They take places
+    /// first, so when `hold_limit` is no
+    /// more than their number, as when a small budget funds fewer than the
+    /// ten places the default budget funds, no ranked gateway gets one.
+    /// Multiple IDs proved by the same node share one place.
     pub fn form(ranking: impl IntoIterator<Item = RankedGateway>, hold_limit: usize) -> Self {
         Self::form_with_incumbents(unique_gateways(ranking), hold_limit, &[])
     }
@@ -316,7 +479,7 @@ impl PreferredGateways {
         let priority = |gateway: &RankedGateway| {
             let connected = gateway.connected_node();
             (
-                gateway.blocks,
+                gateway.rank(),
                 connected.is_some(),
                 connected.is_some_and(|node| incumbents.contains(&node)),
             )
@@ -332,22 +495,129 @@ impl PreferredGateways {
         // A stable sort, so equal gateways keep the order they were given.
         ranking.sort_by_key(|gateway| std::cmp::Reverse(priority(gateway)));
         let hold_limit = hold_limit.min(MAX_PREFERRED_GATEWAYS);
-        let matched = ranking
+        let mut matched: HashSet<NodeId> = HashSet::default();
+        let mut unresolved = 0;
+        for gateway in ranking
             .iter()
-            .filter(|gateway| gateway.is_matched())
-            .count();
-        let hold = hold_limit.min(matched);
-        let set = ranking
-            .iter()
-            .filter_map(RankedGateway::available_node)
-            .take(hold)
-            .collect();
+            .filter(|gateway| gateway.counts_toward_hold())
+        {
+            if let Some(node) = gateway.node() {
+                matched.insert(node);
+            } else {
+                unresolved += 1;
+            }
+        }
+        let hold = hold_limit.min(matched.len() + unresolved);
+        let set = Self::members(&ranking, hold);
         Self {
             ranking,
             hold_limit,
             hold,
             set,
+            deferred: None,
         }
+    }
+
+    /// Lets the next ranked gateway take a place while a dialable member waits
+    /// for its rollback probe. A waiting gateway still contributes to the hold.
+    pub(super) fn defer_dials(&mut self, waiting: impl Fn(NodeId) -> bool) -> bool {
+        let mut changed = false;
+        for gateway in &mut self.ranking {
+            if let GatewayMatch::One((node, GatewayStanding::Dialable)) = gateway.resolution() {
+                if waiting(node) {
+                    *gateway = gateway.with_standing(GatewayStanding::Backoff);
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            // Only dialable entries moved to backoff. The ordering, including
+            // connected tie breakers, and the number of matched gateways stay.
+            self.set = Self::members(&self.ranking, self.hold);
+            self.deferred = None;
+        }
+        changed
+    }
+
+    /// Retains eligible inbound incumbents when moving them to ordinary slots
+    /// would exceed the inbound share. The ranking and TLS ownership stay current.
+    pub(super) fn preserve_inbound_places(
+        &mut self,
+        incumbents: &[NodeId],
+        required: usize,
+        inbound: impl Fn(&NodeId) -> bool,
+    ) {
+        if required == 0 {
+            return;
+        }
+        let reserved = self.set.iter().filter(|node| inbound(node)).count();
+        let mut needed = required.saturating_sub(reserved);
+        if needed == 0 {
+            return;
+        }
+        let desired = self.set.clone();
+        // Prefer the highest-ranked eligible incumbent and displace the
+        // lowest-ranked member whose place protects no inbound connection.
+        for node in self
+            .ranking
+            .iter()
+            .filter_map(RankedGateway::available_node)
+        {
+            if !incumbents.contains(&node) || self.set.contains(&node) || !inbound(&node) {
+                continue;
+            }
+            let Some(index) = self.set.iter().rposition(|member| !inbound(member)) else {
+                break;
+            };
+            self.set[index] = node;
+            needed -= 1;
+            if needed == 0 {
+                break;
+            }
+        }
+        if self.set != desired {
+            self.set.sort_by_key(|node| {
+                self.ranking
+                    .iter()
+                    .position(|g| g.available_node() == Some(*node))
+            });
+            self.deferred = Some(desired);
+        }
+    }
+
+    /// Restores the desired members and returns the incumbents to check
+    /// again after a release. An ordinary release usually has nothing to do.
+    pub(super) fn retry_deferred(&mut self) -> Option<Vec<NodeId>> {
+        let desired = self.deferred.take()?;
+        Some(std::mem::replace(&mut self.set, desired))
+    }
+
+    /// The nodes of the available gateways in `ranking`, in its order and
+    /// each once, up to `hold` of them.
+    fn members(ranking: &[RankedGateway], hold: usize) -> Vec<NodeId> {
+        let mut set = Vec::with_capacity(hold);
+        let mut reserved: HashSet<NodeId> = HashSet::default();
+        let mut places = 0;
+        for gateway in ranking {
+            if let Some(node) = gateway.node() {
+                if reserved.contains(&node) {
+                    if gateway.available_node().is_some() && !set.contains(&node) {
+                        set.push(node);
+                    }
+                    continue;
+                }
+            }
+            if places == hold || (gateway.available_node().is_none() && !gateway.keeps_its_place())
+            {
+                continue;
+            }
+            places += 1;
+            if let Some(node) = gateway.node() {
+                reserved.insert(node);
+                set.extend(gateway.available_node());
+            }
+        }
+        set
     }
 
     /// The connection places held for the preferred set.
@@ -355,8 +625,18 @@ impl PreferredGateways {
         self.hold
     }
 
-    /// The preferred set, in rank order. It never has more members than
-    /// [`Self::hold`].
+    /// How many ranked gateways are ambiguous. A connection can make a
+    /// gateway ambiguous and only a new ranking resolves it again, so a
+    /// higher count after a proof means the proof disputed a gateway.
+    pub(super) fn ambiguous(&self) -> usize {
+        self.ranking
+            .iter()
+            .filter(|gateway| gateway.resolution == GatewayMatch::Several)
+            .count()
+    }
+
+    /// The preferred set, in rank order, each node once. It never has more
+    /// members than [`Self::hold`].
     pub fn set(&self) -> &[NodeId] {
         &self.set
     }
@@ -368,6 +648,9 @@ impl PreferredGateways {
 
     /// Every ranked gateway once, in rank order, with its place. A ranking
     /// keeps at most 256 gateways.
+    ///
+    /// A gateway the node always prefers keeps a held place whatever its
+    /// place reads, unless it is ambiguous.
     pub(crate) fn places(&self) -> impl Iterator<Item = (&RankedGateway, GatewayPlace)> + '_ {
         self.ranking.iter().map(|gateway| {
             let place = match gateway.resolution {
@@ -400,22 +683,29 @@ impl PreferredGateways {
         }
     }
 
-    /// The set re-formed once a connection has proved that it reaches
-    /// `node`; `None` when nothing changes.
+    /// The set re-formed once connections have proved `owners`, all the
+    /// connected nodes TLS has proved; `None` when nothing changes.
     ///
-    /// This is where a connection resolves a gateway: the gateway that
-    /// `node`'s gateway ID names becomes connected as `node`, or ambiguous
-    /// when it named another node, as [`RankedGateway::connected_as`] says.
-    /// It applies when the gateway already owns a preferred place too, so
+    /// This is where a connection resolves a gateway: each gateway an owner
+    /// answers for, under its ID now or an earlier one, becomes connected as
+    /// that owner, or ambiguous, as [`RankedGateway::owned_by`] says.
+    /// `holds_slot` says whether a node ID holds a connection slot. It
+    /// applies when the gateway already owns a preferred place too, so
     /// later callers see its standing in cutoff ties.
-    pub(super) fn with_connected(&self, node: &NodeId) -> Option<Self> {
-        let gateway_id = GatewayId::from_node_id(node.as_bytes());
-        let index = self
-            .ranking
-            .iter()
-            .position(|gateway| gateway.gateway == gateway_id)?;
-        let updated = self.ranking[index].connected_as(*node);
-        self.with_updated(index, updated)
+    pub(super) fn with_owners<'a>(
+        &self,
+        owners: impl IntoIterator<Item = ProvenNode<'a>>,
+        holds_slot: impl Fn(&NodeId) -> bool,
+    ) -> Option<Self> {
+        let updates = owner_updates(&self.ranking, owners, holds_slot);
+        if updates.is_empty() {
+            return None;
+        }
+        let mut ranking = self.ranking.clone();
+        for (index, resolved) in updates {
+            ranking[index] = resolved;
+        }
+        Some(Self::form(ranking, self.hold_limit))
     }
 
     /// The set re-formed with `node` being dialed, once it keeps only an
@@ -427,42 +717,60 @@ impl PreferredGateways {
         })
     }
 
-    /// The set re-formed with `node` in backoff, once it has lost its last
-    /// connection slot; `None` when no gateway names `node`, or it is
-    /// unmatched or already in backoff.
-    ///
-    /// A gateway that loses its last connection slot counts as in backoff
-    /// until the next published ranking. Like a gateway whose dial failed,
-    /// it still counts toward the hold and leaves the set so the next
-    /// available gateway may fill it, and may still call back in.
-    pub(super) fn with_released(&self, node: &NodeId) -> Option<Self> {
-        self.with_standing_of(node, GatewayStanding::Backoff, GatewayStanding::available)
+    /// Recounts a gateway after its named node releases its last slot. A
+    /// remaining owner can now take a place that was held by an in-flight
+    /// dial. An available gateway without an owner goes into backoff.
+    pub(super) fn with_released<'a>(
+        &self,
+        node: &NodeId,
+        owners: impl Iterator<Item = ProvenNode<'a>>,
+        holds_slot: impl Fn(&NodeId) -> bool,
+    ) -> Option<Self> {
+        if !self
+            .ranking
+            .iter()
+            .any(|gateway| gateway.node() == Some(*node))
+        {
+            return None;
+        }
+        let mut ranking = self.ranking.clone();
+        for gateway in &mut ranking {
+            if gateway.available_node() == Some(*node) {
+                *gateway = gateway.with_standing(GatewayStanding::Backoff);
+            }
+        }
+        GatewayRanking::connect_owners(&mut ranking, owners, holds_slot);
+        (ranking != self.ranking)
+            .then(|| Self::form_with_incumbents(ranking, self.hold_limit, &self.set))
     }
 
-    /// The set re-formed with the gateway that already names `node` in
-    /// `standing`, when its current standing passes `applies`.
+    /// The set re-formed with every gateway that already names `node` in
+    /// `standing`, when its current standing passes `applies`. `None` when
+    /// that changes nothing.
     fn with_standing_of(
         &self,
         node: &NodeId,
         standing: GatewayStanding,
         applies: impl Fn(GatewayStanding) -> bool,
     ) -> Option<Self> {
-        let index = self.ranking.iter().position(|gateway| {
+        let names_node = |gateway: &RankedGateway| {
             matches!(gateway.resolution, GatewayMatch::One((named, current))
                 if named == *node && applies(current))
-        })?;
-        let updated = self.ranking[index].with_standing(standing);
-        self.with_updated(index, updated)
-    }
-
-    /// The set re-formed with the gateway at `index` replaced by `updated`;
-    /// `None` when that changes nothing.
-    fn with_updated(&self, index: usize, updated: RankedGateway) -> Option<Self> {
-        if self.ranking[index] == updated {
+        };
+        if !self.ranking.iter().any(names_node) {
             return None;
         }
-        let mut ranking = self.ranking.clone();
-        ranking[index] = updated;
+        let ranking: Vec<_> = self
+            .ranking
+            .iter()
+            .map(|gateway| {
+                if names_node(gateway) {
+                    gateway.with_standing(standing)
+                } else {
+                    *gateway
+                }
+            })
+            .collect();
         Some(Self::form(ranking, self.hold_limit))
     }
 }

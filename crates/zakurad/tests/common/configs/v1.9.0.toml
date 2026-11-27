@@ -63,6 +63,8 @@ tx_cost_limit = 80000000
 [mining]
 internal_miner = false
 miner_mesh = false
+miner_mesh_gateways = []
+miner_mesh_template_nodes = []
 optimistic_block_inventory = true
 
 [network]

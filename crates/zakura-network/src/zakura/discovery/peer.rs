@@ -25,27 +25,27 @@ use std::{sync::Arc, time::Duration};
 
 use zakura_quic::NodeId;
 use zakura_rt::sync::{CancellationToken, Mutex, MutexGuard, Notify, PoisonError};
+use zakura_rt::time::Instant;
 
+#[cfg(test)]
+pub(super) use state::ExchangeProgress;
 #[cfg(any(test, zakura_sim))]
 pub use state::DISCOVERY_INITIAL_EXCHANGE_TIMEOUT;
+pub(super) use state::DISCOVERY_ONLY_EXCHANGE_BUDGET;
 use state::{
     Close, CloseReason, InitialWait, Ownership, PeerInput, PeerOutput, PeerState, SessionCharge,
 };
-#[cfg(test)]
-pub(super) use state::{ExchangeProgress, DISCOVERY_ANSWER_WRITE_DEADLINE};
 
 use super::{
-    protocol::{
-        DiscoveryMessage, GetPeers, GetServices, ZakuraDiscoveryHandle, ZakuraNodeRecord,
-        MAX_DISCOVERY_RECORDS_PER_RESPONSE,
-    },
+    protocol::{DiscoveryMessage, GetServices, ZakuraDiscoveryHandle, ZakuraNodeRecord},
     requester::{AdmittedAnswer, Queries, QueryUnsent},
     service::{DiscoveryPeerSession, SessionSlot},
     serving::AnswersWritten,
 };
 use crate::zakura::{
     regulation::{CadenceSendError, CadenceSender},
-    CloseCause, CloseOutcome, NeutralCause, Service, ZakuraConnId, ZakuraPeerId,
+    CloseCause, CloseOutcome, NeutralCause, Service, ServicePeerDirection, ZakuraConnId,
+    ZakuraPeerId,
 };
 
 /// One session's [`PeerState`], shared by its reader and its writer.
@@ -116,6 +116,10 @@ pub(super) struct PeerIO {
     pub(super) state: SharedPeerState,
     /// Paces `Hello` to its row's send interval.
     pub(super) hello: CadenceSender<DiscoveryMessage>,
+    /// Signature of the last self-record queued on this stream.
+    pub(super) last_hello_signature: Option<[u8; 64]>,
+    /// When this stream last queued a peer query successfully.
+    pub(super) last_peer_query: Option<zakura_rt::time::Instant>,
     /// This session's queries. A query waits until the previous query of its
     /// kind is answered.
     pub(super) queries: Queries,
@@ -131,27 +135,44 @@ pub(super) struct PeerIO {
 impl PeerIO {
     /// Runs the session's steps until the state ends the session.
     pub(super) async fn run(mut self) {
+        let mut exchange_started = Instant::now();
         let mut step = self.state.lock().start();
         loop {
             if let Some(charge) = step.charge {
                 self.charge(charge);
             }
             let input = match step.next {
-                PeerOutput::Exchange => PeerInput::Exchanged {
-                    sent: self.exchange().await.is_ok(),
-                },
-                PeerOutput::WaitInitial { timeout } => {
-                    PeerInput::InitialWaitEnded(self.wait_initial(timeout).await)
+                PeerOutput::Exchange => {
+                    match zakura_rt::time::timeout(DISCOVERY_ONLY_EXCHANGE_BUDGET, self.exchange())
+                        .await
+                    {
+                        Ok(result) => PeerInput::Exchanged {
+                            sent: result.is_ok(),
+                        },
+                        Err(_) => {
+                            self.queries.retract_unsent();
+                            PeerInput::ExchangeDeadline
+                        }
+                    }
                 }
+                PeerOutput::WaitInitial { timeout } => PeerInput::InitialWaitEnded(
+                    self.wait_initial(timeout.min(
+                        DISCOVERY_ONLY_EXCHANGE_BUDGET.saturating_sub(exchange_started.elapsed()),
+                    ))
+                    .await,
+                ),
                 PeerOutput::CheckCurrentSession => PeerInput::CurrentSession {
                     current: self.handle.is_current_session(&self.slot.key).await,
                 },
                 PeerOutput::CheckSoleOwner => PeerInput::Owners(self.owners().await),
-                PeerOutput::Refresh { interval } => PeerInput::Refreshed {
-                    sent: self.refresh_after(interval).await,
-                },
+                PeerOutput::Refresh { interval } => {
+                    let sent = self.refresh_after(interval).await;
+                    exchange_started = Instant::now();
+                    PeerInput::Refreshed { sent }
+                }
                 PeerOutput::WaitForAnswers { deadline } => {
-                    self.wait_for_answers(deadline).await;
+                    self.wait_for_answers(deadline.saturating_sub(exchange_started.elapsed()))
+                        .await;
                     PeerInput::AnswersSettled
                 }
                 PeerOutput::MarkShortLived => {
@@ -223,7 +244,9 @@ impl PeerIO {
         zakura_rt::select! {
             biased;
             _ = cancel.cancelled() => {}
-            () = self.answers_settled() => {}
+            // A local write can finish while QUIC still has the reply buffered.
+            // The dialer knows when it has imported the seed's records and can close.
+            () = self.answers_settled(), if self.session.direction() == ServicePeerDirection::Outbound => {}
             () = zakura_rt::time::sleep(deadline) => {}
         }
     }
@@ -234,7 +257,7 @@ impl PeerIO {
     async fn answers_settled(&self) {
         loop {
             self.answers.wait().await;
-            self.queries.answers_settled().await;
+            self.queries.answers_settled(true).await;
             if self.answers.is_written() {
                 return;
             }
@@ -288,22 +311,15 @@ impl PeerIO {
                     "failed to refresh Zakura discovery self-record"
                 );
             })?;
-        self.send_hello((*record).clone())?;
+        self.send_hello(&record)?;
 
-        let limit = u16::try_from(
-            self.handle
-                .peer_sample_limit()
-                .await
-                .clamp(1, MAX_DISCOVERY_RECORDS_PER_RESPONSE),
-        )
-        .expect("the largest wire limit fits u16");
-        let exclude_node_ids = self.handle.peer_sample_exclusions().await;
-        let get_peers = GetPeers {
-            limit,
-            wanted_services: Vec::new(),
-            exclude_node_ids,
-        };
-        continues(self.queries.send_get_peers(get_peers).await)?;
+        if let Some(query) = self.handle.next_peer_query(self.last_peer_query).await {
+            match self.queries.send_get_peers(query).await {
+                Ok(()) => self.last_peer_query = Some(zakura_rt::time::Instant::now()),
+                Err(QueryUnsent::NotDue) => {}
+                Err(QueryUnsent::Closed) => return Err(()),
+            }
+        }
         let get_services = GetServices {
             wanted_services: Vec::new(),
         };
@@ -313,13 +329,23 @@ impl PeerIO {
     /// Sends `record` as `Hello` if the row's interval has passed and the
     /// previous `Hello` was written. Otherwise the next exchange offers a
     /// fresh record. Returns `Err(())` once the stream is gone.
-    fn send_hello(&mut self, record: ZakuraNodeRecord) -> Result<(), ()> {
+    fn send_hello(&mut self, record: &ZakuraNodeRecord) -> Result<(), ()> {
+        if self.last_hello_signature == Some(record.signature) {
+            return Ok(());
+        }
         let sent = self
             .hello
-            .update(DiscoveryMessage::Hello { record })
+            .update(DiscoveryMessage::Hello {
+                record: record.clone(),
+            })
             .and_then(|()| self.hello.send_due(&self.session.send));
         match sent {
-            Ok(_) => Ok(()),
+            Ok(queued) => {
+                if queued > 0 {
+                    self.last_hello_signature = Some(record.signature);
+                }
+                Ok(())
+            }
             Err(CadenceSendError::Closed) => Err(()),
             Err(error) => {
                 tracing::debug!(

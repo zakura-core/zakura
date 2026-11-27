@@ -13,7 +13,7 @@ use super::super::{
 use super::replay::*;
 use super::state::{
     Close, CloseReason, InitialWait, Ownership, PeerInput, PeerOutput, PeerState, PeerStep,
-    SessionCharge, DISCOVERY_ANSWER_WRITE_DEADLINE, DISCOVERY_INITIAL_EXCHANGE_TIMEOUT,
+    SessionCharge, DISCOVERY_INITIAL_EXCHANGE_TIMEOUT, DISCOVERY_ONLY_EXCHANGE_BUDGET,
 };
 use crate::zakura::machine_test::machine_target_tests;
 
@@ -37,7 +37,7 @@ const REFRESH: PeerOutput = PeerOutput::Refresh {
 };
 
 const WAIT_FOR_ANSWERS: PeerOutput = PeerOutput::WaitForAnswers {
-    deadline: DISCOVERY_ANSWER_WRITE_DEADLINE,
+    deadline: DISCOVERY_ONLY_EXCHANGE_BUDGET,
 };
 
 const END_OPEN: PeerOutput = PeerOutput::End { close: None };

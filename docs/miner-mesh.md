@@ -3,11 +3,12 @@
 A mining pool that hears about a new block late keeps mining on the old tip
 until it does. The miner mesh gives pools a direct path to each other: a pool
 names its gateway node in the coinbase of each block it mines, and every synced
-mining node keeps direct v2 connections to the gateways that recent blocks name
-most often.
+node that prefers gateways (it mines or sets `mining.miner_mesh`) keeps direct
+v2 connections to the gateways that recent blocks name most often.
 
-This page covers the `mining.miner_mesh` setting, the `getminermeshinfo` RPC,
-and what a node does for the gateways it prefers.
+This page covers the `mining.miner_mesh`, `mining.miner_mesh_gateways` and
+`mining.miner_mesh_template_nodes` settings, the `getminermeshinfo` RPC, and
+what a node does for the gateways it prefers.
 
 ## Announce a gateway
 
@@ -18,14 +19,20 @@ miner_mesh = true
 
 [network]
 p2p_stack = "dual"
+external_addr = "203.0.113.10:8233" # Replace the example IP with the gateway's public IP.
 
 [network.zakura]
 listen_addr = "0.0.0.0:8234"
 ```
 
+For a wildcard listener, v2 discovery advertises the IP from
+`network.external_addr` with the port from `network.zakura.listen_addr`.
+Allow inbound UDP on that port (8234 here).
+
 With `miner_mesh = true`, every coinbase the node builds gets one extra
 zero-value output that names the node by its gateway ID: the first 20 bytes of
-its v2 node ID. The output takes 34 bytes of the block and has no effect on its
+its v2 node ID, unless `mining.miner_mesh_gateways` names another node (see
+[Name a relay node](#name-a-relay-node)). The output takes 34 bytes of the block and has no effect on its
 validity. It is off by default.
 
 The output's lock script is `OP_RETURN`, a push of 23 bytes, the tag `MR`
@@ -35,7 +42,9 @@ The output's lock script is `OP_RETURN`, a push of 23 bytes, the tag `MR`
 6a 17 || "MR" || 01 || gateway_id[20]
 ```
 
-`zakurad` refuses to start with `miner_mesh` set unless:
+`zakurad` refuses to start with `miner_mesh` set unless both of these hold,
+or `mining.miner_mesh_gateways` names another node (see
+[Name a relay node](#name-a-relay-node)):
 
 - v2 networking runs (`network.p2p_stack` is `"zakura"` or `"dual"`), since
   other miners find the gateway by its v2 node ID;
@@ -43,9 +52,116 @@ The output's lock script is `OP_RETURN`, a push of 23 bytes, the tag `MR`
   `network.zakura_node_secret_key` is set, or the key file under
   `network.identity_dir` can be read or created.
 
+With a miner address, it also refuses a mining config it cannot build
+coinbases from, such as an address for another network, so the node never
+reports a gateway its blocks do not name.
+
 It warns, and starts anyway, when `network.zakura.listen_addr` is unset or
-loopback (other miners cannot dial the gateway) or when `mining.miner_address`
-is unset (the node builds no coinbase, so it names no gateway).
+loopback, since other miners cannot dial the gateway. A node with
+`miner_mesh` set and no `mining.miner_address` builds no coinbase, but it
+still acts as a gateway that other coinbases can name, and it prefers other
+gateways: see [Name a relay node](#name-a-relay-node).
+
+### Name a relay node
+
+A pool often builds its block templates on an internal node and runs separate
+public nodes that other pools can reach. With `mining.miner_mesh_gateways`,
+the coinbases the template node builds name a public relay node instead of
+the template node itself:
+
+```toml
+# The template node.
+[mining]
+miner_address = "t1..."
+miner_mesh = true
+miner_mesh_gateways = ["<the relay's node_id>"]
+
+[network]
+p2p_stack = "dual"
+```
+
+```toml
+# The relay node.
+[mining]
+miner_mesh = true
+miner_mesh_template_nodes = ["<the template node's node_id>"]
+
+[network]
+p2p_stack = "dual"
+external_addr = "203.0.113.10:8233" # Replace the example IP with the relay's public IP.
+
+[network.zakura]
+listen_addr = "0.0.0.0:8234"
+```
+
+Allow inbound UDP on port 8234 at the relay's public IP. For a new pair,
+enable v2 on both nodes first and read `node_id` from `getminermeshinfo` on
+each. Put the relay's ID on the template node and the template node's ID
+on the relay, then restart both with the mining settings above.
+
+Each `miner_mesh_gateways` entry is the relay's v2 node ID in hex, the `node_id` its
+`getminermeshinfo` reports, or the first 40 hex digits of it, its gateway ID.
+For now the list takes one entry: `zakurad` refuses to start with more, or
+with the node's own ID. An empty list, the default, names the node itself.
+
+`mining.miner_mesh_template_nodes` on the relay lists the template node the
+same way, by the `node_id` its `getminermeshinfo` reports or the first 40 hex
+digits of it. This reserves room for the template node independently of
+which gateways the pool's blocks name.
+
+The two nodes need different things:
+
+- The relay is the gateway. It needs what any gateway needs: v2 networking,
+  a node key that stays the same across restarts, and a listen address other
+  pools can dial. With `miner_mesh` set and no miner address, it counts the
+  gateways recent blocks name and holds places for the best of them, as a
+  mining node does, so it stays connected to the other pools' gateways.
+- The template node can name a relay in its coinbases even on legacy-only
+  Mainnet. To use the relay's reserved v2 place, enable v2 as shown above and
+  preserve the template node's key under `network.identity_dir` across
+  restarts. If its ID changes, update `miner_mesh_template_nodes` on the relay.
+  It refuses to start with `miner_mesh_gateways` set unless `miner_mesh` is
+  set too, and warns when it has no miner address, since then it builds no
+  coinbase to name the relay in.
+
+A synced template node ranks its relay once at least 10 counted blocks name
+the relay. To get a preferred outbound connection, the relay must rank within
+the places the template node's memory budget funds and have a reachable
+address. More highly ranked gateways can take all those places.
+
+On the relay, each listed template node gets priority over block-ranked
+gateways. Within the funded places, an unambiguous template ID keeps its place
+even while offline, so the template node can call in when ordinary inbound
+places are full. The caller must first complete a handshake, which shares
+the relay's normal per-IP and global limits. The relay can also dial the
+template node if it knows a reachable address.
+
+`zakurad` refuses to start with `miner_mesh_template_nodes` set unless
+`miner_mesh` is set and the node is its own gateway (`miner_mesh_gateways` is
+empty), since template nodes connect to the gateway their coinbases name. It
+also refuses a list with the node's own ID, a repeated entry, or more than
+four entries, which leaves at least six of the ten places the default budget
+funds to the gateways recent blocks name. A smaller peer memory budget, or a
+larger `network.zakura.max_connections`, funds fewer places, and the template
+nodes may then take all of them: `zakurad` warns at startup when the funded
+places are no more than the template nodes, and when none are funded at all,
+so no template node gets a place. When only some listed templates fit,
+connected templates take priority. Blocks naming a template still appear
+in its reported count and have no effect on its reservation. A gateway
+with a miner address may list template nodes too.
+
+`getminermeshinfo` on the template node lists the relay's gateway ID in
+`announced_gateways`, which is how an operator confirms the setting. On the
+relay, each template node comes first in `gateways`, with `template_node`
+true, and `connected` says whether it is connected now.
+
+Only a node with a miner address announces a gateway, since only it builds
+coinbases. The `mining.mesh.announcing` metric reports whether this node's own
+coinbases name a gateway, so it reads 0 on the relay. The
+`mining.mesh.gateway.local_blocks` metric counts the blocks that name the
+gateway this node stands for: the one it announces, or itself on a relay. So
+on the relay it counts the template node's blocks, and on the template node it
+counts the same blocks.
 
 ### The gateway's ID
 
@@ -65,6 +181,17 @@ closed: it neither dials nor prefers any of them, holds no place for the
 gateway, and reports it as `ambiguous`. A node also never ranks the gateway ID
 its own node ID starts with.
 
+A gateway that adds a key to its node credential, as a later release may do
+for a new signature scheme, has a new node ID, while blocks go on naming the
+earlier one until its miners update. Its connections still prove the earlier
+ID, because it signs with the keys that ID was made from. Networking
+therefore takes a connected node for the gateway its node ID names and for
+the gateway each earlier ID it proved names, whichever side opened the
+connection, and the gateway keeps its held place under its new node ID. Only
+the holder of the gateway's keys can prove its earlier ID. When two connected
+nodes answer for one gateway ID, networking prefers neither, as with two
+nodes that share the ID.
+
 A block whose coinbase carries a marker in an earlier format names no
 gateway: the node ignores the marker and counts the block as naming none.
 
@@ -73,8 +200,9 @@ gateway and the miners that prefer it must all run it to form a mesh.
 
 ## Prefer announced gateways
 
-Every node with `mining.miner_address` set counts the gateways named in the best
-chain's recent blocks, whether or not it announces one itself. The window is two
+Every node with `mining.miner_address` or `mining.miner_mesh` set counts the
+gateways named in the best chain's recent blocks, whether or not it announces
+one itself. The window is two
 days of blocks ending 10 blocks below the tip, so it holds about 6,912 blocks
 at a 25-second spacing (2,304 at the 75-second spacing before NU7). The node
 reads each block as it reaches 10 deep, reads older blocks in the window when
@@ -93,9 +221,10 @@ can reach. A gateway named in fewer blocks is counted but not ranked, so the
 node neither dials it nor holds a place for it. Ten blocks is about 0.15% of the
 25-second window: a pool that mines that rarely does not take a place, and a node that
 names another node's ID in its blocks must keep mining to hold that node a
-place. When the tracker next checks a stale tip, it publishes an empty ranking.
-Networking releases the held places when it applies that update. A node without
-a miner address holds no places.
+place. When the tracker next checks a stale tip, it publishes a ranking with no
+gateways, which keeps only a relay's template nodes. Networking releases the
+gateways' held places when it applies that update. A node with
+neither a miner address nor `miner_mesh` holds no places.
 
 ### What a held place grants
 
@@ -107,9 +236,15 @@ A held place is a connection slot that only a preferred gateway may use:
   gateway's first connection takes a held place even when the ordinary slots
   and the inbound share are full;
 - a gateway in backoff still counts toward the number of places held. The
-  next available gateway can fill a place while the first waits to retry;
-- a ranked gateway that connects in takes a place when its rank brings it into
-  the preferred set.
+  next available gateway can fill a place while the first waits to retry.
+  This also applies while a moved gateway waits for its 30-second rollback
+  probe and its current ID cannot take a slot;
+- a ranked gateway that connects in can take a place from a lower-ranked
+  gateway. The lower-ranked gateway stays connected as an ordinary peer.
+  If that would use a slot reserved for the node's own dials, the
+  node refuses the new connection and the lower-ranked gateway keeps its place.
+- a template node the relay lists in `miner_mesh_template_nodes` keeps its
+  place while it is unreachable, so no other gateway fills it.
 
 A held place grants nothing else: once connected, a preferred gateway is
 treated like any other peer.
@@ -130,7 +265,7 @@ counts, the places it holds, and its v2 peers. In this example the node has
 ```json
 {
   "node_id": "2840...36c7",
-  "announcing": true,
+  "announced_gateways": ["2840...3793"],
   "mining": true,
   "synced": true,
   "window": {
@@ -141,10 +276,10 @@ counts, the places it holds, and its v2 peers. In this example the node has
     "coverage": 0.5
   },
   "gateways": [
-    { "gateway_id": "4d70...c112", "blocks": 40, "state": "preferred", "connected": true },
-    { "gateway_id": "67bb...6446", "blocks": 12, "state": "backoff", "connected": false },
-    { "gateway_id": "96dd...3b7e", "blocks": 11, "state": "standby", "connected": true },
-    { "gateway_id": "ccc7...2885", "blocks": 10, "state": "unmatched", "connected": false }
+    { "gateway_id": "4d70...c112", "blocks": 40, "state": "preferred", "template_node": false, "connected": true },
+    { "gateway_id": "67bb...6446", "blocks": 12, "state": "backoff", "template_node": false, "connected": false },
+    { "gateway_id": "96dd...3b7e", "blocks": 11, "state": "standby", "template_node": false, "connected": true },
+    { "gateway_id": "ccc7...2885", "blocks": 10, "state": "unmatched", "template_node": false, "connected": false }
   ],
   "hold": 1,
   "slots": { "limit": 40, "in_use": 3, "preferred": 1, "ordinary": 2, "inbound": 2 },
@@ -159,21 +294,32 @@ counts, the places it holds, and its v2 peers. In this example the node has
 | Field | Meaning |
 | --- | --- |
 | `node_id` | This node's v2 node ID in hex, or null without v2 networking. |
-| `announcing` | The coinbases this node builds name its gateway. |
+| `announced_gateways` | The gateway IDs in hex that the coinbases this node builds name: its own, or the relay `mining.miner_mesh_gateways` names. Empty when the node does not announce, and one entry for now. |
 | `mining` | The node has a miner address. |
 | `synced` | The tip is recent enough to prefer gateways when this request is served. Always true on test networks. |
-| `window` | The counted heights, or null on a node that does not mine. |
+| `window` | The counted heights, or null on a node that does not prefer gateways: one with neither a miner address nor `miner_mesh`. |
 | `window.tip` | The best tip height the counts follow. |
 | `window.newest`, `window.oldest` | The heights that count, or null while the tip is below 10. |
 | `window.checked` | Heights in the window read so far. |
 | `window.coverage` | The share of the window read, from 0 to 1. Below 1 the counts are a lower bound, as on a pruned node. A tip below 10 has an empty window, which reports 1. |
-| `gateways` | The last ranking applied by v2 networking, best first, at most 256 gateways. Only gateways named in at least 10 counted blocks are ranked, and the gateway ID this node's own ID starts with is left out. |
-| `gateways[].gateway_id` | The gateway ID in hex: the 20 bytes the blocks name, the first 20 bytes of the gateway's v2 node ID. Peers report their full 32-byte node IDs as `node_id`. |
+| `gateways` | The last ranking applied by v2 networking, best first, at most 256 gateways: the template nodes `mining.miner_mesh_template_nodes` lists, then the gateways named in at least 10 counted blocks. The gateway ID this node's own ID starts with is left out. |
+| `gateways[].gateway_id` | The gateway ID in hex: the 20 bytes the blocks name, the first 20 bytes of the gateway's v2 node ID, or of the node ID it had before it added a key. Peers report their full 32-byte node IDs as `node_id`. |
 | `gateways[].state` | See below. |
+| `gateways[].template_node` | The entry is a template node `mining.miner_mesh_template_nodes` lists. Within the funded places, the node holds a place for it whatever its `state`, unless it is `ambiguous`. |
 | `gateways[].connected` | The gateway is a v2 peer now. |
-| `hold` | The connection places held for preferred gateways. |
+| `hold` | The connection places held for preferred gateways and template nodes. |
 | `slots` | How connection slots are used, or null without v2 networking. `limit` includes all funded ordinary and gateway places. `in_use` is `preferred` plus `ordinary`; `preferred` counts one slot per preferred gateway connected; `inbound` counts slots of connections the remote node opened. |
 | `peers` | Every v2 peer connected now, ordered by node ID, at most the connection limit. A peer connected both ways counts as inbound. |
+
+A gateway that blocks name by an earlier node ID is reported as connected,
+and in its place, while a connection that proved that ID lasts, in either
+direction and even after the earlier address record is evicted. While a dial
+to the earlier ID is still in flight, the report follows that dial. `peers`
+lists the connection under the node ID the gateway has now. While blocks name
+a gateway by both its earlier and its new node ID, both rows show the one
+connected node, which fills one place and counts once in `hold`. Two distinct
+known IDs with the same gateway prefix still make a gateway ambiguous, and so
+do two connected nodes that proved its ID, until the next ranking is applied.
 
 A gateway's `state` reads its standing in v2 networking together with the
 preferred set:
@@ -183,8 +329,8 @@ preferred set:
 | `preferred` | Reachable and among the highest-ranked: it may fill a held place. |
 | `standby` | Known and reachable (it can be dialed, is being dialed, or is connected), but ranked below the gateways that fill the held places. |
 | `backoff` | Known, but waiting out a failed dial or a lost connection. It still counts toward the shared hold and may connect inbound during backoff. |
-| `unmatched` | Networking found no connection or usable dial address for this gateway when it ranked it. A missing or expired address record can produce this state. Gateways are usually learned through v2 peer exchange. |
-| `ambiguous` | Networking knows two or more nodes whose node IDs start with this gateway ID, so it prefers none of them and holds no place for the gateway. |
+| `unmatched` | Networking found no connection or usable dial address for this gateway when it ranked it. A missing or expired address record can produce this state. Gateways are usually learned through v2 peer exchange. A template node keeps its place in this state. |
+| `ambiguous` | Networking knows two or more nodes whose node IDs start with this gateway ID, or two connected nodes that proved a node ID that does, so it prefers none of them and holds no place for the gateway, even for a template node. |
 
 On Mainnet, `synced` can turn false while `gateways` and `hold` still show the
 previous ranking. The tracker rechecks tip freshness on progress and at

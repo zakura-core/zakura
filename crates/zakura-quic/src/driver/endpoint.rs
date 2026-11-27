@@ -715,6 +715,7 @@ mod tests {
         let secret = NodeSecretKey::generate();
         let shared = Arc::new(Shared {
             id: secret.public(),
+            credential: secret.credential().clone(),
             config: QuicConfig::default(),
             max_bidi_streams: 16,
             tls: TlsConfig::new(&secret),

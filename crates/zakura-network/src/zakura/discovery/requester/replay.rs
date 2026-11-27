@@ -310,8 +310,6 @@ pub struct DiscoverySettlementReplaySummary {
     pub refused: usize,
     /// Answers that claimed their query and began settling.
     pub claimed: usize,
-    /// Admitted answers that the claim refused above their query's cap.
-    pub oversized: usize,
     /// Answers that settled.
     pub settled: usize,
     /// `Hello` holds taken.
@@ -402,7 +400,7 @@ impl SettlementSession {
             || self.hello.is_some()
             || self.live.values().any(|query| query.delivered.is_some());
         assert_eq!(
-            self.queries.answers_settled().now_or_never().is_none(),
+            self.queries.answers_settled(false).now_or_never().is_none(),
             holds,
             "{SETTLEMENT}: the close wait disagrees with what the session holds"
         );
@@ -423,14 +421,6 @@ impl SettlementSession {
 /// The most entries the driver's pool holds: enough for the current
 /// session's two queries, and one unsettled answer beside them.
 const SETTLEMENT_POOL: usize = 3;
-
-/// The largest answer that the transport admits for a kind's row.
-fn row_cap(kind: QueryKind) -> u64 {
-    match kind {
-        QueryKind::Peers => LARGEST_PEERS.bytes,
-        QueryKind::Services => LARGEST_SERVICES.bytes,
-    }
-}
 
 fn answer_type(kind: QueryKind) -> u16 {
     u16::from(match kind {
@@ -525,7 +515,7 @@ pub(super) fn run_settlement(
                     );
                 if checked.is_ok() {
                     // The transport queues only an answer that a live query
-                    // owes, at most one per query, and within its row.
+                    // owes, at most one per query, and within its byte allowance.
                     let query = session
                         .live
                         .get_mut(&kind)
@@ -535,8 +525,8 @@ pub(super) fn run_settlement(
                         "{SETTLEMENT}: admitted a second answer"
                     );
                     assert!(
-                        len <= row_cap(kind),
-                        "{SETTLEMENT}: admitted {len} bytes above the row's cap"
+                        len <= query.asked.cap().bytes,
+                        "{SETTLEMENT}: admitted {len} bytes above the query's cap"
                     );
                     summary.delivered += 1;
                     query.delivered = Some(usize::try_from(len).expect("test caps fit usize"));
@@ -548,27 +538,19 @@ pub(super) fn run_settlement(
                 // The reader sees only the frames the transport admitted.
                 let delivered = session.live.get(&kind).and_then(|query| query.delivered);
                 if let Some(len) = delivered {
-                    let query = session
+                    session
                         .live
                         .remove(&kind)
                         .expect("the delivered answer's query is live");
                     session.unwritten.retain(|unwritten| *unwritten != kind);
-                    let cap = query.asked.cap().bytes;
-                    match session.queries.claim(answer_type(kind), len) {
-                        Ok(Some(answer)) if len as u64 <= cap => {
-                            summary.claimed += 1;
-                            assert_eq!(answer.admitted().kind(), kind, "{SETTLEMENT}");
-                            session.answers.push(answer);
-                        }
-                        Err(Unclaimed::Refused(ClaimRefused::OverBytes { bytes }))
-                            if len as u64 > cap && bytes == cap =>
-                        {
-                            summary.oversized += 1;
-                        }
-                        claimed => {
-                            panic!("{SETTLEMENT}: length {len} above cap {cap} got {claimed:?}")
-                        }
-                    }
+                    let answer = session
+                        .queries
+                        .claim(answer_type(kind), len)
+                        .expect("the transport admitted the answer within the query's cap")
+                        .expect("the frame answers a discovery query");
+                    summary.claimed += 1;
+                    assert_eq!(answer.admitted().kind(), kind, "{SETTLEMENT}");
+                    session.answers.push(answer);
                 } else {
                     summary.stale += 1;
                 }

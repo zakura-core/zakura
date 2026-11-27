@@ -959,7 +959,7 @@ pub fn standardness_with_pq(
         #[cfg(feature = "pq")]
         if pq_active && spent_outputs.len() == transaction.inputs().len() {
             let lock_script = &spent_outputs[input_index].lock_script;
-            if policy::authenticated_pq_sig_ops(unlock_script, lock_script).is_some() {
+            if policy::is_authenticated_pq_input(unlock_script, lock_script) {
                 continue;
             }
         }

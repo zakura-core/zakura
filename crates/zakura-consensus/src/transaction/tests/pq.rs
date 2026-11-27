@@ -980,7 +980,7 @@ fn relay_policy_uses_the_authenticated_body_and_the_chain_activation() {
         LockTime::unlocked(),
     );
     let junk = vec![0; crypto::SIGNATURE_BYTES + 1];
-    too_many.install_arguments(&slots(&vec![Some(&junk); 16]));
+    too_many.install_arguments(&slots(&[Some(&junk); 16]));
     assert_eq!(
         policy(&too_many, &active, ACTIVATION),
         Err(TransactionError::NonStandardInputs)

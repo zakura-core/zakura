@@ -224,3 +224,10 @@ pub fn authenticated_pq_sig_ops(
     let spend = output.authenticate_spend(unlock.as_raw_bytes()).ok()?;
     Some(spend.sig_op_count())
 }
+
+/// Whether this input reveals exactly the script its post-quantum output commits to, so the
+/// spend's own bounds apply to it instead of the legacy input rules.
+#[cfg(feature = "pq")]
+pub fn is_authenticated_pq_input(unlock: &transparent::Script, lock: &transparent::Script) -> bool {
+    authenticated_pq_sig_ops(unlock, lock).is_some()
+}

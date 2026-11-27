@@ -174,10 +174,7 @@ const UNAPPLIED: &[(&str, &[&str])] = &[
     ),
     (
         "discovery_wire",
-        &[
-            "discovery/late-response-admitted",
-            "discovery/s4v2/services/over-owed-closes",
-        ],
+        &["discovery/s4v2/services/over-owed-closes"],
     ),
     (
         "handshake_wire",

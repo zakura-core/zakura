@@ -1826,38 +1826,47 @@ fn dial_permits(node: &crate::zakura::testkit::ZakuraTestNode) -> usize {
     )
 }
 
-/// Issue 2805: a node whose record advertises no address dials only up to
-/// the outbound reserve, 23 of 92 slots, so it takes fewer inbound slots on
-/// reachable peers. Its inbound peers don't use up that target. A node that
-/// advertises an address still dials up to the soft cap.
+/// Issue 2805: discovery dials only up to the outbound reserve, 23 of 92
+/// slots, whether or not the node advertises an address, so reachable nodes
+/// leave inbound room for nodes that can only dial. Inbound slots don't use up
+/// the target, but the soft cap still counts them.
 #[tokio::test]
-async fn a_node_without_an_address_dials_only_to_its_outbound_target() {
+async fn discovery_dials_only_to_the_outbound_target() {
     use crate::zakura::testkit::ZakuraTestNode;
     let mut limits = ZakuraLocalLimits::from_config(&crate::Config::default());
     limits.max_connections = 92;
-    // With no bootstrap peers the headroom is 4, so the soft cap is 88.
     let hidden = ZakuraTestNode::builder(9380)
         .limits(limits.clone())
         .spawn()
         .await
         .expect("node spawns");
-    assert_eq!(dial_permits(&hidden), 23);
-    let endpoint = hidden.endpoint();
-    let inbound = endpoint.hold_connection_slots(40, true);
-    assert_eq!(dial_permits(&hidden), 23, "inbound slots leave the target");
-    let outbound = endpoint.hold_connection_slots(23, false);
-    assert_eq!(dial_permits(&hidden), 0);
-    drop((inbound, outbound));
-
     let advertised = ZakuraTestNode::builder(9381)
         .limits(limits)
         .discovery_direct_addrs(vec![SocketAddr::from(([93, 184, 216, 34], 8234))])
         .spawn()
         .await
         .expect("node spawns");
-    let outbound = advertised.endpoint().hold_connection_slots(23, false);
-    assert_eq!(dial_permits(&advertised), 88 - 23);
+    assert_eq!(dial_permits(&hidden), 23);
+    assert_eq!(dial_permits(&advertised), 23);
+
+    // With no bootstrap peers the headroom is 4, so the soft cap is 88.
+    let endpoint = advertised.endpoint();
+    let inbound = endpoint.hold_connection_slots(40, true);
+    assert_eq!(
+        dial_permits(&advertised),
+        23,
+        "inbound slots leave the target"
+    );
+    let outbound = endpoint.hold_connection_slots(23, false);
+    assert_eq!(dial_permits(&advertised), 0);
     drop(outbound);
+    let more_inbound = endpoint.hold_connection_slots(29, true);
+    assert_eq!(
+        dial_permits(&advertised),
+        88 - 69,
+        "the soft cap still counts inbound slots"
+    );
+    drop((inbound, more_inbound));
 
     hidden.shutdown().await;
     advertised.shutdown().await;

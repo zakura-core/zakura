@@ -54,10 +54,9 @@ const MAX_ADJUST_DOWN_PERCENT: u64 = 32;
 /// The outcome of checking metadata whose parent header is unknown.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum UnknownParentVerdict {
-    /// Every check passed: the metadata waits for its parent. `height` is
-    /// the coinbase height that check 2 verified.
+    /// Every check passed: the metadata waits for its parent.
     Park {
-        /// The verified coinbase height.
+        /// The coinbase height that check 2 verified.
         height: u32,
     },
     /// This node cannot place the block, so block sync owns it: its height

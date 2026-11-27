@@ -976,22 +976,23 @@ struct AdmittingEntry {
     started_top: u32,
 }
 
-/// A parked entry that retries header admission. It already passed the
-/// unknown-parent checks, and it keeps its first deadline if it parks again.
+/// A parked entry that retries header admission (see [`BlockTable::park`]).
 #[derive(Copy, Clone, Debug)]
 struct Parked {
     /// When the entry first parked.
     at: Instant,
-    /// The coinbase height its checks verified. A retry that parks again
-    /// checks it against the live `top` (see [`BlockTable::park`]).
+    /// The coinbase height its checks verified.
     height: u32,
 }
 
 /// Where a pending entry's unknown-parent checks stand.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum PendingChecks {
-    /// The checks run as this work.
-    Running(WorkId),
+    /// The checks run as `work` against `top`, from when the entry's header
+    /// admission started. A promoted alternate keeps that `top`, so header
+    /// sync moving it during the first copy's checks makes the alternate
+    /// retry admission instead of dropping (see [`retries_admission`]).
+    Running { work: WorkId, top: u32 },
     /// The checks passed and verified this coinbase height.
     Passed { height: u32 },
 }
@@ -1026,11 +1027,6 @@ struct PendingMetaEntry {
     checks: PendingChecks,
     /// [`BlockTable::best_moves`] when the entry's header admission started.
     best_moves: u64,
-    /// The `top` the entry's checks run against, from when its header
-    /// admission started. A promoted alternate keeps it, so header
-    /// sync moving `top` during the first copy's checks makes the alternate
-    /// retry admission instead of dropping (see [`retries_admission`]).
-    checks_top: u32,
 }
 
 impl PendingMetaEntry {
@@ -2219,9 +2215,11 @@ impl BlockTable {
                         later: entry.later,
                         parent_hash,
                         received_at: now,
-                        checks: PendingChecks::Running(work_id),
+                        checks: PendingChecks::Running {
+                            work: work_id,
+                            top: entry.started_top,
+                        },
                         best_moves: entry.best_moves,
-                        checks_top: entry.started_top,
                     },
                     step,
                 );
@@ -2273,48 +2271,42 @@ impl BlockTable {
         let Some(block_id) = self.work_to_block.remove(&work_id) else {
             return;
         };
-        let Some(entry) = self
-            .pending
-            .get_mut(&block_id)
-            .filter(|entry| entry.checks == PendingChecks::Running(work_id))
-        else {
+        let Some(entry) = self.pending.get_mut(&block_id) else {
             return;
         };
-        if let UnknownParentVerdict::Park { height } = verdict {
-            entry.checks = PendingChecks::Passed { height };
-            if retries_admission(entry.best_moves, self.best_moves, entry.received_at, now) {
-                let entry = self
-                    .remove_pending(block_id)
-                    .expect("pending entry verified present");
-                self.start_admission(
-                    entry.arrived_at,
-                    entry.envelope,
-                    (entry.from_peer, entry.session_gen),
-                    entry.later,
-                    Some(Parked {
-                        at: entry.received_at,
-                        height,
-                    }),
-                    step,
-                );
-            } else if height <= self.top {
-                // The checks ran against an older `top`, and a local proposal
-                // or the verified tip raises it without moving the best header.
-                let entry = self
-                    .remove_pending(block_id)
-                    .expect("pending entry verified present");
-                reject_meta(step, block_id, entry.from_peer, entry.session_gen);
-                reject_later(step, block_id, &entry.later);
-            }
+        let PendingChecks::Running { work, top } = entry.checks else {
             return;
+        };
+        if work != work_id {
+            return;
+        }
+        let retry = retries_admission(entry.best_moves, self.best_moves, entry.received_at, now);
+        if let UnknownParentVerdict::Park { height } = verdict {
+            if !retry && height > self.top {
+                entry.checks = PendingChecks::Passed { height };
+                return;
+            }
         }
         let entry = self
             .remove_pending(block_id)
             .expect("pending entry verified present");
         match verdict {
-            UnknownParentVerdict::Park { .. } => {}
-            // Block sync owns the block, and no sender is at fault.
-            UnknownParentVerdict::Drop => {
+            UnknownParentVerdict::Park { height } if retry => self.start_admission(
+                entry.arrived_at,
+                entry.envelope,
+                (entry.from_peer, entry.session_gen),
+                entry.later,
+                Some(Parked {
+                    at: entry.received_at,
+                    height,
+                }),
+                step,
+            ),
+            // Block sync owns the block, and no sender is at fault. Passing
+            // checks land here when `top` reached the height: they ran
+            // against an older `top`, and a local proposal or the verified
+            // tip raises it without moving the best header.
+            UnknownParentVerdict::Park { .. } | UnknownParentVerdict::Drop => {
                 reject_meta(step, block_id, entry.from_peer, entry.session_gen);
                 reject_later(step, block_id, &entry.later);
             }
@@ -2334,7 +2326,7 @@ impl BlockTable {
             // Another sender's binding may differ under the same hash, so
             // the alternate gets its own check.
             UnknownParentVerdict::Invalid(_) => {
-                self.handle_unknown_parent_binding_failed(block_id, entry, step)
+                self.handle_unknown_parent_binding_failed(block_id, entry, top, step)
             }
         }
     }
@@ -2387,7 +2379,6 @@ impl BlockTable {
                     height: parked.height,
                 },
                 best_moves: entry.best_moves,
-                checks_top: self.top,
             },
             step,
         );
@@ -2492,8 +2483,8 @@ impl BlockTable {
     fn remove_pending(&mut self, block_id: block::Hash) -> Option<PendingMetaEntry> {
         let entry = self.pending.remove(&block_id)?;
         self.pending_bytes = self.pending_bytes.saturating_sub(entry.charged_bytes());
-        if let PendingChecks::Running(work_id) = entry.checks {
-            self.work_to_block.remove(&work_id);
+        if let PendingChecks::Running { work, .. } = entry.checks {
+            self.work_to_block.remove(&work);
         }
         Some(entry)
     }
@@ -2525,7 +2516,7 @@ impl BlockTable {
             .filter_map(|(id, e)| match e.checks {
                 PendingChecks::Passed { height } => Some((*id, height)),
                 // An entry whose checks still run retries when they pass.
-                PendingChecks::Running(_) => None,
+                PendingChecks::Running { .. } => None,
             })
             .collect();
         for (block_id, height) in ready {
@@ -2693,8 +2684,9 @@ impl BlockTable {
     ///
     /// The binding check is a pure function of the envelope, so each session
     /// whose copy equals the failed envelope sent the failed binding. The
-    /// alternate keeps the entry's place in the pending budget, its deadline
-    /// and its best-header count. Its new owner is the first of its senders
+    /// alternate keeps the entry's place in the pending budget, its deadline,
+    /// its best-header count and `top`, the one the failed checks ran
+    /// against. Its new owner is the first of its senders
     /// below [`MAX_PENDING_META_PER_PEER`] (`bpv1-11`). An alternate whose
     /// senders are all at that cap is rejected without fault, and the next
     /// one takes its place.
@@ -2702,6 +2694,7 @@ impl BlockTable {
         &mut self,
         block_id: block::Hash,
         entry: PendingMetaEntry,
+        top: u32,
         step: &mut BlockStep,
     ) {
         let mut later = entry.later;
@@ -2740,14 +2733,14 @@ impl BlockTable {
             work_id,
             block_id,
             envelope: envelope.clone(),
-            top: entry.checks_top,
+            top,
         });
         let entry = PendingMetaEntry {
             envelope,
             from_peer,
             session_gen,
             later,
-            checks: PendingChecks::Running(work_id),
+            checks: PendingChecks::Running { work: work_id, top },
             ..entry
         };
         // The failed entry's charge covered the alternate, so it still fits.

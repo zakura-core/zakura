@@ -16,7 +16,7 @@ use super::{
         HeaderAdmissionResult, MAX_PENDING_META_PER_PEER,
     },
     blocks_tests::{
-        closed_sessions, commitment_ok, header_result, missing_parent, passed, rejected_sessions,
+        closed_sessions, commitment_ok, header_result, missing_parent, rejected_sessions,
         unknown_parent_checked,
     },
     close::Bpv1CloseRow,
@@ -509,7 +509,8 @@ fn close_4_failed_unknown_parent_binding_checks_the_alternate() {
     assert!(rejected_sessions(&failed, block_id).is_empty());
     table.assert_invariants();
 
-    let parked = unknown_parent_checked(&mut table, now, &failed, passed(&failed));
+    let verdict = UnknownParentVerdict::Park { height: 1 };
+    let parked = unknown_parent_checked(&mut table, now, &failed, verdict);
     assert!(parked
         .outputs
         .iter()
@@ -579,7 +580,8 @@ fn close_4_failed_unknown_parent_binding_skips_an_alternate_at_the_pending_cap()
     table.assert_invariants();
 
     // `c`'s copy took the entry, so its checks run and it parks.
-    unknown_parent_checked(&mut table, now, &failed, passed(&failed));
+    let verdict = UnknownParentVerdict::Park { height: 1 };
+    unknown_parent_checked(&mut table, now, &failed, verdict);
     assert_eq!(table.pending_meta_len(), MAX_PENDING_META_PER_PEER + 1);
     table.assert_invariants();
 }
@@ -633,7 +635,8 @@ fn close_4_unknown_parent_alternate_retries_after_the_best_header_moved() {
         vec![a]
     );
 
-    let retried = unknown_parent_checked(&mut table, now, &failed, passed(&failed));
+    let verdict = UnknownParentVerdict::Park { height: 1 };
+    let retried = unknown_parent_checked(&mut table, now, &failed, verdict);
     assert_eq!(table.pending_meta_len(), 0);
     assert!(retried
         .outputs
@@ -698,7 +701,8 @@ fn unknown_parent_alternate_after_header_sync_reached_the_block_retries_admissio
         .iter()
         .any(|o| matches!(o, BlockOutput::CheckUnknownParent { top: 9, .. })));
 
-    let retried = unknown_parent_checked(&mut table, now, &failed, passed(&failed));
+    let verdict = UnknownParentVerdict::Park { height: 11 };
+    let retried = unknown_parent_checked(&mut table, now, &failed, verdict);
     assert!(rejected_sessions(&retried, block_id).is_empty());
     assert_eq!(table.pending_meta_len(), 0);
     let admitted = header_result(

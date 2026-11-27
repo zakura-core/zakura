@@ -113,18 +113,52 @@ where
     }
 }
 
+/// How long [`StateCommittedBlocks`] waits for the next non-finalized publication after
+/// a miss. The state writer publishes the verified tip before the non-finalized state
+/// that holds the committed block, so the wait spans that gap.
+const NON_FINALIZED_PUBLISH_WAIT: Duration = Duration::from_secs(2);
+
 /// Production [`CommittedBlockPort`] over `zakurad`'s read-only state service.
 ///
 /// `ReadRequest::AnyChainBlock` checks the non-finalized chains in memory before the
-/// finalized database, so a block that just committed costs no disk read. A failed read
-/// answers `None`, as a missing block does.
+/// finalized database, so a block that just committed costs no disk read. BPv1 asks
+/// when the verified tip moves, which the state writer publishes before the
+/// non-finalized state that holds the block. So a miss waits once for the next
+/// non-finalized publication, at most [`NON_FINALIZED_PUBLISH_WAIT`], and reads again.
+/// A failed read answers `None`, as a missing block does.
 pub(crate) struct StateCommittedBlocks<S> {
     state: S,
+    non_finalized: zakura_state::WatchReceiver<zakura_state::NonFinalizedState>,
 }
 
 impl<S> StateCommittedBlocks<S> {
-    pub(crate) fn new(state: S) -> Self {
-        Self { state }
+    pub(crate) fn new(
+        state: S,
+        non_finalized: zakura_state::WatchReceiver<zakura_state::NonFinalizedState>,
+    ) -> Self {
+        Self {
+            state,
+            non_finalized,
+        }
+    }
+}
+
+/// Reads `hash` from `state` on any chain. A failed read answers `None`.
+async fn any_chain_block<S>(state: S, hash: block::Hash) -> Option<BlockHandle>
+where
+    S: Service<zakura_state::ReadRequest, Response = zakura_state::ReadResponse>,
+    S::Error: std::fmt::Debug,
+{
+    match state
+        .oneshot(zakura_state::ReadRequest::AnyChainBlock(hash.into()))
+        .await
+    {
+        Ok(zakura_state::ReadResponse::Block(block)) => block,
+        Ok(_) => None,
+        Err(error) => {
+            tracing::debug!(%hash, ?error, "bpv1 committed block read failed");
+            None
+        }
     }
 }
 
@@ -140,17 +174,16 @@ where
 {
     fn committed_block(&self, hash: block::Hash) -> PortFuture<'_, Option<BlockHandle>> {
         let state = self.state.clone();
+        // Marked seen before the first read, so a publication after it wakes the wait.
+        let mut published = self.non_finalized.clone();
+        published.mark_as_seen();
         Box::pin(async move {
-            match state
-                .oneshot(zakura_state::ReadRequest::AnyChainBlock(hash.into()))
-                .await
-            {
-                Ok(zakura_state::ReadResponse::Block(block)) => block,
-                Ok(_) => None,
-                Err(error) => {
-                    tracing::debug!(%hash, ?error, "bpv1 committed block read failed");
-                    None
-                }
+            if let Some(block) = any_chain_block(state.clone(), hash).await {
+                return Some(block);
+            }
+            match tokio::time::timeout(NON_FINALIZED_PUBLISH_WAIT, published.changed()).await {
+                Ok(Ok(())) => any_chain_block(state, hash).await,
+                _ => None,
             }
         })
     }
@@ -227,10 +260,16 @@ mod tests {
 
     use tower::service_fn;
     use zakura_chain::{block::Block, serialization::ZcashDeserializeInto};
-    use zakura_network::zakura::bpv1::{BlockVerifierPort, VerifierVerdict, WorkId};
-    use zakura_node_services::block_memory::{Admission, DecodedBlockPool, OwnedBlock};
+    use zakura_network::zakura::bpv1::{
+        BlockVerifierPort, CommittedBlockPort, VerifierVerdict, WorkId,
+    };
+    use zakura_node_services::block_memory::{
+        Admission, BlockHandle, DecodedBlockPool, OwnedBlock,
+    };
 
-    use super::{RouterBlockVerifierAdapter, SyncCoordinator, SUBMIT_TIMEOUT};
+    use super::{
+        RouterBlockVerifierAdapter, StateCommittedBlocks, SyncCoordinator, SUBMIT_TIMEOUT,
+    };
 
     fn owned_genesis() -> OwnedBlock {
         let block: Block = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
@@ -356,5 +395,43 @@ mod tests {
             VerifierVerdict::LocalCapacity
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// The state writer publishes the verified tip before the non-finalized state that
+    /// holds the block, so BPv1's first read can miss. The port waits for the next
+    /// non-finalized publication and reads again (bpv1-90).
+    #[tokio::test]
+    async fn a_committed_block_read_waits_for_the_non_finalized_publication() {
+        let _init_guard = zakura_test::init();
+        let genesis: Arc<Block> = Arc::new(
+            zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+                .zcash_deserialize_into()
+                .expect("the genesis vector deserializes"),
+        );
+        let reads = Arc::new(AtomicUsize::new(0));
+        let state = service_fn({
+            let (reads, genesis) = (reads.clone(), genesis.clone());
+            move |_request: zakura_state::ReadRequest| {
+                // The first read runs before the publication.
+                let published = reads.fetch_add(1, Ordering::SeqCst) > 0;
+                let block = published.then(|| BlockHandle::from(genesis.clone()));
+                async move {
+                    Ok::<_, std::convert::Infallible>(zakura_state::ReadResponse::Block(block))
+                }
+            }
+        });
+        let (publisher, non_finalized) = tokio::sync::watch::channel(
+            zakura_state::NonFinalizedState::new(&zakura_chain::parameters::Network::Mainnet),
+        );
+        let port =
+            StateCommittedBlocks::new(state, zakura_state::WatchReceiver::new(non_finalized));
+
+        let (block, ()) = tokio::join!(port.committed_block(genesis.hash()), async {
+            tokio::task::yield_now().await;
+            publisher.send_modify(|_| {});
+        });
+
+        assert_eq!(block.map(|block| block.hash()), Some(genesis.hash()));
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
     }
 }

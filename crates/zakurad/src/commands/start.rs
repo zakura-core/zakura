@@ -1001,6 +1001,7 @@ impl StartCmd {
                     )),
                     Arc::new(zakura::bpv1_wiring::StateCommittedBlocks::new(
                         read_only_state_service.clone(),
+                        read_only_state_service.subscribe_non_finalized_state(),
                     )),
                     driver_startup,
                     // Child token so disabling/shutting down BPv1 never shuts down the daemon.

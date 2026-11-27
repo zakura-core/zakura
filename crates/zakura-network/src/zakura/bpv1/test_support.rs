@@ -482,6 +482,8 @@ const MESH_TICK: Duration = Duration::from_millis(50);
 #[derive(Clone, Debug)]
 enum MeshFrame {
     Control(Bpv1Message),
+    /// A `HeaderMeta`, which travels on the data stream (bpv1-8).
+    HeaderMeta(Bpv1Message),
     Part {
         block_id: block::Hash,
         part: VerifiedPart,
@@ -1078,6 +1080,9 @@ impl MachineMesh {
             PeerOutput::SendControl(msg) => {
                 self.send(node, peer, MeshFrame::Control(*msg));
             }
+            PeerOutput::SendHeaderMeta(msg) => {
+                self.send(node, peer, MeshFrame::HeaderMeta(*msg));
+            }
             PeerOutput::SendHave {
                 block_id,
                 flags,
@@ -1206,7 +1211,7 @@ impl MachineMesh {
     fn send(&mut self, from: usize, to: usize, frame: MeshFrame) {
         let table = &self.nodes[from].table;
         match &frame {
-            MeshFrame::Control(Bpv1Message::HeaderMeta { part_root, .. }) => {
+            MeshFrame::HeaderMeta(Bpv1Message::HeaderMeta { part_root, .. }) => {
                 let block_id = self.block_of_root(part_root);
                 assert!(
                     self.wire.meta.insert((from, to, block_id)),
@@ -1251,7 +1256,7 @@ impl MachineMesh {
                     "bpv1-37 BlockDone before assembly"
                 );
             }
-            MeshFrame::Control(_) => {}
+            MeshFrame::Control(_) | MeshFrame::HeaderMeta(_) => {}
             MeshFrame::Part { block_id, part } => {
                 assert!(
                     table
@@ -1352,8 +1357,12 @@ impl MachineMesh {
         };
         let is_ctrl = matches!(frame, MeshFrame::Control(_));
         if !is_ctrl {
+            // The data-frame limit counts block traffic only. A `HeaderMeta`
+            // still goes silent with its stream.
             let carried = self.wire.data_frames.entry((from, to)).or_default();
-            *carried += 1;
+            if !matches!(frame, MeshFrame::HeaderMeta(_)) {
+                *carried += 1;
+            }
             if link.data_frames.is_some_and(|limit| *carried > limit) {
                 return;
             }
@@ -1362,7 +1371,7 @@ impl MachineMesh {
             return;
         }
         let bytes: u64 = match &frame {
-            MeshFrame::Control(_) => 64,
+            MeshFrame::Control(_) | MeshFrame::HeaderMeta(_) => 64,
             MeshFrame::Part { part, .. } => part.payload().len() as u64,
             // Widening usize to u64 is lossless on supported targets.
             MeshFrame::Have { form, indices, .. } => 33 + form.indices_len(indices.len()) as u64,
@@ -1398,7 +1407,7 @@ impl MachineMesh {
             return;
         }
         let input = match frame {
-            MeshFrame::Control(msg @ Bpv1Message::HeaderMeta { part_root, .. }) => {
+            MeshFrame::HeaderMeta(msg @ Bpv1Message::HeaderMeta { part_root, .. }) => {
                 PeerInput::RecvHeaderMeta {
                     block_id: self.block_of_root(&part_root),
                     message: Box::new(msg),
@@ -1421,7 +1430,9 @@ impl MachineMesh {
             MeshFrame::Control(Bpv1Message::BlockDone { block_id }) => {
                 PeerInput::RecvBlockDone { block_id }
             }
-            MeshFrame::Control(other) => unreachable!("{other:?} travels on the data stream"),
+            MeshFrame::Control(other) | MeshFrame::HeaderMeta(other) => {
+                unreachable!("{other:?} travels on the other stream")
+            }
             MeshFrame::Part { block_id, part } => {
                 let index = part.index();
                 let payload = encode_part_frame(block_id, &part).payload;
@@ -1461,7 +1472,7 @@ impl MachineMesh {
         frame: MeshFrame,
     ) {
         match frame {
-            MeshFrame::Control(Bpv1Message::HeaderMeta { part_root, .. }) => {
+            MeshFrame::HeaderMeta(Bpv1Message::HeaderMeta { part_root, .. }) => {
                 let block_id = self.block_of_root(&part_root);
                 let total = self.envelopes[&block_id].coding.total_parts().unwrap_or(0);
                 let indices: Vec<u32> = (0..total).collect();

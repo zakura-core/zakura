@@ -43,6 +43,19 @@ impl PeerState {
             self.flags_lost.len()
         );
         assert!(
+            self.meta_dropped.len() <= MAX_PENDING_META_COUNT,
+            "{PEER_REPLAY}: bpv1-14 dropped-metadata marks {} exceeded {MAX_PENDING_META_COUNT}",
+            self.meta_dropped.len()
+        );
+        // bpv1-14: the early record holds only traffic behind the peer's
+        // `HeaderMeta` while local admission runs.
+        assert!(
+            self.early_data
+                .iter()
+                .all(|e| self.meta_received_pending.contains(&e.kind.block_id())),
+            "{PEER_REPLAY}: bpv1-14 the early record holds traffic with no pending HeaderMeta"
+        );
+        assert!(
             self.early_control.len() <= EARLY_CONTROL_CAP,
             "{PEER_REPLAY}: early_control len {} exceeded cap {}",
             self.early_control.len(),
@@ -161,6 +174,7 @@ impl PeerState {
                 && self.blocks.is_empty()
                 && self.retired.is_empty()
                 && self.meta_received_pending.is_empty()
+                && self.meta_dropped.is_empty()
                 && self.inflight_verify.is_empty()
                 && self.unwritten_ends.is_empty(),
             "{PEER_REPLAY}: bpv1-62 SessionEnd left per-peer state behind"

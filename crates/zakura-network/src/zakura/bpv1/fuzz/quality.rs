@@ -122,6 +122,7 @@ pub const PEER_INPUTS: [&str; 26] = [
 pub fn peer_output_name(output: &PeerOutput) -> &'static str {
     match output {
         PeerOutput::SendControl(_) => "peer-out:SendControl",
+        PeerOutput::SendHeaderMeta(_) => "peer-out:SendHeaderMeta",
         PeerOutput::SendHave { .. } => "peer-out:SendHave",
         PeerOutput::PushPart { .. } => "peer-out:PushPart",
         PeerOutput::SendSeedPart { .. } => "peer-out:SendSeedPart",

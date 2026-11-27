@@ -12,8 +12,8 @@
 //! own. Machine outputs go through the production router
 //! (`route_peer_output`, `route_block_output`, `refused_grant`,
 //! `charge_part`, `held_parts`). Control messages cross the links as frames
-//! from `encode_frame`, data as frames from the production
-//! [`Bpv1FifoQueue`] writer, and receivers read them with the production
+//! from `encode_frame`, data (with `HeaderMeta`) as frames from the
+//! production [`Bpv1FifoQueue`] writer, and receivers read them with the production
 //! stream decoders. Shell work waits in a per-node job list until the input
 //! completes it, in any order:
 //! - header admission answers from the proposer's chain: `Admitted` at the
@@ -40,6 +40,8 @@
 //! Checks after every step: every stepped session's and table's
 //! `assert_invariants`; no honest connection closes with a protocol row,
 //! from either side; a peer's `HeaderMeta` never readmits a retired block;
+//! an honest node writes a block's parts and `Have`s only after the block's
+//! `HeaderMeta` crossed the connection (bpv1-8);
 //! every body claim release follows its claim; an assembled block is the
 //! proposer's block. Every session that ends drains (`assert_drained`).
 //!
@@ -49,7 +51,7 @@
 //! the adversary and the delivery order rather than from the driver.
 
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, HashSet, VecDeque},
     sync::Arc,
     time::Duration,
 };
@@ -104,6 +106,16 @@ use crate::zakura::{
     wire_codec::encode_frame,
     Frame,
 };
+
+/// The block a `HeaderMeta` names.
+fn header_meta_block(message: &Bpv1Message) -> block::Hash {
+    let Bpv1Message::HeaderMeta { header, .. } = message else {
+        panic!("{MESH}: a HeaderMeta queue item holds {message:?}");
+    };
+    Header::zcash_deserialize(&header[..])
+        .expect("an honest HeaderMeta header parses")
+        .hash()
+}
 
 /// Summary returned by [`replay_bpv1_mesh_bytes`].
 #[derive(Clone, Debug, Default)]
@@ -236,6 +248,9 @@ struct Mesh {
     nodes: Vec<Node>,
     proposer: ProposerState,
     links: BTreeMap<(usize, usize), Link>,
+    /// `(lower node, higher node, block)` for every `HeaderMeta` that crossed
+    /// a live connection in either direction (bpv1-8).
+    meta_crossed: HashSet<(usize, usize, block::Hash)>,
     planned: Vec<Planned>,
     solved: Vec<Solved>,
     inbox: VecDeque<Frame>,
@@ -330,6 +345,7 @@ impl Mesh {
             nodes,
             proposer,
             links: BTreeMap::new(),
+            meta_crossed: HashSet::new(),
             planned,
             solved: Vec::new(),
             inbox: VecDeque::new(),
@@ -460,7 +476,13 @@ impl Mesh {
             control_input(&frame)
         };
         match decoded {
-            Ok(input) => self.step_peer(to, from, input),
+            Ok(input) => {
+                if let PeerInput::RecvHeaderMeta { block_id, .. } = input {
+                    self.meta_crossed
+                        .insert((to.min(from), to.max(from), block_id));
+                }
+                self.step_peer(to, from, input)
+            }
             Err(row) => {
                 assert_eq!(
                     from, ADVERSARY,
@@ -509,11 +531,17 @@ impl Mesh {
             .data
             .push_back(frame);
         match item {
+            DataQueueItem::HeaderMeta(message) => {
+                let block_id = header_meta_block(&message);
+                self.meta_crossed
+                    .insert((node.min(peer), node.max(peer), block_id));
+            }
             DataQueueItem::Part { block_id, .. } => {
+                self.assert_meta_crossed(node, peer, block_id);
                 self.step_table(node, BlockInput::PartUploaded { block_id, bytes });
             }
             DataQueueItem::WantEnd { .. } => self.step_peer(node, peer, PeerInput::WantEndWritten),
-            DataQueueItem::Have { .. } => {}
+            DataQueueItem::Have { block_id, .. } => self.assert_meta_crossed(node, peer, block_id),
         }
     }
 
@@ -957,7 +985,10 @@ impl Mesh {
                 let control = frame.as_ref().is_some_and(|f| {
                     !matches!(
                         f.message_type,
-                        message_type::PART | message_type::HAVE | message_type::WANT_END
+                        message_type::HEADER_META
+                            | message_type::PART
+                            | message_type::HAVE
+                            | message_type::WANT_END
                     )
                 });
                 (control, frame)
@@ -1007,10 +1038,7 @@ impl Mesh {
         // `a` bit 7 sends the frame on the other stream.
         let control = matches!(
             message_type,
-            message_type::HEADER_META
-                | message_type::WANT
-                | message_type::STRIPE_DONE
-                | message_type::BLOCK_DONE
+            message_type::WANT | message_type::STRIPE_DONE | message_type::BLOCK_DONE
         ) != (a & 0x80 != 0);
         self.adversary_send(to, control, frame);
     }
@@ -1081,9 +1109,22 @@ impl Mesh {
 
     /// Ends the connection between `i` and `j`: each honest side's session
     /// ends and drains, and the frames in flight are lost.
+    /// bpv1-8: an honest node writes a block's parts and `Have`s to a peer
+    /// only after the block's `HeaderMeta` crossed their connection, so the
+    /// receiver reads the metadata first on the same stream.
+    fn assert_meta_crossed(&self, node: usize, peer: usize, block_id: block::Hash) {
+        assert!(
+            self.meta_crossed
+                .contains(&(node.min(peer), node.max(peer), block_id)),
+            "{MESH}: bpv1-8 node {node} wrote traffic for {block_id} to {peer} before its HeaderMeta crossed"
+        );
+    }
+
     fn end_connection(&mut self, i: usize, j: usize) {
         self.links.remove(&(i, j));
         self.links.remove(&(j, i));
+        self.meta_crossed
+            .retain(|&(a, b, _)| (a, b) != (i.min(j), i.max(j)));
         for (local, remote) in [(i, j), (j, i)] {
             let Some(mut session) = self.nodes[local].sessions.remove(&remote) else {
                 continue;
@@ -1288,6 +1329,11 @@ impl Mesh {
                     .or_default()
                     .control
                     .push_back(frame);
+            }
+            PeerOutput::SendHeaderMeta(message) => {
+                if let Some(s) = self.nodes[node].sessions.get_mut(&peer) {
+                    s.writer.push_header_meta(message);
+                }
             }
             PeerOutput::SendHave {
                 block_id,

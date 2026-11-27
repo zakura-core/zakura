@@ -178,6 +178,10 @@ pub enum DropReason {
     LocalCapacity,
     /// Refused before proof because the block table no longer holds the block.
     NotAdmitted,
+    /// Arrived for a block whose `HeaderMeta` crossed but whose state this
+    /// session dropped: the table rejected the peer's copy, or evicted the
+    /// retired block (bpv1-14).
+    MetaDropped,
 }
 
 /// Block admitted locally in `BlockTable`; triggers `HeaderMeta` send (unless
@@ -328,7 +332,7 @@ pub enum PeerInput {
     /// Block admitted locally in `BlockTable`; triggers `HeaderMeta` send (unless
     /// the peer already sent it) and replays held early entries.
     BlockAdmitted(BlockAdmitted),
-    /// Inbound `HeaderMeta` decoded on the control stream.
+    /// Inbound `HeaderMeta` decoded on the data stream.
     RecvHeaderMeta {
         /// Consensus hash of the header carried in `HeaderMeta`.
         block_id: block::Hash,
@@ -436,8 +440,11 @@ pub enum PeerInput {
 /// Outputs emitted by [`PeerState::step`] for IO to execute.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PeerOutput {
-    /// Enqueue a control-stream message (`HeaderMeta`, `Want`, `StripeDone`, `BlockDone`).
+    /// Enqueue a control-stream message (`Want`, `StripeDone`, `BlockDone`).
     SendControl(Box<Bpv1Message>),
+    /// Enqueue a `HeaderMeta` on the data stream ahead of every queued item
+    /// but earlier `HeaderMeta`s, so it precedes its block's traffic (bpv1-8).
+    SendHeaderMeta(Box<Bpv1Message>),
     /// Enqueue a data-stream `Have` message behind queued data. A flagged
     /// `Have` precedes the [`PeerOutput::PushPart`]s it flags (bpv1-72).
     SendHave {
@@ -1016,6 +1023,12 @@ pub struct PeerState {
     blocks: HashMap<block::Hash, PeerBlockState>,
     /// Blocks whose `HeaderMeta` this peer sent before local admission.
     meta_received_pending: HashSet<block::Hash>,
+    /// Blocks whose `HeaderMeta` crossed this connection but whose state this
+    /// session no longer keeps: the table rejected the peer's copy, or
+    /// evicted the retired block. Their parts and `Have`s drop (bpv1-14).
+    /// Holds at most `MAX_PENDING_META_COUNT`, oldest first. An honest peer
+    /// sends traffic only for blocks in its propagation window, far fewer.
+    meta_dropped: VecDeque<block::Hash>,
     /// Retired block counters kept while inside `PROPAGATION_DEPTH` (bpv1-21).
     retired: HashMap<block::Hash, RetiredCounters>,
 
@@ -1066,6 +1079,7 @@ impl PeerState {
             next_attempt: 1,
             blocks: HashMap::new(),
             meta_received_pending: HashSet::new(),
+            meta_dropped: VecDeque::new(),
             retired: HashMap::new(),
             wants_out: HashMap::new(),
             wants_in: HashMap::new(),
@@ -1310,12 +1324,18 @@ impl PeerState {
             }
             PeerInput::Retire(retire) => self.handle_retire(retire, &mut step),
             PeerInput::MetaRejected { block_id } => {
-                self.meta_received_pending.remove(&block_id);
+                if self.meta_received_pending.remove(&block_id) {
+                    self.note_meta_dropped(block_id);
+                }
                 self.drop_early_for_block(block_id, &mut step);
             }
             PeerInput::EvictRetired { block_id } => {
-                self.retired.remove(&block_id);
-                self.meta_received_pending.remove(&block_id);
+                if self.retired.remove(&block_id).is_some() {
+                    self.note_meta_dropped(block_id);
+                }
+                if self.meta_received_pending.remove(&block_id) {
+                    self.drop_early_for_block(block_id, &mut step);
+                }
                 self.flags_lost.retain(|b| *b != block_id);
             }
             PeerInput::Tick => self.handle_tick(now, &mut step),
@@ -1386,6 +1406,7 @@ impl PeerState {
             return;
         }
         let received = self.meta_received_pending.remove(&block_id);
+        self.meta_dropped.retain(|b| *b != block_id);
         let flags_lost = self.take_flags_lost(block_id);
         let first = !self.blocks.contains_key(&block_id);
         let state = self
@@ -1408,7 +1429,7 @@ impl PeerState {
         // because a peer's later session never received this copy.
         if !state.meta_received && !state.meta_sent {
             state.meta_sent = true;
-            step.outputs.push(PeerOutput::SendControl(header_meta));
+            step.outputs.push(PeerOutput::SendHeaderMeta(header_meta));
         }
 
         // bpv1-9: proposer queues BlockDone right after HeaderMeta so no peer
@@ -1438,13 +1459,10 @@ impl PeerState {
             || self.blocks.get(&block_id).is_some_and(|b| b.meta_received)
             || self.retired.get(&block_id).is_some_and(|r| r.meta_received);
         if duplicate {
-            self.close_protocol(
-                BPV1_CONTROL_KIND,
-                Bpv1CloseRow::Row5DuplicateHeaderMeta,
-                step,
-            );
+            self.close_protocol(BPV1_DATA_KIND, Bpv1CloseRow::Row5DuplicateHeaderMeta, step);
             return;
         }
+        self.meta_dropped.retain(|b| *b != block_id);
         if let Some(block) = self.blocks.get_mut(&block_id) {
             block.meta_received = true;
             // Parts that waited for this `HeaderMeta` (bpv1-14) can now be accepted.
@@ -1489,9 +1507,9 @@ impl PeerState {
             return;
         }
 
-        // 2. Unknown block -> data-stream early record (bpv1-48).
+        // 2. Unadmitted block -> hold, drop, or close 21 (bpv1-14).
         let Some(block) = self.blocks.get(&block_id) else {
-            self.buffer_early_data(now, EarlyDataKind::Part(prefix), step);
+            self.recv_unadmitted(now, EarlyDataKind::Part(prefix), step);
             return;
         };
 
@@ -1874,7 +1892,7 @@ impl PeerState {
         }
 
         let Some(block) = self.blocks.get_mut(&block_id) else {
-            self.buffer_early_data(now, EarlyDataKind::Have(have), step);
+            self.recv_unadmitted(now, EarlyDataKind::Have(have), step);
             return;
         };
         let indices = have.indices;
@@ -2618,6 +2636,7 @@ impl PeerState {
     fn handle_session_end(&mut self) {
         self.blocks.clear();
         self.meta_received_pending.clear();
+        self.meta_dropped.clear();
         self.retired.clear();
         self.wants_out.clear();
         self.wants_in.clear();
@@ -2648,6 +2667,48 @@ impl PeerState {
                 kind,
             });
         }
+    }
+
+    /// Handles a `Part` or `Have` for a block this session has not admitted
+    /// (bpv1-14). The peer's `HeaderMeta` precedes the block's traffic on the
+    /// data stream (bpv1-8), so the metadata crossed unless the peer broke
+    /// that order. Data behind metadata under local admission waits in the
+    /// early record (bpv1-48). Data behind metadata that this session dropped
+    /// drops. Data whose metadata never crossed closes 21.
+    fn recv_unadmitted(&mut self, now: Instant, kind: EarlyDataKind, step: &mut PeerStep) {
+        let block_id = kind.block_id();
+        if self.meta_received_pending.contains(&block_id) {
+            self.buffer_early_data(now, kind, step);
+        } else if self.meta_dropped.contains(&block_id) {
+            // A later admission still opens the push slots of a dropped
+            // flagged `Have` (bpv1-60).
+            self.note_dropped_early(&kind);
+            if let EarlyDataKind::Part(prefix) = kind {
+                step.events.push(PeerEvent::PartDropped {
+                    block_id,
+                    index: prefix.index,
+                    reason: DropReason::MetaDropped,
+                });
+            }
+        } else {
+            self.close_protocol(
+                BPV1_DATA_KIND,
+                Bpv1CloseRow::Row21DataBeforeHeaderMeta,
+                step,
+            );
+        }
+    }
+
+    /// Remembers that this session dropped the state of `block_id` after its
+    /// `HeaderMeta` crossed. The oldest mark leaves when the set is full.
+    fn note_meta_dropped(&mut self, block_id: block::Hash) {
+        if self.meta_dropped.contains(&block_id) {
+            return;
+        }
+        if self.meta_dropped.len() >= MAX_PENDING_META_COUNT {
+            self.meta_dropped.pop_front();
+        }
+        self.meta_dropped.push_back(block_id);
     }
 
     fn buffer_early_data(&mut self, now: Instant, kind: EarlyDataKind, step: &mut PeerStep) {

@@ -1517,10 +1517,11 @@ fn bpv1_59_lying_and_empty_announcers_cannot_stop_honest_fetches() {
         mesh.connect(0, e, honest, honest, peer_cfg, honest_est, honest_est);
     }
     mesh.connect(1, 2, honest, honest, peer_cfg, honest_est, honest_est);
-    // The entry peers' data reaches the victims after the adversaries
-    // announce, so the victims pull before any holder push arrives.
+    // The entry peers' `HeaderMeta` leads their parts on the data stream. A
+    // slow link spaces the parts behind it, so the adversaries announce and
+    // the victims pull from them before most holder pushes arrive.
     let slow_data = LinkProfile {
-        data_delay: Duration::from_millis(150),
+        rate_bps: 2_000,
         ..honest
     };
     for victim in [3, 4] {

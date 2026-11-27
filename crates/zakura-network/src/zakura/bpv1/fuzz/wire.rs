@@ -197,19 +197,16 @@ pub fn replay_bpv1_wire_bytes(
     }
 
     // 2. The control stream decoder decodes first, then refuses data types
-    // with row 1 and a `HeaderMeta` whose header does not parse with row 2.
+    // with row 1.
     let control = control_input(&frame);
     let expected_control = match &decoded {
         Err(_) => Err(Bpv1CloseRow::Row2Decode),
-        Ok(Bpv1Message::Part { .. } | Bpv1Message::Have { .. } | Bpv1Message::WantEnd { .. }) => {
-            Err(Bpv1CloseRow::Row1FrameHeader)
-        }
-        Ok(message @ Bpv1Message::HeaderMeta { .. }) => {
-            match decode_meta_envelope(zakura_chain::block::Hash([0; 32]), message.clone()) {
-                Some(_) => Ok(()),
-                None => Err(Bpv1CloseRow::Row2Decode),
-            }
-        }
+        Ok(
+            Bpv1Message::HeaderMeta { .. }
+            | Bpv1Message::Part { .. }
+            | Bpv1Message::Have { .. }
+            | Bpv1Message::WantEnd { .. },
+        ) => Err(Bpv1CloseRow::Row1FrameHeader),
         Ok(_) => Ok(()),
     };
     assert_eq!(
@@ -218,10 +215,7 @@ pub fn replay_bpv1_wire_bytes(
         "{WIRE}: bpv1-61 the control decoder disagrees with the family decode"
     );
     match &control {
-        Ok(input) => {
-            reached.hit("control:accepted");
-            check_meta(input, &frame, reached);
-        }
+        Ok(_) => reached.hit("control:accepted"),
         Err(row) => reached.hit(row.label()),
     }
 
@@ -248,8 +242,16 @@ pub fn replay_bpv1_wire_bytes(
             }
             check_part(&frame, &encoded, block_id, reached);
         }
-        message_type::HAVE | message_type::WANT_END => {
+        message_type::HEADER_META | message_type::HAVE | message_type::WANT_END => {
+            // A `HeaderMeta` whose header does not parse closes with row 2.
             let expected = match &decoded {
+                Ok(message @ Bpv1Message::HeaderMeta { .. }) => {
+                    match decode_meta_envelope(zakura_chain::block::Hash([0; 32]), message.clone())
+                    {
+                        Some(_) => Ok(()),
+                        None => Err(Bpv1CloseRow::Row2Decode),
+                    }
+                }
                 Ok(_) => Ok(()),
                 Err(WireError::ReservedFlags(_)) => Err(Bpv1CloseRow::Row1FrameHeader),
                 Err(_) => Err(Bpv1CloseRow::Row2Decode),
@@ -259,8 +261,11 @@ pub fn replay_bpv1_wire_bytes(
                 expected,
                 "{WIRE}: bpv1-61 the data decoder disagrees with the family decode"
             );
-            match data {
-                Ok(_) => reached.hit("data:accepted"),
+            match &data {
+                Ok(input) => {
+                    reached.hit("data:accepted");
+                    check_meta(input, &frame, reached);
+                }
                 Err(row) => reached.hit(row.label()),
             }
             if let Ok(message) = &decoded {
@@ -279,7 +284,7 @@ pub fn replay_bpv1_wire_bytes(
     summary
 }
 
-/// A `HeaderMeta` the control decoder accepted yields the table's envelope,
+/// A `HeaderMeta` the data decoder accepted yields the table's envelope,
 /// keyed by its header's hash.
 fn check_meta(input: &PeerInput, frame: &Frame, reached: &mut Reached) {
     let PeerInput::RecvHeaderMeta { block_id, message } = input else {
@@ -387,6 +392,7 @@ fn check_smaller_form(indices: &[u32], reached: &mut Reached) {
 /// same frame.
 fn check_queue_item(message: &Bpv1Message, frame: &Frame, reached: &mut Reached) {
     let item = match message {
+        Bpv1Message::HeaderMeta { .. } => DataQueueItem::HeaderMeta(Box::new(message.clone())),
         Bpv1Message::Have {
             block_id,
             flags,

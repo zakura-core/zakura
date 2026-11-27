@@ -147,10 +147,14 @@ fn close_2_decode_errors() {
         ("zero want_id", control_input(&zero_id)),
         ("empty Want bitmap", control_input(&empty_bitmap)),
         ("truncated Want", control_input(&short_want)),
-        ("unparsable header", control_input(&bad_header)),
     ] {
         assert_eq!(input.err(), Some(Bpv1CloseRow::Row2Decode), "{name}");
     }
+    assert_eq!(
+        data_input(bad_header).err(),
+        Some(Bpv1CloseRow::Row2Decode),
+        "unparsable header"
+    );
 
     assert!(data_input(frame(&plain_have())).is_ok());
     assert!(control_input(&frame(&want(1))).is_ok());
@@ -1279,9 +1283,10 @@ fn close_16_have_bitmap_length_padding_or_repeat() {
     );
     assert_closed(&peer, Bpv1CloseRow::Row16BadHaveIndex);
 
-    // A `Have` before admission waits in the early record, then closes
-    // when its replay meets the layout.
+    // A `Have` behind metadata under admission waits in the early record,
+    // then closes when its replay meets the layout.
     let mut peer = PeerState::new(PeerConfig::for_profile(Profile::TINY), node_id(2), 1);
+    peer.step(now, recv_meta(block_id));
     peer.step(
         now,
         have_in(block_id, HaveForm::Bitmap { len: len + 1 }, vec![0]),
@@ -1291,6 +1296,7 @@ fn close_16_have_bitmap_length_padding_or_repeat() {
     assert_closed(&peer, Bpv1CloseRow::Row16BadHaveIndex);
 
     let mut peer = PeerState::new(PeerConfig::for_profile(Profile::TINY), node_id(2), 1);
+    peer.step(now, recv_meta(block_id));
     peer.step(now, have_in(block_id, fits, vec![0, total - 1]));
     peer.step(now, admitted(block_id, tiny(), node_id(3)));
     assert!(peer.close_cause().is_none());
@@ -1369,6 +1375,49 @@ fn close_20_push_and_relay_flag_bounds() {
     assert!(peer.close_cause().is_none());
     peer.step(now, have_with(block_id, HaveFlags::Relay, vec![bound]));
     assert_closed(&peer, Bpv1CloseRow::Row20BadPushFlags);
+}
+
+/// `bpv1-close-21` (bpv1-14): a `Part` or `Have` for a block whose
+/// `HeaderMeta` crossed the connection in neither direction closes 21 on the
+/// data stream. Behind the peer's `HeaderMeta`, behind this node's, or
+/// behind metadata this session dropped, the same traffic stays open.
+#[test]
+fn close_21_block_traffic_before_any_header_meta() {
+    use super::wire::BPV1_DATA_KIND;
+
+    let now = Instant::now();
+    let block_id = block::Hash([0x65; 32]);
+    let fresh = || PeerState::new(PeerConfig::for_profile(Profile::TINY), node_id(2), 1);
+    let traffic = [
+        tiny_part_prefix(block_id, 0),
+        have_with(block_id, HaveFlags::Plain, vec![0]),
+    ];
+
+    for input in &traffic {
+        let mut peer = fresh();
+        peer.step(now, input.clone());
+        assert_closed(&peer, Bpv1CloseRow::Row21DataBeforeHeaderMeta);
+        assert_eq!(peer.close_cause().unwrap().stream_kind, BPV1_DATA_KIND);
+
+        // The peer's `HeaderMeta` leads it, under admission.
+        let mut peer = fresh();
+        peer.step(now, recv_meta(block_id));
+        peer.step(now, input.clone());
+        assert!(peer.close_cause().is_none());
+
+        // This node's `HeaderMeta` crossed first. A `Have` needs no `Want`.
+        let mut peer = tiny_session(block_id, now);
+        peer.step(now, pull(block_id, 0, &[0], now));
+        peer.step(now, input.clone());
+        assert!(peer.close_cause().is_none());
+
+        // The table rejected the peer's metadata.
+        let mut peer = fresh();
+        peer.step(now, recv_meta(block_id));
+        peer.step(now, PeerInput::MetaRejected { block_id });
+        peer.step(now, input.clone());
+        assert!(peer.close_cause().is_none());
+    }
 }
 
 // ============================================================================

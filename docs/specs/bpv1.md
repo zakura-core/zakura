@@ -327,7 +327,7 @@ the admitted header. The profile bounds coinbase bytes and path depth before
 allocation. The coinbase byte bound is the consensus bound, `MAX_BLOCK_BYTES`:
 consensus has no separate coinbase limit, so a tighter bound would send valid
 blocks to slower relay. A large coinbase travels whole in `HeaderMeta`, so its
-miner pays for it on every connection's control stream. The coinbase byte bound
+miner pays for it on every connection's data stream. The coinbase byte bound
 also bounds the coinbase's outputs and
 script bytes. Pre-NU7 blocks and pool-built coinbases
 without a commitment use existing block propagation.
@@ -412,9 +412,10 @@ that the proposer already flagged or sent on the connection, and every index of
 a stripe or block the neighbour finished. It sends no unflagged `Have`.
 
 The flag travels on the same ordered stream as the parts, so it always
-reaches the neighbour before them, even when the proposer's `HeaderMeta` is
-still in flight on the control stream. A neighbour that admitted the block from
-another peer's `HeaderMeta` therefore accepts the proposer's seeds at once.
+reaches the neighbour before them. The proposer's `HeaderMeta` leads both on
+that stream, unless the neighbour sent the block's metadata first. A neighbour
+that admitted the block from another peer's `HeaderMeta` therefore accepts the
+proposer's seeds at once.
 
 Two hops push. The proposer pushes seeds to its neighbours, and each holder
 pushes its pushed seeds to its own peers. Every later hop pulls parts that its
@@ -574,20 +575,35 @@ or retired block: `Refuse` with reason `UnknownBlock` for a block subscription,
 and `WantEnd` with `sent = 0` for a `Want`.
 
 **Unknown blocks.** Another message can name a `block_id` that this node has not
-admitted: its metadata is still in flight or under admission, the peer runs more than `PROPAGATION_DEPTH` blocks behind, or
-the peer is lying. The receiver cannot yet check such a message.
+admitted: its metadata is still in flight or under admission, this node dropped
+the metadata, the peer runs more than `PROPAGATION_DEPTH` blocks behind, or the
+peer is lying. The receiver cannot yet check such a message.
 
-- On the data stream, the receiver holds `Part` and `Have` messages in a
-  per-peer early record, with a byte bound per peer, a node-wide byte bound, and
-  an age bound `EARLY_AGE`. The byte bounds count what the receiver holds: a
-  held `Have` costs its frame, or its block id plus its decoded indices,
-  whichever is larger, because a bitmap byte names up to eight indices. When a
-  peer's record is full, the receiver pauses reading that peer's data stream
-  until entries leave the record. Pausing is not a violation.
+- On the data stream, a peer's `HeaderMeta` for a block precedes its `Part`s
+  and `Have`s for the block, unless this node sent the metadata first
+  (section 4). A `Part` or `Have` for a block that this node has not admitted
+  falls in one of three cases:
+  - The peer's `HeaderMeta` arrived and admission still runs. The receiver
+    holds the message in a per-peer early record, with a byte bound per peer,
+    a node-wide byte bound, and an age bound `EARLY_AGE`. The byte bounds count
+    what the receiver holds: a held `Have` costs its frame, or its block id
+    plus its decoded indices, whichever is larger, because a bitmap byte names
+    up to eight indices. When a peer's record is full, the receiver pauses
+    reading that peer's data stream until entries leave the record. Pausing is
+    not a violation. Admission is local work, so the pause ends.
+  - The metadata crossed, but this node dropped it: admission rejected the
+    peer's copy, or the retired block left the retired record. The message
+    returns `Drop`. The receiver remembers these blocks in a per-peer set
+    bounded like pending metadata.
+  - The metadata crossed the connection in neither direction. The message
+    returns `Disconnect` (close-21): a conformant peer queues the metadata
+    ahead of the block's traffic on the same stream.
 - On the control stream, the receiver MAY hold `StripeDone`, `BlockDone`, and
-  `Advert` in a separate small per-peer record. It MUST NOT pause the control
-  stream for this record, because the metadata that resolves the block can sit
-  behind the paused message. Messages that do not fit return `Drop`.
+  `Advert` in a separate small per-peer record. The two streams are unordered,
+  so these messages can overtake the metadata. The receiver MUST NOT pause the
+  control stream for this record, because `Want`s and stop signals for other
+  blocks travel behind the held message. Messages that do not fit return
+  `Drop`.
 
 When the block is admitted, the receiver replays the held messages through the
 ordinary checks. A replayed part that is no longer wanted returns `Drop`,
@@ -595,8 +611,9 @@ because the subscription state can change between arrival and replay. Entries
 that reach `EARLY_AGE` return `Drop`.
 
 A flagged `Have` that leaves the early record without replay, because the
-record was full, the entry aged out, or the metadata was rejected, leaves its
-parts behind it on the stream. The receiver remembers that it lost this
+record was full, the entry aged out, or the metadata was dropped, leaves its
+parts behind it on the stream. A flagged `Have` behind dropped metadata does
+the same. The receiver remembers that it lost this
 peer's flags for the block, in a per-peer set bounded like pending metadata.
 After admission, a part from that peer that no push slot or `Want` authorizes
 opens a push slot itself while its stripe has fewer push slots from the peer
@@ -617,7 +634,8 @@ or proof verification. A peer that exhausts either counter sent a part or index
 twice on this connection, which returns `Disconnect`. Other announcements for a
 retired block return `Drop`. A block that leaves the retired record is below
 this node's propagation window, so this node never admits it again. A peer that
-still admits it runs far behind; the early record bounds its traffic.
+still admits it runs far behind. Its traffic for the block returns `Drop` while
+this node remembers the dropped block, as above.
 
 **The bound.** Any peer, honest or not, can send at most one copy of each part
 that this node subscribed to or asked for, plus the parts the peer flagged
@@ -669,9 +687,8 @@ BPv1 is one `zakura-network` service. Its
 [service session](../design/service-sessions.md) has two persistent ordered
 streams carrying seven messages (`decision-13`):
 
-- The **control stream** carries `HeaderMeta`, `Want`, `StripeDone`, and
-  `BlockDone`.
-- The **data stream** carries `Part`, `Have`, and `WantEnd`.
+- The **control stream** carries `Want`, `StripeDone`, and `BlockDone`.
+- The **data stream** carries `HeaderMeta`, `Part`, `Have`, and `WantEnd`.
 
 `Subscribe`, `Unsubscribe`, `Refuse`, `SubscriptionEnd`, and `Advert` from
 revision 2 are omitted in BPv1 (`decision-13`).
@@ -682,6 +699,12 @@ queues MUST NOT block control traffic.
 The two streams impose no order on each other. The protocol places each message
 by the ordering it needs:
 
+- **Metadata travels ahead of its block's traffic.** A node queues `HeaderMeta`
+  on the data stream ahead of every queued message except earlier
+  `HeaderMeta`s. It queues no `Part` or `Have` for the block to the peer
+  before it queued or received the metadata. So a receiver reads a peer's
+  `HeaderMeta` before that peer's parts and `Have`s for the block, and a
+  `HeaderMeta` waits behind at most the frame in flight.
 - **Ends travel behind parts.** `WantEnd` follows, on the FIFO data stream,
   every part its `Want` exchange authorized. No part of an ended `Want` can
   follow its `WantEnd`. The receiver closes the reservation exactly when it
@@ -694,8 +717,9 @@ by the ordering it needs:
 - **Stop signals overtake parts.** `StripeDone` and `BlockDone` travel on the
   control stream so they reach the sender before its queued parts drain.
 
-A message can arrive before the metadata of the block it names. Section 3's
-early record handles that case.
+A control message can arrive before the metadata of the block it names. A data
+message cannot, unless this node sent the metadata. Section 3 handles both
+cases.
 
 ### Message table
 
@@ -705,7 +729,7 @@ describes. Payload caps below are W2 values (`01-wire.md` §1).
 
 | Discriminator | Message | Stream | Role | Answers or ends | Payload cap |
 | --- | --- | --- | --- | --- | --- |
-| 1 | `HeaderMeta` | control | Announcement | — | 2,006,278 |
+| 1 | `HeaderMeta` | data | Announcement | — | 2,006,278 |
 | 4 | `Want` | control | Request | — | 51 |
 | 5 | `StripeDone` | control | Announcement | — | 36 |
 | 6 | `BlockDone` | control | Announcement | — | 32 |
@@ -767,82 +791,6 @@ or `u8(2)` for `Proposer`. In the subscription extension a lane encodes as a 32-
 Section 8 lists every field in transmission order.
 
 ### Control stream
-
-#### `HeaderMeta` — Announcement, discriminator 1
-
-- **Frame**
-  - payload cap = 2,006,278 bytes
-- **Decode**
-  - header length = 1..=4,096 bytes
-  - binding length = 1..=2,002,086 bytes
-  - codec = W2 codec identifier; `part_bytes = S` for `body_bytes` (section 2)
-  - exact consumption
-- **Verify**
-  - `stripes`, `k`, and `n` equal the values recomputed from `body_bytes`
-  - `stripes <= MAX_STRIPES`
-  - header plus body bytes <= `MAX_BLOCK_BYTES`, with checked arithmetic
-  - key-binding envelope within the profile's coinbase, script, output, and
-    path bounds
-- **Admission**, in this order
-  - headerchain admits the header, including proof of work and contextual
-    difficulty
-  - the binding's txid and auth-data paths match the admitted header
-  - the coinbase holds exactly one version-01 commitment, and its `C` equals
-    the recomputed hash (section 2)
-- **Cadence**
-  - at most one `HeaderMeta` per block per connection
-  - capacity = 64 messages; refill = 16 messages/s; on_empty = record and
-    forward
-  - the per-peer and node-wide pending-metadata bounds in section 1
-
-A node MUST send `HeaderMeta` for a block at most once per connection. It
-MUST forward only metadata it admitted, and only within the propagation window
-in section 2. It SHOULD forward admitted metadata promptly to every peer, including peers without subscriptions. Forwarding MUST NOT wait
-for parts or a per-hop request. It SHOULD NOT send metadata on a connection
-on which the peer already sent it the block's metadata. A peer's later
-connection never carried that copy, so it gets the metadata like any other
-connection, even when the peer sent the first copy on an earlier connection.
-The proposer SHOULD write `HeaderMeta` to every peer before it writes any part.
-
-A header that headerchain rejects returns `Disconnect` when headerchain
-classifies the failure as peer-caused. A missing parent invokes bounded
-recovery and is not a violation. With a missing parent, a height outside the
-range in section 1 or a target above the section 1 bound returns `Drop`, and a
-proof of work that fails the section 1 checks returns `Disconnect`. A layout mismatch, invalid binding, or failed
-commitment returns `Disconnect`: an honest relay forwards only admitted
-metadata. A repeat of a block's metadata from the same peer returns `Disconnect`
-while this node holds the block in admission, admitted, or retired. The sender
-keeps the block retired at least until the block leaves its own window, and it
-never admits a block outside that window, so it cannot send the metadata twice.
-
-The header commits the coinbase, and the coinbase commits `C`, so a block has
-one valid `HeaderMeta`. The consensus hash covers only the header, so other
-peers may send different copies under one hash while the first copy is in
-admission:
-
-- The node checks each copy's layout when the copy arrives.
-- A copy that fails its commitment check returns `Disconnect` for every peer
-  that sent an equal copy, first or later. The check depends only on the copy
-  and the admitted height, so an honest relay never forwards a copy that fails
-  it. With a missing parent, a copy whose binding fails the section 1 checks
-  returns `Disconnect` the same way.
-- The node keeps each differing copy while it fits the metadata budget.
-  Kept copies use only room that no first copy needs, and they give way to
-  any first copy that the node admits.
-- When the first copy fails, the node checks the kept copies one at a time,
-  in arrival order, until one passes. With a missing parent, a kept copy
-  whose senders all hold the per-peer pending limit returns `Drop`, and the
-  next kept copy takes its place.
-- A peer whose session ended gets no answer, so the node forgets it as a
-  sender of a copy.
-- Every other duplicate from another peer returns `Drop`, including each copy
-  that arrives after the block is admitted.
-
-Metadata for a retired block, or for a block outside the propagation window,
-returns `Drop`.
-
-`HeaderMeta` authorizes no parts. The proposer's flagged `Have`s on the data
-stream authorize its seeds (section 3).
 
 #### `Want` — Request, discriminator 4
 
@@ -949,6 +897,84 @@ _(Discriminators 2 `Subscribe`, 3 `Unsubscribe`, 7 `Advert`, 10 `Refuse`, and
 
 ### Data stream
 
+#### `HeaderMeta` — Announcement, discriminator 1
+
+- **Frame**
+  - payload cap = 2,006,278 bytes
+- **Decode**
+  - header length = 1..=4,096 bytes
+  - binding length = 1..=2,002,086 bytes
+  - codec = W2 codec identifier; `part_bytes = S` for `body_bytes` (section 2)
+  - exact consumption
+- **Verify**
+  - `stripes`, `k`, and `n` equal the values recomputed from `body_bytes`
+  - `stripes <= MAX_STRIPES`
+  - header plus body bytes <= `MAX_BLOCK_BYTES`, with checked arithmetic
+  - key-binding envelope within the profile's coinbase, script, output, and
+    path bounds
+- **Admission**, in this order
+  - headerchain admits the header, including proof of work and contextual
+    difficulty
+  - the binding's txid and auth-data paths match the admitted header
+  - the coinbase holds exactly one version-01 commitment, and its `C` equals
+    the recomputed hash (section 2)
+- **Cadence**
+  - at most one `HeaderMeta` per block per connection
+  - capacity = 64 messages; refill = 16 messages/s; on_empty = record and
+    forward
+  - the per-peer and node-wide pending-metadata bounds in section 1
+
+A node MUST send `HeaderMeta` for a block at most once per connection. It
+MUST forward only metadata it admitted, and only within the propagation window
+in section 2. It SHOULD forward admitted metadata promptly to every peer, including peers without subscriptions. Forwarding MUST NOT wait
+for parts or a per-hop request. It SHOULD NOT send metadata on a connection
+on which the peer already sent it the block's metadata. A peer's later
+connection never carried that copy, so it gets the metadata like any other
+connection, even when the peer sent the first copy on an earlier connection.
+A node MUST queue `HeaderMeta` on the data stream ahead of every queued message
+except earlier `HeaderMeta`s (section 4). The proposer SHOULD write
+`HeaderMeta` to every peer before it writes any part.
+
+A header that headerchain rejects returns `Disconnect` when headerchain
+classifies the failure as peer-caused. A missing parent invokes bounded
+recovery and is not a violation. With a missing parent, a height outside the
+range in section 1 or a target above the section 1 bound returns `Drop`, and a
+proof of work that fails the section 1 checks returns `Disconnect`. A layout mismatch, invalid binding, or failed
+commitment returns `Disconnect`: an honest relay forwards only admitted
+metadata. A repeat of a block's metadata from the same peer returns `Disconnect`
+while this node holds the block in admission, admitted, or retired. The sender
+keeps the block retired at least until the block leaves its own window, and it
+never admits a block outside that window, so it cannot send the metadata twice.
+
+The header commits the coinbase, and the coinbase commits `C`, so a block has
+one valid `HeaderMeta`. The consensus hash covers only the header, so other
+peers may send different copies under one hash while the first copy is in
+admission:
+
+- The node checks each copy's layout when the copy arrives.
+- A copy that fails its commitment check returns `Disconnect` for every peer
+  that sent an equal copy, first or later. The check depends only on the copy
+  and the admitted height, so an honest relay never forwards a copy that fails
+  it. With a missing parent, a copy whose binding fails the section 1 checks
+  returns `Disconnect` the same way.
+- The node keeps each differing copy while it fits the metadata budget.
+  Kept copies use only room that no first copy needs, and they give way to
+  any first copy that the node admits.
+- When the first copy fails, the node checks the kept copies one at a time,
+  in arrival order, until one passes. With a missing parent, a kept copy
+  whose senders all hold the per-peer pending limit returns `Drop`, and the
+  next kept copy takes its place.
+- A peer whose session ended gets no answer, so the node forgets it as a
+  sender of a copy.
+- Every other duplicate from another peer returns `Drop`, including each copy
+  that arrives after the block is admitted.
+
+Metadata for a retired block, or for a block outside the propagation window,
+returns `Drop`.
+
+`HeaderMeta` authorizes no parts. The proposer's flagged `Have`s behind it
+authorize its seeds (section 3).
+
 #### `Part` — Response, discriminator 8
 
 - **Frame**
@@ -958,7 +984,10 @@ _(Discriminators 2 `Subscribe`, 3 `Unsubscribe`, 7 `Advert`, 10 `Refuse`, and
   - payload = the bytes after the siblings, at most `S_MAX`
   - exact consumption
 - **Reservation precheck**, on the fixed prefix `(block_id, index)`
-  - an unknown block goes to the data-stream early record
+  - a block this node has not admitted follows section 3: behind the peer's
+    `HeaderMeta` under admission it goes to the data-stream early record,
+    behind dropped metadata it returns `Drop`, and otherwise it returns
+    `Disconnect` (close-21)
   - a retired block spends the peer's retired part counter and returns `Drop`;
     an exhausted counter returns `Disconnect`
   - `index < stripes * n`
@@ -1062,8 +1091,9 @@ replay. A `Have` for a retired block spends the retired index counter by its
 index count, whatever its form. A push flag past the connection's
 push bound, a relay flag from a connection other than `proposer_node`, or a
 relay flag past `n - k` in one stripe returns `Disconnect` (close-20). A
-`Have` for an unknown block enters the data-stream early record, and a `Have`
-for a retired block spends the peer's retired index counter, under section 3. A false unflagged `Have` attracts `Want`s that the
+`Have` for a block this node has not admitted follows the same three cases as
+a `Part`, and a `Have` for a retired block spends the peer's retired index
+counter, under section 3. A false unflagged `Have` attracts `Want`s that the
 sender must still end; it cannot force the receiver to accept parts. A false
 flagged `Have` authorizes at most the connection's push bound per stripe, and
 each part must still be a distinct index that verifies against `part_root`.
@@ -1567,11 +1597,13 @@ infrastructure that the
 4. The wanted set. Unsolicited parts, repeats from one peer, parts after
    `SubscriptionEnd` or `WantEnd`, parts beyond a `Want`'s count, parts of
    retired blocks, retired-block counters, and early-record overflow, pausing,
-   and replay. The control stream never pauses for the early record. Push
-   flags past the connection's push bound, relay flags from a peer other than
-   the proposer or past `n - k`, proposer seeds that arrive before the
-   proposer's `HeaderMeta`, a flagged part that never arrives, and a holder
-   push that crosses another peer's copy of the same part.
+   and replay. The control stream never pauses for the early record. Parts
+   and `Have`s whose `HeaderMeta` crossed in neither direction, and traffic
+   behind dropped metadata. Push flags past the connection's push bound,
+   relay flags from a peer other than the proposer or past `n - k`, proposer
+   seeds that arrive before this node admits the block, a flagged part that
+   never arrives, and a holder push that crosses another peer's copy of the
+   same part.
 5. Subscription crossings. A reference model of both peers generates
    interleavings of the two streams: `Subscribe` against `Refuse`, `Unsubscribe`
    against `Refuse` with reason `Shed`, re-subscription after each end, and

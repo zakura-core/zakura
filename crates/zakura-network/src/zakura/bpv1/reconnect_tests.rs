@@ -215,10 +215,12 @@ impl Node {
                 .iter()
                 .filter(|(to, o)| {
                     *to == peer
-                        && matches!(o, PeerOutput::SendControl(msg) if matches!(
-                            (want, &**msg),
-                            (false, Bpv1Message::HeaderMeta { .. }) | (true, Bpv1Message::Want { .. })
-                        ))
+                        && if want {
+                            matches!(o, PeerOutput::SendControl(msg)
+                                if matches!(**msg, Bpv1Message::Want { .. }))
+                        } else {
+                            matches!(o, PeerOutput::SendHeaderMeta(_))
+                        }
                 })
                 .count()
         };

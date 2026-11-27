@@ -75,6 +75,9 @@ pub enum Bpv1CloseRow {
     /// connection that is not `proposer_node`, or relay flags on more than
     /// `n − k` indices of one stripe.
     Row20BadPushFlags = 20,
+    /// `bpv1-close-21`: `Part` or `Have` for a block whose `HeaderMeta`
+    /// crossed the connection in neither direction (bpv1-14).
+    Row21DataBeforeHeaderMeta = 21,
 }
 
 /// Complete versioned close cause attached to a BPv1 disconnect (decision-5).
@@ -107,6 +110,7 @@ impl Bpv1CloseRow {
             Self::Row16BadHaveIndex => "bpv1-close-16",
             Self::Row18BadWantEnd => "bpv1-close-18",
             Self::Row20BadPushFlags => "bpv1-close-20",
+            Self::Row21DataBeforeHeaderMeta => "bpv1-close-21",
         }
     }
 

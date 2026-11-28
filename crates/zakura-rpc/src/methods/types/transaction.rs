@@ -263,6 +263,7 @@ impl CoinbasePlan {
     fn resource_usage(
         &self,
         version: TxVersion,
+        extra_null_data_len: Option<usize>,
     ) -> Result<CoinbaseResourceUsage, TransactionError> {
         const V4_FIXED_FIELDS_BYTES: usize = 16;
         const V5_AND_V6_FIXED_FIELDS_BYTES: usize = 20;
@@ -288,7 +289,7 @@ impl CoinbasePlan {
             transparent_outputs.push((Zatoshis::ZERO, addr));
         }
 
-        let transparent_output_bytes = transparent_outputs
+        let mut transparent_output_bytes = transparent_outputs
             .iter()
             .map(|(amount, addr)| {
                 let output = TxOut::new(*amount, addr.script().into());
@@ -299,13 +300,23 @@ impl CoinbasePlan {
                 bytes.len()
             })
             .sum::<usize>();
+        let mut transparent_output_count = transparent_outputs.len();
+        if let Some(payload_len) = extra_null_data_len {
+            // Exact serialized size of a zero-value OP_RETURN null-data output
+            // (`OP_RETURN <push-opcode> <payload>`), matching `add_transparent_null_data_output`
+            // (46 bytes for the 35-byte BPv1 commitment).
+            let push_header_len = if payload_len <= 75 { 1 } else { 2 };
+            let script_len = 1 + push_header_len + payload_len;
+            transparent_output_bytes +=
+                VALUE_BALANCE_BYTES + compact_size_bytes(script_len) + script_len;
+            transparent_output_count += 1;
+        }
 
         // The commitment is one more output. Its script holds no signature operation.
         let mesh_commitment_bytes = self
             .mesh_commitment
             .map(|commitment| commitment.to_output().zcash_serialized_size());
-        let transparent_output_count =
-            transparent_outputs.len() + usize::from(mesh_commitment_bytes.is_some());
+        transparent_output_count += usize::from(mesh_commitment_bytes.is_some());
 
         let transparent_bytes = compact_size_bytes(1)
             + max_coinbase_input_bytes
@@ -378,29 +389,36 @@ impl CoinbasePlan {
 impl TransactionTemplate<NegativeOrZero> {
     /// Returns the fee-independent [`CoinbaseResourceUsage`] without generating
     /// proofs.
+    ///
+    /// `extra_null_data_len` reserves space for one zero-value `OP_RETURN` output
+    /// with that many payload bytes, such as the BPv1 commitment.
     pub(super) fn coinbase_resource_usage(
         net: &Network,
         height: Height,
         miner_params: &MinerParams,
         issuance_deficit: Option<Amount<NonNegative>>,
+        extra_null_data_len: Option<usize>,
     ) -> Result<CoinbaseResourceUsage, TransactionError> {
         let block_subsidy = block_subsidy(height, net, issuance_deficit)?;
         let plan = CoinbasePlan::new(net, height, miner_params, block_subsidy)?;
         let branch = BranchId::for_height(net, BlockHeight::from(height));
         let version = TxVersion::suggested_for_branch(branch);
 
-        plan.resource_usage(version)
+        plan.resource_usage(version, extra_null_data_len)
     }
 
     /// Constructs a transaction template for a coinbase transaction.
     ///
     /// `txs_fee` is the sum of all non-coinbase fees before the NSM contribution.
+    /// `null_data_output` appends one zero-value `OP_RETURN` output with that payload,
+    /// which BPv1 uses to commit `BP || 0x01 || C`.
     pub fn new_coinbase(
         net: &Network,
         height: Height,
         miner_params: &MinerParams,
         txs_fee: Amount<NonNegative>,
         nsm_value_balance: Option<Amount<NonNegative>>,
+        null_data_output: Option<&[u8]>,
     ) -> Result<Self, TransactionError> {
         let block_subsidy = block_subsidy(height, net, nsm_value_balance)?;
         let plan = CoinbasePlan::new(net, height, miner_params, block_subsidy)?;
@@ -473,6 +491,16 @@ impl TransactionTemplate<NegativeOrZero> {
 
         for (fs_amount, fs_addr) in plan.funding_stream_outputs {
             builder.add_transparent_output(&fs_addr, fs_amount)?;
+        }
+
+        if let Some(null_data) = null_data_output {
+            builder
+                .add_transparent_null_data_output::<String>(null_data)
+                .map_err(|error| {
+                    TransactionError::CoinbaseConstruction(format!(
+                        "Failed to add transparent null-data output: {error}"
+                    ))
+                })?;
         }
 
         if let Some(commitment) = plan.mesh_commitment {

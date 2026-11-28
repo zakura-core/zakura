@@ -48,8 +48,8 @@ pub(crate) fn replace_retired_seed_ids(config_path: Option<&Path>, zakura: &mut 
             warn!(
                 %retired,
                 %current,
-                "zakura.bootstrap_peers names a default seed by the node ID it had before \
-                 p2p-v2/4; dialing its current ID instead. Update the entry where it is set"
+                "zakura.bootstrap_peers names a default seed by its p2p-v2/3 node ID. \
+                 Dialing its p2p-v2/5 ID. Update the entry where it is set"
             );
         }
     }

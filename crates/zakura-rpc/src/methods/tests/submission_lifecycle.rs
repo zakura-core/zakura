@@ -64,6 +64,7 @@ async fn resolve_duplicate(reads_before_commit: Option<usize>) -> (Option<Duplic
             registration,
             early_relay: None,
             committed_block: committed_block_lookup(read_state),
+            bpv1_proposer: None,
         },
         |outcome| outcome.duplicate_body,
     )
@@ -280,4 +281,254 @@ async fn trusted_rpc_keeps_uncertain_hashes_private_and_reports_an_unconfirmed_d
         assert!(pending.resolution(hash).is_none());
         queue.abort();
     }
+}
+
+/// `submit_trusted_block` publishes to BPv1 once its block commits, and never for a block
+/// consensus rejects. Early relay does not publish it: a trusted submission skips state
+/// admission.
+#[tokio::test(start_paused = true)]
+async fn trusted_rpc_publishes_to_bpv1_only_after_commit() {
+    use crate::tests::test_rpc::TestRpcImpl;
+    use zakura_chain::{block::Height, chain_tip::NoChainTip, parameters::Network};
+    use zakura_node_services::bpv1_proposer::{Bpv1ProposerHook, BPV1_COMMITMENT_NULL_DATA_LEN};
+    use zakura_test::mock_service::MockService;
+
+    #[derive(Debug, Default)]
+    struct CountingBpv1Proposer {
+        published: AtomicUsize,
+    }
+
+    impl Bpv1ProposerHook for CountingBpv1Proposer {
+        fn prepare_template_commitment(
+            &self,
+            _light_client_root: [u8; 32],
+            _height: Height,
+            _tx_count: u32,
+            _body_after_coinbase: &[u8],
+        ) -> Option<[u8; BPV1_COMMITMENT_NULL_DATA_LEN]> {
+            None
+        }
+
+        fn empty_template_commitment(
+            &self,
+            _height: Height,
+        ) -> Option<[u8; BPV1_COMMITMENT_NULL_DATA_LEN]> {
+            None
+        }
+
+        fn publish_solved_block(&self, _block: Arc<Block>, _height: Height) -> bool {
+            self.published.fetch_add(1, Ordering::AcqRel);
+            true
+        }
+
+        fn retire_failed_block(&self, _hash: zakura_chain::block::Hash) {}
+    }
+
+    let hash = Network::Mainnet.genesis_hash();
+    let mut verifier: MockService<_, _, _, tower::BoxError> = MockService::build().for_unit_tests();
+    let mempool: MockService<_, _, _, tower::BoxError> = MockService::build().for_unit_tests();
+    let (events, mut early) = tokio::sync::mpsc::unbounded_channel();
+    let (rpc, queue) = TestRpcImpl::new_for_tests(
+        Network::Mainnet,
+        Default::default(),
+        false,
+        "test",
+        "test",
+        tower::buffer::Buffer::new(mempool, 1),
+        tower::service_fn(move |req| async move {
+            assert_eq!(req, zakura_state::Request::KnownBlock(hash));
+            Ok(zakura_state::Response::KnownBlock(None))
+        }),
+        tower::service_fn(|req| async move {
+            assert!(matches!(req, ReadRequest::BlockInfo(_)));
+            Ok(ReadResponse::BlockInfo(Some(Default::default())))
+        }),
+        verifier.clone(),
+        Default::default(),
+        NoChainTip,
+        Default::default(),
+        tokio::sync::watch::channel(None).1,
+        Some(events),
+    );
+    let proposer = Arc::new(CountingBpv1Proposer::default());
+    let rpc = rpc.with_bpv1_proposer(proposer.clone());
+
+    for (result, expected) in [
+        (
+            Err(tower::BoxError::from(zakura_consensus::RouterError::from(
+                zakura_consensus::VerifyBlockError::from(
+                    zakura_consensus::BlockError::DuplicateTransaction,
+                ),
+            ))),
+            0,
+        ),
+        (Ok(hash), 1),
+    ] {
+        let rpc = rpc.clone();
+        let response = tokio::spawn(async move {
+            rpc.submit_trusted_block(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES)
+                .await
+        });
+        let request = verifier
+            .expect_request_that(|req| matches!(req, zakura_consensus::Request::CommitMined { .. }))
+            .await;
+        tokio::time::timeout(Duration::from_secs(1), early.recv())
+            .await
+            .expect("early relay starts before verification completes")
+            .expect("relay channel is open");
+        assert_eq!(
+            proposer.published.load(Ordering::Acquire),
+            0,
+            "early relay does not publish to BPv1"
+        );
+        request.respond(result);
+        let Ok(response) = response.await.unwrap() else {
+            panic!("a complete request returns a verdict")
+        };
+        assert_eq!(
+            crate::server::trusted_block::outcome(&response),
+            if expected == 1 {
+                "accepted"
+            } else {
+                "rejected"
+            }
+        );
+        assert_eq!(proposer.published.load(Ordering::Acquire), expected);
+    }
+    queue.abort();
+}
+
+/// What a [`RecordingBpv1Proposer`] saw, in call order.
+#[derive(Debug, PartialEq, Eq)]
+enum Bpv1Call {
+    /// `publish_solved_block`, and whether the early announcement was already queued.
+    Publish { announced_first: bool },
+    /// `retire_failed_block`.
+    Retire,
+}
+
+/// Records BPv1 hook calls and whether each publish came after the early announcement.
+#[derive(Debug)]
+struct RecordingBpv1Proposer {
+    early: std::sync::Mutex<
+        tokio::sync::mpsc::UnboundedReceiver<crate::methods::types::submit_block::EarlyMinedBlock>,
+    >,
+    calls: std::sync::Mutex<Vec<Bpv1Call>>,
+}
+
+impl zakura_node_services::bpv1_proposer::Bpv1ProposerHook for RecordingBpv1Proposer {
+    fn prepare_template_commitment(
+        &self,
+        _light_client_root: [u8; 32],
+        _height: zakura_chain::block::Height,
+        _tx_count: u32,
+        _body_after_coinbase: &[u8],
+    ) -> Option<[u8; zakura_node_services::bpv1_proposer::BPV1_COMMITMENT_NULL_DATA_LEN]> {
+        None
+    }
+
+    fn empty_template_commitment(
+        &self,
+        _height: zakura_chain::block::Height,
+    ) -> Option<[u8; zakura_node_services::bpv1_proposer::BPV1_COMMITMENT_NULL_DATA_LEN]> {
+        None
+    }
+
+    fn publish_solved_block(
+        &self,
+        _block: Arc<Block>,
+        _height: zakura_chain::block::Height,
+    ) -> bool {
+        let announced_first = self.early.lock().unwrap().try_recv().is_ok();
+        self.calls
+            .lock()
+            .unwrap()
+            .push(Bpv1Call::Publish { announced_first });
+        true
+    }
+
+    fn retire_failed_block(&self, _hash: zakura_chain::block::Hash) {
+        self.calls.lock().unwrap().push(Bpv1Call::Retire);
+    }
+}
+
+/// Submits a mined block whose state admission authorizes early relay, then
+/// answers its commit with `verdict`. Returns the BPv1 hook calls.
+async fn bpv1_calls_after_admission(
+    verdict: fn(zakura_chain::block::Hash) -> Result<zakura_chain::block::Hash, tower::BoxError>,
+) -> Vec<Bpv1Call> {
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .expect("the genesis block is valid");
+    let hash = block.hash();
+    let (sender, early) = tokio::sync::mpsc::unbounded_channel();
+    let bpv1 = Arc::new(RecordingBpv1Proposer {
+        early: std::sync::Mutex::new(early),
+        calls: Default::default(),
+    });
+    let verifier = tower::service_fn(move |request: zakura_consensus::Request| async move {
+        let zakura_consensus::Request::CommitMined { admission, .. } = request else {
+            unreachable!("a mined submission commits through CommitMined");
+        };
+        admission.authorize_optimistic_relay();
+        admission.admit_for_test();
+        // The writer commits after the submission observes admission.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        verdict(hash)
+    });
+    Submission {
+        block: block.clone(),
+        hash,
+        height: block.coinbase_height().unwrap(),
+        size: 0,
+        submitted_at: std::time::Instant::now(),
+        method: MinedBlockSubmission::FullBlock,
+        reservation: MinedSubmissions::default().reserve(hash).unwrap(),
+    }
+    .spawn(
+        verifier,
+        sender,
+        RelayPolicy::AfterStateAdmission {
+            pending_blocks: PendingBlockRegistry::default(),
+            optimistic_block_inventory: true,
+            bpv1_proposer: Some(bpv1.clone()),
+        },
+        |_| (),
+    )
+    .await
+    .unwrap();
+    let calls = std::mem::take(&mut *bpv1.calls.lock().unwrap());
+    calls
+}
+
+/// BPv1 publishes after the early announcement is queued, so its serialization
+/// never delays that announcement. A commit that fails after BPv1 published
+/// retires the block; a commit that succeeds, or a duplicate verdict for a
+/// block already in state, keeps it relaying.
+#[tokio::test(start_paused = true)]
+async fn bpv1_publishes_after_the_early_announcement_and_retires_a_failed_commit() {
+    let published = Bpv1Call::Publish {
+        announced_first: true,
+    };
+    assert_eq!(
+        bpv1_calls_after_admission(|_| Err("the write queue rejected the block".into())).await,
+        [
+            Bpv1Call::Publish {
+                announced_first: true
+            },
+            Bpv1Call::Retire
+        ],
+    );
+    assert_eq!(bpv1_calls_after_admission(Ok).await, [published]);
+    assert_eq!(
+        bpv1_calls_after_admission(|hash| Err(tower::BoxError::from(
+            zakura_consensus::RouterError::from(zakura_consensus::VerifyBlockError::from(
+                zakura_consensus::BlockError::AlreadyInChain(hash, KnownBlock::BestChain),
+            )),
+        )))
+        .await,
+        [Bpv1Call::Publish {
+            announced_first: true
+        }],
+    );
 }

@@ -1,7 +1,7 @@
-//! ML-KEM-768: known answers, refused inputs and the random draws.
+//! ML-KEM-1024: known answers, refused inputs and the random draws.
 //!
-//! The known answers are a subset of Project Wycheproof's ML-KEM-768 files
-//! (`testvectors_v1/mlkem_768_test.json` and `mlkem_768_encaps_test.json` at
+//! The known answers are a subset of Project Wycheproof's ML-KEM-1024 files
+//! (`testvectors_v1/mlkem_1024_test.json` and `mlkem_1024_encaps_test.json` at
 //! <https://github.com/C2SP/wycheproof>, commit 65ca4947, Apache-2.0). The
 //! files under `wycheproof/` keep the upstream layout with fewer tests.
 
@@ -66,7 +66,7 @@ fn vectors(json: &str) -> Vec<Vector> {
 struct Script(Mutex<VecDeque<Vec<u8>>>);
 
 impl Script {
-    /// A leaked script holding `draws`, since [`MlKem768`] wants `'static`.
+    /// A leaked script holding `draws`, since [`MlKem1024`] wants `'static`.
     fn leaked<const N: usize>(draws: [&[u8]; N]) -> &'static Self {
         let draws = draws.iter().map(|draw| draw.to_vec()).collect();
         Box::leak(Box::new(Self(Mutex::new(draws))))
@@ -92,9 +92,9 @@ impl SecureRandom for Script {
     }
 }
 
-/// ML-KEM-768 on the operating system's random source.
-fn system() -> MlKem768 {
-    MlKem768::new(rustls::crypto::ring::default_provider().secure_random)
+/// ML-KEM-1024 on the operating system's random source.
+fn system() -> MlKem1024 {
+    MlKem1024::new(rustls::crypto::ring::default_provider().secure_random)
 }
 
 const INVALID_KEY_SHARE: rustls::Error =
@@ -106,12 +106,12 @@ const INVALID_KEY_SHARE: rustls::Error =
 /// implicit-rejection value. A ciphertext of the wrong length is refused.
 #[test]
 fn key_generation_and_decapsulation_match_wycheproof() {
-    let vectors = vectors(include_str!("wycheproof/mlkem_768_test.json"));
+    let vectors = vectors(include_str!("wycheproof/mlkem_1024_test.json"));
     assert_eq!(vectors.len(), 8);
     for vector in vectors {
         let id = vector.tc_id;
         let random = Script::leaked([&vector.seed]);
-        let key = MlKem768::new(random).generate().unwrap();
+        let key = MlKem1024::new(random).generate().unwrap();
         assert_eq!(random.left(), 0, "test {id}");
         assert_eq!(key.encapsulation_key().as_slice(), vector.ek, "test {id}");
         match vector.result.as_str() {
@@ -139,13 +139,13 @@ fn key_generation_and_decapsulation_match_wycheproof() {
 /// drawn.
 #[test]
 fn encapsulation_matches_wycheproof() {
-    let vectors = vectors(include_str!("wycheproof/mlkem_768_encaps_test.json"));
+    let vectors = vectors(include_str!("wycheproof/mlkem_1024_encaps_test.json"));
     assert_eq!(vectors.len(), 11);
     let mut refused = 0;
     for vector in vectors {
         let id = vector.tc_id;
         let random = Script::leaked([&vector.m]);
-        let result = MlKem768::new(random).encapsulate(&vector.ek);
+        let result = MlKem1024::new(random).encapsulate(&vector.ek);
         match vector.result.as_str() {
             "valid" => {
                 let (ciphertext, secret) = result.unwrap();
@@ -230,7 +230,7 @@ fn an_altered_ciphertext_gives_another_secret() {
 /// When the random source fails, neither side produces a share.
 #[test]
 fn a_failed_random_source_fails_the_exchange() {
-    let failing = MlKem768::new(Script::leaked([]));
+    let failing = MlKem1024::new(Script::leaked([]));
     assert_eq!(
         failing.generate().err(),
         Some(rustls::Error::FailedToGetRandomBytes)
@@ -247,7 +247,7 @@ fn a_failed_random_source_fails_the_exchange() {
 #[test]
 fn each_operation_takes_one_draw() {
     let random = Script::leaked([&[1; 64], &[2; 32]]);
-    let mlkem = MlKem768::new(random);
+    let mlkem = MlKem1024::new(random);
     let key = mlkem.generate().unwrap();
     assert_eq!(random.left(), 1);
     mlkem.encapsulate(key.encapsulation_key()).unwrap();

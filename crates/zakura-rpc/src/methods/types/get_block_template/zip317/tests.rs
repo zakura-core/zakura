@@ -97,6 +97,7 @@ fn selects_transaction_at_400_zatoshis_per_action() {
         None,
         vec![verified_tx],
         TransactionDependencies::default(),
+        None,
     )
     .expect("block template is valid");
 
@@ -111,11 +112,17 @@ fn reserves_serialized_block_and_pool_tag_overhead() {
         [0x7e; 20],
     )));
     let coinbase_resources =
-        TransactionTemplate::coinbase_resource_usage(&network, height, &miner_params, None)
+        TransactionTemplate::coinbase_resource_usage(&network, height, &miner_params, None, None)
             .expect("test coinbase resource usage is valid");
-    let coinbase =
-        TransactionTemplate::new_coinbase(&network, height, &miner_params, Amount::zero(), None)
-            .expect("test coinbase template is valid");
+    let coinbase = TransactionTemplate::new_coinbase(
+        &network,
+        height,
+        &miner_params,
+        Amount::zero(),
+        None,
+        None,
+    )
+    .expect("test coinbase template is valid");
     let transaction: transaction::Transaction = coinbase
         .data
         .as_ref()
@@ -155,6 +162,7 @@ fn reserves_serialized_block_and_pool_tag_overhead() {
             None,
             vec![transaction],
             TransactionDependencies::default(),
+            None,
         )
         .expect("test coinbase template is valid")
     };
@@ -195,6 +203,7 @@ fn excludes_tx_with_unselected_dependencies() {
             None,
             vec![unmined_tx],
             mempool_tx_deps,
+            None,
         )
         .expect("test coinbase template is valid"),
         vec![],
@@ -238,6 +247,7 @@ fn includes_tx_with_selected_dependencies() {
         None,
         unmined_txs.clone(),
         mempool_tx_deps.clone(),
+        None,
     )
     .expect("test coinbase template is valid");
 
@@ -445,9 +455,14 @@ mod zip218_template_limits {
         let miner_params = MinerParams::from(MinerAddress::from(
             TransparentAddress::PublicKeyHash([0x7e; 20]),
         ));
-        let coinbase_resources =
-            TransactionTemplate::coinbase_resource_usage(network, height, &miner_params, None)
-                .expect("valid coinbase resource usage");
+        let coinbase_resources = TransactionTemplate::coinbase_resource_usage(
+            network,
+            height,
+            &miner_params,
+            None,
+            None,
+        )
+        .expect("valid coinbase resource usage");
 
         BlockTemplateLimits::initial(network, height, coinbase_resources)
     }
@@ -489,4 +504,98 @@ mod zip218_template_limits {
         VerifiedUnminedTx::new(unmined_tx, miner_fee, 0, 0, Arc::new(Vec::new()))
             .expect("the fake transaction pays the conventional fee")
     }
+}
+
+#[test]
+fn reserves_exact_46_bytes_for_bpv1_coinbase_null_data_at_block_limit() {
+    use zakura_node_services::bpv1_proposer::BPV1_COMMITMENT_NULL_DATA_LEN;
+
+    let network = Network::Mainnet;
+    let height = Height(1_000_000);
+    let miner_params = MinerParams::from(MinerAddress::from(TransparentAddress::PublicKeyHash(
+        [0x7e; 20],
+    )));
+
+    let base_resources =
+        TransactionTemplate::coinbase_resource_usage(&network, height, &miner_params, None, None)
+            .expect("base coinbase resource usage");
+    let bpv1_resources = TransactionTemplate::coinbase_resource_usage(
+        &network,
+        height,
+        &miner_params,
+        None,
+        Some(BPV1_COMMITMENT_NULL_DATA_LEN),
+    )
+    .expect("bpv1 coinbase resource usage");
+
+    assert_eq!(
+        bpv1_resources.max_serialized_size - base_resources.max_serialized_size,
+        46,
+        "second audit #2: 35-byte OP_RETURN BP 01 C output adds exactly 46 serialized bytes"
+    );
+
+    // Compare actual serialized coinbase with 35-byte null data against the reservation!
+    let dummy_payload = [0x42u8; BPV1_COMMITMENT_NULL_DATA_LEN];
+    let coinbase_with_bpv1 = TransactionTemplate::new_coinbase(
+        &network,
+        height,
+        &miner_params,
+        Amount::zero(),
+        None,
+        Some(&dummy_payload),
+    )
+    .expect("coinbase with bpv1 null data");
+    let tx: transaction::Transaction = coinbase_with_bpv1
+        .data
+        .as_ref()
+        .zcash_deserialize_into()
+        .expect("valid coinbase");
+    let coinbase_script_len = tx.inputs()[0].coinbase_script().unwrap().len();
+    assert_eq!(
+        bpv1_resources.max_serialized_size,
+        coinbase_with_bpv1.data.as_ref().len() + MAX_COINBASE_SCRIPT_LEN - coinbase_script_len,
+        "exact byte reservation matches serialized coinbase + max miner tag headroom"
+    );
+
+    // Boundary check: a tx that fits WITHOUT BPv1 reservation (leaving 0 bytes spare)
+    // MUST be excluded when BPv1's 46-byte reservation is active!
+    let max_block_bytes = usize::try_from(MAX_BLOCK_BYTES).expect("fits in memory");
+    let max_tx_with_bpv1 = max_block_bytes
+        - block_template_overhead_bytes(&network)
+        - bpv1_resources.max_serialized_size;
+    let base_tx = network
+        .unmined_transactions_in_blocks(..)
+        .next()
+        .expect("unmined tx");
+
+    let fits_exact = select_mempool_transactions(
+        &network,
+        height,
+        &miner_params,
+        None,
+        vec![with_serialized_size(base_tx.clone(), max_tx_with_bpv1)],
+        TransactionDependencies::default(),
+        Some(BPV1_COMMITMENT_NULL_DATA_LEN),
+    )
+    .expect("selection succeeds");
+    assert_eq!(
+        fits_exact.len(),
+        1,
+        "tx matching exact BPv1-reserved limit fits"
+    );
+
+    let exceeds_by_one = select_mempool_transactions(
+        &network,
+        height,
+        &miner_params,
+        None,
+        vec![with_serialized_size(base_tx, max_tx_with_bpv1 + 1)],
+        TransactionDependencies::default(),
+        Some(BPV1_COMMITMENT_NULL_DATA_LEN),
+    )
+    .expect("selection succeeds");
+    assert!(
+        exceeds_by_one.is_empty(),
+        "second audit #2: tx exceeding MAX_BLOCK_BYTES once 46-byte BPv1 output is added must not be selected"
+    );
 }

@@ -122,7 +122,9 @@ fn record_with_services(
     expires: u64,
     services: Vec<ZakuraServiceId>,
 ) -> ZakuraNodeRecord {
-    ZakuraNodeRecord::sign(
+    // A replay rebuilds its records, so their bytes may not depend on a
+    // random hedge.
+    ZakuraNodeRecord::sign_with_randomness(
         ZakuraNodeRecordBody {
             keys: signer.key_list().clone(),
             direct_addrs: vec![socket(address)],
@@ -136,6 +138,7 @@ fn record_with_services(
             extensions: Vec::new(),
         },
         signer,
+        [0; 32],
     )
     .expect("the signer authors its own record")
 }

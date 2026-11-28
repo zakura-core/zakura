@@ -875,6 +875,9 @@ impl Mempool {
                     "activating mempool"
                 );
                 self.enable_at_tip(tip_action);
+                // What tests wait for before using the pool. See
+                // `log_activations` in `core/follower.rs`.
+                info!("mempool activated");
             }
 
             // Disable once the same clock estimate used for activation falls

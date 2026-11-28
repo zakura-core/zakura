@@ -6,13 +6,14 @@ use zakura_node_services::task::spawn_erased_named;
 use zakura_quic::{NodeAddr, NodeId};
 use zakura_rt::{
     collections::HashMap,
-    sync::{oneshot, CancellationToken},
+    sync::{oneshot, watch, CancellationToken},
     task::JoinHandle,
 };
 
 use super::{native_dial_supervised, RedialPolicy};
 use crate::zakura::{
     handler::{DialRegistration, DialReport},
+    transport::MovedNodeIds,
     ZakuraEndpoint, ZakuraHandlerError, ZakuraLocalLimits, DEFAULT_ZAKURA_REDIAL_INITIAL_BACKOFF,
     DEFAULT_ZAKURA_REDIAL_MAX_BACKOFF,
 };
@@ -47,17 +48,46 @@ pub(crate) fn spawn_native_bootstrap_dialer(
         let endpoint = endpoint.clone();
         let limits = limits.clone();
         tasks.push(spawn_erased_named("bootstrap_dial", async move {
-            native_dial_supervised(
+            let moved = warn_when_moved(endpoint.supervisor().moved_node_ids(), node_addr.id);
+            let dial = native_dial_supervised(
                 endpoint,
                 node_addr,
                 limits,
                 policy,
                 CancellationToken::new(),
-            )
-            .await;
+            );
+            zakura_rt::pin!(dial, moved);
+            zakura_rt::select! {
+                _ = &mut dial => return,
+                () = &mut moved => {}
+            }
+            dial.await;
         }));
     }
     tasks
+}
+
+/// Waits until a dial finds the bootstrap peer configured as `configured`
+/// under another node ID, and tells the operator once.
+///
+/// The peer added keys, and still answers to the configured ID
+/// (zakura-quic TLS-7), so the maintained dial keeps working. It stops
+/// working if the peer later drops a key the configured ID was made from,
+/// which is why the entry should be updated. Returns without a warning when
+/// the supervisor is gone.
+async fn warn_when_moved(mut moved: watch::Receiver<MovedNodeIds>, configured: NodeId) {
+    let Ok(moved) = moved
+        .wait_for(|moved| moved.current(configured) != configured)
+        .await
+    else {
+        return;
+    };
+    tracing::warn!(
+        %configured,
+        current = %moved.current(configured),
+        "a zakura.bootstrap_peers entry names a peer by an earlier node ID; \
+         replace it with the peer's current node ID"
+    );
 }
 
 /// Refuses a remote bootstrap identity, grouped as the bootstrap dialer groups
@@ -141,9 +171,9 @@ pub(crate) async fn native_bootstrap_dial(
 ) -> Result<(), ZakuraHandlerError> {
     // Only discovery uses the admitted address, to settle per-IP reservations
     // and confirm the record address the dial reached.
-    let (admitted_addr, _) = oneshot::channel();
+    let (authenticated, _) = oneshot::channel();
     let report = DialReport {
-        admitted_addr,
+        authenticated,
         registration,
     };
     crate::zakura::handler::serve_reported_native_dial_connection(
@@ -162,6 +192,7 @@ pub(crate) async fn native_discovery_dial(
     endpoint: &ZakuraEndpoint,
     node_addr: NodeAddr,
     limits: &ZakuraLocalLimits,
+    ordinary_cap: usize,
     report: DialReport,
 ) -> Result<(), ZakuraHandlerError> {
     crate::zakura::handler::serve_reported_native_dial_connection(
@@ -169,7 +200,7 @@ pub(crate) async fn native_discovery_dial(
         node_addr,
         limits,
         Some(report),
-        crate::zakura::handler::NativeDialKind::Discovery,
+        crate::zakura::handler::NativeDialKind::Discovery { ordinary_cap },
     )
     .await
 }
@@ -281,15 +312,15 @@ mod tests {
             );
             let endpoint = node.endpoint();
             assert_eq!(endpoint.discovery_admission_capacity(), 0);
-            let (admitted_addr, _admitted_rx) = tokio::sync::oneshot::channel();
+            let (authenticated, _authenticated_rx) = tokio::sync::oneshot::channel();
             let (registration, _registration_rx) = tokio::sync::oneshot::channel();
             let report = DialReport {
-                admitted_addr,
+                authenticated,
                 registration,
             };
             let result = tokio::time::timeout(
                 Duration::from_millis(200),
-                native_discovery_dial(&endpoint, target, &limits, report),
+                native_discovery_dial(&endpoint, target, &limits, limits.max_connections, report),
             )
             .await?;
             assert!(matches!(result, Err(ref error) if error.is_pre_dial_limit()));

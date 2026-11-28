@@ -98,7 +98,7 @@ reads the ALPN itself. It derives the Initial keys from the client's
 destination connection ID (RFC 9001 §5.2) through
 `crypto::ServerConfig::initial_keys`, decrypts the first Initial packet, and
 reads the ALPN extension. A ClientHello that offers the hybrid key-exchange
-group X25519MLKEM768 spans two Initial packets, so the ALPN may be in the
+group X25519MLKEM1024 spans two Initial packets, so the ALPN may be in the
 second one; the spec's section 2.2 leaves that choice open. It passes the
 ALPN to `Acceptor::admit` in
 `IncomingInfo`. For the wallet ALPN, the node checks `W` and the per-source

@@ -1,10 +1,10 @@
-//! What follows the pool core's published pool: the announcer and the
-//! indexer's change stream.
+//! What follows the pool core's published pool: the announcer, the
+//! indexer's change stream, and the log line that says the pool is on.
 //!
-//! Both read the numbered change log through `PoolReader::view`, which pairs
-//! a snapshot with exactly the entries that lead to it, so an addition is
-//! never read ahead of the snapshot that holds it. Each reads it with a
-//! cursor of its own, so neither waits for the other.
+//! The announcer and the change stream read the numbered change log through
+//! `PoolReader::view`, which pairs a snapshot with exactly the entries that
+//! lead to it, so an addition is never read ahead of the snapshot that holds
+//! it. Each reads it with a cursor of its own, so neither waits for the other.
 //!
 //! The announcer advertises new transactions to legacy peers, at most every
 //! [`TRANSACTION_GOSSIP_DELAY`], as today's gossip task does. A transaction
@@ -44,10 +44,11 @@ use super::super::Outbound;
 /// The most ids one advertisement carries.
 const MAX_ANNOUNCED: usize = MAX_TX_INV_IN_SENT_MESSAGE as usize;
 
-/// The announcer and the change stream.
+/// The announcer, the change stream, and the activation log.
 pub(crate) struct Follower {
     announcer: Announcer,
     stream: ChangeStream,
+    activations: PoolReader,
 }
 
 impl Follower {
@@ -69,12 +70,13 @@ impl Follower {
                 pending: HashSet::new(),
             },
             stream: ChangeStream {
-                pool,
+                pool: pool.clone(),
                 subscriber,
                 changes,
                 capacity,
                 cursor: ChangeSeq::default(),
             },
+            activations: pool,
         }
     }
 
@@ -85,8 +87,30 @@ impl Follower {
     /// events, and an indexer that reads slowly never holds up an
     /// announcement.
     pub async fn run(self) -> Result<(), BoxError> {
-        tokio::join!(self.announcer.run(), self.stream.run());
+        tokio::join!(
+            self.announcer.run(),
+            self.stream.run(),
+            log_activations(self.activations)
+        );
         Ok(())
+    }
+}
+
+/// Logs "mempool activated" each time the published pool turns on, until
+/// the core stops. Readers already see the active snapshot when the line is
+/// written, so whoever waits for it, as the acceptance tests do, finds the
+/// pool answering. "activating mempool" comes earlier, when the node decides.
+async fn log_activations(mut pool: PoolReader) {
+    let mut active = false;
+    loop {
+        let now = pool.snapshot().is_some_and(|snapshot| snapshot.active);
+        if now && !active {
+            tracing::info!("mempool activated");
+        }
+        active = now;
+        if !pool.snapshot_changed().await {
+            return;
+        }
     }
 }
 

@@ -22,8 +22,8 @@ use zakura_rt::{
 };
 
 use super::{
-    connection::CurrentLimits,
     connection::{self, now, ConnTaskParams},
+    connection::{CurrentLimits, HandshakeAllowance},
     ConnRef, ConnShared, Connecting, CLOSING_QUEUE_BYTES, CONNECTION_QUEUE_BYTES,
     SOCKET_QUEUE_BYTES,
 };
@@ -68,7 +68,7 @@ pub(crate) enum EndpointCmd {
 
 struct ConnEntry {
     /// Bounded by [`CONNECTION_QUEUE_BYTES`] through `shared`.
-    datagrams: mpsc::UnboundedSender<(ConnectionEvent, usize)>,
+    datagrams: mpsc::UnboundedSender<(ConnectionEvent, usize, SocketAddr)>,
     control: mpsc::UnboundedSender<ConnectionEvent>,
     shared: Arc<ConnShared>,
     /// Released when the entry leaves the table (ADM-12, ADM-13).
@@ -244,7 +244,9 @@ impl<F: SocketFactory> EndpointTask<F> {
                 let result = self
                     .endpoint
                     .connect(now(), config, remote, crate::tls::UNSENT_SERVER_NAME)
-                    .map(|(handle, conn)| self.spawn_connection(handle, conn, probe, remote, slot));
+                    .map(|(handle, conn)| {
+                        self.spawn_connection(handle, conn, probe, remote, slot, None)
+                    });
                 let _ = reply.send(result);
             }
             EndpointCmd::Serve { server, acceptor } => {
@@ -278,6 +280,7 @@ impl<F: SocketFactory> EndpointTask<F> {
         probe: Arc<CongestionProbe>,
         admitted: SocketAddr,
         slot: Arc<ConnectionSlot>,
+        send_allowance: Option<HandshakeAllowance>,
     ) -> Connecting {
         let (cmds_tx, cmds) = mpsc::unbounded_channel();
         let (datagrams_tx, datagrams) = mpsc::unbounded_channel();
@@ -312,6 +315,7 @@ impl<F: SocketFactory> EndpointTask<F> {
                 shared: shared.clone(),
                 cmds,
                 datagrams,
+                send_allowance,
                 control,
                 to_endpoint: self.events_tx.clone(),
                 socket: self.socket.clone(),
@@ -421,7 +425,9 @@ impl<F: SocketFactory> EndpointTask<F> {
                 .endpoint
                 .handle(now, remote, dst_ip, None, datagram, &mut self.response_buf)
             {
-                Some(DatagramEvent::NewConnection(incoming)) => self.on_incoming(incoming, io),
+                Some(DatagramEvent::NewConnection(incoming)) => {
+                    self.on_incoming(incoming, bytes, io)
+                }
                 Some(DatagramEvent::ConnectionEvent(handle, event)) => {
                     if let Some(entry) = self.conns.get(&handle) {
                         let queued = &entry.shared.queued_datagram_bytes;
@@ -440,7 +446,7 @@ impl<F: SocketFactory> EndpointTask<F> {
                         } else {
                             queued.fetch_add(bytes, Ordering::Relaxed);
                             self.queued_total.fetch_add(bytes, Ordering::Relaxed);
-                            if entry.datagrams.send((event, bytes)).is_err() {
+                            if entry.datagrams.send((event, bytes, remote)).is_err() {
                                 // The connection task has ended.
                                 queued.fetch_sub(bytes, Ordering::Relaxed);
                                 self.queued_total.fetch_sub(bytes, Ordering::Relaxed);
@@ -466,7 +472,7 @@ impl<F: SocketFactory> EndpointTask<F> {
     }
 
     /// Admission (SPEC §7): decide before any handshake work (ADM-2).
-    fn on_incoming(&mut self, incoming: Incoming, io: &F::Socket) {
+    fn on_incoming(&mut self, incoming: Incoming, bytes: usize, io: &F::Socket) {
         let Some((server, acceptor)) = self
             .serve
             .as_ref()
@@ -512,6 +518,12 @@ impl<F: SocketFactory> EndpointTask<F> {
                 let probe = Arc::new(CongestionProbe::default());
                 let mut server = (*server).clone();
                 server.transport_config(self.shared.connection_transport(probe.clone(), io.gso()));
+                let send_allowance = (!info.validated).then(|| {
+                    HandshakeAllowance::new(
+                        bytes,
+                        crate::tls::address_validation::observe(&mut server),
+                    )
+                });
                 match self.endpoint.accept(
                     incoming,
                     now(),
@@ -525,8 +537,14 @@ impl<F: SocketFactory> EndpointTask<F> {
                         self.shared
                             .observe_handshake_attempt(remote, info.validated);
                         metrics::counter!("zakura.quic.incoming.accepted").increment(1);
-                        let connecting =
-                            self.spawn_connection(handle, conn, probe, raw_remote, slot);
+                        let connecting = self.spawn_connection(
+                            handle,
+                            conn,
+                            probe,
+                            raw_remote,
+                            slot,
+                            send_allowance,
+                        );
                         #[cfg(zakura_sim)]
                         self.shared.pending.record(crate::HandshakeEvent::Started {
                             remote: raw_remote,
@@ -697,6 +715,7 @@ mod tests {
         let secret = NodeSecretKey::generate();
         let shared = Arc::new(Shared {
             id: secret.public(),
+            credential: secret.credential().clone(),
             config: QuicConfig::default(),
             max_bidi_streams: 16,
             tls: TlsConfig::new(&secret),

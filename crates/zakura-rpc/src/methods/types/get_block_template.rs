@@ -544,6 +544,14 @@ impl BlockTemplateResponse {
     /// Returns an error if the coinbase transaction cannot be built, for example because
     /// the chain tip's value pools make the ZIP 234 NSM value balance negative. Its `expect`s
     /// check invariants that the caller already guarantees.
+    ///
+    /// `bpv1_proposer` embeds the BPv1 `OP_RETURN BP 01 C` commitment output in
+    /// post-NU7 v6 coinbases. Pass it only when the selection of
+    /// `mempool_txs` reserved that output; see [`GetBlockTemplateHandler::template_bpv1_proposer`].
+    ///
+    /// A `precomputed_coinbase` is used as it is, so the caller passes one only when it
+    /// already carries the commitment output the template needs, and then passes no
+    /// `bpv1_proposer`.
     #[allow(clippy::too_many_arguments, clippy::unwrap_in_result)]
     pub(crate) fn new_internal(
         net: &Network,
@@ -553,6 +561,7 @@ impl BlockTemplateResponse {
         long_poll_id: LongPollId,
         mempool_txs: Vec<zip317::SelectedMempoolTx>,
         submit_old: Option<bool>,
+        bpv1_proposer: Option<&Arc<dyn zakura_node_services::bpv1_proposer::Bpv1ProposerHook>>,
     ) -> Result<Self, TransactionError> {
         // Determine the next block height.
         let height = chain_info
@@ -603,23 +612,40 @@ impl BlockTemplateResponse {
             .sum::<amount::Result<Amount<NonNegative>>>()
             .expect("mempool tx fees must be non-negative");
 
+        let nsm_value_balance = if is_zip234_active(net, height) {
+            Some(parent_nsm_value_balance(
+                chain_info.value_pools.nsm_value_balance_amount(),
+            )?)
+        } else {
+            None
+        };
+
         let coinbase_txn = match precomputed_coinbase {
             Some(coinbase_txn) => coinbase_txn,
-            // ZIP 234 derives the subsidy from the money reserve after the parent, which
-            // is the chain tip this template builds on.
-            None => TransactionTemplate::new_coinbase(
-                net,
-                height,
-                miner_params,
-                txs_fee,
-                if is_zip234_active(net, height) {
-                    Some(parent_nsm_value_balance(
-                        chain_info.value_pools.nsm_value_balance_amount(),
-                    )?)
-                } else {
-                    None
-                },
-            )?,
+            None => {
+                // Selection already reserved the commitment output, so the block stays within
+                // `MAX_BLOCK_BYTES` whatever the proposer returns.
+                let bpv1_commitment = bpv1_proposer.and_then(|proposer| {
+                    bpv1_template_commitment(
+                        proposer.as_ref(),
+                        chain_info.chain_history_root,
+                        height,
+                        mempool_txs
+                            .iter()
+                            .map(|tx| tx.transaction.transaction().as_ref()),
+                    )
+                });
+                // ZIP 234 derives the subsidy from the money reserve after the parent, which
+                // is the chain tip this template builds on.
+                TransactionTemplate::new_coinbase(
+                    net,
+                    height,
+                    miner_params,
+                    txs_fee,
+                    nsm_value_balance,
+                    bpv1_commitment.as_ref().map(|c| c.as_slice()),
+                )?
+            }
         };
 
         let default_roots = DefaultRoots::from_coinbase(
@@ -690,6 +716,38 @@ impl BlockTemplateResponse {
             submit_old,
         })
     }
+}
+
+/// A coinbase for an empty block, built while the long poll waits for the block's parent.
+#[derive(Clone, Debug)]
+pub(crate) struct PrecomputedCoinbase {
+    /// The coinbase transaction.
+    pub(crate) coinbase: TransactionTemplate<amount::NegativeOrZero>,
+    /// The BPv1 commitment payload the coinbase carries, if any.
+    pub(crate) bpv1_commitment:
+        Option<[u8; zakura_node_services::bpv1_proposer::BPV1_COMMITMENT_NULL_DATA_LEN]>,
+}
+
+/// Prepares the BPv1 commitment payload for a template at `height` whose transactions after
+/// the coinbase are `body`, on a parent whose light-client root is `light_client_root`.
+///
+/// Returns `None` when the parent has no light-client root, a transaction does not
+/// serialize, or `proposer` declines.
+pub(crate) fn bpv1_template_commitment<'a>(
+    proposer: &dyn zakura_node_services::bpv1_proposer::Bpv1ProposerHook,
+    light_client_root: Option<block::ChainHistoryMmrRootHash>,
+    height: block::Height,
+    body: impl ExactSizeIterator<Item = &'a zakura_chain::transaction::Transaction>,
+) -> Option<[u8; zakura_node_services::bpv1_proposer::BPV1_COMMITMENT_NULL_DATA_LEN]> {
+    use zakura_chain::serialization::ZcashSerialize;
+
+    let light_client_root: [u8; 32] = light_client_root?.into();
+    let tx_count = u32::try_from(body.len().saturating_add(1)).ok()?;
+    let mut body_after_coinbase = Vec::new();
+    for tx in body {
+        tx.zcash_serialize(&mut body_after_coinbase).ok()?;
+    }
+    proposer.prepare_template_commitment(light_client_root, height, tx_count, &body_after_coinbase)
 }
 
 fn new_work_id() -> String {
@@ -780,7 +838,8 @@ impl MinerParams {
             addr,
             data,
             memo,
-            // The gateway is this node's ID, which only its network stack knows.
+            // The gateway is set at startup: this node's ID or the relay
+            // `mining.miner_mesh_gateways` names.
             mesh_commitment: None,
         })
     }
@@ -900,6 +959,10 @@ where
 
     /// Records the stages of each template this handler returns.
     pub(crate) trace: trace::MiningTemplateTrace,
+
+    /// Optional BPv1 proposer hook for template-time commitment and
+    /// solved-block publication.
+    bpv1_proposer: Option<Arc<dyn zakura_node_services::bpv1_proposer::Bpv1ProposerHook>>,
 }
 
 impl<BlockVerifierRouter, SyncStatus> GetBlockTemplateHandler<BlockVerifierRouter, SyncStatus>
@@ -933,12 +996,42 @@ where
             template_rejections: watch::channel(TemplateRejections::default()).0,
             speculation_breaker: SpeculationBreaker::default(),
             trace: trace::MiningTemplateTrace::default(),
+            bpv1_proposer: None,
         }
     }
 
     /// Shares one pending-block registry with peer serving.
     pub(crate) fn set_pending_blocks(&mut self, pending_blocks: PendingBlockRegistry) {
         self.pending_blocks = pending_blocks;
+    }
+
+    /// Attaches the optional BPv1 proposer hook.
+    pub(crate) fn set_bpv1_proposer(
+        &mut self,
+        proposer: Arc<dyn zakura_node_services::bpv1_proposer::Bpv1ProposerHook>,
+    ) {
+        self.bpv1_proposer = Some(proposer);
+    }
+
+    /// Returns the BPv1 proposer if a template at `height` carries a commitment.
+    ///
+    /// Each template asks once. Selection reserves the commitment output from the answer, and
+    /// the build embeds the commitment only if it receives the proposer.
+    pub(crate) fn template_bpv1_proposer(
+        &self,
+        height: block::Height,
+    ) -> Option<Arc<dyn zakura_node_services::bpv1_proposer::Bpv1ProposerHook>> {
+        self.bpv1_proposer
+            .as_ref()
+            .filter(|proposer| proposer.should_prepare_template(height))
+            .cloned()
+    }
+
+    /// Returns a cloned handle to the optional BPv1 proposer hook, if attached.
+    pub(crate) fn bpv1_proposer(
+        &self,
+    ) -> Option<Arc<dyn zakura_node_services::bpv1_proposer::Bpv1ProposerHook>> {
+        self.bpv1_proposer.clone()
     }
 
     /// Runs one template build at a time across RPC clones, where its `work` belongs.

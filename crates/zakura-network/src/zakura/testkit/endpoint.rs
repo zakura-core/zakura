@@ -3,7 +3,10 @@
 use std::net::{Ipv4Addr, SocketAddr};
 
 use blake2b_simd::Params as Blake2bParams;
-use zakura_quic::{NodeAddr, NodeSecretKey, QuicBindConfig, QuicConfig, QuicEndpoint};
+use zakura_quic::{
+    NodeAddr, NodeCredential, NodeSecretKey, QuicBindConfig, QuicConfig, QuicEndpoint,
+    ED25519_KEY_TAG, ML_DSA_65_KEY_TAG,
+};
 
 use crate::{
     zakura::ZakuraLocalLimits,
@@ -70,17 +73,43 @@ impl LocalEndpointFactory {
         NodeSecretKey::from_bytes(&key_bytes)
     }
 
+    /// [`Self::secret_key`]'s node after it added a key to its credential.
+    ///
+    /// The node signs with the same two keys and has a new node ID. A dial
+    /// to the ID of [`Self::secret_key`] still reaches it (zakura-quic
+    /// TLS-7).
+    pub fn extended_secret_key(seed: u64) -> NodeSecretKey {
+        /// A tag no release defines, above the tags of the node's own keys.
+        const ADDED_KEY_TAG: u16 = 0x0102;
+        let secret = Self::secret_key(seed);
+        let own = [ED25519_KEY_TAG, ML_DSA_65_KEY_TAG].map(|tag| {
+            let key = secret
+                .credential()
+                .key(tag)
+                .expect("a node's credential holds both of its signing keys");
+            (tag, key.to_vec())
+        });
+        let added = (ADDED_KEY_TAG, vec![0x5a; 64]);
+        let credential = NodeCredential::from_entries(own.into_iter().chain([added]))
+            .expect("three entries in tag order form a credential");
+        secret
+            .with_credential(credential)
+            .expect("the credential holds the node's own two keys")
+    }
+
     /// Bind an endpoint to an OS-assigned loopback port.
     pub async fn endpoint(self, seed: u64) -> Result<QuicEndpoint, BoxError> {
+        self.endpoint_with_key(Self::secret_key(seed)).await
+    }
+
+    /// Bind an endpoint whose node key is `secret` to an OS-assigned
+    /// loopback port.
+    pub async fn endpoint_with_key(self, secret: NodeSecretKey) -> Result<QuicEndpoint, BoxError> {
         let bind = QuicBindConfig {
             addrs: vec![SocketAddr::from((Ipv4Addr::LOCALHOST, 0))],
             ..self.bind
         };
-        Ok(QuicEndpoint::bind(
-            Self::secret_key(seed),
-            &bind,
-            &self.quic,
-        )?)
+        Ok(QuicEndpoint::bind(secret, &bind, &self.quic)?)
     }
 
     /// Return the endpoint's direct node address.

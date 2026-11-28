@@ -846,14 +846,21 @@ pub trait RpcServer {
     ///
     /// # Notes
     ///
-    /// A mining node counts the gateways that recent best-chain coinbases
-    /// name, and while it is synced, v2 networking holds up to ten connection
+    /// A node that prefers gateways, because it mines or sets
+    /// `mining.miner_mesh`, counts the gateways that recent best-chain
+    /// coinbases name, and while it is synced, v2 networking holds up to ten connection
     /// places that ordinary peers cannot fill for the highest-ranked gateways
-    /// it can reach. Each gateway's `state` is `preferred` when it may fill a
+    /// it can reach. A relay's template nodes keep their places whether or
+    /// not it is synced. Each gateway's `state` is `preferred` when it may fill a
     /// held place, `standby` when it is reachable but ranked below those,
     /// `backoff` when it is known but waiting out a failed dial or a lost
     /// connection, `unmatched` when v2 networking has no usable dial address for it,
     /// and `ambiguous` when v2 networking knows two or more nodes with its ID.
+    ///
+    /// A relay's template nodes, the ones `mining.miner_mesh_template_nodes`
+    /// lists, come first in `gateways` with `template_node` true. Within the
+    /// funded places, each keeps a held place whatever its `state`, unless it
+    /// is `ambiguous`, and `connected` says whether it is connected now.
     ///
     /// A gateway's `gateway_id` is the 20-byte ID the blocks name it by, the
     /// first 20 bytes of its v2 node ID. Each peer's `node_id` is its full
@@ -862,8 +869,11 @@ pub trait RpcServer {
     /// `synced` is evaluated at request time. The ranking and held places reflect
     /// the last update applied by networking and can lag a change in tip freshness.
     ///
-    /// `window` is null on a node that does not mine, and `slots` is null on
-    /// a node that runs no v2 networking.
+    /// `announced_gateways` lists the gateway IDs this node's coinbases name:
+    /// its own, or the relay `mining.miner_mesh_gateways` names.
+    ///
+    /// `window` is null on a node that does not prefer gateways, and `slots`
+    /// is null on a node that runs no v2 networking.
     #[method(name = "getminermeshinfo")]
     async fn get_miner_mesh_info(&self) -> Result<GetMinerMeshInfoResponse>;
 
@@ -1547,27 +1557,54 @@ where
     /// worker failures to RPC errors.
     ///
     /// Also returns how long the build waited to start and how long it ran.
+    ///
+    /// `bpv1_proposer` comes from the same
+    /// [`GetBlockTemplateHandler::template_bpv1_proposer`] answer that sized the selection of
+    /// `mempool_txs`, so the build never adds a commitment output the selection did not reserve.
+    ///
+    /// An empty template keeps `precomputed_coinbase` when the coinbase carries the BPv1
+    /// commitment this template needs, or none when it needs none.
     #[allow(clippy::too_many_arguments)]
     async fn build_mining_template(
         &self,
-        precomputed_coinbase: Option<TransactionTemplate<zakura_chain::amount::NegativeOrZero>>,
+        precomputed_coinbase: Option<types::get_block_template::PrecomputedCoinbase>,
         miner_params: &types::get_block_template::MinerParams,
         chain_info: &zakura_state::GetBlockTemplateChainInfo,
         long_poll_id: types::long_poll::LongPollId,
         mempool_txs: Vec<types::get_block_template::zip317::SelectedMempoolTx>,
         submit_old: Option<bool>,
+        bpv1_proposer: Option<Arc<dyn zakura_node_services::bpv1_proposer::Bpv1ProposerHook>>,
     ) -> Result<(BlockTemplateResponse, BuildTimes)> {
+        // An empty body's `C` does not depend on the parent, so the commitment matches the
+        // precomputed one unless BPv1 eligibility changed. Preparing it again registers the body
+        // under this parent's light-client root. The empty body's encoding is a few hashes, so
+        // it runs here.
+        let precomputed_coinbase = precomputed_coinbase
+            .filter(|_| mempool_txs.is_empty())
+            .filter(|precomputed| {
+                let bpv1_commitment = bpv1_proposer.as_ref().and_then(|proposer| {
+                    let height = chain_info.tip_height.next().ok()?;
+                    types::get_block_template::bpv1_template_commitment(
+                        proposer.as_ref(),
+                        chain_info.chain_history_root,
+                        height,
+                        std::iter::empty(),
+                    )
+                });
+                bpv1_commitment == precomputed.bpv1_commitment
+            });
         // An empty template with a completed coinbase has no proof work to queue.
-        if precomputed_coinbase.is_some() && mempool_txs.is_empty() {
+        if let Some(precomputed) = precomputed_coinbase {
             let started = std::time::Instant::now();
             let template = BlockTemplateResponse::new_internal(
                 &self.network,
-                precomputed_coinbase,
+                Some(precomputed.coinbase),
                 miner_params,
                 chain_info,
                 long_poll_id,
                 mempool_txs,
                 submit_old,
+                None,
             )
             .map_misc_error()?;
             let times = BuildTimes {
@@ -1577,13 +1614,18 @@ where
             return Ok((template, times));
         }
 
-        let work = match (&precomputed_coinbase, chain_info.tip_height.next()) {
-            (None, Ok(height)) => {
-                TemplateBuildWork::for_coinbase(&self.network, height, miner_params)
+        // When BPv1 encoding is active, run template construction
+        // on the blocking pool (`TemplateBuildWork::Proof`) even for transparent
+        // miners so Reed–Solomon encoding never blocks an async worker thread.
+        let work = if bpv1_proposer.is_some() {
+            TemplateBuildWork::Proof
+        } else {
+            match chain_info.tip_height.next() {
+                Ok(height) => TemplateBuildWork::for_coinbase(&self.network, height, miner_params),
+                // A parent with no next height leaves no proof to create, and the build rejects
+                // it.
+                Err(_) => TemplateBuildWork::ProofFree,
             }
-            // A coinbase that is already built leaves no proof to create, and neither does a
-            // parent with no next height, which the build rejects.
-            _ => TemplateBuildWork::ProofFree,
         };
         let network = self.network.clone();
         let miner_params = miner_params.clone();
@@ -1595,12 +1637,13 @@ where
                 let started = std::time::Instant::now();
                 let template = BlockTemplateResponse::new_internal(
                     &network,
-                    precomputed_coinbase,
+                    None,
                     &miner_params,
                     &chain_info,
                     long_poll_id,
                     mempool_txs,
                     submit_old,
+                    bpv1_proposer.as_ref(),
                 );
                 let times = BuildTimes {
                     wait: started.saturating_duration_since(requested),
@@ -1694,6 +1737,18 @@ where
             .await
     }
 
+    /// Returns the BPv1 proposer for a template with no mempool transactions.
+    ///
+    /// Such a template has no selection, and the commitment output always fits beside its
+    /// coinbase, so this is the template's only eligibility decision.
+    fn empty_template_bpv1_proposer(
+        &self,
+        chain_info: &zakura_state::GetBlockTemplateChainInfo,
+    ) -> Option<Arc<dyn zakura_node_services::bpv1_proposer::Bpv1ProposerHook>> {
+        let height = chain_info.tip_height.next().ok()?;
+        self.gbt.template_bpv1_proposer(height)
+    }
+
     /// Builds the coinbase-only template a long poll returns once it sees a new tip.
     ///
     /// Miners want work on the new tip before the mempool has caught up with it, so this
@@ -1705,7 +1760,7 @@ where
     async fn new_tip_template(
         &self,
         request_id: u64,
-        precomputed_coinbase: Option<TransactionTemplate<zakura_chain::amount::NegativeOrZero>>,
+        precomputed_coinbase: Option<types::get_block_template::PrecomputedCoinbase>,
         miner_params: &types::get_block_template::MinerParams,
         chain_info: &zakura_state::GetBlockTemplateChainInfo,
         rejection_state: &types::get_block_template::TemplateRejections,
@@ -1731,6 +1786,7 @@ where
                 long_poll_id,
                 vec![],
                 submit_old,
+                self.empty_template_bpv1_proposer(chain_info),
             )
             .await?;
         let response = self
@@ -1772,6 +1828,7 @@ where
                 long_poll_id,
                 vec![],
                 submit_old,
+                self.empty_template_bpv1_proposer(chain_info),
             )
             .await?;
 
@@ -1953,6 +2010,7 @@ where
             submission_lifecycle::RelayPolicy::AfterStateAdmission {
                 pending_blocks: self.gbt.pending_blocks(),
                 optimistic_block_inventory: self.gbt.optimistic_block_inventory(),
+                bpv1_proposer: self.gbt.bpv1_proposer(),
             },
             move |outcome| {
                 let submission_lifecycle::VerificationOutcome::Completed(result) =
@@ -2079,6 +2137,16 @@ where
         self
     }
 
+    /// Attaches the optional BPv1 proposer hook for template-time commitment
+    /// embedding and solved-block publication.
+    pub fn with_bpv1_proposer(
+        mut self,
+        proposer: Arc<dyn zakura_node_services::bpv1_proposer::Bpv1ProposerHook>,
+    ) -> Self {
+        self.gbt.set_bpv1_proposer(proposer);
+        self
+    }
+
     /// Writes a `mining_template.jsonl` row to `trace` for each stage of the
     /// `getblocktemplate` path from a new tip to a returned template.
     pub fn with_template_trace(mut self, trace: JsonlEventEmitter) -> Self {
@@ -2088,7 +2156,8 @@ where
 
     /// Makes every coinbase this node builds name the gateway in `commitment`.
     ///
-    /// The node passes its own v2 node ID when `mining.miner_mesh` is set.
+    /// When `mining.miner_mesh` is set, the node passes the gateway
+    /// `mining.miner_mesh_gateways` names, or else its own v2 node ID.
     pub fn with_mesh_commitment(mut self, commitment: MinerMeshCommitment) -> Self {
         self.gbt.set_mesh_commitment(commitment);
         self
@@ -3581,7 +3650,7 @@ where
     ) -> Result<GetBlockTemplateResponse> {
         use types::get_block_template::{
             check_parameters, check_synced_to_tip, fetch_chain_info, fetch_mempool_transactions,
-            validate_block_proposal, zip317::select_mempool_transactions,
+            validate_block_proposal,
         };
 
         // Clone Services
@@ -3794,16 +3863,31 @@ where
                     // before we start waiting for a new tip since computing the coinbase tx takes a few
                     // seconds if the miner mines to a shielded address, and we want to return fast
                     // when the tip changes.
+                    //
+                    // An empty body's BPv1 commitment `C` does not depend on the parent, so the
+                    // coinbase carries it too. The precompute registers nothing with the
+                    // proposer: the new-tip template registers the body under the new parent's
+                    // light-client root, which is still unknown here.
+                    let bpv1_proposer = self.gbt.template_bpv1_proposer(precomputed_height);
                     let precompute_coinbase = |network, height, params| {
                         let work = TemplateBuildWork::for_coinbase(&network, height, &params);
                         self.gbt.run_template_build(work, move || {
+                            let bpv1_commitment = bpv1_proposer
+                                .and_then(|proposer| proposer.empty_template_commitment(height));
                             TransactionTemplate::new_coinbase(
                                 &network,
                                 height,
                                 &params,
                                 Amount::zero(),
                                 None,
+                                bpv1_commitment.as_ref().map(|c| c.as_slice()),
                             )
+                            .map(|coinbase| {
+                                types::get_block_template::PrecomputedCoinbase {
+                                    coinbase,
+                                    bpv1_commitment,
+                                }
+                            })
                         })
                     };
 
@@ -3962,8 +4046,17 @@ where
             let height = chain_info.tip_height.next().map_misc_error()?;
 
             // Select mempool transactions by ancestor-package priority.
+            // BPv1 eligibility is decided once, here. Selection reserves the 46-byte
+            // `OP_RETURN BP 01 C` coinbase output, and the build receives the same
+            // answer, so the commitment output never pushes a template past `MAX_BLOCK_BYTES`.
+            // This reservation must share one coinbase size estimate with the 46-byte miner
+            // mesh output (#2666), so a template can carry both.
+            let bpv1_proposer = self.gbt.template_bpv1_proposer(height);
+            let extra_coinbase_null_data_len = bpv1_proposer
+                .as_ref()
+                .map(|_| zakura_node_services::bpv1_proposer::BPV1_COMMITMENT_NULL_DATA_LEN);
             let selection_started = std::time::Instant::now();
-            let mempool_txs = select_mempool_transactions(
+            let mempool_txs = types::get_block_template::zip317::select_mempool_transactions(
                 &self.network,
                 height,
                 miner_params,
@@ -3977,6 +4070,7 @@ where
                 },
                 mempool_txs,
                 mempool_tx_deps,
+                extra_coinbase_null_data_len,
             )
             .map_misc_error()?;
             let selection = selection_started.elapsed();
@@ -3999,6 +4093,7 @@ where
                     server_long_poll_id,
                     mempool_txs,
                     submit_old,
+                    bpv1_proposer,
                 )
                 .await?;
             if let Some(response) = self
@@ -4254,7 +4349,9 @@ where
             node_id: endpoint
                 .as_ref()
                 .map(|endpoint| *endpoint.local_node_id().as_bytes()),
-            announcing: miner_params.is_some_and(|params| params.mesh_commitment().is_some()),
+            announced_gateway: miner_params
+                .and_then(|params| params.mesh_commitment())
+                .map(|commitment| commitment.gateway_id()),
             mining: miner_params.is_some(),
             synced: synced_to_tip(&self.network, &self.latest_chain_tip).is_ok(),
         };

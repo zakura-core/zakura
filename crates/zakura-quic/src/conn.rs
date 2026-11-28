@@ -16,6 +16,7 @@ use zakura_rt::{
 };
 
 use crate::{
+    composite::COMPOSITE_KEY_TAGS,
     credential::NodeCredential,
     driver::{ConnCmd, ConnRef, ConnShared},
     key::{NodeId, NodeKey},
@@ -195,6 +196,12 @@ pub struct ConnLoad {
     pub frame_rx: quinn_proto::FrameStats,
     /// Sends that failed with an error other than `WouldBlock`.
     pub send_errors: u64,
+    /// Minimum RTT observed on the current path, if any ACK has arrived.
+    pub min_rtt: Option<Duration>,
+    /// Windowed-max stream receive rate in bytes/sec from this peer, if measured.
+    pub rate_in: Option<u64>,
+    /// Windowed-max outbound delivery rate in bytes/sec to this peer, if measured.
+    pub rate_out: Option<u64>,
     /// Smoothed round-trip time, which [`RttReader`] reads.
     pub(crate) rtt: Duration,
 }
@@ -218,7 +225,21 @@ impl ConnLoad {
             udp_rx: quinn_proto::UdpStats::default(),
             frame_rx: quinn_proto::FrameStats::default(),
             send_errors: 0,
+            min_rtt: None,
+            rate_in: None,
+            rate_out: None,
             rtt: Duration::ZERO,
+        }
+    }
+
+    /// A load that reports only a path estimate, for other crates' tests.
+    #[cfg(any(test, zakura_sim, feature = "test-support"))]
+    pub fn with_path(min_rtt: Duration, rate_in: u64, rate_out: u64) -> Self {
+        Self {
+            min_rtt: Some(min_rtt),
+            rate_in: Some(rate_in),
+            rate_out: Some(rate_out),
+            ..Self::new(SocketAddr::from(([127, 0, 0, 1], 0)))
         }
     }
 }
@@ -283,6 +304,8 @@ pub struct Conn {
     /// The credential the peer proved in TLS. The verifier accepted it only
     /// with an Ed25519 key (TLS-4).
     remote: Arc<NodeCredential>,
+    /// The node ID this endpoint dialed. `None` on an accepted connection.
+    dialed_id: Option<NodeId>,
     admitted_addr: SocketAddr,
     admitted_at: Instant,
     source_validated: bool,
@@ -293,6 +316,7 @@ impl fmt::Debug for Conn {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Conn")
             .field("remote_id", &self.remote_id())
+            .field("dialed_id", &self.dialed_id)
             .field("admitted_addr", &self.admitted_addr)
             .field("admitted_at", &self.admitted_at)
             .field("source_validated", &self.source_validated)
@@ -305,6 +329,7 @@ impl Conn {
     pub(crate) fn new(
         inner: ConnRef,
         remote: Arc<NodeCredential>,
+        dialed_id: Option<NodeId>,
         admitted_addr: SocketAddr,
         admitted_at: Instant,
         source_validated: bool,
@@ -313,6 +338,7 @@ impl Conn {
         Self {
             inner,
             remote,
+            dialed_id,
             admitted_addr,
             admitted_at,
             source_validated,
@@ -322,8 +348,41 @@ impl Conn {
 
     /// The peer's node ID, derived from the credential it proved in the TLS
     /// handshake (TLS-8).
+    ///
+    /// On a dial this can differ from [`Self::dialed_id`]: the peer has
+    /// added keys since the dialer learned its ID, and this is its ID now.
     pub fn remote_id(&self) -> NodeId {
         self.remote.node_id()
+    }
+
+    /// The node ID this endpoint dialed to open the connection, which the
+    /// peer proved it also answers to (TLS-7). `None` on a connection this
+    /// endpoint accepted.
+    pub fn dialed_id(&self) -> Option<NodeId> {
+        self.dialed_id
+    }
+
+    /// The earlier node IDs this handshake proves for the peer (TLS-7):
+    /// each ID, other than [`Self::remote_id`], that names a prefix of the
+    /// peer's key list which includes the keys the handshake was signed
+    /// with, held in full. At most [`crate::MAX_EARLIER_NODE_IDS`], shortest
+    /// list first.
+    ///
+    /// Every ID the peer had before it added keys is among them, as long as
+    /// it still signs with the keys that ID names. A peer adds keys only at
+    /// the end of its list (ID-8), so these are exactly those IDs, and only
+    /// the holder of the signing keys can prove any of them. The peer is the
+    /// node each of these IDs names, on a connection it opened as much as on
+    /// one it accepted. On a dial, the dialed ID is [`Self::remote_id`] or
+    /// one of these. An ID that the peer's key list only hashes to proves
+    /// nothing: it is listed only when the peer signed with the keys it
+    /// names.
+    pub fn remote_earlier_ids(&self) -> Vec<NodeId> {
+        let current = self.remote_id();
+        self.remote
+            .proven_ids(&COMPOSITE_KEY_TAGS)
+            .filter(|id| *id != current)
+            .collect()
     }
 
     /// The key list the peer proved in the TLS handshake: the list its node
@@ -424,6 +483,13 @@ impl Conn {
     /// never waits on the connection task.
     pub fn load(&self) -> ConnLoad {
         *self.inner.shared.load.borrow()
+    }
+
+    /// Returns a cloneable watch receiver for [`ConnLoad`] snapshots
+    /// (`min_rtt`, `rate_in`, `rate_out`, updated every [`LOAD_INTERVAL`])
+    /// without keeping the connection open.
+    pub fn subscribe_load(&self) -> zakura_rt::sync::watch::Receiver<ConnLoad> {
+        self.inner.shared.load.subscribe()
     }
 
     /// A reader of this connection's smoothed round-trip time that does not

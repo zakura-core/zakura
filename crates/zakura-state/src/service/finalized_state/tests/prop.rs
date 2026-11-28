@@ -321,6 +321,7 @@ fn vct_test_network() -> Network {
             nu6_2: Some(47),
             nu6_3: Some(48),
             nu7: Some(50),
+            nu7_1: None,
         })
         .expect("failed to set activation heights")
         .extend_funding_streams()
@@ -445,6 +446,7 @@ fn all_upgrades_and_wrong_commitments_with_fake_activation_heights() -> Result<(
             nu6_2: Some(47),
             nu6_3: Some(48),
             nu7: Some(50),
+            nu7_1: None,
         })
         .expect("failed to set activation heights")
         // These chains are generated for their commitments, not their coinbases, so blocks

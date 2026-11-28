@@ -111,8 +111,10 @@ fn violated_witness_fails_while_fixed() {
             WAIT_COMPLETE_WAKES,
             Expect::Violated
         ),
+        // Judged at two rests: while the listening node waits out its
+        // exchange budget, and after it closes.
         Err(WitnessError::Outcome(PropertyOutcome::Held {
-            applicable: 1
+            applicable: 2
         }))
     );
 }
@@ -466,10 +468,11 @@ fn recorded_witness_judges_its_own_trace() {
         &[],
     )
     .expect("a failed witness test still writes its trace");
+    // Judged at both rests, as in `violated_witness_fails_while_fixed`.
     assert_eq!(
         result,
         Err(WitnessError::Outcome(PropertyOutcome::Held {
-            applicable: 1
+            applicable: 2
         }))
     );
     assert!(trace.end.is_some());

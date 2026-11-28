@@ -121,19 +121,13 @@ impl AdvertFanout {
     /// `full_block_window`, rounded down.
     pub(crate) fn window(&self, size: Option<u32>) -> usize {
         let window = size.map_or(self.full_block_window, |size| {
-            let size = u64::from(size).max(self.small_size_bytes);
-            let below_full = self.full_size_bytes.saturating_sub(size);
-            let size_range = self.full_size_bytes.saturating_sub(self.small_size_bytes);
-            let window_range = self
-                .small_block_window
-                .saturating_sub(self.full_block_window);
-            // Both factors fit in 64 bits, so the product cannot overflow.
-            let above_full =
-                window_range as u128 * u128::from(below_full) / u128::from(size_range.max(1));
-            // `above_full` is at most `window_range`.
-            usize::try_from(above_full).map_or(self.small_block_window, |above_full| {
-                self.full_block_window + above_full
-            })
+            advert_window(
+                self.full_block_window,
+                self.small_block_window,
+                self.small_size_bytes,
+                self.full_size_bytes,
+                u64::from(size),
+            )
         });
         if let Some(size) = size {
             metrics::histogram!("peer.block_gossip.advert_block_size_bytes")
@@ -153,10 +147,35 @@ impl AdvertFanout {
     }
 }
 
+/// Returns the initial peer count for a block of `size` bytes.
+///
+/// Blocks at or below `small_size_bytes` use `small_block_window`. Blocks at or
+/// above `full_size_bytes` use `full_block_window`. Between these sizes, the
+/// window decreases linearly from `small_block_window` to `full_block_window`,
+/// rounded down. BPv1 paces `Have`s with the same window (decision-26).
+pub(crate) fn advert_window(
+    full_block_window: usize,
+    small_block_window: usize,
+    small_size_bytes: u64,
+    full_size_bytes: u64,
+    size: u64,
+) -> usize {
+    let size = size.max(small_size_bytes);
+    let below_full = full_size_bytes.saturating_sub(size);
+    let size_range = full_size_bytes.saturating_sub(small_size_bytes);
+    let window_range = small_block_window.saturating_sub(full_block_window);
+    // Both factors fit in 64 bits, so the product cannot overflow.
+    let above_full = window_range as u128 * u128::from(below_full) / u128::from(size_range.max(1));
+    // `above_full` is at most `window_range`.
+    usize::try_from(above_full).map_or(small_block_window, |above_full| {
+        full_block_window + above_full
+    })
+}
+
 /// Every this many selected recipients, a random peer replaces the next-lowest RTT.
 ///
 /// Random peers keep the initial group from depending entirely on the lowest RTTs.
-const ADVERT_RANDOM_INTERVAL: usize = 4;
+pub(crate) const ADVERT_RANDOM_INTERVAL: usize = 4;
 /// Allow the kernel send queue to drain after the framed block write completes.
 const BLOCK_WRITE_GRACE: Duration = Duration::from_millis(750);
 /// Expire request tracking for peers that already have the block. This does not pace gossip.

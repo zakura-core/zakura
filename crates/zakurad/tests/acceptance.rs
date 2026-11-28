@@ -1065,7 +1065,7 @@ async fn sync_checkpoints_local() -> Result<()> {
         .spawn_child(args!["start"])?
         .with_timeout(LARGE_CHECKPOINT_TIMEOUT);
     let producer_rpc_addr = read_listen_addr_from_logs(&mut producer, OPENED_RPC_ENDPOINT_MSG)?;
-    producer.expect_stdout_line_matches("activating mempool")?;
+    producer.expect_stdout_line_matches("mempool activated")?;
 
     let producer_rpc =
         RpcRequestClient::new_with_timeout(producer_rpc_addr, Duration::from_secs(15 * 60));
@@ -2353,7 +2353,7 @@ async fn rejected_block_does_not_reject_same_hash_block_children() -> Result<()>
         .spawn_child(args!["start"])?
         .with_timeout(EXTENDED_LAUNCH_DELAY);
     let rpc_address = read_listen_addr_from_logs(&mut block_builder, OPENED_RPC_ENDPOINT_MSG)?;
-    block_builder.expect_stdout_line_matches("activating mempool")?;
+    block_builder.expect_stdout_line_matches("mempool activated")?;
 
     let client = RpcRequestClient::new(rpc_address);
     let mut blocks = Vec::new();
@@ -2373,7 +2373,7 @@ async fn rejected_block_does_not_reject_same_hash_block_children() -> Result<()>
         .spawn_child(args!["start"])?
         .with_timeout(EXTENDED_LAUNCH_DELAY);
     let rpc_address = read_listen_addr_from_logs(&mut zakurad, OPENED_RPC_ENDPOINT_MSG)?;
-    zakurad.expect_stdout_line_matches("activating mempool")?;
+    zakurad.expect_stdout_line_matches("mempool activated")?;
 
     let client = RpcRequestClient::new(rpc_address);
     client.submit_block(blocks[0].clone()).await?;
@@ -2479,7 +2479,7 @@ async fn getrawtransaction_confirmations_include_non_finalized_blocks() -> Resul
         .spawn_child(args!["start"])?;
     let rpc_address = read_listen_addr_from_logs(&mut zakurad, OPENED_RPC_ENDPOINT_MSG)?;
 
-    zakurad.expect_stdout_line_matches("activating mempool")?;
+    zakurad.expect_stdout_line_matches("mempool activated")?;
 
     let client = RpcRequestClient::new(rpc_address);
     client.generate(1).await?;
@@ -2514,7 +2514,7 @@ async fn getrawtransaction_confirmations_include_non_finalized_blocks() -> Resul
         .spawn_child(args!["start"])?;
     let rpc_address = read_listen_addr_from_logs(&mut zakurad, OPENED_RPC_ENDPOINT_MSG)?;
 
-    zakurad.expect_stdout_line_matches("activating mempool")?;
+    zakurad.expect_stdout_line_matches("mempool activated")?;
 
     let client = RpcRequestClient::new(rpc_address);
     client
@@ -2604,7 +2604,7 @@ async fn pruned_storage_mode_prunes_during_regtest_sync() -> Result<()> {
         .take()
         .expect("zakurad should have a test directory");
 
-    zakurad.expect_stdout_line_matches("activating mempool")?;
+    zakurad.expect_stdout_line_matches("mempool activated")?;
 
     let client = RpcRequestClient::new(rpc_address);
 
@@ -3200,6 +3200,7 @@ async fn nu6_funding_streams_and_coinbase_balance() -> Result<()> {
         &miner_params,
         Amount::zero(),
         None,
+        None,
     )
     .expect("coinbase transaction should be valid under the given parameters");
 
@@ -3266,6 +3267,7 @@ async fn nu6_funding_streams_and_coinbase_balance() -> Result<()> {
         Height(block_template.height()),
         &miner_params,
         Amount::zero(),
+        None,
         None,
     )
     .expect("coinbase transaction should be valid under the given parameters");
@@ -3498,7 +3500,7 @@ async fn invalidate_and_reconsider_block() -> Result<()> {
         .spawn_child(args!["start"])?
         .with_timeout(EXTENDED_LAUNCH_DELAY);
     let rpc_address = read_listen_addr_from_logs(&mut child, OPENED_RPC_ENDPOINT_MSG)?;
-    child.expect_stdout_line_matches("activating mempool")?;
+    child.expect_stdout_line_matches("mempool activated")?;
 
     let rpc_client = RpcRequestClient::new(rpc_address);
     let mut blocks = Vec::new();
@@ -3584,7 +3586,7 @@ async fn precious_block_prefers_equal_work_siblings() -> Result<()> {
         .spawn_child(args!["start"])?
         .with_timeout(EXTENDED_LAUNCH_DELAY);
     let rpc_address = read_listen_addr_from_logs(&mut child, OPENED_RPC_ENDPOINT_MSG)?;
-    child.expect_stdout_line_matches("activating mempool")?;
+    child.expect_stdout_line_matches("mempool activated")?;
     let rpc_client = RpcRequestClient::new(rpc_address);
     rpc_client.generate(2).await?;
 
@@ -3673,7 +3675,7 @@ async fn restores_non_finalized_state_and_commits_new_blocks() -> Result<()> {
     let rpc_client = RpcRequestClient::new(rpc_address);
     child.expect_stdout_line_matches("verified final checkpoint")?;
     wake_debug_mempool(&rpc_client).await?;
-    child.expect_stdout_line_matches("activating mempool")?;
+    child.expect_stdout_line_matches("mempool activated")?;
     let generated_block_hashes = rpc_client.generate(INITIAL_NON_FINALIZED_BLOCKS).await?;
 
     child.kill(true)?;
@@ -3715,7 +3717,7 @@ async fn restores_non_finalized_state_and_commits_new_blocks() -> Result<()> {
 
     tracing::info!("checking that Zakura can commit blocks after restoring non-finalized state");
     wake_debug_mempool(&rpc_client).await?;
-    child.expect_stdout_line_matches("activating mempool")?;
+    child.expect_stdout_line_matches("mempool activated")?;
     rpc_client
         .generate(1)
         .await
@@ -3786,7 +3788,7 @@ async fn restores_non_finalized_state_and_commits_new_blocks() -> Result<()> {
     // after checkpoint verification.
 
     wake_debug_mempool(&rpc_client).await?;
-    child.expect_stdout_line_matches("activating mempool")?;
+    child.expect_stdout_line_matches("mempool activated")?;
     rpc_client
         .generate(1)
         .await
@@ -3815,7 +3817,7 @@ async fn restores_non_finalized_state_and_commits_new_blocks() -> Result<()> {
 
     tracing::info!("checking that Zakura commits blocks with empty non-finalized state");
     wake_debug_mempool(&rpc_client).await?;
-    child.expect_stdout_line_matches("activating mempool")?;
+    child.expect_stdout_line_matches("mempool activated")?;
     rpc_client
         .generate(1)
         .await
@@ -4400,13 +4402,13 @@ fn retired_seed_ids_never_stop_startup() -> Result<()> {
     use zakura_test::command::{test_cmd, CommandExt as _};
 
     let _init_guard = zakura_test::init();
-    // asia-0's node ID before and since p2p-v2/4.
+    // asia-0's p2p-v2/3 and p2p-v2/5 node IDs.
     let retired = "1398f62c6d1a457c51ba6a4b5f3dbd2f69fca93216218dc8997e416bd17d93ca";
-    let current = "a5f148b592404c5fcdc27f06919681c1dceddb274336abf5c91e70780471bc12";
+    let current = "078a60720f0d474743a51674b152f49f575704a77905c16475683cff9d18f246";
     let retired_entry = format!("{retired}@127.0.0.1:1");
     let rewritten = regex::escape("rewrote default seeds' retired node IDs");
     let not_rewritten = regex::escape("could not rewrite the config file");
-    let warning = regex::escape("names a default seed by the node ID it had before");
+    let warning = regex::escape("names a default seed by its p2p-v2/3 node ID");
 
     // Runs `start` with `env` and waits for lines matching each of `expected` in order.
     // The replacement logs before "Starting zakurad", so its lines come first. Killing the

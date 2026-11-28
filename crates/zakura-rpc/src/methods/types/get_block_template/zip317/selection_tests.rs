@@ -54,7 +54,7 @@ const TRANSPARENT_FEE_MULTIPLES: [u64; 5] = [1, 1, 2, 1, 3];
 
 fn limits(network: &Network, height: Height, miner: &MinerParams) -> BlockTemplateLimits {
     let coinbase =
-        TransactionTemplate::coinbase_resource_usage(network, height, miner, None).unwrap();
+        TransactionTemplate::coinbase_resource_usage(network, height, miner, None, None).unwrap();
     BlockTemplateLimits::initial(network, height, coinbase)
 }
 
@@ -995,6 +995,7 @@ fn benchmark_full_mempool_gbt_selection() {
                                 &chain,
                                 "0".repeat(46).parse().unwrap(),
                                 selection.txs,
+                                None,
                                 None,
                             )
                             .unwrap();

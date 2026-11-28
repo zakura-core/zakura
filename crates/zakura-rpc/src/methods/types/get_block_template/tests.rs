@@ -239,12 +239,111 @@ fn announcing_coinbase_names_the_gateway_in_one_extra_output() -> anyhow::Result
 
             assert_coinbase_resource_usage(&net, height, &announcing, &announcing_tx)?;
             assert_eq!(
-                TransactionTemplate::coinbase_resource_usage(&net, height, &announcing, None)?
-                    .max_serialized_size,
-                TransactionTemplate::coinbase_resource_usage(&net, height, &quiet, None)?
+                TransactionTemplate::coinbase_resource_usage(
+                    &net,
+                    height,
+                    &announcing,
+                    None,
+                    None
+                )?
+                .max_serialized_size,
+                TransactionTemplate::coinbase_resource_usage(&net, height, &quiet, None, None)?
                     .max_serialized_size
                     + 34,
             );
+
+            // A BPv1 commitment beside the gateway takes 46 more bytes, within the size the
+            // template reserves for it, and the gateway output stays last.
+            let bpv1 = [0x42; zakura_node_services::bpv1_proposer::BPV1_COMMITMENT_NULL_DATA_LEN];
+            let both_tx = TransactionTemplate::new_coinbase(
+                &net,
+                height,
+                &announcing,
+                Amount::zero(),
+                None,
+                Some(&bpv1),
+            )?
+            .data()
+            .as_ref()
+            .zcash_deserialize_into::<Transaction>()?;
+            assert_eq!(both_tx.outputs().last(), Some(&commitment.to_output()));
+            assert_eq!(
+                both_tx.zcash_serialized_size(),
+                announcing_tx.zcash_serialized_size() + 46
+            );
+            assert_eq!(
+                TransactionTemplate::coinbase_resource_usage(
+                    &net,
+                    height,
+                    &announcing,
+                    None,
+                    Some(bpv1.len())
+                )?
+                .max_serialized_size,
+                TransactionTemplate::coinbase_resource_usage(
+                    &net,
+                    height,
+                    &announcing,
+                    None,
+                    None
+                )?
+                .max_serialized_size
+                    + 46,
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// A coinbase that carries both a BPv1 commitment and a miner mesh output puts
+/// them last, the BPv1 output first, after every paid output.
+#[test]
+fn coinbase_puts_the_bpv1_output_before_the_miner_mesh_output() -> anyhow::Result<()> {
+    use zakura_node_services::bpv1_proposer::BPV1_COMMITMENT_NULL_DATA_LEN;
+
+    let mesh = MinerMeshCommitment::new(GatewayId::from_bytes(GATEWAY_ID));
+    let mut bpv1_payload = [0x42; BPV1_COMMITMENT_NULL_DATA_LEN];
+    bpv1_payload[..3].copy_from_slice(b"BP\x01");
+    // `OP_RETURN`, then a push of the 35-byte payload.
+    let bpv1_script = [&[0x6a, 0x23][..], &bpv1_payload].concat();
+    let bpv1_output =
+        transparent::Output::new(Amount::zero(), transparent::Script::new(&bpv1_script));
+
+    for net in Network::iter() {
+        let quiet = MinerParams::from(
+            MinerAddress::decode(
+                &net,
+                default_miner_address(net.kind(), &MinerAddressType::Transparent),
+            )
+            .ok_or(anyhow!("hard-coded transparent address must be valid"))?,
+        );
+        let mut announcing = quiet.clone();
+        announcing.set_mesh_commitment(mesh);
+
+        for nu in NetworkUpgrade::iter().filter(|nu| nu >= &NetworkUpgrade::Sapling) {
+            let Some(height) = nu.activation_height(&net) else {
+                continue;
+            };
+            let paid = coinbase_transaction(&net, height, &quiet)?;
+            let both = TransactionTemplate::new_coinbase(
+                &net,
+                height,
+                &announcing,
+                Amount::zero(),
+                None,
+                Some(&bpv1_payload),
+            )?
+            .data()
+            .as_ref()
+            .zcash_deserialize_into::<Transaction>()?;
+
+            let [paid_outputs @ .., bpv1, last] = both.outputs() else {
+                panic!("the coinbase holds the BPv1 and miner mesh outputs");
+            };
+            assert_eq!(paid_outputs, paid.outputs(), "{net:?} {nu:?}");
+            assert_eq!(bpv1, &bpv1_output, "{net:?} {nu:?}");
+            assert_eq!(last, &mesh.to_output(), "{net:?} {nu:?}");
         }
     }
 
@@ -273,7 +372,7 @@ fn local_genesis_activation_coinbase_includes_lockbox_marker() -> anyhow::Result
         .ok_or(anyhow!("hard-coded address must be valid"))?,
     );
     let transaction =
-        TransactionTemplate::new_coinbase(&net, height, &miner_params, Amount::zero(), None)?
+        TransactionTemplate::new_coinbase(&net, height, &miner_params, Amount::zero(), None, None)?
             .data()
             .as_ref()
             .zcash_deserialize_into::<Transaction>()?;
@@ -365,6 +464,7 @@ fn coinbase_tag_and_limit() {
         // NU7 is active at the maximum height, so the ZIP 234 subsidy needs a
         // parent NSM value balance.
         Some(Amount::zero()),
+        None,
     )
     .expect("maximum-length tag fits a coinbase transaction")
     .data()
@@ -411,7 +511,7 @@ fn distinct_coinbase_tags_give_shared_address_miners_distinct_work() {
             },
         )
         .expect("valid miner config");
-        TransactionTemplate::new_coinbase(&net, height, &params, Amount::zero(), None)
+        TransactionTemplate::new_coinbase(&net, height, &params, Amount::zero(), None, None)
             .expect("coinbase builds")
             .data()
             .as_ref()
@@ -526,9 +626,10 @@ fn coinbase_addresses_without_sapling() -> anyhow::Result<()> {
             assert!(error
                 .to_string()
                 .contains("Sapling coinbase construction is not supported"));
-            let error = TransactionTemplate::coinbase_resource_usage(&net, height, params, None)
-                .err()
-                .expect("resource planning rejects unsupported payouts too");
+            let error =
+                TransactionTemplate::coinbase_resource_usage(&net, height, params, None, None)
+                    .err()
+                    .expect("resource planning rejects unsupported payouts too");
             assert!(error
                 .to_string()
                 .contains("Sapling coinbase construction is not supported"));
@@ -640,7 +741,7 @@ fn coinbase_transaction(
     miner_params: &MinerParams,
 ) -> anyhow::Result<Transaction> {
     Ok(
-        TransactionTemplate::new_coinbase(net, height, miner_params, Amount::zero(), None)?
+        TransactionTemplate::new_coinbase(net, height, miner_params, Amount::zero(), None, None)?
             .data()
             .as_ref()
             // Deserialization contains checks for elementary consensus rules,
@@ -657,7 +758,8 @@ fn assert_coinbase_resource_usage(
 ) -> anyhow::Result<()> {
     use zcash_transparent::coinbase::MAX_COINBASE_SCRIPT_LEN;
 
-    let resources = TransactionTemplate::coinbase_resource_usage(net, height, miner_params, None)?;
+    let resources =
+        TransactionTemplate::coinbase_resource_usage(net, height, miner_params, None, None)?;
     let coinbase_script_len = transaction.inputs()[0]
         .coinbase_script()
         .expect("generated coinbase input has a canonical script")

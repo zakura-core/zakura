@@ -3,6 +3,8 @@
 pub use zakura_chain::parameters::checkpoint::constants;
 pub mod block_memory;
 pub mod block_relay;
+pub mod body_claims;
+pub mod bpv1_proposer;
 pub mod header_chain;
 pub mod mempool;
 pub mod prune_cadence;

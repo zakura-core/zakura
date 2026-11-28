@@ -107,6 +107,7 @@ fn nsm_fee_templates_pay_miner_and_credit_balance_once() {
                 "0".repeat(46).parse().unwrap(),
                 mempool,
                 None,
+                None,
             )
             .unwrap();
             let coinbase: Transaction = template

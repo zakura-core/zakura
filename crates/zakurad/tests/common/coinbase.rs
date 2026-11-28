@@ -63,12 +63,12 @@ pub(crate) async fn regtest_coinbase_names_the_gateway() -> eyre::Result<()> {
 /// checks the gateway ID in the coinbase, and returns the block.
 async fn announcing_block(net: &Network, addr_type: MinerAddressType) -> eyre::Result<Block> {
     // RFC 8032 section 7.1, test 1, as the node's secret key. The node ID is the hash of
-    // the key list that seed derives: its Ed25519 public key and its ML-DSA-44 key.
+    // the key list that seed derives: its Ed25519 public key and its ML-DSA-65 key.
     const NODE_SECRET_KEY: &str =
         "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60";
-    const NODE_ID: &str = "78333d017dc319f798578d82bcdafb434f582cf38b98bc85e4b17bfde89a4c53";
+    const NODE_ID: &str = "12ffc5e1bb88a852797a9b981b411a1b6a87f73aa3758e967d3c0d2bada0cddd";
     // The first 20 of the node ID's 32 bytes.
-    const GATEWAY_ID: &str = "78333d017dc319f798578d82bcdafb434f582cf3";
+    const GATEWAY_ID: &str = "12ffc5e1bb88a852797a9b981b411a1b6a87f73a";
     assert!(NODE_ID.starts_with(GATEWAY_ID));
 
     let identity_dir = tempfile::tempdir()?;
@@ -139,7 +139,7 @@ async fn mine_template_block(net: &Network, mut config: ZakuradConfig) -> eyre::
         &mut zakurad,
         OPENED_RPC_ENDPOINT_MSG,
     )?);
-    zakurad.expect_stdout_line_matches("activating mempool")?;
+    zakurad.expect_stdout_line_matches("mempool activated")?;
 
     let (mut block, height) = client.block_from_template(net).await?;
 

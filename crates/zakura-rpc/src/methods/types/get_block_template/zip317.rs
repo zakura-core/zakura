@@ -55,7 +55,7 @@ pub(crate) type SelectedMempoolTx = VerifiedUnminedTx;
 const BLOCK_HEADER_NONCE_BYTES: usize = 32;
 
 /// Returns the block header and transaction-count bytes reserved by a template.
-fn block_template_overhead_bytes(net: &Network) -> usize {
+pub(super) fn block_template_overhead_bytes(net: &Network) -> usize {
     let solution_bytes = Solution::for_proposal_for_network(net).zcash_serialized_size();
     let header_bytes = Solution::INPUT_LENGTH + BLOCK_HEADER_NONCE_BYTES + solution_bytes;
 
@@ -85,6 +85,10 @@ fn block_template_overhead_bytes(net: &Network) -> usize {
 /// and sigops do not depend on the reward amount, which lets selection avoid
 /// generating a zero-fee shielded proof.
 ///
+/// `extra_coinbase_null_data_len` reserves space for one zero-value `OP_RETURN`
+/// coinbase output with that many payload bytes; the 35-byte BPv1 commitment
+/// payload takes 46 serialized bytes.
+///
 /// Returns selected transactions from `mempool_txs`, or an error if coinbase
 /// resource usage cannot be calculated from the parent balance.
 ///
@@ -97,9 +101,15 @@ pub fn select_mempool_transactions(
     nsm_value_balance: Option<Amount<amount::NonNegative>>,
     mempool_txs: Vec<VerifiedUnminedTx>,
     mempool_tx_deps: TransactionDependencies,
+    extra_coinbase_null_data_len: Option<usize>,
 ) -> Result<Vec<SelectedMempoolTx>, TransactionError> {
-    let coinbase_resources =
-        TransactionTemplate::coinbase_resource_usage(net, height, miner_params, nsm_value_balance)?;
+    let coinbase_resources = TransactionTemplate::coinbase_resource_usage(
+        net,
+        height,
+        miner_params,
+        nsm_value_balance,
+        extra_coinbase_null_data_len,
+    )?;
     let limits = BlockTemplateLimits::initial(net, height, coinbase_resources);
 
     Ok(IndexedSelector::new(mempool_txs, mempool_tx_deps, limits).select())

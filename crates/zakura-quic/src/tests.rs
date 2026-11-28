@@ -1,7 +1,7 @@
 //! Endpoint conformance tests (SPEC §16).
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 
 use crate::{
     endpoint::watch_interfaces,
-    sim::{LinkModel, NetEvent, SeededInputs, SimNet, Source},
+    sim::{DatagramId, LinkModel, NetEvent, SeededInputs, SimNet, Source},
     Acceptor, Admit, Conn, ConnectError, ConnectionError, IncomingInfo, NodeAddr, NodeSecretKey,
     QuicBindConfig, QuicConfig, QuicEndpoint, SocketBuffers, SocketStats, VarInt,
 };
@@ -368,7 +368,7 @@ fn assert_counted_one_post_quantum_handshake(side: &str, counters: &Counters) {
     assert_eq!(
         counters.series("zakura.quic.tls.key_exchange"),
         BTreeMap::from([(
-            r#"zakura.quic.tls.key_exchange{group="X25519MLKEM768"}"#.to_string(),
+            r#"zakura.quic.tls.key_exchange{group="X25519MLKEM1024"}"#.to_string(),
             1
         )]),
         "{side} key exchanges"
@@ -381,7 +381,7 @@ fn assert_verified_signatures(side: &str, counters: &Counters, expected: u64) {
     assert_eq!(
         counters.series("zakura.quic.tls.signature_verified"),
         BTreeMap::from([(
-            r#"zakura.quic.tls.signature_verified{scheme="ed25519_mldsa44"}"#.to_string(),
+            r#"zakura.quic.tls.signature_verified{scheme="ed25519_mldsa65"}"#.to_string(),
             expected
         )]),
         "{side} verified signatures"
@@ -651,6 +651,30 @@ async fn self_dial_is_refused_before_any_packet() {
     ));
 }
 
+/// DIAL-1, TLS-7: a node that added a key to its credential also answers to
+/// the ID it had before, so a dial to that ID is a self-dial too. A stale
+/// record or config entry naming this node can't make it connect to itself.
+#[tokio::test]
+async fn a_dial_to_this_nodes_earlier_id_is_a_self_dial() {
+    let secret = NodeSecretKey::generate();
+    let earlier = secret.public();
+    let own = [crate::ED25519_KEY_TAG, crate::ML_DSA_65_KEY_TAG]
+        .map(|tag| (tag, secret.credential().key(tag).unwrap().to_vec()));
+    let added = (0x0102, vec![0x5a; 64]);
+    let credential = crate::NodeCredential::from_entries(own.into_iter().chain([added])).unwrap();
+    let secret = secret.with_credential(credential).unwrap();
+    let endpoint = QuicEndpoint::bind(secret, &loopback(), &test_config()).unwrap();
+    assert_ne!(endpoint.local_id(), earlier);
+
+    for id in [earlier, endpoint.local_id()] {
+        let own = NodeAddr::with_addrs(id, endpoint.local_addrs());
+        assert!(matches!(
+            endpoint.connect(own, &[ALPN]).await,
+            Err(ConnectError::SelfDial)
+        ));
+    }
+}
+
 #[tokio::test]
 async fn dial_without_a_matching_family_fails_fast() {
     let server = server();
@@ -709,6 +733,16 @@ async fn a_quic_connection_authenticates_the_full_extended_credential() {
     bytes.extend_from_slice(&[0x5a; 1312]);
     let credential = crate::NodeCredential::decode(&bytes).unwrap();
     let listener_keys = credential.key_list().clone();
+    // The ID of the listener's Ed25519 key and the added key alone.
+    let unsigned_id = crate::NodeCredential::from_entries([
+        (
+            crate::ED25519_KEY_TAG,
+            secret.public_key().as_bytes().to_vec(),
+        ),
+        (0x0102, vec![0x5a; 1312]),
+    ])
+    .unwrap()
+    .node_id();
     let secret = secret.with_credential(credential).unwrap();
 
     tokio::time::timeout(TEST_TIMEOUT, async {
@@ -716,17 +750,238 @@ async fn a_quic_connection_authenticates_the_full_extended_credential() {
         let mut server = serve_test_acceptor(endpoint, &[ALPN], |_| Admit::Accept);
         let client = client();
 
-        let old_pin = NodeAddr::with_addrs(original_id, server.endpoint.local_addrs());
-        assert!(matches!(
-            client.connect(old_pin, &[ALPN]).await,
-            Err(ConnectError::WrongIdentity)
-        ));
+        // TLS-7: the ID the listener had before it added the key still
+        // reaches it, and the connection reports the ID it has now.
+        let earlier = NodeAddr::with_addrs(original_id, server.endpoint.local_addrs());
+        let moved = client.connect(earlier, &[ALPN]).await.unwrap();
+        let inbound = server.handled.recv().await.unwrap();
+        assert_eq!(moved.dialed_id(), Some(original_id));
+        assert_eq!(moved.remote_id(), listener_keys.node_id());
+        assert_eq!(moved.remote_key_list(), &listener_keys);
+        // The one earlier ID the listener's signing keys prove. The ID of
+        // its Ed25519 key and the added key alone is not one of them.
+        assert_eq!(moved.remote_earlier_ids(), [original_id]);
+        assert_eq!(inbound.dialed_id(), None);
+        assert_eq!(inbound.remote_earlier_ids(), []);
+        assert_eq!(echo(&moved, b"hello").await, b"hello");
+
         let conn = client.connect(server.addr(), &[ALPN]).await.unwrap();
         let inbound = server.handled.recv().await.unwrap();
+        assert_eq!(conn.dialed_id(), Some(listener_keys.node_id()));
         assert_eq!(conn.remote_key_list(), &listener_keys);
         assert_eq!(conn.remote_id(), listener_keys.node_id());
+        assert_eq!(conn.remote_earlier_ids(), [original_id]);
         assert_eq!(inbound.remote_id(), client.local_id());
         assert_eq!(echo(&conn, b"hello").await, b"hello");
+
+        // An ID that names the added key but not the ML-DSA-65 key the
+        // listener signs with is not proven by the handshake.
+        let unsigned = NodeAddr::with_addrs(unsigned_id, server.endpoint.local_addrs());
+        assert!(matches!(
+            client.connect(unsigned, &[ALPN]).await,
+            Err(ConnectError::WrongIdentity)
+        ));
+    })
+    .await
+    .unwrap();
+}
+
+/// The key list entries a credential gives after its two signing keys when
+/// it is the largest a node can authenticate with: 27 retired keys as
+/// fingerprints, two keys of the greatest length and one of 2,224 bytes.
+/// With the signing keys that is 32 entries (ID-8) in exactly
+/// [`crate::MAX_CREDENTIAL_BYTES`] (ID-12).
+fn largest_credential_additions() -> Vec<(u16, crate::CredentialKey)> {
+    use crate::CredentialKey::{Fingerprint, Full};
+    let retired = (4u8..31).map(|tag| (u16::from(tag), Fingerprint([tag; 32])));
+    let longest = [31u8, 32].map(|tag| {
+        let key = vec![tag; crate::MAX_CREDENTIAL_KEY_BYTES];
+        (u16::from(tag), Full(key))
+    });
+    retired
+        .chain(longest)
+        .chain([(33, Full(vec![33; 2_224]))])
+        .collect()
+}
+
+/// `secret` presenting its two signing keys and then `additions`.
+fn with_additions(
+    secret: NodeSecretKey,
+    additions: impl IntoIterator<Item = (u16, crate::CredentialKey)>,
+) -> NodeSecretKey {
+    let own = [crate::ED25519_KEY_TAG, crate::ML_DSA_65_KEY_TAG].map(|tag| {
+        let key = secret.credential().key(tag).unwrap().to_vec();
+        (tag, crate::CredentialKey::Full(key))
+    });
+    let credential = crate::NodeCredential::from_entries(own.into_iter().chain(additions)).unwrap();
+    secret.with_credential(credential).unwrap()
+}
+
+/// A new node presenting the largest credential it can authenticate with:
+/// the most entries in the most bytes (ID-8, ID-12).
+pub(crate) fn largest_credential_key() -> NodeSecretKey {
+    let secret = with_additions(NodeSecretKey::generate(), largest_credential_additions());
+    assert_eq!(
+        secret.key_list().encoded_len(),
+        crate::MAX_NODE_KEY_LIST_BYTES
+    );
+    assert_eq!(
+        secret.credential().encode().len(),
+        crate::MAX_CREDENTIAL_BYTES
+    );
+    secret
+}
+
+/// ID-12: the largest credential completes a handshake in both directions.
+#[tokio::test]
+async fn the_largest_credential_completes_a_handshake() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let endpoint =
+            QuicEndpoint::bind(largest_credential_key(), &loopback(), &test_config()).unwrap();
+        let mut server = serve_test_acceptor(endpoint, &[ALPN], |_| Admit::Accept);
+        let client =
+            QuicEndpoint::bind(largest_credential_key(), &loopback(), &test_config()).unwrap();
+
+        let conn = client.connect(server.addr(), &[ALPN]).await.unwrap();
+        let inbound = server.handled.recv().await.unwrap();
+        assert_eq!(conn.remote_id(), server.addr().id);
+        assert_eq!(inbound.remote_id(), client.local_id());
+        assert_eq!(echo(&conn, b"hello").await, b"hello");
+    })
+    .await
+    .unwrap();
+}
+
+/// TLS-7 through whole QUIC handshakes with a 32-entry credential: the node
+/// answers a dial to each ID it has had since its two signing keys, which
+/// are the prefixes of its key list from those two entries on, and to no
+/// other list of its entries.
+#[tokio::test]
+async fn a_node_with_32_keys_answers_to_each_earlier_id_and_no_other_list() {
+    let original = NodeSecretKey::generate();
+    let additions = largest_credential_additions();
+    // The ID the node had after each key it added.
+    let earlier_ids: Vec<_> = (0..additions.len())
+        .map(|added| with_additions(original.clone(), additions[..added].to_vec()).public())
+        .collect();
+    assert_eq!(earlier_ids[0], original.public());
+    // Lists of the node's entries that keep both signing keys and are not
+    // prefixes: one skips the first key the node added, one keeps only the
+    // last. The rule before spec version 0.34 accepted both.
+    let skipping = with_additions(original.clone(), additions[1..].to_vec()).public();
+    let last_only = with_additions(original.clone(), additions[29..].to_vec()).public();
+    // A prefix that leaves a signing key out: the Ed25519 key alone.
+    let ed25519_only = crate::NodeCredential::single(original.public_key()).node_id();
+    let secret = with_additions(original, additions);
+    assert_eq!(
+        secret.key_list().encoded_len(),
+        crate::MAX_NODE_KEY_LIST_BYTES
+    );
+    let current = secret.public();
+
+    tokio::time::timeout(3 * TEST_TIMEOUT, async {
+        let endpoint = QuicEndpoint::bind(secret, &loopback(), &test_config()).unwrap();
+        let mut server = serve_test_acceptor(endpoint, &[ALPN], |_| Admit::Accept);
+        let client = client();
+        let addrs = server.endpoint.local_addrs();
+
+        for dialed in earlier_ids.into_iter().chain([current]) {
+            let addr = NodeAddr::with_addrs(dialed, addrs.clone());
+            let conn = client.connect(addr, &[ALPN]).await.unwrap();
+            server.handled.recv().await.unwrap();
+            assert_eq!(conn.dialed_id(), Some(dialed));
+            assert_eq!(conn.remote_id(), current);
+            conn.close(VarInt::from_u32(0), b"done");
+        }
+        for refused in [skipping, last_only, ed25519_only] {
+            let addr = NodeAddr::with_addrs(refused, addrs.clone());
+            assert!(matches!(
+                client.connect(addr, &[ALPN]).await,
+                Err(ConnectError::WrongIdentity)
+            ));
+        }
+    })
+    .await
+    .unwrap();
+}
+
+/// TLS-7, API-4: a connection reports the earlier IDs its peer proves in
+/// both directions. The largest credential proves the most: the ID of each
+/// prefix of its key list from its two signing keys on, short of the whole,
+/// shortest first. An accepted connection reports them for the dialer as a
+/// dial reports them for the listener, and a dial to any of them reaches
+/// the node.
+#[tokio::test]
+async fn a_connection_reports_the_earlier_ids_its_peer_proves() {
+    // A node with the largest credential, and the IDs its handshake proves
+    // and doesn't.
+    let largest = || {
+        let original = NodeSecretKey::generate();
+        let additions = largest_credential_additions();
+        let earlier: Vec<_> = (0..additions.len())
+            .map(|added| with_additions(original.clone(), additions[..added].to_vec()).public())
+            .collect();
+        assert_eq!(earlier.len(), crate::MAX_EARLIER_NODE_IDS);
+        // Lists of the node's entries the handshake can't prove: one that
+        // leaves out the ML-DSA-65 key, and one that skips the first key the
+        // node added.
+        let ed25519 = original.credential().key(crate::ED25519_KEY_TAG).unwrap();
+        let without_ml_dsa = crate::NodeCredential::from_entries(
+            [(
+                crate::ED25519_KEY_TAG,
+                crate::CredentialKey::Full(ed25519.to_vec()),
+            )]
+            .into_iter()
+            .chain(additions.iter().cloned()),
+        )
+        .unwrap()
+        .node_id();
+        let skipping = with_additions(original.clone(), additions[1..].to_vec()).public();
+        let secret = with_additions(original, additions);
+        (secret, earlier, [without_ml_dsa, skipping])
+    };
+
+    tokio::time::timeout(3 * TEST_TIMEOUT, async {
+        let (listener_key, listener_earlier, listener_unproven) = largest();
+        let (dialer_key, dialer_earlier, dialer_unproven) = largest();
+        let endpoint = QuicEndpoint::bind(listener_key, &loopback(), &test_config()).unwrap();
+        let mut server = serve_test_acceptor(endpoint, &[ALPN], |_| Admit::Accept);
+        let client = QuicEndpoint::bind(dialer_key, &loopback(), &test_config()).unwrap();
+
+        let conn = client.connect(server.addr(), &[ALPN]).await.unwrap();
+        let inbound = server.handled.recv().await.unwrap();
+        assert_eq!(conn.remote_earlier_ids(), listener_earlier);
+        assert_eq!(inbound.remote_earlier_ids(), dialer_earlier);
+        assert!(!conn.remote_earlier_ids().contains(&conn.remote_id()));
+        for (connection, unproven) in [(&conn, listener_unproven), (&inbound, dialer_unproven)] {
+            for id in unproven {
+                assert!(!connection.remote_earlier_ids().contains(&id));
+            }
+        }
+
+        // What a connection reports is what a dial accepts.
+        for earlier in &listener_earlier {
+            let addr = NodeAddr::with_addrs(*earlier, server.endpoint.local_addrs());
+            let moved = client.connect(addr, &[ALPN]).await.unwrap();
+            server.handled.recv().await.unwrap();
+            assert_eq!(moved.dialed_id(), Some(*earlier));
+            assert_eq!(moved.remote_id(), server.addr().id);
+            assert!(moved.remote_earlier_ids().contains(earlier));
+        }
+        for unproven in listener_unproven {
+            let addr = NodeAddr::with_addrs(unproven, server.endpoint.local_addrs());
+            assert!(matches!(
+                client.connect(addr, &[ALPN]).await,
+                Err(ConnectError::WrongIdentity)
+            ));
+        }
+
+        // A node with only its two signing keys has no earlier ID.
+        let plain = self::client();
+        let conn = plain.connect(server.addr(), &[ALPN]).await.unwrap();
+        let inbound = server.handled.recv().await.unwrap();
+        assert_eq!(conn.remote_earlier_ids(), listener_earlier);
+        assert_eq!(inbound.remote_earlier_ids(), []);
     })
     .await
     .unwrap();
@@ -767,6 +1022,9 @@ async fn a_classical_one_datagram_hello_is_refused_and_cancelled() {
             .with_client_cert_resolver(Arc::new(rpk));
         crypto.alpn_protocols = vec![ALPN.to_vec()];
         assert!(dial_raw(&server, crypto).await.is_err());
+        // Past the 3 s handshake deadline: an unpadded hello leaves no
+        // stray attempt behind to fail late.
+        tokio::time::sleep(Duration::from_millis(3500)).await;
         assert_eq!(server.seen.lock().unwrap().len(), 1);
         assert_eq!(server.returned.cancelled.load(Ordering::Relaxed), 1);
         assert_eq!(server.returned.finished.load(Ordering::Relaxed), 0);
@@ -847,11 +1105,12 @@ async fn refused_attempt_creates_no_connection() {
         ));
         // SEC-3: the acceptor never saw a connection.
         assert!(server.handled.try_recv().is_err());
-        // The hello spans two datagrams. The endpoint decides each one it
-        // doesn't accept on its own (ADM-1), so the dial is refused twice.
-        wait_for_attempts(&server, 2).await;
+        // The hello spans two datagrams and the dialer pads it with a third.
+        // The endpoint decides each one it doesn't accept on its own (ADM-1),
+        // so the dial is refused three times.
+        wait_for_attempts(&server, 3).await;
         tokio::time::sleep(Duration::from_millis(100)).await;
-        assert_eq!(server.seen.lock().unwrap().len(), 2);
+        assert_eq!(server.seen.lock().unwrap().len(), 3);
         assert!(server.handled.try_recv().is_err());
     })
     .await
@@ -885,14 +1144,16 @@ async fn retry_threshold_validates_before_accepting() {
         client.connect(server.addr(), &[ALPN]).await.unwrap();
         let inbound = server.handled.recv().await.unwrap();
         assert!(inbound.source_validated(), "the Retry token validated it");
-        // The hello spans two datagrams, and each unvalidated one gets its
-        // own Retry (ADM-1). The dialer answers the first and discards the
-        // second, as RFC 9000 section 17.2.5.2 requires.
+        // The hello spans two datagrams and the dialer pads it with a third.
+        // Each unvalidated one gets its own Retry (ADM-1). The dialer answers
+        // the first and discards the rest, as RFC 9000 section 17.2.5.2
+        // requires. Its retried hello carries the token, so it needs no
+        // padding datagram.
         let seen = server.seen.lock().unwrap().clone();
         assert_eq!(
             seen.iter().map(|info| info.validated).collect::<Vec<_>>(),
-            [false, false, true],
-            "one Retry per datagram of the hello, then the validated attempt"
+            [false, false, false, true],
+            "one Retry per datagram of the first flight, then the validated attempt"
         );
     })
     .await
@@ -2113,7 +2374,7 @@ impl rustls::sign::SigningKey for Impostor {
     }
 
     fn algorithm(&self) -> rustls::SignatureAlgorithm {
-        rustls::SignatureAlgorithm::Unknown(0x44)
+        rustls::SignatureAlgorithm::Unknown(0x65)
     }
 }
 
@@ -2684,7 +2945,10 @@ async fn churn(bind: QuicBindConfig) -> (usize, usize) {
         stop.store(true, Ordering::Relaxed);
         sampler.await.unwrap();
 
-        tokio::time::timeout(Duration::from_secs(5), async {
+        // A later Initial can be admitted after the start of its hello was
+        // refused. That slot waits for its handshake deadline before draining.
+        let drain_timeout = test_config().handshake_timeout().unwrap() + Duration::from_secs(5);
+        tokio::time::timeout(drain_timeout, async {
             while server.connection_count() + server.closing_connection_count() > 0 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -3095,14 +3359,19 @@ async fn cancelled_discovery_dials_restore_every_slot() {
     .unwrap();
 }
 
-/// An endpoint on one simulated socket at `addr`.
+/// An endpoint with a new key on one simulated socket at `addr`.
 fn sim_endpoint(net: &SimNet, addr: SocketAddr) -> QuicEndpoint {
+    sim_endpoint_keyed(net, addr, NodeSecretKey::generate())
+}
+
+/// An endpoint with the key `secret` on one simulated socket at `addr`.
+fn sim_endpoint_keyed(net: &SimNet, addr: SocketAddr, secret: NodeSecretKey) -> QuicEndpoint {
     let bind = QuicBindConfig {
         addrs: vec![addr],
         ..loopback()
     };
     QuicEndpoint::bind_with(
-        NodeSecretKey::generate(),
+        secret,
         &bind,
         &test_config(),
         net.clone(),
@@ -3134,12 +3403,13 @@ async fn pump(net: SimNet) {
     }
 }
 
-/// The dialer's hello carries the hybrid key share, 1,216 bytes, so its first
-/// flight is two full Initial datagrams where a hello with ring's groups
-/// needed one (TLS-9). Both leave before any reply. The server accepts the
-/// first, the second joins that connection, and the handshake completes.
+/// The dialer's hello carries the hybrid key share, 1,600 bytes, so it spans
+/// two full Initial datagrams where a hello with ring's groups needed one
+/// (TLS-9), and the dialer pads its first flight with a third (ADM-1). All
+/// three leave before any reply. The server accepts the first, the others
+/// join that connection, and the handshake completes.
 #[tokio::test(start_paused = true)]
-async fn the_hybrid_hello_leaves_as_two_initial_datagrams() {
+async fn the_hybrid_hello_leaves_as_three_initial_datagrams() {
     tokio::time::timeout(SIM_TEST_TIMEOUT, async {
         let net = sim_net();
         let mut server =
@@ -3156,7 +3426,7 @@ async fn the_hybrid_hello_leaves_as_two_initial_datagrams() {
         for _ in 0..10_000 {
             tokio::task::yield_now().await;
         }
-        assert_eq!(sent_lengths(&net, sim_addr(2)), [1200, 1200]);
+        assert_eq!(sent_lengths(&net, sim_addr(2)), [1200, 1200, 1200]);
 
         let pump = tokio::spawn(pump(net.clone()));
         let (_client, result) = dial.await.unwrap();
@@ -3169,13 +3439,24 @@ async fn the_hybrid_hello_leaves_as_two_initial_datagrams() {
     .unwrap();
 }
 
-/// TLS-4, ADM-1: with the composite credential and signature, the
-/// listener's whole first flight still fits QUIC's allowance before the
-/// dialer's address is validated, three times the 2,400 bytes of the hybrid
-/// hello. The dialer completes its handshake on that flight alone, so the
-/// larger signature adds no round trip.
+/// TLS-4, TLS-9, ADM-1: the listener's whole first flight, about 7.9 KB with
+/// its ML-KEM-1024 ciphertext, ML-DSA-65 credential and composite signature,
+/// is larger than three times the 2,400-byte hello, QUIC's allowance before
+/// the dialer's address is validated. The dialer's padding datagram raises
+/// the allowance to three times 3,600 bytes, the flight fits, and the dialer
+/// completes its handshake on it alone, in one round trip.
 #[tokio::test(start_paused = true)]
-async fn the_listeners_first_flight_fits_the_amplification_limit() {
+async fn the_listeners_first_flight_fits_the_padded_allowance() {
+    check_listener_first_flight(false).await;
+}
+
+/// Until the padding arrives, only the first 2,400 bytes can fund a reply.
+#[tokio::test(start_paused = true)]
+async fn the_listener_stays_within_the_byte_limit_until_padding_arrives() {
+    check_listener_first_flight(true).await;
+}
+
+async fn check_listener_first_flight(delay_padding: bool) {
     tokio::time::timeout(SIM_TEST_TIMEOUT, async {
         let net = sim_net();
         let _server =
@@ -3198,17 +3479,43 @@ async fn the_listeners_first_flight_fits_the_amplification_limit() {
                 }
             }
         };
+        let sent = |src: SocketAddr| -> usize { sent_lengths(&net, src).iter().sum() };
 
         settle().await;
-        let hello: usize = sent_lengths(&net, sim_addr(2)).iter().sum();
-        assert_eq!(hello, 2_400, "the hybrid hello is two full datagrams");
+        let first_flight = sent(sim_addr(2));
+        assert_eq!(
+            first_flight, 3_600,
+            "the hello's two datagrams and the padding datagram"
+        );
         tokio::time::sleep(Duration::from_millis(5)).await;
-        deliver_from(sim_addr(2));
+        if delay_padding {
+            let mut hello = net.deliverable();
+            hello.sort_by_key(|id| id.seq);
+            let [first, second, padding] = hello.as_slice() else {
+                panic!("expected the dialer's two hello datagrams and its padding");
+            };
+            net.deliver(*first).unwrap();
+            net.deliver(*second).unwrap();
+            settle().await;
+            let reply = sent(sim_addr(1));
+            assert!(reply > 0, "the listener can start replying to the hello");
+            assert!(
+                reply <= 3 * 2_400,
+                "sent {reply} bytes before padding arrived"
+            );
+            net.deliver(*padding).unwrap();
+        } else {
+            deliver_from(sim_addr(2));
+        }
         settle().await;
 
-        let flight: usize = sent_lengths(&net, sim_addr(1)).iter().sum();
+        let flight = sent(sim_addr(1));
         assert!(
-            flight <= 3 * hello,
+            flight > 3 * 2_400,
+            "the {flight}-byte flight needs the padding datagram"
+        );
+        assert!(
+            flight <= 3 * first_flight,
             "the listener sent {flight} bytes before validation"
         );
         tokio::time::sleep(Duration::from_millis(5)).await;
@@ -3217,6 +3524,260 @@ async fn the_listeners_first_flight_fits_the_amplification_limit() {
         assert!(
             dial.is_finished(),
             "the dialer completed on the listener's first flight of {flight} bytes"
+        );
+        let (_client, result) = dial.await.unwrap();
+        result.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+/// ID-12, DIAL-8: a listener with the largest credential has a first flight
+/// of about 16 KB, beyond the padded allowance of 10,800 bytes. The dial
+/// takes a second round trip and completes. It doesn't fail.
+#[tokio::test(start_paused = true)]
+async fn the_largest_credential_takes_a_second_round_trip() {
+    tokio::time::timeout(SIM_TEST_TIMEOUT, async {
+        let net = sim_net();
+        let listener = sim_endpoint_keyed(&net, sim_addr(1), largest_credential_key());
+        let _server = serve_test_acceptor(listener, &[ALPN], |_| Admit::Accept);
+        let client = sim_endpoint(&net, sim_addr(2));
+        let target = _server.addr();
+        let dial = tokio::spawn(async move {
+            let result = client.connect(target, &[ALPN]).await;
+            (client, result)
+        });
+        // Waits out the longest link delay, then delivers what `src` sent.
+        let deliver_from = |src: SocketAddr| {
+            let net = net.clone();
+            async move {
+                for _ in 0..10_000 {
+                    tokio::task::yield_now().await;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                for id in net.deliverable() {
+                    if id.link.src == src {
+                        net.deliver(id).unwrap();
+                    }
+                }
+                for _ in 0..10_000 {
+                    tokio::task::yield_now().await;
+                }
+            }
+        };
+
+        deliver_from(sim_addr(2)).await;
+        let flight: usize = sent_lengths(&net, sim_addr(1)).iter().sum();
+        assert!(
+            flight <= 3 * 3_600,
+            "the listener sent {flight} bytes before validation"
+        );
+        deliver_from(sim_addr(1)).await;
+        assert!(
+            !dial.is_finished(),
+            "the allowance can't carry the largest credential in one flight"
+        );
+        deliver_from(sim_addr(2)).await;
+        deliver_from(sim_addr(1)).await;
+        assert!(
+            dial.is_finished(),
+            "the dial completes on the second flight"
+        );
+        let (_client, result) = dial.await.unwrap();
+        assert_eq!(result.unwrap().remote_id(), _server.addr().id);
+    })
+    .await
+    .unwrap();
+}
+
+/// The order [`pump_bursts`] delivers the datagrams of one burst in.
+#[derive(Clone, Copy)]
+enum BurstOrder {
+    /// As they were sent.
+    Sent,
+    /// The datagram sent last first.
+    Reversed,
+}
+
+/// Delivers what is eligible once per simulated millisecond, in `order`.
+/// `drops` is asked about each datagram, with its length, and the ones it
+/// claims are lost.
+async fn pump_bursts(
+    net: SimNet,
+    order: BurstOrder,
+    mut drops: impl FnMut(DatagramId, usize) -> bool,
+) {
+    let mut seen = 0;
+    let mut lengths = HashMap::new();
+    loop {
+        for event in net.events_since(seen) {
+            seen += 1;
+            if let NetEvent::Sent { id, len, .. } = event {
+                lengths.insert(id, len);
+            }
+        }
+        let mut eligible = net.deliverable();
+        eligible.sort_by_key(|id| id.seq);
+        if matches!(order, BurstOrder::Reversed) {
+            eligible.reverse();
+        }
+        for id in eligible {
+            if drops(id, lengths[&id]) {
+                net.drop_datagram(id).unwrap();
+            } else {
+                net.deliver(id).unwrap();
+            }
+        }
+        assert!(net.can_advance(), "a datagram passed its deadline");
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
+/// A simulated network whose links take 5 ms, so the datagrams of one burst
+/// become eligible together and [`pump_bursts`] can reorder them, and may
+/// lose `loss_budget` datagrams each.
+fn bursty_net(loss_budget: u64) -> SimNet {
+    SimNet::new(LinkModel {
+        min_delay: Duration::from_millis(5),
+        max_delay: Duration::from_millis(5),
+        reorder: true,
+        loss_budget,
+    })
+}
+
+/// ID-12: two nodes with the largest credential complete a handshake when
+/// every burst of datagrams arrives in reverse. The flight that carries the
+/// credential, about 14 KB, fits the 16 KiB of handshake data `quinn-proto`
+/// buffers, so no arrival order makes a peer refuse it.
+#[tokio::test(start_paused = true)]
+async fn the_largest_credential_completes_a_handshake_delivered_in_reverse() {
+    tokio::time::timeout(SIM_TEST_TIMEOUT, async {
+        let net = bursty_net(0);
+        let listener = sim_endpoint_keyed(&net, sim_addr(1), largest_credential_key());
+        let mut server = serve_test_acceptor(listener, &[ALPN], |_| Admit::Accept);
+        let client = sim_endpoint_keyed(&net, sim_addr(2), largest_credential_key());
+        let pump = tokio::spawn(pump_bursts(net.clone(), BurstOrder::Reversed, |_, _| false));
+
+        let conn = client.connect(server.addr(), &[ALPN]).await.unwrap();
+        let inbound = server.handled.recv().await.unwrap();
+        assert_eq!(conn.remote_id(), server.addr().id);
+        assert_eq!(inbound.remote_id(), client.local_id());
+        assert_eq!(echo(&conn, b"hello").await, b"hello");
+        pump.abort();
+    })
+    .await
+    .unwrap();
+}
+
+/// Dials a listener with the key `listener` on a network that loses the
+/// first full datagram the listener sends, which carries the start of its
+/// ServerHello, and delivers the others in the order sent. Returns the dial's result, how long it took, how many bytes
+/// the listener sent, and the connections each endpoint still counts.
+async fn dial_losing_the_server_hello(
+    listener: NodeSecretKey,
+) -> (Result<(), ConnectError>, Duration, usize, [usize; 2]) {
+    let net = bursty_net(1);
+    let listener = sim_endpoint_keyed(&net, sim_addr(1), listener);
+    let server = serve_test_acceptor(listener, &[ALPN], |_| Admit::Accept);
+    let client = sim_endpoint(&net, sim_addr(2));
+    let mut lost = false;
+    let drops = move |id: DatagramId, len| {
+        let first_full = !lost && id.link.src == sim_addr(1) && len == 1200;
+        lost |= first_full;
+        first_full
+    };
+    let pump = tokio::spawn(pump_bursts(net.clone(), BurstOrder::Sent, drops));
+
+    let started = tokio::time::Instant::now();
+    let result = client.connect(server.addr(), &[ALPN]).await;
+    let elapsed = started.elapsed();
+    let sent = sent_lengths(&net, sim_addr(1)).iter().sum();
+    let result = result.map(|conn| conn.close(VarInt::from_u32(0), b"done"));
+    // Leaves time for both ends to release a failed or closed connection.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let counts = [
+        server.endpoint.connection_count(),
+        client.connection_count(),
+    ];
+    pump.abort();
+    (result, elapsed, sent, counts)
+}
+
+/// ID-12: what a long credential costs under loss, today. When the datagram
+/// with the start of a listener's ServerHello is lost, the dialer can't
+/// read the rest of the flight, and the listener has to resend that
+/// datagram. A listener with this release's own credential does, and the
+/// dial completes. A listener with the largest credential doesn't: the loss
+/// shrinks its congestion window below the flight it still has unacked, so
+/// `quinn-proto` holds the resend back, and its probes carry handshake data
+/// the dialer can't read yet. The dial fails at the handshake deadline
+/// (ADM-6), no sooner or later, and both ends release the connection. It
+/// doesn't hang, and the listener sends a bounded number of bytes.
+#[tokio::test(start_paused = true)]
+async fn a_lost_server_hello_fails_the_largest_credentials_dial_at_the_deadline() {
+    tokio::time::timeout(SIM_TEST_TIMEOUT, async {
+        let (result, elapsed, _, counts) =
+            dial_losing_the_server_hello(NodeSecretKey::generate()).await;
+        assert!(result.is_ok(), "{result:?}");
+        assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+        assert_eq!(counts, [0, 0]);
+
+        let deadline = test_config().handshake_timeout().unwrap();
+        let (result, elapsed, sent, counts) =
+            dial_losing_the_server_hello(largest_credential_key()).await;
+        assert!(
+            matches!(result, Err(ConnectError::HandshakeTimeout)),
+            "{result:?}"
+        );
+        assert_eq!(elapsed, deadline);
+        assert!(sent < 64 * 1024, "the listener sent {sent} bytes");
+        assert_eq!(counts, [0, 0]);
+    })
+    .await
+    .unwrap();
+}
+
+/// DIAL-8: a hello whose first datagram meets a full send buffer is still
+/// padded. The driver parks that datagram before quinn-proto builds the
+/// second, waits for the socket, and only then adds the padding datagram,
+/// so the dial still completes in one round trip.
+#[tokio::test(start_paused = true)]
+async fn a_hello_that_meets_a_full_send_buffer_is_still_padded() {
+    tokio::time::timeout(SIM_TEST_TIMEOUT, async {
+        let net = sim_net();
+        let server =
+            serve_test_acceptor(sim_endpoint(&net, sim_addr(1)), &[ALPN], |_| Admit::Accept);
+        let client = sim_endpoint(&net, sim_addr(2));
+        assert!(net.fail_next_send(sim_addr(2), std::io::ErrorKind::WouldBlock));
+        let target = server.addr();
+        let dial = tokio::spawn(async move {
+            let result = client.connect(target, &[ALPN]).await;
+            (client, result)
+        });
+        let settle = || async {
+            for _ in 0..10_000 {
+                tokio::task::yield_now().await;
+            }
+        };
+        let deliver_from = |src: SocketAddr| {
+            for id in net.deliverable() {
+                if id.link.src == src {
+                    net.deliver(id).unwrap();
+                }
+            }
+        };
+
+        settle().await;
+        assert_eq!(sent_lengths(&net, sim_addr(2)), [1200, 1200, 1200]);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        deliver_from(sim_addr(2));
+        settle().await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        deliver_from(sim_addr(1));
+        settle().await;
+        assert!(
+            dial.is_finished(),
+            "the dialer completed on the listener's first flight"
         );
         let (_client, result) = dial.await.unwrap();
         result.unwrap();
@@ -3258,11 +3819,12 @@ async fn a_production_dialer_is_refused_by_a_listener_without_the_hybrid_group()
     .unwrap();
 }
 
-/// A refused dial is answered once per datagram of its hello: the endpoint
-/// keeps no record of the attempt it refused, so the second datagram is a
-/// new attempt and gets its own refusal (ADM-1).
+/// A refused dial is answered once per datagram of its first flight: the
+/// endpoint keeps no record of the attempt it refused, so the hello's second
+/// datagram and the padding datagram are new attempts, each with its own
+/// refusal (ADM-1).
 #[tokio::test(start_paused = true)]
-async fn a_refused_two_datagram_hello_is_answered_twice() {
+async fn a_refused_hello_is_answered_once_per_datagram() {
     tokio::time::timeout(SIM_TEST_TIMEOUT, async {
         let net = sim_net();
         let pump = tokio::spawn(pump(net.clone()));
@@ -3274,10 +3836,10 @@ async fn a_refused_two_datagram_hello_is_answered_twice() {
             client.connect(server.addr(), &[ALPN]).await,
             Err(ConnectError::Refused)
         ));
-        // Long enough for the second datagram and its answer to arrive.
+        // Long enough for the later datagrams and their answers to arrive.
         tokio::time::sleep(Duration::from_secs(1)).await;
-        assert_eq!(server.seen.lock().unwrap().len(), 2);
-        assert_eq!(sent_lengths(&net, sim_addr(1)).len(), 2);
+        assert_eq!(server.seen.lock().unwrap().len(), 3);
+        assert_eq!(sent_lengths(&net, sim_addr(1)).len(), 3);
         assert!(server.handled.try_recv().is_err());
         assert_eq!(server.returned.cancelled.load(Ordering::Relaxed), 0);
         assert_eq!(server.returned.finished.load(Ordering::Relaxed), 0);
@@ -3864,4 +4426,112 @@ fn a_simulated_run_refuses_a_wildcard_socket() {
             unread: 0
         })
     );
+}
+
+/// Pumps `net` while enforcing a per-link token bucket of `bytes_per_sec` on
+/// delivered datagrams. Every datagram waits at least `min_delay` in `net`,
+/// and delivery pace on each directed link is bounded by `bytes_per_sec`.
+async fn pump_shaped(net: SimNet, bytes_per_sec: u64) {
+    let mut tokens_by_link: std::collections::HashMap<crate::sim::Link, f64> =
+        std::collections::HashMap::new();
+    let max_burst: f64 = 4_800.0;
+    let tick = Duration::from_millis(1);
+    let refill_per_tick = bytes_per_sec as f64 / 1_000.0;
+    loop {
+        for tokens in tokens_by_link.values_mut() {
+            *tokens = (*tokens + refill_per_tick).min(max_burst);
+        }
+        for id in net.deliverable() {
+            let tokens = tokens_by_link.entry(id.link).or_insert(max_burst);
+            let cost = 1_200.0;
+            if *tokens < cost {
+                continue;
+            }
+            if net.deliver(id).is_ok() {
+                *tokens -= cost;
+            }
+        }
+        tokio::time::sleep(tick).await;
+    }
+}
+
+/// Measures `ConnLoad`'s `min_rtt`, `rate_out` and `rate_in` over a `SimNet`
+/// link with fixed propagation delay and rate shaping.
+async fn measure_shaped_link(
+    one_way_delay: Duration,
+    bytes_per_sec: u64,
+    payload_bytes: usize,
+) -> (crate::ConnLoad, crate::ConnLoad) {
+    let net = SimNet::new(LinkModel {
+        min_delay: one_way_delay,
+        max_delay: one_way_delay + Duration::from_secs(10),
+        reorder: false,
+        loss_budget: 0,
+    });
+    let pumper = tokio::spawn(pump_shaped(net.clone(), bytes_per_sec));
+
+    let server_addr = sim_addr(21);
+    let client_addr = sim_addr(22);
+    let server_ep = sim_endpoint(&net, server_addr);
+    let client_ep = sim_endpoint(&net, client_addr);
+
+    let mut server = serve_test_acceptor(server_ep, &[ALPN], |_| Admit::Accept);
+
+    let server_node = NodeAddr::with_addrs(server.endpoint.local_id(), vec![server_addr]);
+    let client_conn = client_ep.connect(server_node, &[ALPN]).await.unwrap();
+    let server_conn = server.handled.recv().await.unwrap();
+
+    // Send a bulk payload from client to server and receive the echo so both
+    // sides observe sustained outbound and inbound stream traffic.
+    let payload = vec![0xABu8; payload_bytes];
+    assert_eq!(echo(&client_conn, &payload).await, payload);
+
+    // Let the 50 ms load publisher publish the idle snapshot with finalized
+    // receive-rate windows.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let client_load = client_conn.load();
+    let server_load = server_conn.load();
+
+    drop(client_conn);
+    drop(server_conn);
+    pumper.abort();
+    client_ep.shutdown().await;
+    server.endpoint.shutdown().await;
+    (client_load, server_load)
+}
+
+#[tokio::test(start_paused = true)]
+async fn path_estimates_track_shaped_link_rtt_and_rates() {
+    tokio::time::timeout(SIM_TEST_TIMEOUT, async {
+        let (slow_client, slow_server) =
+            measure_shaped_link(Duration::from_millis(15), 300_000, 256 * 1024).await;
+        let (fast_client, fast_server) =
+            measure_shaped_link(Duration::from_millis(15), 2_400_000, 512 * 1024).await;
+
+        // Minimum RTT tracks the 30 ms round-trip propagation delay.
+        for load in [&slow_client, &slow_server, &fast_client, &fast_server] {
+            let min_rtt = load.min_rtt.expect("min_rtt observed after transfer");
+            assert!(
+                min_rtt >= Duration::from_millis(25) && min_rtt <= Duration::from_millis(80),
+                "unexpected min_rtt: {min_rtt:?}"
+            );
+        }
+
+        // Both rate_out and rate_in are populated and distinguish slow vs fast links.
+        let slow_out = slow_client.rate_out.expect("slow rate_out measured");
+        let fast_out = fast_client.rate_out.expect("fast rate_out measured");
+        let slow_in = slow_server.rate_in.expect("slow rate_in measured");
+        let fast_in = fast_server.rate_in.expect("fast rate_in measured");
+
+        assert!(
+            fast_out > slow_out * 3,
+            "fast rate_out ({fast_out}) should significantly exceed slow rate_out ({slow_out})"
+        );
+        assert!(
+            fast_in > slow_in * 3,
+            "fast rate_in ({fast_in}) should significantly exceed slow rate_in ({slow_in})"
+        );
+    })
+    .await
+    .expect("shaped-link path estimate test finished within timeout");
 }

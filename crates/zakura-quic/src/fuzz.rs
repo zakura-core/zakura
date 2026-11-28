@@ -11,8 +11,8 @@ use std::sync::OnceLock;
 use blake2b_simd::Params;
 
 use crate::{
-    composite::{self, COMPOSITE_SIGNATURE_BYTES, ML_DSA_44_KEY_TAG, ML_DSA_44_SIGNATURE_BYTES},
-    credential::{NodeCredential, MAX_CREDENTIAL_KEY_BYTES},
+    composite::{self, COMPOSITE_SIGNATURE_BYTES, ML_DSA_65_KEY_TAG, ML_DSA_65_SIGNATURE_BYTES},
+    credential::{CredentialKey, NodeCredential, MAX_CREDENTIAL_KEY_BYTES},
     key::{NodeId, NodeKey, NodeSecretKey, KEY_LENGTH},
     key_list::{NodeKeyList, ED25519_KEY_TAG},
 };
@@ -25,9 +25,11 @@ const KEY_LIST_ID: &str = "key-list/stable-id";
 const COMPOSITE_TAMPER: &str = "composite/tamper-refused";
 
 /// How far one allocation of a credential parse may exceed its input's
-/// length, in bytes. The parsers' only other allocations are their entry
-/// tables, at most five 34-byte entries each.
-pub const PARSE_ALLOCATION_SLACK_BYTES: usize = 256;
+/// length, in bytes. The allocations the input's length doesn't bound follow
+/// its entry count, at most 32 (ID-8): the parsers' entry tables, under 50
+/// bytes an entry, and the key list a credential of short keys maps to, 34
+/// bytes an entry.
+pub const PARSE_ALLOCATION_SLACK_BYTES: usize = 2_048;
 
 /// The BLAKE2b personalisation of a node ID (ID-9), restated so the drivers
 /// check IDs against the spec rather than the code under test.
@@ -36,6 +38,13 @@ const NODE_ID_PERSONALISATION: &[u8; 16] = b"Zakura_NodeId_v1";
 /// The BLAKE2b personalisation of a key's fingerprint (ID-12), restated for
 /// the same reason.
 const KEY_FINGERPRINT_PERSONALISATION: &[u8; 16] = b"Zakura_KeyFpr_v1";
+
+/// The longest credential encoding (ID-12), restated for the same reason.
+const LONGEST_CREDENTIAL_BYTES: usize = 10_385;
+
+/// The most entries a key list or a credential holds (ID-8), restated for
+/// the same reason.
+const MOST_ENTRIES: usize = 32;
 
 /// The DER `AlgorithmIdentifier` of a credential's SPKI (TLS-3): a SEQUENCE
 /// holding only the object identifier `2.25.<UUID 6a31af47-5aa9-48c7-8ab9-d117edca0d9a>`.
@@ -46,14 +55,14 @@ const CREDENTIAL_ALGORITHM_DER: &[u8] = &[
 ];
 
 /// Length of the Ed25519 half of a composite signature.
-const ED25519_SIGNATURE_BYTES: usize = COMPOSITE_SIGNATURE_BYTES - ML_DSA_44_SIGNATURE_BYTES;
+const ED25519_SIGNATURE_BYTES: usize = COMPOSITE_SIGNATURE_BYTES - ML_DSA_65_SIGNATURE_BYTES;
 
 /// The most edits one composite input applies to the honest witness.
 const MAX_WITNESS_EDITS: usize = 64;
 
 /// The longest field a witness edit can resize to, in bytes. It exceeds every
 /// length the verifier accepts.
-const MAX_WITNESS_FIELD_BYTES: usize = 4_096;
+const MAX_WITNESS_FIELD_BYTES: usize = 8_192;
 
 /// The seed of the node whose signature is the honest witness.
 const WITNESS_SEED: [u8; KEY_LENGTH] = [7; KEY_LENGTH];
@@ -130,6 +139,12 @@ pub fn replay_credential_bytes(
 /// arrived. The caller has checked that its encoding is the input's.
 fn check_credential(credential: &NodeCredential) {
     let encoding = credential.encode();
+    assert!(
+        encoding.len() <= LONGEST_CREDENTIAL_BYTES && usize::from(encoding[0]) <= MOST_ENTRIES,
+        "{CREDENTIAL_BOUNDED}: an accepted credential has {} entries in {} bytes",
+        encoding[0],
+        encoding.len()
+    );
     assert_eq!(
         NodeCredential::decode(&encoding).as_ref(),
         Ok(credential),
@@ -175,9 +190,14 @@ fn der(tag: u8, contents: &[u8]) -> Vec<u8> {
     bytes
 }
 
+/// The bit of a credential entry's length that marks it fingerprint-only
+/// (ID-12), restated like the personalisations above.
+const FINGERPRINT_ONLY_FLAG: u16 = 0x8000;
+
 /// The encoded key list naming an accepted credential `encoding` (ID-12): each
 /// Ed25519 key as itself, any other key as BLAKE2b-256 under
-/// [`KEY_FINGERPRINT_PERSONALISATION`] of its little-endian tag and its bytes.
+/// [`KEY_FINGERPRINT_PERSONALISATION`] of its little-endian tag and its bytes,
+/// and a fingerprint-only entry as the 32 bytes it carries.
 fn fingerprinted_key_list(encoding: &[u8]) -> Vec<u8> {
     let (&count, mut rest) = encoding
         .split_first()
@@ -187,11 +207,18 @@ fn fingerprinted_key_list(encoding: &[u8]) -> Vec<u8> {
         let (&[tag_low, tag_high, length_low, length_high], body) = rest
             .split_first_chunk::<4>()
             .expect("an accepted credential holds its counted entries");
-        let length = usize::from(u16::from_le_bytes([length_low, length_high]));
-        let (key, tail) = body.split_at(length);
+        let length = u16::from_le_bytes([length_low, length_high]);
+        let fingerprint_only = length & FINGERPRINT_ONLY_FLAG != 0;
+        let (key, tail) = body.split_at(usize::from(length & !FINGERPRINT_ONLY_FLAG));
         let tag = [tag_low, tag_high];
+        let is_ed25519 = u16::from_le_bytes(tag) == ED25519_KEY_TAG;
+        assert!(
+            !fingerprint_only || (key.len() == KEY_LENGTH && !is_ed25519),
+            "{CREDENTIAL_CANONICAL}: an accepted fingerprint-only entry is not 32 bytes of a \
+             key other than Ed25519"
+        );
         list.extend_from_slice(&tag);
-        if u16::from_le_bytes(tag) == ED25519_KEY_TAG {
+        if is_ed25519 || fingerprint_only {
             list.extend_from_slice(key);
         } else {
             let fingerprint = Params::new()
@@ -223,6 +250,11 @@ pub fn replay_key_list_bytes(data: &[u8]) -> KeyListReplay {
     let Ok(list) = NodeKeyList::decode(data) else {
         return KeyListReplay::default();
     };
+    assert!(
+        data.len() <= 1 + MOST_ENTRIES * (2 + KEY_LENGTH),
+        "{KEY_LIST_CANONICAL}: an accepted list is {} bytes, more than {MOST_ENTRIES} entries",
+        data.len()
+    );
     assert_eq!(
         list.encode(),
         data,
@@ -288,7 +320,7 @@ pub enum CompositeReplay {
 /// Verifies one composite signature that `data` describes.
 ///
 /// The first byte's low bit picks the layout. With it clear, the rest is an
-/// Ed25519 key, a `u16`-prefixed ML-DSA-44 key, a `u16`-prefixed message and
+/// Ed25519 key, a `u16`-prefixed ML-DSA-65 key, a `u16`-prefixed message and
 /// the signature, each length cut to the bytes left. With it set, the rest is
 /// up to [`MAX_WITNESS_EDITS`] four-byte edits of an honest signature, so a
 /// campaign explores near-valid signatures without a corpus. Each input
@@ -347,8 +379,8 @@ fn witness() -> &'static Witness {
             ed25519: *secret.public_key().as_bytes(),
             ml_dsa: secret
                 .credential()
-                .key(ML_DSA_44_KEY_TAG)
-                .expect("a seed-derived credential holds its ML-DSA-44 key")
+                .key(ML_DSA_65_KEY_TAG)
+                .expect("a seed-derived credential holds its ML-DSA-65 key")
                 .to_vec(),
             message: WITNESS_MESSAGE.to_vec(),
             signature: secret
@@ -361,9 +393,9 @@ fn witness() -> &'static Witness {
 /// Applies `data`'s edits to the witness and verifies the result.
 ///
 /// Each edit is four bytes: a field selector, a little-endian `u16` and a
-/// value. Selectors 0 to 3 XOR the value into the Ed25519 key, the ML-DSA-44
+/// value. Selectors 0 to 3 XOR the value into the Ed25519 key, the ML-DSA-65
 /// key, the message or the signature at the `u16`'s offset; 4 to 6 resize the
-/// ML-DSA-44 key, the message or the signature to the `u16`'s length, up to
+/// ML-DSA-65 key, the message or the signature to the `u16`'s length, up to
 /// [`MAX_WITNESS_FIELD_BYTES`], filling with the value.
 fn replay_witness(data: &[u8]) -> CompositeReplay {
     let honest = witness();
@@ -456,15 +488,64 @@ fn credential_seeds() -> Vec<Seed> {
         (UNKNOWN_TAG, vec![0xCD; 1_312]),
     ])
     .expect("two increasing entries form a credential");
-    let longest = NodeCredential::from_entries([ED25519_KEY_TAG, 3, 4, 5].map(|tag| {
-        let key = if tag == ED25519_KEY_TAG {
-            ed.to_vec()
-        } else {
-            vec![0xEE; MAX_CREDENTIAL_KEY_BYTES]
-        };
-        (tag, key)
-    }))
-    .expect("four increasing entries form a credential");
+    // The Ed25519 key, then keys of the given lengths under the tags from 4
+    // up. Tag 3 is ML-DSA-65, whose length is fixed.
+    let keys_of = |lengths: &[usize]| {
+        let more: Vec<_> = lengths.iter().map(|length| vec![0xEE; *length]).collect();
+        let mut entries = vec![(ED25519_KEY_TAG, &ed[..])];
+        entries.extend((4u16..).zip(more.iter().map(Vec::as_slice)));
+        let count = u8::try_from(entries.len()).expect("seeds hold few entries");
+        credential_encoding(count, &entries)
+    };
+    // The byte limit (ID-12): three keys of the longest length and one of
+    // 2,556 bytes fill it, and one byte more passes it.
+    let longest = keys_of(&[
+        MAX_CREDENTIAL_KEY_BYTES,
+        MAX_CREDENTIAL_KEY_BYTES,
+        MAX_CREDENTIAL_KEY_BYTES,
+        2_556,
+    ]);
+    assert_eq!(longest.len(), LONGEST_CREDENTIAL_BYTES);
+    let too_long = keys_of(&[
+        MAX_CREDENTIAL_KEY_BYTES,
+        MAX_CREDENTIAL_KEY_BYTES,
+        MAX_CREDENTIAL_KEY_BYTES,
+        2_557,
+    ]);
+    // The entry count (ID-8): 32 entries are a credential and 33 are not.
+    let retired = |count: u8| {
+        let fingerprints = (0..count).map(|index| {
+            (
+                u16::from(index) + 4,
+                CredentialKey::Fingerprint([index; 32]),
+            )
+        });
+        [(ED25519_KEY_TAG, CredentialKey::Full(ed.to_vec()))]
+            .into_iter()
+            .chain(fingerprints)
+    };
+    let most_entries =
+        NodeCredential::from_entries(retired(31)).expect("32 increasing entries form a credential");
+    let mut too_many_entries = most_entries.encode();
+    too_many_entries[0] += 1;
+    too_many_entries.extend_from_slice(&UNKNOWN_TAG.to_le_bytes());
+    too_many_entries.extend_from_slice(&(32 | FINGERPRINT_ONLY_FLAG).to_le_bytes());
+    too_many_entries.extend_from_slice(&[0xCD; KEY_LENGTH]);
+
+    let fingerprint_only = node
+        .credential()
+        .clone()
+        .with_fingerprint_only(ML_DSA_65_KEY_TAG)
+        .expect("the node's ML-DSA-65 key can be given as its fingerprint");
+    // One entry whose length carries the fingerprint-only flag.
+    let flagged = |count: u8, leading: &[(u16, &[u8])], tag: u16, value: &[u8]| {
+        let mut bytes = credential_encoding(count, leading);
+        bytes.extend_from_slice(&tag.to_le_bytes());
+        let length = u16::try_from(value.len()).expect("seed keys are short");
+        bytes.extend_from_slice(&(length | FINGERPRINT_ONLY_FLAG).to_le_bytes());
+        bytes.extend_from_slice(value);
+        bytes
+    };
 
     let spki = single.to_spki().as_ref().to_vec();
     let mut trailing = spki.clone();
@@ -485,7 +566,52 @@ fn credential_seeds() -> Vec<Seed> {
             "valid-unknown-tag-spki",
             unknown.to_spki().as_ref().to_vec(),
         ),
-        ("valid-longest-spki", longest.to_spki().as_ref().to_vec()),
+        ("valid-longest-spki", spki_der(&longest)),
+        ("valid-longest-encoding", longest),
+        ("invalid-too-long-spki", spki_der(&too_long)),
+        ("invalid-too-long-encoding", too_long),
+        (
+            "valid-32-entries-spki",
+            most_entries.to_spki().as_ref().to_vec(),
+        ),
+        ("valid-32-entries-encoding", most_entries.encode()),
+        ("invalid-33-entries", too_many_entries),
+        (
+            "valid-fingerprint-only-spki",
+            fingerprint_only.to_spki().as_ref().to_vec(),
+        ),
+        ("valid-fingerprint-only-encoding", fingerprint_only.encode()),
+        (
+            "valid-fingerprint-only-unknown-tag",
+            flagged(
+                2,
+                &[(ED25519_KEY_TAG, &ed)],
+                UNKNOWN_TAG,
+                &[0xCD; KEY_LENGTH],
+            ),
+        ),
+        (
+            "invalid-fingerprint-only-ed25519",
+            flagged(1, &[], ED25519_KEY_TAG, &ed),
+        ),
+        (
+            "invalid-fingerprint-only-short",
+            flagged(
+                2,
+                &[(ED25519_KEY_TAG, &ed)],
+                UNKNOWN_TAG,
+                &[0xCD; KEY_LENGTH - 1],
+            ),
+        ),
+        (
+            "invalid-fingerprint-only-long",
+            flagged(
+                2,
+                &[(ED25519_KEY_TAG, &ed)],
+                UNKNOWN_TAG,
+                &[0xCD; KEY_LENGTH + 1],
+            ),
+        ),
         ("invalid-trailing-spki", trailing),
         ("invalid-long-form-spki", long_form),
         (
@@ -515,7 +641,7 @@ fn credential_seeds() -> Vec<Seed> {
                 2,
                 &[
                     (ED25519_KEY_TAG, &ed),
-                    (ML_DSA_44_KEY_TAG, &[2; KEY_LENGTH]),
+                    (ML_DSA_65_KEY_TAG, &[2; KEY_LENGTH]),
                 ],
             ),
         ),
@@ -544,7 +670,13 @@ fn key_list_seeds() -> Vec<Seed> {
         bytes
     };
     let value = [0xCD; KEY_LENGTH];
-    let five: Vec<_> = (2..7).map(|tag| (tag, value)).collect();
+    // A list holds 32 entries (ID-8): the Ed25519 key and 31 more, or 33.
+    let after_ed25519 = |more: u16| -> Vec<_> {
+        [(ED25519_KEY_TAG, ed)]
+            .into_iter()
+            .chain((2..2 + more).map(|tag| (tag, value)))
+            .collect()
+    };
     let mut trailing = list(1, &[(2, value)]);
     trailing.push(0);
 
@@ -555,16 +687,11 @@ fn key_list_seeds() -> Vec<Seed> {
             list(2, &[(ED25519_KEY_TAG, ed), (0x0102, [0xAB; KEY_LENGTH])]),
         ),
         ("valid-no-ed25519", list(1, &[(0x0102, [0xAB; KEY_LENGTH])])),
-        (
-            "valid-longest",
-            list(
-                4,
-                &[(ED25519_KEY_TAG, ed), (2, value), (3, value), (4, value)],
-            ),
-        ),
+        ("valid-five-entries", list(5, &after_ed25519(4))),
+        ("valid-longest", list(32, &after_ed25519(31))),
         ("invalid-empty", Vec::new()),
         ("invalid-no-entries", vec![0]),
-        ("invalid-five-entries", list(5, &five)),
+        ("invalid-33-entries", list(33, &after_ed25519(32))),
         ("invalid-count-mismatch", list(2, &[(2, value)])),
         ("invalid-trailing", trailing),
         ("invalid-zero-tag", list(1, &[(0, value)])),
@@ -599,7 +726,7 @@ fn composite_seeds() -> Vec<Seed> {
         bytes.extend_from_slice(&honest.signature);
         bytes
     };
-    // Selector 3 flips a bit of the signature's ML-DSA-44 half; 6 truncates it.
+    // Selector 3 flips a bit of the signature's ML-DSA-65 half; 6 truncates it.
     let ml_dsa_half = u16::try_from(ED25519_SIGNATURE_BYTES).expect("64 fits a u16");
     let [low, high] = ml_dsa_half.to_le_bytes();
 

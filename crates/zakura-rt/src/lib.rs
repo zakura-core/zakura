@@ -12,6 +12,11 @@
 //! The simulator build is `RUSTFLAGS="--cfg zakura_sim"`. It swaps in the
 //! modules under `src/sim/` and adds `sim`, the interface the simulator's
 //! scheduler implements. Names it doesn't cover yet stay re-exports.
+//!
+//! [`windowed`] holds the time-windowed min and max filter that block sync
+//! and the QUIC path-rate probe share, over this crate's clock.
+
+pub mod windowed;
 
 #[cfg(not(zakura_sim))]
 pub use tokio::{pin, select};

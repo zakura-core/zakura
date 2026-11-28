@@ -8,7 +8,7 @@ use tracing::{info, warn, Instrument};
 use zakura_chain::{
     block::{self, Height},
     chain_tip::ChainTip,
-    miner_mesh::{GatewayId, MinerSetSnapshot, RecentMinerSet},
+    miner_mesh::{MinerSetSnapshot, RecentMinerSet},
     parameters::Network,
 };
 use zakura_state::{ChainTipChange, ReadRequest, ReadResponse, TipAction, MAX_BLOCK_REORG_HEIGHT};
@@ -18,6 +18,7 @@ use crate::BoxError;
 use super::{
     chain_reads::{best_chain_hash, read_block},
     ranking::RankingPublisher,
+    LocalGateway,
 };
 
 /// How long the tracker waits after a failed state read before it reads again.
@@ -30,14 +31,15 @@ pub(super) const REPUBLISH_INTERVAL: Duration = Duration::from_secs(60);
 /// Starts the task that counts the gateways named in recent best-chain blocks,
 /// reports the counts as metrics and hands the ranking to `publisher`.
 ///
-/// `local_gateway` is the gateway ID this node's own coinbases name, if it announces one. The
-/// tracker reports how many counted blocks name it.
+/// `local_gateway` is the gateway this node's coinbases name, if any, and the gateway it stands
+/// for, if any. The tracker reports whether the node announces, and how many counted blocks
+/// name the gateway it stands for.
 ///
 /// The task runs until the state stops publishing tip changes.
 pub fn spawn<S, Tip>(
     state: S,
     tip_change: ChainTipChange,
-    local_gateway: Option<GatewayId>,
+    local_gateway: LocalGateway,
     publisher: RankingPublisher<Tip>,
 ) -> JoinHandle<()>
 where
@@ -177,8 +179,8 @@ pub(super) struct Tracker<S> {
     /// blocks below it are not read either until the tip moves, so a pruned
     /// block costs one failed read per tip change.
     unreadable_from: Option<Height>,
-    /// The gateway this node's own coinbases name, if it announces one.
-    local_gateway: Option<GatewayId>,
+    /// This node's own part in the miner mesh, for the metrics.
+    local_gateway: LocalGateway,
 }
 
 impl<S> Tracker<S>
@@ -191,12 +193,12 @@ where
             set: RecentMinerSet::new(network),
             state,
             unreadable_from: None,
-            local_gateway: None,
+            local_gateway: LocalGateway::default(),
         }
     }
 
-    /// Reports how many counted blocks name `local_gateway`, this node's own gateway.
-    pub(super) fn with_local_gateway(mut self, local_gateway: Option<GatewayId>) -> Self {
+    /// Reports `local_gateway` and how many counted blocks name the gateway it stands for.
+    pub(super) fn with_local_gateway(mut self, local_gateway: LocalGateway) -> Self {
         self.local_gateway = local_gateway;
         self
     }
@@ -314,47 +316,54 @@ where
 }
 
 /// Reports how many gateways are named, how much of the window is read, how many blocks the
-/// busiest gateway has, and how many name this node's own gateway.
-fn record_metrics(snapshot: &MinerSetSnapshot, local_gateway: Option<GatewayId>) {
+/// busiest gateway has, whether this node announces a gateway, and how many blocks name the
+/// gateway it stands for.
+fn record_metrics(snapshot: &MinerSetSnapshot, local_gateway: LocalGateway) {
     // Each is at most the number of heights in a two-day window.
     metrics::gauge!("mining.mesh.gateways").set(snapshot.gateways.len() as f64);
     metrics::gauge!("mining.mesh.window.checked").set(snapshot.checked as f64);
     metrics::gauge!("mining.mesh.window.total").set(snapshot.window_len() as f64);
 
-    let counts = gateway_block_counts(snapshot, local_gateway);
-    metrics::gauge!("mining.mesh.gateway.top_blocks").set(f64::from(counts.top));
-    metrics::gauge!("mining.mesh.announcing").set(f64::from(u8::from(local_gateway.is_some())));
-    if local_gateway.is_some() {
-        metrics::gauge!("mining.mesh.gateway.local_blocks").set(f64::from(counts.local));
+    let metrics = gateway_metrics(snapshot, local_gateway);
+    metrics::gauge!("mining.mesh.gateway.top_blocks").set(f64::from(metrics.top));
+    metrics::gauge!("mining.mesh.announcing").set(f64::from(u8::from(metrics.announcing)));
+    if let Some(blocks) = metrics.stood_for_blocks {
+        metrics::gauge!("mining.mesh.gateway.local_blocks").set(f64::from(blocks));
     }
 }
 
-/// The block counts the gateway metrics report.
+/// The values the gateway metrics report.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(super) struct GatewayBlockCounts {
+pub(super) struct GatewayMetrics {
     /// How many counted blocks name the busiest gateway, or zero when none is named.
     pub(super) top: u32,
-    /// How many counted blocks name `local_gateway`, or zero when it is not named or unset.
-    pub(super) local: u32,
+    /// Whether the coinbases this node builds name a gateway.
+    pub(super) announcing: bool,
+    /// How many counted blocks name the gateway this node stands for, or `None` when it stands
+    /// for none.
+    pub(super) stood_for_blocks: Option<u32>,
 }
 
-/// Reads the busiest gateway's count and this node's own gateway's count from `snapshot`.
-pub(super) fn gateway_block_counts(
+/// Reads the gateway metrics from `snapshot` for a node whose own part is `local_gateway`.
+pub(super) fn gateway_metrics(
     snapshot: &MinerSetSnapshot,
-    local_gateway: Option<GatewayId>,
-) -> GatewayBlockCounts {
+    local_gateway: LocalGateway,
+) -> GatewayMetrics {
     // The snapshot lists the gateway named in the most blocks first.
     let top = snapshot
         .gateways
         .first()
         .map_or(0, |gateway| gateway.blocks);
-    let local = local_gateway
-        .and_then(|id| {
-            snapshot
-                .gateways
-                .iter()
-                .find(|gateway| gateway.gateway_id == id)
-        })
-        .map_or(0, |gateway| gateway.blocks);
-    GatewayBlockCounts { top, local }
+    let stood_for_blocks = local_gateway.stands_for.map(|id| {
+        snapshot
+            .gateways
+            .iter()
+            .find(|gateway| gateway.gateway_id == id)
+            .map_or(0, |gateway| gateway.blocks)
+    });
+    GatewayMetrics {
+        top,
+        announcing: local_gateway.announced.is_some(),
+        stood_for_blocks,
+    }
 }

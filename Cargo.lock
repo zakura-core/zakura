@@ -158,6 +158,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "blake3"
+version = "1.8.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0aa83c34e62843d924f905e0f5c866eb1dd6545fc4d719e803d9ba6030371fce"
+dependencies = [
+ "arrayref",
+ "arrayvec",
+ "cc",
+ "cfg-if",
+ "constant_time_eq",
+ "cpufeatures 0.3.0",
+]
+
+[[package]]
 name = "block-buffer"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1942,6 +1956,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "readme-rustdocifier"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08ad765b21a08b1a8e5cdce052719188a23772bcbefb3c439f0baaf62c56ceac"
+
+[[package]]
+name = "reed-solomon-simd"
+version = "3.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cffef0520d30fbd4151fb20e262947ae47fb0ab276a744a19b6398438105a072"
+dependencies = [
+ "cpufeatures 0.2.17",
+ "fixedbitset",
+ "once_cell",
+ "readme-rustdocifier",
+]
+
+[[package]]
 name = "ref-cast"
 version = "1.0.25"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2994,7 +3026,7 @@ dependencies = [
 
 [[package]]
 name = "zakura"
-version = "1.9.0-rc2"
+version = "1.9.0"
 dependencies = [
  "base64",
  "bytes",
@@ -3066,9 +3098,9 @@ dependencies = [
 
 [[package]]
 name = "zakura-assets"
-version = "0.3601446.0"
+version = "0.3611446.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dd3dcf05d3e9eb5486fcb640afdb013837e3b3e5eb91153cb33e452e0b4d1d1c"
+checksum = "2c687474d83940cdfdf13bb9054f0b4545d7a0502bd350c18f42737e44ee3ff3"
 
 [[package]]
 name = "zakura-bellman"
@@ -3129,7 +3161,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-chain"
-version = "16.0.0"
+version = "17.0.0"
 dependencies = [
  "bech32",
  "bitflags",
@@ -3371,6 +3403,7 @@ version = "19.0.0"
 dependencies = [
  "bitflags",
  "blake2b_simd",
+ "blake3",
  "byteorder",
  "bytes",
  "chrono",
@@ -3387,6 +3420,7 @@ dependencies = [
  "proptest-derive",
  "rand 0.10.2",
  "rayon",
+ "reed-solomon-simd",
  "ring",
  "serde",
  "serde_json",
@@ -3551,6 +3585,7 @@ version = "2.0.0"
 dependencies = [
  "blake2b_simd",
  "bytes",
+ "criterion",
  "curve25519-dalek",
  "futures",
  "hex",
@@ -3681,7 +3716,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-rt"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "pin-project-lite",
  "rand 0.10.2",
@@ -3731,7 +3766,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-script"
-version = "5.0.8"
+version = "6.0.0"
 dependencies = [
  "hex",
  "ripemd",

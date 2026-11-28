@@ -1278,6 +1278,7 @@ mod tests {
                 nu6_2: None,
                 nu6_3: None,
                 nu7: None,
+                nu7_1: None,
                 #[cfg(zcash_unstable = "zfuture")]
                 zfuture: None,
             })
@@ -1348,17 +1349,17 @@ mod tests {
         let mut cluster = ZakuraTestCluster::new();
         let victim_idx = cluster.spawn_traced_node(1, &mut capture).await?;
         let victim = cluster.node(victim_idx);
-        // Seed 3's node ID sorts below the victim's, so this peer is the side
+        // Seed 4's node ID sorts below the victim's, so this peer is the side
         // that opens the stream.
         let hostile = HostilePeer::connect_native_with_capabilities(
             victim,
-            3,
+            4,
             ZAKURA_CAP_BLOCK_SYNC_REGULATED,
         )
         .await?;
         let hostile_peer = hostile.id()?;
         assert!(
-            LocalEndpointFactory::secret_key(3).public() < LocalEndpointFactory::secret_key(1).public(),
+            LocalEndpointFactory::secret_key(4).public() < LocalEndpointFactory::secret_key(1).public(),
             "the hostile peer must open the stream"
         );
         let peer_set = victim.supervisor().subscribe();
@@ -1418,17 +1419,17 @@ mod tests {
         let mut cluster = ZakuraTestCluster::new();
         let victim_idx = cluster.spawn_traced_node(1, &mut capture).await?;
         let victim = cluster.node(victim_idx);
-        // Seed 3's node ID sorts below the victim's, so this peer is the side
+        // Seed 4's node ID sorts below the victim's, so this peer is the side
         // that opens the stream.
         let hostile = HostilePeer::connect_native_with_capabilities(
             victim,
-            3,
+            4,
             ZAKURA_CAP_BLOCK_SYNC_REGULATED,
         )
         .await?;
         let hostile_peer = hostile.id()?;
         assert!(
-            LocalEndpointFactory::secret_key(3).public() < LocalEndpointFactory::secret_key(1).public(),
+            LocalEndpointFactory::secret_key(4).public() < LocalEndpointFactory::secret_key(1).public(),
             "the hostile peer must open the stream"
         );
         let peer_set = victim.supervisor().subscribe();
@@ -2789,19 +2790,40 @@ mod tests {
             .discovery_direct_addrs(vec![addr_b])
             .spawn()
             .await?;
+        let a_id = a.node_addr().await.id;
         let b_id = b.node_addr().await.id;
 
         a.connect_native(&b, Duration::from_secs(5)).await?;
 
-        let mut learned = false;
-        for _ in 0..100 {
-            if a.discovery().record_for(b_id).await.is_some() {
-                learned = true;
-                break;
+        // Each node's `Hello` carries its record over the loopback
+        // connection, and the other verifies both signatures before it
+        // stores the record.
+        for (reader, author, author_id) in [(&a, &b, b_id), (&b, &a, a_id)] {
+            let mut learned = None;
+            for _ in 0..100 {
+                learned = reader.discovery().record_for(author_id).await;
+                if learned.is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            let learned = learned.expect("each node imports the other's gossiped self-record");
+            assert_eq!(
+                learned,
+                *author.discovery().current_self_record(),
+                "the stored record is the author's, byte for byte"
+            );
+            // The record's extension area is its ML-DSA-65 key and signature.
+            assert_eq!(
+                learned.body.extensions.len(),
+                crate::zakura::RECORD_ML_DSA_65_EXTENSION_BYTES
+            );
+            assert_eq!(
+                learned.body.extensions[..4],
+                [0x01, 0x00, 0xa0, 0x07],
+                "the key extension: type 1, 1,952 bytes"
+            );
         }
-        assert!(learned, "node a imports node b's gossiped self-record");
 
         a.shutdown().await;
         b.shutdown().await;

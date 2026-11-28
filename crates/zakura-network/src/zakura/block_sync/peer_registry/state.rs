@@ -525,6 +525,15 @@ impl PeerTable {
         summary
     }
 
+    pub(super) fn sum_bbr_cwnd_bytes(&self) -> u64 {
+        self.peers
+            .values()
+            .filter(|entry| !entry.session_closed)
+            .fold(0u64, |acc, entry| {
+                acc.saturating_add(entry.slots.bbr_cwnd_bytes)
+            })
+    }
+
     pub(super) fn has_outstanding_request(&self, height: block::Height, hash: block::Hash) -> bool {
         self.peers.values().any(|entry| {
             entry

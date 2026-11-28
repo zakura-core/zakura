@@ -69,6 +69,7 @@ mod work_queue;
 
 // The remaining consumers of these two internal constants are the same-crate
 // fuzz-testkit test modules; the re-exports only exist for test builds.
+pub use admission::CommitWindow;
 #[cfg(test)]
 pub(crate) use admission::DESERIALIZED_MEM_FACTOR;
 #[cfg(feature = "internal-bench")]
@@ -81,7 +82,7 @@ pub use bench::{
 pub(crate) use config::MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES;
 pub use config::{
     BlockSyncStatus, CwndUnit, ZakuraBlockSyncConfig, BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES,
-    MAX_BS_RESPONSE_BYTES,
+    DEFAULT_BS_BBR_MIN_CWND_BYTES, MAX_BS_RESPONSE_BYTES,
 };
 pub use error::{BlockSyncStartError, BlockSyncWireError};
 pub use events::{
@@ -91,11 +92,16 @@ pub use events::{
 #[cfg(any(test, zakura_sim, feature = "zakura-testkit"))]
 pub use peer_routine::routine_accepts_body;
 pub use reactor::spawn_block_sync_reactor;
-pub(crate) use regulated::session::serving_limits as getblocks_serving_limits;
+pub(crate) use regulated::session::{
+    serving_limits as getblocks_serving_limits, BLOCK_SYNC_SESSION_BOOKKEEPING_BYTES,
+    NODE_EXECUTION as BLOCK_SYNC_SERVE_NODE_EXECUTION,
+};
+/// Output byte bound of the largest served GetBlocks response (one max block + ending).
+pub(crate) const LARGEST_SERVED_BLOCK_RESPONSE_BYTES: u64 =
+    regulated::wire::LARGEST_SERVED_RESPONSE.output_bytes();
 pub use request::BlockSizeEstimate;
 pub(crate) use service::BLOCK_SYNC_SERVICE_STREAMS;
-#[cfg(test)]
-pub(crate) use service::MAX_BS_FRAME_BYTES;
+pub use service::MAX_BS_FRAME_BYTES;
 pub use service::{
     block_sync_reactor_budget, BlockSyncPeerSession, BlockSyncService, BLOCK_SYNC_REACTOR_BUDGET,
 };
@@ -106,7 +112,7 @@ pub use source::DetachedReadSession;
 pub use source::{BlockRangeRead, BlockRangeReadLease, BlockRangeReadResult, BlockRangeSource};
 #[cfg(any(test, zakura_sim, feature = "zakura-testkit"))]
 pub use state::DetachedHandleEvents;
-pub use state::{BlockSyncFrontiers, BlockSyncHandle, BlockSyncStartup};
+pub use state::{BlockSyncFrontiers, BlockSyncHandle, BlockSyncMemory, BlockSyncStartup};
 #[cfg(any(test, zakura_sim, feature = "zakura-testkit"))]
 pub use wire::decode_block_payload_for_test;
 pub use wire::{

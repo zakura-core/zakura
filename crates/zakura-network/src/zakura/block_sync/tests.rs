@@ -1,3 +1,4 @@
+mod checkpoint_reserve;
 pub(super) mod gauge_recorder;
 mod progress;
 mod query_lifecycle;
@@ -207,6 +208,7 @@ fn header_tip_startup(
             .decoded_block_pool(10_000)
             .expect("fixture decoded allowance fits"),
         config,
+        crate::zakura::BlockSyncMemory::for_tests(),
     );
     startup.committed_views = Some(startup_committed_view(frontiers, best_header_tip));
     startup
@@ -353,6 +355,7 @@ fn committed_block_sync_startup(
             .decoded_block_pool(10_000)
             .expect("fixture decoded allowance fits"),
         config,
+        crate::zakura::BlockSyncMemory::for_tests(),
     );
 
     (snapshots, startup)
@@ -554,6 +557,7 @@ async fn committed_views_are_the_sole_production_frontier_source() {
         snapshot_rx,
         test_decoded_pool(),
         ZakuraBlockSyncConfig::default(),
+        crate::zakura::BlockSyncMemory::for_tests(),
     );
     assert!(startup.header_tip.is_none());
 
@@ -643,6 +647,7 @@ async fn empty_state_body_queries_bound_the_header_bootstrap_wait() {
         snapshot_rx,
         test_decoded_pool(),
         ZakuraBlockSyncConfig::default(),
+        crate::zakura::BlockSyncMemory::for_tests(),
     );
     let (_handle, mut actions, reactor_task) =
         spawn_block_sync_reactor(startup).expect("valid block-sync config");
@@ -732,6 +737,7 @@ async fn past_genesis_body_queries_ignore_far_ahead_header_quiet_period() {
         snapshot_rx,
         test_decoded_pool(),
         ZakuraBlockSyncConfig::default(),
+        crate::zakura::BlockSyncMemory::for_tests(),
     );
     let (_handle, mut actions, reactor_task) =
         spawn_block_sync_reactor(startup).expect("valid block-sync config");
@@ -802,7 +808,11 @@ async fn startup_body_cooldown_survives_the_first_work_refresh() {
     let view = committed_view(snapshot, 0);
     let scope = zakura_header_chain::BodyWorkAuthority::for_view(&view);
     let (_snapshots, receiver) = watch::channel(Some(view));
-    let mut startup = BlockSyncStartup::inert(ZakuraBlockSyncConfig::default()).unwrap();
+    let mut startup = BlockSyncStartup::inert(
+        ZakuraBlockSyncConfig::default(),
+        crate::zakura::BlockSyncMemory::for_tests(),
+    )
+    .unwrap();
     startup.committed_views = Some(receiver);
     let (handle, _actions, reactor_task) =
         spawn_block_sync_reactor(startup).expect("valid block-sync config");
@@ -834,7 +844,11 @@ async fn operator_body_retry_is_exact_deduplicated_and_requires_a_supplier() {
     let view = committed_view(snapshot, 0);
     let scope = zakura_header_chain::BodyWorkAuthority::for_view(&view);
     let (snapshot_tx, snapshot_rx) = watch::channel(Some(view));
-    let mut startup = BlockSyncStartup::inert(ZakuraBlockSyncConfig::default()).unwrap();
+    let mut startup = BlockSyncStartup::inert(
+        ZakuraBlockSyncConfig::default(),
+        crate::zakura::BlockSyncMemory::for_tests(),
+    )
+    .unwrap();
     startup.frontiers = BlockSyncFrontiers {
         finalized_height: block::Height(9),
         verified_block_tip: block::Height(9),
@@ -964,7 +978,9 @@ async fn newly_eligible_supplier_preserves_persistent_body_alarm_once() {
         .expect("the fixture contains a persistent body alarm");
     let (_snapshot_tx, snapshot_rx) = watch::channel(Some(committed_view(snapshot, 0)));
     let config = ZakuraBlockSyncConfig::default();
-    let mut startup = BlockSyncStartup::inert(config.clone()).unwrap();
+    let mut startup =
+        BlockSyncStartup::inert(config.clone(), crate::zakura::BlockSyncMemory::for_tests())
+            .unwrap();
     startup.frontiers = BlockSyncFrontiers {
         finalized_height: block::Height(9),
         verified_block_tip: block::Height(9),
@@ -1053,7 +1069,11 @@ async fn dropped_status_received_still_restarts_body_alarm_on_requery() {
     let header = zakura_header_chain::Frontier::new(block::Height(10), block::Hash([0x55; 32]));
     let (_snapshot_tx, snapshot_rx) =
         watch::channel(Some(committed_view(alarmed_committed_snapshot(header), 0)));
-    let mut startup = BlockSyncStartup::inert(ZakuraBlockSyncConfig::default()).unwrap();
+    let mut startup = BlockSyncStartup::inert(
+        ZakuraBlockSyncConfig::default(),
+        crate::zakura::BlockSyncMemory::for_tests(),
+    )
+    .unwrap();
     startup.frontiers = BlockSyncFrontiers {
         finalized_height: block::Height(9),
         verified_block_tip: block::Height(9),
@@ -1945,7 +1965,10 @@ fn work_queue_with(
     floor: u32,
     items: impl IntoIterator<Item = (block::Height, block::Hash, BlockSizeEstimate)>,
 ) -> super::work_queue::WorkQueue {
-    let queue = super::work_queue::WorkQueue::new(block::Height(floor), ByteBudget::new(u64::MAX));
+    let queue = super::work_queue::WorkQueue::with_test_pool(
+        block::Height(floor),
+        ByteBudget::new(u64::MAX),
+    );
     queue.set_estimate_floor_for_tests(1);
     queue.extend(test_work_scope(), items);
     queue
@@ -2185,14 +2208,13 @@ fn config_validate_rejects_degenerate_values() {
     };
     assert!(config.validate().is_err());
 
-    // Above 3,633 session slots, even one request per session exceeds the
-    // GetBlocks bookkeeping budget.
+    // Serving GetBlocks bookkeeping now comes from each session's own
+    // `b_block_sync` lease (`02 §8`), so large peer limits still validate and
+    // each admitted session funds its own fixed request cap.
     config = ZakuraBlockSyncConfig::default();
-    config.peer_limits.max_inbound_peers = 3_000;
-    config.peer_limits.max_outbound_peers = 633;
+    config.peer_limits.max_inbound_peers = Some(3_000);
+    config.peer_limits.max_outbound_peers = Some(634);
     assert!(config.validate().is_ok());
-    config.peer_limits.max_outbound_peers = 634;
-    assert!(config.validate().is_err());
 }
 
 #[test]
@@ -2608,7 +2630,7 @@ fn work_queue_refreshes_queued_authority_and_preserves_registered_requests() {
         verified_generation: zakura_header_chain::VerifiedGeneration::new(9),
         ..obsolete
     };
-    let queue = WorkQueue::new(block::Height(0), ByteBudget::new(u64::MAX));
+    let queue = WorkQueue::with_test_pool(block::Height(0), ByteBudget::new(u64::MAX));
     queue.set_estimate_floor_for_tests(1);
     assert_eq!(
         queue.extend(obsolete, [needed(1, BlockSizeEstimate::Advertised(100))]),
@@ -2662,7 +2684,7 @@ fn producer_filter_keeps_live_requests_after_same_epoch_refresh() {
 
     let height = block::Height(1);
     let hash = block::Hash([1; 32]);
-    let queue = WorkQueue::new(block::Height(0), ByteBudget::new(u64::MAX));
+    let queue = WorkQueue::with_test_pool(block::Height(0), ByteBudget::new(u64::MAX));
     queue.set_estimate_floor_for_tests(1);
     assert_eq!(
         queue.extend(scope, [needed(1, BlockSizeEstimate::Advertised(100))]),
@@ -2956,13 +2978,12 @@ fn work_queue_budgeted_take_preserves_estimates_through_take_and_return() {
 
 /// Test shorthand: the grant for an admitted take, or `None` on any refusal.
 fn admit_grant(
-    config: &ZakuraBlockSyncConfig,
     snapshot: super::admission::AdmissionSnapshot,
     start: block::Height,
     servable_high: block::Height,
     response_byte_cap: u64,
 ) -> Option<super::admission::AdmissionGrant> {
-    match super::admission::admit(config, snapshot, start, servable_high, response_byte_cap) {
+    match super::admission::admit(snapshot, start, servable_high, response_byte_cap) {
         super::admission::AdmissionOutcome::Admit(grant) => Some(grant),
         super::admission::AdmissionOutcome::LookaheadAtCap
         | super::admission::AdmissionOutcome::InflightBudgetEmpty => None,
@@ -2970,374 +2991,27 @@ fn admit_grant(
 }
 
 #[test]
-fn admission_blocks_above_floor_at_cap_but_keeps_floor_fundable() {
-    let config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: Some(40_000_000),
-        max_reorder_lookahead_bytes: 500,
-        ..ZakuraBlockSyncConfig::default()
-    };
-    let snapshot = super::admission::AdmissionSnapshot {
-        download_floor: block::Height(10),
-        verified_block_tip: block::Height(10),
-        reorder_buffered_bytes: 500,
-        reorder_buffered_blocks: 1,
-        applying_buffered_bytes: 0,
-        applying_buffered_blocks: 0,
-        sequencer_input_queued_bytes: 0,
-        in_flight_submission_bytes: 0,
-        decoded_resident_bytes: 0,
-        reserved_above_floor_bytes: 0,
-        reserved_above_floor_blocks: 0,
-        budget_available: 40_000_000,
-    };
-
-    let floor = admit_grant(
-        &config,
-        snapshot,
-        block::Height(11),
-        block::Height(11),
-        1_000,
-    )
-    .expect("floor rescue remains admitted at the look-ahead cap");
-    assert_eq!(floor.priority, super::admission::RequestPriority::Floor);
-    assert_eq!(floor.max_request_bytes, 1_000);
-
-    // Height 412 is the first height above the commit window (verified_tip 10 + 401).
-    assert_eq!(
-        admit_grant(
-            &config,
-            snapshot,
-            block::Height(412),
-            block::Height(412),
-            1_000
-        ),
-        None,
-        "above-floor work stops at the look-ahead cap"
-    );
-
-    let under_cap = super::admission::AdmissionSnapshot {
-        reorder_buffered_bytes: 100,
-        budget_available: 40_000_000,
-        ..snapshot
-    };
-    let above = admit_grant(
-        &config,
-        under_cap,
-        block::Height(412),
-        block::Height(412),
-        u64::MAX,
-    )
-    .expect("above-floor work is admitted below the cap");
-    assert_eq!(
-        above.priority,
-        super::admission::RequestPriority::AboveFloor
-    );
-    // Remaining headroom is wire-denominated: 500 - 100 = 400 wire bytes.
-    assert_eq!(above.max_request_bytes, 400);
-}
-
-#[test]
-fn admission_counts_inflight_to_sequencer_bytes() {
-    let config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: Some(64_000_000),
-        max_reorder_lookahead_bytes: 1_000,
-        ..ZakuraBlockSyncConfig::default()
-    };
-    let snapshot = super::admission::AdmissionSnapshot {
-        download_floor: block::Height(10),
-        verified_block_tip: block::Height(10),
-        reorder_buffered_bytes: 200,
-        reorder_buffered_blocks: 1,
-        applying_buffered_bytes: 200,
-        applying_buffered_blocks: 1,
-        sequencer_input_queued_bytes: 600,
-        in_flight_submission_bytes: 0,
-        decoded_resident_bytes: 0,
-        reserved_above_floor_bytes: 0,
-        reserved_above_floor_blocks: 0,
-        budget_available: 64_000_000,
-    };
-
-    // Probe above the commit window (verified_tip 10 + 401) so the gate applies.
-    assert_eq!(
-        admit_grant(
-            &config,
-            snapshot,
-            block::Height(412),
-            block::Height(412),
-            1_000
-        ),
-        None,
-        "above-floor admission includes bytes already queued to the sequencer"
-    );
-}
-
-#[test]
-fn total_resident_plateaus_under_commit_stall() {
-    let config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: Some(64_000_000),
-        max_reorder_lookahead_bytes: 1_000,
-        ..ZakuraBlockSyncConfig::default()
-    };
-    let snapshot = super::admission::AdmissionSnapshot {
-        download_floor: block::Height(10),
-        verified_block_tip: block::Height(10),
-        reorder_buffered_bytes: 300,
-        reorder_buffered_blocks: 1,
-        applying_buffered_bytes: 700,
-        applying_buffered_blocks: 1,
-        sequencer_input_queued_bytes: 0,
-        in_flight_submission_bytes: 0,
-        decoded_resident_bytes: 0,
-        reserved_above_floor_bytes: 0,
-        reserved_above_floor_blocks: 0,
-        budget_available: 64_000_000,
-    };
-
-    // Probe above the commit window (verified_tip 10 + 401) so the gate applies.
-    assert_eq!(
-        admit_grant(
-            &config,
-            snapshot,
-            block::Height(412),
-            block::Height(412),
-            1_000
-        ),
-        None,
-        "above-floor admission includes applying bytes held during a commit stall"
-    );
-}
-
-#[test]
-fn floor_priority_request_does_not_buffer_above_floor_past_cap() {
-    let config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: Some(64_000_000),
-        max_reorder_lookahead_bytes: 1_000,
-        ..ZakuraBlockSyncConfig::default()
-    };
-    let capped = super::admission::AdmissionSnapshot {
-        download_floor: block::Height(10),
-        verified_block_tip: block::Height(10),
-        reorder_buffered_bytes: 1_000,
-        reorder_buffered_blocks: 1,
-        applying_buffered_bytes: 0,
-        applying_buffered_blocks: 0,
-        sequencer_input_queued_bytes: 0,
-        in_flight_submission_bytes: 0,
-        decoded_resident_bytes: 0,
-        reserved_above_floor_bytes: 0,
-        reserved_above_floor_blocks: 0,
-        budget_available: 64_000_000,
-    };
-
-    // Probe above the commit window (verified_tip 10 + 401): the speculative tail of a
-    // floor-starting request is refused at the cap once it leaves the window.
-    assert_eq!(
-        admit_grant(
-            &config,
-            capped,
-            block::Height(412),
-            block::Height(412),
-            1_000
-        ),
-        None,
-        "the above-floor tail of a floor-starting request is refused at the cap"
-    );
-    let floor = admit_grant(
-        &config,
-        capped,
-        block::Height(11),
-        block::Height(10_000),
-        1_000,
-    )
-    .expect("floor height remains fundable");
-    assert_eq!(floor.priority, super::admission::RequestPriority::Floor);
-    // The exempt grant is clamped at the commit-window top: the take cannot carry
-    // above-window heights past the full gate.
-    assert_eq!(floor.take_high, block::Height(411));
-}
-
-#[test]
-fn outstanding_reservations_are_charged_at_wire_size() {
-    // Regression for the reserved-0× hole: outstanding above-floor reservations land as
-    // retained wire bytes like every other serialized pool, so they must be pre-charged
-    // at their wire size. Charging them nothing makes in-flight volume invisible to the
-    // byte gate until it is already resident.
-    let config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: Some(64_000_000),
-        max_reorder_lookahead_bytes: 1_000,
-        ..ZakuraBlockSyncConfig::default()
-    };
-    let snapshot = super::admission::AdmissionSnapshot {
-        download_floor: block::Height(600),
-        verified_block_tip: block::Height(10),
-        reorder_buffered_bytes: 0,
-        reorder_buffered_blocks: 0,
-        applying_buffered_bytes: 0,
-        applying_buffered_blocks: 0,
-        sequencer_input_queued_bytes: 0,
-        in_flight_submission_bytes: 0,
-        decoded_resident_bytes: 0,
-        reserved_above_floor_bytes: 1_100,
-        reserved_above_floor_blocks: 1,
-        budget_available: 64_000_000,
-    };
-    // Reservations alone fill the budget: 1_100 >= 1_000, so both the speculative
-    // lane and an escalated floor block above the commit window are refused.
-    assert_eq!(
-        admit_grant(
-            &config,
-            snapshot,
-            block::Height(602),
-            block::Height(602),
-            u64::MAX
-        ),
-        None,
-        "outstanding reservations must count against the resident budget",
-    );
-    assert!(
-        matches!(
-            super::admission::admit(
-                &config,
-                snapshot,
-                block::Height(601),
-                block::Height(601),
-                u64::MAX
-            ),
-            super::admission::AdmissionOutcome::LookaheadAtCap
-        ),
-        "an escalated floor take above the commit window is refused on reserved bytes alone",
-    );
-    // The commit window stays exempt so the committer can always drain.
-    let window = admit_grant(
-        &config,
-        snapshot,
-        block::Height(411),
-        block::Height(411),
-        1_000,
-    )
-    .expect("the commit window is exempt from the reservation charge");
-    assert_eq!(window.max_request_bytes, 1_000);
-}
-
-#[test]
-fn floor_backpressures_when_download_floor_escalates_past_commit() {
-    // Regression for the OOM. The download floor advances on every download, so a
-    // floor exemption tied to it lets the applying queue escalate unboundedly ahead of
-    // commit. With the exemption anchored to the *commit window* (one checkpoint range above
-    // the verified tip), a floor-priority request far above the commit tip is backpressured
-    // once the resident-memory look-ahead budget is full, while the commit window stays
-    // fundable so a pinned checkpoint range can assemble and commit can drain.
-    let config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: Some(64_000_000),
-        max_reorder_lookahead_bytes: 1_000,
-        // Large enough that the byte (memory) cap, not the block cap, is what bites here.
-        ..ZakuraBlockSyncConfig::default()
-    };
-    // Commit stalled far below the download floor; applying holds a full budget of
-    // serialized backlog bodies: 1_200 wire bytes >= 1_000 budget.
-    let snapshot = super::admission::AdmissionSnapshot {
-        download_floor: block::Height(1_000),
-        verified_block_tip: block::Height(10),
-        reorder_buffered_bytes: 0,
-        reorder_buffered_blocks: 0,
-        applying_buffered_bytes: 1_200,
-        applying_buffered_blocks: 990,
-        sequencer_input_queued_bytes: 0,
-        in_flight_submission_bytes: 0,
-        decoded_resident_bytes: 0,
-        reserved_above_floor_bytes: 0,
-        reserved_above_floor_blocks: 0,
-        budget_available: 64_000_000,
-    };
-
-    // The download-frontier request (floor+1) is still classified floor-priority, but is now
-    // refused: it is above the commit window, so it no longer bypasses the memory cap.
-    assert_eq!(
-        super::admission::request_priority(snapshot.download_floor, block::Height(1_001)),
-        super::admission::RequestPriority::Floor,
-    );
-    assert_eq!(
-        admit_grant(
-            &config,
-            snapshot,
-            block::Height(1_001),
-            block::Height(1_001),
-            1_000
-        ),
-        None,
-        "a floor request far ahead of commit is backpressured when the memory budget is full",
-    );
-
-    // The commit window (verified_tip + 1 ..= verified_tip + 401) stays fundable, so the
-    // committer can advance and drain the pipeline — no deadlock. The boundary is exact:
-    // 411 is the last exempt height, 412 the first gated one.
-    let frontier = admit_grant(
-        &config,
-        snapshot,
-        block::Height(11),
-        block::Height(11),
-        1_000,
-    )
-    .expect("the commit-frontier block is always fundable");
-    assert_eq!(frontier.max_request_bytes, 1_000);
-    let window_top = admit_grant(
-        &config,
-        snapshot,
-        block::Height(411),
-        block::Height(411),
-        1_000,
-    )
-    .expect("the top of the commit window is still fundable");
-    assert_eq!(window_top.max_request_bytes, 1_000);
-    assert_eq!(
-        admit_grant(
-            &config,
-            snapshot,
-            block::Height(412),
-            block::Height(412),
-            1_000
-        ),
-        None,
-        "the first height above the commit window is memory-gated",
-    );
-}
-
-#[test]
 fn exempt_take_never_spans_the_commit_window_boundary() {
-    // Pin for the above-window take bypass: with multi-block responses, a take whose
-    // admission-checked start sits inside the commit window must not extend above the
-    // window top — otherwise above-window heights ride the exempt request past the
-    // resident gate, sized only by the in-flight budget. The clamp is structural
-    // (gate-independent), so it holds whether or not the gate is full.
-    let config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: Some(64_000_000),
-        max_reorder_lookahead_bytes: 1_000,
-        ..ZakuraBlockSyncConfig::default()
-    };
-    // Gate full: 1,000 serialized applying bytes fill the 1,000-byte budget.
-    let full = super::admission::AdmissionSnapshot {
+    // A take whose start sits inside the commit window must not extend above
+    // the window top; otherwise above-window heights would lease from
+    // Consensus.
+    let snapshot = super::admission::AdmissionSnapshot {
         download_floor: block::Height(10),
-        verified_block_tip: block::Height(10),
+        commit_window_top: crate::zakura::CommitWindow::default().top(block::Height(10)),
         reorder_buffered_bytes: 0,
         reorder_buffered_blocks: 0,
-        applying_buffered_bytes: 1_000,
-        applying_buffered_blocks: 10,
+        applying_buffered_bytes: 0,
+        applying_buffered_blocks: 0,
         sequencer_input_queued_bytes: 0,
         in_flight_submission_bytes: 0,
         decoded_resident_bytes: 0,
         reserved_above_floor_bytes: 0,
         reserved_above_floor_blocks: 0,
         budget_available: 64_000_000,
+        consensus_available: 2_000,
     };
-    let grant = admit_grant(
-        &config,
-        full,
-        block::Height(11),
-        block::Height(10_000),
-        1_000,
-    )
-    .expect("an in-window start stays fundable at a full gate");
+    let grant = admit_grant(snapshot, block::Height(11), block::Height(10_000), 1_000)
+        .expect("an in-window start is fundable");
     assert_eq!(
         grant.take_high,
         block::Height(411),
@@ -3345,108 +3019,18 @@ fn exempt_take_never_spans_the_commit_window_boundary() {
     );
     assert_eq!(grant.max_request_bytes, 1_000);
 
-    // Same clamp with the gate open: no exempt take ever spans the boundary.
-    let open = super::admission::AdmissionSnapshot {
-        applying_buffered_bytes: 0,
-        applying_buffered_blocks: 0,
-        ..full
-    };
+    // An above-window start extends to the servable ceiling, sized by block
+    // sync's room.
     let grant = admit_grant(
-        &config,
-        open,
-        block::Height(11),
-        block::Height(10_000),
-        1_000,
-    )
-    .expect("an in-window start is fundable with the gate open");
-    assert_eq!(grant.take_high, block::Height(411));
-
-    // An above-window start with headroom extends to the servable ceiling, sized by the
-    // remaining wire-denominated headroom: 1_000 - 0 = 1_000.
-    let grant = admit_grant(
-        &config,
-        open,
+        snapshot,
         block::Height(412),
         block::Height(10_000),
         u64::MAX,
     )
     .expect("an above-window start is admitted below the cap");
     assert_eq!(grant.take_high, block::Height(10_000));
-    assert_eq!(grant.max_request_bytes, 1_000);
+    assert_eq!(grant.max_request_bytes, 64_000_000);
 }
-
-#[test]
-fn commit_window_stays_fundable_at_exact_floor() {
-    // Regression for the exact-fit clamp deadlock: a config clamped to the checkpoint-range
-    // floors used to leave zero margin, so one next-range reorder body or reservation pushed
-    // the gate over budget and the range-completing block was refused — checkpoint sync
-    // wedged. With the whole commit window exempt, the active range assembles regardless of
-    // how full the gate is.
-    use super::config::{
-        BS_CHECKPOINT_RANGE_BYTE_FLOOR, MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES,
-    };
-
-    let mut config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: Some(BS_CHECKPOINT_RANGE_BYTE_FLOOR),
-        max_reorder_lookahead_bytes: 1,
-        ..ZakuraBlockSyncConfig::default()
-    };
-    config.clamp_reorder_lookahead_to_floor();
-    let range_blocks = u32::try_from(MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES)
-        .expect("checkpoint range block count fits in u32");
-
-    // verified_tip pinned at 0; applying holds all but the last worst-case range block —
-    // all submitted during checkpoint sync, so charged at the decoded multiple — plus
-    // next-range contamination in reorder and outstanding reservations. The byte gate is
-    // full: 8 MiB + 800 MB + 4 MB serialized + 800 MB * 4 decoded >= 3_208_000_000.
-    let snapshot = super::admission::AdmissionSnapshot {
-        download_floor: block::Height(range_blocks - 1),
-        verified_block_tip: block::Height(0),
-        reorder_buffered_bytes: 8_388_608,
-        reorder_buffered_blocks: 4,
-        applying_buffered_bytes: 800_000_000,
-        applying_buffered_blocks: u64::from(range_blocks) - 1,
-        sequencer_input_queued_bytes: 0,
-        in_flight_submission_bytes: 800_000_000,
-        decoded_resident_bytes: 0,
-        reserved_above_floor_bytes: 4_000_000,
-        reserved_above_floor_blocks: 2,
-        budget_available: 2_000_000,
-    };
-
-    // The range-completing block (inside the commit window) stays fundable on both lanes.
-    assert_eq!(
-        super::admission::request_priority(snapshot.download_floor, block::Height(range_blocks)),
-        super::admission::RequestPriority::Floor,
-    );
-    let completing = admit_grant(
-        &config,
-        snapshot,
-        block::Height(range_blocks),
-        block::Height(range_blocks),
-        u64::MAX,
-    )
-    .expect("the range-completing floor take must pass a full gate");
-    assert_eq!(
-        completing.priority,
-        super::admission::RequestPriority::Floor
-    );
-    assert_eq!(completing.max_request_bytes, 2_000_000);
-
-    // The first height above the window is refused while the gate is full — on both
-    // lanes, since `admit` gates every above-window start regardless of priority.
-    assert!(matches!(
-        super::admission::admit(
-            &config,
-            snapshot,
-            block::Height(range_blocks + 1),
-            block::Height(range_blocks + 1),
-            u64::MAX
-        ),
-        super::admission::AdmissionOutcome::LookaheadAtCap
-    ));
-}
-
 #[test]
 fn work_queue_force_cancel_and_owner_timeout_release_once() {
     let queue = work_queue_with(0, [needed(1, BlockSizeEstimate::Advertised(100))]);
@@ -3682,7 +3266,13 @@ async fn floor_watchdog_only_avoids_requests_that_started_writing() {
         assert_eq!(taken.items().len(), 1);
         let owner = taken.items()[0].1.owner.unwrap();
         let write = taken
-            .admit(block::Height(0), CancellationToken::new())
+            .admit_for_connection(
+                block::Height(0),
+                crate::zakura::CommitWindow::default().top(block::Height(0)),
+                0,
+                None,
+                CancellationToken::new(),
+            )
             .unwrap();
         let write = write
             .publish(|_| {
@@ -4849,7 +4439,8 @@ fn work_queue_estimate_clamps_hint_between_floor_and_max_block_bytes() {
 
     // Default estimator: Unknown -> worst case; tiny hints clamp up to the floor;
     // huge hints clamp down to MAX_BLOCK_BYTES; ordinary hints pass through.
-    let queue = super::work_queue::WorkQueue::new(block::Height(0), ByteBudget::new(u64::MAX));
+    let queue =
+        super::work_queue::WorkQueue::with_test_pool(block::Height(0), ByteBudget::new(u64::MAX));
     queue.extend(
         test_work_scope(),
         [
@@ -4873,7 +4464,8 @@ fn work_queue_estimate_clamps_hint_between_floor_and_max_block_bytes() {
     assert_eq!(item(4), block::MAX_BLOCK_BYTES);
 
     // The test estimator override changes the floor clamp.
-    let tuned = super::work_queue::WorkQueue::new(block::Height(0), ByteBudget::new(u64::MAX));
+    let tuned =
+        super::work_queue::WorkQueue::with_test_pool(block::Height(0), ByteBudget::new(u64::MAX));
     tuned.set_estimate_floor_for_tests(100);
     tuned.extend(
         test_work_scope(),
@@ -5044,7 +4636,10 @@ impl std::ops::Deref for TestSequencer {
 
 impl TestSequencer {
     fn settle_payloads(&mut self) {
-        self.payloads.apply(self.policy.take_payload_changes());
+        let deferred = self
+            .payloads
+            .apply_entries(self.policy.take_payload_changes());
+        self.payloads.settle_leases(deferred);
         assert_eq!(
             self.payloads.retained_ids().collect::<BTreeSet<_>>(),
             self.policy.retained_ids().collect::<BTreeSet<_>>(),
@@ -5099,7 +4694,7 @@ impl TestSequencer {
         estimate: Option<u64>,
         peer: ZakuraPeerId,
     ) -> AcceptOutcome {
-        let facts = self.payloads.insert(body);
+        let facts = self.payloads.insert(body, 0, None);
         let result = self.policy.accept_buffered_body(
             owner,
             source,
@@ -5112,7 +4707,10 @@ impl TestSequencer {
             super::events::BlockSupplier { peer, conn_id: 0 },
         );
         if matches!(result, AcceptOutcome::Redundant { .. }) {
-            self.payloads.release(facts.id);
+            let deferred = self
+                .payloads
+                .apply_entries(vec![super::reorder::PayloadChange::Release(facts.id)]);
+            self.payloads.settle_leases(deferred);
         }
         self.settle_payloads();
         result
@@ -5126,7 +4724,8 @@ impl TestSequencer {
             .materialize(
                 facts.id,
                 &test_decoded_pool(),
-                admission::submission_decode_admission(self.policy.verified_tip(), height),
+                admission::submission_decode_admission(self.policy.commit_window_top(), height),
+                &super::work_queue::test_memory_pool(1 << 40),
             )
             .unwrap();
         let intent = self
@@ -5593,12 +5192,12 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
     let (body_tx, body_rx) = mpsc::channel(body_channel_capacity);
     let (control_tx, control_rx) = mpsc::unbounded_channel();
     let (actions_tx, mut actions_rx) = mpsc::channel(submission_limit + 128);
-    let (view_tx, mut view_rx) = watch::channel(initial_view(frontiers));
+    let (view_tx, mut view_rx) = watch::channel(initial_view(frontiers, &Default::default()));
     let budget = ByteBudget::new(1);
     let task = SequencerIO::new(
         Sequencer::new(block::Height(0), submission_limit)
             .with_decoded_window_cap(block::Height(BLOCK_COUNT), 1),
-        Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
+        Arc::new(WorkQueue::with_test_pool(block::Height(0), budget.clone())),
         Arc::new(PeerRegistry::new()),
         actions_tx,
         ThroughputMeter::new(Instant::now()),
@@ -5844,12 +5443,12 @@ impl CappedSequencerTask {
         let (body_tx, body_rx) = mpsc::channel(8);
         let (control_tx, control_rx) = mpsc::unbounded_channel();
         let (actions_tx, actions_rx) = mpsc::channel(8);
-        let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+        let (view_tx, _view_rx) = watch::channel(initial_view(frontiers, &Default::default()));
         let budget = ByteBudget::new(1);
         let task = SequencerIO::new(
             Sequencer::new(block::Height(0), MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES)
                 .with_decoded_window_cap(block::Height(0), max_decoded_bytes),
-            Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
+            Arc::new(WorkQueue::with_test_pool(block::Height(0), budget.clone())),
             Arc::new(PeerRegistry::new()),
             actions_tx,
             ThroughputMeter::new(Instant::now()),
@@ -6307,11 +5906,11 @@ async fn detached_checkpoint_duplicates_refill_current_submission_window() {
     let (body_tx, body_rx) = mpsc::channel(body_channel_capacity);
     let (control_tx, control_rx) = mpsc::unbounded_channel();
     let (actions_tx, mut actions_rx) = mpsc::channel(submission_limit + DETACHED_PREFIX);
-    let (view_tx, mut view_rx) = watch::channel(initial_view(frontiers));
+    let (view_tx, mut view_rx) = watch::channel(initial_view(frontiers, &Default::default()));
     let budget = ByteBudget::new(1);
     let task = SequencerIO::new(
         Sequencer::new(block::Height(0), submission_limit),
-        Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
+        Arc::new(WorkQueue::with_test_pool(block::Height(0), budget.clone())),
         Arc::new(PeerRegistry::new()),
         actions_tx,
         ThroughputMeter::new(Instant::now()),
@@ -6528,14 +6127,14 @@ impl DetachedWindow {
         let (body_tx, body_rx) = mpsc::channel(submission_limit);
         let (control_tx, control_rx) = mpsc::unbounded_channel();
         let (actions_tx, actions_rx) = mpsc::channel(2 * submission_limit);
-        let (view_tx, view_rx) = watch::channel(initial_view(frontiers));
+        let (view_tx, view_rx) = watch::channel(initial_view(frontiers, &Default::default()));
         let body_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let body_input_decoded_attributed_memory_bytes =
             Arc::new(std::sync::atomic::AtomicU64::new(0));
         let budget = ByteBudget::new(1);
         let task = SequencerIO::new(
             Sequencer::new(block::Height(0), submission_limit),
-            Arc::new(WorkQueue::new(block::Height(0), budget)),
+            Arc::new(WorkQueue::with_test_pool(block::Height(0), budget)),
             Arc::new(PeerRegistry::new()),
             actions_tx,
             ThroughputMeter::new(Instant::now()),
@@ -7538,7 +7137,13 @@ async fn reactor_handle_observes_its_actual_request_budget_closing() {
             7,
             std::num::NonZeroU64::new(1).unwrap(),
         )
-        .admit(block::Height(0), CancellationToken::new())
+        .admit_for_connection(
+            block::Height(0),
+            crate::zakura::CommitWindow::default().top(block::Height(0)),
+            0,
+            None,
+            CancellationToken::new(),
+        )
         .unwrap()
         .publish(|_| {})
         .unwrap();
@@ -7565,104 +7170,64 @@ proptest::proptest! {
 
     #[test]
     fn admit_respects_lookahead_bounds(
-        reorder_bytes in 0u64..2_000,
-        applying_bytes in 0u64..2_000,
-        input_bytes in 0u64..2_000,
-        reserved_bytes in 0u64..2_000,
-        // Occasionally saturate the hard block cap so the count-gate arm below
-        // stays non-vacuous (ordinary counts never approach 262,144).
+        budget_available in 0u64..2_000,
+        consensus_available in 0u64..2_000,
+        response_cap in 1u64..2_000,
+        // Occasionally saturate the hard block cap.
         reorder_blocks in proptest::prop_oneof![
             0u64..20,
             proptest::strategy::Just(super::admission::LOOKAHEAD_BLOCK_HARD_CAP),
         ],
-        applying_blocks in 0u64..20,
-        reserved_blocks in 0u64..20,
+        start in 11u32..1_000,
     ) {
-        let config = ZakuraBlockSyncConfig {
-            max_inflight_block_bytes: Some(64_000_000),
-            max_reorder_lookahead_bytes: 1_000,
-            ..ZakuraBlockSyncConfig::default()
-        };
-        // The download floor sits far above the commit window (verified_tip 10 + 401 = 411),
-        // so the gated probe below is genuinely memory-gated, not window-exempt.
+        // The download floor sits above the commit window (verified_tip 10 + 401 = 411).
         let snapshot = super::admission::AdmissionSnapshot {
             download_floor: block::Height(600),
-            verified_block_tip: block::Height(10),
-            reorder_buffered_bytes: reorder_bytes,
+            commit_window_top: crate::zakura::CommitWindow::default().top(block::Height(10)),
+            reorder_buffered_bytes: 0,
             reorder_buffered_blocks: reorder_blocks,
-            applying_buffered_bytes: applying_bytes,
-            applying_buffered_blocks: applying_blocks,
-            sequencer_input_queued_bytes: input_bytes,
+            applying_buffered_bytes: 0,
+            applying_buffered_blocks: 0,
+            sequencer_input_queued_bytes: 0,
             in_flight_submission_bytes: 0,
             decoded_resident_bytes: 0,
-            reserved_above_floor_bytes: reserved_bytes,
-            reserved_above_floor_blocks: reserved_blocks,
-            budget_available: 64_000_000,
+            reserved_above_floor_bytes: 0,
+            reserved_above_floor_blocks: 0,
+            budget_available,
+            consensus_available,
         };
-        // Serialized pools are charged at wire size. The sequencer input also
-        // carries a decoded copy, so it pays the decoded multiple in addition.
-        let factor = super::admission::DESERIALIZED_MEM_FACTOR;
-        let estimated_resident = reorder_bytes
-            .saturating_add(applying_bytes)
-            .saturating_add(input_bytes)
-            .saturating_add(reserved_bytes)
-            .saturating_add(input_bytes.saturating_mul(factor));
-        let held_blocks = reorder_blocks
-            .saturating_add(applying_blocks)
-            .saturating_add(reserved_blocks);
-        let effective = config.effective_max_reorder_lookahead_bytes();
-        let above = super::admission::admit(
-            &config,
+        let top = block::Height(411);
+        let outcome = super::admission::admit(
             snapshot,
-            block::Height(602),
+            block::Height(start),
             block::Height(100_000),
-            1_000,
+            response_cap,
         );
-        if estimated_resident >= effective
-            || held_blocks >= super::admission::LOOKAHEAD_BLOCK_HARD_CAP
-            || effective - estimated_resident == 0
-        {
-            prop_assert_eq!(above, super::admission::AdmissionOutcome::LookaheadAtCap);
-        } else {
-            // A gated request funds min(budget, remaining wire headroom,
-            // response cap); admitted backlog bodies remain serialized.
-            let remaining_wire = effective - estimated_resident;
-            let expected = snapshot.budget_available.min(remaining_wire).min(1_000);
-            match above {
-                super::admission::AdmissionOutcome::Admit(grant) => {
-                    prop_assert_eq!(grant.max_request_bytes, expected);
-                    // Gated grants pass the servable ceiling through unchanged.
-                    prop_assert_eq!(grant.take_high, block::Height(100_000));
-                    // The new reservation is charged at wire size, so one grant
-                    // cannot push the resident estimate past the budget.
-                    prop_assert!(
-                        estimated_resident
-                            .saturating_add(grant.max_request_bytes)
-                            <= effective
-                    );
-                }
-                other => prop_assert!(false, "expected a gated grant, got {:?}", other),
-            }
-        }
-
-        // The commit window (heights <= 411) stays fundable regardless of pool fill,
-        // and the exempt grant never spans the window boundary.
-        match super::admission::admit(
-            &config,
-            snapshot,
-            block::Height(11),
-            block::Height(100_000),
-            1_000,
-        ) {
+        let in_window = block::Height(start) <= top;
+        match outcome {
             super::admission::AdmissionOutcome::Admit(grant) => {
-                prop_assert_eq!(grant.max_request_bytes, 1_000);
-                prop_assert_eq!(grant.take_high, block::Height(411));
+                // A floor take keeps at least one byte, so it reaches the pool.
+                let floor_min = u64::from(grant.priority == super::admission::RequestPriority::Floor);
+                prop_assert!(grant.max_request_bytes <= response_cap);
+                if in_window {
+                    // A commit-window take sizes by Consensus and stops at the window top.
+                    prop_assert!(grant.max_request_bytes <= consensus_available.max(floor_min));
+                    prop_assert_eq!(grant.take_high, top);
+                } else {
+                    prop_assert!(grant.max_request_bytes <= budget_available.max(floor_min));
+                    prop_assert!(reorder_blocks < super::admission::LOOKAHEAD_BLOCK_HARD_CAP);
+                }
             }
-            other => prop_assert!(
-                false,
-                "the commit window remains admitted while budget is available, got {:?}",
-                other
-            ),
+            super::admission::AdmissionOutcome::LookaheadAtCap => {
+                // The block cap never stops commit-window work.
+                prop_assert!(!in_window);
+            }
+            super::admission::AdmissionOutcome::InflightBudgetEmpty => {
+                prop_assert_eq!(
+                    if in_window { consensus_available } else { budget_available },
+                    0
+                );
+            }
         }
     }
 }
@@ -7679,7 +7244,7 @@ proptest::proptest! {
         // release) drains the mirrored budget to zero; any later path is a no-op.
         let mut ledger = BlockBudgetLedger::reserved(estimate);
         let budget = ByteBudget::new(u64::MAX);
-        let mut funding = budget.reserve_owned(estimate).unwrap();
+        let mut funding = budget.charge_owned(estimate).unwrap();
 
         if release_before_receipt {
             drop(funding.split(ledger.release_reserved()).unwrap());
@@ -7708,7 +7273,7 @@ fn budget_reservation_tracks_only_unreceived_estimates() {
         let budget = ByteBudget::new(max);
         let mut reorder = ReorderBuffer::new();
         let mut outstanding = outstanding_three_block_range();
-        let mut funding = budget.reserve_owned(outstanding.reserved_bytes()).unwrap();
+        let mut funding = budget.charge_owned(outstanding.reserved_bytes()).unwrap();
         assert_eq!(budget.reserved(), max);
         assert!(budget.reserved() <= budget.max_bytes_for_test());
 
@@ -7754,7 +7319,7 @@ fn budget_reservation_tracks_only_unreceived_estimates() {
     {
         let budget = ByteBudget::new(max);
         let mut outstanding = outstanding_three_block_range();
-        let mut funding = budget.reserve_owned(outstanding.reserved_bytes()).unwrap();
+        let mut funding = budget.charge_owned(outstanding.reserved_bytes()).unwrap();
         assert_eq!(budget.reserved(), estimate * 3);
         // A short response delivers only height 1; its estimate is released.
         drop(funding.split(estimate).unwrap());
@@ -7848,7 +7413,7 @@ fn underestimated_body_is_buffered_and_releases_only_its_estimate() {
             estimated_bytes: hint,
         }],
     };
-    let funding = budget.reserve_owned(request.estimated_bytes).unwrap();
+    let funding = budget.charge_owned(request.estimated_bytes).unwrap();
     let now = Instant::now();
     let mut outstanding = OutstandingBlockRange {
         request,
@@ -7882,7 +7447,7 @@ fn underestimated_body_is_buffered_and_releases_only_its_estimate() {
     assert_eq!(budget.reserved(), 0);
     assert_eq!(outstanding.reserved_bytes(), 0);
     assert!(
-        budget.reserve_owned(hint).is_some(),
+        budget.charge_owned(hint).is_some(),
         "the freed reservation funds the next request immediately"
     );
     let dropped = reorder.drop_through(block::Height(1));
@@ -7907,7 +7472,11 @@ fn block_sync_stream_declares_kind_capability_version_and_frame_cap() {
 #[tokio::test]
 async fn service_registry_routes_block_sync_by_exact_capability_and_version() {
     let service = Arc::new(
-        BlockSyncService::new(ZakuraBlockSyncConfig::default()).expect("valid block-sync config"),
+        BlockSyncService::new(
+            ZakuraBlockSyncConfig::default(),
+            crate::zakura::BlockSyncMemory::for_tests(),
+        )
+        .expect("valid block-sync config"),
     );
     let registry =
         ServiceRegistry::new(vec![service]).expect("block-sync service declares unique kind");
@@ -7945,8 +7514,11 @@ async fn service_registry_routes_block_sync_by_exact_capability_and_version() {
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn inert_reactor_parks_after_header_tip_watch_closes() {
-    let _service =
-        BlockSyncService::new(ZakuraBlockSyncConfig::default()).expect("valid block-sync config");
+    let _service = BlockSyncService::new(
+        ZakuraBlockSyncConfig::default(),
+        crate::zakura::BlockSyncMemory::for_tests(),
+    )
+    .expect("valid block-sync config");
 
     let elapsed = tokio::time::timeout(Duration::from_secs(1), future::pending::<()>()).await;
 
@@ -7961,7 +7533,11 @@ async fn inert_reactor_parks_after_header_tip_watch_closes() {
 #[tokio::test]
 async fn reactor_drops_a_session_cancelled_before_it_connects() {
     let (handle, _actions, reactor_task) = spawn_block_sync_reactor(
-        BlockSyncStartup::inert(ZakuraBlockSyncConfig::default()).unwrap(),
+        BlockSyncStartup::inert(
+            ZakuraBlockSyncConfig::default(),
+            crate::zakura::BlockSyncMemory::for_tests(),
+        )
+        .unwrap(),
     )
     .expect("valid block-sync config");
     let (send, mut outbound) = framed_channel(1);
@@ -8344,7 +7920,7 @@ async fn disconnect_of_a_skipped_replacement_removes_the_older_handle() {
 #[tokio::test]
 async fn a_rejected_session_leaves_its_registry_entry_to_its_teardown() {
     let mut config = ZakuraBlockSyncConfig::default();
-    config.peer_limits.max_outbound_peers = 1;
+    config.peer_limits.max_outbound_peers = Some(1);
     let mut relayed = RelayedBlockSync::spawn(config);
     let (holder, rejected) = (peer(0x54), peer(0x55));
 
@@ -8581,8 +8157,8 @@ async fn registry_add_peer_requires_negotiated_block_sync_capability() {
 async fn wants_peer_rejects_when_configured_slot_cap_is_reached() {
     let config = ZakuraBlockSyncConfig {
         peer_limits: ServicePeerLimits {
-            max_inbound_peers: 0,
-            max_outbound_peers: 2,
+            max_inbound_peers: Some(0),
+            max_outbound_peers: Some(2),
             ..ServicePeerLimits::default()
         },
         ..ZakuraBlockSyncConfig::default()
@@ -9247,8 +8823,8 @@ fn add_outbound_block_sync_peer(
 #[tokio::test]
 async fn block_sync_add_peer_replaces_same_peer_even_at_full_cap() {
     let mut config = immediate_body_download_config();
-    config.peer_limits.max_outbound_peers = 1;
-    config.peer_limits.max_inbound_peers = 0;
+    config.peer_limits.max_outbound_peers = Some(1);
+    config.peer_limits.max_inbound_peers = Some(0);
     let (service, mut events) = BlockSyncService::new_for_test(config);
 
     // Keep every stream handle alive so the per-peer pipes are not torn down.
@@ -10086,7 +9662,7 @@ async fn routine_disconnect_returns_outstanding_and_releases_budget() {
     // be offered it.
     let mut config = immediate_body_download_config();
     config.request_timeout = Duration::from_secs(300);
-    config.peer_limits.max_outbound_peers = 4;
+    config.peer_limits.max_outbound_peers = Some(4);
     let blocks = mainnet_blocks_1_to_3();
     let (tip_tx, handle, mut actions, reactor_task, service) = spawn_genesis_service(config);
     let (peer_a, _a_in, mut a_out) = connect_peer_with_status(
@@ -10318,7 +9894,7 @@ async fn reactor_keeps_block_sync_peer_after_catch_up_and_reuses_later() {
     // bodies, so closing the stream after every local catch-up would starve fresh
     // Zakura-only nodes between checkpoint windows.
     let mut config = fill_loop_mechanics_config();
-    config.peer_limits.max_outbound_peers = 1;
+    config.peer_limits.max_outbound_peers = Some(1);
     let (_tip_tx, tip_rx) = watch::channel((block::Height(4), block::Hash([4; 32])));
     let startup = header_tip_startup(
         genesis_frontiers(),
@@ -10903,7 +10479,7 @@ async fn checkpoint_hole_disconnect_retries_first_missing_height_with_fresh_peer
     let mut config = immediate_body_download_config();
     config.max_inflight_block_bytes = Some(u64::MAX);
     config.request_timeout = Duration::from_secs(300);
-    config.peer_limits.max_outbound_peers = 1;
+    config.peer_limits.max_outbound_peers = Some(1);
     config.peer_limits.inbound_queue_depth = 128;
     // Keep the outbound queue wide enough that a fill pass never overflows it
     // and cancels the peer.

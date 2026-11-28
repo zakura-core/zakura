@@ -34,7 +34,11 @@ fn compact_session_lifecycle_peak() {
                 default_gate: Some(gate.clone()),
                 ..Default::default()
             });
-            let serving = Serving::new(source, &ZakuraBlockSyncConfig::default());
+            let serving = Serving::new(
+                source,
+                &ZakuraBlockSyncConfig::default(),
+                crate::zakura::BlockSyncMemory::for_tests().pool,
+            );
             let peer = ZakuraPeerId::new(vec![63; 32]).unwrap();
             let count =
                 super::super::serving_max_inflight_requests(&ZakuraBlockSyncConfig::default()) * 2;
@@ -60,7 +64,16 @@ fn compact_session_lifecycle_peak() {
                             .unwrap();
                     }
                     let admitted = measurement.snapshot();
-                    gate.add_permits(usize::try_from(count).unwrap());
+                    // Keep all per-peer execution workers busy while draining output.
+                    // Because `Serve` shrinks `RangeUnavailable` byte grants at the
+                    // ending (`mem-6`), unlocking all 5,632 reads before draining the
+                    // 4-frame test channel would queue thousands of finished output
+                    // frames under `peer_output_responses` rather than measuring
+                    // request bookkeeping.
+                    let total = usize::try_from(count).unwrap();
+                    let initial_batch = super::super::PEER_EXECUTION.min(total);
+                    gate.add_permits(initial_batch);
+                    let mut remaining_permits = total - initial_batch;
                     // Ready order writes each range as its read finishes.
                     for _ in 0..count {
                         let super::super::super::wire::Message::End(ending) =
@@ -68,6 +81,10 @@ fn compact_session_lifecycle_peak() {
                         else {
                             panic!("every range is unavailable");
                         };
+                        if remaining_permits > 0 {
+                            gate.add_permits(1);
+                            remaining_permits -= 1;
+                        }
                         assert!(
                             (1..=count).contains(&ending.start.0)
                                 && ending

@@ -163,7 +163,7 @@ pub fn spawn_block_sync_reactor(
     let progress = ReactorProgress::new(
         startup.frontiers,
         startup.best_header_tip,
-        initial_view(startup.frontiers),
+        initial_view(startup.frontiers, &startup.commit_window),
     );
     let mut local_status = progress.local_status(&startup.config, committed_view.as_ref());
     if let Some(retention) = &body_retention {
@@ -198,7 +198,8 @@ pub fn spawn_block_sync_reactor(
     let mut sequencer = Sequencer::new(
         startup.frontiers.verified_block_tip,
         startup.config.submitted_apply_limit(),
-    );
+    )
+    .with_commit_window(startup.commit_window.clone());
     if let Some(max_checkpoint_height) = startup.max_checkpoint_height {
         sequencer = sequencer.with_decoded_window_cap(
             max_checkpoint_height,
@@ -220,7 +221,8 @@ pub fn spawn_block_sync_reactor(
         .map(|snapshot| snapshot.state_version);
     let sequencer_input_bytes = Arc::new(AtomicU64::new(0));
     let sequencer_input_decoded_attributed_memory_bytes = Arc::new(AtomicU64::new(0));
-    let (sequencer_view_tx, sequencer_view_rx) = watch::channel(initial_view(startup.frontiers));
+    let (sequencer_view_tx, sequencer_view_rx) =
+        watch::channel(initial_view(startup.frontiers, &startup.commit_window));
     // Shared peer facts are also the exact per-supplier body-retry admission gate.
     let registry = PeerRegistry::new();
     #[cfg(any(test, zakura_sim))]
@@ -251,7 +253,7 @@ pub fn spawn_block_sync_reactor(
         startup.decoded_pool.clone(),
     )
     .with_initial_state_version(initial_state_version)
-    .with_retained_body_limit(startup.config.effective_max_reorder_lookahead_bytes());
+    .with_look_ahead_cap(startup.memory.look_ahead_cap);
     #[cfg(any(test, zakura_sim))]
     let sequencer_task = sequencer_task.with_observer(startup.observer.clone());
     spawn_erased_named("block_sync_sequencer", sequencer_task.run());
@@ -273,6 +275,7 @@ pub fn spawn_block_sync_reactor(
         serving: Arc::new(super::regulated::session::Serving::new(
             startup.range_source.clone(),
             &startup.config,
+            startup.memory.pool.clone(),
         )),
         config: startup.config.clone(),
         work: state.work_queue.clone(),

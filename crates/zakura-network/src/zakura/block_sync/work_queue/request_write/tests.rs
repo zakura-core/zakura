@@ -75,7 +75,7 @@ fn settlement_observes_write_status_while_last_owner_is_dropping() {
 #[tokio::test]
 async fn funded_receipt_survives_reset_and_replacement() {
     let mut f = Fixture::new();
-    let unrelated = f.budget.reserve_owned(17).unwrap();
+    let unrelated = f.budget.charge_owned(17).unwrap();
     let claim = f.take(1);
     let owner = claim.owner();
     let claim = claim.publish(|_| {}).unwrap();
@@ -139,7 +139,7 @@ async fn funded_receipt_survives_reset_and_replacement() {
 #[test]
 fn owned_overdraft_rejects_counter_overflow_without_charging() {
     let budget = ByteBudget::new(u64::MAX);
-    let full = budget.reserve_owned(u64::MAX).unwrap();
+    let full = budget.charge_owned(u64::MAX).unwrap();
     assert!(budget.charge_owned(1).is_none());
     assert_eq!(budget.reserved(), u64::MAX);
     drop(full);
@@ -178,7 +178,10 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        Self::with_queue(WorkQueue::new(block::Height(0), ByteBudget::new(1000)))
+        Self::with_queue(WorkQueue::with_test_pool(
+            block::Height(0),
+            ByteBudget::new(1000),
+        ))
     }
 
     /// A fixture whose queue reports each request step to the returned log.
@@ -186,7 +189,8 @@ impl Fixture {
         let log = StepLog::default();
         let observer = ObserverSlot(Some(Arc::new(log.clone())));
         let fixture = Self::with_queue(
-            WorkQueue::new(block::Height(0), ByteBudget::new(1000)).with_observer(observer),
+            WorkQueue::with_test_pool(block::Height(0), ByteBudget::new(1000))
+                .with_observer(observer),
         );
         (fixture, log)
     }
@@ -234,7 +238,7 @@ impl Fixture {
             NonZeroU64::new(id).unwrap(),
         );
         assert_eq!(taken.items().len(), 2);
-        taken.admit(block::Height(0), self.cancel.clone()).unwrap()
+        admit(taken, self.cancel.clone()).unwrap()
     }
 
     fn expire(&mut self, owner: BodyWorkOwner) {
@@ -267,6 +271,7 @@ fn work_shared_with_bpv1() -> (Fixture, SharedBodyClaims) {
         tip_rx,
         DecodedBlockPool::for_block_count(NonZeroU64::new(8).unwrap()),
         ZakuraBlockSyncConfig::default(),
+        crate::zakura::BlockSyncMemory::for_tests(),
     )
     .with_body_claims(claims.clone());
     let work = BlockSyncState::new(&startup).work_queue;
@@ -423,6 +428,21 @@ fn batched_ownership_filter_follows_publication_receipt_and_replacement() {
         vec![(block::Height(2), (replacement.owner(), 22))],
         "a later stale entry for the same height must not hide its current owner",
     );
+}
+
+/// Admits `taken` for connection 0, with the floor and the verified tip at
+/// genesis.
+fn admit(
+    taken: TakenRequest,
+    cancel: CancellationToken,
+) -> Result<UnpublishedRequest, AdmitRefusal> {
+    taken.admit_for_connection(
+        block::Height(0),
+        crate::zakura::CommitWindow::default().top(block::Height(0)),
+        0,
+        None,
+        cancel,
+    )
 }
 
 fn publish(claim: UnpublishedRequest, sender: &FramedSend) -> Arc<RequestWrite> {
@@ -1059,7 +1079,7 @@ fn answered_elsewhere_returns_the_settled_requests_charge() {
     let height = block::Height(1);
     let hash = block::Hash([1; 32]);
     let budget = ByteBudget::new(10_000);
-    let work = Arc::new(WorkQueue::new(block::Height(0), budget.clone()));
+    let work = Arc::new(WorkQueue::with_test_pool(block::Height(0), budget.clone()));
     work.extend(
         test_work_scope(),
         [(height, hash, BlockSizeEstimate::Confirmed(2_000))],
@@ -1068,7 +1088,7 @@ fn answered_elsewhere_returns_the_settled_requests_charge() {
     let take = |id, bytes| {
         let taken = work.take_request(height, height, 1, 10_000, 7, NonZeroU64::new(id).unwrap());
         assert_eq!(taken.items().len(), 1);
-        let request = taken.admit(block::Height(0), cancel.clone()).unwrap();
+        let request = admit(taken, cancel.clone()).unwrap();
         assert_eq!(request.bytes(), bytes);
         request.publish(|_| {}).unwrap()
     };
@@ -1211,7 +1231,7 @@ fn each_write_outcome_reports_its_steps() {
 #[test]
 fn dropping_unpolled_publication_returns_work_and_funding() {
     let mut f = Fixture::new();
-    let unrelated = f.budget.reserve_owned(17).unwrap();
+    let unrelated = f.budget.charge_owned(17).unwrap();
     let request = f.take(1);
     let publication = async move { request.publish(|_| panic!("future was never polled")) };
     assert_eq!(f.budget.reserved(), 217);
@@ -1226,7 +1246,7 @@ fn dropping_unpolled_publication_returns_work_and_funding() {
 #[test]
 fn cancelled_publication_returns_work_and_funding() {
     let mut f = Fixture::new();
-    let unrelated = f.budget.reserve_owned(17).unwrap();
+    let unrelated = f.budget.charge_owned(17).unwrap();
     let request = f.take(1);
     f.cancel.cancel();
     assert!(request
@@ -1244,7 +1264,7 @@ fn publication_unwind_settles_after_unlocking() {
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
         let mut f = Fixture::new();
-        let unrelated = f.budget.reserve_owned(17).unwrap();
+        let unrelated = f.budget.charge_owned(17).unwrap();
         let request = f.take(1);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             request.publish(|_| panic!("publication interrupted"));
@@ -1274,7 +1294,7 @@ fn dropping_unfunded_take_returns_work_without_charging() {
         7,
         NonZeroU64::new(1).unwrap(),
     );
-    let admission = async move { taken.admit(block::Height(0), CancellationToken::new()) };
+    let admission = async move { admit(taken, CancellationToken::new()) };
     assert_eq!(f.work.in_flight_len(), 2);
     assert_eq!(f.budget.reserved(), 0);
     drop(admission);
@@ -1306,7 +1326,7 @@ fn filtered_take_derives_funding_and_priority_from_retained_items() {
     taken.retain_range(1..2);
     assert!(f.work.pending_contains(block::Height(1)));
     assert!(f.work.pending_contains(block::Height(3)));
-    let request = taken.admit(block::Height(0), f.cancel.clone()).unwrap();
+    let request = admit(taken, f.cancel.clone()).unwrap();
     assert_eq!(request.items().len(), 1);
     assert_eq!(request.items()[0].0, block::Height(2));
     assert_eq!(request.priority(), RequestPriority::AboveFloor);
@@ -1317,59 +1337,6 @@ fn filtered_take_derives_funding_and_priority_from_retained_items() {
     drop(claim);
     assert_eq!(f.budget.reserved(), 0);
     assert_eq!(f.work.pending_len(), 3);
-}
-
-#[test]
-fn full_budget_refuses_speculation_but_funds_only_the_owned_floor() {
-    let f = Fixture::new();
-    let unrelated = f.budget.reserve_owned(1000).unwrap();
-    let above = f.work.take_request(
-        block::Height(2),
-        block::Height(2),
-        1,
-        100,
-        7,
-        NonZeroU64::new(1).unwrap(),
-    );
-    assert_eq!(
-        above.admit(block::Height(0), f.cancel.clone()).unwrap_err(),
-        AdmitRefusal::Capacity
-    );
-    assert!(f.work.pending_contains(block::Height(2)));
-    assert_eq!(f.budget.reserved(), 1000);
-    let floor = f
-        .work
-        .take_request(
-            block::Height(1),
-            block::Height(1),
-            1,
-            1,
-            7,
-            NonZeroU64::new(2).unwrap(),
-        )
-        .admit(block::Height(0), f.cancel.clone())
-        .unwrap();
-    assert_eq!(floor.bytes(), 100);
-    assert_eq!(floor.priority(), RequestPriority::Floor);
-    assert_eq!(f.budget.reserved(), 1100);
-    let duplicate = f.work.take_request(
-        block::Height(1),
-        block::Height(1),
-        1,
-        1,
-        8,
-        NonZeroU64::new(3).unwrap(),
-    );
-    assert_eq!(
-        duplicate
-            .admit(block::Height(0), f.cancel.clone())
-            .unwrap_err(),
-        AdmitRefusal::Empty
-    );
-    assert_eq!(f.budget.reserved(), 1100);
-    drop(floor);
-    assert_eq!(f.budget.reserved(), 1000);
-    drop(unrelated);
 }
 
 #[test]
@@ -1394,15 +1361,13 @@ fn stale_take_cannot_fund_or_return_replacement_work() {
         NonZeroU64::new(2).unwrap(),
     );
     assert_eq!(
-        old.admit(block::Height(0), f.cancel.clone()).unwrap_err(),
+        admit(old, f.cancel.clone()).unwrap_err(),
         AdmitRefusal::StaleClaim
     );
     assert_eq!(f.budget.reserved(), 0);
     assert_eq!(f.work.in_flight_len(), 2);
     assert_eq!(f.work.pending_len(), 0);
-    let request = replacement
-        .admit(block::Height(0), f.cancel.clone())
-        .unwrap();
+    let request = admit(replacement, f.cancel.clone()).unwrap();
     assert_eq!(f.budget.reserved(), 200);
     drop(request);
     assert_eq!(f.budget.reserved(), 0);
@@ -1478,7 +1443,13 @@ fn funding_drift_closes_publication_and_survives_reset() {
                     7,
                     NonZeroU64::new(request).unwrap(),
                 )
-                .admit(block::Height(0), f.cancel.clone())
+                .admit_for_connection(
+                    block::Height(0),
+                    crate::zakura::CommitWindow::default().top(block::Height(0)),
+                    0,
+                    None,
+                    f.cancel.clone(),
+                )
                 .unwrap()
         };
         let claim = take_height(1, 1).publish(|_| {}).unwrap();
@@ -1497,7 +1468,7 @@ fn funding_drift_closes_publication_and_survives_reset() {
             f.work
                 .lock()
                 .funding
-                .merge(&mut f.budget.reserve_owned(1).unwrap())
+                .merge(&mut f.budget.charge_owned(1).unwrap())
                 .unwrap();
             assert!(!f.work.audit_funding());
         }
@@ -1541,7 +1512,7 @@ fn accounting_closure_wakes_its_waiter() {
         });
         let mut cx = Context::from_waker(&waker);
         assert!(closed.as_mut().poll(&mut cx).is_pending());
-        drop(f.budget.reserve_owned(17).unwrap());
+        drop(f.budget.charge_owned(17).unwrap());
         assert_eq!(
             wakes.load(Ordering::SeqCst),
             0,
@@ -1554,7 +1525,7 @@ fn accounting_closure_wakes_its_waiter() {
                 f.work
                     .lock()
                     .funding
-                    .merge(&mut f.budget.reserve_owned(1).unwrap())
+                    .merge(&mut f.budget.charge_owned(1).unwrap())
                     .unwrap();
                 assert!(!f.work.audit_funding());
             }
@@ -1629,11 +1600,19 @@ fn funding_drift_refuses_normal_and_floor_admission() {
         f.work
             .lock()
             .funding
-            .merge(&mut f.budget.reserve_owned(1).unwrap())
+            .merge(&mut f.budget.charge_owned(1).unwrap())
             .unwrap();
         assert!(!f.work.audit_funding());
         assert_eq!(
-            taken.admit(floor, f.cancel.clone()).unwrap_err(),
+            taken
+                .admit_for_connection(
+                    floor,
+                    crate::zakura::CommitWindow::default().top(floor),
+                    0,
+                    None,
+                    f.cancel.clone()
+                )
+                .unwrap_err(),
             AdmitRefusal::AccountingClosed
         );
         assert_eq!(f.budget.reserved(), 1);
@@ -1666,7 +1645,7 @@ fn funding_audit_checks_the_actual_counter_and_allows_held_receipts() {
     assert!(funded > 0);
     let original = std::mem::replace(
         &mut f.work.lock().funding,
-        other.reserve_owned(funded).unwrap(),
+        other.charge_owned(funded).unwrap(),
     );
     drop(original);
     assert_eq!(f.work.reserved_bytes(), funded);
@@ -1895,7 +1874,7 @@ fn poisoned_queue_owner_unwind_does_not_abort() {
 
     let phase = std::env::var(CHILD).unwrap();
     let mut f = Fixture::new();
-    let unrelated = f.budget.reserve_owned(17).unwrap();
+    let unrelated = f.budget.charge_owned(17).unwrap();
     let original = f.take(1).publish(|_| {}).unwrap();
     assert!(original.try_start());
     original.written();
@@ -1919,7 +1898,7 @@ fn poisoned_queue_owner_unwind_does_not_abort() {
     if phase == "taken" {
         unwind_owner(taken, &f.work);
     } else {
-        let admitted = taken.admit(block::Height(0), f.cancel.clone()).unwrap();
+        let admitted = admit(taken, f.cancel.clone()).unwrap();
         assert_eq!(f.budget.reserved(), 317);
         if phase == "admitted" {
             unwind_owner(admitted, &f.work);
@@ -1956,7 +1935,7 @@ fn poisoned_queue_owner_unwind_does_not_abort() {
         NonZeroU64::new(3).unwrap(),
     );
     assert!(matches!(
-        replacement.admit(block::Height(0), CancellationToken::new()),
+        admit(replacement, CancellationToken::new()),
         Err(AdmitRefusal::AccountingClosed)
     ));
     f.reset();

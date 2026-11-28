@@ -239,7 +239,6 @@ impl zakura_header_chain::Clock for WallClock {
 #[derive(Debug)]
 pub(super) struct SequencerState {
     sequencer: Sequencer,
-    retained_body_limit: u64,
     /// Tracks the finalized height so the published view carries it forward; the
     /// reactor folds it into its `finalized_height` mirror with a `max`.
     finalized_height: block::Height,
@@ -265,8 +264,6 @@ impl SequencerState {
     ) -> Self {
         Self {
             sequencer,
-            retained_body_limit: ZakuraBlockSyncConfig::default()
-                .effective_max_reorder_lookahead_bytes(),
             finalized_height: frontiers.finalized_height,
             verified_block_hash: frontiers.verified_block_hash,
             reset_epoch: 0,
@@ -279,10 +276,6 @@ impl SequencerState {
             submission_retry: SubmissionRetry::default(),
             pending_evidence: VecDeque::new(),
         }
-    }
-
-    pub(super) fn set_retained_body_limit(&mut self, limit: u64) {
-        self.retained_body_limit = limit;
     }
 
     /// Seed the synchronous state-write coordinate from the startup snapshot.
@@ -381,6 +374,7 @@ impl SequencerState {
         SequencerView {
             verified_tip: self.sequencer.verified_tip(),
             verified_hash: self.verified_block_hash,
+            commit_window_top: self.sequencer.commit_window_top(),
             download_floor: self.sequencer.floor(),
             finalized: self.finalized_height,
             reset_epoch: self.reset_epoch,
@@ -430,11 +424,7 @@ impl SequencerState {
             return BodyAcceptance::StaleScope;
         }
         if !super::super::admission::retain_received_body(
-            self.retained_body_limit,
-            self.sequencer.verified_tip(),
-            self.sequencer
-                .reorder_buffered_bytes()
-                .saturating_add(self.sequencer.applying_buffered_bytes()),
+            self.sequencer.commit_window_top(),
             u64::try_from(
                 self.sequencer
                     .reorder_len()
@@ -442,7 +432,6 @@ impl SequencerState {
             )
             .unwrap_or(u64::MAX),
             body.height,
-            body.bytes,
         ) && !self.sequencer.already_retains(body.height, body.hash)
         {
             return BodyAcceptance::RetentionDeferred {
@@ -880,9 +869,11 @@ impl SequencerState {
             return (false, released);
         }
         let Some((semantic_owner, semantic_state_version)) = semantic_completion else {
-            let _ = self.sequencer.remove_applying(height);
+            // Finish the submission first, so its body releases rather than
+            // detaches.
             self.sequencer
                 .finish_submission(owner, source, token, height, hash);
+            let _ = self.sequencer.remove_applying(height);
             // Removing this submitted body can leave the decoded-cap window with
             // nothing submitted, so wake its pending work (see
             // `Sequencer::submission_admitted`). With nothing pending, a stale
@@ -937,6 +928,10 @@ impl SequencerState {
                 .finish_attached_submission(owner, source, token, height, hash);
             return (false, true);
         }
+        // Finish the submission first, so its body releases rather than
+        // detaches.
+        self.sequencer
+            .finish_submission(owner, source, token, height, hash);
         let applying = self
             .sequencer
             .remove_applying(height)
@@ -947,8 +942,6 @@ impl SequencerState {
         if !cfg!(feature = "sync-metrics") && matches!(result, BlockApplyResult::Committed) {
             outputs.committed_bytes = Some(applying.bytes);
         }
-        self.sequencer
-            .finish_submission(owner, source, token, height, hash);
         match result {
             BlockApplyResult::Committed | BlockApplyResult::Duplicate => {}
             BlockApplyResult::Rejected
@@ -1161,7 +1154,7 @@ impl SequencerState {
         Some(SubmissionBody {
             id: facts.id,
             admission: super::super::admission::submission_decode_admission(
-                self.sequencer.verified_tip(),
+                self.sequencer.commit_window_top(),
                 height,
             ),
         })

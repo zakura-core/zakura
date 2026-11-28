@@ -29,7 +29,9 @@ use zakura_quic::NodeId;
 use zakura_sim::{
     domain::discovery::{is_source, late_answer, LateAnswer, LATE_RESPONSE_ADMITTED},
     harness::{
-        discovery_service::{DiscoveryWire, NodeHandle, SavedPlan, WireScenario, RELAYED},
+        discovery_service::{
+            DiscoveryWire, NodeHandle, SavedPlan, WireScenario, EXCHANGE_BUDGET_MS, RELAYED,
+        },
         run_prepared, HarnessError, Subsystem,
     },
     observe::TransportFact,
@@ -114,9 +116,8 @@ fn closes(report: &RunReport) -> Vec<(u64, String)> {
 }
 
 /// How long after the node admitted its first discovery session the node
-/// closed that session's connection, and how many timers fired between the
-/// two.
-fn admission_to_close(report: &RunReport) -> (Duration, usize) {
+/// closed that session's connection.
+fn admission_to_close(report: &RunReport) -> Duration {
     let entries = report.log.entries();
     let times = times(report);
     let (admitted, connection) = entries
@@ -136,14 +137,27 @@ fn admission_to_close(report: &RunReport) -> (Duration, usize) {
                 Observation::ConnectionClosed { connection: closed, .. } if *closed == connection)
         })
         .expect("the node closed the session's connection");
-    let fired = entries[admitted..closed]
+    times[closed] - times[admitted]
+}
+
+/// The distinct times, after the node admitted its first discovery session,
+/// at which the node's discovery source ran, in order. Something woke the
+/// source at each time after the first.
+fn source_runs(report: &RunReport) -> Vec<Duration> {
+    let entries = report.log.entries();
+    let times = times(report);
+    let admitted = entries
         .iter()
-        .map(|entry| match entry.obs {
-            Observation::TimeAdvanced { fired, .. } => fired,
-            _ => 0,
+        .position(|entry| {
+            matches!(entry.obs, Observation::Session { kind, .. } if kind == ZAKURA_STREAM_DISCOVERY)
         })
-        .sum();
-    (times[closed] - times[admitted], fired)
+        .expect("the node admitted a discovery session");
+    let mut runs: Vec<Duration> = (admitted..entries.len())
+        .filter(|&at| entries[at].obs.ran_task().is_some_and(is_source))
+        .map(|at| times[at] - times[admitted])
+        .collect();
+    runs.dedup();
+    runs
 }
 
 /// The rows of the peers' discovery `PeerFrame`s on `connection`, with
@@ -168,7 +182,10 @@ fn peer_frames(report: &RunReport, connection: u64) -> Vec<(&str, &'static str)>
         .collect()
 }
 
-/// How long after the initial exchange timeout the timed-out session's
+/// The node's discovery-only exchange budget ([`EXCHANGE_BUDGET_MS`]).
+const EXCHANGE_BUDGET: Duration = Duration::from_millis(EXCHANGE_BUDGET_MS);
+
+/// How long after [`EXCHANGE_BUDGET`] a listening node's discovery-only
 /// connection may close: the close waits for scheduled tasks to run.
 const TIMEOUT_SLACK: Duration = Duration::from_millis(100);
 
@@ -329,18 +346,17 @@ fn assert_applied(plan: SavedPlan, report: &RunReport) {
 /// or applies one its history doesn't ([`assert_applied`]), and each shows
 /// its history:
 ///
-/// - `exchange`: the peer's three answers are conformant, and the node
-///   closes with `discovery_exchange_complete` before any timer fires after
-///   the session's admission. The initial wait ends on cancellation,
-///   `wait_complete` or its timer, and a cancelled wait closes nothing, so
-///   `wait_complete` woke the node. A wait that times out closes the same
-///   way once its answer wait ends. The book holds the record the peer
-///   relayed. The peer's own `Hello` names its private `10.x` address, so
-///   the node drops that record.
-/// - `timed-out`: the node closes with `discovery_exchange_timed_out` once
-///   its initial wait's timer fires and its answer wait ends, later after
-///   admission than `exchange` closes, and before the peer's held `Hello`
-///   goes.
+/// - `exchange`: the peer's three answers are conformant, and
+///   `wait_complete` ends the node's initial wait: the node's discovery
+///   source runs at the session's admission and next at the close, so the
+///   wait's timer never woke it. The node listens, and its dialer never
+///   hangs up, so it holds the connection until [`EXCHANGE_BUDGET`], then
+///   closes with `discovery_exchange_complete`. The book holds the record
+///   the peer relayed. The peer's own `Hello` names its private `10.x`
+///   address, so the node drops that record.
+/// - `timed-out`: the initial wait's timer wakes the source, the node holds
+///   the connection until the same budget, and closes with
+///   `discovery_exchange_timed_out` before the peer's held `Hello` goes.
 /// - `verification`: the peer's `Hello` verifies on one `discovery_verify`
 ///   task, and its `Peers` on another, which checks every relayed record.
 ///   Every relayed record enters the book. The run doesn't show the
@@ -355,7 +371,7 @@ fn assert_applied(plan: SavedPlan, report: &RunReport) {
 ///
 #[test]
 fn saved_plans_show_their_histories() {
-    let mut waits = Vec::new();
+    let budget = EXCHANGE_BUDGET..EXCHANGE_BUDGET + TIMEOUT_SLACK;
     for plan in SavedPlan::ALL {
         let name = plan.name();
         assert_eq!(DiscoveryWire::draw(&plan.tag()), plan.scenario(), "{name}");
@@ -376,9 +392,17 @@ fn saved_plans_show_their_histories() {
                     book_record(&handle, relayed_node(0)),
                     "{name}: no relayed record"
                 );
-                let (wait, fired) = admission_to_close(&report);
-                assert_eq!(fired, 0, "{name}: a timer fired before the close");
-                waits.push((plan, wait));
+                let wait = admission_to_close(&report);
+                assert!(
+                    budget.contains(&wait),
+                    "{name}: the node closed {wait:?} after admission, the budget is \
+                     {EXCHANGE_BUDGET:?}"
+                );
+                assert_eq!(
+                    source_runs(&report),
+                    [Duration::ZERO, wait],
+                    "{name}: something woke the source before its close"
+                );
             }
             SavedPlan::TimedOut => {
                 let [(connection, cause)] = &closes[..] else {
@@ -390,17 +414,19 @@ fn saved_plans_show_their_histories() {
                     [("peers", "conformant"), ("services", "conformant")],
                     "{name}: the held Hello never goes"
                 );
-                let (wait, fired) = admission_to_close(&report);
-                assert_ne!(fired, 0, "{name}: no timer ended the initial wait");
-                // The node's own timeout ends the wait, not a later timer.
+                let wait = admission_to_close(&report);
                 assert!(
-                    (DISCOVERY_INITIAL_EXCHANGE_TIMEOUT
-                        ..DISCOVERY_INITIAL_EXCHANGE_TIMEOUT + TIMEOUT_SLACK)
-                        .contains(&wait),
-                    "{name}: the initial wait lasted {wait:?}, the timeout is \
-                     {DISCOVERY_INITIAL_EXCHANGE_TIMEOUT:?}"
+                    budget.contains(&wait),
+                    "{name}: the node closed {wait:?} after admission, the budget is \
+                     {EXCHANGE_BUDGET:?}"
                 );
-                waits.push((plan, wait));
+                // The node's own timeout ends the initial wait, not a later
+                // timer.
+                assert_eq!(
+                    source_runs(&report),
+                    [Duration::ZERO, DISCOVERY_INITIAL_EXCHANGE_TIMEOUT, wait],
+                    "{name}: the initial wait's timer didn't wake the source"
+                );
             }
             SavedPlan::Verification => {
                 assert_eq!(
@@ -462,13 +488,6 @@ fn saved_plans_show_their_histories() {
             }
         }
     }
-    let [(SavedPlan::Exchange, completed), (SavedPlan::TimedOut, timed_out)] = waits[..] else {
-        panic!("{waits:?}");
-    };
-    assert!(
-        completed < timed_out,
-        "the exchange closed {completed:?} after admission, the timeout {timed_out:?}"
-    );
 }
 
 /// A/A and A/B/A: each saved Plan, run twice, then after the next saved

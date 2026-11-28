@@ -1651,6 +1651,9 @@ impl PeerQueryReserve {
 pub struct ZakuraDiscoveryHandle {
     /// Ordinary slot budget shared by discovery scheduling and connection admission.
     pub(crate) ordinary_connection_cap: usize,
+    /// Ordinary outbound connections discovery dials up to. See
+    /// [`discovery_outbound_target`].
+    pub(crate) ordinary_outbound_target: usize,
     inner: Arc<AsyncMutex<DiscoveryState>>,
     connected: watch::Receiver<Vec<ZakuraPeerId>>,
     self_record: watch::Receiver<Arc<ZakuraNodeRecord>>,
@@ -1773,6 +1776,10 @@ impl ZakuraDiscoveryHandle {
             local.next_body(now_unix_secs, wall_clock_sequence, config.record_ttl),
             &signing_key,
         )?);
+        let ordinary_outbound_target = discovery_outbound_target(
+            config.max_zakura_connections,
+            config.discovery_connection_headroom,
+        );
         let (self_record_tx, self_record_rx) = watch::channel(self_record);
         let (peer_snapshot_tx, peer_snapshot_rx) =
             watch::channel(ServicePeerSnapshot::new(0, 0, config.peer_limits));
@@ -1784,6 +1791,7 @@ impl ZakuraDiscoveryHandle {
         let verification_context = state.validation_context(now_unix_secs);
         Ok(Self {
             ordinary_connection_cap,
+            ordinary_outbound_target,
             inner: Arc::new(AsyncMutex::new(state)),
             connected,
             self_record: self_record_rx,
@@ -1945,7 +1953,8 @@ impl ZakuraDiscoveryHandle {
     }
 
     /// Builds the next peer query unless this stream queried recently and the
-    /// node has both a full connection set and a reserve of dialable peers.
+    /// node holds its outbound target in registered peers with a reserve of
+    /// dialable peers (see [`Self::update_peer_query_reserve`]).
     pub(super) async fn next_peer_query(
         &self,
         last_sent: Option<zakura_rt::time::Instant>,
@@ -1974,7 +1983,13 @@ impl ZakuraDiscoveryHandle {
     }
 
     /// Records two replacement candidates that pass the ordinary dialer's live
-    /// route and identity checks. No outbound connection is started or reserved.
+    /// route and identity checks once the registered ordinary peers reach
+    /// [`Self::ordinary_outbound_target`]. No outbound connection is started
+    /// or reserved.
+    ///
+    /// Peers count in either direction. A node that holds that many, with two
+    /// spares to dial, needs no new addresses soon. A node still short of
+    /// outbound peers dials the spares, and queries resume once they run out.
     pub(super) async fn update_peer_query_reserve(
         &self,
         held: &HeldPlaces,
@@ -1988,7 +2003,7 @@ impl ZakuraDiscoveryHandle {
             .count();
         let mut state = self.inner.lock().await;
         let previous = state.peer_query_reserve.take();
-        if ordinary < self.ordinary_connection_cap {
+        if ordinary < self.ordinary_outbound_target {
             return;
         }
 
@@ -4191,6 +4206,24 @@ fn connected_peer_node_ids(connected: &[ZakuraPeerId]) -> Vec<NodeId> {
 
 fn discovery_ordinary_cap(max_connections: usize, connection_headroom: usize) -> usize {
     max_connections.saturating_sub(connection_headroom)
+}
+
+/// Returns the ordinary outbound connections discovery dials up to: the
+/// transport's outbound reserve, 23 of the default 92, within the soft cap of
+/// [`discovery_dial_slot_limit`].
+///
+/// Each dial takes an inbound slot on the peer it reaches. Without the
+/// target, reachable nodes fill each other's slots up to the soft cap and
+/// leave only the few above it for nodes whose records carry no address,
+/// which can only dial.
+/// The target stays above the headroom, so at the connection budget floor a
+/// node that holds only its bootstrap peers, such as a seed holding every
+/// other seed, still has a discovery dial left (see `min_budgeted_connections`).
+fn discovery_outbound_target(max_connections: usize, connection_headroom: usize) -> usize {
+    let soft_cap = discovery_ordinary_cap(max_connections, connection_headroom);
+    let outbound_reserve =
+        max_connections - crate::zakura::transport::inbound_share(max_connections);
+    soft_cap.min(outbound_reserve.max(connection_headroom.saturating_add(1)))
 }
 
 /// Returns how many ordinary discovery dials may start.
@@ -11031,6 +11064,54 @@ mod tests {
         );
     }
 
+    /// Issue 2805: discovery stops dialing at its outbound target, so
+    /// reaching that target with two spares slows peer queries, as a full
+    /// connection set does.
+    #[tokio::test]
+    async fn peer_query_backoff_starts_at_the_outbound_target() {
+        use zakura_rt::time::Instant;
+        let (connected_tx, connected_rx) = watch::channel(Vec::new());
+        let handle = discovery_handle_at(
+            local_config_with(secret_key(), vec![test_addr(48)], vec![service(1)]),
+            ZakuraDiscoveryConfig {
+                max_zakura_connections: 92,
+                discovery_connection_headroom: 9,
+                ..ZakuraDiscoveryConfig::default()
+            },
+            connected_rx,
+            NOW,
+        );
+        assert_eq!(handle.ordinary_outbound_target, 23);
+        for i in 1..=2 {
+            import_hello_record(
+                &handle,
+                runtime_record_with(i.into(), service(1), test_addr(i)),
+            )
+            .await;
+        }
+        let peers: Vec<_> = (0..23)
+            .map(|_| peer_id_for(secret_key().public()))
+            .collect();
+        let sent = Some(Instant::now());
+
+        connected_tx.send_replace(peers[..22].to_vec());
+        handle
+            .update_peer_query_reserve(&HeldPlaces::default(), |_| true)
+            .await;
+        assert!(
+            handle.next_peer_query(sent).await.is_some(),
+            "below the target"
+        );
+        connected_tx.send_replace(peers);
+        handle
+            .update_peer_query_reserve(&HeldPlaces::default(), |_| true)
+            .await;
+        assert!(
+            handle.next_peer_query(sent).await.is_none(),
+            "at the target with two spares"
+        );
+    }
+
     #[tokio::test]
     async fn dial_candidates_exclude_connected_peers_and_respect_soft_cap() {
         let (connected_tx, connected_rx) = watch::channel(Vec::new());
@@ -11171,6 +11252,29 @@ mod tests {
         assert_eq!(discovery_dial_slot_limit(5, 1, 8, 2, 4), 1);
         assert_eq!(discovery_dial_slot_limit(6, 4, 8, 2, 4), 0);
         assert_eq!(discovery_dial_slot_limit(2, 0, 2, 4, 4), 0);
+    }
+
+    /// Discovery dials up to the outbound reserve, and at the connection
+    /// budget floor a node that holds only its bootstrap peers still has a
+    /// dial left.
+    #[test]
+    fn the_outbound_target_is_the_reserve_above_the_bootstrap_headroom() {
+        use crate::zakura::{
+            discovery::effective_discovery_connection_headroom, min_budgeted_connections,
+        };
+
+        assert_eq!(discovery_outbound_target(92, 9), 23);
+        assert_eq!(discovery_outbound_target(92, 4), 23);
+        assert_eq!(discovery_outbound_target(16, 4), 5);
+        assert_eq!(discovery_outbound_target(6, 4), 2);
+        for bootstrap_peers in [0, 3, 9, 20, 100] {
+            let floor = min_budgeted_connections(bootstrap_peers);
+            let headroom = effective_discovery_connection_headroom(bootstrap_peers);
+            assert!(
+                discovery_outbound_target(floor, headroom) > bootstrap_peers,
+                "{bootstrap_peers} bootstrap peers"
+            );
+        }
     }
 
     proptest::proptest! {

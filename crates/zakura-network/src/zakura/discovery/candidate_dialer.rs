@@ -489,7 +489,10 @@ async fn admit_dial_round(
         .discovery_admission_capacity()
         .saturating_sub(preferred.address_attempts);
     let mut free_permits = endpoint
-        .discovery_dial_permits(discovery.ordinary_connection_cap)
+        .discovery_dial_permits(
+            discovery.ordinary_connection_cap,
+            discovery.ordinary_outbound_target,
+        )
         .min(
             endpoint
                 .preferred_dial_permits()

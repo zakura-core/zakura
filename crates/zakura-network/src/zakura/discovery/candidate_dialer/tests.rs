@@ -1862,6 +1862,61 @@ async fn the_dialer_loop_sleeps_until_the_round_deadline_after_a_completion() {
     node.shutdown().await;
 }
 
+/// The discovery dials `node` may start now.
+fn dial_permits(node: &crate::zakura::testkit::ZakuraTestNode) -> usize {
+    let discovery = node.discovery();
+    node.endpoint().discovery_dial_permits(
+        discovery.ordinary_connection_cap,
+        discovery.ordinary_outbound_target,
+    )
+}
+
+/// Issue 2805: discovery dials only up to the outbound reserve, 23 of 92
+/// slots, whether or not the node advertises an address, so reachable nodes
+/// leave inbound room for nodes that can only dial. Inbound slots don't use up
+/// the target, but the soft cap still counts them.
+#[tokio::test]
+async fn discovery_dials_only_to_the_outbound_target() {
+    use crate::zakura::testkit::ZakuraTestNode;
+    let mut limits = ZakuraLocalLimits::from_config(&crate::Config::default());
+    limits.max_connections = 92;
+    let hidden = ZakuraTestNode::builder(9380)
+        .limits(limits.clone())
+        .spawn()
+        .await
+        .expect("node spawns");
+    let advertised = ZakuraTestNode::builder(9381)
+        .limits(limits)
+        .discovery_direct_addrs(vec![SocketAddr::from(([93, 184, 216, 34], 8234))])
+        .spawn()
+        .await
+        .expect("node spawns");
+    assert_eq!(dial_permits(&hidden), 23);
+    assert_eq!(dial_permits(&advertised), 23);
+
+    // With no bootstrap peers the headroom is 4, so the soft cap is 88.
+    let endpoint = advertised.endpoint();
+    let inbound = endpoint.hold_connection_slots(40, true);
+    assert_eq!(
+        dial_permits(&advertised),
+        23,
+        "inbound slots leave the target"
+    );
+    let outbound = endpoint.hold_connection_slots(23, false);
+    assert_eq!(dial_permits(&advertised), 0);
+    drop(outbound);
+    let more_inbound = endpoint.hold_connection_slots(29, true);
+    assert_eq!(
+        dial_permits(&advertised),
+        88 - 69,
+        "the soft cap still counts inbound slots"
+    );
+    drop((inbound, more_inbound));
+
+    hidden.shutdown().await;
+    advertised.shutdown().await;
+}
+
 // V12 F-583: each dial holds one of the handler's connection slots from its
 // start. A round that counted only the transport's free slots could admit
 // more dials than free slots, and the extra workers then failed as local
@@ -1873,12 +1928,10 @@ async fn a_round_admits_no_more_dials_than_free_admission_permits() {
         .await
         .expect("dialer spawns");
     let endpoint = node.endpoint();
-    let permits = endpoint.discovery_dial_permits(node.discovery().ordinary_connection_cap);
-    let held = endpoint.hold_connection_slots(permits - 1, false);
-    assert_eq!(
-        endpoint.discovery_dial_permits(node.discovery().ordinary_connection_cap),
-        1
-    );
+    // Inbound slots leave the outbound target alone, so only the ordinary cap
+    // limits this round.
+    let held = endpoint.hold_connection_slots(node.discovery().ordinary_connection_cap - 1, true);
+    assert_eq!(dial_permits(&node), 1);
     assert!(
         endpoint.discovery_admission_capacity() >= 3,
         "the transport has a slot for each candidate"

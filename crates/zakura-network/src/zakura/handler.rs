@@ -1493,14 +1493,22 @@ impl ZakuraEndpoint {
     }
 
     /// How many dials discovery can start now: the handler's free ordinary
-    /// connection slots, which leave the places held for preferred gateways.
+    /// connection slots, which leave the places held for preferred gateways,
+    /// and no more than bring the ordinary outbound slots to
+    /// `outbound_target`. Inbound slots don't count against the target.
     /// Each dial holds one slot from its start, or fails as a local limit
     /// without one.
-    pub(crate) fn discovery_dial_permits(&self, ordinary_cap: usize) -> usize {
-        self.supervisor
-            .ip_slots
-            .counts()
-            .free_ordinary_connections(ordinary_cap.min(self.handler.limits.max_connections))
+    pub(crate) fn discovery_dial_permits(
+        &self,
+        ordinary_cap: usize,
+        outbound_target: usize,
+    ) -> usize {
+        let split = self.supervisor.ip_slots.counts().slot_split();
+        let ordinary_outbound = split.ordinary.saturating_sub(split.ordinary_inbound);
+        ordinary_cap
+            .min(self.handler.limits.max_connections)
+            .saturating_sub(split.ordinary)
+            .min(outbound_target.saturating_sub(ordinary_outbound))
     }
 
     /// How many dials to preferred gateways can start now: every free

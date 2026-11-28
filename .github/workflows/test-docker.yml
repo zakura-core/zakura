@@ -143,6 +143,56 @@ jobs:
           echo "default-config container did not start within 60 seconds" >&2
           exit 1
 
+      - name: Test non-root startup with a read-only root
+        env:
+          IMAGE: zakurad-runtime-test:${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          # The entrypoint must not try to change ownership when it isn't root,
+          # so a hardened container with a root-owned, group-writable cache
+          # still starts.
+          container=zakura-non-root
+          cleanup() {
+            status=$?
+            trap - EXIT
+            if (( status != 0 )); then
+              docker logs "$container" 2>&1 || true
+            fi
+            docker rm --force "$container" >/dev/null 2>&1 || true
+            exit "$status"
+          }
+          trap cleanup EXIT
+
+          docker run \
+            --detach \
+            --name "$container" \
+            --user 10001:10001 \
+            --cap-drop=ALL \
+            --read-only \
+            --tmpfs /home/zebra/.cache:rw,size=64m,uid=0,gid=10001,mode=0770 \
+            --env ZAKURA_NETWORK__NETWORK=Regtest \
+            --env ZAKURA_STATE__CACHE_DIR=/home/zebra/.cache/zakura \
+            --env ZAKURA_RPC__COOKIE_DIR=/home/zebra/.cache/zakura \
+            "$IMAGE" \
+            zakurad start
+
+          for _ in {1..60}; do
+            logs=$(docker logs "$container" 2>&1)
+            if grep -Fq "Opened Zakura state cache at /home/zebra/.cache/zakura" <<< "$logs"; then
+              exit 0
+            fi
+
+            if [[ $(docker inspect --format '{{.State.Running}}' "$container") != true ]]; then
+              echo "non-root container exited before startup completed" >&2
+              exit 1
+            fi
+            sleep 1
+          done
+
+          echo "non-root container did not start within 60 seconds" >&2
+          exit 1
+
       - name: Test combined configuration overrides
         env:
           IMAGE: zakurad-runtime-test:${{ github.sha }}

@@ -33,7 +33,6 @@
 use zakura_chain::{
     block::{Header, Height},
     parameters::{Network, NetworkUpgrade, MAX_POW_AVERAGING_WINDOW},
-    transparent,
     work::difficulty::{ExpandedDifficulty, ParameterDifficulty as _, U256},
 };
 use zakura_header_chain::{
@@ -167,9 +166,8 @@ pub fn check_binding_and_height(
         binding.light_client_root,
     )
     .map_err(|_| invalid_binding)?;
-    let height = match coinbase.inputs().first() {
-        Some(transparent::Input::Coinbase { height, .. }) => height.0,
-        _ => return Err(invalid_binding),
+    let Some(height) = coinbase.coinbase_height().map(|height| height.0) else {
+        return Err(invalid_binding);
     };
     if height <= top || height > top.saturating_add(PROPAGATION_DEPTH) {
         return Err(UnknownParentVerdict::Drop);

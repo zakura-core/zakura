@@ -1130,7 +1130,8 @@ fn library_verifier_rejects_invalid_value_commitments_that_now_convert() {
         let item = item(tx, nu).expect(
             "librustzcash conversion keeps a Sapling cv as bytes, so even an invalid cv converts",
         );
-        sapling_crypto::BatchValidator::new().check_bundle(item.bundle, item.sighash.into())
+        sapling_crypto::BatchValidator::new()
+            .check_bundle(item.bundle, <[u8; 32]>::from(item.sighash))
     };
 
     assert!(

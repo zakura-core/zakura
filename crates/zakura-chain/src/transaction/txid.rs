@@ -29,6 +29,7 @@ impl<'a> TxIdBuilder<'a> {
             | Transaction::V4 { .. } => self.txid_v1_to_v4(),
             Transaction::V5 { .. } => self.txid_v5(),
             Transaction::V6 { .. } => self.txid_v6(),
+            Transaction::V7 { .. } => Some(super::v7::V7Ref::of(self.trans)?.txid()),
         }
     }
 

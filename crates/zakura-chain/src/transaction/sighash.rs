@@ -7,7 +7,11 @@ use std::sync::Arc;
 use zcash_protocol::value::ZatBalance;
 use zcash_transparent::sighash::SighashType;
 
-use super::{zip244::Zip244SighashCache, Transaction};
+use super::{
+    v7::{ShieldedBundle, ShieldedSighashes, V7SighashCache},
+    zip244::Zip244SighashCache,
+    Transaction,
+};
 
 use crate::parameters::NetworkUpgrade;
 use crate::{transparent, Error};
@@ -158,6 +162,7 @@ pub struct SigHasher {
     precomputed_tx_data: PrecomputedTxData,
     v4: Option<V4Sighash>,
     zip244: Option<Zip244SighashCache>,
+    v7: Option<V7SighashCache>,
 }
 
 impl SigHasher {
@@ -181,6 +186,7 @@ impl SigHasher {
             precomputed_tx_data,
             v4: V4Sighash::new(trans, nu, &all_previous_outputs),
             zip244: Zip244SighashCache::new(trans, &all_previous_outputs),
+            v7: V7SighashCache::new(trans, &all_previous_outputs),
         })
     }
 
@@ -203,11 +209,18 @@ impl SigHasher {
     /// - If the input index is out of bounds for the transaction inputs.
     /// - If a V5 or later `SIGHASH_SINGLE` transparent input does not have a
     ///   corresponding output.
+    /// - If the transaction is v7, whose signatures each sign their own digest: use
+    ///   [`SigHasher::v7_transparent_sighash`] and [`SigHasher::v7_shielded_sighashes`].
     pub fn sighash(
         &self,
         hash_type: HashType,
         input_index_script_code: Option<(usize, Vec<u8>)>,
     ) -> SigHash {
+        assert!(
+            self.v7.is_none(),
+            "v7 signature digests are per signature: use the v7 sighash methods",
+        );
+
         let canonical_hash_type =
             CanonicalHashType::try_from(hash_type).expect("hash type should be canonical");
 
@@ -286,6 +299,31 @@ impl SigHasher {
             raw_hash_type,
             input_index_script_code,
         )
+    }
+
+    /// Returns the digest that a v7 transparent signature on the input at `input_index`
+    /// signs ([ZIP 248] sighash variant 0).
+    ///
+    /// Returns `None`, so that the signature check fails, if the transaction is not v7,
+    /// if `hash_type` is not `SIGHASH_ALL` (the only hash type variant 0 signs), if the
+    /// input does not exist, or if the spent outputs do not match the inputs.
+    ///
+    /// [ZIP 248]: https://zips.z.cash/zip-0248
+    pub fn v7_transparent_sighash(
+        &self,
+        hash_type: HashType,
+        input_index: usize,
+    ) -> Option<SigHash> {
+        self.v7.as_ref()?.transparent(hash_type, input_index)
+    }
+
+    /// Returns the digests that the signatures of a v7 transaction's Sapling, Orchard, or
+    /// Ironwood bundle sign, for that bundle's batch validator.
+    ///
+    /// Returns `None` if the transaction is not v7, has no such bundle, or its spent
+    /// outputs do not match its inputs.
+    pub fn v7_shielded_sighashes(&self, bundle: ShieldedBundle) -> Option<ShieldedSighashes> {
+        self.v7.as_ref()?.shielded(bundle)
     }
 
     /// Returns the Orchard bundle in the precomputed transaction data.

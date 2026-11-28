@@ -574,6 +574,10 @@ where
             Transaction::V6 {
                 sapling_shielded_data,
                 ..
+            }
+            | Transaction::V7 {
+                sapling_shielded_data,
+                ..
             } => *sapling_shielded_data = None,
             Transaction::V1 { .. } | Transaction::V2 { .. } | Transaction::V3 { .. } => {}
         }

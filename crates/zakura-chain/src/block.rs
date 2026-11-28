@@ -221,11 +221,7 @@ impl BlockRef {
         self.0
             .transactions
             .first()
-            .and_then(|tx| tx.inputs().first())
-            .and_then(|input| match input {
-                transparent::Input::Coinbase { ref height, .. } => Some(*height),
-                _ => None,
-            })
+            .and_then(|tx| tx.coinbase_height())
     }
 
     /// Compute the hash of this block.

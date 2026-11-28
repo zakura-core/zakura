@@ -1603,7 +1603,8 @@ fn distinct(count: usize) -> Vec<VerifiedUnminedTx> {
                 | Transaction::V3 { lock_time, .. }
                 | Transaction::V4 { lock_time, .. }
                 | Transaction::V5 { lock_time, .. }
-                | Transaction::V6 { lock_time, .. } => *lock_time = LockTime::Height(height),
+                | Transaction::V6 { lock_time, .. }
+                | Transaction::V7 { lock_time, .. } => *lock_time = LockTime::Height(height),
             }
             VerifiedUnminedTx {
                 transaction: UnminedTx::from(transaction),

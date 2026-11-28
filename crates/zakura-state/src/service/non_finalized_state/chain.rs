@@ -2069,7 +2069,7 @@ impl Chain {
                     sapling_shielded_data,
                     &None,
                     &None,
-                    &None::<ironwood::ShieldedData>,
+                    None::<&ironwood::ShieldedData>,
                 ),
                 V5 {
                     inputs,
@@ -2082,7 +2082,7 @@ impl Chain {
                     &None,
                     sapling_shielded_data,
                     orchard_shielded_data,
-                    &None::<ironwood::ShieldedData>,
+                    None::<&ironwood::ShieldedData>,
                 ),
                 V6 {
                     inputs,
@@ -2096,7 +2096,21 @@ impl Chain {
                     &None,
                     sapling_shielded_data,
                     orchard_shielded_data,
+                    ironwood_shielded_data.as_ref(),
+                ),
+                V7 {
+                    inputs,
+                    sapling_shielded_data,
+                    orchard_shielded_data,
                     ironwood_shielded_data,
+                    ..
+                } => (
+                    inputs,
+                    &None,
+                    &None,
+                    sapling_shielded_data,
+                    orchard_shielded_data,
+                    ironwood_shielded_data.as_deref(),
                 ),
 
                 V1 { .. } | V2 { .. } | V3 { .. } => unreachable!(
@@ -2125,7 +2139,7 @@ impl Chain {
                     &transaction_hash,
                 ))?;
                 self.update_chain_tip_with(&(orchard_shielded_data, &transaction_hash))?;
-                self.update_chain_tip_with(&(ironwood_shielded_data.as_ref(), &transaction_hash))?;
+                self.update_chain_tip_with(&(ironwood_shielded_data, &transaction_hash))?;
             }
 
             // add key `transaction.hash` and value `(height, tx_index)` to `tx_loc_by_hash`
@@ -2285,7 +2299,7 @@ impl UpdateWith<ContextuallyVerifiedBlock> for Chain {
                     sapling_shielded_data,
                     &None,
                     &None,
-                    &None::<ironwood::ShieldedData>,
+                    None::<&ironwood::ShieldedData>,
                 ),
                 V5 {
                     inputs,
@@ -2298,7 +2312,7 @@ impl UpdateWith<ContextuallyVerifiedBlock> for Chain {
                     &None,
                     sapling_shielded_data,
                     orchard_shielded_data,
-                    &None::<ironwood::ShieldedData>,
+                    None::<&ironwood::ShieldedData>,
                 ),
                 V6 {
                     inputs,
@@ -2312,7 +2326,21 @@ impl UpdateWith<ContextuallyVerifiedBlock> for Chain {
                     &None,
                     sapling_shielded_data,
                     orchard_shielded_data,
+                    ironwood_shielded_data.as_ref(),
+                ),
+                V7 {
+                    inputs,
+                    sapling_shielded_data,
+                    orchard_shielded_data,
                     ironwood_shielded_data,
+                    ..
+                } => (
+                    inputs,
+                    &None,
+                    &None,
+                    sapling_shielded_data,
+                    orchard_shielded_data,
+                    ironwood_shielded_data.as_deref(),
                 ),
 
                 V1 { .. } | V2 { .. } | V3 { .. } => unreachable!(
@@ -2347,10 +2375,7 @@ impl UpdateWith<ContextuallyVerifiedBlock> for Chain {
                 position,
             );
             self.revert_chain_with(&(orchard_shielded_data, transaction_hash), position);
-            self.revert_chain_with(
-                &(ironwood_shielded_data.as_ref(), transaction_hash),
-                position,
-            );
+            self.revert_chain_with(&(ironwood_shielded_data, transaction_hash), position);
         }
 
         // TODO: move these to the shielded UpdateWith.revert...()?

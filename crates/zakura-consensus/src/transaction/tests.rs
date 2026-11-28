@@ -3927,7 +3927,7 @@ fn v4_with_invalid_sapling_proof_returns_typed_error() {
 
         let mut verifier = sapling_crypto::BatchValidator::default();
         assert!(
-            verifier.check_bundle(synchronous_check_bundle, sighash.into()),
+            verifier.check_bundle(synchronous_check_bundle, <[u8; 32]>::from(sighash)),
             "the corrupted proof must pass synchronous checks and fail batch validation"
         );
 
@@ -4098,7 +4098,7 @@ fn v4_with_malformed_sapling_proof_returns_typed_error() {
 
         let mut verifier = sapling_crypto::BatchValidator::default();
         assert!(
-            !verifier.check_bundle(check_bundle, sighash.into()),
+            !verifier.check_bundle(check_bundle, <[u8; 32]>::from(sighash)),
             "the malformed proof must fail synchronous bundle checks"
         );
 

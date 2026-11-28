@@ -23,7 +23,7 @@ use crate::{
 use itertools::Itertools;
 
 use super::{
-    FieldNotPresent, JoinSplitData, JoinSplitPubKey, JoinSplitSig, LockTime, Transaction,
+    v7, FieldNotPresent, JoinSplitData, JoinSplitPubKey, JoinSplitSig, LockTime, Transaction,
     UnminedTx, VerifiedUnminedTx,
 };
 
@@ -176,6 +176,91 @@ impl Transaction {
                         } else {
                             orchard_shielded_data.map(Box::new)
                         },
+                    }
+                },
+            )
+            .boxed()
+    }
+
+    /// Generate a proptest strategy for V7 transactions ([ZIP 248]) that decode: their
+    /// inputs spend previous outputs, their Orchard flags fit each pool, their
+    /// Orchard-protocol proofs have the canonical size, and a coinbase transaction has no
+    /// Sapling spends.
+    ///
+    /// Default strategies never generate v7 transactions, so this is not tied to a
+    /// ledger state.
+    ///
+    /// [ZIP 248]: https://zips.z.cash/zip-0248
+    pub fn v7_strategy() -> BoxedStrategy<Self> {
+        let prevout_input = (
+            any::<transparent::OutPoint>(),
+            any::<transparent::Script>(),
+            any::<u32>(),
+        )
+            .prop_map(
+                |(outpoint, unlock_script, sequence)| transparent::Input::PrevOut {
+                    outpoint,
+                    unlock_script,
+                    sequence,
+                },
+            );
+        let ironwood = (any::<orchard::ShieldedData>(), any::<bool>()).prop_map(
+            |(mut data, cross_address)| {
+                data.flags
+                    .set(orchard::Flags::ENABLE_CROSS_ADDRESS, cross_address);
+                data
+            },
+        );
+        (
+            any::<LockTime>(),
+            any::<block::Height>(),
+            vec(prevout_input, 0..MAX_ARBITRARY_ITEMS),
+            vec(any::<transparent::Output>(), 0..MAX_ARBITRARY_ITEMS),
+            option::of(any::<sapling::ShieldedData<sapling::SharedAnchor>>()),
+            option::of(any::<orchard::ShieldedData>()),
+            option::of(ironwood),
+            v7_fields_strategy(),
+        )
+            .prop_map(
+                |(
+                    lock_time,
+                    expiry_height,
+                    mut inputs,
+                    outputs,
+                    mut sapling_shielded_data,
+                    mut orchard_shielded_data,
+                    mut ironwood_shielded_data,
+                    mut v7_fields,
+                )| {
+                    // Fit the parts to the ZIP 248 bundle-local rules, which zcash_primitives
+                    // checks when decoding: a coinbase transaction spends nothing, and a
+                    // transparent or coinbase delta has its bundle.
+                    if v7_fields.coinbase.is_some() {
+                        inputs.clear();
+                        sapling_shielded_data = sapling_shielded_data
+                            .filter(|sapling| sapling.spends().next().is_none());
+                        for data in [&mut orchard_shielded_data, &mut ironwood_shielded_data]
+                            .into_iter()
+                            .flatten()
+                        {
+                            data.flags.remove(orchard::Flags::ENABLE_SPENDS);
+                        }
+                    } else {
+                        v7_fields.value_deltas.coinbase = Amount::zero();
+                    }
+                    if inputs.is_empty() && outputs.is_empty() {
+                        v7_fields.value_deltas.transparent = Amount::zero();
+                    }
+                    Transaction::V7 {
+                        network_upgrade: NetworkUpgrade::Nu7_1,
+                        lock_time,
+                        expiry_height,
+                        inputs,
+                        outputs,
+                        sapling_shielded_data: sapling_shielded_data.map(Box::new),
+                        orchard_shielded_data: orchard_shielded_data.map(Box::new),
+                        ironwood_shielded_data: ironwood_shielded_data.map(Box::new),
+                        v7_fields: Box::new(v7_fields),
                     }
                 },
             )
@@ -868,6 +953,58 @@ impl Arbitrary for VerifiedUnminedTx {
 
 // Utility functions
 
+/// Generates the v7-only value pool deltas and an optional valid coinbase bundle.
+fn v7_fields_strategy() -> BoxedStrategy<v7::V7Fields> {
+    let miner_poll = (vec(any::<u8>(), 1..8), array::uniform16(any::<u8>())).prop_map(
+        |(levels, poll_digest)| {
+            // Distinct ascending signal codes, one per level of support.
+            let signals = levels
+                .into_iter()
+                .enumerate()
+                .map(|(index, level_of_support)| v7::MinerSignal {
+                    signal_code: u8::try_from(index * 31).expect("at most 8 signals"),
+                    level_of_support,
+                })
+                .collect();
+            v7::MinerPoll::new(signals, poll_digest).expect("signals are non-empty and ascending")
+        },
+    );
+    let coinbase = (
+        1..=499_999_999u32,
+        any::<Amount<NonNegative>>(),
+        any::<u64>(),
+        vec(any::<u8>(), 0..=v7::MAX_COINBASE_DATA_LEN),
+        option::of(miner_poll),
+    )
+        .prop_map(
+            |(height, block_subsidy, lockbox_seed, coinbase_data, miner_poll)| {
+                let lockbox_value = Amount::try_from(lockbox_seed % (u64::from(block_subsidy) + 1))
+                    .expect("the lockbox value is at most the block subsidy");
+                v7::CoinbaseBundle::new(
+                    block::Height(height),
+                    block_subsidy,
+                    lockbox_value,
+                    coinbase_data,
+                    miner_poll,
+                )
+                .expect("the generated fields are in range")
+            },
+        );
+    (any::<[Amount<NegativeAllowed>; 4]>(), option::of(coinbase))
+        .prop_map(
+            |([transparent, coinbase_delta, fee, nsm], coinbase)| v7::V7Fields {
+                value_deltas: v7::ValueDeltas {
+                    transparent,
+                    coinbase: coinbase_delta,
+                    fee,
+                    nsm,
+                },
+                coinbase,
+            },
+        )
+        .boxed()
+}
+
 /// Convert `trans` into a fake v5 transaction,
 /// converting sapling shielded data from v4 to v5 if possible.
 pub fn transaction_to_fake_v5(
@@ -942,6 +1079,7 @@ pub fn transaction_to_fake_v5(
         },
         v5 @ V5 { .. } => v5.clone(),
         v6 @ V6 { .. } => v6.clone(),
+        v7 @ V7 { .. } => v7.clone(),
     }
 }
 
@@ -1026,7 +1164,7 @@ pub fn v5_transactions<'b>(
         | Transaction::V3 { .. }
         | Transaction::V4 { .. } => None,
         ref tx @ Transaction::V5 { .. } => Some(tx.clone()),
-        ref tx @ Transaction::V6 { .. } => Some(tx.clone()),
+        ref tx @ Transaction::V6 { .. } | ref tx @ Transaction::V7 { .. } => Some(tx.clone()),
     })
 }
 

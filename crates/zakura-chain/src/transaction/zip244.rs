@@ -44,14 +44,14 @@ use crate::{
 // https://github.com/zcash/librustzcash/blob/4367ba26ed57624544e2350f055a5df89079474a/zcash_primitives/src/transaction/txid.rs#L33-L68
 //
 // txid tree root personalization (`ZcashTxHash_` ‖ consensus_branch_id LE32)
-const ZCASH_TX_PERSONALIZATION_PREFIX: &[u8; 12] = b"ZcashTxHash_";
+pub(super) const ZCASH_TX_PERSONALIZATION_PREFIX: &[u8; 12] = b"ZcashTxHash_";
 const TX_OVERWINTERED_FLAG: u32 = 1 << 31;
 const TX_V5_VERSION: u32 = 5;
 const TX_V6_VERSION: u32 = 6;
 
 // txid level-1 node personalizations
-const ZCASH_HEADERS_HASH_PERSONALIZATION: &[u8; 16] = b"ZTxIdHeadersHash";
-const ZCASH_TRANSPARENT_HASH_PERSONALIZATION: &[u8; 16] = b"ZTxIdTranspaHash";
+pub(super) const ZCASH_HEADERS_HASH_PERSONALIZATION: &[u8; 16] = b"ZTxIdHeadersHash";
+pub(super) const ZCASH_TRANSPARENT_HASH_PERSONALIZATION: &[u8; 16] = b"ZTxIdTranspaHash";
 const ZCASH_SAPLING_HASH_PERSONALIZATION: &[u8; 16] = b"ZTxIdSaplingHash";
 const ZCASH_ORCHARD_HASH_PERSONALIZATION: &[u8; 16] = b"ZTxIdOrchardHash";
 const ZCASH_ORCHARD_V6_HASH_PERSONALIZATION: &[u8; 16] = b"ZTxIdOrchardH_v6";
@@ -86,8 +86,8 @@ const ZCASH_IRONWOOD_ACTIONS_MEMOS_HASH_PERSONALIZATION: &[u8; 16] = b"ZTxIdIrnA
 const ZCASH_IRONWOOD_ACTIONS_NONCOMPACT_HASH_PERSONALIZATION: &[u8; 16] = b"ZTxIdIrnActNH_v6";
 
 // auth-digest tree root personalization (`ZTxAuthHash_` ‖ consensus_branch_id LE32)
-const ZCASH_AUTH_PERSONALIZATION_PREFIX: &[u8; 12] = b"ZTxAuthHash_";
-const ZCASH_TRANSPARENT_SCRIPTS_HASH_PERSONALIZATION: &[u8; 16] = b"ZTxAuthTransHash";
+pub(super) const ZCASH_AUTH_PERSONALIZATION_PREFIX: &[u8; 12] = b"ZTxAuthHash_";
+pub(super) const ZCASH_TRANSPARENT_SCRIPTS_HASH_PERSONALIZATION: &[u8; 16] = b"ZTxAuthTransHash";
 const ZCASH_SAPLING_SIGS_HASH_PERSONALIZATION: &[u8; 16] = b"ZTxAuthSapliHash";
 const ZCASH_SAPLING_V6_SIGS_HASH_PERSONALIZATION: &[u8; 16] = b"ZTxAuthSapliH_v6";
 const ZCASH_ORCHARD_SIGS_HASH_PERSONALIZATION: &[u8; 16] = b"ZTxAuthOrchaHash";
@@ -148,12 +148,12 @@ const EMPTY_IRONWOOD_AUTH_HASH: &[u8; 32] = &[
 ];
 
 /// A new BLAKE2b-256 state with the given 16-byte personalization.
-fn hasher(personal: &[u8; 16]) -> State {
+pub(super) fn hasher(personal: &[u8; 16]) -> State {
     Params::new().hash_length(32).personal(personal).to_state()
 }
 
 /// Finalizes a ZIP-244 node digest as its fixed-width byte representation.
-fn finalize_node_hash(state: State) -> [u8; 32] {
+pub(super) fn finalize_node_hash(state: State) -> [u8; 32] {
     state
         .finalize()
         .as_bytes()
@@ -164,7 +164,7 @@ fn finalize_node_hash(state: State) -> [u8; 32] {
 /// `io::Write` adapter that feeds bytes into a BLAKE2b [`State`], so Zebra's
 /// existing [`ZcashSerialize`] implementations can write a field's canonical
 /// bytes straight into a hash with no intermediate allocation.
-struct HashWriter<'a>(&'a mut State);
+pub(super) struct HashWriter<'a>(pub(super) &'a mut State);
 
 impl io::Write for HashWriter<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
@@ -178,14 +178,14 @@ impl io::Write for HashWriter<'_> {
 }
 
 /// Write a value's canonical [`ZcashSerialize`] bytes into a BLAKE2b state.
-fn update_serialized<T: ZcashSerialize>(state: &mut State, value: &T) {
+pub(super) fn update_serialized<T: ZcashSerialize>(state: &mut State, value: &T) {
     value
         .zcash_serialize(&mut HashWriter(state))
         .expect("writing to a BLAKE2b state is infallible");
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Zip244Version {
+pub(super) enum Zip244Version {
     V5,
     V6,
 }
@@ -290,7 +290,7 @@ const IRONWOOD_V6_PERSONALIZATIONS: BundleCommitmentPersonalizations =
     };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BundleCommitmentFormat {
+pub(super) enum BundleCommitmentFormat {
     OrchardV5,
     OrchardV6,
     IronwoodV6,
@@ -404,7 +404,7 @@ fn hash_header(parts: &Zip244Parts) -> Blake2bHash {
 ///
 /// Reference implementation:
 /// <https://github.com/zcash/librustzcash/blob/4367ba26ed57624544e2350f055a5df89079474a/zcash_primitives/src/transaction/txid.rs#L85>
-fn hash_prevouts(inputs: &[transparent::Input]) -> Blake2bHash {
+pub(super) fn hash_prevouts(inputs: &[transparent::Input]) -> Blake2bHash {
     let mut h = hasher(ZCASH_PREVOUTS_HASH_PERSONALIZATION);
     for input in inputs {
         match input {
@@ -412,8 +412,7 @@ fn hash_prevouts(inputs: &[transparent::Input]) -> Blake2bHash {
             // A coinbase input commits to the null prevout, exactly as Zebra's
             // `Input` serialization writes it.
             transparent::Input::Coinbase { .. } => {
-                h.update(&[0u8; 32]);
-                h.update(&0xffff_ffff_u32.to_le_bytes());
+                update_serialized(&mut h, &transparent::OutPoint::NULL)
             }
         }
     }
@@ -424,7 +423,7 @@ fn hash_prevouts(inputs: &[transparent::Input]) -> Blake2bHash {
 ///
 /// Reference implementation:
 /// <https://github.com/zcash/librustzcash/blob/4367ba26ed57624544e2350f055a5df89079474a/zcash_primitives/src/transaction/txid.rs#L71>
-fn hash_sequence(inputs: &[transparent::Input]) -> Blake2bHash {
+pub(super) fn hash_sequence(inputs: &[transparent::Input]) -> Blake2bHash {
     let mut h = hasher(ZCASH_SEQUENCE_HASH_PERSONALIZATION);
     for input in inputs {
         h.update(&input.sequence().to_le_bytes());
@@ -436,7 +435,7 @@ fn hash_sequence(inputs: &[transparent::Input]) -> Blake2bHash {
 ///
 /// Reference implementation:
 /// <https://github.com/zcash/librustzcash/blob/4367ba26ed57624544e2350f055a5df89079474a/zcash_primitives/src/transaction/txid.rs#L85>
-fn hash_outputs(outputs: &[transparent::Output]) -> Blake2bHash {
+pub(super) fn hash_outputs(outputs: &[transparent::Output]) -> Blake2bHash {
     let mut h = hasher(ZCASH_OUTPUTS_HASH_PERSONALIZATION);
     for output in outputs {
         update_serialized(&mut h, output);
@@ -445,7 +444,7 @@ fn hash_outputs(outputs: &[transparent::Output]) -> Blake2bHash {
 }
 
 /// ZIP-244 §S.2b amounts digest.
-fn hash_amounts(previous_outputs: &[transparent::Output]) -> Blake2bHash {
+pub(super) fn hash_amounts(previous_outputs: &[transparent::Output]) -> Blake2bHash {
     let mut h = hasher(ZCASH_TRANSPARENT_AMOUNTS_HASH_PERSONALIZATION);
     for output in previous_outputs {
         h.update(&output.value.zatoshis().to_le_bytes());
@@ -454,7 +453,7 @@ fn hash_amounts(previous_outputs: &[transparent::Output]) -> Blake2bHash {
 }
 
 /// ZIP-244 §S.2c scriptPubKeys digest.
-fn hash_scriptpubkeys(previous_outputs: &[transparent::Output]) -> Blake2bHash {
+pub(super) fn hash_scriptpubkeys(previous_outputs: &[transparent::Output]) -> Blake2bHash {
     let mut h = hasher(ZCASH_TRANSPARENT_SCRIPTPUBKEYS_HASH_PERSONALIZATION);
     for output in previous_outputs {
         update_serialized(&mut h, &output.lock_script);
@@ -523,7 +522,7 @@ fn hash_transparent_txid(
 ///
 /// Reference implementation:
 /// <https://github.com/zcash/librustzcash/blob/4367ba26ed57624544e2350f055a5df89079474a/zcash_primitives/src/transaction/txid.rs#L100>
-fn hash_sapling_spends(
+pub(super) fn hash_sapling_spends(
     sapling: &sapling::ShieldedData<sapling::SharedAnchor>,
     version: Zip244Version,
 ) -> Blake2bHash {
@@ -557,7 +556,9 @@ fn hash_sapling_spends(
 ///
 /// Reference implementation:
 /// <https://github.com/zcash/librustzcash/blob/4367ba26ed57624544e2350f055a5df89079474a/zcash_primitives/src/transaction/txid.rs#L132>
-fn hash_sapling_outputs(sapling: &sapling::ShieldedData<sapling::SharedAnchor>) -> Blake2bHash {
+pub(super) fn hash_sapling_outputs(
+    sapling: &sapling::ShieldedData<sapling::SharedAnchor>,
+) -> Blake2bHash {
     let mut h = hasher(ZCASH_SAPLING_OUTPUTS_HASH_PERSONALIZATION);
     if sapling.outputs().next().is_some() {
         let mut ch = hasher(ZCASH_SAPLING_OUTPUTS_COMPACT_HASH_PERSONALIZATION);
@@ -621,8 +622,25 @@ fn hash_bundle_txid(
         return *format.empty_txid_hash();
     };
 
+    let mut h = hasher(format.personalizations().bundle);
+    for digest in hash_bundle_actions(bundle, format) {
+        h.update(digest.as_bytes());
+    }
+    h.update(&[bundle.flags.bits()]);
+    h.update(&bundle.value_balance.zatoshis().to_le_bytes());
+    if format.includes_anchor_in_txid_digest() {
+        h.update(&<[u8; 32]>::from(bundle.shared_anchor));
+    }
+    finalize_node_hash(h)
+}
+
+/// The compact, memos, and non-compact digests of an Orchard-style bundle's actions,
+/// personalized for `format`'s pool.
+pub(super) fn hash_bundle_actions(
+    bundle: &orchard::ShieldedData,
+    format: BundleCommitmentFormat,
+) -> [Blake2bHash; 3] {
     let personalizations = format.personalizations();
-    let mut h = hasher(personalizations.bundle);
     let mut ch = hasher(personalizations.actions_compact);
     let mut mh = hasher(personalizations.actions_memos);
     let mut nh = hasher(personalizations.actions_noncompact);
@@ -639,15 +657,7 @@ fn hash_bundle_txid(
         nh.update(&action.enc_ciphertext.0[564..]);
         nh.update(&action.out_ciphertext.0[..]);
     }
-    h.update(ch.finalize().as_bytes());
-    h.update(mh.finalize().as_bytes());
-    h.update(nh.finalize().as_bytes());
-    h.update(&[bundle.flags.bits()]);
-    h.update(&bundle.value_balance.zatoshis().to_le_bytes());
-    if format.includes_anchor_in_txid_digest() {
-        h.update(&<[u8; 32]>::from(bundle.shared_anchor));
-    }
-    finalize_node_hash(h)
+    [ch.finalize(), mh.finalize(), nh.finalize()]
 }
 
 /// Combine the level-1 digests into the txid (ZIP-244 txid digest).

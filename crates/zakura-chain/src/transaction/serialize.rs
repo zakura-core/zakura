@@ -28,7 +28,9 @@ use crate::sapling;
 const ALLOW_CROSS_ADDRESS_BIT: bool = true;
 const ORCHARD_SPEND_OUTPUT_FLAG_BITS: u8 = 0b0000_0011;
 
-fn orchard_allowed_flag_bits(allow_cross_address_bit: bool) -> u8 {
+/// The Orchard flag bits a bundle may set: `enableSpends` and `enableOutputs`, and
+/// `enableCrossAddress` only where it is not reserved (ZIP 2006).
+pub(super) fn orchard_allowed_flag_bits(allow_cross_address_bit: bool) -> u8 {
     if allow_cross_address_bit {
         ORCHARD_SPEND_OUTPUT_FLAG_BITS | orchard::Flags::ENABLE_CROSS_ADDRESS.bits()
     } else {
@@ -622,11 +624,7 @@ impl ZcashSerialize for Transaction {
         // to check the smaller pre-Sapling transaction size limit.
 
         // Denoted as `header` in the spec, contains the `fOverwintered` flag and the `version` field.
-        // Write `version` and set the `fOverwintered` bit if necessary
-        let overwintered_flag = if self.is_overwintered() { 1 << 31 } else { 0 };
-        let version = overwintered_flag | self.version();
-
-        writer.write_u32::<LittleEndian>(version)?;
+        writer.write_u32::<LittleEndian>(header_field(self.is_overwintered(), self.version()))?;
 
         match self {
             Transaction::V1 {
@@ -819,6 +817,10 @@ impl ZcashSerialize for Transaction {
                     !ALLOW_CROSS_ADDRESS_BIT,
                 )?;
             }
+
+            Transaction::V7 { .. } => v7::V7Ref::of(self)
+                .expect("the transaction is v7")
+                .write(writer)?,
 
             Transaction::V6 {
                 network_upgrade,
@@ -1255,6 +1257,7 @@ impl ZcashDeserialize for Transaction {
                     ironwood_shielded_data,
                 })
             }
+            (7, true) => v7::read(reader),
             (_, _) => Err(SerializationError::Parse("bad tx header")),
         }
     }
@@ -1289,6 +1292,17 @@ where
 
     fn zcash_serialized_size(&self) -> usize {
         T::zcash_serialized_size(self)
+    }
+}
+
+/// Encodes a transaction's `header` field: the `fOverwintered` flag in the top bit, and
+/// the `version` in the other 31 bits.
+pub(crate) const fn header_field(overwintered: bool, version: u32) -> u32 {
+    const OVERWINTERED_FLAG: u32 = 1 << 31;
+    if overwintered {
+        OVERWINTERED_FLAG | version
+    } else {
+        version
     }
 }
 

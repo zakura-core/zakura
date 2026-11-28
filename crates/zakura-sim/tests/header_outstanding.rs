@@ -575,8 +575,8 @@ fn the_departed_rows_evict_their_earliest_entry_then_fall_and_rise() {
     let config = scenario.node_settings.config();
     let per_direction = config
         .peer_limits
-        .max_inbound_peers
-        .saturating_add(config.peer_limits.max_outbound_peers);
+        .max_inbound()
+        .saturating_add(config.peer_limits.max_outbound());
     assert!(per_direction < limit, "{stem}: {per_direction} < {limit}");
     let timeouts = timeouts(report.log.entries());
     let hold = config.unproductive_peer_cooldown;

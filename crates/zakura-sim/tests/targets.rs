@@ -77,6 +77,9 @@ fn manifest() -> String {
 /// applies fails the test until it leaves the list, so the list only
 /// shrinks.
 ///
+/// `memory/consensus-once-per-height` applies only at rest with a live
+/// `Consensus` lease, and every `sync/composed` input rests with none.
+///
 /// `tx-relay/stalled-peers-parked` applies only after a parked peer's
 /// readmission, three virtual minutes in. That witness runs too long for a
 /// fuzz input, and `tests/tx_relay_wire.rs` applies the property.
@@ -254,6 +257,7 @@ const UNAPPLIED: &[(&str, &[&str])] = &[
         "sync_composed",
         &[
             "block-sync/frontier-work-consistent",
+            "memory/consensus-once-per-height",
             "session/connection-shares-bound",
             "session/credit-isolated",
             "session/replacement-preserves-authorization",

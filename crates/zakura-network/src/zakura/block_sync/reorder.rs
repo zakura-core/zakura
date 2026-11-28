@@ -1,4 +1,4 @@
-use super::events::BlockSupplier;
+use super::events::{BlockApplyToken, BlockSupplier};
 
 use super::{state::*, wire::DecodedBlockPayload, *};
 use zakura_node_services::block_memory::{
@@ -347,6 +347,17 @@ impl BodyFacts {
 pub(super) enum PayloadChange {
     KeepRaw(BodyId),
     Release(BodyId),
+    /// The body left the sequencer while the driver still holds its
+    /// submission `token`. IO drops the payload and keeps its lease for the
+    /// `decoded_bytes` the driver's block holds, until
+    /// [`Self::EndSubmission`] names the token.
+    Detach {
+        id: BodyId,
+        token: BlockApplyToken,
+        decoded_bytes: u64,
+    },
+    /// The driver no longer holds detached submission `token`.
+    EndSubmission(BlockApplyToken),
 }
 
 #[derive(Clone, Debug)]

@@ -389,6 +389,16 @@ impl ZakuraDb {
         self.read_capacity.control_workers.clone()
     }
 
+    /// Publish the read memory budget's retained bytes and refused reservations,
+    /// so operators can see whether the read limit binds (`02 §4`).
+    pub(crate) fn publish_read_memory_metrics(&self) {
+        let memory = &self.read_capacity.memory;
+        // A gauge is an `f64`; the byte count loses precision only above 2^53.
+        ::metrics::gauge!("state.read.memory.retained_bytes").set(memory.retained_bytes() as f64);
+        ::metrics::counter!("state.read.memory.refused_reservations")
+            .absolute(memory.refused_reservations());
+    }
+
     /// Charge `bytes` serialized from a non-finalized block to the read memory
     /// budget, so they share its limit with serialized disk results.
     ///

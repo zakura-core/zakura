@@ -32,6 +32,7 @@ use zakura_network::zakura::{
 
 use crate::domain::block_sync::OwnerModel;
 use crate::domain::block_sync_semantic::SemanticModel;
+use crate::domain::memory_pool::PoolGaugeModel;
 
 /// An admitted session.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -143,6 +144,8 @@ pub struct BlockSyncView {
     /// The resource properties' owner model, which folds the events as the
     /// tap logs them.
     pub owners: OwnerModel,
+    /// The generic memory-pool gauge model, shared with [`PoolTap`].
+    pub pool: Rc<RefCell<PoolGaugeModel>>,
 }
 
 impl BlockSyncView {
@@ -408,7 +411,7 @@ mod tests {
     fn a_budget_change_from_another_count_is_an_anomaly() {
         let mut view = BlockSyncView::default();
         view.fold(&BlockEvent::Budget(BudgetChange {
-            kind: BudgetChangeKind::Reserved,
+            kind: BudgetChangeKind::Charged,
             before: 0,
             after: 100,
             limit: 1_000,

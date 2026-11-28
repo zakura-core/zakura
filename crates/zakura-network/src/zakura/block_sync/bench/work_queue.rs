@@ -91,7 +91,13 @@ fn admitted_request(count: u32, bytes: u32) -> (Arc<WorkQueue>, ByteBudget, Unpu
         NonZeroU64::new(1).expect("request ID is nonzero"),
     );
     let admitted = taken
-        .admit(block::Height(0), CancellationToken::new())
+        .admit_for_connection(
+            block::Height(0),
+            crate::zakura::CommitWindow::default().top(block::Height(0)),
+            0,
+            None,
+            CancellationToken::new(),
+        )
         .expect("the empty budget admits the whole request");
     assert_eq!(budget.reserved(), total);
     (work, budget, admitted)
@@ -100,7 +106,7 @@ fn admitted_request(count: u32, bytes: u32) -> (Arc<WorkQueue>, ByteBudget, Unpu
 fn pending_work(count: u32, bytes: u32, limit: u64) -> (Arc<WorkQueue>, ByteBudget) {
     assert!(count > 0 && bytes >= 1024);
     let budget = ByteBudget::new(limit);
-    let work = Arc::new(WorkQueue::new(block::Height(0), budget.clone()));
+    let work = Arc::new(WorkQueue::with_test_pool(block::Height(0), budget.clone()));
     let authority = zakura_header_chain::BodyWorkAuthority {
         header: zakura_header_chain::HeaderWorkAuthority {
             header_generation: zakura_header_chain::HeaderGeneration::new(1),
@@ -214,9 +220,15 @@ impl BenchWorkChurn {
             attempt,
         );
         assert_eq!(taken.items().len(), usize::try_from(self.count).unwrap());
-        let admitted = match taken.admit(block::Height(0), CancellationToken::new()) {
+        let admitted = match taken.admit_for_connection(
+            block::Height(0),
+            crate::zakura::CommitWindow::default().top(block::Height(0)),
+            0,
+            None,
+            CancellationToken::new(),
+        ) {
             Ok(admitted) => admitted,
-            Err(AdmitRefusal::Capacity) => return false,
+            Err(AdmitRefusal::Capacity(_)) => return false,
             Err(other) => panic!("churn admission failed unexpectedly: {other:?}"),
         };
         let claim = admitted

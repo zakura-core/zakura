@@ -172,6 +172,7 @@ struct Counters {
     datagrams_received: u64,
     send_blocked: Duration,
     delivered_bytes: u64,
+    accepted_send_bytes: u64,
     send_errors: u64,
 }
 
@@ -205,6 +206,25 @@ struct ConnTask<S: UdpIo> {
     /// The peer's IP as of the last path check (PATH-3).
     path_ip: IpAddr,
     limits: CurrentLimits,
+    /// The receive window last applied to `quinn_proto::Connection`, and the
+    /// unpaid shrink debt `quinn-proto` accumulated from shrinks below it.
+    ///
+    /// `quinn-proto 0.11`'s `set_receive_window` adds `new - old` directly to
+    /// `local_max_data` without first offsetting `receive_window_shrink_debt`,
+    /// so tracking both lets `apply_receive_window` avoid double-granting
+    /// `MAX_DATA` when a window grows while prior shrink debt is still unpaid.
+    ///
+    /// quinn-proto keeps its debt private, so the task counts the payments
+    /// it sees: its reads, and the in-order bytes it discards when it stops
+    /// a stream. quinn-proto also pays with bytes it discards on its own (a
+    /// stop's out-of-order bytes, data for a stopped stream, a peer's
+    /// RESET_STREAM), so the mirror is an upper bound: it never over-grants,
+    /// and later reads correct it.
+    quinn_receive_window: u64,
+    quinn_shrink_debt: u64,
+    /// The sequence number of the last `SetLimits` command applied
+    /// ([`ConnLoad::limits_applied`]).
+    limits_applied: u64,
     /// Every credit hold this task applied, and every release it took
     /// (API-10). The window leaves out their difference. Separate totals keep
     /// a release that arrives before its hold from being lost.
@@ -294,6 +314,9 @@ pub(crate) async fn run<S: UdpIo>(params: ConnTaskParams<S>) {
         local_close: None,
         drained_sent: false,
         path_ip: canonical_ip(admitted.ip()),
+        quinn_receive_window: limits.receive_window,
+        quinn_shrink_debt: 0,
+        limits_applied: 0,
         limits,
         credit_held: 0,
         credit_released: 0,
@@ -558,6 +581,10 @@ impl<S: UdpIo> ConnTask<S> {
             .rate_in
             .sample(now(), load.delivered_bytes, load.udp_rx.bytes);
         load.rate_out = self.probe.rate_out();
+        load.cwnd = stats.path.cwnd;
+        load.accepted_send_bytes = self.counters.accepted_send_bytes;
+        load.limits_applied = self.limits_applied;
+        load.receive_credit_excess = self.receive_credit_excess();
         load.rtt = stats.path.rtt;
         load
     }
@@ -988,7 +1015,10 @@ impl<S: UdpIo> ConnTask<S> {
             ConnCmd::Stats { reply } => {
                 let _ = reply.send(self.stats());
             }
-            ConnCmd::SetLimits { limits } => self.set_limits(limits),
+            ConnCmd::SetLimits { limits, seq } => {
+                self.set_limits(limits);
+                self.limits_applied = seq;
+            }
             ConnCmd::SetPriority { id, priority } => {
                 let _ = self.conn.send_stream(id).set_priority(priority);
             }
@@ -1033,13 +1063,53 @@ impl<S: UdpIo> ConnTask<S> {
         self.credit_held.saturating_sub(self.credit_released)
     }
 
-    fn apply_receive_window(&mut self) {
-        let window = self
-            .limits
+    /// The window the peer should hold: the receive window less live holds.
+    fn target_receive_window(&self) -> u64 {
+        self.limits
             .receive_window
-            .saturating_sub(self.outstanding_credit());
+            .saturating_sub(self.outstanding_credit())
+    }
+
+    /// Credit granted beyond [`Self::target_receive_window`] that reads have
+    /// not repaid yet ([`ConnLoad::receive_credit_excess`]).
+    fn receive_credit_excess(&self) -> u64 {
+        self.quinn_receive_window
+            .saturating_add(self.quinn_shrink_debt)
+            .saturating_sub(self.target_receive_window())
+    }
+
+    /// Counts `bytes` that quinn-proto just took off its shrink debt, then
+    /// grants whatever the window still owes the peer.
+    fn repay_shrink_debt(&mut self, bytes: u64) {
+        if bytes > 0 {
+            self.quinn_shrink_debt = self.quinn_shrink_debt.saturating_sub(bytes);
+            self.apply_receive_window();
+        }
+    }
+
+    fn apply_receive_window(&mut self) {
+        let desired = self.target_receive_window();
+        let current_credit = self
+            .quinn_receive_window
+            .saturating_add(self.quinn_shrink_debt);
+        let next_window = if desired > current_credit {
+            self.quinn_receive_window
+                .saturating_add(desired - current_credit)
+        } else if desired < self.quinn_receive_window {
+            desired
+        } else {
+            return;
+        };
+        if next_window > self.quinn_receive_window {
+            self.quinn_receive_window = next_window;
+        } else {
+            self.quinn_shrink_debt = self
+                .quinn_shrink_debt
+                .saturating_add(self.quinn_receive_window - next_window);
+            self.quinn_receive_window = next_window;
+        }
         self.conn
-            .set_receive_window(VarInt::from_u64(window).unwrap_or(VarInt::MAX));
+            .set_receive_window(VarInt::from_u64(next_window).unwrap_or(VarInt::MAX));
     }
 
     fn stop(&mut self, id: StreamId, code: VarInt) {
@@ -1047,8 +1117,31 @@ impl<S: UdpIo> ConnTask<S> {
         // Stopping drops whatever quinn-proto buffered for the stream.
         self.recv_payload.remove(&id);
         if self.recv_ends.remove(&id).is_none() {
+            // quinn-proto repays shrink debt with the bytes a stop discards
+            // and doesn't say how many. Reading the in-order bytes first
+            // counts them, so the debt mirror doesn't keep withholding
+            // credit for them.
+            let discarded = self.discard_readable(id);
             let _ = self.conn.recv_stream(id).stop(code);
+            self.repay_shrink_debt(discarded);
         }
+    }
+
+    /// Reads and drops the bytes `id` can deliver in order now. Returns how
+    /// many it dropped. The bytes are bounded by the stream's receive
+    /// window, and no reader sees them, so they don't count as delivered.
+    fn discard_readable(&mut self, id: StreamId) -> u64 {
+        let mut stream = self.conn.recv_stream(id);
+        let Ok(mut chunks) = stream.read(true) else {
+            return 0;
+        };
+        let mut discarded = 0_u64;
+        while let Ok(Some(chunk)) = chunks.next(usize::MAX) {
+            // usize always fits in u64 on supported targets.
+            discarded = discarded.saturating_add(chunk.bytes.len() as u64);
+        }
+        let _ = chunks.finalize();
+        discarded
     }
 
     fn serve_openers(&mut self) {
@@ -1115,7 +1208,13 @@ impl<S: UdpIo> ConnTask<S> {
                 let [rest] = chunks;
                 front.data = rest;
                 match result {
-                    Ok(_) => {}
+                    Ok(written) => {
+                        // usize always fits in u64 on supported targets.
+                        self.counters.accepted_send_bytes = self
+                            .counters
+                            .accepted_send_bytes
+                            .saturating_add(written.bytes as u64);
+                    }
                     Err(quinn_proto::WriteError::Blocked) => {
                         // Flow control or the send window: wait for Writable.
                         state.blocked_since.get_or_insert_with(now);
@@ -1217,13 +1316,16 @@ impl<S: UdpIo> ConnTask<S> {
         };
         let mut data = Vec::new();
         let mut budget = max.clamp(1, READ_BATCH_BYTES);
+        let mut read_bytes = 0_u64;
         let mut end = None;
         while budget > 0 {
             match chunks.next(budget) {
                 Ok(Some(chunk)) => {
                     budget = budget.saturating_sub(chunk.bytes.len());
                     // usize always fits in u64 on supported targets.
-                    self.counters.delivered_bytes += chunk.bytes.len() as u64;
+                    let len = chunk.bytes.len() as u64;
+                    self.counters.delivered_bytes += len;
+                    read_bytes = read_bytes.saturating_add(len);
                     data.push(chunk.bytes);
                 }
                 Ok(None) => {
@@ -1240,6 +1342,7 @@ impl<S: UdpIo> ConnTask<S> {
         // Reading pays any held credit first, then frees receive window; the
         // next drive() sends the credit.
         let _ = chunks.finalize();
+        self.repay_shrink_debt(read_bytes);
         if end.is_some() {
             // Read to the end or reset: quinn-proto buffers nothing more.
             self.recv_payload.remove(&id);
@@ -1467,6 +1570,9 @@ mod tests {
             local_close: None,
             drained_sent: false,
             path_ip: canonical_ip(admitted.ip()),
+            quinn_receive_window: limits.receive_window,
+            quinn_shrink_debt: 0,
+            limits_applied: 0,
             limits,
             credit_held: 0,
             credit_released: 0,
@@ -1604,6 +1710,7 @@ mod tests {
             server_transport.congestion_controller_factory(Arc::new(cubic));
             let (client, mut task) = client_task_with(client_transport);
             task.limits.receive_window = WINDOW;
+            task.quinn_receive_window = WINDOW;
             let mut pair = Self {
                 client,
                 task,
@@ -1643,6 +1750,16 @@ mod tests {
             }
             self.sent += took;
             self.pump();
+            took
+        }
+
+        /// Fills the window like [`Self::fill`], then has the task accept the
+        /// stream.
+        async fn fill_and_accept(&mut self) -> u64 {
+            let took = self.fill();
+            let (reply, accepted) = oneshot::channel();
+            self.task.handle_cmd(ConnCmd::AcceptBi { reply });
+            assert_eq!(accepted.await.unwrap().unwrap(), self.stream);
             took
         }
 
@@ -1766,10 +1883,7 @@ mod tests {
     async fn held_credit_bounds_a_greedy_peer() {
         for seed in 1..=8u64 {
             let mut pair = CreditPair::connected();
-            pair.fill();
-            let (reply, accepted) = oneshot::channel();
-            pair.task.handle_cmd(ConnCmd::AcceptBi { reply });
-            assert_eq!(accepted.await.unwrap().unwrap(), pair.stream);
+            pair.fill_and_accept().await;
 
             let mut rng = seed;
             let mut next = |bound: u64| {
@@ -1845,10 +1959,151 @@ mod tests {
             assert_eq!(pair.task.outstanding_credit(), 0);
             let before = pair.sent;
             pair.task.reads.clear();
-            pair.read_direct(WINDOW);
+            loop {
+                let (reply, mut result) = oneshot::channel();
+                pair.task.handle_cmd(ConnCmd::Read {
+                    id: pair.stream,
+                    max: usize::MAX,
+                    hold: 0,
+                    reply,
+                });
+                if !matches!(result.try_recv(), Ok(Ok(Some(_)))) {
+                    break;
+                }
+            }
+            pair.task.reads.clear();
+            pair.pump();
             pair.fill();
             assert!(pair.sent > before, "seed {seed}");
         }
+    }
+
+    /// ConnLoad reports `cwnd` (`PathStats::cwnd`) and `accepted_send_bytes`.
+    /// Shrinking `send_window` below buffered bytes pauses `accepted_send_bytes`
+    /// until the peer drains and ACKs unacknowledged data, after which accepting
+    /// new bytes advances `accepted_send_bytes` again (`02 §6`).
+    #[tokio::test]
+    async fn conn_load_reports_cwnd_and_accepted_send_bytes() {
+        let mut pair = CreditPair::connected();
+        let initial = pair.task.load();
+        assert_eq!(initial.cwnd, pair.task.conn.stats().path.cwnd);
+        assert!(initial.cwnd > 0, "connected path reports a non-zero cwnd");
+        assert_eq!(initial.accepted_send_bytes, 0);
+
+        let (reply, opened) = oneshot::channel();
+        pair.task.handle_cmd(ConnCmd::OpenBi { reply });
+        let stream = opened.await.unwrap().unwrap();
+
+        // Set a small send window (16 KiB) and write 32 KiB.
+        pair.task
+            .set_limits(ConnLimits::default().with_send_window(16 * 1024));
+        let (wreply, _wres) = oneshot::channel();
+        pair.task.handle_cmd(ConnCmd::Write {
+            id: stream,
+            data: Bytes::from(vec![0xAB; 32 * 1024]),
+            reply: wreply,
+        });
+        let mid = pair.task.load();
+        assert!(mid.accepted_send_bytes > 0);
+        assert!(mid.accepted_send_bytes <= 16 * 1024);
+
+        // Shrink send window to 4 KiB while 16 KiB are buffered: no new bytes
+        // are accepted until peer reads & ACKs below 4 KiB.
+        pair.task
+            .set_limits(ConnLimits::default().with_send_window(4 * 1024));
+        let shrunk_accepted = pair.task.load().accepted_send_bytes;
+        pair.task.serve_writer(stream);
+        assert_eq!(pair.task.load().accepted_send_bytes, shrunk_accepted);
+
+        // Pump packets and let peer accept & read the stream so ACKs free send buffer.
+        pair.pump();
+        let peer_stream = pair.peer().streams().accept(Dir::Bi).unwrap();
+        for _ in 0..8 {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            pair.peer().handle_timeout(now());
+            pair.task.conn.handle_timeout(now());
+            pair.pump();
+            if let Ok(mut chunks) = pair.peer().recv_stream(peer_stream).read(true) {
+                while let Ok(Some(_)) = chunks.next(64 * 1024) {}
+                let _ = chunks.finalize();
+            }
+            pair.peer().handle_timeout(now());
+            pair.pump();
+            pair.task.process_events();
+            if pair.task.load().accepted_send_bytes > shrunk_accepted {
+                break;
+            }
+        }
+        let after_drain = pair.task.load();
+        assert!(
+            after_drain.accepted_send_bytes > shrunk_accepted,
+            "accepted_send_bytes must advance once unacked bytes fall below the shrunk window"
+        );
+        // Raising the send window back lets quinn-proto accept the rest immediately.
+        pair.task
+            .set_limits(ConnLimits::default().with_send_window(32 * 1024));
+        pair.task.process_events();
+        let after = pair.task.load();
+        assert_eq!(after.accepted_send_bytes, 32 * 1024);
+        assert_eq!(after.cwnd, pair.task.conn.stats().path.cwnd);
+    }
+
+    /// A stop discards the stream's unread bytes, and quinn-proto counts them
+    /// as reads that repay shrink debt. The task counts them too, so a later
+    /// grow gives the peer the whole window again.
+    #[tokio::test]
+    async fn a_stop_repays_the_shrink_debt_of_its_discarded_bytes() {
+        let mut pair = CreditPair::connected();
+        assert_eq!(pair.fill_and_accept().await, WINDOW);
+
+        // Halving the window under unread bytes leaves half the credit with
+        // the peer until reads repay it.
+        pair.task.handle_cmd(ConnCmd::SetLimits {
+            limits: ConnLimits::default().with_receive_window(WINDOW / 2),
+            seq: 1,
+        });
+        let load = pair.task.load();
+        assert_eq!(load.limits_applied, 1);
+        assert_eq!(load.receive_credit_excess, WINDOW / 2);
+
+        pair.task.handle_cmd(ConnCmd::Stop {
+            id: pair.stream,
+            code: VarInt::from_u32(0),
+            hold: 0,
+        });
+        assert_eq!(pair.task.load().receive_credit_excess, 0);
+
+        pair.task.handle_cmd(ConnCmd::SetLimits {
+            limits: ConnLimits::default().with_receive_window(WINDOW),
+            seq: 2,
+        });
+        pair.pump();
+        pair.stream = pair.peer().streams().open(Dir::Bi).unwrap();
+        assert_eq!(pair.fill(), WINDOW);
+    }
+
+    /// Repeated shrink-then-grow cycles on `receive_window` before reads repay
+    /// debt must never inflate peer credit beyond the target window.
+    #[tokio::test]
+    async fn shrink_then_grow_receive_window_does_not_leak_credit() {
+        let mut pair = CreditPair::connected();
+        assert_eq!(pair.fill_and_accept().await, WINDOW);
+
+        // Shrink by half and grow back 10 times with zero reads in between.
+        for _ in 0..10 {
+            pair.task
+                .set_limits(ConnLimits::default().with_receive_window(WINDOW / 2));
+            pair.pump();
+            pair.task
+                .set_limits(ConnLimits::default().with_receive_window(WINDOW));
+            pair.pump();
+        }
+        assert_eq!(
+            pair.fill(),
+            0,
+            "shrink+grow without reads must grant zero extra MAX_DATA credit"
+        );
+        assert_eq!(pair.sent, WINDOW);
     }
 
     /// API-10: read-ahead can deliver a frame before its hold reaches the

@@ -2189,6 +2189,44 @@ impl PeerTask {
                     }
                 }
                 _ = conn.closed() => {
+                    // A frame QUIC delivered before the close was received,
+                    // even when its reader forwards it after the close wins
+                    // this select. Every reader and the acceptor end with
+                    // the connection, so the drain ends.
+                    drop(events);
+                    while let Some(event) = stream_events.recv().await {
+                        match event {
+                            StreamEvent::Frame { id, frame, at, order } => {
+                                let Some(read) = reads.get_mut(&id) else {
+                                    continue;
+                                };
+                                let seq = *read;
+                                *read += 1;
+                                let credit = if discovery_ids.contains(&id) {
+                                    None
+                                } else {
+                                    decode_frame::<RegtestMessage>(&frame)
+                                        .ok()
+                                        .as_ref()
+                                        .and_then(credit)
+                                };
+                                self.record(remote, id, RecordBody::Received {
+                                    seq,
+                                    message_type: frame.message_type,
+                                    // A frame's payload is under its stream's cap.
+                                    payload: frame.payload.len() as u64,
+                                    credit,
+                                    frame,
+                                    at,
+                                    order,
+                                });
+                            }
+                            StreamEvent::Reset { id, code } => {
+                                self.record(remote, id, RecordBody::Reset { code });
+                            }
+                            StreamEvent::Header { .. } | StreamEvent::Discovery { .. } => {}
+                        }
+                    }
                     self.record_connection_close(conn, remote);
                     self.readiness.set(false);
                     return Ended::Closed;

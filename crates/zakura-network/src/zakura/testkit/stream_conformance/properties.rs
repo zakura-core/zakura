@@ -860,8 +860,20 @@ pub(crate) async fn paused_siblings<A: StreamConformance>(
         "the harness needs one sibling more than the supported count".into()
     })?;
     let seed = seeds(6, layout);
-    let a = LayoutNode::<A>::spawn(seed, layout).await?;
-    let b = LayoutNode::<A>::spawn(seed + 1, layout).await?;
+    // Size the QUIC stream window for the kinds this test node actually
+    // registers (the layout plus the two siblings), rather than inheriting
+    // block sync's larger window on layouts that do not run block sync.
+    let mut limits = production_limits();
+    let shares = limits.reactor_shares();
+    let registered_stream_window = layout
+        .iter()
+        .chain(&SIBLINGS)
+        .map(|stream| shares.share(stream.kind).receive_total())
+        .fold(u64::from(DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW), u64::max);
+    limits.quic.stream_receive_window_bytes =
+        u32::try_from(registered_stream_window).unwrap_or(u32::MAX);
+    let a = LayoutNode::<A>::spawn_with_limits(seed, layout, limits.clone()).await?;
+    let b = LayoutNode::<A>::spawn_with_limits(seed + 1, layout, limits).await?;
     a.connect(&b).await?;
     let (exchanges, pages) = four_windows(&a.shared().plan);
 

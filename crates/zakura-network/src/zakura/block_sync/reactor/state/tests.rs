@@ -99,7 +99,7 @@ fn reactor_state(tip: u32, header_tip: u32) -> ReactorState {
         ReactorProgress::new(
             frontiers(tip),
             (block::Height(header_tip), header_hash(header_tip)),
-            initial_view(frontiers(tip)),
+            initial_view(frontiers(tip), &Default::default()),
         ),
         BootstrapGate::new(true, None),
         None,
@@ -216,7 +216,7 @@ fn view(tip: u32, reset_epoch: u64, reaction_epoch: u64) -> SequencerView {
     SequencerView {
         reset_epoch,
         reaction_epoch,
-        ..initial_view(frontiers(tip))
+        ..initial_view(frontiers(tip), &Default::default())
     }
 }
 
@@ -569,7 +569,7 @@ fn header_quiet_holds_queries_until_body_sync_starts() {
         ReactorProgress::new(
             frontiers(0),
             (block::Height(1_000), header_hash(1_000)),
-            initial_view(frontiers(0)),
+            initial_view(frontiers(0), &Default::default()),
         ),
         BootstrapGate::new(false, None),
         Some(authority_view(0)),

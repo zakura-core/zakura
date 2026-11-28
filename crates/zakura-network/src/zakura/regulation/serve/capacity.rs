@@ -181,6 +181,19 @@ impl Drop for Tally {
     }
 }
 
+/// Optional node-wide memory-pool backing for [`ServeCapacity`] output leases (`02 §4–5`).
+#[derive(Clone, Debug)]
+pub(crate) enum ServePoolBacking {
+    /// Bulk serving consumer (`Consumer::Serving`) with per-peer fairness (`PeerSubPool`, `#1888`).
+    Serving {
+        pool: crate::zakura::memory::MemoryPool,
+        /// Per-peer floor (one largest response for this reactor).
+        peer_floor: u64,
+    },
+    /// Reserved control consumer (`Consumer::Control`, e.g. discovery serving).
+    Control(crate::zakura::memory::MemoryPool),
+}
+
 /// Serving capacity for one request row, shared by every session of the node.
 ///
 /// A peer's budgets live as long as any session or unfinished response holds
@@ -194,6 +207,7 @@ pub(crate) struct ServeCapacity {
     pub(super) node_execution: SlotBudget,
     pub(super) node_output: OutputByteBudget,
     pub(super) node_output_responses: SlotBudget,
+    pub(super) pool_backing: Option<Arc<ServePoolBacking>>,
     peers: Arc<Mutex<HashMap<ZakuraPeerId, WeakPeerBudgets>>>,
     pub(super) metrics: Arc<ServeMetrics>,
     /// Told each lookup's pruning and each push's acquisition, in test and
@@ -274,6 +288,7 @@ impl ServeCapacity {
                 .map_err(|_| limit("node_output_bytes"))?,
             node_output_responses: SlotBudget::new(limits.node_output_responses)
                 .map_err(|_| limit("node_output_responses"))?,
+            pool_backing: None,
             peers: Arc::default(),
             metrics: Arc::new(ServeMetrics {
                 service,
@@ -285,6 +300,44 @@ impl ServeCapacity {
             #[cfg(any(test, zakura_sim))]
             reports: None,
         })
+    }
+
+    /// Back output bytes by the node-wide memory pool (`02 §4–5`).
+    pub(crate) fn with_pool_backing(mut self, backing: ServePoolBacking) -> Self {
+        self.pool_backing = Some(Arc::new(backing));
+        self
+    }
+
+    /// Wait for an output lease from the memory pool `backing`.
+    ///
+    /// A response is never served unleased. A final refusal means the plan
+    /// can't fit this response at all (a plan invariant), so the wait never
+    /// ends; the session's cancellation or the caller's drop ends it.
+    pub(super) async fn acquire_pool_lease(
+        backing: &ServePoolBacking,
+        peer: &ZakuraPeerId,
+        bytes: u64,
+    ) -> crate::zakura::memory::PoolLease {
+        let leased = match backing {
+            ServePoolBacking::Serving { pool, peer_floor } => {
+                pool.acquire_serving(peer, None, *peer_floor, bytes).await
+            }
+            ServePoolBacking::Control(pool) => {
+                pool.acquire(crate::zakura::memory::Consumer::Control, None, bytes)
+                    .await
+            }
+        };
+        match leased {
+            Ok(lease) => lease,
+            Err(denied) => {
+                tracing::error!(
+                    ?denied,
+                    bytes,
+                    "the memory plan cannot lease this serving output; holding the response"
+                );
+                std::future::pending().await
+            }
+        }
     }
 
     /// This capacity, telling `reports` each lookup's pruning and each

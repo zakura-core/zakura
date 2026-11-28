@@ -33,7 +33,15 @@ pub use wire::{
 /// Page reads that may run at once across the node. Each read holds a
 /// retained-path lease in state, which bounds its own capacity, so this keeps
 /// many subscriptions from queueing reads that state cannot run yet.
-const NODE_EXECUTION: usize = 8;
+pub(crate) const HEADER_SYNC_SERVE_NODE_EXECUTION: usize = 8;
+const NODE_EXECUTION: usize = HEADER_SYNC_SERVE_NODE_EXECUTION;
+
+/// Encoded byte bound of the largest header-sync page on `network` (payload
+/// plus frame header).
+pub(crate) fn largest_header_page_bytes(network: &zakura_chain::parameters::Network) -> u64 {
+    let header_bytes = super::header_sync_header_bytes_for_network(network);
+    (largest_page(header_bytes) as u64).saturating_add(crate::zakura::FRAME_HEADER_BYTES as u64)
+}
 
 /// Page reads that may run at once for one peer: its session and a
 /// replacement that overlaps it. Each session's publisher reads one page at a

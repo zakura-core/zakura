@@ -38,8 +38,11 @@ use zakura_rt::{
 };
 
 use super::request::BlockSizeEstimate;
-use crate::zakura::transport::{
-    BudgetClosure, BudgetReader, ByteBudget, ByteRelease, ByteReservation, ReservationError,
+use crate::zakura::{
+    memory::{ConnectionCredit, Consumer, MemoryPool, PoolLease},
+    transport::{
+        BudgetClosure, BudgetReader, ByteBudget, ByteRelease, ByteReservation, ReservationError,
+    },
 };
 
 mod request_write;
@@ -63,6 +66,86 @@ pub(super) struct EndedReservation {
     pub(super) charge: u64,
     /// Owns the charge and the unsent heights of a queued request that receipt retired.
     pub(super) funding: ByteReservation,
+    /// Pool lease transferred from the work queue for this received height
+    /// (`decision-4`: follows the body from request credit into sequencer retention).
+    pub(super) pool_lease: Option<PoolLease>,
+    /// Connection credit controller that holds the matching QUIC receive window
+    /// increase for this request, if any.
+    pub(super) conn_credit: Option<ConnectionCredit>,
+}
+
+/// Pool lease and connection credit controller owned by one published request
+/// while its heights remain unreceived in [`WorkQueueInner`].
+#[derive(Debug)]
+pub(super) struct OwnerLease {
+    pub(super) lease: PoolLease,
+    pub(super) conn_credit: Option<ConnectionCredit>,
+}
+
+/// Deferred release/drain batch for pool leases extracted under the queue lock
+/// and settled only after unlocking (never calling `set_limits` or dropping
+/// leases inside the work-queue mutex).
+#[derive(Debug, Default)]
+struct LeaseDrainBatch {
+    entries: Vec<(Option<ConnectionCredit>, PoolLease)>,
+}
+
+impl LeaseDrainBatch {
+    fn push(&mut self, conn_credit: Option<ConnectionCredit>, lease: PoolLease) {
+        if lease.bytes() > 0 {
+            self.entries.push((conn_credit, lease));
+        }
+    }
+}
+
+impl Drop for LeaseDrainBatch {
+    fn drop(&mut self) {
+        for (conn_credit, lease) in self.entries.drain(..) {
+            if let Some(credit) = conn_credit {
+                finish_receive_credit(&credit, lease.bytes(), Some(lease));
+            } else {
+                drop(lease);
+            }
+        }
+    }
+}
+
+/// Finish `total` bytes of `credit`'s receive credit, and queue `unspent`, the
+/// lease of the credit the peer didn't deliver, on its drain queue (`02 §6`).
+/// A Consensus drain moves to `Consumer::BlockSync` first.
+pub(super) fn finish_receive_credit(
+    credit: &ConnectionCredit,
+    total: u64,
+    unspent: Option<PoolLease>,
+) {
+    let Some(unspent) = unspent else {
+        credit.finish_receive_credit(total, None);
+        return;
+    };
+    let (drain, left) = drain_on_block_sync(unspent);
+    credit.finish_receive_credit(total, Some(drain));
+    if let Some(left) = left {
+        credit.finish_receive_credit(0, Some(left));
+    }
+}
+
+/// Move a Consensus drain, or a detached submission's lease, to
+/// `Consumer::BlockSync`, and return the moved lease and the bytes left on
+/// Consensus.
+///
+/// The height then holds no Consensus lease, so its re-issued request takes
+/// the only one (mem-15). Only a full pool leaves bytes on Consensus; block
+/// sync counts them.
+pub(super) fn drain_on_block_sync(mut lease: PoolLease) -> (PoolLease, Option<PoolLease>) {
+    if lease.consumer() != Consumer::Consensus {
+        return (lease, None);
+    }
+    let drain = lease.move_to(Consumer::BlockSync);
+    if lease.bytes() == 0 {
+        return (drain, None);
+    }
+    metrics::counter!("sync.block.consensus.drain_unmoved_bytes").increment(lease.bytes());
+    (drain, Some(lease))
 }
 
 /// The queue lock's contents: the logical owner plus the runtime registrations
@@ -71,6 +154,8 @@ pub(super) struct EndedReservation {
 struct WorkQueueInner {
     state: WorkQueueState,
     funding: ByteReservation,
+    /// Per-owner pool leases backing published requests.
+    owner_leases: HashMap<zakura_header_chain::BodyWorkOwner, OwnerLease>,
     /// Weak owners allow reset notification without retaining session resources.
     /// Their status survives until writing or terminal cleanup finishes.
     request_writes: HashMap<zakura_header_chain::BodyWorkOwner, RequestWriteRegistration>,
@@ -80,6 +165,41 @@ impl WorkQueueInner {
     fn settle(&mut self, release: &mut ByteRelease<'_>, bytes: u64) {
         // Rejection closes the budget and preserves both owners.
         let _ = self.funding.settle_into(release, bytes);
+    }
+
+    fn take_owner_lease(
+        &mut self,
+        owner: zakura_header_chain::BodyWorkOwner,
+        bytes: u64,
+    ) -> (Option<ConnectionCredit>, Option<PoolLease>) {
+        if bytes == 0 {
+            return (None, None);
+        }
+        let Some(entry) = self.owner_leases.get_mut(&owner) else {
+            return (None, None);
+        };
+        let conn_credit = entry.conn_credit.clone();
+        let take = bytes.min(entry.lease.bytes());
+        let lease = if take == entry.lease.bytes() {
+            self.owner_leases
+                .remove(&owner)
+                .map(|removed| removed.lease)
+        } else {
+            entry.lease.split(take)
+        };
+        (conn_credit, lease)
+    }
+
+    fn settle_owner_lease(
+        &mut self,
+        drain: &mut LeaseDrainBatch,
+        owner: zakura_header_chain::BodyWorkOwner,
+        bytes: u64,
+    ) {
+        let (conn_credit, lease) = self.take_owner_lease(owner, bytes);
+        if let Some(lease) = lease {
+            drain.push(conn_credit, lease);
+        }
     }
 }
 
@@ -122,11 +242,29 @@ impl Drop for WorkQueueGuard<'_> {
     }
 }
 
+/// A pool whose reserved Consensus and bulk BlockSync consumers each fund
+/// `bytes` of requests at any height, the shape block sync leases from, for
+/// tests and fuzzers. Consensus also reserves the floor's headroom.
+#[cfg(any(test, feature = "p2p-fuzz", feature = "internal-bench"))]
+pub(super) fn test_memory_pool(bytes: u64) -> MemoryPool {
+    use crate::zakura::memory::{Consumer, ConsumerSpec, PoolConfig};
+    // Keep the pool's sums far from overflow for "unlimited" test budgets.
+    let bytes = bytes.min(1 << 50);
+    let consensus = bytes + super::admission::FLOOR_CONSENSUS_HEADROOM_BYTES;
+    MemoryPool::new(
+        PoolConfig::new(consensus + bytes, 0)
+            .with_consumer(Consumer::Consensus, ConsumerSpec::reserved(consensus))
+            .with_consumer(Consumer::BlockSync, ConsumerSpec::bulk(0, bytes, 1)),
+    )
+}
+
 /// The shared download work source. See the module docs for the invariants.
 #[derive(Debug)]
 pub(super) struct WorkQueue {
     inner: StdMutex<WorkQueueInner>,
     budget: ByteBudget,
+    /// The node-wide memory pool funding published requests (`02 §4`).
+    memory_pool: MemoryPool,
     /// Caps the reservations one session may publish. Admission checks it.
     owner_cap: OwnerReservationCap,
     /// Bodies another v2 front is fetching. Selection skips them, and a
@@ -144,14 +282,18 @@ pub(super) struct WorkQueue {
 }
 
 impl WorkQueue {
-    pub(super) fn new(floor: block::Height, budget: ByteBudget) -> Self {
+    /// A queue whose requests lease from `memory_pool`. `budget` is the
+    /// settlement ledger of request owners; the pool bounds the bytes.
+    pub(super) fn new(floor: block::Height, budget: ByteBudget, memory_pool: MemoryPool) -> Self {
         Self {
             inner: StdMutex::new(WorkQueueInner {
                 state: WorkQueueState::new(floor),
                 funding: budget.empty_reservation(),
+                owner_leases: HashMap::new(),
                 request_writes: HashMap::new(),
             }),
             budget,
+            memory_pool,
             owner_cap: OwnerReservationCap::UNLIMITED,
             body_claims: None,
             available: Notify::new(),
@@ -159,6 +301,19 @@ impl WorkQueue {
             #[cfg(any(test, zakura_sim))]
             observer: Default::default(),
         }
+    }
+
+    /// A queue whose pool gives Consensus and BlockSync each the byte limit
+    /// of `budget`, for tests and fuzzers that size requests by that limit.
+    #[cfg(any(test, feature = "p2p-fuzz", feature = "internal-bench"))]
+    pub(super) fn with_test_pool(floor: block::Height, budget: ByteBudget) -> Self {
+        let pool = test_memory_pool(budget.max_bytes_for_test());
+        Self::new(floor, budget, pool)
+    }
+
+    /// The memory pool that funds this queue's requests.
+    pub(super) fn memory_pool(&self) -> &MemoryPool {
+        &self.memory_pool
     }
 
     /// This queue, capping each session's published reservations at `cap`.
@@ -412,6 +567,7 @@ impl WorkQueue {
         end: impl FnOnce(&mut WorkQueueState) -> Option<(zakura_header_chain::BodyWorkOwner, u64)>,
     ) -> Result<Option<(zakura_header_chain::BodyWorkOwner, EndedReservation)>, ReservationError>
     {
+        let mut lease_drain = LeaseDrainBatch::default();
         let (ended, claim) = {
             let mut inner = self.lock();
             let Some((owner, charge)) = end(&mut inner.state) else {
@@ -419,11 +575,28 @@ impl WorkQueue {
             };
             let (outcome, claim) = self.return_items_locked(&mut inner, owner, []);
             let funding = self.split_receipt_funding(&mut inner, charge, outcome.released_bytes);
+            let (conn_credit, pool_lease) = if funding.is_ok() {
+                inner.settle_owner_lease(&mut lease_drain, owner, outcome.released_bytes);
+                inner.take_owner_lease(owner, charge)
+            } else {
+                (None, None)
+            };
             (
-                funding.map(|funding| (owner, EndedReservation { charge, funding })),
+                funding.map(|funding| {
+                    (
+                        owner,
+                        EndedReservation {
+                            charge,
+                            funding,
+                            pool_lease,
+                            conn_credit,
+                        },
+                    )
+                }),
                 claim,
             )
         };
+        drop(lease_drain);
         drop(claim);
         ended.map(Some)
     }
@@ -455,17 +628,24 @@ impl WorkQueue {
         owner: zakura_header_chain::BodyWorkOwner,
         height: block::Height,
     ) -> Result<ByteReservation, ReservationError> {
+        let mut lease_drain = LeaseDrainBatch::default();
         let (released, claim) = {
             let mut inner = self.lock();
             let Some(charge) = inner.state.claim_received(owner, height) else {
                 return inner.funding.split(0);
             };
             let (outcome, claim) = self.return_items_locked(&mut inner, owner, []);
-            (
-                self.split_receipt_funding(&mut inner, charge, outcome.released_bytes),
-                claim,
-            )
+            let funding = self.split_receipt_funding(&mut inner, charge, outcome.released_bytes);
+            if funding.is_ok() {
+                inner.settle_owner_lease(
+                    &mut lease_drain,
+                    owner,
+                    charge.saturating_add(outcome.released_bytes),
+                );
+            }
+            (funding, claim)
         };
+        drop(lease_drain);
         drop(claim);
         released
     }
@@ -476,10 +656,13 @@ impl WorkQueue {
         heights: impl IntoIterator<Item = block::Height>,
     ) {
         let mut release = self.budget.deferred_release();
+        let mut lease_drain = LeaseDrainBatch::default();
         let mut inner = self.lock();
         let bytes = inner.state.release_reserved_heights(owner, heights);
         inner.settle(&mut release, bytes);
+        inner.settle_owner_lease(&mut lease_drain, owner, bytes);
         drop(inner);
+        drop(lease_drain);
         drop(release);
     }
 
@@ -491,12 +674,15 @@ impl WorkQueue {
         heights: impl IntoIterator<Item = block::Height>,
     ) -> WorkReturnOutcome {
         let mut release = self.budget.deferred_release();
+        let mut lease_drain = LeaseDrainBatch::default();
         let (outcome, claim) = {
             let mut inner = self.lock();
             let result = self.return_items_locked(&mut inner, owner, heights);
             inner.settle(&mut release, result.0.released_bytes);
+            inner.settle_owner_lease(&mut lease_drain, owner, result.0.released_bytes);
             result
         };
+        drop(lease_drain);
         drop(release);
         drop(claim);
         outcome
@@ -512,10 +698,34 @@ impl WorkQueue {
         bytes: u64,
         verified_tip: block::Height,
     ) -> bool {
-        let deferred = self
-            .lock()
-            .state
-            .defer_received(owner, height, hash, bytes, verified_tip);
+        self.return_received(owner, height, hash, bytes, Some(verified_tip))
+    }
+
+    /// Return a received attempt whose body the pool could not lease, at its
+    /// measured size. Its next request leases the whole body, so it waits for
+    /// the pool instead of retaining unleased bytes.
+    pub(super) fn return_unleased_body(
+        &self,
+        owner: zakura_header_chain::BodyWorkOwner,
+        height: block::Height,
+        hash: block::Hash,
+        bytes: u64,
+    ) -> bool {
+        self.return_received(owner, height, hash, bytes, None)
+    }
+
+    fn return_received(
+        &self,
+        owner: zakura_header_chain::BodyWorkOwner,
+        height: block::Height,
+        hash: block::Hash,
+        bytes: u64,
+        retry_after_tip: Option<block::Height>,
+    ) -> bool {
+        let deferred =
+            self.lock()
+                .state
+                .defer_received(owner, height, hash, bytes, retry_after_tip);
         let Some(wake) = deferred else {
             return false;
         };
@@ -563,10 +773,15 @@ impl WorkQueue {
     /// Received bodies retain their separate payload ownership.
     pub(super) fn advance_floor(&self, floor: block::Height) {
         let mut release = self.budget.deferred_release();
+        let mut lease_drain = LeaseDrainBatch::default();
         let mut inner = self.lock();
         let delta = inner.state.advance_floor(floor);
         inner.settle(&mut release, delta.released_bytes);
+        for (owner, bytes) in &delta.released_by_owner {
+            inner.settle_owner_lease(&mut lease_drain, *owner, *bytes);
+        }
         drop(inner);
+        drop(lease_drain);
         drop(release);
         self.wake(delta.wake);
     }
@@ -578,6 +793,7 @@ impl WorkQueue {
     /// Settle request estimates for removed heights after unlocking.
     pub(super) fn reset_above(&self, floor: block::Height) {
         let mut release = self.budget.deferred_release();
+        let mut lease_drain = LeaseDrainBatch::default();
         let mut inner = self.lock();
         // Retain upgraded owners until after unlocking: a concurrently dropped
         // queue entry can make this the last reference, whose Drop settles work.
@@ -594,7 +810,11 @@ impl WorkQueue {
         }
         let delta = inner.state.reset_above(floor);
         inner.settle(&mut release, delta.released_bytes);
+        for (owner, bytes) in &delta.released_by_owner {
+            inner.settle_owner_lease(&mut lease_drain, *owner, *bytes);
+        }
         drop(inner);
+        drop(lease_drain);
         drop(release);
         drop(claims);
         self.wake(delta.wake);
@@ -790,3 +1010,274 @@ pub use state::{
     WorkOwnershipFailure, WorkOwnershipHistory, WorkOwnershipPhase, WorkOwnershipReplaySummary,
     WorkOwnershipStep, WorkOwnershipView,
 };
+
+#[cfg(test)]
+mod memory_pool_tests {
+    use std::time::Duration;
+
+    use zakura_rt::sync::CancellationToken;
+
+    use super::*;
+    use crate::zakura::{
+        block_sync::state::LookAheadCap,
+        memory::{Consumer, ConsumerSpec, MemoryPool, PoolConfig},
+    };
+
+    fn test_scope() -> zakura_header_chain::BodyWorkAuthority {
+        crate::zakura::block_sync::test_work_scope()
+    }
+
+    const MB: u64 = 1_000_000;
+
+    fn hash(height: u32) -> block::Hash {
+        let mut bytes = [0u8; 32];
+        bytes[..4].copy_from_slice(&height.to_le_bytes());
+        block::Hash(bytes)
+    }
+
+    /// A queue over `pool` with a confirmed 2 MB block at each of `heights`.
+    fn queue_with(pool: &MemoryPool, heights: &[u32]) -> Arc<WorkQueue> {
+        let queue = Arc::new(WorkQueue::new(
+            block::Height(0),
+            ByteBudget::new(u64::MAX),
+            pool.clone(),
+        ));
+        queue.extend(
+            test_scope(),
+            heights.iter().map(|&height| {
+                (
+                    block::Height(height),
+                    hash(height),
+                    BlockSizeEstimate::Confirmed(2_000_000),
+                )
+            }),
+        );
+        queue
+    }
+
+    /// Takes `height` as request `id` and admits it for connection `conn_id`,
+    /// with the floor and the verified tip at genesis.
+    fn admit(
+        queue: &Arc<WorkQueue>,
+        height: u32,
+        id: u64,
+        conn_id: u64,
+        cancel: &CancellationToken,
+    ) -> Result<UnpublishedRequest, AdmitRefusal> {
+        queue
+            .take_request(
+                block::Height(height),
+                block::Height(height),
+                1,
+                2 * MB,
+                1,
+                NonZeroU64::new(id).unwrap(),
+            )
+            .admit_for_connection(
+                block::Height(0),
+                crate::zakura::CommitWindow::default().top(block::Height(0)),
+                conn_id,
+                None,
+                cancel.clone(),
+            )
+    }
+
+    /// mem-15: a withheld commit-window drain moves to block sync, so the
+    /// height's re-issued request takes its only Consensus lease, even with
+    /// block sync at its cap. A full pool leaves the drain on Consensus, and
+    /// the re-issued request waits.
+    #[test]
+    fn withheld_consensus_drain_moves_to_block_sync_before_reissue() {
+        for pool_full in [false, true] {
+            // Consensus reserves exactly one 2 MB above-floor height and the
+            // floor's 2 MB headroom. S = 4 MB.
+            let config = PoolConfig::new(9 * MB, 0)
+                .with_consumer(Consumer::Consensus, ConsumerSpec::reserved(4 * MB))
+                .with_consumer(Consumer::BlockSync, ConsumerSpec::bulk(MB, MB, 1))
+                .with_consumer(Consumer::Serving, ConsumerSpec::bulk(0, 4 * MB, 1));
+            let pool = MemoryPool::new(config);
+            let _bulk = pool
+                .try_acquire(Consumer::BlockSync, Some(1), MB)
+                .expect("block sync fills its cap");
+            let _serving = pool_full.then(|| {
+                pool.try_acquire(Consumer::Serving, Some(2), 4 * MB)
+                    .expect("serving fills S")
+            });
+            let queue = queue_with(&pool, &[100]);
+            // The withheld request's unspent credit lease.
+            let withheld = pool
+                .try_acquire(Consumer::Consensus, Some(42), 2 * MB)
+                .expect("the first request leases the height from Consensus");
+
+            let (drain, left) = drain_on_block_sync(withheld);
+            let reissue = admit(&queue, 100, 1, 43, &CancellationToken::new());
+            if pool_full {
+                assert_eq!(drain.bytes(), 0);
+                assert_eq!(left.as_ref().map(PoolLease::bytes), Some(2 * MB));
+                assert_eq!(
+                    reissue.map(|_| ()).unwrap_err(),
+                    AdmitRefusal::Capacity(Consumer::Consensus)
+                );
+            } else {
+                assert!(left.is_none());
+                assert_eq!(drain.consumer(), Consumer::BlockSync);
+                assert_eq!(drain.bytes(), 2 * MB);
+                assert_eq!(pool.consumer_leased(Consumer::BlockSync), 3 * MB);
+                let reissue =
+                    reissue.expect("the re-issued request takes the only Consensus lease");
+                let _claim = reissue.publish(|_| {}).expect("publish the re-issue");
+                assert_eq!(pool.consumer_leased(Consumer::Consensus), 2 * MB);
+            }
+            assert!(pool.snapshot().total_leased <= pool.snapshot().lease_limit);
+        }
+    }
+
+    /// Above-floor commit-window requests leave one maximum block of
+    /// Consensus free, so the floor height still leases once they fill the
+    /// rest of the reserve.
+    #[test]
+    fn above_floor_requests_leave_consensus_room_for_the_floor() {
+        let config = PoolConfig::new(6 * MB, 0)
+            .with_consumer(Consumer::Consensus, ConsumerSpec::reserved(6 * MB));
+        let pool = MemoryPool::new(config);
+        let queue = queue_with(&pool, &[1, 100, 101, 102]);
+        let cancel = CancellationToken::new();
+
+        let _first = admit(&queue, 100, 1, 42, &cancel).expect("4 MB stays free");
+        let _second = admit(&queue, 101, 2, 42, &cancel).expect("2 MB stays free");
+        assert_eq!(
+            admit(&queue, 102, 3, 42, &cancel).map(|_| ()).unwrap_err(),
+            AdmitRefusal::Capacity(Consumer::Consensus),
+            "a third above-floor request would spend the floor's headroom"
+        );
+        assert_eq!(pool.consumer_leased(Consumer::Consensus), 4 * MB);
+        let _floor = admit(&queue, 1, 4, 42, &cancel).expect("the floor takes the headroom");
+        assert_eq!(pool.consumer_leased(Consumer::Consensus), 6 * MB);
+    }
+
+    #[test]
+    fn commit_window_uses_consensus_reserve_even_when_bulk_pool_is_saturated() {
+        // Shared space S = 8 MB; Consensus reserved = 8 MB; BlockSync floor = 2 MB, cap = 4 MB.
+        let config = PoolConfig::new(20 * MB, 0)
+            .with_consumer(Consumer::Consensus, ConsumerSpec::reserved(8 * MB))
+            .with_consumer(Consumer::BlockSync, ConsumerSpec::bulk(2 * MB, 4 * MB, 1))
+            .with_consumer(Consumer::Serving, ConsumerSpec::bulk(2 * MB, 10 * MB, 1));
+        let pool = MemoryPool::new(config);
+
+        // Saturate bulk completely (BlockSync floor + cap and Serving taking all of S).
+        let bulk_block_sync = pool
+            .try_acquire(Consumer::BlockSync, Some(1), 4 * MB)
+            .expect("fill block sync to cap");
+        let bulk_serving = pool
+            .try_acquire(Consumer::Serving, Some(2), 8 * MB)
+            .expect("drain remaining shared space S");
+        assert_eq!(pool.available_for(Consumer::BlockSync), 0);
+
+        // Height 100 is inside commit window above verified_tip=0 (0..=401);
+        // Height 500 is above the commit window.
+        let queue = queue_with(&pool, &[100, 500]);
+        let cancel = CancellationToken::new();
+        // 1. Commit-window request succeeds on Consumer::Consensus without waiting on bulk!
+        let unpublished_in = admit(&queue, 100, 1, 42, &cancel)
+            .expect("commit-window height must lease from Consensus reserve");
+        let owner_in = unpublished_in.owner();
+        let _claim_in = unpublished_in.publish(|_| {}).expect("publish in-window");
+        assert_eq!(pool.consumer_leased(Consumer::Consensus), 2 * MB);
+
+        // 2. Above-window request is refused cleanly while bulk is full.
+        let err = admit(&queue, 500, 2, 42, &cancel)
+            .expect_err("above-window request must defer when bulk is saturated");
+        assert_eq!(err, AdmitRefusal::Capacity(Consumer::BlockSync));
+
+        // 3. Releasing bulk leases unblocks above-window requests on Consumer::BlockSync.
+        drop(bulk_block_sync);
+        drop(bulk_serving);
+        let unpublished_above = admit(&queue, 500, 3, 42, &cancel)
+            .expect("above-window request leases from BlockSync once room opens");
+        let _claim_above = unpublished_above
+            .publish(|_| {})
+            .expect("publish above-window");
+        assert_eq!(pool.consumer_leased(Consumer::BlockSync), 2 * MB);
+
+        // 4. Receipt transfers the Consensus lease out of WorkQueue; dropping it returns to 0.
+        let ended = queue
+            .begin_receipt_for_owner(owner_in, block::Height(100))
+            .expect("receipt succeeds")
+            .expect("owner held height 100");
+        assert_eq!(
+            ended.pool_lease.as_ref().map(PoolLease::bytes),
+            Some(2 * MB)
+        );
+        assert_eq!(
+            ended.pool_lease.as_ref().map(PoolLease::consumer),
+            Some(Consumer::Consensus)
+        );
+        assert_eq!(pool.consumer_leased(Consumer::Consensus), 2 * MB);
+        drop(ended);
+        assert_eq!(pool.consumer_leased(Consumer::Consensus), 0);
+
+        // 5. Returning unreceived work releases the BlockSync lease back to 0.
+        queue.reset_above(block::Height(0));
+        assert_eq!(pool.consumer_leased(Consumer::BlockSync), 0);
+        assert!(queue.audit_funding());
+    }
+
+    #[test]
+    fn range_fetch_p99_and_derived_look_ahead_cap() {
+        let mut cap = LookAheadCap::new(None);
+        assert_eq!(cap.p99_fetch_time(), None);
+
+        // 99 fast samples at 100 ms + 1 slow tail sample at 2000 ms -> p99 = 100 ms,
+        // then 2 slow samples at 2000 ms -> p99 = 2000 ms.
+        for _ in 0..99 {
+            cap.record_fetch(Duration::from_millis(100));
+        }
+        cap.record_fetch(Duration::from_millis(2_000));
+        assert_eq!(cap.p99_fetch_time(), Some(Duration::from_millis(100)));
+
+        cap.record_fetch(Duration::from_millis(2_000));
+        assert_eq!(cap.p99_fetch_time(), Some(Duration::from_millis(2_000)));
+
+        // Idle at tip (commit_rate == 0) yields 0 look-ahead.
+        assert_eq!(cap.look_ahead_bytes(), 0);
+
+        // 2 × 100 MB/s × 2.0 s = 400 MB.
+        let rate = 100 * 1024 * 1024;
+        cap.tick(rate, 0);
+        assert_eq!(cap.look_ahead_bytes(), 400 * 1024 * 1024);
+
+        // A ceiling lowers the derived cap.
+        let mut capped = LookAheadCap::new(Some(256 * 1024 * 1024));
+        capped.record_fetch(Duration::from_secs(2));
+        capped.tick(rate, 0);
+        assert_eq!(capped.look_ahead_bytes(), 256 * 1024 * 1024);
+    }
+
+    /// A floor stall that stops commits for a few ticks keeps most of the
+    /// look-ahead; the smoothed rate halves in about 30 seconds.
+    #[test]
+    fn look_ahead_cap_decays_through_a_commit_stall() {
+        let mut cap = LookAheadCap::new(None);
+        for _ in 0..100 {
+            cap.record_fetch(Duration::from_secs(1));
+        }
+        let rate = 100 * 1024 * 1024;
+        let full = cap.tick(rate, 0);
+        assert_eq!(full, 2 * rate, "2 × rate × the 1 s p99");
+
+        let mut stalled = full;
+        for _ in 0..5 {
+            stalled = cap.tick(0, 0);
+        }
+        assert!(stalled > full * 85 / 100, "{stalled} of {full} after 5 s");
+        for _ in 5..30 {
+            stalled = cap.tick(0, 0);
+        }
+        assert!(
+            (full * 45 / 100..=full * 55 / 100).contains(&stalled),
+            "{stalled} of {full} after 30 s"
+        );
+        // A recovered rate restores the cap at once, and the cwnd sum adds.
+        assert_eq!(cap.tick(rate, 7), 2 * rate + 7);
+    }
+}

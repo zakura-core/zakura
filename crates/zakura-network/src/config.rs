@@ -636,7 +636,7 @@ impl Config {
     pub fn tcp_ingress_bound_bytes(&self) -> u64 {
         // Widening usize to u64 is lossless on supported targets.
         (self.peerset_total_connection_limit() as u64)
-            .saturating_mul(crate::zakura::TCP_INGRESS_BUDGET.receive)
+            .saturating_mul(crate::zakura::TCP_INGRESS_BUDGET.receive_total())
     }
 
     /// Returns the initial seed peer hostnames for the configured network.
@@ -2001,18 +2001,6 @@ impl<'de> Deserialize<'de> for Config {
         if p2p_stack.resolve(&network).runs_zakura() {
             zakura
                 .validate_stream_receive_window()
-                .map_err(de::Error::custom)?;
-        }
-        if p2p_stack.resolve(&network).runs_zakura() {
-            // Legacy-only nodes create no QUIC endpoint. For v2, the endpoint
-            // lowers a larger cap after tracing starts so its warning is logged.
-            // Whether `tx-relay` runs is decided at startup with the pool, so
-            // this checks the shares every connection has, and the endpoint
-            // charges `tx-relay`'s once it is registered.
-            let mut without_tx_relay = zakura.clone();
-            without_tx_relay.tx_relay.enabled = false;
-            without_tx_relay
-                .budgeted_max_connections(&network)
                 .map_err(de::Error::custom)?;
         }
         // Unconditional peers are dialed on the legacy stack, and only a P2P v2

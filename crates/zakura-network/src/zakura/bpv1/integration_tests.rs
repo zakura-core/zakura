@@ -8,8 +8,10 @@
 //!    retires immediately, releases `SharedBodyClaims` with `Fallback`, and
 //!    wakes native `block_sync`).
 //! 4. Legacy-first `Duplicate` verdict, which commits without a fallback.
+//! 5. `Propagation` leases that fund a W2 block while bulk consumers hold all
+//!    of `S` (mem-5).
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use zakura_chain::{
     block::{self, Height},
@@ -19,7 +21,10 @@ use zakura_chain::{
 use zakura_node_services::body_claims::SharedBodyClaims;
 use zakura_quic::ConnLoad;
 use zakura_rt::{
-    sync::{watch, CancellationToken},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        watch, CancellationToken,
+    },
     time::Instant,
 };
 
@@ -27,12 +32,17 @@ use crate::zakura::{transport::Service, ZakuraPeerId};
 
 use super::{
     blocks::{BlockPhase, VerifierVerdict},
+    config::ZakuraBpv1Config,
+    memory::PropagationReserve,
     profile::Profile,
-    service::Bpv1Handle,
+    service::{Bpv1Handle, Bpv1Service},
     test_support::{
-        build_large_v6_tx, build_v6_tx, connect_pair, node_id, pair, ports, regtest_nu7,
-        solved_block_of, start, wait_until, ScriptedVerifier,
+        build_large_v6_tx, build_v6_tx, connect, connect_pair, node_id, pair, ports, regtest_nu7,
+        solved_block_of, start, startup, wait_until, ScriptedVerifier,
     },
+};
+use crate::zakura::memory::{
+    Consumer, ConsumerSpec, MemoryPool, PoolConfig, PoolEvent, PoolLease, PoolObserver,
 };
 
 /// Level-10: a proposer publishes a solved block to one receiver through two
@@ -208,4 +218,117 @@ async fn level10_root_mismatch_fallback_and_legacy_first_duplicate_matrix() {
     }
 
     shutdown.cancel();
+}
+
+/// The most bytes `Consumer::Propagation` held at once in one pool.
+#[derive(Debug, Default)]
+struct PropagationPeak(AtomicU64);
+
+impl PoolObserver for PropagationPeak {
+    fn observe(&self, event: PoolEvent) {
+        if let PoolEvent::Granted {
+            consumer: Consumer::Propagation,
+            consumer_leased,
+            ..
+        }
+        | PoolEvent::Resized {
+            consumer: Consumer::Propagation,
+            consumer_leased,
+            ..
+        } = event
+        {
+            self.0.fetch_max(consumer_leased, Ordering::Relaxed);
+        }
+    }
+}
+
+/// A pool with the plan's `Propagation` reserve for W2 beside a bulk
+/// consumer, and the lease with which that consumer holds all of `S`.
+fn pool_with_saturated_bulk(peak: &Arc<PropagationPeak>) -> (MemoryPool, PoolLease) {
+    let reserve = PropagationReserve::new(&ZakuraBpv1Config::default(), Profile::W2).total();
+    let bulk = 64 * 1024 * 1024;
+    let pool = MemoryPool::new(
+        PoolConfig::new(reserve + bulk, 0)
+            .with_consumer(Consumer::Propagation, ConsumerSpec::reserved(reserve))
+            .with_consumer(Consumer::BlockSync, ConsumerSpec::bulk(0, bulk, 1)),
+    )
+    .with_observer(Some(Arc::clone(peak) as Arc<dyn PoolObserver>));
+    let held = pool
+        .try_acquire(Consumer::BlockSync, None, bulk)
+        .expect("block sync takes all of S");
+    assert!(
+        pool.try_acquire(Consumer::BlockSync, None, 1).is_err(),
+        "bulk holds all of S"
+    );
+    (pool, held)
+}
+
+fn propagation_leased(pool: &MemoryPool) -> u64 {
+    pool.snapshot().consumers[Consumer::Propagation.index()].leased
+}
+
+/// mem-5: BPv1 funds what it holds from the `Propagation` reserve, so a
+/// near-limit W2 block propagates and commits while bulk consumers hold all
+/// of `S`. Each node's leases cover what its table and proposer hold at
+/// every step, and return every byte at teardown.
+#[tokio::test]
+async fn mem5_propagation_leases_fund_a_block_beside_saturated_bulk() {
+    let height = Height(20);
+    let (id_a, id_b) = (node_id(91), node_id(92));
+    let shutdown = CancellationToken::new();
+    let (peak_a, peak_b) = (Arc::default(), Arc::default());
+    let (pool_a, _bulk_a) = pool_with_saturated_bulk(&peak_a);
+    let (pool_b, _bulk_b) = pool_with_saturated_bulk(&peak_b);
+
+    let valid = ScriptedVerifier::new(VerifierVerdict::Valid);
+    let ports_a = ports(height.0, valid.clone(), SharedBodyClaims::new());
+    let ports_b = ports(height.0, valid, SharedBodyClaims::new());
+    let network = regtest_nu7();
+    let (svc_a, handle_a) = Bpv1Service::start(
+        startup(Profile::W2, network.clone(), id_a, ports_a, &shutdown),
+        pool_a.clone(),
+    );
+    let (svc_b, handle_b) = Bpv1Service::start(
+        startup(Profile::W2, network, id_b, ports_b, &shutdown),
+        pool_b.clone(),
+    );
+    connect(&svc_a, id_a, &svc_b, id_b, &shutdown);
+
+    let txs = (0..32u8)
+        .map(|i| build_large_v6_tx(height, i.wrapping_add(1), 61_000))
+        .collect();
+    let solved = solved_block_of(&handle_a, height, txs);
+    let block_id = solved.hash();
+    assert!(handle_a.publish_solved_block(&solved, height.0));
+    // At every poll, each node's leases cover what its table and proposer
+    // hold.
+    let funded = || {
+        for (node, handle) in [("A", &handle_a), ("B", &handle_b)] {
+            assert_eq!(
+                handle.unfunded_bytes(),
+                0,
+                "{node}'s leases cover what its table and proposer hold"
+            );
+        }
+    };
+    wait_until("B commits the block beside saturated bulk", || {
+        funded();
+        handle_b.block_phase(&block_id) == Some(BlockPhase::Done)
+    })
+    .await;
+    funded();
+
+    for (node, peak) in [("A", &peak_a), ("B", &peak_b)] {
+        assert!(
+            peak.0.load(Ordering::Relaxed) > 0,
+            "{node} leased from Propagation"
+        );
+    }
+
+    shutdown.cancel();
+    drop((svc_a, svc_b, handle_a, handle_b));
+    wait_until("both nodes return every Propagation byte", || {
+        propagation_leased(&pool_a) == 0 && propagation_leased(&pool_b) == 0
+    })
+    .await;
 }

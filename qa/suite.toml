@@ -86,24 +86,6 @@ test = "every_floor_churn_plan_asks_for_the_floor_before_the_reset"
 run = true
 timeout-secs = 1800
 
-[[ignored]]
-file = "crates/zakura-sim/tests/block_resource_properties.rs"
-test = "the_above_window_input_holds_lookahead_overshoot_bound"
-run = true
-timeout-secs = 3600
-
-[[ignored]]
-file = "crates/zakura-sim/tests/block_resource_properties.rs"
-test = "every_worker_count_holds_the_lookahead_bound_above_the_window"
-run = true
-timeout-secs = 3600
-
-[[ignored]]
-file = "crates/zakura-sim/tests/block_resource_properties.rs"
-test = "lookahead_estimate_to_wire_growth"
-run = true
-timeout-secs = 3600
-
 # Header serving under every default session slot, which full-coverage CI
 # runs with `--run-ignored`. Its 40-session sibling runs in the property
 # suite's row.

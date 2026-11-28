@@ -550,7 +550,6 @@ impl BlockTap {
             },
             BlockEvent::Budget(change) => BlockSyncFact::Budget {
                 change: match change.kind {
-                    BudgetChangeKind::Reserved => "reserved",
                     BudgetChangeKind::Charged => "charged",
                     BudgetChangeKind::Released => "released",
                 }

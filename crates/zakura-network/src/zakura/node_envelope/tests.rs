@@ -17,7 +17,7 @@ use crate::{
             ConnectionResources, NodeResources, OwnerCounts, OwnerPhase, StreamResources,
             TransportLimits,
         },
-        ReactorBudget, ReactorShares, Stream,
+        ReactorBudget, ReactorShares, ReceiveBudget, Stream,
     },
 };
 
@@ -46,7 +46,7 @@ fn shares() -> ReactorShares {
         control_receive_bytes: WINDOW,
         kinds: Vec::new(),
         other: ReactorBudget {
-            receive: WINDOW,
+            receive: ReceiveBudget::unsolicited_only(WINDOW),
             output: WINDOW,
         },
     }
@@ -57,11 +57,13 @@ fn limits() -> TransportLimits {
         max_open_streams: MAX_OPEN_STREAMS,
         control_receive_bytes: WINDOW,
         connection_shares: ReactorBudget {
-            receive: 3 * WINDOW,
+            receive: ReceiveBudget::unsolicited_only(3 * WINDOW),
             output: 3 * WINDOW,
         },
+        compat_output: 0,
         compat_exchange_bytes: 0,
         send_window: WINDOW,
+        handshake_send_window: WINDOW,
         max_connections: MAX_CONNECTIONS,
         max_pending_handshakes: 1,
     }
@@ -109,12 +111,8 @@ fn the_default_node_config_composes() {
     let config = Config::default();
     let limits = ZakuraLocalLimits::from_config(&config);
     let envelope =
-        NodeEnvelope::for_node(&config, &limits, &[], 16).expect("the default config fits");
+        NodeEnvelope::for_memory_plan(&config, &limits, &[], 16).expect("the default config fits");
 
-    assert_eq!(
-        limits.max_connections,
-        crate::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS
-    );
     assert_eq!(envelope.owners, limits.owner_bound());
     assert_eq!(
         envelope.decoded_blocks,
@@ -125,18 +123,18 @@ fn the_default_node_config_composes() {
             .expect("the default allowance fits")
             .get()
     );
-    // Block sync and header sync each fund 102 sessions × 64 MiB; discovery adds its
-    // answers.
-    assert!(envelope.serve_output_bytes >= 2 * 102 * (64 << 20));
-    assert!(envelope.serve_output_bytes < 2 * 102 * (64 << 20) + (1 << 30));
-    // The QUIC term is the derived one, within the peer memory budget.
+    // Block sync and header sync each fund `limits.total_connections()` sessions × 64 MiB;
+    // discovery adds its answers.
+    let sessions = limits.total_connections() as u128;
+    assert!(envelope.serve_output_bytes >= 2 * sessions * (64 << 20));
+    assert!(envelope.serve_output_bytes < 2 * sessions * (64 << 20) + (1 << 30));
+    // The QUIC term is the derived one.
     assert_eq!(
         envelope.quic_bytes,
         config
             .zakura
             .quic_memory_bytes(&config.network, limits.total_connections(), &[])
     );
-    assert!(envelope.quic_bytes <= u128::from(config.zakura.peer_memory_budget_bytes));
     assert_eq!(
         envelope.retained_bytes_bound(),
         envelope.transport_bytes
@@ -146,7 +144,7 @@ fn the_default_node_config_composes() {
     );
 }
 
-/// The default node's envelope, term by term: 102 connections at every reactor's
+/// The default node's envelope, term by term: every connection at every reactor's
 /// share on Mainnet.
 #[test]
 fn the_default_envelope_sums_the_reactor_shares() {
@@ -168,82 +166,78 @@ fn the_default_envelope_sums_the_reactor_shares() {
         share(10),
         crate::zakura::tx_relay::wire::TX_RELAY_STATE_BUDGET
     );
-    assert_eq!(shares.control_receive_bytes, 32 * MIB);
+    assert_eq!(
+        shares.control_receive_bytes,
+        crate::zakura::CONTROL_RECEIVE_BYTES
+    );
     // The connection window and the stream window that carry the shares.
     assert_eq!(
         shares.receive_window(shares.kinds.iter().map(|(kind, _)| *kind)),
-        32 * MIB + 79_750_851
+        crate::zakura::CONTROL_RECEIVE_BYTES + 79_750_859
     );
     assert_eq!(
         u64::from(limits.quic.stream_receive_window_bytes),
-        crate::zakura::BLOCK_SYNC_REACTOR_BUDGET.receive
+        crate::zakura::BLOCK_SYNC_REACTOR_BUDGET.receive_total()
     );
-    assert_eq!(u64::from(limits.quic.receive_window_bytes), 32 * MIB);
+    assert_eq!(
+        u64::from(limits.quic.receive_window()),
+        crate::zakura::CONTROL_RECEIVE_BYTES
+    );
+    assert_eq!(
+        limits.quic.send_window_bytes,
+        crate::zakura::HANDSHAKE_SEND_WINDOW_BYTES
+    );
 
     let envelope =
-        NodeEnvelope::for_node(&config, &limits, &[], 16).expect("the default config fits");
+        NodeEnvelope::for_memory_plan(&config, &limits, &[], 16).expect("the default config fits");
     let transport = ResourceEnvelope::new(
         limits.transport_limits_for_kinds(shares.kinds.iter().map(|(kind, _)| *kind)),
     );
-    // Per connection: 79,750,851 B of receive shares and 185,136,635 B of output shares.
-    assert_eq!(transport.connection_raw_bytes, 79_750_851);
-    assert_eq!(transport.connection_output_bytes, 185_136_635);
-    // The shared compatibility client holds at most 288 exchanges at once.
-    assert_eq!(transport.compat_response_bytes, 288 * 20 * MIB);
+    // Per connection: 79,750,859 B of receive shares with `tx-relay` on
+    // (counted inside QUIC receive credit via CreditHold), and unguarded output
+    // shares: 24 MiB for legacy gossip and legacy requests plus `tx-relay`'s
+    // 4,259,840 B. Discovery, header sync and block sync use guarded
+    // Serve/Push output counted in `serve_output_bytes`.
+    assert_eq!(transport.connection_raw_bytes, 79_750_859);
+    assert_eq!(transport.connection_output_bytes, 24 * MIB + 4_259_840);
+    // The node's exchange allowance caps the client's 288 exchanges.
+    assert_eq!(transport.compat_response_bytes, 64 * MIB);
+    let conns = limits.total_connections() as u128;
+    // F-900: the compatibility output and exchanges stop at the node's 128 MiB
+    // allowance instead of growing by 128 MiB per connection.
     assert_eq!(
         envelope.transport_bytes,
-        102 * u128::from(79_750_851_u64 + 185_136_635) + u128::from(288 * 20 * MIB)
+        conns * 4_259_840 + u128::from(crate::zakura::transport::COMPAT_NODE_BYTES)
     );
-    // 102 × 146,859,715 + 32 × 64 MiB + 256 MiB.
-    assert_eq!(envelope.quic_bytes, 17_395_610_034);
+    assert_eq!(crate::zakura::transport::COMPAT_NODE_BYTES, 128 * MIB);
+    // `conns` × 113,370,827 + 32 × 128 KiB + 256 MiB.
+    assert_eq!(
+        envelope.quic_bytes,
+        conns * 113_370_827 + 32 * u128::from(128u64 << 10) + u128::from(256 * MIB)
+    );
 }
 
-/// A custom stream kind takes the `other` share on a live connection, so the peer
-/// memory budget charges every connection for it, and the envelope counts its gates.
+/// A custom stream kind takes the `other` share on a live connection, so every
+/// connection's QUIC term grows by it, and the envelope counts its gates.
 #[test]
-fn custom_stream_kinds_charge_the_peer_memory_budget() {
+fn custom_stream_kinds_take_the_other_share() {
     const CUSTOM: &[u16] = &[40];
-    let mut config = Config::default();
+    let config = Config::default();
     let network = config.network.clone();
-    let native = ZakuraLocalLimits::from_config(&config).max_connections;
-    // A budget that funds the native kinds on exactly the default connections.
-    let native_quic = config.zakura.quic_memory_bytes(&network, native, &[]);
-    config.zakura.peer_memory_budget_bytes =
-        u64::try_from(native_quic).expect("the default QUIC envelope fits u64");
-    assert_eq!(
-        ZakuraLocalLimits::from_config(&config).max_connections,
-        native
-    );
+    let limits = ZakuraLocalLimits::from_config(&config);
+    let connections = limits.total_connections();
 
     // Widening usize to u128 is lossless on supported targets.
-    let other = u128::from(config.zakura.reactor_shares(&network).other.receive);
-    assert_eq!(
-        config.zakura.quic_memory_bytes(&network, native, CUSTOM),
-        native_quic + native as u128 * other
-    );
-
-    let limits = ZakuraLocalLimits::for_node(&config, CUSTOM);
-    assert!(limits.max_connections < native);
-    let node_id = zakura_quic::NodeSecretKey::from_bytes(&[7; 32]).public();
+    let other = u128::from(config.zakura.reactor_shares(&network).other.receive_total());
     assert_eq!(
         config
             .zakura
-            .budgeted_max_connections_for_node(&network, node_id, CUSTOM),
-        Ok(limits.max_connections)
+            .quic_memory_bytes(&network, connections, CUSTOM),
+        config.zakura.quic_memory_bytes(&network, connections, &[]) + connections as u128 * other
     );
 
-    assert!(matches!(
-        NodeEnvelope::for_node(
-            &config,
-            &ZakuraLocalLimits::from_config(&config),
-            CUSTOM,
-            16
-        ),
-        Err(NodeEnvelopeError::PeerMemoryBudget { .. })
-    ));
-    let envelope =
-        NodeEnvelope::for_node(&config, &limits, CUSTOM, 16).expect("the lowered cap fits");
-    assert!(envelope.quic_bytes <= u128::from(config.zakura.peer_memory_budget_bytes));
+    let envelope = NodeEnvelope::for_memory_plan(&config, &limits, CUSTOM, 16)
+        .expect("the default config fits");
     let native_kinds = || {
         limits
             .reactor_shares()
@@ -284,34 +278,37 @@ fn the_byte_bound_adds_each_owner_once() {
 fn configured_serving_budgets_set_the_serve_output_bound() {
     let mut config = Config::default();
     let limits = ZakuraLocalLimits::from_config(&config);
-    let derived = NodeEnvelope::for_node(&config, &limits, &[], 16)
+    let derived = NodeEnvelope::for_memory_plan(&config, &limits, &[], 16)
         .expect("the default config fits")
         .serve_output_bytes;
     config.zakura.block_sync.node_serve_output_bytes = Some(1 << 30);
     config.zakura.header_sync.node_serve_output_bytes = Some(1 << 30);
-    let configured = NodeEnvelope::for_node(&config, &limits, &[], 16)
+    let configured = NodeEnvelope::for_memory_plan(&config, &limits, &[], 16)
         .expect("the configured budgets fit")
         .serve_output_bytes;
-    assert_eq!(derived - configured, 2 * (102 * (64 << 20) - (1 << 30)));
+    assert_eq!(
+        derived - configured,
+        2 * (limits.total_connections() as u128 * (64 << 20) - (1 << 30))
+    );
 }
 
 /// With `tx-relay` on, the serve output bound adds, for each admitted connection,
 /// the built `Tx` and the unwritten `Inv` a session holds outside its output gate.
-/// The default config still fits, and the admitted connections are unchanged.
+/// The default config still fits, and with a fixed connection cap the admitted
+/// connections are unchanged.
 #[test]
 fn tx_relay_counts_what_it_holds_outside_its_output_gate() {
     let mut config = Config::default();
-    // Keep both runs at the same funded capacity even with the extra reactor.
-    config.zakura.peer_memory_budget_bytes = 17 << 30;
+    config.zakura.max_connections = Some(crate::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS);
     config.zakura.tx_relay.enabled = false;
     let off_limits = ZakuraLocalLimits::from_config(&config);
-    let off = NodeEnvelope::for_node(&config, &off_limits, &[], 16)
+    let off = NodeEnvelope::for_memory_plan(&config, &off_limits, &[], 16)
         .expect("the default config fits")
         .serve_output_bytes;
     config.zakura.tx_relay.enabled = true;
     let limits = ZakuraLocalLimits::from_config(&config);
     assert_eq!(limits.total_connections(), off_limits.total_connections());
-    let on = NodeEnvelope::for_node(&config, &limits, &[], 16)
+    let on = NodeEnvelope::for_memory_plan(&config, &limits, &[], 16)
         .expect("the default config fits with tx-relay on")
         .serve_output_bytes;
     let per_session = u128::from(crate::zakura::tx_relay::wire::SESSION_HELD_OUTPUT_BYTES);
@@ -327,6 +324,7 @@ fn tx_relay_counts_what_it_holds_outside_its_output_gate() {
 fn serving_output_counts_admitted_sessions() {
     const SESSION: u64 = 64 << 20;
     let mut config = Config::default();
+    config.zakura.max_connections = Some(crate::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS);
     let limits = ZakuraLocalLimits::from_config(&config);
     let connections = limits.total_connections();
     // Widening usize to u64 and u128 is lossless on supported targets.
@@ -334,7 +332,7 @@ fn serving_output_counts_admitted_sessions() {
         connections as u64,
         u128::from(discovery_serving_output_bytes(connections)),
     );
-    assert!(config.zakura.block_sync.peer_limits.max_inbound_peers > connections);
+    assert!(config.zakura.block_sync.peer_limits.max_inbound() > connections);
 
     // The reactors build their pools from the node's configs.
     let block_sync = config
@@ -354,7 +352,7 @@ fn serving_output_counts_admitted_sessions() {
     assert_eq!(headers.node_serve_output_bytes, Some(sessions * SESSION));
 
     let envelope =
-        NodeEnvelope::for_node(&config, &limits, &[], 16).expect("the default config fits");
+        NodeEnvelope::for_memory_plan(&config, &limits, &[], 16).expect("the default config fits");
     // `tx-relay` is on by default, so each connection adds what it holds
     // outside its output gate.
     let tx_relay =
@@ -376,11 +374,11 @@ fn serving_output_counts_admitted_sessions() {
         &mut config.zakura.block_sync.peer_limits,
         &mut config.zakura.header_sync.peer_limits,
     ] {
-        peer_limits.max_inbound_peers = 3;
-        peer_limits.max_outbound_peers = 2;
+        peer_limits.max_inbound_peers = Some(3);
+        peer_limits.max_outbound_peers = Some(2);
     }
     let envelope =
-        NodeEnvelope::for_node(&config, &limits, &[], 16).expect("the smaller pools fit");
+        NodeEnvelope::for_memory_plan(&config, &limits, &[], 16).expect("the smaller pools fit");
     assert_eq!(
         envelope.serve_output_bytes,
         2 * u128::from(5 * SESSION) + discovery + tx_relay
@@ -431,6 +429,7 @@ fn retiring_generations_count_against_the_node_across_reconnects() {
 /// A generation that outlives its admission slot breaks the bound. The reader reports
 /// that and refuses nothing.
 #[test]
+#[cfg(not(zakura_sim))]
 fn owners_beyond_the_admission_bound_are_visible_and_keep_running() {
     let node = node();
     let connection = connection(&node);
@@ -450,6 +449,33 @@ fn owners_beyond_the_admission_bound_are_visible_and_keep_running() {
         .collect();
     assert!(!bound().admits(&node.usage().owners));
     drop(handshakes);
+}
+
+/// Property conn-17: in the simulator, `report_usage` asserts when stream
+/// owners exceed `OwnerBound`.
+#[cfg(zakura_sim)]
+#[test]
+#[should_panic(expected = "Zakura owners exceed their admission bound")]
+fn report_usage_asserts_when_stream_owners_exceed_bound() {
+    let node = node();
+    let connection = connection(&node);
+    let _streams: Vec<_> = (0..=bound().streams)
+        .map(|_| stream(&connection, BLOCKS))
+        .collect();
+    let _ = node.report_usage(bound());
+}
+
+/// Property conn-17: in the simulator, `report_usage` asserts when handshake
+/// owners exceed `OwnerBound`.
+#[cfg(zakura_sim)]
+#[test]
+#[should_panic(expected = "Zakura owners exceed their admission bound")]
+fn report_usage_asserts_when_handshake_owners_exceed_bound() {
+    let node = node();
+    let _handshakes: Vec<_> = (0..=bound().handshakes)
+        .map(|_| node.owners().enter(OwnerPhase::Handshake))
+        .collect();
+    let _ = node.report_usage(bound());
 }
 
 /// One kind fills its raw and output gates on one connection. Every other kind on
@@ -489,8 +515,10 @@ async fn mixed_family_saturation_leaves_every_other_owner_available() {
         assert_eq!(usage.compat_response_bytes, 1);
         assert!(
             u128::from(usage.raw_bytes())
-                + u128::from(usage.output_bytes())
-                + u128::from(usage.compat_response_bytes)
+                <= u128::from(transport().connection_raw_bytes) * MAX_CONNECTIONS as u128
+        );
+        assert!(
+            u128::from(usage.output_bytes()) + u128::from(usage.compat_response_bytes)
                 <= retained_bound()
         );
 

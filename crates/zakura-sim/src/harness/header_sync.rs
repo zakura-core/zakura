@@ -330,10 +330,10 @@ impl NodeSettings {
     pub fn config(&self) -> ZakuraHeaderSyncConfig {
         let mut config = ZakuraHeaderSyncConfig::default();
         if let Some(max) = self.max_inbound_peers {
-            config.peer_limits.max_inbound_peers = max;
+            config.peer_limits.max_inbound_peers = Some(max);
         }
         if let Some(max) = self.max_outbound_peers {
-            config.peer_limits.max_outbound_peers = max;
+            config.peer_limits.max_outbound_peers = Some(max);
         }
         if let Some(max) = self.max_unproductive_header_requests {
             config.max_unproductive_header_requests = max;
@@ -2687,8 +2687,8 @@ pub fn storage_properties<S: HasView<View = StorageView>>() -> Vec<Property<S>> 
 fn storage_peer_limit(config: &ZakuraHeaderSyncConfig) -> usize {
     let limits = &config.peer_limits;
     admitted_peer_limit(
-        limits.max_inbound_peers,
-        limits.max_outbound_peers,
+        limits.max_inbound(),
+        limits.max_outbound(),
         zakura_network::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS,
     )
 }
@@ -2698,9 +2698,7 @@ fn storage_peer_limit(config: &ZakuraHeaderSyncConfig) -> usize {
 /// `prune_vct_supplier_history` passes them from its `config`.
 fn storage_departed_limit(config: &ZakuraHeaderSyncConfig) -> usize {
     let limits = &config.peer_limits;
-    limits
-        .max_inbound_peers
-        .saturating_add(limits.max_outbound_peers)
+    limits.max_inbound().saturating_add(limits.max_outbound())
 }
 
 /// What [`storage_properties`] read: the node's storage facts and the

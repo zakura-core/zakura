@@ -108,6 +108,18 @@ impl SendStream {
         Ok(())
     }
 
+    /// Waits until quinn-proto holds every write, so none waits at the
+    /// connection task. A caller that funds its written bytes awaits this
+    /// before it releases them, since a write returns with up to
+    /// [`WRITE_AHEAD_BYTES`] still queued there. Cancelling the wait keeps
+    /// every reply.
+    pub async fn flush(&mut self) -> Result<(), WriteError> {
+        while !self.pending.is_empty() {
+            self.settle_oldest().await?;
+        }
+        Ok(())
+    }
+
     /// Collects the replies that already arrived, without waiting.
     fn reap(&mut self) -> Result<(), WriteError> {
         while let Some((len, reply)) = self.pending.front_mut() {

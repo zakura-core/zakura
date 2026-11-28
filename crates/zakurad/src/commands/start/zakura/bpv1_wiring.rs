@@ -16,11 +16,11 @@ use zakura_node_services::{
 
 use zakura_network::zakura::{
     bpv1::{
-        bpv1_custom_service, classify_body_verification_class, BlockVerifierPort, Bpv1Handle,
-        Bpv1Ports, HavePacing, HeaderChainAdmissionAdapter, MemoryBodyStore, NodeId, PortFuture,
-        Profile, VerifierVerdict, WorkId, ZakuraBpv1Config, VERIFY_DEADLINE,
+        classify_body_verification_class, BlockVerifierPort, Bpv1Ports, Bpv1Startup, HavePacing,
+        HeaderChainAdmissionAdapter, MemoryBodyStore, NodeId, PortFuture, VerifierVerdict, WorkId,
+        ZakuraBpv1Config, NODE_PROFILE, VERIFY_DEADLINE,
     },
-    CustomService, ZakuraHeaderSyncDriverStartup,
+    ZakuraHeaderSyncDriverStartup,
 };
 
 use super::{block_verify_error_class, BlockApplyTerminal, SyncCoordinator};
@@ -113,8 +113,9 @@ where
     }
 }
 
-/// Builds the opt-in BPv1 [`CustomService`] and [`Bpv1Handle`] for `Zakura` / `Dual` startup,
-/// sharing `body_claims` with native `block_sync`.
+/// Builds what the endpoint needs to start opt-in BPv1 on `Zakura` / `Dual` stacks, sharing
+/// `body_claims` with native `block_sync`. The endpoint starts it once it has built the memory
+/// pool BPv1 leases from.
 ///
 /// The service follows `committed_snapshots`: the verified tip moves its
 /// propagation window and ends committed collecting and fallback blocks, and the best header
@@ -123,7 +124,7 @@ where
 /// Sizes `DecodedBlockPool` to cover `decoded_backend_blocks` (non-finalized
 /// state retention) plus active BPv1 collection headroom.
 /// The service runs as `local_node` and submits assembled blocks to `verifier`.
-pub(crate) fn build_bpv1_service(
+pub(crate) fn bpv1_startup(
     config: &ZakuraBpv1Config,
     have_pacing: HavePacing,
     network: Network,
@@ -131,7 +132,7 @@ pub(crate) fn build_bpv1_service(
     verifier: Arc<dyn BlockVerifierPort>,
     driver_startup: &mut ZakuraHeaderSyncDriverStartup,
     shutdown: CancellationToken,
-) -> (CustomService, Bpv1Handle) {
+) -> Bpv1Startup {
     let body_claims = SharedBodyClaims::new();
     driver_startup.body_claims = Some(body_claims.clone());
     // Non-finalized state holds committed `OwnedBlock`s until finality (~100 blocks);
@@ -153,15 +154,15 @@ pub(crate) fn build_bpv1_service(
         fallback: Arc::new(body_claims),
         committed_snapshots: driver_startup.committed_snapshots.clone(),
     };
-    bpv1_custom_service(
-        config.clone(),
+    Bpv1Startup {
+        config: config.clone(),
         have_pacing,
-        Profile::W2,
+        profile: NODE_PROFILE,
         network,
         local_node,
         ports,
         shutdown,
-    )
+    }
 }
 
 #[cfg(test)]

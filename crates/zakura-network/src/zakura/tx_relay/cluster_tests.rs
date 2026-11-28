@@ -741,10 +741,16 @@ async fn a_session_that_ends_and_comes_back_is_live_again() -> Result<(), BoxErr
     let _guard = zakura_test::init();
     let (handle, _inbox) = zakura_node_services::mempool::port::pool_port();
     assert!(
-        tx_relay_service(handle, cools(), &Default::default(), Default::default())
-            .service
-            .session_policy()
-            .reopen
+        tx_relay_service(
+            handle,
+            super::test_memory_pool(),
+            cools(),
+            &Default::default(),
+            Default::default()
+        )
+        .service
+        .session_policy()
+        .reopen
     );
 
     let tx = transaction();

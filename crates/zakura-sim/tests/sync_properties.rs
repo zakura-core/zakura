@@ -14,12 +14,13 @@ use support::{
 };
 use zakura_sim::{
     domain::{
-        block_sync::TEARDOWN_RETURNS_BASELINE as BLOCK_TEARDOWN_RETURNS_BASELINE,
         block_sync_semantic::{SemanticModel, FRONTIER_WORK_CONSISTENT, QUERY_WORK_AUTHORIZED},
         cross::{
             EpochHistory, BLOCK_REQUESTS_FOLLOW_HEADERS, HEADER_REORG_RETIRES_BLOCK_WORK,
-            TEARDOWN_RETURNS_BASELINE, TIPS_CONSISTENT,
+            TIPS_CONSISTENT,
         },
+        header_sync::TEARDOWN_RETURNS_BASELINE as HEADER_TEARDOWN_RETURNS_BASELINE,
+        memory_pool::TEARDOWN_RETURNS_ZERO,
     },
     harness::{
         block_node::policy::Trigger,
@@ -179,14 +180,14 @@ fn a_reorg_at_each_pipeline_stage_retires_old_epoch_work() {
     }
 }
 
-/// Asserts that `report` held `sync/teardown-returns-baseline`, violated
+/// Asserts that `report` held `header-sync/teardown-returns-baseline`, violated
 /// nothing, and that its node's first header prepare, the held one, ended
 /// `dropped`: the stopped reactor dropped the call unfinished. A later
 /// prepare, from the other mirror after the round's deadline, may come
 /// before a late shutdown.
 fn dropped_a_held_prepare(label: &str, report: &RunReport) {
     assert_eq!(report.end.violation, None, "{label}: {:?}", report.end);
-    applicable_and_held(report, TEARDOWN_RETURNS_BASELINE);
+    applicable_and_held(report, HEADER_TEARDOWN_RETURNS_BASELINE);
     let facts: Vec<&ReactorFact> = report
         .log
         .entries()
@@ -221,8 +222,8 @@ fn dropped_a_held_prepare(label: &str, report: &RunReport) {
 /// The header half of the teardown matrix: the node shuts down while header
 /// storage holds its first prepare, so the stopped reactor drops that
 /// prepare's call unfinished, and the call's headers return only through
-/// that drop. `sync/teardown-returns-baseline` applies and holds under the
-/// committed input and generated Plans.
+/// that drop. `header-sync/teardown-returns-baseline` applies and holds
+/// under the committed input and generated Plans.
 #[test]
 fn header_teardown_across_a_held_prepare_returns_baseline() {
     let committed = Plan::from_fuzz(&[]);
@@ -310,11 +311,12 @@ fn a_late_teardown_still_drops_the_held_prepare() {
 /// xsync-4's teardown matrix: the node shuts down while block storage holds
 /// its first needed-block query, and while it holds its second body's apply.
 /// Each held operation completes after the shutdown. Once both settle,
-/// `block-sync/teardown-returns-baseline` holds: no block-sync charge
-/// remains, session slots included. `sync/teardown-returns-baseline` holds
-/// too: header sync's tap saw its teardown settle, with no reservation,
-/// lease, budget charge or locator permit left. Neither storage holds an
-/// operation of the node's at the end, and no active property is violated.
+/// `memory/teardown-returns-zero` holds: every live pool lease and every
+/// block-sync charge (session slots included) is back at zero.
+/// `header-sync/teardown-returns-baseline` holds too: header sync's tap saw
+/// its teardown settle, with no reservation, lease, budget charge or locator
+/// permit left. Neither storage holds an operation of the node's at the end,
+/// and no active property is violated.
 #[test]
 fn teardown_across_held_work_returns_baseline() {
     let committed = Plan::from_fuzz(&[]);
@@ -322,8 +324,8 @@ fn teardown_across_held_work_returns_baseline() {
         for input in std::iter::once(committed.clone()).chain(inputs(4, 256)) {
             let (report, ports) = run_with_ports(saved, input);
             assert_eq!(report.end.violation, None, "{}", saved.name());
-            applicable_and_held(&report, BLOCK_TEARDOWN_RETURNS_BASELINE);
-            applicable_and_held(&report, TEARDOWN_RETURNS_BASELINE);
+            applicable_and_held(&report, TEARDOWN_RETURNS_ZERO);
+            applicable_and_held(&report, HEADER_TEARDOWN_RETURNS_BASELINE);
             assert_eq!(ports.port.pending(), Vec::new(), "{}", saved.name());
             assert_eq!(ports.service.pending(), Vec::new(), "{}", saved.name());
         }

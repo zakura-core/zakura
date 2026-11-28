@@ -99,6 +99,44 @@ pub const COMMAND_QUEUE: usize = 1_024;
 #[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ReservationId(pub u64);
 
+/// What a `tx-relay` fetch tells the core about the body it will bring
+/// (`02 §7` item 7, `mem-7`).
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct RelayedFetch {
+    /// The body size the peer announced, which `relay-1` holds it to.
+    pub announced_size: u64,
+    /// The bytes of the `Consumer::Tx` memory lease the caller holds for the
+    /// body. Fewer than `announced_size` asks for the empty-pool exception:
+    /// the core grants it only into an empty pool.
+    pub leased_bytes: u64,
+}
+
+/// The core's hold on a relayed fetch's memory lease. Dropping it tells the
+/// caller, through its [`TxLeaseEnd`], that the core no longer counts the
+/// fetch's bytes.
+#[derive(Debug)]
+pub struct TxLeaseHold {
+    /// Dropped, never sent on: the drop is the signal.
+    _ended: oneshot::Sender<()>,
+}
+
+/// Resolves once the core no longer counts a relayed fetch's bytes: its
+/// transaction was decided, or its reservation ended without a body. The
+/// caller holds its memory lease until then.
+#[derive(Debug, Default)]
+pub struct TxLeaseEnd(Option<oneshot::Receiver<()>>);
+
+impl TxLeaseEnd {
+    /// Waits until the core lets go of the lease. One the core never held
+    /// has already ended.
+    pub async fn ended(self) {
+        if let Some(ended) = self.0 {
+            // The hold's drop, or the core stopping, ends the lease.
+            let _ = ended.await;
+        }
+    }
+}
+
 /// A slot in the core for one transaction id.
 ///
 /// Dropping it frees the slot, unless the core has accepted it. That holds
@@ -119,6 +157,12 @@ pub struct Reservation {
     cancel: CancellationToken,
     /// When the core ends the admission. See [`Self::give_up_at`].
     give_up: Option<Instant>,
+    /// When the core stops counting a relayed fetch's bytes. See
+    /// [`Self::take_tx_lease_end`].
+    tx_lease_end: TxLeaseEnd,
+    /// What a relayed fetch's memory lease holds once its body decoded. See
+    /// [`Self::with_tx_lease_bytes`].
+    tx_lease_bytes: Option<u64>,
 }
 
 impl Reservation {
@@ -136,6 +180,8 @@ impl Reservation {
             release: Some(release),
             cancel,
             give_up: None,
+            tx_lease_end: TxLeaseEnd::default(),
+            tx_lease_bytes: None,
         }
     }
 
@@ -156,12 +202,34 @@ impl Reservation {
         self.give_up
     }
 
+    /// Tells the core that the relayed fetch's memory lease now holds
+    /// `bytes`, grown to cover the decoded body, so the core counts that
+    /// many for the fetch from the submission on.
+    pub fn with_tx_lease_bytes(mut self, bytes: u64) -> Self {
+        self.tx_lease_bytes = Some(bytes);
+        self
+    }
+
+    /// What the relayed fetch's memory lease holds, if its caller grew it.
+    /// See [`Self::with_tx_lease_bytes`].
+    pub fn tx_lease_bytes(&self) -> Option<u64> {
+        self.tx_lease_bytes
+    }
+
     /// Cancelled when the core no longer needs the body this reservation
     /// was taken for, such as when a block mines the transaction while it is
     /// fetched. A caller that is fetching stops and drops the reservation,
     /// which frees its slot, as today's pool cancels the download.
     pub fn cancellation(&self) -> CancellationToken {
         self.cancel.clone()
+    }
+
+    /// Takes the signal that the core no longer counts this relayed fetch's
+    /// bytes. The caller holds its memory lease for the fetch until it
+    /// resolves. A reservation that is not for a relayed fetch, or whose
+    /// signal was taken, has one that has already ended.
+    pub fn take_tx_lease_end(&mut self) -> TxLeaseEnd {
+        std::mem::take(&mut self.tx_lease_end)
     }
 
     /// The core's name for this reservation.
@@ -667,9 +735,9 @@ pub enum PoolCommand {
     Reserve {
         /// The transaction id.
         tx_id: UnminedTxId,
-        /// Whether a `tx-relay` fetch asks, which also needs room under
-        /// [`MAX_RELAYED`].
-        relayed: bool,
+        /// What a `tx-relay` fetch says of its body, when one asks. It also
+        /// needs room under [`MAX_RELAYED`].
+        relayed: Option<RelayedFetch>,
         /// Where the answer goes.
         reply: oneshot::Sender<Result<Reservation, Unreserved>>,
     },
@@ -828,24 +896,28 @@ impl PoolHandle {
         tx_id: UnminedTxId,
         deadline: Instant,
     ) -> Result<Result<Reservation, Unreserved>, Elapsed> {
-        self.reserve_as(tx_id, false, deadline).await
+        self.reserve_as(tx_id, None, deadline).await
     }
 
     /// [`Self::reserve`] for a `tx-relay` fetch, which also needs room under
-    /// [`MAX_RELAYED`].
+    /// [`MAX_RELAYED`]. The core counts the fetch's bytes against `fetch`'s
+    /// memory lease until it decides the transaction or the reservation
+    /// ends. A fetch without a covering lease gets a reservation only into
+    /// an empty pool, and [`Unreserved::NoRoom`] otherwise.
     pub async fn reserve_relayed(
         &self,
         tx_id: UnminedTxId,
+        fetch: RelayedFetch,
         deadline: Instant,
     ) -> Result<Result<Reservation, Unreserved>, Elapsed> {
-        self.reserve_as(tx_id, true, deadline).await
+        self.reserve_as(tx_id, Some(fetch), deadline).await
     }
 
     /// Sends a reserve command and waits for its answer until `deadline`.
     async fn reserve_as(
         &self,
         tx_id: UnminedTxId,
-        relayed: bool,
+        relayed: Option<RelayedFetch>,
         deadline: Instant,
     ) -> Result<Result<Reservation, Unreserved>, Elapsed> {
         by(deadline, async {
@@ -1085,6 +1157,21 @@ impl PoolInbox {
         cancel: CancellationToken,
     ) -> Reservation {
         Reservation::granted(id, tx_id, self.release_handle.clone(), cancel)
+    }
+
+    /// [`Self::grant`] for a relayed fetch whose bytes the core counts until
+    /// it drops the returned hold. The caller learns of the drop through
+    /// [`Reservation::take_tx_lease_end`].
+    pub fn grant_relayed(
+        &self,
+        id: ReservationId,
+        tx_id: UnminedTxId,
+        cancel: CancellationToken,
+    ) -> (Reservation, TxLeaseHold) {
+        let (hold, ended) = oneshot::channel();
+        let mut reservation = self.grant(id, tx_id, cancel);
+        reservation.tx_lease_end = TxLeaseEnd(Some(ended));
+        (reservation, TxLeaseHold { _ended: hold })
     }
 
     /// Publish one batch: append `changes` to the log, then publish the

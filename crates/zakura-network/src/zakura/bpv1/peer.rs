@@ -57,6 +57,11 @@ pub const DEFAULT_EARLY_PEER_BYTES_CAP: usize = 2 * PART_RULE.payload.max();
 /// Control-stream early-record entry cap.
 pub const EARLY_CONTROL_CAP: usize = 64;
 
+/// Bytes the control early records of one session hold at their cap.
+// Widening usize to u64 is lossless on supported targets.
+pub const EARLY_CONTROL_BYTES: u64 =
+    (EARLY_CONTROL_CAP * std::mem::size_of::<EarlyControlEntry>()) as u64;
+
 /// Session park cooldown on first stall (`30 s`, bpv1-58).
 pub const LIVENESS_COOLDOWN: Duration = Duration::from_secs(30);
 

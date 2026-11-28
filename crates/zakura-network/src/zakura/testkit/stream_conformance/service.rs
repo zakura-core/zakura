@@ -459,8 +459,8 @@ impl<A: StreamConformance> LayoutService<A> {
         let pool = ReservationPool::new(sizing::reservation_entries(smallest))
             .expect("derived entries are valid");
         let limits = ServicePeerLimits {
-            max_inbound_peers: 4,
-            max_outbound_peers: 4,
+            max_inbound_peers: Some(4),
+            max_outbound_peers: Some(4),
             max_pending_escalations: 4,
             ..ServicePeerLimits::default()
         };

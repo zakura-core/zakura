@@ -45,14 +45,14 @@ use crate::{
 };
 
 use super::trace::BlockBodySource;
-use super::transport::{COMPAT_RESPONSE_MAX_AGGREGATE_BYTES, DEFAULT_REACTOR_OUTPUT_BYTES};
+use super::transport::COMPAT_RESPONSE_MAX_AGGREGATE_BYTES;
 use super::TxRelaySessions;
 use super::{
     spawn_supervised_peer_task, BoxRunFuture, CloseRow, Frame, FramedSend, OrderedSendError, Peer,
-    ReactorBudget, RequestResponseService, Service as ZakuraService, ServicePeerDirection,
-    SessionDemand, SessionOpening, SessionPolicy, SinkReject, Stream, ZakuraConnId,
-    ZakuraPeerHandle, ZakuraPeerId, ZakuraSupervisorHandle, ZakuraTrace, FRAME_HEADER_BYTES,
-    LOCAL_MAX_CONTROL_FRAME_BYTES, ZAKURA_CAP_LEGACY_GOSSIP,
+    ReactorBudget, ReceiveBudget, RequestResponseService, Service as ZakuraService,
+    ServicePeerDirection, SessionDemand, SessionOpening, SessionPolicy, SinkReject, Stream,
+    ZakuraConnId, ZakuraPeerHandle, ZakuraPeerId, ZakuraSupervisorHandle, ZakuraTrace,
+    FRAME_HEADER_BYTES, LOCAL_MAX_CONTROL_FRAME_BYTES, ZAKURA_CAP_LEGACY_GOSSIP,
 };
 
 mod trace;
@@ -115,7 +115,10 @@ const LEGACY_REQUEST_IN_FLIGHT_LIMIT: usize = 64;
 /// budget. Queue slots do not bound variable-size payloads. A queued transaction can
 /// be as large as a protocol message, so the in-flight limit binds first for
 /// wire-maximum requests, and the queue holds many more ordinary ones.
-const LEGACY_INBOUND_RETAINED_BYTES: u64 =
+///
+/// Each node runs one sink, so the memory plan counts this budget once, as the
+/// fixed term `legacy_inbound`.
+pub(crate) const LEGACY_INBOUND_RETAINED_BYTES: u64 =
     // Widening usize to u64 is lossless on supported targets.
     (LEGACY_REQUEST_IN_FLIGHT_LIMIT * MAX_PROTOCOL_MESSAGE_LEN) as u64;
 /// Inventory fetches that one request client runs at once, including retries.
@@ -189,7 +192,7 @@ pub(super) const LEGACY_RESPONSE_MAX_FRAMES: usize = 8192;
 const REQUEST_ID_BYTES: usize = 8;
 const RESPONSE_CHUNK_HEADER_BYTES: usize = REQUEST_ID_BYTES + 1;
 const NO_STOP_HASH: block::Hash = block::Hash([0; 32]);
-const LEGACY_GOSSIP_SERVICE_STREAMS: [Stream; 2] = [
+pub(crate) const LEGACY_GOSSIP_SERVICE_STREAMS: [Stream; 2] = [
     Stream {
         kind: ZAKURA_STREAM_GOSSIP,
         version: LEGACY_GOSSIP_VERSION,
@@ -227,12 +230,12 @@ const _: () = assert!(LEGACY_GOSSIP_SERVICE_STREAMS[1].kind == ZAKURA_STREAM_LEG
 /// - Receive: two frames. The gossip receive loop decodes each frame and hands it
 ///   to the inbound queue without waiting, dropping it when the queue is full. It
 ///   holds one frame while the reader admits the next.
-/// - Output: [`DEFAULT_REACTOR_OUTPUT_BYTES`], today's share. Outbound gossip drops a
-///   frame that does not fit, so a smaller share would drop advertisements that the
-///   node queues today.
+/// - Output: four frames. Outbound gossip drops a frame that does not fit, here or
+///   in the node's compatibility allowance (`COMPAT_NODE_OUTPUT_BYTES`), so a peer
+///   that stops reading loses advertisements instead of holding more memory.
 pub const LEGACY_GOSSIP_BUDGET: ReactorBudget = ReactorBudget {
-    receive: 2 * LEGACY_GOSSIP_FRAME_BYTES,
-    output: DEFAULT_REACTOR_OUTPUT_BYTES,
+    receive: ReceiveBudget::unsolicited_only(2 * LEGACY_GOSSIP_FRAME_BYTES),
+    output: 4 * LEGACY_GOSSIP_FRAME_BYTES,
 }
 .assert_frame_cap(LEGACY_GOSSIP_SERVICE_STREAMS[0].frame_cap);
 
@@ -241,19 +244,24 @@ pub const LEGACY_GOSSIP_BUDGET: ReactorBudget = ReactorBudget {
 ///
 /// A connection's serving loop runs one outbound exchange at a time, so a
 /// conformant peer has one request and one response in flight on it.
-/// - Receive: one request frame, which this node holds while its service runs, plus
-///   the response payload of this node's one exchange, up to
-///   `COMPAT_RESPONSE_MAX_AGGREGATE_BYTES`. The exchange's frames and decode copies
-///   are funded separately by [`super::COMPAT_EXCHANGE_BUDGET`].
-/// - Output: [`DEFAULT_REACTOR_OUTPUT_BYTES`], today's share. A request reserves its
-///   whole response bound, up to the aggregate cap plus each frame's overhead, before
-///   its service runs, and a bound above this share refuses the request. This share
-///   keeps today's three maximal reservations, so a peer's retry after its own
-///   timeout does not wait on a service that is still running.
+/// - Receive: one request frame in `unsolicited`, which this node holds while
+///   its service runs, plus the response payload of this node's one exchange in
+///   `per_request`, up to `COMPAT_RESPONSE_MAX_AGGREGATE_BYTES`. The exchange's
+///   frames and decode copies are funded separately by
+///   [`super::COMPAT_EXCHANGE_BUDGET`].
+/// - Output: one maximal response: the aggregate cap, plus a quarter for its frames'
+///   overhead. A request reserves its whole response bound before its service runs,
+///   here and in the node's compatibility allowance (`COMPAT_NODE_OUTPUT_BYTES`), and a
+///   bound above this share refuses the request. A peer's retry after its own timeout
+///   waits while a maximal response is still running.
 pub const LEGACY_REQUESTS_BUDGET: ReactorBudget = ReactorBudget {
     // Widening usize to u64 is lossless on supported targets.
-    receive: LEGACY_REQUEST_FRAME_BYTES + COMPAT_RESPONSE_MAX_AGGREGATE_BYTES as u64,
-    output: DEFAULT_REACTOR_OUTPUT_BYTES,
+    receive: ReceiveBudget {
+        unsolicited: LEGACY_REQUEST_FRAME_BYTES,
+        per_request: COMPAT_RESPONSE_MAX_AGGREGATE_BYTES as u64,
+    },
+    // Widening usize to u64 is lossless on supported targets.
+    output: (COMPAT_RESPONSE_MAX_AGGREGATE_BYTES + COMPAT_RESPONSE_MAX_AGGREGATE_BYTES / 4) as u64,
 }
 .assert_frame_cap(LEGACY_GOSSIP_SERVICE_STREAMS[1].frame_cap);
 
@@ -265,7 +273,7 @@ pub const LEGACY_REQUESTS_BUDGET: ReactorBudget = ReactorBudget {
 /// it by the TCP connection limit. TCP output is outside this budget.
 pub const TCP_INGRESS_BUDGET: ReactorBudget = ReactorBudget {
     // Widening usize to u64 is lossless on supported targets.
-    receive: MAX_INCOMPLETE_MESSAGE_BYTES as u64,
+    receive: ReceiveBudget::unsolicited_only(MAX_INCOMPLETE_MESSAGE_BYTES as u64),
     output: 0,
 };
 
@@ -9334,14 +9342,15 @@ mod tests {
         Ok(())
     }
 
-    /// Reconnect churn holds at most one compatibility grant per client request,
-    /// which the node's envelope counts. Each exchange here runs on a fresh
-    /// connection, as after a reconnect, and keeps a full grant after that
-    /// connection's resources drop, until its requester gives up. The live grants
-    /// outnumber the admitted connections but stop at the client's slots.
+    /// Reconnect churn holds compatibility grants only within the node's exchange
+    /// allowance, which the node's envelope counts (F-900). Each exchange here runs
+    /// on a fresh connection, as after a reconnect, and keeps a full grant after
+    /// that connection's resources drop, until its requester gives up. The client
+    /// has 256 inventory slots, but the live grants stop at the allowance and the
+    /// other requests wait.
     #[tokio::test(start_paused = true)]
     async fn reconnect_churn_keeps_compat_grants_within_the_envelope() -> Result<(), BoxError> {
-        let grant_bytes = crate::zakura::COMPAT_EXCHANGE_BUDGET.receive;
+        let grant_bytes = crate::zakura::COMPAT_EXCHANGE_BUDGET.receive_total();
         let node = crate::zakura::transport::NodeResources::new(
             crate::zakura::ReactorShares::from_quic(&zakura_quic::QuicConfig::default()),
             legacy_gossip_streams().iter().copied(),
@@ -9385,8 +9394,10 @@ mod tests {
             })
             .collect();
         let installed = || node.owners().counts().installed;
+        // Widening u64 to usize is lossless on supported targets.
+        let allowed = (crate::zakura::transport::COMPAT_NODE_EXCHANGE_BYTES / grant_bytes) as usize;
         timeout(TEST_NET_TIMEOUT, async {
-            while installed() < LEGACY_CLIENT_INVENTORY_SLOTS {
+            while installed() < allowed {
                 sleep(Duration::from_millis(5)).await;
             }
         })
@@ -9394,8 +9405,8 @@ mod tests {
         sleep(Duration::from_secs(1)).await;
         assert_eq!(
             installed(),
-            LEGACY_CLIENT_INVENTORY_SLOTS,
-            "the extra requests wait for client slots"
+            allowed,
+            "the other requests wait for the node's exchange allowance"
         );
 
         let mut limits =
@@ -9407,7 +9418,6 @@ mod tests {
             LegacyGossipOutbound::default(),
         ))])?;
         let envelope = limits.resource_envelope(&registry);
-        assert!(installed() > limits.max_connections);
         // Widening usize to u64 is lossless on supported targets.
         assert!(installed() as u64 * grant_bytes <= envelope.compat_response_bytes);
 
@@ -9469,28 +9479,31 @@ mod tests {
         assert_eq!(
             LEGACY_GOSSIP_BUDGET,
             ReactorBudget {
-                receive: 2 * MIB,
-                output: 64 * MIB,
+                receive: ReceiveBudget::unsolicited_only(2 * MIB),
+                output: 4 * MIB,
             }
         );
         assert_eq!(
             LEGACY_REQUESTS_BUDGET,
             ReactorBudget {
-                receive: 17 * MIB,
-                output: 64 * MIB,
+                receive: ReceiveBudget {
+                    unsolicited: MIB,
+                    per_request: 16 * MIB,
+                },
+                output: 20 * MIB,
             }
         );
         assert_eq!(
             TCP_INGRESS_BUDGET,
             ReactorBudget {
-                receive: 2 * MIB + 24,
+                receive: ReceiveBudget::unsolicited_only(2 * MIB + 24),
                 output: 0,
             }
         );
         assert_eq!(
             crate::zakura::COMPAT_EXCHANGE_BUDGET,
             ReactorBudget {
-                receive: 20 * MIB,
+                receive: ReceiveBudget::unsolicited_only(20 * MIB),
                 output: 0,
             }
         );
@@ -9515,7 +9528,9 @@ mod tests {
         );
         assert_eq!(
             node.connection(ZAKURA_CAP_LEGACY_GOSSIP).receive_window(),
-            (1 << 20) + LEGACY_GOSSIP_BUDGET.receive + LEGACY_REQUESTS_BUDGET.receive
+            (1 << 20)
+                + LEGACY_GOSSIP_BUDGET.receive_total()
+                + LEGACY_REQUESTS_BUDGET.receive_total()
         );
         for stream in legacy_gossip_streams() {
             assert!(LEGACY_GOSSIP_BUDGET.output >= u64::from(stream.frame_cap));

@@ -188,6 +188,7 @@ fn startup(
             .decoded_block_pool(10_000)
             .expect("fixture decoded allowance fits"),
         ZakuraBlockSyncConfig::default(),
+        zakura_network::zakura::BlockSyncMemory::for_tests(),
     );
     assert!(startup.state_queries_enabled, "the constructor's default");
     startup.shutdown = shutdown;
@@ -483,11 +484,12 @@ fn block_sync_timers_ignore_the_host_clock() {
 }
 
 /// A closed action channel can never accept a query, so the reactor arms no
-/// retry and only its metrics tick wakes it.
+/// retry. Only its periodic ticks wake it, and the sequencer's one-second
+/// look-ahead cap refresh is the first of them.
 #[test]
 fn a_closed_action_channel_arms_no_query_retry() {
     let observed = run(behind(ActionSeam::Close), 3, 2);
-    let tick = ZakuraBlockSyncConfig::default().request_timeout;
+    let tick = Duration::from_secs(1);
     assert_eq!(observed.deadlines[..3], [tick, tick * 2, tick * 3]);
     assert_no_panic(&observed);
 }

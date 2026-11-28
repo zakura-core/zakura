@@ -272,7 +272,7 @@ impl Run {
             RelayEffect::Advert { session, id } => ("Advert", session.0, *id),
             RelayEffect::Serve { session, id } => ("Serve", session.0, *id),
             RelayEffect::NotFound { session, id } => ("NotFound", session.0, *id),
-            RelayEffect::Reserve { call, id } => ("Reserve", call.0, *id),
+            RelayEffect::Reserve { call, id, .. } => ("Reserve", call.0, *id),
             RelayEffect::Submit { waiter, body, .. } => ("Submit", waiter.0, body.id()),
             other => return format!("{other:?}"),
         };

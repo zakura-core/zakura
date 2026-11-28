@@ -337,6 +337,30 @@ pub(crate) struct Scenario {
 }
 
 impl Scenario {
+    /// Block sync's memory for this scenario. The Consensus reserve holds the
+    /// default 401-height commit window at admission's per-block charge, since
+    /// the scenario has no checkpoint list, and block sync's cap is the
+    /// scenario's in-flight and look-ahead bound.
+    pub(crate) fn block_sync_memory(&self) -> crate::zakura::BlockSyncMemory {
+        let (consensus, block_sync) = self.block_sync_memory_bytes();
+        crate::zakura::BlockSyncMemory::with_block_bytes(consensus, block_sync)
+    }
+
+    /// The Consensus reserve and block sync's cap that
+    /// [`Self::block_sync_memory`] builds.
+    pub(crate) fn block_sync_memory_bytes(&self) -> (u64, u64) {
+        use crate::zakura::block_sync::DESERIALIZED_MEM_FACTOR;
+        use crate::zakura::MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES;
+        let consensus = (MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES as u64)
+            .saturating_mul(block::MAX_BLOCK_BYTES)
+            .saturating_mul(1 + DESERIALIZED_MEM_FACTOR);
+        let block_sync = self
+            .config
+            .inflight_block_bytes()
+            .min(self.config.effective_max_reorder_lookahead_bytes());
+        (consensus, block_sync)
+    }
+
     /// A scenario over `blocks` heights whose initial header target is the full chain
     /// (so the node has everything to download immediately) and no timeline events.
     pub(crate) fn new(

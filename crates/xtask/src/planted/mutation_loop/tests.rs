@@ -32,7 +32,7 @@ use super::{
 use crate::planted::lane::{campaign_facts, Campaign, CampaignFacts};
 
 const NAMED: &str = "block-sync/retained-byte-bound";
-const OTHER: &str = "block-sync/reserved-byte-bound";
+const OTHER: &str = "block-sync/budget-ledgers-agree";
 
 /// An end record on thread `t1` whose run `stopped_by` stopped, with each
 /// of `outcomes` as `(id, outcome, applicable)`. An outcome is `held`,
@@ -1018,16 +1018,16 @@ fn a_skipped_search_case_leaves_stdout_to_the_listing() {
 /// names a directory doesn't also select a sibling that starts the same way.
 #[test]
 fn planted_prefixes_end_at_a_component() {
-    let case = "block-sync/reserved-byte-bound/above-floor-charge.patch";
+    let case = "block-sync/budget-ledgers-agree/above-floor-charge.patch";
     assert!(selects("block-sync/", case));
     assert!(selects("block-sync", case));
-    assert!(selects("block-sync/reserved-byte-bound", case));
+    assert!(selects("block-sync/budget-ledgers-agree", case));
     assert!(selects(
-        "block-sync/reserved-byte-bound/above-floor-charge",
+        "block-sync/budget-ledgers-agree/above-floor-charge",
         case
     ));
     assert!(!selects("block", case));
-    assert!(!selects("block-sync/reserved", case));
+    assert!(!selects("block-sync/budget", case));
     assert!(selects(
         "block",
         "block/work-funding/lost-reservation-release.patch"
@@ -1047,7 +1047,7 @@ fn stub_patch(file: &str) -> String {
 }
 
 /// A case watches its work-list entry's paths beside its patch's own: a
-/// change to `admission.rs`, the reserved-byte instance's code, reruns
+/// change to `admission.rs`, the budget-ledgers instance's code, reruns
 /// `budget-ignores-charges`, whose patch changes only the shared
 /// `guard.rs`. The store holds that case and its work-list entry.
 #[test]
@@ -1063,7 +1063,7 @@ fn a_case_watches_its_work_list_entrys_paths() {
         store.path(),
         "qa/native-mutations/cases.json",
         r#"[{"patch": "bounds/budget-ignores-charges/budget-ignores-charges.patch",
-            "entry": "bounds", "property": "block-sync/reserved-byte-bound",
+            "entry": "bounds", "property": "block-sync/budget-ledgers-agree",
             "witness": {"test": "t", "test_target": "block_resource_properties"}}]"#,
     );
     write_file(
@@ -1079,7 +1079,7 @@ property = "block-sync/retained-byte-bound"
 code = ["crates/zakura-network/src/zakura/block_sync/sequencer_task.rs"]
 
 [[entry.instance]]
-property = "block-sync/reserved-byte-bound"
+property = "block-sync/budget-ledgers-agree"
 code = ["crates/zakura-network/src/zakura/block_sync/admission.rs"]
 "#,
     );

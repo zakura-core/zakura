@@ -2,19 +2,16 @@
 //! retry filtering.
 //! Nothing here acquires a resource, reads a clock, or takes a lock; the routine
 //! passes in every observation. The work queue derives funding from the retained
-//! take ([`TakenRequest::admit`](crate::zakura::block_sync::work_queue::TakenRequest::admit)).
+//! take ([`TakenRequest::admit_for_connection`](crate::zakura::block_sync::work_queue::TakenRequest::admit_for_connection)).
 
 use std::ops::Range;
 
 use zakura_chain::block;
 use zakura_rt::time::Instant;
 
-use crate::zakura::block_sync::{
-    admission::{
-        admit, floor_rescue_high, request_priority, AdmissionOutcome, AdmissionSnapshot,
-        RequestPriority,
-    },
-    ZakuraBlockSyncConfig,
+use crate::zakura::block_sync::admission::{
+    admit, floor_rescue_high, request_priority, AdmissionOutcome, AdmissionSnapshot,
+    RequestPriority,
 };
 
 use super::{FillLimits, FillStop};
@@ -45,17 +42,16 @@ pub(super) struct TakePlan {
 /// `floor_start` is the first pending height this peer can serve in the
 /// floor-rescue window, or `None` when there is none or a preferred carrier
 /// should serve it. `admit` is the single authority for the commit-window
-/// exemption, the resident-memory gate, and take geometry and sizing. The plan
+/// exemption, the look-ahead block cap, and take geometry and sizing. The plan
 /// layers the per-peer congestion window's byte headroom on top, so a saturated
 /// window cannot fund a large speculative tail. The floor bypass adds its bodies
 /// of headroom. The one-byte minimum preserves the always-take-first-item
 /// floor-progress guarantee even at zero headroom: that single body is the only
-/// permitted overshoot, and the floor overdraft funds it.
+/// permitted overshoot, and its lease waits for the pool.
 ///
 /// The take starts at `servable_low`, not at `floor_start`. Another routine can
 /// return a lower height before the take.
 pub(super) fn plan_floor(
-    config: &ZakuraBlockSyncConfig,
     limits: &FillLimits,
     snapshot: AdmissionSnapshot,
     floor_start: Option<block::Height>,
@@ -67,7 +63,6 @@ pub(super) fn plan_floor(
         return Ok(None);
     }
     match admit(
-        config,
         snapshot,
         floor_start,
         limits.servable_high,
@@ -98,7 +93,6 @@ pub(super) fn plan_floor(
 /// headroom without the floor bypass, so an above-floor request never overshoots
 /// the byte window beyond the one always-taken item.
 pub(super) fn plan_above_floor(
-    config: &ZakuraBlockSyncConfig,
     limits: &FillLimits,
     snapshot: AdmissionSnapshot,
     start: Option<block::Height>,
@@ -107,7 +101,6 @@ pub(super) fn plan_above_floor(
         return Err(FillStop::NoWork);
     };
     match admit(
-        config,
         snapshot,
         start,
         limits.servable_high,
@@ -150,14 +143,13 @@ pub(super) enum Lane {
 /// floor, and it needs an above-floor slot like the above-floor lane. On a
 /// refusal the caller drops the take, which returns its run.
 pub(super) fn take_lanes(
-    config: &ZakuraBlockSyncConfig,
     limits: &FillLimits,
     snapshot: AdmissionSnapshot,
     floor_start: Option<block::Height>,
     mut take: impl FnMut(Lane, TakePlan) -> Option<block::Height>,
     first_pending: impl FnOnce() -> Option<block::Height>,
 ) -> Result<Lane, FillStop> {
-    if let Some(plan) = plan_floor(config, limits, snapshot, floor_start)? {
+    if let Some(plan) = plan_floor(limits, snapshot, floor_start)? {
         if let Some(first) = take(Lane::Floor, plan) {
             if request_priority(snapshot.download_floor, first) == RequestPriority::AboveFloor {
                 limits.above_floor_slot()?;
@@ -167,7 +159,7 @@ pub(super) fn take_lanes(
     }
 
     limits.above_floor_slot()?;
-    let plan = plan_above_floor(config, limits, snapshot, first_pending())?;
+    let plan = plan_above_floor(limits, snapshot, first_pending())?;
     take(Lane::AboveFloor, plan)
         .map(|_| Lane::AboveFloor)
         .ok_or(FillStop::NoWork)

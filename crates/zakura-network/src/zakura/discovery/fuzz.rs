@@ -1010,8 +1010,8 @@ fn local_config() -> ZakuraDiscoveryLocalConfig {
 
 fn peer_limits() -> ServicePeerLimits {
     ServicePeerLimits {
-        max_inbound_peers: PEER_CAP,
-        max_outbound_peers: PEER_CAP,
+        max_inbound_peers: Some(PEER_CAP),
+        max_outbound_peers: Some(PEER_CAP),
         ..ServicePeerLimits::default()
     }
 }

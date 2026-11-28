@@ -27,11 +27,15 @@ use super::super::{
     sequencer_task::{charge_decoded_handoff, DecodedHandoffCharge, SequencedBody, SequencerView},
     state::{OutstandingBlockRange, RequestKey, ThroughputMeter, WriteOutcome},
     wire::DecodedBlockPayload,
-    work_queue::{RequestWriteStatus, WorkQueue},
+    work_queue::{finish_receive_credit, RequestWriteStatus, WorkQueue},
     BlockSyncMisbehavior, BlockSyncPeerSession, ZakuraPeerId, ZakuraTrace,
 };
 use super::{state::unreceived_heights, SinkReject};
-use crate::zakura::{transport::ByteReservation, FramedRecv, ZakuraConnId};
+use crate::zakura::{
+    memory::{ConnectionCredit, Consumer, MemoryPool, PoolLease, PoolWaitToken},
+    transport::ByteReservation,
+    FramedRecv, ZakuraConnId,
+};
 
 /// The streams, shared owners, channels, and trace handles that one peer
 /// routine uses to execute its decisions. `PeerIO` makes no download, status,
@@ -80,6 +84,13 @@ pub(super) struct PeerIO {
     /// The routine then exits and its `Drop` guard returns work.
     pub(super) cancel: CancellationToken,
     pub(super) trace: ZakuraTrace,
+    /// The node-wide memory pool that `work` leases requests from (`02 §4`).
+    pub(super) memory_pool: MemoryPool,
+    /// Per-connection QUIC receive-credit controller (`02 §3`, `02 §6`).
+    pub(super) conn_credit: Option<ConnectionCredit>,
+    /// Marks the consumer whose refusal stopped the last fill pass waiting.
+    /// The routine polls that consumer's notifier.
+    pub(super) pool_wait: Option<(Consumer, PoolWaitToken)>,
     /// Receives the routine's events and snapshots, in test and simulator
     /// builds.
     #[cfg(any(test, zakura_sim))]
@@ -186,7 +197,7 @@ impl PeerIO {
             self.work.reserved_above(view.download_floor);
         let snapshot = AdmissionSnapshot {
             download_floor: view.download_floor,
-            verified_block_tip: view.verified_tip,
+            commit_window_top: view.commit_window_top,
             reorder_buffered_bytes: view.reorder_buffered_bytes,
             reorder_buffered_blocks: view.reorder_len,
             applying_buffered_bytes: view.applying_buffered_bytes,
@@ -200,13 +211,81 @@ impl PeerIO {
                 .saturating_add(view.applying_decoded_attributed_memory_bytes),
             reserved_above_floor_bytes,
             reserved_above_floor_blocks,
-            budget_available: self.budget.available(),
+            budget_available: self.memory_pool.available_for(Consumer::BlockSync),
+            consensus_available: self.memory_pool.available_for(Consumer::Consensus),
         };
         // This gauge records an admission input, so it changes only here. This
         // lossy cast is metrics-only; admission keeps the integer value.
         metrics::gauge!("sync.block.work.reserved_above_floor_bytes")
             .set(snapshot.reserved_above_floor_bytes as f64);
         snapshot
+    }
+
+    /// Mark `consumer` waiting after its refusal stopped a fill (`02 §5`).
+    pub(super) fn hold_pool_wait(&mut self, consumer: Consumer) {
+        if self
+            .pool_wait
+            .as_ref()
+            .is_none_or(|(waiting, _)| *waiting != consumer)
+        {
+            self.pool_wait = Some((consumer, self.memory_pool.wait_token(consumer)));
+        }
+    }
+
+    /// End the wait: a request leased, or a pass stopped for another reason.
+    pub(super) fn release_pool_wait(&mut self) {
+        self.pool_wait = None;
+    }
+
+    /// The consumer this routine waits on, if a refusal stopped its fill.
+    pub(super) fn pool_wait_consumer(&self) -> Option<Consumer> {
+        self.pool_wait.as_ref().map(|(consumer, _)| *consumer)
+    }
+
+    /// Transition a request's receive-credit lease to a received body lease
+    /// (`decision-4`, `02 §6`).
+    ///
+    /// Lowers the request connection's QUIC receive window by `charge` and
+    /// returns the lease, sized to `serialized_bytes`, that travels with the
+    /// body into sequencer retention. Returns `None` when the pool refuses
+    /// bytes the request didn't lease; the caller then returns the height.
+    ///
+    /// - The credit's unspent `charge - serialized_bytes` stays charged in the
+    ///   connection's drain queue. Commit-window drains move to
+    ///   `Consumer::BlockSync`, so a withholding peer can't pin Consensus.
+    /// - A late body on another connection takes a lease whose credit that
+    ///   connection still holds. Its credit finishes fully unspent, and the
+    ///   body leases its bytes on this connection.
+    pub(super) fn settle_received_body_lease(
+        &self,
+        charge: u64,
+        serialized_bytes: u64,
+        lease: Option<PoolLease>,
+        conn_credit: Option<ConnectionCredit>,
+    ) -> Option<PoolLease> {
+        let mut lease = lease.unwrap_or_else(|| {
+            self.memory_pool
+                .empty_lease(Consumer::BlockSync, Some(self.conn_id))
+        });
+        match conn_credit {
+            Some(credit) if lease.peer() != Some(self.conn_id) => {
+                let consumer = lease.consumer();
+                finish_receive_credit(&credit, charge, Some(lease));
+                lease = self.memory_pool.empty_lease(consumer, Some(self.conn_id));
+            }
+            Some(credit) => {
+                let unspent = charge.saturating_sub(serialized_bytes);
+                let unspent_lease = (unspent > 0)
+                    .then(|| lease.split(unspent.min(lease.bytes())))
+                    .flatten();
+                finish_receive_credit(&credit, charge, unspent_lease);
+            }
+            None => lease.shrink_to(serialized_bytes),
+        }
+        // The QUIC window admitted a body above its estimate. Lease the excess
+        // or return the height, so no retained byte goes unleased.
+        lease.try_grow_to(serialized_bytes).ok()?;
+        Some(lease)
     }
 
     /// Reserve the sequencer slot for a body about to be decoded. A full input
@@ -241,15 +320,36 @@ impl PeerIO {
     /// suspension point separates them. Funding releases only after the body
     /// counts in `sequencer_input_bytes`, so the bytes are never invisible to both
     /// the limiter and the resident snapshot.
+    ///
+    /// A body without a lease (the pool refused its bytes above the estimate)
+    /// is dropped. Its height returns to pending at its measured size, so the
+    /// next request leases the whole body and waits for the pool if it must.
+    /// `fetch_elapsed` is the duration of the request this body completed.
     pub(super) fn send_under_receipt(
         &self,
         body: ReceivedBody<Option<AdmittedBody>>,
         owner: zakura_header_chain::BodyWorkOwner,
         funding: ByteReservation,
+        body_lease: Option<PoolLease>,
         admitted_estimate_bytes: Option<u64>,
+        fetch_elapsed: Option<std::time::Duration>,
     ) {
         let settlement = ReceiptSettlement::new(self, owner, body.height, funding);
-        self.forward_body_to_sequencer(body, owner, admitted_estimate_bytes);
+        let Some(body_lease) = body_lease else {
+            let (height, hash, bytes) = (body.height, body.hash, body.serialized_bytes);
+            drop(body);
+            drop(settlement);
+            metrics::counter!("sync.block.body.unleased_returned").increment(1);
+            self.work.return_unleased_body(owner, height, hash, bytes);
+            return;
+        };
+        self.forward_body_to_sequencer(
+            body,
+            owner,
+            body_lease,
+            admitted_estimate_bytes,
+            fetch_elapsed,
+        );
         drop(settlement);
     }
 
@@ -261,6 +361,7 @@ impl PeerIO {
     pub(super) fn admit_decoded_body(
         &self,
         body: ReceivedBody,
+        body_lease: &mut Option<PoolLease>,
     ) -> Result<(ReceivedBody<Option<AdmittedBody>>, u64), AdmissionFailure> {
         let ReceivedBody {
             height,
@@ -271,7 +372,7 @@ impl PeerIO {
             serialized_bytes,
             permit,
         } = body;
-        let (block, decoded_bytes) = self.admit_block(block)?;
+        let (block, decoded_bytes) = self.admit_block(block, serialized_bytes, body_lease)?;
         Ok((
             ReceivedBody {
                 height,
@@ -289,6 +390,8 @@ impl PeerIO {
     fn admit_block(
         &self,
         block: Arc<block::Block>,
+        serialized_bytes: u64,
+        body_lease: &mut Option<PoolLease>,
     ) -> Result<(Option<AdmittedBody>, u64), AdmissionFailure> {
         if self.decoded_pool.is_closed() {
             self.cancel.cancel();
@@ -307,12 +410,26 @@ impl PeerIO {
         ) else {
             return Ok((None, bytes));
         };
+        // Grow the body's pool lease to cover both raw and decoded bytes before
+        // retaining the decoded copy; refusal keeps only the raw payload. A
+        // body without a lease is returned, so it keeps nothing decoded.
+        let Some(lease) = body_lease.as_mut() else {
+            return Ok((None, bytes));
+        };
+        let prev_lease_bytes = lease.bytes();
+        let target = serialized_bytes.saturating_add(bytes);
+        if lease.try_grow_to(target.max(prev_lease_bytes)).is_err() {
+            return Ok((None, bytes));
+        }
         match self
             .decoded_pool
             .try_admit_measured(block, Admission::WithinLimit)
         {
             Ok(block) => Ok((Some(AdmittedBody { block, charge }), bytes)),
             Err(rejected) => {
+                if let Some(lease) = body_lease.as_mut() {
+                    lease.shrink_to(prev_lease_bytes);
+                }
                 if !matches!(
                     rejected.reason,
                     AdmissionFailure::Capacity | AdmissionFailure::AliasedPayload
@@ -330,7 +447,9 @@ impl PeerIO {
         &self,
         received: ReceivedBody<Option<AdmittedBody>>,
         owner: zakura_header_chain::BodyWorkOwner,
+        body_lease: PoolLease,
         admitted_estimate_bytes: Option<u64>,
+        fetch_elapsed: Option<std::time::Duration>,
     ) {
         let ReceivedBody {
             height,
@@ -351,7 +470,7 @@ impl PeerIO {
             }
             None => BufferedBlockBody::RawFramePayload(raw_payload),
         };
-        let body = SequencedBody::new_handed_off(
+        let mut body = SequencedBody::new_handed_off(
             owner,
             self.source,
             height,
@@ -368,6 +487,8 @@ impl PeerIO {
             self.sequencer_input_bytes.clone(),
             self.sequencer_input_decoded_attributed_memory_bytes.clone(),
         );
+        body.body_lease = Some(body_lease);
+        body.fetch_elapsed = fetch_elapsed;
 
         // Report retention before sending because the sequencer can dequeue
         // the body immediately on another thread.

@@ -2297,7 +2297,7 @@ fn a_session_refused_at_the_peer_cap_is_reported_and_cancelled() {
         Some(recorder.clone()),
         crate::zakura::ZakuraTrace::noop(),
     );
-    reactor.startup.config.peer_limits.max_inbound_peers = 1;
+    reactor.startup.config.peer_limits.max_inbound_peers = Some(1);
     let (first, second) = (
         ZakuraPeerId::new(vec![0x41; 32]).expect("the test peer ID has the required length"),
         ZakuraPeerId::new(vec![0x42; 32]).expect("the test peer ID has the required length"),

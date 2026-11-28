@@ -122,6 +122,15 @@ impl WorkReturnOutcome {
     }
 }
 
+/// Merge `(owner, bytes)` into a compact per-owner release list (preserving order).
+fn add_owner_release(entries: &mut Vec<(BodyWorkOwner, u64)>, owner: BodyWorkOwner, bytes: u64) {
+    if let Some((_, total)) = entries.iter_mut().find(|(existing, _)| *existing == owner) {
+        *total = total.saturating_add(bytes);
+    } else {
+        entries.push((owner, bytes));
+    }
+}
+
 /// Wakeups that a logical work transition requires.
 #[must_use]
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
@@ -135,11 +144,14 @@ pub(in crate::zakura::block_sync) struct WorkWake {
 
 /// The logical change of a settling transition.
 #[must_use]
-#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(in crate::zakura::block_sync) struct WorkDelta {
     /// Reservation bytes that left the ledger. The queue settles exactly these
     /// bytes from its pooled funding, once.
     pub(in crate::zakura::block_sync) released_bytes: u64,
+    /// Per-owner reservation bytes settled by this transition, used to release
+    /// or drain each owner's matching [`PoolLease`](crate::zakura::memory::PoolLease).
+    pub(in crate::zakura::block_sync) released_by_owner: Vec<(BodyWorkOwner, u64)>,
     /// Wakeups the change requires.
     pub(in crate::zakura::block_sync) wake: WorkWake,
 }
@@ -789,7 +801,7 @@ impl WorkQueueState {
         height: block::Height,
         hash: block::Hash,
         bytes: u64,
-        verified_tip: block::Height,
+        retry_after_tip: Option<block::Height>,
     ) -> Option<WorkWake> {
         let Entry::Occupied(entry) = self.in_flight.entry(height) else {
             return None;
@@ -809,7 +821,7 @@ impl WorkQueueState {
             .take()
             .unwrap_or(item.estimated_bytes)
             .max(item.observed_bytes);
-        item.retry_after_tip = Some(verified_tip);
+        item.retry_after_tip = retry_after_tip;
         item.owner = None;
         let revocation = std::mem::take(&mut item.answered_elsewhere);
         self.pending.insert(height, item);
@@ -949,6 +961,7 @@ impl WorkQueueState {
             released = self.add_to_total(released, item.budget.release_reserved());
         }
         let mut revocation = false;
+        let mut released_by_owner = Vec::new();
         while let Some((&height, _)) = self.in_flight.first_key_value() {
             if height > floor {
                 break;
@@ -960,11 +973,17 @@ impl WorkQueueState {
             revocation |= item.budget.is_reserved() || item.answered_elsewhere;
             let charge = item.budget.release_reserved();
             self.settle_in_flight(item.owner, charge);
+            if charge > 0 {
+                if let Some(owner) = item.owner {
+                    add_owner_release(&mut released_by_owner, owner, charge);
+                }
+            }
             released = self.add_to_total(released, charge);
         }
         self.settle_ledger(released);
         WorkDelta {
             released_bytes: released,
+            released_by_owner,
             wake: WorkWake {
                 revocation,
                 ..WorkWake::default()
@@ -980,7 +999,7 @@ impl WorkQueueState {
     ///
     /// IO resets the affected request writes under the same lock first.
     pub(in crate::zakura::block_sync) fn reset_above(&mut self, floor: block::Height) -> WorkDelta {
-        let committed = self.advance_floor(floor);
+        let mut committed = self.advance_floor(floor);
         self.floor = floor;
         // Pop only the `> floor` suffix from each map (O(removed · log n)); see the
         // note in `advance_floor` on why a full-map `retain` is too expensive here.
@@ -1007,12 +1026,18 @@ impl WorkQueueState {
             revocation |= item.budget.is_reserved() || item.answered_elsewhere;
             let charge = item.budget.release_reserved();
             self.settle_in_flight(item.owner, charge);
+            if charge > 0 {
+                if let Some(owner) = item.owner {
+                    add_owner_release(&mut committed.released_by_owner, owner, charge);
+                }
+            }
             released = self.add_to_total(released, charge);
         }
         // `advance_floor` already settled the prefix it dropped.
         self.settle_ledger(released);
         WorkDelta {
             released_bytes: self.add_to_total(released, committed.released_bytes),
+            released_by_owner: committed.released_by_owner,
             wake: WorkWake {
                 revocation,
                 ..WorkWake::default()

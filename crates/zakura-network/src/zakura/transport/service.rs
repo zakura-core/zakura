@@ -338,6 +338,9 @@ pub struct Peer {
     /// Reads the connection's smoothed round-trip time, when the transport
     /// has a QUIC connection to read it from.
     rtt: Option<zakura_quic::RttReader>,
+    /// Per-connection dynamic receive-credit and send-window controller when
+    /// the endpoint runs with a [`crate::zakura::memory::MemoryPool`].
+    credit: Option<crate::zakura::memory::ConnectionCredit>,
 }
 
 impl Peer {
@@ -533,6 +536,7 @@ impl Peer {
             close_cause,
             load: None,
             rtt: None,
+            credit: None,
         }
     }
 
@@ -557,6 +561,21 @@ impl Peer {
     /// transport gave one.
     pub(crate) fn rtt_reader(&self) -> Option<zakura_quic::RttReader> {
         self.rtt.clone()
+    }
+
+    /// Attach the per-connection credit controller used by leased reactors.
+    pub(crate) fn with_connection_credit(
+        mut self,
+        credit: Option<crate::zakura::memory::ConnectionCredit>,
+    ) -> Self {
+        self.credit = credit;
+        self
+    }
+
+    /// Per-connection credit controller, when the transport runs with a
+    /// [`crate::zakura::memory::MemoryPool`].
+    pub(crate) fn connection_credit(&self) -> Option<crate::zakura::memory::ConnectionCredit> {
+        self.credit.clone()
     }
 
     /// This peer, with every stream it carries reporting `origin` as where

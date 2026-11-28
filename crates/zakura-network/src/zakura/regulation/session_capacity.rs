@@ -62,12 +62,14 @@ impl SessionCapacity {
     /// Slots from `limits`. `service` labels the metrics.
     pub(crate) fn new(service: &'static str, limits: &ServicePeerLimits) -> Self {
         let pool = |count: usize| Arc::new(Semaphore::new(count.min(Semaphore::MAX_PERMITS)));
+        let inbound = limits.max_inbound();
+        let outbound = limits.max_outbound();
         let setup = limits.max_pending_escalations.min(Semaphore::MAX_PERMITS);
-        let inbound_setup = setup.saturating_sub(usize::from(limits.max_outbound_peers > 0));
+        let inbound_setup = setup.saturating_sub(usize::from(outbound > 0));
         Self {
             service,
-            inbound: pool(limits.max_inbound_peers),
-            outbound: pool(limits.max_outbound_peers),
+            inbound: pool(inbound),
+            outbound: pool(outbound),
             setup: pool(setup),
             inbound_setup: pool(inbound_setup),
             changed: watch::channel(()).0,

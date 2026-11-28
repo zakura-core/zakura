@@ -123,7 +123,7 @@ use crate::{
         inbound::{self, InboundSetupData, MAX_INBOUND_RESPONSE_TIME},
         mempool::{self, Mempool},
         miner_mesh,
-        sync::{self, show_block_chain_progress, VERIFICATION_PIPELINE_SCALING_MULTIPLIER},
+        sync::{self, show_block_chain_progress},
         tokio::{new_runtime, RuntimeRun},
         zcashd_compat, ChainSync, Inbound,
     },
@@ -786,8 +786,9 @@ impl StartCmd {
             state_config,
             &config.network.network,
             max_checkpoint_height,
-            config.sync.checkpoint_verify_concurrency_limit
-                * (VERIFICATION_PIPELINE_SCALING_MULTIPLIER + 1),
+            config
+                .sync
+                .checkpoint_output_lookahead(&config.network.network, max_checkpoint_height),
         )
         .boxed()
         .await

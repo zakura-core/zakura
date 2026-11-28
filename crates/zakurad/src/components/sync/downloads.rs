@@ -39,7 +39,7 @@ use crate::components::{
         legacy_trace::{
             LegacyBlockOutcome, LegacyDiagnosticSnapshot, LegacySyncTrace, LegacyTaskState,
         },
-        lookahead_limit_multiplier, BLOCK_DOWNLOAD_TIMEOUT, FINAL_CHECKPOINT_BLOCK_VERIFY_TIMEOUT,
+        LookaheadScale, BLOCK_DOWNLOAD_TIMEOUT, FINAL_CHECKPOINT_BLOCK_VERIFY_TIMEOUT,
         FINAL_CHECKPOINT_BLOCK_VERIFY_TIMEOUT_LIMIT,
     },
 };
@@ -70,17 +70,22 @@ pub const VERIFICATION_PIPELINE_DROP_LIMIT: HeightDiff = 50_000;
 
 /// Returns the downloader's drop, pause, and reset heights for `tip_height`.
 ///
-/// `multiplier` scales `lookahead_limit` and [`VERIFICATION_PIPELINE_DROP_LIMIT`]
+/// `scale` scales `lookahead_limit` and [`VERIFICATION_PIPELINE_DROP_LIMIT`]
 /// together, so the syncer never requests blocks that the downloader would drop
 /// just because they arrived before earlier blocks were committed.
 pub(super) fn lookahead_heights(
     tip_height: Option<block::Height>,
     lookahead_limit: usize,
-    multiplier: usize,
+    scale: LookaheadScale,
 ) -> (block::Height, block::Height, block::Height) {
-    let lookahead_limit = lookahead_limit * multiplier;
-    let drop_limit = VERIFICATION_PIPELINE_DROP_LIMIT
-        * HeightDiff::try_from(multiplier).expect("the lookahead multiplier fits in HeightDiff");
+    let lookahead_limit = scale.scale(lookahead_limit);
+    let drop_limit = HeightDiff::try_from(
+        scale.scale(
+            usize::try_from(VERIFICATION_PIPELINE_DROP_LIMIT)
+                .expect("the drop limit is a small positive constant"),
+        ),
+    )
+    .expect("the scaled drop limit fits in HeightDiff");
 
     if let Some(tip_height) = tip_height {
         // Scale the height limit with the lookahead limit,
@@ -744,10 +749,10 @@ where
                 let best_tip = latest_chain_tip.best_tip_height_and_hash();
 
                 // The target spacing at the tip scales the lookahead limit.
-                let multiplier =
-                    tip_height.map_or(1, |tip_height| lookahead_limit_multiplier(&chain_network, tip_height));
+                let scale =
+                    tip_height.map_or(LookaheadScale::UNSCALED, |tip_height| LookaheadScale::at(&chain_network, tip_height));
                 let (lookahead_drop_height, lookahead_pause_height, lookahead_reset_height) =
-                    lookahead_heights(tip_height, lookahead_limit, multiplier);
+                    lookahead_heights(tip_height, lookahead_limit, scale);
 
                 // Get the finalized tip height, assuming we're using the non-finalized state.
                 //

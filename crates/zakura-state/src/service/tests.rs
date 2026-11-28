@@ -163,6 +163,87 @@ async fn block_info_does_not_wait_for_a_queued_parent() {
     ));
 }
 
+/// A coin lookup made while a checkpoint block waits to be written only finds
+/// the block's coins when the block is within `checkpoint_verify_concurrency_limit`
+/// of the final checkpoint. Outside that window, writing the block doesn't answer
+/// the waiting lookup, so it waits until the caller's timeout. See
+/// `full_verifier_utxo_lookahead`.
+#[tokio::test(flavor = "multi_thread")]
+async fn queued_checkpoint_outputs_only_answer_lookups_inside_the_window() {
+    let _init_guard = zakura_test::init();
+    let genesis: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .expect("genesis block deserializes");
+    let block1: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .expect("block 1 deserializes");
+    let outpoint = transparent::OutPoint {
+        hash: block1.transactions[0].hash(),
+        index: 0,
+    };
+    let limit = Duration::from_secs(10);
+    let unanswered = Duration::from_secs(3);
+
+    // With the final checkpoint at 10, a limit of 9 puts block 1 inside the window
+    // and a limit of 5 puts it outside.
+    for (checkpoint_verify_concurrency_limit, inside_window) in [(9, true), (5, false)] {
+        let crate::InitializedState { mut state, .. } = StateService::new(
+            Config::ephemeral(),
+            &Network::Mainnet,
+            Height(10),
+            checkpoint_verify_concurrency_limit,
+        )
+        .await
+        .unwrap();
+
+        // Without genesis, the state queues block 1 but can't write it.
+        let commit = state
+            .ready()
+            .await
+            .unwrap()
+            .call(Request::CommitCheckpointVerifiedBlock(
+                block1.clone().into(),
+            ));
+        let mut lookup = state
+            .ready()
+            .await
+            .unwrap()
+            .call(Request::AwaitUtxo(outpoint));
+
+        if inside_window {
+            assert!(matches!(
+                timeout(limit, lookup).await.unwrap().unwrap(),
+                Response::Utxo(_)
+            ));
+            continue;
+        }
+
+        assert!(timeout(unanswered, &mut lookup).await.is_err());
+
+        // Writing genesis lets block 1 reach disk.
+        timeout(
+            limit,
+            (&mut state).oneshot(Request::CommitCheckpointVerifiedBlock(
+                genesis.clone().into(),
+            )),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        timeout(limit, commit).await.unwrap().unwrap();
+
+        // The earlier lookup still isn't answered, but a new one finds the coin on disk.
+        assert!(timeout(unanswered, &mut lookup).await.is_err());
+        assert!(matches!(
+            timeout(limit, (&mut state).oneshot(Request::AwaitUtxo(outpoint)))
+                .await
+                .unwrap()
+                .unwrap(),
+            Response::Utxo(_)
+        ));
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn await_block_info_waits_for_checkpoint_commit() {
     let _init_guard = zakura_test::init();

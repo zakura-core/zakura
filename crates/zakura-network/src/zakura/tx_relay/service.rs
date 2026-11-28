@@ -24,7 +24,7 @@ use zakura_chain::{
 };
 use zakura_node_services::mempool::port::{
     ChainTip, ChangeSeq, ChangesSince, LocalFault, PoolHandle, PoolReader, PoolSnapshot,
-    PoolView as PortView, Reservation, ReservationId, Unreserved as PortUnreserved,
+    PoolView as PortView, RelayedFetch, Reservation, ReservationId, Unreserved as PortUnreserved,
     Verdict as PortVerdict,
 };
 use zakura_rt::{
@@ -47,11 +47,12 @@ use super::{
         tx_frame, TxRelayMessage, HAVE_RATE, MAX_HAVE_ENTRIES, MAX_TX_BYTES, TX_RELAY_DATA_KIND,
         TX_RELAY_STATE_KIND, TX_RELAY_STREAMS,
     },
-    ZakuraTxRelayConfig,
+    TxRelayStartup,
 };
 use crate::{
     config::UnconditionalPeers,
     zakura::{
+        memory::{ConnectionCredit, Consumer, DrainHold, LeaseDenied, MemoryPool, PoolLease},
         regulation::{ByteBucket, MeteredReady, MeteredSender},
         resume_task_panic,
         transport::OrderedStreamFailure,
@@ -60,6 +61,202 @@ use crate::{
         Service, SessionOpening, SessionPolicy, Stream, ZakuraConnId, ZakuraPeerId,
     },
 };
+
+/// The `Consumer::Tx` credit this node holds for each peer: the announced
+/// bytes of the peer's leased fetches, until the core ends each fetch's
+/// lease, or for credit the peer didn't spend, until its drain releases.
+/// Without a limit per peer, a few peers that never answer could hold the
+/// whole `Consumer::Tx` cap in drains. The machine names a peer by its
+/// identity, so the peer's connections share one limit.
+#[derive(Clone, Debug)]
+struct PeerTxBytes {
+    /// The most credit one peer holds.
+    limit: u64,
+    held: Arc<Mutex<HashMap<PeerKey, u64>>>,
+}
+
+impl PeerTxBytes {
+    /// A tally that lets each peer hold a quarter of `memory_pool`'s
+    /// `Consumer::Tx` cap, and at least one largest body.
+    fn new(memory_pool: &MemoryPool) -> Self {
+        let cap = memory_pool.snapshot().consumers[Consumer::Tx.index()].cap;
+        Self {
+            limit: (cap / 4).max(u64::from(MAX_TX_BYTES)),
+            held: Arc::default(),
+        }
+    }
+
+    /// Charges `bytes` to `peer`, or returns `None` if that would take the
+    /// peer past the limit.
+    fn try_charge(&self, peer: PeerKey, bytes: u64) -> Option<TxCharge> {
+        let mut held = self.lock();
+        let total = held
+            .get(&peer)
+            .map_or(bytes, |held| held.saturating_add(bytes));
+        if total > self.limit {
+            return None;
+        }
+        held.insert(peer, total);
+        Some(TxCharge {
+            tally: self.clone(),
+            peer,
+            bytes,
+        })
+    }
+
+    /// Locks the tally.
+    fn lock(&self) -> zakura_rt::sync::MutexGuard<'_, HashMap<PeerKey, u64>> {
+        self.held
+            .lock()
+            .expect("the tally is never poisoned: no code panics while holding it")
+    }
+}
+
+/// Bytes of one peer's `Consumer::Tx` credit in a [`PeerTxBytes`]. Dropping
+/// it gives them back.
+#[derive(Debug)]
+struct TxCharge {
+    tally: PeerTxBytes,
+    peer: PeerKey,
+    bytes: u64,
+}
+
+impl TxCharge {
+    /// Moves `bytes` of this charge, at most all of it, into a charge of
+    /// their own.
+    fn split(&mut self, bytes: u64) -> TxCharge {
+        let bytes = bytes.min(self.bytes);
+        self.bytes -= bytes;
+        TxCharge {
+            tally: self.tally.clone(),
+            peer: self.peer,
+            bytes,
+        }
+    }
+}
+
+impl Drop for TxCharge {
+    fn drop(&mut self) {
+        if self.bytes == 0 {
+            return;
+        }
+        let mut held = self.tally.lock();
+        if let Some(peer_held) = held.get_mut(&self.peer) {
+            *peer_held = peer_held.saturating_sub(self.bytes);
+            if *peer_held == 0 {
+                held.remove(&self.peer);
+            }
+        }
+    }
+}
+
+/// What a relayed fetch holds from its grant until the core ends its
+/// memory lease (`02 §6`, `02 §7` item 7): its `Consumer::Tx` lease and its
+/// peer's charge for it, which the empty-pool exception goes without, and
+/// the receive credit its `GetTxs` added that no body has spent yet. The
+/// routine, and after the session the reactor, keeps one per reservation
+/// and ends it when the core's
+/// [`TxLeaseEnd`](zakura_node_services::mempool::port::TxLeaseEnd)
+/// resolves.
+#[derive(Debug)]
+struct TxCreditLease {
+    lease: Option<PoolLease>,
+    /// The announced bytes of `lease`, which follow its unspent credit into
+    /// the drains.
+    charge: Option<TxCharge>,
+    credit: Option<ConnectionCredit>,
+    unspent_credit: u64,
+}
+
+impl TxCreditLease {
+    /// A granted fetch holding `lease` and its peer's `charge`, on a
+    /// connection with `credit`.
+    ///
+    /// Only a leased fetch adds receive credit: credit the peer doesn't
+    /// spend stays charged to the lease until the peer can't spend it
+    /// (`02 §6`). The empty-pool exception's fetch has no lease, so its body
+    /// rides on the maximal `Tx` frame the data stream's static base holds.
+    fn new(
+        lease: Option<PoolLease>,
+        charge: Option<TxCharge>,
+        credit: Option<ConnectionCredit>,
+    ) -> Self {
+        Self {
+            credit: credit.filter(|_| lease.is_some()),
+            lease,
+            charge,
+            unspent_credit: 0,
+        }
+    }
+
+    /// A `GetTxs` for `bytes` goes out: the connection's receive window
+    /// grows by them.
+    fn ask(&mut self, bytes: u64) {
+        if let Some(credit) = &self.credit {
+            credit.add_receive_credit(bytes);
+            self.unspent_credit = self.unspent_credit.saturating_add(bytes);
+        }
+    }
+
+    /// A body of `received` bytes arrived, and the request's credit ends.
+    /// Credit the body didn't spend, as when a peer that started cooling
+    /// sends a short body, splits off the lease and drains (`02 §6`). The
+    /// rest of the lease stays: it covers the body until the core decides
+    /// it.
+    fn body_arrived(&mut self, received: u64) {
+        let total = std::mem::take(&mut self.unspent_credit);
+        let Some(credit) = self.credit.as_ref().filter(|_| total > 0) else {
+            return;
+        };
+        let unspent = total.saturating_sub(received);
+        let drain = self
+            .lease
+            .as_mut()
+            .filter(|_| unspent > 0)
+            .and_then(|lease| lease.split(unspent.min(lease.bytes())));
+        let hold = drain.as_ref().and_then(|drain| {
+            let charge = self.charge.as_mut()?.split(drain.bytes());
+            Some(Box::new(charge) as DrainHold)
+        });
+        credit.finish_receive_credit_held(total, drain, hold);
+    }
+
+    /// Grows the lease to cover `body` decoded, which can hold several
+    /// times its wire bytes (`docs/design/block-sync-resource-ledger.md`).
+    /// Returns the bytes the lease holds, `None` for a fetch with no lease,
+    /// or the refusal, which leaves the lease as it was.
+    fn cover_decoded(&mut self, body: &UnminedTx) -> Result<Option<u64>, LeaseDenied> {
+        let Some(lease) = &mut self.lease else {
+            return Ok(None);
+        };
+        let decoded = body.transaction().retained_memory_size_bytes();
+        lease.try_grow_to(decoded.max(lease.bytes()))?;
+        Ok(Some(lease.bytes()))
+    }
+
+    /// The core no longer counts the fetch's bytes. Credit no body spent
+    /// stays leased until the connection delivers past it, and a spent
+    /// lease returns now.
+    fn end(mut self) {
+        match self.credit.take() {
+            Some(credit) if self.unspent_credit > 0 => {
+                let hold = self
+                    .charge
+                    .take()
+                    .map(|charge| Box::new(charge) as DrainHold);
+                credit.finish_receive_credit_held(self.unspent_credit, self.lease.take(), hold);
+            }
+            _ => drop(self.lease.take()),
+        }
+    }
+}
+
+/// What a session that ended hands the reactor: its pool calls in flight
+/// and the relayed fetches whose memory leases the core still counts.
+struct Handoff {
+    calls: Calls,
+    tx_leases: HashMap<ReservationId, TxCreditLease>,
+}
 
 /// Whether a verdict decided at a height may start a cooldown: the node is
 /// current and its best tip is still there. `zakurad` supplies it.
@@ -193,45 +390,42 @@ impl fmt::Debug for TxRelayService {
 }
 
 impl TxRelayService {
-    /// Starts the reactor task on `pool` with `config`'s fan-out and returns
-    /// the service to register. A body whose supplier's address is in
-    /// `unconditional` when it arrives is never charged. Each session is
-    /// published in `sessions` from when its routine holds a view of the
-    /// pool until the session ends or the pool stops.
+    /// Starts the reactor task on `startup`'s pool with its config's fan-out
+    /// and returns the service to register. Each fetch leases its announced
+    /// bytes from `memory_pool`'s `Consumer::Tx`. A body whose supplier's
+    /// address is in `startup`'s unconditional peers when it arrives is never
+    /// charged. Each session is published in `sessions` from when its routine
+    /// holds a view of the pool until the session ends or the pool stops.
     pub fn spawn(
-        pool: PoolHandle,
-        may_cool: MayCool,
-        config: &ZakuraTxRelayConfig,
-        unconditional: UnconditionalPeers,
+        startup: TxRelayStartup,
+        memory_pool: MemoryPool,
         sessions: TxRelaySessions,
     ) -> Arc<Self> {
-        Arc::new(Self::start(pool, may_cool, config, unconditional, sessions))
+        Arc::new(Self::start(startup, memory_pool, sessions))
     }
 
     /// [`Self::spawn`], with every session reporting its steps to
     /// `observer`.
     #[cfg(zakura_sim)]
     pub(crate) fn spawn_observed(
-        pool: PoolHandle,
-        may_cool: MayCool,
-        config: &ZakuraTxRelayConfig,
-        unconditional: UnconditionalPeers,
+        startup: TxRelayStartup,
+        memory_pool: MemoryPool,
         sessions: TxRelaySessions,
         observer: TxRelayObserver,
     ) -> Arc<Self> {
-        let mut service = Self::start(pool, may_cool, config, unconditional, sessions);
+        let mut service = Self::start(startup, memory_pool, sessions);
         service.wiring.observer = Some(observer);
         Arc::new(service)
     }
 
     /// Starts the reactor task and returns the service. See [`Self::spawn`].
-    fn start(
-        pool: PoolHandle,
-        may_cool: MayCool,
-        config: &ZakuraTxRelayConfig,
-        unconditional: UnconditionalPeers,
-        sessions: TxRelaySessions,
-    ) -> Self {
+    fn start(startup: TxRelayStartup, memory_pool: MemoryPool, sessions: TxRelaySessions) -> Self {
+        let TxRelayStartup {
+            pool,
+            may_cool,
+            config,
+            unconditional,
+        } = startup;
         let mut key = [0; 8];
         zakura_rt::rand::rng().fill_bytes(&mut key);
         let node = Node {
@@ -245,6 +439,8 @@ impl TxRelayService {
         let wiring = Wiring {
             node: Arc::new(Mutex::new(node)),
             pool,
+            peer_tx: PeerTxBytes::new(&memory_pool),
+            memory_pool,
             may_cool,
             handoff,
             owned: Owned::default(),
@@ -339,6 +535,7 @@ impl Service for TxRelayService {
         }
         let peer_key = self.peer_key(&peer.id);
         let rtt = peer.rtt_reader();
+        let conn_credit = peer.connection_credit();
         let conn_cancel = peer.cancel_token();
         let session_cancel = peer.service_cancel_token();
         let close_cause = peer.close_cause();
@@ -359,7 +556,15 @@ impl Service for TxRelayService {
             self.wiring.clone(),
             peer_key,
             peer.remote_ip,
-            SessionIo::new(data, state, close, reports_rx, have, connection),
+            SessionIo::new(
+                data,
+                state,
+                close,
+                reports_rx,
+                have,
+                connection,
+                conn_credit,
+            ),
             session_cancel,
             rtt,
         );
@@ -482,10 +687,25 @@ async fn serve_body(send: &FramedSend, bodies: &Bodies, id: UnminedTxId) -> bool
 
 /// What a pool call returns to its routine, or to the reactor task once its
 /// session ended.
+// A fetch's lease and charge trip clippy's size threshold in test builds.
+// Each result is moved once, so boxing them would only add an allocation
+// per fetch.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "boxing would add an allocation per fetch"
+)]
 enum PoolResult {
+    /// The core's answer to a fetch's reservation, with the memory lease
+    /// taken for the fetch and its peer's charge for it, if any.
     Reserved {
         call: CallId,
-        answer: Result<Reservation, PortUnreserved>,
+        answer: Result<Reservation, Unreserved>,
+        lease: Option<PoolLease>,
+        charge: Option<TxCharge>,
+    },
+    /// The core no longer counts the fetch's bytes under `reservation`.
+    TxLeaseEnded {
+        reservation: ReservationId,
     },
     Verdict {
         waiter: WaiterId,
@@ -517,6 +737,8 @@ struct SessionIo {
     have: MeteredSender,
     /// The peer and connection the session runs on.
     connection: (ZakuraPeerId, ZakuraConnId),
+    /// Per-connection QUIC receive-credit controller (`02 §3`, `02 §6`).
+    conn_credit: Option<ConnectionCredit>,
     /// The session's entry in the live-session record, once the routine
     /// holds a view of the pool. It is removed when this drops.
     live: Option<LiveSession>,
@@ -533,6 +755,7 @@ impl SessionIo {
         reports: mpsc::UnboundedReceiver<WriterReport>,
         have: MeteredSender,
         connection: (ZakuraPeerId, ZakuraConnId),
+        conn_credit: Option<ConnectionCredit>,
     ) -> Self {
         Self {
             data,
@@ -542,6 +765,7 @@ impl SessionIo {
             stalled: false,
             have,
             connection,
+            conn_credit,
             live: None,
         }
     }
@@ -646,8 +870,13 @@ impl PoolView for SnapshotView {
 struct Wiring {
     node: Arc<Mutex<Node>>,
     pool: PoolHandle,
+    /// The node's memory pool, whose `Consumer::Tx` funds each fetch
+    /// (`02 §7` item 7).
+    memory_pool: MemoryPool,
+    /// Each peer's share of that funding.
+    peer_tx: PeerTxBytes,
     may_cool: MayCool,
-    handoff: mpsc::UnboundedSender<Calls>,
+    handoff: mpsc::UnboundedSender<Handoff>,
     owned: Owned,
     record: TxRelaySessions,
     have_buckets: HaveBuckets,
@@ -684,6 +913,9 @@ struct Routine {
     pool_open: bool,
     calls: Calls,
     reservations: HashMap<ReservationId, Reservation>,
+    /// Each granted fetch's memory, until the core ends its lease. It
+    /// outlives the reservation while the core holds the fetch's body.
+    tx_leases: HashMap<ReservationId, TxCreditLease>,
     /// Ends the wait on each held reservation's cancellation once the
     /// reservation leaves the routine.
     fetch_waits: HashMap<ReservationId, CancellationToken>,
@@ -757,6 +989,7 @@ impl Routine {
             pool_open: true,
             calls: FuturesUnordered::new(),
             reservations: HashMap::default(),
+            tx_leases: HashMap::default(),
             fetch_waits: HashMap::default(),
         };
         for effect in effects {
@@ -1023,11 +1256,21 @@ impl Routine {
                 self.step(|machine, shared, pool, now| machine.get_txs(shared, pool, id, now));
             }
             TxRelayMessage::NotFound(id) => {
+                // The fetch's unspent credit drains when the core ends its
+                // lease, after the machine drops the reservation.
                 self.step(|machine, shared, pool, now| machine.not_found(shared, pool, id, now));
             }
             TxRelayMessage::Tx { id, body } => {
                 // A frame's body is at most the data stream's cap.
                 let size = u32::try_from(body.len()).unwrap_or(u32::MAX);
+                // The body spent its bytes of receive credit. Its memory
+                // lease stays until the core decides it (`02 §6`, `mem-7`).
+                if let Some(fetch) = self
+                    .reserved_for(id)
+                    .and_then(|reservation| self.tx_leases.get_mut(&reservation))
+                {
+                    fetch.body_arrived(u64::from(size));
+                }
                 // The body is judged as of when it arrived, before and after
                 // it decodes. A body on time when it came is not late because
                 // its decode took time, and its supplier keeps the exemption
@@ -1074,11 +1317,16 @@ impl Routine {
     /// Hands one of this session's pool results to the machine.
     fn pool_result(&mut self, result: PoolResult) {
         match result {
-            PoolResult::Reserved { call, answer } => {
-                let answer = match answer {
-                    Ok(reservation) => Ok(self.hold(reservation)),
-                    Err(refused) => Err(unreserved(refused)),
-                };
+            PoolResult::Reserved {
+                call,
+                answer,
+                lease,
+                charge,
+            } => {
+                let answer = answer.map(|mut reservation| {
+                    self.hold_tx_lease(&mut reservation, lease, charge);
+                    self.hold(reservation)
+                });
                 self.step(|machine, shared, pool, now| {
                     machine.reserve_answer(shared, pool, call, answer, now);
                 });
@@ -1098,8 +1346,40 @@ impl Routine {
                     });
                 }
             }
+            PoolResult::TxLeaseEnded { reservation } => {
+                if let Some(fetch) = self.tx_leases.remove(&reservation) {
+                    fetch.end();
+                }
+            }
             PoolResult::Done => {}
         }
+    }
+
+    /// Holds a granted fetch's memory lease and its peer's charge, if one
+    /// was taken, and the connection's credit until the core ends the lease.
+    fn hold_tx_lease(
+        &mut self,
+        reservation: &mut Reservation,
+        lease: Option<PoolLease>,
+        charge: Option<TxCharge>,
+    ) {
+        let id = reservation.id();
+        let ended = reservation.take_tx_lease_end();
+        let fetch = TxCreditLease::new(lease, charge, self.io.conn_credit.clone());
+        self.tx_leases.insert(id, fetch);
+        self.calls.push(Box::pin(async move {
+            ended.ended().await;
+            PoolResult::TxLeaseEnded { reservation: id }
+        }));
+    }
+
+    /// The reservation of the request out for `id`, while it holds one.
+    fn reserved_for(&self, id: UnminedTxId) -> Option<ReservationId> {
+        self.machine
+            .state
+            .requests
+            .get(&id)
+            .and_then(|request| request.reservation)
     }
 
     /// Holds a granted reservation, waiting on its cancellation unless its
@@ -1188,8 +1468,11 @@ impl Routine {
         }
         self.reservations.clear();
         if !self.calls.is_empty() {
-            let calls = std::mem::take(&mut self.calls);
-            let _ = self.wiring.handoff.send(calls);
+            // Each held memory lease has its end among the calls.
+            let _ = self.wiring.handoff.send(Handoff {
+                calls: std::mem::take(&mut self.calls),
+                tx_leases: std::mem::take(&mut self.tx_leases),
+            });
         }
         disown(&self.wiring.owned, &self.io.connection, Instant::now());
         if let Some(have) = self
@@ -1295,6 +1578,15 @@ impl Routine {
     fn effect(&mut self, effect: RelayEffect) {
         match effect {
             RelayEffect::Ask { id, .. } => {
+                // The answer's bytes are leased already. The connection's
+                // receive window grows by them while the request is out.
+                if let Some((request, fetch)) =
+                    self.machine.state.requests.get(&id).and_then(|request| {
+                        Some((request, self.tx_leases.get_mut(&request.reservation?)?))
+                    })
+                {
+                    fetch.ask(u64::from(request.size));
+                }
                 self.send(TX_RELAY_STATE_KIND, &TxRelayMessage::GetTxs(id));
             }
             // The machine queued the id, and `flush_adverts` asks it for an
@@ -1317,16 +1609,53 @@ impl Routine {
                     self.cancel.cancel();
                 }
             }
-            RelayEffect::Reserve { call, id } => {
+            RelayEffect::Reserve {
+                call,
+                id,
+                announced_size,
+            } => {
+                // A peer that holds its limit of `Consumer::Tx` credit gets
+                // no new fetch until some of it frees. The core isn't asked.
+                let announced_size = u64::from(announced_size);
+                let peer = self.machine.state.peer;
+                let Some(charge) = self.wiring.peer_tx.try_charge(peer, announced_size) else {
+                    self.calls.push(Box::pin(async move {
+                        PoolResult::Reserved {
+                            call,
+                            answer: Err(Unreserved::PeerFull),
+                            lease: None,
+                            charge: None,
+                        }
+                    }));
+                    return;
+                };
+                // A full `Consumer::Tx` leases nothing, and the core decides
+                // whether the empty-pool exception takes the fetch anyway.
+                let lease = self
+                    .wiring
+                    .memory_pool
+                    .try_acquire(Consumer::Tx, Some(self.io.connection.1), announced_size)
+                    .ok();
+                let charge = lease.is_some().then_some(charge);
+                let fetch = RelayedFetch {
+                    announced_size,
+                    leased_bytes: lease.as_ref().map_or(0, PoolLease::bytes),
+                };
                 let pool = self.wiring.pool.clone();
                 self.calls.push(Box::pin(async move {
                     // A core that does not answer in time is busy, so the
                     // machine tries again later.
                     let answer = pool
-                        .reserve_relayed(id, Instant::now() + POOL_ANSWER)
+                        .reserve_relayed(id, fetch, Instant::now() + POOL_ANSWER)
                         .await
-                        .unwrap_or(Err(PortUnreserved::NoRoom));
-                    PoolResult::Reserved { call, answer }
+                        .unwrap_or(Err(PortUnreserved::NoRoom))
+                        .map_err(unreserved);
+                    PoolResult::Reserved {
+                        call,
+                        answer,
+                        lease,
+                        charge,
+                    }
                 }));
             }
             RelayEffect::Submit {
@@ -1334,9 +1663,30 @@ impl Routine {
                 reservation,
                 body,
             } => {
-                let Some(reservation) = self.take_reservation(reservation) else {
+                let Some(mut reservation) = self.take_reservation(reservation) else {
                     return;
                 };
+                // The decoded body's bytes are leased before the core holds
+                // it. A full `Consumer::Tx` is this node's doing: the body is
+                // dropped with a `NoRoom` verdict, which charges no one, and
+                // the id is fetched again later.
+                let leased = match self.tx_leases.get_mut(&reservation.id()) {
+                    Some(fetch) => fetch.cover_decoded(&body),
+                    None => Ok(None),
+                };
+                match leased {
+                    Ok(Some(bytes)) => reservation = reservation.with_tx_lease_bytes(bytes),
+                    Ok(None) => {}
+                    Err(_) => {
+                        self.calls.push(Box::pin(async move {
+                            PoolResult::Verdict {
+                                waiter,
+                                verdict: PortVerdict::NoRoom,
+                            }
+                        }));
+                        return;
+                    }
+                }
                 // The body goes into the core's queue now or is dropped
                 // with a `NoRoom` verdict, so the routine never holds a
                 // decoded body while it reads the next frame.
@@ -1558,17 +1908,27 @@ async fn run_reactor(
     pool: PoolReader,
     may_cool: MayCool,
     base: Instant,
-    mut handed: mpsc::UnboundedReceiver<Calls>,
+    mut handed: mpsc::UnboundedReceiver<Handoff>,
 ) {
     let mut calls: Calls = FuturesUnordered::new();
+    let mut tx_leases: HashMap<ReservationId, TxCreditLease> = HashMap::default();
     let mut open = true;
     loop {
         zakura_rt::select! {
             batch = handed.recv(), if open => match batch {
-                Some(batch) => calls.extend(batch),
+                Some(batch) => {
+                    calls.extend(batch.calls);
+                    tx_leases.extend(batch.tx_leases);
+                }
                 None => open = false,
             },
             Some(result) = calls.next(), if !calls.is_empty() => {
+                if let PoolResult::TxLeaseEnded { reservation } = result {
+                    if let Some(fetch) = tx_leases.remove(&reservation) {
+                        fetch.end();
+                    }
+                    continue;
+                }
                 let now = Instant::now().saturating_duration_since(base);
                 ended_result(&node, &pool, &may_cool, result, now);
             }
@@ -1591,18 +1951,16 @@ fn ended_result(
         let node = &mut *node;
         let marks = Marks::of(&node.shared);
         match result {
-            PoolResult::Reserved { call, answer } => {
-                let answer = match answer {
-                    Ok(reservation) => {
-                        let granted = Granted {
-                            reservation: reservation.id(),
-                            cancelled: reservation.cancellation().is_cancelled(),
-                        };
-                        grant = Some(reservation);
-                        Ok(granted)
-                    }
-                    Err(refused) => Err(unreserved(refused)),
-                };
+            // The grant and its memory lease go back when they drop below.
+            PoolResult::Reserved { call, answer, .. } => {
+                let answer = answer.map(|reservation| {
+                    let granted = Granted {
+                        reservation: reservation.id(),
+                        cancelled: reservation.cancellation().is_cancelled(),
+                    };
+                    grant = Some(reservation);
+                    granted
+                });
                 if !node.shared.ended_call_answer(call, answer) {
                     node.shared.answer_unknown(answer);
                 }
@@ -1616,7 +1974,7 @@ fn ended_result(
                     .map_or_else(SnapshotView::empty, SnapshotView);
                 node.shared.ended_verdict(&view, waiter, verdict, now);
             }
-            PoolResult::Cancelled { .. } | PoolResult::Done => {}
+            PoolResult::Cancelled { .. } | PoolResult::TxLeaseEnded { .. } | PoolResult::Done => {}
         }
         let effects = std::mem::take(&mut node.shared.effects);
         let closes = closers(node, &effects, None);

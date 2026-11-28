@@ -239,8 +239,18 @@ impl Run {
         };
         let body = self.txs[tx].clone();
         let relayed = chance(&mut self.rng, 2);
+        // A relayed fetch's caller usually leases the announced size. Some
+        // find `Consumer::Tx` full and lease nothing, and some peers announce
+        // less than the body holds.
+        let size = u64::try_from(body.real.transaction.size()).expect("a test body fits u64");
+        let (announced, leased) = match pick(&mut self.rng, 16) {
+            0 => (size, 0),
+            1 => (size - 1, size - 1),
+            _ => (size, size),
+        };
+        let unleased = relayed && leased < announced;
         let (answer, step) = if relayed {
-            self.bench.reserve_relayed(&body)
+            self.bench.reserve_relayed(&body, announced, leased)
         } else {
             self.bench.reserve(&body)
         };
@@ -252,7 +262,11 @@ impl Run {
             Ok(reservation) => {
                 assert!(self.active, "a reservation from a pool that is off");
                 assert!(!pooled, "a reservation for a pooled transaction");
-                self.bench.tracker.saw("reserved");
+                self.bench.tracker.saw(if unleased {
+                    "reserved unleased"
+                } else {
+                    "reserved"
+                });
                 self.held.push(Held {
                     id: *reservation,
                     tx,
@@ -272,11 +286,12 @@ impl Run {
                         "Pooled"
                     }
                     Unreserved::NoRoom if self.bench.machine.slots_in_use() < LIMITS.pending => {
-                        assert!(
-                            relayed && self.bench.machine.relaying == LIMITS.relayed,
-                            "no room, with slots free"
-                        );
-                        "NoRoom relayed"
+                        if relayed && self.bench.machine.relaying == LIMITS.relayed {
+                            "NoRoom relayed"
+                        } else {
+                            assert!(unleased, "no room, with slots free");
+                            "NoRoom unleased"
+                        }
                     }
                     Unreserved::NoRoom => {
                         assert_eq!(
@@ -545,6 +560,7 @@ impl Run {
             "the drain verifies again everything a reset took out"
         );
         self.bench.tracker.every_submission_is_answered();
+        self.bench.tracker.every_tx_lease_ended();
     }
 }
 
@@ -629,6 +645,9 @@ fn random_runs_keep_the_invariants_and_drain() {
             "unreserved Inactive",
             "unreserved NoRoom",
             "unreserved NoRoom relayed",
+            "reserved unleased",
+            "unreserved NoRoom unleased",
+            "end tx lease",
         ] {
             assert!(
                 seen.get(kind).is_some_and(|count| *count > 0),

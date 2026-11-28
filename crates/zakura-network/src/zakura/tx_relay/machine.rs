@@ -508,6 +508,9 @@ pub(crate) enum Unreserved {
     },
     /// The node's limit is reached.
     NoRoom,
+    /// The node holds as much of the peer's transaction credit as it lets
+    /// one peer hold. The IO answers this without asking the core.
+    PeerFull,
     /// The core has stopped.
     Stopped,
 }
@@ -629,6 +632,8 @@ pub(crate) enum RelayEffect {
         call: CallId,
         /// The id.
         id: UnminedTxId,
+        /// The serialized body size announced by this peer (`02 §7` item 7).
+        announced_size: u32,
     },
     /// Submit `body` under `reservation`, and answer its verdict through
     /// [`PeerMachine::verdict`] with `waiter`.

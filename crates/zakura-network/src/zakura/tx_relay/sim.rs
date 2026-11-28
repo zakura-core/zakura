@@ -18,9 +18,9 @@ use super::{
     machine,
     service::{MayCool, TxRelayService},
     sessions::TxRelaySessions,
-    tx_relay_service_id, ZakuraTxRelayConfig,
+    tx_relay_service_id, TxRelayStartup, ZakuraTxRelayConfig,
 };
-use crate::zakura::{CloseOutcome, CustomService, ZakuraPeerId};
+use crate::zakura::{memory::MemoryPool, CloseOutcome, CustomService, ZakuraPeerId};
 
 /// The protocol's largest transaction, which our `Hello` names.
 pub const MAX_TX_BYTES: u32 = super::wire::MAX_TX_BYTES;
@@ -159,19 +159,20 @@ pub struct SimState {
 /// `observer`.
 pub fn tx_relay_service_observed(
     pool: PoolHandle,
+    memory_pool: MemoryPool,
     may_cool: MayCool,
     config: &ZakuraTxRelayConfig,
     observer: TxRelayObserver,
 ) -> CustomService {
     let sessions = TxRelaySessions::default();
-    let service: Arc<TxRelayService> = TxRelayService::spawn_observed(
+    let startup = TxRelayStartup {
         pool,
         may_cool,
-        config,
-        Default::default(),
-        sessions.clone(),
-        observer,
-    );
+        config: config.clone(),
+        unconditional: Default::default(),
+    };
+    let service: Arc<TxRelayService> =
+        TxRelayService::spawn_observed(startup, memory_pool, sessions.clone(), observer);
     CustomService {
         service,
         provides: vec![tx_relay_service_id()],

@@ -1431,6 +1431,7 @@ impl PeerMachine {
             shared.effects.push(RelayEffect::Reserve {
                 call,
                 id: pending.id,
+                announced_size: pending.size,
             });
         }
     }
@@ -1533,6 +1534,13 @@ impl PeerMachine {
                 if remembered {
                     wanted.decide(id, pending.generation);
                 }
+                return_probe(wanted, probe);
+            }
+            Err(Unreserved::PeerFull) => {
+                // This node's limit, not the peer's fault: the id waits a
+                // retry delay, and this peer or another brings it once the
+                // peer's held credit frees.
+                wanted.release(id, pending.generation, session, now, true);
                 return_probe(wanted, probe);
             }
             Err(Unreserved::Inactive) => {

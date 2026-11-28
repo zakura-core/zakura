@@ -1362,8 +1362,9 @@ async fn caches_getaddr_response() {
     }
 }
 
-/// The state's read result limit serves the default inbound peers, each holding one
-/// legacy `getdata` block request, clamped to its own 8 GiB ceiling.
+/// On the legacy stack, the state's read result limit serves the default inbound
+/// peers, each holding one legacy `getdata` block request, clamped to its own 8 GiB
+/// ceiling.
 #[test]
 fn read_result_limit_derives_from_getdata_and_inbound_limits() {
     const CEILING: u64 = 8 * 1024 * 1024 * 1024;
@@ -1406,11 +1407,13 @@ fn read_result_limit_derives_from_getdata_and_inbound_limits() {
         Some(derived)
     );
 
-    // The peer memory budget funds QUIC windows, not reads: raising or lowering it
-    // leaves the read limit where it was.
+    // The legacy stack ignores the memory budget, so raising or lowering it leaves
+    // the read limit where it was.
     for budget in [1 << 30, 64 << 30] {
         let mut changed = crate::config::ZakuradConfig::default();
-        changed.network.zakura.peer_memory_budget_bytes = budget;
+        changed.memory.budget = zakura_network::zakura::memory::MemoryBudget::Fixed(
+            zakura_network::zakura::memory::ByteSize(budget),
+        );
         assert_eq!(
             changed
                 .mirrored_state_config()
@@ -1419,6 +1422,49 @@ fn read_result_limit_derives_from_getdata_and_inbound_limits() {
             Some(CEILING)
         );
     }
+}
+
+/// On the v2 stack the memory plan counts state reads as a fixed term, so the state's
+/// read result limit follows read concurrency, not peer count (`02 §4`). `Dual` mode
+/// adds one legacy `getdata` response.
+#[test]
+fn v2_read_result_limit_derives_from_read_concurrency() {
+    use zakura_network::{zakura::memory::derived_read_result_byte_limit, P2pStack};
+
+    let limit = |stack: P2pStack, peers: usize| {
+        let mut config = crate::config::ZakuradConfig::default();
+        config.network.p2p_stack = stack;
+        config.network.peerset_initial_target_size = peers;
+        let state = config.mirrored_state_config();
+        assert_eq!(
+            state.read_result_byte_limit.map(std::num::NonZeroU64::get),
+            Some(derived_read_result_byte_limit(
+                &config.network,
+                &config.network.network
+            ))
+        );
+        state
+            .read_result_byte_limit
+            .expect("zakurad always sets the limit")
+            .get()
+    };
+
+    // Peer count no longer sizes the limit.
+    assert_eq!(limit(P2pStack::Zakura, 5), limit(P2pStack::Zakura, 500));
+    // One legacy response for `Dual` mode's legacy serving.
+    assert_eq!(
+        limit(P2pStack::Dual, 75) - limit(P2pStack::Zakura, 75),
+        zakura_state::READ_RESULT_BLOCKS_PER_PEER
+            * zakura_node_services::block_memory::MAX_DECODED_BLOCK_BYTES
+    );
+    // An operator-set limit wins.
+    let mut config = crate::config::ZakuradConfig::default();
+    config.network.p2p_stack = P2pStack::Zakura;
+    config.state.read_result_byte_limit = std::num::NonZeroU64::new(1 << 30);
+    assert_eq!(
+        config.mirrored_state_config().read_result_byte_limit,
+        std::num::NonZeroU64::new(1 << 30)
+    );
 }
 
 /// A block read that the state refuses for lack of capacity becomes `notfound`, so the

@@ -903,7 +903,7 @@ macro_rules! rpc_trait {
         pub trait $trait:ident {
             $(
                 $(#[doc = $doc:literal])*
-                #[method(name = $name:literal)]
+                #[method(name = $name:literal $(, response = $response:path)?)]
                 $(#[doc = $doc_after:literal])*
                 $(async $(@$async:tt)?)? fn $method:ident(&self $(, $arg:ident: $ty:ty)* $(,)?)
                     -> $ret:ty;
@@ -953,10 +953,8 @@ macro_rules! rpc_trait {
                                 Err(error) => Err(error),
                             };
 
-                            $crate::server::jsonrpc::MethodResponse::response(
-                                id,
-                                &result,
-                                max_response_size,
+                            $crate::server::jsonrpc::rpc_trait!(
+                                @response id, &result, max_response_size $(, $response)?
                             )
                         })),
                     )*
@@ -1013,6 +1011,13 @@ macro_rules! rpc_trait {
                 }
             }
         }
+    };
+
+    (@response $id:expr, $result:expr, $limit:expr, $encoder:path) => {
+        $encoder($id, $result, $limit)
+    };
+    (@response $id:expr, $result:expr, $limit:expr) => {
+        $crate::server::jsonrpc::MethodResponse::response($id, $result, $limit)
     };
 
     (@call $call:expr, async) => { $call.await };

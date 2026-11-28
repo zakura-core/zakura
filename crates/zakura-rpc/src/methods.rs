@@ -742,7 +742,7 @@ pub trait RpcServer {
     ///
     /// Zebra verifies blocks in parallel, and keeps recent chains in parallel,
     /// so moving between chains and forking chains is very cheap.
-    #[method(name = "getblocktemplate")]
+    #[method(name = "getblocktemplate", response = crate::methods::types::get_block_template::json::encode_response)]
     async fn get_block_template(
         &self,
         parameters: Option<GetBlockTemplateParameters>,
@@ -1603,6 +1603,7 @@ where
                 chain_info,
                 long_poll_id,
                 mempool_txs,
+                &self.gbt.transaction_data,
                 submit_old,
                 None,
             )
@@ -1631,6 +1632,7 @@ where
         let miner_params = miner_params.clone();
         let chain_info = chain_info.clone();
         let requested = std::time::Instant::now();
+        let transaction_data = self.gbt.transaction_data.clone();
         let (template, times) = self
             .gbt
             .run_template_build(work, move || {
@@ -1642,6 +1644,7 @@ where
                     &chain_info,
                     long_poll_id,
                     mempool_txs,
+                    &transaction_data,
                     submit_old,
                     bpv1_proposer.as_ref(),
                 );

@@ -132,11 +132,21 @@ still delivering the earlier response.
 
 **Unbounded memory under attacker-controlled bodies or stalls.**
 
-- Outstanding request reservations MUST stay within `max_inflight_block_bytes`
-  (unset: `x × C`, the block-sync connections times the cwnd cap), apart from the single bounded floor overdraft; each reservation MUST be
-  released when its body arrives or the request otherwise terminates.
+- Outstanding request reservations MUST stay within the node-wide memory pool's leases: the
+  `BlockSync` consumer above the commit window and the reserved `Consensus` consumer inside it
+  (`height ≤ verified_tip + 401`). An explicit `max_inflight_block_bytes` MUST also bound them.
+  Each reservation MUST raise the peer's QUIC receive window (API-9) before the request goes out.
+  A request that ends short MUST lower the window by its unspent bytes and keep them leased until
+  the peer can no longer spend them. When the node's `[memory] budget` is smaller than demand, the
+  pool MAY defer requests above the commit window. That costs throughput and never penalizes a
+  peer. Commit-window requests MUST NOT wait on bulk demand.
 - The resident look-ahead gate MUST be the sole authority for speculative bodies
   retained by, or reserved to enter, the reorder, applying, and sequencer-input pools.
+  The pool caps `BlockSync` at its benefit: the sum of the peers' BBR congestion windows plus
+  `2 × commit_rate × p99_range_fetch_time` of look-ahead. The cap is at least one minimum-cwnd
+  request. It is at most the planned cap: the in-flight cap plus `max_reorder_lookahead_bytes`.
+  A large host therefore prefetches only what commits can
+  drain.
   Serialized pools MUST be charged at wire size, while bounded decoded pools MUST also
   pay the calibrated decoded-memory charge. Commit-window work remains exempt so a
   checkpoint range can always assemble.

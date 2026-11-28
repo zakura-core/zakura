@@ -2387,7 +2387,8 @@ async fn mempool_reset_keeps_active_state_when_legacy_sync_falls_behind() -> Res
     assert!(mempool.is_enabled());
 
     // Queue the uncommitted transaction for download.
-    let source = QueueSource::LegacySocket("203.0.113.7:8233".parse().unwrap());
+    let addr = std::net::SocketAddr::from(([203, 0, 113, 7], 8233));
+    let source = QueueSource::LegacySocket(addr);
     let response = mempool
         .ready()
         .await
@@ -2439,7 +2440,10 @@ async fn mempool_reset_keeps_active_state_when_legacy_sync_falls_behind() -> Res
 
     assert_eq!(
         request.request(),
-        &zakura_network::Request::TransactionsById(iter::once(uncommitted_tx_id).collect()),
+        &zn::Request::TransactionsByIdFrom {
+            ids: [uncommitted_tx_id].into(),
+            source: zn::PeerSource::LegacySocket(addr.into()),
+        },
     );
     assert_eq!(mempool.tx_downloads().in_flight(), 1);
 

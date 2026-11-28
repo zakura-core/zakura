@@ -1423,7 +1423,7 @@ async fn a_mined_id_frees_its_fetch_slot(mode: Mode) {
 /// An id a block mines while the pool is still fetching it is answered at
 /// the second stage as today's pool answers a cancelled task.
 async fn a_transaction_mined_while_it_is_brought_in_is_answered_as_cancelled(mode: Mode) {
-    let mut harness = pool(Config::default(), Peers::Silent, mode).await;
+    let mut harness = pool(Config::default(), Peers::Mock, mode).await;
     harness.activate().await;
     // Block 1 starts an upgrade, which resets today's pool.
     harness
@@ -1434,11 +1434,17 @@ async fn a_transaction_mined_while_it_is_brought_in_is_answered_as_cancelled(mod
         .next()
         .expect("block 2 has a transaction")
         .transaction;
-    // An id whose fetch never completes, from peers that never answer.
     let fetching = harness
         .queue_one(fetched.id())
         .await
         .expect("the id is queued");
+    // The pool fetches only after it checks that the id isn't mined, so
+    // waiting for the fetch keeps block 2 from landing before that check.
+    // The fetch is never answered.
+    let _unanswered = harness
+        .peers
+        .expect_request(zn::Request::TransactionsById([fetched.id()].into()))
+        .await;
 
     harness
         .commit(zakura_test::vectors::BLOCK_MAINNET_2_BYTES.as_slice())

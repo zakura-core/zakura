@@ -1538,6 +1538,51 @@ async fn honest_candidates_fill_the_round_when_the_best_share_a_full_ip() {
     node.shutdown().await;
 }
 
+/// The round leaves seeds to the bootstrap dialer, even when the book ranks
+/// them first, and also skips a seed under the ID a dial to its configured
+/// one answered with, as its own record names it.
+#[tokio::test]
+async fn the_round_never_dials_seeds() {
+    let node = crate::zakura::testkit::ZakuraTestNode::builder(9216)
+        .spawn()
+        .await
+        .expect("dialer spawns");
+    let ranked = insert_ranked_static_candidates(
+        &node.discovery(),
+        1,
+        (1..=3)
+            .map(|host| vec![SocketAddr::new(IpAddr::from([198, 51, 100, host]), 8233)])
+            .collect(),
+    )
+    .await;
+    // The second seed is configured under an ID it had before it added keys,
+    // and a dial to that ID found it under the ID its book entry has.
+    let configured = node_id(9);
+    node.supervisor().learn_move(configured, ranked[1]);
+    node.endpoint()
+        .set_seed_ids([ranked[0], configured].into_iter().collect());
+
+    let mut state = CandidateDialerState::new(DIAL_BACKOFF);
+    let admitted = admit_dial_round(
+        &node.endpoint(),
+        &node.discovery(),
+        &[],
+        &mut state,
+        RoundClaims::default(),
+        Instant::now(),
+    )
+    .await;
+
+    assert_eq!(
+        admitted
+            .iter()
+            .map(|(attempt, _)| attempt.node_id)
+            .collect::<Vec<_>>(),
+        ranked[2..],
+    );
+    node.shutdown().await;
+}
+
 // V12 F-518: the transport claims a slot for every address of a dial or
 // fails the whole dial as a local limit. A candidate with more addresses than
 // the free slots used to take the round's slot, fail, and pause dialing. It

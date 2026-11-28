@@ -734,6 +734,7 @@ async fn serving_sets_the_window_to_the_negotiated_shares() -> Result<(), BoxErr
                     conn: ZakuraConnTrace::without_peer(1),
                     control_handshake: None,
                     registration_report: None,
+                    connection_token: None,
                 },
             )
             .await
@@ -897,6 +898,7 @@ impl RawFixture {
                         conn: ZakuraConnTrace::without_peer(1),
                         control_handshake: None,
                         registration_report: None,
+                        connection_token: None,
                     },
                 )
                 .await

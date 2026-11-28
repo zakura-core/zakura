@@ -27,10 +27,12 @@ p2p_stack       = "dual"                     # legacy | zakura | dual | default
 # Optional fleet-wide Zakura settings, rendered into [network.zakura] on every
 # node. Use for a private dev cohort: same dev_network tag + the same bootstrap
 # peers isolate the fleet's v2 overlay (see deploy/runner/ for the perf harness).
+# List every cohort node in bootstrap_peers. A node that finds itself there
+# keeps the others connected, so the cohort stays a full mesh.
 # [defaults.zakura]
 # listen_addr     = "0.0.0.0:8234"          # NOT loopback (single QUIC socket)
 # dev_network     = "my-cohort"             # same string on every cohort node
-# bootstrap_peers = ["nodeid@1.2.3.4:8234"] # node_id@addr of the other peers
+# bootstrap_peers = ["nodeid@1.2.3.4:8234"] # node_id@addr of every cohort node
 # tx_relay        = { enabled = true }      # needs implementation = "core" below
 
 # Optional [mempool] settings, keys passed through verbatim. A [defaults]

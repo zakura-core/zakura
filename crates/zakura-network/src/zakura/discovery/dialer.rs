@@ -2,6 +2,7 @@
 
 use std::{net::SocketAddr, str::FromStr};
 
+use rand_10::seq::SliceRandom;
 use zakura_node_services::task::spawn_erased_named;
 use zakura_quic::{NodeAddr, NodeId};
 use zakura_rt::{
@@ -10,72 +11,56 @@ use zakura_rt::{
     task::JoinHandle,
 };
 
-use super::{native_dial_supervised, RedialPolicy};
+use super::protocol::ZakuraDiscoveryHandle;
 use crate::zakura::{
     handler::{DialRegistration, DialReport},
     transport::MovedNodeIds,
-    ZakuraEndpoint, ZakuraHandlerError, ZakuraLocalLimits, DEFAULT_ZAKURA_REDIAL_INITIAL_BACKOFF,
-    DEFAULT_ZAKURA_REDIAL_MAX_BACKOFF,
+    ZakuraEndpoint, ZakuraHandlerError, ZakuraLocalLimits,
 };
 
-/// Spawn supervised dials for configured native bootstrap peers.
+/// Spawns the bootstrap dialer ([`super::bootstrap`]) for the configured
+/// native bootstrap peers, after merging each remote identity's addresses and
+/// removing the local identity. A node listed among its own bootstrap peers
+/// is a seed and keeps the others connected ([`super::bootstrap`]).
 ///
-/// Returns one task per unique remote identity after merging its configured addresses and removing
-/// the local identity, so the caller can track each maintained dial under the endpoint shutdown
-/// owner. Every dial also observes the shutdown token directly via [`native_dial_supervised`].
+/// Returns the dialer's task, if there are remote peers, so the caller can
+/// track it under the endpoint shutdown owner. The task also observes the
+/// shutdown token directly. The seeds' IDs are set on the endpoint before
+/// this returns, so the candidate dialer never dials a seed.
 pub(crate) fn spawn_native_bootstrap_dialer(
     endpoint: ZakuraEndpoint,
+    discovery: ZakuraDiscoveryHandle,
     bootstrap_peers: Vec<String>,
     limits: ZakuraLocalLimits,
 ) -> Vec<JoinHandle<()>> {
-    if bootstrap_peers.is_empty() {
+    let local_node_id = endpoint.local_node_id();
+    let mesh = bootstrap_peers
+        .iter()
+        .any(|entry| parse_bootstrap_peer(entry).is_ok_and(|seed| seed.id == local_node_id));
+    let mut seeds = grouped_remote_bootstrap_peers(bootstrap_peers, local_node_id);
+    if seeds.is_empty() {
         return Vec::new();
     }
-
-    // Configured bootstrap peers are maintained: keep re-dialing forever so a
-    // node whose only peers are over Zakura (`p2p_stack = "zakura"`) tolerates the
-    // seed not being up yet at startup and recovers when a peer later drops. The
-    // legacy crawler is absent on such a node, so this loop is the only healing
-    // path for its seeds.
-    let policy = RedialPolicy::maintain(
-        DEFAULT_ZAKURA_REDIAL_INITIAL_BACKOFF,
-        DEFAULT_ZAKURA_REDIAL_MAX_BACKOFF,
-    );
-
-    let node_addrs = grouped_remote_bootstrap_peers(bootstrap_peers, endpoint.local_node_id());
-    let mut tasks = Vec::with_capacity(node_addrs.len());
-    for node_addr in node_addrs {
-        let endpoint = endpoint.clone();
-        let limits = limits.clone();
-        tasks.push(spawn_erased_named("bootstrap_dial", async move {
-            let moved = warn_when_moved(endpoint.supervisor().moved_node_ids(), node_addr.id);
-            let dial = native_dial_supervised(
-                endpoint,
-                node_addr,
-                limits,
-                policy,
-                CancellationToken::new(),
-            );
-            zakura_rt::pin!(dial, moved);
-            zakura_rt::select! {
-                _ = &mut dial => return,
-                () = &mut moved => {}
-            }
-            dial.await;
-        }));
-    }
-    tasks
+    endpoint.set_seed_ids(seeds.iter().map(|seed| seed.id).collect());
+    // Shuffled so nodes spread their first dials over the seeds. Sorted first,
+    // so the shuffle is the order's only source of randomness.
+    seeds.sort_unstable_by(|a, b| a.id.as_bytes().cmp(b.id.as_bytes()));
+    seeds.shuffle(&mut zakura_rt::rand::rng());
+    vec![spawn_erased_named(
+        "bootstrap_dialer",
+        super::bootstrap::run_bootstrap_dialer(endpoint, discovery, seeds, mesh, limits),
+    )]
 }
 
 /// Waits until a dial finds the bootstrap peer configured as `configured`
 /// under another node ID, and tells the operator once.
 ///
 /// The peer added keys, and still answers to the configured ID
-/// (zakura-quic TLS-7), so the maintained dial keeps working. It stops
+/// (zakura-quic TLS-7), so dials to it keep working. They stop
 /// working if the peer later drops a key the configured ID was made from,
 /// which is why the entry should be updated. Returns without a warning when
 /// the supervisor is gone.
-async fn warn_when_moved(mut moved: watch::Receiver<MovedNodeIds>, configured: NodeId) {
+pub(super) async fn warn_when_moved(mut moved: watch::Receiver<MovedNodeIds>, configured: NodeId) {
     let Ok(moved) = moved
         .wait_for(|moved| moved.current(configured) != configured)
         .await
@@ -161,13 +146,52 @@ fn grouped_remote_bootstrap_peers(
         .collect()
 }
 
-/// Dials and serves a maintained connection, and reports on `registration`
-/// how its registration ended.
+/// Dials and serves a seed for the bootstrap dialer under `connection_token`,
+/// which closes the connection when cancelled, and reports on
+/// `registration` how its registration ended.
 pub(crate) async fn native_bootstrap_dial(
     endpoint: &ZakuraEndpoint,
     node_addr: NodeAddr,
     limits: &ZakuraLocalLimits,
+    connection_token: CancellationToken,
     registration: oneshot::Sender<DialRegistration>,
+) -> Result<(), ZakuraHandlerError> {
+    native_reported_dial(
+        endpoint,
+        node_addr,
+        limits,
+        registration,
+        crate::zakura::handler::NativeDialKind::Bootstrap { connection_token },
+    )
+    .await
+}
+
+/// Dials and serves a maintained connection, such as an upgrade hand-off,
+/// and reports on `registration` how its registration ended.
+pub(crate) async fn native_maintained_dial(
+    endpoint: &ZakuraEndpoint,
+    node_addr: NodeAddr,
+    limits: &ZakuraLocalLimits,
+    registration: oneshot::Sender<DialRegistration>,
+) -> Result<(), ZakuraHandlerError> {
+    native_reported_dial(
+        endpoint,
+        node_addr,
+        limits,
+        registration,
+        crate::zakura::handler::NativeDialKind::Maintained,
+    )
+    .await
+}
+
+/// Dials `node_addr` as `kind` and reports on `registration` how its
+/// registration ended.
+async fn native_reported_dial(
+    endpoint: &ZakuraEndpoint,
+    node_addr: NodeAddr,
+    limits: &ZakuraLocalLimits,
+    registration: oneshot::Sender<DialRegistration>,
+    kind: crate::zakura::handler::NativeDialKind,
 ) -> Result<(), ZakuraHandlerError> {
     // Only discovery uses the admitted address, to settle per-IP reservations
     // and confirm the record address the dial reached.
@@ -181,7 +205,7 @@ pub(crate) async fn native_bootstrap_dial(
         node_addr,
         limits,
         Some(report),
-        crate::zakura::handler::NativeDialKind::Maintained,
+        kind,
     )
     .await
 }

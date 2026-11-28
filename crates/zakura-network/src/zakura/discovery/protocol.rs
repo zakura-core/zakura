@@ -2526,6 +2526,24 @@ impl ZakuraDiscoveryHandle {
         );
     }
 
+    /// The addresses the book's signed records advertise for each of
+    /// `node_ids` in turn, as [`ZakuraDiscoveryBook::record_addrs`] gives
+    /// them, without repeats.
+    pub(crate) async fn record_addrs(&self, node_ids: &[NodeId]) -> Vec<SocketAddr> {
+        let now = current_unix_secs();
+        let state = self.inner.lock().await;
+        let mut addrs = Vec::new();
+        for addr in node_ids
+            .iter()
+            .flat_map(|id| state.book().record_addrs(id, now))
+        {
+            if !addrs.contains(&addr) {
+                addrs.push(addr);
+            }
+        }
+        addrs
+    }
+
     pub(crate) async fn dial_backoff(&self) -> (Duration, Duration) {
         let state = self.inner.lock().await;
         (
@@ -3291,6 +3309,21 @@ impl ZakuraDiscoveryBook {
             DialReadiness::Unusable => DialTarget::Unknown,
             DialReadiness::InBackoff => DialTarget::InBackoff,
             DialReadiness::Ready => DialTarget::Dialable(candidate.into_candidate()),
+        }
+    }
+
+    /// The addresses `node_id`'s signed record advertises, dialed and
+    /// confirmed ones first, or none when the book holds no record for it
+    /// that [`Self::dial_target`] would offer at `now`. It ignores dial
+    /// backoff.
+    pub(crate) fn record_addrs(&self, node_id: &NodeId, now: u64) -> Vec<SocketAddr> {
+        match self.entries.get(node_id) {
+            Some(entry)
+                if DialCandidateRef::SignedRecord(entry).is_usable(now, self.address_scope) =>
+            {
+                confirmed_first(entry)
+            }
+            _ => Vec::new(),
         }
     }
 

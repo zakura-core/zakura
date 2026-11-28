@@ -582,7 +582,8 @@ pub enum BlockInput {
         /// Consensus verdict.
         verdict: VerifierVerdict,
     },
-    /// Native block sync committed this block; ends it if it is in fallback (`bpv1-57`).
+    /// Native block sync committed this block; ends it if it is collecting or
+    /// in fallback (`bpv1-57`).
     FallbackDone {
         /// Committed block.
         block_id: block::Hash,
@@ -1447,6 +1448,20 @@ impl ActiveBlock {
                 since_meta: now.saturating_duration_since(self.meta_arrived_at),
             });
         }
+    }
+
+    /// Drops the parts, charges, and header bytes a retired block no longer
+    /// needs. It keeps its identity and coding.
+    fn drop_buffers(&mut self) {
+        for st in &mut self.stripes {
+            st.clear_buffers();
+        }
+        self.part_charges.clear();
+        self.stored_charge = 0;
+        self.meta.header_bytes = Vec::new();
+        self.meta.binding.coinbase = Vec::new();
+        self.meta.binding.txid_siblings = Vec::new();
+        self.meta.binding.auth_siblings = Vec::new();
     }
 
     fn all_stripes_assemblable(&self) -> bool {
@@ -2526,6 +2541,25 @@ impl BlockTable {
         if !self.admissible_height(height) {
             reject_meta(step, block_id, entry.from_peer, entry.session_gen);
             reject_later(step, block_id, &entry.later);
+            return;
+        }
+        // Block sync committed the block while its metadata was in admission,
+        // so no `FallbackDone` reaches it (bpv1-57). It goes straight to a
+        // retired record: every session then drops its later parts instead of
+        // holding them as early data, and no later copy admits it.
+        if self.verified_hash == Some(block_id) {
+            let mut block =
+                ActiveBlock::from_envelope(entry.envelope, height, now, entry.arrived_at, false);
+            block.phase = BlockPhase::Retired;
+            block.drop_buffers();
+            let Coding { stripes, n, .. } = block.meta.coding;
+            self.blocks.insert(block_id, block);
+            step.events.push(BlockEvent::Retired { block_id });
+            step.outputs.push(BlockOutput::PublishRetire {
+                block_id,
+                stripes,
+                n,
+            });
             return;
         }
         // All concurrent slots actively collecting: drop cleanly without faulting the peer.
@@ -3662,12 +3696,31 @@ impl BlockTable {
         }
     }
 
-    /// Native block sync committed `block_id`. A `Fallback` block holds no
-    /// complete body to relay, so it retires at once and frees its slot.
+    /// Native block sync committed `block_id` (`bpv1-57`). A `Fallback` or
+    /// `Collecting` block holds no complete body to relay, so it retires at
+    /// once: its pulls stop and its slot frees. Block sync delivered a
+    /// collecting block, so its outcome is `Fallback`.
     fn handle_fallback_done(&mut self, block_id: block::Hash, step: &mut BlockStep) {
-        if self.block_phase(&block_id) == Some(BlockPhase::Fallback) {
-            self.retire_block(block_id, step);
+        let Some(block) = self.blocks.get_mut(&block_id) else {
+            return;
+        };
+        match block.phase {
+            BlockPhase::Fallback => {}
+            BlockPhase::Collecting => {
+                step.events.push(BlockEvent::Outcome {
+                    block_id,
+                    outcome: BlockOutcome::Fallback,
+                });
+                if std::mem::take(&mut block.body_claimed) {
+                    step.outputs.push(BlockOutput::ReleaseBodyClaim {
+                        block_id,
+                        reason: ClaimRelease::Committed,
+                    });
+                }
+            }
+            _ => return,
         }
+        self.retire_block(block_id, step);
     }
 
     fn handle_proposed_commit_failed(&mut self, block_id: block::Hash, step: &mut BlockStep) {
@@ -3863,11 +3916,6 @@ impl BlockTable {
         let n = block.meta.coding.n;
         let release_claim = std::mem::take(&mut block.body_claimed);
         block.verify_work_id = None;
-        for st in &mut block.stripes {
-            st.clear_buffers();
-        }
-        block.part_charges.clear();
-        block.stored_charge = 0;
         if !block.as_proposer {
             step.events.push(BlockEvent::Uploaded {
                 block_id,
@@ -3879,11 +3927,7 @@ impl BlockTable {
                 count: block.duplicates,
             });
         }
-        // A retired block keeps its identity and coding but no longer holds header bytes.
-        block.meta.header_bytes = Vec::new();
-        block.meta.binding.coinbase = Vec::new();
-        block.meta.binding.txid_siblings = Vec::new();
-        block.meta.binding.auth_siblings = Vec::new();
+        block.drop_buffers();
 
         step.events.push(BlockEvent::Retired { block_id });
         if release_claim {

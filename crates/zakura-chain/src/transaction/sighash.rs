@@ -4,7 +4,6 @@ mod v4;
 
 use std::sync::Arc;
 
-use zcash_protocol::value::ZatBalance;
 use zcash_transparent::sighash::SighashType;
 
 use super::{zip244::Zip244SighashCache, Transaction};
@@ -153,34 +152,49 @@ impl From<SigHash> for [u8; 32] {
 
 /// A SigHasher context which stores precomputed data that is reused
 /// between sighash computations for the same transaction.
+///
+/// V4 transactions and V5 and later transactions are hashed natively. Earlier versions have no
+/// native hasher, so they are read by `librustzcash` when the context is created.
 #[derive(Debug)]
 pub struct SigHasher {
-    precomputed_tx_data: PrecomputedTxData,
     v4: Option<V4Sighash>,
     zip244: Option<Zip244SighashCache>,
+    /// The transaction as `librustzcash` reads it, kept only when neither native hasher covers
+    /// the transaction's version.
+    librustzcash: Option<PrecomputedTxData>,
 }
 
 impl SigHasher {
     /// Create a new SigHasher for the given transaction.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// - If `trans` can't be converted to its `librustzcash` equivalent. This could happen, for
-    ///   example, if `trans` contains the `nConsensusBranchId` field, and `nu` doesn't match it.
-    ///   More details in [`PrecomputedTxData::new`].
+    /// - If `trans` contains the `nConsensusBranchId` field, and `nu` doesn't match it.
     /// - If `nu` doesn't contain a consensus branch id convertible to its `librustzcash`
     ///   equivalent.
+    /// - If `trans` has no native hasher and can't be converted to its `librustzcash`
+    ///   equivalent. More details in [`PrecomputedTxData::new`].
     pub fn new(
         trans: &Transaction,
         nu: NetworkUpgrade,
         all_previous_outputs: Arc<Vec<transparent::Output>>,
     ) -> Result<Self, Error> {
-        let precomputed_tx_data = PrecomputedTxData::new(trans, nu, all_previous_outputs.clone())?;
+        let v4 = V4Sighash::new(trans, nu, &all_previous_outputs);
+        let zip244 = Zip244SighashCache::new(trans, &all_previous_outputs);
+
+        let librustzcash = if v4.is_some() || zip244.is_some() {
+            // The native hashers never convert the transaction, so the branch ID rule that
+            // the conversion enforces is checked here instead.
+            trans.librustzcash_branch_id(nu)?;
+            None
+        } else {
+            Some(PrecomputedTxData::new(trans, nu, all_previous_outputs)?)
+        };
 
         Ok(SigHasher {
-            precomputed_tx_data,
-            v4: V4Sighash::new(trans, nu, &all_previous_outputs),
-            zip244: Zip244SighashCache::new(trans, &all_previous_outputs),
+            v4,
+            zip244,
+            librustzcash,
         })
     }
 
@@ -240,11 +254,7 @@ impl SigHasher {
                 );
         }
 
-        sighash(
-            &self.precomputed_tx_data,
-            hash_type,
-            input_index_script_code,
-        )
+        sighash(self.librustzcash(), hash_type, input_index_script_code)
     }
 
     /// Calculate the sighash for the current pre-V5 transaction using the
@@ -281,32 +291,14 @@ impl SigHasher {
                 );
         }
 
-        sighash_v4_raw(
-            &self.precomputed_tx_data,
-            raw_hash_type,
-            input_index_script_code,
-        )
+        sighash_v4_raw(self.librustzcash(), raw_hash_type, input_index_script_code)
     }
 
-    /// Returns the Orchard bundle in the precomputed transaction data.
-    pub fn orchard_bundle(
-        &self,
-    ) -> Option<::orchard::bundle::Bundle<::orchard::bundle::Authorized, ZatBalance>> {
-        self.precomputed_tx_data.orchard_bundle()
-    }
-
-    /// Returns the Ironwood bundle in the precomputed transaction data.
-    pub fn ironwood_bundle(
-        &self,
-    ) -> Option<::orchard::bundle::Bundle<::orchard::bundle::Authorized, ZatBalance>> {
-        self.precomputed_tx_data.ironwood_bundle()
-    }
-
-    /// Returns the Sapling bundle in the precomputed transaction data.
-    pub fn sapling_bundle(
-        &self,
-    ) -> Option<sapling_crypto::Bundle<sapling_crypto::bundle::Authorized, ZatBalance>> {
-        self.precomputed_tx_data.sapling_bundle()
+    /// Returns the transaction as `librustzcash` reads it, for a version with no native hasher.
+    fn librustzcash(&self) -> &PrecomputedTxData {
+        self.librustzcash
+            .as_ref()
+            .expect("SigHasher::new converts every transaction that has no native hasher")
     }
 }
 

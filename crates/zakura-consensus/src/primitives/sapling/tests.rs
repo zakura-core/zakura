@@ -394,7 +394,7 @@ fn sapling_transaction_with_spends() -> Transaction {
 fn item(tx: &Transaction, nu: NetworkUpgrade) -> Option<Item> {
     let all_previous_outputs: Arc<Vec<transparent::Output>> = Arc::new(Vec::new());
     let sighasher = tx.sighasher(nu, all_previous_outputs).ok()?;
-    let bundle = sighasher.sapling_bundle()?;
+    let bundle = tx.shielded_bundles(nu).ok()?.sapling?;
 
     Some(Item::new(
         bundle,

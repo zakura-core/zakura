@@ -13,9 +13,12 @@
 //!
 //! This cache remembers successful bundle verification by transaction ID, sighash and shielded
 //! pool. A hit still runs the whole transaction verifier against the block's height, time and
-//! spent outputs, and skips only the proof and signature checks. Each Orchard circuit era has its
-//! own cache, which binds an entry to its verifying key (see [`super::halo2::verifier_for`]);
-//! Sapling has one verifying key pair for all of history, so one cache covers it.
+//! spent outputs, and skips only the proof and signature checks, along with the second read of
+//! the transaction that builds the bundles for them (see
+//! [`shielded_bundles_are_verified`](super::shielded_bundles_are_verified)). Each Orchard
+//! circuit era has its own cache, which binds an entry to its verifying key (see
+//! [`super::halo2::verifier_for`]); Sapling has one verifying key pair for all of history, so one
+//! cache covers it.
 //!
 //! Only `Ok` results are cached. A batch error is not per-item evidence, because
 //! [`Fallback`](super::fallback::Fallback) re-verifies failures singly, and it may not be a verdict
@@ -81,7 +84,7 @@ const CACHE_SIZE: &str = "zakura.consensus.cache.size";
 /// Ironwood caches at NU6.3 onward are the same cache, so this tag is what keeps their entries
 /// apart; Sapling has its own cache and its tag is defence in depth.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(super) enum ShieldedPool {
+pub(crate) enum ShieldedPool {
     /// The Sapling value pool.
     Sapling,
 
@@ -364,6 +367,14 @@ impl<S> Cached<S> {
         &self.inner
     }
 
+    /// Returns the keys this cache remembers as verified.
+    pub(super) fn verified_keys(&self) -> VerifiedKeys<'_> {
+        VerifiedKeys {
+            verified: &self.verified,
+            verifier_name: self.verifier_name,
+        }
+    }
+
     /// Forgets every remembered bundle.
     ///
     /// This exists for [`clear_shielded_verification_caches`](super::clear_shielded_verification_caches),
@@ -418,6 +429,37 @@ impl<S> Cached<S> {
     }
 }
 
+/// The keys one [`Cached`] verifier remembers as verified.
+///
+/// This is the part of a cache that does not depend on its inner service, so one caller can
+/// consult the Sapling and Halo2 caches alike.
+#[derive(Clone, Copy)]
+pub(super) struct VerifiedKeys<'a> {
+    /// The keys of items that have already verified under the cache's verifying key.
+    verified: &'a Mutex<VerifiedBundles>,
+
+    /// The value the cache reports in the `verifier` label of its metrics.
+    verifier_name: &'static str,
+}
+
+impl VerifiedKeys<'_> {
+    /// Returns `true` if the bundle `key` stands for has already verified.
+    ///
+    /// This does not count a hit; a caller that skips a verification on the answer reports it
+    /// with [`Self::count_hit`].
+    pub(super) fn contains(&self, key: &CacheKey) -> bool {
+        self.verified
+            .lock()
+            .expect("verified bundle cache mutex should not be poisoned")
+            .contains(key)
+    }
+
+    /// Counts one verification answered from the cache.
+    pub(super) fn count_hit(&self) {
+        metrics::counter!(CACHE_HIT, VERIFIER_LABEL => self.verifier_name).increment(1);
+    }
+}
+
 impl<S, I> Service<I> for Cached<S>
 where
     // `Send + 'static` because a miss moves the item into the boxed future that awaits inner
@@ -453,16 +495,10 @@ where
         // Copied once here, outside `Fallback`, which clones every request eagerly.
         let key = item.cache_key();
 
-        if let Some(key) = key {
-            if self
-                .verified
-                .lock()
-                .expect("verified bundle cache mutex should not be poisoned")
-                .contains(&key)
-            {
-                metrics::counter!(CACHE_HIT, VERIFIER_LABEL => self.verifier_name).increment(1);
-                return future::ready(Ok(())).boxed();
-            }
+        let verified_keys = self.verified_keys();
+        if key.is_some_and(|key| verified_keys.contains(&key)) {
+            verified_keys.count_hit();
+            return future::ready(Ok(())).boxed();
         }
 
         metrics::counter!(CACHE_MISS, VERIFIER_LABEL => self.verifier_name).increment(1);

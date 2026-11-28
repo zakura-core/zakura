@@ -224,7 +224,7 @@ fn block_encoding(c: &mut Criterion) {
                     tx.inputs().len()
                 ]);
                 tx.sighasher(nu, outputs.clone())
-                    .expect("vector transactions convert to librustzcash");
+                    .expect("vector transactions have a sighasher at their own network upgrade");
                 (tx.clone(), nu, outputs)
             })
             .collect();
@@ -234,7 +234,23 @@ fn block_encoding(c: &mut Criterion) {
             |b, spent_outputs| {
                 b.iter(|| {
                     for (tx, nu, outputs) in spent_outputs {
-                        black_box(tx.sighasher(*nu, outputs.clone()).expect("converts"));
+                        black_box(tx.sighasher(*nu, outputs.clone()).expect("checked above"));
+                    }
+                })
+            },
+        );
+        // The second read of each transaction, which the transaction verifier does to get the
+        // bundles for the proof verifiers.
+        group.bench_with_input(
+            BenchmarkId::new("shielded_bundles_each", &label),
+            &spent_outputs,
+            |b, spent_outputs| {
+                b.iter(|| {
+                    for (tx, nu, _outputs) in spent_outputs {
+                        black_box(
+                            tx.shielded_bundles(*nu)
+                                .expect("vector transactions convert to librustzcash"),
+                        );
                     }
                 })
             },

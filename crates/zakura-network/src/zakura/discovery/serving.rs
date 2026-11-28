@@ -25,7 +25,7 @@ use super::{
 use crate::zakura::{
     regulation::{
         Produce, Responded, ResponseCap, ResponseSink, ResponsesWritten, Serve, ServeCapacity,
-        ServeEnd, ServeLimits, SinkProgress, WorkLease,
+        ServeEnd, ServeLimits, ServePoolBacking, SinkProgress, WorkLease,
     },
     BlockSyncHandle, CloseCause, FramedSend, HeaderSyncHandle, MessageRole, MessageRule,
     ZakuraPeerId,
@@ -114,6 +114,17 @@ impl ServingCapacity {
             get_peers: row(&GET_PEERS, LARGEST_PEERS),
             get_services: row(&GET_SERVICES, LARGEST_SERVICES),
         }
+    }
+
+    /// Back discovery serving responses by `Consumer::Control` on `pool` (`02 §4`).
+    pub(super) fn with_memory_pool(mut self, pool: crate::zakura::memory::MemoryPool) -> Self {
+        self.get_peers = self
+            .get_peers
+            .with_pool_backing(ServePoolBacking::Control(pool.clone()));
+        self.get_services = self
+            .get_services
+            .with_pool_backing(ServePoolBacking::Control(pool));
+        self
     }
 
     /// Serves one session's requests on `send`. Cancelling `cancel` ends the

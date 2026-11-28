@@ -2900,7 +2900,7 @@ fn disconnected_supplier_history_cannot_block_a_new_supplier() {
         .expect("the new supplier owns the repair requirement");
     let limits = fixture.reactor.startup.config.peer_limits;
     assert!(
-        task.tried_sources.len() <= limits.max_inbound_peers + limits.max_outbound_peers,
+        task.tried_sources.len() <= limits.max_inbound() + limits.max_outbound(),
         "the admitted peer limits bound departed suppliers' history"
     );
     assert!(!task.tried_sources.contains(&source));

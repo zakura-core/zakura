@@ -592,8 +592,8 @@ async fn a_session_without_lifecycle_room_has_its_token_cancelled() {
 
     let tokens = Arc::new(Tokens::default());
     let mut startup = startup(CancellationToken::new());
-    startup.config.peer_limits.max_inbound_peers = 1;
-    startup.config.peer_limits.max_outbound_peers = 0;
+    startup.config.peer_limits.max_inbound_peers = Some(1);
+    startup.config.peer_limits.max_outbound_peers = Some(0);
     startup.observer = ObserverSlot(Some(tokens.clone()));
     let (handle, _actions, _reactor) = build_header_sync_reactor(startup).unwrap();
     let service = HeaderSyncService::new(handle.clone());

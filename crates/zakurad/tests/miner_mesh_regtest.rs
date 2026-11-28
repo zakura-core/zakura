@@ -276,8 +276,7 @@ async fn a_full_node_still_reaches_a_gateway() -> Result<()> {
         NodeSpec::new(Role::Relay),
         NodeSpec::new(Role::Miner)
             .bootstrap_from([HUB])
-            .max_connections(ORDINARY_LIMIT)
-            .gateway_capacity(1),
+            .max_connections(ORDINARY_LIMIT),
         NodeSpec::new(Role::Pool)
             .bootstrap_from([HUB])
             .start_later(),

@@ -37,7 +37,7 @@ use crate::zakura::{
         sample::WireSample,
         BlockHash, HeightLe, WireError,
     },
-    Cadence, Credit, Frame, MessageRole, MessageRule, PayloadLen, ReactorBudget,
+    Cadence, Credit, Frame, MessageRole, MessageRule, PayloadLen, ReactorBudget, ReceiveBudget,
 };
 
 /// The three networks. Mainnet and Testnet share a header size.
@@ -840,11 +840,13 @@ fn every_network_selects_the_layout_for_its_header_size() {
 /// Each budget holds its terms exactly, and each network selects the budget
 /// for its header size.
 ///
-/// The receive share is the peer's `Status` cadence (602 × 122 bytes), one
-/// subscription's byte credit plus its largest page, and the peer's
+/// The receive share, all unsolicited, is the peer's `Status` cadence
+/// (602 × 122 bytes), one subscription's byte credit plus its largest page,
+/// and the peer's
 /// unreleased updates: `credit.objects + credit.bytes / smallest page` grants
 /// and one `Close` at 107 bytes each, and one `Open` at 523 bytes. The output
-/// share is one subscription's byte credit plus its largest page.
+/// share covers `2 × max_live` overlapping subscriptions' byte credit plus
+/// largest page (hsync-15).
 #[test]
 fn every_budget_holds_its_terms() {
     let status = 602 * 122;
@@ -856,23 +858,23 @@ fn every_budget_holds_its_terms() {
     assert_eq!(
         CommonMessage::BUDGET,
         ReactorBudget {
-            receive: status + credit + 2_096_713 + 999_154,
-            output: credit + 2_096_713,
+            receive: ReceiveBudget::unsolicited_only(status + 999_154 + 2_096_713 + 8 + credit),
+            output: 2 * (credit + 2_096_713),
         }
     );
-    assert_eq!(CommonMessage::BUDGET.receive, 11_557_919);
+    assert_eq!(CommonMessage::BUDGET.receive_total(), 11_557_927);
     assert_eq!(HEADER_SYNC_BUDGET, CommonMessage::BUDGET);
     assert_eq!(
         RegtestMessage::BUDGET,
         ReactorBudget {
-            receive: status + credit + 1_348_082 + 3_841_395,
-            output: credit + 1_348_082,
+            receive: ReceiveBudget::unsolicited_only(status + 3_841_395 + 1_348_082 + 8 + credit),
+            output: 2 * (credit + 1_348_082),
         }
     );
-    assert_eq!(RegtestMessage::BUDGET.receive, 13_651_529);
+    assert_eq!(RegtestMessage::BUDGET.receive_total(), 13_651_537);
     assert_eq!(
         (CommonMessage::BUDGET.output, RegtestMessage::BUDGET.output),
-        (10_485_321, 9_736_690)
+        (20_970_642, 19_473_380)
     );
 
     /// Check `network`'s budget against the `HEADER_BYTES` family.

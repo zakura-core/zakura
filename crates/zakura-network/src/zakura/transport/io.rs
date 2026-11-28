@@ -1398,7 +1398,7 @@ mod tests {
         // Scale down the windows so a single bounded frame reaches flow control.
         let quic_config = || QuicConfig {
             stream_receive_window_bytes: 64 * 1024,
-            receive_window_bytes: 128 * 1024,
+            receive_window_bytes: Some(128 * 1024),
             send_window_bytes: 128 * 1024,
             ..QuicConfig::default()
         };

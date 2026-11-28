@@ -989,7 +989,7 @@ fn status_flood(peers: u16, retarget: bool) {
     const BURST: usize = 602;
     let mut startup = startup(CancellationToken::new());
     // Admit the default 256 inbound and 256 outbound sessions in one direction.
-    startup.config.peer_limits.max_inbound_peers = 512;
+    startup.config.peer_limits.max_inbound_peers = Some(512);
     let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
     let snapshot = committed_snapshot(anchor);
     let (_snapshots_tx, snapshots_rx) = watch::channel(Some(snapshot.clone()));
@@ -2361,8 +2361,8 @@ async fn status_flood_during_context_backoff_keeps_supplier_history() {
 async fn active_repair_status_flood_cost() {
     for peers in [16_u16, 92, 512] {
         let (mut reactor, mut actions, mut snapshot) = offers_reactor();
-        reactor.startup.config.peer_limits.max_inbound_peers = 512;
-        reactor.startup.config.peer_limits.max_outbound_peers = 512;
+        reactor.startup.config.peer_limits.max_inbound_peers = Some(512);
+        reactor.startup.config.peer_limits.max_outbound_peers = Some(512);
         reactor.startup.committed_snapshots = None;
         snapshot.frontiers.header_best =
             zakura_header_chain::Frontier::new(block::Height(1), block::Hash([0x40; 32]));

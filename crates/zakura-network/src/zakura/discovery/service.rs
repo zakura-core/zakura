@@ -39,7 +39,7 @@ use super::trace::{AnswerPhase, DiscoveryAnswerEvent, DiscoveryViolationEvent, V
 use super::wire::{PEERS_MAX_BYTES, RULES};
 use crate::zakura::regulation::{CadenceSender, ReservationPool, WriterFence};
 
-const DISCOVERY_SERVICE_STREAMS: [Stream; 1] = [Stream {
+pub(crate) const DISCOVERY_SERVICE_STREAMS: [Stream; 1] = [Stream {
     kind: ZAKURA_STREAM_DISCOVERY,
     version: ZAKURA_DISCOVERY_STREAM_VERSION,
     // The largest payload plus its header is far below u32::MAX.
@@ -60,7 +60,7 @@ const _: () = Stream::validate_layout(&DISCOVERY_SERVICE_STREAMS);
 /// largest answers on each request row, the per-peer serve output that the
 /// serving limits set.
 pub const DISCOVERY_BUDGET: ReactorBudget = {
-    let receive = match Stream::receive_bound(&DISCOVERY_SERVICE_STREAMS, LocalRole::Both) {
+    let receive = match Stream::receive_bound_split(&DISCOVERY_SERVICE_STREAMS, LocalRole::Both) {
         Ok(bytes) => bytes,
         Err(error) => panic!("{}", error.rule()),
     };
@@ -355,6 +355,12 @@ impl DiscoveryService {
             query_pool: reservation_pool(),
             trace,
         }
+    }
+
+    /// Back discovery serving output by `Consumer::Control` on `pool` (`02 §4`).
+    pub(crate) fn with_memory_pool(mut self, pool: crate::zakura::memory::MemoryPool) -> Self {
+        self.serving = self.serving.with_memory_pool(pool);
+        self
     }
 
     pub(crate) fn set_connection_owners(&self, owners: Vec<Arc<dyn Service>>) {
@@ -1032,16 +1038,28 @@ mod tests {
     /// frame headers included.
     #[test]
     fn the_discovery_budget_holds_each_row() {
-        let receive = 42 * 9_601 + 8_470 + 1_090 + 307_234 + 2_394;
+        let unsolicited = 42 * 9_601 + 8_470 + 1_090;
+        let per_request = 307_234 + 2_394;
         let output = 2 * (307_234 + 8) + 2 * (2_394 + 8);
         assert_eq!(
             DISCOVERY_BUDGET,
             ReactorBudget {
-                receive: 722_430,
+                receive: crate::zakura::ReceiveBudget {
+                    unsolicited: 412_802,
+                    per_request: 309_628,
+                },
                 output: 619_288,
             }
         );
-        assert_eq!((receive, output), (722_430, 619_288));
+        assert_eq!(
+            (
+                unsolicited,
+                per_request,
+                DISCOVERY_BUDGET.receive_total(),
+                output
+            ),
+            (412_802, 309_628, 722_430, 619_288)
+        );
     }
 
     #[test]
@@ -1227,7 +1245,7 @@ mod tests {
             },
             ZakuraDiscoveryConfig {
                 peer_limits: ServicePeerLimits {
-                    max_inbound_peers: 4,
+                    max_inbound_peers: Some(4),
                     ..ServicePeerLimits::default()
                 },
                 ..ZakuraDiscoveryConfig::default()
@@ -1324,6 +1342,7 @@ mod tests {
                     .decoded_block_pool(10_000)
                     .expect("fixture decoded allowance fits"),
                 ZakuraBlockSyncConfig::default(),
+                crate::zakura::BlockSyncMemory::for_tests(),
             ))
             .expect("valid block-sync config");
         let service = DiscoveryService::with_sync_services(

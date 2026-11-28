@@ -112,7 +112,15 @@ impl Link {
 
     /// [`Self::connect`] with `client` building the peer's endpoint.
     pub(super) async fn connect_with(client: LocalEndpointFactory) -> Result<Self, BoxError> {
-        let server = LocalEndpointFactory::new().endpoint(95101).await?;
+        Self::connect_pair(LocalEndpointFactory::new(), client).await
+    }
+
+    /// [`Self::connect`] with custom factories for both endpoints.
+    pub(super) async fn connect_pair(
+        server: LocalEndpointFactory,
+        client: LocalEndpointFactory,
+    ) -> Result<Self, BoxError> {
+        let server = server.endpoint(95101).await?;
         let (connection_tx, _connections) = mpsc::channel(1);
         let (stream_tx, streams) = mpsc::channel(2);
         server.serve(CaptureConnection {

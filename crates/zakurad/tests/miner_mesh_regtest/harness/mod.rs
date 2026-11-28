@@ -94,6 +94,12 @@ const FILLER_DIAL_TIMEOUT: Duration = Duration::from_secs(15);
 /// connects from 127.0.0.1, so the default of 16 would cap a larger cluster.
 const MAX_CONNECTIONS_PER_IP: usize = 1_000;
 
+/// A child's `network.zakura.max_connections` unless its [`NodeSpec`] sets
+/// one. The memory plan lowers the cap to the connections the host's memory
+/// funds, but its floor always funds this many, so the slot limit stays the
+/// configured one on any host.
+const DEFAULT_MAX_CONNECTIONS: usize = zakura_network::zakura::MIN_ZAKURA_BUDGETED_CONNECTIONS;
+
 /// The first seed for filler node keys. The testkit derives filler keys from
 /// their seeds by hashing, so a filler's node ID never matches a child's.
 #[cfg(feature = "prometheus")]
@@ -160,13 +166,12 @@ pub struct NodeSpec {
     names_gateway: Option<usize>,
     template_nodes: Vec<usize>,
     max_connections: Option<usize>,
-    gateway_capacity: Option<usize>,
     start_later: bool,
     trace_connections: bool,
 }
 
 impl NodeSpec {
-    /// A node with `role`, no bootstrap peers and the default connection limit.
+    /// A node with `role`, no bootstrap peers and [`DEFAULT_MAX_CONNECTIONS`].
     pub fn new(role: Role) -> Self {
         Self {
             role,
@@ -174,7 +179,6 @@ impl NodeSpec {
             names_gateway: None,
             template_nodes: Vec::new(),
             max_connections: None,
-            gateway_capacity: None,
             start_later: false,
             trace_connections: false,
         }
@@ -202,12 +206,6 @@ impl NodeSpec {
     /// Sets the node's `network.zakura.max_connections`.
     pub fn max_connections(mut self, limit: usize) -> Self {
         self.max_connections = Some(limit);
-        self
-    }
-
-    /// Funds this many gateway places beyond the configured ordinary connection limit.
-    pub fn gateway_capacity(mut self, slots: usize) -> Self {
-        self.gateway_capacity = Some(slots);
         self
     }
 
@@ -1060,20 +1058,8 @@ fn configure_node(
     config.network.zakura.listen_addr = Some(v2_addr);
     config.network.zakura.bootstrap_peers = bootstrap_peers;
     config.network.zakura.max_connections_per_ip = MAX_CONNECTIONS_PER_IP;
-    if let Some(limit) = spec.max_connections {
-        config.network.zakura.max_connections = limit;
-    }
-
-    if let Some(extra) = spec.gateway_capacity {
-        let network = &config.network;
-        let total = network.zakura.max_connections + extra;
-        config.network.zakura.peer_memory_budget_bytes = u64::try_from(
-            network
-                .zakura
-                .quic_memory_bytes(&network.network, total, &[]),
-        )
-        .expect("the regtest peer budget fits in u64");
-    }
+    config.network.zakura.max_connections =
+        Some(spec.max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS));
 
     // The test config names a miner address, which every mining role keeps.
     if !spec.role.mines() {

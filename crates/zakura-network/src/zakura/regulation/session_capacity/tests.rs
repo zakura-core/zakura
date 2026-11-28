@@ -14,8 +14,8 @@ fn capacity(inbound: usize, outbound: usize, setup: usize) -> SessionCapacity {
     SessionCapacity::new(
         "test",
         &ServicePeerLimits {
-            max_inbound_peers: inbound,
-            max_outbound_peers: outbound,
+            max_inbound_peers: Some(inbound),
+            max_outbound_peers: Some(outbound),
             max_pending_escalations: setup,
             ..ServicePeerLimits::default()
         },
@@ -26,8 +26,8 @@ fn capacity(inbound: usize, outbound: usize, setup: usize) -> SessionCapacity {
 fn all_free() -> FreeSlots {
     let limits = ServicePeerLimits::default();
     FreeSlots {
-        inbound: limits.max_inbound_peers,
-        outbound: limits.max_outbound_peers,
+        inbound: limits.max_inbound(),
+        outbound: limits.max_outbound(),
         setup: limits.max_pending_escalations,
         inbound_setup: limits.max_pending_escalations - 1,
     }

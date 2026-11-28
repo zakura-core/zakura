@@ -14,7 +14,7 @@ use crate::{
         handler::{i_open_collision_winner, run_native_initiator_handshake_without_trace},
         testkit::{HostilePeer, LocalEndpointFactory},
         Frame, Stream, StreamPrelude, ZakuraHandshakeConfig, ZakuraLocalLimits, ZakuraPeerId,
-        P2P_V2_ALPN, STREAM_PRELUDE_MAGIC,
+        CONTROL_RECEIVE_BYTES, DEFAULT_ZAKURA_RECEIVE_WINDOW, P2P_V2_ALPN, STREAM_PRELUDE_MAGIC,
     },
     BoxError,
 };
@@ -65,6 +65,19 @@ impl RawLayoutPeer {
             Ok(())
         })
         .await?;
+        // Raw test peers do not run `serve_connection`, so raise handshake-sized
+        // windows to admitted defaults after the control handshake succeeds.
+        let receive_window =
+            if u64::from(limits.quic.receive_window()) == CONTROL_RECEIVE_BYTES {
+                u64::from(DEFAULT_ZAKURA_RECEIVE_WINDOW)
+            } else {
+                u64::from(limits.quic.receive_window())
+            };
+        let _ = connection.set_limits(
+            zakura_quic::ConnLimits::default()
+                .with_receive_window(receive_window)
+                .with_send_window(limits.admitted_send_window_bytes),
+        );
         Ok(Self {
             endpoint,
             connection,

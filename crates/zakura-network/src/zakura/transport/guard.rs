@@ -96,9 +96,7 @@ pub struct BudgetChange {
 #[cfg(any(test, zakura_sim))]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum BudgetChangeKind {
-    /// A reservation within the budget's maximum.
-    Reserved,
-    /// A charge that skipped the admission gate: a floor overdraft.
+    /// An owned charge on the settlement ledger.
     Charged,
     /// A release.
     Released,
@@ -262,41 +260,31 @@ impl ByteBudget {
         }
     }
 
-    /// Admit an owned charge. An admission concurrent with closure can finish;
-    /// the publisher must check closure before exposing its resource.
-    pub(crate) fn reserve_owned(&self, bytes: u64) -> Option<ByteReservation> {
-        self.try_reserve(bytes).then(|| ByteReservation {
-            budget: self.clone(),
-            bytes,
-        })
-    }
-
-    /// Admit the existing floor-progress exception and own its charge.
+    /// Own a charge of `bytes`. The budget is a settlement ledger: it refuses
+    /// only after closing, or on overflow. An admission concurrent with closure
+    /// can finish; the publisher must check closure before exposing its resource.
+    // Rust 1.99 deprecates std's `fetch_update` for `try_update`, which the
+    // 1.97 MSRV lacks. The simulator's atomic keeps its own `fetch_update`.
+    #[allow(deprecated)]
     pub(crate) fn charge_owned(&self, bytes: u64) -> Option<ByteReservation> {
         if self.is_closed() {
             return None;
         }
-        let mut reserved = self.inner.reserved_bytes.load(Ordering::Acquire);
-        loop {
-            let next = reserved.checked_add(bytes)?;
-            match self.inner.reserved_bytes.compare_exchange_weak(
-                reserved,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    publish_reserved_change(reserved, next);
-                    #[cfg(any(test, zakura_sim))]
-                    self.observe(BudgetChangeKind::Charged, reserved, next);
-                    return Some(ByteReservation {
-                        budget: self.clone(),
-                        bytes,
-                    });
-                }
-                Err(observed) => reserved = observed,
-            }
-        }
+        let reserved = self
+            .inner
+            .reserved_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |reserved| {
+                reserved.checked_add(bytes)
+            })
+            .ok()?;
+        let next = reserved + bytes;
+        publish_reserved_change(reserved, next);
+        #[cfg(any(test, zakura_sim))]
+        self.observe(BudgetChangeKind::Charged, reserved, next);
+        Some(ByteReservation {
+            budget: self.clone(),
+            bytes,
+        })
     }
 
     pub(crate) fn new(max_bytes: u64) -> Self {
@@ -368,7 +356,7 @@ impl ByteBudget {
             .saturating_sub(self.inner.reserved_bytes.load(Ordering::Acquire))
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "p2p-fuzz", feature = "internal-bench"))]
     pub(crate) fn max_bytes_for_test(&self) -> u64 {
         self.inner.max_bytes
     }
@@ -377,66 +365,31 @@ impl ByteBudget {
         self.inner.reserved_bytes.load(Ordering::Acquire)
     }
 
-    /// Reserve `bytes` against the shared counter, or fail if the budget cannot
-    /// cover it. A CAS loop so concurrent reservers never over-commit the max.
-    fn try_reserve(&self, bytes: u64) -> bool {
-        if bytes == 0 || self.is_closed() {
-            return false;
-        }
-        let mut reserved = self.inner.reserved_bytes.load(Ordering::Acquire);
-        loop {
-            let available = self.inner.max_bytes.saturating_sub(reserved);
-            if bytes > available {
-                return false;
-            }
-            let next = reserved.saturating_add(bytes);
-            match self.inner.reserved_bytes.compare_exchange_weak(
-                reserved,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    publish_reserved_change(reserved, next);
-                    #[cfg(any(test, zakura_sim))]
-                    self.observe(BudgetChangeKind::Reserved, reserved, next);
-                    return true;
-                }
-                Err(observed) => reserved = observed,
-            }
-        }
-    }
-
     fn release_charge(&self, bytes: u64) {
         self.release_then(bytes, || {});
     }
 
     /// Invoke `released` after the settlement attempt and before waking capacity
     /// waiters. A zero-byte release does nothing.
+    // Rust 1.99 deprecates std's `fetch_update` for `try_update`, which the
+    // 1.97 MSRV lacks. The simulator's atomic keeps its own `fetch_update`.
+    #[allow(deprecated)]
     fn release_then(&self, bytes: u64, released: impl FnOnce()) {
         if bytes == 0 {
             return;
         }
-        let mut reserved = self.inner.reserved_bytes.load(Ordering::Acquire);
-        loop {
-            let Some(next) = reserved.checked_sub(bytes) else {
-                self.close(BudgetClosure::CounterUnderflow { release: bytes });
-                break;
-            };
-            match self.inner.reserved_bytes.compare_exchange_weak(
-                reserved,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    publish_reserved_change(reserved, next);
-                    #[cfg(any(test, zakura_sim))]
-                    self.observe(BudgetChangeKind::Released, reserved, next);
-                    break;
-                }
-                Err(observed) => reserved = observed,
+        match self.inner.reserved_bytes.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |reserved| reserved.checked_sub(bytes),
+        ) {
+            Ok(reserved) => {
+                let next = reserved - bytes;
+                publish_reserved_change(reserved, next);
+                #[cfg(any(test, zakura_sim))]
+                self.observe(BudgetChangeKind::Released, reserved, next);
             }
+            Err(_) => self.close(BudgetClosure::CounterUnderflow { release: bytes }),
         }
         released();
         self.inner.capacity.notify_waiters();
@@ -589,8 +542,8 @@ pub(crate) mod tests {
     #[test]
     fn deferred_settlement_retains_charge_until_drop() {
         let budget = ByteBudget::new(1000);
-        let unrelated = budget.reserve_owned(17).unwrap();
-        let mut funding = budget.reserve_owned(400).unwrap();
+        let unrelated = budget.charge_owned(17).unwrap();
+        let mut funding = budget.charge_owned(400).unwrap();
         let mut release = budget.deferred_release();
         funding.settle_into(&mut release, 100).unwrap();
         funding.settle_into(&mut release, 50).unwrap();
@@ -606,9 +559,9 @@ pub(crate) mod tests {
     #[test]
     fn deferred_settlement_survives_unwind() {
         let budget = ByteBudget::new(1000);
-        let unrelated = budget.reserve_owned(17).unwrap();
+        let unrelated = budget.charge_owned(17).unwrap();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut funding = budget.reserve_owned(200).unwrap();
+            let mut funding = budget.charge_owned(200).unwrap();
             let mut release = budget.deferred_release();
             funding.settle_into(&mut release, 100).unwrap();
             panic!("transition interrupted after funding transfer");
@@ -621,7 +574,7 @@ pub(crate) mod tests {
     #[test]
     fn rejected_transfer_preserves_pool_and_deferred_release() {
         let budget = ByteBudget::new(400);
-        let mut funding = budget.reserve_owned(200).unwrap();
+        let mut funding = budget.charge_owned(200).unwrap();
         let mut release = budget.deferred_release();
         funding.settle_into(&mut release, 50).unwrap();
         assert_eq!(
@@ -645,7 +598,7 @@ pub(crate) mod tests {
     fn underflow_keeps_charge_and_closes_all_admission() {
         use std::{future::Future, task::Context};
         let budget = ByteBudget::new(1_000);
-        let funding = budget.reserve_owned(400).unwrap();
+        let funding = budget.charge_owned(400).unwrap();
         let clone = budget.clone();
         let reader = budget.reader();
         let mut closed = Box::pin(reader.closed());
@@ -669,7 +622,6 @@ pub(crate) mod tests {
         assert!(clone.is_closed());
         assert_eq!(clone.reserved(), 400);
         assert_eq!(clone.available(), 0);
-        assert!(clone.reserve_owned(1).is_none());
         assert!(
             clone.charge_owned(1).is_none(),
             "floor cannot bypass closure"
@@ -681,111 +633,15 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn byte_budget_reserves_and_releases() {
-        let budget = ByteBudget::new(1_000);
-        assert_eq!(budget.available(), 1_000);
-        let funding = budget.reserve_owned(400).unwrap();
-        assert_eq!(budget.reserved(), 400);
-        assert_eq!(budget.available(), 600);
-        // Zero-byte and over-budget reservations are rejected without mutation.
-        assert!(budget.reserve_owned(0).is_none());
-        assert!(budget.reserve_owned(601).is_none());
-        assert_eq!(budget.reserved(), 400);
-        drop(funding);
-        assert_eq!(budget.reserved(), 0);
-    }
-
-    #[test]
     fn byte_budget_charge_overdrafts_past_the_max() {
         let budget = ByteBudget::new(1_000);
-        let ordinary = budget.reserve_owned(900).unwrap();
+        let ordinary = budget.charge_owned(900).unwrap();
         let overdraft = budget.charge_owned(300).unwrap();
         assert_eq!(budget.reserved(), 1_200);
         assert_eq!(budget.available(), 0);
-        assert!(budget.reserve_owned(1).is_none());
         drop(overdraft);
         assert_eq!(budget.reserved(), 900);
         drop(ordinary);
-        assert_eq!(budget.reserved(), 0);
-    }
-
-    // A `ByteBudget` is cloned and shared across the block-sync Sequencer and every
-    // per-peer routine, all reserving concurrently against one counter. The reservation
-    // path must never over-commit the max — the property the CAS loop in `try_reserve`
-    // exists for. This drives many reservers at a tight budget and asserts the shared
-    // counter never exceeds the max; a regression to a non-atomic load-modify-store
-    // would over-commit under this contention.
-    #[test]
-    fn byte_budget_concurrent_reservations_never_over_commit() {
-        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-        use std::sync::{Arc, Barrier};
-        use std::thread;
-
-        const CHUNK: u64 = 4_096;
-        const CAP: u64 = 8;
-        const THREADS: usize = 16; // deliberately oversubscribed: 16 reservers, 8 slots
-        let max = CHUNK * CAP;
-        let budget = ByteBudget::new(max);
-
-        // Phase 1 — deterministic oversubscription. Every thread tries to reserve one
-        // CHUNK simultaneously and holds it across a barrier, so the counter sits at its
-        // peak with all reservations decided. Exactly CAP may be admitted; never more.
-        let start = Arc::new(Barrier::new(THREADS));
-        let all_reserved = Arc::new(Barrier::new(THREADS));
-        let successes = Arc::new(AtomicUsize::new(0));
-        let mut handles = Vec::new();
-        for _ in 0..THREADS {
-            let budget = budget.clone();
-            let start = start.clone();
-            let all_reserved = all_reserved.clone();
-            let successes = successes.clone();
-            handles.push(thread::spawn(move || {
-                start.wait();
-                let funding = budget.reserve_owned(CHUNK);
-                if funding.is_some() {
-                    successes.fetch_add(1, AtomicOrdering::AcqRel);
-                }
-                // All reservations are decided and still held: the counter is at its peak.
-                all_reserved.wait();
-                assert!(
-                    budget.reserved() <= max,
-                    "reserved {} exceeded the budget max {max} (over-commit)",
-                    budget.reserved(),
-                );
-                drop(funding);
-            }));
-        }
-        for handle in handles {
-            handle.join().expect("reserver thread panicked");
-        }
-        assert_eq!(
-            u64::try_from(successes.load(AtomicOrdering::Acquire)).unwrap(),
-            CAP,
-            "exactly CAP reservations may be admitted; the rest must be rejected",
-        );
-        assert_eq!(
-            budget.reserved(),
-            0,
-            "every admitted reservation was released"
-        );
-
-        // Phase 2 — sustained churn. Many reserve/release rounds under contention, each
-        // asserting the counter is never over budget.
-        let mut handles = Vec::new();
-        for _ in 0..THREADS {
-            let budget = budget.clone();
-            handles.push(thread::spawn(move || {
-                for _ in 0..5_000 {
-                    if let Some(funding) = budget.reserve_owned(CHUNK) {
-                        assert!(budget.reserved() <= max, "over-commit during churn");
-                        drop(funding);
-                    }
-                }
-            }));
-        }
-        for handle in handles {
-            handle.join().expect("churn thread panicked");
-        }
         assert_eq!(budget.reserved(), 0);
     }
 

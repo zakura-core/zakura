@@ -59,7 +59,10 @@ fn connection_gates(streams: &[Stream], receive: u64, output: u64) -> Connection
     let shares = ReactorShares {
         control_receive_bytes: 1 << 20,
         kinds: Vec::new(),
-        other: ReactorBudget { receive, output },
+        other: ReactorBudget {
+            receive: ReceiveBudget::unsolicited_only(receive),
+            output,
+        },
     };
     let capabilities = streams
         .iter()
@@ -110,6 +113,50 @@ fn spawn_stream_worker(
 
 /// The reader stops after a checked header until capacity returns. A worker's
 /// frame stays charged until its consumer receives and releases it.
+/// fix-15: the payload buffer grows as bytes arrive, so a frame sent in
+/// many small writes reads back whole and in order.
+#[tokio::test]
+async fn a_payload_sent_in_pieces_reads_back_whole() -> Result<(), BoxError> {
+    const PIECE: usize = 1000;
+    const PAYLOAD_LEN: usize = 40 * PIECE + 7;
+    let mut link = Link::connect().await?;
+    // usize indices below 256 fit u8.
+    let payload: Vec<u8> = (0..PAYLOAD_LEN).map(|i| (i % 251) as u8).collect();
+    let max_frame_bytes = u32::try_from(FRAME_HEADER_BYTES + PAYLOAD_LEN)?;
+    let bytes = Frame {
+        message_type: 0,
+        flags: 0,
+        payload: payload.clone(),
+    }
+    .encode(max_frame_bytes)?;
+    let (header, body) = bytes.split_at(FRAME_HEADER_BYTES);
+    let (mut peer_send, _peer_recv, _send, mut recv) = link.open(header).await?;
+
+    let body = body.to_vec();
+    let writing = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+        for piece in body.chunks(PIECE) {
+            peer_send.write_all(piece).await.unwrap();
+            tokio::task::yield_now().await;
+        }
+        peer_send
+    }));
+    let frame = timeout(
+        TEST_TIMEOUT,
+        read_frame(
+            &mut recv,
+            max_frame_bytes,
+            FrameFilter::new(None, InboundReader::Persistent),
+            TEST_TIMEOUT,
+            None,
+        ),
+    )
+    .await??;
+    assert_eq!(frame.payload, payload);
+    drop(writing);
+    link.close().await;
+    Ok(())
+}
+
 #[tokio::test]
 async fn a_saturated_gate_holds_the_payload_until_capacity_returns() -> Result<(), BoxError> {
     let mut link = Link::connect().await?;
@@ -155,7 +202,7 @@ async fn a_full_kind_leaves_its_unread_frame_out_of_the_usage_report() -> Result
         control_receive_bytes: 1 << 20,
         kinds: Vec::new(),
         other: ReactorBudget {
-            receive: 1024,
+            receive: ReceiveBudget::unsolicited_only(1024),
             output: 1024,
         },
     };
@@ -481,7 +528,7 @@ async fn a_stalled_response_strands_at_most_its_kinds_output_share() -> Result<(
     // The peer's small stream window stalls a response of 400 frames.
     let peer = LocalEndpointFactory::new().quic_config(QuicConfig {
         stream_receive_window_bytes: 64 * 1024,
-        receive_window_bytes: 128 * 1024,
+        receive_window_bytes: Some(128 * 1024),
         ..QuicConfig::default()
     });
     let mut link = Link::connect_with(peer).await?;
@@ -594,7 +641,7 @@ async fn cancelling_the_connection_ends_a_stalled_response_write() -> Result<(),
     // The peer's small stream window stalls a response of 400 frames.
     let peer = LocalEndpointFactory::new().quic_config(QuicConfig {
         stream_receive_window_bytes: 64 * 1024,
-        receive_window_bytes: 128 * 1024,
+        receive_window_bytes: Some(128 * 1024),
         ..QuicConfig::default()
     });
     let mut link = Link::connect_with(peer).await?;
@@ -632,6 +679,62 @@ async fn cancelling_the_connection_ends_a_stalled_response_write() -> Result<(),
     timeout(HELD, worker)
         .await
         .map_err(|_| "cancellation ends the stalled write")??;
+    assert_eq!(output.granted(), 0);
+    link.close().await;
+    Ok(())
+}
+
+/// A response whose tail fits the stream's write-ahead keeps its output grant
+/// until QUIC takes the tail. A peer that stops reading then can't pin uncharged
+/// response bytes in the connection task on each of its streams.
+#[tokio::test]
+async fn a_response_tail_waiting_on_credit_keeps_its_output_grant() -> Result<(), BoxError> {
+    const SLOW: Stream = test_stream(912, StreamMode::RequestResponse);
+    const OTHER: Stream = test_stream(913, StreamMode::RequestResponse);
+    // 70 frames of 1,008 bytes pass the peer's 64 KiB stream window by about
+    // 5 KiB, less than the stream's write-ahead, so no write waits.
+    const RESPONSE_FRAMES: usize = 70;
+    let peer = LocalEndpointFactory::new().quic_config(QuicConfig {
+        stream_receive_window_bytes: 64 * 1024,
+        receive_window_bytes: Some(128 * 1024),
+        ..QuicConfig::default()
+    });
+    let mut link = Link::connect_with(peer).await?;
+    let connection = connection_gates(&[SLOW, OTHER], 1 << 20, 1 << 20);
+    let registry = Arc::new(ServiceRegistry::new(vec![Arc::new(AnsweringRequests {
+        streams: [SLOW, OTHER],
+        frames: RESPONSE_FRAMES,
+    })])?);
+    let response_bytes = u64::try_from(RESPONSE_FRAMES)? * response_frame_bytes(1000);
+    let output = OutputByteBudget::new(1 << 20)?;
+    let (_peer_send, mut peer_recv, worker) = spawn_request(
+        &mut link,
+        &connection,
+        &registry,
+        prelude_of(SLOW.kind, Some(1)),
+        Some(FrameGate::over(output.clone())),
+    )
+    .await?;
+    timeout(TEST_TIMEOUT, async {
+        while output.granted() != response_bytes && !worker.is_finished() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await?;
+    tokio::time::sleep(HELD).await;
+    assert!(
+        !worker.is_finished(),
+        "the worker waits for QUIC to take the tail before it returns the grant"
+    );
+    assert_eq!(
+        output.granted(),
+        response_bytes,
+        "the waiting tail stays charged"
+    );
+
+    let answer = timeout(TEST_TIMEOUT, peer_recv.read_to_end(usize::MAX)).await??;
+    assert_eq!(answer.len(), RESPONSE_FRAMES * 1008);
+    timeout(TEST_TIMEOUT, worker).await??;
     assert_eq!(output.granted(), 0);
     link.close().await;
     Ok(())
@@ -1327,4 +1430,91 @@ fn dropped_stream_resources_leave_no_owner() {
     assert_eq!(node.owners().counts().setup, 1);
     drop(setup);
     assert_eq!(node.owners().counts().total(), 0);
+}
+
+/// Property mem-2 (`lease-follows-bytes`): held raw frames carry a QUIC
+/// `CreditHold` (API-10), so unread QUIC bytes and held raw frames share the
+/// connection's single receive window and are never double-counted. Dropping
+/// the held frames releases both the raw gate and the QUIC credit together.
+#[tokio::test]
+async fn received_frame_bytes_stay_inside_receive_credit_until_release() -> Result<(), BoxError> {
+    const WINDOW: u32 = 64 * 1024;
+    const PAYLOAD_LEN: usize = 1000;
+    const FILL_FRAMES: usize = 64;
+    // Server has a 64 KiB receive window and a larger raw gate (128 KiB), so
+    // only QUIC credit withholding can stop the peer once 64 KiB are held.
+    let server = LocalEndpointFactory::new().quic_config(QuicConfig {
+        stream_receive_window_bytes: WINDOW,
+        receive_window_bytes: Some(WINDOW),
+        ..QuicConfig::default()
+    });
+    let mut link = Link::connect_pair(server, LocalEndpointFactory::new()).await?;
+    let mut context = tabled_context(None, 256);
+    let (gate, budget) = raw_gate(u64::from(WINDOW) * 2);
+    context.resources.raw = gate;
+    let first = frame_bytes(1, PAYLOAD_LEN);
+    let (mut peer_send, _peer_recv, send, recv) = link.open(&first).await?;
+    let (worker, mut inbound, _outbound, cancel) = spawn_stream_worker(send, recv, context);
+
+    // Send 64 frames (~64.5 KiB wire, 64 KiB payload) and hold every admitted
+    // frame in memory so its `FrameGrant` + `CreditHold` stay live.
+    let mut held = Vec::with_capacity(FILL_FRAMES);
+    held.push(
+        timeout(TEST_TIMEOUT, inbound.recv())
+            .await?
+            .ok_or("missing first frame")?,
+    );
+    let wire_frame = frame_bytes(1, PAYLOAD_LEN);
+    let mut peer_writer = tokio::spawn(async move {
+        // Send enough frames to fill the 64 KiB window plus 32 KiB more that
+        // can only flow once held frames release their CreditHold.
+        for _ in 1..(FILL_FRAMES + 32) {
+            peer_send.write_all(&wire_frame).await?;
+        }
+        Ok::<_, BoxError>(peer_send)
+    });
+
+    // Drain every frame QUIC flow control permits while holding all admitted
+    // frames. Because each held frame's `CreditHold` withholds its payload
+    // credit from the single 64 KiB receive window, the peer cannot deliver
+    // all 96 KiB until held frames drop.
+    while let Ok(Some(next)) = timeout(HELD, inbound.recv()).await {
+        held.push(next);
+        if held.len() == FILL_FRAMES + 32 {
+            break;
+        }
+    }
+    assert!(
+        held.len() < FILL_FRAMES + 16,
+        "held {} frames (~{} KiB) without releasing CreditHold on a 64 KiB receive window",
+        held.len(),
+        held.len() * (PAYLOAD_LEN + FRAME_HEADER_BYTES) / 1024,
+    );
+    let held_bytes = u64::try_from(held.len())? * frame_wire_bytes(PAYLOAD_LEN);
+    let one_frame = frame_wire_bytes(PAYLOAD_LEN);
+    assert!(
+        budget.granted() == held_bytes || budget.granted() == held_bytes + one_frame,
+        "granted {} must cover only the {} held frames ({held_bytes}) plus at most one in-progress read ({one_frame})",
+        budget.granted(),
+        held.len(),
+    );
+
+    // Releasing the held frames drops their raw grants and CreditHolds, letting
+    // the remaining frames flow through.
+    let mut received = held.len();
+    held.clear();
+    while received < FILL_FRAMES + 32 {
+        let frame = timeout(TEST_TIMEOUT, inbound.recv())
+            .await?
+            .ok_or("missing released frame")?;
+        drop(frame);
+        received += 1;
+    }
+    let _peer_send = timeout(TEST_TIMEOUT, &mut peer_writer).await???;
+    assert_eq!(budget.granted(), 0);
+
+    cancel.cancel();
+    timeout(TEST_TIMEOUT, worker).await??;
+    link.close().await;
+    Ok(())
 }

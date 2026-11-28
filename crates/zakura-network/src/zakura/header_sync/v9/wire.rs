@@ -28,8 +28,8 @@ use crate::zakura::{
         BlockHash, Bool, BoundedReader, HeightLe, LeU16, LeU32, LeU64, List, Wire, WireError,
         WireMessage, U8,
     },
-    Cadence, Credit, LocalRole, MessageRole, MessageRule, PayloadLen, ReactorBudget, Stream,
-    StreamQueueDepths, FRAME_HEADER_BYTES, ZAKURA_CAP_HEADER_SYNC,
+    Cadence, Credit, LocalRole, MessageRole, MessageRule, PayloadLen, ReactorBudget, ReceiveBudget,
+    Stream, StreamQueueDepths, FRAME_HEADER_BYTES, ZAKURA_CAP_HEADER_SYNC,
 };
 
 /// The header sync stream version this module encodes.
@@ -275,18 +275,26 @@ pub fn budget(network: &zakura_chain::parameters::Network) -> ReactorBudget {
 /// The budget of `layout`, the version 9 layout of a network whose headers
 /// take `header_bytes`. [`Message::BUDGET`] explains each term.
 const fn layout_budget(layout: &[Stream], header_bytes: usize) -> ReactorBudget {
-    let subscriber = match Stream::receive_bound(layout, LocalRole::Requester) {
+    let subscriber = match Stream::receive_bound_split(layout, LocalRole::Requester) {
         Ok(bytes) => bytes,
         Err(error) => panic!("{}", error.rule()),
     };
-    let Some(receive) = subscriber.checked_add(update_bytes(header_bytes)) else {
+    // The publisher pushes pages and updates against the subscription's
+    // credit, and nothing raises the connection's receive window per
+    // subscription, so the whole share is unsolicited. Funding it at
+    // negotiation keeps a header-only peer's window at full credit.
+    let Some(receive) = subscriber.total().checked_add(update_bytes(header_bytes)) else {
         panic!("the header sync receive share fits u64");
     };
+    let Some(receive) = receive.checked_add(FRAME_HEADER_BYTES as u64) else {
+        panic!("the header sync receive share fits u64");
+    };
+    let frame = largest_page(header_bytes) as u64 + FRAME_HEADER_BYTES as u64;
     ReactorBudget {
-        receive,
+        receive: ReceiveBudget::unsolicited_only(receive),
         output: serve_output_bytes(header_bytes),
     }
-    .assert_frame_cap(FRAME_CAP)
+    .assert_frame_cap(frame as u32)
 }
 
 /// Encoded bytes of the pages that the publisher may hold unwritten for one
@@ -297,7 +305,10 @@ const fn layout_budget(layout: &[Stream], header_bytes: usize) -> ReactorBudget 
 /// it, and only a written page can be acknowledged. So the queued pages and
 /// the page in progress stay within one subscription's window. The window
 /// holds at most `credit.objects` pages, and the largest page covers their
-/// frame headers. Terminal outcomes and `Status` take no serve output.
+/// frame headers. `PublicationSlots` admits `2 × max_live` overlapping
+/// subscriptions per session (the 2× subscription margin, hsync-15), so the
+/// output share covers `2 × max_live` windows. Terminal outcomes and `Status`
+/// take no serve output.
 const fn serve_output_bytes(header_bytes: usize) -> u64 {
     let MessageRole::Subscription {
         max_live, credit, ..
@@ -311,7 +322,7 @@ const fn serve_output_bytes(header_bytes: usize) -> u64 {
         credit.objects as u64 * FRAME_HEADER_BYTES as u64 <= largest,
         "the largest page covers a window's frame headers"
     );
-    max_live as u64 * (credit.bytes as u64 + largest)
+    (max_live as u64 * 2) * (credit.bytes as u64 + largest)
 }
 
 /// Payload bytes of the `SubscribeHeaders` updates that a conformant

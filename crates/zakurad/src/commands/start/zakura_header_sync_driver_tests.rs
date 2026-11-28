@@ -448,6 +448,7 @@ fn block_sync_startup_with_snapshot(
             .decoded_block_pool(10_000)
             .expect("fixture decoded allowance fits"),
         config,
+        zakura_network::zakura::BlockSyncMemory::for_tests(),
     );
     startup.committed_views = Some(test_committed_views(frontiers, best_header_tip));
     startup

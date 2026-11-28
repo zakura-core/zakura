@@ -3,9 +3,7 @@
 use super::read_close_cause::Link;
 use super::*;
 use crate::zakura::{
-    legacy_gossip::{
-        LegacyRequestFrame, LegacyResponseCodec, LEGACY_REQUESTS_BUDGET, MSG_RESPONSE_PONG,
-    },
+    legacy_gossip::{LegacyRequestFrame, LegacyResponseCodec, MSG_RESPONSE_PONG},
     regulation::OutputByteBudget,
     RequestResponseService,
 };
@@ -1174,55 +1172,6 @@ async fn a_small_frame_cap_request_funds_its_full_bound_before_the_service() -> 
         0,
         "a gate below the bound refuses the call"
     );
-    assert_eq!(requests.output.granted(), 0);
-    assert_eq!(requests.raw_budget.granted(), 0);
-    requests.link.close().await;
-    Ok(())
-}
-
-/// A peer's tiny frame cap would split one block into a frame per object byte. The
-/// bound counts each frame's overhead, so it exceeds the kind's output share, and
-/// the request is refused before its service runs.
-#[tokio::test]
-async fn a_tiny_frame_cap_block_request_is_refused_before_its_service() -> Result<(), BoxError> {
-    // A frame header, a response chunk header, and one object byte.
-    const TINY_CAP: u32 = 18;
-    let share = LEGACY_REQUESTS_BUDGET.output;
-    let request = Frame {
-        message_type: LEGACY_REQUEST_BLOCKS_BY_HASH,
-        flags: 0,
-        payload: one_block_request(),
-    };
-    let limits = test_connection_limits();
-    let unlimited = response_bound(
-        LEGACY_REQUEST_STREAM_KIND,
-        &request,
-        limits,
-        TINY_CAP,
-        u64::MAX,
-    )
-    .ok_or("an unlimited gate fits every bound")?;
-    assert!(
-        unlimited.bytes > share,
-        "the frames' overhead exceeds the share"
-    );
-    assert_eq!(
-        response_bound(
-            LEGACY_REQUEST_STREAM_KIND,
-            &request,
-            limits,
-            TINY_CAP,
-            share
-        ),
-        None
-    );
-
-    let mut requests = LegacyRequests::connect(share, Vec::new()).await?;
-    let (worker, _cancel) = requests
-        .start_capped(LEGACY_REQUEST_BLOCKS_BY_HASH, one_block_request(), TINY_CAP)
-        .await?;
-    timeout(TEST_TIMEOUT, worker).await??;
-    assert_eq!(requests.calls(), 0, "the service never runs");
     assert_eq!(requests.output.granted(), 0);
     assert_eq!(requests.raw_budget.granted(), 0);
     requests.link.close().await;

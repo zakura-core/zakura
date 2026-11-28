@@ -346,7 +346,7 @@ pub const POST_NU7_1_POW_AVERAGING_WINDOW: usize = 128;
 pub const MAX_POW_AVERAGING_WINDOW: usize = POST_NU7_1_POW_AVERAGING_WINDOW;
 
 /// Per-block limit on the total number of actions in each Orchard-protocol
-/// pool, applied from NU7 activation onwards.
+/// pool, applied from NU7 until NU7.1.
 ///
 /// `OrchardProtocolBlockActionLimit` in ZIP 218. It applies separately to
 /// Orchard actions and to Ironwood actions. Both pools share the single
@@ -355,7 +355,7 @@ pub const MAX_POW_AVERAGING_WINDOW: usize = POST_NU7_1_POW_AVERAGING_WINDOW;
 pub const ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT: u32 = 330;
 
 /// Per-block limit on the total number of Sapling spends plus outputs, applied
-/// from NU7 activation onwards.
+/// from NU7 until NU7.1.
 ///
 /// `SaplingBlockIOLimit` in ZIP 218.
 pub const SAPLING_BLOCK_IO_LIMIT: u32 = 300;
@@ -370,7 +370,7 @@ pub const SAPLING_BLOCK_IO_LIMIT: u32 = 300;
 pub const SPROUT_BLOCK_JOINSPLIT_LIMIT: u32 = 0;
 
 /// Per-block budget for the total shielded cost across all pools, applied from
-/// NU7 activation onwards.
+/// NU7 until NU7.1.
 ///
 /// `GlobalShieldedBudget` in ZIP 218. It bounds the worst-case shielded sync
 /// bandwidth per block whichever combination of pools a block uses. Orchard and
@@ -378,6 +378,39 @@ pub const SPROUT_BLOCK_JOINSPLIT_LIMIT: u32 = 0;
 /// units each. Sprout JoinSplits count twice because each produces two shielded
 /// outputs.
 pub const GLOBAL_SHIELDED_BUDGET: u32 = 330;
+
+/// Per-block limit on the total number of actions in each Orchard-protocol
+/// pool from NU7.1.
+///
+/// `TwentySecondOrchardProtocolBlockActionLimit` in ZIP 223: 4/5 of
+/// [`ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT`], so the daily maximum stays the same
+/// at 20 second spacing.
+pub const POST_NU7_1_ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT: u32 = 264;
+
+/// Per-block limit on the total number of Sapling spends plus outputs from NU7.1.
+///
+/// `TwentySecondSaplingBlockIOLimit` in ZIP 223: 4/5 of [`SAPLING_BLOCK_IO_LIMIT`].
+pub const POST_NU7_1_SAPLING_BLOCK_IO_LIMIT: u32 = 240;
+
+/// Per-block budget for the total shielded cost across all pools from NU7.1.
+///
+/// `TwentySecondGlobalShieldedBudget` in ZIP 223: 4/5 of [`GLOBAL_SHIELDED_BUDGET`].
+pub const POST_NU7_1_GLOBAL_SHIELDED_BUDGET: u32 = 264;
+
+/// The per-block shielded limits that ZIP 218 and ZIP 223 set at a height.
+///
+/// See [`NetworkUpgrade::shielded_block_limits`].
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct ShieldedBlockLimits {
+    /// The limit on Orchard actions, and separately on Ironwood actions.
+    pub orchard_protocol_actions: u32,
+    /// The limit on Sapling spends plus outputs.
+    pub sapling_ios: u32,
+    /// The limit on Sprout JoinSplits.
+    pub sprout_joinsplits: u32,
+    /// The budget for the total shielded cost across all pools.
+    pub global_shielded_budget: u32,
+}
 
 /// The multiplier used to derive the Testnet minimum difficulty time gap before
 /// NU7.
@@ -669,6 +702,35 @@ impl NetworkUpgrade {
     /// `AveragingWindowTimespan` from the Zcash specification.
     pub fn averaging_window_timespan(&self) -> Duration {
         self.target_spacing() * self.averaging_window().try_into().expect("fits in i32")
+    }
+
+    /// Returns the per-block shielded limits at `height` on `network`, or `None`
+    /// before NU7, where no limits apply.
+    ///
+    /// ZIP 218 sets the limits at NU7, and ZIP 223 scales the action limits and
+    /// the global budget by 4/5 at NU7.1.
+    pub fn shielded_block_limits(
+        network: &Network,
+        height: block::Height,
+    ) -> Option<ShieldedBlockLimits> {
+        let upgrade = NetworkUpgrade::current(network, height);
+        if upgrade >= NetworkUpgrade::Nu7_1 {
+            Some(ShieldedBlockLimits {
+                orchard_protocol_actions: POST_NU7_1_ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT,
+                sapling_ios: POST_NU7_1_SAPLING_BLOCK_IO_LIMIT,
+                sprout_joinsplits: SPROUT_BLOCK_JOINSPLIT_LIMIT,
+                global_shielded_budget: POST_NU7_1_GLOBAL_SHIELDED_BUDGET,
+            })
+        } else if upgrade >= NetworkUpgrade::Nu7 {
+            Some(ShieldedBlockLimits {
+                orchard_protocol_actions: ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT,
+                sapling_ios: SAPLING_BLOCK_IO_LIMIT,
+                sprout_joinsplits: SPROUT_BLOCK_JOINSPLIT_LIMIT,
+                global_shielded_budget: GLOBAL_SHIELDED_BUDGET,
+            })
+        } else {
+            None
+        }
     }
 
     /// Returns `true` if NU7's consensus rules apply at `height` on `network`.

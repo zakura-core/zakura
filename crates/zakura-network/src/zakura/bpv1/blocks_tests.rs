@@ -3623,6 +3623,22 @@ fn bpv1_57_metadata_for_the_committed_tip_is_retired_at_admission() {
          peer's later data for the block: {:?}",
         again.outputs
     );
+    // A forged coding on a retired block's copy closes its sender instead of
+    // setting the session's drop counters to the forged part count.
+    let mut forged = make_envelope(block_id, encoded.coding, encoded.part_root, node_id(2));
+    forged.coding.stripes = u32::MAX;
+    let forged = receive(&mut table, t0, forged);
+    assert!(
+        matches!(
+            forged.outputs.as_slice(),
+            [BlockOutput::ClosePeer {
+                row: Bpv1CloseRow::Row4BadMetaOrCommitment,
+                ..
+            }]
+        ),
+        "{:?}",
+        forged.outputs
+    );
     table.assert_invariants();
 }
 

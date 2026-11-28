@@ -1988,17 +1988,6 @@ impl BlockTable {
         step: &mut BlockStep,
     ) {
         let block_id = envelope.block_id;
-        // An admitted block's admission reaches every session, which clears
-        // its received marker, and the table never uses this copy. A session
-        // that opened after the block retired never hears of it, so its copy
-        // is rejected: the session then drops the peer's later data for the
-        // block instead of holding it, or closing once the block is evicted.
-        if let Some(block) = self.blocks.get(&block_id) {
-            if block.phase == BlockPhase::Retired {
-                reject_meta(step, block_id, from_peer, session_gen);
-            }
-            return;
-        }
         // bpv1-10: validate the canonical coding tuple of every copy against
         // the local profile BEFORE scheduling any headerchain admission work.
         if self
@@ -2016,6 +2005,19 @@ impl BlockTable {
                 session_gen,
                 row: Bpv1CloseRow::Row4BadMetaOrCommitment,
             });
+            return;
+        }
+        // An admitted block's admission reaches every session, which clears
+        // its received marker, and the table never uses this copy. A session
+        // that opened after the block retired never hears of it, so its copy
+        // is rejected: the session then drops the peer's later data for the
+        // block instead of holding it, or closing once the block is evicted.
+        // The copy's coding passed the check above, so the part count the
+        // session drops against stays within the profile's largest layout.
+        if let Some(block) = self.blocks.get(&block_id) {
+            if block.phase == BlockPhase::Retired {
+                reject_meta(step, block_id, from_peer, session_gen);
+            }
             return;
         }
         // A block still admitting or pending records this sender, so

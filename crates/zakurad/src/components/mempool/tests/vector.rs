@@ -271,6 +271,8 @@ fn transaction_data_failures_ban_every_version() {
         TransactionError::IronwoodProofSize,
         TransactionError::CoinbaseInMempool,
         TransactionError::NonCoinbaseHasCoinbaseInput,
+        TransactionError::NonCoinbaseHasNullPrevout,
+        TransactionError::V7NsmAddsValue,
         TransactionError::DuplicateTransparentSpend(OutPoint::from_usize(
             zakura_chain::transaction::Hash([0; 32]),
             0,
@@ -282,7 +284,7 @@ fn transaction_data_failures_ban_every_version() {
             transaction_hash: zakura_chain::transaction::Hash([0; 32]),
         },
     ] {
-        for transaction_version in [4, 5, 6] {
+        for transaction_version in [4, 5, 6, 7] {
             let failure = relayed_transaction_failure(error.clone(), transaction_version);
 
             assert_eq!(
@@ -354,7 +356,7 @@ fn upgrade_dependent_failures_ban_only_v5_and_later() {
             "{error:?}"
         );
 
-        for transaction_version in [5, 6] {
+        for transaction_version in [5, 6, 7] {
             let failure = relayed_transaction_failure(error.clone(), transaction_version);
             assert_eq!(
                 transaction_ban_peer(&failure),
@@ -379,7 +381,7 @@ fn tip_dependent_failures_never_ban() {
         // The verifier failed to run the script, so the script is not at fault.
         TransactionError::Script(zakura_script::Error::TxIndex),
     ] {
-        for transaction_version in [4, 5, 6] {
+        for transaction_version in [4, 5, 6, 7] {
             let failure = relayed_transaction_failure(error.clone(), transaction_version);
             assert_eq!(transaction_ban_peer(&failure), None, "{error:?}");
         }
@@ -389,7 +391,7 @@ fn tip_dependent_failures_never_ban() {
 #[test]
 fn sprout_deposits_start_cooldowns() {
     let error = TransactionError::DisabledAddToSproutPool;
-    for transaction_version in [4, 5, 6] {
+    for transaction_version in [4, 5, 6, 7] {
         let failure = relayed_transaction_failure(error.clone(), transaction_version);
         assert_eq!(transaction_ban_peer(&failure), None, "{error:?}");
         assert_eq!(

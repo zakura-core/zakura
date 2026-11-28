@@ -19,6 +19,9 @@ pub mod halo2;
 pub mod redjubjub;
 pub mod redpallas;
 pub mod sapling;
+mod sighashes;
+
+pub use sighashes::BundleSighashes;
 
 /// The maximum batch size for any of the batch verifiers.
 const MAX_BATCH_SIZE: usize = 64;

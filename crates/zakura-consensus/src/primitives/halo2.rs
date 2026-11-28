@@ -17,12 +17,13 @@ use orchard::{
 use rand_10::rng as thread_rng;
 use zakura_chain::{
     parameters::NetworkUpgrade,
-    transaction::{SigHash, UnminedTxId, WtxId},
+    transaction::{UnminedTxId, WtxId},
 };
 use zcash_protocol::value::ZatBalance;
 
 use super::batch_control::{Batch, BatchControl, RequestWeight};
 use super::fallback::Fallback;
+use super::BundleSighashes;
 use crate::{error::TransactionError, BoxError};
 use thiserror::Error;
 use tokio::{
@@ -181,7 +182,7 @@ pub struct Item {
     // shares the bundle instead of deep-copying its actions and multi-KB proof. `add_bundle` only
     // needs `&Bundle`.
     bundle: Arc<orchard::bundle::Bundle<orchard::bundle::Authorized, ZatBalance>>,
-    sighash: SigHash,
+    sighashes: BundleSighashes,
     cache_key: Option<CacheKey>,
 }
 
@@ -197,7 +198,7 @@ impl Item {
         self.bundle.actions().len()
     }
 
-    /// Creates a new [`Item`] from a bundle and sighash.
+    /// Creates a new [`Item`] from a bundle and the digests its signatures sign.
     ///
     /// Items constructed without their transaction's [`WtxId`] are verified
     /// normally but are not cached. The transaction verifier supplies the
@@ -205,11 +206,11 @@ impl Item {
     /// items can reuse successful results.
     pub fn new(
         bundle: orchard::bundle::Bundle<orchard::bundle::Authorized, ZatBalance>,
-        sighash: SigHash,
+        sighashes: impl Into<BundleSighashes>,
     ) -> Self {
         Self {
             bundle: Arc::new(bundle),
-            sighash,
+            sighashes: sighashes.into(),
             cache_key: None,
         }
     }
@@ -223,19 +224,20 @@ impl Item {
     /// this invariant.
     pub(crate) fn new_with_wtx_id(
         bundle: orchard::bundle::Bundle<orchard::bundle::Authorized, ZatBalance>,
-        sighash: SigHash,
+        sighashes: impl Into<BundleSighashes>,
         wtx_id: WtxId,
     ) -> Self {
         let pool = ShieldedPool::from(bundle.bundle_version().value_pool());
+        let sighashes = sighashes.into();
 
         Self {
             bundle: Arc::new(bundle),
-            sighash,
             cache_key: Some(CacheKey::new(
                 UnminedTxId::Witnessed(wtx_id),
-                sighash.0,
+                sighashes.commitment(),
                 pool,
             )),
+            sighashes,
         }
     }
 
@@ -281,10 +283,10 @@ impl QueueBatchVerify for BatchValidator<'_> {
     fn queue(
         &mut self,
         Item {
-            bundle, sighash, ..
+            bundle, sighashes, ..
         }: Item,
     ) -> Result<(), BatchError> {
-        self.add_bundle(bundle.as_ref(), sighash.0)
+        self.add_bundle(bundle.as_ref(), &sighashes)
     }
 }
 

@@ -5,7 +5,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use eyre::Report;
-use zakura_chain::amount::{Amount, DeferredPoolBalanceChange};
+use zakura_chain::amount::Amount;
 use zakura_chain::block::Block;
 use zakura_chain::parameters::NetworkUpgrade::*;
 use zakura_chain::parameters::{subsidy::FundingStreamReceiver, NetworkKind};
@@ -382,13 +382,13 @@ fn mainnet_coinbase_boundaries_match_fixed_oracle() -> Result<(), Report> {
         let block = coinbase_block(height, outputs);
         let deferred = subsidy_is_valid(&block, &network, subsidy)?;
         assert_eq!(
-            i64::from(deferred.value()),
+            i64::from(deferred.balance_change().value()),
             deferred_zats,
             "deferred at {height:?}"
         );
         assert_eq!(
             checkpoint_deferred(height, &network, Some(Amount::zero()))?,
-            Some(deferred)
+            Some(deferred.balance_change())
         );
         miner_fees_are_valid(
             &block.transactions[0],
@@ -697,13 +697,13 @@ fn configured_nu7_fork_coinbase_boundaries_match_fixed_oracle() -> Result<(), Re
         let block = coinbase_block(height, outputs);
         let deferred = subsidy_is_valid(&block, &network, subsidy)?;
         assert_eq!(
-            i64::from(deferred.value()),
+            i64::from(deferred.balance_change().value()),
             deferred_zats,
             "deferred at {height:?}"
         );
         assert_eq!(
             checkpoint_deferred(height, &network, Some(Amount::zero()))?,
-            Some(deferred)
+            Some(deferred.balance_change())
         );
         miner_fees_are_valid(
             &block.transactions[0],
@@ -919,10 +919,14 @@ fn revision_2_funding_streams_are_required_until_the_zip_218_third_halving() -> 
             ],
         );
         let deferred = subsidy_is_valid(&block, &network, subsidy)?;
-        assert_eq!(i64::from(deferred.value()), 6_249_999, "at {height:?}");
+        assert_eq!(
+            i64::from(deferred.balance_change().value()),
+            6_249_999,
+            "at {height:?}"
+        );
         assert_eq!(
             checkpoint_deferred(height, &network, Some(Amount::zero()))?,
-            Some(deferred),
+            Some(deferred.balance_change()),
         );
         miner_fees_are_valid(
             &block.transactions[0],
@@ -970,10 +974,10 @@ fn revision_2_funding_streams_are_required_until_the_zip_218_third_halving() -> 
     assert_eq!(i64::from(subsidy), 26_041_666);
     let block = coinbase_block(height, vec![output(26_041_666, miner_script)]);
     let deferred = subsidy_is_valid(&block, &network, subsidy)?;
-    assert_eq!(deferred, DeferredPoolBalanceChange::zero());
+    assert_eq!(deferred, crate::block::check::LockboxFlows::default());
     assert_eq!(
         checkpoint_deferred(height, &network, Some(Amount::zero()))?,
-        Some(deferred),
+        Some(deferred.balance_change()),
     );
     miner_fees_are_valid(
         &block.transactions[0],

@@ -97,14 +97,25 @@ pub(super) fn coinbase_is_first(block: &BlockRef) -> Result<CoinbaseSummary<'_>,
     if !first.is_coinbase() {
         Err(TransactionError::CoinbasePosition)?;
     }
+    // A v7 coinbase transaction's inputs are not coinbase inputs, so the block would look
+    // them up as spends. Reject them here, before that lookup, so that the block fails
+    // with the coinbase rule rather than a missing input. Earlier coinbase transactions
+    // have only their coinbase input, and keep their checks in the transaction verifier.
+    if first.v7_coinbase().is_some() {
+        crate::transaction::check::coinbase_tx_no_prevout_joinsplit_spend(first)?;
+    }
     // > A transparent input in a non-coinbase transaction MUST NOT have a null prevout
     //
     // <https://zips.z.cash/protocol/protocol.pdf#txnconsensus>
+    //
+    // A v7 transaction decodes a null prevout as a spend, so the block would look it up
+    // in its parent's outputs. Reject it here, before that lookup.
     let mut has_transparent_spends = false;
     for tx in rest {
         if !tx.is_valid_non_coinbase() {
             Err(TransactionError::CoinbaseAfterFirst)?;
         }
+        crate::transaction::check::non_coinbase_has_no_null_prevout(tx)?;
         has_transparent_spends |= tx.has_transparent_inputs();
     }
 
@@ -231,6 +242,39 @@ pub fn proof_of_work_is_valid(
     }
 }
 
+/// What a block's coinbase transaction moves into and out of the lockbox, the deferred
+/// development fund pool of [ZIP 1015].
+///
+/// [ZIP 1015]: https://zips.z.cash/zip-1015
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LockboxFlows {
+    /// The funding streams' deposit into the lockbox, `totalDeferredOutput(height)`.
+    pub deposit: Amount<NonNegative>,
+    /// The [ZIP 271] one-time disbursement out of the lockbox, which is zero except at
+    /// the NU6.1 activation height.
+    ///
+    /// [ZIP 271]: https://zips.z.cash/zip-0271
+    pub disbursement: Amount<NonNegative>,
+}
+
+impl LockboxFlows {
+    /// Returns the change in the lockbox's balance.
+    pub fn balance_change(self) -> DeferredPoolBalanceChange {
+        let change = self
+            .deposit
+            .constrain::<NegativeAllowed>()
+            .expect("a nonnegative amount is a valid signed amount")
+            - self
+                .disbursement
+                .constrain::<NegativeAllowed>()
+                .expect("a nonnegative amount is a valid signed amount");
+        DeferredPoolBalanceChange::new(
+            change
+                .expect("the difference of two amounts in 0..=MAX_MONEY is a valid signed amount"),
+        )
+    }
+}
+
 /// Returns `Ok()` with the deferred pool balance change of the coinbase transaction if the block
 /// subsidy in `block` is valid for `network`
 ///
@@ -239,9 +283,9 @@ pub fn subsidy_is_valid(
     block: &BlockRef,
     net: &Network,
     expected_block_subsidy: Amount<NonNegative>,
-) -> Result<DeferredPoolBalanceChange, BlockError> {
+) -> Result<LockboxFlows, BlockError> {
     if expected_block_subsidy.is_zero() {
-        return Ok(DeferredPoolBalanceChange::zero());
+        return Ok(LockboxFlows::default());
     }
 
     let height = block.coinbase_height().ok_or(SubsidyError::NoCoinbase)?;
@@ -286,7 +330,7 @@ pub fn subsidy_is_valid(
             }
         }
 
-        Ok(DeferredPoolBalanceChange::zero())
+        Ok(LockboxFlows::default())
     } else {
         // # Consensus
         //
@@ -323,10 +367,12 @@ pub fn subsidy_is_valid(
 
         // The deferred pool contribution is checked in `miner_fees_are_valid()` according to
         // [ZIP-1015](https://zips.z.cash/zip-1015).
-        let mut deferred_pool_balance_change = funding_streams
-            .remove(&FundingStreamReceiver::Deferred)
-            .unwrap_or_default()
-            .constrain::<NegativeAllowed>()?;
+        let mut lockbox = LockboxFlows {
+            deposit: funding_streams
+                .remove(&FundingStreamReceiver::Deferred)
+                .unwrap_or_default(),
+            disbursement: Amount::zero(),
+        };
 
         // Check the one-time lockbox disbursements in the NU6.1 activation block's coinbase tx
         // according to [ZIP-271] and [ZIP-1016].
@@ -342,16 +388,14 @@ pub fn subsidy_is_valid(
                 ))?;
             }
 
-            deferred_pool_balance_change = lockbox_disbursements.into_iter().try_fold(
-                deferred_pool_balance_change,
-                |balance, (addr, expected_amount)| {
+            lockbox.disbursement = lockbox_disbursements.into_iter().try_fold(
+                Amount::zero(),
+                |total, (addr, expected_amount)| {
                     if !coinbase_outputs.remove_payment(&addr, expected_amount) {
                         Err(SubsidyError::OneTimeLockboxDisbursementNotFound)?;
                     }
 
-                    balance
-                        .checked_sub(expected_amount)
-                        .ok_or(SubsidyError::Underflow)
+                    (total + expected_amount).map_err(|_| SubsidyError::Overflow)
                 },
             )?;
         };
@@ -373,7 +417,7 @@ pub fn subsidy_is_valid(
             },
         )?;
 
-        Ok(DeferredPoolBalanceChange::new(deferred_pool_balance_change))
+        Ok(lockbox)
     }
 }
 
@@ -388,9 +432,21 @@ pub fn miner_fees_are_valid(
     height: Height,
     block_transaction_fees: Amount<NonNegative>,
     expected_block_subsidy: Amount<NonNegative>,
-    expected_deferred_pool_balance_change: DeferredPoolBalanceChange,
+    lockbox: LockboxFlows,
     network: &Network,
 ) -> Result<(), BlockError> {
+    if let Some(coinbase) = coinbase_tx.v7_coinbase() {
+        v7_coinbase_is_valid(
+            coinbase_tx,
+            coinbase,
+            height,
+            block_transaction_fees,
+            expected_block_subsidy,
+            lockbox.deposit,
+            network,
+        )?;
+    }
+
     let transparent_value_balance = coinbase_tx
         .outputs()
         .iter()
@@ -419,7 +475,7 @@ pub fn miner_fees_are_valid(
         - sapling_value_balance
         - orchard_value_balance
         - ironwood_value_balance
-        + expected_deferred_pool_balance_change.value())
+        + lockbox.balance_change().value())
     .map_err(|_| SubsidyError::Overflow)?;
 
     // NU7 modifies ZIP 236's full-claim rule by excluding the NSM fee contribution.
@@ -441,6 +497,96 @@ pub fn miner_fees_are_valid(
     } {
         Err(SubsidyError::InvalidMinerFees)?
     };
+
+    Ok(())
+}
+
+/// Checks a v7 coinbase transaction's coinbase bundle and value pool deltas against its
+/// block.
+///
+/// The value balance rule of every v7 transaction, that its deltas sum to zero, then
+/// makes the transaction pay out exactly the subsidy less the lockbox deposit plus the
+/// miner's share of the fees, which the total output check below also requires.
+///
+/// # Consensus
+///
+/// > The fees collected by the coinbase transaction MUST equal the sum of the fees paid
+/// > by all other transactions in the block, regardless of their transaction formats.
+/// > [...] For a v7 coinbase transaction, its fee bundle value MUST equal this sum.
+///
+/// > The `blockHeight` field of the coinbase bundle's effecting data MUST equal the
+/// > height of the block containing the transaction.
+///
+/// > The `blockSubsidy` field of the coinbase bundle's effecting data MUST equal the
+/// > block subsidy for that block [...]
+///
+/// > The `lockboxValue` field of the coinbase bundle's effecting data MUST equal the
+/// > total value that the funding streams for that block deposit into the deferred pool
+/// > [...]
+///
+/// > The value of mValuePoolDeltas[CoinbaseBundleId] MUST equal the block subsidy less
+/// > the lockbox deposit and NSMFeeContribution(height) for the block containing the
+/// > transaction.
+///
+/// <https://zips.z.cash/zip-0248#cross-bundle-and-chain-context-rules>
+///
+/// # Lockbox disbursements
+///
+/// ZIP 248 has no bundle that pays out of the lockbox, so a v7 coinbase transaction
+/// cannot pay a [ZIP 271] one-time disbursement: its deltas balance only without the
+/// disbursement outputs, and the total output check requires them. A block at a
+/// disbursement height needs a coinbase transaction of an earlier version, which block
+/// templates fall back to there.
+///
+/// [ZIP 271]: https://zips.z.cash/zip-0271
+fn v7_coinbase_is_valid(
+    coinbase_tx: &Transaction,
+    coinbase: &transaction::v7::CoinbaseBundle,
+    height: Height,
+    block_transaction_fees: Amount<NonNegative>,
+    expected_block_subsidy: Amount<NonNegative>,
+    lockbox_deposit: Amount<NonNegative>,
+    network: &Network,
+) -> Result<(), BlockError> {
+    let deltas = coinbase_tx
+        .v7_fields()
+        .expect("a transaction with a v7 coinbase bundle is a v7 transaction")
+        .value_deltas;
+
+    // Block verification reads `height` from this same field, so this cannot fail there:
+    // the state's parent height sequencing is the real check. It is a cheap guard.
+    if coinbase.height() != height {
+        Err(SubsidyError::V7CoinbaseHeightMismatch)?;
+    }
+    if coinbase.block_subsidy() != expected_block_subsidy {
+        Err(SubsidyError::V7CoinbaseSubsidyMismatch)?;
+    }
+    if coinbase.lockbox_value() != lockbox_deposit {
+        Err(SubsidyError::V7CoinbaseLockboxMismatch)?;
+    }
+
+    // ZIP 235: the part of the fees that the miner does not receive. It can exceed the
+    // subsidy less the deposit, and then the coinbase delta is negative:
+    //
+    // > Note that the coinbase value pool delta can be negative.
+    let signed = |amount: Amount<NonNegative>| -> Amount<NegativeAllowed> {
+        amount
+            .constrain()
+            .expect("a nonnegative amount is a valid signed amount")
+    };
+    let nsm_fee_contribution = signed(block_transaction_fees)
+        - signed(miner_fee_share(height, network, block_transaction_fees));
+    let expected_coinbase_delta = nsm_fee_contribution
+        .and_then(|contribution| {
+            signed(expected_block_subsidy) - signed(lockbox_deposit) - contribution
+        })
+        .map_err(|_| SubsidyError::Underflow)?;
+    if deltas.coinbase != expected_coinbase_delta {
+        Err(SubsidyError::V7CoinbaseDeltaMismatch)?;
+    }
+    if deltas.fee != signed(block_transaction_fees) {
+        Err(SubsidyError::V7CoinbaseFeesMismatch)?;
+    }
 
     Ok(())
 }

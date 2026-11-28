@@ -380,7 +380,19 @@ fn peer_action(error: &TransactionError) -> PeerAction {
         | OrchardProofSize
         | IronwoodProofSize
         | CoinbaseInMempool
-        | NonCoinbaseHasCoinbaseInput => Ban,
+        | NonCoinbaseHasCoinbaseInput
+        | NonCoinbaseHasNullPrevout => Ban,
+
+        // ZIP 248 rules on a v7 transaction's bundles and value pool deltas. A v7
+        // transaction commits to its branch ID, which must match this node's, so these
+        // do not depend on the peer's upgrade; the spent outputs that the transparent
+        // delta is checked against are fixed by their outpoints.
+        V7BundleNotActive(_)
+        | V7DeltaWithoutBundle(_)
+        | V7UnbalancedValuePoolDeltas
+        | V7FeeAddsValue
+        | V7NsmAddsValue
+        | V7TransparentDeltaMismatch => Ban,
 
         // Spends that repeat inside one transaction, and an expiry height above
         // the maximum. Spends that conflict with the chain or the mempool fail
@@ -474,14 +486,18 @@ fn peer_action(error: &TransactionError) -> PeerAction {
         | CoinbaseHasEnableSpendsOrchard
         | CoinbaseHasEnableSpendsIronwood
         | CoinbaseHasOrchardShieldedData
+        | CoinbaseHasTransparentInput
+        | V7CoinbaseFeeRemovesValue
         | CoinbaseOutputsNotDecryptable
         | NotCoinbase
         | CoinbaseExpiryBlockHeight { .. }
         | CoinbaseConstruction(_)
         | Subsidy(_) => Ignore,
 
-        // The verifier failed, or the error does not name the rule that failed.
-        Script(_)
+        // The verifier failed, or the error does not name the rule that failed. Missing
+        // v7 shielded digests mean this node's spent output lookup broke an invariant.
+        V7ShieldedSighashesUnavailable
+        | Script(_)
         | InternalDowncastError(_)
         | StateUnavailable(_)
         | Io(_)

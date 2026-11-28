@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 6e9fc24006e07a4e3f2b33a0b96bbe93a5e23606c6d344f5f7c69b5137afbf12 # shrinks to network = Mainnet, transaction = VerifiedUnminedTx("private")
+cc 43cdf4141e7c998c30f9215ad61b29ea086709f96b813919c3f334ea387ffc50 # shrinks to error = CoinbaseHasTransparentInput

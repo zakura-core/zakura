@@ -260,58 +260,105 @@ proptest! {
     }
 }
 
-proptest! {
-    // The check is cheap, and enough cases generate every error variant.
-    #![proptest_config(proptest::test_runner::Config::with_cases(2048))]
+/// Enough cases to generate every error variant. The check is cheap.
+const ERROR_VARIANT_CASES: u32 = 2048;
 
-    /// Checks that every failure with a mempool misbehavior score bans the
-    /// relaying peer, except the failures in [`is_scored_but_never_bans`], and
-    /// that the failures in [`is_unscored_but_bans`] also ban.
-    ///
-    /// The strategy skips script and signature errors.
-    /// `upgrade_dependent_failures_ban_only_v5_and_later` covers them.
-    #[test]
-    fn scored_failures_ban_unless_they_depend_on_the_tip(error in any::<TransactionError>()) {
-        let peer = zn::PeerSocketAddr::from(([203, 0, 113, 7], 8233));
-        let failure = TransactionDownloadVerifyError::Invalid {
-            error: error.clone(),
-            advertiser_addr: Some(peer),
-            tip_height: Some(block::Height(100)),
-            transaction_version: 5,
-            transaction_network_upgrade: None,
-            retried_after_tip_reset: false,
-        };
+/// The stack size of the threads that run the [`TransactionError`] property tests.
+///
+/// The derived strategy nests a union for each group of variants, and in debug builds
+/// generating a value from those nested unions takes large stack frames. The enum has
+/// outgrown the default 2 MiB test thread stack.
+const ERROR_STRATEGY_STACK_SIZE: usize = 16 * 1024 * 1024;
 
-        let should_ban = (error.mempool_misbehavior_score() != 0 && !is_scored_but_never_bans(&error))
-            || is_unscored_but_bans(&error);
-        prop_assert_eq!(transaction_ban_peer(&failure), should_ban.then_some(peer), "{:?}", error);
-    }
+/// Runs `test` on a thread with [`ERROR_STRATEGY_STACK_SIZE`] bytes of stack.
+fn with_error_strategy_stack(test: impl FnOnce() + Send + 'static) {
+    std::thread::Builder::new()
+        .stack_size(ERROR_STRATEGY_STACK_SIZE)
+        .spawn(test)
+        .expect("the test thread spawns")
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}
 
-    /// Cooldowns only replace failures that the previous mempool policy banned.
-    #[test]
-    fn cooldowns_only_replace_previous_bans(error in any::<TransactionError>()) {
-        for transaction_version in [4, 5, 6] {
-            let failure = TransactionDownloadVerifyError::Invalid {
-                error: error.clone(),
-                advertiser_addr: Some(zn::PeerSocketAddr::from(([203, 0, 113, 7], 8233))),
-                tip_height: Some(block::Height(100)),
-                transaction_version,
-                transaction_network_upgrade: None,
-                retried_after_tip_reset: false,
-            };
+/// Checks that every failure with a mempool misbehavior score bans the
+/// relaying peer, except the failures in [`is_scored_but_never_bans`], and
+/// that the failures in [`is_unscored_but_bans`] also ban.
+///
+/// The strategy skips script and signature errors.
+/// `upgrade_dependent_failures_ban_only_v5_and_later` covers them.
+#[test]
+fn scored_failures_ban_unless_they_depend_on_the_tip() {
+    with_error_strategy_stack(|| {
+        proptest!(
+            ProptestConfig::with_cases(ERROR_VARIANT_CASES),
+            |(error in any::<TransactionError>())| {
+                let peer = zn::PeerSocketAddr::from(([203, 0, 113, 7], 8233));
+                let failure = TransactionDownloadVerifyError::Invalid {
+                    error: error.clone(),
+                    advertiser_addr: Some(peer),
+                    tip_height: Some(block::Height(100)),
+                    transaction_version: 5,
+                    transaction_network_upgrade: None,
+                    retried_after_tip_reset: false,
+                };
 
-            if transaction_cooldown_peer(&failure, Some(block::Height(100)), NetworkUpgrade::Nu7, None).is_some() {
-                prop_assert_ne!(error.mempool_misbehavior_score(), 0, "{:?}", error);
-                // The previous mempool policy exempted these despite their score.
-                prop_assert!(!matches!(error,
-                    TransactionError::WrongConsensusBranchId
-                    | TransactionError::WrongConsensusBranchIdNu6_3GracePeriod
-                    | TransactionError::LockedUntilAfterBlockHeight(_)
-                    | TransactionError::LockedUntilAfterBlockTime(_)
-                ), "{:?}", error);
+                let should_ban = (error.mempool_misbehavior_score() != 0
+                    && !is_scored_but_never_bans(&error))
+                    || is_unscored_but_bans(&error);
+                prop_assert_eq!(
+                    transaction_ban_peer(&failure),
+                    should_ban.then_some(peer),
+                    "{:?}",
+                    error
+                );
             }
-        }
-    }
+        );
+    });
+}
+
+/// Cooldowns only replace failures that the previous mempool policy banned.
+#[test]
+fn cooldowns_only_replace_previous_bans() {
+    with_error_strategy_stack(|| {
+        proptest!(
+            ProptestConfig::with_cases(ERROR_VARIANT_CASES),
+            |(error in any::<TransactionError>())| {
+                for transaction_version in [4, 5, 6, 7] {
+                    let failure = TransactionDownloadVerifyError::Invalid {
+                        error: error.clone(),
+                        advertiser_addr: Some(zn::PeerSocketAddr::from(([203, 0, 113, 7], 8233))),
+                        tip_height: Some(block::Height(100)),
+                        transaction_version,
+                        transaction_network_upgrade: None,
+                        retried_after_tip_reset: false,
+                    };
+
+                    if transaction_cooldown_peer(
+                        &failure,
+                        Some(block::Height(100)),
+                        NetworkUpgrade::Nu7,
+                        None,
+                    )
+                    .is_some()
+                    {
+                        prop_assert_ne!(error.mempool_misbehavior_score(), 0, "{:?}", error);
+                        // The previous mempool policy exempted these despite their score.
+                        prop_assert!(
+                            !matches!(
+                                error,
+                                TransactionError::WrongConsensusBranchId
+                                    | TransactionError::WrongConsensusBranchIdNu6_3GracePeriod
+                                    | TransactionError::LockedUntilAfterBlockHeight(_)
+                                    | TransactionError::LockedUntilAfterBlockTime(_)
+                            ),
+                            "{:?}",
+                            error
+                        );
+                    }
+                }
+            }
+        );
+    });
 }
 
 /// Returns true for failures that have a mempool misbehavior score but never
@@ -337,6 +384,8 @@ fn is_scored_but_never_bans(error: &TransactionError) -> bool {
             | CoinbaseHasEnableSpendsOrchard
             | CoinbaseHasEnableSpendsIronwood
             | CoinbaseHasOrchardShieldedData
+            | CoinbaseHasTransparentInput
+            | V7CoinbaseFeeRemovesValue
             | CoinbaseOutputsNotDecryptable
             | CoinbaseExpiryBlockHeight { .. }
             | Subsidy(_)

@@ -100,8 +100,16 @@ toml = { workspace = true, features = ["display"] }
 tokio = { workspace = true, features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "test-util", "time"] }
 
 zakura-state = { path = "../zakura-state", version = "19.0.0", features = ["proptest-impl"] }
-zakura-chain = { path = "../zakura-chain", version = "17.0.0", features = ["proptest-impl"] }
+zakura-chain = { path = "../zakura-chain", version = "17.0.0", features = ["proptest-impl", "zakura-test"] }
 zakura-test = { path = "../zakura-test/", version = "4.0.0" }
+# Builds signed v7 transactions with real proofs for the ZIP 248 tests.
+zcash_primitives = { workspace = true, features = ["transparent-inputs", "wallet"] }
+zcash_transparent = { workspace = true, features = ["transparent-inputs"] }
+secp256k1 = { workspace = true }
+incrementalmerkletree = { workspace = true }
+bls12_381 = { workspace = true }
+jubjub = { workspace = true }
+rand_core_10 = { workspace = true }
 
 criterion = { workspace = true }
 

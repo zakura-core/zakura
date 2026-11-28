@@ -24,13 +24,12 @@ use zcash_script::script::{self, Evaluable as _};
 
 use crate::error::TransactionError;
 
-/// Rejects v1 to v3 transactions, and v7 transactions until ZIP 248 validation is
-/// implemented, since this node has no verifier for them.
+/// Rejects v1 to v3 transactions, since this node has no verifier for them.
 ///
 /// This runs first among the quick checks so that the mempool's unconditional ban
 /// for the wrong version is never replaced by a tip-dependent chain error.
 pub fn version_has_a_verifier(tx: &Transaction) -> Result<(), TransactionError> {
-    if !(4..=6).contains(&tx.version()) {
+    if !(4..=7).contains(&tx.version()) {
         return Err(TransactionError::WrongVersion);
     }
     Ok(())
@@ -135,11 +134,28 @@ pub fn lock_time_has_passed(
 ///
 /// <https://zips.z.cash/protocol/protocol.pdf#txnconsensus>
 ///
+/// ZIP 248 adds, for v7 transactions, a coinbase bundle to the input-side conditions and
+/// a positive ZIP 233 amount to the output-side conditions:
+///
+/// > [NU6.3 onward] If effectiveVersion ≥ 6, at least one of these input-side conditions
+/// > MUST be satisfied: effectiveVersion ≥ 7 and mEffectBundles contains an entry with
+/// > bundleType = CoinbaseBundleId; [...]
+///
+/// > [NU6.3 onward] If effectiveVersion ≥ 6, at least one of these output-side conditions
+/// > MUST be satisfied: [...] zip233_amount > 0, as defined in ZIP 233.
+///
+/// <https://zips.z.cash/zip-0248#changes-to-the-protocol-specification>
+///
 /// This check counts both `Coinbase` and `PrevOut` transparent inputs.
 pub fn has_inputs_and_outputs(tx: &Transaction) -> Result<(), TransactionError> {
-    if !tx.has_transparent_or_shielded_inputs() {
+    // ZIP 233's NSM bundle removes `zip233_amount` from the transparent transaction value
+    // pool, so its delta is the negated amount.
+    let zip233_amount_is_positive = tx
+        .v7_fields()
+        .is_some_and(|fields| i64::from(fields.value_deltas.nsm) < 0);
+    if !tx.has_transparent_or_shielded_inputs() && tx.v7_coinbase().is_none() {
         Err(TransactionError::NoInputs)
-    } else if !tx.has_transparent_or_shielded_outputs() {
+    } else if !tx.has_transparent_or_shielded_outputs() && !zip233_amount_is_positive {
         Err(TransactionError::NoOutputs)
     } else {
         Ok(())
@@ -258,6 +274,13 @@ pub(super) fn shielded_proof_size_is_canonical(tx: &Transaction) -> Result<(), T
 /// <https://zips.z.cash/protocol/protocol.pdf#txnconsensus>
 pub fn coinbase_tx_no_prevout_joinsplit_spend(tx: &Transaction) -> Result<(), TransactionError> {
     if tx.is_coinbase() {
+        // Before v7, a coinbase transaction's only input is its coinbase input. A v7
+        // coinbase transaction has a coinbase bundle instead, and ZIP 248 requires:
+        //
+        // > A coinbase transaction MUST NOT spend any transparent output.
+        if tx.version() >= 7 && tx.has_transparent_inputs() {
+            return Err(TransactionError::CoinbaseHasTransparentInput);
+        }
         if tx.joinsplit_count() > 0 {
             return Err(TransactionError::CoinbaseHasJoinSplit);
         } else if tx.sapling_spends_per_anchor().count() > 0 {
@@ -277,6 +300,30 @@ pub fn coinbase_tx_no_prevout_joinsplit_spend(tx: &Transaction) -> Result<(), Tr
         }
     }
 
+    Ok(())
+}
+
+/// Checks that no transparent input of a non-coinbase transaction spends the null
+/// previous output.
+///
+/// # Consensus
+///
+/// > A transparent input in a non-coinbase transaction MUST NOT have a null prevout.
+///
+/// <https://zips.z.cash/protocol/protocol.pdf#txnconsensus>
+///
+/// Before v7, decoding reads a null prevout as a coinbase input, which
+/// [`Transaction::is_valid_non_coinbase`] rejects. A v7 transaction has no coinbase
+/// inputs, so it decodes a null prevout as a spend. Callers run this before looking up
+/// spent outputs, because no lookup can find the null previous output.
+pub fn non_coinbase_has_no_null_prevout(tx: &Transaction) -> Result<(), TransactionError> {
+    if !tx.is_coinbase()
+        && tx
+            .spent_outpoints()
+            .any(|outpoint| outpoint == transparent::OutPoint::NULL)
+    {
+        return Err(TransactionError::NonCoinbaseHasNullPrevout);
+    }
     Ok(())
 }
 

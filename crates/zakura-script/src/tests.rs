@@ -6,7 +6,11 @@ use zakura_chain::{
     block::{self, Height},
     parameters::{Network, NetworkUpgrade},
     serialization::{ZcashDeserialize, ZcashDeserializeInto},
-    transaction::{self, HashType, LockTime, SigHasher, Transaction},
+    transaction::{
+        self,
+        v7::{V7Fields, ValueDeltas},
+        HashType, LockTime, SigHasher, Transaction,
+    },
     transparent::{self, Output},
 };
 use zakura_test::prelude::*;
@@ -262,7 +266,8 @@ fn build_and_verify_zip244_p2pkh(
     let nu = match version {
         5 => NetworkUpgrade::Nu5,
         6 => NetworkUpgrade::Nu6_3,
-        _ => panic!("fixture supports ZIP-244 transaction versions"),
+        7 => NetworkUpgrade::Nu7_1,
+        _ => panic!("fixture supports ZIP-244 and ZIP 248 transaction versions"),
     };
 
     // Deterministic keypair (32 bytes, nonzero)
@@ -338,13 +343,50 @@ fn build_and_verify_zip244_p2pkh(
             orchard_shielded_data,
             ironwood_shielded_data: None,
         },
+        (
+            7,
+            Transaction::V5 {
+                network_upgrade,
+                lock_time,
+                expiry_height,
+                inputs,
+                outputs,
+                sapling_shielded_data,
+                orchard_shielded_data,
+            },
+        ) => Transaction::V7 {
+            network_upgrade,
+            lock_time,
+            expiry_height,
+            inputs,
+            outputs,
+            sapling_shielded_data,
+            orchard_shielded_data,
+            ironwood_shielded_data: None,
+            // The input spends 1 ZEC and the output pays 0.9 ZEC.
+            v7_fields: Box::new(V7Fields {
+                value_deltas: ValueDeltas {
+                    transparent: 1000_0000.try_into().expect("valid amount"),
+                    fee: (-1000_0000).try_into().expect("valid amount"),
+                    ..ValueDeltas::default()
+                },
+                coinbase: None,
+            }),
+        },
         _ => unreachable!("fixture starts from V5"),
     };
     let placeholder_tx = to_version(placeholder_tx);
     let all_previous_outputs = Arc::new(vec![previous_output.clone()]);
     let sighasher = SigHasher::new(&placeholder_tx, nu, all_previous_outputs)
         .expect("sighasher creation should succeed");
-    let sighash = sighasher.sighash(canonical_hash_type, Some((0, lock_script_bytes.clone())));
+    // Every v7 signature signs its own SIGHASH_ALL digest, whatever its hash type byte.
+    let sighash = if version >= 7 {
+        sighasher
+            .v7_transparent_sighash(HashType::ALL, 0)
+            .expect("the input's spent output is known")
+    } else {
+        sighasher.sighash(canonical_hash_type, Some((0, lock_script_bytes.clone())))
+    };
 
     // Sign the sighash with the private key
     let msg = Message::from_digest(*sighash.as_ref());
@@ -1908,4 +1950,186 @@ fn only_script_failures_count_as_script_failures() {
 
     assert!(!Error::TxIndex.is_script_failure());
     assert!(!Error::TxCoinbase.is_script_failure());
+}
+
+/// Returns `true` if `result` is the interpreter's rejection of a signature hash type
+/// other than SIGHASH_ALL.
+fn is_sighash_not_all(result: &std::result::Result<(), crate::Error>) -> bool {
+    matches!(
+        result,
+        Err(crate::Error::Interpreter {
+            error: zcash_script::script::Error::Interpreter(
+                _,
+                zcash_script::interpreter::Error::SigHashNotAll
+            ),
+            ..
+        })
+    )
+}
+
+/// A v7 P2PKH spend whose signature uses SIGHASH_ALL passes.
+#[test]
+fn v7_p2pkh_with_sighash_all_passes() {
+    let _init_guard = zakura_test::init();
+    assert_eq!(
+        build_and_verify_zip244_p2pkh(7, false, HashType::ALL, 0x01),
+        Ok(())
+    );
+}
+
+/// ZIP 248 sighash variant 0 has no other hash types, so a v7 signature with any other
+/// hash type byte fails its input.
+#[test]
+fn v7_p2pkh_without_sighash_all_fails() {
+    let _init_guard = zakura_test::init();
+    for hash_type_byte in [0x02, 0x03, 0x81, 0x82, 0x83] {
+        let result = build_and_verify_zip244_p2pkh(7, false, HashType::ALL, hash_type_byte);
+        assert!(
+            is_sighash_not_all(&result),
+            "hash type byte {hash_type_byte:#04x}: {result:?}"
+        );
+    }
+}
+
+/// A script that accepts a failed signature check still fails when the failed signature
+/// does not use SIGHASH_ALL: the rule applies to every nonempty signature, not only to
+/// those the script needs.
+#[test]
+fn v7_tolerated_signature_without_sighash_all_fails() {
+    let _init_guard = zakura_test::init();
+    // The script computes NOT(CHECKSIG). A non-ALL signature fails its check, so the
+    // script alone would succeed.
+    assert!(is_sighash_not_all(&build_and_verify_zip244_p2pkh(
+        7,
+        true,
+        HashType::ALL,
+        0x02
+    )));
+    // The v6 equivalent with SIGHASH_NONE fails only because its signature is valid.
+    assert!(build_and_verify_zip244_p2pkh(6, true, HashType::NONE, 0x02)
+        .expect_err("a valid signature makes NOT(CHECKSIG) false")
+        .is_script_failure());
+}
+
+/// Verifies a spend of an output locked by `lock_script` with `unlock_script` in a v6 or
+/// v7 transaction.
+fn verify_spend(
+    version: u32,
+    unlock_script: &[u8],
+    lock_script: &[u8],
+) -> std::result::Result<(), crate::Error> {
+    let nu = match version {
+        6 => NetworkUpgrade::Nu6_3,
+        7 => NetworkUpgrade::Nu7_1,
+        _ => panic!("fixture supports v6 and v7 transactions"),
+    };
+    let inputs = vec![transparent::Input::PrevOut {
+        outpoint: transparent::OutPoint {
+            hash: transaction::Hash([0u8; 32]),
+            index: 0,
+        },
+        unlock_script: transparent::Script::new(unlock_script),
+        sequence: u32::MAX,
+    }];
+    let outputs = vec![transparent::Output {
+        value: 9000_0000u64.try_into().expect("valid amount"),
+        lock_script: transparent::Script::new(&[0x00]),
+    }];
+    let tx = if version == 6 {
+        Transaction::V6 {
+            network_upgrade: nu,
+            lock_time: LockTime::unlocked(),
+            expiry_height: block::Height(0),
+            inputs,
+            outputs,
+            sapling_shielded_data: None,
+            orchard_shielded_data: None,
+            ironwood_shielded_data: None,
+        }
+    } else {
+        Transaction::V7 {
+            network_upgrade: nu,
+            lock_time: LockTime::unlocked(),
+            expiry_height: block::Height(0),
+            inputs,
+            outputs,
+            sapling_shielded_data: None,
+            orchard_shielded_data: None,
+            ironwood_shielded_data: None,
+            v7_fields: Box::new(V7Fields {
+                value_deltas: ValueDeltas {
+                    transparent: 1000_0000.try_into().expect("valid amount"),
+                    fee: (-1000_0000).try_into().expect("valid amount"),
+                    ..ValueDeltas::default()
+                },
+                coinbase: None,
+            }),
+        }
+    };
+    let previous_output = transparent::Output {
+        value: 1_0000_0000u64.try_into().expect("valid amount"),
+        lock_script: transparent::Script::new(lock_script),
+    };
+    super::CachedFfiTransaction::new(Arc::new(tx), Arc::new(vec![previous_output]), nu)
+        .expect("the network upgrade supports the transaction version")
+        .is_valid(0)
+}
+
+/// A push of a DER signature followed by `hash_type_byte`. The signature signs an
+/// arbitrary message: these scripts never check it successfully.
+fn push_signature(hash_type_byte: u8) -> Vec<u8> {
+    let secret_key = secp256k1::SecretKey::from_secret_bytes([0xcd; 32]).expect("valid key");
+    let mut signature =
+        secp256k1::ecdsa::sign(secp256k1::Message::from_digest([7; 32]), &secret_key)
+            .serialize_der()
+            .to_vec();
+    signature.push(hash_type_byte);
+    let mut push = vec![u8::try_from(signature.len()).expect("a DER signature is short")];
+    push.extend(signature);
+    push
+}
+
+const OP_0: u8 = 0x00;
+const OP_2: u8 = 0x52;
+const OP_CHECKSIG: u8 = 0xac;
+const OP_CHECKMULTISIG: u8 = 0xae;
+const OP_NOT: u8 = 0x91;
+
+/// `<sig> <bad pubkey> CHECKSIG NOT` succeeds because the signature check fails. The
+/// interpreter never computes a digest for the signature, yet v7 still requires its hash
+/// type to be SIGHASH_ALL.
+#[test]
+fn v7_checksig_with_a_bad_pubkey_requires_sighash_all() {
+    let _init_guard = zakura_test::init();
+    let lock_script = [0x01, 0x00, OP_CHECKSIG, OP_NOT];
+
+    assert_eq!(verify_spend(6, &push_signature(0x02), &lock_script), Ok(()));
+    assert!(is_sighash_not_all(&verify_spend(
+        7,
+        &push_signature(0x02),
+        &lock_script
+    )));
+    assert_eq!(verify_spend(7, &push_signature(0x01), &lock_script), Ok(()));
+}
+
+/// In a 2-of-2 `CHECKMULTISIG NOT` whose first check fails, the other signature is never
+/// checked, but it was still supplied, so v7 requires its hash type to be SIGHASH_ALL.
+#[test]
+fn v7_unreached_multisig_signature_requires_sighash_all() {
+    let _init_guard = zakura_test::init();
+    let lock_script = [OP_2, 0x01, 0x00, 0x01, 0x00, OP_2, OP_CHECKMULTISIG, OP_NOT];
+    let unlock_script = |second_hash_type: u8| {
+        let mut script = vec![OP_0];
+        script.extend(push_signature(0x01));
+        script.extend(push_signature(second_hash_type));
+        script
+    };
+
+    assert_eq!(verify_spend(6, &unlock_script(0x81), &lock_script), Ok(()));
+    assert!(is_sighash_not_all(&verify_spend(
+        7,
+        &unlock_script(0x81),
+        &lock_script
+    )));
+    assert_eq!(verify_spend(7, &unlock_script(0x01), &lock_script), Ok(()));
 }

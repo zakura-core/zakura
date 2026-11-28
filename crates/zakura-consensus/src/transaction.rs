@@ -29,7 +29,8 @@ use zakura_chain::{
     primitives::Groth16Proof,
     serialization::DateTime32,
     transaction::{
-        self, HashType, SigHash, Transaction, UnminedTx, UnminedTxId, VerifiedUnminedTx,
+        self, v7::ShieldedBundle, HashType, SigHash, Transaction, UnminedTx, UnminedTxId,
+        VerifiedUnminedTx,
     },
     transparent,
 };
@@ -39,11 +40,16 @@ use zakura_node_services::mempool;
 use zakura_script::{CachedFfiTransaction, Sigops};
 use zakura_state as zs;
 
-use crate::{error::TransactionError, primitives, script, BoxError};
+use crate::{
+    error::TransactionError,
+    primitives::{self, BundleSighashes},
+    script, BoxError,
+};
 
 pub mod check;
 #[cfg(test)]
 mod tests;
+mod zip248;
 
 /// A timeout applied to UTXO lookup requests.
 ///
@@ -570,6 +576,8 @@ where
                 check::coinbase_has_no_orchard_shielded_data(&tx, req.height(), &network)?;
             } else if !tx.is_valid_non_coinbase() {
                 return Err(TransactionError::NonCoinbaseHasCoinbaseInput);
+            } else {
+                check::non_coinbase_has_no_null_prevout(&tx)?;
             }
 
             // Validate `nExpiryHeight` consensus rules
@@ -593,6 +601,9 @@ where
             check::disabled_add_to_orchard_pool(&tx, req.height(), &network)?;
 
             check::spend_conflicts(&tx)?;
+
+            let nu = req.upgrade(&network);
+            zip248::check_bundles_and_deltas(&tx, nu)?;
 
             tracing::trace!(?tx_id, "passed quick checks");
 
@@ -628,6 +639,10 @@ where
             let load_spent_utxos_fut =
                 Self::spent_utxos(tx.clone(), req.clone(), state.clone(), mempool.clone(),);
             let (spent_utxos, spent_outputs, spent_mempool_outpoints) = load_spent_utxos_fut.await?;
+
+            // With the quick ZIP 248 checks, this makes a v7 transaction's stated fee the
+            // value it leaves, so it runs before any fee is read.
+            zip248::check_spent_outputs(&tx, &spent_outputs)?;
 
             // WONTFIX: Return an error for Request::Block as well to replace this check in
             //       the state once #2336 has been implemented?
@@ -667,7 +682,6 @@ where
                 );
             }
 
-            let nu = req.upgrade(&network);
             let cached_ffi_transaction =
                 Arc::new(CachedFfiTransaction::new(tx.clone(), Arc::new(spent_outputs), nu).map_err(|_| TransactionError::UnsupportedByNetworkUpgrade(tx.version(), nu))?);
 
@@ -707,9 +721,15 @@ where
                     cached_ffi_transaction.clone(),
                     wtx_id.expect("a v6 transaction has a witnessed transaction ID"),
                 ),
-                Transaction::V7 { .. } => {
-                    unreachable!("the version quick check rejects v7 transactions before any lookup")
-                }
+                Transaction::V7 {
+                    ..
+                } => Self::verify_v7_transaction(
+                    &req,
+                    &network,
+                    script_verifier,
+                    cached_ffi_transaction.clone(),
+                    wtx_id.expect("a v7 transaction has a witnessed transaction ID"),
+                ),
             };
             let async_checks = match queueing.as_ref() {
                 Some(queueing) => queueing.scope(build_checks),
@@ -805,11 +825,21 @@ where
         }
     }
 
-    /// Calculate the miner fee from the transaction's value balance.
+    /// Calculates the fee a non-coinbase transaction pays to the miner.
+    ///
+    /// A v7 transaction states its fee in its fee bundle (ZIP 2002). The ZIP 248 checks
+    /// have already established that its deltas balance and that its transparent delta
+    /// matches its spent outputs, so the stated fee equals the value the transaction
+    /// leaves. Earlier versions pay what their value balance leaves.
     fn miner_fee(
         tx: &Transaction,
         spent_utxos: &HashMap<transparent::OutPoint, transparent::Utxo>,
     ) -> Result<Amount<NonNegative>, TransactionError> {
+        if let Some(fields) = tx.v7_fields() {
+            return (-fields.value_deltas.fee)
+                .constrain()
+                .map_err(|_| TransactionError::IncorrectFee);
+        }
         match tx.value_balance(spent_utxos) {
             Ok(value_balance) => value_balance
                 .remaining_transaction_value()
@@ -1078,7 +1108,7 @@ where
             cached_ffi_transaction,
         )?
         .and(Self::verify_sprout_shielded_data(joinsplit_data, &sighash)?)
-        .and(Self::verify_sapling_bundle(sapling_bundle, &sighash, tx_id)))
+        .and(Self::verify_sapling_bundle(sapling_bundle, sighash, tx_id)))
     }
 
     /// Verifies if a V4 `transaction` is supported by `network_upgrade` at
@@ -1203,12 +1233,12 @@ where
         )?
         .and(Self::verify_sapling_bundle(
             sapling_bundle,
-            &sighash,
+            sighash,
             UnminedTxId::Witnessed(wtx_id),
         ))
         .and(Self::verify_orchard_bundle(
             orchard_bundle,
-            &sighash,
+            sighash,
             nu,
             wtx_id,
         )))
@@ -1294,18 +1324,18 @@ where
         )?
         .and(Self::verify_sapling_bundle(
             sapling_bundle,
-            &sighash,
+            sighash,
             UnminedTxId::Witnessed(wtx_id),
         ))
         .and(Self::verify_orchard_bundle(
             orchard_bundle,
-            &sighash,
+            sighash,
             nu,
             wtx_id,
         ))
         .and(Self::verify_orchard_bundle(
             ironwood_bundle,
-            &sighash,
+            sighash,
             nu,
             wtx_id,
         )))
@@ -1317,6 +1347,90 @@ where
         network_upgrade: NetworkUpgrade,
     ) -> Result<(), TransactionError> {
         if network_upgrade < NetworkUpgrade::Nu6_3 {
+            return Err(TransactionError::UnsupportedByNetworkUpgrade(
+                transaction.version(),
+                network_upgrade,
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Verify a v7 transaction ([ZIP 248]).
+    ///
+    /// Its transparent and shielded signatures each sign their own digest, so each
+    /// shielded bundle is verified against the per-signature digests of that bundle.
+    ///
+    /// [ZIP 248]: https://zips.z.cash/zip-0248
+    fn verify_v7_transaction(
+        request: &Request,
+        network: &Network,
+        script_verifier: script::Verifier,
+        cached_ffi_transaction: Arc<CachedFfiTransaction<TransactionHandle>>,
+        wtx_id: transaction::WtxId,
+    ) -> Result<AsyncChecks, TransactionError> {
+        let transaction = request.transaction();
+        let nu = request.upgrade(network);
+
+        Self::verify_v7_transaction_network_upgrade(&transaction, nu)?;
+
+        let sighasher = cached_ffi_transaction.sighasher();
+        let sapling_bundle = sighasher.sapling_bundle();
+        let orchard_bundle = sighasher.orchard_bundle();
+        let ironwood_bundle = sighasher.ironwood_bundle();
+        // A bundle's digests are missing only if the spent outputs do not match the
+        // inputs, which loading them prevents. Return an error instead of trusting the
+        // invariant with a panic on peer data. The error is classed as a local verifier
+        // failure, so a broken invariant cannot mark a valid block invalid.
+        let sighashes = |present: bool, bundle| -> Result<_, TransactionError> {
+            present
+                .then(|| {
+                    sighasher
+                        .v7_shielded_sighashes(bundle)
+                        .map(|sighashes| BundleSighashes::PerSignature(Arc::new(sighashes)))
+                        .ok_or(TransactionError::V7ShieldedSighashesUnavailable)
+                })
+                .transpose()
+        };
+        let sapling_sighashes = sighashes(sapling_bundle.is_some(), ShieldedBundle::Sapling)?;
+        let orchard_sighashes = sighashes(orchard_bundle.is_some(), ShieldedBundle::Orchard)?;
+        let ironwood_sighashes = sighashes(ironwood_bundle.is_some(), ShieldedBundle::Ironwood)?;
+
+        let mut checks = Self::verify_transparent_inputs_and_outputs(
+            request,
+            script_verifier,
+            cached_ffi_transaction.clone(),
+        )?;
+        if let Some((bundle, sighashes)) = sapling_bundle.zip(sapling_sighashes) {
+            checks = checks.and(Self::verify_sapling_bundle(
+                Some(bundle),
+                sighashes,
+                UnminedTxId::Witnessed(wtx_id),
+            ));
+        }
+        for (bundle, sighashes) in [
+            orchard_bundle.zip(orchard_sighashes),
+            ironwood_bundle.zip(ironwood_sighashes),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            checks = checks.and(Self::verify_orchard_bundle(
+                Some(bundle),
+                sighashes,
+                nu,
+                wtx_id,
+            ));
+        }
+        Ok(checks)
+    }
+
+    /// Verifies if a V7 `transaction` is supported by `network_upgrade`.
+    fn verify_v7_transaction_network_upgrade(
+        transaction: &Transaction,
+        network_upgrade: NetworkUpgrade,
+    ) -> Result<(), TransactionError> {
+        if network_upgrade < NetworkUpgrade::Nu7_1 {
             return Err(TransactionError::UnsupportedByNetworkUpgrade(
                 transaction.version(),
                 network_upgrade,
@@ -1467,7 +1581,7 @@ where
     /// lets a mempool verification be reused for the block that mines it.
     fn verify_sapling_bundle(
         bundle: Option<sapling_crypto::Bundle<sapling_crypto::bundle::Authorized, ZatBalance>>,
-        sighash: &SigHash,
+        sighashes: impl Into<BundleSighashes>,
         tx_id: UnminedTxId,
     ) -> AsyncChecks {
         let mut async_checks = AsyncChecks::new();
@@ -1525,7 +1639,7 @@ where
             async_checks.push(
                 primitives::sapling::VERIFIER
                     .clone()
-                    .call(primitives::sapling::Item::new(bundle, *sighash, tx_id)),
+                    .call(primitives::sapling::Item::new(bundle, sighashes, tx_id)),
             );
         }
 
@@ -1553,7 +1667,7 @@ where
     /// a v6 transaction.
     fn verify_orchard_bundle(
         bundle: Option<::orchard::bundle::Bundle<::orchard::bundle::Authorized, ZatBalance>>,
-        sighash: &SigHash,
+        sighashes: impl Into<BundleSighashes>,
         network_upgrade: NetworkUpgrade,
         wtx_id: transaction::WtxId,
     ) -> AsyncChecks {
@@ -1582,7 +1696,7 @@ where
                 primitives::halo2::verifier_for(network_upgrade)
                     .clone()
                     .call(primitives::halo2::Item::new_with_wtx_id(
-                        bundle, *sighash, wtx_id,
+                        bundle, sighashes, wtx_id,
                     )),
             );
         }

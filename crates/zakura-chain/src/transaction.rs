@@ -890,6 +890,14 @@ impl Transaction {
         }
     }
 
+    /// Returns the [ZIP 248] bundles of a v7 transaction that have an entry in any of its
+    /// maps, in bundle type order, or nothing before v7.
+    ///
+    /// [ZIP 248]: https://zips.z.cash/zip-0248
+    pub fn v7_bundles(&self) -> Vec<v7::BundleKind> {
+        v7::V7Ref::of(self).map_or_else(Vec::new, |v7| v7.bundles())
+    }
+
     /// Returns the v7-only value pool deltas and coinbase bundle, or `None` before v7.
     pub fn v7_fields(&self) -> Option<&v7::V7Fields> {
         match self {

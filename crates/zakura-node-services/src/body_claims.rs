@@ -12,10 +12,17 @@
 //! earlier expiry, bumps one watch generation, so native block sync wakes
 //! immediately to fetch the missing body or to re-arm its claim-expiry timer.
 
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::Arc;
 
 use zakura_chain::block;
-use zakura_rt::{collections::HashMap, sync::watch, time::Instant};
+// The simulator parks a task on a contended `zakura_rt` mutex. A std mutex
+// would block the run's only thread while its holder waits at a preemption
+// point, such as block sync's start under `if_all_unclaimed`.
+use zakura_rt::{
+    collections::HashMap,
+    sync::{watch, Mutex, MutexGuard, PoisonError},
+    time::Instant,
+};
 
 /// Reason a body claim is released.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]

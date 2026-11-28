@@ -696,12 +696,13 @@ fn post_nu7_spacing_halving_and_subsidy() -> Result<(), Report> {
 }
 
 /// Tests that the averaging window widens at NU7 and that every build retains
-/// enough context for the wider window.
+/// enough context for NU7.1's wider window.
 #[test]
 fn averaging_window_changes_at_nu7_activation_height() -> Result<(), Report> {
     use crate::parameters::{
         testnet::{self, ConfiguredActivationHeights},
-        MAX_POW_AVERAGING_WINDOW, POST_NU7_POW_AVERAGING_WINDOW, PRE_NU7_POW_AVERAGING_WINDOW,
+        MAX_POW_AVERAGING_WINDOW, POST_NU7_1_POW_AVERAGING_WINDOW, POST_NU7_POW_AVERAGING_WINDOW,
+        PRE_NU7_POW_AVERAGING_WINDOW,
     };
 
     let _init_guard = zakura_test::init();
@@ -717,7 +718,7 @@ fn averaging_window_changes_at_nu7_activation_height() -> Result<(), Report> {
         .to_network()
         .expect("configured testnet is valid");
 
-    assert_eq!(POST_NU7_POW_AVERAGING_WINDOW, MAX_POW_AVERAGING_WINDOW);
+    assert_eq!(POST_NU7_1_POW_AVERAGING_WINDOW, MAX_POW_AVERAGING_WINDOW);
 
     assert_eq!(
         PRE_NU7_POW_AVERAGING_WINDOW,

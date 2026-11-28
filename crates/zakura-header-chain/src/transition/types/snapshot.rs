@@ -17,10 +17,10 @@ pub struct HeaderChainDiskVersion(pub u32);
 impl HeaderChainDiskVersion {
     /// Current durable header-chain schema version.
     ///
-    /// Version five retains the validation context for the widest averaging window, so a
-    /// release that reads only the version-four context rejects the format instead of
-    /// failing on the row count.
-    pub const CURRENT: Self = Self(5);
+    /// Versions five and six each widen the retained validation context, for ZIP 218's and
+    /// then ZIP 223's averaging window, so a release that reads only the narrower context
+    /// rejects the format instead of failing on the row count.
+    pub const CURRENT: Self = Self(6);
 }
 
 /// Persistent externally visible engine alarms.

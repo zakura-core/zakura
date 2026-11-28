@@ -21,8 +21,8 @@ pub const POW_PREDECESSOR_CONTEXT_SPAN: usize = POW_ADJUSTMENT_BLOCK_SPAN - 1;
 /// The largest difficulty-adjustment context retained for future consensus
 /// rules.
 ///
-/// ZIP 218 widens `PoWAveragingWindow` to 102 blocks. Retaining that future
-/// window does not make it active before NU7.
+/// ZIP 218 widens `PoWAveragingWindow` to 102 blocks at NU7, and ZIP 223 to 128
+/// blocks at NU7.1. Retaining the widest window does not make it active early.
 pub const MAX_POW_ADJUSTMENT_BLOCK_SPAN: usize = MAX_POW_AVERAGING_WINDOW + POW_MEDIAN_BLOCK_SPAN;
 
 /// Maximum retained predecessors below a separately retained parent frontier.
@@ -32,8 +32,8 @@ pub const MAX_POW_PREDECESSOR_CONTEXT_SPAN: usize = MAX_POW_ADJUSTMENT_BLOCK_SPA
 /// `candidate_height` reads.
 ///
 /// The candidate block's upgrade selects the averaging window, so ZIP 218 widens
-/// this span from [`POW_ADJUSTMENT_BLOCK_SPAN`] to [`MAX_POW_ADJUSTMENT_BLOCK_SPAN`]
-/// at NU7.
+/// this span from [`POW_ADJUSTMENT_BLOCK_SPAN`] to 113 blocks at NU7. It never
+/// exceeds the retained [`MAX_POW_ADJUSTMENT_BLOCK_SPAN`].
 pub fn pow_adjustment_block_span_for_height(
     network: &Network,
     candidate_height: block::Height,

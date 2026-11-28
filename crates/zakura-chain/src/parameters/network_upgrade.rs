@@ -65,6 +65,12 @@ pub enum NetworkUpgrade {
     /// The Zcash protocol after the NU7 upgrade.
     #[serde(rename = "NU7")]
     Nu7,
+    /// The Zcash protocol after the NU7.1 upgrade.
+    ///
+    /// Its rules are being prepared ahead of the NU7.1 coinholder poll and will
+    /// change to match the result. It has no Mainnet or Testnet activation height.
+    #[serde(rename = "NU7.1")]
+    Nu7_1,
 
     #[cfg(zcash_unstable = "zfuture")]
     ZFuture,
@@ -85,6 +91,7 @@ const NETWORK_UPGRADES: &[NetworkUpgrade] = &[
     Nu6_2,
     Nu6_3,
     Nu7,
+    Nu7_1,
     #[cfg(zcash_unstable = "zfuture")]
     ZFuture,
 ];
@@ -268,6 +275,10 @@ pub(crate) const CONSENSUS_BRANCH_IDS: &[(NetworkUpgrade, ConsensusBranchId)] = 
     (Nu6_3, ConsensusBranchId(0x37a5165b)),
     // The NU7 consensus branch ID from ZIP 259, matching zcash_protocol's `BranchId::Nu7`.
     (Nu7, ConsensusBranchId(0x77190ad9)),
+    // Placeholder until the NU7.1 deployment ZIP assigns a branch ID. Test builds only, so
+    // release builds reject NU7.1 blocks on networks that configure it.
+    #[cfg(any(test, feature = "zakura-test"))]
+    (Nu7_1, ConsensusBranchId(0xfffffffe)),
     #[cfg(zcash_unstable = "zfuture")]
     (ZFuture, ConsensusBranchId(0xfffffffd)),
 ];
@@ -518,7 +529,7 @@ impl NetworkUpgrade {
             Blossom | Heartwood | Canopy | Nu5 | Nu6 | Nu6_1 | Nu6_2 | Nu6_3 => {
                 POST_BLOSSOM_POW_TARGET_SPACING.into()
             }
-            Nu7 => POST_NU7_POW_TARGET_SPACING.into(),
+            Nu7 | Nu7_1 => POST_NU7_POW_TARGET_SPACING.into(),
 
             #[cfg(zcash_unstable = "zfuture")]
             ZFuture => POST_NU7_POW_TARGET_SPACING.into(),
@@ -622,7 +633,7 @@ impl NetworkUpgrade {
         match self {
             Genesis | BeforeOverwinter | Overwinter | Sapling | Blossom | Heartwood | Canopy
             | Nu5 | Nu6 | Nu6_1 | Nu6_2 | Nu6_3 => PRE_NU7_POW_AVERAGING_WINDOW,
-            Nu7 => POST_NU7_POW_AVERAGING_WINDOW,
+            Nu7 | Nu7_1 => POST_NU7_POW_AVERAGING_WINDOW,
 
             #[cfg(zcash_unstable = "zfuture")]
             ZFuture => POST_NU7_POW_AVERAGING_WINDOW,

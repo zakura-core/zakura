@@ -103,6 +103,10 @@ pub const MSG_RESPONSE_PONG: u16 = 17;
 pub const MSG_RESPONSE_NIL: u16 = 18;
 
 const LEGACY_GOSSIP_INBOUND_QUEUE: usize = 256;
+const LEGACY_GOSSIP_DECODED_SLOTS: usize = 8;
+/// The share of [`LEGACY_GOSSIP_DECODED_SLOTS`] one peer may hold across all of its
+/// gossip sessions, so a single peer cannot keep every other peer's gossip out.
+const LEGACY_GOSSIP_PEER_DECODED_SLOTS: usize = 2;
 const LEGACY_REQUEST_IN_FLIGHT_LIMIT: usize = 64;
 /// Decoded compatibility work that the inbound queue and its handlers may retain,
 /// until each handler hands its payload to the inbound service.
@@ -180,6 +184,8 @@ const LEGACY_REQUEST_STREAM_RATE_DIVISOR: u32 = 2;
 /// fetch on the legacy peer set forever, starving the Zakura path.
 const DUAL_STACK_LEGACY_INVENTORY_TIMEOUT: Duration = Duration::from_secs(3);
 const LEGACY_RESPONSE_CHUNK_BYTES: usize = 512 * 1024;
+/// Bound framing work while allowing a maximum-size item in 256-byte chunks.
+pub(super) const LEGACY_RESPONSE_MAX_FRAMES: usize = 8192;
 const REQUEST_ID_BYTES: usize = 8;
 const RESPONSE_CHUNK_HEADER_BYTES: usize = REQUEST_ID_BYTES + 1;
 const NO_STOP_HASH: block::Hash = block::Hash([0; 32]);
@@ -1365,6 +1371,7 @@ fn ensure_header_count(count: usize) -> Result<(), LegacyGossipError> {
 #[derive(Default)]
 struct ResponseEncodeBudget {
     bytes: usize,
+    frames: usize,
 }
 
 impl ResponseEncodeBudget {
@@ -1372,6 +1379,10 @@ impl ResponseEncodeBudget {
     /// response once cumulative payload bytes exceed the responder aggregate
     /// budget.
     fn account(&mut self, payload_len: usize) -> Result<(), LegacyGossipError> {
+        if self.frames >= LEGACY_RESPONSE_MAX_FRAMES {
+            return Err(LegacyGossipError::ResponseFrameBudget);
+        }
+        self.frames += 1;
         self.bytes = self.bytes.saturating_add(payload_len);
         if self.bytes > COMPAT_RESPONSE_MAX_AGGREGATE_BYTES {
             return Err(LegacyGossipError::ResponseAggregateBudget(self.bytes));
@@ -1430,16 +1441,13 @@ fn push_chunked_response(
     let chunk_count = bytes.len().div_ceil(chunk_bytes);
 
     for (index, chunk) in bytes.chunks(chunk_bytes).enumerate() {
+        budget.account(RESPONSE_CHUNK_HEADER_BYTES + chunk.len())?;
         let mut payload = Vec::with_capacity(RESPONSE_CHUNK_HEADER_BYTES + chunk.len());
         // The stream prelude already has this id, but each response frame repeats it so
         // malformed peers are rejected at the frame boundary before decoding payload bytes.
         payload.extend_from_slice(&request_id.to_le_bytes());
         payload.push(u8::from(index + 1 == chunk_count));
         payload.extend_from_slice(chunk);
-        // Charge each chunk against the shared budget so a response that
-        // aggregates many available items aborts mid-encode rather than after
-        // the whole `Vec<Frame>` has been materialized.
-        budget.account(payload.len())?;
         frames.push(Frame {
             message_type,
             flags: 0,
@@ -3015,6 +3023,9 @@ impl LegacyGossipForwarder {
 #[derive(Debug)]
 pub struct LegacyGossipSink {
     inbound_tx: mpsc::Sender<LegacyInboundWork>,
+    gossip_slots: Arc<Semaphore>,
+    /// Each peer's decoded-gossip slot pool, by peer. See `peer_gossip_slots`.
+    peer_gossip_slots: StdMutex<HashMap<ZakuraPeerId, std::sync::Weak<Semaphore>>>,
     inbound_budget: InboundBudget,
     outbound: LegacyGossipOutbound,
     switch: TxRelaySwitch,
@@ -3056,6 +3067,8 @@ impl LegacyGossipSink {
         let outbound = outbound_for_supervisor(&supervisor);
         Self {
             inbound_tx,
+            gossip_slots: Arc::new(Semaphore::new(LEGACY_GOSSIP_DECODED_SLOTS)),
+            peer_gossip_slots: StdMutex::default(),
             inbound_budget: InboundBudget::new(LEGACY_INBOUND_RETAINED_BYTES),
             outbound,
             switch: TxRelaySwitch::for_supervisor(&supervisor),
@@ -3065,17 +3078,43 @@ impl LegacyGossipSink {
 }
 
 impl LegacyGossipSink {
+    /// `peer`'s share of the node's decoded-gossip slots. All of the peer's
+    /// sessions draw on one pool while any session or queued item holds it,
+    /// so reopening the gossip stream can't add slots.
+    fn peer_gossip_slots(&self, peer: &ZakuraPeerId) -> Arc<Semaphore> {
+        let mut pools = self
+            .peer_gossip_slots
+            .lock()
+            .expect("the peer gossip slot mutex is never held across a panic");
+        pools.retain(|_, pool| pool.strong_count() > 0);
+        if let Some(pool) = pools.get(peer).and_then(std::sync::Weak::upgrade) {
+            return pool;
+        }
+        let pool = Arc::new(Semaphore::new(LEGACY_GOSSIP_PEER_DECODED_SLOTS));
+        pools.insert(peer.clone(), Arc::downgrade(&pool));
+        pool
+    }
+
     /// Decodes a gossip frame from `peer_id` and queues it for the worker.
-    /// A frame over the retained-byte budget or the queue is dropped, and a
-    /// transaction advert from a peer `switch` leaves to `tx-relay` is
-    /// dropped with no penalty.
+    /// A frame is dropped before decoding when the peer's `peer_slots` or the
+    /// node's `gossip_slots` are all held. A frame over the retained-byte
+    /// budget or the queue is dropped, and a transaction advert from a peer
+    /// `switch` leaves to `tx-relay` is dropped with no penalty.
     fn enqueue_gossip_frame(
         inbound_tx: &mpsc::Sender<LegacyInboundWork>,
+        gossip_slots: &Arc<Semaphore>,
+        peer_slots: &Arc<Semaphore>,
         inbound_budget: &InboundBudget,
         switch: &TxRelaySwitch,
         peer_id: ZakuraPeerId,
         frame: Frame,
     ) -> Result<(), SinkReject> {
+        let Ok(peer_admission) = peer_slots.clone().try_acquire_owned() else {
+            return Ok(());
+        };
+        let Ok(admission) = gossip_slots.clone().try_acquire_owned() else {
+            return Ok(());
+        };
         let frame = LegacyGossipFrame::decode_frame(frame)
             .map_err(|error| SinkReject::protocol(CloseRow::CONN_CLOSE_24, error))?;
         let message_type = frame.message_type();
@@ -3098,6 +3137,7 @@ impl LegacyGossipSink {
         match inbound_tx.try_send(LegacyInboundWork::Gossip(LegacyGossipInbound {
             peer_id,
             frame,
+            _admission: (peer_admission, admission),
             _charge: charge,
         })) {
             Ok(()) => Ok(()),
@@ -3124,6 +3164,8 @@ impl LegacyGossipSink {
 
         Self::enqueue_gossip_frame(
             &self.inbound_tx,
+            &self.gossip_slots,
+            &self.peer_gossip_slots(&peer_id),
             &self.inbound_budget,
             &self.switch,
             peer_id,
@@ -3272,9 +3314,11 @@ impl ZakuraService for LegacyGossipSink {
         };
         let outbound = self.outbound.clone();
         let inbound_tx = self.inbound_tx.clone();
+        let gossip_slots = self.gossip_slots.clone();
         let inbound_budget = self.inbound_budget.clone();
         let switch = self.switch.clone();
         let peer_id = peer.id.clone();
+        let peer_slots = self.peer_gossip_slots(&peer_id);
         let conn_id = peer.conn_id;
         let cancel_token = peer.cancel_token();
         let session = LegacyGossipPeerSession::new(peer_id.clone(), conn_id, session_id, send);
@@ -3360,6 +3404,8 @@ impl ZakuraService for LegacyGossipSink {
 
                     match Self::enqueue_gossip_frame(
                         &inbound_tx,
+                        &gossip_slots,
+                        &peer_slots,
                         &inbound_budget,
                         &switch,
                         peer_id.clone(),
@@ -3437,6 +3483,9 @@ enum LegacyInboundWork {
 
 #[derive(Debug)]
 struct LegacyGossipInbound {
+    /// The sending peer's and the node's decoded-gossip slots, held until
+    /// this item's handler ends.
+    _admission: (OwnedSemaphorePermit, OwnedSemaphorePermit),
     peer_id: ZakuraPeerId,
     frame: LegacyGossipFrame,
     /// Funds `frame` until this item's handler ends.
@@ -3809,6 +3858,9 @@ pub enum LegacyGossipError {
     /// The encoded response would exceed the responder-side aggregate budget.
     #[error("legacy response exceeded responder aggregate budget: {0} bytes")]
     ResponseAggregateBudget(usize),
+    /// Peer-selected chunk sizes would require excessive frame allocations.
+    #[error("legacy response exceeded local frame budget")]
+    ResponseFrameBudget,
     /// The legacy service returned an unexpected response variant.
     #[error("unexpected legacy response: {0}")]
     UnexpectedResponse(&'static str),
@@ -3866,6 +3918,7 @@ impl LegacyGossipError {
             | Self::Serialization(_) => true,
             Self::UnsupportedRequest(_)
             | Self::ResponseAggregateBudget(_)
+            | Self::ResponseFrameBudget
             | Self::UnexpectedResponse(_)
             | Self::MissingResponse(_)
             | Self::Io(_)
@@ -4234,6 +4287,14 @@ mod tests {
             .expect("zero bytes always fit")
     }
 
+    /// A decoded-gossip slot from a pool of its own, for a work item that a
+    /// test builds by hand.
+    fn free_slot() -> OwnedSemaphorePermit {
+        Arc::new(Semaphore::new(1))
+            .try_acquire_owned()
+            .expect("a fresh one-slot pool has its slot")
+    }
+
     /// A sink that sends its work to `inbound_tx` under the production budget.
     fn test_sink(
         inbound_tx: mpsc::Sender<LegacyInboundWork>,
@@ -4241,6 +4302,8 @@ mod tests {
     ) -> LegacyGossipSink {
         LegacyGossipSink {
             inbound_tx,
+            gossip_slots: Arc::new(Semaphore::new(LEGACY_GOSSIP_DECODED_SLOTS)),
+            peer_gossip_slots: StdMutex::default(),
             inbound_budget: InboundBudget::new(LEGACY_INBOUND_RETAINED_BYTES),
             outbound,
             switch: TxRelaySwitch::default(),
@@ -5319,6 +5382,7 @@ mod tests {
         for byte in [1, 2] {
             inbound_tx
                 .send(LegacyInboundWork::Gossip(LegacyGossipInbound {
+                    _admission: (free_slot(), free_slot()),
                     peer_id: inbound_peer(),
                     frame: LegacyGossipFrame::AdvertiseBlock(block_hash(byte)),
                     _charge: free_charge(),
@@ -5957,6 +6021,7 @@ mod tests {
             .await?;
         inbound_tx
             .send(LegacyInboundWork::Gossip(LegacyGossipInbound {
+                _admission: (free_slot(), free_slot()),
                 peer_id: peer_id.clone(),
                 frame: LegacyGossipFrame::AdvertiseBlock(block_hash(12)),
                 _charge: free_charge(),
@@ -6018,6 +6083,7 @@ mod tests {
         for _ in 0..4 {
             inbound_tx
                 .send(LegacyInboundWork::Gossip(LegacyGossipInbound {
+                    _admission: (free_slot(), free_slot()),
                     peer_id: peer_id.clone(),
                     frame: frame.clone(),
                     _charge: free_charge(),
@@ -7228,6 +7294,7 @@ mod tests {
 
         inbound_tx
             .send(LegacyInboundWork::Gossip(LegacyGossipInbound {
+                _admission: (free_slot(), free_slot()),
                 peer_id: peer_id.clone(),
                 frame: frame.clone(),
                 _charge: free_charge(),
@@ -7235,6 +7302,7 @@ mod tests {
             .await?;
         inbound_tx
             .send(LegacyInboundWork::Gossip(LegacyGossipInbound {
+                _admission: (free_slot(), free_slot()),
                 peer_id: peer_id.clone(),
                 frame: frame.clone(),
                 _charge: free_charge(),
@@ -7255,6 +7323,7 @@ mod tests {
 
         inbound_tx
             .send(LegacyInboundWork::Gossip(LegacyGossipInbound {
+                _admission: (free_slot(), free_slot()),
                 peer_id,
                 frame,
                 _charge: free_charge(),
@@ -9106,6 +9175,162 @@ mod tests {
         }
 
         node.shutdown().await;
+        Ok(())
+    }
+    /// Decode eight maximum-size serialized blocks under the default frame and response limits.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn maximum_block_responses_decode_under_default_limits() -> Result<(), BoxError> {
+        let _guard = zakura_test::init();
+        let mut block = Block::zcash_deserialize(BLOCK_TESTNET_141042_BYTES.as_slice())?;
+        let size = block.zcash_serialize_to_vec()?.len();
+        // Expand one output script without changing its CompactSize width unexpectedly.
+        // These are wire-valid blocks. Consensus validity is outside the response decoder.
+        let output = &mut Arc::make_mut(&mut block.transactions[0]).outputs_mut()[0];
+        let script_size = output.lock_script.as_raw_bytes().len() + 2_000_000 - size - 4;
+        output.lock_script = zakura_chain::transparent::Script::new(&vec![0; script_size]);
+        assert_eq!(block.zcash_serialize_to_vec()?.len(), 2_000_000);
+        let blocks: Vec<_> = (0..8_u8)
+            .map(|index| {
+                let mut block = block.clone();
+                Arc::make_mut(&mut block.header).nonce.0[0] = index;
+                Arc::new(block)
+            })
+            .collect();
+        let requested = blocks
+            .iter()
+            .map(|block| block.hash())
+            .collect::<IndexSet<_>>();
+        let server = ZakuraTestNode::builder(95200)
+            .service_from_supervisor(move |supervisor| {
+                Arc::new(LegacyGossipSink::spawn(
+                    tower::service_fn(move |request: Request| {
+                        let response = match request {
+                            Request::BlocksByHash(hashes)
+                            | Request::BlocksByHashFrom { hashes, .. } => Response::Blocks(
+                                hashes
+                                    .into_iter()
+                                    .map(|hash| {
+                                        InventoryResponse::Available((
+                                            blocks
+                                                .iter()
+                                                .find(|block| block.hash() == hash)
+                                                .unwrap()
+                                                .clone()
+                                                .into(),
+                                            None,
+                                        ))
+                                    })
+                                    .collect(),
+                            ),
+                            _ => Response::Nil,
+                        };
+                        std::future::ready(Ok::<_, BoxError>(response))
+                    }),
+                    supervisor,
+                ))
+            })
+            .spawn()
+            .await?;
+        let receiver = ZakuraTestNode::builder(95201).spawn().await?;
+        receiver.connect_native(&server, TEST_NET_TIMEOUT).await?;
+        let response = tokio::time::timeout(
+            TEST_NET_TIMEOUT,
+            LegacyRequestAdapter::new(receiver.supervisor())
+                .request_from_source(Request::BlocksByHash(requested), None),
+        )
+        .await??;
+        let Response::Blocks(received) = response else {
+            panic!("block response")
+        };
+        assert_eq!(received.len(), 8);
+        for item in received {
+            let InventoryResponse::Available((block, _)) = item else {
+                panic!("available block")
+            };
+            assert_eq!(block.zcash_serialize_to_vec()?.len(), 2_000_000);
+        }
+        receiver.shutdown().await;
+        server.shutdown().await;
+        Ok(())
+    }
+    /// One-byte chunks cannot multiply a legal block into millions of allocations.
+    #[test]
+    fn tiny_response_caps_stop_at_local_frame_budget() {
+        let mut frames = Vec::new();
+        let mut budget = ResponseEncodeBudget::default();
+        let error = push_chunked_response(
+            &mut frames,
+            &mut budget,
+            MSG_RESPONSE_BLOCK,
+            1,
+            u32::try_from(FRAME_HEADER_BYTES + RESPONSE_CHUNK_HEADER_BYTES + 1).unwrap(),
+            u32::try_from(MAX_PROTOCOL_MESSAGE_LEN).unwrap(),
+            &vec![0; MAX_PROTOCOL_MESSAGE_LEN],
+        )
+        .unwrap_err();
+        assert!(matches!(error, LegacyGossipError::ResponseFrameBudget));
+        assert!(!error.is_peer_fault());
+        assert_eq!(frames.len(), LEGACY_RESPONSE_MAX_FRAMES);
+        assert!(frames
+            .iter()
+            .all(|frame| frame.payload.capacity() == RESPONSE_CHUNK_HEADER_BYTES + 1));
+    }
+    /// Decoded gossip holds at most its peer's share of the node's slots, over
+    /// every session of that peer, and the node's eight, each until its item's
+    /// handler ends. So neither one peer nor all gossip together can fill the
+    /// queue it shares with requests.
+    #[test]
+    fn decoded_gossip_keeps_request_queue_capacity() -> Result<(), BoxError> {
+        let (tx, mut rx) = mpsc::channel(LEGACY_GOSSIP_INBOUND_QUEUE);
+        let sink = test_sink(tx.clone(), LegacyGossipOutbound::default());
+        let peer = |byte: u8| ZakuraPeerId::new(vec![byte; 32]);
+        let frame = LegacyGossipFrame::AdvertiseTransactionIds(vec![
+            legacy_tx_id(1);
+            usize::try_from(
+                MAX_TX_INV_IN_SENT_MESSAGE
+            )?
+        ])
+        .encode_frame()?;
+        // Each peer floods the queue with as many adverts as get in.
+        let flood_from = |byte: u8| -> Result<(), BoxError> {
+            for _ in 0..LEGACY_GOSSIP_INBOUND_QUEUE {
+                sink.deliver(peer(byte)?, ZAKURA_STREAM_GOSSIP, frame.clone())?;
+            }
+            Ok(())
+        };
+        flood_from(1)?;
+        assert_eq!(
+            rx.len(),
+            LEGACY_GOSSIP_PEER_DECODED_SLOTS,
+            "one peer takes only its share of the node's slots"
+        );
+        assert_eq!(
+            sink.peer_gossip_slots(&peer(1)?).available_permits(),
+            0,
+            "a reopened session draws on its peer's held pool"
+        );
+        // One peer more than the node's slots fit at each peer's share.
+        let peers = u8::try_from(LEGACY_GOSSIP_DECODED_SLOTS / LEGACY_GOSSIP_PEER_DECODED_SLOTS)?;
+        for byte in 2..=peers + 1 {
+            flood_from(byte)?;
+        }
+        assert_eq!(rx.len(), LEGACY_GOSSIP_DECODED_SLOTS);
+        let slots = &sink.gossip_slots;
+        assert_eq!(slots.available_permits(), 0);
+        let running = rx.try_recv()?;
+        assert_eq!(slots.available_permits(), 0);
+        let (response_tx, _) = oneshot::channel();
+        tx.try_send(LegacyInboundWork::Request(LegacyRequestInbound {
+            peer_id: peer(1)?,
+            request_id: 1,
+            frame: LegacyRequestFrame::Ping,
+            response_tx,
+            _charge: free_charge(),
+        }))?;
+        drop(running);
+        assert_eq!(slots.available_permits(), 1);
+        drop(rx);
+        assert_eq!(slots.available_permits(), LEGACY_GOSSIP_DECODED_SLOTS);
         Ok(())
     }
 

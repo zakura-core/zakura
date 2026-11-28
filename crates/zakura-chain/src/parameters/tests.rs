@@ -274,6 +274,7 @@ const NETWORK_UPGRADES_IN_ORDER: &[NetworkUpgrade] = &[
     #[cfg(any(test, feature = "zakura-test"))]
     Nu6_3,
     Nu7,
+    Nu7_1,
 ];
 
 #[test]
@@ -289,7 +290,11 @@ fn full_activation_list_contains_all_upgrades() {
     let network = Network::Mainnet;
     let full_list = network.full_activation_list();
 
-    // ZIP 259 schedules every upgrade through NU7 on Mainnet, so the full
-    // activation list and the iter cover the same upgrades.
-    assert_eq!(full_list.len(), NetworkUpgrade::iter().count());
+    // ZIP 259 schedules every upgrade through NU7 on Mainnet. NU7.1 has no
+    // Mainnet height yet.
+    let scheduled: Vec<_> = NetworkUpgrade::iter()
+        .filter(|nu| *nu <= NetworkUpgrade::Nu7)
+        .collect();
+    let listed: Vec<_> = full_list.into_iter().map(|(_, nu)| nu).collect();
+    assert_eq!(listed, scheduled);
 }

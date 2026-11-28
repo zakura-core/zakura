@@ -368,9 +368,9 @@ pub enum SavedPlan {
     /// A peer dials the node, and both sides exchange `Hello`, `GetPeers`
     /// and `GetServices`. The peer's `Peers` relays one record.
     Exchange,
-    /// A peer dials the node and holds its `Hello` past the node's initial
-    /// exchange wait, so the node times the exchange out. It answers
-    /// `GetPeers` and `GetServices`.
+    /// A peer dials the node and holds its `Hello` past the node's
+    /// [`EXCHANGE_BUDGET_MS`], so the node times the exchange out. It
+    /// answers `GetPeers` and `GetServices`.
     TimedOut,
     /// A peer dials the node, which has one verification slot, and relays
     /// [`RELAYED`] records in its `Peers`.
@@ -433,11 +433,10 @@ impl SavedPlan {
                 relays: 1,
                 ..DiscoveryScript::default()
             }),
-            // Past the node's 2 s initial exchange wait.
             SavedPlan::TimedOut => dialed(DiscoveryScript {
                 holds: vec![Hold {
                     answer: Answer::Hello,
-                    until_ms: 3_000,
+                    until_ms: EXCHANGE_BUDGET_MS + 1_000,
                 }],
                 ..DiscoveryScript::default()
             }),
@@ -486,6 +485,12 @@ fn dialed(script: DiscoveryScript) -> WireScenario {
 /// start: before the node's 2 s initial exchange wait ends, so the
 /// exchange stays open for the act.
 pub const ACT_HOLD_MS: u64 = 1_500;
+
+/// The node's `DISCOVERY_ONLY_EXCHANGE_BUDGET` in milliseconds, which
+/// `zakura-network` keeps private. A listening node waits it out for its
+/// dialer to hang up, even after the exchange completes, so only an answer
+/// held past it times the exchange out.
+pub const EXCHANGE_BUDGET_MS: u64 = 8_000;
 
 /// The scenario where `act` reaches its label: the default node, dialed by
 /// one peer whose script is `act` alone, on links of 1 to 5 ms, so the

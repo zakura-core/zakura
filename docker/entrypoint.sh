@@ -81,11 +81,15 @@ create_owned_directory() {
   fi
 }
 
-# Create and own cache and config directories based on ZAKURA_* environment variables.
-[[ -n ${ZAKURA_STATE__CACHE_DIR} ]] && create_owned_directory "${ZAKURA_STATE__CACHE_DIR}"
-[[ -n ${ZAKURA_RPC__COOKIE_DIR} ]] && create_owned_directory "${ZAKURA_RPC__COOKIE_DIR}"
-[[ -n ${ZAKURA_ZCASHD_COMPAT__ZCASHD_DATADIR:-} ]] && create_owned_directory "${ZAKURA_ZCASHD_COMPAT__ZCASHD_DATADIR}"
-[[ -n ${ZAKURA_TRACING__LOG_FILE:-} ]] && create_owned_directory "$(dirname "${ZAKURA_TRACING__LOG_FILE}")"
+# Create and own cache and config directories based on ZAKURA_* environment
+# variables. Only root can change ownership. A non-root start relies on the
+# directories' existing permissions, and zakurad creates and checks them itself.
+if [[ $(id -u) == '0' ]]; then
+  [[ -n ${ZAKURA_STATE__CACHE_DIR} ]] && create_owned_directory "${ZAKURA_STATE__CACHE_DIR}"
+  [[ -n ${ZAKURA_RPC__COOKIE_DIR} ]] && create_owned_directory "${ZAKURA_RPC__COOKIE_DIR}"
+  [[ -n ${ZAKURA_ZCASHD_COMPAT__ZCASHD_DATADIR:-} ]] && create_owned_directory "${ZAKURA_ZCASHD_COMPAT__ZCASHD_DATADIR}"
+  [[ -n ${ZAKURA_TRACING__LOG_FILE:-} ]] && create_owned_directory "$(dirname "${ZAKURA_TRACING__LOG_FILE}")"
+fi
 
 # --- Optional config file support ---
 # If provided, pass a config file path through to zakurad via CONFIG_FILE_PATH.

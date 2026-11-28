@@ -262,11 +262,11 @@ pub(crate) async fn pruned_checkpoint_sync_mining_without_transparent_indexes_te
     }
 
     let indexed_tip = client.blockchain_info().await?.blocks();
+    wait_for_reorg_window_finalized(config.mirrored_state_config(), &net, indexed_tip).await?;
     zakurad.kill(false)?;
     let mut output = zakurad.wait_with_output()?.assert_failure()?;
     output.assert_was_killed()?;
     let test_dir = output.dir.take().expect("the indexed database is kept");
-    tokio::time::sleep(Duration::from_secs(3)).await;
     let first_skipped_height;
     {
         let state = zakura_state::FinalizedState::new(&config.mirrored_state_config(), &net)?;
@@ -341,13 +341,14 @@ pub(crate) async fn pruned_checkpoint_sync_mining_without_transparent_indexes_te
     assert_transparent_index_rpcs_fail(&client, &miner).await?;
 
     let tip_before_restart = client.blockchain_info().await?.blocks();
+    wait_for_reorg_window_finalized(config.mirrored_state_config(), &net, tip_before_restart)
+        .await?;
 
     // Restart with checkpoint sync disabled. The node keeps the database without indexes.
     zakurad.kill(false)?;
     let mut output = zakurad.wait_with_output()?.assert_failure()?;
     output.assert_was_killed()?;
     let test_dir = output.dir.take().expect("the test directory is kept");
-    tokio::time::sleep(Duration::from_secs(3)).await;
 
     config.consensus.checkpoint_sync = false;
     let mut zakurad = test_dir
@@ -380,12 +381,12 @@ pub(crate) async fn pruned_checkpoint_sync_mining_without_transparent_indexes_te
     }
     assert_transparent_index_rpcs_fail(&client, &miner).await?;
     let final_tip = client.blockchain_info().await?.blocks();
+    wait_for_reorg_window_finalized(config.mirrored_state_config(), &net, final_tip).await?;
 
     zakurad.kill(false)?;
     let mut output = zakurad.wait_with_output()?.assert_failure()?;
     output.assert_was_killed()?;
     let test_dir = output.dir.take().expect("the test directory is kept");
-    tokio::time::sleep(Duration::from_secs(3)).await;
 
     // Inspect the database offline.
     let major_version = zakura_state::state_database_format_version_in_code().major;
@@ -431,6 +432,42 @@ pub(crate) async fn pruned_checkpoint_sync_mining_without_transparent_indexes_te
     drop(test_dir);
 
     Ok(())
+}
+
+/// How long the node gets to finalize the blocks that left the reorg window.
+const FINALIZATION_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Waits until the running node has written every block more than [`MAX_BLOCK_REORG_HEIGHT`]
+/// below `tip` to its finalized state on disk.
+///
+/// The state writer answers a block submission before it finalizes the block that falls out of
+/// the reorg window, so the finalized tip on disk can still lag when the last `submitblock`
+/// returns. This reads the node's database through a read-only secondary instance, which follows
+/// the node's write-ahead log. Those writes survive the node being killed, so once this returns,
+/// the database a later reader opens has at least the finalized tip the caller asked for.
+async fn wait_for_reorg_window_finalized(
+    state_config: zakura_state::Config,
+    net: &Network,
+    tip: Height,
+) -> Result<()> {
+    let target = Height(tip.0.saturating_sub(MAX_BLOCK_REORG_HEIGHT));
+    let (_read_state, db, _sender) = zakura_state::init_read_only(state_config, net)?;
+    let deadline = tokio::time::Instant::now() + FINALIZATION_TIMEOUT;
+    loop {
+        db.spawn_try_catch_up_with_primary().await?;
+        let finalized = db.finalized_tip_height();
+        if finalized.is_some_and(|height| height >= target) {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(eyre!(
+                "the node's finalized tip on disk stayed at {finalized:?} for \
+                 {FINALIZATION_TIMEOUT:?}, below {target:?}, the height it finalizes for best \
+                 tip {tip:?}"
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 /// Returns the outpoint and value of `block`'s coinbase output to `miner`.

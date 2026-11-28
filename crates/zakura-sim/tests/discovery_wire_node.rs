@@ -26,7 +26,7 @@ use zakura_network::{
 };
 use zakura_sim::{
     harness::{
-        discovery_service::{spawn, NodeSpec},
+        discovery_service::{spawn, NodeSpec, EXCHANGE_BUDGET_MS},
         header_sync::wire_config,
         LinkEntry, LinkSpec, NetScenario,
     },
@@ -596,11 +596,14 @@ fn a_peer_holds_an_answer_and_asks_on_its_own() {
     assert_eq!(closes(&report), ["discovery_exchange_complete"]);
 }
 
-/// A peer that holds an answer past the node's 2 s initial wait times the
-/// exchange out, and the node closes with `discovery_exchange_timed_out`.
-/// Without its `Peers`, the node's `GetPeers` exchange is still open when
-/// the session retires its queries, so the writer fence resets only the
-/// session, and the timeout still names the close.
+/// A peer that holds an answer past the node's discovery-only exchange
+/// budget ([`EXCHANGE_BUDGET_MS`]) times the exchange out, and the node
+/// closes with `discovery_exchange_timed_out`. An answer that arrives after
+/// the 2 s initial wait but within the budget still completes the
+/// exchange, because the listening node waits out the budget for its
+/// dialer. Without its `Peers`, the node's `GetPeers` exchange is still
+/// open when the session retires its queries, so the writer fence resets
+/// only the session, and the timeout still names the close.
 #[test]
 fn a_held_answer_times_the_exchange_out() {
     for answer in [Answer::Hello, Answer::Peers] {
@@ -609,7 +612,7 @@ fn a_held_answer_times_the_exchange_out() {
             DiscoveryScript {
                 holds: vec![Hold {
                     answer,
-                    until_ms: 3_000,
+                    until_ms: EXCHANGE_BUDGET_MS + 1_000,
                 }],
                 ..DiscoveryScript::default()
             },

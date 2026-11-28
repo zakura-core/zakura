@@ -7,6 +7,10 @@ mod zip218_rounding;
 
 use eyre::Report;
 
+/// Mainnet's NU7 height, where these NU7 reissuance vectors apply.
+const MAINNET_NU7: crate::block::Height =
+    crate::parameters::constants::activation_heights::mainnet::NU7;
+
 use super::Network;
 use crate::{
     amount::{Amount, NonNegative, MAX_MONEY},
@@ -927,7 +931,8 @@ fn default_testnet_nsm_reissuance_boundary() {
             i64::try_from(reserve).expect("the reference reserve fits the amount range"),
         )
         .expect("the reference reserve is non-negative");
-        let bonus = reissuance_bonus(reserve, &network).expect("the reference bonus is valid");
+        let bonus =
+            reissuance_bonus(reserve, &network, height).expect("the reference bonus is valid");
         let scheduled = halving_block_subsidy(height, &network).expect("valid subsidy");
         assert_eq!(bonus < scheduled, is_crossing);
     }
@@ -1446,7 +1451,7 @@ fn block_subsidy_fraction_halves_the_balance_over_one_interval() {
         Amount::<NonNegative>::try_from(initial).expect("100 ZEC is a valid amount");
     for _ in 0..5_040_000 {
         remaining = (remaining
-            - reissuance_bonus(remaining, &Network::Mainnet).expect("valid bonus"))
+            - reissuance_bonus(remaining, &Network::Mainnet, MAINNET_NU7).expect("valid bonus"))
         .expect("the bonus never exceeds the remaining balance");
     }
 
@@ -1519,8 +1524,12 @@ fn reissuance_bonus_rounding_boundaries() {
         (10_000_000_000 + 1, 1_376),
         (MAX_MONEY, 288_750_000),
     ] {
-        let actual =
-            reissuance_bonus(Amount::try_from(balance).unwrap(), &Network::Mainnet).unwrap();
+        let actual = reissuance_bonus(
+            Amount::try_from(balance).unwrap(),
+            &Network::Mainnet,
+            MAINNET_NU7,
+        )
+        .unwrap();
         assert_eq!(i64::from(actual), expected, "balance {balance}");
     }
 }
@@ -1555,7 +1564,7 @@ proptest::proptest! {
         let numerator = i128::try_from(BLOCK_SUBSIDY_FRACTION_NUMERATOR).unwrap();
         let denominator = i128::try_from(BLOCK_SUBSIDY_FRACTION_DENOMINATOR).unwrap();
         let expected = (i128::from(balance) * numerator + denominator - 1) / denominator;
-        let actual = reissuance_bonus(Amount::try_from(balance).unwrap(), &Network::Mainnet).unwrap();
+        let actual = reissuance_bonus(Amount::try_from(balance).unwrap(), &Network::Mainnet, MAINNET_NU7).unwrap();
         proptest::prop_assert_eq!(i128::from(i64::from(actual)), expected);
         proptest::prop_assert!(i64::from(actual) <= balance);
         proptest::prop_assert!(balance == 0 || i64::from(actual) > 0);

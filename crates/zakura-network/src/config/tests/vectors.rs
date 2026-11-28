@@ -30,8 +30,8 @@ use crate::{
     zakura::{
         retired_seed_replacements, ZakuraConfig, ZakuraLocalLimits, DEFAULT_HS_RANGE,
         DEFAULT_MAINNET_ZAKURA_BOOTSTRAP_PEERS, DEFAULT_TESTNET_ZAKURA_BOOTSTRAP_PEERS,
-        DEFAULT_ZAKURA_BOOTSTRAP_PEERS, DEFAULT_ZAKURA_BUDGETED_CONNECTIONS,
-        DEFAULT_ZAKURA_LISTEN_ADDR, DEFAULT_ZAKURA_MAX_CONNS_PER_IP,
+        DEFAULT_ZAKURA_BOOTSTRAP_PEERS, DEFAULT_ZAKURA_LISTEN_ADDR,
+        DEFAULT_ZAKURA_MAX_CONNS_PER_IP,
     },
     CacheDir, Config, P2pStack, PeerSocketAddr, UnconditionalPeers,
 };
@@ -1074,7 +1074,7 @@ fn p2p_v2_old_config_without_zakura_fields_uses_safe_defaults() {
         default_testnet_zakura_bootstrap_peers()
     );
     assert!(!config.zakura.nat_traversal);
-    assert!(config.zakura.max_connections > 0);
+    assert!(config.zakura.effective_max_connections() > 0);
     assert_eq!(
         config.zakura.max_connections_per_ip,
         DEFAULT_ZAKURA_MAX_CONNS_PER_IP
@@ -1324,7 +1324,7 @@ fn zakura_bootstrap_peers_parse_in_nested_config() {
     assert!(config.v2_p2p());
     assert!(config.legacy_p2p());
     assert_eq!(config.zakura.bootstrap_peers.len(), 1);
-    assert_eq!(config.zakura.max_connections, 4);
+    assert_eq!(config.zakura.max_connections, Some(4));
     assert_eq!(
         config.zakura.max_connections_per_ip,
         DEFAULT_ZAKURA_MAX_CONNS_PER_IP
@@ -1334,38 +1334,14 @@ fn zakura_bootstrap_peers_parse_in_nested_config() {
     assert_eq!(config.zakura.message_rate_per_second, 5);
 }
 
-/// Config load checks the budget without `tx-relay`, which zakurad turns off
-/// with the classic pool, so a budget that funds the floor only without it
-/// still loads.
+/// The transport holds the admitted connections and the headroom, keeps one
+/// discovery record's 8 addresses for dials, lets inbound hold its connection
+/// and handshake shares (zakura-quic ADM-12), and keeps two closing connections
+/// per live slot (ADM-13). A config that predates `[memory]` keeps loading.
 #[test]
-fn zakura_peer_memory_budget_at_load_leaves_out_tx_relay() {
+fn zakura_connection_cap_sets_the_transport_slots() {
     let _init_guard = zakura_test::init();
 
-    // One 256 MiB socket queue, 32 handshakes of 64 MiB, and Mainnet's floor
-    // of 17 connections of 142,599,875 bytes, which is 16 with `tx-relay`'s
-    // 4,259,840 bytes added to each.
-    let config: Config = toml::from_str(
-        r#"
-        p2p_stack = "dual"
-
-        [zakura]
-        peer_memory_budget_bytes = 4840116979
-        "#,
-    )
-    .expect("the budget funds the floor without tx-relay");
-    assert!(config.zakura.tx_relay.enabled);
-    assert!(config
-        .zakura
-        .budgeted_max_connections(&config.network)
-        .is_err());
-}
-
-#[test]
-fn zakura_peer_memory_budget_lowers_or_refuses_at_load() {
-    let _init_guard = zakura_test::init();
-
-    // A config generated before the budget existed keeps loading. The endpoint
-    // lowers its cap to what the default budget admits.
     let config: Config = toml::from_str(
         r#"
         [zakura]
@@ -1373,79 +1349,67 @@ fn zakura_peer_memory_budget_lowers_or_refuses_at_load() {
         "#,
     )
     .unwrap();
-    assert_eq!(config.zakura.max_connections, 256);
-    assert_eq!(
-        config.zakura.budgeted_max_connections(&config.network),
-        Ok(DEFAULT_ZAKURA_BUDGETED_CONNECTIONS)
-    );
-    assert_eq!(
-        ZakuraLocalLimits::from_config(&config).max_connections,
-        DEFAULT_ZAKURA_BUDGETED_CONNECTIONS
-    );
-
-    let config: Config = toml::from_str(
-        r#"
-        [zakura]
-        max_connections = 256
-        peer_memory_budget_bytes = 40012006144
-        "#,
-    )
-    .unwrap();
-    // One 256 MiB socket queue, 32 handshakes of 64 MiB, and 256 admitted
-    // connections of 146,859,715 bytes.
-    assert_eq!(
-        config.zakura.budgeted_max_connections(&config.network),
-        Ok(256)
-    );
-
-    // The transport holds the admitted connections and the headroom, keeps
-    // one discovery record's 8 addresses for dials, lets inbound hold its
-    // connection and handshake shares (zakura-quic ADM-12), and keeps two
-    // closing connections per live slot (ADM-13).
-    let bind = ZakuraLocalLimits::from_config(&config).quic_bind_config(Vec::new());
-    assert_eq!(
-        (
-            bind.max_connections,
-            bind.dial_reserve,
-            bind.max_inbound_connections,
-            bind.max_closing_connections
-        ),
-        (288, 8, Some(216), 576)
-    );
-    let bind = ZakuraLocalLimits::from_config(&Config::default()).quic_bind_config(Vec::new());
-    assert_eq!(
-        (
-            bind.max_connections,
-            bind.dial_reserve,
-            bind.max_inbound_connections,
-            bind.max_closing_connections
-        ),
-        (134, 8, Some(103), 268)
-    );
-
-    // With a 1 GiB receive window, the handshake headroom alone exceeds the
-    // default budget.
-    let error = toml::from_str::<Config>(
-        r#"
-        p2p_stack = "dual"
-
-        [zakura.quic]
-        receive_window_bytes = 1073741824
-        "#,
-    )
-    .unwrap_err()
-    .to_string();
-    assert!(
-        error.contains("[network.zakura] peer_memory_budget_bytes"),
-        "{error}"
-    );
-    assert!(error.contains("receive_window_bytes"), "{error}");
+    assert_eq!(config.zakura.max_connections, Some(256));
+    for config in [config, Config::default()] {
+        let bind = ZakuraLocalLimits::from_config(&config).quic_bind_config(Vec::new());
+        assert_eq!(
+            (
+                bind.max_connections,
+                bind.dial_reserve,
+                bind.max_inbound_connections,
+                bind.max_closing_connections
+            ),
+            (298, 8, Some(226), 596)
+        );
+    }
 }
 
-/// An unused QUIC budget cannot reject legacy startup, but every resolved
-/// stack that runs v2 must enforce it before the endpoint starts.
+/// mem-14: config load never sizes memory, because `zakurad` resolves
+/// `[memory] budget` after it. A raised QUIC window loads on every stack, and
+/// the memory plan names it when the plan doesn't fit the resolved `B`.
 #[test]
-fn zakura_peer_memory_budget_only_rejects_v2_stacks() {
+fn a_raised_quic_window_loads_and_the_plan_sizes_it_against_the_budget() {
+    use crate::zakura::memory::MemoryPlan;
+
+    let _init_guard = zakura_test::init();
+
+    const GIB: u64 = 1 << 30;
+    for stack in ["zakura", "dual"] {
+        let config: Config = toml::from_str(&format!(
+            r#"
+            p2p_stack = "{stack}"
+
+            [zakura.quic]
+            receive_window_bytes = 268435456
+            "#
+        ))
+        .unwrap_or_else(|error| panic!("{stack}: {error}"));
+        let network = config.network.clone();
+
+        let short = MemoryPlan::size(16 * GIB, &config, &network)
+            .expect("sizes")
+            .shortfall
+            .unwrap_or_else(|| panic!("{stack}: 256 MiB handshake windows don't fit 16 GiB"));
+        assert!(
+            short
+                .raised_settings
+                .iter()
+                .any(|raised| raised.setting == "[network.zakura.quic] receive_window_bytes"),
+            "{stack}: {short}"
+        );
+        let funded = MemoryPlan::size(64 * GIB, &config, &network).expect("sizes");
+        assert!(
+            funded.shortfall.is_none(),
+            "{stack}: 64 GiB funds the raised window"
+        );
+    }
+}
+
+/// Configs from older releases set `[network.zakura] peer_memory_budget_bytes`.
+/// They still load on every stack, the value is ignored, and it is never
+/// written back (`02 §2`).
+#[test]
+fn deprecated_peer_memory_budget_bytes_loads_and_is_not_written() {
     let _init_guard = zakura_test::init();
 
     for network in ["Mainnet", "Testnet"] {
@@ -1462,25 +1426,10 @@ fn zakura_peer_memory_budget_only_rejects_v2_stacks() {
             let source = format!(
                 "network = \"{network}\"\n{stack_config}\n[zakura]\npeer_memory_budget_bytes = 1\n"
             );
-            let result = toml::from_str::<Config>(&source);
-            let runs_v2 = match stack {
-                None | Some("default") => network == "Testnet",
-                Some("legacy") => false,
-                Some("zakura" | "dual") => true,
-                _ => unreachable!("the test only supplies supported stack names"),
-            };
-            if runs_v2 {
-                let error = result.unwrap_err().to_string();
-                assert!(
-                    error.contains("peer_memory_budget_bytes"),
-                    "{source}: {error}"
-                );
-            } else {
-                let config = result.unwrap_or_else(|error| panic!("{source}: {error}"));
-                assert!(!config.v2_p2p());
-                assert!(config.legacy_p2p());
-                assert_eq!(config.zakura.peer_memory_budget_bytes, 1);
-            }
+            let config = toml::from_str::<Config>(&source).expect("an old config still loads");
+            assert_eq!(config.zakura.deprecated_peer_memory_budget_bytes, Some(1));
+            let written = toml::to_string(&config).expect("config serializes");
+            assert!(!written.contains("peer_memory_budget_bytes"), "{written}");
         }
     }
 }
@@ -2787,13 +2736,11 @@ fn loaded_block_sync_session_slots_must_fund_one_request_each() {
 
     assert!(load(256, 256).is_ok(), "defaults load");
     assert!(load(0, 0).is_ok(), "zero slots load and serve nobody");
+    // Serving bookkeeping now lives in each session's `b_block_sync` lease
+    // (`02 §8`), so large explicit reactor caps validate cleanly while the
+    // memory pool caps how many sessions actually open.
     assert!(load(3_000, 633).is_ok());
-    for (inbound, outbound) in [(3_000, 634), (i64::MAX as u64, i64::MAX as u64)] {
-        let error = load(inbound, outbound)
-            .expect_err("unfundable session slots must not load")
-            .to_string();
-        assert!(error.contains("at most 3,633"), "unexpected error: {error}");
-    }
+    assert!(load(3_000, 634).is_ok());
 }
 
 /// The TCP ingress partition follows the connection limit and cannot overflow.

@@ -118,13 +118,8 @@ async fn native_invalid_body(tampered: bool) {
     let limits = supplier.limits().clone();
     let dial = tokio::spawn(async move { dial_endpoint.dial(addr, &limits).await });
     let mut peers = endpoint.supervisor().subscribe();
-    timeout(Duration::from_secs(20), async {
-        while peers.borrow_and_update().is_empty() {
-            peers.changed().await.unwrap();
-        }
-    })
-    .await
-    .unwrap();
+    // The violation shows the supplier connected and served. A tampered body
+    // can register and drop the connection before a peer-set watch sees it.
     let violation = timeout(Duration::from_secs(20), receiver.native_violations.recv())
         .await
         .unwrap()

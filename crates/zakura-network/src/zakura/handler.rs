@@ -8357,16 +8357,15 @@ impl LegacyResponseBudget {
             .saturating_add(LEGACY_RESPONSE_REQUEST_ID_BYTES)
             .saturating_add(LEGACY_COMPACT_SIZE_PREFIX_BYTES)
             .min(COMPAT_RESPONSE_MAX_AGGREGATE_BYTES);
-        let most_frames = COMPAT_RESPONSE_MAX_AGGREGATE_BYTES
-            / LEGACY_RESPONSE_CHUNK_HEADER_BYTES.saturating_add(1);
         let filled_frames =
             (COMPAT_RESPONSE_MAX_AGGREGATE_BYTES / chunk_bytes).saturating_add(self.max_items);
+        // The encoder stops at `LEGACY_RESPONSE_MAX_FRAMES`, however small the chunks.
         let frames = self
             .max_items
             .saturating_mul(chunks_per_item)
             .min(filled_frames)
-            .min(most_frames)
-            .saturating_add(1);
+            .saturating_add(1)
+            .min(super::legacy_gossip::LEGACY_RESPONSE_MAX_FRAMES);
         ResponseBound {
             // Widening usize to u64 is lossless on supported targets.
             bytes: payload_bytes
@@ -16503,6 +16502,33 @@ mod tests {
                 limits.max_frame_bytes
             )?,
             super::super::legacy_gossip::LEGACY_RESPONSE_MAX_FRAMES
+        );
+        Ok(())
+    }
+
+    /// The responder reserves output for no more frames than its encoder can
+    /// build, so a tiny negotiated frame cap doesn't inflate the reservation.
+    #[test]
+    fn tiny_frame_caps_reserve_at_most_the_encoder_frame_ceiling() -> Result<(), BoxError> {
+        let limits = test_connection_limits();
+        let request = LegacyRequestFrame::BlocksByHash(vec![zakura_chain::block::Hash([7; 32])])
+            .encode_frame()?;
+        let budget = LegacyResponseBudget::from_request(
+            request.message_type,
+            &request.payload,
+            limits,
+            limits.max_frame_bytes,
+        )
+        .map_err(|error| format!("{error:?}"))?;
+        // A 20-byte frame cap leaves three object bytes per chunk.
+        let reserved = budget.response_bound(20).bytes;
+        let most = COMPAT_RESPONSE_MAX_AGGREGATE_BYTES.saturating_add(
+            super::super::legacy_gossip::LEGACY_RESPONSE_MAX_FRAMES
+                .saturating_mul(RESPONSE_FRAME_OVERHEAD_BYTES),
+        );
+        assert!(
+            reserved <= u64::try_from(most)?,
+            "reserved {reserved} bytes"
         );
         Ok(())
     }

@@ -44,6 +44,17 @@ pub(crate) struct SinkProgress {
     pub(crate) bytes: u64,
 }
 
+impl SinkProgress {
+    /// Encoded bytes of a completed response (every queued frame plus the
+    /// ending, frame headers included).
+    pub(crate) const fn completed_output_bytes(self) -> u64 {
+        // Widening usize and u32 to u64 is lossless on supported targets.
+        let header = FRAME_HEADER_BYTES as u64;
+        let frames = (self.frames as u64).saturating_add(1);
+        self.bytes.saturating_add(frames.saturating_mul(header))
+    }
+}
+
 /// A local defect in a response. The peer is not at fault.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub(crate) enum SinkError {
@@ -181,6 +192,9 @@ impl SinkCore {
         .map_err(|_| SinkError::Closed)?;
         self.bound.progress = progress;
         if ends {
+            // Shrink both output grants to the encoded bytes of the finished
+            // response so surplus cap capacity returns before the write ends.
+            self.grants.shrink_to(progress.completed_output_bytes());
             // The ending is in the ordered output: the exchange is complete on
             // this side, so the peer's commitment is free.
             self.frames = None;

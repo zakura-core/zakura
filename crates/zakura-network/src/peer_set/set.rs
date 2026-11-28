@@ -1468,6 +1468,8 @@ where
     ///
     /// A transaction request whose advertisers are all busy waits for one of them instead, see
     /// [`Self::route_held_tx_requests`]. Another peer usually doesn't have the transaction yet.
+    /// The peer a transaction request names as the advert's sender counts as an advertiser, see
+    /// [`Self::tx_request_source`].
     ///
     /// If all ready peers are missing the inventory,
     /// returns a synthetic [`NotFoundRegistry`](PeerError::NotFoundRegistry) error.
@@ -1479,9 +1481,11 @@ where
         hash: InventoryHash,
         attempt: Option<crate::BlockHedge>,
     ) -> <Self as tower::Service<Request>>::Future {
+        let tx_source = self.tx_request_source(&req, hash);
         let advertising_peer_list = self
             .inventory_registry
             .advertising_peers(hash)
+            .chain(tx_source.as_ref())
             .filter(|&addr| self.ready_services.contains_key(addr))
             .copied()
             .collect();
@@ -1553,7 +1557,7 @@ where
 
         if !matches!(hash, InventoryHash::Block(_))
             && self.held_tx_requests.len() < MAX_HELD_TX_REQUESTS
-            && self.has_busy_advertiser(hash)
+            && self.has_busy_advertiser(hash, tx_source)
         {
             return self.hold_tx_request(req, hash);
         }
@@ -1683,17 +1687,47 @@ where
         .boxed()
     }
 
-    /// Returns true if a peer that advertised `hash` is busy with a request.
-    fn has_busy_advertiser(&self, hash: InventoryHash) -> bool {
+    /// Returns the legacy peer that a transaction request names as the sender of its advert,
+    /// unless that peer has since said it is missing `hash`.
+    ///
+    /// The mempool learns of an advert from the peer's message, and the inventory registry learns
+    /// of it from a separate channel, so a request can arrive before the registry lists its
+    /// sender. That sender is an advertiser like any other: routing picks it at random among the
+    /// ready advertisers, and a request waits for it while it is busy.
+    ///
+    /// # Security
+    ///
+    /// A peer that answered `notfound` is not named again, so a peer can't hold a request it
+    /// won't answer, and no doomed request is routed to it.
+    fn tx_request_source(&self, req: &Request, hash: InventoryHash) -> Option<PeerSocketAddr> {
+        let Request::TransactionsByIdFrom {
+            source: PeerSource::LegacySocket(addr),
+            ..
+        } = req
+        else {
+            return None;
+        };
+        let missing = self
+            .inventory_registry
+            .missing_peers(hash)
+            .any(|missing| missing == addr);
+        (!missing).then_some(*addr)
+    }
+
+    /// Returns true if a peer that advertised `hash`, or the request's `tx_source`, is busy with a
+    /// request.
+    fn has_busy_advertiser(&self, hash: InventoryHash, tx_source: Option<PeerSocketAddr>) -> bool {
         self.inventory_registry
             .advertising_peers(hash)
+            .chain(tx_source.as_ref())
             .any(|addr| self.cancel_handles.contains_key(addr))
     }
 
-    /// Returns true if a peer that advertised `hash` is ready.
-    fn has_ready_advertiser(&self, hash: InventoryHash) -> bool {
+    /// Returns true if a peer that advertised `hash`, or the request's `tx_source`, is ready.
+    fn has_ready_advertiser(&self, hash: InventoryHash, tx_source: Option<PeerSocketAddr>) -> bool {
         self.inventory_registry
             .advertising_peers(hash)
+            .chain(tx_source.as_ref())
             .any(|addr| self.ready_services.contains_key(addr))
     }
 
@@ -1752,8 +1786,13 @@ where
                 continue;
             }
 
-            let to_advertiser = self.has_ready_advertiser(held.hash);
-            if !to_advertiser && held.deadline > now && self.has_busy_advertiser(held.hash) {
+            // Read again for each pass: the source may have said `notfound` since.
+            let tx_source = self.tx_request_source(&held.req, held.hash);
+            let to_advertiser = self.has_ready_advertiser(held.hash, tx_source);
+            if !to_advertiser
+                && held.deadline > now
+                && self.has_busy_advertiser(held.hash, tx_source)
+            {
                 // Every request waits as long, so the oldest has the earliest deadline.
                 next_deadline.get_or_insert(held.deadline);
                 self.held_tx_requests.push_back(held);

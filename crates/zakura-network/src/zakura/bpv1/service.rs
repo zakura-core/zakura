@@ -1102,8 +1102,8 @@ impl Service for Bpv1Service {
 /// Converts a change of committed header-chain frontiers into `BlockTable`
 /// inputs.
 ///
-/// A new verified tip moves the window and ends a fallback block that
-/// native block sync committed. A new best header wakes the metadata
+/// A new verified tip moves the window and ends a collecting or fallback
+/// block that native block sync committed. A new best header wakes the metadata
 /// pending on it, and the metadata for the header itself when the snapshot
 /// skipped its parent. The watch coalesces, so other metadata whose
 /// parent a snapshot skipped ages out instead.

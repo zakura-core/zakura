@@ -3161,7 +3161,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-chain"
-version = "16.1.0"
+version = "17.0.0"
 dependencies = [
  "bech32",
  "bitflags",
@@ -3766,7 +3766,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-script"
-version = "5.1.0"
+version = "6.0.0"
 dependencies = [
  "hex",
  "ripemd",

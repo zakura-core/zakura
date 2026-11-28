@@ -1,0 +1,69 @@
+name: External link check
+
+# Checks the external links in the Markdown docs once a day. A link only fails
+# this workflow after it has been broken on every daily run for 7 days, so
+# short outages of the sites we link to never alert. `ci-alerts.yml` posts the
+# failure. Links between files in this repository are checked on every push
+# and pull request by `docs-check.yml`.
+
+on:
+  schedule:
+    - cron: "23 7 * * *"
+  workflow_dispatch:
+
+# A cancelled run would skip saving the failure history, so never cancel one.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  external-links:
+    name: external links
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install lychee
+        uses: ./.github/actions/install-lychee
+
+      - name: Restore failure history
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 #v6.1.0
+        with:
+          path: .link-rot
+          key: link-rot-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: link-rot-
+
+      - name: Check external links
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Exit 2 only means some links failed. The next step decides whether
+          # any of them have been failing long enough to matter.
+          status=0
+          lychee \
+            --no-progress \
+            --config .github/lychee.toml \
+            --format json \
+            --output lychee.json \
+            "**/*.md" || status=$?
+          if [ "$status" -ne 0 ] && [ "$status" -ne 2 ]; then
+            exit "$status"
+          fi
+
+      - name: Report links broken for 7 days
+        run: |
+          python3 .github/workflows/scripts/link_rot.py \
+            --report lychee.json --state .link-rot/state.json --days 7
+
+      - name: Save failure history
+        if: ${{ always() && hashFiles('.link-rot/state.json') != '' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 #v6.1.0
+        with:
+          path: .link-rot
+          key: link-rot-${{ github.run_id }}-${{ github.run_attempt }}

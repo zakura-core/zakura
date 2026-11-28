@@ -441,6 +441,8 @@ pub const TIMESTAMP_TRUNCATION_SECONDS: u32 = 30 * 60;
 // `Version::min_specified_for_upgrade` holds the same values. Mainnet and Testnet both have
 // an NU7 height, so one binary advertises the Mainnet value, which also meets the Testnet
 // minimum.
+// Next upgrade values, set once Zakura implements every NU7.1 rule:
+//   const CURRENT_NETWORK_PROTOCOL_VERSION_VALUE: u32 = 170_210; // NU7.1 (Mainnet + Testnet).
 const CURRENT_NETWORK_PROTOCOL_VERSION_VALUE: u32 = 170_190; // NU7 (Mainnet + Testnet).
 
 /// The Zcash network protocol version implemented by this crate, and advertised

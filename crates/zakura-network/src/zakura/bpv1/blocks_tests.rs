@@ -3506,6 +3506,117 @@ fn fix4_committed_fallback_block_frees_its_slot_without_eviction() {
     );
 }
 
+/// bpv1-57: block sync commits a block BPv1 still collects. BPv1 can no
+/// longer commit it, so it retires at once without faulting a peer: its
+/// pulls stop, its claim goes as `Committed`, it records a `Fallback`
+/// outcome, and the next block takes its slot without an eviction.
+#[test]
+fn bpv1_57_a_committed_collecting_block_retires_and_frees_its_slot() {
+    let mut cfg = BlockConfig::for_profile(Profile::TINY);
+    cfg.max_concurrent_blocks = 1;
+    let mut table = BlockTable::new(cfg);
+    let t0 = Instant::now();
+    let block_id = block::Hash([0xC3; 32]);
+    let encoded = encode_body(&Profile::TINY, &[0xC3; 128], 2).unwrap();
+    admit(&mut table, t0, block_id, encoded.coding, encoded.part_root);
+    insert(
+        &mut table,
+        t0,
+        block_id,
+        &encoded.parts[0],
+        node_id(2),
+        PartAuth::Want(1),
+    );
+
+    let step = table.step(t0, BlockInput::FallbackDone { block_id });
+    assert_eq!(table.block_phase(&block_id), Some(BlockPhase::Retired));
+    assert!(step.events.contains(&BlockEvent::Outcome {
+        block_id,
+        outcome: BlockOutcome::Fallback,
+    }));
+    assert!(step.outputs.iter().any(|o| matches!(
+        o,
+        BlockOutput::ReleaseBodyClaim {
+            reason: ClaimRelease::Committed,
+            ..
+        }
+    )));
+    assert!(!step
+        .outputs
+        .iter()
+        .any(|o| matches!(o, BlockOutput::ClosePeer { .. })));
+    let late = tick(
+        &mut table,
+        t0 + RECONSTRUCTION_DEADLINE,
+        &[pull_state(node_id(3))],
+    );
+    assert!(late.outputs.is_empty(), "a retired block pulls nothing");
+
+    let next = admit_block(
+        &mut table,
+        t0,
+        block::Hash([0xC4; 32]),
+        2,
+        encoded.coding,
+        encoded.part_root,
+    );
+    assert!(
+        !next
+            .events
+            .iter()
+            .any(|e| matches!(e, BlockEvent::Retired { .. })),
+        "admission evicts nothing"
+    );
+    table.assert_invariants();
+}
+
+/// bpv1-57: block sync commits a block while its metadata is in admission.
+/// No `FallbackDone` can reach a block the table does not hold yet, so the
+/// admission records it as retired, without fault and without collecting it.
+/// Every session then drops the block's later parts, and a later copy starts
+/// no new admission.
+#[test]
+fn bpv1_57_metadata_for_the_committed_tip_is_retired_at_admission() {
+    let mut table = BlockTable::new(BlockConfig::for_profile(Profile::TINY));
+    let t0 = Instant::now();
+    let block_id = block::Hash([0xC5; 32]);
+    let encoded = encode_body(&Profile::TINY, &[0xC5; 128], 2).unwrap();
+    let envelope = make_envelope(block_id, encoded.coding, encoded.part_root, node_id(1));
+    let received = receive(&mut table, t0, envelope.clone());
+    let admitted = header_result(
+        &mut table,
+        t0,
+        &received,
+        HeaderAdmissionResult::Admitted {
+            height: 1,
+            parent_hash: TEST_TIP_HASH,
+        },
+    );
+    table.step(
+        t0,
+        BlockInput::TipHeight {
+            height: 1,
+            hash: block_id,
+        },
+    );
+
+    let step = commitment_ok(&mut table, t0, &admitted);
+    assert_eq!(table.block_phase(&block_id), Some(BlockPhase::Retired));
+    assert!(step.outputs.iter().any(|o| matches!(
+        o,
+        BlockOutput::PublishRetire { block_id: id, .. } if *id == block_id
+    )));
+    assert!(!step.outputs.iter().any(|o| matches!(
+        o,
+        BlockOutput::PublishAdmitted { .. }
+            | BlockOutput::ClaimBody { .. }
+            | BlockOutput::ClosePeer { .. }
+    )));
+    let again = receive(&mut table, t0, envelope);
+    assert!(again.outputs.is_empty(), "a later copy starts no admission");
+    table.assert_invariants();
+}
+
 /// decision-18: a padding source part (`wire_len = 0`) is held from
 /// admission. The planner never requests it, and the stripe decodes and
 /// assembles once its real parts reach `k`.

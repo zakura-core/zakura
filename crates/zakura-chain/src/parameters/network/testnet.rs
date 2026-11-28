@@ -196,6 +196,7 @@ impl From<&BTreeMap<Height, NetworkUpgrade>> for ConfiguredActivationHeights {
                 NetworkUpgrade::Nu6_2 => &mut configured_activation_heights.nu6_2,
                 NetworkUpgrade::Nu6_3 => &mut configured_activation_heights.nu6_3,
                 NetworkUpgrade::Nu7 => &mut configured_activation_heights.nu7,
+                NetworkUpgrade::Nu7_1 => &mut configured_activation_heights.nu7_1,
                 #[cfg(zcash_unstable = "zfuture")]
                 NetworkUpgrade::ZFuture => &mut configured_activation_heights.zfuture,
                 NetworkUpgrade::Genesis => continue,
@@ -579,6 +580,9 @@ pub struct ConfiguredActivationHeights {
     /// Activation height for `NU7` network upgrade.
     #[serde(rename = "NU7")]
     pub nu7: Option<u32>,
+    /// Activation height for `NU7.1` network upgrade.
+    #[serde(rename = "NU7.1")]
+    pub nu7_1: Option<u32>,
     /// Activation height for `ZFuture` network upgrade.
     #[serde(rename = "ZFuture")]
     #[cfg(zcash_unstable = "zfuture")]
@@ -602,6 +606,7 @@ impl ConfiguredActivationHeights {
             nu6_2,
             nu6_3,
             nu7,
+            nu7_1,
             #[cfg(zcash_unstable = "zfuture")]
             zfuture,
         } = self;
@@ -625,6 +630,7 @@ impl ConfiguredActivationHeights {
             nu6_2,
             nu6_3,
             nu7,
+            nu7_1,
             #[cfg(zcash_unstable = "zfuture")]
             zfuture,
         }
@@ -645,6 +651,7 @@ impl ConfiguredActivationHeights {
             self.nu6_2,
             self.nu6_3,
             self.nu7,
+            self.nu7_1,
             #[cfg(zcash_unstable = "zfuture")]
             self.zfuture,
         ]
@@ -668,6 +675,7 @@ impl ConfiguredActivationHeights {
             nu6_2: self.nu6_2.or(base.nu6_2),
             nu6_3: self.nu6_3.or(base.nu6_3),
             nu7: self.nu7.or(base.nu7),
+            nu7_1: self.nu7_1.or(base.nu7_1),
             #[cfg(zcash_unstable = "zfuture")]
             zfuture: self.zfuture.or(base.zfuture),
         }
@@ -913,6 +921,7 @@ impl ParametersBuilder {
             nu6_2,
             nu6_3,
             nu7,
+            nu7_1,
             #[cfg(zcash_unstable = "zfuture")]
             zfuture,
         }: ConfiguredActivationHeights,
@@ -941,7 +950,8 @@ impl ParametersBuilder {
                 .chain(nu6_1.into_iter().map(|h| (h, Nu6_1)))
                 .chain(nu6_2.into_iter().map(|h| (h, Nu6_2)))
                 .chain(nu6_3.into_iter().map(|h| (h, Nu6_3)))
-                .chain(nu7.into_iter().map(|h| (h, Nu7)));
+                .chain(nu7.into_iter().map(|h| (h, Nu7)))
+                .chain(nu7_1.into_iter().map(|h| (h, Nu7_1)));
 
             #[cfg(zcash_unstable = "zfuture")]
             let activation_heights =

@@ -124,7 +124,7 @@ pub struct Args {
     pub last_checkpoint: Option<Height>,
 
     /// Offline mode: read a quiesced Zakura state cache directory instead of
-    /// querying a node over RPC. Mainnet only.
+    /// querying a node over RPC. The export is Mainnet only.
     ///
     /// See the "Mainnet release-state" section of
     /// `docs/design/verified-commitment-trees.md` for the pipeline this feeds.
@@ -203,6 +203,18 @@ pub struct Args {
     #[arg(long)]
     pub full_list: bool,
 
+    /// Offline mode: check that every checkpoint range in the network's
+    /// embedded list (`main-checkpoints.txt` for `mainnet`,
+    /// `test-checkpoints.txt` for `testnet`) holds under
+    /// `MAX_CHECKPOINT_BYTE_COUNT` bytes before its last block and at most
+    /// `MAX_CHECKPOINT_HEIGHT_GAP` heights, reading block sizes from the state
+    /// database. Prints nothing to stdout and fails on the first bad range.
+    ///
+    /// Requires `--state-cache-dir` for a database of that network synced past
+    /// the last embedded checkpoint. Excludes every other offline flag.
+    #[arg(long, value_parser = ["mainnet", "testnet"])]
+    pub check_checkpoint_ranges: Option<String>,
+
     /// Passthrough args for `zcash-cli`.
     /// Only used if the transport is [`Cli`](Transport::Cli).
     #[arg(last = true)]
@@ -231,6 +243,10 @@ impl Args {
                  --mainnet-frontier-grid-output"
                     .to_string(),
             );
+        }
+
+        if self.check_checkpoint_ranges.is_some() {
+            return self.validate_range_check_mode();
         }
 
         if self.state_cache_dir.is_some() && self.mainnet_frontier_grid_checkpoint.is_some() {
@@ -344,6 +360,32 @@ impl Args {
         Ok(())
     }
 
+    /// Check the flags of a `--check-checkpoint-ranges` run, which reads the
+    /// database and changes nothing, so it takes no other mode's flags.
+    fn validate_range_check_mode(&self) -> Result<(), String> {
+        if self.state_cache_dir.is_none() {
+            return Err("--check-checkpoint-ranges requires --state-cache-dir".to_string());
+        }
+        let others = self.addr.is_some()
+            || !self.zcli_args.is_empty()
+            || self.last_checkpoint.is_some()
+            || self.full_list
+            || self.mainnet_frontier_grid_checkpoint.is_some()
+            || self.mainnet_frontier_grid_input.is_some()
+            || self
+                .artifact_outputs()
+                .iter()
+                .any(|(_, path)| path.is_some());
+        if others {
+            return Err(
+                "--check-checkpoint-ranges only reads the database: remove the other mode flags"
+                    .to_string(),
+            );
+        }
+
+        Ok(())
+    }
+
     /// The artifact output flags and their paths, in the order errors report them.
     fn artifact_outputs(&self) -> [(&'static str, &Option<PathBuf>); 3] {
         [
@@ -442,6 +484,7 @@ mod tests {
             frontier_grid_target_cost_ms: None,
             frontier_grid_spacing: None,
             full_list: false,
+            check_checkpoint_ranges: None,
             zcli_args: Vec::new(),
         }
     }
@@ -466,6 +509,34 @@ mod tests {
             mainnet_frontier_grid_checkpoint: Some(Height(3_449_371)),
             ..rpc_args()
         }
+    }
+
+    #[test]
+    fn range_check_flag_combinations() {
+        let check = Args {
+            state_cache_dir: Some(PathBuf::from("state")),
+            check_checkpoint_ranges: Some("testnet".to_string()),
+            ..rpc_args()
+        };
+        assert_eq!(check.validate_mode(), Ok(()));
+        assert!(
+            Args {
+                state_cache_dir: None,
+                ..check.clone()
+            }
+            .validate_mode()
+            .is_err(),
+            "the check reads a database"
+        );
+        assert!(
+            Args {
+                check_checkpoint_ranges: Some("mainnet".to_string()),
+                ..offline_args()
+            }
+            .validate_mode()
+            .is_err(),
+            "the check writes no artifacts"
+        );
     }
 
     #[test]

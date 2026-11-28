@@ -53,7 +53,7 @@ use crate::zakura::{
     transport::{
         frame_wire_bytes, NodeResources, ResourceEnvelope, StreamResources, TransportLimits,
     },
-    ReactorBudget, ReactorShares, Stream, DEFAULT_REACTOR_OUTPUT_BYTES,
+    ReactorBudget, ReactorShares, ReceiveBudget, Stream, DEFAULT_REACTOR_OUTPUT_BYTES,
     DEFAULT_ZAKURA_MAX_CONNECTIONS, DEFAULT_ZAKURA_RECEIVE_WINDOW,
 };
 
@@ -112,7 +112,7 @@ fn composed_shares() -> ReactorShares {
         control_receive_bytes: window,
         kinds: Vec::new(),
         other: ReactorBudget {
-            receive: window,
+            receive: ReceiveBudget::unsolicited_only(window),
             output: DEFAULT_REACTOR_OUTPUT_BYTES,
         },
     }
@@ -122,7 +122,7 @@ fn composed_shares() -> ReactorShares {
 fn baseline_shares() -> ReactorShares {
     ReactorShares {
         other: ReactorBudget {
-            receive: u64::from(u32::MAX),
+            receive: ReceiveBudget::unsolicited_only(u64::from(u32::MAX)),
             output: u64::from(u32::MAX),
         },
         ..composed_shares()
@@ -135,11 +135,13 @@ fn limits(shares: &ReactorShares, peers: usize) -> TransportLimits {
         max_open_streams: 16,
         control_receive_bytes: shares.control_receive_bytes,
         connection_shares: ReactorBudget {
-            receive: 2 * shares.other.receive,
+            receive: ReceiveBudget::unsolicited_only(2 * shares.other.receive_total()),
             output: 2 * shares.other.output,
         },
+        compat_output: 0,
         compat_exchange_bytes: 0,
         send_window: u64::from(DEFAULT_ZAKURA_RECEIVE_WINDOW),
+        handshake_send_window: u64::from(DEFAULT_ZAKURA_RECEIVE_WINDOW),
         max_connections: peers,
         max_pending_handshakes: 1,
     }
@@ -258,7 +260,7 @@ async fn drive(
     delay: Duration,
     tally: Arc<Tally>,
 ) {
-    let held = shares.other.receive;
+    let held = shares.other.receive_total();
     let node = NodeResources::new(shares, [MOVING, SATURATED], 1 << 21);
     // These hold their gates until every task below finishes.
     let (_blocked, _saturated);
@@ -426,7 +428,7 @@ fn composed_owners_stay_within_their_tolerances() {
                          composed={composed:?} baseline={baseline:?}"
                     );
                     let bound =
-                        ResourceEnvelope::new(limits(&shares, peers)).retained_frame_bytes();
+                        ResourceEnvelope::new(limits(&shares, peers)).transport_memory_bytes();
                     for problem in tolerance_problems(&composed, &baseline, bound) {
                         problems.push(format!(
                             "{scenario:?} peers={peers} bytes={bytes} delay={delay:?}: {problem}"

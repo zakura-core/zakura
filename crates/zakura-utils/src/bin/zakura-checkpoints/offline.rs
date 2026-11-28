@@ -25,7 +25,7 @@ use eyre::{ensure, eyre, Context, Result};
 use zakura_chain::{
     block::{self, Height, MAX_BLOCK_BYTES},
     common::atomic_write,
-    parameters::Network,
+    parameters::{checkpoint::list::CheckpointList, Network},
 };
 use zakura_node_services::constants::{MAX_CHECKPOINT_BYTE_COUNT, MAX_CHECKPOINT_HEIGHT_GAP};
 
@@ -100,6 +100,136 @@ pub fn select_checkpoints(
     Ok(selected)
 }
 
+/// The range with the most bytes that [`check_checkpoint_ranges`] found.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LargestRange {
+    /// The checkpoint that ends the range.
+    pub end: Height,
+    /// The range's serialized bytes, its last block included.
+    pub bytes: u64,
+}
+
+/// Check that every range of `checkpoints` that ends at or below `tip`
+/// follows [`select_checkpoints`]' rule: at most `max_height_gap` heights,
+/// and under `max_byte_count` serialized bytes before its last block. `size`
+/// returns one block's serialized size. Returns the range with the most
+/// bytes, or `None` if no range ends at or below `tip`.
+///
+/// Block sync's `Consensus` reserve funds one range at admission's charge
+/// (`WORST_CHECKPOINT_RANGE_CHARGE_BYTES`), so it relies on each shipped range
+/// holding under `MAX_CHECKPOINT_BYTE_COUNT + MAX_BLOCK_BYTES` bytes.
+pub fn check_checkpoint_ranges(
+    checkpoints: &CheckpointList,
+    tip: Height,
+    max_height_gap: u32,
+    max_byte_count: u64,
+    mut size: impl FnMut(Height) -> Result<u32>,
+) -> Result<Option<LargestRange>> {
+    let mut largest: Option<LargestRange> = None;
+    let ends: Vec<Height> = checkpoints
+        .iter_cloned()
+        .map(|(height, _)| height)
+        .take_while(|height| *height <= tip)
+        .collect();
+    for (&start, &end) in ends.iter().zip(ends.iter().skip(1)) {
+        ensure!(
+            end.0 - start.0 <= max_height_gap,
+            "checkpoint range ({}, {}] spans more than {max_height_gap} heights",
+            start.0,
+            end.0
+        );
+        let mut before_last: u64 = 0;
+        for height in start.0 + 1..end.0 {
+            before_last = before_last
+                .checked_add(u64::from(size(Height(height))?))
+                .ok_or_else(|| eyre!("checkpoint range byte count overflowed"))?;
+        }
+        ensure!(
+            before_last < max_byte_count,
+            "checkpoint range ({}, {}] holds {before_last} bytes before its last block, \
+             at least the {max_byte_count}-byte limit",
+            start.0,
+            end.0
+        );
+        let bytes = before_last + u64::from(size(end)?);
+        if largest.is_none_or(|largest| bytes > largest.bytes) {
+            largest = Some(LargestRange { end, bytes });
+        }
+    }
+
+    Ok(largest)
+}
+
+/// Run `--check-checkpoint-ranges`: check every embedded checkpoint range of
+/// `network` against the block sizes in the state database at
+/// `state_cache_dir`. The database must reach the last embedded checkpoint
+/// and agree with every embedded hash.
+fn run_range_check(state_cache_dir: &Path, network: &Network) -> Result<()> {
+    let db = open_state(state_cache_dir, network)?;
+    let checkpoints = network.checkpoint_list();
+    let (tip_height, _) = db
+        .tip()
+        .ok_or_else(|| eyre!("state database has no finalized tip"))?;
+    let last = checkpoints.max_height();
+    ensure!(
+        tip_height >= last,
+        "state tip {} is below the last embedded checkpoint {}; sync further before checking",
+        tip_height.0,
+        last.0
+    );
+    for (height, hash) in checkpoints.iter_cloned() {
+        ensure!(
+            db.hash(height) == Some(hash),
+            "state database disagrees with the embedded checkpoint at {}",
+            height.0
+        );
+    }
+
+    let max_height_gap =
+        u32::try_from(MAX_CHECKPOINT_HEIGHT_GAP).expect("checkpoint height gap fits in u32");
+    let largest = check_checkpoint_ranges(
+        &checkpoints,
+        last,
+        max_height_gap,
+        MAX_CHECKPOINT_BYTE_COUNT,
+        |height| {
+            db.block_info(height.into())
+                .map(|info| info.size())
+                .ok_or_else(|| eyre!("missing retained BlockInfo at height {}", height.0))
+        },
+    )?;
+    let largest = largest.ok_or_else(|| eyre!("the embedded list holds only genesis"))?;
+    eprintln!(
+        "checked {} checkpoint ranges up to {}; the largest ends at {} with {} bytes, \
+         under the {} byte bound",
+        checkpoints.len() - 1,
+        last.0,
+        largest.end.0,
+        largest.bytes,
+        MAX_CHECKPOINT_BYTE_COUNT + MAX_BLOCK_BYTES
+    );
+
+    Ok(())
+}
+
+/// Open the state database at `state_cache_dir` for `network`, read-only.
+fn open_state(state_cache_dir: &Path, network: &Network) -> Result<zakura_state::ZakuraDb> {
+    let state_config = zakura_state::Config {
+        cache_dir: state_cache_dir.to_path_buf(),
+        delete_old_database: false,
+        // Read-only export must opt into pruned mode or the state resume guard
+        // correctly rejects a pruned publisher database as an archive
+        // configuration. Archive databases open fine under a pruned config.
+        storage_mode: zakura_state::StorageMode::Pruned(zakura_state::PruningConfig::default()),
+        ..zakura_state::Config::default()
+    };
+    let (_read_state, db, _non_finalized_sender) =
+        zakura_state::init_read_only(state_config, network)
+            .wrap_err_with(|| format!("opening the {network} state database read-only"))?;
+
+    Ok(db)
+}
+
 /// Verify that a retained header extends the preceding canonical block.
 fn validate_header_link(
     height: Height,
@@ -129,22 +259,20 @@ pub fn run_offline(args: &Args) -> Result<()> {
         .clone()
         .expect("offline mode is only entered with --state-cache-dir");
 
+    if let Some(network) = &args.check_checkpoint_ranges {
+        // Clap accepts only `mainnet` and `testnet`.
+        let network = match network.as_str() {
+            "mainnet" => Network::Mainnet,
+            _ => Network::new_default_testnet(),
+        };
+        return run_range_check(&state_cache_dir, &network);
+    }
+
     let network = Network::Mainnet;
     let embedded_max_height = network.checkpoint_list().max_height();
     let base_height = args.last_checkpoint.unwrap_or(embedded_max_height);
 
-    let state_config = zakura_state::Config {
-        cache_dir: state_cache_dir,
-        delete_old_database: false,
-        // Read-only export must opt into pruned mode or the state resume guard
-        // correctly rejects a pruned publisher database as an archive
-        // configuration. Archive databases open fine under a pruned config.
-        storage_mode: zakura_state::StorageMode::Pruned(zakura_state::PruningConfig::default()),
-        ..zakura_state::Config::default()
-    };
-    let (_read_state, db, _non_finalized_sender) =
-        zakura_state::init_read_only(state_config, &network)
-            .wrap_err("opening the Mainnet state database read-only")?;
+    let db = open_state(&state_cache_dir, &network)?;
 
     if let Some(checkpoint) = args.mainnet_frontier_grid_checkpoint {
         return backfill_frontier_grid(args, &db, &network, checkpoint);
@@ -518,6 +646,48 @@ mod tests {
                 size,
             })
             .collect()
+    }
+
+    /// A checkpoint list with genesis and `heights`.
+    fn list(heights: &[u32]) -> CheckpointList {
+        CheckpointList::from_list(
+            std::iter::once(0)
+                .chain(heights.iter().copied())
+                .map(|height| (Height(height), test_hash(height + 1))),
+        )
+        .expect("test heights are unique and start at genesis")
+    }
+
+    #[test]
+    fn range_check_follows_the_selection_rule() {
+        // Ranges the selector would emit pass, and the largest one is reported.
+        let sizes = |height: Height| Ok(if height.0 == 6 { 90 } else { 40 });
+        assert_eq!(
+            check_checkpoint_ranges(&list(&[3, 6]), Height(6), 4, 100, sizes)
+                .expect("the ranges follow the rule"),
+            Some(LargestRange {
+                end: Height(6),
+                bytes: 170
+            })
+        );
+        // Ranges above the tip are not read.
+        assert_eq!(
+            check_checkpoint_ranges(&list(&[3, 6]), Height(5), 4, 100, sizes)
+                .expect("only the first range is checked"),
+            Some(LargestRange {
+                end: Height(3),
+                bytes: 120
+            })
+        );
+
+        // A range that passes the byte limit before its last block fails.
+        let error = check_checkpoint_ranges(&list(&[4]), Height(4), 4, 100, sizes)
+            .expect_err("three 40-byte blocks reach the limit before the last");
+        assert!(error.to_string().contains("(0, 4]"), "{error}");
+        // So does a range wider than the gap.
+        let error = check_checkpoint_ranges(&list(&[5]), Height(5), 4, u64::MAX, sizes)
+            .expect_err("five heights pass a gap of four");
+        assert!(error.to_string().contains("more than 4 heights"), "{error}");
     }
 
     #[test]

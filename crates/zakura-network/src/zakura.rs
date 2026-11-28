@@ -29,6 +29,7 @@ mod ip;
 mod legacy_gossip;
 #[cfg(any(test, feature = "p2p-fuzz"))]
 pub(crate) mod machine_test;
+pub mod memory;
 mod node_envelope;
 mod peer_memory;
 mod regulation;
@@ -42,7 +43,7 @@ pub mod wire_codec;
 
 pub use block_sync::*;
 pub use bpv1::{
-    bpv1_custom_service, bpv1_service_id, Bpv1Handle, Bpv1Ports, Bpv1Service, ZakuraBpv1Config,
+    bpv1_service_id, Bpv1Handle, Bpv1Ports, Bpv1Service, Bpv1Startup, ZakuraBpv1Config,
     ZAKURA_CAP_BPV1,
 };
 pub use discovery::*;
@@ -61,13 +62,15 @@ pub use trace::{
     commit_state_trace, peer_label as zakura_trace_peer_label,
     reject_reason_label as zakura_trace_reject_reason_label, ZakuraTrace, ZakuraTraceEvent,
     BLOCK_SYNC_TABLE, COMMIT_STATE_TABLE, CONN_TABLE, HANDSHAKE_TABLE, HEADER_SYNC_TABLE,
-    LEGACY_REQUEST_TABLE, QUEUE_SEND_TABLE, QUIC_CONN_TABLE, RATELIMIT_TABLE, STREAM_TABLE,
+    LEGACY_REQUEST_TABLE, MEMORY_TABLE, QUEUE_SEND_TABLE, QUIC_CONN_TABLE, RATELIMIT_TABLE,
+    STREAM_TABLE,
 };
 pub use transport::*;
 #[cfg(zakura_sim)]
 pub use tx_relay::sim as tx_relay_sim;
 pub use tx_relay::{
-    tx_relay_service, tx_relay_service_id, MayCool, TxRelaySessions, ZakuraTxRelayConfig,
+    tx_relay_service, tx_relay_service_id, MayCool, TxRelaySessions, TxRelayStartup,
+    ZakuraTxRelayConfig,
 };
 
 #[cfg(any(test, feature = "zakura-testkit"))]
@@ -109,13 +112,19 @@ pub const DEFAULT_SERVICE_OUTBOUND_QUEUE_DEPTH: usize = 128;
 pub const DEFAULT_SERVICE_MAX_PENDING_ESCALATIONS: usize = 32;
 
 /// Per-service peer and queue limits owned by a Zakura service reactor.
+///
+/// `max_inbound_peers` and `max_outbound_peers` default to `None` (unset),
+/// meaning the node's connection cap `N_cap` (`DEFAULT_SERVICE_MAX_PEERS` = 256
+/// when `[network.zakura] max_connections` is also unset, `02 §8`).
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ServicePeerLimits {
-    /// Maximum inbound peers this service admits.
-    pub max_inbound_peers: usize,
-    /// Maximum outbound peers this service admits.
-    pub max_outbound_peers: usize,
+    /// Maximum inbound peers this service admits (`None` = node connection cap `N_cap`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_inbound_peers: Option<usize>,
+    /// Maximum outbound peers this service admits (`None` = node connection cap `N_cap`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_outbound_peers: Option<usize>,
     /// Inbound queue depth reserved for this service.
     ///
     /// Reserved for future transport queue wiring; not enforced in this phase.
@@ -133,12 +142,72 @@ pub struct ServicePeerLimits {
 impl Default for ServicePeerLimits {
     fn default() -> Self {
         Self {
-            max_inbound_peers: DEFAULT_SERVICE_MAX_PEERS,
-            max_outbound_peers: DEFAULT_SERVICE_MAX_PEERS,
+            max_inbound_peers: None,
+            max_outbound_peers: None,
             inbound_queue_depth: DEFAULT_SERVICE_INBOUND_QUEUE_DEPTH,
             outbound_queue_depth: DEFAULT_SERVICE_OUTBOUND_QUEUE_DEPTH,
             max_pending_escalations: DEFAULT_SERVICE_MAX_PENDING_ESCALATIONS,
         }
+    }
+}
+
+impl ServicePeerLimits {
+    /// Effective inbound peer cap when the node connection cap is `connection_cap`.
+    #[inline]
+    pub const fn effective_max_inbound_peers(&self, connection_cap: usize) -> usize {
+        match self.max_inbound_peers {
+            Some(limit) => limit,
+            None => connection_cap,
+        }
+    }
+
+    /// Effective outbound peer cap when the node connection cap is `connection_cap`.
+    #[inline]
+    pub const fn effective_max_outbound_peers(&self, connection_cap: usize) -> usize {
+        match self.max_outbound_peers {
+            Some(limit) => limit,
+            None => connection_cap,
+        }
+    }
+
+    /// Effective inbound peer cap using [`DEFAULT_SERVICE_MAX_PEERS`] when unset.
+    #[inline]
+    pub const fn max_inbound(&self) -> usize {
+        self.effective_max_inbound_peers(DEFAULT_SERVICE_MAX_PEERS)
+    }
+
+    /// Effective outbound peer cap using [`DEFAULT_SERVICE_MAX_PEERS`] when unset.
+    #[inline]
+    pub const fn max_outbound(&self) -> usize {
+        self.effective_max_outbound_peers(DEFAULT_SERVICE_MAX_PEERS)
+    }
+
+    /// Effective peer cap in `direction`, using [`DEFAULT_SERVICE_MAX_PEERS`]
+    /// when unset.
+    #[inline]
+    pub const fn max_for(&self, direction: ServicePeerDirection) -> usize {
+        match direction {
+            ServicePeerDirection::Inbound => self.max_inbound(),
+            ServicePeerDirection::Outbound => self.max_outbound(),
+        }
+    }
+
+    /// Whether the operator explicitly configured either inbound or outbound peer limits.
+    #[inline]
+    pub const fn has_explicit_peer_caps(&self) -> bool {
+        self.max_inbound_peers.is_some() || self.max_outbound_peers.is_some()
+    }
+
+    /// Resolve unset (`None`) peer caps to `connection_cap` (`02 §8`).
+    #[inline]
+    pub const fn resolved_for_connections(mut self, connection_cap: usize) -> Self {
+        if self.max_inbound_peers.is_none() {
+            self.max_inbound_peers = Some(connection_cap);
+        }
+        if self.max_outbound_peers.is_none() {
+            self.max_outbound_peers = Some(connection_cap);
+        }
+        self
     }
 }
 
@@ -193,8 +262,8 @@ impl ServicePeerSnapshot {
         Self {
             inbound_peers,
             outbound_peers,
-            inbound_slots_free: limits.max_inbound_peers.saturating_sub(inbound_peers),
-            outbound_slots_free: limits.max_outbound_peers.saturating_sub(outbound_peers),
+            inbound_slots_free: limits.max_inbound().saturating_sub(inbound_peers),
+            outbound_slots_free: limits.max_outbound().saturating_sub(outbound_peers),
         }
     }
 }

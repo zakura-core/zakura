@@ -4,30 +4,31 @@
 //! only joins their bounds, so a configuration that no owner can fund fails before
 //! the node binds a socket. It coordinates nothing at runtime. Zero limits never reach
 //! it: `QuicConfig::validate` refuses zero windows, `ZakuraLocalLimits::from_config`
-//! clamps connections and handshakes, handshake constants fund frames and streams, and
-//! `budgeted_max_connections_for_node` refuses a budget below one connection.
+//! clamps connections and handshakes, and handshake constants fund frames and streams.
+//! `MemoryPlan` checks the node's memory against `[memory] budget` before this.
 //!
 //! Every byte bound derives from the reactors' shares (`ReactorShares`): each admitted
 //! connection holds the handshake window, every reactor's receive share and the send
 //! window in QUIC, and each kind's raw and output gates hold that kind's shares of
 //! frames. Handshakes hold the handshake and send windows, and each bound socket its
-//! datagram queue. The peer memory budget is the ceiling on the QUIC part. An
-//! embedder's custom stream kinds take the `other` share, as on a live connection.
+//! datagram queue. An embedder's custom stream kinds take the `other` share, as on a
+//! live connection.
 //!
-//! A held raw frame's bytes sit both in its connection's receive window and in its
-//! kind's raw gate, so the retained bound counts them twice. The second count funds a
-//! payload buffer that the reader allocates before its bytes arrive. TCP decoders
-//! hold their incomplete messages under a connection limit of their own. Decoded
-//! blocks stay a separate allowance: a count across every holder, and a byte limit
-//! only on what the block pipeline still holds.
+//! A held raw frame carries a QUIC `CreditHold` (API-10), so its bytes sit
+//! inside `quic_bytes` and are counted once there rather than again in
+//! `transport_bytes`. TCP decoders hold their incomplete messages under a
+//! connection limit of their own. Decoded blocks stay a separate allowance: a
+//! count across every holder, and a byte limit only on what the block pipeline
+//! still holds.
 //!
 //! Block sync, header sync and discovery reserve a serving response's whole cap
 //! before producing it, and hold it until the last frame is written. Their frames
-//! are guarded, so they skip the transport output gate, and the retained bound adds
-//! the serving bound once. Each family's budget funds one session per connection
-//! that can serve at once, not per configured session slot. `tx-relay`, while it
-//! is registered, builds a served body before it waits for its output grant and
-//! keeps one guarded `Inv` unwritten, so the bound adds both for each connection.
+//! are guarded, so they skip `FrameGate.output`; `transport_bytes` counts only
+//! unguarded kinds, and `serve_output_bytes` counts the guarded serving families
+//! once. Each family's budget funds one session per connection that can serve at
+//! once, not per configured session slot. `tx-relay`, while it is registered,
+//! builds a served body before it waits for its output grant and keeps one
+//! guarded `Have` unwritten, so the bound adds both for each connection.
 
 use std::num::NonZeroU64;
 
@@ -55,18 +56,6 @@ pub(crate) enum NodeEnvelopeError {
     /// The block-sync limits cannot size the decoded block pool.
     #[error("the decoded block allowance is invalid: {0}")]
     DecodedAllowance(&'static str),
-    /// The connections' QUIC windows and the sockets' queues exceed the peer
-    /// memory budget.
-    #[error(
-        "the Zakura QUIC envelope of {quic_bytes} bytes exceeds \
-         [network.zakura] peer_memory_budget_bytes ({budget_bytes} bytes)"
-    )]
-    PeerMemoryBudget {
-        /// The connections' QUIC windows and the sockets' queues.
-        quic_bytes: u128,
-        /// The configured budget.
-        budget_bytes: u64,
-    },
 }
 
 /// The bounds of every owner family on one node.
@@ -119,10 +108,11 @@ impl NodeEnvelope {
         })
     }
 
-    /// The envelope of a node with this configuration that also serves
-    /// `custom_kinds`, or an error if the peer memory budget can't fund its
-    /// connections.
-    pub(crate) fn for_node(
+    /// The envelope of a node with this configuration and `limits` that also
+    /// serves `custom_kinds`. [`MemoryPlan`](crate::zakura::memory::MemoryPlan)
+    /// already enforced the node memory ledger (`02 §8`), so this checks only
+    /// the owner bound and the decoded-block allowance.
+    pub(crate) fn for_memory_plan(
         config: &Config,
         limits: &ZakuraLocalLimits,
         custom_kinds: &[u16],
@@ -134,13 +124,6 @@ impl NodeEnvelope {
             limits.total_connections(),
             custom_kinds,
         );
-        let budget_bytes = config.zakura.peer_memory_budget_bytes;
-        if quic_bytes > u128::from(budget_bytes) {
-            return Err(NodeEnvelopeError::PeerMemoryBudget {
-                quic_bytes,
-                budget_bytes,
-            });
-        }
         Self::new(
             limits.transport_limits_for_kinds(
                 limits
@@ -220,7 +203,7 @@ fn bpv1_held_output_bytes(config: &Config, limits: &ZakuraLocalLimits) -> u128 {
     if !config.zakura.bpv1.enabled {
         return 0;
     }
-    u128::try_from(limits.max_connections)
+    u128::try_from(limits.total_connections())
         .unwrap_or(u128::MAX)
         .saturating_mul(u128::from(
             crate::zakura::bpv1::BPV1_SESSION_HELD_OUTPUT_BYTES,

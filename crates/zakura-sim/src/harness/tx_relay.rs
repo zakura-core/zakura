@@ -36,6 +36,7 @@ use zakura_chain::{
 };
 use zakura_network::{
     zakura::{
+        memory::MemoryPlan,
         tx_relay_sim::{tx_relay_service_observed, TxRelayObserver, HAVE_RATE, TX_RELAY_STREAMS},
         CloseRow, MayCool, Service, ZakuraLocalLimits,
     },
@@ -441,6 +442,17 @@ fn spawn(sim: &mut Sim, scenario: &RelayScenario, evidence: SharedRelay) -> TxRe
     let pool_handle = handle.clone();
     let may_cool: MayCool = Arc::new(|_| true);
     let relay_config = config.zakura.tx_relay.clone();
+    // The node's memory pool, sized as the endpoint sizes it, funds each
+    // fetch.
+    let memory_pool = MemoryPlan::size_for_node(
+        config.zakura.memory_budget.p2p_budget_b(),
+        &config,
+        &config.network,
+        None,
+        &[],
+    )
+    .expect("the relay node's memory plan fits its budget")
+    .build_pool();
     WireEndpoint::spawn_configured(
         sim,
         config,
@@ -451,7 +463,8 @@ fn spawn(sim: &mut Sim, scenario: &RelayScenario, evidence: SharedRelay) -> TxRe
         observer,
         Some(dials),
         move |_, _| {
-            let custom = tx_relay_service_observed(pool_handle, may_cool, &relay_config, relay);
+            let custom =
+                tx_relay_service_observed(pool_handle, memory_pool, may_cool, &relay_config, relay);
             let service: Arc<dyn Service> = custom.service;
             (vec![service], ())
         },

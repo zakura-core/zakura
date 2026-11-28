@@ -606,8 +606,8 @@ fn ownership_probe_counts_last_owners_and_setup_transfers() {
     const INBOUND: ServicePeerDirection = ServicePeerDirection::Inbound;
     const OUTBOUND: ServicePeerDirection = ServicePeerDirection::Outbound;
     let capacity = SessionCapacityHandle::new(&ServicePeerLimits {
-        max_inbound_peers: 2,
-        max_outbound_peers: 1,
+        max_inbound_peers: Some(2),
+        max_outbound_peers: Some(1),
         max_pending_escalations: 2,
         ..ServicePeerLimits::default()
     });

@@ -192,6 +192,11 @@ impl Subsystem for Wire {
             vec![NODE_ADDR]
         };
         let mut config = super::wire_node::config(&network);
+        // The inbound-pressure draw opens at most 95 dialing peers, sized for a
+        // 92-connection cap. An unset cap falls back to 256, where those peers
+        // never reach the inbound share.
+        config.zakura.max_connections =
+            Some(zakura_network::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS);
         if let Some(limit) = scenario.quic_pending_per_ip {
             config.zakura.quic.max_pending_per_ip = Some(limit);
         }
@@ -782,8 +787,8 @@ impl SessionLayouts {
         Self {
             capacity: zakura_network::zakura::testkit::regulation::SessionCapacityHandle::new(
                 &zakura_network::zakura::ServicePeerLimits {
-                    max_inbound_peers: 4,
-                    max_outbound_peers: 1,
+                    max_inbound_peers: Some(4),
+                    max_outbound_peers: Some(1),
                     max_pending_escalations: 2,
                     ..Default::default()
                 },

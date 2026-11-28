@@ -40,11 +40,13 @@ use serde::{Deserialize, Serialize};
 use zakura_chain::block;
 use zakura_header_chain::{BodyWorkAuthority, Frontier};
 use zakura_network::zakura::{
-    block_sync_serving_limit, framed_channel, CloseCauseReader, FramedRecv, FramedSend, Peer,
-    Service, ServicePeerDirection, SessionOrigin, StreamReader, ZakuraBlockSyncConfig,
-    ZakuraPeerId, ZakuraSupervisorHandle, ZAKURA_CAP_BLOCK_SYNC_REGULATED, ZAKURA_CAP_HEADER_SYNC,
-    ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
-    ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_HEADER_SYNC,
+    block_sync_serving_limit, framed_channel,
+    memory::{Consumer, MemoryPlan, MemoryPool},
+    BlockSyncMemory, CloseCauseReader, FramedRecv, FramedSend, Peer, Service, ServicePeerDirection,
+    SessionOrigin, ZakuraBlockSyncConfig, ZakuraPeerId, ZakuraSupervisorHandle,
+    ZAKURA_CAP_BLOCK_SYNC_REGULATED, ZAKURA_CAP_HEADER_SYNC, ZAKURA_HEADER_SYNC_STREAM_VERSION,
+    ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION, ZAKURA_STREAM_BLOCK_SYNC,
+    ZAKURA_STREAM_HEADER_SYNC,
 };
 use zakura_node_services::header_chain::{ApplyHeaderTargetOutcome, Port};
 use zakura_rt::sync::{mpsc, CancellationToken};
@@ -82,26 +84,47 @@ use super::{
     },
     header_sync::Dialer,
     policy::LinkEffect,
+    pool_tap::PoolTap,
     ScenarioFamily, Subsystem,
 };
 use crate::{
     domain::{
-        block_sync::{
-            resource_properties, Limits, OwnerModel, OwnerView,
-            TEARDOWN_RETURNS_BASELINE as BLOCK_TEARDOWN_RETURNS_BASELINE,
-        },
+        block_sync::{resource_properties, Limits, OwnerModel, OwnerView},
         block_sync_semantic::{
             semantic_properties, SemanticModel, SemanticView, CAPACITY_RELEASE_WAKES,
             FRONTIER_WORK_CONSISTENT, QUERY_WORK_AUTHORIZED,
         },
         connection::{WireState, WireView},
         cross::{self, CrossModel, CrossView, Dag, ViewSample},
-        header_sync::TeardownView,
+        header_sync::{
+            teardown_end_violations as header_teardown_end_violations,
+            teardown_returns_baseline as header_teardown_returns_baseline, TeardownView,
+            TEARDOWN_RETURNS_BASELINE as HEADER_TEARDOWN_RETURNS_BASELINE,
+        },
+        memory_pool::{self, PoolGaugeModel, PoolView},
     },
     property::{Capture, HasView, Property, PropertyId, Sources},
     witness::Expect,
     ActionSource, Boundary, Identity, ObservationLog, RunConfig, Sim,
 };
+
+/// Default logical P2P budget `B` (16 GiB) used by simulator harnesses unless
+/// a scenario sets an explicit `memory_budget_bytes`.
+pub const DEFAULT_SIM_MEMORY_BUDGET_B: u64 = 16 * 1024 * 1024 * 1024;
+
+/// Which reactors a mirror registers on `sync/wire` (`None` defaults to
+/// [`MirrorServices::All`]). Used by `mem-13` witnesses to connect peers that
+/// support different reactor sets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MirrorServices {
+    /// Discovery only (`t`).
+    DiscoveryOnly,
+    /// Discovery and header sync (`t + b_header_sync`).
+    HeaderSync,
+    /// Discovery, header sync and block sync (`t + b_header_sync + b_block_sync`).
+    All,
+}
 
 /// A mirror: header sync and block sync on one engine that holds the whole
 /// fixture chain. It's named `mirror-<i>` by its index in
@@ -111,6 +134,9 @@ use crate::{
 pub struct SyncMirror {
     /// Which end of its link to the node dials.
     pub dialer: Dialer,
+    /// Which reactors this mirror registers on QUIC (`None` registers all three).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub services: Option<MirrorServices>,
 }
 
 /// A change the harness makes.
@@ -226,6 +252,7 @@ impl Default for SyncScenario {
             body_bytes: 2_000,
             mirrors: vec![SyncMirror {
                 dialer: Dialer::Mirror,
+                services: None,
             }],
             header_policy: header_node::Policy::converging(),
             block_policy: block_node::Policy::converging(),
@@ -468,7 +495,11 @@ impl SyncTopology {
         id: u64,
         sender: usize,
         receiver: usize,
-    ) -> (FramedSend, FramedRecv, Option<StreamReader>) {
+    ) -> (
+        FramedSend,
+        FramedRecv,
+        Option<zakura_network::zakura::StreamReader>,
+    ) {
         let way = if receiver == 0 {
             Way::ToNode
         } else {
@@ -898,6 +929,8 @@ pub struct SyncStorage {
     /// The actors and links. They live until the run ends, so no reactor
     /// sees its inputs close unless a `Teardown` step stops the node.
     _topology: Rc<SyncTopology>,
+    /// Keeps the node's memory pool (and its observer) alive across teardown.
+    _memory_pool: MemoryPool,
 }
 
 /// What [`SyncStorage`]'s checks read between steps.
@@ -955,6 +988,12 @@ impl OwnerView for SyncView {
     }
 }
 
+impl PoolView for SyncView {
+    fn read_pool<T>(&self, read: impl FnOnce(&PoolGaugeModel) -> T) -> T {
+        read(&self.block.borrow().pool.borrow())
+    }
+}
+
 impl CrossView for SyncView {
     fn cross(&self) -> Rc<RefCell<CrossModel>> {
         self.cross.clone()
@@ -977,9 +1016,9 @@ impl HasView for SyncStorage {
         self.view.rounds().end(end);
     }
 
-    /// [`cross::teardown_end_violations`].
+    /// [`header_teardown_end_violations`].
     fn end_violations(&self, _: &crate::ObservationLog) -> Vec<crate::property::EndViolation> {
-        cross::teardown_end_violations(self.view.rounds())
+        header_teardown_end_violations(self.view.rounds())
     }
 
     /// The node's block-sync view and the cross model, shared rather than
@@ -1097,9 +1136,11 @@ impl Subsystem for SyncStorage {
     /// Spawns the node's actors ([`spawn_actors`]), links each mirror to
     /// the node once, and adds the `Control` source.
     fn build(sim: &mut Sim, scenario: &SyncScenario, ports: SyncPorts) -> Self {
-        let (actors, predicates) = spawn_actors(sim, scenario, &ports);
+        let (actors, predicates, pool_tap) = spawn_actors(sim, scenario, &ports);
+        sim.add_source(Box::new(pool_tap));
         let view = actors.view.clone();
         let header = actors.header.clone();
+        let memory_pool = actors.memory_pool.clone();
         let topology = Rc::new(SyncTopology::new(
             actors,
             scenario,
@@ -1123,6 +1164,7 @@ impl Subsystem for SyncStorage {
             },
             replies: ports.replies,
             _topology: topology,
+            _memory_pool: memory_pool,
         }
     }
 
@@ -1180,17 +1222,39 @@ pub(crate) struct Actors {
     block_tap: TapTeardown,
     /// Which block-sync routine runs on which task, as the node's tap sees.
     pub(crate) routines: TapRoutines,
+    /// Startup memory plan sized for the node under test.
+    pub(crate) memory_plan: MemoryPlan,
+    /// Live node-wide memory pool shared by the node's block sync and (on wire)
+    /// transport handler, as zakurad builds it.
+    pub(crate) memory_pool: MemoryPool,
 }
 
 /// Spawns the node's two services on its storages, each under its policy
 /// and tapped, and the engine watch, then each mirror's services. Returns
-/// the actors and the block policy's predicates, which control steps wait
-/// on.
+/// the actors, the block policy's predicates, and the node's [`PoolTap`]
+/// (which the caller adds after any transport tap).
 pub(crate) fn spawn_actors(
     sim: &mut Sim,
     scenario: &SyncScenario,
     ports: &SyncPorts,
-) -> (Actors, Rc<RefCell<Predicates>>) {
+) -> (Actors, Rc<RefCell<Predicates>>, PoolTap) {
+    let net_config = zakura_network::Config {
+        network: ports.fixture.headers().network().clone(),
+        ..zakura_network::Config::default()
+    };
+    spawn_actors_with_memory(sim, scenario, ports, &net_config, None)
+}
+
+/// [`spawn_actors`] sized against `node_net_config` and an optional P2P memory
+/// budget `memory_budget_bytes` (`None` defaults to
+/// [`DEFAULT_SIM_MEMORY_BUDGET_B`]).
+pub(crate) fn spawn_actors_with_memory(
+    sim: &mut Sim,
+    scenario: &SyncScenario,
+    ports: &SyncPorts,
+    node_net_config: &zakura_network::Config,
+    memory_budget_bytes: Option<u64>,
+) -> (Actors, Rc<RefCell<Predicates>>, PoolTap) {
     let anchor = ports.fixture.anchor();
     // The header side.
     let header_storage = header_node::PolicySource::new(
@@ -1224,7 +1288,7 @@ pub(crate) fn spawn_actors(
         scenario.block_policy.clone(),
         ports.effects.clone(),
     );
-    let config = ZakuraBlockSyncConfig::default();
+    let config = node_net_config.zakura.block_sync.clone();
     let largest_body = ports
         .chain
         .iter()
@@ -1232,8 +1296,7 @@ pub(crate) fn spawn_actors(
         .chain([scenario.body_bytes])
         .max()
         .map_or(0, u64::from);
-    let workers = sync_config(scenario).scheduler.workers;
-    let limits = Limits::of(&config, workers, largest_body);
+    let limits = Limits::of(&config, largest_body);
     assert_eq!(
         limits.per_request, 1,
         "block-sync properties are checked only at one body per request"
@@ -1241,6 +1304,24 @@ pub(crate) fn spawn_actors(
     ports.view.borrow_mut().owners = OwnerModel::new(limits, 0);
     let view = ports.view.clone();
     view.borrow().semantic.borrow_mut().set_limit(&config);
+    let budget_b = memory_budget_bytes.unwrap_or(DEFAULT_SIM_MEMORY_BUDGET_B);
+    let memory_plan = MemoryPlan::size_for_node(
+        budget_b,
+        node_net_config,
+        &node_net_config.network,
+        None,
+        &[],
+    )
+    .expect("sync harness memory plan fits");
+    *view.borrow().pool.borrow_mut() = PoolGaugeModel::new(
+        memory_plan.pool_config.consumers[Consumer::Sessions.index()].floor,
+        memory_plan.shortfall.is_none(),
+    );
+    let (pool_observer, pool_tap) =
+        PoolTap::new(sim, "node", view.borrow().pool.clone(), Some(view.clone()));
+    let memory_pool = memory_plan.build_pool().with_observer(Some(pool_observer));
+    let pool_tap = pool_tap
+        .with_draining_block_receive_bytes(memory_pool.draining_block_receive_bytes_atomic());
     let (block_observer, mut block_tap) = BlockTap::new(sim, &ports.service, "node", view.clone());
     let wire = Wire::new(block_sync_serving_limit(&config));
     block_tap.label_with(wire.clone());
@@ -1271,6 +1352,7 @@ pub(crate) fn spawn_actors(
         .borrow_mut()
         .authority
         .startup(BodyWorkAuthority::for_view(&ports.engine.view()).into());
+    let block_memory = BlockSyncMemory::new(memory_pool.clone(), None);
     let node = SyncNode {
         name: "node".to_owned(),
         header: HeaderNode::spawn(
@@ -1283,7 +1365,7 @@ pub(crate) fn spawn_actors(
             dispatch.clone(),
             Some(header_observer),
         ),
-        block: BlockNode::spawn(
+        block: BlockNode::spawn_with_memory(
             sim,
             "node",
             1,
@@ -1294,6 +1376,7 @@ pub(crate) fn spawn_actors(
             },
             config,
             Some(block_observer),
+            Some(block_memory),
         ),
     };
     sessions.watch(
@@ -1341,24 +1424,29 @@ pub(crate) fn spawn_actors(
             header_tap: header_shutdown,
             block_tap: block_teardown,
             routines,
+            memory_plan,
+            memory_pool,
         },
         predicates,
+        pool_tap,
     )
 }
 
 /// Block storage's operation ID properties, block sync's stream-6
-/// generated, resource and semantic properties, then the cross properties,
-/// for a harness whose view is a [`SyncView`]. It registers no header ID:
-/// header IDs run on the header harnesses, which header acceptance lists
-/// (`HEADER_HARNESSES`), and header storage's operation IDs are checked
-/// there.
+/// generated, resource and semantic properties, the pool gauge properties,
+/// header sync's fixed-term teardown check, then the cross properties,
+/// for a harness whose view is a [`SyncView`].
 pub(crate) fn sync_properties<S: HasView<View = SyncView>>() -> Vec<Property<S>> {
     let mut properties = block_storage_properties();
     properties.extend(table_wiring_properties());
     properties.extend(resource_properties());
+    properties.push(memory_pool::pool_bounded());
+    properties.push(memory_pool::tip_never_waits());
+    properties.push(memory_pool::consensus_once_per_height());
+    properties.push(memory_pool::teardown_returns_zero());
+    properties.push(header_teardown_returns_baseline());
     properties.extend(semantic_properties());
     properties.extend(cross::storage_properties());
-    properties.extend(cross::teardown_properties());
     properties
 }
 
@@ -1515,10 +1603,10 @@ impl SavedSync {
             ],
             SavedSync::RetiredQuery => &[(QUERY_WORK_AUTHORIZED, Expect::Holds)],
             SavedSync::TeardownQuery | SavedSync::TeardownSubmission => &[
-                (BLOCK_TEARDOWN_RETURNS_BASELINE, Expect::Holds),
-                (cross::TEARDOWN_RETURNS_BASELINE, Expect::Holds),
+                (memory_pool::TEARDOWN_RETURNS_ZERO, Expect::Holds),
+                (HEADER_TEARDOWN_RETURNS_BASELINE, Expect::Holds),
             ],
-            SavedSync::TeardownHeaders => &[(cross::TEARDOWN_RETURNS_BASELINE, Expect::Holds)],
+            SavedSync::TeardownHeaders => &[(HEADER_TEARDOWN_RETURNS_BASELINE, Expect::Holds)],
         }
     }
 
@@ -1535,9 +1623,11 @@ impl SavedSync {
             mirrors: vec![
                 SyncMirror {
                     dialer: Dialer::Mirror,
+                    services: None,
                 },
                 SyncMirror {
                     dialer: Dialer::Node,
+                    services: None,
                 },
             ],
             ..SyncScenario::default()

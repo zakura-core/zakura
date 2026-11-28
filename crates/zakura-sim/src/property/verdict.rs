@@ -200,9 +200,9 @@ pub enum Pending {
     /// `header-sync/teardown-returns-baseline`: a released round is
     /// unsettled, or the node's stop has begun and it hasn't settled.
     TeardownOpen,
-    /// `block-sync/teardown-returns-baseline`: every peer left, but a
-    /// routine, queued body or serving lease is still open, or the
-    /// scheduler isn't at rest.
+    /// `memory/teardown-returns-zero`: every peer left, but a routine,
+    /// queued body or serving lease is still open, or the scheduler isn't
+    /// at rest.
     BlockTeardownOpen,
     /// A watch property: a published state still waits for its read or its
     /// third event.

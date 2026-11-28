@@ -28,6 +28,7 @@ pub mod header_sync;
 pub mod header_work;
 pub mod machine;
 pub mod policy;
+pub mod pool_tap;
 mod record;
 pub mod scenario;
 pub mod sync;

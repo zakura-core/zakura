@@ -200,9 +200,11 @@ impl BlockScenario {
     /// 410 blocks, so the node fills its 401-submission window, which
     /// storage holds for 200 s. The 401st submission resets every actor to
     /// a fork from height 1, which detaches the whole window, so the fork's
-    /// bodies wait for room. Mirror reads wait out the first 50 ms. The mirror's
-    /// link closes after its 455th read, relinks, and closes again after its
-    /// 470th. Once it has closed twice and 100 s have
+    /// bodies wait for room. Mirror reads wait out the first 50 ms. The
+    /// fork's answer can end the mirror's block-sync session within a few
+    /// reads of the reset, so the harness relinks the mirror once that
+    /// session ends. Its link then closes after its 455th read, relinks, and
+    /// closes again after its 470th. Once it has closed twice and 100 s have
     /// passed, storage commits the first submission, height 1, which the
     /// fork shares. That frees room beside the waiting fork body at height
     /// 2. Storage fails the 21st admission as retryable, and its verdict
@@ -218,8 +220,10 @@ impl BlockScenario {
     /// steps: a PCT schedule can keep the node syncing past step 600,000, and
     /// the 60,000-step drain can't finish that work (#2641). The closes count
     /// mirror reads, and the fork's bodies wait for room, so a schedule can
-    /// also stop the reads short of the second close. The node then idles
-    /// until the budget, and the run checks nothing about the release.
+    /// also stop the reads short of the second close. A schedule whose
+    /// fork answer leaves the session open stops at the first relink. The
+    /// node then idles until the budget, and the run checks nothing about
+    /// the release.
     pub fn capacity_release() -> Self {
         let mirror = "mirror-0";
         let reads = |count: u32| {
@@ -271,6 +275,7 @@ impl BlockScenario {
                     },
                     when: Some(Trigger::Submitted(Select::nth(BlockKind::Admit, 401))),
                 },
+                relink(mirror),
                 ControlStep {
                     action: ControlAction::Close {
                         peer: mirror.to_owned(),

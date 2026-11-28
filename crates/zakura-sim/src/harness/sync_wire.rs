@@ -33,8 +33,9 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use zakura_network::zakura::{
-    testkit::discovery::build_discovery_handle, DiscoveryService, HeaderSyncService, Service,
-    TransportEvent, TransportObserver, ZakuraHandshakeConfig, ZakuraPeerId, ZakuraServiceId,
+    memory::MemoryPool, testkit::discovery::build_discovery_handle, DiscoveryService,
+    HeaderSyncService, Service, TransportEvent, TransportObserver, ZakuraHandshakeConfig,
+    ZakuraPeerId, ZakuraServiceId,
 };
 use zakura_quic::{sim::SeededInputs, NodeAddr};
 use zakura_rt::sync::watch;
@@ -51,9 +52,9 @@ use super::{
     header_sync::Dialer,
     policy::LinkEffect,
     sync::{
-        spawn_actors, sync_config, sync_properties, Control, QuicLinks, SavedSync, SyncAction,
-        SyncMirror, SyncPorts, SyncScenario, SyncStep, SyncStorage, SyncTopology, SyncView,
-        Transport,
+        spawn_actors_with_memory, sync_config, sync_properties, Control, MirrorServices, QuicLinks,
+        SavedSync, SyncAction, SyncMirror, SyncPorts, SyncScenario, SyncStep, SyncStorage,
+        SyncTopology, SyncView, Transport,
     },
     wire_node::config as wire_config_for,
     wire_node::{Bound, TransportTap, WireEndpoint},
@@ -61,11 +62,11 @@ use super::{
 };
 use crate::{
     domain::{
-        block_sync::TEARDOWN_RETURNS_BASELINE as BLOCK_TEARDOWN_RETURNS_BASELINE,
         connection::{self, WireBounds, WireState},
-        cross,
-        header_sync::TeardownView as _,
-        session,
+        header_sync::{
+            teardown_end_violations as header_teardown_end_violations, TeardownView as _,
+        },
+        memory_pool, session,
     },
     observe::TransportFact,
     peer::{key_index, peer_addr, peer_id, peer_of, NODE_ADDR},
@@ -102,6 +103,10 @@ pub struct SyncWireScenario {
     /// Holds the block-sync routine that a `Control` close supersedes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub superseded_hold: Option<SupersededHold>,
+    /// Optional logical P2P memory budget `B` in bytes for the node's memory
+    /// pool (`None` uses the simulator default of 16 GiB).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_budget_bytes: Option<u64>,
 }
 
 /// The QUIC windows a sim-9.3 scenario sets. The node's reactor shares,
@@ -215,6 +220,8 @@ pub struct SyncWire {
     _topology: Rc<SyncTopology>,
     /// Every endpoint, the node's first.
     _endpoints: Vec<WireEndpoint>,
+    /// Keeps the node's memory pool (and its observer) alive across teardown.
+    _memory_pool: MemoryPool,
 }
 
 impl HasView for SyncWire {
@@ -229,9 +236,9 @@ impl HasView for SyncWire {
         self.view.rounds().end(end);
     }
 
-    /// [`cross::teardown_end_violations`].
+    /// [`header_teardown_end_violations`].
     fn end_violations(&self, _: &crate::ObservationLog) -> Vec<crate::property::EndViolation> {
-        cross::teardown_end_violations(self.view.rounds())
+        header_teardown_end_violations(self.view.rounds())
     }
 
     /// The node's block-sync view and the cross model, shared rather than
@@ -337,7 +344,7 @@ fn configs(
 ) -> (zakura_network::Config, zakura_network::Config) {
     let (mut node, mut mirror) = (wire_config_for(network), wire_config_for(network));
     if let Some(windows) = windows {
-        node.zakura.quic.receive_window_bytes = windows.node_receive_window_bytes;
+        node.zakura.quic.receive_window_bytes = Some(windows.node_receive_window_bytes);
         mirror.zakura.quic.send_window_bytes = windows.mirror_send_window_bytes;
     }
     (node, mirror)
@@ -365,6 +372,7 @@ pub fn wire_config(scenario: &SyncWireScenario) -> RunConfig {
 struct Services {
     header: Arc<dyn Service>,
     block: Arc<dyn Service>,
+    reactors: MirrorServices,
     key: u32,
     addr: std::net::SocketAddr,
 }
@@ -383,23 +391,36 @@ impl Services {
         Vec<Arc<dyn Service>>,
         zakura_network::zakura::ZakuraDiscoveryHandle,
     ) {
+        let advertised = match self.reactors {
+            MirrorServices::DiscoveryOnly => vec![ZakuraServiceId::discovery()],
+            MirrorServices::HeaderSync | MirrorServices::All => {
+                vec![ZakuraServiceId::discovery(), ZakuraServiceId::header_sync()]
+            }
+        };
         let discovery = build_discovery_handle(
             SeededInputs::node_key(seed, self.key),
             vec![self.addr],
-            vec![ZakuraServiceId::discovery(), ZakuraServiceId::header_sync()],
+            advertised,
             handshake,
             limits.max_connections,
             0,
             supervisor.subscribe(),
         )
         .expect("production's config on the fixture network is valid");
-        // Header sync's and block sync's sessions keep a connection open
-        // past discovery's exchange, as zakurad's registry wires them.
+        let (owners, mut registered) = match self.reactors {
+            MirrorServices::DiscoveryOnly => (Vec::new(), Vec::new()),
+            MirrorServices::HeaderSync => (vec![self.header.clone()], vec![self.header]),
+            MirrorServices::All => (
+                vec![self.header.clone(), self.block.clone()],
+                vec![self.header, self.block],
+            ),
+        };
         let service: Arc<dyn Service> = Arc::new(
             DiscoveryService::with_max_connections(discovery.clone(), limits.max_connections)
-                .with_connection_owners(vec![self.header.clone(), self.block.clone()]),
+                .with_connection_owners(owners),
         );
-        (vec![self.header, self.block, service], discovery)
+        registered.push(service);
+        (registered, discovery)
     }
 }
 
@@ -472,9 +493,19 @@ impl Subsystem for SyncWire {
     fn build(sim: &mut Sim, scenario: &SyncWireScenario, ports: SyncPorts) -> Self {
         let net = scenario.net.net();
         sim.add_source(Box::new(net.clone()));
-        let (actors, predicates) = spawn_actors(sim, &scenario.sync, &ports);
+        let network = ports.fixture.headers().network().clone();
+        let (node_config, mirror_config) = configs(&network, scenario.windows);
+        let (actors, predicates, pool_tap) = spawn_actors_with_memory(
+            sim,
+            &scenario.sync,
+            &ports,
+            &node_config,
+            scenario.memory_budget_bytes,
+        );
         let view = actors.view.clone();
         let header = actors.header.clone();
+        let memory_plan = actors.memory_plan.clone();
+        let memory_pool = actors.memory_pool.clone();
         let names: Vec<String> = (0..scenario.sync.mirrors.len())
             .map(|index| format!("mirror-{index}"))
             .collect();
@@ -484,6 +515,7 @@ impl Subsystem for SyncWire {
         };
         let dials = tap.dials();
         sim.add_source(Box::new(tap));
+        sim.add_source(Box::new(pool_tap));
         sim.add_source(Box::new(RegisteredLinks {
             predicates: predicates.clone(),
             names: names.clone(),
@@ -497,11 +529,9 @@ impl Subsystem for SyncWire {
                 mirror_observers.push(observer);
             }
         }
-        let network = ports.fixture.headers().network().clone();
-        let (node_config, mirror_config) = configs(&network, scenario.windows);
         let wire = scenario.windows.map(|_| {
             Rc::new(WireState::new(WireBounds {
-                node: zakura_network::zakura::ZakuraLocalLimits::from_config(&node_config),
+                node: memory_plan.local_limits(&node_config),
                 peer_send_window: mirror_config.zakura.quic.send_window_bytes,
             }))
         });
@@ -532,28 +562,39 @@ impl Subsystem for SyncWire {
             let peer = index.checked_sub(1);
             let (key, addr) =
                 peer.map_or((0, NODE_ADDR), |peer| (key_index(peer), peer_addr(peer, 0)));
+            let reactors = peer
+                .and_then(|peer| scenario.sync.mirrors[peer].services)
+                .unwrap_or(MirrorServices::All);
             let services = Services {
                 header: Arc::new(HeaderSyncService::new(node.header.handle.clone())),
                 block: node
                     .block
                     .wire_service()
                     .expect("a node just spawned holds its service"),
+                reactors,
                 key,
                 addr,
             };
             let slot = (index == 0).then(|| quic.supervisor.clone());
-            let (observer, dials, config): (Arc<dyn TransportObserver>, _, _) = match peer {
-                None => (observer.clone(), Some(dials.clone()), node_config.clone()),
-                Some(peer) => (
-                    mirror_observers
-                        .get(peer)
-                        .cloned()
-                        .unwrap_or_else(|| Arc::new(Unobserved)),
-                    None,
-                    mirror_config.clone(),
-                ),
-            };
-            endpoints.push(WireEndpoint::spawn_configured(
+            let (observer, dials, config, memory): (Arc<dyn TransportObserver>, _, _, _) =
+                match peer {
+                    None => (
+                        observer.clone(),
+                        Some(dials.clone()),
+                        node_config.clone(),
+                        Some((memory_plan.clone(), memory_pool.clone())),
+                    ),
+                    Some(peer) => (
+                        mirror_observers
+                            .get(peer)
+                            .cloned()
+                            .unwrap_or_else(|| Arc::new(Unobserved)),
+                        None,
+                        mirror_config.clone(),
+                        None,
+                    ),
+                };
+            endpoints.push(WireEndpoint::spawn_with_memory(
                 sim,
                 config,
                 net.sim(),
@@ -562,6 +603,7 @@ impl Subsystem for SyncWire {
                 None,
                 observer,
                 dials,
+                memory,
                 move |supervisor, limits| {
                     if let Some(slot) = slot {
                         *slot.lock().unwrap_or_else(PoisonError::into_inner) =
@@ -608,6 +650,7 @@ impl Subsystem for SyncWire {
             replies: ports.replies,
             _topology: topology,
             _endpoints: endpoints,
+            _memory_pool: memory_pool,
         }
     }
 
@@ -829,9 +872,11 @@ impl SavedWire {
             mirrors: vec![
                 SyncMirror {
                     dialer: Dialer::Mirror,
+                    services: None,
                 },
                 SyncMirror {
                     dialer: Dialer::Node,
+                    services: None,
                 },
             ],
             ..SyncScenario::default()
@@ -875,6 +920,7 @@ impl SavedWire {
             SavedWire::ReplaceClaims => SyncScenario {
                 mirrors: vec![SyncMirror {
                     dialer: Dialer::Node,
+                    services: None,
                 }],
                 control: vec![
                     SyncStep {
@@ -898,9 +944,12 @@ impl SavedWire {
                     ..block_policy::Select::default()
                 };
                 let mut block_policy = sync.block_policy.clone();
+                // Hold each read for 7.6 s (> STALL_MS = 5 s, < 8 s request timeout)
+                // so the two stalled waves span discovery's 15 s periodic refresh
+                // regardless of initial handshake ordering.
                 block_policy.holds.push(block_policy::Hold {
                     select: read.clone(),
-                    until: Trigger::VirtualTime(STALL_MS),
+                    until: Trigger::VirtualTime(7_600),
                     then: vec![block_policy::BlockAllow::Serve],
                     deadline_ms: None,
                 });
@@ -926,6 +975,7 @@ impl SavedWire {
             sync,
             windows,
             superseded_hold,
+            memory_budget_bytes: None,
         }
     }
 }
@@ -1027,6 +1077,7 @@ pub fn combined(prefix: &[u8]) -> SyncWireScenario {
         sync,
         windows: None,
         superseded_hold: None,
+        memory_budget_bytes: None,
     }
 }
 
@@ -1034,17 +1085,18 @@ pub fn combined(prefix: &[u8]) -> SyncWireScenario {
 /// properties the shared connection reaches, then the connection properties
 /// a run with sampling taps reaches. A property that reads frames or closes,
 /// which the wire tier excludes ([`SyncWire::sources`]), runs on
-/// `block-sync/storage` and `sync/storage` instead, and so does block
-/// sync's teardown rule, since the wire tier's teardown isn't judged.
+/// `block-sync/storage` and `sync/storage` instead, and so does
+/// `memory/teardown-returns-zero`, since the wire tier's teardown isn't judged.
 fn wire_harness_properties<S: HasView<View = SyncView>>() -> Vec<Property<S>> {
     let sources = SyncWire::sources();
     let mut properties: Vec<Property<S>> = sync_properties()
         .into_iter()
         .filter(|property| {
             sources.observes_all(property.needs)
-                && property.id != PropertyId::new(BLOCK_TEARDOWN_RETURNS_BASELINE)
+                && property.id != PropertyId::new(memory_pool::TEARDOWN_RETURNS_ZERO)
         })
         .collect();
+    properties.push(memory_pool::sessions_within_share());
     properties.extend(session::wire_properties());
     properties.extend(connection::wire_properties());
     properties
@@ -1114,6 +1166,7 @@ pub fn sync_composed(grammar: &[u8]) -> SyncWireScenario {
                 } else {
                     Dialer::Mirror
                 },
+                services: None,
             })
             .collect(),
         ..SyncScenario::default()
@@ -1178,6 +1231,7 @@ pub fn sync_composed(grammar: &[u8]) -> SyncWireScenario {
         sync,
         windows: None,
         superseded_hold: None,
+        memory_budget_bytes: None,
     }
 }
 

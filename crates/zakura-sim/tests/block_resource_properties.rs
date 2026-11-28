@@ -1,8 +1,8 @@
-//! Block sync's resource bounds (P5b, gates P5.1–P5.4): each scenario
-//! input reaches its property's trigger history on the real node and
-//! holds, honest runs hold all four bounds across A/A and A/B/A and across
-//! worker counts, teardown returns every charge, and the owner model folds
-//! the observer's effects as the bounds need. `cargo xtask planted` runs
+//! Block sync's resource bounds: each scenario input reaches its property's
+//! trigger history on the real node and holds, honest runs hold every bound
+//! across A/A and A/B/A and across worker counts, teardown returns every
+//! charge, and the owner model folds the observer's effects as the bounds
+//! need. `cargo xtask planted` runs
 //! its cases' inputs with each property's bypass patch applied.
 #![cfg(zakura_sim)]
 
@@ -10,13 +10,13 @@ mod support;
 
 use support::inputs;
 use zakura_network::zakura::FreeSlots;
-use zakura_scheduler::Status as SchedulerStatus;
 use zakura_sim::{
-    domain::block_sync::{
-        BodyHolder, Limits, Lookahead, OwnerInput, OwnerModel, RequestedHeight,
-        BUDGET_LEDGERS_AGREE, ESTIMATE_CEILING, ESTIMATE_FLOOR, LOOKAHEAD_OVERSHOOT_BOUND,
-        PAYLOAD_INVENTORY_AGREES, RESERVED_BYTE_BOUND, RETAINED_BYTE_BOUND,
-        TEARDOWN_RETURNS_BASELINE,
+    domain::{
+        block_sync::{
+            BodyHolder, Limits, OwnerInput, OwnerModel, RequestedHeight, BUDGET_LEDGERS_AGREE,
+            ESTIMATE_CEILING, PAYLOAD_INVENTORY_AGREES, RETAINED_BYTE_BOUND,
+        },
+        memory_pool::{CONSENSUS_ONCE_PER_HEIGHT, POOL_BOUNDED, TEARDOWN_RETURNS_ZERO},
     },
     harness::{
         block_node::{
@@ -25,8 +25,8 @@ use zakura_sim::{
         },
         block_semantic::STALLED_RESET_TAG,
         block_sync::{
-            BlockScenario, HandoffPause, MirrorSpec, Ports, Storage, ABOVE_WINDOW_TAG,
-            PAUSED_HANDOFFS_TAG, PEERS_LEAVE_SERVED_TAG, PEERS_LEAVE_TAG, STUCK_FLOOR_TAG,
+            BlockScenario, HandoffPause, MirrorSpec, Ports, Storage, PEERS_LEAVE_SERVED_TAG,
+            PEERS_LEAVE_TAG, STUCK_FLOOR_TAG,
         },
         header_sync::Dialer,
         run_prepared, Subsystem,
@@ -38,12 +38,7 @@ use zakura_sim::{
 
 /// The resource bounds every run that rests judges. Teardown applies only
 /// once every peer leaves.
-const IDS: [&str; 4] = [
-    RETAINED_BYTE_BOUND,
-    RESERVED_BYTE_BOUND,
-    BUDGET_LEDGERS_AGREE,
-    LOOKAHEAD_OVERSHOOT_BOUND,
-];
+const IDS: [&str; 3] = [RETAINED_BYTE_BOUND, BUDGET_LEDGERS_AGREE, POOL_BOUNDED];
 
 /// The scenario `tag` picks, under the Plan `plan`.
 fn tagged(tag: [u8; 2], plan: &[u8]) -> WitnessScenario<Storage> {
@@ -53,30 +48,14 @@ fn tagged(tag: [u8; 2], plan: &[u8]) -> WitnessScenario<Storage> {
     }
 }
 
-/// The paused-handoffs scenario under the empty Plan, which picks
-/// round-robin.
-fn paused_handoffs() -> WitnessScenario<Storage> {
-    tagged(PAUSED_HANDOFFS_TAG, &[])
-}
-
 /// The stalled-reset scenario under an arbitrary short Plan: the first of
 /// [`support::byte_inputs`]'s stream, up to 256 bytes.
 fn stalled_reset() -> WitnessScenario<Storage> {
     tagged(STALLED_RESET_TAG, &support::byte_inputs(1, 256)[0])
 }
 
-/// The paused-handoffs input holds the reserved bound after a floor request
-/// charges past `M`. With `above-floor-charge.patch`, above-floor requests
-/// charge past `M` too, and the same input violates it.
-#[test]
-fn the_paused_handoffs_input_holds_reserved_byte_bound() {
-    holds(paused_handoffs(), RESERVED_BYTE_BOUND);
-}
-
 /// The stuck-floor scenario fills the commit window and holds the retained
-/// bound. The scenario runs 1,500,000 steps, which
-/// `wide-commit-window.patch` needs to retain 805 bodies. The window fills
-/// within 400,000, so this test stops there.
+/// bound (`mem-2`: retained wire bytes stay within live pool leases + base).
 #[test]
 #[ignore = "a debug run takes minutes; run it on demand with `--ignored` and `--profile planted`"]
 fn the_stuck_floor_fills_the_commit_window_within_retained_byte_bound() {
@@ -94,60 +73,32 @@ fn the_stalled_reset_input_holds_payload_inventory_agrees() {
     holds(stalled_reset(), PAYLOAD_INVENTORY_AGREES);
 }
 
-/// The stalled-reset input holds the ledgers at every quiescence boundary
-/// after a charged handoff. With `handoff-keeps-charge.patch`, a routine
-/// keeps its charge after the handoff, and the same input violates them.
+/// The stalled-reset input holds the ledgers (including the memory pool's
+/// block-sync + consensus count) at every quiescence boundary after a charged
+/// handoff. With `handoff-keeps-charge.patch`, a routine keeps its charge
+/// after the handoff, and the same input violates them.
 #[test]
 fn the_stalled_reset_input_holds_budget_ledgers_agree() {
     holds(stalled_reset(), BUDGET_LEDGERS_AGREE);
 }
 
-/// D2's `h > 0` witness (P5.1, P5.3): with routines paused in their
-/// handoffs, the byte budget passes `M + 2·B` and stays within
-/// `M + 2·B + h·B`. Three paused routines and a fourth's charge take it to
-/// `M + 2.5·B`.
+/// The floor witness (P5.3): with routines paused in their handoffs, the
+/// floor's owners churn: `mirror-3`'s routine retires when its link closes,
+/// a request for height 7, which every mirror withholds, times out and is
+/// asked again, and the chain resets to a fork. The pool gauge, the retained
+/// bound and the ledgers hold throughout. Height 7 sits in the commit window,
+/// so each request for it leases from `Consensus`, and `Consensus` still
+/// funds each height once (`mem-15`). This harness has no transport credit,
+/// so a timed-out request releases its lease; the wire harness drains it.
 #[test]
-fn paused_handoffs_pass_m_plus_2b_within_the_handoff_allowance() {
-    let witness = paused_handoffs();
-    assert_eq!(witness.scenario, BlockScenario::paused_handoffs());
-    let report = node_run(&witness.scenario, witness.input);
-    let reserved = property(&report, RESERVED_BYTE_BOUND);
-    assert!(
-        matches!(reserved.outcome, PropertyOutcome::Held { .. }),
-        "{reserved:?}"
-    );
-    let limits = Limits::of(&witness.scenario.node_config(), 4, 2_000);
-    let peak = reserved.peaks["reserved-estimate-bytes"];
-    let handoffs = reserved.peaks["open-handoffs"];
-    assert!(
-        peak > limits.reserved_bound(0),
-        "handoff preemption must reach the extra handoff allowance: {:?}",
-        reserved.peaks
-    );
-    assert!(
-        peak <= limits.reserved_bound(handoffs),
-        "{:?}",
-        reserved.peaks
-    );
-    assert_eq!(peak, limits.budget + 5 * B / 2, "{:?}", reserved.peaks);
-}
-
-/// The floor witness (P5.3): routines paused in their handoffs fill the
-/// budget past `M` with floor charges, then the floor's owners churn:
-/// `mirror-3`'s routine retires when its link closes, a request for height
-/// 7, which every mirror withholds, times out, and the chain resets to a
-/// fork. The reserved bound holds after
-/// every step, and the ledgers at every rest. The overshoot past `M` is
-/// reported.
-#[test]
-#[allow(clippy::print_stdout)]
-fn the_floor_churn_holds_the_reserved_bound() {
+fn the_floor_churn_holds_the_pool_and_ledger_bounds() {
     let scenario = BlockScenario::floor_churn();
     let (report, ports) = node_run_with_ports(&scenario, Plan::from_fuzz(&[]));
     for id in [
-        RESERVED_BYTE_BOUND,
+        POOL_BOUNDED,
         BUDGET_LEDGERS_AGREE,
         RETAINED_BYTE_BOUND,
+        CONSENSUS_ONCE_PER_HEIGHT,
     ] {
         let outcome = outcome(&report, id);
         assert!(
@@ -184,11 +135,7 @@ fn the_floor_churn_holds_the_reserved_bound() {
                 if *connection == retired)),
         "mirror-3's routine retires before the reset"
     );
-    // Every mirror withholds height 7, so a request for it ends only at its
-    // timeout or its link's close. The first one goes out on a link the
-    // harness never closes, and once the 8 s request timeout passes, the
-    // work queue holds height 7 unowned again, before the reset.
-    let (asked, session) = facts
+    let (asked, asked_on) = facts
         .iter()
         .find_map(|(step, fact)| match fact {
             BlockSyncFact::Request {
@@ -196,21 +143,20 @@ fn the_floor_churn_holds_the_reserved_bound() {
                 heights,
                 step: moved,
                 ..
-            } if moved == "written" && heights.contains(&7) => Some((*step, owner.session_id)),
+            } if moved == "written" && heights.contains(&7) => {
+                let conn = facts.iter().find_map(|(_, f)| match f {
+                    BlockSyncFact::SessionAdmitted {
+                        connection,
+                        session_id,
+                        ..
+                    } if *session_id == owner.session_id => Some(*connection),
+                    _ => None,
+                })?;
+                (conn != retired).then_some((*step, conn))
+            }
             _ => None,
         })
-        .expect("the node asks for height 7");
-    let asked_on = facts
-        .iter()
-        .find_map(|(_, fact)| match fact {
-            BlockSyncFact::SessionAdmitted {
-                connection,
-                session_id,
-                ..
-            } if *session_id == session => Some(*connection),
-            _ => None,
-        })
-        .expect("the request's session is admitted");
+        .expect("a surviving link asks for height 7");
     assert_ne!(asked_on, retired, "height 7 is asked on a link that stays");
     let timed_out = report
         .log
@@ -231,17 +177,20 @@ fn the_floor_churn_holds_the_reserved_bound() {
                 .any(|item| item.height == 7 && item.owner.is_none()))),
         "the request for height 7 times out before the reset"
     );
-    let limits = Limits::of(&scenario.node_config(), 4, 2_000);
-    let peaks = &property(&report, RESERVED_BYTE_BOUND).peaks;
-    let overshoot = peaks["past-budget-estimate-bytes"];
-    println!(
-        "floor churn: reserved peak {}, {overshoot} past M, with {} open handoffs at most",
-        peaks["reserved-estimate-bytes"], peaks["open-handoffs"]
-    );
-    assert!(overshoot > 0, "{peaks:?}");
+    let asked_for_7 = facts
+        .iter()
+        .filter(|(_, fact)| {
+            matches!(fact, BlockSyncFact::Request { heights, step, .. }
+            if step == "written" && heights.contains(&7))
+        })
+        .count();
     assert!(
-        peaks["reserved-estimate-bytes"] <= limits.reserved_bound(peaks["open-handoffs"]),
-        "{peaks:?}"
+        asked_for_7 >= 2,
+        "height 7 is asked again after its timeout"
+    );
+    assert!(
+        zakura_sim::domain::memory_pool::consensus_height_reissued(&report.log),
+        "a second consensus lease funds a height after the first one's request timed out"
     );
 }
 
@@ -277,14 +226,14 @@ fn asks_for_the_withheld_floor_before_the_reset(report: &RunReport) -> bool {
 }
 
 /// The floor churn with routines paused in their handoffs from height 5,
-/// stopped at 20,000 steps, after the reset at about 16,000.
+/// stopped past the 12 s chain reset.
 fn floor_churn_from_height_5() -> BlockScenario {
     BlockScenario {
         handoff_pause: Some(HandoffPause {
             from_height: 5,
-            steps: 20_000,
+            steps: 40_000,
         }),
-        steps: Some(20_000),
+        steps: Some(40_000),
         ..BlockScenario::floor_churn()
     }
 }
@@ -324,62 +273,28 @@ fn every_floor_churn_plan_asks_for_the_floor_before_the_reset() {
     );
 }
 
-/// The above-window input holds the look-ahead bound while the node's
-/// above-window estimates `E` pass `L`: each worker's admission sees the
-/// others' requests only once they publish, so `E` can pass `L` by up to
-/// `(W + 1)·k·B`. With `omit-outstanding-estimates.patch`, admission
-/// ignores outstanding requests, and the same input violates it. A debug
-/// run takes over a minute, so the test runs the input once, reads the
-/// trigger from the peaks (an above-window estimate the bound counted), and
-/// runs only on demand. The planted runner judges the trigger history on
-/// the same input.
-#[test]
-#[ignore = "a debug run takes over a minute; run it on demand with `--ignored` and `--profile planted`"]
-fn the_above_window_input_holds_lookahead_overshoot_bound() {
-    let witness = tagged(ABOVE_WINDOW_TAG, &[]);
-    assert_eq!(witness.scenario, BlockScenario::above_window());
-    let report = node_run(&witness.scenario, witness.input);
-    let lookahead = property(&report, LOOKAHEAD_OVERSHOOT_BOUND);
-    assert!(
-        matches!(lookahead.outcome, PropertyOutcome::Held { applicable } if applicable > 0),
-        "{lookahead:?}"
-    );
-    let peaks = &lookahead.peaks;
-    let limits = Limits::of(&witness.scenario.node_config(), 2, 2_000);
-    assert!(peaks["past-lookahead-bytes"] > 0, "{peaks:?}");
-    assert!(
-        peaks["above-window-estimate-bytes"] <= limits.lookahead_bound(0),
-        "{peaks:?}"
-    );
-}
-
-/// `block_sync_teardown_returns_baseline`: both mirrors leave while the
-/// node owes them requests. Once every routine has ended, the input queue
-/// is empty and the run rests, the byte budget, the work queue's tally and
-/// the routines' unreceived estimates are zero, and no handoff is open. With `skip-return-on-drop.patch`, a dropped routine keeps its
-/// requests, and the same input violates it.
+/// Both mirrors leave while the node owes them requests. Once every routine
+/// has ended, the input queue is empty and the run rests, every live pool
+/// lease, the byte budget, the work queue's tally and the routines' unreceived
+/// estimates are zero, and no handoff is open (`mem-11`, catalogue G4).
 #[test]
 fn block_sync_teardown_returns_baseline() {
     let witness = tagged(PEERS_LEAVE_TAG, &[]);
     assert_eq!(witness.scenario, BlockScenario::peers_leave());
     let report = node_run(&witness.scenario, witness.input.clone());
-    for id in IDS.into_iter().chain([TEARDOWN_RETURNS_BASELINE]) {
+    for id in IDS.into_iter().chain([TEARDOWN_RETURNS_ZERO]) {
         let outcome = outcome(&report, id);
         assert!(
             matches!(outcome, PropertyOutcome::Held { applicable } if *applicable > 0),
             "{id}: {outcome:?}"
         );
     }
-    check_witness(witness, TEARDOWN_RETURNS_BASELINE, Expect::Holds);
+    check_witness(witness, TEARDOWN_RETURNS_ZERO, Expect::Holds);
 }
 
 /// The peers-leave run with a probe the node serves and links that reserve
 /// its session slots. The node holds a session slot for each link during
-/// the run, and teardown settles with every one returned, so the
-/// session-slot charge applies and holds. With `kept-session-sender.patch`
-/// the server keeps a clone of one session's sender, so that session's slot
-/// never returns, and the same run violates the property. The generator
-/// draws the same scenario by [`PEERS_LEAVE_SERVED_TAG`].
+/// the run, and teardown settles with every slot and pool lease returned.
 #[test]
 fn teardown_returns_session_slots() {
     let scenario = BlockScenario::peers_leave_served();
@@ -393,7 +308,7 @@ fn teardown_returns_session_slots() {
         input: Plan::from_fuzz(&[]),
     };
     let (report, ports) = node_run_with_ports(&witness.scenario, witness.input.clone());
-    let outcome = outcome(&report, TEARDOWN_RETURNS_BASELINE);
+    let outcome = outcome(&report, TEARDOWN_RETURNS_ZERO);
     assert!(
         matches!(outcome, PropertyOutcome::Held { applicable } if *applicable > 0),
         "{outcome:?}"
@@ -404,18 +319,15 @@ fn teardown_returns_session_slots() {
         let peaks = owners.peaks();
         assert_eq!(peaks.session_slots, 3, "{peaks:?}");
         assert_eq!(owners.session_slots(), 0);
+        assert_eq!(view.pool.borrow().total_leased(), 0);
+        assert_eq!(view.pool.borrow().live_lease_count(), 0);
     }
-    check_witness(witness, TEARDOWN_RETURNS_BASELINE, Expect::Holds);
+    check_witness(witness, TEARDOWN_RETURNS_ZERO, Expect::Holds);
 }
 
 /// The served run with the node's first serving read, for height 1, held
 /// until the probe's link has closed and 60 s have passed since the read's
-/// submission. The read holds its serving lease and a clone of the probe
-/// session's sender, so the probe's session slot stays held after every
-/// link closes. Teardown waits for the lease, so it doesn't judge the slot
-/// while the read is in flight, and holds once the read returns it. Before
-/// settlement waited for serving leases, this run violated the property at
-/// step 10,012 with one session slot held.
+/// submission. Teardown waits for the lease, and holds once the read returns it.
 #[test]
 fn teardown_waits_for_a_serving_read_held_across_a_close() {
     let mut scenario = BlockScenario::peers_leave_served();
@@ -429,13 +341,11 @@ fn teardown_waits_for_a_serving_read_held_across_a_close() {
         deadline_ms: None,
     });
     let (report, ports) = node_run_with_ports(&scenario, Plan::from_fuzz(&[]));
-    let outcome = outcome(&report, TEARDOWN_RETURNS_BASELINE);
+    let outcome = outcome(&report, TEARDOWN_RETURNS_ZERO);
     assert!(
         matches!(outcome, PropertyOutcome::Held { applicable } if *applicable > 0),
         "{outcome:?}"
     );
-    // A peer's close records no cause on the node, so each routine's last
-    // snapshot marks its link's end.
     let ends: Vec<u64> = report
         .log
         .entries()
@@ -473,13 +383,12 @@ fn teardown_waits_for_a_serving_read_held_across_a_close() {
     let view = ports.view.borrow();
     assert_eq!(view.owners.serving_leases(), 0);
     assert_eq!(view.owners.session_slots(), 0);
+    assert_eq!(view.pool.borrow().total_leased(), 0);
 }
 
 /// P5.2: the short budget on 1, 2 and 4 workers, each with 2 and 4
-/// mirrors, holds every bound. The report gives each run's overshoot past
-/// `M` and past `L`; the most need not grow with `W`.
+/// mirrors, holds every bound.
 #[test]
-#[allow(clippy::print_stdout)]
 fn every_worker_count_holds_the_resource_bounds() {
     for workers in [1, 2, 4] {
         for mirrors in [2, 4] {
@@ -498,67 +407,7 @@ fn every_worker_count_holds_the_resource_bounds() {
                     "W = {workers}, {mirrors} mirrors: {id}: {outcome:?}"
                 );
             }
-            let peak = |id, quantity| property(&report, id).peaks[quantity];
-            println!(
-                "W = {workers}, {mirrors} mirrors: {} past M, {} past L",
-                peak(RESERVED_BYTE_BOUND, "past-budget-estimate-bytes"),
-                peak(LOOKAHEAD_OVERSHOOT_BOUND, "past-lookahead-bytes"),
-            );
         }
-    }
-}
-
-/// P5.2 on the above-window scenario, whose estimates pass `L`: 1, 2 and 4
-/// workers each hold the look-ahead bound, and the report gives each run's
-/// overshoot past `L`.
-#[test]
-#[ignore = "each debug run takes about 100 s"]
-#[allow(clippy::print_stdout)]
-fn every_worker_count_holds_the_lookahead_bound_above_the_window() {
-    for workers in [1, 2, 4] {
-        let scenario = BlockScenario {
-            workers: Some(workers),
-            ..BlockScenario::above_window()
-        };
-        let report = node_run(&scenario, Plan::from_fuzz(&[]));
-        let lookahead = property(&report, LOOKAHEAD_OVERSHOOT_BOUND);
-        assert!(
-            matches!(lookahead.outcome, PropertyOutcome::Held { .. }),
-            "W = {workers}: {lookahead:?}"
-        );
-        println!(
-            "W = {workers}: E peaks at {}, {} past L",
-            lookahead.peaks["above-window-estimate-bytes"], lookahead.peaks["past-lookahead-bytes"]
-        );
-    }
-}
-
-/// `lookahead_estimate_to_wire_growth` (P5.4): above-window requests that
-/// reserve the smallest estimate get bodies about twice as large while the
-/// sequencer can't commit. With `W` fixed, outstanding requests per peer
-/// and the input queue's capacity vary. Each run holds the look-ahead
-/// bound and retains above-window bodies past their estimates.
-#[test]
-#[ignore = "each debug run takes minutes"]
-#[allow(clippy::print_stdout)]
-fn lookahead_estimate_to_wire_growth() {
-    let hint = BlockScenario::understated_hints(1, 401).size_hint;
-    assert_eq!(hint.map(u64::from), Some(ESTIMATE_FLOOR));
-    for (outstanding, queue) in [(1, 401), (2, 401), (4, 401), (4, 802)] {
-        let scenario = BlockScenario::understated_hints(outstanding, queue);
-        let report = node_run(&scenario, Plan::from_fuzz(&[]));
-        let lookahead = property(&report, LOOKAHEAD_OVERSHOOT_BOUND);
-        assert!(
-            matches!(lookahead.outcome, PropertyOutcome::Held { .. }),
-            "{outstanding} outstanding, Q = {queue}: {lookahead:?}"
-        );
-        let peaks = &lookahead.peaks;
-        println!("{outstanding} outstanding, Q = {queue}: {peaks:?}");
-        assert!(peaks["hint-error-bytes"] > 0, "{peaks:?}");
-        assert!(
-            peaks["above-window-wire-bytes"] > peaks["hint-error-bytes"],
-            "{peaks:?}"
-        );
     }
 }
 
@@ -664,9 +513,9 @@ fn honest_runs_hold_every_resource_bound_a_b_a() {
             }
             let peaks = |id| &property(report, id).peaks;
             assert!(
-                peaks(RESERVED_BYTE_BOUND)["reserved-estimate-bytes"] > 0,
+                peaks(POOL_BOUNDED)["pool-leased-bytes"] > 0,
                 "{name}: {:?}",
-                peaks(RESERVED_BYTE_BOUND)
+                peaks(POOL_BOUNDED)
             );
             assert!(
                 peaks(RETAINED_BYTE_BOUND)["retained-wire-bytes"] > 0,
@@ -686,16 +535,13 @@ fn honest_runs_hold_every_resource_bound_a_b_a() {
 /// `B`, the largest estimate.
 const B: u64 = ESTIMATE_CEILING;
 
-/// Limits with `M` = 10, `L` = 5, `Q` = 401, one body per request,
-/// bodies of at most 3 bytes, and 2 workers.
+/// Limits with `M` = 10, one body per request, and bodies of at most 3
+/// bytes.
 fn small_limits() -> Limits {
     Limits {
         budget: 10,
-        lookahead: 5,
-        queue: 401,
         per_request: 1,
         largest_body: 3,
-        workers: 2,
     }
 }
 
@@ -717,27 +563,16 @@ fn owner(request_id: u64) -> WorkOwner {
     }
 }
 
-/// The reserved bound adds `B` per open handoff to `M + 2·k·B`, and the
-/// retained bound is `L + 401·b + Q·b`.
+/// The handoff pauses end past `M + 2·k·B`.
 #[test]
-fn the_bounds_add_up_their_allowances() {
+fn the_pause_bound_adds_two_requests_to_the_budget() {
     let limits = small_limits();
-    assert_eq!(limits.reserved_bound(0), 10 + 2 * B);
-    assert_eq!(limits.reserved_bound(3), 10 + 5 * B);
-    assert_eq!(limits.retained_bound(), 5 + (401 + 401) * 3);
+    assert_eq!(limits.pause_bound(), 10 + 2 * B);
     let two_per_request = Limits {
         per_request: 2,
         ..limits
     };
-    assert_eq!(two_per_request.reserved_bound(1), 10 + 5 * B);
-    assert_eq!(limits.lookahead_bound(0), 5 + 3 * B);
-    assert_eq!(limits.lookahead_bound(7), 5 + 7 + 3 * B);
-    let four_workers = Limits {
-        workers: 4,
-        ..limits
-    };
-    assert_eq!(four_workers.lookahead_bound(0), 5 + 5 * B);
-    assert_eq!(two_per_request.lookahead_bound(0), 5 + 6 * B);
+    assert_eq!(two_per_request.pause_bound(), 10 + 4 * B);
 }
 
 /// A body counts once while the input queue, the reorder buffer or
@@ -755,6 +590,7 @@ fn a_retained_body_counts_once_per_allocation() {
         request: (1, 1),
         height: 5,
         bytes: 3,
+        decoded_bytes: 0,
     };
     owners.apply(held(BodyHolder::Queued(1)));
     owners.apply(held(BodyHolder::Reorder(1)));
@@ -783,12 +619,14 @@ fn holder_inputs_the_model_cannot_apply_are_gaps() {
         request: (1, 1),
         height: 5,
         bytes: 4,
+        decoded_bytes: 0,
     };
     let unestimated = OwnerInput::Held {
         holder: BodyHolder::Reorder(1),
         request: (1, 1),
         height: 5,
         bytes: 3,
+        decoded_bytes: 0,
     };
     let never_taken = OwnerInput::Released {
         holder: BodyHolder::Applying(2),
@@ -825,11 +663,13 @@ fn a_snapshot_that_differs_from_the_holder_events_is_a_gap() {
         request: (1, 1),
         height: 5,
         bytes: 3,
+        decoded_bytes: 0,
     };
     let snapshot = |holders: &[BodyHolder]| OwnerInput::Snapshot {
         payloads: Vec::new(),
         expected_payloads: Vec::new(),
         holders: holders.iter().map(|holder| (*holder, 5, 3)).collect(),
+        detached_decoded: 0,
     };
     let mut owners = model();
     owners.apply(held(BodyHolder::Queued(1)));
@@ -853,30 +693,30 @@ fn a_snapshot_that_differs_from_the_holder_events_is_a_gap() {
     assert_eq!(omitted.budget_gap(), None);
 }
 
-/// The budget's changes chain from the empty budget, at the configured
-/// maximum. A change from another count, or at another maximum, leaves the
-/// counter unknown.
+/// The budget's changes chain from the empty budget, with no maximum. A
+/// change from another count, or a reported maximum, leaves the counter
+/// unknown.
 #[test]
-fn budget_changes_chain_at_the_configured_maximum() {
+fn budget_changes_chain_with_no_maximum() {
     let change = |before, after, limit| OwnerInput::BudgetChanged {
         before,
         after,
         limit,
     };
     let mut owners = OwnerModel::new(small_limits(), 0);
-    owners.apply(change(0, 7, 10));
-    owners.apply(change(7, 14, 10));
-    owners.apply(change(14, 0, 10));
+    owners.apply(change(0, 7, u64::MAX));
+    owners.apply(change(7, 14, u64::MAX));
+    owners.apply(change(14, 0, u64::MAX));
     assert_eq!((owners.reserved(), owners.peaks().reserved), (0, 14));
     assert_eq!(owners.budget_gap(), None);
 
     let mut skipped = OwnerModel::new(small_limits(), 0);
-    skipped.apply(change(0, 7, 10));
-    skipped.apply(change(3, 0, 10));
+    skipped.apply(change(0, 7, u64::MAX));
+    skipped.apply(change(3, 0, u64::MAX));
     assert!(skipped.budget_gap().is_some());
 
     let mut other_maximum = OwnerModel::new(small_limits(), 0);
-    other_maximum.apply(change(0, 7, 11));
+    other_maximum.apply(change(0, 7, 10));
     assert!(other_maximum.budget_gap().is_some());
 }
 
@@ -913,40 +753,6 @@ fn handoffs_and_routines_follow_their_inputs() {
     assert_eq!(owners.holder_gap(), None);
 }
 
-/// D2's `h` counts open handoffs only while a step leaves a task ready, and
-/// at most one per live routine, so leaked handoffs can't widen the
-/// reserved bound.
-#[test]
-fn counted_handoffs_stop_at_live_routines_and_rest() {
-    let mut owners = OwnerModel::new(small_limits(), 0);
-    let routine = |generation, ended| OwnerInput::Routine {
-        connection: 4,
-        generation,
-        ended,
-        requests: Vec::new(),
-    };
-    owners.apply(routine(1, false));
-    owners.apply(routine(2, false));
-    for request_id in 1..=3 {
-        owners.apply(OwnerInput::HandoffStarted {
-            owner: owner(request_id),
-            height: 5,
-            charge: 7,
-        });
-    }
-    assert_eq!(owners.counted_handoffs(SchedulerStatus::Running), 2);
-    assert_eq!(owners.counted_handoffs(SchedulerStatus::WorkerStarved), 2);
-    owners.apply(routine(2, true));
-    assert_eq!(owners.counted_handoffs(SchedulerStatus::Running), 1);
-    for status in [
-        SchedulerStatus::Quiescent,
-        SchedulerStatus::WaitingOnTime,
-        SchedulerStatus::WaitingOnExternal,
-    ] {
-        assert_eq!(owners.counted_handoffs(status), 0, "{status:?}");
-    }
-}
-
 /// One unreceived height of request `request`, at `height`.
 fn requested(request: u64, height: u32, estimate: u64, received: bool) -> RequestedHeight {
     RequestedHeight {
@@ -978,53 +784,6 @@ fn unreceived_estimates_follow_each_routines_latest_snapshot() {
     assert_eq!(owners.unreceived_estimates(), 10);
     owners.apply(snapshot(1, true, Vec::new()));
     assert_eq!(owners.unreceived_estimates(), 3);
-}
-
-/// Above-window heights are those past the highest verified tip plus 401.
-/// `R` counts their retained bodies once per allocation, `E` their
-/// unreceived estimates, and `H` each retained body's bytes past its
-/// request's estimate. A lower tip never moves heights back out.
-#[test]
-fn the_lookahead_quantities_count_only_above_the_window() {
-    let mut owners = OwnerModel::new(small_limits(), 10);
-    let above = 10 + 402;
-    owners.apply(OwnerInput::Routine {
-        connection: 4,
-        generation: 1,
-        ended: false,
-        requests: vec![
-            requested(1, above, 2, true),
-            requested(2, above - 1, 5, false),
-            requested(3, above + 1, 7, false),
-        ],
-    });
-    for (allocation, request, height) in [(1, 1, above), (2, 2, above - 1)] {
-        owners.apply(OwnerInput::Held {
-            holder: BodyHolder::Reorder(allocation),
-            request: (1, request),
-            height,
-            bytes: 3,
-        });
-    }
-    owners.apply(OwnerInput::Held {
-        holder: BodyHolder::Applying(1),
-        request: (1, 1),
-        height: above,
-        bytes: 3,
-    });
-    assert_eq!(owners.holder_gap(), None);
-    assert_eq!(
-        owners.lookahead(),
-        Lookahead {
-            retained: 3,
-            estimated: 7,
-            hint_error: 1,
-        }
-    );
-    owners.apply(OwnerInput::VerifiedTip { height: 11 });
-    assert_eq!(owners.lookahead().retained, 0);
-    owners.apply(OwnerInput::VerifiedTip { height: 5 });
-    assert_eq!(owners.verified_tip(), 11);
 }
 
 /// Session slots count against the first reading, of every kind together.

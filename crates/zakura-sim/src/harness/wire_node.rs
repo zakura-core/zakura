@@ -291,12 +291,59 @@ impl WireEndpoint {
         F: Future<Output = K> + Send,
         K: Send,
     {
+        Self::spawn_with_memory(
+            sim,
+            config,
+            net,
+            seed,
+            index,
+            listen_addrs,
+            observer,
+            dials,
+            None,
+            services,
+            started,
+        )
+    }
+
+    /// [`WireEndpoint::spawn_configured`], optionally attaching a
+    /// [`MemoryPlan`](zakura_network::zakura::memory::MemoryPlan) and its live
+    /// [`MemoryPool`](zakura_network::zakura::memory::MemoryPool), which the
+    /// node's block sync also serves from, to the handler (`02 §8`,
+    /// `mem-13`).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn spawn_with_memory<T, F, K>(
+        sim: &mut Sim,
+        config: Config,
+        net: SimNet,
+        seed: [u8; 32],
+        index: Option<usize>,
+        listen_addrs: Option<Vec<SocketAddr>>,
+        observer: Arc<dyn TransportObserver>,
+        dials: Option<DialReporter>,
+        memory: Option<(
+            zakura_network::zakura::memory::MemoryPlan,
+            zakura_network::zakura::memory::MemoryPool,
+        )>,
+        services: impl FnOnce(&ZakuraSupervisorHandle, &ZakuraLocalLimits) -> (Vec<Arc<dyn Service>>, T)
+            + Send
+            + 'static,
+        started: impl FnOnce(ZakuraEndpoint, ZakuraLocalLimits, T) -> F + Send + 'static,
+    ) -> Self
+    where
+        T: Send,
+        F: Future<Output = K> + Send,
+        K: Send,
+    {
         let (addr, key) = index.map_or((NODE_ADDR, 0), |index| {
             (peer_addr(index, 0), key_index(index))
         });
         let (bound, endpoint) = watch::channel(None);
         sim.scheduler().spawn_root("wire-node", async move {
-            let limits = ZakuraLocalLimits::from_config(&config);
+            let limits = match &memory {
+                Some((plan, ..)) => plan.local_limits(&config),
+                None => ZakuraLocalLimits::from_config(&config),
+            };
             let quic = QuicEndpoint::bind_with(
                 SeededInputs::node_key(seed, key),
                 &limits.quic_bind_config(listen_addrs.unwrap_or_else(|| vec![addr])),
@@ -309,7 +356,7 @@ impl WireEndpoint {
             let supervisor = ZakuraSupervisorHandle::new(config.zakura.max_connections_per_ip);
             let (services, handed) = services(&supervisor, &limits);
             let registry = ServiceRegistry::new(services).expect("the node's services register");
-            let handler = ZakuraProtocolHandler::new_with_registry_and_trace(
+            let mut handler = ZakuraProtocolHandler::new_with_registry_and_trace(
                 supervisor,
                 config.network.clone(),
                 ZakuraHandshakeConfig::for_network(&config.network),
@@ -319,6 +366,9 @@ impl WireEndpoint {
             )
             .with_local_node_id(quic.local_id())
             .with_transport_observer(observer);
+            if let Some((plan, pool)) = memory {
+                handler = handler.with_memory_pool(plan, pool);
+            }
             quic.serve(handler.clone()).expect("the node serves");
             let endpoint = ZakuraEndpoint::new(quic, handler);
             bound.send_replace(Some((endpoint.clone(), limits.clone())));

@@ -18,8 +18,8 @@ use zakura_storage::{
 
 use crate::{
     observe::{
-        block_sync_entries, peer_entries, peer_transport_entries, reactor_entries, storage_entries,
-        transport_entries,
+        block_sync_entries, peer_entries, peer_transport_entries, pool_entries, reactor_entries,
+        storage_entries, transport_entries,
     },
     Observation,
 };
@@ -127,6 +127,11 @@ pub(crate) enum EvidenceKind {
         /// The peer's name.
         peer: String,
     },
+    /// A memory-pool tap on the node named `node`, a display label only.
+    MemoryPool {
+        /// The node's name.
+        node: String,
+    },
     /// The scripted peers' records of the node named `node`, a display label
     /// only, as their wire evidence places and projects them
     /// ([`crate::peer::PeerControl`]): every `PeerFrame`, `PeerWritten`,
@@ -166,6 +171,7 @@ impl EvidenceKind {
             EvidenceKind::BlockSync { .. } => block_sync_entries(observations, instance),
             EvidenceKind::Transport { .. } => transport_entries(observations, instance),
             EvidenceKind::PeerTransport { .. } => peer_transport_entries(observations, instance),
+            EvidenceKind::MemoryPool { .. } => pool_entries(observations, instance),
             EvidenceKind::Peer { .. } => peer_entries(observations),
         }
     }
@@ -178,6 +184,7 @@ impl EvidenceKind {
             EvidenceKind::BlockSync { node } => format!("block-sync:{node}#{instance}"),
             EvidenceKind::Transport { node } => format!("transport:{node}#{instance}"),
             EvidenceKind::PeerTransport { peer } => format!("peer-transport:{peer}#{instance}"),
+            EvidenceKind::MemoryPool { node } => format!("memory-pool:{node}#{instance}"),
             EvidenceKind::Peer { node } => format!("peer:{node}#{instance}"),
         }
     }
@@ -194,7 +201,8 @@ impl EvidenceKind {
             EvidenceKind::Reactor { .. }
             | EvidenceKind::BlockSync { .. }
             | EvidenceKind::Transport { .. }
-            | EvidenceKind::PeerTransport { .. } => Words {
+            | EvidenceKind::PeerTransport { .. }
+            | EvidenceKind::MemoryPool { .. } => Words {
                 source: "tap",
                 publisher: "tap",
                 entries: "events",

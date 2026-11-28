@@ -52,7 +52,7 @@ impl PeerState {
         assert!(
             self.early_data
                 .iter()
-                .all(|e| self.meta_received_pending.contains(&e.kind.block_id())),
+                .all(|e| self.meta_received_pending.contains_key(&e.kind.block_id())),
             "{PEER_REPLAY}: bpv1-14 the early record holds traffic with no pending HeaderMeta"
         );
         assert!(

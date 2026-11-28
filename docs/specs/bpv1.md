@@ -593,7 +593,10 @@ peer is lying. The receiver cannot yet check such a message.
     not a violation. Admission is local work, so the pause ends.
   - The metadata crossed, but this node dropped it: admission rejected the
     peer's copy, or the retired block left the retired record. The message
-    returns `Drop`. The receiver remembers these blocks in a per-peer set
+    spends the block's two counters, as for a retired block, and returns
+    `Drop`. An exhausted counter returns `Disconnect` (close-15). The counters
+    start at the part count of the peer's `HeaderMeta`, or keep a retired
+    block's counters. The receiver remembers these blocks in a per-peer set
     bounded like pending metadata.
   - The metadata crossed the connection in neither direction. The message
     returns `Disconnect` (close-21): a conformant peer queues the metadata
@@ -602,13 +605,18 @@ peer is lying. The receiver cannot yet check such a message.
   `Advert` in a separate small per-peer record. The two streams are unordered,
   so these messages can overtake the metadata. The receiver MUST NOT pause the
   control stream for this record, because `Want`s and stop signals for other
-  blocks travel behind the held message. Messages that do not fit return
-  `Drop`.
+  blocks travel behind the held message. The record has no age bound. The
+  peer's `HeaderMeta` for the block is ahead of its traffic on the data
+  stream, which can lag the control stream by any backlog. An entry leaves
+  when the block is admitted or retired, when the session ends, or when the
+  record is full and a newer entry arrives. A rejection of the peer's
+  `HeaderMeta` keeps the entries, because another peer's copy can still admit
+  the block.
 
 When the block is admitted, the receiver replays the held messages through the
 ordinary checks. A replayed part that is no longer wanted returns `Drop`,
-because the subscription state can change between arrival and replay. Entries
-that reach `EARLY_AGE` return `Drop`.
+because the subscription state can change between arrival and replay.
+Data-stream entries that reach `EARLY_AGE` return `Drop`.
 
 A flagged `Have` that leaves the early record without replay, because the
 record was full, the entry aged out, or the metadata was dropped, leaves its
@@ -642,7 +650,8 @@ that this node subscribed to or asked for, plus the parts the peer flagged
 within its push bound: `n` per stripe from `proposer_node` and `n - k` from any
 other peer, for each admitted block. Data-stream messages about unknown blocks
 add at most the per-peer early-record bound per
-`EARLY_AGE`. Control-stream announcements about unknown or retired blocks are
+`EARLY_AGE`, plus, behind each `HeaderMeta` this node dropped, one part and one
+announced index per part of the block. Control-stream announcements about unknown or retired blocks are
 small, and their cadence in section 5 records floods. Total receive bytes are
 therefore bounded by this node's own subscriptions and `Want`s over the
 retained blocks, `(n - k) × S` pushed bytes per stripe per connection (`n × S`
@@ -987,7 +996,8 @@ authorize its seeds (section 3).
 - **Reservation precheck**, on the fixed prefix `(block_id, index)`
   - a block this node has not admitted follows section 3: behind the peer's
     `HeaderMeta` under admission it goes to the data-stream early record,
-    behind dropped metadata it returns `Drop`, and otherwise it returns
+    behind dropped metadata it spends the block's part counter and returns
+    `Drop`, or `Disconnect` once the counter is exhausted, and otherwise it returns
     `Disconnect` (close-21)
   - a retired block spends the peer's retired part counter and returns `Drop`;
     an exhausted counter returns `Disconnect`

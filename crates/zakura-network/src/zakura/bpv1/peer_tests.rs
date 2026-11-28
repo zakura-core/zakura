@@ -1887,6 +1887,101 @@ fn bpv1_14_part_for_dropped_header_meta_drops() {
     peer.assert_invariants();
 }
 
+/// bpv1-21: traffic behind dropped metadata spends the block's counters, as
+/// a retired block's does, so a peer cannot reuse a drop mark without bound.
+#[test]
+fn bpv1_21_traffic_behind_dropped_meta_spends_the_counters() {
+    let now = Instant::now();
+    let block_id = block::Hash([0x74; 32]);
+    let total = tiny().total_parts().unwrap();
+    let rejected = || {
+        let mut peer = PeerState::new(PeerConfig::for_profile(Profile::TINY), node_id(2), 1);
+        peer.step(now, recv_meta(block_id));
+        peer.step(now, PeerInput::MetaRejected { block_id });
+        peer
+    };
+
+    let mut peer = rejected();
+    for index in 0..total {
+        peer.step(now, tiny_part_prefix(block_id, index));
+        assert!(peer.close_cause().is_none(), "part {index} drops");
+    }
+    peer.step(now, tiny_part_prefix(block_id, 0));
+    assert_closed(&peer, Bpv1CloseRow::Row15RetiredCounterExhausted);
+
+    let mut peer = rejected();
+    peer.step(
+        now,
+        have_with(block_id, HaveFlags::Plain, (0..total).collect()),
+    );
+    assert!(peer.close_cause().is_none());
+    peer.step(now, have_with(block_id, HaveFlags::Plain, vec![0]));
+    assert_closed(&peer, Bpv1CloseRow::Row15RetiredCounterExhausted);
+}
+
+/// Whether `step` reports that the peer finished `block_id`.
+fn reports_block_done(step: &PeerStep, block_id: block::Hash) -> bool {
+    step.outputs
+        .iter()
+        .any(|o| matches!(o, PeerOutput::PeerBlockDone { block_id: id } if *id == block_id))
+}
+
+/// A `BlockDone` that overtook its block's `HeaderMeta` waits however long
+/// the data stream lags, and applies when the block admits: on this
+/// session's metadata, or after a rejection, on another peer's copy.
+#[test]
+fn an_early_block_done_waits_for_admission_past_the_early_age() {
+    let t0 = Instant::now();
+    let later = t0 + DEFAULT_EARLY_AGE * 3;
+    let block_id = block::Hash([0x75; 32]);
+    let new_peer = || PeerState::new(PeerConfig::for_profile(Profile::TINY), node_id(2), 1);
+
+    let mut peer = new_peer();
+    peer.step(t0, PeerInput::RecvBlockDone { block_id });
+    peer.step(later, PeerInput::Tick);
+    peer.step(later, recv_meta(block_id));
+    let s = peer.step(later, admitted(block_id, tiny(), node_id(2)));
+    assert!(reports_block_done(&s, block_id));
+    assert!(peer.close_cause().is_none());
+    peer.assert_invariants();
+
+    let mut peer = new_peer();
+    peer.step(t0, recv_meta(block_id));
+    peer.step(t0, PeerInput::RecvBlockDone { block_id });
+    peer.step(t0, PeerInput::MetaRejected { block_id });
+    peer.step(later, PeerInput::Tick);
+    let s = peer.step(later, admitted(block_id, tiny(), node_id(3)));
+    assert!(reports_block_done(&s, block_id));
+    assert!(peer.close_cause().is_none());
+    peer.assert_invariants();
+}
+
+/// At `EARLY_CONTROL_CAP`, the oldest held control message leaves for the
+/// newest.
+#[test]
+fn the_early_control_record_evicts_its_oldest_entry_at_the_cap() {
+    let now = Instant::now();
+    let mut peer = PeerState::new(PeerConfig::for_profile(Profile::TINY), node_id(2), 1);
+    let blocks: Vec<block::Hash> = (0..=EARLY_CONTROL_CAP)
+        .map(|index| {
+            let mut bytes = [0x76; 32];
+            bytes[..8].copy_from_slice(&u64::try_from(index).unwrap().to_le_bytes());
+            block::Hash(bytes)
+        })
+        .collect();
+    for &block_id in &blocks {
+        peer.step(now, PeerInput::RecvBlockDone { block_id });
+    }
+    peer.assert_invariants();
+
+    let s = peer.step(now, admitted(blocks[0], tiny(), node_id(3)));
+    assert!(!reports_block_done(&s, blocks[0]), "the oldest entry left");
+    let newest = *blocks.last().unwrap();
+    let s = peer.step(now, admitted(newest, tiny(), node_id(3)));
+    assert!(reports_block_done(&s, newest));
+    peer.assert_invariants();
+}
+
 /// A node admits a `body_bytes` W2 block that node 250 proposed, with
 /// `peer_count` live peers, and publishes it through the production router.
 /// Returns the block, its coding, the deadline, and each peer's session.

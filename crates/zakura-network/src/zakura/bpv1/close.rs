@@ -62,7 +62,8 @@ pub enum Bpv1CloseRow {
     Row13BadPartIndexOrProof = 13,
     /// `bpv1-close-14`: `Part` unwanted or repeated from the same peer.
     Row14UnwantedOrDuplicatePart = 14,
-    /// `bpv1-close-15`: Retired block late `Part` or `Have` counter exhausted.
+    /// `bpv1-close-15`: late `Part` or `Have` counter exhausted, for a retired
+    /// block or one whose `HeaderMeta` this session dropped.
     Row15RetiredCounterExhausted = 15,
     /// `bpv1-close-16`: `Have` index out of range, a repeated index, or a
     /// bitmap whose length is not `ceil(stripes * n / 8)` (decision-33). A

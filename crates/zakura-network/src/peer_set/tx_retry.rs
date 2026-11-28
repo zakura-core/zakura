@@ -101,8 +101,7 @@ impl Drop for Download {
 pub(super) type PeerResponse = BoxFuture<'static, Result<Response, SharedPeerError>>;
 
 pub(super) struct Retry {
-    pub id: UnminedTxId,
+    pub download: Download,
     pub first: PeerSocketAddr,
-    pub alternate: PeerSocketAddr,
     pub reply: oneshot::Sender<PeerResponse>,
 }

@@ -117,6 +117,8 @@ where
     C: ChainTip + Clone + Send + Sync + 'static,
 {
     let (requests, mut incoming) = mpsc::channel::<Dispatch>(PEERSET_BUFFER_SIZE);
+    let (retry_sender, mut retries) = mpsc::channel(PEERSET_BUFFER_SIZE);
+    peers.tx_retry_sender = Some(retry_sender);
     let (refresh, mut refreshes) = mpsc::channel::<oneshot::Sender<()>>(PEERSET_BUFFER_SIZE);
     let mut advertiser = peers.block_advertiser();
     advertiser.refresh = Some(refresh);
@@ -143,6 +145,7 @@ where
                     }
                     running = poll_fn(|cx| {
                         peers.maintain(cx)?;
+                        peers.poll_transaction_retries(cx, &mut retries)?;
                         // Bounded channel polling participates in Tokio's cooperative budget.
                         while let Poll::Ready(Some(reply)) = refreshes.poll_recv(cx) {
                             // Discovery may have arrived between the first maintenance pass and

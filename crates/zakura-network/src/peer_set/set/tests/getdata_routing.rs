@@ -831,7 +831,7 @@ async fn another_announcer_serves_transaction_after_miss_or_disconnect() {
     for (disconnect, second_has_body) in [(false, true), (true, true), (false, false)] {
         let mut first = TestPeer::spawn(8233);
         let mut second = TestPeer::spawn(8234);
-        let (set, _guard) =
+        let (set, mut guard) =
             peer_set_with_peers(&mut [&mut first, &mut second], crate::Config::default());
         let observed = set.tx_announcers.clone();
         let (driver, _adverts) =
@@ -858,7 +858,17 @@ async fn another_announcer_serves_transaction_after_miss_or_disconnect() {
                 Some(crate::PeerSource::LegacySocket(second.addr)),
             ))
             .await;
-        observed.observe(advert.request());
+        // Exercise both delivery orders. On disconnect only the inventory update has arrived.
+        if disconnect {
+            guard
+                .inventory_sender()
+                .as_ref()
+                .unwrap()
+                .send(InventoryStatus::new_available(id.into(), second.addr))
+                .unwrap();
+        } else {
+            observed.observe(advert.request());
+        }
         advert.respond(Response::Nil);
         assert_eq!(second.written_now().await, None);
         if disconnect {

@@ -235,8 +235,7 @@ where
     /// via the [`Discover`] trait implementation.
     discover: D,
     pub(super) tx_announcers: TxAnnouncers,
-    tx_retry_sender: tokio_mpsc::Sender<Retry>,
-    tx_retries: tokio_mpsc::Receiver<Retry>,
+    pub(super) tx_retry_sender: Option<tokio_mpsc::Sender<Retry>>,
 
     /// A channel that asks the peer crawler task to connect to more peers.
     demand_signal: mpsc::Sender<MorePeers>,
@@ -415,13 +414,10 @@ where
         minimum_peer_version: MinimumPeerVersion<C>,
         max_conns_per_ip: Option<usize>,
     ) -> Self {
-        let (tx_retry_sender, tx_retries) =
-            tokio_mpsc::channel(config.peerset_total_connection_limit().max(1));
         let (stall_event_tx, stall_event_rx) = tokio_mpsc::unbounded_channel();
         Self {
             tx_announcers: TxAnnouncers::default(),
-            tx_retry_sender,
-            tx_retries,
+            tx_retry_sender: None,
             // New peers
             discover,
             demand_signal,
@@ -1724,23 +1720,18 @@ where
         download: Option<super::tx_retry::Download>,
         fut: <LoadTrackedClient as Service<Request>>::Future,
     ) -> <Self as Service<Request>>::Future {
-        if let Some(download) = download {
-            let retries = self.tx_retry_sender.clone();
-            let id = download.id;
+        if let (Some(download), Some(retries)) = (download, &self.tx_retry_sender) {
+            let retries = retries.clone();
             return async move {
                 let error = match fut.await {
                     Err(error) if error.transaction_source_failed() => error,
                     result => return result.map_err(Into::into),
                 };
-                let Some(alternate) = download.alternate() else {
-                    return Err(error.into());
-                };
                 let (reply, response) = tokio::sync::oneshot::channel();
                 if retries
                     .try_send(Retry {
-                        id,
+                        download,
                         first: peer,
-                        alternate,
                         reply,
                     })
                     .is_ok()
@@ -1756,14 +1747,19 @@ where
         fut.map_err(Into::into).boxed()
     }
 
-    fn poll_transaction_retries(&mut self, cx: &mut Context<'_>) -> Result<(), BoxError> {
-        while let Poll::Ready(Some(retry)) = self.tx_retries.poll_recv(cx) {
+    pub(super) fn poll_transaction_retries(
+        &mut self,
+        cx: &mut Context<'_>,
+        retries: &mut tokio_mpsc::Receiver<Retry>,
+    ) -> Result<(), BoxError> {
+        while let Poll::Ready(Some(retry)) = retries.poll_recv(cx) {
             if retry.reply.is_closed() {
                 continue;
             }
             let _ = self.inventory_registry.poll_inventory(cx)?;
-            let hash = InventoryHash::from(retry.id);
-            let alternate = Some(retry.alternate).filter(|peer| {
+            let id = retry.download.id;
+            let hash = InventoryHash::from(id);
+            let alternate = retry.download.alternate().filter(|peer| {
                 !self
                     .inventory_registry
                     .missing_peers(hash)
@@ -1778,8 +1774,10 @@ where
                 .collect();
             if let Some(peer) = self.select_p2c_peer_from_list(&candidates) {
                 if let Some(mut svc) = self.take_ready_service(&peer) {
-                    let future = svc.call(Request::TransactionsById([retry.id].into()));
+                    let future = svc.call(Request::TransactionsById([id].into()));
                     self.push_unready(peer, svc);
+                    // Maintenance already polled the peers. Arm readiness for this connection.
+                    cx.waker().wake_by_ref();
                     let _ = retry.reply.send(future.boxed());
                 }
             }
@@ -2228,7 +2226,6 @@ where
         let _poll_pending: Poll<()> = self.poll_background_errors(cx)?;
 
         let _ = self.poll_peers(cx)?;
-        self.poll_transaction_retries(cx)?;
         self.prune_block_gossip_peers();
         self.publish_block_gossip_peers();
 

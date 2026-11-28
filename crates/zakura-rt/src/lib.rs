@@ -160,7 +160,8 @@ pub mod task {
 #[cfg(not(zakura_sim))]
 pub mod time {
     pub use tokio::time::{
-        error, interval, sleep, sleep_until, timeout, Instant, MissedTickBehavior, Sleep, Timeout,
+        error, interval, sleep, sleep_until, timeout, Instant, Interval, MissedTickBehavior, Sleep,
+        Timeout,
     };
 
     /// The current UTC time: the host clock, `SystemTime::now()`. The

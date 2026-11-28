@@ -153,6 +153,12 @@ impl ConnLimits {
         self.receive_window = Some(bytes);
         self
     }
+
+    /// Sets the connection-level send window.
+    pub fn with_send_window(mut self, bytes: u64) -> Self {
+        self.send_window = Some(bytes);
+        self
+    }
 }
 
 /// A connection's buffer and traffic state, published by its connection task
@@ -202,6 +208,22 @@ pub struct ConnLoad {
     pub rate_in: Option<u64>,
     /// Windowed-max outbound delivery rate in bytes/sec to this peer, if measured.
     pub rate_out: Option<u64>,
+    /// Current congestion window in bytes (`quinn_proto::PathStats::cwnd`).
+    pub cwnd: u64,
+    /// Stream bytes accepted into quinn-proto's send buffer.
+    pub accepted_send_bytes: u64,
+    /// The sequence number of the last [`Conn::set_limits`] call the
+    /// connection task applied, or 0 before the first.
+    pub limits_applied: u64,
+    /// Receive credit the peer may still use beyond the current receive
+    /// window less live holds (API-10). quinn-proto never revokes granted
+    /// credit, so lowering the window leaves the granted excess with the
+    /// peer until reads repay it. The task counts its own reads and the
+    /// readable bytes it discards when it stops a stream. quinn-proto also
+    /// repays the excess with bytes it discards itself (a peer's reset, or
+    /// data arriving for a stopped stream) and doesn't report them, so this
+    /// value can stay above the true excess until later reads repay it.
+    pub receive_credit_excess: u64,
     /// Smoothed round-trip time, which [`RttReader`] reads.
     pub(crate) rtt: Duration,
 }
@@ -228,6 +250,10 @@ impl ConnLoad {
             min_rtt: None,
             rate_in: None,
             rate_out: None,
+            cwnd: 0,
+            accepted_send_bytes: 0,
+            limits_applied: 0,
+            receive_credit_excess: 0,
             rtt: Duration::ZERO,
         }
     }
@@ -516,10 +542,12 @@ impl Conn {
             .clone()
     }
 
-    /// Changes this connection's runtime limits (API-9). Returns the close
-    /// reason if the connection has closed.
-    pub fn set_limits(&self, limits: ConnLimits) -> Result<(), ConnectionError> {
-        self.inner.send(ConnCmd::SetLimits { limits })
+    /// Changes this connection's runtime limits (API-9). Returns the call's
+    /// sequence number, which [`ConnLoad::limits_applied`] reaches once the
+    /// connection task applied the limits, or the close reason if the
+    /// connection has closed.
+    pub fn set_limits(&self, limits: ConnLimits) -> Result<u64, ConnectionError> {
+        self.inner.send_limits(limits)
     }
 
     /// Connection statistics (OBS-4), or `None` once the connection task has

@@ -45,6 +45,10 @@ pub const fn connection_memory_bytes(receive_window_bytes: u32, send_window_byte
 // target.
 pub const SOCKET_DATAGRAM_QUEUE_BYTES: u64 = SOCKET_QUEUE_BYTES as u64;
 
+/// The connection receive window used when `receive_window_bytes` is unset.
+// MIB is 2^20, so 32 MiB fits u32.
+pub const DEFAULT_RECEIVE_WINDOW_BYTES: u32 = 32 * MIB as u32;
+
 /// The largest `stream_receive_window_bytes` the QUIC config accepts.
 pub const MAX_STREAM_RECEIVE_WINDOW_BYTES: u64 = 256 * MIB;
 
@@ -76,8 +80,14 @@ pub struct QuicConfig {
     pub initial_window_bytes: Option<u64>,
     /// Per-stream receive window in bytes (CTRL-5).
     pub stream_receive_window_bytes: u32,
-    /// Connection receive window in bytes (CTRL-6).
-    pub receive_window_bytes: u32,
+    /// Connection receive window in bytes; unset uses
+    /// [`DEFAULT_RECEIVE_WINDOW_BYTES`], and lets an application choose a
+    /// smaller window before it admits a peer (CTRL-6).
+    ///
+    /// A value equal to [`DEFAULT_RECEIVE_WINDOW_BYTES`] reads as unset, see
+    /// [`deserialize_receive_window`].
+    #[serde(deserialize_with = "deserialize_receive_window")]
+    pub receive_window_bytes: Option<u32>,
     /// Connection send window in bytes (CTRL-7).
     pub send_window_bytes: u64,
     /// Negotiate the ACK-frequency extension (CTRL-9, WIRE-9).
@@ -112,6 +122,20 @@ pub struct QuicConfig {
     pub kernel_drop_poll_secs: u32,
 }
 
+/// Reads `receive_window_bytes`, treating [`DEFAULT_RECEIVE_WINDOW_BYTES`]
+/// as unset.
+///
+/// Generated configs up to v1.9.0-rc2 wrote `receive_window_bytes =
+/// 33554432`. Read as set, that value keeps a 32 MiB window on every pending
+/// handshake. An operator who chose exactly 32 MiB on purpose looks the same
+/// in an old file and also gets the unset behavior.
+fn deserialize_receive_window<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u32>, D::Error> {
+    let window = Option::<u32>::deserialize(deserializer)?;
+    Ok(window.filter(|&bytes| bytes != DEFAULT_RECEIVE_WINDOW_BYTES))
+}
+
 impl Default for QuicConfig {
     fn default() -> Self {
         Self {
@@ -120,7 +144,7 @@ impl Default for QuicConfig {
             congestion_controller: CongestionController::Cubic,
             initial_window_bytes: None,
             stream_receive_window_bytes: 16 * MIB as u32,
-            receive_window_bytes: 32 * MIB as u32,
+            receive_window_bytes: None,
             send_window_bytes: 32 * MIB,
             ack_frequency: false,
             idle_timeout_secs: 150,
@@ -190,12 +214,9 @@ impl QuicConfig {
             64 * KIB,
             MAX_STREAM_RECEIVE_WINDOW_BYTES,
         )?;
-        check(
-            "receive_window_bytes",
-            u64::from(self.receive_window_bytes),
-            64 * KIB,
-            GIB,
-        )?;
+        if let Some(window) = self.receive_window_bytes {
+            check("receive_window_bytes", u64::from(window), 64 * KIB, GIB)?;
+        }
         check("send_window_bytes", self.send_window_bytes, 64 * KIB, GIB)?;
         check("idle_timeout_secs", self.idle_timeout_secs, 30, 600)?;
         check(
@@ -240,7 +261,13 @@ impl QuicConfig {
 
     /// [`connection_memory_bytes`] for this config's windows (CTRL-26).
     pub fn connection_memory_bytes(&self) -> u64 {
-        connection_memory_bytes(self.receive_window_bytes, self.send_window_bytes)
+        connection_memory_bytes(self.receive_window(), self.send_window_bytes)
+    }
+
+    /// The connection receive window in bytes (CTRL-6).
+    pub fn receive_window(&self) -> u32 {
+        self.receive_window_bytes
+            .unwrap_or(DEFAULT_RECEIVE_WINDOW_BYTES)
     }
 
     /// The connection idle timeout (CTRL-10).
@@ -290,7 +317,7 @@ impl QuicConfig {
         // Windows and timers.
         config
             .stream_receive_window(VarInt::from_u32(self.stream_receive_window_bytes))
-            .receive_window(VarInt::from_u32(self.receive_window_bytes))
+            .receive_window(VarInt::from_u32(self.receive_window()))
             .send_window(self.send_window_bytes)
             .max_idle_timeout(Some(IdleTimeout::try_from(self.idle_timeout()).expect(
                 "validate() bounds idle_timeout_secs to 600, a valid QUIC VarInt",
@@ -467,7 +494,7 @@ mod tests {
         // 32 MiB received and 32 MiB sent.
         assert_eq!(QuicConfig::default().connection_memory_bytes(), 64 * MIB);
         let config = QuicConfig {
-            receive_window_bytes: 1 << 30,
+            receive_window_bytes: Some(1 << 30),
             send_window_bytes: GIB,
             ..QuicConfig::default()
         };
@@ -491,14 +518,14 @@ mod tests {
         assert_eq!(config.validate().unwrap_err().key, "idle_timeout_secs");
 
         let config = QuicConfig {
-            receive_window_bytes: 32 * 1024,
+            receive_window_bytes: Some(32 * 1024),
             ..QuicConfig::default()
         };
         assert_eq!(config.validate().unwrap_err().key, "receive_window_bytes");
 
         // A handshake window below the stream window is valid (CTRL-6).
         let config = QuicConfig {
-            receive_window_bytes: 1024 * 1024,
+            receive_window_bytes: Some(1024 * 1024),
             ..QuicConfig::default()
         };
         assert!(config.validate().is_ok());
@@ -524,5 +551,14 @@ mod tests {
         assert!(toml::from_str::<QuicConfig>("path_idle_timeout_secs = 15\n").is_err());
         // qlog output was removed in SPEC version 0.7 (§17e).
         assert!(toml::from_str::<QuicConfig>("qlog_dir = \"/tmp\"\n").is_err());
+    }
+
+    #[test]
+    fn generated_default_receive_window_reads_as_unset() {
+        let old: QuicConfig = toml::from_str("receive_window_bytes = 33554432\n").unwrap();
+        assert_eq!(old.receive_window_bytes, None);
+
+        let set: QuicConfig = toml::from_str("receive_window_bytes = 1048576\n").unwrap();
+        assert_eq!(set.receive_window_bytes, Some(1_048_576));
     }
 }

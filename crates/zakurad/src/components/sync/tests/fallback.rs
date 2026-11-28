@@ -23,7 +23,8 @@ use zakura_chain::{
 use zakura_network::{self as zn, InventoryResponse::Available};
 use zakura_state as zs;
 use zakura_test::vectors::{
-    BLOCK_MAINNET_1_BYTES, BLOCK_MAINNET_2_BYTES, BLOCK_MAINNET_GENESIS_BYTES,
+    BLOCK_MAINNET_1_BYTES, BLOCK_MAINNET_2_BYTES, BLOCK_MAINNET_3_BYTES,
+    BLOCK_MAINNET_GENESIS_BYTES,
 };
 
 use super::super::{
@@ -554,6 +555,31 @@ fn stalled_zakura_without_legacy_fallback_keeps_waiting() {
     );
 }
 
+#[test]
+fn fresh_sync_waits_for_the_normal_stall_window() {
+    let genesis = Some(Height(0));
+    let max_idle_polls = 60;
+    let mut tracker = ZakuraStallTracker::new(genesis);
+    let mut legacy_probe = ZakuraLegacyProbe::new(genesis);
+
+    for poll in 1..=max_idle_polls {
+        let action = zakura_watchdog_action(
+            &mut tracker,
+            &mut legacy_probe,
+            genesis,
+            genesis,
+            max_idle_polls,
+            true,
+        );
+        let expected = if poll < max_idle_polls {
+            ZakuraWatchdogAction::ContinueWaiting
+        } else {
+            ZakuraWatchdogAction::FallbackToLegacy
+        };
+        assert_eq!(action, expected, "watchdog poll {poll}");
+    }
+}
+
 /// A frozen tip that looks caught up cross-checks legacy peers, and a probe at
 /// or above the behind threshold engages fallback without cancelling Zakura.
 #[test]
@@ -617,13 +643,13 @@ fn legacy_probe_below_threshold_keeps_zakura_running() {
 /// Reproduce a frozen native frontier with legacy peers two blocks ahead.
 #[tokio::test]
 async fn frozen_native_tip_recovers_on_two_linked_legacy_headers_with_work() {
-    let first: block::Block = BLOCK_MAINNET_1_BYTES
-        .zcash_deserialize_into()
-        .expect("valid mainnet block 1");
-    let second: block::Block = BLOCK_MAINNET_2_BYTES
+    let first: block::Block = BLOCK_MAINNET_2_BYTES
         .zcash_deserialize_into()
         .expect("valid mainnet block 2");
-    let tip = (Height(0), first.header.previous_block_hash);
+    let second: block::Block = BLOCK_MAINNET_3_BYTES
+        .zcash_deserialize_into()
+        .expect("valid mainnet block 3");
+    let tip = (Height(1), first.header.previous_block_hash);
     let mut tracker = ZakuraStallTracker::new(Some(tip.0));
     let mut legacy_probe = ZakuraLegacyProbe::new(Some(tip.0));
     for expected in [

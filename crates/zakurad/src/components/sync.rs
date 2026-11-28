@@ -538,10 +538,14 @@ fn zakura_watchdog_action(
         return ZakuraWatchdogAction::ContinueWaiting;
     }
 
+    // A fresh node has a zero gap as soon as genesis is committed, even if it
+    // has never received a header from a peer. Give native sync the normal
+    // stall window to establish its frontier before falling back.
     let looks_caught_up = match (header_tip_height, verified_height) {
-        (Some(header), Some(verified)) => header - verified <= ZAKURA_NEAR_TIP_GAP,
-        // No frontier known yet: our local view cannot tell us we are behind.
-        _ => true,
+        (Some(header), Some(verified)) => {
+            verified > Height(0) && header - verified <= ZAKURA_NEAR_TIP_GAP
+        }
+        _ => false,
     };
 
     if legacy_probe.should_probe(

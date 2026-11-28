@@ -316,6 +316,14 @@ pub struct ZakuraConfig {
     /// are disabled for Zakura v1. Each entry must contain the peer's 32-byte
     /// node id and a directly reachable socket address.
     ///
+    /// An ordinary node dials at most two of these peers, only while it has
+    /// few outbound peers of its own, and closes those connections once it
+    /// has enough. A node that finds its own ID in the list is a seed and
+    /// keeps every other entry connected. So a private fleet stays a full mesh
+    /// when every node gets the same list, itself included. If each node lists
+    /// only the others, each keeps two, and the fleet can split into groups
+    /// that stay apart until a connection drops or a node restarts.
+    ///
     /// An entry can still name a default seed by its p2p-v2/3 node ID, which
     /// [`replace_retired_seed_node_ids`](Self::replace_retired_seed_node_ids)
     /// switches to the seed's current ID.

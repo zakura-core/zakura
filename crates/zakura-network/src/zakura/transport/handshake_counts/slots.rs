@@ -137,14 +137,19 @@ impl ConnectionSlots {
 
     /// Whether a slot is free for an inbound caller whose node ID is not
     /// known yet: an ordinary inbound slot, or a held place that no member
-    /// fills. With no hold this is the ordinary inbound check alone.
-    pub(super) fn inbound_place_free(&self, cap: usize, preferred: &PreferredGateways) -> bool {
+    /// fills and no pending transport handshake is already trying for.
+    pub(super) fn inbound_place_free(
+        &self,
+        cap: usize,
+        preferred: &PreferredGateways,
+        transport_pending: usize,
+    ) -> bool {
         if self.total >= cap.saturating_add(preferred.hold()) {
             return false;
         }
         let split = self.split(preferred);
         let ordinary_free = split.ordinary < cap && split.ordinary_inbound < inbound_share(cap);
-        ordinary_free || split.preferred < preferred.hold()
+        ordinary_free || transport_pending < preferred.hold().saturating_sub(split.preferred)
     }
 
     /// Remaining ordinary places after counting live connections under the current ranking.

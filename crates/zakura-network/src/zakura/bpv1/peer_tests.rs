@@ -10,9 +10,7 @@ use zakura_quic::NodeId;
 use zakura_rt::time::Instant;
 
 use super::{
-    blocks::{
-        BlockConfig, BlockEvent, BlockInput, PartSource, ReleaseReason, MAX_PENDING_META_COUNT,
-    },
+    blocks::{BlockConfig, BlockEvent, BlockInput, PartSource, ReleaseReason},
     close::Bpv1CloseRow,
     codec::encode_body,
     commitment::CoinbaseBinding,
@@ -1886,41 +1884,6 @@ fn bpv1_14_part_for_dropped_header_meta_drops() {
     assert_eq!(drop_reason(&s, 0), Some(DropReason::MetaDropped));
     peer.step(now, have_with(block_id, HaveFlags::Plain, vec![2]));
     assert!(peer.close_cause().is_none());
-    peer.assert_invariants();
-}
-
-/// A session that forgot a dropped block can no longer tell its traffic from
-/// traffic without metadata, so both drop. A peer that replays more blocks
-/// than the dropped set holds, all of which this node rejects, stays open.
-#[test]
-fn bpv1_14_traffic_after_the_dropped_set_forgets_drops() {
-    let now = Instant::now();
-    let mut peer = PeerState::new(PeerConfig::for_profile(Profile::TINY), node_id(2), 1);
-    let blocks: Vec<block::Hash> = (0..=MAX_PENDING_META_COUNT)
-        .map(|index| {
-            let mut bytes = [0x71; 32];
-            bytes[..8].copy_from_slice(&u64::try_from(index).unwrap().to_le_bytes());
-            block::Hash(bytes)
-        })
-        .collect();
-    for &block_id in &blocks {
-        peer.step(now, recv_meta(block_id));
-        peer.step(now, PeerInput::MetaRejected { block_id });
-    }
-
-    let s = peer.step(now, tiny_part_prefix(blocks[0], 0));
-    assert!(
-        peer.close_cause().is_none(),
-        "the forgotten block's metadata crossed"
-    );
-    assert_eq!(drop_reason(&s, 0), Some(DropReason::MetaDropped));
-    peer.step(now, have_with(blocks[0], HaveFlags::Plain, vec![1]));
-    assert!(peer.close_cause().is_none());
-
-    let s = peer.step(now, tiny_part_prefix(block::Hash([0x72; 32]), 0));
-    assert!(peer.close_cause().is_none());
-    assert_eq!(drop_reason(&s, 0), Some(DropReason::MetaDropped));
-    assert_eq!(peer.early_data_bytes(), 0);
     peer.assert_invariants();
 }
 

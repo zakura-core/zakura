@@ -76,8 +76,7 @@ pub enum Bpv1CloseRow {
     /// `n − k` indices of one stripe.
     Row20BadPushFlags = 20,
     /// `bpv1-close-21`: `Part` or `Have` for a block whose `HeaderMeta`
-    /// crossed the connection in neither direction, while the session still
-    /// remembers every block it dropped (bpv1-14).
+    /// crossed the connection in neither direction (bpv1-14).
     Row21DataBeforeHeaderMeta = 21,
 }
 

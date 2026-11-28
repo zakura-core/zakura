@@ -829,8 +829,9 @@ async fn assert_peer_error_starts_no_cooldown(
     assert!(matches!(response, Response::Queued(results) if results.is_empty()));
 
     peer_set
-        .expect_request_that(|request| {
-            matches!(request, zn::Request::TransactionsById(ids) if ids.contains(&transaction_id))
+        .expect_request(zn::Request::TransactionsByIdFrom {
+            ids: [transaction_id].into(),
+            source: zn::PeerSource::LegacySocket(peer_addr),
         })
         .await
         .respond(zn::Response::Transactions(vec![
@@ -1046,8 +1047,9 @@ async fn peer_penalties_with_unconditional(
     assert!(matches!(response, Response::Queued(results) if results.is_empty()));
 
     peer_set
-        .expect_request_that(|request| {
-            matches!(request, zn::Request::TransactionsById(ids) if ids.contains(&transaction_id))
+        .expect_request(zn::Request::TransactionsByIdFrom {
+            ids: [transaction_id].into(),
+            source: zn::PeerSource::LegacySocket(peer),
         })
         .await
         .respond(zn::Response::Transactions(vec![
@@ -1155,8 +1157,9 @@ async fn invalid_peer_transaction_starts_a_cooldown_instead_of_a_ban() -> Result
     assert!(matches!(response, Response::Queued(results) if results.is_empty()));
 
     peer_set
-        .expect_request_that(|request| {
-            matches!(request, zn::Request::TransactionsById(ids) if ids.contains(&oversized_id))
+        .expect_request(zn::Request::TransactionsByIdFrom {
+            ids: [oversized_id].into(),
+            source: zn::PeerSource::LegacySocket(peer_addr),
         })
         .await
         .respond(zn::Response::Transactions(vec![
@@ -1206,8 +1209,9 @@ async fn invalid_peer_transaction_starts_a_cooldown_instead_of_a_ban() -> Result
     assert!(matches!(response, Response::Queued(results) if results.is_empty()));
 
     peer_set
-        .expect_request_that(|request| {
-            matches!(request, zn::Request::TransactionsById(ids) if ids.contains(&at_limit_id))
+        .expect_request(zn::Request::TransactionsByIdFrom {
+            ids: [at_limit_id].into(),
+            source: zn::PeerSource::LegacySocket(peer_addr),
         })
         .await
         .respond(zn::Response::Transactions(vec![
@@ -2383,7 +2387,8 @@ async fn mempool_reset_keeps_active_state_when_legacy_sync_falls_behind() -> Res
     assert!(mempool.is_enabled());
 
     // Queue the uncommitted transaction for download.
-    let source = QueueSource::LegacySocket("203.0.113.7:8233".parse().unwrap());
+    let addr = std::net::SocketAddr::from(([203, 0, 113, 7], 8233));
+    let source = QueueSource::LegacySocket(addr);
     let response = mempool
         .ready()
         .await
@@ -2435,7 +2440,10 @@ async fn mempool_reset_keeps_active_state_when_legacy_sync_falls_behind() -> Res
 
     assert_eq!(
         request.request(),
-        &zakura_network::Request::TransactionsById(iter::once(uncommitted_tx_id).collect()),
+        &zn::Request::TransactionsByIdFrom {
+            ids: [uncommitted_tx_id].into(),
+            source: zn::PeerSource::LegacySocket(addr.into()),
+        },
     );
     assert_eq!(mempool.tx_downloads().in_flight(), 1);
 

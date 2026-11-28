@@ -142,6 +142,7 @@ use crate::{
             next_decision_after, second_request_reason, HeldSecondRequest, SecondResponse,
         },
         stall_tracker::FindResponseStallTracker,
+        tx_retry::{Retry, TxAnnouncers},
         unready_service::{Error as UnreadyError, UnreadyService},
         InventoryChange, InventoryRegistry,
     },
@@ -233,6 +234,8 @@ where
     /// Provides new and deleted peer [`Change`]s to the peer set,
     /// via the [`Discover`] trait implementation.
     discover: D,
+    pub(super) tx_announcers: TxAnnouncers,
+    pub(super) tx_retry_sender: Option<tokio_mpsc::Sender<Retry>>,
 
     /// A channel that asks the peer crawler task to connect to more peers.
     demand_signal: mpsc::Sender<MorePeers>,
@@ -413,6 +416,8 @@ where
     ) -> Self {
         let (stall_event_tx, stall_event_rx) = tokio_mpsc::unbounded_channel();
         Self {
+            tx_announcers: TxAnnouncers::default(),
+            tx_retry_sender: None,
             // New peers
             discover,
             demand_signal,
@@ -1468,6 +1473,8 @@ where
     ///
     /// A transaction request whose advertisers are all busy waits for one of them instead, see
     /// [`Self::route_held_tx_requests`]. Another peer usually doesn't have the transaction yet.
+    /// The peer a transaction request names as the advert's sender counts as an advertiser, see
+    /// [`Self::tx_request_source`].
     ///
     /// If all ready peers are missing the inventory,
     /// returns a synthetic [`NotFoundRegistry`](PeerError::NotFoundRegistry) error.
@@ -1479,9 +1486,11 @@ where
         hash: InventoryHash,
         attempt: Option<crate::BlockHedge>,
     ) -> <Self as tower::Service<Request>>::Future {
+        let tx_source = self.tx_request_source(&req, hash);
         let advertising_peer_list = self
             .inventory_registry
             .advertising_peers(hash)
+            .chain(tx_source.as_ref())
             .filter(|&addr| self.ready_services.contains_key(addr))
             .copied()
             .collect();
@@ -1518,6 +1527,7 @@ where
                 )),
                 _ => None,
             };
+            let download = self.track_transaction(&req, hash, peer);
             let fut = match self.dispatch_inventory(
                 peer,
                 svc,
@@ -1548,12 +1558,12 @@ where
                 }
                 .boxed();
             }
-            return fut.map_err(Into::into).boxed();
+            return self.transaction_response(peer, download, fut);
         }
 
         if !matches!(hash, InventoryHash::Block(_))
             && self.held_tx_requests.len() < MAX_HELD_TX_REQUESTS
-            && self.has_busy_advertiser(hash)
+            && self.has_busy_advertiser(hash, tx_source)
         {
             return self.hold_tx_request(req, hash);
         }
@@ -1624,6 +1634,7 @@ where
                 )),
                 _ => None,
             };
+            let download = self.track_transaction(&req, hash, peer);
             let fut = match self.dispatch_inventory(peer, svc, req, attempt.as_ref(), None) {
                 Ok(fut) => fut,
                 Err(error) => return async { Err(error) }.boxed(),
@@ -1644,7 +1655,7 @@ where
                 }
                 .boxed();
             }
-            return fut.map_err(Into::into).boxed();
+            return self.transaction_response(peer, download, fut);
         }
 
         // Split the synthetic registry-miss by cause so a stall can be diagnosed (the two collapse
@@ -1683,17 +1694,138 @@ where
         .boxed()
     }
 
-    /// Returns true if a peer that advertised `hash` is busy with a request.
-    fn has_busy_advertiser(&self, hash: InventoryHash) -> bool {
+    fn track_transaction(
+        &self,
+        request: &Request,
+        hash: InventoryHash,
+        peer: PeerSocketAddr,
+    ) -> Option<super::tx_retry::Download> {
+        let id = hash.unmined_tx_id()?;
+        let alternate = self
+            .tx_request_source(request, hash)
+            .filter(|addr| *addr != peer)
+            .or_else(|| {
+                self.inventory_registry
+                    .advertising_peers(hash)
+                    .copied()
+                    .find(|addr| *addr != peer)
+            });
+        self.tx_announcers.begin(id, peer, alternate)
+    }
+
+    /// Keep the original response deadline while trying one more known announcer.
+    fn transaction_response(
+        &self,
+        peer: PeerSocketAddr,
+        download: Option<super::tx_retry::Download>,
+        fut: <LoadTrackedClient as Service<Request>>::Future,
+    ) -> <Self as Service<Request>>::Future {
+        if let (Some(download), Some(retries)) = (download, &self.tx_retry_sender) {
+            let retries = retries.clone();
+            return async move {
+                let error = match fut.await {
+                    Err(error) if error.transaction_source_failed() => error,
+                    result => return result.map_err(Into::into),
+                };
+                let (reply, response) = tokio::sync::oneshot::channel();
+                if retries
+                    .try_send(Retry {
+                        download,
+                        first: peer,
+                        reply,
+                    })
+                    .is_ok()
+                {
+                    if let Ok(second) = response.await {
+                        return second.await.map_err(Into::into);
+                    }
+                }
+                Err(error.into())
+            }
+            .boxed();
+        }
+        fut.map_err(Into::into).boxed()
+    }
+
+    pub(super) fn poll_transaction_retries(
+        &mut self,
+        cx: &mut Context<'_>,
+        retries: &mut tokio_mpsc::Receiver<Retry>,
+    ) -> Result<(), BoxError> {
+        while let Poll::Ready(Some(retry)) = retries.poll_recv(cx) {
+            if retry.reply.is_closed() {
+                continue;
+            }
+            let _ = self.inventory_registry.poll_inventory(cx)?;
+            let id = retry.download.id;
+            let hash = InventoryHash::from(id);
+            let alternate = retry.download.alternate().filter(|peer| {
+                !self
+                    .inventory_registry
+                    .missing_peers(hash)
+                    .any(|missing| missing == peer)
+            });
+            let candidates = self
+                .inventory_registry
+                .advertising_peers(hash)
+                .copied()
+                .chain(alternate)
+                .filter(|peer| *peer != retry.first && self.ready_services.contains_key(peer))
+                .collect();
+            if let Some(peer) = self.select_p2c_peer_from_list(&candidates) {
+                if let Some(mut svc) = self.take_ready_service(&peer) {
+                    let future = svc.call(Request::TransactionsById([id].into()));
+                    self.push_unready(peer, svc);
+                    // Maintenance already polled the peers. Arm readiness for this connection.
+                    cx.waker().wake_by_ref();
+                    let _ = retry.reply.send(future.boxed());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns the legacy peer that a transaction request names as the sender of its advert,
+    /// unless that peer has since said it is missing `hash`.
+    ///
+    /// The mempool learns of an advert from the peer's message, and the inventory registry learns
+    /// of it from a separate channel, so a request can arrive before the registry lists its
+    /// sender. That sender is an advertiser like any other: routing picks it at random among the
+    /// ready advertisers, and a request waits for it while it is busy.
+    ///
+    /// # Security
+    ///
+    /// A peer that answered `notfound` is not named again, so a peer can't hold a request it
+    /// won't answer, and no doomed request is routed to it.
+    fn tx_request_source(&self, req: &Request, hash: InventoryHash) -> Option<PeerSocketAddr> {
+        let Request::TransactionsByIdFrom {
+            source: PeerSource::LegacySocket(addr),
+            ..
+        } = req
+        else {
+            return None;
+        };
+        let missing = self
+            .inventory_registry
+            .missing_peers(hash)
+            .any(|missing| missing == addr);
+        (!missing).then_some(*addr)
+    }
+
+    /// Returns true if a peer that advertised `hash`, or the request's `tx_source`, is busy with a
+    /// request.
+    fn has_busy_advertiser(&self, hash: InventoryHash, tx_source: Option<PeerSocketAddr>) -> bool {
         self.inventory_registry
             .advertising_peers(hash)
+            .chain(tx_source.as_ref())
             .any(|addr| self.cancel_handles.contains_key(addr))
     }
 
-    /// Returns true if a peer that advertised `hash` is ready.
-    fn has_ready_advertiser(&self, hash: InventoryHash) -> bool {
+    /// Returns true if a peer that advertised `hash`, or the request's `tx_source`, is ready.
+    fn has_ready_advertiser(&self, hash: InventoryHash, tx_source: Option<PeerSocketAddr>) -> bool {
         self.inventory_registry
             .advertising_peers(hash)
+            .chain(tx_source.as_ref())
             .any(|addr| self.ready_services.contains_key(addr))
     }
 
@@ -1724,7 +1856,7 @@ where
 
     /// Routes the transaction requests held for busy advertisers that can go now. The peer set's
     /// owner calls this after routing each new request, so a waiting request never takes a peer
-    /// from it, and when no new request is waiting.
+    /// from it. It also calls this when no new request can be routed.
     ///
     /// A held request goes to its advertiser once one is ready. Once it has waited
     /// [`TX_ADVERTISER_WAIT`], or no advertiser is connected, it is routed as if no peer had
@@ -1752,8 +1884,13 @@ where
                 continue;
             }
 
-            let to_advertiser = self.has_ready_advertiser(held.hash);
-            if !to_advertiser && held.deadline > now && self.has_busy_advertiser(held.hash) {
+            // Read again for each pass: the source may have said `notfound` since.
+            let tx_source = self.tx_request_source(&held.req, held.hash);
+            let to_advertiser = self.has_ready_advertiser(held.hash, tx_source);
+            if !to_advertiser
+                && held.deadline > now
+                && self.has_busy_advertiser(held.hash, tx_source)
+            {
                 // Every request waits as long, so the oldest has the earliest deadline.
                 next_deadline.get_or_insert(held.deadline);
                 self.held_tx_requests.push_back(held);

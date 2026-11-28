@@ -7,6 +7,7 @@ mod limit;
 mod second_request;
 mod set;
 mod stall_tracker;
+mod tx_retry;
 mod unready_service;
 
 pub(crate) use candidate_set::CandidateSet;

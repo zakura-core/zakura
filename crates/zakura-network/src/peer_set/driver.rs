@@ -117,6 +117,8 @@ where
     C: ChainTip + Clone + Send + Sync + 'static,
 {
     let (requests, mut incoming) = mpsc::channel::<Dispatch>(PEERSET_BUFFER_SIZE);
+    let (retry_sender, mut retries) = mpsc::channel(PEERSET_BUFFER_SIZE);
+    peers.tx_retry_sender = Some(retry_sender);
     let (refresh, mut refreshes) = mpsc::channel::<oneshot::Sender<()>>(PEERSET_BUFFER_SIZE);
     let mut advertiser = peers.block_advertiser();
     advertiser.refresh = Some(refresh);
@@ -143,6 +145,7 @@ where
                     }
                     running = poll_fn(|cx| {
                         peers.maintain(cx)?;
+                        peers.poll_transaction_retries(cx, &mut retries)?;
                         // Bounded channel polling participates in Tokio's cooperative budget.
                         while let Poll::Ready(Some(reply)) = refreshes.poll_recv(cx) {
                             // Discovery may have arrived between the first maintenance pass and
@@ -167,7 +170,12 @@ where
                             return Poll::Ready(Ok(true));
                         }
                         // Maintenance already ran in this poll, so only check routing readiness.
-                        futures::ready!(peers.poll_routing_readiness(cx))?;
+                        if peers.poll_routing_readiness(cx)?.is_pending() {
+                            // A block can be waiting for an archive peer while a pruned peer
+                            // is ready to serve a held transaction.
+                            peers.route_held_tx_requests(cx)?;
+                            return Poll::Pending;
+                        }
                         let request = pending.take().expect("readiness does not remove the request");
                         let response = request.span.in_scope(|| peers.call(request.request));
                         let _ = request.reply.send(response);

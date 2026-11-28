@@ -13871,16 +13871,15 @@ async fn stale_needed_block_completion_cannot_clear_a_newer_query() {
     let BlockSyncAction::QueryNeededBlocks {
         query_id: first_query_id,
         scope: first_scope,
+        best_header_tip: block::Height(10),
         ..
     } = next_action(&mut actions).await
     else {
         panic!("startup must query needed blocks");
     };
 
-    handle
-        .send(BlockSyncEvent::NeededBlocks(Vec::new()))
-        .await
-        .expect("test fixture clears the first pending query");
+    // Keep the first query pending until the new tip supersedes it. Clearing it
+    // early lets the refill timer issue another query for the old tip.
     handle
         .send(BlockSyncEvent::HeaderTipChanged {
             height: block::Height(11),
@@ -13892,6 +13891,7 @@ async fn stale_needed_block_completion_cannot_clear_a_newer_query() {
     let BlockSyncAction::QueryNeededBlocks {
         query_id: second_query_id,
         scope: second_scope,
+        best_header_tip: block::Height(11),
         ..
     } = next_action(&mut actions).await
     else {

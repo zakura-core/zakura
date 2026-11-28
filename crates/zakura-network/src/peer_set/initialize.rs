@@ -301,6 +301,12 @@ where
             .collect(),
     );
 
+    let tx_announcers = super::tx_retry::TxAnnouncers::default();
+    let observed = tx_announcers.clone();
+    let inbound_service = inbound_service.map_request(move |request| {
+        observed.observe(&request);
+        request
+    });
     let (listen_handshaker, outbound_connector) = {
         use tower::timeout::TimeoutLayer;
         let hs_timeout = TimeoutLayer::new(constants::HANDSHAKE_TIMEOUT);
@@ -361,7 +367,7 @@ where
     let (handle_tx, handle_rx) = tokio::sync::oneshot::channel();
 
     // Connect the rx end to a PeerSet, wrapping new peers in load instruments.
-    let peer_set = PeerSet::new(
+    let mut peer_set = PeerSet::new(
         &config,
         block_gossip_peer_ips.clone(),
         discovered_peers,
@@ -373,6 +379,7 @@ where
         MinimumPeerVersion::new(latest_chain_tip, &config.network),
         None,
     );
+    peer_set.tx_announcers = tx_announcers;
     let shutdown = zakura_endpoint
         .as_ref()
         .map(ZakuraEndpoint::background_shutdown_token)

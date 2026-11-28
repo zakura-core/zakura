@@ -158,7 +158,7 @@ where
 
 pub(crate) fn peer_source_from_queue_source(source: &QueueSource) -> Option<zn::PeerSource> {
     match source {
-        QueueSource::LegacySocket(_) => None,
+        QueueSource::LegacySocket(addr) => Some(zn::PeerSource::LegacySocket((*addr).into())),
         QueueSource::Zakura(peer_id) => zn::zakura::ZakuraPeerId::new(peer_id.clone())
             .ok()
             .map(zn::PeerSource::Zakura),

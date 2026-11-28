@@ -825,6 +825,52 @@ async fn pruned_routing_waits_for_busy_archive_while_syncing() {
     assert_eq!(peers.pruned.written_now().await, None);
 }
 
+/// Waiting for an archive peer to serve a block must not delay a transaction that a
+/// ready pruned peer can serve after the advertiser wait expires.
+#[tokio::test(start_paused = true)]
+async fn held_transaction_falls_back_while_archive_readiness_is_pending() {
+    let _init_guard = zakura_test::init();
+    let mut peers = StoragePeers::new().await;
+    reach_network_tip(&peers.tip);
+
+    let [first, second, held] =
+        [1, 2, 3].map(|byte| UnminedTxId::Legacy(transaction::Hash([byte; 32])));
+    let archive = peers.archive.addr;
+    let from_archive = |id| Request::TransactionsByIdFrom {
+        ids: [id].into(),
+        source: crate::PeerSource::LegacySocket(archive),
+    };
+    let _first = peers.set.call(from_archive(first));
+    assert_eq!(
+        StoragePeers::next_message(&mut peers.archive).await,
+        Message::GetData(vec![first.into()])
+    );
+    let _second = peers.set.ready().await.unwrap().call(from_archive(second));
+    let _held = peers.set.ready().await.unwrap().call(from_archive(held));
+    assert_eq!(peers.set.held_tx_requests.len(), 1);
+
+    fall_behind_network_tip(&peers.tip);
+    assert!(peers.set.awaits_archive_block_source());
+    let (mut driver, _adverts) =
+        crate::peer_set::driver::spawn(peers.set, zakura_rt::sync::CancellationToken::new());
+    // Let the idle driver arm the held transaction's deadline before queuing the block.
+    assert_eq!(peers.pruned.written_now().await, None);
+    let _block = driver
+        .ready()
+        .await
+        .unwrap()
+        .call(StoragePeers::block_request());
+    assert_eq!(peers.pruned.written_now().await, None);
+
+    tokio::time::advance(Duration::from_millis(1999)).await;
+    assert_eq!(peers.pruned.written_now().await, None);
+    tokio::time::advance(Duration::from_millis(1)).await;
+    assert_eq!(
+        peers.pruned.written_now().await,
+        Some(Message::GetData(vec![held.into()]))
+    );
+}
+
 /// Near the network tip a full archive peer does not hold requests back: the idle pruned peer
 /// keeps the recent blocks, so it takes the next block request.
 #[tokio::test(start_paused = true)]

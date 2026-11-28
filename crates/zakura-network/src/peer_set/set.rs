@@ -1758,7 +1758,7 @@ where
 
     /// Routes the transaction requests held for busy advertisers that can go now. The peer set's
     /// owner calls this after routing each new request, so a waiting request never takes a peer
-    /// from it, and when no new request is waiting.
+    /// from it. It also calls this when no new request can be routed.
     ///
     /// A held request goes to its advertiser once one is ready. Once it has waited
     /// [`TX_ADVERTISER_WAIT`], or no advertiser is connected, it is routed as if no peer had

@@ -167,7 +167,12 @@ where
                             return Poll::Ready(Ok(true));
                         }
                         // Maintenance already ran in this poll, so only check routing readiness.
-                        futures::ready!(peers.poll_routing_readiness(cx))?;
+                        if peers.poll_routing_readiness(cx)?.is_pending() {
+                            // A block can be waiting for an archive peer while a pruned peer
+                            // is ready to serve a held transaction.
+                            peers.route_held_tx_requests(cx)?;
+                            return Poll::Pending;
+                        }
                         let request = pending.take().expect("readiness does not remove the request");
                         let response = request.span.in_scope(|| peers.call(request.request));
                         let _ = request.reply.send(response);
